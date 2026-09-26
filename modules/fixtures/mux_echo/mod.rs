@@ -11,13 +11,17 @@
 //! somebody else's protocol in this repo to maintain.
 //!
 //! What it does is echo. On the `mux` contract — the surface `quic` actually
-//! exposes — it takes each accepted stream's bytes and sends them straight back
-//! on the same `(session, stream)`, then closes. That exercises exactly what a
-//! transport must get right and nothing else:
+//! exposes — it sends every byte of each accepted stream straight back on the
+//! same `(session, stream)` as it arrives, and closes its half when the peer
+//! closes theirs. That exercises exactly what a transport must get right and
+//! nothing else:
 //!
 //!   * a stream is ACCEPTED and surfaces to the application with its ids intact;
-//!   * inbound bytes arrive on the stream they were sent on;
+//!   * inbound bytes arrive on the stream they were sent on, in order, however
+//!     many deliveries a stream takes;
 //!   * the application can send on that stream and the bytes reach the peer;
+//!   * a write the transport has no room for backs up the command channel
+//!     rather than going missing;
 //!   * closing frees the slot, so the next stream is not starved.
 //!
 //! Anything above that — methods, paths, header compression — belongs to a
@@ -126,6 +130,15 @@ struct EchoState {
     session_id: u32,
     stream_id: u32,
     ticks: u32,
+    /// Bytes read into `buf` and not yet consumed, from `buf_off`. A frame
+    /// whose reply the transport cannot take yet stays here, and nothing
+    /// more is read until it goes: the fixture's own backpressure is the
+    /// command channel filling.
+    buf_len: usize,
+    buf_off: usize,
+    /// Bytes of the current stream delivery already echoed. A delivery can
+    /// carry more than one write may, so its echo can go out in parts.
+    frame_done: usize,
     buf: [u8; BUF],
 }
 
@@ -174,6 +187,9 @@ pub extern "C" fn module_new(
         s.session_id = 0;
         s.stream_id = 0;
         s.ticks = 0;
+        s.buf_len = 0;
+        s.buf_off = 0;
+        s.frame_done = 0;
         s.role = ROLE_ECHO;
         // The composer maps a graph's `role:` onto this tag by reading the
         // schema `define_params!` embeds in the artefact. Parsing the TLV by
@@ -207,38 +223,54 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // drains is the transport's backpressure to apply, not a reason for one
         // module to hold the domain.
         for _ in 0..16 {
+            // What is already read goes first; a reply the transport cannot
+            // take yet holds everything behind it.
+            if !handle_frames(s) {
+                return 0;
+            }
+            // Keep a partial trailing frame, at the front, for the read
+            // that completes it.
+            if s.buf_off > 0 {
+                s.buf.copy_within(s.buf_off..s.buf_len, 0);
+                s.buf_len -= s.buf_off;
+                s.buf_off = 0;
+            }
             let poll = (sys.channel_poll)(s.mux_in, 0x01);
             if poll <= 0 || (poll as u32 & 0x01) == 0 {
                 return 0;
             }
-            let n = (sys.channel_read)(s.mux_in, s.buf.as_mut_ptr(), BUF);
-            if n < mux::FRAME_HDR as i32 {
+            let room = BUF - s.buf_len;
+            let n = (sys.channel_read)(s.mux_in, s.buf.as_mut_ptr().add(s.buf_len), room);
+            if n <= 0 {
                 return 0;
             }
-            handle_frames(s, n as usize);
+            s.buf_len += n as usize;
         }
         0
     }
 }
 
-/// Walk every complete TLV in the read buffer.
+/// Walk every complete TLV held in the read buffer. False when a reply could
+/// not be written: the frame stays, to be finished first next time.
 ///
-/// A single read can return several concatenated frames, and dropping the tail
-/// of a batch is the kind of fault a self-test must never have: it would look
-/// like the transport losing a stream.
-unsafe fn handle_frames(s: &mut EchoState, len: usize) {
-    let mut off = 0usize;
-    while off + mux::FRAME_HDR <= len {
+/// A single read can return several concatenated frames, and a frame can end
+/// in the next read. Dropping either tail is the kind of fault a self-test
+/// must never have: it would look like the transport losing a stream.
+unsafe fn handle_frames(s: &mut EchoState) -> bool {
+    while s.buf_off + mux::FRAME_HDR <= s.buf_len {
+        let off = s.buf_off;
         let t = s.buf[off];
         let plen = (s.buf[off + 1] as usize) | ((s.buf[off + 2] as usize) << 8);
         let body = off + mux::FRAME_HDR;
-        if body + plen > len {
-            return; // partial trailing frame — wait for the rest
+        if body + plen > s.buf_len {
+            return true; // partial trailing frame — wait for the rest
         }
-        if t == mux::MSG_MUX_SESSION_OPENED && plen >= mux::SESSION_OPENED_BODY_MIN + 1 {
+        let done = if t == mux::MSG_MUX_SESSION_OPENED && plen >= mux::SESSION_OPENED_BODY_MIN + 1 {
             latch_session(s, body, plen);
+            true
         } else if s.role == ROLE_DRIVE {
             driver_frame(s, t, body, plen);
+            true
         } else if t == mux::MSG_MUX_STREAM_RX && plen >= mux::STREAM_DATA_PREFIX {
             // ONLY on stream bytes. An accepted-stream event shares the
             // `[session][stream]` prefix but its remaining bytes are the
@@ -246,11 +278,19 @@ unsafe fn handle_frames(s: &mut EchoState, len: usize) {
             // stream id — not stream content. Echoing those back put a
             // spurious prefix on the wire ahead of the real reply, which
             // the peer then read as part of the message.
-            ack_bytes(s, body, plen - mux::STREAM_DATA_PREFIX);
-            echo_stream(s, body, plen);
+            echo_stream(s, body, plen)
+        } else if t == mux::MSG_MUX_STREAM_CLOSED && plen >= mux::STREAM_DATA_PREFIX {
+            close_stream(s, body)
+        } else {
+            true
+        };
+        if !done {
+            return false;
         }
-        off = body + plen;
+        s.buf_off = body + plen;
+        s.frame_done = 0;
     }
+    true
 }
 
 /// Record which session the transport announced, and its ALPN.
@@ -300,56 +340,59 @@ unsafe fn ack_bytes(s: &mut EchoState, body: usize, data_len: usize) {
     let _ = (sys.channel_write)(s.mux_out, f.as_ptr(), f.len());
 }
 
-/// Send the payload back on the stream it arrived on, then close that stream.
+/// Send a delivery's bytes back on the stream they arrived on, in writes of
+/// at most `MUX_QUIC_STREAM_SEND_MAX`. True once all of it is written and its
+/// credit returned; false when the transport cannot take the next write yet.
 ///
 /// The `(session_id, stream_id)` prefix is copied from the inbound frame rather
 /// than reconstructed. That is deliberate: the property under test is that the
 /// transport delivers a stream's bytes to the application *with its identity
 /// intact*, and a fixture that rebuilt the ids from its own state could pass
 /// while the transport mixed two streams up.
-unsafe fn echo_stream(s: &mut EchoState, body: usize, plen: usize) {
+unsafe fn echo_stream(s: &mut EchoState, body: usize, plen: usize) -> bool {
     let sys = &*s.syscalls;
     if s.mux_out < 0 {
-        return;
+        return true;
     }
     let data_len = plen - mux::STREAM_DATA_PREFIX;
-
-    // A zero-length delivery is an accept with no bytes yet: nothing to echo,
-    // and closing here would race the peer's first write.
-    if data_len == 0 {
-        return;
+    let data = body + mux::STREAM_DATA_PREFIX;
+    while s.frame_done < data_len {
+        let n = (data_len - s.frame_done).min(mux::MUX_QUIC_STREAM_SEND_MAX);
+        let out_plen = mux::STREAM_DATA_PREFIX + n;
+        let mut out =
+            [0u8; mux::FRAME_HDR + mux::STREAM_DATA_PREFIX + mux::MUX_QUIC_STREAM_SEND_MAX];
+        out[0] = mux::CMD_MUX_STREAM_SEND;
+        out[1] = (out_plen & 0xFF) as u8;
+        out[2] = ((out_plen >> 8) & 0xFF) as u8;
+        out[mux::FRAME_HDR..mux::FRAME_HDR + mux::STREAM_DATA_PREFIX]
+            .copy_from_slice(&s.buf[body..body + mux::STREAM_DATA_PREFIX]);
+        let from = data + s.frame_done;
+        out[mux::FRAME_HDR + mux::STREAM_DATA_PREFIX..mux::FRAME_HDR + out_plen]
+            .copy_from_slice(&s.buf[from..from + n]);
+        if (sys.channel_write)(s.mux_out, out.as_ptr(), mux::FRAME_HDR + out_plen) <= 0 {
+            return false;
+        }
+        s.frame_done += n;
     }
+    ack_bytes(s, body, data_len);
+    true
+}
 
-    let total = mux::FRAME_HDR + plen;
-    if total > BUF {
-        return;
+/// The peer finished its half: finish ours, after everything echoed so far.
+/// False when the transport cannot take the close yet.
+unsafe fn close_stream(s: &mut EchoState, body: usize) -> bool {
+    let sys = &*s.syscalls;
+    if s.mux_out < 0 {
+        return true;
     }
-
-    // Build in place behind the inbound frame: [type][len][session][stream][data]
-    let mut out = [0u8; BUF];
-    out[0] = mux::CMD_MUX_STREAM_SEND;
-    out[1] = (plen & 0xFF) as u8;
-    out[2] = ((plen >> 8) & 0xFF) as u8;
-    core::ptr::copy_nonoverlapping(s.buf.as_ptr().add(body), out.as_mut_ptr().add(3), plen);
-    if (sys.channel_write)(s.mux_out, out.as_ptr(), total) <= 0 {
-        // The transport is not ready. Drop rather than spin: the peer retries,
-        // and a self-test that blocked here would report a transport fault that
-        // is really its own backpressure.
-        return;
-    }
-
-    // Close our half so the stream slot is reclaimed. Payload is the id prefix
-    // alone.
     let mut fin = [0u8; mux::FRAME_HDR + mux::STREAM_DATA_PREFIX];
     fin[0] = mux::CMD_MUX_STREAM_CLOSE;
     fin[1] = mux::STREAM_DATA_PREFIX as u8;
     fin[2] = 0;
-    core::ptr::copy_nonoverlapping(
-        s.buf.as_ptr().add(body),
-        fin.as_mut_ptr().add(3),
-        mux::STREAM_DATA_PREFIX,
-    );
-    let _ = (sys.channel_write)(s.mux_out, fin.as_ptr(), fin.len());
+    fin[mux::FRAME_HDR..].copy_from_slice(&s.buf[body..body + mux::STREAM_DATA_PREFIX]);
+    if (sys.channel_write)(s.mux_out, fin.as_ptr(), fin.len()) <= 0 {
+        return false;
+    }
 
     s.echoed = s.echoed.wrapping_add(1);
     // The readiness signal the suite keys on. Recurring per stream rather than a
@@ -359,6 +402,7 @@ unsafe fn echo_stream(s: &mut EchoState, body: usize, plen: usize) {
     line[..18].copy_from_slice(b"[mux_echo] echoed ");
     let n = fmt_u32_raw(line.as_mut_ptr().add(18), s.echoed);
     dev_log(sys, 3, line.as_ptr(), 18 + n);
+    true
 }
 
 // ── Driver role ────────────────────────────────────────────────────────────

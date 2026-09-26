@@ -3,16 +3,21 @@ version = "1.0.0"
 timer_class = "wall_clock"
 hardware_targets = ["bcm2712"]
 
-# A stable multiplexed-session anchor (`protocol_surfaces.md` §Continuity),
-# and resumable sessions whose tickets are the session state sealed under a
-# vault-held key.
+# The QUIC mux transport itself, a stable multiplexed-session anchor over it
+# (`protocol_surfaces.md` §Continuity), and resumable sessions whose tickets
+# are the session state sealed under a vault-held key.
 #
-# A QUIC anchor that survives its own host's death is driven by the
-# checkpoint / delta / cut-over surface on `cont_in` / `cont_out`. No third
-# capability is declared for it: the continuity gates prove only what these
-# two already claim, plus `session.resume`'s sealed-secret custody, reused
-# for the `quic-continuity` sealing key.
-capabilities = ["transport.anchor.mux", "session.resume"]
+# `transport.mux.quic` and `transport.anchor.mux` are two roles of one
+# connection state: the mux is what migrates natively when the peer changes
+# address (RFC 9000 §9, `continuity` mechanism `native_primitive`), and the
+# anchor is what owns the client-visible transport. A QUIC anchor that
+# survives its own host's death is driven by the checkpoint / delta /
+# cut-over surface on `cont_in` / `cont_out` (mechanism
+# `platform_replicated_state`). No further capability is declared for it:
+# the continuity gates prove only what these already claim, plus
+# `session.resume`'s sealed-secret custody, reused for the
+# `quic-continuity` sealing key.
+capabilities = ["transport.mux.quic", "transport.anchor.mux", "session.resume"]
 
 # `scope = local`: the sealing key is opened per instance from this host's
 # own vault and the ticket carries this boot's incarnation in its AAD, so a

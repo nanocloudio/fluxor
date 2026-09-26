@@ -118,22 +118,22 @@ impl CryptoReassembler {
 
     /// Insert a fragment whose first byte is at relative offset
     /// `rel_off` (= absolute_offset - delivered_offset). Returns the
-    /// number of bytes that newly become contiguous-from-zero (the
-    /// caller feeds those bytes to the driver and shifts the buffer).
-    pub fn insert(&mut self, rel_off: usize, data: &[u8]) -> usize {
+    /// number of bytes contiguous from zero (the caller feeds those bytes
+    /// to the driver and shifts the buffer), and whether the whole
+    /// fragment fitted: one that runs past the hold is kept only up to
+    /// it, and the packet that carried it must not be acknowledged, so
+    /// the peer sends the rest again.
+    pub fn insert(&mut self, rel_off: usize, data: &[u8]) -> (usize, bool) {
         if data.is_empty() {
-            return 0;
+            return (self.contiguous_high, true);
         }
-        if rel_off + data.len() > CRYPTO_HOLD_LEN {
-            // Overrun — peer sent more than our hold can carry. Drop
-            // the excess; if the lost bytes never get retransmitted
-            // the handshake will time out (which is fine — production
-            // deployments would size the hold larger).
-            let n = CRYPTO_HOLD_LEN.saturating_sub(rel_off);
-            self.write_range(rel_off, &data[..n]);
+        let whole = rel_off + data.len() <= CRYPTO_HOLD_LEN;
+        let n = if whole {
+            data.len()
         } else {
-            self.write_range(rel_off, data);
-        }
+            CRYPTO_HOLD_LEN.saturating_sub(rel_off)
+        };
+        self.write_range(rel_off, &data[..n]);
 
         // Recompute the contiguous-from-zero high water mark.
         while self.contiguous_high < CRYPTO_HOLD_LEN {
@@ -144,7 +144,7 @@ impl CryptoReassembler {
             }
             self.contiguous_high += 1;
         }
-        self.contiguous_high
+        (self.contiguous_high, whole)
     }
 
     fn write_range(&mut self, rel_off: usize, data: &[u8]) {
@@ -212,12 +212,52 @@ impl CryptoReassembler {
 // reset state, and the local handle the application addresses it by.
 // ---------------------------------------------------------------------
 
-pub const MAX_UNI_STREAMS: usize = 6;
-/// Three concurrent bidirectional streams per connection. Identical
-/// memory to the arrangement this replaced (a dedicated stream-0 buffer
-/// plus a pool of two) — the difference is that all three are now the
-/// same kind of thing, addressed the same way.
-pub const MAX_BIDI_STREAMS: usize = 3;
+/// Concurrent streams the peer may open, of each kind: the
+/// `initial_max_streams_*` transport parameters, and the credit that
+/// MAX_STREAMS re-grants as each finishes. Six unidirectional streams
+/// hold HTTP/3's three critical streams with room for WebTransport's.
+pub const PEER_UNI_CREDIT: usize = 6;
+pub const PEER_BIDI_CREDIT: usize = 3;
+/// Streams of each kind this endpoint may open itself at once.
+pub const LOCAL_UNI_STREAMS: usize = 3;
+pub const LOCAL_BIDI_STREAMS: usize = 3;
+/// The stream tables: the peer's credit and the local share side by side,
+/// so a stream this endpoint opens never takes a slot the peer was
+/// promised.
+pub const MAX_UNI_STREAMS: usize = PEER_UNI_CREDIT + LOCAL_UNI_STREAMS;
+pub const MAX_BIDI_STREAMS: usize = PEER_BIDI_CREDIT + LOCAL_BIDI_STREAMS;
+
+/// Which of the peer's stream indices have finished, so a late frame for
+/// one is recognised rather than opening it again. Every index below
+/// `base` is finished; `bits` marks finished ones above it. The peer holds
+/// at most its credit open at once, so the unfinished span above `base`
+/// stays far inside the window.
+#[derive(Clone, Copy)]
+pub struct FinishedStreams {
+    pub base: u64,
+    pub bits: u64,
+}
+
+impl FinishedStreams {
+    pub const fn empty() -> Self {
+        Self { base: 0, bits: 0 }
+    }
+
+    pub fn contains(&self, idx: u64) -> bool {
+        idx < self.base || (idx - self.base < 64 && self.bits & (1 << (idx - self.base)) != 0)
+    }
+
+    pub fn insert(&mut self, idx: u64) {
+        if idx < self.base || idx - self.base >= 64 {
+            return;
+        }
+        self.bits |= 1 << (idx - self.base);
+        while self.bits & 1 != 0 {
+            self.bits >>= 1;
+            self.base += 1;
+        }
+    }
+}
 
 /// Per-stream delivery bookkeeping for the mux app surface, shared by
 /// both pool shapes and by the main stream.
@@ -267,6 +307,8 @@ pub struct StreamAbort {
     pub reset_error: u64,
     /// Our RESET_STREAM has been emitted.
     pub reset_emitted: bool,
+    /// A packet carrying our RESET_STREAM has been acknowledged.
+    pub reset_acked: bool,
     /// The application asked us to STOP_SENDING; not yet on the wire.
     pub stop_pending: bool,
     /// Error code to place in our STOP_SENDING.
@@ -287,6 +329,7 @@ impl StreamAbort {
             reset_pending: false,
             reset_error: 0,
             reset_emitted: false,
+            reset_acked: false,
             stop_pending: false,
             stop_error: 0,
             stop_emitted: false,
@@ -306,6 +349,8 @@ pub struct StreamFlow {
     pub send_max_data: u64,
     /// We hit `send_max_data` and owe the peer a STREAM_DATA_BLOCKED.
     pub send_blocked_pending: bool,
+    /// The limit the last STREAM_DATA_BLOCKED reported.
+    pub blocked_at: u64,
     /// Highest offset we have allowed the peer to write.
     pub recv_max_data: u64,
     /// Bytes the application has acknowledged consuming on this stream
@@ -325,6 +370,7 @@ impl StreamFlow {
             // interoperate with advertises at least.
             send_max_data: DEFAULT_PEER_STREAM_WINDOW,
             send_blocked_pending: false,
+            blocked_at: 0,
             recv_max_data: initial_recv,
             recv_consumed: 0,
             recv_max_data_tx_pending: false,
@@ -345,6 +391,176 @@ pub const LOCAL_CONN_WINDOW: u64 = 1 << 20;
 /// this fraction of it — one frame per window rather than one per read.
 pub const FLOW_UPDATE_DIVISOR: u64 = 2;
 
+/// Send-buffer size of a bidirectional stream, and of the transparent
+/// stream. The buffer holds every byte from the acknowledged prefix onward,
+/// so it bounds how much of one stream can be in flight: a few packets per
+/// round trip, while a lost packet's bytes are still here to send again.
+pub const BIDI_SEND_BUF: usize = 4096;
+/// Send-buffer size of a locally-opened unidirectional stream.
+pub const UNI_SEND_BUF: usize = 256;
+
+/// The send half of a stream (RFC 9000 §3.1).
+///
+/// Bytes stay in `buf` until the peer acknowledges them, because a packet
+/// that carried them may be lost and its STREAM frame must then be sent
+/// again (RFC 9000 §13.3). `buf[0]` is the byte at stream offset `base`:
+/// everything below `base` is acknowledged. From `base` the buffer holds
+/// bytes sent but unacknowledged (up to `sent`) and then bytes not yet
+/// sent (up to `end()`).
+///
+/// A lost range is repaired by lowering `rtx` to its start: the bytes from
+/// `rtx` up to `sent` are sent again before any new ones. Some of them may
+/// have arrived in another packet; the peer places STREAM data by offset,
+/// so a repeat is harmless.
+#[derive(Clone, Copy)]
+pub struct SendHalf<const N: usize> {
+    /// Stream offset of `buf[0]`; every byte below it is acknowledged.
+    pub base: u64,
+    pub buf: [u8; N],
+    /// Bytes held from `base`: sent-unacknowledged, then unsent.
+    pub len: usize,
+    /// One past the highest offset sent.
+    pub sent: u64,
+    /// Next offset to send again. Equal to `sent` when nothing is owed.
+    pub rtx: u64,
+    /// The application closed the send half; the final size is `end()`.
+    pub fin: bool,
+    /// A FIN is carried by a packet not known to be lost.
+    pub fin_sent: bool,
+    /// A packet carrying the FIN has been acknowledged.
+    pub fin_acked: bool,
+}
+
+impl<const N: usize> SendHalf<N> {
+    pub const fn empty() -> Self {
+        Self {
+            base: 0,
+            buf: [0; N],
+            len: 0,
+            sent: 0,
+            rtx: 0,
+            fin: false,
+            fin_sent: false,
+            fin_acked: false,
+        }
+    }
+
+    /// One past the last byte the application has written.
+    pub fn end(&self) -> u64 {
+        self.base + self.len as u64
+    }
+
+    /// Room for more application bytes.
+    pub fn space(&self) -> usize {
+        N - self.len
+    }
+
+    /// Append application bytes. All-or-nothing; refused once closed.
+    pub fn stage(&mut self, data: &[u8]) -> bool {
+        if self.fin || data.len() > self.space() {
+            return false;
+        }
+        self.buf[self.len..self.len + data.len()].copy_from_slice(data);
+        self.len += data.len();
+        true
+    }
+
+    /// Whether anything is owed to the wire: a repair, unsent bytes, or
+    /// the FIN.
+    pub fn has_pending(&self) -> bool {
+        self.rtx < self.sent || self.sent < self.end() || (self.fin && !self.fin_sent)
+    }
+
+    /// Whether every byte and the FIN have been acknowledged.
+    pub fn done(&self) -> bool {
+        self.fin && self.fin_acked && self.base == self.end()
+    }
+
+    /// Whether anything sent is still unacknowledged.
+    pub fn unacked(&self) -> bool {
+        self.base < self.sent || (self.fin_sent && !self.fin_acked)
+    }
+
+    /// The next STREAM frame to send, at most `max` bytes: a repair first,
+    /// then new bytes, then a bare FIN. Returns `(offset, bytes, fin)`.
+    pub fn next_chunk(&self, max: usize) -> Option<(u64, &[u8], bool)> {
+        let (off, limit) = if self.rtx < self.sent {
+            (self.rtx, self.sent)
+        } else if self.sent < self.end() {
+            (self.sent, self.end())
+        } else if self.fin && !self.fin_sent {
+            return Some((self.end(), &[], true));
+        } else {
+            return None;
+        };
+        let n = ((limit - off) as usize).min(max);
+        let start = (off - self.base) as usize;
+        let fin = self.fin && off + n as u64 == self.end();
+        Some((off, &self.buf[start..start + n], fin))
+    }
+
+    /// A STREAM frame for `[off, off + n)` went out.
+    pub fn on_sent(&mut self, off: u64, n: usize, fin: bool) {
+        let stop = off + n as u64;
+        if off < self.sent {
+            // A repair: the owed range now starts past it.
+            if self.rtx >= off && self.rtx < stop {
+                self.rtx = stop.min(self.sent);
+            }
+        } else {
+            self.sent = self.sent.max(stop);
+            self.rtx = self.rtx.max(self.sent);
+        }
+        if fin {
+            self.fin_sent = true;
+        }
+    }
+
+    /// A packet that carried `[off, off + n)` (and the FIN when `fin`) was
+    /// declared lost: owe the range again.
+    pub fn on_lost(&mut self, off: u64, n: usize, fin: bool) {
+        if off + (n as u64) > self.base && off < self.sent {
+            self.rtx = self.rtx.min(off.max(self.base));
+        }
+        if fin && !self.fin_acked {
+            self.fin_sent = false;
+        }
+    }
+
+    /// Owe everything unacknowledged again: the probe a PTO sends (RFC
+    /// 9002 §6.2.4), and what a standby that took over a connection owes
+    /// the peer.
+    pub fn requeue_unacked(&mut self) {
+        self.rtx = self.base;
+        if !self.fin_acked {
+            self.fin_sent = false;
+        }
+    }
+
+    /// The peer has acknowledged every byte below `acked`: drop them.
+    pub fn release_to(&mut self, acked: u64) {
+        let acked = acked.min(self.sent);
+        if acked <= self.base {
+            return;
+        }
+        let d = (acked - self.base) as usize;
+        self.buf.copy_within(d..self.len, 0);
+        self.len -= d;
+        self.base = acked;
+        self.rtx = self.rtx.max(acked);
+    }
+
+    /// Abandon the send half for a RESET_STREAM (RFC 9000 §19.4): nothing
+    /// more is sent, and the final size is what was already sent.
+    pub fn abandon(&mut self) {
+        self.base = self.sent;
+        self.len = 0;
+        self.rtx = self.sent;
+        self.fin = false;
+        self.fin_sent = false;
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct UniStream {
     pub stream_id: u64,
@@ -354,11 +570,7 @@ pub struct UniStream {
     /// the send half is unused.
     pub locally_initiated: bool,
 
-    pub send_off: u64,
-    pub send_buf: [u8; 256],
-    pub send_buf_len: usize,
-    pub send_fin_pending: bool,
-    pub send_fin_emitted: bool,
+    pub send: SendHalf<UNI_SEND_BUF>,
 
     pub recv_off: u64,
     pub recv_buf: [u8; 256],
@@ -376,11 +588,7 @@ impl UniStream {
             stream_id: 0,
             allocated: false,
             locally_initiated: false,
-            send_off: 0,
-            send_buf: [0; 256],
-            send_buf_len: 0,
-            send_fin_pending: false,
-            send_fin_emitted: false,
+            send: SendHalf::empty(),
             recv_off: 0,
             recv_buf: [0; 256],
             recv_buf_len: 0,
@@ -403,11 +611,7 @@ pub struct BidiStream {
     /// holding a peer-initiated stream.
     pub locally_initiated: bool,
 
-    pub send_off: u64,
-    pub send_buf: [u8; 1200],
-    pub send_buf_len: usize,
-    pub send_fin_pending: bool,
-    pub send_fin_emitted: bool,
+    pub send: SendHalf<BIDI_SEND_BUF>,
 
     pub recv_off: u64,
     pub recv_buf: [u8; 1500],
@@ -425,11 +629,7 @@ impl BidiStream {
             stream_id: 0,
             allocated: false,
             locally_initiated: false,
-            send_off: 0,
-            send_buf: [0; 1200],
-            send_buf_len: 0,
-            send_fin_pending: false,
-            send_fin_emitted: false,
+            send: SendHalf::empty(),
             recv_off: 0,
             recv_buf: [0; 1500],
             recv_buf_len: 0,
@@ -470,6 +670,123 @@ impl SentPacket {
 
 pub const SENT_PACKET_RING: usize = 16;
 
+/// Which stream a [`SentChunk`] belongs to: none, the transparent stream,
+/// a bidirectional slot, or a unidirectional slot.
+pub const CHUNK_NONE: u8 = 0;
+pub const CHUNK_MAIN: u8 = 1;
+/// A 1-RTT CRYPTO frame (a NewSessionTicket, or a key update's handshake
+/// message), repaired from the space's `crypto_send` exactly like stream
+/// data.
+pub const CHUNK_CRYPTO: u8 = 2;
+pub const CHUNK_BIDI: u8 = 3;
+pub const CHUNK_UNI: u8 = CHUNK_BIDI + MAX_BIDI_STREAMS as u8;
+/// At most one frame per stream, and one CRYPTO frame, in a packet.
+pub const CHUNKS_PER_PACKET: usize = 2 + MAX_BIDI_STREAMS + MAX_UNI_STREAMS;
+
+/// Index of a packet-number space in the per-space arrays.
+pub const fn space_index(level: EncLevel) -> usize {
+    match level {
+        EncLevel::Initial => 0,
+        EncLevel::Handshake => 1,
+        EncLevel::OneRtt => 2,
+    }
+}
+
+/// The CRYPTO range an Initial or Handshake packet carried, by ring slot:
+/// what is owed again if the packet is lost. `len == 0` carried none.
+#[derive(Clone, Copy)]
+pub struct CryptoChunk {
+    pub off: u64,
+    pub len: u16,
+}
+
+impl CryptoChunk {
+    pub const fn empty() -> Self {
+        Self { off: 0, len: 0 }
+    }
+}
+
+/// One STREAM or CRYPTO frame a 1-RTT packet carried.
+#[derive(Clone, Copy)]
+pub struct SentChunk {
+    /// `CHUNK_*`, plus the slot index for a pool stream.
+    pub stream: u8,
+    pub fin: bool,
+    pub len: u16,
+    pub off: u64,
+    /// The stream the slot held when the frame went out; a slot reused
+    /// since then is not the stream this frame belongs to.
+    pub stream_id: u64,
+}
+
+impl SentChunk {
+    pub const fn empty() -> Self {
+        Self {
+            stream: CHUNK_NONE,
+            fin: false,
+            len: 0,
+            off: 0,
+            stream_id: 0,
+        }
+    }
+}
+
+/// Control frames a 1-RTT packet carried, as bits: sent again with their
+/// current values when the packet is lost (RFC 9000 §13.3).
+pub const CTRL_HANDSHAKE_DONE: u128 = 1 << 0;
+pub const CTRL_MAX_STREAMS_BIDI: u128 = 1 << 1;
+pub const CTRL_MAX_STREAMS_UNI: u128 = 1 << 2;
+pub const CTRL_MAX_DATA: u128 = 1 << 3;
+pub const CTRL_DATA_BLOCKED: u128 = 1 << 4;
+pub const CTRL_STREAMS_BLOCKED_BIDI: u128 = 1 << 5;
+pub const CTRL_STREAMS_BLOCKED_UNI: u128 = 1 << 6;
+pub const CTRL_NEW_CID: u128 = 1 << 7;
+/// Per-slot bits: RESET_STREAM, STOP_SENDING, MAX_STREAM_DATA and
+/// STREAM_DATA_BLOCKED for each bidirectional slot, then each
+/// unidirectional slot.
+pub const CTRL_BIDI_RESET: u32 = 16;
+pub const CTRL_BIDI_STOP: u32 = CTRL_BIDI_RESET + MAX_BIDI_STREAMS as u32;
+pub const CTRL_BIDI_MSD: u32 = CTRL_BIDI_STOP + MAX_BIDI_STREAMS as u32;
+pub const CTRL_BIDI_BLOCKED: u32 = CTRL_BIDI_MSD + MAX_BIDI_STREAMS as u32;
+pub const CTRL_UNI_RESET: u32 = CTRL_BIDI_BLOCKED + MAX_BIDI_STREAMS as u32;
+pub const CTRL_UNI_STOP: u32 = CTRL_UNI_RESET + MAX_UNI_STREAMS as u32;
+pub const CTRL_UNI_MSD: u32 = CTRL_UNI_STOP + MAX_UNI_STREAMS as u32;
+pub const CTRL_UNI_BLOCKED: u32 = CTRL_UNI_MSD + MAX_UNI_STREAMS as u32;
+const _: () = assert!(CTRL_UNI_BLOCKED + MAX_UNI_STREAMS as u32 <= 128);
+
+/// Peer connection IDs awaiting RETIRE_CONNECTION_ID. We hold at most two
+/// of the peer's IDs (`active_connection_id_limit` = 2) plus the one the
+/// previous path still uses, so no more than three can be owed at once.
+pub const RETIRE_QUEUE: usize = 4;
+
+/// QUIC transport error codes this endpoint closes with (RFC 9000 §20.1).
+pub const ERR_STREAM_LIMIT: u64 = 0x04;
+pub const ERR_STREAM_STATE: u64 = 0x05;
+pub const ERR_CONNECTION_ID_LIMIT: u64 = 0x09;
+pub const ERR_PROTOCOL_VIOLATION: u64 = 0x0a;
+
+/// What a tracked 1-RTT packet carried that has to be sent again if it is
+/// lost. Held beside its `SentPacket`, at the same ring index.
+#[derive(Clone, Copy)]
+pub struct SentFrames {
+    pub chunks: [SentChunk; CHUNKS_PER_PACKET],
+    pub ctrl: u128,
+    /// Peer connection IDs this packet retired.
+    pub retired: [u64; RETIRE_QUEUE],
+    pub retired_n: u8,
+}
+
+impl SentFrames {
+    pub const fn empty() -> Self {
+        Self {
+            chunks: [SentChunk::empty(); CHUNKS_PER_PACKET],
+            ctrl: 0,
+            retired: [0; RETIRE_QUEUE],
+            retired_n: 0,
+        }
+    }
+}
+
 /// Per-EncLevel packet number space + crypto state.
 pub struct PnSpace {
     pub read_keys: QuicKeys,
@@ -478,7 +795,9 @@ pub struct PnSpace {
     pub next_send_pn: u64,
     pub largest_recv_pn: u64,
     pub crypto_recv_offset: u64,
-    pub crypto_send_offset: u64,
+    /// This space's keys are gone (RFC 9001 §4.9): nothing is sent in it,
+    /// and a packet for it is dropped unread.
+    pub discarded: bool,
     pub ack_tracker: AckTracker,
     pub ack_pending: bool,
     pub reassembler: CryptoReassembler,
@@ -549,7 +868,7 @@ impl PnSpace {
             next_send_pn: 0,
             largest_recv_pn: 0,
             crypto_recv_offset: 0,
-            crypto_send_offset: 0,
+            discarded: false,
             ack_tracker: AckTracker::new(),
             ack_pending: false,
             reassembler: CryptoReassembler::new(),
@@ -576,14 +895,14 @@ impl PnSpace {
         }
     }
 
-    /// Place a freshly-sent packet into a free slot. Returns true on
-    /// success. Returns false when every slot is still live (meaning
+    /// Place a freshly-sent packet into a free slot. Returns the slot on
+    /// success, or `None` when every slot is still live (meaning
     /// every previously-tracked packet is unacked) — caller must
     /// treat this as a transient back-pressure signal and retry once
     /// ACKs free a slot. Never overwriting a live entry preserves
     /// `bytes_in_flight` accounting: an inbound ACK can always find
     /// the original entry to credit back.
-    pub fn record_sent(&mut self, pkt: SentPacket) -> bool {
+    pub fn record_sent(&mut self, pkt: SentPacket) -> Option<usize> {
         // Prefer the slot at sent_head if it's free, otherwise sweep
         // the whole ring. Sweeping is O(SENT_PACKET_RING) which is
         // fine for a 16-slot ring.
@@ -600,13 +919,13 @@ impl PnSpace {
                 k += 1;
             }
             if found == usize::MAX {
-                return false;
+                return None;
             }
             idx = found;
         }
         self.sent_packets[idx] = pkt;
         self.sent_head = (idx + 1) % SENT_PACKET_RING;
-        true
+        Some(idx)
     }
 
     /// Returns true iff the ring has at least one slot that's not
@@ -789,16 +1108,19 @@ pub struct QuicConnection {
     // revision supports. The client opens it with stream_id=0 (per
     // RFC 9000 §2.1: client-initiated bidi); the server replies on
     // the same id. STREAM frames carry app payload byte-for-byte.
-    /// Highest offset the application has produced for outbound on this
-    /// stream. Each outbound STREAM frame ships
-    /// data[stream_send_off..stream_send_off+n] and advances the offset.
-    pub stream_send_off: u64,
-    /// Pending bytes from `clear_in` waiting to be wrapped in STREAM
-    /// frames. Sized to fit one MTU's worth of unframed data.
-    pub stream_send_buf: [u8; 1200],
-    pub stream_send_buf_len: usize,
-    /// Whether the local app has signalled end-of-stream (clear_in closed).
-    pub stream_send_fin: bool,
+    /// Bytes from `clear_in` on their way to the peer, held until it
+    /// acknowledges them. `fin` is set when the application closes.
+    pub stream_send: SendHalf<BIDI_SEND_BUF>,
+    /// CRYPTO bytes of each packet-number space (`space_index`), moved out
+    /// of the handshake driver so they are held until acknowledged and a
+    /// lost range is sent again in a new packet (RFC 9000 §13.3) — never
+    /// by repeating a packet number.
+    pub crypto_send: [SendHalf<QUIC_CRYPTO_BUF>; 3],
+    /// What each tracked Initial / Handshake packet carried, by ring slot.
+    pub hs_crypto_frames: [[CryptoChunk; SENT_PACKET_RING]; 2],
+    /// A PING is owed in the Initial / Handshake space, for a probe with
+    /// nothing else to carry.
+    pub hs_ping_pending: [bool; 2],
 
     /// Highest contiguous offset received from the peer; bytes up to
     /// this point have either been forwarded to clear_out or are
@@ -887,11 +1209,11 @@ pub struct QuicConnection {
     /// Counter for self-allocated unidirectional stream ids. Server
     /// uni = 3, 7, 11, ...; client uni = 2, 6, 10, ... — both
     /// increment by 4. We track the next index to allocate.
-    pub next_uni_idx: u8,
+    pub next_uni_idx: u64,
     /// Sequence counter for our own bidi stream allocations. First local
     /// bidi = the main stream; subsequent = 4, 8, ... (client) or
     /// 5, 9, ... (server).
-    pub next_bidi_idx: u8,
+    pub next_bidi_idx: u64,
     /// Monotonic allocator for the opaque per-stream app handles the mux
     /// contract addresses streams by. Starts at 1 — 0 is never a live
     /// handle, so a zeroed field is unambiguously "unassigned".
@@ -1010,13 +1332,108 @@ pub struct QuicConnection {
     /// the wrong path.
     pub recv_ip: [u8; 4],
     pub recv_port: u16,
+    /// Size of the datagram currently being dispatched, counted toward the
+    /// anti-amplification allowance of an unvalidated address (RFC 9000
+    /// §8), and whether it was addressed to our spare connection ID.
+    pub recv_len: u16,
+    /// Sequence number of our connection ID the datagram was addressed to.
+    pub recv_dcid_seq: u64,
+    /// The packet being processed carried STREAM data this endpoint could
+    /// not take whole — ahead of a gap, past a full buffer, or for a stream
+    /// with no slot. It is not acknowledged, so the peer sends it again: a
+    /// packet is acknowledged only once everything in it is processed
+    /// (RFC 9000 §13.1).
+    pub rx_unaccepted: bool,
+    /// Sequence number of our connection ID the peer used on the active
+    /// path. A change with the address marks an intentional migration,
+    /// which moves our own sending to a fresh peer ID (RFC 9000 §9.5).
+    pub peer_dcid_seq: u64,
+    /// `peer` has been validated. False from the moment the peer migrates
+    /// until its new address answers a PATH_CHALLENGE; until then sending
+    /// to it is bounded by three times what it has sent (RFC 9000 §8,
+    /// §9.3.1).
+    pub peer_validated: bool,
+    /// The last validated peer address: where a failed validation returns
+    /// the connection (RFC 9000 §9.3.2).
+    pub last_valid_peer: PeerAddr,
+    /// Bytes received from and sent to `peer` while it is unvalidated.
+    pub amp_rx: u64,
+    pub amp_tx: u64,
+    /// The peer's address changed IP, not only port: on validation the
+    /// RTT estimator restarts too (RFC 9000 §9.4).
+    pub path_reset_rtt: bool,
+    /// The outstanding PATH_CHALLENGE went out in a datagram of at least
+    /// 1200 bytes. One that could not be expanded validates the address
+    /// but not the path MTU, so a second, expanded one follows (§8.2.1).
+    pub challenge_expanded: bool,
+    /// The next PATH_CHALLENGE needs fresh unpredictable bytes (§8.2.1).
+    pub challenge_refresh: bool,
+    /// The previously active path, challenged when the peer migrates so a
+    /// forwarded packet cannot move the connection unnoticed (§9.3.3).
+    pub old_path_validating: bool,
+    pub old_path_challenge_data: [u8; 8],
+    pub old_path: PeerAddr,
+    pub old_path_challenge_tx_pending: bool,
+    /// The peer connection ID last used on the previous path. When the
+    /// peer moved onto a new ID of ours, we moved onto a new one of its,
+    /// and this one still addresses the previous path until its
+    /// validation ends; it is retired then (RFC 9000 §9.5).
+    pub old_path_cid: [u8; MAX_CID_LEN],
+    pub old_path_cid_len: u8,
+    pub old_path_cid_seq: u64,
+    pub old_path_cid_retire: bool,
+    /// Size of the datagram that carried the PATH_CHALLENGE being answered,
+    /// which bounds how far the response may be expanded (§8.2.2).
+    pub path_response_rx_len: u16,
+
+    // ── Peer connection IDs (RFC 9000 §5.1) ─────────────────────────
+    /// Sequence number of `peer_cid`.
+    pub peer_cid_seq: u64,
+    /// One unused connection ID the peer issued with NEW_CONNECTION_ID,
+    /// for the next path we send on.
+    pub spare_peer_cid: [u8; MAX_CID_LEN],
+    pub spare_peer_cid_len: u8,
+    pub spare_peer_cid_seq: u64,
+    pub spare_peer_reset_token: [u8; 16],
+    /// Peer IDs we stopped using, each owed a RETIRE_CONNECTION_ID.
+    pub retire_queue: [u64; RETIRE_QUEUE],
+    pub retire_len: u8,
+    /// The peer migrated onto a new connection ID of ours and we hold no
+    /// unused ID of its: nothing can be sent on the new path until it
+    /// issues one (RFC 9000 §9.3).
+    pub peer_cid_starved: bool,
 
     // ── Stream-count flow control (RFC 9000 §4.6) ──────────────────
     /// Cumulative bidi-stream allowance granted to the peer. Starts at the
     /// `initial_max_streams_bidi` transport parameter and rises as streams
     /// are reclaimed, so a connection is not limited to its initial
     /// allowance for life.
+    /// Consecutive 1-RTT probe timeouts without an acknowledgement; each
+    /// doubles the next timeout (RFC 9002 §6.2.1).
+    pub pto_count: u8,
+    /// Probe packets still owed after a timeout. They are sent even when
+    /// congestion control would hold them (RFC 9002 §6.2.4).
+    pub pto_probes: u8,
+    /// A PING is owed so a probe elicits an acknowledgement when there is
+    /// nothing else to send.
+    pub ping_pending: bool,
+    /// The limits the last DATA_BLOCKED / STREAMS_BLOCKED frames reported.
+    pub data_blocked_at: u64,
+    pub streams_blocked_bidi_at: u64,
+    pub streams_blocked_uni_at: u64,
+    /// Sequence number of `our_cid`, and the next one this endpoint issues.
+    pub our_cid_seq: u64,
+    pub next_cid_seq: u64,
+    /// Transport error the connection closes with once `Errored`.
+    pub close_error: u64,
+    /// What each tracked 1-RTT packet carried, by `one_rtt.sent_packets`
+    /// index, so loss requeues it and acknowledgement releases it.
+    pub one_rtt_frames: [SentFrames; SENT_PACKET_RING],
+
     pub max_streams_bidi_granted: u64,
+    /// The peer's streams, by index, that have finished.
+    pub peer_bidi_finished: FinishedStreams,
+    pub peer_uni_finished: FinishedStreams,
     /// A MAX_STREAMS (bidi) frame is owed to the peer.
     pub max_streams_tx_pending: bool,
     /// Same, for unidirectional streams. Without this a peer that opens
@@ -1196,6 +1613,398 @@ impl Default for QuicConnection {
 }
 
 impl QuicConnection {
+    /// A tracked 1-RTT packet was declared lost: owe again every STREAM
+    /// range and control frame it carried (RFC 9000 §13.3). A range whose
+    /// slot now holds another stream is dropped with it.
+    pub fn on_one_rtt_lost(&mut self, slot: usize) {
+        let frames = self.one_rtt_frames[slot];
+        self.one_rtt_frames[slot] = SentFrames::empty();
+        let mut i = 0;
+        while i < CHUNKS_PER_PACKET {
+            let c = frames.chunks[i];
+            i += 1;
+            match c.stream {
+                CHUNK_NONE => {}
+                CHUNK_MAIN => self.stream_send.on_lost(c.off, c.len as usize, c.fin),
+                CHUNK_CRYPTO => self.crypto_send[2].on_lost(c.off, c.len as usize, false),
+                k if k < CHUNK_UNI => {
+                    let st = &mut self.bidi_streams[(k - CHUNK_BIDI) as usize];
+                    if st.allocated && st.stream_id == c.stream_id {
+                        st.send.on_lost(c.off, c.len as usize, c.fin);
+                    }
+                }
+                k => {
+                    let st = &mut self.uni_streams[(k - CHUNK_UNI) as usize];
+                    if st.allocated && st.stream_id == c.stream_id {
+                        st.send.on_lost(c.off, c.len as usize, c.fin);
+                    }
+                }
+            }
+        }
+        self.requeue_ctrl(frames.ctrl);
+        let mut r = 0;
+        while r < frames.retired_n as usize {
+            self.queue_retire(frames.retired[r]);
+            r += 1;
+        }
+    }
+
+    /// A tracked 1-RTT packet was acknowledged.
+    pub fn on_one_rtt_acked(&mut self, slot: usize) {
+        let frames = self.one_rtt_frames[slot];
+        self.one_rtt_frames[slot] = SentFrames::empty();
+        let mut i = 0;
+        while i < CHUNKS_PER_PACKET {
+            let c = frames.chunks[i];
+            i += 1;
+            if !c.fin {
+                continue;
+            }
+            match c.stream {
+                CHUNK_NONE | CHUNK_CRYPTO => {}
+                CHUNK_MAIN => self.stream_send.fin_acked = true,
+                k if k < CHUNK_UNI => {
+                    let st = &mut self.bidi_streams[(k - CHUNK_BIDI) as usize];
+                    if st.allocated && st.stream_id == c.stream_id {
+                        st.send.fin_acked = true;
+                    }
+                }
+                k => {
+                    let st = &mut self.uni_streams[(k - CHUNK_UNI) as usize];
+                    if st.allocated && st.stream_id == c.stream_id {
+                        st.send.fin_acked = true;
+                    }
+                }
+            }
+        }
+        let mut k = 0;
+        while k < MAX_BIDI_STREAMS {
+            if frames.ctrl & (1u128 << (CTRL_BIDI_RESET + k as u32)) != 0 {
+                let a = &mut self.bidi_streams[k].abort;
+                a.reset_acked = a.reset_emitted;
+            }
+            k += 1;
+        }
+        let mut k = 0;
+        while k < MAX_UNI_STREAMS {
+            if frames.ctrl & (1u128 << (CTRL_UNI_RESET + k as u32)) != 0 {
+                let a = &mut self.uni_streams[k].abort;
+                a.reset_acked = a.reset_emitted;
+            }
+            k += 1;
+        }
+    }
+
+    /// Queue again every control frame named in `ctrl`, carrying its
+    /// current value. A per-stream frame is requeued only while its slot
+    /// still holds the stream it was sent for: a reused slot starts with
+    /// fresh abort state, so `*_emitted` is the test.
+    fn requeue_ctrl(&mut self, ctrl: u128) {
+        let bit = |b: u32| ctrl & (1u128 << b) != 0;
+        if ctrl & CTRL_HANDSHAKE_DONE != 0 {
+            self.pending_handshake_done = true;
+        }
+        if ctrl & CTRL_MAX_STREAMS_BIDI != 0 {
+            self.max_streams_tx_pending = true;
+        }
+        if ctrl & CTRL_MAX_STREAMS_UNI != 0 {
+            self.max_streams_uni_tx_pending = true;
+        }
+        if ctrl & CTRL_MAX_DATA != 0 {
+            self.max_data_tx_pending = true;
+        }
+        // A BLOCKED frame is sent again only while the limit it reported
+        // still stands (RFC 9000 §13.3).
+        if ctrl & CTRL_DATA_BLOCKED != 0 && self.send_max_data == self.data_blocked_at {
+            self.data_blocked_pending = true;
+        }
+        if ctrl & CTRL_STREAMS_BLOCKED_BIDI != 0
+            && self.peer_max_streams_bidi == self.streams_blocked_bidi_at
+        {
+            self.streams_blocked_bidi_pending = true;
+        }
+        if ctrl & CTRL_STREAMS_BLOCKED_UNI != 0
+            && self.peer_max_streams_uni == self.streams_blocked_uni_at
+        {
+            self.streams_blocked_uni_pending = true;
+        }
+        if ctrl & CTRL_NEW_CID != 0 && self.alt_cid_len > 0 {
+            self.new_cid_tx_pending = true;
+        }
+
+        let mut k = 0;
+        while k < MAX_BIDI_STREAMS {
+            let st = &mut self.bidi_streams[k];
+            if st.allocated {
+                if bit(CTRL_BIDI_RESET + k as u32) && st.abort.reset_emitted {
+                    st.abort.reset_emitted = false;
+                    st.abort.reset_pending = true;
+                }
+                if bit(CTRL_BIDI_STOP + k as u32) && st.abort.stop_emitted {
+                    st.abort.stop_emitted = false;
+                    st.abort.stop_pending = true;
+                }
+                if bit(CTRL_BIDI_MSD + k as u32) {
+                    st.flow.recv_max_data_tx_pending = true;
+                }
+                if bit(CTRL_BIDI_BLOCKED + k as u32) && st.flow.send_max_data == st.flow.blocked_at
+                {
+                    st.flow.send_blocked_pending = true;
+                }
+            }
+            k += 1;
+        }
+        let mut k = 0;
+        while k < MAX_UNI_STREAMS {
+            let st = &mut self.uni_streams[k];
+            if st.allocated {
+                if bit(CTRL_UNI_RESET + k as u32) && st.abort.reset_emitted {
+                    st.abort.reset_emitted = false;
+                    st.abort.reset_pending = true;
+                }
+                if bit(CTRL_UNI_STOP + k as u32) && st.abort.stop_emitted {
+                    st.abort.stop_emitted = false;
+                    st.abort.stop_pending = true;
+                }
+                if bit(CTRL_UNI_MSD + k as u32) {
+                    st.flow.recv_max_data_tx_pending = true;
+                }
+                if bit(CTRL_UNI_BLOCKED + k as u32) && st.flow.send_max_data == st.flow.blocked_at {
+                    st.flow.send_blocked_pending = true;
+                }
+            }
+            k += 1;
+        }
+    }
+
+    /// Drop every byte the peer has acknowledged from each send buffer. A
+    /// stream's acknowledged prefix ends at the lowest offset still owed:
+    /// the repair cursor, or the start of any range a live packet carries.
+    pub fn release_acked_streams(&mut self) {
+        let lowest_live = |conn: &QuicConnection, stream: u8, id: u64| -> Option<u64> {
+            let mut low: Option<u64> = None;
+            let mut p = 0;
+            while p < SENT_PACKET_RING {
+                if conn.one_rtt.sent_packets[p].live {
+                    let mut i = 0;
+                    while i < CHUNKS_PER_PACKET {
+                        let c = conn.one_rtt_frames[p].chunks[i];
+                        if c.stream == stream && c.stream_id == id && c.len > 0 {
+                            low = Some(low.map_or(c.off, |l: u64| l.min(c.off)));
+                        }
+                        i += 1;
+                    }
+                }
+                p += 1;
+            }
+            low
+        };
+        let prefix = |rtx: u64, live: Option<u64>| live.map_or(rtx, |l| l.min(rtx));
+        let main = prefix(self.stream_send.rtx, lowest_live(self, CHUNK_MAIN, 0));
+        self.stream_send.release_to(main);
+        let crypto = prefix(self.crypto_send[2].rtx, lowest_live(self, CHUNK_CRYPTO, 0));
+        self.crypto_send[2].release_to(crypto);
+        let mut k = 0;
+        while k < MAX_BIDI_STREAMS {
+            if self.bidi_streams[k].allocated {
+                let id = self.bidi_streams[k].stream_id;
+                let low = lowest_live(self, CHUNK_BIDI + k as u8, id);
+                let acked = prefix(self.bidi_streams[k].send.rtx, low);
+                self.bidi_streams[k].send.release_to(acked);
+            }
+            k += 1;
+        }
+        let mut k = 0;
+        while k < MAX_UNI_STREAMS {
+            if self.uni_streams[k].allocated {
+                let id = self.uni_streams[k].stream_id;
+                let low = lowest_live(self, CHUNK_UNI + k as u8, id);
+                let acked = prefix(self.uni_streams[k].send.rtx, low);
+                self.uni_streams[k].send.release_to(acked);
+            }
+            k += 1;
+        }
+    }
+
+    /// Whether packets can be sent and received in `level`'s space.
+    pub fn space_usable(&self, level: EncLevel) -> bool {
+        let space = match level {
+            EncLevel::Initial => &self.initial,
+            EncLevel::Handshake => &self.handshake,
+            EncLevel::OneRtt => &self.one_rtt,
+        };
+        space.keys_set && !space.discarded
+    }
+
+    /// An Initial or Handshake packet was declared lost: its CRYPTO range
+    /// is owed again.
+    pub fn on_hs_lost(&mut self, level: EncLevel, slot: usize) {
+        let i = space_index(level);
+        let c = self.hs_crypto_frames[i][slot];
+        self.hs_crypto_frames[i][slot] = CryptoChunk::empty();
+        if c.len > 0 {
+            self.crypto_send[i].on_lost(c.off, c.len as usize, false);
+        }
+    }
+
+    /// Drop the CRYPTO bytes of an Initial or Handshake space that the peer
+    /// has acknowledged: everything below the lowest range still owed or in
+    /// a live packet.
+    pub fn release_hs_crypto(&mut self, level: EncLevel) {
+        let i = space_index(level);
+        let space = match level {
+            EncLevel::Initial => &self.initial,
+            _ => &self.handshake,
+        };
+        let mut acked = self.crypto_send[i].rtx;
+        let mut p = 0;
+        while p < SENT_PACKET_RING {
+            let c = self.hs_crypto_frames[i][p];
+            if space.sent_packets[p].live && c.len > 0 {
+                acked = acked.min(c.off);
+            }
+            p += 1;
+        }
+        self.crypto_send[i].release_to(acked);
+    }
+
+    /// Discard a space's keys (RFC 9001 §4.9): its packets in flight no
+    /// longer count toward congestion control (RFC 9002 §6.4), nothing more
+    /// is sent in it, and what it still held is dropped.
+    pub fn discard_space(&mut self, level: EncLevel) {
+        let space = match level {
+            EncLevel::Initial => &mut self.initial,
+            EncLevel::Handshake => &mut self.handshake,
+            EncLevel::OneRtt => return,
+        };
+        if space.discarded {
+            return;
+        }
+        let mut in_flight = 0u64;
+        let mut p = 0;
+        while p < SENT_PACKET_RING {
+            if space.sent_packets[p].live && space.sent_packets[p].in_flight {
+                in_flight += space.sent_packets[p].bytes as u64;
+            }
+            space.sent_packets[p].live = false;
+            p += 1;
+        }
+        space.discarded = true;
+        space.ack_pending = false;
+        space.last_emitted_len = 0;
+        space.last_emitted_ms = 0;
+        space.reassembler.reset();
+        self.bytes_in_flight = self.bytes_in_flight.saturating_sub(in_flight);
+        let i = space_index(level);
+        self.crypto_send[i] = SendHalf::empty();
+        self.hs_crypto_frames[i] = [CryptoChunk::empty(); SENT_PACKET_RING];
+        self.hs_ping_pending[i] = false;
+    }
+
+    /// Anti-amplification allowance toward `dest` (RFC 9000 §8, §9.3.1):
+    /// unbounded for a validated address, and three times what an
+    /// unvalidated `peer` has sent, less what has gone to it.
+    pub fn amp_allowance(&self, dest: &PeerAddr) -> u64 {
+        if self.peer_validated || !self.peer.matches(&dest.ip, dest.port) {
+            u64::MAX
+        } else {
+            self.amp_rx.saturating_mul(3).saturating_sub(self.amp_tx)
+        }
+    }
+
+    /// Count a datagram sent to `dest` against its allowance.
+    pub fn amp_charge(&mut self, dest: &PeerAddr, len: usize) {
+        if !self.peer_validated && self.peer.matches(&dest.ip, dest.port) {
+            self.amp_tx = self.amp_tx.saturating_add(len as u64);
+        }
+    }
+
+    /// Owe the peer a RETIRE_CONNECTION_ID for its ID `seq`.
+    pub fn queue_retire(&mut self, seq: u64) {
+        let n = self.retire_len as usize;
+        if self.retire_queue[..n].contains(&seq) {
+            return;
+        }
+        // RETIRE_QUEUE bounds how many can be owed at once; see there.
+        if n < RETIRE_QUEUE {
+            self.retire_queue[n] = seq;
+            self.retire_len += 1;
+        }
+    }
+
+    /// A retirement is owed.
+    pub fn retire_tx_pending(&self) -> bool {
+        self.retire_len > 0
+    }
+
+    /// End the connection with transport error `code` (RFC 9000 §20.1).
+    pub fn fail(&mut self, code: u64) {
+        self.close_error = code;
+        self.phase = ConnPhase::Errored;
+    }
+
+    /// Move our sending onto the peer's spare connection ID, keeping the
+    /// current one for the previous path until its validation ends. With
+    /// no spare, nothing can be sent on the new path until the peer
+    /// issues one (RFC 9000 §9.3, §9.5).
+    pub fn rotate_peer_cid(&mut self) {
+        if self.spare_peer_cid_len == 0 {
+            self.peer_cid_starved = true;
+            return;
+        }
+        self.old_path_cid = self.peer_cid;
+        self.old_path_cid_len = self.peer_cid_len;
+        self.old_path_cid_seq = self.peer_cid_seq;
+        self.old_path_cid_retire = true;
+        self.peer_cid = self.spare_peer_cid;
+        self.peer_cid_len = self.spare_peer_cid_len;
+        self.peer_cid_seq = self.spare_peer_cid_seq;
+        self.spare_peer_cid_len = 0;
+        self.peer_cid_starved = false;
+    }
+
+    /// The previous path's validation is over, answered or not: stop
+    /// probing it and retire the connection ID it used, if it has one of
+    /// its own.
+    pub fn finish_old_path(&mut self) {
+        self.old_path_validating = false;
+        self.old_path_challenge_tx_pending = false;
+        if self.old_path_cid_retire {
+            self.old_path_cid_retire = false;
+            self.queue_retire(self.old_path_cid_seq);
+        }
+    }
+
+    /// A 1-RTT probe timeout (RFC 9002 §6.2.4): owe again everything
+    /// unacknowledged, so the probe carries data the peer may be missing,
+    /// and the control frames of every packet still in flight.
+    pub fn requeue_for_probe(&mut self) {
+        self.stream_send.requeue_unacked();
+        self.crypto_send[2].requeue_unacked();
+        let mut k = 0;
+        while k < MAX_BIDI_STREAMS {
+            if self.bidi_streams[k].allocated {
+                self.bidi_streams[k].send.requeue_unacked();
+            }
+            k += 1;
+        }
+        let mut k = 0;
+        while k < MAX_UNI_STREAMS {
+            if self.uni_streams[k].allocated {
+                self.uni_streams[k].send.requeue_unacked();
+            }
+            k += 1;
+        }
+        let mut p = 0;
+        while p < SENT_PACKET_RING {
+            if self.one_rtt.sent_packets[p].live {
+                let ctrl = self.one_rtt_frames[p].ctrl;
+                self.requeue_ctrl(ctrl);
+            }
+            p += 1;
+        }
+    }
+
     pub const fn new() -> Self {
         Self {
             phase: ConnPhase::Idle,
@@ -1217,10 +2026,10 @@ impl QuicConnection {
             inbound_off: 0,
             pending_handshake_done: false,
             handshake_confirmed: false,
-            stream_send_off: 0,
-            stream_send_buf: [0; 1200],
-            stream_send_buf_len: 0,
-            stream_send_fin: false,
+            stream_send: SendHalf::empty(),
+            crypto_send: [SendHalf::empty(); 3],
+            hs_crypto_frames: [[CryptoChunk::empty(); SENT_PACKET_RING]; 2],
+            hs_ping_pending: [false; 2],
             stream_recv_off: 0,
             stream_recv_fin: false,
             stream_recv_buf: [0; 1500],
@@ -1286,9 +2095,49 @@ impl QuicConnection {
             path_response_to_port: 0,
             recv_ip: [0; 4],
             recv_port: 0,
-            max_streams_bidi_granted: MAX_BIDI_STREAMS as u64,
+            recv_len: 0,
+            recv_dcid_seq: 0,
+            rx_unaccepted: false,
+            peer_dcid_seq: 0,
+            peer_validated: true,
+            last_valid_peer: PeerAddr::unset(),
+            amp_rx: 0,
+            amp_tx: 0,
+            path_reset_rtt: false,
+            challenge_expanded: false,
+            challenge_refresh: false,
+            old_path_validating: false,
+            old_path_challenge_data: [0; 8],
+            old_path: PeerAddr::unset(),
+            old_path_challenge_tx_pending: false,
+            old_path_cid: [0; MAX_CID_LEN],
+            old_path_cid_len: 0,
+            old_path_cid_seq: 0,
+            old_path_cid_retire: false,
+            path_response_rx_len: 0,
+            peer_cid_seq: 0,
+            spare_peer_cid: [0; MAX_CID_LEN],
+            spare_peer_cid_len: 0,
+            spare_peer_cid_seq: 0,
+            spare_peer_reset_token: [0; 16],
+            retire_queue: [0; RETIRE_QUEUE],
+            retire_len: 0,
+            peer_cid_starved: false,
+            data_blocked_at: 0,
+            streams_blocked_bidi_at: 0,
+            streams_blocked_uni_at: 0,
+            our_cid_seq: 0,
+            next_cid_seq: 1,
+            close_error: ERR_PROTOCOL_VIOLATION,
+            pto_count: 0,
+            pto_probes: 0,
+            ping_pending: false,
+            one_rtt_frames: [SentFrames::empty(); SENT_PACKET_RING],
+            max_streams_bidi_granted: PEER_BIDI_CREDIT as u64,
+            peer_bidi_finished: FinishedStreams::empty(),
+            peer_uni_finished: FinishedStreams::empty(),
             max_streams_tx_pending: false,
-            max_streams_uni_granted: MAX_UNI_STREAMS as u64,
+            max_streams_uni_granted: PEER_UNI_CREDIT as u64,
             max_streams_uni_tx_pending: false,
             // Until the peer's transport parameters are parsed, assume it
             // advertises what we do. A peer that advertises less is
@@ -1596,26 +2445,26 @@ pub fn locate_handle(conn: &QuicConnection, handle: u32) -> Option<StreamLoc> {
 
 /// Allocate the next server-initiated unidirectional stream id.
 /// Server uni ids = 3, 7, 11, ...  (low 2 bits = 11).
-pub fn next_server_uni_id(idx: u8) -> u64 {
-    3 + (idx as u64) * 4
+pub fn next_server_uni_id(idx: u64) -> u64 {
+    3 + idx * 4
 }
 
 /// Allocate the next client-initiated unidirectional stream id.
 /// Client uni ids = 2, 6, 10, ... (low 2 bits = 10).
-pub fn next_client_uni_id(idx: u8) -> u64 {
-    2 + (idx as u64) * 4
+pub fn next_client_uni_id(idx: u64) -> u64 {
+    2 + idx * 4
 }
 
 /// Allocate the next client-initiated bidirectional stream id.
 /// Client bidi ids = 0, 4, 8, ...  (low 2 bits = 00).
-pub fn next_client_bidi_id(idx: u8) -> u64 {
-    (idx as u64) * 4
+pub fn next_client_bidi_id(idx: u64) -> u64 {
+    idx * 4
 }
 
 /// Allocate the next server-initiated bidirectional stream id.
 /// Server bidi ids = 1, 5, 9, ...  (low 2 bits = 01).
-pub fn next_server_bidi_id(idx: u8) -> u64 {
-    1 + (idx as u64) * 4
+pub fn next_server_bidi_id(idx: u64) -> u64 {
+    1 + idx * 4
 }
 
 /// Set up Initial-level keys for a freshly-allocated connection
@@ -1786,13 +2635,13 @@ pub unsafe fn build_transport_params_client(
         out,
         &mut pos,
         TP_INITIAL_MAX_STREAMS_BIDI,
-        MAX_BIDI_STREAMS as u64,
+        PEER_BIDI_CREDIT as u64,
     );
     tp_put_int(
         out,
         &mut pos,
         TP_INITIAL_MAX_STREAMS_UNI,
-        MAX_UNI_STREAMS as u64,
+        PEER_UNI_CREDIT as u64,
     );
     tp_put_int(out, &mut pos, TP_ACTIVE_CONNECTION_ID_LIMIT, 2);
     // RFC 9221 §3: advertise our inbound DATAGRAM capacity so the peer
@@ -1859,13 +2708,13 @@ pub unsafe fn build_transport_params_server(
         out,
         &mut pos,
         TP_INITIAL_MAX_STREAMS_BIDI,
-        MAX_BIDI_STREAMS as u64,
+        PEER_BIDI_CREDIT as u64,
     );
     tp_put_int(
         out,
         &mut pos,
         TP_INITIAL_MAX_STREAMS_UNI,
-        MAX_UNI_STREAMS as u64,
+        PEER_UNI_CREDIT as u64,
     );
     tp_put_int(out, &mut pos, TP_ACTIVE_CONNECTION_ID_LIMIT, 2);
     // RFC 9221 §3: advertise our inbound DATAGRAM capacity.

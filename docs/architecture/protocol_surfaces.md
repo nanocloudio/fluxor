@@ -228,10 +228,14 @@ applications that need it (HTTP/3 names streams by it in GOAWAY and
 PRIORITY_UPDATE). Neither is derivable from the other.
 
 Stream open takes bidi / unidirectional / urgent flags; opened and
-accepted events add a generic initiator bit. Flow-control credit is
-carried by `MSG_MUX_STREAM_READY` (0xC6) and `CMD_MUX_STREAM_ACK`
-(0xB5) — the consumer's acknowledgement is what advances the provider's
-receive windows. Abrupt termination is `CMD_MUX_STREAM_RESET` (0xB7) /
+accepted events add a generic initiator bit. Receive credit is
+`CMD_MUX_STREAM_ACK` (0xB5): the consumer's acknowledgement is what
+advances the provider's receive windows. Send backpressure is the command
+channel itself: a `CMD_MUX_STREAM_SEND` the provider has no room for yet
+is held, and the provider reads no further command until it applies, so
+the consumer's own channel write is what waits — a write is never
+dropped, truncated or refused for want of room, only for a stream that
+cannot take it at all. Abrupt termination is `CMD_MUX_STREAM_RESET` (0xB7) /
 `CMD_MUX_STREAM_STOP_SENDING` (0xB8) outbound and
 `MSG_MUX_STREAM_RESET` (0xCA) / `MSG_MUX_STREAM_STOPPED` (0xCB) inbound,
 each carrying an opaque application error code the provider never
@@ -247,7 +251,10 @@ The live consumers are the `quic` module (provider), the `mux_echo`
 fixture, and downstream HTTP/3 and MQTT-over-QUIC modules. `quic` bounds one reliable write at
 `MUX_QUIC_STREAM_SEND_MAX` (1200 bytes) — a transport bound, not a
 profile restriction — and refuses an oversize write rather than
-truncating it.
+truncating it. It keeps every byte it sends until the peer acknowledges
+it, and repairs a lost packet's STREAM, CRYPTO and control frames in new
+packets (RFC 9000 §13.3, RFC 9002); a packet whose STREAM data it could
+not take whole is left unacknowledged, so the peer sends it again.
 
 ### Session Control Sideband
 
@@ -314,9 +321,15 @@ The transport association itself may change path or attachment point
 without client reconnect. Required structure: a declared `mechanism`,
 one of:
 
-- `native_primitive` — the graph contains a `transport.mux.*`
-  provider (a transport whose connection model supports migration,
-  such as QUIC).
+- `native_primitive` — the peer changes address and the connection
+  follows it (RFC 9000 §9). The `anchor` must carry the mux itself — a
+  `transport.mux.*` transport and `transport.anchor.mux`, as `quic`
+  declares — configured as a server that does not advertise
+  `disable_active_migration`. The serving host does not move, so there
+  is no fence, reservation, directory, AEAD class or failover budget,
+  and declaring any of them is refused. This covers client migration
+  only; a standby host continuing the connection is
+  `platform_replicated_state`, where quic is an admitted mux anchor.
 - `platform_replicated_state` — the anchor must provide one of
   `transport.anchor.datagram`, `transport.anchor.stream.secure` or
   `transport.anchor.mux`, and a stream or mux anchor is admitted only on
@@ -554,10 +567,11 @@ none of the named front-door modules exist in this repository.
 - **Internal replication** (`resumable`): both endpoints are under
   platform control and the protocol has its own indices and retry
   logic, so `resumable` is usually enough.
-- **QUIC-based services** (`transport_migratable` via
-  `native_primitive`): the `quic` module provides the mux surface
-  over the datagram surface; its connection model is designed for
-  path movement.
+- **QUIC-based services** (`transport_migratable`): the `quic` module
+  provides the mux surface over the datagram surface. A client that
+  changes address keeps its connection under `native_primitive`; a
+  service that must also survive its own host is declared
+  `platform_replicated_state` with quic as the mux anchor.
 
 ## Delivery Cursors
 

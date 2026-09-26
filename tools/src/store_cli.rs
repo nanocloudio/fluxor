@@ -882,17 +882,42 @@ mod tests {
     /// in a tempdir leaves a permanent ledger entry naming a directory
     /// that no longer exists, which `fluxor store fsck` then correctly
     /// reports as a dead pin. One throwaway store for the whole test
-    /// binary, pointed at before the first pin.
-    fn isolate_store() {
+    /// binary, pointed at for the length of each pin under the crate's
+    /// one environment lock, so no other test reads it mid-change.
+    fn scratch_store() -> std::path::PathBuf {
         use std::sync::OnceLock;
         static SCRATCH: OnceLock<tempfile::TempDir> = OnceLock::new();
         let dir = SCRATCH.get_or_init(|| tempfile::tempdir().expect("scratch store"));
-        std::env::set_var("FLUXOR_STORE", dir.path().join("ledger-only"));
+        dir.path().join("ledger-only")
+    }
+
+    /// `FLUXOR_STORE` pointed at a path until dropped, then restored —
+    /// including when the pin between panics.
+    struct StoreScope(Option<std::ffi::OsString>);
+
+    impl StoreScope {
+        fn point_at(path: &Path) -> Self {
+            let old = std::env::var_os("FLUXOR_STORE");
+            std::env::set_var("FLUXOR_STORE", path);
+            StoreScope(old)
+        }
+    }
+
+    impl Drop for StoreScope {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(v) => std::env::set_var("FLUXOR_STORE", v),
+                None => std::env::remove_var("FLUXOR_STORE"),
+            }
+        }
     }
 
     /// Upsert one `[[artifact]]` module pin the way `store pin` does.
     fn pin_module(proj: &Path, name: &str, target: &str, digest: &str, reference: &str) {
-        isolate_store();
+        let _env = crate::project::tests::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _scope = StoreScope::point_at(&scratch_store());
         store_resolve::pin_artifact(
             proj,
             &store_resolve::Artifact {

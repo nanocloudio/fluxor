@@ -2148,18 +2148,165 @@ mod continuity_tests {
         assert!(format!("{e:?}").contains("only valid"), "got: {e:?}");
     }
 
-    #[test]
-    fn continuity_native_primitive_needs_mux_transport() {
-        let (n, m) = edge_graph();
-        let cfg = json!({"continuity": [
-            {"id": "x", "class": "transport_migratable",
-             "mechanism": "native_primitive"}]});
-        let e = validate_continuity(&cfg, &n, &m).unwrap_err();
-        assert!(format!("{e:?}").contains("transport.mux"), "got: {e:?}");
+    /// The quic module's capabilities as its manifest declares them: the mux
+    /// transport and the anchor over it.
+    const QUIC_CAPS: &[&str] = &["transport.anchor.mux", "transport.mux.quic", "session.resume"];
 
-        let mut m2 = HashMap::new();
-        m2.insert("quic".to_string(), man(&["transport.mux.quic"]));
-        validate_continuity(&cfg, &names(&["quic"]), &m2).unwrap();
+    /// A graph with a quic server instance `edge` and a worker behind it.
+    fn native_graph(anchor_caps: &[&str]) -> (Vec<String>, HashMap<String, Manifest>) {
+        let mut manifests = HashMap::new();
+        manifests.insert("edge".to_string(), man(anchor_caps));
+        manifests.insert("wkr".to_string(), man(&["session.worker"]));
+        (names(&["edge", "wkr"]), manifests)
+    }
+
+    fn native_cfg(edge: serde_json::Value, extra: serde_json::Value) -> serde_json::Value {
+        let mut entry = json!({"id": "mqtt", "class": "transport_migratable",
+                               "mechanism": "native_primitive", "anchor": "edge"});
+        for (k, v) in extra.as_object().unwrap() {
+            entry[k] = v.clone();
+        }
+        json!({"modules": [edge, {"name": "wkr", "type": "worker"}],
+               "continuity": [entry]})
+    }
+
+    fn quic_server() -> serde_json::Value {
+        json!({"name": "edge", "type": "quic", "mode": 1, "port": 4443})
+    }
+
+    /// A quic-anchored graph is admitted with no directory, fence or
+    /// reservation, on a hosted target as on bare metal: the connection
+    /// state that follows the peer is the quic module's, not the kernel's.
+    #[test]
+    fn continuity_native_primitive_admits_a_quic_anchor() {
+        let (n, m) = native_graph(QUIC_CAPS);
+        let cfg = native_cfg(quic_server(), json!({}));
+        for target in [Some("bcm2712"), Some("linux"), None] {
+            validate_continuity_on(&cfg, &n, &m, target).unwrap();
+        }
+        // `mode` defaults to server when the graph leaves it out.
+        let cfg = native_cfg(json!({"name": "edge", "type": "quic"}), json!({}));
+        validate_continuity_on(&cfg, &n, &m, Some("bcm2712")).unwrap();
+    }
+
+    #[test]
+    fn continuity_native_primitive_needs_a_mux_provider() {
+        let (n, m) = native_graph(&["transport.anchor.mux"]);
+        let cfg = native_cfg(quic_server(), json!({}));
+        let e = validate_continuity_on(&cfg, &n, &m, Some("bcm2712")).unwrap_err();
+        assert!(format!("{e:?}").contains("no module in the graph provides"), "got: {e:?}");
+    }
+
+    /// A TLS or TCP anchor carries no mux, and a mux elsewhere in the graph
+    /// does not lend it one: migration lives in the connection state of the
+    /// module that carries it.
+    #[test]
+    fn continuity_native_primitive_refuses_a_stream_anchor() {
+        for anchor_cap in ["transport.anchor.stream.secure", "transport.anchor.stream"] {
+            let (mut n, mut m) = native_graph(&[anchor_cap]);
+            m.insert("quic".to_string(), man(QUIC_CAPS));
+            n.push("quic".to_string());
+            let cfg = native_cfg(json!({"name": "edge", "type": "tls"}), json!({}));
+            let e = validate_continuity_on(&cfg, &n, &m, Some("bcm2712")).unwrap_err();
+            let msg = format!("{e:?}");
+            assert!(msg.contains("anchor `edge` does not carry"), "{anchor_cap}: {msg}");
+        }
+    }
+
+    #[test]
+    fn continuity_native_primitive_needs_an_anchor_that_owns_the_transport() {
+        let (n, m) = native_graph(&["transport.mux.quic"]);
+        let cfg = native_cfg(quic_server(), json!({}));
+        let e = validate_continuity_on(&cfg, &n, &m, Some("bcm2712")).unwrap_err();
+        assert!(format!("{e:?}").contains("transport.anchor.mux"), "got: {e:?}");
+
+        let (n, m) = native_graph(QUIC_CAPS);
+        let mut cfg = native_cfg(quic_server(), json!({}));
+        cfg["continuity"][0].as_object_mut().unwrap().remove("anchor");
+        let e = validate_continuity_on(&cfg, &n, &m, Some("bcm2712")).unwrap_err();
+        assert!(format!("{e:?}").contains("requires an `anchor`"), "got: {e:?}");
+    }
+
+    /// The instance, not only its type, decides whether the wire offers
+    /// migration.
+    #[test]
+    fn continuity_native_primitive_refuses_an_anchor_configured_against_it() {
+        let (n, m) = native_graph(QUIC_CAPS);
+        let client = json!({"name": "edge", "type": "quic", "mode": 0});
+        let e = validate_continuity_on(&native_cfg(client, json!({})), &n, &m, Some("bcm2712"))
+            .unwrap_err();
+        assert!(format!("{e:?}").contains("client"), "got: {e:?}");
+
+        for disabled in [json!(1), json!(true)] {
+            let edge = json!({"name": "edge", "type": "quic", "disable_migration": disabled});
+            let e = validate_continuity_on(&native_cfg(edge, json!({})), &n, &m, Some("bcm2712"))
+                .unwrap_err();
+            assert!(format!("{e:?}").contains("disable_active_migration"), "got: {e:?}");
+        }
+        let edge = json!({"name": "edge", "type": "quic", "disable_migration": 0});
+        validate_continuity_on(&native_cfg(edge, json!({})), &n, &m, Some("bcm2712")).unwrap();
+    }
+
+    /// The terms of a takeover are refused by name rather than ignored.
+    #[test]
+    fn continuity_native_primitive_refuses_takeover_terms() {
+        let (mut n, mut m) = native_graph(QUIC_CAPS);
+        m.insert("dir".to_string(), man(&["session.directory"]));
+        n.push("dir".to_string());
+        for extra in [
+            json!({"aead": "on_wire_sequence"}),
+            json!({"directory": "dir"}),
+            json!({"failover_budget_ms": 8000}),
+            json!({"client_keepalive_ms": 20000}),
+        ] {
+            let field = extra.as_object().unwrap().keys().next().unwrap().clone();
+            let e = validate_continuity_on(&native_cfg(quic_server(), extra), &n, &m, Some("bcm2712"))
+                .unwrap_err();
+            let msg = format!("{e:?}");
+            assert!(
+                msg.contains(&format!("`{field}` is not valid with mechanism native_primitive"))
+                    && msg.contains("platform_replicated_state"),
+                "{field}: {msg}"
+            );
+        }
+    }
+
+    fn quic_manifest() -> Manifest {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        Manifest::from_toml_for_target(
+            &root.join("modules/foundation/quic/manifest.toml"),
+            Some("bcm2712"),
+        )
+        .expect("quic manifest")
+    }
+
+    /// The quic module's own manifest satisfies both halves of the rule, and
+    /// still satisfies platform_replicated_state's anchor role.
+    #[test]
+    fn the_quic_manifest_is_a_native_primitive_anchor() {
+        let quic = quic_manifest();
+        let has = |want: &str| quic.capabilities.iter().any(|c| cap_satisfies(c, want));
+        assert!(has("transport.mux") && has("transport.anchor.mux"), "{:?}", quic.capabilities);
+        let mut m = HashMap::new();
+        m.insert("edge".to_string(), quic);
+        m.insert("wkr".to_string(), man(&["session.worker"]));
+        validate_continuity_on(
+            &native_cfg(quic_server(), json!({})),
+            &names(&["edge", "wkr"]),
+            &m,
+            Some("bcm2712"),
+        )
+        .unwrap();
+
+        // The same manifest anchoring a platform-replicated-state graph: a
+        // standby takeover stays that mechanism's, on the anchor's own
+        // `aead` fact.
+        let (n, mut m) = prs_graph_with("transport.anchor.mux");
+        m.insert("anc".to_string(), quic_manifest());
+        m.get_mut("dir").unwrap().capabilities.push("session.reservation".to_string());
+        validate_continuity_on(&prs_cfg(prs_entry()), &n, &m, Some("bcm2712")).unwrap();
+        let e = validate_continuity_on(&prs_cfg(prs_entry()), &n, &m, Some("linux")).unwrap_err();
+        assert!(format!("{e:?}").contains("bare-metal"), "got: {e:?}");
     }
 
     /// A manifest declaring capabilities and one `capability_facts` row.
@@ -2864,6 +3011,38 @@ mod port_capability_tests {
         validate_port_capabilities(&edge(), &m).unwrap();
     }
 
+    /// A producer whose payload ceiling is per-target, as a module that tiers
+    /// its buffers by state arena declares it.
+    const TIERED_PUMP: &str = "version = \"0.1.0\"\n\
+        hardware_targets = [\"bcm2712\", \"rp2350\", \"rp2040\"]\n\n\
+        [[ports]]\nname = \"publish_out\"\ndirection = \"output\"\n\
+        content_type = \"OctetStream\"\nrequires_capability = \"stream.publish\"\n\n\
+        [capability_facts.\"stream.publish\"]\n\
+        max_payload = { bcm2712 = 8192, rp2350 = 4096, rp2040 = 512 }\n";
+
+    /// The composer checks the value for the graph's target: the same pump
+    /// fits a 1024-byte backend on rp2040 and is refused by it on bcm2712.
+    #[test]
+    fn a_per_target_payload_is_checked_for_the_graphs_target() {
+        let graph = |silicon: &str| {
+            let mut m = HashMap::new();
+            m.insert(
+                "pump".to_string(),
+                Manifest::from_toml_str_for_target(TIERED_PUMP, Some(silicon)).expect("parse"),
+            );
+            m.insert(
+                "sink".to_string(),
+                provider(&["stream.publish"], Some(1024)),
+            );
+            validate_port_capabilities(&edge(), &m)
+        };
+        graph("rp2040").expect("512 fits a 1024-byte ceiling");
+        let msg = format!("{:?}", graph("bcm2712").unwrap_err());
+        assert!(msg.contains("8192") && msg.contains("1024"), "got: {msg}");
+        let msg = format!("{:?}", graph("rp2350").unwrap_err());
+        assert!(msg.contains("4096"), "got: {msg}");
+    }
+
     /// A producer that states no payload fact is unvalidated, not assumed
     /// to fit: the honest position, and the reason declaring it is worth it.
     #[test]
@@ -3045,6 +3224,89 @@ mod port_fact_tests {
         .unwrap_err()
         .to_string();
         assert!(e.contains("[ports.facts]"), "{e}");
+    }
+
+    /// A pipeline-shaped manifest whose `max_payload` fact is written `fact`.
+    fn per_target_fact_manifest(fact: &str) -> String {
+        format!(
+            "version = \"0.1.0\"\nhardware_targets = [\"bcm2712\", \"rp2350\", \"rp2040\"]\n\
+             capabilities = [\"stream.ordered_ack.sink\"]\n\n\
+             [capability_facts.\"stream.ordered_ack.sink\"]\nack = \"transport\"\n{fact}\n"
+        )
+    }
+
+    fn resolved_fact(src: &str, silicon: Option<&str>) -> std::result::Result<String, String> {
+        Manifest::from_toml_str_for_target(src, silicon)
+            .map(|m| m.capability_facts["stream.ordered_ack.sink"]["max_payload"].clone())
+            .map_err(|e| e.to_string())
+    }
+
+    /// Each target resolves its own entry; a flat fact beside it is untouched.
+    #[test]
+    fn a_per_target_fact_resolves_for_each_target() {
+        let src = per_target_fact_manifest(
+            "max_payload = { bcm2712 = 8192, rp2350 = 4096, rp2040 = 512 }",
+        );
+        for (silicon, want) in [("bcm2712", "8192"), ("rp2350", "4096"), ("rp2040", "512")] {
+            assert_eq!(resolved_fact(&src, Some(silicon)).unwrap(), want, "{silicon}");
+        }
+        let m = Manifest::from_toml_str_for_target(&src, Some("rp2040")).unwrap();
+        assert_eq!(m.capability_facts["stream.ordered_ack.sink"]["ack"], "transport");
+    }
+
+    /// An explicit `default` answers for every target the table does not
+    /// name, including a load for no target.
+    #[test]
+    fn a_per_target_fact_takes_its_explicit_default() {
+        let src = per_target_fact_manifest("max_payload = { default = 8192, rp2040 = 512 }");
+        assert_eq!(resolved_fact(&src, Some("rp2040")).unwrap(), "512");
+        assert_eq!(resolved_fact(&src, Some("rp2350")).unwrap(), "8192");
+        assert_eq!(resolved_fact(&src, Some("bcm2712")).unwrap(), "8192");
+        assert_eq!(resolved_fact(&src, None).unwrap(), "8192");
+    }
+
+    /// Plain integer and string facts keep their meaning.
+    #[test]
+    fn flat_facts_stay_valid() {
+        let src = per_target_fact_manifest("max_payload = 8192");
+        assert_eq!(resolved_fact(&src, Some("rp2040")).unwrap(), "8192");
+        let src = per_target_fact_manifest("max_payload = \"8192\"");
+        assert_eq!(resolved_fact(&src, None).unwrap(), "8192");
+    }
+
+    /// Malformed and partial per-target tables are refused, whichever target
+    /// is loaded, and never resolve to some other entry.
+    #[test]
+    fn a_malformed_per_target_fact_is_refused() {
+        let refused = |fact: &str, silicon: Option<&str>| {
+            resolved_fact(&per_target_fact_manifest(fact), silicon).unwrap_err()
+        };
+        // Partial: rp2040 is a hardware target with no entry and no default,
+        // refused even when loading for a target the table does name.
+        let e = refused("max_payload = { bcm2712 = 8192, rp2350 = 4096 }", Some("bcm2712"));
+        assert!(e.contains("no value for rp2040") && e.contains("no `default`"), "{e}");
+        // Complete for the module's targets, but a load for no target has
+        // nothing to resolve.
+        let e = refused(
+            "max_payload = { bcm2712 = 8192, rp2350 = 4096, rp2040 = 512 }",
+            None,
+        );
+        assert!(e.contains("no entry for target \"<none>\""), "{e}");
+        let e = refused("max_payload = {}", Some("rp2040"));
+        assert!(e.contains("empty table"), "{e}");
+        let e = refused("max_payload = { default = 8192, rp2O40 = 512 }", Some("rp2040"));
+        assert!(e.contains("unknown target `rp2O40`"), "{e}");
+        // Every entry is schema-checked, not only the resolved one.
+        let e = refused("max_payload = { default = 8192, rp2040 = \"small\" }", Some("bcm2712"));
+        assert!(e.contains("takes a u32, got `small`"), "{e}");
+        let e = refused("max_payload = { default = 8192, rp2040 = -1 }", Some("bcm2712"));
+        assert!(e.contains("negative"), "{e}");
+        let e = refused("max_payload = { default = 8192, rp2040 = true }", Some("bcm2712"));
+        assert!(e.contains("must be a string, an integer"), "{e}");
+        let e = refused("max_payload = { default = { rp2040 = 512 } }", Some("rp2040"));
+        assert!(e.contains("got a table"), "{e}");
+        let e = refused("max_payload = [512, 4096]", Some("rp2040"));
+        assert!(e.contains("got a array"), "{e}");
     }
 
     /// A mistyped port key is an error, not a silently ignored table.

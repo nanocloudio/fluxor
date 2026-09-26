@@ -213,15 +213,29 @@ pub fn sort_entries(entries: &mut Vec<Artifact>) {
 /// advisory lock (`crate::lockfile::lock_lockfile`) around the whole
 /// read-modify-write transaction — this fn never takes it itself, so
 /// one guard can span resolve → materialise → write.
+///
+/// The catalog stamp is the digest of the discovered install root's
+/// catalog, or absent when no install root is found.
 pub fn write_store_lock(project_root: &Path, entries: &[Artifact]) -> Result<PathBuf> {
-    let mut sorted = entries.to_vec();
-    sort_entries(&mut sorted);
     let catalog = crate::project::install_root()
         .and_then(|r| catalog_digest(&r.path))
         .map(|digest| Catalog {
             digest,
             source: None,
         });
+    write_store_lock_stamped(project_root, entries, catalog)
+}
+
+/// Write `fluxor.lock` carrying the given catalog stamp. The rendering
+/// depends only on its arguments; install-root discovery (environment,
+/// workspace file, executable path) stays in [`write_store_lock`].
+fn write_store_lock_stamped(
+    project_root: &Path,
+    entries: &[Artifact],
+    catalog: Option<Catalog>,
+) -> Result<PathBuf> {
+    let mut sorted = entries.to_vec();
+    sort_entries(&mut sorted);
     let lock = StoreLock {
         artifacts: sorted,
         catalog,
@@ -830,16 +844,24 @@ mod tests {
             entry("module", "fluxor", "tls", Some("bcm2712")),
             entry("module", "fluxor", "tls", Some("linux")),
         ];
-        write_store_lock(dir.path(), &entries).unwrap();
+        let stamp = Catalog {
+            digest: format!("sha256:{}", "ef".repeat(32)),
+            source: None,
+        };
+        write_store_lock_stamped(dir.path(), &entries, Some(stamp.clone())).unwrap();
         let read_back = read_store_lock(dir.path()).unwrap().unwrap();
         assert_eq!(read_back.artifacts.len(), 3);
+        assert_eq!(
+            read_back.catalog.as_ref().map(|c| c.digest.as_str()),
+            Some(stamp.digest.as_str())
+        );
         // Sorted by (kind, project, name, target): modules first.
         assert_eq!(read_back.artifacts[0].name, "tls");
         assert_eq!(read_back.artifacts[0].target.as_deref(), Some("bcm2712"));
         assert_eq!(read_back.artifacts[2].kind, "source");
         // Byte-stable across a rewrite.
         let one = std::fs::read(lockfile_path(dir.path())).unwrap();
-        write_store_lock(dir.path(), &read_back.artifacts).unwrap();
+        write_store_lock_stamped(dir.path(), &read_back.artifacts, read_back.catalog).unwrap();
         let two = std::fs::read(lockfile_path(dir.path())).unwrap();
         assert_eq!(one, two);
     }
@@ -895,8 +917,13 @@ mod tests {
     #[test]
     fn a_written_catalog_stamp_carries_no_source_path() {
         let dir = tempfile::tempdir().unwrap();
-        write_store_lock(dir.path(), &[]).unwrap();
+        let stamp = Catalog {
+            digest: "sha256:abc".into(),
+            source: Some("/home/someone/checkout".into()),
+        };
+        write_store_lock_stamped(dir.path(), &[], Some(stamp)).unwrap();
         let text = std::fs::read_to_string(lockfile_path(dir.path())).unwrap();
+        assert!(text.contains("[catalog]"), "got:\n{text}");
         assert!(!text.contains("source ="), "got:\n{text}");
     }
 }

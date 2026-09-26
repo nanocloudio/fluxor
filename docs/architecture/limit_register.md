@@ -158,6 +158,7 @@ CAPACITY >= PSTATUS_ROUND | src/kernel/sys/telemetry_ring.rs
 | QUIC peer certificate | `MAX_CERT_LEN` | modules/foundation/quic/mod.rs | 1024 | Policy: the per-certificate ceiling for the configured leaf and each trust anchor. An anchor past it, or a ninth anchor, marks the table refused and the instance declines to construct |
 | QUIC configured ALPN list | `MAX_ALPN_CFG` | modules/foundation/quic/mod.rs | 64 | Policy: the comma-separated protocol tokens a graph configures (`mqtt,h3`); 64 bytes holds several names with their separators |
 | QUIC resumption tickets | `MAX_TICKETS` | modules/foundation/quic/mod.rs | 4 | Policy: the client-side ticket cache. Each entry is bound to the authority that issued it, so the table holds a handful of recently dialled peers and the oldest is displaced rather than grown |
+| QUIC transparent stream read | `TRANSPARENT_READ_MAX` | modules/foundation/quic/mod.rs | 1200 | Policy: the most one read of the no-ALPN byte stream takes from `app_in`, one packet's worth. It is read only while the stream's send buffer has room for a whole read, so `app_in` backs up rather than losing bytes |
 | DNS pending forwarded queries | `MAX_PENDING` | modules/foundation/dns/mod.rs | 8 | Policy: with every slot live and unexpired, a new query is answered SERVFAIL rather than displacing accepted work |
 | DNS configured host entries | `MAX_HOSTS` | modules/foundation/dns/mod.rs | 16 | Policy: `host=` parameters past the table are ignored at parse |
 | DNS upstream authority length | `UPSTREAM_AUTHORITY_MAX` | modules/foundation/dns/mod.rs | 64 | Policy: the `host[:port]` an encrypted upstream is dialled at; a longer value refuses construction rather than dialling a truncated authority |
@@ -186,7 +187,7 @@ CAPACITY >= PSTATUS_ROUND | src/kernel/sys/telemetry_ring.rs
 | OTA image layers | `MAX_LAYERS` | modules/foundation/ota_registry/mod.rs | 48 | Policy: sized to the 48-module fleet profile; a larger manifest is refused whole |
 | SMMU DMA map table | `MAX_DMA_MAPS` | modules/foundation/smmu/mod.rs | 32 | Policy: a map past the translation table is refused ENOMEM before any MMIO write |
 | QUIC continuity shadow slots | `MAX_SHADOW_SLOTS` | modules/foundation/quic/continuity.rs | 2 | Policy: connections under CT_QUIC takeover at once, one per slot. Continuity is a control-plane event, not steady state, and each shadow stages a whole connection's worth of state; a PAIR_PREPARE past the free slots is refused `STATUS_NO_CAPACITY` |
-| QUIC continuity checkpoint record | `CHECKPOINT_RECORD_MAX` | modules/foundation/quic/continuity.rs | 16384 | Sized, not chosen: holds the full serialized connection state — three bidi (1200+1500) and six uni (256+256) stream buffers, the retained last-emitted packet, the sealed secret set, and the fixed header, with headroom. A checkpoint whose `total_len` exceeds it is refused `STATUS_NO_CAPACITY` at CHECKPOINT_BEGIN and the shadow is discarded |
+| QUIC continuity checkpoint record | `CHECKPOINT_RECORD_MAX` | modules/foundation/quic/continuity.rs | 49152 | Sized, not chosen: holds the full serialized connection state — six bidi (4096 send + 1500 receive) and nine uni (256+256) stream buffers, the 1-RTT CRYPTO send buffer, the retained last-emitted packet, the sealed secret set, and the fixed header, with headroom. A checkpoint whose `total_len` exceeds it is refused `STATUS_NO_CAPACITY` at CHECKPOINT_BEGIN and the shadow is discarded |
 | ARP-wait handshake list | `ARP_WAIT_MAX` | modules/foundation/ip/mod.rs | 64 | Policy: handshakes remembered as waiting on neighbour resolution, so an ARP reply retries exactly those rather than walking the connection table. A full list only defers the retry to the timer sweep's next slice |
 | GEM RX descriptors | `RX_DESC_COUNT` | modules/drivers/rp1_gem/mod.rs | 192 | Policy: the burst the Pi 5 MAC absorbs between two driver steps; a step drains the whole ring. The platform DMA arena holds 256 buffers shared with the 64 TX descriptors. The rings are walked with free-running `u16` positions under a `position % count` index, and those positions wrap at the largest multiple of the ring size a `u16` holds rather than at 65,536 (`rp1_gem/ring.rs`), so the index stays continuous across the wrap and a size that does not divide 65,536 is safe |
 | fan frames per step | `FAN_FRAMES_PER_STEP` | src/kernel/exec/scheduler/module_types.rs | 64 | Policy: whole frames a framed `_tee` or `_merge` moves in one step. A fan sits between a producer and its consumers, so this times the tick rate is the ceiling on every fanned port — `debug: to: net` fans the ip module's consumer ports, and every accept, delivery and send on that graph crosses one |
@@ -260,10 +261,17 @@ cannot be evaluated from its own file reads `—` and says why.
 | fat32 unlink free-list | `UNLINK_FREE_SLOTS` | modules/foundation/fat32/mod.rs | 8 | Deliberate cap with a stated degradation: sized for WAL segment compaction retiring a handful of segments per snapshot; overflow degrades to orphaning clusters, which fsck reclaims |
 | fat32 directory chain | `MAX_DIR_CLUSTERS` | modules/foundation/fat32/mod.rs | 65536 | Sanity bound: far past any real directory and far short of walking a cyclic chain for ever |
 | Mounts | `MAX_MOUNTS` | modules/foundation/mount/mod.rs | 8 | Policy: volumes one mount module routes; a backend registering past it fails EBUSY and its mounts resolve ENODEV |
-| QUIC unidirectional streams per connection | `MAX_UNI_STREAMS` | modules/foundation/quic/connection.rs | 6 | Policy, advertised to the peer as a transport parameter: the stream state is a fixed table, so the advertised limit and the table are one number |
-| QUIC bidirectional streams per connection | `MAX_BIDI_STREAMS` | modules/foundation/quic/connection.rs | 3 | Policy, advertised to the peer as a transport parameter: as the unidirectional ceiling above, and lower because each bidirectional stream carries state in both directions |
+| QUIC peer unidirectional stream credit | `PEER_UNI_CREDIT` | modules/foundation/quic/connection.rs | 6 | Policy, advertised as `initial_max_streams_uni` and re-granted as each finishes: HTTP/3's three critical streams with room for WebTransport's. A stream past the credit closes the connection with STREAM_LIMIT_ERROR |
+| QUIC peer bidirectional stream credit | `PEER_BIDI_CREDIT` | modules/foundation/quic/connection.rs | 3 | Policy, advertised as `initial_max_streams_bidi`: as the unidirectional credit, lower because each bidirectional stream carries state in both directions |
+| QUIC local unidirectional streams | `LOCAL_UNI_STREAMS` | modules/foundation/quic/connection.rs | 3 | Policy: streams of this kind the endpoint opens itself at once; an open past it is refused with `STATUS_NO_CAPACITY` |
+| QUIC local bidirectional streams | `LOCAL_BIDI_STREAMS` | modules/foundation/quic/connection.rs | 3 | Policy: as the unidirectional share above |
+| QUIC unidirectional stream table | `MAX_UNI_STREAMS` | modules/foundation/quic/connection.rs | 9 | Sized, not chosen: the peer's credit and the local share side by side, so a local open never takes a slot the peer was promised |
+| QUIC bidirectional stream table | `MAX_BIDI_STREAMS` | modules/foundation/quic/connection.rs | 6 | Sized, not chosen: as the unidirectional table |
+| QUIC connection IDs owed retirement | `RETIRE_QUEUE` | modules/foundation/quic/connection.rs | 4 | Sized, not chosen: at most two of the peer's IDs are active (`active_connection_id_limit` = 2) plus the one the previous path still uses, so no more than three can be owed at once |
 | QUIC datagram frame ceiling | `QUIC_DGRAM_MAX` | modules/foundation/quic/connection.rs | 1500 | Policy: the wire layer caps a UDP datagram at one Ethernet MTU |
 | QUIC sent-datagram ceiling | `QUIC_MAX_DATAGRAM_SIZE` | modules/foundation/quic/connection.rs | 1200 | Policy: what this endpoint will itself send, held under the MTU ceiling above so a datagram never depends on path discovery to arrive |
+| QUIC bidirectional send buffer | `BIDI_SEND_BUF` | modules/foundation/quic/connection.rs | 4096 | Policy: each byte a bidirectional (or the transparent) stream sends is held until the peer acknowledges it, so a lost packet is sent again; the buffer bounds that stream's bytes in flight to a few packets per round trip. An application write with no room is held and the command channel backs up, never refused or truncated |
+| QUIC unidirectional send buffer | `UNI_SEND_BUF` | modules/foundation/quic/connection.rs | 256 | Policy: as the bidirectional buffer, for a locally-opened unidirectional stream — typically a small control or metadata channel |
 | SMMU stream ids | `MAX_STREAM_IDS` | modules/foundation/smmu/mod.rs | 8 | Policy: stream-id table entries one SMMU module programs; a device past it is refused |
 | TLS checkpoint SNI | `CKPT_SNI_MAX` | modules/foundation/tls/continuity.rs | 64 | Policy, wire-visible in the checkpoint record: a session whose server name is longer is not checkpointable, and is refused rather than truncated |
 | TLS checkpoint ALPN | `CKPT_ALPN_MAX` | modules/foundation/tls/continuity.rs | 16 | Policy, wire-visible in the checkpoint record: as the server-name ceiling above, for the negotiated protocol name |
@@ -397,6 +405,7 @@ MAX_PEER_NAME | modules/foundation/quic/mod.rs | 64 | *
 MAX_CERT_LEN | modules/foundation/quic/mod.rs | 1024 | *
 MAX_ALPN_CFG | modules/foundation/quic/mod.rs | 64 | *
 MAX_TICKETS | modules/foundation/quic/mod.rs | 4 | *
+TRANSPARENT_READ_MAX | modules/foundation/quic/mod.rs | 1200 | *
 MAX_PENDING | modules/foundation/dns/mod.rs | 8 | *
 UPSTREAM_AUTHORITY_MAX | modules/foundation/dns/mod.rs | 64 | *
 UPSTREAM_PATH_MAX | modules/foundation/dns/mod.rs | 64 | *
@@ -426,7 +435,7 @@ MAX_OPEN | modules/foundation/mount/mod.rs | 64 | *
 MAX_LAYERS | modules/foundation/ota_registry/mod.rs | 48 | *
 MAX_DMA_MAPS | modules/foundation/smmu/mod.rs | 32 | *
 MAX_SHADOW_SLOTS | modules/foundation/quic/continuity.rs | 2 | *
-CHECKPOINT_RECORD_MAX | modules/foundation/quic/continuity.rs | 16384 | *
+CHECKPOINT_RECORD_MAX | modules/foundation/quic/continuity.rs | 49152 | *
 ARP_WAIT_MAX | modules/foundation/ip/mod.rs | 64 | *
 RX_DESC_COUNT | modules/drivers/rp1_gem/mod.rs | 192 | *
 FAN_FRAMES_PER_STEP | src/kernel/exec/scheduler/module_types.rs | 64 | *
@@ -452,10 +461,17 @@ MAX_FILES | modules/foundation/fat32/mod.rs | 128 | *
 UNLINK_FREE_SLOTS | modules/foundation/fat32/mod.rs | 8 | *
 MAX_DIR_CLUSTERS | modules/foundation/fat32/mod.rs | 65_536 | *
 MAX_MOUNTS | modules/foundation/mount/mod.rs | 8 | *
-MAX_UNI_STREAMS | modules/foundation/quic/connection.rs | 6 | *
-MAX_BIDI_STREAMS | modules/foundation/quic/connection.rs | 3 | *
+PEER_UNI_CREDIT | modules/foundation/quic/connection.rs | 6 | *
+PEER_BIDI_CREDIT | modules/foundation/quic/connection.rs | 3 | *
+LOCAL_UNI_STREAMS | modules/foundation/quic/connection.rs | 3 | *
+LOCAL_BIDI_STREAMS | modules/foundation/quic/connection.rs | 3 | *
+MAX_UNI_STREAMS | modules/foundation/quic/connection.rs | PEER_UNI_CREDIT + LOCAL_UNI_STREAMS | *
+MAX_BIDI_STREAMS | modules/foundation/quic/connection.rs | PEER_BIDI_CREDIT + LOCAL_BIDI_STREAMS | *
+RETIRE_QUEUE | modules/foundation/quic/connection.rs | 4 | *
 QUIC_DGRAM_MAX | modules/foundation/quic/connection.rs | 1500 | *
 QUIC_MAX_DATAGRAM_SIZE | modules/foundation/quic/connection.rs | 1200 | *
+BIDI_SEND_BUF | modules/foundation/quic/connection.rs | 4096 | *
+UNI_SEND_BUF | modules/foundation/quic/connection.rs | 256 | *
 MAX_STREAM_IDS | modules/foundation/smmu/mod.rs | 8 | *
 CKPT_SNI_MAX | modules/foundation/tls/continuity.rs | 64 | *
 CKPT_ALPN_MAX | modules/foundation/tls/continuity.rs | 16 | *
@@ -540,6 +556,8 @@ NET_SCRATCH_SIZE | modules/foundation/tls/mod.rs | scratch: one net frame around
 MAX_KEY_LEN | modules/foundation/quic/mod.rs | mirror of the registered tls MAX_KEY_LEN, so a key_file shared between them packs identically
 MUX_DATA_MAX | modules/foundation/quic/mod.rs | derived: mux::MUX_QUIC_STREAM_RX_MAX, the contract's published bound
 NET_BUF_SIZE | modules/foundation/quic/mod.rs | scratch: one net frame around one QUIC packet
+ERR_STREAM_LIMIT | modules/foundation/quic/connection.rs | RFC 9000 §20.1 transport error code STREAM_LIMIT_ERROR, a protocol constant
+ERR_CONNECTION_ID_LIMIT | modules/foundation/quic/connection.rs | RFC 9000 §20.1 transport error code CONNECTION_ID_LIMIT_ERROR, a protocol constant
 STATE_ARENA_SIZE | src/kernel/module/loader.rs | mirror of the registered modules/sdk/abi/config.rs ceiling, re-exported for the loader
 RSA_BYTES_MAX | modules/sdk/crypto/rsa.rs | derived: RSA_MODULUS_BITS_MAX in bytes
 RSA_LIMBS_MAX | modules/sdk/crypto/rsa.rs | derived: RSA_MODULUS_BITS_MAX in limbs of the target's word

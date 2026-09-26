@@ -80,8 +80,12 @@
 // handshake-in-progress or closing connection is refused
 // ABORT_UNSUPPORTED_STATE — its lifecycle is not exportable. The shadow is
 // non-emitting until ACTIVATE with a strictly higher epoch and a non-zero
-// fence generation; the importer restores the anti-amplification limit and
-// marks a fresh path validation owed before unrestricted sending.
+// fence generation. The peer's address, validated by the primary, is the
+// one the standby answers from behind the same service address; what the
+// standby does not inherit is the primary's view of the path, so activation
+// restarts congestion control and the round-trip estimate. A connection in
+// the middle of a path validation is not exported: the peer's address is not
+// yet settled.
 
 use abi::contracts::net::session_ctrl as sc;
 
@@ -93,10 +97,11 @@ pub const CONT_FLOW_ID_BYTES: usize = 16;
 /// of state.
 pub const MAX_SHADOW_SLOTS: usize = 2;
 /// Largest checkpoint record the codec produces / accepts. Sized to hold
-/// the full connection state: three bidi (1200+1500) and six uni (256+256)
-/// stream buffers, the retained last-emitted packet, the sealed secret set,
-/// and the fixed header, with headroom.
-pub const CHECKPOINT_RECORD_MAX: usize = 16384;
+/// the full connection state: six bidi (4096 send + 1500 receive) and nine
+/// uni (256+256) stream buffers, the 1-RTT CRYPTO send buffer, the retained
+/// last-emitted packet, the sealed secret set, and the fixed header, with
+/// headroom.
+pub const CHECKPOINT_RECORD_MAX: usize = 49152;
 /// Labelled vault key the continuity secrets are sealed under.
 pub const CONT_LABEL: &[u8] = b"quic-continuity";
 /// Bytes the vault adds to a sealed plaintext: a 12-byte nonce and a
@@ -116,6 +121,26 @@ pub const CONT_SECRET_PT_MAX: usize = 4 * 48
     + MAX_TICKET_LEN;
 /// Record magic.
 const CONT_MAGIC: [u8; 4] = *b"QKR1";
+
+/// Restore a stream's send half from a checkpoint: the bytes held from its
+/// acknowledged base, of which those below `sent` went out. Which packets
+/// carried them is the primary's, so the standby owes every unacknowledged
+/// byte, and the FIN, again.
+fn import_send_half<const N: usize>(
+    send: &mut SendHalf<N>,
+    base: u64,
+    sent: u64,
+    fin: bool,
+    held: &[u8],
+) {
+    *send = SendHalf::empty();
+    send.base = base;
+    send.buf[..held.len()].copy_from_slice(held);
+    send.len = held.len();
+    send.sent = sent;
+    send.fin = fin;
+    send.requeue_unacked();
+}
 
 /// A durable reservation grant carried on `cont_in`: the flow it applies
 /// to, then the grant record. Both are laid out in
@@ -156,6 +181,10 @@ pub struct ShadowSlot {
 
 pub struct ContinuityState {
     shadows: [ShadowSlot; MAX_SHADOW_SLOTS],
+    /// The checkpoint record the primary builds and streams out. Held here,
+    /// not on the stack: a whole connection's state does not belong in a
+    /// step's frame.
+    scratch: [u8; CHECKPOINT_RECORD_MAX],
     /// Fence generation the last ACTIVATE observed (zero refused).
     last_fence_gen: u32,
 }
@@ -389,15 +418,24 @@ unsafe fn serialize_checkpoint(
     idx: usize,
     flow_id: &[u8; CONT_FLOW_ID_BYTES],
     epoch: u32,
-    out: &mut [u8],
 ) -> usize {
     if idx >= MAX_CONNS {
         return 0;
     }
     // A handshake-in-progress or closing/errored connection has no
-    // exportable steady-state lifecycle.
-    if !matches!(s.conns[idx].phase, ConnPhase::Established) || !s.conns[idx].handshake_confirmed {
-        return 0;
+    // exportable steady-state lifecycle, and one whose peer address is
+    // mid-validation has no settled path to hand over.
+    {
+        let c = &s.conns[idx];
+        if !matches!(c.phase, ConnPhase::Established)
+            || !c.handshake_confirmed
+            || !c.peer_validated
+            || c.path_validating
+            || c.old_path_validating
+            || c.peer_cid_starved
+        {
+            return 0;
+        }
     }
     let handle = cont_vault_key(s);
     if handle < 0 {
@@ -468,8 +506,8 @@ unsafe fn serialize_checkpoint(
     }
 
     let now_ms = dev_millis(sys);
-    let mut w = Writer::new(out);
     let c = &s.conns[idx];
+    let mut w = Writer::new(&mut s.continuity.scratch);
     w.bytes(&CONT_MAGIC);
     w.bytes(flow_id);
     w.u32(epoch);
@@ -479,6 +517,35 @@ unsafe fn serialize_checkpoint(
     w.cid(&c.original_dcid, c.original_dcid_len);
     w.bytes(&c.peer.ip);
     w.u16(c.peer.port);
+    // Connection IDs (RFC 9000 §5.1): ours with its sequence, the spare we
+    // issued, the peer's in use and its spare, and retirements still owed.
+    w.u64(c.our_cid_seq);
+    w.u64(c.next_cid_seq);
+    w.cid(&c.alt_cid, c.alt_cid_len);
+    w.u64(c.alt_cid_seq);
+    w.bytes(&c.alt_cid_reset_token);
+    w.u8(u8::from(c.alt_cid_issued) | u8::from(c.new_cid_tx_pending) << 1);
+    w.u64(c.peer_cid_seq);
+    w.cid(&c.spare_peer_cid, c.spare_peer_cid_len);
+    w.u64(c.spare_peer_cid_seq);
+    w.bytes(&c.spare_peer_reset_token);
+    w.u64(c.peer_dcid_seq);
+    w.u8(c.retire_len);
+    let mut q = 0;
+    while q < c.retire_len as usize {
+        w.u64(c.retire_queue[q]);
+        q += 1;
+    }
+    // Stream numbering: the next of our streams to open, the peer's that
+    // have finished, and the application handle counter — so a standby
+    // never reopens a stream or reuses a handle.
+    w.u64(c.next_bidi_idx);
+    w.u64(c.next_uni_idx);
+    w.u64(c.peer_bidi_finished.base);
+    w.u64(c.peer_bidi_finished.bits);
+    w.u64(c.peer_uni_finished.base);
+    w.u64(c.peer_uni_finished.bits);
+    w.u32(c.next_app_handle);
     // Idle timeout as a REMAINING duration, never a host timestamp.
     let elapsed = now_ms.saturating_sub(c.last_activity_ms);
     let idle_remaining = c.idle_timeout_ms.saturating_sub(elapsed);
@@ -510,7 +577,12 @@ unsafe fn serialize_checkpoint(
     w.u8(u8::from(c.key_update_awaiting_ack));
     w.u64(c.key_update_first_pn);
     w.u32(c.one_rtt_pkts_since_phase);
-    w.u64(c.one_rtt.crypto_send_offset);
+    // 1-RTT CRYPTO still unacknowledged, from its acknowledged base.
+    let cs = &c.crypto_send[2];
+    w.u64(cs.base);
+    w.u64(cs.sent);
+    w.u16(cs.len as u16);
+    w.bytes(&cs.buf[..cs.len]);
     w.u64(c.one_rtt.crypto_recv_offset);
     let arc = c.one_rtt.ack_tracker.count.min(MAX_ACK_RANGES as u8);
     w.u8(arc);
@@ -562,20 +634,16 @@ unsafe fn serialize_checkpoint(
             w.u8(if st.locally_initiated { 1 } else { 0 });
             w.u64(st.stream_id);
             w.u32(st.app.handle);
-            w.u64(st.send_off);
+            w.u64(st.send.base);
+            w.u64(st.send.sent);
             w.u64(st.recv_off);
-            w.u8(if st.send_fin_pending || st.send_fin_emitted {
-                1
-            } else {
-                0
-            });
+            w.u8(if st.send.fin { 1 } else { 0 });
             w.u8(if st.recv_fin { 1 } else { 0 });
             w.u64(st.flow.send_max_data);
             w.u64(st.flow.recv_max_data);
             w.u64(st.flow.recv_consumed);
-            let sl = st.send_buf_len.min(st.send_buf.len());
-            w.u16(sl as u16);
-            w.bytes(&st.send_buf[..sl]);
+            w.u16(st.send.len as u16);
+            w.bytes(&st.send.buf[..st.send.len]);
             let rl = st.recv_buf_len.min(st.recv_buf.len());
             w.u16(rl as u16);
             w.bytes(&st.recv_buf[..rl]);
@@ -590,20 +658,16 @@ unsafe fn serialize_checkpoint(
             w.u8(if st.locally_initiated { 1 } else { 0 });
             w.u64(st.stream_id);
             w.u32(st.app.handle);
-            w.u64(st.send_off);
+            w.u64(st.send.base);
+            w.u64(st.send.sent);
             w.u64(st.recv_off);
-            w.u8(if st.send_fin_pending || st.send_fin_emitted {
-                1
-            } else {
-                0
-            });
+            w.u8(if st.send.fin { 1 } else { 0 });
             w.u8(if st.recv_fin { 1 } else { 0 });
             w.u64(st.flow.send_max_data);
             w.u64(st.flow.recv_max_data);
             w.u64(st.flow.recv_consumed);
-            let sl = st.send_buf_len.min(st.send_buf.len());
-            w.u16(sl as u16);
-            w.bytes(&st.send_buf[..sl]);
+            w.u16(st.send.len as u16);
+            w.bytes(&st.send.buf[..st.send.len]);
             let rl = st.recv_buf_len.min(st.recv_buf.len());
             w.u16(rl as u16);
             w.bytes(&st.recv_buf[..rl]);
@@ -627,17 +691,16 @@ unsafe fn serialize_checkpoint(
 ///. The staged connection is left NON-EMITTING (a shadow phase) —
 /// it becomes live only at ACTIVATE.
 unsafe fn import_checkpoint(
-    s: &mut QuicState,
+    sys: &SyscallTable,
+    handle: i32,
     conn: &mut QuicConnection,
     flow_id: &[u8; CONT_FLOW_ID_BYTES],
     epoch: u32,
     record: &[u8],
 ) -> u8 {
-    let handle = cont_vault_key(s);
     if handle < 0 {
         return sc::STATUS_CORRUPT;
     }
-    let sys = &*s.syscalls;
     let mut r = Reader::new(record);
     // Magic + flow + epoch.
     let magic = match r.take(4) {
@@ -691,11 +754,9 @@ unsafe fn import_checkpoint(
     conn.peer = PeerAddr { ip, port };
     conn.recv_ip = ip;
     conn.recv_port = port;
-    let idle_remaining = match r.u64() {
-        Some(v) => v,
-        None => return sc::STATUS_CORRUPT,
-    };
-    conn.idle_timeout_ms = idle_remaining;
+    // Exported only once the address was validated: it is the settled one.
+    conn.peer_validated = true;
+    conn.last_valid_peer = conn.peer;
     macro_rules! rd_u64 {
         ($field:expr) => {
             match r.u64() {
@@ -704,6 +765,67 @@ unsafe fn import_checkpoint(
             }
         };
     }
+    // Connection IDs.
+    rd_u64!(conn.our_cid_seq);
+    rd_u64!(conn.next_cid_seq);
+    match r.cid(&mut conn.alt_cid) {
+        Some(n) => conn.alt_cid_len = n,
+        None => return sc::STATUS_CORRUPT,
+    }
+    rd_u64!(conn.alt_cid_seq);
+    match r.take(16) {
+        Some(t) => conn.alt_cid_reset_token.copy_from_slice(t),
+        None => return sc::STATUS_CORRUPT,
+    }
+    let alt_flags = match r.u8() {
+        Some(v) if v <= 3 => v,
+        _ => return sc::STATUS_CORRUPT,
+    };
+    conn.alt_cid_issued = alt_flags & 1 != 0;
+    conn.new_cid_tx_pending = alt_flags & 2 != 0;
+    rd_u64!(conn.peer_cid_seq);
+    match r.cid(&mut conn.spare_peer_cid) {
+        Some(n) => conn.spare_peer_cid_len = n,
+        None => return sc::STATUS_CORRUPT,
+    }
+    rd_u64!(conn.spare_peer_cid_seq);
+    match r.take(16) {
+        Some(t) => conn.spare_peer_reset_token.copy_from_slice(t),
+        None => return sc::STATUS_CORRUPT,
+    }
+    rd_u64!(conn.peer_dcid_seq);
+    let retire_len = match r.u8() {
+        Some(v) if v as usize <= RETIRE_QUEUE => v,
+        _ => return sc::STATUS_CORRUPT,
+    };
+    let mut q = 0;
+    while q < retire_len as usize {
+        rd_u64!(conn.retire_queue[q]);
+        q += 1;
+    }
+    conn.retire_len = retire_len;
+    // Impossible relations: an ID of ours at or past the next to issue.
+    if conn.our_cid_seq >= conn.next_cid_seq
+        || (conn.alt_cid_len > 0 && conn.alt_cid_seq >= conn.next_cid_seq)
+    {
+        return sc::STATUS_CORRUPT;
+    }
+    // Stream numbering.
+    rd_u64!(conn.next_bidi_idx);
+    rd_u64!(conn.next_uni_idx);
+    rd_u64!(conn.peer_bidi_finished.base);
+    rd_u64!(conn.peer_bidi_finished.bits);
+    rd_u64!(conn.peer_uni_finished.base);
+    rd_u64!(conn.peer_uni_finished.bits);
+    match r.u32() {
+        Some(v) if v != 0 => conn.next_app_handle = v,
+        _ => return sc::STATUS_CORRUPT,
+    }
+    let idle_remaining = match r.u64() {
+        Some(v) => v,
+        None => return sc::STATUS_CORRUPT,
+    };
+    conn.idle_timeout_ms = idle_remaining;
     rd_u64!(conn.send_max_data);
     rd_u64!(conn.peer_max_streams_bidi);
     rd_u64!(conn.peer_max_streams_uni);
@@ -736,7 +858,17 @@ unsafe fn import_checkpoint(
     conn.key_update_awaiting_ack = ku_wait == 1;
     conn.key_update_first_pn = ku_first;
     conn.one_rtt_pkts_since_phase = since;
-    rd_u64!(conn.one_rtt.crypto_send_offset);
+    let (Some(cs_base), Some(cs_sent), Some(cs_len)) = (r.u64(), r.u64(), r.u16()) else {
+        return sc::STATUS_CORRUPT;
+    };
+    let cs_len = cs_len as usize;
+    if cs_len > QUIC_CRYPTO_BUF || cs_sent < cs_base || cs_sent - cs_base > cs_len as u64 {
+        return sc::STATUS_CORRUPT;
+    }
+    let Some(cs_bytes) = r.take(cs_len) else {
+        return sc::STATUS_CORRUPT;
+    };
+    import_send_half(&mut conn.crypto_send[2], cs_base, cs_sent, false, cs_bytes);
     rd_u64!(conn.one_rtt.crypto_recv_offset);
     let arc = match r.u8() {
         Some(v) => v,
@@ -853,7 +985,11 @@ unsafe fn import_checkpoint(
             Some(v) => v,
             None => return sc::STATUS_CORRUPT,
         };
-        let send_off = match r.u64() {
+        let send_base = match r.u64() {
+            Some(v) => v,
+            None => return sc::STATUS_CORRUPT,
+        };
+        let send_sent = match r.u64() {
             Some(v) => v,
             None => return sc::STATUS_CORRUPT,
         };
@@ -885,14 +1021,20 @@ unsafe fn import_checkpoint(
             Some(v) => v as usize,
             None => return sc::STATUS_CORRUPT,
         };
-        if kind == 1 && sl > 256 || kind == 2 && sl > 1200 {
+        // The held bytes run from the acknowledged base past everything
+        // sent; a record claiming otherwise describes no real stream.
+        if kind == 1 && sl > UNI_SEND_BUF
+            || kind == 2 && sl > BIDI_SEND_BUF
+            || send_sent < send_base
+            || send_sent - send_base > sl as u64
+        {
             return sc::STATUS_CORRUPT;
         }
         let sbytes = match r.take(sl) {
             Some(b) => b,
             None => return sc::STATUS_CORRUPT,
         };
-        let mut sbuf = [0u8; 1200];
+        let mut sbuf = [0u8; BIDI_SEND_BUF];
         sbuf[..sl].copy_from_slice(sbytes);
         let rl = match r.u16() {
             Some(v) => v as usize,
@@ -918,16 +1060,12 @@ unsafe fn import_checkpoint(
             st.stream_id = stream_id;
             st.app.handle = handle;
             st.app.open_sent = true;
-            st.send_off = send_off;
             st.recv_off = recv_off;
-            st.send_fin_emitted = send_fin;
             st.recv_fin = recv_fin;
             st.flow.send_max_data = f_send;
             st.flow.recv_max_data = f_recv;
             st.flow.recv_consumed = f_cons;
-            let cl = sl.min(st.send_buf.len());
-            st.send_buf[..cl].copy_from_slice(&sbuf[..cl]);
-            st.send_buf_len = cl;
+            import_send_half(&mut st.send, send_base, send_sent, send_fin, &sbuf[..sl]);
             let crl = rl.min(st.recv_buf.len());
             st.recv_buf[..crl].copy_from_slice(&rbuf[..crl]);
             st.recv_buf_len = crl;
@@ -943,16 +1081,12 @@ unsafe fn import_checkpoint(
             st.stream_id = stream_id;
             st.app.handle = handle;
             st.app.open_sent = true;
-            st.send_off = send_off;
             st.recv_off = recv_off;
-            st.send_fin_emitted = send_fin;
             st.recv_fin = recv_fin;
             st.flow.send_max_data = f_send;
             st.flow.recv_max_data = f_recv;
             st.flow.recv_consumed = f_cons;
-            let cl = sl.min(st.send_buf.len());
-            st.send_buf[..cl].copy_from_slice(&sbuf[..cl]);
-            st.send_buf_len = cl;
+            import_send_half(&mut st.send, send_base, send_sent, send_fin, &sbuf[..sl]);
             let crl = rl.min(st.recv_buf.len());
             st.recv_buf[..crl].copy_from_slice(&rbuf[..crl]);
             st.recv_buf_len = crl;
@@ -1045,6 +1179,9 @@ unsafe fn import_checkpoint(
     conn.one_rtt.prev_read_keys = prev;
     conn.one_rtt.prev_read_valid = prev_valid;
     conn.one_rtt.keys_set = true;
+    // An exported connection is past its handshake (RFC 9001 §4.9).
+    conn.initial.discarded = true;
+    conn.handshake.discarded = true;
     // Zeroize the opened plaintext.
     let mut z = 0;
     while z < n {
@@ -1062,15 +1199,23 @@ unsafe fn import_checkpoint(
     sc::STATUS_OK
 }
 
-/// Promote an imported shadow to a live connection under a strictly higher
-/// epoch and a non-zero fence generation. The reservation resumes at
-/// the checkpoint high-water so packet numbers never repeat across the
-/// takeover, the anti-amplification limit is restored, and a fresh path
-/// validation is required before unrestricted sending. Returns the
-/// live connection index, or -1 on refusal.
+/// Promote an imported connection to a live slot under a strictly higher
+/// epoch and a non-zero fence generation. The reservation resumes at the
+/// checkpoint high-water so packet numbers never repeat across the
+/// takeover. The connection is the peer's same connection on the same
+/// validated address; what the standby lacks is the primary's view of the
+/// path, so congestion control and the round-trip estimate start afresh.
+/// Returns the live connection index, or -1 on refusal.
+///
+/// `from` is copied into the live slot, not moved through the stack: a
+/// connection is too large for a step's frame. The caller clears it.
+///
+/// # Safety
+/// `from` points to a connection inside `s` that is not one of `s.conns`'
+/// free slots, and nothing else holds a reference to it.
 unsafe fn activate_shadow(
     s: &mut QuicState,
-    mut conn: QuicConnection,
+    from: *mut QuicConnection,
     new_epoch: u32,
     fence_gen: u32,
     prior_epoch: u32,
@@ -1082,17 +1227,17 @@ unsafe fn activate_shadow(
         Some(i) => i,
         None => {
             // Refused for want of a slot. The connection handed in holds
-            // every opened secret; it is retired here rather than dropped
+            // every opened secret; it is retired here rather than left
             // with them still in it.
-            retire_connection(&mut conn);
+            retire_connection(&mut *from);
             return -1;
         }
     };
+    core::ptr::copy_nonoverlapping(from, core::ptr::addr_of_mut!(s.conns[idx]), 1);
     // The floor the checkpoint carried, seeded into the shadow's reservation
     // at import; any delta since may have raised it.
-    let floor = conn.send_pn_res.high_water().max(conn.one_rtt.next_send_pn);
-    s.conns[idx] = conn;
     let c = &mut s.conns[idx];
+    let floor = c.send_pn_res.high_water().max(c.one_rtt.next_send_pn);
     c.phase = ConnPhase::Established;
     c.cont_epoch = new_epoch;
     // A retained read phase is retained from now: the window the primary
@@ -1106,12 +1251,14 @@ unsafe fn activate_shadow(
     c.send_pn_res = NonceReservation::resume(new_epoch, floor);
     c.pn_res_durable = false;
     c.one_rtt.next_send_pn = floor;
-    // Restore anti-amplification / path-validation posture: a changed path
-    // does not inherit unrestricted sending credit.
+    // This host's path to the peer starts from initial congestion and RTT
+    // state (RFC 9002 §B.3, §5.3); nothing it sends is in flight yet.
     c.bytes_in_flight = 0;
     c.congestion_window = INITIAL_WINDOW;
     c.ssthresh = u64::MAX;
     c.recovery_start_time = 0;
+    c.rtt = RttSample::new();
+    c.pto_count = 0;
     c.last_activity_ms = dev_millis(&*s.syscalls);
     s.continuity.last_fence_gen = fence_gen;
     idx as i32
@@ -1288,11 +1435,11 @@ unsafe fn cont_apply_quiesce(s: &mut QuicState, payload: &[u8], _begin: bool) {
     };
     let (out_pending, in_pending) = {
         let c = &s.conns[idx];
-        let mut op: u32 = c.stream_send_buf_len as u32;
+        let mut op: u32 = c.stream_send.len as u32;
         let mut ip: u32 = c.stream_recv_buf_len as u32;
         let mut k = 0;
         while k < MAX_BIDI_STREAMS {
-            op += c.bidi_streams[k].send_buf_len as u32;
+            op += c.bidi_streams[k].send.len as u32;
             ip += c.bidi_streams[k].recv_buf_len as u32;
             k += 1;
         }
@@ -1337,8 +1484,7 @@ unsafe fn cont_apply_cut_export(s: &mut QuicState, payload: &[u8]) {
         );
         return;
     }
-    let mut rec = [0u8; CHECKPOINT_RECORD_MAX];
-    let n = serialize_checkpoint(s, idx, &flow, epoch, &mut rec);
+    let n = serialize_checkpoint(s, idx, &flow, epoch);
     if n == 0 {
         cont_reply(
             s,
@@ -1359,9 +1505,9 @@ unsafe fn cont_apply_cut_export(s: &mut QuicState, payload: &[u8]) {
         s.conns[idx].send_pn_res.void_outstanding();
     }
     let ckpt_gen = s.conns[idx].cont_delta_no.wrapping_add(1);
-    let digest = record_sha256(&rec[..n]);
-    let crc = handoff_crc32(&rec[..n]);
-    emit_checkpoint_stream(s, &flow, epoch, ckpt_gen, &rec[..n], &digest, crc);
+    let digest = record_sha256(&s.continuity.scratch[..n]);
+    let crc = handoff_crc32(&s.continuity.scratch[..n]);
+    emit_checkpoint_stream(s, &flow, epoch, ckpt_gen, n, &digest, crc);
     // The cut manifest names the record and carries the sealed object
     // (the sealed secret set already lives inside the record's tail).
     let mut body = [0u8; 4 + 4 + 32 + 1 + 2];
@@ -1373,20 +1519,22 @@ unsafe fn cont_apply_cut_export(s: &mut QuicState, payload: &[u8]) {
     cont_reply(s, &flow, epoch, sc::CR_CUT, sc::STATUS_OK, &body);
 }
 
-/// Chunk a checkpoint record onto `cont_out` as CHECKPOINT_BEGIN /
-/// CHECKPOINT_NEXT* / CHECKPOINT_COMMIT (CRC32 over the chunk stream).
+/// Chunk the first `len` bytes of the checkpoint record in the scratch
+/// onto `cont_out` as CHECKPOINT_BEGIN / CHECKPOINT_NEXT* /
+/// CHECKPOINT_COMMIT (CRC32 over the chunk stream).
 unsafe fn emit_checkpoint_stream(
-    s: &mut QuicState,
+    s: &QuicState,
     flow: &[u8; CONT_FLOW_ID_BYTES],
     epoch: u32,
     ckpt_gen: u32,
-    record: &[u8],
+    len: usize,
     digest: &[u8; 32],
     crc: u32,
 ) {
     if s.cont_out < 0 {
         return;
     }
+    let record = &s.continuity.scratch[..len];
     let sys = &*s.syscalls;
     // BEGIN.
     {
@@ -1683,10 +1831,19 @@ unsafe fn release_held(s: &mut QuicState, idx: usize) -> bool {
         &mut s.net_scratch,
     );
     if sent {
-        s.conns[idx].cont_emission_held = false;
-        s.conns[idx].cont_held_confirmed = false;
-        s.conns[idx].cont_horizon_steps = 0;
-        s.conns[idx].last_activity_ms = dev_millis(sys);
+        let now = dev_millis(sys);
+        let conn = &mut s.conns[idx];
+        conn.cont_emission_held = false;
+        conn.cont_held_confirmed = false;
+        conn.cont_horizon_steps = 0;
+        conn.last_activity_ms = now;
+        // The packet reached the wire now, not when it was built: loss and
+        // probe timers run from here.
+        let pn = conn.one_rtt.last_emitted_pn;
+        conn.one_rtt.last_emitted_ms = now;
+        if let Some((_, _, _, _, ix)) = conn.one_rtt.find_sent(pn) {
+            conn.one_rtt.sent_packets[ix].sent_ms = now;
+        }
     }
     sent
 }
@@ -2194,20 +2351,30 @@ unsafe fn cont_apply_ckpt_commit(s: &mut QuicState, payload: &[u8]) {
         );
         return;
     }
-    // Import the record into the shadow connection. Move the record out to a
-    // scratch to avoid overlapping borrows.
-    let mut rec = [0u8; CHECKPOINT_RECORD_MAX];
-    rec[..total_len].copy_from_slice(&s.continuity.shadows[slot].record[..total_len]);
-    let mut staged = QuicConnection::new();
-    let st = import_checkpoint(s, &mut staged, &flow_arr, epoch, &rec[..total_len]);
+    // Import the record straight into the shadow's connection, which is
+    // not live: a refused import leaves nothing a caller could use.
+    let handle = cont_vault_key(s);
+    let sys = &*s.syscalls;
+    let st = {
+        let sh = &mut s.continuity.shadows[slot];
+        import_checkpoint(
+            sys,
+            handle,
+            &mut sh.conn,
+            &flow_arr,
+            epoch,
+            &sh.record[..total_len],
+        )
+    };
     if st != sc::STATUS_OK {
-        s.continuity.shadows[slot].phase = ShadowPhase::Prepared;
+        let sh = &mut s.continuity.shadows[slot];
+        retire_connection(&mut sh.conn);
+        sh.phase = ShadowPhase::Prepared;
         cont_reply(s, &flow_arr, epoch, sc::CR_CHECKPOINT_COMMITTED, st, &[]);
         return;
     }
     {
         let sh = &mut s.continuity.shadows[slot];
-        sh.conn = staged;
         sh.phase = ShadowPhase::Committed;
         sh.record_digest = expected_digest;
     }
@@ -2329,11 +2496,10 @@ unsafe fn cont_apply_activate(s: &mut QuicState, payload: &[u8]) {
         );
         return;
     }
-    // Move the shadow connection out and promote it.
-    let mut promoted = QuicConnection::new();
-    core::mem::swap(&mut promoted, &mut s.continuity.shadows[slot].conn);
-    promoted.cont_flow_id = flow_arr;
-    let live = activate_shadow(s, promoted, new_epoch, fence_gen, prior_epoch);
+    // Promote the shadow connection into a live slot.
+    s.continuity.shadows[slot].conn.cont_flow_id = flow_arr;
+    let from = core::ptr::addr_of_mut!(s.continuity.shadows[slot].conn);
+    let live = activate_shadow(s, from, new_epoch, fence_gen, prior_epoch);
     {
         let sh = &mut s.continuity.shadows[slot];
         sh.phase = ShadowPhase::Free;

@@ -187,9 +187,13 @@ pub const CMD_MUX_STREAM_CLOSE: u8 = 0xB3;
 /// Send bytes on a stream.
 /// Payload: [session_id: u32 LE] [stream_id: u32 LE] [data: ...].
 ///
-/// Reliable and all-or-nothing: a write the provider cannot take whole
-/// is refused with MSG_MUX_STREAM_ERROR rather than truncated, and the
-/// stream cursor does not advance.
+/// Reliable and all-or-nothing: a write is never truncated. One the
+/// provider has no room for yet — its stream's send buffer or flow-control
+/// window is full — is held, and the provider reads no further command
+/// until it applies, so the command channel backs up and the application's
+/// own channel write is what waits. A write that can never apply — an
+/// unknown stream, or one whose send half is closed — is refused with
+/// MSG_MUX_STREAM_ERROR.
 pub const CMD_MUX_STREAM_SEND: u8 = 0xB4;
 
 /// Acknowledge a flow-control credit grant from the consumer (consumer
@@ -311,11 +315,6 @@ pub const MSG_MUX_STREAM_CLOSED: u8 = 0xC4;
 /// Received bytes on a stream.
 /// Payload: [session_id: u32 LE] [stream_id: u32 LE] [data: ...].
 pub const MSG_MUX_STREAM_RX: u8 = 0xC5;
-
-/// Stream is ready to accept more outbound bytes (flow-control credit
-/// granted by the peer).
-/// Payload: [session_id: u32 LE] [stream_id: u32 LE] [bytes: u32 LE].
-pub const MSG_MUX_STREAM_READY: u8 = 0xC6;
 
 /// Received an unreliable datagram on the session (RFC 9221 QUIC
 /// DATAGRAM). Session-scoped. Payload: [session_id: u32 LE] [data: ...].
@@ -444,15 +443,14 @@ pub const STREAM_APP_ERROR_BODY: usize = APP_ERROR_BYTES;
 pub const SESSION_OPENED_BODY_MIN: usize = 1 + 1 + 1;
 
 /// Maximum data bytes the QUIC provider accepts in one
-/// `CMD_MUX_STREAM_SEND` (it matches the engine's single-MTU stream send
-/// buffer). A reliable write larger than this is refused with
-/// `MSG_MUX_STREAM_ERROR`, not truncated — the engine reads frames with
-/// an alignment-preserving reader, so an oversize frame neither desyncs
-/// the FIFO nor silently loses its tail.
+/// `CMD_MUX_STREAM_SEND`: one packet's worth of stream data. A reliable
+/// write larger than this is refused, not truncated — the engine reads
+/// frames with an alignment-preserving reader, so an oversize frame
+/// neither desyncs the FIFO nor silently loses its tail.
 ///
-/// This is a real transport bound, independent of any protocol: it is
-/// how much unframed application data one stream can hold pending
-/// packetisation.
+/// This is a real transport bound, independent of any protocol. A stream
+/// holds several such writes: its send buffer keeps each byte until the
+/// peer acknowledges it, so a lost packet can be sent again.
 pub const MUX_QUIC_STREAM_SEND_MAX: usize = 1200;
 
 /// Maximum data bytes the QUIC provider delivers in one
@@ -467,8 +465,8 @@ pub const MUX_QUIC_STREAM_SEND_MAX: usize = 1200;
 /// request or response that is simply short.
 ///
 /// This is larger than [`MUX_QUIC_STREAM_SEND_MAX`], and deliberately so.
-/// The send bound is what one stream may hold pending packetisation; this
-/// is what a peer's packets may already have delivered, and the transport
+/// The send bound is what one write may carry; this is what a peer's
+/// packets may already have delivered, and the transport
 /// does not get to choose how much a peer sends.
 ///
 /// A consumer that cannot accept this much MUST fail the stream explicitly

@@ -444,15 +444,82 @@ pub fn validate_continuity_on(
                 }
                 match mech {
                     "native_primitive" => {
-                        // The wire protocol itself carries migration —
-                        // a natively-migratable mux transport must be
-                        // present (e.g. transport.mux.quic).
+                        // The wire protocol itself carries migration: the
+                        // peer moves to a new address and the connection
+                        // follows it. That is a property of the connection
+                        // state, so the anchor is the module that holds it —
+                        // it carries the mux (`transport.mux.*`) and owns the
+                        // client-visible transport (`transport.anchor.mux`).
+                        // The server does not move, so nothing is fenced,
+                        // reserved or handed over, and the terms of a
+                        // takeover are mis-statements here.
+                        for (field, instead) in [
+                            ("aead", "the AEAD class is a takeover term"),
+                            ("directory", "no session is handed to another host"),
+                            (
+                                "failover_budget_ms",
+                                "the serving host does not fail over; the peer's own \
+                                 absence is bounded by the idle timeout it negotiated",
+                            ),
+                            ("client_keepalive_ms", "there is no failover to fit under it"),
+                        ] {
+                            if g.get(field).is_some() {
+                                return Err(err(format!(
+                                    "`{field}` is not valid with mechanism native_primitive \
+                                     ({instead}); a standby continuing the connection is \
+                                     mechanism platform_replicated_state"
+                                )));
+                            }
+                        }
                         if !graph_has("transport.mux") {
                             return Err(err(
                                 "mechanism native_primitive but no module in the graph \
                                  provides a `transport.mux.*` transport"
                                     .into(),
                             ));
+                        }
+                        let a = anchor.ok_or_else(|| {
+                            err("mechanism native_primitive requires an `anchor`: the module \
+                                 carrying the natively-migratable mux"
+                                .into())
+                        })?;
+                        if !module_has(a, "transport.mux") {
+                            return Err(err(format!(
+                                "anchor `{a}` does not carry a `transport.mux.*` transport; \
+                                 under native_primitive the migration happens in the mux \
+                                 connection's own state, so the anchor must be the module \
+                                 that carries it"
+                            )));
+                        }
+                        if !module_has(a, "transport.anchor.mux") {
+                            return Err(err(format!(
+                                "anchor `{a}` carries a mux but does not declare \
+                                 `transport.anchor.mux`, so it does not own the \
+                                 client-visible transport"
+                            )));
+                        }
+                        // What the anchor instance is configured to do decides
+                        // whether the wire offers migration at all: only a
+                        // server follows its peer, and one that advertises
+                        // `disable_active_migration` tells the peer not to move.
+                        let param = |key: &str| -> Option<u64> {
+                            instance_entry(config, a).and_then(|m| m.get(key)).and_then(|v| {
+                                v.as_u64().or_else(|| v.as_bool().map(u64::from))
+                            })
+                        };
+                        if param("mode") == Some(0) {
+                            return Err(err(format!(
+                                "anchor `{a}` is configured as a client (`mode: 0`); \
+                                 native_primitive covers a peer migrating to a new \
+                                 address, which a server anchor follows"
+                            )));
+                        }
+                        if param("disable_migration").is_some_and(|v| v != 0) {
+                            return Err(err(format!(
+                                "anchor `{a}` sets `disable_migration`, advertising \
+                                 disable_active_migration to its peers; drop it, or \
+                                 declare a class that does not rely on the peer moving"
+                            )));
                         }
                     }
                     "platform_replicated_state" => {
@@ -537,8 +604,7 @@ pub fn validate_continuity_on(
                         }
                         // A stream or mux anchor owns its transport only on
                         // bare metal: on a hosted platform TCP lives in the
-                        // host kernel and no checkpoint can capture it
-                        // host kernel, and no checkpoint can capture it.
+                        // host kernel and no checkpoint can capture it.
                         if *anchor_cap != "transport.anchor.datagram" {
                             match target {
                                 Some(t) if crate::target_facts::TargetFacts::owns_transport(t) => {}

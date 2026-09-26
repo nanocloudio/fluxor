@@ -273,6 +273,15 @@ model these support):
 | `transport.anchor.stream.secure` | Stable secure stream-facing anchor. tls declares `aead = "implicit_counter"` with `horizon = "exact"` |
 | `transport.anchor.datagram` | Stable datagram-facing anchor |
 | `transport.anchor.mux` | Stable multiplexed-session anchor. quic declares `aead = "on_wire_sequence"` |
+
+The transport and anchor branches name different roles, and one module may
+carry both. `quic` declares `transport.mux.quic` and `transport.anchor.mux`
+because its connection state is both at once: the mux that migrates
+natively when the peer changes address, and the anchor that owns the
+client-visible transport. The two branches are siblings under `transport`,
+so neither satisfies the other; a rule that needs the mux asks for
+`transport.mux`, and a module that is the mux says so, rather than an
+anchor role standing in for a transport it may not carry.
 | `session.worker` | Movable session / application worker |
 | `session.directory` | Placement and continuity metadata service |
 | `session.resume` | Resumable session state support. Facts `scope` (`local`: the ticket names state only the minting host holds; `fleet`: the ticket is the state, sealed under a vault key any admitted host with that generation opens) and `early_data` (`off`, or `local_single_use` against the minting host's single-use record). quic declares `local` / `local_single_use` |
@@ -326,6 +335,24 @@ multi-partition ack, and with `broadcast = "degenerate"` is MQTT's single
 ordering unit. The admitted facts and their values are
 `CAPABILITY_FACTS` in `contracts/src/vocabulary.rs`; unknown names and
 unadmitted values are rejected at manifest parse.
+
+A fact whose value depends on the silicon takes the same per-target table
+as a port's `buffer_size`:
+
+```toml
+[capability_facts."stream.ordered_ack"]
+max_payload = { default = 4096, rp2040 = 512 }
+```
+
+Keys are the silicon ids `rp2040`, `rp2350`, `bcm2712` and `wasm` (a
+`linux` host loads the `bcm2712` build), plus an optional `default`. The
+composer resolves the value for the graph's target, so compose-time checks
+such as a producer's `max_payload` against a provider's compare the
+numbers that target runs with. A table without `default` must name every
+silicon in the module's `hardware_targets`; a partial table, an empty
+table, an unknown key, or an entry the fact's schema does not admit is
+refused at manifest parse, whichever target is being built. Plain string
+and integer facts hold for every target.
 
 `replication.state_machine` sits one layer above the storage
 read / write / durability surfaces: its index echo, snapshot callbacks, and
@@ -527,9 +554,20 @@ as graph structure:
   capability; every worker must carry `session.worker`; with more than one
   worker (an anchor-preserved swap target), every worker must also carry
   `session.handoff`.
-- `transport_migratable` with mechanism `native_primitive` — some module
-  in the graph must provide a `transport.mux.*` transport, since the wire
-  protocol itself carries the migration.
+- `transport_migratable` with mechanism `native_primitive` — the wire
+  protocol itself carries the migration, so the declaration must name an
+  `anchor` that both carries a `transport.mux.*` transport and declares
+  `transport.anchor.mux`: the connection state that follows the peer is
+  the anchor's own. The anchor instance must be a server (`mode` other
+  than `0`) and must not set `disable_migration`. Nothing is fenced,
+  reserved or handed to another host, so `aead`, `directory`,
+  `failover_budget_ms` and `client_keepalive_ms` are refused; the peer's
+  absence while it moves is bounded by the idle timeout it negotiated,
+  not by a failover budget. There is no target restriction: the migrating
+  state is the quic module's on every target, including hosted ones. The
+  mechanism covers a peer changing address — a rebinding, or an active
+  migration onto a connection ID the anchor issued (RFC 9000 §9). A
+  standby host continuing the connection is `platform_replicated_state`.
 - `transport_migratable` with mechanism `platform_replicated_state` — the
   declaration must name an `anchor` carrying `transport.anchor.datagram`,
   `transport.anchor.stream.secure` or `transport.anchor.mux` and a

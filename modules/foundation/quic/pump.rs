@@ -29,6 +29,9 @@ fn cipher_suites_offer(client_suites: &[u8], want: u16) -> bool {
 }
 
 unsafe fn pump_session(s: &mut QuicState, idx: usize) -> bool {
+    // Handshake bytes a full driver could not take earlier go first.
+    deliver_crypto(&mut s.conns[idx], EncLevel::Initial);
+    deliver_crypto(&mut s.conns[idx], EncLevel::Handshake);
     let st = s.conns[idx].driver.hs_state;
     // First-contact attribution: the longest single handshake step since
     // boot, and which state it was, ride the `[quic] hb` beat (`fcs=`/`fcu=`).
@@ -1786,6 +1789,10 @@ unsafe fn drain_inbound_one(s: &mut QuicState, idx: usize) -> bool {
                         // == our_cid (we keep one SCID across Retry +
                         // ServerHello).
                         conn.used_retry = true;
+                        // A valid Retry token proves the client's address
+                        // (RFC 9000 §8.1).
+                        conn.peer_validated = true;
+                        conn.last_valid_peer = conn.peer;
                         conn.original_dcid[..odcid_len_for_tp]
                             .copy_from_slice(&odcid_for_tp[..odcid_len_for_tp]);
                         conn.original_dcid_len = odcid_len_for_tp as u8;
@@ -1817,6 +1824,12 @@ unsafe fn drain_inbound_one(s: &mut QuicState, idx: usize) -> bool {
                 return false;
             }
         };
+        if space.discarded {
+            // RFC 9001 §4.9: this space's keys are gone; its packets are
+            // dropped unread.
+            mark_inbound_consumed(conn);
+            return false;
+        }
         if !space.keys_set {
             // Keys for this level not yet installed — leave the bytes
             // in place so the next pump iteration (which may install
@@ -1845,8 +1858,6 @@ unsafe fn drain_inbound_one(s: &mut QuicState, idx: usize) -> bool {
         } else {
             space.largest_recv_pn
         };
-        space.ack_pending = true;
-        space.ack_tracker.record(parsed.pn, 0);
         // Idle-timeout activity stamp (RFC 9000 §10.1).
         let now_ms = dev_millis(&*s.syscalls);
         conn.last_activity_ms = now_ms;
@@ -1873,7 +1884,26 @@ unsafe fn drain_inbound_one(s: &mut QuicState, idx: usize) -> bool {
         // Migration is a 1-RTT concern only; the non-probing flag is
         // unused at Initial / Handshake level.
         let mut np_ignored = false;
+        conn.rx_unaccepted = false;
         process_frames(conn, level, payload, now_ms, &mut np_ignored);
+        // Acknowledged once processed, unless part of it could not be taken
+        // (RFC 9000 §13.1).
+        if !conn.rx_unaccepted {
+            let space = match level {
+                EncLevel::Initial => &mut conn.initial,
+                _ => &mut conn.handshake,
+            };
+            space.ack_pending = true;
+            space.ack_tracker.record(parsed.pn, 0);
+        }
+        // A Handshake packet from the client proves it holds its address
+        // (RFC 9000 §8.1), and ends the server's use of Initial keys (RFC
+        // 9001 §4.9.1).
+        if conn.is_server && matches!(level, EncLevel::Handshake) {
+            conn.peer_validated = true;
+            conn.last_valid_peer = conn.peer;
+            conn.discard_space(EncLevel::Initial);
+        }
 
         // Advance past this packet — coalesced peer per RFC 9000 §12.2
         // may follow with another packet in the same datagram.
@@ -2004,17 +2034,12 @@ unsafe fn drain_inbound_one(s: &mut QuicState, idx: usize) -> bool {
                 mirror_abandon(sys, s.cont_out, conn);
             }
         }
+        let highest = pn >= conn.one_rtt.largest_recv_pn;
         conn.one_rtt.largest_recv_pn = if pn > conn.one_rtt.largest_recv_pn {
             pn
         } else {
             conn.one_rtt.largest_recv_pn
         };
-        // Acknowledged to the peer now, unless the mirror holds it until
-        // the standby has confirmed the number.
-        if !on_one_rtt_received(&*s.syscalls, s.cont_out, conn, pn) {
-            conn.one_rtt.ack_pending = true;
-            conn.one_rtt.ack_tracker.record(pn, 0);
-        }
         // Server: receipt of an ack-eliciting 1-RTT packet confirms
         // the handshake (RFC 9001 §4.1.2).
         if conn.is_server {
@@ -2023,57 +2048,116 @@ unsafe fn drain_inbound_one(s: &mut QuicState, idx: usize) -> bool {
         let payload = &pkt_copy[body_off..body_off + body_len];
         let now_ms = dev_millis(&*s.syscalls);
         let mut non_probing = false;
-        process_frames(conn, EncLevel::OneRtt, payload, now_ms, &mut non_probing);
-        arm_migration_if_new_path(conn, &*s.syscalls, migration_enabled, non_probing);
+        process_one_rtt_payload(
+            &*s.syscalls,
+            s.cont_out,
+            conn,
+            pn,
+            payload,
+            now_ms,
+            &mut non_probing,
+        );
+        arm_migration_if_new_path(conn, &*s.syscalls, migration_enabled, non_probing, highest);
         mark_inbound_consumed(conn);
         true
     }
 }
 
-/// RFC 9000 §9 connection migration, armed ONLY after a 1-RTT packet has
-/// been AEAD-authenticated AND parsed, and ONLY when it was a NON-probing
-/// packet (§9.1). The source 4-tuple (`recv_*`, recorded at ingest) is
-/// compared to the active path; a genuine change carried by an
-/// authenticated, non-probing packet from a confirmed-handshake
-/// connection arms path validation toward the new address.
+/// Process a 1-RTT packet's frames, then acknowledge it — unless part of
+/// it could not be taken (RFC 9000 §13.1: a packet is acknowledged only
+/// once everything in it is processed, so the peer sends what was not
+/// taken again), or the mirror holds the acknowledgement until the standby
+/// has confirmed the number.
+pub(crate) unsafe fn process_one_rtt_payload(
+    sys: &SyscallTable,
+    cont_out: i32,
+    conn: &mut QuicConnection,
+    pn: u64,
+    payload: &[u8],
+    now_ms: u64,
+    non_probing: &mut bool,
+) {
+    conn.rx_unaccepted = false;
+    process_frames(conn, EncLevel::OneRtt, payload, now_ms, non_probing);
+    if !conn.rx_unaccepted && !on_one_rtt_received(sys, cont_out, conn, pn) {
+        conn.one_rtt.ack_pending = true;
+        conn.one_rtt.ack_tracker.record(pn, 0);
+    }
+}
+
+/// RFC 9000 §9 connection migration, decided ONLY after a 1-RTT packet
+/// has been AEAD-authenticated AND parsed, and ONLY for a NON-probing
+/// packet (§9.1) that is the highest-numbered received (§9.3), so a
+/// reordered packet from an old address cannot pull the connection back.
 ///
-/// Two guards matter:
-///  • arming pre-auth would let a spoofed packet bearing a known DCID
-///    redirect challenge traffic and overwrite validation state;
-///  • arming on a probing-only packet (a bare PATH_CHALLENGE /
-///    PATH_RESPONSE, which a peer can send from any address) would let
-///    path probes themselves drive migration.
+/// The source (`recv_*`, recorded at ingest) differing from `peer` means
+/// the peer has migrated there. Sending moves to the new address at once
+/// (§9.3) — bounded by three times what it has sent until it answers a
+/// PATH_CHALLENGE (§8, §9.3.1) — and the previously active path is
+/// challenged too, so a forwarded copy cannot move the connection
+/// unnoticed (§9.3.3). A packet from the last validated address while a
+/// new one is still unproven returns there without validation (§9.3). A
+/// peer that moved onto our spare connection ID is answered on a spare of
+/// its own (§9.5).
 ///
-/// No-op when migration is disabled, the packet was probing-only, the
-/// handshake isn't confirmed, or the source matches the active path.
+/// Arming pre-auth would let a spoofed packet bearing a known DCID
+/// redirect traffic; arming on a probing-only packet would let path
+/// probes themselves drive migration.
 pub(crate) unsafe fn arm_migration_if_new_path(
     conn: &mut QuicConnection,
     sys: &SyscallTable,
     migration_enabled: bool,
     non_probing: bool,
+    highest: bool,
 ) {
-    if !(migration_enabled
-        && non_probing
-        && conn.handshake_confirmed
-        && !conn.peer.matches(&conn.recv_ip, conn.recv_port))
-    {
+    if !(migration_enabled && non_probing && conn.handshake_confirmed && highest) {
         return;
     }
-    let already =
-        conn.path_validating && conn.cand_ip == conn.recv_ip && conn.cand_port == conn.recv_port;
-    if !already {
-        // New candidate: fresh challenge bytes.
-        conn.cand_ip = conn.recv_ip;
-        conn.cand_port = conn.recv_port;
-        dev_csprng_fill(sys, conn.path_challenge_data.as_mut_ptr(), 8);
-        conn.path_validating = true;
-        conn.path_validate_ms = dev_millis(sys);
-        conn.path_challenge_tx_ms = 0;
+    let from = PeerAddr {
+        ip: conn.recv_ip,
+        port: conn.recv_port,
+    };
+    if conn.peer.matches(&from.ip, from.port) {
+        return;
     }
-    // (Re)arm the probe on every authenticated non-probing packet from the
-    // candidate; it is also retried on PTO (see quic_pto_check) so a
-    // wire-lost challenge is resent even if the peer goes quiet.
+    if !conn.peer_validated && conn.last_valid_peer.matches(&from.ip, from.port) {
+        conn.peer = from;
+        conn.peer_validated = true;
+        conn.path_validating = false;
+        conn.path_challenge_tx_pending = false;
+        return;
+    }
+    if conn.peer_validated {
+        conn.last_valid_peer = conn.peer;
+    }
+    conn.path_reset_rtt = conn.last_valid_peer.ip != from.ip;
+    conn.peer = from;
+    conn.peer_validated = false;
+    conn.amp_rx = conn.recv_len as u64;
+    conn.amp_tx = 0;
+
+    let now = dev_millis(sys);
+    conn.cand_ip = from.ip;
+    conn.cand_port = from.port;
+    dev_csprng_fill(sys, conn.path_challenge_data.as_mut_ptr(), 8);
+    conn.path_validating = true;
+    conn.path_validate_ms = now;
+    conn.path_challenge_tx_ms = 0;
     conn.path_challenge_tx_pending = true;
+
+    if conn.old_path_cid_retire {
+        // A previous move's old path is still being probed: that ends now.
+        conn.finish_old_path();
+    }
+    conn.old_path = conn.last_valid_peer;
+    dev_csprng_fill(sys, conn.old_path_challenge_data.as_mut_ptr(), 8);
+    conn.old_path_validating = true;
+    conn.old_path_challenge_tx_pending = true;
+
+    if conn.recv_dcid_seq != conn.peer_dcid_seq {
+        conn.peer_dcid_seq = conn.recv_dcid_seq;
+        conn.rotate_peer_cid();
+    }
 }
 
 fn mark_inbound_consumed(conn: &mut QuicConnection) {
@@ -2356,7 +2440,17 @@ unsafe fn handle_retry(s: &mut QuicState, idx: usize, off: usize, avail: usize) 
     conn.initial.next_send_pn = 0;
     conn.initial.largest_recv_pn = 0;
     conn.initial.crypto_recv_offset = 0;
-    conn.initial.crypto_send_offset = 0;
+    conn.crypto_send[0] = SendHalf::empty();
+    conn.hs_crypto_frames[0] = [CryptoChunk::empty(); SENT_PACKET_RING];
+    let mut p = 0;
+    while p < SENT_PACKET_RING {
+        if conn.initial.sent_packets[p].live && conn.initial.sent_packets[p].in_flight {
+            let b = conn.initial.sent_packets[p].bytes as u64;
+            conn.bytes_in_flight = conn.bytes_in_flight.saturating_sub(b);
+        }
+        conn.initial.sent_packets[p].live = false;
+        p += 1;
+    }
     conn.initial.ack_pending = false;
     conn.initial.ack_tracker = AckTracker::new();
     conn.initial.reassembler.reset();
@@ -2589,6 +2683,11 @@ unsafe fn process_frames(
                 // matching record in our sent-packet ring.
                 let mut new_rtt_sample: Option<u32> = None;
                 let mut acked_bytes_total: u64 = 0;
+                // Ring slots acknowledged / declared lost by this frame, so
+                // what the packets carried can be released or requeued once
+                // the packet-space borrow ends.
+                let mut acked_slots: u32 = 0;
+                let mut lost_slots: u32 = 0;
                 {
                     let space = match level {
                         EncLevel::Initial => &mut conn.initial,
@@ -2620,6 +2719,7 @@ unsafe fn process_frames(
                                     }
                                 }
                                 space.sent_packets[ix].live = false;
+                                acked_slots |= 1 << ix;
                             }
                             ix += 1;
                         }
@@ -2676,7 +2776,11 @@ unsafe fn process_frames(
                         if space.peer_acked_seen && p.pn <= pkt_threshold {
                             lost = true;
                         }
+                        // The time threshold applies only to packets sent
+                        // before the largest acknowledged (RFC 9002 §6.1).
                         if !lost
+                            && space.peer_acked_seen
+                            && p.pn < space.peer_acked_largest
                             && time_threshold_ms > 0
                             && p.sent_ms > 0
                             && now_ms.saturating_sub(p.sent_ms) > time_threshold_ms
@@ -2691,10 +2795,42 @@ unsafe fn process_frames(
                                 earliest_lost_ms = p.sent_ms;
                             }
                             space.sent_packets[ix].live = false;
+                            lost_slots |= 1 << ix;
                         }
                         ix += 1;
                     }
                     oldest_loss_time = earliest_lost_ms;
+                }
+                if matches!(level, EncLevel::OneRtt) {
+                    if acked_slots != 0 {
+                        conn.pto_count = 0;
+                    }
+                    let mut ix = 0;
+                    while ix < SENT_PACKET_RING {
+                        if acked_slots & (1 << ix) != 0 {
+                            conn.on_one_rtt_acked(ix);
+                        }
+                        if lost_slots & (1 << ix) != 0 {
+                            conn.on_one_rtt_lost(ix);
+                        }
+                        ix += 1;
+                    }
+                    conn.release_acked_streams();
+                } else {
+                    if acked_slots != 0 {
+                        conn.pto_count = 0;
+                    }
+                    let mut ix = 0;
+                    while ix < SENT_PACKET_RING {
+                        if acked_slots & (1 << ix) != 0 {
+                            conn.hs_crypto_frames[space_index(level)][ix] = CryptoChunk::empty();
+                        }
+                        if lost_slots & (1 << ix) != 0 {
+                            conn.on_hs_lost(level, ix);
+                        }
+                        ix += 1;
+                    }
+                    conn.release_hs_crypto(level);
                 }
                 if total_lost > 0 {
                     conn.cc_on_loss(total_lost, oldest_loss_time);
@@ -2703,13 +2839,13 @@ unsafe fn process_frames(
             FRAME_NEW_CONNECTION_ID => {
                 pos += 1;
                 let after = &payload[pos..];
-                let (_seq, n1) = match varint_decode(after.as_ptr(), after.len()) {
+                let (seq, n1) = match varint_decode(after.as_ptr(), after.len()) {
                     Some(t) => t,
                     None => return,
                 };
                 pos += n1;
                 let after = &payload[pos..];
-                let (_retire, n2) = match varint_decode(after.as_ptr(), after.len()) {
+                let (retire_prior_to, n2) = match varint_decode(after.as_ptr(), after.len()) {
                     Some(t) => t,
                     None => return,
                 };
@@ -2719,23 +2855,75 @@ unsafe fn process_frames(
                 }
                 let cid_len = payload[pos] as usize;
                 pos += 1;
-                if pos + cid_len + 16 > payload.len() {
+                if cid_len == 0 || cid_len > MAX_CID_LEN || pos + cid_len + 16 > payload.len() {
                     return;
                 }
-                // Production: store the new CID + token in a per-conn
-                // CID pool, swap to it on connection migration. We
-                // accept the frame structurally so peers don't get
-                // FRAME_ENCODING_ERROR, but don't migrate.
+                let cid = &payload[pos..pos + cid_len];
+                let token = &payload[pos + cid_len..pos + cid_len + 16];
                 pos += cid_len + 16;
+                let repeat = seq == conn.peer_cid_seq
+                    || (conn.spare_peer_cid_len > 0 && seq == conn.spare_peer_cid_seq);
+                if repeat || seq < conn.peer_cid_seq {
+                    // Already held, or older than the one in use.
+                } else if seq < retire_prior_to {
+                    // RFC 9000 §5.1.2: retired as it arrives.
+                    conn.queue_retire(seq);
+                } else {
+                    // Keep one unused peer ID, the next path's (§5.1.1). A
+                    // spare still in force would make three active IDs
+                    // against our limit of two.
+                    if conn.spare_peer_cid_len > 0 {
+                        if conn.spare_peer_cid_seq >= retire_prior_to {
+                            conn.fail(ERR_CONNECTION_ID_LIMIT);
+                            return;
+                        }
+                        conn.queue_retire(conn.spare_peer_cid_seq);
+                    }
+                    conn.spare_peer_cid[..cid_len].copy_from_slice(cid);
+                    conn.spare_peer_cid_len = cid_len as u8;
+                    conn.spare_peer_cid_seq = seq;
+                    conn.spare_peer_reset_token.copy_from_slice(token);
+                }
+                // §5.1.2: the ID we send with is retired, so sending moves
+                // to the spare; or we are waiting on one to send on a new
+                // path at all.
+                if retire_prior_to > conn.peer_cid_seq {
+                    if conn.old_path_validating {
+                        conn.finish_old_path();
+                    }
+                    conn.rotate_peer_cid();
+                    conn.finish_old_path();
+                } else if conn.peer_cid_starved && conn.spare_peer_cid_len > 0 {
+                    conn.rotate_peer_cid();
+                }
             }
             FRAME_RETIRE_CONNECTION_ID => {
                 pos += 1;
                 let after = &payload[pos..];
-                let (_seq, n) = match varint_decode(after.as_ptr(), after.len()) {
+                let (seq, n) = match varint_decode(after.as_ptr(), after.len()) {
                     Some(t) => t,
                     None => return,
                 };
                 pos += n;
+                // RFC 9000 §19.16: the peer has stopped using our ID `seq`.
+                // One we never issued is a protocol violation.
+                if seq >= conn.next_cid_seq {
+                    conn.fail(ERR_PROTOCOL_VIOLATION);
+                    return;
+                }
+                if conn.alt_cid_len > 0 && seq == conn.alt_cid_seq {
+                    // The spare is gone: a replacement is issued.
+                    conn.alt_cid_len = 0;
+                    conn.alt_cid_issued = false;
+                } else if seq == conn.our_cid_seq && conn.alt_cid_len > 0 {
+                    // The peer moved onto the spare, which is now our ID;
+                    // a new spare is issued for its next move.
+                    conn.our_cid = conn.alt_cid;
+                    conn.our_cid_len = conn.alt_cid_len;
+                    conn.our_cid_seq = conn.alt_cid_seq;
+                    conn.alt_cid_len = 0;
+                    conn.alt_cid_issued = false;
+                }
             }
             FRAME_CONNECTION_CLOSE_TRANSPORT | FRAME_CONNECTION_CLOSE_APP => {
                 let app = frame_type == FRAME_CONNECTION_CLOSE_APP;
@@ -2936,18 +3124,16 @@ unsafe fn process_frames(
                 conn.path_response_data = data;
                 conn.path_response_to_ip = conn.recv_ip;
                 conn.path_response_to_port = conn.recv_port;
+                conn.path_response_rx_len = conn.recv_len;
                 conn.path_response_tx_pending = true;
             }
             FRAME_PATH_RESPONSE => {
-                // RFC 9000 §8.2.3 / §9.3: a PATH_RESPONSE validates the
-                // candidate path only when (a) its token echoes our
-                // outstanding PATH_CHALLENGE AND (b) it was received on
-                // the path the challenge was sent to (the candidate). A
-                // response that merely echoes the token but arrives on a
-                // different path does NOT validate — otherwise an
-                // off-path attacker who observed the token could promote
-                // an unreachable candidate. On success, switch the active
-                // path and reset congestion control (RFC 9000 §9.4).
+                // RFC 9000 §8.2.3: a PATH_RESPONSE echoing our challenge
+                // validates the path the challenge was SENT on, whichever
+                // path the response arrives on — requiring the same path
+                // is what §8.2.2 forbids the initiator to enforce. The
+                // eight bytes are unpredictable and only readable inside
+                // the connection's protection, so echoing them is proof.
                 pos += 1;
                 let after = &payload[pos..];
                 let data = match parse_path_data(after) {
@@ -2955,21 +3141,36 @@ unsafe fn process_frames(
                     None => return,
                 };
                 pos += 8;
-                let on_candidate_path =
-                    conn.recv_ip == conn.cand_ip && conn.recv_port == conn.cand_port;
-                if conn.path_validating && data == conn.path_challenge_data && on_candidate_path {
-                    conn.peer = PeerAddr {
-                        ip: conn.cand_ip,
-                        port: conn.cand_port,
-                    };
+                if conn.path_validating && data == conn.path_challenge_data {
                     conn.path_validating = false;
                     conn.path_challenge_tx_pending = false;
-                    // RFC 9000 §9.4 — reset the congestion controller and
-                    // RTT for the new path (anti-amplification fresh start).
-                    conn.congestion_window = INITIAL_WINDOW;
-                    conn.ssthresh = u64::MAX;
-                    conn.bytes_in_flight = 0;
-                    conn.recovery_start_time = 0;
+                    if !conn.peer_validated && conn.peer.matches(&conn.cand_ip, conn.cand_port) {
+                        conn.peer_validated = true;
+                        conn.last_valid_peer = conn.peer;
+                        // RFC 9000 §9.4: the new path starts from initial
+                        // congestion state, and a new IP from an initial
+                        // RTT estimate too.
+                        conn.congestion_window = INITIAL_WINDOW;
+                        conn.ssthresh = u64::MAX;
+                        conn.bytes_in_flight = 0;
+                        conn.recovery_start_time = 0;
+                        if conn.path_reset_rtt {
+                            conn.rtt = RttSample::new();
+                        }
+                    }
+                    if !conn.challenge_expanded {
+                        // The address is proven but not the path MTU: a
+                        // second challenge follows, expanded now that the
+                        // allowance permits it (§8.2.1).
+                        conn.challenge_refresh = true;
+                        conn.path_validating = true;
+                        conn.path_validate_ms = now_ms;
+                        conn.path_challenge_tx_ms = 0;
+                        conn.path_challenge_tx_pending = true;
+                    }
+                }
+                if conn.old_path_validating && data == conn.old_path_challenge_data {
+                    conn.finish_old_path();
                 }
             }
             FRAME_DATAGRAM_NOLEN | FRAME_DATAGRAM_LEN => {
@@ -3030,10 +3231,14 @@ unsafe fn handle_stream_frame(conn: &mut QuicConnection, sf: &StreamFrame<'_>) {
         } else if sf.offset == base {
             sf.data
         } else {
+            conn.rx_unaccepted = true;
             return;
         };
         let space = conn.stream_recv_buf.len() - conn.stream_recv_buf_len;
         let n = data_slice.len().min(space);
+        if n < data_slice.len() {
+            conn.rx_unaccepted = true;
+        }
         if n == 0 && !data_slice.is_empty() {
             return;
         }
@@ -3052,24 +3257,73 @@ unsafe fn handle_stream_frame(conn: &mut QuicConnection, sf: &StreamFrame<'_>) {
         return;
     }
 
-    // RFC 9000 §2.1: bit 1 of `stream_id` is 0 for bidi, 1 for uni.
+    // RFC 9000 §2.1: bit 1 of `stream_id` is 0 for bidi, 1 for uni, and
+    // bit 0 names the initiator (0 = client).
     let is_bidi = (sf.stream_id & 0x2) == 0;
+    let peer_opened = ((sf.stream_id & 0x1) == 0) == conn.is_server;
+    let found = if is_bidi {
+        bidi_find(conn, sf.stream_id).is_some()
+    } else {
+        uni_find(conn, sf.stream_id).is_some()
+    };
+    if !found {
+        let index = sf.stream_id >> 2;
+        if peer_opened {
+            let (finished, granted) = if is_bidi {
+                (&conn.peer_bidi_finished, conn.max_streams_bidi_granted)
+            } else {
+                (&conn.peer_uni_finished, conn.max_streams_uni_granted)
+            };
+            if finished.contains(index) {
+                // A late copy for a stream already done: taken, not
+                // reopened.
+                return;
+            }
+            if index >= granted {
+                // RFC 9000 §4.6: past the credit this endpoint granted.
+                conn.fail(ERR_STREAM_LIMIT);
+                return;
+            }
+        } else {
+            let opened = if is_bidi {
+                conn.next_bidi_idx
+            } else {
+                conn.next_uni_idx
+            };
+            if index < opened {
+                // A late copy for one of our streams, already done.
+                return;
+            }
+            // RFC 9000 §19.8: a stream of ours this endpoint never opened.
+            conn.fail(ERR_STREAM_STATE);
+            return;
+        }
+    } else if !is_bidi && !peer_opened {
+        // Our unidirectional stream has no receive half (RFC 9000 §19.8).
+        conn.fail(ERR_STREAM_STATE);
+        return;
+    }
     if is_bidi {
         let slot_idx = match bidi_find(conn, sf.stream_id) {
             Some(i) => i,
             None => match bidi_alloc(conn, sf.stream_id, false) {
                 Some(i) => i,
-                None => return,
+                None => {
+                    conn.rx_unaccepted = true;
+                    return;
+                }
             },
         };
         let slot = &mut conn.bidi_streams[slot_idx];
-        stream_slot_ingest(
+        if !stream_slot_ingest(
             &mut slot.recv_off,
             &mut slot.recv_buf,
             &mut slot.recv_buf_len,
             &mut slot.recv_fin,
             sf,
-        );
+        ) {
+            conn.rx_unaccepted = true;
+        }
         return;
     }
 
@@ -3077,20 +3331,28 @@ unsafe fn handle_stream_frame(conn: &mut QuicConnection, sf: &StreamFrame<'_>) {
         Some(i) => i,
         None => match uni_alloc(conn, sf.stream_id, false) {
             Some(i) => i,
-            None => return,
+            None => {
+                conn.rx_unaccepted = true;
+                return;
+            }
         },
     };
     let slot = &mut conn.uni_streams[slot_idx];
-    stream_slot_ingest(
+    if !stream_slot_ingest(
         &mut slot.recv_off,
         &mut slot.recv_buf,
         &mut slot.recv_buf_len,
         &mut slot.recv_fin,
         sf,
-    );
+    ) {
+        conn.rx_unaccepted = true;
+    }
 }
 
 /// The offset/overlap/FIN bookkeeping one slot does with a STREAM frame.
+///
+/// False when the frame's new bytes were not all taken — it starts past a
+/// gap, or runs past the buffer — so the packet must not be acknowledged.
 ///
 /// Takes the four fields rather than the slot so the two pool shapes —
 /// which differ only in buffer size — share it without a trait object.
@@ -3103,11 +3365,15 @@ unsafe fn stream_slot_ingest(
     recv_buf_len: &mut usize,
     recv_fin: &mut bool,
     sf: &StreamFrame<'_>,
-) {
+) -> bool {
     let base = *recv_off;
     let frame_end = sf.offset + sf.data.len() as u64;
     if frame_end <= base {
-        return;
+        // Nothing new; a repeated FIN at the final size is taken.
+        if sf.fin && frame_end == base {
+            *recv_fin = true;
+        }
+        return true;
     }
     let data_slice = if sf.offset < base {
         let skip = (base - sf.offset) as usize;
@@ -3115,12 +3381,12 @@ unsafe fn stream_slot_ingest(
     } else if sf.offset == base {
         sf.data
     } else {
-        return;
+        return false;
     };
     let space = recv_buf.len() - *recv_buf_len;
     let n = data_slice.len().min(space);
     if n == 0 && !data_slice.is_empty() {
-        return;
+        return false;
     }
     core::ptr::copy_nonoverlapping(
         data_slice.as_ptr(),
@@ -3132,6 +3398,7 @@ unsafe fn stream_slot_ingest(
     if sf.fin && n == data_slice.len() {
         *recv_fin = true;
     }
+    n == data_slice.len()
 }
 
 /// Mark a stream's receive half terminally reset by the peer
@@ -3227,28 +3494,50 @@ unsafe fn handle_crypto_frame(
         (0, data)
     };
     let rel_off = (offset + skip as u64 - base) as usize;
-    let high = space.reassembler.insert(rel_off, data);
+    let (_, whole) = space.reassembler.insert(rel_off, data);
+    if !whole {
+        conn.rx_unaccepted = true;
+    }
+    deliver_crypto(conn, level);
+}
 
-    // Drain the contiguous prefix now exposed at the front of the hold.
+/// Hand the contiguous CRYPTO bytes at the front of a level's hold to the
+/// handshake driver, as many as it has room for. Whatever it cannot take
+/// yet stays in the hold and is offered again on the next pump, so no
+/// received byte is lost to a full driver.
+unsafe fn deliver_crypto(conn: &mut QuicConnection, level: EncLevel) {
+    let space = match level {
+        EncLevel::Initial => &mut conn.initial,
+        EncLevel::Handshake => &mut conn.handshake,
+        EncLevel::OneRtt => &mut conn.one_rtt,
+    };
+    let high = space.reassembler.contiguous_high;
     if high == 0 {
         return;
     }
     // Snapshot the contiguous bytes out of the hold buffer so we can
-    // shift before feeding the driver (avoids overlapping borrows).
+    // shift after feeding the driver (avoids overlapping borrows).
     let mut tmp = [0u8; CRYPTO_HOLD_LEN];
     core::ptr::copy_nonoverlapping(space.reassembler.buf.as_ptr(), tmp.as_mut_ptr(), high);
-    space.reassembler.shift(high);
-    space.crypto_recv_offset += high as u64;
 
     // Post-handshake CRYPTO at OneRtt = NewSessionTicket / KeyUpdate
     // / handshake_done extensions (RFC 8446 §4.6 + §4.6.3). We bypass
     // the in_buf queue and parse directly so we don't confuse the
-    // pump_recv_* readers that look at in_buf.
-    if matches!(level, EncLevel::OneRtt) && !conn.is_server {
+    // pump_recv_* readers that look at in_buf. Otherwise the driver takes
+    // what it has room for; the rest stays in the hold for the next pass.
+    let taken = if matches!(level, EncLevel::OneRtt) && !conn.is_server {
         handle_post_handshake_crypto(conn, &tmp[..high]);
-        return;
-    }
-    let _ = conn.driver.feed_handshake(level, &tmp[..high]);
+        high
+    } else {
+        conn.driver.feed_handshake(level, &tmp[..high])
+    };
+    let space = match level {
+        EncLevel::Initial => &mut conn.initial,
+        EncLevel::Handshake => &mut conn.handshake,
+        EncLevel::OneRtt => &mut conn.one_rtt,
+    };
+    space.reassembler.shift(taken);
+    space.crypto_recv_offset += taken as u64;
 }
 
 /// Client-side post-handshake CRYPTO bytes: the only message we
@@ -3327,33 +3616,35 @@ fn current_send_level(conn: &QuicConnection) -> EncLevel {
 
 unsafe fn drain_outbound(s: &mut QuicState, idx: usize) {
     // Migration: emit dedicated, destination-scoped path-validation
-    // packets FIRST and separately, so neither shares a packet (or a
-    // destination) with application data (RFC 9000 §9.3.3 / §8.2.2).
-    //  • PATH_CHALLENGE → the candidate path under validation.
+    // packets FIRST and separately, each alone in its packet so it can be
+    // expanded to prove the path (RFC 9000 §8.2).
+    //  • PATH_CHALLENGE → the path under validation.
     //  • PATH_RESPONSE  → the path the peer's PATH_CHALLENGE arrived on
-    //    (`path_response_to_*`), which may differ from the validated
-    //    `peer` when the peer is probing a new path during its own
-    //    migration.
+    //    (`path_response_to_*`), which may differ from `peer` when the
+    //    peer is probing a new path during its own migration.
+    //  • PATH_CHALLENGE → the previous path after a migration (§9.3.3).
     if s.conns[idx].path_validating && s.conns[idx].path_challenge_tx_pending {
         emit_path_challenge(s, idx);
     }
     if s.conns[idx].path_response_tx_pending {
         emit_path_response(s, idx);
     }
+    if s.conns[idx].old_path_validating && s.conns[idx].old_path_challenge_tx_pending {
+        emit_old_path_challenge(s, idx);
+    }
     loop {
-        let mut send_len;
+        // CRYPTO bytes the driver produces move into the connection's own
+        // send buffer for their space, where they stay until the peer
+        // acknowledges them: a lost range is sent again in a new packet.
+        move_driver_crypto(&mut s.conns[idx]);
+
         let level;
-        let mut emit_ack_only = false;
-        // `force_ack_only` is the stronger sibling of `emit_ack_only`:
-        // when true, `emit_crypto_packet` will suppress every
-        // ack-eliciting frame and pack only the pending ACK. We set
-        // this when CC blocks ack-eliciting traffic but there's still
-        // an ACK that needs to ship (RFC 9002 §A.1 — ACKs aren't
-        // congestion-controlled).
+        // Suppress every ack-eliciting frame and pack only the pending
+        // ACK: congestion control or a full sent-packet ring holds the
+        // rest, and ACKs are not congestion-controlled (RFC 9002 §A.1).
         let mut force_ack_only = false;
         {
             let conn = &s.conns[idx];
-            let lvl_now = current_send_level(conn);
 
             // Survey 1-RTT ack-eliciting work pending across every
             // source: the transparent stream, HANDSHAKE_DONE, both
@@ -3367,8 +3658,7 @@ unsafe fn drain_outbound(s: &mut QuicState, idx: usize) {
                     let st = &conn.uni_streams[k];
                     if st.allocated
                         && ((st.locally_initiated
-                            && (st.send_buf_len > 0
-                                || (st.send_fin_pending && !st.send_fin_emitted)))
+                            && (st.send.has_pending() || st.flow.send_blocked_pending))
                             || (st.abort.reset_pending && !st.abort.reset_emitted)
                             || (st.abort.stop_pending && !st.abort.stop_emitted)
                             || st.flow.recv_max_data_tx_pending)
@@ -3383,8 +3673,8 @@ unsafe fn drain_outbound(s: &mut QuicState, idx: usize) {
                     while k < MAX_BIDI_STREAMS {
                         let st = &conn.bidi_streams[k];
                         if st.allocated
-                            && (st.send_buf_len > 0
-                                || (st.send_fin_pending && !st.send_fin_emitted)
+                            && (st.send.has_pending()
+                                || st.flow.send_blocked_pending
                                 || (st.abort.reset_pending && !st.abort.reset_emitted)
                                 || (st.abort.stop_pending && !st.abort.stop_emitted)
                                 || st.flow.recv_max_data_tx_pending)
@@ -3405,193 +3695,99 @@ unsafe fn drain_outbound(s: &mut QuicState, idx: usize) {
                 }
                 found
             };
-            let one_rtt_ack_eliciting_pending = conn.stream_send_buf_len > 0
-                || conn.stream_send_fin
+            let one_rtt_ack_eliciting_pending = (!conn.framed_app_surface
+                && conn.stream_send.has_pending())
                 || conn.pending_handshake_done
+                || conn.retire_tx_pending()
+                || conn.ping_pending
+                || conn.crypto_send[2].has_pending()
                 || has_extra_pending
                 || conn.dgram_tx_pending
-                // (PATH_CHALLENGE and PATH_RESPONSE are emitted separately
-                // as dedicated destination-scoped packets — to the
-                // candidate / the challenge's source path respectively —
-                // by emit_path_challenge / emit_path_response, never
-                // packed into a validated-path data packet.)
                 || conn.new_cid_tx_pending;
 
-            // RFC 9002 §7 — congestion control gates every ack-eliciting
-            // 1-RTT send. Initial / Handshake packets are exempt so an
-            // early window collapse can't deadlock the handshake; ACK
-            // frames are also exempt (RFC 9002 §A.1, §7) because they
-            // aren't ack-eliciting and don't count toward bytes_in_flight.
-            //
-            // 1-RTT data falls in two flavours, both ack-eliciting:
-            //   • CRYPTO bytes pending in driver.out_buf at OneRtt
-            //     level (post-handshake key updates, server's
-            //     NewSessionTicket frame) — `lvl_now == OneRtt &&
-            //     driver.out_len > 0`.
-            //   • Other 1-RTT frames: STREAM, HANDSHAKE_DONE, h3
-            //     extra-stream / bidi-extra-stream STREAMs.
-            //
-            // Both categories must be CC-gated: 1-RTT CRYPTO bytes left
-            // ungated would let a NewSessionTicket bypass cwnd.
-            let level_at_one_rtt = matches!(lvl_now, EncLevel::OneRtt);
-            let one_rtt_crypto_pending = level_at_one_rtt && conn.driver.out_len > 0;
-            let one_rtt_data_pending =
-                one_rtt_crypto_pending || (level_at_one_rtt && one_rtt_ack_eliciting_pending);
-            let one_rtt_cc_blocked = one_rtt_data_pending && !conn.cc_can_send(MAX_DATAGRAM_SIZE);
+            // Initial and Handshake packets are exempt from congestion
+            // control so an early window collapse cannot deadlock the
+            // handshake; every ack-eliciting 1-RTT packet is gated
+            // (RFC 9002 §7), except a probe a timeout owes (§6.2.4).
+            let init_ok = conn.space_usable(EncLevel::Initial);
+            let hs_ok = conn.space_usable(EncLevel::Handshake);
+            let init_data =
+                init_ok && (conn.crypto_send[0].has_pending() || conn.hs_ping_pending[0]);
+            let hs_data = hs_ok && (conn.crypto_send[1].has_pending() || conn.hs_ping_pending[1]);
+            let one_rtt_data = conn.space_usable(EncLevel::OneRtt) && one_rtt_ack_eliciting_pending;
+            let one_rtt_cc_blocked =
+                one_rtt_data && conn.pto_probes == 0 && !conn.cc_can_send(MAX_DATAGRAM_SIZE);
 
-            // ACKs are not congestion-controlled (RFC 9002 §A.1, §7),
-            // so a CC-blocked 1-RTT path must NOT suppress pending
-            // lower-level ACKs. The early-return only fires when CC
-            // blocks AND every level's ACK is empty — otherwise fall
-            // through to the level selector below which will pick the
-            // lowest level with a pending ACK.
-            let any_ack_sendable = (conn.initial.ack_pending && conn.initial.keys_set)
-                || (conn.handshake.ack_pending && conn.handshake.keys_set)
-                || (conn.one_rtt.ack_pending && conn.one_rtt.keys_set);
-            if one_rtt_cc_blocked && !any_ack_sendable {
-                // CC blocks all ack-eliciting work and there's no
-                // piggyback ACK at any level — nothing useful to
-                // send this tick.
-                return;
-            }
-
-            if conn.driver.out_len > 0 && !one_rtt_cc_blocked {
-                // CRYPTO can ship: either at Initial / Handshake
-                // (CC-exempt) or at OneRtt with cwnd available.
-                send_len = conn.driver.out_len;
-                level = current_send_level(conn);
-            } else {
-                // Either driver.out_buf is empty, or a 1-RTT CRYPTO
-                // payload is sitting in it but blocked by CC. In the
-                // latter case the CRYPTO bytes stay in the buffer for
-                // the next tick. Pick the lowest level with a pending
-                // ACK first (RFC 9000 §17.2 forbids 1-RTT before
-                // handshake completes, server-side); these are CC
-                // exempt and ship even when 1-RTT is blocked.
-                send_len = 0;
-                if conn.initial.ack_pending && conn.initial.keys_set {
-                    level = EncLevel::Initial;
-                    emit_ack_only = true;
-                } else if conn.handshake.ack_pending && conn.handshake.keys_set {
-                    level = EncLevel::Handshake;
-                    emit_ack_only = true;
-                } else if (conn.one_rtt.ack_pending
-                    || one_rtt_ack_eliciting_pending
-                    || one_rtt_crypto_pending)
-                    && conn.one_rtt.keys_set
-                {
-                    level = EncLevel::OneRtt;
-                    emit_ack_only = true;
-                    // CC-blocked but ACK pending → suppress every
-                    // ack-eliciting frame (and 1-RTT CRYPTO) so this
-                    // packet ships as a pure ACK without overshooting
-                    // cwnd.
-                    if one_rtt_cc_blocked {
-                        force_ack_only = true;
-                    }
-                } else {
-                    return;
-                }
-            }
-
-            // Ring-full back-pressure gate. If this emit would be
-            // ack-eliciting (CRYPTO at any level, or 1-RTT data when
-            // not in force_ack_only mode), the chosen level's
-            // sent_packets ring must have a free slot. Without this
-            // gate, ack-eliciting traffic that exceeds SENT_PACKET_RING
-            // outstanding entries would overwrite still-live tracking
-            // records — incoming ACKs could no longer find them, so
-            // bytes_in_flight would never be credited back and CC
-            // would stall artificially.
-            //
-            // Pure-ACK / CONNECTION_CLOSE-style packets aren't
-            // tracked, so they skip the gate.
-            let would_be_ack_eliciting = if force_ack_only {
-                false
-            } else if send_len > 0 {
+            // The lowest space with anything to send goes first.
+            let elicits = if init_data || (init_ok && conn.initial.ack_pending) {
+                level = EncLevel::Initial;
+                init_data
+            } else if hs_data || (hs_ok && conn.handshake.ack_pending) {
+                level = EncLevel::Handshake;
+                hs_data
+            } else if one_rtt_data && !one_rtt_cc_blocked {
+                level = EncLevel::OneRtt;
                 true
+            } else if conn.one_rtt.ack_pending && conn.space_usable(EncLevel::OneRtt) {
+                level = EncLevel::OneRtt;
+                force_ack_only = true;
+                false
             } else {
-                matches!(level, EncLevel::OneRtt) && one_rtt_ack_eliciting_pending
+                return;
             };
-            if would_be_ack_eliciting {
+
+            // Ring-full back-pressure gate. An ack-eliciting packet needs a
+            // free slot in its space's sent-packet ring, or incoming ACKs
+            // could no longer find it and `bytes_in_flight` would never be
+            // credited back. Pure-ACK packets aren't tracked, so a pending
+            // ACK still ships.
+            if elicits {
                 let space = match level {
                     EncLevel::Initial => &conn.initial,
                     EncLevel::Handshake => &conn.handshake,
                     EncLevel::OneRtt => &conn.one_rtt,
                 };
                 if !space.has_free_sent_slot() {
-                    // Ring full at the chosen level. ACKs aren't
-                    // ring-tracked (RFC 9002 §A.1, §6.1 — only
-                    // ack-eliciting packets feed loss/RTT) so a
-                    // 1-RTT ACK can still ship. Downgrade to
-                    // ack-only — same shape as the cc_blocked
-                    // fallback above. Initial / Handshake CRYPTO
-                    // can't downgrade (CRYPTO IS the payload at
-                    // those levels), so we bail there and wait
-                    // for ACKs to free a slot.
-                    if matches!(level, EncLevel::OneRtt) && conn.one_rtt.ack_pending {
+                    if space.ack_pending {
                         force_ack_only = true;
-                        emit_ack_only = true;
-                        send_len = 0;
                     } else {
                         return;
                     }
                 }
             }
         }
-        let (emitted, crypto_consumed) =
-            emit_crypto_packet(s, idx, level, send_len, force_ack_only);
-        if !emitted {
-            // No packet went on the wire — final build failed (packet
-            // overflow / encoding error) or there was nothing to pack.
-            // Bail out for both CRYPTO and ack-only paths; otherwise
-            // drain_outbound would spin re-trying the same emit against
-            // the same unchanged conn state. The pending state survives
-            // for the next tick to retry once new conditions apply.
+        if !emit_crypto_packet(s, idx, level, force_ack_only) {
+            // No packet went on the wire — the channel, the path's
+            // allowance, or a build failure held it. The pending state
+            // survives for the next tick; looping would only rebuild the
+            // same refusal.
             return;
-        }
-        if !emit_ack_only {
-            // CRYPTO path: trim only what was actually packed.
-            let conn = &mut s.conns[idx];
-            if crypto_consumed > 0 {
-                let remain = conn.driver.out_len - crypto_consumed;
-                if remain > 0 {
-                    core::ptr::copy(
-                        conn.driver.out_buf.as_ptr().add(crypto_consumed),
-                        conn.driver.out_buf.as_mut_ptr(),
-                        remain,
-                    );
-                }
-                conn.driver.out_len = remain;
-            }
         }
     }
 }
 
-/// Build + send one packet at `level` carrying a single CRYPTO frame
-/// with the next `send_len` bytes from `conn.driver.out_buf`.
-///
-/// `ack_only_mode = true` suppresses every ack-eliciting frame
-/// (CRYPTO, HANDSHAKE_DONE, STREAM, extra/bidi STREAM) so the caller
-/// can ship a pure-ACK packet when congestion control is blocking
-/// ack-eliciting traffic. ACK frames are not congestion-controlled
-/// (RFC 9002 §A.1, §7) and so must be allowed through even when
-/// `cc_can_send` is false; otherwise the peer's loss recovery stalls.
-///
-/// Returns `(emitted, crypto_packed)`:
-///   * `emitted` is true iff a packet was actually written to the wire.
-///     If false, the caller must not advance any driver state and must
-///     not loop back into the same emit path this tick — the pending
-///     state will retry on a future tick once conditions change.
-///   * `crypto_packed` is the number of CRYPTO bytes that made it into
-///     the emitted packet (≤ `send_len`; always 0 in ack-only mode).
-///     The caller advances `driver.out_buf` by exactly that many
-///     bytes. Large flights are fragmented across multiple
-///     `drain_outbound` iterations.
-///
-/// All other connection-state mutations (PN advance, ack_pending,
-/// pending_handshake_done, per-stream send buffers) are deferred to
-/// the success path so a build failure leaves no "sent" residue.
+/// Move what the handshake driver has produced into the send buffer of the
+/// space it belongs to, as much as fits. What does not fit waits in the
+/// driver until acknowledgements free room.
+unsafe fn move_driver_crypto(conn: &mut QuicConnection) {
+    let n = conn.driver.out_len;
+    if n == 0 {
+        return;
+    }
+    let i = space_index(current_send_level(conn));
+    let n = n.min(conn.crypto_send[i].space());
+    if n == 0 {
+        return;
+    }
+    let mut moved = [0u8; QUIC_CRYPTO_BUF];
+    moved[..n].copy_from_slice(&conn.driver.out_buf[..n]);
+    if conn.crypto_send[i].stage(&moved[..n]) {
+        let remain = conn.driver.out_len - n;
+        conn.driver.out_buf.copy_within(n..n + remain, 0);
+        conn.driver.out_len = remain;
+    }
+}
+
 /// RFC 9001 §6 key update — INITIATION. The responder path (flipping on
 /// receipt of a new peer phase) lives in `drain_inbound_one`. Initiation is
 /// a protocol exchange with prerequisites: only after handshake
@@ -3647,13 +3843,25 @@ unsafe fn maybe_initiate_key_update(conn: &mut QuicConnection, now_ms: u64, thre
     let _ = msg;
 }
 
+/// Build and send one packet in `level`'s space: its ACK, then a CRYPTO
+/// frame from the space's send buffer (a repair of a lost range first),
+/// then — at 1-RTT — every other pending frame.
+///
+/// `ack_only_mode` suppresses every ack-eliciting frame so a pure ACK can
+/// ship while congestion control or a full sent-packet ring holds the rest:
+/// ACKs are not congestion-controlled (RFC 9002 §A.1, §7).
+///
+/// Returns whether a packet went on the wire. When it did not, no state
+/// moved and the caller must not loop back into the same emit this tick;
+/// what was pending retries on a later one. Every mutation (packet number,
+/// ACK state, send buffers, pending flags) is deferred to the success path
+/// so a build or send failure leaves no "sent" residue.
 unsafe fn emit_crypto_packet(
     s: &mut QuicState,
     idx: usize,
     level: EncLevel,
-    send_len: usize,
     ack_only_mode: bool,
-) -> (bool, usize) {
+) -> bool {
     let sys = &*s.syscalls;
 
     // 1-RTT emission is gated by the send packet-number reservation and is
@@ -3668,7 +3876,7 @@ unsafe fn emit_crypto_packet(
         // DELTA_ACK returns, so a takeover retransmits identical
         // ciphertext rather than emitting bytes the standby never saw.
         if s.conns[idx].cont_emission_held {
-            return (false, 0);
+            return false;
         }
         let now_ms = dev_millis(sys);
         let phase_before = s.conns[idx].one_rtt.key_phase;
@@ -3681,21 +3889,15 @@ unsafe fn emit_crypto_packet(
         }
         if !s.conns[idx].one_rtt_pn_ok() {
             s.reservation_exhausted_stall = s.reservation_exhausted_stall.wrapping_add(1);
-            return (false, 0);
+            return false;
         }
     }
 
     // Snapshot necessary fields out of the connection so we can build
     // payloads without holding a borrow on the conn during send.
-    let (offset, our_cid, our_cid_len, peer_cid, peer_cid_len, peer, is_server) = {
+    let (our_cid, our_cid_len, peer_cid, peer_cid_len, peer, is_server) = {
         let conn = &s.conns[idx];
-        let space = match level {
-            EncLevel::Initial => &conn.initial,
-            EncLevel::Handshake => &conn.handshake,
-            EncLevel::OneRtt => &conn.one_rtt,
-        };
         (
-            space.crypto_send_offset,
             conn.our_cid,
             conn.our_cid_len,
             conn.peer_cid,
@@ -3742,62 +3944,40 @@ unsafe fn emit_crypto_packet(
         }
     }
 
-    // CRYPTO frame (if we're sending handshake bytes). RFC 9000 §7.5
-    // explicitly permits — and large flights (cert chains) require —
-    // splitting handshake bytes across multiple QUIC packets via
-    // multiple CRYPTO frames at increasing offsets. We cap the data
-    // packed into this packet so a 1.3KB+ flight ships as N back-to-back
-    // packets instead of stalling forever on a single-packet build that
-    // can't fit. The remaining bytes stay in `driver.out_buf` and the
-    // next `drain_outbound` iteration picks them up.
-    //
-    // MAX_CRYPTO_FRAME_PAYLOAD is sized so the resulting QUIC packet
-    // (header + pn + payload + AEAD tag) comfortably fits in the
-    // 1500-byte `pkt` buffer used by `build_*_packet`. The leftover
-    // headroom (~200B) covers worst-case long-header packets:
-    // 1B first + 4B version + 1B + DCID(20) + 1B + SCID(20) + token
-    // varint + token + length varint + 4B pn + 16B AEAD tag.
-    const MAX_CRYPTO_FRAME_PAYLOAD: usize = 1300;
-    // ack_only_mode only suppresses CRYPTO at 1-RTT — Initial /
-    // Handshake CRYPTO carries the handshake itself and is exempt
-    // from CC, so we never want to skip it. The caller is expected
-    // to only set ack_only_mode when level == OneRtt; this guard is
-    // defense-in-depth.
-    let suppress_crypto = ack_only_mode && matches!(level, EncLevel::OneRtt);
-    let mut crypto_packed: usize = 0;
-    if send_len > 0 && !suppress_crypto {
-        // Reserve room for the CRYPTO frame's own header (type byte +
-        // varint offset + varint length, max 17 bytes total) plus
-        // anything already in the payload (typically the ACK frame).
-        let frame_overhead = 1 + 8 + 8;
-        let avail = MAX_CRYPTO_FRAME_PAYLOAD
-            .saturating_sub(payload_len)
-            .saturating_sub(frame_overhead);
-        let send_now = if avail == 0 {
-            0
-        } else if send_len < avail {
-            send_len
-        } else {
-            avail
-        };
-        if send_now > 0 {
+    // CRYPTO frame, from the space's send buffer: a repair of a lost range
+    // first, then new bytes. RFC 9000 §7.5 permits — and a certificate
+    // chain requires — a flight split across packets at increasing
+    // offsets; `stream_room` keeps each packet within one datagram.
+    let mut had_crypto = false;
+    let mut crypto_off: u64 = 0;
+    let mut crypto_len: usize = 0;
+    if !ack_only_mode {
+        let send = &s.conns[idx].crypto_send[space_index(level)];
+        if let Some((off, data, _)) = send.next_chunk(stream_room(payload_len)) {
             let mut frame_buf = [0u8; QUIC_DGRAM_MAX];
-            let frame_len = build_crypto(
-                offset,
-                &s.conns[idx].driver.out_buf[..send_now],
-                &mut frame_buf,
-            );
-            if frame_len == 0 || payload_len + frame_len > payload.len() {
-                // Frame builder rejected our budget — abort without
-                // mutating per-conn state so the caller retries with
-                // identical inputs next tick (defensive: the cap above
-                // should make this unreachable).
-                return (false, 0);
+            let n = build_crypto(off, data, &mut frame_buf);
+            if !data.is_empty() && n > 0 && payload_len + n <= payload.len() {
+                payload[payload_len..payload_len + n].copy_from_slice(&frame_buf[..n]);
+                payload_len += n;
+                had_crypto = true;
+                crypto_off = off;
+                crypto_len = data.len();
             }
-            payload[payload_len..payload_len + frame_len].copy_from_slice(&frame_buf[..frame_len]);
-            payload_len += frame_len;
-            crypto_packed = send_now;
         }
+    }
+
+    // PING in the Initial / Handshake space: the probe a timeout owes when
+    // there is nothing else to send there.
+    let mut had_hs_ping = false;
+    if !matches!(level, EncLevel::OneRtt)
+        && !ack_only_mode
+        && !had_crypto
+        && s.conns[idx].hs_ping_pending[space_index(level)]
+        && payload_len < payload.len()
+    {
+        payload[payload_len] = FRAME_PING;
+        payload_len += 1;
+        had_hs_ping = true;
     }
 
     // HANDSHAKE_DONE (1-RTT only, server-only, queued at Complete).
@@ -3812,6 +3992,19 @@ unsafe fn emit_crypto_packet(
         had_handshake_done = true;
     }
 
+    // PING: the probe a timeout owes when nothing else would elicit an
+    // acknowledgement (RFC 9002 §6.2.4).
+    let mut had_ping = false;
+    if matches!(level, EncLevel::OneRtt)
+        && !ack_only_mode
+        && s.conns[idx].ping_pending
+        && payload_len < payload.len()
+    {
+        payload[payload_len] = FRAME_PING;
+        payload_len += 1;
+        had_ping = true;
+    }
+
     // STREAM frames. On the transparent (no-ALPN) surface there is one
     // stream, held in the connection's single-stream send buffer; on the
     // framed mux surface every stream is a pool slot and several may be
@@ -3822,19 +4015,24 @@ unsafe fn emit_crypto_packet(
     // a stream that always fills the packet would otherwise be the only
     // one ever emitted.
     let mut had_main_stream = false;
+    let mut main_stream_off: u64 = 0;
     let mut main_stream_buf_len: usize = 0;
     let mut main_stream_fin_emitted = false;
     let mut had_uni_stream = [false; MAX_UNI_STREAMS];
+    let mut uni_stream_off = [0u64; MAX_UNI_STREAMS];
     let mut uni_stream_buf_len = [0usize; MAX_UNI_STREAMS];
     let mut uni_stream_fin_emitted = [false; MAX_UNI_STREAMS];
     let mut had_uni_reset = [false; MAX_UNI_STREAMS];
     let mut had_uni_stop = [false; MAX_UNI_STREAMS];
     let mut had_bidi_stream = [false; MAX_BIDI_STREAMS];
+    let mut bidi_stream_off = [0u64; MAX_BIDI_STREAMS];
     let mut bidi_stream_buf_len = [0usize; MAX_BIDI_STREAMS];
     let mut bidi_stream_fin_emitted = [false; MAX_BIDI_STREAMS];
     let mut had_bidi_reset = [false; MAX_BIDI_STREAMS];
     let mut had_bidi_stop = [false; MAX_BIDI_STREAMS];
     let mut had_bidi_max_stream_data = [false; MAX_BIDI_STREAMS];
+    let mut had_bidi_blocked = [false; MAX_BIDI_STREAMS];
+    let mut had_uni_blocked = [false; MAX_UNI_STREAMS];
     let mut had_uni_max_stream_data = [false; MAX_UNI_STREAMS];
     let mut had_max_streams = false;
     let mut had_max_streams_uni = false;
@@ -3902,21 +4100,18 @@ unsafe fn emit_crypto_packet(
                 had_streams_blocked_uni = true;
             }
         }
-        if !conn.framed_app_surface && (conn.stream_send_buf_len > 0 || conn.stream_send_fin) {
-            let mut frame_buf = [0u8; QUIC_DGRAM_MAX];
-            let n = build_stream(
-                0,
-                conn.stream_send_off,
-                conn.stream_send_fin,
-                &conn.stream_send_buf[..conn.stream_send_buf_len],
-                &mut frame_buf,
-            );
-            if n > 0 && payload_len + n <= payload.len() {
-                payload[payload_len..payload_len + n].copy_from_slice(&frame_buf[..n]);
-                payload_len += n;
-                had_main_stream = true;
-                main_stream_buf_len = conn.stream_send_buf_len;
-                main_stream_fin_emitted = conn.stream_send_fin;
+        if !conn.framed_app_surface {
+            if let Some((off, data, fin)) = conn.stream_send.next_chunk(stream_room(payload_len)) {
+                let mut frame_buf = [0u8; QUIC_DGRAM_MAX];
+                let n = build_stream(0, off, fin, data, &mut frame_buf);
+                if (!data.is_empty() || fin) && n > 0 && payload_len + n <= payload.len() {
+                    payload[payload_len..payload_len + n].copy_from_slice(&frame_buf[..n]);
+                    payload_len += n;
+                    had_main_stream = true;
+                    main_stream_off = off;
+                    main_stream_buf_len = data.len();
+                    main_stream_fin_emitted = fin;
+                }
             }
         }
         // Bidirectional pool slots, round-robin from the cursor.
@@ -3935,7 +4130,7 @@ unsafe fn emit_crypto_packet(
                 let n = build_reset_stream(
                     slot.stream_id,
                     slot.abort.reset_error,
-                    slot.send_off,
+                    slot.send.sent,
                     &mut fb,
                 );
                 if n > 0 && payload_len + n <= payload.len() {
@@ -3969,23 +4164,19 @@ unsafe fn emit_crypto_packet(
                 if n > 0 && payload_len + n <= payload.len() {
                     payload[payload_len..payload_len + n].copy_from_slice(&fb[..n]);
                     payload_len += n;
+                    had_bidi_blocked[k] = true;
                 }
             }
-            if slot.send_buf_len > 0 || (slot.send_fin_pending && !slot.send_fin_emitted) {
+            if let Some((off, data, fin)) = slot.send.next_chunk(stream_room(payload_len)) {
                 let mut frame_buf = [0u8; QUIC_DGRAM_MAX];
-                let n = build_stream(
-                    slot.stream_id,
-                    slot.send_off,
-                    slot.send_fin_pending,
-                    &slot.send_buf[..slot.send_buf_len],
-                    &mut frame_buf,
-                );
-                if n > 0 && payload_len + n <= payload.len() {
+                let n = build_stream(slot.stream_id, off, fin, data, &mut frame_buf);
+                if (!data.is_empty() || fin) && n > 0 && payload_len + n <= payload.len() {
                     payload[payload_len..payload_len + n].copy_from_slice(&frame_buf[..n]);
                     payload_len += n;
                     had_bidi_stream[k] = true;
-                    bidi_stream_buf_len[k] = slot.send_buf_len;
-                    bidi_stream_fin_emitted[k] = slot.send_fin_pending;
+                    bidi_stream_off[k] = off;
+                    bidi_stream_buf_len[k] = data.len();
+                    bidi_stream_fin_emitted[k] = fin;
                 }
             }
         }
@@ -4003,7 +4194,7 @@ unsafe fn emit_crypto_packet(
                 let n = build_reset_stream(
                     slot.stream_id,
                     slot.abort.reset_error,
-                    slot.send_off,
+                    slot.send.sent,
                     &mut fb,
                 );
                 if n > 0 && payload_len + n <= payload.len() {
@@ -4031,23 +4222,30 @@ unsafe fn emit_crypto_packet(
                     had_uni_max_stream_data[k] = true;
                 }
             }
-            if slot.locally_initiated
-                && (slot.send_buf_len > 0 || (slot.send_fin_pending && !slot.send_fin_emitted))
-            {
-                let mut frame_buf = [0u8; 384];
-                let n = build_stream(
-                    slot.stream_id,
-                    slot.send_off,
-                    slot.send_fin_pending,
-                    &slot.send_buf[..slot.send_buf_len],
-                    &mut frame_buf,
-                );
+            if slot.locally_initiated && slot.flow.send_blocked_pending {
+                let mut fb = [0u8; 24];
+                let n = build_stream_data_blocked(slot.stream_id, slot.flow.send_max_data, &mut fb);
                 if n > 0 && payload_len + n <= payload.len() {
+                    payload[payload_len..payload_len + n].copy_from_slice(&fb[..n]);
+                    payload_len += n;
+                    had_uni_blocked[k] = true;
+                }
+            }
+            let chunk = if slot.locally_initiated {
+                slot.send.next_chunk(stream_room(payload_len))
+            } else {
+                None
+            };
+            if let Some((off, data, fin)) = chunk {
+                let mut frame_buf = [0u8; 384];
+                let n = build_stream(slot.stream_id, off, fin, data, &mut frame_buf);
+                if (!data.is_empty() || fin) && n > 0 && payload_len + n <= payload.len() {
                     payload[payload_len..payload_len + n].copy_from_slice(&frame_buf[..n]);
                     payload_len += n;
                     had_uni_stream[k] = true;
-                    uni_stream_buf_len[k] = slot.send_buf_len;
-                    uni_stream_fin_emitted[k] = slot.send_fin_pending;
+                    uni_stream_off[k] = off;
+                    uni_stream_buf_len[k] = data.len();
+                    uni_stream_fin_emitted[k] = fin;
                 }
             }
         }
@@ -4086,6 +4284,27 @@ unsafe fn emit_crypto_packet(
         }
     }
 
+    // RETIRE_CONNECTION_ID (RFC 9000 §19.16, 1-RTT): a peer connection ID
+    // this endpoint has stopped using, after moving to a fresh one.
+    let mut retired = [0u64; RETIRE_QUEUE];
+    let mut retired_n = 0usize;
+    if matches!(level, EncLevel::OneRtt) && !ack_only_mode {
+        let conn = &s.conns[idx];
+        while retired_n < conn.retire_len as usize {
+            let seq = conn.retire_queue[retired_n];
+            let mut fb = [0u8; 16];
+            let n = build_retire_connection_id(seq, &mut fb);
+            if n == 0 || payload_len + n > payload.len() {
+                break;
+            }
+            payload[payload_len..payload_len + n].copy_from_slice(&fb[..n]);
+            payload_len += n;
+            retired[retired_n] = seq;
+            retired_n += 1;
+        }
+    }
+    let had_retire = retired_n > 0;
+
     let mut had_datagram = false;
     if matches!(level, EncLevel::OneRtt) && !ack_only_mode && s.conns[idx].dgram_tx_pending {
         let dlen = s.conns[idx].dgram_tx_len;
@@ -4101,12 +4320,14 @@ unsafe fn emit_crypto_packet(
     }
 
     if payload_len == 0 {
-        return (false, 0);
+        return false;
     }
 
-    // For client Initial packets, RFC 9000 §14.1 mandates ≥1200 byte
-    // datagrams. We pad the payload with 0x00 (PADDING) frames.
-    let pad_to_min_initial = matches!(level, EncLevel::Initial) && !is_server;
+    // RFC 9000 §14.1: a client expands every datagram carrying an Initial
+    // packet to at least 1200 bytes, and a server every one carrying an
+    // ack-eliciting Initial. We pad the payload with 0x00 (PADDING) frames.
+    let pad_to_min_initial =
+        matches!(level, EncLevel::Initial) && (!is_server || had_crypto || had_hs_ping);
 
     let pn_len = 4;
     let dcid: &[u8] = match level {
@@ -4241,7 +4462,19 @@ unsafe fn emit_crypto_packet(
         // stream send buffers) so the next tick retries from a clean
         // state. Returning (false, 0) also signals drain_outbound to
         // bail this tick instead of looping on the same failure.
-        return (false, 0);
+        return false;
+    }
+
+    // An unproven address limits what may be sent to it: no more than
+    // three times what it has sent us (RFC 9000 §8, §9.3.1) — a client
+    // before its first Handshake packet, a peer after migrating — and on a
+    // new path nothing at all while the peer has left us no connection ID
+    // for it (§9.3). The packet is held back like a full channel's, state
+    // untouched.
+    if s.conns[idx].amp_allowance(&peer) < n as u64
+        || (matches!(level, EncLevel::OneRtt) && s.conns[idx].peer_cid_starved)
+    {
+        return false;
     }
 
     // Mirror a 1-RTT packet before it can reach the wire. Under the strict
@@ -4280,7 +4513,15 @@ unsafe fn emit_crypto_packet(
         // new_cid_tx_pending) so the next tick rebuilds and re-sends the
         // same content. Returning (false, 0) also tells drain_outbound to
         // bail this tick rather than spin on the blocked channel.
-        return (false, 0);
+        return false;
+    }
+    if !held {
+        s.conns[idx].amp_charge(&peer, n);
+    }
+    // RFC 9001 §4.9.1: a client discards its Initial keys once it sends
+    // its first Handshake packet.
+    if matches!(level, EncLevel::Handshake) && !is_server {
+        s.conns[idx].discard_space(EncLevel::Initial);
     }
     // Idle-timeout activity stamp on emit too (RFC 9000 §10.1.2).
     s.conns[idx].last_activity_ms = dev_millis(sys);
@@ -4306,22 +4547,58 @@ unsafe fn emit_crypto_packet(
         }
         if had_data_blocked {
             conn.data_blocked_pending = false;
+            conn.data_blocked_at = conn.send_max_data;
         }
         if had_streams_blocked_bidi {
             conn.streams_blocked_bidi_pending = false;
+            conn.streams_blocked_bidi_at = conn.peer_max_streams_bidi;
         }
         if had_streams_blocked_uni {
             conn.streams_blocked_uni_pending = false;
+            conn.streams_blocked_uni_at = conn.peer_max_streams_uni;
+        }
+        let mut k = 0;
+        while k < MAX_BIDI_STREAMS {
+            if had_bidi_blocked[k] {
+                let f = &mut conn.bidi_streams[k].flow;
+                f.send_blocked_pending = false;
+                f.blocked_at = f.send_max_data;
+            }
+            k += 1;
+        }
+        let mut k = 0;
+        while k < MAX_UNI_STREAMS {
+            if had_uni_blocked[k] {
+                let f = &mut conn.uni_streams[k].flow;
+                f.send_blocked_pending = false;
+                f.blocked_at = f.send_max_data;
+            }
+            k += 1;
         }
         if had_new_cid {
             conn.new_cid_tx_pending = false;
         }
+        if had_retire {
+            // The queue drains from the front, which is what was packed.
+            let n = conn.retire_len as usize;
+            conn.retire_queue.copy_within(retired_n..n, 0);
+            conn.retire_len = (n - retired_n) as u8;
+        }
         if had_main_stream {
-            conn.stream_send_off += main_stream_buf_len as u64;
-            conn.stream_send_buf_len = 0;
-            if main_stream_fin_emitted {
-                conn.stream_send_fin = false;
-            }
+            conn.stream_send.on_sent(
+                main_stream_off,
+                main_stream_buf_len,
+                main_stream_fin_emitted,
+            );
+        }
+        if had_crypto {
+            conn.crypto_send[space_index(level)].on_sent(crypto_off, crypto_len, false);
+        }
+        if had_hs_ping {
+            conn.hs_ping_pending[space_index(level)] = false;
+        }
+        if had_ping {
+            conn.ping_pending = false;
         }
         let mut k = 0;
         while k < MAX_UNI_STREAMS {
@@ -4337,13 +4614,11 @@ unsafe fn emit_crypto_packet(
                 conn.uni_streams[k].flow.recv_max_data_tx_pending = false;
             }
             if had_uni_stream[k] {
-                let slot = &mut conn.uni_streams[k];
-                slot.send_off += uni_stream_buf_len[k] as u64;
-                slot.send_buf_len = 0;
-                if uni_stream_fin_emitted[k] {
-                    slot.send_fin_emitted = true;
-                    slot.send_fin_pending = false;
-                }
+                conn.uni_streams[k].send.on_sent(
+                    uni_stream_off[k],
+                    uni_stream_buf_len[k],
+                    uni_stream_fin_emitted[k],
+                );
             }
             k += 1;
         }
@@ -4365,13 +4640,11 @@ unsafe fn emit_crypto_packet(
                 conn.bidi_streams[k].flow.recv_max_data_tx_pending = false;
             }
             if had_bidi_stream[k] {
-                let slot = &mut conn.bidi_streams[k];
-                slot.send_off += bidi_stream_buf_len[k] as u64;
-                slot.send_buf_len = 0;
-                if bidi_stream_fin_emitted[k] {
-                    slot.send_fin_emitted = true;
-                    slot.send_fin_pending = false;
-                }
+                conn.bidi_streams[k].send.on_sent(
+                    bidi_stream_off[k],
+                    bidi_stream_buf_len[k],
+                    bidi_stream_fin_emitted[k],
+                );
             }
             k += 1;
         }
@@ -4381,7 +4654,6 @@ unsafe fn emit_crypto_packet(
             EncLevel::OneRtt => &mut conn.one_rtt,
         };
         space.next_send_pn = pn + 1;
-        space.crypto_send_offset += crypto_packed as u64;
         if had_ack {
             space.ack_pending = false;
         }
@@ -4413,6 +4685,7 @@ unsafe fn emit_crypto_packet(
                 || had_uni_reset[k]
                 || had_uni_stop[k]
                 || had_uni_max_stream_data[k]
+                || had_uni_blocked[k]
             {
                 had_pool_frame = true;
                 break;
@@ -4426,6 +4699,7 @@ unsafe fn emit_crypto_packet(
                     || had_bidi_reset[k]
                     || had_bidi_stop[k]
                     || had_bidi_max_stream_data[k]
+                    || had_bidi_blocked[k]
                 {
                     had_pool_frame = true;
                     break;
@@ -4434,7 +4708,9 @@ unsafe fn emit_crypto_packet(
             }
         }
     }
-    let ack_eliciting = crypto_packed > 0
+    let ack_eliciting = had_crypto
+        || had_hs_ping
+        || had_ping
         || had_handshake_done
         || had_main_stream
         || had_pool_frame
@@ -4445,7 +4721,8 @@ unsafe fn emit_crypto_packet(
         || had_streams_blocked_bidi
         || had_streams_blocked_uni
         || had_datagram
-        || had_new_cid;
+        || had_new_cid
+        || had_retire;
     let conn = &mut s.conns[idx];
     let space = match level {
         EncLevel::Initial => &mut conn.initial,
@@ -4474,7 +4751,7 @@ unsafe fn emit_crypto_packet(
         // tracking entry rather than overwriting a live one. ACK
         // accounting may temporarily skip this packet — the peer's
         // ACK will return as a no-op `find_sent` miss.
-        let _ = space.record_sent(SentPacket {
+        let slot = space.record_sent(SentPacket {
             pn,
             bytes: n as u32,
             sent_ms: now_ms,
@@ -4483,8 +4760,123 @@ unsafe fn emit_crypto_packet(
             live: true,
         });
         conn.bytes_in_flight = conn.bytes_in_flight.saturating_add(n as u64);
+        // What a lost 1-RTT packet has to be sent again from.
+        if let (Some(slot), EncLevel::OneRtt) = (slot, level) {
+            let mut frames = SentFrames::empty();
+            let mut c = 0;
+            let mut chunk = |stream: u8, stream_id: u64, off: u64, len: usize, fin: bool| {
+                frames.chunks[c] = SentChunk {
+                    stream,
+                    fin,
+                    len: len as u16,
+                    off,
+                    stream_id,
+                };
+                c += 1;
+            };
+            if had_main_stream {
+                chunk(
+                    CHUNK_MAIN,
+                    0,
+                    main_stream_off,
+                    main_stream_buf_len,
+                    main_stream_fin_emitted,
+                );
+            }
+            if had_crypto {
+                chunk(CHUNK_CRYPTO, 0, crypto_off, crypto_len, false);
+            }
+            let mut k = 0;
+            while k < MAX_BIDI_STREAMS {
+                if had_bidi_stream[k] {
+                    let id = conn.bidi_streams[k].stream_id;
+                    let (off, len, fin) = (
+                        bidi_stream_off[k],
+                        bidi_stream_buf_len[k],
+                        bidi_stream_fin_emitted[k],
+                    );
+                    chunk(CHUNK_BIDI + k as u8, id, off, len, fin);
+                }
+                k += 1;
+            }
+            let mut k = 0;
+            while k < MAX_UNI_STREAMS {
+                if had_uni_stream[k] {
+                    let id = conn.uni_streams[k].stream_id;
+                    let (off, len, fin) = (
+                        uni_stream_off[k],
+                        uni_stream_buf_len[k],
+                        uni_stream_fin_emitted[k],
+                    );
+                    chunk(CHUNK_UNI + k as u8, id, off, len, fin);
+                }
+                k += 1;
+            }
+            let mut ctrl = 0u128;
+            for (had, bit) in [
+                (had_handshake_done, CTRL_HANDSHAKE_DONE),
+                (had_max_streams, CTRL_MAX_STREAMS_BIDI),
+                (had_max_streams_uni, CTRL_MAX_STREAMS_UNI),
+                (had_max_data, CTRL_MAX_DATA),
+                (had_data_blocked, CTRL_DATA_BLOCKED),
+                (had_streams_blocked_bidi, CTRL_STREAMS_BLOCKED_BIDI),
+                (had_streams_blocked_uni, CTRL_STREAMS_BLOCKED_UNI),
+                (had_new_cid, CTRL_NEW_CID),
+            ] {
+                if had {
+                    ctrl |= bit;
+                }
+            }
+            let mut k = 0;
+            while k < MAX_BIDI_STREAMS {
+                for (had, base) in [
+                    (had_bidi_reset[k], CTRL_BIDI_RESET),
+                    (had_bidi_stop[k], CTRL_BIDI_STOP),
+                    (had_bidi_max_stream_data[k], CTRL_BIDI_MSD),
+                    (had_bidi_blocked[k], CTRL_BIDI_BLOCKED),
+                ] {
+                    if had {
+                        ctrl |= 1u128 << (base + k as u32);
+                    }
+                }
+                k += 1;
+            }
+            let mut k = 0;
+            while k < MAX_UNI_STREAMS {
+                for (had, base) in [
+                    (had_uni_reset[k], CTRL_UNI_RESET),
+                    (had_uni_stop[k], CTRL_UNI_STOP),
+                    (had_uni_max_stream_data[k], CTRL_UNI_MSD),
+                    (had_uni_blocked[k], CTRL_UNI_BLOCKED),
+                ] {
+                    if had {
+                        ctrl |= 1u128 << (base + k as u32);
+                    }
+                }
+                k += 1;
+            }
+            frames.ctrl = ctrl;
+            frames.retired[..retired_n].copy_from_slice(&retired[..retired_n]);
+            frames.retired_n = retired_n as u8;
+            conn.one_rtt_frames[slot] = frames;
+            conn.pto_probes = conn.pto_probes.saturating_sub(1);
+        } else if let Some(slot) = slot {
+            conn.hs_crypto_frames[space_index(level)][slot] = CryptoChunk {
+                off: crypto_off,
+                len: if had_crypto { crypto_len as u16 } else { 0 },
+            };
+        }
     }
-    (true, crypto_packed)
+    true
+}
+
+/// Most STREAM data a frame may carry once `payload_len` bytes of the
+/// packet are taken: the packet stays within one datagram on a 1500-byte
+/// path, with room for the frame's own header.
+fn stream_room(payload_len: usize) -> usize {
+    const PACKET_PAYLOAD_BUDGET: usize = 1300;
+    const STREAM_FRAME_HEADER: usize = 1 + 8 + 8 + 8;
+    PACKET_PAYLOAD_BUDGET.saturating_sub(payload_len + STREAM_FRAME_HEADER)
 }
 
 /// Emit a CONNECTION_CLOSE frame (RFC 9000 §19.19 + §10.2). Picks
@@ -4621,210 +5013,375 @@ pub(crate) unsafe fn emit_connection_close(
     dev_log(sys, 3, msg.as_ptr(), msg.len());
 }
 
-/// Emit a dedicated PATH_CHALLENGE probe (RFC 9000 §8.2.1 / §9.3.3) to
-/// the candidate 4-tuple under validation. The probe is its OWN 1-RTT
-/// packet carrying nothing but the challenge frame — no application
-/// data, ACK, or CRYPTO ever reaches the unvalidated address. Clears
-/// `path_challenge_tx_pending`; the migration detector re-arms it on the
-/// next packet from the candidate, so a lost probe is naturally retried
-/// as long as the migrating peer keeps sending (bounded by the
-/// validation timeout). 1-RTT only — path validation is post-handshake.
-pub(crate) unsafe fn emit_path_challenge(s: &mut QuicState, idx: usize) {
-    let conn = &s.conns[idx];
-    if !conn.one_rtt.keys_set {
-        return;
-    }
-    let mut frame_buf = [0u8; 9];
-    let n = build_path_challenge(&conn.path_challenge_data, &mut frame_buf);
-    if n == 0 {
-        return;
-    }
-    let peer_cid_len = conn.peer_cid_len as usize;
-    let peer_cid = conn.peer_cid;
-    let cand = PeerAddr {
-        ip: conn.cand_ip,
-        port: conn.cand_port,
-    };
-    let keys = conn.one_rtt.write_keys;
-    let hp_key = conn.one_rtt.write_keys.hp;
-    let pn = conn.one_rtt.next_send_pn;
-    let key_phase = conn.one_rtt.key_phase;
-    let hp = Aes128Hp::new(&hp_key);
-    let mut pkt = [0u8; QUIC_DGRAM_MAX];
-    let dcid = &peer_cid[..peer_cid_len];
-    let pkt_len = build_one_rtt_packet(
-        &keys,
-        &hp,
-        pn,
-        4,
-        key_phase,
-        dcid,
-        &frame_buf[..n],
-        &mut pkt,
-    );
-    if pkt_len == 0 {
-        return;
-    }
-    let sys = &*s.syscalls;
-    // Only burn the packet number and clear the pending flag once the
-    // probe is actually accepted by the channel. On backpressure we
-    // leave both intact so drain_outbound re-emits the SAME challenge
-    // (same bytes, same PN-to-be) next tick rather than dropping it.
-    if send_datagram(
-        sys,
-        s.net_out,
-        &s.endpoint,
-        &s.peer_name[..s.peer_name_len as usize],
-        &cand,
-        &pkt[..pkt_len],
-        &mut s.net_scratch,
-    ) {
-        s.conns[idx].one_rtt.next_send_pn = pn + 1;
-        s.conns[idx].one_rtt_pn_commit();
-        s.conns[idx].path_challenge_tx_pending = false;
-        // Stamp the probe so quic_pto_check can retransmit it on timeout
-        // (RFC 9000 §8.1 / §9.3.3) even if the peer stops sending — these
-        // dedicated probes are outside the data sent-packet ring, so PTO
-        // is the only retry driver when the candidate falls silent.
-        s.conns[idx].path_challenge_tx_ms = dev_millis(sys);
-    }
-}
+/// Smallest datagram that proves a path can carry QUIC (RFC 9000 §14.1):
+/// what a path probe is expanded to where the allowance permits.
+const PATH_PROBE_EXPANDED: usize = 1200;
 
-/// Emit a dedicated PATH_RESPONSE (RFC 9000 §8.2.2 / §19.18) echoing a
-/// PATH_CHALLENGE the peer sent us. Per §8.2.2 the response MUST go out
-/// on the network path the challenge arrived on — `path_response_to_*`,
-/// captured at frame-dispatch time — NOT necessarily the validated
-/// `peer`. Its own 1-RTT packet (no other frames). Clears
-/// `path_response_tx_pending` only on a successful enqueue so a
-/// backpressured response is retried. 1-RTT only.
-pub(crate) unsafe fn emit_path_response(s: &mut QuicState, idx: usize) {
+/// Send `frame` alone in a 1-RTT packet to `dest` under peer connection ID
+/// `dcid`, expanded with PADDING to `PATH_PROBE_EXPANDED` bytes when
+/// `expand`. Returns the datagram size, or `None` when it did not go —
+/// no keys, or a full channel — leaving the caller's pending state for
+/// the next step.
+unsafe fn send_path_probe(
+    s: &mut QuicState,
+    idx: usize,
+    frame: &[u8],
+    dest: PeerAddr,
+    dcid: &[u8],
+    expand: bool,
+) -> Option<usize> {
     let conn = &s.conns[idx];
     if !conn.one_rtt.keys_set {
-        return;
+        return None;
     }
-    let mut frame_buf = [0u8; 9];
-    let n = build_path_response(&conn.path_response_data, &mut frame_buf);
-    if n == 0 {
-        return;
-    }
-    let peer_cid_len = conn.peer_cid_len as usize;
-    let peer_cid = conn.peer_cid;
-    let dest = PeerAddr {
-        ip: conn.path_response_to_ip,
-        port: conn.path_response_to_port,
-    };
     let keys = conn.one_rtt.write_keys;
-    let hp_key = conn.one_rtt.write_keys.hp;
+    let hp = Aes128Hp::new(&conn.one_rtt.write_keys.hp);
     let pn = conn.one_rtt.next_send_pn;
     let key_phase = conn.one_rtt.key_phase;
-    let hp = Aes128Hp::new(&hp_key);
+    const PN_LEN: usize = 4;
+    const TAG: usize = 16;
+    let mut payload = [0u8; PATH_PROBE_EXPANDED];
+    payload[..frame.len()].copy_from_slice(frame);
+    let overhead = 1 + dcid.len() + PN_LEN + TAG;
+    let payload_len = if expand {
+        PATH_PROBE_EXPANDED
+            .saturating_sub(overhead)
+            .max(frame.len())
+    } else {
+        frame.len()
+    };
     let mut pkt = [0u8; QUIC_DGRAM_MAX];
-    let dcid = &peer_cid[..peer_cid_len];
-    let pkt_len = build_one_rtt_packet(
+    let n = build_one_rtt_packet(
         &keys,
         &hp,
         pn,
-        4,
+        PN_LEN,
         key_phase,
         dcid,
-        &frame_buf[..n],
+        &payload[..payload_len],
         &mut pkt,
     );
-    if pkt_len == 0 {
-        return;
+    if n == 0 {
+        return None;
     }
     let sys = &*s.syscalls;
-    if send_datagram(
+    // Only burn the packet number once the channel takes the datagram; on
+    // backpressure the same probe is rebuilt next step.
+    if !send_datagram(
         sys,
         s.net_out,
         &s.endpoint,
         &s.peer_name[..s.peer_name_len as usize],
         &dest,
-        &pkt[..pkt_len],
+        &pkt[..n],
         &mut s.net_scratch,
     ) {
-        s.conns[idx].one_rtt.next_send_pn = pn + 1;
-        s.conns[idx].one_rtt_pn_commit();
+        return None;
+    }
+    let conn = &mut s.conns[idx];
+    conn.one_rtt.next_send_pn = pn + 1;
+    conn.one_rtt_pn_commit();
+    conn.amp_charge(&dest, n);
+    Some(n)
+}
+
+/// Emit a dedicated PATH_CHALLENGE (RFC 9000 §8.2.1) to the path under
+/// validation — its own packet, carrying nothing else. Expanded to 1200
+/// bytes where the new address's anti-amplification allowance permits;
+/// otherwise sent small, and followed by an expanded one once validation
+/// succeeds. Retried on PTO (see `quic_pto_check`) until the validation
+/// timeout. 1-RTT only — path validation is post-handshake.
+pub(crate) unsafe fn emit_path_challenge(s: &mut QuicState, idx: usize) {
+    if s.conns[idx].peer_cid_starved {
+        return;
+    }
+    if s.conns[idx].challenge_refresh {
+        let sys = &*s.syscalls;
+        dev_csprng_fill(sys, s.conns[idx].path_challenge_data.as_mut_ptr(), 8);
+        s.conns[idx].challenge_refresh = false;
+    }
+    let conn = &s.conns[idx];
+    let mut frame = [0u8; 9];
+    let n = build_path_challenge(&conn.path_challenge_data, &mut frame);
+    if n == 0 {
+        return;
+    }
+    let dest = PeerAddr {
+        ip: conn.cand_ip,
+        port: conn.cand_port,
+    };
+    let allowance = conn.amp_allowance(&dest);
+    let expand = allowance >= PATH_PROBE_EXPANDED as u64;
+    if !expand && allowance < 64 {
+        // Not even a small probe fits yet; more from the peer raises it.
+        return;
+    }
+    let dcid = conn.peer_cid;
+    let dcid_len = conn.peer_cid_len as usize;
+    if send_path_probe(s, idx, &frame[..n], dest, &dcid[..dcid_len], expand).is_some() {
+        let sys = &*s.syscalls;
+        let conn = &mut s.conns[idx];
+        conn.path_challenge_tx_pending = false;
+        conn.challenge_expanded = expand;
+        conn.path_challenge_tx_ms = dev_millis(sys);
+    }
+}
+
+/// Challenge the previously active path after a migration (RFC 9000
+/// §9.3.3), under the connection ID that path used. Its answer changes
+/// nothing; the point is to elicit traffic there, so a forwarded copy of
+/// the peer's packets cannot quietly move the connection.
+pub(crate) unsafe fn emit_old_path_challenge(s: &mut QuicState, idx: usize) {
+    let conn = &s.conns[idx];
+    let mut frame = [0u8; 9];
+    let n = build_path_challenge(&conn.old_path_challenge_data, &mut frame);
+    if n == 0 || conn.old_path.is_unset() {
+        return;
+    }
+    let (dcid, dcid_len) = if conn.old_path_cid_retire {
+        (conn.old_path_cid, conn.old_path_cid_len as usize)
+    } else {
+        (conn.peer_cid, conn.peer_cid_len as usize)
+    };
+    let dest = conn.old_path;
+    if send_path_probe(s, idx, &frame[..n], dest, &dcid[..dcid_len], true).is_some() {
+        s.conns[idx].old_path_challenge_tx_pending = false;
+    }
+}
+
+/// Emit a dedicated PATH_RESPONSE (RFC 9000 §8.2.2) echoing a
+/// PATH_CHALLENGE the peer sent, on the path the challenge ARRIVED on —
+/// `path_response_to_*` — not necessarily `peer`. Expanded to 1200 bytes
+/// unless that would exceed three times the datagram that carried the
+/// challenge toward an address not yet validated. Its own packet; the
+/// pending flag clears only on a successful enqueue.
+pub(crate) unsafe fn emit_path_response(s: &mut QuicState, idx: usize) {
+    let conn = &s.conns[idx];
+    let mut frame = [0u8; 9];
+    let n = build_path_response(&conn.path_response_data, &mut frame);
+    if n == 0 {
+        return;
+    }
+    let dest = PeerAddr {
+        ip: conn.path_response_to_ip,
+        port: conn.path_response_to_port,
+    };
+    let validated = (conn.peer_validated && conn.peer.matches(&dest.ip, dest.port))
+        || conn.last_valid_peer.matches(&dest.ip, dest.port);
+    let expand = validated || (conn.path_response_rx_len as usize) * 3 >= PATH_PROBE_EXPANDED;
+    let dcid = conn.peer_cid;
+    let dcid_len = conn.peer_cid_len as usize;
+    if send_path_probe(s, idx, &frame[..n], dest, &dcid[..dcid_len], expand).is_some() {
         s.conns[idx].path_response_tx_pending = false;
     }
 }
 
-/// Probe-Timeout (RFC 9002 §6.2) check — replay the saved packet for
-/// any space whose oldest unacked send is older than the connection's
-/// computed PTO. PTO is `smoothed_rtt + max(4*rttvar, granularity) +
-/// max_ack_delay` (RFC 9002 §6.2.1); for a brand-new connection we
-/// fall back to `kInitialRtt = 333ms`.
+/// The 1-RTT space's timers (RFC 9002 §6.1.2, §6.2).
 ///
-/// On expiry we also drive the NewReno congestion controller: the
-/// presumed-lost packet's bytes are deducted from `bytes_in_flight`
+/// Loss: a packet sent before the largest acknowledged one and older than
+/// 9/8 of the round trip is lost even when no further acknowledgement
+/// arrives to say so, and what it carried is owed again.
+///
+/// Probe: when the newest packet in flight has gone unanswered for a
+/// probe timeout, every unacknowledged range is owed again and up to two
+/// probes go out past the congestion window. A ring with no free slot
+/// gives up its oldest packet as lost, or the probe could never be
+/// tracked.
+unsafe fn one_rtt_timeouts(conn: &mut QuicConnection, now_ms: u64, pto_ms: u64) {
+    if !conn.one_rtt.keys_set || conn.cont_emission_held {
+        return;
+    }
+    let rtt_max = conn.rtt.smoothed_rtt.max(conn.rtt.latest_rtt) as u64;
+    let loss_after = rtt_max + (rtt_max >> 3);
+    let mut lost_bytes: u64 = 0;
+    let mut earliest_lost: u64 = 0;
+    let mut newest_sent: u64 = 0;
+    let mut oldest: Option<usize> = None;
+    let mut ix = 0;
+    while ix < SENT_PACKET_RING {
+        let p = conn.one_rtt.sent_packets[ix];
+        ix += 1;
+        if !p.live {
+            continue;
+        }
+        let i = ix - 1;
+        let lost = conn.one_rtt.peer_acked_seen
+            && p.pn < conn.one_rtt.peer_acked_largest
+            && loss_after > 0
+            && now_ms.saturating_sub(p.sent_ms) > loss_after;
+        if lost {
+            conn.one_rtt.sent_packets[i].live = false;
+            if p.in_flight {
+                lost_bytes = lost_bytes.saturating_add(p.bytes as u64);
+            }
+            if earliest_lost == 0 || p.sent_ms < earliest_lost {
+                earliest_lost = p.sent_ms;
+            }
+            conn.on_one_rtt_lost(i);
+            continue;
+        }
+        newest_sent = newest_sent.max(p.sent_ms);
+        if oldest.is_none_or(|o| p.pn < conn.one_rtt.sent_packets[o].pn) {
+            oldest = Some(i);
+        }
+    }
+    if lost_bytes > 0 {
+        conn.cc_on_loss(lost_bytes, earliest_lost);
+    }
+    let Some(oldest) = oldest else {
+        return;
+    };
+    let backoff = pto_ms << conn.pto_count.min(PTO_BACKOFF_MAX);
+    if now_ms.saturating_sub(newest_sent) < backoff {
+        return;
+    }
+    conn.pto_count = conn.pto_count.saturating_add(1);
+    conn.pto_probes = PTO_PROBES;
+    conn.ping_pending = true;
+    conn.requeue_for_probe();
+    if !conn.one_rtt.has_free_sent_slot() {
+        let p = conn.one_rtt.sent_packets[oldest];
+        conn.one_rtt.sent_packets[oldest].live = false;
+        if p.in_flight {
+            conn.bytes_in_flight = conn.bytes_in_flight.saturating_sub(p.bytes as u64);
+        }
+        conn.on_one_rtt_lost(oldest);
+    }
+}
+
+/// The Initial / Handshake space's timers (RFC 9002 §6.1.2, §6.2).
+///
+/// Loss: a packet sent before the largest acknowledged one and older than
+/// 9/8 of the round trip is lost, and its CRYPTO range owed again.
+///
+/// Probe: when the newest packet in flight has gone unanswered for a probe
+/// timeout, the space's unacknowledged CRYPTO is owed again, with a PING
+/// when there is none. A client keeps this timer armed with nothing in
+/// flight until the server has acknowledged one of its Handshake packets
+/// (§6.2.2.1): a server held by the anti-amplification limit can only be
+/// released by the client sending again.
+unsafe fn hs_timeouts(conn: &mut QuicConnection, level: EncLevel, now_ms: u64, pto_ms: u64) {
+    if !conn.space_usable(level) {
+        return;
+    }
+    let rtt_max = conn.rtt.smoothed_rtt.max(conn.rtt.latest_rtt) as u64;
+    let loss_after = rtt_max + (rtt_max >> 3);
+    let mut lost_bytes: u64 = 0;
+    let mut earliest_lost: u64 = 0;
+    let mut newest_sent: u64 = 0;
+    let mut oldest: Option<usize> = None;
+    let mut lost_slots: u32 = 0;
+    {
+        let space = match level {
+            EncLevel::Initial => &mut conn.initial,
+            _ => &mut conn.handshake,
+        };
+        let mut ix = 0;
+        while ix < SENT_PACKET_RING {
+            let p = space.sent_packets[ix];
+            let i = ix;
+            ix += 1;
+            if !p.live {
+                continue;
+            }
+            let lost = space.peer_acked_seen
+                && p.pn < space.peer_acked_largest
+                && loss_after > 0
+                && now_ms.saturating_sub(p.sent_ms) > loss_after;
+            if lost {
+                space.sent_packets[i].live = false;
+                if p.in_flight {
+                    lost_bytes = lost_bytes.saturating_add(p.bytes as u64);
+                }
+                if earliest_lost == 0 || p.sent_ms < earliest_lost {
+                    earliest_lost = p.sent_ms;
+                }
+                lost_slots |= 1 << i;
+                continue;
+            }
+            newest_sent = newest_sent.max(p.sent_ms);
+            if oldest.is_none_or(|o| p.pn < space.sent_packets[o].pn) {
+                oldest = Some(i);
+            }
+        }
+    }
+    let mut ix = 0;
+    while ix < SENT_PACKET_RING {
+        if lost_slots & (1 << ix) != 0 {
+            conn.on_hs_lost(level, ix);
+        }
+        ix += 1;
+    }
+    if lost_bytes > 0 {
+        conn.cc_on_loss(lost_bytes, earliest_lost);
+    }
+    // A client not yet acknowledged at Handshake level times from its
+    // last send in this space even with nothing in flight.
+    let unanswered_client = !conn.is_server
+        && !conn.handshake_confirmed
+        && !conn.handshake.peer_acked_seen
+        && (matches!(level, EncLevel::Handshake) || !conn.space_usable(EncLevel::Handshake));
+    let since = match (oldest, unanswered_client) {
+        (Some(_), _) => newest_sent,
+        (None, true) => match level {
+            EncLevel::Initial => conn.initial.last_emitted_ms,
+            _ => conn.handshake.last_emitted_ms,
+        },
+        (None, false) => return,
+    };
+    if since == 0 {
+        return;
+    }
+    let backoff = pto_ms << conn.pto_count.min(PTO_BACKOFF_MAX);
+    if now_ms.saturating_sub(since) < backoff {
+        return;
+    }
+    let i = space_index(level);
+    conn.pto_count = conn.pto_count.saturating_add(1);
+    conn.crypto_send[i].requeue_unacked();
+    if !conn.crypto_send[i].has_pending() {
+        conn.hs_ping_pending[i] = true;
+    }
+    let space = match level {
+        EncLevel::Initial => &mut conn.initial,
+        _ => &mut conn.handshake,
+    };
+    space.last_emitted_ms = now_ms;
+    if let (Some(oldest), false) = (oldest, space.has_free_sent_slot()) {
+        let p = space.sent_packets[oldest];
+        space.sent_packets[oldest].live = false;
+        if p.in_flight {
+            conn.bytes_in_flight = conn.bytes_in_flight.saturating_sub(p.bytes as u64);
+        }
+        conn.on_hs_lost(level, oldest);
+    }
+}
+
+/// Probes a 1-RTT timeout sends (RFC 9002 §6.2.4 allows up to two).
+const PTO_PROBES: u8 = 2;
+/// Doublings of the probe timeout before it stops growing.
+const PTO_BACKOFF_MAX: u8 = 6;
+
+/// Probe-Timeout (RFC 9002 §6.2) check for every space whose last
+/// ack-eliciting send is older than the connection's computed PTO.
+/// PTO is `smoothed_rtt + max(4*rttvar, granularity) + max_ack_delay`
+/// (RFC 9002 §6.2.1); for a brand-new connection we fall back to
+/// `kInitialRtt = 333ms`.
+///
+/// In the 1-RTT space a timeout owes probes (RFC 9002 §6.2.4): new
+/// packets, sent past the congestion window, that carry every
+/// unacknowledged range again, and a PING when there is none. Each
+/// consecutive timeout doubles the next. The Initial and Handshake
+/// spaces replay the saved packet and drive the NewReno controller:
+/// the presumed-lost packet's bytes are deducted from `bytes_in_flight`
 /// and `cc_on_loss` collapses cwnd (RFC 9002 §B.6).
 pub(crate) unsafe fn quic_pto_check(s: &mut QuicState, idx: usize) {
     let sys = &*s.syscalls;
     let now_ms = dev_millis(sys);
     let pto_threshold = s.conns[idx].rtt.pto() as u64;
-    for level in [EncLevel::Initial, EncLevel::Handshake, EncLevel::OneRtt] {
-        let resend_bytes;
-        let resend_len;
-        let peer;
-        let mut lost_bytes: u64 = 0;
-        let lost_pn: u64;
-        let lost_sent_ms: u64;
-        {
-            let conn = &mut s.conns[idx];
-            let space = match level {
-                EncLevel::Initial => &mut conn.initial,
-                EncLevel::Handshake => &mut conn.handshake,
-                EncLevel::OneRtt => &mut conn.one_rtt,
-            };
-            if space.last_emitted_len == 0 || space.last_emitted_ms == 0 {
-                continue;
-            }
-            // A withheld packet has not been shown to the peer, so it
-            // cannot have been lost. Replaying it here would put its
-            // packet number on the wire twice — once now and once when
-            // the horizon releases the same bytes — and would show the
-            // peer a transition the standby has not confirmed, which is
-            // the whole of what the horizon prevents.
-            if matches!(level, EncLevel::OneRtt) && conn.cont_emission_held {
-                continue;
-            }
-            if now_ms.wrapping_sub(space.last_emitted_ms) < pto_threshold {
-                continue;
-            }
-            // Time up — replay the saved packet bytes.
-            resend_len = space.last_emitted_len;
-            let mut buf = [0u8; 1500];
-            core::ptr::copy_nonoverlapping(
-                space.last_emitted.as_ptr(),
-                buf.as_mut_ptr(),
-                resend_len,
-            );
-            resend_bytes = buf;
-            peer = conn.peer;
-            lost_pn = space.last_emitted_pn;
-            lost_sent_ms = space.last_emitted_ms;
-            // Mark the lost packet's tracked entry (if present) so
-            // it doesn't get double-counted when a late ACK arrives.
-            if let Some((bytes, _ack_eliciting, in_flight, _ms, ix)) = space.find_sent(lost_pn) {
-                if in_flight {
-                    lost_bytes = bytes as u64;
-                }
-                space.clear_sent(ix);
-            }
-            space.last_emitted_ms = now_ms; // exponential backoff in real impl
-        }
-        let _ = send_datagram(
-            sys,
-            s.net_out,
-            &s.endpoint,
-            &s.peer_name[..s.peer_name_len as usize],
-            &peer,
-            &resend_bytes[..resend_len],
-            &mut s.net_scratch,
-        );
-        if lost_bytes > 0 {
-            s.conns[idx].cc_on_loss(lost_bytes, lost_sent_ms);
-        }
+    one_rtt_timeouts(&mut s.conns[idx], now_ms, pto_threshold);
+    for level in [EncLevel::Initial, EncLevel::Handshake] {
+        hs_timeouts(&mut s.conns[idx], level, now_ms, pto_threshold);
     }
     // PTO retransmission of a path-validation PATH_CHALLENGE (RFC 9000
     // §8.1 / §9.3.3). These probes are dedicated packets to the candidate

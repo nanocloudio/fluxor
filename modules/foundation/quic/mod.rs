@@ -168,7 +168,6 @@ const PATH_VALIDATE_TIMEOUT_MS: u64 = 3_000;
 //   quic → app: MSG_MUX_STREAM_CLOSED   [session][stream][reason]  (FIN)
 //   quic → app: MSG_MUX_STREAM_RESET    [session][stream][app_error]
 //   quic → app: MSG_MUX_STREAM_STOPPED  [session][stream][app_error]
-//   quic → app: MSG_MUX_STREAM_READY    [session][stream][bytes]
 //   quic → app: MSG_MUX_STREAM_ERROR    [session][stream][errno]
 //   quic → app: MSG_MUX_DATAGRAM_RX     [session][data]
 //   app → quic: CMD_MUX_STREAM_OPEN     [session][flags]
@@ -293,6 +292,14 @@ pub(crate) struct QuicState {
     net_out: i32,
     app_in: i32,
     app_out: i32,
+    /// An application command read from `app_in` that cannot be applied
+    /// yet — a stream write its send buffer or flow-control window has no
+    /// room for. Nothing more is read until it applies, so `app_in` backs
+    /// up and the application's own write is what waits.
+    app_cmd_held: bool,
+    app_cmd_held_type: u8,
+    app_cmd_held_len: usize,
+    app_cmd_held_payload: [u8; mux::STREAM_DATA_PREFIX + mux::MUX_QUIC_STREAM_SEND_MAX],
     /// Transport-continuity control ports. `cont_in` receives
     /// checkpoint/delta/cut-over commands and durable reservation grants;
     /// `cont_out` emits `MSG_SC_CONTINUITY` replies and mirror deltas.
@@ -681,6 +688,8 @@ pub unsafe extern "C" fn module_new(
     let sys = &*s.syscalls;
     s.net_in = dev_channel_port(sys, 0, 0);
     s.app_in = dev_channel_port(sys, 0, 1);
+    s.app_cmd_held = false;
+    s.app_cmd_held_len = 0;
     s.net_out = dev_channel_port(sys, 1, 0);
     s.app_out = dev_channel_port(sys, 1, 1);
     // in[2] / out[2] = continuity control (-1 when unwired). Optional
@@ -1404,6 +1413,21 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                 // PATH_RESPONSE (§8.2.2 / §8.2.3).
                                 conn.recv_ip = ip;
                                 conn.recv_port = port;
+                                conn.recv_len = dlen as u16;
+                                // Every datagram an unproven address sends
+                                // raises what may be sent back to it.
+                                if !conn.peer_validated && conn.peer.matches(&ip, port) {
+                                    conn.amp_rx = conn.amp_rx.saturating_add(dlen as u64);
+                                }
+                                let alt = conn.alt_cid_len as usize;
+                                conn.recv_dcid_seq = if alt > 0
+                                    && dcid_len == alt
+                                    && dcid_buf[..alt] == conn.alt_cid[..alt]
+                                {
+                                    conn.alt_cid_seq
+                                } else {
+                                    conn.our_cid_seq
+                                };
                                 let take_peek = if peek_len <= QUIC_DGRAM_MAX {
                                     peek_len
                                 } else {
@@ -1480,12 +1504,18 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
     }
 
     // Drain Errored connections by emitting a CONNECTION_CLOSE frame
-    // (RFC 9000 §10.2) with PROTOCOL_VIOLATION (0x0a, §20.1), then
-    // transition to Closed.
+    // (RFC 9000 §10.2) carrying the transport error that ended them
+    // (§20.1), then transition to Closed.
     let mut i = 0;
     while i < MAX_CONNS {
         if s.conns[i].phase == ConnPhase::Errored {
-            emit_connection_close(s, i, 0x0a, 0, b"protocol violation");
+            let code = s.conns[i].close_error;
+            let reason: &[u8] = match code {
+                ERR_STREAM_LIMIT => b"stream limit",
+                ERR_CONNECTION_ID_LIMIT => b"connection id limit",
+                _ => b"protocol violation",
+            };
+            emit_connection_close(s, i, code, 0, reason);
             s.conns[i].phase = ConnPhase::Closed;
         }
         i += 1;
@@ -1508,16 +1538,27 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 dev_log(sys, 3, msg.as_ptr(), msg.len());
             }
             // RFC 9000 §8.2.4: abandon a path validation that hasn't
-            // completed within the timeout so the flag doesn't latch
-            // forever (which would block a later genuine migration to the
-            // same address). The active path is unchanged — we simply stop
-            // waiting on this candidate.
-            if s.conns[i].path_validating
-                && s.conns[i].path_validate_ms > 0
-                && now_ms_top.saturating_sub(s.conns[i].path_validate_ms) > PATH_VALIDATE_TIMEOUT_MS
-            {
-                s.conns[i].path_validating = false;
-                s.conns[i].path_challenge_tx_pending = false;
+            // completed within the timeout, and the previous path's with it.
+            let conn = &mut s.conns[i];
+            let expired = conn.path_validate_ms > 0
+                && now_ms_top.saturating_sub(conn.path_validate_ms) > PATH_VALIDATE_TIMEOUT_MS;
+            if conn.path_validating && expired {
+                conn.path_validating = false;
+                conn.path_challenge_tx_pending = false;
+                // An address that never proved itself is abandoned for the
+                // last one that did (RFC 9000 §9.3.2). With none, the
+                // connection has nowhere it may send, and ends silently.
+                if !conn.peer_validated {
+                    if conn.last_valid_peer.is_unset() {
+                        conn.phase = ConnPhase::Closed;
+                    } else {
+                        conn.peer = conn.last_valid_peer;
+                        conn.peer_validated = true;
+                    }
+                }
+            }
+            if conn.old_path_validating && expired {
+                conn.finish_old_path();
             }
         }
         i += 1;
@@ -1699,6 +1740,12 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
             // migration being enabled (no point issuing CIDs we forbid
             // the peer from using) and our advertised
             // active_connection_id_limit = 2 (one spare).
+            // RFC 9001 §4.9.2: a confirmed handshake ends the use of the
+            // Handshake keys, and of any Initial keys still held.
+            if s.conns[i].handshake_confirmed {
+                s.conns[i].discard_space(EncLevel::Handshake);
+                s.conns[i].discard_space(EncLevel::Initial);
+            }
             if s.disable_migration == 0
                 && s.conns[i].handshake_confirmed
                 && !s.conns[i].alt_cid_issued
@@ -1728,7 +1775,8 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 conn.alt_cid_issued = true;
                 if cid_ok && tok_ok {
                     conn.alt_cid_len = 8;
-                    conn.alt_cid_seq = 1;
+                    conn.alt_cid_seq = conn.next_cid_seq;
+                    conn.next_cid_seq += 1;
                     conn.new_cid_tx_pending = true;
                 } else {
                     // Declined for this connection: nothing queued, no retry.
@@ -1760,19 +1808,10 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 // Client-side auto-probe for the transparent path only.
                 if !s.conns[i].is_server
                     && !s.conns[i].test_sent
-                    && s.conns[i].stream_send_off == 0
-                    && s.conns[i].stream_send_buf_len == 0
+                    && s.conns[i].stream_send.end() == 0
                 {
-                    let msg = b"hello quic stream";
-                    let n = msg.len();
                     let conn = &mut s.conns[i];
-                    core::ptr::copy_nonoverlapping(
-                        msg.as_ptr(),
-                        conn.stream_send_buf.as_mut_ptr(),
-                        n,
-                    );
-                    conn.stream_send_buf_len = n;
-                    conn.test_sent = true;
+                    conn.test_sent = conn.stream_send.stage(b"hello quic stream");
                 }
             }
             // Read app→quic commands.
@@ -1793,23 +1832,17 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 }
             } else if s.app_in >= 0 {
                 // Transparent (no-ALPN) raw byte stream → conn[i] stream.
-                // Only read when the send buffer is drained so the whole
-                // read fits (reliable); otherwise app_in backpressures.
-                if s.conns[i].stream_send_buf_len == 0 {
+                // Only read when the send buffer has room for a whole read
+                // (reliable); otherwise app_in backpressures.
+                if s.conns[i].stream_send.space() >= TRANSPARENT_READ_MAX {
                     let poll = (sys.channel_poll)(s.app_in, POLL_IN);
                     if poll > 0 && (poll as u32 & POLL_IN) != 0 {
                         let conn = &mut s.conns[i];
-                        let mut tmp = [0u8; 1200];
-                        let cap = tmp.len().min(conn.stream_send_buf.len());
-                        let r = (sys.channel_read)(s.app_in, tmp.as_mut_ptr(), cap);
+                        let mut tmp = [0u8; TRANSPARENT_READ_MAX];
+                        let r = (sys.channel_read)(s.app_in, tmp.as_mut_ptr(), tmp.len());
                         if r > 0 {
                             let n = r as usize;
-                            core::ptr::copy_nonoverlapping(
-                                tmp.as_ptr(),
-                                conn.stream_send_buf.as_mut_ptr(),
-                                n,
-                            );
-                            conn.stream_send_buf_len = n;
+                            let _ = conn.stream_send.stage(&tmp[..n]);
                             s.tlm.bytes_out = s.tlm.bytes_out.wrapping_add(n as u32);
                         }
                     }
@@ -1838,8 +1871,11 @@ pub unsafe extern "C" fn module_destroy(_state: *mut u8) {}
 // keeps the two from drifting apart.
 const MUX_DATA_MAX: usize = mux::MUX_QUIC_STREAM_RX_MAX;
 
-/// True when every connection's outbound stream buffer is drained, so a
-/// freshly-read CMD_MUX_STREAM_SEND payload is guaranteed to land in full
+/// Most bytes one read of the transparent byte stream takes from `app_in`.
+const TRANSPARENT_READ_MAX: usize = 1200;
+
+/// True when every live connection's transparent send buffer has room for
+/// a whole read, so a freshly-read payload is guaranteed to land in full
 /// (reliable backpressure: we don't consume an app frame we can't store).
 unsafe fn drained_for_app_in(s: &QuicState) -> bool {
     let mut i = 0;
@@ -1853,7 +1889,7 @@ unsafe fn drained_for_app_in(s: &QuicState) -> bool {
             s.conns[i].phase,
             ConnPhase::Handshaking | ConnPhase::Established
         );
-        if live && s.conns[i].stream_send_buf_len != 0 {
+        if live && s.conns[i].stream_send.space() < TRANSPARENT_READ_MAX {
             return false;
         }
         i += 1;
@@ -1917,8 +1953,8 @@ struct StreamSnap {
     is_bidi: bool,
     recv_buf_len: usize,
     recv_fin: bool,
-    send_buf_len: usize,
-    send_fin_emitted: bool,
+    /// Every byte and the FIN of the send half are acknowledged.
+    send_done: bool,
     open_sent: bool,
     close_sent: bool,
     reset_sent: bool,
@@ -1927,7 +1963,8 @@ struct StreamSnap {
     recv_reset_error: u64,
     recv_stop: bool,
     recv_stop_error: u64,
-    reset_emitted: bool,
+    /// Our RESET_STREAM is acknowledged.
+    reset_acked: bool,
     reset_pending: bool,
 }
 
@@ -1946,8 +1983,7 @@ unsafe fn stream_snap(conn: &QuicConnection, loc: StreamLoc) -> Option<StreamSna
                 is_bidi: true,
                 recv_buf_len: st.recv_buf_len,
                 recv_fin: st.recv_fin,
-                send_buf_len: st.send_buf_len,
-                send_fin_emitted: st.send_fin_emitted,
+                send_done: st.send.done(),
                 open_sent: st.app.open_sent,
                 close_sent: st.app.close_sent,
                 reset_sent: st.app.reset_sent,
@@ -1956,7 +1992,7 @@ unsafe fn stream_snap(conn: &QuicConnection, loc: StreamLoc) -> Option<StreamSna
                 recv_reset_error: st.abort.recv_reset_error,
                 recv_stop: st.abort.recv_stop,
                 recv_stop_error: st.abort.recv_stop_error,
-                reset_emitted: st.abort.reset_emitted,
+                reset_acked: st.abort.reset_acked,
                 reset_pending: st.abort.reset_pending,
             })
         }
@@ -1972,8 +2008,7 @@ unsafe fn stream_snap(conn: &QuicConnection, loc: StreamLoc) -> Option<StreamSna
                 is_bidi: false,
                 recv_buf_len: st.recv_buf_len,
                 recv_fin: st.recv_fin,
-                send_buf_len: st.send_buf_len,
-                send_fin_emitted: st.send_fin_emitted,
+                send_done: st.send.done(),
                 open_sent: st.app.open_sent,
                 close_sent: st.app.close_sent,
                 reset_sent: st.app.reset_sent,
@@ -1982,7 +2017,7 @@ unsafe fn stream_snap(conn: &QuicConnection, loc: StreamLoc) -> Option<StreamSna
                 recv_reset_error: st.abort.recv_reset_error,
                 recv_stop: st.abort.recv_stop,
                 recv_stop_error: st.abort.recv_stop_error,
-                reset_emitted: st.abort.reset_emitted,
+                reset_acked: st.abort.reset_acked,
                 reset_pending: st.abort.reset_pending,
             })
         }
@@ -2053,6 +2088,10 @@ unsafe fn stream_release(conn: &mut QuicConnection, loc: StreamLoc) {
     match loc {
         StreamLoc::Bidi(k) => {
             let peer_opened = !conn.bidi_streams[k].locally_initiated;
+            if peer_opened {
+                let index = conn.bidi_streams[k].stream_id >> 2;
+                conn.peer_bidi_finished.insert(index);
+            }
             conn.bidi_streams[k] = BidiStream::empty();
             // Freeing the slot is only half of it. The peer's ability to
             // OPEN another stream is governed by MAX_STREAMS credit (RFC
@@ -2067,6 +2106,10 @@ unsafe fn stream_release(conn: &mut QuicConnection, loc: StreamLoc) {
         }
         StreamLoc::Uni(k) => {
             let peer_opened = !conn.uni_streams[k].locally_initiated;
+            if peer_opened {
+                let index = conn.uni_streams[k].stream_id >> 2;
+                conn.peer_uni_finished.insert(index);
+            }
             conn.uni_streams[k] = UniStream::empty();
             if peer_opened {
                 conn.max_streams_uni_granted = conn.max_streams_uni_granted.saturating_add(1);
@@ -2205,7 +2248,10 @@ unsafe fn stream_deliver(s: &mut QuicState, idx: usize, loc: StreamLoc) -> bool 
     // 5. Reclaim. Only once BOTH halves are finished AND every
     //    notification about them has actually been delivered — recycling
     //    a slot earlier would hand its handle to a new stream while the
-    //    application still believed the old one was live.
+    //    application still believed the old one was live. A send half is
+    //    finished when the peer has acknowledged all of it, FIN or
+    //    RESET_STREAM included: until then a lost packet must still be
+    //    sent again from this slot.
     let done = match stream_snap(&s.conns[idx], loc) {
         Some(v) => v,
         None => return true,
@@ -2214,9 +2260,8 @@ unsafe fn stream_deliver(s: &mut QuicState, idx: usize, loc: StreamLoc) -> bool 
     // A peer-initiated unidirectional stream has no send half, and a
     // locally-initiated one has no recv half.
     let send_half_applies = done.is_bidi || done.locally_initiated;
-    let send_done = !send_half_applies
-        || (done.send_buf_len == 0 && done.send_fin_emitted)
-        || (done.reset_emitted && !done.reset_pending);
+    let send_done =
+        !send_half_applies || done.send_done || (done.reset_acked && !done.reset_pending);
     let recv_half_applies = done.is_bidi || !done.locally_initiated;
     if send_done && (!recv_half_applies || recv_done) {
         stream_release(&mut s.conns[idx], loc);
@@ -2403,18 +2448,34 @@ unsafe fn stream_open_local(s: &mut QuicState, cid: usize, flags: u8) -> Option<
             conn.streams_blocked_uni_pending = true;
             return None;
         }
+        // The local share of the table; the rest is held for the peer's
+        // credit.
+        let local = conn
+            .uni_streams
+            .iter()
+            .filter(|st| st.allocated && st.locally_initiated);
+        if local.count() >= LOCAL_UNI_STREAMS {
+            return None;
+        }
         let id = if is_server {
             next_server_uni_id(conn.next_uni_idx)
         } else {
             next_client_uni_id(conn.next_uni_idx)
         };
         let slot = uni_alloc(conn, id, true)?;
-        conn.next_uni_idx = conn.next_uni_idx.wrapping_add(1);
+        conn.next_uni_idx += 1;
         conn.local_uni_opened = conn.local_uni_opened.saturating_add(1);
         return Some((conn.uni_streams[slot].app.handle, id));
     }
     if conn.local_bidi_opened >= conn.peer_max_streams_bidi {
         conn.streams_blocked_bidi_pending = true;
+        return None;
+    }
+    let local = conn
+        .bidi_streams
+        .iter()
+        .filter(|st| st.allocated && st.locally_initiated);
+    if local.count() >= LOCAL_BIDI_STREAMS {
         return None;
     }
     let id = if is_server {
@@ -2423,25 +2484,37 @@ unsafe fn stream_open_local(s: &mut QuicState, cid: usize, flags: u8) -> Option<
         next_client_bidi_id(conn.next_bidi_idx)
     };
     let slot = bidi_alloc(conn, id, true)?;
-    conn.next_bidi_idx = conn.next_bidi_idx.wrapping_add(1);
+    conn.next_bidi_idx += 1;
     conn.local_bidi_opened = conn.local_bidi_opened.saturating_add(1);
     Some((conn.bidi_streams[slot].app.handle, id))
 }
 
+/// What became of an application write.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Staged {
+    /// On the stream's send buffer.
+    Taken,
+    /// No room yet — in the send buffer, which frees as the peer
+    /// acknowledges, or in a flow-control window the peer will widen.
+    Wait,
+    /// Never: no such stream, or a stream with no send half.
+    Refused,
+}
+
 /// Stage application bytes onto a stream's send buffer.
 ///
-/// All-or-nothing: a write that does not fit whole is refused, never
-/// truncated and never partially applied. Truncating a reliable write is
-/// worse than refusing it — the application has no way to learn which
-/// suffix was dropped, and the stream carries a silently corrupted
-/// message from then on.
-unsafe fn stream_stage_send(s: &mut QuicState, cid: usize, handle: u32, data: &[u8]) -> bool {
+/// All-or-nothing: a write that does not fit whole is taken later or
+/// refused, never truncated and never partially applied. Truncating a
+/// reliable write is worse than refusing it — the application has no way
+/// to learn which suffix was dropped, and the stream carries a silently
+/// corrupted message from then on.
+unsafe fn stream_stage_send(s: &mut QuicState, cid: usize, handle: u32, data: &[u8]) -> Staged {
     if cid >= MAX_CONNS {
-        return false;
+        return Staged::Refused;
     }
     let loc = match locate_handle(&s.conns[cid], handle) {
         Some(l) => l,
-        None => return false,
+        None => return Staged::Refused,
     };
     // Connection-level flow control (RFC 9000 §4.1) applies across every
     // stream, so a write can be refused by the aggregate window even
@@ -2450,26 +2523,19 @@ unsafe fn stream_stage_send(s: &mut QuicState, cid: usize, handle: u32, data: &[
     let need = data.len() as u64;
     if conn.send_data_used.saturating_add(need) > conn.send_max_data {
         conn.data_blocked_pending = true;
-        return false;
+        return Staged::Wait;
     }
-    let ok = match loc {
+    let staged = match loc {
         StreamLoc::Bidi(k) => {
             let st = &mut conn.bidi_streams[k];
-            let space = st.send_buf.len() - st.send_buf_len;
-            let window_left = st.flow.send_max_data.saturating_sub(st.send_off);
+            let window_left = st.flow.send_max_data.saturating_sub(st.send.end());
             if need > window_left {
                 st.flow.send_blocked_pending = true;
-                false
-            } else if data.len() > space {
-                false
+                Staged::Wait
+            } else if st.send.stage(data) {
+                Staged::Taken
             } else {
-                core::ptr::copy_nonoverlapping(
-                    data.as_ptr(),
-                    st.send_buf.as_mut_ptr().add(st.send_buf_len),
-                    data.len(),
-                );
-                st.send_buf_len += data.len();
-                true
+                Staged::Wait
             }
         }
         StreamLoc::Uni(k) => {
@@ -2477,32 +2543,45 @@ unsafe fn stream_stage_send(s: &mut QuicState, cid: usize, handle: u32, data: &[
             if !st.locally_initiated {
                 // A unidirectional stream the PEER opened is receive-only
                 // for us; there is no send half to write to.
-                false
+                Staged::Refused
             } else {
-                let space = st.send_buf.len() - st.send_buf_len;
-                let window_left = st.flow.send_max_data.saturating_sub(st.send_off);
+                let window_left = st.flow.send_max_data.saturating_sub(st.send.end());
                 if need > window_left {
                     st.flow.send_blocked_pending = true;
-                    false
-                } else if data.len() > space {
-                    false
+                    Staged::Wait
+                } else if st.send.stage(data) {
+                    Staged::Taken
                 } else {
-                    core::ptr::copy_nonoverlapping(
-                        data.as_ptr(),
-                        st.send_buf.as_mut_ptr().add(st.send_buf_len),
-                        data.len(),
-                    );
-                    st.send_buf_len += data.len();
-                    true
+                    Staged::Wait
                 }
             }
         }
     };
-    if ok {
+    if staged == Staged::Taken {
         conn.send_data_used = conn.send_data_used.saturating_add(need);
         s.tlm.bytes_out = s.tlm.bytes_out.wrapping_add(data.len() as u32);
     }
-    ok
+    staged
+}
+
+/// Whether the local send half of a stream is closed — finished with a FIN
+/// or abandoned with RESET_STREAM — which fixes the stream's final size.
+unsafe fn stream_send_closed(s: &QuicState, cid: usize, handle: u32) -> bool {
+    if cid >= MAX_CONNS {
+        return false;
+    }
+    let conn = &s.conns[cid];
+    match locate_handle(conn, handle) {
+        Some(StreamLoc::Bidi(k)) => {
+            let st = &conn.bidi_streams[k];
+            st.send.fin || st.abort.reset_pending || st.abort.reset_emitted
+        }
+        Some(StreamLoc::Uni(k)) => {
+            let st = &conn.uni_streams[k];
+            st.send.fin || st.abort.reset_pending || st.abort.reset_emitted
+        }
+        None => false,
+    }
 }
 
 /// Mark a stream's local send half finished, so a STREAM frame with FIN
@@ -2513,14 +2592,14 @@ unsafe fn stream_fin_local(s: &mut QuicState, cid: usize, handle: u32) -> bool {
     }
     match locate_handle(&s.conns[cid], handle) {
         Some(StreamLoc::Bidi(k)) => {
-            s.conns[cid].bidi_streams[k].send_fin_pending = true;
+            s.conns[cid].bidi_streams[k].send.fin = true;
             true
         }
         Some(StreamLoc::Uni(k)) => {
             if !s.conns[cid].uni_streams[k].locally_initiated {
                 return false;
             }
-            s.conns[cid].uni_streams[k].send_fin_pending = true;
+            s.conns[cid].uni_streams[k].send.fin = true;
             true
         }
         None => false,
@@ -2538,7 +2617,7 @@ unsafe fn stream_reset_local(s: &mut QuicState, cid: usize, handle: u32, app_err
             let st = &mut s.conns[cid].bidi_streams[k];
             st.abort.reset_pending = true;
             st.abort.reset_error = app_error;
-            st.send_buf_len = 0;
+            st.send.abandon();
             true
         }
         Some(StreamLoc::Uni(k)) => {
@@ -2548,7 +2627,7 @@ unsafe fn stream_reset_local(s: &mut QuicState, cid: usize, handle: u32, app_err
             }
             st.abort.reset_pending = true;
             st.abort.reset_error = app_error;
-            st.send_buf_len = 0;
+            st.send.abandon();
             true
         }
         None => false,
@@ -2630,6 +2709,16 @@ const MUX_CMDS_PER_STEP: usize = 8;
 /// Drain up to [`MUX_CMDS_PER_STEP`] application commands.
 unsafe fn mux_pump_upstream(s: &mut QuicState) {
     let sys = &*s.syscalls;
+    // A write held from an earlier step goes first, and nothing behind it
+    // is read until it applies: commands apply in the order sent.
+    if s.app_cmd_held {
+        let held = s.app_cmd_held_payload;
+        let (mt, n) = (s.app_cmd_held_type, s.app_cmd_held_len);
+        if !mux_apply_command(s, mt, &held[..n]) {
+            return;
+        }
+        s.app_cmd_held = false;
+    }
     let mut budget = 0usize;
     while budget < MUX_CMDS_PER_STEP {
         budget += 1;
@@ -2664,19 +2753,26 @@ unsafe fn mux_pump_upstream(s: &mut QuicState) {
             continue;
         }
         let payload = &buf[NET_FRAME_HDR..NET_FRAME_HDR + plen];
-        mux_apply_command(s, mt, payload);
+        if !mux_apply_command(s, mt, payload) {
+            s.app_cmd_held_payload[..plen].copy_from_slice(payload);
+            s.app_cmd_held_type = mt;
+            s.app_cmd_held_len = plen;
+            s.app_cmd_held = true;
+            return;
+        }
     }
 }
 
-/// Apply one decoded application command.
-unsafe fn mux_apply_command(s: &mut QuicState, mt: u8, payload: &[u8]) {
+/// Apply one decoded application command. False when it cannot apply yet
+/// — a stream write with no room — and must be offered again.
+unsafe fn mux_apply_command(s: &mut QuicState, mt: u8, payload: &[u8]) -> bool {
     let sys = &*s.syscalls;
     if plen_lt(payload, mux::SESSION_ID_BYTES) {
-        return;
+        return true;
     }
     let cid = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
     if cid >= MAX_CONNS {
-        return;
+        return true;
     }
     // Stream-scoped commands share a prefix; decode it once.
     let handle = if payload.len() >= mux::STREAM_DATA_PREFIX {
@@ -2723,18 +2819,28 @@ unsafe fn mux_apply_command(s: &mut QuicState, mt: u8, payload: &[u8]) {
         }
         mux::CMD_MUX_STREAM_SEND => {
             if payload.len() < mux::STREAM_DATA_PREFIX {
-                return;
+                return true;
             }
             let data = &payload[mux::STREAM_DATA_PREFIX..];
-            if !stream_stage_send(s, cid, handle, data) {
-                // Never silently dropped: the application is told the
-                // bytes did not go out, so it can retry them.
-                mux_emit_stream_error(s, cid, handle, abi::errno::EAGAIN as i8);
+            if stream_send_closed(s, cid, handle) {
+                // The send half is closed, so its final size is fixed
+                // (RFC 9000 §4.5): these bytes can never be sent.
+                mux_emit_stream_error(s, cid, handle, abi::errno::EINVAL as i8);
+            } else {
+                match stream_stage_send(s, cid, handle, data) {
+                    Staged::Taken => {}
+                    // Held by the caller and applied once there is room.
+                    Staged::Wait => return false,
+                    // Never silently dropped: the application is told.
+                    Staged::Refused => {
+                        mux_emit_stream_error(s, cid, handle, abi::errno::EINVAL as i8);
+                    }
+                }
             }
         }
         mux::CMD_MUX_STREAM_CLOSE => {
             if payload.len() < mux::STREAM_DATA_PREFIX {
-                return;
+                return true;
             }
             if !stream_fin_local(s, cid, handle) {
                 mux_emit_stream_error(s, cid, handle, abi::errno::EINVAL as i8);
@@ -2742,7 +2848,7 @@ unsafe fn mux_apply_command(s: &mut QuicState, mt: u8, payload: &[u8]) {
         }
         mux::CMD_MUX_STREAM_RESET => {
             if payload.len() < mux::STREAM_DATA_PREFIX + mux::STREAM_APP_ERROR_BODY {
-                return;
+                return true;
             }
             let app_error = le_u64(&payload[mux::STREAM_DATA_PREFIX..]);
             if !stream_reset_local(s, cid, handle, app_error) {
@@ -2751,7 +2857,7 @@ unsafe fn mux_apply_command(s: &mut QuicState, mt: u8, payload: &[u8]) {
         }
         mux::CMD_MUX_STREAM_STOP_SENDING => {
             if payload.len() < mux::STREAM_DATA_PREFIX + mux::STREAM_APP_ERROR_BODY {
-                return;
+                return true;
             }
             let app_error = le_u64(&payload[mux::STREAM_DATA_PREFIX..]);
             if !stream_stop_local(s, cid, handle, app_error) {
@@ -2760,7 +2866,7 @@ unsafe fn mux_apply_command(s: &mut QuicState, mt: u8, payload: &[u8]) {
         }
         mux::CMD_MUX_STREAM_ACK => {
             if payload.len() < mux::STREAM_DATA_PREFIX + 4 {
-                return;
+                return true;
             }
             let n = u32::from_le_bytes([
                 payload[mux::STREAM_DATA_PREFIX],
@@ -2795,6 +2901,7 @@ unsafe fn mux_apply_command(s: &mut QuicState, mt: u8, payload: &[u8]) {
         }
         _ => {}
     }
+    true
 }
 
 /// Length guard shared by the command decoders.
@@ -2842,16 +2949,9 @@ unsafe fn legacy_stream_forward(s: &mut QuicState, idx: usize) {
     dev_log(sys, 3, log_buf.as_ptr(), p);
     if s.conns[idx].is_server {
         let conn = &mut s.conns[idx];
-        let space = conn.stream_send_buf.len() - conn.stream_send_buf_len;
-        let to_copy = n.min(space);
-        core::ptr::copy_nonoverlapping(
-            conn.stream_recv_buf.as_ptr(),
-            conn.stream_send_buf
-                .as_mut_ptr()
-                .add(conn.stream_send_buf_len),
-            to_copy,
-        );
-        conn.stream_send_buf_len += to_copy;
+        let to_copy = n.min(conn.stream_send.space());
+        let echo = conn.stream_recv_buf;
+        let _ = conn.stream_send.stage(&echo[..to_copy]);
     }
     if s.app_out >= 0 {
         let mut frame = [0u8; 1600];
@@ -3242,6 +3342,10 @@ unsafe fn alloc_server_connection(s: &mut QuicState, ip: &[u8; 4], port: u16) ->
             conn.reset();
             conn.peer.ip = *ip;
             conn.peer.port = port;
+            // The client's address is unproven until it sends a Handshake
+            // packet or a valid Retry token (RFC 9000 §8.1): until then
+            // the server sends it at most three times what it has sent.
+            conn.peer_validated = false;
             conn.phase = ConnPhase::Handshaking;
             conn.is_server = true;
             conn.driver.is_server = true;
@@ -3601,19 +3705,6 @@ pub mod test_helpers {
         n
     }
 
-    /// The current peer UDP port for connection `idx` (the active path).
-    /// After a successful migration this reflects the new 4-tuple.
-    ///
-    /// # Safety
-    /// `state` points to an initialised `QuicState`.
-    pub unsafe fn peer_port_of(state: *const u8, idx: usize) -> u16 {
-        let s = &*(state as *const QuicState);
-        if idx >= MAX_CONNS {
-            return 0;
-        }
-        s.conns[idx].peer.port
-    }
-
     /// The current peer address for connection `idx`; all-zero while a
     /// peer dialled by name has not yet answered.
     ///
@@ -3805,10 +3896,9 @@ pub mod test_helpers {
     }
 
     /// Feed 1-RTT frames as an AUTHENTICATED packet from `src`, then run
-    /// the same post-auth migration-arming decision the real receive path
-    /// uses (`arm_migration_if_new_path`). Lets a test verify that only a
-    /// NON-probing packet from a new path arms validation (RFC 9000 §9.1).
-    /// Returns whether path validation is now armed.
+    /// the same post-auth migration decision the real receive path uses
+    /// (`arm_migration_if_new_path`), as the highest-numbered packet so far.
+    /// Returns whether a path validation is under way afterward.
     ///
     /// # Safety
     /// `state` points to an initialised `QuicState`; `idx < MAX_CONNS`.
@@ -3819,10 +3909,35 @@ pub mod test_helpers {
         src_port: u16,
         payload: &[u8],
     ) -> bool {
+        feed_authenticated_1rtt_via(state, idx, src_ip, src_port, false, payload)
+    }
+
+    /// [`feed_authenticated_1rtt_from`], the packet addressed to our spare
+    /// connection ID when `on_alt_cid`.
+    ///
+    /// # Safety
+    /// `state` points to an initialised `QuicState`; `idx < MAX_CONNS`.
+    pub unsafe fn feed_authenticated_1rtt_via(
+        state: *mut u8,
+        idx: usize,
+        src_ip: [u8; 4],
+        src_port: u16,
+        on_alt_cid: bool,
+        payload: &[u8],
+    ) -> bool {
         let s = &mut *(state as *mut QuicState);
         let migration_enabled = s.disable_migration == 0;
         s.conns[idx].recv_ip = src_ip;
         s.conns[idx].recv_port = src_port;
+        // The datagram a short-header packet carrying `payload` makes: first
+        // byte, 8-byte connection ID, 4-byte packet number, AEAD tag.
+        s.conns[idx].recv_len = (1 + 8 + 4 + payload.len() + 16) as u16;
+        let c = &mut s.conns[idx];
+        c.recv_dcid_seq = if on_alt_cid {
+            c.alt_cid_seq
+        } else {
+            c.our_cid_seq
+        };
         let mut non_probing = false;
         super::process_frames(
             &mut s.conns[idx],
@@ -3836,8 +3951,103 @@ pub mod test_helpers {
             &*s.syscalls,
             migration_enabled,
             non_probing,
+            true,
         );
         s.conns[idx].path_validating
+    }
+
+    /// Run a 1-RTT packet numbered `pn` through the real receive step —
+    /// frames processed, then acknowledged only if everything was taken —
+    /// and answer whether it is now acknowledged.
+    ///
+    /// # Safety
+    /// `state` points to an initialised `QuicState`; `idx < MAX_CONNS`.
+    pub unsafe fn receive_one_rtt(state: *mut u8, idx: usize, pn: u64, payload: &[u8]) -> bool {
+        let s = &mut *(state as *mut QuicState);
+        s.conns[idx].recv_ip = s.conns[idx].peer.ip;
+        s.conns[idx].recv_port = s.conns[idx].peer.port;
+        let mut np = false;
+        let sys = &*s.syscalls;
+        super::process_one_rtt_payload(sys, s.cont_out, &mut s.conns[idx], pn, payload, 1, &mut np);
+        let t = &s.conns[idx].one_rtt.ack_tracker;
+        t.ranges[..t.count as usize]
+            .iter()
+            .any(|r| r.low <= pn && pn <= r.high)
+    }
+
+    /// What a test observes of connection `idx`: its paths, connection IDs,
+    /// packet-number spaces and whether it has failed.
+    #[derive(Debug, Clone, Copy)]
+    pub struct ConnView {
+        pub peer_port: u16,
+        pub peer_validated: bool,
+        pub path_validating: bool,
+        pub challenge: [u8; 8],
+        pub old_path_validating: bool,
+        pub old_path_port: u16,
+        pub old_challenge: [u8; 8],
+        pub amp_rx: u64,
+        pub amp_tx: u64,
+        pub peer_cid_seq: u64,
+        pub peer_cid_starved: bool,
+        pub retire_pending: Option<u64>,
+        pub our_cid_seq: u64,
+        pub alt_cid_seq: Option<u64>,
+        pub next_cid_seq: u64,
+        pub failed_with: Option<u64>,
+        pub initial_discarded: bool,
+        pub handshake_discarded: bool,
+        pub spare_peer_cid_seq: Option<u64>,
+        pub next_bidi_idx: u64,
+        pub next_uni_idx: u64,
+        pub next_app_handle: u32,
+    }
+
+    /// Snapshot connection `idx`'s migration state.
+    ///
+    /// # Safety
+    /// `state` points to an initialised `QuicState`; `idx < MAX_CONNS`.
+    pub unsafe fn conn_view(state: *const u8, idx: usize) -> ConnView {
+        let c = &(*(state as *const QuicState)).conns[idx];
+        ConnView {
+            peer_port: c.peer.port,
+            peer_validated: c.peer_validated,
+            path_validating: c.path_validating,
+            challenge: c.path_challenge_data,
+            old_path_validating: c.old_path_validating,
+            old_path_port: c.old_path.port,
+            old_challenge: c.old_path_challenge_data,
+            amp_rx: c.amp_rx,
+            amp_tx: c.amp_tx,
+            peer_cid_seq: c.peer_cid_seq,
+            peer_cid_starved: c.peer_cid_starved,
+            retire_pending: (c.retire_len > 0).then_some(c.retire_queue[0]),
+            our_cid_seq: c.our_cid_seq,
+            alt_cid_seq: (c.alt_cid_len > 0).then_some(c.alt_cid_seq),
+            next_cid_seq: c.next_cid_seq,
+            failed_with: (c.phase == ConnPhase::Errored).then_some(c.close_error),
+            initial_discarded: c.initial.discarded,
+            handshake_discarded: c.handshake.discarded,
+            spare_peer_cid_seq: (c.spare_peer_cid_len > 0).then_some(c.spare_peer_cid_seq),
+            next_bidi_idx: c.next_bidi_idx,
+            next_uni_idx: c.next_uni_idx,
+            next_app_handle: c.next_app_handle,
+        }
+    }
+
+    /// Open a local stream on connection `idx` through the real open path.
+    /// Returns its QUIC stream id, or `None` when refused.
+    ///
+    /// # Safety
+    /// `state` points to an initialised `QuicState`; `idx < MAX_CONNS`.
+    pub unsafe fn open_local_stream(state: *mut u8, idx: usize, bidi: bool) -> Option<u64> {
+        let s = &mut *(state as *mut QuicState);
+        let flags = if bidi {
+            super::mux::STREAM_FLAG_BIDI
+        } else {
+            super::mux::STREAM_FLAG_UNI
+        };
+        super::stream_open_local(s, idx, flags).map(|(_, id)| id)
     }
 
     /// Override connection `idx`'s peer `max_datagram_frame_size` so a
@@ -3887,28 +4097,6 @@ pub mod test_helpers {
         let len = s.conns[idx].alt_cid_len as usize;
         let all_zero = s.conns[idx].alt_cid[..len].iter().all(|&b| b == 0);
         Some(all_zero)
-    }
-
-    /// Arm a migration on connection `idx`: record the candidate 4-tuple,
-    /// mint the PATH_CHALLENGE data, and mark validation in progress —
-    /// exactly what the RX demux does on a 4-tuple change. Returns the
-    /// challenge bytes so a test can build the matching PATH_RESPONSE.
-    ///
-    /// # Safety
-    /// `state` points to an initialised `QuicState`; `idx < MAX_CONNS`.
-    pub unsafe fn arm_migration(
-        state: *mut u8,
-        idx: usize,
-        cand_ip: [u8; 4],
-        cand_port: u16,
-    ) -> [u8; 8] {
-        let s = &mut *(state as *mut QuicState);
-        let conn = &mut s.conns[idx];
-        conn.cand_ip = cand_ip;
-        conn.cand_port = cand_port;
-        conn.path_challenge_data = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
-        conn.path_validating = true;
-        conn.path_challenge_data
     }
 
     /// The handshake driver's current `hs_state` discriminant for
@@ -4073,6 +4261,14 @@ pub mod test_helpers {
         (*(state as *const QuicState)).reservation_exhausted_stall
     }
 
+    /// Cumulative bidirectional-stream credit granted to the peer.
+    ///
+    /// # Safety
+    /// `state` points to an initialised `QuicState`; `idx < MAX_CONNS`.
+    pub unsafe fn max_streams_bidi_granted(state: *const u8, idx: usize) -> u64 {
+        (*(state as *const QuicState)).conns[idx].max_streams_bidi_granted
+    }
+
     /// The current 1-RTT next-send packet number.
     ///
     /// # Safety
@@ -4122,8 +4318,12 @@ pub mod test_helpers {
         cap: usize,
     ) -> usize {
         let s = &mut *(state as *mut QuicState);
-        let buf = core::slice::from_raw_parts_mut(out, cap);
-        serialize_checkpoint(s, idx, flow, epoch, buf)
+        let n = serialize_checkpoint(s, idx, flow, epoch);
+        if n > cap {
+            return 0;
+        }
+        core::ptr::copy_nonoverlapping(s.continuity.scratch.as_ptr(), out, n);
+        n
     }
 
     /// Import a checkpoint record into connection slot `idx`, leaving it a
@@ -4140,11 +4340,13 @@ pub mod test_helpers {
         record: &[u8],
     ) -> u8 {
         let s = &mut *(state as *mut QuicState);
-        let mut staged = super::QuicConnection::new();
-        let st = import_checkpoint(s, &mut staged, flow, epoch, record);
+        let handle = super::cont_vault_key(s);
+        let sys = &*s.syscalls;
+        let st = import_checkpoint(sys, handle, &mut s.conns[idx], flow, epoch, record);
         if st == 0 {
-            s.conns[idx] = staged;
             s.conns[idx].phase = ConnPhase::Idle; // shadow: never emits
+        } else {
+            s.conns[idx].reset();
         }
         st
     }
@@ -4193,9 +4395,15 @@ pub mod test_helpers {
         prior_epoch: u32,
     ) -> i32 {
         let s = &mut *(state as *mut QuicState);
-        let mut moved = super::QuicConnection::new();
-        core::mem::swap(&mut moved, &mut s.conns[src_idx]);
-        activate_shadow(s, moved, new_epoch, fence_gen, prior_epoch)
+        // The source slot is Idle while it is copied, so the allocator may
+        // pick it; free it only when the copy landed elsewhere.
+        s.conns[src_idx].phase = ConnPhase::Closed;
+        let from = core::ptr::addr_of_mut!(s.conns[src_idx]);
+        let live = activate_shadow(s, from, new_epoch, fence_gen, prior_epoch);
+        if live != src_idx as i32 {
+            s.conns[src_idx].reset();
+        }
+        live
     }
 
     /// Build a 1-RTT PING packet from connection `idx` (advancing its send
@@ -4304,7 +4512,7 @@ pub mod test_helpers {
         let mut k = 0;
         while k < MAX_BIDI_STREAMS {
             let st = &mut c.bidi_streams[k];
-            if st.allocated && st.locally_initiated && st.send_buf_len == 0 {
+            if st.allocated && st.locally_initiated && !st.send.fin {
                 break;
             }
             if !st.allocated {
@@ -4320,13 +4528,7 @@ pub mod test_helpers {
         if k == MAX_BIDI_STREAMS {
             return false;
         }
-        let st = &mut c.bidi_streams[k];
-        if bytes.len() > st.send_buf.len() {
-            return false;
-        }
-        st.send_buf[..bytes.len()].copy_from_slice(bytes);
-        st.send_buf_len = bytes.len();
-        true
+        c.bidi_streams[k].send.stage(bytes)
     }
 
     /// Hand a datagram to connection `idx` as the pump would after the RX
@@ -4351,7 +4553,7 @@ pub mod test_helpers {
         drain_inbound_one(s, idx)
     }
 
-    /// Bytes still queued on connection `idx`'s transparent stream.
+    /// Bytes queued on connection `idx`'s streams and not yet sent.
     ///
     /// # Safety
     /// `state` points to an initialised `QuicState`; `idx < MAX_CONNS`.
@@ -4361,7 +4563,8 @@ pub mod test_helpers {
         let mut k = 0;
         while k < MAX_BIDI_STREAMS {
             if c.bidi_streams[k].allocated {
-                n += c.bidi_streams[k].send_buf_len;
+                let send = &c.bidi_streams[k].send;
+                n += (send.end() - send.sent) as usize;
             }
             k += 1;
         }

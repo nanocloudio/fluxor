@@ -283,49 +283,166 @@ fn canonical_capability(name: &str, field: &str) -> Result<String> {
     }
 }
 
-/// Validate a `[capability_facts]` table: every capability it names must be
-/// one this module declares or requires (or a parent of one), every fact
-/// must be admitted by that capability's schema, and every value must be
-/// admitted by that fact.
+/// Facts keyed by capability, then fact name, each value as written: one
+/// value for every target, or one per silicon.
+type RawCapabilityFacts =
+    std::collections::BTreeMap<String, std::collections::BTreeMap<String, FactValue>>;
+
+/// Facts keyed by capability, then fact name, resolved for one target.
+type CapabilityFacts =
+    std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>;
+
+/// One `[capability_facts]` value: flat (`max_payload = 4096`) or per-target
+/// (`max_payload = { default = 4096, rp2040 = 512 }`), in the same shape as a
+/// port's `buffer_size`. Keys of a per-target table are the silicon ids of
+/// `CAPACITY_TARGET_KEYS` plus `default`.
+enum FactValue {
+    Flat(String),
+    PerTarget(std::collections::BTreeMap<String, String>),
+}
+
+impl FactValue {
+    fn values(&self) -> impl Iterator<Item = &String> {
+        let (flat, per_target) = match self {
+            FactValue::Flat(v) => (Some(v), None),
+            FactValue::PerTarget(map) => (None, Some(map.values())),
+        };
+        flat.into_iter().chain(per_target.into_iter().flatten())
+    }
+}
+
+/// One scalar fact value as a string. A numeric fact reads naturally
+/// unquoted (`max_payload = 4096`) and a string fact quoted
+/// (`ack = "durable"`); both leave as strings, so the schema check downstream
+/// has one shape to reason about. Any other TOML type is a manifest error
+/// rather than a coercion — `ack = true` is a mistake, not a boolean fact.
+fn fact_scalar(capability: &str, fact: &str, value: toml::Value) -> Result<String> {
+    match value {
+        toml::Value::String(s) => Ok(s),
+        toml::Value::Integer(i) if i < 0 => Err(Error::Module(format!(
+            "fact `{fact}` on capability `{capability}` is negative ({i}); \
+             capability facts are non-negative."
+        ))),
+        toml::Value::Integer(i) => Ok(i.to_string()),
+        other => Err(Error::Module(format!(
+            "fact `{fact}` on capability `{capability}` must be a string, an integer, or a \
+             per-target table of them, got a {}.",
+            other.type_str(),
+        ))),
+    }
+}
+
+/// Read `[capability_facts]` TOML values into their written shape.
 ///
-/// Declaring facts for a capability the module neither carries nor needs is
-/// an error rather than a no-op: it is always a mistake, and a silently
-/// ignored `ack = "durable"` is exactly the kind of unchecked promise the
-/// registry exists to prevent.
-/// Flatten `[capability_facts]` TOML values to strings.
-///
-/// A numeric fact reads naturally unquoted (`max_payload = 4096`) and a
-/// string fact quoted (`ack = "durable"`); both arrive here as raw TOML and
-/// leave as strings, so the schema check downstream has one shape to reason
-/// about. Any other TOML type is a manifest error rather than a coercion —
-/// `ack = true` is a mistake, not a boolean fact.
+/// A per-target table must be complete: it either carries `default` or names
+/// every silicon the module is built for (`hardware_targets`, where `linux`
+/// loads the `bcm2712` build). A partial table is refused here, whichever
+/// target is being loaded, so a gap cannot hide behind a build for a target
+/// the table happens to name.
 fn normalise_capability_facts(
     raw: Option<
         std::collections::BTreeMap<String, std::collections::BTreeMap<String, toml::Value>>,
     >,
-) -> Result<std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>> {
-    let mut out: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>> =
-        std::collections::BTreeMap::new();
+    hardware_targets: u16,
+) -> Result<RawCapabilityFacts> {
+    let mut out = RawCapabilityFacts::new();
     for (capability, table) in raw.unwrap_or_default() {
-        let mut flat = std::collections::BTreeMap::new();
+        let mut facts = std::collections::BTreeMap::new();
         for (fact, value) in table {
+            let value = match value {
+                toml::Value::Table(per_target) => FactValue::PerTarget(per_target_fact(
+                    &capability,
+                    &fact,
+                    per_target,
+                    hardware_targets,
+                )?),
+                scalar => FactValue::Flat(fact_scalar(&capability, &fact, scalar)?),
+            };
+            facts.insert(fact, value);
+        }
+        out.insert(capability, facts);
+    }
+    Ok(out)
+}
+
+fn per_target_fact(
+    capability: &str,
+    fact: &str,
+    table: toml::map::Map<String, toml::Value>,
+    hardware_targets: u16,
+) -> Result<std::collections::BTreeMap<String, String>> {
+    if table.is_empty() {
+        return Err(Error::Module(format!(
+            "per-target fact `{fact}` on capability `{capability}` is an empty table; \
+             give a value per target or a `default`."
+        )));
+    }
+    let mut map = std::collections::BTreeMap::new();
+    for (key, value) in table {
+        if !CAPACITY_TARGET_KEYS.contains(&key.as_str()) {
+            return Err(Error::Module(format!(
+                "unknown target `{key}` in per-target fact `{fact}` on capability \
+                 `{capability}` (known: {CAPACITY_TARGET_KEYS:?})."
+            )));
+        }
+        map.insert(key, fact_scalar(capability, fact, value)?);
+    }
+    if !map.contains_key("default") {
+        let missing: Vec<&str> = module_silicons(hardware_targets)
+            .filter(|s| !map.contains_key(*s))
+            .collect();
+        if !missing.is_empty() {
+            return Err(Error::Module(format!(
+                "per-target fact `{fact}` on capability `{capability}` has no value for {} \
+                 and no `default`; name every target in `hardware_targets` or add a `default`.",
+                missing.join(", "),
+            )));
+        }
+    }
+    Ok(map)
+}
+
+/// The silicon ids a module is built for, from its `hardware_targets` mask.
+/// The `linux` host loads the `bcm2712` build.
+fn module_silicons(hardware_targets: u16) -> impl Iterator<Item = &'static str> {
+    [
+        (0x01u16, "rp2350"),
+        (0x02, "rp2040"),
+        (0x04 | 0x10, "bcm2712"),
+        (0x08, "wasm"),
+    ]
+    .into_iter()
+    .filter(move |(bits, _)| hardware_targets & bits != 0)
+    .map(|(_, silicon)| silicon)
+}
+
+/// Resolve every fact for `silicon`: a per-target value takes that silicon's
+/// entry, else the table's explicit `default`. A `None` silicon resolves
+/// `default` only. A target the table does not answer for is refused rather
+/// than dropped, since a missing fact would skip the compose-time checks that
+/// read it.
+fn resolve_capability_facts(
+    raw: RawCapabilityFacts,
+    silicon: Option<&str>,
+) -> Result<CapabilityFacts> {
+    let mut out = CapabilityFacts::new();
+    for (capability, facts) in raw {
+        let mut flat = std::collections::BTreeMap::new();
+        for (fact, value) in facts {
             let text = match value {
-                toml::Value::String(s) => s,
-                toml::Value::Integer(i) => {
-                    if i < 0 {
-                        return Err(Error::Module(format!(
-                            "fact `{fact}` on capability `{capability}` is negative ({i}); \
-                             capability facts are non-negative."
-                        )));
+                FactValue::Flat(v) => v,
+                FactValue::PerTarget(mut map) => {
+                    let hit = silicon.and_then(|s| map.remove(s));
+                    match hit.or_else(|| map.remove("default")) {
+                        Some(v) => v,
+                        None => {
+                            return Err(Error::Module(format!(
+                                "per-target fact `{fact}` on capability `{capability}` has no \
+                                 entry for target {:?} and no `default`.",
+                                silicon.unwrap_or("<none>"),
+                            )))
+                        }
                     }
-                    i.to_string()
-                }
-                other => {
-                    return Err(Error::Module(format!(
-                        "fact `{fact}` on capability `{capability}` must be a string or an \
-                         integer, got a {}.",
-                        other.type_str(),
-                    )))
                 }
             };
             flat.insert(fact, text);
@@ -335,8 +452,18 @@ fn normalise_capability_facts(
     Ok(out)
 }
 
+/// Validate a `[capability_facts]` table: every capability it names must be
+/// one this module declares or requires (or a parent of one), every fact
+/// must be admitted by that capability's schema, and every value must be
+/// admitted by that fact. Every entry of a per-target value is checked, not
+/// only the one the current target resolves.
+///
+/// Declaring facts for a capability the module neither carries nor needs is
+/// an error rather than a no-op: it is always a mistake, and a silently
+/// ignored `ack = "durable"` is exactly the kind of unchecked promise the
+/// registry exists to prevent.
 fn validate_capability_facts(
-    facts: &std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+    facts: &RawCapabilityFacts,
     declared: &[String],
     required: &[String],
 ) -> Result<()> {
@@ -374,7 +501,7 @@ fn validate_capability_facts(
                  [capability_facts.\"{canonical}\"] has nothing to declare."
             )));
         };
-        for (fact, value) in table {
+        for (fact, written) in table {
             let Some((_, admitted)) = schema.iter().find(|(n, _)| n == fact) else {
                 let candidates: Vec<String> =
                     schema.iter().map(|(n, _)| (*n).to_string()).collect();
@@ -387,18 +514,20 @@ fn validate_capability_facts(
                     candidates.join(", "),
                 )));
             };
-            if fact_is_numeric(&canonical, fact) {
-                if value.parse::<u32>().is_err() {
+            for value in written.values() {
+                if fact_is_numeric(&canonical, fact) {
+                    if value.parse::<u32>().is_err() {
+                        return Err(Error::Module(format!(
+                            "fact `{fact}` on capability `{canonical}` takes a u32, got `{value}`."
+                        )));
+                    }
+                } else if !admitted.iter().any(|a| a == value) {
                     return Err(Error::Module(format!(
-                        "fact `{fact}` on capability `{canonical}` takes a u32, got `{value}`."
+                        "value `{value}` is not admitted for fact `{fact}` on capability \
+                         `{canonical}`. Expected one of: {}.",
+                        admitted.join(", "),
                     )));
                 }
-            } else if !admitted.iter().any(|a| a == value) {
-                return Err(Error::Module(format!(
-                    "value `{value}` is not admitted for fact `{fact}` on capability \
-                     `{canonical}`. Expected one of: {}.",
-                    admitted.join(", "),
-                )));
             }
         }
     }
@@ -2070,12 +2199,14 @@ impl Manifest {
         validate_provides_names(&provides)?;
         let mut capabilities = toml_val.capabilities.unwrap_or_default();
         validate_capability_names(&mut capabilities)?;
-        let capability_facts = normalise_capability_facts(toml_val.capability_facts)?;
+        let capability_facts =
+            normalise_capability_facts(toml_val.capability_facts, hardware_targets)?;
         let required_caps: Vec<String> = ports
             .iter()
             .filter_map(|p| p.requires_capability.clone())
             .collect();
         validate_capability_facts(&capability_facts, &capabilities, &required_caps)?;
+        let capability_facts = resolve_capability_facts(capability_facts, silicon)?;
         let requires_when = validate_requires_when(toml_val.requires_when.unwrap_or_default())?;
         // Read for publication by `publish_withheld`; checked here so a
         // reasonless withholding fails the build, not only the publish.
@@ -3012,7 +3143,9 @@ struct TomlManifest {
     /// `fluxor_contracts::vocabulary::CAPABILITY_FACTS`.
     /// Values are read as raw TOML so a numeric fact may be written
     /// naturally (`max_payload = 4096`) or as a string (`"4096"`); both
-    /// normalise to the same stored form.
+    /// normalise to the same stored form. A value may instead be a
+    /// per-target table (`max_payload = { default = 4096, rp2040 = 512 }`),
+    /// resolved for the silicon being loaded.
     capability_facts:
         Option<std::collections::BTreeMap<String, std::collections::BTreeMap<String, toml::Value>>>,
     /// Author attests ISR-safety. Required for Tier 1b/2 admission.

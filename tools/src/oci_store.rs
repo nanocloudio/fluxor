@@ -2558,10 +2558,14 @@ pub fn sha256_hex_prefixed(bytes: &[u8]) -> String {
 /// Process-wide serialisation for tests that mutate `FLUXOR_STORE` /
 /// `FLUXOR_WORKSPACE`: env vars are process-global and cargo runs the
 /// lib tests threaded, so every env-touching test holds this guard.
+/// It is the crate's one env mutex, `project::tests::ENV_LOCK`, so these
+/// tests also exclude the project-discovery tests that set the same
+/// variables.
 #[cfg(test)]
 pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
-    static M: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    M.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    crate::project::tests::ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Scoped env override for tests: set on construction, restored to the

@@ -8,8 +8,8 @@
 // operands. Stated per layer, because a blanket claim asserts more
 // than a reader can check against the code:
 //
-//   1. Field and scalar arithmetic — constant-time. `mod_p`, `fp_add`,
-//      `fp_sub`, `mod_n_reduce` and `fn_add` compute the correction
+//   1. Field and scalar arithmetic — constant-time. `fp_add`, `fp_sub`,
+//      `mod_n_reduce` and `fn_add` compute the correction
 //      unconditionally and select it with `ct_select_u256` on a
 //      carry/borrow mask. `fp_reduce` applies a fixed five masked
 //      additions then eight masked subtractions instead of correcting
@@ -311,7 +311,7 @@ fn u256_inv_vartime(a: &U256, m: &U256) -> U256 {
 // Modular arithmetic mod p (P-256 prime).
 //
 // Every routine in this section is constant-time in its operands.
-// `mod_p`, `fp_add` and `fp_sub` compute both the corrected and the
+// `fp_add` and `fp_sub` compute both the corrected and the
 // uncorrected value and choose between them with `ct_select_u256` on a
 // mask built from the carry or borrow; `fp_reduce` performs a fixed
 // number of masked corrections rather than looping until the value is
@@ -319,14 +319,6 @@ fn u256_inv_vartime(a: &U256, m: &U256) -> U256 {
 // the operands, which are secret on every ECDH agreement and ECDSA
 // signature.
 // ============================================================================
-
-/// Reduce mod p, for `a < 2p`. Computes `a - p` and selects it over `a`
-/// on the subtraction borrow; the borrow is 1 exactly when `a < p`.
-fn mod_p(a: &U256) -> U256 {
-    let p = load_p();
-    let (r, borrow) = u256_sub(a, &p);
-    ct_select_u256(&r, a, borrow.wrapping_neg())
-}
 
 /// Modular addition: (a + b) mod p. The correction is always computed
 /// and selected under a mask.
