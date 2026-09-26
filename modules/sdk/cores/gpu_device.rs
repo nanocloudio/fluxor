@@ -2549,7 +2549,7 @@ impl<'a> GpuDevice<'a> {
         owner: u16,
         hdr: &Header,
         p: &[u8],
-        reserve: usize,
+        _reserve: usize,
     ) -> Result<Work, (u16, u32)> {
         let h = get_u64(p, 0).ok_or((REASON_MALFORMED, 0))?;
         let idx = self
@@ -2564,15 +2564,15 @@ impl<'a> GpuDevice<'a> {
             // the "drop bytes to make room" this contract refuses.
             return Err((REASON_NOT_READY, 0));
         }
-        // Release BEFORE allocating the acknowledgement's own fence. The other
-        // order deadlocks a full table: the one operation that frees a slot
-        // would itself be refused for want of one.
+        // The acknowledgement must terminate the retention chain. Creating a
+        // fence here replaces the released slot with another retained result,
+        // so even a consumer acknowledging every result eventually fills it.
+        // Admission already checked ring room before any state could change.
         self.release_fence_slot(idx);
-        let ack = self
-            .alloc_fence(owner, hdr.op, hdr.corr, QUEUE_TRANSFER)
-            .ok_or((REASON_FENCE_EXHAUSTED, 0))?;
-        self.accept(ack, reserve);
-        self.settle_now(ack);
+        let mut payload = [0u8; 24];
+        put_u32(&mut payload, 8, COMPLETED_PUBLISHED);
+        // Null fence: this correlated completion itself needs no release.
+        self.emit(OUT_COMPLETED, hdr.corr, &payload, 0);
         Ok(Work::None)
     }
 

@@ -140,7 +140,7 @@ Exactly one of these per request:
 
 - `OUT_REJECTED` — terminal. Nothing was admitted; no caller-visible output
   changed, no fence was allocated, no resource was mutated.
-- `OUT_ACCEPTED` — admitted, with a fence. Every admitted request gets one,
+- `OUT_ACCEPTED` — admitted, with a fence. Every admitted work request gets one,
   including those that finish at admission, so there is one completion rule
   rather than a fast path and a slow path.
 
@@ -153,6 +153,11 @@ Terminal outcomes are **retained** until the consumer acknowledges them with
 `RELEASE_FENCE`. When the fence pool fills, new work is refused at admission —
 results are never dropped to make room, because a dropped result is
 indistinguishable from work that never ran.
+
+`RELEASE_FENCE` is the acknowledgement exception: success emits a correlated
+`OUT_COMPLETED` with a null fence, without allocating a new fence or requiring
+another release. Invalid releases are rejected. Output capacity is checked
+before the retained result is removed, so backpressure leaves it intact.
 
 ## 7. Output commit
 

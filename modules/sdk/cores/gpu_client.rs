@@ -621,6 +621,7 @@ impl GpuClient<'_> {
     }
 
     /// Acknowledge a fence, releasing the provider's retained result.
+    /// Success completes with a null fence and does not require another release.
     ///
     /// A consumer that never does this eventually exhausts the fence pool and
     /// is refused at admission — which is the contract working, not a fault.

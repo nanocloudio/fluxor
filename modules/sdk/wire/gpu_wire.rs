@@ -60,7 +60,7 @@
 // - [`OUT_REJECTED`] — terminal. Nothing was admitted; **no caller-visible
 //   output changed**, no fence was allocated, no resource was mutated.
 // - [`OUT_ACCEPTED`] — the request was admitted and a fence allocated. Every
-//   admitted request, including ones that finish at admission, gets a fence,
+//   admitted work request, including ones that finish at admission, gets a fence,
 //   so there is one completion rule rather than a fast path and a slow path.
 //
 // An accepted request then reaches exactly one terminal fence outcome inside
@@ -74,6 +74,11 @@
 // refused at admission ([`REASON_FENCE_EXHAUSTED`]) — results are never
 // dropped to make room, because a dropped result is indistinguishable from
 // work that never ran.
+//
+// `OP_RELEASE_FENCE` is the acknowledgement exception: success emits only
+// `OUT_COMPLETED` with the request correlation and a null fence. It allocates
+// no new fence and requires no further acknowledgement. Admission reserves
+// output capacity before releasing anything; invalid releases are rejected.
 //
 // ## Bulk data
 //
