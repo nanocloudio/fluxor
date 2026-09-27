@@ -487,6 +487,8 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
     0 // Continue
 }
 
+declare_module_arena_bytes!(65536);
+
 #[no_mangle]
 pub unsafe extern "C" fn module_arena_size() -> u32 {
     // Request 64KB resident arena as fallback (RP2350 without paged arena)

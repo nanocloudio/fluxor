@@ -1,18 +1,18 @@
 version = "1.0.0"
-hardware_targets = ["bcm2712"]
+hardware_targets = ["bcm2712", "rp2350", "rp2040"]
 
-# EL0 module-isolation probe for the Pi 5 walking skeleton. Runs at EL0
-# under its own page table when wired with `protection: isolated` and
-# demonstrates allowed (own state) vs. denied (kernel / out-of-region /
-# execute-state / write-code) accesses, each of which becomes a contained
-# module protection fault rather than a core hang. Diagnostic only — not
-# loaded by production configs.
+# Module-isolation probe. Runs gated (`protection: isolated` or `contained`)
+# and demonstrates allowed (own state, gateway calls) against denied accesses
+# (the kernel's gateway page, out-of-region memory, executing state, writing
+# code, foreign channels, foreign pointers, never returning), each of which
+# becomes a contained module fault or a gateway refusal rather than a core
+# hang. Diagnostic only — not loaded by production configs.
 
 # The probe's fault mode IS its behaviour: modes that provoke a contained
 # fault return an error so `fault_policy: restart` re-steps the same
 # instance, and the probe relies on its state surviving that. It qualifies
-# for the attestation on every count: `module_step` is syscall-free, so no
-# provider handle is ever held; each step is one self-contained probe
+# for the attestation on every count: it opens no provider handle, so none is
+# ever held; each step is one self-contained probe
 # action; the probe carries no channel protocol whose in-flight bytes could
 # be lost; and its only carried state is a step counter and two diagnostic
 # sentinels.

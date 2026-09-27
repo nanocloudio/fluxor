@@ -1362,6 +1362,11 @@ pub unsafe fn query_module_state(module_idx: usize, out_buf: *mut u8, out_cap: u
     buf[8..10].copy_from_slice(&s.restart_count.to_le_bytes());
     buf[10..14].copy_from_slice(&s.inactive_for_ticks.to_le_bytes());
     buf[14..18].copy_from_slice(&s.slot_generation.to_le_bytes());
+    // SAFETY: scheduler-thread-only read; module_idx bounded above.
+    buf[19] = unsafe {
+        let p = &raw const SCHED;
+        (*p).protection[module_idx]
+    };
 
     // The name goes in only if the caller left room for it; a caller
     // that asked for the header alone gets `name_len = 0` rather than a

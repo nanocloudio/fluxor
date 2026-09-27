@@ -599,75 +599,80 @@ fn validate_sink_pins(
     }
 }
 
-/// Validate isolation settings against target capabilities.
+/// Validate protection settings against what the target implements.
 ///
-/// `protection: isolated` is admitted only where the kernel isolates a module:
-/// an MMU target, whose modules run at EL0 under their own page table with a
-/// guarded stack. An MPU is not enough on its own — the kernel does not run
-/// RP2350's MPU regime — so an RP target refuses the request here rather than
-/// load a module that asked for isolation and would not get it.
+/// Every module's level is resolved once (`protection::resolve`): an explicit
+/// `protection:` on the module, else the graph's, else its trust tier's
+/// default (the module's `trust_tier`, else the graph's `default_trust_tier`).
+/// The level is a floor; a request above every level the target implements is
+/// refused here, naming the levels it has. A gated module (`contained`,
+/// `isolated`) cannot also be an interrupt-tier module: an ISR runs
+/// privileged, in handler mode, with no gateway between it and the kernel.
 fn validate_isolation(config: &Value, target: &TargetDescriptor, result: &mut ValidationResult) {
-    // Check for protection setting in config (can be at top level or in graph)
-    let protection = config
-        .get("protection")
-        .or_else(|| config.get("graph").and_then(|g| g.get("protection")))
-        .and_then(|v| v.as_str());
-
-    if protection == Some("isolated") && !target.has_mmu {
-        result.add_error(format!(
-            "protection: isolated requires a target whose kernel isolates \
-             modules (an MMU target, EL0); target '{}' has none.",
-            target.id,
-        ));
+    let levels = &target.isolation.levels;
+    let listed = crate::protection::module_entries(config);
+    let model = target.isolation.planner_model();
+    let mut windows: Vec<(usize, &str, (u64, u32))> = Vec::new();
+    for (i, (ty, m)) in listed.iter().enumerate() {
+        match crate::protection::resolve(m, config, levels) {
+            Ok(r) => {
+                let iso = &target.isolation;
+                match crate::protection::device_window(m, &iso.device_ranges) {
+                    Ok(Some(w)) => {
+                        if let Some(why) = crate::protection::window_refusal(
+                            w,
+                            r.provided,
+                            iso.device_windows,
+                            model,
+                        ) {
+                            result.add_error(format!(
+                                "modules[{i}] ({ty}): {why} on target '{}'",
+                                target.id
+                            ));
+                        }
+                        for &(j, other, (ob, oz)) in &windows {
+                            if w.0 < ob + oz as u64 && ob < w.0 + w.1 as u64 {
+                                result.add_error(format!(
+                                    "modules[{i}] ({ty}): device window overlaps modules[{j}] \
+                                     ({other})'s; a peripheral has one driver"
+                                ));
+                            }
+                        }
+                        windows.push((i, ty, w));
+                    }
+                    Ok(None) => {}
+                    Err(e) => result.add_error(format!("modules[{i}] ({ty}): {e}")),
+                }
+                let tier = m.get("tier").and_then(|v| v.as_str());
+                if r.provided.is_gated() && matches!(tier, Some("1b") | Some("2")) {
+                    result.add_error(format!(
+                        "modules[{i}] ({ty}): protection {} cannot apply to an interrupt-tier \
+                         (tier {}) module — an ISR runs privileged with no gateway",
+                        r.provided.name(),
+                        tier.unwrap_or(""),
+                    ));
+                }
+            }
+            Err(e) => result.add_error(format!(
+                "modules[{i}] ({ty}): {e} on target '{}'",
+                target.id
+            )),
+        }
     }
-
-    // Per-module `trust_tier` and `protection` cross-checks.
-    //   trust_tier: platform | verified | community | unsigned
-    //   protection: none     | guarded  | isolated
-    // When `protection` is omitted it defaults from the tier:
-    //   platform -> none,  verified -> guarded,  community/unsigned -> isolated.
-    let valid_tiers = ["platform", "verified", "community", "unsigned"];
-    let valid_prot = ["none", "guarded", "isolated"];
-    if let Some(modules) = config.get("modules").and_then(|m| m.as_array()) {
-        let has_isolation = target.has_mmu;
-        for (i, m) in modules.iter().enumerate() {
-            if let Some(t) = m.get("trust_tier").and_then(|v| v.as_str()) {
-                if !valid_tiers.contains(&t) {
-                    result.add_error(format!(
-                        "modules[{i}]: invalid trust_tier '{t}' (expected one of {valid_tiers:?})",
-                    ));
-                }
-            }
-            if let Some(p) = m.get("protection").and_then(|v| v.as_str()) {
-                if !valid_prot.contains(&p) {
-                    result.add_error(format!(
-                        "modules[{i}]: invalid protection '{p}' (expected one of {valid_prot:?})",
-                    ));
-                } else if p == "isolated" && !has_isolation {
-                    result.add_error(format!(
-                        "modules[{i}]: protection: isolated requires a target whose kernel isolates modules (an MMU target, EL0); target '{}' has none",
-                        target.id,
-                    ));
-                }
-            }
-            // A community/unsigned tier without an explicit protection override
-            // implies isolation — catch targets that can't provide it.
-            let tier = m
-                .get("trust_tier")
-                .and_then(|v| v.as_str())
-                .unwrap_or("platform");
-            let explicit_prot = m.get("protection").and_then(|v| v.as_str());
-            if explicit_prot.is_none()
-                && (tier == "community" || tier == "unsigned")
-                && !has_isolation
-            {
-                result.add_error(format!(
-                    "modules[{i}]: trust_tier '{tier}' implies protection: isolated, \
-                     but target '{}' does not isolate modules. Either set protection \
-                     explicitly or deploy to an MMU target.",
-                    target.id,
-                ));
-            }
+    // Modules the graph does not list (a stack's) take the graph's defaults.
+    if let Err(e) = crate::protection::resolve(&Value::Null, config, levels) {
+        if config.get("protection").is_some()
+            || config
+                .get("graph")
+                .and_then(|g| g.get("protection"))
+                .is_some()
+            || config.get("default_trust_tier").is_some()
+            || config
+                .get("graph")
+                .and_then(|g| g.get("default_trust_tier"))
+                .is_some()
+        {
+            result.add_error(format!("graph defaults: {e} on target '{}'", target.id));
         }
     }
 }
@@ -756,7 +761,7 @@ fn validate_paged_arenas(config: &Value, target: &TargetDescriptor, result: &mut
     // Check target has MMU
     if has_paged_arena && !target.has_mmu {
         result.add_error(format!(
-            "paged_arena requires MMU support (target '{}' has_mmu=false). \
+            "paged_arena requires an MMU (target '{}' has none). \
              Only bcm2712-class targets (pi5 / qemu-virt) support demand paging.",
             target.id
         ));
@@ -796,10 +801,16 @@ mod tests {
         let module = json!({ "modules": [{ "name": "m", "protection": "isolated" }] });
         let tier = json!({ "modules": [{ "name": "m", "trust_tier": "community" }] });
         for config in [&graph, &module, &tier] {
-            assert!(isolation_errors("pi5", config.clone()).is_empty());
-            // An MPU the kernel does not run is no isolation: refused.
-            assert_eq!(isolation_errors("pico2w", config.clone()).len(), 1);
-            assert_eq!(isolation_errors("pico", config.clone()).len(), 1);
+            // The MMU backend (pi5) and both MPU backends (rp2350, rp2040).
+            for board in ["pi5", "pico2w", "pico"] {
+                assert!(
+                    isolation_errors(board, config.clone()).is_empty(),
+                    "{board}"
+                );
+            }
+            // A target with no backend compiled in: refused, never run
+            // without it.
+            assert_eq!(isolation_errors("linux", config.clone()).len(), 1);
         }
     }
 }

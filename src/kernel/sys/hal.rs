@@ -196,13 +196,14 @@ pub struct HalOps {
     pub smp_max_domains: fn() -> usize,
 
     // ── Module protection (MPU / MMU / none) ─────────────────────────
-    /// Enable module protection after the first `protection: isolated` module
-    /// is admitted (MPU regions on Cortex-M, EL0 page tables on aarch64).
+    /// Enable module protection after the first gated module is admitted
+    /// (MPU regions on Cortex-M, EL0 page tables on aarch64).
     pub protection_set_enabled: fn(bool),
     /// Drop all per-module protection state for a graph reconfigure.
     pub protection_reset: fn(),
-    /// Register a module's code/state/heap footprints with the protection
-    /// hardware. `code_base`/`code_size` in bytes (platforms narrow as needed).
+    /// Build a gated module's protection domain from its code/state/heap
+    /// footprints, before any of its code runs. `false` fails the load
+    /// closed: the module is never run privileged instead.
     pub protection_register_module: fn(
         module_idx: usize,
         code_base: usize,
@@ -211,20 +212,26 @@ pub struct HalOps {
         state_size: usize,
         heap_ptr: *mut u8,
         heap_size: usize,
-    ),
-    /// Register a module's channel-buffer range so an isolated module sees
-    /// only its own buffers. Platforms apply their own alignment/rounding and
-    /// fail-closed policies.
-    pub protection_set_channel_region: fn(module_idx: usize, base: usize, size: usize),
-    /// Record the channel handles an isolated module may name in a mediated
-    /// gateway call.
-    pub protection_set_isolated_channels:
-        fn(module_idx: usize, in_chan: i32, out_chan: i32, ctrl_chan: i32),
-    /// Run one isolated module step under the platform's protection domain
-    /// (EL0 entry on aarch64). Platforms without a protected-call mechanism
-    /// install [`protected_step_direct`].
-    pub protected_step:
-        unsafe fn(step_fn: crate::kernel::module::loader::ModuleStepFn, state_ptr: *mut u8) -> i32,
+    ) -> bool,
+    /// Release a gated module's protection domain (its slot, tables and
+    /// stack) at teardown.
+    pub protection_release_module: fn(module_idx: usize),
+    /// The `SyscallTable` a gated module is handed: every entry a veneer that
+    /// traps into the gateway. Null where no backend is compiled in.
+    pub protection_gateway_table: fn() -> *const crate::abi::SyscallTable,
+    /// Call one entry point of gated module `module_idx` unprivileged, with
+    /// `args` in its first argument registers and `params` copied onto its
+    /// own stack (their address replacing `args[3]`), forced out if it runs
+    /// past `deadline_us`. Platforms with no backend install
+    /// [`protected_call_unavailable`]; the loader refuses gated modules there
+    /// before this is reached.
+    pub protected_call: unsafe fn(
+        module_idx: usize,
+        entry: usize,
+        args: &[usize; 8],
+        params: &[u8],
+        deadline_us: u32,
+    ) -> i32,
     /// Map / unmap one 4 KiB page in a module's protection tables (paged
     /// arena). No-ops where module page tables don't exist.
     pub protection_map_page: fn(module_idx: usize, vaddr: usize, phys: usize, writable: bool),
@@ -244,20 +251,29 @@ pub struct HalOps {
     pub serial_write: fn(bytes: &[u8]) -> usize,
 }
 
-/// Default `protected_step` for platforms without a protected-call mechanism:
-/// the plain module call with the post-PIC barrier (identical to the loader's
-/// direct dispatch path).
+/// The result of a protected call that could not be made: a fault, so the
+/// scheduler applies the module's fault policy. The module never runs.
+pub const PROTECTED_CALL_REFUSED: i32 = -14;
+
+/// `protected_call` for platforms with no protection backend. The loader
+/// refuses gated modules on them, so this is a backstop that fails closed
+/// rather than running the module privileged.
 ///
 /// # Safety
-/// Same contract as any module step dispatch: `step_fn`/`state_ptr` validated
-/// at module construction.
-pub unsafe fn protected_step_direct(
-    step_fn: crate::kernel::module::loader::ModuleStepFn,
-    state_ptr: *mut u8,
+/// None required; it calls nothing.
+pub unsafe fn protected_call_unavailable(
+    _module_idx: usize,
+    _entry: usize,
+    _args: &[usize; 8],
+    _params: &[u8],
+    _deadline_us: u32,
 ) -> i32 {
-    let r = step_fn(state_ptr);
-    pic_barrier();
-    r
+    PROTECTED_CALL_REFUSED
+}
+
+/// `protection_gateway_table` for platforms with no protection backend.
+pub fn no_gateway_table() -> *const crate::abi::SyscallTable {
+    core::ptr::null()
 }
 
 /// Park every online secondary core for a structural mutation. `true` iff
@@ -300,32 +316,31 @@ pub fn protection_register_module(
     state_size: usize,
     heap_ptr: *mut u8,
     heap_size: usize,
-) {
+) -> bool {
     (ops().protection_register_module)(
         module_idx, code_base, code_size, state_ptr, state_size, heap_ptr, heap_size,
     )
 }
 #[inline]
-pub fn protection_set_channel_region(module_idx: usize, base: usize, size: usize) {
-    (ops().protection_set_channel_region)(module_idx, base, size)
+pub fn protection_release_module(module_idx: usize) {
+    (ops().protection_release_module)(module_idx)
 }
 #[inline]
-pub fn protection_set_isolated_channels(
-    module_idx: usize,
-    in_chan: i32,
-    out_chan: i32,
-    ctrl_chan: i32,
-) {
-    (ops().protection_set_isolated_channels)(module_idx, in_chan, out_chan, ctrl_chan)
+pub fn protection_gateway_table() -> *const crate::abi::SyscallTable {
+    (ops().protection_gateway_table)()
 }
 /// # Safety
-/// `step_fn`/`state_ptr` validated at module construction; scheduler-thread.
+/// `entry` is a validated export of gated module `module_idx`, and `args`
+/// are what that entry point takes; scheduler-thread.
 #[inline]
-pub unsafe fn protected_step(
-    step_fn: crate::kernel::module::loader::ModuleStepFn,
-    state_ptr: *mut u8,
+pub unsafe fn protected_call(
+    module_idx: usize,
+    entry: usize,
+    args: &[usize; 8],
+    params: &[u8],
+    deadline_us: u32,
 ) -> i32 {
-    (ops().protected_step)(step_fn, state_ptr)
+    (ops().protected_call)(module_idx, entry, args, params, deadline_us)
 }
 #[inline]
 pub fn protection_map_page(module_idx: usize, vaddr: usize, phys: usize, writable: bool) {

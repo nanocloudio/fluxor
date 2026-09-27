@@ -47,6 +47,12 @@ mod guard {
         alarm::set_enabled(IDX, false);
         step_guard::set_timed_out();
         step_guard::set_armed(false);
+        // A gated module can be forced out: unprivileged, it holds no kernel
+        // lock the kernel could need back.
+        #[cfg(feature = "kernel-mpu")]
+        if crate::platform::rp_protection::gated_active() {
+            crate::platform::rp_protection::force_out();
+        }
     }
 }
 

@@ -34,12 +34,38 @@ pio_count = 0
 pio_state_machines = 0
 dma_channels = 16
 
+[kernel]
+# The EL1 stack each core runs on: the primary's `__stack_start..__stack_end`
+# (`linker/memory-bcm2712.x`) and each secondary's `CORE_STACK_SIZE`
+# (`multicore.rs`), each above an unmapped guard page. A module that is not
+# isolated steps on it.
+kernel_stack_kb = 1024
+# The kernel's own frames beneath a module's: the scheduler's and whatever a
+# syscall from the module runs (a key-vault signature, a flash write). A
+# non-isolated module is admitted against the stack less this.
+kernel_stack_reserve_kb = 256
+
 [isolation]
-has_mmu = true
+# What the kernel implements here (`kernel-vm`, EL0 under a per-module page
+# table). `contained` requests are given `isolated` — the floor rule.
+levels = ["isolated"]
+region_model = "pages"
+stack_bound = "guard-page"
+device_windows = true
+# The peripheral blocks an isolated driver may be granted as its
+# `device_window`, by name: an allowlist, default deny. A block is listed only
+# when no kernel driver touches it (RP1's UART, GPIO and RIO, the GIC and the
+# PCIe root complex are the kernel's) and it cannot master the bus. RP1
+# peripherals are at 0x1c_0000_0000 + (RP1 address - 0x4000_0000).
+device_ranges = [
+    { name = "rp1_sysinfo", base = "0x1c00000000", size = "0x4000" },
+]
 # The stack an isolated module runs on at EL0, above an unmapped guard page
 # (`ISOLATED_STACK_BYTES`). The composer refuses an isolated module that
 # declares more.
 isolated_stack_kb = 64
+# Isolated modules at once: the kernel's static page-table slots (`MAX_ISO`).
+isolated_slots = 2
 
 # [kernel] capacity tunables for BCM2712 live in
 # `modules/sdk/config.rs::profile_host` (selected at compile time via

@@ -341,6 +341,13 @@ fn generate_config_impl(
     // The edge ceiling follows the same profile, and the graph section is
     // laid out for exactly that many slots (`capacity::kernel_max_edges`).
     let max_edges = crate::capacity::kernel_max_edges(resolved_target.unwrap_or("linux"));
+    // The target's isolation facts: each module's protection tag carries the
+    // level the target provides rather than what was asked, and a device
+    // window the block the target resolves its name to.
+    let isolation = resolved_target
+        .and_then(|t| crate::target::load_target(t, project_root).ok())
+        .map(|t| t.isolation)
+        .unwrap_or_default();
     let (module_entries, module_names) = parse_modules_map(
         modules_ref,
         data_section,
@@ -348,6 +355,7 @@ fn generate_config_impl(
         modules_dir,
         &manifests,
         max_modules,
+        &isolation,
     )?;
 
     // Hardware-capability validation. Each module's `[requires]`
@@ -663,15 +671,24 @@ fn generate_config_impl(
     // set when buffer_group != 0). Without this, the channel is a
     // byte-streaming FIFO and structured envelopes get fragmented.
     let mut buffer_groups = assign_buffer_groups(&edges, &module_names, module_caps)?;
+    let mut explicit_group = vec![false; buffer_groups.len()];
     if let Some(wiring) = config.get("wiring").and_then(|w| w.as_array()) {
         for (i, entry) in wiring.iter().enumerate() {
             if let Some(g) = entry.get("buffer_group").and_then(|v| v.as_u64()) {
                 if g > 0 && g <= 31 && i < buffer_groups.len() {
                     buffer_groups[i] = g as u8;
+                    explicit_group[i] = true;
                 }
             }
         }
     }
+    ungroup_gated_edges(
+        &edges,
+        &mut buffer_groups,
+        &explicit_group,
+        &gated_modules(config, &module_names, &isolation.levels),
+        &module_names,
+    )?;
 
     // Resolve per-edge edge_class from wiring entries
     let edge_classes = resolve_edge_classes(config, &module_names, &domain_names)?;
@@ -1192,6 +1209,57 @@ fn build_pod_section(
 /// to alias them to the same channel buffer at runtime.
 ///
 /// Returns a Vec of group IDs parallel to the edges slice. Group 0 = no aliasing.
+/// Which modules, by index, run at a gated level on this target.
+fn gated_modules(config: &Value, module_names: &[String], levels: &[crate::protection::Level]) -> Vec<bool> {
+    let entries = crate::protection::module_entries(config);
+    module_names
+        .iter()
+        .map(|name| {
+            entries
+                .iter()
+                .find(|(_, m)| m.get("name").and_then(|n| n.as_str()) == Some(name.as_str()))
+                .and_then(|(_, m)| crate::protection::resolve(m, config, levels).ok())
+                .is_some_and(|r| r.provided.is_gated())
+        })
+        .collect()
+}
+
+/// A gated module reaches channels only through the gateway, which copies,
+/// so no zero-copy (buffer-group) edge may touch one: the kernel refuses such
+/// a graph at load. A group the auto-assign pass formed is an optimisation
+/// and is dropped whole; a `buffer_group:` the graph wrote is refused.
+fn ungroup_gated_edges(
+    edges: &[(u8, u8, u8, u8, u8)],
+    groups: &mut [u8],
+    explicit: &[bool],
+    gated: &[bool],
+    module_names: &[String],
+) -> Result<()> {
+    let is_gated = |id: u8| gated.get(id as usize).copied().unwrap_or(false);
+    let mut dropped = [false; 32];
+    for (i, &(from, to, ..)) in edges.iter().enumerate() {
+        let g = groups[i];
+        if g == 0 || !(is_gated(from) || is_gated(to)) {
+            continue;
+        }
+        if explicit[i] {
+            let m = if is_gated(from) { from } else { to };
+            return Err(Error::Config(format!(
+                "wiring[{i}]: buffer_group {g} makes a zero-copy edge at gated module '{}'; a \
+                 gated module reaches channels only through the gateway, which copies",
+                module_names.get(m as usize).map(String::as_str).unwrap_or("?")
+            )));
+        }
+        dropped[g as usize & 31] = true;
+    }
+    for (i, g) in groups.iter_mut().enumerate() {
+        if *g != 0 && dropped[*g as usize & 31] && !explicit[i] {
+            *g = 0;
+        }
+    }
+    Ok(())
+}
+
 fn assign_buffer_groups(
     edges: &[(u8, u8, u8, u8, u8)],
     module_names: &[String],

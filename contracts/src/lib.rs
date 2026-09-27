@@ -14,14 +14,19 @@
 
 #![no_std]
 
+#[cfg(feature = "alloc")]
 extern crate alloc;
 
+#[cfg(feature = "alloc")]
 use alloc::string::String;
+#[cfg(feature = "alloc")]
 use alloc::vec::Vec;
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
+pub mod isolation;
+#[cfg(feature = "alloc")]
 pub mod log_ring;
 pub mod observability;
 pub mod vocabulary;
@@ -485,6 +490,7 @@ pub fn rate_class_floor(class: RateClass, embedded: bool) -> Option<u32> {
 /// Per-operation fence: the actual guarantee a returning operation
 /// achieved. Operations MUST NOT advertise a fence stronger than the
 /// underlying graph produced.
+#[cfg(feature = "alloc")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "serde", serde(tag = "kind", rename_all = "snake_case"))]
@@ -508,6 +514,7 @@ pub enum Fence {
     },
 }
 
+#[cfg(feature = "alloc")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
@@ -520,6 +527,7 @@ pub enum HashAlgo {
 /// completed. Constructed by the replicating provider the operation
 /// went through; carried on `Fence::ReplicatedDurable` so downstream
 /// consumers can verify the fence was real.
+#[cfg(feature = "alloc")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct FenceWitness {
@@ -529,6 +537,7 @@ pub struct FenceWitness {
     pub acked_participants: Vec<String>,
 }
 
+#[cfg(feature = "alloc")]
 impl FenceWitness {
     pub fn new(
         fence_epoch: u64,

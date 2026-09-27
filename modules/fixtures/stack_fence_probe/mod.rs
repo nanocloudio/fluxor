@@ -41,6 +41,12 @@ include!("../../sdk/runtime.rs");
 
 /// How far below its entry the probe writes: past any admitted depth on an RP
 /// part, well inside the stack region.
+/// How far below its entry the probe writes: past the kernel stack less its
+/// reserve on RP (the fence), past the 1 MiB EL1 stack on bcm2712 (its guard
+/// page).
+#[cfg(target_arch = "aarch64")]
+const DEPTH: usize = 2 * 1024 * 1024;
+#[cfg(not(target_arch = "aarch64"))]
 const DEPTH: usize = 16 * 1024;
 
 #[repr(C)]
@@ -90,25 +96,41 @@ pub extern "C" fn module_new(
 
 /// Lower the stack pointer by `DEPTH`, write every word of the range, and put
 /// it back.
+/// Write downward from the stack pointer, a word every 128 bytes, until
+/// `DEPTH` below it — the order a real overflow takes, so the first thing
+/// crossed is whatever bounds the stack (the fence words, the guard page),
+/// never memory beyond it.
 #[inline(never)]
 fn go_deep() {
-    // SAFETY: the range lies inside the kernel stack region on every RP part
-    // (the admitted stack alone is larger than `DEPTH`); nothing lives below
-    // the stack pointer, and the pointer is restored before returning.
+    #[cfg(target_arch = "aarch64")]
     unsafe {
         core::arch::asm!(
-            "mov {top}, sp",
-            "sub {cur}, {top}, {n}",
-            "mov sp, {cur}",
-            "mov {z}, #0",
+            "mov {cur}, sp",
+            "sub {end}, {cur}, {n}",
             "2:",
-            "str {z}, [{cur}]",
-            "add {cur}, {cur}, #4",
-            "cmp {cur}, {top}",
-            "blo 2b",
-            "mov sp, {top}",
-            top = out(reg) _,
+            "sub {cur}, {cur}, #128",
+            "str xzr, [{cur}]",
+            "cmp {cur}, {end}",
+            "b.hi 2b",
             cur = out(reg) _,
+            end = out(reg) _,
+            n = in(reg) DEPTH,
+        );
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    unsafe {
+        core::arch::asm!(
+            "mov {cur}, sp",
+            "mov {end}, sp",
+            "subs {end}, {end}, {n}",
+            "movs {z}, #0",
+            "2:",
+            "subs {cur}, #128",
+            "str {z}, [{cur}]",
+            "cmp {cur}, {end}",
+            "bhi 2b",
+            cur = out(reg) _,
+            end = out(reg) _,
             z = out(reg) _,
             n = in(reg) DEPTH,
         );

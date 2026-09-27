@@ -1491,6 +1491,7 @@ mod scheduler_validation_tests {
             modules_dir,
             &manifests,
             crate::capacity::kernel_max_modules("linux"),
+            &crate::target::IsolationFacts::default(),
         )
         .expect("emit module entry");
         // Entry layout (see `parse_module_entry`): bytes 0-3 =
@@ -3320,5 +3321,43 @@ mod port_fact_tests {
         .unwrap_err()
         .to_string();
         assert!(e.contains("stream"), "{e}");
+    }
+}
+
+#[cfg(test)]
+mod gated_edge_tests {
+    use super::*;
+
+    fn names() -> Vec<String> {
+        ["src", "mid", "sink"].iter().map(|s| s.to_string()).collect()
+    }
+
+    /// An auto-assigned group touching a gated module is dropped whole, so
+    /// the kernel never sees a zero-copy edge at one.
+    #[test]
+    fn an_auto_group_at_a_gated_module_is_dropped_whole() {
+        let edges = [(0u8, 1u8, 0u8, 0u8, 0u8), (1, 2, 0, 0, 0)];
+        let mut groups = vec![1u8, 1];
+        ungroup_gated_edges(&edges, &mut groups, &[false, false], &[true, false, false], &names())
+            .expect("an auto group is dropped, not refused");
+        assert_eq!(groups, vec![0, 0], "the edge beyond the gated module leaves the group too");
+    }
+
+    #[test]
+    fn a_written_group_at_a_gated_module_is_refused() {
+        let edges = [(0u8, 1u8, 0u8, 0u8, 0u8)];
+        let mut groups = vec![3u8];
+        let e = ungroup_gated_edges(&edges, &mut groups, &[true], &[false, true, false], &names())
+            .expect_err("a written zero-copy edge at a gated module");
+        assert!(e.to_string().contains("'mid'"), "names the module: {e}");
+    }
+
+    #[test]
+    fn groups_away_from_gated_modules_are_kept() {
+        let edges = [(0u8, 1u8, 0u8, 0u8, 0u8), (1, 2, 0, 0, 0)];
+        let mut groups = vec![2u8, 2];
+        ungroup_gated_edges(&edges, &mut groups, &[false, true], &[false, false, false], &names())
+            .unwrap();
+        assert_eq!(groups, vec![2, 2]);
     }
 }

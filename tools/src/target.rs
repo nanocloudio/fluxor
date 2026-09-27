@@ -40,12 +40,198 @@ struct TomlKernelConfig {
     state_arena_kb: Option<u32>,
     ram_static_max_kb: Option<u32>,
     kernel_stack_reserve_kb: Option<u32>,
+    kernel_stack_kb: Option<u32>,
 }
 
 #[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct TomlIsolationConfig {
-    has_mmu: Option<bool>,
+    levels: Option<Vec<String>>,
+    region_model: Option<String>,
+    regions: Option<u32>,
+    stack_bound: Option<String>,
+    device_windows: Option<bool>,
+    device_ranges: Option<Vec<TomlDeviceRange>>,
+    #[serde(rename = "peripheral_gate")]
+    _peripheral_gate: Option<TomlPeripheralGate>,
     isolated_stack_kb: Option<u32>,
+    isolated_slots: Option<u32>,
+    exception_frame_bytes: Option<u32>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TomlDeviceRange {
+    name: String,
+    base: String,
+    size: String,
+    /// The block's peripheral-gate register (kernel fact; the composer
+    /// needs only the range).
+    #[serde(rename = "gate")]
+    _gate: Option<String>,
+}
+
+/// The peripheral access-control block the kernel locks at boot (kernel
+/// fact; parsed so the section stays closed to typos).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TomlPeripheralGate {
+    #[serde(rename = "base")]
+    _base: String,
+    #[serde(rename = "first")]
+    _first: String,
+    #[serde(rename = "last")]
+    _last: String,
+}
+
+/// How a target's protection unit draws a region — the planner's model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegionModel {
+    /// No protection unit the kernel drives.
+    None,
+    /// ARMv8-M PMSAv8: base/limit, 32-byte granularity.
+    Pmsav8,
+    /// ARMv6-M/ARMv7-M PMSAv7: power-of-two size, size-aligned, 8 subregions.
+    Pmsav7,
+    /// An MMU with 4 KiB pages.
+    Pages,
+}
+
+impl RegionModel {
+    fn parse(s: &str) -> Option<RegionModel> {
+        match s {
+            "none" => Some(RegionModel::None),
+            "pmsav8" => Some(RegionModel::Pmsav8),
+            "pmsav7" => Some(RegionModel::Pmsav7),
+            "pages" => Some(RegionModel::Pages),
+            _ => None,
+        }
+    }
+}
+
+/// What bounds a gated module's stack in hardware.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StackBound {
+    None,
+    LimitRegister,
+    GuardRegion,
+    GuardPage,
+}
+
+impl StackBound {
+    fn parse(s: &str) -> Option<StackBound> {
+        match s {
+            "none" => Some(StackBound::None),
+            "limit-register" => Some(StackBound::LimitRegister),
+            "guard-region" => Some(StackBound::GuardRegion),
+            "guard-page" => Some(StackBound::GuardPage),
+            _ => None,
+        }
+    }
+}
+
+/// A target's isolation facts (`[isolation]`). Published by the target and
+/// admitted against by the composer; chip identity is never consulted. The
+/// default is a target with no protection unit and no gated level.
+#[derive(Debug, Clone)]
+pub struct IsolationFacts {
+    /// The gated levels the kernel implements here (`contained`,
+    /// `isolated`). `none` and `guarded` are implemented everywhere.
+    pub levels: Vec<crate::protection::Level>,
+    pub region_model: RegionModel,
+    /// Protection regions per core.
+    pub regions: u32,
+    pub stack_bound: StackBound,
+    /// Whether an isolated module can be given a device window.
+    pub device_windows: bool,
+    /// The peripheral blocks a gated driver may be granted as its device
+    /// window, by name: (name, base, size).
+    pub device_ranges: Vec<(String, u64, u32)>,
+    /// How many modules can be isolated at once.
+    pub isolated_slots: u32,
+    /// Bytes an exception frame takes on a gated module's stack.
+    pub exception_frame_bytes: u32,
+}
+
+impl Default for IsolationFacts {
+    fn default() -> IsolationFacts {
+        IsolationFacts {
+            levels: Vec::new(),
+            region_model: RegionModel::None,
+            regions: 0,
+            stack_bound: StackBound::None,
+            device_windows: false,
+            device_ranges: Vec::new(),
+            isolated_slots: 0,
+            exception_frame_bytes: 0,
+        }
+    }
+}
+
+impl IsolationFacts {
+    /// The region planner's model for these facts, or `None` where no
+    /// protection unit is driven.
+    pub fn planner_model(&self) -> Option<fluxor_contracts::isolation::RegionModel> {
+        use fluxor_contracts::isolation::RegionModel as P;
+        let regions = self.regions as u8;
+        match self.region_model {
+            RegionModel::Pmsav8 => Some(P::Pmsav8 { regions }),
+            RegionModel::Pmsav7 => Some(P::Pmsav7 { regions }),
+            RegionModel::Pages => Some(P::Pages),
+            RegionModel::None => None,
+        }
+    }
+
+    fn from_toml(t: Option<&TomlIsolationConfig>, id: &str) -> Result<IsolationFacts> {
+        let Some(t) = t else {
+            return Ok(Self::default());
+        };
+        let bad = |what: &str, v: &str| {
+            Error::Config(format!(
+                "targets/{id}: [isolation] {what} '{v}' is not recognised"
+            ))
+        };
+        let mut levels = Vec::new();
+        for l in t.levels.iter().flatten() {
+            let level = crate::protection::Level::parse(l).ok_or_else(|| bad("level", l))?;
+            if !level.is_gated() {
+                return Err(Error::Config(format!(
+                    "targets/{id}: [isolation] levels lists '{l}', which every target \
+                     implements; list only gated levels (contained, isolated)"
+                )));
+            }
+            levels.push(level);
+        }
+        let region_model = match &t.region_model {
+            Some(m) => RegionModel::parse(m).ok_or_else(|| bad("region_model", m))?,
+            None => RegionModel::None,
+        };
+        let stack_bound = match &t.stack_bound {
+            Some(b) => StackBound::parse(b).ok_or_else(|| bad("stack_bound", b))?,
+            None => StackBound::None,
+        };
+        let mut device_ranges = Vec::new();
+        for r in t.device_ranges.iter().flatten() {
+            let num = |v: &str| {
+                let h = v.strip_prefix("0x").or_else(|| v.strip_prefix("0X"));
+                h.and_then(|h| u64::from_str_radix(&h.replace('_', ""), 16).ok())
+                    .ok_or_else(|| bad("device_ranges address", v))
+            };
+            let size =
+                u32::try_from(num(&r.size)?).map_err(|_| bad("device_ranges size", &r.size))?;
+            device_ranges.push((r.name.clone(), num(&r.base)?, size));
+        }
+        Ok(IsolationFacts {
+            levels,
+            region_model,
+            regions: t.regions.unwrap_or(0),
+            stack_bound,
+            device_windows: t.device_windows.unwrap_or(false),
+            device_ranges,
+            isolated_slots: t.isolated_slots.unwrap_or(0),
+            exception_frame_bytes: t.exception_frame_bytes.unwrap_or(0),
+        })
+    }
 }
 
 #[derive(Deserialize)]
@@ -223,8 +409,15 @@ pub struct TargetDescriptor {
     /// The kernel's own frames at a module call on a target whose modules
     /// step on the kernel stack, in KiB (`[kernel] kernel_stack_reserve_kb`).
     pub kernel_stack_reserve_kb: Option<u32>,
-    /// Whether the target has an MMU (for full page-table isolation)
+    /// Whether the target has an MMU — derived from the isolation facts'
+    /// region model, so paged arenas and isolation agree about it.
     pub has_mmu: bool,
+    /// The target's isolation facts.
+    pub isolation: IsolationFacts,
+    /// The EL1 kernel stack each core runs on, in KiB (`[kernel]
+    /// kernel_stack_kb`), on a target whose kernel stack is not what its RAM
+    /// region leaves over.
+    pub kernel_stack_kb: Option<u32>,
     /// The stack an isolated module runs on, in KiB
     /// (`[isolation] isolated_stack_kb`). Pinned to the kernel's
     /// `ISOLATED_STACK_BYTES`.
@@ -263,23 +456,40 @@ pub struct MemoryConfig {
 // ── Implementation ──────────────────────────────────────────────────────────
 
 impl TargetDescriptor {
-    /// The deepest stack a module on this target may declare, in bytes, and
-    /// what it is measured against. An MMU target runs an isolated module on
-    /// its own fixed stack; a target without one steps every module on the
-    /// kernel stack, which is what the RAM region leaves above the static
-    /// ceiling, less the kernel's own reserve. `None` where the target states
-    /// neither (a host, where the OS owns the stack).
-    pub fn module_stack_limit(&self) -> Option<(u64, &'static str)> {
-        if self.has_mmu {
+    /// The stack a module at `level` steps on, in bytes, and what it is. An
+    /// isolated module on an MMU target has its own fixed stack; every other
+    /// module — and on an MPU target a gated one too, whose process stack is
+    /// the module part of the kernel stack — steps on the kernel stack. `None`
+    /// where the target states neither (a host, where the OS owns the stack).
+    pub fn module_stack_limit(
+        &self,
+        level: crate::protection::Level,
+    ) -> Option<(u64, &'static str)> {
+        if self.has_mmu && level == crate::protection::Level::Isolated {
             return self
                 .isolated_stack_kb
                 .map(|kb| (u64::from(kb) * 1024, "the isolated module stack"));
         }
-        let ram = self.memory.as_ref()?.ram_size as u64;
-        let statics = u64::from(self.ram_static_max_kb?) * 1024;
+        self.kernel_stack_limit()
+    }
+
+    /// What the kernel stack leaves a module that steps on it: the stack less
+    /// the kernel's own reserve. The stack is `[kernel] kernel_stack_kb` where
+    /// the target states it (an MMU target, whose stacks are linker
+    /// reservations), otherwise what the RAM region leaves above the static
+    /// ceiling.
+    pub fn kernel_stack_limit(&self) -> Option<(u64, &'static str)> {
         let reserve = u64::from(self.kernel_stack_reserve_kb?) * 1024;
+        let stack = match self.kernel_stack_kb {
+            Some(kb) => u64::from(kb) * 1024,
+            None => {
+                let ram = self.memory.as_ref()?.ram_size as u64;
+                let statics = u64::from(self.ram_static_max_kb?) * 1024;
+                ram.checked_sub(statics)?
+            }
+        };
         Some((
-            ram.checked_sub(statics)?.checked_sub(reserve)?,
+            stack.checked_sub(reserve)?,
             "the kernel stack less its reserve",
         ))
     }
@@ -557,6 +767,7 @@ fn load_silicon_target(path: &Path, kind: TargetKind) -> Result<TargetDescriptor
     });
 
     let p = &silicon.peripherals;
+    let isolation = IsolationFacts::from_toml(silicon.isolation.as_ref(), &silicon.target.id)?;
 
     Ok(TargetDescriptor {
         kind,
@@ -593,11 +804,9 @@ fn load_silicon_target(path: &Path, kind: TargetKind) -> Result<TargetDescriptor
             .kernel
             .as_ref()
             .and_then(|k| k.kernel_stack_reserve_kb),
-        has_mmu: silicon
-            .isolation
-            .as_ref()
-            .and_then(|i| i.has_mmu)
-            .unwrap_or(false),
+        has_mmu: isolation.region_model == RegionModel::Pages,
+        isolation,
+        kernel_stack_kb: silicon.kernel.as_ref().and_then(|k| k.kernel_stack_kb),
         isolated_stack_kb: silicon.isolation.as_ref().and_then(|i| i.isolated_stack_kb),
     })
 }

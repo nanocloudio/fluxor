@@ -165,8 +165,17 @@ unsafe extern "C" fn syscall_provider_call(
     // class byte for handle=-1 globals and scheduler-assigned channel
     // fds. Non-channel contracts hand out tagged fds so `contract_of`
     // produces an unambiguous result per handle.
-    let contract =
-        crate::kernel::module::provider::contract_of(handle).unwrap_or(((op >> 8) & 0xFF) as u16);
+    //
+    // A kernel primitive (the 0x0Cxx class) is routed by its opcode ahead of
+    // any handle (`provider::provider_call`), so it is granted by its class
+    // too: LOG_WRITE carries a log level in the handle slot, and checking a
+    // level-3 log against whatever handle happens to be number 3 refuses it.
+    let class = ((op >> 8) & 0xFF) as u16;
+    let contract = if class == crate::kernel::module::provider::contract::INTERNAL_DISPATCH_BUCKET {
+        class
+    } else {
+        crate::kernel::module::provider::contract_of(handle).unwrap_or(class)
+    };
     if let Some(rc) = check_contract_grant(contract) {
         return rc;
     }

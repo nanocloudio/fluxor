@@ -367,25 +367,24 @@ pub fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i3
         return Err(crate::kernel::sys::errno::EINVAL);
     }
 
-    // Register each module's channel-buffer range with the MPU/MMU so an
-    // isolated module sees only its own buffers through region 6.
-    for i in 0..module_count {
-        let (base, size) = crate::kernel::ipc::buffer_pool::compute_module_buffer_range(i as u8);
-        if size > 0 {
-            // Platform protection policy (page rounding, fail-closed
-            // interleave checks) lives behind the HAL seam.
-            crate::kernel::sys::hal::protection_set_channel_region(i, base, size);
+    // A gated module's channels stay kernel memory: it reads and writes them
+    // only through the gateway, which copies, so no channel buffer is ever
+    // mapped into its protection domain. Zero-copy edges (mailbox, in-place)
+    // cannot touch a gated module.
+    for e in edges[..runtime_edge_count].iter() {
+        if e.buffer_group == 0 {
+            continue;
+        }
+        for m in [e.from_module, e.to_module] {
+            if crate::kernel::exec::scheduler::module_is_isolated(m) {
+                log::error!(
+                    "[graph] module {m} is gated and sits on a zero-copy edge; a gated \
+                     module reaches channels only through the gateway"
+                );
+                return Err(crate::kernel::sys::errno::EINVAL);
+            }
         }
     }
-
-    // EL0-isolation page tables are built LAZILY on a module's first EL0 entry
-    // (`mmu::enter_el0` → `build_table`), not here: module instantiation (which
-    // registers the code/state/heap regions via `register_module`) runs in the
-    // platform flow AFTER `prepare_graph` returns, so the regions aren't known
-    // yet at this point. `register_module` preserves the channel region set by
-    // the pass above, so the lazy build sees code/state/heap plus the
-    // page-aligned channel range together. A failed lazy build fails the module
-    // closed (never stepped at EL1) — see `enter_el0`.
 
     // Compute topological execution order. A graph with cycles is
     // rejected by default: silently running the topological prefix

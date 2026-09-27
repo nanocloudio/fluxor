@@ -64,6 +64,14 @@ pub struct ModuleInfo {
 }
 
 impl ModuleInfo {
+    /// Bytes of code in the packed module (its header's `code_size`).
+    pub fn code_size(&self) -> usize {
+        self.data
+            .get(8..12)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
+            .unwrap_or(0)
+    }
+
     /// Load module from .fmod file
     pub fn from_file(path: &Path) -> Result<Self> {
         let data = std::fs::read(path)?;
@@ -964,6 +972,18 @@ fn read_embedded_stack_bytes(sections: &[ElfSection], symbols: &[ElfSymbol]) -> 
     Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
 }
 
+/// Read the module's declared heap arena out of the ELF, as data (the SDK's
+/// `declare_module_arena_bytes!`). `None` for a module that has not declared.
+fn read_embedded_arena_bytes(sections: &[ElfSection], symbols: &[ElfSymbol]) -> Option<u32> {
+    let sym = symbols
+        .iter()
+        .find(|s| s.name.contains("FLUXOR_MODULE_ARENA_BYTES"))?;
+    let sec = sections.get(sym.section_idx as usize)?;
+    let start = (sym.value as usize).checked_sub(sec.addr)?;
+    let bytes = sec.data.get(start..start + 4)?;
+    Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
 /// Find a section by name
 fn find_section<'a>(sections: &'a [ElfSection], name: &str) -> Option<&'a ElfSection> {
     sections.iter().find(|s| s.name == name)
@@ -1266,6 +1286,12 @@ pub fn pack_fmod(
     }
     let stack = declared.max(measured_stack.unwrap_or(0));
     module_manifest.stack_bytes_64 = u16::try_from(stack.div_ceil(64)).unwrap_or(u16::MAX);
+
+    // Heap arena: the declared figure, so the loader sizes the arena from the
+    // manifest instead of calling `module_arena_size`.
+    if let Some(bytes) = read_embedded_arena_bytes(&sections, &symbols) {
+        module_manifest.arena_bytes = bytes;
+    }
 
     let manifest_bytes = module_manifest.to_bytes();
 

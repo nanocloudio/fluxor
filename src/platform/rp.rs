@@ -456,7 +456,56 @@ fn rp_merge_runtime_overrides(module_id: u16, buf: *mut u8, len: usize, max: usi
     }
 }
 
-use fluxor::kernel::sys::hal::protected_step_direct as fluxor_protected_step_direct;
+
+// Module protection (HalOps seam): the MPU backend where it is compiled in;
+// elsewhere a gated module is refused at load and these fail closed.
+fn rp_protection_register(
+    module_idx: usize,
+    _code_base: usize,
+    _code_size: usize,
+    _state_ptr: *mut u8,
+    _state_size: usize,
+    _heap_ptr: *mut u8,
+    _heap_size: usize,
+) -> bool {
+    #[cfg(feature = "kernel-mpu")]
+    return fluxor::platform::rp_protection::register(module_idx);
+    #[cfg(not(feature = "kernel-mpu"))]
+    {
+        let _ = module_idx;
+        false
+    }
+}
+fn rp_protection_release(module_idx: usize) {
+    #[cfg(feature = "kernel-mpu")]
+    fluxor::platform::rp_protection::release(module_idx);
+    let _ = module_idx;
+}
+fn rp_gateway_table() -> *const fluxor::abi::SyscallTable {
+    #[cfg(feature = "kernel-mpu")]
+    return fluxor::platform::rp_protection::gateway_table();
+    #[cfg(not(feature = "kernel-mpu"))]
+    core::ptr::null()
+}
+unsafe fn rp_protected_call(
+    module_idx: usize,
+    entry: usize,
+    args: &[usize; 8],
+    params: &[u8],
+    deadline_us: u32,
+) -> i32 {
+    #[cfg(feature = "kernel-mpu")]
+    // SAFETY: forwarded from the HAL contract.
+    return unsafe {
+        fluxor::platform::rp_protection::protected_call(module_idx, entry, args, params, deadline_us)
+    };
+    #[cfg(not(feature = "kernel-mpu"))]
+    {
+        let _ = (module_idx, entry, args, params, deadline_us);
+        fluxor::kernel::sys::hal::PROTECTED_CALL_REFUSED
+    }
+}
+
 
 static RP_HAL_OPS: HalOps = HalOps {
     // No durable home for a sealed blob on this platform yet, and saying so
@@ -520,10 +569,10 @@ static RP_HAL_OPS: HalOps = HalOps {
     smp_max_domains: || 1,
     protection_set_enabled: |_| {},
     protection_reset: || {},
-    protection_register_module: |_, _, _, _, _, _, _| {},
-    protection_set_channel_region: |_, _, _| {},
-    protection_set_isolated_channels: |_, _, _, _| {},
-    protected_step: fluxor_protected_step_direct,
+    protection_register_module: rp_protection_register,
+    protection_release_module: rp_protection_release,
+    protection_gateway_table: rp_gateway_table,
+    protected_call: rp_protected_call,
     protection_map_page: |_, _, _, _| {},
     protection_unmap_page: |_, _| {},
     stack_fence_arm: fluxor::platform::rp_boot::stack_fence_arm,
@@ -614,6 +663,9 @@ fn rp_setup_graph() -> i32 {
 
         let instantiated = walk.instantiated();
         scheduler::set_current_module(instantiated);
+        fluxor::platform::rp_watchdog::breadcrumb(
+            fluxor::platform::rp_watchdog::stage::GRAPH | (instantiated as u32 & 0xFF),
+        );
         match scheduler::instantiate_one_module(
             loader,
             entry,
@@ -628,6 +680,7 @@ fn rp_setup_graph() -> i32 {
                 let mut settled = false;
                 loop {
                     rp_spin_ms(1);
+                    fluxor::platform::rp_watchdog::feed_boot();
                     if !walk.record_poll() {
                         break;
                     }
@@ -727,6 +780,10 @@ const PANIC_MARKER: u32 = 0x5041_4E49; // "PANI"
 pub unsafe extern "C" fn fluxor_rp_main() -> ! {
     use fluxor::platform::chip::{SYS_CLK_HZ, XOSC_HZ};
 
+    // A board the liveness watchdog reset was wedged: go to BOOTSEL rather
+    // than boot the same image into the same wedge.
+    fluxor::platform::rp_watchdog::recover_from_wedge();
+
     // The console before the PLLs, running from the crystal.
     //
     // `clk_peri` is disabled out of reset, so a UART brought up before this
@@ -790,22 +847,42 @@ pub unsafe extern "C" fn fluxor_rp_main() -> ! {
         }
     }
 
-    // The bootloader may have left the watchdog running and nothing here
-    // feeds it.
-    // SAFETY: a fixed MMIO register whose address is generated from the
-    // silicon TOML; single boot-thread writer.
-    unsafe {
-        fluxor::platform::rp_regs::write32(fluxor::platform::chip::WATCHDOG_CTRL as usize, 0);
-    }
-
     fluxor::platform::rp_timer::init_scheduler_alarm();
+    // From here to the main loop nothing feeds the liveness watchdog, so it
+    // is armed for the whole boot: whatever the bootloader left it doing is
+    // replaced, and a boot that hangs still ends in BOOTSEL.
+    fluxor::platform::rp_watchdog::arm_for_boot();
+    fluxor::platform::rp_watchdog::breadcrumb(fluxor::platform::rp_watchdog::stage::CLOCKS);
     init_logger();
+    if let Some(s) = fluxor::platform::rp_watchdog::last_wedge() {
+        use fluxor::platform::rp_watchdog::stage;
+        match s {
+            stage::CLOCKS => log::error!("[boot] the previous boot wedged before USB came up"),
+            stage::USB => log::error!("[boot] the previous boot wedged bringing up USB"),
+            stage::MAIN_LOOP => log::error!("[boot] the previous boot wedged in the main loop"),
+            s if s & stage::GRAPH != 0 => log::error!(
+                "[boot] the previous boot wedged instantiating module {}",
+                s & 0xFF
+            ),
+            s => log::error!("[boot] the previous boot wedged (stage 0x{s:x})"),
+        }
+    }
     fluxor::platform::rp_clocks::verify();
+    #[cfg(feature = "kernel-mpu")]
+    fluxor::platform::rp_protection::init();
 
     // The device stack, before the graph: a host that enumerates early gets
     // the boot logs, and a failure here is reported over the UART rather
     // than inferred from silence.
     fluxor::platform::rp_uart::write_str("[fluxor] usb: bringing up\r\n");
+    fluxor::platform::rp_watchdog::breadcrumb(fluxor::platform::rp_watchdog::stage::USB);
+    // The serial, read before the device stack exists: on RP2040 it is a
+    // flash command that takes XIP away, which must not happen under a
+    // control transfer or a DMA read. Zero if the part does not say.
+    USB_UNIQUE_ID.store(
+        fluxor::platform::rp_bootrom::unique_id().unwrap_or(0),
+        core::sync::atomic::Ordering::Relaxed,
+    );
     if fluxor::platform::rp_usb_device::init() {
         fluxor::platform::rp_usb_device::attach();
         fluxor::platform::rp_uart::write_str("[fluxor] usb: attached\r\n");
@@ -832,6 +909,7 @@ pub unsafe extern "C" fn fluxor_rp_main() -> ! {
     // configuration.
     loop {
         fluxor::platform::rp_uart::write_str("[fluxor] boot: building graph\r\n");
+        fluxor::platform::rp_watchdog::arm_for_boot();
         let module_count = rp_setup_graph();
         if module_count < 0 {
             park_reporting("[fluxor] boot: graph setup failed\r\n");
@@ -872,8 +950,11 @@ fn rp_run_main_loop(module_count: usize) -> Option<(*const u8, usize)> {
     let tick_period_us = scheduler::tick_us() as u64;
 
     log::info!("[sched] running modules={module_count} tick_us={tick_period_us}");
+    fluxor::platform::rp_watchdog::arm();
+    fluxor::platform::rp_watchdog::breadcrumb(fluxor::platform::rp_watchdog::stage::MAIN_LOOP);
 
     loop {
+        fluxor::platform::rp_watchdog::feed();
         fluxor::platform::rp_io::gpio::poll_gpio_edges();
 
         match scheduler::step_modules(modules, module_count) {
@@ -977,6 +1058,10 @@ fn rp_run_main_loop(module_count: usize) -> Option<(*const u8, usize)> {
     }
 }
 
+/// The chip's unique ID, which the serial string is rendered from. Written
+/// once at boot before the device stack starts.
+static USB_UNIQUE_ID: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
+
 /// Answer a `GET_DESCRIPTOR`, or `None` for anything this device does not
 /// have — which the control layer turns into a STALL.
 ///
@@ -1007,17 +1092,7 @@ fn descriptor_for(setup: &fluxor::kernel::usb::control::Setup) -> Option<&'stati
             static mut STRING_BUF: [u8; cdc_desc::STRING_DESCRIPTOR_MAX] =
                 [0; cdc_desc::STRING_DESCRIPTOR_MAX];
             let ptr = &raw mut STRING_BUF;
-            // Read once: the ROM call is not free and the ID does not change.
-            static mut UNIQUE_ID: Option<u64> = None;
-            let id_slot: *mut Option<u64> = &raw mut UNIQUE_ID;
-            // SAFETY: single-threaded; this is the only user of the static,
-            // and no reference to it outlives this block.
-            let id = unsafe {
-                if (*id_slot).is_none() {
-                    *id_slot = Some(fluxor::platform::rp_bootrom::unique_id().unwrap_or(0));
-                }
-                (*id_slot).unwrap_or(0)
-            };
+            let id = USB_UNIQUE_ID.load(core::sync::atomic::Ordering::Relaxed);
             // SAFETY: single-threaded, and one control transfer at a time —
             // the pump finishes streaming the previous descriptor before
             // another SETUP can reach this function, so no second borrow of
@@ -1123,6 +1198,9 @@ fn rp_usb_step() -> u32 {
         let was_open = unsafe { core::ptr::replace(&raw mut PORT_OPEN, open) };
         if open && !was_open {
             fluxor::kernel::sys::log_ring::activate_local_from_backlog();
+            // The backlog it replays carries this boot's report of a wedged
+            // predecessor, so the report has now reached someone.
+            fluxor::platform::rp_watchdog::wedge_reported();
         } else if !open && was_open {
             fluxor::kernel::sys::log_ring::disable_local();
         }
@@ -1170,6 +1248,7 @@ fn rp_usb_step() -> u32 {
 /// over the console being brought up, which is the one a person actually
 /// has.
 fn park_reporting(reason: &str) -> ! {
+    fluxor::platform::rp_watchdog::disarm();
     fluxor::platform::rp_uart::write_str(reason);
     fluxor::platform::rp_uart::flush();
     log::error!("{}", reason.trim_end());
@@ -1196,6 +1275,7 @@ fn park_reporting(reason: &str) -> ! {
 /// it needs no interrupt and never waits.
 #[unsafe(no_mangle)]
 pub extern "C" fn fluxor_fault_park(pc: u32, lr: u32, cfsr: u32, hfsr: u32, bfar: u32) -> ! {
+    fluxor::platform::rp_watchdog::disarm();
     use core::fmt::Write as _;
     let mut w = FixedWriter {
         buf: [0; 192],

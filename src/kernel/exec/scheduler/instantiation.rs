@@ -102,7 +102,7 @@ pub(crate) fn build_module_list(config: &Config) -> Result<ModuleList, i32> {
 /// stores the hints in MODULE_HINTS. Modules without the export
 /// get empty hints (all ports use default buffer sizes).
 /// Pre-pass: set `SCHED.isolated[i]` for every module whose config params
-/// request `protection: isolated` (TLV tag 0xF5 >= 2), BEFORE channels are
+/// request a gated level (TLV tag 0xF5 >= contained), BEFORE channels are
 /// opened. This lets `open_channels`/`alloc_streaming_for_module` page-align an
 /// isolated producer's channel buffers and the channel-region pass round its
 /// region to whole pages. The full protection TLV (fault policy, deadlines, …)
@@ -617,15 +617,20 @@ pub fn module_is_isolated(idx: usize) -> bool {
     unsafe { SCHED.isolated[idx] }
 }
 
-/// Peek a module's params TLV for a `protection: isolated` request (tag
-/// 0xF5, value >= 2) WITHOUT mutating any scheduler state. The loader calls
-/// this before allocating state so it can route an isolated module's state and
-/// heap into the dedicated page-aligned ISO arena (the EL0 mapping rounds to
-/// pages, so isolated allocations must own their pages — see
-/// `loader::alloc_isolated`). Mirrors the tag walk in `parse_protection_config`.
-pub fn params_request_isolation(params: &[u8]) -> bool {
+/// Protection levels as tag 0xF5 carries them. `>= CONTAINED` is gated: the
+/// module runs unprivileged and reaches the kernel only through the gateway.
+pub mod protection_level {
+    pub const NONE: u8 = 0;
+    pub const GUARDED: u8 = 1;
+    pub const CONTAINED: u8 = 2;
+    pub const ISOLATED: u8 = 3;
+}
+
+/// The protection level a module's params TLV asks for (tag 0xF5), without
+/// mutating any scheduler state; `NONE` when the tag is absent.
+pub fn params_protection_level(params: &[u8]) -> u8 {
     if params.len() < 4 {
-        return false;
+        return protection_level::NONE;
     }
     let mut pos = if params[0] == 0xFE { 4 } else { 0 };
     while pos + 2 <= params.len() {
@@ -638,12 +643,59 @@ pub fn params_request_isolation(params: &[u8]) -> bool {
         if pos + len > params.len() {
             break;
         }
-        if tag == 0xF5 && len == 1 && params[pos] >= 2 {
-            return true;
+        if tag == 0xF5 && len == 1 {
+            return params[pos];
         }
         pos += len;
     }
-    false
+    protection_level::NONE
+}
+
+/// The step deadline `idx` runs under, in microseconds: its declared
+/// `step_deadline_us`, or the default.
+pub fn module_step_deadline_us(idx: usize) -> u32 {
+    if idx >= MAX_MODULES {
+        return crate::kernel::exec::step_guard::DEFAULT_STEP_DEADLINE_US;
+    }
+    // SAFETY: fault_info is written on the setup path and by the scheduler
+    // thread that is asking.
+    unsafe {
+        let p = &raw const SCHED;
+        (*p).fault_info[idx].effective_deadline_us()
+    }
+}
+
+/// The device window the graph granted `idx` (tag 0xFD), if any.
+pub fn module_device_window(idx: usize) -> Option<(u64, u32)> {
+    if idx >= MAX_MODULES {
+        return None;
+    }
+    // SAFETY: written at instantiation on the setup path; read-only after.
+    let w = unsafe {
+        let p = &raw const SCHED;
+        (*p).device_window[idx]
+    };
+    (w.1 != 0).then_some(w)
+}
+
+/// The protection level `idx` was instantiated at (tag 0xF5).
+pub fn module_protection_level(idx: usize) -> u8 {
+    if idx >= MAX_MODULES {
+        return protection_level::NONE;
+    }
+    // SAFETY: written at instantiation on the setup path; read-only after.
+    unsafe {
+        let p = &raw const SCHED;
+        (*p).protection[idx]
+    }
+}
+
+/// Whether a module's params ask for a gated level (`contained` or
+/// `isolated`). The loader calls this before allocating state so a gated
+/// module's state and heap go where its protection regions can cover them
+/// (`loader::alloc_isolated`).
+pub fn params_request_isolation(params: &[u8]) -> bool {
+    params_protection_level(params) >= protection_level::CONTAINED
 }
 
 /// Parse protection configuration from module params TLV.
@@ -660,6 +712,8 @@ pub fn params_request_isolation(params: &[u8]) -> bool {
 /// - 0xF8: heap_zero_on_free (u8 bool)
 /// - 0xF9: heap_fault_on_alloc_failure (u8 bool)
 /// - 0xFA: heap_canary_enabled (u8 bool)
+/// - 0xFC: irq (u16 LE)
+/// - 0xFD: device window (u64 base LE, u32 size LE)
 pub fn parse_protection_config(module_idx: usize, params: &[u8]) {
     if params.len() < 4 {
         return;
@@ -733,17 +787,15 @@ pub fn parse_protection_config(module_idx: usize, params: &[u8]) {
                 }
             }
             0xF5 if len == 1 => {
-                // protection: 0=none, 1=guarded, 2=isolated.
-                // An isolated module opts the whole graph into MPU/MMU
-                // isolation; per-module regions are registered during
-                // instantiation and the page table is built before the
-                // first step (see `build_isolated_tables`).
-                if params[pos] >= 2 {
+                // protection: 0=none, 1=guarded, 2=contained, 3=isolated. A
+                // gated level (>= contained) opts the graph into the
+                // platform's protection regime; the module's regions are
+                // registered at instantiation, before any of its code runs.
+                sched.protection[module_idx] = params[pos];
+                let gated = params[pos] >= protection_level::CONTAINED;
+                sched.isolated[module_idx] = gated;
+                if gated {
                     crate::kernel::sys::hal::protection_set_enabled(true);
-                    sched.isolated[module_idx] = true;
-                    // On Pi 5 (BCM2712), enable the EL0 MMU-isolation regime so
-                    // `mmu::protected_step` drops the module to EL0. No-op on
-                    // other platforms (the Cortex-M MPU path above stands in).
                 }
             }
             0xF6 if len == 4 => {
@@ -795,6 +847,16 @@ pub fn parse_protection_config(module_idx: usize, params: &[u8]) {
                 // to `register_tier2_module`.
                 let val = u16::from_le_bytes([params[pos], params[pos + 1]]);
                 set_module_irq(module_idx, val);
+            }
+            0xFD if len == 12 => {
+                // device window (u64 base LE, u32 size LE): registers a gated
+                // driver may reach directly. The platform maps it into the
+                // module's protection domain at registration.
+                let mut b = [0u8; 8];
+                b.copy_from_slice(&params[pos..pos + 8]);
+                let mut z = [0u8; 4];
+                z.copy_from_slice(&params[pos + 8..pos + 12]);
+                sched.device_window[module_idx] = (u64::from_le_bytes(b), u32::from_le_bytes(z));
             }
             _ => {}
         }

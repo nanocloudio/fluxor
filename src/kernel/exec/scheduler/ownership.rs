@@ -419,6 +419,29 @@ pub fn free_module_state(module_idx: usize) {
     // path — release them before the slot is reused.
     crate::kernel::mem::elastic::reclaim_module(module_idx as u8);
 
+    // A gated module on an MPU target owns one private region — its stack,
+    // state and heap — which goes back to the pool whole; its state and heap
+    // are not freed on their own as well.
+    #[cfg(feature = "kernel-mpu")]
+    let private = crate::kernel::module::gateway::regions(module_idx)
+        .filter(|(_, stack, p)| stack.len != 0 && p[0].base == stack.base)
+        .map(|(_, _, p)| p[0]);
+    #[cfg(not(feature = "kernel-mpu"))]
+    let private: Option<crate::kernel::module::gateway::Region> = None;
+    if let Some(region) = private {
+        #[cfg(feature = "kernel-mpu")]
+        // SAFETY: the region `alloc_private` returned for this module, which
+        // is torn down and no longer stepping.
+        unsafe {
+            crate::kernel::module::loader::free_private(region.base as *mut u8, region.len);
+        }
+        let _ = region;
+        sched.arenas[module_idx] = ArenaInfo::empty();
+        if let ModuleSlot::Dynamic(_) =
+            core::mem::replace(&mut sched.modules[module_idx], ModuleSlot::Empty)
+        {}
+    }
+
     // Heap arena (from module_arena_size export, if any).
     let arena = sched.arenas[module_idx];
     if !arena.ptr.is_null() && arena.size > 0 {
@@ -438,6 +461,16 @@ pub fn free_module_state(module_idx: usize) {
             m.free();
         }
     }
+
+    // A gated module's protection domain goes with it: its slot, tables and
+    // stack, and every handle the gateway minted for it.
+    if crate::kernel::module::gateway::is_gated(module_idx) {
+        crate::kernel::sys::hal::protection_release_module(module_idx);
+        crate::kernel::module::gateway::release(module_idx);
+    }
+    sched.isolated[module_idx] = false;
+    sched.protection[module_idx] = 0;
+    sched.device_window[module_idx] = (0, 0);
 
     // Reset per-module scheduler bookkeeping so reuse is clean.
     sched.ports[module_idx] = ModulePorts::empty();

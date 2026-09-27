@@ -256,6 +256,17 @@ struct ChannelSlot {
 // access is sequenced.
 unsafe impl Sync for ChannelSlot {}
 
+/// What an attempt to claim one channel slot came to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SlotClaim {
+    Allocated,
+    /// Another channel holds the slot; the next one may be free.
+    Taken,
+    /// The slot was free but the buffer arena could not back it. Every
+    /// other free slot would fail the same way.
+    NoBuffer,
+}
+
 impl ChannelSlot {
     const fn new() -> Self {
         Self {
@@ -278,7 +289,7 @@ impl ChannelSlot {
         }
     }
 
-    fn try_allocate(&self, idx: usize, buf_capacity: usize, producer_module: u8) -> bool {
+    fn try_allocate(&self, idx: usize, buf_capacity: usize, producer_module: u8) -> SlotClaim {
         if self
             .state
             .compare_exchange(
@@ -296,7 +307,7 @@ impl ChannelSlot {
                 // No buffer available, rollback
                 self.state
                     .store(ChannelState::Free as u8, Ordering::Release);
-                return false;
+                return SlotClaim::NoBuffer;
             }
             self.buffer_slot.store(buf_slot as i16, Ordering::Release);
             self.chan_type.store(CHANNEL_TYPE_PIPE, Ordering::Release);
@@ -308,9 +319,9 @@ impl ChannelSlot {
             unsafe {
                 (*self.fifo.get()).init(buf_capacity);
             }
-            true
+            SlotClaim::Allocated
         } else {
-            false
+            SlotClaim::Taken
         }
     }
 
@@ -492,11 +503,17 @@ pub fn channel_open_for_module(
         return crate::kernel::sys::errno::ENOSPC;
     }
     for (idx, slot) in CHANNELS.iter().enumerate() {
-        if slot.try_allocate(idx, buf_capacity, producer_module) {
-            slot.state
-                .store(ChannelState::Connected as u8, Ordering::Release);
-            debug!("channel_open: allocated channel {idx} buf_size={buf_capacity}");
-            return idx as i32;
+        match slot.try_allocate(idx, buf_capacity, producer_module) {
+            SlotClaim::Allocated => {
+                slot.state
+                    .store(ChannelState::Connected as u8, Ordering::Release);
+                debug!("channel_open: allocated channel {idx} buf_size={buf_capacity}");
+                return idx as i32;
+            }
+            SlotClaim::Taken => {}
+            // The arena is short, not the slot table: say so once rather
+            // than retrying the same allocation against every free slot.
+            SlotClaim::NoBuffer => return errno::ENOMEM,
         }
     }
     // Slot table exhausted — an accounted capacity denial, not a busy peer.

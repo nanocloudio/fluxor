@@ -135,15 +135,11 @@ and checks it afterwards; a module that crossed it is reported
 fault. On rp2040, where nothing traps an overflow, the fence is the only thing
 that sees one.
 
-The RP kernel does not isolate modules. On rp2040 that is a design decision:
-the M0+ MPU has power-of-two regions and no stack limit, and a graph's state
-already fills most of the arena. On rp2350 the hardware can: the design, when a
-graph needs it, is PMSAv8 with the background region disabled for
-unprivileged code and regions covering only what the module may touch (its
-code, its state, its channel buffers — no region spanning all of SRAM), a
-process stack carved from the module's own state allocation and bounded by
-`PSPLIM`, and SRAM bounds taken from the silicon TOML. Until then an RP target
-refuses `protection: isolated` at compose and at load.
+A module stepped at a gated level (`contained` or `isolated`) does not use this
+stack. It runs unprivileged on a stack at the bottom of its own private
+region, and its overruns are bounded in hardware: by `PSPLIM` on rp2350, and
+on rp2040 by the end of the region. Both RP dies implement both gated levels;
+see [module_isolation.md](module_isolation.md).
 
 ## Bus Primitives
 
@@ -457,9 +453,11 @@ else:
 1. **`HalOps`** (`src/kernel/sys/hal.rs`) — the function-pointer table each
    platform installs at boot. All platform *behaviour* the kernel invokes goes
    through it: timing, interrupts, step-guard, ISR tiers, SMP quiesce, and the module
-   protection surface (`protection_*`, `protected_step` — EL0 MMU isolation on
-   aarch64, direct dispatch elsewhere — and `stack_fence_*`, which the RP
-   platform implements and the others install as no-ops).
+   protection surface: `protection_register_module`/`_release_module`,
+   `protection_gateway_table` and `protected_call`, which run a gated module
+   unprivileged (EL0 under the MMU on aarch64, the MPU on RP; see
+   [module_isolation.md](module_isolation.md)), and `stack_fence_*`, which the
+   RP platform implements and the others install as no-ops.
 2. **`platform::chip`** — the cfg-selected per-target *constants* module
    (arena sizes, capacity ceilings). These size static arrays, so they must be
    compile-time constants; a cfg-selected constants module IS the compile-time
@@ -471,8 +469,8 @@ else:
 
 The kernel branches on capability, never chip identity. Chip-conditional
 behaviour is expressed as capability features that a chip feature turns on:
-`kernel-vm` (page-table VM + EL0 isolation), `smp` (multi-core execution
-domains), `dtb` (device-tree boot). `chip-bcm2712` provides all three and is
+`kernel-vm` (page-table VM + EL0 isolation), `kernel-mpu` (MPU isolation),
+`smp` (multi-core execution domains), `dtb` (device-tree boot). `chip-bcm2712` provides all three and is
 today the only target that does, but a future MMU-but-single-core (or
 MPU-but-multi-core) target flips only the capabilities it has; no chip name
 appears in `src/kernel`.

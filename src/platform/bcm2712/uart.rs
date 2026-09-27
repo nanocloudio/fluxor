@@ -194,6 +194,7 @@ pub static mut DEBUG_SINK: Bcm2712UartSink = Bcm2712UartSink;
 /// Drain queued log bytes to the UART. MUST only be called from core 0.
 #[inline]
 pub fn debug_drain_poll_core0() {
+    super::exception::report_core_faults();
     // SAFETY: SPSC consumer on log_ring; only called from core 0 in
     // the main loop or during boot before secondary cores wake.
     unsafe {

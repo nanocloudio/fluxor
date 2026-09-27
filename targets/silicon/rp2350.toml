@@ -225,10 +225,11 @@ state_arena_kb = 240
 buffer_arena_kb = 64
 config_buffer_kb = 16
 config_arena_kb = 16
-# Early-boot log ring. Sized to cover boot until log_net is up; the
-# host-class 64 KiB ring is an eighth of this die's 512 KiB and does
-# not fit beside the state and buffer arenas.
-log_ring_kb = 4
+# Early-boot log ring: sized to hold a whole boot until a reader arrives —
+# the USB console opened after enumeration replays it from the oldest line,
+# so a rig reads this image's boot, not a tail of it. The host-class 64 KiB
+# ring does not fit beside the state and buffer arenas.
+log_ring_kb = 8
 # Ceiling on the kernel image's static RAM (.data + .bss + .uninit)
 # out of the linker's 512 KiB RAM region. What is left over is the
 # stack, which grows down from the top of that region and which every
@@ -252,6 +253,42 @@ overclock_sys_hz = 240000000
 usb_hz = 48000000
 flash_erase_block_size = "0x80000000"
 flash_erase_cmd = "0x00"
+
+[isolation]
+# What the kernel implements here (`kernel-mpu`). A gated module runs
+# unprivileged on its own stack, in one private region (stack, state, heap)
+# the planner shapes for this MPU. `isolated` adds a region over only its own
+# code and one over the gateway block; `contained` gives it all of flash to
+# read and execute instead, which keeps the kernel's memory out of reach at
+# the cost of its code being readable by other modules — and draws a module
+# whose code is too large for its region model at page alignment.
+levels = ["contained", "isolated"]
+region_model = "pmsav8"
+# Regions per core in the Secure MPU; the kernel reads MPU_TYPE at boot and
+# refuses isolation if the die disagrees.
+regions = 8
+stack_bound = "limit-register"
+device_windows = true
+# The peripheral blocks a gated driver may be granted as its `device_window`,
+# by name: an allowlist, default deny. A block is listed only when no kernel driver
+# touches it (UART, SPI and I2C are kernel buses; TIMER carries the step
+# guard; WATCHDOG, RESETS, CLOCKS and the PLLs are the kernel's) and it
+# cannot master the bus (DMA, PIO and USB can reach any address). Each block
+# includes its atomic set/clear/xor aliases.
+# ACCESSCTRL, the second layer under the MPU: at boot every peripheral's
+# register (`first`..=`last`) is made Secure-privileged only, and a block's
+# unprivileged bit is set again only while a gated module holds it as its
+# device window (`gate`, the block's ACCESSCTRL register offset). An MPU
+# mistake then still cannot reach a peripheral. SRAM, ROM and XIP stay open:
+# a gated module runs and keeps its memory there, behind the MPU.
+peripheral_gate = { base = "0x40060000", first = "0x48", last = "0xe0" }
+device_ranges = [
+    { name = "sysinfo", base = "0x40000000", size = "0x8000", gate = "0x60" },
+    { name = "adc", base = "0x400a0000", size = "0x8000", gate = "0x7c" },
+    { name = "pwm", base = "0x400a8000", size = "0x8000", gate = "0x8c" },
+]
+# A basic exception frame and its alignment pad on the module's stack.
+exception_frame_bytes = 36
 
 [kernel.bootsel]
 qspi_ss_bit = 27

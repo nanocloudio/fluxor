@@ -619,6 +619,8 @@ pub extern "C" fn module_state_size() -> u32 {
     core::mem::size_of::<QuicState>() as u32
 }
 
+declare_module_arena_bytes!(65536);
+
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 pub extern "C" fn module_arena_size() -> u32 {
     65536

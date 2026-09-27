@@ -1248,6 +1248,11 @@ pub struct Manifest {
     /// the module has not declared. Carried in the binary as flag bit 6 plus a
     /// 2-byte block, inside the signed envelope.
     pub stack_bytes_64: u16,
+    /// The heap arena the module asks for, in bytes; 0 for none. Filled by
+    /// `pack` from the `FLUXOR_MODULE_ARENA_BYTES` static the SDK's
+    /// `declare_module_arena_bytes!` emits, so the loader sizes the arena
+    /// without calling module code.
+    pub arena_bytes: u32,
     pub ports: Vec<PortSpec>,
     pub resources: Vec<ResourceClaim>,
     pub permissions: ManifestPermissions,
@@ -1402,6 +1407,7 @@ impl Default for Manifest {
             hardware_targets: 0x01, // RP2350 by default
             state_bytes_64: 0,
             stack_bytes_64: 0,
+            arena_bytes: 0,
             ports: Vec::new(),
             resources: Vec::new(),
             permissions: ManifestPermissions::default(),
@@ -2542,6 +2548,7 @@ impl Manifest {
             hardware_targets,
             state_bytes_64,
             stack_bytes_64: 0, // set by pack from the built artefact
+            arena_bytes: 0,    // likewise
             ports,
             resources,
             permissions,
@@ -2591,6 +2598,9 @@ impl Manifest {
         // Stack block (flag bit 6): 2 bytes, `stack_bytes_64` LE, directly
         // after the port-capacity section and so inside the signed envelope.
         let has_stack = self.stack_bytes_64 != 0;
+        // Arena block (flag bit 7): 4 bytes, `arena_bytes` LE, after the stack
+        // block and inside the signed envelope.
+        let has_arena = self.arena_bytes != 0;
         let var_size = self.ports.len() * 4
             + self.resources.len() * 4
             + self.dependencies.len() * 8
@@ -2600,6 +2610,7 @@ impl Manifest {
                 0
             }
             + if has_stack { 2 } else { 0 }
+            + if has_arena { 4 } else { 0 }
             + if has_integrity { 32 } else { 0 }
             + if has_signature {
                 SIGNATURE_BLOCK_SIZE
@@ -2646,14 +2657,15 @@ impl Manifest {
         //          bit 4 = ABI-surface attestation block present.
         //          bit 5 = port-capacity block present.
         //          bit 6 = stack block present.
-        //          bit 7: reserved (0).
+        //          bit 7 = arena block present.
         let flags = (if has_integrity { 1 } else { 0 })
             | (if has_signature { 2 } else { 0 })
             | (if self.isr_safe { 4 } else { 0 })
             | (if self.pre_tick_drain { 8 } else { 0 })
             | (if has_abi_surface { 0x10 } else { 0 })
             | (if has_port_capacity { 0x20 } else { 0 })
-            | (if has_stack { 0x40 } else { 0 });
+            | (if has_stack { 0x40 } else { 0 })
+            | (if has_arena { 0x80 } else { 0 });
         buf.push(flags);
         // byte 15: fine-grained permissions bitmap (see `permission::*`).
         // The kernel reads this byte directly at module instantiation.
@@ -2700,6 +2712,11 @@ impl Manifest {
         // Stack block (flag bit 6).
         if has_stack {
             buf.extend_from_slice(&self.stack_bytes_64.to_le_bytes());
+        }
+
+        // Arena block (flag bit 7).
+        if has_arena {
+            buf.extend_from_slice(&self.arena_bytes.to_le_bytes());
         }
 
         // Integrity hash (32 bytes)
@@ -2771,6 +2788,7 @@ impl Manifest {
             + dependency_count * 8
             + if has_port_capacity { port_count * 8 } else { 0 }
             + if has_stack { 2 } else { 0 }
+            + if flags & 0x80 != 0 { 4 } else { 0 }
             + if has_integrity { 32 } else { 0 }
             + if has_signature {
                 SIGNATURE_BLOCK_SIZE
@@ -2866,6 +2884,20 @@ impl Manifest {
             0
         };
 
+        // Arena block (flag bit 7).
+        let arena_bytes = if flags & 0x80 != 0 {
+            let v = u32::from_le_bytes([
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+            ]);
+            offset += 4;
+            v
+        } else {
+            0
+        };
+
         let integrity_hash = if has_integrity {
             let mut hash = [0u8; 32];
             hash.copy_from_slice(&data[offset..offset + 32]);
@@ -2900,6 +2932,7 @@ impl Manifest {
             hardware_targets,
             state_bytes_64,
             stack_bytes_64,
+            arena_bytes,
             ports,
             resources,
             permissions: ManifestPermissions {
@@ -2969,6 +3002,9 @@ impl Manifest {
                 self.stack_bytes_64 as usize * 64,
                 self.stack_bytes_64
             ));
+        }
+        if self.arena_bytes > 0 {
+            lines.push(format!("  arena: {} bytes", self.arena_bytes));
         }
         if !self.ports.is_empty() {
             lines.push("  ports:".into());

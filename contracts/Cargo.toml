@@ -10,10 +10,14 @@ name = "fluxor_contracts"
 path = "src/lib.rs"
 
 [features]
-default = []
+default = ["alloc"]
+# The types that own heap memory: the storage fence witness and the decoded
+# owner-log records. Off for a consumer with no allocator (an RP kernel,
+# which needs only the isolation planner and the vocabulary).
+alloc = []
 # Derive serde::{Serialize, Deserialize} on every public type. Off by
 # default so embedded consumers don't pull in serde.
-serde = ["dep:serde"]
+serde = ["dep:serde", "alloc"]
 
 [dependencies]
 serde = { version = "1.0.228", default-features = false, features = ["derive", "alloc"], optional = true }

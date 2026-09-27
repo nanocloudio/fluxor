@@ -184,10 +184,11 @@ state_arena_kb = 64
 buffer_arena_kb = 16
 config_buffer_kb = 8
 config_arena_kb = 8
-# Early-boot log ring. Sized to cover boot until log_net is up; the
-# host-class 64 KiB ring is a quarter of this die's SRAM and does not
-# fit beside the state and buffer arenas.
-log_ring_kb = 4
+# Early-boot log ring: sized to hold a whole boot until a reader arrives —
+# the USB console opened after enumeration replays it from the oldest line,
+# so a rig reads this image's boot, not a tail of it. The host-class 64 KiB
+# ring does not fit beside the state and buffer arenas.
+log_ring_kb = 8
 # Ceiling on the kernel image's static RAM (.data + .bss + .uninit)
 # out of the linker's 256 KiB RAM region. What is left over is the
 # stack, which grows down from the top of that region and which every
@@ -209,6 +210,37 @@ usb_hz = 48000000
 flash_erase_block_size = "0x1000"
 flash_erase_cmd = "0x20"
 
+[isolation]
+# What the kernel implements here (`kernel-mpu`). A gated module runs
+# unprivileged on its own stack, in one private region (stack, state, heap)
+# the planner shapes for this MPU. `isolated` adds a region over only its own
+# code and one over the gateway block; `contained` gives it all of flash to
+# read and execute instead, which keeps the kernel's memory out of reach at
+# the cost of its code being readable by other modules — and draws a module
+# whose code is too large for its region model at page alignment.
+levels = ["contained", "isolated"]
+region_model = "pmsav7"
+regions = 8
+# ARMv6-M has no stack-limit register. The stack sits at the bottom of the
+# private region, so an overrun runs off the region and faults; on silicon it
+# is taken as a HardFault and contained as a module fault (rig
+# `picow_iso_stack`). Should a core ever lock up instead, the liveness
+# watchdog returns the board to BOOTSEL.
+stack_bound = "guard-region"
+device_windows = true
+# The peripheral blocks a gated driver may be granted as its `device_window`,
+# by name: an allowlist, default deny. A block is listed only when no kernel driver
+# touches it (UART, SPI and I2C are kernel buses; TIMER carries the step
+# guard; WATCHDOG, RESETS, CLOCKS and the PLLs are the kernel's) and it
+# cannot master the bus (DMA, PIO and USB can reach any address). Each block
+# includes its atomic set/clear/xor aliases.
+device_ranges = [
+    { name = "sysinfo", base = "0x40000000", size = "0x4000" },
+    { name = "adc", base = "0x4004c000", size = "0x4000" },
+    { name = "pwm", base = "0x40050000", size = "0x4000" },
+]
+exception_frame_bytes = 36
+
 [kernel.bootsel]
 qspi_ss_bit = 1
 flash_release_addr = "0x18000008"
@@ -219,6 +251,27 @@ ctrl_addr = "0x4001800C"
 ctrl_value = "0x2005"
 status_addr = "0x40018008"
 gpio_hi_addr = "0xD0000008"
+
+# The chip's unique ID. RP2040 has none in silicon: the ID is the flash
+# device's own (the Winbond RUID command, 0x4B then four dummy bytes, then
+# eight ID bytes), read over XIP_SSI with flash out of XIP and chip select
+# forced through QSPI_SS's OUTOVER field. It is the serial the bootrom's
+# PICOBOOT reports and the one picotool matches, so the running image must
+# present the same string or picotool cannot find the board again after a
+# forced reboot. RP2350 reads its ID from the ROM and has no such section.
+[kernel.flash_unique_id]
+ssi_dr0_addr = "0x18000060"
+ssi_sr_addr = "0x18000028"
+# SSI SR.RFNE: the receive FIFO holds a byte.
+ssi_sr_rfne_bit = 3
+# IO_QSPI GPIO_QSPI_SS_CTRL (the pin BOOTSEL is sampled on) and its OUTOVER
+# field, bits 9:8: 2 drives the pin low, 3 high, 0 returns it to the SSI.
+ss_ctrl_addr = "0x4001800C"
+ss_outover_mask = "0x300"
+ss_outover_low = "0x200"
+ss_outover_high = "0x300"
+cmd = "0x4B"
+dummy_bytes = 4
 
 # Timer ownership ledger. See rp2350.toml for the shape.
 # RP2040 has one timer instance, so the external driver's alarm and this

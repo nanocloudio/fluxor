@@ -333,6 +333,8 @@ mod bootsel {
     /// argument shape — calling one form on the other passes the wrong
     /// arguments to a real function pointer.
     pub fn enter_bootsel(disable_msd: bool) -> Result<core::convert::Infallible, BootselError> {
+        // A deliberate reboot is not a wedge.
+        crate::platform::rp_watchdog::disarm();
         let interface_flags = if disable_msd {
             bootsel_flags::DISABLE_MSD
         } else {
@@ -389,6 +391,8 @@ mod bootsel {
     /// there the watchdog is armed with every block selected for reset and
     /// triggered — the SDK's `watchdog_reboot(0, 0, ..)`.
     pub fn reboot_to_flash() -> Result<core::convert::Infallible, BootselError> {
+        // A deliberate reboot is not a wedge.
+        crate::platform::rp_watchdog::disarm();
         #[cfg(feature = "chip-rp2040")]
         {
             use crate::platform::chip::{PSM_WDSEL, PSM_WDSEL_MASK, WATCHDOG_CTRL};
@@ -436,12 +440,14 @@ mod bootsel {
     /// after the package word of `SYS_INFO_CHIP_INFO`, most significant
     /// first — so the two strings are equal.
     ///
-    /// `None` on RP2040, whose ID lives in the flash device and needs the
-    /// flash's own RUID command rather than a ROM call.
+    /// RP2040 has no ID in silicon: there it is the flash device's RUID,
+    /// which is also what its PICOBOOT reports, read by a flash command
+    /// rather than a ROM call — so call this once at boot, before the device
+    /// stack and anything else that reads flash.
     pub fn unique_id() -> Option<u64> {
         #[cfg(feature = "chip-rp2040")]
         {
-            None
+            crate::platform::rp_flash::unique_id::read()
         }
         #[cfg(not(feature = "chip-rp2040"))]
         {

@@ -342,3 +342,39 @@ unsafe fn dev_pcie1_msi_alloc_vector(
     let data = u32::from_le_bytes([*bp.add(16), *bp.add(17), *bp.add(18), *bp.add(19)]);
     Some((vec, addr, data))
 }
+
+/// The device window the graph granted this module (config tag 0xFD), as
+/// `(base, size)`: the one peripheral block a gated driver may reach
+/// directly. Read from the params blob `module_new` receives; `None` when
+/// the graph granted none.
+///
+/// # Safety
+/// `params` must be valid for reads of `len` bytes (or null).
+#[inline(never)]
+unsafe fn device_window(params: *const u8, len: usize) -> Option<(u64, u32)> {
+    if params.is_null() || len < 4 || *params != 0xFE {
+        return None;
+    }
+    let mut pos = 4;
+    while pos + 2 <= len {
+        let tag = *params.add(pos);
+        let n = *params.add(pos + 1) as usize;
+        pos += 2;
+        if tag == 0xFF || pos + n > len {
+            return None;
+        }
+        if tag == 0xFD && n == 12 {
+            let mut base = 0u64;
+            for i in (0..8).rev() {
+                base = (base << 8) | *params.add(pos + i) as u64;
+            }
+            let mut size = 0u32;
+            for i in (0..4).rev() {
+                size = (size << 8) | *params.add(pos + 8 + i) as u32;
+            }
+            return Some((base, size));
+        }
+        pos += n;
+    }
+    None
+}

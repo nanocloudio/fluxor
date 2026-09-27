@@ -595,6 +595,7 @@ fn cmd_generate(
 /// budget is not enforced.
 fn check_state_budget(
     modules: &[modules::ModuleInfo],
+    config: &serde_json::Value,
     target: &crate::target::TargetDescriptor,
 ) -> Result<()> {
     if modules.is_empty() {
@@ -604,8 +605,26 @@ fn check_state_budget(
     let mut total = 0u64;
     let mut unknown: Vec<&str> = Vec::new();
     let mut rows: Vec<(String, u64)> = Vec::new();
+    // A gated module on an MPU target takes its whole private region — its
+    // stack, state and heap as one allocation the planner shapes — from the
+    // state arena, so that is what it is charged.
+    let mpu = target.isolation.planner_model()
+        .filter(|m| !matches!(m, fluxor_contracts::isolation::RegionModel::Pages));
+    let levels = module_levels(config, target);
+    let default = graph_default_level(config, target);
     for m in modules {
-        let bytes = m.manifest.state_bytes_64 as u64 * 64;
+        let state = m.manifest.state_bytes_64 as u64 * 64;
+        let gated = levels.get(&m.name).copied().unwrap_or(default).is_gated();
+        let bytes = match mpu {
+            Some(model) if gated && state != 0 => crate::protection::private_region_bytes(
+                m.manifest.stack_bytes_64 as u64 * 64,
+                state,
+                m.manifest.arena_bytes as u64,
+                target.isolation.exception_frame_bytes as u64,
+                model,
+            ),
+            _ => state,
+        };
         if bytes == 0 {
             unknown.push(m.name.as_str());
         } else {
@@ -668,45 +687,46 @@ fn check_state_budget(
 /// Admit each module's stack depth against the stack it will run on.
 ///
 /// Every `.fmod` carries the worst-case depth its build measured from the call
-/// graph (or its author declared where the graph has no bound). Without an MMU
-/// every module steps in turn on the kernel stack, so the DEEPEST module —
-/// a maximum, not a sum — must fit what the target leaves for a module
-/// (`TargetDescriptor::module_stack_limit`); a module with no figure is
-/// refused there, since the stack is unguarded on rp2040 and shared on both
-/// RP parts. With an MMU only an isolated module has a fixed stack, and each
-/// is admitted against it.
+/// graph (or its author declared where the graph has no bound). A module steps
+/// on the kernel stack unless it is isolated on an MMU target, which gives it
+/// its own; the kernel stack is shared one module at a time, so the DEEPEST
+/// module on it — a maximum, not a sum — must fit what the kernel leaves
+/// (`TargetDescriptor::module_stack_limit`). A module with no figure is
+/// refused on a target without an MMU, where nothing traps an overrun.
 fn check_stack_budget(
     modules: &[modules::ModuleInfo],
     config: &serde_json::Value,
     target: &crate::target::TargetDescriptor,
 ) -> Result<()> {
-    let Some((limit, what)) = target.module_stack_limit() else {
-        return Ok(());
-    };
-    let admitted: Vec<&modules::ModuleInfo> = if target.has_mmu {
-        let isolated = isolated_module_types(config);
-        modules
-            .iter()
-            .filter(|m| isolated.contains(&m.name))
-            .collect()
-    } else {
-        modules.iter().collect()
-    };
-    if admitted.is_empty() {
+    let levels = module_levels(config, target);
+    let mut rows: Vec<(&str, u64, u64, &'static str)> = Vec::new();
+    for m in modules {
+        let level = levels
+            .get(&m.name)
+            .copied()
+            .unwrap_or_else(|| graph_default_level(config, target));
+        let Some((limit, what)) = target.module_stack_limit(level) else {
+            continue;
+        };
+        rows.push((m.name.as_str(), m.manifest.stack_bytes_64 as u64 * 64, limit, what));
+    }
+    if rows.is_empty() {
         return Ok(());
     }
-
-    let mut rows: Vec<(&str, u64)> = admitted
-        .iter()
-        .map(|m| (m.name.as_str(), m.manifest.stack_bytes_64 as u64 * 64))
-        .collect();
     rows.sort_by(|a, b| b.1.cmp(&a.1));
-    println!("Module stack ({}): {limit} B, {what}", target.id);
-    for (name, bytes) in &rows {
-        if *bytes == 0 {
-            println!("  {name:<20} unknown");
-        } else {
-            println!("  {name:<20} {bytes:>9}");
+
+    let mut stacks: Vec<(u64, &'static str)> = rows.iter().map(|r| (r.2, r.3)).collect();
+    stacks.sort();
+    stacks.dedup();
+    for (limit, what) in &stacks {
+        println!("Module stack ({}): {limit} B, {what}", target.id);
+        for (name, bytes, l, _) in rows.iter().filter(|r| r.2 == *limit) {
+            let _ = l;
+            if *bytes == 0 {
+                println!("  {name:<20} unknown");
+            } else {
+                println!("  {name:<20} {bytes:>9}");
+            }
         }
     }
 
@@ -722,12 +742,12 @@ fn check_stack_budget(
     }
     let over: Vec<String> = rows
         .iter()
-        .filter(|r| r.1 > limit)
-        .map(|(name, bytes)| format!("{name} ({bytes} B)"))
+        .filter(|r| r.1 > r.2)
+        .map(|(name, bytes, limit, what)| format!("{name} ({bytes} B > {what}, {limit} B)"))
         .collect();
     if !over.is_empty() {
         return Err(Error::Config(format!(
-            "{} go(es) deeper than {what} on {}, {limit} B. Shorten the path \
+            "{} go(es) deeper than the stack it runs on on {}. Shorten the path \
              (`fluxor modules build -v` names it) or run the module where the stack \
              is larger.",
             over.join(", "),
@@ -737,44 +757,108 @@ fn check_stack_budget(
     Ok(())
 }
 
-/// The module types a graph runs under `protection: isolated` — named
-/// explicitly, implied by a community or unsigned `trust_tier`, or set for the
-/// whole graph.
-fn isolated_module_types(config: &serde_json::Value) -> std::collections::BTreeSet<String> {
-    let whole = config
-        .get("protection")
-        .or_else(|| config.get("graph").and_then(|g| g.get("protection")))
-        .and_then(|v| v.as_str())
-        == Some("isolated");
-    let entries: Vec<(String, &serde_json::Value)> = match config.get("modules") {
-        Some(serde_json::Value::Array(list)) => list
-            .iter()
-            .filter_map(|m| {
-                let name = m.as_str().or_else(|| m.get("name").and_then(|n| n.as_str()))?;
-                let ty = m.get("type").and_then(|t| t.as_str()).unwrap_or(name);
-                Some((ty.to_string(), m))
-            })
-            .collect(),
-        Some(serde_json::Value::Object(map)) => map
-            .iter()
-            .map(|(name, m)| {
-                let ty = m.get("type").and_then(|t| t.as_str()).unwrap_or(name);
-                (ty.to_string(), m)
-            })
-            .collect(),
-        _ => Vec::new(),
-    };
-    entries
-        .into_iter()
-        .filter(|(_, m)| {
-            let tier = m.get("trust_tier").and_then(|v| v.as_str()).unwrap_or("platform");
-            match m.get("protection").and_then(|v| v.as_str()) {
-                Some(p) => p == "isolated",
-                None => whole || tier == "community" || tier == "unsigned",
-            }
+/// Admit the graph's gated modules (`contained`, `isolated`) against what the
+/// target and the gateway can give them, and print the level every gated
+/// module gets.
+///
+/// Refused: more isolated modules than the target has slots for; a gated
+/// module holding any permission that reaches past the gateway (raw
+/// peripherals, DMA, flash, graph reconfiguration, the fault monitor,
+/// cross-domain dispatch, PCIe, USB host, backing providers); a gated module
+/// that provides a contract, whose other modules' calls would run its code
+/// privileged.
+fn check_gated_admission(
+    modules: &[modules::ModuleInfo],
+    config: &serde_json::Value,
+    target: &crate::target::TargetDescriptor,
+) -> Result<()> {
+    let levels = module_levels(config, target);
+    let default = graph_default_level(config, target);
+    let gated: Vec<(&modules::ModuleInfo, crate::protection::Level)> = modules
+        .iter()
+        .map(|m| (m, levels.get(&m.name).copied().unwrap_or(default)))
+        .filter(|(_, l)| l.is_gated())
+        .collect();
+    if gated.is_empty() {
+        return Ok(());
+    }
+    println!("Protection ({}):", target.id);
+    let mpu = target.isolation.planner_model()
+        .filter(|m| !matches!(m, fluxor_contracts::isolation::RegionModel::Pages));
+    for (m, l) in &gated {
+        match mpu {
+            Some(model) => println!(
+                "  {:<20} {:<9} private region {} B",
+                m.name,
+                l.name(),
+                crate::protection::private_region_bytes(
+                    m.manifest.stack_bytes_64 as u64 * 64,
+                    m.manifest.state_bytes_64 as u64 * 64,
+                    m.manifest.arena_bytes as u64,
+                    target.isolation.exception_frame_bytes as u64,
+                    model,
+                ),
+            ),
+            None => println!("  {:<20} {}", m.name, l.name()),
+        }
+    }
+
+    let entries: Vec<crate::protection::Gated<'_>> = gated
+        .iter()
+        .map(|(m, l)| crate::protection::Gated {
+            name: m.name.as_str(),
+            level: *l,
+            permissions: m.manifest.permissions.bits,
+            provides: &m.manifest.provides,
+            code: m.code_size() as u64,
         })
-        .map(|(ty, _)| ty)
-        .collect()
+        .collect();
+    let model = target.isolation.planner_model();
+    let refusals = crate::protection::gated_refusals(
+        &entries,
+        target.isolation.isolated_slots,
+        &target.id,
+        model,
+    );
+    if refusals.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::Config(format!(
+            "gated admission on {}: {}",
+            target.id,
+            refusals.join("; ")
+        )))
+    }
+}
+
+/// The protection level each module type in the graph is given on `target`
+/// (the strongest over its instances). A module the resolver refuses is left
+/// out; the validator reports it.
+fn module_levels(
+    config: &serde_json::Value,
+    target: &crate::target::TargetDescriptor,
+) -> std::collections::BTreeMap<String, crate::protection::Level> {
+    let mut out = std::collections::BTreeMap::new();
+    for (ty, m) in crate::protection::module_entries(config) {
+        if let Ok(r) = crate::protection::resolve(m, config, &target.isolation.levels) {
+            let e = out.entry(ty).or_insert(r.provided);
+            if r.provided > *e {
+                *e = r.provided;
+            }
+        }
+    }
+    out
+}
+
+/// The level a module the graph does not list (one a stack inserts) is given:
+/// the graph's own defaults.
+fn graph_default_level(
+    config: &serde_json::Value,
+    target: &crate::target::TargetDescriptor,
+) -> crate::protection::Level {
+    crate::protection::resolve(&serde_json::json!({}), config, &target.isolation.levels)
+        .map(|r| r.provided)
+        .unwrap_or(crate::protection::Level::None)
 }
 
 fn cmd_combine(
@@ -937,8 +1021,9 @@ fn cmd_combine(
         &crate::project::root_for_config(config_path),
     )?;
 
-    check_state_budget(&modules, &target_desc)?;
+    check_state_budget(&modules, &config, &target_desc)?;
     check_stack_budget(&modules, &config, &target_desc)?;
+    check_gated_admission(&modules, &config, &target_desc)?;
 
     let modules_data = if !modules.is_empty() {
         if verbose {
@@ -1235,8 +1320,9 @@ fn build_packaged_blobs(
         project_root,
     )?;
 
-    check_state_budget(&modules, target_desc)?;
+    check_state_budget(&modules, config, target_desc)?;
     check_stack_budget(&modules, config, target_desc)?;
+    check_gated_admission(&modules, config, target_desc)?;
 
     let modules_data = if !modules.is_empty() {
         if verbose {

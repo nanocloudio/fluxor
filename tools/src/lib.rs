@@ -71,6 +71,7 @@ pub mod content_render;
 pub mod presentation_resolver;
 pub mod presentation_shell;
 pub mod project;
+pub mod protection;
 pub mod publish;
 pub mod render_template;
 // The consolidated store flow: `store_publish` (the single store-write

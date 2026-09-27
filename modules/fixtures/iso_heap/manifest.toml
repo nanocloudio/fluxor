@@ -1,11 +1,8 @@
 version = "1.0.0"
-hardware_targets = ["bcm2712"]
+hardware_targets = ["bcm2712", "rp2350", "rp2040"]
 
-# EL0 isolated heap module — proves the SVC #1 heap-mediation slice
-# (heap_alloc / heap_free) end to end. Runs at EL0 under its own page table
-# when wired with `protection: isolated`, allocating from / freeing to its
-# OWN per-module heap via mediated syscalls, with no access to kernel memory.
-# Exercises a rejected invalid free (a non-heap pointer) to prove the gateway
-# fails closed. REQUIRES `protection: isolated` (run non-isolated, its
-# `svc #1` has no EL1 handler). Diagnostic/demonstration — not loaded by
-# production configs.
+# Isolated heap module — proves a gated module's heap end to end: it
+# allocates from and frees to its OWN per-module arena through the gateway,
+# and hands the gateway a pointer it does not own, which must be refused
+# without disturbing the allocator. An ordinary SDK module, so it runs gated
+# or not; gated is the point. Diagnostic — not loaded by production configs.

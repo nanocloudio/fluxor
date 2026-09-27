@@ -106,8 +106,7 @@ global_asm!(
     ".balign 128",
     "b fluxor_el0_lower_sync_vec", // Synchronous
     ".balign 128",
-    "mov w17, #10",
-    "b fluxor_el1_catch", // IRQ (lower EL)
+    "b fluxor_el0_lower_irq_vec", // IRQ (lower EL): an interrupt taken at EL0
     ".balign 128",
     "mov w17, #11",
     "b fluxor_el1_catch", // FIQ (lower EL)
@@ -181,6 +180,42 @@ pub static CORE_FAULT_ELR: [AtomicU64; 4] = [
     AtomicU64::new(0),
 ];
 
+/// Fault counts `report_core_faults` has already logged, per core.
+static CORE_FAULT_REPORTED: [AtomicU32; 4] = [
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+];
+
+/// Log each secondary core's newly latched fault, once, from core 0 — the
+/// core that owns the log drain, so the line reaches the network log even
+/// though the faulting core has stopped. A fault whose address lies in a
+/// kernel stack guard page is named as the stack overflow it is.
+pub fn report_core_faults() {
+    for c in 1..4 {
+        let n = CORE_FAULT_COUNT[c].load(Ordering::Relaxed);
+        if n == CORE_FAULT_REPORTED[c].load(Ordering::Relaxed) {
+            continue;
+        }
+        CORE_FAULT_REPORTED[c].store(n, Ordering::Relaxed);
+        let far = CORE_FAULT_FAR[c].load(Ordering::Relaxed);
+        let kind = match fluxor::platform::multicore::stack_guard_core(far) {
+            Some(_) => "kernel-stack-overflow",
+            None => "kernel",
+        };
+        log::error!(
+            "[fault] core={} kind={} far=0x{:x} esr=0x{:x} elr=0x{:x} spsr=0x{:x}",
+            c,
+            kind,
+            far,
+            CORE_FAULT_ESR[c].load(Ordering::Relaxed),
+            CORE_FAULT_ELR[c].load(Ordering::Relaxed),
+            CORE_FAULT_SPSR[c].load(Ordering::Relaxed),
+        );
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn exception_dump(elr: u64, esr: u64, far: u64) {
     // Latch the fault per-core BEFORE the recursion guard so a sibling core
@@ -225,6 +260,11 @@ pub unsafe extern "C" fn exception_dump(elr: u64, esr: u64, far: u64) {
     uart_raw_puts(b"\r\n  FAR=0x");
     exception_dump_hex64(far);
     uart_raw_puts(b"\r\n");
+    if let Some(core) = fluxor::platform::multicore::stack_guard_core(far) {
+        uart_raw_puts(b"  kernel stack overflow: guard page of core ");
+        exception_dump_hex64(core as u64);
+        uart_raw_puts(b"\r\n");
+    }
     // Recent log tail — helps correlate the fault with whatever the
     // system logged right before it. `read_tail` does not advance
     // the SPSC tail pointer, so a concurrent drain (if any remains)

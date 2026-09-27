@@ -22,6 +22,7 @@ How the system works. These are the authoritative references.
 
 - [architecture/pipeline.md](architecture/pipeline.md) — graph runner, channels, FIFO and mailbox IPC, burst stepping, capacity profiles
 - [architecture/module_architecture.md](architecture/module_architecture.md) — module lifecycle, step contract, fault recovery, drain protocol
+- [architecture/module_isolation.md](architecture/module_isolation.md) — protection levels, the gateway, MPU/MMU backends, device windows
 - [architecture/scheduler.md](architecture/scheduler.md) — execution tiers, ISR-tier admission and I/O contract, domain loops
 - [architecture/concurrency.md](architecture/concurrency.md) — what is shared, what is domain-local, and why it is safe
 - [architecture/timing.md](architecture/timing.md) — stream clock vs wall clock, StreamTime, producer scheduling

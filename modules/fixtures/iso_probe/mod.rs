@@ -1,46 +1,33 @@
-//! EL0 isolation probe — a purpose-built PIC module for the Pi 5
-//! module-isolation walking skeleton (`protection: isolated`).
+//! Isolation probe — a purpose-built PIC module that runs gated
+//! (`protection: isolated`, or `contained`) and demonstrates, one `mode` at a
+//! time, that the boundary behaves as designed:
 //!
-//! The probe runs **at EL0 under its own page table** and demonstrates, one
-//! `mode` at a time, that the hardware boundary behaves as designed:
+//! | mode | name            | expected result                                          |
+//! |------|-----------------|----------------------------------------------------------|
+//! | 0    | `self_rw`       | reads+writes its own state, returns Continue             |
+//! | 1    | `write_gateway` | writes the kernel's gateway table (read-only) → abort     |
+//! | 2    | `oob_read`      | reads far outside its own memory → abort                  |
+//! | 3    | `exec_state`    | jumps into its (execute-never) state → instruction abort  |
+//! | 4    | `write_code`    | writes its own (read-only) code → permission abort        |
+//! | 5    | `done`          | returns Done (clean round-trip)                           |
+//! | 6    | `bad_channel`   | reads a channel it does not own → the gateway's EACCES    |
+//! | 7    | `spin`          | never returns → forced out at its step deadline           |
+//! | 8    | `bad_pointer`   | hands the gateway memory it does not own → EFAULT          |
+//! | 9    | `overflow`      | recurses until its stack runs out → stack-bound fault     |
+//! | 10   | `write_kernel`  | writes kernel RAM just below its own memory → abort       |
+//! | 11   | `device_window` | reads its device window's first register and logs it,    |
+//! |      |                 | then reads the byte just past the window → abort          |
 //!
-//! | mode | name          | expected result on Pi 5                              |
-//! |------|---------------|-----------------------------------------------------|
-//! | 0    | `self_rw`     | reads+writes its own state, returns Continue (OK)   |
-//! | 1    | `kernel_read` | dereferences a kernel pointer → EL0 data abort      |
-//! | 2    | `oob_read`    | reads far outside its regions → EL0 data abort      |
-//! | 3    | `exec_state`  | jumps into its (XN) state buffer → instruction abort|
-//! | 4    | `write_code`  | writes its own (RO) code → permission abort         |
-//! | 5    | `done`        | returns Done (clean EL0 round-trip)                 |
-//! | 6    | `bad_channel` | `SVC #1` read on a FOREIGN handle → gateway EPERM (Continue) |
+//! It is an ordinary SDK module: it reaches the kernel through the
+//! `SyscallTable` it was given, which for a gated module is the gateway's —
+//! every entry a veneer that traps. Its `module_new` runs gated too, so the
+//! `[iso_probe] init` line is itself a gateway call.
 //!
-//! Mode 6 is the channel-authorization probe: each step it issues an `SVC #1`
-//! `channel_read` naming a handle it was never granted. The kernel gateway
-//! (`el0_syscall_dispatch` → `el0_chan_ok`) must reject it with `EPERM`
-//! (-1) WITHOUT touching channel state — proving an isolated module cannot
-//! reach unrelated graph edges. On the expected EPERM the probe returns
-//! Continue; if the call returns >= 0 the authorization failed (a breach) and
-//! the probe returns a hard error (-120).
-//!
-//! Note: mode 6 deliberately uses the SANCTIONED `SVC #1` gateway (legal at
-//! EL0 for an isolated module), NOT a direct `SyscallTable` call — the
-//! syscall-free constraint below applies to the EL1 kernel function pointers,
-//! which remain unmapped at EL0.
-//!
-//! Modes 1-4 are *expected* faults: the kernel's lower-EL abort handler
-//! turns each into a module protection fault (MON_FAULT + an `[el0]` log
-//! line carrying the EC/ESR/FAR), runs the configured Skip/Restart policy,
-//! and **leaves a healthy sibling module stepping** — never a core hang.
-//!
-//! ## EL0 / syscall constraint (walking skeleton)
-//!
-//! `module_step` MUST be syscall-free. Every `SyscallTable` entry is a
-//! direct EL1 kernel code pointer that is *not mapped* at EL0, so calling
-//! one would itself fault. The probe therefore touches only its own mapped
-//! regions and reports results through the **StepOutcome return value**
-//! (Continue / Done / Error) and through the faults it deliberately raises.
-//! `dev_log` is used only in `module_new`, which runs at EL1 during
-//! instantiation. EL0 code reaches no syscall gateway of its own.
+//! Modes 1-4 and 7 are expected faults: each becomes a module fault
+//! (MON_FAULT plus a kernel log line), the configured fault policy runs, and
+//! a healthy sibling keeps stepping. Modes 6 and 8 are refusals the module
+//! observes: on the expected errno it returns an error so a restart policy
+//! re-steps it; a success would mean the gateway served what it must not.
 
 #![no_std]
 #![allow(
@@ -77,12 +64,11 @@ include!("../../sdk/runtime/params.rs");
 
 #[repr(C)]
 struct IsoProbeState {
-    /// Kernel syscall table pointer. Stored at EL1 in `module_new`; in mode
-    /// `kernel_read` the probe dereferences it from EL0 to prove kernel
-    /// memory is unreachable.
+    /// The syscall table the kernel handed this module — for a gated module
+    /// the gateway's, in a kernel-owned page it may read but not write.
     syscalls: *const SyscallTable,
-    /// Input channel handle captured at `module_new` (EL1). Mode `bad_channel`
-    /// derives a deliberately-foreign handle from it for the authz probe.
+    /// Input channel handle captured at `module_new`. Mode `bad_channel`
+    /// derives a deliberately-foreign handle from it.
     in_chan: i32,
     /// Probe mode (see table above).
     mode: u8,
@@ -97,39 +83,21 @@ struct IsoProbeState {
     /// Scratch the probe reads OOB values into so the load can't be
     /// optimised away.
     sink: u64,
+    /// The device window the graph granted, (base, size); size 0 for none.
+    window_base: u64,
+    window_size: u32,
 }
+
+declare_module_state_bytes!(IsoProbeState);
+// The recursion in `overflow` has no bound the build can measure; this is
+// the stack every other mode needs, which `overflow` then runs past.
+declare_module_stack_bytes!(512);
 
 const SENTINEL_MAGIC: u32 = 0x5130_B0E0; // "iso probe"
 
-/// `SVC #1` gateway op selector for the `bad_channel` probe.
-const SYS_CHANNEL_READ: u64 = 0;
-
-/// Issue one `SVC #1` channel syscall (valid only at EL0, i.e. when this
-/// module is `protection: isolated`). Mirrors the gateway calling convention:
-/// `x0 = op`, `x1 = channel handle`, `x2 = buffer ptr`, `x3 = len` → result in
-/// `x0`. Used by mode `bad_channel` to probe the gateway's handle allowlist.
-///
-/// # Safety
-/// Only valid at EL0 under the isolated page table; `ptr`/`len` must lie in the
-/// module's own mapped region.
-#[cfg(target_arch = "aarch64")]
-unsafe fn svc1(op: u64, chan: i32, ptr: *mut u8, len: usize) -> i32 {
-    let result: i64;
-    core::arch::asm!(
-        "svc #1",
-        in("x0") op,
-        in("x1") chan as i64,
-        in("x2") ptr,
-        in("x3") len,
-        lateout("x0") result,
-        clobber_abi("C"),
-    );
-    result as i32
-}
-#[cfg(not(target_arch = "aarch64"))]
-unsafe fn svc1(_op: u64, _chan: i32, _ptr: *mut u8, _len: usize) -> i32 {
-    -1
-}
+/// The gateway's refusals, as the module sees them.
+const EACCES: i32 = -13;
+const EFAULT: i32 = -14;
 
 // ============================================================================
 // Parameter Definitions
@@ -145,7 +113,7 @@ mod params_def {
         IsoProbeState;
 
         1, mode, u8, 0,
-            enum { self_rw=0, kernel_read=1, oob_read=2, exec_state=3, write_code=4, done=5, bad_channel=6 }
+            enum { self_rw=0, write_gateway=1, oob_read=2, exec_state=3, write_code=4, done=5, bad_channel=6, spin=7, bad_pointer=8, overflow=9, write_kernel=10, device_window=11 }
             => |s, d, len| { s.mode = p_u8(d, len, 0, 0); };
 
         2, delay_steps, u16, 3
@@ -179,7 +147,7 @@ pub extern "C" fn module_new(
     state_size: usize,
     syscalls: *const c_void,
 ) -> i32 {
-    // Runs at EL1 during instantiation — `dev_log` is allowed here.
+    // Runs gated like `module_step`: `dev_log` below is a gateway call.
     unsafe {
         if syscalls.is_null() {
             return -2;
@@ -193,6 +161,9 @@ pub extern "C" fn module_new(
         s.step_count = 0;
         s.sentinel = 0;
         s.sink = 0;
+        let (wb, wz) = device_window(params, params_len).unwrap_or((0, 0));
+        s.window_base = wb;
+        s.window_size = wz;
 
         let is_tlv =
             !params.is_null() && params_len >= 4 && *params == 0xFE && *params.add(1) == 0x01;
@@ -202,12 +173,13 @@ pub extern "C" fn module_new(
             params_def::set_defaults(s);
         }
 
-        dev_log(
-            &*s.syscalls,
-            3, // INFO
-            b"[iso_probe] init\0".as_ptr(),
-            16,
-        );
+        // The mode in the line, so a rig reading the console knows this
+        // image's probe from the previous one's.
+        let mut line = *b"[iso_probe] init mode=00";
+        let n = line.len();
+        line[n - 2] = b'0' + (s.mode / 10) % 10;
+        line[n - 1] = b'0' + s.mode % 10;
+        dev_log(&*s.syscalls, 3, line.as_ptr(), line.len());
         0 // Ready
     }
 }
@@ -215,9 +187,7 @@ pub extern "C" fn module_new(
 #[no_mangle]
 #[link_section = ".text.module_step"]
 pub extern "C" fn module_step(state: *mut u8) -> i32 {
-    // Runs at EL0 under the module's page table when `protection: isolated`.
-    // SYSCALL-FREE — see the module header. Reports via the return value
-    // and via deliberately-raised faults.
+    // Reports via the return value and via deliberately-raised faults.
     unsafe {
         let s = &mut *(state as *mut IsoProbeState);
         s.step_count += 1;
@@ -244,13 +214,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     -101
                 }
             }
-            // Dereference a kernel pointer → EL0 data abort (kernel memory
-            // is not mapped in the module's page table).
+            // Write the kernel's gateway table: kernel-owned, mapped
+            // read-only so the module can call through it → permission abort.
             1 => {
-                let kptr = s.syscalls as *const u64;
-                s.sink = core::ptr::read_volatile(kptr);
-                // Reaching here means isolation FAILED (kernel memory was
-                // readable). Signal a hard error so the test flags it.
+                let table = s.syscalls as *mut u32;
+                core::ptr::write_volatile(table, 0);
+                // Reaching here means the kernel's page was writable.
                 -110
             }
             // Read far outside any mapped region (stands in for a neighbour
@@ -276,39 +245,107 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             // Clean finish — proves the full EL0→SVC→EL1 round-trip with a
             // terminal outcome.
             5 => 1, // Done
-            // Channel authorization: issue an SVC #1 channel_read naming a
-            // FOREIGN handle (one this module was never granted). The gateway
-            // must reject it with EPERM (-1) before touching channel state. A
-            // non-negative result means the read was serviced on an edge we
-            // don't own → authorization breach → hard error.
+            // Channel authority: read a handle this module was never given.
+            // The gateway must refuse it (EACCES) before touching any channel.
+            // The buffer is its own state, so only the handle can be refused.
             6 => {
-                // DENIED path: read a handle guaranteed NOT in our [in,out,ctrl]
-                // allowlist. `+1000` lands outside any real handle; the gateway
-                // rejects by allowlist membership regardless of whether it names
-                // a real channel. Buffer is our own state, so only the handle
-                // check (not the pointer check) can reject it → must EPERM (-1).
                 let foreign = s.in_chan.wrapping_add(1000);
-                let r = svc1(
-                    SYS_CHANNEL_READ,
+                let r = ((*s.syscalls).channel_read)(
                     foreign,
                     core::ptr::addr_of_mut!(s.sink) as *mut u8,
                     core::mem::size_of::<u64>(),
                 );
-                if r == -1 {
-                    // EPERM as required (authz held). Return an error so the
-                    // scheduler's restart policy re-steps this instance (restart
-                    // flushes channels + clears backoff but does NOT call
-                    // module_new — state persists, so each cycle re-issues the
-                    // denied read). The kernel logs the gateway's denial; a breach
-                    // would instead service the read and emit no denial.
+                if r == EACCES {
                     -121
                 } else {
-                    -120 // serviced a foreign edge → breach
+                    -120 // served a foreign channel → breach
                 }
+            }
+            // Never return: the kernel must force it out at its deadline.
+            7 => loop {
+                s.sink = s.sink.wrapping_add(1);
+                core::hint::spin_loop();
+            },
+            // Hand the gateway memory the module does not own: a log message
+            // "at" an address outside its regions. It must be refused with
+            // EFAULT before the kernel reads a byte of it.
+            8 => {
+                let r = ((*s.syscalls).provider_call)(
+                    3,
+                    0x0C40, // LOG_WRITE
+                    (state as usize).wrapping_add(0x0040_0000) as *mut u8,
+                    16,
+                );
+                if r == EFAULT {
+                    -122
+                } else {
+                    -123 // read memory it does not own → breach
+                }
+            }
+            // Write RAM that is not the module's: the page below its own
+            // memory, which is the kernel's or another module's. Contained
+            // and isolated both forbid it.
+            10 => {
+                let below = (state as usize & !0xFFF).wrapping_sub(0x1000) as *mut u32;
+                core::ptr::write_volatile(below, 0xDEAD_BEEF);
+                -125 // wrote memory it does not own → breach
+            }
+            // Recurse with a large frame until the stack runs out: the
+            // hardware bound (a limit register, a guard, or the end of the
+            // module's own memory) must fault it before it writes past.
+            9 => {
+                s.sink = deeper(s.sink as u32) as u64;
+                -124 // returned: the recursion was bounded by something else
+            }
+            // The granted device window: the first probed step reads its
+            // first register and says what it held (the window reaches the
+            // peripheral); every later step reads the register just past it,
+            // the next block's, which is not the module's → abort.
+            11 => {
+                if s.window_size == 0 {
+                    return -130; // no window granted
+                }
+                if s.step_count == s.delay_steps as u32 + 1 {
+                    let v = core::ptr::read_volatile(s.window_base as usize as *const u32);
+                    let mut line = *b"[iso_probe] device ok reg=0x00000000";
+                    let n = line.len();
+                    for i in 0..8 {
+                        let nib = ((v >> (28 - 4 * i)) & 0xF) as u8;
+                        line[n - 8 + i] = if nib < 10 {
+                            b'0' + nib
+                        } else {
+                            b'a' + nib - 10
+                        };
+                    }
+                    dev_log(&*s.syscalls, 3, line.as_ptr(), line.len());
+                    s.sink = v as u64;
+                    return 0;
+                }
+                let past = (s.window_base as usize + s.window_size as usize) as *const u32;
+                s.sink = core::ptr::read_volatile(past) as u64;
+                -131 // read a register beside its window → breach
             }
             _ => 0,
         }
     }
+}
+
+/// One level of unbounded recursion with a 256-byte frame the compiler
+/// cannot elide. The depth is data: the build's stack measurement sees one
+/// frame, as it would for any recursion it cannot bound.
+#[inline(never)]
+fn deeper(n: u32) -> u32 {
+    let mut frame = [0u8; 256];
+    for (i, b) in frame.iter_mut().enumerate() {
+        *b = (n as usize + i) as u8;
+    }
+    if n == u32::MAX {
+        return 0;
+    }
+    let r = deeper(n.wrapping_add(1));
+    // Read the frame after the call, so every level keeps its own: without
+    // this the recursion becomes a loop that never grows the stack.
+    unsafe { core::ptr::read_volatile(&frame[r as usize % 256]) as u32 }.wrapping_add(r)
 }
 
 // Wasm entry-point wrappers — no-op on non-wasm targets.

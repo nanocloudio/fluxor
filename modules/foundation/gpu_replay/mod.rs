@@ -172,6 +172,8 @@ pub extern "C" fn module_state_size() -> u32 {
     STATE_SIZE as u32
 }
 
+declare_module_arena_bytes!(HEAP_BYTES);
+
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[cfg_attr(not(feature = "host-test"), link_section = ".text.module_arena_size")]
 pub extern "C" fn module_arena_size() -> u32 {

@@ -522,7 +522,7 @@ pub mod store {
     ///         before flash_exit_xip() since flash is inaccessible after that.
     /// RP2350: boot2 is shadowed in BOOTRAM (0x400e_0000), always readable.
     #[inline(always)]
-    unsafe fn copy_boot2(buf: &mut [u32; 256 / 4]) -> unsafe extern "C" fn() {
+    pub(super) unsafe fn copy_boot2(buf: &mut [u32; 256 / 4]) -> unsafe extern "C" fn() {
         core::ptr::copy_nonoverlapping(
             crate::platform::chip::BOOT2_SRC as *const u8,
             buf.as_mut_ptr() as *mut u8,
@@ -844,5 +844,127 @@ pub mod xip_lock {
         core::arch::asm!("isb", options(nomem, nostack, preserves_flags));
 
         (status, sio_hi)
+    }
+}
+
+/// The flash device's unique ID, which is the chip's on RP2040.
+///
+/// RP2040 has no ID in silicon; the SDK's `pico_get_unique_board_id` and the
+/// bootrom's PICOBOOT both report the flash's RUID, and picotool matches a
+/// board by it. Reading it is a flash command, so it runs the way an erase
+/// does: from RAM, interrupts off, DMA quiesced, flash out of XIP, and boot2
+/// to restore XIP afterwards.
+#[cfg(feature = "chip-rp2040")]
+pub mod unique_id {
+    use crate::platform::chip;
+    use crate::platform::rp_bootrom as bootrom;
+
+    const ID_BYTES: usize = 8;
+    /// Command, dummy bytes, then the ID: one byte in for every byte out.
+    const FRAME: usize = 1 + chip::FLASH_UID_DUMMY_BYTES + ID_BYTES;
+    /// Polls of SR.RFNE per byte before the transfer is abandoned. A byte
+    /// takes a few hundred cycles at the ROM's SSI clock; a count this large
+    /// only ends a wait on an SSI that is not clocking at all, which would
+    /// otherwise hang with interrupts off.
+    const RX_POLL_LIMIT: u32 = 100_000;
+
+    /// Read the ID, or `None` if the flash did not answer.
+    ///
+    /// Call before anything else can be reading flash through DMA or the
+    /// second core: once at boot, before the device stack and the graph.
+    pub fn read() -> Option<u64> {
+        use crate::platform::rp_dma::{quiesce_flash_readers, QUIESCE_LIMIT};
+
+        let rom = bootrom::FlashRom::resolve()?;
+        let mut rx = [0u8; FRAME];
+        let complete = crate::arch::cortex_m::interrupt_free(|| {
+            if !quiesce_flash_readers(QUIESCE_LIMIT) {
+                return false;
+            }
+            // SAFETY: interrupts are off and no DMA channel reads flash;
+            // `transfer` is RAM-resident and restores XIP before returning.
+            unsafe { transfer(&rom, &mut rx) }
+        });
+        if !complete {
+            return None;
+        }
+        let id = rx[FRAME - ID_BYTES..]
+            .iter()
+            .fold(0u64, |acc, &b| (acc << 8) | u64::from(b));
+        // A floating bus reads all ones, a held one all zeros; neither is an ID.
+        if id == 0 || id == u64::MAX {
+            return None;
+        }
+        Some(id)
+    }
+
+    /// Clock one RUID frame through XIP_SSI with chip select held low.
+    ///
+    /// Returns false if the SSI stopped answering part-way; XIP is restored
+    /// either way.
+    ///
+    /// # Safety
+    /// Interrupts off and flash DMA idle, as for an erase.
+    #[inline(never)]
+    #[link_section = ".data.ram_func"]
+    unsafe fn transfer(rom: &bootrom::FlashRom, rx: &mut [u8; FRAME]) -> bool {
+        let mut boot2 = [0u32; 256 / 4];
+        // SAFETY: boot2 is copied out of flash before flash goes away.
+        let boot2_fn = unsafe { super::store::copy_boot2(&mut boot2) };
+
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+
+        let dr0 = chip::FLASH_UID_SSI_DR0_ADDR as *mut u32;
+        let sr = chip::FLASH_UID_SSI_SR_ADDR as *const u32;
+        let rfne = 1u32 << chip::FLASH_UID_SSI_SR_RFNE_BIT;
+        let mut complete = true;
+
+        // SAFETY: every pointer was resolved before flash was disconnected,
+        // and this function is in RAM. `exit_xip` leaves the SSI in 8-bit
+        // standard SPI, transmit-and-receive; `flush_cache` hands chip select
+        // back to the SSI (it clears OUTOVER) and boot2 restores XIP.
+        unsafe {
+            (rom.connect)();
+            (rom.exit_xip)();
+            ss_force(chip::FLASH_UID_SS_OUTOVER_LOW);
+            for (i, slot) in rx.iter_mut().enumerate() {
+                let out = if i == 0 {
+                    u32::from(chip::FLASH_UID_CMD)
+                } else {
+                    0
+                };
+                core::ptr::write_volatile(dr0, out);
+                let mut polls = 0u32;
+                while core::ptr::read_volatile(sr) & rfne == 0 {
+                    polls += 1;
+                    if polls == RX_POLL_LIMIT {
+                        complete = false;
+                        break;
+                    }
+                }
+                if !complete {
+                    break;
+                }
+                *slot = core::ptr::read_volatile(dr0) as u8;
+            }
+            ss_force(chip::FLASH_UID_SS_OUTOVER_HIGH);
+            (rom.flush_cache)();
+            boot2_fn();
+        }
+        complete
+    }
+
+    /// Drive QSPI_SS through its OUTOVER field.
+    ///
+    /// # Safety
+    /// Only between `exit_xip` and `flush_cache`, from RAM.
+    #[inline(always)]
+    unsafe fn ss_force(value: u32) {
+        let ctrl = chip::FLASH_UID_SS_CTRL_ADDR as *mut u32;
+        // SAFETY: a fixed IO_QSPI register from the silicon TOML.
+        unsafe {
+            let cur = core::ptr::read_volatile(ctrl);
+            core::ptr::write_volatile(ctrl, (cur & !chip::FLASH_UID_SS_OUTOVER_MASK) | value);
+        }
     }
 }

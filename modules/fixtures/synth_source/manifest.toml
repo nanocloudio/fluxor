@@ -22,9 +22,9 @@ required = true
 # consumer is one tick behind. The downstream (http) typically requests
 # 65536; the kernel takes max(producer, consumer) hints, so this value
 # matters only when the downstream isn't http.
-buffer_size = 65536
+buffer_size = { default = 4096, bcm2712 = 65536 }
 # MAX_CHUNK_SIZE — largest single chunk emit.
-max_record = 32768
+max_record = { default = 4096, bcm2712 = 32768 }
 
 # Module-scope observability — exempt (see standards/observability.md §6).
 [observability]

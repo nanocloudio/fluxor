@@ -470,11 +470,59 @@ pub fn get_cross_channel(idx: usize) -> Option<&'static CrossDomainChannel> {
 /// image size.
 pub const CORE_STACK_SIZE: usize = 1024 * 1024;
 
-/// Stack storage for secondary cores. 16-byte aligned per AArch64 SP
-/// alignment requirement.
-#[repr(C, align(16))]
-struct CoreStacks([[u8; CORE_STACK_SIZE]; MAX_SECONDARY_CORES]);
-static mut CORE_STACKS: CoreStacks = CoreStacks([[0u8; CORE_STACK_SIZE]; MAX_SECONDARY_CORES]);
+/// The unmapped page below every kernel stack.
+pub const STACK_GUARD_SIZE: usize = 4096;
+
+/// One secondary core's stack: a guard page, then the stack, which grows
+/// down towards it. Page-aligned so the guard is a whole page the kernel's
+/// table can leave unmapped.
+#[repr(C, align(4096))]
+struct CoreStackSlab {
+    guard: [u8; STACK_GUARD_SIZE],
+    stack: [u8; CORE_STACK_SIZE],
+}
+
+/// Byte size of one [`CoreStackSlab`]; the trampoline indexes slabs by it
+/// and a secondary core's SP starts at the top of its slab.
+const CORE_STACK_SLAB: usize = STACK_GUARD_SIZE + CORE_STACK_SIZE;
+const _: () = assert!(core::mem::size_of::<CoreStackSlab>() == CORE_STACK_SLAB);
+
+#[repr(C, align(4096))]
+struct CoreStacks([CoreStackSlab; MAX_SECONDARY_CORES]);
+static mut CORE_STACKS: CoreStacks = CoreStacks(
+    [const {
+        CoreStackSlab {
+            guard: [0; STACK_GUARD_SIZE],
+            stack: [0; CORE_STACK_SIZE],
+        }
+    }; MAX_SECONDARY_CORES],
+);
+
+/// The guard page under every kernel stack: the primary's
+/// (`__stack_guard`, `linker/memory-bcm2712.x`) and each secondary core's.
+/// The kernel's identity table and every isolated module's table leave these
+/// pages unmapped.
+pub fn kernel_stack_guards() -> [u64; 1 + MAX_SECONDARY_CORES] {
+    extern "C" {
+        static __stack_guard: u8;
+    }
+    let mut out = [0u64; 1 + MAX_SECONDARY_CORES];
+    // Only the address of the linker symbol is taken.
+    out[0] = core::ptr::addr_of!(__stack_guard) as u64;
+    let base = core::ptr::addr_of!(CORE_STACKS) as u64;
+    for (i, slot) in out[1..].iter_mut().enumerate() {
+        *slot = base + (i * CORE_STACK_SLAB) as u64;
+    }
+    out
+}
+
+/// Which kernel stack guard page `addr` falls in: 0 for the primary core's,
+/// `n` for secondary core `n`, `None` if it is in none of them.
+pub fn stack_guard_core(addr: u64) -> Option<usize> {
+    kernel_stack_guards()
+        .iter()
+        .position(|&g| addr >= g && addr < g + STACK_GUARD_SIZE as u64)
+}
 
 /// Per-core entry function pointer, set by `wake_core` and invoked by
 /// the trampoline after it finishes CPU bring-up.
@@ -683,10 +731,12 @@ unsafe extern "C" fn secondary_core_trampoline() -> ! {
         "msr SPSel, #1",                // SP_EL1
         "isb",
 
-        // SP = CORE_STACKS + (core_id - 1) * CORE_STACK_SIZE + CORE_STACK_SIZE
+        // SP = CORE_STACKS + (core_id - 1) * CORE_STACK_SLAB + CORE_STACK_SLAB:
+        // the top of the core's slab, above its guard page and stack.
         "sub x1, x0, #1",
         "ldr x2, ={stack_base}",
-        "mov x3, #{stack_size}",
+        // 1 MiB + 4 KiB is not a valid `mov` immediate; load it.
+        "ldr x3, ={stack_size}",
         "madd x2, x1, x3, x2",
         "add sp, x2, x3",
 
@@ -699,7 +749,7 @@ unsafe extern "C" fn secondary_core_trampoline() -> ! {
         "b 1b",
 
         stack_base = sym CORE_STACKS,
-        stack_size = const CORE_STACK_SIZE,
+        stack_size = const CORE_STACK_SLAB,
         entry = sym secondary_core_entry,
         mair_ptr = sym crate::platform::multicore::SECONDARY_MMU_MAIR,
         tcr_ptr = sym crate::platform::multicore::SECONDARY_MMU_TCR,

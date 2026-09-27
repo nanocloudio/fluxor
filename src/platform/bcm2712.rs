@@ -1352,6 +1352,7 @@ fn run_domain_loop(domain_id: usize) -> ! {
                 // pump thread; bounded by MAX_DOMAINS.
                 let metrics = unsafe { &mut DOMAIN_METRICS[domain_id] };
                 metrics.tick_count += 1;
+                scheduler::maybe_emit_alive(metrics.tick_count as u64, Some(domain_id));
                 maybe_emit_soc_temp(core_id);
                 // live-rebuild bridge (Tier 1a primary).
                 poll_rebuild_bridge(domain_id);
@@ -1489,6 +1490,7 @@ fn run_domain_loop(domain_id: usize) -> ! {
                 // pump thread; bounded by MAX_DOMAINS.
                 let metrics = unsafe { &mut DOMAIN_METRICS[domain_id] };
                 metrics.poll_steps += 1;
+                scheduler::maybe_emit_alive(metrics.poll_steps as u64, Some(domain_id));
                 if !any_burst {
                     metrics.poll_idle += 1;
                     metrics.wfe_count += 1;
@@ -1544,6 +1546,7 @@ fn run_domain_loop(domain_id: usize) -> ! {
                 // domain `d`'s pump thread; bounded by MAX_DOMAINS.
                 let metrics = unsafe { &mut DOMAIN_METRICS[domain_id] };
                 metrics.tick_count += 1;
+                scheduler::maybe_emit_alive(metrics.tick_count as u64, Some(domain_id));
                 // live-rebuild bridge (Tier 1b primary).
                 poll_rebuild_bridge(domain_id);
                 if metrics.tick_count.is_multiple_of(1_000_000) {
@@ -1584,6 +1587,7 @@ fn run_domain_loop(domain_id: usize) -> ! {
                 // `d`'s pump thread; bounded by MAX_DOMAINS.
                 let metrics = unsafe { &mut DOMAIN_METRICS[domain_id] };
                 metrics.tick_count += 1;
+                scheduler::maybe_emit_alive(metrics.tick_count as u64, Some(domain_id));
                 // live-rebuild bridge (so a Tier-2 domain can be reconfigured).
                 poll_rebuild_bridge(domain_id);
                 if metrics.tick_count.is_multiple_of(1_000_000) {
@@ -2829,7 +2833,7 @@ fn bcm_protection_register_module(
     state_size: usize,
     heap_ptr: *mut u8,
     heap_size: usize,
-) {
+) -> bool {
     mmu::register_module(
         module_idx,
         code_base as u64,
@@ -2838,35 +2842,7 @@ fn bcm_protection_register_module(
         state_size,
         heap_ptr,
         heap_size,
-    );
-}
-/// Channel-region registration with the EL0 page-rounding + fail-closed
-/// interleave policy: an isolated module's channel span is mapped EL0-RW as
-/// one page-rounded range; if a PEER producer's buffer falls inside that span
-/// (possible for a multi-output module whose buffers bracket a peer's),
-/// mapping it would grant writable access to the peer's buffer — refuse to
-/// register instead (the isolated module's own channel I/O then faults per
-/// policy, but no peer buffer is ever exposed).
-fn bcm_protection_set_channel_region(i: usize, base: usize, size: usize) {
-    const PAGE: usize = 4096;
-    if fluxor::kernel::exec::scheduler::module_is_isolated(i) {
-        let pbase = base & !(PAGE - 1);
-        let pend = (base + size + PAGE - 1) & !(PAGE - 1);
-        if fluxor::kernel::ipc::buffer_pool::any_foreign_buffer_in_range(
-            i as u8,
-            pbase,
-            pend - pbase,
-        ) {
-            log::error!(
-                "[el0] module {i}: channel span 0x{pbase:x}+{} overlaps a peer buffer —                  REFUSING to map channel region (fail closed).",
-                pend - pbase,
-            );
-        } else {
-            mmu::set_channel_region(i, pbase as u64, (pend - pbase) as u64);
-        }
-    } else {
-        mmu::set_channel_region(i, base as u64, size as u64);
-    }
+    )
 }
 fn bcm_protection_map_page(module_idx: usize, vaddr: usize, phys: usize, writable: bool) {
     mmu::map_4k_page(module_idx, vaddr as u64, phys as u64, writable);
@@ -3173,9 +3149,9 @@ static BCM2712_HAL_OPS: HalOps = HalOps {
     protection_set_enabled: bcm_protection_set_enabled,
     protection_reset: mmu::reset_isolation,
     protection_register_module: bcm_protection_register_module,
-    protection_set_channel_region: bcm_protection_set_channel_region,
-    protection_set_isolated_channels: mmu::set_isolated_channels,
-    protected_step: mmu::protected_step,
+    protection_release_module: mmu::release_module,
+    protection_gateway_table: mmu::gateway_table,
+    protected_call: mmu::protected_call,
     protection_map_page: bcm_protection_map_page,
     protection_unmap_page: bcm_protection_unmap_page,
     // An isolated module's stack sits above an unmapped guard page; the

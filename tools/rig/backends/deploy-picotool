@@ -2,10 +2,12 @@
 """deploy-picotool — flash a running board over USB with picotool.
 
 Verb:
-  stage   (actuator) — `picotool load -f <artifact>`: the board's reset
+  stage   (actuator) — `picotool load -f -x <artifact>`: the board's reset
                        interface takes it into BOOTSEL, the image is written,
-                       and it reboots into the application. No button, no
-                       drive, nobody at the bench.
+                       and it starts the application. A board already in
+                       BOOTSEL — where the liveness watchdog leaves a wedged
+                       one — is flashed and started the same way. No button,
+                       no drive, nobody at the bench.
 
 Binding fields:
   serial      (str, optional)  the board's USB serial; passed as `--ser` so
@@ -59,6 +61,10 @@ def main():
     cmd = [tool, "load", path, "-f"]
     if serial:
         cmd += ["--ser", serial]
+    # `-x` starts the image whether the board was running (and `-f` took it
+    # into BOOTSEL) or was already in BOOTSEL, where `-f` alone leaves it.
+    # picotool parses it after the device selection, so it comes last.
+    cmd += ["-x"]
     t0 = time.monotonic()
     run = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
     if run.returncode != 0:

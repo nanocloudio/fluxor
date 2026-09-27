@@ -486,7 +486,6 @@ fn linux_merge_runtime_overrides(module_id: u16, buf: *mut u8, len: usize, max: 
 }
 
 
-use fluxor::kernel::sys::hal::protected_step_direct as fluxor_protected_step_direct;
 
 static LINUX_HAL_OPS: HalOps = HalOps {
     disable_interrupts: linux_disable_interrupts,
@@ -534,10 +533,10 @@ static LINUX_HAL_OPS: HalOps = HalOps {
     smp_max_domains: || 1,
     protection_set_enabled: |_| {},
     protection_reset: || {},
-    protection_register_module: |_, _, _, _, _, _, _| {},
-    protection_set_channel_region: |_, _, _| {},
-    protection_set_isolated_channels: |_, _, _, _| {},
-    protected_step: fluxor_protected_step_direct,
+    protection_register_module: |_, _, _, _, _, _, _| false,
+    protection_release_module: |_| {},
+    protection_gateway_table: fluxor::kernel::sys::hal::no_gateway_table,
+    protected_call: fluxor::kernel::sys::hal::protected_call_unavailable,
     protection_map_page: |_, _, _, _| {},
     protection_unmap_page: |_, _| {},
     // Modules step on a host thread's stack, which the OS guards.

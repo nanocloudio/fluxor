@@ -35,9 +35,12 @@ pre-emption mechanism. Before each `module_step()` the scheduler arms
 the step guard with the module's `effective_deadline_us()` (its
 declared `step_deadline_us`, or `DEFAULT_STEP_DEADLINE_US`, 2 ms, when
 it declares none) and disarms it on return. No target takes the
-processor back from a cooperative module that has already exceeded its
+processor back from an ungated module that has already exceeded its
 deadline; what differs between targets is only how promptly the
-overrun is noticed.
+overrun is noticed. A gated (`contained` or `isolated`) module is the
+exception: it is forced out at its deadline and faulted, by PendSV from the
+same alarm on RP and by a lower-EL interrupt on BCM2712 (see
+[module_isolation.md](module_isolation.md#liveness)).
 
 | Target | Guard mechanism | Overrun observed |
 |--------|-----------------|------------------|

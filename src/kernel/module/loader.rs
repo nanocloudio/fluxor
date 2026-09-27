@@ -23,6 +23,11 @@ use crate::modules::{Module, StepOutcome};
 /// This is build-config key provisioning, not a hardware mechanism, so it lives
 /// here with its sole consumer (the signature check below) rather than in the
 /// generic HAL.
+/// Whether this kernel was built with a root signing key.
+fn root_key_provisioned() -> bool {
+    signing_pubkey_from_build_env(&mut [0u8; 32])
+}
+
 fn signing_pubkey_from_build_env(out: &mut [u8; 32]) -> bool {
     match option_env!("FLUXOR_SIGNING_PUBKEY_HEX") {
         Some(hex) if hex.len() == 64 => {
@@ -160,6 +165,17 @@ pub enum LoaderError {
     /// An isolated module's manifest declares more stack than the isolated
     /// stack holds.
     StackTooSmall { declared: u32, available: u32 },
+    /// A gated module's manifest does not declare a footprint the loader
+    /// needs, and the loader never runs a gated module's code to ask it.
+    GatedUndeclared(&'static str),
+    /// A gated module does something the gateway cannot mediate (provides a
+    /// contract, owns an interrupt).
+    GatedRefused(&'static str),
+    /// The module does not verify against this kernel's root key, and the
+    /// graph asked for an ungated level; an unverified module runs gated.
+    BelowSigningFloor,
+    /// The platform could not build the gated module's protection domain.
+    ProtectionUnavailable,
 }
 impl LoaderError {
     /// Log the error with appropriate level.
@@ -192,6 +208,21 @@ impl LoaderError {
             } => log::error!(
                 "[loader] {context}: declares {declared} B of stack; isolation gives {available} B"
             ),
+            Self::GatedUndeclared(what) => log::error!(
+                "[loader] {context}: gated, but the manifest declares no {what}; rebuild it \
+                 with the SDK's declare_module_* macros"
+            ),
+            Self::GatedRefused(why) => {
+                log::error!("[loader] {context}: cannot be gated: {why}")
+            }
+            Self::BelowSigningFloor => log::error!(
+                "[loader] {context}: not signed by this kernel's root key; it runs only at a gated \
+                 protection level (contained or isolated)"
+            ),
+            Self::ProtectionUnavailable => log::error!(
+                "[loader] {context}: gated, and its protection domain could not be built \
+                 (no free slot, or its memory cannot be covered) — not run privileged instead"
+            ),
         }
     }
 }
@@ -206,6 +237,8 @@ struct ManifestLayout {
     capacity: usize,
     /// Stack block (flag bit 6).
     stack: usize,
+    /// Arena block (flag bit 7).
+    arena: usize,
     /// Integrity hash (flag bit 0); the signature block follows it.
     hash: usize,
 }
@@ -215,10 +248,12 @@ impl ManifestLayout {
         let ports = port_count as usize;
         let capacity = 17 + ports * 4 + resource_count as usize * 4 + dep_count as usize * 8;
         let stack = capacity + if flags & 0x20 != 0 { ports * 8 } else { 0 };
-        let hash = stack + if flags & 0x40 != 0 { 2 } else { 0 };
+        let arena = stack + if flags & 0x40 != 0 { 2 } else { 0 };
+        let hash = arena + if flags & 0x80 != 0 { 4 } else { 0 };
         Self {
             capacity,
             stack,
+            arena,
             hash,
         }
     }
@@ -625,6 +660,53 @@ pub fn alloc_isolated(size: usize) -> Result<(*mut u8, usize), LoaderError> {
         ISO_ARENA_OFFSET = next;
         Ok((ptr, mapped))
     }
+}
+
+/// Allocate a gated module's private region from the state arena: `size`
+/// bytes at an `align`-aligned address (the planner's shape), zeroed. The
+/// alignment pad below it stays in the arena until the next graph reset.
+#[cfg(feature = "kernel-mpu")]
+pub fn alloc_private(size: usize, align: usize) -> Result<*mut u8, LoaderError> {
+    // SAFETY: single-threaded instantiation path; bump allocation on the
+    // state arena with checked arithmetic against its compiled capacity and
+    // the deployment envelope.
+    unsafe {
+        let base = core::ptr::addr_of_mut!(STATE_ARENA.0).cast::<u8>() as usize;
+        let cur = base + STATE_ARENA_OFFSET;
+        let start = cur.next_multiple_of(align);
+        let end = start
+            .checked_add(size)
+            .ok_or(LoaderError::StatePoolExhausted)?;
+        let used = end - base;
+        let pool = crate::abi::contracts::resource::POOL_STATE_ARENA;
+        let envelope = crate::kernel::sys::resource_ledger::enforced(pool);
+        if used > STATE_ARENA_SIZE || envelope.is_some_and(|cap| used as u32 > cap) {
+            log::error!(
+                "[loader] STATE ARENA EXHAUSTED for a private region — need={size} align={align} \
+                 would use={used} cap={STATE_ARENA_SIZE}"
+            );
+            crate::kernel::sys::resource_ledger::deny(pool);
+            return Err(LoaderError::StatePoolExhausted);
+        }
+        let ptr = start as *mut u8;
+        core::ptr::write_bytes(ptr, 0, size);
+        STATE_ARENA_OFFSET = used;
+        Ok(ptr)
+    }
+}
+
+/// Return a private region from [`alloc_private`] to the pool.
+///
+/// # Safety
+/// `(ptr, size)` is exactly a region `alloc_private` returned, and nothing
+/// references it any more.
+#[cfg(feature = "kernel-mpu")]
+pub unsafe fn free_private(ptr: *mut u8, size: usize) {
+    // A private region's size is a multiple of eight, so the canary-adjusted
+    // footprint `free_state_range` computes is the region itself.
+    // SAFETY: the caller's contract — `ptr` is a region `alloc_private`
+    // returned with this size, and nothing uses it any more.
+    unsafe { free_state_range(ptr, size - STATE_CANARY_SIZE) };
 }
 
 /// True if `ptr` was handed out by [`alloc_isolated`] (lives in the ISO arena).
@@ -1256,6 +1338,62 @@ impl LoadedModule {
             u16::from_le_bytes([*p.add(at), *p.add(at + 1)]) as u32 * 64
         }
     }
+    /// The manifest's head and layout, or `None` when it is absent or not a
+    /// manifest. The pointer addresses the manifest's first byte; the length
+    /// is its size.
+    fn manifest_view(&self) -> Option<(*const u8, usize, u8, ManifestLayout)> {
+        let manifest_size = self.header.manifest_size() as usize;
+        if manifest_size < 17 {
+            return None;
+        }
+        let code_size = self.header.code_size as usize;
+        let data_size = self.header.data_size as usize;
+        let export_size = self.header.export_count as usize * 8;
+        let schema_size = self.header.schema_size() as usize;
+        let manifest_offset =
+            ModuleHeader::SIZE + code_size + data_size + export_size + schema_size;
+        // SAFETY: manifest_offset + manifest_size lies inside the .fmod
+        // mapping (validated at load time).
+        unsafe {
+            let p = offset_ptr(self.base, manifest_offset);
+            let magic = u32::from_le_bytes([*p, *p.add(1), *p.add(2), *p.add(3)]);
+            if magic != 0x464D5846 {
+                return None;
+            } // "FXMF"
+            let flags = *p.add(14);
+            let layout = ManifestLayout::of(*p.add(5), *p.add(6), *p.add(7), flags);
+            Some((p, manifest_size, flags, layout))
+        }
+    }
+
+    /// The module's resident state in bytes, from the manifest head, or
+    /// `None` when it declares none — or declares the most the 16-bit field
+    /// can hold, which says only "at least this much" and is not a size.
+    pub fn manifest_state_bytes(&self) -> Option<usize> {
+        let (p, _, _, _) = self.manifest_view()?;
+        // SAFETY: bytes 12..14 of a manifest of at least 17 bytes.
+        let units = unsafe { u16::from_le_bytes([*p.add(12), *p.add(13)]) };
+        if units == 0 || units == u16::MAX {
+            return None;
+        }
+        Some(units as usize * 64)
+    }
+
+    /// The heap arena the module declares in bytes (flag-bit-7 block), or
+    /// `None` when it declares none.
+    pub fn manifest_arena_bytes(&self) -> Option<usize> {
+        let (p, size, flags, layout) = self.manifest_view()?;
+        if flags & 0x80 == 0 || size < layout.arena + 4 {
+            return None;
+        }
+        let at = layout.arena;
+        // SAFETY: bounds-checked against the manifest size above.
+        let v = unsafe {
+            u32::from_le_bytes([*p.add(at), *p.add(at + 1), *p.add(at + 2), *p.add(at + 3)])
+        };
+        (v != 0).then_some(v as usize)
+    }
+
     /// Read the static port-capacity hints from the manifest's
     /// flag-bit-5 capacity section. Needs no module code execution,
     /// works for wasm payloads (whose packed export tables are
@@ -1735,8 +1873,20 @@ fn validate_fn_addr(addr: usize, name: &str) -> Result<(), LoaderError> {
     let _ = name;
     Ok(())
 }
-/// Validate a loaded module's base address and header.
-pub fn validate_module(module: &LoadedModule, name: &str) -> Result<(), LoaderError> {
+/// What a module's signature establishes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Signing {
+    /// Signed, and the signature verifies against the root key this kernel
+    /// was built with.
+    RootVerified,
+    /// Unsigned, or no root key is provisioned to verify against.
+    Unverified,
+}
+
+/// Validate a loaded module's base address and header, and report what its
+/// signature establishes.
+pub fn validate_module(module: &LoadedModule, name: &str) -> Result<Signing, LoaderError> {
+    let mut signing = Signing::Unverified;
     // Check base is in valid memory range
     if !hal::validate_module_base(module.base as usize) {
         log::error!(
@@ -1813,7 +1963,7 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<(), LoaderEr
             );
             return Err(LoaderError::SignatureInvalid);
         }
-        return Ok(());
+        return Ok(Signing::Unverified);
     }
     {
         let code_size = module.header.code_size as usize;
@@ -1849,7 +1999,7 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<(), LoaderEr
                 // is treated as "no manifest" — the integrity /
                 // signature work below is skipped because it can't
                 // trust the byte layout.
-                return Ok(());
+                return Ok(Signing::Unverified);
             }
             {
                 // Manifest-format envelope version. v1-only; an unknown
@@ -1864,7 +2014,7 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<(), LoaderEr
                         );
                         return Err(LoaderError::SignatureInvalid);
                     }
-                    return Ok(());
+                    return Ok(Signing::Unverified);
                 }
                 let flags = manifest_data[14];
                 let has_integrity = (flags & 0x01) != 0;
@@ -2018,6 +2168,7 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<(), LoaderEr
                             log::error!("[loader] {name}: signature invalid");
                             return Err(LoaderError::SignatureInvalid);
                         }
+                        signing = Signing::RootVerified;
                     } else if cfg!(feature = "enforce_signatures") {
                         // No pubkey provisioned but enforcement demanded — reject.
                         return Err(LoaderError::SignatureInvalid);
@@ -2030,7 +2181,7 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<(), LoaderEr
             }
         }
     }
-    Ok(())
+    Ok(signing)
 }
 /// Check if function address is within module's code section.
 fn validate_fn_in_code(
@@ -2148,6 +2299,81 @@ pub fn invoke_init(
     unsafe { call_init(init_fn, syscalls) };
     Ok(())
 }
+/// How long a gated module's `module_init` or `module_new` may run before it
+/// is forced out and its load fails. Construction that takes longer returns
+/// pending and is retried.
+const GATED_CONSTRUCT_DEADLINE_US: u32 = 50_000;
+
+/// `module_init` for a gated module: run unprivileged, handed the gateway
+/// table instead of the kernel's.
+fn invoke_init_protected(module: &LoadedModule, module_idx: usize) -> Result<(), LoaderError> {
+    let init_addr = module
+        .get_export_addr(export_hashes::MODULE_INIT)
+        .map_err(|_| LoaderError::ExportNotFound)?;
+    validate_fn_addr(init_addr, "module_init")?;
+    validate_fn_in_code(
+        init_addr,
+        module.code_base() as usize,
+        module.header.code_size,
+        "module_init",
+    )?;
+    let table = crate::kernel::sys::hal::protection_gateway_table() as usize;
+    let args = [table, 0, 0, 0, 0, 0, 0, 0];
+    // SAFETY: init_addr validated inside the module's code; the module's
+    // protection domain was built by `protection_register_module`.
+    let rc = unsafe {
+        crate::kernel::sys::hal::protected_call(
+            module_idx,
+            init_addr,
+            &args,
+            &[],
+            GATED_CONSTRUCT_DEADLINE_US,
+        )
+    };
+    if rc < 0 {
+        return Err(LoaderError::InitFailed(rc));
+    }
+    Ok(())
+}
+
+/// `module_new` for a gated module: run unprivileged, handed the gateway
+/// table, with its params copied onto its own stack.
+fn invoke_new_protected(
+    module_idx: usize,
+    new_fn: ModuleNewFn,
+    a: &ModuleInitArgs,
+    params: &[u8],
+) -> Result<NewStatus, LoaderError> {
+    let table = crate::kernel::sys::hal::protection_gateway_table() as usize;
+    let args = [
+        a.in_chan as usize,
+        a.out_chan as usize,
+        a.ctrl_chan as usize,
+        0, // params: the platform places them on the module's stack
+        params.len(),
+        a.state_ptr as usize,
+        a.state_size,
+        table,
+    ];
+    // SAFETY: new_fn validated in lookup_exports; the domain exists.
+    let rc = unsafe {
+        crate::kernel::sys::hal::protected_call(
+            module_idx,
+            new_fn as usize,
+            &args,
+            params,
+            GATED_CONSTRUCT_DEADLINE_US,
+        )
+    };
+    if rc < 0 {
+        Err(LoaderError::NewFailed(rc))
+    } else if rc > 0 {
+        Ok(NewStatus::Pending)
+    } else {
+        Ok(NewStatus::Ready)
+    }
+}
+
 /// Status returned by module_new
 pub enum NewStatus {
     /// Initialization complete (returned 0)
@@ -2312,7 +2538,20 @@ impl DynamicModulePending {
             state_ptr: self.state_ptr,
             state_size: self.state_size,
         };
-        match invoke_new(self.new_fn, &*self.syscalls, &args)? {
+        let idx = self.module_idx as usize;
+        let status = if crate::kernel::module::gateway::is_gated(idx) {
+            let params = if self.params_ptr.is_null() || self.params_len == 0 {
+                &[][..]
+            } else {
+                // SAFETY: params_ptr points into the static PARAM_BUFFER,
+                // valid through the pending loop.
+                unsafe { core::slice::from_raw_parts(self.params_ptr, self.params_len) }
+            };
+            invoke_new_protected(idx, self.new_fn, &args, params)
+        } else {
+            invoke_new(self.new_fn, &*self.syscalls, &args)
+        };
+        match status? {
             NewStatus::Ready => {
                 log::info!("[inst] loaded {}", self.name);
                 if let Some(ar) = self.auto_register.as_ref() {
@@ -2445,6 +2684,8 @@ impl DynamicModule {
     /// module's behalf and must run on the module's owning core.
     pub unsafe fn call_drain(&self) -> i32 {
         match self.drain_fn {
+            // A gated module drains unprivileged, like every other entry.
+            Some(f) if self.isolated => gated_entry(f as usize, self.state_ptr),
             Some(f) => call_drain(f, self.state_ptr),
             None => -1,
         }
@@ -2488,17 +2729,10 @@ impl DynamicModule {
         name: &'static str,
     ) -> Result<StartNewResult, LoaderError> {
         // 1. Validate module header (safe)
-        validate_module(module, name)?;
+        let signing = validate_module(module, name)?;
         // 2. Lookup and validate exports (safe)
         module.log_header_info();
         let exports = lookup_exports(module, name)?;
-        // 3. Get required state size (FFI call, but validated)
-        let required_size = invoke_state_size(&exports);
-        // Peek the protection TLV BEFORE allocating: an isolated module's
-        // state/heap must come from the dedicated page-aligned ISO arena so the
-        // EL0 mapping (which rounds to whole pages) can't expose neighbours.
-        // (Full parse happens after heap init, below — this is a non-mutating
-        // read.) `iso_requested` is always false off BCM2712 (no EL0 regime).
         let params_slice = if params.ptr.is_null() || params.len == 0 {
             &[][..]
         } else {
@@ -2506,15 +2740,50 @@ impl DynamicModule {
             // caller validated the pointer covers `params.len` bytes.
             unsafe { core::slice::from_raw_parts(params.ptr, params.len) }
         };
-        #[cfg(feature = "kernel-vm")]
-        let iso_requested = crate::kernel::exec::scheduler::params_request_isolation(params_slice);
-        #[cfg(not(feature = "kernel-vm"))]
-        let iso_requested = false;
+        // Peek the protection TLV BEFORE anything else: a gated module
+        // (contained or isolated) never has its code run privileged, so its
+        // sizes come from the manifest and its memory from where its
+        // protection regions can cover it. (The full parse follows heap init.)
+        let gated = crate::kernel::exec::scheduler::params_request_isolation(params_slice);
+        // The signature sets a floor the graph cannot lower: where this
+        // kernel carries a root key, a module that does not verify against it
+        // runs gated or not at all.
+        if !gated && signing == Signing::Unverified && root_key_provisioned() {
+            return Err(LoaderError::BelowSigningFloor);
+        }
         // Isolation this kernel cannot give is refused, never run without it.
-        #[cfg(not(feature = "kernel-vm"))]
-        if crate::kernel::exec::scheduler::params_request_isolation(params_slice) {
+        #[cfg(not(any(feature = "kernel-vm", feature = "kernel-mpu")))]
+        if gated {
             return Err(LoaderError::IsolationUnavailable);
         }
+        #[cfg(feature = "kernel-vm")]
+        let iso_requested = gated;
+        #[cfg(not(feature = "kernel-vm"))]
+        let iso_requested = false;
+        if gated {
+            // What the gateway cannot mediate: a module other modules call
+            // into, and one the hardware calls into.
+            if module
+                .get_export_addr(export_hashes::MODULE_PROVIDES_CONTRACT)
+                .is_ok()
+            {
+                return Err(LoaderError::GatedRefused(
+                    "it provides a contract, and other modules' calls would run its code privileged",
+                ));
+            }
+            if exports.isr_entry_fn.is_some() {
+                return Err(LoaderError::GatedRefused(
+                    "it has an interrupt entry, which runs privileged",
+                ));
+            }
+        }
+        // 3. Required state size: the manifest's figure, so no module code
+        // runs to find it; a trusted module that declares none is asked.
+        let required_size = match module.manifest_state_bytes() {
+            Some(n) => n,
+            None if gated => return Err(LoaderError::GatedUndeclared("state size")),
+            None => invoke_state_size(&exports),
+        };
         // An isolated module runs on a fixed stack above a guard page. The
         // composer admits its declared depth against that stack; this refuses a
         // blob that reached the device without going through the composer.
@@ -2532,6 +2801,46 @@ impl DynamicModule {
         // 4. Allocate state. `state_map_size` is the footprint the MMU maps
         // (page-padded for isolated modules so it owns whole pages); the module
         // and its canary still use `required_size`.
+        // On an MPU target a gated module's stack, state and heap are one
+        // allocation — `[stack | state | heap]`, stack at the bottom so an
+        // overflow runs off the region — shaped by the planner so one region
+        // covers it exactly. (stack_len, whole region, heap pointer.)
+        #[cfg(feature = "kernel-mpu")]
+        let mpu_private: Option<(usize, usize, usize, *mut u8)> = if gated {
+            let arena = module.manifest_arena_bytes().unwrap_or(0);
+            let stack = (module.manifest_stack_bytes() as usize).next_multiple_of(8)
+                + crate::platform::rp_protection::EXCEPTION_FRAME_BYTES
+                + params.len.next_multiple_of(8)
+                + 64;
+            let state = (required_size + STATE_CANARY_SIZE).next_multiple_of(8);
+            let total = (stack + state + arena.next_multiple_of(8)) as u64;
+            let (size, align) = fluxor_contracts::isolation::private_region_shape(
+                total,
+                crate::platform::rp_protection::MODEL,
+            );
+            let base = alloc_private(size as usize, align as usize)?;
+            let heap = if arena > 0 {
+                // SAFETY: inside the region just allocated.
+                unsafe { base.add(stack + state) }
+            } else {
+                core::ptr::null_mut()
+            };
+            Some((stack, base as usize, size as usize, heap))
+        } else {
+            None
+        };
+        #[cfg(feature = "kernel-mpu")]
+        let (state_ptr, state_map_size) = match mpu_private {
+            // SAFETY: the state follows the stack inside the region, with
+            // room for its canary, which the state checks expect after it.
+            Some((stack, base, _, _)) => unsafe {
+                let state = (base as *mut u8).add(stack);
+                core::ptr::write_unaligned(state.add(required_size) as *mut u32, STATE_CANARY);
+                (state, required_size)
+            },
+            None => (alloc_state(required_size)?, required_size),
+        };
+        #[cfg(not(feature = "kernel-mpu"))]
         let (state_ptr, state_map_size) = if iso_requested {
             #[cfg(feature = "kernel-vm")]
             {
@@ -2566,11 +2875,28 @@ impl DynamicModule {
         // Footprint the MMU maps for the heap (page-padded for isolated modules);
         // the heap allocator still manages only `arena_size` usable bytes.
         let mut iso_heap_map_size: usize = 0;
-        if let Ok(arena_addr) = module.get_export_addr(export_hashes::MODULE_ARENA_SIZE) {
-            let arena_fn: ModuleStateSizeFn = fn_ptr_from_addr(arena_addr);
-            let arena_size = call_state_size(arena_fn);
+        // The heap arena: the manifest's figure, else (a trusted module only)
+        // what its `module_arena_size` export says.
+        let arena_size = match module.manifest_arena_bytes() {
+            Some(n) => n,
+            None if gated => 0,
+            None => match module.get_export_addr(export_hashes::MODULE_ARENA_SIZE) {
+                Ok(arena_addr) => {
+                    let arena_fn: ModuleStateSizeFn = fn_ptr_from_addr(arena_addr);
+                    call_state_size(arena_fn)
+                }
+                Err(_) => 0,
+            },
+        };
+        {
             if arena_size > 0 {
-                let arena_alloc = if iso_requested {
+                #[cfg(feature = "kernel-mpu")]
+                let carved = mpu_private.map(|(_, _, _, heap)| (heap, arena_size));
+                #[cfg(not(feature = "kernel-mpu"))]
+                let carved: Option<(*mut u8, usize)> = None;
+                let arena_alloc = if let Some(c) = carved {
+                    Ok(c)
+                } else if iso_requested {
                     #[cfg(feature = "kernel-vm")]
                     {
                         alloc_isolated(arena_size)
@@ -2632,46 +2958,62 @@ impl DynamicModule {
         // the top of this fn for the early isolation peek; reuse it here.)
         crate::kernel::exec::scheduler::parse_protection_config(inst_idx, params_slice);
 
-        // Register this module's code/state/heap regions with the MMU so
-        // that — if it declared `protection: isolated` — the graph-prepare
-        // pass can build a complete EL0 page table from them. Cheap and
-        // always recorded; only consulted when isolation is enabled. The
-        // channel-buffer region is registered separately once channels are
-        // open (see `set_channel_region` in the prepare pass). BCM2712 only.
-        // Register the MMU-mapped footprints: `state_map_size`/`iso_heap_map_size`
-        // are page-padded for isolated modules so the EL0 mapping covers only
-        // pages this module owns (and `build_table`'s page-clean check passes).
-        // For non-isolated modules these equal the raw sizes.
-        crate::kernel::sys::hal::protection_register_module(
-            inst_idx,
-            module.code_base() as usize,
-            module.header.code_size as usize,
-            state_ptr,
-            state_map_size,
-            iso_heap_ptr,
-            iso_heap_map_size,
-        );
-        // Record the exact channel handles this module is allowed to name in
-        // an isolated `SVC #1` gateway call — its own in/out/ctrl. The gateway
-        // rejects any other handle so an isolated module can't read or modify
-        // unrelated graph edges. Always recorded (cheap); only consulted for
-        // isolated modules. BCM2712 only.
-        crate::kernel::sys::hal::protection_set_isolated_channels(
-            inst_idx,
-            channels.in_chan,
-            channels.out_chan,
-            channels.ctrl_chan,
-        );
-        // Silence unused warnings on non-BCM2712 targets, where these feed only
-        // the cfg-gated MMU registration above.
-        let _ = (
-            iso_heap_ptr,
-            iso_heap_size,
-            state_map_size,
-            iso_heap_map_size,
-        );
+        // A gated module's protection domain exists before any of its code
+        // runs: the gateway learns its memory, the platform builds its regions.
+        // Either failing refuses the load; the module is never run privileged
+        // in its place.
+        if gated {
+            use crate::kernel::module::gateway::{self, Region};
+            let state = Region {
+                base: state_ptr as usize,
+                len: required_size,
+            };
+            let heap = Region {
+                base: iso_heap_ptr as usize,
+                len: iso_heap_size,
+            };
+            let code = Region {
+                base: module.code_base() as usize,
+                len: module.header.code_size as usize,
+            };
+            #[cfg(feature = "kernel-mpu")]
+            if let Some((stack, base, size, _)) = mpu_private {
+                gateway::register(inst_idx, code, heap, &[Region { base, len: size }]);
+                gateway::set_stack(inst_idx, Region { base, len: stack });
+            }
+            #[cfg(feature = "kernel-mpu")]
+            let registered = mpu_private.is_some();
+            #[cfg(not(feature = "kernel-mpu"))]
+            let registered = false;
+            if !registered {
+                gateway::register(inst_idx, code, heap, &[state, heap]);
+            }
+            if !crate::kernel::sys::hal::protection_register_module(
+                inst_idx,
+                module.code_base() as usize,
+                module.header.code_size as usize,
+                state_ptr,
+                state_map_size,
+                iso_heap_ptr,
+                iso_heap_map_size,
+            ) {
+                gateway::release(inst_idx);
+                free_state_range(state_ptr, required_size);
+                return Err(LoaderError::ProtectionUnavailable);
+            }
+        }
+        let _ = (iso_heap_size, state_map_size, iso_heap_map_size);
         // 5. Initialize module (FFI call, but validated)
-        if let Err(e) = invoke_init(module, syscalls, name) {
+        let init = if gated {
+            invoke_init_protected(module, inst_idx)
+        } else {
+            invoke_init(module, syscalls, name)
+        };
+        if let Err(e) = init {
+            if gated {
+                crate::kernel::sys::hal::protection_release_module(inst_idx);
+                crate::kernel::module::gateway::release(inst_idx);
+            }
             free_state_range(state_ptr, required_size);
             return Err(e);
         }
@@ -2690,7 +3032,12 @@ impl DynamicModule {
             state_ptr,
             state_size: required_size,
         };
-        match invoke_new(exports.new_fn, syscalls, &init_args)? {
+        let status = if gated {
+            invoke_new_protected(inst_idx, exports.new_fn, &init_args, params_slice)
+        } else {
+            invoke_new(exports.new_fn, syscalls, &init_args)
+        };
+        match status? {
             NewStatus::Ready => {
                 log::info!("[inst] loaded {name}");
                 if let Some(ar) = auto_register.as_ref() {
@@ -2738,6 +3085,20 @@ impl DynamicModule {
         }
     }
 }
+/// Run one of the current gated module's per-step entries (`module_step`,
+/// `module_post_tick_flush`, `module_pipeline_refill`) unprivileged, bounded
+/// by its step deadline.
+///
+/// # Safety
+/// `entry` is a validated export of the current module, taking its state.
+unsafe fn gated_entry(entry: usize, state: *mut u8) -> i32 {
+    let idx = crate::kernel::exec::scheduler::current_module_index();
+    let deadline = crate::kernel::exec::scheduler::module_step_deadline_us(idx);
+    let args = [state as usize, 0, 0, 0, 0, 0, 0, 0];
+    // SAFETY: forwarded from the caller.
+    unsafe { crate::kernel::sys::hal::protected_call(idx, entry, &args, &[], deadline) }
+}
+
 impl Module for DynamicModule {
     fn step(&mut self) -> Result<StepOutcome, i32> {
         // Isolated modules drop to EL0 under their own page table via
@@ -2752,7 +3113,7 @@ impl Module for DynamicModule {
             // `m.step()`, which the protected entry uses to locate the page
             // table. Platforms without a protected call run the direct
             // dispatch (identical to `call_step`).
-            unsafe { crate::kernel::sys::hal::protected_step(self.step_fn, self.state_ptr) }
+            unsafe { gated_entry(self.step_fn as usize, self.state_ptr) }
         } else {
             // SAFETY: step_fn and state_ptr were validated during construction
             unsafe { call_step(self.step_fn, self.state_ptr) }
@@ -2773,7 +3134,7 @@ impl Module for DynamicModule {
         let result = if self.isolated {
             // SAFETY: flush_fn is a validated module export run under the
             // module's protection domain (direct dispatch where none exists).
-            unsafe { crate::kernel::sys::hal::protected_step(flush_fn, self.state_ptr) }
+            unsafe { gated_entry(flush_fn as usize, self.state_ptr) }
         } else {
             // SAFETY: flush_fn is a validated module export; state_ptr is the
             // module's own state arena.
@@ -2793,7 +3154,7 @@ impl Module for DynamicModule {
         let result = if self.isolated {
             // SAFETY: refill_fn is a validated module export run under the
             // module's protection domain (direct dispatch where none exists).
-            unsafe { crate::kernel::sys::hal::protected_step(refill_fn, self.state_ptr) }
+            unsafe { gated_entry(refill_fn as usize, self.state_ptr) }
         } else {
             // SAFETY: refill_fn is a validated module export; state_ptr is the
             // module's own state arena.

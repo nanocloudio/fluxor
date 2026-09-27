@@ -91,16 +91,18 @@ mod pi5_impl {
         addr | VALID | BLOCK | (0 << ATTR_IDX_SHIFT) | AP_RW | SH_INNER | AF | NG
     }
 
-    // Block descriptor for Device memory: Device-nGnRnE, RW, no exec
+    // Block descriptor for Device memory: Device-nGnRnE, RW, no exec. nG for
+    // the reason DRAM is: a global entry for an MMIO gigabyte would shadow an
+    // isolated module's device window carved in it.
     const fn device_block(addr: u64) -> u64 {
-        addr | VALID | BLOCK | (1 << ATTR_IDX_SHIFT) | AP_RW | AF | PXN | UXN
+        addr | VALID | BLOCK | (1 << ATTR_IDX_SHIFT) | AP_RW | AF | NG | PXN | UXN
     }
 
     // Block descriptor for DMA memory: Normal Non-Cacheable, RW, Inner Shareable
     // Used for NIC DMA arena so hardware DMA and CPU see coherent data without
     // explicit cache maintenance. MAIR index 2 = 0x44 (Normal Non-cacheable).
     const fn dma_block(addr: u64) -> u64 {
-        addr | VALID | BLOCK | (2 << ATTR_IDX_SHIFT) | AP_RW | SH_INNER | AF | UXN
+        addr | VALID | BLOCK | (2 << ATTR_IDX_SHIFT) | AP_RW | SH_INNER | AF | NG | UXN
     }
 
     // Table descriptor: points L1 entry to an L2 table (for 2MB granularity)
@@ -125,6 +127,47 @@ mod pi5_impl {
 
     #[link_section = ".bss"]
     static mut L2_TABLE_0: L2Table = L2Table([0; 512]);
+
+    /// L3 tables for the 2 MB blocks that hold a kernel stack guard page —
+    /// one per guard at most (primary + secondaries).
+    const GUARD_L3_TABLES: usize = fluxor::platform::multicore::MAX_SECONDARY_CORES + 1;
+
+    #[link_section = ".bss"]
+    static mut GUARD_L3: [L2Table; GUARD_L3_TABLES] = [const { L2Table([0; 512]) }; GUARD_L3_TABLES];
+
+    /// Split the 2 MB block holding each kernel stack guard page into 4 KB
+    /// pages carrying the block's own attributes, with the guard page
+    /// invalid. Two guards in one block share its table.
+    unsafe fn unmap_stack_guards(l2: &mut [u64; 512]) {
+        const VALID_TYPE_MASK: u64 = 0b11;
+        const PAGE_TYPE: u64 = 0b11;
+        const BLOCK_ADDR: u64 = 0x0000_FFFF_FFE0_0000;
+        let mut used = 0usize;
+        for guard in fluxor::platform::multicore::kernel_stack_guards() {
+            let l2i = (guard >> 21) as usize;
+            if l2i >= 512 {
+                continue;
+            }
+            let entry = l2[l2i];
+            let l3: *mut [u64; 512] = if entry & VALID_TYPE_MASK == VALID | TABLE {
+                (entry & 0x0000_FFFF_FFFF_F000) as *mut [u64; 512]
+            } else {
+                if used == GUARD_L3_TABLES {
+                    continue;
+                }
+                let t = &raw mut GUARD_L3[used].0;
+                used += 1;
+                let base = entry & BLOCK_ADDR;
+                let attrs = entry & !BLOCK_ADDR & !VALID_TYPE_MASK;
+                for (j, e) in (*t).iter_mut().enumerate() {
+                    *e = (base + (j as u64) * 0x1000) | attrs | PAGE_TYPE;
+                }
+                l2[l2i] = table_desc(t as u64);
+                t
+            };
+            (*l3)[((guard >> 12) & 0x1FF) as usize] = 0;
+        }
+    }
 
     /// Fill the L1 page table with identity mappings.
     /// Must be called before enabling the MMU.
@@ -170,6 +213,10 @@ mod pi5_impl {
                     idx += 1;
                 }
             }
+            // Leave each kernel stack's guard page unmapped, so an overflow
+            // faults at an address instead of writing through the statics
+            // below the stack.
+            unmap_stack_guards(l2);
             // Point L1[0] to our L2 table
             table[0] = table_desc(&raw const L2_TABLE_0 as u64);
         }

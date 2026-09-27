@@ -83,3 +83,23 @@ macro_rules! declare_module_stack_bytes {
         pub static FLUXOR_MODULE_STACK_BYTES: u32 = ($bytes) as u32;
     };
 }
+
+// `declare_module_arena_bytes!` publishes the heap arena the module asks for,
+// in bytes, as data `pack` records in the manifest — the figure
+// `module_arena_size` returns, which the loader then never has to call. A
+// gated (contained or isolated) module's code never runs privileged, so for
+// one the declaration is the only way to get a heap:
+//
+//     declare_module_arena_bytes!(16 * 1024);
+
+#[allow(
+    unused_macros,
+    reason = "every module includes the SDK runtime; only those with a heap arena invoke it"
+)]
+macro_rules! declare_module_arena_bytes {
+    ($bytes:expr) => {
+        /// This module's heap arena in bytes, as data for `pack` to read.
+        #[used]
+        pub static FLUXOR_MODULE_ARENA_BYTES: u32 = ($bytes) as u32;
+    };
+}

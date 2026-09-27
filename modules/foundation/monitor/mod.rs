@@ -49,6 +49,7 @@ include!("../../sdk/runtime.rs");
 // A module's run state, as the verdict line names it; 3 and beyond are
 // terminated.
 name_table!(STATE_NAMES = [b"running", b"faulted", b"recovering", b"terminated"]);
+name_table!(PROTECTION_NAMES = [b"none", b"guarded", b"contained", b"isolated"]);
 include!("../../sdk/runtime/params.rs");
 
 // Opcodes imported from the layered ABI — no hardcoded 0x0Cxx here.
@@ -244,6 +245,8 @@ unsafe fn build_mon_state(sys: &SyscallTable, mod_idx: u8, out: &mut [u8]) -> us
     emit_decimal(u32_at(10), out, &mut pos);
     emit_bytes(b" gen=", out, &mut pos);
     emit_decimal(u32_at(14), out, &mut pos);
+    emit_bytes(b" prot=", out, &mut pos);
+    emit_bytes(PROTECTION_NAMES.get(st[19].min(3) as usize), out, &mut pos);
     pos
 }
 

@@ -275,6 +275,8 @@ pub mod errno {
     pub const ERROR: i32 = -1;
     /// Permission denied (capability check failed).
     pub const EACCES: i32 = -13;
+    /// A pointer the caller passed is not the caller's memory.
+    pub const EFAULT: i32 = -14;
     /// No such device or address (e.g. I2C NACK).
     pub const ENXIO: i32 = -6;
     /// Resource temporarily unavailable — try again.

@@ -34,7 +34,7 @@ MON_FAULT mod=<idx> kind=<k> fault_count=<n> restart_count=<n> tick=<t>
 | Field           | Meaning                                                                 |
 |-----------------|-------------------------------------------------------------------------|
 | `mod`           | Module index (0..MAX_MODULES-1).                                        |
-| `kind`          | Fault type: `1` timeout, `2` step error, `3` hard fault, `4` protection (MMU abort, stack fence). |
+| `kind`          | Fault type: `1` timeout, `2` step error, `3` hard fault, `4` protection (MPU or MMU abort, stack bound, stack fence). |
 | `fault_count`   | Cumulative fault count for this module after this event.                |
 | `restart_count` | Cumulative restart count after this event.                              |
 | `tick`          | Kernel tick at which the fault was recorded.                            |
@@ -78,7 +78,7 @@ Slots the scheduler holds empty are skipped, so every line is a real
 module.
 
 ```
-MON_STATE mod=<idx> name=<s> state=<s> ready=<0|1> finished=<0|1> restarts=<n> domain=<d> period=<n> inactive=<n> gen=<n>
+MON_STATE mod=<idx> name=<s> state=<s> ready=<0|1> finished=<0|1> restarts=<n> domain=<d> period=<n> inactive=<n> gen=<n> prot=<s>
 ```
 
 - `name` — the module's type name. Omitted when the caller's buffer had
@@ -95,11 +95,14 @@ MON_STATE mod=<idx> name=<s> state=<s> ready=<0|1> finished=<0|1> restarts=<n> d
 - `gen` — per-slot generation, bumped on reset, restart and replacement.
   Pair it across two reads: a change means the slot was reused and the
   earlier line describes a different module.
+- `prot` — the protection level the kernel enforces on the module: `none`,
+  `guarded`, `contained` or `isolated` (see
+  [module_isolation.md](module_isolation.md)). This is what the target
+  provides, which can be stronger than what the graph asked for.
 
-Protection level and trust tier are not reported: the scheduler tracks
-neither per module, so there is nothing to report them from. A field
-synthesised at the emitter would be a reading nobody could trust, which
-is worse than an absent column.
+Trust tier is not reported: the scheduler does not keep it per module, so
+there is nothing to report it from. A field synthesised at the emitter would
+be a reading nobody could trust, which is worse than an absent column.
 
 ### `MON_HEAVY_STEP`
 

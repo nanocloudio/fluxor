@@ -1718,6 +1718,7 @@ const NON_PARAM_KEYS: &[&str] = &[
     "restart_backoff_ms",
     "trust_tier",
     "protection",
+    "device_window",
     "cert_file",
     "key_file",
     // `trust` is NOT here: it is a schema parameter of tls and quic (a
@@ -2201,6 +2202,7 @@ fn build_module_entry(
     modules_dir: &Path,
     manifests: &HashMap<String, Manifest>,
     max_modules: usize,
+    isolation: &crate::target::IsolationFacts,
 ) -> Result<Vec<u8>> {
     // Start with max possible size, will truncate to actual used size
     let mut entry = vec![0u8; MODULE_ENTRY_HEADER_SIZE + MAX_MODULE_PARAMS_SIZE];
@@ -2566,74 +2568,24 @@ fn build_module_entry(
         }
     }
 
-    // Tag 0xF4: trust_tier (u8: 0=platform, 1=verified, 2=community, 3=unsigned).
-    // Per-module field wins; `default_trust_tier` at the top level or under
-    // `graph:` applies to any module that omits it. Defaults to `platform`
-    // (most permissive) for first-party builds.
-    let tier_str = module
-        .get("trust_tier")
-        .and_then(|v| v.as_str())
-        .or_else(|| {
-            config
-                .get("default_trust_tier")
-                .and_then(|v| v.as_str())
-                .or_else(|| {
-                    config
-                        .get("graph")
-                        .and_then(|g| g.get("default_trust_tier"))
-                        .and_then(|v| v.as_str())
-                })
-        })
-        .unwrap_or("platform");
-    let tier_val: u8 = match tier_str {
-        "platform" => 0,
-        "verified" => 1,
-        "community" => 2,
-        "unsigned" => 3,
-        _ => 0,
-    };
+    // Tags 0xF4 (trust tier) and 0xF5 (protection level), from the one
+    // resolution the validator admitted (`protection::resolve`): the level
+    // emitted is the level the target PROVIDES — a `contained` request on a
+    // target that implements only `isolated` is sent as `isolated` — so the
+    // kernel enforces what the composer printed. A request the target cannot
+    // meet was refused by the validator; it never reaches here.
+    let resolved = crate::protection::resolve(module, config, &isolation.levels)
+        .map_err(|e| Error::Config(format!("module '{name}': {e}")))?;
     if base + extra_len + 3 < entry.len() {
         entry[base + extra_len] = 0xF4;
         entry[base + extra_len + 1] = 1;
-        entry[base + extra_len + 2] = tier_val;
+        entry[base + extra_len + 2] = resolved.tier as u8;
         extra_len += 3;
     }
-
-    // Tag 0xF5: protection level (u8: 0=none, 1=guarded, 2=isolated).
-    // An explicit `protection:` on the module (or the graph) wins; otherwise
-    // derive from the trust tier:
-    //   platform  -> none
-    //   verified  -> guarded
-    //   community -> isolated
-    //   unsigned  -> isolated (signature enforcement refuses the load elsewhere)
-    let explicit_prot = module
-        .get("protection")
-        .and_then(|v| v.as_str())
-        .or_else(|| {
-            config
-                .get("protection")
-                .and_then(|v| v.as_str())
-                .or_else(|| {
-                    config
-                        .get("graph")
-                        .and_then(|g| g.get("protection"))
-                        .and_then(|v| v.as_str())
-                })
-        });
-    let prot_val: u8 = match explicit_prot {
-        Some("none") => 0,
-        Some("guarded") => 1,
-        Some("isolated") => 2,
-        _ => match tier_val {
-            0 => 0, // platform -> none
-            1 => 1, // verified -> guarded
-            _ => 2, // community/unsigned -> isolated
-        },
-    };
     if base + extra_len + 3 < entry.len() {
         entry[base + extra_len] = 0xF5;
         entry[base + extra_len + 1] = 1;
-        entry[base + extra_len + 2] = prot_val;
+        entry[base + extra_len + 2] = resolved.provided as u8;
         extra_len += 3;
     }
 
@@ -2805,6 +2757,22 @@ fn build_module_entry(
                 entry[base + extra_len + 2..base + extra_len + 4].copy_from_slice(&bytes);
                 extra_len += 4;
             }
+        }
+    }
+
+    // Tag 0xFD: device window (u64 base LE, u32 size LE): the peripheral
+    // block the graph grants a gated driver by name, resolved against the
+    // target's grantable blocks. The kernel maps it into the module's domain;
+    // the module reads its base from the same tag in its params.
+    if let Some((wb, wz)) = crate::protection::device_window(module, &isolation.device_ranges)
+        .map_err(|e| Error::Config(format!("module '{name}': {e}")))?
+    {
+        if base + extra_len + 14 < entry.len() {
+            entry[base + extra_len] = 0xFD;
+            entry[base + extra_len + 1] = 12;
+            entry[base + extra_len + 2..base + extra_len + 10].copy_from_slice(&wb.to_le_bytes());
+            entry[base + extra_len + 10..base + extra_len + 14].copy_from_slice(&wz.to_le_bytes());
+            extra_len += 14;
         }
     }
 
@@ -3056,13 +3024,14 @@ fn build_module_entry(
 }
 
 
-fn parse_modules_map(
+pub(crate) fn parse_modules_map(
     modules: &Value,
     data_section: Option<&Value>,
     config: &Value,
     modules_dir: &Path,
     manifests: &HashMap<String, Manifest>,
     max_modules: usize,
+    isolation: &crate::target::IsolationFacts,
 ) -> Result<(Vec<Vec<u8>>, Vec<String>)> {
     let mut entries = Vec::new();
     let mut names = Vec::new();
@@ -3167,6 +3136,7 @@ fn parse_modules_map(
             modules_dir,
             manifests,
             max_modules,
+            isolation,
         )?;
         entries.push(entry);
         names.push(name.to_string());

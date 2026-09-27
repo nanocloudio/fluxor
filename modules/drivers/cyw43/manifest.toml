@@ -36,11 +36,15 @@ index = 2
 direction = "output"
 content_type = "OctetStream"
 
+# status, netif_state and wifi_ctrl carry control messages of a few bytes
+# (cyw43 reads a command into 128), so they take 512-byte rings; the 8 KiB
+# default would spend rp2040's whole 16 KiB buffer arena on the three.
 [[ports]]
 name = "status"
 index = 3
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 512
 
 [[ports]]
 name = "hci_rx"
@@ -53,11 +57,13 @@ name = "netif_state"
 index = 5
 direction = "output"
 content_type = "FmpMessage"
+buffer_size = 512
 
 [[ports]]
 name = "wifi_ctrl"
 direction = "ctrl_input"
 content_type = "FmpMessage"
+buffer_size = 512
 
 [[resources]]
 requires_contract = "pio"

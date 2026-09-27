@@ -19,11 +19,41 @@ struct SiliconToml {
     kernel: Option<KernelConfig>,
     peripherals: Option<PeripheralConfig>,
     memory: Option<MemoryToml>,
+    isolation: Option<IsolationToml>,
+}
+
+/// The `[isolation]` facts the RP protection backend compiles against. The
+/// tools parse the whole section; the kernel needs only how regions are
+/// drawn and how many there are, and checks the count against `MPU_TYPE`.
+#[derive(Deserialize)]
+struct IsolationToml {
+    region_model: Option<String>,
+    regions: Option<u8>,
+    device_ranges: Option<Vec<DeviceRangeToml>>,
+    peripheral_gate: Option<PeripheralGateToml>,
+}
+
+/// ACCESSCTRL: the peripheral registers the kernel makes privileged-only.
+#[derive(Deserialize)]
+struct PeripheralGateToml {
+    base: String,
+    first: String,
+    last: String,
+}
+
+/// A peripheral block a gated driver's device window may lie in.
+#[derive(Deserialize)]
+struct DeviceRangeToml {
+    base: String,
+    size: String,
+    gate: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct MemoryToml {
     ram_size: String,
+    flash_base: Option<String>,
+    flash_size: Option<String>,
 }
 
 // Board TOML — only the [platform.pcie] topology this script generates.
@@ -134,6 +164,8 @@ struct KernelConfig {
     flash_erase_block_size: String,
     flash_erase_cmd: String,
     bootsel: BootselConfig,
+    /// RP2040 only: its unique ID lives in the flash device.
+    flash_unique_id: Option<FlashUniqueIdConfig>,
 }
 
 /// One alarm and its single named owner.
@@ -172,6 +204,20 @@ struct BootselConfig {
     ctrl_value: String,
     status_addr: String,
     gpio_hi_addr: String,
+}
+
+/// Reading the flash device's unique ID over XIP_SSI (RP2040).
+#[derive(Deserialize)]
+struct FlashUniqueIdConfig {
+    ssi_dr0_addr: String,
+    ssi_sr_addr: String,
+    ssi_sr_rfne_bit: u8,
+    ss_ctrl_addr: String,
+    ss_outover_mask: String,
+    ss_outover_low: String,
+    ss_outover_high: String,
+    cmd: String,
+    dummy_bytes: u8,
 }
 
 // ============================================================================
@@ -215,6 +261,30 @@ fn linker_ram_bytes(script: &[u8]) -> Option<u32> {
 
 fn emit_const(gen: &mut String, name: &str, ty: &str, val: &str) {
     gen.push_str(&format!("pub const {name}: {ty} = {val};\n"));
+}
+
+/// `DEVICE_RANGES`: the peripheral blocks a device window may lie in. The
+/// kernel refuses a window outside them even when the composer admitted it.
+fn emit_device_ranges(gen: &mut String, isolation: Option<&IsolationToml>) {
+    let hex64 = |s: &str| {
+        let h = s
+            .trim_start_matches("0x")
+            .trim_start_matches("0X")
+            .replace('_', "");
+        u64::from_str_radix(&h, 16).unwrap_or_else(|_| panic!("device_ranges: '{s}' is not hex"))
+    };
+    let ranges: Vec<String> = isolation
+        .and_then(|i| i.device_ranges.as_ref())
+        .into_iter()
+        .flatten()
+        .map(|r| format!("(0x{:x}, 0x{:x})", hex64(&r.base), hex64(&r.size)))
+        .collect();
+    emit_const(
+        gen,
+        "DEVICE_RANGES",
+        "&[(u64, u64)]",
+        &format!("&[{}]", ranges.join(", ")),
+    );
 }
 
 fn emit_hex_const(gen: &mut String, name: &str, hex_str: &str) {
@@ -788,6 +858,30 @@ fn generate_chip_rs(
     emit_hex_const(&mut g, "BOOTSEL_GPIO_HI_ADDR", &b.gpio_hi_addr);
     g.push('\n');
 
+    if let Some(u) = &k.flash_unique_id {
+        emit_hex_const(&mut g, "FLASH_UID_SSI_DR0_ADDR", &u.ssi_dr0_addr);
+        emit_hex_const(&mut g, "FLASH_UID_SSI_SR_ADDR", &u.ssi_sr_addr);
+        emit_const(
+            &mut g,
+            "FLASH_UID_SSI_SR_RFNE_BIT",
+            "u32",
+            &format!("{}", u.ssi_sr_rfne_bit),
+        );
+        emit_hex_const(&mut g, "FLASH_UID_SS_CTRL_ADDR", &u.ss_ctrl_addr);
+        emit_hex_const(&mut g, "FLASH_UID_SS_OUTOVER_MASK", &u.ss_outover_mask);
+        emit_hex_const(&mut g, "FLASH_UID_SS_OUTOVER_LOW", &u.ss_outover_low);
+        emit_hex_const(&mut g, "FLASH_UID_SS_OUTOVER_HIGH", &u.ss_outover_high);
+        let cmd = parse_hex(&u.cmd) as u8;
+        emit_const(&mut g, "FLASH_UID_CMD", "u8", &format!("{cmd:#04X}"));
+        emit_const(
+            &mut g,
+            "FLASH_UID_DUMMY_BYTES",
+            "usize",
+            &format!("{}", u.dummy_bytes),
+        );
+        g.push('\n');
+    }
+
     emit_const(
         &mut g,
         "IS_RP2040",
@@ -1130,6 +1224,21 @@ fn emit_bcm2712(out: &Path) {
     };
     emit_board_pcie_aliases(out, board_toml);
     println!("cargo:rerun-if-changed={board_toml}");
+
+    // The isolation facts the MMU backend compiles against: the blocks a
+    // device window may be granted in. `src/platform/bcm2712/mmu.rs` includes
+    // the result.
+    #[derive(Deserialize)]
+    struct IsolationOnly {
+        isolation: Option<IsolationToml>,
+    }
+    let silicon: IsolationOnly = toml::from_str(
+        &fs::read_to_string("targets/silicon/bcm2712.toml").expect("targets/silicon/bcm2712.toml"),
+    )
+    .expect("targets/silicon/bcm2712.toml parses");
+    let mut generated = String::new();
+    emit_device_ranges(&mut generated, silicon.isolation.as_ref());
+    fs::write(out.join("isolation_generated.rs"), generated).unwrap();
 }
 
 fn emit_board_pcie_aliases(out: &Path, board_toml: &str) {
@@ -1214,7 +1323,76 @@ fn emit_rp(out: &Path, family: Rp) {
         "{toml_path}: [memory] ram_size {toml_ram:#x} is not the linker's RAM region \
          ({ram_bytes:#x}), which is where the kernel's statics and stack live"
     );
-    let generated = generate_chip_rs(&kernel, is_rp2040, &peripherals, ram_bytes);
+    let mut generated = generate_chip_rs(&kernel, is_rp2040, &peripherals, ram_bytes);
+    // Isolation facts. A silicon with no [isolation] section compiles no
+    // backend in, so these default to "no protection unit".
+    let (model, regions) = match &silicon.isolation {
+        Some(i) => (
+            i.region_model.clone().unwrap_or_else(|| "none".into()),
+            i.regions.unwrap_or(0),
+        ),
+        None => ("none".into(), 0),
+    };
+    assert!(
+        matches!(model.as_str(), "none" | "pmsav7" | "pmsav8"),
+        "{toml_path}: [isolation] region_model '{model}' is not an MPU model"
+    );
+    emit_const(
+        &mut generated,
+        "ISOLATION_PMSAV8",
+        "bool",
+        if model == "pmsav8" { "true" } else { "false" },
+    );
+    emit_const(
+        &mut generated,
+        "ISOLATION_PMSAV7",
+        "bool",
+        if model == "pmsav7" { "true" } else { "false" },
+    );
+    emit_const(
+        &mut generated,
+        "ISOLATION_REGIONS",
+        "u8",
+        &format!("{regions}"),
+    );
+    emit_device_ranges(&mut generated, silicon.isolation.as_ref());
+    // The peripheral gate, and each grantable block's register in it (0 for
+    // a block with none), parallel to `DEVICE_RANGES`.
+    let iso = silicon.isolation.as_ref();
+    let gates: Vec<String> = iso
+        .and_then(|i| i.device_ranges.as_ref())
+        .into_iter()
+        .flatten()
+        .map(|r| format!("0x{:x}", r.gate.as_deref().map(parse_hex).unwrap_or(0)))
+        .collect();
+    emit_const(
+        &mut generated,
+        "DEVICE_RANGE_GATES",
+        "&[u32]",
+        &format!("&[{}]", gates.join(", ")),
+    );
+    let gate = match iso.and_then(|i| i.peripheral_gate.as_ref()) {
+        Some(g) => format!(
+            "Some((0x{:08x}, 0x{:x}, 0x{:x}))",
+            parse_hex(&g.base),
+            parse_hex(&g.first),
+            parse_hex(&g.last)
+        ),
+        None => "None".into(),
+    };
+    emit_const(
+        &mut generated,
+        "PERIPHERAL_GATE",
+        "Option<(u32, u32, u32)>",
+        &gate,
+    );
+    // The whole XIP flash, which a contained module may read and execute.
+    if let Some(m) = &silicon.memory {
+        if let (Some(b), Some(z)) = (&m.flash_base, &m.flash_size) {
+            emit_hex_const(&mut generated, "FLASH_BASE", b);
+            emit_hex_const(&mut generated, "FLASH_SIZE", z);
+        }
+    }
     File::create(out.join("chip_generated.rs"))
         .unwrap()
         .write_all(generated.as_bytes())

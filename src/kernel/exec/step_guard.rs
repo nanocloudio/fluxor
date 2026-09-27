@@ -334,6 +334,15 @@ pub fn record_mpu_fault(module_idx: usize) {
     GUARDED_MODULE[c].store(module_idx as u8, Ordering::Release);
 }
 
+/// Record that a gated module was forced out of an entry for running past
+/// its step deadline. The scheduler handles it exactly as a step the guard
+/// alarm caught: the module's timeout policy applies.
+pub fn record_forced_timeout(module_idx: usize) {
+    let c = cur_core();
+    STEP_TIMED_OUT[c].store(true, Ordering::Release);
+    GUARDED_MODULE[c].store(module_idx as u8, Ordering::Release);
+}
+
 /// Check if an MPU fault is pending on the current core (and clear).
 #[inline]
 pub fn check_and_clear_mpu_fault() -> bool {

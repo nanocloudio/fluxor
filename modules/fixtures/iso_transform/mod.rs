@@ -1,28 +1,14 @@
-//! EL0 isolated transform module — proves the `SVC #1` channel-syscall
-//! gateway end to end: a useful module that runs entirely at EL0 under its
-//! own page table, reads from its input channel, transforms the bytes, and
-//! writes to its output channel — all via mediated syscalls, with zero
-//! access to kernel memory or the `SyscallTable` function pointers.
+//! Isolated transform module — a useful module that runs gated, reads its
+//! input channel, transforms the bytes and writes its output channel, all
+//! through the gateway: its `SyscallTable` is the gateway's, so every channel
+//! call is a veneer that traps, and the kernel copies between the channel and
+//! this module's own buffer after checking both the handle and the buffer.
 //!
-//! Wire it between two ordinary (non-isolated) modules with
-//! `protection: isolated`; see `examples/iso_transform/pi5.yaml`.
+//! Wire it between two ordinary modules with `protection: isolated`; see
+//! `examples/iso_transform/pi5.yaml`.
 //!
 //! Transform: byte-wise XOR with `0xFF` (involutive, so a second instance
 //! restores the original — handy for a loopback sanity check).
-//!
-//! ## Why this is "useful" isolation (vs the iso_probe diagnostic)
-//!
-//! `module_step` performs real I/O through the kernel without holding any
-//! kernel pointer: `channel_poll` / `channel_read` / `channel_write` are
-//! issued as `SVC #1`, the kernel validates the EL0 buffer against this
-//! module's own mapped regions, services the channel op at EL1, and `ERET`s
-//! back to EL0. Heap, providers, timers and events are NOT available in
-//! this slice (a later gateway extension) — channel I/O is the highest-value
-//! surface with the smallest privilege footprint.
-//!
-//! **Requires `protection: isolated`.** Run non-isolated it would execute at
-//! EL1, where `svc #1` traps to the current-EL vector (no syscall path) —
-//! so this module is only meaningful under EL0 isolation.
 
 #![no_std]
 #![allow(
@@ -52,35 +38,6 @@ use abi::SyscallTable;
 
 include!("../../sdk/runtime.rs");
 
-// ---- EL0 syscall gateway (SVC #1) ------------------------------------------
-//
-// Calling convention mirrors `kernel::module::el0_abi`:
-//   x0 = op, x1 = channel handle, x2 = buffer ptr, x3 = len -> x0 = result.
-const SYS_CHANNEL_READ: u64 = 0;
-const SYS_CHANNEL_WRITE: u64 = 1;
-const SYS_CHANNEL_POLL: u64 = 2;
-
-/// Issue one channel syscall via `SVC #1`. Only valid at EL0 (isolated).
-///
-/// # Safety
-/// `ptr`/`len` must describe a buffer inside this module's own mapped EL0
-/// regions (the kernel re-validates and returns EFAULT otherwise). For
-/// poll, pass a null ptr and 0 len.
-#[inline(always)]
-unsafe fn svc1(op: u64, chan: i32, ptr: *mut u8, len: usize) -> i32 {
-    let ret: u64;
-    core::arch::asm!(
-        "svc #1",
-        in("x0") op,
-        in("x1") chan as i64,
-        in("x2") ptr as u64,
-        in("x3") len as u64,
-        lateout("x0") ret,
-        clobber_abi("C"),
-    );
-    ret as i32
-}
-
 // ============================================================================
 // Module State
 // ============================================================================
@@ -105,6 +62,8 @@ struct IsoTransformState {
     /// pending region is `out_buf[out_head..out_len]`.
     out_len: usize,
 }
+
+declare_module_state_bytes!(IsoTransformState);
 
 // ============================================================================
 // Exported functions
@@ -132,7 +91,7 @@ pub extern "C" fn module_new(
     state_size: usize,
     syscalls: *const c_void,
 ) -> i32 {
-    // Runs at EL1 during instantiation — `dev_log` is allowed here.
+    // Runs gated like `module_step`: `dev_log` below is a gateway call.
     unsafe {
         if syscalls.is_null() {
             return -2;
@@ -156,10 +115,9 @@ pub extern "C" fn module_new(
 #[no_mangle]
 #[link_section = ".text.module_step"]
 pub extern "C" fn module_step(state: *mut u8) -> i32 {
-    // Runs at EL0 under the module's page table. SYSCALL-MEDIATED: all
-    // channel I/O goes through `svc1` (SVC #1); no kernel pointer is touched.
     unsafe {
         let s = &mut *(state as *mut IsoTransformState);
+        let sys = &*s.syscalls;
         if s.in_chan < 0 || s.out_chan < 0 {
             return -1;
         }
@@ -169,16 +127,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // A previous tick's write may have been short (downstream backpressure
         // returns fewer bytes than offered, possibly 0). The unwritten tail
         // lives in `out_buf[out_head..out_len]`; drain it before touching the
-        // input so no transformed byte is ever dropped. The SVC gateway's
-        // write returns bytes actually written (>=0) or a negative errno.
+        // input so no transformed byte is ever dropped. A write returns the
+        // bytes actually written (>=0) or a negative errno.
         if s.out_head < s.out_len {
             let pending = s.out_len - s.out_head;
-            let w = svc1(
-                SYS_CHANNEL_WRITE,
-                s.out_chan,
-                s.out_buf.as_mut_ptr().add(s.out_head),
-                pending,
-            );
+            let w = (sys.channel_write)(s.out_chan, s.out_buf.as_ptr().add(s.out_head), pending);
             if w == E_AGAIN {
                 // Downstream FIFO full — backpressure, not an error. Hold the
                 // pending tail staged and retry next tick (consume no input).
@@ -200,36 +153,16 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
         // --- Phase 2: read new input only once output is fully drained. -----
 
-        // How many bytes are waiting on the input channel? The SVC gateway's
-        // poll returns the readable byte count (not the SDK readiness bitmask)
-        // — see note in the gateway dispatch. Distinguish "nothing available"
-        // from a real gateway error: 0 (and EAGAIN) = idle → Continue; any other
-        // negative (EPERM/EFAULT/EINVAL — a denied handle, bad pointer, or bad
-        // op) is a genuine fault and MUST propagate, not be silently swallowed.
-        let avail = svc1(SYS_CHANNEL_POLL, s.in_chan, core::ptr::null_mut(), 0);
-        if avail == 0 || avail == E_AGAIN {
-            return 0; // Continue — nothing to read this tick
-        }
-        if avail < 0 {
-            return avail; // gateway error → fault per policy
-        }
-
-        // Read only as much as we can buffer (BUF_LEN), so the staging buffer
-        // can hold the entire transformed result and we never have to consume
-        // input we cannot stage. The read happens into the staging buffer
-        // directly (mapped in this module's EL0 region, so the kernel's
-        // pointer check accepts it).
-        let want = if (avail as usize) < BUF_LEN {
-            avail as usize
-        } else {
-            BUF_LEN
-        };
-        let n = svc1(SYS_CHANNEL_READ, s.in_chan, s.out_buf.as_mut_ptr(), want);
+        // Read at most what the staging buffer holds, so every byte read can
+        // be transformed and staged. 0 (and EAGAIN) = nothing this tick; any
+        // other negative — a refused handle or buffer — is a genuine fault
+        // and propagates.
+        let n = (sys.channel_read)(s.in_chan, s.out_buf.as_mut_ptr(), BUF_LEN);
         if n == 0 || n == E_AGAIN {
             return 0; // nothing to read right now → Continue
         }
         if n < 0 {
-            return n; // gateway error (EPERM/EFAULT/EINVAL) → fault, don't hide it
+            return n;
         }
         let n = n as usize;
 
@@ -243,12 +176,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // Attempt the first write now; whatever the downstream cannot accept
         // stays staged and is retried in Phase 1 on subsequent ticks. The
         // write returns bytes written (0 under full backpressure) or <0 errno.
-        let w = svc1(
-            SYS_CHANNEL_WRITE,
-            s.out_chan,
-            s.out_buf.as_mut_ptr(),
-            s.out_len,
-        );
+        let w = (sys.channel_write)(s.out_chan, s.out_buf.as_ptr(), s.out_len);
         if w == E_AGAIN {
             // Downstream FIFO full — keep the freshly-staged result
             // (out_head=0, out_len=n) and retry in Phase 1 next tick.

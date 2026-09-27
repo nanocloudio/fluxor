@@ -527,7 +527,7 @@ mod profile_embedded {
         pub const CONFIG_ARENA_SIZE: usize = 16 * 1024;
         #[cfg(fluxor_silicon = "rp2040")]
         pub const CONFIG_ARENA_SIZE: usize = 8 * 1024;
-        pub const LOG_RING_CAPACITY: usize = 4096;
+        pub const LOG_RING_CAPACITY: usize = 8192;
         /// No Tier B on MCU-class targets: elasticity compiles out
         /// — `ELASTIC_ALLOC` denies.
         pub const ELASTIC_REGION_SIZE: usize = 0;

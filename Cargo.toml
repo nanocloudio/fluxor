@@ -114,7 +114,7 @@ embedded-platform = []
 # slot, owner fields on graph objects compile out, and the authorization
 # helpers become no-ops — so single-tenant bare-metal targets (rp*) carry no
 # ownership cost. Enabled by the multi-Pod targets (bcm2712, host-linux).
-multitenant = []
+multitenant = ["fluxor-contracts/alloc"]
 
 # Test-only: bcm2712 fires a one-shot graph rebuild ~5 s after boot so the
 # live-rebuild bridge can be observed on hardware. Never enabled in
@@ -153,9 +153,9 @@ rp-critical-section = [
 
 # Single binary for both RP2350A and RP2350B. Always compile with B (superset).
 # Runtime silicon detection (SYSINFO.package_sel) gates pin availability.
-chip-rp2350b = ["rp", "rp-critical-section", "embedded-platform"]
+chip-rp2350b = ["rp", "rp-critical-section", "embedded-platform", "kernel-mpu"]
 # RP2040 (Cortex-M0+, 30 GPIO, no PIO2). Requires target thumbv6m-none-eabi.
-chip-rp2040 = ["rp", "rp2040-boot2", "embedded-platform"]
+chip-rp2040 = ["rp", "rp2040-boot2", "embedded-platform", "kernel-mpu"]
 
 # Non-production RP overclock. Selects the silicon's declared
 # `overclock_sys_hz` instead of its production `sys_hz`; a silicon that
@@ -172,6 +172,9 @@ rp-overclock = []
 # would flip only the capabilities it actually has.
 #   kernel-vm: kernel-managed page-table virtual memory + EL0 module isolation
 #              (external-arena paging, isolated/page-aligned allocation).
+#   kernel-mpu: MPU-based module isolation on a microcontroller: gated
+#              modules run unprivileged on their own process stack behind the
+#              gateway, inside regions from the shared planner.
 #   smp:       multiple hardware execution domains (multi-core domain ordering).
 #   dtb:       boot configuration/identity read from a device tree.
 #   pq-vault:  the key vault's ML-DSA suites. A signing operation needs ~58 KB
@@ -188,6 +191,7 @@ rp-overclock = []
 #              without it reports the RSA suites unsupported and a graph
 #              naming an RSA identity there is refused at compose.
 kernel-vm = []
+kernel-mpu = []
 smp = []
 dtb = []
 pq-vault = []

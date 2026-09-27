@@ -122,6 +122,10 @@ pub mod rp_io;
 /// machine addressing is host-testable; the register access is `rp`-gated.
 #[path = "rp/pio_regs.rs"]
 pub mod rp_pio_regs;
+/// RP module protection: unprivileged gated modules behind the gateway.
+#[cfg(all(feature = "rp", feature = "kernel-mpu"))]
+#[path = "rp/protection.rs"]
+pub mod rp_protection;
 /// RP platform provider registrations.
 #[cfg(feature = "rp")]
 #[path = "rp/providers.rs"]
@@ -161,3 +165,7 @@ pub mod rp_usb_events;
 /// arithmetic is host-testable; role-exclusive from the device backend.
 #[path = "rp/usb_host.rs"]
 pub mod rp_usb_host;
+/// RP liveness watchdog: a wedged board falls back to BOOTSEL.
+#[cfg(feature = "rp")]
+#[path = "rp/watchdog.rs"]
+pub mod rp_watchdog;

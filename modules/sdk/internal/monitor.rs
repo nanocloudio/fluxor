@@ -43,7 +43,8 @@ pub const STEP_HISTOGRAM_QUERY: u32 = 0x0C55;
 ///                               gate has blocked this module
 ///   [14..18] slot_generation: u32
 ///   [18]     name_len: u8 — 0 when the buffer had no room for a name
-///   [19]     reserved
+///   [19]     protection: u8 — the level the kernel enforces: 0 none,
+///                               1 guarded, 2 contained, 3 isolated
 ///   [20..]   name: name_len bytes — the module's type name
 /// ```
 ///
@@ -51,9 +52,9 @@ pub const STEP_HISTOGRAM_QUERY: u32 = 0x0C55;
 /// actually got rather than assuming the one it asked for. A buffer of
 /// exactly `MODULE_STATE_LEN` is valid and yields `name_len = 0`.
 ///
-/// Protection level and trust tier are deliberately absent: the
-/// scheduler does not track either per module, and a field invented at
-/// the emitter would be a reading nobody could trust.
+/// Trust tier is deliberately absent: the scheduler does not keep it per
+/// module, and a field invented at the emitter would be a reading nobody
+/// could trust.
 pub const MODULE_STATE_QUERY: u32 = 0x0C57;
 
 /// The fixed header `MODULE_STATE_QUERY` always writes. A variable

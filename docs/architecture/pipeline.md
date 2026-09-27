@@ -395,12 +395,14 @@ Modules can declare a protection level:
 |-------|------|----------|
 | 0 | None | Direct call, no isolation |
 | 1 | Guarded | Step guard timer detects timeouts |
-| 2 | Isolated | Hardware memory protection (MPU on RP2350, MMU on Pi 5) per step |
+| 2 | Contained | Unprivileged: its own RAM and all of flash (MPU targets) |
+| 3 | Isolated | Unprivileged: its own RAM and its own code (MPU on RP, MMU on Pi 5) |
 
-Isolated modules execute with their state, code, and channel buffers
-mapped via the MPU/MMU and everything else excluded. A wild pointer
-write outside their permitted regions raises a fault that the scheduler
-catches, classifies, and handles via a per-module fault policy:
+A gated (contained or isolated) module reaches the kernel only through the
+gateway, which checks every pointer, channel and handle it is handed; see
+[module_isolation.md](module_isolation.md). An access outside its regions
+raises a fault that the scheduler catches, classifies, and handles via a
+per-module fault policy:
 
 | Policy | Behaviour |
 |--------|-----------|
@@ -500,7 +502,7 @@ state from the state arena, and wraps loaded modules in a
 `DynamicModule` that implements the kernel's `Module` trait. Related
 concerns live alongside it in `src/kernel/module/`: `syscalls.rs`
 (the syscall table handed to modules), `provider.rs` (provider
-contract dispatch), `el0_abi.rs` (EL0 isolation ABI), and
+contract dispatch), `gateway.rs` (the gated modules' syscall gateway), and
 `ota_stage.rs` (over-the-air staging).
 
 The loader resolves exports via FNV-1a name hashing; there is no

@@ -355,9 +355,9 @@ upgrade that moves a row is caught the day it lands.
 
 #### Stack depth
 
-A module steps on a stack it does not own — the kernel's on an RP part, where
-every module steps in turn on one stack; its own fixed stack when it is
-isolated on an MMU target — so the composer admits its depth before a device
+A module steps on a stack it did not size — the kernel's on an RP part, where
+every ungated module steps in turn on one stack; a stack in its own private
+region when it is gated — so the composer admits its depth before a device
 runs it. `fluxor modules build` measures it: the compile emits the assembly
 beside the object, and the build walks the call graph from every `module_*`
 entry point, summing each function's frame along the deepest path. The
@@ -383,8 +383,9 @@ A declaration is a floor: the manifest records the larger of it and the
 measurement, and a declaration below the measurement fails the build. The
 composer refuses a graph on an RP target whose deepest module does not fit
 the stack (see [The RP stack](hal_architecture.md#the-rp-stack)), or that
-carries a module with no figure; on an MMU target it refuses an isolated
-module deeper than `[isolation] isolated_stack_kb`. The scheduler fences each
+carries a module with no figure; it sizes a gated module's private region for
+its depth, and on an MMU target refuses an isolated module deeper than
+`[isolation] isolated_stack_kb`. The scheduler fences each
 step at the admitted depth on the device and faults a module that crosses it,
 which is what catches the paths the walk does not follow.
 
@@ -491,17 +492,15 @@ Modules can be assigned a protection level at config time:
 - **Level 0 (None)** — direct call, no isolation.
 - **Level 1 (Guarded)** — step guard timer detects timeouts. A module
   that overruns its step deadline is marked as faulted.
-- **Level 2 (Isolated)** — hardware memory protection, on targets whose
-  kernel isolates modules: the MMU targets (Pi 5), where a module runs at
-  EL0 under its own page table mapping only its state, code, channel
-  buffers and heap, on a 64 KiB stack (`ISOLATED_STACK_BYTES`) above an
-  unmapped guard page; any other access raises a fault. The composer
-  refuses an isolated module whose declared stack (see
-  [Stack depth](#stack-depth)) exceeds that stack, and the loader repeats
-  the check for a blob that reached the device some other way. The kernel
-  does not isolate modules on RP2040 or RP2350, so an RP target refuses an
-  isolation request at compose and at load rather than run the module
-  without it.
+- **Level 2 (Contained)** and **Level 3 (Isolated)** — the gated levels.
+  The module runs unprivileged, reaching only its own private region
+  (stack, state, heap) and its code — all of flash when contained — and
+  the kernel only through the gateway; any other access raises a fault.
+  Implemented on rp2040 and rp2350 (MPU) and on the Pi 5 (EL0 under a
+  per-module page table, isolated only). A request is a floor: the target
+  provides the weakest level it implements at or above it, and refuses one
+  above everything it implements. See
+  [module_isolation.md](module_isolation.md).
 
 Faulted modules transition through `Running → Faulted → Recovering`
 (or `Terminated`) according to a per-module fault policy:

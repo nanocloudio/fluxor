@@ -283,7 +283,15 @@ core::arch::global_asm!(
 
 #[cfg(feature = "rp")]
 unsafe extern "C" {
-    /// The fault entry, in assembly above.
+    /// The fault entry, in assembly above. With module protection compiled
+    /// in, its trap reaches this by name for the kernel's own faults.
+    #[cfg_attr(
+        feature = "kernel-mpu",
+        allow(
+            dead_code,
+            reason = "reached from the protection trap's assembly by name"
+        )
+    )]
     fn FaultTrampoline() -> !;
     /// Where a fault goes once decoded. Defined by the runtime, which owns
     /// the console the report has to reach; this file cannot log.
@@ -391,7 +399,7 @@ impl Vector {
 #[no_mangle]
 pub static EXCEPTIONS: [Vector; 14] = [
     Vector::handler(DefaultExceptionHandler),     // 2 NMI
-    Vector::handler(FaultTrampoline),             // 3 HardFault
+    Vector::handler(FAULT),                       // 3 HardFault
     exception_slot(vector::index::MEM_MANAGE),    // 4
     exception_slot(vector::index::BUS_FAULT),     // 5
     exception_slot(vector::index::USAGE_FAULT),   // 6
@@ -399,19 +407,42 @@ pub static EXCEPTIONS: [Vector; 14] = [
     Vector::reserved(),                           // 8
     Vector::reserved(),                           // 9
     Vector::reserved(),                           // 10
-    Vector::handler(DefaultExceptionHandler),     // 11 SVCall
+    Vector::handler(SVCALL),                      // 11 SVCall
     exception_slot(vector::index::DEBUG_MONITOR), // 12
     Vector::reserved(),                           // 13
-    Vector::handler(DefaultExceptionHandler),     // 14 PendSV
+    Vector::handler(PENDSV),                      // 14 PendSV
     Vector::handler(DefaultExceptionHandler),     // 15 SysTick
 ];
+
+/// Where faults, SVCs and PendSV go. With module protection compiled in, all
+/// three enter its trap, which serves a gated module's trap and hands
+/// anything else — the kernel's own fault — to `FaultTrampoline` as before.
+#[cfg(all(feature = "rp", feature = "kernel-mpu"))]
+const FAULT: unsafe extern "C" fn() -> ! = fluxor_rp_trap;
+#[cfg(all(feature = "rp", not(feature = "kernel-mpu")))]
+const FAULT: unsafe extern "C" fn() -> ! = FaultTrampoline;
+#[cfg(all(feature = "rp", feature = "kernel-mpu"))]
+const SVCALL: unsafe extern "C" fn() -> ! = fluxor_rp_trap;
+#[cfg(all(feature = "rp", not(feature = "kernel-mpu")))]
+const SVCALL: unsafe extern "C" fn() -> ! = DefaultExceptionHandler;
+#[cfg(all(feature = "rp", feature = "kernel-mpu"))]
+const PENDSV: unsafe extern "C" fn() -> ! = fluxor_rp_trap;
+#[cfg(all(feature = "rp", not(feature = "kernel-mpu")))]
+const PENDSV: unsafe extern "C" fn() -> ! = DefaultExceptionHandler;
+
+#[cfg(all(feature = "rp", feature = "kernel-mpu"))]
+unsafe extern "C" {
+    /// The module-protection trap (`platform/rp/protection.rs`). Typed as
+    /// diverging to fit the table; it returns only by exception return.
+    fn fluxor_rp_trap() -> !;
+}
 
 /// A handler where the architecture implements the slot, zero where it does
 /// not — so one table serves both chips without a `cfg` per entry.
 #[cfg(feature = "rp")]
 const fn exception_slot(slot: usize) -> Vector {
     if vector::slot_is_implemented(slot) {
-        Vector::handler(FaultTrampoline)
+        Vector::handler(FAULT)
     } else {
         Vector::reserved()
     }

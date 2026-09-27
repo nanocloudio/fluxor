@@ -196,8 +196,6 @@ fn wasm_sleep_until(_deadline_us: u64) -> u32 {
     crate::kernel::sys::hal::WOKEN_DEADLINE
 }
 
-use crate::kernel::sys::hal::protected_step_direct as fluxor_protected_step_direct;
-
 pub static WASM_HAL_OPS: HalOps = HalOps {
     // No durable home for a sealed blob on this platform yet, and saying so
     // is the point: the vault keeps its in-RAM entry and behaves exactly as
@@ -258,10 +256,10 @@ pub static WASM_HAL_OPS: HalOps = HalOps {
     smp_max_domains: || 1,
     protection_set_enabled: |_| {},
     protection_reset: || {},
-    protection_register_module: |_, _, _, _, _, _, _| {},
-    protection_set_channel_region: |_, _, _| {},
-    protection_set_isolated_channels: |_, _, _, _| {},
-    protected_step: fluxor_protected_step_direct,
+    protection_register_module: |_, _, _, _, _, _, _| false,
+    protection_release_module: |_| {},
+    protection_gateway_table: crate::kernel::sys::hal::no_gateway_table,
+    protected_call: crate::kernel::sys::hal::protected_call_unavailable,
     protection_map_page: |_, _, _, _| {},
     protection_unmap_page: |_, _| {},
     // The wasm runtime owns the stack and traps on its overflow.

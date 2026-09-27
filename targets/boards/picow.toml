@@ -49,11 +49,17 @@ reserved_pins = [23, 24, 25, 29]
 phy = "wifi"
 nic = "cyw43"
 
-# Public hardware-rig contract.
+# Public hardware-rig contract. Board-level facts only — which board is
+# attached and how it is reached is a private rig profile.
+#
+# picotool needs nobody at the bench: it takes a running board into BOOTSEL
+# over the reset interface, writes the image and reboots it. It finds the
+# board again by serial, which on RP2040 is the flash device's unique ID in
+# both BOOTSEL and a running image.
 [rig]
 artifact = "uf2"
 deploy = ["deploy.uf2_mount", "deploy.picotool", "deploy.swd"]
-preferred_deploy = "deploy.uf2_mount"
+preferred_deploy = "deploy.picotool"
 console = ["console.usb_cdc", "console.serial"]
 preferred_console = "console.usb_cdc"
 observe = ["observe.console_regex", "observe.usb_enumeration"]

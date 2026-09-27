@@ -78,8 +78,13 @@ SECTIONS {
 
     /* Stack in RAM, not part of the loadable image. 1 MB covers the deep
        call chains in the P-256 primitives (each curve constant materialised
-       on the stack per call). */
-    . = ALIGN(16);
+       on the stack per call). The page below it is the guard: left unmapped
+       in the kernel's table (and every isolated module's), so an overflow
+       takes a translation fault at an address instead of writing through
+       whatever lies beneath. */
+    . = ALIGN(4096);
+    __stack_guard = .;
+    . = . + 4096;
     __stack_start = .;
     . = . + 1M;
     __stack_end = .;

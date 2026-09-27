@@ -1,10 +1,14 @@
 version = "1.0.0"
 hardware_targets = ["rp2040", "rp2350"]
 
+# status, netif_state and wifi_ctrl carry control messages of a few bytes
+# (cyw43 reads a command into 128), so they take 512-byte rings; the 8 KiB
+# default would spend rp2040's whole 16 KiB buffer arena on the three.
 [[ports]]
 name = "status"
 direction = "input"
 content_type = "FmpMessage"
+buffer_size = 512
 
 [[ports]]
 name = "scan_data"
@@ -17,11 +21,13 @@ name = "netif_state"
 index = 2
 direction = "input"
 content_type = "FmpMessage"
+buffer_size = 512
 
 [[ports]]
 name = "wifi_ctrl"
 direction = "output"
 content_type = "FmpMessage"
+buffer_size = 512
 
 [commands]
 accepts = ["radio_ready", "connected", "disconnected", "scan_done", "scan_result"]

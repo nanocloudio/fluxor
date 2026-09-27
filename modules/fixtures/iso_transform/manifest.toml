@@ -1,9 +1,8 @@
 version = "1.0.0"
-hardware_targets = ["bcm2712"]
+hardware_targets = ["bcm2712", "rp2350", "rp2040"]
 
-# EL0 isolated transform module — proves the SVC #1 channel-syscall gateway
-# (channel_read / channel_write / channel_poll) end to end. Runs at EL0 under
-# its own page table when wired with `protection: isolated`, doing real
-# channel I/O via mediated syscalls with no access to kernel memory. REQUIRES
-# `protection: isolated` (run non-isolated, its `svc #1` has no EL1 handler).
-# Diagnostic/demonstration — not loaded by production configs.
+# Isolated transform module — real channel I/O through the gateway: it reads
+# its input, XORs the bytes and writes its output, with the kernel copying
+# between the channels and its own buffer. An ordinary SDK module, so it runs
+# gated or not; gated is the point. Diagnostic — not loaded by production
+# configs.

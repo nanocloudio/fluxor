@@ -188,6 +188,20 @@ pub fn merge_owning_lane(ch: i32) -> Option<usize> {
     None
 }
 
+/// Whether `handle` is one of `module_idx`'s channel ports — in, out or
+/// control. The gateway's authority check for a gated module's channel ops.
+pub fn module_owns_channel(module_idx: usize, handle: i32) -> bool {
+    if module_idx >= MAX_MODULES || handle < 0 {
+        return false;
+    }
+    // SAFETY: SCHED scheduler-thread owned; ports are written at graph setup
+    // and read here; module_idx bounded above.
+    let ports = unsafe { &SCHED.ports[module_idx] };
+    ports.in_chans.contains(&handle)
+        || ports.out_chans.contains(&handle)
+        || ports.ctrl_chans.contains(&handle)
+}
+
 /// Read a port channel handle for a module. Mirror of `set_module_port`.
 /// Returns -1 if unset or out of range.
 pub fn get_module_port(module_idx: usize, port_type: u8, port_index: u8) -> i32 {
@@ -356,10 +370,14 @@ pub struct SchedulerState {
     pub(crate) in_place_writer: [bool; MAX_MODULES],
     /// Per-module deferred ready flag (header flags bit 2)
     pub(crate) deferred_ready: [bool; MAX_MODULES],
-    /// Per-module EL0-isolation request (set from the `protection: isolated`
-    /// TLV tag 0xF5 == 2). Gates whether the module is routed through the
-    /// EL0 protected step; `none`/`guarded` modules keep the direct EL1 path.
+    /// Per-module gated flag (tag 0xF5 >= contained). Gates whether the
+    /// module is routed through the protected entry; `none`/`guarded`
+    /// modules keep the direct privileged path.
     pub(crate) isolated: [bool; MAX_MODULES],
+    /// Per-module protection level as tag 0xF5 carries it.
+    pub(crate) protection: [u8; MAX_MODULES],
+    /// Per-module device window (base, size) from tag 0xFD; size 0 = none.
+    pub(crate) device_window: [(u64, u32); MAX_MODULES],
     /// Per-module ready flag (true = outputs meaningful, false = still initializing)
     pub(crate) ready: [bool; MAX_MODULES],
     /// Per-module upstream dependency bitmask (precomputed from edges).
@@ -624,6 +642,8 @@ impl SchedulerState {
             in_place_writer: [false; MAX_MODULES],
             deferred_ready: [false; MAX_MODULES],
             isolated: [false; MAX_MODULES],
+            protection: [0; MAX_MODULES],
+            device_window: [(0, 0); MAX_MODULES],
             ready: [true; MAX_MODULES],
             upstream_mask: [ModuleMask::EMPTY; MAX_MODULES],
             completion_mask: [ModuleMask::EMPTY; MAX_MODULES],
@@ -698,7 +718,12 @@ impl SchedulerState {
             self.mailbox_safe[i] = false;
             self.in_place_writer[i] = false;
             self.deferred_ready[i] = false;
+            if crate::kernel::module::gateway::is_gated(i) {
+                crate::kernel::module::gateway::release(i);
+            }
             self.isolated[i] = false;
+            self.protection[i] = 0;
+            self.device_window[i] = (0, 0);
             self.ready[i] = true;
             self.upstream_mask[i] = ModuleMask::EMPTY;
             self.completion_mask[i] = ModuleMask::EMPTY;
