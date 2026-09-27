@@ -470,10 +470,11 @@ else:
 The kernel branches on capability, never chip identity. Chip-conditional
 behaviour is expressed as capability features that a chip feature turns on:
 `kernel-vm` (page-table VM + EL0 isolation), `kernel-mpu` (MPU isolation),
-`smp` (multi-core execution domains), `dtb` (device-tree boot). `chip-bcm2712` provides all three and is
-today the only target that does, but a future MMU-but-single-core (or
-MPU-but-multi-core) target flips only the capabilities it has; no chip name
-appears in `src/kernel`.
+`smp` (multi-core execution domains), `dtb` (device-tree boot).
+`chip-bcm2712` provides `kernel-vm`, `smp` and `dtb` and is today the only
+target that does; the RP chips provide `kernel-mpu`. A future
+MMU-but-single-core (or MPU-but-multi-core) target flips only the
+capabilities it has; no chip name appears in `src/kernel`.
 
 Anything a kernel file wants from a platform beyond these two seams is a
 boundary bug: add a `HalOps` op (behaviour), a `chip` constant (fact via

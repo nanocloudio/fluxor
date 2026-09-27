@@ -39,8 +39,6 @@ use abi::SyscallTable;
 
 include!("../../sdk/runtime.rs");
 
-/// How far below its entry the probe writes: past any admitted depth on an RP
-/// part, well inside the stack region.
 /// How far below its entry the probe writes: past the kernel stack less its
 /// reserve on RP (the fence), past the 1 MiB EL1 stack on bcm2712 (its guard
 /// page).
@@ -94,12 +92,11 @@ pub extern "C" fn module_new(
     0
 }
 
-/// Lower the stack pointer by `DEPTH`, write every word of the range, and put
-/// it back.
 /// Write downward from the stack pointer, a word every 128 bytes, until
 /// `DEPTH` below it — the order a real overflow takes, so the first thing
-/// crossed is whatever bounds the stack (the fence words, the guard page),
-/// never memory beyond it.
+/// crossed is whatever bounds the stack (the fence, the guard page), never
+/// memory beyond it. The stride is the fence's width, so one write always
+/// lands in it.
 #[inline(never)]
 fn go_deep() {
     #[cfg(target_arch = "aarch64")]

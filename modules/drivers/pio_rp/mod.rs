@@ -57,12 +57,12 @@ const TOTAL_SLOTS: usize = MAX_STREAM_SLOTS + MAX_CMD_SLOTS + MAX_RX_SLOTS;
 ///
 /// The slot buffers dominate this module's resident state, and at the large-die
 /// sizes they carry it to 41,600 B: more than the whole IP stack (20,608 B) and
-/// 63% of an RP2040 arena. The tiny-die sizes bring it to 10,880 B. A PIO driver
-/// on the die whose PIO blocks are its distinguishing feature should not be the
-/// arena's dominant term.
+/// most of an RP2040 arena. The tiny-die sizes keep it a minor term. A PIO
+/// driver on the die whose PIO blocks are its distinguishing feature should not
+/// be the arena's dominant term.
 ///
-/// Those are the figures the arena is CHARGED, which is `size_of` rounded up to
-/// the manifest's 64-byte granule — the struct itself measures 10,840 B here.
+/// What the arena is charged is `size_of` rounded up to the manifest's 64-byte
+/// granule; `fluxor build` prints the figure for each target.
 ///
 /// The trade is real and is throughput, not correctness: a smaller TX buffer
 /// holds less ahead of the state machine, so a high-rate stream underruns
@@ -76,9 +76,19 @@ const TINY_ARENA: bool = abi::config::kernel::STATE_ARENA_SIZE <= 64 * 1024;
 /// 2048 words this pair is 16 KiB of every stream slot; 512 words on a 64 KiB
 /// arena.
 const STREAM_BUF_WORDS: usize = if TINY_ARENA { 512 } else { 2048 };
-/// CMD scratch buffer size in u32 words (512 words = 2 KiB; 128 = 512 B on a
-/// 64 KiB arena).
-const CMD_SCRATCH_WORDS: usize = if TINY_ARENA { 128 } else { 512 };
+/// The largest frame a command transfer carries, in u32 words: 1600 bytes,
+/// a full Ethernet frame with the gSPI caller's headers, the size of that
+/// caller's transaction buffers. A request beyond it is refused, so the DMA
+/// can never run past the scratch it lands in. The same on every die: a
+/// frame is the same size on a small arena.
+const CMD_FRAME_WORDS: usize = 400;
+/// Words a command transfer adds around the frame: the command word on the
+/// way out; the response, a padding word and the status word on the way in.
+const CMD_HEADER_WORDS: usize = 4;
+/// TX scratch per command slot: the words the DMA pushes to the state machine.
+const CMD_TX_WORDS: usize = CMD_FRAME_WORDS + CMD_HEADER_WORDS;
+/// RX scratch per command slot: the words the DMA pulls from the state machine.
+const CMD_RX_WORDS: usize = CMD_FRAME_WORDS + CMD_HEADER_WORDS;
 /// RX stream buffer size in u32 words, also two per slot (512 words = 2 KiB
 /// each; 128 on a 64 KiB arena).
 const RX_BUF_WORDS: usize = if TINY_ARENA { 128 } else { 512 };
@@ -244,7 +254,8 @@ struct CmdSlot {
     xfer_rx_words: u32,
     xfer_total: u32,
     program: PioProgram,
-    scratch: [u32; CMD_SCRATCH_WORDS],
+    tx_scratch: [u32; CMD_TX_WORDS],
+    rx_scratch: [u32; CMD_RX_WORDS],
 }
 
 // ============================================================================
@@ -1345,12 +1356,12 @@ pub unsafe extern "C" fn pio_dispatch(
                 0
             };
 
-            if tx_words > CMD_SCRATCH_WORDS {
+            if tx_words > CMD_TX_WORDS || rx_words > CMD_RX_WORDS {
                 return -22;
             }
 
             // Copy TX data to aligned scratch
-            let scratch = (*cp).scratch.as_mut_ptr();
+            let scratch = (*cp).tx_scratch.as_mut_ptr();
             if tx_words > 0 {
                 // Zero last word (partial fill)
                 core::ptr::write_volatile(scratch.add(tx_words - 1), 0);
@@ -1378,8 +1389,7 @@ pub unsafe extern "C" fn pio_dispatch(
                 return -5;
             }
 
-            // RX writes to the second half of scratch to avoid clobbering TX data
-            let rx_scratch = scratch.add(CMD_SCRATCH_WORDS >> 1);
+            let rx_scratch = (*cp).rx_scratch.as_mut_ptr();
 
             // Atomic PIO CMD transfer via kernel — all SM setup + DMA in one call
             // to eliminate syscall latency between register writes.
@@ -1419,9 +1429,9 @@ pub unsafe extern "C" fn pio_dispatch(
             if rc < 0 {
                 return rc;
             }
-            // Started, not finished. RX lands in the second half of scratch
-            // as the transfer runs; `CMD_POLL` copies it out once both DMA
-            // channels have stopped.
+            // Started, not finished. RX lands in the RX scratch as the
+            // transfer runs; `CMD_POLL` copies it out once both DMA channels
+            // have stopped.
             (*cp).xfer_rx_ptr = rx_ptr;
             (*cp).xfer_rx_len = rx_len as u32;
             (*cp).xfer_rx_words = rx_words as u32;
@@ -1456,7 +1466,7 @@ pub unsafe extern "C" fn pio_dispatch(
             let rx_ptr = (*cp).xfer_rx_ptr;
             let rx_len = (*cp).xfer_rx_len as usize;
             if rx_words > 0 && rx_ptr != 0 && rx_len > 0 {
-                let rx_scratch = (*cp).scratch.as_ptr().add(CMD_SCRATCH_WORDS >> 1);
+                let rx_scratch = (*cp).rx_scratch.as_ptr();
                 let copy_len = if (rx_words << 2) < rx_len {
                     rx_words << 2
                 } else {

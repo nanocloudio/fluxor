@@ -6,6 +6,15 @@
 //! overlap between owners and the timer provider.
 
 use crate::kernel::exec::step_guard;
+use portable_atomic::{AtomicU32, Ordering};
+
+/// Alarm fires the step guard dropped because their target was still ahead.
+static STRAY: AtomicU32 = AtomicU32::new(0);
+
+/// How many step-guard alarm fires were dropped as not due.
+pub fn stray_count() -> u32 {
+    STRAY.load(Ordering::Relaxed)
+}
 
 // ── Step-guard backend (one implementation, both chips) ───────────────
 //
@@ -26,9 +35,13 @@ mod guard {
     }
 
     pub fn arm(deadline_us: u32) {
+        // Quiesce first: an alarm still live from the previous step could
+        // otherwise fire between the flag being cleared and the new target
+        // being written, and be read as this step's timeout.
+        alarm::set_enabled(IDX, false);
+        alarm::ack(IDX);
         step_guard::clear_timed_out();
         step_guard::set_armed(true);
-        alarm::ack(IDX);
         alarm::set_target_from_now(IDX, deadline_us);
         alarm::set_enabled(IDX, true);
     }
@@ -45,6 +58,14 @@ mod guard {
     pub fn on_timer_irq() {
         alarm::ack(IDX);
         alarm::set_enabled(IDX, false);
+        // The deadline has passed only if the counter has reached the
+        // target this arm wrote. A fire that reports a target still ahead
+        // belongs to no step; it is counted and dropped.
+        if alarm::now_raw_lo().wrapping_sub(alarm::target(IDX)) > i32::MAX as u32 {
+            STRAY.fetch_add(1, Ordering::Relaxed);
+            step_guard::set_armed(false);
+            return;
+        }
         step_guard::set_timed_out();
         step_guard::set_armed(false);
         // A gated module can be forced out: unprivileged, it holds no kernel

@@ -342,8 +342,7 @@ On rp2350 `f32` is a trap of a different kind, and a worse one. The target
 is `thumbv8m.main-none-eabihf`, so the compiler lowers `f32` to VFP
 instructions rather than calls, and the module links. The RP kernel does not
 grant the coprocessor, so the first such instruction is a NOCP UsageFault
-(CFSR bit 19), escalated to HardFault; the fault handler reports it and parks
-the node. One `f32` operation in any module stops every module on the board,
+(CFSR bit 19); the fault handler reports it and parks the node. One `f32` operation in any module stops every module on the board,
 not just its own. The FPU stays off by design: enabling it means lazy FP
 context stacking on every exception (72 more bytes on the kernel stack each
 time) and scrubbing the FP registers between modules, for no module that
@@ -386,8 +385,9 @@ the stack (see [The RP stack](hal_architecture.md#the-rp-stack)), or that
 carries a module with no figure; it sizes a gated module's private region for
 its depth, and on an MMU target refuses an isolated module deeper than
 `[isolation] isolated_stack_kb`. The scheduler fences each
-step at the admitted depth on the device and faults a module that crosses it,
-which is what catches the paths the walk does not follow.
+step at the admitted depth on the device — 128 painted bytes below it — and
+faults a module whose frames write into the fence, which is what catches the
+paths the walk does not follow.
 
 Large locals are the usual cause of a deep path, and the compiler names them:
 `rustc -C remark=stack-frame-layout -C debuginfo=2` lists every stack slot

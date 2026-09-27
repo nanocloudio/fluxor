@@ -5,8 +5,8 @@ hardware_targets = ["rp2350"]
 # built for `thumbv8m.main-none-eabihf`, so an `f32` operation compiles to a VFP
 # instruction rather than a runtime call and the module links. The kernel never
 # grants CP10/CP11 in CPACR, so the first such instruction is a NOCP
-# UsageFault, escalated to HardFault and reported by the fault park — which
-# stops the whole node, not just this module. Diagnostic only; no production
+# UsageFault, reported by the fault park — which stops the whole node, not
+# just this module. Diagnostic only; no production
 # graph loads it.
 
 [observability]

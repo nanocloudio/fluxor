@@ -11,7 +11,6 @@ use fluxor::kernel::module::syscalls;
 use fluxor::platform::planner::Hardware;
 use fluxor::platform::planner::{self, PioRole};
 
-
 /// HAL `irq_bind` for RP: enable the NVIC line for a Tier 2 module's IRQ so it
 /// dispatches through the vector table's default interrupt handler →
 /// `isr_tier2_trampoline`. The `event_handle` / `trampoline` parameters are
@@ -160,7 +159,6 @@ fn debug_drain_poll() {
         drain.poll(sink);
     }
 }
-
 
 /// Hardware bring-up, shared by both runtimes.
 ///
@@ -456,7 +454,6 @@ fn rp_merge_runtime_overrides(module_id: u16, buf: *mut u8, len: usize, max: usi
     }
 }
 
-
 // Module protection (HalOps seam): the MPU backend where it is compiled in;
 // elsewhere a gated module is refused at load and these fail closed.
 fn rp_protection_register(
@@ -497,7 +494,13 @@ unsafe fn rp_protected_call(
     #[cfg(feature = "kernel-mpu")]
     // SAFETY: forwarded from the HAL contract.
     return unsafe {
-        fluxor::platform::rp_protection::protected_call(module_idx, entry, args, params, deadline_us)
+        fluxor::platform::rp_protection::protected_call(
+            module_idx,
+            entry,
+            args,
+            params,
+            deadline_us,
+        )
     };
     #[cfg(not(feature = "kernel-mpu"))]
     {
@@ -505,7 +508,6 @@ unsafe fn rp_protected_call(
         fluxor::kernel::sys::hal::PROTECTED_CALL_REFUSED
     }
 }
-
 
 static RP_HAL_OPS: HalOps = HalOps {
     // No durable home for a sealed blob on this platform yet, and saying so
@@ -887,9 +889,7 @@ pub unsafe extern "C" fn fluxor_rp_main() -> ! {
         fluxor::platform::rp_usb_device::attach();
         fluxor::platform::rp_uart::write_str("[fluxor] usb: attached\r\n");
     } else {
-        fluxor::platform::rp_uart::write_str(
-            "[fluxor] usb: controller never left reset\r\n",
-        );
+        fluxor::platform::rp_uart::write_str("[fluxor] usb: controller never left reset\r\n");
     }
 
     let Some((hw, _plan)) = rp_boot_hardware() else {
@@ -987,9 +987,10 @@ fn rp_run_main_loop(module_count: usize) -> Option<(*const u8, usize)> {
                 // SAFETY: as above.
                 unsafe { NEXT_WORST_MS = now_ms.saturating_add(5000) };
                 log::info!(
-                    "[sched] worst_us={} tick_us={}",
+                    "[sched] worst_us={} tick_us={} guard_stray={}",
                     scheduler::domain_worst_step_us(0),
-                    scheduler::tick_us()
+                    scheduler::tick_us(),
+                    fluxor::platform::rp_step_guard::stray_count()
                 );
                 // The deepest the one stack every module steps on has been,
                 // against the region it has. The composer admitted the graph
@@ -1501,9 +1502,15 @@ fn usb_diag_report(pump: &fluxor::kernel::usb::device::DevicePump) {
     );
     log::info!(
         "[usb] epctl={:08x},{:08x},{:08x},{:08x} bufctl={:08x},{:08x},{:08x},{:08x},{:08x},{:08x}",
-        r.ep_control[0], r.ep_control[1], r.ep_control[2], r.ep_control[3],
-        r.buf_control[0], r.buf_control[1], r.buf_control[2],
-        r.buf_control[3], r.buf_control[4], r.buf_control[5],
+        r.ep_control[0],
+        r.ep_control[1],
+        r.ep_control[2],
+        r.ep_control[3],
+        r.buf_control[0],
+        r.buf_control[1],
+        r.buf_control[2],
+        r.buf_control[3],
+        r.buf_control[4],
+        r.buf_control[5],
     );
 }
-

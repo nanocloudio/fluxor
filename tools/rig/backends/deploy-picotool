@@ -2,30 +2,128 @@
 """deploy-picotool — flash a running board over USB with picotool.
 
 Verb:
-  stage   (actuator) — `picotool load -f -x <artifact>`: the board's reset
-                       interface takes it into BOOTSEL, the image is written,
-                       and it starts the application. A board already in
+  stage   (actuator) — take the board into BOOTSEL over its reset interface,
+                       write the image and start it. A board already in
                        BOOTSEL — where the liveness watchdog leaves a wedged
                        one — is flashed and started the same way. No button,
                        no drive, nobody at the bench.
 
 Binding fields:
-  serial      (str, optional)  the board's USB serial; passed as `--ser` so
-                               the right board is flashed when several are
-                               attached.
+  serial      (str, optional)  the board's USB serial; selects the board when
+                               several are attached.
   picotool    (str, optional)  path to the picotool binary (default: on PATH).
   settle_s    (int, optional)  seconds to wait for the console to re-enumerate
                                after the reboot before reporting (default 8).
+
+The board is followed across the reboot by its USB port, not by its serial:
+the RP2040 bootrom reports one fixed serial for every RP2040, so a running
+board's serial — the flash device's unique ID — never matches it in BOOTSEL.
+The serial finds the running board; the port it sits on finds the BOOTSEL
+device it becomes; picotool is then pointed at that bus address. A board
+found already in BOOTSEL is matched by serial where the bootrom reports a
+real one (RP2350), and otherwise taken only when it is the sole BOOTSEL
+device on the host.
 
 Requires the board to run firmware that carries the reset interface and the
 pico-sdk USB identity, which every native RP image does; and a udev rule
 that lets an unprivileged user open Raspberry Pi USB devices.
 """
+
 import glob
 import json
+import os
 import subprocess
 import sys
 import time
+
+RPI_VENDOR = "2e8a"
+# The bootrom's PICOBOOT device: RP2040 and RP2350.
+BOOTSEL_PRODUCTS = {"0003", "000f"}
+SYSFS = "/sys/bus/usb/devices"
+
+
+def _read(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def usb_devices():
+    """Every Raspberry Pi USB device the host sees, keyed by its port."""
+    found = []
+    for port in os.listdir(SYSFS):
+        base = os.path.join(SYSFS, port)
+        if _read(os.path.join(base, "idVendor")) != RPI_VENDOR:
+            continue
+        found.append({
+            "port": port,
+            "product": _read(os.path.join(base, "idProduct")),
+            "serial": _read(os.path.join(base, "serial")),
+            "bus": _read(os.path.join(base, "busnum")),
+            "address": _read(os.path.join(base, "devnum")),
+        })
+    return found
+
+
+def in_bootsel(dev):
+    return dev["product"] in BOOTSEL_PRODUCTS
+
+
+def by_address(dev):
+    return ["--bus", dev["bus"], "--address", dev["address"]]
+
+
+def wait_for_bootsel(port, timeout_s=15.0):
+    """The BOOTSEL device that appears on `port` after a reboot into it."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        for dev in usb_devices():
+            if dev["port"] == port and in_bootsel(dev):
+                return dev
+        time.sleep(0.2)
+    return None
+
+
+def run_tool(cmd):
+    run = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    if run.returncode != 0:
+        sys.stderr.write(run.stdout[-2000:] + run.stderr[-2000:])
+        print(f"deploy-picotool: `{' '.join(cmd)}` exited {run.returncode}", file=sys.stderr)
+    return run.returncode == 0
+
+
+def select_board(tool, serial):
+    """The picotool device-selection arguments for the board in BOOTSEL.
+
+    Takes a running board into BOOTSEL first. None when the board cannot be
+    told apart from the others on the host."""
+    devices = usb_devices()
+    running = [d for d in devices if d["serial"] == serial and not in_bootsel(d)]
+    if running:
+        port = running[0]["port"]
+        if not run_tool([tool, "reboot", "-u", "-f", "--ser", serial]):
+            return None
+        dev = wait_for_bootsel(port)
+        if dev is None:
+            print(f"deploy-picotool: {serial} left port {port} but no BOOTSEL device came back on it",
+                  file=sys.stderr)
+            return None
+        return by_address(dev)
+    if any(d["serial"] == serial and in_bootsel(d) for d in devices):
+        return ["--ser", serial]
+    bootsel = [d for d in devices if in_bootsel(d)]
+    if len(bootsel) == 1:
+        # A wedged board in BOOTSEL; an RP2040 bootrom cannot say which one.
+        return by_address(bootsel[0])
+    if not bootsel:
+        print(f"deploy-picotool: no running board with serial {serial} and no board in BOOTSEL",
+              file=sys.stderr)
+    else:
+        print(f"deploy-picotool: no running board with serial {serial} and {len(bootsel)} boards in BOOTSEL: "
+              "cannot tell which is it", file=sys.stderr)
+    return None
 
 
 def main():
@@ -58,18 +156,20 @@ def main():
     tool = str(binding.get("picotool", "picotool"))
     settle = int(binding.get("settle_s", 8))
 
-    cmd = [tool, "load", path, "-f"]
-    if serial:
-        cmd += ["--ser", serial]
-    # `-x` starts the image whether the board was running (and `-f` took it
-    # into BOOTSEL) or was already in BOOTSEL, where `-f` alone leaves it.
-    # picotool parses it after the device selection, so it comes last.
-    cmd += ["-x"]
     t0 = time.monotonic()
-    run = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
-    if run.returncode != 0:
-        sys.stderr.write(run.stdout[-2000:] + run.stderr[-2000:])
-        print(f"deploy-picotool: `{' '.join(cmd)}` exited {run.returncode}", file=sys.stderr)
+    cmd = [tool, "load", path]
+    if serial:
+        selection = select_board(tool, serial)
+        if selection is None:
+            return 1
+        cmd += selection
+    else:
+        # The only board: picotool takes it into BOOTSEL itself.
+        cmd += ["-f"]
+    # `-x` starts the image. picotool parses it after the device selection,
+    # so it comes last.
+    cmd += ["-x"]
+    if not run_tool(cmd):
         return 1
 
     # Back as a running application: the CDC console is the sign.

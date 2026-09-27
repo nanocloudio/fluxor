@@ -366,21 +366,13 @@ const LED_OP_INIT_OUT: u8 = 4; // Clear GPIO_OUTPUT bit 0 (LED off)
 const LED_OP_SEND_WINDOW: u8 = 5; // Set backplane window (if needed)
 const LED_OP_SEND_WRITE: u8 = 6; // Write GPIO_OUTPUT bit 0
 
-/// Maximum firmware chunks per step() call. At 64B/chunk and ~50µs/chunk,
-/// 32 chunks ≈ 1.6ms per step, completing 230KB FW upload in ~115 steps.
 /// Backplane chunks uploaded per `module_step` call during firmware load.
 ///
-/// Each chunk is a **synchronous** 64-byte gSPI backplane write preceded by a
-/// window set, so this number directly sets how long one step takes. At 32 it
-/// exceeded `DEFAULT_STEP_DEADLINE_US` (2 ms) and the step guard terminated
-/// the module on its first firmware step — which went unnoticed for as long
-/// as it did only because the RP2350 step guard could not fire at all
-/// (its TIMER1 had no tick), so nothing was measuring this.
-///
-/// Eight keeps a step comfortably inside the deadline with margin for a slow
-/// gSPI response, at the cost of more scheduler passes to move the same
-/// firmware — which is the correct trade for a cooperative scheduler: the
-/// work is bounded per pass rather than fast and occasionally fatal.
+/// Each chunk is a synchronous 64-byte gSPI backplane write preceded by a
+/// window set, so this number sets how long one step takes. Eight keeps a
+/// step inside the default step deadline with margin for a slow gSPI
+/// response, at the cost of more scheduler passes to move the same firmware:
+/// the work is bounded per pass rather than fast and occasionally fatal.
 const FW_CHUNKS_PER_STEP: u32 = 8;
 
 // ============================================================================

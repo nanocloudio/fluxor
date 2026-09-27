@@ -562,6 +562,7 @@ pub(crate) fn step_domain_pipeline_refill(
         step_guard::post_step_check();
         let timed_out = step_guard::check_and_clear_timeout();
         let mpu = step_guard::check_and_clear_mpu_fault();
+        step_guard::disarm();
         if timed_out {
             handle_step_timeout(sched, modules, module_idx, active_count);
         } else if mpu {
@@ -634,6 +635,7 @@ pub(crate) fn step_domain_post_tick_flush(
         step_guard::post_step_check();
         let timed_out = step_guard::check_and_clear_timeout();
         let mpu = step_guard::check_and_clear_mpu_fault();
+        step_guard::disarm();
         if timed_out {
             handle_step_timeout(sched, modules, module_idx, active_count);
         } else if mpu {
@@ -901,11 +903,12 @@ pub(crate) fn step_one_module(
 
         match outcome {
             Ok(StepOutcome::Continue) => {
-                // Run the post-step deadline check BEFORE disarming. The BCM
-                // (cooperative) guard's `post_step_check` early-returns when the
-                // guard is already disarmed, so the previous `disarm()`-first
-                // order silently dropped every over-deadline step; `post_step_check`
-                // both records the timeout AND disarms.
+                // The post-step deadline check runs BEFORE the disarm: the
+                // cooperative guard's `post_step_check` records the timeout
+                // only while it is armed. The hardware guard then still
+                // needs the disarm — its alarm stays live until told
+                // otherwise, and a step that ends near its deadline would
+                // otherwise leave one to fire into a sibling's step.
                 step_guard::post_step_check();
                 // A single step finalizes AT MOST ONCE. A timeout and a
                 // protection fault (EL0 abort or a broken stack fence) each
@@ -916,6 +919,7 @@ pub(crate) fn step_one_module(
                 // timeout takes precedence.
                 let timed_out = step_guard::check_and_clear_timeout();
                 let mpu = step_guard::check_and_clear_mpu_fault();
+                step_guard::disarm();
                 if timed_out {
                     handle_step_timeout(sched, modules, module_idx, active_count);
                 } else if mpu {
@@ -1068,6 +1072,7 @@ pub(crate) fn step_one_module(
                 step_guard::post_step_check();
                 let timed_out = step_guard::check_and_clear_timeout();
                 let mpu = step_guard::check_and_clear_mpu_fault();
+                step_guard::disarm();
                 if timed_out {
                     handle_step_timeout(sched, modules, module_idx, active_count);
                 } else if mpu {

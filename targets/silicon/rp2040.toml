@@ -255,10 +255,12 @@ gpio_hi_addr = "0xD0000008"
 # The chip's unique ID. RP2040 has none in silicon: the ID is the flash
 # device's own (the Winbond RUID command, 0x4B then four dummy bytes, then
 # eight ID bytes), read over XIP_SSI with flash out of XIP and chip select
-# forced through QSPI_SS's OUTOVER field. It is the serial the bootrom's
-# PICOBOOT reports and the one picotool matches, so the running image must
-# present the same string or picotool cannot find the board again after a
-# forced reboot. RP2350 reads its ID from the ROM and has no such section.
+# forced through QSPI_SS's OUTOVER field. The running image presents it as
+# its USB serial, which tells boards apart while they run and names each
+# one's console. The bootrom's PICOBOOT reports one fixed serial for every
+# RP2040, so a rig follows a board across a reboot into BOOTSEL by its USB
+# port, not by this ID. RP2350 reads its ID from the ROM and has no such
+# section.
 [kernel.flash_unique_id]
 ssi_dr0_addr = "0x18000060"
 ssi_sr_addr = "0x18000028"

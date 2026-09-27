@@ -53,9 +53,10 @@ nic = "cyw43"
 # attached and how it is reached is a private rig profile.
 #
 # picotool needs nobody at the bench: it takes a running board into BOOTSEL
-# over the reset interface, writes the image and reboots it. It finds the
-# board again by serial, which on RP2040 is the flash device's unique ID in
-# both BOOTSEL and a running image.
+# over the reset interface, writes the image and reboots it. The running
+# image's serial is the flash device's unique ID; the RP2040 bootrom reports
+# one fixed serial for every RP2040, so the deploy backend follows the board
+# across the reboot by its USB port.
 [rig]
 artifact = "uf2"
 deploy = ["deploy.uf2_mount", "deploy.picotool", "deploy.swd"]

@@ -3014,6 +3014,8 @@ fn build_module_entry(
     } else {
         params_len + extra_len
     };
+    crate::protection::params_fit(resolved.provided, payload_total)
+        .map_err(|e| Error::Config(format!("module '{name}': {e}")))?;
     let entry_len = MODULE_ENTRY_HEADER_SIZE + payload_total;
     entry[0..4].copy_from_slice(&(entry_len as u32).to_le_bytes());
 

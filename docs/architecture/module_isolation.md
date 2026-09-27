@@ -128,11 +128,19 @@ state and stack budgets.
 | Forced out at deadline | PendSV from the step-guard alarm | PendSV from the step-guard alarm | lower-EL IRQ |
 | Trap | SVC, PendSV and faults enter one trap; the kernel serves it in privileged thread mode | same | SVC from EL0; dispatch under the kernel's table with IRQs open |
 
-On the RP kernel, privilege is dropped and restored inside a single 256-byte
-gateway block in flash, which holds the veneers, the table, and the launch
-and resume stubs. `init` and `new` run gated as well as `step`, with a 50 ms
-construction deadline, so no module code ever runs privileged at a gated
-level.
+On the RP kernel the module is launched, and resumed after every gateway
+op, by an exception return onto a frame on its own stack: privilege is
+dropped only by that return, never in thread mode, so no kernel instruction
+runs unprivileged. The 256-byte gateway block in flash holds the veneers and
+the table and nothing else. `init` and `new` run gated as well as `step`,
+with a 50 ms construction deadline, so no module code ever runs privileged
+at a gated level.
+
+A deadline that passes while the kernel is serving a gateway op is honoured
+before the module can resume, on both kernels: the RP trap records the
+PendSV that reached the kernel path and finishes the entry as forced out at
+the resume; the bcm2712 gateway makes the IRQ path's deadline check before
+returning to EL0.
 
 ## Device windows
 

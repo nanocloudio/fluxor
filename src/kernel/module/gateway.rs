@@ -21,9 +21,9 @@ use portable_atomic::AtomicU64;
 use crate::kernel::exec::scheduler::MAX_MODULES;
 use crate::kernel::sys::errno;
 
-/// Operations, numbered by their slot in `SyscallTable`: the positional ABI
-/// is the operation space, so a new table field is a new op and nothing else
-/// has to agree with it.
+/// Operations, one per function slot of `SyscallTable`, numbered in the
+/// table's order (the `telemetry_enabled` data slot has no op). A gated
+/// module is handed a table whose slot `i` is the veneer for op `i`.
 pub mod op {
     pub const CHANNEL_READ: u32 = 0;
     pub const CHANNEL_WRITE: u32 = 1;
@@ -555,9 +555,19 @@ fn check_handle(module: usize, rule: &Rule, handle: i32) -> Result<(), Refusal> 
     }
 }
 
-/// Authorise one call without performing it. Pure over the gateway's tables,
-/// so the refusal matrix is host-testable.
-pub fn authorise(module: usize, op: u32, a: &[usize; 6]) -> Result<(), Refusal> {
+/// Authorise one call without performing it. Pure over the gateway's tables
+/// and its arguments, so the refusal matrix is host-testable.
+///
+/// `walked` is the kernel's copy of the argument struct for an op whose
+/// rule walks one — copied before it is checked, so the pointers the check
+/// sees are the pointers the provider is handed. `None` for every other op;
+/// a walked op with no copy is refused.
+pub fn authorise(
+    module: usize,
+    op: u32,
+    a: &[usize; 6],
+    walked: Option<&[u8]>,
+) -> Result<(), Refusal> {
     let g = gated(module).ok_or(Refusal::NotGated)?;
     let h = a[0] as i32;
     match op {
@@ -603,9 +613,10 @@ pub fn authorise(module: usize, op: u32, a: &[usize; 6]) -> Result<(), Refusal> 
             check_handle(module, rule, h)?;
             check_arg(&g, rule.arg, a[2], a[3])?;
             if let Some(w) = rule.walk {
-                // SAFETY: `[a[2], a[2]+a[3])` was just checked readable in the
-                // caller's own memory; the caller is suspended.
-                let arg = unsafe { core::slice::from_raw_parts(a[2] as *const u8, a[3]) };
+                let arg = walked.ok_or(Refusal::Pointer)?;
+                if arg.len() != a[3] {
+                    return Err(Refusal::Pointer);
+                }
                 check_walk(&g, w, arg)?;
             }
             Ok(())
@@ -644,7 +655,27 @@ pub fn authorise(module: usize, op: u32, a: &[usize; 6]) -> Result<(), Refusal> 
 /// Called from the platform's trap path, with the caller's memory mapped for
 /// the kernel and the caller not running.
 pub unsafe fn dispatch(module: usize, op: u32, a: [usize; 6]) -> isize {
-    if let Err(why) = authorise(module, op, &a) {
+    // An argument struct the provider follows pointers in is copied into
+    // kernel memory first and checked there: the caller cannot change what
+    // was checked before the provider reads it. The copy itself is bounded
+    // by the rule's length and taken only from the caller's own memory.
+    let walks = op == op::PROVIDER_CALL && rule_for(a[1] as u32).is_some_and(|r| r.walk.is_some());
+    let mut copy = [0u8; WALK_MAX];
+    let walked: Option<&[u8]> = if walks {
+        let readable = a[3] <= WALK_MAX && gated(module).is_some_and(|g| g.readable(a[2], a[3]));
+        if !readable {
+            note_refusal(module, op, &a, Refusal::Pointer);
+            return Refusal::Pointer.errno() as isize;
+        }
+        // SAFETY: `[a[2], a[2] + a[3])` lies in the caller's own memory,
+        // checked above, and the caller is suspended.
+        copy[..a[3]]
+            .copy_from_slice(unsafe { core::slice::from_raw_parts(a[2] as *const u8, a[3]) });
+        Some(&copy[..a[3]])
+    } else {
+        None
+    };
+    if let Err(why) = authorise(module, op, &a, walked) {
         note_refusal(module, op, &a, why);
         return why.errno() as isize;
     }
@@ -676,16 +707,9 @@ pub unsafe fn dispatch(module: usize, op: u32, a: [usize; 6]) -> isize {
             }
             op::PROVIDER_CALL => {
                 let rule = rule_for(a[1] as u32);
-                // A walked struct is handed over as a kernel copy: the
-                // pointers in it were checked, and the caller cannot change
-                // them between the check and the provider reading them.
-                let mut copy = [0u8; WALK_MAX];
-                let arg = match rule.and_then(|r| r.walk) {
-                    Some(_) => {
-                        copy[..a[3]]
-                            .copy_from_slice(core::slice::from_raw_parts(a[2] as *const u8, a[3]));
-                        copy.as_mut_ptr()
-                    }
+                // A walked struct is handed over as the kernel's checked copy.
+                let arg = match walked {
+                    Some(_) => copy.as_mut_ptr(),
                     None => a[2] as *mut u8,
                 };
                 let rc = (sys.provider_call)(h, a[1] as u32, arg, a[3]);

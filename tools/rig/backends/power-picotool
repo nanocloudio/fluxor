@@ -12,16 +12,51 @@ Verbs:
             switched hub (`power-uhubctl`) or a smart plug.
 
 Binding fields:
-  serial      (str, optional)  the board's USB serial, passed as `--ser`.
+  serial      (str, optional)  the board's USB serial. It selects a running
+                               board. A board sitting in BOOTSEL is selected
+                               by serial where the bootrom reports a real one
+                               (RP2350), and otherwise — the RP2040 bootrom
+                               reports one fixed serial for every RP2040 —
+                               only when it is the sole BOOTSEL device.
   picotool    (str, optional)  path to the picotool binary.
   boot_delay_ms (int, optional) wait after the reboot before returning
                                (default 3000): the console must have
                                re-enumerated before observers expect it.
 """
 import json
+import os
 import subprocess
 import sys
 import time
+
+RPI_VENDOR = "2e8a"
+BOOTSEL_PRODUCTS = {"0003", "000f"}
+SYSFS = "/sys/bus/usb/devices"
+
+
+def _read(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def select_board(serial):
+    """picotool's device-selection arguments for the board with `serial`."""
+    bootsel = []
+    for port in os.listdir(SYSFS):
+        base = os.path.join(SYSFS, port)
+        if _read(os.path.join(base, "idVendor")) != RPI_VENDOR:
+            continue
+        if _read(os.path.join(base, "serial")) == serial:
+            return ["--ser", serial]
+        if _read(os.path.join(base, "idProduct")) in BOOTSEL_PRODUCTS:
+            bootsel.append(["--bus", _read(os.path.join(base, "busnum")),
+                            "--address", _read(os.path.join(base, "devnum"))])
+    if len(bootsel) == 1:
+        return bootsel[0]
+    return ["--ser", serial]
 
 
 def main():
@@ -41,7 +76,7 @@ def main():
         return 2
     cmd = [tool, "reboot", "-f"]
     if serial:
-        cmd += ["--ser", serial]
+        cmd += select_board(serial)
     run = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
     if run.returncode != 0:
         sys.stderr.write(run.stdout[-2000:] + run.stderr[-2000:])

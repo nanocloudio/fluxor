@@ -213,7 +213,14 @@ pub fn build_module_table(modules: &[ModuleInfo]) -> Result<Vec<u8>> {
         data_size += module.data.len();
     }
 
-    let total_size = TABLE_HEADER_SIZE + entries_size + data_size;
+    // The table ends on a page as well: an isolated module's code region is
+    // drawn to page alignment, so the bytes after the last module's image
+    // must be the table's own pad, not whatever the image places next.
+    let total_size = if modules.is_empty() {
+        TABLE_HEADER_SIZE
+    } else {
+        (TABLE_HEADER_SIZE + entries_size + data_size).next_multiple_of(4096)
+    };
     let mut result = Vec::with_capacity(total_size);
 
     // Header (16 bytes)
@@ -244,6 +251,7 @@ pub fn build_module_table(modules: &[ModuleInfo]) -> Result<Vec<u8>> {
         }
         result.extend_from_slice(&module.data);
     }
+    result.resize(total_size, 0);
 
     assert_eq!(result.len(), total_size);
 
@@ -1809,6 +1817,51 @@ mod tests {
         assert_eq!(
             u32::from_le_bytes([table[0], table[1], table[2], table[3]]),
             MODULE_TABLE_MAGIC
+        );
+    }
+
+    /// Every module's code starts on a page, and the table ends on one: an
+    /// isolated module's code region is drawn to page alignment, so what
+    /// lies past the last module's image must be the table's own pad.
+    #[test]
+    fn a_module_table_places_code_on_pages_and_ends_on_one() {
+        let module = |name: &str, code: usize| ModuleInfo {
+            name: name.to_string(),
+            name_hash: fnv1a_hash(name.as_bytes()),
+            module_type: 1,
+            mailbox_safe: false,
+            in_place_writer: false,
+            drain_capable: false,
+            permissions_bits: 0,
+            schema: None,
+            manifest: Manifest::default(),
+            data: vec![0xAB; MODULE_HEADER_SIZE + code],
+        };
+        let table = build_module_table(&[module("a", 100), module("b", 5000)]).unwrap();
+        assert_eq!(table.len() % 4096, 0, "the table ends on a page");
+        let total = u32::from_le_bytes([table[6], table[7], table[8], table[9]]) as usize;
+        assert_eq!(total, table.len(), "the header states the padded size");
+        for i in 0..2 {
+            let at = TABLE_HEADER_SIZE + i * ENTRY_SIZE + 4;
+            let offset =
+                u32::from_le_bytes([table[at], table[at + 1], table[at + 2], table[at + 3]])
+                    as usize;
+            assert_eq!(
+                (offset + MODULE_HEADER_SIZE) % 4096,
+                0,
+                "module {i}'s code starts on a page"
+            );
+        }
+        let last_end = {
+            let at = TABLE_HEADER_SIZE + ENTRY_SIZE + 4;
+            let offset =
+                u32::from_le_bytes([table[at], table[at + 1], table[at + 2], table[at + 3]])
+                    as usize;
+            offset + MODULE_HEADER_SIZE + 5000
+        };
+        assert!(
+            table[last_end..].iter().all(|&b| b == 0),
+            "only pad follows the last module"
         );
     }
 

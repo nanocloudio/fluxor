@@ -133,7 +133,8 @@ mod pi5_impl {
     const GUARD_L3_TABLES: usize = fluxor::platform::multicore::MAX_SECONDARY_CORES + 1;
 
     #[link_section = ".bss"]
-    static mut GUARD_L3: [L2Table; GUARD_L3_TABLES] = [const { L2Table([0; 512]) }; GUARD_L3_TABLES];
+    static mut GUARD_L3: [L2Table; GUARD_L3_TABLES] =
+        [const { L2Table([0; 512]) }; GUARD_L3_TABLES];
 
     /// Split the 2 MB block holding each kernel stack guard page into 4 KB
     /// pages carrying the block's own attributes, with the guard page

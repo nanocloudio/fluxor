@@ -104,7 +104,10 @@ pub unsafe fn txn_write(s: &mut Cyw43State, function: u32, address: u32, data: &
     }
 
     let size = data.len();
-    if size > MAX_FRAME_SIZE {
+    // The frame, padded to a word, plus the transfer's three header words
+    // must fit the transaction buffer.
+    let data_padded = (size + 3) & !3;
+    if size > MAX_FRAME_SIZE || data_padded + 12 > s.txn_buf.len() {
         return -2;
     }
 
@@ -112,7 +115,6 @@ pub unsafe fn txn_write(s: &mut Cyw43State, function: u32, address: u32, data: &
     let cmd = make_cmd(true, function, address, size as u32);
 
     // Calculate TX words: 1 command + ceil(data_bytes/4) data words
-    let data_padded = (size + 3) & !3;
     let data_words = data_padded / 4;
     let tx_words: u32 = (1 + data_words) as u32; // cmd + data
 
@@ -237,6 +239,11 @@ pub unsafe fn txn_read(s: &mut Cyw43State, function: u32, address: u32, read_len
     let payload_padded = (read_len + 3) & !3;
     let payload_words = payload_padded / 4;
     let rx_words: u32 = (skip_words + payload_words + GSPI_STATUS_WORDS) as u32;
+    // The response lands in the transaction buffer whole: skip words,
+    // payload and status.
+    if rx_words as usize * 4 > s.rxn_buf.len() {
+        return -2;
+    }
 
     // TX buffer: [tx_words(4)] [cmd(4)] [rx_words(4)]
     let tx_words: u32 = 1; // just the command word

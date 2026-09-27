@@ -18,10 +18,10 @@ use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use fluxor::kernel::boot::config::EdgeClass;
-use fluxor::kernel::module::loader;
-use fluxor::platform::multicore;
-use fluxor::platform::mmu;
 use fluxor::kernel::exec::scheduler;
+use fluxor::kernel::module::loader;
+use fluxor::platform::mmu;
+use fluxor::platform::multicore;
 
 // ── Boot-time submodules (binary-private; not exposed via fluxor::kernel) ──
 //
@@ -625,8 +625,7 @@ fn bridge_cross_domain_edges() -> Result<usize, &'static str> {
         let to = edge_snapshot.to_module;
         let from_domain = scheduler::module_domain_id(from);
         let to_domain = scheduler::module_domain_id(to);
-        let is_cross =
-            from_domain != to_domain || edge_snapshot.edge_class == EdgeClass::CrossCore;
+        let is_cross = from_domain != to_domain || edge_snapshot.edge_class == EdgeClass::CrossCore;
         if !is_cross {
             e += 1;
             continue;
@@ -1076,18 +1075,20 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
         // any real graph module, so the stamp is observable yet harmless (it
         // does not re-own the live net-stack modules and break the netconsole).
         static TEST_PLAN: [u8; 90] = [
-            0x46, 0x4c, 0x58, 0x50, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0xaa, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x64, 0x00, 0x01, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1b, 0x97,
-            0x01, 0x60, 0x9a, 0xb6, 0xd0, 0xd4, 0x07, 0x20, 0x5f, 0x44, 0x14, 0x8b,
-            0xed, 0x5e, 0x42, 0xa9, 0x63, 0x47, 0x6b, 0x72, 0x4d, 0xc6, 0xc8, 0x58,
+            0x46, 0x4c, 0x58, 0x50, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0xaa, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x02,
+            0x00, 0x64, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x1b, 0x97, 0x01, 0x60, 0x9a, 0xb6, 0xd0, 0xd4, 0x07, 0x20, 0x5f, 0x44,
+            0x14, 0x8b, 0xed, 0x5e, 0x42, 0xa9, 0x63, 0x47, 0x6b, 0x72, 0x4d, 0xc6, 0xc8, 0x58,
             0xf7, 0x14, 0x6e, 0x50, 0x2c, 0x35,
         ];
         // SAFETY: TEST_PLAN is 'static; the pointer stays valid for the run.
         unsafe {
-            fluxor::kernel::workload::owner_plan::set_staged_plan(TEST_PLAN.as_ptr(), TEST_PLAN.len());
+            fluxor::kernel::workload::owner_plan::set_staged_plan(
+                TEST_PLAN.as_ptr(),
+                TEST_PLAN.len(),
+            );
         }
         uart_puts(b"[test] staged embedded owner plan\r\n");
     }
@@ -1194,7 +1195,6 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     // Main loop — domain 0 on core 0
     run_domain_loop(0)
 }
-
 
 // ============================================================================
 // Domain execution loop
@@ -1438,7 +1438,9 @@ fn run_domain_loop(domain_id: usize) -> ! {
                         xp(1,2), xc(1,2), xp(3,2), xc(3,2),
                         xp(2,1), xc(2,1), xp(2,3), xc(2,3), xp(2,0), xc(2,0),
                     );
-                    let _ = (d1p, d2p, f2, e2, d1t, ct1, dl1, m1, elr1, f1, e1, far1, sp1, fe1);
+                    let _ = (
+                        d1p, d2p, f2, e2, d1t, ct1, dl1, m1, elr1, f1, e1, far1, sp1, fe1,
+                    );
                     // If any core latched a panic, broadcast the site over UDP.
                     let pc = PANIC_CORE.load(Ordering::Relaxed);
                     if pc != 0xFFFF_FFFF {
@@ -1783,7 +1785,8 @@ fn pump_cross_domain(domain_id: usize) {
                 let Some(slot_len) = ch.try_peek_len() else {
                     break; // ring empty
                 };
-                if fluxor::kernel::ipc::channel::channel_writable_bytes(edge.local_in_handle) < slot_len
+                if fluxor::kernel::ipc::channel::channel_writable_bytes(edge.local_in_handle)
+                    < slot_len
                 {
                     multicore::CROSS_DOMAIN_BACKPRESSURE.fetch_add(1, Ordering::Relaxed);
                     break;
@@ -1796,7 +1799,11 @@ fn pump_cross_domain(domain_id: usize) {
                 // the FIFO was just confirmed to have room for the whole slot,
                 // so this write is complete (no truncation).
                 unsafe {
-                    fluxor::kernel::ipc::channel::channel_write(edge.local_in_handle, buf.as_ptr(), len);
+                    fluxor::kernel::ipc::channel::channel_write(
+                        edge.local_in_handle,
+                        buf.as_ptr(),
+                        len,
+                    );
                 }
                 let mi = ((edge.from_domain as usize) * 4 + edge.to_domain as usize) & 15;
                 XPUMP_CONS[mi].fetch_add(1, Ordering::Relaxed);
@@ -2339,7 +2346,8 @@ fn bcm_isr_tier_start(period_us: u32) {
 }
 
 fn bcm_isr_tier_stop() {
-    fluxor::kernel::exec::isr_tier::TIER1B_ACTIVE.store(false, core::sync::atomic::Ordering::Release);
+    fluxor::kernel::exec::isr_tier::TIER1B_ACTIVE
+        .store(false, core::sync::atomic::Ordering::Release);
 }
 
 fn bcm_isr_tier_poll() {
@@ -2437,8 +2445,8 @@ unsafe fn bcm_system_extension_dispatch(
     arg: *mut u8,
     arg_len: usize,
 ) -> i32 {
-    use fluxor::abi::contracts::storage::paged_arena;
     use fluxor::abi::contracts::hal::pcie_device;
+    use fluxor::abi::contracts::storage::paged_arena;
     use fluxor::abi::platform::bcm2712::{mmio_dma, msi, nic_ring, pcie_config};
     match opcode {
         mmio_dma::MMIO_READ32 => {
@@ -2533,8 +2541,10 @@ unsafe fn bcm_system_extension_dispatch(
             // Streaming arena stays WB-cacheable. Callers must pair writes
             // with DMA_FLUSH before device-reads and DMA_INVALIDATE before
             // CPU-reads of device-written regions.
-            let phys =
-                fluxor::platform::nic_ring::pcie1_dma_alloc_streaming(size as usize, align as usize);
+            let phys = fluxor::platform::nic_ring::pcie1_dma_alloc_streaming(
+                size as usize,
+                align as usize,
+            );
             if phys == 0 {
                 return -38;
             }
@@ -2605,7 +2615,9 @@ unsafe fn bcm_system_extension_dispatch(
         nic_ring::NIC_BAR_MAP => fluxor::platform::pcie::syscall_bar_map(arg, arg_len),
         nic_ring::NIC_BAR_UNMAP => fluxor::platform::pcie::syscall_bar_unmap(arg, arg_len),
         nic_ring::NIC_RING_CREATE => fluxor::platform::nic_ring::syscall_ring_create(arg, arg_len),
-        nic_ring::NIC_RING_DESTROY => fluxor::platform::nic_ring::syscall_ring_destroy(arg, arg_len),
+        nic_ring::NIC_RING_DESTROY => {
+            fluxor::platform::nic_ring::syscall_ring_destroy(arg, arg_len)
+        }
         nic_ring::NIC_RING_INFO => {
             fluxor::platform::nic_ring::syscall_ring_info(_handle, arg, arg_len)
         }
@@ -2666,7 +2678,9 @@ unsafe fn bcm_system_extension_dispatch(
         pcie_device::CFG_WRITE32 => {
             fluxor::platform::pcie::syscall_device_cfg_write32(_handle, arg, arg_len)
         }
-        pcie_device::BAR_MAP => fluxor::platform::pcie::syscall_device_bar_map(_handle, arg, arg_len),
+        pcie_device::BAR_MAP => {
+            fluxor::platform::pcie::syscall_device_bar_map(_handle, arg, arg_len)
+        }
         pcie_device::MSI_ALLOC => {
             if arg.is_null() || arg_len < 20 || _handle < 0 {
                 return -22;
@@ -2921,8 +2935,7 @@ static mut VC_MBOX_BUF: VcMboxBuf = VcMboxBuf([0; 32]);
 /// Acquire/Release so the winner's buffer writes are ordered against the
 /// flag; every exit path below releases it, because in a kernel with no
 /// RAII a leaked flag would be a permanent SOFTWARE tier until reboot.
-static VC_MBOX_BUSY: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
+static VC_MBOX_BUSY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Clean+invalidate the buffer's lines to PoC. Same idiom as the
 /// `DMA_FLUSH`/`DMA_INVALIDATE` handlers above (the PoC pair) — NOT the

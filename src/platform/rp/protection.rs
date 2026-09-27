@@ -11,23 +11,37 @@
 //! # The round trip
 //!
 //! - **Entry** ([`protected_call`], privileged thread on MSP): program the
-//!   module's regions (and `PSPLIM` on ARMv8-M), set `PSP` below its params,
-//!   save the kernel's callee-saved registers and MSP in this core's control
-//!   block, drop to unprivileged thread on PSP and branch to the entry point
-//!   with the return veneer in `lr`.
+//!   module's regions (and `PSPLIM` on ARMv8-M), build the module's first
+//!   exception frame on its own stack below its params — arguments, the
+//!   return veneer as `lr`, the entry point as `pc` — save the kernel's
+//!   callee-saved registers and MSP in this core's control block, and issue
+//!   the launch SVC.
+//! - **Launch and resume** (the trap, handler mode, from a kernel SVC while
+//!   an entry is live): restore the module's callee-saved registers, put MSP
+//!   back where the kernel left it, mark thread mode unprivileged and
+//!   exception-return onto the module's PSP frame. Privilege is dropped only
+//!   by that return, never in thread mode, so no kernel instruction runs
+//!   unprivileged and nothing the module can reach needs to.
 //! - **Trap** (`fluxor_rp_trap`, handler mode): an SVC from a veneer, a fault,
 //!   or PendSV pended by the step guard, taken while this core's gated module
 //!   runs, saves the module's callee-saved registers and PSP frame, regains
 //!   privilege, and exception-returns to thread mode on MSP in
 //!   `fluxor_rp_trap_thread` — so everything the kernel then does runs in
 //!   privileged thread mode, exactly as a non-gated module's calls do.
-//! - **Serve** ([`fluxor_rp_serve`]): a gateway op is authorised and served
-//!   and the module resumed by a direct branch into its veneer's `bx lr`; the
-//!   return veneer, a fault or a missed deadline returns to the kernel from
-//!   `protected_call` with the outcome.
+//! - **Serve** ([`fluxor_rp_serve`]): a gateway op is authorised and served,
+//!   the result is written into the module's frame, and the resume SVC puts
+//!   the module back at its veneer's `bx lr`; the return veneer, a fault or a
+//!   missed deadline returns to the kernel from `protected_call` with the
+//!   outcome.
 //!
-//! Anything that traps with the core privileged, or on MSP, is the kernel's
-//! own fault and parks the node as before.
+//! A PendSV the step guard pends while the kernel is serving a gateway op
+//! arrives on MSP. It is recorded in the control block and honoured at the
+//! resume SVC, which then finishes the entry as forced out instead of
+//! returning to the module, so a deadline cannot slip past between a check
+//! and the privilege drop.
+//!
+//! Anything else that traps with the core privileged, or on MSP, is the
+//! kernel's own fault and parks the node as before.
 
 use portable_atomic::{AtomicU32, Ordering};
 
@@ -85,8 +99,8 @@ unsafe fn r(addr: usize) -> u32 {
 // may read and execute: the veneers (`svc #op; bx lr`, four bytes each, the
 // op derived from the trapping address so a module cannot name one with an
 // SVC of its own), the return veneer, then the gateway `SyscallTable` in
-// `SyscallTable`'s own field order. 256 bytes and 256-aligned is one region
-// under both models.
+// `SyscallTable`'s own field order. Nothing else is in it. 256 bytes and
+// 256-aligned is one region under both models.
 core::arch::global_asm!(
     ".section .text.fluxor_gateway, \"ax\"",
     ".p2align 8",
@@ -120,26 +134,6 @@ core::arch::global_asm!(
     // module and current at once; the SDK treats null as "ask".
     ".word 0",
     ".word fluxor_rp_gateway + 11*4 + 1", // provider_call_sel
-    // Privilege is dropped here, inside the block the module may execute:
-    // the instructions after `msr CONTROL` run unprivileged, so they cannot
-    // be kernel flash. Entered privileged with CONTROL's new value in r4
-    // (launch) or r1 (resume) and the target in r12.
-    ".global fluxor_rp_launch",
-    ".thumb_func",
-    "fluxor_rp_launch:",
-    "msr CONTROL, r4",
-    "isb",
-    "movs r4, #0",
-    "bx r12",
-    ".global fluxor_rp_resume",
-    ".thumb_func",
-    "fluxor_rp_resume:",
-    "msr CONTROL, r1",
-    "isb",
-    "movs r1, #0",
-    "movs r2, #0",
-    "movs r3, #0",
-    "bx r12",
     ".p2align 8",
     version = const crate::abi::ABI_VERSION,
 );
@@ -152,11 +146,21 @@ unsafe extern "C" {
 const GATEWAY_BLOCK: u32 = 256;
 const RETURN_OP: u32 = gateway::op::RETURN;
 const _: () = assert!(gateway::op::COUNT == 12 && RETURN_OP == 12);
+/// The immediate of the SVC the kernel issues, on MSP, to launch or resume
+/// a gated module. A veneer's immediate is its op, which is below
+/// `RETURN_OP`; a module has no SVC of its own the trap honours.
+const RESUME_SVC: u32 = 0xFF;
+const _: () = assert!(RESUME_SVC > RETURN_OP);
 
 fn gateway_base() -> u32 {
     // Only the address of the assembly label is taken.
     core::ptr::addr_of!(fluxor_rp_gateway) as u32
 }
+
+const _: () = assert!(
+    RESUME_SVC == 0xFF,
+    "the launch and resume SVCs above are `svc #0xFF`"
+);
 
 /// The gateway `SyscallTable` a gated module is handed.
 pub fn gateway_table() -> *const crate::abi::SyscallTable {
@@ -293,13 +297,13 @@ pub fn register(module: usize) -> bool {
     let Some(whole) = private.iter().find(|r| r.len != 0) else {
         return false;
     };
-    // An isolated module reads and executes only its own code. Code starts
-    // page-aligned in the module table; rounding its end up to the model's
-    // granule (32 bytes, or an eighth of the smallest power-of-two region that
-    // holds it) reaches only the module's own trailing bytes. A contained
-    // module may read and execute all of flash — it is the kernel's memory,
-    // not its code, that `contained` protects — which also serves a module
-    // whose code is too large for PMSAv7 to draw at its page alignment.
+    // An isolated module reads and executes only its own code, as the span
+    // the planner draws for it: its code rounded to the packer's page
+    // alignment, which reaches its own image and the pad before the next
+    // module's header, never another module's code. A contained module may
+    // read and execute all of flash — it is the kernel's memory, not its
+    // code, that `contained` protects — which also serves a module whose
+    // code is too large for PMSAv7 to draw at its page alignment.
     let contained = crate::kernel::exec::scheduler::module_protection_level(module)
         == crate::kernel::exec::scheduler::protection_level::CONTAINED;
     let (code_base, code_len) = if contained {
@@ -307,7 +311,7 @@ pub fn register(module: usize) -> bool {
     } else {
         (
             code.base as u64,
-            fluxor_contracts::isolation::private_region_shape(code.len as u64, MODEL).0,
+            fluxor_contracts::isolation::code_region_len(code.len as u64),
         )
     };
     let code_span = Span {
@@ -510,13 +514,17 @@ struct Cb {
     result: u32,         // 48
     module: u32,         // 52
     outcome: i32,        // 56
-    _pad: u32,           // 60
+    /// A PendSV the step guard pended reached the kernel path (MSP) while
+    /// the entry was live: the module is forced out at its next resume
+    /// instead of running on.
+    pending: u32, // 60
 }
 
 const _: () = {
     assert!(core::mem::size_of::<Cb>() == 64);
     assert!(core::mem::offset_of!(Cb, result) == 48);
     assert!(core::mem::offset_of!(Cb, outcome) == 56);
+    assert!(core::mem::offset_of!(Cb, pending) == 60);
 };
 
 const CORES: usize = 2;
@@ -532,7 +540,7 @@ static mut FLUXOR_RP_GATE_CB: [Cb; CORES] = [const {
         result: 0,
         module: 0,
         outcome: 0,
-        _pad: 0,
+        pending: 0,
     }
 }; CORES];
 
@@ -591,6 +599,10 @@ unsafe extern "C" {
 /// `protected_call`). A module with no domain is refused, never run
 /// privileged.
 ///
+/// The module's stack starts below its params, then four words for
+/// arguments five to eight, then the exception frame the launch returns
+/// onto: `args[0..4]` in r0–r3, the return veneer in `lr`, `entry` in `pc`.
+///
 /// # Safety
 /// `entry` is a validated export of `module` taking `args`; the caller runs
 /// on the core the module is stepped on.
@@ -613,9 +625,9 @@ pub unsafe fn protected_call(
     for (o, i) in a.iter_mut().zip(args.iter()) {
         *o = *i as u32;
     }
-    // Params at the top of the module's own stack, 8-aligned, below them the
-    // stack proper; four words below that for arguments five to eight, which
-    // the entry sequence places.
+    // Params at the top of the module's own stack, 8-aligned; below them the
+    // four words for arguments five to eight and the launch frame, which the
+    // entry sequence places, then the stack proper.
     let mut psp = d.stack_top;
     if !params.is_empty() {
         let len = (params.len() as u32 + 7) & !7;
@@ -635,6 +647,9 @@ pub unsafe fn protected_call(
         (*cb).module = module as u32;
         (*cb).outcome = 0;
         program(&d);
+        // The process stack's limit register, where the architecture has
+        // one: ARMv8-M. The ARMv6-M build has no `PSPLIM`, so there the
+        // bound is the end of the private region.
         #[cfg(not(feature = "chip-rp2040"))]
         core::arch::asm!("msr PSPLIM, {0}", in(reg) d.stack_floor, options(nomem, nostack));
     }
@@ -728,6 +743,14 @@ unsafe extern "C" fn fluxor_rp_serve(cb: *mut Cb) -> u32 {
             // SAFETY: the module is suspended at its veneer; the gateway
             // validates everything before use.
             let rc = unsafe { gateway::dispatch(module, op, args) };
+            // The deadline may have passed while the kernel served the op:
+            // the alarm's PendSV then reached the kernel path, and the
+            // module is not resumed on borrowed time.
+            if crate::kernel::exec::step_guard::is_timed_out() {
+                log::error!("[mpu] module {module} forced out: ran past its step deadline");
+                crate::kernel::exec::step_guard::record_forced_timeout(module);
+                return finish(0);
+            }
             // SAFETY: this core's control block; the module is suspended.
             unsafe { (*cb).result = rc as u32 };
             RESUME
@@ -787,6 +810,10 @@ fn note_clean(module: usize) {
 core::arch::global_asm!(
     ".section .text.fluxor_rp_protection, \"ax\"",
     // fluxor_rp_enter(cb=r0, entry=r1, args=r2, psp=r3, [sp]=ret) -> i32
+    //
+    // Saves the kernel's callee-saved registers and MSP, builds the module's
+    // launch frame on its stack, and issues the launch SVC. Returns — from
+    // the trap's return path, onto the frame pushed here — with the outcome.
     ".global fluxor_rp_enter",
     ".thumb_func",
     "fluxor_rp_enter:",
@@ -809,28 +836,41 @@ core::arch::global_asm!(
     "str r4, [r3, #8]",
     "ldr r4, [r2, #28]",
     "str r4, [r3, #12]",
+    // The launch frame below them: r0-r3 = arguments, r12 = 0, lr = the
+    // return veneer, pc = the entry (bit 0 clear), xPSR = Thumb.
+    "subs r3, #32",
+    "ldr r4, [r2, #0]",
+    "str r4, [r3, #0]",
+    "ldr r4, [r2, #4]",
+    "str r4, [r3, #4]",
+    "ldr r4, [r2, #8]",
+    "str r4, [r3, #8]",
+    "ldr r4, [r2, #12]",
+    "str r4, [r3, #12]",
+    "movs r4, #0",
+    "str r4, [r3, #16]",
+    "str r6, [r3, #20]",
+    "movs r4, #1",
+    "bics r1, r4",
+    "str r1, [r3, #24]",
+    "ldr r4, =0x01000000",
+    "str r4, [r3, #28]",
     "msr psp, r3",
+    // Nothing of the kernel's reaches the module: its r4-r11 start at zero.
+    "movs r4, #0",
+    "str r4, [r0, #16]",
+    "str r4, [r0, #20]",
+    "str r4, [r0, #24]",
+    "str r4, [r0, #28]",
+    "str r4, [r0, #32]",
+    "str r4, [r0, #36]",
+    "str r4, [r0, #40]",
+    "str r4, [r0, #44]",
+    "str r4, [r0, #60]", // pending = 0
     "movs r4, #1",
     "str r4, [r0, #4]", // active = 1
-    "mov lr, r6",
-    "mov r12, r1",
-    "ldr r0, [r2, #0]",
-    "ldr r1, [r2, #4]",
-    "ldr r3, [r2, #12]",
-    "ldr r2, [r2, #8]",
-    // Nothing of the kernel's in r4-r11 (they are pushed).
-    "movs r4, #0",
-    "mov r8, r4",
-    "mov r9, r4",
-    "mov r10, r4",
-    "mov r11, r4",
-    "movs r5, #0",
-    "movs r6, #0",
-    "movs r7, #0",
-    // Unprivileged, on PSP — dropped inside the gateway block.
-    "movs r4, #3",
-    "ldr r5, =fluxor_rp_launch",
-    "bx r5",
+    "svc #0xFF",
+    "b .",
     // ---- fluxor_rp_trap: SVCall, PendSV, HardFault, MemManage, BusFault, UsageFault
     ".global fluxor_rp_trap",
     ".thumb_func",
@@ -874,6 +914,7 @@ core::arch::global_asm!(
     "msr CONTROL, r2",
     "isb",
     // A frame on MSP that returns to thread mode in fluxor_rp_trap_thread(cb).
+    "7:",
     "ldr r2, [r3, #0]",
     "subs r2, #32",
     "lsrs r2, r2, #3",
@@ -894,17 +935,76 @@ core::arch::global_asm!(
     "str r1, [r2, #28]",
     "ldr r0, =0xFFFFFFF9",
     "bx r0",
-    // The kernel's own: faults to the report, SVC and PendSV ignored.
+    // The kernel's own, on MSP: faults to the report; PendSV and SVC while
+    // a gated entry is live are the guard's force-out and the launch/resume
+    // SVC; any other SVC or PendSV is ignored.
     "9:",
+    "ldr r2, =0xD0000000",
+    "ldr r2, [r2]",
+    "movs r1, #1",
+    "ands r2, r1",
+    "lsls r2, r2, #6",
+    "ldr r3, =FLUXOR_RP_GATE_CB",
+    "adds r3, r3, r2", // r3 = this core's block
     "mrs r0, ipsr",
     "cmp r0, #11",
-    "beq 8f",
+    "beq 5f",
     "cmp r0, #14",
-    "beq 8f",
+    "beq 6f",
     "ldr r1, =FaultTrampoline",
     "bx r1",
+    // PendSV while the kernel serves a live entry: remembered for the resume.
+    "6:",
+    "ldr r2, [r3, #4]",
+    "cmp r2, #0",
+    "beq 8f",
+    "movs r2, #1",
+    "str r2, [r3, #60]", // pending = 1
     "8:",
     "bx lr",
+    // SVC: the launch/resume request, if an entry is live and the immediate
+    // is RESUME_SVC (read from the instruction the stacked pc follows).
+    "5:",
+    "ldr r2, [r3, #4]",
+    "cmp r2, #0",
+    "beq 8b",
+    "mrs r2, msp",
+    "ldr r1, [r2, #24]",
+    "subs r1, #2",
+    "ldrb r1, [r1]",
+    "cmp r1, #0xFF",
+    "bne 8b",
+    "ldr r1, [r3, #60]",
+    "cmp r1, #0",
+    "bne 4f",
+    // Resume: the module's r4-r11, MSP back to the kernel's, thread mode
+    // unprivileged, and an exception return onto the frame on PSP.
+    "ldr r4, [r3, #16]",
+    "ldr r5, [r3, #20]",
+    "ldr r6, [r3, #24]",
+    "ldr r7, [r3, #28]",
+    "ldr r0, [r3, #32]",
+    "mov r8, r0",
+    "ldr r0, [r3, #36]",
+    "mov r9, r0",
+    "ldr r0, [r3, #40]",
+    "mov r10, r0",
+    "ldr r0, [r3, #44]",
+    "mov r11, r0",
+    "ldr r0, [r3, #0]",
+    "msr msp, r0",
+    "movs r0, #1",
+    "msr CONTROL, r0",
+    "isb",
+    "ldr r0, =0xFFFFFFFD",
+    "bx r0",
+    // Forced out before it could resume: served as the PendSV it was.
+    "4:",
+    "movs r1, #0",
+    "str r1, [r3, #60]",
+    "movs r1, #14",
+    "str r1, [r3, #12]", // kind = PendSV
+    "b 7b",
     // ---- fluxor_rp_trap_thread(cb=r0): privileged thread mode on MSP.
     ".global fluxor_rp_trap_thread",
     ".thumb_func",
@@ -913,40 +1013,13 @@ core::arch::global_asm!(
     "bl fluxor_rp_serve",
     "cmp r0, #0",
     "bne 1f",
-    // Resume the module at its veneer's `bx lr`, the op's result in r0.
+    // Resume the module at its veneer's `bx lr`: the op's result goes into
+    // its frame's r0, and the resume SVC returns onto that frame.
     "ldr r0, [r4, #8]",  // frame
-    "ldr r1, [r0, #28]", // xpsr
-    "movs r2, #1",
-    "lsls r2, r2, #9",
-    "ands r1, r2",
-    "lsrs r1, r1, #7", // pad: 4 or 0
-    "adds r1, #32",
-    "adds r1, r0, r1",
-    "msr psp, r1",
-    "ldr r1, [r0, #20]",
-    "mov lr, r1",
-    "ldr r1, [r0, #24]",
-    "movs r2, #1",
-    "orrs r1, r2",
-    "mov r12, r1",
-    "ldr r1, [r4, #32]",
-    "mov r8, r1",
-    "ldr r1, [r4, #36]",
-    "mov r9, r1",
-    "ldr r1, [r4, #40]",
-    "mov r10, r1",
-    "ldr r1, [r4, #44]",
-    "mov r11, r1",
-    "ldr r0, [r4, #48]", // result
-    "ldr r5, [r4, #20]",
-    "ldr r6, [r4, #24]",
-    "ldr r7, [r4, #28]",
-    "mov r3, r4",
-    "ldr r4, [r3, #16]",
-    "ldr r5, [r3, #20]",
-    "movs r1, #3",
-    "ldr r2, =fluxor_rp_resume",
-    "bx r2",
+    "ldr r1, [r4, #48]", // result
+    "str r1, [r0, #0]",
+    "svc #0xFF",
+    "b .",
     // The entry is over: back to protected_call with the outcome.
     "1:",
     "ldr r0, [r4, #56]",

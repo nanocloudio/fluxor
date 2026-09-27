@@ -309,8 +309,9 @@ pub mod addr {
 ///
 /// The write semantics are the point of using the typed layer here:
 ///
-/// - `INTE` is a plain read/modify/write — one alarm's enable bit changes and
-///   the other three keep their state;
+/// - `INTE` is changed through the atomic set/clear aliases — one alarm's
+///   enable bit changes and the other three keep their state, with no
+///   read-modify-write for an alarm's interrupt handler to land inside;
 /// - `INTR` is **write-one-to-clear** — acknowledging alarm *n* means writing
 ///   only bit *n*. A read-modify-write would clear whichever of the other
 ///   three happened to be pending at that instant, losing an interrupt that
@@ -318,7 +319,7 @@ pub mod addr {
 #[cfg(feature = "rp")]
 pub mod alarm {
     use crate::platform::chip::{MONOTONIC_BASE, TIMER_INTE_OFFSET, TIMER_INTR_OFFSET};
-    use crate::platform::rp_regs::{clear_w1c, modify32, read32, write32};
+    use crate::platform::rp_regs::{clear_bits, clear_w1c, read32, set_bits, write32};
 
     use super::addr;
 
@@ -334,20 +335,31 @@ pub mod alarm {
         unsafe { read32(addr::TIMELR + base()) }
     }
 
+    /// Current low word of the raw counter, the value alarms compare against.
+    #[inline]
+    pub fn now_raw_lo() -> u32 {
+        // SAFETY: generated base plus this block's own offset.
+        unsafe { read32(addr::TIMERAWL + base()) }
+    }
+
+    /// The target an alarm holds.
+    #[inline]
+    pub fn target(idx: u8) -> u32 {
+        // SAFETY: plain RW alarm compare register.
+        unsafe { read32(addr::alarm(base(), idx)) }
+    }
+
     /// Enable or disable one alarm's interrupt, leaving the others alone.
     #[inline]
     pub fn set_enabled(idx: u8, on: bool) {
         let bit = addr::alarm_bit(idx);
-        // SAFETY: INTE is a plain RW register; RMW is correct here and only
-        // here.
+        // SAFETY: INTE is a plain RW register with the RP atomic aliases.
         unsafe {
-            modify32(base() + TIMER_INTE_OFFSET as usize, |v| {
-                if on {
-                    v | bit
-                } else {
-                    v & !bit
-                }
-            })
+            if on {
+                set_bits(base() + TIMER_INTE_OFFSET as usize, bit);
+            } else {
+                clear_bits(base() + TIMER_INTE_OFFSET as usize, bit);
+            }
         };
     }
 

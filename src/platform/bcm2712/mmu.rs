@@ -2009,6 +2009,14 @@ mod bcm2712_impl {
             "msr   daifclr, #2",
             "bl    fluxor_gateway_el0",
             "msr   daifset, #2",
+            // The deadline may have passed while the kernel served the op:
+            // an interrupt taken at EL1 could not force the module out, so
+            // the check the EL0 IRQ path makes is made here before it can
+            // resume.
+            "str   x0, [sp, #-16]!",
+            "bl    fluxor_el0_irq_preempt",
+            "mov   x9, x0",
+            "ldr   x0, [sp], #16",
             "mrs   x10, mpidr_el1",
             "lsr   x10, x10, #8",
             "and   x10, x10, #3", // core id (Pi 5: MPIDR Aff1)
@@ -2016,6 +2024,7 @@ mod bcm2712_impl {
             "add   x11, x11, #:lo12:EL0_CBS",
             "mov   x12, #384",          // CB_SIZE
             "madd  x11, x10, x12, x11", // x11 = &EL0_CBS[core]
+            "cbnz  w9, fluxor_el0_gate_forced",
             "ldr   x13, [x11, #296]",
             "msr   elr_el1, x13",
             "ldr   x13, [x11, #304]",
@@ -2086,6 +2095,17 @@ mod bcm2712_impl {
             "str   x16, [x11, #136]", // fault_elr
             "mov   x0, x11",
             "movn  w1, #21", // outcome = -22 (EINVAL)
+            "b     fluxor_el0_resume",
+            // Past its deadline during a gateway op: record where it was and
+            // resume the kernel as if the entry had faulted; the kernel's
+            // table is already live.
+            "fluxor_el0_gate_forced:",
+            "ldr   x16, [x11, #296]", // the module's ELR
+            "str   x16, [x11, #136]", // fault_elr
+            "mov   w16, #3",
+            "str   w16, [x11, #148]", // fault_pending = 3 (deadline)
+            "mov   x0, x11",
+            "movn  w1, #109", // outcome = -110 (ETIMEDOUT)
             "b     fluxor_el0_resume",
             "fluxor_el0_inactive:",
             "b     unhandled_exception",

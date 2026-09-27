@@ -212,8 +212,23 @@ pub fn module_entries(config: &Value) -> Vec<(String, &Value)> {
 }
 
 /// Params a gated module's `module_new` receives are copied onto its own
-/// stack; this is what the composer budgets for them.
+/// stack; this is what the composer budgets for them, and the most a gated
+/// module's params may be.
 pub const PARAMS_BUDGET: u64 = 256;
+
+/// Whether a module at `level` may carry `params_len` bytes of params: a
+/// gated module's are copied onto its own stack at every construction,
+/// inside the room the composer charged for them.
+pub fn params_fit(level: Level, params_len: usize) -> Result<(), String> {
+    if level.is_gated() && params_len as u64 > PARAMS_BUDGET {
+        return Err(format!(
+            "its params are {params_len} bytes, and a {} module's are copied onto its own \
+             stack, budgeted at {PARAMS_BUDGET} bytes",
+            level.name()
+        ));
+    }
+    Ok(())
+}
 
 /// The private region (stack, state, heap) a gated module gets on an MPU
 /// target: what the loader allocates, and so what the state arena is charged.
@@ -231,11 +246,12 @@ pub fn private_region_bytes(
 }
 
 /// Whether an isolated module's code, which the packer starts on a 4 KiB
-/// boundary, can be drawn as one region under `model`. Checked at the
-/// worst-case base: page-aligned and nothing more.
+/// boundary, can be drawn as one region under `model` — the span the
+/// kernel draws, `code_region_len`. Checked at the worst-case base:
+/// page-aligned and nothing more.
 pub fn code_plannable(code: u64, model: fluxor_contracts::isolation::RegionModel) -> bool {
     use fluxor_contracts::isolation::{region_plan, Access, Span};
-    let len = fluxor_contracts::isolation::private_region_shape(code.max(1), model).0;
+    let len = fluxor_contracts::isolation::code_region_len(code);
     region_plan(
         &[Span {
             base: 0x1000_1000,
@@ -559,6 +575,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r.provided, Level::Contained);
+    }
+
+    #[test]
+    fn a_gated_modules_params_fit_its_stack_budget() {
+        assert!(params_fit(Level::Isolated, PARAMS_BUDGET as usize).is_ok());
+        assert!(
+            params_fit(Level::None, 4096).is_ok(),
+            "an ungated module's params are the kernel's"
+        );
+        let e = params_fit(Level::Contained, PARAMS_BUDGET as usize + 1).unwrap_err();
+        assert!(e.contains("257 bytes") && e.contains("256 bytes"), "{e}");
     }
 
     #[test]

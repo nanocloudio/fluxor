@@ -2330,10 +2330,24 @@ fn invoke_init_protected(module: &LoadedModule, module_idx: usize) -> Result<(),
             GATED_CONSTRUCT_DEADLINE_US,
         )
     };
+    let rc = construction_outcome(rc);
     if rc < 0 {
         return Err(LoaderError::InitFailed(rc));
     }
     Ok(())
+}
+
+/// The outcome of a gated construction call. One forced out at its deadline
+/// returns through the step guard's timeout flag, which the scheduler
+/// consumes around a step and nothing consumes here: a construction that
+/// never returned did not construct, whatever value the forced return
+/// carries.
+fn construction_outcome(rc: i32) -> i32 {
+    if crate::kernel::exec::step_guard::check_and_clear_timeout() {
+        crate::kernel::sys::errno::ETIMEDOUT
+    } else {
+        rc
+    }
 }
 
 /// `module_new` for a gated module: run unprivileged, handed the gateway
@@ -2365,6 +2379,7 @@ fn invoke_new_protected(
             GATED_CONSTRUCT_DEADLINE_US,
         )
     };
+    let rc = construction_outcome(rc);
     if rc < 0 {
         Err(LoaderError::NewFailed(rc))
     } else if rc > 0 {
@@ -2808,6 +2823,12 @@ impl DynamicModule {
         #[cfg(feature = "kernel-mpu")]
         let mpu_private: Option<(usize, usize, usize, *mut u8)> = if gated {
             let arena = module.manifest_arena_bytes().unwrap_or(0);
+            // The stack is sized from the manifest alone; a module that
+            // carries no depth would get one too small to reach its first
+            // call, so it is refused here rather than faulted there.
+            if module.manifest_stack_bytes() == 0 {
+                return Err(LoaderError::GatedUndeclared("stack depth"));
+            }
             let stack = (module.manifest_stack_bytes() as usize).next_multiple_of(8)
                 + crate::platform::rp_protection::EXCEPTION_FRAME_BYTES
                 + params.len.next_multiple_of(8)
@@ -2840,6 +2861,13 @@ impl DynamicModule {
             },
             None => (alloc_state(required_size)?, required_size),
         };
+        // The one allocation a failure below hands back: on an MPU target a
+        // gated module's private region, whose state pointer is interior to
+        // it; otherwise the state buffer itself.
+        #[cfg(feature = "kernel-mpu")]
+        let private_region = mpu_private.map(|(_, base, size, _)| (base as *mut u8, size));
+        #[cfg(not(feature = "kernel-mpu"))]
+        let private_region: Option<(*mut u8, usize)> = None;
         #[cfg(not(feature = "kernel-mpu"))]
         let (state_ptr, state_map_size) = if iso_requested {
             #[cfg(feature = "kernel-vm")]
@@ -2998,7 +3026,9 @@ impl DynamicModule {
                 iso_heap_map_size,
             ) {
                 gateway::release(inst_idx);
-                free_state_range(state_ptr, required_size);
+                // SAFETY: the allocation this call made, referenced by
+                // nothing yet.
+                unsafe { free_allocation(state_ptr, required_size, private_region) };
                 return Err(LoaderError::ProtectionUnavailable);
             }
         }
@@ -3014,7 +3044,9 @@ impl DynamicModule {
                 crate::kernel::sys::hal::protection_release_module(inst_idx);
                 crate::kernel::module::gateway::release(inst_idx);
             }
-            free_state_range(state_ptr, required_size);
+            // SAFETY: the allocation this call made; the module never ran
+            // past its failed init and nothing else references it.
+            unsafe { free_allocation(state_ptr, required_size, private_region) };
             return Err(e);
         }
         // 5b. Resolve optional module_drain export
@@ -3085,6 +3117,24 @@ impl DynamicModule {
         }
     }
 }
+/// Hand back what `start_new` allocated for a module whose load failed:
+/// its private region when it has one, else its state buffer.
+///
+/// # Safety
+/// `state` and `private` are what this load allocated, and nothing
+/// references them any more.
+unsafe fn free_allocation(state: *mut u8, state_size: usize, private: Option<(*mut u8, usize)>) {
+    match private {
+        // SAFETY: the caller's contract, forwarded.
+        #[cfg(feature = "kernel-mpu")]
+        Some((base, size)) => unsafe { free_private(base, size) },
+        #[cfg(not(feature = "kernel-mpu"))]
+        Some(_) => {}
+        // SAFETY: the caller's contract, forwarded.
+        None => unsafe { free_state_range(state, state_size) },
+    }
+}
+
 /// Run one of the current gated module's per-step entries (`module_step`,
 /// `module_post_tick_flush`, `module_pipeline_refill`) unprivileged, bounded
 /// by its step deadline.

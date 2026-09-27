@@ -50,8 +50,11 @@ board = "pico2w"
 tags = ["wifi", "usb"]
 
 # The board's USB serial is the chip's unique ID — `picotool info -d`
-# prints it as `chipid`. It selects the board when several are attached,
-# and it is what picotool tracks across the reboot it asks for.
+# prints it as `chipid` on RP2350 and as `flash id` on RP2040. It selects
+# the board when several are attached. The RP2350 bootrom reports the same
+# serial in BOOTSEL; the RP2040 bootrom reports one fixed serial for every
+# RP2040, so the backend follows a Pico W across the reboot by its USB
+# port instead.
 [deploy.picotool]
 serial = "<chip-id>"
 

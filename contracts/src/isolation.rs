@@ -231,6 +231,25 @@ fn pmsav7_region(s: &Span) -> Option<Region> {
     None
 }
 
+/// Bytes the packer aligns every module's code to in the module table, and
+/// the granule an isolated module's code region is drawn at.
+pub const CODE_ALIGN: u64 = 4096;
+
+/// The span an isolated module's code region covers: its code rounded up
+/// to the packer's alignment. Every byte the rounding reaches is the
+/// module's own image — its data, exports and manifest — or the pad before
+/// the next module's header; never another module's code. Rounding to a
+/// model's own granule instead could reach further (a PMSAv7 eighth of a
+/// 64 KiB region is 8 KiB), so this is the span on every model, and a model
+/// that cannot draw it refuses rather than widens.
+pub const fn code_region_len(code: u64) -> u64 {
+    if code == 0 {
+        CODE_ALIGN
+    } else {
+        code.div_ceil(CODE_ALIGN) * CODE_ALIGN
+    }
+}
+
 /// The smallest allocation of at least `len` bytes that a single region of
 /// `model` can cover exactly, and the alignment it must be placed at: what
 /// the loader allocates a gated module's private region as.

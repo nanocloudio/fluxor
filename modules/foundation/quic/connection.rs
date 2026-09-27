@@ -229,9 +229,10 @@ pub const MAX_BIDI_STREAMS: usize = PEER_BIDI_CREDIT + LOCAL_BIDI_STREAMS;
 
 /// Which of the peer's stream indices have finished, so a late frame for
 /// one is recognised rather than opening it again. Every index below
-/// `base` is finished; `bits` marks finished ones above it. The peer holds
-/// at most its credit open at once, so the unfinished span above `base`
-/// stays far inside the window.
+/// `base` is finished; `bits` marks finished ones above it. The credit
+/// granted to the peer never reaches past `base + 64` (`credit_ceiling`),
+/// so every index it can open fits the window: a stream that stays open
+/// holds `base`, and the streams after it are counted here until it ends.
 #[derive(Clone, Copy)]
 pub struct FinishedStreams {
     pub base: u64,
@@ -256,6 +257,24 @@ impl FinishedStreams {
             self.bits >>= 1;
             self.base += 1;
         }
+    }
+
+    /// How many of the peer's streams have finished.
+    pub fn count(&self) -> u64 {
+        self.base + u64::from(self.bits.count_ones())
+    }
+
+    /// The most stream credit the peer may hold: every index below it is
+    /// one this window can still record as finished.
+    pub fn credit_ceiling(&self) -> u64 {
+        self.base + 64
+    }
+
+    /// The credit to grant the peer for `initial` streams at once: one more
+    /// for each that finished, held under the window's ceiling until the
+    /// stream holding `base` ends.
+    pub fn credit(&self, initial: u64) -> u64 {
+        (initial + self.count()).min(self.credit_ceiling())
     }
 }
 

@@ -177,11 +177,12 @@ static mut ENTRY_DEPTH: usize = 0;
 #[cfg(feature = "rp")]
 static mut FENCE: usize = 0;
 
-/// Words the fence spans. A frame that crosses it writes at least its saved
-/// registers into the words it reserves, so a short run of painted words is
-/// enough to see one go past.
+/// Words the fence spans: 128 bytes. A frame that crosses the fence is seen
+/// when it writes into it, and a frame's pushed registers and spilled locals
+/// write far more densely than one word in 128; only a frame that reserves
+/// more than this and writes none of it steps over unseen.
 #[cfg(feature = "rp")]
-const FENCE_WORDS: usize = 4;
+const FENCE_WORDS: usize = 32;
 
 /// Arm the stack fence for a module call whose admitted depth is `depth`
 /// bytes (0 disarms). The fence sits `KERNEL_STACK_RESERVE + depth` below the

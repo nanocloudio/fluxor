@@ -2097,13 +2097,17 @@ unsafe fn stream_release(conn: &mut QuicConnection, loc: StreamLoc) {
             conn.bidi_streams[k] = BidiStream::empty();
             // Freeing the slot is only half of it. The peer's ability to
             // OPEN another stream is governed by MAX_STREAMS credit (RFC
-            // 9000 §4.6), which is cumulative — so without this a
-            // connection is limited to its initial allowance for life,
-            // and simply stops serving with no error on either side.
-            // Only a slot the PEER used consumed peer credit.
+            // 9000 §4.6), which is cumulative: one more for each of the
+            // peer's streams that ends — never past what the
+            // finished-stream window can record, so a late frame for any
+            // index the peer may use is recognised. Only a slot the PEER
+            // used consumed peer credit.
             if peer_opened {
-                conn.max_streams_bidi_granted = conn.max_streams_bidi_granted.saturating_add(1);
-                conn.max_streams_tx_pending = true;
+                let credit = conn.peer_bidi_finished.credit(PEER_BIDI_CREDIT as u64);
+                if credit > conn.max_streams_bidi_granted {
+                    conn.max_streams_bidi_granted = credit;
+                    conn.max_streams_tx_pending = true;
+                }
             }
         }
         StreamLoc::Uni(k) => {
@@ -2114,8 +2118,11 @@ unsafe fn stream_release(conn: &mut QuicConnection, loc: StreamLoc) {
             }
             conn.uni_streams[k] = UniStream::empty();
             if peer_opened {
-                conn.max_streams_uni_granted = conn.max_streams_uni_granted.saturating_add(1);
-                conn.max_streams_uni_tx_pending = true;
+                let credit = conn.peer_uni_finished.credit(PEER_UNI_CREDIT as u64);
+                if credit > conn.max_streams_uni_granted {
+                    conn.max_streams_uni_granted = credit;
+                    conn.max_streams_uni_tx_pending = true;
+                }
             }
         }
     }
