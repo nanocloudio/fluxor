@@ -210,11 +210,16 @@ pub const FRAME_KIND_NET: u8 = 2;
 pub const FRAME_KIND_TELEMETRY: u8 = 3;
 
 /// Manifest `content_type` byte values that map to a non-NONE
-/// `FRAME_KIND_*`. Position must match `tools::manifest::CONTENT_TYPES`
-/// (drift-guarded by `graph_unification::content_type_byte_maps_to_expected_frame_kind`).
-pub const CONTENT_TYPE_ETHERNET_FRAME: u8 = 19;
-pub const CONTENT_TYPE_NET_PROTO: u8 = 30;
-pub const CONTENT_TYPE_TELEMETRY: u8 = 35;
+/// `FRAME_KIND_*`: each name's position in `fluxor_contracts::CONTENT_TYPES`,
+/// the table manifests are packed from. Written here because the kernel
+/// cannot link the contracts crate on every target (bare metal has no
+/// allocator for its `alloc` half); each is checked BY NAME against that
+/// table in `graph_unification::content_type_byte_maps_to_expected_frame_kind`.
+/// A byte that misses its type leaves a fan over that port forwarding raw
+/// bytes, splitting frames whenever one reader falls behind.
+pub const CONTENT_TYPE_ETHERNET_FRAME: u8 = 14;
+pub const CONTENT_TYPE_NET_PROTO: u8 = 25;
+pub const CONTENT_TYPE_TELEMETRY: u8 = 30;
 
 /// Total length of a `TelemetryRecord` from its 2-byte `signal`+`kind`
 /// prefix. A kernel-side mirror of
