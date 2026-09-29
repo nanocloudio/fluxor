@@ -12,7 +12,10 @@
     reason = "user-facing diagnostics on the unhappy path; there is no logging substrate before the CLI execs"
 )]
 
-use std::os::fd::AsRawFd;
+use std::fs::File;
+use std::io::{Seek, SeekFrom};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 const TRIPLE: &str = env!("FLUXOR_HOST_TRIPLE");
@@ -33,6 +36,33 @@ fn die(msg: &str) -> ! {
     eprintln!("fluxor: {msg}");
     eprintln!("        no fluxor CLI in store — run `make install` from a fluxor checkout");
     std::process::exit(127);
+}
+
+/// Return a descriptor the kernel may execute.
+///
+/// OCI runtime blobs are executable in a live store, but a portable store can
+/// cross an archive or filesystem that does not preserve Unix mode bits.  The
+/// blob remains content-addressed; only its missing execution metadata needs
+/// reconstructing.  Keep the store read-only and stage those bytes in an
+/// anonymous file rather than mutating shared store state.
+fn executable_file(file: File) -> std::io::Result<File> {
+    if file.metadata()?.permissions().mode() & 0o111 != 0 {
+        return Ok(file);
+    }
+
+    // SAFETY: `memfd_create` receives a static NUL-terminated name and returns
+    // either a new owned descriptor or -1. `File` assumes ownership exactly
+    // once on the successful path.
+    let fd = unsafe { libc::memfd_create(c"fluxor-runtime".as_ptr(), 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `fd` is a fresh descriptor returned by `memfd_create` above.
+    let mut staged = unsafe { File::from_raw_fd(fd) };
+    std::io::copy(&mut &file, &mut staged)?;
+    staged.set_permissions(std::fs::Permissions::from_mode(0o700))?;
+    staged.seek(SeekFrom::Start(0))?;
+    Ok(staged)
 }
 
 fn main() {
@@ -71,9 +101,13 @@ fn main() {
     let Some(bin_digest) = manifest["layers"][0]["digest"].as_str() else {
         die("CLI manifest has no binary layer");
     };
-    let file = match std::fs::File::open(blob(bin_digest)) {
+    let file = match File::open(blob(bin_digest)) {
         Ok(f) => f,
         Err(e) => die(&format!("CLI blob missing ({e})")),
+    };
+    let file = match executable_file(file) {
+        Ok(f) => f,
+        Err(e) => die(&format!("CLI blob could not be staged for execution ({e})")),
     };
 
     // fexecve: exec the open descriptor — collection of a superseded
@@ -112,4 +146,55 @@ fn main() {
         "exec of CLI blob failed ({})",
         std::io::Error::last_os_error()
     ));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+    use std::os::unix::fs::MetadataExt;
+
+    fn fixture(name: &str, mode: u32) -> std::io::Result<PathBuf> {
+        let path =
+            std::env::temp_dir().join(format!("fluxor-launcher-{name}-{}", std::process::id()));
+        std::fs::write(&path, b"content-addressed runtime")?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))?;
+        Ok(path)
+    }
+
+    #[test]
+    fn executable_store_blob_is_used_in_place() -> Result<(), Box<dyn std::error::Error>> {
+        let path = fixture("executable", 0o700)?;
+        let source = File::open(&path)?;
+        let source_meta = source.metadata()?;
+        let staged = executable_file(source)?;
+        let staged_meta = staged.metadata()?;
+
+        assert_eq!(staged_meta.dev(), source_meta.dev());
+        assert_eq!(staged_meta.ino(), source_meta.ino());
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn read_only_store_blob_is_staged_in_executable_memfd() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let path = fixture("read-only", 0o444)?;
+        let source = File::open(&path)?;
+        let source_meta = source.metadata()?;
+        let mut staged = executable_file(source)?;
+        let staged_meta = staged.metadata()?;
+        let mut bytes = Vec::new();
+        staged.read_to_end(&mut bytes)?;
+
+        assert_ne!(staged_meta.ino(), source_meta.ino());
+        assert_ne!(staged_meta.permissions().mode() & 0o111, 0);
+        assert_eq!(bytes, b"content-addressed runtime");
+        assert_eq!(
+            std::fs::metadata(&path)?.permissions().mode() & 0o777,
+            0o444
+        );
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
 }
