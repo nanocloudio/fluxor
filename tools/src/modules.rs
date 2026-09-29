@@ -1179,6 +1179,9 @@ pub fn pack_fmod(
         // Provider auto-registration (loader reads this to get the
         // contract id and auto-registers the module as provider).
         "module_provides_contract",
+        // Several contracts from one provider state (a store that owns its
+        // objects and their namespace): the loader registers each.
+        "module_provides_contracts",
         // Instance selector for a keyed provider (a fat32 with a `volume:`).
         // The loader resolves this by hash; without it here the symbol never
         // reaches the fmod export table and every keyed backend silently

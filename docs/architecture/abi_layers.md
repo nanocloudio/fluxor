@@ -459,6 +459,26 @@ contracts, FS, and the storage namespace/object contracts
 (`is_module_providable` in `src/kernel/module/provider.rs`); other
 contract ids are rejected.
 
+A provider whose one state serves several contracts — a store that owns
+its objects and their namespace — exports `module_provides_contracts`
+instead:
+
+```rust
+#[no_mangle]
+#[link_section = ".text.module_provides_contracts"]
+pub unsafe extern "C" fn module_provides_contracts(
+    state: *mut u8, out: *mut u16, cap: u32,
+) -> u32 {
+    /* write each contract id to out[..], answer how many — none when this
+       instance's config says it provides nothing */
+}
+```
+
+The loader calls it after `module_new()`, with the module's state, and
+registers each listed contract (at most four) with the same dispatch,
+state and selector; the dispatch tells them apart by the opcode's class
+byte. When both exports are present, the list wins.
+
 ## Capabilities
 
 Source: `src/kernel/module/syscalls.rs`.

@@ -247,6 +247,7 @@ cannot be evaluated from its own file reads `—` and says why.
 | Isolated-image arena | `ISO_ARENA_SIZE` | src/kernel/module/loader.rs | 2097152 | Policy (`kernel-vm`): all isolated module state and heap of one image; exhaustion refuses the load |
 | Tracked provider handles | `MAX_TRACKED` | src/kernel/module/provider.rs | 128 | Policy: handle-to-owner bindings the kernel keeps for cross-owner checks; an open past it is refused, and the table is scanned on every provider call, so it is kept small on purpose |
 | Provider vtables | `MAX_PROVIDERS` | src/kernel/module/provider.rs | 64 | Derived, not chosen: one vtable slot per contract id, so a contract registerable in one and not the other is impossible by construction |
+| Contracts per provider module | `MAX_CONTRACTS_PER_PROVIDER` | src/kernel/module/loader.rs | 4 | Policy: the contracts one provider state may serve through `module_provides_contracts` (a store owning its objects and their namespace needs two); entries past it are not registered |
 | Dynamic tag routes | `MAX_DYN_TAG_ROUTES` | src/kernel/module/provider.rs | 4 | Policy: keyed provider routes a policy module may add at runtime |
 | Key material per vault slot | `MAX_KEY_BYTES` | src/kernel/security/key_vault.rs | 64 | Policy: a P-256 scalar is 32; the doubled width admits larger keying material without a header change |
 | Vault label | `MAX_LABEL` | src/kernel/security/key_vault.rs | 64 | Policy, wire-visible: the label is how a module names a key; the contract's `MAX_LABEL` mirrors it |
@@ -350,6 +351,7 @@ MAX_MODULE_CODE_SIZE | modules/sdk/abi/config.rs | 1024 * 1024 | host
 MAX_MODULE_CODE_SIZE | modules/sdk/abi/config.rs | 1024 * 1024 | wasm
 MAX_MODULE_CODE_SIZE | modules/sdk/abi/config.rs | 384 * 1024 | embedded
 MAX_MODULES_BLOB_SIZE | src/kernel/module/loader.rs | 8 * 1024 * 1024 | *
+MAX_CONTRACTS_PER_PROVIDER | src/kernel/module/loader.rs | 4 | *
 MAX_CONFIG_SIZE | src/kernel/boot/config.rs | 256 * 1024 | hosted
 MAX_CONFIG_SIZE | src/kernel/boot/config.rs | 32 * 1024 | bare
 STAGE_CAPACITY | src/kernel/module/ota_stage.rs | 8 * 1024 * 1024 | *

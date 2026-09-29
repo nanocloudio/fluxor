@@ -34,6 +34,7 @@ SECTIONS
         KEEP(*(.text.module_arena_size*))
         KEEP(*(.text.module_provider_dispatch*))
         KEEP(*(.text.module_provides_contract*))
+        KEEP(*(.text.module_provides_contracts*))
         /* Instance selector for a keyed provider, and the owner-release
          * subscription marker. Both are resolved by the loader through
          * `get_export_addr`, so nothing in the module references them and

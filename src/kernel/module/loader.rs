@@ -70,6 +70,7 @@ pub mod export_hashes {
     pub const MODULE_ISR_ENTRY: u32 = 0x56c6a743; // "module_isr_entry"
     pub const MODULE_PROVIDER_DISPATCH: u32 = 0xc7832e76; // "module_provider_dispatch"
     pub const MODULE_PROVIDES_CONTRACT: u32 = 0x671c57bb; // "module_provides_contract"
+    pub const MODULE_PROVIDES_CONTRACTS: u32 = 0x199e2fd8; // "module_provides_contracts"
     pub const MODULE_PROVIDER_SELECTOR: u32 = 0xfd70b311; // "module_provider_selector"
     pub const MODULE_OBSERVES_OWNER_RELEASE: u32 = 0x3dc0c8a1; // "module_observes_owner_release"
     pub const MODULE_FLASH_STORE_DISPATCH: u32 = 0x2f7172b5; // "module_flash_store_dispatch"
@@ -355,7 +356,16 @@ unsafe fn fn_ptr_from_addr<F: Copy>(addr: usize) -> F {
 /// Modules that aren't providers leave both exports absent and this
 /// whole path is a no-op.
 struct ProviderAutoRegister {
-    contract_fn: unsafe extern "C" fn() -> u32,
+    /// `module_provides_contract() -> u32`: the one contract, or absent
+    /// when the module lists several.
+    contract_fn: Option<unsafe extern "C" fn() -> u32>,
+    /// `module_provides_contracts(state, out: *mut u16, cap: u32) -> u32`:
+    /// every contract one provider state serves (a store providing its
+    /// objects and their namespace), written to `out`, their count answered
+    /// — none when the module's config says it provides nothing. Each is
+    /// registered with the same dispatch, state and selector; the dispatch
+    /// tells them apart by opcode class.
+    contracts_fn: Option<unsafe extern "C" fn(*mut u8, *mut u16, u32) -> u32>,
     dispatch_fn: crate::kernel::module::provider::ModuleProviderDispatchFn,
     /// Optional `module_provider_selector(state) -> u32` export. Present on
     /// instance-keyed volume backends (a fat32 with a `volume:` param), which
@@ -373,9 +383,27 @@ impl ProviderAutoRegister {
     /// Look for the `module_provides_contract` + `module_provider_dispatch`
     /// export pair. Returns None if the module isn't a provider.
     unsafe fn resolve(module: &LoadedModule) -> Option<Self> {
-        let contract_addr = module
+        let contract_fn = module
             .get_export_addr(export_hashes::MODULE_PROVIDES_CONTRACT)
-            .ok()?;
+            .ok()
+            .map(|addr| {
+                // SAFETY: resolved inside the module's code region; the
+                // symbol's declared C ABI is `fn() -> u32`.
+                unsafe { fn_ptr_from_addr::<unsafe extern "C" fn() -> u32>(addr) }
+            });
+        let contracts_fn = module
+            .get_export_addr(export_hashes::MODULE_PROVIDES_CONTRACTS)
+            .ok()
+            .map(|addr| {
+                // SAFETY: as above; the declared C ABI is
+                // `fn(*mut u8, *mut u16, u32) -> u32`.
+                unsafe {
+                    fn_ptr_from_addr::<unsafe extern "C" fn(*mut u8, *mut u16, u32) -> u32>(addr)
+                }
+            });
+        if contract_fn.is_none() && contracts_fn.is_none() {
+            return None;
+        }
         let dispatch_addr = module
             .get_export_addr(export_hashes::MODULE_PROVIDER_DISPATCH)
             .ok()?;
@@ -392,7 +420,8 @@ impl ProviderAutoRegister {
             .get_export_addr(export_hashes::MODULE_OBSERVES_OWNER_RELEASE)
             .is_ok();
         Some(Self {
-            contract_fn: fn_ptr_from_addr(contract_addr),
+            contract_fn,
+            contracts_fn,
             dispatch_fn: fn_ptr_from_addr(dispatch_addr),
             selector_fn,
             observes_owner_release,
@@ -400,7 +429,20 @@ impl ProviderAutoRegister {
     }
     /// Register this module as a provider. Called after module_new() Ready.
     unsafe fn register(&self, module_idx: u8, state_ptr: *mut u8, name: &'static str) {
-        let contract = (self.contract_fn)() as u16;
+        let mut list = [0u16; MAX_CONTRACTS_PER_PROVIDER];
+        let n = match (self.contracts_fn, self.contract_fn) {
+            (Some(f), _) => (f(
+                state_ptr,
+                list.as_mut_ptr(),
+                MAX_CONTRACTS_PER_PROVIDER as u32,
+            ) as usize)
+                .min(MAX_CONTRACTS_PER_PROVIDER),
+            (None, Some(f)) => {
+                list[0] = f() as u16;
+                1
+            }
+            (None, None) => 0,
+        };
         // Selector 0 = unkeyed / default provider (the class-byte dispatch
         // path). Instance-keyed volume backends supply a non-zero selector
         // through the optional `module_provider_selector` export (called with
@@ -411,17 +453,24 @@ impl ProviderAutoRegister {
             Some(f) => f(state_ptr),
             None => 0u32,
         };
-        let rc = crate::kernel::module::provider::register_module_provider(
-            contract,
-            module_idx,
-            self.dispatch_fn,
-            state_ptr,
-            selector,
-        );
-        if rc != 0 {
-            log::warn!(
-                "[inst] {name} provider auto-register failed contract=0x{contract:04x} rc={rc}"
+        let mut registered = 0usize;
+        for &contract in &list[..n] {
+            let rc = crate::kernel::module::provider::register_module_provider(
+                contract,
+                module_idx,
+                self.dispatch_fn,
+                state_ptr,
+                selector,
             );
+            if rc != 0 {
+                log::warn!(
+                    "[inst] {name} provider auto-register failed contract=0x{contract:04x} rc={rc}"
+                );
+                continue;
+            }
+            registered += 1;
+        }
+        if registered == 0 {
             return;
         }
         // Subscribe AFTER a successful registration: the observer set is keyed
@@ -435,6 +484,10 @@ impl ProviderAutoRegister {
         }
     }
 }
+/// Contracts one provider state may serve through
+/// `module_provides_contracts`.
+const MAX_CONTRACTS_PER_PROVIDER: usize = 4;
+
 /// Count of PIC calls that returned with interrupts disabled.
 static mut PIC_IRQ_DISABLED_COUNT: u32 = 0;
 /// Increment the IRQ-disabled counter (called by HAL pic_barrier).
