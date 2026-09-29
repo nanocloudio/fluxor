@@ -33,6 +33,7 @@ include!("runtime/format.rs");
 include!("runtime/names.rs");
 include!("runtime/wasm.rs");
 include!("runtime/provider.rs");
+include!("runtime/block.rs");
 include!("runtime/net.rs");
 include!("runtime/telemetry.rs");
 include!("runtime/device_access.rs");

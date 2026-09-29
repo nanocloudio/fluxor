@@ -40,6 +40,7 @@ use core::ptr::null_mut;
 
 use crate::abi::{SyscallTable, ABI_VERSION};
 use crate::kernel::ipc::channel;
+use crate::kernel::module::block_lend;
 use crate::kernel::sys::errno;
 use crate::kernel::sys::hal;
 // ============================================================================
@@ -450,17 +451,12 @@ pub fn init_providers() {
     // itself. If nothing is registered, `provider::dispatch(FS, …)`
     // returns ENOSYS naturally; no stub needed.
     provider::register(dev_class::BUFFER, buffer_provider_dispatch);
-    // KEY_VAULT: the kernel software backend is the *default* a platform
-    // may override. Unlike FS, KEY_VAULT is registered here in kernel
-    // core on BOTH paths — this class-byte dispatch and the
-    // KEY_VAULT_VTABLE below — so a hardware platform (e.g. the Linux
-    // PKCS#11 backend) must re-register BOTH at platform boot:
-    // `register` and `register_vtable` overwrite, and
-    // `hal::init_providers()` runs after these defaults, so a platform
-    // override wins. Overriding only one path would split custody
-    // between two backends. When no hardware is present the software
-    // backend stays live; consumers never name a platform — they read
-    // PROBE/CAPS/TIER.
+    // KEY_VAULT: the router, on BOTH paths — this class-byte dispatch and
+    // the KEY_VAULT_VTABLE below. It serves the kernel software backend
+    // and, when a platform registers one behind it (the Linux PKCS#11
+    // backend), a hardware backend; each handle names the backend that
+    // holds its key. Consumers never name a platform — they read
+    // PROBE/TIER/DESCRIBE.
     provider::register(dev_class::KEY_VAULT, key_vault_provider_dispatch);
 
     // Handle-scoped vtables for the kernel-owned contracts. Tracked
@@ -537,10 +533,7 @@ static BUFFER_VTABLE: crate::kernel::module::provider::ProviderVTable =
         default_close_op: 0, // buffers released by explicit RELEASE opcodes
     };
 
-// Default (software-backend) KEY_VAULT vtable. A hardware platform
-// overriding KEY_VAULT registers its own vtable with the same
-// `default_close_op` alongside its class dispatch — see the note at
-// the class registration in `init_providers`.
+// KEY_VAULT vtable: the router, over every backend.
 static KEY_VAULT_VTABLE: crate::kernel::module::provider::ProviderVTable =
     crate::kernel::module::provider::ProviderVTable {
         contract: crate::kernel::module::provider::contract::KEY_VAULT,
@@ -747,14 +740,14 @@ static HAL_PWM_VTABLE: crate::kernel::module::provider::ProviderVTable =
         default_close_op: contracts::hal::pwm::CLOSE,
     };
 
-/// KEY_VAULT provider adapter — forwards to the kernel key_vault module.
+/// KEY_VAULT provider adapter — forwards to the router.
 unsafe fn key_vault_provider_dispatch(
     handle: i32,
     opcode: u32,
     arg: *mut u8,
     arg_len: usize,
 ) -> i32 {
-    crate::kernel::security::key_vault::provider_dispatch(handle, opcode, arg, arg_len)
+    crate::kernel::security::key_vault_router::dispatch(handle, opcode, arg, arg_len)
 }
 
 // ============================================================================
@@ -789,7 +782,7 @@ unsafe fn key_vault_provider_dispatch(
 // on the same footing as FS (already in the masks below) when — and only
 // when — it declares them in `[[resources]]` (the manifest gate in
 // `check_contract_grant` remains authoritative). This lets a service-tier
-// backend (e.g. an emulator asset bank, RFC 0009) resolve an object
+// backend (e.g. an emulator asset bank) resolve an object
 // handle via `storage.object`/`storage.namespace` without being
 // mis-typed as a CAP_FULL `Protocol` module just to get the grant.
 // STORAGE_NAMESPACE = 0x13, STORAGE_OBJECT = 0x14 — both read-only.
@@ -811,7 +804,7 @@ const STORAGE_FAMILY: u64 = (1u64
 /// `pub` so the cap-class policy can be pinned by an out-of-tree harness
 /// test (`tests/harness/tests/kernel_permissions.rs`) — production `src/`
 /// keeps no inline tests (enforced by `tools/tests/src_shape_no_inline_tests`).
-/// PROC (0x16, bit 22) — the host process-executor contract. Added to the service-tier
+/// PROC (0x16, bit 22) — the host process-executor contract. In the service-tier
 /// ceilings so an app/Source/Transformer module (e.g. sector's `do`) CAN declare it; this
 /// is a ceiling only, the manifest `[[resources]]` gate still grants per-module.
 const PROC_CONTRACT: u64 = 1u64 << 0x16;
@@ -834,33 +827,41 @@ const TRUST_CONTRACT: u64 = 1u64 << 0x1D;
 /// spawning a workload. CAPS / READ / PROBE are not privileged: an in-graph
 /// enforcer reads the table it enforces.
 const NET_POLICY_CONTRACT: u64 = 1u64 << 0x1E;
+/// HOST_MOUNT (0x1F, bit 31) — a Linux node mounting a block device under the
+/// operator's mount root for its workloads. In the service-tier ceilings so a
+/// node's mount actuator can declare it; MOUNT and UMOUNT additionally require
+/// `platform_raw`, PRIV and ROOT are reads.
+const HOST_MOUNT_CONTRACT: u64 = 1u64 << 0x1F;
 pub const CAP_CONTRACT_MASK: [u64; 4] = [
     0x0027_1FE1
         | STORAGE_FAMILY
         | PROC_CONTRACT
         | WORKLOAD_CONTRACT
         | TRUST_CONTRACT
-        | NET_POLICY_CONTRACT, // CAP_SERVICE: infra + FS + storage family + KEY_VAULT + PLATFORM_NIC_RING + PLATFORM_DMA + PLATFORM_DMA_FD + PCIE_DEVICE + USB_HOST + PROC + WORKLOAD + TRUST + NET_POLICY
+        | NET_POLICY_CONTRACT
+        | HOST_MOUNT_CONTRACT, // CAP_SERVICE: infra + FS + storage family + KEY_VAULT + PLATFORM_NIC_RING + PLATFORM_DMA + PLATFORM_DMA_FD + PCIE_DEVICE + USB_HOST + PROC + WORKLOAD + TRUST + NET_POLICY + HOST_MOUNT
     0x0027_1FF1
         | STORAGE_FAMILY
         | PROC_CONTRACT
         | WORKLOAD_CONTRACT
         | TRUST_CONTRACT
-        | NET_POLICY_CONTRACT, // CAP_SERVICE_PIO: service + HAL_PIO
+        | NET_POLICY_CONTRACT
+        | HOST_MOUNT_CONTRACT, // CAP_SERVICE_PIO: service + HAL_PIO
     0x0027_1FE3
         | STORAGE_FAMILY
         | PROC_CONTRACT
         | WORKLOAD_CONTRACT
         | TRUST_CONTRACT
-        | NET_POLICY_CONTRACT, // CAP_SERVICE_GPIO: service + HAL_GPIO
+        | NET_POLICY_CONTRACT
+        | HOST_MOUNT_CONTRACT, // CAP_SERVICE_GPIO: service + HAL_GPIO
     u64::MAX, // CAP_FULL: any contract
 ];
 
 unsafe fn check_contract_grant(contract: u16) -> Option<i32> {
     use crate::kernel::module::provider::contract as ct;
 
-    // host_process (0x1B) is the workload contract's Linux host-class companion
-    // (D-WORKLOAD-ABI eviction from the 0x1A surface): the READ/EXEC/TTY ops act
+    // host_process (0x1B) is the workload contract's Linux host-class companion:
+    // the READ/EXEC/TTY ops act
     // on a workload the module already created, so they carry the SAME
     // `requires_contract = "workload"` grant (see provider::contract::HOST_PROCESS).
     // Without this the opcode-class-byte gate would demand a separate 0x1B bit
@@ -1021,6 +1022,11 @@ fn privileged_op_permission(op: u32) -> Option<u16> {
     // net.policy (0x1Exx) REPLACE / CLEAR rewrite the host's packet policy:
     // platform_raw, like the workload ops. PROBE / CAPS / READ are reads.
     if op == 0x1E02 || op == 0x1E03 {
+        return Some(PLATFORM_RAW);
+    }
+    // host_mount (0x1Fxx) MOUNT / UMOUNT change what the host has mounted:
+    // platform_raw. PRIV and ROOT are reads.
+    if op == 0x1F01 || op == 0x1F02 {
         return Some(PLATFORM_RAW);
     }
     if !(0x0C00..=0x0CFF).contains(&op) {
@@ -1200,8 +1206,15 @@ unsafe fn channel_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_
                     }
                 }
                 _ => {
-                    // Module-registered handler — length is part of
-                    // the per-cmd contract, validated by the handler.
+                    // A handler receives the pointer and never a length, so
+                    // the commands whose record the contract fixes are held to
+                    // exactly that length here. Any other command belongs to a
+                    // module-registered handler and its own contract.
+                    if let Some(want) = block_lend::arg_len(cmd) {
+                        if payload_len != want {
+                            return E_INVAL;
+                        }
+                    }
                 }
             }
             let data_ptr = if payload_len > 0 {
@@ -1209,7 +1222,16 @@ unsafe fn channel_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_
             } else {
                 core::ptr::null_mut()
             };
-            channel::syscall_channel_ioctl(handle, cmd, data_ptr)
+            // A block request that lends its buffer is on the ledger from
+            // here until its completion is reaped.
+            let holder = crate::kernel::exec::scheduler::current_module_index();
+            let pending = match block_lend::begin(handle, holder, cmd, data_ptr, payload_len) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            let rc = channel::syscall_channel_ioctl(handle, cmd, data_ptr);
+            block_lend::finish(pending, handle, cmd, rc, data_ptr, payload_len);
+            rc
         }
         dev_channel::REGISTER_IOCTL => {
             if arg.is_null() || arg_len < 16 {

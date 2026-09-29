@@ -1,4 +1,5 @@
-// Contract: key_vault — backend-managed asymmetric keys (ECDSA / EdDSA / ECDH).
+// Contract: key_vault — backend-managed opaque keys: signing, agreement,
+// sealing and MAC keys behind handles that never expose the key bytes.
 //
 // Layer: contracts (public, stable).
 //
@@ -27,8 +28,8 @@ pub const PROBE: u32 = 0x1000;
 /// Returns an opaque handle (>= 0) or negative errno. Pass the handle back
 /// unmodified to SIGN / ECDH / PUBLIC / DESTROY; do not decode it.
 ///
-/// `key_len` is a `u32` because an ML-DSA-87 private key is 4896 bytes; no
-/// narrower field can express one.
+/// `key_len` is a `u32` so that the field never bounds a key's encoding: an
+/// ML-DSA-87 private key is 4896 bytes.
 ///
 /// STORE is an *import* path: the key existed outside the backend and is
 /// received-then-wiped, not never-present. A non-extractable HSM may refuse
@@ -158,15 +159,13 @@ pub const TIER: u32 = 0x1008;
 /// Key suites: what a slot's key bytes mean, which operations it admits,
 /// and how big each answer is.
 ///
-/// A `u16` because the space this has to hold is large: ML-DSA and
-/// SLH-DSA come in three parameter sets each, ML-KEM in three more, and
-/// every hybrid is its own entry. A byte would have been enough for a
-/// decade and then not, and widening a field that eleven modules index by
-/// is the change nobody wants to make under time pressure.
+/// A `u16` because the space this has to hold is large: each post-quantum
+/// family comes in several parameter sets, and every hybrid is its own
+/// entry.
 ///
 /// **Naming a suite is not implementing it.** [`SUITE_QUERY`] is the only
-/// thing that says whether a backend can use one; the ids exist so sizes
-/// and policies are already suite-shaped when the primitives arrive.
+/// thing that says whether a backend can use one: `P384` and `ML_KEM_768`
+/// are ids a backend may report `ENOSYS` for.
 pub mod suite {
     /// No suite. Never valid: a key that does not say what it is cannot be
     /// used, and defaulting one picks the answer for the caller.
@@ -212,8 +211,17 @@ pub mod suite {
     pub const RSA_3072: u16 = 11;
     pub const RSA_4096: u16 = 12;
 
+    /// A sealing key for AES-256-GCM, 32 bytes, no public half. Offered
+    /// only where the block cipher runs in constant time: elsewhere
+    /// `SUITE_QUERY` answers `ENOSYS`, and `AEAD_KEY` is the sealing suite.
+    pub const AEAD_AES256_GCM: u16 = 13;
+    /// A key-derivation master, 32 bytes, no public half: its only use is
+    /// [`super::usage::DERIVE`], which makes purpose keys from it. A volume,
+    /// WAL or snapshot key is one, so no purpose key is ever the master.
+    pub const KDF_KEY: u16 = 14;
+
     /// Highest id this registry defines.
-    pub const MAX_ID: u16 = RSA_4096;
+    pub const MAX_ID: u16 = KDF_KEY;
 }
 
 /// How [`SIGN`] should treat the bytes it is given.
@@ -267,9 +275,11 @@ pub mod usage {
     /// composition, never in the clear. A key without this bit never
     /// leaves at all.
     pub const WRAP: u32 = 1 << 5;
-    /// The key may seal ([`AEAD_SEAL`]).
+    /// The key may seal ([`AEAD_SEAL`], [`AEAD_SEAL_UNITS`]).
     pub const SEAL: u32 = 1 << 6;
-    /// The key may open ([`AEAD_OPEN`]).
+    /// Derive purpose keys from this key ([`super::DERIVE`]).
+    pub const DERIVE: u32 = 1 << 8;
+    /// The key may open ([`AEAD_OPEN`], [`AEAD_OPEN_UNITS`]).
     pub const OPEN: u32 = 1 << 7;
 }
 
@@ -285,7 +295,13 @@ pub const MAX_LABEL: usize = 64;
 /// [label[label_len]]
 /// [pub_out_ptr:u64][pub_out_cap:u16][pub_len_out:u16]
 /// ```
-/// Returns an opaque handle (>= 0), or a negative errno.
+/// Returns an opaque handle (>= 0), or a negative errno:
+/// - `-EACCES`: the key exists under another suite, or with fewer uses than
+///   `usage_mask` asks for;
+/// - `-EBUSY`: another instance of the caller's module type holds the key
+///   open;
+/// - `-ENOMEM`: no slot is free;
+/// - `-ERANGE`: the public-key buffer is short (nothing was opened or made).
 ///
 /// **This is the operation that makes an issuer key survive a restart**,
 /// and it is one operation rather than "does it exist?" then "create it"
@@ -318,7 +334,8 @@ pub const OPEN: u32 = 0x100A;
 /// Destroy the key named by `label`, wherever it is stored.
 ///
 /// handle=-1. arg layout: `[label_len:u8][label[label_len]]`.
-/// Returns 0, or `-ENOENT`.
+/// Returns 0, `-ENOENT` when no key has the label, or the generic error
+/// (`-1`) when the sealed record could not be removed (it would come back).
 ///
 /// By label rather than by handle because the point is to remove the
 /// PERSISTED key: destroying a handle frees a slot and leaves the sealed
@@ -417,6 +434,299 @@ pub const AEAD_SEAL: u32 = 0x1012;
 /// output the plaintext. Returns 0, `-EINVAL` when the tag does not
 /// verify, or `-ERANGE`.
 pub const AEAD_OPEN: u32 = 0x1013;
+
+/// Derive a purpose key from a [`suite::KDF_KEY`] slot. handle = the
+/// master (must permit [`usage::DERIVE`]). arg layout: see [`derive`].
+/// Returns a new handle, owned by the caller, holding
+/// `HKDF-SHA256(ikm = master, salt = derive::SALT, info = label ‖ context)`
+/// as a key of the target suite with the target uses. A derived key is
+/// never persisted: it is derived again when needed.
+pub const DERIVE: u32 = 0x1014;
+
+/// Seal up to [`units::MAX_ENTRIES`] buffers in place under an AEAD slot
+/// ([`suite::AEAD_KEY`] or [`suite::AEAD_AES256_GCM`], must permit
+/// [`usage::SEAL`]), each with the nonce its entry names. arg layout: see
+/// [`units`]. Returns 0 when every entry sealed, or a negative errno when
+/// the request was refused before any.
+///
+/// The caller chooses the nonces, so their uniqueness under the key is the
+/// caller's obligation — the reason this exists beside [`AEAD_SEAL`], whose
+/// vault-drawn random nonces suit a record now and then and not a storage
+/// device writing the same key for years. The slot is owned by one module,
+/// so no other can seal under it.
+pub const AEAD_SEAL_UNITS: u32 = 0x1015;
+
+/// Open up to [`units::MAX_ENTRIES`] buffers in place, verifying each tag.
+/// An entry whose tag does not verify has its status set to
+/// [`units::STATUS_AUTH_FAILED`] and its buffer zeroed, so unauthenticated
+/// plaintext is never left behind. Returns the number of entries that
+/// failed, or a negative errno when the request was refused before any.
+pub const AEAD_OPEN_UNITS: u32 = 0x1016;
+
+/// Split a 32-byte key 2-of-3 and wrap each share to its own recipient.
+/// handle = the key (must permit [`usage::WRAP`]; a [`suite::KDF_KEY`],
+/// [`suite::AEAD_KEY`] or [`suite::AEAD_AES256_GCM`]). arg layout: see
+/// [`share::split`]. Writes three [`share`] envelopes, for share indices 1,
+/// 2 and 3 in recipient order. Returns 0, or `-ERANGE` with the requirement
+/// in `out_len_out`.
+///
+/// The shares exist only inside the call: each is sealed to its recipient
+/// as it is made, and the scratch is zeroed. Any two envelopes, opened by
+/// their recipients, give the key back through [`SHARE_COMBINE`]; one gives
+/// nothing.
+pub const SHARE_SPLIT: u32 = 0x1017;
+
+/// Open one share envelope and seal the share to another recipient.
+/// handle = the P-256 key the envelope is wrapped to (must permit
+/// [`usage::AGREE`] and [`usage::EXPORT_PUBLIC`]: an envelope names its
+/// recipient by public key). arg layout: see [`share::rewrap`]. Returns 0, or
+/// `-ERANGE`.
+///
+/// What a custodian does to release its share: the share leaves this vault
+/// only sealed to the new recipient, bound to a new purpose, lease fence,
+/// expiry and policy digest. The recovery set, protected resource, epoch
+/// and share index are carried over and cannot be changed.
+pub const SHARE_REWRAP: u32 = 0x1018;
+
+/// Open two share envelopes and reconstruct their key into a fresh handle,
+/// owned by the caller. handle=-1. arg layout: see [`share::combine`]. The
+/// two opener handles are the caller's recipient keys, each permitting
+/// [`usage::AGREE`] and [`usage::EXPORT_PUBLIC`], held in any backend.
+/// Returns the handle, or:
+/// - `-EINVAL`: an envelope is malformed or does not open, or the two do
+///   not belong together — another recovery set, resource, epoch or AEAD,
+///   or the same share index twice;
+/// - `-EACCES`: an envelope is not wrapped to the handle opening it, has
+///   expired (or carries an expiry with no wall clock to check it), was
+///   already consumed, or is for another resource or epoch than asked.
+///
+/// Reconstruction happens only here, and the key it yields is a handle:
+/// neither share nor key is ever written to the caller. The new key is
+/// never persisted; a volume attaches again after a restart.
+pub const SHARE_COMBINE: u32 = 0x1019;
+
+/// Attest a key: signed evidence of what a handle is, bound to a caller's
+/// challenge, never its bytes. handle = the key attested. arg layout: see
+/// [`attest_key`]. The output is `[record][signature]`, the signature made
+/// by the signer handle the argument names (must permit [`usage::SIGN`]) in
+/// its suite's convention, as [`ATTEST_COMPOSITION`] signs. Returns 0, or
+/// `-ERANGE` with the requirement in `out_len_out`.
+///
+/// The record commits to the key without revealing it, names its suite,
+/// uses, owner namespace, persistence and the vault's tier, and carries the
+/// composition digest, so a verifier that trusts the signer's public key
+/// learns which composition holds which kind of key under which policy.
+pub const ATTEST_KEY: u32 = 0x101A;
+
+/// Share envelopes (the recovery and attachment format): one 2-of-3 share
+/// of a 32-byte key, sealed to one recipient's P-256 key.
+///
+/// ```text
+/// [magic "FXSE"][kem:u16][aead:u16][purpose:u8][index:u8][threshold:u8]
+/// [count:u8][set_id:16][resource:16][epoch:u32][recipient_thumbprint:32]
+/// [fence:u64][expiry_ms:u64][anti_replay:16][policy:32][enc_len:u16]
+/// [encapsulation][ciphertext:33][tag:16]
+/// ```
+///
+/// `recipient_thumbprint` is SHA-256 of the recipient's uncompressed public
+/// key. The key is `HKDF-SHA256(ikm = ECDH(ephemeral, recipient),
+/// salt = derive::SALT, info = "share/envelope" ‖ header)` and the AEAD
+/// seals `index ‖ y` under a zero nonce with the header as associated data,
+/// the header being every byte before the ciphertext. The nonce is fixed
+/// because every envelope's key comes from a fresh ephemeral key.
+pub mod share {
+    pub const MAGIC: [u8; 4] = *b"FXSE";
+    pub const KEM: usize = 4;
+    pub const AEAD: usize = 6;
+    pub const PURPOSE: usize = 8;
+    pub const INDEX: usize = 9;
+    pub const THRESHOLD: usize = 10;
+    pub const COUNT: usize = 11;
+    pub const SET_ID: usize = 12;
+    pub const RESOURCE: usize = 28;
+    pub const EPOCH: usize = 44;
+    pub const RECIPIENT: usize = 48;
+    pub const FENCE: usize = 80;
+    pub const EXPIRY: usize = 88;
+    pub const ANTI_REPLAY: usize = 96;
+    pub const POLICY: usize = 112;
+    pub const ENC_LEN: usize = 144;
+    pub const ENC: usize = 146;
+    /// The sealed share: `index(1) ‖ y(32)`.
+    pub const SHARE_LEN: usize = 33;
+    pub const TAG_LEN: usize = 16;
+
+    /// KEM suites.
+    pub mod kem {
+        /// P-256 ECDH with an ephemeral key; the encapsulation is its
+        /// 65-byte uncompressed public key.
+        pub const P256: u16 = 1;
+    }
+    /// Envelope AEAD suites, the ids the storage formats record.
+    pub mod aead {
+        pub const CHACHA20_POLY1305: u16 = 1;
+        /// Offered where the vault offers [`super::super::suite::AEAD_AES256_GCM`].
+        pub const AES_256_GCM: u16 = 2;
+    }
+    pub mod purpose {
+        /// Released to a node for one attach, bound to its lease fence.
+        pub const ATTACHMENT: u8 = 1;
+        /// Held by a recovery custodian.
+        pub const RECOVERY: u8 = 2;
+    }
+
+    pub const P256_PUB_LEN: usize = 65;
+    /// An envelope under [`kem::P256`].
+    pub const P256_LEN: usize = ENC + P256_PUB_LEN + SHARE_LEN + TAG_LEN;
+    pub const THRESHOLD_V1: u8 = 2;
+    pub const COUNT_V1: u8 = 3;
+
+    /// What a split or rewrap binds an envelope to, as the argument
+    /// carries it:
+    /// `[purpose:u8][_pad:u8][aead:u16][set_id:16][resource:16][epoch:u32]
+    ///  [fence:u64][expiry_ms:u64][policy:32]`. A rewrap reads only the
+    /// purpose, fence, expiry and policy and carries the rest over.
+    pub mod grant {
+        pub const PURPOSE: usize = 0;
+        pub const AEAD: usize = 2;
+        pub const SET_ID: usize = 4;
+        pub const RESOURCE: usize = 20;
+        pub const EPOCH: usize = 36;
+        pub const FENCE: usize = 40;
+        pub const EXPIRY: usize = 48;
+        pub const POLICY: usize = 56;
+        pub const LEN: usize = 88;
+    }
+
+    /// [`super::SHARE_SPLIT`]:
+    /// `[grant][recipient:65 ×3][out_ptr:u64][out_cap:u32][out_len_out:u32]`.
+    pub mod split {
+        use super::{grant, P256_PUB_LEN};
+        pub const RECIPIENTS: usize = grant::LEN;
+        pub const OUT_PTR: usize = RECIPIENTS + 3 * P256_PUB_LEN;
+        pub const OUT_CAP: usize = OUT_PTR + 8;
+        pub const OUT_LEN: usize = OUT_CAP + 4;
+        pub const LEN: usize = OUT_LEN + 4;
+    }
+
+    /// [`super::SHARE_REWRAP`]:
+    /// `[grant][recipient:65][out_ptr:u64][out_cap:u32][out_len_out:u32]
+    ///  [env_len:u16][envelope]`.
+    pub mod rewrap {
+        use super::{grant, P256_PUB_LEN};
+        pub const RECIPIENT: usize = grant::LEN;
+        pub const OUT_PTR: usize = RECIPIENT + P256_PUB_LEN;
+        pub const OUT_CAP: usize = OUT_PTR + 8;
+        pub const OUT_LEN: usize = OUT_CAP + 4;
+        pub const ENV_LEN: usize = OUT_LEN + 4;
+        pub const ENV: usize = ENV_LEN + 2;
+    }
+
+    /// [`super::SHARE_COMBINE`]:
+    /// `[target_suite:u16][target_usage:u32][_pad:u16][opener_a:i32]
+    ///  [opener_b:i32][resource:16][epoch:u32][env_a_len:u16][env_b_len:u16]
+    ///  [env_a][env_b]`. The target suite is one a split source may hold,
+    /// and the uses may not include [`super::super::usage::PERSIST`].
+    pub mod combine {
+        pub const TARGET_SUITE: usize = 0;
+        pub const TARGET_USAGE: usize = 2;
+        pub const OPENER_A: usize = 8;
+        pub const OPENER_B: usize = 12;
+        pub const RESOURCE: usize = 16;
+        pub const EPOCH: usize = 32;
+        pub const ENV_A_LEN: usize = 36;
+        pub const ENV_B_LEN: usize = 38;
+        pub const ENVS: usize = 40;
+    }
+}
+
+/// [`ATTEST_KEY`]: the argument, and the record it signs.
+///
+/// arg: `[challenge:32][signer:i32][_pad:u32][out_ptr:u64][out_cap:u32]
+/// [out_len_out:u32]`.
+///
+/// record: `["FXHA"][challenge:32][composition:32][backend:u8][tier:u8]
+/// [persisted:u8][_pad:u8][suite:u16][_pad:u16][usage:u32][namespace:u32]
+/// [commitment:32][public_thumbprint:32]`, where `composition` is the
+/// composition digest [`KEY_WRAP`] binds to, `commitment` is
+/// `HMAC-SHA256(key, "fluxor/v1 attest/commitment")` — the same key always
+/// gives the same commitment and the commitment gives nothing of the key —
+/// and `public_thumbprint` is SHA-256 of the public half, zero for a key
+/// without one. A key a hardware backend holds has no readable bytes to
+/// commit to: its commitment is zero and its public thumbprint names it.
+pub mod attest_key {
+    pub const CHALLENGE: usize = 0;
+    pub const SIGNER: usize = 32;
+    pub const OUT_PTR: usize = 40;
+    pub const OUT_CAP: usize = 48;
+    pub const OUT_LEN: usize = 52;
+    pub const ARG_LEN: usize = 56;
+
+    pub const MAGIC: [u8; 4] = *b"FXHA";
+    pub const R_CHALLENGE: usize = 4;
+    pub const R_COMPOSITION: usize = 36;
+    pub const R_BACKEND: usize = 68;
+    pub const R_TIER: usize = 69;
+    pub const R_PERSISTED: usize = 70;
+    pub const R_SUITE: usize = 72;
+    pub const R_USAGE: usize = 76;
+    pub const R_NAMESPACE: usize = 80;
+    pub const R_COMMITMENT: usize = 84;
+    pub const R_THUMBPRINT: usize = 116;
+    pub const RECORD_LEN: usize = 148;
+    pub const COMMITMENT_LABEL: &[u8] = b"fluxor/v1 attest/commitment";
+
+    /// Which backend holds the key.
+    pub mod backend {
+        pub const KERNEL: u8 = 0;
+        pub const PKCS11: u8 = 1;
+    }
+}
+
+/// Layout of a [`DERIVE`] argument.
+///
+/// `[target_suite:u16][target_usage:u32][label_len:u8][_pad:u8]
+///  [context_len:u16][label][context]`
+pub mod derive {
+    pub const TARGET_SUITE: usize = 0;
+    pub const TARGET_USAGE: usize = 2;
+    pub const LABEL_LEN: usize = 6;
+    pub const CONTEXT_LEN: usize = 8;
+    /// Where the label starts; the context follows it.
+    pub const LABEL: usize = 10;
+    pub const MAX_LABEL: usize = 64;
+    pub const MAX_CONTEXT: usize = 128;
+    /// The HKDF salt every derivation uses.
+    pub const SALT: &[u8] = b"fluxor/v1";
+}
+
+/// Layout of an [`AEAD_SEAL_UNITS`] / [`AEAD_OPEN_UNITS`] argument:
+/// a header, then `count` entries.
+pub mod units {
+    /// `[count:u16][_pad:u16]`
+    pub const HEADER_LEN: usize = 4;
+    pub const COUNT: usize = 0;
+    /// One entry: `[nonce:12][aad_len:u16][status:u8][_pad:u8]
+    /// [aad_ptr:u64][data_ptr:u64][data_len:u32][_pad:u32][tag_ptr:u64]`.
+    pub const ENTRY_LEN: usize = 48;
+    pub const NONCE: usize = 0;
+    pub const AAD_LEN: usize = 12;
+    /// Written by the vault: 0, or [`STATUS_AUTH_FAILED`].
+    pub const STATUS: usize = 14;
+    pub const AAD_PTR: usize = 16;
+    pub const DATA_PTR: usize = 24;
+    pub const DATA_LEN: usize = 32;
+    /// 16 bytes: written by a seal, checked by an open.
+    pub const TAG_PTR: usize = 40;
+    pub const STATUS_AUTH_FAILED: u8 = 1;
+    /// Entries one call carries.
+    pub const MAX_ENTRIES: usize = 32;
+    /// Bytes one call seals or opens, across its entries: bounds the work
+    /// done inside the caller's step.
+    pub const MAX_BYTES: usize = 256 * 1024;
+    /// Longest associated data per entry.
+    pub const MAX_AAD: usize = 128;
+}
 
 /// Layout constants for [`KEY_WRAP`] blobs.
 pub mod wrap {

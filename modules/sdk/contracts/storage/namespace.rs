@@ -79,6 +79,9 @@
 // on the returned event stream is documented under
 // `docs/architecture/storage_capability_surface.md` §"namespace.change".
 
+/// A write's answer here is classified as `storage.object`'s is.
+pub use super::object::{write_answer, WriteAnswer};
+
 /// Look up a name under this namespace.
 ///
 /// `handle = -1`; `arg` points at the UTF-8 path (no null
@@ -196,6 +199,14 @@ pub const LIST: u32 = 0x1302;
 /// `ReplicatedDurable { source, .. }` once a quorum acks,
 /// `Volatile` for in-memory namespaces — into `fence_out_ptr`
 /// atomically with returning success.
+///
+/// `RENAME`, `DELETE` and `BIND` MAY answer `EINPROGRESS` when the
+/// provider cannot decide the write inside the call (a replicated
+/// provider decides it at its log position). The caller asks again later
+/// with byte-identical arguments; the answer to a later ask is the
+/// decision and its fence. The provider keys an undecided write by the
+/// calling module and the request's bytes, so asking again is never a
+/// second write. This is the same rule as `storage.object`'s writes.
 pub const RENAME: u32 = 0x1303;
 
 /// Delete an entry.
@@ -210,9 +221,9 @@ pub const RENAME: u32 = 0x1303;
 ///   [fence_out_cap: u16 LE]       — must be >= `fence::WIRE_MAX_LEN`
 /// ```
 ///
-/// Returns 0 or negative errno. Same fence-advertisement rules as
-/// `RENAME` — the encoded fence is written into `fence_out_ptr`
-/// atomically with the op return.
+/// Returns 0 or negative errno, or `EINPROGRESS` as for `RENAME`. Same
+/// fence-advertisement rules as `RENAME` — the encoded fence is written
+/// into `fence_out_ptr` atomically with the op return.
 pub const DELETE: u32 = 0x1304;
 
 /// Open an `Event<namespace.change>` subscription rooted at a
@@ -293,11 +304,11 @@ pub const CHANGES: u32 = 0x1307;
 ///   [fence_out_cap: u16 LE]       — must be >= `fence::WIRE_MAX_LEN`
 /// ```
 ///
-/// Returns 0 or negative errno. Same fence-advertisement rules as
-/// `RENAME`/`DELETE`: the achieved fence — `Volatile` for in-memory
-/// namespaces, `LocalDurable { device_id }` once locally committed,
-/// `ReplicatedDurable { source, .. }` once a quorum acks — is written
-/// into `fence_out_ptr` atomically with the op return.
+/// Returns 0 or negative errno, or `EINPROGRESS` as for `RENAME`. Same
+/// fence-advertisement rules as `RENAME`/`DELETE`: the achieved fence —
+/// `Volatile` for in-memory namespaces, `LocalDurable { device_id }` once
+/// locally committed, `ReplicatedDurable { source, .. }` once a quorum acks —
+/// is written into `fence_out_ptr` atomically with the op return.
 ///
 /// ## Relation to `fs::OPEN_CREATE` and `fs::MKDIR`
 ///

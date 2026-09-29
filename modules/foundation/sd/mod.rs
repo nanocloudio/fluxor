@@ -31,7 +31,7 @@
 //! - Macro-based code reuse (compile-time expansion)
 //! - All syscalls through function pointer table
 
-#![no_std]
+#![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
     dead_code,
     reason = "the PIC build mounts the whole of modules/sdk/* via include!, so every \
@@ -103,6 +103,9 @@ const DATA_FREQ: u32 = 12_000_000;
 
 /// Maximum attempts waiting for R1 response
 const CMD_TIMEOUT: u32 = 100;
+
+/// Channel ioctl: the producer's end-of-stream.
+const IOCTL_SET_HUP: u32 = 4;
 
 /// Data token indicating start of block data
 const TOKEN_DATA: u8 = 0xFE;
@@ -194,6 +197,19 @@ enum BlockReadState {
     SendingCmd = 2,
     WaitingR1 = 3,
     ReadingDataBlock = 4,
+}
+
+/// The one `storage.block` request the source holds.
+///
+/// Empty → Queued (`SUBMIT`) → Running (the step owns the read machine) →
+/// Done (`REAP` takes the completion) → Empty.
+#[repr(u8)]
+#[derive(Clone, Copy, PartialEq)]
+enum ReqState {
+    Empty = 0,
+    Queued = 1,
+    Running = 2,
+    Done = 3,
 }
 
 /// SD card initialization state machine (SD Physical Layer Simplified Spec §4.2).
@@ -306,8 +322,8 @@ struct SdState {
     rd_attempts_lo: u8,
     rd_attempts_hi: u8,
     _pad3: u8,
-    rd_start_ms_lo: u32,
-    rd_start_ms_hi: u32,
+    /// Landing buffer of the data block read in flight.
+    rd_buf: *mut u8,
     crc_buf: [u8; 2],
     _pad4: [u8; 2],
 
@@ -315,8 +331,8 @@ struct SdState {
     rb_state: BlockReadState,
     rb_attempts: u8,
     rb_addr: u32,
-    rb_start_ms_lo: u32,
-    rb_start_ms_hi: u32,
+    /// Landing buffer of the block read in flight.
+    rb_buf: *mut u8,
 
     // Init state
     init_state: SdInitPhase,
@@ -346,9 +362,28 @@ struct SdState {
     /// Timer fd for init retry delays (fd-based timer API)
     timer_fd: i32,
 
+    /// The `storage.block` request in flight (queue depth 1).
+    req_state: ReqState,
+    /// `op::*` of the request.
+    req_op: u8,
+    _pad7: [u8; 2],
+    /// Completion status once `req_state` is `Done`.
+    req_status: i32,
+    /// Request tag, little-endian halves (the state carries no 8-aligned
+    /// field).
+    req_tag_lo: u32,
+    req_tag_hi: u32,
+    /// Card address of the block the request reads.
+    req_addr: u32,
+    /// The caller's buffer, lent until the completion is reaped.
+    req_buf: *mut u8,
+
     // Buffers (at end for alignment)
     block_buf: [u8; BLOCK_SIZE],
     csd_buf: [u8; BLOCK_SIZE],
+    /// Landing buffer for requested reads, copied to the caller only when the
+    /// whole block has arrived intact.
+    req_data: [u8; BLOCK_SIZE],
 }
 
 impl SdState {
@@ -373,15 +408,21 @@ impl SdState {
         self.rd_attempts_lo = 0;
         self.rd_attempts_hi = 0;
         self._pad3 = 0;
-        self.rd_start_ms_lo = 0;
-        self.rd_start_ms_hi = 0;
+        self.rd_buf = ptr::null_mut();
         self.crc_buf = [0xFF; 2];
         self._pad4 = [0; 2];
         self.rb_state = BlockReadState::Idle;
         self.rb_attempts = 0;
         self.rb_addr = 0;
-        self.rb_start_ms_lo = 0;
-        self.rb_start_ms_hi = 0;
+        self.rb_buf = ptr::null_mut();
+        self.req_state = ReqState::Empty;
+        self.req_op = 0;
+        self._pad7 = [0; 2];
+        self.req_status = 0;
+        self.req_tag_lo = 0;
+        self.req_tag_hi = 0;
+        self.req_addr = 0;
+        self.req_buf = ptr::null_mut();
         self.init_state = SdInitPhase::Idle;
         self.init_retry = 0;
         self.init_preclk_count = 0;
@@ -839,8 +880,7 @@ unsafe fn send_cmd_poll(s: &mut SdState) -> i32 {
 // ============================================================================
 
 unsafe fn read_data_block_start(s: &mut SdState, buf: *mut u8, selected: bool) {
-    s.rd_start_ms_lo = buf as u32;
-    s.rd_start_ms_hi = 0;
+    s.rd_buf = buf;
     s.rd_attempts_lo = 0;
     s.rd_attempts_hi = 0;
     if selected {
@@ -855,7 +895,7 @@ unsafe fn read_data_block_start(s: &mut SdState, buf: *mut u8, selected: bool) {
 
 #[inline(always)]
 fn get_rd_buf(s: &SdState) -> *mut u8 {
-    s.rd_start_ms_lo as *mut u8
+    s.rd_buf
 }
 
 #[inline(always)]
@@ -978,10 +1018,28 @@ unsafe fn read_data_block_poll(s: &mut SdState) -> i32 {
 // Block Read Layer (read_block)
 // ============================================================================
 
-unsafe fn read_block_start(s: &mut SdState, block: u32, buf: *mut u8) {
-    s.rb_start_ms_lo = buf as u32;
-    s.rb_start_ms_hi = 0;
-    s.rb_addr = block * s.cdv;
+/// The CMD17 argument for logical block `lba`: a block number on a
+/// block-addressed card (`cdv` 1), a byte offset on a byte-addressed one
+/// (`cdv` 512). `None` when the card's 32-bit argument cannot name the block.
+fn card_address(lba: u64, cdv: u32) -> Option<u32> {
+    u32::try_from(lba.checked_mul(u64::from(cdv))?).ok()
+}
+
+/// Start a read of logical block `block` into `buf`. False, with nothing
+/// started, when the card cannot address the block.
+unsafe fn read_block_start(s: &mut SdState, block: u64, buf: *mut u8) -> bool {
+    match card_address(block, s.cdv) {
+        Some(addr) => {
+            read_addr_start(s, addr, buf);
+            true
+        }
+        None => false,
+    }
+}
+
+unsafe fn read_addr_start(s: &mut SdState, addr: u32, buf: *mut u8) {
+    s.rb_buf = buf;
+    s.rb_addr = addr;
     s.cmd_buf = [
         0x40 | CMD17,
         (s.rb_addr >> 24) as u8,
@@ -998,14 +1056,26 @@ unsafe fn read_block_start(s: &mut SdState, block: u32, buf: *mut u8) {
 
 #[inline(always)]
 fn get_rb_buf(s: &SdState) -> *mut u8 {
-    s.rb_start_ms_lo as *mut u8
+    s.rb_buf
+}
+
+/// Result of a read the card cannot address (never started).
+const E_UNREACHABLE: i32 = -10;
+
+/// Signal end-of-stream on `blocks`: the channel reports `POLL_HUP` once its
+/// data drains, which is what a finished module's channels report. The
+/// source itself keeps running.
+unsafe fn end_stream(s: &SdState) {
+    if s.out_chan >= 0 {
+        dev_channel_ioctl(s.sys(), s.out_chan, IOCTL_SET_HUP, ptr::null_mut(), 0);
+    }
 }
 
 /// Poll block read.
 /// Returns: 0 = pending, 1 = done, negative = error
 /// Error codes: -1=idle, -2=claim_xfer, -3=claim_timeout, -4=cmd_xfer,
 ///   -5=r1_poll, -6=r1_error(response in rb_attempts), -7=r1_timeout,
-///   -8=data_block, -9=unknown
+///   -8=data_block, -9=unknown, -10=unreachable block
 unsafe fn read_block_poll(s: &mut SdState) -> i32 {
     loop {
         match s.rb_state {
@@ -1091,6 +1161,212 @@ unsafe fn read_block_poll(s: &mut SdState) -> i32 {
 
             _ => return -9,
         }
+    }
+}
+
+// ============================================================================
+// storage.block v1
+// ============================================================================
+//
+// A read-only source: `CAPS`, and one-block `READ` requests through
+// `SUBMIT` / `REAP` (queue depth 1), run on the same read machine the stream
+// uses, between the stream's own blocks. The stream on `blocks` itself is
+// unchanged.
+//
+// There is no `EXEC`. It must finish inside the call, and a card transfer
+// takes as long as the card takes; a call that waits for it holds the whole
+// scheduler step. The contract gives `EXEC` no retryable answer, so the
+// source answers it `ENOSYS`, as a source that cannot queue answers `SUBMIT`.
+// Every step advances the request by one bounded poll of the read machine.
+
+use abi::contracts::storage::block::{self as blk, Caps, Cpl, Req};
+use abi::fence::Fence;
+
+/// Logical blocks a card holds, from its CSD register. `None` for a CSD
+/// structure this driver does not know.
+pub fn csd_block_count(csd: &[u8]) -> Option<u64> {
+    let bits = |hi: usize, lo: usize| -> u64 {
+        // CSD bit n is bit (n % 8) of byte 15 - n / 8.
+        let mut v = 0u64;
+        let mut n = hi;
+        loop {
+            let byte = csd[15 - n / 8];
+            v = (v << 1) | u64::from((byte >> (n % 8)) & 1);
+            if n == lo {
+                return v;
+            }
+            n -= 1;
+        }
+    };
+    if csd.len() < 16 {
+        return None;
+    }
+    match bits(127, 126) {
+        // CSD 2.0 (SDHC/SDXC): (C_SIZE + 1) * 512 KiB.
+        1 => Some((bits(69, 48) + 1) * 1024),
+        // CSD 1.0: (C_SIZE + 1) * 2^(C_SIZE_MULT + 2) blocks of READ_BL_LEN.
+        0 => {
+            let c_size = bits(73, 62);
+            let mult = bits(49, 47);
+            let read_bl_len = bits(83, 80);
+            let bytes = (c_size + 1) << (mult + 2 + read_bl_len);
+            Some(bytes / BLOCK_SIZE as u64)
+        }
+        _ => None,
+    }
+}
+
+/// FNV-1a 64 over the CSD: the device a `LocalDurable` fence names.
+pub fn csd_device_id(csd: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in csd.iter().take(16) {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01B3);
+    }
+    h
+}
+
+fn sd_caps(s: &SdState) -> Option<Caps> {
+    if s.init_state != SdInitPhase::Done {
+        return None;
+    }
+    let count = csd_block_count(&s.csd_buf)?;
+    Some(Caps {
+        logical_block_size: BLOCK_SIZE as u32,
+        block_count: count,
+        max_blocks: 1,
+        atomic_blocks: 1,
+        queue_depth: 1,
+        flags: blk::caps::F_ASYNC,
+        device_id: csd_device_id(&s.csd_buf),
+    })
+}
+
+/// Finish the request that held the read machine: `res` is the machine's
+/// result, positive for a block read whole.
+unsafe fn request_finish(s: &mut SdState, res: i32) {
+    if res > 0 {
+        let dst = s.req_buf;
+        let mut i = 0usize;
+        while i < BLOCK_SIZE {
+            *dst.add(i) = s.req_data[i];
+            i += 1;
+        }
+        s.blocks_read = s.blocks_read.wrapping_add(1);
+        s.req_status = 0;
+    } else {
+        s.req_status = E_IO;
+    }
+    s.req_state = ReqState::Done;
+}
+
+/// Advance the queued request by one bounded poll of the read machine.
+/// True when the request holds the machine this step, so the stream waits.
+unsafe fn request_step(s: &mut SdState) -> bool {
+    if s.req_state == ReqState::Queued {
+        // The stream's block in flight finishes first; the request follows
+        // it, ahead of the stream's next block.
+        if s.rb_state != BlockReadState::Idle {
+            return false;
+        }
+        let buf = s.req_data.as_mut_ptr();
+        read_addr_start(s, s.req_addr, buf);
+        s.req_state = ReqState::Running;
+    }
+    if s.req_state != ReqState::Running {
+        return false;
+    }
+    let res = read_block_poll(s);
+    if res != 0 {
+        request_finish(s, res);
+    }
+    true
+}
+
+/// `SUBMIT`: take one request. 0 when queued, `EAGAIN` while the card is
+/// not attached or the slot is taken, `EINVAL` when the request is refused.
+unsafe fn request_submit(s: &mut SdState, arg: *mut u8) -> i32 {
+    let Some(r) = Req::decode(core::slice::from_raw_parts(arg, blk::req::LEN)) else {
+        return E_INVAL;
+    };
+    let Some(c) = sd_caps(s) else {
+        return E_AGAIN;
+    };
+    if !c.admits(&r) {
+        return E_INVAL;
+    }
+    if s.req_state != ReqState::Empty {
+        return E_AGAIN;
+    }
+    let mut addr = 0u32;
+    let mut buf = ptr::null_mut();
+    if r.op == blk::op::READ {
+        // A block the card's command argument cannot name is out of range
+        // however large the card claims to be.
+        let Some(a) = card_address(r.lba, s.cdv) else {
+            return E_INVAL;
+        };
+        let Ok(p) = usize::try_from(r.buf_ptr) else {
+            return E_INVAL;
+        };
+        addr = a;
+        buf = p as *mut u8;
+    }
+    s.req_op = r.op;
+    s.req_tag_lo = r.tag as u32;
+    s.req_tag_hi = (r.tag >> 32) as u32;
+    s.req_addr = addr;
+    s.req_buf = buf;
+    s.req_status = 0;
+    // Only a read touches the card. Nothing is ever written, so a flush has
+    // nothing to wait for.
+    s.req_state = if r.op == blk::op::READ {
+        ReqState::Queued
+    } else {
+        ReqState::Done
+    };
+    0
+}
+
+/// `REAP`: hand back the finished request. 1 when a completion was written,
+/// 0 when none is ready.
+unsafe fn request_reap(s: &mut SdState, arg: *mut u8) -> i32 {
+    if s.req_state != ReqState::Done {
+        return 0;
+    }
+    let tag = u64::from(s.req_tag_lo) | (u64::from(s.req_tag_hi) << 32);
+    let mut cpl = Cpl::bare(tag, s.req_status);
+    if s.req_op != blk::op::READ {
+        if let Some(c) = sd_caps(s) {
+            let f = Fence::LocalDurable {
+                device_id: c.device_id,
+            };
+            if let Some(n) = f.encode(&mut cpl.fence) {
+                cpl.fence_len = n as u16;
+            }
+        }
+    }
+    cpl.encode(core::slice::from_raw_parts_mut(arg, blk::cpl::LEN));
+    s.req_state = ReqState::Empty;
+    1
+}
+
+unsafe extern "C" fn sd_blocks_ioctl_handler(state: *mut c_void, cmd: u32, arg: *mut u8) -> i32 {
+    if state.is_null() || arg.is_null() {
+        return E_INVAL;
+    }
+    let s = &mut *(state as *mut SdState);
+    match cmd {
+        blk::ioctl::CAPS => match sd_caps(s) {
+            Some(c) => {
+                c.encode(core::slice::from_raw_parts_mut(arg, blk::caps::LEN));
+                blk::caps::LEN as i32
+            }
+            None => E_AGAIN,
+        },
+        blk::ioctl::SUBMIT => request_submit(s, arg),
+        blk::ioctl::REAP => request_reap(s, arg),
+        _ => E_NOSYS,
     }
 }
 
@@ -1421,17 +1697,17 @@ unsafe fn init_poll(s: &mut SdState) -> i32 {
 
 declare_module_state_bytes!(SdState);
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_state_size"]
 pub extern "C" fn module_state_size() -> u32 {
     core::mem::size_of::<SdState>() as u32
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_init"]
 pub extern "C" fn module_init(_syscalls: *const c_void) {}
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_new"]
 pub extern "C" fn module_new(
     _in_chan: i32,
@@ -1458,6 +1734,14 @@ pub extern "C" fn module_new(
         s.init(syscalls as *const SyscallTable);
 
         s.out_chan = out_chan;
+        if out_chan >= 0 {
+            dev_channel_register_ioctl(
+                &*s.syscalls,
+                out_chan,
+                state as *mut c_void,
+                Some(sd_blocks_ioctl_handler),
+            );
+        }
 
         // Parse params
         let is_tlv =
@@ -1583,7 +1867,7 @@ unsafe fn check_seek_request(s: &SdState) -> u32 {
     }
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_step"]
 pub extern "C" fn module_step(state: *mut u8) -> i32 {
     unsafe {
@@ -1630,6 +1914,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             log_info(s, b"[sd] init done");
         }
 
+        // A `storage.block` request runs between the stream's blocks.
+        if request_step(s) {
+            return 0;
+        }
+
         // Check for seek request (when not mid-SPI-read)
         if s.rb_state == BlockReadState::Idle {
             let seek_pos = check_seek_request(s);
@@ -1644,11 +1933,13 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // Read blocks
         match s.mod_state {
             SdModPhase::Reading => {
+                let mut res = 0;
                 // Check if we've read all blocks (block_count=0 means unlimited)
                 if s.block_count > 0 && s.current_block >= s.start_block + s.block_count {
                     s.mod_state = SdModPhase::Done;
                     log_info(s, b"[sd] all read");
-                    return 0; // Return 0 to let downstream drain
+                    end_stream(s);
+                    return 0;
                 }
 
                 // Start a new read if idle (with backpressure check)
@@ -1660,11 +1951,15 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         }
                     }
                     let buf = s.block_buf.as_mut_ptr();
-                    read_block_start(s, s.current_block, buf);
+                    if !read_block_start(s, u64::from(s.current_block), buf) {
+                        res = E_UNREACHABLE;
+                    }
                 }
 
                 // Poll the read
-                let res = read_block_poll(s);
+                if res == 0 {
+                    res = read_block_poll(s);
+                }
                 if res < 0 {
                     // Log: [sd] E<code> @<block>
                     let mut lb = [0u8; 40];
@@ -1750,7 +2045,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 0
             }
 
-            SdModPhase::Done => 1,
+            // The stream is over but the source stays alive: a finished module
+            // is no longer stepped, and requests are served from the step.
+            SdModPhase::Done => 0,
 
             _ => -1,
         }

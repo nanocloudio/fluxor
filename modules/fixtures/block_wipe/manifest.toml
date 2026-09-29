@@ -1,0 +1,19 @@
+version = "1.0.0"
+hardware_targets = ["bcm2712"]
+
+# Zeroes the first `sectors` blocks of the block source wired to `blocks`,
+# flushes, and reports. A rig uses it to return a device to blank, so the
+# next boot's `fat32` (`format: 1`) lays a new volume over it: `fat32`
+# never formats a device whose first sector carries a signature.
+#
+# Destroys what those blocks held. With `sectors` absent or 0 it writes
+# nothing.
+
+[[ports]]
+name = "blocks"
+direction = "input"
+content_type = "OctetStream"
+required = true
+
+[observability]
+exempt = "rig fixture — reports its one verdict on the log"

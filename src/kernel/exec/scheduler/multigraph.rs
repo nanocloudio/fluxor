@@ -920,6 +920,8 @@ fn multi_graph_runner(modules: &mut [ModuleSlot; MAX_MODULES], domain: usize) ->
 
     // ISR-bridge drain — domain-global, once per tick.
     pump_isr_bridges();
+    // Reap the completions of torn-down modules' lent buffers.
+    crate::kernel::module::block_lend::pump();
 
     let result = if active_count == 0 {
         StepResult::Done

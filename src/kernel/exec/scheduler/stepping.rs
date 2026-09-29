@@ -364,29 +364,24 @@ pub(crate) fn handle_mpu_fault(
     apply_quarantine(sched, modules, module_idx, active_count);
 }
 
-/// Attempt to restart a faulted module.
+/// Resume a faulted module on the state it had.
 ///
-/// **v1 partial-restart contract**:
-///
-/// 1. `syscalls::release_module_handles` releases events, timers, DMA, and
-///    tracked provider handles owned by the module.
+/// 1. `syscalls::release_module_handles` releases everything the module
+///    registered or opened: events, timers, platform handles (DMA among
+///    them), provider layers and the channel ioctl handlers it bound.
 /// 2. Every connected channel (in / out / ctrl) is `IOCTL_FLUSH`'d.
 /// 3. If the module was `deferred_ready`, its ready bit is reset.
 /// 4. Fault state moves back to `Running`; `finished[idx]` is cleared.
 ///
-/// What is **not** done in v1, and would be needed for a full restart:
-///   - State memory is **not** zeroed — the module observes whatever state
-///     it had when it faulted. Safe for stateless / idempotent modules.
-///   - `module_new()` is **not** re-called. Stored params + loader state to
-///     drive a fresh init aren't plumbed through the restart path yet.
-///   - Channel ioctl handlers registered by the module are **not** cleared.
-///     Today this matches behaviour (no `module_new` re-call means no
-///     re-register), but a full restart implementation must clear them
-///     before re-init to avoid stale handler pointers.
-///
-/// Modules whose invariants do not survive "saw faulted state and got
-/// re-stepped" should use `FaultPolicy::Skip` and rely on the operator to
-/// drain+reload via the reconfigure module.
+/// This is not a re-instantiation. State memory is not zeroed and
+/// `module_new` is not run again, so the module resumes with the state it
+/// faulted in, minus every resource that state may name. That is safe only
+/// for a module that holds nothing across steps, which is why the composer
+/// requires its manifest to attest `resume_after_fault` and refuses the
+/// policy outright to a module that provides a contract or surface (nothing
+/// registers its layer or handlers again). A module whose invariants do not
+/// survive being re-stepped uses `FaultPolicy::Skip`, and the operator
+/// drains and reloads it, or `FaultPolicy::RestartGraph`.
 pub(crate) fn handle_module_restart(
     sched: &mut SchedulerState,
     modules: &mut [ModuleSlot; MAX_MODULES],
@@ -434,14 +429,8 @@ pub(crate) fn handle_module_restart(
         }
     }
 
-    // **v1 partial-restart**: state is intentionally NOT zeroed — the
-    // `DynamicModule` doesn't carry its `state_size`, and zeroing a
-    // conservative range could overrun adjacent module state in the
-    // shared arena. The module will see whatever state it had at fault
-    // time; this matches the docstring above. Full restart (state zero
-    // + `module_new` re-call) needs stored params and loader state
-    // plumbed through this path. Modules that can't safely
-    // resume from faulted state must opt out of `Restart` (use `Skip`).
+    // State is deliberately left as it was at the fault (see above); the
+    // module resumes on it.
     let _ = &modules[module_idx];
 
     // Reset ready signal if module was deferred_ready
@@ -712,6 +701,8 @@ pub fn step_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize) -> St
     // so a producer's tick-T output reaches the ISR side as soon as
     // tick T finishes.
     pump_isr_bridges();
+    // Reap the completions of torn-down modules' lent buffers.
+    crate::kernel::module::block_lend::pump();
 
     if active_count == 0 {
         StepResult::Done

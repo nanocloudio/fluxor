@@ -1,8 +1,9 @@
 # nvme — NVMe block driver (Pi 5, PCIe1 external slot)
 
 NVMe driver for the Pi 5 NVMe HAT+. Implements NVMe 1.4 controller
-initialisation, Identify Controller / Namespace, and 512-byte block
-read/write on one admin queue plus up to `MAX_IO_QUEUES` (4) I/O
+initialisation, Identify Controller / Namespace, and block
+read/write at the namespace's logical block size (512 B to 4 KiB; the
+`READ_STREAM` ioctl requires 512 B) on one admin queue plus up to `MAX_IO_QUEUES` (4) I/O
 queue pairs (`io_queue_count` parameter, default 1). With
 `irq_mode = 1` completions are delivered via MSI-X through the
 brcmstb MSI mux; otherwise the CQ is drained by polling in
@@ -47,10 +48,38 @@ UART even if the log_net module isn't running yet.
 - **BAR:** BAR0 (memory-mapped). Controller registers NVMe 1.4 §3.1.
 - **DMA:** all queues + PRP data buffers come from `dev_dma_alloc`
   (kernel-owned non-cacheable arena).
-- **Inputs:** `requests` channel — 16-byte block I/O requests from
-  `fat32` or other consumers.
-- **Outputs:** `blocks` channel — 512-byte block data, same contract
-  as the `sd` module so `fat32` consumes it unchanged.
+- **Inputs:** `requests` channel — the channel write pipeline.
+- **Outputs:** `blocks` channel — `storage.block` v1 (`CAPS`, `EXEC`,
+  `SUBMIT`, `REAP`, `READ_STREAM`) from an 8-slot request table on I/O
+  queue 0, with a truthful fence per completion: FUA, flush and
+  no-volatile-cache writes are `LocalDurable`, other writes `Volatile`.
+
+---
+
+## Command identifiers
+
+A CID is unique among the commands outstanding on a queue, by construction:
+each family owns a disjoint CID range, and a CID is handed out again only
+after its completion has been consumed. A wait that gives up (budget
+expired) leaves its command with the controller, so its CID and DMA memory
+stay claimed until the completion lands.
+
+| Family | CIDs | Reuse rule |
+| --- | --- | --- |
+| Admin | `0x0001..` | one command at a time, issued once |
+| Stream read | `0x0005` | one at a time |
+| Channel writes | `0x0100 + (queue << CID_SLOT_BITS) + slot` | ring slot, freed in order |
+| Single-page pager read / write | `0x0200` / `0x0201` | share one DMA page; a call first waits out either |
+| Barrier Flush | `0x0202` | a call waits out an earlier Flush, then submits its own |
+| Bulk read | `0x0300 + slot` | a call waits for every slot before reusing any |
+| Bulk write | `0x0400 + slot` | ring slot, freed in order |
+| v1 request | `0x0500 + slot` | slot freed when its completion is reaped (or abandoned and then landed) |
+| v1 preflush Flush | `0x0508 + slot` (4 slots) | rotating allocation; a slot is free only after its completion; `EAGAIN` when all are outstanding |
+
+A preflush that times out is retried with a new Flush under another CID.
+It does not attach to the first one, which covers only the writes completed
+before it was submitted. A completion for a CID with no outstanding command
+is counted and dropped; it never completes a request.
 
 ---
 
@@ -206,7 +235,7 @@ command completion) read once per step and return `Continue`.
 
 Same shape as `IdentifyController`, CNS = 0x00, NSID = namespace
 from config param. Response (4 KB) contains NSZE (total LBAs),
-LBAF[] array indicating LBA size (we assume 512 B → LBAF[n].LBADS = 9).
+LBAF[] array indicating LBA size (LBADS 9..12, i.e. 512 B to 4 KiB, is accepted; any other size is refused).
 
 ### `CreateIoCQ`, `CreateIoSQ`
 
@@ -263,7 +292,7 @@ retry on next step. State machine does NOT advance on partial writes.
 |-----|--------------------|------|--------------|-----------------------------------------------|
 | 1   | bind               | str  | `m2_primary` | PCIE_DEVICE selector (alias or `@class=nvme`) |
 | 2   | namespace          | u32  | 1            | Namespace ID for Identify Namespace / I/O     |
-| 3   | queue_depth        | u16  | 32           | I/O queue depth (v1 uses 1 in-flight)         |
+| 3   | queue_depth        | u16  | 32           | I/O queue depth                               |
 | 4   | irq_mode           | u8   | 0            | 0=polled, 1=MSI-X                             |
 | 6   | io_queue_count     | u8   | 1            | I/O queue pairs (1..4)                        |
 
@@ -287,5 +316,3 @@ does one unit of work. That means:
 - Backpressure on the `blocks` output channel is an explicit state
   — we can't just drop a CQE if the consumer isn't ready for the
   data.
-- Queue depth > 1 (v2) means tracking one in-flight record per CID;
-  doable but out of scope for v1.

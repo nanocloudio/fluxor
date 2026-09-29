@@ -1224,6 +1224,10 @@ impl BoundDevice {
 static mut BOUND_DEVICES: [BoundDevice; MAX_SCAN_DEVS] =
     [const { BoundDevice::empty() }; MAX_SCAN_DEVS];
 
+/// Whether a bind has already reported an alias absent from enumeration.
+#[cfg(feature = "board-pi5")]
+static mut ALIAS_ABSENCE_REPORTED: bool = false;
+
 /// Parse a selector and return the bound device handle, or a negative
 /// errno. Invoked by the kernel dispatcher on `PCIE_DEVICE::BIND`.
 ///
@@ -1287,13 +1291,20 @@ pub unsafe fn bind_selector(sel: &[u8]) -> i32 {
                     return finalize_bind(i, alias.root, s);
                 }
             }
-            log::warn!(
-                "[pcie_device] alias '{}' ({}:{}.{}) not present in enumeration",
-                s,
-                alias.bus,
-                alias.dev,
-                alias.func,
-            );
+            // A driver retries its bind every step while the link trains,
+            // so the absence is reported once, not once per attempt: a
+            // warning per step fills the log ring before anything drains
+            // it, and the ring drops what is written after.
+            if !*core::ptr::addr_of!(ALIAS_ABSENCE_REPORTED) {
+                *core::ptr::addr_of_mut!(ALIAS_ABSENCE_REPORTED) = true;
+                log::warn!(
+                    "[pcie_device] alias '{}' ({}:{}.{}) not present in enumeration",
+                    s,
+                    alias.bus,
+                    alias.dev,
+                    alias.func,
+                );
+            }
             crate::kernel::sys::errno::ENODEV
         }
         crate::platform::pcie_aliases::PcieRoot::Pcie2 => {

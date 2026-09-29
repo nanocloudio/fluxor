@@ -259,6 +259,10 @@ pub enum Walker {
     StorageDelete,
     /// `storage.object` RANGE_GET: offset, length, out (`length` bytes).
     StorageRangeGet,
+    /// `channel::IOCTL`: `[cmd: u32]` then the command's own argument. Only
+    /// the kernel's built-in commands and the `storage.block` requests are
+    /// admitted; a block request's buffer is the pointer walked.
+    ChannelIoctl,
 }
 
 /// One opcode a gated module may use.
@@ -295,6 +299,18 @@ const fn walked(op: u32, handle: HandleUse, max: usize, walker: Walker) -> Rule 
     }
 }
 
+/// A walked struct the provider also writes results into. The kernel's
+/// checked copy is handed over and copied back to the caller afterwards.
+const fn walked_inout(op: u32, handle: HandleUse, max: usize, walker: Walker) -> Rule {
+    Rule {
+        op,
+        handle,
+        arg: Arg::InOut(max),
+        walk: Some(walker),
+        closes: false,
+    }
+}
+
 const fn closing(op: u32) -> Rule {
     Rule {
         op,
@@ -312,8 +328,9 @@ const ANY: usize = usize::MAX;
 /// The provider operations served to gated modules. Default deny: an opcode
 /// not listed here is refused with `EACCES`, whatever the caller's grants.
 ///
-/// None of these operations keeps a pointer past the call or registers code
-/// for the kernel to call; an operation that does is not listed. An operation
+/// None of these operations registers code for the kernel to call. The one
+/// that keeps a pointer past its call is a `storage.block` `SUBMIT`, whose
+/// buffer is lent to the source until the completion is reaped. An operation
 /// whose argument struct carries pointers is listed with the walker that
 /// finds them, and every one is checked.
 pub static RULES: &[Rule] = &[
@@ -334,11 +351,11 @@ pub static RULES: &[Rule] = &[
     rule(0x0C50, HandleUse::Global, Arg::In(4)), // REPORT_LATENCY
     // Handles the caller holds.
     rule(0x0C41, HandleUse::Channel, Arg::InOut(1)), // HANDLE_POLL on a port
-    // Channels: port discovery and the kernel's built-in ioctls. Registering
-    // a handler (REGISTER_IOCTL, 0x0507) is not served: it hands the kernel
-    // code to call.
+    // Channels: port discovery, the kernel's built-in ioctls and the
+    // `storage.block` requests. Registering a handler (REGISTER_IOCTL,
+    // 0x0507) is not served: it hands the kernel code to call.
     rule(0x050C, HandleUse::Global, Arg::InOut(2)), // channel::PORT
-    rule(0x0506, HandleUse::Channel, Arg::InOut(ANY)), // channel::IOCTL
+    walked_inout(0x0506, HandleUse::Channel, WALK_MAX, Walker::ChannelIoctl),
     // Events.
     rule(0x0B00, HandleUse::Mints, Arg::None), // event::CREATE
     rule(0x0B01, HandleUse::Minted, Arg::None), // event::SIGNAL
@@ -463,8 +480,59 @@ pub fn walk(walker: Walker, arg: &[u8]) -> Option<([Embedded; 3], usize)> {
             };
             1
         }
+        Walker::ChannelIoctl => {
+            use crate::abi::contracts::storage::block::{ioctl, Req};
+            let cmd = r.u32()? as u32;
+            let rest = arg.get(4..)?;
+            match cmd {
+                ioctl::SUBMIT | ioctl::EXEC => {
+                    let q = Req::decode(rest)?;
+                    if q.buf_len == 0 {
+                        0
+                    } else {
+                        out[0] = Embedded {
+                            ptr: usize::try_from(q.buf_ptr).ok()?,
+                            len: q.buf_len as usize,
+                            write: q.writes_buffer(),
+                        };
+                        1
+                    }
+                }
+                // The data comes back on the channel; the buffer fields are
+                // not followed.
+                ioctl::READ_STREAM => {
+                    Req::decode(rest)?;
+                    0
+                }
+                _ if channel_ioctl_admitted(cmd) => 0,
+                _ => return None,
+            }
+        }
     };
     Some((out, n))
+}
+
+/// Whether a gated module may issue channel ioctl `cmd`.
+///
+/// The kernel's built-in commands carry no pointers, and the `storage.block`
+/// requests carry one the gateway walks. Any other command is served by a
+/// module-registered handler whose argument layout the gateway cannot see
+/// into, so a pointer inside it would reach a privileged module unchecked.
+pub fn channel_ioctl_admitted(cmd: u32) -> bool {
+    use crate::abi::contracts::storage::block::ioctl;
+    use crate::kernel::ipc::channel as ch;
+    matches!(
+        cmd,
+        ch::IOCTL_NOTIFY
+            | ch::IOCTL_POLL_NOTIFY
+            | ch::IOCTL_FLUSH
+            | ch::IOCTL_SET_HUP
+            | ioctl::CAPS
+            | ioctl::REAP
+            | ioctl::SUBMIT
+            | ioctl::EXEC
+            | ioctl::READ_STREAM
+    )
 }
 
 /// Query keys served to gated modules; each writes at most the given bytes.
@@ -617,6 +685,15 @@ pub fn authorise(
                 if arg.len() != a[3] {
                     return Err(Refusal::Pointer);
                 }
+                if w == Walker::ChannelIoctl {
+                    let cmd = arg
+                        .get(..4)
+                        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                        .ok_or(Refusal::Pointer)?;
+                    if !channel_ioctl_admitted(cmd) {
+                        return Err(Refusal::Opcode);
+                    }
+                }
                 check_walk(&g, w, arg)?;
             }
             Ok(())
@@ -679,6 +756,7 @@ pub unsafe fn dispatch(module: usize, op: u32, a: [usize; 6]) -> isize {
         note_refusal(module, op, &a, why);
         return why.errno() as isize;
     }
+    let is_walked = walked.is_some();
     let sys = crate::kernel::module::syscalls::get_syscall_table();
     let h = a[0] as i32;
     // SAFETY: every pointer below was checked against the caller's own
@@ -708,11 +786,17 @@ pub unsafe fn dispatch(module: usize, op: u32, a: [usize; 6]) -> isize {
             op::PROVIDER_CALL => {
                 let rule = rule_for(a[1] as u32);
                 // A walked struct is handed over as the kernel's checked copy.
-                let arg = match walked {
-                    Some(_) => copy.as_mut_ptr(),
-                    None => a[2] as *mut u8,
+                let arg = if is_walked {
+                    copy.as_mut_ptr()
+                } else {
+                    a[2] as *mut u8
                 };
                 let rc = (sys.provider_call)(h, a[1] as u32, arg, a[3]);
+                // A walked struct the provider writes into goes back to the
+                // caller: `authorise` checked `[a[2], a[2] + a[3])` writable.
+                if is_walked && rule.is_some_and(|r| matches!(r.arg, Arg::InOut(_))) {
+                    core::ptr::copy_nonoverlapping(copy.as_ptr(), a[2] as *mut u8, a[3]);
+                }
                 match rule {
                     Some(r) if r.handle == HandleUse::Mints => mint_result(module, rc),
                     Some(r) if r.closes && rc >= 0 => {

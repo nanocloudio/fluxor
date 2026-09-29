@@ -608,7 +608,9 @@ fn check_state_budget(
     // A gated module on an MPU target takes its whole private region — its
     // stack, state and heap as one allocation the planner shapes — from the
     // state arena, so that is what it is charged.
-    let mpu = target.isolation.planner_model()
+    let mpu = target
+        .isolation
+        .planner_model()
         .filter(|m| !matches!(m, fluxor_contracts::isolation::RegionModel::Pages));
     let levels = module_levels(config, target);
     let default = graph_default_level(config, target);
@@ -708,7 +710,12 @@ fn check_stack_budget(
         let Some((limit, what)) = target.module_stack_limit(level) else {
             continue;
         };
-        rows.push((m.name.as_str(), m.manifest.stack_bytes_64 as u64 * 64, limit, what));
+        rows.push((
+            m.name.as_str(),
+            m.manifest.stack_bytes_64 as u64 * 64,
+            limit,
+            what,
+        ));
     }
     if rows.is_empty() {
         return Ok(());
@@ -783,7 +790,9 @@ fn check_gated_admission(
         return Ok(());
     }
     println!("Protection ({}):", target.id);
-    let mpu = target.isolation.planner_model()
+    let mpu = target
+        .isolation
+        .planner_model()
         .filter(|m| !matches!(m, fluxor_contracts::isolation::RegionModel::Pages));
     for (m, l) in &gated {
         match mpu {
@@ -1421,15 +1430,14 @@ fn cmd_graph_image(
 
     let modules_dir_path = crate::modules_build::modules_dir_for(&target_desc);
     let modules_dir = modules_dir_override.unwrap_or(modules_dir_path.as_path());
-    let (modules_data, config_data) =
-        build_packaged_blobs(
-            &config,
-            modules_dir,
-            &[],
-            &target_desc,
-            verbose,
-            &crate::project::root_for_config(config_path),
-        )?;
+    let (modules_data, config_data) = build_packaged_blobs(
+        &config,
+        modules_dir,
+        &[],
+        &target_desc,
+        verbose,
+        &crate::project::root_for_config(config_path),
+    )?;
     let modules_data = modules_data
         .ok_or_else(|| error::Error::Config("A graph image requires at least one module".into()))?;
 
@@ -1597,4 +1605,3 @@ fn resolve_target(
     let root = crate::project::root();
     target::load_target(name, &root)
 }
-

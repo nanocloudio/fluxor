@@ -166,14 +166,16 @@ pub struct SyscallTable {
     /// losing the records is not.
     pub telemetry_enabled: *const u32,
 
-    /// Call an instance-keyed provider selected by name (`sel`, a short
-    /// volume string). The contract is the opcode's class byte, as on the
-    /// `handle = -1` path — so the `mount` policy module names the target
-    /// volume inline on every op, resolved by the shared
-    /// `provider_selector::hash`. `op_handle` carries the op's OWN handle
-    /// (`-1` for open-style ops, or a provider-local slot for handle-bound
-    /// ops); `sel` is purely routing. Returns the provider's result, or
-    /// `EINVAL` / `ENODEV` (no registered layer carries that selector).
+    /// Call the provider of the opcode's contract selected by name (`sel`):
+    /// an instance-keyed layer (a volume string, resolved by the shared
+    /// `provider_selector::hash`), or for the reserved name `platform` the
+    /// platform's own provider beneath every module layer. The contract is
+    /// the opcode's class byte, as on the `handle = -1` path. `op_handle` is
+    /// `-1` for an open-style op; a handle that op mints comes back routed —
+    /// it names its minting provider, so later ops on it, here or through
+    /// `provider_call`, reach that provider. A non-negative `op_handle` must
+    /// be one minted through the same `sel` (`EBADF` otherwise). Returns the
+    /// provider's result, or `EINVAL` / `ENODEV` (nothing carries `sel`).
     pub provider_call_sel: unsafe extern "C" fn(
         sel: *const u8,
         sel_len: usize,

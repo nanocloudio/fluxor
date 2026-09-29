@@ -1162,8 +1162,9 @@ mod scheduler_validation_tests {
             vec![json!({"name": "unflagged", "type": "unflagged", "domain": "audio_isr"})];
         let modules_dir = std::path::Path::new("/nonexistent/modules");
         let extras: Vec<&std::path::Path> = vec![dir.path()];
-        let err = validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras, None, modules_dir)
-            .expect_err("unflagged module in Tier 1b domain must be rejected");
+        let err =
+            validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras, None, modules_dir)
+                .expect_err("unflagged module in Tier 1b domain must be rejected");
         let msg = format!("{err:?}");
         assert!(
             msg.contains("isr_safe = true") && msg.contains("unflagged"),
@@ -1195,8 +1196,9 @@ mod scheduler_validation_tests {
         })];
         let modules_dir = std::path::Path::new("/nonexistent/modules");
         let extras: Vec<&std::path::Path> = Vec::new();
-        let err = validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras, None, modules_dir)
-            .expect_err("Tier 1b module with no resolvable manifest must be rejected");
+        let err =
+            validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras, None, modules_dir)
+                .expect_err("Tier 1b module with no resolvable manifest must be rejected");
         let msg = format!("{err:?}");
         assert!(
             msg.contains("ghost_module") && msg.contains("manifest"),
@@ -1263,8 +1265,9 @@ mod scheduler_validation_tests {
         })];
         let modules_dir = std::path::Path::new("/nonexistent/modules");
         let extras: Vec<&std::path::Path> = vec![extra.path()];
-        let err = validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras, None, modules_dir)
-            .expect_err("extras-first lookup must surface the NEON-importing override");
+        let err =
+            validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras, None, modules_dir)
+                .expect_err("extras-first lookup must surface the NEON-importing override");
         let msg = format!("{err:?}");
         assert!(
             msg.contains("NEON") && msg.contains("coll"),
@@ -1340,8 +1343,9 @@ mod scheduler_validation_tests {
         })];
         let modules_dir = std::path::Path::new("/nonexistent/modules");
         let extras: Vec<&std::path::Path> = vec![dir.path()];
-        let err = validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras, None, modules_dir)
-            .expect_err("Tier 2 module without module_isr_entry must be rejected");
+        let err =
+            validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras, None, modules_dir)
+                .expect_err("Tier 2 module without module_isr_entry must be rejected");
         let msg = format!("{err:?}");
         assert!(
             msg.contains("module_isr_entry") && msg.contains("irq_driver"),
@@ -1378,8 +1382,9 @@ mod scheduler_validation_tests {
         })];
         let modules_dir = std::path::Path::new("/nonexistent/modules");
         let extras: Vec<&std::path::Path> = vec![dir.path()];
-        let err = validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras, None, modules_dir)
-            .expect_err("Tier 2 module without irq: must be rejected");
+        let err =
+            validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras, None, modules_dir)
+                .expect_err("Tier 2 module without irq: must be rejected");
         let msg = format!("{err:?}");
         assert!(
             msg.contains("irq") && msg.contains("irq_driver"),
@@ -1431,8 +1436,9 @@ mod scheduler_validation_tests {
         })];
         let modules_dir = std::path::Path::new("/nonexistent/modules");
         let extras: Vec<&std::path::Path> = Vec::new();
-        let err = validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras, None, modules_dir)
-            .expect_err("standard-tree NEON-importing ISR module must be rejected");
+        let err =
+            validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras, None, modules_dir)
+                .expect_err("standard-tree NEON-importing ISR module must be rejected");
         let msg = format!("{err:?}");
         assert!(
             msg.contains("NEON")
@@ -1620,8 +1626,9 @@ mod scheduler_validation_tests {
         ];
         let modules_dir = std::path::Path::new("/nonexistent/modules");
         let extras: Vec<&std::path::Path> = vec![dir.path()];
-        let err = validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras, None, modules_dir)
-            .expect_err("untagged edge into Tier 1b module must still be rejected");
+        let err =
+            validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras, None, modules_dir)
+                .expect_err("untagged edge into Tier 1b module must still be rejected");
         let msg = format!("{err:?}");
         assert!(
             msg.contains("ISR-tier endpoint")
@@ -1939,6 +1946,32 @@ mod continuity_tests {
         validate_fault_policy(&cfg, &names(&["a"]), &m).unwrap();
     }
 
+    /// A provider's layer and handlers are among what a restart releases and
+    /// nothing registers them again, so no attestation lets it take `restart`.
+    #[test]
+    fn fault_policy_restart_is_refused_to_a_provider_even_when_attested() {
+        let cfg = json!({"modules": [{"name": "a", "fault_policy": "restart"}]});
+        let mut m = HashMap::new();
+        m.insert(
+            "a".to_string(),
+            Manifest {
+                resume_after_fault: true,
+                provides: vec!["storage.block".to_string()],
+                ..Manifest::default()
+            },
+        );
+        let e = validate_fault_policy(&cfg, &names(&["a"]), &m).unwrap_err();
+        let msg = format!("{e:?}");
+        assert!(msg.contains("storage.block"), "names what it provides: {msg}");
+        assert!(msg.contains("restart_graph"), "offers the alternatives: {msg}");
+
+        // The other policies stay open to it.
+        for policy in ["skip", "restart_graph", "tolerate"] {
+            let cfg = json!({"modules": [{"name": "a", "fault_policy": policy}]});
+            validate_fault_policy(&cfg, &names(&["a"]), &m).unwrap();
+        }
+    }
+
     /// Every other policy, and a graph with no policy at all, is
     /// unaffected — the gate is specific to the resuming one.
     #[test]
@@ -1989,8 +2022,8 @@ mod continuity_tests {
             "fat32_b".to_string(),
             prov(&["file.data", "storage.namespace"]),
         );
-        let e = validate_single_provider(&json!({}), &names(&["fat32_a", "fat32_b"]), &m)
-            .unwrap_err();
+        let e =
+            validate_single_provider(&json!({}), &names(&["fat32_a", "fat32_b"]), &m).unwrap_err();
         let s = format!("{e:?}");
         assert!(
             s.contains("fat32_a") && s.contains("fat32_b"),
@@ -2004,13 +2037,13 @@ mod continuity_tests {
 
     #[test]
     fn single_provider_allows_two_block_drivers() {
-        // `storage.block` is not class-byte dispatched (block drivers wire by
-        // port name), so two block providers do NOT shadow — an SD card + a
-        // flash blob store is a legitimate composition, not an error.
+        // `storage.block` is not class-byte dispatched (a source is the
+        // channel wired to its consumer), so two block devices in one graph
+        // do NOT shadow.
         let mut m = HashMap::new();
         m.insert("sd".to_string(), prov(&["storage.block"]));
-        m.insert("flash_rp".to_string(), prov(&["storage.block"]));
-        validate_single_provider(&json!({}), &names(&["sd", "flash_rp"]), &m).unwrap();
+        m.insert("nvme".to_string(), prov(&["storage.block"]));
+        validate_single_provider(&json!({}), &names(&["sd", "nvme"]), &m).unwrap();
     }
 
     #[test]
@@ -2035,7 +2068,10 @@ mod continuity_tests {
             "fat32_data".to_string(),
             prov(&["file.data", "storage.namespace"]),
         );
-        m.insert("mount".to_string(), prov(&["file.data", "storage.namespace"]));
+        m.insert(
+            "mount".to_string(),
+            prov(&["file.data", "storage.namespace"]),
+        );
         let cfg = json!({"modules": [
             {"name": "mount", "type": "mount"},
             {"name": "fat32_boot", "type": "fat32", "params": {"volume": "sd0"}},
@@ -2089,7 +2125,38 @@ mod continuity_tests {
             {"name": "only", "type": "fat32", "params": {"volume": "nvme0"}},
         ]});
         let e = validate_single_provider(&cfg, &names(&["only"]), &m).unwrap_err();
-        assert!(format!("{e:?}").contains("none is the default"), "got: {e:?}");
+        assert!(
+            format!("{e:?}").contains("none is the default"),
+            "got: {e:?}"
+        );
+    }
+
+    #[test]
+    fn single_provider_refuses_the_reserved_platform_selector() {
+        // `platform` names the platform's own provider beneath the graph; a
+        // module registered under it would capture that path, and the kernel
+        // refuses the registration, so the build refuses it first.
+        let mut m = HashMap::new();
+        m.insert("mount".to_string(), prov(&["file.data"]));
+        m.insert("vol".to_string(), prov(&["file.data"]));
+        let cfg = json!({"modules": [
+            {"name": "mount", "type": "mount"},
+            {"name": "vol", "type": "fat32", "params": {"volume": "platform"}},
+        ]});
+        let e = validate_single_provider(&cfg, &names(&["mount", "vol"]), &m).unwrap_err();
+        let s = format!("{e:?}");
+        assert!(s.contains("`vol`") && s.contains("reserved"), "got: {s}");
+
+        // A block source naming `platform` as the fs its image lives on is a
+        // consumer of that provider, not a registration: allowed.
+        let mut m = HashMap::new();
+        m.insert("file_block".to_string(), prov(&["storage.block"]));
+        m.insert("fat32".to_string(), prov(&["file.data"]));
+        let cfg = json!({"modules": [
+            {"name": "file_block", "params": {"volume": "platform"}},
+            {"name": "fat32"},
+        ]});
+        validate_single_provider(&cfg, &names(&["file_block", "fat32"]), &m).unwrap();
     }
 
     #[test]
@@ -2151,7 +2218,11 @@ mod continuity_tests {
 
     /// The quic module's capabilities as its manifest declares them: the mux
     /// transport and the anchor over it.
-    const QUIC_CAPS: &[&str] = &["transport.anchor.mux", "transport.mux.quic", "session.resume"];
+    const QUIC_CAPS: &[&str] = &[
+        "transport.anchor.mux",
+        "transport.mux.quic",
+        "session.resume",
+    ];
 
     /// A graph with a quic server instance `edge` and a worker behind it.
     fn native_graph(anchor_caps: &[&str]) -> (Vec<String>, HashMap<String, Manifest>) {
@@ -2195,7 +2266,10 @@ mod continuity_tests {
         let (n, m) = native_graph(&["transport.anchor.mux"]);
         let cfg = native_cfg(quic_server(), json!({}));
         let e = validate_continuity_on(&cfg, &n, &m, Some("bcm2712")).unwrap_err();
-        assert!(format!("{e:?}").contains("no module in the graph provides"), "got: {e:?}");
+        assert!(
+            format!("{e:?}").contains("no module in the graph provides"),
+            "got: {e:?}"
+        );
     }
 
     /// A TLS or TCP anchor carries no mux, and a mux elsewhere in the graph
@@ -2210,7 +2284,10 @@ mod continuity_tests {
             let cfg = native_cfg(json!({"name": "edge", "type": "tls"}), json!({}));
             let e = validate_continuity_on(&cfg, &n, &m, Some("bcm2712")).unwrap_err();
             let msg = format!("{e:?}");
-            assert!(msg.contains("anchor `edge` does not carry"), "{anchor_cap}: {msg}");
+            assert!(
+                msg.contains("anchor `edge` does not carry"),
+                "{anchor_cap}: {msg}"
+            );
         }
     }
 
@@ -2219,13 +2296,22 @@ mod continuity_tests {
         let (n, m) = native_graph(&["transport.mux.quic"]);
         let cfg = native_cfg(quic_server(), json!({}));
         let e = validate_continuity_on(&cfg, &n, &m, Some("bcm2712")).unwrap_err();
-        assert!(format!("{e:?}").contains("transport.anchor.mux"), "got: {e:?}");
+        assert!(
+            format!("{e:?}").contains("transport.anchor.mux"),
+            "got: {e:?}"
+        );
 
         let (n, m) = native_graph(QUIC_CAPS);
         let mut cfg = native_cfg(quic_server(), json!({}));
-        cfg["continuity"][0].as_object_mut().unwrap().remove("anchor");
+        cfg["continuity"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("anchor");
         let e = validate_continuity_on(&cfg, &n, &m, Some("bcm2712")).unwrap_err();
-        assert!(format!("{e:?}").contains("requires an `anchor`"), "got: {e:?}");
+        assert!(
+            format!("{e:?}").contains("requires an `anchor`"),
+            "got: {e:?}"
+        );
     }
 
     /// The instance, not only its type, decides whether the wire offers
@@ -2242,7 +2328,10 @@ mod continuity_tests {
             let edge = json!({"name": "edge", "type": "quic", "disable_migration": disabled});
             let e = validate_continuity_on(&native_cfg(edge, json!({})), &n, &m, Some("bcm2712"))
                 .unwrap_err();
-            assert!(format!("{e:?}").contains("disable_active_migration"), "got: {e:?}");
+            assert!(
+                format!("{e:?}").contains("disable_active_migration"),
+                "got: {e:?}"
+            );
         }
         let edge = json!({"name": "edge", "type": "quic", "disable_migration": 0});
         validate_continuity_on(&native_cfg(edge, json!({})), &n, &m, Some("bcm2712")).unwrap();
@@ -2261,12 +2350,14 @@ mod continuity_tests {
             json!({"client_keepalive_ms": 20000}),
         ] {
             let field = extra.as_object().unwrap().keys().next().unwrap().clone();
-            let e = validate_continuity_on(&native_cfg(quic_server(), extra), &n, &m, Some("bcm2712"))
-                .unwrap_err();
+            let e =
+                validate_continuity_on(&native_cfg(quic_server(), extra), &n, &m, Some("bcm2712"))
+                    .unwrap_err();
             let msg = format!("{e:?}");
             assert!(
-                msg.contains(&format!("`{field}` is not valid with mechanism native_primitive"))
-                    && msg.contains("platform_replicated_state"),
+                msg.contains(&format!(
+                    "`{field}` is not valid with mechanism native_primitive"
+                )) && msg.contains("platform_replicated_state"),
                 "{field}: {msg}"
             );
         }
@@ -2287,7 +2378,11 @@ mod continuity_tests {
     fn the_quic_manifest_is_a_native_primitive_anchor() {
         let quic = quic_manifest();
         let has = |want: &str| quic.capabilities.iter().any(|c| cap_satisfies(c, want));
-        assert!(has("transport.mux") && has("transport.anchor.mux"), "{:?}", quic.capabilities);
+        assert!(
+            has("transport.mux") && has("transport.anchor.mux"),
+            "{:?}",
+            quic.capabilities
+        );
         let mut m = HashMap::new();
         m.insert("edge".to_string(), quic);
         m.insert("wkr".to_string(), man(&["session.worker"]));
@@ -2304,7 +2399,10 @@ mod continuity_tests {
         // `aead` fact.
         let (n, mut m) = prs_graph_with("transport.anchor.mux");
         m.insert("anc".to_string(), quic_manifest());
-        m.get_mut("dir").unwrap().capabilities.push("session.reservation".to_string());
+        m.get_mut("dir")
+            .unwrap()
+            .capabilities
+            .push("session.reservation".to_string());
         validate_continuity_on(&prs_cfg(prs_entry()), &n, &m, Some("bcm2712")).unwrap();
         let e = validate_continuity_on(&prs_cfg(prs_entry()), &n, &m, Some("linux")).unwrap_err();
         assert!(format!("{e:?}").contains("bare-metal"), "got: {e:?}");
@@ -2323,7 +2421,10 @@ mod continuity_tests {
     /// the ip stack (local fence, reach decided by the target) and an
     /// out-of-band fence agent declaring the wire.
     fn prs_graph_with(anchor_cap: &str) -> (Vec<String>, HashMap<String, Manifest>) {
-        prs_graph_with_terms(anchor_cap, &[("aead", aead_of(anchor_cap)), ("horizon", "exact")])
+        prs_graph_with_terms(
+            anchor_cap,
+            &[("aead", aead_of(anchor_cap)), ("horizon", "exact")],
+        )
     }
 
     /// The AEAD class each anchor role is carried on, as its manifest would
@@ -2363,11 +2464,21 @@ mod continuity_tests {
         );
         manifests.insert(
             "ip".to_string(),
-            man_facts(&["fence.enforceable"], "fence.enforceable", "cutoff", "ring_handoff"),
+            man_facts(
+                &["fence.enforceable"],
+                "fence.enforceable",
+                "cutoff",
+                "ring_handoff",
+            ),
         );
         manifests.insert(
             "pdu".to_string(),
-            man_facts(&["fence.enforceable"], "fence.enforceable", "cutoff", "wire"),
+            man_facts(
+                &["fence.enforceable"],
+                "fence.enforceable",
+                "cutoff",
+                "wire",
+            ),
         );
         (names(&["anc", "wkr", "dir", "ip", "pdu"]), manifests)
     }
@@ -2512,11 +2623,18 @@ mod continuity_tests {
         ] {
             let (n, m) = prs_graph_with_terms(cap, terms);
             let e = validate_continuity_on(&cfg, &n, &m, Some("bcm2712")).unwrap_err();
-            assert!(format!("{e:?}").contains("resumable"), "terms {terms:?}: got {e:?}");
-            assert!(format!("{e:?}").contains("exact"), "terms {terms:?}: got {e:?}");
+            assert!(
+                format!("{e:?}").contains("resumable"),
+                "terms {terms:?}: got {e:?}"
+            );
+            assert!(
+                format!("{e:?}").contains("exact"),
+                "terms {terms:?}: got {e:?}"
+            );
         }
         // … and with it the class is admitted.
-        let (n, m) = prs_graph_with_terms(cap, &[("aead", "implicit_counter"), ("horizon", "exact")]);
+        let (n, m) =
+            prs_graph_with_terms(cap, &[("aead", "implicit_counter"), ("horizon", "exact")]);
         validate_continuity_on(&cfg, &n, &m, Some("bcm2712")).unwrap();
     }
 
@@ -2546,7 +2664,10 @@ mod continuity_tests {
         let (n, m) = prs_graph_with_terms("transport.anchor.datagram", &[]);
         let cfg = prs_cfg(prs_entry());
         let e = validate_continuity_on(&cfg, &n, &m, Some("bcm2712")).unwrap_err();
-        assert!(format!("{e:?}").contains("declares no `aead` fact"), "got: {e:?}");
+        assert!(
+            format!("{e:?}").contains("declares no `aead` fact"),
+            "got: {e:?}"
+        );
     }
 
     #[test]
@@ -2630,7 +2751,10 @@ mod rate_class_resolution_tests {
         }
     }
 
-    fn with_default(mut p: manifest::PortSpec, class: fluxor_contracts::RateClass) -> manifest::PortSpec {
+    fn with_default(
+        mut p: manifest::PortSpec,
+        class: fluxor_contracts::RateClass,
+    ) -> manifest::PortSpec {
         p.rate_class_default = Some(class);
         p
     }
@@ -2648,7 +2772,10 @@ mod rate_class_resolution_tests {
     fn unknown_rate_override_is_a_config_error() {
         let entry = json!({"rate": "ludicrous"});
         let err = resolve_edge_rate_class(Some(&entry), None, None).unwrap_err();
-        assert!(format!("{err:?}").contains("unknown rate class"), "got: {err:?}");
+        assert!(
+            format!("{err:?}").contains("unknown rate class"),
+            "got: {err:?}"
+        );
     }
 
     #[test]
@@ -2703,7 +2830,10 @@ mod rate_class_resolution_tests {
     /// consuming config's wiring.
     #[test]
     fn http_ingress_style_producer_cap_is_satisfied_by_its_own_default() {
-        let mut from = with_default(port("OctetStream"), fluxor_contracts::RateClass::Transaction);
+        let mut from = with_default(
+            port("OctetStream"),
+            fluxor_contracts::RateClass::Transaction,
+        );
         from.rate_class_max = Some(fluxor_contracts::RateClass::Transaction);
         let to = port("NetProto"); // linux_net.net_in / ip.net_in — no default of its own
         let class = resolve_edge_rate_class(None, Some(&from), Some(&to)).unwrap();
@@ -2785,7 +2915,6 @@ mod rate_class_severity_tests {
     }
 }
 
-
 #[cfg(test)]
 mod capacity_envelope_tests {
     use super::*;
@@ -2827,8 +2956,7 @@ mod capacity_envelope_tests {
         assert!(format!("{err:?}").contains("exceeds"));
 
         let cfg = json!({"capacity": {"events": 0}});
-        let err = build_capacity_envelope(&cfg, Some("linux"))
-            .expect_err("zero is not a capacity");
+        let err = build_capacity_envelope(&cfg, Some("linux")).expect_err("zero is not a capacity");
         assert!(format!("{err:?}").contains("positive"));
     }
 
@@ -2915,6 +3043,82 @@ mod port_capability_tests {
 
     fn edge() -> Value {
         json!({"wiring": [{"from": "pump.publish_out", "to": "sink.publish_in"}]})
+    }
+
+    /// A module whose `provides` lists `surfaces`.
+    fn surface_provider(surfaces: &[&str]) -> Manifest {
+        Manifest {
+            provides: surfaces.iter().map(|s| s.to_string()).collect(),
+            ..Manifest::default()
+        }
+    }
+
+    fn block_graph(edges: &[(&str, &str)]) -> Value {
+        let wiring: Vec<Value> = edges
+            .iter()
+            .map(|(from, to)| json!({"from": from, "to": to}))
+            .collect();
+        json!({ "wiring": wiring })
+    }
+
+    #[test]
+    fn a_surface_requirement_is_met_by_a_provider_of_it() {
+        let mut m = HashMap::new();
+        m.insert("fat32".to_string(), consumer("blocks", "storage.block", 0));
+        m.insert("nvme".to_string(), surface_provider(&["storage.block"]));
+        let g = block_graph(&[("nvme.blocks", "fat32.blocks")]);
+        validate_port_capabilities(&g, &m).unwrap();
+    }
+
+    #[test]
+    fn a_surface_requirement_refuses_a_module_that_does_not_provide_it() {
+        let mut m = HashMap::new();
+        m.insert("fat32".to_string(), consumer("blocks", "storage.block", 0));
+        m.insert("flash_rp".to_string(), surface_provider(&[]));
+        let g = block_graph(&[("flash_rp.stream", "fat32.blocks")]);
+        let msg = format!("{:?}", validate_port_capabilities(&g, &m).unwrap_err());
+        assert!(
+            msg.contains("storage.block") && msg.contains("flash_rp"),
+            "got: {msg}"
+        );
+    }
+
+    /// A block source answers on the one channel wired to its consumer, so a
+    /// second source into the same input could never be reached.
+    #[test]
+    fn a_surface_requirement_takes_exactly_one_source() {
+        let mut m = HashMap::new();
+        m.insert("fat32".to_string(), consumer("blocks", "storage.block", 0));
+        m.insert("nvme".to_string(), surface_provider(&["storage.block"]));
+        m.insert("sd".to_string(), surface_provider(&["storage.block"]));
+        let g = block_graph(&[
+            ("nvme.blocks", "fat32.blocks"),
+            ("sd.blocks", "fat32.blocks"),
+        ]);
+        let msg = format!("{:?}", validate_port_capabilities(&g, &m).unwrap_err());
+        assert!(msg.contains("exactly one source"), "got: {msg}");
+    }
+
+    /// Two block consumers, each on its own source, are two independent
+    /// edges.
+    #[test]
+    fn two_block_consumers_each_take_their_own_source() {
+        let mut m = HashMap::new();
+        m.insert(
+            "fat32_a".to_string(),
+            consumer("blocks", "storage.block", 0),
+        );
+        m.insert(
+            "fat32_b".to_string(),
+            consumer("blocks", "storage.block", 0),
+        );
+        m.insert("nvme".to_string(), surface_provider(&["storage.block"]));
+        m.insert("sd".to_string(), surface_provider(&["storage.block"]));
+        let g = block_graph(&[
+            ("nvme.blocks", "fat32_a.blocks"),
+            ("sd.blocks", "fat32_b.blocks"),
+        ]);
+        validate_port_capabilities(&g, &m).unwrap();
     }
 
     #[test]
@@ -3131,7 +3335,10 @@ mod port_fact_tests {
     #[test]
     fn a_producer_whose_codecs_the_consumer_takes_is_accepted() {
         let (cfg, m) = graph(
-            &[("enc", out_port("codec = \"pcmu\"")), ("tx", in_port("codec = [\"pcmu\", \"opus\"]"))],
+            &[
+                ("enc", out_port("codec = \"pcmu\"")),
+                ("tx", in_port("codec = [\"pcmu\", \"opus\"]")),
+            ],
             json!([{"from": "enc.media_out", "to": "tx.media_in"}]),
         );
         validate_port_facts(&cfg, &m).unwrap();
@@ -3142,7 +3349,10 @@ mod port_fact_tests {
     #[test]
     fn a_producer_that_may_send_an_untaken_codec_is_refused() {
         let (cfg, m) = graph(
-            &[("demux", out_port("codec = [\"aac\", \"mp3\"]")), ("dec", in_port("codec = \"aac\""))],
+            &[
+                ("demux", out_port("codec = [\"aac\", \"mp3\"]")),
+                ("dec", in_port("codec = \"aac\"")),
+            ],
             json!([{"from": "demux.media_out", "to": "dec.media_in"}]),
         );
         let e = validate_port_facts(&cfg, &m).unwrap_err().to_string();
@@ -3152,17 +3362,26 @@ mod port_fact_tests {
     #[test]
     fn exact_and_ceiling_facts_are_compared() {
         let (cfg, m) = graph(
-            &[("a", out_port("clock_rate = 8000")), ("b", in_port("clock_rate = 48000"))],
+            &[
+                ("a", out_port("clock_rate = 8000")),
+                ("b", in_port("clock_rate = 48000")),
+            ],
             json!([{"from": "a.media_out", "to": "b.media_in"}]),
         );
         assert!(validate_port_facts(&cfg, &m).is_err());
         let (cfg, m) = graph(
-            &[("a", out_port("max_payload = 2048")), ("b", in_port("max_payload = 1200"))],
+            &[
+                ("a", out_port("max_payload = 2048")),
+                ("b", in_port("max_payload = 1200")),
+            ],
             json!([{"from": "a.media_out", "to": "b.media_in"}]),
         );
         assert!(validate_port_facts(&cfg, &m).is_err());
         let (cfg, m) = graph(
-            &[("a", out_port("max_payload = 1000")), ("b", in_port("max_payload = 1200"))],
+            &[
+                ("a", out_port("max_payload = 1000")),
+                ("b", in_port("max_payload = 1200")),
+            ],
             json!([{"from": "a.media_out", "to": "b.media_in"}]),
         );
         validate_port_facts(&cfg, &m).unwrap();
@@ -3171,7 +3390,10 @@ mod port_fact_tests {
     #[test]
     fn a_fact_one_end_leaves_undeclared_is_unconstrained() {
         let (cfg, m) = graph(
-            &[("a", out_port("codec = \"opus\"")), ("b", in_port("channels = 2"))],
+            &[
+                ("a", out_port("codec = \"opus\"")),
+                ("b", in_port("channels = 2")),
+            ],
             json!([{"from": "a.media_out", "to": "b.media_in"}]),
         );
         validate_port_facts(&cfg, &m).unwrap();
@@ -3188,7 +3410,10 @@ mod port_fact_tests {
             json!([{"from": "a.media_out", "to": "rx.media_in"}, {"from": "b.media_out", "to": "rx.media_in"}]),
         );
         let e = validate_port_facts(&cfg, &m).unwrap_err().to_string();
-        assert!(e.contains("rx.media_in") && e.contains("2 producers"), "{e}");
+        assert!(
+            e.contains("rx.media_in") && e.contains("2 producers"),
+            "{e}"
+        );
     }
 
     #[test]
@@ -3249,10 +3474,17 @@ mod port_fact_tests {
             "max_payload = { bcm2712 = 8192, rp2350 = 4096, rp2040 = 512 }",
         );
         for (silicon, want) in [("bcm2712", "8192"), ("rp2350", "4096"), ("rp2040", "512")] {
-            assert_eq!(resolved_fact(&src, Some(silicon)).unwrap(), want, "{silicon}");
+            assert_eq!(
+                resolved_fact(&src, Some(silicon)).unwrap(),
+                want,
+                "{silicon}"
+            );
         }
         let m = Manifest::from_toml_str_for_target(&src, Some("rp2040")).unwrap();
-        assert_eq!(m.capability_facts["stream.ordered_ack.sink"]["ack"], "transport");
+        assert_eq!(
+            m.capability_facts["stream.ordered_ack.sink"]["ack"],
+            "transport"
+        );
     }
 
     /// An explicit `default` answers for every target the table does not
@@ -3284,8 +3516,14 @@ mod port_fact_tests {
         };
         // Partial: rp2040 is a hardware target with no entry and no default,
         // refused even when loading for a target the table does name.
-        let e = refused("max_payload = { bcm2712 = 8192, rp2350 = 4096 }", Some("bcm2712"));
-        assert!(e.contains("no value for rp2040") && e.contains("no `default`"), "{e}");
+        let e = refused(
+            "max_payload = { bcm2712 = 8192, rp2350 = 4096 }",
+            Some("bcm2712"),
+        );
+        assert!(
+            e.contains("no value for rp2040") && e.contains("no `default`"),
+            "{e}"
+        );
         // Complete for the module's targets, but a load for no target has
         // nothing to resolve.
         let e = refused(
@@ -3295,16 +3533,31 @@ mod port_fact_tests {
         assert!(e.contains("no entry for target \"<none>\""), "{e}");
         let e = refused("max_payload = {}", Some("rp2040"));
         assert!(e.contains("empty table"), "{e}");
-        let e = refused("max_payload = { default = 8192, rp2O40 = 512 }", Some("rp2040"));
+        let e = refused(
+            "max_payload = { default = 8192, rp2O40 = 512 }",
+            Some("rp2040"),
+        );
         assert!(e.contains("unknown target `rp2O40`"), "{e}");
         // Every entry is schema-checked, not only the resolved one.
-        let e = refused("max_payload = { default = 8192, rp2040 = \"small\" }", Some("bcm2712"));
+        let e = refused(
+            "max_payload = { default = 8192, rp2040 = \"small\" }",
+            Some("bcm2712"),
+        );
         assert!(e.contains("takes a u32, got `small`"), "{e}");
-        let e = refused("max_payload = { default = 8192, rp2040 = -1 }", Some("bcm2712"));
+        let e = refused(
+            "max_payload = { default = 8192, rp2040 = -1 }",
+            Some("bcm2712"),
+        );
         assert!(e.contains("negative"), "{e}");
-        let e = refused("max_payload = { default = 8192, rp2040 = true }", Some("bcm2712"));
+        let e = refused(
+            "max_payload = { default = 8192, rp2040 = true }",
+            Some("bcm2712"),
+        );
         assert!(e.contains("must be a string, an integer"), "{e}");
-        let e = refused("max_payload = { default = { rp2040 = 512 } }", Some("rp2040"));
+        let e = refused(
+            "max_payload = { default = { rp2040 = 512 } }",
+            Some("rp2040"),
+        );
         assert!(e.contains("got a table"), "{e}");
         let e = refused("max_payload = [512, 4096]", Some("rp2040"));
         assert!(e.contains("got a array"), "{e}");
@@ -3329,7 +3582,10 @@ mod gated_edge_tests {
     use super::*;
 
     fn names() -> Vec<String> {
-        ["src", "mid", "sink"].iter().map(|s| s.to_string()).collect()
+        ["src", "mid", "sink"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
     }
 
     /// An auto-assigned group touching a gated module is dropped whole, so
@@ -3338,17 +3594,33 @@ mod gated_edge_tests {
     fn an_auto_group_at_a_gated_module_is_dropped_whole() {
         let edges = [(0u8, 1u8, 0u8, 0u8, 0u8), (1, 2, 0, 0, 0)];
         let mut groups = vec![1u8, 1];
-        ungroup_gated_edges(&edges, &mut groups, &[false, false], &[true, false, false], &names())
-            .expect("an auto group is dropped, not refused");
-        assert_eq!(groups, vec![0, 0], "the edge beyond the gated module leaves the group too");
+        ungroup_gated_edges(
+            &edges,
+            &mut groups,
+            &[false, false],
+            &[true, false, false],
+            &names(),
+        )
+        .expect("an auto group is dropped, not refused");
+        assert_eq!(
+            groups,
+            vec![0, 0],
+            "the edge beyond the gated module leaves the group too"
+        );
     }
 
     #[test]
     fn a_written_group_at_a_gated_module_is_refused() {
         let edges = [(0u8, 1u8, 0u8, 0u8, 0u8)];
         let mut groups = vec![3u8];
-        let e = ungroup_gated_edges(&edges, &mut groups, &[true], &[false, true, false], &names())
-            .expect_err("a written zero-copy edge at a gated module");
+        let e = ungroup_gated_edges(
+            &edges,
+            &mut groups,
+            &[true],
+            &[false, true, false],
+            &names(),
+        )
+        .expect_err("a written zero-copy edge at a gated module");
         assert!(e.to_string().contains("'mid'"), "names the module: {e}");
     }
 
@@ -3356,8 +3628,14 @@ mod gated_edge_tests {
     fn groups_away_from_gated_modules_are_kept() {
         let edges = [(0u8, 1u8, 0u8, 0u8, 0u8), (1, 2, 0, 0, 0)];
         let mut groups = vec![2u8, 2];
-        ungroup_gated_edges(&edges, &mut groups, &[false, true], &[false, false, false], &names())
-            .unwrap();
+        ungroup_gated_edges(
+            &edges,
+            &mut groups,
+            &[false, true],
+            &[false, false, false],
+            &names(),
+        )
+        .unwrap();
         assert_eq!(groups, vec![2, 2]);
     }
 }

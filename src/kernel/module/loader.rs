@@ -762,6 +762,75 @@ pub unsafe fn free_private(ptr: *mut u8, size: usize) {
     unsafe { free_state_range(ptr, size - STATE_CANARY_SIZE) };
 }
 
+/// The memory a torn-down module held: its state buffer, the heap arena it
+/// declared, and on a protection-unit target the private region that holds
+/// all of them. Detached from its slot so the release can wait for whoever
+/// else may still be using a buffer inside it (see `block_lend`).
+pub struct ModuleMemory {
+    state: (*mut u8, usize),
+    arena: (*mut u8, usize),
+    private: Option<(*mut u8, usize)>,
+}
+
+// SAFETY: the ranges are plain allocations from the loader's pools, owned by
+// nothing but this value until `release`; moving it between cores moves that
+// ownership.
+unsafe impl Send for ModuleMemory {}
+
+impl ModuleMemory {
+    /// No memory.
+    pub const fn none() -> Self {
+        Self {
+            state: (core::ptr::null_mut(), 0),
+            arena: (core::ptr::null_mut(), 0),
+            private: None,
+        }
+    }
+
+    /// A module's state buffer and heap arena, with the private region that
+    /// contains them when it has one. A private region owns the state and the
+    /// heap, so they are not released on their own as well.
+    pub fn new(
+        state: (*mut u8, usize),
+        arena: (*mut u8, usize),
+        private: Option<(*mut u8, usize)>,
+    ) -> Self {
+        Self {
+            state,
+            arena,
+            private,
+        }
+    }
+
+    /// Return every range to its pool.
+    ///
+    /// # Safety
+    /// Each range is exactly what the loader handed out for this module, and
+    /// nothing references any of them any more.
+    pub unsafe fn release(self) {
+        if let Some((ptr, size)) = self.private {
+            #[cfg(feature = "kernel-mpu")]
+            // SAFETY: the region `alloc_private` returned for this module, per
+            // the caller's contract.
+            unsafe {
+                free_private(ptr, size)
+            };
+            #[cfg(not(feature = "kernel-mpu"))]
+            let _ = (ptr, size);
+            return;
+        }
+        if !self.arena.0.is_null() && self.arena.1 > 0 {
+            // SAFETY: the arena `alloc_state` returned, per the caller's contract.
+            unsafe { free_state_range(self.arena.0, self.arena.1) };
+        }
+        if !self.state.0.is_null() {
+            // SAFETY: the state buffer `alloc_state` returned, per the
+            // caller's contract.
+            unsafe { free_state_range(self.state.0, self.state.1) };
+        }
+    }
+}
+
 /// True if `ptr` was handed out by [`alloc_isolated`] (lives in the ISO arena).
 /// `free_state_range` uses this to skip the STATE_ARENA free-list bookkeeping
 /// for isolated allocations (which are reclaimed wholesale at reset).
@@ -1035,6 +1104,9 @@ pub unsafe fn free_state_range(ptr: *mut u8, size: usize) {
 /// Reset the pool: clear the free list and drop the high-water mark to 0.
 /// Called from scheduler at the start of `prepare_graph`.
 pub fn reset_state_arena() {
+    // Every module's memory goes at once, and the ledger of buffers lent
+    // from it with it.
+    crate::kernel::module::block_lend::reset();
     // SAFETY: Single-threaded embedded context
     unsafe {
         STATE_ARENA_OFFSET = 0;
@@ -2740,6 +2812,12 @@ impl DynamicModule {
         if !self.state_ptr.is_null() {
             free_state_range(self.state_ptr, self.state_size as usize);
         }
+    }
+    /// The state buffer this module owns, as `(pointer, size)`, consuming the
+    /// module without freeing anything: the caller takes over releasing it,
+    /// as part of a [`ModuleMemory`].
+    pub fn into_state_range(self) -> (*mut u8, usize) {
+        (self.state_ptr, self.state_size as usize)
     }
     /// Call module_drain if the module exports it.
     /// Returns the drain function's return code, or -1 if not drain-capable.

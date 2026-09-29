@@ -5,9 +5,9 @@ permissions = ["platform_raw", "backing_provider", "pcie_device", "dma"]
 # all use dev_millis. The step counter is observational only.
 timer_class = "wall_clock"
 
-# Provided storage surface (storage_capability_surface.md §1): raw
-# 512-byte block I/O. Free-form provider capability string; tools-only,
-# never serialized to the .fmod.
+# Provided storage surface (storage_capability_surface.md §1): raw block
+# I/O at the namespace's logical block size (512 B to 4 KiB). Free-form
+# provider capability string; tools-only, never serialized to the .fmod.
 provides = ["storage.block"]
 
 # Bind the NVMe controller via the PCIE_DEVICE contract. The driver

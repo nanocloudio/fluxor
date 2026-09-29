@@ -9,11 +9,11 @@
 // host test harness. A backend that can only be exercised by booting a whole
 // graph is a backend whose faults are found on hardware, at the end.
 
+use fluxor::platform::builtin_param_tags::linux_gpu as gpu_tags;
 use fluxor::platform::builtin_param_tags::linux_gpu::{
     TAG_RESIDENT_MB as GPU_TAG_RESIDENT_MB, TAG_STAGING_KB as GPU_TAG_STAGING_KB,
 };
 use fluxor::platform::linux::gpu::GpuProvider;
-use fluxor::platform::builtin_param_tags::linux_gpu as gpu_tags;
 
 const LINUX_GPU_HASH: u32 = 0x0C49_64C4; // fnv1a32("linux_gpu")
 
@@ -102,7 +102,11 @@ fn flush_owed(st: &mut LinuxGpuInstance) {
         // SAFETY: `sent < owed.len()`, so the pointer and length name bytes
         // inside the buffer.
         let n = unsafe {
-            channel::channel_write(st.out_chan, st.owed.as_ptr().add(sent), st.owed.len() - sent)
+            channel::channel_write(
+                st.out_chan,
+                st.owed.as_ptr().add(sent),
+                st.owed.len() - sent,
+            )
         };
         if n <= 0 {
             break;

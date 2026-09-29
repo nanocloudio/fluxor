@@ -3078,7 +3078,7 @@ fn bcm_read_device_seal_key(out: &mut [u8; 32]) -> bool {
 ///
 /// `key_vault` asks on every `TIER` and every `DESCRIBE`, and each ask is a
 /// full cache-maintained mailbox round trip — plus, under concurrency, the
-/// busy-flag loser would transiently answer `None`, and a `key_custody`
+/// busy-flag loser would transiently answer `None`, and a provenance
 /// check racing an unrelated `DESCRIBE` would refuse spuriously. A
 /// validated `DeviceUnique` read of OTP cannot become truer or falser
 /// later, so a confirmed answer is cached forever; a FAILURE is never
@@ -3105,6 +3105,8 @@ static BCM2712_HAL_OPS: HalOps = HalOps {
     // before. A platform gains cold-restart persistence by implementing
     // these two and loses nothing by not.
     seal_blob_write: |_, _| false,
+    seal_blob_store: || false,
+    seal_blob_delete: |_| true,
     seal_blob_read: |_, _| None,
     disable_interrupts: bcm_disable_interrupts,
     restore_interrupts: bcm_restore_interrupts,
@@ -3125,8 +3127,8 @@ static BCM2712_HAL_OPS: HalOps = HalOps {
     // raises a vault's isolation tier and with it what a deployment
     // believes about keys it has not protected.
     seal_provenance: bcm_seal_provenance,
-    seal: |_, _| None,
-    unseal: |_, _| None,
+    seal: |_, _, _| None,
+    unseal: |_, _, _| None,
     now_micros: bcm_now_micros,
     tick_count: bcm_tick_count,
     flash_base: bcm_flash_base,

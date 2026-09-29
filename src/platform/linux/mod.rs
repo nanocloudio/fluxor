@@ -16,6 +16,7 @@ pub mod clock;
 /// harness can drive it against a real adapter.
 pub mod gpu;
 pub mod host_backend;
+pub mod host_mount;
 #[cfg(feature = "host-hsm")]
 pub mod hsm_key_vault;
 pub mod net_identity;

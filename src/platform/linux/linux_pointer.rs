@@ -10,11 +10,11 @@
 // pointer records, scaled from the device axis range to the surface's
 // logical geometry. Included into `linux.rs`; shares its imports.
 
+use fluxor::platform::builtin_param_tags::linux_pointer as pointer_tags;
 use fluxor::platform::builtin_param_tags::linux_pointer::{
     TAG_HEIGHT as POINTER_TAG_HEIGHT, TAG_PATH as POINTER_TAG_PATH, TAG_WIDTH as POINTER_TAG_WIDTH,
     TAG_X_MAX as POINTER_TAG_X_MAX, TAG_Y_MAX as POINTER_TAG_Y_MAX,
 };
-use fluxor::platform::builtin_param_tags::linux_pointer as pointer_tags;
 
 const LINUX_POINTER_HASH: u32 = 0xEEA3_12EF; // fnv1a32("linux_pointer")
 
@@ -136,7 +136,11 @@ fn linux_pointer_step(state: *mut u8) -> i32 {
                 } else {
                     log::info!(
                         "[linux_pointer] reading '{}' → {}x{} logical (x_max={} y_max={})",
-                        st.path, st.width, st.height, st.x_max, st.y_max
+                        st.path,
+                        st.width,
+                        st.height,
+                        st.x_max,
+                        st.y_max
                     );
                 }
             }

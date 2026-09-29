@@ -1,8 +1,9 @@
 //! PKCS#11 (HSM/token) `key_vault` backend — Linux platform.
 //!
-//! Registers as the KEY_VAULT provider (class dispatch + vtable, see the
-//! registration note in `kernel/syscalls.rs`) when a token is configured,
-//! overriding the kernel software backend. Maps the vault opcodes onto
+//! Registers behind the KEY_VAULT router (`key_vault_router`) when a token
+//! is configured. The software backend stays beside it: the router sends
+//! this backend the P-256 keys it generates and every handle it minted,
+//! and the software backend everything else. Maps the vault opcodes onto
 //! PKCS#11:
 //!
 //! - `GENERATE` → `C_GenerateKeyPair` with `CKA_SENSITIVE=true`,
@@ -30,15 +31,19 @@
 //!   so consumers know to use `GENERATE`.
 //! - `TIER` → `PROCESS_HW`: a host process talking to a token isolates
 //!   the key from host-memory compromise to the extent the token does.
+//! - `DESCRIBE` → P-256, the key's sealed uses, `PROCESS_HW`, not
+//!   persisted (session objects).
 //!
 //! This backend is P-256-scoped. `SUITE_QUERY` answers `ENOSYS` for every
 //! other suite and `SUITE_ENUM` lists only P-256, so a consumer that needs
 //! EdDSA learns it before it commits and falls back per its own policy.
 //!
-//! Generated keys are *session* objects (`CKA_TOKEN=false`): vault slots
-//! are per-run (the software backend wipes on scheduler reset), so
-//! persistent token objects would leak one keypair per boot. A
-//! bind-existing-key op is a contract extension for a future workload.
+//! Generated keys are *session* objects (`CKA_TOKEN=false`): a key lives
+//! as long as its owning module and the process, so persistent token
+//! objects would leak one keypair per run. There is no operation that binds
+//! a key already on the token. A key whose owning module is gone (restart,
+//! replacement or graph rebuild) is destroyed in the token when a slot is
+//! next needed.
 //!
 //! Configuration (all read once at platform boot by
 //! [`try_register_from_env`]; the backend activates only when the module
@@ -69,9 +74,8 @@ use cryptoki::slot::Slot;
 use cryptoki::types::AuthPin;
 
 use crate::abi::contracts::key_vault as dev_key_vault;
-use crate::abi::errno::{EINVAL, ENOMEM, ENOSYS, ERROR};
+use crate::abi::errno::{EACCES, EINVAL, ENOENT, ENOMEM, ENOSYS, ERROR};
 use crate::kernel::ipc::fd;
-use crate::kernel::module::provider;
 
 /// DER encoding of the `secp256r1` (NIST P-256, a.k.a. `prime256v1`)
 /// named-curve OID `1.2.840.10045.3.1.7`, as required for `CKA_EC_PARAMS`.
@@ -111,14 +115,14 @@ fn normalise_low_s(sig: &mut [u8; 64]) {
     }
 }
 
-/// Same slot count as the software backend: the vault contract exposes a
-/// small fixed handle space, not the token's whole object store.
+/// Slots this backend holds: the vault contract exposes a small fixed handle
+/// space, not the token's whole object store.
 const MAX_SLOTS: usize = 8;
 
 /// What this backend permits for the one suite it supports.
 ///
-/// No `PERSIST` bit is needed: the token IS the persistence, and every key
-/// it generates is a session object today (see `GENERATE`). Nor is there a
+/// There is no `PERSIST` bit: every key this backend generates is a session
+/// object (see `GENERATE`), and nothing here outlives the process. Nor is there a
 /// `STORE_IMPORT` equivalent — import is refused per-suite through
 /// `SUITE_QUERY` rather than as one global bit, because tokens differ by
 /// algorithm and a single bit could not say which.
@@ -143,6 +147,10 @@ unsafe fn read_u64(p: *const u8) -> u64 {
 struct HsmSlot {
     private: ObjectHandle,
     public: ObjectHandle,
+    /// The module that generated this key: scheduler slot and occupancy.
+    owner: (u8, u32),
+    /// Permitted uses, sealed at generation and checked per operation.
+    usage: u32,
 }
 
 /// The process-wide backend state, initialised once at platform boot.
@@ -153,6 +161,9 @@ struct HsmVault {
     /// Keeps the loaded PKCS#11 library alive as long as the session.
     _ctx: Pkcs11,
     slots: Mutex<[Option<HsmSlot>; MAX_SLOTS]>,
+    /// Per-slot generation, bumped when a key is destroyed and carried in
+    /// every handle, so a handle to a destroyed key never reaches the next.
+    generations: Mutex<[u32; MAX_SLOTS]>,
 }
 
 static VAULT: OnceLock<HsmVault> = OnceLock::new();
@@ -249,15 +260,15 @@ fn open_vault(module: &str, token: &TokenSelector, pin: &str) -> Result<HsmVault
         session: Mutex::new(session),
         _ctx: ctx,
         slots: Mutex::new([const { None }; MAX_SLOTS]),
+        generations: Mutex::new([0; MAX_SLOTS]),
     })
 }
 
-/// Activate the PKCS#11 backend if the environment configures one:
-/// override the KEY_VAULT registration on *both* dispatch paths (class
-/// byte + vtable — see `kernel/syscalls.rs`). Returns `true` when the
-/// override happened; on `false` the kernel software default stays live
-/// (a consumer requiring hardware sees `TIER = SOFTWARE` and refuses —
-/// the vault never silently overclaims).
+/// Activate the PKCS#11 backend if the environment configures one: register
+/// it behind the KEY_VAULT router. Returns `true` when it registered; on
+/// `false` the software backend serves everything alone (a consumer
+/// requiring hardware sees `TIER = SOFTWARE` and refuses — the vault never
+/// silently overclaims).
 pub fn try_register_from_env() -> bool {
     let Some((module, token, pin)) = config_from_env() else {
         return false;
@@ -276,18 +287,11 @@ pub fn try_register_from_env() -> bool {
         log::error!("hsm_key_vault: already registered");
         return false;
     }
-    provider::register(provider::contract::KEY_VAULT, hsm_key_vault_dispatch);
-    provider::register_vtable(&HSM_KEY_VAULT_VTABLE);
+    // SAFETY: platform boot, before any module runs.
+    unsafe { crate::kernel::security::key_vault_router::register_hardware(hsm_key_vault_dispatch) };
     log::info!("hsm_key_vault: PKCS#11 backend registered (module {module}, TIER=PROCESS_HW)");
     true
 }
-
-static HSM_KEY_VAULT_VTABLE: provider::ProviderVTable = provider::ProviderVTable {
-    contract: provider::contract::KEY_VAULT,
-    call: hsm_key_vault_dispatch,
-    query: None,
-    default_close_op: dev_key_vault::DESTROY,
-};
 
 /// Read `CKA_EC_POINT` and return the raw 65-byte SEC1 uncompressed
 /// point. PKCS#11 returns the attribute as a DER `OCTET STRING` wrapping
@@ -320,16 +324,80 @@ fn read_public_point(session: &Session, public_key: ObjectHandle) -> Result<[u8;
     Ok(out)
 }
 
-/// Untag and range-check a slot-bound handle.
-fn slot_index(handle: i32) -> Option<usize> {
+/// Handle bits naming the slot; the generation sits above them.
+const SLOT_BITS: u32 = 6;
+const GENERATION_MASK: u32 = (1 << 19) - 1;
+/// Set on every handle this backend mints, so the router sends it here.
+const BACKEND_BIT: i32 = crate::kernel::security::key_vault_router::HARDWARE_FIELD_BIT;
+const _: () = assert!(MAX_SLOTS <= 1 << SLOT_BITS);
+
+/// The slot a handle names, if the caller may use it — the same rule as
+/// the software backend: `EINVAL` for something that is not a vault handle,
+/// `ENOENT` for a key that no longer exists, `EACCES` for another module's.
+fn resolve(vault: &HsmVault, handle: i32) -> Result<usize, i32> {
     if handle < 0 {
-        return None;
+        return Err(EINVAL);
     }
-    let (tag, slot) = fd::untag_fd(handle);
-    if tag != fd::FD_TAG_KEY_VAULT || slot < 0 || (slot as usize) >= MAX_SLOTS {
-        return None;
+    let (tag, field) = fd::untag_fd(handle);
+    if tag != fd::FD_TAG_KEY_VAULT || field & BACKEND_BIT == 0 {
+        return Err(EINVAL);
     }
-    Some(slot as usize)
+    let field = field & !BACKEND_BIT;
+    let idx = (field & ((1 << SLOT_BITS) - 1)) as usize;
+    let g = (field >> SLOT_BITS) as u32;
+    if idx >= MAX_SLOTS {
+        return Err(EINVAL);
+    }
+    let slots = vault.slots.lock().map_err(|_| ERROR)?;
+    let generations = vault.generations.lock().map_err(|_| ERROR)?;
+    let Some(slot) = &slots[idx] else {
+        return Err(ENOENT);
+    };
+    if generations[idx] & GENERATION_MASK != g {
+        return Err(ENOENT);
+    }
+    // A key whose owner is gone no longer exists, for anyone; its slot is
+    // freed when the next GENERATE needs one.
+    if !crate::kernel::security::key_vault::owner_is_live(slot.owner.0, slot.owner.1) {
+        return Err(ENOENT);
+    }
+    if slot.owner != crate::kernel::security::key_vault::caller_owner() {
+        return Err(EACCES);
+    }
+    Ok(idx)
+}
+
+/// The handle naming slot `idx` at its current generation.
+fn handle_of(vault: &HsmVault, idx: usize) -> i32 {
+    let g = vault
+        .generations
+        .lock()
+        .map(|g| (g[idx] & GENERATION_MASK) as i32)
+        .unwrap_or(0);
+    fd::tag_fd(
+        fd::FD_TAG_KEY_VAULT,
+        BACKEND_BIT | (g << SLOT_BITS) | idx as i32,
+    )
+}
+
+/// Destroy a slot's token objects and retire its handles: the generation
+/// moves on, so a handle to the key stops resolving.
+fn release_slot(vault: &HsmVault, session: &Session, idx: usize, slot: HsmSlot) {
+    let _ = session.destroy_object(slot.private);
+    let _ = session.destroy_object(slot.public);
+    if let Ok(mut g) = vault.generations.lock() {
+        g[idx] = g[idx].wrapping_add(1) & GENERATION_MASK;
+    }
+}
+
+/// Whether slot `idx` permits `want`: `Err(EACCES)` when it does not.
+fn permits(vault: &HsmVault, idx: usize, want: u32) -> Result<(), i32> {
+    let slots = vault.slots.lock().map_err(|_| ERROR)?;
+    match &slots[idx] {
+        Some(slot) if slot.usage & want == want => Ok(()),
+        Some(_) => Err(EACCES),
+        None => Err(ENOENT),
+    }
 }
 
 /// KEY_VAULT provider dispatch backed by the PKCS#11 token.
@@ -414,9 +482,13 @@ pub unsafe fn hsm_key_vault_dispatch(
             if arg.is_null() || arg_len < 4 {
                 return EINVAL;
             }
-            let Some(idx) = slot_index(handle) else {
-                return EINVAL;
+            let idx = match resolve(vault, handle) {
+                Ok(i) => i,
+                Err(e) => return e,
             };
+            if let Err(e) = permits(vault, idx, dev_key_vault::usage::AGREE) {
+                return e;
+            }
             let peer_len =
                 u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]) as usize;
             if peer_len == 0 || peer_len > 65 || 4 + peer_len + 12 > arg_len {
@@ -547,12 +619,25 @@ pub unsafe fn hsm_key_vault_dispatch(
                 Ok(s) => s,
                 Err(_) => return ERROR,
             };
-            let Some(idx) = slots.iter().position(Option::is_none) else {
-                return ENOMEM;
-            };
             let session = match vault.session.lock() {
                 Ok(s) => s,
                 Err(_) => return ERROR,
+            };
+            // Keys whose owning module is gone are unreachable: free their
+            // slots and token objects before looking for one.
+            for i in 0..MAX_SLOTS {
+                let orphan = matches!(
+                    &slots[i],
+                    Some(k) if !crate::kernel::security::key_vault::owner_is_live(k.owner.0, k.owner.1)
+                );
+                if orphan {
+                    if let Some(k) = slots[i].take() {
+                        release_slot(vault, &session, i, k);
+                    }
+                }
+            }
+            let Some(idx) = slots.iter().position(Option::is_none) else {
+                return ENOMEM;
             };
             // The private key is sensitive + non-extractable regardless
             // of the flags byte: this backend has nothing weaker to offer,
@@ -599,17 +684,27 @@ pub unsafe fn hsm_key_vault_dispatch(
                 core::ptr::copy_nonoverlapping(point.as_ptr(), gen_out, 65);
             }
             core::ptr::copy_nonoverlapping(65u16.to_le_bytes().as_ptr(), gen_tail.add(10), 2);
-            slots[idx] = Some(HsmSlot { private, public });
-            fd::tag_fd(fd::FD_TAG_KEY_VAULT, idx as i32)
+            slots[idx] = Some(HsmSlot {
+                private,
+                public,
+                owner: crate::kernel::security::key_vault::caller_owner(),
+                usage,
+            });
+            drop(slots);
+            handle_of(vault, idx)
         }
         dev_key_vault::PUBLIC => {
             // arg: [out_ptr:u64][out_cap:u16][out_len_out:u16]
             if arg.is_null() || arg_len < 12 {
                 return EINVAL;
             }
-            let Some(idx) = slot_index(handle) else {
-                return EINVAL;
+            let idx = match resolve(vault, handle) {
+                Ok(i) => i,
+                Err(e) => return e,
             };
+            if let Err(e) = permits(vault, idx, dev_key_vault::usage::EXPORT_PUBLIC) {
+                return e;
+            }
             let pub_out = read_u64(arg) as *mut u8;
             let pub_cap = u16::from_le_bytes([*arg.add(8), *arg.add(9)]) as usize;
             if pub_cap < 65 {
@@ -647,9 +742,13 @@ pub unsafe fn hsm_key_vault_dispatch(
             if arg.is_null() || arg_len < 6 {
                 return EINVAL;
             }
-            let Some(idx) = slot_index(handle) else {
-                return EINVAL;
+            let idx = match resolve(vault, handle) {
+                Ok(i) => i,
+                Err(e) => return e,
             };
+            if let Err(e) = permits(vault, idx, dev_key_vault::usage::SIGN) {
+                return e;
+            }
             // P-256 signs a DIGEST. Explicit rather than inferred: a caller
             // that handed this a message would otherwise get a valid
             // signature over the wrong thing.
@@ -704,25 +803,47 @@ pub unsafe fn hsm_key_vault_dispatch(
             0
         }
         dev_key_vault::DESTROY => {
-            let Some(idx) = slot_index(handle) else {
-                return EINVAL;
+            let idx = match resolve(vault, handle) {
+                Ok(i) => i,
+                Err(e) => return e,
             };
             let mut slots = match vault.slots.lock() {
                 Ok(s) => s,
                 Err(_) => return ERROR,
             };
             let Some(slot) = slots[idx].take() else {
-                // Matches the software backend: destroying a free slot
-                // is a no-op success.
                 return 0;
             };
             let session = match vault.session.lock() {
                 Ok(s) => s,
                 Err(_) => return ERROR,
             };
-            let _ = session.destroy_object(slot.private);
-            let _ = session.destroy_object(slot.public);
+            release_slot(vault, &session, idx, slot);
             0
+        }
+        dev_key_vault::DESCRIBE => {
+            // arg: [suite_out:u16][usage_out:u32][tier_out:u8][persisted_out:u8]
+            if arg.is_null() || arg_len < 8 {
+                return EINVAL;
+            }
+            let idx = match resolve(vault, handle) {
+                Ok(i) => i,
+                Err(e) => return e,
+            };
+            let usage = match vault.slots.lock() {
+                Ok(s) => s[idx].as_ref().map_or(0, |slot| slot.usage),
+                Err(_) => return ERROR,
+            };
+            core::ptr::copy_nonoverlapping(
+                dev_key_vault::suite::P256.to_le_bytes().as_ptr(),
+                arg,
+                2,
+            );
+            core::ptr::copy_nonoverlapping(usage.to_le_bytes().as_ptr(), arg.add(2), 4);
+            *arg.add(6) = dev_key_vault::tier::PROCESS_HW;
+            // Session objects: nothing of the key outlives the process.
+            *arg.add(7) = 0;
+            8
         }
         _ => ENOSYS,
     }

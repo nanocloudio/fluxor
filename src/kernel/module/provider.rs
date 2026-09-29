@@ -38,6 +38,13 @@
 //! `fat32` volumes behind a `mount` router — without any of them shadowing
 //! another. Selectors are unique per contract: a duplicate is refused at
 //! registration, because a shadowed provider is silently unreachable.
+//!
+//! The name `platform` is reserved: `provider_call_sel("platform", …)`
+//! reaches the platform's own (kernel-registered) provider of the contract
+//! beneath any module layers — the host filesystem under a graph-local
+//! `fat32`, say. A handle minted through any selector is returned as a
+//! routed handle that names its minting provider, so its handle-bound ops
+//! reach that provider however the default layer changes (see `Route`).
 
 use crate::kernel::ipc::fd;
 use crate::kernel::sys::errno;
@@ -176,10 +183,14 @@ pub mod contract {
     /// `FD_TAG_WORKLOAD`-tagged.
     pub const WORKLOAD: u16 = 0x001A;
     /// Linux host-process mechanics (exec/PTY/read/bundles) — the host-scoped
-    /// class evicted from the stable 0x1A surface (D-WORKLOAD-ABI). Registered
+    /// class beside the stable 0x1A workload surface. Registered
     /// only by the linux host platform; semantic constants live at
     /// `abi::platform::linux::host_process`.
     pub const HOST_PROCESS: u16 = 0x001B;
+    /// Linux host mounts of block devices under the operator's mount root —
+    /// a host-scoped class, registered only by the linux host platform;
+    /// semantic constants live at `abi::platform::linux::host_mount`.
+    pub const HOST_MOUNT: u16 = 0x001F;
 
     // Short-name aliases used by kernel-side dispatchers (`GPIO`, `SPI`,
     // `PIO`, `UART`, `ADC`, `PWM`). Same numeric values as the `HAL_*`
@@ -413,11 +424,9 @@ fn fd_tag_contract(handle: i32) -> Option<ContractId> {
         _t if _t == fd::FD_TAG_STORAGE_OBJECT => Some(contract::STORAGE_OBJECT),
         _t if _t == fd::FD_TAG_HAL_PIO => Some(contract::HAL_PIO),
         _t if _t == fd::FD_TAG_WORKLOAD => Some(contract::WORKLOAD),
-        // USB host (scaffold). No live producer yet — the kernel-side
-        // USB host stack is unimplemented, so `provider_open(USB_HOST,
-        // ...)` never returns a tagged handle today. The lookup is
-        // wired in advance so a future implementation needs no surface
-        // change.
+        // USB host: allocated but unserved (see `contract::USB_HOST`), so
+        // `provider_open(USB_HOST, ...)` returns no tagged handle; the tag
+        // resolves here so a registered vtable would be reachable unchanged.
         _t if _t == fd::FD_TAG_USB_HOST => Some(contract::USB_HOST),
         // Platform-registered routes (host-scoped tags the generic kernel
         // does not know by name — see `register_fd_tag_route`).
@@ -462,7 +471,7 @@ fn release_handle(handle: i32) {
     }
 }
 
-// ── Handle-scoped dispatch (new API) ─────────────────────────────────
+// ── Handle-scoped dispatch ───────────────────────────────────────────
 
 /// Contract → FD-tag mapping. Every contract that returns a handle
 /// to a module appears here so `provider_open` can apply the tag
@@ -517,8 +526,8 @@ pub fn provider_open(
     if crate::kernel::exec::scheduler::deny_isr_tier_syscall("provider_open") {
         return errno::EACCES;
     }
-    // Admission gate: opening a provider handle is NEW admission, refused for
-    // a Draining owner. Handles it already holds keep working (`authorize_use`
+    // Admission gate: opening a provider handle admits new work, which is
+    // refused for a Draining owner. Handles it already holds keep working (`authorize_use`
     // semantics) so in-flight work can run dry. System-owned modules are
     // unaffected.
     #[cfg(feature = "multitenant")]
@@ -637,6 +646,14 @@ pub fn provider_call(handle: i32, op: u32, arg: *mut u8, arg_len: usize) -> i32 
         // SAFETY: dispatch routes to the kernel-internal bucket handler.
         return unsafe { dispatch(class, handle, op, arg, arg_len) };
     }
+    // A handle minted through a selector belongs to the provider that minted
+    // it, not to whichever layer is the default now.
+    match route_lookup(handle) {
+        // SAFETY: caller owns `arg`/`arg_len` for the call.
+        RouteLookup::Live(idx) => return unsafe { call_route(idx, op, arg, arg_len) },
+        RouteLookup::Stale => return EBADF,
+        RouteLookup::NotRouted => {}
+    }
     if let Some(contract) = lookup_contract(handle) {
         if let Some(vt) = vtable_for(contract) {
             // SAFETY: vt.call is the contract's registered ABI entry;
@@ -680,6 +697,20 @@ pub fn provider_close(handle: i32) -> i32 {
     if deny_cross_owner_handle(handle, "provider_close") {
         return errno::EACCES;
     }
+    match route_lookup(handle) {
+        RouteLookup::Live(idx) => {
+            let r = route_at(idx);
+            let close = vtable_for(r.contract).map_or(0, |v| v.default_close_op);
+            if close == 0 {
+                retire_route(idx, r.generation);
+                return 0;
+            }
+            // SAFETY: close convention: null arg, zero length.
+            return unsafe { call_route(idx, close, core::ptr::null_mut(), 0) };
+        }
+        RouteLookup::Stale => return EBADF,
+        RouteLookup::NotRouted => {}
+    }
     let result = if let Some(contract) = lookup_contract(handle) {
         if let Some(vt) = vtable_for(contract) {
             if vt.default_close_op != 0 {
@@ -708,6 +739,12 @@ pub fn reset_handle_tracking() {
         for slot in (*p).iter_mut() {
             slot.handle = -1;
             slot.contract = 0;
+        }
+        let p = &raw mut ROUTES;
+        let routes = &mut *p;
+        for r in routes.iter_mut() {
+            r.in_use = false;
+            r.inner = -1;
         }
     }
 }
@@ -796,11 +833,9 @@ struct ProviderLayer {
     /// Instance selector (FNV-1a hash of a short volume/instance string,
     /// shared with modules via `abi::provider_selector::hash`). `0` =
     /// unkeyed / default provider — the target of the class-byte
-    /// (`handle == -1`) dispatch path, so a graph with a single unkeyed
-    /// provider behaves exactly as before instance-keying existed. A
-    /// non-zero selector is reachable only via `provider_call_sel`, letting
-    /// multiple volumes of one contract (two `fat32`, NVMe + SD) coexist
-    /// without shadowing.
+    /// (`handle == -1`) dispatch path. A non-zero selector is reachable only
+    /// via `provider_call_sel`, letting multiple volumes of one contract (two
+    /// `fat32`, NVMe + SD) coexist without shadowing.
     selector: u32,
 }
 
@@ -844,13 +879,13 @@ pub fn register(contract: ContractId, dispatch: ProviderDispatch) {
 
 /// Contracts a PIC module is allowed to provide. The loader calls
 /// `register_module_provider` after resolving a module's
-/// `module_provides_contract` export — a compromised or mis-built
-/// module could in principle name any contract. We whitelist only
-/// the contracts where it's architecturally legitimate for a module
-/// to be the provider: the HAL peripherals and FS (bare-metal
-/// filesystems). CHANNEL / TIMER / BUFFER / EVENT / KEY_VAULT and
-/// the internal dispatch bucket are kernel-only and must not be
-/// replaceable by a module.
+/// `module_provides_contract` (or `module_provides_contracts`) export — a
+/// compromised or mis-built module could in principle name any contract.
+/// Only the contracts where it is architecturally legitimate for a module to
+/// be the provider are admitted: the HAL peripherals, FS, and the
+/// `storage.namespace` / `storage.object` surfaces. CHANNEL / TIMER / BUFFER /
+/// EVENT / KEY_VAULT and the internal dispatch bucket are kernel-only and
+/// must not be replaceable by a module.
 #[inline]
 fn is_module_providable(contract: ContractId) -> bool {
     matches!(
@@ -870,10 +905,12 @@ fn is_module_providable(contract: ContractId) -> bool {
 
 /// Register a PIC module as provider for a contract.
 ///
-/// Pushes the module onto the top of the chain. Returns 0 on success,
-/// EINVAL if `contract` is out of range or not in the module-providable
-/// whitelist, or if the dispatch pointer is outside the module's code
-/// region; EBUSY if chain is full.
+/// Pushes the module onto the top of the chain. Returns 0 on success;
+/// EINVAL if `contract` is out of range or the dispatch pointer is outside
+/// the module's code region; EACCES if `contract` is not module-providable or
+/// `selector` is the reserved `platform` name; EBUSY if the module already
+/// holds a layer of this contract, the selector is already taken, or the
+/// chain is full.
 pub fn register_module_provider(
     contract: ContractId,
     module_idx: u8,
@@ -888,6 +925,16 @@ pub fn register_module_provider(
     if !is_module_providable(contract) {
         log::error!(
             "[provider] module {module_idx} tried to register for non-providable contract 0x{contract:04x}",
+        );
+        return errno::EACCES;
+    }
+    // The platform's name is not a module's to take: a layer carrying it
+    // would make `provider_call_sel("platform", …)` reach the module, and the
+    // one path that names the platform beneath a graph would stop doing so.
+    if selector == PLATFORM_SELECTOR {
+        log::error!(
+            "[provider] module {module_idx} registers the reserved selector `platform` for \
+             contract 0x{contract:04x}; that name reaches the platform's own provider"
         );
         return errno::EACCES;
     }
@@ -989,6 +1036,9 @@ pub fn release_module_providers(module_idx: u8) {
     // A freed slot must not stay subscribed: the slot is reused, and the next
     // module to land in it would inherit a subscription it never asked for.
     clear_owner_release_observer(module_idx);
+    // Before the chain is compacted, so the departing module's own routed
+    // handles are closed at owners that are still registered.
+    release_routes_of(module_idx);
     // SAFETY: called from scheduler module-finish path; scheduler thread.
     unsafe {
         let p = &raw mut PROVIDERS;
@@ -1205,11 +1255,6 @@ fn module_dispatch_entry(module_idx: u8) -> Option<(ModuleProviderDispatchFn, *m
     None
 }
 
-/// Dispatch an operation to the registered provider for `contract`.
-///
-/// Module provider chain top takes priority. Falls back to kernel provider.
-/// Returns E_NOSYS if no provider is registered for this contract.
-///
 /// Run a provider's dispatch with `module_idx` as the current module and the
 /// previous one published as the caller.
 ///
@@ -1220,7 +1265,7 @@ fn module_dispatch_entry(module_idx: u8) -> Option<(ModuleProviderDispatchFn, *m
 /// owner argument, because widening it is a positional-ABI flag day across
 /// every module in the fleet for a fact the kernel already holds.
 #[inline]
-fn in_provider_frame<R>(module_idx: usize, f: impl FnOnce() -> R) -> R {
+pub(crate) fn in_provider_frame<R>(module_idx: usize, f: impl FnOnce() -> R) -> R {
     use crate::kernel::exec::scheduler;
     let saved_current = scheduler::current_module_index();
     let saved_caller = scheduler::caller_module_index();
@@ -1232,6 +1277,12 @@ fn in_provider_frame<R>(module_idx: usize, f: impl FnOnce() -> R) -> R {
     result
 }
 
+/// Dispatch an operation to the registered provider for `contract`.
+///
+/// The top-most unkeyed module layer takes priority; the kernel provider
+/// answers when none is registered. Returns ENOSYS if no provider is
+/// registered for this contract.
+///
 /// # Safety
 /// `arg` must satisfy the aliasing and validity requirements expected by the
 /// registered dispatch handler for the given `contract` and `opcode`.
@@ -1370,8 +1421,7 @@ pub unsafe fn dispatch_next(
 
 /// Index of the layer that serves the class-byte (`handle == -1`) dispatch
 /// path for a contract: the top-most (highest-index) unkeyed (selector 0)
-/// layer. Identical to `chain[depth-1]` when every provider is unkeyed (the
-/// pre-instance-keying world).
+/// layer. Identical to `chain[depth-1]` when every provider is unkeyed.
 ///
 /// `None` when the chain is empty OR when every layer is instance-keyed.
 /// Falling back to some keyed layer would reinstate exactly the shadowing
@@ -1392,19 +1442,26 @@ fn default_layer_index(entry: &ProviderEntry) -> Option<usize> {
     None
 }
 
-/// Call an instance-keyed provider selected by `sel` (a short selector
-/// string, e.g. a volume name). The contract is the opcode's class byte —
-/// the same rule the `handle == -1` path uses — so a policy module (e.g.
-/// `mount`) names the target volume inline on every op rather than caching
-/// a token. `op_handle` carries the op's OWN handle (`-1` for open-style
-/// ops, or a provider-local slot for handle-bound ops); `sel` is purely
-/// routing, so it never collides with a provider's slot space.
+/// Call the provider of the opcode's contract selected by `sel`: an
+/// instance-keyed module layer (a volume name), or — for the reserved name
+/// [`PLATFORM_SELECTOR_NAME`] — the platform's own provider of that contract
+/// (the host filesystem on Linux), whatever module layers sit above it. The
+/// contract is the opcode's class byte, the same rule the `handle == -1` path
+/// uses.
 ///
-/// Resolving by selector on each call (rather than by a cached
-/// module-index token) is what keeps this sound under live graph mutation:
-/// a freed-then-reused module index cannot alias a stale binding, because
-/// the match is on the stable selector, not the volatile index. Returns
-/// `EINVAL` on bad args, `ENODEV` if no registered layer carries `sel`.
+/// `op_handle` is `-1` for an open-style op. A handle such an op mints is
+/// returned as a *routed* handle (see [`Route`]): it names the provider that
+/// minted it, so every later op on it — through this call or through plain
+/// `provider_call` — reaches that provider with the provider's own slot, no
+/// matter which layer is the default. A non-negative `op_handle` must be such
+/// a routed handle minted through the same selector for the opcode's own
+/// contract; anything else is
+/// `EBADF`, because a handle another provider minted means nothing here.
+///
+/// Resolving by selector (rather than by a cached module-index token) is what
+/// keeps this sound under live graph mutation: a freed-then-reused module
+/// index cannot alias a stale binding. Returns `EINVAL` on bad args, `ENODEV`
+/// if nothing carries `sel`.
 ///
 /// # Safety
 /// `sel` must point to `sel_len` readable bytes; `arg` must satisfy the
@@ -1420,8 +1477,8 @@ pub unsafe fn provider_call_sel(
     if sel.is_null() || sel_len == 0 {
         return errno::EINVAL;
     }
-    let contract = ((opcode >> 8) & 0xFF) as usize;
-    if contract >= MAX_PROVIDERS {
+    let contract = ((opcode >> 8) & 0xFF) as u16;
+    if contract as usize >= MAX_PROVIDERS {
         return errno::EINVAL;
     }
     // SAFETY: caller guarantees `sel[..sel_len]` is readable.
@@ -1429,21 +1486,431 @@ pub unsafe fn provider_call_sel(
     // Never 0: `hash` nudges a zero result to 1 precisely so a real name can
     // never alias the "unkeyed default" sentinel.
     let want = crate::abi::kernel_abi::provider_selector::hash(bytes);
-    // SAFETY: PROVIDERS is mutated only on the scheduler thread.
-    unsafe {
-        let entry = &PROVIDERS[contract];
-        for i in 0..entry.depth as usize {
-            if let Some(ref layer) = entry.chain[i] {
-                if layer.selector == want {
-                    let result = in_provider_frame(layer.module_idx as usize, || {
-                        (layer.dispatch)(layer.state, op_handle, opcode, arg, arg_len)
-                    });
-                    return result;
+
+    if op_handle >= 0 {
+        return match route_lookup(op_handle) {
+            RouteLookup::Live(idx) => {
+                let r = route_at(idx);
+                if r.selector != want || r.contract != contract {
+                    log::warn!(
+                        "[provider] call_sel: handle {op_handle:#x} belongs to contract \
+                         0x{:04x} selector 0x{:08x}, not contract 0x{contract:04x} selector \
+                         0x{want:08x}",
+                        r.contract,
+                        r.selector
+                    );
+                    return EBADF;
                 }
+                // SAFETY: forwarded caller contract.
+                unsafe { call_route(idx, opcode, arg, arg_len) }
+            }
+            RouteLookup::Stale => EBADF,
+            RouteLookup::NotRouted if is_module_providable(contract) => EBADF,
+            // Kernel-only contracts are never routed: no module can stand in
+            // front of them, so their handles already belong to the platform.
+            RouteLookup::NotRouted => match target_of(contract, want) {
+                // SAFETY: forwarded caller contract.
+                Some(t) => unsafe { call_target(contract, t, op_handle, opcode, arg, arg_len) },
+                None => errno::ENODEV,
+            },
+        };
+    }
+
+    let Some(target) = target_of(contract, want) else {
+        return errno::ENODEV;
+    };
+    // SAFETY: forwarded caller contract.
+    let rc = unsafe { call_target(contract, target, -1, opcode, arg, arg_len) };
+    mint_route(contract, want, target, rc)
+}
+
+// ── Routed handles ───────────────────────────────────────────────────────────
+//
+// A handle a provider mints is a slot in THAT provider's table. Two providers
+// of one contract hand out colliding slots (every fs provider starts at slot 0),
+// and handle-bound ops carry no contract beyond the handle's tag, so a
+// provider-local handle names its owner only as long as that owner is the one
+// layer the tag resolves to — the default. A handle minted through a selector
+// (a keyed volume, or the platform beneath a graph-local default) does not
+// satisfy that, so the kernel mints a routed handle in its place: same contract
+// tag, a slot in this table, and the table records which provider owns it and
+// what the provider called it. Every later op on the routed handle, through
+// either `provider_call` or `provider_call_sel`, is delivered to that owner
+// with its own slot. `mount` needs exactly this for its backends and uses the
+// same mechanism, so there is one owner rule for every non-default handle.
+
+/// `EBADF`: a handle this call cannot use — minted by another provider, or
+/// closed. Module-local here as in `mount`: the stable errno table has no
+/// entry for it.
+const EBADF: i32 = -9;
+
+/// Selector name reserved for the platform's own provider of a contract. A
+/// module may not register it (refused in `register_module_provider`, and by
+/// the config validator before that).
+pub const PLATFORM_SELECTOR_NAME: &[u8] = b"platform";
+/// The selector [`PLATFORM_SELECTOR_NAME`] hashes to.
+pub const PLATFORM_SELECTOR: u32 =
+    crate::abi::kernel_abi::provider_selector::hash(PLATFORM_SELECTOR_NAME);
+
+/// Slot bit marking a routed handle. Providers mint small slots (their table
+/// indices); the kernel owns this bit of the 26-bit slot field.
+const ROUTED_SLOT_BIT: i32 = 1 << 25;
+/// Slot bits carrying the route index; the bits above it (below
+/// [`ROUTED_SLOT_BIT`]) carry the entry's generation, so a handle kept past
+/// its close does not resolve onto whatever reused the entry.
+const ROUTE_IDX_BITS: u32 = 8;
+const ROUTE_IDX_MASK: i32 = (1 << ROUTE_IDX_BITS) - 1;
+const ROUTE_GEN_MASK: u16 = 0xFFFF;
+
+/// Routed handles live at once. Sized per target like the chain depth: one
+/// per file a sel-minted consumer holds open (`mount` holds one per open
+/// file on a keyed volume).
+#[cfg(feature = "chip-rp2040")]
+const MAX_ROUTES: usize = 16;
+#[cfg(all(feature = "rp", not(feature = "chip-rp2040")))]
+const MAX_ROUTES: usize = 32;
+#[cfg(not(feature = "rp"))]
+const MAX_ROUTES: usize = 128;
+const _: () = assert!(MAX_ROUTES <= 1 << ROUTE_IDX_BITS);
+
+/// `module_idx` of a route whose owner is the platform provider.
+const ROUTE_PLATFORM: u8 = u8::MAX;
+
+/// Which provider serves a selector.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Target {
+    Platform,
+    Module(u8),
+}
+
+/// One routed handle.
+#[derive(Clone, Copy)]
+struct Route {
+    in_use: bool,
+    contract: ContractId,
+    /// Selector the handle was minted through ([`PLATFORM_SELECTOR`] for the
+    /// platform).
+    selector: u32,
+    /// Owning layer's module index, or [`ROUTE_PLATFORM`].
+    module_idx: u8,
+    /// Module that was running when the handle was minted: its handles are
+    /// closed when it is released.
+    minter: u8,
+    generation: u16,
+    /// The handle as the owning provider minted it.
+    inner: i32,
+}
+
+impl Route {
+    const EMPTY: Self = Self {
+        in_use: false,
+        contract: 0,
+        selector: 0,
+        module_idx: 0,
+        minter: 0,
+        generation: 0,
+        inner: -1,
+    };
+
+    fn target(&self) -> Target {
+        if self.module_idx == ROUTE_PLATFORM {
+            Target::Platform
+        } else {
+            Target::Module(self.module_idx)
+        }
+    }
+}
+
+static mut ROUTES: [Route; MAX_ROUTES] = [Route::EMPTY; MAX_ROUTES];
+
+/// A copy of route `idx`, so no borrow of the table spans a call into a
+/// provider.
+fn route_at(idx: usize) -> Route {
+    // SAFETY: scheduler-thread read; `idx < MAX_ROUTES` at every caller.
+    unsafe {
+        let p = &raw const ROUTES;
+        (*p)[idx]
+    }
+}
+
+enum RouteLookup {
+    /// Not a routed handle.
+    NotRouted,
+    /// Carries the routed bit but names no live route: closed, or its owner
+    /// is gone.
+    Stale,
+    Live(usize),
+}
+
+fn route_lookup(handle: i32) -> RouteLookup {
+    // Only handles of contracts a module can provide are ever routed; every
+    // other tag keeps its own slot space.
+    let Some(contract) = fd_tag_contract(handle) else {
+        return RouteLookup::NotRouted;
+    };
+    if !is_module_providable(contract) {
+        return RouteLookup::NotRouted;
+    }
+    let slot = fd::slot_of(handle);
+    if slot & ROUTED_SLOT_BIT == 0 {
+        return RouteLookup::NotRouted;
+    }
+    let idx = (slot & ROUTE_IDX_MASK) as usize;
+    let field = (slot & !ROUTED_SLOT_BIT) >> ROUTE_IDX_BITS;
+    // Bits above the generation are never minted: a handle carrying them
+    // names no route, not the route its low bits would alias.
+    if idx >= MAX_ROUTES || field > i32::from(ROUTE_GEN_MASK) {
+        return RouteLookup::Stale;
+    }
+    let generation = field as u16;
+    let r = route_at(idx);
+    if r.in_use && r.generation == generation && r.contract == contract {
+        RouteLookup::Live(idx)
+    } else {
+        RouteLookup::Stale
+    }
+}
+
+/// The provider `selector` names for `contract`, if any.
+fn target_of(contract: ContractId, selector: u32) -> Option<Target> {
+    // SAFETY: scheduler-thread read; `contract < MAX_PROVIDERS` checked by
+    // every caller.
+    let entry = unsafe {
+        let p = &raw const PROVIDERS;
+        &(*p)[contract as usize]
+    };
+    if selector == PLATFORM_SELECTOR {
+        return entry.kernel_dispatch.map(|_| Target::Platform);
+    }
+    for i in 0..entry.depth as usize {
+        if let Some(ref layer) = entry.chain[i] {
+            if layer.selector == selector {
+                return Some(Target::Module(layer.module_idx));
             }
         }
     }
-    errno::ENODEV
+    None
+}
+
+/// Deliver one op to `target`. `ENODEV` when the target has gone.
+///
+/// # Safety
+/// `arg` must satisfy the target's requirements for `opcode`.
+unsafe fn call_target(
+    contract: ContractId,
+    target: Target,
+    handle: i32,
+    opcode: u32,
+    arg: *mut u8,
+    arg_len: usize,
+) -> i32 {
+    // SAFETY: as `target_of`.
+    let entry = unsafe {
+        let p = &raw const PROVIDERS;
+        &(*p)[contract as usize]
+    };
+    match target {
+        Target::Platform => match entry.kernel_dispatch {
+            // SAFETY: the registered kernel handler; caller's `arg` contract.
+            Some(handler) => unsafe { handler(handle, opcode, arg, arg_len) },
+            None => errno::ENODEV,
+        },
+        Target::Module(midx) => {
+            for i in 0..entry.depth as usize {
+                if let Some(ref layer) = entry.chain[i] {
+                    if layer.module_idx == midx {
+                        return in_provider_frame(midx as usize, || {
+                            // SAFETY: the pair the module registered.
+                            unsafe { (layer.dispatch)(layer.state, handle, opcode, arg, arg_len) }
+                        });
+                    }
+                }
+            }
+            errno::ENODEV
+        }
+    }
+}
+
+/// Turn the result of an open-style op sent through a selector into what the
+/// caller gets back: a routed handle when `rc` is a handle of `contract`,
+/// `rc` unchanged otherwise.
+///
+/// A result is a handle when it carries the contract's own fd tag — the
+/// convention every provider follows for the handles its open-style ops
+/// return (`provider_open` additionally tags a bare slot, and refuses another
+/// contract's tag). Byte counts and capability words from a `handle == -1` op
+/// never reach the tag bits.
+fn mint_route(contract: ContractId, selector: u32, target: Target, rc: i32) -> i32 {
+    if rc < 0 || !is_module_providable(contract) {
+        return rc;
+    }
+    let Some(tag) = contract_to_tag(contract) else {
+        return rc;
+    };
+    let (rc_tag, rc_slot) = fd::untag_fd(rc);
+    if rc_tag != tag || tag == 0 {
+        return rc;
+    }
+    // A provider handing back a routed handle it holds (it opened through a
+    // selector itself) passes an owner that is already recorded.
+    if rc_slot & ROUTED_SLOT_BIT != 0 {
+        return rc;
+    }
+    let minter = {
+        let m = crate::kernel::exec::scheduler::current_module_index();
+        if m < ROUTE_PLATFORM as usize {
+            m as u8
+        } else {
+            ROUTE_PLATFORM
+        }
+    };
+    // SAFETY: scheduler-thread mutation; no module code runs in this block.
+    let claimed = unsafe {
+        let p = &raw mut ROUTES;
+        let routes = &mut *p;
+        let mut claimed = None;
+        for (i, r) in routes.iter_mut().enumerate() {
+            if !r.in_use {
+                r.in_use = true;
+                r.contract = contract;
+                r.selector = selector;
+                r.module_idx = match target {
+                    Target::Platform => ROUTE_PLATFORM,
+                    Target::Module(m) => m,
+                };
+                r.minter = minter;
+                r.generation = r.generation.wrapping_add(1) & ROUTE_GEN_MASK;
+                r.inner = rc;
+                claimed = Some((i, r.generation));
+                break;
+            }
+        }
+        claimed
+    };
+    match claimed {
+        Some((idx, generation)) => {
+            let slot = ROUTED_SLOT_BIT | (i32::from(generation) << ROUTE_IDX_BITS) | idx as i32;
+            fd::tag_fd(tag, slot)
+        }
+        None => {
+            log::error!(
+                "[provider] routed-handle table exhausted (MAX_ROUTES={MAX_ROUTES}); closing \
+                 handle {rc:#x} of contract {contract:#x} rather than returning one no op \
+                 could reach"
+            );
+            if let Some(close) = vtable_for(contract).map(|v| v.default_close_op) {
+                if close != 0 {
+                    // SAFETY: close convention: null arg, zero length.
+                    unsafe {
+                        call_target(
+                            contract,
+                            target,
+                            fd::slot_of(rc),
+                            close,
+                            core::ptr::null_mut(),
+                            0,
+                        );
+                    }
+                }
+            }
+            errno::ENOMEM
+        }
+    }
+}
+
+/// Deliver `opcode` on live route `idx` to its owner with the owner's own
+/// slot, and retire the route when the op is the contract's close.
+///
+/// The slot is passed untagged, as the class-byte vtables pass every handle
+/// inward: providers index their tables with it.
+///
+/// # Safety
+/// `arg` must satisfy the owner's requirements for `opcode`.
+unsafe fn call_route(idx: usize, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
+    let r = route_at(idx);
+    let close = vtable_for(r.contract).map_or(0, |v| v.default_close_op);
+    // SAFETY: forwarded caller contract.
+    let rc = unsafe {
+        call_target(
+            r.contract,
+            r.target(),
+            fd::slot_of(r.inner),
+            opcode,
+            arg,
+            arg_len,
+        )
+    };
+    if close != 0 && opcode == close {
+        retire_route(idx, r.generation);
+    }
+    rc
+}
+
+/// Free route `idx` if it still holds `generation` (the op may have run
+/// module code that already retired it).
+fn retire_route(idx: usize, generation: u16) {
+    // SAFETY: scheduler-thread mutation.
+    unsafe {
+        let p = &raw mut ROUTES;
+        let r = &mut (*p)[idx];
+        if r.in_use && r.generation == generation {
+            r.in_use = false;
+            r.inner = -1;
+        }
+    }
+}
+
+/// Retire every route owned by, or minted by, `module_idx`. A route whose
+/// owner is gone names nothing and is dropped. A route the departing module
+/// minted on a provider that stays is closed there, so the provider does not
+/// hold the file open for a consumer that no longer exists.
+fn release_routes_of(module_idx: u8) {
+    // The platform's sentinel is not a module: nothing releases it.
+    if module_idx == ROUTE_PLATFORM {
+        return;
+    }
+    let mut to_close = [(0usize, 0u16); MAX_ROUTES];
+    let mut n = 0usize;
+    // SAFETY: scheduler-thread mutation; no module code runs in this block.
+    unsafe {
+        let p = &raw mut ROUTES;
+        let routes = &mut *p;
+        for (i, r) in routes.iter_mut().enumerate() {
+            if !r.in_use {
+                continue;
+            }
+            if r.module_idx == module_idx {
+                r.in_use = false;
+                r.inner = -1;
+            } else if r.minter == module_idx {
+                to_close[n] = (i, r.generation);
+                n += 1;
+            }
+        }
+    }
+    for &(idx, generation) in &to_close[..n] {
+        let r = route_at(idx);
+        if !r.in_use || r.generation != generation {
+            continue;
+        }
+        let close = vtable_for(r.contract).map_or(0, |v| v.default_close_op);
+        if close != 0 {
+            // SAFETY: close convention: null arg, zero length.
+            unsafe {
+                call_route(idx, close, core::ptr::null_mut(), 0);
+            }
+        }
+        retire_route(idx, generation);
+    }
+}
+
+/// Routed handles currently live. Diagnostics and tests.
+pub fn routed_handles_in_use() -> usize {
+    // SAFETY: scheduler-thread read.
+    unsafe {
+        let p = &raw const ROUTES;
+        (*p).iter().filter(|r| r.in_use).count()
+    }
 }
 
 // ── Platform-registered fd-tag routes ────────────────────────────────────────

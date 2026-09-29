@@ -20,13 +20,18 @@
 //!
 //! # Handle remapping
 //!
-//! A backend `FS_OPEN` returns `FD_TAG_FS | backend_slot`; two volumes can
-//! return the same slot, so this module allocates its OWN mount slot,
-//! records `(mount_idx, backend_handle)`, and returns `FD_TAG_FS |
-//! mount_slot` to the consumer. Later handle-bound ops (`FS_READ` /
-//! `FS_CLOSE` / …) route by tag back to this module (the default FS
-//! provider), which decodes the mount slot and forwards to the owning
-//! backend. `FS_CLOSE` frees the mount slot.
+//! A backend `FS_OPEN` sent through `provider_call_sel` comes back as a
+//! kernel-routed handle that names the backend that minted it, so the
+//! handles two volumes return never collide and each op on one reaches its
+//! own backend with the backend's own slot. The consumer still gets a handle
+//! of this module's: it allocates its OWN mount slot, records `(mount_idx,
+//! backend_handle)`, and returns `FD_TAG_FS | mount_slot`. Later
+//! handle-bound ops (`FS_READ` / `FS_CLOSE` / …) route by tag back to this
+//! module (the default FS provider), which is what lets an unmount revoke
+//! them, and forwards each to the backend. `FS_CLOSE` frees the mount slot.
+//!
+//! A mount may name `platform` as its volume: the platform's own FS provider
+//! (the host filesystem on Linux), beneath this module.
 //!
 //! # Configuration
 //!
@@ -243,10 +248,27 @@ unsafe fn parse_mounts(s: &mut MountState, d: *const u8, len: usize) {
 
 /// Mark every open handle on volume `mi` revoked, so in-flight consumers
 /// get `ENODEV`; a fresh open after re-add routes to the new backend.
+///
+/// Each backend file is closed now, while the entry still names its volume:
+/// the consumer's handle stays until its next op reports the revocation, but
+/// nothing reaches the backend through it again, so holding the backend's
+/// file (and the kernel's route to it) open until then would only leak them.
 unsafe fn revoke_volume(s: &mut MountState, mi: usize) {
-    for slot in s.opens.iter_mut() {
-        if slot.in_use && slot.mount_idx as usize == mi {
-            slot.revoked = true;
+    for i in 0..MAX_OPEN {
+        let slot = s.opens[i];
+        if slot.in_use && !slot.revoked && slot.mount_idx as usize == mi {
+            if slot.backend_handle >= 0 {
+                call_volume(
+                    s,
+                    mi,
+                    slot.backend_handle,
+                    FS_CLOSE,
+                    core::ptr::null_mut(),
+                    0,
+                );
+            }
+            s.opens[i].revoked = true;
+            s.opens[i].backend_handle = -1;
         }
     }
 }
@@ -428,7 +450,8 @@ unsafe fn rewrite_path(s: &mut MountState, mi: usize, path: *const u8, path_len:
 /// Forward one op to the backend for mount `mi`, selecting the volume by
 /// name each call. `provider_call_sel` re-resolves by selector, so there is
 /// no cached token to go stale under live graph mutation. `op_handle` is
-/// the backend's OWN handle (`-1` for open-style ops).
+/// `-1` for open-style ops, or the routed handle this volume's open returned;
+/// the kernel refuses one minted through any other selector.
 unsafe fn call_volume(
     s: &mut MountState,
     mi: usize,

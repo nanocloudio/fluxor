@@ -201,4 +201,3 @@ pub fn synthesize_from_graph(graph_path: &Path) -> Result<Option<Scenario>> {
         sequential: block.sequential,
     }))
 }
-

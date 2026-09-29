@@ -72,6 +72,33 @@ fn edge_port_key(edge: &Edge, direction: FanDirection) -> u8 {
     }
 }
 
+/// Whether the out-edges `group` of `module_idx` reach exactly the modules
+/// that feed its data input, each once.
+fn fan_pairs_with_inputs(
+    edges: &[Edge; MAX_CHANNELS],
+    edge_count: usize,
+    module_idx: usize,
+    group: &[usize],
+) -> bool {
+    let feeds = |m: usize| {
+        edges
+            .iter()
+            .take(edge_count)
+            .any(|e| e.from_module == m && e.to_module == module_idx && !e.is_ctrl())
+    };
+    for (k, &ei) in group.iter().enumerate() {
+        let c = edges[ei].to_module;
+        if !feeds(c) || group[..k].iter().any(|&ej| edges[ej].to_module == c) {
+            return false;
+        }
+    }
+    edges.iter().take(edge_count).all(|e| {
+        e.to_module != module_idx
+            || e.is_ctrl()
+            || group.iter().any(|&ei| edges[ei].to_module == e.from_module)
+    })
+}
+
 /// Check if an edge connects to `module_idx` in the given direction.
 fn edge_matches_module(edge: &Edge, module_idx: usize, direction: FanDirection) -> bool {
     match direction {
@@ -144,6 +171,21 @@ fn insert_fan(
 
             if group_count <= 1 {
                 continue;
+            }
+
+            // A multi-outbound producer keeps one channel per edge when the
+            // consumers it fans out to are exactly the modules that produce
+            // into it: each reads only the events of what it asked for.
+            if direction == FanDirection::Out {
+                let producer_hash = module_list[module_idx]
+                    .as_ref()
+                    .map(|e| e.name_hash)
+                    .unwrap_or(0);
+                if is_multi_outbound(producer_hash)
+                    && fan_pairs_with_inputs(edges, *edge_count, module_idx, &group[..group_count])
+                {
+                    continue;
+                }
             }
 
             // Multi-inbound consumers keep one channel per edge (priority
@@ -543,6 +585,7 @@ pub fn instantiate_one_module(
     unsafe {
         let p = &raw mut SCHED;
         let sched = &mut *p;
+        sched.type_hash[instantiated] = entry.name_hash;
         sched.cap_class[instantiated] = match found_module.header.module_type {
             5 => 3, // Protocol → CAP_FULL
             3 => 1, // Sink → CAP_SERVICE_PIO
@@ -613,35 +656,35 @@ pub fn instantiate_one_module(
         }
     }
 
-    // Full instantiation via start_new.
-    // Set current module index so any syscall made from inside
-    // module_new() can identify the calling module (state pointer,
-    // heap, required_caps, loader-driven provider registration).
-    set_current_module(instantiated);
-    // SAFETY: PARAM_BUFFER lives for the duration of start_new; the
-    // pointer's lifetime is bounded by this scope.
-    let result = unsafe {
-        let pb = core::ptr::addr_of!(PARAM_BUFFER);
-        DynamicModule::start_new(
-            &found_module,
-            syscalls,
-            crate::kernel::module::loader::ChannelHandles {
-                in_chan,
-                out_chan,
-                ctrl_chan,
-            },
-            crate::kernel::module::loader::ParamSlice {
-                ptr: (*pb).as_ptr(),
-                len: (*pb).len(),
-            },
-            static_name,
-        )
-    };
-    clear_instantiation_state();
-    // module_new returned — drop module context (see step_one_module):
-    // result-handling logs below are platform logs, owner-attributed to
-    // the system, not to the module just instantiated.
-    set_current_module(MAX_MODULES);
+    // Full instantiation via start_new, as the new module: any syscall made
+    // from inside module_new() identifies it (state pointer, heap,
+    // required_caps, loader-driven provider registration). Afterwards the
+    // context is the caller's again — a module staging a subgraph from its
+    // own syscall, or no module at boot — so result-handling logs are never
+    // the new module's.
+    let result = with_module_context(instantiated, || {
+        // SAFETY: PARAM_BUFFER lives for the duration of start_new; the
+        // pointer's lifetime is bounded by this scope.
+        let r = unsafe {
+            let pb = core::ptr::addr_of!(PARAM_BUFFER);
+            DynamicModule::start_new(
+                &found_module,
+                syscalls,
+                crate::kernel::module::loader::ChannelHandles {
+                    in_chan,
+                    out_chan,
+                    ctrl_chan,
+                },
+                crate::kernel::module::loader::ParamSlice {
+                    ptr: (*pb).as_ptr(),
+                    len: (*pb).len(),
+                },
+                static_name,
+            )
+        };
+        clear_instantiation_state();
+        r
+    });
 
     match result {
         Ok(StartNewResult::Ready(dynamic)) => {

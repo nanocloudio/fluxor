@@ -22,12 +22,12 @@ const WRITE_CHUNK: usize = 1024;
 // Param TLV tags come from the module's `manifest.toml` `[[params]]` table,
 // generated into `builtin_param_tags`. `scale_mode` selects fit=0, stretch=1.
 #[cfg(feature = "host-image")]
+use fluxor::platform::builtin_param_tags::host_image_codec as image_codec_tags;
+#[cfg(feature = "host-image")]
 use fluxor::platform::builtin_param_tags::host_image_codec::{
     TAG_HEIGHT as IMG_TAG_HEIGHT, TAG_MAX_BYTES as IMG_TAG_MAX_BYTES,
     TAG_SCALE_MODE as IMG_TAG_SCALE_MODE, TAG_WIDTH as IMG_TAG_WIDTH,
 };
-#[cfg(feature = "host-image")]
-use fluxor::platform::builtin_param_tags::host_image_codec as image_codec_tags;
 
 #[cfg(feature = "host-image")]
 const IMG_SCALE_MODE_FIT: u8 = 0;
@@ -88,8 +88,7 @@ fn decode_to_rgb565(
     use image::imageops::FilterType;
     use image::GenericImageView;
 
-    let img = image::load_from_memory(encoded)
-        .map_err(|e| format!("decode failed: {}", e))?;
+    let img = image::load_from_memory(encoded).map_err(|e| format!("decode failed: {}", e))?;
     let (src_w, src_h) = img.dimensions();
     log::info!(
         "[host_image] decoded {}x{} → resizing to {}x{} ({:?})",
@@ -153,11 +152,7 @@ fn host_image_step(state: *mut u8) -> i32 {
     while st.pending_pos < st.pending.len() {
         let take = (st.pending.len() - st.pending_pos).min(WRITE_CHUNK);
         let w = unsafe {
-            channel::channel_write(
-                st.out_chan,
-                st.pending.as_ptr().add(st.pending_pos),
-                take,
-            )
+            channel::channel_write(st.out_chan, st.pending.as_ptr().add(st.pending_pos), take)
         };
         if w > 0 {
             st.pending_pos += w as usize;
@@ -211,10 +206,7 @@ fn host_image_step(state: *mut u8) -> i32 {
     }
 
     // EOF reached — decode, resize, queue all output bytes for write.
-    log::info!(
-        "[host_image] eof — decoding {} bytes",
-        st.encoded.len()
-    );
+    log::info!("[host_image] eof — decoding {} bytes", st.encoded.len());
     let frame = match decode_to_rgb565(&st.encoded, st.width, st.height, st.scale_mode) {
         Ok(f) => f,
         Err(e) => {

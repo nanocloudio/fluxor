@@ -114,12 +114,32 @@ struct WorkloadSlot {
     /// took one. Retained at CREATE so DESTROY/KILL can emit the matching
     /// `ADDR_DEL` (§3.3).
     net_addr: [u8; 16],
+    /// The creating module's lanes into the subgraph (`wl::LANES`).
+    lanes: [CallerLane; wl::MAX_CALLER_LANES],
+    lane_count: u8,
 }
+
+/// One key of the creator's lanes: the channel it reads (the subgraph's edge
+/// into it) and the one it writes (its edge into the subgraph), -1 if absent.
+#[derive(Clone, Copy)]
+struct CallerLane {
+    key: u8,
+    to_caller: i32,
+    from_caller: i32,
+}
+
+const NO_LANE: CallerLane = CallerLane {
+    key: 0,
+    to_caller: -1,
+    from_caller: -1,
+};
 
 const WL_EMPTY: WorkloadSlot = WorkloadSlot {
     in_use: false,
     owner: OWNER_SYSTEM,
     net_addr: [0u8; 16],
+    lanes: [NO_LANE; wl::MAX_CALLER_LANES],
+    lane_count: 0,
 };
 
 const MAX_WORKLOADS: usize = MAX_OWNERS;
@@ -388,12 +408,25 @@ unsafe fn workload_create(arg: *mut u8, arg_len: usize) -> i32 {
     //    A host-shared workload carries no sentinel and takes the plain path,
     //    byte-identical.
     let src_ptr = arg.add(src_start);
+    // The creator's own lanes (FLXA `Caller` edges) are found before the add,
+    // which overwrites the blob's head; each lands at the edge count before
+    // the add plus its position.
+    let mut caller_edges = [live::CallerEdge::default(); wl::MAX_CALLER_LANES * 2];
+    let Some(caller_edge_count) = live::caller_edges(
+        core::slice::from_raw_parts(src_ptr, source_ref_len),
+        &mut caller_edges,
+    ) else {
+        return errno::EINVAL;
+    };
+    let edge_base = scheduler::sched_mut().edge_count;
+    live::set_caller(Some(scheduler::current_module_index()));
     let rc = if wants_identity {
         let spare_lane = provider_net_in_spare_lane();
         live::apply_add_encoded_spare_lane(src_ptr, source_ref_len, spare_lane)
     } else {
         live::apply_add_encoded(src_ptr, source_ref_len)
     };
+    live::set_caller(None);
     if rc != 0 {
         return rc; // negative AddError::code, -ENOMEM (no spare lane), or -EINVAL
     }
@@ -451,12 +484,37 @@ unsafe fn workload_create(arg: *mut u8, arg_len: usize) -> i32 {
             return errno::ENOMEM;
         }
     };
+    let mut lanes = [NO_LANE; wl::MAX_CALLER_LANES];
+    let mut lane_count = 0usize;
+    for ce in caller_edges.iter().take(caller_edge_count) {
+        let ch = scheduler::sched_mut().edges[edge_base + ce.index].channel;
+        let at = match lanes[..lane_count].iter().position(|l| l.key == ce.key) {
+            Some(at) => at,
+            None if lane_count < wl::MAX_CALLER_LANES => {
+                lanes[lane_count].key = ce.key;
+                lane_count += 1;
+                lane_count - 1
+            }
+            None => {
+                remove_identity(&net_addr);
+                let _ = live::free_owner(owner);
+                return errno::ENOMEM;
+            }
+        };
+        if ce.into_caller {
+            lanes[at].to_caller = ch;
+        } else {
+            lanes[at].from_caller = ch;
+        }
+    }
     slots[widx] = WorkloadSlot {
         in_use: true,
         owner,
         // Only an installed identity is remembered for the DESTROY-time
         // ADDR_DEL; a host-shared workload stores a zero address (no-op DEL).
         net_addr: if wants_identity { net_addr } else { [0u8; 16] },
+        lanes,
+        lane_count: lane_count as u8,
     };
     tag_fd(FD_TAG_WORKLOAD, widx as i32)
 }
@@ -618,11 +676,38 @@ pub unsafe fn workload_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
                     let slots = &mut *core::ptr::addr_of_mut!(FMOD_WORKLOADS);
                     remove_identity(&slots[raw as usize].net_addr);
                     slots[raw as usize].net_addr = [0u8; 16];
+                    // The lanes' channels close with the owner; the ids must
+                    // not outlive them, or LANES would name channels another
+                    // owner may be given.
+                    slots[raw as usize].lanes = [NO_LANE; wl::MAX_CALLER_LANES];
+                    slots[raw as usize].lane_count = 0;
                     let _ = live::free_owner(owner);
                     0
                 }
                 _ => errno::ENOSYS, // portable subset only
             }
+        }
+        wl::LANES => {
+            // An owner that has gone (drained out, torn down elsewhere) took
+            // its channels with it.
+            if scheduler::owners_mut().lookup(owner).is_none() {
+                return errno::EINVAL;
+            }
+            let slot = &(*core::ptr::addr_of!(FMOD_WORKLOADS))[raw as usize];
+            let n = slot.lane_count as usize;
+            let need = 1 + n * 9;
+            if arg.is_null() || arg_len < need {
+                return errno::EINVAL;
+            }
+            let out = core::slice::from_raw_parts_mut(arg, need);
+            out[0] = n as u8;
+            for (i, l) in slot.lanes.iter().take(n).enumerate() {
+                let o = 1 + i * 9;
+                out[o] = l.key;
+                out[o + 1..o + 5].copy_from_slice(&l.to_caller.to_le_bytes());
+                out[o + 5..o + 9].copy_from_slice(&l.from_caller.to_le_bytes());
+            }
+            need as i32
         }
         wl::DESTROY => {
             // Remove the net identity (§3.3 — ADDR_DEL) before freeing the

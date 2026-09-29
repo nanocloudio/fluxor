@@ -283,11 +283,14 @@ routes through the `provider_*` entries:
   contract's vtable. For handle=-1 global operations and untracked
   handles, the opcode's high byte carries the contract id and
   dispatch routes directly through the class chain.
-- `provider_call_sel(sel, sel_len, op_handle, op, arg, len)` calls an
-  instance-keyed provider selected by a short selector string (for
-  example a volume name on the storage surface). The contract is the
-  opcode's class byte; `op_handle` carries the op's own handle (`-1`
-  for open-style ops) and `sel` is purely routing.
+- `provider_call_sel(sel, sel_len, op_handle, op, arg, len)` calls the
+  provider a short selector string names: an instance-keyed layer (for
+  example a volume name on the storage surface), or, for the reserved
+  name `platform`, the platform's own provider beneath every module
+  layer. The contract is the opcode's class byte. `op_handle` is `-1`
+  for open-style ops; a handle one mints is returned routed, so later
+  ops on it — here or through `provider_call` — reach the provider that
+  minted it, and a handle minted elsewhere is refused (`EBADF`).
 - `provider_query(handle, key, out, len)` reads introspection state.
 - `provider_close(handle)` invokes the contract's default close
   opcode (if any) and releases the tracking entry.

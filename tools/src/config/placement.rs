@@ -207,7 +207,10 @@ mod placement_tests {
             "wiring": [{"from": "a.out", "to": "b.in"}]});
         lift_remote_members(&mut cfg).unwrap();
         let e = refuse_wiring_to_remote(&cfg).unwrap_err();
-        assert!(format!("{e:?}").contains("placed on node `bench`"), "got: {e:?}");
+        assert!(
+            format!("{e:?}").contains("placed on node `bench`"),
+            "got: {e:?}"
+        );
         let cfg = json!({"modules": [{"name": "a"}], "wiring": [{"from": "a.out", "to": "a.in"}]});
         refuse_wiring_to_remote(&cfg).unwrap();
     }

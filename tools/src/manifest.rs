@@ -127,7 +127,7 @@ pub const CONTRACT_ID_SPACE: usize = 64;
 /// Positions consumed in the `required_caps` space, counting the four
 /// reserved ids and excluding the kernel-internal dispatch bucket (0x0C).
 /// Registered in `docs/architecture/limit_register.md`.
-pub const CONTRACT_ID_POSITIONS_ASSIGNED: usize = 30;
+pub const CONTRACT_ID_POSITIONS_ASSIGNED: usize = 31;
 
 /// Parse a contract name from `[[resources]].requires_contract`. Only
 /// public contract names are accepted here — `"internal"` and specific
@@ -184,6 +184,9 @@ pub fn contract_id_from_name(s: &str) -> Result<u8> {
         // this contract lets it do: no anchors cross it.
         "trust" => Ok(0x1D),
         "net_policy" => Ok(0x1E),
+        // Host mounts of block devices under the operator's mount root.
+        // Host-linux; also requires the platform_raw permission.
+        "host_mount" => Ok(0x1F),
         // Anything that looks like a permission name is a manifest
         // schema error — those go in `permissions = [...]`, not
         // `[[resources]]`.
@@ -197,7 +200,7 @@ pub fn contract_id_from_name(s: &str) -> Result<u8> {
             "unknown contract name: {s} — expected one of: gpio, spi, i2c, pio, \
              uart, adc, pwm, fs, storage.namespace, storage.object, usb_host, \
              platform_nic_ring, platform_dma, platform_dma_fd, \
-             pcie_device, trust (see docs/architecture/abi_layers.md)"
+             pcie_device, trust, host_mount (see docs/architecture/abi_layers.md)"
         ))),
     }
 }
@@ -281,6 +284,20 @@ fn canonical_capability(name: &str, field: &str) -> Result<String> {
             )))
         }
     }
+}
+
+/// Canonicalise a port's `requires_capability`: a capability, or a provided
+/// surface (`PROVIDER_SURFACES`) such as `storage.block`, which a port can
+/// require of the module on its edge just as it can a capability.
+fn canonical_port_requirement(name: &str) -> Result<String> {
+    use fluxor_contracts::vocabulary::PROVIDER_SURFACES;
+    if let Some(surface) = PROVIDER_SURFACES
+        .iter()
+        .find(|n| n.eq_ignore_ascii_case(name))
+    {
+        return Ok((*surface).to_string());
+    }
+    canonical_capability(name, "requires_capability")
 }
 
 /// Facts keyed by capability, then fact name, each value as written: one
@@ -2144,7 +2161,7 @@ impl Manifest {
                     None => None,
                 },
                 requires_capability: match &p.requires_capability {
-                    Some(c) => Some(canonical_capability(c, "requires_capability")?),
+                    Some(c) => Some(canonical_port_requirement(c)?),
                     None => None,
                 },
                 facts,

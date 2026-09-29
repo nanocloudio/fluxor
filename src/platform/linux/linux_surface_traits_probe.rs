@@ -53,10 +53,7 @@ fn build_linux_surface_traits_probe(module_idx: usize) -> scheduler::BuiltInModu
         "linux_surface_traits_probe",
         linux_surface_traits_probe_step,
     );
-    install_state(
-        &mut m,
-        Box::new(LinuxSurfaceTraitsProbeState { in_chan }),
-    );
+    install_state(&mut m, Box::new(LinuxSurfaceTraitsProbeState { in_chan }));
     log::info!("[inst] module {module_idx} = linux_surface_traits_probe (built-in, demo consumer; in_chan={in_chan})");
     m
 }

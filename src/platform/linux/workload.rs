@@ -227,11 +227,10 @@ unsafe fn workload_create(arg: *const u8, arg_len: usize) -> i32 {
         return errno::EINVAL;
     }
 
-    // Backend selection is by source kind (placement routes fmod-graph to a
-    // metal node; a bundle to a Linux node). Only the host-process backend
-    // exists here.
+    // An fmod graph went to the module-graph backend in the dispatch; any
+    // other kind this backend does not run.
     if source_kind != hp::SOURCE_HOST_PROCESS {
-        return errno::ENOSYS; // fmod-graph → MPU/EL0 backend, not on Linux
+        return errno::ENOSYS;
     }
     if !host_backend_honors_posture(posture) {
         return errno::ENOSYS; // e.g. HARDENED before seccomp/caps land
@@ -405,8 +404,18 @@ fn portable_signo(signo: u32) -> Option<u8> {
     }
 }
 
+/// First slot of the module-graph backend's handles. A workload whose source
+/// is an fmod graph is staged into this runtime's own live graph by the
+/// kernel's module-graph backend, the one bare metal runs; its slots are
+/// offset here so they never collide with the host-process backend's.
+const GRAPH_SLOT_BASE: i32 = 0x1000;
+
 /// `workload` provider dispatch. CREATE is `handle = -1`; lifecycle ops carry
 /// the `FD_TAG_WORKLOAD` handle (stripped to a slot by `slot_of`).
+///
+/// Two backends answer, chosen by the CREATE's source kind: a host-process
+/// bundle runs as an isolated host process, and an fmod graph is staged into
+/// the live graph by `kernel::workload::workload_graph`.
 /// # Safety
 /// Single-threaded platform dispatch only: touches `static mut` provider
 /// state without synchronization. `arg` must be null or valid for reads
@@ -420,7 +429,17 @@ pub unsafe fn linux_workload_dispatch(
     use crate::kernel::ipc::fd::slot_of;
     use crate::kernel::sys::errno;
 
+    use crate::kernel::ipc::fd::{tag_fd, FD_TAG_WORKLOAD};
+    use crate::kernel::workload::workload_graph;
+
     if opcode == wl::CREATE {
+        if !arg.is_null() && arg_len > 17 && *arg.add(17) == wl::SOURCE_FMOD_GRAPH {
+            let rc = workload_graph::workload_dispatch(-1, opcode, arg, arg_len);
+            if rc < 0 {
+                return rc;
+            }
+            return tag_fd(FD_TAG_WORKLOAD, GRAPH_SLOT_BASE + slot_of(rc));
+        }
         return workload_create(arg as *const u8, arg_len);
     }
     if opcode == wl::CAPS {
@@ -428,6 +447,10 @@ pub unsafe fn linux_workload_dispatch(
     }
 
     let raw = slot_of(handle);
+    if raw >= GRAPH_SLOT_BASE {
+        let inner = tag_fd(FD_TAG_WORKLOAD, raw - GRAPH_SLOT_BASE);
+        return workload_graph::workload_dispatch(inner, opcode, arg, arg_len);
+    }
     let Some(bidx) = workload_backend_idx(raw) else {
         return errno::EINVAL;
     };
@@ -468,12 +491,14 @@ unsafe fn workload_caps(arg: *mut u8, arg_len: usize) -> i32 {
     }
     let out = core::slice::from_raw_parts_mut(arg, arg_len);
     out[0] = wl::caps::POSTURE_SHARED | wl::caps::POSTURE_ISOLATED;
-    out[1] = hp::CAPS_SOURCE_HOST_PROCESS;
+    // Both backends: a host-process bundle, and an fmod graph staged into
+    // the live graph. Each refuses at CREATE what it cannot honour.
+    out[1] = hp::CAPS_SOURCE_HOST_PROCESS | wl::caps::SOURCE_FMOD_GRAPH;
     // Implemented optional ops: READ + EXEC + the TTY set + real-signal SIGNAL
     // delivery (process-group). PAUSE is
     // advertised iff the host can freeze at all (cgroup2 present); a workload
     // whose own cgroup setup failed still gets per-workload ENOSYS.
-    // READ/EXEC/TTY retired to the 0x1B host-process class (D-WORKLOAD-ABI).
+    // READ/EXEC/TTY are the host-process class's ops, not this contract's.
     let mut ops = wl::caps::SIGNAL;
     if host_backend_can_freeze() {
         ops |= wl::caps::PAUSE;
@@ -509,8 +534,8 @@ pub fn linux_workload_close_owner(owner: OwnerHandle) {
     }
 }
 
-/// Host-process (0x1B) provider dispatch — the linux host mechanics evicted
-/// from the stable 0x1A surface (D-WORKLOAD-ABI). Every op is a `handle = -1`
+/// Host-process (0x1B) provider dispatch — the linux host mechanics that sit
+/// beside the stable 0x1A workload surface. Every op is a `handle = -1`
 /// call; workload-targeting ops carry the tagged workload fd in the leading
 /// 4 bytes of `arg` (LE), TTY session ops carry the session id as before.
 ///

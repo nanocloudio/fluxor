@@ -35,13 +35,7 @@ include!("../../sdk/runtime/params.rs");
 
 use abi::contracts::net::identity as netid;
 
-/// Host process-executor opcodes (class `host_process::PROC_CLASS`).
-/// `PROC_STATUS` answers `1` while the command runs and `0` once it is
-/// done, writing its exit code into the caller's buffer.
-const PROC_SPAWN: u32 = 0x1600;
-const PROC_READ: u32 = 0x1601;
-const PROC_STATUS: u32 = 0x1602;
-const PROC_CLOSE: u32 = 0x1603;
+use abi::platform::linux::host_process::{PROC_CLOSE, PROC_READ, PROC_SPAWN, PROC_STATUS};
 
 /// Longest actuator command line.
 const CMD_MAX: usize = 96;

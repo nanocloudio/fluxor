@@ -30,11 +30,12 @@
 //
 // `target_feature = "aes"` is set for the bcm2712 module build
 // (`tools/src/modules_build.rs` appends `-C
-// target-feature=+aes,+sha2,+neon`) and for the aarch64 kernel builds,
-// which do not compile this file. Every other build — the host test
-// harness including on aarch64 hosts, wasm32, rp2040, rp2350 — compiles
-// the scalar path, because rustc does not infer the build host's CPU
-// features without `-C target-cpu=native`.
+// target-feature=+aes,+sha2,+neon`) and for every build for
+// `aarch64-unknown-linux-gnu` (`.cargo/config.toml` carries the same
+// flags): the Linux host's kernel, the CLI and the host test harness. Every
+// other build — x86-64 hosts, wasm32, rp2040, rp2350 — compiles the scalar
+// path, because rustc does not infer the build host's CPU features without
+// `-C target-cpu=native`.
 //
 // Callers that need a portable AEAD with no key-dependent memory
 // addressing and no key-dependent branches should select
@@ -155,13 +156,9 @@ impl AesKey {
                 rk[i][3] = SBOX[prev[12] as usize] ^ prev2[3];
                 rcon_idx += 1;
             } else {
-                // AES-256 odd-index step: SubWord applied to the LAST
-                // word of the previous round key (W[i-1] in FIPS-197
-                // notation), i.e. `prev[12..15]` not `prev[0..3]`.
-                // Caught by NIST GCM Test Case 13/14 — the previous
-                // code was operating on W[i-4] which silently produced
-                // a wrong key schedule with no other test ever
-                // exercising it.
+                // AES-256 odd-index step: SubWord (no RotWord, no RCON)
+                // applied to the LAST word of the previous round key
+                // (W[i-1] in FIPS-197 notation), i.e. `prev[12..16]`.
                 rk[i][0] = SBOX[prev[12] as usize] ^ prev2[0];
                 rk[i][1] = SBOX[prev[13] as usize] ^ prev2[1];
                 rk[i][2] = SBOX[prev[14] as usize] ^ prev2[2];
@@ -184,31 +181,31 @@ impl AesKey {
     fn encrypt_block(&self, block: &mut [u8; 16]) {
         // ARMv8 Cryptography Extension fast path. Gated on
         // `target_feature = "aes"` (not just `target_arch =
-        // "aarch64"`) — bare ARMv8-A without the +crypto extension
-        // SIGILLs on AESE/AESMC. Cortex-A76 (Pi 5, our pi5 build)
-        // and every Pi-class A-core ships +crypto; the gate keeps
-        // QEMU-unknown / older Cortex-A53 hosts honest.
+        // "aarch64"`): ARMv8-A without the extension SIGILLs on
+        // AESE/AESMC, and the extension is optional (the Cortex-A76 of
+        // the bcm2712 has it).
         //
-        // The feature is set for every build of this file on an aarch64 host:
+        // The feature is set for every aarch64 build of this file:
         // `.cargo/config.toml` carries `-C target-feature=+aes,+sha2,+neon`
         // for `aarch64-unknown-linux-gnu`, and the bcm2712 PIC module build
         // passes the same flags. That includes the host test harness, so the
-        // KATs cover this path — what bcm2712 ships — and not the scalar one.
-        // wasm32, rp2040 and rp2350 take the scalar path, with the S-box
-        // cache-timing exposure documented at the top of this file; nothing
-        // on an aarch64 host exercises it.
+        // KATs cover this path, which is what bcm2712 ships. wasm32, rp2040,
+        // rp2350 and x86-64 hosts take the scalar path, with the S-box
+        // cache-timing exposure documented at the top of this file; the
+        // aarch64 harness does not exercise it.
         //
         // No `return` here: the two arms are mutually exclusive by cfg, so
         // the scalar block below is absent whenever this one is present.
         #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+        // SAFETY: compiled only where the AES extension exists (the cfg
+        // above), and the routine reads `rounds + 1` round keys out of the
+        // 15 the schedule holds and one 16-byte block, both borrowed here.
         unsafe {
             encrypt_block_aarch64_aes(block, &self.round_keys, self.rounds);
         }
         // Scalar AddRoundKey + SubBytes + ShiftRows + MixColumns +
-        // AddRoundKey loop. Byte-identical reference for KATs and
-        // the fallback used on aarch64-without-crypto, rp2350
-        // Cortex-M33, wasm32, and any host where the AES extension
-        // isn't present.
+        // AddRoundKey loop: the path of every build without the AES
+        // extension (aarch64 without it, rp2040, rp2350, wasm32, x86-64).
         #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
         {
             // AddRoundKey (initial)
@@ -545,9 +542,10 @@ pub const GCM_TAG_LEN: usize = 16;
 /// key-dependent byte. GHASH is branchless regardless, so this
 /// constant describes the block cipher only.
 ///
-/// True for exactly one build of this file: the bcm2712 PIC module
-/// build. The host test harness (including on a Pi 5), wasm32, rp2040
-/// and rp2350 are all false.
+/// True for the aarch64 builds, which carry the extension: the bcm2712
+/// PIC module build and every `aarch64-unknown-linux-gnu` build (the Linux
+/// host's kernel, the CLI, the test harness). wasm32, rp2040, rp2350 and
+/// x86-64 hosts are false.
 pub const AES_IS_CONSTANT_TIME: bool = cfg!(all(target_arch = "aarch64", target_feature = "aes"));
 
 /// Whether AES-GCM cipher suites may be offered or accepted by suite
@@ -567,14 +565,14 @@ pub const AES_IS_CONSTANT_TIME: bool = cfg!(all(target_arch = "aarch64", target_
 ///     mandatory-to-implement argument for `TLS_AES_128_GCM_SHA256`
 ///     does not bind them, and declining AES-GCM is the complete
 ///     mitigation there.
-///   - Every other target: on. On bcm2712 the block cipher is
-///     data-independent. On the Linux host it is not, and that host
-///     is the genuinely exposed target — multi-tenant, hardware data
-///     caches, possible co-resident untrusted workloads — but it is
-///     also the one target that must interoperate with arbitrary
-///     peers, and a node that cannot speak `TLS_AES_128_GCM_SHA256`
-///     is not a TLS 1.3 implementation. The default is therefore on
-///     and the exposure is accepted, not absent.
+///   - Every other target: on. On the aarch64 builds the block cipher is
+///     data-independent. A build without the extension (an x86-64 host)
+///     runs it on the secret-indexed S-box: such a host is multi-tenant
+///     with hardware data caches and possible co-resident untrusted
+///     workloads, but it must also interoperate with arbitrary peers, and a
+///     node that cannot speak `TLS_AES_128_GCM_SHA256` is not a TLS 1.3
+///     implementation. The default is therefore on and the exposure is
+///     accepted, not absent.
 pub const AES_GCM_SUITES_ENABLED: bool = !cfg!(any(target_arch = "arm", target_arch = "wasm32"));
 
 /// AES-GCM context with expanded key and H (for GHASH)
@@ -689,14 +687,10 @@ impl AesGcm {
         Self::inc_counter(&mut ctr);
         self.ctr_xor(&mut ctr, data);
 
-        // GHASH. `update` already zero-pads each call's trailing partial
-        // block up to the GCM block boundary (see GHash::update), which is
-        // exactly the padding GCM requires between AAD and ciphertext and
-        // before the length block. Do NOT add an extra explicit padding
-        // block here — that injects a spurious all-zero GHASH block for any
-        // non-16-aligned AAD/ciphertext, producing a wrong tag. (It stayed
-        // hidden because it's self-consistent encrypt↔decrypt and the only
-        // GCM KAT used empty AAD + a block-aligned plaintext.)
+        // GHASH. `update` zero-pads each call's trailing partial block up
+        // to the GCM block boundary (see GHash::update), which is exactly
+        // the padding GCM requires between AAD and ciphertext and before
+        // the length block; no further padding block is added.
         let mut ghash = GHash::new(&self.h);
         ghash.update(aad);
         ghash.update(data);
@@ -721,11 +715,8 @@ impl AesGcm {
         let mut tag_mask = ctr;
         self.aes.encrypt_block(&mut tag_mask);
 
-        // GHASH over ciphertext (before decryption). `update` already
-        // zero-pads each call's trailing partial block to the GCM block
-        // boundary, so no extra explicit padding block must be added (doing
-        // so injects a spurious all-zero GHASH block for non-16-aligned
-        // AAD/ciphertext and yields a wrong tag). Mirror `encrypt`.
+        // GHASH over the ciphertext, before decryption; padded as in
+        // `encrypt`.
         let mut ghash = GHash::new(&self.h);
         ghash.update(aad);
         ghash.update(data);

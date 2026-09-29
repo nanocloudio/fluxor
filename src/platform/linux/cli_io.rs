@@ -21,10 +21,10 @@
 // process with CLI_EXIT_CODE.
 
 use fluxor::kernel::workload::extbridge::{ExtBridge, OverloadPolicy, PushOutcome};
-use portable_atomic::AtomicI32;
-use std::sync::Arc;
 use fluxor::platform::builtin_param_tags::cli_in as cli_in_tags;
 use fluxor::platform::builtin_param_tags::cli_out as cli_out_tags;
+use portable_atomic::AtomicI32;
+use std::sync::Arc;
 
 const CLI_IN_HASH: u32 = 0x39EB09AD; // fnv1a32("cli_in")
 const CLI_OUT_HASH: u32 = 0xD0D89096; // fnv1a32("cli_out")
@@ -70,8 +70,7 @@ pub(crate) static CLI_RUN_COMPLETE: core::sync::atomic::AtomicBool =
 // stays intact (so non-interactive commands print correctly even though stdin
 // is always wired), and Ctrl-C still signals. The original termios is saved in
 // a signal-safe static and restored on the exit path (and via SIGINT/SIGTERM).
-static TERM_RAW_ACTIVE: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
+static TERM_RAW_ACTIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static mut TERM_ORIG: core::mem::MaybeUninit<libc::termios> = core::mem::MaybeUninit::uninit();
 
 /// Restore the terminal saved by `enter_raw_stdin` (idempotent; signal-safe —
@@ -204,13 +203,10 @@ fn cli_in_step(state: *mut u8) -> i32 {
                     // Undeliverable. Almost always the record is bigger than
                     // the channel, in which case no number of retries helps.
                     //
-                    // **This used to hang, silently and forever**, and the
-                    // symptom was as far from the cause as it gets: a CLI
-                    // applet whose argument grew past the channel simply
-                    // never started, with nothing in the log and no exit. A
-                    // caller sees a command that produces no output and does
-                    // not return — indistinguishable from a deadlock in the
-                    // applet itself, which is where anyone would look first.
+                    // Retrying forever would hang silently: an applet whose
+                    // argument outgrew the channel would never start, with
+                    // nothing in the log and no exit, indistinguishable from
+                    // a deadlock in the applet itself.
                     //
                     // Reported, then given up on rather than retried: the
                     // graph continues, the applet reads no argv, and an

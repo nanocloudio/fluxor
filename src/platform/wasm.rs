@@ -38,10 +38,10 @@ mod dom_input;
 // Per-class input modules (capability-surface model). Each emits one
 // of the `modules/sdk/contracts/input/*` contracts; see the matching
 // `stacks/{gamepad,pointer,keyboard}.toml` for how `platform.gamepad:
-// {}` etc. select the right producer per-target. The legacy
-// `dom_input` above multiplexes keyboard events on a single channel;
-// new graphs wire one of the per-class modules below via a
-// `platform.<class>: {}` stack reference instead.
+// {}` etc. select the right producer per-target. `dom_input` above
+// multiplexes keyboard events on a single channel; a graph that wants one
+// class wires the matching per-class module below via a
+// `platform.<class>: {}` stack reference.
 #[path = "wasm/keyboard.rs"]
 mod keyboard;
 
@@ -695,7 +695,7 @@ unsafe fn load_embedded_modules() -> usize {
         }
 
         // Per-class input modules — capability-surface partition of
-        // the old dom_input. Each emits its corresponding
+        // `dom_input`. Each emits its corresponding
         // `modules/sdk/contracts/input/*` contract on its single
         // output port (port idx 0 — input modules are sources).
         if entry.name_hash == WASM_BROWSER_KEYBOARD_HASH {
@@ -1388,6 +1388,7 @@ unsafe fn load_embedded_modules() -> usize {
             header.required_caps(),
             loaded.manifest_permissions(),
         );
+        scheduler::set_module_type_hash(module_idx, entry.name_hash);
 
         let code_size = header.code_size as usize;
         let code_ptr = loaded.code_base();
@@ -1824,8 +1825,8 @@ const MODULES_BLOB_MAGIC: [u8; 16] = *b"FLUXOR_MOD_BLOB\0";
 const CONFIG_BLOB_MAGIC: [u8; 16] = *b"FLUXOR_CFG_BLOB\0";
 
 /// Total placeholder size for `modules.bin`, including the 32-byte
-/// header. 1 MiB covers the largest module set observed today — a browser
-/// app graph runs ~520 KiB now that an app module can carry hi-DPI font
+/// header. 1 MiB covers the largest module set observed — a browser
+/// app graph runs ~520 KiB, an app module able to carry hi-DPI font
 /// atlases (truffle_shell ships 32px+48px DejaVu coverage, ~235 KiB, for
 /// device-pixel supersampled text). Reproducible: the bundle tool fails
 /// fast if the real blob exceeds capacity, with a clear "rebuild kernel

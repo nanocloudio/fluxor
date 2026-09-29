@@ -202,12 +202,18 @@ enum Fat32InitPhase {
     ReadGptEntry = 10,
     WaitGptEntry = 11,
     Done = 12,
+    /// Laying a fresh volume down: zeroing the reserved region, both FATs
+    /// and the root cluster, a bounded run of sectors per step.
+    FormatZero = 13,
+    /// Writing the FAT heads, FSINFO, the backup boot record and, last, the
+    /// boot sector itself.
+    FormatMeta = 14,
 }
 
 // Reads flow through the synchronous FS_CONTRACT dispatch
 // (`fat32_fs_dispatch`) and the per-FD scratch in `OpenFile` — there
 // is no per-step read state machine; the dispatch call walks the FAT
-// chain in-line via `IOCTL_BLOCKS_READ_LBAS_SYNC`.
+// chain in-line through `storage.block` `EXEC` reads.
 
 // ============================================================================
 /// FAT32 "clean shutdown" bit in cluster 1's FAT entry. When set the
@@ -220,16 +226,6 @@ const CLN_SHUT_BIT: u32 = 0x0800_0000;
 /// asked for. Distinct from `ENOSYS`: the operation exists, the volume does
 /// not, and no fallback is appropriate.
 const E_NODEV: i32 = -19;
-
-/// Geometry-query ioctl on the blocks channel. Matches
-/// `nvme::IOCTL_NVME_NS_INFO`. Arg is 13 B: in=`nsid:u32` / out=
-/// `ns_size:u64 + ns_lbads:u8`. A non-nvme consumer returns ENOSYS,
-/// which fat32 treats as "geometry info unavailable, proceed".
-const IOCTL_NVME_NS_INFO: u32 = 0x4E56_0001;
-
-/// Expected LBA data-size shift. LBA size = 2^ns_lbads; fat32 only
-/// supports 512 B LBAs, i.e. `ns_lbads == 9`.
-const EXPECTED_LBADS: u8 = 9;
 
 include!("../../sdk/runtime.rs");
 include!("../../sdk/runtime/params.rs");
@@ -343,6 +339,23 @@ mod params_def {
         // the one at fault.
         13, max_open_per_owner, u32, 0
             => |s, d, len| { s.max_open_per_owner = p_u32(d, len, 0, 0); };
+
+        // 1 = lay a fresh FAT32 volume on a source that holds none. Only a
+        // source whose first sector is entirely zero is formatted: a blank
+        // device, such as a fresh `crypt_block` container. A first sector
+        // with any content — a FAT32 volume, a partition table, another
+        // filesystem's data — is never overwritten, whatever this says. The volume spans the whole
+        // source; the source must serve `storage.block` requests (the
+        // streaming-only `sd` path cannot be written this way).
+        14, format, u32, 0
+            => |s, d, len| { s.format = p_u32(d, len, 0, 0) as u8; };
+
+        // Sectors per cluster for a volume `format` lays: a power of two up
+        // to 128, as `mkfs.vfat -s` takes it. 0 = the FAT32 specification's
+        // table for the source's size. A size that leaves the volume outside
+        // FAT32's cluster-count range is refused, and nothing is formatted.
+        15, format_cluster_sectors, u32, 0
+            => |s, d, len| { s.format_spc = p_u32(d, len, 0, 0).min(255) as u8; };
     }
 }
 
@@ -611,7 +624,7 @@ struct Fat32State {
     syscalls: *const SyscallTable,
     /// Provider instance selector (FNV-1a hash of the `volume:` param).
     /// `0` when no `volume:` is given → this fat32 is the single unkeyed
-    /// (default) FS provider, exactly as before. Non-zero → a keyed volume
+    /// (default) FS provider. Non-zero → a keyed volume
     /// backend the `mount` module reaches via `provider_bind`. Exposed to
     /// the loader through the `module_provider_selector` export.
     selector: u32,
@@ -620,6 +633,9 @@ struct Fat32State {
     /// FAT walks, FS_CONTRACT sync block reads — flows through this
     /// channel via ioctls on the producer side.
     in_chan: i32,
+    /// `storage.block` requests on `in_chan`, and the pipelined writes and
+    /// fences built from them.
+    blk: BlockClient,
 
     // FAT32 geometry (from boot sector)
     bytes_per_sector: u16,
@@ -675,7 +691,7 @@ struct Fat32State {
     // being read or modified; `fat_buf` caches the FAT sector the chain
     // walk is reading. The FS dispatch maintains its own per-FD data
     // scratch in `OpenFile`.
-    pending_block: u32,
+    pending_block: u64,
     block_offset: u16,
     read_fill: u16,
     block_buf: [u8; BLOCK_SIZE],
@@ -742,8 +758,8 @@ struct Fat32State {
     /// slot is independent — multiple consumers can open multiple
     /// files concurrently (HTTP parallel range reads, etc.). Block
     /// I/O is shared (single nvme.blocks channel) but the FS_READ
-    /// path uses `IOCTL_BLOCKS_READ_LBAS_SYNC` which is fully
-    /// synchronous and serializes within each dispatch call.
+    /// path uses `storage.block` `EXEC` reads, which are fully
+    /// synchronous and serialize within each dispatch call.
     open_files: [OpenFile; MAX_OPEN_FILES],
 
     /// Linear free-cluster allocation hint for the synchronous FS write
@@ -826,6 +842,20 @@ struct Fat32State {
     /// published.
     fs_settle_pending: u8,
     _pad_settle: u8,
+
+    /// Param `format`: 1 lays a fresh volume on a source holding none.
+    format: u8,
+    /// 1 when the block source serves `storage.block` requests, so the mount
+    /// reads its sectors through them instead of the streaming channel.
+    sync_src: u8,
+    /// Param `format_cluster_sectors`: 0 = the specification's table.
+    format_spc: u8,
+    _pad_fmt: u8,
+    /// Result of the mount's last synchronous sector read, reported by the
+    /// phase that consumes it.
+    sync_rc: i32,
+    /// Format in progress: the geometry being laid down and how far it got.
+    fmt: FormatPlan,
 
     /// Position of a directory walk that ran out of step budget, so the
     /// next call continues instead of starting over. See [`DirCursor`].
@@ -980,6 +1010,10 @@ impl Fat32State {
         self.fs_settle_pending = 0;
         self.cache_defeated = 0;
         self.dir_cursor = DirCursor::empty();
+        self.format = 0;
+        self.sync_src = 0;
+        self.sync_rc = 0;
+        self.fmt = FormatPlan::EMPTY;
         self.unlink_free = [0; UNLINK_FREE_SLOTS];
         self.fences = [FenceSlot::empty(); MAX_FENCES];
         self.file_count = 0;
@@ -1097,11 +1131,10 @@ unsafe fn log_info(s: &Fat32State, msg: &[u8]) {
 
 /// Seek the block source's stream to absolute `lba`.
 ///
-/// Mount discovery rides the streaming channel rather than the synchronous
-/// ioctls, because it has to work against a source that has only the
-/// former — sd does not implement `IOCTL_BLOCKS_READ_LBAS_SYNC`. That seek
-/// is `IOCTL_NOTIFY`, whose argument is four bytes, so this is the one place
-/// in the provider that cannot express the full 64-bit address.
+/// Mount discovery over a source that is not a writable `storage.block`
+/// source rides its streaming channel (see [`start_read`]). That seek is
+/// `IOCTL_NOTIFY`, whose argument is four bytes, so this is the one place in
+/// the provider that cannot express the full 64-bit address.
 ///
 /// It refuses rather than truncates. A volume whose boot sector sits past
 /// the 2 TiB a 32-bit seek can name is not mountable through a streaming
@@ -1123,6 +1156,51 @@ unsafe fn flush_input(s: &Fat32State) -> i32 {
     dev_channel_ioctl(s.sys(), s.in_chan, IOCTL_FLUSH, core::ptr::null_mut(), 0)
 }
 
+/// Whether the block source is read through synchronous `storage.block`
+/// requests rather than its stream.
+///
+/// A writable source with no read stream — a transform (`crypt_block`,
+/// `loam_volume`) or a file-backed source (`file_block`) — has nothing to
+/// answer a seek, so it is mounted and read through requests. A source that
+/// offers `F_READ_STREAM` (`nvme`) is read through its stream: a directory
+/// walk is many sectors, and one device round trip per sector in the
+/// caller's step outlasts the step. A read-only source (`sd`) and one that
+/// has not attached yet keep the streamed mount; [`init_step`] switches over
+/// if it turns out to be a stream-less writable source.
+unsafe fn writable_block_source(s: &Fat32State) -> bool {
+    use abi::contracts::storage::block::caps as bc;
+    s.blk.caps(&*s.syscalls) == 0
+        && s.blk.flags() & bc::F_WRITE != 0
+        && s.blk.flags() & bc::F_READ_STREAM == 0
+}
+
+/// Start the mount's read of absolute sector `lba` into `block_buf`; the
+/// following `Wait*` phase collects it with [`try_read_block`].
+///
+/// A writable `storage.block` source (see [`writable_block_source`]) is read
+/// synchronously here; anything else is sought on the stream. Returns 0 when
+/// the read is under way (or done), 1 to retry next step, or a negative
+/// errno.
+unsafe fn start_read(s: &mut Fat32State, lba: u64) -> i32 {
+    if s.sync_src != 0 {
+        let buf = s.block_buf.as_mut_ptr();
+        let rc = s.blk.read(&*s.syscalls, lba, 1, buf);
+        if rc == E_AGAIN {
+            return 1;
+        }
+        s.sync_rc = rc;
+        s.read_fill = BLOCK_SIZE as u16;
+        return 0;
+    }
+    flush_input(s);
+    let rc = seek_block(s, lba);
+    if rc < 0 {
+        return rc;
+    }
+    s.read_fill = 0;
+    0
+}
+
 // ============================================================================
 // Boot Sector Parsing
 // ============================================================================
@@ -1130,6 +1208,9 @@ unsafe fn flush_input(s: &Fat32State) -> i32 {
 /// Parse boot sector and extract FAT32 geometry
 /// Note: uses pointer arithmetic to avoid bounds check panics.
 unsafe fn parse_boot_sector(s: &mut Fat32State) -> bool {
+    // Asked before the sector is borrowed; checked below with the format's
+    // own sector size.
+    let dev_bs = fs_device_block_size(s);
     let buf = &s.block_buf;
 
     // Check boot signature (use pointer arithmetic, no bounds check)
@@ -1181,7 +1262,6 @@ unsafe fn parse_boot_sector(s: &mut Fat32State) -> bool {
     // is a volume that mounts and quietly stops providing the crash
     // semantics its consumers are built on. Zero means the source has not
     // attached yet; the mount is retried, not failed.
-    let dev_bs = fs_device_block_size(s);
     if dev_bs != 0 && dev_bs as usize != BLOCK_SIZE {
         log_info(s, b"[fat32] device block size unsupported");
         return false;
@@ -1253,6 +1333,9 @@ unsafe fn parse_mbr(buf: &[u8]) -> u32 {
 #[inline]
 unsafe fn try_read_block(s: &mut Fat32State) -> i32 {
     s.block_buf_lba = LBA_NONE;
+    if s.sync_src != 0 {
+        return if s.sync_rc == 0 { 1 } else { -1 };
+    }
     let poll = (s.sys().channel_poll)(s.in_chan, POLL_IN);
     if poll <= 0 || (poll as u32 & POLL_IN) == 0 {
         return 0;
@@ -1485,7 +1568,7 @@ unsafe fn parse_dir_entry(s: &mut Fat32State, entry_offset: usize) -> bool {
 // ============================================================================
 //
 // Bare-metal counterpart to `linux_fs_dispatch`. Sector reads issue
-// `IOCTL_BLOCKS_READ_LBAS_SYNC` against whatever block source is
+// `storage.block` `EXEC` reads against whatever block source is
 // wired to `s.in_chan` (nvme, sd, …). Up to MAX_OPEN_FILES concurrent
 // opens; per-FD state lives in `OpenFile`. Random-access read latency
 // is bounded by the producer's per-command device latency since the
@@ -1595,21 +1678,11 @@ const FAT32_FS_DEVICE_ID: u64 = 0x6661_7433_325f_6673; // "fat32_fs"
 /// has not attached has no geometry, and a guess latched at mount is exactly
 /// the failure the `CAPS` probe rule exists to stop.
 unsafe fn fs_device_block_size(s: &Fat32State) -> u32 {
-    let mut arg = [0u8; 12];
-    let rc = dev_channel_ioctl(
-        s.sys(),
-        s.in_chan,
-        IOCTL_BLOCKS_GEOMETRY,
-        arg.as_mut_ptr(),
-        12,
-    );
-    if rc == E_NOSYS {
-        return BLOCK_SIZE as u32;
+    match s.blk.caps(&*s.syscalls) {
+        0 => s.blk.block_size(),
+        E_NOSYS => BLOCK_SIZE as u32,
+        _ => 0,
     }
-    if rc < 4 {
-        return 0;
-    }
-    read_u32_le(&arg, 0)
 }
 
 /// Absolute device LBA of a sector named relative to this volume.
@@ -1618,40 +1691,12 @@ fn fs_abs_lba(s: &Fat32State, lba: u32) -> u64 {
     s.partition_lba + u64::from(lba)
 }
 
-/// Build the block contract's ioctl argument at the offsets the SDK
-/// declares (`blk_arg`).
-///
-/// One builder for all four data-carrying block ioctls, because they share
-/// the layout and three hand-rolled copies of a byte-poking loop is three
-/// chances to widen one field and forget another.
-fn fs_blk_arg(lba: u64, nlb: u16, buf: u64) -> [u8; blk_arg::LEN] {
-    let mut arg = [0u8; blk_arg::LEN];
-    let lba_b = lba.to_le_bytes();
-    let nlb_b = nlb.to_le_bytes();
-    let buf_b = buf.to_le_bytes();
-    let mut i = 0usize;
-    while i < 8 {
-        arg[blk_arg::LBA + i] = lba_b[i];
-        arg[blk_arg::BUF_PTR + i] = buf_b[i];
-        i += 1;
-    }
-    arg[blk_arg::NLB] = nlb_b[0];
-    arg[blk_arg::NLB + 1] = nlb_b[1];
-    arg
-}
-
 /// Synchronously fetch a 512-byte sector at volume-relative `lba` into
 /// `out`. Returns 0 on success, negative errno otherwise. The block source
-/// must implement `IOCTL_BLOCKS_READ_LBAS_SYNC` — nvme does; sd does not.
+/// must serve `storage.block` `EXEC` reads — nvme does; sd serves only
+/// `SUBMIT` / `REAP`.
 unsafe fn fs_sync_read_sector(s: &Fat32State, lba: u32, out: *mut u8) -> i32 {
-    let mut arg = fs_blk_arg(fs_abs_lba(s, lba), 1, out as u64);
-    dev_channel_ioctl(
-        s.sys(),
-        s.in_chan,
-        IOCTL_BLOCKS_READ_LBAS_SYNC,
-        arg.as_mut_ptr(),
-        blk_arg::LEN,
-    )
+    s.blk.read(&*s.syscalls, fs_abs_lba(s, lba), 1, out)
 }
 
 /// Read one FAT entry synchronously; returns the next cluster
@@ -1843,7 +1888,7 @@ struct ResolvedFile {
 /// One path component, in both forms the directory can be searched by.
 ///
 /// A name that fits 8.3 has `long_len == 0` and is matched against entries'
-/// own name fields — the whole of what this provider used to do. A name that
+/// own name fields. A name that
 /// does not is matched against the long-name companion run instead, and
 /// carries its 8.3 form only as the synthesised `BASE~N.EXT` that will be
 /// minted alongside it.
@@ -2265,8 +2310,8 @@ fn write_dec_u32(buf: &mut [u8], n: &mut usize, v: u32) {
 }
 
 /// FS_OPEN: resolve the absolute path through the FAT32 tree
-/// (`fs_resolve_path` walks the dir chain synchronously via
-/// `IOCTL_BLOCKS_READ_LBAS_SYNC`), then allocate an `OpenFile` slot
+/// (`fs_resolve_path` walks the dir chain synchronously through
+/// `storage.block` `EXEC` reads), then allocate an `OpenFile` slot
 /// populated with the file's `start_cluster` + `size`. Returns the
 /// slot index as the FD, or a negative errno.
 unsafe fn fs_op_open(s: &mut Fat32State, arg: *const u8, arg_len: usize) -> i32 {
@@ -2980,9 +3025,8 @@ unsafe fn fs_op_readdir(s: &mut Fat32State, handle: i32, arg: *mut u8, arg_len: 
 // ============================================================================
 //
 // Append-only synchronous writer, the counterpart of the synchronous
-// read path (`fs_op_open`/`fs_op_read` via `IOCTL_BLOCKS_READ_LBAS_SYNC`).
-// Every block op goes through the producer's synchronous ioctls
-// (`IOCTL_BLOCKS_{WRITE,READ}_LBAS_SYNC`, `IOCTL_BLOCKS_FLUSH_SYNC`),
+// read path (`fs_op_open`/`fs_op_read`). Every block op is a
+// `storage.block` `EXEC` request, or a pipelined write fenced later,
 // because a `provider_call` must complete within the call. Targets the
 // append-only workload:
 // OPEN_CREATE → WRITE×N → FSYNC → CLOSE. All bookkeeping is sector-at-a-
@@ -2997,19 +3041,13 @@ unsafe fn fs_sync_write_sectors(s: &Fat32State, lba: u32, nlb: u16, buf: *const 
     if nlb == 0 || nlb > MAX_WRITE_NLB {
         return E_INVAL;
     }
-    let mut arg = fs_blk_arg(fs_abs_lba(s, lba), nlb, buf as u64);
-    dev_channel_ioctl(
-        s.sys(),
-        s.in_chan,
-        IOCTL_BLOCKS_WRITE_LBAS_SYNC,
-        arg.as_mut_ptr(),
-        blk_arg::LEN,
-    )
+    s.blk
+        .write(&*s.syscalls, fs_abs_lba(s, lba), u32::from(nlb), buf, false)
 }
 
-/// Commit the block source's write cache (NVMe Flush). Returns 0 on
-/// success; ENOSYS-tolerant callers treat a negative result as "no
-/// durable flush available" but fat32 surfaces it.
+/// Make every write so far durable: wait for the pipelined writes, then
+/// flush the source's volatile write cache if it has one. Returns 0 on
+/// success or the failure that makes durability unprovable.
 ///
 /// Lands any staged FAT sector first. A device flush is the provider's
 /// statement that everything it has said is durable; a FAT link still only
@@ -3019,72 +3057,45 @@ unsafe fn fs_sync_flush(s: &mut Fat32State) -> i32 {
     if frc != 0 {
         return frc;
     }
-    dev_channel_ioctl(
-        s.sys(),
-        s.in_chan,
-        IOCTL_BLOCKS_FLUSH_SYNC,
-        core::ptr::null_mut(),
-        0,
-    )
+    let sys = &*s.syscalls;
+    s.blk.flush(sys)
 }
 
 /// Submit one 512-byte sector write WITHOUT waiting (async durable-write
-/// path). The block source copies the data into its own in-flight DMA
-/// slot before returning, so `buf` (an FD's `scratch_block`) is free to
-/// reuse immediately. Returns 0 on submit, `E_AGAIN` when the ring is
+/// path). The block client requires a source that copies write data at
+/// `SUBMIT`, so `buf` (an FD's `scratch_block`) is free to reuse
+/// immediately. Returns 0 on submit, `E_AGAIN` when the ring is
 /// full (callers surface this as backpressure — a short write count or
 /// a retried fence — never a silent sync downgrade), or a negative
 /// errno.
-unsafe fn fs_async_write_sectors(s: &Fat32State, lba: u32, nlb: u16, buf: *const u8) -> i32 {
+unsafe fn fs_async_write_sectors(s: &mut Fat32State, lba: u32, nlb: u16, buf: *const u8) -> i32 {
     if nlb == 0 || nlb > 8 {
         return E_INVAL;
     }
-    let mut arg = fs_blk_arg(fs_abs_lba(s, lba), nlb, buf as u64);
-    dev_channel_ioctl(
-        s.sys(),
-        s.in_chan,
-        IOCTL_BLOCKS_WRITE_LBAS_ASYNC,
-        arg.as_mut_ptr(),
-        blk_arg::LEN,
-    )
+    let sys = &*s.syscalls;
+    let lba = fs_abs_lba(s, lba);
+    s.blk.submit_write(sys, lba, u32::from(nlb), buf)
 }
 
 /// Open a durability fence over every async write submitted so far,
 /// writing its ticket (`u64`) into `ticket`. Pairs with
-/// [`fs_fence_poll`]. Returns the ioctl rc; on failure `ticket` is left
-/// untouched — a failed fence MUST NOT alias ticket 0, which polls as
-/// already-durable.
+/// [`fs_fence_poll`]. Lands any staged FAT sector first and returns its
+/// error, leaving `ticket` untouched — a failed fence MUST NOT alias
+/// ticket 0, which polls as already-durable.
 unsafe fn fs_fence_submit(s: &mut Fat32State, ticket: &mut u64) -> i32 {
     let frc = fs_fat_flush(s);
     if frc != 0 {
         return frc;
     }
-    let mut arg = [0u8; 8];
-    let rc = dev_channel_ioctl(
-        s.sys(),
-        s.in_chan,
-        IOCTL_BLOCKS_FENCE_SUBMIT,
-        arg.as_mut_ptr(),
-        8,
-    );
-    if rc != 0 {
-        return rc;
-    }
-    *ticket = u64::from_le_bytes(arg);
+    *ticket = s.blk.fence_open();
     0
 }
 
 /// Non-blocking poll of a fence ticket. Returns 0 = durable, 1 = pending,
 /// or a negative errno if a harvested write failed.
-unsafe fn fs_fence_poll(s: &Fat32State, ticket: u64) -> i32 {
-    let mut arg = ticket.to_le_bytes();
-    dev_channel_ioctl(
-        s.sys(),
-        s.in_chan,
-        IOCTL_BLOCKS_FENCE_POLL,
-        arg.as_mut_ptr(),
-        8,
-    )
+unsafe fn fs_fence_poll(s: &mut Fat32State, ticket: u64) -> i32 {
+    let sys = &*s.syscalls;
+    s.blk.fence_poll(sys, ticket)
 }
 
 /// Synchronously read one sector at `lba` into `block_buf`. Hoists the
@@ -5104,7 +5115,7 @@ unsafe fn fs_op_create(s: &mut Fat32State, arg: *const u8, arg_len: usize) -> i3
 
     let mut want = want;
     // A long name needs its companion slots reserved contiguously with the
-    // entry they name; an 8.3 name needs one slot, exactly as before.
+    // entry they name; an 8.3 name needs one slot.
     let mut loc = match fs_name_walk(s, parent, &want, want.lfn_entries() + 1) {
         DirScan::Found(l) => l,
         DirScan::Free(l) => l,
@@ -5898,8 +5909,17 @@ unsafe fn fs_op_write(
     if s.open_files[slot].writable == 0 {
         return E_INVAL;
     }
+    // The async path hands sectors to the source at SUBMIT and reuses the
+    // buffer at once, so it needs a source that queues writes and copies
+    // their data (`crypt_block` and `loam_volume` lend the buffer until
+    // reaped instead). Over any other source the write is synchronous and
+    // its fence is a flush: the truthful fence for that source.
     if async_flush {
-        s.open_files[slot].async_mode = 1;
+        use abi::contracts::storage::block::caps as bc;
+        let copies = bc::F_ASYNC | bc::F_WRITE_COPIES;
+        if s.blk.flags() & copies == copies {
+            s.open_files[slot].async_mode = 1;
+        }
     }
     s.io_rc = 0;
     let bps = s.bytes_per_sector as u32;
@@ -5950,8 +5970,10 @@ unsafe fn fs_op_write(
                 // Async mode submits the completed sector to the block ring
                 // (copied into a device DMA slot, so `scratch_block` is free
                 // to reuse on return) and pipelines; durability is proven by
-                // the FSYNC_SUBMIT/POLL fence, not this submit.
-                if async_flush {
+                // the FSYNC_SUBMIT/POLL fence, not this submit. The file's
+                // mode, not the request's, decides: a source that cannot
+                // queue copied writes keeps the file synchronous.
+                if s.open_files[slot].async_mode != 0 {
                     let wr = fs_async_write_sectors(s, prev, prev_span, wp);
                     if wr == 0 {
                         fs_cache_drop_range(s, prev, prev_span);
@@ -6254,7 +6276,7 @@ const RI_DST_PREV: usize = 84;
 const RI_VOL_ID: usize = 116;
 const RI_CHECK: usize = 120;
 
-/// Absolute LBA of this volume's rename-intent record, or `None` when the
+/// Volume-relative sector of this volume's rename-intent record, or `None` when the
 /// reserved region is too small to hold one.
 fn fs_rename_intent_lba(s: &Fat32State) -> Option<u32> {
     if s.reserved_sectors < RENAME_INTENT_MIN_RESERVED {
@@ -7221,6 +7243,7 @@ pub extern "C" fn module_new(
         s.init(syscalls as *const SyscallTable);
 
         s.in_chan = in_chan;
+        s.blk.bind(in_chan);
 
         // Parse params
         let is_tlv =
@@ -7367,15 +7390,404 @@ unsafe fn step_inner(s: &mut Fat32State) -> i32 {
     0
 }
 
+// ============================================================================
+// Format
+// ============================================================================
+//
+// Laying a fresh volume on a source that holds none (param `format`). The
+// layout is the one `mkfs.vfat -F 32` and the FAT32 specification describe:
+// a 32-sector reserved region carrying the boot sector (0), FSINFO (1) and
+// their backups (6, 7); two FATs; the root directory in cluster 2. Cluster
+// size follows the specification's table for the volume's size.
+//
+// The boot sector is written last, after everything else is on media behind
+// a flush. It is what makes the device a volume: a format cut short leaves a
+// first sector with no signature, which the next mount formats again from
+// the start, rather than a boot sector describing FATs that were never
+// cleared.
+
+/// Reserved sectors a formatted volume carries. Ten or more leave room for
+/// the rename intent record in the last one; 32 is what `mkfs.vfat` uses.
+const FMT_RESERVED: u32 = 32;
+/// FSINFO and the backup boot record, at the specification's positions.
+const FMT_FSINFO: u32 = 1;
+const FMT_BACKUP_BOOT: u32 = 6;
+/// Clusters below which the specification calls a volume FAT16, whatever its
+/// boot sector says: a reader that types the volume by its cluster count, as
+/// the specification directs, would misread a smaller FAT32.
+const FMT_MIN_CLUSTERS: u32 = 65_525;
+/// Requests one format step issues at most while clearing, so a large
+/// device spans many steps rather than holding one.
+const FMT_ZERO_PER_STEP: u32 = 64;
+/// Sectors per pipelined zero write in a format.
+const FMT_ZERO_RUN: u32 = 8;
+/// Time a format step spends clearing before it yields.
+const FMT_ZERO_STEP_US: u64 = 500;
+/// FAT32's largest cluster number plus one; a volume past it is not FAT32.
+const FMT_MAX_CLUSTERS: u32 = 0x0FFF_FFF5;
+
+/// A format in progress.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct FormatPlan {
+    /// Sectors the volume spans.
+    total: u32,
+    fat_size: u32,
+    clusters: u32,
+    volume_id: u32,
+    /// Next sector to write: while zeroing, a sector number; while writing
+    /// metadata, the index of the next record in [`format_meta_step`].
+    cursor: u32,
+    /// First sector past the region to zero (the end of the root cluster).
+    zero_end: u32,
+    spc: u8,
+    _pad: [u8; 3],
+}
+
+impl FormatPlan {
+    const EMPTY: Self = Self {
+        total: 0,
+        fat_size: 0,
+        clusters: 0,
+        volume_id: 0,
+        cursor: 0,
+        zero_end: 0,
+        spc: 0,
+        _pad: [0; 3],
+    };
+}
+
+/// Sectors per cluster for a volume of `total` 512-byte sectors, from the
+/// FAT32 specification's table.
+const fn fmt_sectors_per_cluster(total: u32) -> u32 {
+    if total <= 532_480 {
+        1
+    } else if total <= 16_777_216 {
+        8
+    } else if total <= 33_554_432 {
+        16
+    } else if total <= 67_108_864 {
+        32
+    } else {
+        64
+    }
+}
+
+/// Plan a volume of `total` sectors with `spc` sectors per cluster (0 = the
+/// specification's table): `(sectors_per_cluster, fat_size, clusters)`, or
+/// `None` when `spc` is not a power of two up to 128 or the volume would
+/// fall outside FAT32's cluster-count range.
+///
+/// The FAT size is the specification's closed form, which may exceed the
+/// minimum by a sector — a FAT with room to spare is valid, one short of its
+/// clusters is not. Every division is 32-bit or through
+/// [`div_rem_u64_by_u32`]: a PIC module has no division helpers to call.
+fn fmt_plan(total: u32, spc: u32) -> Option<(u32, u32, u32)> {
+    let spc = if spc == 0 {
+        fmt_sectors_per_cluster(total)
+    } else {
+        spc
+    };
+    if !spc.is_power_of_two() || spc > 128 {
+        return None;
+    }
+    if total <= FMT_RESERVED {
+        return None;
+    }
+    let avail = total - FMT_RESERVED;
+    let per = 128 * spc + 1;
+    let (fat_size, _) = div_rem_u64_by_u32(u64::from(avail) + u64::from(per - 1), per);
+    let fat_size = fat_size as u32;
+    let meta = 2 * fat_size;
+    if meta >= avail {
+        return None;
+    }
+    let clusters = (avail - meta) / spc;
+    if !(FMT_MIN_CLUSTERS..=FMT_MAX_CLUSTERS).contains(&clusters) {
+        return None;
+    }
+    // The FAT must index every cluster plus its two reserved entries.
+    if u64::from(fat_size) * 128 < u64::from(clusters) + 2 {
+        return None;
+    }
+    Some((spc, fat_size, clusters))
+}
+
+/// Begin formatting the source, whose first sector carries no signature.
+/// Returns the init step's result.
+unsafe fn format_begin(s: &mut Fat32State) -> i32 {
+    // The format writes through `storage.block` requests whichever way the
+    // mount reads, so what it needs is a source that takes writes.
+    if s.blk.caps(&*s.syscalls) != 0
+        || s.blk.flags() & abi::contracts::storage::block::caps::F_WRITE == 0
+    {
+        log_info(s, b"[fat32] format needs a writable storage.block source");
+        return -1;
+    }
+    if s.blk.block_size() as usize != BLOCK_SIZE {
+        log_info(s, b"[fat32] format: device block size unsupported");
+        return -1;
+    }
+    let count = s.blk.block_count();
+    let total = if count > u64::from(u32::MAX) {
+        u32::MAX
+    } else {
+        count as u32
+    };
+    let Some((spc, fat_size, clusters)) = fmt_plan(total, u32::from(s.format_spc)) else {
+        log_info(
+            s,
+            b"[fat32] format: no FAT32 volume fits this source and cluster size",
+        );
+        return -1;
+    };
+    // The serial is the volume's only identity: taken from the clock and the
+    // device, so two formats of one device, or one moment on two, differ.
+    let sys = &*s.syscalls;
+    let t = dev_micros(sys);
+    let dev = s.blk.device_id();
+    let mut id = (t as u32) ^ ((t >> 32) as u32) ^ (dev as u32) ^ ((dev >> 32) as u32);
+    id = id.rotate_left(13) ^ total;
+    if id == 0 {
+        id = 1;
+    }
+    s.fmt = FormatPlan {
+        total,
+        fat_size,
+        clusters,
+        volume_id: id,
+        cursor: 1,
+        zero_end: FMT_RESERVED + 2 * fat_size + spc,
+        spc: spc as u8,
+        _pad: [0; 3],
+    };
+    s.partition_lba = 0;
+    log_info(s, b"[fat32] formatting");
+    s.init_phase = Fat32InitPhase::FormatZero;
+    0
+}
+
+/// Zero the next run of the metadata region. Sector 0 is left for the last
+/// write of the format.
+///
+/// The region is two whole FATs, which on a large device is most of a
+/// gigabyte, so how it is cleared matters:
+/// - a source whose discarded blocks read back as zeros is discarded, in
+///   runs of its request size: a transform such as `crypt_block` then seals
+///   each unit once rather than rewriting it for every sector;
+/// - a source that pipelines copied writes is sent zero runs of
+///   `FMT_ZERO_RUN` sectors without waiting, and the format goes on only
+///   once they have all completed;
+/// - any other source is written one sector per request.
+///
+/// Every path stops for the step after `FMT_ZERO_STEP_US`: a device round
+/// trip can take most of a step on its own.
+unsafe fn format_zero_step(s: &mut Fat32State) -> i32 {
+    use abi::contracts::storage::block as blk;
+    s.block_buf = [0; BLOCK_SIZE];
+    s.block_buf_lba = LBA_NONE;
+    let sys = &*s.syscalls;
+    let t0 = dev_micros(sys);
+    let spent = |sys: &SyscallTable| dev_micros(sys).wrapping_sub(t0) >= FMT_ZERO_STEP_US;
+    let mut n = 0u32;
+    let zeroes = blk::caps::F_DISCARD | blk::caps::F_DISCARD_ZEROES;
+    let copies = blk::caps::F_ASYNC | blk::caps::F_WRITE_COPIES;
+    if s.blk.flags() & zeroes == zeroes {
+        while s.fmt.cursor < s.fmt.zero_end && n < FMT_ZERO_PER_STEP && !spent(sys) {
+            let run = (s.fmt.zero_end - s.fmt.cursor).min(s.blk.max_blocks().max(1));
+            let r = blk::Req {
+                op: blk::op::DISCARD,
+                flags: 0,
+                nblocks: run,
+                lba: u64::from(s.fmt.cursor),
+                buf_ptr: 0,
+                buf_len: 0,
+                tag: 0,
+            };
+            let rc = s.blk.exec(sys, &r);
+            if rc == E_AGAIN {
+                return 0;
+            }
+            if rc < 0 {
+                log_info(s, b"[fat32] format discard failed");
+                return -1;
+            }
+            s.fmt.cursor += run;
+            n += 1;
+        }
+    } else if s.blk.flags() & copies == copies {
+        let zero = [0u8; FMT_ZERO_RUN as usize * BLOCK_SIZE];
+        while s.fmt.cursor < s.fmt.zero_end && n < FMT_ZERO_PER_STEP && !spent(sys) {
+            let run = (s.fmt.zero_end - s.fmt.cursor)
+                .min(FMT_ZERO_RUN)
+                .min(s.blk.max_blocks().max(1));
+            let lba = fs_abs_lba(s, s.fmt.cursor);
+            let rc = s.blk.submit_write(sys, lba, run, zero.as_ptr());
+            if rc == E_AGAIN {
+                return 0;
+            }
+            if rc < 0 {
+                log_info(s, b"[fat32] format write failed");
+                return -1;
+            }
+            s.fmt.cursor += run;
+            n += 1;
+        }
+        if s.fmt.cursor < s.fmt.zero_end {
+            return 0;
+        }
+        // Everything submitted must have landed before the metadata that
+        // names it is written.
+        match s.blk.flush(sys) {
+            0 => {}
+            E_AGAIN => return 0,
+            _ => {
+                log_info(s, b"[fat32] format write failed");
+                return -1;
+            }
+        }
+    } else {
+        while s.fmt.cursor < s.fmt.zero_end && n < FMT_ZERO_PER_STEP && !spent(sys) {
+            let buf = s.block_buf.as_ptr();
+            let rc = s.blk.write(sys, u64::from(s.fmt.cursor), 1, buf, false);
+            if rc == E_AGAIN {
+                return 0;
+            }
+            if rc < 0 {
+                log_info(s, b"[fat32] format write failed");
+                return -1;
+            }
+            s.fmt.cursor += 1;
+            n += 1;
+        }
+    }
+    if s.fmt.cursor >= s.fmt.zero_end {
+        s.fmt.cursor = 0;
+        s.init_phase = Fat32InitPhase::FormatMeta;
+    }
+    0
+}
+
+/// Build the boot sector of the planned volume in `block_buf`.
+fn format_boot_sector(s: &mut Fat32State) {
+    let p = s.fmt;
+    let b = &mut s.block_buf;
+    *b = [0; BLOCK_SIZE];
+    b[0] = 0xEB;
+    b[1] = 0x58;
+    b[2] = 0x90;
+    b[3..11].copy_from_slice(b"FLUXOR  ");
+    b[11..13].copy_from_slice(&(BLOCK_SIZE as u16).to_le_bytes());
+    b[13] = p.spc;
+    b[14..16].copy_from_slice(&(FMT_RESERVED as u16).to_le_bytes());
+    b[16] = 2; // FATs
+               // 17..19 root entries, 19..21 16-bit total, 22..24 16-bit FAT size: 0.
+    b[21] = 0xF8; // fixed media
+    b[24..26].copy_from_slice(&63u16.to_le_bytes()); // sectors per track
+    b[26..28].copy_from_slice(&255u16.to_le_bytes()); // heads
+    b[32..36].copy_from_slice(&p.total.to_le_bytes());
+    b[36..40].copy_from_slice(&p.fat_size.to_le_bytes());
+    // 40..42 flags (both FATs mirrored), 42..44 version 0.0.
+    b[44..48].copy_from_slice(&2u32.to_le_bytes()); // root cluster
+    b[48..50].copy_from_slice(&(FMT_FSINFO as u16).to_le_bytes());
+    b[50..52].copy_from_slice(&(FMT_BACKUP_BOOT as u16).to_le_bytes());
+    b[64] = 0x80; // drive number
+    b[66] = 0x29; // extended boot signature: the next three fields exist
+    b[67..71].copy_from_slice(&p.volume_id.to_le_bytes());
+    b[71..82].copy_from_slice(b"NO NAME    ");
+    b[82..90].copy_from_slice(b"FAT32   ");
+    b[510] = 0x55;
+    b[511] = 0xAA;
+}
+
+/// Build the FSINFO sector of the planned volume in `block_buf`: every
+/// cluster but the root's free, allocation to start after it.
+fn format_fsinfo(s: &mut Fat32State) {
+    let free = s.fmt.clusters - 1;
+    let b = &mut s.block_buf;
+    *b = [0; BLOCK_SIZE];
+    b[0..4].copy_from_slice(&0x4161_5252u32.to_le_bytes());
+    b[484..488].copy_from_slice(&0x6141_7272u32.to_le_bytes());
+    b[FSINFO_FREE_COUNT..FSINFO_FREE_COUNT + 4].copy_from_slice(&free.to_le_bytes());
+    b[FSINFO_NEXT_FREE..FSINFO_NEXT_FREE + 4].copy_from_slice(&3u32.to_le_bytes());
+    b[508..512].copy_from_slice(&0xAA55_0000u32.to_le_bytes());
+}
+
+/// Build the first sector of a FAT in `block_buf`: the media entry, the
+/// clean-shutdown entry, and the root directory's end of chain.
+fn format_fat_head(s: &mut Fat32State) {
+    let b = &mut s.block_buf;
+    *b = [0; BLOCK_SIZE];
+    b[0..4].copy_from_slice(&0x0FFF_FFF8u32.to_le_bytes());
+    b[4..8].copy_from_slice(&FAT32_TAIL.to_le_bytes());
+    b[8..12].copy_from_slice(&FAT32_TAIL.to_le_bytes());
+}
+
+/// Write the volume's metadata, one record per `cursor` value, and commit it
+/// with the boot sector. Resumes where an `EAGAIN` stopped it.
+unsafe fn format_meta_step(s: &mut Fat32State) -> i32 {
+    s.block_buf_lba = LBA_NONE;
+    while s.fmt.cursor < 8 {
+        let lba: u32 = match s.fmt.cursor {
+            0 => {
+                format_fat_head(s);
+                FMT_RESERVED
+            }
+            1 => {
+                format_fat_head(s);
+                FMT_RESERVED + s.fmt.fat_size
+            }
+            2 => {
+                format_fsinfo(s);
+                FMT_FSINFO
+            }
+            3 => {
+                format_boot_sector(s);
+                FMT_BACKUP_BOOT
+            }
+            4 => {
+                format_fsinfo(s);
+                FMT_BACKUP_BOOT + FMT_FSINFO
+            }
+            6 => {
+                format_boot_sector(s);
+                0
+            }
+            // 5 and 7: everything before them reaches media before the
+            // step after them runs.
+            _ => LBA_NONE,
+        };
+        let rc = if lba == LBA_NONE {
+            s.blk.flush(&*s.syscalls)
+        } else {
+            let buf = s.block_buf.as_ptr();
+            s.blk.write(&*s.syscalls, u64::from(lba), 1, buf, false)
+        };
+        if rc == E_AGAIN {
+            return 0;
+        }
+        if rc < 0 {
+            log_info(s, b"[fat32] format write failed");
+            return -1;
+        }
+        s.fmt.cursor += 1;
+    }
+    log_info(s, b"[fat32] formatted");
+    // Mount what was just written, through the same path as any volume.
+    s.init_phase = Fat32InitPhase::Idle;
+    0
+}
+
 /// Initialization state machine
 unsafe fn init_step(s: &mut Fat32State) -> i32 {
     match s.init_phase {
         Fat32InitPhase::Idle => {
-            flush_input(s);
-            if seek_block(s, 0) < 0 {
-                return -1;
+            s.sync_src = u8::from(writable_block_source(s));
+            match start_read(s, 0) {
+                0 => {}
+                1 => return 0,
+                _ => return -1,
             }
-            s.read_fill = 0;
             s.init_phase = Fat32InitPhase::WaitBlock0;
             0
         }
@@ -7387,6 +7799,12 @@ unsafe fn init_step(s: &mut Fat32State) -> i32 {
                 return -1;
             }
             if res == 0 {
+                // A source still attaching when the stream was sought may be
+                // one that has no stream at all; once it says it takes
+                // requests, mount through them.
+                if s.sync_src == 0 && writable_block_source(s) {
+                    s.init_phase = Fat32InitPhase::Idle;
+                }
                 return 0;
             }
 
@@ -7422,16 +7840,30 @@ unsafe fn init_step(s: &mut Fat32State) -> i32 {
                 }
             }
 
-            log_info(s, b"[fat32] no fat32");
-            -1
+            if sig0 == 0x55 && sig1 == 0xAA {
+                // Something wrote this device — a partition table this
+                // provider does not mount from, or another filesystem.
+                // `format` never overwrites it.
+                log_info(s, b"[fat32] no fat32");
+                return -1;
+            }
+            // Only a first sector that is entirely zero is blank. Filesystems
+            // such as ext4 and containers such as LUKS sign nothing at
+            // offset 510, so an unsigned sector with content is someone's
+            // data, and `format` leaves it alone.
+            if s.format == 0 || s.block_buf.iter().any(|&b| b != 0) {
+                log_info(s, b"[fat32] no fat32");
+                return -1;
+            }
+            format_begin(s)
         }
 
         Fat32InitPhase::ReadBoot => {
-            flush_input(s);
-            if seek_block(s, s.partition_lba) < 0 {
-                return -1;
+            match start_read(s, s.partition_lba) {
+                0 => {}
+                1 => return 0,
+                _ => return -1,
             }
-            s.read_fill = 0;
             s.init_phase = Fat32InitPhase::WaitBoot;
             0
         }
@@ -7458,11 +7890,11 @@ unsafe fn init_step(s: &mut Fat32State) -> i32 {
 
         Fat32InitPhase::ReadRoot => {
             let sector = cluster_to_sector(s, s.dir_cluster) + (s.dir_sector_in_cluster as u32);
-            flush_input(s);
-            if seek_block(s, fs_abs_lba(s, sector)) < 0 {
-                return -1;
+            match start_read(s, fs_abs_lba(s, sector)) {
+                0 => {}
+                1 => return 0,
+                _ => return -1,
             }
-            s.read_fill = 0;
             s.init_phase = Fat32InitPhase::WaitRoot;
             0
         }
@@ -7589,11 +8021,11 @@ unsafe fn init_step(s: &mut Fat32State) -> i32 {
 
         Fat32InitPhase::ReadDirFat => {
             let fat_sector = fat_sector_for_cluster(s, s.dir_cluster);
-            flush_input(s);
-            if seek_block(s, fs_abs_lba(s, fat_sector)) < 0 {
-                return -1;
+            match start_read(s, fs_abs_lba(s, fat_sector)) {
+                0 => {}
+                1 => return 0,
+                _ => return -1,
             }
-            s.read_fill = 0;
             s.init_phase = Fat32InitPhase::WaitDirFat;
             0
         }
@@ -7642,11 +8074,11 @@ unsafe fn init_step(s: &mut Fat32State) -> i32 {
 
         Fat32InitPhase::ReadGptHeader => {
             // GPT header is at LBA 1
-            flush_input(s);
-            if seek_block(s, 1) < 0 {
-                return -1;
+            match start_read(s, 1) {
+                0 => {}
+                1 => return 0,
+                _ => return -1,
             }
-            s.read_fill = 0;
             s.init_phase = Fat32InitPhase::WaitGptHeader;
             0
         }
@@ -7678,19 +8110,19 @@ unsafe fn init_step(s: &mut Fat32State) -> i32 {
                 return -1;
             }
 
-            // Partition entry array start LBA at offset 72 (u64, use lower 32 bits)
-            let entry_lba = read_u32_le(&s.block_buf, 72);
-            s.pending_block = entry_lba;
+            // Partition entry array start LBA: the u64 at offset 72.
+            s.pending_block = u64::from(read_u32_le(&s.block_buf, 72))
+                | (u64::from(read_u32_le(&s.block_buf, 76)) << 32);
             s.init_phase = Fat32InitPhase::ReadGptEntry;
             2 // Burst — read partition entries
         }
 
         Fat32InitPhase::ReadGptEntry => {
-            flush_input(s);
-            if seek_block(s, u64::from(s.pending_block)) < 0 {
-                return -1;
+            match start_read(s, s.pending_block) {
+                0 => {}
+                1 => return 0,
+                _ => return -1,
             }
-            s.read_fill = 0;
             s.init_phase = Fat32InitPhase::WaitGptEntry;
             0
         }
@@ -7737,10 +8169,11 @@ unsafe fn init_step(s: &mut Fat32State) -> i32 {
                     }
 
                     if !is_efi {
-                        // Starting LBA at offset 32 within entry (u64, lower 32 bits)
-                        let lba = read_u32_le(&s.block_buf, offset + 32);
+                        // Starting LBA: the u64 at offset 32 within the entry.
+                        let lba = u64::from(read_u32_le(&s.block_buf, offset + 32))
+                            | (u64::from(read_u32_le(&s.block_buf, offset + 36)) << 32);
                         if lba > 0 {
-                            s.partition_lba = u64::from(lba);
+                            s.partition_lba = lba;
                             s.init_phase = Fat32InitPhase::ReadBoot;
                             return 2; // Burst — read boot sector
                         }
@@ -7749,11 +8182,14 @@ unsafe fn init_step(s: &mut Fat32State) -> i32 {
                 i += 1;
             }
 
-            // If we only scanned 4 entries and didn't find it, try next sector
-            // For now, report failure (most SD cards have data partition in first 4)
+            // Only the four entries of the first partition-entry sector are
+            // scanned; a data partition listed beyond them is not found.
             log_info(s, b"[fat32] no gpt part");
             -1
         }
+
+        Fat32InitPhase::FormatZero => format_zero_step(s),
+        Fat32InitPhase::FormatMeta => format_meta_step(s),
 
         Fat32InitPhase::Done => 0,
 
@@ -7984,6 +8420,29 @@ pub unsafe fn test_mount_sync(state: *mut u8) -> bool {
     s.next_free_hint = 2;
     s.init_phase = Fat32InitPhase::Done;
     true
+}
+
+/// Host-test only: whether the stepped mount (and any format before it) has
+/// finished, so a test driving `module_step` knows when to start using the
+/// volume.
+///
+/// # Safety
+/// As [`test_force_ready`].
+#[cfg(feature = "host-test")]
+#[must_use]
+pub unsafe fn test_mounted(state: *const u8) -> bool {
+    (*(state as *const Fat32State)).init_phase == Fat32InitPhase::Done
+}
+
+/// Host-test only: the mounted volume's serial (`BS_VolID`), the identity a
+/// reformat would change.
+///
+/// # Safety
+/// As [`test_force_ready`].
+#[cfg(feature = "host-test")]
+#[must_use]
+pub unsafe fn test_volume_id(state: *const u8) -> u32 {
+    (*(state as *const Fat32State)).volume_id
 }
 
 /// Host-test only: read a writable OpenFile slot's first cluster, so a test

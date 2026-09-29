@@ -34,10 +34,10 @@ pub(crate) static SURFACE_WINDOW_GEOM: AtomicU32 = AtomicU32::new(0);
 
 const LINUX_SURFACE_TRAITS_HASH: u32 = 0x9772_C0F3; // fnv1a32("linux_surface_traits")
 
+use fluxor::platform::builtin_param_tags::linux_surface_traits as surface_traits_tags;
 use fluxor::platform::builtin_param_tags::linux_surface_traits::{
     TAG_HEIGHT as ST_TAG_HEIGHT, TAG_WIDTH as ST_TAG_WIDTH,
 };
-use fluxor::platform::builtin_param_tags::linux_surface_traits as surface_traits_tags;
 
 /// Re-scan modality presence every N steps so USB hot-plug is noticed without
 /// scanning /proc every tick. Geometry + audio are cheap atomic loads and are
@@ -218,8 +218,7 @@ fn build_linux_surface_traits(module_idx: usize, params: &[u8]) -> scheduler::Bu
     });
     scheduler::set_current_module(module_idx);
     let out_chan = scheduler::module_port(module_idx, surface_traits_tags::PORT_EVENTS);
-    let mut m =
-        scheduler::BuiltInModule::new("linux_surface_traits", linux_surface_traits_step);
+    let mut m = scheduler::BuiltInModule::new("linux_surface_traits", linux_surface_traits_step);
     install_state(
         &mut m,
         Box::new(LinuxSurfaceTraitsState {
@@ -248,4 +247,3 @@ fn build_linux_surface_traits(module_idx: usize, params: &[u8]) -> scheduler::Bu
     );
     m
 }
-

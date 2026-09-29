@@ -25,8 +25,8 @@ wiring = [
 # in the platform's PCIe alias table — nothing here or in user YAML
 # names `pcie1` directly.
 #
-# One edge, both directions: `fat32` reads and writes through the block
-# source's synchronous ioctls on `blocks`, so there is no separate
+# One edge, both directions: `fat32` reads and writes through
+# `storage.block` requests on `blocks`, so there is no separate
 # write-request channel to wire and no way to compose a half-writable
 # volume by forgetting an edge.
 [[variant]]

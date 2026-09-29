@@ -248,7 +248,8 @@ const PRS_ANCHOR_CAPS: &[&str] = &[
 fn instance_entry<'a>(config: &'a Value, instance: &str) -> Option<&'a Value> {
     ["modules", REMOTE_MEMBERS_KEY].iter().find_map(|key| {
         config.get(key).and_then(|m| m.as_array()).and_then(|list| {
-            list.iter().find(|m| m.get("name").and_then(|n| n.as_str()) == Some(instance))
+            list.iter()
+                .find(|m| m.get("name").and_then(|n| n.as_str()) == Some(instance))
         })
     })
 }
@@ -257,7 +258,11 @@ fn instance_entry<'a>(config: &'a Value, instance: &str) -> Option<&'a Value> {
 /// name when the config names none — the convention the loader uses.
 fn instance_type(config: &Value, instance: &str) -> String {
     instance_entry(config, instance)
-        .and_then(|m| m.get("type").and_then(|t| t.as_str()).map(|t| t.to_string()))
+        .and_then(|m| {
+            m.get("type")
+                .and_then(|t| t.as_str())
+                .map(|t| t.to_string())
+        })
         .unwrap_or_else(|| instance.to_string())
 }
 
@@ -461,7 +466,10 @@ pub fn validate_continuity_on(
                                 "the serving host does not fail over; the peer's own \
                                  absence is bounded by the idle timeout it negotiated",
                             ),
-                            ("client_keepalive_ms", "there is no failover to fit under it"),
+                            (
+                                "client_keepalive_ms",
+                                "there is no failover to fit under it",
+                            ),
                         ] {
                             if g.get(field).is_some() {
                                 return Err(err(format!(
@@ -479,9 +487,11 @@ pub fn validate_continuity_on(
                             ));
                         }
                         let a = anchor.ok_or_else(|| {
-                            err("mechanism native_primitive requires an `anchor`: the module \
+                            err(
+                                "mechanism native_primitive requires an `anchor`: the module \
                                  carrying the natively-migratable mux"
-                                .into())
+                                    .into(),
+                            )
                         })?;
                         if !module_has(a, "transport.mux") {
                             return Err(err(format!(
@@ -503,9 +513,9 @@ pub fn validate_continuity_on(
                         // server follows its peer, and one that advertises
                         // `disable_active_migration` tells the peer not to move.
                         let param = |key: &str| -> Option<u64> {
-                            instance_entry(config, a).and_then(|m| m.get(key)).and_then(|v| {
-                                v.as_u64().or_else(|| v.as_bool().map(u64::from))
-                            })
+                            instance_entry(config, a)
+                                .and_then(|m| m.get(key))
+                                .and_then(|v| v.as_u64().or_else(|| v.as_bool().map(u64::from)))
                         };
                         if param("mode") == Some(0) {
                             return Err(err(format!(
@@ -676,7 +686,9 @@ pub fn validate_continuity_on(
                                  `fence.enforceable` to reach `cutoff = \"wire\"` on the \
                                  target{} — a fence whose boundary is the ring hand-off \
                                  cannot confirm the old emitter is quiet",
-                                target.map(|t| format!(" (`{t}` does not)")).unwrap_or_default()
+                                target
+                                    .map(|t| format!(" (`{t}` does not)"))
+                                    .unwrap_or_default()
                             )));
                         }
                         if !out_of_band_wire {
@@ -688,15 +700,13 @@ pub fn validate_continuity_on(
                                      composed from another node — declare it with `node: <name>`"
                                 )));
                             }
-                            return Err(err(
-                                "platform_replicated_state requires an out-of-band \
+                            return Err(err("platform_replicated_state requires an out-of-band \
                                  `fence.enforceable` provider (a fence agent outside the \
                                  failure domain, a member placed with `node:`) declaring \
                                  [capability_facts.\"fence.enforceable\"] cutoff = \"wire\"; a \
                                  local cutoff alone is never enough — the host that must be \
                                  proved quiet is the one that may have failed"
-                                    .into(),
-                            ));
+                                .into()));
                         }
                         let d = directory.ok_or_else(|| {
                             err("platform_replicated_state requires a `directory` module \
@@ -1233,14 +1243,20 @@ fn resolve_edge_buffer_bytes(config: &Value) -> Vec<u32> {
 const CHAIN_AWARE_PROVIDES: &[&str] = &[];
 
 /// Surfaces that are NOT routed by class-byte contract dispatch, so multiple
-/// providers of them do NOT shadow. `storage.block` is exposed through
-/// per-driver block-IO ioctls on each driver's own channels (wired by port
-/// name, e.g. `nvme.blocks -> fat32.blocks`), never through a single class
-/// byte — so an SD card + a flash blob store both providing `storage.block`
-/// is a legitimate composition, not a silent shadow. The single-provider
+/// providers of them do NOT shadow. A `storage.block` source is the channel
+/// wired to its consumer (`nvme.blocks -> fat32.blocks`), never a class
+/// byte, so two block devices in one graph are a legitimate composition,
+/// not a silent shadow. What binds a block consumer to its source is
+/// checked per edge by `validate_port_capabilities`. The single-provider
 /// rule targets class-byte dispatch shadowing (FS / storage.namespace /
 /// storage.object), so these are exempt.
 const NON_DISPATCH_SURFACES: &[&str] = &["storage.block"];
+
+/// Selector names no module may register: `platform` names the platform's
+/// own provider of a contract, beneath every module layer. The kernel's
+/// `provider::PLATFORM_SELECTOR_NAME` is the other half, and refuses the
+/// registration at load; this turns that into a build error.
+const RESERVED_SELECTORS: &[&str] = &["platform"];
 
 /// The per-module `volume:` param — the instance selector that keys an
 /// FS/namespace provider. Empty string = the default (unkeyed) provider.
@@ -1300,6 +1316,14 @@ pub fn validate_single_provider(
             {
                 continue;
             }
+            if RESERVED_SELECTORS.contains(&sel) {
+                return Err(Error::Config(format!(
+                    "`{name}` provides `{surface}` with `volume = \"{sel}\"`, a name reserved for \
+                     the platform's own provider of the contract (a consumer reaches the host \
+                     filesystem beneath the graph through it). The kernel refuses to register a \
+                     module under it; pick another `volume:`."
+                )));
+            }
             let key = (surface.as_str(), sel);
             match seen.get(&key) {
                 None => {
@@ -1349,7 +1373,10 @@ pub fn validate_single_provider(
             if sel.is_empty() {
                 has_default.insert(surface.as_str(), true);
             } else {
-                keyed.entry(surface.as_str()).or_default().push(name.as_str());
+                keyed
+                    .entry(surface.as_str())
+                    .or_default()
+                    .push(name.as_str());
             }
         }
     }
@@ -1370,17 +1397,23 @@ pub fn validate_single_provider(
 }
 
 /// Reject `fault_policy: restart` for a module whose manifest does not
-/// attest that it can resume after an arbitrary fault.
+/// attest that it can resume after an arbitrary fault, and for any module that
+/// provides a contract or surface.
 ///
-/// The kernel's restart path releases every provider handle the module
-/// owned, flushes every connected input / output / control channel, and
-/// then resumes the **same** state allocation: state is not zeroed and
+/// The kernel's restart path releases everything the module registered or
+/// opened — its events, timers, platform handles, provider layers and channel
+/// ioctl handlers — flushes every connected input / output / control channel,
+/// and then resumes the **same** state allocation: state is not zeroed and
 /// `module_new` is not re-called. A module carrying an invariant across
 /// steps therefore resumes with its own bookkeeping describing handles
 /// and in-flight work that no longer exist — silent corruption, not
 /// recovery. Nothing at instantiation time can infer whether that is
 /// safe, so the module attests it in its own manifest
 /// (`resume_after_fault = true`) and this is where the claim is required.
+///
+/// A module that provides something cannot attest at all: its provider layer
+/// and handlers are among what the restart releases, and nothing registers
+/// them again, so it would run on as a provider no consumer can reach.
 ///
 /// A module with no manifest in the map is not gated — the same
 /// convention the other validators in this file use for modules supplied
@@ -1406,14 +1439,25 @@ pub fn validate_fault_policy(
         let Some(m) = manifests.get(name) else {
             continue;
         };
+        if !m.provides.is_empty() {
+            return Err(Error::Config(format!(
+                "module '{name}': fault_policy = \"restart\" is not available to a module that \
+                 provides {}. The restart releases the provider layer and the channel ioctl \
+                 handlers the module registered and does not run `module_new` again, so the \
+                 module would resume as a provider nothing can reach. Choose \
+                 `fault_policy: \"skip\"` to terminate it, or `fault_policy: \"restart_graph\"` \
+                 to re-instantiate the whole graph.",
+                m.provides.join(", ")
+            )));
+        }
         if m.resume_after_fault {
             continue;
         }
         return Err(Error::Config(format!(
             "module '{name}': fault_policy = \"restart\" requires the module to attest \
              that it can resume after a fault, and `{name}`'s manifest does not. \
-             This policy does NOT re-instantiate the module: it releases every provider \
-             handle the module holds, flushes every connected channel, and resumes the \
+             This policy does NOT re-instantiate the module: it releases every handle, \
+             provider layer and ioctl handler the module holds, flushes every connected channel, and resumes the \
              SAME state allocation without zeroing it and without re-running \
              `module_new`. A module with state that spans steps therefore resumes with \
              stale handles and stale bookkeeping. Either add `resume_after_fault = true` \
@@ -1427,7 +1471,6 @@ pub fn validate_fault_policy(
     }
     Ok(())
 }
-
 
 /// Validate every `[[ports]] requires_capability` against the module actually
 /// wired to that port.
@@ -1464,6 +1507,12 @@ pub fn validate_fault_policy(
 ///      unvalidated here, which is the honest position and the reason
 ///      declaring the fact is worth doing.
 ///
+/// A requirement may also name a provided surface (`PROVIDER_SURFACES`),
+/// satisfied by a peer whose `provides` lists it. An input that requires a
+/// surface takes exactly one edge: a `storage.block` source is the channel
+/// wired to the consumer, answering on that channel alone, so a second
+/// producer into the same input could never be reached.
+///
 /// FAILS OPEN on a module whose manifest could not be resolved. A pinned
 /// store artifact may carry no `manifest.toml` layer at all, and refusing to
 /// build in that case would break every existing graph that composes a
@@ -1492,6 +1541,10 @@ pub fn validate_port_capabilities(
             .cloned()
     };
 
+    let is_surface =
+        |wanted: &str| fluxor_contracts::vocabulary::PROVIDER_SURFACES.contains(&wanted);
+    let mut surface_edges: HashMap<String, Vec<String>> = HashMap::new();
+
     for entry in wiring {
         let Some(from) = entry.get("from").and_then(|v| v.as_str()) else {
             continue;
@@ -1499,9 +1552,25 @@ pub fn validate_port_capabilities(
         let Some(to) = entry.get("to").and_then(|v| v.as_str()) else {
             continue;
         };
-        let (Some((from_mod, from_port)), Some((to_mod, to_port))) = (split(from), split(to)) else {
+        let (Some((from_mod, from_port)), Some((to_mod, to_port))) = (split(from), split(to))
+        else {
             continue;
         };
+
+        if let Some(wanted) = port_of(&to_mod, &to_port).and_then(|p| p.requires_capability) {
+            if is_surface(&wanted) {
+                let sources = surface_edges.entry(to.to_string()).or_default();
+                sources.push(from.to_string());
+                if sources.len() > 1 {
+                    return Err(Error::Config(format!(
+                        "`{to}` requires `{wanted}` from exactly one source, but it is wired \
+                         from {}. A `{wanted}` source is the one channel wired to its \
+                         consumer; wire a single source, or put a transform between them.",
+                        sources.join(" and "),
+                    )));
+                }
+            }
+        }
 
         // Both directions: a requirement may sit on the producing or the
         // consuming side of the edge.
@@ -1520,10 +1589,22 @@ pub fn validate_port_capabilities(
                 continue;
             };
 
-            let Some(satisfying) = peer
-                .capabilities
-                .iter()
-                .find(|c| cap_satisfies(c, wanted))
+            if is_surface(wanted) {
+                if peer.provides.iter().any(|p| p == wanted) {
+                    continue;
+                }
+                return Err(Error::Config(format!(
+                    "`{req_mod}.{req_port}` requires `{wanted}`, but `{peer_mod}` wired to it \
+                     provides {}. Wire a module that provides `{wanted}`.",
+                    if peer.provides.is_empty() {
+                        "nothing".to_string()
+                    } else {
+                        format!("only [{}]", peer.provides.join(", "))
+                    },
+                )));
+            }
+
+            let Some(satisfying) = peer.capabilities.iter().find(|c| cap_satisfies(c, wanted))
             else {
                 return Err(Error::Config(format!(
                     "`{req_mod}.{req_port}` requires capability `{wanted}`, but `{peer_mod}` \
@@ -1723,8 +1804,16 @@ const RETIRED_ADDRESS_KEYS_BY_TYPE: &[(&str, &[&str])] = &[
     (
         "peer_router",
         &[
-            "peer0_host", "peer0_port", "peer1_host", "peer1_port", "peer2_host", "peer2_port",
-            "peer3_host", "peer3_port", "peer4_host", "peer4_port",
+            "peer0_host",
+            "peer0_port",
+            "peer1_host",
+            "peer1_port",
+            "peer2_host",
+            "peer2_port",
+            "peer3_host",
+            "peer3_port",
+            "peer4_host",
+            "peer4_port",
         ],
     ),
 ];
@@ -1823,7 +1912,8 @@ fn connector_addressing_warnings(config: &Value) -> Vec<String> {
         if !matches!(mode.as_deref(), None | Some("0") | Some("client")) {
             continue;
         }
-        let Some(expected) = module_param(module, "verify_hostname").and_then(|v| v.as_str()) else {
+        let Some(expected) = module_param(module, "verify_hostname").and_then(|v| v.as_str())
+        else {
             continue;
         };
         let clear_in = format!("{name}.clear_in");

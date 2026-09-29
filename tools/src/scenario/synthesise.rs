@@ -68,12 +68,14 @@ pub fn synthesise_host_config(
 ///
 /// Edits to either file rebuild `fluxor-tools` automatically —
 /// `include_str!` registers the file as a build dependency.
-const CANONICAL_RUNTIME_HTML_RAW: &str = include_str!("../../../src/platform/wasm/host/runtime.html");
+const CANONICAL_RUNTIME_HTML_RAW: &str =
+    include_str!("../../../src/platform/wasm/host/runtime.html");
 const CANONICAL_HOST_SHIMS_JS_RAW: &str =
     include_str!("../../../src/platform/wasm/host/host_shims.js");
 /// Emulation Worker (?worker=1): runs the kernel + step pump off the main thread.
 /// importScripts'es the canonical host_shims.js; reused across every scenario.
-const CANONICAL_WORKER_JS_RAW: &str = include_str!("../../../src/platform/wasm/host/fluxor-worker.js");
+const CANONICAL_WORKER_JS_RAW: &str =
+    include_str!("../../../src/platform/wasm/host/fluxor-worker.js");
 /// Generic browser-overlay renderer (`presentation.shell`). Inlined
 /// into the served runtime.html (rather than a separate route) so it
 /// costs no slot against the kernel's `MAX_ROUTES = 8`. Defines
@@ -1629,4 +1631,3 @@ pub fn render_graphviz(scenario: &Scenario) -> String {
     out.push_str("}\n");
     out
 }
-

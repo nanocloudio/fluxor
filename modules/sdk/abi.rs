@@ -191,6 +191,10 @@ pub mod contracts {
         pub mod paged_arena {
             include!("contracts/storage/paged_arena.rs");
         }
+        /// Raw logical-block I/O over a `blocks` channel.
+        pub mod block {
+            include!("contracts/storage/block.rs");
+        }
         pub mod fs {
             include!("contracts/storage/fs.rs");
         }
@@ -322,6 +326,9 @@ pub mod platform {
     pub mod linux {
         pub mod host_process {
             include!("platform/linux/host_process.rs");
+        }
+        pub mod host_mount {
+            include!("platform/linux/host_mount.rs");
         }
     }
     pub mod bcm2712 {

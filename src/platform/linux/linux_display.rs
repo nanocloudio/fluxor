@@ -248,12 +248,12 @@ const LINUX_DISPLAY_HASH: u32 = 0xEE7453F4; // fnv1a32("linux_display")
 // header and takes geometry from the STREAM rather than the width/height
 // config — so a producer can resize without the two ends agreeing on a config.
 // See sector/modules/common/sector_raster.rs (`SRF1`).
+use fluxor::platform::builtin_param_tags::linux_display as display_tags;
 use fluxor::platform::builtin_param_tags::linux_display::{
     TAG_HEADER as DISPLAY_TAG_HEADER, TAG_HEIGHT as DISPLAY_TAG_HEIGHT,
     TAG_MODE as DISPLAY_TAG_MODE, TAG_PATH as DISPLAY_TAG_PATH, TAG_SCALE as DISPLAY_TAG_SCALE,
     TAG_WIDTH as DISPLAY_TAG_WIDTH,
 };
-use fluxor::platform::builtin_param_tags::linux_display as display_tags;
 // When set, each frame on `pixels` is prefixed with a self-describing header and the
 // display takes its geometry from the STREAM, not the `width`/`height` config — so a
 // producer can resize without the two ends agreeing on a config. See
@@ -522,8 +522,6 @@ fn build_linux_display(module_idx: usize, params: &[u8]) -> scheduler::BuiltInMo
             window,
         }),
     );
-    log::info!(
-        "[inst] module {module_idx} = linux_display (built-in) in={in_chan}"
-    );
+    log::info!("[inst] module {module_idx} = linux_display (built-in) in={in_chan}");
     m
 }

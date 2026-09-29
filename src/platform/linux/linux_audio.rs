@@ -152,11 +152,11 @@ struct LinuxAudioState {
 // Param TLV tags come from the module's `manifest.toml` `[[params]]` table,
 // generated into `builtin_param_tags`. `mode` selects wav=0, raw=1, null=2,
 // playback=3.
+use fluxor::platform::builtin_param_tags::linux_audio as audio_tags;
 use fluxor::platform::builtin_param_tags::linux_audio::{
     TAG_CHANNELS as AUDIO_TAG_CHANNELS, TAG_MODE as AUDIO_TAG_MODE, TAG_PATH as AUDIO_TAG_PATH,
     TAG_SAMPLE_RATE as AUDIO_TAG_SAMPLE_RATE,
 };
-use fluxor::platform::builtin_param_tags::linux_audio as audio_tags;
 
 const AUDIO_MODE_WAV: u8 = 0;
 const AUDIO_MODE_RAW: u8 = 1;
@@ -404,9 +404,7 @@ fn build_linux_audio(module_idx: usize, params: &[u8]) -> scheduler::BuiltInModu
         #[cfg(feature = "host-playback")]
         AudioMode::Playback => "playback",
     };
-    log::info!(
-        "[linux_audio] mode={mode_str} {sample_rate}Hz {channels}ch path='{path}'",
-    );
+    log::info!("[linux_audio] mode={mode_str} {sample_rate}Hz {channels}ch path='{path}'",);
     // SAFETY: module construction; no other thread observes
     // `LINUX_AUDIO_CLOCK` until step starts running.
     unsafe {
@@ -464,8 +462,6 @@ fn build_linux_audio(module_idx: usize, params: &[u8]) -> scheduler::BuiltInModu
             playback_cap_samples,
         }),
     );
-    log::info!(
-        "[inst] module {module_idx} = linux_audio (built-in) in={in_chan}"
-    );
+    log::info!("[inst] module {module_idx} = linux_audio (built-in) in={in_chan}");
     m
 }

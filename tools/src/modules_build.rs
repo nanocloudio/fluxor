@@ -67,8 +67,8 @@ const SILICON_SPECS: &[SiliconSpec] = &[
     SiliconSpec {
         silicon_id: "bcm2712",
         // Cortex-A76 — AES + SHA2 + NEON enabled so the inline-asm
-        // crypto paths in `modules/sdk/aes_gcm.rs` activate. Without
-        // these features the AESE/AESMC instructions SIGILL.
+        // crypto paths in `modules/sdk/crypto/aes_gcm.rs` activate;
+        // without them the scalar paths are compiled instead.
         module_target: "aarch64-unknown-none",
         extra_rustflags: &["-C", "target-feature=+aes,+sha2,+neon"],
         linker: Some(LinkerSpec {

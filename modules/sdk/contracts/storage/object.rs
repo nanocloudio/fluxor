@@ -70,29 +70,61 @@
 // This mirrors `storage.fs`, which states the same MUST for the same
 // reason, and it is what the wasm provider already does.
 //
-// ### Writes: there is no pending, by construction
+// ### Writes: `EINPROGRESS` means ask again with the same request
 //
-// `PUT`, `PUT_STREAMED_*` and `DELETE` MUST accept synchronously. A
-// provider MUST NOT report "not yet" from a write: it takes the bytes,
-// returns, and persists behind the call.
+// `PUT`, `PUT_STREAMED_COMMIT` and `DELETE` MAY return `EINPROGRESS` when
+// the provider cannot decide the write inside the call. A replicated
+// provider is the case: a write and its precondition are decided where
+// the entry lands in the group's log, which is the linearization point
+// `precondition` requires, and that takes a consensus round.
 //
-// This is a ruling, not an omission, and it rests on the fence. "Taken
-// but not yet durable" is already expressible, and precisely — a write
-// that has been staged and not persisted returns success carrying
-// `Fence::Volatile`, and advertises a stronger fence once it commits.
-// A caller that needs durability waits on the fence it was handed; it
-// does not retry the write. Retrying would be the wrong instrument
-// anyway: the bytes are already accepted, so a second `PUT` is a second
-// write, not a second look at the first one.
+// `EINPROGRESS` means the write is taken and not yet decided. The caller
+// MUST ask again later with byte-identical arguments, and MUST NOT change
+// them; the answer to a later ask is the decision (0, `EEXIST`, `EAGAIN`
+// for a lost etag, …) with its fence. The provider keys an undecided write
+// by the calling module and the request's bytes, so asking again is a
+// second look at the same write, never a second write. The request names
+// its buffers by address, so the buffers it names (key, value, fence out)
+// stay where they are and keep their contents until the write is decided:
+// the provider reads the value and writes the fence on a later ask, not
+// only on the first. A caller that stops asking does not undo the write:
+// it was decided in the log, and only the answer is uncollected.
 //
-// The other half of the ruling is that `EAGAIN` on the write path is
-// already taken and keeps its single meaning. `precondition::ETAG`
-// answers `EAGAIN` when the etag moved, and a caller's correct response
-// there is to re-read and retry with the new etag — the opposite of
-// what it should do for a write still in flight. A provider that
-// overloaded `EAGAIN` with "not yet" would make a lost update and a
-// pending commit indistinguishable to every consumer that uses
-// conditional writes.
+// `EAGAIN` keeps its single meaning on the write path: `precondition::ETAG`
+// answers it when the etag moved, and the caller re-reads and retries with
+// the new etag. "Not yet" has its own code, so a lost update and a pending
+// write are never confused.
+//
+// A provider that decides inside the call never answers `EINPROGRESS`.
+// "Taken but not yet durable" is a success carrying `Fence::Volatile`.
+
+/// What a storage write answered: decided, or not yet.
+///
+/// Every write `provider_call` (`PUT`, `PUT_STREAMED_COMMIT`, `DELETE`, and
+/// `storage.namespace`'s `RENAME`, `DELETE`, `BIND`) hands its return code
+/// to [`write_answer`]; the hygiene scan holds every call site to that. A
+/// `match` on the answer then has to say what the caller does with
+/// [`WriteAnswer::Pending`], which is the point: a pending write is not a
+/// failure, and the caller asks again with the same request.
+#[must_use]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriteAnswer {
+    /// The provider's decision: 0, or a negative errno (`EEXIST` for a
+    /// lost `ABSENT`, `EAGAIN` for a lost `ETAG`, …).
+    Decided(i32),
+    /// `EINPROGRESS`: taken, not yet decided. Ask again later with
+    /// byte-identical arguments.
+    Pending,
+}
+
+/// Classify a write's return code.
+pub const fn write_answer(rc: i32) -> WriteAnswer {
+    if rc == super::super::super::kernel_abi::errno::EINPROGRESS {
+        WriteAnswer::Pending
+    } else {
+        WriteAnswer::Decided(rc)
+    }
+}
 
 /// Single-shot put of a complete blob.
 ///

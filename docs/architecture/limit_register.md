@@ -98,7 +98,7 @@ CAPACITY >= PSTATUS_ROUND | src/kernel/sys/telemetry_ring.rs
 | resolver cache entry (`ip` stub resolver) | u8 (table index) | 255 | `MAX_DNS_CACHE` | modules/sdk/abi/config.rs | 32 | Names held with their address until the answer's TTL runs out; a full table replaces the entry nearest its expiry. One entry is a 64-byte name plus address and expiry (~76 B). 32 on wasm, 4 on embedded |
 | resolver pending dial (`ip` stub resolver) | u8 (table index) | 255 | `MAX_DNS_PENDING` | modules/sdk/abi/config.rs | 8 | Dials parked on a name lookup in flight; two dials of one name share one entry's query. One past the table is refused `EAGAIN` until an answer or timeout frees an entry. 8 on wasm, 4 on embedded |
 | contract class (`required_caps` bitmask, fmod header) | u64 bit position | 64 | `MAX_CONTRACTS` | src/kernel/module/provider.rs | 64 | One number for three roles: vtable index, opcode class byte, and bit position in the header's `required_caps`. Registration past the ceiling is refused EINVAL, and a dispatch id at or past it is refused ENOSYS by `check_contract_grant` before either capability gate |
-| contract-class positions consumed | — | 64 | `CONTRACT_ID_POSITIONS_ASSIGNED` | tools/src/manifest.rs | 30 | Counts the four reserved ids, excludes the kernel-internal dispatch bucket. Highest allocated is `NET_POLICY` = 0x1E, leaving 0x1F–0x3F (33 positions) free. The tools-side mirror of the space, `CONTRACT_ID_SPACE`, holds the same width as the kernel's `MAX_CONTRACTS`: an id outside it is unrepresentable in the header mask and unregisterable as a vtable |
+| contract-class positions consumed | — | 64 | `CONTRACT_ID_POSITIONS_ASSIGNED` | tools/src/manifest.rs | 31 | Counts the four reserved ids, excludes the kernel-internal dispatch bucket. Highest allocated is `HOST_MOUNT` = 0x1F, leaving 0x20–0x3F (32 positions) free. The tools-side mirror of the space, `CONTRACT_ID_SPACE`, holds the same width as the kernel's `MAX_CONTRACTS`: an id outside it is unrepresentable in the header mask and unregisterable as a vtable |
 | permission category (fmod header) | u16 bitfield | 16 | — | src/kernel/module/loader.rs | — | 9 of 16 bits assigned (`observe` = bit 8); widening changes the module header layout |
 | module index (exec_order, fault ids) | u8 | 256 | `MAX_MODULES` | modules/sdk/abi/config.rs | 255 | Deliberate keep at u8; the aarch64 profile sits at 255 — every slot the width admits except 0xFF, the no-module sentinel in the page pool, step guard and elastic allocator. Dual asserts: `src/kernel/boot/config.rs`, `src/kernel/exec/scheduler/mod.rs` |
 | channel buffer slot | i16 (−1 sentinel) | 32768 | `MAX_BUFFER_SLOTS` | src/kernel/ipc/buffer_pool.rs | — | Derived, not chosen: one slot per channel (`MAX_CHANNELS`), so the two cannot drift. `ChannelSlot.buffer_slot` holds a single id and every allocation takes its owning channel, so a slot past the channel table is unreachable and a pool short of it leaves the table's upper range unallocatable — `channel_open` refusing while slots are free. The buffer arena binds first by orders of magnitude |
@@ -115,6 +115,9 @@ CAPACITY >= PSTATUS_ROUND | src/kernel/sys/telemetry_ring.rs
 | Ordered-ack publish frame | `PUBLISH_FRAME_MAX` | modules/sdk/contracts/exchange.rs | 8717 | Derived, not chosen: `PUBLISH_OVERHEAD + KEY_MAX + PAYLOAD_MAX` — what a `publish_in` port must take as one record and what a producer declares as `max_record`. Moves when any of its three parts moves, which is why it is checked rather than restated |
 | Ordered-ack reply frame | `REPLY_FRAME_MAX` | modules/sdk/contracts/exchange.rs | 8717 | Derived, not chosen: `REPLY_OVERHEAD + KEY_MAX + PAYLOAD_MAX` — what a `reply_out` port must be able to emit as one record. Equal to `PUBLISH_FRAME_MAX` only because the two overheads happen to match; it is stated separately so a change to either frame moves only its own row |
 | Telemetry ring capacity | `CAPACITY` | src/kernel/sys/telemetry_ring.rs | 4096 | Policy, per target family (4 KiB on RP2040, 8 KiB on RP2350, 32 KiB on bcm2712/host). Records are denser than log text, so the ring sits below the log ring's split. A const assert holds it at or above one whole PSTATUS round — the scheduler emits a round as one uninterrupted burst, so a ring under that size drops the tail of *every* round and the high-index modules never report at all |
+| Block buffers lent at once | `MAX_LENDS` | src/kernel/module/block_lend.rs | 128 | Policy: the kernel's ledger of buffers lent to `storage.block` sources, across every consumer. Deeper than any source's queue (nvme holds 8 per queue) so it only binds on a runaway consumer; a `SUBMIT` past it is `EAGAIN` before the source sees it |
+| Torn-down modules awaiting their lends | `MAX_QUARANTINED` | src/kernel/module/block_lend.rs | 8 | Policy: modules torn down while a source still holds a buffer lent from them, whose memory is kept until the source returns it. Past it the memory stays lent and is not released (a leak, never a corruption) |
+| Channels closed on a quarantine's behalf | `MAX_ADOPTED` | src/kernel/module/block_lend.rs | 16 | Policy: channels carrying a lend of a torn-down module, closed once the lends are back. Past it a channel stays open |
 | Telemetry drain slots | `RING_CONSUMERS` | modules/sdk/contracts/telemetry.rs | 4 | Policy: the console exporter, one `otel` engine per export destination, and a spare. It is wire-visible — a `TLM_STATS` reply is `[head][dropped × RING_CONSUMERS]` — so a caller sizes its buffer from it and widening is an ABI change, not a tuning knob |
 | Telemetry record | `TELEMETRY_MAX_RECORD` | src/kernel/exec/scheduler/module_types.rs | 144 | Derived, not chosen: the widest record kind, a 16-bucket histogram metric. The ring reserves atomically at this size and rejects anything larger whole, so a value below the true maximum silently bounces every wider emit at the syscall rather than failing loudly |
 | Instrument dimension cardinality | `DIM_MAX_PRODUCT` | modules/sdk/contracts/telemetry.rs | 65534 | Policy: the product of one instrument's declared dimension domains, enforced at build so every composite index stays below the reserved `DIM_OTHER` (`0xFFFF`). Cardinality is a declared resource bound — an instrument that would exceed it shrinks a domain rather than discovering the ceiling at runtime |
@@ -129,7 +132,9 @@ CAPACITY >= PSTATUS_ROUND | src/kernel/sys/telemetry_ring.rs
 | HTTP/2 streams per conn | `MAX_STREAMS` | modules/sdk/abi/config.rs | 4 | Policy: bounds per-connection stream state on every profile |
 | HTTP route table | `MAX_ROUTES` | modules/sdk/abi/config.rs | 8 | Policy: a config declaring more routes is a compose-time error |
 | Provider chain depth per contract | `MAX_CHAIN_DEPTH` | src/kernel/module/provider.rs | — | Policy, per-profile (3 RP2040 / 4 RP2350 / 8 aarch64-host); registration past the ceiling is refused EBUSY |
-| KEY_VAULT key slots | `MAX_SLOTS` | src/kernel/security/key_vault.rs | 8 | Policy: generate/import with no free slot is refused ENOMEM |
+| Routed provider handles | `MAX_ROUTES` | src/kernel/module/provider.rs | — | Policy, per-profile (16 RP2040 / 32 RP2350 / 128 aarch64-host): handles minted through `provider_call_sel` that are open at once (one per file `mount` holds on a keyed volume, one per `file_block` image on `platform`). An open past it is closed at its provider and refused ENOMEM; at most 256, the width of the route index in the handle's slot |
+| KEY_VAULT key slots | `MAX_SLOTS` | src/kernel/security/key_vault.rs | — | Policy, per-profile (64 aarch64 / 8 elsewhere): a slot is held per TLS session key, per mounted encrypted volume's data key, per attaching volume's recipient key, and per Clustor WAL or snapshot master key. Clustor segment subkeys are derived inside the operation that uses them and take no slot. Generate or import with no free slot is refused ENOMEM, and a consumer refuses its attach rather than falling back |
+| PKCS#11 vault handles | `MAX_SLOTS` | src/platform/linux/hsm_key_vault.rs | 8 | Policy: token session objects one process holds through the Linux PKCS#11 backend. Separate from the kernel software vault's slots: each backend reports its own ceiling |
 | KEY_VAULT RSA entries | `RSA_ENTRIES` | src/kernel/security/key_vault.rs | 2 | Policy: an RSA key is kilobytes of CRT material and Montgomery constants rather than the 64 bytes a slot carries, so RSA slots name one of two backend entries — an identity and its successor during a rotation. A third `STORE` is refused ENOMEM until one is destroyed. Behind the `rsa-vault` feature, about 22 KB of `.bss` with the signing job |
 | RSA modulus width | `RSA_MODULUS_BITS_MAX` | modules/sdk/crypto/rsa.rs | 4096 | Policy: the widest key the core verifies or signs with. It sizes every buffer in the core and every job's step cost; no public issuer signs with more, and 8192 would double both for a key nothing presents |
 | RSA public exponent width | `RSA_EXPONENT_BITS_MAX` | modules/sdk/crypto/rsa.rs | 32 | Policy: the exponent a public operation walks; 65537 needs 17 bits, and a key whose exponent is wider is refused rather than exponentiated at length |
@@ -138,6 +143,37 @@ CAPACITY >= PSTATUS_ROUND | src/kernel/sys/telemetry_ring.rs
 | fat32 long-name length | `LFN_MAX_CHARS` | modules/foundation/fat32/mod.rs | 64 | Policy: the format allows 255, but a buffer for that is carried in the directory cursor and in every wanted-name argument, on a board whose whole module state is measured against a 240 KiB arena. A longer name is refused at creation, not clipped. Names longer than this that were written elsewhere are still preserved and retired correctly — preservation walks the companion run without decoding it, so only matching and generation are bounded |
 | fat32 free-cluster scan | `FAT_SCAN_BUDGET_SECTORS` | modules/foundation/fat32/mod.rs | 32 | Policy: FAT sectors one `provider_call` reads looking for a free cluster before returning EAGAIN with its cursor saved. Matches `DIR_SCAN_BUDGET_SECTORS` for the same reason — a synchronous device read inside a dispatch is charged to the cooperative step budget, and the FAT of a large volume is far too big to walk in one |
 | fat32 outstanding fences | `MAX_FENCES` | modules/foundation/fat32/mod.rs | — | Policy: equals `MAX_OPEN_FILES`. A fence table smaller than the handle table would let a consumer open a handle it cannot fence, which reads as a durability failure rather than a resource limit. `FSYNC_SUBMIT` past the table is refused EAGAIN (backpressure) |
+| nvme channel write pipeline | `MAX_INFLIGHT` | modules/drivers/nvme/mod.rs | — | Policy, per-profile (32 aarch64 / 8 elsewhere): writes in flight per I/O queue on the channel write path, each holding one 4 KiB DMA page. The command-id layout carries the slot in `CID_SLOT_BITS`, which moves with it |
+| nvme block requests in flight | `V1_SLOTS` | modules/drivers/nvme/mod.rs | 8 | Policy: `storage.block` requests one namespace holds between `SUBMIT` and `REAP`, each with its own command id and 4 KiB DMA page. It is the `queue_depth` the source reports. They share I/O queue 0 with the channel pipeline, the bulk ring and the synchronous paths, and the sum stays below `IO_Q_ENTRIES` |
+| nvme preflush flushes in flight | `V1_FLUSH_SLOTS` | modules/drivers/nvme/mod.rs | 4 | Policy: Flushes the `F_PREFLUSH` requests of one namespace can have outstanding at once, each its own command identifier. Past it a preflush request is `EAGAIN` before anything is submitted, so a retry never reuses an identifier still on the controller |
+| nvme I/O queue pairs | `MAX_IO_QUEUES` | modules/drivers/nvme/mod.rs | 4 | Policy: submission/completion queue pairs created at bring-up; the channel write pipeline stripes across them and every other path runs on queue 0 |
+| nvme blocks per command | `MAX_NLB` | modules/drivers/nvme/mod.rs | 8 | Sanity bound: one PRP1 page of 512-byte sectors, so no command needs a PRP list on the channel and synchronous paths |
+| nvme pager bulk ring | `ASYNC_BULK_SLOTS` | modules/drivers/nvme/mod.rs | 8 | Policy: pager bulk commands in flight, each owning `MAX_BULK_PAGES` of contiguous DMA |
+| nvme held completions | `HELD_MAX` | modules/drivers/nvme/mod.rs | 8 | Policy: completions a synchronous request takes off queue 0 and holds for their owner (a stream read's) to reach its own behind them; past it the request waits for the owner to consume them |
+| nvme pager bulk transfer | `MAX_BULK_PAGES` | modules/drivers/nvme/mod.rs | 32 | Policy: 4 KiB pages one pager bulk command moves through its PRP list (128 KiB) |
+| file_block requests awaiting reap | `QUEUE_DEPTH` | modules/foundation/file_block/mod.rs | 8 | Policy: completions a `SUBMIT` queues for `REAP`; the queue depth the source reports. A `SUBMIT` past it is refused EAGAIN |
+| file_block blocks per request | `MAX_BLOCKS` | modules/foundation/file_block/mod.rs | 64 | Policy: bounds the file I/O one request runs inside its caller's dispatch |
+| file_block image path | `PATH_CAP` | modules/foundation/file_block/mod.rs | 96 | Policy: the longest image path the `path` parameter holds; a longer one is truncated at parse and fails to open |
+| file_block fs volume name | `VOLUME_CAP` | modules/foundation/file_block/mod.rs | 16 | Policy: the longest selector the `volume` parameter holds; a longer one is refused at open (EINVAL), never clipped into another provider's name |
+| crypt_block authentication unit | `MAX_UNIT` | modules/foundation/crypt_block/mod.rs | 4096 | Policy: the largest authentication unit, which sizes the module's unit, ciphertext and journal-header scratch buffers |
+| crypt_block lower block | `MAX_LOWER_BLOCK` | modules/foundation/crypt_block/mod.rs | 4096 | Policy: the largest lower logical block the metadata read-modify-write buffer holds; a larger lower device is refused at mount |
+| crypt_block requests awaiting reap | `QUEUE_DEPTH` | modules/foundation/crypt_block/mod.rs | 8 | Policy: completions a `SUBMIT` queues for `REAP`; the queue depth the source reports |
+| crypt_block journal records | `MAX_JOURNAL_RECORDS` | modules/foundation/crypt_block/mod.rs | 64 | Policy: journal records indexed in memory until they are home (half the largest journal). A full journal runs a flush cycle before the next write |
+| crypt_block nonce reservation | `NONCE_STRIDE` | modules/foundation/crypt_block/mod.rs | 1048576 | Policy: nonce sequences reserved per superblock write. A restart abandons the unused rest of a range, so the stride trades superblock writes against wasted sequences out of 2^64 |
+| crypt_block key label | `KEY_LABEL_CAP` | modules/foundation/crypt_block/mod.rs | 64 | Mirrors the vault's `MAX_LABEL` |
+| crypt_block rotation batch | `MIGRATE_BATCH` | modules/foundation/crypt_block/mod.rs | 8 | Policy: units a data-key rotation re-seals, or metadata blocks its retirement scan reads, in one module step; bounds the rotation's share of a step while the volume stays mounted |
+| crypt_block engine pump | `STEP_BUDGET` | modules/foundation/crypt_block/mod.rs | 4096 | Policy: lower requests and operation resumptions one pump of the lower-I/O engine runs before it yields to the next step. Above a whole upper request over a source that completes inline (a full journal cycle at one lower block per request), so `EXEC` over such a source still completes in its call; a format or erase of a large device spans steps |
+| crypt_block operation nesting | `MAX_FRAMES` | modules/foundation/crypt_block/mod.rs | 5 | Implementation: resumable operations under way at once — a request, the unit write it makes, the journal cycle that write needs, the metadata write in that — with one to spare; a deeper call fails `EIO` rather than overrunning |
+| nbd_serve chunks in flight | `MAX_SLOTS` | modules/foundation/nbd_serve/mod.rs | 8 | Policy: buffer slots, and so block requests one NBD client keeps in flight to the source; the `queue_depth` parameter and the source's reported depth can only lower it. Each slot is `SLOT_SIZE` of module state |
+| nbd_serve chunk size | `SLOT_SIZE` | modules/foundation/nbd_serve/mod.rs | 16384 | Policy: the largest block request one NBD read or write is split into (lower when the source's `max_blocks` is). Larger NBD requests stream through the pool chunk by chunk; a source block larger than a slot is not published |
+| nbd_serve NBD requests admitted | `MAX_REQUESTS` | modules/foundation/nbd_serve/mod.rs | 16 | Policy: NBD requests held between their header and their reply. A client past it is not read until one is answered, so TCP backpressure holds it |
+| nbd_serve largest request | `MAX_REQUEST_BYTES` | modules/foundation/nbd_serve/mod.rs | 33554432 | Policy: ceiling on the `max_request` parameter, the NBD protocol's customary 32 MiB maximum payload. A read or write past `max_request` is refused EINVAL (a write's payload is drained, not buffered) |
+| nbd_serve export name | `EXPORT_NAME_CAP` | modules/foundation/nbd_serve/mod.rs | 64 | Policy: the longest `export` parameter; a client naming anything else is refused |
+| nbd_serve option payload | `OPT_BUF_SIZE` | modules/foundation/nbd_serve/mod.rs | 512 | Policy: the longest handshake option parsed; a longer one is drained and refused (`ERR_TOO_BIG`, or a close for `EXPORT_NAME`, which has no error reply) |
+| nbd_serve reply frame | `OUT_DATA_MAX` | modules/foundation/nbd_serve/mod.rs | 4096 | Policy: reply bytes in one `CMD_SEND`; below `net_proto::MAX_CMD_DATA` and a sixteenth of the 64 KiB `net_out` buffer the manifest asks for |
+| nbd_serve frames read per step | `STEP_FRAME_BUDGET` | modules/foundation/nbd_serve/mod.rs | 16 | Policy: transport frames (at most 1460 payload bytes each) one step parses, bounding the payload a step copies into slots |
+| nbd_serve frames sent per step | `STEP_SEND_BUDGET` | modules/foundation/nbd_serve/mod.rs | 16 | Policy: reply frames one step writes |
+| nbd_serve completions per step | `STEP_REAP_BUDGET` | modules/foundation/nbd_serve/mod.rs | 16 | Policy: completions one step reaps from the source; covers `MAX_SLOTS` twice |
 | resolver name held | `DNS_NAME_CAP` | modules/foundation/ip/mod.rs | 64 | Policy: the longest name the stub resolver holds, in a cache entry and in a pending dial. It is what bounds those tables on an MCU-class profile, so a dial naming something longer is refused EINVAL rather than truncated to a name that resolves to somewhere else |
 | OTA registry authority | `MAX_AUTHORITY_LEN` | modules/foundation/ota_registry/mod.rs | 128 | Policy: the `host[:port]` the puller dials and sends as `Host:`. A longer one is refused at construction, naming the parameter — a truncated authority would dial a different registry |
 | TLS/DTLS peer certificate | `MAX_CERT_LEN` | modules/foundation/tls/mod.rs | 2048 | Policy: the longest single certificate the module retains — each trust anchor, and the leaf inside a configured chain. An anchor past it refuses the instance rather than being stored truncated, because a truncated certificate is one that verifies nothing |
@@ -251,8 +287,9 @@ cannot be evaluated from its own file reads `—` and says why.
 | Dynamic tag routes | `MAX_DYN_TAG_ROUTES` | src/kernel/module/provider.rs | 4 | Policy: keyed provider routes a policy module may add at runtime |
 | Key material per vault slot | `MAX_KEY_BYTES` | src/kernel/security/key_vault.rs | 64 | Policy: a P-256 scalar is 32; the doubled width admits larger keying material without a header change |
 | Vault label | `MAX_LABEL` | src/kernel/security/key_vault.rs | 64 | Policy, wire-visible: the label is how a module names a key; the contract's `MAX_LABEL` mirrors it |
-| Persisted vault keys | `MAX_PERSISTED` | src/kernel/security/key_vault.rs | 8 | Policy: a deployment needing more persisted keys than this needs a real HSM, which is the tier the policy would already be asking for |
+| Persisted vault keys | `MAX_PERSISTED` | src/kernel/security/key_vault.rs | — | Policy, per-profile (64 aarch64 / 8 elsewhere), like the slot table: a Pi-class node persists a master per Clustor group, replica and key epoch, per locally encrypted volume, and its identities. With none free, persisting is refused and the consumer refuses its operation rather than holding an unpersisted key |
 | One AEAD seal/open | `MAX_SEAL_BYTES` | src/kernel/security/key_vault.rs | 2048 | Policy: a resumption ticket or a checkpoint chunk in one call, never a bulk stream; a larger plaintext is refused EINVAL |
+| Consumed share envelopes | `MAX_CONSUMED` | src/kernel/security/key_share.rs | 32 | Policy: anti-replay ids of the last envelopes a reconstruction used, refused EACCES if presented again. An attachment envelope's recipient is a fresh key destroyed after the attach, which stops replay to any other opener; the ring covers the recipient's own lifetime, which spans one attach |
 | Parameter tag space | `PARAM_TAG_MAX` | tools/src/manifest.rs | 239 | Id width: a module parameter is addressed by a byte tag, and 0xF0–0xFF are reserved for protection and policy metadata (voice-preset blobs, TLV magic, the terminator among them) |
 | Transmit-side ethernet frame | `MAX_FRAME_SIZE` | modules/foundation/ip/mod.rs | 1536 | Policy: the frame ceiling every NIC driver and `ip` size their staging to — MTU plus headers, rounded to a 32-byte multiple. Every transmit-payload ceiling in `ip` derives from it |
 | Listening TCP sockets | `MAX_LISTENERS` | modules/foundation/ip/mod.rs | — | Policy, per-profile (derived from `MAX_TCP_CONNS`): a SYN is matched against the listener list, never the whole table |
@@ -324,7 +361,7 @@ MAX_DNS_PENDING | modules/sdk/abi/config.rs | 8 | host
 MAX_DNS_PENDING | modules/sdk/abi/config.rs | 8 | wasm
 MAX_DNS_PENDING | modules/sdk/abi/config.rs | 4 | embedded
 MAX_CONTRACTS | src/kernel/module/provider.rs | 64 | *
-CONTRACT_ID_POSITIONS_ASSIGNED | tools/src/manifest.rs | 30 | *
+CONTRACT_ID_POSITIONS_ASSIGNED | tools/src/manifest.rs | 31 | *
 MAX_MODULES | modules/sdk/abi/config.rs | 255 | host
 MAX_MODULES | modules/sdk/abi/config.rs | 48 | wasm
 MAX_MODULES | modules/sdk/abi/config.rs | 32 | embedded
@@ -375,7 +412,12 @@ MAX_ROUTES | modules/sdk/abi/config.rs | 4 | embedded
 MAX_CHAIN_DEPTH | src/kernel/module/provider.rs | 3 | chip-rp2040
 MAX_CHAIN_DEPTH | src/kernel/module/provider.rs | 4 | rp2350-chip
 MAX_CHAIN_DEPTH | src/kernel/module/provider.rs | 8 | non-rp
-MAX_SLOTS | src/kernel/security/key_vault.rs | 8 | *
+MAX_ROUTES | src/kernel/module/provider.rs | 16 | chip-rp2040
+MAX_ROUTES | src/kernel/module/provider.rs | 32 | rp2350-chip
+MAX_ROUTES | src/kernel/module/provider.rs | 128 | non-rp
+MAX_SLOTS | src/kernel/security/key_vault.rs | 64 | host
+MAX_SLOTS | src/kernel/security/key_vault.rs | 8 | off-host
+MAX_SLOTS | src/platform/linux/hsm_key_vault.rs | 8 | *
 RSA_ENTRIES | src/kernel/security/key_vault.rs | 2 | rsa-vault
 RSA_MODULUS_BITS_MAX | modules/sdk/crypto/rsa.rs | 4096 | *
 RSA_EXPONENT_BITS_MAX | modules/sdk/crypto/rsa.rs | 32 | *
@@ -385,6 +427,38 @@ DIR_SCAN_BUDGET_SECTORS | modules/foundation/fat32/mod.rs | 32 | *
 LFN_MAX_CHARS | modules/foundation/fat32/mod.rs | 64 | *
 FAT_SCAN_BUDGET_SECTORS | modules/foundation/fat32/mod.rs | 32 | *
 MAX_FENCES | modules/foundation/fat32/mod.rs | MAX_OPEN_FILES | *
+MAX_INFLIGHT | modules/drivers/nvme/mod.rs | 32 | host
+MAX_INFLIGHT | modules/drivers/nvme/mod.rs | 8 | off-host
+V1_SLOTS | modules/drivers/nvme/mod.rs | 8 | *
+V1_FLUSH_SLOTS | modules/drivers/nvme/mod.rs | 4 | *
+MAX_IO_QUEUES | modules/drivers/nvme/mod.rs | 4 | *
+MAX_NLB | modules/drivers/nvme/mod.rs | 8 | *
+ASYNC_BULK_SLOTS | modules/drivers/nvme/mod.rs | 8 | *
+HELD_MAX | modules/drivers/nvme/mod.rs | 8 | *
+MAX_BULK_PAGES | modules/drivers/nvme/mod.rs | 32 | *
+QUEUE_DEPTH | modules/foundation/file_block/mod.rs | 8 | *
+MAX_BLOCKS | modules/foundation/file_block/mod.rs | 64 | *
+PATH_CAP | modules/foundation/file_block/mod.rs | 96 | *
+VOLUME_CAP | modules/foundation/file_block/mod.rs | 16 | *
+MAX_UNIT | modules/foundation/crypt_block/mod.rs | 4096 | *
+MAX_LOWER_BLOCK | modules/foundation/crypt_block/mod.rs | 4096 | *
+QUEUE_DEPTH | modules/foundation/crypt_block/mod.rs | 8 | *
+MAX_JOURNAL_RECORDS | modules/foundation/crypt_block/mod.rs | 64 | *
+NONCE_STRIDE | modules/foundation/crypt_block/mod.rs | 1 << 20 | *
+KEY_LABEL_CAP | modules/foundation/crypt_block/mod.rs | 64 | *
+MIGRATE_BATCH | modules/foundation/crypt_block/mod.rs | 8 | *
+STEP_BUDGET | modules/foundation/crypt_block/mod.rs | 4096 | *
+MAX_FRAMES | modules/foundation/crypt_block/mod.rs | 5 | *
+MAX_SLOTS | modules/foundation/nbd_serve/mod.rs | 8 | *
+SLOT_SIZE | modules/foundation/nbd_serve/mod.rs | 16384 | *
+MAX_REQUESTS | modules/foundation/nbd_serve/mod.rs | 16 | *
+MAX_REQUEST_BYTES | modules/foundation/nbd_serve/mod.rs | 32 << 20 | *
+EXPORT_NAME_CAP | modules/foundation/nbd_serve/mod.rs | 64 | *
+OPT_BUF_SIZE | modules/foundation/nbd_serve/mod.rs | 512 | *
+OUT_DATA_MAX | modules/foundation/nbd_serve/mod.rs | 4096 | *
+STEP_FRAME_BUDGET | modules/foundation/nbd_serve/mod.rs | 16 | *
+STEP_SEND_BUDGET | modules/foundation/nbd_serve/mod.rs | 16 | *
+STEP_REAP_BUDGET | modules/foundation/nbd_serve/mod.rs | 16 | *
 DNS_NAME_CAP | modules/foundation/ip/mod.rs | 64 | *
 MAX_AUTHORITY_LEN | modules/foundation/ota_registry/mod.rs | 128 | *
 MAX_CERT_LEN | modules/foundation/tls/mod.rs | 2048 | *
@@ -539,23 +613,38 @@ MAX_PROVIDERS | src/kernel/module/provider.rs | MAX_CONTRACTS | *
 MAX_DYN_TAG_ROUTES | src/kernel/module/provider.rs | 4 | *
 MAX_KEY_BYTES | src/kernel/security/key_vault.rs | 64 | *
 MAX_LABEL | src/kernel/security/key_vault.rs | 64 | *
-MAX_PERSISTED | src/kernel/security/key_vault.rs | 8 | *
+MAX_PERSISTED | src/kernel/security/key_vault.rs | 64 | host
+MAX_PERSISTED | src/kernel/security/key_vault.rs | 8 | off-host
 MAX_SEAL_BYTES | src/kernel/security/key_vault.rs | 2048 | *
+MAX_CONSUMED | src/kernel/security/key_share.rs | 32 | *
 PARAM_TAG_MAX | tools/src/manifest.rs | 0xEF | *
 ```
 
 Constants in these files that are shaped like ceilings but are not
 resource decisions — record layouts, scratch sized from a ceiling above,
-protocol constants, mirrors of a registered symbol — are retired from
+protocol constants, mirrors of a registered symbol — are excluded from
 the coverage report here, each with the reason it is not a row.
 
 ```limit-register-exempt
+CTRL_CAP | modules/foundation/nbd_serve/mod.rs | derived: the longest handshake answer, EXPORT_NAME's 134 bytes with the pad, or GO's two infos and ACK
+INFO_BLOCK_SIZE | modules/foundation/nbd_serve/mod.rs | protocol: the NBD info type number for block-size constraints
 NET_CMD_RECORD_CAPACITY | modules/foundation/tls/mod.rs | derived: the frame scratch less overhead, capped by net_proto MAX_CMD_DATA
 CLEAR_CHUNK_MAX | modules/foundation/tls/mod.rs | derived: the record payload budget of NET_CMD_RECORD_CAPACITY
 HS_FRAGMENT_MAX | modules/foundation/tls/mod.rs | derived: the same budget less the appended ChangeCipherSpec record
 WIRE_RECORD_MAX | modules/foundation/tls/mod.rs | derived: equals NET_CMD_RECORD_CAPACITY; sizes the record staging buffers
 NET_SCRATCH_SIZE | modules/foundation/tls/mod.rs | scratch: one net frame around one TLS record
 MAX_KEY_LEN | modules/foundation/quic/mod.rs | mirror of the registered tls MAX_KEY_LEN, so a key_file shared between them packs identically
+BLOCK_SIZE | modules/drivers/nvme/mod.rs | format: the 512-byte sector the channel stream moves
+PAGER_WRITE_SLOTS | modules/drivers/nvme/mod.rs | derived: ASYNC_BULK_SLOTS * MAX_BULK_PAGES
+REG_CAP | modules/drivers/nvme/mod.rs | register offset: controller capabilities
+REQ_HDR_SIZE | modules/drivers/nvme/mod.rs | wire: the channel write-request header
+SQE_SIZE | modules/drivers/nvme/mod.rs | format: the 64-byte NVMe submission entry, re-exported to the host-test controller model
+CQE_SIZE | modules/drivers/nvme/mod.rs | format: the 16-byte NVMe completion entry, re-exported to the host-test controller model
+IO_READ_BUDGET | modules/drivers/nvme/mod.rs | mirror of IO_READ_BUDGET_MS, a timeout and not a capacity, re-exported to the host-test controller model
+PAGER_SUBMIT_BUDGET | modules/drivers/nvme/mod.rs | mirror of PAGER_SUBMIT_BUDGET_MS, a timeout and not a capacity, re-exported to the host-test controller model
+MAX_HEADER | src/kernel/security/key_vault.rs | derived: the persisted-record header, magic through the longest label
+MAX_BLOB_NAME | src/kernel/security/key_vault.rs | derived: the durable name, namespace and the longest label
+PEER_MAX | src/kernel/security/key_share.rs | derived: an uncompressed P-256 point, the one encapsulation a v1 envelope carries
 MUX_DATA_MAX | modules/foundation/quic/mod.rs | derived: mux::MUX_QUIC_STREAM_RX_MAX, the contract's published bound
 NET_BUF_SIZE | modules/foundation/quic/mod.rs | scratch: one net frame around one QUIC packet
 ERR_STREAM_LIMIT | modules/foundation/quic/connection.rs | RFC 9000 §20.1 transport error code STREAM_LIMIT_ERROR, a protocol constant

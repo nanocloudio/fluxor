@@ -52,8 +52,8 @@ required = true
 A consumer opens a stream with `CMD_CONNECT_TO` (`net_proto`, 0x14), whose
 target carries an address family: `AF_INET` dials the literal at once,
 `AF_INET6` is refused `EINVAL` (there is no IPv6 stack), and `AF_NAME` is
-resolved here before the SYN goes out. The retired `CMD_CONNECT` (0x13) is
-answered `MSG_ERROR ENOSYS` on its tag, with one log line naming the
+resolved here before the SYN goes out. The reserved `CMD_CONNECT` (0x13) is
+unsupported and answered `MSG_ERROR ENOSYS` on its tag, with one log line naming the
 replacement, so a stale emitter fails on its first dial.
 
 The stub resolver is this module's: it owns the datagram path and the DHCP

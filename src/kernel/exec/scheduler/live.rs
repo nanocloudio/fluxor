@@ -30,8 +30,8 @@
 //! (host-linux + bcm2712 enable it; bare-metal rp compiles it out at zero cost).
 
 use super::{
-    BuiltInModule, Edge, InstantiateResult, ModulePorts, ModuleSlot, SchedulerState, MAX_CHANNELS,
-    MAX_MODULES, SCHED,
+    BuiltInModule, Edge, InstantiateResult, ModuleSlot, SchedulerState, MAX_CHANNELS, MAX_MODULES,
+    SCHED,
 };
 use crate::kernel::boot::config::ModuleEntry;
 use crate::kernel::workload::owner::{OwnerHandle, OwnerState, OWNER_SYSTEM};
@@ -60,8 +60,7 @@ pub const SPARE_LANE_SENTINEL: u16 = 0xFFFF;
 pub enum ModuleSource {
     /// A PIC `.fmod` resolved by `name_hash`, instantiated via the loader.
     /// Must complete synchronously (`InstantiateResult::Done`); an async
-    /// (`Pending`) load yields [`AddError::WouldBlock`] — the async path is a
-    /// follow-up, not part of the keystone core.
+    /// (`Pending`) load yields [`AddError::WouldBlock`].
     Pic(ModuleEntry),
     /// A statically-linked built-in (host shims, REPL/test emitters). The
     /// module resolves its channels from its port table (populated before
@@ -97,6 +96,36 @@ pub enum Endpoint {
     /// back-pressuring the producer — and the tapped module's own wiring is
     /// untouched. FLXA endpoint kind 2. One tap per channel.
     Tap(u16),
+    /// The node's network, through a lane of the workload's own
+    /// (`kernel::workload::net_attach`). As an edge `to` it receives a new
+    /// module's net commands; as an edge `from` it delivers that module's net
+    /// events. The key pairs the two: each key names exactly one edge of
+    /// each direction, and each key is a lane. FLXA endpoint kind 3.
+    Net(u8),
+    /// The module that is staging this subgraph (see [`set_caller`]): the
+    /// workload manager's own lanes into the graph it creates, for what it
+    /// must exchange with it — a key's record, a control input. Each key
+    /// names at most one edge of each direction. FLXA endpoint kind 4.
+    Caller(u8),
+}
+
+/// `to_port_index` bit on an FLXA edge that addresses the consumer's control
+/// input rather than a data input; the low bits are the control port index.
+pub const CTRL_PORT_BIT: u8 = 0x80;
+
+/// The module staging the next subgraph, for `Endpoint::Caller`.
+static mut CALLER: Option<usize> = None;
+
+/// Name the module on whose behalf the next `apply_add` stages a subgraph,
+/// so `Endpoint::Caller` resolves to it; `None` after the add.
+pub fn set_caller(slot: Option<usize>) {
+    // SAFETY: scheduler thread only, like the add it brackets.
+    unsafe { *core::ptr::addr_of_mut!(CALLER) = slot };
+}
+
+fn caller() -> Option<usize> {
+    // SAFETY: as `set_caller`.
+    unsafe { *core::ptr::addr_of!(CALLER) }
 }
 
 /// One edge of the added subgraph. `from`/`to` are subgraph-local for new
@@ -150,6 +179,8 @@ pub enum AddError {
     /// module state. Refused at admission rather than allowed to draw down the
     /// shared state arena at its neighbours' expense.
     StateCapExceeded,
+    /// The node's net provider refused a lane.
+    NetAttachFailed,
 }
 
 impl AddError {
@@ -166,6 +197,7 @@ impl AddError {
             AddError::Instantiate => -8,
             AddError::WouldBlock => -11, // -EAGAIN
             AddError::StateCapExceeded => -9,
+            AddError::NetAttachFailed => -10,
         }
     }
 }
@@ -327,7 +359,11 @@ pub fn apply_add(
                 }
                 let candidate = scan;
                 scan += 1;
-                if matches!(s.modules[candidate], ModuleSlot::Empty) {
+                // A torn-down module's memory is kept while a source may still
+                // write into a buffer lent from it; the slot is not free yet.
+                if matches!(s.modules[candidate], ModuleSlot::Empty)
+                    && !crate::kernel::module::block_lend::slot_quarantined(candidate)
+                {
                     break candidate;
                 }
             };
@@ -338,7 +374,7 @@ pub fn apply_add(
     // Resolve an endpoint to a global module index.
     let resolve = |ep: Endpoint| -> Option<usize> {
         match ep {
-            Endpoint::New(l) => local_to_global.get(l as usize).copied(),
+            Endpoint::New(l) => local_to_global[..n].get(l as usize).copied(),
             Endpoint::Existing(g) | Endpoint::Tap(g) => {
                 let g = g as usize;
                 if g < MAX_MODULES && !matches!(sched().modules[g], ModuleSlot::Empty) {
@@ -350,8 +386,20 @@ pub fn apply_add(
             // A raw channel id resolves to no module — attach edges are handled
             // out of band in the edge-build loop below.
             Endpoint::ExistingChannel(_) => None,
+            // The node's net provider; the lane is attached once the subgraph
+            // has instantiated.
+            Endpoint::Net(_) => crate::kernel::workload::net_attach::provider_slot(),
+            Endpoint::Caller(_) => caller()
+                .filter(|&g| g < MAX_MODULES && !matches!(sched().modules[g], ModuleSlot::Empty)),
         }
     };
+
+    // Each net key must name exactly one command edge (into the network) from
+    // a new module and one event edge (out of it) to a new module.
+    if !net_keys_paired(sub.edges) || !caller_keys_valid(sub.edges) {
+        sched().owners.free(handle);
+        return Err(AddError::BadEndpoint);
+    }
 
     // 3. Append the new edges to `sched.edges[edge_base..]`.
     let edge_base = sched().edge_count;
@@ -420,8 +468,12 @@ pub fn apply_add(
         } else {
             -1
         };
-        let mut edge =
-            Edge::new_indexed(from, "out", ae.from_port_index, to, "in", ae.to_port_index);
+        let (to_port, to_index) = if ae.to_port_index & CTRL_PORT_BIT != 0 {
+            ("ctrl", ae.to_port_index & !CTRL_PORT_BIT)
+        } else {
+            ("in", ae.to_port_index)
+        };
+        let mut edge = Edge::new_indexed(from, "out", ae.from_port_index, to, to_port, to_index);
         edge.tap = tap_source >= 0;
         edge.tap_source = tap_source;
         edge.buffer_bytes = ae.buffer_bytes;
@@ -523,6 +575,33 @@ pub fn apply_add(
         // Ready-gate only on NEW upstream modules — never gate on existing ones,
         // and never modify an existing module's mask (isolation).
         s.upstream_mask[slot].clear_all();
+    }
+    // Hand each net key's two channels to the node's net provider as one lane
+    // of this owner's. Every module has instantiated, so nothing it opens can
+    // precede its lane; a refused lane rolls the whole add back.
+    for (i, ae) in sub.edges.iter().enumerate() {
+        let Endpoint::Net(key) = ae.to else {
+            continue;
+        };
+        let commands = sched().edges[edge_base + i].channel;
+        let events = sub
+            .edges
+            .iter()
+            .position(|x| matches!(x.from, Endpoint::Net(k) if k == key))
+            .map(|j| sched().edges[edge_base + j].channel)
+            .unwrap_or(-1);
+        // SAFETY: scheduler thread; both channels were opened above for
+        // this owner's edges.
+        let rc =
+            unsafe { crate::kernel::workload::net_attach::attach(handle, key, commands, events) };
+        if rc != 0 {
+            log::warn!(
+                "[live] owner slot {} net lane {key} refused: {rc}",
+                handle.slot
+            );
+            rollback_add(handle, &local_to_global[..n], edge_base, e);
+            return Err(AddError::NetAttachFailed);
+        }
     }
     // Fill new modules' upstream masks from intra-owner edges (after all slots
     // are known) for deterministic ready-gating among the added modules.
@@ -640,8 +719,8 @@ fn instantiate_pic(slot: usize, entry: &ModuleEntry) -> Result<(), AddError> {
         &mut s.ports,
     ) {
         InstantiateResult::Done => Ok(()),
-        // Async/streaming load is a documented follow-up; abort the pending
-        // handle so no half-built slot lingers.
+        // A load that cannot complete synchronously is refused; abort the
+        // pending handle so no half-built slot lingers.
         InstantiateResult::Pending(pending) => {
             // SAFETY: `pending` is the loader handle just returned for `slot`.
             unsafe { pending.abort() };
@@ -649,6 +728,54 @@ fn instantiate_pic(slot: usize, entry: &ModuleEntry) -> Result<(), AddError> {
         }
         InstantiateResult::Error(_) => Err(AddError::Instantiate),
     }
+}
+
+/// Whether every net key in `edges` names exactly one command edge (a new
+/// module into the network) and one event edge (the network to a new module).
+fn net_keys_paired(edges: &[AddEdge]) -> bool {
+    for ae in edges {
+        let key = match (ae.from, ae.to) {
+            (Endpoint::New(_), Endpoint::Net(k)) | (Endpoint::Net(k), Endpoint::New(_)) => k,
+            (Endpoint::Net(_), _) | (_, Endpoint::Net(_)) => return false,
+            _ => continue,
+        };
+        let into = edges
+            .iter()
+            .filter(|x| matches!(x.to, Endpoint::Net(k) if k == key))
+            .count();
+        let out = edges
+            .iter()
+            .filter(|x| matches!(x.from, Endpoint::Net(k) if k == key))
+            .count();
+        if into != 1 || out != 1 {
+            return false;
+        }
+    }
+    true
+}
+
+/// Whether every caller key names at most one edge of each direction, each
+/// between the caller and a new module.
+fn caller_keys_valid(edges: &[AddEdge]) -> bool {
+    for ae in edges {
+        let key = match (ae.from, ae.to) {
+            (Endpoint::New(_), Endpoint::Caller(k)) | (Endpoint::Caller(k), Endpoint::New(_)) => k,
+            (Endpoint::Caller(_), _) | (_, Endpoint::Caller(_)) => return false,
+            _ => continue,
+        };
+        let into = edges
+            .iter()
+            .filter(|x| matches!(x.to, Endpoint::Caller(k) if k == key))
+            .count();
+        let out = edges
+            .iter()
+            .filter(|x| matches!(x.from, Endpoint::Caller(k) if k == key))
+            .count();
+        if into > 1 || out > 1 {
+            return false;
+        }
+    }
+    true
 }
 
 /// Roll back a partially-applied add. The exec-order splice has not happened
@@ -660,17 +787,18 @@ fn rollback_add(handle: OwnerHandle, slots: &[usize], edge_base: usize, e: usize
     // Same edge, same ordering as `free_owner`: notify before anything is torn
     // down and while the handle still resolves.
     crate::kernel::module::provider::notify_owner_released(handle);
+    // SAFETY: scheduler thread, before the owner's channels close.
+    unsafe { crate::kernel::workload::net_attach::detach(handle) };
     let s = sched();
     for &slot in slots {
-        let taken = core::mem::replace(&mut s.modules[slot], ModuleSlot::Empty);
-        if let ModuleSlot::Dynamic(dm) = taken {
-            // SAFETY: the slot is being torn down and will not be stepped.
-            unsafe { dm.free() };
-        }
-        s.ports[slot] = ModulePorts::empty();
-        s.upstream_mask[slot].clear_all();
-        s.ready[slot] = true;
-        s.finished[slot] = false;
+        // What a module that instantiated registered or opened (provider
+        // layer, ioctl handler, events, timers) goes before its state does.
+        crate::kernel::module::syscalls::release_module_handles(slot as u8);
+        // The module never stepped, so it lent nothing and its memory goes
+        // back at once, with its protection domain and slot bookkeeping.
+        super::free_module_state(slot);
+        s.type_hash[slot] = 0;
+        s.slot_generation[slot] = s.slot_generation[slot].wrapping_add(1);
         super::set_module_owner(slot, OWNER_SYSTEM);
     }
     if e > 0 {
@@ -786,6 +914,10 @@ pub fn free_owner(handle: OwnerHandle) -> Result<(), FreeError> {
     // paths that bypass it — the workload verbs (KILL/DESTROY) and admission
     // rollback — are covered by the same edge.
     crate::kernel::module::provider::notify_owner_released(handle);
+    // Its net lanes go before its channels close, and the provider closes
+    // every endpoint they opened.
+    // SAFETY: scheduler thread, before the owner's channels close.
+    unsafe { crate::kernel::workload::net_attach::detach(handle) };
     // Which module slots belong to this owner, and which domains they occupy —
     // captured up front (pure reads) BEFORE any mutation, because the metal
     // per-domain unsplice below needs the freed owner's domain set, and
@@ -834,11 +966,9 @@ pub fn free_owner(handle: OwnerHandle) -> Result<(), FreeError> {
             }
             if let ModuleSlot::Dynamic(ref m) = s.modules[i] {
                 // SAFETY: module is live and about to be torn down; drain runs
-                // on its owning (scheduler) core.
-                unsafe {
-                    super::set_current_module(i);
-                    let _ = m.call_drain();
-                }
+                // on its owning (scheduler) core. The caller (a workload
+                // manager's KILL or DESTROY) gets its own context back.
+                let _ = super::with_module_context(i, || unsafe { m.call_drain() });
             }
             s.finished[i] = true;
         }
@@ -858,6 +988,14 @@ pub fn free_owner(handle: OwnerHandle) -> Result<(), FreeError> {
             w += 1;
         }
         s.exec_order_count = w;
+    }
+
+    // A module with buffers lent to a block source is being torn down: from
+    // here the kernel reaps its completions itself (see `block_lend`).
+    for (i, &is_owned) in owned.iter().enumerate() {
+        if is_owned {
+            crate::kernel::module::block_lend::mark_dying(i);
+        }
     }
 
     // 3. Close the owner's edges and compact the edges array. Nothing
@@ -893,7 +1031,14 @@ pub fn free_owner(handle: OwnerHandle) -> Result<(), FreeError> {
                 // removed with the owner but its channel is NEVER closed — the
                 // boot merge caches it. Dropping the edge alone frees the lane
                 // (`channel_producer_owner` reverts to system on the next scan).
-                if edge.channel >= 0 && !edge.shared_channel {
+                //
+                // A channel carrying a buffer lent from a torn-down module stays
+                // open: the source can only be asked to return it there. The
+                // ledger closes it once the lends are back.
+                if edge.channel >= 0
+                    && !edge.shared_channel
+                    && !crate::kernel::module::block_lend::adopt_channel(edge.channel)
+                {
                     crate::kernel::module::syscalls::channel_close(edge.channel);
                 }
                 continue;
@@ -916,23 +1061,19 @@ pub fn free_owner(handle: OwnerHandle) -> Result<(), FreeError> {
             if !is_owned {
                 continue;
             }
-            // A live-added module may have auto-registered as a contract
-            // provider (e.g. a mounted volume backend). Compact its layer out
-            // of the provider table before its state is freed, or a later
-            // dispatch would call into freed code. Boot modules reach this via
-            // `release_module_handles` on finish; the live-splice teardown must
-            // do it explicitly.
-            crate::kernel::module::provider::release_module_providers(i as u8);
-            let taken = core::mem::replace(&mut s.modules[i], ModuleSlot::Empty);
-            if let ModuleSlot::Dynamic(dm) = taken {
-                // SAFETY: slot unspliced and finished; never stepped again.
-                unsafe { dm.free() };
-            }
-            s.ports[i] = ModulePorts::empty();
-            s.upstream_mask[i].clear_all();
-            s.ready[i] = true;
-            s.finished[i] = false;
+            // A live-added module may hold events, timers and platform handles,
+            // a channel ioctl handler, and a contract-provider layer (e.g. a
+            // mounted volume backend). Release them before its state is freed,
+            // or a later dispatch would call into freed code. Boot modules
+            // reach this through the finish path; the live-splice teardown
+            // does it explicitly.
+            crate::kernel::module::syscalls::release_module_handles(i as u8);
+            // Memory, protection domain and per-slot bookkeeping, as one
+            // teardown. A module with buffers lent to a block source keeps its
+            // memory until they are back.
+            super::free_module_state(i);
             s.slot_generation[i] = s.slot_generation[i].wrapping_add(1);
+            s.type_hash[i] = 0;
             super::set_module_owner(i, OWNER_SYSTEM);
         }
         s.active_module_count = s.active_module_count.saturating_sub(owned_count);
@@ -963,8 +1104,8 @@ pub fn free_owner(handle: OwnerHandle) -> Result<(), FreeError> {
 // ============================================================================
 //
 // The metal PAUSE verb: a reversible quiesce built from exactly the two
-// primitives the drain RFC specifies — §3.5 admission close (the
-// `authorize_admit` gate, closed by the `Paused` owner state) and §3.6
+// primitives drain is built from — admission close (the
+// `authorize_admit` gate, closed by the `Paused` owner state) and
 // per-owner wake masking (`event::pause_mask_modules`) — plus the re-latch
 // path `owner_resume` owns. Deliberately weaker than drain: no
 // `module_drain`, no channel-empty requirement, no deadline. In-flight
@@ -1061,8 +1202,8 @@ pub fn owner_resume(handle: OwnerHandle) -> Result<(), PauseError> {
 // Bounded binary `AddSubgraph` for the on-device caller (REPL / node agent).
 // Big-endian, fixed-width — same discipline as the composed-plan codec in
 // `tools/src/compose.rs`. PIC modules only (a built-in has no serialisable
-// form); a target with asynchronous PIC load returns `WouldBlock` until the
-// async follow-up. Integrity/signature verification of the blob is the signing
+// form); a target with asynchronous PIC load returns `WouldBlock`.
+// Integrity/signature verification of the blob is the signing
 // layer's job and the channel is authenticated (k8s node-agent), so this
 // decoder validates structure and bounds, not a content digest.
 
@@ -1103,11 +1244,64 @@ impl<'a> Cur<'a> {
 
 fn decode_endpoint(kind: u8, idx: u16) -> Option<Endpoint> {
     match kind {
-        0 => Some(Endpoint::New(idx as u8)),
+        0 if idx <= u16::from(u8::MAX) => Some(Endpoint::New(idx as u8)),
         1 => Some(Endpoint::Existing(idx)),
         2 => Some(Endpoint::Tap(idx)),
+        3 if idx <= u16::from(u8::MAX) => Some(Endpoint::Net(idx as u8)),
+        4 if idx <= u16::from(u8::MAX) => Some(Endpoint::Caller(idx as u8)),
         _ => None,
     }
+}
+
+/// One `Endpoint::Caller` edge of an encoded subgraph: its position among
+/// the blob's edges, its key, and whether it runs into the caller.
+#[derive(Clone, Copy, Default)]
+pub struct CallerEdge {
+    pub index: usize,
+    pub key: u8,
+    pub into_caller: bool,
+}
+
+/// The `Endpoint::Caller` edges of an encoded subgraph, in edge order, into
+/// `out`; how many there are, or `None` for a blob that does not decode.
+/// `apply_add` appends a subgraph's edges in blob order, so edge `index`
+/// lands at the edge count before the add plus `index`.
+pub fn caller_edges(blob: &[u8], out: &mut [CallerEdge]) -> Option<usize> {
+    let mut c = Cur::new(blob);
+    if c.u32()? != ADD_MAGIC || c.u16()? != ADD_VERSION {
+        return None;
+    }
+    c.u16()?;
+    c.take(16 + 4 + 4)?;
+    let mc = c.u8()? as usize;
+    let ec = c.u8()? as usize;
+    for _ in 0..mc {
+        c.take(4 + 1)?;
+        let plen = c.u16()? as usize;
+        c.take(plen)?;
+    }
+    let mut n = 0;
+    for index in 0..ec {
+        let (fk, fi) = (c.u8()?, c.u16()?);
+        c.u8()?;
+        let (tk, ti) = (c.u8()?, c.u16()?);
+        c.take(1 + 4)?;
+        let found = match (fk, tk) {
+            (4, _) => Some((fi, false)),
+            (_, 4) => Some((ti, true)),
+            _ => None,
+        };
+        if let Some((key, into_caller)) = found {
+            let slot = out.get_mut(n)?;
+            *slot = CallerEdge {
+                index,
+                key: u8::try_from(key).ok()?,
+                into_caller,
+            };
+            n += 1;
+        }
+    }
+    Some(n)
 }
 
 /// Decode a bounded binary `AddSubgraph` and apply it. On success writes the

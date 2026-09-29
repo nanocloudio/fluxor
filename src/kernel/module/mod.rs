@@ -1,5 +1,6 @@
 //! Module domain — PIC loader, provider dispatch, syscall surface, EL0 gateway.
 
+pub mod block_lend;
 pub mod gateway;
 pub mod loader;
 // OTA RAM staging surface (Pi 5 / hosted Linux). Not compiled on RP —

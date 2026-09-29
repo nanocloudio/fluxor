@@ -22,8 +22,8 @@
 
 const HOST_ASSET_INDEX_HASH: u32 = 0xFB4428B3; // fnv1a32("host_asset_index")
 
-use fluxor::platform::builtin_param_tags::host_asset_index::TAG_PATHS as ASSET_INDEX_TAG_PATHS;
 use fluxor::platform::builtin_param_tags::host_asset_index as asset_index_tags;
+use fluxor::platform::builtin_param_tags::host_asset_index::TAG_PATHS as ASSET_INDEX_TAG_PATHS;
 
 struct HostAssetIndexState {
     out_chan: i32,
@@ -81,15 +81,13 @@ fn host_asset_index_step(state: *mut u8) -> i32 {
                 Ok(f) => {
                     log::info!(
                         "[host_asset_index] streaming idx={} path={}",
-                        idx, st.paths[idx]
+                        idx,
+                        st.paths[idx]
                     );
                     st.current = Some(f);
                 }
                 Err(e) => {
-                    log::warn!(
-                        "[host_asset_index] open '{}' failed: {}",
-                        st.paths[idx], e
-                    );
+                    log::warn!("[host_asset_index] open '{}' failed: {}", st.paths[idx], e);
                     st.current = None;
                     // Signal HUP so the consumer doesn't block forever.
                     fluxor::kernel::ipc::channel::channel_ioctl(
@@ -102,7 +100,8 @@ fn host_asset_index_step(state: *mut u8) -> i32 {
         } else {
             log::warn!(
                 "[host_asset_index] seek idx={} out of range (have {} paths)",
-                idx, st.paths.len()
+                idx,
+                st.paths.len()
             );
             st.current = None;
             fluxor::kernel::ipc::channel::channel_ioctl(
@@ -148,13 +147,8 @@ fn host_asset_index_step(state: *mut u8) -> i32 {
     let mut written = 0usize;
     while written < n {
         // SAFETY: `written < n <= buf.len()`; offset stays in-bounds.
-        let w = unsafe {
-            channel::channel_write(
-                st.out_chan,
-                buf.as_ptr().add(written),
-                n - written,
-            )
-        };
+        let w =
+            unsafe { channel::channel_write(st.out_chan, buf.as_ptr().add(written), n - written) };
         if w > 0 {
             written += w as usize;
         } else {

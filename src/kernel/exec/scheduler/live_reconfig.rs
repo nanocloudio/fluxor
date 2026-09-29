@@ -102,14 +102,11 @@ pub fn call_module_drain(module_idx: usize) -> i32 {
         &*p
     };
     if let ModuleSlot::Dynamic(ref m) = sched.modules[module_idx] {
-        set_current_module(module_idx);
+        // A drain asked from a module's own syscall runs inside that
+        // module's step: its context is what comes back afterwards.
         // SAFETY: `m` is the dynamic-module slot's owned handle; `call_drain`
         // is its ABI surface invoked from a safe scheduler context.
-        let rc = unsafe { m.call_drain() };
-        // Drop module context (see step_one_module) so post-drain
-        // platform logs attribute to the system owner.
-        set_current_module(MAX_MODULES);
-        rc
+        with_module_context(module_idx, || unsafe { m.call_drain() })
     } else {
         -1
     }

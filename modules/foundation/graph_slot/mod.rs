@@ -93,7 +93,6 @@ use abi::internal::flash::{
 const CONTINUE: i32 = 0;
 const READY: i32 = 3;
 
-const E_IO: i32 = -5;
 const NO_LIVE_SLOT: i32 = -1;
 
 // Channel protocol — defined once in the public contract.
@@ -312,8 +311,9 @@ fn own_abi_surface_digest() -> [u8; 32] {
 }
 
 /// Slot ABI pin admission (mirror of the kernel selector's rule):
-/// strict equality with this build's surface digest, no legacy
-/// grandfather — an unprovable slot is rejected like a corrupt one.
+/// strict equality with this build's surface digest, no exemption for
+/// slots built against another surface — an unprovable slot is rejected
+/// like a corrupt one.
 unsafe fn slot_pin_admits(base_xip: *const u8, own: &[u8; 32]) -> bool {
     let mut pin = [0u8; 32];
     let mut i = 0;

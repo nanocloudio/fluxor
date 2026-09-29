@@ -515,6 +515,8 @@ static RP_HAL_OPS: HalOps = HalOps {
     // before. A platform gains cold-restart persistence by implementing
     // these two and loses nothing by not.
     seal_blob_write: |_, _| false,
+    seal_blob_store: || false,
+    seal_blob_delete: |_| true,
     seal_blob_read: |_, _| None,
     disable_interrupts: rp_disable_interrupts,
     restore_interrupts: rp_restore_interrupts,
@@ -535,8 +537,8 @@ static RP_HAL_OPS: HalOps = HalOps {
     // raises a vault's isolation tier and with it what a deployment
     // believes about keys it has not protected.
     seal_provenance: || fluxor::kernel::sys::hal::SealProvenance::None,
-    seal: |_, _| None,
-    unseal: |_, _| None,
+    seal: |_, _, _| None,
+    unseal: |_, _, _| None,
     now_micros: rp_now_micros,
     tick_count: rp_tick_count,
     flash_base: rp_flash_base,

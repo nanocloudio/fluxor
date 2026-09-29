@@ -349,6 +349,10 @@ pub struct SchedulerState {
     pub(crate) arenas: [ArenaInfo; MAX_MODULES],
     /// Per-module capability class (checked on provider dispatch)
     pub(crate) cap_class: [u8; MAX_MODULES],
+    /// Per-module type: the config entry's `name_hash`, the FNV-1a of the
+    /// module's type name. Stable across boots and graph edits, so it names
+    /// what a module is where the slot index names only where it sits.
+    pub(crate) type_hash: [u32; MAX_MODULES],
     /// Per-module required_caps bitmask from manifest — public contract bits only
     pub(crate) required_caps: [u64; MAX_MODULES],
     /// Per-module fine-grained permissions bitmap (from manifest binary
@@ -634,6 +638,7 @@ impl SchedulerState {
             finished: [false; MAX_MODULES],
             arenas: [const { ArenaInfo::empty() }; MAX_MODULES],
             cap_class: [0; MAX_MODULES],
+            type_hash: [0; MAX_MODULES],
             required_caps: [0; MAX_MODULES],
             permissions: [0; MAX_MODULES],
             module_params_ptr: [core::ptr::null(); MAX_MODULES],
@@ -741,6 +746,7 @@ impl SchedulerState {
             // Wrapping ensures we keep producing fresh tokens across
             // many reconfigures without overflowing.
             self.slot_generation[i] = self.slot_generation[i].wrapping_add(1);
+            self.type_hash[i] = 0;
             self.module_latency[i] = 0;
             self.downstream_latency[i] = 0;
             self.fault_info[i] = ModuleFaultInfo::new();
@@ -907,6 +913,21 @@ pub fn module_state_footprint(idx: usize) -> u32 {
 pub fn set_current_module(idx: usize) {
     let core = crate::kernel::sys::hal::core_id();
     CURRENT_MODULE_PER_CORE[core].store(idx as u32, portable_atomic::Ordering::Relaxed);
+}
+
+/// Run `f` as module `idx`, then return to whichever context was current.
+///
+/// A module's entry points (`module_new`, `module_drain`) can be reached from
+/// inside another module's syscall — a subgraph staged by a workload CREATE,
+/// a drain asked through reconfigure — and that caller's next syscall is
+/// gated on its own identity. At boot the context around the call is no
+/// module, and that is what comes back.
+pub fn with_module_context<R>(idx: usize, f: impl FnOnce() -> R) -> R {
+    let caller = current_module_index();
+    set_current_module(idx);
+    let r = f();
+    set_current_module(caller);
+    r
 }
 
 /// Per-core module index of whoever *asked* for the provider frame currently
@@ -1100,6 +1121,37 @@ pub fn set_module_caps(idx: usize, cap_class: u8, required_caps: u64, permission
         SCHED.required_caps[idx] = required_caps;
         SCHED.permissions[idx] = permissions;
     }
+}
+
+/// Record the type of the module in slot `idx`.
+pub fn set_module_type_hash(idx: usize, type_hash: u32) {
+    if idx >= MAX_MODULES {
+        return;
+    }
+    // SAFETY: scheduler-thread-only mutation; idx bounded.
+    unsafe {
+        SCHED.type_hash[idx] = type_hash;
+    }
+}
+
+/// The type of the module in slot `idx`, or 0 when the slot holds none.
+pub fn module_type_hash(idx: usize) -> u32 {
+    if idx >= MAX_MODULES {
+        return 0;
+    }
+    // SAFETY: scheduler-thread-only read; idx bounded.
+    unsafe { SCHED.type_hash[idx] }
+}
+
+/// The generation of slot `idx`: bumped whenever the slot is reset,
+/// restarted or given another module, so a pair (slot, generation) names
+/// one module occupancy.
+pub fn module_slot_generation(idx: usize) -> u32 {
+    if idx >= MAX_MODULES {
+        return 0;
+    }
+    // SAFETY: scheduler-thread-only read; idx bounded.
+    unsafe { SCHED.slot_generation[idx] }
 }
 
 /// Register a module's per-instance params blob so the

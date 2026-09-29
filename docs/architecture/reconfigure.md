@@ -117,6 +117,25 @@ Each subscriber is called once per released owner, whatever number of contracts
 it serves. The return value is ignored: a provider with nothing to release may
 answer `-ENOSYS`.
 
+## Modules for Workloads Staged at Runtime
+
+A subgraph staged after boot names its modules by type, and a type resolves
+only against the module table packed into the image. List the types a node's
+workloads may be staged with under `workload_modules:`; they are packed
+without being instantiated:
+
+```yaml
+workload_modules:
+  - fat32
+  - crypt_block
+  - nbd_serve
+```
+
+An entry is a type name, or `{ type: <name>, variant: <variant> }` to pick a
+build. Resident pods' types are packed the same way. One image carries one
+build of a type, so a variant must agree with the base graph's and every
+pod's.
+
 ## Drain-Then-Reset Model
 
 The implemented reconfigure model is drain-then-reset:

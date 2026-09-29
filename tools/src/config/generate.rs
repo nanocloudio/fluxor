@@ -417,7 +417,8 @@ fn generate_config_impl(
                 let facts_key = facts_owned.as_deref().unwrap_or(silicon);
                 let facts = crate::target_facts::TargetFacts::for_silicon(facts_key);
                 let key = crate::identity_key::classify(&der);
-                if let Err(e) = crate::identity_key::admit_identity(key, facts_key, facts.vault_suites)
+                if let Err(e) =
+                    crate::identity_key::admit_identity(key, facts_key, facts.vault_suites)
                 {
                     return Err(Error::Config(format!("modules[{i}] ({name}): {e}")));
                 }
@@ -562,8 +563,8 @@ fn generate_config_impl(
     // Single-provider-per-contract. Providers auto-register in
     // module-index order onto a bounded dispatch stack that returns the
     // last registration unconditionally, so two modules providing the
-    // same surface (two `fat32` volumes, two `storage.block` drivers)
-    // silently shadow — one drive becomes unreachable with no runtime
+    // same dispatched surface (two unkeyed `fat32` volumes) silently
+    // shadow — one drive becomes unreachable with no runtime
     // warning. Reject it at build time. See storage_capability_surface.md.
     validate_single_provider(config, &module_names, &manifests)?;
 
@@ -943,10 +944,7 @@ fn build_capacity_envelope(config: &Value, resolved_target: Option<&str>) -> Res
     let mut entries: Vec<(u16, u32)> = Vec::new();
     println!("Capacity envelope ({target}):");
     for (name, val) in obj {
-        let Some((_, pool_id)) = crate::capacity::POOL_IDS
-            .iter()
-            .find(|(n, _)| n == name)
-        else {
+        let Some((_, pool_id)) = crate::capacity::POOL_IDS.iter().find(|(n, _)| n == name) else {
             let known: Vec<&str> = crate::capacity::POOL_IDS.iter().map(|(n, _)| *n).collect();
             return Err(Error::Config(format!(
                 "capacity: unknown pool '{name}' (known: {})",
@@ -972,7 +970,9 @@ fn build_capacity_envelope(config: &Value, resolved_target: Option<&str>) -> Res
             }
         }
         if n > u32::MAX as u64 {
-            return Err(Error::Config(format!("capacity: '{name}' = {n} overflows u32")));
+            return Err(Error::Config(format!(
+                "capacity: '{name}' = {n} overflows u32"
+            )));
         }
         entries.push((*pool_id, n as u32));
     }
@@ -1210,7 +1210,11 @@ fn build_pod_section(
 ///
 /// Returns a Vec of group IDs parallel to the edges slice. Group 0 = no aliasing.
 /// Which modules, by index, run at a gated level on this target.
-fn gated_modules(config: &Value, module_names: &[String], levels: &[crate::protection::Level]) -> Vec<bool> {
+fn gated_modules(
+    config: &Value,
+    module_names: &[String],
+    levels: &[crate::protection::Level],
+) -> Vec<bool> {
     let entries = crate::protection::module_entries(config);
     module_names
         .iter()
@@ -1247,7 +1251,10 @@ fn ungroup_gated_edges(
             return Err(Error::Config(format!(
                 "wiring[{i}]: buffer_group {g} makes a zero-copy edge at gated module '{}'; a \
                  gated module reaches channels only through the gateway, which copies",
-                module_names.get(m as usize).map(String::as_str).unwrap_or("?")
+                module_names
+                    .get(m as usize)
+                    .map(String::as_str)
+                    .unwrap_or("?")
             )));
         }
         dropped[g as usize & 31] = true;
@@ -1513,7 +1520,6 @@ fn validate_services(
 
 use crate::hash::crc16_ccitt;
 
-
 #[cfg(test)]
 mod buffer_group_tests {
     use super::*;
@@ -1535,7 +1541,11 @@ mod buffer_group_tests {
     #[test]
     fn a_one_in_one_out_in_place_module_aliases_its_edges() {
         let names = names(&["src", "filter", "sink"]);
-        let caps = vec![caps("src", false), caps("filter", true), caps("sink", false)];
+        let caps = vec![
+            caps("src", false),
+            caps("filter", true),
+            caps("sink", false),
+        ];
         let edges = [(0u8, 1u8, 0u8, 0u8, 0u8), (1, 2, 0, 0, 0)];
         let groups = assign_buffer_groups(&edges, &names, &caps).unwrap();
         assert_eq!(groups, vec![1, 1]);
@@ -1552,11 +1562,7 @@ mod buffer_group_tests {
             caps("sink", false),
             caps("monitor", false),
         ];
-        let edges = [
-            (1u8, 3u8, 1u8, 1u8, 0u8),
-            (0, 1, 0, 0, 0),
-            (1, 2, 0, 0, 0),
-        ];
+        let edges = [(1u8, 3u8, 1u8, 1u8, 0u8), (0, 1, 0, 0, 0), (1, 2, 0, 0, 0)];
         let groups = assign_buffer_groups(&edges, &names, &caps).unwrap();
         assert_eq!(groups, vec![0, 1, 1]);
     }

@@ -43,18 +43,22 @@ struct CliArgs {
     modules_path: String,
 }
 
-/// `fluxor-linux vault-import --label <label> --suite <hmac-sha256|aead-key>
-/// --key-hex <64 hex>`: provision one symmetric key into this host's durable
-/// vault, sealed exactly as the kernel vault seals a key it generated, so a
-/// later `OPEN` by label finds it. The consumer that needs a shared secret
-/// provisioned out of band — a TSIG key for the dns module — has no other
-/// path to one: `OPEN_OR_GENERATE` would mint a key nobody else holds.
+/// `fluxor-linux vault-import --module <type> --label <label> --suite
+/// <hmac-sha256|aead-key> --key-hex <64 hex>`: provision one symmetric key
+/// into this host's durable vault for module type `<type>`, sealed exactly as
+/// the kernel vault seals a key it generated, so that module's later `OPEN` by
+/// label finds it. Labels live in their module type's namespace, so the key is
+/// provisioned for the module that will open it. The consumer that needs a
+/// shared secret provisioned out of band — a TSIG key for the dns module — has
+/// no other path to one: `OPEN_OR_GENERATE` would mint a key nobody else
+/// holds.
 ///
 /// Needs `FLUXOR_SEAL_KEY` and `FLUXOR_VAULT_DIR` (or `FLUXOR_STORE_DIR`),
 /// the same two the runtime unseals with. The key is 32 bytes; the label is
 /// at most 64 bytes. Exits 0 on success, 1 otherwise.
 fn vault_import(args: &[String]) -> ! {
     use fluxor::abi::contracts::key_vault as kv;
+    let mut module = String::new();
     let mut label = String::new();
     let mut suite = String::new();
     let mut key_hex = String::new();
@@ -62,6 +66,7 @@ fn vault_import(args: &[String]) -> ! {
     while i < args.len() {
         let next = args.get(i + 1).cloned().unwrap_or_default();
         match args[i].as_str() {
+            "--module" => module = next,
             "--label" => label = next,
             "--suite" => suite = next,
             "--key-hex" => key_hex = next,
@@ -86,6 +91,10 @@ fn vault_import(args: &[String]) -> ! {
             process::exit(1);
         }
     };
+    if module.is_empty() {
+        eprintln!("error: vault-import: --module names the module type that opens the key");
+        process::exit(1);
+    }
     if label.is_empty() || label.len() > kv::MAX_LABEL {
         eprintln!(
             "error: vault-import: --label must be 1..={} bytes",
@@ -105,27 +114,33 @@ fn vault_import(args: &[String]) -> ! {
         process::exit(1);
     };
     fluxor::kernel::boot(&LINUX_HAL_OPS);
-    // The kernel vault's record: `[suite:u16][usage:u32][sealed]`, with the
-    // sealed part the HAL's own seal of the raw key — what `persist_key`
-    // writes and `rehydrate_persisted` reads.
-    let mut sealed = [0u8; 32 + 12 + 16];
-    let Some(n) = fluxor::kernel::sys::hal::seal(&key, &mut sealed) else {
-        eprintln!("error: vault-import: this host cannot seal (set FLUXOR_SEAL_KEY, 64 hex)");
-        process::exit(1);
+    let namespace = fluxor::abi::wire::fnv1a32(module.as_bytes());
+    // SAFETY: single-threaded CLI; nothing else touches the vault.
+    let rc = unsafe {
+        fluxor::kernel::security::key_vault::import_persisted(
+            namespace,
+            label.as_bytes(),
+            suite_id,
+            usage,
+            &key,
+        )
     };
     for b in key.iter_mut() {
         // SAFETY: `b` is a live, exclusively-borrowed byte.
         unsafe { core::ptr::write_volatile(b, 0) };
     }
-    let mut record = Vec::with_capacity(6 + n);
-    record.extend_from_slice(&suite_id.to_le_bytes());
-    record.extend_from_slice(&usage.to_le_bytes());
-    record.extend_from_slice(&sealed[..n]);
-    if !fluxor::kernel::sys::hal::seal_blob_write(label.as_bytes(), &record) {
-        eprintln!(
-            "error: vault-import: no durable vault (set FLUXOR_VAULT_DIR or FLUXOR_STORE_DIR)"
-        );
-        process::exit(1);
+    match rc {
+        Ok(()) => {}
+        Err(e) if e == fluxor::abi::errno::ENOSYS => {
+            eprintln!(
+                "error: vault-import: this host cannot keep keys (set FLUXOR_SEAL_KEY, 64 hex, and FLUXOR_VAULT_DIR or FLUXOR_STORE_DIR)"
+            );
+            process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("error: vault-import: the key could not be stored durably ({e})");
+            process::exit(1);
+        }
     }
     println!("vault-import: {label} ({suite}) sealed");
     process::exit(0);
@@ -162,7 +177,7 @@ fn parse_args() -> CliArgs {
             }
             "--help" | "-h" => {
                 eprintln!("Usage: fluxor-linux --config <config.bin> --modules <modules.bin>");
-                eprintln!("       fluxor-linux vault-import --label <label> --suite <hmac-sha256|aead-key> --key-hex <64 hex>");
+                eprintln!("       fluxor-linux vault-import --module <type> --label <label> --suite <hmac-sha256|aead-key> --key-hex <64 hex>");
                 eprintln!();
                 eprintln!("Options:");
                 eprintln!("  -c, --config <path>   Path to config.bin");
@@ -227,8 +242,8 @@ use fluxor::platform::builtin_param_tags::linux_net::{
 use fluxor::platform::linux::owner_drain::{arm_drains, drain_tick, synthesize_restart_terminals};
 use fluxor::platform::linux::owner_status::OwnerStatusWriter;
 use fluxor::platform::linux::providers::{
-    linux_fs_dispatch, linux_net_close_all_and_clear_registry, linux_net_register_state,
-    linux_net_step, linux_proc_dispatch, LinuxNetState, LINUX_NET_HASH,
+    linux_fs_dispatch, linux_net_attach, linux_net_close_all_and_clear_registry, linux_net_detach,
+    linux_net_register_state, linux_net_step, linux_proc_dispatch, LinuxNetState, LINUX_NET_HASH,
     LINUX_NET_LISTEN_BACKLOG_DEFAULT, LINUX_NET_MAX_CONNS_DEFAULT, LINUX_NET_MAX_INBOUND,
     LINUX_NET_WRITE_BUF_DEFAULT,
 };
@@ -310,6 +325,9 @@ fn build_graph_linux() -> (usize, usize) {
     // linux_net drains one inbound lane per wired edge (priority by
     // wiring order) — tell graph prep not to merge its fan-in.
     scheduler::register_multi_inbound(LINUX_NET_HASH);
+    // …and keeps one events channel per consumer when those consumers are
+    // its producers, so each lane's events reach only the module that asked.
+    scheduler::register_multi_outbound(LINUX_NET_HASH);
     let (module_list, module_count) = match scheduler::prepare_graph() {
         Ok(v) => v,
         Err(rc) => {
@@ -338,6 +356,9 @@ fn build_graph_linux() -> (usize, usize) {
     // instantiation, before/between worker stepping.
     let sched = unsafe { scheduler::sched_mut() };
     let mut loaded_count = 0usize;
+    // The first linux_net instance is the node's net provider: the one a
+    // workload staged at runtime attaches its lanes to.
+    let mut net_provider_registered = false;
 
     for (module_idx, entry) in module_list.iter().enumerate().take(module_count) {
         let entry = match entry {
@@ -366,7 +387,24 @@ fn build_graph_linux() -> (usize, usize) {
                     lane_count = k + 1;
                 }
             }
-            let net_out_ch = scheduler::module_port(module_idx, PORT_NET_OUT);
+            // One events channel per `from: linux_net.net_out` edge (or the
+            // single teed one), and each lane's: the one its producer reads.
+            let mut net_outs = [-1i32; LINUX_NET_MAX_INBOUND];
+            for (k, slot) in net_outs.iter_mut().enumerate() {
+                *slot =
+                    scheduler::module_port(module_idx, (PORT_NET_OUT.0, PORT_NET_OUT.1 + k as u8));
+            }
+            let mut lane_out = [0u8; LINUX_NET_MAX_INBOUND];
+            for (k, out) in lane_out.iter_mut().enumerate() {
+                let producer = scheduler::channel_producer_module(net_ins[k]);
+                if let Some(j) = net_outs.iter().position(|&ch| {
+                    ch >= 0
+                        && producer.is_some()
+                        && scheduler::channel_consumer_module(ch) == producer
+                }) {
+                    *out = j as u8;
+                }
+            }
             // Table and backlog sizing from the graph (`platform: net:`
             // fields); the manifest defaults apply when absent.
             let mut max_conns = LINUX_NET_MAX_CONNS_DEFAULT as u32;
@@ -382,7 +420,8 @@ fn build_graph_linux() -> (usize, usize) {
             let state = LinuxNetState::new(
                 net_ins,
                 lane_owners,
-                net_out_ch,
+                net_outs,
+                lane_out,
                 max_conns as usize,
                 write_buf_kib as usize * 1024,
                 listen_backlog.min(i32::MAX as u32) as i32,
@@ -390,10 +429,20 @@ fn build_graph_linux() -> (usize, usize) {
             // Register for the platform-side endpoint report, the owner
             // teardown hook, and the rebuild fd close-out.
             linux_net_register_state(&*state as *const LinuxNetState as *mut LinuxNetState);
+            if !net_provider_registered {
+                fluxor::kernel::workload::net_attach::register(
+                    module_idx,
+                    linux_net_attach,
+                    linux_net_detach,
+                );
+                net_provider_registered = true;
+            }
             install_state(&mut m, state);
             scheduler::store_builtin_module(module_idx, m);
             log::info!(
-                "[inst] module {module_idx} = linux_net (built-in) net_in_lanes={lane_count} net_out={net_out_ch}"
+                "[inst] module {module_idx} = linux_net (built-in) net_in_lanes={lane_count} net_outs={} lane_out={:?}",
+                net_outs.iter().filter(|&&c| c >= 0).count(),
+                &lane_out[..lane_count]
             );
             loaded_count += 1;
             continue;

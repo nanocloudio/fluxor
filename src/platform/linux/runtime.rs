@@ -77,20 +77,6 @@ fn linux_clock_sync_status() -> Option<(bool, u64)> {
     fluxor::platform::linux::clock::sync_status()
 }
 
-/// Where the Linux sealing key comes from.
-///
-/// `HostReadable`, and that is the honest answer rather than a placeholder.
-/// The key is derived from `FLUXOR_SEAL_KEY` or a file under the store
-/// directory — both readable by anything running as this user. Sealing
-/// therefore protects a stored key from a compromised MODULE and not from a
-/// compromised HOST, and the vault's tier stays `SOFTWARE` because of it.
-///
-/// A Linux box with a TPM could report `DeviceUnique` by sealing to the
-/// storage root key. That is a real path and deliberately not taken here on
-/// the quiet: claiming it requires actually talking to the TPM, and a
-/// provenance that overstates itself is worse than no sealing at all — it
-/// raises a vault's tier and, with it, what a deployment believes about
-/// keys it has not actually protected.
 /// Where sealed key blobs live on Linux: one file per label under
 /// `$FLUXOR_VAULT_DIR`, or `$FLUXOR_STORE_DIR/vault` when only the store dir
 /// is set.
@@ -126,11 +112,13 @@ fn linux_vault_path(label: &[u8]) -> Option<std::path::PathBuf> {
 /// [`HalOps::seal_blob_write`].
 ///
 /// The blob arrives ALREADY SEALED — this decides where it lives, nothing
-/// more. Written to a temporary and renamed, so a crash midway leaves the
-/// previous key intact rather than a truncated one: a half-written key reads
-/// back as a key that does not open, and the vault would then generate a new
-/// one and silently invalidate every credential signed under the old.
+/// more. Written to a temporary, flushed, renamed over the old one, and the
+/// directory flushed, so the answer is `true` only once the new blob would
+/// survive a power cut, and a crash at any point leaves the previous blob
+/// whole rather than a truncated one: a half-written key reads back as a
+/// key that does not open.
 fn linux_seal_blob_write(label: &[u8], blob: &[u8]) -> bool {
+    use std::io::Write as _;
     let Some(path) = linux_vault_path(label) else {
         return false;
     };
@@ -141,10 +129,39 @@ fn linux_seal_blob_write(label: &[u8], blob: &[u8]) -> bool {
         return false;
     }
     let tmp = path.with_extension("tmp");
-    if std::fs::write(&tmp, blob).is_err() {
+    let written =
+        std::fs::File::create(&tmp).and_then(|mut f| f.write_all(blob).and_then(|()| f.sync_all()));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
         return false;
     }
-    std::fs::rename(&tmp, &path).is_ok()
+    if std::fs::rename(&tmp, &path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return false;
+    }
+    linux_sync_dir(dir)
+}
+
+/// Flush a directory, so a rename or removal inside it is durable.
+fn linux_sync_dir(dir: &std::path::Path) -> bool {
+    std::fs::File::open(dir).and_then(|d| d.sync_all()).is_ok()
+}
+
+/// Whether sealed blobs have somewhere durable to live. See
+/// [`HalOps::seal_blob_store`].
+fn linux_seal_blob_store() -> bool {
+    linux_vault_dir().is_some()
+}
+
+/// Remove a sealed blob durably. See [`HalOps::seal_blob_delete`].
+fn linux_seal_blob_delete(label: &[u8]) -> bool {
+    let Some(path) = linux_vault_path(label) else {
+        return true;
+    };
+    match std::fs::remove_file(&path) {
+        Ok(()) => path.parent().is_none_or(linux_sync_dir),
+        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+    }
 }
 
 /// Read a sealed blob back. See [`HalOps::seal_blob_read`].
@@ -160,6 +177,20 @@ fn linux_seal_blob_read(label: &[u8], out: &mut [u8]) -> Option<usize> {
     Some(data.len())
 }
 
+/// Where the Linux sealing key comes from.
+///
+/// `HostReadable`, and that is the honest answer rather than a placeholder.
+/// The key is derived from `FLUXOR_SEAL_KEY` or a file under the store
+/// directory — both readable by anything running as this user. Sealing
+/// therefore protects a stored key from a compromised MODULE and not from a
+/// compromised HOST, and the vault's tier stays `SOFTWARE` because of it.
+///
+/// A Linux box with a TPM could report `DeviceUnique` by sealing to the
+/// storage root key. That is a real path and deliberately not taken here on
+/// the quiet: claiming it requires actually talking to the TPM, and a
+/// provenance that overstates itself is worse than no sealing at all — it
+/// raises a vault's tier and, with it, what a deployment believes about
+/// keys it has not actually protected.
 fn linux_seal_provenance() -> fluxor::kernel::sys::hal::SealProvenance {
     if linux_seal_key().is_some() {
         fluxor::kernel::sys::hal::SealProvenance::HostReadable
@@ -195,7 +226,7 @@ fn linux_seal_key() -> Option<[u8; 32]> {
 /// from the kernel CSPRNG — a repeated nonce under one key breaks
 /// confidentiality outright for a stream cipher, so it is generated rather
 /// than derived from anything the caller controls.
-fn linux_seal(plain: &[u8], out: &mut [u8]) -> Option<usize> {
+fn linux_seal(aad: &[u8], plain: &[u8], out: &mut [u8]) -> Option<usize> {
     let key = linux_seal_key()?;
     let total = 12 + plain.len() + 16;
     if out.len() < total {
@@ -208,14 +239,14 @@ fn linux_seal(plain: &[u8], out: &mut [u8]) -> Option<usize> {
     let tag = fluxor::kernel::security::crypto::chacha20::chacha20_poly1305_encrypt(
         &key,
         &nonce,
-        &[],
+        aad,
         &mut out[12..12 + plain.len()],
     );
     out[12 + plain.len()..total].copy_from_slice(&tag);
     Some(total)
 }
 
-fn linux_unseal(sealed: &[u8], out: &mut [u8]) -> Option<usize> {
+fn linux_unseal(aad: &[u8], sealed: &[u8], out: &mut [u8]) -> Option<usize> {
     let key = linux_seal_key()?;
     if sealed.len() < 12 + 16 {
         return None;
@@ -235,7 +266,7 @@ fn linux_unseal(sealed: &[u8], out: &mut [u8]) -> Option<usize> {
     if fluxor::kernel::security::crypto::chacha20::chacha20_poly1305_decrypt(
         &key,
         &nonce,
-        &[],
+        aad,
         &mut out[..body_len],
         &tag,
     ) {
@@ -251,9 +282,7 @@ fn linux_unseal(sealed: &[u8], out: &mut [u8]) -> Option<usize> {
 
 fn getrandom_bytes(buf: &mut [u8]) -> Option<()> {
     // SAFETY: `buf` is a live, exclusively-borrowed slice of `buf.len()`.
-    let rc = unsafe {
-        libc::getrandom(buf.as_mut_ptr().cast(), buf.len(), 0)
-    };
+    let rc = unsafe { libc::getrandom(buf.as_mut_ptr().cast(), buf.len(), 0) };
     if rc as usize == buf.len() {
         Some(())
     } else {
@@ -389,7 +418,10 @@ fn linux_init_providers() {
     #[cfg(feature = "trust-system")]
     provider::register(dev_class::TRUST, trust_provider::dispatch);
     // Packet policy and service NAT: nftables tables, applied atomically.
-    provider::register(dev_class::NET_POLICY, fluxor::platform::linux::net_policy::dispatch);
+    provider::register(
+        dev_class::NET_POLICY,
+        fluxor::platform::linux::net_policy::dispatch,
+    );
     // storage.object over HTTP `Range:` — wasm peer in
     // `src/platform/wasm/object.rs`; shared windowing in
     // `abi::contracts::storage::object::range`.
@@ -443,6 +475,12 @@ fn linux_init_providers() {
         dev_class::HOST_PROCESS,
         fluxor::platform::linux::workload::host_process_dispatch,
     );
+    // Host mounts of block devices under the operator's mount root. Gated by
+    // requires_contract = "host_mount" + platform_raw.
+    provider::register(
+        dev_class::HOST_MOUNT,
+        fluxor::platform::linux::host_mount::host_mount_dispatch,
+    );
     // KEY_VAULT hardware override: when a PKCS#11 token is configured,
     // re-register both KEY_VAULT dispatch paths over the kernel software
     // default. Runs after the kernel-core registrations, so the override
@@ -485,8 +523,6 @@ fn linux_merge_runtime_overrides(module_id: u16, buf: *mut u8, len: usize, max: 
     unsafe { param_store::merge_runtime_overrides(module_id, buf, len, max) }
 }
 
-
-
 static LINUX_HAL_OPS: HalOps = HalOps {
     disable_interrupts: linux_disable_interrupts,
     restore_interrupts: linux_restore_interrupts,
@@ -496,6 +532,8 @@ static LINUX_HAL_OPS: HalOps = HalOps {
     clock_sync_status: linux_clock_sync_status,
     seal_provenance: linux_seal_provenance,
     seal_blob_write: linux_seal_blob_write,
+    seal_blob_store: linux_seal_blob_store,
+    seal_blob_delete: linux_seal_blob_delete,
     seal_blob_read: linux_seal_blob_read,
     seal: linux_seal,
     unseal: linux_unseal,
@@ -564,8 +602,7 @@ fn linux_csprng_fill(buf: *mut u8, len: usize) -> i32 {
     // selector and `(buf, len, flags=0)` matches `getrandom(2)`. The
     // caller supplies `buf`/`len` from a Rust slice, so the pointer
     // is valid for writes of `len` bytes.
-    let ret =
-        unsafe { libc::syscall(libc::SYS_getrandom, buf as *mut libc::c_void, len, 0u32) };
+    let ret = unsafe { libc::syscall(libc::SYS_getrandom, buf as *mut libc::c_void, len, 0u32) };
     if ret < 0 || ret as usize != len {
         return -1;
     }

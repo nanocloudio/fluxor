@@ -1,9 +1,10 @@
-//! Kernel-side cryptography for the loader's root-of-trust.
+//! Kernel-side cryptography: the loader's root of trust and the key vault.
 //!
-//! Hand-rolled SHA-512 and Ed25519 verification. These primitives intentionally
-//! live in the kernel because the loader's signature check must run before any
-//! PIC module is admitted — we cannot bootstrap module verification through a
-//! module that itself awaits verification.
+//! SHA-256, SHA-512 and Ed25519 verification stay in the kernel because the
+//! loader's signature check must run before any PIC module is admitted — we
+//! cannot bootstrap module verification through a module that itself awaits
+//! verification. P-256, Ed25519 signing, ML-DSA (with SHA-3), RSA, ChaCha20-
+//! Poly1305 and AES-256-GCM back the key vault's operations.
 //!
 //! No external crates: pure Rust, no_std-compatible. The implementations
 //! prioritise readability over peak performance; a single Ed25519 verify takes
@@ -45,6 +46,29 @@ pub mod chacha20 {
     }
 
     include!("../../../../modules/sdk/crypto/chacha20.rs");
+}
+
+// AES-256-GCM, mounted from the SDK for the same reason as ChaCha20: one
+// implementation and one set of vectors. The vault offers it only where the
+// block cipher is constant-time (`AES_IS_CONSTANT_TIME`).
+#[allow(
+    dead_code,
+    reason = "the SDK file is one implementation shared by PIC modules and the \
+              kernel; the kernel uses the AEAD entry points and not every \
+              helper the module builds reach for"
+)]
+pub mod aes_gcm {
+    //! AES-128/256-GCM.
+
+    /// Overwrite `buf`, volatile so the writes survive optimisation.
+    fn zeroize(buf: &mut [u8]) {
+        for b in buf.iter_mut() {
+            // SAFETY: `b` is a live, exclusively-borrowed byte.
+            unsafe { core::ptr::write_volatile(b, 0) };
+        }
+    }
+
+    include!("../../../../modules/sdk/crypto/aes_gcm.rs");
 }
 
 pub mod ed25519;

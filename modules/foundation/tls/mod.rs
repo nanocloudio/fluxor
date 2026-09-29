@@ -375,7 +375,8 @@ const NET_MSG_TRACE_CTX: u8 = 0x09;
 const NET_CMD_BIND: u8 = 0x10;
 const NET_CMD_SEND: u8 = 0x11;
 const NET_CMD_CLOSE: u8 = 0x12;
-/// Retired dial; answered `ENOSYS` on its tag, never forwarded.
+/// The reserved pre-`CMD_CONNECT_TO` dial; answered `ENOSYS` on its tag,
+/// never forwarded.
 const NET_CMD_CONNECT: u8 = net_proto::CMD_CONNECT;
 /// The dial: `[sock_type][af][port][addr…][tag?]`. Its target is what this
 /// client authenticates the peer as (a name → `dNSName`, sent as SNI under
@@ -812,10 +813,9 @@ struct TlsState {
     /// leave off for perf runs, on only when triaging step costs.
     diag_phase_timing: u8,
     /// Handshake state transitions a session may take per tick.
-    /// 1 (the default) paces concurrent connection setup at one leg per
-    /// tick per session; raising it lets
-    /// simultaneous handshakes overlap. See the use site for the starvation
-    /// bound that makes a budget above one safe.
+    /// 1 (the default) takes one leg per tick per session; a larger value
+    /// lets a session with several legs queued take them in one tick. See
+    /// the use site.
     handshake_pump_budget: u16,
     /// ALPN restriction for the server EncryptedExtensions selection.
     /// 0 (default) offers the `h2` > `http/1.1` preference. 1 restricts
@@ -1059,6 +1059,14 @@ struct TlsState {
 
     // Scratch buffer for net_proto frame assembly
     net_scratch: [u8; NET_SCRATCH_SIZE],
+    /// A sealed application record cipher_out had no room for, written
+    /// before anything else from the clear side.
+    tx_stall: [u8; WIRE_RECORD_MAX],
+    tx_stall_len: u16,
+    /// The session `tx_stall` and `clear_left` belong to.
+    tx_stall_idx: u8,
+    /// Unread bytes of the clear frame the stalled record came from.
+    clear_left: u16,
     /// One inbound record's ciphertext, for the decrypt path.
     ///
     /// In MODULE STATE, not on the stack. A `[0u8; RECV_BUF_SIZE]` local
@@ -1256,7 +1264,7 @@ define_params! {
     5, dtls_port, u16, 4433
         => |s, d, len| { s.dtls_port = p_u16(d, len, 0, 4433); };
 
-    // Tags 6 and 7 are retired; the next allocation is 18.
+    // Tags 6 and 7 are unassigned; the next allocation is 18.
     // The DTLS client's peer, `host[:port]` with port 4433 when it names
     // none. A v4 literal: a datagram session is keyed by the address its
     // records arrive from, so there is nothing to key on until a name
@@ -1986,39 +1994,19 @@ unsafe fn tcp_module_step(s: &mut TlsState) -> i32 {
         }
         if s.sessions[i].state == SessionState::Handshaking {
             // How many handshake state transitions this session may take per
-            // tick. Was a hard-coded 1, to "yield after one state transition
-            // per tick so a heavy handshake step doesn't starve the
-            // IP/rp1_gem RX path long enough to drop arriving SYNs."
+            // tick (`handshake_pump_budget`).
             //
-            // That premise did not survive measurement. The dropped SYNs it
-            // was written to prevent were `conn_guard` running at its default
-            // 16/s because its params never reached it (see that module's
-            // `module_new`), not RX starvation. With that fixed, the Pi 5
-            // HTTPS rig run shows `drop_syn=0`, `bna=0 ovr=0 cdr=0`,
-            // `dupSYN=0` and a domain at ~11 % of its tick budget — there is
-            // no starvation left to throttle against.
+            // It is not a throughput knob. The loop below breaks as soon as
+            // a pass neither drained input nor progressed the state machine,
+            // so a handshake is paced by ARRIVING DATA (round trips), not by
+            // this budget: there is rarely more than one transition's worth
+            // of input queued for the budget to release. A budget of 4
+            // instead of 1 measured identically at 32 concurrent connections
+            // on the Pi 5 HTTPS rig. It stays a parameter for a latency-bound
+            // peer that queues several legs at once.
             //
-            // Made configurable to TEST whether this pacing was what
-            // serialised concurrent connection setup. It is not. Measured on
-            // the Pi 5 HTTPS rig at 32 concurrent connections, budget 1 vs 4
-            // produced tls step profiles identical inside noise: domain
-            // overruns 3181 vs 3151, heavy steps 126 vs 127, `MON_HIST` b7
-            // 693 vs 698, max step 277 vs 286 µs, burst aborts 126 vs 127.
-            //
-            // The loop below explains why: it breaks as soon as a pass
-            // neither drained input nor progressed the state machine, so a
-            // handshake is paced by ARRIVING DATA — round trips — not by this
-            // budget. There is rarely more than one transition's worth of
-            // input queued for the budget to release.
-            //
-            // Kept as a parameter because it is now plumbed and documented,
-            // and because a future latency-bound peer might genuinely queue
-            // several legs. It is NOT a throughput knob, and raising it on
-            // the evidence to date buys nothing.
-            //
-            // DEFAULT STAYS 1 — this is shared foundation code and every
-            // other project's graph keeps its current behaviour untouched
-            // unless it opts in.
+            // The default is 1: this is shared foundation code, and a graph
+            // keeps one transition per tick unless it opts in.
             let mut steps = 0;
             // Floor at 1 here as well as in the param decoder. `set_defaults`
             // covers the no-params case today, but a zero reaching this loop
@@ -2574,7 +2562,17 @@ unsafe fn tcp_module_step(s: &mut TlsState) -> i32 {
     // ── Phase 3: Read from clear_in (upstream: HTTP → TLS) ──
     let clear_in_frozen = continuity_gate_clear_in(s);
     let mut cl_drained = 0u32;
-    while !clear_in_frozen && cl_drained < TLS_INBOUND_DRAIN_BUDGET {
+    // A record cipher_out had no room for goes first, then the rest of
+    // the clear frame it came from; until both are out nothing new is read.
+    let mut clear_blocked = !flush_tx_stall(s);
+    if !clear_blocked && s.clear_left > 0 {
+        let idx = s.tx_stall_idx as usize;
+        let left = s.clear_left as usize;
+        s.clear_left = 0;
+        did_work = true;
+        clear_blocked = !seal_clear(s, idx, left);
+    }
+    while !clear_in_frozen && !clear_blocked && cl_drained < TLS_INBOUND_DRAIN_BUDGET {
         let poll_cl = (sys.channel_poll)(s.clear_in, POLL_IN);
         if poll_cl <= 0 || (poll_cl as u32 & POLL_IN) == 0 {
             break;
@@ -2618,81 +2616,8 @@ unsafe fn tcp_module_step(s: &mut TlsState) -> i32 {
                     if si >= 0 {
                         let idx = si as usize;
                         if s.sessions[idx].state == SessionState::Ready && data_len > 0 {
-                            // Split bodies larger than one wire record
-                            // into multiple application_data records.
-                            // `CLEAR_CHUNK_MAX` derives from the same
-                            // carrier capacity the handshake fragmenter
-                            // uses, so the record header, content-type
-                            // trailer, AEAD tag and outer framing are
-                            // accounted for in exactly one place.
-                            let mut remaining = data_len;
-                            while remaining > 0 {
-                                let rd = remaining.min(CLEAR_CHUNK_MAX);
-
-                                // Read plaintext directly into the
-                                // wire-record buffer so encrypt
-                                // happens in place (saves two memcpys
-                                // vs the prior staged path).
-                                let mut rec = [0u8; WIRE_RECORD_MAX];
-                                (sys.channel_read)(s.clear_in, rec.as_mut_ptr().add(5), rd);
-
-                                let sess = &mut s.sessions[idx];
-                                let enc_payload_len = match encrypt_record_in_place(
-                                    sess.driver.suite,
-                                    &mut sess.write_keys,
-                                    CT_APPLICATION_DATA,
-                                    rd,
-                                    &mut rec[5..],
-                                ) {
-                                    Ok(n) => n,
-                                    Err(_) => {
-                                        // No record was produced and
-                                        // the AEAD seq did not move,
-                                        // so nothing is on the wire
-                                        // to desync. The session
-                                        // cannot continue: there is
-                                        // no rekey path.
-                                        let msg: &[u8] =
-                                            b"[tls] record encrypt refused; session->Error";
-                                        dev_log(sys, 3, msg.as_ptr(), msg.len());
-                                        s.sessions[idx].state = SessionState::Error;
-                                        s.last_err_site = 2;
-                                        tls_discard(sys, s.clear_in, remaining - rd);
-                                        break;
-                                    }
-                                };
-                                // Header written AFTER encrypt so the
-                                // length reflects the actual payload.
-                                *rec.as_mut_ptr() = CT_APPLICATION_DATA;
-                                *rec.as_mut_ptr().add(1) = 0x03;
-                                *rec.as_mut_ptr().add(2) = 0x03;
-                                *rec.as_mut_ptr().add(3) = (enc_payload_len >> 8) as u8;
-                                *rec.as_mut_ptr().add(4) = enc_payload_len as u8;
-                                let total = 5 + enc_payload_len;
-
-                                // The AEAD seq has already advanced;
-                                // dropping this record would desync
-                                // the peer permanently. Fail the
-                                // session loudly instead. Under a
-                                // mirrored strict profile the record
-                                // is held for its send horizon and
-                                // written when the standby confirms.
-                                if emit_record(s, idx, rec.as_ptr(), total) == EmitOutcome::Failed {
-                                    let msg: &[u8] =
-                                        b"[tls] cipher_out full mid-record; session->Error";
-                                    dev_log(sys, 3, msg.as_ptr(), msg.len());
-                                    s.sessions[idx].state = SessionState::Error;
-                                    s.last_err_site = 3;
-                                    if remaining > rd {
-                                        // Drop the rest of the
-                                        // incoming clear send;
-                                        // session is already
-                                        // Errored.
-                                        tls_discard(sys, s.clear_in, remaining - rd);
-                                    }
-                                    break;
-                                }
-                                remaining -= rd;
+                            if !seal_clear(s, idx, data_len) {
+                                break;
                             }
                         } else {
                             tls_discard(sys, s.clear_in, data_len);
@@ -2753,7 +2678,7 @@ unsafe fn tcp_module_step(s: &mut TlsState) -> i32 {
                 );
             }
             NET_CMD_CONNECT => {
-                // Retired. Not forwarded: a record whose target this module
+                // Reserved, unsupported. Not forwarded: a record whose target this module
                 // cannot read is one whose peer it cannot authenticate.
                 let pl = payload_len as usize;
                 let rd = pl.min(NET_SCRATCH_SIZE);
@@ -2764,7 +2689,8 @@ unsafe fn tcp_module_step(s: &mut TlsState) -> i32 {
                     tls_discard(sys, s.clear_in, pl - rd);
                 }
                 let tag = net_proto::retired_connect_tag(&s.net_scratch[..rd]);
-                let msg = b"[tls] CMD_CONNECT (0x13) is retired; dial with CMD_CONNECT_TO (0x14)";
+                let msg =
+                    b"[tls] CMD_CONNECT (0x13) is unsupported; dial with CMD_CONNECT_TO (0x14)";
                 dev_log(sys, 1, msg.as_ptr(), msg.len());
                 let err = [(-38i8) as u8, tag]; // ENOSYS + downstream tag
                 let _ = tls_write_or_count(
@@ -6051,7 +5977,10 @@ unsafe fn send_key_update(s: &mut TlsState, idx: usize, request_update: u8) -> b
     rec[4] = enc_len as u8;
     let total = 5 + enc_len;
     let _ = conn_id;
-    if emit_record(s, idx, rec.as_ptr(), total) == EmitOutcome::Failed {
+    if !matches!(
+        emit_record(s, idx, rec.as_ptr(), total),
+        EmitOutcome::Sent | EmitOutcome::Held
+    ) {
         return false;
     }
     // The retired epoch's keys outlive the rotation until the barrier
@@ -6191,6 +6120,78 @@ unsafe fn tls_read_header(sys: &SyscallTable, chan: i32) -> (u8, u16) {
     let msg_type = *p;
     let payload_len = (*p.add(1) as u16) | ((*p.add(2) as u16) << 8);
     (msg_type, payload_len)
+}
+
+/// Seal `remaining` clear bytes of the current `CMD_SEND` on `clear_in`
+/// into application records for session `idx` and write them to
+/// `cipher_out`, one record per command.
+///
+/// False when cipher_out had no room: the sealed record is kept in
+/// `tx_stall` and the frame's unread bytes stay on `clear_in`
+/// (`clear_left`), both resumed next step before anything else is read,
+/// so a writer faster than the network is held back rather than failing
+/// the session. True otherwise, including when the session failed and
+/// the rest of the frame was discarded.
+unsafe fn seal_clear(s: &mut TlsState, idx: usize, mut remaining: usize) -> bool {
+    let sys = &*s.syscalls;
+    while remaining > 0 {
+        let rd = remaining.min(CLEAR_CHUNK_MAX);
+        // Plaintext is read straight into the wire-record buffer and
+        // sealed in place.
+        let mut rec = [0u8; WIRE_RECORD_MAX];
+        (sys.channel_read)(s.clear_in, rec.as_mut_ptr().add(5), rd);
+        let sess = &mut s.sessions[idx];
+        let enc_payload_len = match encrypt_record_in_place(
+            sess.driver.suite,
+            &mut sess.write_keys,
+            CT_APPLICATION_DATA,
+            rd,
+            &mut rec[5..],
+        ) {
+            Ok(n) => n,
+            Err(_) => {
+                // No record was produced and the AEAD seq did not move,
+                // so nothing is on the wire to desync. The session
+                // cannot continue: there is no rekey path.
+                let msg: &[u8] = b"[tls] record encrypt refused; session->Error";
+                dev_log(sys, 3, msg.as_ptr(), msg.len());
+                s.sessions[idx].state = SessionState::Error;
+                s.last_err_site = 2;
+                tls_discard(sys, s.clear_in, remaining - rd);
+                return true;
+            }
+        };
+        // Header written after sealing so the length is the sealed one.
+        *rec.as_mut_ptr() = CT_APPLICATION_DATA;
+        *rec.as_mut_ptr().add(1) = 0x03;
+        *rec.as_mut_ptr().add(2) = 0x03;
+        *rec.as_mut_ptr().add(3) = (enc_payload_len >> 8) as u8;
+        *rec.as_mut_ptr().add(4) = enc_payload_len as u8;
+        let total = 5 + enc_payload_len;
+        match emit_record(s, idx, rec.as_ptr(), total) {
+            EmitOutcome::Sent | EmitOutcome::Held => remaining -= rd,
+            EmitOutcome::Blocked => {
+                // The AEAD seq has moved: this record is the next one the
+                // peer expects, so it is kept and written first.
+                s.tx_stall[..total].copy_from_slice(&rec[..total]);
+                s.tx_stall_len = total as u16;
+                s.tx_stall_idx = idx as u8;
+                s.clear_left = (remaining - rd) as u16;
+                return false;
+            }
+            EmitOutcome::Failed => {
+                // The AEAD seq has moved and the record cannot be held:
+                // fail the session loudly rather than desync the peer.
+                let msg: &[u8] = b"[tls] record not emitted; session->Error";
+                dev_log(sys, 3, msg.as_ptr(), msg.len());
+                s.sessions[idx].state = SessionState::Error;
+                s.last_err_site = 3;
+                tls_discard(sys, s.clear_in, remaining - rd);
+                return true;
+            }
+        }
+    }
+    true
 }
 
 /// Write a net_proto frame with conn_id prefix, atomically.
@@ -6520,8 +6521,9 @@ unsafe fn ready_feed_from_channel(s: &mut TlsState, idx: usize, len: usize) -> u
 }
 
 /// Push what is left of the decrypted record in `record_scratch` to the
-/// clear side, from `*off`, in `NET_CMD_RECORD_CAPACITY` chunks. Answers
-/// whether it all went.
+/// clear side, from `*off`, in `MSG_DATA` frames of at most
+/// `MAX_DATA_FRAGMENT` bytes, the contract's bound every consumer sizes its
+/// frame buffer to. Answers whether it all went.
 ///
 /// Advances `*off` by what was taken, so a caller that is held can resume at
 /// exactly the byte the consumer stopped at. A chunk the channel will not
@@ -6537,7 +6539,7 @@ unsafe fn drain_clear_record(
 ) -> bool {
     let sys = &*s.syscalls;
     let ct_ptr = core::ptr::addr_of_mut!(s.record_scratch) as *mut u8;
-    const CLEAR_FWD_CHUNK: usize = NET_CMD_RECORD_CAPACITY;
+    const CLEAR_FWD_CHUNK: usize = abi::contracts::net::net_proto::MAX_DATA_FRAGMENT;
     while *off < pt_len {
         let chunk = (pt_len - *off).min(CLEAR_FWD_CHUNK);
         let sent = tls_write_frame(

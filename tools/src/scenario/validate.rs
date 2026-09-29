@@ -363,4 +363,3 @@ fn sniff_graph_target(path: &Path) -> Option<String> {
         .and_then(|v| v.as_str())
         .map(String::from)
 }
-

@@ -659,7 +659,10 @@ fn resolve_edge_rate_class(
 /// arrive in pieces. The error names the edge and the fix, because the
 /// runtime symptom — a consumer parsing a length out of a fragment —
 /// looks like a protocol bug rather than a wiring one.
-#[allow(clippy::too_many_arguments, reason = "resolved edge context, all of it needed to name the offending wiring entry")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "resolved edge context, all of it needed to name the offending wiring entry"
+)]
 fn check_edge_framing(
     i: usize,
     edge: &(u8, u8, u8, u8, u8),
@@ -892,7 +895,10 @@ fn validate_wiring_capacity(
             // telling them to raise `buffer_bytes` on it names a line
             // they never wrote and cannot find. Say where it came from
             // and what they can actually change.
-            let remedy = match entry.and_then(|e| e.get("_from_stack")).and_then(|v| v.as_str()) {
+            let remedy = match entry
+                .and_then(|e| e.get("_from_stack"))
+                .and_then(|v| v.as_str())
+            {
                 Some(stack) => format!(
                     " The '{stack}' stack inserted this edge; it is not in this \
                      config, so there is no buffer_bytes here to raise. Lower \
@@ -1037,4 +1043,3 @@ fn check_enum(field: &str, value: &str, allowed: &[&str], group_id: &str) -> Res
     }
     Ok(())
 }
-

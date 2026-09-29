@@ -6,13 +6,13 @@
 // scheduler (main) thread, owner-attributed and pushed into the kernel
 // per-owner ring for `fluxor agent logs`.
 //
-// Single-writer discipline (rfc §4.2): the kernel rings are written only by the
+// Single-writer discipline: the kernel rings are written only by the
 // scheduler thread. The Linux runtime runs the scheduler single-threaded on the
 // main thread, so on-step records push directly. Records emitted off the main
 // thread (today only platform/background threads — the graph-integrated
 // `proc_executor` worker path has no in-tree callers yet) go to stderr only;
-// routing them into the owning ring via a bounded MPSC drained on the tick is
-// the documented follow-up for when owner-scoped worker threads land (rfc §4.2).
+// routing them into the owning ring would take a bounded MPSC drained on the
+// tick, which owner-scoped worker threads would need.
 
 // NOTE: this file is `include!`d into `linux.rs`, so it shares that module's
 // imports (`OnceLock`, `thread`, `std::io::Write`). Other paths are fully
@@ -51,8 +51,7 @@ static SCHED_TID: OnceLock<std::thread::ThreadId> = OnceLock::new();
 /// which is only legal once the runtime is initialized. Until then every
 /// record is a platform/boot record → owner 0, no scheduler access. Set by
 /// [`enable_owner_log_attribution`] right before the main loop.
-static ATTRIBUTION_READY: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static ATTRIBUTION_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 struct TeeLogger;
 
@@ -227,12 +226,13 @@ fn install_owner_log_tee() {
     // Own the timestamp (unix ms, matching the ring records) so env_logger's
     // `humantime`/jiff timestamp backend isn't needed. Level + module filtering
     // still comes from `env_filter` via `RUST_LOG`.
-    let logger = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .format(|buf, record| {
-            use std::io::Write;
-            writeln!(buf, "{}", format_record(record))
-        })
-        .build();
+    let logger =
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+            .format(|buf, record| {
+                use std::io::Write;
+                writeln!(buf, "{}", format_record(record))
+            })
+            .build();
     log::set_max_level(logger.filter());
     let _ = INNER.set(logger);
     // Exec mode: `fluxor exec` names the applet; its records are filed
@@ -309,7 +309,8 @@ fn flush_owner_rings(logs_dir: &std::path::Path) {
             continue; // nothing new since last flush
         }
 
-        let Some((header, buffer)) = fluxor::kernel::workload::owner_log::snapshot_slot_bytes(slot) else {
+        let Some((header, buffer)) = fluxor::kernel::workload::owner_log::snapshot_slot_bytes(slot)
+        else {
             continue;
         };
 
@@ -339,7 +340,7 @@ fn flush_owner_rings(logs_dir: &std::path::Path) {
 
 /// Write a ring file in place: `[header][ring bytes]`. Not tmp+rename — that is
 /// wrong for rings (it orphans a follower's fd); a follower tolerates a torn
-/// read via the per-record CRC (rfc §4.3). The whole file is rewritten each
+/// read via the per-record CRC. The whole file is rewritten each
 /// flush.
 /// Returns true only when the full `[header][ring bytes]` image landed —
 /// the caller's flush high-water must not advance otherwise.

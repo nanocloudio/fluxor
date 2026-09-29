@@ -74,7 +74,7 @@
 //! answer or a dial with no resolver known. `CMD_DG_SEND_TO` takes the same
 //! `AF_NAME`: a cached name sends at once; a name not in hand starts the
 //! lookup and drops that datagram, which a datagram sender retransmits.
-//! The retired `CMD_CONNECT` (0x13) is answered `MSG_ERROR ENOSYS`.
+//! The reserved `CMD_CONNECT` (0x13) is unsupported and answered `MSG_ERROR ENOSYS`.
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
@@ -7177,7 +7177,7 @@ unsafe fn service_net_channels(s: &mut IpState) {
                 let tag = abi::contracts::net::net_proto::retired_connect_tag(&buf[..plen]);
                 log_error(
                     s,
-                    b"[ip] CMD_CONNECT (0x13) is retired; dial with CMD_CONNECT_TO (0x14)",
+                    b"[ip] CMD_CONNECT (0x13) is unsupported; dial with CMD_CONNECT_TO (0x14)",
                 );
                 net_send_error(s, 0, -38, tag); // ENOSYS
             }

@@ -529,6 +529,9 @@ pub fn channel_close(handle: i32) {
     if idx >= MAX_CHANNELS {
         return;
     }
+    // Closing clears the source's handler, so no lend on this channel can be
+    // reaped again.
+    crate::kernel::module::block_lend::channel_closed(handle);
     CHANNELS[idx].reset();
 }
 
@@ -1074,15 +1077,25 @@ pub fn channel_ioctl(handle: i32, cmd: u32, arg: *mut u8) -> i32 {
                 return CHAN_ENOSYS;
             }
             let state = slot.ioctl_state.load(Ordering::Acquire);
+            let owner = slot.ioctl_owner.load(Ordering::Acquire);
             // SAFETY: `ioctl_handler` is set by `channel_register_ioctl_handler`
             // from a `ChannelIoctlHandler` fn-pointer via the same transmute;
             // the registration / unregister handshake guarantees the pointer
             // is either null (checked above) or points at a live handler.
             let handler: ChannelIoctlHandler = unsafe { core::mem::transmute(h) };
+            // The handler is the registering module's code, so it runs as that
+            // module: what it asks of the kernel — its vault handles, its heap —
+            // is its own, not the caller's. The caller is published as such,
+            // exactly as for a provider dispatch.
             // SAFETY: `handler` is the registered ABI function; `state` is
             // the handler's own opaque pointer paired with `h` at register
             // time.
-            unsafe { handler(state as *mut c_void, cmd, arg) }
+            let call = || unsafe { handler(state as *mut c_void, cmd, arg) };
+            if owner == u8::MAX {
+                call()
+            } else {
+                crate::kernel::module::provider::in_provider_frame(owner as usize, call)
+            }
         }
     }
 }

@@ -106,10 +106,18 @@ domain); the implementation conforms to RFC 8032.
 Source: `modules/sdk/contracts/key_vault.rs` (contract),
 `src/kernel/security/key_vault.rs` (software backend).
 
-A kernel-managed asymmetric-key store. Every slot names its **suite** —
-P-256, Ed25519, one of the three ML-DSA parameter sets, or RSA at 2048,
-3072 or 4096 bits — and the suite decides what the key bytes mean, which
-operations the slot admits, and how big each answer is. Opcodes:
+The kernel's opaque key custody, for asymmetric and symmetric keys alike.
+Every slot names its **suite**:
+- P-256, Ed25519, one of the three ML-DSA parameter sets, or RSA at 2048,
+  3072 or 4096 bits;
+- `AEAD_KEY` (ChaCha20-Poly1305), `AEAD_AES256_GCM`, or `HMAC_SHA256`;
+- `KDF_KEY`, a derivation master whose only use is `DERIVE`.
+
+`AEAD_AES256_GCM` is offered only where AES runs in constant time (aarch64
+with the AES extension); elsewhere `SUITE_QUERY` answers `ENOSYS`.
+
+The suite decides what the key bytes mean, which operations the slot admits,
+and how big each answer is. Opcodes:
 
 | Opcode | Name | Semantics |
 |--------|------|-----------|
@@ -124,23 +132,115 @@ operations the slot admits, and how big each answer is. Opcodes:
 | `0x1008` | `TIER` | Report the backend tier (software vs hardware-backed). |
 | `0x1009` | `OPEN_OR_GENERATE` | Open the slot filed under a label, generating it if absent. |
 | `0x100A` | `OPEN` | Open the slot filed under a label. |
-| `0x100B` | `DESTROY_BY_LABEL` | Zeroise and free the slot filed under a label. |
-| `0x100C` | `DESCRIBE` | Report a slot's suite, usage mask and label. |
+| `0x100B` | `DESTROY_BY_LABEL` | Zeroise and free the slot filed under a label, and remove its sealed record. |
+| `0x100C` | `DESCRIBE` | Report a slot's suite, usage mask, tier and whether it is persisted. |
 | `0x100D` | `SUITE_QUERY` | Report a suite's usage mask and its private, public and signature lengths. |
 | `0x100E` | `SUITE_ENUM` | Enumerate the suites this backend supports. |
+| `0x100F` | `ATTEST_COMPOSITION` | Sign the running-composition record (§ Composition Attestation). |
+| `0x1010` | `KEY_WRAP` | Wrap a slot's key for one destination composition. |
+| `0x1011` | `KEY_UNWRAP` | Unwrap into a new slot, only as the composition it was wrapped for. |
+| `0x1012` | `AEAD_SEAL` | Seal under an `AEAD_KEY` slot. |
+| `0x1013` | `AEAD_OPEN` | Open under an `AEAD_KEY` slot. |
+| `0x1014` | `DERIVE` | Make a purpose key from a `KDF_KEY`: HKDF-SHA256 over a label and context, never persisted. |
+| `0x1015` | `AEAD_SEAL_UNITS` | Seal up to 32 buffers in place, each under the nonce its caller names. |
+| `0x1016` | `AEAD_OPEN_UNITS` | Open up to 32 buffers in place; a buffer that fails is zeroed and reported. |
+| `0x1017` | `SHARE_SPLIT` | Split a 32-byte symmetric key 2-of-3 and seal each share to its own recipient. |
+| `0x1018` | `SHARE_REWRAP` | Open one share envelope and seal the share to a new recipient under a new grant. |
+| `0x1019` | `SHARE_COMBINE` | Open two share envelopes and reconstruct their key into a new, never-persisted handle. |
+| `0x101A` | `ATTEST_KEY` | Sign challenge-bound evidence of a key's suite, uses, owner and tier, and a commitment to it. |
+
+`AEAD_SEAL` draws a random nonce per call, which suits a record now and then.
+The unit operations take the caller's nonces, which is what a storage device
+writing under one key for years needs: its nonce domain is a reserved,
+monotone sequence that it owns. The key is owned by that one module, so no
+other module can seal under it.
+
+### Recovery shares
+
+A symmetric key that must outlive any one node leaves the vault only as
+shares. `SHARE_SPLIT` splits it 2-of-3 over GF(2^8) and seals each share in
+an envelope to one recipient's P-256 key. The envelope authenticates:
+- the recovery set, protected resource and key epoch;
+- the share index, threshold and recipient thumbprint;
+- the purpose, lease fence, expiry and policy digest;
+- an anti-replay id.
+
+A custodian releases its share with `SHARE_REWRAP`. This seals the share to
+a new recipient under a new purpose, fence, expiry and policy. The share's
+set, resource, epoch and index cannot be changed.
+
+`SHARE_COMBINE` opens two envelopes with the caller's own recipient keys
+and reconstructs the key into a handle the caller owns. That handle is
+never persisted. The operation refuses:
+
+| Refused | Answer |
+| --- | --- |
+| An envelope wrapped to another key | `EACCES` |
+| An envelope already used (the last 32 are remembered) | `EACCES` |
+| An expired envelope, or one with an expiry the platform clock cannot check | `EACCES` |
+| A resource or epoch other than the one the caller asked for | `EACCES` |
+| Shares of different sets, resources or epochs | `EINVAL` |
+| The same index twice | `EINVAL` |
+
+Neither a share nor the key is ever written to a caller.
+
+`ATTEST_KEY` signs a record with one of the caller's signing keys. The
+record carries:
+- the caller's challenge;
+- the composition digest;
+- the key's backend, tier, persistence, suite, uses and owner namespace;
+- a commitment to the key, HMAC-SHA256 under the key itself, so the same
+  key always commits the same way and the commitment reveals nothing of it.
+
+The envelope and record layouts are the contract's `share` and `attest_key`
+modules.
+
+### Handles, owners and labels
+
+- **Handles.** A handle names one key for one module. It carries its slot's
+  generation, bumped when the key is destroyed, so a handle to a destroyed
+  key answers `ENOENT` rather than reaching the slot's next key.
+- **Owners.** The slot records the module that created the key: its
+  scheduler slot and that slot's occupancy. Any other module is refused
+  `EACCES`, including a later module in the same slot. A module's channel
+  ioctl handler runs as that module, so the handles it holds work in the
+  handler as in its step.
+- **Labels.** Labels live in their owner's module-type namespace: no module
+  reaches another type's labels. A reopen must name the key's suite and may
+  not widen its uses. A label open in another instance of the same type is
+  refused `EBUSY`.
+
+### Persisted keys
+
+A labelled key asked to persist is sealed through the platform HAL.
+- **The record.** The header (namespace, label, suite and usage) is the
+  seal's associated data, so a record altered at rest does not open as
+  anything.
+- **Durability.** On a platform with a durable store, a record that could
+  not be written durably refuses the key rather than reporting it persisted.
+  Linux writes a temporary file, flushes it, renames it, and flushes the
+  directory.
+- **Destroy.** Destroying a label removes its record, so the key does not
+  come back.
+- **Provisioning.** `fluxor-linux vault-import --module <type>` provisions a
+  shared secret into a module type's namespace.
 
 Sizes come from `SUITE_QUERY` rather than from a caller's assumption,
-because they are no longer uniform: an ML-DSA-87 signature is 4627 bytes
-where a P-256 or Ed25519 one is 64. The private length a backend reports is
+because they are not uniform: an ML-DSA-87 signature is 4627 bytes where a
+P-256 or Ed25519 one is 64. The private length a backend reports is
 what it actually holds, which is not always the algorithm's encoded private
 key — the software backend holds an ML-DSA key as the 32-byte FIPS 204 seed
 that reproduces it, so it reports 32 and a caller with an already-expanded
 key learns from that number that it cannot import one here.
 
-The software backend's slot table holds 8 slots of up to 64 bytes each — a
-seed or a scalar, never an expanded key. `reset_all()` zeroises every slot
-on scheduler reset. Slot contents are never surfaced through any
-introspection API. Crypto runs against the kernel-side
+The software backend's slot table holds 64 slots on aarch64 and 8 elsewhere,
+of up to 64 bytes each — a seed or a scalar, never an expanded key. With no
+free slot, generate, import, open, derive and unwrap are refused `ENOMEM`.
+A key is zeroised by `DESTROY`, and once its owning module is gone: when the
+scheduler slot it was made in holds a new occupancy (restart, replacement or
+graph rebuild), the vault zeroises the key before it next allocates a slot or
+looks a label up. Slot contents are never surfaced through any introspection
+API. Crypto runs against the kernel-side
 `src/kernel/security/crypto/`: `p256.rs` (field/group/scalar ops plus
 HMAC-SHA256 for the RFC 6979 nonce), `ed25519.rs`, and `ml_dsa.rs` over
 `sha3.rs`.
@@ -175,17 +275,39 @@ or digest meanwhile is `EBUSY`. `VERIFY` is not extended to RSA: the tls
 module verifies peers in-module and nothing calls the vault with a
 certificate key.
 
-The backend is platform-overridable: the Linux platform registers a
-PKCS#11 HSM backend (`src/platform/linux/hsm_key_vault.rs`) when
-`FLUXOR_HSM_PKCS11_MODULE` is set at platform boot. It is compiled into
-the published runtime (the `host-hsm` feature), so selecting it is a
-matter of configuration; a binary built without the feature reports the
-absence through `--print-features`. Registration is fail-soft — a
-configured token that cannot be opened leaves the software backend live
-rather than failing the boot, and `TIER` is what says which one answered.
-The consumer-visible opcode surface is identical; backends differ only in
-what `TIER` and `SUITE_QUERY` report. See [abi_layers.md](abi_layers.md)
-for the backend rules.
+### Backends and the router
+
+Modules call one KEY_VAULT provider, the router
+(`src/kernel/security/key_vault_router.rs`). It serves the software backend
+and, on Linux when `FLUXOR_HSM_PKCS11_MODULE` is set at platform boot, a
+PKCS#11 backend (`src/platform/linux/hsm_key_vault.rs`) beside it. The
+PKCS#11 backend is compiled into the published runtime (the `host-hsm`
+feature); a binary built without it reports the absence through
+`--print-features`. Registration is fail-soft: a configured token that
+cannot be opened leaves the software backend alone.
+
+| Request | Served by |
+| --- | --- |
+| An operation on a handle | The backend that minted it; each backend resolves only its own handles |
+| `GENERATE`, `SUITE_QUERY` for a suite the token serves (P-256) | The token |
+| Labels, `STORE`, symmetric and every other suite | Software |
+| `TIER` | The token when present: the backend that holds identity keys |
+| `SHARE_REWRAP`, `SHARE_COMBINE`, `ATTEST_KEY` | The router, reaching each key through `ECDH`, `PUBLIC`, `SIGN` and `DESCRIBE` on its own backend |
+
+A key's own custody is its `DESCRIBE`. A volume key reconstructed from
+shares opened by a token recipient key is a software session key:
+- the agreed secrets cross only bounded kernel scratch, zeroed on every
+  path;
+- `DESCRIBE` and `ATTEST_KEY` report it `SOFTWARE`, never the token's tier.
+
+A share opener must permit `AGREE` and `EXPORT_PUBLIC`: the router names the
+recipient by its public key. A token key cannot be split (`ENOSYS`), and its
+attestation carries its public thumbprint and no commitment.
+
+The software backend reports `DEVICE_HW` only when the platform's sealing
+key is device-unique and the platform actually seals with it; a board that
+reads a device key but cannot seal holds every key in RAM and reports
+`SOFTWARE`. See [abi_layers.md](abi_layers.md) for the backend rules.
 
 ### TLS integration
 
@@ -407,7 +529,8 @@ so the definitions in the standard are what the code runs.
 
 Source: `src/kernel/exec/scheduler/attest.rs`,
 `src/kernel/security/key_vault.rs`, contract
-`modules/sdk/contracts/key_vault.rs` (0x100F–0x1013).
+`modules/sdk/contracts/key_vault.rs` (`ATTEST_COMPOSITION`, `KEY_WRAP`,
+`KEY_UNWRAP`, `AEAD_SEAL`, `AEAD_OPEN`).
 
 The vault can sign what the kernel is running. `ATTEST_COMPOSITION`
 builds the running-composition record from what the kernel holds — the
@@ -429,7 +552,7 @@ with the destination vault's public key, HKDF-SHA256 salted by the
 destination's composition digest, ChaCha20-Poly1305 with that digest as
 the associated data. `KEY_UNWRAP` on the destination recomputes its own
 composition digest first and refuses when it differs — the key was
-wrapped for the composition that was attested, and this is no longer it.
+wrapped for the composition that was attested, and this is another.
 No surface ever carries the key in the clear.
 
 `AEAD_SEAL` / `AEAD_OPEN` on a `suite::AEAD_KEY` slot are the vault-held

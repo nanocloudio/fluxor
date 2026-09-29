@@ -28,8 +28,10 @@ Every PIC module receives a `SyscallTable` at init. It holds exactly:
 - `heap_alloc` / `heap_free` / `heap_realloc` — per-module heap
 - `provider_open` / `provider_call` / `provider_query` / `provider_close` — handle-scoped contract dispatch
 - `provider_call_sel` — selector-routed provider call: the op names its
-  target (e.g. a storage volume) inline via a selector string instead of
-  a pre-opened handle, so policy modules can route per-op
+  target (e.g. a storage volume, or `platform` for the platform's own
+  provider beneath the graph) inline via a selector string, so policy
+  modules can route per-op; a handle it mints comes back routed to its
+  minting provider
 
 Everything else goes through `provider_*`. The kernel tracks each
 handle's bound contract and routes calls to the contract's vtable;
@@ -88,6 +90,11 @@ Current backends of `KEY_VAULT`:
 |---------|--------|------|-----------|
 | Software (default) | `src/kernel/security/key_vault.rs` | `SOFTWARE` | Always available |
 | PKCS#11 HSM (Linux) | `src/platform/linux/hsm_key_vault.rs` | `PROCESS_HW` | `FLUXOR_HSM_PKCS11_MODULE` env at platform boot |
+
+`KEY_VAULT` backends do not replace each other: the router
+(`src/kernel/security/key_vault_router.rs`) is the one registered provider,
+and a hardware backend registers behind it beside the software one. Each
+handle names its backend ([security.md](security.md#backends-and-the-router)).
 
 Rules for adding a backend: it must sit behind an **existing** kernel
 service contract (a backend never introduces opcodes consumers must
@@ -150,6 +157,19 @@ host-process mechanics (exec, PTY, read, bundles), registered only by
 the Linux platform, with semantic constants at
 `abi::platform::linux::host_process`. Unregistered platforms return
 `ENOSYS`, which doubles as discovery.
+
+`HOST_MOUNT` (`0x001F`) is host-scoped the same way: mounting a block
+device onto a directory under the operator's mount root
+(`FLUXOR_MOUNT_ROOT`) and unmounting it, with semantic constants at
+`abi::platform::linux::host_mount`. The platform holds the policy — the
+source must be a block device, every mount point lies under the root, every
+mount is `nodev,nosuid`, no symlink under the root is followed — and answers
+with the kernel's errno. Mount and unmount run off the scheduler thread and
+answer `EAGAIN` until a repeat of the same request finds the result; each
+caller holds a bounded number of jobs, uncollected results expire, and both
+operations are idempotent against the host mount table. Making or
+checking a filesystem is a userland tool and goes through the process
+executor.
 
 Plus channel-served protocols (no contract id — there's nothing to
 dispatch, just message formats):

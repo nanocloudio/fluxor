@@ -22,7 +22,7 @@
 //! page origin (and the in-bundle `asset://` map), which serves shipped,
 //! immutable content. There is no way to `PUT` to an HTTP origin from the
 //! browser, so on its own this tier cannot persist user-generated data
-//! (RFC 0009 save-state derivatives, imported ROMs, caches).
+//! (save-state derivatives, imported ROMs, caches).
 //!
 //! `host_object_put` adds the missing write tier, backed by **OPFS**
 //! (Origin Private File System) on the host side — see

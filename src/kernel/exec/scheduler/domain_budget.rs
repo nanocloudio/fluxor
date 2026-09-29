@@ -437,6 +437,8 @@ pub fn step_domain_modules(
     // Drain cooperative⇄ISR bridges after the domain finishes its
     // exec_order rotation. Mirrors the pump call in `step_modules`.
     pump_isr_bridges();
+    // Reap the completions of torn-down modules' lent buffers.
+    crate::kernel::module::block_lend::pump();
 
     if active_count == 0 {
         StepResult::Done

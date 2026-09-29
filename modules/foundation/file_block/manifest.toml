@@ -1,0 +1,20 @@
+version = "1.0.0"
+hardware_targets = ["rp2350", "bcm2712", "linux"]
+
+# A `storage.block` source over one file reached through the `fs` contract:
+# a loop device over a FAT32 file on bare metal, a disk image on a Linux
+# host. Tools-only, never serialized to the .fmod.
+provides = ["storage.block"]
+
+[[resources]]
+requires_contract = "fs"
+access = "write"
+
+[[ports]]
+name = "blocks"
+direction = "output"
+content_type = "OctetStream"
+required = true
+
+[observability]
+exempt = "block source over a file — block I/O is observed at the consumer above it"

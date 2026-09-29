@@ -757,7 +757,7 @@ registerProcessor('pcm-ring', PcmRing);
     //
     // Read tier vs. write tier: `fetch()` + `asset://` are read-only and
     // serve shipped content. `host_object_put` adds the persistent write
-    // tier (RFC 0009 save-states, imports) backed by OPFS. Writes land
+    // tier (save-states, imports) backed by OPFS. Writes land
     // synchronously in `objStore` (so an immediately-following read sees
     // them) and persist to OPFS in the background; `objStore` is also
     // hydrated from OPFS at boot. Reads consult `objStore` before

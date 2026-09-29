@@ -98,8 +98,8 @@ pub fn alloc(module_idx: u8, bytes: usize) -> Option<(*mut u8, usize)> {
     }
 }
 
-/// Release every chunk `module_idx` holds — the owner-teardown reclaim
-/// (§3.6: teardown is the reclaim path; there is no individual free).
+/// Release every chunk `module_idx` holds — the owner-teardown reclaim.
+/// Teardown is the reclaim path; there is no individual free.
 pub fn reclaim_module(module_idx: u8) {
     if ELASTIC_REGION_SIZE == 0 {
         return;

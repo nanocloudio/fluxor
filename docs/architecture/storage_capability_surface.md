@@ -28,7 +28,7 @@ compose the family; every provider declares one or more.
 
 | Surface             | Domain                                                          | Providers / consumers                                        |
 |---------------------|-----------------------------------------------------------------|--------------------------------------------------------------|
-| `storage.block`     | Raw block I/O                                                   | sd, nvme, flash_rp provide; fat32 consumes                   |
+| `storage.block`     | Raw block I/O                                                   | nvme, sd (read-only), file_block, crypt_block provide; fat32, crypt_block and nbd_serve consume |
 | `file.data`         | Byte-stream file access (open, read, seek, stat, write, fsync)  | fat32 and the mount router provide; player / viewer modules consume |
 | `storage.namespace` | Name-keyed directory surface (lookup, stat, list, rename, delete, bind, subscribe) | host platform providers (§5); scanners and stores consume |
 | `storage.object`    | Whole-blob byte-addressed surface (put, get, head, range_get, delete) | host platform providers (§5); object_bank consumes     |
@@ -68,9 +68,9 @@ Loadable modules carrying `provides = [...]` in their `manifest.toml`:
 
 | Surface             | Declared by (`provides`)                            |
 |---------------------|-----------------------------------------------------|
-| `storage.block`     | `foundation/sd`, `drivers/nvme`, `drivers/flash_rp` |
+| `storage.block`     | `drivers/nvme`, `foundation/sd`, `foundation/file_block`, `foundation/crypt_block` |
 | `file.data`         | `foundation/fat32`, `foundation/mount`              |
-| `storage.namespace` | no loadable module                                  |
+| `storage.namespace` | `fixtures/mem_ns` (a RAM test fixture)              |
 | `storage.object`    | no loadable module                                  |
 
 The hosts carry no `provides` rows: on Linux and wasm these surfaces are
@@ -86,7 +86,8 @@ and `"storage.object"`.
 ### Multiple volumes: instance-keyed providers + the `mount` module
 
 Source: `tools/src/config/validate.rs` (`validate_single_provider`),
-`src/kernel/module/syscalls.rs`, `modules/foundation/mount/mod.rs`.
+`src/kernel/module/provider.rs`, `src/kernel/module/syscalls.rs`,
+`modules/foundation/mount/mod.rs`.
 
 Contract providers are auto-registered by the loader after each module
 reaches Ready, in module-index order. The class-byte dispatch path
@@ -110,14 +111,36 @@ syscall for reaching a keyed layer:
   it sound under live graph mutation: a freed-then-reused module index
   cannot alias a stale binding.
 
+The selector name `platform` is reserved: `provider_call_sel("platform",
+…)` reaches the platform's own (kernel-registered) provider of the
+opcode's contract, beneath every module layer — the host filesystem on
+Linux, even when the graph carries a `fat32` of its own as the default.
+No module may register it: the loader's registration is refused
+(`EACCES`) and `validate_single_provider` rejects `volume: platform` on
+a provider first. `file_block`'s `volume: platform` is how an image file
+on the host sits under a graph-local filesystem built on it.
+
+A handle minted through any selector is **routed**: the kernel returns
+its own handle in the provider's place — same contract tag, a slot in
+its route table — and records which provider minted it and what that
+provider called it. Every later op on it, through `provider_call` or
+`provider_call_sel`, reaches that provider with the provider's own
+(untagged) slot, whatever the default layer is. `provider_call_sel`
+refuses (`EBADF`) a handle minted through another selector, and a
+handle no selector minted; a route dies with its owner's layer, a
+departing consumer's routes are closed at their owners, and a graph
+reset forgets them all.
+
 The **`mount` module** (`modules/foundation/mount/`) is the policy layer.
 It registers as the default (unkeyed) FS provider and carries a
 `mounts: "/boot=sd0;/data=nvme0"` table. On `FS_OPEN(path)` it
 longest-prefix-matches the path to a volume, forwards the prefix-stripped
-path to that volume via `provider_call_sel`, and remaps the returned
-handle so later handle-bound ops (`FS_READ` / `FS_CLOSE` / …) route back
-to the owning volume. Path policy stays in the module; the kernel never
-parses paths. `validate_single_provider` therefore allows several
+path to that volume via `provider_call_sel`, keeps the routed handle it
+gets back, and hands the consumer a handle of its own, so later
+handle-bound ops (`FS_READ` / `FS_CLOSE` / …) come back to it (which is
+what lets an unmount revoke them) and are forwarded to the owning
+volume. A mount may name `platform` as its volume. Path policy stays in
+the module; the kernel never parses paths. `validate_single_provider` therefore allows several
 providers of one surface as long as each `volume:` selector is distinct
 (two same-volume or two unkeyed providers still error), and separately
 rejects a graph in which every provider of a surface is keyed with no
@@ -155,7 +178,7 @@ surfaces (`file.data`, and, when routed, `storage.namespace` /
 `storage.object`), tenant-scoped stores, and similar. It is deliberately
 not applied to physical hardware channels:
 
-- Block devices (`storage.block` on sd / nvme / flash_rp) and NIC frames
+- Block devices (`storage.block` on nvme / sd / file_block) and NIC frames
   are `OctetStream` / `EthernetFrame` channels wired by name, not
   provider-call dispatch. A physical device's identity is its graph
   position ("the NVMe on `m2_primary`", "the NIC at this slot"); there is
@@ -184,11 +207,88 @@ contract id, so every dispatched surface needs its own class byte:
 | `0x13`     | `STORAGE_NAMESPACE`                         | `0x1300..0x13FF` — directory-like name-keyed surface (`namespace.rs`) |
 | `0x14`     | `STORAGE_OBJECT`                            | `0x1400..0x14FF` — whole-blob byte-addressed surface (`object.rs`) |
 
-`storage.block` is exposed through block-IO requests on driver channels
-(sd, nvme, …) rather than a single class byte; per-driver request formats
-are documented alongside those modules. Class byte `0x0A` is `BUFFER`,
-not a storage surface — namespace and object opcodes sit in their own
-class bytes to avoid the collision.
+`storage.block` has no class byte. Its requests are channel ioctls on the
+source's `blocks` channel (§1.1). Class byte `0x0A` is `BUFFER`, not a
+storage surface — namespace and object opcodes sit in their own class bytes
+to avoid the collision.
+
+### 1.1 `storage.block` v1
+
+Source: `modules/sdk/contracts/storage/block.rs`; consumer client:
+`modules/sdk/runtime/block.rs`.
+
+A block source is the channel wired to a consumer's `blocks` input. A
+consumer port that declares `requires_capability = "storage.block"` must be
+wired from exactly one module that provides it. Every request is one fixed
+record:
+
+| Ioctl | Argument | Result |
+| --- | --- | --- |
+| `CAPS` `0x4E56_0009` | capability record (40 B, written) | its length, or `EAGAIN` before attach |
+| `EXEC` `0x4E56_000C` | request (40 B) + completion (80 B, written) | the completion's status |
+| `SUBMIT` `0x4E56_000A` | request | 0, `EAGAIN` when full, or a refusal |
+| `REAP` `0x4E56_000B` | completion (written) | 1 when one was written, 0 when none |
+| `READ_STREAM` `0x4E56_0002` | request, op `READ` | data streamed on the channel |
+
+- **Ops:** `READ`, `WRITE`, `FLUSH`, `DISCARD`.
+- **Flags:** `FUA` makes a write durable before it completes. `PREFLUSH`
+  flushes every write reaped before the request was submitted, then runs it.
+- **Units:** every count and address is in logical blocks of the size `CAPS`
+  reports; addresses are 64-bit.
+- **Ordering:** requests in flight are unordered. A `FLUSH` covers writes
+  whose completions were reaped before it was submitted.
+- **Lengths:** a source's handler is given a pointer and never a length, so
+  the kernel holds every caller, gated or not, to exactly the record each
+  command carries; any other length is `EINVAL` before a handler runs.
+- **Buffers:** a buffer is lent until its completion is reaped, except a
+  write buffer on a source reporting `F_WRITE_COPIES`, which is released at
+  `SUBMIT`. The kernel keeps a ledger of lent buffers (128 at once; a
+  `SUBMIT` beyond it is `EAGAIN`) and refuses a tag already in flight on the
+  channel with `EINVAL`. A consumer torn down while buffers are still lent is
+  **quarantined**: its memory, its module slot and the channels carrying the
+  lends are kept, nothing steps it, and the kernel reaps its completions each
+  tick. When the last is back, the memory is released, the channels are
+  closed and the slot is free. A source that never completes keeps the
+  memory it was lent, which is a leak and not a corruption.
+- **Fences:** each successful completion carries the strongest `Fence` the
+  source achieved (§2): `LocalDurable` for a flush, a FUA write, or any write
+  on a device with no volatile cache; `Volatile` for other writes; none for a
+  read. A transform such as `crypt_block` passes the fence of the source
+  below it through as reported, never strengthened.
+- **Capabilities:** block size and count, per-request and atomic block
+  limits, queue depth, device id, and whether the source writes, flushes,
+  honours FUA natively, discards (and reads back zeros), pipelines, streams,
+  or copies write data at submit.
+- **Gated callers:** the gateway walks a request's buffer against the
+  caller's own memory and refuses every other module-registered ioctl
+  (`module_isolation.md`).
+
+| Source | Serves |
+| --- | --- |
+| `nvme` | everything; 8 requests in flight on I/O queue 0 |
+| `sd` | read-only: `CAPS` and one-block `SUBMIT`/`REAP` reads (queue depth 1, `EXEC` answers `ENOSYS`), beside its sector stream |
+| `file_block` | everything over one file reached through `fs` |
+| `crypt_block` | everything, as authenticated encryption over the source wired to its `lower` input |
+
+Every source that runs on a host is checked against one conformance corpus
+of these rules.
+
+#### Publishing a source to Linux
+
+`nbd_serve` consumes the source on its `blocks` input and serves it over NBD
+(fixed newstyle, simple replies) on a `net_proto` stream transport, so
+`nbd-client` attaches it as `/dev/nbdN`. It drives the source with
+`SUBMIT`/`REAP` when the source reports `F_ASYNC` and `EXEC` otherwise,
+answers `FLUSH` only after the source's `FLUSH` completes, and honours `FUA`
+natively or as write-then-flush. Transmission flags, size and block size come
+from `CAPS`. One client at a time; see its README.
+
+ublk is the intended Linux frontend and NBD the portability fallback, but the
+ublk gate is closed on the reference Pi 5 host: its kernel
+(6.18.33+rpt-rpi-2712) is built without `CONFIG_BLK_DEV_UBLK`, so there is no
+`ublk_drv` and no `/dev/ublk-control`, while `nbd.ko` is present
+(`CONFIG_BLK_DEV_NBD=m`) and io_uring is enabled. A ublk frontend would
+consume the same records and replace only the transport.
 
 ---
 
@@ -632,8 +732,8 @@ conclude a write outlived a power cut.
 
 On bare metal, `foundation/fat32` provides `file.data` over a
 `storage.block` channel: random-access reads through the FS contract,
-reads and writes both riding the block source's synchronous ioctls on its `blocks` input port
-(typically wired to `nvme.requests`), and directory listing served
+reads and writes both riding `storage.block` requests on its `blocks` input
+port (typically wired from `nvme.blocks`), and directory listing served
 through the FS contract's `OPENDIR` / `READDIR`. It does not implement
 the `storage.namespace` contract.
 

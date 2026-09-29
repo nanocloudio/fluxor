@@ -9,13 +9,13 @@ use std::fs::File;
 use std::io::Read;
 
 const HOST_ASSET_SOURCE_HASH: u32 = 0x504EEEF0; // fnv1a32("host_asset_source")
-// Stay well below the smallest channel buffer (2 KB by default) — the
-// kernel's ring `write` is all-or-nothing, so a chunk larger than the
-// channel never gets written.
+                                                // Stay well below the smallest channel buffer (2 KB by default) — the
+                                                // kernel's ring `write` is all-or-nothing, so a chunk larger than the
+                                                // channel never gets written.
 const CHUNK_SIZE: usize = 1024;
 
-use fluxor::platform::builtin_param_tags::host_asset_source::TAG_PATH as ASSET_TAG_PATH;
 use fluxor::platform::builtin_param_tags::host_asset_source as asset_source_tags;
+use fluxor::platform::builtin_param_tags::host_asset_source::TAG_PATH as ASSET_TAG_PATH;
 
 struct HostAssetState {
     out_chan: i32,
@@ -84,13 +84,8 @@ fn host_asset_step(state: *mut u8) -> i32 {
     while written < n {
         // SAFETY: `written < n <= buf.len() = CHUNK_SIZE`; offset stays
         // within the stack buffer.
-        let w = unsafe {
-            channel::channel_write(
-                st.out_chan,
-                buf.as_ptr().add(written),
-                n - written,
-            )
-        };
+        let w =
+            unsafe { channel::channel_write(st.out_chan, buf.as_ptr().add(written), n - written) };
         if w > 0 {
             written += w as usize;
         } else {

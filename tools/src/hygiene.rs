@@ -12,6 +12,11 @@
 //!      - SDK-mount rule: `#[path]`/`include!` mounts must read the
 //!        staged, digest-verified `target/fluxor/**` tree, never a
 //!        raw `deps/<project>/modules/{sdk,common}/` checkout.
+//!      - Pending-write rule: in `modules/**`, a storage write's
+//!        return code (`storage.object` PUT/DELETE/PUT_STREAMED_COMMIT,
+//!        `storage.namespace` RENAME/DELETE/BIND) must go straight
+//!        into `write_answer(...)`, because the write may answer
+//!        `EINPROGRESS`. There is no exemption row; classify the answer.
 //!   3. Whole-repo checks:
 //!      - Module-structure rules over `modules/**`.
 //!      - Shadow-guard rules over the shadow-tracked test tiers.
@@ -44,6 +49,7 @@ pub enum Rule {
     RepoFiles,
     ConsumerNaming,
     CrateRootAllow,
+    PendingWrite,
 }
 
 impl Rule {
@@ -94,6 +100,7 @@ impl Rule {
             Rule::SdkMount => "sdk-mount",
             Rule::RepoFiles => "repo-files",
             Rule::ConsumerNaming => "consumer-naming",
+            Rule::PendingWrite => "pending-write",
         }
     }
 }
@@ -273,6 +280,11 @@ pub fn scan(project_root: &Path, config: &Config) -> Result<Report, ScanError> {
     // module compiles away unnoticed, and these blocks do not.
     let host_compiled = host_compiled_closure(project_root);
 
+    // Opcode constants are often defined by the module that mounts a
+    // shared body which calls with them, so the pending-write rule reads
+    // them repo-wide.
+    let write_consts = repo_write_op_consts(project_root);
+
     let walker = walkdir::WalkDir::new(project_root)
         .follow_links(false)
         .into_iter()
@@ -318,6 +330,7 @@ pub fn scan(project_root: &Path, config: &Config) -> Result<Report, ScanError> {
         if !sdk_owner {
             file_violations.extend(scan_sdk_mounts(&rel, &content));
         }
+        file_violations.extend(scan_pending_writes(&rel, &content, &write_consts));
         report.violations.extend(file_violations);
     }
 
@@ -819,6 +832,244 @@ const CONSUMER_PROJECTS: &[&str] = &[
 fn is_normative_surface(rel: &Path) -> bool {
     let p = rel.to_string_lossy().replace('\\', "/");
     p.starts_with("contracts/src/") || p.starts_with("modules/sdk/")
+}
+
+/// Storage write opcodes whose answer may be `EINPROGRESS`
+/// (`modules/sdk/contracts/storage/object.rs`, "Writes: `EINPROGRESS` means ask again
+/// with the same request"): `storage.object` PUT, DELETE and
+/// PUT_STREAMED_COMMIT, and `storage.namespace` RENAME, DELETE and BIND.
+const STORAGE_WRITE_OPS: [u64; 6] = [0x1420, 0x1424, 0x1428, 0x1303, 0x1304, 0x1308];
+
+/// pending-write: a storage write's return code must go straight into
+/// `write_answer(...)`, so the `WriteAnswer` it becomes makes every caller
+/// say what a pending write means to it.
+///
+/// A write is any call or method call — `provider_call`, a syscall-table
+/// field, a module's own wrapper — one of whose arguments names a write
+/// opcode: an SDK path (`object::PUT`, `ns::DELETE`, …), an integer
+/// literal, or a constant (this file's, or one the whole repo defines only
+/// as a write opcode). A wrapper handed a write opcode returns the write's
+/// answer, so it is classified where it is called. An opcode chosen at run
+/// time from a variable is not seen. Module sources only.
+fn scan_pending_writes(
+    rel: &Path,
+    src: &str,
+    repo_consts: &std::collections::HashSet<String>,
+) -> Vec<Violation> {
+    use syn::spanned::Spanned;
+    if !rel.starts_with("modules") {
+        return Vec::new();
+    }
+    let Ok(file) = syn::parse_file(src) else {
+        return Vec::new();
+    };
+    // This file's own constants, by value, and the repo's unambiguous
+    // write-opcode names.
+    let mut consts: std::collections::HashMap<String, u64> = file_int_consts(&file);
+    for name in repo_consts {
+        consts.entry(name.clone()).or_insert(STORAGE_WRITE_OPS[0]);
+    }
+
+    fn callee_name(f: &syn::Expr) -> Option<String> {
+        match f {
+            syn::Expr::Path(p) => p.path.segments.last().map(|s| s.ident.to_string()),
+            syn::Expr::Field(x) => match &x.member {
+                syn::Member::Named(i) => Some(i.to_string()),
+                _ => None,
+            },
+            syn::Expr::Paren(p) => callee_name(&p.expr),
+            _ => None,
+        }
+    }
+    struct Finder<'c> {
+        consts: &'c std::collections::HashMap<String, u64>,
+        rel: &'c Path,
+        out: Vec<Violation>,
+        /// Inside the argument of a `write_answer(...)`, directly.
+        covered: u32,
+    }
+    impl Finder<'_> {
+        fn names_write(&self, e: &syn::Expr) -> bool {
+            match e {
+                syn::Expr::Cast(c) => self.names_write(&c.expr),
+                syn::Expr::Paren(p) => self.names_write(&p.expr),
+                syn::Expr::Lit(_) => int_value(e).is_some_and(|v| STORAGE_WRITE_OPS.contains(&v)),
+                syn::Expr::Path(p) => {
+                    if p.path.segments.len() == 1 {
+                        let name = p.path.segments[0].ident.to_string();
+                        return self
+                            .consts
+                            .get(&name)
+                            .is_some_and(|v| STORAGE_WRITE_OPS.contains(v));
+                    }
+                    is_write_op_path(e)
+                }
+                _ => false,
+            }
+        }
+        fn is_write_call(&self, e: &syn::Expr) -> bool {
+            match e {
+                syn::Expr::Call(c) => c.args.iter().any(|a| self.names_write(a)),
+                syn::Expr::MethodCall(m) => m.args.iter().any(|a| self.names_write(a)),
+                syn::Expr::Paren(p) => self.is_write_call(&p.expr),
+                syn::Expr::Unsafe(u) => {
+                    u.block.stmts.len() == 1
+                        && matches!(&u.block.stmts[0], syn::Stmt::Expr(x, None) if self.is_write_call(x))
+                }
+                _ => false,
+            }
+        }
+        fn flag(&mut self, line: usize) {
+            self.out.push(Violation {
+                path: self.rel.to_path_buf(),
+                line,
+                rule: Rule::PendingWrite,
+                message: "a storage write's return code must go straight into \
+                          `write_answer(...)`: its answer may be `EINPROGRESS`, \
+                          meaning ask again with the same request"
+                    .to_string(),
+            });
+        }
+    }
+    impl<'a> Visit<'a> for Finder<'_> {
+        fn visit_expr_call(&mut self, c: &'a syn::ExprCall) {
+            if callee_name(&c.func).as_deref() == Some("write_answer") {
+                // The answer is classified: the write inside is not a
+                // finding, though its own arguments are still looked at.
+                self.covered += 1;
+                syn::visit::visit_expr_call(self, c);
+                self.covered -= 1;
+                return;
+            }
+            let call = syn::Expr::Call(c.clone());
+            if self.is_write_call(&call) {
+                if self.covered == 0 {
+                    self.flag(c.span().start().line);
+                }
+                let saved = self.covered;
+                self.covered = 0;
+                syn::visit::visit_expr_call(self, c);
+                self.covered = saved;
+                return;
+            }
+            let saved = self.covered;
+            self.covered = 0;
+            syn::visit::visit_expr_call(self, c);
+            self.covered = saved;
+        }
+        fn visit_expr_method_call(&mut self, m: &'a syn::ExprMethodCall) {
+            let call = syn::Expr::MethodCall(m.clone());
+            if self.is_write_call(&call) && self.covered == 0 {
+                self.flag(m.span().start().line);
+            }
+            let saved = self.covered;
+            self.covered = 0;
+            syn::visit::visit_expr_method_call(self, m);
+            self.covered = saved;
+        }
+        fn visit_expr_unsafe(&mut self, u: &'a syn::ExprUnsafe) {
+            // `write_answer(unsafe { call(...) })` covers the call inside.
+            syn::visit::visit_expr_unsafe(self, u);
+        }
+    }
+    let mut f = Finder {
+        consts: &consts,
+        rel,
+        out: Vec::new(),
+        covered: 0,
+    };
+    f.visit_file(&file);
+    f.out
+}
+
+/// An integer literal's value, through casts and parentheses.
+fn int_value(e: &syn::Expr) -> Option<u64> {
+    match e {
+        syn::Expr::Lit(l) => match &l.lit {
+            syn::Lit::Int(i) => i.base10_parse::<u64>().ok(),
+            _ => None,
+        },
+        syn::Expr::Cast(c) => int_value(&c.expr),
+        syn::Expr::Paren(p) => int_value(&p.expr),
+        _ => None,
+    }
+}
+
+/// Whether `e` is an SDK path naming a storage write opcode
+/// (`object::PUT`, `ns::DELETE`, …).
+fn is_write_op_path(e: &syn::Expr) -> bool {
+    let syn::Expr::Path(p) = e else {
+        return false;
+    };
+    let segs: Vec<String> = p
+        .path
+        .segments
+        .iter()
+        .map(|s| s.ident.to_string())
+        .collect();
+    if segs.len() < 2 {
+        return false;
+    }
+    let name = segs[segs.len() - 1].as_str();
+    let owner = segs[segs.len() - 2].to_ascii_lowercase();
+    let object = owner.contains("obj");
+    let namespace = owner == "ns" || owner.contains("namespace");
+    (object && matches!(name, "PUT" | "DELETE" | "PUT_STREAMED_COMMIT"))
+        || (namespace && matches!(name, "RENAME" | "DELETE" | "BIND"))
+}
+
+/// Every integer constant a file defines, by name. A constant that aliases
+/// an SDK write opcode by path counts as that opcode.
+fn file_int_consts(file: &syn::File) -> std::collections::HashMap<String, u64> {
+    struct Consts(std::collections::HashMap<String, u64>);
+    impl<'a> Visit<'a> for Consts {
+        fn visit_item_const(&mut self, c: &'a syn::ItemConst) {
+            if let Some(v) = int_value(&c.expr) {
+                self.0.insert(c.ident.to_string(), v);
+            } else if is_write_op_path(&c.expr) {
+                self.0.insert(c.ident.to_string(), STORAGE_WRITE_OPS[0]);
+            }
+            syn::visit::visit_item_const(self, c);
+        }
+    }
+    let mut c = Consts(std::collections::HashMap::new());
+    c.visit_file(file);
+    c.0
+}
+
+/// Constant names that, everywhere the repo defines them, name a storage
+/// write opcode. A name some definition gives another value is ambiguous
+/// and left out.
+fn repo_write_op_consts(project_root: &Path) -> std::collections::HashSet<String> {
+    let mut seen: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    let walker = walkdir::WalkDir::new(project_root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|e| !should_skip(e));
+    for entry in walker.flatten() {
+        let path = entry.path();
+        if !entry.file_type().is_file() || path.extension().and_then(|s| s.to_str()) != Some("rs") {
+            continue;
+        }
+        let Ok(src) = fs::read_to_string(path) else {
+            continue;
+        };
+        if !src.contains("const ") {
+            continue;
+        }
+        let Ok(file) = syn::parse_file(&src) else {
+            continue;
+        };
+        for (name, v) in file_int_consts(&file) {
+            let write = STORAGE_WRITE_OPS.contains(&v);
+            let e = seen.entry(name).or_insert(write);
+            *e = *e && write;
+        }
+    }
+    seen.into_iter()
+        .filter(|(_, w)| *w)
+        .map(|(n, _)| n)
+        .collect()
 }
 
 /// A contract must not be defined by naming the consumer that happens to
@@ -1924,5 +2175,68 @@ include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
             ),
             std::path::PathBuf::from("modules/common/x.rs")
         );
+    }
+
+    fn pending(src: &str) -> usize {
+        let none = std::collections::HashSet::new();
+        scan_pending_writes(std::path::Path::new("modules/app/x/mod.rs"), src, &none).len()
+    }
+
+    #[test]
+    fn a_storage_write_must_be_classified() {
+        let bare = "fn f(sys: &S) { let rc = (sys.provider_call)(-1, obj::PUT, p, n); }";
+        assert_eq!(
+            pending(bare),
+            1,
+            "a field-called PUT whose code is used raw"
+        );
+        let ok = "fn f(sys: &S) { match write_answer((sys.provider_call)(-1, obj::PUT, p, n)) { _ => {} } }";
+        assert_eq!(pending(ok), 0, "classified at the call");
+        let path = "fn f() { let rc = provider_call(-1, abi::contracts::storage::namespace::DELETE, p, n); }";
+        assert_eq!(pending(path), 1, "a namespace DELETE by full path");
+    }
+
+    #[test]
+    fn a_write_is_known_by_its_literal_or_a_constant() {
+        let lit = "fn f() { provider_call(-1, 0x1424, p, n); }";
+        assert_eq!(pending(lit), 1);
+        let konst =
+            "const OBJ_COMMIT: u32 = 0x1428; fn f() { provider_call(h, OBJ_COMMIT, p, 0); }";
+        assert_eq!(pending(konst), 1);
+        let alias = "const OBJ_PUT: u32 = abi::contracts::storage::object::PUT; fn f() { provider_call(-1, OBJ_PUT, p, n); }";
+        assert_eq!(pending(alias), 1, "a constant aliasing the SDK's opcode");
+    }
+
+    #[test]
+    fn a_constant_defined_by_the_mounting_module_counts() {
+        let mut repo = std::collections::HashSet::new();
+        repo.insert("OBJ_PUT".to_string());
+        let shared = "fn put(sys: &S) -> i32 { (sys.provider_call)(-1, OBJ_PUT, p, n) }";
+        let v = scan_pending_writes(
+            std::path::Path::new("modules/app/_shared/store.rs"),
+            shared,
+            &repo,
+        );
+        assert_eq!(v.len(), 1);
+    }
+
+    #[test]
+    fn a_wrapper_handed_a_write_opcode_is_a_write() {
+        let m = "fn f(s: &S) { let rc = unsafe { s.call(h, obj::PUT_STREAMED_COMMIT, p, n) }; }";
+        assert_eq!(pending(m), 1);
+        let ok = "fn f(s: &S) { let a = write_answer(unsafe { s.call(h, obj::PUT_STREAMED_COMMIT, p, n) }); }";
+        assert_eq!(pending(ok), 0);
+        let nested = "fn f() { write_answer(g(provider_call(-1, obj::PUT, p, n))); }";
+        assert_eq!(pending(nested), 1, "only the direct argument is classified");
+    }
+
+    #[test]
+    fn reads_and_other_contracts_are_not_writes() {
+        let get = "fn f() { provider_call(-1, obj::GET, p, n); provider_call(-1, 0x1421, p, n); }";
+        assert_eq!(pending(get), 0);
+        let fs_delete = "fn f() { provider_call(-1, fs::DELETE, p, n); }";
+        assert_eq!(pending(fs_delete), 0, "fs is not the storage write surface");
+        let open = "fn f() { provider_call(-1, obj::PUT_STREAMED_OPEN, p, n); }";
+        assert_eq!(pending(open), 0, "opening a streamed write decides nothing");
     }
 }

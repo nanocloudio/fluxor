@@ -543,79 +543,101 @@ pub fn parse_modules_from_config_multi(
         }
     }
 
-    // Resident-pod module types: a pod is admitted at boot via `apply_add` and
-    // references its PIC modules by `name_hash`, which resolves only against
-    // the module table — so a pod's .fmod must be packed into that table even
-    // though the pod is not part of the base graph. Scan `pods:[*].modules:[*].type` and load
-    // any type not already present (dedup against the base graph's modules).
+    // Module types a subgraph staged by `apply_add` references by `name_hash`,
+    // which resolves only against the module table — so their .fmod must be
+    // packed into that table though the base graph does not instantiate
+    // them. Two sources, loaded alike (dedup against the base graph's
+    // modules):
+    // - resident pods, admitted at boot: `pods:[*].modules:[*].type`;
+    // - `workload_modules:`, the types a workload may be staged with at run
+    //   time (a node's volume graphs, say): each a type name, or
+    //   `{type, variant}`.
+    let mut staged: Vec<(&str, Option<&str>)> = Vec::new();
     if let Some(pods) = config["pods"].as_array() {
-        let mut loaded_types: std::collections::HashSet<String> =
-            modules.iter().map(|m| m.name.clone()).collect();
         for pod in pods {
             let Some(pmods) = pod["modules"].as_array() else {
                 continue;
             };
             for m in pmods {
-                let module_type = match m["type"].as_str().or_else(|| m["name"].as_str()) {
-                    Some(t) => t,
-                    None => continue,
-                };
-                let pod_variant = m["variant"].as_str();
-                // Variant conflict check BEFORE the dedup skip: a pod
-                // naming a different variant than the base graph (or an
-                // earlier pod) loaded must fail, not silently ride on
-                // whichever build got there first — same rule as the
-                // base graph: one FXMT entry per type, so one build.
-                match loaded_variants.entry(module_type.to_string()) {
-                    std::collections::hash_map::Entry::Occupied(e) => {
-                        if e.get().as_deref() != pod_variant {
-                            return Err(Error::Module(format!(
-                                "pod module type '{}' requests variant '{}' but the image \
-                                 already carries '{}' — one image carries one build of a \
-                                 module type; align pods and base graph on a single variant",
+                if let Some(t) = m["type"].as_str().or_else(|| m["name"].as_str()) {
+                    staged.push((t, m["variant"].as_str()));
+                }
+            }
+        }
+    }
+    if let Some(list) = config["workload_modules"].as_array() {
+        for m in list {
+            if let Some(t) = m.as_str() {
+                staged.push((t, None));
+            } else if let Some(t) = m["type"].as_str() {
+                staged.push((t, m["variant"].as_str()));
+            } else {
+                return Err(Error::Module(format!(
+                    "workload_modules entry {m} names no module type: give a type name or \
+                     {{type, variant}}"
+                )));
+            }
+        }
+    }
+    if !staged.is_empty() {
+        let mut loaded_types: std::collections::HashSet<String> =
+            modules.iter().map(|m| m.name.clone()).collect();
+        for &(module_type, variant) in &staged {
+            // Variant conflict check BEFORE the dedup skip: a staged
+            // type naming a different variant than the base graph (or an
+            // earlier staged type) loaded must fail, not silently ride on
+            // whichever build got there first — same rule as the
+            // base graph: one FXMT entry per type, so one build.
+            match loaded_variants.entry(module_type.to_string()) {
+                std::collections::hash_map::Entry::Occupied(e) => {
+                    if e.get().as_deref() != variant {
+                        return Err(Error::Module(format!(
+                                "module type '{}' (staged by a pod or workload_modules) requests variant '{}' but the \
+                                 image already carries '{}' — one image carries one build of a \
+                                 module type; align pods, workload_modules and the base graph \
+                                 on a single variant",
                                 module_type,
-                                pod_variant.unwrap_or("<default>"),
+                                variant.unwrap_or("<default>"),
                                 e.get().as_deref().unwrap_or("<default>"),
                             )));
-                        }
-                    }
-                    std::collections::hash_map::Entry::Vacant(v) => {
-                        v.insert(pod_variant.map(str::to_string));
                     }
                 }
-                if !loaded_types.insert(module_type.to_string()) {
-                    continue;
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    v.insert(variant.map(str::to_string));
                 }
-                if is_builtin_module(module_type) {
-                    if let Some(v) = pod_variant {
-                        return Err(Error::Module(format!(
-                            "pod module type '{module_type}' requests variant '{v}', but \
-                             the type is built into the kernel — built-ins have no \
+            }
+            if !loaded_types.insert(module_type.to_string()) {
+                continue;
+            }
+            if is_builtin_module(module_type) {
+                if let Some(v) = variant {
+                    return Err(Error::Module(format!(
+                            "module type '{module_type}' (staged by a pod or workload_modules) requests variant \
+                             '{v}', but the type is built into the kernel — built-ins have no \
                              variant artifacts; drop `variant:`"
                         )));
-                    }
-                    continue;
                 }
-                let pod_artifact = artifact_name(module_type, pod_variant);
-                let module_path = resolve_fmod(&pod_artifact, modules_dir, extra_dirs, store_fallback)?.ok_or_else(
+                continue;
+            }
+            let artifact = artifact_name(module_type, variant);
+            let module_path = resolve_fmod(&artifact, modules_dir, extra_dirs, store_fallback)?.ok_or_else(
                     || {
                         let searched: Vec<String> = std::iter::once(modules_dir)
                             .chain(extra_dirs.iter().copied())
                             .map(|d| d.display().to_string())
                             .collect();
                         Error::Module(format!(
-                            "pod module type '{}' (artifact '{}.fmod') not found in: {} (nor pinned in fluxor.lock [[artifact]])\nRun 'fluxor modules build' to build modules, or pin it with 'fluxor store pin'.{}",
+                            "module type '{}' (staged by a pod or workload_modules; artifact '{}.fmod') not found in: {} (nor pinned in fluxor.lock [[artifact]])\nRun 'fluxor modules build' to build modules, or pin it with 'fluxor store pin'.{}",
                             module_type,
-                            pod_artifact,
+                            artifact,
                             searched.join(", "),
-                            default_variant_hint(module_type, pod_variant),
+                            default_variant_hint(module_type, variant),
                         ))
                     },
                 )?;
-                let module_info = ModuleInfo::from_file(&module_path)?;
-                verify_module_abi_surface(&module_info, &module_path)?;
-                modules.push(module_info);
-            }
+            let module_info = ModuleInfo::from_file(&module_path)?;
+            verify_module_abi_surface(&module_info, &module_path)?;
+            modules.push(module_info);
         }
     }
 
@@ -1789,6 +1811,52 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("'slim'"), "got: {msg}");
         assert!(msg.contains("'<default>'"), "got: {msg}");
+    }
+
+    /// `workload_modules:` types are resolved like the base graph's: one the
+    /// image cannot carry fails the build, naming where it came from.
+    #[test]
+    fn a_missing_workload_module_fails_naming_its_source() {
+        let config = serde_json::json!({
+            "modules": [],
+            "workload_modules": ["no_such_volume_module"],
+        });
+        let tmp = tempfile::tempdir().unwrap();
+        let err = parse_modules_from_config_multi(&config, tmp.path(), &[], None)
+            .expect_err("a workload module the image cannot carry must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("no_such_volume_module.fmod"), "got: {msg}");
+        assert!(msg.contains("workload_modules"), "got: {msg}");
+    }
+
+    /// An entry that names no type is an error, not a skipped line.
+    #[test]
+    fn a_workload_modules_entry_without_a_type_is_an_error() {
+        let config = serde_json::json!({
+            "modules": [],
+            "workload_modules": [{ "variant": "slim" }],
+        });
+        let tmp = tempfile::tempdir().unwrap();
+        let err = parse_modules_from_config_multi(&config, tmp.path(), &[], None)
+            .expect_err("an entry without a type must fail");
+        assert!(
+            err.to_string().contains("names no module type"),
+            "got: {err}"
+        );
+    }
+
+    /// One image carries one build of a type: a workload module naming a
+    /// variant the base graph did not load is refused, as a pod's is.
+    #[test]
+    fn a_workload_module_variant_conflicting_with_the_base_graph_fails() {
+        let config = serde_json::json!({
+            "modules": [{ "name": "net", "type": "linux_net" }],
+            "workload_modules": [{ "type": "linux_net", "variant": "slim" }],
+        });
+        let tmp = tempfile::tempdir().unwrap();
+        let err = parse_modules_from_config_multi(&config, tmp.path(), &[], None)
+            .expect_err("conflicting variants must fail");
+        assert!(err.to_string().contains("'slim'"), "got: {err}");
     }
 
     /// Same type + same variant twice is the normal dedup: second entry

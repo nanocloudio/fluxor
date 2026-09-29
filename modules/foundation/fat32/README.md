@@ -21,7 +21,7 @@ implementation accepts, not merely one this provider can read back.
 
 | Port | Direction | Purpose |
 |---|---|---|
-| `blocks` | input | Block source (`nvme`, `sd`). Reads and writes both ride its synchronous ioctls. |
+| `blocks` | input | Block source (`nvme`, `sd`, `crypt_block`, `file_block`). Reads and writes both ride its synchronous ioctls. |
 
 ## Capabilities
 
@@ -190,12 +190,37 @@ Putting a known file on a device at bring-up is not this module's job. The
 scenario needs nothing placed on the volume beforehand and this provider
 carries no second implementation of its own write path.
 
+## Mounting and formatting
+
+A writable `storage.block` source (`nvme`, `crypt_block`, `file_block`) is
+mounted through its requests; a read-only or streaming one (`sd`) through its
+stream. A transform such as `crypt_block` has no stream at all, which is why
+the choice follows the source rather than a parameter.
+
+`format: 1` lays a FAT32 volume across the whole source when its first sector
+is entirely zero: a blank device, such as a fresh `crypt_block` container.
+A first sector with any content — a FAT32 volume, a partition table, another
+filesystem's data — is never overwritten, and without `format` nothing is
+written at all. The layout is `mkfs.vfat -F 32`'s:
+32 reserved sectors (boot sector, FSINFO, backups at 6 and 7), two FATs, the
+root in cluster 2, cluster size from the specification's table, a serial from
+the clock and the device. A source too small for 65 525 clusters is refused:
+below that the specification types a volume as FAT16 whatever it says.
+
+The reserved region, both FATs and the root cluster are zeroed at most 64
+requests per step (discard runs, 8-sector pipelined writes or single sectors,
+by what the source offers), then the metadata is written behind a flush and the boot sector last,
+behind another. A format cut short leaves the first sector unsigned, and the
+next mount formats from the start. Log: `[fat32] formatting`, `[fat32]
+formatted`, then the ordinary `[fat32] boot ok`.
+
 ## Parameters
 
 | Param | Purpose |
 |---|---|
 | `path`, `pattern` | Directory and glob for the enumeration surface. |
-| `volume` | Instance selector for multi-volume routing (`mount` binds by name). |
+| `volume` | Instance selector for multi-volume routing (`mount` binds by name). `platform` is reserved: the build and the kernel refuse it. |
+| `format` | 1 = lay a fresh volume on a source that holds none (see Mounting and formatting). |
 | `namespace` | NVMe namespace id. |
 | `expect_volume_id` | Volume serial this graph expects. Refuses every operation on a mismatch, and **gates the destructive parameters below**. |
 | `max_open_per_owner` | Handles one owner may hold at once. 0 = provider-wide table only. |

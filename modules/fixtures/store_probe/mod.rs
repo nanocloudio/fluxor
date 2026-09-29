@@ -68,6 +68,9 @@ const OBJ_GET: u32 = abi::contracts::storage::object::GET;
 const OBJ_RANGE_GET: u32 = abi::contracts::storage::object::RANGE_GET;
 const OBJ_DELETE: u32 = abi::contracts::storage::object::DELETE;
 const OBJ_CLOSE: u32 = abi::contracts::storage::object::CLOSE;
+use abi::contracts::storage::object::{write_answer, WriteAnswer};
+/// Room for an encoded fence (`fence::WIRE_MAX_LEN`).
+const FENCE_CAP: usize = 64;
 const NS_LIST: u32 = abi::contracts::storage::namespace::LIST;
 const NS_SUBSCRIBE: u32 = abi::contracts::storage::namespace::SUBSCRIBE;
 
@@ -112,6 +115,11 @@ struct State {
     wit_a_len: u32,
     wit_b_pfx: [u8; MAX_WITNESS],
     wit_b_len: u32,
+    /// Subscribed in state 3: a write asked again does not subscribe again.
+    subscribed: u32,
+    /// Where a write's fence lands. In the state, not on the stack, so a
+    /// write asked again names the same buffer: the same request.
+    fence: [u8; FENCE_CAP],
     scratch: [u8; 1024],
 }
 
@@ -168,7 +176,12 @@ unsafe fn witness_counts(sys: &SyscallTable, s: &mut State) -> (u32, u32) {
     (a, b)
 }
 
-unsafe fn put(sys: &SyscallTable, key: &[u8], val: &[u8]) -> i32 {
+unsafe fn put(
+    sys: &SyscallTable,
+    key: &[u8],
+    val: &[u8],
+    fence: &mut [u8; FENCE_CAP],
+) -> WriteAnswer {
     // [key_len:u16][key][ct_len:u8][body_ptr:u64][body_len:u64]
     // [precondition:u8][etag_len:u8][fence_ptr:u64][fence_cap:u16]
     let mut arg = [0u8; 320];
@@ -186,11 +199,11 @@ unsafe fn put(sys: &SyscallTable, key: &[u8], val: &[u8]) -> i32 {
     arg[p] = 0; // precondition ANY
     arg[p + 1] = 0; // etag_len
     p += 2;
-    arg[p..p + 8].copy_from_slice(&0u64.to_le_bytes()); // fence_out_ptr
+    arg[p..p + 8].copy_from_slice(&(fence.as_mut_ptr() as u64).to_le_bytes());
     p += 8;
-    arg[p..p + 2].copy_from_slice(&0u16.to_le_bytes()); // fence_out_cap
+    arg[p..p + 2].copy_from_slice(&(FENCE_CAP as u16).to_le_bytes());
     p += 2;
-    (sys.provider_call)(-1, OBJ_PUT, arg.as_mut_ptr(), p)
+    write_answer((sys.provider_call)(-1, OBJ_PUT, arg.as_mut_ptr(), p))
 }
 
 unsafe fn get(sys: &SyscallTable, key: &[u8], dst: &mut [u8]) -> i32 {
@@ -209,7 +222,7 @@ unsafe fn get(sys: &SyscallTable, key: &[u8], dst: &mut [u8]) -> i32 {
     n
 }
 
-unsafe fn delete(sys: &SyscallTable, key: &[u8]) -> i32 {
+unsafe fn delete(sys: &SyscallTable, key: &[u8], fence: &mut [u8; FENCE_CAP]) -> WriteAnswer {
     let mut arg = [0u8; 224];
     let mut p = 0usize;
     arg[0..2].copy_from_slice(&(key.len() as u16).to_le_bytes());
@@ -219,11 +232,11 @@ unsafe fn delete(sys: &SyscallTable, key: &[u8]) -> i32 {
     arg[p] = 0; // precondition ANY
     arg[p + 1] = 0; // etag_len
     p += 2;
-    arg[p..p + 8].copy_from_slice(&0u64.to_le_bytes());
+    arg[p..p + 8].copy_from_slice(&(fence.as_mut_ptr() as u64).to_le_bytes());
     p += 8;
-    arg[p..p + 2].copy_from_slice(&0u16.to_le_bytes());
+    arg[p..p + 2].copy_from_slice(&(FENCE_CAP as u16).to_le_bytes());
     p += 2;
-    (sys.provider_call)(-1, OBJ_DELETE, arg.as_mut_ptr(), p)
+    write_answer((sys.provider_call)(-1, OBJ_DELETE, arg.as_mut_ptr(), p))
 }
 
 /// LIST one page of `prefix`; returns the number of entries counted, or a
@@ -405,22 +418,22 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
         match s.state {
             0 => {
-                // 1. PUT two objects.
-                if put(sys, KEY_A, VAL_A) != 0 {
-                    s.err = -1;
-                    s.state = 99;
-                    emit(s);
-                    return 0;
+                // 1. PUT two objects. A write the store has not decided yet
+                // is asked again next step, with the same request.
+                let (key, err) = if s.put == 0 { (KEY_A, -1) } else { (KEY_B, -2) };
+                match put(sys, key, VAL_A, &mut s.fence) {
+                    WriteAnswer::Pending => return 0,
+                    WriteAnswer::Decided(0) => s.put += 1,
+                    WriteAnswer::Decided(_) => {
+                        s.err = err;
+                        s.state = 99;
+                        emit(s);
+                        return 0;
+                    }
                 }
-                s.put += 1;
-                if put(sys, KEY_B, VAL_A) != 0 {
-                    s.err = -2;
-                    s.state = 99;
-                    emit(s);
-                    return 0;
+                if s.put == 2 {
+                    s.state = 1;
                 }
-                s.put += 1;
-                s.state = 1;
             }
             1 => {
                 // 2. GET one back and BYTE-COMPARE. A provider that answers a
@@ -462,17 +475,24 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     emit(s);
                     return 0;
                 }
-                if subscribe(sys, PREFIX, s.sink) < 0 {
-                    s.err = -7;
-                    s.state = 99;
-                    emit(s);
-                    return 0;
+                if s.subscribed == 0 {
+                    if subscribe(sys, PREFIX, s.sink) < 0 {
+                        s.err = -7;
+                        s.state = 99;
+                        emit(s);
+                        return 0;
+                    }
+                    s.subscribed = 1;
                 }
-                if put(sys, KEY_C, VAL_C) != 0 {
-                    s.err = -8;
-                    s.state = 99;
-                    emit(s);
-                    return 0;
+                match put(sys, KEY_C, VAL_C, &mut s.fence) {
+                    WriteAnswer::Pending => return 0,
+                    WriteAnswer::Decided(0) => {}
+                    WriteAnswer::Decided(_) => {
+                        s.err = -8;
+                        s.state = 99;
+                        emit(s);
+                        return 0;
+                    }
                 }
                 s.put += 1;
                 s.state = 4;
@@ -495,11 +515,15 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
             5 if s.done == 0 => {
                 // 5. DELETE one, LIST again.
-                if delete(sys, KEY_B) != 0 {
-                    s.err = -9;
-                    s.state = 99;
-                    emit(s);
-                    return 0;
+                match delete(sys, KEY_B, &mut s.fence) {
+                    WriteAnswer::Pending => return 0,
+                    WriteAnswer::Decided(0) => {}
+                    WriteAnswer::Decided(_) => {
+                        s.err = -9;
+                        s.state = 99;
+                        emit(s);
+                        return 0;
+                    }
                 }
                 s.del = 1;
                 let n = list_count(sys, PREFIX, &mut s.scratch);

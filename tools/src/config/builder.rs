@@ -20,7 +20,6 @@ const MAX_GRAPH_EDGES: usize = 128;
 const DOMAIN_META_ENTRY_SIZE: usize = 4;
 const DOMAIN_META_SIZE: usize = 4 * DOMAIN_META_ENTRY_SIZE;
 
-
 /// Module entry header size (entry_length:u32 + name_hash:u32 + id:u8 + reserved:u8).
 /// `entry_length` is a u32 so a single module's params can exceed
 /// 64 KiB — needed by synth host's http module when both halves of a
@@ -1726,7 +1725,7 @@ const NON_PARAM_KEYS: &[&str] = &[
     // lifted out before packing by `lift_trust_source`.
     "verify_hostname",
     "verify_uri", // URI SAN required under peer_auth: ca_uri, extended TLV tag 15
-    "alpn", // RFC 7301 ALPN list, emitted as extended TLV tag 14
+    "alpn",       // RFC 7301 ALPN list, emitted as extended TLV tag 14
     "domain",
     "sample_rate", // injected by graph_sample_rate
     // Protection-control keys emitted as TLV tags by
@@ -1736,8 +1735,8 @@ const NON_PARAM_KEYS: &[&str] = &[
     "step_deadline_burst_us",
     "quarantine_partner",     // name form, resolved at wiring pass
     "quarantine_partner_idx", // numeric form passed straight through
-    "heap",                   // nested object: { zero_on_free,
-                              //   alloc_failure_policy, canary_enabled }
+    // `heap`: nested object { zero_on_free, alloc_failure_policy, canary_enabled }
+    "heap",
     // Provenance recorded by stack expansion, not authored and not
     // emitted: which stack injected this module entry and which of its
     // params that stack set. Read only to explain a catalog/module skew
@@ -3025,7 +3024,6 @@ fn build_module_entry(
     Ok(entry)
 }
 
-
 pub(crate) fn parse_modules_map(
     modules: &Value,
     data_section: Option<&Value>,
@@ -3146,4 +3144,3 @@ pub(crate) fn parse_modules_map(
 
     Ok((entries, names))
 }
-

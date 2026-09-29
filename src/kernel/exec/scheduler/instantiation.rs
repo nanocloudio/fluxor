@@ -44,6 +44,38 @@ pub(crate) fn is_multi_inbound(name_hash: u32) -> bool {
     table.iter().any(|&h| h != 0 && h == name_hash)
 }
 
+/// Name-hashes of built-ins whose data output keeps one channel per edge when
+/// every consumer of it is also one of its producers: each consumer then
+/// reads only its own events, so one that falls behind holds up nobody else.
+/// A fan whose consumers and producers differ keeps the tee, as the module
+/// cannot tell which consumer an event is for. Platforms register these
+/// before `prepare_graph` (e.g. linux_net).
+static mut MULTI_OUTBOUND_HASHES: [u32; 8] = [0; 8];
+
+/// Register a module name-hash whose data output may keep one channel per
+/// edge (see [`MULTI_OUTBOUND_HASHES`]). Call before `prepare_graph`.
+pub fn register_multi_outbound(name_hash: u32) {
+    // SAFETY: called single-threaded during platform bring-up, before
+    // the scheduler starts stepping.
+    let table = unsafe { &mut *core::ptr::addr_of_mut!(MULTI_OUTBOUND_HASHES) };
+    for slot in table.iter_mut() {
+        if *slot == name_hash {
+            return;
+        }
+        if *slot == 0 {
+            *slot = name_hash;
+            return;
+        }
+    }
+    log::error!("[graph] multi-outbound table full; {name_hash:#x} not registered");
+}
+
+pub(crate) fn is_multi_outbound(name_hash: u32) -> bool {
+    // SAFETY: read-only after bring-up registration.
+    let table = unsafe { &*core::ptr::addr_of!(MULTI_OUTBOUND_HASHES) };
+    table.iter().any(|&h| h != 0 && h == name_hash)
+}
+
 /// Build the dense module list from the validated config.
 ///
 /// Fail-closed on every malformation:

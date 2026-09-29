@@ -1701,6 +1701,10 @@ enum EmitOutcome {
     /// Not written. The AEAD sequence has moved, so the caller fails
     /// the session.
     Failed,
+    /// Not written: `cipher_out` had no room, or an earlier record of the
+    /// session is still waiting for it. Nothing is on the wire, so a
+    /// caller that keeps the record and writes it first stays in step.
+    Blocked,
 }
 
 /// Write an already-sealed record to cipher_out, retaining it for
@@ -1726,14 +1730,51 @@ unsafe fn emit_record(s: &mut TlsState, idx: usize, rec: *const u8, total: usize
         mirror_tx_hold(s, idx);
         return EmitOutcome::Held;
     }
+    // A record may not overtake the session's stalled one.
+    if tx_stalled(s, idx) {
+        return EmitOutcome::Blocked;
+    }
+    if !write_record_now(s, idx, rec, total) {
+        return EmitOutcome::Blocked;
+    }
     if mirror && mirror_record_out(s, idx, rec, total) == 0 {
         mirror_abandon(s, idx);
     }
-    if write_record_now(s, idx, rec, total) {
-        EmitOutcome::Sent
-    } else {
-        EmitOutcome::Failed
+    EmitOutcome::Sent
+}
+
+/// Whether session `idx` has a sealed record waiting for `cipher_out`.
+fn tx_stalled(s: &TlsState, idx: usize) -> bool {
+    s.tx_stall_len > 0 && s.tx_stall_idx as usize == idx
+}
+
+/// Write the sealed record `cipher_out` last had no room for. True once
+/// nothing is stalled. A stalled session that is no longer ready drops
+/// the record and the unread rest of its clear frame.
+unsafe fn flush_tx_stall(s: &mut TlsState) -> bool {
+    let n = s.tx_stall_len as usize;
+    if n == 0 {
+        return true;
     }
+    let idx = s.tx_stall_idx as usize;
+    if s.sessions[idx].state != SessionState::Ready {
+        s.tx_stall_len = 0;
+        let left = s.clear_left as usize;
+        s.clear_left = 0;
+        if left > 0 {
+            tls_discard(&*s.syscalls, s.clear_in, left);
+        }
+        return true;
+    }
+    let rec = s.tx_stall.as_ptr();
+    if !write_record_now(s, idx, rec, n) {
+        return false;
+    }
+    s.tx_stall_len = 0;
+    if s.sessions[idx].cont.mirror && mirror_record_out(s, idx, rec, n) == 0 {
+        mirror_abandon(s, idx);
+    }
+    true
 }
 
 /// The unconditional write: cipher_out, byte accounting, retention.
@@ -2147,7 +2188,10 @@ unsafe fn handle_quiesce(s: &mut TlsState, p: &[u8], begin: bool) {
         s.sessions[idx].cont.quiescing = true;
     }
     let sess = &s.sessions[idx];
-    let pending_out: u32 = (sess.cont.tx_hold_len != 0) as u32;
+    // A sealed record `cipher_out` had no room for is output the peer is
+    // owed: the write sequence has moved past it, so a cut taken now would
+    // hand the standby a sequence the peer never saw the record for.
+    let pending_out: u32 = (sess.cont.tx_hold_len != 0 || tx_stalled(s, idx)) as u32;
     let head_complete = sess.recv_len >= RECORD_HEADER_LEN && {
         let rl = ((sess.recv_buf[3] as usize) << 8) | sess.recv_buf[4] as usize;
         sess.recv_len >= RECORD_HEADER_LEN + rl
@@ -2177,7 +2221,10 @@ unsafe fn handle_cut_export(s: &mut TlsState, p: &[u8]) {
         cont_reply(s, &flow, epoch, sc::CR_CUT, sc::STATUS_STALE_EPOCH, &[]);
         return;
     }
-    if s.sessions[idx].state != SessionState::Ready || s.sessions[idx].cont.horizon_outstanding() {
+    if s.sessions[idx].state != SessionState::Ready
+        || s.sessions[idx].cont.horizon_outstanding()
+        || tx_stalled(s, idx)
+    {
         cont_reply(
             s,
             &flow,

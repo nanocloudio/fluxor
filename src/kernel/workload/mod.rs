@@ -2,6 +2,7 @@
 
 pub mod bitmask;
 pub mod extbridge;
+pub mod net_attach;
 pub mod owner;
 #[cfg(feature = "host-linux")]
 pub mod owner_log;

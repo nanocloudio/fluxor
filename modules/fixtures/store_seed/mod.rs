@@ -48,6 +48,9 @@ include!("../../sdk/runtime/params.rs");
 // The opcode comes from the contract this fixture drives, not from a
 // literal: a seeder that restates the wire can write against its own copy.
 const OBJ_PUT: u32 = abi::contracts::storage::object::PUT;
+use abi::contracts::storage::object::{write_answer, WriteAnswer};
+/// Room for an encoded fence (`fence::WIRE_MAX_LEN`).
+const FENCE_CAP: usize = 64;
 const MAX_KEY: usize = 192;
 const MAX_VALUE: usize = 1024;
 
@@ -61,6 +64,9 @@ struct State {
     written: u32,
     ticks: u32,
     rc: i32,
+    /// Where the write's fence lands. In the state, so a write asked again
+    /// is the same request.
+    fence: [u8; FENCE_CAP],
 }
 
 mod params_def {
@@ -195,11 +201,15 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         arg[p] = 0; // precondition ANY
         arg[p + 1] = 0;
         p += 2;
-        arg[p..p + 8].copy_from_slice(&0u64.to_le_bytes());
+        arg[p..p + 8].copy_from_slice(&(s.fence.as_mut_ptr() as u64).to_le_bytes());
         p += 8;
-        arg[p..p + 2].copy_from_slice(&0u16.to_le_bytes());
+        arg[p..p + 2].copy_from_slice(&(FENCE_CAP as u16).to_le_bytes());
         p += 2;
-        s.rc = (sys.provider_call)(-1, OBJ_PUT, arg.as_mut_ptr(), p);
+        s.rc = match write_answer((sys.provider_call)(-1, OBJ_PUT, arg.as_mut_ptr(), p)) {
+            // Not decided yet: asked again next step, with the same request.
+            WriteAnswer::Pending => return 0,
+            WriteAnswer::Decided(rc) => rc,
+        };
         s.written = 1;
 
         let mut buf = [0u8; 96];
@@ -207,6 +217,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         let pre = b"[seed] rc=";
         core::ptr::copy_nonoverlapping(pre.as_ptr(), pb, pre.len());
         let mut pos = pre.len();
+        if s.rc < 0 {
+            *pb.add(pos) = b'-';
+            pos += 1;
+        }
         let v = s.rc.unsigned_abs();
         let mut tmp = [0u8; 10];
         let mut n = 0usize;

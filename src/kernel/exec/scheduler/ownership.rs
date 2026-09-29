@@ -303,6 +303,43 @@ pub fn channel_producer_owner(ch: i32) -> OwnerHandle {
     crate::kernel::workload::owner::OWNER_SYSTEM
 }
 
+/// The module that writes channel `ch`, if an edge names it.
+pub fn channel_producer_module(ch: i32) -> Option<usize> {
+    if ch < 0 {
+        return None;
+    }
+    // SAFETY: scheduler-thread read of the static edge table.
+    let sched = unsafe {
+        let p = &raw const SCHED;
+        &*p
+    };
+    sched
+        .edges
+        .iter()
+        .take(sched.edge_count)
+        .find(|e| e.channel == ch && e.from_module < MAX_MODULES)
+        .map(|e| e.from_module)
+}
+
+/// The module that reads channel `ch` (the edge's consuming end), if an edge
+/// names it.
+pub fn channel_consumer_module(ch: i32) -> Option<usize> {
+    if ch < 0 {
+        return None;
+    }
+    // SAFETY: scheduler-thread read of the static edge table.
+    let sched = unsafe {
+        let p = &raw const SCHED;
+        &*p
+    };
+    sched
+        .edges
+        .iter()
+        .take(sched.edge_count)
+        .find(|e| e.channel == ch && e.to_module < MAX_MODULES)
+        .map(|e| e.to_module)
+}
+
 /// Owner attribution for a module: `(owner_uid, slot, generation)`, or `None` if
 /// the module is system-owned or its owner stamp is stale (slot reused at a
 /// newer generation). Mirrors `owner_live_snapshot`'s stale-stamp rule. Used by
@@ -397,27 +434,26 @@ pub fn take_rebuild_request() -> Option<(*const u8, usize)> {
     }
 }
 
-/// Tear down a single module: release its module heap arena, then its
-/// state buffer, back to the loader pool. Clears the slot, port
-/// assignments, hints, drain flags, and finished state so the slot can
-/// be reused.
+/// Tear down a single module: take its memory (state buffer, heap arena,
+/// elastic chunks and, on a protection-unit target, its private region) back
+/// to the loader, drop its protection domain, and clear its slot, port
+/// assignments, hints, drain flags and finished state so the slot can be
+/// reused.
 ///
-/// Intended for use by the graph-rebuild path when only some modules
-/// need to be replaced. Not called by the atomic reconfigure path,
-/// which uses `reset_state_arena` to drop everything at once.
+/// The caller has already released what the module registered or opened
+/// (`release_module_handles`) and unspliced it from the execution order. A
+/// module with buffers still lent to a block source is **quarantined**: its
+/// memory and slot are kept until the source has returned them (see
+/// `block_lend`), and everything else is torn down at once.
 pub fn free_module_state(module_idx: usize) {
     if module_idx >= MAX_MODULES {
         return;
     }
-    // SAFETY: graph-rebuild context — scheduler thread is the sole mutator.
+    // SAFETY: teardown context — the scheduler thread is the sole mutator.
     let sched = unsafe {
         let p = &raw mut SCHED;
         &mut *p
     };
-
-    // Elastic-region chunks the module grew into: teardown IS the reclaim
-    // path — release them before the slot is reused.
-    crate::kernel::mem::elastic::reclaim_module(module_idx as u8);
 
     // A gated module on an MPU target owns one private region — its stack,
     // state and heap — which goes back to the pool whole; its state and heap
@@ -425,41 +461,31 @@ pub fn free_module_state(module_idx: usize) {
     #[cfg(feature = "kernel-mpu")]
     let private = crate::kernel::module::gateway::regions(module_idx)
         .filter(|(_, stack, p)| stack.len != 0 && p[0].base == stack.base)
-        .map(|(_, _, p)| p[0]);
+        .map(|(_, _, p)| (p[0].base as *mut u8, p[0].len));
     #[cfg(not(feature = "kernel-mpu"))]
-    let private: Option<crate::kernel::module::gateway::Region> = None;
-    if let Some(region) = private {
-        #[cfg(feature = "kernel-mpu")]
-        // SAFETY: the region `alloc_private` returned for this module, which
-        // is torn down and no longer stepping.
-        unsafe {
-            crate::kernel::module::loader::free_private(region.base as *mut u8, region.len);
-        }
-        let _ = region;
-        sched.arenas[module_idx] = ArenaInfo::empty();
-        if let ModuleSlot::Dynamic(_) =
-            core::mem::replace(&mut sched.modules[module_idx], ModuleSlot::Empty)
-        {}
-    }
+    let private: Option<(*mut u8, usize)> = None;
 
-    // Heap arena (from module_arena_size export, if any).
-    let arena = sched.arenas[module_idx];
-    if !arena.ptr.is_null() && arena.size > 0 {
-        // SAFETY: `(arena.ptr, arena.size)` was returned by
-        // `loader::alloc_state(size)` during instantiation.
-        unsafe {
-            crate::kernel::module::loader::free_state_range(arena.ptr, arena.size as usize);
-        }
-    }
-    sched.arenas[module_idx] = ArenaInfo::empty();
-
-    // State buffer lives inside the DynamicModule; consume the slot.
-    let slot = core::mem::replace(&mut sched.modules[module_idx], ModuleSlot::Empty);
-    if let ModuleSlot::Dynamic(m) = slot {
-        // SAFETY: `m` is the just-replaced slot; no other reference is live.
-        unsafe {
-            m.free();
-        }
+    // The heap arena (from the module_arena_size export, if any) and the
+    // state buffer, which lives inside the DynamicModule.
+    let arena = core::mem::replace(&mut sched.arenas[module_idx], ArenaInfo::empty());
+    let state = match core::mem::replace(&mut sched.modules[module_idx], ModuleSlot::Empty) {
+        ModuleSlot::Dynamic(m) => m.into_state_range(),
+        _ => (core::ptr::null_mut(), 0),
+    };
+    let memory = crate::kernel::module::loader::ModuleMemory::new(
+        state,
+        (arena.ptr, arena.size as usize),
+        private,
+    );
+    if crate::kernel::module::block_lend::holds_lends(module_idx) {
+        crate::kernel::module::block_lend::quarantine(module_idx, memory);
+    } else {
+        // Elastic-region chunks the module grew into: teardown IS the reclaim
+        // path — release them before the slot is reused.
+        crate::kernel::mem::elastic::reclaim_module(module_idx as u8);
+        // SAFETY: the module is unspliced and never stepped again, and no
+        // source holds a buffer inside its memory.
+        unsafe { memory.release() };
     }
 
     // A gated module's protection domain goes with it: its slot, tables and

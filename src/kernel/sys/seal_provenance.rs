@@ -45,10 +45,10 @@ pub enum SealProvenance {
 ///
 /// Getting that wrong is the single most expensive mistake in this file.
 /// `DeviceUnique` is the only variant that RAISES a vault's tier, and the
-/// tier is what `key_custody` refuses production on — so a platform that
-/// claims it wrongly converts a fail-closed refusal into a silent pass, and
-/// every consumer checking `tier >= DEVICE_HW` believes keys are
-/// hardware-protected when they are not.
+/// tier is what a consumer's `tier >= DEVICE_HW` refusal reads — so a
+/// platform that claims it wrongly converts a fail-closed refusal into a
+/// silent pass, and every consumer checking `tier >= DEVICE_HW` believes
+/// keys are hardware-protected when they are not.
 ///
 /// So the key is not believed on its own: it must be preceded by this
 /// magic, written at provisioning time. Unprogrammed fuses read as all-zero
@@ -125,4 +125,3 @@ pub fn provenance_from_hardware_key(read_ok: bool, blob: &[u8]) -> SealProvenanc
     }
     SealProvenance::DeviceUnique
 }
-

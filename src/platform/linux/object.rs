@@ -26,10 +26,10 @@
 // qualified; the two `io` traits are pulled in anonymously
 // (`as _`) inside `http_request` so their methods resolve without
 // binding a colliding name.
-use fluxor::abi::fence as obj_dev_fence;
 use fluxor::abi::contracts::storage::object as obj_dev;
-use fluxor::kernel::sys::errno as obj_errno;
+use fluxor::abi::fence as obj_dev_fence;
 use fluxor::kernel::ipc::fd::{tag_fd, FD_TAG_STORAGE_OBJECT};
+use fluxor::kernel::sys::errno as obj_errno;
 
 const OBJ_MAX_OPEN: usize = 16;
 const OBJ_MAX_KEY: usize = 256;
@@ -47,8 +47,7 @@ const OBJ_EMPTY_SLOT: LinuxObjectSlot = LinuxObjectSlot {
     key_len: 0,
 };
 
-static mut LINUX_OBJECTS: [LinuxObjectSlot; OBJ_MAX_OPEN] =
-    [OBJ_EMPTY_SLOT; OBJ_MAX_OPEN];
+static mut LINUX_OBJECTS: [LinuxObjectSlot; OBJ_MAX_OPEN] = [OBJ_EMPTY_SLOT; OBJ_MAX_OPEN];
 
 /// Outcome of one blocking HTTP request.
 struct HttpResult {
@@ -64,12 +63,7 @@ struct HttpResult {
 
 /// Dispatch entry registered for the STORAGE_OBJECT contract from
 /// `linux_init_providers`.
-unsafe fn linux_object_dispatch(
-    handle: i32,
-    opcode: u32,
-    arg: *mut u8,
-    arg_len: usize,
-) -> i32 {
+unsafe fn linux_object_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
     // Control-plane store mode (FLUXOR_STORE_DIR set): the versioned store backs
     // storage.object here (PUT/GET/HEAD/DELETE/CAS + revision fence). Otherwise
     // this provider is the HTTP-backed object surface below.
@@ -305,7 +299,9 @@ fn http_request(key: &[u8], range: Option<(u64, u64)>, head: bool) -> Result<Htt
         .map_err(|_| obj_errno::ENODEV)?;
 
     let mut raw = Vec::new();
-    stream.read_to_end(&mut raw).map_err(|_| obj_errno::ENODEV)?;
+    stream
+        .read_to_end(&mut raw)
+        .map_err(|_| obj_errno::ENODEV)?;
 
     // Split headers / body at the first CRLFCRLF.
     let split = find_subslice(&raw, b"\r\n\r\n").ok_or(obj_errno::ERROR)?;
@@ -345,7 +341,5 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || haystack.len() < needle.len() {
         return None;
     }
-    haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
+    haystack.windows(needle.len()).position(|w| w == needle)
 }

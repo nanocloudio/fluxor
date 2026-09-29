@@ -84,6 +84,13 @@ Provider opcodes pass through a default-deny rule table:
 - An opcode the table does not name is refused with `EACCES`.
 - A struct that carries pointers (the `storage.object` requests) is copied
   into kernel memory, and every embedded pointer is checked before dispatch.
+- A channel ioctl is admitted only for the kernel's built-in commands and the
+  `storage.block` requests. A block request's buffer is checked like any
+  embedded pointer: private memory for a read, readable memory for a write.
+  Any other command would reach a module-registered handler whose argument
+  the gateway cannot see into, so it is refused. Every block command carries
+  exactly its record's length, and a buffer lent by `SUBMIT` stays valid after
+  the module is gone: see [Lent buffers](storage_capability_surface.md#11-storageblock-v1).
 - Refusals are logged as `[gate] module M op N refused: <why>`, rate-limited.
 
 Channel data is copied by the gateway, so a gated module has no view onto a

@@ -125,7 +125,7 @@ so the stream stays frame-aligned.
 | `0x10` | `CMD_BIND` | `[port: u16 LE]` — open a listener |
 | `0x11` | `CMD_SEND` | `[conn_id: u16 LE][data…]` — send bytes on a connection |
 | `0x12` | `CMD_CLOSE` | `[conn_id: u16 LE]` — tear down a connection |
-| `0x13` | `CMD_CONNECT` | retired — every provider answers `MSG_ERROR` ENOSYS on the requester tag |
+| `0x13` | `CMD_CONNECT` | reserved, unsupported — every provider answers `MSG_ERROR` ENOSYS on the requester tag |
 | `0x14` | `CMD_CONNECT_TO` | `[sock_type: u8][af: u8][port: u16 LE][addr…][requester_tag: u8?]` |
 
 `CMD_CONNECT_TO` carries one of three address families: `AF_INET` (4,
@@ -250,7 +250,7 @@ dials.
 Errors are synchronous or tagged, never a timeout: a name over 253 bytes,
 a malformed record, or a family the provider does not serve is EINVAL at
 the connect; a name that does not resolve is ENOENT on the requester
-tag; the retired `CMD_CONNECT` (0x13) is ENOSYS. The `ip` stub resolver
+tag; the unsupported `CMD_CONNECT` (0x13) is ENOSYS. The `ip` stub resolver
 is narrower than the contract and holds names of at most 64 bytes, so it
 refuses a longer one EINVAL as well. A misconfigured graph fails its
 first dial with a reason.
@@ -466,6 +466,25 @@ On the Linux target there is no IP module in the graph. The `linux_net`
 platform module presents the same `net_in` / `net_out` net_proto surface
 and bridges it to host sockets internally, so the same consumer modules
 run unchanged. The Linux variant of `stacks/net.toml` instantiates it.
+
+### Lanes for a workload staged at runtime
+
+A subgraph staged by a `workload` CREATE (an fmod-graph source) joins the
+network through lanes of its own rather than the fanned `net_out`. Its
+FLXA names the provider as an endpoint, `Net(key)`: one edge from a module
+into it (commands) and one edge out of it to a module (events) per key.
+Each key becomes one lane:
+
+| Rule | Effect |
+|---|---|
+| Owner | Commands run as the workload's owner: binds are lease-gated as it, and what they open is stamped with it |
+| Events | Every message about something the lane opened — accepts, data, closes, connect results — goes to the lane's events channel and nowhere else; a full lane back-pressures only its own sockets |
+| Isolation | A lane sends on and closes only what it opened; the node's own lanes cannot touch a workload's connections either |
+| Teardown | Freeing the owner detaches its lanes and closes everything they opened |
+
+The stream surface is complete on a lane; the datagram surface is refused
+(`EOPNOTSUPP`). `linux_net` implements lanes; the first instance in a graph
+is the provider.
 
 ## TLS as a Channel Transformer
 
@@ -757,8 +776,8 @@ under a strictly higher epoch and a non-zero fence generation: timers
 are converted from their remaining durations with the transfer age
 charged, expired ones fire on the next sweep, congestion restarts
 conservatively (window capped at the initial window, recovery cleared),
-and the TCP side reports the live conn id the TLS side binds to. The old
-anchor's `RETIRE` drops the connection silently — no FIN, no RST, no
+and the TCP side reports the live conn id the TLS side binds to. The primary's
+`RETIRE` drops the connection silently — no FIN, no RST, no
 consumer event — and zeroizes its secrets. The peer never sees the move.
 
 What the ip and tls modules own here is the codec, the horizons and the

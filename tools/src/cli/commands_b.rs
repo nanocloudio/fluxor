@@ -60,11 +60,8 @@ fn cmd_validate(config_path: &PathBuf, target_override: Option<&str>) -> Result<
         // providers without compiling. Members placed on another node
         // are part of the declaration and are resolved against no target.
         let remote_list = serde_json::Value::Array(crate::config::remote_members(&config));
-        let remote_manifests = crate::config::load_module_manifests_with_extra(
-            &remote_list,
-            &extra_dirs,
-            &cfg_root,
-        );
+        let remote_manifests =
+            crate::config::load_module_manifests_with_extra(&remote_list, &extra_dirs, &cfg_root);
         let mut continuity_names = module_names.clone();
         continuity_names.extend(crate::config::remote_member_names(&config));
         let mut continuity_manifests = manifests.clone();
@@ -1732,8 +1729,14 @@ fn cmd_inspect_store_ref(reference: &str, json: bool) -> Result<()> {
     println!("digest:        {}", desc.digest);
     println!("tags:          {tags_line}");
     println!("epoch:         {epoch_line}");
-    println!("input-digest:  {}", ann(ANN_INPUT_DIGEST).unwrap_or("(none)"));
-    println!("content:       {}", crate::store_resolve::content_digest(&manifest));
+    println!(
+        "input-digest:  {}",
+        ann(ANN_INPUT_DIGEST).unwrap_or("(none)")
+    );
+    println!(
+        "content:       {}",
+        crate::store_resolve::content_digest(&manifest)
+    );
     // Provenance is a fact about the publishing RUN, so it lives beside
     // the manifest rather than inside it: an artifact re-published from
     // a later commit is the SAME manifest with one more row filed

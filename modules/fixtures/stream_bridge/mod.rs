@@ -8,8 +8,10 @@
 //! RECONNECT_MS` after one nothing answered. In both modes the
 //! connection's bytes flow to `bytes_out` and `bytes_in` flows to the
 //! connection in `CMD_SEND`
-//! frames of at most `CHUNK` bytes; a refused write leaves the bytes on
-//! `bytes_in` for the next step.
+//! frames of at most `CHUNK` bytes. Neither direction drops a byte: a
+//! frame the net side refuses is kept and written first next step, and
+//! data `bytes_out` has no room for is kept and nothing more is read from
+//! the connection until it has gone.
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
@@ -104,6 +106,13 @@ pub struct BridgeState {
     pub connections: u32,
     buf: [u8; BUF],
     out: [u8; 3 + 2 + CHUNK],
+    /// Length of the `CMD_SEND` frame in `out` still owed to `net_out`;
+    /// 0 when none.
+    out_len: u16,
+    /// Connection data in `buf[5..]` still owed to `bytes_out`: from
+    /// `down_off` up to `down_len`.
+    down_off: u16,
+    down_len: u16,
 }
 
 mod params_def {
@@ -112,7 +121,7 @@ mod params_def {
         BridgeState;
         1, mode, u8, 0, enum { listen=0, connect=1 } => |s, d, len| { s.mode = p_u8(d, len, 0, 0); };
         2, port, u16, 9100 => |s, d, len| { s.port = p_u16(d, len, 0, 9100); };
-        // Tag 3 is retired; the next allocation is 5.
+        // Tag 3 is unassigned.
         4, authority, str, 0 => |s, d, len| {
             // An authority that does not fit is dropped rather than
             // clipped: a prefix of a name is a different host, and the
@@ -220,8 +229,34 @@ unsafe fn send_close(s: &mut BridgeState, conn: u16) {
     );
 }
 
+/// Hand `bytes_out` what it has room for of the data kept in `buf`. True
+/// once none is left.
+unsafe fn deliver_down(s: &mut BridgeState) -> bool {
+    let sys = &*s.syscalls;
+    let off = s.down_off as usize;
+    let len = s.down_len as usize;
+    if off >= len {
+        return true;
+    }
+    let n = (sys.channel_write)(s.bytes_out, s.buf.as_ptr().add(5 + off), len - off);
+    if n > 0 {
+        s.down_off = (off + n as usize) as u16;
+        s.bytes_down = s.bytes_down.wrapping_add(n as u32);
+    }
+    if s.down_off as usize >= len {
+        s.down_off = 0;
+        s.down_len = 0;
+        return true;
+    }
+    false
+}
+
 unsafe fn service_net(s: &mut BridgeState) {
     let sys = &*s.syscalls;
+    // Connection data first: nothing behind it is read until it is out.
+    if !deliver_down(s) {
+        return;
+    }
     let mut n = 0;
     while n < FRAMES_PER_STEP {
         let (msg, plen) = net_read_frame(sys, s.net_in, s.buf.as_mut_ptr(), BUF);
@@ -270,10 +305,10 @@ unsafe fn service_net(s: &mut BridgeState) {
                 }
             }
             NET_MSG_DATA if plen > 2 && id == s.conn && s.phase == PH_LIVE => {
-                let data = p.add(2);
-                let len = plen - 2;
-                if (sys.channel_write)(s.bytes_out, data, len) == len as i32 {
-                    s.bytes_down = s.bytes_down.wrapping_add(len as u32);
+                s.down_off = 0;
+                s.down_len = (plen - 2) as u16;
+                if !deliver_down(s) {
+                    break;
                 }
             }
             NET_MSG_CLOSED | NET_MSG_ERROR => {
@@ -284,6 +319,8 @@ unsafe fn service_net(s: &mut BridgeState) {
                         log(s, b"[bridge] closed");
                     }
                     s.conn = NO_CONN;
+                    // A frame owed to the old connection names its id.
+                    s.out_len = 0;
                     s.phase = if s.mode == MODE_LISTEN {
                         PH_LISTENING
                     } else {
@@ -303,14 +340,22 @@ unsafe fn service_bytes(s: &mut BridgeState) {
         return;
     }
     let sys = &*s.syscalls;
+    // The frame the net side refused last goes first.
+    if s.out_len > 0 {
+        let total = s.out_len as usize;
+        if (sys.channel_write)(s.net_out, s.out.as_ptr(), total) != total as i32 {
+            return;
+        }
+        s.bytes_up = s.bytes_up.wrapping_add((total - 5) as u32);
+        s.out_len = 0;
+    }
     let mut n = 0;
     while n < FRAMES_PER_STEP {
         let poll = (sys.channel_poll)(s.bytes_in, POLL_IN);
         if poll <= 0 || (poll as u32 & POLL_IN) == 0 {
             break;
         }
-        // The net side must be able to take a whole chunk, or the bytes
-        // stay where they are.
+        // No room at all on the net side: leave the bytes where they are.
         let out_poll = (sys.channel_poll)(s.net_out, POLL_OUT);
         if out_poll <= 0 || (out_poll as u32 & POLL_OUT) == 0 {
             break;
@@ -329,9 +374,13 @@ unsafe fn service_bytes(s: &mut BridgeState) {
         *s.out.as_mut_ptr().add(3) = cb[0];
         *s.out.as_mut_ptr().add(4) = cb[1];
         let total = 3 + plen;
-        if (sys.channel_write)(s.net_out, s.out.as_ptr(), total) == total as i32 {
-            s.bytes_up = s.bytes_up.wrapping_add(len as u32);
+        if (sys.channel_write)(s.net_out, s.out.as_ptr(), total) != total as i32 {
+            // Room for part of it only: the bytes are already off
+            // `bytes_in`, so the frame is kept and written first next step.
+            s.out_len = total as u16;
+            break;
         }
+        s.bytes_up = s.bytes_up.wrapping_add(len as u32);
         n += 1;
     }
 }

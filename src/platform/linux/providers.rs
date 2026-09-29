@@ -320,17 +320,12 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             }
 
             // Open policy: read-write on existing files, never auto-
-            // create. The kernel's `FS_OPEN` opcode has no flags
-            // argument today — there's no way for the caller to
-            // signal "I need to write" vs "I'm just reading". A
-            // previous rev tried `O_RDWR|O_CREAT` first to support
-            // write-side callers, but that silently 200-OK'd missing
-            // files (a typo'd `GET /api/list/nope.png` would create
-            // an empty file and persist it on disk). Now: if the
-            // file doesn't exist, return ENOENT → the http handler
-            // emits 404 cleanly. Future write-side callers can use
-            // a new `FS_OPEN_CREATE` opcode or pass flags in the
-            // path-extension slot once the ABI grows that knob.
+            // create. `FS_OPEN` carries no flags, so the caller cannot
+            // say "I need to write" versus "I'm just reading". Creating
+            // on open would answer a missing file with an empty one
+            // persisted on disk (a typo'd `GET /api/list/nope.png` would
+            // 200), so a missing file is ENOENT and the http handler
+            // emits 404.
             let fd_raw = libc::open(path_buf.as_ptr() as *const libc::c_char, libc::O_RDWR, 0);
             if fd_raw < 0 {
                 // Fall back to read-only (covers files we can read
@@ -901,10 +896,7 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
 // is the boundary). Config-driven root/env/timeout scoping and OS sandboxing
 // are not applied here.
 
-const PROC_SPAWN: u32 = 0x1600;
-const PROC_READ: u32 = 0x1601;
-const PROC_STATUS: u32 = 0x1602;
-const PROC_CLOSE: u32 = 0x1603;
+use crate::abi::platform::linux::host_process::{PROC_CLOSE, PROC_READ, PROC_SPAWN, PROC_STATUS};
 
 const MAX_PROCS: usize = 8;
 
@@ -1166,7 +1158,7 @@ const MSG_BIND_REFUSED: u8 = 0x07;
 const CMD_BIND: u8 = 0x10;
 const CMD_SEND: u8 = 0x11;
 const CMD_CLOSE: u8 = 0x12;
-/// RETIRED dial (`[sock_type][ip u32 LE][port][tag?]`). Answered with
+/// Reserved dial (`[sock_type][ip u32 LE][port][tag?]`), unsupported. Answered with
 /// `MSG_ERROR ENOSYS` on its tag so a stale emitter fails on its first dial
 /// rather than dialling the address its bytes would decode to under the
 /// live shape.
@@ -1222,6 +1214,13 @@ pub const LINUX_NET_MAX_CONNS_CAP: usize = 65535;
 const LINUX_NET_READY_BATCH: usize = 1024;
 /// Max distinct inbound command channels (priority lanes).
 pub const LINUX_NET_MAX_INBOUND: usize = 8;
+/// Lanes a workload staged at runtime may attach (`net_attach`). Attached
+/// lane `j` is lane index `LINUX_NET_MAX_INBOUND + j`, after every boot lane.
+pub const LINUX_NET_MAX_ATTACHED: usize = 32;
+/// Control frames held for one destination channel while it is full.
+/// Bounded so a wedged consumer cannot grow it without limit; past the cap
+/// the oldest frame is dropped.
+const PENDING_CTRL_CAP: usize = 256;
 /// Per-connection write backlog cap when the graph does not set
 /// `write_buf_kib`. 128 KiB holds a full Spectrum video frame's worth of
 /// WS fragments (~98 KB) so a slow peer can absorb one frame's
@@ -1269,6 +1268,11 @@ struct LinuxNetConn {
     /// bind/connect that created this slot (/// attribution is carried via the lane, never inferred from the executing
     /// module, which may be system-owned). Immutable for the life of the slot.
     owner: crate::kernel::workload::owner::OwnerHandle,
+    /// The lane whose command created this slot (an accepted connection
+    /// takes its listener's). Every event about the slot goes to that
+    /// lane's events channel, and an attached lane may act only on the
+    /// slots it created. Immutable for the life of the slot.
+    lane: u16,
     /// Datagram endpoints only: the `owner_tag` the consumer stamped on
     /// `DG_CMD_BIND`. `DG_CMD_SEND_TO` / `DG_CMD_CLOSE` must present the same
     /// value or the command is refused with `EPERM`. Zero is the host
@@ -1316,6 +1320,7 @@ impl LinuxNetConn {
             resolve_started: None,
             release_at: None,
             owner: crate::kernel::workload::owner::OWNER_SYSTEM,
+            lane: 0,
             dg_owner_tag: 0,
             write_buf: Vec::new(),
             alts: Vec::new(),
@@ -1323,6 +1328,23 @@ impl LinuxNetConn {
             racing: Vec::new(),
         }
     }
+}
+
+/// Control frames waiting for room on one destination channel, in order.
+type PendingCtrl = std::collections::VecDeque<([u8; 8], usize)>;
+
+/// A lane a runtime-staged workload attached (`net_attach`): its own
+/// command channel, read like a boot lane, and its own events channel,
+/// which every event for a slot the lane created goes to and nothing else
+/// does.
+struct AttachedLane {
+    owner: crate::kernel::workload::owner::OwnerHandle,
+    key: u8,
+    commands: i32,
+    events: i32,
+    /// Control frames `events` had no room for. Per lane, so one consumer
+    /// that falls behind holds up only its own terminal results.
+    pending: PendingCtrl,
 }
 
 /// linux_net keeps per-instance state in a `Box<LinuxNetState>` like
@@ -1346,7 +1368,13 @@ pub struct LinuxNetState {
     /// the wired edge (`channel_producer_owner`) and refreshed on every
     /// rebuild — the carried-attribution source for bind stamps.
     lane_owners: [crate::kernel::workload::owner::OwnerHandle; LINUX_NET_MAX_INBOUND],
-    net_out: i32,
+    /// Event channels, one per `from: linux_net.net_out` edge when the graph
+    /// pairs each with a lane's producer, else the one (teed) `net_out`.
+    net_outs: [i32; LINUX_NET_MAX_INBOUND],
+    /// The `net_outs` index each boot lane's events go to: the channel its
+    /// producer reads, so a consumer that falls behind holds up only the
+    /// connections it opened.
+    lane_out: [u8; LINUX_NET_MAX_INBOUND],
     /// Connection table, `max_conns` slots; the slot index is the
     /// net_proto conn id.
     conns: Vec<LinuxNetConn>,
@@ -1380,18 +1408,26 @@ pub struct LinuxNetState {
     hold_slot: i32,
     hold_off: usize,
     hold_len: usize,
+    /// The lane the held tail is owed to, fixed when the hold is taken: the
+    /// slot may be closed while its tail waits, and its bytes still belong
+    /// to the lane that was reading it.
+    hold_lane: usize,
     /// Next slot to consider when allocating a connection. Used to
     /// allocate round-robin instead of "first free", so a slot freed
     /// in step T isn't immediately reused in step T+1 — that race lets
     /// stale `CMD_SEND` bytes from the previous session land on the
     /// fresh connection's fd, scrambling its response stream.
     next_alloc: usize,
-    /// Control-frame (MSG_CONNECTED / CLOSED / ERROR / BOUND) retry queue. The
-    /// consumer channel is all-or-nothing; when it's momentarily full a tiny
-    /// control frame would otherwise be DROPPED, stranding a waiter. Queue it and
-    /// flush before each step. Bounded so a wedged consumer can't grow it without
-    /// limit (oldest dropped past the cap).
-    pending_ctrl: std::collections::VecDeque<([u8; 8], usize)>,
+    /// Control-frame (MSG_CONNECTED / CLOSED / ERROR / BOUND) retry queues,
+    /// one per `net_outs` channel. The consumer channel is all-or-nothing;
+    /// when it's momentarily full a tiny control frame would otherwise be
+    /// DROPPED, stranding a waiter. Queue it and flush before each step.
+    /// Bounded at `PENDING_CTRL_CAP`. Attached lanes queue on their own.
+    pending_ctrl: [PendingCtrl; LINUX_NET_MAX_INBOUND],
+    /// Runtime-attached lanes; entry `j` is lane `LINUX_NET_MAX_INBOUND + j`.
+    /// A detached entry is `None` and its index may be reused, which is safe
+    /// because detaching closes every slot the lane created.
+    attached: Vec<Option<AttachedLane>>,
     /// The resolver thread's queues, started on the first name this
     /// instance is asked to dial. Everything crossing the thread boundary
     /// is owned: a job carries its own copy of the name.
@@ -1620,7 +1656,8 @@ impl LinuxNetState {
     pub fn new(
         net_ins: [i32; LINUX_NET_MAX_INBOUND],
         lane_owners: [crate::kernel::workload::owner::OwnerHandle; LINUX_NET_MAX_INBOUND],
-        net_out: i32,
+        net_outs: [i32; LINUX_NET_MAX_INBOUND],
+        lane_out: [u8; LINUX_NET_MAX_INBOUND],
         max_conns: usize,
         write_buf_max: usize,
         listen_backlog: i32,
@@ -1642,7 +1679,8 @@ impl LinuxNetState {
         Box::new(Self {
             net_ins,
             lane_owners,
-            net_out,
+            net_outs,
+            lane_out: lane_out.map(|j| j.min(LINUX_NET_MAX_INBOUND as u8 - 1)),
             conns,
             write_buf_max: write_buf_max.max(1),
             listen_backlog: listen_backlog.max(1),
@@ -1655,10 +1693,12 @@ impl LinuxNetState {
             hold_slot: -1,
             hold_off: 0,
             hold_len: 0,
+            hold_lane: 0,
             // Skip slot 0 in initial rotation — it's almost always the
             // TCP listener bound by the first CMD_BIND.
             next_alloc: 1,
-            pending_ctrl: std::collections::VecDeque::new(),
+            pending_ctrl: core::array::from_fn(|_| PendingCtrl::new()),
+            attached: (0..LINUX_NET_MAX_ATTACHED).map(|_| None).collect(),
             resolver: None,
             resolve_seq: 0,
             warming: Vec::new(),
@@ -1725,19 +1765,131 @@ impl LinuxNetState {
         }
     }
 
-    /// Flush queued control frames; stops at the first one the channel can't
-    /// take so ordering is preserved. Returns true if the queue is now empty.
-    unsafe fn flush_pending_ctrl(&mut self) -> bool {
-        while let Some((frame, len)) = self.pending_ctrl.front() {
-            if self.net_out < 0 {
+    /// The control-frame queue for `lane`'s destination: its `net_outs`
+    /// channel's for a boot lane, the lane's own for an attached one. `None`
+    /// for an attached index with no lane.
+    fn lane_queue(&mut self, lane: usize) -> Option<&mut PendingCtrl> {
+        if lane < LINUX_NET_MAX_INBOUND {
+            return Some(&mut self.pending_ctrl[self.lane_out[lane] as usize]);
+        }
+        self.attached
+            .get_mut(lane - LINUX_NET_MAX_INBOUND)
+            .and_then(|a| a.as_mut())
+            .map(|a| &mut a.pending)
+    }
+
+    /// Flush `lane`'s queued control frames; stops at the first one its
+    /// channel can't take so ordering is preserved. Returns true if the
+    /// queue is now empty.
+    unsafe fn flush_lane(&mut self, lane: usize) -> bool {
+        let ch = lane_events(self, lane);
+        let Some(q) = self.lane_queue(lane) else {
+            return true;
+        };
+        while let Some((frame, len)) = q.front() {
+            if ch < 0 {
                 return false;
             }
-            if channel::channel_write(self.net_out, frame.as_ptr(), *len) < *len as i32 {
+            if channel::channel_write(ch, frame.as_ptr(), *len) < *len as i32 {
                 return false;
             }
-            self.pending_ctrl.pop_front();
+            q.pop_front();
         }
         true
+    }
+
+    /// Flush every destination's queued control frames, each on its own so
+    /// a full channel holds up only its own. Returns true if all are empty.
+    unsafe fn flush_pending_ctrl(&mut self) -> bool {
+        let mut all_empty = true;
+        for lane in 0..LINUX_NET_MAX_INBOUND {
+            all_empty &= self.flush_lane(lane);
+        }
+        for j in 0..self.attached.len() {
+            if self.attached[j].is_some() {
+                all_empty &= self.flush_lane(LINUX_NET_MAX_INBOUND + j);
+            }
+        }
+        all_empty
+    }
+}
+
+/// The owner a lane's commands run as: the boot lane's producer, or the
+/// workload that attached the lane.
+fn lane_owner(st: &LinuxNetState, lane: usize) -> crate::kernel::workload::owner::OwnerHandle {
+    if lane < LINUX_NET_MAX_INBOUND {
+        return st.lane_owners[lane];
+    }
+    st.attached
+        .get(lane - LINUX_NET_MAX_INBOUND)
+        .and_then(|a| a.as_ref())
+        .map_or(crate::kernel::workload::owner::OWNER_SYSTEM, |a| a.owner)
+}
+
+/// The channel a lane's commands are read from, or -1.
+fn lane_commands(st: &LinuxNetState, lane: usize) -> i32 {
+    if lane < LINUX_NET_MAX_INBOUND {
+        return st.net_ins[lane];
+    }
+    st.attached
+        .get(lane - LINUX_NET_MAX_INBOUND)
+        .and_then(|a| a.as_ref())
+        .map_or(-1, |a| a.commands)
+}
+
+/// The channel a lane's events go to: the `net_outs` channel its producer
+/// reads for a boot lane, the lane's own for an attached one, or -1 for an
+/// attached index with no lane.
+fn lane_events(st: &LinuxNetState, lane: usize) -> i32 {
+    if lane < LINUX_NET_MAX_INBOUND {
+        return st.net_outs[st.lane_out[lane] as usize];
+    }
+    st.attached
+        .get(lane - LINUX_NET_MAX_INBOUND)
+        .and_then(|a| a.as_ref())
+        .map_or(-1, |a| a.events)
+}
+
+/// Whether a command on `lane` may act on slot `idx`. An attached lane
+/// reaches only the slots it created, and no other lane reaches those. Boot
+/// lanes share the table among themselves.
+fn lane_may_touch(st: &LinuxNetState, lane: usize, idx: usize) -> bool {
+    let Some(c) = st.conns.get(idx) else {
+        return true; // no such slot: the handler ignores it
+    };
+    if c.state == 0 {
+        return true;
+    }
+    let owner_lane = c.lane as usize;
+    owner_lane == lane || (owner_lane < LINUX_NET_MAX_INBOUND && lane < LINUX_NET_MAX_INBOUND)
+}
+
+/// Close every slot `lane` created, without a word to the lane: it is being
+/// detached, and its events channel closes with it. Drops a recv tail held
+/// for it, whose bytes have nowhere left to go.
+unsafe fn close_lane_conns(st: &mut LinuxNetState, lane: usize) {
+    let mut resolving_freed = 0usize;
+    for (i, conn) in st.conns.iter_mut().enumerate() {
+        if conn.state == 0 || conn.lane as usize != lane {
+            continue;
+        }
+        if conn.state == 5 {
+            resolving_freed += 1;
+        }
+        if conn.fd >= 0 {
+            libc::close(conn.fd);
+        }
+        for &fd in &conn.racing {
+            libc::close(fd);
+        }
+        log::info!("[linux_net] closed slot {i} (lane {lane} detached)");
+        *conn = LinuxNetConn::empty();
+    }
+    st.resolving = st.resolving.saturating_sub(resolving_freed);
+    if st.hold_slot >= 0 && st.hold_lane == lane {
+        st.hold_slot = -1;
+        st.hold_off = 0;
+        st.hold_len = 0;
     }
 }
 
@@ -1790,8 +1942,97 @@ pub fn linux_net_close_all_and_clear_registry() {
                 *conn = LinuxNetConn::empty();
             }
             st.resolving = 0;
+            // Attached lanes' channels die with the graph they were opened in.
+            for a in st.attached.iter_mut() {
+                *a = None;
+            }
+            st.hold_slot = -1;
         }
         (*reg).clear();
+    }
+    // The provider is the instance the rebuild is about to register again.
+    crate::kernel::workload::net_attach::unregister();
+}
+
+/// The instance that serves attached lanes: the first registered one.
+///
+/// # Safety
+/// Platform thread; the pointer is valid until the next rebuild clears the
+/// registry.
+unsafe fn linux_net_provider_state() -> Option<&'static mut LinuxNetState> {
+    let reg = &raw const LINUX_NET_REGISTRY;
+    (*reg).first().map(|&p| &mut *p)
+}
+
+/// `net_attach` hook: take `(commands, events)` as a lane of `owner`'s.
+/// EINVAL for a missing or shared channel, ENODEV with no instance, EEXIST
+/// for an `(owner, key)` already attached, ENOSPC when every lane is taken.
+///
+/// # Safety
+/// Scheduler thread; both channels are open for `owner`'s edges.
+pub unsafe fn linux_net_attach(
+    owner: crate::kernel::workload::owner::OwnerHandle,
+    key: u8,
+    commands: i32,
+    events: i32,
+) -> i32 {
+    use crate::kernel::sys::errno;
+    if commands < 0 || events < 0 || commands == events {
+        return errno::EINVAL;
+    }
+    let Some(st) = linux_net_provider_state() else {
+        return errno::ENODEV;
+    };
+    if st
+        .attached
+        .iter()
+        .flatten()
+        .any(|a| a.owner == owner && a.key == key)
+    {
+        return errno::EEXIST;
+    }
+    let Some(j) = st.attached.iter().position(|a| a.is_none()) else {
+        log::warn!(
+            "[linux_net] owner slot {} lane {key} refused: all {LINUX_NET_MAX_ATTACHED} attached lanes taken",
+            owner.slot
+        );
+        return errno::ENOSPC;
+    };
+    st.attached[j] = Some(AttachedLane {
+        owner,
+        key,
+        commands,
+        events,
+        pending: PendingCtrl::new(),
+    });
+    log::info!(
+        "[linux_net] owner slot {} lane {key} attached as lane {} (commands {commands}, events {events})",
+        owner.slot,
+        LINUX_NET_MAX_INBOUND + j
+    );
+    0
+}
+
+/// `net_attach` hook: detach every lane of `owner`, drop what was queued
+/// for them, and close every slot they created. A no-op for an owner with
+/// no lanes.
+///
+/// # Safety
+/// Scheduler thread, before `owner`'s channels close.
+pub unsafe fn linux_net_detach(owner: crate::kernel::workload::owner::OwnerHandle) {
+    let Some(st) = linux_net_provider_state() else {
+        return;
+    };
+    for j in 0..st.attached.len() {
+        if st.attached[j].as_ref().is_some_and(|a| a.owner == owner) {
+            st.attached[j] = None;
+            close_lane_conns(st, LINUX_NET_MAX_INBOUND + j);
+            log::info!(
+                "[linux_net] owner slot {} lane {} detached",
+                owner.slot,
+                LINUX_NET_MAX_INBOUND + j
+            );
+        }
     }
 }
 
@@ -1872,8 +2113,11 @@ fn linux_net_alloc_conn(st: &mut LinuxNetState) -> i32 {
     -1
 }
 
-unsafe fn linux_net_send_msg(st: &mut LinuxNetState, data: &[u8]) {
-    if st.net_out < 0 || data.is_empty() {
+/// Emit one message to `lane`'s events channel: the lane a slot's events
+/// belong to, or the lane whose command a slot-less result answers.
+unsafe fn linux_net_send_msg(st: &mut LinuxNetState, lane: usize, data: &[u8]) {
+    let events = lane_events(st, lane);
+    if events < 0 || data.is_empty() {
         return;
     }
     let msg_type = data[0];
@@ -1896,27 +2140,29 @@ unsafe fn linux_net_send_msg(st: &mut LinuxNetState, data: &[u8]) {
     // fully land, enqueue for retry rather than dropping the terminal result.
     // Small control frames (≤8 B) fit the queue slot; larger frames (datagram
     // RX) fall back to best-effort (they're not terminal results).
-    let queued_empty = st.flush_pending_ctrl();
-    if queued_empty && channel::channel_write(st.net_out, frame.as_ptr(), total) == total as i32 {
+    // Ordering is per destination: only this lane's queue stands in front.
+    let queued_empty = st.flush_lane(lane);
+    if queued_empty && channel::channel_write(events, frame.as_ptr(), total) == total as i32 {
         return;
     }
     if total <= 8 {
-        const PENDING_CTRL_CAP: usize = 256;
-        if st.pending_ctrl.len() >= PENDING_CTRL_CAP {
-            st.pending_ctrl.pop_front(); // bounded — drop oldest under sustained wedge
+        if let Some(q) = st.lane_queue(lane) {
+            if q.len() >= PENDING_CTRL_CAP {
+                q.pop_front(); // bounded — drop oldest under sustained wedge
+            }
+            let mut slot = [0u8; 8];
+            slot[..total].copy_from_slice(&frame[..total]);
+            q.push_back((slot, total));
         }
-        let mut slot = [0u8; 8];
-        slot[..total].copy_from_slice(&frame[..total]);
-        st.pending_ctrl.push_back((slot, total));
     }
 }
 
 /// Emit `MSG_BIND_REFUSED [port:2 LE][errno:1]` so a bind failure/refusal is
 /// surfaced to the requester rather than leaving it waiting for MSG_BOUND.
-unsafe fn linux_net_send_bind_refused(st: &mut LinuxNetState, port: u16, errno: u8) {
+unsafe fn linux_net_send_bind_refused(st: &mut LinuxNetState, lane: usize, port: u16, errno: u8) {
     let pb = port.to_le_bytes();
     let msg = [MSG_BIND_REFUSED, pb[0], pb[1], errno];
-    linux_net_send_msg(st, &msg);
+    linux_net_send_msg(st, lane, &msg);
 }
 
 /// Emit the datagram contract's `DG_MSG_ERROR [ep_id][errno]` for a failed
@@ -1926,9 +2172,9 @@ unsafe fn linux_net_send_bind_refused(st: &mut LinuxNetState, port: u16, errno: 
 /// faulting. `ep_id` 0xFF = no endpoint was
 /// allocated. Emitting both frames is additive-safe: each surface's
 /// listeners match only their own opcode.
-unsafe fn linux_net_send_dg_error(st: &mut LinuxNetState, errno: u8) {
+unsafe fn linux_net_send_dg_error(st: &mut LinuxNetState, lane: usize, errno: u8) {
     let msg = [DG_MSG_ERROR, 0xFF, errno];
-    linux_net_send_msg(st, &msg);
+    linux_net_send_msg(st, lane, &msg);
 }
 
 /// The Part B bind gate for a NEW bind by `commander`: admission must be open
@@ -1970,7 +2216,7 @@ fn linux_net_new_bind_refusal(
 }
 
 unsafe fn linux_net_cmd_bind(st: &mut LinuxNetState, port: u16, lane: usize) {
-    let commander = st.lane_owners[lane];
+    let commander = lane_owner(st, lane);
     // Embedded IP modules close their listener after each accepted
     // connection; their TCP/IP servers re-issue CMD_BIND between
     // requests. On Linux the listening fd persists, so a re-bind on the
@@ -1980,15 +2226,16 @@ unsafe fn linux_net_cmd_bind(st: &mut LinuxNetState, port: u16, lane: usize) {
     // was owner-blind and would silently hand one owner's listener to
     // another. Same-owner re-bind is use-class (allowed even while
     // Draining — the accept-loop case); a cross-owner claim on a live
-    // listener is refused.
+    // listener is refused. So is a claim across an attached lane: the
+    // listener's accepts go to the lane that bound it, never to another.
     for (li, c) in st.conns.iter().enumerate() {
         if c.state == 3 && c.conn_type == 1 && c.fd >= 0 && c.port == port {
-            if c.owner == commander {
+            if c.owner == commander && lane_may_touch(st, lane, li) {
                 // MSG_BOUND payload: [conn_id:2 LE][local_port:2 LE]
                 let pb = port.to_le_bytes();
                 let cb = (li as u16).to_le_bytes();
                 let msg = [MSG_BOUND, cb[0], cb[1], pb[0], pb[1]];
-                linux_net_send_msg(st, &msg);
+                linux_net_send_msg(st, lane, &msg);
             } else {
                 log::warn!(
                     "[linux_net] bind port {port} refused: held by owner slot {} \
@@ -1996,28 +2243,28 @@ unsafe fn linux_net_cmd_bind(st: &mut LinuxNetState, port: u16, lane: usize) {
                     c.owner.slot,
                     commander.slot
                 );
-                linux_net_send_bind_refused(st, port, 98); // EADDRINUSE
+                linux_net_send_bind_refused(st, lane, port, 98); // EADDRINUSE
             }
             return;
         }
     }
 
     if let Some(errno) = linux_net_new_bind_refusal(commander, 1, port) {
-        linux_net_send_bind_refused(st, port, errno);
+        linux_net_send_bind_refused(st, lane, port, errno);
         return;
     }
 
     let slot = linux_net_alloc_conn(st);
     if slot < 0 {
         log::error!("[linux_net] no free slots for listener");
-        linux_net_send_bind_refused(st, port, 105); // ENOBUFS
+        linux_net_send_bind_refused(st, lane, port, 105); // ENOBUFS
         return;
     }
 
     let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
     if fd < 0 {
         log::error!("[linux_net] socket() failed");
-        linux_net_send_bind_refused(st, port, 23); // ENFILE
+        linux_net_send_bind_refused(st, lane, port, 23); // ENFILE
         return;
     }
 
@@ -2044,7 +2291,7 @@ unsafe fn linux_net_cmd_bind(st: &mut LinuxNetState, port: u16, lane: usize) {
         let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
         log::error!("[linux_net] bind() failed on port {port} (errno {errno})");
         libc::close(fd);
-        linux_net_send_bind_refused(st, port, errno.clamp(0, 255) as u8);
+        linux_net_send_bind_refused(st, lane, port, errno.clamp(0, 255) as u8);
         return;
     }
 
@@ -2055,7 +2302,7 @@ unsafe fn linux_net_cmd_bind(st: &mut LinuxNetState, port: u16, lane: usize) {
     if libc::listen(fd, st.listen_backlog) < 0 {
         log::error!("[linux_net] listen() failed");
         libc::close(fd);
-        linux_net_send_bind_refused(st, port, 95); // EOPNOTSUPP
+        linux_net_send_bind_refused(st, lane, port, 95); // EOPNOTSUPP
         return;
     }
 
@@ -2067,6 +2314,7 @@ unsafe fn linux_net_cmd_bind(st: &mut LinuxNetState, port: u16, lane: usize) {
         state: 3,
         port,
         owner: commander,
+        lane: lane as u16,
         ..LinuxNetConn::empty()
     };
     st.watch(fd, idx, libc::EPOLLIN as u32);
@@ -2087,7 +2335,7 @@ unsafe fn linux_net_cmd_bind(st: &mut LinuxNetState, port: u16, lane: usize) {
     let pb = port.to_le_bytes();
     let cb = (idx as u16).to_le_bytes();
     let msg = [MSG_BOUND, cb[0], cb[1], pb[0], pb[1]];
-    linux_net_send_msg(st, &msg);
+    linux_net_send_msg(st, lane, &msg);
 }
 
 // ----------------------------------------------------------------------
@@ -2110,25 +2358,25 @@ fn dg_claimed_owner_tag(payload: &[u8]) -> (u16, usize) {
 }
 
 unsafe fn linux_net_dg_cmd_bind(st: &mut LinuxNetState, port: u16, owner_tag: u16, lane: usize) {
-    let commander = st.lane_owners[lane];
+    let commander = lane_owner(st, lane);
     if let Some(errno) = linux_net_new_bind_refusal(commander, 2, port) {
-        linux_net_send_bind_refused(st, port, errno);
-        linux_net_send_dg_error(st, errno);
+        linux_net_send_bind_refused(st, lane, port, errno);
+        linux_net_send_dg_error(st, lane, errno);
         return;
     }
     let slot = linux_net_alloc_conn(st);
     if slot < 0 {
         log::error!("[linux_net] no free slots for UDP bind");
-        linux_net_send_bind_refused(st, port, 105); // ENOBUFS
-        linux_net_send_dg_error(st, 105);
+        linux_net_send_bind_refused(st, lane, port, 105); // ENOBUFS
+        linux_net_send_dg_error(st, lane, 105);
         return;
     }
 
     let fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
     if fd < 0 {
         log::error!("[linux_net] UDP socket() failed");
-        linux_net_send_bind_refused(st, port, 23); // ENFILE
-        linux_net_send_dg_error(st, 23);
+        linux_net_send_bind_refused(st, lane, port, 23); // ENFILE
+        linux_net_send_dg_error(st, lane, 23);
         return;
     }
     let opt: i32 = 1;
@@ -2154,8 +2402,8 @@ unsafe fn linux_net_dg_cmd_bind(st: &mut LinuxNetState, port: u16, owner_tag: u1
         let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
         log::error!("[linux_net] UDP bind() failed on port {port} (errno {errno})");
         libc::close(fd);
-        linux_net_send_bind_refused(st, port, errno.clamp(0, 255) as u8);
-        linux_net_send_dg_error(st, errno.clamp(0, 255) as u8);
+        linux_net_send_bind_refused(st, lane, port, errno.clamp(0, 255) as u8);
+        linux_net_send_dg_error(st, lane, errno.clamp(0, 255) as u8);
         return;
     }
     set_nonblocking(fd);
@@ -2167,6 +2415,7 @@ unsafe fn linux_net_dg_cmd_bind(st: &mut LinuxNetState, port: u16, owner_tag: u1
         state: 3,
         port,
         owner: commander,
+        lane: lane as u16,
         dg_owner_tag: owner_tag,
         ..LinuxNetConn::empty()
     };
@@ -2180,7 +2429,7 @@ unsafe fn linux_net_dg_cmd_bind(st: &mut LinuxNetState, port: u16, owner_tag: u1
     msg[1] = idx as u8;
     msg[2] = (port & 0xFF) as u8;
     msg[3] = (port >> 8) as u8;
-    linux_net_send_msg(st, &msg);
+    linux_net_send_msg(st, lane, &msg);
 }
 
 /// Whether the consumer claiming `claimed_tag` may send on endpoint `ep`:
@@ -2189,7 +2438,12 @@ unsafe fn linux_net_dg_cmd_bind(st: &mut LinuxNetState, port: u16, owner_tag: u1
 /// a consumer that does not hold it, and nothing at all on a slot that
 /// holds no endpoint. Asked BEFORE the destination is read, so an
 /// unowned endpoint buys neither a datagram nor a name lookup.
-unsafe fn dg_endpoint_admits(st: &mut LinuxNetState, ep: i16, claimed_tag: u16) -> bool {
+unsafe fn dg_endpoint_admits(
+    st: &mut LinuxNetState,
+    lane: usize,
+    ep: i16,
+    claimed_tag: u16,
+) -> bool {
     if ep < 0 || (ep as usize) >= st.conns.len() {
         return false;
     }
@@ -2198,7 +2452,7 @@ unsafe fn dg_endpoint_admits(st: &mut LinuxNetState, ep: i16, claimed_tag: u16) 
         return false;
     }
     if c.dg_owner_tag != claimed_tag {
-        linux_net_send_dg_error(st, 1); // EPERM
+        linux_net_send_dg_error(st, lane, 1); // EPERM
         return false;
     }
     true
@@ -2206,6 +2460,7 @@ unsafe fn dg_endpoint_admits(st: &mut LinuxNetState, ep: i16, claimed_tag: u16) 
 
 unsafe fn linux_net_dg_cmd_send_to(
     st: &mut LinuxNetState,
+    lane: usize,
     ep: i16,
     claimed_tag: u16,
     ip: [u8; 4],
@@ -2227,7 +2482,7 @@ unsafe fn linux_net_dg_cmd_send_to(
     // producer into one stream and carries no producer identity. The tag
     // recorded at bind is what says who holds the endpoint.
     if bound_tag != claimed_tag {
-        linux_net_send_dg_error(st, 1); // EPERM
+        linux_net_send_dg_error(st, lane, 1); // EPERM
         return;
     }
     let mut addr: libc::sockaddr_in = core::mem::zeroed();
@@ -2244,14 +2499,14 @@ unsafe fn linux_net_dg_cmd_send_to(
     );
 }
 
-unsafe fn linux_net_dg_cmd_close(st: &mut LinuxNetState, ep: i16, claimed_tag: u16) {
+unsafe fn linux_net_dg_cmd_close(st: &mut LinuxNetState, lane: usize, ep: i16, claimed_tag: u16) {
     if ep < 0 || (ep as usize) >= st.conns.len() {
         return;
     }
     let idx = ep as usize;
     // Close is the destructive half of the same authority question as send.
     if st.conns[idx].conn_type == CONN_TYPE_UDP_BOUND && st.conns[idx].dg_owner_tag != claimed_tag {
-        linux_net_send_dg_error(st, 1); // EPERM
+        linux_net_send_dg_error(st, lane, 1); // EPERM
         return;
     }
     if st.conns[idx].fd >= 0 && st.conns[idx].conn_type == CONN_TYPE_UDP_BOUND {
@@ -2264,7 +2519,7 @@ unsafe fn linux_net_dg_cmd_close(st: &mut LinuxNetState, ep: i16, claimed_tag: u
     let ep_b = ep.to_le_bytes();
     msg[1] = ep_b[0];
     msg[2] = ep_b[1];
-    linux_net_send_msg(st, &msg);
+    linux_net_send_msg(st, lane, &msg);
 }
 
 unsafe fn linux_net_dg_poll_recv(st: &mut LinuxNetState) -> bool {
@@ -2317,7 +2572,8 @@ unsafe fn linux_net_dg_poll_recv(st: &mut LinuxNetState) -> bool {
                 // Copy out so `st` is free to borrow mutably in the send (the
                 // datagram RX frame lives in `st.msg_buf`).
                 let msg = st.msg_buf[..1 + payload_len].to_vec();
-                linux_net_send_msg(st, &msg);
+                let lane = st.conns[i].lane as usize;
+                linux_net_send_msg(st, lane, &msg);
                 had_work = true;
             }
         }
@@ -2345,7 +2601,7 @@ unsafe fn linux_net_cmd_connect_to(
     const SOCK_TYPE_STREAM: u8 = 1;
     if sock_type != SOCK_TYPE_STREAM {
         let msg = [MSG_ERROR, 0u8, 0u8, 22u8, tag]; // EINVAL, no slot allocated (conn 0, u16 LE)
-        linux_net_send_msg(st, &msg);
+        linux_net_send_msg(st, lane, &msg);
         return;
     }
     let addrs = match target {
@@ -2358,11 +2614,11 @@ unsafe fn linux_net_cmd_connect_to(
         log::error!("[linux_net] no free connection slots");
         // Tagged terminal result (ENOMEM) so the requester completes.
         let msg = [MSG_ERROR, 0u8, 0u8, 12u8, tag];
-        linux_net_send_msg(st, &msg);
+        linux_net_send_msg(st, lane, &msg);
         return;
     }
     let idx = slot as usize;
-    let owner = st.lane_owners[lane];
+    let owner = lane_owner(st, lane);
     match addrs {
         Some(addrs) if !addrs.is_empty() => {
             let mut addrs = interleave_families(addrs);
@@ -2373,6 +2629,7 @@ unsafe fn linux_net_cmd_connect_to(
                 port,
                 tag,
                 owner,
+                lane: lane as u16,
                 racing: Vec::new(),
             };
             linux_net_dial(st, idx, first, dial);
@@ -2393,13 +2650,14 @@ unsafe fn linux_net_cmd_connect_to(
                         resolve_id: id,
                         resolve_started: Some(std::time::Instant::now()),
                         owner,
+                        lane: lane as u16,
                         ..LinuxNetConn::empty()
                     };
                 }
                 None => {
                     st.conns[idx] = LinuxNetConn::empty();
                     let msg = [MSG_ERROR, 0u8, 0u8, 2u8, tag]; // ENOENT
-                    linux_net_send_msg(st, &msg);
+                    linux_net_send_msg(st, lane, &msg);
                 }
             }
         }
@@ -2442,9 +2700,9 @@ unsafe fn linux_net_drain_resolved(st: &mut LinuxNetState) -> bool {
             continue; // stale: the slot was revoked while the lookup ran
         }
         st.resolving = st.resolving.saturating_sub(1);
-        let (sock_type, port, tag, owner) = {
+        let (sock_type, port, tag, owner, lane) = {
             let c = &st.conns[idx];
-            (c.conn_type, c.port, c.connect_tag, c.owner)
+            (c.conn_type, c.port, c.connect_tag, c.owner, c.lane)
         };
         match done.result {
             Ok(addrs) if !addrs.is_empty() => {
@@ -2456,6 +2714,7 @@ unsafe fn linux_net_drain_resolved(st: &mut LinuxNetState) -> bool {
                     port,
                     tag,
                     owner,
+                    lane,
                     racing: Vec::new(),
                 };
                 linux_net_dial(st, idx, first, dial);
@@ -2463,12 +2722,12 @@ unsafe fn linux_net_drain_resolved(st: &mut LinuxNetState) -> bool {
             Ok(_) => {
                 st.conns[idx] = LinuxNetConn::empty();
                 let msg = [MSG_ERROR, 0u8, 0u8, libc::ENOENT as u8, tag];
-                linux_net_send_msg(st, &msg);
+                linux_net_send_msg(st, lane as usize, &msg);
             }
             Err(errno) => {
                 st.conns[idx] = LinuxNetConn::empty();
                 let msg = [MSG_ERROR, 0u8, 0u8, errno as u8, tag];
-                linux_net_send_msg(st, &msg);
+                linux_net_send_msg(st, lane as usize, &msg);
             }
         }
     }
@@ -2486,10 +2745,11 @@ unsafe fn linux_net_drain_resolved(st: &mut LinuxNetState) -> bool {
         };
         if now.duration_since(started) > RESOLVE_GUARD {
             let tag = st.conns[i].connect_tag;
+            let lane = st.conns[i].lane as usize;
             st.conns[i] = LinuxNetConn::empty();
             st.resolving = st.resolving.saturating_sub(1);
             let msg = [MSG_ERROR, 0u8, 0u8, 2u8, tag]; // ENOENT
-            linux_net_send_msg(st, &msg);
+            linux_net_send_msg(st, lane, &msg);
             had_work = true;
         }
     }
@@ -2552,6 +2812,8 @@ struct Dial {
     /// The requester's tag, echoed on the single terminal result.
     tag: u8,
     owner: crate::kernel::workload::owner::OwnerHandle,
+    /// The lane that asked, which every result of the dial answers.
+    lane: u16,
     /// Attempts already in flight, carried down the ladder so a rung
     /// started on the attempt delay does not abandon the one before it.
     racing: Vec<i32>,
@@ -2584,6 +2846,7 @@ unsafe fn start_connect(addr: Resolved, port: u16) -> Option<i32> {
         return None;
     }
     set_nonblocking(fd);
+    tune_stream(fd);
     let mut sa4: libc::sockaddr_in = core::mem::zeroed();
     let mut sa6: libc::sockaddr_in6 = core::mem::zeroed();
     let (sa_ptr, sa_len): (*const libc::sockaddr, u32) = match addr {
@@ -2634,6 +2897,7 @@ unsafe fn linux_net_dial(st: &mut LinuxNetState, idx: usize, addr: Resolved, dia
     }
 
     set_nonblocking(fd);
+    tune_stream(fd);
 
     let mut sa4: libc::sockaddr_in = core::mem::zeroed();
     let mut sa6: libc::sockaddr_in6 = core::mem::zeroed();
@@ -2679,6 +2943,7 @@ unsafe fn linux_net_dial(st: &mut LinuxNetState, idx: usize, addr: Resolved, dia
             // down with its owner on drain/revoke; otherwise it stays
             // OWNER_SYSTEM and outlives revocation.
             owner: dial.owner,
+            lane: dial.lane,
             ..LinuxNetConn::empty()
         };
         st.watch(fd, idx, (libc::EPOLLOUT | libc::EPOLLIN) as u32);
@@ -2690,12 +2955,13 @@ unsafe fn linux_net_dial(st: &mut LinuxNetState, idx: usize, addr: Resolved, dia
             port: dial.port,
             connect_tag: dial.tag,
             owner: dial.owner,
+            lane: dial.lane,
             ..LinuxNetConn::empty()
         };
         st.watch(fd, idx, libc::EPOLLIN as u32);
         let cb = (idx as u16).to_le_bytes();
         let msg = [MSG_CONNECTED, cb[0], cb[1], dial.tag];
-        linux_net_send_msg(st, &msg);
+        linux_net_send_msg(st, dial.lane as usize, &msg);
     }
 }
 
@@ -2718,7 +2984,7 @@ unsafe fn linux_net_dial_failed(st: &mut LinuxNetState, idx: usize, mut dial: Di
     st.conns[idx] = LinuxNetConn::empty();
     let cb = (idx as u16).to_le_bytes();
     let msg = [MSG_ERROR, cb[0], cb[1], errno as u8, dial.tag];
-    linux_net_send_msg(st, &msg);
+    linux_net_send_msg(st, dial.lane as usize, &msg);
 }
 
 /// Send `data` on `conn_id`. The fd is non-blocking, so libc::send may
@@ -2762,11 +3028,12 @@ unsafe fn linux_net_cmd_send(st: &mut LinuxNetState, conn_id: u16, data: &[u8]) 
                 // firewall.
                 log::warn!("[linux_net] dropping conn {conn_id} on send error (errno {err})");
                 let fd = conn.fd;
+                let lane = conn.lane as usize;
                 st.conns[idx] = LinuxNetConn::empty();
                 libc::close(fd);
                 let cb = conn_id.to_le_bytes();
                 let msg = [MSG_CLOSED, cb[0], cb[1]];
-                linux_net_send_msg(st, &msg);
+                linux_net_send_msg(st, lane, &msg);
                 return;
             }
         }
@@ -2796,11 +3063,12 @@ unsafe fn linux_net_cmd_send(st: &mut LinuxNetState, conn_id: u16, data: &[u8]) 
             "[linux_net] write backlog overflow on conn {conn_id} ({already} pending + {remaining} new > {write_buf_max})"
         );
         let fd = conn.fd;
+        let lane = conn.lane as usize;
         st.conns[idx] = LinuxNetConn::empty();
         libc::close(fd);
         let cb = conn_id.to_le_bytes();
         let msg = [MSG_CLOSED, cb[0], cb[1]];
-        linux_net_send_msg(st, &msg);
+        linux_net_send_msg(st, lane, &msg);
         return;
     }
 
@@ -2864,11 +3132,12 @@ unsafe fn linux_net_drain_writes(st: &mut LinuxNetState) -> bool {
             if err != libc::EAGAIN && err != libc::EWOULDBLOCK && err != libc::EINTR {
                 log::warn!("[linux_net] dropping conn {i} on drain-write error (errno {err})");
                 let fd = c.fd;
+                let lane = c.lane as usize;
                 let cb = (i as u16).to_le_bytes();
                 st.conns[i] = LinuxNetConn::empty();
                 libc::close(fd);
                 let msg = [MSG_CLOSED, cb[0], cb[1]];
-                linux_net_send_msg(st, &msg);
+                linux_net_send_msg(st, lane, &msg);
                 continue;
             }
         }
@@ -2895,15 +3164,17 @@ unsafe fn hold_closed_slot(st: &mut LinuxNetState, i: usize) {
         libc::close(st.conns[i].fd);
     }
     let owner = st.conns[i].owner;
+    let lane = st.conns[i].lane;
     st.conns[i] = LinuxNetConn::empty();
     st.conns[i].owner = owner;
+    st.conns[i].lane = lane;
     st.conns[i].state = 4;
     st.conns[i].release_at = Some(
         std::time::Instant::now() + std::time::Duration::from_millis(u64::from(CLOSED_ID_GRACE_MS)),
     );
     let cb = (i as u16).to_le_bytes();
     let msg = [MSG_CLOSED, cb[0], cb[1]];
-    linux_net_send_msg(st, &msg);
+    linux_net_send_msg(st, lane as usize, &msg);
 }
 
 /// Release held ids whose grace interval has passed.
@@ -2933,10 +3204,11 @@ unsafe fn linux_net_cmd_close(st: &mut LinuxNetState, conn_id: u16) {
     if st.conns[idx].state == 5 {
         st.resolving = st.resolving.saturating_sub(1);
     }
+    let lane = st.conns[idx].lane as usize;
     st.conns[idx] = LinuxNetConn::empty();
     let cb = conn_id.to_le_bytes();
     let msg = [MSG_CLOSED, cb[0], cb[1]];
-    linux_net_send_msg(st, &msg);
+    linux_net_send_msg(st, lane, &msg);
 }
 
 unsafe fn linux_net_poll_accept(st: &mut LinuxNetState) -> bool {
@@ -2965,6 +3237,9 @@ unsafe fn linux_net_poll_accept(st: &mut LinuxNetState) -> bool {
         // The accepted client inherits the listener's owner so it is torn down
         // with the owner on drain/revoke.
         let listener_owner = st.conns[li].owner;
+        // ... and the listener's lane, so its accepts and their data go to
+        // the lane that bound it.
+        let listener_lane = st.conns[li].lane;
         let mut accepted_on_this_listener: u32 = 0;
         while accepted_on_this_listener < PER_TICK_ACCEPT_BUDGET {
             let mut addr: libc::sockaddr_in = core::mem::zeroed();
@@ -2980,11 +3255,83 @@ unsafe fn linux_net_poll_accept(st: &mut LinuxNetState) -> bool {
                 break; // EAGAIN / EWOULDBLOCK — queue drained
             }
             accepted_on_this_listener += 1;
-            accept_one_client(st, client_fd, listener_port, listener_owner);
+            accept_one_client(st, client_fd, listener_port, listener_owner, listener_lane);
             had_work = true;
         }
     }
     had_work
+}
+
+/// The options every TCP stream this provider carries is given, accepted or
+/// dialled alike.
+unsafe fn tune_stream(fd: i32) {
+    // Enable application-friendly TCP keepalive so a silently-dead
+    // peer (laptop suspended, NAT timeout without RST) is detected
+    // within ~30 s instead of the kernel default ~2 h. Without
+    // this, a paused-emulator/idle stream wouldn't trigger the
+    // outbound-write cleanup path (no data → no EPIPE) and the
+    // slot would stay live until OS keepalive fired.
+    let one: i32 = 1;
+    libc::setsockopt(
+        fd,
+        libc::SOL_SOCKET,
+        libc::SO_KEEPALIVE,
+        &one as *const i32 as *const libc::c_void,
+        4,
+    );
+
+    // TCP_NODELAY disables Nagle's algorithm, which would otherwise
+    // hold small sends until either the kernel ACKs the previous
+    // outbound packet or a 200 ms timer fires. Fluxor already does
+    // its own segmentation/coalescing per `CMD_SEND`, so Nagle only
+    // adds latency. With NODELAY the throughput ceiling is set by
+    // `SO_SNDBUF` instead.
+    libc::setsockopt(
+        fd,
+        libc::IPPROTO_TCP,
+        libc::TCP_NODELAY,
+        &one as *const i32 as *const libc::c_void,
+        4,
+    );
+    let buf_bytes: i32 = 1 << 20; // 1 MiB
+    libc::setsockopt(
+        fd,
+        libc::SOL_SOCKET,
+        libc::SO_SNDBUF,
+        &buf_bytes as *const i32 as *const libc::c_void,
+        4,
+    );
+    libc::setsockopt(
+        fd,
+        libc::SOL_SOCKET,
+        libc::SO_RCVBUF,
+        &buf_bytes as *const i32 as *const libc::c_void,
+        4,
+    );
+    let idle_secs: i32 = 15;
+    libc::setsockopt(
+        fd,
+        libc::IPPROTO_TCP,
+        libc::TCP_KEEPIDLE,
+        &idle_secs as *const i32 as *const libc::c_void,
+        4,
+    );
+    let intvl_secs: i32 = 5;
+    libc::setsockopt(
+        fd,
+        libc::IPPROTO_TCP,
+        libc::TCP_KEEPINTVL,
+        &intvl_secs as *const i32 as *const libc::c_void,
+        4,
+    );
+    let probes: i32 = 3;
+    libc::setsockopt(
+        fd,
+        libc::IPPROTO_TCP,
+        libc::TCP_KEEPCNT,
+        &probes as *const i32 as *const libc::c_void,
+        4,
+    );
 }
 
 /// Per-accepted-connection setsockopt + slot allocation + MSG_ACCEPTED
@@ -3001,74 +3348,9 @@ unsafe fn accept_one_client(
     client_fd: i32,
     listener_port: u16,
     owner: crate::kernel::workload::owner::OwnerHandle,
+    lane: u16,
 ) {
-    // Enable application-friendly TCP keepalive so a silently-dead
-    // peer (laptop suspended, NAT timeout without RST) is detected
-    // within ~30 s instead of the kernel default ~2 h. Without
-    // this, a paused-emulator/idle stream wouldn't trigger the
-    // outbound-write cleanup path (no data → no EPIPE) and the
-    // slot would stay live until OS keepalive fired.
-    let one: i32 = 1;
-    libc::setsockopt(
-        client_fd,
-        libc::SOL_SOCKET,
-        libc::SO_KEEPALIVE,
-        &one as *const i32 as *const libc::c_void,
-        4,
-    );
-
-    // TCP_NODELAY disables Nagle's algorithm, which would otherwise
-    // hold small sends until either the kernel ACKs the previous
-    // outbound packet or a 200 ms timer fires. Fluxor already does
-    // its own segmentation/coalescing per `CMD_SEND`, so Nagle only
-    // adds latency. With NODELAY the throughput ceiling is set by
-    // `SO_SNDBUF` instead.
-    libc::setsockopt(
-        client_fd,
-        libc::IPPROTO_TCP,
-        libc::TCP_NODELAY,
-        &one as *const i32 as *const libc::c_void,
-        4,
-    );
-    let buf_bytes: i32 = 1 << 20; // 1 MiB
-    libc::setsockopt(
-        client_fd,
-        libc::SOL_SOCKET,
-        libc::SO_SNDBUF,
-        &buf_bytes as *const i32 as *const libc::c_void,
-        4,
-    );
-    libc::setsockopt(
-        client_fd,
-        libc::SOL_SOCKET,
-        libc::SO_RCVBUF,
-        &buf_bytes as *const i32 as *const libc::c_void,
-        4,
-    );
-    let idle_secs: i32 = 15;
-    libc::setsockopt(
-        client_fd,
-        libc::IPPROTO_TCP,
-        libc::TCP_KEEPIDLE,
-        &idle_secs as *const i32 as *const libc::c_void,
-        4,
-    );
-    let intvl_secs: i32 = 5;
-    libc::setsockopt(
-        client_fd,
-        libc::IPPROTO_TCP,
-        libc::TCP_KEEPINTVL,
-        &intvl_secs as *const i32 as *const libc::c_void,
-        4,
-    );
-    let probes: i32 = 3;
-    libc::setsockopt(
-        client_fd,
-        libc::IPPROTO_TCP,
-        libc::TCP_KEEPCNT,
-        &probes as *const i32 as *const libc::c_void,
-        4,
-    );
+    tune_stream(client_fd);
 
     let slot = linux_net_alloc_conn(st);
     if slot < 0 {
@@ -3099,6 +3381,7 @@ unsafe fn accept_one_client(
         conn_type: 1,
         state: 2,
         owner,
+        lane,
         ..LinuxNetConn::empty()
     };
     st.watch(client_fd, idx, libc::EPOLLIN as u32);
@@ -3107,18 +3390,25 @@ unsafe fn accept_one_client(
     let pb = listener_port.to_le_bytes();
     let cb = (idx as u16).to_le_bytes();
     let msg = [MSG_ACCEPTED, cb[0], cb[1], pb[0], pb[1]];
-    linux_net_send_msg(st, &msg);
+    linux_net_send_msg(st, lane as usize, &msg);
     log::info!("[linux_net] accepted conn_id={idx}");
 }
 
-/// Write `recv_buf[from..total]` to the consumer channel as MSG_DATA frames,
-/// returning where it got to.
+/// Write `recv_buf[from..total]` to `lane`'s events channel as MSG_DATA
+/// frames, returning where it got to.
 ///
 /// A frame write is all-or-nothing, so this stops at the first one that does
 /// not fit rather than splitting it. What it returns is the caller's business:
 /// the bytes past it have left the kernel's buffer and exist nowhere else.
-unsafe fn forward_chunks(st: &mut LinuxNetState, slot: usize, from: usize, total: usize) -> usize {
+unsafe fn forward_chunks(
+    st: &mut LinuxNetState,
+    lane: usize,
+    slot: usize,
+    from: usize,
+    total: usize,
+) -> usize {
     const MAX_DATA_FRAGMENT: usize = 1460; // mirrors net_proto::MAX_DATA_FRAGMENT
+    let events = lane_events(st, lane);
     let mut off = from;
     while off < total {
         let chunk = (total - off).min(MAX_DATA_FRAGMENT);
@@ -3138,7 +3428,7 @@ unsafe fn forward_chunks(st: &mut LinuxNetState, slot: usize, from: usize, total
             st.msg_buf.as_mut_ptr().add(5),
             chunk,
         );
-        let wrote = channel::channel_write(st.net_out, st.msg_buf.as_ptr(), frame_len);
+        let wrote = channel::channel_write(events, st.msg_buf.as_ptr(), frame_len);
         if wrote < frame_len as i32 {
             break;
         }
@@ -3157,7 +3447,7 @@ unsafe fn linux_net_poll_recv(st: &mut LinuxNetState) -> bool {
     // eventually.
     if st.hold_slot >= 0 {
         let slot = st.hold_slot as usize;
-        let off = forward_chunks(st, slot, st.hold_off, st.hold_len);
+        let off = forward_chunks(st, st.hold_lane, slot, st.hold_off, st.hold_len);
         if off < st.hold_len {
             st.hold_off = off;
             return true; // still blocked — keep getting scheduled
@@ -3240,7 +3530,8 @@ unsafe fn linux_net_poll_recv(st: &mut LinuxNetState) -> bool {
                     st.rewatch(fd, i, libc::EPOLLIN as u32);
                     let cb = (i as u16).to_le_bytes();
                     let msg = [MSG_CONNECTED, cb[0], cb[1], tag];
-                    linux_net_send_msg(st, &msg);
+                    let lane = st.conns[i].lane as usize;
+                    linux_net_send_msg(st, lane, &msg);
                     had_work = true;
                 } else if !dead.is_empty() {
                     // Drop the attempts that failed. The slot only falls to
@@ -3259,6 +3550,7 @@ unsafe fn linux_net_poll_recv(st: &mut LinuxNetState) -> bool {
                                 port: c.port,
                                 tag,
                                 owner: c.owner,
+                                lane: c.lane,
                                 racing: Vec::new(),
                             }
                         };
@@ -3304,9 +3596,12 @@ unsafe fn linux_net_poll_recv(st: &mut LinuxNetState) -> bool {
         // now — leaving the rest in the socket so TCP windows the peer down.
         // Reading more and dropping the overflow would silently corrupt the
         // stream. Bound the recv to the writable space minus chunk-framing
-        // overhead (≤5 B per ≤MSS fragment).
-        let room = if st.net_out >= 0 {
-            channel::channel_writable_bytes(st.net_out)
+        // overhead (≤5 B per ≤MSS fragment). The space is the connection's own
+        // lane's, so a full attached lane windows down only its own sockets.
+        let lane = st.conns[i].lane as usize;
+        let events = lane_events(st, lane);
+        let room = if events >= 0 {
+            channel::channel_writable_bytes(events)
         } else {
             0
         };
@@ -3335,9 +3630,10 @@ unsafe fn linux_net_poll_recv(st: &mut LinuxNetState) -> bool {
             // bounded by the room, so every chunk should fit; a short write
             // anyway leaves a tail to re-offer rather than bytes to drop.
             let total = n as usize;
-            let off = forward_chunks(st, i, 0, total);
+            let off = forward_chunks(st, lane, i, 0, total);
             if off < total {
                 st.hold_slot = i as i32;
+                st.hold_lane = lane;
                 st.hold_off = off;
                 st.hold_len = total;
                 // Every connection shares `recv_buf`, so no other one may be
@@ -3397,11 +3693,13 @@ pub fn linux_net_step(state: *mut u8) -> i32 {
 
         if !heavy_pending {
             let mut gated = false;
-            for lane in 0..LINUX_NET_MAX_INBOUND {
+            // Boot lanes in wiring order, then every attached lane: a lane a
+            // workload attached at runtime ranks below the node's own.
+            for lane in 0..LINUX_NET_MAX_INBOUND + LINUX_NET_MAX_ATTACHED {
                 if gated {
                     break;
                 }
-                let lane_ch = st.net_ins[lane];
+                let lane_ch = lane_commands(st, lane);
                 if lane_ch < 0 {
                     continue;
                 }
@@ -3446,16 +3744,16 @@ pub fn linux_net_step(state: *mut u8) -> i32 {
                             had_work = true;
                         }
                         CMD_CONNECT => {
-                            // Retired. Fail the emitter loudly on its tag rather
+                            // Unsupported. Fail the emitter loudly on its tag rather
                             // than dial whatever its address bytes decode to.
                             let tag = crate::abi::contracts::net::net_proto::retired_connect_tag(
                                 &st.cmd_buf[..payload_len],
                             );
                             log::warn!(
-                                "[linux_net] CMD_CONNECT (0x13) is retired; dial with CMD_CONNECT_TO (0x14) [tag {tag}]"
+                                "[linux_net] CMD_CONNECT (0x13) is unsupported; dial with CMD_CONNECT_TO (0x14) [tag {tag}]"
                             );
                             let msg = [MSG_ERROR, 0u8, 0u8, 38u8, tag]; // ENOSYS
-                            linux_net_send_msg(st, &msg);
+                            linux_net_send_msg(st, lane, &msg);
                             had_work = true;
                         }
                         CMD_CONNECT_TO => {
@@ -3487,13 +3785,22 @@ pub fn linux_net_step(state: *mut u8) -> i32 {
                                         "[linux_net] malformed CMD_CONNECT_TO ({payload_len} B)"
                                     );
                                     let msg = [MSG_ERROR, 0u8, 0u8, 22u8, tag];
-                                    linux_net_send_msg(st, &msg);
+                                    linux_net_send_msg(st, lane, &msg);
                                 }
                             }
                             had_work = true;
                         }
                         CMD_SEND if payload_len >= 3 => {
                             let conn_id = u16::from_le_bytes([st.cmd_buf[0], st.cmd_buf[1]]);
+                            if !lane_may_touch(st, lane, conn_id as usize) {
+                                log::warn!(
+                                    "[linux_net] lane {lane} CMD_SEND on conn {conn_id} refused: \
+                                     opened by lane {}",
+                                    st.conns[conn_id as usize].lane
+                                );
+                                had_work = true;
+                                continue;
+                            }
                             let data_len = payload_len - 2;
                             let data_slice =
                                 core::slice::from_raw_parts(st.cmd_buf.as_ptr().add(2), data_len);
@@ -3512,7 +3819,38 @@ pub fn linux_net_step(state: *mut u8) -> i32 {
                         }
                         CMD_CLOSE if payload_len >= 2 => {
                             let conn_id = u16::from_le_bytes([st.cmd_buf[0], st.cmd_buf[1]]);
+                            if !lane_may_touch(st, lane, conn_id as usize) {
+                                log::warn!(
+                                    "[linux_net] lane {lane} CMD_CLOSE on conn {conn_id} refused: \
+                                     opened by lane {}",
+                                    st.conns[conn_id as usize].lane
+                                );
+                                had_work = true;
+                                continue;
+                            }
                             linux_net_cmd_close(st, conn_id);
+                            had_work = true;
+                        }
+                        DG_CMD_BIND | DG_CMD_SEND_TO | DG_CMD_CLOSE
+                            if lane >= LINUX_NET_MAX_INBOUND =>
+                        {
+                            // The datagram surface is served on boot lanes
+                            // only. Its endpoint ids are a byte and its
+                            // authority is a consumer-stamped tag, not the
+                            // lane; routing and isolating it per lane is a
+                            // surface of its own. Refused in the surface's
+                            // own error shape so the sender faults rather
+                            // than waits.
+                            log::warn!(
+                                "[linux_net] lane {lane}: datagram command 0x{msg_type:02x} refused \
+                                 on an attached lane"
+                            );
+                            if msg_type == DG_CMD_BIND && payload_len >= 2 {
+                                let port = u16::from_le_bytes([st.cmd_buf[0], st.cmd_buf[1]]);
+                                linux_net_send_bind_refused(st, lane, port, 95);
+                                // EOPNOTSUPP
+                            }
+                            linux_net_send_dg_error(st, lane, 95); // EOPNOTSUPP
                             had_work = true;
                         }
                         DG_CMD_BIND if payload_len >= 3 => {
@@ -3537,7 +3875,7 @@ pub fn linux_net_step(state: *mut u8) -> i32 {
                             let (claimed_tag, dest_off) =
                                 dg_claimed_owner_tag(&st.cmd_buf[..payload_len]);
                             let ep = st.cmd_buf[0] as i16;
-                            if !dg_endpoint_admits(st, ep, claimed_tag) {
+                            if !dg_endpoint_admits(st, lane, ep, claimed_tag) {
                                 had_work = true;
                                 continue;
                             }
@@ -3584,7 +3922,7 @@ pub fn linux_net_step(state: *mut u8) -> i32 {
                                     }
                                 }
                                 _ => {
-                                    linux_net_send_dg_error(st, 97); // EAFNOSUPPORT
+                                    linux_net_send_dg_error(st, lane, 97); // EAFNOSUPPORT
                                     had_work = true;
                                     continue;
                                 }
@@ -3597,7 +3935,7 @@ pub fn linux_net_step(state: *mut u8) -> i32 {
                                 st.cmd_buf.as_ptr().add(data_off),
                                 data_len,
                             );
-                            linux_net_dg_cmd_send_to(st, ep, claimed_tag, ip, port, data);
+                            linux_net_dg_cmd_send_to(st, lane, ep, claimed_tag, ip, port, data);
                             had_work = true;
                         }
                         DG_CMD_CLOSE if payload_len >= 1 => {
@@ -3605,7 +3943,18 @@ pub fn linux_net_step(state: *mut u8) -> i32 {
                             // [ep_id: u8][MARK][owner_tag: u16 LE].
                             let (claimed_tag, _) = dg_claimed_owner_tag(&st.cmd_buf[..payload_len]);
                             let ep = st.cmd_buf[0] as i16;
-                            linux_net_dg_cmd_close(st, ep, claimed_tag);
+                            // A boot lane's datagram close must not free a
+                            // slot an attached lane opened.
+                            if !lane_may_touch(st, lane, ep as usize) {
+                                log::warn!(
+                                    "[linux_net] lane {lane} DG_CMD_CLOSE on slot {ep} refused: \
+                                     opened by lane {}",
+                                    st.conns[ep as usize].lane
+                                );
+                                had_work = true;
+                                continue;
+                            }
+                            linux_net_dg_cmd_close(st, lane, ep, claimed_tag);
                             had_work = true;
                         }
                         _ => {

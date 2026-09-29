@@ -1,0 +1,30 @@
+version = "1.0.0"
+hardware_targets = ["bcm2712", "linux"]
+
+# NBD frontend: publishes the `storage.block` source wired to `blocks` to a
+# Linux NBD client over a `net_proto` stream transport (`linux_net` on a
+# Linux host, `ip` on bare metal). One client at a time.
+
+# The block source to publish.
+[[ports]]
+name = "blocks"
+direction = "input"
+content_type = "OctetStream"
+required = true
+
+[[ports]]
+name = "net_in"
+direction = "input"
+content_type = "NetProto"
+required = true
+buffer_size = 65536
+
+[[ports]]
+name = "net_out"
+direction = "output"
+content_type = "NetProto"
+required = true
+buffer_size = 65536
+
+[observability]
+exempt = "block frontend — block I/O is observed at the source below it; client connects and closes are logged"

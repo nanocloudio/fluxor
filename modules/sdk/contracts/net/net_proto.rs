@@ -192,8 +192,8 @@ pub const MAX_CMD_DATA: usize = 8192;
 /// is still the consumer's — and a no-op on an id the transport has already
 /// released.
 pub const CMD_CLOSE: u8 = 0x12;
-/// RETIRED. The 7/8-byte `[sock_type][ip: u32 LE][port: u16 LE][tag?]`
-/// dial. Every provider answers it with `MSG_ERROR` `ENOSYS` on the
+/// Reserved and unsupported: the 7/8-byte `[sock_type][ip: u32 LE][port: u16 LE][tag?]`
+/// dial shape. Every provider answers it with `MSG_ERROR` `ENOSYS` on the
 /// requester tag (byte 7 when present) and one log line naming
 /// [`CMD_CONNECT_TO`], so a stale emitter fails loudly on its first dial
 /// instead of dialling a garbage address: byte 1 of this payload is the
@@ -647,7 +647,7 @@ pub fn read_connect_to(payload: &[u8]) -> Option<(u8, u16, Target<'_>, Option<u8
     Some((sock_type, port, target, tag))
 }
 
-/// The requester tag of a RETIRED [`CMD_CONNECT`] payload, so a provider
+/// The requester tag of an unsupported [`CMD_CONNECT`] payload, so a provider
 /// can address its `ENOSYS` to the emitter that dialled. Byte 7 when the
 /// 8-byte form was sent; `REQUESTER_TAG_NONE` otherwise.
 pub fn retired_connect_tag(payload: &[u8]) -> u8 {

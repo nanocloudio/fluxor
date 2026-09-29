@@ -1,0 +1,45 @@
+version = "1.0.0"
+hardware_targets = ["rp2350", "bcm2712", "linux"]
+
+# Authenticated encryption for a block source: a `storage.block` consumer on
+# `lower` and a `storage.block` source on `blocks`. Tools-only, never
+# serialized to the .fmod.
+provides = ["storage.block"]
+
+# The block source the container lives on.
+[[ports]]
+name = "lower"
+direction = "input"
+content_type = "OctetStream"
+required = true
+
+# The decrypted device.
+[[ports]]
+name = "blocks"
+direction = "output"
+content_type = "OctetStream"
+required = true
+
+# Attach mode: the recipient key's announcement ("FXRK" + public key).
+[[ports]]
+name = "recipient"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 128
+
+# The status record ("FXST", 40 bytes), written when it changes.
+[[ports]]
+name = "status"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 128
+
+# Attach mode: the attachment bundle ("FXSB" + two share envelopes).
+[[ports]]
+name = "bundle"
+direction = "ctrl_input"
+content_type = "OctetStream"
+buffer_size = 1024
+
+[observability]
+exempt = "block transform — block I/O is observed at the consumer above it"

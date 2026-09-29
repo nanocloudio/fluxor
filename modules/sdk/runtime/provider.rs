@@ -300,7 +300,9 @@ unsafe fn dev_channel_ioctl(
     arg: *mut u8,
     arg_len: usize,
 ) -> i32 {
-    const MAX_IOCTL_ARG: usize = 64;
+    // Room for the largest argument a channel carries: a block `EXEC`
+    // request and its completion.
+    const MAX_IOCTL_ARG: usize = 128;
     if arg_len > MAX_IOCTL_ARG {
         return -22;
     }
@@ -383,12 +385,13 @@ unsafe fn dev_buffer_release_read(sys: &SyscallTable, chan: i32) -> i32 {
     (sys.provider_call)(chan, 0x0A03, core::ptr::null_mut(), 0)
 }
 
-/// Call an instance-keyed provider selected by name (`sel`, a short volume
-/// string). The contract is the opcode's class byte, so the `mount` policy
-/// module names the target volume inline on every op. `op_handle` carries
-/// the op's OWN handle (`-1` for open-style ops, or a provider-local slot);
-/// `sel` is purely routing. Returns the provider's result, or negative
-/// errno (`EINVAL` / `ENODEV` when no layer carries that selector).
+/// Call the provider selected by name (`sel`): a keyed volume, or
+/// `platform` for the platform's own provider beneath the graph. The
+/// contract is the opcode's class byte. `op_handle` is `-1` for open-style
+/// ops, or a handle an open through the same `sel` returned (routed: it
+/// names its minting provider). Returns the provider's result, or negative
+/// errno (`EINVAL` / `ENODEV` when nothing carries `sel`, `EBADF` for a
+/// handle minted elsewhere).
 #[inline(always)]
 unsafe fn dev_provider_call_sel(
     sys: &SyscallTable,

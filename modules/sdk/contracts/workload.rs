@@ -86,6 +86,15 @@ pub const PAUSE: u32 = 0x1A0B;
 /// `RESUME` — thaw a paused workload, see [`PAUSE`]. Idempotent: RESUME on a
 /// running workload returns status 0.
 pub const RESUME: u32 = 0x1A0C;
+/// `LANES` — the caller's own lanes into a workload it staged from an fmod
+/// graph: the edges whose FLXA endpoint is the caller (kind 4). Writes
+/// `[count:u8]` then `count × ([key:u8][to_caller:i32 LE][from_caller:i32
+/// LE])`: the channel the caller reads for the key's edge into it, and the
+/// one it writes for the key's edge out of it, -1 for a direction the graph
+/// does not have. Returns the bytes written.
+pub const LANES: u32 = 0x1A0D;
+/// Most caller lanes one workload holds.
+pub const MAX_CALLER_LANES: usize = 8;
 
 /// `CAPS` (`0x1AFF`) — backend capability discovery. Writes the fixed prefix
 /// `[postures:u8][source_kinds:u8][ops:u16 LE][net:u8]` then a
