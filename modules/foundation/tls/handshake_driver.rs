@@ -108,6 +108,11 @@ pub struct HandshakeDriver {
 
     pub peer_cert_pubkey: [u8; PEER_KEY_MAX],
     pub peer_cert_pubkey_len: u16,
+    /// The accepted leaf's validity window, Unix seconds, as it states it
+    /// (`peer_identity` reports it; whether it was enforced is the
+    /// VALIDITY check flag's to say).
+    pub peer_cert_not_before: u64,
+    pub peer_cert_not_after: u64,
     /// The suite the peer's leaf key belongs to, which decides which
     /// CertificateVerify schemes it may sign with and how its bytes are read.
     pub peer_cert_key_suite: u16,
@@ -201,6 +206,8 @@ impl HandshakeDriver {
             cert_verify_hash_ready: 0,
             peer_cert_pubkey: [0; PEER_KEY_MAX],
             peer_cert_pubkey_len: 0,
+            peer_cert_not_before: 0,
+            peer_cert_not_after: 0,
             peer_cert_key_suite: suite::UNKNOWN,
             deferred_links: DeferredLinks::empty(),
             ecdsa_verify: EcdsaVerifyJob::empty(),
@@ -247,6 +254,8 @@ impl HandshakeDriver {
         self.peer_key_share_len = 0;
         self.group = GROUP_SECP256R1;
         self.peer_cert_pubkey_len = 0;
+        self.peer_cert_not_before = 0;
+        self.peer_cert_not_after = 0;
         self.peer_cert_key_suite = suite::UNKNOWN;
         self.deferred_links.clear();
         self.ecdsa_verify = EcdsaVerifyJob::empty();
@@ -567,6 +576,8 @@ pub unsafe fn bind_peer_cert_key_core(driver: &mut HandshakeDriver, cert_der: &[
     }
     driver.peer_cert_pubkey[..pk.len()].copy_from_slice(pk);
     driver.peer_cert_pubkey_len = pk.len() as u16;
+    driver.peer_cert_not_before = cert.not_before;
+    driver.peer_cert_not_after = cert.not_after;
     driver.peer_cert_key_suite = cert.key_suite;
     CERT_OK
 }

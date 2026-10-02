@@ -53,6 +53,25 @@ pub fn connected_parts(payload: &[u8]) -> (u16, u8) {
     (conn_id(payload), tag)
 }
 
+/// The session generation a `MSG_ACCEPTED` or `MSG_CONNECTED` carries after
+/// its fixed fields (`fixed`: [`ACCEPTED_FIXED`] or [`CONNECTED_FIXED`]), or
+/// 0 when it carries none. A stage that terminates sessions over the
+/// transport's connections (`tls`) numbers each session it opens; its
+/// `peer_identity` records name the session by that number, so a consumer
+/// can tell a connection id's current session from a closed one's.
+#[inline]
+pub fn session_generation(payload: &[u8], fixed: usize) -> u16 {
+    match payload.get(fixed..fixed + 2) {
+        Some(g) => u16::from_le_bytes([g[0], g[1]]),
+        None => 0,
+    }
+}
+
+/// `MSG_ACCEPTED`'s fixed part: `[conn_id][local_port]`.
+pub const ACCEPTED_FIXED: usize = CONN_ID_LEN + 2;
+/// `MSG_CONNECTED`'s fixed part: `[conn_id][requester_tag]`.
+pub const CONNECTED_FIXED: usize = CONN_ID_LEN + 1;
+
 /// Parts of a `MSG_ERROR` payload: `(conn_id, errno, requester_tag)`.
 ///
 /// The 3-byte form carries no tag and yields `REQUESTER_TAG_NONE` — an
@@ -93,7 +112,9 @@ pub fn accepted_parts(payload: &[u8]) -> (u16, u16) {
 /// `local_port` and claims only the connections accepted on its own
 /// `CMD_BIND` — otherwise they would all `alloc` the same `conn_id` and
 /// corrupt each other's subsequent `MSG_DATA`. A single-consumer graph
-/// may ignore the trailing port bytes and read just `conn_id`.
+/// may ignore the trailing port bytes and read just `conn_id`. A session
+/// stage appends `[generation: u16 LE]` ([`session_generation`]) to the
+/// port-qualified form.
 pub const MSG_ACCEPTED: u8 = 0x01;
 /// Received data. Payload: `[conn_id: u16 LE][data…]`. The `data` portion of a
 /// single `MSG_DATA` frame MUST NOT exceed [`MAX_DATA_FRAGMENT`] — a producer
@@ -140,7 +161,8 @@ pub const MSG_BOUND: u8 = 0x04;
 /// index) so that when `ip.net_out` is fanned to several stream consumers (e.g.
 /// TLS + an OTLP exporter), each claims only the connections it opened. A
 /// consumer that doesn't filter just reads `conn_id` and ignores the trailing
-/// byte; untagged connects echo tag `0` (`REQUESTER_TAG_NONE`).
+/// byte; untagged connects echo tag `0` (`REQUESTER_TAG_NONE`). A session
+/// stage appends `[generation: u16 LE]` ([`session_generation`]).
 pub const MSG_CONNECTED: u8 = 0x05;
 /// Error. Payload: `[conn_id: u16 LE][errno: i8][requester_tag: u8?]`. For a
 /// connect-phase failure the trailing `requester_tag` echoes the failing

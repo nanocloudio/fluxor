@@ -116,7 +116,12 @@ const OFF_RESULT: usize = 4;
 const OFF_FLAGS: usize = 24;
 const OFF_FP_LEN: usize = 29;
 
-/// Session id — the writer's connection id widened to `u32`.
+/// Session id: the connection id in the low 16 bits, and in the high 16 the
+/// session's generation — the one its `MSG_ACCEPTED` / `MSG_CONNECTED`
+/// carried ([`super::net_proto::session_generation`]), 0 when the writer
+/// numbers no sessions. A consumer that holds a connection's generation
+/// takes only the identity of that session: a record outliving its session
+/// names a connection id that may already belong to another.
 ///
 /// Callers bounds-check `payload.len() >= PAYLOAD_FIXED` first.
 #[inline]
@@ -137,6 +142,12 @@ pub fn session_id(payload: &[u8]) -> u32 {
 #[inline]
 pub fn conn_id(payload: &[u8]) -> u16 {
     u16::from_le_bytes([payload[OFF_SESSION_ID], payload[OFF_SESSION_ID + 1]])
+}
+
+/// The session's generation (the high half of [`session_id`]); 0: none.
+#[inline]
+pub fn generation(payload: &[u8]) -> u16 {
+    u16::from_le_bytes([payload[OFF_SESSION_ID + 2], payload[OFF_SESSION_ID + 3]])
 }
 
 /// Which checks ran.

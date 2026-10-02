@@ -468,6 +468,10 @@ struct TlsSession {
     state: SessionState,
     conn_id: u16,      // net_proto connection ID
     held_msg_type: u8, // held ACCEPTED/CONNECTED msg type to forward after handshake
+    /// This session's generation: carried on the ACCEPTED/CONNECTED it
+    /// releases and in its `peer_identity` record's session id, so a
+    /// consumer takes only this session's identity for the connection.
+    generation: u16,
 
     /// Record-agnostic handshake state machine. Owns the key schedule,
     /// transcript, ECDH state, peer key share, peer cert pubkey, server
@@ -586,6 +590,7 @@ impl TlsSession {
             state: SessionState::Idle,
             conn_id: 0,
             held_msg_type: 0,
+            generation: 0,
             driver: HandshakeDriver::empty(),
             read_keys: TrafficKeys::empty(),
             write_keys: TrafficKeys::empty(),
@@ -1032,6 +1037,8 @@ struct TlsState {
     /// not a neighbour's on a shared fan. 0 = unknown → claim every accept
     /// (single-anchor, or a producer that forwards no port).
     accept_port: u16,
+    /// The generation the next session takes (never 0: 0 is "none").
+    next_generation: u16,
     /// Port from the `CMD_BIND` this TLS instance forwarded downstream
     /// (toward IP). Used to recognise our own `MSG_BOUND` on a shared
     /// `cipher_in` fan and ignore bounds belonging to other anchors.
@@ -1383,6 +1390,7 @@ pub unsafe extern "C" fn module_new(
     s.passthrough_conns = [0u8; 32];
     s.transport = TRANSPORT_TCP;
     s.accept_port = 0;
+    s.next_generation = 1;
     s.bind_port = 0;
     s.dtls_endpoint = DatagramEndpoint::new();
     s.dtls_port = 4433;
@@ -3012,6 +3020,11 @@ fn alloc_session_for_conn(s: &mut TlsState, conn_id: u16) -> Option<usize> {
             if s.sessions[i].state == SessionState::Idle {
                 s.sessions[i].state = SessionState::Allocated;
                 s.sessions[i].conn_id = conn_id;
+                s.sessions[i].generation = s.next_generation;
+                s.next_generation = match s.next_generation.wrapping_add(1) {
+                    0 => 1,
+                    g => g,
+                };
                 s.sessions[i].held_msg_type = 0;
                 s.sessions[i].recv_len = 0;
                 return Some(i);
@@ -5311,9 +5324,10 @@ unsafe fn forward_held_completion(s: &mut TlsState, idx: usize) {
     let conn_id = s.sessions[idx].conn_id;
     let held = s.sessions[idx].held_msg_type;
     if held != 0 {
+        let g = s.sessions[idx].generation.to_le_bytes();
         let ok = if held == NET_MSG_CONNECTED {
-            let dtag = [s.sessions[idx].downstream_tag];
-            tls_write_or_count(s, s.clear_out, held, conn_id, dtag.as_ptr(), 1)
+            let tail = [s.sessions[idx].downstream_tag, g[0], g[1]];
+            tls_write_or_count(s, s.clear_out, held, conn_id, tail.as_ptr(), 3)
         } else {
             // NET_MSG_ACCEPTED: carry the listener port the connection was
             // accepted on (`[conn_id][local_port:2 LE]`, net_proto §
@@ -5321,9 +5335,16 @@ unsafe fn forward_held_completion(s: &mut TlsState, idx: usize) {
             // port — matching the port-qualified accepts TLS itself
             // consumes. A port-less form is forwarded only when we never
             // learned our bound port (a sole-consumer graph).
+            // The session's generation follows the port
+            // (`net_proto::session_generation`).
             if s.accept_port != 0 {
-                let port = [(s.accept_port & 0xFF) as u8, (s.accept_port >> 8) as u8];
-                tls_write_or_count(s, s.clear_out, held, conn_id, port.as_ptr(), 2)
+                let tail = [
+                    (s.accept_port & 0xFF) as u8,
+                    (s.accept_port >> 8) as u8,
+                    g[0],
+                    g[1],
+                ];
+                tls_write_or_count(s, s.clear_out, held, conn_id, tail.as_ptr(), 4)
             } else {
                 tls_write_or_count(s, s.clear_out, held, conn_id, core::ptr::null(), 0)
             }
@@ -5654,12 +5675,13 @@ unsafe fn emit_peer_identity(s: &mut TlsState, idx: usize) {
     let principal: &[u8] = &[];
 
     let identity = PeerIdentity {
-        session_id: u32::from(s.sessions[idx].conn_id),
+        session_id: u32::from(s.sessions[idx].conn_id)
+            | u32::from(s.sessions[idx].generation) << 16,
         verification_result: result,
         credential_kind,
         profile_id: u16::from(s.peer_auth),
-        not_before: 0,
-        not_after: 0,
+        not_before: s.sessions[idx].driver.peer_cert_not_before,
+        not_after: s.sessions[idx].driver.peer_cert_not_after,
         verification_flags: flags,
         key_fp_alg: peer_fp_alg::SHA256,
         key_fingerprint: fingerprint,
