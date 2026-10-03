@@ -12,13 +12,18 @@
 //! OCI-backed external-node ports correspond to a declared export and the image
 //! is digest-pinned; every digest field is well-formed. The resource footprint that
 //! feeds the scheduler reservation (`compose::ResourceProfile`) is extracted from
-//! the implementation's signed resource profile, never trusted from handwriting.
+//! the implementation's digest-pinned resource profile document.
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
 use crate::compose::{PodUid, ResourceProfile};
+use crate::service_params::ParamSpec;
+
+fn default_role() -> String {
+    "service".to_string()
+}
 
 // ============================================================================
 // Manifest types
@@ -87,9 +92,8 @@ pub struct Contract {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Target {
-    /// Silicon or host token from the closed set
-    /// (standards/target_consolidation.md): `bcm2712`, `rp2040`,
-    /// `rp2350`, `esp32s3`, `linux`, `wasm`. Never a board id.
+    /// Silicon or host token from the closed set of target families, never
+    /// a board id.
     pub family: String,
     pub architecture: String,
     pub fluxor_abi: u32,
@@ -157,29 +161,38 @@ pub struct WorkloadManifest {
     pub schema_version: u32,
     pub name: String,
     pub version: String,
+    /// `service` (a long-running graph with the health/update contract) or
+    /// `cli` (an applet: argv in, stdout and an exit code out).
+    #[serde(default = "default_role")]
+    pub role: String,
     pub contract: Contract,
     #[serde(default)]
     pub implementations: Vec<Implementation>,
+    /// A service's run-time parameters. The shipped graph is a template
+    /// naming them as `${param:<name>}`; its digest is the template's, and a
+    /// run substitutes values checked against this schema
+    /// ([`crate::service_params`]).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub params: BTreeMap<String, ParamSpec>,
     /// Where this workload's control-plane store lives, relative to the
     /// bundle directory unless absolute.
     ///
     /// A workload that keeps state says where it keeps it, and what it
     /// says beats `FLUXOR_STORE_DIR` in the launching process's
     /// environment: the deployment knows what its own state is and the
-    /// caller does not. Left to the environment alone, an applet's
-    /// storage is whatever its caller happened to export, so the same
-    /// applet run from two shells reaches two different stores, or none,
-    /// with nothing reporting the difference. The variable remains for a
-    /// node-wide store no single workload owns.
+    /// caller does not, so the same applet run from two shells reaches the
+    /// same store. The variable serves a node-wide store no single
+    /// workload owns.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub store_dir: Option<String>,
 }
 
 /// The resource-footprint document referenced by an implementation's
 /// `resources` digest (`application/vnd.nanocloud.fluxor.resources.v1+json`).
-/// Generated/measured by the build tool, never handwritten: the numbers here
-/// are what the scheduler reserves, so a hand-tuned value would reserve a
-/// footprint the graph does not actually have.
+/// The build tool emits it: module and edge counts and the state size are
+/// derived from the graph and its built modules, and the capacities are the
+/// source manifest's `[resources]` declarations. The numbers are what the
+/// scheduler reserves.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResourceProfileDoc {
@@ -247,9 +260,31 @@ impl ValidationReport {
     }
 }
 
+/// Is `name` a workload name: an ASCII letter or digit, then letters,
+/// digits, `.`, `_` or `-`, at most 64 bytes. A name becomes a path
+/// component (`target/fluxor/<name>/`, `target/fluxor/bundles/<name>/`) and
+/// an OCI tag, so it can hold no separator and cannot be `.` or `..`.
+pub fn is_workload_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    bytes.next().is_some_and(|b| b.is_ascii_alphanumeric())
+        && name.len() <= 64
+        && bytes.all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// Is `name` a module name: an ASCII letter or digit, then letters, digits,
+/// `_` or `-`, at most 64 bytes. A bundle names its modules in
+/// `workload.json`, and the name becomes a file name (`<name>.fmod`) wherever
+/// the bundle is materialised, so it can hold no separator or `.`.
+pub fn is_module_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    bytes.next().is_some_and(|b| b.is_ascii_alphanumeric())
+        && name.len() <= 64
+        && bytes.all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+}
+
 fn is_sha256(s: &str) -> bool {
     match s.strip_prefix("sha256:") {
-        Some(hex) => hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()),
+        Some(hex) => hex.len() == 64 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
         None => false,
     }
 }
@@ -263,8 +298,9 @@ fn is_digest_pinned_image(image: &str) -> bool {
 }
 
 /// Validate a manifest against the contract rules: `schemaVersion` is 1 and the
-/// name non-empty; every digest field is a well-formed `sha256:<64 hex>`; both
-/// health signals are non-empty and bound in every implementation; every
+/// name a [`is_workload_name`]; `role` is `service` or `cli`, a service's
+/// parameter schema is well-formed and a `cli` declares none; every digest
+/// field is a well-formed `sha256:<64 hex>`; both health signals are non-empty and bound in every implementation; every
 /// declared import and export is bound exactly once per implementation, with no
 /// binding that matches no declaration; `statePolicy` is one of the two known
 /// values; at least one implementation exists; and every OCI-backed external
@@ -279,8 +315,24 @@ pub fn validate(m: &WorkloadManifest) -> ValidationReport {
             m.schema_version
         ));
     }
-    if m.name.trim().is_empty() {
-        r.push("name: must not be empty");
+    if !is_workload_name(&m.name) {
+        r.push(format!(
+            "name: '{}' is not a workload name (ASCII letters, digits, '.', '_' or '-', \
+             starting with a letter or digit, at most 64 bytes)",
+            m.name
+        ));
+    }
+    match m.role.as_str() {
+        "service" => {
+            for e in crate::service_params::validate_schema(&m.params) {
+                r.push(format!("params: {e}"));
+            }
+        }
+        "cli" if !m.params.is_empty() => {
+            r.push("params: a cli applet takes argv; parameters belong to services");
+        }
+        "cli" => {}
+        other => r.push(format!("role: unsupported '{other}' (service | cli)")),
     }
     if !m.contract.config_schema.is_well_formed() {
         r.push("contract.configSchema.digest: not a sha256: digest");
@@ -322,6 +374,12 @@ fn validate_implementation(
         r.push(format!("{p}.resources.digest: not a sha256: digest"));
     }
     for (j, md) in imp.modules.iter().enumerate() {
+        if !is_module_name(&md.name) {
+            r.push(format!(
+                "{p}.modules[{j}]: name {:?} is not a module name (letters, digits, `_`, `-`; at most 64)",
+                md.name
+            ));
+        }
         if !is_sha256(&md.digest) {
             r.push(format!(
                 "{p}.modules[{j}] ({}): digest not sha256:",
@@ -554,6 +612,31 @@ mod tests {
             .errors
             .iter()
             .any(|e| e.contains("implementations[0].bindings.imports") && e.contains("keyVault")));
+    }
+
+    #[test]
+    fn unsafe_module_names_and_uppercase_digests_are_rejected() {
+        let good = quantum_manifest_json();
+        for bad in ["../../etc/x", "a/b", "a.b", "", "-x"] {
+            let json = good.replace(
+                "\"protocol_router\", \"digest\"",
+                &format!("\"{bad}\", \"digest\""),
+            );
+            let m = parse_manifest(&json).unwrap();
+            let report = validate(&m);
+            assert!(
+                report
+                    .errors
+                    .iter()
+                    .any(|e| e.contains("not a module name")),
+                "{bad:?}: {:?}",
+                report.errors
+            );
+        }
+        let upper = good.replace(&"ab".repeat(32), &"AB".repeat(32));
+        let m = parse_manifest(&upper).unwrap();
+        assert!(!validate(&m).is_ok());
+        assert!(is_module_name("protocol_router") && is_module_name("tls-variant1"));
     }
 
     #[test]

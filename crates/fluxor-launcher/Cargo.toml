@@ -6,8 +6,7 @@ license = "Apache-2.0"
 publish = false
 description = "Resolving launcher: ~/.cargo/bin/fluxor resolves the CLI's :latest store artifact and execs its blob"
 
-# The one binary `make install` puts on PATH (Decision 8,
-# registry_consolidation.md): there is no installed CLI copy to go
+# The one binary `make install` puts on PATH: there is no installed CLI copy to go
 # stale — every invocation resolves `fluxor/run/fluxor-<triple>:latest`
 # from the local OCI store and execs the content-addressed blob via an
 # open descriptor, so a GC sweep can never race an in-flight launch.

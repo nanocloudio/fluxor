@@ -1780,12 +1780,11 @@ pub fn validate_execution_profile(
     crate::target_facts::admit_execution_profile(config, module_names, manifests, target)
 }
 
-/// Parameters retired when a connector took its `authority`. A graph
-/// naming one is refused with the key named and what replaced it, which is
-/// more than "unknown param" says. Every one of these is gone from every
-/// module in the workspace: a connector states `authority`, a server states
-/// `port`, and nothing states an address twice.
-const RETIRED_ADDRESS_KEYS: &[&str] = &[
+/// Address parameters no module takes. A connector states `authority`, a
+/// server states `port`, and nothing states an address twice, so a graph
+/// naming one of these is refused with the key named and the parameter to
+/// use, which says more than "unknown param".
+const UNSUPPORTED_ADDRESS_KEYS: &[&str] = &[
     "host_ip",
     "registry_ip",
     "endpoint",
@@ -1795,9 +1794,10 @@ const RETIRED_ADDRESS_KEYS: &[&str] = &[
     "server_port",
 ];
 
-/// Retired on the types that took an `authority`, and ordinary parameters
-/// elsewhere: `host` is a field name a server module may keep.
-const RETIRED_ADDRESS_KEYS_BY_TYPE: &[(&str, &[&str])] = &[
+/// Address parameters refused on the types that take an `authority`; the
+/// same names are ordinary parameters elsewhere (`host` is a field name a
+/// server module may keep).
+const UNSUPPORTED_ADDRESS_KEYS_BY_TYPE: &[(&str, &[&str])] = &[
     ("ota_registry", &["host", "registry_port"]),
     ("s3", &["host"]),
     ("websocket", &["host"]),
@@ -1838,10 +1838,10 @@ fn module_param_keys(module: &Value) -> Vec<&str> {
     keys
 }
 
-/// Whether `key` is a retired address parameter on a module of type `ty`.
-fn is_retired_address_key(ty: &str, key: &str) -> bool {
-    RETIRED_ADDRESS_KEYS.contains(&key)
-        || RETIRED_ADDRESS_KEYS_BY_TYPE
+/// Whether `key` is an unsupported address parameter on a module of type `ty`.
+fn is_unsupported_address_key(ty: &str, key: &str) -> bool {
+    UNSUPPORTED_ADDRESS_KEYS.contains(&key)
+        || UNSUPPORTED_ADDRESS_KEYS_BY_TYPE
             .iter()
             .any(|(t, keys)| *t == ty && keys.contains(&key))
 }
@@ -1859,9 +1859,9 @@ fn instance_mode(module: &Value) -> Option<String> {
 /// Whether an instance of `ty` takes its peer's port from `authority`, so a
 /// `port` beside it is a second spelling of one fact.
 ///
-/// Only types whose `port` WAS the peer's are here. A `port` that binds is
+/// Only types whose client-mode `port` is the peer's are here. A `port` that binds is
 /// not an authority and stays: `quic` binds its local UDP port in both
-/// modes, and a `stream_bridge` in `listen` mode binds the port it accepts
+/// modes, and a `remote_channel` in `listen` role binds the port it accepts
 /// on.
 fn dials_in_client_mode(ty: &str, module: &Value) -> bool {
     let mode = instance_mode(module);
@@ -1869,7 +1869,10 @@ fn dials_in_client_mode(ty: &str, module: &Value) -> bool {
     match ty {
         "tls_probe" | "ota_registry" => true,
         "http" => matches!(mode, Some("1") | Some("client")),
-        "stream_bridge" => matches!(mode, Some("1") | Some("connect")),
+        "remote_channel" => matches!(
+            module_param(module, "role"),
+            Some(Value::String(r)) if r == "dial"
+        ) || matches!(module_param(module, "role"), Some(Value::Number(n)) if n.as_u64() == Some(1)),
         _ => false,
     }
 }
@@ -1948,8 +1951,8 @@ fn connector_addressing_warnings(config: &Value) -> Vec<String> {
 }
 
 /// Connectors are addressed by `authority` alone. A module instance
-/// carrying another address-bearing parameter (`ADDRESS_PARAM_KEYS`, or
-/// `host` on `ota_registry`) is refused, as is a client-mode `port` beside
+/// carrying another address-bearing parameter (`UNSUPPORTED_ADDRESS_KEYS`,
+/// or the per-type list) is refused, as is a client-mode `port` beside
 /// an `authority`: the port lives inside the authority. A client-mode `tls`
 /// whose `verify_hostname` differs from the authority wired into it is a
 /// warning naming the override.
@@ -1971,7 +1974,7 @@ pub fn check_connector_addressing(config: &Value) -> Result<()> {
             };
             let ty = instance_type(config, name);
             for key in module_param_keys(module) {
-                if is_retired_address_key(&ty, key) {
+                if is_unsupported_address_key(&ty, key) {
                     return Err(Error::Config(format!(
                         "module '{name}' ({ty}): parameter '{key}' is not accepted; a \
                          connector takes `authority` (`host[:port]`) — a name the network \

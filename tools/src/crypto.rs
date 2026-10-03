@@ -614,7 +614,81 @@ fn reduce(r: &mut [u8; 64]) -> [u8; 32] {
     out
 }
 
+/// The field prime `p = 2^255 - 19`, little-endian.
+const FIELD_PRIME: [u8; 32] = {
+    let mut p = [0xffu8; 32];
+    p[0] = 0xed;
+    p[31] = 0x7f;
+    p
+};
+
+/// Whether `a`, read as little-endian integers, is below `b`.
+fn le_below(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    for i in (0..32).rev() {
+        if a[i] != b[i] {
+            return a[i] < b[i];
+        }
+    }
+    false
+}
+
+/// The group order `L` as little-endian bytes.
+pub(crate) fn group_order_bytes() -> [u8; 32] {
+    let mut l = [0u8; 32];
+    for (b, v) in l.iter_mut().zip(L.iter()) {
+        *b = *v as u8;
+    }
+    l
+}
+
+/// A point encoding whose y coordinate is reduced (below `p`).
+fn is_canonical_encoding(enc: &[u8; 32]) -> bool {
+    let mut y = *enc;
+    y[31] &= 0x7f;
+    le_below(&y, &FIELD_PRIME)
+}
+
+/// Whether the encoded point has order dividing 8: the identity or a torsion
+/// point. `[8]P` is the identity exactly then.
+fn is_small_order(enc: &[u8; 32]) -> bool {
+    let mut p: Point = [GF0; 4];
+    if !unpack_neg(&mut p, enc) {
+        return false;
+    }
+    for _ in 0..3 {
+        let q = p;
+        point_add(&mut p, &q);
+    }
+    let mut packed = [0u8; 32];
+    pack_point(&mut packed, &p);
+    let mut identity = [0u8; 32];
+    identity[0] = 1;
+    packed == identity
+}
+
+/// Verify an Ed25519 signature strictly: the same rules the module verifier in
+/// `modules/sdk/crypto/ed25519.rs` applies. `S` must be below the group
+/// order, the encodings of the key and of `R` must be canonical points on the
+/// curve, and neither may have small order. A signature this refuses is one a
+/// device refuses, so the tool never reports a chain or module as good that a
+/// device would reject.
 pub fn verify(public_key: &[u8; 32], msg: &[u8], signature: &[u8; 64]) -> bool {
+    let mut r_enc = [0u8; 32];
+    r_enc.copy_from_slice(&signature[..32]);
+    let mut s_enc = [0u8; 32];
+    s_enc.copy_from_slice(&signature[32..]);
+    if !le_below(&s_enc, &group_order_bytes())
+        || !is_canonical_encoding(public_key)
+        || !is_canonical_encoding(&r_enc)
+        || is_small_order(public_key)
+        || is_small_order(&r_enc)
+    {
+        return false;
+    }
+    let mut r_point: Point = [GF0; 4];
+    if !unpack_neg(&mut r_point, &r_enc) {
+        return false;
+    }
     let mut q: Point = [GF0; 4];
     if !unpack_neg(&mut q, public_key) {
         return false;
@@ -761,6 +835,159 @@ mod tests {
         let (pk, sig) = sign(&seed, b"");
         assert_eq!(pk, expected_pk);
         assert_eq!(&sig[..], &expected_sig[..]);
+    }
+
+    /// RFC 8032 §7.1: each vector signs to the published signature, and the
+    /// strict verifier accepts it and refuses it for any other message.
+    #[test]
+    fn rfc_8032_vectors_sign_and_verify() {
+        let abc = sha512(b"abc");
+        let vectors: [(&str, &str, &[u8], &str); 4] = [
+            (
+                "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+                "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+                b"",
+                "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b",
+            ),
+            (
+                "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb",
+                "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c",
+                &[0x72],
+                "92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00",
+            ),
+            (
+                "c5aa8df43f9f837bedb7442f31dcb7b166d38535076f094b85ce3a2e0b4458f7",
+                "fc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025",
+                &[0xaf, 0x82],
+                "6291d657deec24024827e69c3abe01a30ce548a284743a445e3680d7db5ac3ac18ff9b538d16f290ae67f760984dc6594a7c15e9716ed28dc027beceea1ec40a",
+            ),
+            (
+                "833fe62409237b9d62ec77587520911e9a759cec1d19755b7da901b96dca3d42",
+                "ec172b93ad5e563bf4932c70e1245034c35467ef2efd4d64ebf819683467e2bf",
+                &abc,
+                "dc2a4459e7369633a52b1bf277839a00201009a3efbf3ecb69bea2186c26b58909351fc9ac90b3ecfdfbc7c66431e0303dca179c138ac17ad9bef1177331a704",
+            ),
+        ];
+        for (seed, pk, msg, sig) in vectors {
+            let seed = arr32(&parse_hex(seed));
+            let pk = arr32(&parse_hex(pk));
+            let mut want = [0u8; 64];
+            want.copy_from_slice(&parse_hex(sig));
+            let (got_pk, got_sig) = sign(&seed, msg);
+            assert_eq!(got_pk, pk);
+            assert_eq!(got_sig, want);
+            assert!(verify(&pk, msg, &want));
+            let mut other = msg.to_vec();
+            other.push(0);
+            assert!(!verify(&pk, &other, &want));
+        }
+    }
+
+    /// x = 0 with the sign bit set is an encoding RFC 8032 excludes; the only
+    /// such points (the identity and the order-2 point) are small-order, so
+    /// they are refused as keys and as `R` whichever sign bit they carry.
+    #[test]
+    fn an_x_zero_point_with_its_sign_bit_set_is_refused() {
+        let (pk, sig) = sign(&[0x55u8; 32], b"m");
+        let mut identity_neg = [0u8; 32];
+        identity_neg[0] = 1;
+        identity_neg[31] = 0x80;
+        let mut order_two_neg = FIELD_PRIME;
+        order_two_neg[0] = 0xec;
+        order_two_neg[31] = 0xff;
+        for enc in [identity_neg, order_two_neg] {
+            assert!(is_canonical_encoding(&enc));
+            assert!(is_small_order(&enc));
+            let mut bad_r = sig;
+            bad_r[..32].copy_from_slice(&enc);
+            assert!(!verify(&pk, b"m", &bad_r));
+            assert!(!verify(&enc, b"m", &sig));
+        }
+    }
+
+    /// `[8]P` by three doublings: a point of order 4 or 8 is small-order, a
+    /// prime-order point and one of mixed order are not.
+    #[test]
+    fn small_order_covers_every_torsion_point_and_only_those() {
+        // The order-4 points have y = 0; an order-8 point (Bernstein et al.'s
+        // list of Ed25519's small-order encodings).
+        let order_four = [0u8; 32];
+        let order_eight = arr32(&parse_hex(
+            "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05",
+        ));
+        assert!(is_small_order(&order_four));
+        assert!(is_small_order(&order_eight));
+        let (pk, _) = sign(&[0x66u8; 32], b"");
+        assert!(!is_small_order(&pk));
+        // pk + an order-8 point: on the curve, of mixed order, not small.
+        let mut a: Point = [GF0; 4];
+        assert!(unpack_neg(&mut a, &pk));
+        let mut t: Point = [GF0; 4];
+        assert!(unpack_neg(&mut t, &order_eight));
+        point_add(&mut a, &t);
+        let mut mixed = [0u8; 32];
+        pack_point(&mut mixed, &a);
+        assert!(!is_small_order(&mixed));
+    }
+
+    /// A scalar one group order above a valid `S` names the same point; a strict
+    /// verifier refuses it.
+    #[test]
+    fn a_malleated_signature_is_refused() {
+        let (pk, sig) = sign(&[0x22u8; 32], b"malleable");
+        assert!(verify(&pk, b"malleable", &sig));
+        let l = group_order_bytes();
+        let mut s = [0u8; 32];
+        s.copy_from_slice(&sig[32..]);
+        let mut carry = 0u16;
+        for i in 0..32 {
+            let v = u16::from(s[i]) + u16::from(l[i]) + carry;
+            s[i] = v as u8;
+            carry = v >> 8;
+        }
+        assert_eq!(carry, 0, "S + L fits the field");
+        let mut forged = sig;
+        forged[32..].copy_from_slice(&s);
+        assert!(!verify(&pk, b"malleable", &forged), "S + L is refused");
+    }
+
+    /// The identity and the order-2 point are small-order keys: they verify
+    /// signatures for messages nobody signed, so they are refused outright.
+    #[test]
+    fn a_small_order_key_or_nonce_point_is_refused() {
+        let mut identity = [0u8; 32];
+        identity[0] = 1;
+        let mut order_two = [0xffu8; 32];
+        order_two[0] = 0xec;
+        order_two[31] = 0x7f;
+        assert!(is_small_order(&identity));
+        assert!(is_small_order(&order_two));
+        let (pk, sig) = sign(&[0x33u8; 32], b"m");
+        assert!(!is_small_order(&pk));
+        for small in [identity, order_two] {
+            // As the key, with the identity as R and S = 0.
+            let mut forged = [0u8; 64];
+            forged[..32].copy_from_slice(&identity);
+            assert!(!verify(&small, b"anything", &forged));
+            // As the nonce point of an otherwise honest signature.
+            let mut bad_r = sig;
+            bad_r[..32].copy_from_slice(&small);
+            assert!(!verify(&pk, b"m", &bad_r));
+        }
+    }
+
+    /// A y coordinate at or above the field prime is a second spelling of a
+    /// small y; only the reduced one is accepted.
+    #[test]
+    fn a_non_canonical_point_encoding_is_refused() {
+        let (pk, sig) = sign(&[0x44u8; 32], b"m");
+        assert!(is_canonical_encoding(&pk));
+        let mut non_canonical = FIELD_PRIME;
+        non_canonical[0] = 0xee; // p + 1: the identity's y, written unreduced
+        assert!(!is_canonical_encoding(&non_canonical));
+        let mut bad_r = sig;
+        bad_r[..32].copy_from_slice(&non_canonical);
+        assert!(!verify(&pk, b"m", &bad_r));
     }
 
     #[test]

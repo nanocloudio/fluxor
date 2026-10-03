@@ -106,6 +106,7 @@ include!("../../sdk/cores/bank_stream.rs");
 const NS_LOOKUP: u32 = 0x1300;
 const NS_LIST: u32 = 0x1302;
 const NS_CLOSE: u32 = 0x1306;
+const NS_CAPS: u32 = 0x13FF;
 const OBJ_GET: u32 = 0x1421;
 const OBJ_RANGE_GET: u32 = 0x1423;
 const OBJ_CLOSE: u32 = 0x1425;
@@ -166,6 +167,13 @@ unsafe fn backend_scan(s: &mut BankState) {
         }
         return;
     }
+    // The shape of the names LIST returns: a directory-shaped provider names
+    // the prefix's children, joined to it to make a key; a key-shaped one
+    // (or one without CAPS) names whole keys.
+    let caps = (s.sys().provider_call)(-1, NS_CAPS, core::ptr::null_mut(), 0);
+    let child_names =
+        caps >= 0 && (caps as u32) & abi::contracts::storage::namespace::caps::CHILD_NAMES != 0;
+    let parent: &[u8] = if child_names { &dir_path[..dlen] } else { &[] };
     // Reset path table — the scan owns it.
     s.path_count = 0;
     let mut i = 0;
@@ -173,106 +181,71 @@ unsafe fn backend_scan(s: &mut BankState) {
         s.path_lens[i] = 0;
         i += 1;
     }
-    // Opaque ≤32-byte cursor; our namespace provider encodes it as a
-    // 4-byte LE page index. 0 bytes = first page.
-    let mut cursor = [0u8; 4];
+    use abi::contracts::storage::handle::STORAGE_KEY_MAX;
+    use abi::contracts::storage::namespace::list;
+    // The cursor is the last name the previous page returned; empty = first
+    // page.
+    let mut cursor = [0u8; STORAGE_KEY_MAX];
     let mut cursor_len = 0usize;
     let mut fence = [0u8; 64]; // >= fence::WIRE_MAX_LEN (62)
     let mut full = false;
     loop {
-        // Build the LIST arg (mirrors storage::namespace::LIST):
-        //   [prefix_len:u16][prefix][cursor_len:u16][cursor]
-        //   [out_ptr:u64][out_cap:u32][fence_ptr:u64][fence_cap:u16]
-        let mut arg = [0u8; 2 + MAX_PATH_LEN + 2 + 4 + 8 + 4 + 8 + 2];
-        let mut p = 0usize;
-        arg[p..p + 2].copy_from_slice(&(dlen as u16).to_le_bytes());
-        p += 2;
-        arg[p..p + dlen].copy_from_slice(&dir_path[..dlen]);
-        p += dlen;
-        arg[p..p + 2].copy_from_slice(&(cursor_len as u16).to_le_bytes());
-        p += 2;
-        arg[p..p + cursor_len].copy_from_slice(&cursor[..cursor_len]);
-        p += cursor_len;
-        let out_ptr = s.buf.as_mut_ptr() as u64;
-        arg[p..p + 8].copy_from_slice(&out_ptr.to_le_bytes());
-        p += 8;
-        arg[p..p + 4].copy_from_slice(&(BUF_SIZE as u32).to_le_bytes());
-        p += 4;
-        let fence_ptr = fence.as_mut_ptr() as u64;
-        arg[p..p + 8].copy_from_slice(&fence_ptr.to_le_bytes());
-        p += 8;
-        arg[p..p + 2].copy_from_slice(&(fence.len() as u16).to_le_bytes());
-        p += 2;
+        let req = list::Request {
+            prefix: &dir_path[..dlen],
+            cursor: &cursor[..cursor_len],
+            out_ptr: s.buf.as_mut_ptr() as u64,
+            out_cap: BUF_SIZE as u32,
+            fence_out_ptr: fence.as_mut_ptr() as u64,
+            fence_out_cap: fence.len() as u16,
+        };
+        let mut arg = [0u8; list::REQUEST_FIXED_LEN + MAX_PATH_LEN + STORAGE_KEY_MAX];
+        let Some(arg_len) = list::encode_request(&mut arg, &req) else {
+            log_info(s, b"[object_bank] LIST request too long");
+            break;
+        };
 
         // Contract: LIST is handle = -1 (prefix is in `arg`), not the
         // LOOKUP handle — see the readiness-gate note above.
-        let n = (s.sys().provider_call)(-1, NS_LIST, arg.as_mut_ptr(), p);
+        let n = (s.sys().provider_call)(-1, NS_LIST, arg.as_mut_ptr(), arg_len);
         if n <= 0 {
             break;
         }
-        let n = n as usize;
-
-        // Parse entries `[name_len:u8][kind:u8][name]` until the
-        // trailing `[0xFF][0xFF][cursor_len:u8][cursor]` record. BOTH
-        // marker bytes are checked: an entry whose name is exactly 255
-        // bytes carries 0xFF in its `name_len`, and testing only the
-        // first byte reads that entry as the end of the page and
-        // silently drops every entry behind it.
-        let mut pos = 0usize;
-        let mut next_cursor = [0u8; 4];
-        let mut next_cursor_len = 0usize;
-        let mut saw_cursor = false;
-        while pos + 2 <= n {
-            if s.buf[pos] == 0xFF && s.buf[pos + 1] == 0xFF {
-                saw_cursor = true;
-                if pos + 3 <= n {
-                    let clen = s.buf[pos + 2] as usize;
-                    let cl = if clen > 4 { 4 } else { clen };
-                    if pos + 3 + clen <= n {
-                        next_cursor[..cl].copy_from_slice(&s.buf[pos + 3..pos + 3 + cl]);
-                        next_cursor_len = cl;
-                    }
-                }
-                break;
-            }
-            let name_len = s.buf[pos] as usize;
-            let kind = s.buf[pos + 1];
-            pos += 2;
-            if pos + name_len > n {
-                break;
-            }
-            // Copy the name out of `s.buf` before append_path borrows
-            // `s` mutably.
-            let nl = if name_len > MAX_PATH_LEN {
-                MAX_PATH_LEN
-            } else {
-                name_len
-            };
-            let mut name = [0u8; MAX_PATH_LEN];
-            name[..nl].copy_from_slice(&s.buf[pos..pos + nl]);
-            pos += name_len;
+        // SAFETY: `s.buf[..n]` is the page the provider just wrote; the
+        // entries are copied out of it before `append_path` borrows `s`
+        // mutably, and `append_path` does not touch `s.buf`.
+        let page_bytes = core::slice::from_raw_parts(s.buf.as_ptr(), n as usize);
+        let Some(page) = list::decode_page(page_bytes) else {
+            log_info(s, b"[object_bank] LIST page malformed");
+            break;
+        };
+        for entry in page.entries() {
             // Skip sub-namespaces; object_bank doesn't recurse.
-            if kind == 1 {
+            if entry.kind == abi::contracts::storage::namespace::KIND_NAMESPACE {
                 continue;
             }
+            // A name whose path does not fit a path slot is skipped, not
+            // truncated: a cut name addresses a different object.
+            let nl = entry.name.len();
+            let sep = parent.last().is_some_and(|&b| b != b'/') as usize;
+            if parent.len() + sep + nl > MAX_PATH_LEN {
+                continue;
+            }
+            let mut name = [0u8; MAX_PATH_LEN];
+            name[..nl].copy_from_slice(entry.name);
             if !matches_format(s, &name[..nl]) {
                 continue;
             }
-            if !append_path(s, &dir_path[..dlen], &name[..nl]) {
+            if !append_path(s, parent, &name[..nl]) {
                 full = true;
                 break;
             }
         }
-        if full {
+        if full || page.is_last() {
             break;
         }
-        // No trailing cursor record, or an end-of-listing cursor
-        // (`cursor_len == 0`): the listing is complete.
-        if !saw_cursor || next_cursor_len == 0 {
-            break;
-        }
-        cursor[..next_cursor_len].copy_from_slice(&next_cursor[..next_cursor_len]);
-        cursor_len = next_cursor_len;
+        let next = page.cursor();
+        cursor[..next.len()].copy_from_slice(next);
+        cursor_len = next.len();
     }
     (s.sys().provider_call)(handle, NS_CLOSE, core::ptr::null_mut(), 0);
     (s.sys().provider_close)(handle);

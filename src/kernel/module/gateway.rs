@@ -232,6 +232,12 @@ pub enum HandleUse {
     /// Global, and a non-negative result is a new handle minted for the
     /// caller.
     Mints,
+    /// Global, or run under a handle minted for the caller (a storage op
+    /// under the grant it presented).
+    Scoped,
+    /// [`HandleUse::Scoped`], and a non-negative result is a new handle
+    /// minted for the caller.
+    ScopedMints,
 }
 
 /// How the kernel uses the argument buffer.
@@ -259,6 +265,8 @@ pub enum Walker {
     StorageDelete,
     /// `storage.object` RANGE_GET: offset, length, out (`length` bytes).
     StorageRangeGet,
+    /// `storage.object` LIST: prefix, cursor, max keys, page out, fence out.
+    StorageList,
     /// `channel::IOCTL`: `[cmd: u32]` then the command's own argument. Only
     /// the kernel's built-in commands and the `storage.block` requests are
     /// admitted; a block request's buffer is the pointer walked.
@@ -365,16 +373,29 @@ pub static RULES: &[Rule] = &[
     rule(0x0C3A, HandleUse::Global, Arg::Out(4)), // ARENA_GET
     // storage.object — persistence. Synchronous: no provider keeps a pointer
     // past the call (the contract's write path takes the bytes and returns).
-    walked(0x1420, HandleUse::Global, WALK_MAX, Walker::StoragePut),
-    rule(0x1421, HandleUse::Mints, Arg::In(ANY)), // GET: arg is the key
-    walked(0x1422, HandleUse::Global, WALK_MAX, Walker::StorageHead),
+    // A guarded store admits each op under a grant `PRESENT` minted, passed
+    // as the handle; an unguarded one takes `-1`.
+    walked(0x1420, HandleUse::Scoped, WALK_MAX, Walker::StoragePut),
+    rule(0x1421, HandleUse::ScopedMints, Arg::In(ANY)), // GET: arg is the key
+    walked(0x1422, HandleUse::Scoped, WALK_MAX, Walker::StorageHead),
     walked(0x1423, HandleUse::Minted, WALK_MAX, Walker::StorageRangeGet),
-    walked(0x1424, HandleUse::Global, WALK_MAX, Walker::StorageDelete),
+    walked(0x1424, HandleUse::Scoped, WALK_MAX, Walker::StorageDelete),
+    walked(0x142A, HandleUse::Scoped, WALK_MAX, Walker::StorageList),
+    // PRESENT: no pointers; the refusal is written into the request.
+    rule(0x142B, HandleUse::Mints, Arg::InOut(ANY)),
     closing(0x1425), // CLOSE
 ];
 
-/// Longest argument struct the gateway copies to walk.
-const WALK_MAX: usize = 512;
+/// Longest argument struct the gateway copies to walk, sized to the largest
+/// request a gated caller makes: a `storage.object` `LIST` carrying a prefix
+/// and a cursor of `STORAGE_KEY_MAX` bytes each, rounded up to 16. A caller
+/// can therefore resume a listing at any key a provider holds.
+const WALK_MAX: usize = 544;
+const _: () = {
+    use crate::abi::contracts::storage::{handle::STORAGE_KEY_MAX, object::list};
+    let need = list::REQUEST_FIXED_LEN + 2 * STORAGE_KEY_MAX;
+    assert!(WALK_MAX >= need && WALK_MAX - 16 < need);
+};
 
 /// A pointer an argument struct carries: where, how long, and whether the
 /// provider writes it.
@@ -479,6 +500,24 @@ pub fn walk(walker: Walker, arg: &[u8]) -> Option<([Embedded; 3], usize)> {
                 write: true,
             };
             1
+        }
+        Walker::StorageList => {
+            let p = r.u16()?;
+            r.take(p)?;
+            let c = r.u16()?;
+            r.take(c)?;
+            r.u16()?; // max_keys
+            out[0] = Embedded {
+                ptr: r.u64()?,
+                len: r.u32()?,
+                write: true,
+            };
+            out[1] = Embedded {
+                ptr: r.u64()?,
+                len: r.u16()?,
+                write: true,
+            };
+            2
         }
         Walker::ChannelIoctl => {
             use crate::abi::contracts::storage::block::{ioctl, Req};
@@ -612,6 +651,7 @@ fn check_walk(g: &Gated, w: Walker, arg: &[u8]) -> Result<(), Refusal> {
 fn check_handle(module: usize, rule: &Rule, handle: i32) -> Result<(), Refusal> {
     let ok = match rule.handle {
         HandleUse::Global | HandleUse::Mints => handle == -1,
+        HandleUse::Scoped | HandleUse::ScopedMints => handle == -1 || handles::owns(module, handle),
         HandleUse::Value => true,
         HandleUse::Channel => owns_channel(module, handle),
         HandleUse::Minted => handles::owns(module, handle),
@@ -671,7 +711,7 @@ pub fn authorise(
             // provider_open(contract, open_op, config, len): only opens the
             // rule table lists as minting.
             let rule = rule_for(a[1] as u32).ok_or(Refusal::Opcode)?;
-            if rule.handle != HandleUse::Mints {
+            if !matches!(rule.handle, HandleUse::Mints | HandleUse::ScopedMints) {
                 return Err(Refusal::Opcode);
             }
             check_arg(&g, Arg::In(ANY), a[2], a[3])
@@ -798,7 +838,9 @@ pub unsafe fn dispatch(module: usize, op: u32, a: [usize; 6]) -> isize {
                     core::ptr::copy_nonoverlapping(copy.as_ptr(), a[2] as *mut u8, a[3]);
                 }
                 match rule {
-                    Some(r) if r.handle == HandleUse::Mints => mint_result(module, rc),
+                    Some(r) if matches!(r.handle, HandleUse::Mints | HandleUse::ScopedMints) => {
+                        mint_result(module, rc)
+                    }
                     Some(r) if r.closes && rc >= 0 => {
                         handles::forget(module, h);
                         rc as isize

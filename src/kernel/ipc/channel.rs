@@ -36,17 +36,17 @@
 //!
 //! No silent truncation occurs in either direction.
 //!
-//! ## buffer_acquire_write capacity_out semantics
+//! ## Acquire refusals
 //!
-//! `buffer_acquire_write` returns `(null, capacity_out)` in two distinct cases:
+//! The acquires answer an [`Acquired`]: a status, the buffer, and a length.
+//! `buffer_acquire_write` refuses in two distinct ways:
 //!
-//! - **Not a mailbox channel** (`mailbox` flag is false): `capacity_out = 0`.
-//! - **Mailbox channel, buffer busy** (not in STREAMING state): `capacity_out > 0`
-//!   (the actual buffer capacity).
+//! - **Not a mailbox channel** (`mailbox` flag is false): `ENOTSUP`, length 0.
+//! - **Mailbox channel, buffer busy** (not in STREAMING state): `EAGAIN`, and
+//!   the length is the buffer's capacity.
 //!
-//! Producers must check `capacity_out` to distinguish these cases. Treating a
-//! busy mailbox as "not mailbox" and falling back to FIFO writes would corrupt
-//! the in-flight mailbox data.
+//! Producers must tell these apart. Treating a busy mailbox as "not mailbox"
+//! and falling back to FIFO writes would corrupt the in-flight mailbox data.
 //!
 //! ## In-place processing
 //!
@@ -205,7 +205,7 @@ struct ChannelSlot {
     reader_gone: AtomicBool,
     /// Channel is in mailbox mode (zero-copy buffer handoff).
     /// Set by the scheduler for aliased channels (buffer_group != 0).
-    /// When false, buffer_acquire_write returns null, forcing FIFO mode.
+    /// When false, the buffer acquires refuse with `ENOTSUP`, forcing FIFO mode.
     mailbox: AtomicBool,
     /// Auxiliary u32 value (module-defined: seek position, file index, etc.)
     /// NO_AUX_PENDING if none pending.
@@ -1162,9 +1162,9 @@ pub fn channel_register_ioctl_handler(
 /// Enable mailbox mode on a channel.
 ///
 /// Called by the scheduler for aliased channels (buffer_group != 0).
-/// When set, buffer_acquire_write and buffer_acquire_inplace are allowed
-/// on this channel, enabling zero-copy producer→consumer handoff and
-/// in-place processing by intermediate modules.
+/// When set, the buffer acquires (`buffer_acquire_write`, `_read` and
+/// `_inplace`) are allowed on this channel, enabling zero-copy
+/// producer→consumer handoff and in-place processing by intermediate modules.
 pub fn channel_set_mailbox(handle: i32) {
     if handle < 0 {
         return;
@@ -1366,70 +1366,80 @@ pub extern "C" fn syscall_channel_register_ioctl_handler(
 //
 // No pool scan needed — the channel knows its buffer slot directly.
 
-/// Acquire write access to the channel's buffer (mailbox mode).
+/// What a mailbox acquire hands back: a status, the buffer's address, and a
+/// length. The address travels beside the status and never inside it — a
+/// pointer does not fit an `i32` result on a 64-bit target.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Acquired {
+    /// `0` when the buffer was acquired; otherwise a negative errno:
+    /// `EAGAIN` for a mailbox that is not available now (write: the buffer is
+    /// busy with an earlier message; read and in-place: no message is ready),
+    /// `ENOTSUP` for a channel that is not a mailbox, `EINVAL` for a channel
+    /// that does not exist.
+    pub status: i32,
+    /// The buffer, or null unless `status` is `0`.
+    pub ptr: *mut u8,
+    /// Write: the buffer's capacity, also reported for a busy mailbox so a
+    /// producer can tell "busy" from "not a mailbox". Read and in-place: the
+    /// message length. `0` otherwise.
+    pub len: u32,
+}
+
+impl Acquired {
+    const fn refused(status: i32, len: u32) -> Self {
+        Self {
+            status,
+            ptr: core::ptr::null_mut(),
+            len,
+        }
+    }
+}
+
+/// The buffer slot behind mailbox channel `chan`, or the refusal that explains
+/// why there is none.
 ///
-/// Returns pointer to buffer data for direct writing, or null if:
-/// - Channel is not in mailbox mode (FIFO-only channels return null)
-/// - Buffer is not in idle state (previous message not yet consumed)
-///
-/// The mailbox flag is set by the scheduler for aliased channels (buffer_group != 0).
-/// This prevents producers from accidentally using mailbox mode on FIFO channels,
-/// which would cause data loss (FIFO reads check ring buffer head/tail, not buffer state).
-///
-/// # Safety
-/// `capacity_out` must either be null or a valid `*mut u32` — the kernel
-/// writes the buffer capacity (or 0 on error) through it. The returned
-/// `*mut u8` is owned by the caller until matched with
-/// `syscall_buffer_release_write`; aliasing it past the release breaks
-/// the mailbox state machine.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn syscall_buffer_acquire_write(
-    chan: i32,
-    capacity_out: *mut u32,
-) -> *mut u8 {
+/// Only a channel the scheduler marked as a mailbox (an aliased channel,
+/// `buffer_group != 0`) is acquired this way. That keeps a module from using
+/// mailbox mode on a FIFO channel, which would lose data: a FIFO read looks at
+/// the ring's head and tail, not at the buffer's state.
+fn mailbox_slot(chan: i32) -> Result<i32, Acquired> {
     if chan < 0 || chan as usize >= MAX_CHANNELS {
-        if !capacity_out.is_null() {
-            *capacity_out = 0;
-        }
-        return core::ptr::null_mut();
+        return Err(Acquired::refused(CHAN_EINVAL, 0));
     }
-
     let channel = &CHANNELS[chan as usize];
-
-    // Only allow mailbox writes on channels explicitly marked for mailbox mode
-    if !channel.mailbox.load(Ordering::Acquire) {
-        if !capacity_out.is_null() {
-            *capacity_out = 0;
-        }
-        return core::ptr::null_mut();
-    }
-
+    // Every open channel holds a buffer slot: none means no channel.
     let buf_slot = channel.buffer_slot.load(Ordering::Acquire);
     if buf_slot < 0 {
-        if !capacity_out.is_null() {
-            *capacity_out = 0;
-        }
-        return core::ptr::null_mut();
+        return Err(Acquired::refused(CHAN_EINVAL, 0));
     }
+    if !channel.mailbox.load(Ordering::Acquire) {
+        return Err(Acquired::refused(errno::ENOTSUP, 0));
+    }
+    Ok(buf_slot as i32)
+}
 
-    // Transition channel's buffer: STREAMING → PRODUCER
-    let (ptr, cap) = buffer_pool::mailbox_acquire_write(buf_slot as i32);
+/// Acquire write access to the channel's buffer (mailbox mode: STREAMING →
+/// PRODUCER).
+///
+/// The buffer is owned by the caller until matched with
+/// `syscall_buffer_release_write`; aliasing it past the release breaks the
+/// mailbox state machine.
+pub fn buffer_acquire_write(chan: i32) -> Acquired {
+    let slot = match mailbox_slot(chan) {
+        Ok(v) => v,
+        Err(refused) => return refused,
+    };
+    let (ptr, cap) = buffer_pool::mailbox_acquire_write(slot);
     if ptr.is_null() {
-        // Buffer is busy (not STREAMING) — signal mailbox-busy to the caller
-        // by writing the buffer capacity. This lets producers distinguish
-        // "not a mailbox channel" (capacity_out=0) from "mailbox channel,
-        // buffer busy" (capacity_out>0) and avoid falling back to FIFO writes
-        // that would corrupt the pending mailbox data.
-        if !capacity_out.is_null() {
-            *capacity_out = buffer_pool::get_capacity(buf_slot as i32);
-        }
-        return core::ptr::null_mut();
+        // Busy, not absent: the capacity tells the producer it must not fall
+        // back to a FIFO write, which would corrupt the pending message.
+        return Acquired::refused(errno::EAGAIN, buffer_pool::get_capacity(slot));
     }
-
-    if !capacity_out.is_null() {
-        *capacity_out = cap;
+    Acquired {
+        status: 0,
+        ptr,
+        len: cap,
     }
-    ptr
 }
 
 /// Release buffer after writing (mailbox mode: PRODUCER → READY).
@@ -1460,36 +1470,24 @@ pub unsafe extern "C" fn syscall_buffer_release_write(chan: i32, len: u32) -> i3
     rc
 }
 
-/// Acquire read access to the channel's buffer (mailbox mode: READY → CONSUMER).
-///
-/// Returns pointer to buffer data, or null if no message ready.
-///
-/// # Safety
-/// `len_out` must either be null or a valid `*mut u32`. The returned
-/// `*const u8` is borrowed for read-only access until matched with
-/// `syscall_buffer_release_read`; mutation through this pointer or
-/// access after release breaks the mailbox state machine.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn syscall_buffer_acquire_read(chan: i32, len_out: *mut u32) -> *const u8 {
-    if chan < 0 || chan as usize >= MAX_CHANNELS {
-        return core::ptr::null();
-    }
-
-    let channel = &CHANNELS[chan as usize];
-    let buf_slot = channel.buffer_slot.load(Ordering::Acquire);
-    if buf_slot < 0 {
-        return core::ptr::null();
-    }
-
-    let (ptr, len) = buffer_pool::mailbox_acquire_read(buf_slot as i32);
+/// Acquire read access to the channel's buffer (mailbox mode: READY →
+/// CONSUMER). The buffer is borrowed for reading until matched with
+/// `syscall_buffer_release_read`; mutating through it, or touching it after
+/// the release, breaks the mailbox state machine.
+pub fn buffer_acquire_read(chan: i32) -> Acquired {
+    let slot = match mailbox_slot(chan) {
+        Ok(v) => v,
+        Err(refused) => return refused,
+    };
+    let (ptr, len) = buffer_pool::mailbox_acquire_read(slot);
     if ptr.is_null() {
-        return core::ptr::null();
+        return Acquired::refused(errno::EAGAIN, 0);
     }
-
-    if !len_out.is_null() {
-        *len_out = len;
+    Acquired {
+        status: 0,
+        ptr: ptr as *mut u8,
+        len,
     }
-    ptr
 }
 
 /// Release buffer after reading (mailbox mode: CONSUMER → STREAMING).
@@ -1515,36 +1513,23 @@ pub unsafe extern "C" fn syscall_buffer_release_read(chan: i32) -> i32 {
 
 /// Acquire in-place access to the channel's buffer (READY → PRODUCER).
 ///
-/// For aliased buffer chains where an in-place module reads and modifies
-/// the upstream module's output buffer directly. Returns a mutable pointer
-/// to the existing data. After processing, call buffer_release_write to
-/// transition back to READY for the next module in the chain.
-///
-/// # Safety
-/// `len_out` must either be null or a valid `*mut u32`. The returned
-/// `*mut u8` is borrowed mutably until matched with
-/// `syscall_buffer_release_write`; concurrent access from another
-/// module (or another core) violates the single-writer invariant.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn syscall_buffer_acquire_inplace(chan: i32, len_out: *mut u32) -> *mut u8 {
-    if chan < 0 || chan as usize >= MAX_CHANNELS {
-        return core::ptr::null_mut();
-    }
-
-    let channel = &CHANNELS[chan as usize];
-    let buf_slot = channel.buffer_slot.load(Ordering::Acquire);
-    if buf_slot < 0 {
-        return core::ptr::null_mut();
-    }
-
-    // Transition channel's buffer: READY → PRODUCER
-    let (ptr, len) = buffer_pool::mailbox_acquire_inplace(buf_slot as i32);
+/// For an aliased buffer chain where an in-place module reads and modifies the
+/// upstream module's output directly: the buffer holds the existing message,
+/// and `syscall_buffer_release_write` hands it to the next module in the chain.
+/// The buffer is borrowed mutably until then; concurrent access from another
+/// module or core violates the single-writer invariant.
+pub fn buffer_acquire_inplace(chan: i32) -> Acquired {
+    let slot = match mailbox_slot(chan) {
+        Ok(v) => v,
+        Err(refused) => return refused,
+    };
+    let (ptr, len) = buffer_pool::mailbox_acquire_inplace(slot);
     if ptr.is_null() {
-        return core::ptr::null_mut();
+        return Acquired::refused(errno::EAGAIN, 0);
     }
-
-    if !len_out.is_null() {
-        *len_out = len;
+    Acquired {
+        status: 0,
+        ptr,
+        len,
     }
-    ptr
 }

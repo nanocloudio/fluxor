@@ -1,24 +1,48 @@
 version = "1.0.0"
 hardware_targets = ["rp2350", "bcm2712", "linux", "wasm"]
+# Redial backoff and the session-setup deadline are wall-clock; everything
+# else is per-frame.
+timer_class = "wall_clock"
 
-# Remote-channel multiplexer.
+# Remote-channel multiplexer: up to eight local channels carried record for
+# record across one authenticated transport session. Wire protocol in
+# `wire.rs`; behaviour in `mod.rs`.
 #
-# Multiplexes up to 4 logical Fluxor channels onto a single byte
-# transport. Pairs naturally with `wasm_browser_websocket` (browser-
-# WASM-Fluxor peer) or with `foundation/http`'s WebSocket fan-out
-# (server side), but works over any byte transport — TCP via
-# `net_proto`, a serial link, a custom UART tunnel, etc.
+# ─── Parameters (TLV) ──────────────────────────────────────────────────
+# | Tag | Name         | Type | Default | Description |
+# |-----|--------------|------|---------|-------------|
+# | 1   | transport    | u8   | net     | `net`: `net_proto` on `transport_in`/`transport_out`, toward the clear side of `tls` (or a network provider, with `require_peer: 0`). `mux`: the mux contract, toward `quic`'s `app_out`/`app_in`; one stream per channel. |
+# | 2   | role         | u8   | listen  | `net` only: `listen` binds `port` and adopts one session at a time; `dial` connects to `authority` and redials after a close. On `mux` the transport's own client/server mode decides, and the side that dialled opens the streams. |
+# | 3   | port         | u16  | 9100    | `listen`: the port bound. |
+# | 4   | authority    | str  | —       | `dial`: `host[:port]` (port 9100 when omitted) — a name the network provider resolves, or a literal. |
+# | 5   | channels     | str  | —       | The channel table, `content_type:framing:max_record;…`, channel index = position, at most 8. `framing` is how records are delimited on the channel's local ports: `tlv16` (`[type:1][len:2 LE][payload]`), `len32` (`[len:4 LE][payload]`), `mailbox` (the edge has a `buffer_group`; one buffer is one record, and an empty buffer is skipped), or `bytes` (a stream with no records, carried in order; `max_record` bounds one piece). `max_record` counts the whole local record, header included, up to `MAX_RECORD`. Both ends must state the same content types and maxima or the session is refused. |
+# | 6   | require_peer | u8   | 1       | 1: a session is used only once the transport's peer identity binds (tls `peer_identity` wired to `peer_identity`, a record naming the session by connection id and generation; quic's in-band record). A `net` transport that numbers no sessions cannot bind one. 0: the transport is trusted as wired. |
+# | 7   | redial_ms    | u32  | 1000    | `dial`: wait after a close or a failed dial. |
 #
-# Wire format per frame:
-#   [magic: u8 = 0xFC][channel_id: u8][len_lo: u8][len_hi: u8][payload]
+# Each channel's reassembly ring takes `max_record + 4` bytes, and a `mailbox`
+# channel a further `2 * max_record` for its send and delivery stages. The sum
+# over channels must fit `REASSEMBLY_BYTES`; an instance that does not is
+# refused at construction rather than shrunk. On `mux` the channel count is
+# also bounded by the streams `quic` lets one connection open (three at a
+# time), and a session that cannot open a stream per channel is closed.
 #
-# Magic is a sync sentinel for resync after a parse error. Channel id
-# 0..3 corresponds to the local port pairs `ch0`/`ch0_rx` ..
-# `ch3`/`ch3_rx`. Frames that don't match the magic are dropped at
-# the framer's discretion (in practice the framer realigns on the
-# next 0xFC byte).
+# A session that has not bound its peer and exchanged tables ten seconds
+# after the transport session came up is closed. A connection or session
+# that arrives while one is served is closed.
 
-# Outbound: per-channel inputs (data going *out* to the remote peer).
+[[ports]]
+name = "transport_in"
+direction = "input"
+content_type = "OctetStream"
+required = true
+buffer_size = { default = 4096, bcm2712 = 16384 }
+
+# tls `peer_identity` (`net` with `require_peer`).
+[[ports]]
+name = "peer_identity"
+direction = "input"
+content_type = "OctetStream"
+
 [[ports]]
 name = "ch0"
 direction = "input"
@@ -39,7 +63,33 @@ name = "ch3"
 direction = "input"
 content_type = "OctetStream"
 
-# Inbound: per-channel outputs (data coming *in* from the remote peer).
+[[ports]]
+name = "ch4"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "ch5"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "ch6"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "ch7"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "transport_out"
+direction = "output"
+content_type = "OctetStream"
+required = true
+buffer_size = { default = 8192, bcm2712 = 16384 }
+
 [[ports]]
 name = "ch0_rx"
 direction = "output"
@@ -60,17 +110,30 @@ name = "ch3_rx"
 direction = "output"
 content_type = "OctetStream"
 
-# Transport: framed bytes flow through here.
 [[ports]]
-name = "transport_rx"
-direction = "input"
-content_type = "OctetStream"
-
-[[ports]]
-name = "transport_tx"
+name = "ch4_rx"
 direction = "output"
 content_type = "OctetStream"
 
-# Module-scope observability — exempt (see standards/observability.md §6).
+[[ports]]
+name = "ch5_rx"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "ch6_rx"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "ch7_rx"
+direction = "output"
+content_type = "OctetStream"
+
+[[resources]]
+requires_contract = "channel"
+access = "read"
+
+# Module-scope observability is exempt.
 [observability]
-exempt = "channel-bridge fabric — byte throughput is observed at its wired transport endpoints"
+exempt = "channel fabric — byte throughput is observed at the transport it rides (tls / quic / the network provider)"

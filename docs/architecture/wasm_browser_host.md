@@ -62,6 +62,17 @@ the kernel's exports. The invariant is one-to-one: every wasm-side
 extern has a matching `host_*` shim entry, and a missing entry fails
 instantiation with a `LinkError` naming the import.
 
+A child module has its own linear memory, so the bridge copies argument
+bytes between it and the kernel's, and rewrites the output and fence
+pointers a request embeds (`storage.namespace` `LIST`, `RENAME`, `DELETE`,
+`BIND`; `storage.object` `HEAD`, `RANGE_GET`, `DELETE`, `LIST` and the
+streamed commit) to kernel scratch whose results it copies back; a null
+pointer stays null and one past the child's memory is `EINVAL`.
+`storage.object` `PUT` is served from the child's memory directly, under
+the wasm object provider's rules. The buffer primitive's acquire would hand
+back a kernel address, so across the bridge every acquire and release
+answers `ENOTSUP` and the module uses `channel_read` / `channel_write`.
+
 The `fluxor` CLI's scenario synthesiser serves the pieces as static
 routes on the synthesised host whenever a component targets wasm:
 
@@ -152,7 +163,7 @@ host_fetch_close(handle) -> i32
 
 // storage.object provider (§5).
 host_object_head / host_object_range_open / host_object_recv /
-host_object_close / host_object_put
+host_object_close / host_object_put / host_object_delete
 
 // storage.namespace provider (§5).
 host_ns_stat / host_ns_list
@@ -341,9 +352,11 @@ Source: `src/platform/wasm/websocket.rs`,
 a fixed-size retry buffer, so no bytes are dropped under backpressure:
 an unsent tail drains before new input is pulled. The handle opens
 asynchronously; neither direction progresses until the handshake
-completes. Stream-surface semantics live in modules layered above (a
-stream framing module feeding `foundation/remote_channel`), the same
-way `tls` wraps `net_proto` byte streams.
+completes. Stream-surface semantics live in modules layered above it,
+the same way `tls` wraps `net_proto` byte streams. It is not a
+remote-channel transport: a remote channel needs a session with a
+beginning, an end and an authenticated peer, which a raw byte stream
+does not carry.
 
 `wasm_browser_ws_source` is the receive-only "thin viewer" variant:
 it emits incoming binary messages on a `VideoRaster` output, so an
@@ -461,7 +474,14 @@ tier:
   browsers). The store is re-hydrated from persistent storage at
   boot, so a key written in a prior session reads back after a
   reload. This is what lets user-written data (save states, imported
-  assets) survive in the browser.
+  assets) survive in the browser. `DELETE` removes a key from this tier
+  only (`host_object_delete`); a key served by the read tier is not the
+  provider's to delete.
+
+`LIST` answers `ENOSYS`: the read tier falls through to `fetch()` against
+the page origin, which cannot be enumerated, and a listing of the written
+tier alone would omit objects `GET` serves. Enumeration is the
+`storage.namespace` provider's.
 
 Reads consult the written store before falling through to `fetch()`.
 Durability is best-effort: the per-handle fence stays `Volatile`,
@@ -483,7 +503,9 @@ fetches each hit via `storage.object` on the same key.
 a scanner treats a negative `LIST` as end-of-listing, so these never
 return `EAGAIN`. The index hydrates asynchronously at boot and mutates
 synchronously on object `PUT`; a scan that races boot sees a smaller
-tree, never a stall. `LIST` pages via an integer cursor; `STAT`
+tree, never a stall. `LIST` pages by name: the cursor is the last name
+the page returned, in UTF-8 byte order, and a write behind it never shifts
+the next page; `STAT`
 returns size, mtime, kind, and an etag (a stable FNV hash synthesised
 per key for written entries, or the manifest-supplied etag for shipped
 content).

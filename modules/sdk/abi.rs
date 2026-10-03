@@ -215,6 +215,18 @@ pub mod contracts {
     pub mod key_vault {
         include!("contracts/key_vault.rs");
     }
+    /// The mesh substrate's authority: capability tokens, delegation chains,
+    /// local verification, and their presentation on a session.
+    pub mod mesh {
+        pub mod capability {
+            include!("contracts/mesh/capability.rs");
+        }
+        /// Golden vectors every consumer of `capability` checks itself
+        /// against.
+        pub mod capability_vectors {
+            include!("contracts/mesh/capability_vectors.rs");
+        }
+    }
     /// Platform-neutral isolated-workload surface (contract class `0x1A`).
     pub mod workload {
         include!("contracts/workload.rs");

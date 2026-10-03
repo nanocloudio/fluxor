@@ -154,12 +154,11 @@ pub struct Config {
     /// Path prefixes where a crate-root `#![allow(...)]` is permitted, each
     /// with the reason it is permitted there.
     ///
-    /// `standards/lints.md` §4 bans crate-root allows outright, which a tree
+    /// The lint standard bans crate-root allows outright, which a tree
     /// with a structural cause for them cannot satisfy. The escape is the one
     /// the ecosystem's other gates take: a structured row carrying its own
-    /// reason, per `standards/rfc-process.md` §6 — *"Plain path lists are not
-    /// allowed; an exemption without a reason is a conformance failure, not
-    /// an escape hatch"*.
+    /// reason: plain path lists are not allowed, and an exemption without a
+    /// reason is a conformance failure, not an escape hatch.
     pub allow_crate_root: Vec<(String, String)>,
 }
 
@@ -347,8 +346,7 @@ pub fn scan(project_root: &Path, config: &Config) -> Result<Report, ScanError> {
     Ok(report)
 }
 
-/// Structure rules for the `modules/` tree (standards/fluxor-modules.md
-/// §1–§3, §7): a module is a directory, never a crate; tier placement
+/// Structure rules for the `modules/` tree: a module is a directory, never a crate; tier placement
 /// must agree with the manifest; in-module `tests/` must be declared.
 /// `modules/sdk/` is the staged-source contract, not a module tree —
 /// exempt. All findings report under `Rule::ModuleStructure`.
@@ -442,13 +440,12 @@ fn scan_module_structure(project_root: &Path, report: &mut Report) {
         }
 
         // Tests live in the repo-root `tests/` tree, never under a module
-        // (standards/fluxor-modules.md §0.2) — and never as a manifest
+        // — and never as a manifest
         // `[test]` lane.
         if module_dir.join("tests").is_dir() {
             push(
                 module_rel.clone(),
-                "tests/ directory under a module — relocate to the repo-root `tests/` tree \
-                 (standards/fluxor-modules.md §0.2)"
+                "tests/ directory under a module — relocate to the repo-root `tests/` tree"
                     .to_string(),
                 report,
             );
@@ -457,7 +454,7 @@ fn scan_module_structure(project_root: &Path, report: &mut Report) {
             push(
                 module_rel.clone(),
                 "manifest `[test]` section — the module-local test lane is retired; tests \
-                 live in the repo-root `tests/` tree (standards/fluxor-modules.md §0.2)"
+                 live in the repo-root `tests/` tree"
                     .to_string(),
                 report,
             );
@@ -523,7 +520,7 @@ fn push_repo_violation(report: &mut Report, rel: PathBuf, rule: Rule, message: S
 /// them; a tier only participates when it exists on disk.
 const SHADOW_TIERS: [&str; 5] = ["tests", "benches", "examples", "fixtures", "fuzz"];
 
-/// Shadow-tracking conformance (standards/test-tracking.md §4, §7) —
+/// Shadow-tracking conformance —
 /// the native replacement for the per-repo `tools/ci-shadow-guard.sh`
 /// copies. For every tier that exists on disk:
 ///
@@ -533,8 +530,7 @@ const SHADOW_TIERS: [&str; 5] = ["tests", "benches", "examples", "fixtures", "fu
 ///   shadow repo versions nothing);
 /// - a repo with no shadow repo must not gitignore the tier — a
 ///   gitignored-only tier exists on exactly one machine and has no
-///   recovery path (the explicit failure mode named in
-///   standards/test-tracking.md §1).
+///   recovery path (the explicit failure mode of shadow tracking).
 fn scan_shadow_guard(project_root: &Path, report: &mut Report) {
     let shadow_dir = project_root.join(".git-shadow");
     let has_shadow = shadow_dir.is_dir();
@@ -560,7 +556,7 @@ fn scan_shadow_guard(project_root: &Path, report: &mut Report) {
                 format!(
                     "`{tier}/` is gitignored in the primary repo and there is no `.git-shadow/` \
                      — its contents are versioned nowhere and exist only on this machine. \
-                     Run the standards/test-tracking.md §4 setup (init `.git-shadow`, invert the \
+                     Set up shadow tracking (init `.git-shadow`, invert the \
                      excludes, `git shadow add -A && git shadow commit`), or drop `{tier}/` from \
                      .gitignore and track it in the primary repo"
                 ),
@@ -577,8 +573,7 @@ fn scan_shadow_guard(project_root: &Path, report: &mut Report) {
             Rule::ShadowGuard,
             "`.git-shadow/` is initialised but has no commits — the shadow-tracked tiers are \
              versioned nowhere, which is compliance shape without compliance. Run \
-             `git shadow add -A && git shadow commit -m \"Initial shadow-tracked tests/benches\"` \
-             (standards/test-tracking.md §4 step 5)"
+             `git shadow add -A && git shadow commit -m \"Initial shadow-tracked tests/benches\"`"
                 .to_string(),
         );
     }
@@ -601,8 +596,7 @@ fn scan_shadow_guard(project_root: &Path, report: &mut Report) {
                 Rule::ShadowGuard,
                 format!(
                     "`{tier}/` is a shadow-tracked tier but is not excluded from the primary \
-                     repo — add `/{tier}/` to .gitignore, or it reaches the shared remote \
-                     (standards/test-tracking.md §4 step 1)"
+                     repo — add `/{tier}/` to .gitignore, or it reaches the shared remote"
                 ),
             );
         }
@@ -614,7 +608,7 @@ fn scan_shadow_guard(project_root: &Path, report: &mut Report) {
                 format!(
                     "`{tier}/` is not un-excluded in .git-shadow/info/exclude — the shadow repo \
                      tracks nothing under it, so the tier is versioned nowhere. Add `!/{tier}/` \
-                     there (standards/test-tracking.md §4 step 3)"
+                     there"
                 ),
             );
             continue;
@@ -627,8 +621,7 @@ fn scan_shadow_guard(project_root: &Path, report: &mut Report) {
                 format!(
                     "`{tier}/` exists on disk and is un-excluded in .git-shadow/info/exclude, but \
                      no file under it is committed in the shadow repo — run \
-                     `git shadow add -A {tier} && git shadow commit` \
-                     (standards/test-tracking.md §5)"
+                     `git shadow add -A {tier} && git shadow commit`"
                 ),
             );
         }
@@ -761,7 +754,7 @@ fn shadow_tier_is_empty(shadow_dir: &Path, project_root: &Path, tier: &str) -> b
     }
 }
 
-/// SDK-mount rule (standards/dependencies.md): a consuming project
+/// SDK-mount rule: a consuming project
 /// mounts fluxor's SDK — and any sibling's shared source tree — from
 /// the staged, digest-verified tree `fluxor sync` materialises under
 /// `target/fluxor/`, never from a raw `deps/<project>/` checkout. A
@@ -790,8 +783,7 @@ fn scan_sdk_mounts(rel: &Path, src: &str) -> Vec<Violation> {
             rule: Rule::SdkMount,
             message: format!(
                 "raw `deps/` source mount — no pin, no digest, no staleness signal. Mount the \
-                 staged tree `{staged}...` that `fluxor sync` materialises \
-                 (standards/dependencies.md)"
+                 staged tree `{staged}...` that `fluxor sync` materialises"
             ),
         });
     }
@@ -803,15 +795,14 @@ fn scan_sdk_mounts(rel: &Path, src: &str) -> Vec<Violation> {
 /// file with no standard behind it would be exactly the hand-written
 /// variant this rule exists to remove.
 ///
-/// - `clippy.toml` — standards/lints.md §6 ("Workspace-shared
-///   `clippy.toml` at repo root"), for the lints that take
+/// - `clippy.toml` — the workspace-shared `clippy.toml` at repo root, for the lints that take
 ///   configuration rather than a level. Checked for Cargo workspaces
 ///   only; a repo with no workspace root has nothing to share.
 ///
 /// `rustfmt.toml`, `rust-toolchain.toml` and `LICENSE` are deliberately
 /// absent: no standard states whether a project carries them, so the
 /// spread across the ecosystem is an open owner decision, not a
-/// violation. See standards/lints.md §6.1.
+/// violation.
 /// Sibling projects that consume this SDK. Names, not common words: a
 /// list that included `wave` or `sector` would fire on ordinary prose.
 const CONSUMER_PROJECTS: &[&str] = &[
@@ -1146,7 +1137,7 @@ fn scan_repo_files(project_root: &Path, report: &mut Report) {
         report,
         PathBuf::from("Cargo.toml"),
         Rule::RepoFiles,
-        "workspace root carries no `clippy.toml` — standards/lints.md §6 states the \
+        "workspace root carries no `clippy.toml` — the \
          configuration-taking lints (`disallowed-macros`, `disallowed-methods`) are configured \
          in a workspace-shared `clippy.toml` at the repo root; without it those lints are \
          unconfigured and silently enforce nothing"
@@ -1408,7 +1399,7 @@ impl<'a> HygieneVisitor<'a> {
         });
     }
 
-    /// `standards/lints.md` §4: a crate-root `#![allow(...)]` in a
+    /// A crate-root `#![allow(...)]` in a
     /// non-generated file is not permitted. Permitted only where the project
     /// has declared a prefix and said why.
     fn check_crate_root_allow(&mut self, attr: &Attribute, exempt: &[(String, String)]) {

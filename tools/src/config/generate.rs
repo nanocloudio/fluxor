@@ -75,6 +75,21 @@ fn generate_config_impl(
         .get("modules")
         .ok_or_else(|| Error::Config("modules section required".into()))?;
 
+    // The silicon `modules_dir` holds artefacts for, which tags the pins
+    // consulted when a `.fmod` is absent from it. Stated here from the
+    // target, never read off the directory: `--module-root` can name any
+    // path. A graph naming no resolvable target consults no pins.
+    let module_silicon = resolved_target
+        .or_else(|| config.get("target").and_then(|t| t.as_str()))
+        .and_then(|t| crate::target::load_target(t, project_root).ok())
+        .map(|d| d.module_silicon().to_string())
+        .unwrap_or_default();
+    let loc = schema::ModuleLocation {
+        dir: modules_dir,
+        silicon: &module_silicon,
+        project_root,
+    };
+
     // Parse graph-level sample_rate (top-level or under graph: key)
     let graph_sample_rate: u32 = config
         .get("sample_rate")
@@ -352,7 +367,7 @@ fn generate_config_impl(
         modules_ref,
         data_section,
         config,
-        modules_dir,
+        loc,
         &manifests,
         max_modules,
         &isolation,
@@ -436,7 +451,7 @@ fn generate_config_impl(
                 // run under.
                 if !manifest.requires_when.is_empty() {
                     let mtype = m.get("type").and_then(|t| t.as_str()).unwrap_or(name);
-                    let param_schema = schema::load_schema_for_module(mtype, modules_dir)?;
+                    let param_schema = schema::load_schema_for_module(mtype, loc)?;
                     let facts_key = facts_owned.as_deref().unwrap_or(silicon);
                     let facts = crate::target_facts::TargetFacts::for_silicon(facts_key);
                     for rw in &manifest.requires_when {
@@ -623,7 +638,7 @@ fn generate_config_impl(
     let mut result = Vec::new();
 
     // Header (8 bytes): magic, version, checksum
-    result.extend_from_slice(&MAGIC_LEGACY.to_le_bytes()); // "FXWR"
+    result.extend_from_slice(&MAGIC_FXWR.to_le_bytes()); // "FXWR"
     result.extend_from_slice(&version.to_le_bytes());
     result.extend_from_slice(&0u16.to_le_bytes()); // checksum (computed later)
 
@@ -913,7 +928,7 @@ fn generate_config_impl(
     // (so the kernel reads it at `total_size + ADAPTIVE_POST_SIZE`), also PAST the
     // checksummed body — same additive discipline, no format-version bump. Absent
     // `pods:` ⇒ empty ⇒ byte-identical single-graph config.
-    let pod_section = build_pod_section(config, modules_dir, extra_module_dirs)?;
+    let pod_section = build_pod_section(config, loc, extra_module_dirs)?;
     result.extend_from_slice(&pod_section);
 
     // Capacity-envelope section (compose-time Tier A sizing): the
@@ -990,7 +1005,7 @@ fn build_capacity_envelope(config: &Value, resolved_target: Option<&str>) -> Res
 /// are not supported in v1 (strict isolation). Returns an empty Vec with no pods.
 fn build_pod_section(
     config: &Value,
-    modules_dir: &Path,
+    loc: schema::ModuleLocation<'_>,
     extra_module_dirs: &[&Path],
 ) -> Result<Vec<u8>> {
     let Some(pods_yaml) = config.get("pods").and_then(|p| p.as_array()) else {
@@ -1006,7 +1021,7 @@ fn build_pod_section(
     // checked rather than silently passing and losing its pre-tick semantics.
     let manifest_search: Vec<&Path> = {
         let mut v: Vec<&Path> = extra_module_dirs.to_vec();
-        v.push(modules_dir);
+        v.push(loc.dir);
         v
     };
     // Per-domain exec_mode (Tier) so pods can be rejected from ISR-tier domains.
@@ -1107,7 +1122,7 @@ fn build_pod_section(
             // Inline-TLV params — identical packing to base modules, so the kernel
             // reads them via `params_ptr` exactly the same way.
             let params =
-                if let Some(param_schema) = schema::load_schema_for_module(mtype, modules_dir)? {
+                if let Some(param_schema) = schema::load_schema_for_module(mtype, loc)? {
                     let mut buf = vec![0u8; MAX_MODULE_PARAMS_SIZE];
                     let plen = schema::build_params_from_schema(
                         m,

@@ -65,7 +65,7 @@ pub struct Artifact {
 }
 
 /// Content address of a manifest: a digest over its layer digests in
-/// manifest order. Stable across a provenance re-stamp by construction.
+/// manifest order. Independent of the manifest's annotations by construction.
 pub fn content_digest(manifest: &ImageManifest) -> String {
     let joined = manifest
         .layers
@@ -89,21 +89,17 @@ pub struct StoreLock {
     /// The catalog (`stacks/` + `targets/`) these pins were resolved
     /// against.
     ///
-    /// The catalog is the one input to a build that nothing pinned. It
+    /// The catalog is the one input to a build that nothing pins. It
     /// is read live from the fluxor checkout while the modules it
     /// configures come from the digests above, so the two move
     /// independently: a stack edited in a sibling checkout changes every
-    /// downstream build immediately, with no publish, no `update`, and
-    /// no record anywhere that anything changed.
-    ///
-    /// That is not hypothetical. A commit that added parameters to a
-    /// module and referenced them from a stack was coherent in its own
-    /// tree and broke every consumer's networked build until each
-    /// rebuilt that target — and the failure named a parameter the
-    /// consumer's config had never mentioned.
+    /// downstream build immediately, with no publish and no `update`. A
+    /// stack that references parameters a pinned module does not yet
+    /// have breaks the consumer's build with a message naming a
+    /// parameter its own config never mentioned.
     ///
     /// Recording the catalog here does not freeze it; it makes the drift
-    /// observable, which is what was missing.
+    /// observable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub catalog: Option<Catalog>,
 }
@@ -115,13 +111,6 @@ pub struct Catalog {
     /// Digest over every `stacks/*.toml` and `targets/**/*.toml` in the
     /// install root, by sorted relative path.
     pub digest: String,
-    /// Accepted from a lock written before the stamp dropped it, and never
-    /// written: it held the install root's absolute path, which is a fact
-    /// about one machine in a file every machine commits. Nothing read it —
-    /// the drift diagnostic names the root it just digested, which is the
-    /// one its reader can actually go and look at.
-    #[serde(default, skip_serializing)]
-    pub source: Option<String>,
 }
 
 /// Digest the catalog at `install_root` — every `stacks/*.toml` and
@@ -187,8 +176,10 @@ pub fn read_store_lock(project_root: &Path) -> Result<Option<StoreLock>> {
     let text = fs::read_to_string(&path)?;
     let parsed: StoreLock = toml::from_str(&text).map_err(|e| {
         Error::Config(format!(
-            "{}: {e}— run `fluxor update` to rewrite it",
-            path.display()
+            "{} does not parse: {} — correct it, or delete it (and with it every pin \
+             it holds) and run `fluxor update`",
+            path.display(),
+            e.to_string().trim_end()
         ))
     })?;
     Ok(Some(parsed))
@@ -219,10 +210,7 @@ pub fn sort_entries(entries: &mut Vec<Artifact>) {
 pub fn write_store_lock(project_root: &Path, entries: &[Artifact]) -> Result<PathBuf> {
     let catalog = crate::project::install_root()
         .and_then(|r| catalog_digest(&r.path))
-        .map(|digest| Catalog {
-            digest,
-            source: None,
-        });
+        .map(|digest| Catalog { digest });
     write_store_lock_stamped(project_root, entries, catalog)
 }
 
@@ -290,8 +278,7 @@ pub fn register_pins(project_root: &Path, artifacts: &[Artifact]) {
 /// them apart.
 fn fill_content(store: &OciStore, entries: &mut [Artifact]) {
     for e in entries.iter_mut() {
-        let resolved = store.resolve_pin(&e.digest);
-        if let Ok(bytes) = store.read_blob(&resolved) {
+        if let Ok(bytes) = store.read_blob(&e.digest) {
             if let Ok(m) = serde_json::from_slice::<ImageManifest>(&bytes) {
                 e.content = Some(content_digest(&m));
             }
@@ -461,8 +448,8 @@ pub(crate) fn resolve_dependency(
                     out.push(a);
                 }
             }
-            // Bundles are install-time artifacts (`fluxor install`),
-            // not sync pins.
+            // Bundles are not dependency pins: a consumer pins the
+            // services it runs itself (`fluxor store pin`).
             _ => {}
         }
     }
@@ -489,11 +476,21 @@ pub fn resolve_project(project_root: &Path) -> Result<Vec<Artifact>> {
 /// `fluxor update` in the consolidated flow: without `--from`, advance
 /// every pin to the deps' latest published state; with
 /// `--from snapshot/<name>`, the snapshot's children replace the pins
-/// wholesale. Update deliberately does NOT read the existing lockfile
-/// — it is the verb that rewrites an unreadable one.
+/// wholesale. A lockfile that does not parse is an error: its bundle
+/// pins are the consumer's own decisions, which nothing else records, so
+/// rewriting it would drop them silently.
 pub fn cmd_update(project_root: &Path, from_snapshot: Option<&str>) -> Result<()> {
+    let _guard = crate::lockfile::lock_lockfile(project_root)?;
+    let before = read_store_lock(project_root)?
+        .map(|l| l.artifacts)
+        .unwrap_or_default();
     let entries = match from_snapshot {
-        None => resolve_project(project_root)?,
+        None => {
+            let mut out = resolve_project(project_root)?;
+            out.extend(advance_bundle_pins(&before)?);
+            sort_entries(&mut out);
+            out
+        }
         Some(name) => {
             let store = OciStore::open(crate::oci_store::store_root()?)?;
             let reference = if name.starts_with("snapshot/") {
@@ -514,15 +511,6 @@ pub fn cmd_update(project_root: &Path, from_snapshot: Option<&str>) -> Result<()
             out
         }
     };
-    let _guard = crate::lockfile::lock_lockfile(project_root)?;
-    // Read for REPORTING only. `update` stays the verb that rewrites an
-    // unreadable lockfile, so a lock it cannot parse simply yields no
-    // comparison rather than an error.
-    let before = read_store_lock(project_root)
-        .ok()
-        .flatten()
-        .map(|l| l.artifacts)
-        .unwrap_or_default();
     let path = write_store_lock(project_root, &entries)?;
     println!(
         "wrote {} ({} artifact(s): {})",
@@ -536,15 +524,58 @@ pub fn cmd_update(project_root: &Path, from_snapshot: Option<&str>) -> Result<()
     Ok(())
 }
 
+/// The bundles this project pinned (`fluxor store pin`), advanced to the
+/// latest digest their publisher tagged.
+///
+/// Dependency indexes do not name bundles — a consumer chooses which
+/// services it runs — so a bundle pin is the consumer's own decision and
+/// `update` carries it forward rather than dropping it. A pinned bundle
+/// whose `:latest` is gone, or now belongs to another project, is an error:
+/// silently losing the pin would leave `fluxor run <name>` with nothing to
+/// run.
+fn advance_bundle_pins(before: &[Artifact]) -> Result<Vec<Artifact>> {
+    let pinned: Vec<&Artifact> = before.iter().filter(|a| a.kind == "bundle").collect();
+    if pinned.is_empty() {
+        return Ok(Vec::new());
+    }
+    let store = OciStore::open(crate::oci_store::store_root()?)?;
+    let mut out = Vec::new();
+    for old in pinned {
+        let latest = format!("{}:latest", old.name);
+        let desc = store.resolve(&latest).map_err(|_| {
+            Error::Config(format!(
+                "bundle '{}' is pinned but '{latest}' is not in the store — run `fluxor publish \
+                 bundle` in {}, or drop the pin",
+                old.name, old.project
+            ))
+        })?;
+        let Some(new) = artifact_from_descriptor(&desc)?.filter(|a| a.kind == "bundle") else {
+            return Err(Error::Config(format!(
+                "'{latest}' is no longer a bundle artifact"
+            )));
+        };
+        if new.project != old.project {
+            return Err(Error::Config(format!(
+                "bundle '{}' was pinned from project '{}' but '{latest}' is now published by '{}'",
+                old.name, old.project, new.project
+            )));
+        }
+        out.push(new);
+    }
+    fill_content(&store, &mut out);
+    Ok(out)
+}
+
 /// How one pin changed across an update.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PinChange {
     /// Same digest — the pin did not move at all.
     Same,
     /// The digest moved but the artifact did not: identical content
-    /// address. The churn this whole design exists to stop, and after
-    /// the restamp it should never be reported again.
-    Restamped,
+    /// address. A publish that changed nothing must never produce this,
+    /// so a non-zero count is the standing check that provenance stays
+    /// outside the manifest.
+    SameContent,
     /// The artifact changed.
     Changed,
 }
@@ -554,24 +585,20 @@ fn classify(old: &Artifact, new: &Artifact) -> PinChange {
         return PinChange::Same;
     }
     match (&old.content, &new.content) {
-        // Same bytes under a new manifest digest. Whether to call that a
-        // re-stamp or a rebuild is not knowable from the content alone —
-        // both produce identical layers — so the honest label is the one
-        // that names the observable: the content did not move.
-        (Some(a), Some(b)) if a == b => PinChange::Restamped,
+        // Same bytes under a new manifest digest: the label names the
+        // observable, that the content did not move.
+        (Some(a), Some(b)) if a == b => PinChange::SameContent,
         _ => PinChange::Changed,
     }
 }
 
 /// One line describing what an update actually did.
 ///
-/// `wrote fluxor.lock (77 artifact(s))` was true and useless: it could
-/// not distinguish 77 modules changing from a publish that changed
-/// nothing and merely re-stamped every manifest. Reporting `0 changed`
-/// for the second case is the difference between a treadmill and a
-/// signal — and a non-zero `re-stamped` count after the migration is the
-/// standing regression check that provenance is still outside the
-/// manifest.
+/// A bare artifact count cannot distinguish 77 modules changing from a
+/// publish that changed nothing and re-published every manifest. Reporting
+/// `0 changed` for the second case is the difference between a treadmill
+/// and a signal, and a non-zero `same content` count is the standing check
+/// that provenance is still outside the manifest.
 fn describe_update(before: &[Artifact], after: &[Artifact]) -> String {
     if before.is_empty() {
         return format!("{} new", after.len());
@@ -590,7 +617,7 @@ fn describe_update(before: &[Artifact], after: &[Artifact]) -> String {
         let label = match old.get(&key(a)).map(|o| classify(o, a)) {
             None => "new",
             Some(PinChange::Same) => "unchanged",
-            Some(PinChange::Restamped) => "re-stamped",
+            Some(PinChange::SameContent) => "same content",
             Some(PinChange::Changed) => "changed",
         };
         *counts.entry(label).or_default() += 1;
@@ -621,7 +648,7 @@ fn describe_update(before: &[Artifact], after: &[Artifact]) -> String {
 /// A consumer advancing its own pins is correct and unremarkable, and it
 /// is also the event that can leave another checkout's pin as the last
 /// thing keeping a manifest reachable. The store can see both sides; the
-/// checkout doing it could not, until now.
+/// checkout doing it cannot.
 fn withdrawal_note(project_root: &Path, before: &[Artifact], after: &[Artifact]) -> Option<String> {
     let kept: BTreeSet<&str> = after.iter().map(|a| a.digest.as_str()).collect();
     let dropped: Vec<&Artifact> = before
@@ -679,11 +706,6 @@ pub fn pin_artifact(project_root: &Path, artifact: &Artifact) -> Result<()> {
 /// Read a blob the lockfile pins, mapping absence onto the one
 /// recovery message every pin-follows-a-missing-blob path shares.
 pub(crate) fn read_pinned_blob(store: &OciStore, name: &str, digest: &str) -> Result<Vec<u8>> {
-    // A pin written before provenance moved out of the manifest names a
-    // digest the store may no longer hold; `resolve_pin` follows the
-    // restamp alias to the manifest that replaced it — same layers, same
-    // target, same epoch. It is a no-op for every other pin.
-    let digest = &store.resolve_pin(digest);
     store.read_blob(digest).map_err(|_| {
         Error::Config(format!(
             "artifact '{name}' ({digest}) no longer in store — run `fluxor update`"
@@ -747,8 +769,7 @@ pub fn current_epoch_hex(live_projects: &BTreeMap<String, PathBuf>) -> Result<St
         .collect())
 }
 
-/// The two epoch rules over one resolved artifact set
-/// (registry_consolidation.md, "Epoch check at sync"):
+/// The two epoch rules over one resolved artifact set:
 ///
 /// 1. **Homogeneity, for everyone**: every artifact must carry the
 ///    same `io.fluxor.abi-surface`; a mixed set is a hard error naming
@@ -846,7 +867,6 @@ mod tests {
         ];
         let stamp = Catalog {
             digest: format!("sha256:{}", "ef".repeat(32)),
-            source: None,
         };
         write_store_lock_stamped(dir.path(), &entries, Some(stamp.clone())).unwrap();
         let read_back = read_store_lock(dir.path()).unwrap().unwrap();
@@ -880,6 +900,39 @@ mod tests {
         assert!(err.contains("run `fluxor update`"), "{err}");
     }
 
+    /// `fluxor update` refuses a lockfile it cannot parse rather than
+    /// rewriting it: the bundle pins inside are recorded nowhere else.
+    #[test]
+    fn update_refuses_a_lockfile_that_does_not_parse() {
+        let _env = crate::oci_store::test_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("fluxor.toml"),
+            "[project]\nname = \"consumer\"\nversion = \"0.0.1\"\n",
+        )
+        .unwrap();
+        let store_dir = dir.path().join("store");
+        let no_workspace = dir.path().join("no-workspace.toml");
+        let _scope = crate::oci_store::EnvScope::set(&[
+            ("FLUXOR_STORE", &store_dir),
+            ("FLUXOR_WORKSPACE", &no_workspace),
+        ]);
+        let bundle = entry("bundle", "svc", "web", None);
+        write_store_lock_stamped(dir.path(), std::slice::from_ref(&bundle), None).unwrap();
+        let path = lockfile_path(dir.path());
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text.insert_str(0, "stray = 1\n");
+        std::fs::write(&path, &text).unwrap();
+
+        let err = cmd_update(dir.path(), None).unwrap_err().to_string();
+        assert!(err.contains("does not parse"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            text,
+            "lock rewritten"
+        );
+    }
+
     #[test]
     fn pin_artifact_upserts_by_identity() {
         let dir = tempfile::tempdir().unwrap();
@@ -893,13 +946,12 @@ mod tests {
         assert_eq!(lock.artifacts[0].digest, b.digest);
     }
 
-    /// A lock written while the stamp still carried the install root's
-    /// path still parses. Every repo holds one, and `deny_unknown_fields`
-    /// would otherwise turn dropping the field into a flag day: each lock
-    /// unreadable until someone regenerated it, which is the whole point
-    /// of keeping the field declared.
+    /// The catalog stamp is its digest and nothing else: a lock is
+    /// committed by every machine, so it carries no one machine's layout
+    /// (an install-root path), and an unknown field is refused rather than
+    /// ignored.
     #[test]
-    fn a_catalog_stamp_carrying_the_old_source_field_still_parses() {
+    fn a_catalog_stamp_carries_a_digest_only() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             lockfile_path(dir.path()),
@@ -907,23 +959,23 @@ mod tests {
              source = \"/home/someone/checkout\"\n",
         )
         .unwrap();
-        let lock = read_store_lock(dir.path()).unwrap().unwrap();
-        let catalog = lock.catalog.expect("the stamp parses");
-        assert_eq!(catalog.digest, "sha256:abc");
-    }
+        assert!(read_store_lock(dir.path()).is_err());
 
-    /// ...and writing it back leaves the path out, so the file stops
-    /// carrying one machine's layout into everyone else's tree.
-    #[test]
-    fn a_written_catalog_stamp_carries_no_source_path() {
-        let dir = tempfile::tempdir().unwrap();
         let stamp = Catalog {
             digest: "sha256:abc".into(),
-            source: Some("/home/someone/checkout".into()),
         };
         write_store_lock_stamped(dir.path(), &[], Some(stamp)).unwrap();
         let text = std::fs::read_to_string(lockfile_path(dir.path())).unwrap();
         assert!(text.contains("[catalog]"), "got:\n{text}");
         assert!(!text.contains("source ="), "got:\n{text}");
+        assert_eq!(
+            read_store_lock(dir.path())
+                .unwrap()
+                .unwrap()
+                .catalog
+                .unwrap()
+                .digest,
+            "sha256:abc"
+        );
     }
 }

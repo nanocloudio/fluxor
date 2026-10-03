@@ -16,7 +16,7 @@ use crate::error::{Error, Result};
 // Bin-root helper (cli/commands_c.rs, flat `include!` scope).
 use crate::resolve_project_root;
 use fluxor_tools::oci_store::{
-    self, git_source_rev, publish_bundle, sha256_hex_prefixed, BundlePublish, ImageManifest,
+    self, git_source_rev, sha256_hex_prefixed, ArtifactMeta, BundleArtifact, ImageManifest,
     OciStore, ANN_KIND, ANN_REF_NAME, ANN_TARGET, PROVENANCE_LOCAL, PROVENANCE_PUBLISHED,
 };
 use fluxor_tools::store_remote;
@@ -144,18 +144,6 @@ pub enum StoreCommand {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Move provenance out of every manifest, once.
-    ///
-    /// Manifests published before provenance moved to the store's side
-    /// table carry `io.fluxor.source-rev`, which changes on every
-    /// commit — so re-publishing unchanged content rewrites the manifest
-    /// and moves the digest every downstream lockfile pins. This is the
-    /// one-time migration that stops it. Every digest it moves is
-    /// recorded as an alias, so locks written beforehand keep resolving.
-    Restamp {
-        #[arg(long)]
-        store: Option<PathBuf>,
-    },
     /// Pin an artifact into `fluxor.lock` (`[[artifact]]`) so
     /// combine/packaging resolve its `.fmod` by digest from the store
     /// when it's absent from `target/fluxor/<target>/modules/`.
@@ -189,44 +177,162 @@ fn provenance_flag(published: bool) -> &'static str {
 
 // ── fluxor publish bundle ─────────────────────────────────────────────
 
+/// `fluxor publish bundle <dir | workload.toml>`.
+///
+/// A source manifest is emitted first. The bundle directory may be an
+/// emitted root (`target/fluxor/<name>/`, documents under its target
+/// subdir), a flat target dir, or a materialised bundle (documents plus
+/// `modules/`). The module bytes come from the bundle's own `modules/` when
+/// it has one, else from the publishing project's built modules; either way
+/// each must hash to the digest `workload.json` pins. The bundle is
+/// published under its project (`[project]` of the tree it lives in) and
+/// joins that project's index in one transaction.
 pub fn cmd_bundle_publish(
-    bundle_dir: &Path,
+    bundle: &Path,
     store_dir: Option<&Path>,
     tag: Option<&str>,
     published: bool,
+    verbose: bool,
 ) -> Result<()> {
-    let store = open_store(store_dir)?;
+    let dir = if crate::workload_src::is_source_manifest(bundle) {
+        crate::workload_src::emit_bundle(bundle, None, verbose)?
+    } else {
+        bundle.to_path_buf()
+    };
+    let docs = if dir.join("graph.yaml").is_file() {
+        dir.clone()
+    } else {
+        dir.join("linux")
+    };
     let read = |name: &str| -> Result<Vec<u8>> {
-        fs::read(bundle_dir.join(name))
-            .map_err(|e| Error::Config(format!("bundle {}: {name}: {e}", bundle_dir.display())))
+        fs::read(docs.join(name))
+            .map_err(|e| Error::Config(format!("bundle {}: {name}: {e}", docs.display())))
     };
     let workload_json = String::from_utf8(read("workload.json")?)
         .map_err(|e| Error::Config(format!("workload.json: {e}")))?;
     let resources_json = read("resources.json")?;
     let graph_yaml = read("graph.yaml")?;
+    let manifest = fluxor_tools::workload::parse_manifest(&workload_json).map_err(Error::Config)?;
+    let report = fluxor_tools::workload::validate(&manifest);
+    if !report.is_ok() {
+        return Err(Error::Config(format!(
+            "bundle '{}' failed validation: {}",
+            manifest.name,
+            report.errors.join("; ")
+        )));
+    }
+
+    let project_root = crate::project::root_for_config(&docs.join("workload.json"));
+    let identity = crate::project::project_identity(&project_root)
+        .map_err(Error::Config)?
+        .ok_or_else(|| {
+            Error::Config(format!(
+                "no [project] table in {}/fluxor.toml — a bundle is published under its project",
+                project_root.display()
+            ))
+        })?;
+
+    let modules_dir = if docs.join("modules").is_dir() {
+        docs.join("modules")
+    } else {
+        crate::modules_build::module_root(
+            None,
+            &project_root,
+            &project_root.join("target/fluxor"),
+            "linux",
+        )?
+    };
+    let mut modules: Vec<(String, Vec<u8>)> = Vec::new();
+    for imp in &manifest.implementations {
+        for m in &imp.modules {
+            if modules.iter().any(|(n, _)| n == &m.name) {
+                continue;
+            }
+            let path = modules_dir.join(format!("{}.fmod", m.name));
+            let bytes = fs::read(&path).map_err(|e| {
+                Error::Config(format!(
+                    "module '{}' has no built .fmod at {} ({e})",
+                    m.name,
+                    path.display()
+                ))
+            })?;
+            modules.push((m.name.clone(), bytes));
+        }
+    }
 
     let ref_name = match tag {
         Some(t) => t.to_string(),
-        None => {
-            let manifest =
-                fluxor_tools::workload::parse_manifest(&workload_json).map_err(Error::Config)?;
-            format!("{}:{}", manifest.name, manifest.version)
-        }
+        None => format!("{}:{}", manifest.name, manifest.version),
     };
-    let source_rev = git_source_rev(bundle_dir);
-    let desc = publish_bundle(
-        &store,
-        &BundlePublish {
-            workload_json: &workload_json,
-            resources_json: &resources_json,
-            graph_yaml: &graph_yaml,
-            provenance: provenance_flag(published),
-            source_rev: source_rev.as_deref(),
-            ref_name: &ref_name,
-        },
-    )
-    .map_err(|e| Error::Config(e.to_string()))?;
-    println!("{ref_name} -> {}", desc.digest);
+    let epoch_hex: String = crate::hash::abi_surface_digest()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let source_rev = git_source_rev(&project_root);
+    let meta = ArtifactMeta {
+        project: &identity.name,
+        provenance: provenance_flag(published),
+        source_rev: source_rev.as_deref(),
+        abi_surface_hex: &epoch_hex,
+        input_digest_hex: None,
+        ci_digest_hex: None,
+    };
+    let deps = crate::project::dependencies(&project_root)
+        .unwrap_or_default()
+        .iter()
+        .map(|d| d.name.clone())
+        .collect::<Vec<_>>()
+        .join(",");
+    let deps = (!deps.is_empty()).then_some(deps);
+
+    let store = open_store(store_dir)?;
+    let txn = store
+        .begin_publish()
+        .map_err(|e| Error::Config(e.to_string()))?;
+    let prepared = store
+        .prepare_bundle(
+            &BundleArtifact {
+                workload_json: &workload_json,
+                resources_json: &resources_json,
+                graph_yaml: &graph_yaml,
+                modules: &modules,
+                ref_name: &ref_name,
+            },
+            &meta,
+        )
+        .map_err(|e| Error::Config(e.to_string()))?;
+    let version = identity.version.clone();
+    let prepared = vec![prepared];
+    let (committed, report) = store
+        .read_index()
+        .and_then(|index| {
+            store.plan_publish(
+                &index,
+                &identity.name,
+                &version,
+                &prepared,
+                deps.as_deref(),
+                &[],
+            )
+        })
+        .and_then(|plan| store.commit_plan(&txn, plan, prepared, Some(&project_root)))
+        .map_err(|e| Error::Config(e.to_string()))?;
+    if !report.is_empty() {
+        eprint!(
+            "\npublish bundle {ref_name} — displacement report{}",
+            oci_store::render_displacement(&report)
+        );
+    }
+    let digest = committed
+        .iter()
+        .find(|d| d.annotations.get(ANN_REF_NAME) == Some(&ref_name))
+        .map(|d| d.digest.clone())
+        .unwrap_or_default();
+    println!(
+        "{ref_name} -> {digest} ({} module(s), project {})",
+        modules.len(),
+        identity.name
+    );
     Ok(())
 }
 
@@ -345,7 +451,6 @@ pub fn dispatch_store(args: StoreArgs) -> Result<()> {
             forget_missing,
             dry_run,
         } => cmd_store_gc(store.as_deref(), retain_days, forget_missing, dry_run),
-        StoreCommand::Restamp { store } => cmd_store_restamp(store.as_deref()),
     }
 }
 
@@ -380,10 +485,7 @@ fn cmd_store_fsck(store_dir: Option<&Path>, repair: bool) -> Result<()> {
             report.index_faults.len()
         )));
     }
-    println!(
-        "
-fsck: every pin resolves."
-    );
+    println!("\nfsck: every pin resolves.");
     Ok(())
 }
 
@@ -398,7 +500,8 @@ fn cmd_store_gc(
         let report = fluxor_tools::store_maint::fsck(&store, false)
             .map_err(|e| Error::Config(e.to_string()))?;
         println!(
-            "gc --dry-run: {} of {} blobs are unreachable from any root ({:.1} GiB);              {} already quarantined",
+            "gc --dry-run: {} of {} blobs are unreachable from any root ({:.1} GiB); \
+             {} already quarantined",
             report.blobs_total - report.blobs_live,
             report.blobs_total,
             report.reclaimable as f64 / (1u64 << 30) as f64,
@@ -410,7 +513,8 @@ fn cmd_store_gc(
         .gc(retain_days, forget_missing)
         .map_err(|e| Error::Config(e.to_string()))?;
     println!(
-        "gc: {} blob(s) quarantined, {} deleted after {retain_days}d ({:.1} GiB freed),          {} still held",
+        "gc: {} blob(s) quarantined, {} deleted after {retain_days}d ({:.1} GiB freed), \
+         {} still held",
         report.quarantined.len(),
         report.deleted.len(),
         report.bytes_freed as f64 / (1u64 << 30) as f64,
@@ -418,23 +522,6 @@ fn cmd_store_gc(
     );
     for checkout in &report.forgotten {
         println!("  forgot ledger entry for {}", checkout.display());
-    }
-    Ok(())
-}
-
-fn cmd_store_restamp(store_dir: Option<&Path>) -> Result<()> {
-    let store = open_store(store_dir)?;
-    let report = store.restamp().map_err(|e| Error::Config(e.to_string()))?;
-    println!(
-        "restamp: {} manifest(s) rewritten, {} already clean, {} provenance row(s) filed",
-        report.moved.len(),
-        report.already_clean,
-        report.rows_filed
-    );
-    if !report.moved.is_empty() {
-        println!(
-            "  Each rewritten digest is recorded as an alias, so lockfiles written \n             \x20 beforehand keep resolving. Run `fluxor update` in each consumer at \n             \x20 leisure; after this, a publish that changes nothing moves no pin."
-        );
     }
     Ok(())
 }
@@ -453,8 +540,10 @@ fn cmd_store_push(
     let desc = store_remote::push(&store, reference, &remote, &client)
         .map_err(|e| Error::Config(e.to_string()))?;
     println!(
-        "\x1b[1;32mPushed\x1b[0m {reference} → {}/{}:{} ({})",
-        remote.host, remote.repo, remote.reference, desc.digest
+        "\x1b[1;32mPushed\x1b[0m {reference} → {}/{} ({})",
+        remote.host,
+        remote.name(),
+        desc.digest
     );
     Ok(())
 }
@@ -476,8 +565,10 @@ fn cmd_store_pull(
         .map(str::to_string)
         .unwrap_or_else(|| format!("{}:{}", remote.repo, remote.reference));
     println!(
-        "\x1b[1;32mPulled\x1b[0m {}/{}:{} → {tag} ({})",
-        remote.host, remote.repo, remote.reference, desc.digest
+        "\x1b[1;32mPulled\x1b[0m {}/{} → {tag} ({})",
+        remote.host,
+        remote.name(),
+        desc.digest
     );
     Ok(())
 }
@@ -490,8 +581,8 @@ fn cmd_store_ls(store_dir: Option<&Path>, provenance: Option<&str>, json: bool) 
     let ann = |d: &oci_store::Descriptor, key: &str| -> String {
         d.annotations.get(key).cloned().unwrap_or_default()
     };
-    // Provenance lives beside the manifest, not inside it — so that
-    // re-stamping it cannot move the digest everything downstream pins.
+    // Provenance lives beside the manifest, not inside it, so that recording
+    // it cannot move the digest everything downstream pins.
     // Reading it is one file open per artifact, against a local store.
     let latest = |d: &oci_store::Descriptor| store.latest_provenance(&d.digest);
     let mut entries: Vec<&oci_store::Descriptor> = index
@@ -568,7 +659,7 @@ struct ModulePin {
 
 /// Read the project's `[[artifact]]` module pins. `Ok(None)` when the
 /// lockfile is absent or pins no modules; `Err` when it exists but is
-/// unreadable/legacy-shape — which names are pinned is then unknowable,
+/// unreadable — which names are pinned is then unknowable,
 /// and guessing "none" would let packaging silently consume unpinned
 /// bytes.
 fn read_module_pins(project_root: &Path) -> Result<Option<Vec<ModulePin>>> {
@@ -613,8 +704,8 @@ fn cmd_store_pin(
         .map_err(|e| Error::Config(e.to_string()))?
         .ok_or_else(|| {
             Error::Config(format!(
-                "'{reference}' is not a pinnable artifact (no kind annotation — \
-                 published by an older tool; re-publish it)"
+                "'{reference}' is not a pinnable artifact (it carries no \
+                 `io.fluxor.kind` annotation)"
             ))
         })?;
     if artifact.kind == "module" {
@@ -625,6 +716,18 @@ fn cmd_store_pin(
         store
             .module_fmod_blob(&manifest)
             .map_err(|e| Error::Config(e.to_string()))?;
+    }
+    if artifact.kind == "bundle" {
+        // Fail now, not at sync time, if any layer is unreadable: a pinned
+        // bundle is consumed whole.
+        let manifest = store
+            .read_manifest(&desc)
+            .map_err(|e| Error::Config(e.to_string()))?;
+        for layer in &manifest.layers {
+            store
+                .read_blob(&layer.digest)
+                .map_err(|e| Error::Config(format!("bundle '{}': {e}", artifact.name)))?;
+        }
     }
     store_resolve::pin_artifact(&pr, &artifact).map_err(|e| Error::Config(e.to_string()))?;
     println!(
@@ -687,11 +790,7 @@ pub fn lock_store_resolver(
         let Some(pin) = pins.iter().find(|p| p.name == name) else {
             return StorePin::NotPinned;
         };
-        // A pin written before provenance moved out of the manifest
-        // names a digest the store may no longer hold; the alias leads
-        // to the manifest that replaced it, byte-identical in layers.
-        let digest = store.resolve_pin(&pin.digest);
-        let manifest_bytes = match store.read_blob(&digest) {
+        let manifest_bytes = match store.read_blob(&pin.digest) {
             Ok(b) => b,
             Err(e) => return StorePin::Failed(e.to_string()),
         };
@@ -816,7 +915,7 @@ pub fn lock_store_manifest_resolver(
             }
         };
         let pin_id = format!("pin {} ({})", pin.reference, pin.digest);
-        let manifest_bytes = match store.read_blob(&store.resolve_pin(&pin.digest)) {
+        let manifest_bytes = match store.read_blob(&pin.digest) {
             Ok(b) => b,
             Err(e) => return ManifestPin::Failed(format!("{pin_id}: {e}")),
         };

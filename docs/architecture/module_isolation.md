@@ -82,8 +82,17 @@ Provider opcodes pass through a default-deny rule table:
 - The time, entropy, log, telemetry, report, event, arena and `storage.object`
   opcodes are listed, each with its direction and handle kind.
 - An opcode the table does not name is refused with `EACCES`.
-- A struct that carries pointers (the `storage.object` requests) is copied
-  into kernel memory, and every embedded pointer is checked before dispatch.
+- A struct that carries pointers (the `storage.object` `PUT`, `HEAD`,
+  `RANGE_GET`, `DELETE` and `LIST` requests) is copied into kernel memory,
+  and every embedded pointer is checked before dispatch. The gateway copies
+  at most 544 bytes of such a struct, sized to the largest `LIST` request: a
+  prefix and a cursor of `STORAGE_KEY_MAX` (255) bytes each, so a gated caller can
+  resume a listing at any key a provider holds.
+- The `storage.object` ops a guarded store admits under a grant (`PUT`, `GET`,
+  `HEAD`, `DELETE`, `LIST`) take either `-1` or a handle the gateway minted for
+  the caller, never another module's grant. `PRESENT` carries no pointer, since
+  its refusal is written into the request itself, so a gated caller can present
+  the longest capability chain however far it runs past the struct copy.
 - A channel ioctl is admitted only for the kernel's built-in commands and the
   `storage.block` requests. A block request's buffer is checked like any
   embedded pointer: private memory for a read, readable memory for a write.

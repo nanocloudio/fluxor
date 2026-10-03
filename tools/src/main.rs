@@ -32,6 +32,7 @@ mod asset_bank;
 )]
 mod b64;
 mod board;
+mod capability;
 mod capacity;
 mod ci;
 mod config;
@@ -76,6 +77,9 @@ pub(crate) use fluxor_tools::store_sync;
 // `lifecycle`), so re-export the lib's single copies.
 pub(crate) use fluxor_tools::ci_schema;
 pub(crate) use fluxor_tools::makefile_lint;
+// `ci.rs` checks service bundles through `crate::service_params`, which is
+// lib-only; the bin reaches the lib's single copy.
+pub(crate) use fluxor_tools::service_params;
 mod project;
 pub mod reconfigure;
 mod render_template;
@@ -160,7 +164,7 @@ fn main() {
             emit,
             check,
             firmware,
-            modules_dir,
+            module_root,
             target,
             epoch,
         } => cmd_build_dispatch(
@@ -170,7 +174,7 @@ fn main() {
                 emit,
                 check,
                 firmware,
-                modules_dir,
+                module_root,
                 target,
                 epoch,
             },
@@ -188,7 +192,10 @@ fn main() {
             base_port,
             http_offset,
             vars,
+            params,
+            params_file,
             ca,
+            module_root,
             args,
         } => (|| {
             // `-` reads the config from stdin into a scratch file, so a
@@ -203,11 +210,29 @@ fn main() {
                     "run --ca does not apply to --replicas templates".into(),
                 ));
             }
+            let params = workload_src::RunParams {
+                flags: params,
+                file: params_file,
+                module_root: module_root.clone(),
+            };
+            if !params.is_empty() && replicas.is_some() {
+                return Err(Error::Config(
+                    "run --param/--params apply to a service bundle, not --replicas templates"
+                        .into(),
+                ));
+            }
             match replicas {
                 // `--replicas` renders the template once per replica and
                 // spawns them side-by-side.
                 Some(n) => match config.as_ref() {
-                    Some(template) => up::cmd_up(template, n, base_port, http_offset, &vars, None),
+                    Some(template) => up::cmd_up(
+                        template,
+                        n,
+                        base_port,
+                        http_offset,
+                        &vars,
+                        module_root.as_deref(),
+                    ),
                     None => Err(Error::Config(
                         "run --replicas needs a template config argument".into(),
                     )),
@@ -222,6 +247,8 @@ fn main() {
                         list,
                         open,
                         ca,
+                        module_root,
+                        params,
                         args,
                     },
                     verbose,
@@ -237,7 +264,10 @@ fn main() {
         Commands::Install { bundle, name, link } => {
             workload_src::install_applet(&bundle, name.as_deref(), link.as_deref(), verbose)
         }
-        Commands::Flash { config } => cmd_flash(&config, verbose),
+        Commands::Flash {
+            config,
+            module_root,
+        } => cmd_flash(&config, module_root.as_deref(), verbose),
         Commands::RenderTemplate {
             template,
             vars,
@@ -318,7 +348,11 @@ fn main() {
             ModulesAction::List { project_root, json } => {
                 cmd_modules_list(project_root.as_deref(), json)
             }
-            ModulesAction::Resolve { target, out } => cmd_modules_resolve(&target, &out),
+            ModulesAction::Resolve {
+                target,
+                out,
+                module_root,
+            } => cmd_modules_resolve(&target, &out, module_root.as_deref()),
             ModulesAction::Pack {
                 input,
                 output,
@@ -330,6 +364,47 @@ fn main() {
                 cmd_sign(&input, &key, output.as_deref(), verbose)
             }
             ModulesAction::Keygen { key, force } => cmd_keygen(&key, force),
+            ModulesAction::Cap { action } => match action {
+                CapAction::Mint {
+                    key,
+                    object,
+                    scope,
+                    perms,
+                    not_before,
+                    not_after,
+                    chain,
+                } => capability::cmd_mint(
+                    &key,
+                    object.as_deref(),
+                    scope.as_deref(),
+                    &perms,
+                    &not_before,
+                    &not_after,
+                    chain.as_deref(),
+                ),
+                CapAction::Delegate {
+                    key,
+                    to,
+                    perms,
+                    not_before,
+                    not_after,
+                    chain,
+                } => capability::cmd_delegate(
+                    &key,
+                    &to,
+                    &perms,
+                    &not_before,
+                    &not_after,
+                    chain.as_deref(),
+                ),
+                CapAction::Verify {
+                    root,
+                    object,
+                    perms,
+                    chain,
+                } => capability::cmd_verify(&root, &object, &perms, &chain),
+                CapAction::Inspect { chain } => capability::cmd_inspect(&chain),
+            },
         },
         Commands::Gpu { action } => match action {
             GpuAction::Pack {
@@ -453,17 +528,18 @@ fn cmd_publish(
         ));
     }
     if let Some(PublishAction::Bundle {
-        bundle_dir,
+        bundle,
         store,
         tag,
         published,
     }) = action
     {
         return store_cli::cmd_bundle_publish(
-            &bundle_dir,
+            &bundle,
             store.as_deref(),
             tag.as_deref(),
             published,
+            verbose,
         );
     }
     if let Some(PublishAction::Image {

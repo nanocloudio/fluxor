@@ -21,9 +21,9 @@
 //! green. A zero digest (no injection) resolves, flagged unverified.
 //!
 //! **Boot-epoch re-anchoring:** device records carry free-running monotonic
-//! micros (`standards/observability.md` §4). Each source's boot epoch is
-//! estimated as `recv_wall − t_micros` (an upper bound tightened over time);
-//! a device timestamp that jumps backwards is a reboot — the epoch resets,
+//! micros. Each source's boot epoch is estimated as `recv_wall − t_micros`
+//! (an upper bound tightened over time); a device timestamp that jumps
+//! backwards is a reboot — the epoch resets,
 //! which is also what gives OTLP its `startTimeUnixNano` and Prometheus its
 //! counter-reset semantics, for free.
 

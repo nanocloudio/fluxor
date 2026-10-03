@@ -1081,7 +1081,7 @@ registerProcessor('pcm-ring', PcmRing);
     };
 
     // Immediate children under `prefix`, deduped and name-sorted (stable
-    // order so integer-cursor paging is deterministic). A name that is
+    // order so paging by name is deterministic). A name that is
     // both a leaf and a sub-prefix resolves to a namespace.
     const nsListChildren = (prefix) => {
       let pfx = prefix;
@@ -1359,58 +1359,55 @@ registerProcessor('pcm-ring', PcmRing);
         }
       },
 
-      // LIST one page: entries [name_len:u8][kind:u8][name] then a
-      // trailing [0xFF][0xFF][cursor_len:u8][cursor] record — a 4-byte
-      // LE next-index when more remain, cursor_len=0 at end of listing.
-      host_ns_list: (prefixPtr, prefixLen, cursorIdx, outPtr, outCap) => {
+      // LIST one page: entries [name_len:u8][kind:u8][name] then a trailing
+      // [0xFF][0xFF][cursor_len:u8][cursor] record. Names are in ascending
+      // byte order of their UTF-8 encoding; the cursor is the last name the
+      // page returned and the page resumes strictly after the cursor name,
+      // so a write behind it never shifts what follows. cursor_len=0 ends
+      // the listing.
+      host_ns_list: (prefixPtr, prefixLen, cursorPtr, cursorLen, outPtr, outCap) => {
         try {
-          const children = nsListChildren(kstr(prefixPtr, prefixLen));
+          const KEY_MAX = 255;
+          const enc = new TextEncoder();
+          const cmp = (a, b) => {
+            const n = Math.min(a.length, b.length);
+            for (let i = 0; i < n; i++) if (a[i] !== b[i]) return a[i] - b[i];
+            return a.length - b.length;
+          };
+          const cursor = cursorLen > 0 ? kview(cursorPtr, cursorLen).slice() : null;
+          const children = nsListChildren(kstr(prefixPtr, prefixLen))
+            .map(([n, kind]) => [enc.encode(n), kind])
+            .sort((x, y) => cmp(x[0], y[0]))
+            // The empty name is the end-of-listing cursor, never an entry (a
+            // key with an empty segment, `a//b`, would otherwise make one).
+            .filter(([n]) => n.length > 0 && (cursor === null || cmp(n, cursor) > 0));
           const out = kview(outPtr, outCap);
           let w = 0;
-          let i = cursorIdx >>> 0;
+          let last = null;
+          let i = 0;
           for (; i < children.length; i++) {
-            const name = new TextEncoder().encode(children[i][0]);
-            // `name_len` is one byte. A longer name is refused, not
-            // skipped: a short page the caller believes is complete is
-            // the same silent loss the two-byte trailer exists to stop.
-            if (name.length > 255) return -75; // EOVERFLOW
-            const need = 2 + name.length;
-            // Always leave room for the worst-case trailing cursor (7 B).
-            if (w + need + 7 > outCap) break;
+            const name = children[i][0];
+            // A longer name is refused, not skipped: a short page the caller
+            // believes is complete is a silent loss.
+            if (name.length > KEY_MAX) return -75; // EOVERFLOW
+            // The entry and the trailer that resumes after it (3 + its name).
+            if (w + 2 + name.length + 3 + name.length > outCap) break;
             out[w++] = name.length;
             out[w++] = children[i][1] === 'namespace' ? NS_KIND_NAMESPACE : NS_KIND_OBJECT;
             out.set(name, w); w += name.length;
+            last = name;
           }
-          // The trailing cursor record is MANDATORY — a caller parses it
-          // to learn whether more pages remain. Out-of-range writes on a
-          // too-small typed array are silent no-ops, so without an
-          // explicit check we'd return a positive count over a buffer
-          // that never actually received the trailer, leaving the caller
-          // to parse stale/malformed bytes. Fail with EINVAL instead:
-          //   - more entries remain but nothing fit (w === 0): the buffer
-          //     can't even hold one entry + the 6-byte cursor, so the
-          //     caller could never advance — reject rather than hand back
-          //     an empty page that re-polls forever;
-          //   - end-of-listing but no room for the 2-byte terminator.
-          // (When the loop DID emit entries it already reserved 6 B.)
           const more = i < children.length;
-          if (more) {
-            if (w === 0 || w + 7 > outCap) return -22; // EINVAL — buffer too small to page
-          } else if (w + 3 > outCap) {
-            return -22; // EINVAL — no room for end-of-listing marker
-          }
-          // Two marker bytes. The second lands where an entry carries
-          // its `kind`, which is never 0xFF, so a 255-byte name can no
-          // longer be read as the end of the page.
+          // A page that cannot hold the next entry made no progress.
+          if (more && last === null) return -12; // ENOMEM
+          const cur = more ? last : new Uint8Array(0);
+          if (w + 3 + cur.length > outCap) return -12; // ENOMEM
+          // The second 0xFF lands where an entry carries its `kind`, which is
+          // never 0xFF, so a 255-byte name cannot read as the end of the page.
           out[w++] = 0xFF;
           out[w++] = 0xFF;
-          if (more) {
-            out[w++] = 4;
-            out[w++] = i & 0xff; out[w++] = (i >>> 8) & 0xff;
-            out[w++] = (i >>> 16) & 0xff; out[w++] = (i >>> 24) & 0xff;
-          } else {
-            out[w++] = 0; // end of listing
-          }
+          out[w++] = cur.length;
+          out.set(cur, w); w += cur.length;
           return w;
         } catch (err) {
           console.error(`host_ns_list threw: ${err.message}`);
@@ -2320,117 +2317,187 @@ registerProcessor('pcm-ring', PcmRing);
               return r;
             },
             provider_call: (h, op, p, l) => {
-              // storage.namespace LIST (op 0x1302) is special: its output
-              // buffer + fence are passed as pointers EMBEDDED in the arg
-              // blob (into the CHILD's memory), not as direct args. The
-              // generic arg copy-back below can't follow embedded pointers,
-              // so the provider's page would be written into kernel memory
-              // at a child address and never reach the module (empty LIST).
-              // Bridge them explicitly: alloc kernel scratch, rewrite the
-              // embedded pointers to it, then copy the results back to the
-              // child. Arg layout (see contracts/storage/namespace.rs LIST):
-              //   [prefix_len u16][prefix][cursor_len u16][cursor]
-              //   [out_buf u64][out_cap u32][fence_ptr u64][fence_cap u16]
-              const NS_LIST_OP = 0x1302;
-              if (op === NS_LIST_OP && p && l >= 26) {
+              // The buffer primitive's acquire record carries an address in
+              // the KERNEL's memory, which names nothing in this module's
+              // own memory, so zero-copy acquisition is not offered across
+              // the bridge: an acquire answers ENOTSUP with a zeroed record
+              // and the module falls back to channel_read/channel_write.
+              // With nothing acquirable, a release is ENOTSUP too.
+              const BUF_ACQUIRE_WRITE = 0x0A00, BUF_ACQUIRE_READ = 0x0A02;
+              const BUF_ACQUIRE_INPLACE = 0x0A04, ACQUIRED_SIZE = 16, ENOTSUP = -95;
+              if (op >= BUF_ACQUIRE_WRITE && op <= BUF_ACQUIRE_INPLACE) {
+                const acquire = op === BUF_ACQUIRE_WRITE || op === BUF_ACQUIRE_READ
+                  || op === BUF_ACQUIRE_INPLACE;
+                if (acquire && p) childMem().fill(0, p, p + Math.min(l, ACQUIRED_SIZE));
+                return ENOTSUP;
+              }
+              // Requests that embed pointers into the CHILD's memory. Copied
+              // as they are, the provider would write through a child address
+              // into kernel memory: the module never sees the result and the
+              // kernel is corrupted. Each layout names the embedded output
+              // buffers as `[pointer offset, capacity offset, capacity width,
+              // whole]` (`whole`: copy the full buffer back, as for a fence,
+              // rather than the count the call returns). The bridge points
+              // them at kernel scratch, calls, and copies the results back. A
+              // null child pointer stays null, so the provider refuses it as
+              // it would a direct caller's.
+              const at16 = (dv, o) => (o + 2 <= dv.byteLength ? dv.getUint16(o, true) : -1);
+              const at8 = (dv, o) => (o < dv.byteLength ? dv.getUint8(o) : -1);
+              const embedded = {
+                // storage.namespace LIST:
+                // [prefix_len u16][prefix][cursor_len u16][cursor]
+                // [out u64][out_cap u32][fence u64][fence_cap u16]
+                0x1302: (dv) => {
+                  const pl = at16(dv, 0); const cl = pl < 0 ? -1 : at16(dv, 2 + pl);
+                  if (cl < 0) return null;
+                  const o = 4 + pl + cl;
+                  return [[o, o + 8, 4, false], [o + 12, o + 20, 2, true]];
+                },
+                // RENAME: [src_len u16][src][dst_len u16][dst][flags u8][fence]
+                0x1303: (dv) => {
+                  const sl = at16(dv, 0); const dl = sl < 0 ? -1 : at16(dv, 2 + sl);
+                  if (dl < 0) return null;
+                  const o = 4 + sl + dl + 1;
+                  return [[o, o + 8, 2, true]];
+                },
+                // namespace DELETE: [path_len u16][path][flags u8][fence]
+                0x1304: (dv) => {
+                  const pl = at16(dv, 0);
+                  if (pl < 0) return null;
+                  const o = 2 + pl + 1;
+                  return [[o, o + 8, 2, true]];
+                },
+                // BIND: [path_len u16][path][kind u8][flags u8]
+                // [target_len u16][target][fence]
+                0x1308: (dv) => {
+                  const pl = at16(dv, 0); const tl = pl < 0 ? -1 : at16(dv, 2 + pl + 2);
+                  if (tl < 0) return null;
+                  const o = 2 + pl + 4 + tl;
+                  return [[o, o + 8, 2, true]];
+                },
+                // HEAD: [key_len u16][key][out u64][out_cap u32][fence]
+                0x1422: (dv) => {
+                  const kl = at16(dv, 0);
+                  if (kl < 0) return null;
+                  const o = 2 + kl;
+                  return [[o, o + 8, 4, false], [o + 12, o + 20, 2, true]];
+                },
+                // RANGE_GET: [offset u64][length u32][out u64]
+                0x1423: () => [[12, 8, 4, false]],
+                // object DELETE: [key_len u16][key][precondition u8]
+                // [etag_len u8][etag][fence]
+                0x1424: (dv) => {
+                  const kl = at16(dv, 0); const el = kl < 0 ? -1 : at8(dv, 2 + kl + 1);
+                  if (el < 0) return null;
+                  const o = 2 + kl + 2 + el;
+                  return [[o, o + 8, 2, true]];
+                },
+                // PUT_STREAMED_COMMIT: [fence]
+                0x1428: () => [[0, 8, 2, true]],
+                // object LIST: [prefix_len u16][prefix][cursor_len u16]
+                // [cursor][max_keys u16][out u64][out_cap u32][fence]
+                0x142A: (dv) => {
+                  const pl = at16(dv, 0); const cl = pl < 0 ? -1 : at16(dv, 2 + pl);
+                  if (cl < 0) return null;
+                  const o = 4 + pl + cl + 2;
+                  return [[o, o + 8, 4, false], [o + 12, o + 20, 2, true]];
+                },
+              };
+              if (embedded[op]) {
+                const EINVAL = -22, ENOMEM = -12;
+                if (!p) return EINVAL;
                 const cbuf = childMem();
+                if (p + l > cbuf.length) return EINVAL;
                 const cdv = new DataView(cbuf.buffer, cbuf.byteOffset + p, l);
-                const prefixLen = cdv.getUint16(0, true);
-                const cursorOff = 2 + prefixLen;
-                if (cursorOff + 2 <= l) {
-                  const cursorLen = cdv.getUint16(cursorOff, true);
-                  const oOff = cursorOff + 2 + cursorLen; // start of out_buf
-                  if (oOff + 22 <= l) {
-                    const outBufChild = cdv.getUint32(oOff, true);       // u64 lo
-                    const outCap = cdv.getUint32(oOff + 8, true);
-                    const fenceChild = cdv.getUint32(oOff + 12, true);   // u64 lo
-                    const fenceCap = cdv.getUint16(oOff + 20, true);
-                    const k = childToKernel(p, l);
-                    if (!k) return -1;
-                    const outK = outCap ? getKernel().exports.kernel_heap_alloc(outCap) : 0;
-                    const fenceK = fenceCap ? getKernel().exports.kernel_heap_alloc(fenceCap) : 0;
-                    // Rewrite the embedded pointers in the kernel arg copy to
-                    // point at the kernel scratch (both u64: set lo + zero hi).
-                    const kbuf = kmem();
-                    const kdv = new DataView(kbuf.buffer, kbuf.byteOffset + k, l);
-                    kdv.setUint32(oOff, outK, true); kdv.setUint32(oOff + 4, 0, true);
-                    kdv.setUint32(oOff + 12, fenceK, true); kdv.setUint32(oOff + 16, 0, true);
-                    const r = getKernel().exports.provider_call(h, op, k, l);
-                    if (r > 0 && outK && outBufChild) {
-                      kernelToChild(outK, outBufChild, Math.min(r, outCap));
-                    }
-                    if (fenceK && fenceChild) kernelToChild(fenceK, fenceChild, fenceCap);
-                    if (outK) getKernel().exports.kernel_heap_free(outK);
-                    if (fenceK) getKernel().exports.kernel_heap_free(fenceK);
-                    getKernel().exports.kernel_heap_free(k);
-                    return r;
+                const layout = embedded[op](cdv);
+                if (!layout) return EINVAL;
+                const bufs = [];
+                for (const [at, capAt, capWidth, whole] of layout) {
+                  if (at + 8 > l || capAt + capWidth > l) return EINVAL;
+                  const child = Number(cdv.getBigUint64(at, true));
+                  const cap = capWidth === 4 ? cdv.getUint32(capAt, true) : cdv.getUint16(capAt, true);
+                  if (child && child + cap > cbuf.length) return EINVAL;
+                  bufs.push({ at, child, cap, whole, kp: 0 });
+                }
+                const ex = getKernel().exports;
+                const k = childToKernel(p, l);
+                const release = () => {
+                  for (const b of bufs) if (b.kp) ex.kernel_heap_free(b.kp);
+                  if (k) ex.kernel_heap_free(k);
+                };
+                if (!k) return ENOMEM;
+                for (const b of bufs) {
+                  if (!b.child) continue;
+                  b.kp = ex.kernel_heap_alloc(Math.max(b.cap, 1));
+                  if (!b.kp) { release(); return ENOMEM; }
+                }
+                const kbuf = kmem();
+                const kdv = new DataView(kbuf.buffer, kbuf.byteOffset + k, l);
+                for (const b of bufs) kdv.setBigUint64(b.at, BigInt(b.kp), true);
+                const r = ex.provider_call(h, op, k, l);
+                if (r >= 0) {
+                  for (const b of bufs) {
+                    const n = b.whole ? b.cap : Math.min(r, b.cap);
+                    if (b.kp && n > 0) kernelToChild(b.kp, b.child, n);
                   }
                 }
+                release();
+                return r;
               }
-              // storage.object PUT (0x1420) embeds body_ptr + fence_out_ptr
-              // (child addresses) in the arg. Unbridged, the provider would
-              // read the body from an untranslated child address in KERNEL
-              // memory (persisting garbage) and write the fence to a child
-              // address in kernel memory (heap corruption). Copy the body
-              // through kernel scratch and rewrite both pointers.
+              // storage.object PUT (0x1420) embeds body_ptr and fence_out_ptr
+              // (child addresses) in the arg, and the body can be megabytes.
+              // Rather than stage it through kernel heap scratch, the PUT is
+              // served here from child memory with the wasm provider's own
+              // rules (`object.rs::obj_put`): a key of 1..=255 UTF-8 bytes,
+              // `ANY` as the only precondition (others are ENOSYS), a fence
+              // buffer of at least WIRE_MAX_LEN bytes, and a Volatile fence on
+              // success.
               // Arg: [key_len:u16][key][ct_len:u8][ct][body_ptr:u64]
-              //      [body_len:u64][if_match_len:u8][if_match]
+              //      [body_len:u64][precondition:u8][etag_len:u8][etag]
               //      [fence_ptr:u64][fence_cap:u16]
-              const OBJ_PUT_OP = 0x1420, OBJ_RANGE_GET_OP = 0x1423;
-              if (op === OBJ_PUT_OP && p && l >= 2) {
-                // Service the PUT directly from child memory: the kernel
-                // path would need the whole (multi-MB) body staged through
-                // kernel heap scratch just to end up in THIS closure's
-                // host_object_put anyway. Same semantics (objStore +
-                // OPFS persist), zero kernel-heap pressure. The fence is
-                // left zeroed (the fence buffer lives child-side and the
-                // wasm store is LocalDurable-at-best anyway).
+              const OBJ_PUT_OP = 0x1420;
+              if (op === OBJ_PUT_OP) {
+                const EINVAL = -22, ENOSYS = -38, ENODEV = -19;
+                const KEY_MAX = 255, FENCE_WIRE_MAX = 62, TAG_VOLATILE = 0;
                 try {
+                  if (!p || l < 2) return EINVAL;
                   const cbuf = childMem();
+                  if (p + l > cbuf.length) return EINVAL;
                   const cdv = new DataView(cbuf.buffer, cbuf.byteOffset + p, l);
                   const keyLen = cdv.getUint16(0, true);
+                  if (keyLen === 0 || keyLen > KEY_MAX) return EINVAL;
                   const ctOff = 2 + keyLen;
-                  if (keyLen === 0 || ctOff + 1 > l) return -1;
-                  const ctLen = cdv.getUint8(ctOff);
-                  const bodyOff = ctOff + 1 + ctLen;
-                  if (bodyOff + 17 > l) return -1;
-                  const bodyChild = cdv.getUint32(bodyOff, true);          // u64 lo
+                  if (ctOff + 1 > l) return EINVAL;
+                  const bodyOff = ctOff + 1 + cdv.getUint8(ctOff);
+                  if (bodyOff + 18 > l) return EINVAL;
+                  const bodyChild = Number(cdv.getBigUint64(bodyOff, true));
                   const bodyLen = Number(cdv.getBigUint64(bodyOff + 8, true));
-                  const ifLen = cdv.getUint8(bodyOff + 16);
-                  if (ifLen !== 0) return -38;                             // ENOSYS, like the kernel
-                  const key = new TextDecoder().decode(cbuf.subarray(p + 2, p + 2 + keyLen));
+                  const precondition = cdv.getUint8(bodyOff + 16);
+                  const fenceOff = bodyOff + 18 + cdv.getUint8(bodyOff + 17);
+                  if (fenceOff + 10 > l) return EINVAL;
+                  if (precondition !== 0) return ENOSYS;
+                  // The fence buffer must be able to receive the fence.
+                  const fenceChild = Number(cdv.getBigUint64(fenceOff, true));
+                  const fenceCap = cdv.getUint16(fenceOff + 8, true);
+                  if (!fenceChild || fenceCap < FENCE_WIRE_MAX
+                    || fenceChild + FENCE_WIRE_MAX > cbuf.length) return EINVAL;
+                  if (bodyLen > 0 && bodyChild + bodyLen > cbuf.length) return EINVAL;
+                  let key;
+                  try {
+                    key = new TextDecoder('utf-8', { fatal: true })
+                      .decode(cbuf.subarray(p + 2, p + 2 + keyLen));
+                  } catch (_err) {
+                    return EINVAL;
+                  }
                   const body = cbuf.slice(bodyChild, bodyChild + bodyLen);
                   objStore.set(key, body);
                   opfsPersist(key, body);
+                  cbuf[fenceChild] = TAG_VOLATILE;
                   return 0;
                 } catch (err) {
                   console.error(`module OBJ_PUT bridge threw: ${err.message}`);
-                  return -1;
+                  return ENODEV;
                 }
-              }
-              // storage.object RANGE_GET (0x1423) embeds out_ptr (child):
-              // unbridged, the provider writes the window into kernel memory
-              // at the child address — the module never sees the bytes AND
-              // kernel memory is corrupted. Alloc kernel scratch, rewrite,
-              // copy the read bytes back to the child.
-              // Arg: [offset:u64][length:u32][out_ptr:u64]
-              if (op === OBJ_RANGE_GET_OP && p && l >= 20) {
-                const cbuf = childMem();
-                const cdv = new DataView(cbuf.buffer, cbuf.byteOffset + p, l);
-                const rgLen = cdv.getUint32(8, true);
-                const outChild = cdv.getUint32(12, true);                 // u64 lo
-                const k = childToKernel(p, l);
-                if (!k) return -1;
-                const outK = rgLen ? getKernel().exports.kernel_heap_alloc(rgLen) : 0;
-                if (rgLen && !outK) { getKernel().exports.kernel_heap_free(k); return -1; }
-                const kbuf = kmem();
-                const kdv = new DataView(kbuf.buffer, kbuf.byteOffset + k, l);
-                kdv.setUint32(12, outK, true); kdv.setUint32(16, 0, true);
-                const r = getKernel().exports.provider_call(h, op, k, l);
-                if (r > 0 && outK && outChild) kernelToChild(outK, outChild, Math.min(r, rgLen));
-                if (outK) getKernel().exports.kernel_heap_free(outK);
-                getKernel().exports.kernel_heap_free(k);
-                return r;
               }
               const k = childToKernel(p, l);
               const r = getKernel().exports.provider_call(h, op, k, l);

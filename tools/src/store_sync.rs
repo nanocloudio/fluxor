@@ -285,6 +285,23 @@ fn runtime_layer_digest(store: &OciStore, e: &Artifact) -> Result<Option<String>
 
 // ── Materialisation ───────────────────────────────────────────────────
 
+/// `value` as one path component: a name or target taken from a lockfile
+/// entry or a bundle's `workload.json` becomes a directory or file name
+/// under the project tree, so it may hold no separator and cannot be `.`,
+/// `..` or empty.
+fn path_component<'a>(what: &str, value: &'a str) -> Result<&'a str> {
+    if value.is_empty()
+        || value == "."
+        || value == ".."
+        || value.bytes().any(|b| b == b'/' || b == b'\\' || b == 0)
+    {
+        return Err(Error::Config(format!(
+            "{what} {value:?} is not a single path component — refusing to materialise it"
+        )));
+    }
+    Ok(value)
+}
+
 fn missing_layer_err(e: &Artifact) -> Error {
     Error::Config(format!(
         "artifact '{}' ({}) has no payload layer — corrupt manifest",
@@ -310,9 +327,9 @@ fn materialize_artifact(store: &OciStore, project_root: &Path, e: &Artifact) -> 
                 .ok_or_else(|| Error::Config(format!("module '{}' pin has no target", e.name)))?;
             let dest = project_root
                 .join("target/fluxor")
-                .join(target)
+                .join(path_component("module target", target)?)
                 .join("modules")
-                .join(format!("{}.fmod", e.name));
+                .join(format!("{}.fmod", path_component("module name", &e.name)?));
             if !file_matches(&dest, &bytes) {
                 write_file_atomic(&dest, &bytes, false)?;
             }
@@ -325,7 +342,9 @@ fn materialize_artifact(store: &OciStore, project_root: &Path, e: &Artifact) -> 
                 .iter()
                 .find(|l| l.media_type == MT_FLUXOR_SOURCE)
                 .ok_or_else(|| missing_layer_err(e))?;
-            let dest = project_root.join("target/fluxor").join(&e.name);
+            let dest = project_root
+                .join("target/fluxor")
+                .join(path_component("source name", &e.name)?);
             // Skip only when the stamp names this revision AND the tree
             // still holds the bytes that revision published. Re-extraction
             // is the one thing that puts an edited tree right, so gating it
@@ -357,22 +376,166 @@ fn materialize_artifact(store: &OciStore, project_root: &Path, e: &Artifact) -> 
             })?;
             let dest = project_root
                 .join("target")
-                .join(triple)
+                .join(path_component("runtime triple", triple)?)
                 .join("release")
-                .join(&e.name);
+                .join(path_component("runtime name", &e.name)?);
             if !file_matches(&dest, &bytes) {
                 write_file_atomic(&dest, &bytes, true)?;
             }
             Ok(format!("runtime {} → {}", e.name, dest.display()))
         }
-        // Bundles are install-time artifacts (`fluxor install`); a pin
-        // keeps them alive for GC but sync has no tree location for
-        // them.
-        _ => Ok(format!(
-            "{} '{}' pinned (no tree materialisation)",
-            e.kind, e.name
-        )),
+        "bundle" => materialize_bundle(
+            store,
+            e,
+            &bundle_dir(project_root, path_component("bundle name", &e.name)?),
+        ),
+        other => Err(Error::Config(format!(
+            "artifact '{}' has kind '{other}', which sync does not know how to materialise",
+            e.name
+        ))),
     }
+}
+
+/// Where a pinned bundle materialises: `target/fluxor/bundles/<name>/`.
+pub fn bundle_dir(project_root: &Path, name: &str) -> PathBuf {
+    project_root.join("target/fluxor/bundles").join(name)
+}
+
+/// Materialise one pinned bundle into `dest`, flat:
+///
+/// ```text
+/// <dest>/workload.json  graph.yaml  resources.json
+/// <dest>/modules/<module>.fmod      # every module the manifest pins
+/// <dest>/.fluxor-sync-stamp         # artifact digest + content digest
+/// ```
+///
+/// Every layer is read through `read_blob`, which hashes it against its
+/// layer digest, and is then held to `workload.json`: the graph and the
+/// resource profile must be the bytes its linux implementation pins, and
+/// each module the bytes its module reference pins. A run launches from
+/// exactly these files, so a bundle is never paired with modules other than
+/// the ones it was published with. Skipped when the stamp names this
+/// artifact and the tree still holds the bytes it was written with.
+pub fn materialize_bundle(store: &OciStore, e: &Artifact, dest: &Path) -> Result<String> {
+    use crate::oci_store::{
+        sha256_hex_prefixed, MT_FLUXOR_GRAPH, MT_FLUXOR_MODULE, MT_FLUXOR_RESOURCES,
+        MT_FLUXOR_WORKLOAD,
+    };
+    if let Some(stamp) = read_sync_stamp(dest) {
+        if stamp.digest == e.digest
+            && stamp.content.as_deref()
+                == Some(crate::store_publish::tree_content_digest(dest)?.as_str())
+        {
+            return Ok(format!("bundle {} up to date ({})", e.name, dest.display()));
+        }
+    }
+    let manifest = read_pinned_manifest(store, e)?;
+    let layer = |mt: &str| -> Result<Vec<u8>> {
+        let l = manifest
+            .layers
+            .iter()
+            .find(|l| l.media_type == mt)
+            .ok_or_else(|| missing_layer_err(e))?;
+        read_manifest_layer_blob(store, &e.name, &e.digest, &l.digest)
+    };
+    let workload_json = layer(MT_FLUXOR_WORKLOAD)?;
+    let graph_yaml = layer(MT_FLUXOR_GRAPH)?;
+    let resources_json = layer(MT_FLUXOR_RESOURCES)?;
+    let workload = crate::workload::parse_manifest(
+        std::str::from_utf8(&workload_json)
+            .map_err(|err| Error::Config(format!("bundle '{}': workload.json: {err}", e.name)))?,
+    )
+    .map_err(|err| Error::Config(format!("bundle '{}': {err}", e.name)))?;
+    let imp = workload
+        .implementations
+        .iter()
+        .find(|i| i.target.family == "linux")
+        .ok_or_else(|| {
+            Error::Config(format!(
+                "bundle '{}' has no linux implementation to materialise",
+                e.name
+            ))
+        })?;
+    for (file, bytes, pinned) in [
+        ("graph.yaml", &graph_yaml, &imp.graph.digest),
+        ("resources.json", &resources_json, &imp.resources.digest),
+    ] {
+        let actual = sha256_hex_prefixed(bytes);
+        if &actual != pinned {
+            return Err(Error::Config(format!(
+                "bundle '{}': the {file} layer is {actual} but workload.json pins {pinned}",
+                e.name
+            )));
+        }
+    }
+    let mut modules: Vec<(String, Vec<u8>)> = Vec::new();
+    for m in &imp.modules {
+        path_component(&format!("bundle '{}' module name", e.name), &m.name)?;
+        let l = manifest
+            .layers
+            .iter()
+            .find(|l| l.media_type == MT_FLUXOR_MODULE && l.digest == m.digest)
+            .ok_or_else(|| {
+                Error::Config(format!(
+                    "bundle '{}' pins module '{}' at {} but carries no layer with that digest",
+                    e.name, m.name, m.digest
+                ))
+            })?;
+        modules.push((
+            m.name.clone(),
+            read_manifest_layer_blob(store, &e.name, &e.digest, &l.digest)?,
+        ));
+    }
+    install_tree_atomic(dest, &e.digest, |tmp| {
+        fs::write(tmp.join("workload.json"), &workload_json)?;
+        fs::write(tmp.join("graph.yaml"), &graph_yaml)?;
+        fs::write(tmp.join("resources.json"), &resources_json)?;
+        fs::create_dir_all(tmp.join("modules"))?;
+        for (name, bytes) in &modules {
+            fs::write(tmp.join("modules").join(format!("{name}.fmod")), bytes)?;
+        }
+        Ok(())
+    })?;
+    Ok(format!(
+        "bundle {} ({} module(s)) → {}",
+        e.name,
+        modules.len(),
+        dest.display()
+    ))
+}
+
+/// Materialise the bundle `fluxor.lock` pins under `name`, if it pins one,
+/// and return its directory. Replays the pin; never re-resolves a tag.
+pub fn ensure_bundle(project_root: &Path, name: &str) -> Result<Option<PathBuf>> {
+    let Some(lock) = read_store_lock(project_root)? else {
+        return Ok(None);
+    };
+    let Some(e) = lock
+        .artifacts
+        .iter()
+        .find(|a| a.kind == "bundle" && a.name == name)
+    else {
+        return Ok(None);
+    };
+    let store = OciStore::open(crate::oci_store::store_root()?)?;
+    let dest = bundle_dir(project_root, path_component("bundle name", name)?);
+    materialize_bundle(&store, e, &dest)?;
+    Ok(Some(dest))
+}
+
+/// The bundle names `fluxor.lock` pins, for messages that list them.
+pub fn pinned_bundles(project_root: &Path) -> Vec<String> {
+    read_store_lock(project_root)
+        .ok()
+        .flatten()
+        .map(|l| {
+            l.artifacts
+                .into_iter()
+                .filter(|a| a.kind == "bundle")
+                .map(|a| a.name)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn file_matches(path: &Path, bytes: &[u8]) -> bool {
@@ -405,21 +568,34 @@ fn write_file_atomic(path: &Path, bytes: &[u8], executable: bool) -> Result<()> 
 }
 
 /// Extract a canonical (plain ustar, uncompressed) tar into `dest`,
-/// via temp dir + atomic swap, writing the sync stamp last inside the
-/// temp tree so a completed `dest` always carries its digest.
+/// via temp dir + atomic swap (see [`install_tree_atomic`]).
 fn extract_tree_atomic(tar: &[u8], dest: &Path, digest: &str) -> Result<()> {
+    install_tree_atomic(dest, digest, |tmp| extract_ustar(tar, tmp))
+}
+
+/// Build a tree in a temp dir beside `dest` with `fill`, stamp it with the
+/// artifact digest and the tree's content digest, then swap it into place,
+/// so a completed `dest` always carries its stamp and a failed fill leaves
+/// the previous tree standing.
+fn install_tree_atomic(
+    dest: &Path,
+    digest: &str,
+    fill: impl FnOnce(&Path) -> Result<()>,
+) -> Result<()> {
     let parent = dest
         .parent()
         .ok_or_else(|| Error::Config(format!("no parent dir for {}", dest.display())))?;
     fs::create_dir_all(parent)?;
     let base = dest.file_name().unwrap_or_default().to_string_lossy();
-    let tmp = parent.join(format!(".sync-tmp-{}-{}", base, std::process::id()));
-    let old = parent.join(format!(".sync-old-{}-{}", base, std::process::id()));
+    // The build directory is private to this call (process and sequence
+    // number), so concurrent fills never share one; the swap below is
+    // serialised by the lock.
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = parent.join(format!(".sync-tmp-{base}-{}-{seq}", std::process::id()));
     let _ = fs::remove_dir_all(&tmp);
-    let _ = fs::remove_dir_all(&old);
     fs::create_dir_all(&tmp)?;
-    let extracted = extract_ustar(tar, &tmp);
-    if let Err(err) = extracted {
+    if let Err(err) = fill(&tmp) {
         let _ = fs::remove_dir_all(&tmp);
         return Err(err);
     }
@@ -430,8 +606,37 @@ fn extract_tree_atomic(tar: &[u8], dest: &Path, digest: &str) -> Result<()> {
         tmp.join(SYNC_STAMP),
         format!("{digest}\ncontent:{content}\n"),
     )?;
+    // Two processes materialising the same destination (a `run` beside a
+    // `sync` in a shared checkout) take turns: the second finds the first's
+    // identical tree in place and leaves it alone rather than racing the
+    // swap. The lock is advisory and dies with its holder, so a crash
+    // strands no lock; the lock file itself stays, empty.
+    let lock_path = parent.join(format!(".sync-lock-{base}"));
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)?;
+    lock.lock()
+        .map_err(|e| Error::Config(format!("lock {}: {e}", lock_path.display())))?;
+    if let Some(stamp) = read_sync_stamp(dest) {
+        if stamp.digest == digest
+            && stamp.content.as_deref() == Some(content.as_str())
+            && crate::store_publish::tree_content_digest(dest)? == content
+        {
+            let _ = fs::remove_dir_all(&tmp);
+            return Ok(());
+        }
+    }
+    // Under the lock, so one name serves every process, and a displaced
+    // tree a crashed swap left behind is cleared by the next one.
+    let old = parent.join(format!(".sync-old-{base}"));
+    let _ = fs::remove_dir_all(&old);
     if dest.exists() {
-        fs::rename(dest, &old)?;
+        if let Err(err) = fs::rename(dest, &old) {
+            let _ = fs::remove_dir_all(&tmp);
+            return Err(err.into());
+        }
     }
     if let Err(err) = fs::rename(&tmp, dest) {
         // Best-effort rollback of the displaced tree.
@@ -444,11 +649,12 @@ fn extract_tree_atomic(tar: &[u8], dest: &Path, digest: &str) -> Result<()> {
 }
 
 /// Minimal ustar reader matching `canonical_tar`'s writer: regular
-/// files only, clean relative paths, uncompressed. Defensive on the
-/// same axes as the legacy `tar -x` flags: absolute paths and `..`
-/// traversal are rejected, archive mode/owner bits are ignored.
+/// files only, clean relative paths, uncompressed. Absolute paths, `.` and
+/// `..` components, a path that appears twice and a size field that is not
+/// plain octal are rejected; archive mode/owner bits are ignored.
 fn extract_ustar(tar: &[u8], dest: &Path) -> Result<()> {
     let mut off = 0usize;
+    let mut seen: BTreeSet<String> = BTreeSet::new();
     while off + 512 <= tar.len() {
         let hdr = &tar[off..off + 512];
         if hdr.iter().all(|&b| b == 0) {
@@ -459,10 +665,13 @@ fn extract_ustar(tar: &[u8], dest: &Path) -> Result<()> {
         let size = octal_field(&hdr[124..136])?;
         let typeflag = hdr[156];
         off += 512;
+        let end = off
+            .checked_add(size)
+            .ok_or_else(|| Error::Config("tar entry size overflows".into()))?;
         let data = tar
-            .get(off..off + size)
+            .get(off..end)
             .ok_or_else(|| Error::Config("truncated tar archive".into()))?;
-        off += size + (512 - size % 512) % 512;
+        off = end.saturating_add((512 - size % 512) % 512);
         if typeflag != b'0' && typeflag != 0 {
             return Err(Error::Config(format!(
                 "tar entry '{name}' is not a regular file (type {typeflag:#x}) — \
@@ -474,9 +683,18 @@ fn extract_ustar(tar: &[u8], dest: &Path) -> Result<()> {
         } else {
             format!("{prefix}/{name}")
         };
-        if path.starts_with('/') || path.split('/').any(|c| c == ".." || c.is_empty()) {
+        if path.starts_with('/')
+            || path
+                .split('/')
+                .any(|c| c.is_empty() || c == "." || c == "..")
+        {
             return Err(Error::Config(format!(
                 "tar entry has unsafe path {path:?} — refusing"
+            )));
+        }
+        if !seen.insert(path.clone()) {
+            return Err(Error::Config(format!(
+                "tar entry {path:?} appears twice — refusing"
             )));
         }
         let out = dest.join(&path);
@@ -493,13 +711,28 @@ fn header_str(field: &[u8]) -> &str {
     std::str::from_utf8(&field[..end]).unwrap_or("")
 }
 
+/// A NUL- or space-terminated octal number. Anything else (a base-256
+/// size, stray bytes) is an error rather than a size of zero, which would
+/// read the entry's data as the next header.
 fn octal_field(field: &[u8]) -> Result<usize> {
-    let s = header_str(field);
-    let s = s.trim_matches(|c: char| c == ' ' || c == '\0');
-    if s.is_empty() {
+    let end = field.iter().position(|&b| b == 0).unwrap_or(field.len());
+    let digits = field[..end].trim_ascii();
+    if digits.is_empty() {
         return Ok(0);
     }
-    usize::from_str_radix(s, 8).map_err(|e| Error::Config(format!("bad tar size field {s:?}: {e}")))
+    let bad = || {
+        Error::Config(format!(
+            "bad tar size field {:?}",
+            String::from_utf8_lossy(field)
+        ))
+    };
+    if !digits.iter().all(|b| (b'0'..=b'7').contains(b)) {
+        return Err(bad());
+    }
+    std::str::from_utf8(digits)
+        .ok()
+        .and_then(|s| usize::from_str_radix(s, 8).ok())
+        .ok_or_else(bad)
 }
 
 // ── ensure_synced ─────────────────────────────────────────────────────
@@ -606,8 +839,8 @@ pub fn workspace_publish(dry_run: bool) -> Result<Vec<(String, MemberOutcome)>> 
         }
         // Materialise this member's dependencies BEFORE building it.
         //
-        // Without this a surface migration cannot proceed: the member still
-        // holds the previous SDK under `target/fluxor/`, compiles against
+        // Without this an ABI-surface move cannot proceed: the member still
+        // holds the prior SDK under `target/fluxor/`, compiles against
         // it, and the freshly built module embeds the OLD surface digest —
         // which packaging then rejects with "compiled against a different
         // ABI surface", in a member nobody edited. Topological order is what
@@ -1062,6 +1295,128 @@ mod tests {
     }
 
     use crate::oci_store::EnvScope;
+
+    /// A name or target that is not one path component never reaches a
+    /// path join: a bundle's module name is publisher-authored.
+    #[test]
+    fn path_components_refuse_separators_and_dots() {
+        for ok in ["tls", "bcm2712", "aarch64-unknown-linux-gnu", "a.b"] {
+            assert!(path_component("name", ok).is_ok(), "{ok}");
+        }
+        for bad in ["", ".", "..", "../x", "a/b", "a\\b", "x\0y"] {
+            assert!(path_component("name", bad).is_err(), "{bad:?}");
+        }
+    }
+
+    /// A tar naming one path twice is refused rather than silently taking
+    /// the later copy; a size field running past the archive is a
+    /// truncation error, not a panic.
+    #[test]
+    fn extract_ustar_refuses_duplicates_and_overruns() {
+        let one =
+            crate::oci_store::canonical_tar(&[("a.txt".to_string(), b"hi".to_vec())]).unwrap();
+        let body = &one[..one.len() - 1024];
+        let mut twice = body.to_vec();
+        twice.extend_from_slice(body);
+        twice.extend_from_slice(&[0u8; 1024]);
+        let dir = tempfile::tempdir().unwrap();
+        let err = extract_ustar(&twice, dir.path()).unwrap_err().to_string();
+        assert!(err.contains("appears twice"), "{err}");
+
+        let dir = tempfile::tempdir().unwrap();
+        extract_ustar(&one, dir.path()).unwrap();
+        assert_eq!(std::fs::read(dir.path().join("a.txt")).unwrap(), b"hi");
+
+        let mut huge = one.clone();
+        huge[124..136].copy_from_slice(b"77777777777\0");
+        let dir = tempfile::tempdir().unwrap();
+        let err = extract_ustar(&huge, dir.path()).unwrap_err().to_string();
+        assert!(err.contains("truncated"), "{err}");
+    }
+
+    /// A size field that is not plain octal fails; read as zero it would
+    /// turn the entry's data block into a header naming a second file.
+    #[test]
+    fn extract_ustar_refuses_a_non_octal_size() {
+        let tar = crate::oci_store::canonical_tar(&[(
+            "a.txt".to_string(),
+            b"evil.txt\0".iter().copied().chain([0u8; 502]).collect(),
+        )])
+        .unwrap();
+        let mut binary = tar.clone();
+        binary[124..136].copy_from_slice(&[0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0]);
+        let dir = tempfile::tempdir().unwrap();
+        let err = extract_ustar(&binary, dir.path()).unwrap_err().to_string();
+        assert!(err.contains("bad tar size field"), "{err}");
+        assert!(!dir.path().join("evil.txt").exists());
+
+        // `.` components are refused like `..`: no two spellings of a path.
+        let dotted =
+            crate::oci_store::canonical_tar(&[("./a".to_string(), b"x".to_vec())]).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        assert!(extract_ustar(&dotted, dir.path()).is_err());
+    }
+
+    /// Two materialisations of one destination leave one consistent tree:
+    /// the second finds the first's identical tree in place.
+    #[test]
+    fn install_tree_atomic_is_idempotent_for_an_identical_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("tree");
+        let fill = |tmp: &Path| -> Result<()> {
+            std::fs::write(tmp.join("f"), b"bytes")?;
+            Ok(())
+        };
+        install_tree_atomic(&dest, "sha256:aa", fill).unwrap();
+        // A dotfile is outside the content digest, so it survives only if
+        // the second install leaves the tree in place rather than swapping.
+        std::fs::write(dest.join(".marker"), b"").unwrap();
+        install_tree_atomic(&dest, "sha256:aa", fill).unwrap();
+        assert_eq!(std::fs::read(dest.join("f")).unwrap(), b"bytes");
+        assert!(
+            dest.join(".marker").exists(),
+            "an identical tree was swapped"
+        );
+        // An edited tree is put right, not trusted by its stamp.
+        std::fs::write(dest.join("f"), b"edited").unwrap();
+        install_tree_atomic(&dest, "sha256:aa", fill).unwrap();
+        assert_eq!(std::fs::read(dest.join("f")).unwrap(), b"bytes");
+        assert!(!dest.join(".marker").exists());
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".sync-tmp-") || n.starts_with(".sync-old-"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    /// Concurrent installs of one destination each succeed and leave one
+    /// whole tree: no fill shares another's build directory, and the swap
+    /// is taken in turn.
+    #[test]
+    fn concurrent_installs_of_one_destination_all_succeed() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("tree");
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                let dest = dest.clone();
+                std::thread::spawn(move || {
+                    install_tree_atomic(&dest, "sha256:aa", |tmp| {
+                        std::fs::write(tmp.join("f"), b"bytes")?;
+                        std::thread::sleep(std::time::Duration::from_millis(30));
+                        std::fs::write(tmp.join("g"), b"more")?;
+                        Ok(())
+                    })
+                })
+            })
+            .collect();
+        for w in workers {
+            w.join().unwrap().unwrap();
+        }
+        assert_eq!(std::fs::read(dest.join("f")).unwrap(), b"bytes");
+        assert_eq!(std::fs::read(dest.join("g")).unwrap(), b"more");
+        assert!(read_sync_stamp(&dest).is_some());
+    }
 
     fn fake_project(root: &Path, name: &str, deps: &[&str]) {
         std::fs::create_dir_all(root).unwrap();

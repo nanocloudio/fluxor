@@ -1,7 +1,7 @@
 //! Store maintenance: `fluxor store fsck`.
 //!
-//! The store has one destructive verb (`gc`), one migration verb
-//! (`restamp`) and one question: is everything anybody pins still here?
+//! The store has one destructive verb (`gc`) and one question: is
+//! everything anybody pins still here?
 //! Without a way to ask it, a missing artifact is discovered one at a
 //! time, by a build that can no longer resolve a module — so `fsck`
 //! asks it of the whole store at once.
@@ -29,8 +29,6 @@ pub enum PinHealth {
     /// operator can see the sweep guessed wrong, not because anything
     /// is broken.
     Quarantined,
-    /// The manifest resolves through a restamp alias.
-    Aliased(String),
     /// The manifest is present but a blob it references is not.
     Dangling(String),
     /// Gone. A rebuild yields a different digest, so this is a loss, not
@@ -43,7 +41,6 @@ impl PinHealth {
         match self {
             PinHealth::Resolvable => "ok".into(),
             PinHealth::Quarantined => "quarantined (healed on read)".into(),
-            PinHealth::Aliased(d) => format!("via restamp alias {}", short(d)),
             PinHealth::Dangling(d) => format!("DANGLING: layer {} missing", short(d)),
             PinHealth::Dead => "DEAD: manifest not in store".into(),
         }
@@ -76,9 +73,6 @@ pub struct FsckReport {
     pub checkouts: Vec<CheckoutReport>,
     /// Index descriptors whose manifest or closure could not be read.
     pub index_faults: Vec<String>,
-    /// Manifests still carrying provenance annotations — they will keep
-    /// churning until `fluxor store restamp` runs.
-    pub unrestamped: usize,
     pub blobs_total: usize,
     pub blobs_live: usize,
     pub reclaimable: u64,
@@ -102,16 +96,10 @@ pub fn fsck(store: &OciStore, repair: bool) -> Result<FsckReport> {
     let index = store.read_index()?;
     let holders = store_pins::holders(store.root())?;
 
-    // 1. Index integrity, and how much of the store still predates the
-    //    restamp.
+    // 1. Index integrity.
     for d in &index.manifests {
         match store.read_manifest(d) {
             Ok(m) => {
-                if m.annotations.contains_key(crate::oci_store::ANN_PROVENANCE)
-                    || m.annotations.contains_key(crate::oci_store::ANN_SOURCE_REV)
-                {
-                    report.unrestamped += 1;
-                }
                 for l in m.layers.iter().chain(std::iter::once(&m.config)) {
                     if !store.has_blob(&l.digest) {
                         report.index_faults.push(format!(
@@ -210,8 +198,7 @@ fn health_of(store: &OciStore, digest: &str, quarantined: bool) -> PinHealth {
     if quarantined {
         return PinHealth::Quarantined;
     }
-    let resolved = store.resolve_pin(digest);
-    let Ok(bytes) = store.read_blob(&resolved) else {
+    let Ok(bytes) = store.read_blob(digest) else {
         return PinHealth::Dead;
     };
     if let Ok(m) = serde_json::from_slice::<crate::oci_store::ImageManifest>(&bytes) {
@@ -220,9 +207,6 @@ fn health_of(store: &OciStore, digest: &str, quarantined: bool) -> PinHealth {
                 return PinHealth::Dangling(l.digest.clone());
             }
         }
-    }
-    if resolved != digest {
-        return PinHealth::Aliased(resolved);
     }
     PinHealth::Resolvable
 }
@@ -276,13 +260,6 @@ pub fn render(report: &FsckReport) -> String {
         "  quarantined          {:>8}  (restored automatically on read)\n",
         report.quarantined
     ));
-    if report.unrestamped > 0 {
-        s.push_str(&format!(
-            "  un-restamped         {:>8}  manifests still carry provenance annotations \
-             and will keep\n                                 churning — run `fluxor store restamp`\n",
-            report.unrestamped
-        ));
-    }
     for fault in &report.index_faults {
         s.push_str(&format!("  INDEX FAULT  {fault}\n"));
     }

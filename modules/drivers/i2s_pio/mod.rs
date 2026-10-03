@@ -10,18 +10,15 @@
 //! - clock_base: GPIO pin for BCLK (LRCLK is clock_base + 1)
 //! - sample_rate: Output sample rate in Hz (default: 44100)
 //!
-//! # Mailbox contract
+//! # Mailbox input
 //!
-//! When the input channel is a mailbox (buffer_group alias), the producer must
-//! fill exactly `PIO_BUFFER_WORDS * 4` bytes (currently 512 × 4 = 2048) per
-//! release — one complete DMA buffer of frame-aligned stereo i16 data. A size
-//! mismatch is a fatal contract violation (I2sPhase::Error, no recovery).
-//!
-//! If `PIO_BUFFER_WORDS` changes, either update the producer's buffer size to
-//! match or use the FIFO (channel_read) path, which handles partial frames.
-//! The default channel hint (2048 bytes = `abi::CHANNEL_BUFFER_SIZE`) already
-//! matches 512 words × 4, so the two stay in sync as long as both reference
-//! the same constant.
+//! Input is read with `channel_read` on both FIFO and mailbox edges. On a
+//! mailbox edge a read takes one whole message or nothing, so the input
+//! buffer holds one partly filled PIO buffer plus one message: any message up
+//! to `abi::CHANNEL_BUFFER_SIZE` (one PIO buffer, `PIO_BUFFER_WORDS * 4` bytes)
+//! is accepted at any fill level, and a larger one stays unread. Messages need
+//! not be PIO-buffer sized; the module pushes a PIO buffer whenever a full
+//! one has accumulated.
 //!
 //! # PIC Safety
 //!
@@ -103,10 +100,9 @@ struct PioConfigureArgs {
 // Constants
 // ============================================================================
 
-/// Input buffer: 2× PIO buffer size to handle mailbox messages that arrive
-/// when in_buf is partially filled. On mailbox channels, channel_read returns
-/// the full message or EINVAL — we need space for one partial buffer + one
-/// full message to avoid data loss.
+/// Input buffer: two PIO buffers, so one whole mailbox message fits beside a
+/// partly filled PIO buffer. A mailbox read takes a whole message or leaves it
+/// in place when the space is too small.
 const IN_BUF_SIZE: usize = abi::CHANNEL_BUFFER_SIZE * 2; // 4096 bytes
 
 // ============================================================================
@@ -150,8 +146,6 @@ struct I2sState {
     data_pin: u8,
     clock_base: u8,
     phase: I2sPhase,
-    /// Skip mailbox path (set on first size mismatch, use FIFO forever)
-    skip_mbox: u8,
     _pad0: u8,
     sample_rate: u32,
     /// Bytes accumulated in in_buf waiting for a full PIO buffer
@@ -174,7 +168,6 @@ impl I2sState {
         self.data_pin = 28;
         self.clock_base = 26;
         self.phase = I2sPhase::Init;
-        self.skip_mbox = 0;
         self._pad0 = 0;
         self.sample_rate = 44100;
         self.in_buf_fill = 0;
@@ -544,9 +537,8 @@ unsafe fn step_running(s: &mut I2sState) -> i32 {
     0
 }
 
-/// Declare that the I2S module can safely consume from mailbox channels.
-/// It uses buffer_acquire_read (read-only) and channel_read (which handles
-/// mailbox transparently), but does NOT modify the buffer in place.
+/// Declare that the I2S module can safely consume from mailbox channels: it
+/// reads them with `channel_read` and never modifies a buffer in place.
 #[no_mangle]
 #[link_section = ".text.module_mailbox_safe"]
 pub extern "C" fn module_mailbox_safe() -> i32 {

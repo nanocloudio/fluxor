@@ -1,4 +1,8 @@
-fn cmd_validate(config_path: &PathBuf, target_override: Option<&str>) -> Result<()> {
+fn cmd_validate(
+    config_path: &PathBuf,
+    target_override: Option<&str>,
+    module_root: Option<&Path>,
+) -> Result<()> {
     let content = substitute_env_vars(&std::fs::read_to_string(config_path)?)?;
     let config: serde_json::Value = if config_path
         .extension()
@@ -107,7 +111,7 @@ fn cmd_validate(config_path: &PathBuf, target_override: Option<&str>) -> Result<
     // The module directory and pin/pio bounds use the target's
     // declared geometry so a host-target validate doesn't try to
     // load .fmod files from an embedded target tree.
-    let modules_dir = crate::modules_build::modules_dir_for(&target_desc);
+    let modules_dir = target_module_root(module_root, &project_root, &target_desc)?;
     let search_paths = crate::config::extract_module_search_paths(&config, config_path);
     let extra_dirs: Vec<&std::path::Path> = search_paths.iter().map(|p| p.as_path()).collect();
     let dry_run_builder = ConfigBuilder::new();
@@ -427,10 +431,8 @@ fn cmd_inspect_json(config_path: Option<&Path>) -> Result<()> {
     }
     out["targets"] = serde_json::Value::Array(targets_arr);
 
-    // Stacks — same dual-root pattern. v1 shape change: stacks
-    // is now an array of objects `{"name", "source"}` instead of
-    // an array of name strings. Tooling consumers that ignore
-    // extra fields keep working; the source annotation is new.
+    // Stacks — same dual-root pattern: an array of objects
+    // `{"name", "source"}`.
     let project_stack_names = stack_expand::list_available_stack_names(&pr.path);
     let install_stack_names: Vec<String> = install_path_for_json
         .as_deref()
@@ -1128,7 +1130,11 @@ fn inspect_config(config_path: &Path, project_root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn cmd_mktable_config(config_path: &Path, modules_dirs: &[PathBuf], output: &Path) -> Result<()> {
+fn cmd_mktable_config(
+    config_path: &Path,
+    module_root: Option<&Path>,
+    output: &Path,
+) -> Result<()> {
     let content = substitute_env_vars(&std::fs::read_to_string(config_path)?)?;
     let mut config: serde_json::Value = if config_path
         .extension()
@@ -1152,13 +1158,7 @@ fn cmd_mktable_config(config_path: &Path, modules_dirs: &[PathBuf], output: &Pat
     let project_root = crate::project::root_for_config(config_path);
     stack_expand::expand_platform_stacks(&mut config, &target_desc, &project_root)?;
 
-    let primary_dir = if modules_dirs.is_empty() {
-        return Err(Error::Module("--modules-dir is required".into()));
-    } else {
-        &modules_dirs[0]
-    };
-    let extra_dirs: Vec<&std::path::Path> =
-        modules_dirs.iter().skip(1).map(|p| p.as_path()).collect();
+    let module_root = target_module_root(module_root, &project_root, &target_desc)?;
     // Pins are SILICON-tagged, and for the linux host that silicon is not its
     // own id — it loads the aarch64 modules built for `bcm2712`. Filter to the
     // silicon the .fmods actually come from, else a store-composed provider
@@ -1167,8 +1167,8 @@ fn cmd_mktable_config(config_path: &Path, modules_dirs: &[PathBuf], output: &Pat
     let store_fb = store_cli::lock_store_resolver(&project_root, pin_silicon, None);
     let modules = parse_modules_from_config_multi(
         &config,
-        primary_dir,
-        &extra_dirs,
+        &module_root,
+        &[],
         store_fb.as_deref().map(|f| f as _),
     )?;
     // All-builtin configs (e.g. linux_display + host_image_codec) leave
@@ -1198,10 +1198,13 @@ fn cmd_diff(old_path: &PathBuf, new_path: &PathBuf, target_override: Option<&str
     let new_config: serde_json::Value = serde_yaml::from_str(&new_content)?;
 
     let target_desc = resolve_target(&new_config, target_override)?;
-    let modules_dir = crate::modules_build::modules_dir_for(&target_desc);
-    let modules_dir = modules_dir.as_path();
+    let modules_dir = target_module_root(
+        None,
+        &crate::project::root_for_config(new_path),
+        &target_desc,
+    )?;
 
-    let plan = reconfigure::compute_transition_plan(&old_config, &new_config, modules_dir);
+    let plan = reconfigure::compute_transition_plan(&old_config, &new_config, &modules_dir);
 
     print!("{}", reconfigure::format_plan(&plan));
 
@@ -1243,6 +1246,19 @@ fn build_one(
     output_override: Option<&std::path::Path>,
     verbose: bool,
 ) -> Result<BuildResult> {
+    build_one_from(yaml_path, output_override, None, verbose)
+}
+
+/// [`build_one`] with an explicit `--module-root`: the directory every
+/// `.fmod` the graph names is loaded from, instead of the project's built
+/// modules (`$FLUXOR_MODULE_ROOT` applies when it is `None`). A service
+/// bundle builds from its own pinned modules this way.
+fn build_one_from(
+    yaml_path: &std::path::Path,
+    output_override: Option<&std::path::Path>,
+    module_root: Option<&std::path::Path>,
+    verbose: bool,
+) -> Result<BuildResult> {
     // Load and parse config
     let content = substitute_env_vars(&std::fs::read_to_string(yaml_path)?)?;
     let config: serde_json::Value = if yaml_path
@@ -1262,7 +1278,6 @@ fn build_one(
     let project_root = crate::project::root_for_config(yaml_path);
     stack_expand::expand_platform_stacks(&mut config, &target_desc, &project_root)?;
     let family = target_desc.family.clone();
-    let silicon_id = target_desc.id.clone();
     // Silicon the PIC modules come from — the target's own for firmware
     // families, `bcm2712` for the aarch64 linux host.
     let module_silicon = target_desc.module_silicon().to_string();
@@ -1272,11 +1287,12 @@ fn build_one(
     // Artifact layout:
     //   firmware  target/{build_id}/firmware.bin   (board-specific when cargo
     //                                               features differ per board)
-    //   modules   target/fluxor/{silicon_id}/modules/  (byte-identical per
-    //                                               silicon + module target)
+    //   modules   target/fluxor/{silicon}/modules/    (byte-identical per
+    //                                               silicon + module target;
+    //                                               `module_root` overrides)
     //   output    target/{build_id}/{images|uf2}/<subdir>/<name>.{img|uf2}
     let firmware_path = PathBuf::from(format!("target/{build_id}/firmware.bin"));
-    let modules_dir = PathBuf::from(format!("target/fluxor/{silicon_id}/modules"));
+    let modules_dir = target_module_root(module_root, &project_root, &target_desc)?;
 
     let name = yaml_path
         .file_stem()
@@ -1347,23 +1363,18 @@ fn build_one(
                 )));
             }
             if !modules_dir.exists() {
-                let abs = modules_dir.canonicalize().unwrap_or_else(|_| {
-                    std::env::current_dir()
-                        .unwrap_or_default()
-                        .join(&modules_dir)
-                });
                 return Err(Error::Config(format!(
-                    "Modules not found at {} (resolved to {}). Run 'fluxor modules build --target {}' from the \
+                    "Modules not found at {}. Run 'fluxor modules build --target {}' from the \
                      project root (`fluxor inspect` shows where that is) to produce them.",
                     modules_dir.display(),
-                    abs.display(),
-                    build_id
+                    module_silicon
                 )));
             }
             cmd_combine(
                 &firmware_path,
                 &yaml_path.to_path_buf(),
                 &output_path,
+                module_root,
                 verbose,
             )?;
         }
@@ -1377,29 +1388,14 @@ fn build_one(
             let modules_bin_path = out_dir.join("modules.bin");
 
             // The host loads whichever silicon's PIC modules the descriptor
-            // names (`module_silicon`, bcm2712 for the aarch64 host). Anchor to
-            // the resolved project root (not the caller's cwd) so `fluxor run
-            // <path>` finds them regardless of where it is invoked from — a bare
-            // `fluxor run examples/hello/linux.yaml` from a subdirectory must
-            // resolve the same modules as from the repo root. When fluxor is
-            // consumed as a submodule, accept a sibling copy under
-            // ../deps/fluxor/target/fluxor/<silicon>/modules.
-            let modules_rel = format!("target/fluxor/{module_silicon}/modules");
-            let modules_dir = project_root.join(&modules_rel);
-            let mut fmod_dirs: Vec<PathBuf> = Vec::new();
-            if modules_dir.exists() {
-                fmod_dirs.push(modules_dir.clone());
-            }
-            if let Some(config_parent) = yaml_path.parent().and_then(|p| p.parent()) {
-                let ext_modules = config_parent.join(format!("deps/fluxor/{modules_rel}"));
-                if ext_modules.exists() {
-                    fmod_dirs.push(ext_modules);
-                }
-            }
-            if fmod_dirs.is_empty() {
+            // names (`module_silicon`, bcm2712 for the aarch64 host). The
+            // default root is anchored to the resolved project root (not the
+            // caller's cwd) so `fluxor run <path>` finds the same modules from
+            // any directory.
+            if !crate::modules_build::holds_fmod(&modules_dir) {
                 return Err(Error::Config(format!(
-                    "Modules not found at {}. Run 'fluxor modules build --target {}' from the project \
-                     root (`fluxor inspect` shows where that is) first.",
+                    "Modules not found at {}. Run 'fluxor modules build --target {}' from the \
+                     project root (`fluxor inspect` shows where that is) first.",
                     modules_dir.display(),
                     module_silicon
                 )));
@@ -1419,7 +1415,7 @@ fn build_one(
                 Some(modules_dir.as_path()),
                 true,
             )?;
-            cmd_mktable_config(yaml_path, &fmod_dirs, &modules_bin_path)?;
+            cmd_mktable_config(yaml_path, Some(&modules_dir), &modules_bin_path)?;
         }
         "wasm" => {
             // wasm produces one self-contained `.wasm` file: the
@@ -1434,7 +1430,7 @@ fn build_one(
                     kernel_wasm_path.display()
                 )));
             }
-            if !modules_dir.exists() {
+            if !crate::modules_build::holds_fmod(&modules_dir) {
                 return Err(Error::Config(format!(
                     "Modules not found at {}. Run 'fluxor modules build --target wasm' first.",
                     modules_dir.display()
@@ -1452,11 +1448,7 @@ fn build_one(
             let modules_bin_path = work_dir.join(format!("{name}.modules.bin"));
             let config_bin_path = work_dir.join(format!("{name}.config.bin"));
 
-            let extra_dirs: Vec<PathBuf> = Vec::new();
-            let fmod_dirs: Vec<PathBuf> = std::iter::once(modules_dir.clone())
-                .chain(extra_dirs)
-                .collect();
-            cmd_mktable_config(yaml_path, &fmod_dirs, &modules_bin_path)?;
+            cmd_mktable_config(yaml_path, Some(&modules_dir), &modules_bin_path)?;
             cmd_generate(
                 yaml_path,
                 Some(config_bin_path.as_path()),

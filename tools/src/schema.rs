@@ -1181,13 +1181,13 @@ fn pack_voice_inner(
 /// The schema is generated at build time from the module's `define_params!`
 /// and lives ONLY in the `.fmod` (not the manifest), so config generation must
 /// read the actual artifact to encode a module's params. When the `.fmod` is
-/// absent from `modules_dir` the module may be a store-pinned provider composed
+/// absent from `loc.dir` the module may be a store-pinned provider composed
 /// in from a sibling project: resolve it from the OCI store exactly as the
 /// module TABLE builder (`parse_modules_from_config_multi`) does, else the
-/// provider's params (e.g. a connector `endpoint`) silently drop and the module
-/// runs unconfigured. `modules_dir` is already resolved to the build's silicon
-/// — the same answer `TargetDescriptor::module_silicon()` gives, which is also
-/// the silicon tag on the `fluxor.lock` pins consulted below.
+/// provider's params (e.g. a connector `authority`) silently drop and the
+/// module runs unconfigured. `loc.silicon` is the build's
+/// `TargetDescriptor::module_silicon()`, the silicon tag on the `fluxor.lock`
+/// pins consulted below.
 ///
 /// Three outcomes, deliberately distinguishable:
 ///   - `Ok(Some(schema))` — a schema was read.
@@ -1202,22 +1202,34 @@ fn pack_voice_inner(
 ///     silently build with its params dropped.
 pub fn load_schema_for_module(
     module_type: &str,
-    modules_dir: &Path,
+    loc: ModuleLocation<'_>,
 ) -> crate::Result<Option<ParamSchema>> {
-    let fmod_path = modules_dir.join(format!("{module_type}.fmod"));
+    let fmod_path = loc.dir.join(format!("{module_type}.fmod"));
     let info = if fmod_path.exists() {
         match ModuleInfo::from_file(&fmod_path) {
             Ok(i) => i,
             Err(_) => return Ok(None),
         }
     } else {
-        let Some(pinned) = resolve_pinned_fmod(module_type, modules_dir)? else {
+        let Some(pinned) = resolve_pinned_fmod(module_type, loc)? else {
             return Ok(None);
         };
         ModuleInfo::from_file(&pinned.path)
             .map_err(|e| pinned_schema_error(module_type, &format!("{}: {e}", pinned.pin_label)))?
     };
     Ok(ParamSchema::from_module_info(&info))
+}
+
+/// Where one build reads module artefacts from, and what that location
+/// means: `dir` holds the `.fmod`s of `silicon` (the silicon tag on the
+/// `fluxor.lock` pins consulted when one is absent), for the project at
+/// `project_root`. The three are stated by the caller, never inferred from
+/// the directory's name or position: `--module-root` can name any path.
+#[derive(Debug, Clone, Copy)]
+pub struct ModuleLocation<'a> {
+    pub dir: &'a Path,
+    pub silicon: &'a str,
+    pub project_root: &'a Path,
 }
 
 /// A pin that resolved to real bytes, carrying the label the error path
@@ -1257,33 +1269,21 @@ fn pinned_schema_error(module_type: &str, why: &str) -> crate::Error {
 }
 
 /// Resolve a module's `.fmod` path from the project's `[[artifact]]` module pins when
-/// it is absent on disk. The pin silicon is `modules_dir`'s own parent, which
-/// holds in both artifact layouts (`target/fluxor/<silicon>/modules` and the
-/// `--out target` form `target/<silicon>/modules`). The project root comes from
-/// the marker walk rather than a fixed ancestor depth: those two layouts differ
-/// by one level, so a fixed depth reads a foreign `fluxor.lock` under one of
-/// them and the pin silently fails to resolve.
+/// it is absent on disk, for `loc.silicon` in the project at `loc.project_root`.
 ///
-/// `Ok(None)` means no pin covers this name; `Err` means one does and it is
-/// unresolvable (missing/corrupt blob, integrity failure, unreadable store or
-/// lockfile), which is a hard error rather than a silent drop to "no params".
-fn resolve_pinned_fmod(module_type: &str, modules_dir: &Path) -> crate::Result<Option<PinnedFmod>> {
-    let silicon = match modules_dir.parent().and_then(|p| p.file_name()) {
-        Some(s) => s.to_string_lossy().into_owned(),
-        None => return Ok(None),
-    };
-    // Anchor a relative dir to the cwd so the walk has a real path to climb.
-    let anchored = if modules_dir.is_absolute() {
-        modules_dir.to_path_buf()
-    } else {
-        match std::env::current_dir() {
-            Ok(cwd) => cwd.join(modules_dir),
-            Err(_) => return Ok(None),
-        }
-    };
-    let project_root = crate::project::discover_from(&anchored)
-        .map(|r| r.path)
-        .unwrap_or_else(crate::project::root);
+/// `Ok(None)` means no pin covers this name (or the location names no
+/// silicon); `Err` means one does and it is unresolvable (missing/corrupt
+/// blob, integrity failure, unreadable store or lockfile), which is a hard
+/// error rather than a silent drop to "no params".
+fn resolve_pinned_fmod(
+    module_type: &str,
+    loc: ModuleLocation<'_>,
+) -> crate::Result<Option<PinnedFmod>> {
+    if loc.silicon.is_empty() {
+        return Ok(None);
+    }
+    let silicon = loc.silicon.to_string();
+    let project_root = loc.project_root.to_path_buf();
     let Some(resolver) = crate::store_cli::lock_store_resolver(&project_root, &silicon, None)
     else {
         return Ok(None);
@@ -1727,10 +1727,15 @@ mod tests {
     /// which already fails closed on the manifest half of the same pin.
     #[test]
     fn pinned_module_with_unresolvable_store_is_a_hard_error() {
-        let (_project, store, modules_dir) = pinned_but_missing_fixture();
+        let (project, store, modules_dir) = pinned_but_missing_fixture();
         let _env = crate::config::test_env::EnvGuard::set(&[("FLUXOR_STORE", store.path())]);
 
-        let err = load_schema_for_module("pinned_conn", &modules_dir)
+        let loc = ModuleLocation {
+            dir: &modules_dir,
+            silicon: "bcm2712",
+            project_root: project.path(),
+        };
+        let err = load_schema_for_module("pinned_conn", loc)
             .expect_err("pinned module with no store artifact must fail closed");
         let msg = err.to_string();
         assert!(msg.contains("pinned_conn"), "names the module: {msg}");
@@ -1751,12 +1756,49 @@ mod tests {
     /// into an error would break every built-in module.
     #[test]
     fn unpinned_module_without_fmod_reports_no_schema() {
-        let (_project, store, modules_dir) = pinned_but_missing_fixture();
+        let (project, store, modules_dir) = pinned_but_missing_fixture();
         let _env = crate::config::test_env::EnvGuard::set(&[("FLUXOR_STORE", store.path())]);
 
-        let schema =
-            load_schema_for_module("not_pinned_anywhere", &modules_dir).expect("not a hard error");
+        let loc = ModuleLocation {
+            dir: &modules_dir,
+            silicon: "bcm2712",
+            project_root: project.path(),
+        };
+        let schema = load_schema_for_module("not_pinned_anywhere", loc).expect("not a hard error");
         assert!(schema.is_none(), "no pin, no .fmod → no schema");
+    }
+
+    /// The silicon and project come from the caller, not from where the
+    /// directory sits: a `--module-root` named `anything` still resolves the
+    /// pin for the silicon the build is for, and a location naming no
+    /// silicon consults no pin.
+    #[test]
+    fn the_pin_silicon_comes_from_the_caller_not_the_directory_name() {
+        let (project, store, _modules_dir) = pinned_but_missing_fixture();
+        let _env = crate::config::test_env::EnvGuard::set(&[("FLUXOR_STORE", store.path())]);
+        let elsewhere = project.path().join("anything");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+
+        let loc = ModuleLocation {
+            dir: &elsewhere,
+            silicon: "bcm2712",
+            project_root: project.path(),
+        };
+        let err = load_schema_for_module("pinned_conn", loc)
+            .expect_err("the bcm2712 pin applies wherever the directory is");
+        assert!(err.to_string().contains("pinned in fluxor.lock"), "{err}");
+
+        let other = ModuleLocation {
+            silicon: "rp2350",
+            ..loc
+        };
+        assert!(load_schema_for_module("pinned_conn", other)
+            .unwrap()
+            .is_none());
+        let none = ModuleLocation { silicon: "", ..loc };
+        assert!(load_schema_for_module("pinned_conn", none)
+            .unwrap()
+            .is_none());
     }
 }
 

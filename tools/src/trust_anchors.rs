@@ -27,7 +27,7 @@ use std::path::Path;
 use crate::hash::{crc16_ccitt, fnv1a_hash};
 
 /// The FXWR config-blob magic (`kernel::config::MAGIC_CONFIG`), the one
-/// definition the writer (`config::MAGIC_LEGACY`) and the re-sealer share.
+/// definition the writer (`config::MAGIC_FXWR`) and the re-sealer share.
 pub const FXWR_MAGIC: u32 = 0x5257_5846;
 
 /// Most anchors one instance holds — `MAX_ANCHORS` in the tls and quic
@@ -211,7 +211,7 @@ pub fn encode_ext(tag: u8, certs: &[Vec<u8>]) -> Vec<u8> {
 
 /// Size of the FXWR header (`kernel::config::read_config_from_slice`).
 const HEADER_SIZE: usize = 16;
-/// Size of a LEGACY graph section (slot code 0): a 4-byte header, 128 edges
+/// Size of a 128-slot graph section (slot code 0): a 4-byte header, 128 edges
 /// of 12 bytes, and four 4-byte domain-metadata entries. A blob states its own
 /// slot count in graph-section byte 3 — see [`graph_section_size`]. Only the
 /// test fixtures build a section from scratch, so only they need the size.

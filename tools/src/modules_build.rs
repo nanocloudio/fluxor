@@ -92,7 +92,7 @@ fn silicon_spec(silicon: &str) -> Option<&'static SiliconSpec> {
 
 /// Resolve a user-supplied module-build target name to the silicon id
 /// used for module artefacts, via the `targets/` registry (the ONLY
-/// board→silicon mapping — standards/target_consolidation.md §3).
+/// board→silicon mapping).
 ///
 /// Module builds take silicon and host ids only: a board name is a
 /// level error (build the board's silicon instead). Hosts redirect via
@@ -211,8 +211,8 @@ struct ManifestRaw {
     hardware_targets: Option<Vec<String>>,
     /// `builtin = true` marks a manifest as a declaration of a
     /// kernel-resident module: the implementation is compiled into
-    /// the kernel and the directory carries no entry file
-    /// (standards/fluxor-modules.md §0.1). There is nothing to build.
+    /// the kernel and the directory carries no entry file, so there is
+    /// nothing to build.
     #[serde(default)]
     builtin: bool,
     #[serde(default, rename = "type")]
@@ -299,10 +299,9 @@ fn discover_all(project_root: &Path) -> Result<Vec<Candidate>> {
             let entry_rel = raw.entry.unwrap_or_else(|| "mod.rs".to_string());
             let entry = dir.join(&entry_rel);
             // A `builtin = true` manifest is a declaration of a
-            // kernel-resident module (standards/fluxor-modules.md
-            // §0.1): the implementation is compiled into the kernel
-            // and the directory carries no entry file. Its absence is
-            // correct, not the broken-module case below.
+            // kernel-resident module: the implementation is compiled into
+            // the kernel and the directory carries no entry file. Its
+            // absence is correct, not the broken-module case below.
             if !builtin && !entry.exists() {
                 // A manifest pointing at a missing entry is a broken
                 // module, not an absent one — diagnose the skip so the
@@ -1963,26 +1962,27 @@ pub struct ModuleSummary {
     pub builtin: bool,
 }
 
-/// The `target/fluxor/<silicon>/modules` directory whose artefacts a target
-/// LOADS, from a descriptor the caller already holds.
+/// The project-relative `target/fluxor/<silicon>/modules` directory whose
+/// artefacts a target LOADS, from a descriptor the caller already holds: the
+/// default [`select_module_root`] falls back to.
 ///
 /// Takes the descriptor rather than a target name because the two differ
 /// exactly where it matters: a host target loads the artefacts of the silicon
 /// it runs on — `linux` loads `bcm2712`'s — and a directory named after the
-/// host has no artefact tree and never will. Every caller that needs .fmod
-/// bytes goes through here, so that rule is stated once instead of being
-/// rebuilt from `target_desc.id` at each call site, which is how a host
-/// target came to resolve to an empty directory and report every module as
-/// carrying no parameter schema.
+/// host has no artefact tree and never will. The rule is stated here once
+/// rather than rebuilt from `target_desc.id` at each call site.
 pub fn modules_dir_for(desc: &crate::target::TargetDescriptor) -> PathBuf {
     PathBuf::from("target/fluxor")
         .join(desc.module_silicon())
         .join("modules")
 }
 
-/// `fluxor modules resolve` — print the resolved `target/.../modules`
-/// directory for a given target, honouring the dual-root resolution
-/// from standards/fluxor-modules.md §6.
+/// The default location of a target's modules: `<out_root>/<silicon>/modules`,
+/// where `<silicon>` is the silicon whose artefacts the target loads.
+///
+/// This is the layout alone. A consumer that reads `.fmod` bytes must go
+/// through [`module_root`] (or [`select_module_root`]), which puts the
+/// explicit `--module-root` and `$FLUXOR_MODULE_ROOT` ahead of it.
 pub fn resolve(project_root: &Path, out_root: &Path, target: &str) -> PathBuf {
     // A BOARD is a legitimate subject here even though it is not a
     // legitimate build target: its modules live in its silicon's
@@ -1999,6 +1999,88 @@ pub fn resolve(project_root: &Path, out_root: &Path, target: &str) -> PathBuf {
         .map(|d| d.module_silicon().to_string())
         .unwrap_or_else(|_| target.to_string());
     out_root.join(silicon).join("modules")
+}
+
+/// Environment variable naming the module root: the directory holding
+/// the `.fmod` artefacts for the target being operated on.
+pub const ENV_MODULE_ROOT: &str = "FLUXOR_MODULE_ROOT";
+
+/// The module root for a target named by `target`: [`select_module_root`]
+/// over [`resolve`]'s default location.
+pub fn module_root(
+    explicit: Option<&Path>,
+    project_root: &Path,
+    out_root: &Path,
+    target: &str,
+) -> Result<PathBuf> {
+    select_module_root(explicit, resolve(project_root, out_root, target))
+}
+
+/// THE module-root resolution, shared by every subcommand that locates
+/// `.fmod` artefacts (`run` including `--replicas`, `build`, `flash`,
+/// `modules resolve`, bundle staging). Order:
+///
+///   1. the explicit `--module-root <path>`;
+///   2. `$FLUXOR_MODULE_ROOT` (an empty value counts as unset);
+///   3. `default_dir`, the project's `target/fluxor/<silicon>/modules`.
+///
+/// A root chosen by 1 or 2 is a statement of intent, so it is validated
+/// and never replaced: it must name an existing directory that holds at
+/// least one `.fmod`, otherwise resolution fails naming where the path
+/// came from. Relative paths are taken against the current directory. The
+/// default is returned as given, existing or not: asking where the
+/// artefacts will be built is legitimate before they exist, and consumers
+/// that need the bytes report the missing directory themselves.
+pub fn select_module_root(explicit: Option<&Path>, default_dir: PathBuf) -> Result<PathBuf> {
+    let cwd = std::env::current_dir()
+        .map_err(|e| Error::Config(format!("cannot resolve a module root: current dir: {e}")))?;
+    select_module_root_with(
+        explicit,
+        std::env::var_os(ENV_MODULE_ROOT).as_deref(),
+        &cwd,
+        default_dir,
+    )
+}
+
+fn select_module_root_with(
+    explicit: Option<&Path>,
+    env: Option<&std::ffi::OsStr>,
+    cwd: &Path,
+    default_dir: PathBuf,
+) -> Result<PathBuf> {
+    let (raw, origin) = match (explicit, env) {
+        (Some(p), _) => (p, "--module-root".to_string()),
+        (None, Some(v)) if !v.is_empty() => (Path::new(v), format!("${ENV_MODULE_ROOT}")),
+        _ => return Ok(default_dir),
+    };
+    if raw.as_os_str().is_empty() {
+        return Err(Error::Config(format!("{origin} is an empty path")));
+    }
+    let root = cwd.join(raw);
+    if !root.is_dir() {
+        return Err(Error::Config(format!(
+            "{origin} names {}, which is not a directory",
+            root.display()
+        )));
+    }
+    std::fs::read_dir(&root)
+        .map_err(|e| Error::Config(format!("{origin}: reading {}: {e}", root.display())))?;
+    if !holds_fmod(&root) {
+        return Err(Error::Config(format!(
+            "{origin} names {}, which holds no .fmod modules",
+            root.display()
+        )));
+    }
+    Ok(root)
+}
+
+/// Whether `dir` is a directory holding at least one `.fmod`.
+pub fn holds_fmod(dir: &Path) -> bool {
+    std::fs::read_dir(dir).is_ok_and(|entries| {
+        entries
+            .filter_map(|e| e.ok())
+            .any(|e| e.path().extension().is_some_and(|x| x == "fmod"))
+    })
 }
 
 #[cfg(test)]
@@ -2285,11 +2367,10 @@ pub static RS_NAMES: [&[u8]; 2] = [b"src/a.rs", b"src/b.rs"];
     /// `modules_dir_for` sends a HOST target to the silicon whose artefacts
     /// it loads, not to a directory named after itself.
     ///
-    /// The call sites that build a modules path from `target_desc.id` instead
-    /// gave `target/fluxor/linux/modules`, which is never created. Every .fmod
-    /// lookup under it missed, and a config check reported the modules as
-    /// carrying no parameter schema — a staleness-shaped message for a path
-    /// fault, which is the hardest kind to trace back.
+    /// A path built from `target_desc.id` would be
+    /// `target/fluxor/linux/modules`, which is never created: every .fmod
+    /// lookup under it would miss, and a config check would report the
+    /// modules as carrying no parameter schema.
     #[test]
     fn modules_dir_for_sends_a_host_target_to_its_silicon() {
         let root = repo_root();
@@ -2637,5 +2718,111 @@ pub static RS_NAMES: [&[u8]; 2] = [b"src/a.rs", b"src/b.rs"];
         assert!(!includes_are_older(&moddir, past));
 
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// A scratch directory under the temp dir holding `n` `.fmod` files.
+    fn module_dir(tag: &str, n: usize) -> PathBuf {
+        let d =
+            std::env::temp_dir().join(format!("fluxor-module-root-{tag}-{}", std::process::id()));
+        std::fs::remove_dir_all(&d).ok();
+        std::fs::create_dir_all(&d).unwrap();
+        for i in 0..n {
+            std::fs::write(d.join(format!("m{i}.fmod")), b"x").unwrap();
+        }
+        d
+    }
+
+    /// Explicit beats the environment, which beats the project default.
+    #[test]
+    fn module_root_order_is_flag_then_env_then_project() {
+        let flag = module_dir("flag", 1);
+        let env = module_dir("env", 1);
+        let default = PathBuf::from("/nonexistent/project/target/fluxor/bcm2712/modules");
+        let cwd = Path::new("/");
+        let got = select_module_root_with(Some(&flag), Some(env.as_os_str()), cwd, default.clone())
+            .unwrap();
+        assert_eq!(got, flag);
+        let got =
+            select_module_root_with(None, Some(env.as_os_str()), cwd, default.clone()).unwrap();
+        assert_eq!(got, env);
+        let got = select_module_root_with(None, None, cwd, default.clone()).unwrap();
+        assert_eq!(
+            got, default,
+            "the default is returned even when it does not exist"
+        );
+        std::fs::remove_dir_all(flag).ok();
+        std::fs::remove_dir_all(env).ok();
+    }
+
+    /// An empty `$FLUXOR_MODULE_ROOT` is unset, not an error and not "".
+    #[test]
+    fn module_root_empty_env_is_unset() {
+        let default = PathBuf::from("/d/modules");
+        let got = select_module_root_with(
+            None,
+            Some(std::ffi::OsStr::new("")),
+            Path::new("/"),
+            default.clone(),
+        )
+        .unwrap();
+        assert_eq!(got, default);
+    }
+
+    /// A relative root is taken against the current directory.
+    #[test]
+    fn module_root_relative_path_resolves_against_cwd() {
+        let base = module_dir("rel", 0);
+        let sub = base.join("mods");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("a.fmod"), b"x").unwrap();
+        let got =
+            select_module_root_with(Some(Path::new("mods")), None, &base, PathBuf::from("/d"))
+                .unwrap();
+        assert_eq!(got, base.join("mods"));
+        let got = select_module_root_with(
+            None,
+            Some(std::ffi::OsStr::new("mods")),
+            &base,
+            PathBuf::from("/d"),
+        )
+        .unwrap();
+        assert_eq!(got, base.join("mods"));
+        std::fs::remove_dir_all(base).ok();
+    }
+
+    /// A missing, empty-path or `.fmod`-less explicit root is an error that
+    /// names its origin; it never falls back to the environment or default.
+    #[test]
+    fn module_root_bad_explicit_root_is_an_error_never_a_fallback() {
+        let env = module_dir("fb", 1);
+        let default = PathBuf::from("/d/modules");
+        let cwd = Path::new("/");
+        let missing = select_module_root_with(
+            Some(Path::new("/definitely/not/here")),
+            Some(env.as_os_str()),
+            cwd,
+            default.clone(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(missing.contains("--module-root") && missing.contains("not a directory"));
+        let empty_path = select_module_root_with(Some(Path::new("")), None, cwd, default.clone())
+            .unwrap_err()
+            .to_string();
+        assert!(empty_path.contains("empty path"));
+        let no_fmod = module_dir("nofmod", 0);
+        let e = select_module_root_with(Some(&no_fmod), None, cwd, default.clone())
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("holds no .fmod"), "{e}");
+        let e = select_module_root_with(None, Some(no_fmod.as_os_str()), cwd, default)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("$FLUXOR_MODULE_ROOT") && e.contains("holds no .fmod"),
+            "{e}"
+        );
+        std::fs::remove_dir_all(env).ok();
+        std::fs::remove_dir_all(no_fmod).ok();
     }
 }

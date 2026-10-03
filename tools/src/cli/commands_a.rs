@@ -5,14 +5,16 @@ fn cmd_decode(file: &PathBuf, format: &str) -> Result<()> {
     // Read trailer to find config address
     let config_addr = read_trailer_config_addr(&memory)?;
 
-    // Extract config region
+    // The contiguous region from the config address; the decoder reads only
+    // as far as the blob's own section sizes say.
     let config_data = {
         let mut data = Vec::new();
-        for i in 0..4096u32 {
-            if let Some(&byte) = memory.get(&(config_addr + i)) {
-                data.push(byte);
-            } else if !data.is_empty() {
-                break; // End of contiguous region
+        let mut addr = config_addr;
+        while let Some(&byte) = memory.get(&addr) {
+            data.push(byte);
+            match addr.checked_add(1) {
+                Some(next) => addr = next,
+                None => break,
             }
         }
         if data.len() < 64 {
@@ -23,7 +25,7 @@ fn cmd_decode(file: &PathBuf, format: &str) -> Result<()> {
         data
     };
 
-    let config = decode_config(&config_data, &memory)?;
+    let config = decode_config(&config_data)?;
 
     match format {
         "json" => println!("{}", serde_json::to_string_pretty(&config)?),
@@ -172,17 +174,10 @@ fn cmd_info(file: &PathBuf) -> Result<()> {
                 header_data[2],
                 header_data[3],
             ]);
-            // Both magics are live, and the names invite the wrong
-            // conclusion: the constants here are the TOOLS' pair, where
-            // `MAGIC_CONFIG` is FXCF (pointer-based) and `MAGIC_LEGACY` is
-            // FXWR. The KERNEL has its own `MAGIC_CONFIG`
-            // (`src/kernel/boot/config.rs`) and it is FXWR — so the magic
-            // called legacy here is the one a booting image carries.
-            // Reporting either as invalid tells bring-up that a bootable
-            // image is broken.
+            // The tools' `MAGIC_FXWR` is the kernel's own `MAGIC_CONFIG`: the
+            // config blob a booting image carries.
             match magic {
-                config::MAGIC_CONFIG => println!("  Config magic: Valid (0x{magic:08x}, FXCF)"),
-                config::MAGIC_LEGACY => println!("  Config magic: Valid (0x{magic:08x}, FXWR)"),
+                config::MAGIC_FXWR => println!("  Config magic: Valid (0x{magic:08x}, FXWR)"),
                 _ => println!("  Config magic: Invalid (0x{magic:08x})"),
             }
         }
@@ -300,100 +295,12 @@ fn cmd_info(file: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-/// Substitute `${VAR}` and `${VAR:-default}` patterns with environment variable values.
-/// Escape literal `${` with `$${`.
-/// True iff `s` is a POSIX-valid environment variable identifier
-/// (`[A-Za-z_][A-Za-z0-9_]*`). Anything else inside `${...}` is
-/// treated as a literal pass-through so YAML config can embed JS
-/// template-literal source without the substitution treating its
-/// `${expr}` syntax as missing env vars.
-fn is_env_var_name(s: &str) -> bool {
-    if s.is_empty() {
-        return false;
-    }
-    let mut chars = s.chars();
-    let first = chars.next().unwrap();
-    if !(first.is_ascii_alphabetic() || first == '_') {
-        return false;
-    }
-    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
-}
-
+/// Substitute `${VAR}` and `${VAR:-default}` with environment values on
+/// every graph read. The pass itself lives in the library
+/// ([`fluxor_tools::env_subst`]) because the service-bundle renderer runs
+/// it too, ahead of parameter substitution.
 pub(crate) fn substitute_env_vars(input: &str) -> Result<String> {
-    let mut out = String::with_capacity(input.len());
-    let mut rest = input;
-
-    while let Some(pos) = rest.find("${") {
-        // Check for escape: $${
-        if pos > 0 && rest.as_bytes()[pos - 1] == b'$' {
-            // Push everything up to (but not including) the extra '$', then literal '${'
-            out.push_str(&rest[..pos - 1]);
-            out.push_str("${");
-            rest = &rest[pos + 2..];
-            continue;
-        }
-
-        // Push text before '${'
-        out.push_str(&rest[..pos]);
-        rest = &rest[pos + 2..];
-
-        // Find closing '}'
-        let end = rest
-            .find('}')
-            .ok_or_else(|| crate::error::Error::Config("Unclosed ${} in config".to_string()))?;
-
-        let expr = &rest[..end];
-        if expr.is_empty() {
-            return Err(crate::error::Error::Config(
-                "Empty variable name in ${}".to_string(),
-            ));
-        }
-
-        // Split on ":-" for default value
-        let (var_name, default) = if let Some(sep) = expr.find(":-") {
-            (&expr[..sep], Some(&expr[sep + 2..]))
-        } else {
-            (expr, None)
-        };
-
-        // POSIX-valid env-var name: `[A-Za-z_][A-Za-z0-9_]*`. Any
-        // other shape (dots, spaces, hyphens, etc.) is a JS-side
-        // template literal that just happens to look like `${...}`
-        // when YAML embeds JS source (e.g. the canonical wasm
-        // runtime shell embeds JS that does
-        // `\`${window.__fluxorBase}host_shims.js\``). Treat
-        // non-env-shaped names as inert — emit the literal
-        // `${...}` back into the output unchanged. Only well-formed
-        // names participate in substitution, so unset env vars
-        // still error loudly.
-        if !is_env_var_name(var_name) {
-            out.push_str("${");
-            out.push_str(expr);
-            out.push('}');
-            rest = &rest[end + 1..];
-            continue;
-        }
-
-        match std::env::var(var_name) {
-            Ok(val) => out.push_str(&val),
-            Err(_) => {
-                if let Some(def) = default {
-                    out.push_str(def);
-                } else {
-                    return Err(crate::error::Error::Config(format!(
-                        "Environment variable '{var_name}' is not set (referenced in config). \
-                         Use ${{{var_name}:-default}} to provide a fallback.",
-                    )));
-                }
-            }
-        }
-
-        rest = &rest[end + 1..];
-    }
-
-    // Push remaining text
-    out.push_str(rest);
-    Ok(out)
+    fluxor_tools::env_subst::substitute(input).map_err(crate::error::Error::Config)
 }
 
 /// Tiny base64 encoder for binary `body_file` payloads. Avoids
@@ -480,10 +387,24 @@ fn inline_route_body_files(
     Ok(())
 }
 
+/// The module root a build for `desc` reads `.fmod` artefacts from: the
+/// explicit `--module-root`, else `$FLUXOR_MODULE_ROOT`, else the project's
+/// `target/fluxor/<silicon>/modules` (see `modules_build::select_module_root`).
+fn target_module_root(
+    explicit: Option<&std::path::Path>,
+    project_root: &std::path::Path,
+    desc: &crate::target::TargetDescriptor,
+) -> Result<PathBuf> {
+    crate::modules_build::select_module_root(
+        explicit,
+        project_root.join(crate::modules_build::modules_dir_for(desc)),
+    )
+}
+
 fn cmd_generate(
     config_path: &Path,
     output: Option<&std::path::Path>,
-    modules_dir_override: Option<&std::path::Path>,
+    module_root: Option<&std::path::Path>,
     binary: bool,
 ) -> Result<()> {
     let content = substitute_env_vars(&std::fs::read_to_string(config_path)?)?;
@@ -526,8 +447,7 @@ fn cmd_generate(
         }
         config["hardware"] = serde_json::Value::Object(merged);
     }
-    let modules_dir_default = crate::modules_build::modules_dir_for(&target_desc);
-    let modules_dir = modules_dir_override.unwrap_or(modules_dir_default.as_path());
+    let modules_dir = target_module_root(module_root, &project_root, &target_desc)?;
 
     // Manifest search paths: explicit `module_search_paths:` from the
     // YAML plus the implicit <config-parent>/../modules default. See
@@ -539,7 +459,7 @@ fn cmd_generate(
         &config,
         &builder,
         &[],
-        modules_dir,
+        &modules_dir,
         &extra_dirs,
         target_desc.max_pin + 1,
         target_desc.pio_count,
@@ -874,6 +794,7 @@ fn cmd_combine(
     firmware_path: &PathBuf,
     config_path: &PathBuf,
     output_path: &PathBuf,
+    module_root: Option<&Path>,
     verbose: bool,
 ) -> Result<()> {
     // Parse config file (substitute env vars before YAML parse)
@@ -987,7 +908,7 @@ fn cmd_combine(
     // `<config-parent>/../modules` default — same mechanism the linux build
     // path uses (`cmd_generate`). Without this, fan modules like
     // media_loader fail port-name resolution.
-    let modules_dir_path = crate::modules_build::modules_dir_for(&target_desc);
+    let modules_dir_path = target_module_root(module_root, &project_root, &target_desc)?;
     let modules_dir = modules_dir_path.as_path();
     let search_paths = config::extract_module_search_paths(&config, config_path);
     let extra_dirs: Vec<&std::path::Path> = search_paths.iter().map(|p| p.as_path()).collect();
@@ -1292,7 +1213,7 @@ fn build_packaged_blobs(
     config: &serde_json::Value,
     modules_dir: &std::path::Path,
     extra_dirs: &[&std::path::Path],
-    target_desc: &target::TargetDescriptor,
+    target_desc: &crate::target::TargetDescriptor,
     verbose: bool,
     project_root: &std::path::Path,
 ) -> Result<(Option<Vec<u8>>, Vec<u8>)> {
@@ -1365,7 +1286,7 @@ fn cmd_graph_image(
     output_path: &PathBuf,
     target_override: Option<&str>,
     epoch: u64,
-    modules_dir_override: Option<&std::path::Path>,
+    module_root: Option<&std::path::Path>,
     verbose: bool,
 ) -> Result<()> {
     // Image layout constants mirror modules/sdk/abi.rs :: graph_slot
@@ -1428,8 +1349,8 @@ fn cmd_graph_image(
         ));
     }
 
-    let modules_dir_path = crate::modules_build::modules_dir_for(&target_desc);
-    let modules_dir = modules_dir_override.unwrap_or(modules_dir_path.as_path());
+    let modules_dir_path = target_module_root(module_root, &project_root, &target_desc)?;
+    let modules_dir = modules_dir_path.as_path();
     let (modules_data, config_data) = build_packaged_blobs(
         &config,
         modules_dir,

@@ -4,17 +4,17 @@
 //! This is the object-surface sibling of [`super::fs`]. Where the FS
 //! provider fronts whole-file streaming `GET`s and intentionally has
 //! no seek (`FS_SEEK` → `ENOSYS`), the object provider adds the
-//! bounded-range reads the Playload RFC (§12.3) needs so a wasm host
-//! can demand-page immutable assets instead of fetching whole files.
+//! bounded-range reads a wasm host needs to demand-page immutable
+//! assets instead of fetching whole files.
 //!
-//! It is backed by five host bindings, the browser shims named by the
-//! RFC:
+//! It is backed by these host bindings, the browser shims:
 //!
 //!   - `host_object_head`       — issue a `HEAD`, surface size + mtime
 //!   - `host_object_range_open` — issue a ranged `GET`, return a stream
 //!   - `host_object_recv`       — drain bytes / metadata from a stream
 //!   - `host_object_close`      — cancel + release a stream handle
 //!   - `host_object_put`        — write a blob to the persistent tier
+//!   - `host_object_delete`     — remove a blob from the persistent tier
 //!
 //! ## Read tier vs. write tier (OPFS)
 //!
@@ -24,9 +24,9 @@
 //! browser, so on its own this tier cannot persist user-generated data
 //! (save-state derivatives, imported ROMs, caches).
 //!
-//! `host_object_put` adds the missing write tier, backed by **OPFS**
-//! (Origin Private File System) on the host side — see
-//! `docs/architecture/wasm_browser_host.md` §5.6. Writes are
+//! `host_object_put` is the write tier, backed by **OPFS** (Origin
+//! Private File System) on the host side — see
+//! `docs/architecture/wasm_browser_host.md` §5. Writes are
 //! synchronously *accepted* into an in-memory store (so an immediately
 //! following `GET`/`HEAD`/`RANGE_GET` of the same key sees the bytes)
 //! and persisted to OPFS in the background; the shim also hydrates that
@@ -35,7 +35,11 @@
 //! `fetch()`, which is why GET/HEAD/RANGE_GET need no wasm-side change to
 //! see PUT data. Durability is therefore *best-effort* — the per-handle
 //! fence stays `Volatile`, matching the browser quota model (origin
-//! storage may be evicted) per `endpoint_capability_surface.md` §4.
+//! storage may be evicted).
+//!
+//! `LIST` answers `ENOSYS`: reads fall through to `fetch()` against the
+//! page origin, which cannot be enumerated, and a listing of the written
+//! tier alone would omit objects `GET` serves.
 //!
 //! All windowing math (clamping a request to the object tail, encoding
 //! the `HEAD` record) lives in the host-neutral, unit-tested
@@ -53,6 +57,7 @@
 //! that returns `EAGAIN` and is retried re-finds the same in-flight
 //! request rather than issuing a duplicate fetch.
 
+use crate::abi::contracts::storage::handle as dev_obj_handle;
 use crate::abi::contracts::storage::object as dev_obj;
 use crate::abi::contracts::storage::object::precondition as obj_precondition;
 use crate::abi::fence as dev_fence;
@@ -60,9 +65,11 @@ use crate::kernel::ipc::fd::{slot_of, tag_fd, FD_TAG_STORAGE_OBJECT};
 use crate::kernel::sys::errno;
 
 const MAX_OPEN_OBJECTS: usize = 16;
-/// Bounded copy of the object key so a slot can re-issue a ranged GET
-/// across `EAGAIN` retries without the caller's buffer staying live.
-const MAX_KEY_LEN: usize = 256;
+/// Longest object key: the contract's one bound, so a key `PUT` writes is
+/// one `storage.namespace` can list. A slot keeps a bounded copy of its key
+/// to re-issue a ranged GET across `EAGAIN` retries without the caller's
+/// buffer staying live.
+const MAX_KEY_LEN: usize = dev_obj_handle::STORAGE_KEY_MAX;
 
 struct ObjectSlot {
     in_use: bool,
@@ -202,6 +209,8 @@ unsafe fn wasm_object_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: 
         dev_obj::RANGE_GET => obj_range_get(handle, arg, arg_len),
         dev_obj::DELETE => obj_delete(arg, arg_len),
         dev_obj::CLOSE => obj_close(handle),
+        // See the module docs: the origin cannot be enumerated.
+        dev_obj::LIST => errno::ENOSYS,
         dev_obj::IMG_DECODE => img_decode(arg, arg_len),
         dev_obj::IMG_RECV => img_recv(handle, arg, arg_len),
         dev_obj::IMG_CLOSE => img_close(handle),
@@ -370,8 +379,15 @@ unsafe fn obj_put(arg: *mut u8, arg_len: usize) -> i32 {
         core::ptr::copy_nonoverlapping(arg.add(p), b.as_mut_ptr(), 2);
         u16::from_le_bytes(b) as usize
     };
+    if !fence_ok(fence_out_ptr, fence_out_cap) {
+        return errno::EINVAL;
+    }
 
+    // A key that is not UTF-8 is not one a listing can name.
     let key_ptr = arg.add(2);
+    if core::str::from_utf8(core::slice::from_raw_parts(key_ptr, key_len)).is_err() {
+        return errno::EINVAL;
+    }
     let rc = host_object_put(key_ptr, key_len, body_ptr, body_len);
     if rc < 0 {
         return errno::ENODEV;
@@ -496,6 +512,9 @@ unsafe fn obj_head(arg: *mut u8, arg_len: usize) -> i32 {
         core::ptr::copy_nonoverlapping(arg.add(p), b.as_mut_ptr(), 2);
         u16::from_le_bytes(b) as usize
     };
+    if !fence_ok(fence_out_ptr, fence_out_cap) {
+        return errno::EINVAL;
+    }
 
     // Idempotent per key: a retry after EAGAIN re-finds the same
     // in-flight HEAD on the host side.
@@ -523,7 +542,7 @@ unsafe fn obj_head(arg: *mut u8, arg_len: usize) -> i32 {
     let out = core::slice::from_raw_parts_mut(out_ptr, out_cap);
     let written = match dev_obj::range::encode_head(out, size, mtime, &[], &[]) {
         Some(n) => n,
-        None => return errno::EINVAL,
+        None => return errno::ENOMEM,
     };
 
     write_fence_out(fence_out_ptr, fence_out_cap);
@@ -542,9 +561,10 @@ unsafe fn obj_head(arg: *mut u8, arg_len: usize) -> i32 {
 /// memory, traps — a small write at a modest offset of a large memory,
 /// failing for no reason visible at the call site.
 ///
-/// Nothing routes that path today: `host_shims.js` services `OBJ_PUT`
-/// straight from child memory and never reaches here. This is the guard
-/// that keeps it a refusal rather than a trap if something ever does.
+/// The module bridge in `host_shims.js` serves a child's `PUT` from the
+/// child's memory and rewrites the pointers its other requests embed to
+/// kernel scratch, so a pointer that still fails this check was never
+/// rewritten. Refusing it keeps that a refusal rather than a trap.
 #[inline]
 fn in_linear_memory(ptr: *const u8, len: usize) -> bool {
     if ptr.is_null() || len == 0 {
@@ -564,13 +584,16 @@ fn in_linear_memory(ptr: *const u8, len: usize) -> bool {
 /// gets no fence rather than a trap; the operation itself already
 /// succeeded and its result does not depend on the advertisement.
 #[inline]
+/// Whether a caller's fence buffer can receive a fence: at least
+/// `WIRE_MAX_LEN` bytes, inside this module's memory. An op with one that
+/// cannot is refused `EINVAL` before it acts.
+fn fence_ok(fence_out_ptr: *mut u8, fence_out_cap: usize) -> bool {
+    fence_out_cap >= dev_fence::WIRE_MAX_LEN
+        && in_linear_memory(fence_out_ptr as *const u8, dev_fence::WIRE_MAX_LEN)
+}
+
+/// Write a `Volatile` fence into a buffer `fence_ok` accepted.
 unsafe fn write_fence_out(fence_out_ptr: *mut u8, fence_out_cap: usize) {
-    if fence_out_cap < dev_fence::WIRE_MAX_LEN {
-        return;
-    }
-    if !in_linear_memory(fence_out_ptr as *const u8, dev_fence::WIRE_MAX_LEN) {
-        return;
-    }
     let fbuf = core::slice::from_raw_parts_mut(fence_out_ptr, fence_out_cap);
     let _ = dev_fence::Fence::Volatile.encode(fbuf);
 }
@@ -579,10 +602,6 @@ unsafe fn write_fence_out(fence_out_ptr: *mut u8, fence_out_cap: usize) {
 ///
 /// `arg` is `[key_len:u16][key][precondition:u8][etag_len:u8][etag]
 /// [fence_out_ptr:u64][fence_out_cap:u16]`.
-///
-/// This arm did not exist: DELETE fell to the `ENOSYS` default, so
-/// `storage.object`'s delete member was advertised by the contract and
-/// answered by nothing on this platform.
 ///
 /// Preconditions are REFUSED rather than ignored. This tier keys bytes
 /// and holds no etag to compare, and the contract is explicit that a
@@ -620,6 +639,9 @@ unsafe fn obj_delete(arg: *mut u8, arg_len: usize) -> i32 {
         core::ptr::copy_nonoverlapping(arg.add(p + 8), b.as_mut_ptr(), 2);
         u16::from_le_bytes(b) as usize
     };
+    if !fence_ok(fence_out_ptr, fence_out_cap) {
+        return errno::EINVAL;
+    }
 
     let rc = host_object_delete(arg.add(2) as *const u8, key_len);
     if rc < 0 {

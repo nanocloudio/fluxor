@@ -19,8 +19,7 @@ use std::path::Path;
 /// A `[[ci.observability.exemption]]` row from `fluxor.toml` — the
 /// project-level escape hatch for a data-moving module whose manifest can't be
 /// edited (e.g. a vendored/downstream module). Equivalent to a per-manifest
-/// `[observability] exempt = "..."`, but declared centrally. See
-/// `standards/observability.md` §9.
+/// `[observability] exempt = "..."`, but declared centrally.
 #[derive(Debug, Clone, Deserialize)]
 pub struct TomlExemption {
     /// Module path as it appears in the lint (e.g. `foundation/quic`), matched
@@ -281,7 +280,7 @@ impl IdTable {
     }
 }
 
-// ── Instrumentation-contract lint (standards/observability.md §6) ───────────
+// ── Instrumentation-contract lint ───────────
 
 /// A module's standing against the instrumentation contract.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -296,11 +295,11 @@ pub enum ObsStatus {
     NotDataMoving,
 }
 
-/// The attribute-key vocabulary (`standards/observability.md` §5): the OTel
+/// The attribute-key vocabulary: the OTel
 /// semantic-convention keys the standard names for reuse, extracted into a
 /// checkable list so `fluxor lint observability` enforces the semantic
 /// conventions as a live contract instead of prose. Keep this list in sync
-/// with `standards/observability.md` §5 — a
+/// with the observability standard — a
 /// key used by a manifest that is neither here nor `fluxor.*` is a lint
 /// error, which is exactly the drift the rule exists to stop.
 pub const SEMCONV_KEYS: &[&str] = &[
@@ -404,7 +403,7 @@ pub fn lint(root: &Path) -> ObsLintReport {
 /// `[[ci.observability.exemption]]` row is treated as `Exempt` even when its
 /// manifest declares neither instruments nor an `exempt` reason. The
 /// per-manifest field takes precedence; the toml list only rescues otherwise-
-/// uninstrumented modules. See `standards/observability.md` §9.
+/// uninstrumented modules.
 pub fn lint_with_exemptions(root: &Path, toml_exemptions: &[TomlExemption]) -> ObsLintReport {
     let mut report = ObsLintReport::default();
     for entry in walkdir::WalkDir::new(root)

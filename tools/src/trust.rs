@@ -6,8 +6,8 @@
 //! retired. **Revocation is first-class**: an artifact signed only by a revoked
 //! key fails admission even if the key would otherwise be trusted.
 //!
-//! The Ed25519 signature check itself is [`crate::crypto::verify`] (the same
-//! verify path the kernel loader runs); the node agent verifies a signature to
+//! The Ed25519 signature check itself is [`crate::crypto::verify`], which
+//! applies the same strict rules as the kernel loader's verifier; the node agent verifies a signature to
 //! establish the signer key, then consults this policy for the trust/revocation
 //! *decision*. Keeping the decision separate from the crypto keeps it
 //! exhaustively testable, and keeps the two questions apart: a valid signature

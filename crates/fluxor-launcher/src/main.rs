@@ -12,6 +12,7 @@
     reason = "user-facing diagnostics on the unhappy path; there is no logging substrate before the CLI execs"
 )]
 
+use std::ffi::OsString;
 use std::fs::File;
 use std::io::{Seek, SeekFrom};
 use std::os::fd::{AsRawFd, FromRawFd};
@@ -20,16 +21,41 @@ use std::path::PathBuf;
 
 const TRIPLE: &str = env!("FLUXOR_HOST_TRIPLE");
 
+/// The store root, by the rule the CLI's `oci_store::store_root` applies:
+/// `$FLUXOR_STORE`, else `$XDG_DATA_HOME/fluxor/store`, else
+/// `$HOME/.local/share/fluxor/store`. An empty `$FLUXOR_STORE` or
+/// `$XDG_DATA_HOME` counts as unset; with none of the three set there is no
+/// root.
+fn store_root_from(
+    fluxor_store: Option<OsString>,
+    xdg_data_home: Option<OsString>,
+    home: Option<OsString>,
+) -> Option<PathBuf> {
+    if let Some(v) = fluxor_store.filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(v));
+    }
+    if let Some(xdg) = xdg_data_home.filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(xdg).join("fluxor").join("store"));
+    }
+    home.map(|h| PathBuf::from(h).join(".local/share/fluxor/store"))
+}
+
 fn store_root() -> PathBuf {
-    if let Some(v) = std::env::var_os("FLUXOR_STORE") {
-        return PathBuf::from(v);
-    }
-    if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
-        if !xdg.is_empty() {
-            return PathBuf::from(xdg).join("fluxor").join("store");
-        }
-    }
-    PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/share/fluxor/store")
+    store_root_from(
+        std::env::var_os("FLUXOR_STORE"),
+        std::env::var_os("XDG_DATA_HOME"),
+        std::env::var_os("HOME"),
+    )
+    .unwrap_or_else(|| {
+        die("cannot resolve store root: none of $FLUXOR_STORE, $XDG_DATA_HOME, $HOME set")
+    })
+}
+
+/// The 64-hex body of a `sha256:` digest, or `None`: a digest read from the
+/// index becomes a path under `blobs/sha256/`, so nothing else may.
+fn digest_hex(d: &str) -> Option<&str> {
+    d.strip_prefix("sha256:")
+        .filter(|h| h.len() == 64 && h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
 }
 
 fn die(msg: &str) -> ! {
@@ -86,18 +112,18 @@ fn main() {
     }) else {
         die(&format!("tag {want} not found in store"));
     };
-    let digest = desc["digest"].as_str().unwrap_or_default();
-    let blob = |d: &str| {
-        root.join("blobs/sha256")
-            .join(d.trim_start_matches("sha256:"))
+    let blob = |d: &str| match digest_hex(d) {
+        Some(hex) => root.join("blobs/sha256").join(hex),
+        None => die(&format!("malformed digest {d:?} in store index")),
     };
-    let manifest: serde_json::Value = match std::fs::read(blob(digest)) {
-        Ok(b) => match serde_json::from_slice(&b) {
-            Ok(v) => v,
-            Err(e) => die(&format!("CLI manifest blob unreadable ({e})")),
-        },
-        Err(e) => die(&format!("CLI manifest blob missing ({e})")),
-    };
+    let manifest: serde_json::Value =
+        match std::fs::read(blob(desc["digest"].as_str().unwrap_or_default())) {
+            Ok(b) => match serde_json::from_slice(&b) {
+                Ok(v) => v,
+                Err(e) => die(&format!("CLI manifest blob unreadable ({e})")),
+            },
+            Err(e) => die(&format!("CLI manifest blob missing ({e})")),
+        };
     let Some(bin_digest) = manifest["layers"][0]["digest"].as_str() else {
         die("CLI manifest has no binary layer");
     };
@@ -160,6 +186,40 @@ mod tests {
         std::fs::write(&path, b"content-addressed runtime")?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))?;
         Ok(path)
+    }
+
+    /// The CLI's rule exactly: an empty `$FLUXOR_STORE` or `$XDG_DATA_HOME`
+    /// is unset, and no variable at all is no root.
+    #[test]
+    fn store_root_matches_the_cli_rule() {
+        let s = |v: &str| Some(OsString::from(v));
+        assert_eq!(
+            store_root_from(s("/st"), s("/xdg"), s("/h")),
+            Some(PathBuf::from("/st"))
+        );
+        assert_eq!(
+            store_root_from(s(""), s("/xdg"), s("/h")),
+            Some(PathBuf::from("/xdg/fluxor/store"))
+        );
+        assert_eq!(
+            store_root_from(s(""), s(""), s("/h")),
+            Some(PathBuf::from("/h/.local/share/fluxor/store"))
+        );
+        assert_eq!(store_root_from(None, None, None), None);
+    }
+
+    #[test]
+    fn index_digests_are_held_to_sha256_hex() {
+        let hex = "a".repeat(64);
+        assert_eq!(digest_hex(&format!("sha256:{hex}")), Some(hex.as_str()));
+        for bad in [
+            "sha256:../../bin/sh".to_string(),
+            format!("sha256:{}", "A".repeat(64)),
+            hex.clone(),
+            String::new(),
+        ] {
+            assert_eq!(digest_hex(&bad), None, "{bad:?}");
+        }
     }
 
     #[test]

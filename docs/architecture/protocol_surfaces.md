@@ -676,10 +676,16 @@ anchor–worker boundary is a channel boundary, and remote channels let
 it cross nodes without rewriting the module model. When an anchor
 terminates TLS, DTLS, or QUIC crypto and forwards post-decrypt traffic
 to a worker on another node, that hop becomes the trust boundary, and
-the remote-channel transport must provide mutual authentication,
-integrity protection, and encryption. Continuity expectations differ
-per edge: internal cluster streams may be `resumable` while external
-client sessions are `edge_anchored`.
+the transport under the remote channel must provide mutual
+authentication, integrity protection and encryption: `remote_channel`
+authenticates and encrypts nothing itself. It speaks `net_proto` to the
+clear side of a mutual-TLS `tls` instance and, by default, uses a session
+only once that instance's `peer_identity` binds the peer, or it speaks
+the mux contract to `quic`, one stream per channel. It carries each
+channel's records whole and refuses a session whose channel table differs
+from its own (see [`mesh.md`](mesh.md#transport)). Continuity expectations
+differ per edge: internal cluster streams may be `resumable` while
+external client sessions are `edge_anchored`.
 
 A graph is instantiated on one node, but a continuity declaration may
 name members that live on others. Such a member is declared in

@@ -23,8 +23,9 @@
 //! Single-writer by construction, as on Linux: the provider serialises calls
 //! and the runtime is one scheduler on one core for this dispatch.
 
+use crate::abi::contracts::storage::handle::STORAGE_KEY_MAX;
 use crate::abi::contracts::storage::{namespace as ns_op, object as obj_op};
-use crate::abi::fence::Fence;
+use crate::abi::fence::{Fence, WIRE_MAX_LEN};
 use crate::kernel::ipc::channel::channel_write;
 use crate::kernel::ipc::fd::{slot_of, tag_fd, FD_TAG_STORAGE_NAMESPACE, FD_TAG_STORAGE_OBJECT};
 use crate::kernel::sys::errno;
@@ -34,9 +35,6 @@ use crate::kernel::sys::errno;
 /// missing key as a deletion, so silently evicting is how it comes to tear
 /// down what that key named.
 pub const MAX_OBJECTS: usize = 512;
-/// Longest key. Sized for a several-segment path with names at each segment,
-/// which is the deepest shape a keyed object graph builds.
-pub const MAX_KEY: usize = 192;
 /// Longest value. Matches `store_effect`'s own `MAX_VALUE`, so a value that
 /// crosses the connector fits the store that holds it.
 pub const MAX_VALUE: usize = 4096;
@@ -70,7 +68,7 @@ enum Kind {
 #[derive(Clone, Copy)]
 struct Entry {
     in_use: bool,
-    key: [u8; MAX_KEY],
+    key: [u8; STORAGE_KEY_MAX],
     key_len: u16,
     val: [u8; MAX_VALUE],
     val_len: u16,
@@ -79,7 +77,7 @@ struct Entry {
 
 const ENTRY_EMPTY: Entry = Entry {
     in_use: false,
-    key: [0; MAX_KEY],
+    key: [0; STORAGE_KEY_MAX],
     key_len: 0,
     val: [0; MAX_VALUE],
     val_len: 0,
@@ -90,7 +88,7 @@ const ENTRY_EMPTY: Entry = Entry {
 struct HistEntry {
     revision: u64,
     kind: Kind,
-    key: [u8; MAX_KEY],
+    key: [u8; STORAGE_KEY_MAX],
     key_len: u16,
     val: [u8; MAX_VALUE],
     val_len: u16,
@@ -99,7 +97,7 @@ struct HistEntry {
 const HIST_EMPTY: HistEntry = HistEntry {
     revision: 0,
     kind: Kind::Added,
-    key: [0; MAX_KEY],
+    key: [0; STORAGE_KEY_MAX],
     key_len: 0,
     val: [0; MAX_VALUE],
     val_len: 0,
@@ -108,7 +106,7 @@ const HIST_EMPTY: HistEntry = HistEntry {
 #[derive(Clone, Copy)]
 struct Sub {
     in_use: bool,
-    prefix: [u8; MAX_KEY],
+    prefix: [u8; STORAGE_KEY_MAX],
     prefix_len: u16,
     sink_chan: u32,
     sequence: u32,
@@ -118,7 +116,7 @@ struct Sub {
 
 const SUB_EMPTY: Sub = Sub {
     in_use: false,
-    prefix: [0; MAX_KEY],
+    prefix: [0; STORAGE_KEY_MAX],
     prefix_len: 0,
     sink_chan: 0,
     sequence: 0,
@@ -260,7 +258,7 @@ impl Store {
         let h = &mut self.hist[self.hist_head];
         h.revision = revision;
         h.kind = kind;
-        h.key_len = key.len().min(MAX_KEY) as u16;
+        h.key_len = key.len().min(STORAGE_KEY_MAX) as u16;
         h.key[..h.key_len as usize].copy_from_slice(&key[..h.key_len as usize]);
         h.val_len = val.len().min(MAX_VALUE) as u16;
         h.val[..h.val_len as usize].copy_from_slice(&val[..h.val_len as usize]);
@@ -281,7 +279,7 @@ impl Store {
     }
 
     fn put(&mut self, key: &[u8], val: &[u8]) -> Result<u64, i32> {
-        if key.len() > MAX_KEY || val.len() > MAX_VALUE {
+        if key.len() > STORAGE_KEY_MAX || val.len() > MAX_VALUE {
             return Err(errno::EINVAL);
         }
         self.revision += 1;
@@ -325,6 +323,85 @@ impl Store {
     }
 }
 
+/// What a write may be made conditional on, by the contract's discriminants.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Condition {
+    Any,
+    Absent,
+    Revision(u64),
+}
+
+impl Condition {
+    /// Whether a key at `existing` (its revision, `None` when absent) refuses
+    /// the write.
+    fn refuses(self, existing: Option<u64>) -> bool {
+        match self {
+            Condition::Any => false,
+            Condition::Absent => existing.is_some(),
+            Condition::Revision(want) => existing != Some(want),
+        }
+    }
+}
+
+/// Read a `[precondition:u8][etag_len:u8][etag]` block at `*p`, advancing past
+/// it. `None` when the block is cut short, names a kind this store does not
+/// know, or carries `ETAG` without a whole revision: each is a malformed
+/// request, and answering one as unconditional would turn a guard the caller
+/// asked for into no guard at all.
+fn read_condition(a: &[u8], p: &mut usize) -> Option<Condition> {
+    use obj_op::precondition as pre;
+    let kind = *a.get(*p)?;
+    let etag_len = *a.get(*p + 1)? as usize;
+    let etag = a.get(*p + 2..*p + 2 + etag_len)?;
+    *p += 2 + etag_len;
+    match kind {
+        pre::ANY => Some(Condition::Any),
+        pre::ABSENT => Some(Condition::Absent),
+        pre::ETAG => Some(Condition::Revision(get_u64(etag, 0)?)),
+        _ => None,
+    }
+}
+
+impl Store {
+    /// The in-use entry with the smallest key under `prefix` that sorts
+    /// strictly after `after` (any key when `after` is `None`). The table is
+    /// in slot order, not key order, so a listing selects its next entry
+    /// by key each step.
+    fn next_after(&self, prefix: &[u8], after: Option<&[u8]>) -> Option<usize> {
+        let mut pick: Option<usize> = None;
+        for (i, e) in self.entries.iter().enumerate() {
+            let key = &e.key[..e.key_len as usize];
+            if !e.in_use || !has_prefix(key, prefix) || after.is_some_and(|a| key <= a) {
+                continue;
+            }
+            match pick {
+                Some(j) if &self.entries[j].key[..self.entries[j].key_len as usize] <= key => {}
+                _ => pick = Some(i),
+            }
+        }
+        pick
+    }
+}
+
+/// The `LIST` cursor as a key under `prefix`, or `EINVAL`: it is the last key
+/// a page returned, so anything else was not issued here.
+fn list_cursor<'a>(cursor: &'a [u8], prefix: &[u8]) -> Result<Option<&'a [u8]>, i32> {
+    if cursor.is_empty() {
+        Ok(None)
+    } else if core::str::from_utf8(cursor).is_err() || !has_prefix(cursor, prefix) {
+        Err(errno::EINVAL)
+    } else {
+        Ok(Some(cursor))
+    }
+}
+
+/// A key a `PUT` may create: UTF-8, as every listed name is, and not empty,
+/// which is the relist sentinel's key on the change stream and the "end of
+/// listing" cursor on `LIST`.
+fn writable_key(key: &[u8]) -> bool {
+    !key.is_empty() && key.len() <= STORAGE_KEY_MAX && core::str::from_utf8(key).is_ok()
+}
+
 fn has_prefix(key: &[u8], prefix: &[u8]) -> bool {
     key.len() >= prefix.len() && &key[..prefix.len()] == prefix
 }
@@ -365,6 +442,15 @@ fn etag_from_rev(rev: u64) -> [u8; 32] {
     let mut e = [0u8; 32];
     e[..8].copy_from_slice(&rev.to_le_bytes());
     e
+}
+
+/// The `[fence_out_ptr:u64][fence_out_cap:u16]` pair at `off`, or `None` —
+/// the op answers `EINVAL` before acting — when it is cut short, null, or
+/// smaller than `WIRE_MAX_LEN`.
+fn fence_out(a: &[u8], off: usize) -> Option<(u64, u16)> {
+    let ptr = get_u64(a, off)?;
+    let cap = get_u16(a, off + 8)?;
+    (ptr != 0 && cap as usize >= WIRE_MAX_LEN).then_some((ptr, cap))
 }
 
 unsafe fn write_fence(fence: Fence, ptr: u64, cap: u16) {
@@ -463,7 +549,7 @@ unsafe fn pump_subscriptions(store: &mut Store) {
             }
             let Some(i) = pick else { break };
             let h = store.hist[i];
-            let mut buf = [0u8; EVENT_HEADER_SIZE + 16 + MAX_KEY + MAX_VALUE];
+            let mut buf = [0u8; EVENT_HEADER_SIZE + 16 + STORAGE_KEY_MAX + MAX_VALUE];
             let n = encode_event(
                 s.sequence,
                 h.revision,
@@ -512,14 +598,12 @@ pub unsafe fn dispatch_object(handle: i32, opcode: u32, arg: *mut u8, arg_len: u
             let Some(kl) = get_u16(a, 0).map(|v| v as usize) else {
                 return errno::EINVAL;
             };
-            if a.len() < 2 + kl {
+            let Some(key) = a.get(2..2 + kl) else {
+                return errno::EINVAL;
+            };
+            if !writable_key(key) {
                 return errno::EINVAL;
             }
-            let mut key = [0u8; MAX_KEY];
-            if kl > MAX_KEY {
-                return errno::EINVAL;
-            }
-            key[..kl].copy_from_slice(&a[2..2 + kl]);
             let mut p = 2 + kl;
             let Some(&ctl) = a.get(p) else {
                 return errno::EINVAL;
@@ -532,37 +616,26 @@ pub unsafe fn dispatch_object(handle: i32, opcode: u32, arg: *mut u8, arg_len: u
                 return errno::EINVAL;
             };
             p += 16;
-            // [precondition:u8][etag_len:u8][etag] — the PAIR, then the etag.
-            let Some(&pre) = a.get(p) else {
+            let Some(condition) = read_condition(a, &mut p) else {
                 return errno::EINVAL;
             };
-            let Some(&etag_len) = a.get(p + 1) else {
+            let Some((fence_ptr, fence_cap)) = fence_out(a, p) else {
                 return errno::EINVAL;
             };
-            let etag = a.get(p + 2..p + 2 + etag_len as usize).unwrap_or(&[]);
-            p += 2 + etag_len as usize;
-            let fence_ptr = get_u64(a, p).unwrap_or(0);
-            let fence_cap = get_u16(a, p + 8).unwrap_or(0);
+            if body_len > MAX_VALUE as u64 {
+                return errno::EINVAL;
+            }
 
-            let existing = store.get(&key[..kl]).map(|(_, r)| r);
-            // Preconditions, by the contract's discriminants: 0 ANY,
-            // 1 ABSENT (create-only), 2 MATCH (compare-and-swap).
-            match pre {
-                1 if existing.is_some() => return errno::EEXIST,
-                2 => {
-                    let want = if etag.len() >= 8 {
-                        u64::from_le_bytes([
-                            etag[0], etag[1], etag[2], etag[3], etag[4], etag[5], etag[6], etag[7],
-                        ])
-                    } else {
-                        return errno::EINVAL;
-                    };
-                    // A CAS against a key that moved, or is gone, loses.
-                    if existing != Some(want) {
-                        return errno::EAGAIN;
-                    }
-                }
-                _ => {}
+            let existing = store.get(key).map(|(_, r)| r);
+            if condition.refuses(existing) {
+                // `EEXIST`: somebody created this key, so a create-only caller
+                // has LOST. `EAGAIN`: the key moved or is gone under a
+                // compare-and-swap, so re-read and retry.
+                return if condition == Condition::Absent {
+                    errno::EEXIST
+                } else {
+                    errno::EAGAIN
+                };
             }
 
             let body = if body_len == 0 {
@@ -570,7 +643,7 @@ pub unsafe fn dispatch_object(handle: i32, opcode: u32, arg: *mut u8, arg_len: u
             } else {
                 core::slice::from_raw_parts(body_ptr as *const u8, body_len as usize)
             };
-            match store.put(&key[..kl], body) {
+            match store.put(key, body) {
                 Ok(rev) => {
                     TLM_PUTS = TLM_PUTS.wrapping_add(1);
                     // RevisionMonotone, never LocalDurable: this store is RAM.
@@ -638,6 +711,9 @@ pub unsafe fn dispatch_object(handle: i32, opcode: u32, arg: *mut u8, arg_len: u
             if a.len() < 2 + kl {
                 return errno::EINVAL;
             }
+            let Some((fptr, fcap)) = fence_out(a, 2 + kl + 12) else {
+                return errno::EINVAL;
+            };
             let Some((val, rev)) = store.get(&a[2..2 + kl]) else {
                 return errno::ENXIO;
             };
@@ -649,11 +725,15 @@ pub unsafe fn dispatch_object(handle: i32, opcode: u32, arg: *mut u8, arg_len: u
             rec[0..8].copy_from_slice(&(vlen as u64).to_le_bytes());
             rec[17] = 32;
             rec[18..50].copy_from_slice(&etag_from_rev(rev));
-            if out_ptr != 0 && rec.len() <= out_cap {
-                core::ptr::copy_nonoverlapping(rec.as_ptr(), out_ptr as *mut u8, rec.len());
+            // The count returned is the count written: a record that does not
+            // fit is refused, not reported as delivered.
+            if out_ptr == 0 {
+                return errno::EINVAL;
             }
-            let fptr = get_u64(a, 2 + kl + 12).unwrap_or(0);
-            let fcap = get_u16(a, 2 + kl + 20).unwrap_or(0);
+            if rec.len() > out_cap {
+                return errno::ENOMEM;
+            }
+            core::ptr::copy_nonoverlapping(rec.as_ptr(), out_ptr as *mut u8, rec.len());
             write_fence(
                 Fence::ViewConsistent {
                     source: STORE_SOURCE,
@@ -670,35 +750,20 @@ pub unsafe fn dispatch_object(handle: i32, opcode: u32, arg: *mut u8, arg_len: u
             let Some(kl) = get_u16(a, 0).map(|v| v as usize) else {
                 return errno::EINVAL;
             };
-            if a.len() < 2 + kl || kl > MAX_KEY {
+            let Some(key) = a.get(2..2 + kl) else {
                 return errno::EINVAL;
-            }
-            let mut key = [0u8; MAX_KEY];
-            key[..kl].copy_from_slice(&a[2..2 + kl]);
+            };
             let mut p = 2 + kl;
-            let Some(&pre) = a.get(p) else {
+            let Some(condition) = read_condition(a, &mut p) else {
                 return errno::EINVAL;
             };
-            let Some(&etag_len) = a.get(p + 1) else {
+            let Some((fptr, fcap)) = fence_out(a, p) else {
                 return errno::EINVAL;
             };
-            let etag = a.get(p + 2..p + 2 + etag_len as usize).unwrap_or(&[]);
-            p += 2 + etag_len as usize;
-            let fptr = get_u64(a, p).unwrap_or(0);
-            let fcap = get_u16(a, p + 8).unwrap_or(0);
-            if pre == 2 {
-                let want = if etag.len() >= 8 {
-                    u64::from_le_bytes([
-                        etag[0], etag[1], etag[2], etag[3], etag[4], etag[5], etag[6], etag[7],
-                    ])
-                } else {
-                    return errno::EINVAL;
-                };
-                if store.get(&key[..kl]).map(|(_, r)| r) != Some(want) {
-                    return errno::EAGAIN;
-                }
+            if condition.refuses(store.get(key).map(|(_, r)| r)) {
+                return errno::EAGAIN;
             }
-            let rev = store.delete(&key[..kl]).unwrap_or(store.revision);
+            let rev = store.delete(key).unwrap_or(store.revision);
             TLM_DELS = TLM_DELS.wrapping_add(1);
             write_fence(
                 Fence::RevisionMonotone {
@@ -710,6 +775,64 @@ pub unsafe fn dispatch_object(handle: i32, opcode: u32, arg: *mut u8, arg_len: u
             );
             pump_subscriptions(store);
             0
+        }
+        obj_op::LIST => {
+            TLM_LISTS = TLM_LISTS.wrapping_add(1);
+            let Some(req) = obj_op::list::parse_request(a) else {
+                return errno::EINVAL;
+            };
+            let after = match list_cursor(req.cursor, req.prefix) {
+                Ok(after) => after,
+                Err(e) => return e,
+            };
+            let out = core::slice::from_raw_parts_mut(req.out_ptr as *mut u8, req.out_cap as usize);
+            let mut page = obj_op::list::PageWriter::new(out, req.max_keys);
+            // Bounded by `max_keys` steps of one `MAX_OBJECTS` pass each.
+            let mut last = [0u8; STORAGE_KEY_MAX];
+            let mut last_len = 0usize;
+            let mut more = false;
+            while let Some(i) = store.next_after(
+                req.prefix,
+                if last_len > 0 {
+                    Some(&last[..last_len])
+                } else {
+                    after
+                },
+            ) {
+                if page.is_full() {
+                    more = true;
+                    break;
+                }
+                let e = &store.entries[i];
+                let key = &e.key[..e.key_len as usize];
+                // mtime 0, as HEAD reports it: the store keeps no clock.
+                if !page.push(key, e.val_len as u64, 0, &etag_from_rev(e.revision)) {
+                    more = true;
+                    break;
+                }
+                last_len = key.len();
+                last[..last_len].copy_from_slice(key);
+            }
+            let cursor: &[u8] = if !more {
+                &[]
+            } else if page.count() == 0 {
+                // A page that cannot hold the next entry made no progress.
+                return errno::ENOMEM;
+            } else {
+                &last[..last_len]
+            };
+            let Some(n) = page.finish(cursor) else {
+                return errno::ENOMEM;
+            };
+            write_fence(
+                Fence::ViewConsistent {
+                    source: STORE_SOURCE,
+                    revision: store.revision,
+                },
+                req.fence_out_ptr,
+                req.fence_out_cap,
+            );
+            n as i32
         }
         obj_op::CLOSE => {
             let idx = slot_of(handle) as usize;
@@ -743,107 +866,62 @@ pub unsafe fn dispatch_namespace(handle: i32, opcode: u32, arg: *mut u8, arg_len
         ns_op::CAPS => (ns_op::caps::SUBSCRIBE | ns_op::caps::CHANGES) as i32,
         ns_op::LIST => {
             TLM_LISTS = TLM_LISTS.wrapping_add(1);
-            // [prefix_len:u16][prefix][cursor_len:u16][cursor][out_buf:u64]
-            // [out_cap:u32][fence_ptr:u64][fence_cap:u16]
-            let Some(pl) = get_u16(a, 0).map(|v| v as usize) else {
+            let Some(req) = ns_op::list::parse_request(a) else {
                 return errno::EINVAL;
             };
-            if a.len() < 2 + pl {
-                return errno::EINVAL;
-            }
-            let prefix = &a[2..2 + pl];
-            let mut p = 2 + pl;
-            let Some(cl) = get_u16(a, p).map(|v| v as usize) else {
-                return errno::EINVAL;
+            let after = match list_cursor(req.cursor, req.prefix) {
+                Ok(after) => after,
+                Err(e) => return e,
             };
-            // A 4-byte LE start index, exactly as Linux encodes it. Any other
-            // length is REFUSED rather than treated as absent: silently
-            // restarting a listing the caller believed it was continuing
-            // loops it over the first page forever.
-            let start = match cl {
-                0 => 0usize,
-                4 => match a.get(p + 2..p + 6) {
-                    Some(i) => u32::from_le_bytes([i[0], i[1], i[2], i[3]]) as usize,
-                    None => return errno::EINVAL,
+            let out = core::slice::from_raw_parts_mut(req.out_ptr as *mut u8, req.out_cap as usize);
+            let mut page = ns_op::list::PageWriter::new(out);
+            let mut last = [0u8; STORAGE_KEY_MAX];
+            let mut last_len = 0usize;
+            let mut more = false;
+            while let Some(i) = store.next_after(
+                req.prefix,
+                if last_len > 0 {
+                    Some(&last[..last_len])
+                } else {
+                    after
                 },
-                _ => return errno::EINVAL,
-            };
-            p += 2 + cl;
-            if a.len() < p + 22 {
-                return errno::EINVAL;
-            }
-            let out_buf = get_u64(a, p).unwrap_or(0);
-            let out_cap = get_u32(a, p + 8).unwrap_or(0) as usize;
-            let fptr = get_u64(a, p + 12).unwrap_or(0);
-            let fcap = get_u16(a, p + 20).unwrap_or(0);
-
-            // Listing order must be STABLE across calls or the cursor means
-            // nothing: entry-slot order is stable here because a slot is only
-            // reused after a delete, and a delete already invalidates a
-            // listing in progress.
-            let mut idxs = [0usize; MAX_OBJECTS];
-            let mut n = 0usize;
-            for (i, e) in store.entries.iter().enumerate() {
-                if e.in_use && has_prefix(&e.key[..e.key_len as usize], prefix) {
-                    idxs[n] = i;
-                    n += 1;
-                }
-            }
-
-            const TRAILER_MAX: usize = 6;
-            let mut buf = [0u8; 2048];
-            let mut o = 0usize;
-            let mut next = start;
-            while next < n {
-                let e = &store.entries[idxs[next]];
-                let name = &e.key[..e.key_len as usize];
-                // The record's length prefix is one byte, and `MAX_KEY`
-                // (192) is what keeps every key expressible in it.
-                const _: () = assert!(MAX_KEY <= 255);
-                let need = 2 + name.len();
-                if o + need + TRAILER_MAX > buf.len()
-                    || (out_buf != 0 && o + need + TRAILER_MAX > out_cap)
-                {
+            ) {
+                let e = &store.entries[i];
+                let key = &e.key[..e.key_len as usize];
+                if !page.push(key, ns_op::KIND_OBJECT) {
+                    more = true;
                     break;
                 }
-                buf[o] = name.len() as u8;
-                buf[o + 1] = ns_op::KIND_OBJECT;
-                buf[o + 2..o + 2 + name.len()].copy_from_slice(name);
-                o += need;
-                next += 1;
+                last_len = key.len();
+                last[..last_len].copy_from_slice(key);
             }
-            buf[o] = 0xFF;
-            o += 1;
-            if next < n {
-                buf[o] = 4;
-                buf[o + 1..o + 5].copy_from_slice(&(next as u32).to_le_bytes());
-                o += 5;
+            let cursor: &[u8] = if !more {
+                &[]
+            } else if page.count() == 0 {
+                // A page that cannot hold the next entry made no progress.
+                return errno::ENOMEM;
             } else {
-                buf[o] = 0;
-                o += 1;
-            }
-            if out_buf != 0 {
-                if o > out_cap {
-                    return errno::ENOMEM;
-                }
-                core::ptr::copy_nonoverlapping(buf.as_ptr(), out_buf as *mut u8, o);
-            }
+                &last[..last_len]
+            };
+            let Some(n) = page.finish(cursor) else {
+                return errno::ENOMEM;
+            };
             write_fence(
                 Fence::ViewConsistent {
                     source: STORE_SOURCE,
                     revision: store.revision,
                 },
-                fptr,
-                fcap,
+                req.fence_out_ptr,
+                req.fence_out_cap,
             );
-            o as i32
+            n as i32
         }
         ns_op::SUBSCRIBE => {
             // [prefix_len:u16][prefix][sink_chan:u32][flags:u8]
             let Some(pl) = get_u16(a, 0).map(|v| v as usize) else {
                 return errno::EINVAL;
             };
-            if a.len() < 2 + pl || pl > MAX_KEY {
+            if a.len() < 2 + pl || pl > STORAGE_KEY_MAX {
                 return errno::EINVAL;
             }
             let Some(sink_chan) = get_u32(a, 2 + pl) else {
@@ -873,7 +951,7 @@ pub unsafe fn dispatch_namespace(handle: i32, opcode: u32, arg: *mut u8, arg_len
                     {
                         continue;
                     }
-                    let mut buf = [0u8; EVENT_HEADER_SIZE + 16 + MAX_KEY + MAX_VALUE];
+                    let mut buf = [0u8; EVENT_HEADER_SIZE + 16 + STORAGE_KEY_MAX + MAX_VALUE];
                     let n = encode_event(
                         subs[idx].sequence,
                         e.revision,

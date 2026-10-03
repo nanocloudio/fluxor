@@ -347,39 +347,73 @@ unsafe fn dev_channel_register_ioctl(
     (sys.provider_call)(handle, 0x0507, buf.as_mut_ptr(), 16)
 }
 
-/// Acquire write access to mailbox buffer via provider_call (BUFFER::ACQUIRE_WRITE 0x0A00).
-/// Returns pointer (as *mut u8) or null. capacity_out receives buffer capacity.
+/// Run one of the three mailbox acquires (`kernel_abi::buffer`): the buffer,
+/// or null, and the length the kernel reported through `len_out` when it is
+/// not null. The address comes back in the call's argument record, never in
+/// its `i32` result, so it survives on a 64-bit target.
+#[inline(always)]
+unsafe fn dev_buffer_acquire(sys: &SyscallTable, chan: i32, op: u32, len_out: *mut u32) -> *mut u8 {
+    use abi::kernel_abi::buffer::acquired;
+    let mut rec = [0u8; acquired::SIZE];
+    let rc = (sys.provider_call)(chan, op, rec.as_mut_ptr(), rec.len());
+    if !len_out.is_null() {
+        *len_out = u32::from_le_bytes([
+            rec[acquired::LEN],
+            rec[acquired::LEN + 1],
+            rec[acquired::LEN + 2],
+            rec[acquired::LEN + 3],
+        ]);
+    }
+    if rc != 0 {
+        return core::ptr::null_mut();
+    }
+    let mut a = [0u8; 8];
+    a.copy_from_slice(&rec[acquired::PTR..acquired::PTR + 8]);
+    u64::from_le_bytes(a) as usize as *mut u8
+}
+
+/// Acquire write access to a mailbox channel's buffer
+/// (`kernel_abi::buffer::ACQUIRE_WRITE`). Returns the buffer, or null.
+/// `capacity_out` receives the buffer's capacity, also when the mailbox is
+/// busy, so a producer can tell "busy" (non-zero) from "not a mailbox" (zero).
 #[inline(always)]
 unsafe fn dev_buffer_acquire_write(
     sys: &SyscallTable,
     chan: i32,
     capacity_out: *mut u32,
 ) -> *mut u8 {
-    (sys.provider_call)(chan, 0x0A00, capacity_out as *mut u8, 4) as *mut u8
+    dev_buffer_acquire(
+        sys,
+        chan,
+        abi::kernel_abi::buffer::ACQUIRE_WRITE,
+        capacity_out,
+    )
 }
 
-/// Release write buffer via provider_call (BUFFER::RELEASE_WRITE 0x0A01).
+/// Release a write buffer (`kernel_abi::buffer::RELEASE_WRITE`).
 #[inline(always)]
 unsafe fn dev_buffer_release_write(sys: &SyscallTable, chan: i32, len: u32) -> i32 {
     let mut buf = len.to_le_bytes();
     (sys.provider_call)(chan, 0x0A01, buf.as_mut_ptr(), 4)
 }
 
-/// Acquire in-place buffer access via provider_call (BUFFER::ACQUIRE_INPLACE 0x0A04).
-/// Returns pointer to existing data or null. len_out receives data length.
+/// Acquire in-place access to the pending message
+/// (`kernel_abi::buffer::ACQUIRE_INPLACE`). Returns the buffer, or null;
+/// `len_out` receives the message length.
 #[inline(always)]
 unsafe fn dev_buffer_acquire_inplace(sys: &SyscallTable, chan: i32, len_out: *mut u32) -> *mut u8 {
-    (sys.provider_call)(chan, 0x0A04, len_out as *mut u8, 4) as *mut u8
+    dev_buffer_acquire(sys, chan, abi::kernel_abi::buffer::ACQUIRE_INPLACE, len_out)
 }
 
-/// Acquire read access to buffer via provider_call (BUFFER::ACQUIRE_READ 0x0A02).
-/// Returns pointer to data or null. len_out receives data length.
+/// Acquire read access to the pending message
+/// (`kernel_abi::buffer::ACQUIRE_READ`). Returns the buffer, or null;
+/// `len_out` receives the message length.
 #[inline(always)]
 unsafe fn dev_buffer_acquire_read(sys: &SyscallTable, chan: i32, len_out: *mut u32) -> *const u8 {
-    (sys.provider_call)(chan, 0x0A02, len_out as *mut u8, 4) as *const u8
+    dev_buffer_acquire(sys, chan, abi::kernel_abi::buffer::ACQUIRE_READ, len_out) as *const u8
 }
 
-/// Release read buffer via provider_call (BUFFER::RELEASE_READ 0x0A03).
+/// Release a read buffer (`kernel_abi::buffer::RELEASE_READ`).
 #[inline(always)]
 unsafe fn dev_buffer_release_read(sys: &SyscallTable, chan: i32) -> i32 {
     (sys.provider_call)(chan, 0x0A03, core::ptr::null_mut(), 0)

@@ -1,11 +1,12 @@
 //! Store publish — the single store-write path behind `fluxor
 //! publish`: every artifact kind (source trees, fmods, runtimes, the
 //! CLI) staged under one publish transaction and committed in one
-//! locked index swap, each annotated with the epoch, its
-//! token-canonical input digest, provenance, source rev, and — when
-//! the last green `fluxor ci` covered the same inputs — the ci
-//! digest. Lib-only (the store engine layering): the bin reaches it
-//! via `fluxor_tools::store_publish`, mirroring `store_cli`.
+//! locked index swap. Each manifest is annotated with the epoch and its
+//! token-canonical input digest; the provenance, source rev and — when
+//! the last green `fluxor ci` covered the same inputs — the ci digest
+//! are filed in the store's provenance table beside it. Lib-only (the
+//! store engine layering): the bin reaches it via
+//! `fluxor_tools::store_publish`, mirroring `store_cli`.
 
 use std::path::{Path, PathBuf};
 
@@ -100,7 +101,7 @@ pub(crate) fn tree_content_digest(root: &Path) -> Result<String> {
 
 /// Where `fluxor ci` records the input digests it went green on:
 /// `target/fluxor/.ci-green.toml` (`name = "hex"` lines). Publish
-/// annotates `ci-digest` only for artifacts whose current input digest
+/// records the ci digest only for artifacts whose current input digest
 /// appears here — information, never a gate.
 pub fn ci_green_stamp_path(project_root: &Path) -> PathBuf {
     project_root.join("target/fluxor/.ci-green.toml")
@@ -152,7 +153,7 @@ fn source_candidates(
 /// Per-artifact input digests for everything the project publishes —
 /// the shared walk behind publish annotation and the ci green stamp
 /// (`fluxor ci` writes exactly this map on a green run; publish
-/// annotates `ci-digest` where current digests match it).
+/// records the ci digest where current digests match it).
 pub fn project_input_digests(pr: &Path) -> Result<BTreeMap<String, String>> {
     let identity = require_project_identity(pr)?;
     let mut out = BTreeMap::new();
@@ -224,13 +225,15 @@ pub fn project_input_digests(pr: &Path) -> Result<BTreeMap<String, String>> {
 /// checkouts are still pinning.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PublishMode {
-    /// Compute and print the displacement report, then stop without
-    /// writing anything. The report is a pure function of the prepared
-    /// manifests, the index and the pin ledger, so what it describes is
-    /// exactly what a real publish would then do.
+    /// Compute and print the displacement report and the tags a publish
+    /// would retire, then stop without writing anything. The report is a
+    /// pure function of the prepared manifests, the index and the pin
+    /// ledger, so what it describes is exactly what a real publish would
+    /// then do.
     pub dry_run: bool,
-    /// Refuse the publish if it would displace a manifest another
-    /// checkout pins. The right default for a release publish and the
+    /// Refuse the publish if it would displace (repoint or retire) a
+    /// manifest another checkout pins; a refused publish writes nothing.
+    /// The right default for a release publish and the
     /// wrong one for the fifteen local publishes a working session does,
     /// which is why it is a flag and not a setting.
     pub strict_pins: bool,
@@ -266,8 +269,8 @@ pub fn publish_project_with_mode(
 
     let store = OciStore::open(crate::oci_store::store_root()?)?;
 
-    // Retire tags for modules this project no longer has, BEFORE opening
-    // the publish transaction.
+    // Retire tags for modules this project no longer has, as part of the
+    // publish plan.
     //
     // A publish that only ever ADDED tags would leave a module deleted from
     // the source tree holding its artefact in the store forever, at whatever
@@ -278,10 +281,9 @@ pub fn publish_project_with_mode(
     // to. Retirement is what keeps the published set a function of the
     // current tree rather than of every tree there has ever been.
     //
-    // Before the transaction rather than after, for two reasons. `remove`
-    // takes the same store lock `begin_publish` holds, so doing it inside
-    // deadlocks against ourselves. And tidying first means a publish that
-    // then fails still leaves the store consistent rather than half-swept.
+    // The retired tags join the same plan as the repointed ones: one index
+    // swap drops them, the displacement report and `--strict-pins` see
+    // them, and a dry run or a refusal leaves them exactly where they were.
     //
     // Only this project's own module tags, and only when the fmod sweep
     // will actually run — a `--only source` publish has no opinion about
@@ -291,11 +293,13 @@ pub fn publish_project_with_mode(
     } else {
         BTreeMap::new()
     };
-    if want("fmod") {
-        retire_deleted_modules(&store, &pr, &identity.name, &withheld, verbose)?;
-    }
 
     let txn = store.begin_publish()?;
+    let retire = if want("fmod") {
+        modules_to_retire(&store, &pr, &identity.name, &withheld)?
+    } else {
+        Vec::new()
+    };
     let mut prepared: Vec<Prepared> = Vec::new();
 
     let meta_for = |name: &str, input_hex: Option<&str>, ci: &BTreeMap<String, String>| {
@@ -599,18 +603,19 @@ pub fn publish_project_with_mode(
         .join(",");
     let deps = if deps.is_empty() { None } else { Some(deps) };
 
-    // The displacement report, before anything is written. Both the dry
-    // run and the strict gate read the SAME plan the commit will use, so
-    // neither can describe a publish other than the one that follows.
+    // One plan, made before anything is written: the dry run, the strict
+    // gate and the commit all read it, so none can describe a publish other
+    // than the one that follows, and a refusal leaves the store untouched.
+    let retire_refs: Vec<String> = retire.iter().map(|(r, _)| r.clone()).collect();
+    let plan = store.plan_publish(
+        &store.read_index()?,
+        &identity.name,
+        &identity.version,
+        &prepared,
+        deps.as_deref(),
+        &retire_refs,
+    )?;
     if mode.dry_run || mode.strict_pins {
-        let index = store.read_index()?;
-        let plan = store.plan_publish(
-            &index,
-            &identity.name,
-            &identity.version,
-            &prepared,
-            deps.as_deref(),
-        )?;
         let report = store.displacement_report(&plan, &pr)?;
         print!(
             "\npublish {} {} — displacement report{}",
@@ -632,19 +637,20 @@ pub fn publish_project_with_mode(
             )));
         }
         if mode.dry_run {
+            for (reference, why) in &retire {
+                println!("would retire {reference} ({why})");
+            }
             println!("\ndry run: nothing was written.");
             return Ok(Vec::new());
         }
     }
 
-    let (committed, report) = store.commit_publish_reported(
-        &txn,
-        &identity.name,
-        &identity.version,
-        prepared,
-        deps.as_deref(),
-        Some(&pr),
-    )?;
+    let (committed, report) = store.commit_plan(&txn, plan, prepared, Some(&pr))?;
+    if verbose {
+        for (reference, why) in &retire {
+            println!("retired {reference} ({why})");
+        }
+    }
     if !report.is_empty() {
         eprint!(
             "\npublish {} {} — displacement report{}",
@@ -675,20 +681,19 @@ fn withheld_artifacts(project_root: &Path) -> Result<BTreeMap<String, String>> {
     Ok(out)
 }
 
-/// Remove store tags for modules that are no longer in `project_root`, and
-/// for modules whose manifest withholds them from publication.
+/// The store tags of modules that are no longer in `project_root`, and of
+/// modules whose manifest withholds them from publication, each with the
+/// reason. Nothing is removed here: the tags join the publish plan.
 ///
 /// A withheld module must not stay resolvable at whatever digest it was last
 /// published with: consumers would keep syncing an artefact the project has
-/// stopped vouching for. See the call site for why this runs before the
-/// publish transaction.
-fn retire_deleted_modules(
+/// stopped vouching for.
+fn modules_to_retire(
     store: &OciStore,
     project_root: &Path,
     project: &str,
     withheld: &BTreeMap<String, String>,
-    verbose: bool,
-) -> Result<()> {
+) -> Result<Vec<(String, &'static str)>> {
     let live: std::collections::BTreeSet<String> = crate::modules_build::list(project_root)?
         .into_iter()
         .map(|m| m.name)
@@ -699,12 +704,10 @@ fn retire_deleted_modules(
     // would be catastrophic and silent. Nothing is retired without at least
     // one live module to compare against.
     if live.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
-    let Ok(index) = store.read_index() else {
-        return Ok(());
-    };
-    let mut stale: Vec<String> = Vec::new();
+    let index = store.read_index()?;
+    let mut stale: Vec<(String, &'static str)> = Vec::new();
     for d in &index.manifests {
         let Some(reference) = d.annotations.get(crate::oci_store::ANN_REF_NAME) else {
             continue;
@@ -728,23 +731,15 @@ fn retire_deleted_modules(
         if shelf == "src" || shelf == "run" || name == "meta" || shelf.contains('/') {
             continue;
         }
-        if !live.contains(name) || withheld.contains_key(name) {
-            stale.push(reference.clone());
+        if withheld.contains_key(name) {
+            stale.push((reference.clone(), "module withheld"));
+        } else if !live.contains(name) {
+            stale.push((reference.clone(), "module no longer in the source tree"));
         }
     }
     stale.sort();
     stale.dedup();
-    for reference in stale {
-        if store.remove(&reference).is_ok() && verbose {
-            let why = reference
-                .rsplit_once(':')
-                .and_then(|(body, _)| body.rsplit_once('/'))
-                .and_then(|(_, name)| withheld.get(name))
-                .map_or("module no longer in the source tree", |_| "module withheld");
-            println!("retired {reference} ({why})");
-        }
-    }
-    Ok(())
+    Ok(stale)
 }
 
 /// Record a green `fluxor ci` run: the per-artifact input digests the
@@ -757,7 +752,7 @@ pub fn write_ci_green_stamp(project_root: &Path) -> Result<PathBuf> {
     }
     let mut text = String::from(
         "# Written by `fluxor ci` on a green run: artifact name -> input digest.\n\
-         # `fluxor publish` annotates io.fluxor.ci-digest where these match.\n",
+         # `fluxor publish` records the ci digest in the provenance table where these match.\n",
     );
     for (name, hex) in &digests {
         text.push_str(&format!("{name} = \"{hex}\"\n"));
@@ -769,6 +764,7 @@ pub fn write_ci_green_stamp(project_root: &Path) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::publish_project_to_store;
+    use std::collections::BTreeMap;
 
     /// GAP: transitive `#[path]`/`include!` staleness. A module whose
     /// sources reach a file OUTSIDE the module directory must fold
@@ -855,6 +851,21 @@ mod tests {
             "version = \"0.1.0\"\n\n[publish]\nwithheld = \"licence provenance open\"\n",
         )
         .unwrap();
+        // A dry run moves no tag, the retirement included.
+        super::publish_project_with_mode(
+            &pr,
+            &[],
+            false,
+            super::PublishMode {
+                dry_run: true,
+                strict_pins: false,
+            },
+        )
+        .unwrap();
+        let held_after_dry_run = crate::oci_store::OciStore::open(&store_dir)
+            .unwrap()
+            .resolve("bcm2712/held:0.0.1")
+            .is_ok();
         let second = publish_project_to_store(&pr, &[], false).unwrap();
         let digests = super::project_input_digests(&pr).unwrap();
         let store = crate::oci_store::OciStore::open(&store_dir).unwrap();
@@ -867,12 +878,133 @@ mod tests {
             "{second:?}"
         );
         assert!(!second.iter().any(|t| t.contains("/held:")), "{second:?}");
+        assert!(held_after_dry_run, "a dry run retired a tag");
         assert!(
             !held_resolves,
             "a withheld module's earlier tag must be retired"
         );
         assert!(digests.contains_key("kept"));
         assert!(!digests.contains_key("held"));
+    }
+
+    /// Every file under `root`, by relative path, with its bytes.
+    fn tree_bytes(root: &std::path::Path) -> BTreeMap<String, Vec<u8>> {
+        fn walk(
+            root: &std::path::Path,
+            dir: &std::path::Path,
+            out: &mut BTreeMap<String, Vec<u8>>,
+        ) {
+            for e in std::fs::read_dir(dir).unwrap() {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    walk(root, &p, out);
+                } else {
+                    let rel = p.strip_prefix(root).unwrap().to_string_lossy().into_owned();
+                    out.insert(rel, std::fs::read(&p).unwrap());
+                }
+            }
+        }
+        let mut out = BTreeMap::new();
+        walk(root, root, &mut out);
+        out
+    }
+
+    /// A publish that `--strict-pins` refuses, or a dry run, leaves the
+    /// store byte for byte as it was — the retirement of a withheld module
+    /// another checkout pins included, and no blob of the refused publish
+    /// staged — and the refusal is what that retirement triggers.
+    #[test]
+    fn a_refused_or_dry_run_publish_leaves_the_store_untouched() {
+        let scratch = tempfile::tempdir().unwrap();
+        let pr = scratch.path().join("proj");
+        for name in ["kept", "held"] {
+            let dir = pr.join("modules/app").join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("manifest.toml"), "version = \"0.1.0\"\n").unwrap();
+            std::fs::write(dir.join("mod.rs"), "pub fn v() {}\n").unwrap();
+        }
+        std::fs::write(
+            pr.join("fluxor.toml"),
+            "[project]\nname = \"heldproj\"\nversion = \"0.0.1\"\n\n[ci]\ntargets = [\"bcm2712\"]\n",
+        )
+        .unwrap();
+        let silicon = pr.join("targets/silicon");
+        std::fs::create_dir_all(&silicon).unwrap();
+        std::fs::copy(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../targets/silicon/bcm2712.toml"),
+            silicon.join("bcm2712.toml"),
+        )
+        .unwrap();
+        let shelf = pr.join("target/fluxor/bcm2712/modules");
+        std::fs::create_dir_all(&shelf).unwrap();
+        std::fs::write(shelf.join("kept.fmod"), b"kept-bytes").unwrap();
+        std::fs::write(shelf.join("held.fmod"), b"held-bytes").unwrap();
+
+        let store_dir = scratch.path().join("store");
+        let no_workspace = scratch.path().join("no-workspace.toml");
+        let _env = crate::oci_store::test_env_lock();
+        let _scope = crate::oci_store::EnvScope::set(&[
+            ("FLUXOR_STORE", &store_dir),
+            ("FLUXOR_WORKSPACE", &no_workspace),
+        ]);
+        publish_project_to_store(&pr, &[], false).unwrap();
+        let store = crate::oci_store::OciStore::open(&store_dir).unwrap();
+        let held = store.resolve("bcm2712/held:0.0.1").unwrap().digest;
+
+        // Another checkout pins the module about to be withheld.
+        let outsider = scratch.path().join("outsider");
+        std::fs::create_dir_all(&outsider).unwrap();
+        std::fs::write(
+            outsider.join("fluxor.lock"),
+            format!(
+                "[[artifact]]\nkind = \"module\"\nname = \"held\"\nproject = \"heldproj\"\n\
+                 target = \"bcm2712\"\ndigest = \"{held}\"\nreference = \"bcm2712/held:0.0.1\"\n"
+            ),
+        )
+        .unwrap();
+        crate::store_pins::adopt(store.root(), &outsider).unwrap();
+
+        std::fs::write(
+            pr.join("modules/app/held/manifest.toml"),
+            "version = \"0.1.0\"\n\n[publish]\nwithheld = \"licence provenance open\"\n",
+        )
+        .unwrap();
+        // New bytes too, so a publish that staged before refusing would
+        // leave a blob behind.
+        std::fs::write(shelf.join("kept.fmod"), b"kept-bytes-v2").unwrap();
+        let before = tree_bytes(&store_dir);
+
+        let strict = super::PublishMode {
+            dry_run: false,
+            strict_pins: true,
+        };
+        let err = super::publish_project_with_mode(&pr, &[], false, strict)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--strict-pins"), "{err}");
+        assert!(
+            tree_bytes(&store_dir) == before,
+            "a refused publish changed the store"
+        );
+
+        let dry = super::PublishMode {
+            dry_run: true,
+            strict_pins: false,
+        };
+        super::publish_project_with_mode(&pr, &[], false, dry).unwrap();
+        assert!(
+            tree_bytes(&store_dir) == before,
+            "a dry run changed the store"
+        );
+
+        // The same publish without the gate retires the tag in its one swap.
+        publish_project_to_store(&pr, &[], false).unwrap();
+        assert!(store.resolve("bcm2712/held:0.0.1").is_err());
+        assert!(
+            store.has_blob(&held),
+            "the outsider's pin still holds the bytes"
+        );
     }
 
     /// A declared module with no artefact on a declared shelf refuses the whole

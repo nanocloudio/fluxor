@@ -1,16 +1,13 @@
 // =============================================================================
-// Graph Config (Version 3+)
+// Graph Config
 // =============================================================================
 
 /// Graph edge size in bytes (12 = 4-byte fixed header + 4-byte
-/// `buffer_bytes` u32 LE override + rate_class u8 + 3 reserved).
+/// `buffer_bytes` u32 LE override + rate_class u8 + wake flags u8 + 2
+/// reserved).
 /// Mirrors `kernel::config::GRAPH_EDGE_SIZE`; the layout is
 /// documented there.
 const GRAPH_EDGE_SIZE: usize = 12;
-/// Edge slots in a LEGACY graph section (slot code 0). A generated blob sizes
-/// its section from the target's profile (`capacity::kernel_max_edges`); this
-/// is the size a reader assumes for a blob that states no slot code.
-const MAX_GRAPH_EDGES: usize = 128;
 /// Per-domain metadata: 4 domains × DOMAIN_META_ENTRY_SIZE.
 /// Entry = `tick_us:u16 | exec_mode:u8 | adaptive_flags:u8` = 4 bytes. The
 /// adaptive-tick `tick_min_us`/`tick_max_us` bounds are NOT in this entry; they
@@ -20,7 +17,8 @@ const MAX_GRAPH_EDGES: usize = 128;
 const DOMAIN_META_ENTRY_SIZE: usize = 4;
 const DOMAIN_META_SIZE: usize = 4 * DOMAIN_META_ENTRY_SIZE;
 
-/// Module entry header size (entry_length:u32 + name_hash:u32 + id:u8 + reserved:u8).
+/// Module entry header size (entry_length:u32 + name_hash:u32 + id:u8 + meta:u8,
+/// where meta is domain_id in bits 0-2 and pre_tick_drain in bit 4).
 /// `entry_length` is a u32 so a single module's params can exceed
 /// 64 KiB — needed by synth host's http module when both halves of a
 /// split scenario inline the canonical wasm shell as body routes
@@ -1094,14 +1092,21 @@ fn validate_isr_tier_admission(
                     // fall-through to Tier 0 cooperative would let a
                     // typo (`tier: 1c`) silently downgrade the
                     // execution discipline.
-                    if dom.get("tier").is_some() || dom.get("exec_mode").is_some() {
-                        let label = domain_names_local[i]
-                            .clone()
-                            .unwrap_or_else(|| format!("domains[{i}]"));
+                    let label = domain_names_local[i]
+                        .clone()
+                        .unwrap_or_else(|| format!("domains[{i}]"));
+                    if dom.get("exec_mode").is_some() {
                         return Err(Error::Config(format!(
-                            "execution.domains entry '{label}' has an unknown tier/exec_mode \
-                             value. Valid: 0/cooperative, 1a/high_rate, 1b/isr_timer, \
-                             3/poll, 2/isr_owned."
+                            "execution.domains entry '{label}' sets `exec_mode`, which is not a \
+                             key; name the tier with `tier:` (0/cooperative, 1a/high_rate, \
+                             1b/isr_timer, 3/poll, 2/isr_owned)."
+                        )));
+                    }
+                    if dom.get("tier").is_some() {
+                        return Err(Error::Config(format!(
+                            "execution.domains entry '{label}' has an unknown tier value. \
+                             Valid: 0/cooperative, 1a/high_rate, 1b/isr_timer, 3/poll, \
+                             2/isr_owned."
                         )));
                     }
                 }
@@ -1577,15 +1582,14 @@ fn validate_pre_tick_drain_admission(
 /// to Tier 0 cooperative without warning: an ISR-tier module would
 /// then run cooperatively with none of the ISR gates applied.
 pub(crate) fn parse_domain_tier_to_exec_mode(domain: &Value) -> Option<u8> {
-    // `tier:` is the preferred friendly form.
     if let Some(raw) = domain.get("tier") {
         if let Some(s) = raw.as_str() {
             return match s {
                 "0" | "cooperative" => Some(0),
-                "1a" | "high_rate" | "tier1a" => Some(1),
-                "1b" | "isr_timer" | "tier1b" => Some(2),
-                "3" | "poll" | "tier3" => Some(3),
-                "2" | "isr_owned" | "tier2" => Some(4),
+                "1a" | "high_rate" => Some(1),
+                "1b" | "isr_timer" => Some(2),
+                "3" | "poll" => Some(3),
+                "2" | "isr_owned" => Some(4),
                 _ => None,
             };
         }
@@ -1598,18 +1602,6 @@ pub(crate) fn parse_domain_tier_to_exec_mode(domain: &Value) -> Option<u8> {
                 _ => None,
             };
         }
-    }
-    // `exec_mode:` is an accepted alias for `tier:`, taking the long
-    // names only (no `1a`/`1b` short forms).
-    if let Some(m) = domain.get("exec_mode").and_then(|m| m.as_str()) {
-        return match m {
-            "cooperative" => Some(0),
-            "high_rate" | "tier1a" => Some(1),
-            "isr_timer" | "tier1b" => Some(2),
-            "poll" | "tier3" => Some(3),
-            "isr_owned" | "tier2" => Some(4),
-            _ => None,
-        };
     }
     None
 }
@@ -2198,7 +2190,7 @@ fn build_module_entry(
     id: u8,
     data_section: Option<&Value>,
     config: &Value,
-    modules_dir: &Path,
+    loc: schema::ModuleLocation<'_>,
     manifests: &HashMap<String, Manifest>,
     max_modules: usize,
     isolation: &crate::target::IsolationFacts,
@@ -2259,7 +2251,7 @@ fn build_module_entry(
     // error (sibling of `assert_pinned_manifests_resolvable`). "No `.fmod`
     // schema" stays `Ok(None)` and falls through to the built-in path — a
     // built-in is never pinned and has no `.fmod`.
-    let pic_schema = schema::load_schema_for_module(type_name, modules_dir)?;
+    let pic_schema = schema::load_schema_for_module(type_name, loc)?;
     // On a module whose schema declares `trust` (tls, quic) the key is a
     // trust-anchor source spec: validated against the schema with the
     // other keys, then lifted out, since its value is resolved to a bundle
@@ -3028,7 +3020,7 @@ pub(crate) fn parse_modules_map(
     modules: &Value,
     data_section: Option<&Value>,
     config: &Value,
-    modules_dir: &Path,
+    loc: schema::ModuleLocation<'_>,
     manifests: &HashMap<String, Manifest>,
     max_modules: usize,
     isolation: &crate::target::IsolationFacts,
@@ -3133,7 +3125,7 @@ pub(crate) fn parse_modules_map(
             id,
             data_section,
             config,
-            modules_dir,
+            loc,
             manifests,
             max_modules,
             isolation,

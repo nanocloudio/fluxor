@@ -76,6 +76,7 @@ const KIND_MAX: u8 = 2; // 0=object, 1=namespace, 2=stream
 const E_NOENT: i32 = -2;
 const E_EXIST: i32 = -17;
 const E_NOSPC: i32 = -28;
+const E_NOMEM: i32 = -12;
 
 const MAX_BINDINGS: usize = 64;
 const MAX_PATH: usize = 96;
@@ -201,9 +202,15 @@ unsafe fn write_volatile_fence(a: &[u8], off: usize) -> i32 {
     let Some(fptr) = get_u64(a, off) else {
         return E_INVAL;
     };
-    let Some(fcap) = get_u16(a, off + 8).map(|v| v as usize) else {
+    let Some(fcap) = get_u16(a, off + 8) else {
         return E_INVAL;
     };
+    write_volatile_fence_at(fptr, fcap)
+}
+
+/// Write a `Volatile` fence into the caller's `[fptr, fptr + fcap)`.
+unsafe fn write_volatile_fence_at(fptr: u64, fcap: u16) -> i32 {
+    let fcap = fcap as usize;
     if fptr == 0 || fcap < abi::fence::WIRE_MAX_LEN {
         return E_INVAL;
     }
@@ -226,6 +233,44 @@ fn find_binding(s: &MemNsState, path: &[u8]) -> Option<usize> {
     None
 }
 
+/// Whether `b` is well-formed UTF-8: no overlong forms, no surrogates,
+/// nothing past U+10FFFF. Spelled out because `core::str::from_utf8` does not
+/// link into a PIC module.
+fn is_utf8(b: &[u8]) -> bool {
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if c < 0x80 {
+            i += 1;
+            continue;
+        }
+        // Continuation count, and the range the first continuation byte must
+        // fall in for this lead byte.
+        let (n, lo, hi) = match c {
+            0xC2..=0xDF => (1, 0x80, 0xBF),
+            0xE0 => (2, 0xA0, 0xBF),
+            0xED => (2, 0x80, 0x9F),
+            0xE1..=0xEC | 0xEE..=0xEF => (2, 0x80, 0xBF),
+            0xF0 => (3, 0x90, 0xBF),
+            0xF1..=0xF3 => (3, 0x80, 0xBF),
+            0xF4 => (3, 0x80, 0x8F),
+            _ => return false,
+        };
+        if i + n >= b.len() || b[i + 1] < lo || b[i + 1] > hi {
+            return false;
+        }
+        let mut k = 2;
+        while k <= n {
+            if b[i + k] & 0xC0 != 0x80 {
+                return false;
+            }
+            k += 1;
+        }
+        i += n + 1;
+    }
+    true
+}
+
 // ── ops ────────────────────────────────────────────────────────────
 
 /// BIND — `[path_len:u16][path][kind:u8][flags:u8][target_len:u16][target]
@@ -238,6 +283,10 @@ unsafe fn ns_bind(s: &mut MemNsState, a: &[u8]) -> i32 {
         return E_INVAL;
     }
     let path = &a[2..2 + pl];
+    // A path is what LIST names, and a listed name is UTF-8.
+    if !is_utf8(path) {
+        return E_INVAL;
+    }
     let kind = a[2 + pl];
     let flags = a[2 + pl + 1];
     if kind > KIND_MAX {
@@ -338,66 +387,73 @@ unsafe fn ns_stat(s: &MemNsState, handle: i32, arg: *mut u8, arg_len: usize) -> 
     OUT as i32
 }
 
-/// LIST — `[prefix_len:u16][prefix][cursor_len:u16][cursor][out_buf:u64]
-/// [out_cap:u32][fence_out_ptr:u64][fence_out_cap:u16]`. Single page
-/// (the table is 64 entries); the trailing cursor record is always
-/// `[0xFF, 0xFF, 0]` — end of listing. Two marker bytes: the second
-/// sits where an entry carries its `kind`, so a 255-byte name cannot
-/// be read as the end of the page.
+/// LIST — the `namespace::LIST` request; the page is written by
+/// `namespace::list::PageWriter`. Entries are in ascending path order and the
+/// cursor is the last path a page returned, so the table's slot order and any
+/// write between pages are invisible to the listing.
 unsafe fn ns_list(s: &MemNsState, a: &[u8]) -> i32 {
-    let Some(pl) = get_u16(a, 0).map(|v| v as usize) else {
+    let Some(req) = abi::contracts::storage::namespace::list::parse_request(a) else {
         return E_INVAL;
     };
-    if a.len() < 2 + pl + 2 {
+    // Key-shaped: the cursor is the last path a page returned, so one that is
+    // not UTF-8 or not under the prefix was not issued here.
+    let mut after: Option<&[u8]> = if req.cursor.is_empty() {
+        None
+    } else if req.cursor.starts_with(req.prefix) && is_utf8(req.cursor) {
+        Some(req.cursor)
+    } else {
         return E_INVAL;
+    };
+    let out = core::slice::from_raw_parts_mut(req.out_ptr as *mut u8, req.out_cap as usize);
+    let mut page = abi::contracts::storage::namespace::list::PageWriter::new(out);
+    let mut more = false;
+    let mut last_binding = MAX_BINDINGS;
+    loop {
+        // The smallest path under the prefix that sorts after `after`.
+        let mut pick = MAX_BINDINGS;
+        let mut i = 0;
+        while i < MAX_BINDINGS {
+            let b = &s.bindings[i];
+            let path = &b.path[..b.path_len as usize];
+            if b.in_use != 0
+                && path.starts_with(req.prefix)
+                && after.is_none_or(|c| path > c)
+                && (pick == MAX_BINDINGS
+                    || path < &s.bindings[pick].path[..s.bindings[pick].path_len as usize])
+            {
+                pick = i;
+            }
+            i += 1;
+        }
+        if pick == MAX_BINDINGS {
+            break;
+        }
+        let b = &s.bindings[pick];
+        let path = &b.path[..b.path_len as usize];
+        if !page.push(path, b.kind) {
+            more = true;
+            break;
+        }
+        after = Some(path);
+        last_binding = pick;
     }
-    let prefix = &a[2..2 + pl];
-    let Some(cl) = get_u16(a, 2 + pl).map(|v| v as usize) else {
-        return E_INVAL;
+    let cursor: &[u8] = if !more {
+        &[]
+    } else if last_binding == MAX_BINDINGS {
+        // A page that cannot hold the next entry made no progress.
+        return E_NOMEM;
+    } else {
+        let b = &s.bindings[last_binding];
+        &b.path[..b.path_len as usize]
     };
-    let base = 2 + pl + 2 + cl;
-    let Some(out_ptr) = get_u64(a, base) else {
-        return E_INVAL;
+    let Some(n) = page.finish(cursor) else {
+        return E_NOMEM;
     };
-    let Some(out_cap) = a
-        .get(base + 8..base + 12)
-        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
-    else {
-        return E_INVAL;
-    };
-    if out_ptr == 0 {
-        return E_INVAL;
-    }
-    let frc = write_volatile_fence(a, base + 12);
+    let frc = write_volatile_fence_at(req.fence_out_ptr, req.fence_out_cap);
     if frc != 0 {
         return frc;
     }
-    let out = core::slice::from_raw_parts_mut(out_ptr as *mut u8, out_cap);
-    let mut w = 0usize;
-    let mut i = 0;
-    while i < MAX_BINDINGS {
-        let b = &s.bindings[i];
-        if b.in_use != 0 && b.path[..b.path_len as usize].starts_with(prefix) {
-            let need = 2 + b.path_len as usize;
-            if w + need + 3 > out_cap {
-                return E_INVAL; // caller buffer too small for one page
-            }
-            out[w] = b.path_len;
-            out[w + 1] = b.kind;
-            out[w + 2..w + 2 + b.path_len as usize].copy_from_slice(&b.path[..b.path_len as usize]);
-            w += need;
-        }
-        i += 1;
-    }
-    // End-of-listing cursor record.
-    if w + 3 > out_cap {
-        return E_INVAL;
-    }
-    out[w] = 0xFF;
-    out[w + 1] = 0xFF;
-    out[w + 2] = 0;
-    w += 3;
-    w as i32
+    n as i32
 }
 
 /// RENAME — `[src_len:u16][src][dst_len:u16][dst][flags:u8]
@@ -413,6 +469,9 @@ unsafe fn ns_rename(s: &mut MemNsState, a: &[u8]) -> i32 {
         return E_INVAL;
     };
     if dl == 0 || dl > MAX_PATH || a.len() < 2 + sl + 2 + dl + 1 + 10 {
+        return E_INVAL;
+    }
+    if !is_utf8(&a[2 + sl + 2..2 + sl + 2 + dl]) {
         return E_INVAL;
     }
     let flags_off = 2 + sl + 2 + dl;

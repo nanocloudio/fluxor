@@ -1,25 +1,25 @@
 //! Local versioned watchable store — the in-runtime backing for the
 //! `storage.object` (0x14) and `storage.namespace` (0x13) contracts on Linux.
 //!
-//! A versioned watchable KV is not a
-//! bespoke fluxor contract — it decomposes into the standard storage surfaces
-//! (`storage.object` CAS + `storage.namespace` LIST/SUBSCRIBE + a
-//! `RevisionMonotone` fence). This module is the primitive-level implementation
-//! of that: a keyed byte store with a monotone revision clock, per-key revision
-//! (the CAS token / etag), prefix enumeration, and a bounded change history that
-//! drives SUBSCRIBE with resume-from-revision.
+//! A versioned watchable KV is not a bespoke contract: it decomposes into the
+//! standard storage surfaces (`storage.object` CAS and LIST,
+//! `storage.namespace` LIST/SUBSCRIBE, and a `RevisionMonotone` fence). This
+//! module implements that decomposition: a keyed byte store with a monotone
+//! revision clock, per-key revision (the CAS token / etag), prefix
+//! enumeration, and a bounded change history that drives SUBSCRIBE with
+//! resume-from-revision.
 //!
-//! There is deliberately **no multi-process WAL and no `flock`**: the
-//! control plane is fmods in one
-//! runtime (§8), so the store is single-writer — the provider serialises calls.
-//! Durability is a plain single-writer append log (no lock, no concurrent tail):
-//! written by whoever runs the store, and replayed at open. That log is also the
-//! seam a test harness seeds through between phases.
+//! The store is single-writer: the runtime hosts the control plane's modules
+//! in one process and the provider serialises calls, so there is no
+//! multi-process WAL and no `flock`. Durability is a plain append log
+//! (`store.log`), replayed at open, whose torn tail is cut off before the
+//! first append. The log is also the seam a test harness seeds through
+//! between runs.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Log record op discriminants.
 const OP_PUT: u8 = 1;
@@ -89,11 +89,14 @@ struct Watch {
     cap: usize,
 }
 
-/// A single-writer append log — the store's durability + seed seam. No `flock`:
-/// the store has one writer at a time (the runtime, or a harness between phases).
+/// A single-writer append log — the store's durability and seed seam. No
+/// `flock`: the store has one writer at a time (the runtime, or a harness
+/// between runs).
 /// Record: `[rev:u64 LE][op:u8][key_len:u16 LE][val_len:u32 LE][key][val]`.
 struct Log {
     file: File,
+    /// Length of the valid records; the next append lands here.
+    len: u64,
 }
 
 /// One replayed log record: `(rev, op, key, value)`.
@@ -110,47 +113,99 @@ impl Log {
             .open(path)?;
         let mut data = Vec::new();
         file.read_to_end(&mut data)?;
-        let records = parse_log(&data);
-        file.seek(SeekFrom::End(0))?;
-        Ok((Log { file }, records))
+        let (records, valid) = parse_log(&data)?;
+        // A crash mid-append leaves a partial record. Appending behind it
+        // would let the next replay read the partial header's lengths across
+        // the new record, so the tail is cut off first.
+        if valid < data.len() {
+            file.set_len(valid as u64)?;
+            file.sync_data()?;
+        }
+        file.seek(SeekFrom::Start(valid as u64))?;
+        Ok((
+            Log {
+                file,
+                len: valid as u64,
+            },
+            records,
+        ))
     }
 
     fn append(&mut self, rev: u64, op: u8, key: &str, value: &[u8]) -> std::io::Result<()> {
-        let mut buf = Vec::with_capacity(15 + key.len() + value.len());
+        let too_long = || std::io::Error::from(std::io::ErrorKind::InvalidInput);
+        let key_len = u16::try_from(key.len()).map_err(|_| too_long())?;
+        let value_len = u32::try_from(value.len()).map_err(|_| too_long())?;
+        let mut buf = Vec::with_capacity(LOG_HEADER_LEN + key.len() + value.len());
         buf.extend_from_slice(&rev.to_le_bytes());
         buf.push(op);
-        buf.extend_from_slice(&(key.len() as u16).to_le_bytes());
-        buf.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&key_len.to_le_bytes());
+        buf.extend_from_slice(&value_len.to_le_bytes());
         buf.extend_from_slice(key.as_bytes());
         buf.extend_from_slice(value);
-        self.file.write_all(&buf)?;
-        self.file.flush()?;
-        self.file.sync_data()
+        let written = self
+            .file
+            .write_all(&buf)
+            .and_then(|()| self.file.flush())
+            .and_then(|()| self.file.sync_data());
+        match written {
+            Ok(()) => {
+                self.len += buf.len() as u64;
+                Ok(())
+            }
+            Err(e) => {
+                // A refused append must not leave a partial record that the
+                // next append would land behind.
+                let _ = self.file.set_len(self.len);
+                let _ = self.file.seek(SeekFrom::Start(self.len));
+                Err(e)
+            }
+        }
     }
 }
 
-/// Parse an append log into `(rev, op, key, value)` records, stopping at the
-/// first truncated tail (a crash mid-append leaves at most one partial record).
-fn parse_log(data: &[u8]) -> Vec<LogRecord> {
+/// `[rev:u64][op:u8][key_len:u16][val_len:u32]`.
+const LOG_HEADER_LEN: usize = 15;
+
+/// Make `dir`'s entries durable.
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    File::open(dir)?.sync_all()
+}
+
+/// Parse an append log into `(rev, op, key, value)` records and the length
+/// they occupy. A partial record at the end (a crash mid-append leaves at most
+/// one) ends the parse and is excluded from that length. A complete record that
+/// cannot be applied — an unknown op, a key that is not UTF-8, or the empty key
+/// (which no `PUT` creates and no listing can return) — is not a torn write and
+/// is refused as corruption rather than silently dropped with everything
+/// behind it.
+fn parse_log(data: &[u8]) -> std::io::Result<(Vec<LogRecord>, usize)> {
+    let corrupt =
+        |what: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, what.to_string());
     let mut out = Vec::new();
     let mut p = 0usize;
-    while p + 15 <= data.len() {
+    while p + LOG_HEADER_LEN <= data.len() {
         let rev = u64::from_le_bytes(data[p..p + 8].try_into().unwrap());
         let op = data[p + 8];
         let kl = u16::from_le_bytes(data[p + 9..p + 11].try_into().unwrap()) as usize;
         let vl = u32::from_le_bytes(data[p + 11..p + 15].try_into().unwrap()) as usize;
-        if p + 15 + kl + vl > data.len() {
+        let end = p + LOG_HEADER_LEN + kl + vl;
+        if end > data.len() {
             break;
         }
-        let key = match std::str::from_utf8(&data[p + 15..p + 15 + kl]) {
-            Ok(k) => k.to_string(),
-            Err(_) => break,
-        };
-        let value = data[p + 15 + kl..p + 15 + kl + vl].to_vec();
+        if op != OP_PUT && op != OP_DELETE {
+            return Err(corrupt("store.log: unknown record op"));
+        }
+        if kl == 0 {
+            return Err(corrupt("store.log: record key is empty"));
+        }
+        let key = std::str::from_utf8(&data[p + LOG_HEADER_LEN..p + LOG_HEADER_LEN + kl])
+            .map_err(|_| corrupt("store.log: record key is not UTF-8"))?
+            .to_string();
+        let value = data[p + LOG_HEADER_LEN + kl..end].to_vec();
         out.push((rev, op, key, value));
-        p += 15 + kl + vl;
+        p = end;
     }
-    out
+    Ok((out, p))
 }
 
 /// An in-memory versioned keyspace with an optional durable append log.
@@ -165,11 +220,6 @@ pub struct Store {
     next_watch: u64,
     default_ring_cap: usize,
     log: Option<Log>,
-    #[allow(
-        dead_code,
-        reason = "store root retained for future compaction; unread today"
-    )]
-    dir: Option<PathBuf>,
 }
 
 /// What a mutating write may be made conditional on.
@@ -225,21 +275,30 @@ impl Store {
             next_watch: 1,
             default_ring_cap: ring_cap.max(1),
             log: None,
-            dir: None,
         }
     }
 
     /// Open a durable store, replaying its append log at `dir/store.log` to
     /// rebuild the map, the revision clock, and the tail of the change history.
     pub fn open(dir: &Path, history_cap: usize, ring_cap: usize) -> std::io::Result<Self> {
+        let created = !dir.exists();
         std::fs::create_dir_all(dir)?;
         let mut store = Self::with_limits(history_cap, ring_cap);
         let (log, records) = Log::open(&dir.join("store.log"))?;
+        // A write is acknowledged `LocalDurable` once its record is synced,
+        // which holds across a power cut only if the log's directory entry
+        // (and the directory's own, when it was just made) is durable too.
+        sync_dir(dir)?;
+        if created {
+            match dir.parent() {
+                Some(parent) if !parent.as_os_str().is_empty() => sync_dir(parent)?,
+                _ => sync_dir(Path::new("."))?,
+            }
+        }
         for (rev, op, key, value) in records {
             store.replay(rev, op, key, value);
         }
         store.log = Some(log);
-        store.dir = Some(dir.to_path_buf());
         Ok(store)
     }
 
@@ -392,6 +451,33 @@ impl Store {
         (items, self.revision)
     }
 
+    /// Key-ordered `(key, size, revision)` under the byte `prefix`, starting
+    /// strictly after `after` when given. A lazy walk of the map, so a page
+    /// costs the entries it returns rather than the whole prefix.
+    pub fn scan<'a>(
+        &'a self,
+        prefix: &'a [u8],
+        after: Option<&'a str>,
+    ) -> impl Iterator<Item = (&'a str, u64, u64)> + 'a {
+        use std::ops::Bound;
+        // The longest UTF-8 head of the prefix is a lower bound on every key
+        // that starts with the prefix; a prefix that ends inside a code point
+        // still matches the keys that complete it.
+        let head = match core::str::from_utf8(prefix) {
+            Ok(s) => s,
+            Err(e) => core::str::from_utf8(&prefix[..e.valid_up_to()]).unwrap_or(""),
+        };
+        let lower = match after {
+            Some(a) if a >= head => Bound::Excluded(a),
+            _ => Bound::Included(head),
+        };
+        self.entries
+            .range::<str, _>((lower, Bound::Unbounded))
+            .skip_while(move |(k, _)| k.as_bytes() < prefix)
+            .take_while(move |(k, _)| k.as_bytes().starts_with(prefix))
+            .map(|(k, e)| (k.as_str(), e.value.len() as u64, e.revision))
+    }
+
     /// Open a watch over `prefix`, delivering every retained change with
     /// `revision > since_revision`, then live changes. If `since_revision`
     /// precedes retained history, the watch opens already `Lost`.
@@ -504,6 +590,8 @@ impl Default for Store {
 // no locking.
 // ===========================================================================
 
+use crate::abi::contracts::mesh::capability as cap;
+use crate::abi::contracts::storage::handle::STORAGE_KEY_MAX;
 use crate::abi::contracts::storage::object::precondition as obj_precondition;
 use crate::abi::contracts::storage::{namespace as ns_op, object as obj_op};
 use crate::abi::fence::{Fence, QUERY_OP, WIRE_MAX_LEN};
@@ -556,36 +644,65 @@ struct ReadSlot {
     in_use: bool,
     value: Vec<u8>,
     revision: u64,
+    /// The grant the slot was opened under, which it dies with.
+    grant: Option<usize>,
 }
 const READ_EMPTY: ReadSlot = ReadSlot {
     in_use: false,
     value: Vec::new(),
     revision: 0,
+    grant: None,
 };
+
+/// Grants presented to a guarded store at once. A presentation past it is
+/// refused `ENOMEM` until one is closed; none is evicted, because an evicted
+/// grant is a caller whose next operation silently starts failing.
+const STORE_MAX_GRANTS: usize = 64;
+
+/// Grant handles are store slots from here up, apart from read slots.
+const GRANT_SLOT_BASE: usize = 0x1_0000;
+
+/// A capability grant a caller presented: its scope, rights and expiry, and
+/// the module occupancy it belongs to.
+struct Grant {
+    scope: Vec<u8>,
+    permissions: u16,
+    not_after: u32,
+    owner: usize,
+    owner_generation: u32,
+}
+
+/// The mesh roots a guarded store verifies chains against, from
+/// `FLUXOR_MESH_ROOTS`. Empty: the store is unguarded.
+static mut MESH_ROOTS: Vec<[u8; 32]> = Vec::new();
+static mut GRANTS: Vec<Option<Grant>> = Vec::new();
+
+struct KernelCrypto;
+
+impl cap::CapCrypto for KernelCrypto {
+    fn sha256(&self, data: &[u8]) -> [u8; 32] {
+        let mut h = crate::kernel::security::crypto::sha256::Sha256::new();
+        h.update(data);
+        h.finalize()
+    }
+    fn ed25519_verify(&self, key: &[u8; 32], msg: &[u8], sig: &[u8; 64]) -> bool {
+        crate::kernel::security::crypto::ed25519::verify(key, msg, sig)
+    }
+}
 
 static mut LINUX_STORE: Option<Store> = None;
 static mut LINUX_SUBS: [Sub; STORE_MAX_SUBS] = [SUB_EMPTY; STORE_MAX_SUBS];
 static mut LINUX_READS: [ReadSlot; STORE_MAX_READS] = [READ_EMPTY; STORE_MAX_READS];
 
-/// Initialise the control-plane store from `FLUXOR_STORE_DIR`, if set. Called
-/// once at provider registration. Returns true if the store is now active.
-/// # Safety
-/// Single-threaded platform dispatch only: initialises the `static mut`
-/// store singleton without synchronization.
-/// What `store_init_from_env` did — three outcomes, not two.
+/// What `store_init_from_env` found: three outcomes, not two, because "no
+/// store was asked for" and "a store was asked for and could not be opened"
+/// must not look alike.
 ///
-/// `bool` could not tell "no store was asked for" from "a store was asked for
-/// and could not be opened", and the caller consequently discarded both. The
-/// first is the ordinary case for every graph that does not use the
-/// control-plane store; the second leaves EVERY store-backed module in the
-/// graph talking to a store that is not there, and it did so silently.
-///
-/// That silence is expensive out of proportion to the bug behind it: a module
-/// whose provider is absent does not fail, it simply never produces anything,
-/// and from outside that is indistinguishable from a module that has nothing
-/// to do. It is the same class of defect as a provider that answers
-/// `UNAVAILABLE` without logging — the reason `security_state` probes at init
-/// and says so.
+/// The first is the ordinary case for every graph that does not use the
+/// control-plane store. The second leaves EVERY store-backed module in the
+/// graph talking to a store that is not there, and such a module does not
+/// fail: it simply never produces anything, which from outside is
+/// indistinguishable from a module with nothing to do.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum StoreInit {
     /// `FLUXOR_STORE_DIR` is unset: this node has no control-plane store, by
@@ -598,6 +715,9 @@ pub enum StoreInit {
     Failed,
 }
 
+/// Initialise the control-plane store from `FLUXOR_STORE_DIR`, if set. Called
+/// once at provider registration.
+///
 /// # Safety
 /// Single-threaded startup only; initialises the `static mut` store singleton
 /// before any provider dispatch.
@@ -608,6 +728,12 @@ pub unsafe fn store_init_from_env() -> StoreInit {
     let Ok(dir) = std::env::var("FLUXOR_STORE_DIR") else {
         return StoreInit::NotConfigured;
     };
+    // Roots that do not parse fail the store rather than open it unguarded:
+    // a deployment that asked for authority must not quietly run without it.
+    match parse_roots(std::env::var("FLUXOR_MESH_ROOTS").ok().as_deref()) {
+        Some(roots) => MESH_ROOTS = roots,
+        None => return StoreInit::Failed,
+    }
     match Store::open(std::path::Path::new(&dir), 65536, 4096) {
         Ok(s) => {
             LINUX_STORE = Some(s);
@@ -615,6 +741,168 @@ pub unsafe fn store_init_from_env() -> StoreInit {
         }
         Err(_) => StoreInit::Failed,
     }
+}
+
+/// `FLUXOR_MESH_ROOTS`: up to `cap::MAX_ROOTS` comma-separated 64-hex-digit
+/// Ed25519 keys; absent is no roots. `None` when it does not parse.
+fn parse_roots(v: Option<&str>) -> Option<Vec<[u8; 32]>> {
+    let Some(v) = v.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Some(Vec::new());
+    };
+    let mut roots = Vec::new();
+    for item in v.split(',') {
+        let item = item.trim();
+        if item.len() != 64 || roots.len() == cap::MAX_ROOTS {
+            return None;
+        }
+        let mut k = [0u8; 32];
+        for (i, b) in k.iter_mut().enumerate() {
+            *b = u8::from_str_radix(item.get(2 * i..2 * i + 2)?, 16).ok()?;
+        }
+        roots.push(k);
+    }
+    Some(roots)
+}
+
+/// Install the mesh roots directly — the harness's way in, where the store
+/// is opened without the environment.
+/// # Safety
+/// Single-threaded platform dispatch only.
+pub unsafe fn set_mesh_roots(roots: &[[u8; 32]]) {
+    MESH_ROOTS = roots.to_vec();
+    (*core::ptr::addr_of_mut!(GRANTS)).clear();
+}
+
+unsafe fn guarded() -> bool {
+    !(*core::ptr::addr_of!(MESH_ROOTS)).is_empty()
+}
+
+fn grant_handle(i: usize) -> i32 {
+    tag_fd(FD_TAG_STORAGE_OBJECT, (GRANT_SLOT_BASE + i) as i32)
+}
+
+/// The grant `handle` names, if it is a live one the caller owns.
+unsafe fn grant_of(handle: i32) -> Option<usize> {
+    if handle < 0 {
+        return None;
+    }
+    let slot = slot_of(handle) as usize;
+    let i = slot.checked_sub(GRANT_SLOT_BASE)?;
+    let g = (&*core::ptr::addr_of!(GRANTS)).get(i)?.as_ref()?;
+    let owner = crate::kernel::exec::scheduler::caller_module_index();
+    let generation = crate::kernel::exec::scheduler::module_slot_generation(owner);
+    (g.owner == owner && g.owner_generation == generation).then_some(i)
+}
+
+fn trusted_clock() -> Option<cap::Clock> {
+    cap::Clock::from_trusted(&crate::kernel::module::syscalls::trusted_unix_record())
+}
+
+/// Whether grant `i` is still inside its window by the trusted clock.
+unsafe fn grant_live(i: usize) -> bool {
+    let Some(Some(g)) = (&*core::ptr::addr_of!(GRANTS)).get(i) else {
+        return false;
+    };
+    match trusted_clock() {
+        Some(c) => c.now.saturating_add(c.uncertainty) <= g.not_after as u64,
+        None => false,
+    }
+}
+
+/// `PRESENT`: verify a chain over a scope and mint a grant. `arg` is the
+/// caller's request buffer: its first byte receives the refusal.
+unsafe fn present(arg: *mut u8, a: &[u8]) -> i32 {
+    if !guarded() {
+        return errno::ENOSYS;
+    }
+    let Some(req) = obj_op::grant::parse_present(a) else {
+        return errno::EINVAL;
+    };
+    let Some(object) = obj_op::grant::scope_object(&KernelCrypto, req.scope) else {
+        return errno::EINVAL;
+    };
+    let roots = &*core::ptr::addr_of!(MESH_ROOTS);
+    // Verified for the scope only; each op checks its own permission.
+    let verdict =
+        cap::verify(&KernelCrypto, req.chain, roots, trusted_clock(), None).and_then(|g| {
+            if g.object_id == object {
+                Ok(g)
+            } else {
+                Err(cap::Refusal::ObjectMismatch)
+            }
+        });
+    let g = match verdict {
+        Ok(g) => g,
+        Err(r) => {
+            *arg.add(obj_op::grant::REFUSAL_AT) = r as u8;
+            return errno::EACCES;
+        }
+    };
+    let grants = &mut *core::ptr::addr_of_mut!(GRANTS);
+    let i = match grants.iter().position(Option::is_none) {
+        Some(i) => i,
+        None if grants.len() < STORE_MAX_GRANTS => {
+            grants.push(None);
+            grants.len() - 1
+        }
+        None => return errno::ENOMEM,
+    };
+    let owner = crate::kernel::exec::scheduler::caller_module_index();
+    grants[i] = Some(Grant {
+        scope: req.scope.to_vec(),
+        permissions: g.permissions,
+        not_after: g.not_after,
+        owner,
+        owner_generation: crate::kernel::exec::scheduler::module_slot_generation(owner),
+    });
+    grant_handle(i)
+}
+
+/// The key (or `LIST` prefix) an op addresses, for its scope check.
+fn op_key(opcode: u32, a: &[u8]) -> Option<&[u8]> {
+    match opcode {
+        obj_op::GET => Some(a),
+        obj_op::LIST => obj_op::list::parse_request(a).map(|r| r.prefix),
+        obj_op::PUT | obj_op::HEAD | obj_op::DELETE | obj_op::PUT_STREAMED_OPEN => {
+            let n = u16::from_le_bytes([*a.first()?, *a.get(1)?]) as usize;
+            a.get(2..2 + n)
+        }
+        _ => None,
+    }
+}
+
+/// Admit an op on a guarded store: `Ok(Some(grant))` for an op run under a
+/// grant, `Ok(None)` for one no grant covers (a read handle's own ops,
+/// `CLOSE`), `Err(errno)` to refuse it.
+unsafe fn admit(handle: i32, opcode: u32, a: &[u8]) -> Result<Option<usize>, i32> {
+    let Some(access) = obj_op::grant::access_of(opcode) else {
+        return Ok(None);
+    };
+    if opcode == obj_op::RANGE_GET {
+        // A read handle carries the grant it was opened under.
+        let idx = slot_of(handle) as usize;
+        let reads = &*core::ptr::addr_of!(LINUX_READS);
+        return match reads.get(idx).and_then(|r| r.grant) {
+            Some(g) if grant_live(g) => Ok(None),
+            _ => Err(errno::EACCES),
+        };
+    }
+    let i = grant_of(handle).ok_or(errno::EACCES)?;
+    if !grant_live(i) {
+        return Err(errno::EACCES);
+    }
+    let Some(Some(g)) = (&*core::ptr::addr_of!(GRANTS)).get(i) else {
+        return Err(errno::EACCES);
+    };
+    let need = access.permission();
+    if g.permissions & need != need {
+        return Err(errno::EACCES);
+    }
+    let key = op_key(opcode, a).ok_or(errno::EINVAL)?;
+    if !obj_op::grant::in_scope(&g.scope, key) {
+        return Err(errno::EACCES);
+    }
+    Ok(Some(i))
 }
 
 /// True iff the control-plane store backs the storage contracts on this node.
@@ -651,19 +939,43 @@ fn read_precondition(a: &[u8], p: &mut usize) -> Option<Precondition> {
     match kind {
         obj_precondition::ANY => Some(Precondition::Any),
         obj_precondition::ABSENT => Some(Precondition::Absent),
-        obj_precondition::ETAG if etag_len > 0 => Some(Precondition::Revision(rev_from_etag(etag))),
-        // `ETAG` with no etag is not a weaker condition, it is a malformed
-        // request: answering it as unconditional would turn a guard the
-        // caller asked for into no guard at all.
+        obj_precondition::ETAG if etag_len >= 8 => Some(Precondition::Revision(
+            u64::from_le_bytes(etag[..8].try_into().unwrap()),
+        )),
+        // `ETAG` without a whole revision in its etag, and a kind this store
+        // does not know, are malformed requests, not weaker conditions:
+        // answering either as unconditional would turn a guard the caller
+        // asked for into no guard at all.
         _ => None,
     }
 }
 
-fn rev_from_etag(etag: &[u8]) -> u64 {
-    if etag.len() >= 8 {
-        u64::from_le_bytes(etag[..8].try_into().unwrap())
-    } else {
-        0
+/// A `[len: u16 LE][bytes]` field at the head of `a` as UTF-8, with the offset
+/// just past it. `None` when the field runs past `a` or is not UTF-8: a
+/// request is refused, never indexed past its end.
+fn str_field(a: &[u8]) -> Option<(&str, usize)> {
+    let len = get_u16(a, 0)? as usize;
+    let bytes = a.get(2..2 + len)?;
+    Some((core::str::from_utf8(bytes).ok()?, 2 + len))
+}
+
+/// A key a `PUT` may create. Empty is the relist sentinel's key on the change
+/// stream and the "end of listing" cursor on `LIST`; longer than `STORAGE_KEY_MAX`
+/// cannot be carried by either listing.
+fn writable_key(key: &str) -> bool {
+    !key.is_empty() && key.len() <= STORAGE_KEY_MAX
+}
+
+/// The `LIST` cursor as a key of this store under `prefix`, or `EINVAL`. A
+/// cursor is the last key a page returned, so anything else was not issued
+/// here.
+fn list_cursor<'a>(cursor: &'a [u8], prefix: &[u8]) -> Result<Option<&'a str>, i32> {
+    if cursor.is_empty() {
+        return Ok(None);
+    }
+    match core::str::from_utf8(cursor) {
+        Ok(c) if cursor.starts_with(prefix) => Ok(Some(c)),
+        _ => Err(errno::EINVAL),
     }
 }
 
@@ -680,9 +992,19 @@ fn get_u64(b: &[u8], off: usize) -> Option<u64> {
         .map(|s| u64::from_le_bytes(s.try_into().unwrap()))
 }
 
+/// The `[fence_out_ptr:u64][fence_out_cap:u16]` pair at `off`, or `None` —
+/// the op answers `EINVAL` before acting — when it is cut short, null, or
+/// smaller than `WIRE_MAX_LEN`.
+fn fence_out(a: &[u8], off: usize) -> Option<(u64, u16)> {
+    let ptr = get_u64(a, off)?;
+    let cap = get_u16(a, off + 8)?;
+    (ptr != 0 && cap as usize >= WIRE_MAX_LEN).then_some((ptr, cap))
+}
+
 /// Write an encoded fence into a caller `[fence_out_ptr:u64][fence_out_cap:u16]`.
+/// A null pointer receives nothing.
 unsafe fn write_fence(fence: Fence, ptr: u64, cap: u16) {
-    if ptr == 0 || (cap as usize) < 25 {
+    if ptr == 0 {
         return;
     }
     let buf = core::slice::from_raw_parts_mut(ptr as *mut u8, cap as usize);
@@ -824,18 +1146,45 @@ pub unsafe fn dispatch_object(handle: i32, opcode: u32, arg: *mut u8, arg_len: u
         core::slice::from_raw_parts(arg, arg_len)
     };
 
+    if opcode == obj_op::PRESENT {
+        if arg.is_null() {
+            return errno::EINVAL;
+        }
+        return present(arg, a);
+    }
+    if opcode == obj_op::CLOSE && handle >= 0 && slot_of(handle) as usize >= GRANT_SLOT_BASE {
+        let Some(i) = grant_of(handle) else {
+            return errno::EACCES;
+        };
+        (&mut *core::ptr::addr_of_mut!(GRANTS))[i] = None;
+        // Read handles opened under it die with it.
+        for r in (*core::ptr::addr_of_mut!(LINUX_READS)).iter_mut() {
+            if r.grant == Some(i) {
+                *r = READ_EMPTY;
+            }
+        }
+        return 0;
+    }
+    let grant = if guarded() {
+        match admit(handle, opcode, a) {
+            Ok(g) => g,
+            Err(e) => return e,
+        }
+    } else {
+        None
+    };
+
     match opcode {
         obj_op::PUT => {
             // [key_len:u16][key][ct_len:u8][ct][body_ptr:u64][body_len:u64]
             // [precondition:u8][etag_len:u8][etag]
             // [fence_out_ptr:u64][fence_out_cap:u16]
-            let Some(kl) = get_u16(a, 0).map(|v| v as usize) else {
+            let Some((key, mut p)) = str_field(a) else {
                 return errno::EINVAL;
             };
-            let mut p = 2 + kl;
-            let Ok(key) = core::str::from_utf8(&a[2..2 + kl]) else {
+            if !writable_key(key) {
                 return errno::EINVAL;
-            };
+            }
             let key = key.to_string();
             let Some(&ctl) = a.get(p) else {
                 return errno::EINVAL;
@@ -852,8 +1201,9 @@ pub unsafe fn dispatch_object(handle: i32, opcode: u32, arg: *mut u8, arg_len: u
                 return errno::EINVAL;
             };
             let absent = precondition == Precondition::Absent;
-            let fence_ptr = get_u64(a, p).unwrap_or(0);
-            let fence_cap = get_u16(a, p + 8).unwrap_or(0);
+            let Some((fence_ptr, fence_cap)) = fence_out(a, p) else {
+                return errno::EINVAL;
+            };
 
             let body = if body_len == 0 {
                 Vec::new()
@@ -918,6 +1268,7 @@ pub unsafe fn dispatch_object(handle: i32, opcode: u32, arg: *mut u8, arg_len: u
                 in_use: true,
                 value: val,
                 revision: rev,
+                grant,
             };
             tag_fd(FD_TAG_STORAGE_OBJECT, idx as i32)
         }
@@ -948,17 +1299,17 @@ pub unsafe fn dispatch_object(handle: i32, opcode: u32, arg: *mut u8, arg_len: u
         }
         obj_op::HEAD => {
             // [key_len:u16][key][out_ptr:u64][out_cap:u32][fence_out_ptr:u64][fence_out_cap:u16]
-            let Some(kl) = get_u16(a, 0).map(|v| v as usize) else {
+            let Some((key, p)) = str_field(a) else {
                 return errno::EINVAL;
             };
-            let Ok(key) = core::str::from_utf8(&a[2..2 + kl]) else {
+            let out_ptr = get_u64(a, p).unwrap_or(0);
+            let out_cap = get_u32(a, p + 8).unwrap_or(0) as usize;
+            let Some((fptr, fcap)) = fence_out(a, p + 12) else {
                 return errno::EINVAL;
             };
             let Some((val, rev)) = store.get(key) else {
                 return errno::ENXIO;
             };
-            let out_ptr = get_u64(a, 2 + kl).unwrap_or(0);
-            let out_cap = get_u32(a, 2 + kl + 8).unwrap_or(0) as usize;
             // HEAD record: [size:u64][mtime:u64][content_type_len:u8][ct][etag_len:u8][etag]
             let etag = etag_from_rev(rev);
             let mut rec = Vec::new();
@@ -967,11 +1318,15 @@ pub unsafe fn dispatch_object(handle: i32, opcode: u32, arg: *mut u8, arg_len: u
             rec.push(0); // content_type_len
             rec.push(32); // etag_len
             rec.extend_from_slice(&etag);
-            if out_ptr != 0 && rec.len() <= out_cap {
-                core::ptr::copy_nonoverlapping(rec.as_ptr(), out_ptr as *mut u8, rec.len());
+            // The count returned is the count written: a record that does not
+            // fit is refused, not reported as delivered.
+            if out_ptr == 0 {
+                return errno::EINVAL;
             }
-            let fptr = get_u64(a, 2 + kl + 12).unwrap_or(0);
-            let fcap = get_u16(a, 2 + kl + 20).unwrap_or(0);
+            if rec.len() > out_cap {
+                return errno::ENOMEM;
+            }
+            core::ptr::copy_nonoverlapping(rec.as_ptr(), out_ptr as *mut u8, rec.len());
             write_fence(
                 Fence::ViewConsistent {
                     source: STORE_SOURCE,
@@ -985,19 +1340,16 @@ pub unsafe fn dispatch_object(handle: i32, opcode: u32, arg: *mut u8, arg_len: u
         obj_op::DELETE => {
             // [key_len:u16][key][precondition:u8][etag_len:u8][etag]
             //   [fence_out_ptr:u64][fence_out_cap:u16]
-            let Some(kl) = get_u16(a, 0).map(|v| v as usize) else {
-                return errno::EINVAL;
-            };
-            let Ok(key) = core::str::from_utf8(&a[2..2 + kl]) else {
+            let Some((key, mut p)) = str_field(a) else {
                 return errno::EINVAL;
             };
             let key = key.to_string();
-            let mut p = 2 + kl;
             let Some(precondition) = read_precondition(a, &mut p) else {
                 return errno::EINVAL;
             };
-            let fptr = get_u64(a, p).unwrap_or(0);
-            let fcap = get_u16(a, p + 8).unwrap_or(0);
+            let Some((fptr, fcap)) = fence_out(a, p) else {
+                return errno::EINVAL;
+            };
             match store.delete(&key, precondition) {
                 Ok(opt) => {
                     let rev = opt.unwrap_or_else(|| store.revision());
@@ -1024,6 +1376,52 @@ pub unsafe fn dispatch_object(handle: i32, opcode: u32, arg: *mut u8, arg_len: u
                 Err(WriteError::Io(_)) => errno::ERROR,
             }
         }
+        obj_op::LIST => {
+            let Some(req) = obj_op::list::parse_request(a) else {
+                return errno::EINVAL;
+            };
+            let after = match list_cursor(req.cursor, req.prefix) {
+                Ok(after) => after,
+                Err(e) => return e,
+            };
+            let out = core::slice::from_raw_parts_mut(req.out_ptr as *mut u8, req.out_cap as usize);
+            let mut page = obj_op::list::PageWriter::new(out, req.max_keys);
+            let mut last: Option<&str> = None;
+            let mut more = false;
+            for (key, size, rev) in store.scan(req.prefix, after) {
+                if page.is_full() {
+                    more = true;
+                    break;
+                }
+                if key.len() > STORAGE_KEY_MAX {
+                    return errno::EOVERFLOW;
+                }
+                // mtime 0, as HEAD reports it: the store keeps no clock.
+                if !page.push(key.as_bytes(), size, 0, &etag_from_rev(rev)) {
+                    more = true;
+                    break;
+                }
+                last = Some(key);
+            }
+            let cursor = match last {
+                Some(k) if more => k.as_bytes(),
+                // A page that cannot hold the next entry made no progress.
+                None if more => return errno::ENOMEM,
+                _ => &[],
+            };
+            let Some(n) = page.finish(cursor) else {
+                return errno::ENOMEM;
+            };
+            write_fence(
+                Fence::ViewConsistent {
+                    source: STORE_SOURCE,
+                    revision: store.revision(),
+                },
+                req.fence_out_ptr,
+                req.fence_out_cap,
+            );
+            n as i32
+        }
         obj_op::CLOSE => {
             let idx = slot_of(handle) as usize;
             let reads = &mut *core::ptr::addr_of_mut!(LINUX_READS);
@@ -1045,6 +1443,12 @@ pub unsafe fn dispatch_object(handle: i32, opcode: u32, arg: *mut u8, arg_len: u
 /// state without synchronization. `arg` must be null or valid for reads
 /// and writes of `arg_len` bytes for the duration of the call.
 pub unsafe fn dispatch_namespace(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
+    // A guarded store is reached through `storage.object` under a grant. The
+    // namespace surface has no way to carry one, so it answers nothing that
+    // would list or change what a scope hides.
+    if guarded() {
+        return errno::EACCES;
+    }
     let Some(store) = store_ref() else {
         return errno::ENOSYS;
     };
@@ -1079,123 +1483,56 @@ pub unsafe fn dispatch_namespace(handle: i32, opcode: u32, arg: *mut u8, arg_len
         // object surface, not this one (namespace.rs::caps).
         ns_op::CAPS => (ns_op::caps::SUBSCRIBE | ns_op::caps::CHANGES) as i32,
         ns_op::LIST => {
-            // [prefix_len:u16][prefix][cursor_len:u16][cursor][out_buf:u64][out_cap:u32]
-            // [fence_out_ptr:u64][fence_out_cap:u16]
-            let Some(pl) = get_u16(a, 0).map(|v| v as usize) else {
+            let Some(req) = ns_op::list::parse_request(a) else {
                 return errno::EINVAL;
             };
-            let Ok(prefix) = core::str::from_utf8(&a[2..2 + pl]) else {
-                return errno::EINVAL;
+            let after = match list_cursor(req.cursor, req.prefix) {
+                Ok(after) => after,
+                Err(e) => return e,
             };
-            let mut p = 2 + pl;
-            let Some(cl) = get_u16(a, p).map(|v| v as usize) else {
-                return errno::EINVAL;
-            };
-            // Opaque cursor, encoded as a 4-byte LE start index — the same
-            // encoding `platform/linux/namespace.rs` uses, so the two
-            // namespace providers agree on the wire a consumer must parse.
-            // Absent (length 0) starts at the beginning; any other length is
-            // refused rather than treated as absent, because silently
-            // restarting a listing the caller believed it was continuing
-            // loops it over the first page forever.
-            let start = match cl {
-                0 => 0usize,
-                4 => match a.get(p + 2..p + 6) {
-                    Some(idx) => u32::from_le_bytes([idx[0], idx[1], idx[2], idx[3]]) as usize,
-                    None => return errno::EINVAL,
-                },
-                _ => return errno::EINVAL,
-            };
-            p += 2 + cl;
-            // The fixed tail: out_buf(8) + out_cap(4) + fence_ptr(8) +
-            // fence_cap(2). Requiring all 22 bytes is what makes a
-            // `cursor_len` that does not match the bytes supplied detectable
-            // — it shifts the tail, and a partly-in-range read would
-            // otherwise yield a plausible-looking pointer to write into.
-            if a.len() < p + 22 {
-                return errno::EINVAL;
-            }
-            let out_buf = get_u64(a, p).unwrap_or(0);
-            let out_cap = get_u32(a, p + 8).unwrap_or(0) as usize;
-            let fptr = get_u64(a, p + 12).unwrap_or(0);
-            let fcap = get_u16(a, p + 20).unwrap_or(0);
-
-            let (items, watermark) = store.list(prefix);
-            // entries: [name_len:u8][kind:u8][name] ; trailing
-            // [0xFF][0xFF][cursor_len:u8][cursor] — cursor_len 0 means end of
-            // listing. The second marker byte sits where an entry carries its
-            // `kind`, which is never 0xFF, so a 255-byte name (whose
-            // `name_len` IS 0xFF) cannot be read as the page end.
-            //
-            // A prefix holds an unbounded number of objects, so the reply
-            // PAGES: fill the buffer, emit a cursor, let the caller ask
-            // again. Serving a listing whole and refusing with ENOMEM when it
-            // did not fit would make the caller's buffer a ceiling on how
-            // many objects a prefix may hold — a consumer would stop listing
-            // entirely once its prefix outgrew that buffer, rather than
-            // degrading.
-            //
-            // Worst case the trailing record is 7 bytes (two markers + len +
-            // 4-byte cursor); reserve that so a page can always be terminated.
-            const TRAILER_MAX: usize = 7;
-            let mut buf = Vec::new();
-            let mut next = start;
-            for (k, _rev) in items.iter().skip(start) {
-                let name = k.as_bytes();
-                if name.len() > ns_op::MAX_ENTRY_NAME_LEN {
-                    // `name_len` is a byte and this name does not fit one.
-                    // Refuse: skipping returns a page the caller has no way
-                    // to know is short.
+            let out = core::slice::from_raw_parts_mut(req.out_ptr as *mut u8, req.out_cap as usize);
+            let mut page = ns_op::list::PageWriter::new(out);
+            let mut last: Option<&str> = None;
+            let mut more = false;
+            for (key, _, _) in store.scan(req.prefix, after) {
+                if key.len() > STORAGE_KEY_MAX {
                     return errno::EOVERFLOW;
                 }
-                let need = 2 + name.len();
-                if out_buf != 0 && buf.len() + need + TRAILER_MAX > out_cap {
+                if !page.push(key.as_bytes(), ns_op::KIND_OBJECT) {
+                    more = true;
                     break;
                 }
-                buf.push(name.len() as u8);
-                buf.push(ns_op::KIND_OBJECT);
-                buf.extend_from_slice(name);
-                next += 1;
+                last = Some(key);
             }
-            buf.push(ns_op::TRAILER_MARK);
-            buf.push(ns_op::TRAILER_MARK);
-            if next < items.len() {
-                buf.push(4); // cursor_len
-                buf.extend_from_slice(&(next as u32).to_le_bytes());
-            } else {
-                buf.push(0); // cursor_len 0 = end of listing
-            }
-            if out_buf != 0 {
-                if buf.len() > out_cap {
-                    // Too small to hold even one entry plus the trailer. The
-                    // caller must offer a usable buffer; paging cannot help.
-                    return errno::ENOMEM;
-                }
-                core::ptr::copy_nonoverlapping(buf.as_ptr(), out_buf as *mut u8, buf.len());
-            }
+            let cursor = match last {
+                Some(k) if more => k.as_bytes(),
+                // A page that cannot hold the next entry made no progress.
+                None if more => return errno::ENOMEM,
+                _ => &[],
+            };
+            let Some(n) = page.finish(cursor) else {
+                return errno::ENOMEM;
+            };
             write_fence(
                 Fence::ViewConsistent {
                     source: STORE_SOURCE,
-                    revision: watermark,
+                    revision: store.revision(),
                 },
-                fptr,
-                fcap,
+                req.fence_out_ptr,
+                req.fence_out_cap,
             );
-            buf.len() as i32
+            n as i32
         }
         ns_op::SUBSCRIBE => {
             // [prefix_len:u16][prefix][sink_chan:u32][flags:u8]
-            let Some(pl) = get_u16(a, 0).map(|v| v as usize) else {
-                return errno::EINVAL;
-            };
-            let Ok(prefix) = core::str::from_utf8(&a[2..2 + pl]) else {
+            let Some((prefix, p)) = str_field(a) else {
                 return errno::EINVAL;
             };
             let prefix = prefix.to_string();
-            let Some(sink_chan) = get_u32(a, 2 + pl) else {
+            let Some(sink_chan) = get_u32(a, p) else {
                 return errno::EINVAL;
             };
-            let flags = *a.get(2 + pl + 4).unwrap_or(&0);
+            let flags = *a.get(p + 4).unwrap_or(&0);
             let include_initial = flags & 0x01 != 0;
 
             // Live subscription from the current watermark; if the caller wants the
@@ -1258,17 +1595,10 @@ pub unsafe fn dispatch_namespace(handle: i32, opcode: u32, arg: *mut u8, arg_len
         ns_op::CHANGES => {
             // [prefix_len:u16][prefix][since:u64][out_buf:u64][out_cap:u32]
             // [fence_out_ptr:u64][fence_out_cap:u16]
-            let Some(pl) = get_u16(a, 0).map(|v| v as usize) else {
-                return errno::EINVAL;
-            };
-            if a.len() < 2 + pl {
-                return errno::EINVAL;
-            }
-            let Ok(prefix) = core::str::from_utf8(&a[2..2 + pl]) else {
+            let Some((prefix, mut p)) = str_field(a) else {
                 return errno::EINVAL;
             };
             let prefix = prefix.to_string();
-            let mut p = 2 + pl;
             let since = get_u64(a, p).unwrap_or(0);
             p += 8;
             let out_buf = get_u64(a, p).unwrap_or(0);
@@ -1350,14 +1680,8 @@ pub unsafe fn dispatch_namespace(handle: i32, opcode: u32, arg: *mut u8, arg_len
             );
             buf.len() as i32
         }
-        ns_op::LOOKUP => {
-            // Snapshot handle over a path — reuse the SUBSCRIBE slot table's
-            // sibling not needed; just return a synthetic handle (STAT reads by
-            // path re-lookup). We record nothing; STAT takes the path via LIST.
-            // Return a tagged handle whose slot is the read table (unused body).
-            errno::ENOSYS // LOOKUP/STAT not needed by the reconcilers; deferred
-        }
-        ns_op::STAT => errno::ENOSYS,
+        // The store enumerates and watches; it has no per-path handle.
+        ns_op::LOOKUP | ns_op::STAT => errno::ENOSYS,
         ns_op::CLOSE => {
             let idx = slot_of(handle) as usize;
             let subs = &mut *core::ptr::addr_of_mut!(LINUX_SUBS);

@@ -677,9 +677,7 @@ unsafe fn step_running(s: &mut LinkState) -> i32 {
             if in_poll > 0 && ((in_poll as u32) & POLL_IN) != 0 {
                 // Try mailbox
                 let mut mailbox_len: u32 = 0;
-                let mailbox_ptr =
-                    (dev_call)(in_chan, 0x0A02, &mut mailbox_len as *mut u32 as *mut u8, 4)
-                        as *const u8;
+                let mailbox_ptr = dev_buffer_acquire_read(&*s.syscalls, in_chan, &mut mailbox_len);
                 if !mailbox_ptr.is_null() && mailbox_len >= block_bytes as u32 {
                     let frame_id = compute_frame_id(s, dev_call);
                     let wire_len = link_frame_encode(
@@ -692,14 +690,14 @@ unsafe fn step_running(s: &mut LinkState) -> i32 {
                         s.wire_buf.as_mut_ptr(),
                         MAX_WIRE_BUF,
                     );
-                    (dev_call)(in_chan, 0x0A03, core::ptr::null_mut(), 0);
+                    dev_buffer_release_read(&*s.syscalls, in_chan);
                     s.tx_seq = s.tx_seq.wrapping_add(1);
                     if wire_len > 0 {
                         send_wire(s, dev_call, wire_len);
                     }
                 } else {
                     if !mailbox_ptr.is_null() {
-                        (dev_call)(in_chan, 0x0A03, core::ptr::null_mut(), 0);
+                        dev_buffer_release_read(&*s.syscalls, in_chan);
                     }
                     // FIFO path
                     let audio_offset = MAX_WIRE_BUF - block_bytes;
@@ -785,8 +783,7 @@ unsafe fn step_running(s: &mut LinkState) -> i32 {
             if sp.valid && sp.frame_id == s.playout_frame_id {
                 // Mailbox write
                 let mut cap: u32 = 0;
-                let mbuf =
-                    (dev_call)(out_chan, 0x0A00, &mut cap as *mut u32 as *mut u8, 4) as *mut u8;
+                let mbuf = dev_buffer_acquire_write(&*s.syscalls, out_chan, &mut cap);
                 if !mbuf.is_null() && cap >= block_bytes as u32 {
                     let src = s.jitter_data.as_ptr().add(slot_idx * MAX_BLOCK_BYTES);
                     let mut j = 0usize;
@@ -794,12 +791,10 @@ unsafe fn step_running(s: &mut LinkState) -> i32 {
                         core::ptr::write_volatile(mbuf.add(j), *src.add(j));
                         j += 1;
                     }
-                    let mut len_arg = (block_bytes as u32).to_le_bytes();
-                    (dev_call)(out_chan, 0x0A01, len_arg.as_mut_ptr(), 4);
+                    dev_buffer_release_write(&*s.syscalls, out_chan, block_bytes as u32);
                 } else {
                     if !mbuf.is_null() {
-                        let mut zero_arg = 0u32.to_le_bytes();
-                        (dev_call)(out_chan, 0x0A01, zero_arg.as_mut_ptr(), 4);
+                        dev_buffer_release_write(&*s.syscalls, out_chan, 0);
                     }
                     let src = s.jitter_data.as_ptr().add(slot_idx * MAX_BLOCK_BYTES);
                     (channel_write)(out_chan, src, block_bytes);
@@ -809,20 +804,17 @@ unsafe fn step_running(s: &mut LinkState) -> i32 {
             } else {
                 // Missing block — output silence
                 let mut cap: u32 = 0;
-                let mbuf =
-                    (dev_call)(out_chan, 0x0A00, &mut cap as *mut u32 as *mut u8, 4) as *mut u8;
+                let mbuf = dev_buffer_acquire_write(&*s.syscalls, out_chan, &mut cap);
                 if !mbuf.is_null() && cap >= block_bytes as u32 {
                     let mut j = 0usize;
                     while j < block_bytes {
                         core::ptr::write_volatile(mbuf.add(j), 0);
                         j += 1;
                     }
-                    let mut len_arg = (block_bytes as u32).to_le_bytes();
-                    (dev_call)(out_chan, 0x0A01, len_arg.as_mut_ptr(), 4);
+                    dev_buffer_release_write(&*s.syscalls, out_chan, block_bytes as u32);
                 } else {
                     if !mbuf.is_null() {
-                        let mut zero_arg = 0u32.to_le_bytes();
-                        (dev_call)(out_chan, 0x0A01, zero_arg.as_mut_ptr(), 4);
+                        dev_buffer_release_write(&*s.syscalls, out_chan, 0);
                     }
                     let zeros = [0u8; 64];
                     let mut remaining = block_bytes;

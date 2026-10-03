@@ -67,11 +67,13 @@ enum Commands {
         /// --emit=combined: the firmware UF2 to combine with.
         #[arg(long)]
         firmware: Option<PathBuf>,
-        /// Modules directory override (default:
-        /// target/fluxor/{silicon}/modules). Single dir for
-        /// uf2/bin/image; repeatable for --emit=table.
-        #[arg(short = 'm', long = "modules-dir", action = clap::ArgAction::Append)]
-        modules_dir: Vec<PathBuf>,
+        /// Directory holding the `.fmod` modules to use, instead of the
+        /// project's `target/fluxor/<silicon>/modules`. Falls back to
+        /// `$FLUXOR_MODULE_ROOT`, then that default. A root given here
+        /// or by the variable must be an existing directory containing
+        /// at least one `.fmod`; it is never silently replaced.
+        #[arg(long, value_name = "DIR")]
+        module_root: Option<PathBuf>,
         /// Target override (--check / --emit=image; default: read from
         /// the config's `target:` field).
         #[arg(short, long)]
@@ -115,8 +117,10 @@ enum Commands {
     /// (listen_port + http_offset); anything else via `--var`.
     Run {
         /// Config file (YAML), or `-` to read the config from stdin
-        /// (heredoc-friendly; works with `--replicas` templates too).
-        /// Optional only when `--list` is given.
+        /// (heredoc-friendly; works with `--replicas` templates too); a
+        /// workload bundle (source manifest or bundle dir); or the name of
+        /// a bundle `fluxor.lock` pins. Optional only when `--list` is
+        /// given.
         config: Option<PathBuf>,
         /// Scenario only: dump the synthesised host graph YAML and exit.
         #[arg(long)]
@@ -158,6 +162,14 @@ enum Commands {
         /// applied uniformly to every replica. Repeat for multiple.
         #[arg(long = "var", value_name = "KEY=VALUE")]
         vars: Vec<String>,
+        /// Service bundle: one parameter value, typed by the bundle's
+        /// declared schema. Repeatable; overrides `--params`.
+        #[arg(long = "param", value_name = "NAME=VALUE")]
+        params: Vec<String>,
+        /// Service bundle: a values file — one flat TOML table of
+        /// `name = value`, typed values checked against the schema.
+        #[arg(long = "params", value_name = "FILE")]
+        params_file: Option<PathBuf>,
         /// Append the certificates in this PEM file to the trust anchors
         /// of every CLIENT-MODE `tls` / `quic` instance for this run. A
         /// server instance is never widened, whether or not it verifies
@@ -165,6 +177,14 @@ enum Commands {
         /// and not `--replicas`; there is no environment-variable form.
         #[arg(long, value_name = "PEM")]
         ca: Option<PathBuf>,
+        /// Directory holding the `.fmod` modules to use (graph, scenario or
+        /// `--replicas` runs; every replica gets the same root), instead of the
+        /// project's `target/fluxor/<silicon>/modules`. Falls back to
+        /// `$FLUXOR_MODULE_ROOT`, then that default. A root given here
+        /// or by the variable must be an existing directory containing
+        /// at least one `.fmod`; it is never silently replaced.
+        #[arg(long, value_name = "DIR")]
+        module_root: Option<PathBuf>,
         /// Program argv, after `--`. Forwarded to the graph's `cli_in`
         /// exactly as `fluxor exec` forwards an applet's, so a graph that
         /// takes arguments can be run from its source as well as from an
@@ -213,6 +233,13 @@ enum Commands {
     Flash {
         /// Config file (YAML)
         config: PathBuf,
+        /// Directory holding the `.fmod` modules to use, instead of the
+        /// project's `target/fluxor/<silicon>/modules`. Falls back to
+        /// `$FLUXOR_MODULE_ROOT`, then that default. A root given here
+        /// or by the variable must be an existing directory containing
+        /// at least one `.fmod`; it is never silently replaced.
+        #[arg(long, value_name = "DIR")]
+        module_root: Option<PathBuf>,
     },
     /// Render a YAML config template by substituting `__KEY__`
     /// placeholders with `--var KEY=VALUE` pairs. Writes the
@@ -383,16 +410,35 @@ enum Commands {
         action: GpuAction,
     },
 
-    /// Full CI gate. Runs in order: fmt-check, clippy, workspace-lint
-    /// opt-in audit, hygiene scan, observability + presentation lints,
-    /// template render, version-skew check, lockfile consistency,
-    /// live-staleness, cargo unit tests, modules build (strict), and
-    /// cargo integration tests. Every phase runs even when an earlier
-    /// one fails; the summary lists all failures and exits non-zero.
+    /// Full CI gate. Phases run in this order, each only where the project
+    /// has what it checks: fmt-check, clippy, workspace-lint-opt-in,
+    /// hygiene, observability, presentation, makefile, fluxor-toml-schema,
+    /// template-render, version-skew, lockfile-consistency, catalog-drift,
+    /// sdk-materialisation, live-staleness, limit-register,
+    /// abi-surface-pin, modules-build (strict), host-binary, cargo unit
+    /// tests, wasm-host-shims (node), examples, service-bundles,
+    /// kernel-link (rp), project-e2e, and the cargo integration tests.
+    /// Every phase runs even when an earlier one fails; the summary lists
+    /// every phase and the exit status is non-zero if any failed. A
+    /// warning does not fail the run.
+    ///
+    /// Subprocess phases run against THIS `fluxor`, not whichever one is
+    /// installed: their PATH begins with a directory whose `fluxor` is the
+    /// running binary, and `$FLUXOR_BIN` names it. The modules and the
+    /// host runtime `fluxor-linux` are built ahead of every test suite and
+    /// e2e script (incrementally, so a no-op when current), so no test runs
+    /// against an artefact built from another tree, and a failed build fails
+    /// the run.
     Ci {
-        /// Skip an individual phase for local iteration. Rejected
-        /// when `$CI=1` so production CI always runs the full set.
-        /// Allowed values: cargo, modules, lint, hygiene, templates.
+        /// Skip phases for local iteration (comma-separated or repeated):
+        /// `cargo` (unit, integration, node, host-binary and project-e2e
+        /// tests), `modules` (strict module build), `lint` (fmt-check,
+        /// clippy, workspace-lint-opt-in, presentation, makefile, examples,
+        /// service-bundles),
+        /// `hygiene` (hygiene, observability), `templates`
+        /// (template-render), `kernel` (kernel-link). Rejected when
+        /// `$CI` is set, so production CI always runs the full set; a run
+        /// with any skip does not record a green stamp.
         #[arg(long, value_delimiter = ',')]
         skip: Vec<String>,
         /// Project root override.
@@ -402,9 +448,10 @@ enum Commands {
 
     /// Publish this project's artifacts into the local OCI store —
     /// the single store-write verb. Every artifact is annotated with
-    /// its epoch (ABI-surface digest), token-canonical input digest,
-    /// provenance, and source rev; tags and the project index repoint
-    /// in one transactional index swap. In the fluxor repo, `runtime`
+    /// its epoch (ABI-surface digest) and token-canonical input digest,
+    /// and its provenance, source rev and ci digest are filed beside the
+    /// manifest; tags and the project index repoint in one transactional
+    /// index swap. Publishing writes what is built and never builds. In the fluxor repo, `runtime`
     /// includes the CLI itself (the launcher resolves it on the next
     /// invocation). `publish bundle` publishes a built workload
     /// bundle directory.
@@ -466,10 +513,11 @@ enum Commands {
 
     /// Maintain the local OCI artifact store
     /// (`$XDG_DATA_HOME/fluxor/store`, override `$FLUXOR_STORE`):
-    /// `ls`, `rm`, `pin`, `snapshot`. Modules and workload bundles
-    /// publish into it as OCI artifacts with provenance annotations;
-    /// consume paths read only from it (offline-first). Read-only
-    /// artifact display lives on `fluxor inspect <ref>`.
+    /// `ls`, `rm`, `pin`, `snapshot`, `push`, `pull`, `adopt`, `fsck`,
+    /// `gc`. Modules and workload bundles publish into it as OCI
+    /// artifacts; consume paths read only from it (offline-first), and
+    /// `push`/`pull` are the only verbs that touch the network.
+    /// Read-only artifact display lives on `fluxor inspect <ref>`.
     Store(store_cli::StoreArgs),
 
     /// Export a graph's observability id-table as JSON: instrument names,
@@ -581,12 +629,13 @@ enum PublishAction {
         #[arg(long)]
         store: Option<PathBuf>,
     },
-    /// Publish a workload bundle directory (workload.json +
-    /// resources.json + graph.yaml) into the local OCI store. Every
-    /// module digest the manifest pins must already be in the store.
+    /// Publish a workload bundle into the local OCI store, under the
+    /// project its tree belongs to. Takes a source manifest
+    /// (`workload.toml`, emitted first) or a bundle directory. The bundle
+    /// carries the `.fmod` bytes of every module `workload.json` pins.
     Bundle {
-        /// Bundle directory.
-        bundle_dir: PathBuf,
+        /// Source manifest or bundle directory.
+        bundle: PathBuf,
         /// Store directory (default: $XDG_DATA_HOME/fluxor/store,
         /// override with $FLUXOR_STORE).
         #[arg(long)]
@@ -753,8 +802,7 @@ enum LintAction {
         #[arg(long)]
         json: bool,
     },
-    /// Observability instrumentation-contract check
-    /// (standards/observability.md §6): every data-moving module declares
+    /// Observability instrumentation-contract check: every data-moving module declares
     /// `[observability]` metrics/spans or an `exempt` reason, and instrument
     /// names are dotted lowercase. Reports the uninstrumented-module gap list;
     /// fails only on malformed names.
@@ -800,10 +848,9 @@ enum ModulesAction {
         #[arg(long, conflicts_with = "target")]
         all: bool,
         /// Output root for `<silicon>/modules/<name>.fmod`. Defaults
-        /// to `target/fluxor` (standards/fluxor-modules.md §2). Pass
-        /// `--out target` for the alternate
-        /// `target/<silicon>/modules/` layout the combine / run
-        /// tooling also accepts.
+        /// to `target/fluxor`. A consumer reads artefacts from another
+        /// root through `--module-root <out>/<silicon>/modules` (or
+        /// `$FLUXOR_MODULE_ROOT`).
         #[arg(long, default_value = "target/fluxor")]
         out: PathBuf,
         /// `rustc -D warnings` mode. Required for `fluxor ci`.
@@ -824,8 +871,7 @@ enum ModulesAction {
         #[arg(long, default_value = "target/fluxor")]
         out: PathBuf,
     },
-    /// Inventory every module discovered under the standard's tier
-    /// directories (standards/fluxor-modules.md §0.1) —
+    /// Inventory every module discovered under the tier directories —
     /// `<tier>/<name>/manifest.toml`.
     ///
     /// A declaration-only manifest — a kernel-resident built-in, with
@@ -837,14 +883,27 @@ enum ModulesAction {
         #[arg(long)]
         json: bool,
     },
-    /// Print the resolved `<out>/<silicon>/modules` path for a target.
-    /// Lets Makefiles and harness scripts refer to the artefact dir
-    /// without hard-coding the layout.
+    /// Print the module root for a target: `--module-root`, else
+    /// `$FLUXOR_MODULE_ROOT`, else `<out>/<silicon>/modules` (the
+    /// target's silicon, so a board resolves to its silicon's
+    /// directory). Lets Makefiles and harness scripts refer to the
+    /// artefact dir without hard-coding the layout.
     Resolve {
+        /// Target whose modules directory to print (silicon, host or
+        /// board).
         #[arg(long)]
         target: String,
+        /// Output root the default location is under, matching
+        /// `modules build --out`.
         #[arg(long, default_value = "target/fluxor")]
         out: PathBuf,
+        /// Directory holding the `.fmod` modules to use, instead of the
+        /// project's `target/fluxor/<silicon>/modules`. Falls back to
+        /// `$FLUXOR_MODULE_ROOT`, then that default. A root given here
+        /// or by the variable must be an existing directory containing
+        /// at least one `.fmod`; it is never silently replaced.
+        #[arg(long, value_name = "DIR")]
+        module_root: Option<PathBuf>,
     },
     /// Pack an ELF object file into the `.fmod` module format.
     Pack {
@@ -896,4 +955,76 @@ enum ModulesAction {
         #[arg(long)]
         force: bool,
     },
+    /// Issue and check mesh capability chains, signed with `keygen` seeds.
+    ///
+    /// The codec and chain rules are the SDK's mesh capability contract, the
+    /// same source every verifying module links. A key's public half (what
+    /// `keygen` prints) is a root's verifiers' trust anchor.
+    Cap {
+        #[command(subcommand)]
+        action: CapAction,
+    },
+}
+
+/// `fluxor modules cap` actions. A time is unix seconds, `now`, `now+N` or
+/// `now-N`; an object is 32 hex digits or a UUID; permissions are a comma
+/// list of `read_state subscribe send_command configure admin delegate`; a
+/// chain is its text form, `fxcap1.…`.
+#[derive(Subcommand)]
+enum CapAction {
+    /// Grant permissions on an object. Prints the chain.
+    Mint {
+        /// The issuing key's seed.
+        #[arg(short = 'k', long)]
+        key: PathBuf,
+        /// The object granted on: 32 hex digits or a UUID.
+        #[arg(long, conflicts_with = "scope", required_unless_present = "scope")]
+        object: Option<String>,
+        /// A storage scope granted on instead: a key prefix ending `/`
+        /// (`photos/`), as a store's `PRESENT` names it.
+        #[arg(long)]
+        scope: Option<String>,
+        #[arg(long)]
+        perms: String,
+        #[arg(long)]
+        not_before: String,
+        #[arg(long)]
+        not_after: String,
+        /// The chain that authorises the issuing key; omitted for a root.
+        #[arg(long)]
+        chain: Option<String>,
+    },
+    /// Authorise another key to grant within the given permissions, which
+    /// must include `delegate`. Prints the chain.
+    Delegate {
+        /// The issuing key's seed.
+        #[arg(short = 'k', long)]
+        key: PathBuf,
+        /// The delegate's public key, 64 hex digits.
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        perms: String,
+        #[arg(long)]
+        not_before: String,
+        #[arg(long)]
+        not_after: String,
+        /// The chain that authorises the issuing key; omitted for a root.
+        #[arg(long)]
+        chain: Option<String>,
+    },
+    /// Verify a chain under a root for one operation, against this host's
+    /// clock. Exits non-zero with the refusal on any failure.
+    Verify {
+        /// The root public key, 64 hex digits.
+        #[arg(long)]
+        root: String,
+        #[arg(long)]
+        object: String,
+        #[arg(long)]
+        perms: String,
+        chain: String,
+    },
+    /// Print every link of a chain.
+    Inspect { chain: String },
 }

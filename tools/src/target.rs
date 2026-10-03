@@ -7,7 +7,7 @@
 //! Resolution: `load_target("pico2w")` checks `targets/boards/pico2w.toml`
 //! first (which references silicon "rp2350"), then `targets/host/`, then
 //! `targets/silicon/`. The registry is the ONLY board→silicon mapping —
-//! tooling must not carry alias tables (standards/target_consolidation.md §3).
+//! tooling must not carry alias tables.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -343,8 +343,7 @@ struct TomlBoardMeta {
 // ── Public types ────────────────────────────────────────────────────────────
 
 /// Which registry tier a target name resolved through. Boards deploy,
-/// hosts run fluxor as a process, silicon keys module artifacts. See
-/// standards/target_consolidation.md §2 for where each may appear.
+/// hosts run fluxor as a process, silicon keys module artifacts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TargetKind {
     Silicon,

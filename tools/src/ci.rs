@@ -80,6 +80,7 @@ impl SkipSet {
 /// the aggregate exit status (`ok()` is true iff every non-skipped
 /// phase passed).
 pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<PhaseResult>> {
+    let _cli = RunningCli::hold();
     let in_ci = std::env::var_os("CI").is_some();
     if in_ci
         && (skip.cargo
@@ -187,9 +188,8 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
 
     // ───── observability instrumentation contract ────────────────────────
     //
-    // Enforce standards/observability.md §6: every data-moving module
-    // either declares `[observability]` metrics/spans or carries an
-    // `exempt` reason. Strict (a gap is an error, not a warning), so a
+    // Every data-moving module either declares `[observability]`
+    // metrics/spans or carries an `exempt` reason. Strict (a gap is an error, not a warning), so a
     // new byte-moving module can't land uninstrumented and unexplained.
     results.push(if skip.hygiene {
         skipped("observability")
@@ -212,7 +212,7 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
 
     // ───── Makefile standard ─────────────────────────────────────────────
     //
-    // Holds this project's Makefile to `standards/make.md`. A CLI verb that
+    // Holds this project's Makefile to the Makefile standard. A CLI verb that
     // moves strands the help text and the scripts naming it across every
     // checkout, and each one is then found by hand. This phase reads the live
     // CLI, so the standard is enforced where it is violated.
@@ -263,15 +263,14 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
     // `stacks/` and `targets/` are the one build input nothing pinned.
     // They are read live from the fluxor checkout while the modules they
     // configure come from digests in `fluxor.lock`, so a stack edited in
-    // a sibling checkout changes every downstream build at once — no
-    // publish, no `update`, and until now no record that anything moved.
-    // `fluxor update` stamps the catalog it resolved against; this
-    // reports when the live one has drifted from that stamp.
+    // a sibling checkout changes every downstream build at once, with no
+    // publish and no `update`. `fluxor update` stamps the catalog it
+    // resolved against; this reports when the live one has drifted from
+    // that stamp.
     //
     // Warns rather than fails, for the same reason live-staleness does:
-    // a catalog that has moved on is an ordinary state, not a defect.
-    // What was missing was any way to SEE it, which is what turned a
-    // one-line skew into an afternoon.
+    // a catalog that has moved on is an ordinary state, not a defect. The
+    // value is in making the drift visible.
     {
         if verbose {
             eprintln!("[ci] running phase: catalog-drift");
@@ -476,16 +475,47 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
         }));
     }
 
+    // ───── modules build ─────────────────────────────────────────────────
+    //
+    // Ahead of every phase that runs tests: the tools crate's CLI tests, the
+    // examples build-check and the harness all load `.fmod` artefacts, and a
+    // module built against another ABI surface is refused at load. Run after
+    // them, a test checks whatever an earlier build left in `target/fluxor`
+    // and fails on the first run after an ABI change.
+    results.push(if skip.modules {
+        skipped("modules-build (strict)")
+    } else {
+        run_step("modules-build (strict)", verbose, || {
+            run_modules_build_strict(project_root, verbose)
+        })
+    });
+
+    // ───── host runtime ──────────────────────────────────────────────────
+    //
+    // The production binary the test suites boot (the tools crate's CLI
+    // tests as well as the harness) is also what the project's E2E scripts
+    // launch their graphs on, so it is built, and current, before the first
+    // of them runs.
+    if kernel_workspace {
+        results.push(if skip.cargo {
+            skipped("host-binary")
+        } else {
+            run_step("host-binary", verbose, || {
+                build_host_binary(project_root, verbose)
+            })
+        });
+    }
+
     // ───── cargo unit + library tests ────────────────────────────────────
     //
     // For fluxor itself, run from `tools/` rather than workspace
     // root: the kernel's default features pull in embedded crates
-    // that don't compile on the host. The Makefile's `make test`
-    // follows the same pattern (cd tools && cargo test --all-targets
-    // --all-features). Downstreams may declare their own host-tools
-    // sub-crate via `[ci.cargo] host_tools_crate = "tools"`; absent
-    // that, a host-buildable workspace runs the standard's phase-2
-    // command at the workspace root instead (see below).
+    // that don't compile on the host. `fluxor test` resolves the same
+    // site (`cargo test --all-targets --all-features` in `tools/`).
+    // Downstreams may declare their own host-tools sub-crate via
+    // `[ci.cargo] host_tools_crate = "tools"`; absent that, a
+    // host-buildable workspace runs `cargo test --workspace --lib --bins`
+    // at the workspace root instead (see below).
     // `cargo test` needs a cargo project. A crate-less fmod-only project
     // (no root `Cargo.toml`) with no host-tools crate has nothing here, so
     // the phase is omitted rather than perpetually listed as skipped.
@@ -524,15 +554,6 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
         });
     }
 
-    // ───── modules build ─────────────────────────────────────────────────
-    results.push(if skip.modules {
-        skipped("modules-build (strict)")
-    } else {
-        run_step("modules-build (strict)", verbose, || {
-            run_modules_build_strict(project_root, verbose)
-        })
-    });
-
     // ───── tracked examples build-check ──────────────────────────────────
     //
     // `examples/` is the front door, and a graph naming a module the repo does
@@ -554,6 +575,26 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
     } else {
         run_step("examples", verbose, || run_examples(project_root))
     });
+
+    // ───── service bundles ───────────────────────────────────────────────
+    //
+    // A service bundle ships a graph TEMPLATE plus a parameter schema, and
+    // a consumer runs it without reading either. So the schema and the
+    // template are checked here, by the producer, against each other and
+    // rendered with the declared defaults and examples through the same
+    // `build --check` a plain graph takes — after the module build, for the
+    // same reason as the examples phase. Omitted when the project ships no
+    // service manifest.
+    let service_manifests = crate::service_params::service_manifests(project_root);
+    if !service_manifests.is_empty() {
+        results.push(if skip.lint {
+            skipped("service-bundles")
+        } else {
+            run_step("service-bundles", verbose, || {
+                run_service_bundles(project_root, &service_manifests)
+            })
+        });
+    }
 
     // ───── kernel link + static-RAM budget ───────────────────────────────
     //
@@ -614,9 +655,6 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
     // `fluxor test` and by nothing in the gate.
     //
     // `cargo_integration_sites` is the same call `fluxor test` makes.
-    if !skip.cargo && is_fluxor_kernel_workspace(project_root) {
-        ensure_host_binary(project_root, verbose);
-    }
     for (label, dir, args) in cargo_integration_sites(project_root) {
         results.push(if skip.cargo {
             skipped(label)
@@ -743,9 +781,9 @@ fn run_node_tests(project_root: &Path, verbose: bool) -> PhaseResult {
             if verbose {
                 eprintln!("[ci] {NAME}: {name}");
             }
-            let out = Command::new("node")
-                .arg(test)
-                .current_dir(project_root)
+            let mut cmd = Command::new("node");
+            cmd.arg(test).current_dir(project_root);
+            let out = with_running_cli(&mut cmd)
                 .output()
                 .map_err(|e| format!("node: spawn failed: {e}"))?;
             if !out.status.success() {
@@ -780,6 +818,7 @@ fn skipped(name: &'static str) -> PhaseResult {
 pub(crate) fn cargo_in(dir: &Path, args: &[&str]) -> std::result::Result<(), String> {
     let mut cmd = Command::new("cargo");
     cmd.current_dir(dir).args(args);
+    with_running_cli(&mut cmd);
     let status = cmd
         .status()
         .map_err(|e| format!("cargo: spawn failed: {e}"))?;
@@ -814,7 +853,7 @@ fn clippy_downstream(project_root: &Path) -> std::result::Result<(), String> {
 /// linted in a single `cargo clippy --workspace` invocation because
 /// the kernel's default features pull embedded-only deps that don't
 /// compile on the host; each entry below is one self-consistent
-/// build configuration matching `Makefile :: lint`.
+/// build configuration matching `fluxor lint`.
 fn clippy_matrix(project_root: &Path) -> std::result::Result<(), String> {
     let matrix: &[ClippyJob<'_>] = &[
         // Host tools — all features enabled.
@@ -987,8 +1026,7 @@ fn clippy_matrix(project_root: &Path) -> std::result::Result<(), String> {
         // module core under the host-test feature, exercising the same
         // code that ships as `.fmod` blobs on hardware. One clippy pass
         // there covers all mounted cores' host-test cfg branches, which
-        // no per-crate job could: module directories carry no crates
-        // (standards/fluxor-modules.md §0).
+        // no per-crate job could: module directories carry no crates.
         // Skipped naturally when `tests/harness/` doesn't exist.
         ClippyJob {
             label: "harness (module cores, host-test)",
@@ -1258,43 +1296,39 @@ pub(crate) fn cargo_host_tools_dir(project_root: &Path) -> Option<PathBuf> {
 /// have to agree: a binary under another triple is a binary those tests skip.
 const HARNESS_TARGET: &str = "aarch64-unknown-linux-gnu";
 
-/// Build `fluxor-linux` so the Tier-2 integration tests have the binary they
-/// drive.
+/// Build `fluxor-linux` so the test suites and the project's E2E scripts have
+/// the binary they drive, and have the CURRENT one.
 ///
 /// Those tests boot the production binary and observe it as a user would. When
 /// it is absent each one prints a skip line and RETURNS — which libtest records
-/// as a pass, so the phase reports green over suites that never ran. `make ci`
+/// as a pass, so the phase reports green over suites that never ran. A stale
+/// one is worse: the suites run, against code that is not in the tree. `make ci`
 /// is `fluxor ci` alone and does not depend on `make install`, so nothing else
-/// in the gate guarantees the binary exists.
+/// in the gate guarantees either.
 ///
-/// Only when it is missing: a present binary is left alone, because rebuilding
-/// it here would overwrite whatever the developer is testing against.
-fn ensure_host_binary(project_root: &Path, verbose: bool) {
-    let bin = project_root
-        .join("target")
-        .join(HARNESS_TARGET)
-        .join("release")
-        .join("fluxor-linux");
-    if bin.is_file() {
-        return;
-    }
+/// Always built: cargo's incremental build makes an up-to-date tree a no-op.
+/// A failed build fails this phase and so the run; the later suites still run
+/// (every phase does), against whatever binary the last good build left.
+fn build_host_binary(project_root: &Path, verbose: bool) -> std::result::Result<(), String> {
     if verbose {
-        println!("  building fluxor-linux for the integration tests");
+        println!("  building fluxor-linux for the test suites");
     }
-    let _ = cargo_in(
-        project_root,
-        &[
-            "build",
-            "--release",
-            "--bin",
-            "fluxor-linux",
-            "--no-default-features",
-            "--features",
-            "host-linux,host-playback,host-hsm",
-            "--target",
-            HARNESS_TARGET,
-        ],
-    );
+    cargo_in(project_root, &host_binary_build_args())
+}
+
+/// The `cargo` arguments that build the host runtime for [`HARNESS_TARGET`].
+fn host_binary_build_args() -> [&'static str; 9] {
+    [
+        "build",
+        "--release",
+        "--bin",
+        "fluxor-linux",
+        "--no-default-features",
+        "--features",
+        "host-linux,host-playback,host-hsm",
+        "--target",
+        HARNESS_TARGET,
+    ]
 }
 
 /// The UNIT-test invocation: `(directory, args)`, or `None` with no cargo tree.
@@ -1404,7 +1438,7 @@ pub(crate) fn run_hygiene(project_root: &Path) -> std::result::Result<(), String
 /// Observability instrumentation-contract phase. Mirrors `fluxor lint
 /// observability --strict`: a data-moving module with neither `[observability]`
 /// instruments nor an `exempt` reason fails, as does a malformed instrument
-/// name. See `standards/observability.md` §6.
+/// name.
 fn run_observability(project_root: &Path) -> std::result::Result<(), String> {
     let toml_exempt = crate::observability::load_toml_exemptions(project_root);
     let report =
@@ -1424,7 +1458,7 @@ fn run_observability(project_root: &Path) -> std::result::Result<(), String> {
     }
     if !report.invalid_attr_keys.is_empty() {
         msg.push_str(&format!(
-            "{} dimension key(s) outside the standards/observability.md §5              vocabulary ({}); ",
+            "{} dimension key(s) outside the OTel semantic-convention vocabulary ({}); ",
             report.invalid_attr_keys.len(),
             report
                 .invalid_attr_keys
@@ -1445,25 +1479,30 @@ fn run_observability(project_root: &Path) -> std::result::Result<(), String> {
     Err(msg)
 }
 
-/// Run the placement-resolver lint over every config's
-/// `presentation.shell`. Mirrors `fluxor lint presentation`. A `Command`
-/// that re-invokes this CLI binary as `fluxor`. The launcher `fexecve`s a
-/// digest-named store blob, so `current_exe()` is `blobs/sha256/<hex>` —
-/// spawning it bare puts the hex digest in the child's argv[0] and the
-/// busybox applet dispatch fires instead of the subcommand parse. Pin
-/// argv[0].
+/// The executable of the CLI running this gate, or `None` when it is gone.
+///
+/// A concurrent `cargo build` replaces the running binary by rename, after
+/// which `current_exe()` names a deleted inode and spawning it fails ENOENT.
+/// `/proc/self/exe` still execs the original image, so [`self_invoke`] falls
+/// back to it; a child that must LOCATE the CLI by path cannot, since that
+/// link names the child's own image.
+fn running_exe() -> Option<PathBuf> {
+    std::env::current_exe().ok().filter(|p| p.exists())
+}
+
+/// A `Command` that re-invokes this CLI binary as `fluxor`. The launcher
+/// `fexecve`s a digest-named store blob, so `current_exe()` is
+/// `blobs/sha256/<hex>` — spawning it bare puts the hex digest in the child's
+/// argv[0] and the busybox applet dispatch fires instead of the subcommand
+/// parse. Pin argv[0].
 fn self_invoke() -> Command {
-    let exe = std::env::current_exe().unwrap_or_else(|_| "fluxor".into());
-    // A concurrent `cargo build` replaces the running binary by rename,
-    // after which `current_exe()` names a deleted inode and spawning it
-    // fails ENOENT. `/proc/self/exe` still execs the original image, so
-    // the run stays self-consistent instead of failing every spawn.
-    #[cfg(target_os = "linux")]
-    let exe = if exe.exists() {
-        exe
-    } else {
-        std::path::PathBuf::from("/proc/self/exe")
-    };
+    let exe = running_exe().unwrap_or_else(|| {
+        if cfg!(target_os = "linux") {
+            PathBuf::from("/proc/self/exe")
+        } else {
+            "fluxor".into()
+        }
+    });
     let mut cmd = Command::new(exe);
     #[cfg(unix)]
     {
@@ -1473,6 +1512,109 @@ fn self_invoke() -> Command {
     cmd
 }
 
+/// The private `fluxor` directories this process made, by parent. Only a
+/// directory recorded here is reused or removed.
+static CLI_DIRS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// The private directory for `exe` under `shim_parent`, named by this
+/// process so concurrent gates never share one.
+fn shim_dir(shim_parent: &Path) -> PathBuf {
+    shim_parent.join(format!("fluxor-ci-cli-{}", std::process::id()))
+}
+
+/// Directory to put first on a child's `PATH` so a bare `fluxor` resolves to
+/// `exe`: the binary's own directory when it is named `fluxor` (and can be a
+/// `PATH` entry), otherwise a private directory under `shim_parent` holding a
+/// `fluxor` symlink to it (a store blob is named by digest, a test binary by
+/// hash). Idempotent within the process.
+///
+/// The private directory is always one this process created, owner-only. The
+/// temp dir is shared and the name is predictable, so a directory already
+/// standing there (left by a crashed run with this pid, or planted by
+/// another user) is removed if it can be and otherwise refused: a `fluxor`
+/// on a child's `PATH` must be one nobody else can replace.
+fn cli_dir_for(exe: &Path, shim_parent: &Path) -> Option<PathBuf> {
+    if exe.file_name().is_some_and(|n| n == "fluxor") {
+        if let Some(parent) = exe.parent() {
+            if std::env::join_paths([parent]).is_ok() {
+                return Some(parent.to_path_buf());
+            }
+        }
+    }
+    let mut made = CLI_DIRS.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = shim_dir(shim_parent);
+    let link = dir.join("fluxor");
+    if made.contains(&dir) && std::fs::read_link(&link).is_ok_and(|t| t == exe) {
+        return Some(dir);
+    }
+    made.retain(|d| d != &dir);
+    let _ = std::fs::remove_dir_all(&dir);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        std::fs::DirBuilder::new().mode(0o700).create(&dir).ok()?;
+        made.push(dir.clone());
+        std::os::unix::fs::symlink(exe, &link).ok()?;
+        Some(dir)
+    }
+    #[cfg(not(unix))]
+    None
+}
+
+/// `path` with `dir` ahead of every existing entry. An unset or empty `path`
+/// yields `dir` alone: an empty entry would put the current directory on it.
+fn path_with_first(dir: &Path, path: Option<std::ffi::OsString>) -> Option<std::ffi::OsString> {
+    let existing = path.filter(|p| !p.is_empty());
+    let rest = existing.as_deref().map(std::env::split_paths);
+    std::env::join_paths(std::iter::once(dir.to_path_buf()).chain(rest.into_iter().flatten())).ok()
+}
+
+/// Make `cmd` run against the CLI that is running the gate: its `PATH`
+/// begins with a directory whose `fluxor` is this binary, and `$FLUXOR_BIN`
+/// names it. A test suite or script that shells out to `fluxor` then
+/// exercises the tree under test, not whatever stale `fluxor` is installed.
+/// Every subprocess phase that may call `fluxor` is built through here, under
+/// a [`RunningCli`] guard.
+pub(crate) fn with_running_cli(cmd: &mut Command) -> &mut Command {
+    let Some(exe) = running_exe() else {
+        return cmd;
+    };
+    if let Some(dir) = cli_dir_for(&exe, &std::env::temp_dir()) {
+        if let Some(path) = path_with_first(&dir, std::env::var_os("PATH")) {
+            cmd.env("PATH", path);
+        }
+    }
+    cmd.env("FLUXOR_BIN", exe)
+}
+
+/// Scope guard for subprocess phases that run through
+/// [`with_running_cli`]: dropping it, on any return path including a panic,
+/// removes the private `fluxor` directory they may have made.
+pub struct RunningCli(());
+
+impl RunningCli {
+    pub fn hold() -> RunningCli {
+        RunningCli(())
+    }
+}
+
+impl Drop for RunningCli {
+    fn drop(&mut self) {
+        release_cli_dir(&std::env::temp_dir());
+    }
+}
+
+/// Remove the private `fluxor` directory [`cli_dir_for`] made under
+/// `shim_parent`, if it made one. A binary named `fluxor` needs none.
+fn release_cli_dir(shim_parent: &Path) {
+    let mut made = CLI_DIRS.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = shim_dir(shim_parent);
+    if made.contains(&dir) {
+        made.retain(|d| d != &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// Build-check every git-tracked config under `examples/`.
 ///
 /// Uses `git ls-files` rather than a directory walk so untracked local
@@ -1480,8 +1622,7 @@ fn self_invoke() -> Command {
 /// gated on. A repo without git, or without tracked examples, passes trivially.
 fn run_examples(project_root: &Path) -> std::result::Result<(), String> {
     // Versioned examples, from BOTH repos: a project may keep its
-    // examples in the primary repo, shadow-track them
-    // (standards/test-tracking.md), or be mid-move between the two.
+    // examples in the primary repo or in a separate tracking repo.
     // Enumerating one repo silently gates a subset: the graphs tracked in
     // the other repo are on disk and never checked.
     let mut listing: BTreeSet<String> = BTreeSet::new();
@@ -1507,6 +1648,7 @@ fn run_examples(project_root: &Path) -> std::result::Result<(), String> {
             );
         }
     }
+    let templates = service_templates(project_root);
     let mut failures: Vec<String> = Vec::new();
     let mut checked = 0usize;
     for rel in &listing {
@@ -1515,6 +1657,12 @@ fn run_examples(project_root: &Path) -> std::result::Result<(), String> {
         // `bundle/` holds packaged OUTPUT (`workload.json` beside a
         // rendered `graph.yaml`) whose source graph is checked already.
         if rel.contains("test_harness/") || rel.contains("/bundle/") {
+            continue;
+        }
+        // A service template names parameters only a run supplies; the
+        // service-bundles phase checks it rendered.
+        let abs = project_root.join(rel);
+        if templates.contains(&abs.canonicalize().unwrap_or(abs)) {
             continue;
         }
         // Tracked in an index but absent from disk. Build-checking it
@@ -1537,30 +1685,7 @@ fn run_examples(project_root: &Path) -> std::result::Result<(), String> {
             .output();
         match st {
             Ok(o) if o.status.success() => {}
-            Ok(o) => {
-                // The specific diagnostic goes to stdout; stderr carries only
-                // the "Validation failed" summary. Reporting the summary alone
-                // would make this phase say a config is broken without saying
-                // why — search both, and prefer the detailed line.
-                let combined = format!(
-                    "{}{}",
-                    String::from_utf8_lossy(&o.stdout),
-                    String::from_utf8_lossy(&o.stderr)
-                );
-                let detail = combined
-                    .lines()
-                    .map(str::trim)
-                    .find(|l| l.contains("ERROR"))
-                    .or_else(|| {
-                        combined
-                            .lines()
-                            .map(str::trim)
-                            .find(|l| l.contains("error") && !l.contains("Validation failed"))
-                    })
-                    .unwrap_or("build --check failed")
-                    .to_string();
-                failures.push(format!("{rel}: {detail}"));
-            }
+            Ok(o) => failures.push(format!("{rel}: {}", build_check_detail(&o))),
             Err(e) => failures.push(format!("{rel}: could not run build --check: {e}")),
         }
     }
@@ -1574,14 +1699,132 @@ fn run_examples(project_root: &Path) -> std::result::Result<(), String> {
     ))
 }
 
-/// Enforce `standards/make.md` against this project's Makefile.
+/// The line that says why `fluxor build --check` failed. The specific
+/// diagnostic goes to stdout; stderr carries only the "Validation failed"
+/// summary. Reporting the summary alone would say a config is broken without
+/// saying why — search both, and prefer the detailed line.
+fn build_check_detail(o: &std::process::Output) -> String {
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&o.stdout),
+        String::from_utf8_lossy(&o.stderr)
+    );
+    combined
+        .lines()
+        .map(str::trim)
+        .find(|l| l.contains("ERROR"))
+        .or_else(|| {
+            combined
+                .lines()
+                .map(str::trim)
+                .find(|l| l.contains("error") && !l.contains("Validation failed"))
+        })
+        .unwrap_or("build --check failed")
+        .to_string()
+}
+
+/// Graphs a service manifest ships as templates. They name parameters the
+/// examples phase has no values for; the service-bundles phase checks them
+/// rendered instead.
+fn service_templates(project_root: &Path) -> BTreeSet<PathBuf> {
+    crate::service_params::service_manifests(project_root)
+        .iter()
+        .filter_map(|m| crate::service_params::read_source(m).ok())
+        .flat_map(|src| src.implementations.into_iter().map(|(_, g)| g))
+        .map(|g| g.canonicalize().unwrap_or(g))
+        .collect()
+}
+
+/// Hold every service source manifest the project ships to its contract
+/// contract: the parameter schema is well-formed,
+/// every `${param:<name>}` its graphs carry is declared and every declared
+/// parameter is referenced, and each linux graph rendered with its defaults
+/// and examples passes the same `fluxor build --check` a plain graph does.
+///
+/// Discovery: `packaging/service/workload.toml`,
+/// `packaging/service/<name>/workload.toml` and `examples/<name>/workload.toml`
+/// whose role is `service`. The rendered graph is written under the project's
+/// `target/fluxor/ci-service/` so it resolves against this project.
+fn run_service_bundles(
+    project_root: &Path,
+    manifests: &[PathBuf],
+) -> std::result::Result<(), String> {
+    let mut failures = Vec::new();
+    let mut checked = 0usize;
+    for manifest in manifests {
+        let rel = manifest
+            .strip_prefix(project_root)
+            .unwrap_or(manifest)
+            .display()
+            .to_string();
+        let graphs = match crate::service_params::check_source(manifest) {
+            Ok(g) => g,
+            Err(e) => {
+                failures.push(e);
+                continue;
+            }
+        };
+        if graphs.is_empty() {
+            failures.push(format!("{rel}: no linux implementation to check"));
+            continue;
+        }
+        checked += 1;
+        let name = crate::service_params::read_source(manifest)
+            .map(|s| s.name)
+            .unwrap_or_default();
+        for (i, (graph, rendered)) in graphs.iter().enumerate() {
+            let dir = project_root
+                .join("target/fluxor/ci-service")
+                .join(format!("{name}-{i}"));
+            let out = dir.join("graph.yaml");
+            if let Err(e) =
+                std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&out, rendered))
+            {
+                failures.push(format!("{}: {e}", out.display()));
+                continue;
+            }
+            match self_invoke()
+                .arg("build")
+                .arg("--check")
+                .arg(&out)
+                .current_dir(project_root)
+                .output()
+            {
+                Ok(o) if o.status.success() => {}
+                Ok(o) => failures.push(format!(
+                    "{} rendered with defaults and examples: {}",
+                    graph.display(),
+                    build_check_detail(&o)
+                )),
+                Err(e) => failures.push(format!("{rel}: could not run build --check: {e}")),
+            }
+        }
+    }
+    if failures.is_empty() {
+        return vacuity(
+            "service-bundles",
+            checked,
+            manifests.len(),
+            "service source manifest(s) were found",
+            "no manifest reached its graphs",
+        );
+    }
+    Err(format!(
+        "{} of {} service manifest(s) fail:\n  {}",
+        failures.len(),
+        manifests.len(),
+        failures.join("\n  ")
+    ))
+}
+
+/// Enforce the Makefile standard against this project's Makefile.
 ///
 /// The rules themselves — preamble, target set, canonical recipe
 /// bodies, §3 recipe complexity — live in [`crate::makefile_lint`],
 /// which is pure text and unit-tested as such. What this wrapper adds
 /// is the live CLI: every `fluxor <verb>` the Makefile names is
 /// resolved against *this binary's* command set, so a verb that is
-/// renamed or retired fails here on the day it moves rather than in a
+/// renamed or removed fails here on the day it moves rather than in a
 /// sibling repo weeks later. Nothing about the check needs updating
 /// when the CLI changes — it asks the binary.
 fn run_makefile(project_root: &Path) -> std::result::Result<(), String> {
@@ -1596,7 +1839,7 @@ fn run_makefile(project_root: &Path) -> std::result::Result<(), String> {
         .collect();
 
     // The scripts §3 sends complexity into are part of the same surface:
-    // a Makefile one line long that calls a script naming a retired verb
+    // a Makefile one line long that calls a script naming a removed verb
     // is drift the Makefile check cannot see.
     for script in shell_scripts(project_root) {
         let Ok(body) = std::fs::read_to_string(project_root.join(&script)) else {
@@ -1613,7 +1856,7 @@ fn run_makefile(project_root: &Path) -> std::result::Result<(), String> {
         return Ok(());
     }
     Err(format!(
-        "deviates from standards/make.md:\n  {}",
+        "deviates from the Makefile standard:\n  {}",
         problems.join("\n  ")
     ))
 }
@@ -2323,11 +2566,12 @@ pub(crate) fn run_test_scripts(
         if verbose {
             eprintln!("[ci] project-e2e: {name}");
         }
-        match Command::new("bash")
-            .arg(script)
-            .current_dir(project_root)
-            .output()
-        {
+        // The script runs against the CLI running this gate, so it exercises
+        // the tree under test rather than whatever `fluxor` is on PATH.
+        let mut cmd = Command::new("bash");
+        cmd.arg(script).current_dir(project_root);
+        with_running_cli(&mut cmd);
+        match cmd.output() {
             Ok(o) if o.status.success() => {}
             Ok(o) => {
                 failed.push(name.clone());
@@ -2383,9 +2627,9 @@ fn run_kernel_link_budget(project_root: &Path, verbose: bool) -> std::result::Re
     for target in &boards {
         let board = target.board_id.as_deref().unwrap_or(&target.id);
         let silicon = &target.id;
-        let out = Command::new("tools/firmware.sh")
-            .arg(board)
-            .current_dir(project_root)
+        let mut cmd = Command::new("tools/firmware.sh");
+        cmd.arg(board).current_dir(project_root);
+        let out = with_running_cli(&mut cmd)
             .output()
             .map_err(|e| format!("firmware.sh {board}: {e}"))?;
         if !out.status.success() {
@@ -2480,7 +2724,7 @@ fn run_modules_build_strict(project_root: &Path, verbose: bool) -> std::result::
     let opts = modules_build::BuildOpts {
         project_root: project_root.to_path_buf(),
         selector: modules_build::TargetSelector::All,
-        // Per the standard's §2 path, ci writes to `target/fluxor/`.
+        // ci writes module artefacts to `target/fluxor/`.
         out_root: project_root.join("target/fluxor"),
         strict: true,
         verbose,
@@ -2502,8 +2746,8 @@ fn run_modules_build_strict(project_root: &Path, verbose: bool) -> std::result::
         considered,
         module_manifest_count(project_root),
         "module manifest(s) exist under `modules/`",
-        "they are in a flat `modules/<name>/` layout the tiers do not cover \
-         (standards/fluxor-modules.md §0.1), or `[ci] targets` names no target",
+        "they are in a flat `modules/<name>/` layout the tiers do not cover, \
+         or `[ci] targets` names no target",
     )
 }
 
@@ -2575,11 +2819,13 @@ fn cargo_test_in(dir: &Path, args: &[&str]) -> std::result::Result<(), String> {
     use std::io::{BufRead, BufReader, Write};
     use std::process::Stdio;
 
-    let mut child = Command::new("cargo")
-        .current_dir(dir)
+    let mut cmd = Command::new("cargo");
+    cmd.current_dir(dir)
         .args(args)
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    with_running_cli(&mut cmd);
+    let mut child = cmd
         .spawn()
         .map_err(|e| format!("cargo: spawn failed: {e}"))?;
     let mut failed: Vec<String> = Vec::new();
@@ -2636,8 +2882,7 @@ fn cargo_test_phase(dir: &Path, args: &[&str]) -> std::result::Result<(), String
     Err(format!(
         "`cargo {}` executed 0 tests, but this cargo tree declares integration test target(s) \
          ({}) — either the selector does not reach them or their sources are absent from the \
-         checkout (a `tests/` tree that is gitignored and shadow-tracked is present only on the \
-         machine that wrote it; standards/test-tracking.md §7)",
+         checkout (a gitignored `tests/` tree is present only on the machine that wrote it)",
         args.join(" "),
         integration.join(", ")
     ))
@@ -2765,7 +3010,11 @@ fn preview(items: &[String]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_staleness, live_staleness_scope, PhaseStatus};
+    use super::{
+        classify_staleness, cli_dir_for, host_binary_build_args, live_staleness_scope,
+        path_with_first, release_cli_dir, shim_dir, with_running_cli, PhaseStatus, RunningCli,
+        HARNESS_TARGET,
+    };
     use crate::store_sync::StalenessScope;
 
     fn findings(lines: &[&str]) -> Vec<String> {
@@ -2945,5 +3194,132 @@ mod tests {
         // Nested form still matches via the `/` suffix rule.
         let nested = Path::new("modules/cluster/configs/x.yaml");
         assert!(path_matches(nested, "cluster/configs/x.yaml"));
+    }
+
+    /// What a child started through `with_running_cli` sees: its PATH, the
+    /// `fluxor` a bare name resolves to, and `$FLUXOR_BIN`.
+    fn child_view() -> (String, String, String) {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg("printf '%s\\n' \"$PATH\"; command -v fluxor; printf '%s\\n' \"$FLUXOR_BIN\"");
+        with_running_cli(&mut cmd);
+        let out = cmd.output().expect("sh runs");
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        let mut lines = text.lines().map(str::to_string);
+        (
+            lines.next().expect("PATH line"),
+            lines.next().expect("fluxor resolves"),
+            lines.next().expect("FLUXOR_BIN set"),
+        )
+    }
+
+    /// A child resolves a bare `fluxor` to the running binary and begins its
+    /// PATH with the directory holding it, whatever `fluxor` an inherited
+    /// PATH would have found; the guard removes the private directory on
+    /// drop and the next child gets it back.
+    #[test]
+    fn a_child_resolves_fluxor_to_the_running_binary_first() {
+        let exe = std::env::current_exe().unwrap();
+        let check = |(path, found, bin): (String, String, String)| {
+            assert_eq!(std::path::Path::new(&bin), exe);
+            assert_eq!(
+                std::fs::canonicalize(&found).unwrap(),
+                std::fs::canonicalize(&exe).unwrap(),
+                "bare `fluxor` must be the running binary"
+            );
+            let first = std::env::split_paths(&path).next().unwrap();
+            assert_eq!(
+                std::path::Path::new(&found).parent().unwrap(),
+                first,
+                "the directory holding that `fluxor` is first on PATH"
+            );
+        };
+        check(child_view());
+        let shim = shim_dir(&std::env::temp_dir());
+        {
+            let _guard = RunningCli::hold();
+        }
+        assert!(
+            !shim.exists(),
+            "dropping the guard removes the private directory"
+        );
+        check(child_view());
+        drop(RunningCli::hold());
+    }
+
+    /// A binary already named `fluxor` is exposed through its own
+    /// directory, with no shim; any other name gets a directory holding a
+    /// `fluxor` link to it.
+    #[test]
+    fn cli_dir_is_the_binarys_directory_when_named_fluxor() {
+        let base = std::env::temp_dir().join(format!("fluxor-ci-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("bin")).unwrap();
+        let named = base.join("bin/fluxor");
+        std::fs::write(&named, b"x").unwrap();
+        assert_eq!(cli_dir_for(&named, &base), Some(base.join("bin")));
+        let other = base.join("bin/3f9a");
+        std::fs::write(&other, b"x").unwrap();
+        let dir = cli_dir_for(&other, &base).expect("shim dir");
+        assert_eq!(std::fs::read_link(dir.join("fluxor")).unwrap(), other);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The running binary's directory goes ahead of every inherited entry,
+    /// and an unset PATH is not a failure.
+    #[test]
+    fn path_with_first_prepends() {
+        let joined =
+            path_with_first(std::path::Path::new("/cli"), Some("/usr/bin:/bin".into())).unwrap();
+        let parts: Vec<_> = std::env::split_paths(&joined).collect();
+        assert_eq!(parts[0], std::path::Path::new("/cli"));
+        assert_eq!(parts[1], std::path::Path::new("/usr/bin"));
+        // An unset or empty PATH gives the directory alone: a trailing empty
+        // entry would put the child's current directory on its PATH.
+        for unset in [None, Some(std::ffi::OsString::new())] {
+            let only = path_with_first(std::path::Path::new("/cli"), unset).unwrap();
+            assert_eq!(only, std::ffi::OsString::from("/cli"));
+        }
+    }
+
+    /// A directory already standing at the private path is never adopted: it
+    /// is replaced by a fresh owner-only one, and released only by the
+    /// process that made it.
+    #[cfg(unix)]
+    #[test]
+    fn a_preexisting_shim_dir_is_replaced_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let base = std::env::temp_dir().join(format!("fluxor-ci-stale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let exe = base.join("3f9a");
+        std::fs::write(&exe, b"x").unwrap();
+        // A world-writable directory whose `fluxor` already names `exe`.
+        let planted = shim_dir(&base);
+        std::fs::create_dir_all(&planted).unwrap();
+        std::fs::set_permissions(&planted, std::fs::Permissions::from_mode(0o777)).unwrap();
+        std::os::unix::fs::symlink(&exe, planted.join("fluxor")).unwrap();
+        std::fs::write(planted.join("extra"), b"planted").unwrap();
+
+        let dir = cli_dir_for(&exe, &base).expect("shim dir");
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "the directory is made fresh, owner-only");
+        assert!(!dir.join("extra").exists(), "nothing planted survives");
+        assert_eq!(std::fs::read_link(dir.join("fluxor")).unwrap(), exe);
+
+        release_cli_dir(&base);
+        assert!(!dir.exists(), "released by the process that made it");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The host runtime is built unconditionally, for the triple the
+    /// harness suites run under, in release mode.
+    #[test]
+    fn the_host_binary_build_names_the_harness_target() {
+        let args = host_binary_build_args();
+        assert_eq!(args[0], "build");
+        assert!(args.contains(&"--release"));
+        assert!(args.windows(2).any(|w| w == ["--target", HARNESS_TARGET]));
+        assert!(args.windows(2).any(|w| w == ["--bin", "fluxor-linux"]));
     }
 }

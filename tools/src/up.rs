@@ -39,7 +39,7 @@ pub fn cmd_up(
     base_port: u16,
     http_offset: u16,
     extra_vars: &[String],
-    fluxor_bin: Option<&Path>,
+    module_root: Option<&Path>,
 ) -> Result<()> {
     if replicas == 0 {
         return Err(Error::Config("--replicas must be at least 1".to_string()));
@@ -55,7 +55,8 @@ pub fn cmd_up(
     fluxor_tools::store_sync::ensure_synced(&crate::project::root())
         .map_err(|e| Error::Config(e.to_string()))?;
 
-    let fluxor = resolve_fluxor_bin(fluxor_bin)?;
+    let module_root = replica_module_root(module_root)?;
+    let fluxor = resolve_fluxor_bin();
     let extra = parse_vars(extra_vars)?;
     let project_root = crate::project::root();
 
@@ -144,8 +145,11 @@ pub fn cmd_up(
             use std::os::unix::process::CommandExt as _;
             cmd.arg0("fluxor");
         }
+        cmd.arg("run");
+        if let Some(root) = &module_root {
+            cmd.arg("--module-root").arg(root);
+        }
         let child = cmd
-            .arg("run")
             .arg(&yaml_path)
             .current_dir(&node_dir)
             .env(crate::project::ENV_PROJECT_ROOT, &project_root)
@@ -312,28 +316,18 @@ fn tail_loop(id: u8, path: &Path, interrupt: Arc<AtomicBool>) {
     }
 }
 
-fn resolve_fluxor_bin(override_path: Option<&Path>) -> Result<PathBuf> {
-    if let Some(p) = override_path {
-        if !p.exists() {
-            return Err(Error::Config(format!(
-                "fluxor binary not found at {}",
-                p.display()
-            )));
-        }
-        // Absolutise: replicas spawn with a per-node cwd, and a
-        // relative program path containing a slash is resolved in the
-        // child AFTER the chdir — a relative override would fail to
-        // spawn against the replica dir.
-        return Ok(p.canonicalize().unwrap_or_else(|_| p.to_path_buf()));
-    }
-    // Default: assume we're called as `fluxor run --replicas`, so re-invoke
-    // `fluxor run` via the same binary on $PATH. Falling back to
-    // `current_exe()` covers the in-tree development case where
-    // fluxor isn't installed system-wide.
-    if let Ok(exe) = std::env::current_exe() {
-        return Ok(exe);
-    }
-    Ok(PathBuf::from("fluxor"))
+/// The `fluxor` every replica runs: this binary, else the one on `PATH`.
+fn resolve_fluxor_bin() -> PathBuf {
+    std::env::current_exe().unwrap_or_else(|_| PathBuf::from("fluxor"))
+}
+
+/// The module root every replica gets, from `--module-root` or
+/// `$FLUXOR_MODULE_ROOT`, validated once and made absolute: each replica
+/// runs in its own working directory, where a relative root would name
+/// another place. `None` leaves the replicas on the project default.
+fn replica_module_root(explicit: Option<&Path>) -> Result<Option<PathBuf>> {
+    let root = crate::modules_build::select_module_root(explicit, PathBuf::new())?;
+    Ok((!root.as_os_str().is_empty()).then_some(root))
 }
 
 fn tempdir_unique(prefix: &str) -> Result<PathBuf> {
@@ -345,4 +339,43 @@ fn tempdir_unique(prefix: &str) -> Result<PathBuf> {
     std::fs::create_dir_all(&path)
         .map_err(|e| Error::Config(format!("creating scratch dir {}: {}", path.display(), e)))?;
     Ok(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A root named by `$FLUXOR_MODULE_ROOT` reaches every replica as an
+    /// absolute `--module-root`, so a relative value still names the
+    /// directory it named where `run --replicas` was invoked; an empty
+    /// variable leaves the replicas on the project default.
+    #[test]
+    fn the_environment_root_reaches_replicas_absolute() {
+        let cwd = std::env::current_dir().unwrap();
+        let abs = std::env::temp_dir().join(format!("fluxor-up-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&abs);
+        std::fs::create_dir_all(&abs).unwrap();
+        std::fs::write(abs.join("a.fmod"), b"x").unwrap();
+        // The same directory, spelled relative to the current directory.
+        let up = cwd.components().count().saturating_sub(1);
+        let mut rel = PathBuf::new();
+        for _ in 0..up {
+            rel.push("..");
+        }
+        rel.push(abs.strip_prefix("/").unwrap());
+        assert!(rel.is_relative());
+
+        {
+            let _env = crate::config::test_env::EnvGuard::set(&[("FLUXOR_MODULE_ROOT", &rel)]);
+            let got = replica_module_root(None).unwrap().expect("a root");
+            assert!(got.is_absolute(), "{}", got.display());
+            assert_eq!(got.canonicalize().unwrap(), abs.canonicalize().unwrap());
+        }
+        {
+            let _env =
+                crate::config::test_env::EnvGuard::set(&[("FLUXOR_MODULE_ROOT", Path::new(""))]);
+            assert_eq!(replica_module_root(None).unwrap(), None);
+        }
+        let _ = std::fs::remove_dir_all(&abs);
+    }
 }

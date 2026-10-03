@@ -1,10 +1,10 @@
-//! `standards/make.md` conformance — the text half of `fluxor ci`'s
+//! Makefile-standard conformance — the text half of `fluxor ci`'s
 //! `makefile` phase.
 //!
 //! A conforming target *name* says nothing about what the recipe under
 //! it does: a `build:` that runs a per-crate shell loop, a `test:` that
 //! skips the member crates and a `lint:` that runs rustfmt alone all
-//! carry the right names. `standards/cli.md` §1 fixes what a body may
+//! carry the right names. The standard fixes what a body may
 //! be — **one delegation to the CLI verb of the same name** — which
 //! makes the body checkable text, and this module checks it.
 //!
@@ -70,7 +70,7 @@ pub(crate) const LIFECYCLE: &[(&str, &str)] = &[
     ("clean", "fluxor clean"),
 ];
 
-/// Target names `standards/make.md` §1 forbids: each either renames one
+/// Target names the Makefile standard forbids: each either renames one
 /// CLI command or splits a lifecycle stage.
 const FORBIDDEN_TARGETS: &[&str] = &[
     "fmt",
@@ -165,7 +165,7 @@ fn split_rule_head(line: &str) -> Option<(String, String)> {
     Some((name.to_string(), rest.trim().to_string()))
 }
 
-/// Every deviation from `standards/make.md` this text carries.
+/// Every deviation from the Makefile standard this text carries.
 ///
 /// `cli_verbs` is the live CLI's top-level command set; an empty set
 /// disables the verb check (an unreadable probe must not fail the gate

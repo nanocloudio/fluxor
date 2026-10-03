@@ -239,6 +239,29 @@ CAPACITY >= PSTATUS_ROUND | src/kernel/sys/telemetry_ring.rs
 | QUIC 1-RTT self-grant block | `LOCAL_PN_BLOCK` | modules/foundation/quic/connection.rs | 4096 | Policy: the send packet-number block a connection self-grants in local (non-durable) mode, refilled `LOCAL_PN_REFILL_LOW` (512) values ahead of exhaustion so the reservation never stalls a healthy sender. Matches the directory's smoke-path reserve size; in durable mode the directory chooses the block |
 | declared step cost (`[execution] max_step_us`) | `STEP_BUDGET_DEFAULT_TICK_US` | tools/src/target_facts.rs | 1000 | Policy: the scheduler's default pass budget (`DEFAULT_TICK_US`, one tick) on every silicon; a manifest whose step cannot fit one default pass on a target it names is refused at parse. Per-target in shape so a slower part can publish a smaller budget |
 | early-boot log ring | `LOG_RING_CAPACITY` | modules/sdk/abi/config.rs | 65536 | Sized to cover boot until a consumer reaches its transport, and NOT raised past it: the whole ring is replayed in one burst when the consumer attaches, and on the Pi 5 rig a 256 KiB ring outran the collector's socket buffer, losing the oldest datagrams — the exact ones the replay exists to deliver. Growing this needs a paced replay first. Then per-profile because the ring is static `.bss` charged against the whole SRAM: 16 KiB on wasm, 8 KiB on the RP parts (the smallest that still holds a whole boot until a host opens the USB console), where a host-class ring is a quarter of an RP2040's linker RAM region and an eighth of an RP2350's, and on both pushes `.bss` past that region once the state and buffer arenas are placed beside it. The RP kernels take the figure from their silicon TOML (`[kernel] log_ring_kb`), and that figure and the embedded profile's constant must state the same size. A full ring drops new records rather than overwriting unread ones, and counts the drops |
+| Capability chain length | `MAX_CHAIN_LINKS` | modules/sdk/contracts/mesh/capability.rs | 8 | Policy: the root's grant plus seven delegations. Every link is one Ed25519 verification and a chain is verified on every presentation, so this is what one presentation can cost a verifier. A longer chain is refused (`ChainTooLong`), never truncated |
+| Capability chain bytes | `MAX_CHAIN_BYTES` | modules/sdk/contracts/mesh/capability.rs | 1026 | Derived, not chosen: `CHAIN_HDR + MAX_CHAIN_LINKS * LINK_LEN` — the largest chain a receiver must be able to hold |
+| Capability roots per verifier | `MAX_ROOTS` | modules/sdk/contracts/mesh/capability.rs | 2 | Policy: the deployment's root and its successor during a rotation; a chain signed by either verifies |
+| Grants per session | `MAX_SESSION_GRANTS` | modules/sdk/contracts/mesh/capability.rs | 8 | Policy: the verified grants one session holds at once. A presentation past it is refused (`GRANTS_FULL`) until one is withdrawn; nothing is evicted, because an evicted grant is an operation that silently starts failing |
+| Capability presentation payload | `PRESENT_MAX` | modules/sdk/contracts/mesh/capability.rs | 1030 | Derived, not chosen: the presentation id plus `MAX_CHAIN_BYTES` |
+| Capability text form | `MAX_TEXT_LEN` | modules/sdk/contracts/mesh/capability.rs | 1375 | Derived, not chosen: the prefix plus unpadded base64url of `MAX_CHAIN_BYTES` — what an HTTP header carrying a chain must admit. Written as its value and held to that derivation by a const assert |
+| Object LIST page | `LIST_PAGE_MAX` | modules/sdk/contracts/storage/object.rs | 1000 | Policy: entries one `storage.object` `LIST` call may return — S3's own `MaxKeys` ceiling, and the bound on one call's work. A request outside 1..=1000 is `EINVAL` |
+| Storage key and entry name | `STORAGE_KEY_MAX` | modules/sdk/contracts/storage/handle.rs | 255 | Wire width: the `u8` `name_len` and trailing `cursor_len` of a `storage.namespace` LIST page, so it is also the longest key a store creates, the longest cursor on both listing surfaces (the cursor is the last name returned), the longest `storage.object` LIST prefix, and what the gateway's argument copy is sized to carry. A provider meeting a longer name in a range it lists refuses the page `EOVERFLOW` rather than skip it. One bound for one concept: the Linux and `bcm2712` key stores size their keys by it directly |
+| Namespace path | `PATH_MAX` | modules/sdk/contracts/storage/namespace.rs | 1024 | Policy: the longest `storage.namespace` LIST prefix or LOOKUP path. A path is not a name: a directory-shaped provider's prefix is a host directory at any depth, while each name below it stays within `STORAGE_KEY_MAX`. Namespace ops are not walked by the gateway, so the bound costs no gated stack |
+| Private regions per gated module | `MAX_PRIVATE` | src/kernel/module/gateway.rs | 3 | Sanity bound: state, heap and stack on an MMU target; one combined region on an MPU target. A pointer a gated module passes must lie in one of them |
+| Gateway argument copy | `WALK_MAX` | src/kernel/module/gateway.rs | 544 | Derived, not chosen: the largest walked request, an object `LIST` with a prefix and a cursor of `STORAGE_KEY_MAX` bytes each (`REQUEST_FIXED_LEN + 2 * STORAGE_KEY_MAX`, rounded up to 16). Stack-resident per gated call |
+| Remote channels per instance | `MAX_CHANNELS` | modules/foundation/remote_channel/wire.rs | 8 | Policy: each channel is a port pair, a reassembly region, a send state and on `quic` a stream; the manifest declares eight port pairs. A longer table is refused at construction |
+| Remote-channel content-type name | `CT_NAME_MAX` | modules/foundation/remote_channel/wire.rs | 32 | Sanity bound: longer than any name in the content-type registry; a longer name in `channels` is refused |
+| Remote-channel table frame | `HELLO_MAX` | modules/foundation/remote_channel/wire.rs | 301 | Derived, not chosen: the whole channel table at `MAX_CHANNELS` entries of `CT_NAME_MAX` names |
+| Remote-channel record | `MAX_RECORD` | modules/foundation/remote_channel/mod.rs | 262144 | Policy: the largest record any channel may declare — one record is reassembled whole before delivery, so this is the largest allocation a peer can make the module hold. Above a large body record with its frame (loam's 128 KiB frames). 128 KiB on wasm, 16 KiB on embedded. A larger declaration is refused at construction; a larger record is refused and counted |
+| Remote-channel reassembly | `REASSEMBLY_BYTES` | modules/foundation/remote_channel/mod.rs | 1048576 | Policy: every channel's reassembly ring (`max_record + 4`) and, on a `mailbox` channel, its two record stages must fit; a table that does not is refused at construction rather than shrunk. 256 KiB on wasm, 32 KiB on embedded |
+| Remote-channel fragment (`net`) | `FRAGMENT_MAX` | modules/foundation/remote_channel/mod.rs | 4096 | Policy: record bytes in one frame on a shared stream — how long one channel holds the stream before the next channel's turn |
+| Remote-channel fragment (`mux`) | `MUX_FRAGMENT_MAX` | modules/foundation/remote_channel/mod.rs | 1192 | Derived, not chosen: a whole frame fits one `CMD_MUX_STREAM_SEND` (`MUX_QUIC_STREAM_SEND_MAX` less the frame header and record length), held to that by a const assert |
+| Service parameters | `MAX_PARAMS` | tools/src/service_params.rs | 64 | Policy: parameters one service bundle may declare. A service needing more is being configured through its internals rather than its run surface; the bound also bounds the checks every launch makes |
+| Service parameter value | `MAX_PARAM_STRING_BYTES` | tools/src/service_params.rs | 4096 | Policy: the longest string value from `--param` or `--params`; content belongs in a file the value names |
+| Service parameter name | `MAX_PARAM_NAME_BYTES` | tools/src/service_params.rs | 64 | Sanity bound on a declared parameter name |
+| Grant scope | `SCOPE_MAX` | modules/sdk/contracts/storage/object.rs | 255 | Derived, not chosen: a scope is a key prefix, so it is bounded as keys are (`STORAGE_KEY_MAX`), held equal by a const assert. A longer scope is refused at `PRESENT` |
+| Grants on a guarded store | `STORE_MAX_GRANTS` | src/platform/linux/store.rs | 64 | Policy: capability grants presented to the Linux store at once. A presentation past it is `ENOMEM` until one is closed; none is evicted, because an evicted grant is a caller whose next operation silently starts failing |
 
 ## Tables, arenas and budgets
 
@@ -618,6 +641,33 @@ MAX_PERSISTED | src/kernel/security/key_vault.rs | 8 | off-host
 MAX_SEAL_BYTES | src/kernel/security/key_vault.rs | 2048 | *
 MAX_CONSUMED | src/kernel/security/key_share.rs | 32 | *
 PARAM_TAG_MAX | tools/src/manifest.rs | 0xEF | *
+MAX_CHAIN_LINKS | modules/sdk/contracts/mesh/capability.rs | 8 | *
+MAX_CHAIN_BYTES | modules/sdk/contracts/mesh/capability.rs | CHAIN_HDR + MAX_CHAIN_LINKS * LINK_LEN | *
+MAX_ROOTS | modules/sdk/contracts/mesh/capability.rs | 2 | *
+MAX_SESSION_GRANTS | modules/sdk/contracts/mesh/capability.rs | 8 | *
+PRESENT_MAX | modules/sdk/contracts/mesh/capability.rs | 4 + MAX_CHAIN_BYTES | *
+MAX_TEXT_LEN | modules/sdk/contracts/mesh/capability.rs | 1375 | *
+LIST_PAGE_MAX | modules/sdk/contracts/storage/object.rs | 1000 | *
+STORAGE_KEY_MAX | modules/sdk/contracts/storage/handle.rs | 255 | *
+PATH_MAX | modules/sdk/contracts/storage/namespace.rs | 1024 | *
+MAX_PRIVATE | src/kernel/module/gateway.rs | 3 | *
+WALK_MAX | src/kernel/module/gateway.rs | 544 | *
+MAX_CHANNELS | modules/foundation/remote_channel/wire.rs | 8 | *
+CT_NAME_MAX | modules/foundation/remote_channel/wire.rs | 32 | *
+HELLO_MAX | modules/foundation/remote_channel/wire.rs | 4 + 1 + MAX_CHANNELS * HELLO_ENTRY_LEN | *
+MAX_RECORD | modules/foundation/remote_channel/mod.rs | 256 * 1024 | host
+MAX_RECORD | modules/foundation/remote_channel/mod.rs | 128 * 1024 | wasm
+MAX_RECORD | modules/foundation/remote_channel/mod.rs | 16 * 1024 | embedded
+REASSEMBLY_BYTES | modules/foundation/remote_channel/mod.rs | 1024 * 1024 | host
+REASSEMBLY_BYTES | modules/foundation/remote_channel/mod.rs | 256 * 1024 | wasm
+REASSEMBLY_BYTES | modules/foundation/remote_channel/mod.rs | 32 * 1024 | embedded
+FRAGMENT_MAX | modules/foundation/remote_channel/mod.rs | 4096 | *
+MUX_FRAGMENT_MAX | modules/foundation/remote_channel/mod.rs | 1192 | *
+MAX_PARAMS | tools/src/service_params.rs | 64 | *
+MAX_PARAM_STRING_BYTES | tools/src/service_params.rs | 4096 | *
+MAX_PARAM_NAME_BYTES | tools/src/service_params.rs | 64 | *
+SCOPE_MAX | modules/sdk/contracts/storage/object.rs | 255 | *
+STORE_MAX_GRANTS | src/platform/linux/store.rs | 64 | *
 ```
 
 Constants in these files that are shaped like ceilings but are not
@@ -738,4 +788,7 @@ MAX_ATTEST_RECORD | src/kernel/security/key_vault.rs | scratch derived from the 
 MAX_RECORD | src/kernel/sys/telemetry_ring.rs | mirror of TELEMETRY_MAX_RECORD
 MANIFEST_HEADER_SIZE | tools/src/manifest.rs | manifest layout
 SIGNATURE_BLOCK_SIZE | tools/src/manifest.rs | signature block layout
+MAX_AUTHORITY_LEN | modules/foundation/remote_channel/mod.rs | holds the `authority` parameter as written; the provider's own name ceiling binds the dial
+TABLE_TEXT_MAX | modules/foundation/remote_channel/mod.rs | holds the `channels` parameter text; MAX_CHANNELS and CT_NAME_MAX bind the table it parses to
+EVENT_HEADER_SIZE | src/platform/linux/store.rs | protocol: the mesh event header's fixed length, not a ceiling
 ```

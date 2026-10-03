@@ -661,15 +661,16 @@ pub fn config_arena_usage() -> (usize, usize) {
 
 /// Parsed module entry with variable-length params
 ///
-/// Binary format (variable length):
-/// - Bytes 0-1: entry_length (u16) - total entry size including header
-/// - Bytes 2-5: name_hash (fnv1a32)
-/// - Byte 6: id
-/// - Byte 7: bit-packed metadata —
+/// Binary format (variable length, 10-byte header):
+/// - Bytes 0-3: entry_length (u32) - total entry size including the header;
+///   u32 so one module's params may exceed 64 KiB
+/// - Bytes 4-7: name_hash (fnv1a32)
+/// - Byte 8: id
+/// - Byte 9: bit-packed metadata —
 ///   bits 0-2 = domain_id (0..7, 0 = default domain),
 ///   bit  4   = pre_tick_drain (Tier 1c opt-in),
 ///   bits 3, 5-7 reserved.
-/// - Bytes 8+: params (entry_length - 8 bytes)
+/// - Bytes 10+: params (entry_length - 10 bytes)
 #[derive(Debug, Clone, Copy)]
 pub struct ModuleEntry {
     pub name_hash: u32,
@@ -1449,15 +1450,9 @@ fn parse_envelope_payload(payload: &[u8]) {
 
 /// Parse variable-length module entry
 ///
-/// Format (10-byte header — entry_length widened to u32 to allow
-/// per-module params >64 KiB, needed by the synth host's http
-/// module when both halves of a split scenario inline their wasm
-/// shells as body routes):
-/// - Bytes 0-3: entry_length (u32)
-/// - Bytes 4-7: name_hash (u32)
-/// - Byte 8: id
-/// - Byte 9: reserved/domain_id
-/// - Bytes 10+: params
+/// The layout is [`ModuleEntry`]'s. `entry_length` is u32 because one
+/// module's params can exceed 64 KiB: the synthesised host's http module
+/// carries both halves of a split scenario's wasm shells as body routes.
 fn parse_module_entry(ptr: *const u8, entry_len: usize) -> Option<ModuleEntry> {
     // SAFETY: caller validated `entry_len >= 10` and that `ptr..ptr+entry_len`
     // lies inside the config blob. All inner reads are bounded by `entry_len`.

@@ -307,12 +307,16 @@ consuming the FIFO input:
 
 ```c
 // Correct: reserve the output buffer first
+if (!(channel_poll(in_chan, POLL_IN) & POLL_IN)) return 0;  // nothing to move
 u32 cap = 0;
 u8 *buf = buffer_acquire_write(out_chan, &cap);
 if (!buf) return 0;          // do not read input — output not ready
 int read = channel_read(in_chan, buf, cap);
-if (read > 0) buffer_release_write(out_chan, read);
+buffer_release_write(out_chan, read > 0 ? read : 0);
 ```
+
+A release always publishes: a release of zero bytes hands the consumer an
+empty message, so the input is polled before the output is acquired.
 
 FIFO reads are destructive. If the module reads input but then cannot
 acquire the mailbox output, the data is lost; there is no recovery

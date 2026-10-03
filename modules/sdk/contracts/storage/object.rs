@@ -26,14 +26,18 @@
 //   - Handle-bound ops (`RANGE_GET`, `CLOSE`) and open-returning
 //     ops (`GET`, `PUT_STREAMED_OPEN`) advertise the per-handle
 //     fence via `provider_query(handle, query_key::LAST_FENCE, …)`.
-//   - Handle=-1 one-shot ops (`PUT`, `HEAD`, `DELETE`) carry an
+//   - Handle=-1 one-shot ops (`PUT`, `HEAD`, `DELETE`, `LIST`) carry an
 //     explicit `[fence_out_ptr, fence_out_cap]` pair in their arg
 //     layout. The provider writes up to `fence::WIRE_MAX_LEN` bytes
 //     of `Fence::encode` output into `fence_out_ptr` atomically
 //     with returning the op's i32 result; callers decode via
-//     `Fence::decode`.
+//     `Fence::decode`. A null `fence_out_ptr`, or a `fence_out_cap`
+//     below `fence::WIRE_MAX_LEN`, is `EINVAL`, refused before the op
+//     acts: an answer whose fence cannot be delivered is not an answer.
 //
 // Typical advertisements:
+//   - `LIST` → `ViewConsistent { source, revision }` per page; a
+//     listing spans pages and is not a snapshot (see `LIST`).
 //   - `GET` / `RANGE_GET` / `HEAD` → `ViewConsistent { source,
 //     revision }` for snapshot-based providers, or
 //     `ContentHashed { algorithm, digest }` for CAS providers.
@@ -68,7 +72,7 @@
 // that serves one fetch per handle, never terminates.
 //
 // This mirrors `storage.fs`, which states the same MUST for the same
-// reason, and it is what the wasm provider already does.
+// reason, and it is what the wasm provider does.
 //
 // ### Writes: `EINPROGRESS` means ask again with the same request
 //
@@ -148,7 +152,11 @@ pub const fn write_answer(rc: i32) -> WriteAnswer {
 /// encoded fence (up to `fence::WIRE_MAX_LEN` bytes) into the
 /// buffer at `fence_out_ptr`. `body_len` must fit a single
 /// in-memory blob; large bodies use the `PUT_STREAMED_*` sequence
-/// below.
+/// below. A provider that enumerates its keys refuses (`EINVAL`) a key it
+/// could not list: the empty key, and one longer than the listing surfaces
+/// it serves can carry.
+pub const PUT: u32 = 0x1420;
+
 /// Conditions a mutating op may be made subject to.
 ///
 /// Three named conditions rather than a bare etag guard. An etag field
@@ -190,8 +198,6 @@ pub mod precondition {
     pub const ETAG: u8 = 2;
 }
 
-pub const PUT: u32 = 0x1420;
-
 /// Open a blob for streaming reads.
 ///
 /// `handle = -1`; `arg` is the UTF-8 key, `arg_len` its length.
@@ -225,7 +231,9 @@ pub const GET: u32 = 0x1421;
 /// ```
 ///
 /// and writes the encoded fence into `fence_out_ptr`. Returns the
-/// number of bytes written to `out_ptr`, or negative errno.
+/// number of bytes written to `out_ptr`, or negative errno: `ENXIO` for
+/// an absent key, `ENOMEM` when `out_cap` cannot hold the record,
+/// `EINVAL` for a null `out_ptr`.
 pub const HEAD: u32 = 0x1422;
 
 /// Read a byte range from an open object handle.
@@ -361,6 +369,554 @@ pub const PUT_STREAMED_COMMIT: u32 = 0x1428;
 /// not observe any appended chunks. After ABORT the handle is
 /// released — callers do not need to `CLOSE`.
 pub const PUT_STREAMED_ABORT: u32 = 0x1429;
+
+// ── Enumeration ─────────────────────────────────────────────────────
+
+/// Enumerate the objects whose key starts with a prefix, in ascending
+/// bytewise key order, one bounded page per call, resumed by an opaque
+/// cursor.
+///
+/// `handle = -1`; `arg` is:
+///
+/// ```text
+///   [prefix_len: u16 LE]
+///   [prefix: prefix_len bytes]
+///   [cursor_len: u16 LE]                      — 0 for the first page
+///   [cursor: cursor_len bytes]                — otherwise exactly the cursor
+///                                               a previous page returned
+///   [max_keys: u16 LE]                        — 1..=`LIST_PAGE_MAX`
+///   [out_ptr: u64 LE]
+///   [out_cap: u32 LE]
+///   [fence_out_ptr: u64 LE]                   — receives Fence::encode bytes
+///   [fence_out_cap: u16 LE]                   — must be >= `fence::WIRE_MAX_LEN`
+/// ```
+///
+/// On success the provider writes one page into `out_ptr`:
+///
+/// ```text
+///   [count: u16 LE]
+///   count × entry:
+///     [key_len: u16 LE][key][size: u64 LE][mtime: u64 LE]
+///     [etag_len: u8][etag]
+///   [cursor_len: u16 LE]                      — 0 means END OF LISTING
+///   [cursor: cursor_len bytes]                — opaque, echo to fetch the next page
+/// ```
+///
+/// and the encoded fence into `fence_out_ptr`. Returns the number of
+/// bytes written to `out_ptr`, or negative errno. [`list`] is the codec
+/// for both sides; providers and consumers use it rather than spelling
+/// the offsets themselves.
+///
+/// An entry names an object by the key `GET`, `HEAD` and `DELETE` take,
+/// and carries what `HEAD` would report for it — its size, mtime and etag —
+/// so a listing needs no `GET` to learn them. Listing opens nothing and
+/// returns no handle; a caller reads an object by opening its key.
+///
+/// ## Paging
+///
+/// A page holds at most `max_keys` entries. The provider fills as many
+/// whole entries as fit `out_cap` while keeping room for the trailing
+/// cursor, which is the last key returned, so a page can always be
+/// terminated. A page MUST make progress: when
+/// not even one entry plus the trailer fits, the provider refuses with
+/// `ENOMEM` rather than return an empty page that is not the last. A
+/// prefix with nothing under it answers `count = 0, cursor_len = 0`.
+///
+/// ## Cursor
+///
+/// The cursor names a position in key order: the next page resumes
+/// strictly after the last key the previous page returned. Keys inserted
+/// or deleted between pages are therefore seen or not according to
+/// whether they sort after the cursor, and a key present for the whole
+/// listing is never skipped or repeated. Each page writes its own fence —
+/// `ViewConsistent { source, revision }` from a store — so a listing is
+/// a sequence of views, not a snapshot.
+///
+/// The empty cursor means "first page" in a request and "end of listing"
+/// in a page, so the empty key is never a key (see [`PUT`]).
+///
+/// A key is at most [`STORAGE_KEY_MAX`](super::handle::STORAGE_KEY_MAX) bytes, which is also the
+/// longest prefix and cursor, so a provider that enumerates its keys refuses
+/// to create a longer one ([`PUT`]). A provider that meets one anyway in the
+/// range it is listing refuses the call with `EOVERFLOW` rather than skip it:
+/// a listing a caller believes is complete and is not is a silent loss.
+///
+/// A module that reaches the provider through the kernel's gateway sends the
+/// request through the gateway's argument copy, which is sized to carry a
+/// prefix and a cursor of `STORAGE_KEY_MAX` bytes each, so such a caller can resume
+/// at any key a provider holds.
+///
+/// ## Errors
+///
+///   - `EINVAL` — malformed request, `max_keys` of 0 or above
+///     [`LIST_PAGE_MAX`], `fence_out_cap` below `fence::WIRE_MAX_LEN`, or
+///     a cursor this provider did not issue for this prefix.
+///   - `ENOMEM` — `out_cap` cannot hold one entry plus the trailer.
+///   - `EOVERFLOW` — a key in range exceeds `STORAGE_KEY_MAX`.
+///   - `ENOSYS` — the provider cannot enumerate its keys (an HTTP origin
+///     offers no listing).
+pub const LIST: u32 = 0x142A;
+
+/// Most entries one [`LIST`] page may carry. S3's `MaxKeys` ceiling;
+/// bounds the work one call does.
+pub const LIST_PAGE_MAX: u16 = 1000;
+
+/// The [`LIST`] wire codec — request parsing, page writing with the
+/// trailer reservation, and page decoding. No `std`, no allocation, so
+/// the kernel providers, bare-metal providers and PIC consumers share
+/// one implementation of the layout.
+pub mod list {
+    use super::super::handle::STORAGE_KEY_MAX;
+    use super::LIST_PAGE_MAX;
+
+    /// `[count: u16]` at the head of a page.
+    pub const PAGE_HEADER_LEN: usize = 2;
+
+    /// `[cursor_len: u16]`, the trailing record's bytes besides its cursor.
+    pub const TRAILER_HEADER_LEN: usize = 2;
+
+    /// An entry's bytes besides its key and etag:
+    /// `[key_len: u16][size: u64][mtime: u64][etag_len: u8]`.
+    pub const ENTRY_FIXED_LEN: usize = 2 + 8 + 8 + 1;
+
+    /// Request bytes besides the prefix and cursor:
+    /// the two length prefixes, `max_keys`, `out_ptr`, `out_cap`,
+    /// `fence_out_ptr` and `fence_out_cap`.
+    pub const REQUEST_FIXED_LEN: usize = 2 + 2 + 2 + 8 + 4 + 8 + 2;
+
+    /// Encoded size of one entry.
+    pub const fn entry_len(key_len: usize, etag_len: usize) -> usize {
+        ENTRY_FIXED_LEN + key_len + etag_len
+    }
+
+    /// Smallest `out_cap` that holds one entry of this shape and the trailer
+    /// that resumes after it (the cursor is this key): what a provider needs
+    /// to make progress past it.
+    pub const fn min_out_cap(key_len: usize, etag_len: usize) -> usize {
+        PAGE_HEADER_LEN + entry_len(key_len, etag_len) + TRAILER_HEADER_LEN + key_len
+    }
+
+    /// A decoded [`super::LIST`] request.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct Request<'a> {
+        pub prefix: &'a [u8],
+        /// Empty for the first page.
+        pub cursor: &'a [u8],
+        pub max_keys: u16,
+        pub out_ptr: u64,
+        pub out_cap: u32,
+        pub fence_out_ptr: u64,
+        pub fence_out_cap: u16,
+    }
+
+    fn u16_at(b: &[u8], at: usize) -> Option<u16> {
+        let s = b.get(at..at.checked_add(2)?)?;
+        Some(u16::from_le_bytes([s[0], s[1]]))
+    }
+
+    fn u32_at(b: &[u8], at: usize) -> Option<u32> {
+        let s = b.get(at..at.checked_add(4)?)?;
+        Some(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+    }
+
+    fn u64_at(b: &[u8], at: usize) -> Option<u64> {
+        let s = b.get(at..at.checked_add(8)?)?;
+        Some(u64::from_le_bytes([
+            s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
+        ]))
+    }
+
+    /// Parse and validate a request. `None` — the provider answers
+    /// `EINVAL` — when the bytes are not exactly one request, `max_keys`
+    /// is outside `1..=LIST_PAGE_MAX`, the prefix or cursor is longer than
+    /// `STORAGE_KEY_MAX`, either output pointer is null, or the fence buffer is
+    /// smaller than `fence::WIRE_MAX_LEN`.
+    ///
+    /// The length is exact: a `cursor_len` that disagrees with the bytes
+    /// supplied shifts the fixed tail, and reading a shifted tail yields a
+    /// plausible pointer to write into.
+    pub fn parse_request(arg: &[u8]) -> Option<Request<'_>> {
+        let prefix_len = u16_at(arg, 0)? as usize;
+        if prefix_len > STORAGE_KEY_MAX {
+            return None;
+        }
+        let prefix = arg.get(2..2 + prefix_len)?;
+        let mut p = 2 + prefix_len;
+        let cursor_len = u16_at(arg, p)? as usize;
+        if cursor_len > STORAGE_KEY_MAX {
+            return None;
+        }
+        let cursor = arg.get(p + 2..p + 2 + cursor_len)?;
+        p += 2 + cursor_len;
+        if arg.len() != p + REQUEST_FIXED_LEN - 4 {
+            return None;
+        }
+        let req = Request {
+            prefix,
+            cursor,
+            max_keys: u16_at(arg, p)?,
+            out_ptr: u64_at(arg, p + 2)?,
+            out_cap: u32_at(arg, p + 10)?,
+            fence_out_ptr: u64_at(arg, p + 14)?,
+            fence_out_cap: u16_at(arg, p + 22)?,
+        };
+        if req.max_keys == 0 || req.max_keys > LIST_PAGE_MAX {
+            return None;
+        }
+        if req.out_ptr == 0
+            || req.fence_out_ptr == 0
+            || (req.fence_out_cap as usize) < super::super::super::super::fence::WIRE_MAX_LEN
+        {
+            return None;
+        }
+        Some(req)
+    }
+
+    /// Encode `req` into `out`. Returns the bytes written, or `None` when
+    /// `out` is too small or a field exceeds its length prefix.
+    pub fn encode_request(out: &mut [u8], req: &Request<'_>) -> Option<usize> {
+        if req.prefix.len() > STORAGE_KEY_MAX || req.cursor.len() > STORAGE_KEY_MAX {
+            return None;
+        }
+        let total = REQUEST_FIXED_LEN + req.prefix.len() + req.cursor.len();
+        let out = out.get_mut(..total)?;
+        let mut p = 0;
+        let mut put = |bytes: &[u8]| {
+            out[p..p + bytes.len()].copy_from_slice(bytes);
+            p += bytes.len();
+        };
+        put(&(req.prefix.len() as u16).to_le_bytes());
+        put(req.prefix);
+        put(&(req.cursor.len() as u16).to_le_bytes());
+        put(req.cursor);
+        put(&req.max_keys.to_le_bytes());
+        put(&req.out_ptr.to_le_bytes());
+        put(&req.out_cap.to_le_bytes());
+        put(&req.fence_out_ptr.to_le_bytes());
+        put(&req.fence_out_cap.to_le_bytes());
+        Some(total)
+    }
+
+    /// Writes one page into a caller buffer, keeping the trailer's room
+    /// in reserve so the page can always be finished.
+    pub struct PageWriter<'a> {
+        out: &'a mut [u8],
+        pos: usize,
+        count: u16,
+        max_keys: u16,
+    }
+
+    impl<'a> PageWriter<'a> {
+        /// A writer over `out` that accepts at most `max_keys` entries.
+        pub fn new(out: &'a mut [u8], max_keys: u16) -> Self {
+            PageWriter {
+                out,
+                pos: PAGE_HEADER_LEN,
+                count: 0,
+                max_keys,
+            }
+        }
+
+        /// Entries written so far.
+        pub fn count(&self) -> u16 {
+            self.count
+        }
+
+        /// The page holds `max_keys` entries and takes no more.
+        pub fn is_full(&self) -> bool {
+            self.count >= self.max_keys
+        }
+
+        /// Append one entry. `false` when the page is full, when the entry
+        /// and the trailer that resumes after it (the cursor is this key) do
+        /// not both fit, or when the key is empty or exceeds `STORAGE_KEY_MAX`, or the
+        /// etag its `u8` length prefix — the caller tells those apart before
+        /// pushing. Nothing is written on `false`.
+        pub fn push(&mut self, key: &[u8], size: u64, mtime: u64, etag: &[u8]) -> bool {
+            if self.is_full()
+                || key.is_empty()
+                || key.len() > STORAGE_KEY_MAX
+                || etag.len() > u8::MAX as usize
+            {
+                return false;
+            }
+            let need = entry_len(key.len(), etag.len());
+            let end = self.pos + need;
+            if end + TRAILER_HEADER_LEN + key.len() > self.out.len() {
+                return false;
+            }
+            let o = &mut self.out[self.pos..end];
+            o[0..2].copy_from_slice(&(key.len() as u16).to_le_bytes());
+            let mut p = 2 + key.len();
+            o[2..p].copy_from_slice(key);
+            o[p..p + 8].copy_from_slice(&size.to_le_bytes());
+            o[p + 8..p + 16].copy_from_slice(&mtime.to_le_bytes());
+            o[p + 16] = etag.len() as u8;
+            p += 17;
+            o[p..p + etag.len()].copy_from_slice(etag);
+            self.pos = end;
+            self.count += 1;
+            true
+        }
+
+        /// Write the header and the trailing cursor (empty = end of
+        /// listing). Returns the page length, or `None` when the buffer
+        /// cannot hold the page — the provider answers `ENOMEM`.
+        pub fn finish(self, cursor: &[u8]) -> Option<usize> {
+            if cursor.len() > STORAGE_KEY_MAX {
+                return None;
+            }
+            let end = self.pos + TRAILER_HEADER_LEN + cursor.len();
+            if end > self.out.len() {
+                return None;
+            }
+            self.out[0..2].copy_from_slice(&self.count.to_le_bytes());
+            self.out[self.pos..self.pos + 2].copy_from_slice(&(cursor.len() as u16).to_le_bytes());
+            self.out[self.pos + 2..end].copy_from_slice(cursor);
+            Some(end)
+        }
+    }
+
+    /// One listed object.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct Entry<'a> {
+        pub key: &'a [u8],
+        pub size: u64,
+        pub mtime: u64,
+        pub etag: &'a [u8],
+    }
+
+    /// A decoded page: its entries and the cursor that continues it.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct Page<'a> {
+        count: u16,
+        entries: &'a [u8],
+        cursor: &'a [u8],
+    }
+
+    fn entry_at(b: &[u8], at: usize) -> Option<(Entry<'_>, usize)> {
+        let key_len = u16_at(b, at)? as usize;
+        let key = b.get(at + 2..at + 2 + key_len)?;
+        let p = at + 2 + key_len;
+        let size = u64_at(b, p)?;
+        let mtime = u64_at(b, p + 8)?;
+        let etag_len = *b.get(p + 16)? as usize;
+        let etag = b.get(p + 17..p + 17 + etag_len)?;
+        Some((
+            Entry {
+                key,
+                size,
+                mtime,
+                etag,
+            },
+            p + 17 + etag_len,
+        ))
+    }
+
+    /// Decode exactly one page — the `n` bytes a successful call reported.
+    /// `None` when the bytes are not one well-formed page.
+    pub fn decode_page(page: &[u8]) -> Option<Page<'_>> {
+        let count = u16_at(page, 0)?;
+        let mut p = PAGE_HEADER_LEN;
+        for _ in 0..count {
+            p = entry_at(page, p)?.1;
+        }
+        let cursor_len = u16_at(page, p)? as usize;
+        if cursor_len > STORAGE_KEY_MAX || page.len() != p + TRAILER_HEADER_LEN + cursor_len {
+            return None;
+        }
+        Some(Page {
+            count,
+            entries: &page[PAGE_HEADER_LEN..p],
+            cursor: &page[p + 2..],
+        })
+    }
+
+    impl<'a> Page<'a> {
+        pub fn count(&self) -> u16 {
+            self.count
+        }
+
+        /// The cursor to send for the next page; empty at the end of the
+        /// listing.
+        pub fn cursor(&self) -> &'a [u8] {
+            self.cursor
+        }
+
+        /// This page is the last of the listing.
+        pub fn is_last(&self) -> bool {
+            self.cursor.is_empty()
+        }
+
+        pub fn entries(&self) -> Entries<'a> {
+            Entries {
+                buf: self.entries,
+                pos: 0,
+            }
+        }
+    }
+
+    /// The entries of a decoded [`Page`], in key order.
+    pub struct Entries<'a> {
+        buf: &'a [u8],
+        pos: usize,
+    }
+
+    impl<'a> Iterator for Entries<'a> {
+        type Item = Entry<'a>;
+
+        fn next(&mut self) -> Option<Entry<'a>> {
+            let (entry, next) = entry_at(self.buf, self.pos)?;
+            self.pos = next;
+            Some(entry)
+        }
+    }
+}
+
+// ── Authority: presenting a capability ─────────────────────────────
+//
+// A provider configured with mesh roots admits nothing on its say-so alone:
+// every op runs under a GRANT the caller presented. `PRESENT` takes a scope
+// (a key prefix — a bucket, say `photos/`) and a capability chain whose
+// leaf names that scope's object ([`grant::scope_object`]); the provider
+// verifies the chain against its roots and its trusted clock and answers a
+// grant handle. Every later op passes the grant as its `handle` — `PUT`,
+// `GET`, `HEAD`, `DELETE`, `LIST` and `PUT_STREAMED_OPEN`, which otherwise
+// take `-1` — and is admitted only when:
+//
+//   - the key (or, for `LIST`, the prefix) lies inside the scope;
+//   - the grant carries the permission the op's class needs
+//     ([`grant::access_of`] → `StorageAccess::permission`);
+//   - the grant's window has not closed, by the provider's trusted clock.
+//
+// A refusal is `EACCES`. A handle minted under a grant (a `GET`'s read
+// handle) dies with it. `CLOSE` on a grant drops it. The grant belongs to the
+// module occupancy that presented it; another module, or a later occupancy
+// of the same scheduler slot, is refused `EACCES`.
+//
+// A provider with no roots is an unguarded local store: it answers
+// `PRESENT` with `ENOSYS` and serves `handle = -1` ops as before. A provider
+// with roots answers every `handle = -1` op with `EACCES`, and refuses its
+// namespace surface the same way, because that surface has no way to carry a
+// grant and would otherwise list what the scope hides.
+
+/// Present a capability chain for a scope; answers a grant handle.
+///
+/// `handle = -1`; `arg` is:
+///
+/// ```text
+///   [refusal: u8]                                 — written: the `Refusal`
+///                                                   byte on EACCES, else 0
+///   [scope_len: u16 LE][scope: scope_len bytes]   — a key prefix ending `/`
+///   [chain_len: u16 LE][chain: chain_len bytes]   — mesh::capability chain
+/// ```
+///
+/// The answer's reason travels in the request rather than behind a pointer,
+/// so the request carries no pointer at all and an isolated module can
+/// present the longest chain.
+///
+/// Returns a grant handle (tagged like a `GET` handle), `EACCES` when the
+/// chain is refused (its reason in byte 0), `EINVAL` when the request or
+/// scope is malformed, `ENOSYS` from a provider with no roots, or `ENOMEM`
+/// when no grant slot is free.
+pub const PRESENT: u32 = 0x142B;
+
+/// Grants, scopes, and which permission each op needs. Shared so a
+/// provider, a consumer and an issuer compute the same object for the same
+/// scope.
+pub mod grant {
+    use super::super::super::mesh::capability::{CapCrypto, ObjectId};
+    use super::super::handle::{StorageAccess, STORAGE_KEY_MAX};
+
+    /// Longest scope a grant names: a scope is a key prefix, so it is
+    /// bounded as keys are.
+    pub const SCOPE_MAX: usize = 255;
+    const _: () = assert!(SCOPE_MAX == STORAGE_KEY_MAX);
+
+    /// Domain separation for [`scope_object`], so a scope's object can never
+    /// equal a delegated key's (`capability::key_object`).
+    pub const SCOPE_DOMAIN: &[u8] = b"fluxor.storage.scope\0";
+
+    /// The object a capability over `scope` names: the first 16 bytes of
+    /// SHA-256 of [`SCOPE_DOMAIN`] followed by the scope. `None` for a scope
+    /// that is not [`valid_scope`].
+    pub fn scope_object<C: CapCrypto>(crypto: &C, scope: &[u8]) -> Option<ObjectId> {
+        if !valid_scope(scope) {
+            return None;
+        }
+        let mut buf = [0u8; SCOPE_DOMAIN.len() + SCOPE_MAX];
+        let n = SCOPE_DOMAIN.len();
+        buf[..n].copy_from_slice(SCOPE_DOMAIN);
+        buf[n..n + scope.len()].copy_from_slice(scope);
+        let h = crypto.sha256(&buf[..n + scope.len()]);
+        let mut o = [0u8; 16];
+        o.copy_from_slice(&h[..16]);
+        Some(o)
+    }
+
+    /// A scope is non-empty, at most [`SCOPE_MAX`] bytes, and ends `/`, so
+    /// `photos/` never admits `photos2/…`.
+    pub fn valid_scope(scope: &[u8]) -> bool {
+        !scope.is_empty() && scope.len() <= SCOPE_MAX && scope.last() == Some(&b'/')
+    }
+
+    /// Whether `key` (or a `LIST` prefix) lies inside `scope`.
+    pub fn in_scope(scope: &[u8], key: &[u8]) -> bool {
+        key.starts_with(scope)
+    }
+
+    /// The access class an op needs; `None` for an op no grant covers.
+    pub fn access_of(op: u32) -> Option<StorageAccess> {
+        match op {
+            super::GET | super::HEAD | super::RANGE_GET | super::LIST => Some(StorageAccess::Read),
+            super::PUT
+            | super::DELETE
+            | super::PUT_STREAMED_OPEN
+            | super::PUT_STREAMED_WRITE
+            | super::PUT_STREAMED_COMMIT
+            | super::PUT_STREAMED_ABORT => Some(StorageAccess::Write),
+            _ => None,
+        }
+    }
+
+    /// A parsed `PRESENT` request.
+    pub struct Present<'a> {
+        pub scope: &'a [u8],
+        pub chain: &'a [u8],
+    }
+
+    /// Offset of the refusal byte the provider writes.
+    pub const REFUSAL_AT: usize = 0;
+
+    /// Parse a `PRESENT` argument; `None` unless it is exactly one request.
+    pub fn parse_present(arg: &[u8]) -> Option<Present<'_>> {
+        let sl = u16::from_le_bytes([*arg.get(1)?, *arg.get(2)?]) as usize;
+        let scope = arg.get(3..3 + sl)?;
+        let at = 3 + sl;
+        let cl = u16::from_le_bytes([*arg.get(at)?, *arg.get(at + 1)?]) as usize;
+        let chain = arg.get(at + 2..at + 2 + cl)?;
+        if arg.len() != at + 2 + cl {
+            return None;
+        }
+        Some(Present { scope, chain })
+    }
+
+    /// Encode a `PRESENT` argument into `out`; its length, or `None` when it
+    /// does not fit.
+    pub fn encode_present(out: &mut [u8], scope: &[u8], chain: &[u8]) -> Option<usize> {
+        let n = 1 + 2 + scope.len() + 2 + chain.len();
+        if out.len() < n || scope.len() > u16::MAX as usize || chain.len() > u16::MAX as usize {
+            return None;
+        }
+        out[0] = 0;
+        out[1..3].copy_from_slice(&(scope.len() as u16).to_le_bytes());
+        out[3..3 + scope.len()].copy_from_slice(scope);
+        let at = 3 + scope.len();
+        out[at..at + 2].copy_from_slice(&(chain.len() as u16).to_le_bytes());
+        out[at + 2..at + 2 + chain.len()].copy_from_slice(chain);
+        Some(n)
+    }
+}
 
 /// Host-neutral helpers shared by the platform `storage.object`
 /// adapters that back `HEAD` / `RANGE_GET` with browser `fetch()`

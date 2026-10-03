@@ -65,7 +65,7 @@ the pair. Startup logs similar to these mean the graph is live:
 [... INFO fluxor_linux] [sched] starting main loop, tick_us=1000
 ```
 
-The scheduler also logs that it is accepting a two-module cycle:
+The scheduler also warns that it is accepting cycle modules:
 `linux_net` and `dns` feed each other, which is why the config sets
 `scheduler.accept_cycles`.
 
@@ -94,6 +94,19 @@ the response leaves the same way.
 
 Ctrl+C in the terminal running `fluxor run` stops the runtime. Each
 run is stateless; running the command again starts fresh.
+
+## Running a published service
+
+A service another project publishes is run by name once it is pinned,
+with its parameters on the command line or in a values file:
+
+```sh
+fluxor store pin dns_service:latest
+fluxor run dns_service --param port=15353 --param answer=10.1.2.3
+```
+
+[service-bundles.md](service-bundles.md) covers the parameter schema
+and how a service is published.
 
 ## Richer graphs
 

@@ -124,9 +124,8 @@ pub fn install_root() -> Option<InstallRoot> {
     }
 
     // 2. Workspace member with install markers. Workspace mode
-    //    already routes source crates / fmods / runtimes through
-    //    live member checkouts; catalogs are the one fluxor-owned
-    //    resource the lookup hadn't yet covered. First member whose
+    //    routes source crates / fmods / runtimes through live member
+    //    checkouts, and the catalogs follow them. First member whose
     //    root has both markers wins (in practice only fluxor's own
     //    checkout passes). Silent skip on missing / unparseable
     //    workspace.toml — broken user state should never block the
@@ -301,10 +300,6 @@ pub struct ProjectIdentity {
     /// `[project].version` — the human-readable `<ver>` tag label;
     /// defaults to `"0.0.0-dev"` when absent. Resolution never orders
     /// versions — `:latest` is the only tag with semantics.
-    #[allow(
-        dead_code,
-        reason = "read by the lib-context store flow; this file dual-compiles into the bin, whose paths only read `name`"
-    )]
     pub version: String,
     /// `[project].runtimes` — explicit opt-in list of host runtime
     /// binaries this project owns. The `fluxor publish` runtime sweep

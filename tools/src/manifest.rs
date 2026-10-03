@@ -16,8 +16,7 @@ use sha2::{Digest, Sha256};
 use crate::error::{Error, Result};
 use crate::hash::fnv1a_hash;
 
-/// The module tiers, in tier-table order
-/// (standards/fluxor-modules.md §0.1). A module lives in exactly one
+/// The module tiers, in tier-table order. A module lives in exactly one
 /// of these directories; the tier is its ownership/portability
 /// statement, never its delivery (`builtin = true` is a manifest key).
 ///
@@ -1308,7 +1307,7 @@ pub struct Manifest {
     pub capabilities: Vec<String>,
     /// Build-time observability declarations from the `[observability]` table
     /// (parsed from TOML, not serialized to the binary `.fmod`). Consulted by
-    /// `fluxor lint observability`. See `standards/observability.md` §6.
+    /// `fluxor lint observability`.
     pub observability: Observability,
     /// Module is built into the kernel (no .fmod file needed).
     /// Used by platform-specific modules like linux_net.
@@ -1460,7 +1459,7 @@ impl Default for Manifest {
 /// table — the instrument names a module emits, and an optional opt-out reason.
 /// Parsed from TOML, not serialized to the binary `.fmod`. Instrument-name
 /// resolution and the baseline contract are enforced by
-/// `fluxor lint observability`; see `standards/observability.md`.
+/// `fluxor lint observability`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Observability {
     /// Metric instrument names this module emits (interned per module at build).
@@ -1529,8 +1528,8 @@ impl InstrumentKind {
 /// `__other__`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DimensionDecl {
-    /// Attribute key — OTel semconv or `fluxor.*` (standards/observability.md
-    /// §5; vocabulary enforced by `fluxor lint observability`).
+    /// Attribute key — OTel semconv or `fluxor.*` (vocabulary enforced by
+    /// `fluxor lint observability`).
     pub key: String,
     pub domain: DimDomain,
 }
@@ -3469,8 +3468,7 @@ impl TargetCapabilities {
         // Silicon and host tokens only — board names resolve through the
         // `targets/` registry BEFORE reaching this table (callers pass
         // `TargetDescriptor::module_silicon()`). No alias rows: the
-        // registry is the single board→silicon mapping
-        // (standards/target_consolidation.md §3).
+        // registry is the single board→silicon mapping.
         match name {
             // Cortex-M0+, no FPU, no SIMD, no MMU.
             "rp2040" => Self {

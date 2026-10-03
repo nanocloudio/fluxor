@@ -1,3 +1,14 @@
+/// A module location with no silicon and no pins, for tests that read
+/// artefacts from `dir` alone.
+#[cfg(test)]
+fn test_loc(dir: &std::path::Path) -> crate::schema::ModuleLocation<'_> {
+    crate::schema::ModuleLocation {
+        dir,
+        silicon: "",
+        project_root: std::path::Path::new("/nonexistent"),
+    }
+}
+
 /// Shared test helpers for env-mutating tests.
 ///
 /// Multiple test modules in this file (`scheduler_validation_tests`
@@ -518,7 +529,7 @@ mod scheduler_validation_tests {
             ]},
             "pods": [{"modules": [{"name": "p", "type": "pod_pic_mod", "domain": "isrd"}]}]
         });
-        let err = build_pod_section(&cfg_isr, &tmp, &[])
+        let err = build_pod_section(&cfg_isr, test_loc(&tmp), &[])
             .expect_err("an ISR-tier pod placement must be rejected");
         assert!(
             format!("{err:?}").contains("ISR-tier"),
@@ -533,7 +544,7 @@ mod scheduler_validation_tests {
             ]},
             "pods": [{"modules": [{"name": "p", "type": "pod_pic_mod", "domain": "coop"}]}]
         });
-        build_pod_section(&cfg_ok, &tmp, &[])
+        build_pod_section(&cfg_ok, test_loc(&tmp), &[])
             .expect("a cooperative-domain pod placement must be accepted");
     }
 
@@ -549,7 +560,7 @@ mod scheduler_validation_tests {
                 {"name": "dup", "type": "pod_pic_mod2", "domain": "coop"}
             ]}]
         });
-        let err = build_pod_section(&cfg, &tmp, &[])
+        let err = build_pod_section(&cfg, test_loc(&tmp), &[])
             .expect_err("duplicate pod-local module names must be rejected");
         assert!(
             format!("{err:?}").contains("duplicate module name"),
@@ -918,31 +929,20 @@ mod scheduler_validation_tests {
     }
 
     #[test]
-    fn legacy_exec_mode_field_still_parses() {
-        // `exec_mode:` is an accepted alias spelling of `tier:`, with its
-        // own synonym set (`tier1a`, `high_rate`, `poll`, …). Both keys
-        // resolve to the same exec_mode bytes.
-        assert_eq!(
-            parse_domain_tier_to_exec_mode(&json!({"exec_mode": "tier1a"})),
-            Some(1)
-        );
-        assert_eq!(
-            parse_domain_tier_to_exec_mode(&json!({"exec_mode": "high_rate"})),
-            Some(1)
-        );
-        assert_eq!(
-            parse_domain_tier_to_exec_mode(&json!({"exec_mode": "poll"})),
-            Some(3)
-        );
+    fn only_the_tier_key_names_a_domains_tier() {
+        // `exec_mode` is the wire byte's name, not a YAML key: a domain that
+        // spells its tier that way names none, and the builder refuses it.
+        assert!(parse_domain_tier_to_exec_mode(&json!({"exec_mode": "poll"})).is_none());
+        // Each tier has a number and a name, and nothing else.
+        assert!(parse_domain_tier_to_exec_mode(&json!({"tier": "tier1a"})).is_none());
     }
 
     #[test]
     fn unknown_tier_string_returns_none() {
         // Caller is responsible for hard-failing on a None when the
-        // YAML actually had a `tier` / `exec_mode` field — silent
+        // YAML actually had a `tier` field — silent
         // fall-through to Tier 0 would mask typos.
         assert!(parse_domain_tier_to_exec_mode(&json!({"tier": "1c"})).is_none());
-        assert!(parse_domain_tier_to_exec_mode(&json!({"exec_mode": "real-time"})).is_none());
     }
 
     #[test]
@@ -951,28 +951,24 @@ mod scheduler_validation_tests {
     }
 
     #[test]
-    fn exec_mode_wire_bytes_locked_against_rfc_d5_table() {
+    fn exec_mode_wire_bytes_are_locked() {
         // The FULL `(string → byte)` mapping, pinned. These bytes are a
         // wire contract: a `.cfg.bin` blob carries the byte, and the kernel
         // reads it back through `scheduler::exec_mode::*`, so a changed
         // mapping silently mis-routes domains. Failing this test means the
-        // table or one of its synonyms moved, which needs a coordinated
+        // table or one of its spellings moved, which needs a coordinated
         // kernel + tools + docs change.
         let pairs: &[(&str, u8)] = &[
             ("cooperative", 0),
             ("0", 0),
             ("1a", 1),
             ("high_rate", 1),
-            ("tier1a", 1),
             ("1b", 2),
             ("isr_timer", 2),
-            ("tier1b", 2),
             ("3", 3),
             ("poll", 3),
-            ("tier3", 3),
             ("2", 4),
             ("isr_owned", 4),
-            ("tier2", 4),
         ];
         for (s, expected) in pairs {
             assert_eq!(
@@ -1494,7 +1490,7 @@ mod scheduler_validation_tests {
             0,
             None,
             &config,
-            modules_dir,
+            test_loc(modules_dir),
             &manifests,
             crate::capacity::kernel_max_modules("linux"),
             &crate::target::IsolationFacts::default(),
@@ -3637,5 +3633,106 @@ mod gated_edge_tests {
         )
         .unwrap();
         assert_eq!(groups, vec![2, 2]);
+    }
+}
+
+#[cfg(test)]
+mod fxwr_decode_tests {
+    use crate::config::{decode_config, MAGIC_FXWR};
+
+    /// A blob laid out as `generate_config_impl` writes one: two modules,
+    /// two edges, a 128-slot graph section, two GPIO entries.
+    fn blob() -> Vec<u8> {
+        let mut d = Vec::new();
+        d.extend_from_slice(&MAGIC_FXWR.to_le_bytes());
+        d.extend_from_slice(&1u16.to_le_bytes()); // version
+        d.extend_from_slice(&0xBEEFu16.to_le_bytes()); // checksum
+        d.push(2); // module_count
+        d.push(2); // edge_count low byte
+        d.extend_from_slice(&1000u16.to_le_bytes()); // tick_us
+        d.extend_from_slice(&48_000u32.to_le_bytes()); // graph_sample_rate
+        let mut entries = Vec::new();
+        for (id, hash, meta, params) in [(0u8, 0x1111_1111u32, 0u8, 3usize), (1, 0x2222_2222, 0x11, 0)]
+        {
+            entries.extend_from_slice(&((10 + params) as u32).to_le_bytes());
+            entries.extend_from_slice(&hash.to_le_bytes());
+            entries.push(id);
+            entries.push(meta);
+            entries.extend(std::iter::repeat_n(0xAA, params));
+        }
+        d.push(2);
+        d.push(0);
+        d.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        d.extend_from_slice(&entries);
+        // Graph section: count low, flags (accept_cycles), count high, slot code 0.
+        d.extend_from_slice(&[2, 0x01, 0, 0]);
+        let mut edges = vec![0u8; 128 * 12];
+        edges[..12].copy_from_slice(&[0, 1, 0x80 | (1 << 5) | 3, 0x21, 0, 4, 0, 0, 4, 1, 0, 0]);
+        edges[12..24].copy_from_slice(&[1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        d.extend_from_slice(&edges);
+        // Domain metadata: four entries.
+        d.extend_from_slice(&[0xE8, 0x03, 1, 3]);
+        d.extend_from_slice(&[0u8; 12]);
+        // Hardware header: spi, i2c, gpio, pio, reserved, uart.
+        d.extend_from_slice(&[0, 0, 2, 0, 0, 1]);
+        d
+    }
+
+    /// Every field a built blob carries comes back where the encoder put it.
+    #[test]
+    fn a_built_blob_decodes_field_for_field() {
+        let v = decode_config(&blob()).expect("decodes");
+        assert_eq!(v["version"], 1);
+        assert_eq!(v["tick_us"], 1000);
+        assert_eq!(v["graph_sample_rate"], 48_000);
+        assert_eq!(v["modules"].as_array().unwrap().len(), 2);
+        assert_eq!(v["modules"][0]["name_hash"], "0x11111111");
+        assert_eq!(v["modules"][0]["param_bytes"], 3);
+        assert_eq!(v["modules"][1]["id"], 1);
+        assert_eq!(v["modules"][1]["domain_id"], 1);
+        assert_eq!(v["modules"][1]["pre_tick_drain"], true);
+        assert_eq!(v["accept_cycles"], true);
+        assert_eq!(v["edge_slots"], 128);
+        let e = &v["graph"][0];
+        assert_eq!((e["from_id"].clone(), e["to_id"].clone()), (0.into(), 1.into()));
+        assert_eq!(e["to_port"], "ctrl");
+        assert_eq!(e["edge_class"], "dma_owned");
+        assert_eq!(e["buffer_group"], 3);
+        assert_eq!((e["from_port_index"].clone(), e["to_port_index"].clone()), (2.into(), 1.into()));
+        assert_eq!(e["buffer_bytes"], 1024);
+        assert_eq!(e["rate"], "transaction");
+        assert_eq!(e["wake"], true);
+        assert_eq!(v["graph"].as_array().unwrap().len(), 2);
+        assert_eq!(v["domains"][0]["tick_us"], 1000);
+        assert_eq!(v["domains"][0]["exec_mode"], 1);
+        assert_eq!(v["hardware"]["gpio"], 2);
+        assert_eq!(v["hardware"]["uart"], 1);
+    }
+
+    /// Every prefix of a blob is refused with an error, never a panic.
+    #[test]
+    fn every_truncation_is_an_error() {
+        let full = blob();
+        for len in 0..full.len() {
+            assert!(decode_config(&full[..len]).is_err(), "prefix of {len} bytes");
+        }
+    }
+
+    /// Only the version the builder writes decodes, and a wrong magic or a
+    /// module entry whose length leaves its section is refused.
+    #[test]
+    fn foreign_versions_magics_and_entry_lengths_are_refused() {
+        for v in [0u16, 2, 3] {
+            let mut d = blob();
+            d[4..6].copy_from_slice(&v.to_le_bytes());
+            let err = decode_config(&d).unwrap_err().to_string();
+            assert!(err.contains("not supported"), "{err}");
+        }
+        let mut d = blob();
+        d[..4].copy_from_slice(&0x4643_5846u32.to_le_bytes());
+        assert!(decode_config(&d).is_err());
+        let mut d = blob();
+        d[22..26].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(decode_config(&d).unwrap_err().to_string().contains("does not fit"));
     }
 }

@@ -125,59 +125,171 @@ A capability is a self-contained signed assertion of authority:
 |----------------|--------|-------|----------|
 | object_id      | 0      | 16 B  | The object this grant applies to (full ObjectId, no truncation) |
 | permissions    | 16     | 2 B   | u16 bitfield from the table above |
-| flags          | 18     | 2 B   | u16, reserved, must be 0 (future: delegation depth, contextual caveats) |
-| not_before     | 20     | 4 B   | u32 seconds since epoch — earliest validity, anti-replay |
+| flags          | 18     | 2 B   | u16, reserved, must be 0; a token with any flag set is refused |
+| not_before     | 20     | 4 B   | u32 seconds since epoch — earliest validity |
 | not_after      | 24     | 4 B   | u32 seconds since epoch — expiry, the lease bound |
-| issuer_key_id  | 28     | 4 B   | First 4 bytes of `SHA-256(issuer_pubkey)`, resolving to a slot in the device trust store |
-| signature      | 32     | 64 B  | Ed25519 over bytes 0..32 |
+| issuer_key_id  | 28     | 4 B   | First 4 bytes of `SHA-256(issuer_pubkey)`, naming the key carried with the link (see below) |
+| signature      | 32     | 64 B  | Ed25519 over the 16-byte domain tag `fluxor.mesh.cap\0` followed by bytes 0..32 |
+
+The domain tag separates token signatures from every other signature a
+key makes: a module's signing envelope is also 32 bytes, and without the
+tag a signature over one would be a valid token. Bytes 0..32 are every
+field but the signature, so no field steers a grant unsigned. A token is
+a bearer assertion: whoever holds the bytes inside the window can present
+them, which is why a session must be authenticated before it may present
+one (see Presenting a capability).
 
 ### Delegation chains
 
 A capability whose issuer is a delegated subkey rather than the root
-travels with a *chain*: a contiguous sequence of the same 96-byte
-records, ordered leaf → … → root-signed, carried as
-`<u16 chain_len><96 B record>×N`. For each non-leaf link, its
-`object_id` is the SHA-256 of the next link's signing key (binding
-the subkey it authorises), its `permissions` must include `Delegate`
-and be a superset of the next link's, and its validity window must
-contain `now`. Authority can only narrow link by link; no delegation
-ever widens what the root granted.
+travels with a *chain*. The chain is carried as `<u16 link_count BE>`
+followed by that many 128-byte links, ordered leaf → … → root-signed.
+Each link is a 96-byte token followed by the 32-byte Ed25519 public key
+that signed it. A delegate's key cannot be looked up anywhere, which is
+the point of a chain, so it travels with the link it signed, and the
+link's `issuer_key_id` must name it.
+
+For each delegation link (every link but the leaf):
+
+- its `object_id` is the first 16 bytes of SHA-256 of the key that
+  signed the link before it, binding the subkey it authorises;
+- its `permissions` include `Delegate` and are a superset of the
+  previous link's;
+- its validity window contains the previous link's.
+
+The last link's signer must be a root the verifier holds. Authority can
+only narrow link by link, in rights and in time; no delegation ever
+widens what the root granted in rights or time. Objects do not narrow: a
+delegation names a key, not an object, so a delegate may grant its
+permissions on any object, and a root that delegates to a key trusts that
+key with every object. A chain holds at most `MAX_CHAIN_LINKS`
+(8) links, so one presentation costs a verifier at most eight signature
+checks.
+
+The codec, the chain rules and the verifier are one source,
+`modules/sdk/contracts/mesh/capability.rs`. It ships in the SDK source
+artefact (`fluxor-abi`), so any PIC module or host tool links the same
+bytes. It takes SHA-256 and Ed25519 verification from its caller
+(`CapCrypto`), so the contract carries no crypto of its own. Golden
+vectors in `capability_vectors.rs` beside it cover valid tokens and
+chains and one vector per refusal class, and a consumer runs them to
+prove it wired the verifier as the contract means.
 
 ### Security model
 
-The mesh uses the same trust primitives as the rest of Fluxor:
-Ed25519 signatures, root public keys, and KEY_VAULT-resident key
-material (see [`security.md`](security.md)). There is no X.509, no
-certificate authority, no name binding — capabilities are bearer
-assertions, not certificates.
+The mesh uses the same trust primitives as the rest of Fluxor: Ed25519
+signatures, root public keys, and KEY_VAULT-resident private keys (see
+[`security.md`](security.md)). There is no X.509, no certificate
+authority, no name binding: capabilities are bearer assertions, not
+certificates.
 
-Each device carries a root Ed25519 public key in KEY_VAULT (slot 0
-by convention), established at provisioning. It is the only key
-whose authority is assumed; every other signing key must be
-reachable from it by a verifiable chain.
+A verifier holds the deployment's mesh root public key, and during a
+rotation its successor as well (`MAX_ROOTS`, 2). The root is a trust
+anchor of the same kind as a TLS `trust` bundle: it is configuration the
+deployment states, given to the verifying module as a parameter, and
+covered by the composition the graph attests. It is not a KEY_VAULT slot.
+The vault holds private keys, owned by the module that made them and
+named by labels in that module's own namespace, so no slot is shared and
+none is public. Every other signing key must be reachable from a root by
+a verifiable chain.
 
-On receipt of a command bearing a capability, the receiver checks,
-entirely locally:
+On receipt of a chain, the receiver checks, entirely locally and before
+any signature:
 
-1. **Structural decode** — the token is 96 bytes and any chain is
-   well-formed.
-2. **Signature** — verified against the issuer key, which must
-   resolve to the local root or to the leaf of an attached chain
-   whose head verifies to the root.
-3. **Chain coherence** — the narrowing, key-binding, and lease rules
-   above hold for every link.
-4. **Validity window** — `not_before ≤ now ≤ not_after`.
-5. **Permission match** — the attempted operation is allowed by the
-   bitfield.
+1. **Structure.** The link count is 1–8 and the bytes hold exactly that
+   many links.
+2. **Reserved bits.** `flags` is zero and no permission bit outside the
+   six above is set. A caveat a verifier cannot name is refused, never
+   ignored.
+3. **Keys.** Every link's `issuer_key_id` names the key it carries, and
+   the last link's key is a root.
+4. **Chain coherence.** The key-binding, `Delegate`, permission-narrowing
+   and window-narrowing rules above hold for every delegation.
+5. **Validity window.** `not_before ≤ now − u` and `now + u ≤ not_after`
+   for every link, where `now` and `u` are the `TRUSTED_UNIX`
+   observation and its uncertainty. A reading the platform does not mark
+   trusted, or one flagged as having gone backwards, is no clock, and the
+   chain is refused rather than checked against a guess.
+6. **Object and permission.** The leaf names the object the operation
+   targets and carries every permission it needs.
 
-Any failure aborts the command. Leases are checked once at
-admission: in-flight commands complete under the lease they entered
-with, and a holder is never expected to renew mid-operation.
+Only then are the signatures verified, one per call
+(`ChainCheck::step`), leaf first. A stream of forged chains therefore
+costs a verifier no signature work, and a long chain fits a
+microcontroller's step budget. Any failure refuses the operation with
+one of sixteen named refusals. Leases are checked at admission:
+in-flight commands complete under the lease they entered with, and a
+holder is never expected to renew mid-operation.
 
-Issuer private keys never leave KEY_VAULT. A holder exercising
-`Delegate` does so through a KEY_VAULT signing primitive that takes
-the delegated capability bytes and emits the signature; private key
-bytes are never exposed to module code.
+Private keys are never exposed to module code. An operator's issuing
+keys are seeds held as module-signing keys are. A module that delegates
+at run time signs `Token::signed_bytes` with `KEY_VAULT::SIGN` on an Ed25519 slot it
+owns.
+
+### Issuing
+
+Operators issue with the `fluxor` CLI, alongside module signing. A key
+is the 32-byte Ed25519 seed `fluxor modules keygen` makes, and the public
+key it prints is what a root's verifiers are configured with.
+
+- `fluxor modules cap mint` grants permissions on an object.
+- `fluxor modules cap delegate` authorises another key to grant within a
+  narrower set.
+- `fluxor modules cap verify` checks a chain for one operation.
+- `fluxor modules cap inspect` prints a chain's links.
+
+`mint` and `delegate` sign a new link and put it in front of the chain
+that authorises the signing key, or start a chain when that key is the
+root. Before signing, they refuse a link that does not narrow the link
+that delegated to its key, so the CLI never issues a chain a verifier
+would refuse on those grounds.
+
+The CLI links the contract's own codec and chain rules and signs with
+its own RFC 8032 Ed25519. Its verifier is as strict as a device's: it
+refuses a scalar not below the group order, a non-canonical key or `R`,
+and a small-order key or `R`. The golden vectors hold it to the
+contract, and it reissues their root-signed links byte for byte. A chain
+it issues is therefore what every verifier accepts. `verify` checks against the host's clock with no
+uncertainty; a device decides against its own trusted clock.
+
+### Presenting a capability
+
+Mutual TLS (or QUIC) authenticates the channel; the capability
+authorises the operation. A client presents a chain once per session
+with `MSG_CAP_PRESENT` (`0xD0`). The server verifies it and answers
+`MSG_CAP_ANSWER` (`0xD1`) with the grant or the refusal, and records the
+grant against the session. Each later command names its object and is
+admitted against the grants that session holds, at the time the command
+arrives (`SessionGrants::authorise`). A session holds at most
+`MAX_SESSION_GRANTS` (8) grants. A ninth presentation is refused until
+one is withdrawn (`MSG_CAP_WITHDRAW`, `0xD2`), and nothing is evicted.
+Grants die with the session.
+
+A server refuses a presentation on a session whose `peer_identity` does
+not bind an identity. A bearer token on an anonymous channel is a token
+anyone who saw it can replay.
+
+Request-scoped protocols carry the chain in the `fluxor-capability`
+header as `fxcap1.` + unpadded base64url and verify it per request, or
+cache it per connection. The frames use the TLV header the net contracts
+share, in a range disjoint from all of them, so a protocol's own channel
+can carry them beside its own frames.
+
+Storage names the same permission bits. `StorageAccess` maps each storage
+operation class to one bit (read → `ReadState`, write → `SendCommand`,
+subscribe → `Subscribe`, delegate → `Delegate`), `StorageHandle::allows`
+checks a handle's bits against it, and `lease_bound_ns` bounds a handle's
+lease by its grant's expiry.
+
+A module calling a store through `provider_call` has no session to present
+on, so `storage.object` presents through an op of its own. `PRESENT` names
+a scope (a key prefix such as `photos/`) and carries a chain whose leaf
+names that scope's object. The store verifies the chain and answers a grant
+handle, and every later op passes that grant as its handle. Each op is
+admitted only inside the scope, with the bit its access class needs, while
+the grant's window is open, and only for the module that presented it. The
+Linux store enforces this whenever it is configured with roots (see
+[presenting a grant to a store](storage_capability_surface.md#31-presenting-a-grant-to-a-store)).
 
 ## Handles
 
@@ -245,7 +357,8 @@ the hardware. Objects stay declarative; graphs handle the hardware.
 
 ## Embedded Memory Budgets
 
-The substrate is sized to run on constrained targets:
+The object registry is designed to run on constrained targets, within
+these limits:
 
 | Resource | Limit |
 |----------|------|
@@ -257,22 +370,42 @@ The substrate is sized to run on constrained targets:
 
 ## Transport
 
-The mesh does not define its own fabric. Cross-node transport is
-carried by remote channels (`modules/foundation/remote_channel/`),
-which multiplex logical channels over one byte transport; mesh
-events and commands ride the same fabric as every other cross-node
+The mesh does not define its own fabric. Cross-node transport is carried
+by remote channels (`modules/foundation/remote_channel/`), which
+multiplex up to eight local channels over one authenticated session.
+
+- **Records preserved.** Each channel declares a content type, a local
+  record framing and a maximum record. Both ends exchange these tables
+  when a session opens and refuse the session on any difference. A
+  record up to the maximum is fragmented and reassembled whole before
+  delivery. A record over it is refused and counted, never truncated.
+- **Per-channel credit.** Every channel has its own credit, so a large
+  or stalled record holds up only its own channel, and nothing is
+  dropped under backpressure.
+- **Authenticated transport.** The transport authenticates and the
+  channel module does not. Remote channels ride the clear side of
+  mutual TLS, with the session used only once a `peer_identity` record
+  naming that session binds, or ride QUIC, where each channel is its own
+  stream so one channel's loss recovery never blocks another's.
+
+Mesh events and commands ride this fabric like every other cross-node
 channel.
 
 ## Adoption Status
 
-The runtime adopts the mesh incrementally. In the tree today: the
-128-bit `ObjectId` and the 32-byte event header are implemented and
-carry the storage namespace change feed; the content-type registry
-is shared with on-device channels; and the storage contract's
-handles realise the handle/permission/lease shape with a narrower
-permission set (Read / Write / Subscribe / Delegate) and monotonic
-nanosecond lease bounds. The substrate proper — the capability token
-codec, chain verification, the object registry, and the bridge — is
-a design target, not yet wired; when built it decomposes into
-identity, content_type, event, command, capability, handle, object,
-and mesh_bridge submodules of a single module.
+What the tree implements:
+
+- the 128-bit `ObjectId` and the 32-byte event header, carrying the
+  storage namespace change feed;
+- the content-type registry shared with on-device channels;
+- the capability token and chain codec, local verification against
+  trusted time, the session presentation wire and per-session grants
+  (`contracts/mesh/capability.rs`), with their golden vectors;
+- issuance and checking in the `fluxor` CLI (`fluxor modules cap`);
+- capability grants on `storage.object` (`PRESENT`): scope, permission
+  and expiry enforced per op by the Linux store when it holds roots;
+- the remote-channel fabric.
+
+The object registry and the mesh bridge are not built. When built they
+complete a single module of identity, event, command, handle, object
+and mesh_bridge submodules over the capability contract above.

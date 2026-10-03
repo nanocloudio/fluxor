@@ -30,6 +30,7 @@ pub mod b64;
 pub mod capacity;
 pub mod ci_schema;
 pub mod compose;
+pub mod env_subst;
 pub mod error;
 pub mod genstore;
 pub mod gpu_contract;
@@ -44,7 +45,7 @@ pub mod identity_key;
 pub mod lifecycle;
 pub mod limit_register;
 pub mod lockfile;
-// `standards/make.md` as checkable text: preamble, target set, the
+// The Makefile standard as checkable text: preamble, target set, the
 // canonical lifecycle recipe bodies, and §3 recipe complexity. Driven
 // by `fluxor ci`'s `makefile` phase, which adds the live-CLI verb
 // resolution on top.
@@ -74,6 +75,7 @@ pub mod project;
 pub mod protection;
 pub mod publish;
 pub mod render_template;
+pub mod service_params;
 // The consolidated store flow: `store_publish` (the single store-write
 // path), `store_resolve` (uniform `[[artifact]]` lockfile resolution),
 // and `store_sync` (the one-path materialiser + `workspace publish`).

@@ -1300,8 +1300,7 @@ pub fn write_merged_component_yaml(
 /// token itself for host targets (linux fluxor-linux reuses bcm2712 PIC
 /// modules, so `["bcm2712"]` is legal under `runtime_override: linux`).
 /// Boards never appear in `hardware_targets` — a board id there is the
-/// level error this validator exists to catch
-/// (standards/target_consolidation.md §2 rule 1).
+/// level error this validator exists to catch.
 fn target_aliases(target: &str) -> Vec<String> {
     match crate::target::load_target(target, &crate::project::root()) {
         Ok(desc) => desc.accepted_hardware_targets(),

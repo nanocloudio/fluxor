@@ -239,47 +239,47 @@ unsafe fn delete(sys: &SyscallTable, key: &[u8], fence: &mut [u8; FENCE_CAP]) ->
     write_answer((sys.provider_call)(-1, OBJ_DELETE, arg.as_mut_ptr(), p))
 }
 
-/// LIST one page of `prefix`; returns the number of entries counted, or a
-/// negative errno.
+/// LIST every page of `prefix`; returns the number of entries counted, or a
+/// negative errno. Each page resumes after the last name the previous one
+/// returned.
 unsafe fn list_count(sys: &SyscallTable, prefix: &[u8], page: &mut [u8]) -> i32 {
-    // [prefix_len:u16][prefix][cursor_len:u16][out_buf:u64][out_cap:u32]
-    // [fence_ptr:u64][fence_cap:u16]
-    let mut arg = [0u8; 256];
-    let mut p = 0usize;
-    arg[0..2].copy_from_slice(&(prefix.len() as u16).to_le_bytes());
-    p += 2;
-    arg[p..p + prefix.len()].copy_from_slice(prefix);
-    p += prefix.len();
-    arg[p..p + 2].copy_from_slice(&0u16.to_le_bytes()); // cursor_len 0
-    p += 2;
-    arg[p..p + 8].copy_from_slice(&(page.as_mut_ptr() as u64).to_le_bytes());
-    p += 8;
-    arg[p..p + 4].copy_from_slice(&(page.len() as u32).to_le_bytes());
-    p += 4;
-    arg[p..p + 8].copy_from_slice(&0u64.to_le_bytes());
-    p += 8;
-    arg[p..p + 2].copy_from_slice(&0u16.to_le_bytes());
-    p += 2;
-    let n = (sys.provider_call)(-1, NS_LIST, arg.as_mut_ptr(), p);
-    if n < 0 {
-        return n;
-    }
-    // entries: [name_len:u8][kind:u8][name]… then the trailing record
-    // [0xFF][0xFF][cursor_len:u8][cursor]. Both marker bytes are
-    // checked: a 255-byte name puts 0xFF in `name_len`, so a one-byte
-    // test ends the page early and undercounts.
+    use abi::contracts::storage::namespace::list;
+    let mut fence = [0u8; abi::fence::WIRE_MAX_LEN];
+    let mut cursor = [0u8; abi::contracts::storage::handle::STORAGE_KEY_MAX];
+    let mut cursor_len = 0usize;
     let mut count = 0i32;
-    let mut o = 0usize;
-    let n = n as usize;
-    while o + 1 < n {
-        if page[o] == 0xFF && page[o + 1] == 0xFF {
-            break;
+    let mut pages = 0;
+    while pages < 4096 {
+        pages += 1;
+        let req = list::Request {
+            prefix,
+            cursor: &cursor[..cursor_len],
+            out_ptr: page.as_mut_ptr() as u64,
+            out_cap: page.len() as u32,
+            fence_out_ptr: fence.as_mut_ptr() as u64,
+            fence_out_cap: fence.len() as u16,
+        };
+        let mut arg =
+            [0u8; list::REQUEST_FIXED_LEN + 2 * abi::contracts::storage::handle::STORAGE_KEY_MAX];
+        let Some(len) = list::encode_request(&mut arg, &req) else {
+            return E_INVAL;
+        };
+        let n = (sys.provider_call)(-1, NS_LIST, arg.as_mut_ptr(), len);
+        if n < 0 {
+            return n;
         }
-        let l = page[o] as usize;
-        o += 2 + l;
-        count += 1;
+        let Some(decoded) = list::decode_page(&page[..n as usize]) else {
+            return E_INVAL;
+        };
+        count += decoded.entries().count() as i32;
+        if decoded.is_last() {
+            return count;
+        }
+        let next = decoded.cursor();
+        cursor[..next.len()].copy_from_slice(next);
+        cursor_len = next.len();
     }
-    count
+    E_INVAL
 }
 
 unsafe fn subscribe(sys: &SyscallTable, prefix: &[u8], sink: i32) -> i32 {

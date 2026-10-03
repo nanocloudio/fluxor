@@ -322,12 +322,10 @@ kernel tracks no interface state.
 The kernel has exactly one channel implementation: a ring buffer.
 Drivers and the IP module exchange complete frames via `channel_write` /
 `channel_read`; the ring provides flow control and the IP module's
-parser handles frame boundaries. For zero-copy handoff, channels also
-have a mailbox mode: the producer acquires a buffer via
-`buffer_acquire_write`, hardware DMA fills it directly, and the consumer
-maps it via `buffer_acquire_read` without copying. This is the same
-mailbox primitive used for zero-copy audio buffers; see `pipeline.md`
-for the buffer state machine.
+parser handles frame boundaries. Channels also have a mailbox mode, a
+single message buffer handed from producer to consumer without a copy,
+which the audio pipeline uses; see `pipeline.md` for its state machine.
+The network drivers and the IP module use the ring.
 
 ### ch9120: hardware TCP/IP offload
 

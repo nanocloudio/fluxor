@@ -502,11 +502,42 @@ pub mod timer {
 // Buffer primitive (zero-copy slot acquisition)
 // ─────────────────────────────────────────────────────────────────────
 pub mod buffer {
+    /// Acquire the channel's buffer for writing (STREAMING → PRODUCER).
+    /// Argument: an [`acquired`] record, written by the kernel.
     pub const ACQUIRE_WRITE: u32 = 0x0A00;
+    /// Publish the written buffer (PRODUCER → READY). Argument: `u32` LE, the
+    /// length of the message in bytes (at most the capacity `ACQUIRE_WRITE`
+    /// reported). A length of `0` publishes an empty message; an argument
+    /// shorter than 4 bytes is `EINVAL` and publishes nothing.
     pub const RELEASE_WRITE: u32 = 0x0A01;
+    /// Acquire the channel's pending message for reading (READY → CONSUMER).
+    /// Argument: an [`acquired`] record, written by the kernel.
     pub const ACQUIRE_READ: u32 = 0x0A02;
+    /// Return the message buffer (CONSUMER → STREAMING). No argument.
     pub const RELEASE_READ: u32 = 0x0A03;
+    /// Acquire the channel's pending message for modification (READY →
+    /// PRODUCER); `RELEASE_WRITE` then hands it on. Argument: an [`acquired`]
+    /// record, written by the kernel.
     pub const ACQUIRE_INPLACE: u32 = 0x0A04;
+
+    /// The record the three acquire operations fill in. The call's result is
+    /// the status and never the address: a pointer does not fit the `i32` a
+    /// call returns on a 64-bit target.
+    ///
+    /// Result `0`: acquired. `EAGAIN`: the channel is a mailbox that is not
+    /// available now (write: the buffer holds an earlier message and `LEN` is
+    /// its capacity; read and in-place: no message is ready). `ENOTSUP`: the
+    /// channel is not a mailbox. `EINVAL`: no such channel, or an argument
+    /// shorter than [`SIZE`] (nothing is acquired then).
+    pub mod acquired {
+        /// Total length, in bytes.
+        pub const SIZE: usize = 16;
+        /// `u64` LE — the buffer's address; `0` unless the result was `0`.
+        pub const PTR: usize = 0;
+        /// `u32` LE — write: the buffer's capacity (also for a busy
+        /// mailbox); read and in-place: the message length; `0` otherwise.
+        pub const LEN: usize = 8;
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────

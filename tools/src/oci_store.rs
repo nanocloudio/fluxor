@@ -7,18 +7,16 @@
 //! `artifactType` is a fluxor media type (one per artifact kind, spelled
 //! `application/vnd.nanocloud.fluxor.<kind>.v1`).
 //!
-//! Four sibling directories carry what the manifests deliberately do not:
+//! Three sibling directories carry what the manifests deliberately do not:
 //!
 //! - `provenance/<hex>.toml` — how a manifest came to be published
 //!   ([`ProvenanceRow`]): `local-build` vs `published`, the git revision,
 //!   the ci digest. Queryable, not guessed, and outside the manifest so
-//!   that re-stamping it cannot move the digest everything pins.
+//!   that recording it cannot move the digest everything pins.
 //! - `pins/` — the pin ledger (`store_pins`): which checkouts hold which
 //!   digests, and therefore what the collector must not touch.
 //! - `quarantine/` — blobs a sweep could not prove live. Any read
 //!   restores them; only `fluxor store gc` deletes.
-//! - `aliases/<old-hex>` — the one-time restamp mapping, so a lockfile
-//!   written before provenance moved out still resolves.
 //!
 //! Offline-first invariant: nothing in this module touches the network.
 //! Publishing writes only into the local store; consumption reads only
@@ -93,29 +91,18 @@ pub const MT_FLUXOR_RUNTIME: &str = "application/vnd.nanocloud.fluxor.runtime.v1
 
 pub const ANN_REF_NAME: &str = "org.opencontainers.image.ref.name";
 pub const ANN_TITLE: &str = "org.opencontainers.image.title";
-/// Provenance annotations, as manifests published BEFORE the provenance
-/// side table carried them. Nothing writes these any more; `fluxor store
-/// restamp` reads them off old manifests to file the rows they were
-/// carrying, and `fluxor store fsck` reports a manifest still wearing
-/// one. See [`ProvenanceRow`] for why they moved.
-pub const ANN_PROVENANCE: &str = "io.fluxor.provenance";
-pub const ANN_SOURCE_REV: &str = "io.fluxor.source-rev";
 pub const ANN_KIND: &str = "io.fluxor.kind";
 pub const ANN_TARGET: &str = "io.fluxor.module.target";
 pub const ANN_MODULE_NAME: &str = "io.fluxor.module.name";
 /// The ecosystem epoch: the ABI-surface digest the artifact was built
 /// against. Sync verifies set homogeneity (everyone) and currency
 /// (live members) on this annotation; an artifact without it is not
-/// consumable (registry_consolidation.md, epoch rules).
+/// consumable.
 pub const ANN_ABI_SURFACE: &str = "io.fluxor.abi-surface";
 /// Token-canonical digest of the artifact's actual inputs, stamped at
 /// publish — the per-artifact staleness signal and `workspace publish`
 /// work-list key. Runtimes carry `source-rev` + a dirty bit instead.
 pub const ANN_INPUT_DIGEST: &str = "io.fluxor.input-digest";
-/// The input digest the project's `ci` gate last passed on, when known.
-/// Information, never a gate: green-ci is required only at the future
-/// promotion-to-`published` re-tag.
-pub const ANN_CI_DIGEST: &str = "io.fluxor.ci-digest";
 /// Host triple of a runtime artifact's binary layer.
 pub const ANN_RUNTIME_TRIPLE: &str = "io.fluxor.runtime.triple";
 
@@ -265,7 +252,9 @@ pub struct ImageIndex {
 /// `$XDG_DATA_HOME/fluxor/store`, else `$HOME/.local/share/fluxor/store`.
 pub fn store_root() -> Result<PathBuf> {
     if let Some(v) = std::env::var_os("FLUXOR_STORE") {
-        return Ok(PathBuf::from(v));
+        if !v.is_empty() {
+            return Ok(PathBuf::from(v));
+        }
     }
     if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
         if !xdg.is_empty() {
@@ -404,7 +393,7 @@ impl OciStore {
         let hex = digest
             .strip_prefix("sha256:")
             .ok_or_else(|| Error::Config(format!("digest '{digest}' is not sha256:-prefixed")))?;
-        if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        if hex.len() != 64 || !hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
             return Err(Error::Config(format!("malformed digest '{digest}'")));
         }
         Ok(hex)
@@ -465,54 +454,6 @@ impl OciStore {
             .unwrap_or(false)
     }
 
-    // ── Restamp aliases ───────────────────────────────────────────────
-    //
-    // `fluxor store restamp` rewrites every manifest once, to move
-    // provenance out of it (see `base_annotations`). That is the only
-    // event in the store's life that moves a digest without the content
-    // moving, and a lockfile written before it would otherwise pin a
-    // digest nothing answers to. An alias records old → new so such a
-    // pin still resolves, offline, to a manifest with identical layers,
-    // target, epoch and input digest.
-    //
-    // Aliases are consulted ONLY when the pinned digest is not in the
-    // store. They are never consulted by `read_blob`, which must keep
-    // meaning "these exact bytes" — substituting different bytes under a
-    // content-addressed read is the one thing this store cannot do.
-
-    fn alias_dir(&self) -> PathBuf {
-        self.root.join("aliases")
-    }
-
-    /// Record that `old` was restamped into `new`.
-    pub fn record_alias(&self, old: &str, new: &str) -> Result<()> {
-        let hex = Self::digest_hex(old)?;
-        Self::digest_hex(new)?;
-        fs::create_dir_all(self.alias_dir())?;
-        write_atomic(&self.alias_dir().join(hex), new.as_bytes())
-    }
-
-    /// The digest `old` was restamped into, if any.
-    pub fn alias_of(&self, old: &str) -> Option<String> {
-        let hex = Self::digest_hex(old).ok()?;
-        let text = fs::read_to_string(self.alias_dir().join(hex)).ok()?;
-        let target = text.trim().to_string();
-        Self::digest_hex(&target).ok()?;
-        Some(target)
-    }
-
-    /// Resolve a PINNED digest: itself when the store holds it, else the
-    /// digest it was restamped into. Pin-resolution paths call this;
-    /// integrity paths (`read_blob`) never do.
-    pub fn resolve_pin(&self, digest: &str) -> String {
-        if self.has_blob(digest) {
-            return digest.to_string();
-        }
-        self.alias_of(digest)
-            .filter(|target| self.has_blob(target))
-            .unwrap_or_else(|| digest.to_string())
-    }
-
     // ── Provenance side table ─────────────────────────────────────────
 
     fn provenance_dir(&self) -> PathBuf {
@@ -524,9 +465,9 @@ impl OciStore {
     ///
     /// Append rather than replace: one manifest is legitimately
     /// published from several revisions — that is the NORMAL case, since
-    /// a rebuild of unchanged sources now yields the same manifest — and
-    /// a table that kept only the last row would throw away the history
-    /// the annotation used to carry.
+    /// a rebuild of unchanged sources yields the same manifest — and a
+    /// table that kept only the last row would throw away the record of
+    /// every other publish.
     pub fn record_provenance(&self, digest: &str, row: &ProvenanceRow) -> Result<()> {
         let hex = Self::digest_hex(digest)?;
         let path = self.provenance_dir().join(format!("{hex}.toml"));
@@ -653,7 +594,26 @@ impl OciStore {
     /// descriptor lands in the index).
     fn tag_manifest_locked(&self, manifest: &ImageManifest, ref_name: &str) -> Result<Descriptor> {
         let bytes = serde_json::to_vec(manifest)?;
-        let (digest, size) = self.put_blob(&bytes)?;
+        self.tag_manifest_bytes_locked(&bytes, manifest, ref_name)
+    }
+
+    /// Tag a manifest whose exact bytes the caller holds — a pulled
+    /// manifest keeps the digest the registry knows it by. The bytes must
+    /// parse as an [`ImageManifest`]; they are stored verbatim.
+    pub fn tag_manifest_bytes(&self, bytes: &[u8], ref_name: &str) -> Result<Descriptor> {
+        let manifest: ImageManifest = serde_json::from_slice(bytes)
+            .map_err(|e| Error::Config(format!("manifest does not parse: {e}")))?;
+        let _index_lock = self.lock_index()?;
+        self.tag_manifest_bytes_locked(bytes, &manifest, ref_name)
+    }
+
+    fn tag_manifest_bytes_locked(
+        &self,
+        bytes: &[u8],
+        manifest: &ImageManifest,
+        ref_name: &str,
+    ) -> Result<Descriptor> {
+        let (digest, size) = self.put_blob(bytes)?;
         let mut annotations = manifest.annotations.clone();
         annotations.insert(ANN_REF_NAME.into(), ref_name.to_string());
         let desc = Descriptor {
@@ -737,7 +697,7 @@ impl OciStore {
 
     pub fn read_manifest(&self, desc: &Descriptor) -> Result<ImageManifest> {
         let bytes = self.read_blob(&desc.digest)?;
-        serde_json::from_str(&String::from_utf8_lossy(&bytes))
+        serde_json::from_slice(&bytes)
             .map_err(|e| Error::Config(format!("corrupt manifest {}: {e}", desc.digest)))
     }
 
@@ -764,7 +724,7 @@ impl OciStore {
     }
 
     /// Return the verified bytes of a module artifact's `manifest.toml`
-    /// layer, or `None` if the artifact predates the metadata layer.
+    /// layer, or `None` if the artifact carries none.
     /// The symmetric partner of `module_fmod_blob`: wiring/port
     /// resolution needs the manifest a pinned module ships alongside its
     /// `.fmod`, so a store-only module resolves BOTH layers from the same
@@ -1121,144 +1081,6 @@ pub fn publish_device_artifact(
     }
 }
 
-/// Everything needed to publish a workload bundle into the store.
-pub struct BundlePublish<'a> {
-    pub workload_json: &'a str,
-    pub resources_json: &'a [u8],
-    pub graph_yaml: &'a [u8],
-    pub provenance: &'a str,
-    pub source_rev: Option<&'a str>,
-    pub ref_name: &'a str,
-}
-
-/// Publish a workload bundle. The manifest is validated first; every module
-/// digest an implementation pins must already be a blob in the store —
-/// publishing is where the offline-first closure is established, so a bundle
-/// referencing absent modules is rejected with the missing digests listed.
-pub fn publish_bundle(store: &OciStore, b: &BundlePublish<'_>) -> Result<Descriptor> {
-    // One critical section over blob writes + index update (see
-    // `tag_manifest_locked`).
-    let _index_lock = store.lock_index()?;
-    let manifest = crate::workload::parse_manifest(b.workload_json).map_err(Error::Config)?;
-    let report = crate::workload::validate(&manifest);
-    if !report.is_ok() {
-        return Err(Error::Config(format!(
-            "bundle '{}' failed validation: {}",
-            manifest.name,
-            report.errors.join("; ")
-        )));
-    }
-
-    // Verify the bundle artifacts against the digests the manifest pins for
-    // at least one implementation (each implementation may pin its own graph/
-    // resources; all pinned digests that match the provided bytes are fine —
-    // what matters is the provided bytes are pinned *somewhere*).
-    let resources_digest = sha256_hex_prefixed(b.resources_json);
-    let graph_digest = sha256_hex_prefixed(b.graph_yaml);
-    let pins_resources = manifest
-        .implementations
-        .iter()
-        .any(|i| i.resources.digest == resources_digest);
-    let pins_graph = manifest
-        .implementations
-        .iter()
-        .any(|i| i.graph.digest == graph_digest);
-    if !pins_resources {
-        return Err(Error::Config(format!(
-            "resources.json ({resources_digest}) is not pinned by any implementation"
-        )));
-    }
-    if !pins_graph {
-        return Err(Error::Config(format!(
-            "graph.yaml ({graph_digest}) is not pinned by any implementation"
-        )));
-    }
-
-    // Offline-first closure: every referenced module must already be present.
-    let mut missing: Vec<String> = Vec::new();
-    let mut module_layers: Vec<Descriptor> = Vec::new();
-    let mut seen: BTreeSet<String> = BTreeSet::new();
-    for imp in &manifest.implementations {
-        for mr in &imp.modules {
-            if !seen.insert(mr.digest.clone()) {
-                continue;
-            }
-            // Content verification, not a metadata existence check: the
-            // bundle pins these digests, so the bytes behind them must
-            // actually hash to them at publish time.
-            match store.read_blob(&mr.digest) {
-                Ok(bytes) => module_layers.push(Descriptor {
-                    media_type: MT_FLUXOR_MODULE.into(),
-                    digest: mr.digest.clone(),
-                    size: bytes.len() as u64,
-                    annotations: one_annotation(ANN_TITLE, &format!("{}.fmod", mr.name)),
-                }),
-                Err(e) => missing.push(format!("{} ({}): {e}", mr.name, mr.digest)),
-            }
-        }
-    }
-    if !missing.is_empty() {
-        return Err(Error::Config(format!(
-            "bundle '{}' references modules not in the store — publish them first \
-             (`fluxor modules publish`): {}",
-            manifest.name,
-            missing.join(", ")
-        )));
-    }
-
-    let (config_digest, config_size) = store.put_blob(EMPTY_CONFIG)?;
-    let (wl_digest, wl_size) = store.put_blob(b.workload_json.as_bytes())?;
-    let (res_digest, res_size) = store.put_blob(b.resources_json)?;
-    let (graph_blob_digest, graph_size) = store.put_blob(b.graph_yaml)?;
-
-    let mut layers = vec![
-        Descriptor {
-            media_type: MT_FLUXOR_WORKLOAD.into(),
-            digest: wl_digest,
-            size: wl_size,
-            annotations: one_annotation(ANN_TITLE, "workload.json"),
-        },
-        Descriptor {
-            media_type: MT_FLUXOR_RESOURCES.into(),
-            digest: res_digest,
-            size: res_size,
-            annotations: one_annotation(ANN_TITLE, "resources.json"),
-        },
-        Descriptor {
-            media_type: MT_FLUXOR_GRAPH.into(),
-            digest: graph_blob_digest,
-            size: graph_size,
-            annotations: one_annotation(ANN_TITLE, "graph.yaml"),
-        },
-    ];
-    layers.extend(module_layers);
-
-    let mut annotations = Annotations::new();
-    annotations.insert(ANN_KIND.into(), "bundle".into());
-
-    let oci_manifest = ImageManifest {
-        schema_version: 2,
-        media_type: MT_OCI_MANIFEST.into(),
-        artifact_type: Some(MT_FLUXOR_WORKLOAD.into()),
-        config: Descriptor {
-            media_type: MT_OCI_EMPTY.into(),
-            digest: config_digest,
-            size: config_size,
-            annotations: Annotations::new(),
-        },
-        layers,
-        annotations,
-    };
-    {
-        let desc = store.tag_manifest_locked(&oci_manifest, b.ref_name)?;
-        store.record_provenance(
-            &desc.digest,
-            &ProvenanceRow::new(b.provenance).with_rev(b.source_rev),
-        )?;
-        Ok(desc)
-    }
-}
-
 // ── Source / runtime artifacts + transactional batch publish ─────────
 //
 // The consolidated publish path: every
@@ -1284,6 +1106,9 @@ pub struct PublishPlan {
     pub new_descs: Vec<Descriptor>,
     /// Tags this publish repoints.
     pub repointed: BTreeSet<String>,
+    /// Tags this publish removes without replacing (modules deleted from
+    /// the source tree or withheld); only those the index holds.
+    pub retired: BTreeSet<String>,
     /// Descriptors the swap drops: manifests that were reachable by tag
     /// and will not be afterwards.
     pub displaced: Vec<Descriptor>,
@@ -1301,13 +1126,13 @@ pub struct DisplacedPin {
     /// say a publish displaces twice as much as it does.
     pub references: Vec<String>,
     pub old_digest: String,
+    /// The digest the tag moves to; empty when the publish retires it.
     pub new_digest: String,
     /// Identical layers AND identical input digest: the publish is doing
     /// nothing to this artifact but moving its name.
     pub content_unchanged: bool,
-    /// No workspace member pins the old digest. Under the old root set
-    /// that meant "about to be deleted"; it now means "held up by the
-    /// ledger alone", which is exactly the coupling worth naming.
+    /// No workspace member pins the old digest: it is held up by the
+    /// ledger alone, which is exactly the coupling worth naming.
     pub outside_members: bool,
     /// Workspace-member checkouts still pinning the old digest.
     pub members: Vec<String>,
@@ -1357,17 +1182,25 @@ pub fn render_displacement(report: &[DisplacedPin]) -> String {
         report.len()
     );
     for p in report {
-        s.push_str(&format!(
-            "    {:<26} {} → {}   content {}\n",
-            p.reference(),
-            short(&p.old_digest),
-            short(&p.new_digest),
-            if p.content_unchanged {
-                "UNCHANGED"
-            } else {
-                "changed"
-            }
-        ));
+        if p.new_digest.is_empty() {
+            s.push_str(&format!(
+                "    {:<26} {} retired\n",
+                p.reference(),
+                short(&p.old_digest)
+            ));
+        } else {
+            s.push_str(&format!(
+                "    {:<26} {} → {}   content {}\n",
+                p.reference(),
+                short(&p.old_digest),
+                short(&p.new_digest),
+                if p.content_unchanged {
+                    "UNCHANGED"
+                } else {
+                    "changed"
+                }
+            ));
+        }
         s.push_str(&format!("      pinned by  {}", p.holders().join(", ")));
         if p.outside_members {
             s.push_str("   ← no workspace member pins this");
@@ -1377,18 +1210,32 @@ pub fn render_displacement(report: &[DisplacedPin]) -> String {
     let unchanged = report.iter().filter(|p| p.content_unchanged).count();
     if unchanged > 0 {
         s.push_str(&format!(
-            "\n  {unchanged} of {} are re-stamps: identical layers, identical input-digest.\n",
+            "\n  {unchanged} of {} keep their content: identical layers, identical input-digest.\n",
             report.len()
         ));
     }
     s
 }
 
-/// A staged-but-uncommitted artifact: blobs are in the store, the
-/// manifest is built, no tag exists yet. Produced under the caller's
-/// batch lock by the `prepare_*` fns; committed by `commit_publish`.
+/// Everything a workload-bundle publish stages.
+pub struct BundleArtifact<'a> {
+    pub workload_json: &'a str,
+    pub resources_json: &'a [u8],
+    pub graph_yaml: &'a [u8],
+    /// `(module name, .fmod bytes)` for every module an implementation pins.
+    pub modules: &'a [(String, Vec<u8>)],
+    /// Canonical tag, `<name>:<version>` unless overridden.
+    pub ref_name: &'a str,
+}
+
+/// A prepared-but-uncommitted artifact: the manifest is built and its
+/// blobs are held in memory, hashed but not yet written; the store is
+/// untouched until `commit_publish` writes the blobs and swaps the tags.
+/// Produced under the caller's batch lock by the `prepare_*` fns.
 pub struct Prepared {
     pub manifest: ImageManifest,
+    /// The bytes behind every digest the manifest names.
+    staged: Vec<StagedBlob>,
     /// Canonical tag, e.g. `bcm2712/tls:0.0.1` or `fluxor/src/fluxor-abi:0.0.1`.
     pub ref_name: String,
     /// Moving tag repointed on every publish, e.g. `bcm2712/tls:latest`.
@@ -1396,6 +1243,24 @@ pub struct Prepared {
     /// How this publishing run produced it — filed beside the manifest
     /// by `commit_publish`, never inside it.
     pub provenance: ProvenanceRow,
+}
+
+/// One blob a prepared artifact will write at commit.
+struct StagedBlob {
+    bytes: Vec<u8>,
+    /// Runtime binaries are executed in place (`fexecve` of the blob), so
+    /// they carry the x bit.
+    executable: bool,
+}
+
+/// Hash `bytes` and hold them for the commit: `(digest, size)`.
+fn stage(staged: &mut Vec<StagedBlob>, bytes: &[u8], executable: bool) -> (String, u64) {
+    let digest = sha256_hex_prefixed(bytes);
+    staged.push(StagedBlob {
+        bytes: bytes.to_vec(),
+        executable,
+    });
+    (digest, bytes.len() as u64)
 }
 
 /// Common annotation payload every prepared artifact carries.
@@ -1461,8 +1326,9 @@ impl OciStore {
         manifest_toml: Option<&str>,
         meta: &ArtifactMeta<'_>,
     ) -> Result<Prepared> {
-        let (config_digest, config_size) = self.put_blob(EMPTY_CONFIG)?;
-        let (fmod_digest, fmod_size) = self.put_blob(fmod_bytes)?;
+        let mut staged = Vec::new();
+        let (config_digest, config_size) = stage(&mut staged, EMPTY_CONFIG, false);
+        let (fmod_digest, fmod_size) = stage(&mut staged, fmod_bytes, false);
         let mut layers = vec![Descriptor {
             media_type: MT_FLUXOR_MODULE.into(),
             digest: fmod_digest,
@@ -1470,7 +1336,7 @@ impl OciStore {
             annotations: one_annotation(ANN_TITLE, &format!("{name}.fmod")),
         }];
         if let Some(toml_text) = manifest_toml {
-            let (d, s) = self.put_blob(toml_text.as_bytes())?;
+            let (d, s) = stage(&mut staged, toml_text.as_bytes(), false);
             layers.push(Descriptor {
                 media_type: MT_FLUXOR_MODULE_META.into(),
                 digest: d,
@@ -1496,6 +1362,7 @@ impl OciStore {
         };
         Ok(Prepared {
             manifest,
+            staged,
             ref_name: format!("{target}/{name}:{version}"),
             latest_ref: format!("{target}/{name}:latest"),
             provenance: base_provenance(meta),
@@ -1512,8 +1379,9 @@ impl OciStore {
         meta: &ArtifactMeta<'_>,
     ) -> Result<Prepared> {
         let tar = canonical_tar(files)?;
-        let (config_digest, config_size) = self.put_blob(EMPTY_CONFIG)?;
-        let (tar_digest, tar_size) = self.put_blob(&tar)?;
+        let mut staged = Vec::new();
+        let (config_digest, config_size) = stage(&mut staged, EMPTY_CONFIG, false);
+        let (tar_digest, tar_size) = stage(&mut staged, &tar, false);
         let manifest = ImageManifest {
             schema_version: 2,
             media_type: MT_OCI_MANIFEST.into(),
@@ -1534,6 +1402,7 @@ impl OciStore {
         };
         Ok(Prepared {
             manifest,
+            staged,
             ref_name: format!("{}/src/{name}:{version}", meta.project),
             latest_ref: format!("{}/src/{name}:latest", meta.project),
             provenance: base_provenance(meta),
@@ -1558,19 +1427,9 @@ impl OciStore {
                 meta.project
             )));
         }
-        let (config_digest, config_size) = self.put_blob(EMPTY_CONFIG)?;
-        let (bin_digest, bin_size) = self.put_blob(binary)?;
-        // Runtime blobs are executed in place: the CLI launcher opens
-        // the blob and `fexecve`s the descriptor, and exec requires the
-        // x bit on the file itself. Idempotent on re-publish.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(
-                self.blob_path(&bin_digest)?,
-                fs::Permissions::from_mode(0o755),
-            )?;
-        }
+        let mut staged = Vec::new();
+        let (config_digest, config_size) = stage(&mut staged, EMPTY_CONFIG, false);
+        let (bin_digest, bin_size) = stage(&mut staged, binary, true);
         let mut annotations = base_annotations("runtime", meta);
         annotations.insert(ANN_RUNTIME_TRIPLE.into(), triple.into());
         let manifest = ImageManifest {
@@ -1593,8 +1452,167 @@ impl OciStore {
         };
         Ok(Prepared {
             manifest,
+            staged,
             ref_name: format!("fluxor/run/{name}-{triple}:{version}"),
             latest_ref: format!("fluxor/run/{name}-{triple}:latest"),
+            provenance: base_provenance(meta),
+        })
+    }
+
+    /// Stage a workload bundle: `workload.json`, `resources.json`,
+    /// `graph.yaml`, and one module layer per module the manifest pins.
+    ///
+    /// A bundle is self-contained: it carries the `.fmod` bytes it pins
+    /// rather than pointing at module artifacts that must be published
+    /// first, so pinning a bundle pins everything one run of it loads. Each
+    /// module's bytes must hash to the digest `workload.json` pins for it,
+    /// and the graph and resource profile must be bytes some implementation
+    /// pins; a bundle whose parts disagree with its own manifest is refused
+    /// rather than published. Bundle names carry no project namespace, so a
+    /// name another project already publishes a bundle under is refused,
+    /// naming both owners.
+    pub fn prepare_bundle(
+        &self,
+        b: &BundleArtifact<'_>,
+        meta: &ArtifactMeta<'_>,
+    ) -> Result<Prepared> {
+        let manifest = crate::workload::parse_manifest(b.workload_json).map_err(Error::Config)?;
+        let report = crate::workload::validate(&manifest);
+        if !report.is_ok() {
+            return Err(Error::Config(format!(
+                "bundle '{}' failed validation: {}",
+                manifest.name,
+                report.errors.join("; ")
+            )));
+        }
+        let resources_digest = sha256_hex_prefixed(b.resources_json);
+        let graph_digest = sha256_hex_prefixed(b.graph_yaml);
+        if !manifest
+            .implementations
+            .iter()
+            .any(|i| i.resources.digest == resources_digest)
+        {
+            return Err(Error::Config(format!(
+                "resources.json ({resources_digest}) is not pinned by any implementation"
+            )));
+        }
+        if !manifest
+            .implementations
+            .iter()
+            .any(|i| i.graph.digest == graph_digest)
+        {
+            return Err(Error::Config(format!(
+                "graph.yaml ({graph_digest}) is not pinned by any implementation"
+            )));
+        }
+
+        let body = b
+            .ref_name
+            .rsplit_once(':')
+            .map_or(b.ref_name, |(body, _)| body);
+        for d in &self.read_index()?.manifests {
+            let is_bundle = d.annotations.get(ANN_KIND).map(String::as_str) == Some("bundle");
+            let same_name = d
+                .annotations
+                .get(ANN_REF_NAME)
+                .and_then(|r| r.rsplit_once(':'))
+                .is_some_and(|(rb, _)| rb == body);
+            let owner = d.annotations.get(ANN_PROJECT).map(String::as_str);
+            if is_bundle && same_name && owner != Some(meta.project) {
+                return Err(Error::Config(format!(
+                    "bundle name '{body}' is already published by project '{}'; refusing to \
+                     publish it from '{}' (bundle names are ecosystem-unique)",
+                    owner.unwrap_or("<unannotated>"),
+                    meta.project
+                )));
+            }
+        }
+
+        let mut staged = Vec::new();
+        let mut module_layers: Vec<Descriptor> = Vec::new();
+        let mut problems: Vec<String> = Vec::new();
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        for imp in &manifest.implementations {
+            for mr in &imp.modules {
+                if !seen.insert(mr.digest.clone()) {
+                    continue;
+                }
+                let Some((_, bytes)) = b.modules.iter().find(|(name, _)| name == &mr.name) else {
+                    problems.push(format!(
+                        "module '{}' ({}) has no built .fmod",
+                        mr.name, mr.digest
+                    ));
+                    continue;
+                };
+                let actual = sha256_hex_prefixed(bytes);
+                if actual != mr.digest {
+                    problems.push(format!(
+                        "module '{}': the .fmod is {actual} but workload.json pins {} — \
+                         re-emit the bundle from the modules it should carry",
+                        mr.name, mr.digest
+                    ));
+                    continue;
+                }
+                let (digest, size) = stage(&mut staged, bytes, false);
+                module_layers.push(Descriptor {
+                    media_type: MT_FLUXOR_MODULE.into(),
+                    digest,
+                    size,
+                    annotations: one_annotation(ANN_TITLE, &format!("{}.fmod", mr.name)),
+                });
+            }
+        }
+        if !problems.is_empty() {
+            return Err(Error::Config(format!(
+                "bundle '{}': {}",
+                manifest.name,
+                problems.join("; ")
+            )));
+        }
+
+        let (config_digest, config_size) = stage(&mut staged, EMPTY_CONFIG, false);
+        let (wl_digest, wl_size) = stage(&mut staged, b.workload_json.as_bytes(), false);
+        let (res_digest, res_size) = stage(&mut staged, b.resources_json, false);
+        let (graph_blob_digest, graph_size) = stage(&mut staged, b.graph_yaml, false);
+        let mut layers = vec![
+            Descriptor {
+                media_type: MT_FLUXOR_WORKLOAD.into(),
+                digest: wl_digest,
+                size: wl_size,
+                annotations: one_annotation(ANN_TITLE, "workload.json"),
+            },
+            Descriptor {
+                media_type: MT_FLUXOR_RESOURCES.into(),
+                digest: res_digest,
+                size: res_size,
+                annotations: one_annotation(ANN_TITLE, "resources.json"),
+            },
+            Descriptor {
+                media_type: MT_FLUXOR_GRAPH.into(),
+                digest: graph_blob_digest,
+                size: graph_size,
+                annotations: one_annotation(ANN_TITLE, "graph.yaml"),
+            },
+        ];
+        layers.extend(module_layers);
+        let manifest = ImageManifest {
+            schema_version: 2,
+            media_type: MT_OCI_MANIFEST.into(),
+            artifact_type: Some(MT_FLUXOR_WORKLOAD.into()),
+            config: Descriptor {
+                media_type: MT_OCI_EMPTY.into(),
+                digest: config_digest,
+                size: config_size,
+                annotations: Annotations::new(),
+            },
+            layers,
+            annotations: base_annotations("bundle", meta),
+        };
+        Ok(Prepared {
+            manifest,
+            staged,
+            ref_name: b.ref_name.to_string(),
+            latest_ref: format!("{body}:latest"),
             provenance: base_provenance(meta),
         })
     }
@@ -1613,7 +1631,15 @@ impl OciStore {
         version: &str,
         prepared: &[Prepared],
         deps_annotation: Option<&str>,
+        retire: &[String],
     ) -> Result<PublishPlan> {
+        let retired: BTreeSet<String> = index
+            .manifests
+            .iter()
+            .filter_map(|d| d.annotations.get(ANN_REF_NAME))
+            .filter(|r| retire.contains(r))
+            .cloned()
+            .collect();
         let mut new_descs: Vec<Descriptor> = Vec::new();
         let mut repointed: BTreeSet<String> = BTreeSet::new();
         let mut manifest_blobs: Vec<(String, Vec<u8>)> = Vec::new();
@@ -1654,10 +1680,9 @@ impl OciStore {
                 .annotations
                 .get(ANN_REF_NAME)
                 .is_some_and(|r| r.starts_with(&format!("{project}/meta:")));
-            let displaced_ref = d
-                .annotations
-                .get(ANN_REF_NAME)
-                .is_some_and(|r| repointed.contains(r) || r.ends_with(":latest"));
+            let displaced_ref = d.annotations.get(ANN_REF_NAME).is_some_and(|r| {
+                repointed.contains(r) || retired.contains(r) || r.ends_with(":latest")
+            });
             if same_project && !is_meta && !displaced_ref {
                 children.push(d.clone());
             }
@@ -1697,7 +1722,7 @@ impl OciStore {
             .filter(|d| {
                 d.annotations
                     .get(ANN_REF_NAME)
-                    .is_some_and(|r| repointed.contains(r))
+                    .is_some_and(|r| repointed.contains(r) || retired.contains(r))
                     && !new_descs.iter().any(|n| n.digest == d.digest)
             })
             .cloned()
@@ -1706,6 +1731,7 @@ impl OciStore {
         Ok(PublishPlan {
             new_descs,
             repointed,
+            retired,
             displaced,
             manifest_blobs,
             index_blob: (idx_digest, idx_bytes),
@@ -1822,24 +1848,34 @@ impl OciStore {
         prepared: Vec<Prepared>,
         deps_annotation: Option<&str>,
     ) -> Result<Vec<Descriptor>> {
-        self.commit_publish_reported(_txn, project, version, prepared, deps_annotation, None)
+        let plan = self.plan_publish(
+            &self.read_index()?,
+            project,
+            version,
+            &prepared,
+            deps_annotation,
+            &[],
+        )?;
+        self.commit_plan(_txn, plan, prepared, None)
             .map(|(descs, _)| descs)
     }
 
-    /// `commit_publish` plus the displacement report. `publisher` is the
-    /// checkout doing the publishing — its own pins are not somebody
-    /// else's problem, so they are excluded from the report.
-    pub fn commit_publish_reported(
+    /// Commit `plan`, which [`plan_publish`](Self::plan_publish) made from
+    /// `prepared` against the index this transaction holds locked, plus
+    /// the displacement report. `publisher` is the checkout doing the
+    /// publishing — its own pins are not somebody else's problem, so they
+    /// are excluded from the report.
+    ///
+    /// Nothing is written before this call: the caller can plan, report
+    /// and refuse with the store exactly as it was.
+    pub fn commit_plan(
         &self,
         _txn: &PublishLock,
-        project: &str,
-        version: &str,
+        plan: PublishPlan,
         prepared: Vec<Prepared>,
-        deps_annotation: Option<&str>,
         publisher: Option<&Path>,
     ) -> Result<(Vec<Descriptor>, Vec<DisplacedPin>)> {
         let mut index = self.read_index()?;
-        let plan = self.plan_publish(&index, project, version, &prepared, deps_annotation)?;
 
         // Before any mutation, while the displaced manifests are still
         // readable: who else is holding what this publish is about to
@@ -1849,6 +1885,16 @@ impl OciStore {
             None => Vec::new(),
         };
 
+        for blob in prepared.iter().flat_map(|p| &p.staged) {
+            let (digest, _) = self.put_blob(&blob.bytes)?;
+            // Executed in place by the launcher, which needs the x bit on
+            // the file itself. Idempotent on re-publish.
+            #[cfg(unix)]
+            if blob.executable {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(self.blob_path(&digest)?, fs::Permissions::from_mode(0o755))?;
+            }
+        }
         for (_digest, bytes) in &plan.manifest_blobs {
             self.put_blob(bytes)?;
         }
@@ -1861,11 +1907,12 @@ impl OciStore {
             self.record_provenance(digest, &p.provenance)?;
         }
 
-        // The single swap: drop every repointed ref, append the batch.
+        // The single swap: drop every repointed and retired ref, append
+        // the batch.
         index.manifests.retain(|d| {
             d.annotations
                 .get(ANN_REF_NAME)
-                .is_none_or(|r| !plan.repointed.contains(r))
+                .is_none_or(|r| !plan.repointed.contains(r) && !plan.retired.contains(r))
         });
         index.manifests.extend(plan.new_descs.clone());
         self.write_index(&index)?;
@@ -2021,7 +2068,7 @@ impl OciStore {
     /// An unreadable ledger entry or member lockfile — or a pin whose
     /// blob is present but unreadable — fails CLOSED for the sweep only:
     /// warn and quarantine nothing; the publish that triggered the sweep
-    /// has already succeeded (registry_consolidation.md, GC rules).
+    /// has already succeeded.
     ///
     /// Nothing here deletes. Doomed blobs are MOVED to `quarantine/`,
     /// from which any read restores them; only `fluxor store gc` unlinks
@@ -2041,14 +2088,8 @@ impl OciStore {
             })?;
         }
         for digest in crate::store_pins::root_digests(&self.root)? {
-            // A pin written before the restamp names a manifest the
-            // store may no longer hold under that digest; its alias is
-            // just as live, and sweeping it would strand the pin for
-            // good.
-            for d in [digest.clone(), self.resolve_pin(&digest)] {
-                self.add_closure_by_digest(&d, &mut live, &mut tiers)
-                    .map_err(|e| Error::Config(format!("pinned blob {d} is unreadable ({e})")))?;
-            }
+            self.add_closure_by_digest(&digest, &mut live, &mut tiers)
+                .map_err(|e| Error::Config(format!("pinned blob {digest} is unreadable ({e})")))?;
         }
         let mut candidates: BTreeSet<String> = BTreeSet::new();
         for v in victims {
@@ -2079,7 +2120,7 @@ impl OciStore {
             // digest. Quarantined bytes come back automatically the next
             // time anything asks for them (`blob_path`), and are deleted
             // only by the explicit `fluxor store gc`.
-            if fs::rename(&p, quarantine.join(hex)).is_ok() {
+            if quarantine_move(&p, &quarantine.join(hex)) {
                 removed.push(digest.clone());
             }
         }
@@ -2087,15 +2128,22 @@ impl OciStore {
     }
 }
 
-/// What one `fluxor store restamp` did.
-#[derive(Debug, Default)]
-pub struct RestampReport {
-    /// `(old digest, new digest)` for every manifest or index rewritten.
-    pub moved: Vec<(String, String)>,
-    /// Manifests already carrying no provenance annotations.
-    pub already_clean: usize,
-    /// Provenance rows recovered from stripped annotations.
-    pub rows_filed: usize,
+/// Move a blob into quarantine and stamp the move as its modification time.
+/// Retention counts from when a blob was quarantined, and a rename keeps the
+/// time its bytes were first written, so an old blob quarantined today would
+/// otherwise expire on the next `gc`. A blob whose time cannot be stamped is
+/// moved back and left live.
+fn quarantine_move(from: &Path, to: &Path) -> bool {
+    if fs::rename(from, to).is_err() {
+        return false;
+    }
+    let stamped = fs::File::open(to)
+        .and_then(|f| f.set_modified(std::time::SystemTime::now()))
+        .is_ok();
+    if !stamped {
+        let _ = fs::rename(to, from);
+    }
+    stamped
 }
 
 /// What one `fluxor store gc` did.
@@ -2127,7 +2175,6 @@ impl OciStore {
         let mut damaged: Vec<String> = Vec::new();
         let mut stack: Vec<String> = index.manifests.iter().map(|d| d.digest.clone()).collect();
         for digest in crate::store_pins::root_digests(&self.root)? {
-            stack.push(self.resolve_pin(&digest));
             stack.push(digest);
         }
         while let Some(digest) = stack.pop() {
@@ -2203,7 +2250,7 @@ impl OciStore {
         }
         for digest in &doomed {
             let hex = Self::digest_hex(digest)?;
-            if fs::rename(blobs.join(hex), quarantine.join(hex)).is_ok() {
+            if quarantine_move(&blobs.join(hex), &quarantine.join(hex)) {
                 report.quarantined.push(digest.clone());
             }
         }
@@ -2241,183 +2288,6 @@ impl OciStore {
         }
         Ok(report)
     }
-
-    /// Move provenance out of every manifest in the store, once.
-    ///
-    /// This is the migration for [`ProvenanceRow`]: manifests published
-    /// before provenance moved to the side table carry annotations that
-    /// change on every publish, so they keep churning until they are
-    /// rewritten. Rewriting moves each digest exactly once and never
-    /// again.
-    ///
-    /// No lock is stranded by it. The old manifest blob stays in the
-    /// store — a few hundred bytes, and its layers are the same ones —
-    /// so a pin written beforehand keeps resolving directly; and if a
-    /// later `gc` does eventually collect it, `resolve_pin` follows the
-    /// alias recorded here to the rewritten manifest, which carries
-    /// identical layers, target, epoch and input digest.
-    pub fn restamp(&self) -> Result<RestampReport> {
-        let _lock = self.lock_index()?;
-        let mut report = RestampReport::default();
-        let mut index = self.read_index()?;
-        let mut map: BTreeMap<String, Descriptor> = BTreeMap::new();
-
-        // Manifests first, then the indexes that list them, so a
-        // rewritten index always points at rewritten children.
-        let mut order: Vec<Descriptor> = Vec::new();
-        let mut seen: BTreeSet<String> = BTreeSet::new();
-        let mut stack: Vec<Descriptor> = index.manifests.clone();
-        while let Some(d) = stack.pop() {
-            if !seen.insert(d.digest.clone()) {
-                continue;
-            }
-            if d.media_type == MT_OCI_INDEX {
-                if let Ok(bytes) = self.read_blob(&d.digest) {
-                    if let Ok(idx) = serde_json::from_slice::<ImageIndex>(&bytes) {
-                        stack.extend(idx.manifests);
-                    }
-                }
-            }
-            order.push(d);
-        }
-        // Leaves (manifests) before their referrers.
-        order.sort_by_key(|d| u8::from(d.media_type == MT_OCI_INDEX));
-
-        // One pass suffices for a manifest under an index, but an index
-        // listing another index — a snapshot over project indexes — can
-        // be visited before its child and would then be rewritten around
-        // a digest that moves afterwards. Iterate to a fixpoint rather
-        // than reason about the order: rewriting is idempotent, so a
-        // second visit either changes nothing or corrects a stale child.
-        // Bounded, because a cycle is impossible in a content-addressed
-        // graph but a bug that produced one must not hang a migration.
-        for _pass in 0..8 {
-            let before = map.len();
-            self.restamp_pass(&order, &mut map, &mut report)?;
-            if map.len() == before {
-                break;
-            }
-        }
-        report.moved.sort();
-        report.moved.dedup_by_key(|(old, _)| old.clone());
-
-        for d in &mut index.manifests {
-            let ref_name = d.annotations.get(ANN_REF_NAME).cloned();
-            if let Some(new) = map.get(&d.digest) {
-                d.digest = new.digest.clone();
-                d.size = new.size;
-            }
-            d.annotations = strip_provenance(&d.annotations);
-            if let Some(r) = ref_name {
-                d.annotations.insert(ANN_REF_NAME.into(), r);
-            }
-        }
-        self.write_index(&index)?;
-        Ok(report)
-    }
-
-    /// One rewriting pass over `order`, accumulating old → new in `map`.
-    fn restamp_pass(
-        &self,
-        order: &[Descriptor],
-        map: &mut BTreeMap<String, Descriptor>,
-        report: &mut RestampReport,
-    ) -> Result<()> {
-        for d in order {
-            // A manifest's rewrite depends only on its own bytes, so it
-            // is settled after one visit. Only an index can be made
-            // stale by a later pass, and only an index is revisited.
-            if d.media_type != MT_OCI_INDEX && map.contains_key(&d.digest) {
-                continue;
-            }
-            let Ok(bytes) = self.read_blob(&d.digest) else {
-                continue;
-            };
-            let rewritten = if d.media_type == MT_OCI_INDEX {
-                let Ok(idx) = serde_json::from_slice::<ImageIndex>(&bytes) else {
-                    continue;
-                };
-                let children: Vec<Descriptor> = idx
-                    .manifests
-                    .iter()
-                    .map(|c| match map.get(&c.digest) {
-                        Some(new) => Descriptor {
-                            media_type: c.media_type.clone(),
-                            digest: new.digest.clone(),
-                            size: new.size,
-                            annotations: strip_provenance(&c.annotations),
-                        },
-                        None => Descriptor {
-                            annotations: strip_provenance(&c.annotations),
-                            ..c.clone()
-                        },
-                    })
-                    .collect();
-                serde_json::to_vec(&ImageIndex {
-                    manifests: children,
-                    ..idx
-                })?
-            } else {
-                let Ok(m) = serde_json::from_slice::<ImageManifest>(&bytes) else {
-                    continue;
-                };
-                report.rows_filed += usize::from(self.file_legacy_provenance(&d.digest, &m)?);
-                serde_json::to_vec(&ImageManifest {
-                    annotations: strip_provenance(&m.annotations),
-                    ..m
-                })?
-            };
-            if rewritten == bytes {
-                report.already_clean += 1;
-                continue;
-            }
-            let (new_digest, new_size) = self.put_blob(&rewritten)?;
-            self.record_alias(&d.digest, &new_digest)?;
-            // Provenance already filed under the OLD digest is filed
-            // under the new one too, so `store ls` keeps answering after
-            // the rewrite.
-            for row in self.provenance_of(&d.digest) {
-                self.record_provenance(&new_digest, &row)?;
-            }
-            report.moved.push((d.digest.clone(), new_digest.clone()));
-            map.insert(
-                d.digest.clone(),
-                Descriptor {
-                    media_type: d.media_type.clone(),
-                    digest: new_digest,
-                    size: new_size,
-                    annotations: Annotations::new(),
-                },
-            );
-        }
-        Ok(())
-    }
-
-    /// File the provenance an old manifest was carrying as annotations.
-    /// Returns whether a row was filed.
-    fn file_legacy_provenance(&self, digest: &str, m: &ImageManifest) -> Result<bool> {
-        let Some(provenance) = m.annotations.get(ANN_PROVENANCE) else {
-            return Ok(false);
-        };
-        let row = ProvenanceRow::new(provenance)
-            .with_rev(m.annotations.get(ANN_SOURCE_REV).map(String::as_str))
-            .with_ci(m.annotations.get(ANN_CI_DIGEST).map(String::as_str));
-        self.record_provenance(digest, &row)?;
-        Ok(true)
-    }
-}
-
-/// Drop the three publishing-run annotations, keeping every annotation
-/// that describes the artifact itself.
-fn strip_provenance(a: &Annotations) -> Annotations {
-    a.iter()
-        .filter(|(k, _)| {
-            k.as_str() != ANN_PROVENANCE
-                && k.as_str() != ANN_SOURCE_REV
-                && k.as_str() != ANN_CI_DIGEST
-        })
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect()
 }
 
 /// Where a blob sits in the reference hierarchy, learned from the
@@ -2455,7 +2325,7 @@ fn record_tier(tiers: &mut BTreeMap<String, BlobTier>, digest: &str, tier: BlobT
 /// mode 0644, no directory entries, two zero blocks at the end.
 /// Property: identical file content ⇒ identical archive bytes ⇒
 /// identical layer digest — the store's identity for source-tree
-/// artifacts (standards/fluxor-modules.md; registry_consolidation.md).
+/// artifacts.
 /// No compression: gzip is nondeterministic across implementations and
 /// blobs are local.
 pub fn canonical_tar(files: &[(String, Vec<u8>)]) -> Result<Vec<u8>> {
@@ -2746,6 +2616,42 @@ mod tests {
         assert!(OciStore::open(&root).is_err());
     }
 
+    /// A digest is spelled in lowercase hex only: an uppercase spelling
+    /// would name a second file for the same bytes, and could never match
+    /// the digest the bytes hash to.
+    #[test]
+    fn digests_are_lowercase_hex_only() {
+        let (_d, store) = temp_store();
+        let (digest, _) = store.put_blob(b"bytes").unwrap();
+        assert!(store.blob_path(&digest).is_ok());
+        let upper = format!("sha256:{}", digest[7..].to_uppercase());
+        assert!(store.blob_path(&upper).is_err());
+        assert!(store.read_blob(&upper).is_err());
+        assert!(!store.has_blob(&upper));
+    }
+
+    /// An empty `$FLUXOR_STORE` is unset, not the relative path "".
+    #[test]
+    fn an_empty_store_variable_falls_through() {
+        let _env = test_env_lock();
+        let saved = (
+            std::env::var_os("FLUXOR_STORE"),
+            std::env::var_os("XDG_DATA_HOME"),
+        );
+        std::env::set_var("FLUXOR_STORE", "");
+        std::env::set_var("XDG_DATA_HOME", "/xdg");
+        let root = store_root();
+        match saved.0 {
+            Some(v) => std::env::set_var("FLUXOR_STORE", v),
+            None => std::env::remove_var("FLUXOR_STORE"),
+        }
+        match saved.1 {
+            Some(v) => std::env::set_var("XDG_DATA_HOME", v),
+            None => std::env::remove_var("XDG_DATA_HOME"),
+        }
+        assert_eq!(root.unwrap(), PathBuf::from("/xdg/fluxor/store"));
+    }
+
     #[test]
     fn blobs_are_content_addressed_and_deduped() {
         let (_dir, store) = temp_store();
@@ -2792,8 +2698,8 @@ mod tests {
         // re-publish from a later commit cannot move the digest every
         // downstream lockfile pins.
         assert!(
-            !manifest.annotations.contains_key(ANN_PROVENANCE)
-                && !manifest.annotations.contains_key(ANN_SOURCE_REV),
+            !manifest.annotations.contains_key("io.fluxor.provenance")
+                && !manifest.annotations.contains_key("io.fluxor.source-rev"),
             "manifest annotations must describe the artifact, not the publishing run: {:?}",
             manifest.annotations
         );
@@ -3086,10 +2992,17 @@ mod tests {
         );
     }
 
-    fn bundle_fixture(store: &OciStore) -> (String, Vec<u8>, Vec<u8>) {
+    struct BundleFixture {
+        workload: String,
+        resources: Vec<u8>,
+        graph: Vec<u8>,
+        modules: Vec<(String, Vec<u8>)>,
+    }
+
+    fn bundle_fixture() -> BundleFixture {
         let resources = br#"{"modules":1,"edges":0,"stateBytes":1024,"bufferBytes":0}"#.to_vec();
         let graph = b"modules: []\n".to_vec();
-        let (fmod_digest, _) = store.put_blob(b"router-fmod").unwrap();
+        let fmod = b"router-fmod".to_vec();
         let cfg = format!("sha256:{}", "ab".repeat(32));
         let workload = format!(
             r#"{{
@@ -3104,84 +3017,141 @@ mod tests {
   "implementations": [ {{
     "target": {{ "family": "linux", "architecture": "aarch64", "fluxorAbi": 1 }},
     "graph": {{ "digest": "{graph_d}" }},
-    "modules": [ {{ "name": "router", "digest": "{fmod_digest}" }} ],
+    "modules": [ {{ "name": "router", "digest": "{fmod_d}" }} ],
     "resources": {{ "digest": "{res_d}" }},
     "bindings": {{ "imports": {{}}, "exports": {{}}, "health": {{ "r": "m.r", "l": "m.l" }} }}
   }} ]
 }}"#,
             graph_d = sha256_hex_prefixed(&graph),
             res_d = sha256_hex_prefixed(&resources),
+            fmod_d = sha256_hex_prefixed(&fmod),
         );
-        (workload, resources, graph)
+        BundleFixture {
+            workload,
+            resources,
+            graph,
+            modules: vec![("router".to_string(), fmod)],
+        }
+    }
+
+    fn bundle_meta(project: &str) -> ArtifactMeta<'_> {
+        ArtifactMeta {
+            project,
+            provenance: PROVENANCE_PUBLISHED,
+            source_rev: None,
+            abi_surface_hex: "ee",
+            input_digest_hex: None,
+            ci_digest_hex: None,
+        }
+    }
+
+    fn prepare(store: &OciStore, f: &BundleFixture, project: &str) -> Result<Prepared> {
+        store.prepare_bundle(
+            &BundleArtifact {
+                workload_json: &f.workload,
+                resources_json: &f.resources,
+                graph_yaml: &f.graph,
+                modules: &f.modules,
+                ref_name: "demo:1.0.0",
+            },
+            &bundle_meta(project),
+        )
+    }
+
+    fn refusal(store: &OciStore, f: &BundleFixture, project: &str) -> String {
+        match prepare(store, f, project) {
+            Ok(_) => panic!("expected the bundle to be refused"),
+            Err(e) => e.to_string(),
+        }
     }
 
     #[test]
-    fn bundle_publish_roundtrip() {
+    fn bundle_publish_is_self_contained_and_joins_the_project_index() {
         let (_dir, store) = temp_store();
-        let (workload, resources, graph) = bundle_fixture(&store);
-        let desc = publish_bundle(
-            &store,
-            &BundlePublish {
-                workload_json: &workload,
-                resources_json: &resources,
-                graph_yaml: &graph,
-                provenance: PROVENANCE_PUBLISHED,
-                source_rev: None,
-                ref_name: "demo:1.0.0",
-            },
-        )
-        .expect("publish bundle");
+        let f = bundle_fixture();
+        let txn = store.begin_publish().unwrap();
+        let prepared = prepare(&store, &f, "proj").expect("prepare bundle");
+        store
+            .commit_publish(&txn, "proj", "0.1.0", vec![prepared], None)
+            .expect("commit bundle");
+        drop(txn);
+
+        let desc = store.resolve("demo:latest").unwrap();
         let m = store.read_manifest(&desc).unwrap();
         assert_eq!(m.artifact_type.as_deref(), Some(MT_FLUXOR_WORKLOAD));
-        // workload + resources + graph + 1 module layer
+        // workload + resources + graph + the module's own bytes
         assert_eq!(m.layers.len(), 4);
-        assert!(!m.annotations.contains_key(ANN_PROVENANCE));
+        assert_eq!(
+            store.read_blob(&m.layers[3].digest).unwrap(),
+            b"router-fmod".to_vec()
+        );
+        assert_eq!(
+            m.annotations.get(ANN_KIND).map(String::as_str),
+            Some("bundle")
+        );
+        assert_eq!(
+            m.annotations.get(ANN_PROJECT).map(String::as_str),
+            Some("proj")
+        );
+        assert_eq!(
+            m.annotations.get(ANN_ABI_SURFACE).map(String::as_str),
+            Some("ee")
+        );
+        assert!(!m.annotations.contains_key("io.fluxor.provenance"));
+        assert_eq!(store.resolve("demo:1.0.0").unwrap().digest, desc.digest);
+
+        let meta = store.resolve("proj/meta:latest").unwrap();
+        let idx: ImageIndex =
+            serde_json::from_slice(&store.read_blob(&meta.digest).unwrap()).unwrap();
+        assert!(
+            idx.manifests.iter().any(|c| c.digest == desc.digest),
+            "the bundle is a child of its project's index"
+        );
         let row = store
             .latest_provenance(&desc.digest)
             .expect("provenance row");
         assert_eq!(row.provenance, PROVENANCE_PUBLISHED);
-        assert_eq!(row.source_rev, None);
     }
 
     #[test]
-    fn bundle_publish_rejects_missing_module_blob() {
+    fn bundle_publish_refuses_module_bytes_that_are_not_the_pinned_ones() {
         let (_dir, store) = temp_store();
-        let (workload, resources, graph) = bundle_fixture(&store);
-        // Blow away the module blob the fixture staged.
-        let fmod_digest = sha256_hex_prefixed(b"router-fmod");
-        std::fs::remove_file(store.blob_path(&fmod_digest).unwrap()).unwrap();
-        let err = publish_bundle(
-            &store,
-            &BundlePublish {
-                workload_json: &workload,
-                resources_json: &resources,
-                graph_yaml: &graph,
-                provenance: PROVENANCE_LOCAL,
-                source_rev: None,
-                ref_name: "demo:1.0.0",
-            },
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("not in the store"), "{err}");
+        let mut f = bundle_fixture();
+        f.modules = vec![("router".to_string(), b"rebuilt-since".to_vec())];
+        let _txn = store.begin_publish().unwrap();
+        let err = refusal(&store, &f, "proj");
+        assert!(err.contains("workload.json pins"), "{err}");
+        f.modules.clear();
+        let err = refusal(&store, &f, "proj");
+        assert!(err.contains("has no built .fmod"), "{err}");
     }
 
     #[test]
     fn bundle_publish_rejects_unpinned_artifacts() {
         let (_dir, store) = temp_store();
-        let (workload, resources, _graph) = bundle_fixture(&store);
-        let err = publish_bundle(
-            &store,
-            &BundlePublish {
-                workload_json: &workload,
-                resources_json: &resources,
-                graph_yaml: b"tampered: true\n",
-                provenance: PROVENANCE_LOCAL,
-                source_rev: None,
-                ref_name: "demo:1.0.0",
-            },
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("not pinned"), "{err}");
+        let mut f = bundle_fixture();
+        f.graph = b"tampered: true\n".to_vec();
+        let _txn = store.begin_publish().unwrap();
+        let err = refusal(&store, &f, "proj");
+        assert!(err.contains("not pinned"), "{err}");
+    }
+
+    #[test]
+    fn a_bundle_name_belongs_to_one_project() {
+        let (_dir, store) = temp_store();
+        let f = bundle_fixture();
+        let txn = store.begin_publish().unwrap();
+        let prepared = prepare(&store, &f, "first").unwrap();
+        store
+            .commit_publish(&txn, "first", "0.1.0", vec![prepared], None)
+            .unwrap();
+        let err = refusal(&store, &f, "second");
+        assert!(
+            err.contains("already published by project 'first'") && err.contains("'second'"),
+            "{err}"
+        );
+        // The owner republishes freely.
+        assert!(prepare(&store, &f, "first").is_ok());
     }
 
     #[test]
@@ -3573,6 +3543,7 @@ mod tests {
                 "0.0.1",
                 std::slice::from_ref(&prepared),
                 None,
+                &[],
             )
             .unwrap();
         // The publisher is a third directory: the outsider's pin is
@@ -3626,76 +3597,6 @@ mod tests {
         assert_eq!(fx.store.read_blob(&layers[0].digest).unwrap(), b"v1-bytes");
     }
 
-    /// The migration: provenance leaves the manifest once, every moved
-    /// digest is aliased, and a lockfile written beforehand still
-    /// resolves — even after the old manifest is collected.
-    #[test]
-    fn restamp_moves_each_digest_once_and_strands_no_lock() {
-        let _env = test_env_lock();
-        let fx = pin_fixture();
-
-        // A manifest in the pre-restamp shape: provenance inside it.
-        let legacy = publish_module(
-            &fx.store,
-            &ModulePublish {
-                name: "tls",
-                target: "rp2350",
-                fmod_bytes: b"v1-bytes",
-                manifest_toml: None,
-                provenance: PROVENANCE_LOCAL,
-                source_rev: Some("dbec8a4b73e5"),
-                ref_name: "rp2350/tls:0.0.1",
-            },
-        )
-        .unwrap();
-        let mut manifest = fx.store.read_manifest(&legacy).unwrap();
-        manifest
-            .annotations
-            .insert(ANN_SOURCE_REV.into(), "dbec8a4b73e5".into());
-        manifest
-            .annotations
-            .insert(ANN_PROVENANCE.into(), PROVENANCE_LOCAL.into());
-        let (old_digest, _) = fx
-            .store
-            .put_blob(&serde_json::to_vec(&manifest).unwrap())
-            .unwrap();
-        let tagged = fx
-            .store
-            .tag_manifest(&manifest, "rp2350/tls:0.0.1")
-            .unwrap();
-        assert_eq!(tagged.digest, old_digest);
-        outsider_pins(&fx, &old_digest);
-
-        let report = fx.store.restamp().unwrap();
-        assert!(
-            !report.moved.is_empty(),
-            "the legacy manifest was rewritten"
-        );
-        let new_digest = fx.store.resolve("rp2350/tls:0.0.1").unwrap().digest;
-        assert_ne!(new_digest, old_digest);
-
-        let restamped = fx.store.read_blob(&new_digest).unwrap();
-        let restamped: ImageManifest = serde_json::from_slice(&restamped).unwrap();
-        assert!(!restamped.annotations.contains_key(ANN_SOURCE_REV));
-        assert_eq!(restamped.layers, manifest.layers, "content did not move");
-        assert_eq!(
-            fx.store
-                .latest_provenance(&new_digest)
-                .unwrap()
-                .source_rev
-                .as_deref(),
-            Some("dbec8a4b73e5"),
-            "the annotation it was carrying became a provenance row"
-        );
-
-        // The old manifest is still there, so the outsider's pin resolves
-        // directly. Remove it and the alias takes over — offline, with no
-        // re-pin, onto a manifest carrying identical layers.
-        assert_eq!(fx.store.resolve_pin(&old_digest), old_digest);
-        std::fs::remove_file(fx.store.blob_path(&old_digest).unwrap()).unwrap();
-        assert_eq!(fx.store.resolve_pin(&old_digest), new_digest);
-    }
-
     /// The whole-store collector: it reclaims what the displacement
     /// sweep never revisits, and it keeps everything any checkout pins.
     #[test]
@@ -3722,6 +3623,21 @@ mod tests {
         );
         assert!(fx.store.has_blob(&first.digest));
 
+        // Retention counts from the quarantine, not from when the bytes
+        // were written: an orphan written long ago survives its first gc.
+        let (old_orphan, _) = fx.store.put_blob(b"written long ago").unwrap();
+        let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(90 * 86_400);
+        std::fs::File::open(fx.store.blob_path(&old_orphan).unwrap())
+            .unwrap()
+            .set_modified(long_ago)
+            .unwrap();
+        let report = fx.store.gc(30, false).unwrap();
+        assert!(report.quarantined.contains(&old_orphan));
+        assert!(report.deleted.is_empty(), "{:?}", report.deleted);
+        assert!(fx.store.has_blob(&old_orphan), "still recoverable");
+        let report = fx.store.gc(30, false).unwrap();
+        assert!(!report.deleted.contains(&old_orphan));
+
         // Zero retention: quarantined bytes go for good. This is the only
         // verb in the store that deletes.
         let report = fx.store.gc(0, false).unwrap();
@@ -3738,7 +3654,7 @@ mod tests {
         let fx = pin_fixture();
         let first = publish_tls(&fx.store, "dbec8a4b73e5", b"v1-bytes");
         outsider_pins(&fx, &first.digest);
-        // Simulate the damage the old root set did.
+        // Lose the pinned manifest's bytes.
         std::fs::remove_file(fx.store.blob_path(&first.digest).unwrap()).unwrap();
 
         let report = crate::store_maint::fsck(&fx.store, false).unwrap();

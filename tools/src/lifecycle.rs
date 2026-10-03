@@ -311,6 +311,7 @@ fn step(cmd: &str) {
 /// cargo tree, build the modules. A crate-less project builds modules
 /// alone; a module-less project builds cargo alone.
 pub fn build(project_root: &Path, verbose: bool) -> Result<()> {
+    let _cli = ci::RunningCli::hold();
     let s = shape(project_root);
     let mut did_something = false;
 
@@ -363,6 +364,7 @@ pub fn build(project_root: &Path, verbose: bool) -> Result<()> {
 /// `fluxor ci`'s own project-e2e runner, so `make test` and the gate
 /// agree on what "the scripts passed" means.
 pub fn test(project_root: &Path, _verbose: bool) -> Result<()> {
+    let _cli = ci::RunningCli::hold();
     let s = shape(project_root);
     let mut did_something = false;
 
@@ -408,6 +410,7 @@ pub fn test(project_root: &Path, _verbose: bool) -> Result<()> {
 /// fmt and clippy phases stay in `fluxor ci`: they walk every PIC source
 /// per target and belong to the gate, not the edit loop.
 pub fn lint(project_root: &Path) -> Result<()> {
+    let _cli = ci::RunningCli::hold();
     let s = shape(project_root);
 
     if s.has_cargo {
@@ -450,6 +453,7 @@ pub fn lint(project_root: &Path) -> Result<()> {
 /// `fluxor clean` — module artefacts, cargo's target tree, and the
 /// generated module-test crates.
 pub fn clean(project_root: &Path) -> Result<()> {
+    let _cli = ci::RunningCli::hold();
     let s = shape(project_root);
 
     if s.has_modules {

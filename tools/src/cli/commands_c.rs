@@ -20,12 +20,17 @@ pub fn tie_to_parent(cmd: &mut std::process::Command) -> &mut std::process::Comm
     }
 }
 
-fn cmd_build(path: &Path, output: Option<&std::path::Path>, verbose: bool) -> Result<()> {
+fn cmd_build(
+    path: &Path,
+    output: Option<&std::path::Path>,
+    module_root: Option<&Path>,
+    verbose: bool,
+) -> Result<()> {
     // A workload source manifest — a `.toml` with a `[workload]` table —
     // emits the committed bundle + per-target blobs instead of a single
     // image. Any other `.toml` falls through.
     if workload_src::is_source_manifest(path) {
-        workload_src::emit_bundle(path, verbose)?;
+        workload_src::emit_bundle(path, module_root, verbose)?;
         return Ok(());
     }
     if path.is_dir() {
@@ -46,7 +51,7 @@ fn cmd_build(path: &Path, output: Option<&std::path::Path>, verbose: bool) -> Re
         let mut failed = 0;
 
         for yaml in &yamls {
-            match build_one(yaml, None, verbose) {
+            match build_one_from(yaml, None, module_root, verbose) {
                 Ok(_) => built += 1,
                 Err(e) => {
                     eprintln!("\x1b[1;33mWarn:\x1b[0m {} -- {}", yaml.display(), e);
@@ -61,7 +66,7 @@ fn cmd_build(path: &Path, output: Option<&std::path::Path>, verbose: bool) -> Re
         }
         Ok(())
     } else {
-        build_one(path, output, verbose)?;
+        build_one_from(path, output, module_root, verbose)?;
         Ok(())
     }
 }
@@ -220,6 +225,13 @@ struct RunFlags {
     /// `--ca <PEM>`: operator anchors for client-mode tls/quic instances.
     /// A linux graph or a bundle only.
     ca: Option<PathBuf>,
+    /// `--module-root <DIR>`: where the graph's `.fmod` modules are read
+    /// from. A graph or a source manifest's build; a built bundle loads
+    /// its own pinned modules and a scenario's components load different
+    /// silicons' modules.
+    module_root: Option<PathBuf>,
+    /// `--param` / `--params`: a service bundle's run-time values.
+    params: workload_src::RunParams,
     /// Program argv after `--`, forwarded to the graph's `cli_in`.
     args: Vec<String>,
 }
@@ -259,16 +271,29 @@ fn cmd_run_dispatch(config_path: Option<&PathBuf>, flags: RunFlags, verbose: boo
         Error::Config("fluxor run: missing <CONFIG> argument (omit only with --list)".into())
     })?;
 
-    // A workload bundle — source manifest, bundle root, or target
-    // subdir: resolve an implementation with the agent's own resolver
-    // and exec its built blobs.
-    if workload_src::is_bundle_path(config_path) {
+    // A workload bundle — source manifest, bundle root, target subdir, or
+    // the name of a bundle `fluxor.lock` pins: resolve an implementation
+    // with the agent's own resolver and run it.
+    let pinned = if config_path.exists() {
+        None
+    } else {
+        Some(workload_src::pinned_bundle(&config_path.to_string_lossy())?)
+    };
+    if let Some(bundle) = pinned.as_deref().or_else(|| {
+        workload_src::is_bundle_path(config_path).then_some(config_path.as_path())
+    }) {
         if flags.any_scenario_flag() {
             return Err(Error::Config(
                 "fluxor run <bundle>: scenario-only flags do not apply to a workload bundle".into(),
             ));
         }
-        return workload_src::run_bundle_with_ca(config_path, flags.ca.as_deref(), verbose);
+        return workload_src::run_bundle(bundle, &flags.params, flags.ca.as_deref(), verbose);
+    }
+    if !flags.params.is_empty() {
+        return Err(Error::Config(format!(
+            "fluxor run {}: --param/--params apply to a service bundle, and this is not one",
+            config_path.display()
+        )));
     }
 
     if flags.ca.is_some()
@@ -277,6 +302,17 @@ fn cmd_run_dispatch(config_path: Option<&PathBuf>, flags: RunFlags, verbose: boo
     {
         return Err(Error::Config(
             "fluxor run --ca applies to a graph or a bundle, not a scenario".into(),
+        ));
+    }
+
+    if flags.module_root.is_some()
+        && (scenario::is_scenario_file(config_path)
+            || scenario::synthesize_from_graph(config_path)?.is_some())
+    {
+        return Err(Error::Config(
+            "fluxor run --module-root applies to a graph, not a scenario: its components \
+             load different silicons' modules"
+                .into(),
         ));
     }
 
@@ -303,7 +339,13 @@ fn cmd_run_dispatch(config_path: Option<&PathBuf>, flags: RunFlags, verbose: boo
         )));
     }
 
-    cmd_run(config_path, flags.ca.as_deref(), &flags.args, verbose)
+    cmd_run(
+        config_path,
+        flags.ca.as_deref(),
+        flags.module_root.as_deref(),
+        &flags.args,
+        verbose,
+    )
 }
 
 /// Scenario flow for an in-memory `Scenario` synthesised from a graph
@@ -776,7 +818,7 @@ fn spawn_and_wait_one(
         DurationOutcome::NaturalExit(s) => s,
         // Duration expired → component ran for as long as the
         // scenario asked. Treat as success regardless of the signal
-        // we used to wind it down.
+        // that wound it down.
         DurationOutcome::DurationExpired => synthetic_success_exit_status(),
     })
 }
@@ -1049,6 +1091,7 @@ mod scenario_readiness_probe {
 fn cmd_run(
     config_path: &PathBuf,
     ca: Option<&Path>,
+    module_root: Option<&Path>,
     app_args: &[String],
     verbose: bool,
 ) -> Result<()> {
@@ -1060,7 +1103,7 @@ fn cmd_run(
     fluxor_tools::store_sync::ensure_synced(&crate::project::root_for_config(config_path))
         .map_err(|e| Error::Config(e.to_string()))?;
 
-    let result = build_one(config_path, None, verbose)?;
+    let result = build_one_from(config_path, None, module_root, verbose)?;
 
     if ca.is_some() && result.family != "linux" {
         return Err(Error::Config(
@@ -1145,7 +1188,11 @@ fn cmd_run(
                 let modules_blob = out_dir.join("modules.bin");
 
                 let (config, target_desc) = load_config_with_defaults(config_path, verbose)?;
-                let modules_dir = crate::modules_build::modules_dir_for(&target_desc);
+                let modules_dir = target_module_root(
+                    module_root,
+                    &crate::project::root_for_config(config_path),
+                    &target_desc,
+                )?;
                 if !modules_dir.exists() {
                     return Err(Error::Config(format!(
                         "Modules not found at {}. Run 'fluxor modules build --target {}' first.",
@@ -1269,8 +1316,8 @@ fn cmd_run(
     Ok(())
 }
 
-fn cmd_flash(config_path: &Path, verbose: bool) -> Result<()> {
-    let result = build_one(config_path, None, verbose)?;
+fn cmd_flash(config_path: &Path, module_root: Option<&Path>, verbose: bool) -> Result<()> {
+    let result = build_one_from(config_path, None, module_root, verbose)?;
 
     match result.family.as_str() {
         "rp2" => {
@@ -1710,8 +1757,7 @@ fn resolve_project_root(override_arg: Option<&Path>) -> PathBuf {
 
 /// `fluxor lint observability` — check the instrumentation contract across
 /// every module manifest. Reports the gap list (data-moving modules with no
-/// `[observability]`); fails only on malformed instrument names
-/// (standards/observability.md §6, §9).
+/// `[observability]`); fails only on malformed instrument names.
 fn cmd_lint_observability(
     project_root_override: Option<&Path>,
     json: bool,
@@ -1759,8 +1805,7 @@ fn cmd_lint_observability(
     for (m, k) in &report.invalid_attr_keys {
         eprintln!(
             "\x1b[1;31mobservability\x1b[0m {m}: dimension key {k:?} is neither an \
-             OTel semantic-convention key from standards/observability.md §5 nor \
-             `fluxor.*`"
+             OTel semantic-convention key nor `fluxor.*`"
         );
     }
     for m in &report.uninstrumented {
@@ -1976,7 +2021,7 @@ fn cmd_modules_list(project_root: Option<&Path>, json: bool) -> Result<()> {
             s.hardware_targets.join(",")
         };
         // A `builtin = true` module is compiled into the kernel and
-        // has no entry file to name (standards/fluxor-modules.md §0.1).
+        // has no entry file to name.
         let entry = if s.builtin {
             "<builtin>".to_string()
         } else {
@@ -1992,14 +2037,14 @@ fn cmd_modules_list(project_root: Option<&Path>, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_modules_resolve(target: &str, out: &Path) -> Result<()> {
+fn cmd_modules_resolve(target: &str, out: &Path, module_root: Option<&Path>) -> Result<()> {
     let project_root = crate::project::root();
     let out_root = if out.is_absolute() {
         out.to_path_buf()
     } else {
         project_root.join(out)
     };
-    let path = modules_build::resolve(&project_root, &out_root, target);
+    let path = modules_build::module_root(module_root, &project_root, &out_root, target)?;
     println!("{}", path.display());
     Ok(())
 }
@@ -2014,7 +2059,7 @@ fn cmd_ci(skip: &[String], project_root: Option<&Path>, verbose: bool) -> Result
         std::process::exit(1);
     }
     // Green FULL run: stamp the input digests it covered so `publish`
-    // can annotate `io.fluxor.ci-digest` on matching artifacts —
+    // can record the ci digest in the provenance table for matching artifacts —
     // information for `inspect`/promotion, never a gate. A run with
     // any `--skip` flag proved less than the full gate, so it must
     // not stamp (the ci-digest would claim coverage it doesn't have).
@@ -2066,7 +2111,7 @@ struct BuildFlags {
     emit: Option<String>,
     check: bool,
     firmware: Option<PathBuf>,
-    modules_dir: Vec<PathBuf>,
+    module_root: Option<PathBuf>,
     target: Option<String>,
     epoch: u64,
 }
@@ -2080,7 +2125,7 @@ fn cmd_build_dispatch(path: Option<&PathBuf>, flags: BuildFlags, verbose: bool) 
             || flags.emit.is_some()
             || flags.output.is_some()
             || flags.firmware.is_some()
-            || !flags.modules_dir.is_empty()
+            || flags.module_root.is_some()
             || flags.target.is_some()
         {
             return Err(Error::Config(
@@ -2100,7 +2145,7 @@ fn cmd_build_dispatch(path: Option<&PathBuf>, flags: BuildFlags, verbose: bool) 
                 "--check validates without building; drop --emit".into(),
             ));
         }
-        return cmd_validate(path, flags.target.as_deref());
+        return cmd_validate(path, flags.target.as_deref(), flags.module_root.as_deref());
     }
     let require_output = |what: &str| {
         flags
@@ -2109,17 +2154,22 @@ fn cmd_build_dispatch(path: Option<&PathBuf>, flags: BuildFlags, verbose: bool) 
             .ok_or_else(|| Error::Config(format!("--emit={what} requires --output <FILE>")))
     };
     match flags.emit.as_deref() {
-        None => cmd_build(path, flags.output.as_deref(), verbose),
+        None => cmd_build(
+            path,
+            flags.output.as_deref(),
+            flags.module_root.as_deref(),
+            verbose,
+        ),
         Some("uf2") => cmd_generate(
             path,
             flags.output.as_deref(),
-            flags.modules_dir.first().map(PathBuf::as_path),
+            flags.module_root.as_deref(),
             false,
         ),
         Some("bin") => cmd_generate(
             path,
             flags.output.as_deref(),
-            flags.modules_dir.first().map(PathBuf::as_path),
+            flags.module_root.as_deref(),
             true,
         ),
         Some("combined") => {
@@ -2128,7 +2178,7 @@ fn cmd_build_dispatch(path: Option<&PathBuf>, flags: BuildFlags, verbose: bool) 
                 .as_ref()
                 .ok_or_else(|| Error::Config("--emit=combined requires --firmware <UF2>".into()))?;
             let output = require_output("combined")?;
-            cmd_combine(firmware, path, &output, verbose)
+            cmd_combine(firmware, path, &output, flags.module_root.as_deref(), verbose)
         }
         Some("image") => {
             let output = require_output("image")?;
@@ -2137,13 +2187,13 @@ fn cmd_build_dispatch(path: Option<&PathBuf>, flags: BuildFlags, verbose: bool) 
                 &output,
                 flags.target.as_deref(),
                 flags.epoch,
-                flags.modules_dir.first().map(PathBuf::as_path),
+                flags.module_root.as_deref(),
                 verbose,
             )
         }
         Some("table") => {
             let output = require_output("table")?;
-            cmd_mktable_config(path, &flags.modules_dir, &output)
+            cmd_mktable_config(path, flags.module_root.as_deref(), &output)
         }
         Some(other) => Err(Error::Config(format!(
             "unknown --emit form '{other}' (expected uf2|bin|combined|image|table)"

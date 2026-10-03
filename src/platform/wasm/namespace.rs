@@ -38,7 +38,7 @@
 //!
 //!   - `host_ns_stat` — write a `STAT` record for an exact key.
 //!   - `host_ns_list` — write a `LIST` page (entries + trailing cursor
-//!     record) for a prefix + integer page cursor.
+//!     record) for a prefix and a name cursor.
 //!
 //! ## Synchronous answers, boot-ordered hydration
 //!
@@ -61,7 +61,9 @@ use crate::kernel::ipc::fd::{slot_of, tag_fd, FD_TAG_STORAGE_NAMESPACE};
 use crate::kernel::sys::errno;
 
 const MAX_OPEN: usize = 16;
-const MAX_PATH_LEN: usize = 256;
+/// Longest `LOOKUP` path: every path in this index is a whole key of the
+/// object tier, which `PUT` bounds by `STORAGE_KEY_MAX`.
+const MAX_PATH_LEN: usize = crate::abi::contracts::storage::handle::STORAGE_KEY_MAX;
 
 struct NsSlot {
     in_use: bool,
@@ -85,17 +87,18 @@ extern "C" {
     /// (`-2 ENOENT` when the key names neither an object nor a prefix).
     fn host_ns_stat(key_ptr: *const u8, key_len: usize, out_ptr: *mut u8, out_cap: usize) -> i32;
 
-    /// Write one `LIST` page for `prefix_ptr[..prefix_len]` starting at
-    /// page `cursor_idx` (0 = first page) into `out_ptr[..out_cap]`. The
-    /// host renders the full contract page: zero or more
-    /// `[name_len:u8][kind:u8][name]` entries followed by a trailing
-    /// `[0xFF][0xFF][cursor_len:u8][cursor]` record — a 4-byte LE next-index
-    /// cursor when more pages remain, or `cursor_len = 0` at end of
-    /// listing. Returns bytes written, or a negative errno.
+    /// Write one `LIST` page for `prefix_ptr[..prefix_len]`, resuming strictly
+    /// after the name `cursor_ptr[..cursor_len]` (empty = first page), into
+    /// `out_ptr[..out_cap]`. The host renders the full contract page: zero or
+    /// more `[name_len:u8][kind:u8][name]` entries followed by a trailing
+    /// `[0xFF][0xFF][cursor_len:u8][cursor]` record whose cursor is the last
+    /// name written when more remain, or empty at end of listing. Returns
+    /// bytes written, or a negative errno.
     fn host_ns_list(
         prefix_ptr: *const u8,
         prefix_len: usize,
-        cursor_idx: u32,
+        cursor_ptr: *const u8,
+        cursor_len: usize,
         out_ptr: *mut u8,
         out_cap: usize,
     ) -> i32;
@@ -138,18 +141,11 @@ unsafe fn wasm_ns_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usiz
         dev_ns::STAT => ns_stat(raw, arg, arg_len),
         dev_ns::LIST => ns_list(arg, arg_len),
         dev_ns::CLOSE => ns_close(raw),
-        // Read-only enumeration surface: no mutation or change ops, so
-        // every optional-cap bit is honestly zero (namespace.rs::caps).
-        dev_ns::CAPS => 0,
+        // Read-only enumeration surface: no mutation or change ops. LIST is
+        // directory-shaped (namespace.rs::caps).
+        dev_ns::CAPS => dev_ns::caps::CHILD_NAMES as i32,
         _ => errno::ENOSYS,
     }
-}
-
-/// Read a little-endian `u64` from `ptr[off..off+8]`.
-unsafe fn read_u64(ptr: *const u8, off: usize) -> u64 {
-    let mut b = [0u8; 8];
-    core::ptr::copy_nonoverlapping(ptr.add(off), b.as_mut_ptr(), 8);
-    u64::from_le_bytes(b)
 }
 
 /// `LOOKUP` — `arg` is the UTF-8 path; bind a handle to it. Resolution
@@ -189,74 +185,38 @@ unsafe fn ns_stat(raw: i32, out_ptr: *mut u8, out_cap: usize) -> i32 {
 }
 
 /// `LIST` — parse the request, render one page through the host index,
-/// and write a `Volatile` fence. `arg` layout (mirrors
-/// `namespace.rs::LIST`):
-///
-/// ```text
-///   [prefix_len:u16][prefix][cursor_len:u16][cursor]
-///   [out_buf:u64][out_cap:u32][fence_out_ptr:u64][fence_out_cap:u16]
-/// ```
+/// and write a `Volatile` fence. `arg` is the `namespace::LIST` request; the
+/// cursor is the last name the previous page returned, and the host renders
+/// the page in the contract's wire format.
 unsafe fn ns_list(arg: *mut u8, arg_len: usize) -> i32 {
-    if arg.is_null() || arg_len < 2 {
+    if arg.is_null() {
         return errno::EINVAL;
     }
-    let prefix_len = {
-        let mut b = [0u8; 2];
-        core::ptr::copy_nonoverlapping(arg, b.as_mut_ptr(), 2);
-        u16::from_le_bytes(b) as usize
+    let Some(req) = dev_ns::list::parse_request(core::slice::from_raw_parts(arg, arg_len)) else {
+        return errno::EINVAL;
     };
-    let mut p = 2;
-    if arg_len < p + prefix_len + 2 {
+    // Names are UTF-8 and, directory-shaped, never hold a `/`: a prefix or
+    // cursor that breaks either was not issued here.
+    let cursor_ok = matches!(core::str::from_utf8(req.cursor), Ok(c) if !c.contains('/'));
+    if core::str::from_utf8(req.prefix).is_err() || !cursor_ok {
         return errno::EINVAL;
     }
-    let prefix_ptr = arg.add(p);
-    p += prefix_len;
-    let cursor_len = {
-        let mut b = [0u8; 2];
-        core::ptr::copy_nonoverlapping(arg.add(p), b.as_mut_ptr(), 2);
-        u16::from_le_bytes(b) as usize
-    };
-    p += 2;
-    if arg_len < p + cursor_len + 8 + 4 + 8 + 2 {
-        return errno::EINVAL;
-    }
-    // Cursor is an opaque ≤32-byte blob to the consumer; we encode it as
-    // a 4-byte LE page index. Read up to 4 bytes (zero-padded).
-    let mut cidx_bytes = [0u8; 4];
-    let take = cursor_len.min(4);
-    if take > 0 {
-        core::ptr::copy_nonoverlapping(arg.add(p), cidx_bytes.as_mut_ptr(), take);
-    }
-    let cursor_idx = u32::from_le_bytes(cidx_bytes);
-    p += cursor_len;
-
-    let out_ptr = read_u64(arg, p) as usize as *mut u8;
-    p += 8;
-    let out_cap = {
-        let mut b = [0u8; 4];
-        core::ptr::copy_nonoverlapping(arg.add(p), b.as_mut_ptr(), 4);
-        u32::from_le_bytes(b) as usize
-    };
-    p += 4;
-    let fence_out_ptr = read_u64(arg, p) as usize as *mut u8;
-    p += 8;
-    let fence_out_cap = {
-        let mut b = [0u8; 2];
-        core::ptr::copy_nonoverlapping(arg.add(p), b.as_mut_ptr(), 2);
-        u16::from_le_bytes(b) as usize
-    };
-
-    if out_ptr.is_null() {
-        return errno::EINVAL;
-    }
-    let written = host_ns_list(prefix_ptr, prefix_len, cursor_idx, out_ptr, out_cap);
+    let written = host_ns_list(
+        req.prefix.as_ptr(),
+        req.prefix.len(),
+        req.cursor.as_ptr(),
+        req.cursor.len(),
+        req.out_ptr as usize as *mut u8,
+        req.out_cap as usize,
+    );
     if written < 0 {
         return written;
     }
-    if !fence_out_ptr.is_null() && fence_out_cap >= dev_fence::WIRE_MAX_LEN {
-        let fbuf = core::slice::from_raw_parts_mut(fence_out_ptr, fence_out_cap);
-        let _ = dev_fence::Fence::Volatile.encode(fbuf);
-    }
+    let fbuf = core::slice::from_raw_parts_mut(
+        req.fence_out_ptr as usize as *mut u8,
+        req.fence_out_cap as usize,
+    );
+    let _ = dev_fence::Fence::Volatile.encode(fbuf);
     written
 }
 

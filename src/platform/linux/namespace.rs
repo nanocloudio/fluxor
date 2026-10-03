@@ -23,8 +23,9 @@
 //
 // `LIST`/`STAT` answer synchronously from the filesystem — a consumer treats
 // a negative/empty `LIST` as "end of listing" and does not retry (no EAGAIN).
-// Results are name-sorted so the integer-cursor paging is deterministic. The
-// per-handle fence is advertised `Volatile` (a live, mutable host fs).
+// Results are name-sorted and paged by name: the cursor is the last name a
+// page returned. The per-handle fence is advertised `Volatile` (a live,
+// mutable host fs).
 
 // This file is `include!`'d into `src/platform/linux.rs`, sharing its flat
 // namespace — so `fs`, `Path`, and `tag_fd` are already in scope from there;
@@ -36,7 +37,7 @@ use fluxor::kernel::sys::errno;
 use std::time::UNIX_EPOCH;
 
 const NS_MAX_OPEN: usize = 16;
-const NS_MAX_PATH: usize = 1024;
+const NS_MAX_PATH: usize = dev_ns::PATH_MAX;
 
 struct LinuxNsSlot {
     in_use: bool,
@@ -73,83 +74,46 @@ fn ns_fs_path(key: &str) -> &str {
     }
 }
 
-/// `LIST` — render one page of `prefix`'s immediate children into the
-/// caller's output buffer. `arg` layout mirrors `namespace.rs::LIST`:
-///
-/// ```text
-///   [prefix_len:u16][prefix][cursor_len:u16][cursor]
-///   [out_buf:u64][out_cap:u32][fence_out_ptr:u64][fence_out_cap:u16]
-/// ```
-///
-/// Each entry is `[name_len:u8][kind:u8][name]`; the page ends with a
-/// `[0xFF][0xFF][cursor_len:u8][cursor]` record (a 4-byte LE next-index cursor
-/// when more pages remain, `cursor_len = 0` at end of listing). The second
-/// `0xFF` sits where an entry carries its `kind`, which is what keeps a
-/// 255-byte name from reading as the end of the page.
+/// `LIST` — render one page of `prefix`'s immediate children, in ascending
+/// name order, into the caller's output buffer. `arg` is the
+/// `namespace::LIST` request and the page is written by
+/// `namespace::list::PageWriter`. The cursor is the last name a page
+/// returned and the next page resumes strictly after it, so a file created or
+/// removed between pages never shifts the entries behind the cursor. A child
+/// whose name is not UTF-8 is not expressible in the contract and is not
+/// listed.
 unsafe fn ns_list(arg: *mut u8, arg_len: usize) -> i32 {
-    if arg.is_null() || arg_len < 2 {
+    if arg.is_null() {
         return errno::EINVAL;
     }
-    let read_u16 = |off: usize| -> usize {
-        let mut b = [0u8; 2];
-        core::ptr::copy_nonoverlapping(arg.add(off), b.as_mut_ptr(), 2);
-        u16::from_le_bytes(b) as usize
+    let Some(req) = dev_ns::list::parse_request(core::slice::from_raw_parts(arg, arg_len)) else {
+        return errno::EINVAL;
     };
-    let prefix_len = read_u16(0);
-    let mut p = 2;
-    if arg_len < p + prefix_len + 2 {
+    let Ok(prefix) = core::str::from_utf8(req.prefix) else {
         return errno::EINVAL;
-    }
-    let prefix = {
-        let s = core::slice::from_raw_parts(arg.add(p), prefix_len);
-        core::str::from_utf8(s).unwrap_or("").to_string()
     };
-    p += prefix_len;
-    let cursor_len = read_u16(p);
-    p += 2;
-    if arg_len < p + cursor_len + 8 + 4 + 8 + 2 {
-        return errno::EINVAL;
-    }
-    // Cursor is an opaque ≤32-byte blob to the consumer; we encode it as a
-    // 4-byte LE page index (the start entry).
-    let mut cidx = [0u8; 4];
-    let take = cursor_len.min(4);
-    if take > 0 {
-        core::ptr::copy_nonoverlapping(arg.add(p), cidx.as_mut_ptr(), take);
-    }
-    let start = u32::from_le_bytes(cidx) as usize;
-    p += cursor_len;
+    // Directory-shaped: the cursor is a child name, so one that is not UTF-8
+    // or that holds a `/` was not issued here.
+    let after = if req.cursor.is_empty() {
+        None
+    } else {
+        match core::str::from_utf8(req.cursor) {
+            Ok(c) if !c.contains('/') => Some(c),
+            _ => return errno::EINVAL,
+        }
+    };
 
-    let read_u64 = |off: usize| -> u64 {
-        let mut b = [0u8; 8];
-        core::ptr::copy_nonoverlapping(arg.add(off), b.as_mut_ptr(), 8);
-        u64::from_le_bytes(b)
-    };
-    let out_ptr = read_u64(p) as usize as *mut u8;
-    p += 8;
-    let out_cap = {
-        let mut b = [0u8; 4];
-        core::ptr::copy_nonoverlapping(arg.add(p), b.as_mut_ptr(), 4);
-        u32::from_le_bytes(b) as usize
-    };
-    p += 4;
-    let fence_out_ptr = read_u64(p) as usize as *mut u8;
-    p += 8;
-    let fence_out_cap = read_u16(p);
-
-    if out_ptr.is_null() || out_cap < dev_ns::TRAILER_HEADER_LEN {
-        return errno::EINVAL;
-    }
-
-    // Name-sorted immediate children (stable order for deterministic paging).
-    // Classify dir-ness via `fs::metadata` (which FOLLOWS symlinks), matching
-    // STAT — a symlinked album dir must enumerate as a namespace, not a leaf.
-    let base = ns_fs_path(&prefix);
+    // Name-sorted immediate children. Classify dir-ness via `fs::metadata`
+    // (which FOLLOWS symlinks), matching STAT — a symlinked album dir must
+    // enumerate as a namespace, not a leaf.
+    let base = ns_fs_path(prefix);
     let mut names: Vec<(String, bool)> = Vec::new(); // (name, is_dir)
     if let Ok(rd) = fs::read_dir(base) {
         for ent in rd.flatten() {
-            let name = ent.file_name().to_string_lossy().to_string();
-            if name.is_empty() {
+            let Ok(name) = ent.file_name().into_string() else {
+                continue;
+            };
+            if name.is_empty() || after.is_some_and(|a| name.as_str() <= a) {
                 continue;
             }
             let child = Path::new(base).join(&name);
@@ -164,66 +128,40 @@ unsafe fn ns_list(arg: *mut u8, arg_len: usize) -> i32 {
     }
     names.sort_by(|a, b| a.0.cmp(&b.0));
 
-    let out = core::slice::from_raw_parts_mut(out_ptr, out_cap);
-    let mut w = 0usize;
-    let mut idx = start;
-    while idx < names.len() {
-        let (name, is_dir) = &names[idx];
-        let nb = name.as_bytes();
-        if nb.len() > dev_ns::MAX_ENTRY_NAME_LEN {
-            // `name_len` is a byte and this name does not fit in one.
-            // Refusing is the contract's answer: skipping it returns a
-            // short page the caller has no way to know is short.
+    let out = core::slice::from_raw_parts_mut(req.out_ptr as *mut u8, req.out_cap as usize);
+    let mut page = dev_ns::list::PageWriter::new(out);
+    let mut last: Option<&str> = None;
+    let mut more = false;
+    for (name, is_dir) in &names {
+        if name.len() > fluxor::abi::contracts::storage::handle::STORAGE_KEY_MAX {
+            // Refusing is the contract's answer: skipping it returns a short
+            // page the caller has no way to know is short.
             return errno::EOVERFLOW;
         }
-        let need = 2 + nb.len();
-        // Leave room for the trailing end/cursor record.
-        if w + need + dev_ns::TRAILER_MAX_LEN > out_cap {
-            break;
-        }
-        out[w] = nb.len() as u8;
-        out[w + 1] = if *is_dir {
+        let kind = if *is_dir {
             dev_ns::KIND_NAMESPACE
         } else {
             dev_ns::KIND_OBJECT
         };
-        out[w + 2..w + 2 + nb.len()].copy_from_slice(nb);
-        w += need;
-        idx += 1;
+        if !page.push(name.as_bytes(), kind) {
+            more = true;
+            break;
+        }
+        last = Some(name);
     }
-    // Trailing cursor record. Two marker bytes: the second sits in an
-    // entry's `kind` position, where 0xFF is not a legal value, so a
-    // 255-byte name cannot be mistaken for the end of the page.
-    //
-    // The record is mandatory — a caller reads it to learn whether more
-    // pages follow — so a buffer with no room for it gets a refusal
-    // rather than a positive count over bytes that never received one.
-    let more = idx < names.len();
-    let trailer_len = if more {
-        dev_ns::TRAILER_MAX_LEN
-    } else {
-        dev_ns::TRAILER_HEADER_LEN
+    let cursor = match last {
+        Some(n) if more => n.as_bytes(),
+        // A page that cannot hold the next entry made no progress.
+        None if more => return errno::ENOMEM,
+        _ => &[],
     };
-    if w + trailer_len > out_cap {
-        return errno::EINVAL;
-    }
-    out[w] = dev_ns::TRAILER_MARK;
-    out[w + 1] = dev_ns::TRAILER_MARK;
-    if more {
-        // More pages: encode the next start index as a 4-byte LE cursor.
-        out[w + 2] = 4;
-        out[w + 3..w + 7].copy_from_slice(&(idx as u32).to_le_bytes());
-        w += dev_ns::TRAILER_MAX_LEN;
-    } else {
-        out[w + 2] = 0; // end of listing
-        w += dev_ns::TRAILER_HEADER_LEN;
-    }
-
-    if !fence_out_ptr.is_null() && fence_out_cap >= dev_fence::WIRE_MAX_LEN {
-        let fbuf = core::slice::from_raw_parts_mut(fence_out_ptr, fence_out_cap);
-        let _ = dev_fence::Fence::Volatile.encode(fbuf);
-    }
-    w as i32
+    let Some(n) = page.finish(cursor) else {
+        return errno::ENOMEM;
+    };
+    let fbuf =
+        core::slice::from_raw_parts_mut(req.fence_out_ptr as *mut u8, req.fence_out_cap as usize);
+    let _ = dev_fence::Fence::Volatile.encode(fbuf);
+    n as i32
 }
 
 /// `STAT` — write `[size:u64][mtime:u64][kind:u8][etag_len:u8][etag]` for the
@@ -351,9 +289,9 @@ unsafe fn linux_namespace_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
         dev_ns::STAT => ns_stat(raw, arg, arg_len),
         dev_ns::LIST => ns_list(arg, arg_len),
         dev_ns::CLOSE => ns_close(raw),
-        // Read-only enumeration surface: no mutation or change ops, so
-        // every optional-cap bit is honestly zero (namespace.rs::caps).
-        dev_ns::CAPS => 0,
+        // Read-only enumeration surface: no mutation or change ops. LIST is
+        // directory-shaped (namespace.rs::caps).
+        dev_ns::CAPS => dev_ns::caps::CHILD_NAMES as i32,
         _ => errno::ENOSYS,
     }
 }

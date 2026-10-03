@@ -13,12 +13,8 @@
 // host-neutral `abi::contracts::storage::object::range` module, which
 // is unit-tested off-target. This file is the transport wrapper.
 //
-// "Through linux_net": production routing should hand these requests to
-// the async `linux_net` module's connection table. This skeleton uses a
-// blocking `std::net::TcpStream` directly (same pragmatic shape as the
-// libc-backed FS provider above) so the surface is exercisable before
-// that integration lands; the request bytes — including the `Range`
-// header — are identical either way.
+// Requests go over a blocking `std::net::TcpStream` (the same shape as the
+// libc-backed FS provider above), `Range` header included.
 
 // This file is textually `include!`d into the `linux` platform module,
 // which already imports `std::io::{Read, Write}` and others elsewhere.
@@ -91,6 +87,8 @@ unsafe fn linux_object_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
         obj_dev::HEAD => linux_obj_head(arg, arg_len),
         obj_dev::RANGE_GET => linux_obj_range_get(handle, arg, arg_len),
         obj_dev::CLOSE => linux_obj_close(handle),
+        // An HTTP origin offers no enumeration of the paths it serves.
+        obj_dev::LIST => obj_errno::ENOSYS,
         _ => obj_errno::ENOSYS,
     }
 }
@@ -203,25 +201,22 @@ unsafe fn linux_obj_head(arg: *mut u8, arg_len: usize) -> i32 {
         core::ptr::copy_nonoverlapping(arg.add(p), b.as_mut_ptr(), 2);
         u16::from_le_bytes(b) as usize
     };
+    if out_ptr.is_null() || fence_out_ptr.is_null() || fence_out_cap < obj_dev_fence::WIRE_MAX_LEN {
+        return obj_errno::EINVAL;
+    }
 
     let size = match http_request(key, None, true) {
         Ok(res) => res.content_length,
         Err(code) => return code,
     };
-    if out_ptr.is_null() {
-        return obj_errno::EINVAL;
-    }
     let out = core::slice::from_raw_parts_mut(out_ptr, out_cap);
-    // mtime is left 0: parsing the HTTP-date `Last-Modified` header
-    // without a date dependency is deferred to the linux_net integration.
+    // mtime is 0: the HTTP-date `Last-Modified` header is not parsed.
     let written = match obj_dev::range::encode_head(out, size, 0, &[], &[]) {
         Some(n) => n,
-        None => return obj_errno::EINVAL,
+        None => return obj_errno::ENOMEM,
     };
-    if !fence_out_ptr.is_null() && fence_out_cap >= obj_dev_fence::WIRE_MAX_LEN {
-        let fbuf = core::slice::from_raw_parts_mut(fence_out_ptr, fence_out_cap);
-        let _ = obj_dev_fence::Fence::Volatile.encode(fbuf);
-    }
+    let fbuf = core::slice::from_raw_parts_mut(fence_out_ptr, fence_out_cap);
+    let _ = obj_dev_fence::Fence::Volatile.encode(fbuf);
     written as i32
 }
 

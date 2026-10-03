@@ -16,7 +16,7 @@
 //! which would wake every watcher on the prefix forever and make an idle graph
 //! look busy.
 
-#![no_std]
+#![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
     dead_code,
     reason = "the PIC build mounts the whole of modules/sdk/* via include!, so every \
@@ -51,14 +51,21 @@ const OBJ_PUT: u32 = abi::contracts::storage::object::PUT;
 use abi::contracts::storage::object::{write_answer, WriteAnswer};
 /// Room for an encoded fence (`fence::WIRE_MAX_LEN`).
 const FENCE_CAP: usize = 64;
-const MAX_KEY: usize = 192;
+/// The contract's one key bound: a key this seeds is one every store holds.
+const MAX_KEY: usize = abi::contracts::storage::handle::STORAGE_KEY_MAX;
 const MAX_VALUE: usize = 1024;
+/// `[key_len:u16][key][ct_len:u8][body_ptr:u64][body_len:u64]
+/// [precondition:u8][etag_len:u8][fence_ptr:u64][fence_cap:u16]`.
+const PUT_ARG_MAX: usize = 2 + MAX_KEY + 1 + 8 + 8 + 2 + 8 + 2;
 
 #[repr(C)]
 struct State {
     syscalls: *const SyscallTable,
     key: [u8; MAX_KEY],
     key_len: u32,
+    /// A parameter that did not fit its field: reported, never truncated,
+    /// because a cut key or value is a different object.
+    too_long: u8,
     value: [u8; MAX_VALUE],
     value_len: u32,
     written: u32,
@@ -81,16 +88,24 @@ mod params_def {
 
         1, key, str, 0
             => |s, d, len| {
-                let n = if len > MAX_KEY { MAX_KEY } else { len };
-                s.key_len = n as u32;
-                if n > 0 { ptr_copy(s.key.as_mut_ptr(), d, n); }
+                if len > MAX_KEY {
+                    s.too_long = 1;
+                    s.key_len = 0;
+                } else {
+                    s.key_len = len as u32;
+                    if len > 0 { ptr_copy(s.key.as_mut_ptr(), d, len); }
+                }
             };
 
         2, value, str, 0
             => |s, d, len| {
-                let n = if len > MAX_VALUE { MAX_VALUE } else { len };
-                s.value_len = n as u32;
-                if n > 0 { ptr_copy(s.value.as_mut_ptr(), d, n); }
+                if len > MAX_VALUE {
+                    s.too_long = 1;
+                    s.value_len = 0;
+                } else {
+                    s.value_len = len as u32;
+                    if len > 0 { ptr_copy(s.value.as_mut_ptr(), d, len); }
+                }
             };
     }
 }
@@ -100,20 +115,20 @@ unsafe fn ptr_copy(dst: *mut u8, src: *const u8, n: usize) {
     core::ptr::copy_nonoverlapping(src, dst, n);
 }
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
+#[cfg_attr(not(feature = "host-test"), no_mangle)]
+#[cfg_attr(not(feature = "host-test"), link_section = ".text.module_state_size")]
 pub extern "C" fn module_state_size() -> u32 {
     core::mem::size_of::<State>() as u32
 }
 
-#[no_mangle]
-#[link_section = ".text.module_init"]
+#[cfg_attr(not(feature = "host-test"), no_mangle)]
+#[cfg_attr(not(feature = "host-test"), link_section = ".text.module_init")]
 pub extern "C" fn module_init(_syscalls: *const c_void) {}
 
 /// # Safety
 /// Kernel module-ABI entry point.
-#[no_mangle]
-#[link_section = ".text.module_new"]
+#[cfg_attr(not(feature = "host-test"), no_mangle)]
+#[cfg_attr(not(feature = "host-test"), link_section = ".text.module_new")]
 pub unsafe extern "C" fn module_new(
     _in_chan: i32,
     _out_chan: i32,
@@ -135,6 +150,7 @@ pub unsafe extern "C" fn module_new(
         s.syscalls = syscalls as *const SyscallTable;
         s.key_len = 0;
         s.value_len = 0;
+        s.too_long = 0;
         s.written = 0;
         s.ticks = 0;
         s.rc = 0;
@@ -144,8 +160,8 @@ pub unsafe extern "C" fn module_new(
     }
 }
 
-#[no_mangle]
-#[link_section = ".text.module_step"]
+#[cfg_attr(not(feature = "host-test"), no_mangle)]
+#[cfg_attr(not(feature = "host-test"), link_section = ".text.module_step")]
 pub extern "C" fn module_step(state: *mut u8) -> i32 {
     unsafe {
         if state.is_null() {
@@ -164,6 +180,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             dev_log(&*s.syscalls, 3, m.as_ptr(), m.len());
         }
         if s.written != 0 {
+            return 0;
+        }
+        if s.too_long != 0 {
+            s.written = 1;
+            let m = b"[seed] PARAM TOO LONG - key or value refused, nothing written";
+            dev_log(&*s.syscalls, 3, m.as_ptr(), m.len());
             return 0;
         }
         // An EMPTY key is reported, not skipped. Returning quietly here is how
@@ -186,7 +208,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
         // [key_len:u16][key][ct_len:u8][body_ptr:u64][body_len:u64]
         // [precondition:u8][etag_len:u8][fence_ptr:u64][fence_cap:u16]
-        let mut arg = [0u8; 256];
+        let mut arg = [0u8; PUT_ARG_MAX];
         let mut p = 0usize;
         arg[0..2].copy_from_slice(&(key.len() as u16).to_le_bytes());
         p += 2;

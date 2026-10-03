@@ -60,9 +60,9 @@ const ALLOWED: &[(&str, &[&str])] = &[
             "allow_crate_root",
         ],
     ),
-    // Declared prefixes where a crate-root `#![allow(...)]` is permitted, per
-    // `standards/lints.md` §4. Both keys are required: an exemption without a
-    // reason is a conformance failure, not an escape hatch.
+    // Declared prefixes where a crate-root `#![allow(...)]` is permitted.
+    // Both keys are required: an exemption without a reason is a
+    // conformance failure, not an escape hatch.
     ("ci.hygiene.allow_crate_root", &["prefix", "reason"]),
     ("ci.lints", &["exemption"]),
     ("ci.lints.exemption", &["crate", "reason"]),

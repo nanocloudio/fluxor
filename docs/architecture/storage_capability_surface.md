@@ -31,7 +31,7 @@ compose the family; every provider declares one or more.
 | `storage.block`     | Raw block I/O                                                   | nvme, sd (read-only), file_block, crypt_block provide; fat32, crypt_block and nbd_serve consume |
 | `file.data`         | Byte-stream file access (open, read, seek, stat, write, fsync)  | fat32 and the mount router provide; player / viewer modules consume |
 | `storage.namespace` | Name-keyed directory surface (lookup, stat, list, rename, delete, bind, subscribe) | host platform providers (§5); scanners and stores consume |
-| `storage.object`    | Whole-blob byte-addressed surface (put, get, head, range_get, delete) | host platform providers (§5); object_bank consumes     |
+| `storage.object`    | Whole-blob byte-addressed surface (put, get, head, range_get, delete, list) | host platform providers (§5); object_bank consumes     |
 
 Multipart object upload is deliberately not part of `storage.object`.
 Large writes compose via the `event.log` pattern in §4 and finalise with
@@ -416,7 +416,7 @@ PIC module providers handle `QUERY_OP` through their existing dispatch
 function; there is no separate query-callback ABI.
 
 **2. Handle=-1 one-shot ops** (e.g. `object::PUT`, `object::HEAD`,
-`object::DELETE`, `namespace::LIST`, `namespace::RENAME`,
+`object::DELETE`, `object::LIST`, `namespace::LIST`, `namespace::RENAME`,
 `namespace::DELETE`, `namespace::BIND`, `object::PUT_STREAMED_COMMIT`)
 carry a `[fence_out_ptr: u64 LE, fence_out_cap: u16 LE]` pair at the end
 of their arg layout. The provider writes the encoded fence (up to
@@ -575,7 +575,7 @@ close. Storage handles compose the mesh primitives (`mesh.md`):
 pub struct StorageHandle {
     pub object: ObjectId,        // mesh primitive #1
     pub kind: HandleKind,        // Object | Namespace | Stream
-    pub permissions: u16,        // OR-combined StoragePerm
+    pub permissions: u16,        // mesh permission bits of the grant (mesh primitive #2)
     pub slot: u16,               // provider-local FD; crosses the syscall boundary
     pub not_after: u64,          // mesh primitive #8 (Lease)
     pub hint: LocationHintBlob,  // mesh LocationHint, opaque blob
@@ -585,19 +585,77 @@ pub struct StorageHandle {
 
 Lifecycle rules:
 
-- Providers map `(ObjectId, Capability, LocationHint)` to a small integer
-  slot index. The integer is what crosses the syscall boundary;
-  `StorageHandle` is the typed Rust view inside the provider and any
-  host-side caller that has the slot mapping.
-- `not_after` is an absolute monotonic timestamp (kernel `time_ns`).
-  Providers refuse ops with `now >= not_after` and free the slot.
-- Revocation is provider-driven: an unmount, a replicated store
-  reconfiguration, or an explicit revoke from the issuer flips `revoked`
-  and frees the slot. The next op against a revoked handle fails with
-  `EACCES` or `ENODEV`.
-- Richer per-slot state extends `StorageHandle`; new permissions extend
-  `StoragePerm`. Storage providers compose this primitive rather than
-  parallel handle / FD types.
+- A provider hands out a small integer slot index. The integer is what
+  crosses the syscall boundary; `StorageHandle` is the typed Rust view for a
+  provider or host-side caller that keeps the slot's authority and lease.
+- The kernel gateway refuses a gated module any provider handle it was not
+  minted, and releases the handle on `CLOSE` (`module_isolation.md`).
+- The Linux key store, configured with mesh roots, binds every op to a
+  verified grant (§3.1). Without roots it, the bcm2712 store and the HTTP and
+  wasm object providers issue plain slot indices: a slot carries no
+  capability, lease or revocation state, and their only handle limit is the
+  slot table (a full table answers `ENOMEM`).
+- A provider that binds a handle to a verified mesh grant
+  (`contracts/mesh/capability.rs`, [`mesh.md`](mesh.md#authority)) uses
+  the vocabulary in `handle.rs`. Storage has no permission vocabulary of
+  its own: the handle carries the grant's mesh permission bits, and each
+  operation class needs one — `StorageAccess::Read` (`GET`, `HEAD`,
+  `RANGE_GET`, `LIST`, `LOOKUP`, `STAT`) needs `ReadState`, `Write`
+  (`PUT`, the streamed put, `DELETE`, `RENAME`, `BIND`) needs
+  `SendCommand`, `Subscribe` (`SUBSCRIBE`, `CHANGES`) needs `Subscribe`,
+  and `Delegate` needs `Delegate`. `StorageHandle::allows` is the check.
+- `not_after` is an absolute monotonic timestamp (kernel `time_ns`). Such a
+  provider refuses ops with `now >= not_after` and frees the slot, and
+  takes the earlier of its own lease and the grant's expiry
+  (`lease_bound_ns`), so the handle never outlives its authority.
+- Revocation by such a provider (an unmount, a replicated store
+  reconfiguration, an explicit revoke from the issuer) flips `revoked` and
+  frees the slot; the next op against it fails with `EACCES` or `ENODEV`.
+
+### 3.1 Presenting a grant to a store
+
+Source: `modules/sdk/contracts/storage/object.rs` (`PRESENT`, `grant`),
+`src/platform/linux/store.rs`.
+
+A module reaches a guarded store through `provider_call`, which has no
+session for the mesh's `MSG_CAP_PRESENT` to ride. So `storage.object` has
+its own presentation op:
+
+1. `PRESENT` (`0x142B`) names a scope and carries a capability chain. A
+   scope is a key prefix ending `/` (`photos/`). The chain's leaf names the
+   scope's object, `grant::scope_object`: SHA-256 over a domain tag and the
+   scope, truncated to an `ObjectId`. `fluxor modules cap mint --scope
+   photos/` issues one.
+2. The store verifies the chain against its roots and its trusted clock
+   and answers a grant handle. A refused chain answers `EACCES`, with its
+   `Refusal` written into the request's first byte. The request carries no
+   pointer, so an isolated module can present the longest chain.
+3. Every later op passes the grant as its `handle`: `PUT`, `GET`, `HEAD`,
+   `DELETE`, `LIST` and `PUT_STREAMED_OPEN`, which otherwise take `-1`. The
+   store admits an op only when all of these hold:
+   - its key, or `LIST`'s prefix, lies inside the scope;
+   - the grant carries the bit its `StorageAccess` class needs;
+   - the grant's window is still open by the trusted clock.
+4. A read handle opened under a grant dies with it, and `CLOSE` on the grant
+   ends both.
+
+Anything else is `EACCES`:
+
+- an op on `-1`;
+- a key outside the scope, or a missing permission;
+- an expired grant, or no trusted clock;
+- a grant presented by another module, or by an earlier occupancy of the
+  caller's scheduler slot.
+
+The store's namespace surface cannot carry a grant, so a guarded store
+refuses it entirely rather than list what a scope hides.
+
+Roots come from `FLUXOR_MESH_ROOTS`: up to two comma-separated 64-hex
+Ed25519 public keys, the second for a rotation. Roots that do not parse
+fail the store, rather than open it unguarded. Without roots the store is
+an unguarded local store: `PRESENT` answers `ENOSYS` and `handle = -1` ops
+run as before. The bcm2712 store has no roots and answers `PRESENT` with
+`ENOSYS`.
 
 `HandleKind::Stream` is the kind issued for either `file.data` reads or
 for an `event.log` subscription (§4).
@@ -692,8 +750,13 @@ into the runtime rather than loadable modules:
 - **Linux `storage.object`** — `src/platform/linux/object.rs`, HTTP/1.1
   `Range:` reads (`HEAD` / `GET` / `RANGE_GET` / `CLOSE`) so a
   Linux-hosted graph can demand-page immutable assets by byte range.
+  `LIST` answers `ENOSYS`: an HTTP origin offers no enumeration.
 - **wasm peers** — `src/platform/wasm/fs.rs`, `namespace.rs`, and
-  `object.rs` serve the same three contracts in the browser host.
+  `object.rs` serve the same three contracts in the browser host. The
+  wasm `storage.object` answers `LIST` with `ENOSYS`: its reads fall
+  through to `fetch()` against the page origin, which cannot be
+  enumerated, and a listing of the written tier alone would omit objects
+  `GET` serves.
 
 ### The versioned watchable key store
 
@@ -706,29 +769,104 @@ a graph selects it by wiring, not by asking which platform it is on:
   set the two providers above route here instead of to HTTP and the host
   filesystem, backed by an append-only log the directory holds.
 
+  Every write is appended to the log and synced before it is applied, and
+  the log's directory entry is synced when the store opens, so an
+  acknowledged write reports `LocalDurable`. An append that fails part-way
+  is cut back off before the write is refused. A crash mid-append leaves
+  at most one partial record; opening the store cuts it off, so the next
+  append never lands behind it. A complete record that cannot be applied
+  (an unknown op, an empty key, a key that is not UTF-8) is corruption,
+  and the open is refused rather than dropping the records behind it.
+
   A workload names its own store with `store_dir` in the `[workload]`
   table of its source manifest; it is carried into `workload.json` and
   set for the runtime at launch, relative to the installed bundle unless
-  absolute. Declared there it wins over the caller's environment, which
-  is the point: an applet's state is a property of the applet, and while
-  the variable was the only way to say it, the same applet run from two
-  shells reached two different stores, or none, with nothing reporting
-  the difference. The variable remains for a node-wide store that no
-  single workload owns.
+  absolute. Declared there it wins over the caller's environment: an
+  applet's state is a property of the applet, and the same applet run
+  from two shells must reach the same store. The variable serves a
+  node-wide store that no single workload owns.
 - **bcm2712** — `src/platform/bcm2712/store.rs`, the same semantics and
   byte-identical wire over a fixed-capacity RAM store, because bare metal
-  has no heap to grow one on. Its capacities (`MAX_OBJECTS`, `MAX_KEY`,
-  `MAX_VALUE`, `HISTORY`) are the honest ceiling; exceeding one is refused
+  has no heap to grow one on. Its capacities (`MAX_OBJECTS`, `MAX_VALUE`,
+  `HISTORY`) are the honest ceiling; exceeding one is refused
   rather than evicted, since a consumer reads a missing key as a deletion and
   would tear down whatever that key named.
 
+Both refuse (`EINVAL`) a `PUT` of the empty key, which is the relist
+sentinel on the change stream and the end-of-listing cursor on `LIST`, of
+a key that is not UTF-8, and of a key longer than `STORAGE_KEY_MAX` (255
+bytes, `handle.rs`), the longest name either listing carries. A
+precondition kind they do not know, or an `ETAG` without a whole revision,
+is `EINVAL` rather than an unconditional write. `HEAD` into a buffer too
+small for its record answers `ENOMEM`. A `PUT`, `HEAD` or `DELETE` whose
+fence buffer is null or shorter than `fence::WIRE_MAX_LEN` is `EINVAL`,
+refused before the op acts, as the contract states for every op that carries
+a fence pair.
+
 Both keep a monotone revision clock, use a key's revision as the CAS
-token, page `LIST` with a cursor, and drive `SUBSCRIBE` from a bounded
-change history — a watcher that falls out of that window is told to
-relist rather than handed a gap. The bcm2712 store is VOLATILE: it
-reports `Fence::RevisionMonotone` and never `LocalDurable`, because
-under-reporting durability is the safe direction and a caller must not
-conclude a write outlived a power cut.
+token, page `namespace::LIST` and `object::LIST` with a cursor, and drive
+`SUBSCRIBE` from a bounded change history — a watcher that falls out of
+that window is told to relist rather than handed a gap. A page that cannot
+hold one entry is `ENOMEM` on both listings, never an empty page that
+returns the cursor it was given. Both cursors are the last name the page
+returned, so a write behind the cursor never shifts the page after it. The
+bcm2712 store is VOLATILE: it reports `Fence::RevisionMonotone` and never
+`LocalDurable`, because under-reporting durability is the safe direction and
+a caller must not conclude a write outlived a power cut.
+
+### Listing names
+
+One bound serves both listings' names: `STORAGE_KEY_MAX` (255 bytes,
+`handle.rs`) is the longest key, entry name and cursor, and the longest
+`object::LIST` prefix. It is the width of the `namespace::LIST` `name_len`
+and trailing `cursor_len` (a `u8`), and the kernel gateway's argument copy
+is sized to carry an `object::LIST` prefix and cursor of that length, so a
+gated module can resume a listing at any key a provider holds. A
+`namespace::LIST` prefix is a path, not a name, bounded by
+`namespace::PATH_MAX` (1024): a filesystem provider's prefix is a host
+directory at any depth.
+
+`object::LIST` enumerates the keys under a prefix in ascending bytewise
+order, one bounded page per call. A page carries at most `max_keys`
+entries (`1..=LIST_PAGE_MAX`, 1000), each with the key, size, mtime and
+etag `HEAD` would report, and ends with a cursor; an empty cursor ends the
+listing. `namespace::LIST` pages the same way, each entry carrying a name
+and a kind. The provider fills whole entries while keeping room for the
+trailer that resumes after the last one (the cursor is that entry's key),
+and refuses with `ENOMEM` when not even one entry fits, so every page but
+the last makes progress (`list::min_out_cap`).
+
+The cursor is the last name the page returned, and the next page resumes
+strictly after it in name order; it is not a snapshot. A key written or
+deleted between pages is seen or not according to whether it sorts after
+the cursor, a write behind the cursor never shifts, skips or repeats an
+entry, and a key present for the whole listing is seen exactly once. Each
+page carries its own fence: `ViewConsistent` from the key stores,
+`Volatile` from the filesystem, wasm and `mem_ns` namespaces. A key longer
+than `STORAGE_KEY_MAX` cannot be carried by a cursor, so a provider that
+meets one in range refuses with `EOVERFLOW` rather than skip it.
+
+`namespace::LIST` names come in two shapes, and a provider states its
+shape in `CAPS` with `caps::CHILD_NAMES`. A key-shaped provider (the key
+stores, `mem_ns`; the bit clear, as for a provider without `CAPS`) lists
+whole keys under the prefix, so its cursor starts with the prefix. A
+directory-shaped provider (the filesystem and wasm namespaces; the bit set)
+lists the prefix's immediate children by name, so its cursor is a child
+name and never holds `/`, and a consumer joins prefix and name with one `/`
+to make the entry's key. A cursor of the wrong shape, or not UTF-8, was not
+issued by the provider: `EINVAL`. An `object::LIST` entry's key is the key `GET`,
+`HEAD` and `DELETE` take, and listing returns no handle. The request, page
+and cursor codec is `object::list` and `namespace::list`; providers and
+consumers share it.
+
+| Provider | `object::LIST` | `namespace::LIST` |
+| --- | --- | --- |
+| Linux key store (`store.rs`) | served, over its ordered map | served, same map |
+| bcm2712 key store (`store.rs`) | served, by ordered selection over its fixed table | served, same selection |
+| Linux HTTP range provider (`object.rs`) | `ENOSYS` | — |
+| Linux filesystem provider (`namespace.rs`) | — | served, immediate children of a directory in name order; a name that is not UTF-8 is not listed |
+| wasm (`object.rs`, `namespace.rs`) | `ENOSYS` | served by the host index, in UTF-8 byte order |
+| `mem_ns` fixture | — | served, over its binding table |
 
 On bare metal, `foundation/fat32` provides `file.data` over a
 `storage.block` channel: random-access reads through the FS contract,
