@@ -72,7 +72,6 @@ const BACKEND_DONE: i32 = 1;
 
 extern "C" {
     fn host_gpu_service_init() -> i32;
-    fn host_gpu_service_poll_init() -> i32;
     /// Write [`exec::FACT_LEN`] bytes of adapter facts. 0, or <0 with no device.
     fn host_gpu_service_facts(out_ptr: *mut u8) -> i32;
     fn host_gpu_service_create_buffer(slot: u32, size: u32, usage: u32) -> i32;
@@ -117,6 +116,8 @@ extern "C" {
         len: u32,
     ) -> i32;
     fn host_gpu_service_drain(ticket: u32) -> i32;
+    /// Destroy the page device and advance the epoch. 0, or <0 with no device.
+    fn host_gpu_service_reset() -> i32;
     fn host_gpu_service_epoch() -> u32;
 }
 
@@ -356,11 +357,10 @@ unsafe fn refuse(st: &mut GpuComputeState) {
 /// # Safety
 /// Called only from the step, with `st` valid.
 unsafe fn acquire(st: &mut GpuComputeState) -> bool {
-    let status = if st.backend_epoch == 0 {
-        host_gpu_service_init()
-    } else {
-        host_gpu_service_poll_init()
-    };
+    // `init` starts acquisition when the page holds no device and answers its
+    // progress while one is pending, so the same call opens the first device
+    // and every replacement after a loss or a reset.
+    let status = host_gpu_service_init();
     if status < 0 {
         st.unavailable = true;
         return false;
@@ -421,9 +421,10 @@ fn limits_from(facts: &[u8; exec::FACT_LEN]) -> gw::DeviceLimits {
     let features = gw::FEATURE_COMPUTE
         | gw::FEATURE_RASTER
         | gw::FEATURE_COMPUTE_TO_RASTER
-        | gw::FEATURE_READBACK;
+        | gw::FEATURE_READBACK
+        | gw::FEATURE_DEVICE_RESET;
     // Shared surfaces, indirect dispatch, subgroups, preemption, timestamps
-    // and device reset are not implemented in this provider, so none is
+    // are not implemented in this provider, so none is
     // claimed. The host may report a timestamp capability, but this
     // provider places no query and every completion reports `gpu_nanos` of
     // zero — advertising what the host could manage rather than what this
@@ -493,6 +494,7 @@ unsafe fn step(st: &mut GpuComputeState) {
     // saying so is the whole recovery contract — a consumer rebuilds its
     // derived state rather than working against objects that no longer exist.
     let epoch = host_gpu_service_epoch();
+    let mut device_lost = false;
     if epoch != st.backend_epoch {
         st.backend_epoch = epoch;
         dev.bump_epoch(gw::NO_SLOT);
@@ -506,6 +508,7 @@ unsafe fn step(st: &mut GpuComputeState) {
         // device never claimed, which is the one thing a capability record
         // must never do.
         st.live = false;
+        device_lost = true;
     }
 
     let out_chan = st.out_chan;
@@ -518,6 +521,15 @@ unsafe fn step(st: &mut GpuComputeState) {
 
     poll_backend(&mut dev, awaiting, rb_buf);
     gw::flush_outcomes(&mut dev, out_buf, &mut st.out, &mut write);
+
+    if device_lost {
+        // Nothing may be admitted against the dead backend. Commands remain
+        // in the channel until `acquire` has opened the replacement device;
+        // accepting them here would create contract handles for objects the
+        // host can no longer create.
+        st.saved = dev.save();
+        return;
+    }
 
     while !st.faulted && (st.cmd_len as usize) < CMD_BUF {
         let room = CMD_BUF - st.cmd_len as usize;
@@ -542,9 +554,26 @@ unsafe fn step(st: &mut GpuComputeState) {
     dev.advance();
     while let Some(fence) = dev.next_ready() {
         dev.mark_running(fence);
-        if dev.fence(fence).map_or(0, |f| f.op) == gw::OP_DRAIN {
+        let op = dev.fence(fence).map_or(0, |f| f.op);
+        if op == gw::OP_DRAIN {
             awaiting[fence as usize] = Await::Ticket;
             host_gpu_service_drain(fence as u32);
+        } else if op == gw::OP_RESET {
+            // Destroying the page device is the reset: every object made from
+            // it is gone, the host's epoch advances and every other consumer
+            // of the device is told. The core has already ended this side's
+            // epoch, so the host's advance is taken as seen rather than
+            // reported as a second loss, and the next step reacquires.
+            if host_gpu_service_reset() < 0 {
+                dev.fail(fence, gw::REASON_DEVICE_LOST, 0);
+            } else {
+                dev.complete(fence, 0);
+            }
+            st.backend_epoch = host_gpu_service_epoch();
+            for a in awaiting.iter_mut() {
+                *a = Await::Idle;
+            }
+            st.live = false;
         } else {
             // Everything else was handed to the backend at admission; a fence
             // that reaches here with nothing pending has already done its work.
@@ -654,7 +683,8 @@ unsafe fn poll_backend(dev: &mut gw::GpuDevice<'_>, awaiting: &mut [Await], rb: 
     }
 }
 
-/// Hand one admitted request to the backend.
+/// Hand one admitted request to the backend. Answers whether admission may
+/// continue past this record.
 ///
 /// # Safety
 /// Called from the step; every slice borrows a live buffer.
@@ -853,13 +883,13 @@ unsafe fn translate(
             true
         }
 
-        gw::Work::Reset { fence, .. } => {
-            dev.fail(
-                fence,
-                gw::REASON_UNSUPPORTED_FEATURE,
-                gw::FEATURE_DEVICE_RESET,
-            );
-            true
+        gw::Work::Reset { .. } => {
+            // The core has already terminated every other outstanding request
+            // and retired every handle. The device itself is reset from the
+            // ready loop, like a drain. Admission stops at this record:
+            // anything after it belongs to the new epoch and must wait for
+            // the replacement device rather than reach the one being reset.
+            false
         }
 
         gw::Work::ExportSurface { fence, .. } => {

@@ -4,7 +4,7 @@
 //! application knowledge: no shaders, no vertex formats, no uniform layouts.
 //! Applications supply all of those as data via `CMD_SET_PIPELINE`; this
 //! driver only frames the command stream and forwards it to the host backend
-//! (`host_gpu_raster_*` in host_shims.js today; a Vulkan or bare-metal driver
+//! (`host_gpu_raster_*` in host_shims.js; a Vulkan or bare-metal driver
 //! implements the same imports unchanged — WGSL compiles to SPIR-V via naga).
 //!
 //! ## Command stream (channel input, little-endian)
@@ -135,11 +135,11 @@ const GPU_INIT_READY: i32 = 0;
 const GPU_INIT_PENDING: i32 = 1;
 const GPU_INIT_NOT_STARTED: i32 = 2;
 
-// Not every host_gpu_raster_* import is called yet (resize / get_size are part of the
-// host ABI surface the JS driver implements but the module does not drive today).
+// resize / get_size are part of the host surface the JS driver implements; this
+// module does not call them.
 #[allow(
     dead_code,
-    reason = "resize/get_size are part of the host ABI surface but not yet driven"
+    reason = "resize/get_size are part of the host surface this module does not drive"
 )]
 extern "C" {
     /// Initialize the GPU backend. Returns 0=ready, 1=pending, <0=error
@@ -302,6 +302,13 @@ fn gpu_step(state: *mut u8) -> i32 {
             return -1;
         }
         let st = &mut *st_ptr;
+
+        // The page device is shared, and a loss or a reset by another of its
+        // consumers ends it under this module: the backend then answers
+        // NOT_STARTED, and initialising again opens the successor.
+        if st.init_status == GPU_INIT_READY {
+            st.init_status = host_gpu_raster_poll_init();
+        }
 
         // Initialize the backend if not started
         if st.init_status == GPU_INIT_NOT_STARTED {

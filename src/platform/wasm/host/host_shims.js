@@ -2590,6 +2590,19 @@ registerProcessor('pcm-ring', PcmRing);
       lostReason: '',
       onLost: [],
 
+      // End `device`'s epoch, once. A reset retires the device synchronously
+      // and its `lost` promise resolves later; naming the device makes that
+      // late resolution a no-op rather than the retirement of its successor.
+      retire(device, reason, message) {
+        if (this.device !== device) return;
+        console.error('[gpu] device lost (' + reason + '):', message);
+        this.device = null;
+        this.status = GPU_INIT_NOT_STARTED;
+        this.lostReason = message || String(reason);
+        this.epoch = (this.epoch + 1) >>> 0 || 1;
+        for (const cb of this.onLost) { try { cb(); } catch (e) { console.error(e); } }
+      },
+
       // Start acquisition once. Answers the current status; the caller polls.
       ensure() {
         if (this.device) return GPU_INIT_READY;
@@ -2605,19 +2618,15 @@ registerProcessor('pcm-ring', PcmRing);
           try {
             this.adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
             if (!this.adapter) throw new Error('no adapter');
-            this.device = await this.adapter.requestDevice();
-            this.device.lost.then((info) => {
+            const device = await this.adapter.requestDevice();
+            this.device = device;
+            device.lost.then((info) => {
               // A lost device invalidates every object made from it. Bumping
               // the epoch and telling each consumer is the whole recovery
               // contract: nothing minted before this is valid after it.
-              console.error('[gpu] device lost (' + info.reason + '):', info.message);
-              this.device = null;
-              this.status = GPU_INIT_NOT_STARTED;
-              this.lostReason = info.message || String(info.reason);
-              this.epoch = (this.epoch + 1) >>> 0 || 1;
-              for (const cb of this.onLost) { try { cb(); } catch (e) { console.error(e); } }
+              this.retire(device, info.reason, info.message);
             });
-            this.device.onuncapturederror = (e) => {
+            device.onuncapturederror = (e) => {
               console.error('[gpu] uncaptured:', e.error.message);
             };
             this.status = GPU_INIT_READY;
@@ -2679,6 +2688,7 @@ registerProcessor('pcm-ring', PcmRing);
     let gpuEncoder = null;
     let gpuPass = null;
     let gpuInitialized = false;
+    let gpuLostHooked = false;
     // Vsync throttle. The kernel pump free-runs (thousands of ticks/s), so an
     // unpaced producer can submit hundreds of frames per display refresh —
     // renders then land on canvas textures the compositor has already expired
@@ -2800,11 +2810,27 @@ registerProcessor('pcm-ring', PcmRing);
             return;
           }
           gpuDevice = gpuService.device;
-          gpuService.onLost.push(() => {
-            gpuInitialized = false;
-            gpuDevice = null;
-            gpuInitStatus = GPU_INIT_NOT_STARTED;
-          });
+          if (!gpuLostHooked) {
+            gpuLostHooked = true;
+            // Everything here was made from the device that ended, and none
+            // of it may reach its successor. The module sees NOT_STARTED and
+            // initialises again; until the app sends its pipelines, targets
+            // and geometry again, commands naming them are refused.
+            gpuService.onLost.push(() => {
+              gpuInitialized = false;
+              gpuDevice = null;
+              gpuInitStatus = GPU_INIT_NOT_STARTED;
+              gpuPipelines.clear();
+              gpuSlots.clear();
+              gpuTargets.clear();
+              gpuEncoder = null;
+              gpuPass = null;
+              gpuMsaaTexture = null;
+              gpuDepthTexture = null;
+              gpuLinearSampler = null;
+              gpuAnyDepth = false;
+            });
+          }
 
           // Find or create canvas
           gpuCanvas = canvasContainer
@@ -3342,14 +3368,30 @@ registerProcessor('pcm-ring', PcmRing);
     const svcReads = new Map();     // ticket -> { staging, span, lead, len, state }
     // 0 pending, 1 done, <0 failed — the same three answers everywhere here,
     // so a poller has one thing to understand.
+    //
+    // A promise settles into the entry object it was started for, never into
+    // the map by key: slots and tickets are reused, across epochs as well as
+    // within one, and a late settlement must not land on the slot's next
+    // occupant.
     const SVC_PENDING = 0, SVC_DONE = 1;
 
+    // Every object here belongs to the device that just ended. Nothing of it
+    // may be found under a slot in the next epoch.
     function svcReset() {
       svcBuffers.clear();
+      svcTextures.clear();
+      svcDepths.clear();
       svcModules.clear();
       svcPipelines.clear();
       svcTickets.clear();
       svcReads.clear();
+    }
+
+    // A staging buffer that will never be read is released now rather than
+    // left mapped until the device ends.
+    function svcDropRead(key, entry) {
+      svcReads.delete(key);
+      try { entry.staging.destroy(); } catch (e) { /* already gone with its device */ }
     }
 
     const gpuServiceShim = {
@@ -3360,13 +3402,6 @@ registerProcessor('pcm-ring', PcmRing);
           gpuService.onLost.push(svcReset);
         }
         return status;
-      },
-      host_gpu_service_poll_init: () => {
-        if (gpuService.device && !gpuServiceShim._hooked) {
-          gpuServiceShim._hooked = true;
-          gpuService.onLost.push(svcReset);
-        }
-        return gpuService.status;
       },
 
       // Report the adapter's own limits. Read off the device rather than
@@ -3499,15 +3534,17 @@ registerProcessor('pcm-ring', PcmRing);
         const m = svcModules.get(programSlot >>> 0);
         if (!d || !m) return -1;
         const key = slot >>> 0;
-        svcPipelines.set(key, { pipeline: null, state: SVC_PENDING });
+        const entry = { pipeline: null, state: SVC_PENDING };
+        svcPipelines.set(key, entry);
         d.createComputePipelineAsync({
           layout: 'auto',
           compute: { module: m.module, entryPoint: m.entry },
         }).then((pipeline) => {
-          svcPipelines.set(key, { pipeline, state: SVC_DONE });
+          entry.pipeline = pipeline;
+          entry.state = SVC_DONE;
         }).catch((e) => {
           console.error('[gpu.service] pipeline', key, 'failed:', e.message);
-          svcPipelines.set(key, { pipeline: null, state: -3 });
+          entry.state = -3;
         });
         return 0;
       },
@@ -3559,7 +3596,8 @@ registerProcessor('pcm-ring', PcmRing);
           // positions needs no dummy geometry bound.
           const buffers = attributes.length
             ? [{ arrayStride: stride, stepMode: 'vertex', attributes }] : [];
-          svcPipelines.set(key, { pipeline: null, state: SVC_PENDING, raster: true });
+          const entry = { pipeline: null, state: SVC_PENDING, raster: true };
+          svcPipelines.set(key, entry);
           d.createRenderPipelineAsync({
             layout: 'auto',
             vertex: { module: m.module, entryPoint: m.entry, buffers },
@@ -3567,16 +3605,16 @@ registerProcessor('pcm-ring', PcmRing);
             depthStencil: depthFmt
               ? { format: depthFmt, depthWriteEnabled: depthWrite, depthCompare: compare }
               : undefined,
-            // The fragment entry shares the vertex entry's module and is
-            // found by being the only one: the contract's program envelope
-            // names a single entry point, and splitting it would need a
-            // second manifest field rather than a convention invented here.
+            // The program envelope names one entry, the vertex stage's. A
+            // raster module carries exactly one `@fragment` function, and an
+            // absent entry point selects it, as on the native provider.
             fragment: { module: m.module, targets: [{ format: colour, blend }] },
           }).then((pipeline) => {
-            svcPipelines.set(key, { pipeline, state: SVC_DONE, raster: true, colour, depth: !!depthFmt });
+            entry.pipeline = pipeline;
+            entry.state = SVC_DONE;
           }).catch((e) => {
             console.error('[gpu.service] raster pipeline', key, 'failed:', e.message);
-            svcPipelines.set(key, { pipeline: null, state: -3, raster: true });
+            entry.state = -3;
           });
           return 0;
         } catch (e) {
@@ -3739,20 +3777,20 @@ registerProcessor('pcm-ring', PcmRing);
           if (pass) pass.end();
           d.queue.submit([enc.finish()]);
         } catch (e) {
+          // Refused, so no ticket: the provider fails the fence on this answer
+          // and never polls it.
           console.error('[gpu.service] submit', ticket, 'failed:', e.message);
-          svcTickets.set(ticket >>> 0, { state: -3 });
           return -3;
         }
-        const key = ticket >>> 0;
-        svcTickets.set(key, { state: SVC_PENDING });
+        const entry = { state: SVC_PENDING };
+        svcTickets.set(ticket >>> 0, entry);
         // Conservative queue completion: the fence answers when the queue has
         // drained, which is a fact the API gives. A per-submit GPU timestamp
         // is not available here, and the provider's outcome says so rather
         // than reporting a CPU reading as one.
-        d.queue.onSubmittedWorkDone().then(() => {
-          const t = svcTickets.get(key);
-          if (t && t.state === SVC_PENDING) t.state = SVC_DONE;
-        }).catch(() => { svcTickets.set(key, { state: -3 }); });
+        d.queue.onSubmittedWorkDone()
+          .then(() => { entry.state = SVC_DONE; })
+          .catch(() => { entry.state = -3; });
         return 0;
       },
       host_gpu_service_poll_submit: (ticket) => {
@@ -3774,23 +3812,70 @@ registerProcessor('pcm-ring', PcmRing);
         const existing = svcReads.get(key);
         if (existing) {
           if (existing.state === SVC_PENDING) return -1;
-          if (existing.state < 0) { svcReads.delete(key); return -3; }
+          if (existing.state < 0) { svcDropRead(key, existing); return -3; }
+          // The window mapped is the one first asked for. A later call may
+          // offer a different room, so never answer more than was mapped.
+          len = Math.min(len, existing.len);
           try {
             const src = new Uint8Array(
               existing.staging.getMappedRange(0, existing.span));
-            kview(outPtr, len).set(src.subarray(existing.lead, existing.lead + len));
+            const dst = kview(outPtr, len);
+            if (existing.rowBytes) {
+              let logical = existing.logicalOffset, wrote = 0;
+              while (wrote < len) {
+                const row = Math.floor(logical / existing.rowBytes);
+                const column = logical % existing.rowBytes;
+                const take = Math.min(len - wrote, existing.rowBytes - column);
+                const at = row * existing.paddedRowBytes + column;
+                dst.set(src.subarray(at, at + take), wrote);
+                logical += take;
+                wrote += take;
+              }
+            } else {
+              dst.set(src.subarray(existing.lead, existing.lead + len));
+            }
           } catch (e) {
             console.error('[gpu.service] readback copy:', e.message);
-            svcReads.delete(key);
+            svcDropRead(key, existing);
             return -3;
           }
           existing.staging.unmap();
-          existing.staging.destroy();
-          svcReads.delete(key);
+          svcDropRead(key, existing);
           return len;
         }
         const b = svcBuffers.get(slot >>> 0);
-        if (!b || len === 0) return -3;
+        const t = svcTextures.get(slot >>> 0);
+        if ((!b && !t) || len === 0) return -3;
+        if (t) {
+          const rowBytes = t.width * 4;
+          const total = rowBytes * t.height;
+          const logicalOffset = Number(offset);
+          if (logicalOffset + len > total) return -3;
+          const paddedRowBytes = Math.ceil(rowBytes / 256) * 256;
+          const span = paddedRowBytes * t.height;
+          const staging = d.createBuffer({
+            size: span,
+            usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+          });
+          const enc = d.createCommandEncoder();
+          enc.copyTextureToBuffer(
+            { texture: t.texture },
+            { buffer: staging, bytesPerRow: paddedRowBytes, rowsPerImage: t.height },
+            { width: t.width, height: t.height, depthOrArrayLayers: 1 });
+          d.queue.submit([enc.finish()]);
+          const entry = {
+            staging, span, lead: 0, len, state: SVC_PENDING,
+            rowBytes, paddedRowBytes, logicalOffset,
+          };
+          svcReads.set(key, entry);
+          staging.mapAsync(GPUMapMode.READ, 0, span)
+            .then(() => { entry.state = SVC_DONE; })
+            .catch((err) => {
+              console.error('[gpu.service] texture readback map:', err.message);
+              entry.state = -3;
+            });
+          return -1;
+        }
         // Copy offsets and sizes are 4-aligned in WebGPU; round the window out
         // and trim, so a byte-granular request still works.
         const start = Number(offset) & ~3;
@@ -3821,11 +3906,24 @@ registerProcessor('pcm-ring', PcmRing);
         if (!d) return -1;
         const key = ticket >>> 0;
         if (svcTickets.has(key)) return svcTickets.get(key).state;
-        svcTickets.set(key, { state: SVC_PENDING });
+        const entry = { state: SVC_PENDING };
+        svcTickets.set(key, entry);
         d.queue.onSubmittedWorkDone()
-          .then(() => { const t = svcTickets.get(key); if (t) t.state = SVC_DONE; })
-          .catch(() => { svcTickets.set(key, { state: -3 }); });
+          .then(() => { entry.state = SVC_DONE; })
+          .catch(() => { entry.state = -3; });
         return SVC_PENDING;
+      },
+
+      // A contract reset ends the page device. Retiring it first advances the
+      // epoch and tells every consumer of the shared device, synchronously, so
+      // the provider sees the transition in the same step; destroying it then
+      // releases everything made from it. The next `init` opens a successor.
+      host_gpu_service_reset: () => {
+        const d = gpuService.device;
+        if (!d) return -1;
+        gpuService.retire(d, 'destroyed', 'Device was reset.');
+        d.destroy();
+        return 0;
       },
 
       // The device epoch. A bump means every handle minted before it is dead;

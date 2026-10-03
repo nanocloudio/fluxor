@@ -318,11 +318,12 @@ shaders as data and describes the work as a command stream.
   The command byte layout is documented in the module doc-comment in
   `src/platform/wasm/gpu.rs`. Present timing is the application's
   decision — pace it on the audio `STREAM_TIME` clock for A/V sync.
-- **Compute** (`wasm_browser_compute`, `capabilities =
-  ["gpu.compute"]`) → `host_gpu_service_*`: the generic GPU contract
-  (`docs/architecture/gpu_contract.md`) — program packs, buffers and
-  bounded views, dependency-ordered submissions, fences, structured
-  outcomes and readback. Validation, handles, sealing, residency,
+- **Contract** (`wasm_browser_compute`, `capabilities =
+  ["gpu.compute", "gpu.render"]`) → `host_gpu_service_*`: the generic
+  GPU contract (`docs/architecture/gpu_contract.md`) — program packs,
+  buffers, textures and bounded views, compute and raster pipelines,
+  dependency-ordered submissions, fences, structured outcomes,
+  readback and device reset. Validation, handles, sealing, residency,
   output commit and epochs are the shared cores; the JavaScript half
   owns device objects and nothing else.
 
@@ -333,6 +334,12 @@ wrote could not be bound as raster geometry without a CPU round trip at
 every hand-off. Sharing a device does not merge the surfaces'
 capabilities or oblige either to own a swapchain — it only makes the
 hand-off expressible.
+
+Sharing a device also shares its end. When the device is lost, or a
+contract reset destroys it, every surface on the page sees the same
+loss: the contract provider reports it as a new epoch and opens a
+successor; the raster surface initialises again, and refuses commands
+naming pipelines, targets or buffers until the app sends them again.
 
 The browser backend is WebGPU. The compute surface's contract is the
 same one the native (`linux_gpu`) and replay (`gpu_replay`)

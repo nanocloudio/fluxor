@@ -62,7 +62,7 @@ debug with one.
 |---|---|---|---|
 | `gpu_replay` | `modules/foundation/gpu_replay` | Byte arena, fixture transformation | compute, readback, device reset |
 | `linux_gpu` | `src/platform/linux/gpu.rs` (`--features host-gpu`) | wgpu on Vulkan, headless | compute, raster, compute→raster, readback, device reset |
-| `wasm_browser_compute` | `src/platform/wasm/gpu_compute.rs` | WebGPU, shared page device | compute, readback |
+| `wasm_browser_compute` | `src/platform/wasm/gpu_compute.rs` | WebGPU, shared page device | compute, raster, compute→raster, readback, device reset |
 
 None of them advertises shared surfaces or preemption, because none implements
 them. A capability record is worth nothing if it reports the union of what some
@@ -78,6 +78,16 @@ reads with no CPU detour. It advertises `DEVICE_RESET` because the reset polls
 the device to quiescence before destroying anything, and reclaims the old
 epoch's memory only after that poll returns — which is a demonstration, where
 recreating an adapter would have been a hope.
+
+`wasm_browser_compute` executes the same raster half on WebGPU, with texture
+readback de-padded from WebGPU's 256-byte row pitch into the same packed
+layout. Its device is the page's one device, shared with every other GPU
+surface there, which is what makes `COMPUTE_TO_RASTER` hold. It advertises
+`DEVICE_RESET` because the reset is `GPUDevice.destroy()`: WebGPU, not the
+page, keeps memory alive until no submitted work can reach it, and every
+object of the old epoch is gone with the device. The provider opens a
+successor and reads its limits afresh, and every other consumer of the page
+device sees the same loss and initialises again.
 
 `gpu_replay` exists for two reasons. It is the correctness oracle every other
 backend is held to — the same lifetime and fault corpus runs there with no
@@ -217,6 +227,10 @@ two providers. Its decoder refuses what it can check: a depth format in the
 colour slot, depth state with no attachment to honour it, an attribute running
 past the stride, two attributes at one location, an unallocated format.
 
+A raster program's pack entry names its vertex function. Its module carries
+exactly one `@fragment` function, which every provider selects by stage
+rather than by name; a module with more than one fails to build its pipeline.
+
 A depth attachment is pass-local. Nothing outside a pass names, binds, copies
 or reads one back, so `PASS_DEPTH` asks the provider to supply one against the
 target's extent instead of the handle table carrying it. A provider that
@@ -304,9 +318,13 @@ A drain completes on physical quiescence, never on an empty channel. A reset
 terminates every outstanding request with `DEVICE_LOST`, bumps the device
 epoch, invalidates every handle, fence, surface and pipeline-cache reference,
 and only then reclaims memory — a timeout alone frees nothing. Reset is
-advertised only where it has been demonstrated: `gpu_replay` clears a byte
-arena, which is verified quiescence; the native and browser providers do not
-claim it, because recreating an adapter is not a proof.
+advertised only where reclamation follows quiescence by construction:
+`gpu_replay` clears a byte arena, which has nothing in flight; `linux_gpu`
+polls the device to completion before destroying anything and reports a
+failed poll as a failed reset; `wasm_browser_compute` destroys the device,
+which WebGPU defines as safe against work still queued. Requests after a reset
+belong to the new epoch and are admitted only once the provider holds the
+device that serves it.
 
 ## 15. Composition
 
@@ -326,9 +344,6 @@ Named here so nothing above reads as more than it is.
 
 - **Presentation sinks.** The contract carries surface leases and the device
   model validates them. No provider exports one.
-- **Browser raster.** `linux_gpu` executes the raster half; the browser
-  provider does not yet, so a consumer drawing through both needs the native
-  one today.
 - **Direct V3D.** Bare-metal V3D does not inherit Linux's GPU services.
   Selecting MMIO, interrupts, power/clock/reset, address translation and cache
   policy needs silicon evidence from pinned sources and a rig, and the kernel

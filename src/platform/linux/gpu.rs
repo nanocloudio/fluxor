@@ -891,11 +891,10 @@ mod worker {
                 },
                 depth_stencil: depth,
                 multisample: wgpu::MultisampleState::default(),
-                // The fragment entry point shares the vertex entry's name.
-                // One pack, one entry: the contract's program envelope names
-                // a single entry point, and splitting it would need a second
-                // field in the manifest rather than a convention invented
-                // here.
+                // The program envelope names one entry, the vertex stage's.
+                // A raster module carries exactly one `@fragment` function, and
+                // `None` selects it: WGSL needs distinct names for the two
+                // stages, so reusing the vertex name could never resolve.
                 fragment: Some(wgpu::FragmentState {
                     module,
                     entry_point: None,
@@ -1858,7 +1857,7 @@ fn drain_pending_bytes(
 /// Everything crossing the thread boundary is copied here, because the record
 /// it came from is gone by the time the queue writes it. That copy is the
 /// explicit transfer cost this contract insists on reporting rather than
-/// hiding.
+/// hiding. Answers whether admission may continue past this record.
 #[allow(
     clippy::too_many_arguments,
     reason = "the disjoint borrows the step split out of one state struct; \
@@ -2119,11 +2118,13 @@ fn translate(
             //
             // Dispatched from the step's ready loop like a drain, not sent
             // from here, so one place decides when a fence's work reaches the
-            // device.
+            // device. Admission stops at this record: anything admitted after
+            // it belongs to the new epoch, and its objects would reach the
+            // worker ahead of the reset job and be destroyed by it.
             let _ = fence;
             deferred.clear();
             program_source.clear();
-            true
+            false
         }
 
         Work::ExportSurface { fence, .. } => {

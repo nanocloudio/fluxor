@@ -21,14 +21,21 @@ builtin = true
 # step cannot wait for a driver and a synchronous pipeline create would stall
 # the shared device's whole timeline behind one compile.
 
-capabilities = ["gpu.compute"]
+capabilities = ["gpu.compute", "gpu.render"]
 
 [capability_facts."gpu.compute"]
 backend  = "webgpu"
 readback = "yes"
-# No device-resident surface is handed to a sink from here: presenting without
-# a readback is the raster half's work, and this provider is the compute half.
-# Declaring otherwise would be a capability nothing honours.
+# No device-resident surface is handed to a sink: no surface lease is
+# exported, and declaring one would be a capability nothing honours.
+shared_surface = "no"
+
+# Raster through the contract — textures, raster pipelines, passes and draws —
+# on the same page device, so a dispatch can write the geometry a later draw
+# reads. Composed independently of compute, on the same terms.
+[capability_facts."gpu.render"]
+backend  = "webgpu"
+readback = "yes"
 shared_surface = "no"
 
 [[ports]]
