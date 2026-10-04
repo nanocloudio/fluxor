@@ -1145,6 +1145,15 @@ const MSG_CLOSED: u8 = 0x03;
 /// carries its own copy of the opcode table; the contract module is the
 /// authority.
 const CLOSED_ID_GRACE_MS: u32 = 5_000;
+/// How long a deferred `CMD_CLOSE` waits for the connection's queued bytes to
+/// reach the wire before closing anyway.
+///
+/// The wait exists so a close does not discard what the consumer already
+/// handed over (RFC 793 §3.5). It is bounded because a peer that has stopped
+/// reading would otherwise hold the slot and its descriptor for good: past
+/// this the remainder is dropped, loudly, which is a reported loss rather than
+/// a silent one.
+const CLOSE_DRAIN_MAX_MS: u64 = 10_000;
 const MSG_BOUND: u8 = 0x04;
 const MSG_CONNECTED: u8 = 0x05;
 const MSG_ERROR: u8 = 0x06;
@@ -1250,6 +1259,15 @@ struct LinuxNetConn {
     /// listener is bound to. Used by `linux_net_cmd_bind` to recognise
     /// re-binds on the same port. Zero for non-listener slots.
     port: u16,
+    /// `CMD_CLOSE` arrived while `write_buf` still held unsent bytes. The
+    /// close waits for them: RFC 793 §3.5 has CLOSE transmit everything
+    /// already queued, and `close(2)` over a live backlog drops it — the peer
+    /// then reads a clean FIN on a response short by exactly that much, with
+    /// no error anywhere to say so. The bare-metal `ip` module defers its FIN
+    /// for the same reason.
+    close_when_drained: bool,
+    /// When the deferred close gives up and closes regardless.
+    close_deadline: Option<std::time::Instant>,
     /// Bytes already drained from `write_buf`.
     write_offset: u32,
     /// Total valid bytes in `write_buf` (drained slice is `[offset..len]`).
@@ -1313,6 +1331,8 @@ impl LinuxNetConn {
             conn_type: 0,
             state: 0,
             port: 0,
+            close_when_drained: false,
+            close_deadline: None,
             write_offset: 0,
             write_len: 0,
             connect_tag: 0,
@@ -3145,9 +3165,42 @@ unsafe fn linux_net_drain_writes(st: &mut LinuxNetState) -> bool {
         if backlog_full(st.write_buf_max, still_pending) {
             heavy_pending = true;
         }
+        if c.close_when_drained
+            && c.close_deadline
+                .is_some_and(|t| std::time::Instant::now() >= t)
+        {
+            log::warn!(
+                "[linux_net] conn {i}: closing with {still_pending} bytes undelivered \u{2014} the \
+                 peer stopped reading for {CLOSE_DRAIN_MAX_MS}ms"
+            );
+            let fd = c.fd;
+            let lane = c.lane as usize;
+            let cb = (i as u16).to_le_bytes();
+            st.conns[i] = LinuxNetConn::empty();
+            if fd >= 0 {
+                libc::close(fd);
+            }
+            let msg = [MSG_CLOSED, cb[0], cb[1]];
+            linux_net_send_msg(st, lane, &msg);
+            continue;
+        }
         if c.write_offset >= c.write_len {
             c.write_offset = 0;
             c.write_len = 0;
+            if c.close_when_drained {
+                // Everything queued is on the wire: the deferred close runs
+                // now, and reports as any other close does.
+                let fd = c.fd;
+                let lane = c.lane as usize;
+                let cb = (i as u16).to_le_bytes();
+                st.conns[i] = LinuxNetConn::empty();
+                if fd >= 0 {
+                    libc::close(fd);
+                }
+                let msg = [MSG_CLOSED, cb[0], cb[1]];
+                linux_net_send_msg(st, lane, &msg);
+                continue;
+            }
         }
     }
     heavy_pending
@@ -3196,6 +3249,16 @@ unsafe fn linux_net_cmd_close(st: &mut LinuxNetState, conn_id: u16) {
         // The consumer answered MSG_CLOSED within the grace interval: the id
         // is released now, and MSG_CLOSED is not repeated.
         st.conns[idx] = LinuxNetConn::empty();
+        return;
+    }
+    if st.conns[idx].fd >= 0 && st.conns[idx].write_len > st.conns[idx].write_offset {
+        // Queued bytes first. The drain sweep finishes the close once they
+        // are on the wire; until then the slot stays live so nothing reuses
+        // the id, and the consumer is answered `MSG_CLOSED` only when the
+        // close has actually happened.
+        st.conns[idx].close_when_drained = true;
+        st.conns[idx].close_deadline =
+            Some(std::time::Instant::now() + std::time::Duration::from_millis(CLOSE_DRAIN_MAX_MS));
         return;
     }
     if st.conns[idx].fd >= 0 {

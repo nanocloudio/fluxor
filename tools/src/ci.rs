@@ -1571,20 +1571,33 @@ fn path_with_first(dir: &Path, path: Option<std::ffi::OsString>) -> Option<std::
 
 /// Make `cmd` run against the CLI that is running the gate: its `PATH`
 /// begins with a directory whose `fluxor` is this binary, and `$FLUXOR_BIN`
-/// names it. A test suite or script that shells out to `fluxor` then
+/// is that `fluxor`. A test suite or script that shells out to `fluxor` then
 /// exercises the tree under test, not whatever stale `fluxor` is installed.
 /// Every subprocess phase that may call `fluxor` is built through here, under
 /// a [`RunningCli`] guard.
+///
+/// Both handles name the binary through a path CALLED `fluxor`, which is
+/// what makes them interchangeable. A child may resolve the bare name on
+/// PATH or exec `$FLUXOR_BIN` directly, and either way argv[0] is `fluxor`
+/// and the subcommand parse runs. Handing out `current_exe()` instead would
+/// work on PATH and fail on exec: under the launcher that path is a
+/// digest-named store blob, whose basename reaches the applet dispatch as an
+/// applet name (see [`self_invoke`], which pins argv[0] for the same
+/// reason). `$FLUXOR_BIN` falls back to the raw path only where no such
+/// directory could be made — the case where PATH is not fixed up either, so
+/// a child has nothing better to go on.
 pub(crate) fn with_running_cli(cmd: &mut Command) -> &mut Command {
     let Some(exe) = running_exe() else {
         return cmd;
     };
+    let mut named = exe.clone();
     if let Some(dir) = cli_dir_for(&exe, &std::env::temp_dir()) {
         if let Some(path) = path_with_first(&dir, std::env::var_os("PATH")) {
             cmd.env("PATH", path);
         }
+        named = dir.join("fluxor");
     }
-    cmd.env("FLUXOR_BIN", exe)
+    cmd.env("FLUXOR_BIN", named)
 }
 
 /// Scope guard for subprocess phases that run through
@@ -3217,11 +3230,25 @@ mod tests {
     /// PATH with the directory holding it, whatever `fluxor` an inherited
     /// PATH would have found; the guard removes the private directory on
     /// drop and the next child gets it back.
+    ///
+    /// `$FLUXOR_BIN` is that same `fluxor`, not `current_exe()`: a child that
+    /// execs it by path must land on a basename the applet dispatch reads as
+    /// `fluxor`, which a digest-named store blob is not.
     #[test]
     fn a_child_resolves_fluxor_to_the_running_binary_first() {
         let exe = std::env::current_exe().unwrap();
         let check = |(path, found, bin): (String, String, String)| {
-            assert_eq!(std::path::Path::new(&bin), exe);
+            let bin = std::path::Path::new(&bin);
+            assert_eq!(
+                bin.file_name().and_then(|n| n.to_str()),
+                Some("fluxor"),
+                "$FLUXOR_BIN must be a path called `fluxor`, not {bin:?}"
+            );
+            assert_eq!(
+                std::fs::canonicalize(bin).unwrap(),
+                std::fs::canonicalize(&exe).unwrap(),
+                "$FLUXOR_BIN must be the running binary"
+            );
             assert_eq!(
                 std::fs::canonicalize(&found).unwrap(),
                 std::fs::canonicalize(&exe).unwrap(),

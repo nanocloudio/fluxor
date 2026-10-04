@@ -654,12 +654,62 @@ const READ_EMPTY: ReadSlot = ReadSlot {
     grant: None,
 };
 
+/// A `PUT_STREAMED_OPEN`-opened write slot: the bytes staged so far, and the
+/// condition the commit will be judged by.
+///
+/// Staged in memory because that is where this store keeps objects anyway —
+/// `PUT` takes a whole body and `apply_local` holds it — so a temp file would
+/// buy nothing a single-shot `PUT` does not already pay. `STORE_STAGE_MAX`
+/// bounds one stream so a caller that never commits is refused rather than
+/// being allowed to exhaust the node; a provider for bulk objects stages to
+/// disk instead and advertises the same contract.
+struct WriteSlot {
+    in_use: bool,
+    /// Set by `COMMIT`: the bytes have landed and the handle awaits `CLOSE`.
+    committed: bool,
+    key: String,
+    staged: Vec<u8>,
+    /// Stated at `OPEN`, evaluated at `COMMIT` — the contract's single
+    /// linearization point, which is why it is kept rather than checked here.
+    precondition: Precondition,
+    /// The grant the slot was opened under, which it dies with.
+    grant: Option<usize>,
+}
+const WRITE_EMPTY: WriteSlot = WriteSlot {
+    in_use: false,
+    committed: false,
+    key: String::new(),
+    staged: Vec::new(),
+    precondition: Precondition::Any,
+    grant: None,
+};
+
+/// Streaming writes open at once. Matched to `STORE_MAX_READS`, and for the
+/// same reason: one slot per operation a node has in flight, and an S3 server
+/// fronting this store streams every object write.
+const STORE_MAX_WRITES: usize = 32;
+
+/// Bytes one streaming write may stage before `COMMIT`. Past it the write is
+/// refused `ENOSPC` rather than growing until the node dies.
+const STORE_STAGE_MAX: usize = 64 * 1024 * 1024;
+
+/// Most a `PUT_STREAMED_OPEN` size hint may reserve up front. The hint is the
+/// caller's, so it is taken as advice and not as an allocation request; past
+/// this the staging buffer grows as the bytes arrive.
+const STORE_STAGE_RESERVE_MAX: u64 = 1024 * 1024;
+
 /// Grants presented to a guarded store at once. A presentation past it is
 /// refused `ENOMEM` until one is closed; none is evicted, because an evicted
 /// grant is a caller whose next operation silently starts failing.
 const STORE_MAX_GRANTS: usize = 64;
 
-/// Grant handles are store slots from here up, apart from read slots.
+/// Streaming-write handles are store slots from here up to `GRANT_SLOT_BASE`.
+/// A band of its own, so a handle names exactly one kind of slot and the
+/// grant-close path below cannot mistake a write for a grant.
+const WRITE_SLOT_BASE: usize = 0x8000;
+
+/// Grant handles are store slots from here up, apart from read and write
+/// slots.
 const GRANT_SLOT_BASE: usize = 0x1_0000;
 
 /// A capability grant a caller presented: its scope, rights and expiry, and
@@ -693,6 +743,7 @@ impl cap::CapCrypto for KernelCrypto {
 static mut LINUX_STORE: Option<Store> = None;
 static mut LINUX_SUBS: [Sub; STORE_MAX_SUBS] = [SUB_EMPTY; STORE_MAX_SUBS];
 static mut LINUX_READS: [ReadSlot; STORE_MAX_READS] = [READ_EMPTY; STORE_MAX_READS];
+static mut LINUX_WRITES: [WriteSlot; STORE_MAX_WRITES] = [WRITE_EMPTY; STORE_MAX_WRITES];
 
 /// What `store_init_from_env` found: three outcomes, not two, because "no
 /// store was asked for" and "a store was asked for and could not be opened"
@@ -779,6 +830,19 @@ unsafe fn guarded() -> bool {
 
 fn grant_handle(i: usize) -> i32 {
     tag_fd(FD_TAG_STORAGE_OBJECT, (GRANT_SLOT_BASE + i) as i32)
+}
+
+/// The streaming-write slot `handle` names, if it is a live one.
+unsafe fn write_of(handle: i32) -> Option<usize> {
+    if handle < 0 {
+        return None;
+    }
+    let slot = slot_of(handle) as usize;
+    let i = slot.checked_sub(WRITE_SLOT_BASE)?;
+    if slot >= GRANT_SLOT_BASE || i >= STORE_MAX_WRITES {
+        return None;
+    }
+    (*core::ptr::addr_of!(LINUX_WRITES))[i].in_use.then_some(i)
 }
 
 /// The grant `handle` names, if it is a live one the caller owns.
@@ -883,6 +947,19 @@ unsafe fn admit(handle: i32, opcode: u32, a: &[u8]) -> Result<Option<usize>, i32
         let idx = slot_of(handle) as usize;
         let reads = &*core::ptr::addr_of!(LINUX_READS);
         return match reads.get(idx).and_then(|r| r.grant) {
+            Some(g) if grant_live(g) => Ok(None),
+            _ => Err(errno::EACCES),
+        };
+    }
+    if matches!(
+        opcode,
+        obj_op::PUT_STREAMED_WRITE | obj_op::PUT_STREAMED_COMMIT | obj_op::PUT_STREAMED_ABORT
+    ) {
+        // Likewise a write handle: the key was scoped once at OPEN, and the
+        // grant is re-checked for life on every call so closing it stops a
+        // stream already running.
+        let writes = &*core::ptr::addr_of!(LINUX_WRITES);
+        return match write_of(handle).and_then(|i| writes[i].grant) {
             Some(g) if grant_live(g) => Ok(None),
             _ => Err(errno::EACCES),
         };
@@ -1157,10 +1234,16 @@ pub unsafe fn dispatch_object(handle: i32, opcode: u32, arg: *mut u8, arg_len: u
             return errno::EACCES;
         };
         (&mut *core::ptr::addr_of_mut!(GRANTS))[i] = None;
-        // Read handles opened under it die with it.
+        // Read and write handles opened under it die with it; a staged
+        // write that is never committed is dropped, not landed.
         for r in (*core::ptr::addr_of_mut!(LINUX_READS)).iter_mut() {
             if r.grant == Some(i) {
                 *r = READ_EMPTY;
+            }
+        }
+        for w in (*core::ptr::addr_of_mut!(LINUX_WRITES)).iter_mut() {
+            if w.grant == Some(i) {
+                *w = WRITE_EMPTY;
             }
         }
         return 0;
@@ -1250,6 +1333,114 @@ pub unsafe fn dispatch_object(handle: i32, opcode: u32, arg: *mut u8, arg_len: u
                 Err(WriteError::Conflict(_)) => errno::EAGAIN,
                 Err(WriteError::Io(_)) => errno::ERROR,
             }
+        }
+        obj_op::PUT_STREAMED_OPEN => {
+            // [key_len:u16][key][ct_len:u8][ct][expected_size:u64]
+            // [precondition:u8][etag_len:u8][etag]
+            let Some((key, mut p)) = str_field(a) else {
+                return errno::EINVAL;
+            };
+            if !writable_key(key) {
+                return errno::EINVAL;
+            }
+            let key = key.to_string();
+            let Some(&ctl) = a.get(p) else {
+                return errno::EINVAL;
+            };
+            p += 1 + ctl as usize; // skip content-type
+            let Some(expected) = get_u64(a, p) else {
+                return errno::EINVAL;
+            };
+            p += 8;
+            // Held, not evaluated: the contract's linearization point is the
+            // commit, and a key that satisfies the condition now may not when
+            // the bytes land.
+            let Some(precondition) = read_precondition(a, &mut p) else {
+                return errno::EINVAL;
+            };
+            let writes = &mut *core::ptr::addr_of_mut!(LINUX_WRITES);
+            let Some(idx) = writes.iter().position(|w| !w.in_use) else {
+                return errno::ENOMEM;
+            };
+            writes[idx] = WriteSlot {
+                in_use: true,
+                committed: false,
+                key,
+                staged: Vec::with_capacity(expected.min(STORE_STAGE_RESERVE_MAX) as usize),
+                precondition,
+                grant,
+            };
+            tag_fd(FD_TAG_STORAGE_OBJECT, (WRITE_SLOT_BASE + idx) as i32)
+        }
+        obj_op::PUT_STREAMED_WRITE => {
+            // arg = the chunk; appended to the staged body.
+            let Some(idx) = write_of(handle) else {
+                return errno::EINVAL;
+            };
+            let writes = &mut *core::ptr::addr_of_mut!(LINUX_WRITES);
+            if writes[idx].committed {
+                return errno::EINVAL;
+            }
+            if writes[idx].staged.len() + a.len() > STORE_STAGE_MAX {
+                return errno::ENOSPC;
+            }
+            writes[idx].staged.extend_from_slice(a);
+            0
+        }
+        obj_op::PUT_STREAMED_COMMIT => {
+            // [fence_out_ptr:u64][fence_out_cap:u16]
+            let Some(idx) = write_of(handle) else {
+                return errno::EINVAL;
+            };
+            let Some((fence_ptr, fence_cap)) = fence_out(a, 0) else {
+                return errno::EINVAL;
+            };
+            let writes = &mut *core::ptr::addr_of_mut!(LINUX_WRITES);
+            if writes[idx].committed {
+                return errno::EINVAL;
+            }
+            // The staged bytes move into the store; the slot keeps its key so
+            // a later CLOSE is still well formed.
+            let body = core::mem::take(&mut writes[idx].staged);
+            let precondition = writes[idx].precondition;
+            let absent = precondition == Precondition::Absent;
+            let key = writes[idx].key.clone();
+            match store.put(&key, body, precondition) {
+                Ok(rev) => {
+                    // One `put`, so the same durability the single-shot path
+                    // reports: the log record is synced before this returns.
+                    let achieved = if store.is_durable() {
+                        Fence::LocalDurable {
+                            device_id: STORE_DEVICE_ID,
+                        }
+                    } else {
+                        Fence::RevisionMonotone {
+                            source: STORE_SOURCE,
+                            revision: rev,
+                        }
+                    };
+                    write_fence(achieved, fence_ptr, fence_cap);
+                    pump_subscriptions(store);
+                    (*core::ptr::addr_of_mut!(LINUX_WRITES))[idx].committed = true;
+                    0
+                }
+                // As for `PUT`: a create-only caller has lost the key, or a
+                // compare-and-swap caller must re-read and retry. The staged
+                // bytes are gone either way — the stream is finished, and a
+                // retry is a new one.
+                Err(WriteError::Conflict(_)) if absent => errno::EEXIST,
+                Err(WriteError::Conflict(_)) => errno::EAGAIN,
+                Err(WriteError::Io(_)) => errno::ERROR,
+            }
+        }
+        obj_op::PUT_STREAMED_ABORT => {
+            // The staged bytes are dropped and the handle released, so no
+            // CLOSE follows.
+            let Some(idx) = write_of(handle) else {
+                return errno::EINVAL;
+            };
+            (*core::ptr::addr_of_mut!(LINUX_WRITES))[idx] = WRITE_EMPTY;
+            0
         }
         obj_op::GET => {
             // arg = UTF-8 key → open a read slot, return tagged handle.
@@ -1423,6 +1614,10 @@ pub unsafe fn dispatch_object(handle: i32, opcode: u32, arg: *mut u8, arg_len: u
             n as i32
         }
         obj_op::CLOSE => {
+            if let Some(i) = write_of(handle) {
+                (*core::ptr::addr_of_mut!(LINUX_WRITES))[i] = WRITE_EMPTY;
+                return 0;
+            }
             let idx = slot_of(handle) as usize;
             let reads = &mut *core::ptr::addr_of_mut!(LINUX_READS);
             if idx < STORE_MAX_READS {

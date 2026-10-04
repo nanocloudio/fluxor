@@ -262,6 +262,8 @@ CAPACITY >= PSTATUS_ROUND | src/kernel/sys/telemetry_ring.rs
 | Service parameter name | `MAX_PARAM_NAME_BYTES` | tools/src/service_params.rs | 64 | Sanity bound on a declared parameter name |
 | Grant scope | `SCOPE_MAX` | modules/sdk/contracts/storage/object.rs | 255 | Derived, not chosen: a scope is a key prefix, so it is bounded as keys are (`STORAGE_KEY_MAX`), held equal by a const assert. A longer scope is refused at `PRESENT` |
 | Grants on a guarded store | `STORE_MAX_GRANTS` | src/platform/linux/store.rs | 64 | Policy: capability grants presented to the Linux store at once. A presentation past it is `ENOMEM` until one is closed; none is evicted, because an evicted grant is a caller whose next operation silently starts failing |
+| Staged streaming write | `STORE_STAGE_MAX` | src/platform/linux/store.rs | 67108864 | Policy: 64 MiB, the bytes one `PUT_STREAMED_*` write may stage before its commit. The store keeps objects in memory, so an open stream is the one place a caller can take the node's memory without committing anything; past it the write is `ENOSPC`. A provider for bulk objects stages to disk and carries no such bound |
+| Streaming-write size hint | `STORE_STAGE_RESERVE_MAX` | src/platform/linux/store.rs | 1048576 | Policy: 1 MiB, the most a `PUT_STREAMED_OPEN` size hint may reserve up front. The hint is the caller's, so it is advice and not an allocation request; past this the staging buffer grows as the bytes arrive |
 
 ## Tables, arenas and budgets
 
@@ -283,6 +285,8 @@ cannot be evaluated from its own file reads `—` and says why.
 | Config arena | `CONFIG_ARENA_SIZE` | modules/sdk/abi/config.rs | 262144 | Sized against the largest per-module params section (~95 KiB for an http module on the host) with headroom for the rest of the graph. A packed config larger than this is refused at boot 32 KiB on wasm, 16 KiB on embedded. |
 | One module's params section | `MAX_MODULE_CONFIG_SIZE` | modules/sdk/abi/config.rs | 262144 | Sanity bound on one module's slice of the config arena; kept in lockstep with the kernel's `MAX_MODULE_SECTION` and the CLI's params cap so the three refuse the same blob. 16 KiB on wasm; on the RP parts 16 KiB (rp2350) and 8 KiB (rp2040), taken from `[kernel] config_buffer_kb` in the silicon TOML, which the RP kernels generate their own copy from — the two must state the same size |
 | Kernel module-section bound | `MAX_MODULE_SECTION` | src/kernel/boot/config.rs | 262144 | The kernel-side twin of `MAX_MODULE_CONFIG_SIZE` (linux + wasm / bare metal): a section past it is refused while parsing, before any module is instantiated. Registered separately so the pair cannot drift apart unnoticed 32 KiB on bare metal. |
+| Store read slots | `STORE_MAX_READS` | src/platform/linux/store.rs | 32 | Policy: `GET`-opened read slots on the Linux store at once. A slot holds one value snapshot the caller drains by `RANGE_GET`, so the table bounds how many reads a node can have in flight; an open past it is `ENOMEM` |
+| Store streaming-write slots | `STORE_MAX_WRITES` | src/platform/linux/store.rs | 32 | Policy: `PUT_STREAMED_OPEN`-opened write slots at once, matched to `STORE_MAX_READS` and for the same reason — one slot per operation in flight. An S3 server fronting this store streams every object write, so writes need the depth reads have; an open past it is `ENOMEM` |
 | HTTP concurrent connections | `MAX_CONCURRENT_CONNS` | modules/sdk/abi/config.rs | 256 | Policy: the http module's own table, below `MAX_TCP_CONNS`; an accept past it is closed before any request is read. The embedded 4 is sized against the 8-slot TCP table in that profile; the one-session TLS table beneath it bounds HTTPS. 4 on embedded. |
 | HTTP per-connection receive buffer | `RECV_BUF_SIZE` | modules/sdk/abi/config.rs | 8192 | Policy: a whole request line, headers and a small body in one read; a request that does not fit is refused 431, not spilled 4096 on wasm, 2048 on embedded. |
 | HTTP per-connection send buffer | `SEND_BUF_SIZE` | modules/sdk/abi/config.rs | 4100 | Policy, deliberately 4 KiB + 4: a WebSocket frame of exactly 4096 bytes of payload plus its header fits in one write, so the RFC 6455 fragmentation path is taken only by frames that genuinely exceed it |
@@ -668,6 +672,10 @@ MAX_PARAM_STRING_BYTES | tools/src/service_params.rs | 4096 | *
 MAX_PARAM_NAME_BYTES | tools/src/service_params.rs | 64 | *
 SCOPE_MAX | modules/sdk/contracts/storage/object.rs | 255 | *
 STORE_MAX_GRANTS | src/platform/linux/store.rs | 64 | *
+STORE_MAX_READS | src/platform/linux/store.rs | 32 | *
+STORE_MAX_WRITES | src/platform/linux/store.rs | 32 | *
+STORE_STAGE_MAX | src/platform/linux/store.rs | 64 * 1024 * 1024 | *
+STORE_STAGE_RESERVE_MAX | src/platform/linux/store.rs | 1024 * 1024 | *
 ```
 
 Constants in these files that are shaped like ceilings but are not
