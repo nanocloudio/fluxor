@@ -233,44 +233,6 @@ fn find_binding(s: &MemNsState, path: &[u8]) -> Option<usize> {
     None
 }
 
-/// Whether `b` is well-formed UTF-8: no overlong forms, no surrogates,
-/// nothing past U+10FFFF. Spelled out because `core::str::from_utf8` does not
-/// link into a PIC module.
-fn is_utf8(b: &[u8]) -> bool {
-    let mut i = 0;
-    while i < b.len() {
-        let c = b[i];
-        if c < 0x80 {
-            i += 1;
-            continue;
-        }
-        // Continuation count, and the range the first continuation byte must
-        // fall in for this lead byte.
-        let (n, lo, hi) = match c {
-            0xC2..=0xDF => (1, 0x80, 0xBF),
-            0xE0 => (2, 0xA0, 0xBF),
-            0xED => (2, 0x80, 0x9F),
-            0xE1..=0xEC | 0xEE..=0xEF => (2, 0x80, 0xBF),
-            0xF0 => (3, 0x90, 0xBF),
-            0xF1..=0xF3 => (3, 0x80, 0xBF),
-            0xF4 => (3, 0x80, 0x8F),
-            _ => return false,
-        };
-        if i + n >= b.len() || b[i + 1] < lo || b[i + 1] > hi {
-            return false;
-        }
-        let mut k = 2;
-        while k <= n {
-            if b[i + k] & 0xC0 != 0x80 {
-                return false;
-            }
-            k += 1;
-        }
-        i += n + 1;
-    }
-    true
-}
-
 // ── ops ────────────────────────────────────────────────────────────
 
 /// BIND — `[path_len:u16][path][kind:u8][flags:u8][target_len:u16][target]
@@ -284,7 +246,7 @@ unsafe fn ns_bind(s: &mut MemNsState, a: &[u8]) -> i32 {
     }
     let path = &a[2..2 + pl];
     // A path is what LIST names, and a listed name is UTF-8.
-    if !is_utf8(path) {
+    if !utf8_valid(path) {
         return E_INVAL;
     }
     let kind = a[2 + pl];
@@ -399,7 +361,7 @@ unsafe fn ns_list(s: &MemNsState, a: &[u8]) -> i32 {
     // not UTF-8 or not under the prefix was not issued here.
     let mut after: Option<&[u8]> = if req.cursor.is_empty() {
         None
-    } else if req.cursor.starts_with(req.prefix) && is_utf8(req.cursor) {
+    } else if req.cursor.starts_with(req.prefix) && utf8_valid(req.cursor) {
         Some(req.cursor)
     } else {
         return E_INVAL;
@@ -471,7 +433,7 @@ unsafe fn ns_rename(s: &mut MemNsState, a: &[u8]) -> i32 {
     if dl == 0 || dl > MAX_PATH || a.len() < 2 + sl + 2 + dl + 1 + 10 {
         return E_INVAL;
     }
-    if !is_utf8(&a[2 + sl + 2..2 + sl + 2 + dl]) {
+    if !utf8_valid(&a[2 + sl + 2..2 + sl + 2 + dl]) {
         return E_INVAL;
     }
     let flags_off = 2 + sl + 2 + dl;

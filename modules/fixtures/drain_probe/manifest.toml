@@ -1,0 +1,16 @@
+version = "1.0.0"
+hardware_targets = ["bcm2712", "linux"]
+
+# Fixture for stopping a graph by draining it. It exports `module_drain`,
+# answers 0 (work in flight), and finishes that work over
+# `finish_after_steps` more steps before returning Done — the shape of a
+# module that commits staged writes and releases a lease on drain. With
+# `hold: 1` it never finishes, so a stop runs into its drain deadline.
+#
+#   [drain_probe] up                 first step
+#   [drain_probe] draining           module_drain was called
+#   [drain_probe] drained            the drain work finished; Done follows
+
+# Module-scope observability — exempt (standards/observability.md §6).
+[observability]
+exempt = "drain fixture; its '[drain_probe]' log lines are the observable, consumed by the stop-drain test"

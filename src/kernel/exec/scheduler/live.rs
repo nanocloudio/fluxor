@@ -481,8 +481,18 @@ pub fn apply_add(
         sched().edges[edge_base + i] = edge;
     }
 
-    // 4. Open only the new edges' channels. On failure, close whatever opened
-    //    and roll back (the appended edges are not yet committed to edge_count).
+    // 4. Open only the new edges' channels, sized by the new modules' declared
+    //    port capacities. On failure, close whatever opened and roll back (the
+    //    appended edges are not yet committed to edge_count).
+    {
+        // SAFETY: scheduler-thread graph-mutation context.
+        let loader = unsafe { super::static_loader() };
+        for (local, m) in sub.modules.iter().enumerate().take(n) {
+            if let ModuleSource::Pic(entry) = &m.source {
+                super::collect_one_module_hints(loader, entry, local_to_global[local]);
+            }
+        }
+    }
     if e > 0 {
         let rc = super::open_channels(&mut sched().edges[edge_base..edge_base + e]);
         if rc < 0 {

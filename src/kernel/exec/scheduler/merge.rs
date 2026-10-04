@@ -284,30 +284,6 @@ pub fn set_module_port(module_idx: usize, port_type: u8, port_index: u8, channel
     }
 }
 
-/// Maximum hints per module
-const MAX_HINTS_PER_MODULE: usize = 8;
-
-/// Per-module channel hints (buffer size requests)
-#[derive(Clone, Copy)]
-pub(crate) struct ModuleHints {
-    pub(crate) hints: [ChannelHint; MAX_HINTS_PER_MODULE],
-    pub(crate) count: usize,
-}
-
-impl ModuleHints {
-    pub(crate) const fn empty() -> Self {
-        Self {
-            hints: [ChannelHint {
-                port_type: 0,
-                port_index: 0,
-                buffer_size: 0,
-                max_record: 0,
-            }; MAX_HINTS_PER_MODULE],
-            count: 0,
-        }
-    }
-}
-
 /// Per-module arena info: (ptr, size). Null if module has no arena.
 #[derive(Copy, Clone)]
 pub(crate) struct ArenaInfo {
@@ -341,8 +317,8 @@ pub struct SchedulerState {
     pub modules: [ModuleSlot; MAX_MODULES],
     /// Per-module port assignments
     pub ports: [ModulePorts; MAX_MODULES],
-    /// Per-module channel hints (buffer size requests)
-    pub(crate) hints: [ModuleHints; MAX_MODULES],
+    /// Per-module declared port capacities (buffer size requests)
+    pub(crate) port_caps: [PortCapacities; MAX_MODULES],
     /// Per-module finished flags (done or errored)
     pub(crate) finished: [bool; MAX_MODULES],
     /// Per-module arena allocations
@@ -634,7 +610,7 @@ impl SchedulerState {
             flow_stalls: [0; MAX_CHANNELS],
             modules: [const { ModuleSlot::Empty }; MAX_MODULES],
             ports: [ModulePorts::empty(); MAX_MODULES],
-            hints: [ModuleHints::empty(); MAX_MODULES],
+            port_caps: [PortCapacities::NONE; MAX_MODULES],
             finished: [false; MAX_MODULES],
             arenas: [const { ArenaInfo::empty() }; MAX_MODULES],
             cap_class: [0; MAX_MODULES],
@@ -714,7 +690,7 @@ impl SchedulerState {
         for i in 0..MAX_MODULES {
             self.modules[i] = ModuleSlot::Empty;
             self.ports[i] = ModulePorts::empty();
-            self.hints[i] = ModuleHints::empty();
+            self.port_caps[i] = PortCapacities::NONE;
             self.finished[i] = false;
             self.arenas[i] = ArenaInfo::empty();
             self.cap_class[i] = 0;

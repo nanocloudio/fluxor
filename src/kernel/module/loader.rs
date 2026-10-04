@@ -1519,77 +1519,30 @@ impl LoadedModule {
         (v != 0).then_some(v as usize)
     }
 
-    /// Read the static port-capacity hints from the manifest's
-    /// flag-bit-5 capacity section. Needs no module code execution,
-    /// works for wasm payloads (whose packed export tables are
-    /// empty), and is covered by the signing envelope.
-    ///
-    /// Returns hints in the scheduler's `ChannelHint` shape. Manifest
-    /// port directions 0..=2 (input/output/ctrl_input) map directly to
-    /// hint port_types 0..=2; ctrl_output (3) ports and all-zero
-    /// entries are skipped. `(_, 0)` when the manifest is absent,
-    /// malformed, or carries no capacity section.
-    pub fn manifest_port_capacities(&self) -> ([ChannelHint; 8], usize) {
-        let mut out = [ChannelHint {
-            port_type: 0,
-            port_index: 0,
-            buffer_size: 0,
-            max_record: 0,
-        }; 8];
-        let manifest_size = self.header.manifest_size() as usize;
-        if manifest_size < 17 {
-            return (out, 0);
+    /// The static port capacities from the manifest's flag-bit-5
+    /// section. Needs no module code execution, works for wasm payloads
+    /// (whose packed export tables are empty), and is covered by the
+    /// signing envelope. Every port is answerable: the table points into
+    /// the manifest rather than copying a bounded subset out of it.
+    /// [`PortCapacities::NONE`] when the manifest is absent, malformed,
+    /// or carries no capacity section.
+    pub fn port_capacities(&self) -> PortCapacities {
+        let (p, size, flags, layout) = match self.manifest_view() {
+            Some(v) => v,
+            None => return PortCapacities::NONE,
+        };
+        if flags & 0x20 == 0 {
+            return PortCapacities::NONE;
         }
-        let code_size = self.header.code_size as usize;
-        let data_size = self.header.data_size as usize;
-        let export_size = self.header.export_count as usize * 8;
-        let schema_size = self.header.schema_size() as usize;
-        let manifest_offset =
-            ModuleHeader::SIZE + code_size + data_size + export_size + schema_size;
-        // SAFETY: manifest_offset + manifest_size lies inside the .fmod
-        // mapping (validated at load time); every read below is bounds-
-        // checked against manifest_size first.
-        unsafe {
-            let p = offset_ptr(self.base, manifest_offset);
-            let magic = u32::from_le_bytes([*p, *p.add(1), *p.add(2), *p.add(3)]);
-            if magic != 0x464D5846 {
-                return (out, 0);
-            } // "FXMF"
-            let flags = *p.add(14);
-            if flags & 0x20 == 0 {
-                return (out, 0); // no capacity section
-            }
-            let port_count = *p.add(5) as usize;
-            let cap_offset = ManifestLayout::of(*p.add(5), *p.add(6), *p.add(7), flags).capacity;
-            if manifest_size < cap_offset + port_count * 8 {
-                return (out, 0);
-            }
-            let mut n = 0usize;
-            for i in 0..port_count {
-                if n >= out.len() {
-                    break;
-                }
-                // Port records start after the 17-byte fixed head
-                // (permissions widened to u16 — bytes 15..17).
-                let rec = p.add(17 + i * 4);
-                let direction = *rec;
-                let index = *rec.add(3);
-                let cap = p.add(cap_offset + i * 8);
-                let buffer_size = u32::from_le_bytes([*cap, *cap.add(1), *cap.add(2), *cap.add(3)]);
-                let max_record =
-                    u32::from_le_bytes([*cap.add(4), *cap.add(5), *cap.add(6), *cap.add(7)]);
-                if direction > 2 || (buffer_size == 0 && max_record == 0) {
-                    continue;
-                }
-                out[n] = ChannelHint {
-                    port_type: direction,
-                    port_index: index,
-                    buffer_size,
-                    max_record,
-                };
-                n += 1;
-            }
-            (out, n)
+        // SAFETY: byte 5 of a manifest of at least 17 bytes.
+        let port_count = unsafe { *p.add(5) };
+        if size < layout.capacity + port_count as usize * 8 {
+            return PortCapacities::NONE;
+        }
+        PortCapacities {
+            manifest: p,
+            capacity: layout.capacity as u16,
+            port_count,
         }
     }
 
@@ -3360,46 +3313,51 @@ impl Module for DynamicModule {
 // ============================================================================
 // Channel Hints Query
 // ============================================================================
-/// Per-port buffer size hint from a module.
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct ChannelHint {
-    /// Port direction: 0=in, 1=out, 2=ctrl
-    pub port_type: u8,
-    /// Port index within that direction
-    pub port_index: u8,
-    /// Requested buffer size in bytes (0 = use default).
-    /// 2 bytes of natural alignment padding precede this field.
-    pub buffer_size: u32,
-    /// Largest single channel_write this port issues (0 = undeclared),
-    /// from the manifest's port-capacity section.
-    pub max_record: u32,
-}
-/// Wire size of one `ChannelHint` slot. Sourced from `abi::wire` so
-/// the kernel reader and the SDK writer agree on the layout.
-/// Maximum number of hints we can collect per module
-/// Look up the declared max single-write size for a specific port.
-/// Returns 0 when undeclared.
-pub fn find_max_record_for_port(hints: &[ChannelHint], port_type: u8, port_index: u8) -> u32 {
-    for hint in hints {
-        if hint.port_type == port_type && hint.port_index == port_index {
-            return hint.max_record;
-        }
-    }
-    0
+/// A module's declared per-port capacities, read in place from its
+/// manifest. The pointer stays valid while the module image is mapped,
+/// which spans the graph the module belongs to.
+#[derive(Clone, Copy)]
+pub struct PortCapacities {
+    manifest: *const u8,
+    /// Offset of the capacity section within the manifest.
+    capacity: u16,
+    port_count: u8,
 }
 
-/// Look up buffer size hint for a specific port.
-///
-/// Returns the requested buffer size, or 0 if no hint exists (use default).
-pub fn find_hint_for_port(hints: &[ChannelHint], port_type: u8, port_index: u8) -> u32 {
-    for hint in hints {
-        if hint.port_type == port_type && hint.port_index == port_index {
-            return hint.buffer_size;
+impl PortCapacities {
+    pub const NONE: Self = Self {
+        manifest: core::ptr::null(),
+        capacity: 0,
+        port_count: 0,
+    };
+
+    /// `(buffer_size, max_record)` declared for a port, `(0, 0)` when
+    /// undeclared. `port_type` is the manifest direction: 0=in, 1=out,
+    /// 2=ctrl_input.
+    pub fn lookup(&self, port_type: u8, port_index: u8) -> (u32, u32) {
+        if self.manifest.is_null() {
+            return (0, 0);
         }
+        for i in 0..self.port_count as usize {
+            // SAFETY: `port_capacities` checked that the port records
+            // (17 + i*4) and the capacity section (capacity + i*8) both
+            // lie inside the manifest.
+            unsafe {
+                let rec = self.manifest.add(17 + i * 4);
+                if *rec != port_type || *rec.add(3) != port_index {
+                    continue;
+                }
+                let cap = self.manifest.add(self.capacity as usize + i * 8);
+                let buffer_size = u32::from_le_bytes([*cap, *cap.add(1), *cap.add(2), *cap.add(3)]);
+                let max_record =
+                    u32::from_le_bytes([*cap.add(4), *cap.add(5), *cap.add(6), *cap.add(7)]);
+                return (buffer_size, max_record);
+            }
+        }
+        (0, 0)
     }
-    0
 }
+
 // ============================================================================
 // Export resolution for provider dispatch
 // ============================================================================

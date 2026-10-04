@@ -424,11 +424,11 @@ fn generate_config_impl(
             // that will serve, and the composer is where that is cheapest to
             // hear.
             if let Some(key_path) = m.get("key_file").and_then(|v| v.as_str()) {
-                let der = std::fs::read(key_path).map_err(|e| {
-                    Error::Config(format!(
-                        "modules[{i}] ({name}): key_file '{key_path}' could not be read: {e}"
-                    ))
-                })?;
+                let der = crate::trust_anchors::read_der_file(
+                    std::path::Path::new(key_path),
+                    crate::trust_anchors::KEY_LABELS,
+                )
+                .map_err(|e| Error::Config(format!("modules[{i}] ({name}): key_file: {e}")))?;
                 let facts_key = facts_owned.as_deref().unwrap_or(silicon);
                 let facts = crate::target_facts::TargetFacts::for_silicon(facts_key);
                 let key = crate::identity_key::classify(&der);

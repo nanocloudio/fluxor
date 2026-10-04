@@ -32,7 +32,7 @@ pub const MAX_PARAMS: usize = 64;
 /// Longest string value, in bytes, a parameter accepts — from a default, an
 /// example, `--param` or a `--params` file. Values are paths, hosts and
 /// identifiers; a multi-kilobyte value is a file's contents, and a file is
-/// passed by path.
+/// passed by path, as a `file` parameter.
 pub const MAX_PARAM_STRING_BYTES: usize = 4096;
 
 /// Longest parameter name, in bytes.
@@ -46,12 +46,21 @@ const PLACEHOLDER: &str = "${param:";
 // ============================================================================
 
 /// A declared parameter's type.
+///
+/// A `file` is a path to a file the consumer supplies at run time — a CA
+/// bundle, a certificate, a key — that the graph names where a module takes
+/// a path (`cert_file: ${param:cert}`, `trust: "${file:${param:ca}}"`). Its
+/// value renders as the file's absolute path, and a run is refused before
+/// anything is built when the file is not there. It has no default: the
+/// file is the consumer's, not the bundle's. Its example names a sample
+/// relative to the source manifest, which the checks build with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ParamType {
     String,
     Integer,
     Boolean,
+    File,
 }
 
 impl ParamType {
@@ -60,6 +69,7 @@ impl ParamType {
             ParamType::String => "a string",
             ParamType::Integer => "an integer",
             ParamType::Boolean => "a boolean",
+            ParamType::File => "a file path",
         }
     }
 }
@@ -80,6 +90,11 @@ impl ParamValue {
             ParamValue::Integer(_) => ParamType::Integer,
             ParamValue::String(_) => ParamType::String,
         }
+    }
+
+    /// Whether this value can be a `ty`: a file is carried as its path.
+    fn is(&self, ty: ParamType) -> bool {
+        self.ty() == ty || (ty == ParamType::File && self.ty() == ParamType::String)
     }
 
     fn to_yaml(&self) -> serde_yaml::Value {
@@ -159,7 +174,9 @@ fn toml_type_word(v: &toml::Value) -> &'static str {
 /// A TOML value as the declared type, or an error naming both.
 fn typed_toml(what: &str, ty: ParamType, v: &toml::Value) -> Result<ParamValue, String> {
     match (ty, v) {
-        (ParamType::String, toml::Value::String(s)) => Ok(ParamValue::String(s.clone())),
+        (ParamType::String | ParamType::File, toml::Value::String(s)) => {
+            Ok(ParamValue::String(s.clone()))
+        }
         (ParamType::Integer, toml::Value::Integer(i)) => Ok(ParamValue::Integer(*i)),
         (ParamType::Boolean, toml::Value::Boolean(b)) => Ok(ParamValue::Boolean(*b)),
         _ => Err(format!(
@@ -204,7 +221,7 @@ pub fn parse_source_params(table: &toml::Table) -> Result<BTreeMap<String, Param
 /// A value against its parameter's declaration: type, integer bounds,
 /// string length, and no NUL byte in a string.
 fn check_value(name: &str, spec: &ParamSpec, v: &ParamValue) -> Result<(), String> {
-    if v.ty() != spec.ty {
+    if !v.is(spec.ty) {
         return Err(format!(
             "param '{name}' is {}, got {}",
             spec.ty.label(),
@@ -260,6 +277,12 @@ pub fn validate_schema(params: &BTreeMap<String, ParamSpec>) -> Vec<String> {
                 "param '{name}' is optional but declares no default; an omitted value must still render"
             ));
         }
+        if spec.ty == ParamType::File && spec.default.is_some() {
+            errors.push(format!(
+                "param '{name}' is a file and declares a default; the file is the consumer's — \
+                 declare it required, with an example"
+            ));
+        }
         if spec.required && spec.example.is_none() {
             errors.push(format!(
                 "param '{name}' is required but declares no example; the ci gate renders the graph \
@@ -289,17 +312,58 @@ pub fn validate_schema(params: &BTreeMap<String, ParamSpec>) -> Vec<String> {
 }
 
 /// The value every parameter takes when the graph is checked without a
-/// consumer: its default, else its example.
-pub fn check_values(params: &BTreeMap<String, ParamSpec>) -> BTreeMap<String, ParamValue> {
-    params
-        .iter()
-        .filter_map(|(n, s)| {
-            s.default
-                .clone()
-                .or_else(|| s.example.clone())
-                .map(|v| (n.clone(), v))
-        })
-        .collect()
+/// consumer: its default, else its example. A file example names a sample
+/// relative to `source_dir`, the source manifest's directory, and is
+/// refused when the sample is not there.
+pub fn check_values(
+    params: &BTreeMap<String, ParamSpec>,
+    source_dir: &Path,
+) -> Result<BTreeMap<String, ParamValue>, String> {
+    let mut out = BTreeMap::new();
+    let mut errors = Vec::new();
+    for (name, spec) in params {
+        let Some(v) = spec.default.clone().or_else(|| spec.example.clone()) else {
+            continue;
+        };
+        let v = match (spec.ty, v) {
+            (ParamType::File, ParamValue::String(p)) => {
+                match existing_file(name, &source_dir.join(&p)) {
+                    Ok(abs) => ParamValue::String(abs),
+                    Err(e) => {
+                        errors.push(format!("example: {e}"));
+                        continue;
+                    }
+                }
+            }
+            (_, v) => v,
+        };
+        out.insert(name.clone(), v);
+    }
+    if errors.is_empty() {
+        Ok(out)
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+/// `path` as an absolute path to a file that can be read, or an error
+/// naming parameter `name`.
+fn existing_file(name: &str, path: &Path) -> Result<String, String> {
+    let abs = std::path::absolute(path)
+        .map_err(|e| format!("param '{name}': {}: {e}", path.display()))?;
+    std::fs::File::open(&abs)
+        .and_then(|f| f.metadata())
+        .map_err(|e| format!("param '{name}': {}: {e}", abs.display()))
+        .and_then(|m| {
+            if m.is_file() {
+                Ok(())
+            } else {
+                Err(format!("param '{name}': {} is not a file", abs.display()))
+            }
+        })?;
+    abs.into_os_string()
+        .into_string()
+        .map_err(|_| format!("param '{name}': {} is not UTF-8", path.display()))
 }
 
 // ============================================================================
@@ -520,7 +584,7 @@ pub fn read_values_file(path: &Path) -> Result<BTreeMap<String, toml::Value>, St
 /// A `--param` string as the declared type.
 fn typed_flag(name: &str, ty: ParamType, raw: &str) -> Result<ParamValue, String> {
     match ty {
-        ParamType::String => Ok(ParamValue::String(raw.to_string())),
+        ParamType::String | ParamType::File => Ok(ParamValue::String(raw.to_string())),
         ParamType::Integer => raw.parse::<i64>().map(ParamValue::Integer).map_err(|_| {
             format!("--param {name}={raw}: '{name}' is an integer, and {raw:?} is not one")
         }),
@@ -536,8 +600,11 @@ fn typed_flag(name: &str, ty: ParamType, raw: &str) -> Result<ParamValue, String
 
 /// The values one run uses: the `--params` file, overridden by `--param`
 /// flags, with defaults for the rest. Every refusal — an unknown name, a
-/// missing required value, a type or range error, values given to a bundle
-/// that declares no parameters — is collected and reported together.
+/// missing required value, a type or range error, a file that is not there,
+/// values given to a bundle that declares no parameters — is collected and
+/// reported together. A file value becomes the file's absolute path; a
+/// relative one is taken from the working directory (the caller makes a
+/// values file's paths relative to that file first).
 pub fn resolve_values(
     params: &BTreeMap<String, ParamSpec>,
     file: &BTreeMap<String, toml::Value>,
@@ -597,6 +664,16 @@ pub fn resolve_values(
     }
 
     for (name, spec) in params {
+        if spec.ty == ParamType::File {
+            if let Some(ParamValue::String(p)) = values.get(name) {
+                match existing_file(name, Path::new(p)) {
+                    Ok(abs) => {
+                        values.insert(name.clone(), ParamValue::String(abs));
+                    }
+                    Err(e) => errors.push(e),
+                }
+            }
+        }
         if values.contains_key(name) {
             continue;
         }
@@ -767,7 +844,8 @@ pub fn check_source(path: &Path) -> Result<Vec<(PathBuf, String)>, String> {
     if !errors.is_empty() {
         return Err(format!("{}: {}", path.display(), errors.join("; ")));
     }
-    let values = check_values(&src.params);
+    let values = check_values(&src.params, path.parent().unwrap_or(Path::new(".")))
+        .map_err(|e| format!("{}: {e}", path.display()))?;
     graphs
         .into_iter()
         .map(|(graph, template)| {
@@ -1025,6 +1103,96 @@ default = false
         let e = resolve_values(&BTreeMap::new(), &BTreeMap::new(), &[flag("port=1")]).unwrap_err();
         assert!(e.contains("declares no parameters"), "{e}");
         assert!(resolve_values(&BTreeMap::new(), &BTreeMap::new(), &[]).is_ok());
+    }
+
+    /// A scratch directory holding `ca.pem`, unique to this test.
+    fn scratch_with_ca(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("fluxor-file-param-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("testdata")).unwrap();
+        std::fs::write(dir.join("testdata/ca.pem"), "pem").unwrap();
+        dir
+    }
+
+    const FILE_SCHEMA: &str = r#"
+[params.ca]
+type = "file"
+required = true
+example = "testdata/ca.pem"
+description = "CA bundle"
+"#;
+
+    #[test]
+    fn a_file_param_is_required_and_has_no_default() {
+        assert!(schema(FILE_SCHEMA).is_ok());
+        let e = schema("[params.ca]\ntype = \"file\"\ndefault = \"/etc/ca.pem\"\n").unwrap_err();
+        assert!(e.contains("is a file and declares a default"), "{e}");
+        let e = schema("[params.ca]\ntype = \"file\"\nrequired = true\nexample = 3\n").unwrap_err();
+        assert!(e.contains("must be a file path, got an integer"), "{e}");
+    }
+
+    #[test]
+    fn a_file_value_is_its_absolute_path_and_must_be_there() {
+        let flag = |s: &str| parse_flag(s).unwrap();
+        let dir = scratch_with_ca("run");
+        let p = schema(FILE_SCHEMA).unwrap();
+        let ca = dir.join("testdata/ca.pem");
+        let v = resolve_values(
+            &p,
+            &BTreeMap::new(),
+            &[flag(&format!("ca={}", ca.display()))],
+        )
+        .unwrap();
+        assert_eq!(v["ca"], ParamValue::String(ca.display().to_string()));
+
+        let missing = dir.join("nope.pem");
+        let e = resolve_values(
+            &p,
+            &BTreeMap::new(),
+            &[flag(&format!("ca={}", missing.display()))],
+        )
+        .unwrap_err();
+        assert!(e.contains("param 'ca'") && e.contains("nope.pem"), "{e}");
+        let e = resolve_values(
+            &p,
+            &BTreeMap::new(),
+            &[flag(&format!("ca={}", dir.display()))],
+        )
+        .unwrap_err();
+        assert!(e.contains("is not a file"), "{e}");
+
+        // The graph names it where a module takes a path, alone or inside a
+        // `${file:..}` source spec, and the build's environment pass leaves
+        // both as rendered.
+        let template = "modules:\n  - name: tls\n    trust: \"${file:${param:ca}}\"\n    \
+                        cert_file: ${param:ca}\n";
+        let text = render_graph_text(template, &v).unwrap();
+        let reread: serde_yaml::Value =
+            serde_yaml::from_str(&crate::env_subst::substitute(&text).unwrap()).unwrap();
+        let m = &reread["modules"][0];
+        assert_eq!(
+            m["trust"],
+            serde_yaml::Value::String(format!("${{file:{}}}", ca.display()))
+        );
+        assert_eq!(
+            m["cert_file"],
+            serde_yaml::Value::String(ca.display().to_string())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_example_is_a_sample_beside_the_source_manifest() {
+        let dir = scratch_with_ca("check");
+        let p = schema(FILE_SCHEMA).unwrap();
+        let v = check_values(&p, &dir).unwrap();
+        assert_eq!(
+            v["ca"],
+            ParamValue::String(dir.join("testdata/ca.pem").display().to_string())
+        );
+        let e = check_values(&p, &dir.join("elsewhere")).unwrap_err();
+        assert!(e.contains("example: param 'ca'"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

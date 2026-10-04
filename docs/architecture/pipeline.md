@@ -114,7 +114,6 @@ Optional exports surface additional capabilities:
 | Export | Purpose |
 |--------|--------|
 | `module_arena_size` | Request a per-module heap (see [heap.md](heap.md)) |
-| `module_channel_hints` | Request specific channel buffer sizes per port |
 | `module_drain` | Support graceful drain during live reconfigure |
 | `module_deferred_ready` | Gate downstream modules until init completes |
 | `module_mailbox_safe` | Declare safe consumption from mailbox channels |
@@ -219,12 +218,14 @@ state, so that channel sizing does not compete with module memory.
 
 ### Channel Buffer Sizing
 
-Before opening channels, the scheduler queries each module's optional
-`module_channel_hints` export to determine per-port buffer sizes.
+Before opening channels, the scheduler reads each module's per-port
+`buffer_size` and `max_record` from the port-capacity section of its
+signed manifest. No module code runs, and every declared port is
+honoured.
 Channel buffers are allocated from the buffer arena. Both the state
 arena and the buffer arena are reset on graph reconfigure.
 
-Modules without channel hints get the default 2048 bytes per port. The
+A port that declares no `buffer_size` gets the default 8192 bytes. The
 config tool validates that the sum of all channel buffers fits within
 the buffer arena for the target silicon. Typical hint choices: a few
 hundred bytes for control channels, 2048 bytes for PCM audio, several
@@ -372,8 +373,7 @@ PIC modules go through this sequence during graph setup:
 5. **Heap query** — call `module_arena_size()` if exported, reserve heap
 6. **Init** — call `module_init(syscalls)` once
 7. **New** — call `module_new(in, out, ctrl, params, params_len, state, state_size, syscalls)`
-8. **Channel hints** — call `module_channel_hints()` if exported
-9. **Wait for ready** — if `deferred_ready` flag is set, gate downstream until first `Ready` outcome
+8. **Wait for ready** — if `deferred_ready` flag is set, gate downstream until first `Ready` outcome
 
 State memory is zeroed by `alloc_state()` before `module_new` is
 called, so modules do not need to re-zero their state struct.

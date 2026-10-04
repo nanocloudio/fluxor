@@ -31,7 +31,7 @@ pub const ABI_VERSION: u32 = super::wire::ABI_VERSION as u32;
 /// channel write — byte-stream parsers see message boundaries at fixed
 /// offsets rather than scrambling across fragments. Embedded targets
 /// (rp2040 16 KiB arena, rp2350 32 KiB) constrain the upper bound;
-/// channels needing more should request it via `module_channel_hints`
+/// ports needing more declare `buffer_size` in the module manifest
 /// rather than raising this default.
 pub const CHANNEL_BUFFER_SIZE: usize = 8192;
 

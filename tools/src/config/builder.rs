@@ -2805,44 +2805,33 @@ fn build_module_entry(
         }
     }
 
-    // Tag 10: cert_file (DER blob, extended TLV for > 255 bytes)
-    if let Some(cert_path) = module.get("cert_file").and_then(|v| v.as_str()) {
-        match std::fs::read(cert_path) {
-            Ok(cert_data) => {
-                let n = cert_data.len();
-                if n > 0 && base + extra_len + 4 + n < entry.len() {
-                    entry[base + extra_len] = 10; // tag
-                    entry[base + extra_len + 1] = 0x00; // extended length marker
-                    entry[base + extra_len + 2] = (n >> 8) as u8;
-                    entry[base + extra_len + 3] = n as u8;
-                    entry[base + extra_len + 4..base + extra_len + 4 + n]
-                        .copy_from_slice(&cert_data);
-                    extra_len += 4 + n;
-                    eprintln!("  cert_file: {cert_path} ({n} bytes)");
-                }
-            }
-            Err(e) => eprintln!("  warn: cert_file: could not read '{cert_path}': {e}"),
+    // Tags 10 and 11: the instance's own certificate and private key,
+    // `cert_file` / `key_file`, each PEM or DER, embedded as DER. A file
+    // that cannot be read, decoded or carried fails the build: an instance
+    // run without the identity it was given would fail later, further from
+    // the cause.
+    for (key, tag, labels) in [
+        ("cert_file", 10u8, crate::trust_anchors::CERT_LABELS),
+        ("key_file", 11u8, crate::trust_anchors::KEY_LABELS),
+    ] {
+        let Some(path) = module.get(key).and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let der = crate::trust_anchors::read_der_file(Path::new(path), labels)
+            .map_err(|e| Error::Config(format!("module '{name}': {key}: {e}")))?;
+        let n = der.len();
+        if n > u16::MAX as usize || base + extra_len + 4 + n >= entry.len() {
+            return Err(Error::Config(format!(
+                "module '{name}': {key} '{path}' ({n} bytes) does not fit in the module entry"
+            )));
         }
-    }
-
-    // Tag 11: key_file (DER blob, extended TLV for > 255 bytes)
-    if let Some(key_path) = module.get("key_file").and_then(|v| v.as_str()) {
-        match std::fs::read(key_path) {
-            Ok(key_data) => {
-                let n = key_data.len();
-                if n > 0 && base + extra_len + 4 + n < entry.len() {
-                    entry[base + extra_len] = 11; // tag
-                    entry[base + extra_len + 1] = 0x00; // extended length marker
-                    entry[base + extra_len + 2] = (n >> 8) as u8;
-                    entry[base + extra_len + 3] = n as u8;
-                    entry[base + extra_len + 4..base + extra_len + 4 + n]
-                        .copy_from_slice(&key_data);
-                    extra_len += 4 + n;
-                    eprintln!("  key_file: {key_path} ({n} bytes)");
-                }
-            }
-            Err(e) => eprintln!("  warn: key_file: could not read '{key_path}': {e}"),
-        }
+        entry[base + extra_len] = tag;
+        entry[base + extra_len + 1] = 0x00; // extended length marker
+        entry[base + extra_len + 2] = (n >> 8) as u8;
+        entry[base + extra_len + 3] = n as u8;
+        entry[base + extra_len + 4..base + extra_len + 4 + n].copy_from_slice(&der);
+        extra_len += 4 + n;
+        eprintln!("  {key}: {path} ({n} bytes)");
     }
 
     // Tag 12: the deployment's trust anchors — `trust: "${file:<path>}"`,

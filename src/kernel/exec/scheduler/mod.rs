@@ -35,7 +35,7 @@ use crate::kernel::ipc::channel::{
     channel_set_flags, channel_set_mailbox, channel_set_reader_gone, POLL_ERR, POLL_HUP,
 };
 use crate::kernel::module::loader::{
-    find_hint_for_port, reset_state_arena, ChannelHint, DynamicModule, ModuleLoader, StartNewResult,
+    reset_state_arena, DynamicModule, ModuleLoader, PortCapacities, StartNewResult,
 };
 use crate::kernel::module::syscalls;
 use crate::kernel::module::syscalls::{get_table_for_module_type, is_spi_initialized};
@@ -203,8 +203,8 @@ pub struct Edge {
     /// Edge class metadata (Local, DmaOwned, CrossCore). Pure metadata on single-core.
     pub edge_class: crate::kernel::boot::config::EdgeClass,
     /// Per-edge ring-buffer size override in bytes (from
-    /// `wiring[i].buffer_bytes` in the YAML config). `0` defers to
-    /// `module_channel_hints`; non-zero is combined with module hints
+    /// `wiring[i].buffer_bytes` in the YAML config). `0` defers to the
+    /// manifest port capacities; non-zero is combined with them
     /// via `max(...)` in `open_channels`. See
     /// `kernel::boot::config::GraphEdge::buffer_bytes`.
     pub buffer_bytes: u32,
@@ -368,30 +368,20 @@ impl Edge {
 pub fn open_channels(edges: &mut [Edge]) -> i32 {
     // SAFETY: SCHED is scheduler-thread owned; read-only access via
     // `&raw const`. open_channels runs during graph prep.
-    let module_hints = unsafe {
+    let port_caps = unsafe {
         let p = &raw const SCHED;
-        &(*p).hints
+        &(*p).port_caps
     };
 
     // Resolve the per-edge buffer-size signal. Combines the
-    // producer/consumer `module_channel_hints` with the YAML
+    // producer/consumer manifest port capacities with the YAML
     // `buffer_bytes` override via `max(...)` — module hints express
     // a per-port-type minimum, the YAML field expresses a graph-
     // level bandwidth requirement, so the larger always wins.
     let edge_min_size = |edge: &Edge| -> u32 {
-        let from_hints = &module_hints[edge.from_module];
-        let from_size = find_hint_for_port(
-            &from_hints.hints[..from_hints.count],
-            1, // port_type = out
-            edge.from_port_index,
-        );
-        let to_hints = &module_hints[edge.to_module];
+        let (from_size, _) = port_caps[edge.from_module].lookup(1, edge.from_port_index);
         let to_port_type = if edge.is_ctrl() { 2 } else { 0 };
-        let to_size = find_hint_for_port(
-            &to_hints.hints[..to_hints.count],
-            to_port_type,
-            edge.to_port_index,
-        );
+        let (to_size, _) = port_caps[edge.to_module].lookup(to_port_type, edge.to_port_index);
         from_size.max(to_size).max(edge.buffer_bytes)
     };
 
@@ -456,12 +446,7 @@ pub fn open_channels(edges: &mut [Edge]) -> i32 {
         // permanent-wedge-by-construction — refuse the graph now,
         // with numbers, instead of freezing at runtime.
         {
-            let from_hints = &module_hints[edge.from_module];
-            let max_record = crate::kernel::module::loader::find_max_record_for_port(
-                &from_hints.hints[..from_hints.count],
-                1, // port_type = out
-                edge.from_port_index,
-            );
+            let (_, max_record) = port_caps[edge.from_module].lookup(1, edge.from_port_index);
             {
                 const MAX_CHAN_BYTES: u32 = 4 * 1024 * 1024;
                 if buf_size > MAX_CHAN_BYTES {

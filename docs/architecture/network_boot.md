@@ -112,8 +112,13 @@ On a Linux host, `fluxor run --ca <pem>` and `fluxor exec --ca <pem>`
 append the PEM's certificates to the anchors of every client-mode `tls`
 and `quic` instance for that run. A server instance is never widened,
 whether or not it verifies its clients; there is no environment-variable
-form. The `tls` line that reports an accepted chain says how many anchors
-the instance held and where they came from (`source=deployment`,
+form. Under `trust: system` the operator's anchors add to the platform's
+store rather than replace it: the platform judges every chain first, and
+only a chain it refuses for an unknown issuer is walked against the
+`--ca` anchors. Any other platform verdict (expired, revoked, name
+mismatch) stands. The `tls` line that reports an accepted chain says
+either that the platform verified it, or how many anchors the instance
+held and where they came from (`source=deployment`,
 `deployment+operator`, or `operator`).
 
 ## The Registry Puller: ota_registry

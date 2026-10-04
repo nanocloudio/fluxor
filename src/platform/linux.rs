@@ -261,6 +261,7 @@ use fluxor::platform::linux::workload::linux_workload_dispatch;
 // built-in modules here resolve them by bare name.
 use fluxor::platform::linux::builtin_params::*;
 include!("linux/cli_io.rs");
+include!("linux/stop.rs");
 include!("linux/host_asset_source.rs");
 include!("linux/host_asset_index.rs");
 include!("linux/linux_gpu.rs");
@@ -783,6 +784,8 @@ fn main() {
     // `tick_duration` any more. With no adaptive flag set the pacer returns the
     // nominal tick every iteration, so pacing is byte-identical to before.
     let mut tick: u64 = 0;
+    let mut stop: Option<StopDrain> = None;
+    install_stop_signals();
     // Test hook: when FLUXOR_TEST_REBUILD_EVERY=N is set,
     // self-trigger a graph rebuild every N loop iterations to exercise the
     // live-rebuild loop without a full reconfigure graph. No-op when unset.
@@ -825,6 +828,14 @@ fn main() {
     loop {
         let t0 = Instant::now();
         iter = iter.wrapping_add(1);
+
+        // A stop signal drains the graph, then exits; see `linux/stop.rs`.
+        if stop.is_none() && stop_requested() {
+            stop = Some(StopDrain::begin());
+        }
+        if stop.as_ref().is_some_and(StopDrain::over) {
+            finish_stop(owner_status.as_mut(), logs_dir.as_deref());
+        }
 
         // Test hook: periodic self-trigger (no-op unless FLUXOR_TEST_REBUILD_EVERY set).
         if test_rebuild_every > 0 && iter.is_multiple_of(test_rebuild_every) {
@@ -941,7 +952,13 @@ fn main() {
         // never declares itself finished, so waiting for one is waiting for
         // ever. Node-agent mode owns its own lifetime and is excluded below.
         let cli_done = CLI_RUN_COMPLETE.load(Ordering::Acquire);
-        if cli_done || matches!(result, fluxor::kernel::exec::scheduler::StepResult::Done) {
+        let all_done = matches!(result, fluxor::kernel::exec::scheduler::StepResult::Done);
+        if stop.is_some() && all_done {
+            // Stopping, and nothing is left to drain.
+            log::info!("[stop] drained; exiting");
+            finish_stop(owner_status.as_mut(), logs_dir.as_deref());
+        }
+        if cli_done || all_done {
             // Node-agent mode (FLUXOR_PLAN set): the runtime is the node's
             // persistent substrate — workloads come and go via plan reloads, so an
             // all-done/empty graph idles awaiting SIGHUP instead of exiting.

@@ -662,6 +662,7 @@ unsafe fn dtls_pump_recv_certificate(s: &mut TlsState, idx: usize) -> bool {
         expected[..4].copy_from_slice(&s.dtls_peer_ip.to_le_bytes());
         (4, true)
     };
+    let mut by_platform = false;
     let mut rc = peer_cert_reason(
         s,
         is_server,
@@ -669,8 +670,10 @@ unsafe fn dtls_pump_recv_certificate(s: &mut TlsState, idx: usize) -> bool {
         expected_is_ip,
         body,
         Some(&mut deferred),
+        &mut by_platform,
     );
     s.peer_sessions[idx].endpoint.driver.deferred_links = deferred;
+    s.peer_sessions[idx].endpoint.driver.chain_by_platform = by_platform;
     if rc == CERT_OK {
         rc = bind_peer_cert_key(&mut s.peer_sessions[idx].endpoint.driver, body);
     }

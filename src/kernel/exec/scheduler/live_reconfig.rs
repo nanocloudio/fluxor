@@ -112,6 +112,63 @@ pub fn call_module_drain(module_idx: usize) -> i32 {
     }
 }
 
+/// Ask every drain-capable module to drain because the graph is stopping:
+/// `module_drain` once each, in reverse execution order so a consumer
+/// hears before its producers. A module that answers 0 has work in flight
+/// — staged writes to commit, a lease to release — and returns `Done` from
+/// a later step once it has finished it; its slot is set in `waiting`.
+/// Any other answer (1: nothing to finish, negative: cannot drain) is not
+/// waited for. The graph keeps stepping throughout: a draining module
+/// finishes its work through the modules around it.
+///
+/// Returns how many modules were asked.
+pub fn begin_stop_drain(waiting: &mut ModuleMask) -> usize {
+    // SAFETY: scheduler-thread read.
+    let sched = unsafe {
+        let p = &raw const SCHED;
+        &*p
+    };
+    let mut asked = ModuleMask::EMPTY;
+    let mut ask = |i: usize, waiting: &mut ModuleMask| {
+        if asked.test(i) || sched.finished[i] {
+            return;
+        }
+        if let ModuleSlot::Dynamic(ref m) = sched.modules[i] {
+            if !m.has_drain() {
+                return;
+            }
+            asked.set(i);
+            // SAFETY: `m` is a live dynamic-module slot on the scheduler
+            // thread; `call_drain` is its ABI surface.
+            let rc = with_module_context(i, || unsafe { m.call_drain() });
+            if rc == 0 {
+                waiting.set(i);
+            }
+        }
+    };
+    for pos in (0..sched.exec_order_count).rev() {
+        ask(sched.exec_order[pos] as usize, waiting);
+    }
+    // Slots outside the execution order (another resident graph's).
+    for i in (0..MAX_MODULES).rev() {
+        ask(i, waiting);
+    }
+    asked.count_ones() as usize
+}
+
+/// Whether every module [`begin_stop_drain`] is waiting for has finished,
+/// whether by returning `Done` or by faulting out.
+pub fn stop_drain_settled(waiting: &ModuleMask) -> bool {
+    // SAFETY: scheduler-thread read.
+    let sched = unsafe {
+        let p = &raw const SCHED;
+        &*p
+    };
+    waiting
+        .iter_set()
+        .all(|i| sched.finished[i] || matches!(sched.modules[i], ModuleSlot::Empty))
+}
+
 /// Mark a module as finished so the scheduler skips it in future ticks.
 pub fn mark_module_finished(module_idx: usize) {
     if module_idx < MAX_MODULES {

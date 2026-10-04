@@ -21,7 +21,7 @@ target = "linux"
 graph = "linux.yaml"
 
 [params.port]
-type = "integer"          # string | integer | boolean
+type = "integer"          # string | integer | boolean | file
 default = 15353
 min = 1                   # integer only, inclusive
 max = 65535
@@ -35,7 +35,24 @@ description = "IPv4 address served for service.test"
 ```
 
 A param is optional with a `default`, or `required = true` with an
-`example` and no default. Param names are `[a-z][a-z0-9_]*`, at most 64
+`example` and no default.
+
+A `file` param is a path to a file the consumer supplies when it runs
+the bundle — a CA bundle, a certificate, a private key:
+
+```
+[params.ca]
+type = "file"
+required = true
+example = "testdata/ca.pem"   # a sample, relative to this manifest
+description = "CA bundle a client certificate must chain to"
+```
+
+A file param is always required and has no default: the file is the
+consumer's, not the bundle's. Its `example` names a sample relative to
+the source manifest, and emit and the ci gate build the template with
+that sample, so a bundle whose TLS identity is a run-time value is
+still built and checked before it is published. Param names are `[a-z][a-z0-9_]*`, at most 64
 bytes. The workload name is ASCII letters, digits, `.`, `_` and `-`,
 starting with a letter or digit, at most 64 bytes: it becomes a
 directory name and a store tag. Unknown keys anywhere in the manifest,
@@ -56,6 +73,19 @@ modules:
     host:
       - "service.test=${param:answer}"   # inside text: interpolated
 ```
+
+A file param renders as the file's absolute path, and goes where a
+module takes a path:
+
+```
+  - name: tls
+    trust: "${file:${param:ca}}"   # inside a source spec
+    cert_file: ${param:cert}       # PEM or DER
+    key_file: ${param:key}         # PEM or DER (PKCS#8, SEC1 or PKCS#1)
+```
+
+`cert_file` and `key_file` take PEM or DER; a file that cannot be read
+or decoded fails the build.
 
 Substitution runs on the parsed graph, never on its text. A scalar
 that is exactly one placeholder becomes a typed node; a placeholder
@@ -112,10 +142,12 @@ bundle; its exit code is the run's.
 `--param name=value` is parsed by the declared type and may be
 repeated; `--params <file.toml>` is one flat TOML table of
 `name = value` with typed values. A `--param` overrides the file.
-Before anything is built, the run refuses an unknown param (listing
-the declared ones), a missing required param, a type or range error,
-a repeated `--param`, and any value given to a bundle that declares
-no params.
+A file param's path is relative to the working directory when given
+by `--param`, and to the values file when given in `--params`. Before
+anything is built, the run refuses an unknown param (listing the
+declared ones), a missing required param, a type or range error, a file
+param naming no readable file, a repeated `--param`, and any value
+given to a bundle that declares no params.
 
 `fluxor update` carries bundle pins forward to `<name>:latest`.
 

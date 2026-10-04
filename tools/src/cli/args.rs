@@ -173,8 +173,9 @@ enum Commands {
         /// Append the certificates in this PEM file to the trust anchors
         /// of every CLIENT-MODE `tls` / `quic` instance for this run. A
         /// server instance is never widened, whether or not it verifies
-        /// its clients. A linux graph or a bundle only — not a scenario
-        /// and not `--replicas`; there is no environment-variable form.
+        /// its clients. Under `trust: system` they add to the platform's
+        /// store. A linux graph or a bundle only — not a scenario and not
+        /// `--replicas`; there is no environment-variable form.
         #[arg(long, value_name = "PEM")]
         ca: Option<PathBuf>,
         /// Directory holding the `.fmod` modules to use (graph, scenario or

@@ -226,6 +226,10 @@ pub mod contracts {
         pub mod capability_vectors {
             include!("contracts/mesh/capability_vectors.rs");
         }
+        /// A `remote_channel`'s session opening and ending.
+        pub mod remote_session {
+            include!("contracts/mesh/remote_session.rs");
+        }
     }
     /// Platform-neutral isolated-workload surface (contract class `0x1A`).
     pub mod workload {

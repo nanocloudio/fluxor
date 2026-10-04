@@ -37,7 +37,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use crate::error::{Error, Result};
-use fluxor_tools::service_params::{self, ParamSpec, ParamValue};
+use fluxor_tools::service_params::{self, ParamSpec, ParamType, ParamValue};
 use fluxor_tools::workload::{
     validate, Bindings, Contract, DigestRef, Export, Health, Implementation, ModuleRef,
     ResourceProfileDoc, Target, UpdatePolicy, WorkloadManifest,
@@ -404,11 +404,10 @@ pub fn emit_bundle(
                 src.workload.name,
                 std::process::id()
             ));
-            let rendered = service_params::render_graph_text(
-                &template,
-                &service_params::check_values(&params),
-            )
-            .map_err(|e| Error::Config(format!("{}: {e}", graph_path.display())))?;
+            let values = service_params::check_values(&params, manifest_dir)
+                .map_err(|e| Error::Config(format!("{}: {e}", manifest_path.display())))?;
+            let rendered = service_params::render_graph_text(&template, &values)
+                .map_err(|e| Error::Config(format!("{}: {e}", graph_path.display())))?;
             std::fs::create_dir_all(&check_dir)?;
             let check_graph = check_dir.join("graph.yaml");
             std::fs::write(&check_graph, rendered)?;
@@ -633,10 +632,20 @@ impl RunParams {
         bundle: &str,
         schema: &BTreeMap<String, ParamSpec>,
     ) -> Result<BTreeMap<String, ParamValue>> {
-        let file = match &self.file {
+        let mut file = match &self.file {
             Some(path) => service_params::read_values_file(path).map_err(Error::Config)?,
             None => BTreeMap::new(),
         };
+        // A path in a values file is relative to that file, not to wherever
+        // the run was started.
+        if let Some(dir) = self.file.as_deref().and_then(Path::parent) {
+            for (name, v) in file.iter_mut() {
+                let is_file = schema.get(name).is_some_and(|s| s.ty == ParamType::File);
+                if let (true, toml::Value::String(p)) = (is_file, &*v) {
+                    *v = toml::Value::String(dir.join(p).to_string_lossy().into_owned());
+                }
+            }
+        }
         let flags = self
             .flags
             .iter()
@@ -1013,11 +1022,13 @@ fn launch_bundle(
         cmd.env("FLUXOR_STORE_DIR", &resolved);
     }
     // Die-with-parent (see `tie_to_parent`): a killed/timeouted `fluxor exec`
-    // must not orphan a runtime that never exits on its own.
-    let status = crate::tie_to_parent(&mut cmd).status();
+    // must not orphan a runtime that never exits on its own. A stop signal
+    // is passed on so the runtime drains first (see `run_tied`).
+    let status = crate::run_tied(&mut cmd);
     // `exit` below skips destructors.
     drop(scratch);
     let status = status?;
+    crate::exit_if_signalled(&status);
     // A CLI bundle's exit code IS the deliverable: propagate it verbatim
     // rather than wrapping a non-zero status in a tool error, so a shell
     // sees what the program returned.

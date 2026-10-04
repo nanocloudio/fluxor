@@ -20,6 +20,75 @@ pub fn tie_to_parent(cmd: &mut std::process::Command) -> &mut std::process::Comm
     }
 }
 
+/// The runtime a running [`run_tied`] waits on; 0 when none.
+static STOP_FORWARD_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+/// A stop signal that arrived before the runtime had a pid to forward it to.
+static STOP_PENDING: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+extern "C" fn forward_stop_signal(sig: i32) {
+    use std::sync::atomic::Ordering;
+    let pid = STOP_FORWARD_PID.load(Ordering::Acquire);
+    if pid > 0 {
+        // SAFETY: kill is async-signal-safe; `pid` is our own child.
+        unsafe {
+            libc::kill(pid, sig);
+        }
+    } else {
+        STOP_PENDING.store(sig, Ordering::Release);
+    }
+}
+
+/// Run a tied `fluxor-linux` (see [`tie_to_parent`]) to completion. A
+/// SIGTERM or SIGINT this process receives meanwhile is passed on to the
+/// runtime rather than ending this process, which would SIGKILL the runtime
+/// through its death signal: the runtime drains its graph on a stop signal —
+/// a module holding a lease releases it — and this process waits for that.
+pub fn run_tied(cmd: &mut std::process::Command) -> std::io::Result<std::process::ExitStatus> {
+    use std::sync::atomic::Ordering;
+    STOP_PENDING.store(0, Ordering::Release);
+    // SAFETY: the handler only reads atomics and calls kill, both
+    // async-signal-safe; its pointer is valid for the process lifetime.
+    let (prev_int, prev_term) = unsafe {
+        (
+            libc::signal(libc::SIGINT, forward_stop_signal as libc::sighandler_t),
+            libc::signal(libc::SIGTERM, forward_stop_signal as libc::sighandler_t),
+        )
+    };
+    let result = tie_to_parent(cmd).spawn().and_then(|mut child| {
+        STOP_FORWARD_PID.store(child.id() as i32, Ordering::Release);
+        let pending = STOP_PENDING.swap(0, Ordering::AcqRel);
+        if pending != 0 {
+            // SAFETY: signalling our own just-spawned child.
+            unsafe {
+                libc::kill(child.id() as i32, pending);
+            }
+        }
+        child.wait()
+    });
+    STOP_FORWARD_PID.store(0, Ordering::Release);
+    // SAFETY: reinstating the dispositions saved above.
+    unsafe {
+        libc::signal(libc::SIGINT, prev_int);
+        libc::signal(libc::SIGTERM, prev_term);
+    }
+    result
+}
+
+/// When the runtime was ended by a signal, end this process by the same
+/// one, so a caller sees the status it would have seen without a CLI in
+/// between. Returns when the runtime exited on its own.
+pub fn exit_if_signalled(status: &std::process::ExitStatus) {
+    use std::os::unix::process::ExitStatusExt as _;
+    if let Some(sig) = status.signal() {
+        // SAFETY: plain libc calls with the signal the child died of.
+        unsafe {
+            libc::signal(sig, libc::SIG_DFL);
+            libc::raise(sig);
+        }
+        std::process::exit(128 + sig);
+    }
+}
+
 fn cmd_build(
     path: &Path,
     output: Option<&std::path::Path>,
@@ -1158,7 +1227,8 @@ fn cmd_run(
                     cmd.arg(a);
                 }
             }
-            let status = tie_to_parent(&mut cmd).status()?;
+            let status = run_tied(&mut cmd)?;
+            exit_if_signalled(&status);
 
             if !status.success() {
                 return Err(Error::Config(format!(

@@ -134,6 +134,9 @@ pub struct HandshakeDriver {
     /// Pump calls the deferred verification has taken so far, for the
     /// line that reports it.
     pub verify_steps: u16,
+    /// The peer's chain was accepted by the platform (`trust: "system"`)
+    /// rather than walked against this instance's anchors.
+    pub chain_by_platform: bool,
     /// The CertificateVerify scheme, signature span and content hash the
     /// job verifies.
     pub cv_scheme: u16,
@@ -215,6 +218,7 @@ impl HandshakeDriver {
             held_len: 0,
             rsa_job_active: 0,
             verify_steps: 0,
+            chain_by_platform: false,
             cv_scheme: 0,
             cv_sig_off: 0,
             cv_sig_len: 0,

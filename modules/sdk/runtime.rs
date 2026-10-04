@@ -30,6 +30,7 @@ include!("runtime/state.rs");
 include!("runtime/intrinsics.rs");
 include!("runtime/consts.rs");
 include!("runtime/format.rs");
+include!("runtime/utf8.rs");
 include!("runtime/names.rs");
 include!("runtime/wasm.rs");
 include!("runtime/provider.rs");

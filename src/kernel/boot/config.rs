@@ -774,10 +774,10 @@ pub struct GraphEdge {
     /// single-core; no runtime cost.
     pub edge_class: EdgeClass,
     /// Per-edge ring-buffer size override in bytes. `0` defers to the
-    /// producer/consumer module hints (`module_channel_hints`) and the
+    /// producer/consumer manifest port capacities and the
     /// global `BUFFER_SIZE` fallback. Non-zero requests at least this
-    /// many bytes; the scheduler combines it with module hints via
-    /// `max(module_hint, buffer_bytes)` and `channel_open_for_module`
+    /// many bytes; the scheduler combines it with the port capacities via
+    /// `max(port_capacity, buffer_bytes)` and `channel_open_for_module`
     /// clamps to `MAX_CHAN_BYTES = 256 KiB` and rounds up to a power
     /// of two. Encoded as a u32 LE in bytes 4-7 of the edge record.
     pub buffer_bytes: u32,

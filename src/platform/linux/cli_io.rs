@@ -69,7 +69,7 @@ pub(crate) static CLI_RUN_COMPLETE: core::sync::atomic::AtomicBool =
 // double echo. We deliberately do NOT touch OPOST/ISIG: output `\n`→`\r\n`
 // stays intact (so non-interactive commands print correctly even though stdin
 // is always wired), and Ctrl-C still signals. The original termios is saved in
-// a signal-safe static and restored on the exit path (and via SIGINT/SIGTERM).
+// a signal-safe static and restored on every exit path.
 static TERM_RAW_ACTIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static mut TERM_ORIG: core::mem::MaybeUninit<libc::termios> = core::mem::MaybeUninit::uninit();
 
@@ -88,19 +88,9 @@ pub(crate) fn restore_terminal() {
     }
 }
 
-extern "C" fn term_signal_handler(sig: i32) {
-    restore_terminal();
-    // Re-raise with the default disposition so the process dies normally.
-    // SAFETY: signal + raise are async-signal-safe libc calls with constant
-    // arguments; nothing here touches Rust-managed state.
-    unsafe {
-        libc::signal(sig, libc::SIG_DFL);
-        libc::raise(sig);
-    }
-}
-
 /// Put a TTY stdin into interactive mode (ICANON + ECHO off). No-op if stdin is
-/// not a terminal. Installs SIGINT/SIGTERM handlers to restore on interruption.
+/// not a terminal. Every exit path restores it, a signal's included (see
+/// `linux/stop.rs`).
 fn enter_raw_stdin() {
     use core::sync::atomic::Ordering;
     // SAFETY: single-threaded platform init is the only caller, so the
@@ -122,8 +112,6 @@ fn enter_raw_stdin() {
         raw.c_cc[libc::VMIN] = 1;
         raw.c_cc[libc::VTIME] = 0;
         libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw);
-        libc::signal(libc::SIGINT, term_signal_handler as libc::sighandler_t);
-        libc::signal(libc::SIGTERM, term_signal_handler as libc::sighandler_t);
     }
 }
 

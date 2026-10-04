@@ -243,7 +243,7 @@ The runtime loader enforces a concrete module binary contract:
 - Module ABI version must match loader expectation
 - Required exports are FNV-1a hash resolved: `module_state_size`,
   `module_init`, `module_new`, `module_step`
-- Optional exports: `module_channel_hints`, `module_arena_size`,
+- Optional exports: `module_arena_size`,
   `module_drain`, `module_deferred_ready`, `module_mailbox_safe`,
   `module_in_place_safe`, `module_pipeline_refill`,
   `module_post_tick_flush`, `module_isr_init` / `module_isr_entry`,
@@ -482,6 +482,18 @@ drain-capable modules have completed, the scheduler transitions to
 `Migrating` and instantiates the new graph.
 
 See [reconfigure.md](reconfigure.md) for the full state machine.
+
+Stopping the hosted runtime (SIGTERM or SIGINT) drains the same way. The
+runtime calls `module_drain` once on every drain-capable module, in
+reverse execution order, and keeps the whole graph stepping. A module
+that answers 0 has work in flight (staged writes to commit, a lease to
+release) and is waited for until it returns `Done`. Any other answer
+means there is nothing to wait for. The process exits once every module
+it waits for has finished, or when the drain deadline passes
+(`FLUXOR_DRAIN_MS`, default 10 s). It then ends by the signal it was
+sent, and a second signal from the same sender stops it at once. `fluxor
+run` and `fluxor exec` pass the signal to the runtime rather than ending
+it.
 
 ### Fault Recovery
 

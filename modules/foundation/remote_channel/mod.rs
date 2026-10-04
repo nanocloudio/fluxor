@@ -43,7 +43,10 @@
 //!
 //! One session at a time. A record whose sending had begun when its session
 //! ended is lost and counted; a record not yet begun waits for the next
-//! session, and every record delivered was delivered whole.
+//! session, and every record delivered was delivered whole. The optional
+//! `session` output says when a session opens and ends
+//! (`contracts/mesh/remote_session.rs`), so a consumer can stop sending
+//! toward a member that cannot hear it rather than wait out a deadline.
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
@@ -69,6 +72,7 @@ use core::ffi::c_void;
 
 #[path = "../../sdk/abi.rs"]
 mod abi;
+use abi::contracts::mesh::remote_session;
 use abi::contracts::net::{mux, net_proto, peer_identity};
 use abi::{errno, SyscallTable};
 
@@ -123,6 +127,8 @@ const ROLE_DIAL: u8 = 1;
 const PORT_PEER_IDENTITY: u8 = 1;
 const PORT_CH_IN: u8 = 2;
 const PORT_CH_OUT: u8 = 1;
+/// Output after the eight `chN_rx`.
+const PORT_SESSION: u8 = 9;
 
 const MAX_AUTHORITY_LEN: usize = 128;
 const TABLE_TEXT_MAX: usize = 512;
@@ -269,6 +275,11 @@ pub struct State {
     n_closes: u8,
     rx: [u8; RX_SCRATCH],
     pub sessions: u32,
+    /// `session` output; see `report_session`.
+    session_out: i32,
+    /// The state the `session` output last carried: open, and its ordinal.
+    reported_open: bool,
+    reported_session: u32,
     pool: [u8; REASSEMBLY_BYTES],
 }
 
@@ -1698,6 +1709,7 @@ pub unsafe extern "C" fn module_new(
     s.transport_in = in_chan;
     s.transport_out = out_chan;
     s.identity_in = dev_channel_port(sys, 0, PORT_PEER_IDENTITY);
+    s.session_out = dev_channel_port(sys, 1, PORT_SESSION);
     s.port = DEFAULT_PORT;
     s.peer_port = DEFAULT_PORT;
     s.require_peer = 1;
@@ -1790,7 +1802,31 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     if flush_tx(s) && send_control(s) {
         send_records(s);
     }
+    report_session(s);
     0
+}
+
+/// Tell the `session` output whether a session is open, when that differs
+/// from what it last carried. A frame the output cannot take now is
+/// written on a later step, as whatever the state is by then: a consumer
+/// needs the session it may send on, not a history of them.
+unsafe fn report_session(s: &mut State) {
+    if s.session_out < 0 {
+        return;
+    }
+    let open = s.phase == PH_OPEN;
+    let session = s.sessions;
+    if open == s.reported_open && (!open || session == s.reported_session) {
+        return;
+    }
+    // A session that opened and ended between two reports still ended:
+    // the frame for a closed state names the last session that opened.
+    let frame = remote_session::encode(open, session);
+    let sys = &*s.syscalls;
+    if (sys.channel_write)(s.session_out, frame.as_ptr(), frame.len()) == frame.len() as i32 {
+        s.reported_open = open;
+        s.reported_session = session;
+    }
 }
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]

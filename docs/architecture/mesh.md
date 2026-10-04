@@ -387,6 +387,14 @@ multiplex up to eight local channels over one authenticated session.
   mutual TLS, with the session used only once a `peer_identity` record
   naming that session binds, or ride QUIC, where each channel is its own
   stream so one channel's loss recovery never blocks another's.
+- **Session state is visible.** The optional `session` output carries a
+  frame each time a session opens or ends
+  (`modules/sdk/contracts/mesh/remote_session.rs`), numbered by session.
+  A record whose sending had begun when its session ended is lost and
+  counted; one not yet begun waits for the next session. A consumer
+  that must not wait for a member that is down refuses its requests
+  toward that member on `MSG_SESSION_DOWN` rather than waiting out its
+  own deadline.
 
 Mesh events and commands ride this fabric like every other cross-node
 channel.

@@ -31,6 +31,10 @@ use std::time::Duration;
 // Default `http_offset` value (10 000, a conventional diagnostic-surface
 // offset) is declared on the clap arg in `main.rs`; no in-module constant.
 
+/// How long a stopping node gets before SIGKILL: the runtime's default
+/// drain deadline, and a margin for it to exit after.
+const STOP_GRACE: Duration = Duration::from_millis(11_000);
+
 /// Spawn N replicas from one template. Returns once every child has
 /// exited (Ctrl+C → SIGTERM → wait).
 pub fn cmd_up(
@@ -208,10 +212,19 @@ pub fn cmd_up(
     eprintln!();
     eprintln!("shutting down...");
     for s in spawned.iter_mut() {
-        // Try a graceful TERM, then escalate.
+        // A graceful TERM drains each runtime's graph (a module holding a
+        // lease releases it); escalate only once the runtime's own drain
+        // deadline (10 s by default) has had its chance.
         let _ = signal_child(&s.child, libc::SIGTERM);
     }
-    thread::sleep(Duration::from_millis(500));
+    let deadline = std::time::Instant::now() + STOP_GRACE;
+    while std::time::Instant::now() < deadline
+        && spawned
+            .iter_mut()
+            .any(|s| matches!(s.child.try_wait(), Ok(None)))
+    {
+        thread::sleep(Duration::from_millis(50));
+    }
     for s in spawned.iter_mut() {
         if let Ok(None) = s.child.try_wait() {
             let _ = signal_child(&s.child, libc::SIGKILL);

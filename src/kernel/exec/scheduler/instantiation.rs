@@ -128,11 +128,6 @@ pub(crate) fn build_module_list(config: &Config) -> Result<ModuleList, i32> {
     Ok((module_list, count, id_to_slot))
 }
 
-/// Query channel hints for all modules in the list.
-///
-/// For each module, looks up its `module_channel_hints` export and
-/// stores the hints in MODULE_HINTS. Modules without the export
-/// get empty hints (all ports use default buffer sizes).
 /// Pre-pass: set `SCHED.isolated[i]` for every module whose config params
 /// request a gated level (TLV tag 0xF5 >= contained), BEFORE channels are
 /// opened. This lets `open_channels`/`alloc_streaming_for_module` page-align an
@@ -166,64 +161,55 @@ pub(crate) fn mark_isolated_from_params(
     }
 }
 
+/// Record every listed module's manifest port capacities (and its
+/// buffer-group flags) before its channels are opened.
 pub(crate) fn collect_module_hints(
     loader: &ModuleLoader,
     module_list: &[Option<ModuleEntry>; MAX_MODULES],
     module_count: usize,
 ) {
-    // SAFETY: prepare_graph context — single mutator of SCHED.
-    let module_hints = unsafe {
-        let p = &raw mut SCHED;
-        &mut (*p).hints
+    for (module_idx, slot) in module_list.iter().enumerate().take(module_count) {
+        if let Some(entry) = slot {
+            collect_one_module_hints(loader, entry, module_idx);
+        }
+    }
+}
+
+/// Record one module's manifest port capacities and buffer-group flags
+/// into `SCHED` slot `module_idx`. Reads only the signed manifest; no
+/// module code runs.
+pub(crate) fn collect_one_module_hints(
+    loader: &ModuleLoader,
+    entry: &ModuleEntry,
+    module_idx: usize,
+) {
+    // Internal modules (tee, merge) have no manifest.
+    if is_internal_module(entry) {
+        return;
+    }
+
+    let loaded = match loader.find_by_name_hash(entry.name_hash) {
+        Ok(m) => m,
+        Err(_) => return, // Will be caught during instantiation
     };
 
-    for module_idx in 0..module_count {
-        let entry = match &module_list[module_idx] {
-            Some(e) => e,
-            None => continue,
-        };
+    // Validate integrity/signature before trusting anything the image
+    // says. A module that fails here is skipped now and hard-rejected
+    // when instantiation re-validates it.
+    if crate::kernel::module::loader::validate_module(&loaded, "hints").is_err() {
+        return;
+    }
 
-        // Skip internal modules (tee, merge) — they have no hints export
-        if is_internal_module(entry) {
-            continue;
-        }
-
-        // Find the module in flash
-        let loaded = match loader.find_by_name_hash(entry.name_hash) {
-            Ok(m) => m,
-            Err(_) => continue, // Will be caught during instantiation
-        };
-
-        // Validate integrity/signature BEFORE invoking any of the module's own
-        // code. `query_channel_hints` below calls the module's
-        // `module_channel_hints` export; without this gate unverified native
-        // code runs before admission, because the signature/integrity check in
-        // `start_new` only happens later, at instantiation. A module that fails
-        // here is skipped now (its code never runs) and is hard-rejected when
-        // instantiation re-validates it.
-        if crate::kernel::module::loader::validate_module(&loaded, "hints").is_err() {
-            continue;
-        }
-
-        // Extract mailbox_safe / in_place_writer flags early so open_channels
-        // can use them for buffer-group aliasing decisions.
-        let flags_byte = loaded.header.reserved[0];
-        // SAFETY: prepare_graph context — single mutator.
-        unsafe {
-            let p = &raw mut SCHED;
-            let sched = &mut *p;
-            sched.mailbox_safe[module_idx] = (flags_byte & 0x01) != 0;
-            sched.in_place_writer[module_idx] = (flags_byte & 0x02) != 0;
-        }
-
-        // Static manifest capacities (flag-bit-5 section): no module
-        // code executes, and wasm payloads (whose packed export
-        // tables are empty) are covered.
-        let (hints, count) = loaded.manifest_port_capacities();
-        if count > 0 {
-            module_hints[module_idx].hints = hints;
-            module_hints[module_idx].count = count;
-        }
+    // Extract mailbox_safe / in_place_writer flags early so open_channels
+    // can use them for buffer-group aliasing decisions.
+    let flags_byte = loaded.header.reserved[0];
+    // SAFETY: graph-mutation context — single mutator of SCHED.
+    unsafe {
+        let p = &raw mut SCHED;
+        let sched = &mut *p;
+        sched.mailbox_safe[module_idx] = (flags_byte & 0x01) != 0;
+        sched.in_place_writer[module_idx] = (flags_byte & 0x02) != 0;
+        sched.port_caps[module_idx] = loaded.port_capacities();
     }
 }
 

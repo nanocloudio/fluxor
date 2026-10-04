@@ -500,7 +500,7 @@ pub fn free_module_state(module_idx: usize) {
 
     // Reset per-module scheduler bookkeeping so reuse is clean.
     sched.ports[module_idx] = ModulePorts::empty();
-    sched.hints[module_idx] = ModuleHints::empty();
+    sched.port_caps[module_idx] = PortCapacities::NONE;
     sched.finished[module_idx] = false;
     sched.ready[module_idx] = true;
     sched.deferred_ready[module_idx] = false;

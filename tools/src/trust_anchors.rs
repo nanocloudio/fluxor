@@ -93,6 +93,69 @@ pub fn pem_certificates(pem: &str) -> Vec<Vec<u8>> {
     out
 }
 
+/// The first PEM block in `text` labelled one of `labels`, decoded.
+pub fn pem_block(text: &str, labels: &[&str]) -> Option<Vec<u8>> {
+    let mut label: Option<&str> = None;
+    let mut b64 = String::new();
+    for line in text.lines() {
+        let line = line.trim();
+        match label {
+            None => {
+                label = labels.iter().copied().find(|l| {
+                    line.strip_prefix("-----BEGIN ")
+                        .and_then(|r| r.strip_suffix("-----"))
+                        == Some(*l)
+                });
+            }
+            Some(l) => {
+                if line
+                    .strip_prefix("-----END ")
+                    .and_then(|r| r.strip_suffix("-----"))
+                    == Some(l)
+                {
+                    return crate::b64::decode(&b64);
+                }
+                b64.push_str(line);
+            }
+        }
+    }
+    None
+}
+
+/// A certificate or private-key file as the DER a `tls` / `quic` instance
+/// embeds: PEM (the first block labelled one of `labels`) or DER as is.
+pub fn read_der_file(path: &Path, labels: &[&str]) -> Result<Vec<u8>, String> {
+    let bytes =
+        std::fs::read(path).map_err(|e| format!("could not read '{}': {e}", path.display()))?;
+    if bytes.is_empty() {
+        return Err(format!("'{}' is empty", path.display()));
+    }
+    let Some(text) = std::str::from_utf8(&bytes)
+        .ok()
+        .filter(|t| t.contains("-----BEGIN "))
+    else {
+        return Ok(bytes);
+    };
+    if text.contains("-----BEGIN ENCRYPTED PRIVATE KEY-----") {
+        return Err(format!(
+            "'{}' holds an encrypted private key; give the key unencrypted",
+            path.display()
+        ));
+    }
+    pem_block(text, labels).ok_or_else(|| {
+        format!(
+            "'{}' is PEM with no decodable {} block",
+            path.display(),
+            labels.join(" / ")
+        )
+    })
+}
+
+/// PEM labels a `cert_file` may hold.
+pub const CERT_LABELS: &[&str] = &["CERTIFICATE"];
+/// PEM labels a `key_file` may hold: PKCS#8, SEC1 or PKCS#1.
+pub const KEY_LABELS: &[&str] = &["PRIVATE KEY", "EC PRIVATE KEY", "RSA PRIVATE KEY"];
+
 /// Split concatenated DER into its top-level SEQUENCEs. Every byte must
 /// belong to a well-formed SEQUENCE with a definite, minimal length: a
 /// trailing fragment is refused rather than dropped, since a file with a

@@ -3330,6 +3330,7 @@ unsafe fn peer_cert_reason(
     expected_is_ip: bool,
     hs_body: &[u8],
     deferred: Option<&mut DeferredLinks>,
+    by_platform: &mut bool,
 ) -> u32 {
     // A server validates a client certificate and a client validates a
     // server's, so the purpose the leaf must be authorised for is the role
@@ -3340,11 +3341,20 @@ unsafe fn peer_cert_reason(
         EKU_SERVER_AUTH
     };
     let now = trusted_now_secs(&*s.syscalls);
+    *by_platform = false;
     if s.trust_system {
-        // The platform decides. Nothing below is consulted: this instance
-        // holds no anchors, and second-guessing an answer it did not compute
-        // is how a weaker verifier gets to overrule a stronger one.
-        return platform_cert_reason(s, is_server, expected, expected_is_ip, hs_body, now);
+        // The platform decides about every chain it can place. Its verdict
+        // stands whenever it knew the issuer: a weaker verifier must never
+        // overrule a stronger one. The one thing it cannot know about is an
+        // anchor the operator added with `--ca` — those are this instance's
+        // alone, so a chain the platform refused only for its unknown issuer
+        // is walked against them, as it would be with no system trust at all.
+        let (rc, unknown_ca) =
+            platform_cert_reason(s, is_server, expected, expected_is_ip, hs_body, now);
+        if !unknown_ca || s.anchor_operator == 0 {
+            *by_platform = true;
+            return rc;
+        }
     }
     verify_chain_with(
         hs_body,
@@ -3359,7 +3369,9 @@ unsafe fn peer_cert_reason(
 /// this module's reason vocabulary so every caller and every log line reads
 /// the same whichever verifier decided. A transport failure is NOT a
 /// refusal: it becomes `CERT_ERR_NO_ANCHOR`, because a consumer that could
-/// not ask must not behave as though it asked and was told yes.
+/// not ask must not behave as though it asked and was told yes. The flag is
+/// set only when the platform refused because it knew no issuer for the
+/// chain.
 unsafe fn platform_cert_reason(
     s: &TlsState,
     is_server: bool,
@@ -3367,19 +3379,19 @@ unsafe fn platform_cert_reason(
     expected_is_ip: bool,
     hs_body: &[u8],
     now: u64,
-) -> u32 {
+) -> (u32, bool) {
     use abi::contracts::trust as tw;
     // An IP literal has no name to give the platform, and a server checking
     // a client certificate is not what this provider is wired for; both are
     // the local verifier's job and reaching here with one is a compose bug.
     if is_server || expected_is_ip {
-        return CERT_ERR_NO_ANCHOR;
+        return (CERT_ERR_NO_ANCHOR, false);
     }
     let mut chain: [&[u8]; MAX_CHAIN_LEN] = [&[]; MAX_CHAIN_LEN];
     let count = match parse_cert_chain(hs_body, &mut chain) {
         Ok(n) if n > 0 => n,
-        Ok(_) => return CERT_ERR_NO_ANCHOR,
-        Err(e) => return e,
+        Ok(_) => return (CERT_ERR_NO_ANCHOR, false),
+        Err(e) => return (e, false),
     };
     let name_len = expected.len().min(tw::MAX_NAME);
     let mut arg = [0u8; TRUST_ARG_BYTES];
@@ -3389,7 +3401,7 @@ unsafe fn platform_cert_reason(
     arg[tw::offset::CERT_COUNT] = count as u8;
     arg[tw::offset::UNIX_SECONDS..tw::offset::UNIX_SECONDS + 8].copy_from_slice(&now.to_le_bytes());
     if at + name_len > arg.len() {
-        return CERT_ERR_NO_ANCHOR;
+        return (CERT_ERR_NO_ANCHOR, false);
     }
     arg[at..at + name_len].copy_from_slice(expected.get(..name_len).unwrap_or(&[]));
     at += name_len;
@@ -3399,7 +3411,7 @@ unsafe fn platform_cert_reason(
         if at + 2 + der.len() + tw::OUT_LEN > arg.len() {
             // A chain this instance cannot carry to the provider is one it
             // cannot have an answer about.
-            return CERT_ERR_NO_ANCHOR;
+            return (CERT_ERR_NO_ANCHOR, false);
         }
         let len = der.len() as u16;
         arg[at..at + 2].copy_from_slice(&len.to_le_bytes());
@@ -3415,13 +3427,13 @@ unsafe fn platform_cert_reason(
     if rc < 0 {
         let msg: &[u8] = b"[tls] the trust provider could not answer; chain refused";
         dev_log(sys, 1, msg.as_ptr(), msg.len());
-        return CERT_ERR_NO_ANCHOR;
+        return (CERT_ERR_NO_ANCHOR, false);
     }
     let result = arg[out_at];
     let checks = arg[out_at + 1];
     let reason = arg[out_at + 2];
     if result == tw::result::TRUSTED {
-        return CERT_OK;
+        return (CERT_OK, false);
     }
     // Say who refused and what they checked. Without this a platform refusal
     // is indistinguishable from any other handshake failure, and an operator
@@ -3452,13 +3464,14 @@ unsafe fn platform_cert_reason(
         }
         dev_log(sys, 1, buf.as_ptr(), pos);
     }
-    match reason {
+    let rc = match reason {
         tw::reason::NAME_MISMATCH => CERT_ERR_NAME_MISMATCH,
         tw::reason::EXPIRED => CERT_ERR_EXPIRED,
         tw::reason::MALFORMED => CERT_ERR_MSG_MALFORMED,
         tw::reason::BAD_PURPOSE => CERT_ERR_LEAF_EKU,
         _ => CERT_ERR_NO_ANCHOR,
-    }
+    };
+    (rc, reason == tw::reason::UNKNOWN_CA)
 }
 
 /// Room for one VERIFY request: the header, a full-length name, the longest
@@ -3516,6 +3529,7 @@ unsafe fn session_verify_peer_cert(s: &mut TlsState, idx: usize, hs_body: &[u8])
     let expected = s.sessions[idx].expected;
     let expected_len = s.sessions[idx].expected_len as usize;
     let expected_is_ip = s.sessions[idx].expected_is_ip;
+    let mut by_platform = false;
     // A client under `ca_dns` authenticates a name or an address on every
     // session. One that has neither was opened by no dial of ours, and is
     // refused rather than verified against no name at all.
@@ -3529,9 +3543,11 @@ unsafe fn session_verify_peer_cert(s: &mut TlsState, idx: usize, hs_body: &[u8])
             expected_is_ip,
             hs_body,
             Some(&mut deferred),
+            &mut by_platform,
         )
     };
     s.sessions[idx].driver.deferred_links = deferred;
+    s.sessions[idx].driver.chain_by_platform = by_platform;
     if rc == CERT_OK {
         rc = bind_peer_cert_key(&mut s.sessions[idx].driver, hs_body);
     }
@@ -3673,11 +3689,11 @@ unsafe fn log_chain_verified(s: &mut TlsState, idx: usize, suite: u16) {
     let d = &s.sessions[idx].driver;
     let links = d.deferred_links.len as u32;
     let steps = d.verify_steps as u32;
+    let by_platform = d.chain_by_platform;
     s.sessions[idx].driver.verify_steps = 0;
-    if s.trust_system {
-        // The platform decided, so this module counted no links, took no
-        // steps and holds no anchors. Printing those zeros beside an empty
-        // source reads as "nothing verified this", which is the opposite of
+    if by_platform {
+        // The platform decided, so this module counted no links and took no
+        // steps. Printing those zeros beside an anchor count reads as "nothing verified this", which is the opposite of
         // what happened — one line that says who decided instead.
         let sys = &*s.syscalls;
         let msg: &[u8] = b"[tls] chain verified by the platform (trust=system)";

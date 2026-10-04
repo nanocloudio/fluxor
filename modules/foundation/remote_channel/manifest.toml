@@ -29,6 +29,10 @@ timer_class = "wall_clock"
 # A session that has not bound its peer and exchanged tables ten seconds
 # after the transport session came up is closed. A connection or session
 # that arrives while one is served is closed.
+#
+# `session` (optional output) carries a frame each time a session opens or
+# ends, so a consumer can refuse work toward a member that is down at once
+# instead of waiting out its own deadline.
 
 [[ports]]
 name = "transport_in"
@@ -127,6 +131,13 @@ content_type = "OctetStream"
 
 [[ports]]
 name = "ch7_rx"
+direction = "output"
+content_type = "OctetStream"
+
+# Session opened / ended: `contracts/mesh/remote_session.rs` frames. Down
+# until the first `MSG_SESSION_UP`.
+[[ports]]
+name = "session"
 direction = "output"
 content_type = "OctetStream"
 
