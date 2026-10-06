@@ -25,6 +25,38 @@ pub const FRAME_HDR: usize = 3;
 /// 65,535 ids; the R1 conn tables bind long before the id space does).
 pub const CONN_ID_LEN: usize = 2;
 
+/// The `msg_type` of a frame, from its header.
+///
+/// Callers bounds-check `frame.len() >= FRAME_HDR` first.
+#[inline]
+#[must_use]
+pub fn msg_type(frame: &[u8]) -> u8 {
+    frame[0]
+}
+
+/// The payload length a frame's header declares.
+///
+/// A reader framing this protocol off a byte stream has only the header and has
+/// to know how much more to take; one that reads a whole buffer and acts on the
+/// first frame drops whatever was queued behind it. Both need this field, so the
+/// contract reads it rather than each of them open-coding the same two bytes.
+///
+/// Callers bounds-check `frame.len() >= FRAME_HDR` first.
+#[inline]
+#[must_use]
+pub fn payload_len(frame: &[u8]) -> usize {
+    u16::from_le_bytes([frame[1], frame[2]]) as usize
+}
+
+/// The whole wire length of a frame, header included.
+///
+/// Callers bounds-check `frame.len() >= FRAME_HDR` first.
+#[inline]
+#[must_use]
+pub fn frame_len(frame: &[u8]) -> usize {
+    FRAME_HDR + payload_len(frame)
+}
+
 /// Read the leading `conn_id` of a payload. Callers bounds-check
 /// `payload.len() >= CONN_ID_LEN` first (frame validation).
 #[inline]

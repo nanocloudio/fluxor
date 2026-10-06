@@ -71,8 +71,8 @@ pub mod route_handler {
     /// method path is `/<service>/<Method>` and a trailing `/`
     /// matches as a prefix.
     pub const GRPC: u8 = 10;
-    /// Hand the request to a downstream graph node as an
-    /// `HttpRequest` and await its `HttpResponse`.
+    /// Hand the request to a downstream graph node as exchange records
+    /// and serve the response records it answers with.
     pub const APP: u8 = 11;
     /// WebSocket fan-out gated on external admission: the 101 is
     /// composed only once the admission answer accepts. Distinct

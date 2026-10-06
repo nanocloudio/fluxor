@@ -36,6 +36,7 @@ include!("runtime/wasm.rs");
 include!("runtime/provider.rs");
 include!("runtime/block.rs");
 include!("runtime/net.rs");
+include!("runtime/exchange.rs");
 include!("runtime/telemetry.rs");
 include!("runtime/device_access.rs");
 include!("runtime/storage.rs");

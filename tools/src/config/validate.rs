@@ -1477,8 +1477,8 @@ pub fn validate_fault_policy(
 ///
 /// This is the consumer half of the capability registry. It lives on the EDGE
 /// rather than on the module because that is what a capability requirement
-/// actually means: a producer's `publish_out` needs the thing on the other end
-/// of *that wire* to be a publish sink, and a graph-wide "some module declares
+/// actually means: a requester's `request_out` needs the thing on the other
+/// end of *that wire* to be a publish sink, and a graph-wide "some module declares
 /// it" check would pass a config that wired it to a metrics collector.
 ///
 /// Two checks per requiring port:
@@ -1491,13 +1491,13 @@ pub fn validate_fault_policy(
 ///      check with teeth: a provider's ceiling is a property of that
 ///      provider, not of the protocol it speaks, and a producer wired to one
 ///      whose backend takes less than it sends is a guaranteed runtime
-///      OVERSIZE refusal that nothing else sees before the graph runs.
+///      413 refusal that nothing else sees before the graph runs.
 ///
 ///      Fact against fact, and NEVER a fact against a port's `max_record`:
-///      the two measure different things. `max_record` sizes a whole framed
-///      record — correlation id, flags, key, length prefixes — while
-///      `max_payload` is the payload alone, and on the ordered-ack surface
-///      they differ by 525 bytes. Port sizing is separately covered anyway:
+///      the two measure different things. `max_record` sizes one whole
+///      record — on the exchange surface the record prefix, the head's
+///      fixed fields and the target — while `max_payload` is the body
+///      alone, which a provider may collect across many records. Port sizing is separately covered anyway:
 ///      the kernel refuses a wiring whose `max_record` exceeds the granted
 ///      ring. What a fact adds is what the BACKEND will take, and only
 ///      another fact states what the producer will send.

@@ -3038,7 +3038,7 @@ mod port_capability_tests {
     }
 
     fn edge() -> Value {
-        json!({"wiring": [{"from": "pump.publish_out", "to": "sink.publish_in"}]})
+        json!({"wiring": [{"from": "pump.request_out", "to": "sink.request_in"}]})
     }
 
     /// A module whose `provides` lists `surfaces`.
@@ -3122,7 +3122,7 @@ mod port_capability_tests {
         let mut m = HashMap::new();
         m.insert(
             "pump".to_string(),
-            consumer("publish_out", "stream.publish", 0),
+            consumer("request_out", "stream.publish", 0),
         );
         m.insert("sink".to_string(), provider(&["stream.publish"], None));
         validate_port_capabilities(&edge(), &m).unwrap();
@@ -3135,7 +3135,7 @@ mod port_capability_tests {
         let mut m = HashMap::new();
         m.insert(
             "pump".to_string(),
-            consumer("publish_out", "stream.publish", 0),
+            consumer("request_out", "stream.publish", 0),
         );
         m.insert("sink".to_string(), provider(&["telemetry.sink"], None));
         let e = validate_port_capabilities(&edge(), &m).unwrap_err();
@@ -3148,25 +3148,25 @@ mod port_capability_tests {
     #[test]
     fn parent_matches_child_but_not_the_reverse() {
         let mut m = HashMap::new();
-        m.insert("pump".to_string(), consumer("publish_out", "stream", 0));
+        m.insert("pump".to_string(), consumer("request_out", "stream", 0));
         m.insert("sink".to_string(), provider(&["stream.publish"], None));
         validate_port_capabilities(&edge(), &m).unwrap();
 
         let mut m = HashMap::new();
         m.insert(
             "pump".to_string(),
-            consumer("publish_out", "stream.publish", 0),
+            consumer("request_out", "stream.publish", 0),
         );
         m.insert("sink".to_string(), provider(&["stream"], None));
         validate_port_capabilities(&edge(), &m).unwrap_err();
     }
 
     /// A producer that declares it sends more than the provider's backend
-    /// takes fails the build rather than collecting runtime OVERSIZE refusals.
+    /// takes fails the build rather than collecting runtime 413 refusals.
     #[test]
     fn rejects_a_payload_larger_than_the_providers_ceiling() {
         let mut m = HashMap::new();
-        let mut pump = consumer("publish_out", "stream.publish", 8717);
+        let mut pump = consumer("request_out", "stream.publish", 8192);
         pump.capability_facts = facts("stream.publish", 8192);
         m.insert("pump".to_string(), pump);
         m.insert(
@@ -3181,7 +3181,7 @@ mod port_capability_tests {
     #[test]
     fn accepts_a_payload_within_the_ceiling() {
         let mut m = HashMap::new();
-        let mut pump = consumer("publish_out", "stream.publish", 8717);
+        let mut pump = consumer("request_out", "stream.publish", 8192);
         pump.capability_facts = facts("stream.publish", 1600);
         m.insert("pump".to_string(), pump);
         m.insert(
@@ -3192,22 +3192,21 @@ mod port_capability_tests {
     }
 
     /// A port's `max_record` is never the quantity compared against a
-    /// provider's `max_payload`: `max_record` frames a whole record —
-    /// correlation id, flags, key, length prefixes — while `max_payload` is
-    /// the payload alone, and on the ordered-ack surface they differ by 525
-    /// bytes. This is the shape of the real graph — a pump whose port takes
-    /// an 8717-byte frame, sending 8192-byte payloads, into a sink that
-    /// accepts 8192 — so confusing the two would fail every correctly
-    /// configured producer.
+    /// provider's `max_payload`: `max_record` bounds one whole record — on the
+    /// exchange surface the record prefix, the head's fixed fields and the
+    /// target — while `max_payload` is the body alone, which a provider may
+    /// collect across many records. A pump whose port takes 8192-byte records,
+    /// sending 4096-byte payloads into a sink that accepts 4096, is correctly
+    /// configured, so confusing the two would fail it.
     #[test]
-    fn a_frame_sized_port_does_not_fail_against_an_equal_payload_ceiling() {
+    fn a_record_sized_port_does_not_fail_against_an_equal_payload_ceiling() {
         let mut m = HashMap::new();
-        let mut pump = consumer("publish_out", "stream.publish", 8717);
-        pump.capability_facts = facts("stream.publish", 8192);
+        let mut pump = consumer("request_out", "stream.publish", 8192);
+        pump.capability_facts = facts("stream.publish", 4096);
         m.insert("pump".to_string(), pump);
         m.insert(
             "sink".to_string(),
-            provider(&["stream.publish"], Some(8192)),
+            provider(&["stream.publish"], Some(4096)),
         );
         validate_port_capabilities(&edge(), &m).unwrap();
     }
@@ -3216,7 +3215,7 @@ mod port_capability_tests {
     /// its buffers by state arena declares it.
     const TIERED_PUMP: &str = "version = \"0.1.0\"\n\
         hardware_targets = [\"bcm2712\", \"rp2350\", \"rp2040\"]\n\n\
-        [[ports]]\nname = \"publish_out\"\ndirection = \"output\"\n\
+        [[ports]]\nname = \"request_out\"\ndirection = \"output\"\n\
         content_type = \"OctetStream\"\nrequires_capability = \"stream.publish\"\n\n\
         [capability_facts.\"stream.publish\"]\n\
         max_payload = { bcm2712 = 8192, rp2350 = 4096, rp2040 = 512 }\n";
@@ -3251,7 +3250,7 @@ mod port_capability_tests {
         let mut m = HashMap::new();
         m.insert(
             "pump".to_string(),
-            consumer("publish_out", "stream.publish", 8717),
+            consumer("request_out", "stream.publish", 8192),
         );
         m.insert(
             "sink".to_string(),
@@ -3268,7 +3267,7 @@ mod port_capability_tests {
         let mut m = HashMap::new();
         m.insert(
             "pump".to_string(),
-            consumer("publish_out", "stream.publish", 8192),
+            consumer("request_out", "stream.publish", 8192),
         );
         validate_port_capabilities(&edge(), &m).unwrap();
     }
@@ -3282,7 +3281,7 @@ mod port_capability_tests {
             "pump".to_string(),
             Manifest {
                 ports: vec![PortSpec {
-                    name: Some("publish_out".to_string()),
+                    name: Some("request_out".to_string()),
                     ..port_default()
                 }],
                 ..Manifest::default()
@@ -3633,6 +3632,116 @@ mod gated_edge_tests {
         )
         .unwrap();
         assert_eq!(groups, vec![2, 2]);
+    }
+}
+
+#[cfg(test)]
+mod framed_edge_tests {
+    use super::*;
+    use crate::manifest::{Manifest, PortSpec};
+    use serde_json::json;
+
+    fn content_type(name: &str) -> u8 {
+        fluxor_contracts::CONTENT_TYPES
+            .iter()
+            .position(|t| *t == name)
+            .expect("a content type the table names") as u8
+    }
+
+    fn port(direction: u8, index: u8, ty: &str, flags: u8) -> PortSpec {
+        PortSpec {
+            direction,
+            content_type: content_type(ty),
+            flags,
+            name: None,
+            index,
+            buffer_size: 0,
+            max_record: 0,
+            rate_class_max: None,
+            rate_class_default: None,
+            requires_capability: None,
+            facts: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// A requester with an exchange pair and a byte stream out, and a
+    /// provider with the matching inputs.
+    fn manifests() -> HashMap<String, Manifest> {
+        let mut m = HashMap::new();
+        m.insert(
+            "req".to_string(),
+            Manifest {
+                ports: vec![
+                    port(1, 0, "ExchangeRequest", 0),
+                    port(1, 1, "OctetStream", 0),
+                    port(1, 2, "OctetStream", 0x02),
+                ],
+                ..Manifest::default()
+            },
+        );
+        m.insert(
+            "prov".to_string(),
+            Manifest {
+                ports: vec![
+                    port(0, 0, "ExchangeRequest", 0),
+                    port(0, 1, "OctetStream", 0),
+                    port(0, 2, "OctetStream", 0),
+                ],
+                ..Manifest::default()
+            },
+        );
+        m
+    }
+
+    fn names() -> Vec<String> {
+        vec!["req".to_string(), "prov".to_string()]
+    }
+
+    fn groups(config: &Value) -> Vec<Option<u64>> {
+        config["wiring"]
+            .as_array()
+            .expect("wiring")
+            .iter()
+            .map(|e| e.get("buffer_group").and_then(|v| v.as_u64()))
+            .collect()
+    }
+
+    /// A framed edge the wiring leaves ungrouped gets a mailbox group of its
+    /// own; a byte-stream edge stays a FIFO.
+    #[test]
+    fn a_framed_edge_without_a_group_is_given_one() {
+        let config = json!({"wiring": [
+            {"from": "req.request_out", "to": "prov.request_in"},
+            {"from": "req.bytes", "to": "prov.bytes"},
+        ]});
+        let edges = [(0u8, 1u8, 0u8, 0u8, 0u8), (0, 1, 0, 1, 1)];
+        let out = group_framed_edges(&config, &edges, &names(), &manifests()).unwrap();
+        assert_eq!(groups(&out), vec![Some(31), None]);
+    }
+
+    /// A port declaring `framed = true` over a streamed type is a framed edge
+    /// too, and every framed edge gets a group nobody else holds.
+    #[test]
+    fn each_framed_edge_gets_a_distinct_group_clear_of_written_ones() {
+        let config = json!({"wiring": [
+            {"from": "req.request_out", "to": "prov.request_in"},
+            {"from": "req.records", "to": "prov.records"},
+            {"from": "req.bytes", "to": "prov.bytes", "buffer_group": 30},
+        ]});
+        let edges = [(0u8, 1u8, 0u8, 0u8, 0u8), (0, 1, 0, 2, 2), (0, 1, 0, 1, 1)];
+        let out = group_framed_edges(&config, &edges, &names(), &manifests()).unwrap();
+        assert_eq!(groups(&out), vec![Some(31), Some(29), Some(30)]);
+    }
+
+    /// A group the wiring names is kept as written.
+    #[test]
+    fn a_written_group_on_a_framed_edge_is_kept() {
+        let config = json!({"wiring": [
+            {"from": "req.request_out", "to": "prov.request_in", "buffer_group": 4},
+        ]});
+        let edges = [(0u8, 1u8, 0u8, 0u8, 0u8)];
+        let out = group_framed_edges(&config, &edges, &names(), &manifests()).unwrap();
+        assert_eq!(groups(&out), vec![Some(4)]);
     }
 }
 

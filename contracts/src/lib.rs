@@ -158,27 +158,20 @@ pub const CONTENT_TYPES: &[&str] = &[
     // a consumer applies a whole layout or none of it, never a mixture of
     // two surface states.
     "PresentationLayout",
-    // HTTP application fan-out surface — the request half. Header
-    // `{conn_id u16, stream_id u16, method u8, flags u8, path_len u16,
-    // hdr_len u16, body_len u16}` followed by `path_len + hdr_len +
-    // body_len` bytes. Carried on a port when a transport gateway — a
-    // consuming HTTP module — is configured to hand a matched route's
-    // requests to a downstream module instead of answering them itself.
-    //
-    // The pair with `HttpResponse` is what lets a graph serve an API
-    // whose meaning lives in an application module: the gateway keeps
-    // owning HTTP framing, connection state and bounded body handling,
-    // and owns none of the request's meaning. `stream_id` is carried
-    // beside `conn_id` because HTTP/2 multiplexes many requests over one
-    // connection — correlating on `conn_id` alone misroutes the moment a
-    // client opens parallel streams.
-    "HttpRequest",
-    // HTTP application fan-out surface — the response half. Header
-    // `{conn_id u16, stream_id u16, status u16, flags u8, ct_len u8,
-    // hdr_len u16, body_len u16}` followed by `ct_len + hdr_len +
-    // body_len` bytes. The gateway matches it back to the originating
-    // request by `(conn_id, stream_id)`.
-    "HttpResponse",
+    // Exchange records, request direction: a request HEAD (method, target,
+    // headers, peer, response credit, the first body bytes), further BODY
+    // records, CREDIT, ABORT and DATAGRAM — the layout in
+    // `modules/sdk/contracts/exchange.rs`. Every record names its exchange by
+    // a 14-byte id the requester chooses. Carried on a port where a requester
+    // asks a provider anything: an HTTP server handing a route to an
+    // application, a pipeline calling an endpoint, a producer publishing to a
+    // broker or a table.
+    "ExchangeRequest",
+    // Exchange records, response direction: a response HEAD (status, content
+    // type, headers, the first body bytes), further BODY records, CREDIT,
+    // ABORT, DATAGRAM, and LINK for the provider's link to its backend. Each
+    // echoes the id of the request it answers.
+    "ExchangeResponse",
     // Control-plane store change surface — one record per key mutation,
     // emitted by the `storage.namespace` SUBSCRIBE stream. Payload
     // `{revision u64, kind u8, key_len u16, val_len u32}` followed by
@@ -352,8 +345,8 @@ pub const CONTENT_RATE_CLASS: &[RateClass] = &[
     // request/response, not a sustained stream. A route that carries
     // bulk bodies (artefact push/pull, media upload) declares `rate:`
     // on the edge rather than reclassifying the type for everyone.
-    Control, // HttpRequest
-    Control, // HttpResponse
+    Control, // ExchangeRequest
+    Control, // ExchangeResponse
     // One record per key mutation — bursty control traffic, not a stream.
     Control, // NamespaceChange
     // Bulk by nature: uploads and readbacks move in runs of 64 KiB chunks, so
@@ -441,8 +434,8 @@ pub const CONTENT_FRAMING: &[Framing] = &[
     Streamed, // Telemetry
     Streamed, // SurfaceTraits
     Streamed, // PresentationLayout
-    Framed,   // HttpRequest
-    Framed,   // HttpResponse
+    Framed,   // ExchangeRequest
+    Framed,   // ExchangeResponse
     // One record per key mutation, inside a mesh Event envelope — a reader
     // that was handed half of one could not tell which key changed.
     Framed, // NamespaceChange

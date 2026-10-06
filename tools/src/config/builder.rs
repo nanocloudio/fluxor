@@ -1133,9 +1133,12 @@ fn validate_isr_tier_admission(
         }
     };
 
-    let manifests = load_module_manifests_with_extra(
+    // Resolved for the graph's own target, as config generation resolves
+    // them: a module pinned per silicon binds that target's pin.
+    let manifests = load_module_manifests_with_extra_for_target(
         &Value::Array(module_list.to_vec()),
         extra_module_dirs,
+        resolved_target.or_else(|| config.get("target").and_then(|t| t.as_str())),
         project_root,
     );
 
@@ -1485,6 +1488,7 @@ fn validate_pre_tick_drain_admission(
     config: &Value,
     module_list: &[Value],
     extra_module_dirs: &[&std::path::Path],
+    resolved_target: Option<&str>,
     project_root: &std::path::Path,
 ) -> Result<()> {
     // Per-domain exec_mode for the four supported domains.
@@ -1505,9 +1509,12 @@ fn validate_pre_tick_drain_admission(
         }
     }
 
-    let manifests = load_module_manifests_with_extra(
+    // Resolved for the graph's own target, as config generation resolves
+    // them: a module pinned per silicon binds that target's pin.
+    let manifests = load_module_manifests_with_extra_for_target(
         &Value::Array(module_list.to_vec()),
         extra_module_dirs,
+        resolved_target.or_else(|| config.get("target").and_then(|t| t.as_str())),
         project_root,
     );
 

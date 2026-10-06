@@ -240,8 +240,9 @@ Who resolves: the provider that receives the record. `linux_net` calls
 the host's `getaddrinfo` on a resolver thread and keeps a 60 s positive
 cache; `ip` runs a stub resolver over UDP/53 against the `resolver`
 parameter when set and otherwise the nameserver DHCP handed it. In the
-browser there is no stream provider at all — the wasm host serves the
-HTTP exchange contract, and the browser resolves the URL's host. A
+browser there is no stream provider at all — the wasm host answers HTTP
+requests as a provider of the exchange contract (`wasm_browser_http`,
+`exchange.md`), and the browser resolves the URL's host. A
 provider that cannot resolve answers an `AF_NAME` target with EINVAL,
 and one with no IPv6 stack answers an `AF_INET6` literal the same way —
 `ip` refuses both. An IPv4 literal is the only target every provider

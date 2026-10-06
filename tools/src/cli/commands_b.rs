@@ -51,8 +51,15 @@ fn cmd_validate(
         // Config-anchored root so a cross-project `fluxor build --check ../x.yaml`
         // reads the CONFIG's fluxor.lock pins, not the cwd's.
         let cfg_root = crate::project::root_for_config(config_path);
-        let manifests =
-            crate::config::load_module_manifests_with_extra(modules, &extra_dirs, &cfg_root);
+        // Resolved for the graph's own target, as the build resolves them: a
+        // module pinned per silicon binds the pin for that target, and a host
+        // target binds none.
+        let manifests = crate::config::load_module_manifests_with_extra_for_target(
+            modules,
+            &extra_dirs,
+            Some(target_desc.id.as_str()),
+            &cfg_root,
+        );
         if let Err(e) =
             crate::config::validate_presentation_groups(&config, &module_names, &manifests)
         {

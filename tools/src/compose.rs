@@ -1827,6 +1827,46 @@ mod tests {
         }
     }
 
+    /// The bcm2712 silicon TOML states the arena the aarch64 kernel allocates:
+    /// the SDK's `STATE_ARENA_SIZE`, which `platform::chip` re-exports. The
+    /// graph builder admits against the TOML figure and the composer against
+    /// `capacity_for_profile`, so all three are one number.
+    #[test]
+    fn bcm2712_state_arena_is_the_aarch64_kernel_arena() {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let toml = std::fs::read_to_string(repo.join("targets/silicon/bcm2712.toml"))
+            .expect("bcm2712 silicon toml");
+        let kb: u64 = toml
+            .lines()
+            .find(|l| l.trim_start().starts_with("state_arena_kb"))
+            .expect("bcm2712: no state_arena_kb")
+            .split('=')
+            .nth(1)
+            .expect("value")
+            .trim()
+            .parse()
+            .expect("integer");
+        let sdk = std::fs::read_to_string(repo.join("modules/sdk/abi/config.rs"))
+            .expect("modules/sdk/abi/config.rs");
+        let host = &sdk[sdk.find("mod profile_host {").expect("profile_host module")..];
+        let decl = "pub const STATE_ARENA_SIZE: usize = ";
+        let expr = host[host.find(decl).expect("STATE_ARENA_SIZE") + decl.len()..]
+            .split(';')
+            .next()
+            .expect("expression");
+        let sdk_bytes: u64 = expr
+            .split('*')
+            .map(|f| f.trim().parse::<u64>().expect("integer factor"))
+            .product();
+        assert_eq!(
+            kb * 1024,
+            sdk_bytes,
+            "bcm2712 state_arena_kb is not the SDK's aarch64 arena"
+        );
+        let cap = capacity_for_profile("bcm2712").expect("bcm2712 capacity row");
+        assert_eq!(cap.state_bytes as u64, sdk_bytes);
+    }
+
     /// Drift guard: `capacity_for_profile` mirrors kernel constants it cannot
     /// import (they live behind target cfgs). Textual extraction is the
     /// accepted pattern for cross-cfg drift guards in this repo (see the ABI

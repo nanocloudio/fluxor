@@ -110,10 +110,9 @@ CAPACITY >= PSTATUS_ROUND | src/kernel/sys/telemetry_ring.rs
 
 | Cap | Symbol | Source | Value | Reason |
 |---|---|---|---|---|
-| Ordered-ack record payload | `PAYLOAD_MAX` | modules/sdk/contracts/exchange.rs | 8192 | Policy: the one ceiling every provider of `stream.ordered_ack` derives from, so a producer has a number it can hold itself to. A per-provider ceiling is undiscoverable by the producer that must stay under it. A provider whose backend cannot take the full size declares the smaller number as its `max_payload` capability fact, which the build checks against the producer's own `max_payload` fact |
-| Ordered-ack message key | `KEY_MAX` | modules/sdk/contracts/exchange.rs | 512 | Policy: a table or topic identifier plus a 256-byte natural key, with room for producers whose ordering unit is wider. The key is the ordering unit and is opaque to the provider |
-| Ordered-ack publish frame | `PUBLISH_FRAME_MAX` | modules/sdk/contracts/exchange.rs | 8717 | Derived, not chosen: `PUBLISH_OVERHEAD + KEY_MAX + PAYLOAD_MAX` — what a `publish_in` port must take as one record and what a producer declares as `max_record`. Moves when any of its three parts moves, which is why it is checked rather than restated |
-| Ordered-ack reply frame | `REPLY_FRAME_MAX` | modules/sdk/contracts/exchange.rs | 8717 | Derived, not chosen: `REPLY_OVERHEAD + KEY_MAX + PAYLOAD_MAX` — what a `reply_out` port must be able to emit as one record. Equal to `PUBLISH_FRAME_MAX` only because the two overheads happen to match; it is stated separately so a change to either frame moves only its own row |
+| Exchange record | `RECORD_MAX` | modules/sdk/contracts/exchange.rs | 8192 | Policy: the largest record either side of an exchange writes, and so one channel record — what an `ExchangeRequest` or `ExchangeResponse` port declares as `max_record`. A body of any size crosses as many records under credit, so this bounds a reader's buffer, never a request or an answer |
+| Exchange collected body | `PAYLOAD_MAX` | modules/sdk/contracts/exchange.rs | 8192 | Policy: the largest body a provider that takes requests whole collects, and the one ceiling every provider of `stream.ordered_ack` derives from, so a requester has a number it can hold itself to. A per-provider ceiling is undiscoverable by the requester that must stay under it. A provider whose backend cannot take the full size declares the smaller number as its `max_payload` capability fact, which the build checks against the requester's own `max_payload` fact |
+| Exchange ordering key | `KEY_MAX` | modules/sdk/contracts/exchange.rs | 512 | Policy: the largest `target` a publish carries — a table or topic identifier plus a 256-byte natural key, with room for requesters whose ordering unit is wider. The key is the ordering unit and is opaque to the provider |
 | Telemetry ring capacity | `CAPACITY` | src/kernel/sys/telemetry_ring.rs | 4096 | Policy, per target family (4 KiB on RP2040, 8 KiB on RP2350, 32 KiB on bcm2712/host). Records are denser than log text, so the ring sits below the log ring's split. A const assert holds it at or above one whole PSTATUS round — the scheduler emits a round as one uninterrupted burst, so a ring under that size drops the tail of *every* round and the high-index modules never report at all |
 | Block buffers lent at once | `MAX_LENDS` | src/kernel/module/block_lend.rs | 128 | Policy: the kernel's ledger of buffers lent to `storage.block` sources, across every consumer. Deeper than any source's queue (nvme holds 8 per queue) so it only binds on a runaway consumer; a `SUBMIT` past it is `EAGAIN` before the source sees it |
 | Torn-down modules awaiting their lends | `MAX_QUARANTINED` | src/kernel/module/block_lend.rs | 8 | Policy: modules torn down while a source still holds a buffer lent from them, whose memory is kept until the source returns it. Past it the memory stays lent and is not released (a leak, never a corruption) |
@@ -401,10 +400,9 @@ MAX_OWNERS | src/kernel/workload/owner.rs | 1 | single-owner
 MAX_PATH | modules/sdk/abi/config.rs | 200 | host
 MAX_PATH | modules/sdk/abi/config.rs | 32 | wasm
 MAX_PATH | modules/sdk/abi/config.rs | 32 | embedded
+RECORD_MAX | modules/sdk/contracts/exchange.rs | 8192 | *
 PAYLOAD_MAX | modules/sdk/contracts/exchange.rs | 8192 | *
 KEY_MAX | modules/sdk/contracts/exchange.rs | 512 | *
-PUBLISH_FRAME_MAX | modules/sdk/contracts/exchange.rs | PUBLISH_OVERHEAD + KEY_MAX + PAYLOAD_MAX | *
-REPLY_FRAME_MAX | modules/sdk/contracts/exchange.rs | REPLY_OVERHEAD + KEY_MAX + PAYLOAD_MAX | *
 CAPACITY | src/kernel/sys/telemetry_ring.rs | 4096 | chip-rp2040
 CAPACITY | src/kernel/sys/telemetry_ring.rs | 8192 | rp2350-chip
 CAPACITY | src/kernel/sys/telemetry_ring.rs | 32768 | non-rp
@@ -684,6 +682,7 @@ protocol constants, mirrors of a registered symbol — are excluded from
 the coverage report here, each with the reason it is not a row.
 
 ```limit-register-exempt
+BODY_MAX | modules/sdk/contracts/exchange.rs | derived: one RECORD_MAX record less its 16-byte prefix
 CTRL_CAP | modules/foundation/nbd_serve/mod.rs | derived: the longest handshake answer, EXPORT_NAME's 134 bytes with the pad, or GO's two infos and ACK
 INFO_BLOCK_SIZE | modules/foundation/nbd_serve/mod.rs | protocol: the NBD info type number for block-size constraints
 NET_CMD_RECORD_CAPACITY | modules/foundation/tls/mod.rs | derived: the frame scratch less overhead, capped by net_proto MAX_CMD_DATA

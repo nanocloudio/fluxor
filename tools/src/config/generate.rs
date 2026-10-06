@@ -294,7 +294,13 @@ fn generate_config_impl(
     // Placement in Tier 1b/2/3 domains is rejected here so the
     // misconfiguration surfaces at build time rather than as silent
     // misbehaviour at runtime.
-    validate_pre_tick_drain_admission(config, validation_list, extra_module_dirs, project_root)?;
+    validate_pre_tick_drain_admission(
+        config,
+        validation_list,
+        extra_module_dirs,
+        resolved_target,
+        project_root,
+    )?;
 
     // Inject graph sample_rate into modules that don't declare their own
     let modules_with_rate;
@@ -488,6 +494,8 @@ fn generate_config_impl(
     } else {
         return Err(Error::Config("wiring section required".into()));
     };
+    let grouped = group_framed_edges(config, &edges, &module_names, &manifests)?;
+    let config = &grouped;
 
     // Validate content-type compatibility
     validate_wiring_types(
@@ -1280,6 +1288,62 @@ fn ungroup_gated_edges(
         }
     }
     Ok(())
+}
+
+/// Give every framed edge the wiring left ungrouped a mailbox group of its own.
+///
+/// A framed content type carries whole records, and only a mailbox channel
+/// delivers a record whole: a byte FIFO can hand the consumer part of one. The
+/// content type already says which edges those are, so the graph does not —
+/// each such edge gets a group nobody else uses, numbered down from the top of
+/// the 5-bit range so it never meets the in-place chain groups
+/// [`assign_buffer_groups`] numbers up from 1. A group the wiring names is kept.
+fn group_framed_edges(
+    config: &Value,
+    edges: &[(u8, u8, u8, u8, u8)],
+    module_names: &[String],
+    manifests: &HashMap<String, Manifest>,
+) -> Result<Value> {
+    const GROUP_MAX: u64 = 31;
+    let mut out = config.clone();
+    let Some(wiring) = out.get_mut("wiring").and_then(|w| w.as_array_mut()) else {
+        return Ok(out);
+    };
+    let mut used = [false; GROUP_MAX as usize + 1];
+    for entry in wiring.iter() {
+        if let Some(g) = entry.get("buffer_group").and_then(|v| v.as_u64()) {
+            if g <= GROUP_MAX {
+                used[g as usize] = true;
+            }
+        }
+    }
+    let mut next = GROUP_MAX;
+    for (i, edge) in edges.iter().enumerate() {
+        let Some(entry) = wiring.get_mut(i) else {
+            continue;
+        };
+        let grouped = entry
+            .get("buffer_group")
+            .and_then(|v| v.as_u64())
+            .is_some_and(|g| g != 0);
+        if grouped || edge_framed_type(edge, module_names, manifests).is_none() {
+            continue;
+        }
+        while next > 0 && used[next as usize] {
+            next -= 1;
+        }
+        if next == 0 {
+            return Err(Error::Config(format!(
+                "wiring[{i}]: more record-carrying edges than the {GROUP_MAX} mailbox \
+                 groups a graph has"
+            )));
+        }
+        used[next as usize] = true;
+        if let Some(map) = entry.as_object_mut() {
+            map.insert("buffer_group".into(), Value::from(next));
+        }
+    }
+    Ok(out)
 }
 
 fn assign_buffer_groups(

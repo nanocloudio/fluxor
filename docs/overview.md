@@ -43,6 +43,7 @@ How the system works. These are the authoritative references.
 - [architecture/wasm_browser_host.md](architecture/wasm_browser_host.md) — the browser host runtime and its built-in modules
 - [architecture/network.md](architecture/network.md) — channel-based networking, net_proto, drivers, IP module, TLS
 - [architecture/datagram_secure_transports.md](architecture/datagram_secure_transports.md) — DTLS 1.3 and QUIC v1 on the datagram surface
+- [architecture/exchange.md](architecture/exchange.md) — the exchange contract: one request and its answer between any requester and provider
 - [architecture/protocol_surfaces.md](architecture/protocol_surfaces.md) — datagram, packet, mux, and session-control contracts; continuity classes
 - [architecture/network_boot.md](architecture/network_boot.md) — OTA graph delivery: graph images, registry pull, staging, activation
 - [architecture/mesh.md](architecture/mesh.md) — the mesh architecture: distributed objects, capability-based authority, events, leases

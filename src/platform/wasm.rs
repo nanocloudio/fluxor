@@ -1054,26 +1054,16 @@ unsafe fn load_embedded_modules() -> usize {
             }
             let mut origin_buf = [0u8; 256];
             let mut origin_len = 0usize;
-            let mut surface_status = false;
-            walk_tlv(entry.params(), |tag, value| match tag {
-                http_tags::TAG_ORIGIN => {
+            walk_tlv(entry.params(), |tag, value| {
+                if tag == http_tags::TAG_ORIGIN {
                     let n = value.len().min(origin_buf.len());
                     origin_buf[..n].copy_from_slice(&value[..n]);
                     origin_len = n;
                 }
-                http_tags::TAG_SURFACE_STATUS => surface_status = tlv_u32(value) != 0,
-                _ => {}
             });
-            let publish_in = scheduler::module_port(module_idx, http_tags::PORT_PUBLISH_IN);
-            let reply_out = scheduler::module_port(module_idx, http_tags::PORT_REPLY_OUT);
-            let file_ctrl = scheduler::module_port(module_idx, http_tags::PORT_FILE_CTRL);
-            let m = http::build(
-                &origin_buf[..origin_len],
-                surface_status,
-                publish_in,
-                reply_out,
-                file_ctrl,
-            );
+            let request_in = scheduler::module_port(module_idx, http_tags::PORT_REQUEST_IN);
+            let response_out = scheduler::module_port(module_idx, http_tags::PORT_RESPONSE_OUT);
+            let m = http::build(&origin_buf[..origin_len], request_in, response_out);
             scheduler::store_builtin_module(module_idx, m);
             registered += 1;
             log_fmt2(

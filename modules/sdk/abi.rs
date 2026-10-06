@@ -117,12 +117,6 @@ pub mod contracts {
         pub mod ws_frame {
             include!("contracts/net/ws_frame.rs");
         }
-        /// The records an HTTP connector is asked through over
-        /// `stream.ordered_ack.exchange`: a request, a reply head, a body
-        /// chunk, and the method vocabulary they share.
-        pub mod http_exchange {
-            include!("contracts/net/http_exchange.rs");
-        }
         /// The records that drive a WebSocket connector from outside it:
         /// which resource to open on which link, and what became of it.
         pub mod ws_control {
@@ -175,9 +169,9 @@ pub mod contracts {
     pub mod trust {
         include!("contracts/trust.rs");
     }
-    /// Ordered-ack record exchange (`stream.ordered_ack`): publish frames in,
-    /// durable acks out, and an optional reply carrying data back on the same
-    /// correlation.
+    /// The exchange records every request and its answer travel in, between
+    /// any requester and any provider, and the collector a provider uses to
+    /// take requests whole.
     pub mod exchange {
         include!("contracts/exchange.rs");
     }

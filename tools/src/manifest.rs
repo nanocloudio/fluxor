@@ -4325,7 +4325,6 @@ scratch = 512
         ("wasm_browser_video_codec", "height", "u16", 11),
         ("wasm_browser_video_codec", "max_frame_bytes", "u32", 12),
         ("wasm_browser_http", "origin", "str", 10),
-        ("wasm_browser_http", "surface_status", "u8", 11),
         ("wasm_browser_websocket", "url", "str", 10),
         ("wasm_browser_ws", "origin", "str", 10),
         ("wasm_browser_ws_source", "url", "str", 10),

@@ -290,15 +290,14 @@ wiring = [
 # whatever `to:` transport the graph selects. A variant would compete with the
 # `to = net|console|terminal` pick and tie on specificity.
 # `export_telemetry: otlp-http` — on-device OTLP over HTTP POST. Inserts the
-# same `otel` engine in `otlp-proto`
-# encoding plus the generic exchange chain: `exchange_poster` wraps each
-# encoded document in an exchange MSG_PUBLISH (POST /v1/metrics,
-# application/x-protobuf) and an `http` client in exchange mode performs it;
-# the correlated reply drives `otel.delivery`, so batches are RETAINED and
-# retried on transport failure — the reliable-mode contract, composed
-# from generic parts. Protobuf (not JSON) is deliberate: an encoded document
-# must fit one exchange payload (8 KiB ceiling; a JSON body can exceed it,
-# and one document cannot be fragmented).
+# same `otel` engine in `otlp-proto` encoding plus the generic exchange chain:
+# `exchange_poster` sends each encoded document as one exchange request
+# (POST /v1/metrics, `content-type: application/x-protobuf`) and an `http`
+# client in exchange mode performs it; the response status drives
+# `otel.delivery`, so batches are RETAINED and retried on transport failure —
+# the reliable-mode contract, composed from generic parts. Protobuf (not JSON)
+# is deliberate: the poster sends each document whole in one exchange record
+# (8 KiB), and a JSON body can exceed it.
 #
 # The client is `require_distinct`: a graph that already carries an `http`
 # module of a DIFFERENT variant conflicts (one image, one build of a type)
@@ -320,20 +319,19 @@ modules = [
       encoding = "1",
   } },
   { name = "otlp_poster", type = "exchange_poster", params = {
-      path = "user:export_otlp_path|/v1/metrics",
+      path         = "user:export_otlp_path|/v1/metrics",
+      content_type = "application/x-protobuf",
   } },
   { name = "otlp_client", type = "http", variant = "exchange", require_distinct = true, params = {
-      mode           = "1",
-      protocol       = "0",
-      authority      = "user:export_otlp_authority|host:debug.otlp_authority|required",
-      content_type   = "application/x-protobuf",
-      surface_status = "1",
+      mode      = "1",
+      protocol  = "0",
+      authority = "user:export_otlp_authority|host:debug.otlp_authority|required",
   } },
 ]
 wiring = [
   "otel.export -> otlp_poster.payload",
-  "otlp_poster.publish_out -> otlp_client.publish_in",
-  "otlp_client.reply_out -> otlp_poster.reply_in",
+  "otlp_poster.request_out -> otlp_client.request_in",
+  "otlp_client.response_out -> otlp_poster.response_in",
   "otlp_poster.delivery_out -> otel.delivery",
   "otlp_client.net_out -> ip.net_in",
   "ip.net_out -> otlp_client.net_in",
@@ -348,20 +346,19 @@ modules = [
       encoding = "1",
   } },
   { name = "otlp_poster", type = "exchange_poster", params = {
-      path = "user:export_otlp_path|/v1/metrics",
+      path         = "user:export_otlp_path|/v1/metrics",
+      content_type = "application/x-protobuf",
   } },
   { name = "otlp_client", type = "http", variant = "exchange", require_distinct = true, params = {
-      mode           = "1",
-      protocol       = "0",
-      authority      = "user:export_otlp_authority|host:debug.otlp_authority|required",
-      content_type   = "application/x-protobuf",
-      surface_status = "1",
+      mode      = "1",
+      protocol  = "0",
+      authority = "user:export_otlp_authority|host:debug.otlp_authority|required",
   } },
 ]
 wiring = [
   "otel.export -> otlp_poster.payload",
-  "otlp_poster.publish_out -> otlp_client.publish_in",
-  "otlp_client.reply_out -> otlp_poster.reply_in",
+  "otlp_poster.request_out -> otlp_client.request_in",
+  "otlp_client.response_out -> otlp_poster.response_in",
   "otlp_poster.delivery_out -> otel.delivery",
   "otlp_client.net_out -> linux_net.net_in",
   "linux_net.net_out -> otlp_client.net_in",

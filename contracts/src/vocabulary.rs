@@ -105,9 +105,10 @@ pub const CAPABILITY_NAMES: &[&str] = &[
     // no facts: a verifier either answers or it does not.
     "trust.system",
     "replication.state_machine",
-    // The ordered-ack exchange surface (`modules/sdk/contracts/exchange.rs`):
-    // ordered publishes in, durable acks out, and — for a provider that
-    // answers — a reply carrying data on the same correlation.
+    // The ordered-ack terms of the exchange contract
+    // (`modules/sdk/contracts/exchange.rs`): publish requests in order, each
+    // answered 200 once durably accepted, and — for a provider that answers
+    // with data — a response body on the same exchange.
     //
     // Three names — one parent and two roles — because the roles are not
     // interchangeable in both directions. An exchange does everything a sink
@@ -127,9 +128,9 @@ pub const CAPABILITY_NAMES: &[&str] = &[
     //
     // `stream.publish` generalises `stream.ordered_ack`. The narrower name
     // is a capability of its own rather than a fact on this one, because it
-    // additionally promises the durable-ack session protocol in
-    // `modules/sdk/contracts/exchange.rs` — link-state signals and
-    // replay-after-LINK_DOWN, which is NOT a plain call. `stream.publish` is
+    // additionally promises the durable-acceptance terms in
+    // `modules/sdk/contracts/exchange.rs` — LINK records and re-issue after
+    // LINK DOWN, which is NOT a plain call. `stream.publish` is
     // the substitutable fire-and-collect surface a pipeline stage or a
     // program binds. A provider may declare both.
     //
@@ -208,8 +209,8 @@ pub type CapabilityFacts = (&'static str, &'static [Fact]);
 /// build, a frame negotiation, a column width — and in practice it lands
 /// far below the suite's 8192-byte record. It cannot be inferred from the
 /// protocol name, which is exactly why it is a declared fact; validating it
-/// against the producing port's `max_record` is what turns a runtime
-/// OVERSIZE refusal into a build failure.
+/// against the requester's own `max_payload` fact is what turns a runtime
+/// 413 refusal into a build failure.
 ///
 /// Unknown fact names and unadmitted values are rejected at manifest parse
 /// with a did-you-mean, for the same reason the name registries exist: a

@@ -1408,8 +1408,8 @@ fn expand_routes(
             handler = handler_id::GRPC;
         } else if obj.get("app").and_then(|v| v.as_bool()).unwrap_or(false) {
             // Application fan-out (HANDLER_APP) — the request goes out on the
-            // http module's `req_out` port as an `HttpRequest` envelope and the
-            // answer comes back on `resp_in`, so a downstream graph node
+            // http module's `request_out` port as exchange records and the
+            // answer comes back on `response_in`, so a downstream graph node
             // decides what the request MEANS while http keeps owning HTTP.
             //
             // The route path is normally a prefix ending in `/`, since an API

@@ -6,27 +6,28 @@ hardware_targets = ["bcm2712", "rp2350"]
 timer_class      = "agnostic"
 
 # exchange_poster — the generic byte-egress adapter between a framed payload
-# producer (the `otel` export engine) and an exchange-contract request client
-# (wave's `http` in exchange mode, or any provider of the same surface).
+# producer (the `otel` export engine) and any provider of the exchange
+# contract (`modules/sdk/contracts/exchange.rs`) — an HTTP client, or anything
+# else that answers a request. The poster is the requester.
 #
-#   payload_in   ->  one framed body per batch (net_proto [msg_type][len][body])
-#   publish_out  ->  MSG_PUBLISH: corr, msg_key, and a request record wrapping
-#                    the body (method/path from params)
-#   reply_in     <-  MSG_REPLY, correlated
-#   delivery_out ->  one status byte per batch (delivered / retry / drop),
-#                    the `otel.delivery` backchannel — which is what turns a
-#                    fire-and-forget export into a retained, retried one.
+#   payload       ->  one framed body per batch (net_proto [msg_type][len][body])
+#   request_out   ->  one request HEAD per batch: method and target from
+#                     params, a `content-type` header when one is set, the
+#                     batch inline as the whole body
+#   response_in   <-  the provider's answer, by exchange id
+#   delivery_out  ->  one status byte per batch (delivered / retry / drop),
+#                     the `otel.delivery` backchannel — which is what turns a
+#                     fire-and-forget export into a retained, retried one.
 #
-# The adapter is protocol-blind: it composes exchange frames and a request
-# record (framing, per the exchange contract's own doctrine — "a producer
-# composes this at a pipeline edge"), never an HTTP byte.
+# The adapter is protocol-blind: it composes exchange records, never an HTTP
+# byte. A batch that does not fit one record is dropped, permanently and
+# reported — it is one encoded document, and the producer's encoding is the fix.
 #
-# Reply mapping: STATUS_OK -> delivered; REFUSE_UNROUTABLE (connect/exchange
-# failure — the collector is down) -> retry; REFUSE_UPSTREAM (the peer's own
-# status, u16 LE in the reply payload, from a client running
-# `surface_status`) -> retry when 5xx/429 (the OTLP retryable family), drop
-# otherwise; REFUSE_OVERSIZE and anything else -> drop (permanent; retrying
-# wedges the pipe).
+# Response mapping: a 2xx status -> delivered; 429 and every 5xx (the OTLP
+# retryable family, including the 502 and 504 a provider raises when the
+# collector is unreachable or silent) -> retry; any other status -> drop
+# (permanent; retrying wedges the pipe). A provider ABORT -> retry, except
+# TOO_LARGE / MALFORMED -> drop. LINK DOWN -> the batch in flight retries.
 
 [[ports]]
 name         = "payload"
@@ -37,20 +38,20 @@ max_record   = 8500
 buffer_size  = { default = 8704, rp2350 = 4352 }
 
 [[ports]]
-name         = "publish_out"
+name         = "request_out"
 index        = 0
 direction    = "output"
-content_type = "OctetStream"
-max_record   = 8704
-buffer_size  = { default = 9216, rp2350 = 4608 }
+content_type = "ExchangeRequest"
+max_record   = 8192
+buffer_size  = 8192
 
 [[ports]]
-name         = "reply_in"
+name         = "response_in"
 index        = 1
 direction    = "input"
-content_type = "OctetStream"
-max_record   = 8704
-buffer_size  = { default = 9216, rp2350 = 4608 }
+content_type = "ExchangeResponse"
+max_record   = 8192
+buffer_size  = 8192
 
 [[ports]]
 name         = "delivery_out"

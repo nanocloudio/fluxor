@@ -652,29 +652,16 @@ fn resolve_edge_rate_class(
         .unwrap_or(RateClass::Control))
 }
 
-/// Reject a `Framed` content type on a byte-streaming edge.
-///
-/// The type table owns the requirement (`CONTENT_FRAMING`), so a
-/// producer and a consumer cannot disagree about whether a record may
-/// arrive in pieces. The error names the edge and the fix, because the
-/// runtime symptom — a consumer parsing a length out of a fragment —
-/// looks like a protocol bug rather than a wiring one.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "resolved edge context, all of it needed to name the offending wiring entry"
-)]
-fn check_edge_framing(
-    i: usize,
+/// The content type of an edge that carries whole records, or `None` for a
+/// byte-stream edge. An edge is framed when either end's port is: by its
+/// content type's framing, or by the port's own `framed = true`.
+fn edge_framed_type(
     edge: &(u8, u8, u8, u8, u8),
     module_names: &[String],
     manifests: &HashMap<String, Manifest>,
-    from_port_index: u8,
-    to_port_index: u8,
-    to_port: u8,
-    from_specs: &[String],
-    to_specs: &[String],
-) -> Result<()> {
-    use fluxor_contracts::{Framing, CONTENT_FRAMING, CONTENT_TYPES};
+) -> Option<u8> {
+    use fluxor_contracts::{Framing, CONTENT_FRAMING};
+    let &(_, _, to_port, from_port_index, to_port_index) = edge;
 
     // The type table is the primary source: it owns framing, so a producer and
     // a consumer cannot disagree about it. A port may ALSO declare
@@ -701,17 +688,7 @@ fn check_edge_framing(
         .get(&module_names[edge.1 as usize])
         .and_then(|m| m.find_port_spec(to_direction, to_port_index));
 
-    if let Some(ct) = framed_of(from_port).or_else(|| framed_of(to_port_spec)) {
-        let name = CONTENT_TYPES.get(ct as usize).copied().unwrap_or("?");
-        return Err(Error::Config(format!(
-            "wiring[{i}] ({} → {}): `{name}` is a record envelope and needs a \
-             non-zero `buffer_group:` on this edge. Without one the channel is a \
-             byte FIFO, so a consumer can be handed part of an envelope and read \
-             a length that is not there.",
-            from_specs[i], to_specs[i]
-        )));
-    }
-    Ok(())
+    framed_of(from_port).or_else(|| framed_of(to_port_spec))
 }
 
 /// Per-edge capacity + rate-class validation.
@@ -768,24 +745,11 @@ fn validate_wiring_capacity(
         if buffer_group != 0 {
             continue; // mailbox/group-max semantics — runtime validates
         }
+        debug_assert!(
+            edge_framed_type(&edges[i], module_names, manifests).is_none(),
+            "every framed edge is grouped before capacity is checked"
+        );
 
-        // Framing, before capacity: a `Framed` content type on a
-        // group-0 edge is a byte FIFO carrying header-framed records,
-        // which builds clean and then hands the consumer half an
-        // envelope at runtime. Checked here because this is where the
-        // edge's ports are already resolved, and only for group-0 edges
-        // because a non-zero group IS the mailbox mode the type needs.
-        check_edge_framing(
-            i,
-            &edges[i],
-            module_names,
-            manifests,
-            from_port_index,
-            to_port_index,
-            to_port,
-            from_specs,
-            to_specs,
-        )?;
 
         let buffer_bytes = entry
             .and_then(|e| e.get("buffer_bytes"))

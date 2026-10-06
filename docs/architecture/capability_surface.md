@@ -164,8 +164,8 @@ Source: `contracts/src/lib.rs`.
 | 30 | `Telemetry` | Fixed-layout `TelemetryRecord` (`modules/sdk/contracts/telemetry.rs`) |
 | 31 | `SurfaceTraits` | Fixed 24-byte environment-plane descriptor (`modules/sdk/contracts/input/surface_traits.rs`) |
 | 32 | `PresentationLayout` | Resolved presentation-layout records (`tools/src/presentation_resolver.rs`) |
-| 33 | `HttpRequest` | HTTP fan-out request half: `{conn_id u16, stream_id u16, method u8, flags u8, path_len u16, hdr_len u16, body_len u16}` + bytes |
-| 34 | `HttpResponse` | HTTP fan-out response half, matched to its request by `(conn_id, stream_id)` |
+| 33 | `ExchangeRequest` | Exchange records, request direction: request HEAD, BODY, CREDIT, ABORT, DATAGRAM, each naming its exchange by a 14-byte id the requester chooses (`modules/sdk/contracts/exchange.rs`, `exchange.md`) |
+| 34 | `ExchangeResponse` | Exchange records, response direction: response HEAD, BODY, CREDIT, ABORT, DATAGRAM, and LINK for the provider's link to its backend; each echoes its request's id |
 | 35 | `NamespaceChange` | Control-plane store change surface, one record per key mutation: `{revision u64, kind u8, key_len u16, val_len u32}` + key and value bytes, inside a mesh Event envelope |
 | 36 | `GpuCommand` | Generic GPU work — the request stream of `modules/sdk/wire/gpu_wire.rs` (query, resource, program, transfer, submission, fence, control, surface) |
 | 37 | `GpuOutcome` | Generic GPU outcomes — the reply half: acceptance, handles, capabilities, readback bytes, surface leases, and exactly one terminal outcome per accepted request |
@@ -316,11 +316,11 @@ Replication and streaming:
 | Capability | Meaning |
 |------------|---------|
 | `replication.state_machine` | Replicated commit-and-apply surface: per-entry committed stream, accepted-into-WAL index echo, quorum-durability notice, snapshot install / export, apply-pipeline reset |
-| `stream.ordered_ack` | Ordered-publish surface answering durable acks and link-state signals; the parent a consumer requires when it only publishes, satisfied by either role below. Wire contract: `modules/sdk/contracts/exchange.rs` |
+| `stream.ordered_ack` | A provider of the exchange contract that durably accepts records in order: a 200 answer means durable acceptance, LINK records report its backend link; the parent a requester requires when it only publishes, satisfied by either role below. Wire contract: `modules/sdk/contracts/exchange.rs` |
 | `stream.ordered_ack.sink` | A provider that accepts records and does not answer with data: an MQTT topic, a Kafka partition, an INSERT |
-| `stream.ordered_ack.exchange` | A provider that additionally answers each publish with data on the same correlation: an HTTP GET, a SELECT |
+| `stream.ordered_ack.exchange` | A provider that additionally answers each request with data on the same exchange: an HTTP GET, a SELECT |
 | `stream.line` | Line- or byte-delimited text stream: one command's output feeding the next command's input, unidirectional, backpressured by the channel, with no correlation and no acks |
-| `stream.publish` | Substitutable fire-and-collect publish surface — what a pipeline stage or a program binds. Generalises `stream.ordered_ack`, which additionally promises the durable-ack session protocol |
+| `stream.publish` | Substitutable fire-and-collect publish surface — what a pipeline stage or a program binds. Generalises `stream.ordered_ack`, which additionally promises durable acceptance and re-issue after LINK DOWN |
 | `stream.subscribe` | Substitutable subscribe surface: records delivered to a stage, with the delivery guarantee and replay support declared as facts |
 | `request.http` | Substitutable HTTP request surface |
 | `request.record` | Substitutable record-query surface (a table, a key-value store) |

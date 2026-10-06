@@ -246,7 +246,7 @@ Media, transport, and diagnostics:
 | `wasm_browser_ws_source`| `bytes` out (`VideoRaster`) | §4.5 |
 | `wasm_browser_ws`       | `open_in` in, `ws_in` in (`WsFrame`), `ws_out` out (`WsFrame`), `event_out` out | §4.5 |
 | `host_browser_fetch`    | `bytes` out (`OctetStream`) | §4.6 |
-| `wasm_browser_http`     | `publish_in` in, `reply_out` out, `file_ctrl` out (`OctetStream`) | §4.6 |
+| `wasm_browser_http`     | `request_in` in (`ExchangeRequest`), `response_out` out (`ExchangeResponse`) | §4.6 |
 | `wasm_browser_camera`   | `frames` out (`OctetStream`) | luma frames from `getUserMedia`, for a downstream decoder |
 | `wasm_browser_display_capture` | `pixels` out (`VideoRaster`) | `SRF1` RGB565 frames of a surface the person chose to share, from `getDisplayMedia`; §4.7 |
 | `wasm_browser_scan_out` | `result` in (`OctetStream`) | surfaces a decoded byte result (e.g. a scanned token) in the page |
@@ -401,25 +401,30 @@ built-ins. One in-flight request per module instance; for parallel
 fetches, instantiate one module per URL.
 
 `wasm_browser_http` (`src/platform/wasm/http.rs`) is the browser as an
-HTTP exchange provider: the provider half of
-`stream.ordered_ack.exchange`, answering the same `http_exchange`
-records with the same replies and refusals a socket-backed HTTP client
-does, so a consumer moves between the two by wiring alone. A request
-arrives on `publish_in` as a `Publish` carrying a request record; the
-page's `fetch()` performs it; the `Reply` leaves on `reply_out` under
-the same correlation, echoing the request's key. A plain request is
-answered with the response body; an extended one (the verb's high bit)
-is answered with the status and header block, and its body streams on
-`file_ctrl` as length-framed chunks ending with an empty one. A path
-names the resource and the `origin` param names where (empty means the
-page's origin); a path with its own scheme or host, a broadcast, a
-CONNECT, or a failed fetch is refused UNROUTABLE, a request or body
-past the contract's ceiling is OVERSIZE, and with `surface_status` set
-a response of 400 or above is REFUSE_UPSTREAM carrying the code.
-Redirects are followed. One exchange is in flight at a time; a graph
-that wants concurrency instantiates more. Backed by `host_http_*`,
-kept apart from the fetch imports because those serve the written
-store and the asset bank ahead of the network and discard the status.
+HTTP exchange provider: a provider of the exchange contract
+(`exchange.md`) declaring `stream.ordered_ack.exchange`, answering with
+the same records and statuses a socket-backed HTTP client does, so a
+requester moves between the two by wiring alone. Request records arrive
+on `request_in`; each request is collected whole (`fetch()` takes its
+body in one piece, up to `PAYLOAD_MAX`), and the page's `fetch()`
+performs it. The answer leaves on `response_out` under the request's
+exchange id: a response HEAD with the status, the content type, the
+response's other header fields and the first body bytes, then BODY
+records as the rest arrives, never past the requester's credit.
+
+A request's target is a path and the `origin` param names where (empty
+means the page's origin); a request may name its authority in a `host`
+header, which must match a set origin and is dialled over https when
+none is set. A target with its own scheme or host, an unknown method,
+CONNECT, a publish, a broadcast or an upgrade is answered 400; a request
+past what it collects 413; more exchanges at once than it holds 503; a
+fetch that fails before the response head, or a head too large for one
+record, 502. A fetch that fails after the head aborts the exchange; an
+ABORT from the requester cancels the fetch. Redirects are followed. One
+exchange is performed at a time; a graph that wants concurrency
+instantiates more. Backed by `host_http_*`, kept apart from the fetch
+imports because those serve the written store and the asset bank ahead
+of the network and discard the status.
 
 ### 4.7 `wasm_browser_display_capture` — shared-surface source
 
