@@ -219,9 +219,9 @@ unsafe fn flush_out(st: &mut HttpState) -> bool {
     st.out_len == 0
 }
 
-/// Answer an exchange with a status and no body, in `out`.
+/// Refuse an exchange with a status this provider raised, in `out`.
 fn answer_status(st: &mut HttpState, id: &ExchangeId, code: u16) {
-    if let Some(n) = ex::write_response(id, code, b"", b"", &mut st.out) {
+    if let Some(n) = ex::write_refusal(id, code, &mut st.out) {
         st.out_len = n as u32;
     }
 }
@@ -256,7 +256,7 @@ unsafe fn take_requests(st: &mut HttpState) {
             }
         }
         if let Some((id, why)) = st.requests.take_refusal() {
-            if let Some(len) = ex::write_response(&id, why.status(), b"", b"", &mut st.ctl) {
+            if let Some(len) = ex::write_refusal(&id, why.status(), &mut st.ctl) {
                 st.ctl_len = len as u32;
             }
         }

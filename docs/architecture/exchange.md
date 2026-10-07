@@ -78,6 +78,16 @@ itself are named in `status`:
 | 503 | the provider holds as many exchanges as it can; the request may be repeated |
 | 504 | the peer behind the provider did not answer in time |
 
+A HEAD carrying a status the provider raised is marked `RAISED` (`0x80`), and
+`write_refusal` writes one. The bit is the only thing that tells "the peer
+answered 502" from "there was no peer to answer": a requester that relays the
+status onward — an HTTP server answering its client — needs nothing more than
+the number, while one that reports a failure differently from an answer — a
+script runtime whose `fetch` rejects on a network error — reads the flag. A
+peer's own answer is never marked, whatever its status; an origin's 503 is an
+answer. A relay that forwards response records unchanged forwards the flag
+with them.
+
 ## Credit
 
 Flow is credit-based in both directions, and only body bytes count. The

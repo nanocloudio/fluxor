@@ -55,7 +55,9 @@
 // `status` is an HTTP status code for every provider, HTTP or not: 200 is an
 // answer (for a sink, durable acceptance, with an empty body), and a provider
 // that relays a peer's answer reports the peer's own status. The refusals a
-// provider raises itself are named in `status` below.
+// provider raises itself are named in `status` below, and the HEAD that
+// carries one is marked RAISED: the same number from a peer and from the
+// provider are different facts, and only the flag tells them apart.
 //
 // LINK carries the provider's connection to whatever backs it, not an
 // exchange. LINK_DOWN says every exchange the requester has open without a
@@ -152,6 +154,21 @@ pub mod flag {
     pub const ROUTE_PROXY: u8 = 0x20;
     /// Request: deliver to every ordering unit, not the one `target` names.
     pub const BROADCAST: u8 = 0x40;
+    /// Response HEAD: the provider raised this status itself, and no peer
+    /// answered — it could not reach one, the peer did not answer in time,
+    /// or the provider refused the request before asking. Without it, the
+    /// status is the peer's own answer. A requester that must tell "the
+    /// origin said 502" from "there was no origin to say anything" reads
+    /// this bit; one that relays the status onward needs nothing else.
+    ///
+    /// Set on a response HEAD. A body, if any — inline or in the BODY records
+    /// that follow under MORE — is the provider's own account of what
+    /// happened, never a peer's; a requester that wants no such account
+    /// ABORTs the exchange rather than leave it waiting for credit. A relay that forwards
+    /// response records unchanged forwards it unchanged; one that answers
+    /// from a peer that set it keeps it, since its own requester was not
+    /// answered by a peer either.
+    pub const RAISED: u8 = 0x80;
 }
 
 /// Why an exchange was aborted.
@@ -182,8 +199,9 @@ pub mod link {
     pub const UP: u8 = 2;
 }
 
-/// The statuses a provider raises itself. Everything else a status carries is
-/// an answer, including a relayed peer's own.
+/// The statuses a provider raises itself, each on a HEAD marked
+/// [`flag::RAISED`]. Everything else a status carries is an answer, including
+/// a relayed peer's own, and is not marked.
 pub mod status {
     /// Answered; for a sink, durably accepted.
     pub const OK: u16 = 200;
@@ -682,6 +700,22 @@ pub fn write_response(
             content_type,
             headers: &[],
             body,
+        },
+        out,
+    )
+}
+
+/// Encode a refusal the provider raises itself: a terminal HEAD carrying
+/// `status`, marked [`flag::RAISED`], with no content type, headers or body.
+pub fn write_refusal(id: &ExchangeId, status: u16, out: &mut [u8]) -> Option<usize> {
+    write_response_head(
+        &ResponseHead {
+            id: *id,
+            flags: flag::RAISED,
+            status,
+            content_type: &[],
+            headers: &[],
+            body: &[],
         },
         out,
     )
