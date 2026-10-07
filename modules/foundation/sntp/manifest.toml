@@ -1,0 +1,58 @@
+version = "0.1.0"
+hardware_targets = ["bcm2712"]
+permissions = ["platform_raw"]
+
+# SNTP client (RFC 4330) that anchors the platform's wall clock on a board
+# with no RTC and no operating system to run a time protocol — the source of
+# `timer::TRUSTED_UNIX` = NETWORK_SYNC on bare metal, which every certificate
+# and token validity decision waits on.
+#
+# Each round queries every configured server (`server0..3`, IPv4 as u32, e.g.
+# "0xA29FC801") over the ip datagram surface. A reply counts only when its
+# origin timestamp echoes the random nonce our request carried, it is a
+# server-mode reply from stratum 1..15, and its leap indicator is not
+# "unsynchronised"; it becomes an anchor at the reply's arrival: unix = T3 +
+# delay/2, error = delay/2 + root_delay/2 + root_dispersion. The largest set
+# of anchors that agree within `agree_ms` is chosen; only when it holds at
+# least `quorum` servers does the tightest of them reach the kernel through
+# `timer::DISCIPLINE`, its error widened by the set's spread — one lying or
+# broken server can neither set the clock nor, among enough honest ones, stop
+# it being set.
+#
+# Rounds repeat every `poll_s` (15..1800 s: at least RFC 4330's 15 s floor,
+# at most half the kernel's 1 h anchor staleness). A round that does not
+# anchor retries after `retry_s` (at least 15 s), doubling per consecutive
+# failure up to `poll_s`. A kiss-o'-death answering our request is obeyed:
+# `DENY` / `RSTR` stop all requests to that server, `RATE` holds it off for
+# a poll interval.
+#
+# Privileged (`platform_raw`): DISCIPLINE decides every validity window on
+# the node. Unauthenticated NTP is the same trust Linux gives chrony/timesyncd
+# by default; a signed source (roughtime / NTS) is the upgrade path.
+#
+# Logs: `[sntp] sync n=<agreeing> got=<replies> spread_us= err_us= unix_ms=
+# rc=`, `[sntp] no_quorum got=<replies> n=<agreeing> spread_us=`,
+# `[sntp] kod_denied|kod_rate|kod server=<i>`, and a `[sntp] hb` every 30 s
+# that repeats the outcome beside the kernel's own TRUSTED_UNIX verdict (a
+# one-shot line can lose the race with log_net).
+
+timer_class = "wall_clock"
+
+[[ports]]
+name = "net_in"
+direction = "input"
+content_type = "NetProto"
+
+[[ports]]
+name = "net_out"
+direction = "output"
+content_type = "NetProto"
+
+# `write`: DISCIPLINE sets the platform's wall clock.
+[[resources]]
+requires_contract = "timer"
+access = "write"
+
+# Module-scope observability — exempt (standards/observability.md §6).
+[observability]
+exempt = "its '[sntp]' sync / no_quorum / kod / hb lines are the observable; the kernel's own '[time] anchored' line confirms each anchor"

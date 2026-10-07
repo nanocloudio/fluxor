@@ -440,7 +440,7 @@ impl LocalAddr {
         }
     }
 
-    /// A slot is in use when its IPv4 word is non-zero (v1 is IPv4-only).
+    /// A slot is in use when its IPv4 word is non-zero (addresses are IPv4).
     #[inline(always)]
     fn is_active(&self) -> bool {
         (self.addr[0] | self.addr[1] | self.addr[2] | self.addr[3]) != 0
@@ -891,9 +891,10 @@ const NET_OUT_QUEUE_HEADROOM: usize = 4;
 // Module State
 // ============================================================================
 
-/// Ingress refusals and security-relevant admission decisions. Every field is
-/// a free-running lifetime counter: an operator reads deltas, and a
-/// non-advancing counter is itself the signal that a defence never fired.
+/// Ingress refusals, security-relevant admission decisions, and the inbound
+/// stream repairs beside them. Every field is a free-running lifetime
+/// counter: an operator reads deltas, and a non-advancing counter is itself
+/// the signal that a defence never fired.
 ///
 /// These sit apart from `TlmCounters` (bytes / idle / backpressure) because
 /// they answer a different question — not "how much moved" but "what was
@@ -969,6 +970,10 @@ pub struct IpDrops {
     /// Challenge ACKs the rate limiter suppressed. A rising count is the
     /// signal that a flood is being absorbed rather than reflected.
     pub tcp_challenge_suppressed: u32,
+    /// Retransmits that straddled RCV.NXT, trimmed to their new bytes.
+    pub tcp_overlap_trimmed: u32,
+    /// Window-update ACKs sent when a closed receive window reopened.
+    pub tcp_window_update: u32,
     /// RSTs dropped for landing outside the receive window.
     pub tcp_rst_out_of_window: u32,
     /// Window advertisements ignored for arriving on a segment no newer than
@@ -1018,6 +1023,8 @@ impl IpDrops {
             tcp_ack_invalid: 0,
             tcp_challenge_sent: 0,
             tcp_challenge_suppressed: 0,
+            tcp_overlap_trimmed: 0,
+            tcp_window_update: 0,
             tcp_rst_out_of_window: 0,
             tcp_stale_window: 0,
             dg_bind_conflict: 0,
@@ -1189,8 +1196,8 @@ struct IpState {
     net_in_chan: i32,
     net_out_chan: i32,
     /// Address-control input port (in[2]); -1 when unwired. Single writer =
-    /// the platform workload backend. Graphs without it wired get today's
-    /// single-address behaviour, byte-identical.
+    /// the platform workload backend. A graph without it wired runs with the
+    /// single primary address.
     addr_ctl_chan: i32,
     /// Emission events back to that writer (out[5]); -1 when unwired.
     addr_evt_chan: i32,
@@ -1340,6 +1347,14 @@ struct IpState {
     tlm: TlmCounters,
     /// One-line scratch for the tlm emit, sized at `TLM_LINE_BUF_SIZE`.
     tlm_scratch: [u8; TLM_LINE_BUF_SIZE],
+    /// Receivers whose window was updated in the current sharing epoch,
+    /// hashed by connection index (`conn_idx & 255`; a collision undercounts,
+    /// which only offers a larger share), and the previous epoch's count. The
+    /// receive window is a share of the consumer ring, and this is how many
+    /// it is shared between (`update_rcv_wnd`).
+    rx_seen: [u64; 4],
+    rx_active_prev: u16,
+    rx_epoch_ms: u32,
     /// Which line of the periodic report the next step writes; 0 when none.
     report_line: u8,
 
@@ -2471,22 +2486,76 @@ unsafe fn dg_send_error(s: &mut IpState, ep_id: u8, errno: i8) {
     net_send_or_queue(s, &frame);
 }
 
-/// Recompute the advertised receive window from consumer-channel backpressure.
-/// Called after delivering data on a connection.
+/// Length of a receive-window sharing epoch (`rx_seen`).
+const RX_EPOCH_MS: u32 = 50;
+/// Smallest window worth opening (RFC 9293 §3.8.6.2.2 receiver-side silly
+/// window avoidance): below one default-MSS segment, advertise zero and
+/// let the sweep reopen it once the ring has drained.
+const MIN_OPEN_WND: u32 = 536;
+
+/// Recompute the advertised receive window. Called after delivering data
+/// on a connection, and by the sweep for a window backpressure closed.
+///
+/// Every connection delivers into the same consumer ring, so the window is
+/// sized against that ring: the share offered is its free space divided
+/// between the receivers active in this epoch or the last, less framing.
+///
+/// The share decides how far the right edge (RCV.NXT + RCV.WND) moves
+/// forward, never that it moves back (RFC 9293 §3.8.6.2.2). Bytes the peer
+/// sent inside an earlier, larger window are in flight under a promise;
+/// refusing them at the window test would drop data the ring may well
+/// hold, and the peer would wait out a retransmit to resend it. Delivery is
+/// what guards the ring: a segment the ring cannot take is refused there
+/// (RCV.NXT does not move, nothing is acknowledged) and the window closes
+/// to zero, the one shrink a full ring forces. A continuity fence closes it
+/// too (`rcv_wnd_exposed`).
 unsafe fn update_rcv_wnd(s: &mut IpState, conn_idx: usize) {
     let sys = &*s.syscalls;
-    // Check whether the consumer channel has drained space.
-    let poll_out = (sys.channel_poll)(s.net_out_chan, POLL_OUT);
-    let consumer_ready = poll_out > 0 && (poll_out as u32 & POLL_OUT) != 0;
-    let conn = &mut *s.tcp_conns.as_mut_ptr().add(conn_idx);
-    // Heuristic: if consumer channel reports writable, treat the
-    // downstream buffer as fully drained.
-    if consumer_ready {
-        conn.consumed_bytes = conn.delivered_bytes;
+    // Epoch bookkeeping: which receivers are active.
+    let now_ms = dev_millis(sys) as u32;
+    if now_ms.wrapping_sub(s.rx_epoch_ms) >= RX_EPOCH_MS {
+        let seen: u32 = s.rx_seen.iter().map(|w| w.count_ones()).sum();
+        s.rx_active_prev = seen as u16;
+        s.rx_seen = [0; 4];
+        s.rx_epoch_ms = now_ms;
     }
-    let in_flight = conn.delivered_bytes.wrapping_sub(conn.consumed_bytes);
-    let avail = (tcp::MAX_RCV_WND as u32).saturating_sub(in_flight) as u16;
-    let wnd = core::cmp::min(avail, tcp::MAX_RCV_WND);
+    let bit = conn_idx & 255;
+    s.rx_seen[bit >> 6] |= 1u64 << (bit & 63);
+    let seen_now: u32 = s.rx_seen.iter().map(|w| w.count_ones()).sum();
+    let sharers = seen_now.max(s.rx_active_prev as u32).max(1);
+
+    let mut free = [0u8; 4];
+    let rc = dev_channel_ioctl(sys, s.net_out_chan, IOCTL_WRITABLE, free.as_mut_ptr(), 4);
+    let free = u32::from_le_bytes(free);
+    let wnd = if rc < 0 || free == 0 {
+        // Zero free bytes is either a full ring or a channel with no ring
+        // to measure (a mailbox reports 0 yet accepts a write), and a refused
+        // ioctl measures nothing. Readiness tells them apart: a full ring is
+        // not writable.
+        let poll_out = (sys.channel_poll)(s.net_out_chan, POLL_OUT);
+        if poll_out > 0 && (poll_out as u32 & POLL_OUT) != 0 {
+            tcp::MAX_RCV_WND as u32
+        } else {
+            0
+        }
+    } else {
+        // Each segment is delivered as one MSG_DATA frame; reserve 1/16
+        // for its header and connection id.
+        let share = free / sharers;
+        share - share / 16
+    };
+    let share = if wnd < MIN_OPEN_WND {
+        0
+    } else {
+        wnd.min(tcp::MAX_RCV_WND as u32) as u16
+    };
+    let conn = &mut *s.tcp_conns.as_mut_ptr().add(conn_idx);
+    let wnd = tcp::hold_right_edge(
+        conn.rcv_wnd,
+        conn.delivered_bytes.wrapping_sub(conn.consumed_bytes),
+        share,
+    );
+    conn.consumed_bytes = conn.delivered_bytes;
     conn.rcv_wnd = continuity::rcv_wnd_exposed(s, conn_idx, wnd);
 }
 
@@ -3561,6 +3630,19 @@ unsafe fn emit_report_line(s: &mut IpState) {
             pos += fmt_u32_dec(s.tcp_half_open_max, buf.add(pos));
             emit(b" hosrc=", &mut pos);
             pos += fmt_u32_dec(s.tcp_half_open_src_max, buf.add(pos));
+            dev_log(sys, 3, buf, pos);
+            // Inbound-stream health, on its own line (the drop line is full):
+            // TCP checksum failures, straddling retransmits trimmed, reopened
+            // windows announced, and how many receivers share the ring.
+            pos = 0;
+            emit(b"[ip] rx cktcp=", &mut pos);
+            num(s.drops.cksum_tcp, &mut pos);
+            emit(b" trim=", &mut pos);
+            num(s.drops.tcp_overlap_trimmed, &mut pos);
+            emit(b" wupd=", &mut pos);
+            num(s.drops.tcp_window_update, &mut pos);
+            emit(b" sharers=", &mut pos);
+            num(s.rx_active_prev as u32, &mut pos);
             dev_log(sys, 3, buf, pos);
         }
         5 => {
@@ -5026,9 +5108,24 @@ unsafe fn process_tcp_segment(
                             }
                         }
                     }
+                    // Bytes of this segment already delivered: a retransmit
+                    // that straddles RCV.NXT (sent before a zero window, say)
+                    // carries them ahead of the new data. RFC 9293
+                    // §3.10.7.4 trims and processes the rest; dropping the
+                    // whole segment instead stalls the stream until the
+                    // peer's RTO resends exactly from RCV.NXT.
+                    let already = conn.rcv_nxt.wrapping_sub(tcp_hdr.seq_num);
+                    let straddles = tcp_hdr.payload_len > 0
+                        && (already as i32) > 0
+                        && already < tcp_hdr.payload_len as u32;
                     if tcp_hdr.payload_len > 0 && tcp_hdr.seq_num == conn.rcv_nxt {
                         rx_payload_offset = tcp_hdr.payload_offset;
                         rx_payload_len = tcp_hdr.payload_len;
+                        action = ACTION_RX_DATA;
+                    } else if straddles {
+                        rx_payload_offset = tcp_hdr.payload_offset + already as usize;
+                        rx_payload_len = tcp_hdr.payload_len - already as usize;
+                        s.drops.tcp_overlap_trimmed = s.drops.tcp_overlap_trimmed.wrapping_add(1);
                         action = ACTION_RX_DATA;
                     } else if tcp_hdr.payload_len > 0
                         && seq_between(
@@ -8036,6 +8133,13 @@ unsafe fn sweep_range(s: &mut IpState, start: usize, end: usize) {
                 )
             {
                 update_rcv_wnd(s, ci);
+                // Announce the reopened window (RFC 9293 §3.8.6.2.2): the
+                // peer otherwise learns of it only from its persist probe,
+                // which meets the rate-limited challenge path and backs off.
+                if (*s.tcp_conns.as_ptr().add(ci)).rcv_wnd != 0 {
+                    s.drops.tcp_window_update = s.drops.tcp_window_update.wrapping_add(1);
+                    let _ = send_tcp_control(s, ci, tcp::ACK, false);
+                }
             }
             ci += 1;
         }

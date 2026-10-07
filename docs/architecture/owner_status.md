@@ -7,8 +7,8 @@ CLI only, no sockets and no signals.
 
 Everything below the last hop is owner-space: the kernel, the runtime and the
 file speak `owner`, the same vocabulary as the rest of the graph runtime. The
-translation into an orchestrator's own nouns happens once, at the CLI boundary,
-and is described in [Pod projection](#pod-projection) at the end.
+join onto the agent's durable workload records happens once, at the CLI
+boundary, and is described in [Workload status](#workload-status) at the end.
 
 ## Why the kernel has to aggregate
 
@@ -88,8 +88,7 @@ The file carries a small envelope plus one entry per resident workload:
 
 `terminated` is present only when `phase == "Terminated"`; `waiting_reason`
 only when `phase == "Activating"`; `started_at` only once the owner has
-started. Two additive groups appear conditionally and are omitted otherwise,
-so their absence keeps older output byte-identical:
+started. Two groups appear only when they apply and are omitted otherwise:
 
 - `bound_endpoints`: the owner's bound network ports, as
   `[{"protocol": "tcp" | "udp", "port": N}, …]`.
@@ -145,22 +144,26 @@ are in the vocabulary so those paths can land without a format change.
 - **Durability** mirrors the plan publish: temp write, fsync, atomic rename,
   parent-dir fsync. A reader never observes a half-written file.
 
-## Pod projection
+## Workload status
 
-`fluxor agent status --json` is where owner-space meets orchestrator-space. It
-joins each `owner_status.json` record onto the durable record for that owner
-and emits it as `pods[].runtime`, using the field names above unchanged.
+`fluxor agent status --json` is where owner-space meets the agent's durable
+records. Each committed workload is owned by the owner whose UID is the
+workload's UID; the agent joins each `owner_status.json` entry onto that
+workload by UID, slot and owner generation, and emits its `runtime` as
+`workloads[].runtime` with the field names above.
 
 Two properties matter to a consumer:
 
 - `runtime` is **absent** when the node runtime isn't up — no file, unreadable
   file, out-of-vocabulary value, or a dead writer. Absence means "unknown", not
   "not running"; a consumer must not read it as a negative assertion.
-- The key is additive. Everything else in `agent status --json` is unchanged,
-  so a consumer that ignores `runtime` sees exactly what it saw before.
+- `runtime` is optional. A consumer that reads only the durable fields reads
+  the same record whether or not a runtime is attached.
 
-`pod` is the orchestrator's noun, not fluxor's — the kernel and runtime carry
-no Kubernetes vocabulary, and this projection is the single point where the two
-naming systems meet. Downstream, nanocloud maps `pods[].runtime` onto
-`containerStatuses`; that mapping and the Kubernetes status schema are
-nanocloud's concern, specified in its own Pod API rather than here.
+A runtime entry with no durable record left — an owner whose revocation has
+aged out of the plan while its terminal record is still in the runtime's
+retention window — is reported as a runtime-only row, `committed: false`, so
+the terminal state is not dropped.
+
+Fluxor's nouns end here. An orchestrator that presents workloads under names
+of its own maps `workloads[].runtime` onto its schema itself.

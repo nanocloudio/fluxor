@@ -55,6 +55,9 @@ pub const IOCTL_NOTIFY: u32 = 1;
 pub const IOCTL_POLL_NOTIFY: u32 = 2;
 pub const IOCTL_FLUSH: u32 = 3;
 pub const IOCTL_EOF: u32 = 4;
+/// Bytes a write can place in the channel's ring now (`[u32 out]`); 0 for a
+/// full ring and for a mailbox channel, which has no ring to measure.
+pub const IOCTL_WRITABLE: u32 = 5;
 
 // ============================================================================
 // FMP Well-Known Message Types (pre-computed FNV-1a hashes)

@@ -1024,6 +1024,11 @@ fn privileged_op_permission(op: u32) -> Option<u16> {
     if op == 0x1E02 || op == 0x1E03 {
         return Some(PLATFORM_RAW);
     }
+    // timer::DISCIPLINE anchors the wall clock every credential validity
+    // window is judged against: platform_raw, unlike the timer reads.
+    if op == 0x060A {
+        return Some(PLATFORM_RAW);
+    }
     // host_mount (0x1Fxx) MOUNT / UMOUNT change what the host has mounted:
     // platform_raw. PRIV and ROOT are reads.
     if op == 0x1F01 || op == 0x1F02 {
@@ -1195,7 +1200,7 @@ unsafe fn channel_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_
             // mismatched length here rather than letting them read
             // out-of-bounds bytes from the caller's buffer.
             match cmd {
-                channel::IOCTL_NOTIFY | channel::IOCTL_POLL_NOTIFY => {
+                channel::IOCTL_NOTIFY | channel::IOCTL_POLL_NOTIFY | channel::IOCTL_WRITABLE => {
                     if payload_len != 4 {
                         return E_INVAL;
                     }
@@ -1308,6 +1313,32 @@ unsafe fn buffer_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
             acquire_reply(arg, arg_len, || channel::buffer_acquire_inplace(handle))
         }
         _ => E_NOSYS,
+    }
+}
+
+/// `TIMER::DISCIPLINE`: anchor the network-disciplined wall clock. Only a
+/// platform whose HAL reads `time_sync` (bcm2712) takes an anchor; anywhere
+/// else the call is `ENOSYS` rather than a second clock nobody reads.
+fn discipline_wall_clock(unix_us: u64, mono_us: u64, err_us: u64) -> i32 {
+    #[cfg(feature = "chip-bcm2712")]
+    {
+        // SAFETY: takes no pointers; the kernel timer is initialised before
+        // any module runs.
+        let now = unsafe { syscall_micros() };
+        let rc = crate::kernel::sys::time_sync::discipline(unix_us, mono_us, err_us, now);
+        if rc == 0 {
+            log::info!(
+                "[time] anchored unix_ms={} err_us={}",
+                unix_us / 1_000,
+                err_us
+            );
+        }
+        rc
+    }
+    #[cfg(not(feature = "chip-bcm2712"))]
+    {
+        let _ = (unix_us, mono_us, err_us);
+        E_NOSYS
     }
 }
 
@@ -1456,6 +1487,17 @@ unsafe fn timer_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_le
             let rec = trusted_unix_record();
             core::ptr::copy_nonoverlapping(rec.as_ptr(), arg, tt::LEN);
             0
+        }
+        dev_timer::DISCIPLINE => {
+            if arg.is_null() || arg_len < 20 {
+                return E_INVAL;
+            }
+            let a = core::slice::from_raw_parts(arg, 20);
+            let unix_us = u64::from_le_bytes([a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]]);
+            let mono_us =
+                u64::from_le_bytes([a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15]]);
+            let err_us = u32::from_le_bytes([a[16], a[17], a[18], a[19]]) as u64;
+            discipline_wall_clock(unix_us, mono_us, err_us)
         }
         dev_timer::CREATE => fd::timer_create(),
         dev_timer::SET => {
@@ -2430,8 +2472,6 @@ pub unsafe extern "C" fn syscall_millis() -> u64 {
 pub unsafe extern "C" fn syscall_micros() -> u64 {
     hal::now_micros()
 }
-
-// DMA channel allocation and bridge — platform-specific, moved to rp/providers.rs
 
 // ============================================================================
 // Device Query

@@ -416,6 +416,41 @@ control blocks, UDP socket bindings, the ARP cache, the routing table
 (typically a single default route), and port allocation. Other modules
 see only the frames they receive on their channels.
 
+### Receive windows
+
+Every TCP connection delivers into the same consumer ring (`net_out`), so
+receive windows are sized against that ring. After each delivery, and
+from the timer sweep for a window that backpressure closed, the module
+asks the kernel how many bytes the ring can take (`IOCTL_WRITABLE`) and
+computes each connection's share: an equal part of that room among the
+connections that received in the current or previous 50 ms epoch, less
+1/16 for `MSG_DATA` framing, capped at `MAX_RCV_WND` (4 KiB on aarch64,
+where that cap keeps the sum of windows inside the 32 KiB `frames_rx`
+ring; 8 KiB elsewhere). A share under 536 bytes — one default-MSS
+segment — is zero rather than a sliver (receiver-side silly window
+avoidance). A channel with no ring to measure (a mailbox) is judged by
+writability alone: writable offers the full cap, otherwise zero.
+
+The share decides how far the right edge of the window (`RCV.NXT +
+RCV.WND`) moves forward; it never moves the edge back (RFC 9293
+§3.8.6.2.2). The window advertised is the larger of the share and what
+is left of the previous window once the bytes delivered since are
+subtracted, so data the peer sent under an earlier, larger window is
+admitted even after other connections have filled the ring. The ring
+itself is guarded at delivery: a segment it cannot take is not
+acknowledged, `RCV.NXT` stays put, and the window closes to zero — the
+one shrink a full ring forces — until the consumer drains. A continuity
+quiesce closes the window the same way. The peer resends what was
+refused. When the sweep reopens a closed
+window it sends a window-update ACK at once, rather than leaving the peer
+to discover it through its persist timer. A retransmit that straddles
+`RCV.NXT` — some of its bytes already delivered — is trimmed to its new
+bytes and processed (RFC 9293 §3.10.7.4) instead of dropped whole.
+
+The periodic report carries these on one line:
+`[ip] rx cktcp=<TCP checksum failures> trim=<straddling retransmits
+trimmed> wupd=<window updates sent> sharers=<receivers in the last epoch>`.
+
 ### Multiple instances
 
 Nothing in the architecture prevents running two IP modules in one

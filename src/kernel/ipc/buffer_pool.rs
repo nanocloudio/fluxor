@@ -9,10 +9,19 @@
 //!
 //! ## Concurrency
 //!
-//! `BUFFER_ARENA` and `BUFFER_ARENA_OFFSET` are boot-only (channel
-//! allocation happens in `prepare_graph` on core 0). Each
-//! `BUFFER_REGISTRY` slot is touched on every step from any core, so
-//! its fields are atomic. See `docs/architecture/concurrency.md`.
+//! The arena allocator (`alloc_buffer` / `release_buffer`) runs under one
+//! spin lock: channels open and close at graph build, on live graph changes
+//! and from module calls on any core. Each `BUFFER_REGISTRY` slot is touched
+//! on every step from any core, so its fields are atomic. See
+//! `docs/architecture/concurrency.md`.
+//!
+//! ## Arena reuse
+//!
+//! Closing a channel returns its buffer to the arena: the region is merged
+//! with any free neighbours and either lowers the high-water mark or joins a
+//! bounded free list that later allocations take from (best fit, split). A
+//! node that admits and reaps workloads indefinitely therefore holds its
+//! buffer arena at a fixed point instead of exhausting it.
 //!
 //! ## Buffer Modes
 //!
@@ -42,7 +51,7 @@
 //! - **READY**: data available; acquire_read or acquire_inplace may proceed
 //! - **CONSUMER**: reader holds buffer (read-only via acquire_read)
 //! - **READY_PROCESSED**: in-place module has processed; prevents double-processing
-//! - **mailbox_flush**: force-resets any state to STREAMING (clears len, inplace_flag)
+//! - **mailbox_flush**: force-resets a slot holding a buffer to STREAMING (clears len, inplace_flag)
 //! - **mailbox_cancel_read**: CONSUMER → READY without consuming (preserves payload)
 //!
 //! ## In-place processing limit
@@ -67,7 +76,7 @@
 //! first module that produces whole buffers; prior stages use FIFO copy. See
 //! `docs/architecture/pipeline.md` §FIFO→Mailbox for the full pattern.
 
-use portable_atomic::{AtomicI16, AtomicU32, AtomicU8, Ordering};
+use portable_atomic::{AtomicBool, AtomicI16, AtomicU32, AtomicU8, AtomicUsize, Ordering};
 
 use crate::kernel::ipc::channel::MAX_CHANNELS;
 use crate::kernel::sys::errno;
@@ -103,72 +112,234 @@ const _: () = assert!(
 /// Derived from the canonical constant in abi.rs.
 pub const BUFFER_SIZE: usize = crate::abi::CHANNEL_BUFFER_SIZE;
 
-/// Buffer arena size — from silicon TOML [kernel] section.
-/// RP2350: 32 KB, RP2040: 16 KB.
+/// Buffer arena size — the silicon TOML's `[kernel] buffer_arena_kb`.
 const BUFFER_ARENA_SIZE: usize = crate::kernel::config::BUFFER_ARENA_SIZE;
 
 // ============================================================================
 // Buffer Arena (separate from module state arena)
 // ============================================================================
 
-// Page-aligned (4 KiB) so a buffer carved at a page-aligned offset is at a
-// page-aligned ADDRESS — required for isolated-module channel buffers, whose
-// EL0 page-table mapping rounds to whole pages. (Was `align(4)`; widening the
-// base alignment is harmless for non-isolated buffers.)
-#[repr(C, align(4096))]
-struct AlignedBufferArena([u8; BUFFER_ARENA_SIZE]);
-static mut BUFFER_ARENA: AlignedBufferArena = AlignedBufferArena([0; BUFFER_ARENA_SIZE]);
-static mut BUFFER_ARENA_OFFSET: usize = 0;
+/// Alignment of every channel buffer: one cache line. Capacities are powers of
+/// two of at least 64 bytes (`channel_open`), so every buffer starts and ends
+/// on a line boundary: two channels never share a line, and cache maintenance
+/// on one buffer (a DMA-owned edge) never touches its neighbour.
+const BUFFER_ALIGN: usize = 64;
 
-/// Bump high-water mark: `(used_bytes, total_bytes)` — resource-ledger
-/// sample for `POOL_BUFFER_ARENA`.
-pub fn arena_usage() -> (usize, usize) {
-    // SAFETY: word-sized read of a static usize; scheduler-thread writer.
-    (unsafe { BUFFER_ARENA_OFFSET }, BUFFER_ARENA_SIZE)
+#[repr(C, align(64))]
+struct AlignedBufferArena([u8; BUFFER_ARENA_SIZE]);
+const _: () = assert!(core::mem::align_of::<AlignedBufferArena>() == BUFFER_ALIGN);
+static mut BUFFER_ARENA: AlignedBufferArena = AlignedBufferArena([0; BUFFER_ARENA_SIZE]);
+
+/// Bump high-water mark: `[0, offset)` has been handed out at some point;
+/// the returned regions inside it are on the free list. Written only under
+/// `ARENA_LOCK`; read without it by `arena_usage`.
+static BUFFER_ARENA_OFFSET: AtomicUsize = AtomicUsize::new(0);
+
+/// Serialises the arena allocator. A buffer is allocated when a channel
+/// opens and returned when it closes; both happen at graph build, on a live
+/// graph change, when the kernel closes a channel whose block lends came back
+/// (core 0, peers running), and on a module's own `channel::OPEN` / `CLOSE`
+/// from whichever core steps it.
+static ARENA_LOCK: AtomicBool = AtomicBool::new(false);
+
+/// A returned region of the arena, below the high-water mark.
+#[derive(Clone, Copy)]
+struct FreeRegion {
+    offset: u32,
+    size: u32,
 }
 
-/// Allocate a buffer from the dedicated buffer arena.
-///
-/// Returns pointer to zeroed buffer, aligned to 4 bytes.
+/// Bounded free list of returned regions, kept coalesced: no two entries are
+/// adjacent, and none ends at the high-water mark (that region lowers the
+/// mark instead). A node that admits and reaps workloads for its whole life
+/// closes channels for its whole life; the free list is what lets each reaped
+/// workload's buffers serve the next one, whatever its capacities. A region
+/// returned while the list is full is leaked (counted in `leaked`) until the
+/// next `reset_buffer_arena`.
+const MAX_FREE_REGIONS: usize = 128;
+
+struct FreeList {
+    regions: [FreeRegion; MAX_FREE_REGIONS],
+    count: usize,
+    leaked: usize,
+}
+
+static mut FREE_LIST: FreeList = FreeList {
+    regions: [FreeRegion { offset: 0, size: 0 }; MAX_FREE_REGIONS],
+    count: 0,
+    leaked: 0,
+};
+
+/// Run `f` on the free list with `ARENA_LOCK` held.
+fn with_arena<R>(f: impl FnOnce(&mut FreeList) -> R) -> R {
+    while ARENA_LOCK
+        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        core::hint::spin_loop();
+    }
+    // SAFETY: `ARENA_LOCK` is held, so this is the only reference.
+    let r = f(unsafe { &mut *core::ptr::addr_of_mut!(FREE_LIST) });
+    ARENA_LOCK.store(false, Ordering::Release);
+    r
+}
+
+/// Bytes an allocation of `size` occupies in the arena.
+fn arena_need(size: usize) -> Option<usize> {
+    size.checked_add(BUFFER_ALIGN - 1)
+        .map(|n| n & !(BUFFER_ALIGN - 1))
+}
+
+impl FreeList {
+    fn remove(&mut self, i: usize) {
+        self.regions[i] = self.regions[self.count - 1];
+        self.count -= 1;
+    }
+
+    /// Best fit: the smallest region that holds `need`, split if larger.
+    /// Returns its offset.
+    fn take(&mut self, need: usize) -> Option<usize> {
+        let i = (0..self.count)
+            .filter(|&i| self.regions[i].size as usize >= need)
+            .min_by_key(|&i| self.regions[i].size)?;
+        let r = self.regions[i];
+        if r.size as usize == need {
+            self.remove(i);
+        } else {
+            self.regions[i] = FreeRegion {
+                offset: r.offset + need as u32,
+                size: r.size - need as u32,
+            };
+        }
+        Some(r.offset as usize)
+    }
+
+    /// Return `[offset, offset + need)`: merge it with the free neighbours on
+    /// either side, then either lower the high-water mark (the region reaches
+    /// it) or record it.
+    fn give(&mut self, offset: usize, need: usize) {
+        let mut start = offset;
+        let mut end = offset + need;
+        let mut i = 0;
+        while i < self.count {
+            let r = self.regions[i];
+            let (r_start, r_end) = (r.offset as usize, (r.offset + r.size) as usize);
+            if r_end == start {
+                start = r_start;
+                self.remove(i);
+            } else if r_start == end {
+                end = r_end;
+                self.remove(i);
+            } else {
+                i += 1;
+            }
+        }
+        if end == BUFFER_ARENA_OFFSET.load(Ordering::Relaxed) {
+            BUFFER_ARENA_OFFSET.store(start, Ordering::Relaxed);
+        } else if self.count < MAX_FREE_REGIONS {
+            self.regions[self.count] = FreeRegion {
+                offset: start as u32,
+                size: (end - start) as u32,
+            };
+            self.count += 1;
+        } else {
+            self.leaked += end - start;
+        }
+    }
+}
+
+/// Bump high-water mark: `(used_bytes, total_bytes)` — resource-ledger
+/// sample for `POOL_BUFFER_ARENA`. Regions on the free list are inside
+/// `used_bytes`; `buffer_free_list_usage` reports them.
+pub fn arena_usage() -> (usize, usize) {
+    (
+        BUFFER_ARENA_OFFSET.load(Ordering::Relaxed),
+        BUFFER_ARENA_SIZE,
+    )
+}
+
+/// Returned-region occupancy: `(regions, region_bytes, leaked_bytes)`.
+pub fn buffer_free_list_usage() -> (usize, usize, usize) {
+    with_arena(|l| {
+        let bytes = l.regions[..l.count].iter().map(|r| r.size as usize).sum();
+        (l.count, bytes, l.leaked)
+    })
+}
+
+/// Allocate a zeroed, `BUFFER_ALIGN`-aligned buffer of `size` bytes: the best
+/// fitting returned region if one holds it, otherwise from the high-water
+/// mark.
 fn alloc_buffer(size: usize) -> Option<*mut u8> {
-    // SAFETY: bump-allocator on `BUFFER_ARENA`; `aligned + size <= ARENA_SIZE`
-    // is checked above so the pointer is in-bounds. Single-threaded boot path
-    // (called during scheduler::prepare_graph), no concurrent allocators.
-    unsafe {
-        let aligned = (BUFFER_ARENA_OFFSET + 3) & !3;
-        if aligned + size > BUFFER_ARENA_SIZE
+    let need = arena_need(size)?;
+    let got = with_arena(|l| {
+        if let Some(off) = l.take(need) {
+            return Ok(off);
+        }
+        let off = BUFFER_ARENA_OFFSET.load(Ordering::Relaxed);
+        if off + need > BUFFER_ARENA_SIZE
             || !crate::kernel::sys::resource_ledger::enforced_allows(
                 crate::abi::contracts::resource::POOL_BUFFER_ARENA,
-                (aligned + size) as u32,
+                (off + need) as u32,
             )
         {
-            log::error!("[buf] arena full need={size} used={aligned} cap={BUFFER_ARENA_SIZE}");
+            return Err(off);
+        }
+        BUFFER_ARENA_OFFSET.store(off + need, Ordering::Relaxed);
+        Ok(off)
+    });
+    match got {
+        Ok(off) => {
+            // SAFETY: `off + need <= BUFFER_ARENA_SIZE` (checked at the bump,
+            // and every free region lies below the mark), and the range is
+            // this caller's alone once it left the allocator.
+            unsafe {
+                let ptr = core::ptr::addr_of_mut!(BUFFER_ARENA.0)
+                    .cast::<u8>()
+                    .add(off);
+                core::ptr::write_bytes(ptr, 0, size);
+                Some(ptr)
+            }
+        }
+        Err(used) => {
+            log::error!("[buf] arena full need={need} used={used} cap={BUFFER_ARENA_SIZE}");
             crate::kernel::sys::resource_ledger::deny(
                 crate::abi::contracts::resource::POOL_BUFFER_ARENA,
             );
-            return None;
+            None
         }
-        let ptr = core::ptr::addr_of_mut!(BUFFER_ARENA.0)
-            .cast::<u8>()
-            .add(aligned);
-        core::ptr::write_bytes(ptr, 0, size);
-        BUFFER_ARENA_OFFSET = aligned + size;
-        Some(ptr)
+    }
+}
+
+/// Return a buffer `alloc_buffer` handed out for `size` bytes.
+///
+/// # Safety
+/// `ptr` came from `alloc_buffer(size)` and nothing reaches it any more: no
+/// registry slot names it and no lend of it is outstanding.
+unsafe fn release_buffer(ptr: *mut u8, size: usize) {
+    let base = core::ptr::addr_of_mut!(BUFFER_ARENA.0).cast::<u8>() as usize;
+    let addr = ptr as usize;
+    let Some(need) = arena_need(size) else { return };
+    if size == 0 || addr < base || addr + need > base + BUFFER_ARENA_SIZE {
+        return;
+    }
+    with_arena(|l| l.give(addr - base, need));
+}
+
+/// Account a buffer that cannot be returned (it is still lent out) as leaked
+/// until the next `reset_buffer_arena`.
+fn abandon_buffer(size: usize) {
+    if let Some(need) = arena_need(size) {
+        with_arena(|l| l.leaked += need);
     }
 }
 
 /// Reset the buffer arena for a new graph configuration.
 pub fn reset_buffer_arena() {
-    // SAFETY: called between graph rebuilds; no buffer pointers are live.
-    unsafe {
-        BUFFER_ARENA_OFFSET = 0;
-    }
-}
-
-/// Return current buffer arena usage: (used_bytes, total_bytes).
-pub fn buffer_arena_usage() -> (usize, usize) {
-    // SAFETY: `BUFFER_ARENA_OFFSET` is a `usize`; load is atomic-sized.
-    unsafe { (BUFFER_ARENA_OFFSET, BUFFER_ARENA_SIZE) }
+    with_arena(|l| {
+        l.count = 0;
+        l.leaked = 0;
+        BUFFER_ARENA_OFFSET.store(0, Ordering::Relaxed);
+    });
 }
 
 // ============================================================================
@@ -194,6 +365,10 @@ pub const STATE_STREAMING: u8 = 4;
 /// Like READY but acquire_inplace won't accept it, preventing double-processing.
 pub const STATE_READY_PROCESSED: u8 = 5;
 
+/// Slot being freed (`free_streaming`): no transition starts from it, and it
+/// becomes FREE once the slot is cleared.
+const STATE_CLOSING: u8 = 6;
+
 // ============================================================================
 // Error Codes
 // ============================================================================
@@ -217,7 +392,7 @@ pub const BUF_EBUSY: i32 = errno::EBUSY;
 /// A registry entry tracking an arena-allocated buffer.
 ///
 /// The actual buffer data lives in the buffer arena; this slot only holds
-/// metadata (pointer, capacity, state). ~20 bytes per slot vs 2KB+ before.
+/// metadata (pointer, capacity, state).
 struct BufferRegistrySlot {
     /// Pointer to arena-allocated buffer data (null if not allocated)
     data_ptr: core::cell::UnsafeCell<*mut u8>,
@@ -282,8 +457,8 @@ impl BufferRegistrySlot {
 
     /// Assign arena-allocated memory to this slot.
     fn assign(&self, ptr: *mut u8, capacity: usize, channel: i16) {
-        // SAFETY: `assign` is called from `prepare_graph` on the
-        // single-threaded boot path; no other accessors are live.
+        // SAFETY: the caller claimed this slot (FREE -> STREAMING) and has
+        // not yet published it to a channel, so nothing else reads it.
         unsafe {
             *self.data_ptr.get() = ptr;
         }
@@ -386,17 +561,22 @@ impl BufferRegistrySlot {
         true
     }
 
+    /// Clear the slot and mark it FREE. The state goes last, so a claimant
+    /// that wins the slot after it reads FREE finds nothing of the old
+    /// buffer to clobber its own.
     fn reset(&self) {
-        self.state.store(STATE_FREE, Ordering::Release);
         self.owner_channel.store(-1, Ordering::Release);
         self.capacity.store(0, Ordering::Release);
         self.len.store(0, Ordering::Release);
         self.inplace_flag.store(0, Ordering::Release);
         self.producer_module.store(0xFF, Ordering::Release);
-        // SAFETY: reset called from prepare_graph teardown; no other accessor.
+        // SAFETY: the slot's channel has detached it (`ChannelSlot::reset`
+        // under the ring lock) or the whole graph is being torn down; nothing
+        // reaches the slot through a channel any more.
         unsafe {
             *self.data_ptr.get() = core::ptr::null_mut();
         }
+        self.state.store(STATE_FREE, Ordering::Release);
     }
 }
 
@@ -459,20 +639,45 @@ pub fn alloc_streaming_for_module(channel: i16, capacity: usize, producer_module
     -1
 }
 
-/// Free a streaming buffer slot.
+/// Free a buffer slot and return its arena memory for reuse.
 ///
-/// Note: The arena memory is not individually freed (bump allocator).
-/// It will be reclaimed on the next reset_buffer_arena() call.
+/// A mailbox buffer may be in any state when its channel closes. One that is
+/// lent out — a writer in `PRODUCER` or a reader in `CONSUMER` holds its
+/// pointer — is not returned: the holder may still touch it, and memory
+/// handed to the next channel would take that write. It stays spent (counted
+/// as leaked) until the next `reset_buffer_arena`. Any other state means no
+/// pointer to it is outstanding.
 pub fn free_streaming(slot: i32) {
-    if valid_slot(slot) {
-        let buf = &BUFFER_REGISTRY[slot as usize];
-        let prev_state = buf.state();
-        // Unconditionally reset: a mailbox buffer may be in PRODUCER, READY,
-        // or CONSUMER state when the channel is closed.  Only gating on
-        // STATE_STREAMING would orphan the slot permanently.
-        if prev_state != STATE_FREE {
-            buf.reset();
+    if !valid_slot(slot) {
+        return;
+    }
+    let buf = &BUFFER_REGISTRY[slot as usize];
+    // Take the slot out of every state a mailbox transition starts from, so
+    // the state judged below is the one it was freed in.
+    let mut prev_state = buf.state();
+    loop {
+        if prev_state == STATE_FREE || prev_state == STATE_CLOSING {
+            return;
         }
+        match buf.state.compare_exchange_weak(
+            prev_state,
+            STATE_CLOSING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => break,
+            Err(now) => prev_state = now,
+        }
+    }
+    let ptr = buf.data_ptr();
+    let size = buf.capacity.load(Ordering::Acquire) as usize;
+    buf.reset();
+    if matches!(prev_state, STATE_PRODUCER | STATE_CONSUMER) {
+        abandon_buffer(size);
+    } else {
+        // SAFETY: the slot no longer names the buffer, its channel is
+        // closed, and no mailbox lend of it is outstanding.
+        unsafe { release_buffer(ptr, size) };
     }
 }
 
@@ -516,15 +721,30 @@ pub fn mailbox_can_write(slot: i32) -> bool {
 
 /// Force-reset a mailbox buffer back to STREAMING state.
 /// Used by IOCTL_FLUSH to unstick a mailbox buffer that's in READY/CONSUMER/PRODUCER.
-/// Returns true if the slot was valid and reset.
+/// Returns true if the slot holds a buffer and was reset.
 pub fn mailbox_flush(slot: i32) -> bool {
     if !valid_slot(slot) {
         return false;
     }
     let buf = &BUFFER_REGISTRY[slot as usize];
+    let mut cur = buf.state();
+    loop {
+        // A slot with no buffer behind it stays as it is.
+        if cur == STATE_FREE || cur == STATE_CLOSING {
+            return false;
+        }
+        match buf.state.compare_exchange_weak(
+            cur,
+            STATE_STREAMING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => break,
+            Err(now) => cur = now,
+        }
+    }
     buf.len.store(0, Ordering::Release);
     buf.inplace_flag.store(0, Ordering::Release);
-    buf.state.store(STATE_STREAMING, Ordering::Release);
     true
 }
 
@@ -705,8 +925,8 @@ pub fn stats() -> BufferPoolStats {
     s
 }
 
-/// Reset all buffer slots (for testing/cleanup).
-/// Does NOT free buffer arena memory — that happens via reset_buffer_arena().
+/// Reset every buffer slot at a graph rebuild. The arena memory is reclaimed
+/// separately, wholesale, by `reset_buffer_arena`.
 pub fn reset_all() {
     for slot in BUFFER_REGISTRY.iter() {
         slot.reset();

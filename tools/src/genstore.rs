@@ -195,7 +195,7 @@ impl<S: Storage> GenStore<S> {
     /// redundancy tolerates one record being unreadable, and gen/artifact reads
     /// that come back empty already fail closed via `GenerationMissing`. Distinct
     /// from the node-agent's desired/slot-gens reads, which must tell an I/O
-    /// error apart from "absent" to avoid dropping live pods (they call the
+    /// error apart from "absent" to avoid dropping live workloads (they call the
     /// `Storage::read` `Result` directly).
     fn read_tolerant(&self, key: &str) -> Option<Vec<u8>> {
         self.storage.read(key).ok().flatten()

@@ -178,31 +178,31 @@ fn generate_config_impl(
         );
     }
 
-    // Resident-pod modules are admitted into REAL
+    // Resident-workload modules are admitted into REAL
     // execution domains and share their domain's runner, budget, and timing/ISR
     // constraints, so they must pass the SAME admission checks as base modules —
-    // not a weaker pod-only path. Build an augmented list (base + every pod's
+    // not a weaker workload-only path. Build an augmented list (base + every workload's
     // modules) and run the budget / ISR-tier / pre-tick / adaptive-timer-class /
     // hardware validators over it. The config-EMIT path is unchanged: base
-    // entries from `modules`, pods from `build_pod_section`. With no `pods:` the
+    // entries from `modules`, workloads from `build_workload_section`. With no `workloads:` the
     // augmented list is the base list (byte-identical validation).
-    // Pod module local names are scoped to their pod, so two pods (or a pod and
+    // Workload module local names are scoped to their workload, so two workloads (or a workload and
     // the base graph) may legitimately reuse a name. The manifest map
     // (`load_module_manifests_with_extra`) is keyed by `name` ALONE and silently
-    // overwrites on collision — so a flat base+pod list could resolve a module to
+    // overwrites on collision — so a flat base+workload list could resolve a module to
     // the WRONG manifest (wrong ISR safety / timer class / hardware / pre_tick
-    // metadata). Give every pod module a graph-scoped unique `name` for the
+    // metadata). Give every workload module a graph-scoped unique `name` for the
     // validation list while preserving its `type` (manifests resolve by type), so
     // each module is validated against its own manifest with no overwrite. This
-    // is validation-only; the emit path (`build_pod_section`) is unaffected.
-    let pod_modules: Vec<Value> = config
-        .get("pods")
+    // is validation-only; the emit path (`build_workload_section`) is unaffected.
+    let workload_modules: Vec<Value> = config
+        .get("workloads")
         .and_then(|p| p.as_array())
-        .map(|pods| {
-            pods.iter()
+        .map(|workloads| {
+            workloads.iter()
                 .enumerate()
-                .flat_map(|(pi, pod)| {
-                    pod.get("modules")
+                .flat_map(|(pi, workload)| {
+                    workload.get("modules")
                         .and_then(|m| m.as_array())
                         .cloned()
                         .unwrap_or_default()
@@ -210,19 +210,19 @@ fn generate_config_impl(
                         .enumerate()
                         .map(move |(li, mut m)| {
                             if let Some(obj) = m.as_object_mut() {
-                                // Give EVERY pod module an INDEX-based graph-scoped
-                                // identity (`__pod{pi}__m{li}`), including `type`-only
+                                // Give EVERY workload module an INDEX-based graph-scoped
+                                // identity (`__workload{pi}__m{li}`), including `type`-only
                                 // entries and duplicate local names. A name-derived
                                 // identity would collide for two modules sharing a
-                                // local name in one pod (and the manifest loader skips
+                                // local name in one workload (and the manifest loader skips
                                 // nameless modules), letting a tick-counted module
                                 // dodge the timer-class gate. Index identities are
                                 // unique by construction; `type` is preserved
                                 // (manifests resolve by type). Duplicate local names
-                                // are separately rejected in `build_pod_section`.
+                                // are separately rejected in `build_workload_section`.
                                 obj.insert(
                                     "name".to_string(),
-                                    Value::String(format!("__pod{pi}__m{li}")),
+                                    Value::String(format!("__workload{pi}__m{li}")),
                                 );
                             }
                             m
@@ -231,11 +231,11 @@ fn generate_config_impl(
                 .collect()
         })
         .unwrap_or_default();
-    let validation_modules: Vec<Value> = if pod_modules.is_empty() {
+    let validation_modules: Vec<Value> = if workload_modules.is_empty() {
         module_list.clone()
     } else {
         let mut v = module_list.clone();
-        v.extend(pod_modules.iter().cloned());
+        v.extend(workload_modules.iter().cloned());
         v
     };
     let validation_list: &[Value] = &validation_modules;
@@ -329,9 +329,9 @@ fn generate_config_impl(
     // of doing a second, narrower lookup that may miss modules
     // outside the hard-coded `Manifest::from_source_tree` search
     // list (e.g. modules in the install root or in extras).
-    // Manifests for the AUGMENTED set (base + pod modules) so the adaptive
-    // timer-class gate below resolves pod modules too; `parse_modules_map` (emit,
-    // base-only) just ignores the extra pod entries keyed by type.
+    // Manifests for the AUGMENTED set (base + workload modules) so the adaptive
+    // timer-class gate below resolves workload modules too; `parse_modules_map` (emit,
+    // base-only) just ignores the extra workload entries keyed by type.
     let manifest_src = Value::Array(validation_modules.clone());
     let manifests = load_module_manifests_with_extra_for_target(
         &manifest_src,
@@ -416,7 +416,7 @@ fn generate_config_impl(
             .unwrap_or_else(|_| t.to_string())
     });
     if let Some(silicon) = silicon_owned.as_deref() {
-        // Cover base AND pod modules — a pod module runs on the same silicon and
+        // Cover base AND workload modules — a workload module runs on the same silicon and
         // must satisfy the same `[requires]` (FPU/NEON/MMU).
         for (i, m) in validation_list.iter().enumerate() {
             let name = m
@@ -930,14 +930,14 @@ fn generate_config_impl(
         result.extend_from_slice(&tmax.to_le_bytes());
     }
 
-    // Resident-pod section: each top-level `pods:`
+    // Resident-workload section: each top-level `workloads:`
     // entry becomes a self-contained `AddSubgraph` (FLXA) blob the kernel admits
     // at boot via `apply_add`. Appended right AFTER the 16-byte adaptive post-body
     // (so the kernel reads it at `total_size + ADAPTIVE_POST_SIZE`), also PAST the
     // checksummed body — same additive discipline, no format-version bump. Absent
-    // `pods:` ⇒ empty ⇒ byte-identical single-graph config.
-    let pod_section = build_pod_section(config, loc, extra_module_dirs)?;
-    result.extend_from_slice(&pod_section);
+    // `workloads:` ⇒ empty ⇒ byte-identical single-graph config.
+    let workload_section = build_workload_section(config, loc, extra_module_dirs)?;
+    result.extend_from_slice(&workload_section);
 
     // Capacity-envelope section (compose-time Tier A sizing): the
     // optional top-level `capacity:` map becomes an FXEV post-body section
@@ -1005,21 +1005,21 @@ fn build_capacity_envelope(config: &Value, resolved_target: Option<&str>) -> Res
     Ok(crate::capacity::encode_envelope_section(&entries))
 }
 
-/// Build the resident-pod config section from the optional top-level `pods:`
-/// list. Each pod is a self-contained subgraph:
+/// Build the resident-workload config section from the optional top-level `workloads:`
+/// list. Each workload is a self-contained subgraph:
 /// modules referenced by `name_hash` (FNV-1a of type) with inline-TLV params (the
 /// same `build_params_from_schema` packing base modules use), and optional
-/// intra-pod `wiring:` (`from`/`to` by pod-local module name). Cross-pod edges
-/// are not supported in v1 (strict isolation). Returns an empty Vec with no pods.
-fn build_pod_section(
+/// intra-workload `wiring:` (`from`/`to` by workload-local module name). Cross-workload edges
+/// are not supported in v1 (strict isolation). Returns an empty Vec with no workloads.
+fn build_workload_section(
     config: &Value,
     loc: schema::ModuleLocation<'_>,
     extra_module_dirs: &[&Path],
 ) -> Result<Vec<u8>> {
-    let Some(pods_yaml) = config.get("pods").and_then(|p| p.as_array()) else {
+    let Some(workloads_yaml) = config.get("workloads").and_then(|p| p.as_array()) else {
         return Ok(Vec::new());
     };
-    if pods_yaml.is_empty() {
+    if workloads_yaml.is_empty() {
         return Ok(Vec::new());
     }
     let data_section = config.get("data");
@@ -1032,11 +1032,11 @@ fn build_pod_section(
         v.push(loc.dir);
         v
     };
-    // Per-domain exec_mode (Tier) so pods can be rejected from ISR-tier domains.
-    // The FLXA pod codec carries NO exec-mode / `isr_safe` / `pre_tick_drain`
-    // metadata, and pod admission runs AFTER the platform registers ISR handlers
-    // (bcm2712.rs) — so an ISR-tier pod would be admitted yet never dispatched
-    // (the cooperative runner skips ISR domains) and a `pre_tick_drain` pod would
+    // Per-domain exec_mode (Tier) so workloads can be rejected from ISR-tier domains.
+    // The FLXA workload codec carries NO exec-mode / `isr_safe` / `pre_tick_drain`
+    // metadata, and workload admission runs AFTER the platform registers ISR handlers
+    // (bcm2712.rs) — so an ISR-tier workload would be admitted yet never dispatched
+    // (the cooperative runner skips ISR domains) and a `pre_tick_drain` workload would
     // silently lose its pre-pass semantics. Reject both until the codec and
     // post-admission registration support them.
     let mut domain_exec_mode: [u8; 4] = [0; 4];
@@ -1051,17 +1051,17 @@ fn build_pod_section(
             }
         }
     }
-    let mut pods = Vec::new();
-    for (pi, pod_yaml) in pods_yaml.iter().enumerate() {
-        let mods_yaml = pod_yaml
+    let mut workloads = Vec::new();
+    for (pi, workload_yaml) in workloads_yaml.iter().enumerate() {
+        let mods_yaml = workload_yaml
             .get("modules")
             .and_then(|m| m.as_array())
-            .ok_or_else(|| Error::Config(format!("pod {pi}: missing `modules:` array")))?;
-        // Deterministic pod_uid: 0xD0 marker + index (host composer / kernel both
+            .ok_or_else(|| Error::Config(format!("workload {pi}: missing `modules:` array")))?;
+        // Deterministic workload_uid: 0xD0 marker + index (host composer / kernel both
         // treat the UID as opaque identity; uniqueness within the bundle suffices).
-        let mut pod_uid = [0u8; 16];
-        pod_uid[0] = 0xD0;
-        pod_uid[1] = pi as u8;
+        let mut workload_uid = [0u8; 16];
+        workload_uid[0] = 0xD0;
+        workload_uid[1] = pi as u8;
         let mut name_to_local: HashMap<String, u8> = HashMap::new();
         let mut modules = Vec::new();
         for (li, m) in mods_yaml.iter().enumerate() {
@@ -1070,46 +1070,46 @@ fn build_pod_section(
                 .and_then(|v| v.as_str())
                 .or_else(|| m.get("type").and_then(|v| v.as_str()))
                 .ok_or_else(|| {
-                    Error::Config(format!("pod {pi} module {li}: needs a `name` or `type`"))
+                    Error::Config(format!("workload {pi} module {li}: needs a `name` or `type`"))
                 })?;
             let mtype = m.get("type").and_then(|v| v.as_str()).unwrap_or(mname);
-            // PIC-only: the FLXA pod codec admits modules via the loader by
+            // PIC-only: the FLXA workload codec admits modules via the loader by
             // name_hash; a built-in has no .fmod and apply_add cannot decode it.
             if crate::modules::is_builtin_module(mtype) {
                 return Err(Error::Config(format!(
-                    "pod {pi} module '{mtype}' is a kernel built-in; resident pods are PIC-only \
+                    "workload {pi} module '{mtype}' is a kernel built-in; resident workloads are PIC-only \
                      (no .fmod for apply_add to load). Use a PIC module, or place it in the base graph."
                 )));
             }
-            // Reject duplicate local names within a pod: `name_to_local` resolves
+            // Reject duplicate local names within a workload: `name_to_local` resolves
             // `wiring:` endpoints, so a silent overwrite would mis-wire edges to the
-            // wrong module. Names must be unique per pod (a module's `name` defaults
+            // wrong module. Names must be unique per workload (a module's `name` defaults
             // to its `type`, so two same-type modules need explicit distinct names).
             if name_to_local.insert(mname.to_string(), li as u8).is_some() {
                 return Err(Error::Config(format!(
-                    "pod {pi}: duplicate module name '{mname}' — pod-local module names must be \
+                    "workload {pi}: duplicate module name '{mname}' — workload-local module names must be \
                      unique (they resolve `wiring:` endpoints). Give each module a distinct `name` \
                      (two modules of the same `type` default to the same name)."
                 )));
             }
             let name_hash = crate::hash::fnv1a_hash(mtype.as_bytes());
             // Domain is a NAME resolved against execution.domains (same namespace
-            // as base modules), so pod modules share their domain's runner/budget
+            // as base modules), so workload modules share their domain's runner/budget
             // and the admission validators resolve them identically.
             let domain_id = resolve_domain_id(m, config)?;
-            // Reject ISR-tier (1b/2) pod placement — the codec cannot represent it
+            // Reject ISR-tier (1b/2) workload placement — the codec cannot represent it
             // and the cooperative runner would never dispatch it.
             let exec_mode = *domain_exec_mode.get(domain_id as usize).unwrap_or(&0);
             if exec_mode == 2 || exec_mode == 4 {
                 return Err(Error::Config(format!(
-                    "pod {pi} module '{mtype}' targets an ISR-tier domain (tier 1b/2). Resident \
-                     pods are cooperative-only in v1: the FLXA codec carries no ISR metadata and \
-                     pod admission runs after ISR registration, so an ISR-tier pod would never \
+                    "workload {pi} module '{mtype}' targets an ISR-tier domain (tier 1b/2). Resident \
+                     workloads are cooperative-only in v1: the FLXA codec carries no ISR metadata and \
+                     workload admission runs after ISR registration, so an ISR-tier workload would never \
                      execute. Place ISR-tier modules in the base graph."
                 )));
             }
-            // Reject `pre_tick_drain` pod modules — the codec drops the flag, so a
-            // pod module would silently run as an ordinary cooperative module,
+            // Reject `pre_tick_drain` workload modules — the codec drops the flag, so a
+            // workload module would silently run as an ordinary cooperative module,
             // losing its Tier-1c pre-pass drain semantics.
             if let Some(root) = resolve_module_root(mtype, &manifest_search) {
                 let mpath = root.join("manifest.toml");
@@ -1117,8 +1117,8 @@ fn build_pod_section(
                     if let Ok(man) = Manifest::from_toml(&mpath) {
                         if man.pre_tick_drain {
                             return Err(Error::Config(format!(
-                                "pod {pi} module '{mtype}' is a pre_tick_drain (Tier 1c) module, \
-                                 which resident pods do not support in v1: the FLXA codec carries \
+                                "workload {pi} module '{mtype}' is a pre_tick_drain (Tier 1c) module, \
+                                 which resident workloads do not support in v1: the FLXA codec carries \
                                  no pre_tick_drain flag, so the module would silently run as an \
                                  ordinary cooperative module. Place pre_tick_drain modules in the \
                                  base graph."
@@ -1146,47 +1146,47 @@ fn build_pod_section(
                 } else {
                     Vec::new()
                 };
-            modules.push(crate::add_subgraph::PodModule {
+            modules.push(crate::add_subgraph::WorkloadModule {
                 name_hash,
                 domain_id,
                 params,
             });
         }
         let mut edges = Vec::new();
-        if let Some(wiring) = pod_yaml.get("wiring").and_then(|w| w.as_array()) {
+        if let Some(wiring) = workload_yaml.get("wiring").and_then(|w| w.as_array()) {
             for (ei, e) in wiring.iter().enumerate() {
                 let resolve = |key: &str| -> Result<u8> {
                     let n = e.get(key).and_then(|v| v.as_str()).ok_or_else(|| {
                         Error::Config(format!(
-                            "pod {pi} wiring {ei}: `{key}` must be a module name"
+                            "workload {pi} wiring {ei}: `{key}` must be a module name"
                         ))
                     })?;
                     name_to_local.get(n).copied().ok_or_else(|| {
                         Error::Config(format!(
-                            "pod {pi} wiring {ei}: unknown module `{n}` (cross-pod edges are not \
-                             supported in v1 — pods are self-contained)"
+                            "workload {pi} wiring {ei}: unknown module `{n}` (cross-workload edges are not \
+                             supported in v1 — workloads are self-contained)"
                         ))
                     })
                 };
                 let from_local = resolve("from")?;
                 let to_local = resolve("to")?;
-                // Reject cross-domain pod edges (v1). On bcm2712 a cross-domain
+                // Reject cross-domain workload edges (v1). On bcm2712 a cross-domain
                 // edge needs the SPSC bridge provisioned at boot (base edges get
-                // it before pod admission, bcm2712.rs); `apply_add` opens an
-                // ordinary channel, so a cross-domain pod edge would silently lose
-                // the bridge. Until pod admission provisions the bridge, require
-                // intra-domain pod wiring on every target (self-contained pods).
+                // it before workload admission, bcm2712.rs); `apply_add` opens an
+                // ordinary channel, so a cross-domain workload edge would silently lose
+                // the bridge. Until workload admission provisions the bridge, require
+                // intra-domain workload wiring on every target (self-contained workloads).
                 let from_dom = modules[from_local as usize].domain_id;
                 let to_dom = modules[to_local as usize].domain_id;
                 if from_dom != to_dom {
                     return Err(Error::Config(format!(
-                        "pod {pi} wiring {ei}: cross-domain edge (domain {from_dom} → {to_dom}) is \
-                         not supported — a cross-domain edge needs the SPSC bridge that pod \
-                         admission does not yet provision (notably on bcm2712). Keep pod modules \
+                        "workload {pi} wiring {ei}: cross-domain edge (domain {from_dom} → {to_dom}) is \
+                         not supported — a cross-domain edge needs the SPSC bridge that workload \
+                         admission does not yet provision (notably on bcm2712). Keep workload modules \
                          that are wired together in the same domain."
                     )));
                 }
-                edges.push(crate::add_subgraph::PodEdge {
+                edges.push(crate::add_subgraph::WorkloadEdge {
                     from_local,
                     from_port: e.get("from_port").and_then(|v| v.as_u64()).unwrap_or(0) as u8,
                     to_local,
@@ -1196,24 +1196,24 @@ fn build_pod_section(
                 });
             }
         }
-        let state_cap = pod_yaml
+        let state_cap = workload_yaml
             .get("state_cap")
             .and_then(|v| v.as_u64())
             .unwrap_or(0) as u32;
-        let buffer_cap = pod_yaml
+        let buffer_cap = workload_yaml
             .get("buffer_cap")
             .and_then(|v| v.as_u64())
             .unwrap_or(0) as u32;
-        // Idle-safe attestation: the operator asserts (pod-level
-        // `idle_safe: true`) that this pod is demand-driven and may be parked when
+        // Idle-safe attestation: the operator asserts (workload-level
+        // `idle_safe: true`) that this workload is demand-driven and may be parked when
         // idle. Absent/false ⇒ fail-closed: the kernel relaxes it to the `tick_max`
         // backstop cadence rather than parking it.
-        let idle_safe = pod_yaml
+        let idle_safe = workload_yaml
             .get("idle_safe")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        pods.push(crate::add_subgraph::Pod {
-            pod_uid,
+        workloads.push(crate::add_subgraph::Workload {
+            workload_uid,
             state_cap,
             buffer_cap,
             modules,
@@ -1221,7 +1221,7 @@ fn build_pod_section(
             idle_safe,
         });
     }
-    crate::add_subgraph::encode_pod_section(&pods).map_err(Error::Config)
+    crate::add_subgraph::encode_workload_section(&workloads).map_err(Error::Config)
 }
 
 /// Assign buffer group IDs for aliasable edge chains.

@@ -163,11 +163,13 @@ impl TargetFacts {
                 step_budget_us: STEP_BUDGET_DEFAULT_TICK_US,
                 nic_tx_drain: false,
             },
-            // Bare metal with no RTC and no time source; an OTP-read
-            // device-unique sealing key when provisioned; the rp1_gem
-            // driver owns the transmit ring and reports it drained.
+            // Bare metal with no RTC: the kernel vouches for wall time once
+            // a time-sync module (`sntp`) anchors it from a quorum of
+            // servers. An OTP-read device-unique sealing key when
+            // provisioned; the rp1_gem driver owns the transmit ring and
+            // reports it drained.
             "bcm2712" => Self {
-                time_wall_source: None,
+                time_wall_source: Some("network_sync"),
                 trust_system: false,
                 vault_suites: SUITES_PQ,
                 vault_tier_ceiling: vault_tier::DEVICE_HW,

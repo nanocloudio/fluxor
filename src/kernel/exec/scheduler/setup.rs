@@ -114,12 +114,12 @@ pub fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i3
     set_current_module(MAX_MODULES);
 
     // Reset all scheduler state, state arena, and name arena. Channel
-    // slots and buffer registry slots also need to be wiped so a prior
-    // graph's claims don't accumulate — bump-allocator-only resets
-    // leave slot metadata in `Allocated` state across reconfigures,
-    // and `try_allocate` would then skip those slots until
-    // `MAX_CHANNELS` / `MAX_BUFFER_SLOTS` are exhausted even on
-    // otherwise well-sized graphs.
+    // slots and buffer registry slots are wiped too, so a prior graph's
+    // claims don't accumulate: resetting the arenas alone would leave slot
+    // metadata `Allocated` across rebuilds, and `try_allocate` would skip
+    // those slots until `MAX_CHANNELS` / `MAX_BUFFER_SLOTS` ran out even on
+    // otherwise well-sized graphs. Module provider layers go with the
+    // modules that registered them (`reset_module_layers`).
     reset_state_arena();
     // Drop any EL0-isolation page tables from a previous graph so a
     // reconfigure rebuilds them from the new graph's regions. No-op on
@@ -131,6 +131,7 @@ pub fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i3
     NameArena::reset();
     crate::kernel::backing_provider::unregister();
     crate::kernel::module::provider::reset_handle_tracking();
+    crate::kernel::module::provider::reset_module_layers();
     // Tear down any prior graph's ISR-tier registrations and bridge
     // slots before walking the new module table. Without this, the
     // post-instantiation `register_isr_tier_modules_from_graph`
@@ -287,16 +288,11 @@ pub fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i3
         return Err(-1);
     }
 
-    // EL0-isolation pre-pass: mark which modules requested `protection:
-    // isolated` from their config params BEFORE channels are opened. The full
-    // protection TLV is parsed later, at instantiation (`parse_protection_config`,
-    // which runs after this in the platform flow), but `open_channels` →
-    // `alloc_streaming_for_module` and the channel-region pass below both need
-    // `module_is_isolated` to already be true so an isolated producer's channel
-    // buffers are page-aligned + page-padded (otherwise the EL0 channel mapping
-    // would round into a peer's buffer, and `build_table` would refuse the
-    // non-page-clean region → the module would fail closed). Cheap, idempotent
-    // with the later full parse.
+    // Isolation pre-pass: mark which modules requested a gated protection
+    // level in their config params. The full protection TLV is parsed later,
+    // at instantiation (`parse_protection_config`), but the zero-copy check
+    // below must already know which modules are gated. Cheap, idempotent with
+    // the later full parse.
     mark_isolated_from_params(&module_list, module_count);
 
     // Query channel hints and open channels
@@ -427,12 +423,9 @@ pub fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i3
     validate_domains_static(module_count, runtime_edge_count);
 
     // Log DmaOwned edges so operators can confirm the graph declares them.
-    // Today DmaOwned is a metadata annotation — the scheduler doesn't issue
-    // DC CVAC / DC IVAC at edge handoff because channels are copy-FIFO and
-    // the consumer module (nvme) owns its own streaming buffers. Zero-copy
-    // mailbox edges (buffer_group != 0) are where the scheduler will start
-    // driving cache maintenance automatically; this log line pre-stages
-    // the observability.
+    // DmaOwned is a metadata annotation: the scheduler issues no DC CVAC /
+    // DC IVAC at edge handoff, because channels are copy-FIFO and a
+    // DMA-driving consumer (nvme) owns its own streaming buffers.
     log_dma_owned_edges(runtime_edge_count);
 
     sched.active_module_count = module_count;
@@ -1026,9 +1019,9 @@ pub fn register_isr_tier_modules_from_graph() -> usize {
 /// all rather than with a cap to raise.
 pub fn finalize_instantiation_accounting() {
     charge_resident_owner_state();
-    let (state_used, state_cap) = crate::kernel::module::loader::state_arena_usage();
+    let (state_used, state_cap) = crate::kernel::module::loader::arena_usage();
     let (cfg_used, cfg_cap) = crate::kernel::boot::config::config_arena_usage();
-    let (buf_used, buf_cap) = crate::kernel::ipc::buffer_pool::buffer_arena_usage();
+    let (buf_used, buf_cap) = crate::kernel::ipc::buffer_pool::arena_usage();
     log::info!(
         "[arena] state={state_used}/{state_cap} cfg={cfg_used}/{cfg_cap} buf={buf_used}/{buf_cap}"
     );

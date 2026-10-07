@@ -1,7 +1,9 @@
 //! Channel - kernel-managed pipes for inter-module data flow.
 //!
 //! Channels are FIFO buffers that connect modules in the processing graph.
-//! The kernel allocates channels at config time and passes handles to modules.
+//! The kernel opens channels when it builds the graph or adds to it live,
+//! and passes handles to modules. Closing a channel (a live removal, or the
+//! next rebuild) returns its buffer to the buffer arena for the next one.
 //!
 //! From a module's perspective, channels are for reading/writing to adjacent
 //! modules in the graph. Network I/O also flows through channels: the ip or
@@ -56,8 +58,8 @@
 //! from re-processing the same buffer. The final consumer (`acquire_read`)
 //! accepts both READY and READY_PROCESSED.
 //!
-//! Current design supports at most one in-place module per alias chain. For
-//! multiple transforms, insert a FIFO copy step between them.
+//! At most one in-place module is supported per alias chain. For multiple
+//! transforms, insert a FIFO copy step between them.
 //!
 //! ## FIFO→Mailbox chaining
 //!
@@ -125,6 +127,13 @@ pub const IOCTL_FLUSH: u32 = 3;
 /// Set HUP flag (end-of-stream signal from producer).
 /// Consumer detects via channel_poll/fd_poll with POLL_HUP.
 pub const IOCTL_SET_HUP: u32 = 4;
+
+/// Bytes a write can place in the ring right now. arg: pointer to u32
+/// output; 0 for a full ring and for a mailbox channel, which has no ring to
+/// measure (`channel_writable_bytes`). Lets a producer that admits data on
+/// someone else's behalf (a TCP receive window) offer only what the ring can
+/// take, instead of offering more and refusing it at delivery.
+pub const IOCTL_WRITABLE: u32 = 5;
 
 /// Channel-side ioctl handler registered by a module. Signature matches
 /// [`syscall_channel_ioctl`] (cmd + arg pointer), with a state pointer
@@ -326,8 +335,14 @@ impl ChannelSlot {
     }
 
     fn reset(&self) {
-        // Free buffer back to registry
-        let buf_slot = self.buffer_slot.swap(-1, Ordering::AcqRel);
+        // Detach the buffer under the ring lock: a reader or writer on
+        // another core either finishes with it first or finds no buffer. Only
+        // then does it go back to the arena, where the next channel may take
+        // it.
+        let buf_slot = self.with_lock(|fifo, _| {
+            *fifo = FifoState::new();
+            self.buffer_slot.swap(-1, Ordering::AcqRel)
+        });
         if buf_slot >= 0 {
             buffer_pool::free_streaming(buf_slot as i32);
         }
@@ -347,11 +362,6 @@ impl ChannelSlot {
         self.ioctl_state
             .store(core::ptr::null_mut(), Ordering::Release);
         self.mirror.store(-1, Ordering::Release);
-        // SAFETY: `reset()` runs under the slot's free-transition; no
-        // active references to `self.fifo` are live at this point.
-        unsafe {
-            *self.fifo.get() = FifoState::new();
-        }
     }
 
     fn is_pipe(&self) -> bool {
@@ -398,8 +408,9 @@ impl ChannelSlot {
             None
         } else {
             // SAFETY: `buf_ptr` was obtained from `buffer_pool::get_streaming_ptr`
-            // for the slot pinned in `self.buffer_slot`; the lock ensures the
-            // slot can't be released while this slice is live.
+            // for the slot pinned in `self.buffer_slot`; `reset` detaches the
+            // buffer under this lock, so it cannot be released while this
+            // slice is live.
             Some(unsafe { core::slice::from_raw_parts_mut(buf_ptr, fifo.capacity()) })
         };
         let result = f(fifo, storage);
@@ -452,7 +463,7 @@ pub fn channel_open_for_module(
     if chan_type != CHANNEL_TYPE_PIPE {
         return CHAN_EINVAL;
     }
-    // The v1 channel-open request shape is exactly:
+    // The channel-open request shape is exactly:
     //   * `config = NULL && config_len == 0` → caller wants the
     //     default capacity (`BUFFER_SIZE`).
     //   * `config != NULL && config_len == 4` → the 4 bytes are a
@@ -466,11 +477,9 @@ pub fn channel_open_for_module(
     // power-of-two capacity) is a wiring bug and gets a deterministic
     // rejection.
     const MIN_CHAN_BYTES: usize = 64;
-    // Matches the scheduler's normalisation cap. Raised 256 KiB -> 2 MiB -> 4 MiB
-    // so a whole app video/GPU frame (emulator command streams run past 1 MiB, and
-    // chunk's GPU ring carries a chunk mesh + far-terrain LOD ring in one step) fits
-    // one ring; the 8 MiB wasm buffer arena has ample room (only channels that
-    // request more allocate more).
+    // Matches the scheduler's normalisation cap. 4 MiB lets a whole app
+    // video/GPU frame (emulator command streams run past 1 MiB) fit one ring;
+    // only channels that request more allocate more.
     const MAX_CHAN_BYTES: usize = 4 * 1024 * 1024;
     let buf_capacity = if config.is_null() {
         if config_len != 0 {
@@ -586,10 +595,10 @@ pub fn stats() -> ChannelStats {
 /// **DMA-owned edge contract**: callers must ensure any device with
 /// outstanding DMA against a streaming buffer attached to a channel
 /// has been quiesced (descriptors retired, device idle) before
-/// invoking `reset_all`. The kernel does not issue `DMA_INVALIDATE`
-/// on the buffer memory here — the streaming arena's bump allocator
-/// may reuse the underlying pages for the next graph immediately,
-/// and a still-active device would corrupt the new occupant.
+/// invoking `reset_all` (or closing that one channel). The kernel does
+/// not issue `DMA_INVALIDATE` on the buffer memory here — the buffer
+/// arena hands the memory to the next channel opened, and a
+/// still-active device would corrupt the new occupant.
 /// Platforms whose drivers hold DMA descriptors (NIC RX rings, NVMe
 /// submission queues, PIO DMA streams) are responsible for tearing
 /// the device down via their module's `module_drain` /
@@ -611,8 +620,9 @@ pub fn reset_all() {
 ///
 /// Only the handler triple (`ioctl_handler`, `ioctl_state`,
 /// `ioctl_owner`) is reset; the slot's `chan_type` and lifecycle
-/// state are left intact. Full slot teardown happens later through
-/// `reset_all` on graph rebuild.
+/// state are left intact. The slot itself is torn down when its
+/// channel closes (`channel_close`) or at the next graph rebuild
+/// (`reset_all`).
 pub fn release_module_handlers(module_idx: u8) {
     for slot in CHANNELS.iter() {
         if slot.ioctl_owner.load(Ordering::Acquire) == module_idx {
@@ -1056,6 +1066,16 @@ pub fn channel_ioctl(handle: i32, cmd: u32, arg: *mut u8) -> i32 {
             slot.sticky_events.store(0, Ordering::Release);
             slot.aux_u32.store(NO_AUX_PENDING, Ordering::Release);
             debug!("chan_ioctl h={handle} FLUSH");
+            CHAN_OK
+        }
+        IOCTL_WRITABLE => {
+            if arg.is_null() {
+                return CHAN_EINVAL;
+            }
+            let n = channel_writable_bytes(handle).min(u32::MAX as usize) as u32;
+            // SAFETY: WRITABLE contract: `arg` is a `*mut u32` from the
+            // caller; non-null checked above.
+            unsafe { core::ptr::write_unaligned(arg as *mut u32, n) };
             CHAN_OK
         }
         IOCTL_SET_HUP => {

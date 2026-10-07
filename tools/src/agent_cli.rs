@@ -5,10 +5,10 @@
 //! fluxor's composition code or a general OCI execution library in its own
 //! address space. One verb for now:
 //!
-//! `fluxor agent commit` — reconcile a single-pod desired state into a durable
+//! `fluxor agent commit` — reconcile a single-workload desired state into a durable
 //! generation store and publish the committed plan blob for the Linux
 //! runtime's `FLUXOR_PLAN` staging. Prints the workload handle
-//! (`fluxor://<pod-uid-hex>/<generation>`) on stdout for the caller to track.
+//! (`fluxor://<workload-uid-hex>/<generation>`) on stdout for the caller to track.
 
 use std::path::PathBuf;
 
@@ -16,12 +16,12 @@ use clap::{Args, Subcommand};
 
 use crate::error::{Error, Result};
 use fluxor_tools::compose::{
-    capacity_for_profile, DesiredPhase, NodeCapacity, PodDesired, ResourceProfile,
+    capacity_for_profile, DesiredPhase, NodeCapacity, ResourceProfile, WorkloadDesired,
 };
 use fluxor_tools::genstore::{FsStorage, GenStore};
 use fluxor_tools::node_agent::{
-    node_status_with_runtime, publish_committed_plan, record_publish_path, remove_pod_and_commit,
-    upsert_pod_and_commit, PodRuntimeStatus, RuntimePhase,
+    node_status_with_runtime, publish_committed_plan, record_publish_path,
+    remove_workload_and_commit, upsert_workload_and_commit, RuntimePhase, WorkloadRuntimeStatus,
 };
 use fluxor_tools::workload::{
     parse_manifest, parse_resource_profile, select_implementation, validate,
@@ -35,18 +35,18 @@ pub struct AgentArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum AgentCommand {
-    /// Upsert a pod into the node's desired state, recompose all resident
-    /// pods into the next generation, and publish the plan blob.
+    /// Upsert a workload into the node's desired state, recompose all resident
+    /// workloads into the next generation, and publish the plan blob.
     Commit(CommitArgs),
-    /// Remove a pod from the desired state, recompose, and publish.
+    /// Remove a workload from the desired state, recompose, and publish.
     Remove(RemoveArgs),
-    /// Report the node's committed generation and per-pod status
-    /// (owner-tagged by the full join key: pod UID + owner slot + generation).
+    /// Report the node's committed generation and per-workload status
+    /// (owner-tagged by the full join key: workload UID + owner slot + generation).
     Status(StatusArgs),
     /// Stream an owner's per-owner log ring.
     Logs(LogsArgs),
     /// Read or set the node policy composition consults on every commit/remove
-    /// — node-scoped, never per-pod: today the reserved-port set.
+    /// — node-scoped, never per-workload: today the reserved-port set.
     Policy(PolicyArgs),
 }
 
@@ -61,7 +61,7 @@ pub struct PolicyArgs {
     #[arg(long)]
     pub reserved_ports: Option<String>,
     /// The node substrate's platform-module prefix (platform stacks prepend
-    /// their modules): pod module ranges are placed past compiled indices
+    /// their modules): workload module ranges are placed past compiled indices
     /// [0, N). Omitted → unchanged.
     #[arg(long)]
     pub system_modules: Option<u16>,
@@ -74,7 +74,7 @@ pub struct LogsArgs {
     pub store: PathBuf,
     /// Owner UID: 32 hex chars (dashes allowed) or the literal `system` for
     /// owner-0 / platform records.
-    #[arg(long, visible_alias = "pod-uid")]
+    #[arg(long)]
     pub owner_uid: String,
     /// Only records at or after this Unix-millisecond timestamp.
     #[arg(long)]
@@ -105,9 +105,9 @@ pub struct RemoveArgs {
     pub store: PathBuf,
     #[arg(long)]
     pub publish: PathBuf,
-    /// Owner UID as 32 hex chars (dashes allowed).
-    #[arg(long, visible_alias = "owner-uid")]
-    pub pod_uid: String,
+    /// Workload UID as 32 hex chars (dashes allowed).
+    #[arg(long)]
+    pub workload_uid: String,
     /// Grace window in seconds: the owner drains (admission closed, in-flight
     /// work runs, readiness withdrawn) and is revoked at quiescence or this
     /// deadline, whichever comes first. 0 = revoke immediately.
@@ -127,9 +127,9 @@ pub struct CommitArgs {
     /// Path to publish the committed plan blob to (FLUXOR_PLAN target).
     #[arg(long)]
     pub publish: PathBuf,
-    /// Pod UID as 32 hex chars (Kubernetes UID with dashes stripped).
+    /// Workload UID as 32 hex chars (dashes allowed).
     #[arg(long)]
-    pub pod_uid: String,
+    pub workload_uid: String,
     #[arg(long, default_value = "default")]
     pub namespace: String,
     #[arg(long)]
@@ -189,7 +189,7 @@ fn verify_artifact(bytes: &[u8], declared: &str, what: &str) -> Result<()> {
     Ok(())
 }
 
-/// Validate a bundle dir and extract the pod's resource profile + workload
+/// Validate a bundle dir and extract the workload's resource profile + workload
 /// digest from it. Admission-gates the manifest: a bundle that fails
 /// validation, lacks a linux implementation, or whose artifacts don't match the
 /// manifest's pinned digests is rejected before anything is committed.
@@ -240,10 +240,10 @@ fn resolve_bundle(
         .map_err(Error::Config)?;
 
     // The workload digest identifies the (verified) workload: the sha256 of its
-    // manifest, recorded on the pod so the committed generation is tied to a
+    // manifest, recorded on the workload so the committed generation is tied to a
     // specific workload rather than a zeroed placeholder.
     let workload_digest = sha256_bytes(manifest_json.as_bytes());
-    // Declared exports travel with the desired pod so `agent status` can join
+    // Declared exports travel with the desired workload so `agent status` can join
     // them against the runtime's report of what actually bound.
     let exports = manifest
         .contract
@@ -257,17 +257,17 @@ fn resolve_bundle(
     Ok((doc.to_compose(), workload_digest, exports))
 }
 
-fn parse_pod_uid(hex: &str) -> Result<[u8; 16]> {
+fn parse_workload_uid(hex: &str) -> Result<[u8; 16]> {
     let cleaned: String = hex.chars().filter(|c| *c != '-').collect();
     if cleaned.len() != 32 || !cleaned.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(Error::Config(format!(
-            "--pod-uid must be 32 hex chars (got '{hex}')"
+            "--workload-uid must be 32 hex chars (got '{hex}')"
         )));
     }
     let mut uid = [0u8; 16];
     for (i, byte) in uid.iter_mut().enumerate() {
         *byte = u8::from_str_radix(&cleaned[i * 2..i * 2 + 2], 16)
-            .map_err(|e| Error::Config(format!("--pod-uid: {e}")))?;
+            .map_err(|e| Error::Config(format!("--workload-uid: {e}")))?;
     }
     Ok(uid)
 }
@@ -455,13 +455,13 @@ fn status(a: StatusArgs) -> Result<()> {
     }
     println!(
         "{:<32} {:<16} {:<10} {:<8} {:<5} {:<5} {:<8} {:<6} {:<24}",
-        "POD-UID", "NAME", "NAMESPACE", "PHASE", "SLOT", "GEN", "MODULES", "EDGES", "RUNTIME"
+        "WORKLOAD-UID", "NAME", "NAMESPACE", "PHASE", "SLOT", "GEN", "MODULES", "EDGES", "RUNTIME"
     );
-    for p in &st.pods {
+    for p in &st.workloads {
         let dash = || "-".to_string();
         println!(
             "{:<32} {:<16} {:<10} {:<8} {:<5} {:<5} {:<8} {:<6} {:<24}",
-            p.pod_uid_hex,
+            p.workload_uid_hex,
             p.name,
             p.namespace,
             format!("{:?}", p.desired_phase),
@@ -479,7 +479,7 @@ fn status(a: StatusArgs) -> Result<()> {
 
 /// Human-readable summary of the live runtime state for the table output
 /// ("-" when the runtime isn't up; the JSON form carries the full object).
-fn runtime_column(rt: Option<&PodRuntimeStatus>) -> String {
+fn runtime_column(rt: Option<&WorkloadRuntimeStatus>) -> String {
     let Some(rt) = rt else {
         return "-".to_string();
     };
@@ -495,23 +495,23 @@ fn runtime_column(rt: Option<&PodRuntimeStatus>) -> String {
 }
 
 fn remove(r: RemoveArgs) -> Result<()> {
-    let pod_uid = parse_pod_uid(&r.pod_uid)?;
+    let workload_uid = parse_workload_uid(&r.workload_uid)?;
     let storage = FsStorage::open(&r.store)
         .map_err(|e| Error::Config(format!("open store {}: {e}", r.store.display())))?;
     let mut store = GenStore::new(storage);
     let cap = capacity(&r.profile)?;
-    let (plan, gen) = remove_pod_and_commit(&mut store, pod_uid, r.grace, &cap)
+    let (plan, gen) = remove_workload_and_commit(&mut store, workload_uid, r.grace, &cap)
         .map_err(|e| Error::Config(format!("remove/recompose failed: {e:?}")))?;
     publish_committed_plan(&store, &r.publish)
         .map_err(|e| Error::Config(format!("publish failed: {e}")))?;
     // Best-effort: status still works without it, just without live state.
     let _ = record_publish_path(&mut store, &r.publish);
-    println!("gen {} pods {}", gen, plan.assignments.len());
+    println!("gen {} workloads {}", gen, plan.assignments.len());
     Ok(())
 }
 
 fn commit(c: CommitArgs) -> Result<()> {
-    let pod_uid = parse_pod_uid(&c.pod_uid)?;
+    let workload_uid = parse_workload_uid(&c.workload_uid)?;
     let (profile, workload_digest, exports) = match &c.bundle {
         Some(dir) => resolve_bundle(dir)?,
         None => (
@@ -528,8 +528,8 @@ fn commit(c: CommitArgs) -> Result<()> {
             Vec::new(),
         ),
     };
-    let pod = PodDesired {
-        pod_uid,
+    let workload = WorkloadDesired {
+        workload_uid,
         namespace: c.namespace.clone(),
         name: c.name.clone(),
         workload_digest,
@@ -543,7 +543,7 @@ fn commit(c: CommitArgs) -> Result<()> {
         .map_err(|e| Error::Config(format!("open store {}: {e}", c.store.display())))?;
     let mut store = GenStore::new(storage);
     let cap = capacity(&c.profile)?;
-    let (_plan, gen) = upsert_pod_and_commit(&mut store, pod, &cap)
+    let (_plan, gen) = upsert_workload_and_commit(&mut store, workload, &cap)
         .map_err(|e| Error::Config(format!("reconcile/commit failed: {e:?}")))?;
     publish_committed_plan(&store, &c.publish)
         .map_err(|e| Error::Config(format!("publish failed: {e}")))?
@@ -556,7 +556,10 @@ fn commit(c: CommitArgs) -> Result<()> {
     // The workload handle the orchestrator tracks: `fluxor://<uid-hex>/<gen>`.
     println!(
         "fluxor://{}/{}",
-        c.pod_uid.chars().filter(|c| *c != '-').collect::<String>(),
+        c.workload_uid
+            .chars()
+            .filter(|c| *c != '-')
+            .collect::<String>(),
         gen
     );
     Ok(())

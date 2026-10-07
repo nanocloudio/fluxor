@@ -9,7 +9,7 @@
 //! Rendering, per table `nc_<name>` (family `ip`):
 //!   filter_fwd  forward hook: `ct state established,related accept` first
 //!               when the table isolates anything (NetworkPolicy is stateful —
-//!               a reply to an isolated pod's own connection must come back),
+//!               a reply to an isolated workload's own connection must come back),
 //!               then ALLOW/DROP in table order, then each ISOLATE's drop, then
 //!               the reject for any VIP with no backends
 //!   filter_out  output hook: the same no-backend rejects, for host traffic

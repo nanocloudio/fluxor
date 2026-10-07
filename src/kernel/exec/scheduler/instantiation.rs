@@ -129,12 +129,11 @@ pub(crate) fn build_module_list(config: &Config) -> Result<ModuleList, i32> {
 }
 
 /// Pre-pass: set `SCHED.isolated[i]` for every module whose config params
-/// request a gated level (TLV tag 0xF5 >= contained), BEFORE channels are
-/// opened. This lets `open_channels`/`alloc_streaming_for_module` page-align an
-/// isolated producer's channel buffers and the channel-region pass round its
-/// region to whole pages. The full protection TLV (fault policy, deadlines, …)
-/// is still parsed at instantiation via `parse_protection_config`; this only
-/// peeks the isolation bit. No-op off BCM2712 (EL0 isolation is BCM2712-only,
+/// request a gated level (TLV tag 0xF5 >= contained), BEFORE the graph's
+/// edges are validated, so the zero-copy check in `prepare_graph` can refuse a
+/// gated module on a mailbox or in-place edge. The full protection TLV (fault
+/// policy, deadlines, …) is still parsed at instantiation via
+/// `parse_protection_config`; this only peeks the isolation bit. No-op off BCM2712 (EL0 isolation is BCM2712-only,
 /// but the flag itself is platform-agnostic — `module_is_isolated` callers gate
 /// on the chip feature).
 pub(crate) fn mark_isolated_from_params(

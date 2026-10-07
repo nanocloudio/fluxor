@@ -223,7 +223,15 @@ Before opening channels, the scheduler reads each module's per-port
 signed manifest. No module code runs, and every declared port is
 honoured.
 Channel buffers are allocated from the buffer arena. Both the state
-arena and the buffer arena are reset on graph reconfigure.
+arena and the buffer arena are reset on graph reconfigure. Between
+reconfigures, a channel closed by a live graph change returns its buffer:
+the region merges with free neighbours and either lowers the arena's
+high-water mark or joins a free list that later channels take from (best
+fit), so a node that admits and reaps workloads indefinitely holds the
+arena at a fixed point. Every buffer is aligned to a 64-byte cache line.
+A mailbox buffer still lent to a producer or consumer when its channel
+closes is not returned — the holder may still touch it — and stays spent
+until the next reconfigure.
 
 A port that declares no `buffer_size` gets the default 8192 bytes. The
 config tool validates that the sum of all channel buffers fits within
@@ -469,12 +477,12 @@ per-architecture profiles in `modules/sdk/abi/config.rs`:
 
 | Resource | Constant | Values |
 |----------|----------|--------|
-| Modules | `MAX_MODULES` | 32 (embedded profile), 48 (wasm), 128 (host/aarch64) |
-| Channel edges | `MAX_GRAPH_EDGES` | 128 (`src/kernel/boot/config.rs`) |
+| Modules | `MAX_MODULES` | 32 (embedded profile), 48 (wasm), 255 (aarch64) |
+| Channel edges | `MAX_GRAPH_EDGES` | 128, or 384 where `MAX_MODULES` exceeds 128 (`src/kernel/boot/config.rs`) |
 | Event slots | `MAX_EVENTS` | 32 (`src/kernel/ipc/event.rs`) |
-| State arena | `STATE_ARENA_SIZE` | 64 KiB (rp2040), 240 KiB (rp2350), 96 MiB (host/wasm profiles) |
-| Buffer arena | `BUFFER_ARENA_SIZE` | 16 KiB (rp2040), 32 KiB (rp2350), 8 MiB (host/wasm profiles) |
-| Buffer slots | `MAX_BUFFER_SLOTS` | 256 (`src/kernel/ipc/buffer_pool.rs`) |
+| State arena | `STATE_ARENA_SIZE` | 64 KiB (rp2040), 240 KiB (rp2350), 96 MiB (wasm), 256 MiB (aarch64) |
+| Buffer arena | `BUFFER_ARENA_SIZE` | 16 KiB (rp2040), 64 KiB (rp2350), 8 MiB (wasm, aarch64) |
+| Buffer slots | `MAX_BUFFER_SLOTS` | one per channel: `MAX_GRAPH_EDGES` (`src/kernel/ipc/buffer_pool.rs`) |
 
 These are sized per silicon: small embedded targets have tight
 budgets, server-class targets have headroom for larger graphs. The

@@ -1,0 +1,42 @@
+version = "1.0.0"
+hardware_targets = ["bcm2712"]
+permissions = ["platform_raw"]
+
+# Workload-churn driver (tests/hardware/pi5_workload_churn.toml): admits and
+# reaps a small workload `cycles` times through the metal `workload` backend
+# (0x1A), the way a node agent does, then stages two faulting workloads.
+#
+# Each cycle: CREATE the FLXA workload churn_probe(source) -> churn_probe(relay) ->
+# this module's lane (edges sized `chan_bytes`), START, read the lane until a
+# counter arrives (or `read_timeout_ms`), DESTROY. Every 25 cycles, and once
+# more when the loop ends:
+#   [churn] progress n=<cycles> ok=<lane reads> tmo=<timeouts> cf=<refused creates>
+#           cmax_us=<worst CREATE> dmax_us=<worst DESTROY> gapmax_ms=<worst own step gap>
+# Three refused CREATEs in a row end the loop: `[churn] exhausted n=<cycle> rc=<errno>`.
+# The kernel's own `[live]` line (workload_graph.rs) reports both arenas'
+# high-water marks beside the graph's population, so a leak is a reading.
+#
+# Fault phase (`fault: 1`): a test_fault workload in mode `error`, then mode
+# `infinite_loop`; WAIT is polled for up to 5 s and reported as
+# `[churn] fault mode=<m> state=<s> code=<c> ms=<t>`, then DESTROY. Finally
+# `[churn] done n=<cycles> ok=<lane reads>`.
+#
+# Every 5 s, in every phase, the whole outcome repeats as one line, so a
+# reader that misses a one-shot line still sees the result:
+#   [churn] hb ms=<now> phase=<0 wait|1 idle|2 running|3 fault|4 done> n= ok= tmo=
+#           cf= exh=<1 if exhausted> f1=<WAIT state, mode error> f0=<WAIT state,
+#           mode infinite_loop> (0xFF = not reached; 2 = SIGNALLED)
+
+timer_class = "wall_clock"
+
+[[resources]]
+requires_contract = "timer"
+access = "read"
+
+[[resources]]
+requires_contract = "workload"
+access = "write"
+
+# Module-scope observability — exempt (standards/observability.md §6).
+[observability]
+exempt = "workload-churn driver fixture; its '[churn]' log lines are the observable, consumed by the rig scenario's pass rules"

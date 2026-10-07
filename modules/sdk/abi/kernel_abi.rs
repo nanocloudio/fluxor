@@ -186,8 +186,8 @@ pub struct SyscallTable {
     ) -> i32,
 }
 
-// SAFETY: `SyscallTable` was auto-`Sync` before the `telemetry_enabled` raw
-// pointer was added (it is otherwise `fn` pointers + a `u32`). The table is
+// SAFETY: apart from the `telemetry_enabled` raw pointer, `SyscallTable` is
+// `fn` pointers and a `u32`, all `Sync`. The table is
 // immutable after construction and shared by `&`-reference — the wasm runtime
 // holds it in a `static` (`WASM_SYSCALLS`), and the kernel hands out a shared
 // pointer to every module across cores. `telemetry_enabled` points at a
@@ -359,14 +359,18 @@ pub mod errno {
 // below are reserved for the control plane (open/close/bind/listen/
 // accept) and for ioctl sideband.
 //
-// Channel ioctl commands (stable ABI values, passed in the ioctl `cmd`
-// parameter rather than as opcodes):
-//   1 = SET_U32:  store auxiliary u32 value (arg: *const u32)
-//                 Use case: seek position, file index, producer signal
-//   2 = GET_U32:  atomic read-and-clear of auxiliary u32 (arg: *mut u32)
-//                 Returns OK if value was pending, EAGAIN if not
-//   3 = FLUSH:    clear ring buffer and reset flags
-//   4 = SET_HUP:  set HUP flag (detected via handle_poll with poll::HUP)
+// Channel ioctl commands the kernel handles (stable ABI values, passed in
+// the ioctl `cmd` parameter rather than as opcodes; `runtime/consts.rs`
+// names them for modules):
+//   1 = NOTIFY:      store an auxiliary u32 (arg: *const u32)
+//                    Use case: seek position, file index, producer signal
+//   2 = POLL_NOTIFY: read-and-clear the auxiliary u32 (arg: *mut u32)
+//                    Returns OK if a value was pending, EAGAIN if not
+//   3 = FLUSH:       clear the ring buffer and reset flags (no arg)
+//   4 = SET_HUP:     set the HUP flag (seen via handle_poll with poll::HUP)
+//   5 = WRITABLE:    bytes a write can place in the ring now (arg: *mut u32);
+//                    0 for a full ring and for a mailbox channel, which has
+//                    no ring to measure
 pub mod channel {
     pub const OPEN: u32 = 0x0500;
     pub const CLOSE: u32 = 0x0501;
@@ -378,7 +382,7 @@ pub mod channel {
     /// Bind a module-provided ioctl handler to this channel.
     /// Arg layout: `{ state_ptr: u64 LE, handler_fn: u64 LE }` (16 B).
     /// Any `channel_ioctl` cmd not handled by the kernel's built-in set
-    /// (NOTIFY / POLL_NOTIFY / FLUSH / SET_HUP) is forwarded to
+    /// (NOTIFY / POLL_NOTIFY / FLUSH / SET_HUP / WRITABLE) is forwarded to
     /// `handler_fn(state_ptr, cmd, arg)`. `handler_fn = 0` clears.
     pub const REGISTER_IOCTL: u32 = 0x0507;
     pub const BIND: u32 = 0x0509;
@@ -496,6 +500,19 @@ pub mod timer {
     pub const CANCEL: u32 = 0x0606;
     /// Destroy timer. handle=timer_fd.
     pub const DESTROY: u32 = 0x0607;
+    /// Anchor the platform's wall clock to a network time measurement — for a
+    /// board with no RTC and no OS time service (the `sntp` foundation module
+    /// calls it). `handle=-1`, `arg` = `[unix_us: u64 LE][monotonic_us: u64
+    /// LE][error_us: u32 LE]` (20 bytes): at monotonic instant `monotonic_us`
+    /// (a `MICROS` reading, not in the future) it was `unix_us`, within
+    /// `error_us`. The platform then reports `NETWORK_SYNC` through
+    /// `TRUSTED_UNIX`, its uncertainty growing with the anchor's age, until
+    /// the anchor goes stale (one hour without a fresh one). `EINVAL` for an anchor that cannot be true (a
+    /// Unix time before 2024, or a monotonic instant in the future).
+    /// Privileged (`platform_raw`): whoever anchors the clock decides every
+    /// credential's validity window. `ENOSYS` on a platform whose wall clock
+    /// does not come from this anchor (bcm2712 is the one that does).
+    pub const DISCIPLINE: u32 = 0x060A;
 }
 
 // ─────────────────────────────────────────────────────────────────────

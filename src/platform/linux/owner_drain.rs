@@ -252,7 +252,7 @@ pub fn drain_overlay_for_status(
 /// Render the retained terminal records as status-file workload entries (same shape
 /// as the live workloads array; §7.2 vocabulary + the additive `drain{}` detail).
 /// Returns entries WITHOUT leading separators; empty when nothing is retained.
-pub fn drain_terminal_pods_json() -> Vec<String> {
+pub fn drain_terminal_workloads_json() -> Vec<String> {
     use std::fmt::Write as _;
     let d = drain_driver();
     let mut out = Vec::with_capacity(d.terminals.len());

@@ -24,7 +24,7 @@
 // provider that records tables but cannot act on them (wasm; bare metal with
 // no filter in the packet path) accepts REPLACE and leaves [`caps::ENFORCED`]
 // clear. A consumer that must not run unenforced — a NetworkPolicy exists for
-// a pod — reads the bit and reports the gap; it never assumes. A rule kind the
+// a workload — reads the bit and reports the gap; it never assumes. A rule kind the
 // provider cannot realize at all fails REPLACE with `ENOSYS` rather than being
 // dropped: a table that silently lost its DNAT is a Service that silently
 // stopped working.

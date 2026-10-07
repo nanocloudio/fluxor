@@ -1,13 +1,13 @@
-//! Owner-pause probe — resident-pod half of the metal PAUSE silicon AC.
+//! Owner-pause probe — resident-workload half of the metal PAUSE silicon AC.
 //!
-//! A self-driven counter that runs inside a resident pod (workload owner).
+//! A self-driven counter that runs inside a resident workload (its own owner).
 //! Every `log_every` steps it logs `[pprobe] c=<count> ms=<dev_millis>`
 //! (the liveness observable), and whenever the wall-clock gap between two
 //! consecutive steps exceeds `gap_min_ms` it logs
-//! `[pprobe] gap_ms=<gap>` — the pod's OWN proof that it was not stepped
+//! `[pprobe] gap_ms=<gap>` — the workload's OWN proof that it was not stepped
 //! for that window. Paired with `pause_driver`, which pauses/resumes the
-//! pod's owner from the base graph: the gap line can only appear if the
-//! pause actually froze the pod, and its magnitude must match the
+//! workload's owner from the base graph: the gap line can only appear if the
+//! pause actually froze the workload, and its magnitude must match the
 //! driver's pause→resume window.
 
 #![no_std]

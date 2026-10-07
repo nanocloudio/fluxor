@@ -29,7 +29,6 @@ need no synchronisation:
 - `src/kernel/module/loader.rs`: `STATE_ARENA`, `STATE_ARENA_OFFSET`,
   `FREE_LIST`, `FREE_COUNT`, `PIC_IRQ_DISABLED_COUNT`
 - `src/kernel/boot/config.rs`: `CONFIG_ARENA`, `ARENA_OFFSET`
-- `src/kernel/ipc/buffer_pool.rs`: `BUFFER_ARENA`, `BUFFER_ARENA_OFFSET`
 - `src/kernel/exec/scheduler/`: `STATIC_CONFIG`, `STATIC_LOADER`,
   `PARAM_BUFFER`, `NAME_STORAGE`, `NEXT_NAME_SLOT`,
   `INSTANTIATION_STATE`, `INSTANTIATION_IDX`, `MODULE_STATE_PTR`
@@ -41,7 +40,10 @@ After init these are read-only. All four platforms publish
 `INIT_COMPLETE` (or its equivalent; for RP/Linux/WASM there is no
 secondary core to release) before any code reads them. Writes during
 reconfigure happen on core 0 with all secondaries parked, restoring
-boot-only semantics for the duration of the rebuild.
+boot-only semantics for the duration of the rebuild. The state arena
+allocator is also written after init, but only on core 0: live graph
+changes (peer cores quiesced) and the block-lend ledger releasing a
+quarantined module's memory. No other core allocates module state.
 
 ### Per-core-sliced — steady state, no byte shared
 
@@ -73,6 +75,19 @@ must be an atomic or guarded by a lock:
   `lock` for the FIFO critical section. Cross-core safe.
 - `BUFFER_REGISTRY[i]` (`src/kernel/ipc/buffer_pool.rs`) — each
   `BufferRegistrySlot` is fully atomic. Cross-core safe.
+- The buffer arena allocator (`src/kernel/ipc/buffer_pool.rs`) —
+  channels open and close at graph build, on live graph changes, when
+  the block-lend ledger closes a channel (core 0, peers running), and
+  from a module's own `channel::OPEN` / `CLOSE` on any core. The free
+  list and high-water mark change only under `ARENA_LOCK`; the mark is
+  an `AtomicUsize` so occupancy reads need no lock. A channel detaches
+  its buffer under its own FIFO lock before returning it, so a reader
+  or writer on another core finishes with the buffer first or finds
+  none.
+- The network-disciplined wall clock (`src/kernel/sys/time_sync.rs`) —
+  any core reads the anchor; any core's module may install one through
+  `timer::DISCIPLINE`. A sequence lock (writers claim it even-to-odd by
+  compare-exchange) keeps a reader from pairing two anchors' fields.
 - Event queues (`src/kernel/ipc/event.rs`) — atomic ring per event
   handle.
 

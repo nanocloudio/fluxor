@@ -9,11 +9,11 @@
 //! `(desired, capacity, snapshot)` inputs must produce a byte-identical plan
 //! and the same `plan_digest`, so any node — or offline tooling — composes the
 //! same answer. The rules enforced here:
-//!   * pods are processed in ascending `pod_uid` order;
-//!   * an already-resident pod keeps its slot and generation (handle preserved);
-//!   * a new pod takes the lowest free slot; its generation is the slot's
+//!   * workloads are processed in ascending `workload_uid` order;
+//!   * an already-resident workload keeps its slot and generation (handle preserved);
+//!   * a new workload takes the lowest free slot; its generation is the slot's
 //!     persistent counter + 1 (monotonic across reuse, so a stale handle from a
-//!     deleted pod can never match);
+//!     deleted workload can never match);
 //!   * module/edge index ranges are assigned contiguously in ascending slot
 //!     order.
 //!
@@ -24,10 +24,10 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-pub type PodUid = [u8; 16];
+pub type WorkloadUid = [u8; 16];
 pub type Digest32 = [u8; 32];
 
-/// Desired lifecycle of a pod.
+/// Desired lifecycle of a workload.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DesiredPhase {
     Running,
@@ -35,7 +35,7 @@ pub enum DesiredPhase {
 }
 
 /// Measured runtime demand of a workload implementation (the signed resource
-/// profile). Counts are per-pod.
+/// profile). Counts are per-workload.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResourceProfile {
     pub modules: u16,
@@ -49,17 +49,17 @@ pub struct ResourceProfile {
 /// One declared network export of an admitted workload (mirrors the workload
 /// manifest's `Export`, minus the name — the agent joins the runtime's bound
 /// report against these). Persisted with the
-/// desired pod; `#[serde(default)]` tolerates a desired pod that declares none.
+/// desired workload; `#[serde(default)]` tolerates a desired workload that declares none.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExportDecl {
     pub protocol: String,
     pub port: u16,
 }
 
-/// One pod's desired state.
+/// One workload's desired state.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PodDesired {
-    pub pod_uid: PodUid,
+pub struct WorkloadDesired {
+    pub workload_uid: WorkloadUid,
     pub namespace: String,
     pub name: String,
     pub workload_digest: Digest32,
@@ -77,7 +77,7 @@ pub struct PodDesired {
 pub struct DeviceDesiredState {
     pub generation: u64,
     pub system_revision: u64,
-    pub pods: Vec<PodDesired>,
+    pub workloads: Vec<WorkloadDesired>,
 }
 
 /// Node capacity facts — mirrors the per-profile kernel limits the plan must
@@ -159,7 +159,7 @@ pub fn capacity_for_profile(profile: &str) -> Option<NodeCapacity> {
 /// so reuse always issues a strictly higher generation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SlotState {
-    pub occupant: Option<PodUid>,
+    pub occupant: Option<WorkloadUid>,
     pub generation: u32,
 }
 
@@ -171,7 +171,7 @@ impl SlotState {
 }
 
 /// Snapshot of the owner table, indexed by slot (slot 0 = system), plus the
-/// committed plan's records: prior assignments (so resident pods retain their
+/// committed plan's records: prior assignments (so resident workloads retain their
 /// module/edge ranges verbatim across membership changes) and prior
 /// revocations (carried forward until expiry).
 #[derive(Clone, Debug, Default)]
@@ -193,7 +193,7 @@ impl OwnerSnapshot {
         }
     }
 
-    fn slot_of(&self, uid: &PodUid) -> Option<u16> {
+    fn slot_of(&self, uid: &WorkloadUid) -> Option<u16> {
         self.slots
             .iter()
             .position(|s| s.occupant.as_ref() == Some(uid))
@@ -211,7 +211,7 @@ impl OwnerSnapshot {
 /// One owner's placement in a composed plan.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OwnerAssignment {
-    pub pod_uid: PodUid,
+    pub workload_uid: WorkloadUid,
     pub slot: u16,
     pub generation: u32,
     pub module_base: u16,
@@ -350,25 +350,25 @@ fn insert_interval(occupied: &mut Vec<Interval>, base: u32, count: u32) {
 /// the new running set departs as a NEW revocation record (its last assignment
 /// verbatim + `deadline_unix = now + grace`); live revocations occupy their
 /// slot, hold their module/edge ranges, and charge state/buffer capacity.
-/// Resident pods retain their prior ranges verbatim; new (or resized) pods are
+/// Resident workloads retain their prior ranges verbatim; new (or resized) workloads are
 /// placed first-fit into the gaps, so a removal generation leaves every
 /// surviving assignment byte-identical.
 pub fn compose(
     desired: &DeviceDesiredState,
     cap: &NodeCapacity,
     prior: &OwnerSnapshot,
-    revoke_graces: &[(PodUid, u16)],
+    revoke_graces: &[(WorkloadUid, u16)],
     now_unix: u64,
     reserved_ports: &[u16],
     system_modules: u16,
 ) -> Result<CompositionPlan, ComposeError> {
-    // 1. Only running pods are placed; sort by pod_uid for a stable order.
-    let mut running: Vec<&PodDesired> = desired
-        .pods
+    // 1. Only running workloads are placed; sort by workload_uid for a stable order.
+    let mut running: Vec<&WorkloadDesired> = desired
+        .workloads
         .iter()
         .filter(|p| p.desired_phase == DesiredPhase::Running)
         .collect();
-    running.sort_by(|a, b| a.pod_uid.cmp(&b.pod_uid));
+    running.sort_by(|a, b| a.workload_uid.cmp(&b.workload_uid));
 
     // 2. Revocations: carry forward the prior plan's live records, then add one
     //    for each prior occupant departing in this generation.
@@ -378,16 +378,17 @@ pub fn compose(
         .filter(|r| r.live_at(now_unix))
         .copied()
         .collect();
-    let prior_assignment_of = |uid: &PodUid| prior.assignments.iter().find(|a| &a.pod_uid == uid);
+    let prior_assignment_of =
+        |uid: &WorkloadUid| prior.assignments.iter().find(|a| &a.workload_uid == uid);
     for a in &prior.assignments {
-        let still_running = running.iter().any(|p| p.pod_uid == a.pod_uid);
+        let still_running = running.iter().any(|p| p.workload_uid == a.workload_uid);
         let already_revoked = revocations
             .iter()
             .any(|r| r.assignment.slot == a.slot && r.assignment.generation == a.generation);
         if !still_running && !already_revoked {
             let grace = revoke_graces
                 .iter()
-                .find(|(uid, _)| uid == &a.pod_uid)
+                .find(|(uid, _)| uid == &a.workload_uid)
                 .map(|(_, g)| *g)
                 .unwrap_or(0);
             let rev = PlanRevocation {
@@ -402,12 +403,12 @@ pub fn compose(
     }
     revocations.sort_by_key(|r| r.assignment.slot);
 
-    // 3. Assign owner slots. Resident pods keep their slot+generation; new pods
+    // 3. Assign owner slots. Resident workloads keep their slot+generation; new workloads
     //    take the lowest free slot (never one held by a live revocation) with a
     //    bumped generation.
     let mut occupied_slots: Vec<u16> = running
         .iter()
-        .filter_map(|p| prior.slot_of(&p.pod_uid))
+        .filter_map(|p| prior.slot_of(&p.workload_uid))
         .collect();
     occupied_slots.extend(revocations.iter().map(|r| r.assignment.slot));
 
@@ -423,10 +424,10 @@ pub fn compose(
         None
     };
 
-    // (slot, generation) per running pod, in the running (uid-sorted) order.
+    // (slot, generation) per running workload, in the running (uid-sorted) order.
     let mut placed: Vec<(u16, u32)> = Vec::with_capacity(running.len());
     for p in &running {
-        if let Some(slot) = prior.slot_of(&p.pod_uid) {
+        if let Some(slot) = prior.slot_of(&p.workload_uid) {
             placed.push((slot, prior.generation_at(slot)));
         } else {
             let slot = free_slot(&occupied_slots, cap).ok_or(ComposeError::OwnerSlotsExhausted)?;
@@ -434,10 +435,10 @@ pub fn compose(
         }
     }
 
-    // 4. Range layout: live revocations hold their ranges; resident pods
+    // 4. Range layout: live revocations hold their ranges; resident workloads
     //    whose profile still matches retain their prior ranges VERBATIM; new or
-    //    resized pods first-fit into the gaps. Aggregate capacity charges
-    //    running pods plus live revocations (the draining owner really is still
+    //    resized workloads first-fit into the gaps. Aggregate capacity charges
+    //    running workloads plus live revocations (the draining owner really is still
     //    holding modules/state/buffers).
     let mut module_occ: Vec<Interval> = Vec::new();
     let mut edge_occ: Vec<Interval> = Vec::new();
@@ -473,7 +474,7 @@ pub fn compose(
     let mut pending: Vec<Pending> = Vec::with_capacity(order.len());
     for &i in &order {
         let p = running[i];
-        let retained = prior_assignment_of(&p.pod_uid).and_then(|a| {
+        let retained = prior_assignment_of(&p.workload_uid).and_then(|a| {
             (a.module_count == p.profile.modules && a.edge_count == p.profile.edges)
                 .then_some((a.module_base, a.edge_base))
         });
@@ -536,7 +537,7 @@ pub fn compose(
         };
 
         assignments.push(OwnerAssignment {
-            pod_uid: p.pod_uid,
+            workload_uid: p.workload_uid,
             slot,
             generation,
             module_base: module_base as u16,
@@ -548,20 +549,20 @@ pub fn compose(
         });
 
         // Endpoint leases: one per declared
-        // tcp/udp export, charged against the pod's admitted endpoint count;
+        // tcp/udp export, charged against the workload's admitted endpoint count;
         // duplicates across owners and reserved-port intersections are
-        // admission-time errors — a bind race between co-resident pods (or
+        // admission-time errors — a bind race between co-resident workloads (or
         // with the embedding host's own listeners) never reaches the node.
         // A DRAINING owner's ports are not in this set (revocation records
         // carry no exports); overlap with a drain window is refused at bind
         // time by the owner-aware fast path instead.
-        let mut pod_leases = 0u32;
+        let mut workload_leases = 0u32;
         for export in &p.exports {
             let Some(protocol) = lease_protocol(&export.protocol) else {
                 continue; // non-tcp/udp exports are reported, not leased
             };
-            pod_leases += 1;
-            if pod_leases > p.profile.endpoints as u32 {
+            workload_leases += 1;
+            if workload_leases > p.profile.endpoints as u32 {
                 return Err(ComposeError::EndpointsExceeded);
             }
             // Port 0 cannot be exported: the kernel's bind gate treats 0 as
@@ -596,7 +597,7 @@ pub fn compose(
 }
 
 /// Per-assignment fixed record width in the canonical plan body:
-/// pod_uid(16) + slot(2) + generation(4) + module_base(2) + module_count(2)
+/// workload_uid(16) + slot(2) + generation(4) + module_base(2) + module_count(2)
 /// + edge_base(2) + edge_count(2).
 const ASSIGN_REC_LEN: usize = 16 + 2 + 4 + 2 + 2 + 2 + 2 + 4 + 4;
 
@@ -616,7 +617,7 @@ const LEASE_SECTION_MARKER: u32 = 0xFFFF_FFFF;
 pub const MAX_PLAN_LEASES: usize = 256;
 
 fn push_assignment(buf: &mut Vec<u8>, a: &OwnerAssignment) {
-    buf.extend_from_slice(&a.pod_uid);
+    buf.extend_from_slice(&a.workload_uid);
     buf.extend_from_slice(&a.slot.to_be_bytes());
     buf.extend_from_slice(&a.generation.to_be_bytes());
     buf.extend_from_slice(&a.module_base.to_be_bytes());
@@ -701,7 +702,7 @@ fn digest_plan(
 
 // ============================================================================
 // Binary plan codec. The kernel consumes a validated, bounded binary plan; it
-// never parses Kubernetes objects, OCI manifests, or YAML.
+// parses no orchestrator objects, OCI manifests or YAML.
 // ============================================================================
 
 /// Magic for an encoded device-graph plan: "FLXP".
@@ -830,10 +831,10 @@ pub fn decode_plan(bytes: &[u8]) -> Result<CompositionPlan, PlanDecodeError> {
         return Err(PlanDecodeError::DigestMismatch);
     }
     let read_assignment = |r: &[u8]| -> OwnerAssignment {
-        let mut pod_uid = [0u8; 16];
-        pod_uid.copy_from_slice(&r[0..16]);
+        let mut workload_uid = [0u8; 16];
+        workload_uid.copy_from_slice(&r[0..16]);
         OwnerAssignment {
-            pod_uid,
+            workload_uid,
             slot: u16::from_be_bytes(r[16..18].try_into().unwrap()),
             generation: u32::from_be_bytes(r[18..22].try_into().unwrap()),
             module_base: u16::from_be_bytes(r[22..24].try_into().unwrap()),
@@ -899,11 +900,11 @@ pub fn decode_plan(bytes: &[u8]) -> Result<CompositionPlan, PlanDecodeError> {
 // Reservation protocol
 // ============================================================================
 
-/// A single-use placement reservation. Bound to the pod, the workload and plan
+/// A single-use placement reservation. Bound to the workload, the workload and plan
 /// digests, and the node epoch under which it was issued.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReservationToken {
-    pub pod_uid: PodUid,
+    pub workload_uid: WorkloadUid,
     pub workload_digest: Digest32,
     pub plan_digest: Digest32,
     pub node_epoch: u64,
@@ -925,7 +926,7 @@ pub enum ReserveError {
 #[derive(Clone, Debug)]
 pub struct Reservations {
     node_epoch: u64,
-    consumed: Vec<(PodUid, u64)>,
+    consumed: Vec<(WorkloadUid, u64)>,
 }
 
 impl Reservations {
@@ -943,12 +944,12 @@ impl Reservations {
     /// Issue a reservation against the current epoch.
     pub fn reserve(
         &self,
-        pod_uid: PodUid,
+        workload_uid: WorkloadUid,
         workload_digest: Digest32,
         plan_digest: Digest32,
     ) -> ReservationToken {
         ReservationToken {
-            pod_uid,
+            workload_uid,
             workload_digest,
             plan_digest,
             node_epoch: self.node_epoch,
@@ -964,11 +965,11 @@ impl Reservations {
         if self
             .consumed
             .iter()
-            .any(|(uid, epoch)| *uid == token.pod_uid && *epoch == token.node_epoch)
+            .any(|(uid, epoch)| *uid == token.workload_uid && *epoch == token.node_epoch)
         {
             return Err(ReserveError::AlreadyConsumed);
         }
-        self.consumed.push((token.pod_uid, token.node_epoch));
+        self.consumed.push((token.workload_uid, token.node_epoch));
         Ok(())
     }
 
@@ -985,7 +986,7 @@ impl Reservations {
 mod tests {
     use super::*;
 
-    fn uid(n: u8) -> PodUid {
+    fn uid(n: u8) -> WorkloadUid {
         let mut u = [0u8; 16];
         u[0] = n;
         u
@@ -1002,11 +1003,11 @@ mod tests {
         }
     }
 
-    fn pod(n: u8, phase: DesiredPhase, p: ResourceProfile) -> PodDesired {
-        PodDesired {
-            pod_uid: uid(n),
+    fn workload(n: u8, phase: DesiredPhase, p: ResourceProfile) -> WorkloadDesired {
+        WorkloadDesired {
+            workload_uid: uid(n),
             namespace: "default".into(),
-            name: format!("pod-{n}"),
+            name: format!("workload-{n}"),
             workload_digest: [n; 32],
             config_generation: 1,
             desired_phase: phase,
@@ -1030,19 +1031,19 @@ mod tests {
     #[test]
     fn composition_is_deterministic_regardless_of_input_order() {
         let snap = OwnerSnapshot::empty(16);
-        let a = pod(1, DesiredPhase::Running, profile(4, 6));
-        let b = pod(2, DesiredPhase::Running, profile(8, 10));
+        let a = workload(1, DesiredPhase::Running, profile(4, 6));
+        let b = workload(2, DesiredPhase::Running, profile(8, 10));
 
         let s1 = DeviceDesiredState {
             generation: 7,
             system_revision: 1,
-            pods: vec![a.clone(), b.clone()],
+            workloads: vec![a.clone(), b.clone()],
         };
-        // same pods, reversed order
+        // same workloads, reversed order
         let s2 = DeviceDesiredState {
             generation: 7,
             system_revision: 1,
-            pods: vec![b, a],
+            workloads: vec![b, a],
         };
 
         let p1 = compose(&s1, &cap(), &snap, &[], 0, &[], 0).unwrap();
@@ -1050,8 +1051,8 @@ mod tests {
         assert_eq!(p1, p2);
         assert_eq!(p1.plan_digest, p2.plan_digest);
 
-        // pod 1 (lower uid) takes slot 1, module base 0; pod 2 slot 2.
-        assert_eq!(p1.assignments[0].pod_uid, uid(1));
+        // workload 1 (lower uid) takes slot 1, module base 0; workload 2 slot 2.
+        assert_eq!(p1.assignments[0].workload_uid, uid(1));
         assert_eq!(p1.assignments[0].slot, 1);
         assert_eq!(p1.assignments[0].module_base, 0);
         assert_eq!(p1.assignments[1].slot, 2);
@@ -1059,24 +1060,24 @@ mod tests {
     }
 
     #[test]
-    fn stopped_pods_are_not_placed() {
+    fn stopped_workloads_are_not_placed() {
         let snap = OwnerSnapshot::empty(16);
         let ds = DeviceDesiredState {
             generation: 1,
             system_revision: 1,
-            pods: vec![
-                pod(1, DesiredPhase::Stopped, profile(4, 4)),
-                pod(2, DesiredPhase::Running, profile(4, 4)),
+            workloads: vec![
+                workload(1, DesiredPhase::Stopped, profile(4, 4)),
+                workload(2, DesiredPhase::Running, profile(4, 4)),
             ],
         };
         let plan = compose(&ds, &cap(), &snap, &[], 0, &[], 0).unwrap();
         assert_eq!(plan.assignments.len(), 1);
-        assert_eq!(plan.assignments[0].pod_uid, uid(2));
+        assert_eq!(plan.assignments[0].workload_uid, uid(2));
     }
 
     #[test]
-    fn resident_workload_keeps_slot_new_pod_bumps_generation() {
-        // pod 2 already resides in slot 1 at generation 5.
+    fn resident_workload_keeps_slot_new_workload_bumps_generation() {
+        // workload 2 already resides in slot 1 at generation 5.
         let mut snap = OwnerSnapshot::empty(16);
         snap.slots[1] = SlotState {
             occupant: Some(uid(2)),
@@ -1085,25 +1086,25 @@ mod tests {
         let ds = DeviceDesiredState {
             generation: 2,
             system_revision: 1,
-            pods: vec![
-                pod(2, DesiredPhase::Running, profile(4, 4)),
-                pod(3, DesiredPhase::Running, profile(4, 4)),
+            workloads: vec![
+                workload(2, DesiredPhase::Running, profile(4, 4)),
+                workload(3, DesiredPhase::Running, profile(4, 4)),
             ],
         };
         let plan = compose(&ds, &cap(), &snap, &[], 0, &[], 0).unwrap();
         let a2 = plan
             .assignments
             .iter()
-            .find(|a| a.pod_uid == uid(2))
+            .find(|a| a.workload_uid == uid(2))
             .unwrap();
         let a3 = plan
             .assignments
             .iter()
-            .find(|a| a.pod_uid == uid(3))
+            .find(|a| a.workload_uid == uid(3))
             .unwrap();
-        // resident pod 2 keeps slot 1 + generation 5
+        // resident workload 2 keeps slot 1 + generation 5
         assert_eq!((a2.slot, a2.generation), (1, 5));
-        // new pod 3 takes the next free slot 2, generation 1 (fresh slot)
+        // new workload 3 takes the next free slot 2, generation 1 (fresh slot)
         assert_eq!((a3.slot, a3.generation), (2, 1));
     }
 
@@ -1118,7 +1119,7 @@ mod tests {
         let ds = DeviceDesiredState {
             generation: 3,
             system_revision: 1,
-            pods: vec![pod(7, DesiredPhase::Running, profile(4, 4))],
+            workloads: vec![workload(7, DesiredPhase::Running, profile(4, 4))],
         };
         let plan = compose(&ds, &cap(), &snap, &[], 0, &[], 0).unwrap();
         assert_eq!(plan.assignments[0].slot, 1);
@@ -1131,7 +1132,7 @@ mod tests {
         let ds = DeviceDesiredState {
             generation: 1,
             system_revision: 1,
-            pods: vec![pod(1, DesiredPhase::Running, profile(200, 4))],
+            workloads: vec![workload(1, DesiredPhase::Running, profile(200, 4))],
         };
         assert_eq!(
             compose(&ds, &cap(), &snap, &[], 0, &[], 0),
@@ -1149,9 +1150,9 @@ mod tests {
         let ds = DeviceDesiredState {
             generation: 1,
             system_revision: 1,
-            pods: vec![
-                pod(1, DesiredPhase::Running, profile(1, 1)),
-                pod(2, DesiredPhase::Running, profile(1, 1)),
+            workloads: vec![
+                workload(1, DesiredPhase::Running, profile(1, 1)),
+                workload(2, DesiredPhase::Running, profile(1, 1)),
             ],
         };
         assert_eq!(
@@ -1187,9 +1188,9 @@ mod tests {
         let ds = DeviceDesiredState {
             generation: 42,
             system_revision: 1,
-            pods: vec![
-                pod(1, DesiredPhase::Running, profile(4, 6)),
-                pod(2, DesiredPhase::Running, profile(8, 10)),
+            workloads: vec![
+                workload(1, DesiredPhase::Running, profile(4, 6)),
+                workload(2, DesiredPhase::Running, profile(8, 10)),
             ],
         };
         compose(&ds, &cap(), &snap, &[], 0, &[], 0).unwrap()
@@ -1254,7 +1255,7 @@ mod tests {
         let ds = DeviceDesiredState {
             generation: 43,
             system_revision: 1,
-            pods: vec![],
+            workloads: vec![],
         };
         // Build a plan with exactly 3 revocations via three graced removals.
         let mut with_revs = compose(
@@ -1322,8 +1323,8 @@ mod tests {
 
     #[test]
     fn compose_grants_charges_and_conflicts_leases() {
-        let exported_pod = |n: u8, port: u16, endpoints: u16| {
-            let mut p = pod(n, DesiredPhase::Running, profile(4, 6));
+        let exported_workload = |n: u8, port: u16, endpoints: u16| {
+            let mut p = workload(n, DesiredPhase::Running, profile(4, 6));
             p.profile.endpoints = endpoints;
             p.exports = vec![ExportDecl {
                 protocol: "TCP".into(),
@@ -1333,11 +1334,11 @@ mod tests {
         };
         let snap = OwnerSnapshot::empty(16);
 
-        // Grant: an export becomes a lease bound to the pod's (slot, gen).
+        // Grant: an export becomes a lease bound to the workload's (slot, gen).
         let ds = DeviceDesiredState {
             generation: 1,
             system_revision: 1,
-            pods: vec![exported_pod(1, 8080, 1)],
+            workloads: vec![exported_workload(1, 8080, 1)],
         };
         let plan = compose(&ds, &cap(), &snap, &[], 0, &[], 0).unwrap();
         assert_eq!(plan.leases.len(), 1);
@@ -1345,7 +1346,7 @@ mod tests {
         assert_eq!(plan.leases[0].slot, plan.assignments[0].slot);
 
         // Charge: more exports than admitted endpoints → EndpointsExceeded.
-        let mut greedy = exported_pod(2, 7000, 1);
+        let mut greedy = exported_workload(2, 7000, 1);
         greedy.exports.push(ExportDecl {
             protocol: "udp".into(),
             port: 7001,
@@ -1353,7 +1354,7 @@ mod tests {
         let ds = DeviceDesiredState {
             generation: 1,
             system_revision: 1,
-            pods: vec![greedy],
+            workloads: vec![greedy],
         };
         assert_eq!(
             compose(&ds, &cap(), &snap, &[], 0, &[], 0),
@@ -1364,7 +1365,7 @@ mod tests {
         let ds = DeviceDesiredState {
             generation: 1,
             system_revision: 1,
-            pods: vec![exported_pod(1, 8080, 1), exported_pod(2, 8080, 1)],
+            workloads: vec![exported_workload(1, 8080, 1), exported_workload(2, 8080, 1)],
         };
         assert_eq!(
             compose(&ds, &cap(), &snap, &[], 0, &[], 0),
@@ -1375,7 +1376,7 @@ mod tests {
         let ds = DeviceDesiredState {
             generation: 1,
             system_revision: 1,
-            pods: vec![exported_pod(1, 6443, 1)],
+            workloads: vec![exported_workload(1, 6443, 1)],
         };
         assert_eq!(
             compose(&ds, &cap(), &snap, &[], 0, &[6443], 0),
@@ -1387,7 +1388,7 @@ mod tests {
         let ds = DeviceDesiredState {
             generation: 1,
             system_revision: 1,
-            pods: vec![exported_pod(1, 0, 1)],
+            workloads: vec![exported_workload(1, 0, 1)],
         };
         assert_eq!(
             compose(&ds, &cap(), &snap, &[], 0, &[], 0),
@@ -1420,7 +1421,7 @@ mod tests {
     fn snap_from(plan: &CompositionPlan, max_owners: u16) -> OwnerSnapshot {
         let mut snap = OwnerSnapshot::empty(max_owners);
         for a in &plan.assignments {
-            snap.slots[a.slot as usize].occupant = Some(a.pod_uid);
+            snap.slots[a.slot as usize].occupant = Some(a.workload_uid);
             snap.slots[a.slot as usize].generation = a.generation;
         }
         for r in &plan.revocations {
@@ -1463,17 +1464,17 @@ mod tests {
     fn plan_with_revocations_round_trips_and_digest_guards_the_deadline() {
         let committed = sample_plan();
         let snap = snap_from(&committed, 16);
-        // Remove pod 1 with a 30 s grace at t=1000.
+        // Remove workload 1 with a 30 s grace at t=1000.
         let ds = DeviceDesiredState {
             generation: 43,
             system_revision: 1,
-            pods: vec![pod(2, DesiredPhase::Running, profile(8, 10))],
+            workloads: vec![workload(2, DesiredPhase::Running, profile(8, 10))],
         };
         let plan = compose(&ds, &cap(), &snap, &[(uid(1), 30)], 1000, &[], 0).unwrap();
         assert_eq!(plan.assignments.len(), 1);
         assert_eq!(plan.revocations.len(), 1);
         let rev = &plan.revocations[0];
-        assert_eq!(rev.assignment.pod_uid, uid(1));
+        assert_eq!(rev.assignment.workload_uid, uid(1));
         assert_eq!(rev.grace_secs, 30);
         assert_eq!(rev.deadline_unix, 1030);
 
@@ -1499,19 +1500,19 @@ mod tests {
         let survivor = *committed
             .assignments
             .iter()
-            .find(|a| a.pod_uid == uid(2))
+            .find(|a| a.workload_uid == uid(2))
             .unwrap();
         let departed = *committed
             .assignments
             .iter()
-            .find(|a| a.pod_uid == uid(1))
+            .find(|a| a.workload_uid == uid(1))
             .unwrap();
         let snap = snap_from(&committed, 16);
 
         let ds = DeviceDesiredState {
             generation: 43,
             system_revision: 1,
-            pods: vec![pod(2, DesiredPhase::Running, profile(8, 10))],
+            workloads: vec![workload(2, DesiredPhase::Running, profile(8, 10))],
         };
         let plan = compose(&ds, &cap(), &snap, &[(uid(1), 60)], 1000, &[], 0).unwrap();
         // The survivor's record is BYTE-identical (slot, gen, ranges).
@@ -1519,22 +1520,22 @@ mod tests {
         // The departed owner's ranges are still held by its revocation.
         assert_eq!(plan.revocations[0].assignment, departed);
 
-        // A new pod admitted during the drain first-fits AROUND the held
+        // A new workload admitted during the drain first-fits AROUND the held
         // ranges — it must not overlap the draining owner's modules.
         let snap2 = snap_from(&plan, 16);
         let ds2 = DeviceDesiredState {
             generation: 44,
             system_revision: 1,
-            pods: vec![
-                pod(2, DesiredPhase::Running, profile(8, 10)),
-                pod(3, DesiredPhase::Running, profile(4, 6)),
+            workloads: vec![
+                workload(2, DesiredPhase::Running, profile(8, 10)),
+                workload(3, DesiredPhase::Running, profile(4, 6)),
             ],
         };
         let plan2 = compose(&ds2, &cap(), &snap2, &[], 1001, &[], 0).unwrap();
         let newcomer = plan2
             .assignments
             .iter()
-            .find(|a| a.pod_uid == uid(3))
+            .find(|a| a.workload_uid == uid(3))
             .unwrap();
         let dep_end = departed.module_base + departed.module_count;
         let new_end = newcomer.module_base + newcomer.module_count;
@@ -1554,27 +1555,27 @@ mod tests {
         let departed = *committed
             .assignments
             .iter()
-            .find(|a| a.pod_uid == uid(1))
+            .find(|a| a.workload_uid == uid(1))
             .unwrap();
         let snap = snap_from(&committed, 16);
         let ds = DeviceDesiredState {
             generation: 43,
             system_revision: 1,
-            pods: vec![pod(2, DesiredPhase::Running, profile(8, 10))],
+            workloads: vec![workload(2, DesiredPhase::Running, profile(8, 10))],
         };
         let plan = compose(&ds, &cap(), &snap, &[(uid(1), 10)], 1000, &[], 0).unwrap();
         assert_eq!(plan.revocations.len(), 1, "live during the window");
 
-        // Recompose after deadline + settle: the record drops, and a new pod
+        // Recompose after deadline + settle: the record drops, and a new workload
         // may reuse the freed slot (post-expiry, at a bumped generation via the
         // high-water table — modeled here by the retained snapshot generation).
         let snap2 = snap_from(&plan, 16);
         let ds2 = DeviceDesiredState {
             generation: 44,
             system_revision: 1,
-            pods: vec![
-                pod(2, DesiredPhase::Running, profile(8, 10)),
-                pod(3, DesiredPhase::Running, profile(4, 6)),
+            workloads: vec![
+                workload(2, DesiredPhase::Running, profile(8, 10)),
+                workload(3, DesiredPhase::Running, profile(4, 6)),
             ],
         };
         let expired_now = 1000 + 10 + REVOCATION_SETTLE_SECS + 1;
@@ -1583,7 +1584,7 @@ mod tests {
         let newcomer = plan2
             .assignments
             .iter()
-            .find(|a| a.pod_uid == uid(3))
+            .find(|a| a.workload_uid == uid(3))
             .unwrap();
         assert_eq!(newcomer.slot, departed.slot, "slot freed by the calendar");
         assert!(
@@ -1594,25 +1595,25 @@ mod tests {
 
     #[test]
     fn revocations_charge_capacity_honestly() {
-        // Node with room for exactly 12 modules. One 8-module pod committed.
+        // Node with room for exactly 12 modules. One 8-module workload committed.
         let mut small = cap();
         small.max_modules = 12;
         let snap0 = OwnerSnapshot::empty(16);
         let ds0 = DeviceDesiredState {
             generation: 1,
             system_revision: 1,
-            pods: vec![pod(1, DesiredPhase::Running, profile(8, 4))],
+            workloads: vec![workload(1, DesiredPhase::Running, profile(8, 4))],
         };
         let committed = compose(&ds0, &small, &snap0, &[], 0, &[], 0).unwrap();
 
-        // Remove it with grace, and try to admit another 8-module pod during
+        // Remove it with grace, and try to admit another 8-module workload during
         // the window: the draining owner still holds its 8 modules, so the
         // node honestly reports exhaustion.
         let snap = snap_from(&committed, 16);
         let ds = DeviceDesiredState {
             generation: 2,
             system_revision: 1,
-            pods: vec![pod(2, DesiredPhase::Running, profile(8, 4))],
+            workloads: vec![workload(2, DesiredPhase::Running, profile(8, 4))],
         };
         assert_eq!(
             compose(&ds, &small, &snap, &[(uid(1), 60)], 1000, &[], 0),
@@ -1625,7 +1626,7 @@ mod tests {
         let ds_removed = DeviceDesiredState {
             generation: 2,
             system_revision: 1,
-            pods: vec![],
+            workloads: vec![],
         };
         let removal = compose(&ds_removed, &small, &snap, &[(uid(1), 60)], 1000, &[], 0).unwrap();
         assert_eq!(removal.revocations.len(), 1);
@@ -1633,7 +1634,7 @@ mod tests {
         let ds2 = DeviceDesiredState {
             generation: 3,
             system_revision: 1,
-            pods: vec![pod(2, DesiredPhase::Running, profile(8, 4))],
+            workloads: vec![workload(2, DesiredPhase::Running, profile(8, 4))],
         };
         assert_eq!(
             compose(&ds2, &small, &snap2, &[], 1000, &[], 0),

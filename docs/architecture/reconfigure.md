@@ -44,7 +44,9 @@ unchanged, so it appears in the new graph with the same binary,
 parameters, and wiring, is not asked to drain, and is not force-stopped.
 Its RAM state does not carry across: `prepare_graph` resets the state
 arena, the channel and buffer registries, and the name arena for every
-module in the graph, then re-instantiates each one through `module_new`.
+module in the graph, drops every provider layer a module registered, then
+re-instantiates each one through `module_new` (which registers its
+provider layers afresh).
 The status therefore predicts what the new graph looks like, not what
 the running instance keeps.
 
@@ -132,9 +134,9 @@ workload_modules:
 ```
 
 An entry is a type name, or `{ type: <name>, variant: <variant> }` to pick a
-build. Resident pods' types are packed the same way. One image carries one
+build. Resident workloads' types are packed the same way. One image carries one
 build of a type, so a variant must agree with the base graph's and every
-pod's.
+workload's.
 
 ## Drain-Then-Reset Model
 

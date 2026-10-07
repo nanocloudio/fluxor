@@ -18,8 +18,8 @@ use fluxor_contracts::log_ring::{read_ring_records, GapCursor, LogRecord, RingHe
 /// (validation rejects it), so this is unambiguous.
 pub const SYSTEM_UID: [u8; 16] = [0u8; 16];
 
-/// Parse an `--owner-uid` value: 32 hex chars (dashes allowed, as Kubernetes
-/// UIDs carry them) or the reserved literal `system`.
+/// Parse an `--owner-uid` value: 32 hex chars (dashes allowed, so a UID in
+/// the hyphenated 8-4-4-4-12 form is accepted) or the reserved literal `system`.
 pub fn parse_owner_uid(value: &str) -> Option<[u8; 16]> {
     if value.eq_ignore_ascii_case("system") {
         return Some(SYSTEM_UID);

@@ -305,7 +305,8 @@ cannot be evaluated from its own file reads `—` and says why.
 | Hardware sections: GPIO pins | `MAX_GPIO_CONFIGS` | src/kernel/boot/config.rs | 8 | Policy: pins configured from the config blob; a driver claims the rest at runtime |
 | Resident-workload section | `MAX_WORKLOAD_SECTION_BYTES` | src/kernel/boot/config.rs | 8192 | Sanity bound on a torn or hostile config tail; sized for a handful of workloads with room |
 | Tick period ceiling | `TICK_BOUND_MAX` | src/kernel/boot/config.rs | 50000 | Policy: the longest tick (µs) a config may ask for; above it the adaptive tick has nothing left to adapt and a stuck graph looks like a slow one |
-| Free-region list | `MAX_FREE_REGIONS` | src/kernel/module/loader.rs | 32 | Deliberate cap with a stated degradation: when the list is full a freed region is leaked until the next full arena reset, which is what a reconfigure does anyway |
+| Buffer-arena free-region list | `MAX_FREE_REGIONS` | src/kernel/ipc/buffer_pool.rs | 128 | Deliberate cap with a stated degradation: returned regions are kept coalesced, so the list holds one entry per gap in the arena, not per closed channel; a region returned while it is full is leaked (reported by `buffer_free_list_usage`) until the next `reset_buffer_arena` |
+| State-arena free-region list | `MAX_FREE_REGIONS` | src/kernel/module/loader.rs | 32 | Deliberate cap with a stated degradation: when the list is full a freed region is leaked until the next full arena reset, which is what a reconfigure does anyway |
 | Isolated-image arena | `ISO_ARENA_SIZE` | src/kernel/module/loader.rs | 2097152 | Policy (`kernel-vm`): all isolated module state and heap of one image; exhaustion refuses the load |
 | Tracked provider handles | `MAX_TRACKED` | src/kernel/module/provider.rs | 128 | Policy: handle-to-owner bindings the kernel keeps for cross-owner checks; an open past it is refused, and the table is scanned on every provider call, so it is kept small on purpose |
 | Provider vtables | `MAX_PROVIDERS` | src/kernel/module/provider.rs | 64 | Derived, not chosen: one vtable slot per contract id, so a contract registerable in one and not the other is impossible by construction |
@@ -631,6 +632,7 @@ MAX_PIO_CONFIGS | src/kernel/boot/config.rs | 3 | *
 MAX_GPIO_CONFIGS | src/kernel/boot/config.rs | 8 | *
 MAX_WORKLOAD_SECTION_BYTES | src/kernel/boot/config.rs | 8 * 1024 | *
 TICK_BOUND_MAX | src/kernel/boot/config.rs | 50_000 | *
+MAX_FREE_REGIONS | src/kernel/ipc/buffer_pool.rs | 128 | *
 MAX_FREE_REGIONS | src/kernel/module/loader.rs | 32 | *
 ISO_ARENA_SIZE | src/kernel/module/loader.rs | 2 * 1024 * 1024 | kernel-vm
 MAX_TRACKED | src/kernel/module/provider.rs | 128 | *

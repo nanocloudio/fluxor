@@ -1,0 +1,22 @@
+version = "1.0.0"
+hardware_targets = ["bcm2712"]
+
+# The body of the churn workload (tests/hardware/pi5_workload_churn.toml).
+# `mode: source` writes a little-endian u32 step counter on `data_out` every step;
+# `mode: relay` copies whatever arrives on `data_in` to `data_out`. The churn workload is
+# source -> relay -> the driver's lane, so a counter reaching the driver proves
+# both modules were spliced, stepped, and joined by a live channel.
+
+[[ports]]
+name = "data_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "data_out"
+direction = "output"
+content_type = "OctetStream"
+
+# Module-scope observability — exempt (standards/observability.md §6).
+[observability]
+exempt = "churn workload body; silent by design — the driver reports what reaches its lane"

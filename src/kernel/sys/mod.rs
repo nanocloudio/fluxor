@@ -8,4 +8,5 @@ pub mod incarnation;
 pub mod log_ring;
 pub mod resource_ledger;
 pub mod telemetry_ring;
+pub mod time_sync;
 pub mod wall_clock;

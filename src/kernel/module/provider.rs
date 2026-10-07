@@ -1029,6 +1029,30 @@ pub fn register_module_provider(
     0
 }
 
+/// Drop every module-registered provider layer and owner-release
+/// subscription, keeping the kernel's own dispatchers. A full graph rebuild
+/// (`prepare_graph`) calls this: the modules that registered those layers
+/// are gone, their state arena is reset and reused, and the rebuild never
+/// runs their finish path. A layer left in place would stay the default
+/// provider — old code called against reused state — and the new instance
+/// landing in the same slot would be refused `EBUSY` when it registers.
+/// Routed handles minted through those layers are dropped by
+/// `reset_handle_tracking`, which the rebuild runs first.
+pub fn reset_module_layers() {
+    // SAFETY: rebuild path, scheduler thread, peers parked.
+    unsafe {
+        let p = &raw mut PROVIDERS;
+        for entry in (*p).iter_mut() {
+            for layer in entry.chain.iter_mut() {
+                *layer = None;
+            }
+            entry.depth = 0;
+        }
+        let o = &raw mut OWNER_RELEASE_OBSERVERS;
+        *o = crate::kernel::workload::bitmask::ModuleMask::new();
+    }
+}
+
 /// Release all module providers owned by a given module index.
 /// Called on module finish (Done/Error) for cleanup.
 /// Compacts chains to maintain stack ordering.

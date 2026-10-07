@@ -4,7 +4,7 @@
 //!
 //! Usage: cargo run -p fluxor-tools --example emit_plan -- <out-path>
 //!
-//! Composes a single-pod plan that owns module index 0 (matching a 1-module
+//! Composes a single-workload plan that owns module index 0 (matching a 1-module
 //! graph like examples/hello/linux.yaml), then writes the encoded plan blob.
 
 #![allow(
@@ -14,7 +14,7 @@
 
 use fluxor_tools::compose::{
     compose, encode_plan, DesiredPhase, DeviceDesiredState, NodeCapacity, OwnerSnapshot,
-    PodDesired, ResourceProfile,
+    ResourceProfile, WorkloadDesired,
 };
 
 fn main() {
@@ -22,10 +22,10 @@ fn main() {
         .nth(1)
         .expect("usage: emit_plan <out-path>");
 
-    let mut pod_uid = [0u8; 16];
-    pod_uid[0] = 0xaa;
-    let pod = PodDesired {
-        pod_uid,
+    let mut workload_uid = [0u8; 16];
+    workload_uid[0] = 0xaa;
+    let workload = WorkloadDesired {
+        workload_uid,
         namespace: "default".into(),
         name: "demo".into(),
         workload_digest: [0u8; 32],
@@ -44,7 +44,7 @@ fn main() {
     let ds = DeviceDesiredState {
         generation: 1,
         system_revision: 1,
-        pods: vec![pod],
+        workloads: vec![workload],
     };
     let cap = NodeCapacity {
         max_owners: 16,

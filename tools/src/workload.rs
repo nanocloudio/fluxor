@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::compose::{PodUid, ResourceProfile};
+use crate::compose::{ResourceProfile, WorkloadUid};
 use crate::service_params::ParamSpec;
 
 fn default_role() -> String {
@@ -484,33 +484,33 @@ pub fn select_implementation<'a>(
 }
 
 // ============================================================================
-// Deterministic subgraph namespacing: each pod's modules are qualified into a
-// per-pod namespace before they join the single device graph
+// Deterministic subgraph namespacing: each workload's modules are qualified into a
+// per-workload namespace before they join the single device graph
 // ============================================================================
 
-/// Qualify a pod-local module name into its globally-unique composed-graph name
-/// `pod/<namespace>/<pod-uid-hex>/<module>`. Deterministic and collision-free
-/// across pods (the Pod UID disambiguates), so two pods can declare a module of
+/// Qualify a workload-local module name into its globally-unique composed-graph name
+/// `workload/<namespace>/<workload-uid-hex>/<module>`. Deterministic and collision-free
+/// across workloads (the Workload UID disambiguates), so two workloads can declare a module of
 /// the same local name without clashing in the composed device graph.
-pub fn qualify_module(namespace: &str, pod_uid: &PodUid, module: &str) -> String {
+pub fn qualify_module(namespace: &str, workload_uid: &WorkloadUid, module: &str) -> String {
     use std::fmt::Write;
     let mut hex = String::with_capacity(32);
-    for b in pod_uid {
+    for b in workload_uid {
         let _ = write!(hex, "{b:02x}");
     }
-    format!("pod/{namespace}/{hex}/{module}")
+    format!("workload/{namespace}/{hex}/{module}")
 }
 
 /// Qualify every module in an implementation, in manifest-declaration order
 /// (deterministic — the order feeds the composition layout).
 pub fn qualify_implementation_modules(
     namespace: &str,
-    pod_uid: &PodUid,
+    workload_uid: &WorkloadUid,
     imp: &Implementation,
 ) -> Vec<String> {
     imp.modules
         .iter()
-        .map(|m| qualify_module(namespace, pod_uid, &m.name))
+        .map(|m| qualify_module(namespace, workload_uid, &m.name))
         .collect()
 }
 
@@ -694,10 +694,10 @@ mod tests {
         let n1 = qualify_module("default", &uid_a, "protocol_router");
         let n2 = qualify_module("default", &uid_a, "protocol_router");
         assert_eq!(n1, n2, "deterministic");
-        assert!(n1.starts_with("pod/default/ab"));
+        assert!(n1.starts_with("workload/default/ab"));
         assert!(n1.ends_with("/protocol_router"));
 
-        // same local name, different pods → distinct qualified names
+        // same local name, different workloads → distinct qualified names
         let other = qualify_module("default", &uid_b, "protocol_router");
         assert_ne!(n1, other);
 

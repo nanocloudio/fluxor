@@ -403,8 +403,11 @@ capability = "time.wall"
 ```
 
 Which targets provide `time.wall` follows the HAL: a hosted Linux runtime
-queries `adjtimex(2)` and reports `network_sync`; the bare-metal and
-browser platforms have no synchronisation evidence and provide nothing. A
+queries `adjtimex(2)` and reports `network_sync`; bcm2712, which has no
+RTC, reports `network_sync` once an in-graph time client (the `sntp`
+foundation module) anchors its clock through `timer::DISCIPLINE`, and
+stops reporting it an hour after the last anchor; the RP and browser
+platforms have no synchronisation evidence and provide nothing. A
 target that gains a time source gains the row, and the table states the
 same facts as the platform HALs it describes.
 

@@ -410,10 +410,10 @@ mod scheduler_validation_tests {
     }
 
     #[test]
-    fn multi_graph_pods_exceeding_pacer_table_rejected() {
-        // Resident graphs (base + `pods:`) × domains must fit the kernel's
+    fn multi_graph_workloads_exceeding_pacer_table_rejected() {
+        // Resident graphs (base + `workloads:`) × domains must fit the kernel's
         // static GRAPH_PACERS table (16 slots). A base
-        // graph (1 domain) plus 16 single-domain pods = 17 instances → reject.
+        // graph (1 domain) plus 16 single-domain workloads = 17 instances → reject.
         let modules = vec![json!({"name": "m", "type": "passthrough"})];
         let names = vec!["main".to_string()];
         let ticks = vec![100u16];
@@ -422,10 +422,10 @@ mod scheduler_validation_tests {
             "name": "main", "cores": [0], "adaptive_flags": 1,
             "tick_min_us": 100, "tick_max_us": 8000
         });
-        let pods_over: Vec<_> = (0..16)
+        let workloads_over: Vec<_> = (0..16)
             .map(|i| json!({"modules": [{"name": format!("p{i}"), "type": "passthrough", "domain": 0}]}))
             .collect();
-        let cfg_over = json!({"execution": {"domains": [domain.clone()]}, "pods": pods_over});
+        let cfg_over = json!({"execution": {"domains": [domain.clone()]}, "workloads": workloads_over});
         // resolved_target None ⇒ event-driven (Linux); skips the bcm wake-policy
         // gate so this isolates the pacer-table gate.
         let err = validate_adaptive_tick(
@@ -445,11 +445,11 @@ mod scheduler_validation_tests {
             "expected the pacer-table overflow diagnostic, got: {err:?}"
         );
 
-        // 3 pods → 1 (base) + 3 = 4 instances → fits.
-        let pods_ok: Vec<_> = (0..3)
+        // 3 workloads → 1 (base) + 3 = 4 instances → fits.
+        let workloads_ok: Vec<_> = (0..3)
             .map(|i| json!({"modules": [{"name": format!("p{i}"), "type": "passthrough", "domain": 0}]}))
             .collect();
-        let cfg_ok = json!({"execution": {"domains": [domain]}, "pods": pods_ok});
+        let cfg_ok = json!({"execution": {"domains": [domain]}, "workloads": workloads_ok});
         validate_adaptive_tick(
             &cfg_ok,
             &modules,
@@ -464,10 +464,10 @@ mod scheduler_validation_tests {
     }
 
     #[test]
-    fn multi_graph_pods_overflow_rejected_without_adaptive_flags() {
+    fn multi_graph_workloads_overflow_rejected_without_adaptive_flags() {
         // The pacer-table gate must run even when NO domain sets adaptive_flags:
         // the runtime keys/steps the resident-graph table for any multi-graph
-        // config (fixed-tick too), so an overflowing `pods:` set with no adaptive
+        // config (fixed-tick too), so an overflowing `workloads:` set with no adaptive
         // flags must still be rejected, not silently dropped at runtime.
         let modules = vec![json!({"name": "m", "type": "passthrough"})];
         let names = vec!["main".to_string()];
@@ -475,10 +475,10 @@ mod scheduler_validation_tests {
         let manifests = std::collections::HashMap::new();
         // domain with NO adaptive_flags (fixed-tick).
         let domain = json!({"name": "main", "cores": [0]});
-        let pods_over: Vec<_> = (0..16)
+        let workloads_over: Vec<_> = (0..16)
             .map(|i| json!({"modules": [{"name": format!("p{i}"), "type": "passthrough", "domain": 0}]}))
             .collect();
-        let cfg_over = json!({"execution": {"domains": [domain.clone()]}, "pods": pods_over});
+        let cfg_over = json!({"execution": {"domains": [domain.clone()]}, "workloads": workloads_over});
         let err = validate_adaptive_tick(
             &cfg_over,
             &modules,
@@ -497,11 +497,11 @@ mod scheduler_validation_tests {
              flags, got: {err:?}"
         );
 
-        // 2 fixed-tick pods → 1 + 2 = 3 instances → fits.
-        let pods_ok: Vec<_> = (0..2)
+        // 2 fixed-tick workloads → 1 + 2 = 3 instances → fits.
+        let workloads_ok: Vec<_> = (0..2)
             .map(|i| json!({"modules": [{"name": format!("p{i}"), "type": "passthrough", "domain": 0}]}))
             .collect();
-        let cfg_ok = json!({"execution": {"domains": [domain]}, "pods": pods_ok});
+        let cfg_ok = json!({"execution": {"domains": [domain]}, "workloads": workloads_ok});
         validate_adaptive_tick(
             &cfg_ok,
             &modules,
@@ -516,9 +516,9 @@ mod scheduler_validation_tests {
     }
 
     #[test]
-    fn multi_graph_isr_tier_pod_rejected() {
-        // A pod module placed in an ISR-tier domain (tier 1b/2) must be rejected
-        // at emit time — the FLXA codec carries no ISR metadata and pod admission
+    fn multi_graph_isr_tier_workload_rejected() {
+        // A workload module placed in an ISR-tier domain (tier 1b/2) must be rejected
+        // at emit time — the FLXA codec carries no ISR metadata and workload admission
         // runs after ISR registration, so it would never execute.
         let tmp = std::env::temp_dir();
         // Domain 1 is tier 1b (isr_timer, exec_mode 2); domain 0 cooperative.
@@ -527,13 +527,13 @@ mod scheduler_validation_tests {
                 {"name": "coop", "cores": [0]},
                 {"name": "isrd", "cores": [1], "tier": "1b"}
             ]},
-            "pods": [{"modules": [{"name": "p", "type": "pod_pic_mod", "domain": "isrd"}]}]
+            "workloads": [{"modules": [{"name": "p", "type": "workload_pic_mod", "domain": "isrd"}]}]
         });
-        let err = build_pod_section(&cfg_isr, test_loc(&tmp), &[])
-            .expect_err("an ISR-tier pod placement must be rejected");
+        let err = build_workload_section(&cfg_isr, test_loc(&tmp), &[])
+            .expect_err("an ISR-tier workload placement must be rejected");
         assert!(
             format!("{err:?}").contains("ISR-tier"),
-            "expected the ISR-tier pod rejection diagnostic, got: {err:?}"
+            "expected the ISR-tier workload rejection diagnostic, got: {err:?}"
         );
 
         // Same module in the cooperative domain is accepted (reaches schema/emit).
@@ -542,26 +542,26 @@ mod scheduler_validation_tests {
                 {"name": "coop", "cores": [0]},
                 {"name": "isrd", "cores": [1], "tier": "1b"}
             ]},
-            "pods": [{"modules": [{"name": "p", "type": "pod_pic_mod", "domain": "coop"}]}]
+            "workloads": [{"modules": [{"name": "p", "type": "workload_pic_mod", "domain": "coop"}]}]
         });
-        build_pod_section(&cfg_ok, test_loc(&tmp), &[])
-            .expect("a cooperative-domain pod placement must be accepted");
+        build_workload_section(&cfg_ok, test_loc(&tmp), &[])
+            .expect("a cooperative-domain workload placement must be accepted");
     }
 
     #[test]
-    fn multi_graph_duplicate_pod_local_name_rejected() {
-        // Two modules sharing a pod-local name would silently overwrite the
+    fn multi_graph_duplicate_workload_local_name_rejected() {
+        // Two modules sharing a workload-local name would silently overwrite the
         // wiring map (`name_to_local`) and mis-route edges. Must be rejected.
         let tmp = std::env::temp_dir();
         let cfg = json!({
             "execution": {"domains": [{"name": "coop", "cores": [0]}]},
-            "pods": [{"modules": [
-                {"name": "dup", "type": "pod_pic_mod", "domain": "coop"},
-                {"name": "dup", "type": "pod_pic_mod2", "domain": "coop"}
+            "workloads": [{"modules": [
+                {"name": "dup", "type": "workload_pic_mod", "domain": "coop"},
+                {"name": "dup", "type": "workload_pic_mod2", "domain": "coop"}
             ]}]
         });
-        let err = build_pod_section(&cfg, test_loc(&tmp), &[])
-            .expect_err("duplicate pod-local module names must be rejected");
+        let err = build_workload_section(&cfg, test_loc(&tmp), &[])
+            .expect_err("duplicate workload-local module names must be rejected");
         assert!(
             format!("{err:?}").contains("duplicate module name"),
             "expected the duplicate-name diagnostic, got: {err:?}"

@@ -48,6 +48,8 @@ The foundation layer covers:
 - **Networking** (`ip` — which includes the DHCP client — plus `dns`,
   `tls`, `quic`); application-protocol clients and servers (`http`,
   `mqtt`, …) live in sibling projects that consume them
+- **Time** (`sntp`, which anchors the wall clock of a board with no RTC
+  through `timer::DISCIPLINE` once a quorum of NTP servers agree)
 - **Network-plane hygiene** (`conn_guard` for TCP-SYN connection-rate
   filtering, `demux` for 4-tuple hashed frame fan-out to replicated IP
   lanes, `conn_demux` for per-connection fan-out to parallel TLS

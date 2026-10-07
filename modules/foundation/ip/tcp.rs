@@ -126,7 +126,7 @@ pub struct TcpConn {
     pub remote_ip: u32,
 
     /// Local-address slot this conn is reached at / sources from. Index into
-    /// `IpState::local_addrs`; `0` = primary (today's `local_ip`). Accepted
+    /// `IpState::local_addrs`; `0` = primary (`local_ip`). Accepted
     /// conns latch the slot the inbound dst-IP matched; outbound connects use
     /// slot 0; listeners and datagram endpoints carry `LOCAL_SLOT_ANY`
     /// (wildcard — reachable at every local address). The tuple match
@@ -184,7 +184,7 @@ pub struct TcpConn {
     /// slot (net_proto's release rule, `CLOSED_ID_GRACE_MS`).
     pub closewait_timer: u16,
 
-    // NewReno congestion control (§4.2)
+    // NewReno congestion control
     pub cwnd: u16,         // congestion window (bytes)
     pub ssthresh: u16,     // slow-start threshold
     pub dup_ack_count: u8, // consecutive duplicate ACKs
@@ -200,9 +200,12 @@ pub struct TcpConn {
     pub rtt_start: u16,
     pub rtt_active: bool,
 
-    // Dynamic receive window bookkeeping (§4.3). `delivered_bytes` is the
-    // total written to the consumer channel for this connection;
-    // `consumed_bytes` tracks what the consumer has read.
+    // Receive bookkeeping, carried in the continuity checkpoint.
+    // `delivered_bytes` is the total written to the consumer channel for
+    // this connection; `consumed_bytes` is `delivered_bytes` as of the last
+    // window update (`update_rcv_wnd`). Their difference is how far RCV.NXT
+    // has moved into the window advertised then, which is what keeps that
+    // window's right edge from moving back (`hold_right_edge`).
     pub delivered_bytes: u32,
     pub consumed_bytes: u32,
 
@@ -238,7 +241,7 @@ pub struct TcpConn {
     pub trace_id: [u8; 16],
     pub span_id: [u8; 8],
 
-    // Bounded reorder buffer (§4.1). Per-slot payload storage lives in
+    // Bounded reorder buffer. Per-slot payload storage lives in
     // `reorder_buf`; metadata in `reorder_slots`.
     pub reorder_slots: [ReorderSlot; REORDER_SLOTS],
     pub reorder_buf: [u8; REORDER_SLOTS * REORDER_SLOT_BYTES],
@@ -311,27 +314,38 @@ pub const MSS: u16 = 1460;
 /// brings sub-RTT HTTP responses into the same ballpark.
 pub const INITIAL_CWND: u16 = 10 * MSS;
 
-/// Starting receive window. Grows dynamically up to MAX_RCV_WND.
+/// Receive window advertised from the handshake until the first delivery;
+/// from then on `update_rcv_wnd` sizes it from consumer-ring room, up to
+/// `MAX_RCV_WND`.
 pub const INITIAL_RCV_WND: u16 = 2048;
 
 /// Upper bound on the advertised receive window. Bounds how many bytes
 /// the peer may have in flight to us.
 ///
-/// **aarch64** — 4 KiB, held below the smallest consumer ring (8 KiB)
-/// so a compliant peer can never have more in flight than a single
-/// delivery pass absorbs: the ring-full/zero-window recovery path
-/// corrupts bulk inbound streams on bcm2712 (open defect), and a
-/// window under one ring never enters it. Bulk-download throughput is
-/// bounded by the 1 ms tick either way; the `update_rcv_wnd`
-/// self-throttle still closes the window under consumer backpressure.
+/// **aarch64** — 4 KiB. The bound is the frame ring INTO `ip`
+/// (`frames_rx`, 32 KiB on bcm2712): every connection's in-flight window
+/// lands in that one ring, and windows that together exceed it overrun it
+/// under concurrent bulk receive — the NIC drops frames and every connection
+/// waits out a retransmit. `update_rcv_wnd` shares the window against the
+/// consumer ring only, so this ceiling is what keeps the sum of windows
+/// of a few concurrent bulk receivers inside the ingress ring.
 ///
-/// **rp2350 / rp2040 / wasm32** — 8 KiB. Original embedded budget;
-/// bumping further would inflate per-`TcpConn` reorder bookkeeping
-/// past the 16 KiB stack budget.
+/// **rp2350 / rp2040 / wasm32** — 8 KiB.
 #[cfg(target_arch = "aarch64")]
 pub const MAX_RCV_WND: u16 = 4096;
 #[cfg(not(target_arch = "aarch64"))]
 pub const MAX_RCV_WND: u16 = 8192;
+
+/// The window to advertise: the larger of `share`, what the receive ring can
+/// take now, and what is left of the window last advertised, `prev`, after
+/// `advanced` bytes have been delivered into it. The second term is what
+/// keeps the right edge (RCV.NXT + RCV.WND) from moving back: a window,
+/// once offered, is spent down by delivery, not withdrawn. A `prev` of zero
+/// (a window a full ring closed) holds nothing.
+pub fn hold_right_edge(prev: u16, advanced: u32, share: u16) -> u16 {
+    let left = (prev as u32).saturating_sub(advanced);
+    (left as u16).max(share)
+}
 
 /// Initial retransmission timeout in step ticks (≈1 s at 1 kHz).
 pub const RTO_INITIAL: u16 = 1000;
@@ -740,7 +754,7 @@ pub fn apply_window_update(conn: &mut TcpConn, seq: u32, ack: u32, wnd: u16) {
 }
 
 // ============================================================================
-// Reorder buffer (§4.1)
+// Reorder buffer
 // ============================================================================
 
 /// Store an out-of-order segment in the reorder buffer. Returns true if the
@@ -854,7 +868,7 @@ pub unsafe fn reorder_consume_at(conn: &mut TcpConn, seq: u32) {
 }
 
 // ============================================================================
-// Congestion control (§4.2) — NewReno
+// Congestion control — NewReno
 // ============================================================================
 
 /// Minimum useful cwnd per RFC 5681 after a loss event.

@@ -109,11 +109,11 @@ default = ["chip-rp2350b"]
 # lib alone.
 embedded-platform = []
 
-# Multi-Pod workload ownership.
+# Multi-owner workload ownership.
 # When OFF, `MAX_OWNERS == 1`, the owner table collapses to a single system
 # slot, owner fields on graph objects compile out, and the authorization
 # helpers become no-ops — so single-tenant bare-metal targets (rp*) carry no
-# ownership cost. Enabled by the multi-Pod targets (bcm2712, host-linux).
+# ownership cost. Enabled by the multi-owner targets (bcm2712, host-linux).
 multitenant = ["fluxor-contracts/alloc"]
 
 # Test-only: bcm2712 fires a one-shot graph rebuild ~5 s after boot so the
@@ -122,7 +122,7 @@ multitenant = ["fluxor-contracts/alloc"]
 test-rebuild = []
 
 # Test-only: bcm2712 stages an embedded owner plan at boot so the staged-plan
-# apply path (per-Pod ownership) can be observed on hardware. Never shipped.
+# apply path (per-workload ownership) can be observed on hardware. Never shipped.
 test-plan = []
 
 # RP-family silicon support: register layers, generated facts, the boot

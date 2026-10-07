@@ -1,7 +1,7 @@
 //! Owner-pause driver — base-graph half of the metal PAUSE silicon AC.
 //!
 //! Runs in the SYSTEM graph and drives one pause→resume cycle against a
-//! resident pod's owner via the OWNER_PAUSE / OWNER_RESUME live-mutation
+//! resident workload's owner via the OWNER_PAUSE / OWNER_RESUME live-mutation
 //! ops (0x0C49/0x0C4A, beside APPLY_ADD/FREE_OWNER):
 //!
 //!   at `pause_at_ms`  → OWNER_PAUSE  `[slot:u16 LE][generation:u32 LE]`
@@ -9,10 +9,10 @@
 //!
 //! Logs `[pdrv] pause ms=<t> rc=<rc>` / `[pdrv] resume ms=<t> rc=<rc>`
 //! and a periodic `[pdrv] hb ms=<t>` heartbeat proving the SYSTEM graph
-//! keeps stepping throughout the pod's pause window. The paired
-//! `pause_probe` inside the pod logs the freeze (`[pprobe] gap_ms=…`).
+//! keeps stepping throughout the workload's pause window. The paired
+//! `pause_probe` inside the workload logs the freeze (`[pprobe] gap_ms=…`).
 //!
-//! The boot-admitted first pod deterministically owns slot 1 at
+//! The boot-admitted first workload deterministically owns slot 1 at
 //! generation 1 (lowest-free-slot + fresh monotonic generation), which
 //! the defaults encode; override via params for other topologies.
 
@@ -49,7 +49,7 @@ include!("../../sdk/runtime/params.rs");
 #[repr(C)]
 struct State {
     syscalls: *const SyscallTable,
-    /// Target owner handle (defaults: first boot-admitted pod).
+    /// Target owner handle (defaults: first boot-admitted workload).
     slot: u32,
     generation: u32,
     /// Wall-clock schedule (ms since boot).
@@ -206,7 +206,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             return 0;
         }
         // System-graph liveness heartbeat — must keep appearing while the
-        // pod is paused (co-resident isolation).
+        // workload is paused (co-resident isolation).
         if now.saturating_sub(s.last_hb_ms) >= s.hb_every_ms as u64 {
             s.last_hb_ms = now;
             emit(sys, b"hb", now, 0);

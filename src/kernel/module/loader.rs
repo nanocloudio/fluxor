@@ -5,10 +5,12 @@
 //!
 //! ## Concurrency
 //!
-//! Every `static mut` in this file is a boot-only datum: written by
-//! core 0 during `prepare_graph` / `instantiate_one_module`, then read
-//! only via `state_arena_usage()`. Reconfigure parks secondary cores
-//! before re-entering this code. See `docs/architecture/concurrency.md`.
+//! Every `static mut` in this file is written only on core 0: graph build
+//! (`prepare_graph` / `instantiate_one_module`), live graph changes (which
+//! quiesce the peer cores), and the block-lend ledger releasing a
+//! quarantined module's memory. No other core allocates or frees module
+//! state, so the state arena needs no lock; other cores read only the
+//! word-sized occupancy figures. See `docs/architecture/concurrency.md`.
 use crate::abi::SyscallTable;
 use crate::fnv1a32;
 use crate::kernel::boot::config::read_layout;
@@ -96,8 +98,7 @@ pub const MAX_MODULES_BLOB_SIZE: usize = 8 * 1024 * 1024;
 /// Channel buffers are allocated from a separate arena in buffer_pool.rs,
 /// so this entire budget is available for module state.
 ///
-/// Module state arena size — from silicon TOML [kernel] section.
-/// RP2350: 240 KB, RP2040: 64 KB.
+/// Module state arena size — the silicon TOML's `[kernel] state_arena_kb`.
 const STATE_ARENA_SIZE: usize = crate::kernel::config::STATE_ARENA_SIZE;
 // Pending modules hold a pointer to the static PARAM_BUFFER rather than a
 // copy, so no parameter blob is truncated to a fixed bound.
@@ -113,11 +114,10 @@ pub use crate::abi::wire::ABI_VERSION as MODULE_ABI_VERSION;
 // the module ABI version above: the table envelope, the per-module
 // header envelope, and the manifest each carry their own version byte,
 // written by the pack tool (`tools/src/modules.rs` TABLE_VERSION /
-// `tools/src/manifest.rs` MANIFEST_VERSION). The kernel pins them to v1
-// and rejects anything else — the project stays on v1 across all sibling
-// consumers until v1 is formally cut, so a non-1 byte means a corrupt or
-// forward-incompatible artifact, not a format we can parse. They share a
-// value today but are named distinctly so they can diverge per-axis.
+// `tools/src/manifest.rs` MANIFEST_VERSION). The kernel accepts exactly
+// the value each axis defines and rejects anything else: any other byte is
+// a corrupt artifact, not a format it can parse. They share a value but are
+// named distinctly because they are distinct axes.
 /// Module-table envelope format version (`ModuleTableHeader.version`).
 pub const EXPECTED_TABLE_VERSION: u8 = 1;
 /// Per-module header envelope format version (`ModuleHeader.version`,
@@ -881,7 +881,7 @@ const STATE_CANARY_SIZE: usize = 4;
 /// `write_bytes(ptr, 0, size)` would then overrun by the original
 /// huge `size`.
 pub fn alloc_state(size: usize) -> Result<*mut u8, LoaderError> {
-    // SAFETY: Single-threaded embedded context, no concurrent access
+    // SAFETY: core 0 only (module header), so nothing else touches the arena.
     unsafe {
         let need = size
             .checked_add(STATE_CANARY_SIZE)
@@ -1007,8 +1007,10 @@ pub fn validate_state_canary(ptr: *const u8, size: usize) -> bool {
         core::ptr::read_unaligned(canary_ptr) == STATE_CANARY
     }
 }
-/// Return high-water mark: (used_bytes, total_bytes). Does not reflect
-/// free-list holes — live memory is (used − Σ holes).
+/// State-arena occupancy: `(used_bytes, total_bytes)`, where `used_bytes` is
+/// the bump high-water mark. Holes a freed module left below it are inside
+/// that figure (`state_free_list_usage` reports them): live memory is
+/// `used − Σ holes`.
 pub fn arena_usage() -> (usize, usize) {
     // SAFETY: word-sized read of static usize.
     unsafe { (STATE_ARENA_OFFSET, STATE_ARENA_SIZE) }
@@ -1107,7 +1109,7 @@ pub fn reset_state_arena() {
     // Every module's memory goes at once, and the ledger of buffers lent
     // from it with it.
     crate::kernel::module::block_lend::reset();
-    // SAFETY: Single-threaded embedded context
+    // SAFETY: core 0 only (module header), at a rebuild: no module is live.
     unsafe {
         STATE_ARENA_OFFSET = 0;
         FREE_COUNT = 0;
@@ -1120,15 +1122,19 @@ pub fn reset_state_arena() {
         // Content is not zeroed; alloc_state zeros each allocation.
     }
 }
-/// Current state-arena occupancy: `(used_bytes, total_bytes)`. The
-/// "used" figure is the bump high-water mark — it doesn't subtract
-/// holes the free list could re-use, so it overestimates live bytes
-/// when modules have been freed (which only happens at full
-/// `reset_state_arena`). Read by `scheduler::finalize_instantiation_accounting` for
-/// post-instantiation telemetry.
-pub fn state_arena_usage() -> (usize, usize) {
-    // SAFETY: word-sized read of static usize.
-    unsafe { (STATE_ARENA_OFFSET, STATE_ARENA_SIZE) }
+/// Free-list occupancy: `(holes, hole_bytes)` — the regions below the
+/// high-water mark a later allocation can reuse. A full list
+/// (`MAX_FREE_REGIONS`) leaks the next freed region that cannot merge into
+/// one already held, so live churn telemetry reports it beside the
+/// high-water mark.
+pub fn state_free_list_usage() -> (usize, usize) {
+    // SAFETY: scheduler-thread reads of the free-list statics.
+    unsafe {
+        let list = &*core::ptr::addr_of!(FREE_LIST);
+        let n = FREE_COUNT;
+        let bytes = list[..n].iter().map(|r| r.size as usize).sum();
+        (n, bytes)
+    }
 }
 // ============================================================================
 // Table types
@@ -1811,9 +1817,8 @@ impl ModuleLoader {
         blob_len: usize,
         header: &ModuleTableHeader,
     ) -> Result<(), LoaderError> {
-        // Table-format envelope version. The project stays on v1; a
-        // different byte is a corrupt or forward-incompatible artifact
-        // we must not parse with v1 field offsets.
+        // Table-format envelope version: any other byte is a corrupt
+        // artifact we must not parse with these field offsets.
         if header.version != EXPECTED_TABLE_VERSION {
             log::error!(
                 "[loader] module-table version={} expected={EXPECTED_TABLE_VERSION}",
@@ -1989,8 +1994,8 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<Signing, Loa
     }
     // Check module-header envelope format version (a separate axis from
     // `abi_version` above — the syscall-table ABI vs the on-disk header
-    // layout). v1-only; a different byte is a corrupt or forward-format
-    // header we must not parse with v1 field offsets.
+    // layout). Any other byte is a corrupt header we must not parse with
+    // these field offsets.
     if module.header.version != EXPECTED_MODULE_VERSION {
         log::error!(
             "[loader] {}: module header version={} expected={}",

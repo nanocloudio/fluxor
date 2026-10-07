@@ -4,7 +4,7 @@
 //
 // The bare-metal realization of the `workload` contract: a workload is an owned
 // module subgraph, staged onto the live graph via the already-built owner /
-// lease / live-graph primitives (the "facade" of `fluxor_nanocloud.md` §4.1).
+// lease / live-graph primitives.
 // This is the metal twin of `platform::linux::workload` (the host-process
 // backend). It lives in `src/kernel` — not `src/platform/bcm2712` — because the
 // logic is kernel-generic multitenant: `apply_add`/`free_owner`/`owner_pause`
@@ -14,15 +14,15 @@
 //
 // Per-op mapping:
 //   CREATE  — decode the `source_ref` FLXA subgraph → `apply_add`; stage paused
-//             (§4.1 START barrier); lease-gate the header endpoints; allocate a
+//             (the START barrier); lease-gate the header endpoints; allocate a
 //             `WorkloadSlot`; return `tag_fd(FD_TAG_WORKLOAD, idx)`.
 //   START   — `owner_resume` (release the create-time pause).
-//   WAIT    — map the owner's live status → `[state:u8][code:i32 LE]` (§4.2).
-//   SIGNAL  — TERM → `begin_drain`, KILL → `free_owner` (§4.3).
+//   WAIT    — map the owner's live status → `[state:u8][code:i32 LE]`.
+//   SIGNAL  — TERM → `begin_drain`, KILL → `free_owner`.
 //   DESTROY — `free_owner` + clear the slot (idempotent).
 //   PAUSE / RESUME — `owner_pause` / `owner_resume` (direct).
-//   CAPS    — the metal bitmap (§4.4): SHARED posture, FMOD_GRAPH source, PAUSE
-//             op, no net identity.
+//   CAPS    — the metal bitmap: SHARED posture, FMOD_GRAPH source, PAUSE
+//             op, own-address net identity.
 //
 // **Dispatch context invariant:** runtime `apply_add`/ `free_owner` must run
 // on the primary domain / core 0 — `request_quiesce` (the peer-core quiesce
@@ -51,7 +51,7 @@ use crate::kernel::workload::owner_plan::{lease_gate, LeaseGate};
 // its control/ingress port indices, and the backend speaks the shared
 // `net::identity` contract (opcodes, framing, payload layout) to whatever
 // registered. Any base-graph module implementing the contract's `addr_ctl`
-// receiver is a valid provider; the foundation `ip` module is today's.
+// receiver is a valid provider; the foundation `ip` module is one.
 
 use crate::abi::contracts::net::identity as netid;
 use portable_atomic::{AtomicU32, Ordering};
@@ -112,7 +112,7 @@ struct WorkloadSlot {
     /// The workload's installed IPv4 identity (16-byte address, IPv4 in bytes
     /// 0..4 network order), or all-zero for a host-shared workload that never
     /// took one. Retained at CREATE so DESTROY/KILL can emit the matching
-    /// `ADDR_DEL` (§3.3).
+    /// `ADDR_DEL`.
     net_addr: [u8; 16],
     /// The creating module's lanes into the subgraph (`wl::LANES`).
     lanes: [CallerLane; wl::MAX_CALLER_LANES],
@@ -166,8 +166,8 @@ const FLXA_MIN_LEN: usize = 34;
 
 /// Clamp a blob cap field to the envelope memory ceiling, in place. `mem_ceil`
 /// is `None` for an unlimited envelope; a blob cap of 0 is also "unlimited", so
-/// the ceiling wins; otherwise the tighter of the two holds (§3.1 step 3 —
-/// caps, never a new meter).
+/// the ceiling wins; otherwise the tighter of the two holds (caps, never a
+/// new meter).
 #[inline]
 fn clamp_cap_be(buf: &mut [u8], off: usize, mem_ceil: Option<u32>) {
     let existing = u32::from_be_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]);
@@ -180,7 +180,7 @@ fn clamp_cap_be(buf: &mut [u8], off: usize, mem_ceil: Option<u32>) {
 }
 
 /// Resolve the net-identity provider's `addr_ctl` channel from the
-/// registration (§3.3), or `-1` when no provider has registered (a node with
+/// registration, or `-1` when no provider has registered (a node with
 /// no network stack).
 fn addr_ctl_channel() -> i32 {
     match net_identity_provider() {
@@ -212,7 +212,7 @@ fn provider_net_in_spare_lane() -> i32 {
     scheduler::merge_next_free_lane(merge as usize)
 }
 
-/// Single-writer gate (§3.3): the backend is the *sole* writer of `addr_ctl`, so
+/// Single-writer gate: the backend is the *sole* writer of `addr_ctl`, so
 /// the base graph must leave the channel producer-less (no module edged into
 /// it). `channel_producer_owner` returns `OWNER_SYSTEM` for a producer-less (or
 /// benign system-anchored) channel; a non-system producer means a mis-wired base
@@ -240,7 +240,7 @@ unsafe fn write_addr_ctl_frame(ch: i32, msg_type: u8, payload: &[u8]) -> bool {
 }
 
 /// Install a `net=own` workload's IPv4 identity into the net-identity provider
-/// (§3.3): resolve the `addr_ctl` channel, assert single-writer, and write
+///: resolve the `addr_ctl` channel, assert single-writer, and write
 /// `ADDR_ADD [addr:16][prefix_len:1][owner_tag:2 LE]` with
 /// `owner_tag = owner_slot`. The address is live before START releases the
 /// workload. Returns 0, or a negative errno:
@@ -272,7 +272,7 @@ unsafe fn install_identity(addr16: &[u8], prefix_len: u8, owner_slot: u16) -> i3
     }
 }
 
-/// Emit `ADDR_DEL [addr:16]` for a torn-down workload's address (§3.3).
+/// Emit `ADDR_DEL [addr:16]` for a torn-down workload's address.
 /// Best-effort: a zero address (host-shared workload, never installed) is a
 /// no-op, and if the provider / addr_ctl is gone or the ring is momentarily
 /// full the address ages out with the freed owner anyway.
@@ -375,9 +375,9 @@ unsafe fn workload_create(arg: *mut u8, arg_len: usize) -> i32 {
     }
 
     // ── Bridge the durable workload identity into the FLXA blob so `apply_add`'s
-    //    `owners.alloc(owner_uid)` / `find_by_uid` carries the header identity
-    //    (§3.1 step 2), and clamp the FLXA caps to the envelope memory ceiling
-    //    (§3.1 step 3 — caps, never a new meter). Both edits are in place within
+    //    `owners.alloc(owner_uid)` / `find_by_uid` carries the header identity,
+    //    and clamp the FLXA caps to the envelope memory ceiling (caps, never a
+    //    new meter). Both edits are in place within
     //    the `source_ref` region, which we validated is >= FLXA_MIN_LEN long.
     buf.copy_within(0..16, src_start + FLXA_OWNER_UID_OFF);
     let mem_ceil = if memory_bytes == 0 {
@@ -437,7 +437,7 @@ unsafe fn workload_create(arg: *mut u8, arg_len: usize) -> i32 {
     };
 
     // ── Lease-gate each declared endpoint against the owner's retained plan
-    //    (§3.1 step 5, identical to `linux/workload.rs`). A refusal fails CREATE
+    //    (as `linux/workload.rs` does). A refusal fails CREATE
     //    here — not silently at bind — so roll the staged owner back.
     for i in 0..endpoint_count {
         let e = ep_start + i * wl::NET_ENDPOINT_SIZE;
@@ -466,7 +466,7 @@ unsafe fn workload_create(arg: *mut u8, arg_len: usize) -> i32 {
         }
     }
 
-    // ── START barrier (§4.1): stage paused. `apply_add` set the owner Active;
+    // ── START barrier: stage paused. `apply_add` set the owner Active;
     //    pause it now so it does not run until START resumes it.
     if live::owner_pause(owner).is_err() {
         remove_identity(&net_addr);
@@ -530,9 +530,9 @@ unsafe fn slot_owner(raw: i32) -> Option<OwnerHandle> {
     Some(slots[idx].owner)
 }
 
-/// Map an owner's live status to the WAIT `(state, code)` pair (§4.2, redefined
-/// for the fmod model — a graph runs forever, so there is no process-shaped
-/// "exit code"):
+/// Map an owner's live status to the WAIT `(state, code)` pair, defined for
+/// the fmod model — a graph runs forever, so there is no process-shaped
+/// "exit code":
 ///   * no record (owner freed / torn down) → `(STATE_EXITED, 0)` — the only
 ///     EXITED path,
 ///   * any module faulted (`last_fault_kind != NONE` or `modules_terminated`)
@@ -559,7 +559,7 @@ pub fn wait_state_map(rec: Option<&OwnerLiveStatus>) -> (u8, i32) {
 }
 
 /// WORKLOAD_WAIT: snapshot the owner's live status and write
-/// `[state:u8][code:i32 LE]` into `out` (§4.2). Non-blocking.
+/// `[state:u8][code:i32 LE]` into `out`. Non-blocking.
 ///
 /// `owner` is `None` when the workload slot was already reaped (DESTROY/KILL):
 /// a torn-down handle reads as EXITED — the terminal state a status loop polls
@@ -585,7 +585,7 @@ unsafe fn workload_wait(owner: Option<OwnerHandle>, arg: *mut u8, arg_len: usize
     5
 }
 
-/// WORKLOAD_CAPS: write the metal backend's honest capability set (§4.4). Same
+/// WORKLOAD_CAPS: write the metal backend's honest capability set. Same
 /// prefix shape as the Linux backend: `[postures:u8][source_kinds:u8]
 /// [ops:u16 LE][net:u8]` then an empty namespace directory `[ns_count:u16 = 0]`.
 ///
@@ -596,7 +596,7 @@ unsafe fn workload_caps(arg: *mut u8, arg_len: usize) -> i32 {
         return errno::EINVAL;
     }
     let out = core::slice::from_raw_parts_mut(arg, arg_len);
-    // Postures: SHARED only. ISOLATED/HARDENED need EL0-per-workload (§5).
+    // Postures: SHARED only. ISOLATED/HARDENED need EL0-per-workload.
     out[0] = wl::caps::POSTURE_SHARED;
     // Source kinds: fmod-graph (metal has no rootfs bundle transport).
     out[1] = wl::caps::SOURCE_FMOD_GRAPH;
@@ -625,6 +625,102 @@ unsafe fn workload_caps(arg: *mut u8, arg_len: usize) -> i32 {
 /// (core 0) — see the module header. `arg` must be null or valid for reads and
 /// writes of `arg_len` bytes for the call.
 pub unsafe fn workload_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
+    let timed = matches!(opcode, wl::CREATE | wl::DESTROY);
+    let t0 = if timed {
+        crate::kernel::sys::hal::now_micros()
+    } else {
+        0
+    };
+    let rc = dispatch_op(handle, opcode, arg, arg_len);
+    if timed {
+        live_stats_record(
+            opcode,
+            rc,
+            crate::kernel::sys::hal::now_micros().saturating_sub(t0),
+        );
+    }
+    rc
+}
+
+// ── Live-churn telemetry ─────────────────────────────────────────
+//
+// A node that admits and reaps workloads for its whole life must not leak
+// what each one takes. These counters make that a reading rather than a
+// guess: every `LIVE_STATS_EVERY` DESTROY calls (and on any refused CREATE)
+// one `[live]` line reports the graph's population beside both arenas'
+// high-water marks and free lists, so a rig run shows whether churn returns
+// to a fixed point. The worst CREATE/DESTROY wall time bounds how long one
+// live change held the scheduler thread; the peer cores are quiesced for the
+// graph edit inside it.
+
+struct LiveStats {
+    creates: u32,
+    create_fails: u32,
+    destroys: u32,
+    create_max_us: u32,
+    destroy_max_us: u32,
+}
+
+static mut LIVE_STATS: LiveStats = LiveStats {
+    creates: 0,
+    create_fails: 0,
+    destroys: 0,
+    create_max_us: 0,
+    destroy_max_us: 0,
+};
+
+const LIVE_STATS_EVERY: u32 = 25;
+
+/// Fold one timed op into the counters and report when due. Scheduler thread.
+unsafe fn live_stats_record(opcode: u32, rc: i32, us: u64) {
+    let st = &mut *core::ptr::addr_of_mut!(LIVE_STATS);
+    let us = us.min(u32::MAX as u64) as u32;
+    let due = if opcode == wl::CREATE {
+        if rc < 0 {
+            st.create_fails = st.create_fails.wrapping_add(1);
+            true
+        } else {
+            st.creates = st.creates.wrapping_add(1);
+            st.create_max_us = st.create_max_us.max(us);
+            false
+        }
+    } else {
+        st.destroys = st.destroys.wrapping_add(1);
+        st.destroy_max_us = st.destroy_max_us.max(us);
+        st.destroys.checked_rem(LIVE_STATS_EVERY) == Some(0)
+    };
+    if !due {
+        return;
+    }
+    let s = scheduler::sched_mut();
+    let (state_used, state_cap) = crate::kernel::module::loader::arena_usage();
+    let (holes, hole_bytes) = crate::kernel::module::loader::state_free_list_usage();
+    let (buf_used, buf_cap) = crate::kernel::ipc::buffer_pool::arena_usage();
+    let (bholes, bhole_bytes, bleaked) = crate::kernel::ipc::buffer_pool::buffer_free_list_usage();
+    log::info!(
+        "[live] c={} cf={} d={} rc={} mods={} edges={} owners={} state={}/{} holes={}/{} buf={}/{} bholes={}/{} bleak={} cmax_us={} dmax_us={}",
+        st.creates,
+        st.create_fails,
+        st.destroys,
+        rc,
+        s.active_module_count,
+        s.edge_count,
+        scheduler::owners_mut().active_workload_count(),
+        state_used,
+        state_cap,
+        holes,
+        hole_bytes,
+        buf_used,
+        buf_cap,
+        bholes,
+        bhole_bytes,
+        bleaked,
+        st.create_max_us,
+        st.destroy_max_us,
+    );
+}
+
+unsafe fn dispatch_op(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
     if opcode == wl::CREATE {
         return workload_create(arg, arg_len);
     }
@@ -634,7 +730,7 @@ pub unsafe fn workload_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
 
     let raw = slot_of(handle);
     let owner_opt = slot_owner(raw);
-    // WAIT tolerates a reaped slot → EXITED (§4.2): a status loop keeps polling
+    // WAIT tolerates a reaped slot → EXITED: a status loop keeps polling
     // after DESTROY/KILL and must see the terminal state, not an error.
     if opcode == wl::WAIT {
         return workload_wait(owner_opt, arg, arg_len);
@@ -643,7 +739,7 @@ pub unsafe fn workload_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
         return errno::EINVAL;
     };
     match opcode {
-        // START releases the create-time pause (§4.1). Idempotent (resume of an
+        // START releases the create-time pause. Idempotent (resume of an
         // already-Active owner is a no-op).
         wl::START => match live::owner_resume(owner) {
             Ok(()) => 0,
@@ -670,7 +766,7 @@ pub unsafe fn workload_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
                 }
                 // Immediate: tear the owner down. The slot is left in place so a
                 // subsequent WAIT resolves the handle and reports EXITED; DESTROY
-                // reaps the slot. Remove the net identity (§3.3) and clear the
+                // reaps the slot. Remove the net identity and clear the
                 // stored address so DESTROY does not re-emit ADDR_DEL.
                 wl::SIG_KILL => {
                     let slots = &mut *core::ptr::addr_of_mut!(FMOD_WORKLOADS);
@@ -710,7 +806,7 @@ pub unsafe fn workload_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             need as i32
         }
         wl::DESTROY => {
-            // Remove the net identity (§3.3 — ADDR_DEL) before freeing the
+            // Remove the net identity (ADDR_DEL) before freeing the
             // owner; a zero/cleared address is a no-op (host-shared, or already
             // removed by SIG_KILL).
             let slots = &mut *core::ptr::addr_of_mut!(FMOD_WORKLOADS);

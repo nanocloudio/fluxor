@@ -548,14 +548,14 @@ pub fn parse_modules_from_config_multi(
     // packed into that table though the base graph does not instantiate
     // them. Two sources, loaded alike (dedup against the base graph's
     // modules):
-    // - resident pods, admitted at boot: `pods:[*].modules:[*].type`;
+    // - resident workloads, admitted at boot: `workloads:[*].modules:[*].type`;
     // - `workload_modules:`, the types a workload may be staged with at run
     //   time (a node's volume graphs, say): each a type name, or
     //   `{type, variant}`.
     let mut staged: Vec<(&str, Option<&str>)> = Vec::new();
-    if let Some(pods) = config["pods"].as_array() {
-        for pod in pods {
-            let Some(pmods) = pod["modules"].as_array() else {
+    if let Some(workloads) = config["workloads"].as_array() {
+        for workload in workloads {
+            let Some(pmods) = workload["modules"].as_array() else {
                 continue;
             };
             for m in pmods {
@@ -592,9 +592,9 @@ pub fn parse_modules_from_config_multi(
                 std::collections::hash_map::Entry::Occupied(e) => {
                     if e.get().as_deref() != variant {
                         return Err(Error::Module(format!(
-                                "module type '{}' (staged by a pod or workload_modules) requests variant '{}' but the \
+                                "module type '{}' (staged by a workload or workload_modules) requests variant '{}' but the \
                                  image already carries '{}' — one image carries one build of a \
-                                 module type; align pods, workload_modules and the base graph \
+                                 module type; align workloads, workload_modules and the base graph \
                                  on a single variant",
                                 module_type,
                                 variant.unwrap_or("<default>"),
@@ -612,7 +612,7 @@ pub fn parse_modules_from_config_multi(
             if is_builtin_module(module_type) {
                 if let Some(v) = variant {
                     return Err(Error::Module(format!(
-                            "module type '{module_type}' (staged by a pod or workload_modules) requests variant \
+                            "module type '{module_type}' (staged by a workload or workload_modules) requests variant \
                              '{v}', but the type is built into the kernel — built-ins have no \
                              variant artifacts; drop `variant:`"
                         )));
@@ -627,7 +627,7 @@ pub fn parse_modules_from_config_multi(
                             .map(|d| d.display().to_string())
                             .collect();
                         Error::Module(format!(
-                            "module type '{}' (staged by a pod or workload_modules; artifact '{}.fmod') not found in: {} (nor pinned in fluxor.lock [[artifact]])\nRun 'fluxor modules build' to build modules, or pin it with 'fluxor store pin'.{}",
+                            "module type '{}' (staged by a workload or workload_modules; artifact '{}.fmod') not found in: {} (nor pinned in fluxor.lock [[artifact]])\nRun 'fluxor modules build' to build modules, or pin it with 'fluxor store pin'.{}",
                             module_type,
                             artifact,
                             searched.join(", "),
@@ -1792,22 +1792,22 @@ mod tests {
         assert!(msg.contains("built into the kernel"), "got: {msg}");
     }
 
-    /// Pod-vs-pod variant conflict must fail, not first-wins: the
-    /// variant conflict check runs BEFORE the pod dedup skip and
+    /// Workload-vs-workload variant conflict must fail, not first-wins: the
+    /// variant conflict check runs BEFORE the workload dedup skip and
     /// before the builtin bypass, so even a builtin type (which never
     /// resolves an artifact) surfaces the disagreement.
     #[test]
-    fn pod_conflicting_variants_is_hard_error() {
+    fn workload_conflicting_variants_is_hard_error() {
         let config = serde_json::json!({
             "modules": [],
-            "pods": [
+            "workloads": [
                 { "modules": [ { "type": "linux_net" } ] },
                 { "modules": [ { "type": "linux_net", "variant": "slim" } ] },
             ]
         });
         let tmp = tempfile::tempdir().unwrap();
         let err = parse_modules_from_config_multi(&config, tmp.path(), &[], None)
-            .expect_err("conflicting pod variants must fail");
+            .expect_err("conflicting workload variants must fail");
         let msg = err.to_string();
         assert!(msg.contains("'slim'"), "got: {msg}");
         assert!(msg.contains("'<default>'"), "got: {msg}");
@@ -1846,7 +1846,7 @@ mod tests {
     }
 
     /// One image carries one build of a type: a workload module naming a
-    /// variant the base graph did not load is refused, as a pod's is.
+    /// variant the base graph did not load is refused, as a workload's is.
     #[test]
     fn a_workload_module_variant_conflicting_with_the_base_graph_fails() {
         let config = serde_json::json!({

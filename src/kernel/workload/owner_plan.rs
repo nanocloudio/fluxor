@@ -1,6 +1,6 @@
-//! Kernel-side decode + apply of the bounded binary device-graph plan
-//! ("the kernel consumes a validated bounded binary plan; it
-//! does not parse Kubernetes objects, OCI manifests, or arbitrary YAML").
+//! Kernel-side decode + apply of the bounded binary device-graph plan. The
+//! kernel consumes a validated, bounded binary plan; it parses no orchestrator
+//! objects, OCI manifests or YAML.
 //!
 //! This is the kernel half of the host composer's wire format
 //! (`tools/src/compose.rs::encode_plan`). The two MUST stay in lockstep: same

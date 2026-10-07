@@ -347,6 +347,7 @@ pub static RULES: &[Rule] = &[
     rule(0x0603, HandleUse::Global, Arg::Out(8)), // timer::MICROS
     rule(0x0608, HandleUse::Global, Arg::Out(8)), // timer::UNIX_MILLIS
     rule(0x0609, HandleUse::Global, Arg::Out(36)), // timer::TRUSTED_UNIX
+    rule(0x060A, HandleUse::Global, Arg::In(20)), // timer::DISCIPLINE
     // Identity and entropy.
     rule(0x0C2F, HandleUse::Global, Arg::Out(16)), // BOOT_INCARNATION
     rule(0x0C3C, HandleUse::Global, Arg::Out(ANY)), // CSPRNG_FILL
@@ -566,6 +567,7 @@ pub fn channel_ioctl_admitted(cmd: u32) -> bool {
             | ch::IOCTL_POLL_NOTIFY
             | ch::IOCTL_FLUSH
             | ch::IOCTL_SET_HUP
+            | ch::IOCTL_WRITABLE
             | ioctl::CAPS
             | ioctl::REAP
             | ioctl::SUBMIT

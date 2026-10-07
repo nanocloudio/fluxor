@@ -309,7 +309,8 @@ fn release_peers(parked: bool) {
 /// Add `sub` as a new owner to the running graph. On success returns the new
 /// [`OwnerHandle`]. `assignment`, when `Some((slot, generation))`, asserts the
 /// kernel-allocated owner matches the placement a host-side composer chose
-/// (determinism contract, `k8s_plan §11`); pass `None` for a standalone caller.
+/// (the composer's allocation is deterministic, and the kernel's must agree
+/// with it); pass `None` for a standalone caller.
 ///
 /// Atomic: the execution-order splice is the last mutation, so any earlier
 /// failure rolls back to a bit-identical graph and the scheduler never observes
@@ -1214,7 +1215,7 @@ pub fn owner_resume(handle: OwnerHandle) -> Result<(), PauseError> {
 // `tools/src/compose.rs`. PIC modules only (a built-in has no serialisable
 // form); a target with asynchronous PIC load returns `WouldBlock`.
 // Integrity/signature verification of the blob is the signing
-// layer's job and the channel is authenticated (k8s node-agent), so this
+// layer's job and the channel is authenticated (the node agent's), so this
 // decoder validates structure and bounds, not a content digest.
 
 /// Wire magic: "FLXA".

@@ -14,7 +14,7 @@
 )]
 
 use fluxor_tools::compose::{
-    DesiredPhase, DeviceDesiredState, NodeCapacity, OwnerSnapshot, PodDesired, ResourceProfile,
+    DesiredPhase, DeviceDesiredState, NodeCapacity, OwnerSnapshot, ResourceProfile, WorkloadDesired,
 };
 use fluxor_tools::genstore::{FsStorage, GenStore};
 use fluxor_tools::node_agent::{publish_committed_plan, reconcile_and_commit};
@@ -28,13 +28,13 @@ fn main() {
         .next()
         .expect("usage: agent_publish <store-dir> <plan-out>");
 
-    let mut pod_uid = [0u8; 16];
-    pod_uid[0] = 0xaa;
+    let mut workload_uid = [0u8; 16];
+    workload_uid[0] = 0xaa;
     let desired = DeviceDesiredState {
         generation: 1,
         system_revision: 1,
-        pods: vec![PodDesired {
-            pod_uid,
+        workloads: vec![WorkloadDesired {
+            workload_uid,
             namespace: "default".into(),
             name: "hello".into(),
             workload_digest: [0u8; 32],

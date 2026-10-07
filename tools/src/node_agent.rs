@@ -1,5 +1,5 @@
 //! Node-agent reconcile → stage → commit orchestration: the device-side control
-//! loop that turns one node's desired pod set into a single durably committed
+//! loop that turns one node's desired workload set into a single durably committed
 //! graph generation, tying together composition, the binary plan codec, and the
 //! durable generation store.
 //!
@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 
 use crate::compose::{
     compose, decode_plan, encode_plan, ComposeError, CompositionPlan, DesiredPhase,
-    DeviceDesiredState, NodeCapacity, OwnerSnapshot, PodDesired,
+    DeviceDesiredState, NodeCapacity, OwnerSnapshot, WorkloadDesired,
 };
 use crate::genstore::{GenStore, Storage, StoreError};
 
@@ -142,8 +142,8 @@ pub fn publish_committed_plan<S: Storage>(
     Ok(Some(blob.len()))
 }
 
-/// Key under which the node's desired pod set persists in the store.
-const DESIRED_KEY: &str = "desired.pods";
+/// Key under which the node's desired workload set persists in the store.
+const DESIRED_KEY: &str = "desired.workloads";
 /// Key recording where the committed plan was last published (the
 /// `FLUXOR_PLAN` file). The node runtime writes its live owner-status file
 /// (`owner_status.json`) NEXT TO the plan it consumes, so this is how a later
@@ -152,12 +152,12 @@ const DESIRED_KEY: &str = "desired.pods";
 const PUBLISH_PATH_KEY: &str = "publish.path";
 /// Key holding the per-slot high-water owner generation. Slot generations must
 /// survive a slot going empty — reusing a slot must always issue a STRICTLY
-/// higher owner generation, so a deleted pod's stale handles can never match —
+/// higher owner generation, so a deleted workload's stale handles can never match —
 /// and the committed plan only records currently-occupied slots.
 const SLOT_GENS_KEY: &str = "slot.generations";
 /// Key holding the node policy the orchestrator supplies out-of-band of any
-/// one pod: today the reserved-port set that exported endpoints must not
-/// intersect. It is node-scoped, never a per-pod manifest field, because the
+/// one workload: today the reserved-port set that exported endpoints must not
+/// intersect. It is node-scoped, never a per-workload manifest field, because the
 /// ports it protects belong to the orchestrator itself. Persisted so EVERY recompose —
 /// commit or remove, whoever triggers it — composes against the same policy.
 const NODE_POLICY_KEY: &str = "node.policy";
@@ -173,7 +173,7 @@ pub struct NodePolicy {
     pub reserved_ports: Vec<u16>,
     /// The node substrate's platform-module prefix: platform stacks PREPEND
     /// their modules (linux_net et al.), so compiled indices [0, N) are
-    /// system infrastructure and pod module ranges must start past them
+    /// system infrastructure and workload module ranges must start past them
     /// — the node's own system services are not ownable by a workload.
     /// 0 = no platform modules (a substrate
     /// whose module list is entirely ownable).
@@ -232,11 +232,11 @@ fn save_slot_gens<S: Storage>(store: &mut GenStore<S>, gens: &[u32]) -> Result<(
         .map_err(|_| StoreError::WriteFailed)
 }
 
-fn load_desired<S: Storage>(store: &GenStore<S>) -> Result<Vec<PodDesired>, StoreError> {
+fn load_desired<S: Storage>(store: &GenStore<S>) -> Result<Vec<WorkloadDesired>, StoreError> {
     // Absent → first run (empty desired set). Present but undecodable → hard
     // error: silently treating corrupt state as an empty set would drop every
-    // live pod on the next reconcile. An I/O fault is a hard error too — a
-    // transient read failure must never look like "no pods desired".
+    // live workload on the next reconcile. An I/O fault is a hard error too — a
+    // transient read failure must never look like "no workloads desired".
     match store
         .storage
         .read(DESIRED_KEY)
@@ -249,9 +249,9 @@ fn load_desired<S: Storage>(store: &GenStore<S>) -> Result<Vec<PodDesired>, Stor
 
 fn save_desired<S: Storage>(
     store: &mut GenStore<S>,
-    pods: &[PodDesired],
+    workloads: &[WorkloadDesired],
 ) -> Result<(), StoreError> {
-    let bytes = serde_json::to_vec(pods).map_err(|_| StoreError::WriteFailed)?;
+    let bytes = serde_json::to_vec(workloads).map_err(|_| StoreError::WriteFailed)?;
     store
         .storage
         .write(DESIRED_KEY, &bytes)
@@ -259,9 +259,9 @@ fn save_desired<S: Storage>(
 }
 
 /// Owner snapshot derived from the committed plan: the plan IS the record of
-/// which pod holds which slot at which generation — the input the next slot and
+/// which workload holds which slot at which generation — the input the next slot and
 /// generation allocation is computed against — so recomposition keeps resident
-/// pods' slots/generations stable.
+/// workloads' slots/generations stable.
 fn snapshot_from_committed<S: Storage>(
     store: &GenStore<S>,
     max_owners: u16,
@@ -277,7 +277,7 @@ fn snapshot_from_committed<S: Storage>(
     if let Some(plan) = load_committed_plan(store) {
         for a in &plan.assignments {
             if let Some(slot) = snap.slots.get_mut(a.slot as usize) {
-                slot.occupant = Some(a.pod_uid);
+                slot.occupant = Some(a.workload_uid);
                 slot.generation = slot.generation.max(a.generation);
             }
         }
@@ -319,17 +319,17 @@ pub fn published_sidecar_dir<S: Storage>(store: &GenStore<S>) -> Option<std::pat
     Some(std::path::Path::new(&publish).parent()?.to_path_buf())
 }
 
-// ── Live runtime status (the closed pod-status vocabulary) ──────────────────
+// ── Live runtime status (the closed workload-status vocabulary) ──────────────────
 //
 // These types mirror what the node runtime writes into `owner_status.json`.
 // The reason/phase enums ARE the closed vocabulary — the complete, fixed set of
-// phase, terminated-reason and waiting-reason strings a pod status may carry,
+// phase, terminated-reason and waiting-reason strings a workload status may carry,
 // and nothing outside it is a valid value: deserialization
 // rejects anything outside the set, so a runtime emitting an unknown reason
 // can never leak it into the orchestrator-facing JSON (nanocloud matches on
 // these strings and rejects others).
 
-/// Aggregate pod phase as observed by the live runtime.
+/// Aggregate workload phase as observed by the live runtime.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RuntimePhase {
     Activating,
@@ -370,10 +370,10 @@ pub struct TerminatedState {
     pub finished_at: String,
 }
 
-/// One pod's LIVE runtime status, in the closed status vocabulary above. Joined
-/// into [`PodStatus`] by pod UID; absent entirely when the runtime isn't up.
+/// One workload's LIVE runtime status, in the closed status vocabulary above. Joined
+/// into [`WorkloadStatus`] by workload UID; absent entirely when the runtime isn't up.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct PodRuntimeStatus {
+pub struct WorkloadRuntimeStatus {
     pub phase: RuntimePhase,
     /// Aggregate readiness (`ContainersReady`).
     pub ready: bool,
@@ -383,7 +383,7 @@ pub struct PodRuntimeStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at: Option<String>,
     /// AGGREGATE owner re-activations only — an internal module retry is
-    /// module telemetry, never a Kubernetes container restart.
+    /// module telemetry, never an owner restart.
     pub restart_count: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminated: Option<TerminatedState>,
@@ -407,7 +407,7 @@ pub struct PodRuntimeStatus {
     pub drain: Option<DrainDetail>,
     /// The runtime's RAW bound-endpoint report — which (protocol, port) pairs
     /// are actually listening for this owner. The runtime reports ONLY what it
-    /// observed binding; matching those against the pod's declared exports is
+    /// observed binding; matching those against the workload's declared exports is
     /// the agent's job, never the runtime's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bound_endpoints: Option<Vec<BoundEndpoint>>,
@@ -432,7 +432,7 @@ pub struct EndpointStatus {
     pub declared: bool,
 }
 
-/// Join a pod's declared exports with the runtime's bound report. Pure —
+/// Join a workload's declared exports with the runtime's bound report. Pure —
 /// unit-tested without a store or runtime. Matching is case-insensitive on
 /// protocol + numeric port equality.
 pub fn join_endpoints(
@@ -493,29 +493,31 @@ struct RuntimeStatusFile {
     pid_start_ticks: u64,
     /// Plan generation the live state was derived under. The join is scoped
     /// to it: after a new commit/publish, live state from the previous
-    /// generation must not be attached to the new durable pod records.
+    /// generation must not be attached to the new durable workload records.
     plan_generation: u64,
-    pods: Vec<RuntimeStatusPod>,
+    workloads: Vec<RuntimeStatusWorkload>,
 }
 
 #[derive(Debug, serde::Deserialize)]
-struct RuntimeStatusPod {
-    pod_uid_hex: String,
-    /// Owner slot + generation — with the pod UID, the full join key. ALL
+struct RuntimeStatusWorkload {
+    /// The runtime speaks owner-space: the UID it reports is the owner's,
+    /// which the commit sets to the workload's UID.
+    owner_uid_hex: String,
+    /// Owner slot + generation — with the workload UID, the full join key. ALL
     /// three must match the committed assignment for the join to attach.
     slot: u16,
     owner_generation: u32,
-    runtime: PodRuntimeStatus,
+    runtime: WorkloadRuntimeStatus,
 }
 
-/// One pod's surfaced status: the owner-tagged join of the persisted desired
-/// state and the committed plan. Pod UID + owner slot + owner generation is
+/// One workload's surfaced status: the owner-tagged join of the persisted desired
+/// state and the committed plan. Workload UID + owner slot + owner generation is
 /// the join key between orchestrator-facing status and device telemetry; a
 /// partial match is not a match. `slot`/`owner_generation`/allocation fields are present only
-/// when the pod is in the committed generation.
+/// when the workload is in the committed generation.
 #[derive(Clone, Debug, serde::Serialize)]
-pub struct PodStatus {
-    pub pod_uid_hex: String,
+pub struct WorkloadStatus {
+    pub workload_uid_hex: String,
     pub namespace: String,
     pub name: String,
     pub desired_phase: DesiredPhase,
@@ -532,11 +534,11 @@ pub struct PodStatus {
     pub state_cap: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub buffer_cap: Option<u32>,
-    /// LIVE per-pod runtime status (in the closed status vocabulary), joined
-    /// from the runtime's `owner_status.json` by pod UID. Absent when the runtime isn't up —
+    /// LIVE per-workload runtime status (in the closed status vocabulary), joined
+    /// from the runtime's `owner_status.json` by workload UID. Absent when the runtime isn't up —
     /// additive: existing consumers of the durable fields are unaffected.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub runtime: Option<PodRuntimeStatus>,
+    pub runtime: Option<WorkloadRuntimeStatus>,
     /// Declared⇄bound endpoint join: present only
     /// when live runtime state is attached — an absent runtime means "unknown",
     /// never a claimed `bound:false`.
@@ -562,10 +564,10 @@ pub struct NodeStatus {
     /// generation at boot.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub committed_abi_surface: Option<String>,
-    pub pods: Vec<PodStatus>,
+    pub workloads: Vec<WorkloadStatus>,
 }
 
-/// Derive the node's per-pod status from the store: desired set joined with
+/// Derive the node's per-workload status from the store: desired set joined with
 /// the committed plan's owner assignments. Read-only; safe to run while the
 /// runtime is live (the store is only ever appended by commit).
 pub fn node_status<S: Storage>(store: &GenStore<S>) -> Result<NodeStatus, StoreError> {
@@ -574,19 +576,21 @@ pub fn node_status<S: Storage>(store: &GenStore<S>) -> Result<NodeStatus, StoreE
     let committed = store.committed();
     let generation = committed.as_ref().map(|g| g.id);
     let committed_abi_surface = committed.as_ref().map(|g| crate::hash::hex(&g.abi_surface));
-    let mut pods: Vec<PodStatus> = desired
+    let mut workloads: Vec<WorkloadStatus> = desired
         .iter()
         .map(|p| {
-            let assignment = plan
-                .as_ref()
-                .and_then(|pl| pl.assignments.iter().find(|a| a.pod_uid == p.pod_uid));
+            let assignment = plan.as_ref().and_then(|pl| {
+                pl.assignments
+                    .iter()
+                    .find(|a| a.workload_uid == p.workload_uid)
+            });
             let mut hex = String::with_capacity(32);
-            for b in &p.pod_uid {
+            for b in &p.workload_uid {
                 use std::fmt::Write;
                 let _ = write!(hex, "{b:02x}");
             }
-            PodStatus {
-                pod_uid_hex: hex,
+            WorkloadStatus {
+                workload_uid_hex: hex,
                 namespace: p.namespace.clone(),
                 name: p.name.clone(),
                 desired_phase: p.desired_phase,
@@ -602,28 +606,28 @@ pub fn node_status<S: Storage>(store: &GenStore<S>) -> Result<NodeStatus, StoreE
             }
         })
         .collect();
-    // Departing pods stay observable for the whole drain window: a removed
-    // pod is gone from desired state immediately, but its revocation record
+    // Departing workloads stay observable for the whole drain window: a removed
+    // workload is gone from desired state immediately, but its revocation record
     // rides the committed plan until retention lapses
     // until its retention lapses. Synthesize a row from each revocation whose
     // UID no longer has a desired row, so `status` keeps
     // showing the owner (and, via the runtime join, its Draining/Terminated
-    // state) instead of the pod silently vanishing mid-drain. Namespace and
+    // state) instead of the workload silently vanishing mid-drain. Namespace and
     // name left empty — the desired record that carried them is gone; the
-    // pod UID is the orchestrator's join key.
+    // workload UID is the orchestrator's join key.
     if let Some(pl) = plan.as_ref() {
         for rev in &pl.revocations {
             let a = &rev.assignment;
             let mut hex = String::with_capacity(32);
-            for b in &a.pod_uid {
+            for b in &a.workload_uid {
                 use std::fmt::Write;
                 let _ = write!(hex, "{b:02x}");
             }
-            if pods.iter().any(|p| p.pod_uid_hex == hex) {
+            if workloads.iter().any(|p| p.workload_uid_hex == hex) {
                 continue;
             }
-            pods.push(PodStatus {
-                pod_uid_hex: hex,
+            workloads.push(WorkloadStatus {
+                workload_uid_hex: hex,
                 namespace: String::new(),
                 name: String::new(),
                 desired_phase: DesiredPhase::Stopped,
@@ -639,19 +643,19 @@ pub fn node_status<S: Storage>(store: &GenStore<S>) -> Result<NodeStatus, StoreE
             });
         }
     }
-    pods.sort_by(|a, b| a.pod_uid_hex.cmp(&b.pod_uid_hex));
+    workloads.sort_by(|a, b| a.workload_uid_hex.cmp(&b.workload_uid_hex));
     Ok(NodeStatus {
         generation,
         abi_surface: crate::hash::hex(&crate::hash::abi_surface_digest()),
         committed_abi_surface,
-        pods,
+        workloads,
     })
 }
 
-/// `node_status` plus the LIVE per-pod runtime join: read the runtime's
+/// `node_status` plus the LIVE per-workload runtime join: read the runtime's
 /// `owner_status.json` (located beside the plan file recorded by
-/// [`record_publish_path`]) and attach each pod's `runtime` object by the full
-/// join key — pod UID + owner slot + owner generation,
+/// [`record_publish_path`]) and attach each workload's `runtime` object by the full
+/// join key — workload UID + owner slot + owner generation,
 /// scoped to the committed plan generation. Best-effort and fail-absent: a
 /// missing/garbled/out-of-vocabulary file, a writer process that is no
 /// longer alive (or is a recycled PID), a file from a different plan
@@ -665,24 +669,24 @@ pub fn node_status_with_runtime<S: Storage>(store: &GenStore<S>) -> Result<NodeS
         // hasn't rebuilt onto the new commit yet, or is behind a rollback)
         // must not be joined to the new durable records.
         if Some(file.plan_generation) == st.generation {
-            // Declared exports per pod, for the declared⇄bound endpoint join
+            // Declared exports per workload, for the declared⇄bound endpoint join
             // (the agent owns this join; the runtime reported only the raw
             // binds it observed, with no notion of what was declared).
             let desired = load_desired(store)?;
-            for pod in &mut st.pods {
-                if let Some(entry) = file.pods.iter().find(|p| {
-                    p.pod_uid_hex == pod.pod_uid_hex
-                        && Some(p.slot) == pod.slot
-                        && Some(p.owner_generation) == pod.owner_generation
+            for workload in &mut st.workloads {
+                if let Some(entry) = file.workloads.iter().find(|p| {
+                    p.owner_uid_hex == workload.workload_uid_hex
+                        && Some(p.slot) == workload.slot
+                        && Some(p.owner_generation) == workload.owner_generation
                 }) {
                     let declared = desired
                         .iter()
-                        .find(|d| crate::hash::hex(&d.pod_uid) == pod.pod_uid_hex)
+                        .find(|d| crate::hash::hex(&d.workload_uid) == workload.workload_uid_hex)
                         .map(|d| d.exports.as_slice())
                         .unwrap_or(&[]);
                     let bound = entry.runtime.bound_endpoints.as_deref().unwrap_or(&[]);
-                    pod.endpoints = join_endpoints(declared, bound);
-                    pod.runtime = Some(entry.runtime.clone());
+                    workload.endpoints = join_endpoints(declared, bound);
+                    workload.runtime = Some(entry.runtime.clone());
                 }
             }
             // Runtime entries with no durable row left — a departed owner
@@ -690,12 +694,16 @@ pub fn node_status_with_runtime<S: Storage>(store: &GenStore<S>) -> Result<NodeS
             // terminal record is still inside the runtime's retention
             // window. Surface them as runtime-only rows rather than
             // dropping the terminal state.
-            for entry in &file.pods {
-                if st.pods.iter().any(|p| p.pod_uid_hex == entry.pod_uid_hex) {
+            for entry in &file.workloads {
+                if st
+                    .workloads
+                    .iter()
+                    .any(|p| p.workload_uid_hex == entry.owner_uid_hex)
+                {
                     continue;
                 }
-                st.pods.push(PodStatus {
-                    pod_uid_hex: entry.pod_uid_hex.clone(),
+                st.workloads.push(WorkloadStatus {
+                    workload_uid_hex: entry.owner_uid_hex.clone(),
                     namespace: String::new(),
                     name: String::new(),
                     desired_phase: DesiredPhase::Stopped,
@@ -710,7 +718,8 @@ pub fn node_status_with_runtime<S: Storage>(store: &GenStore<S>) -> Result<NodeS
                     endpoints: Vec::new(),
                 });
             }
-            st.pods.sort_by(|a, b| a.pod_uid_hex.cmp(&b.pod_uid_hex));
+            st.workloads
+                .sort_by(|a, b| a.workload_uid_hex.cmp(&b.workload_uid_hex));
         }
     }
     Ok(st)
@@ -759,47 +768,47 @@ fn proc_start_ticks(pid: u32) -> Option<u64> {
     fields.nth(18)?.parse().ok()
 }
 
-/// Upsert `pod` into the node's persisted desired state and recompose ALL
-/// running pods into the next generation — one device runs exactly ONE
-/// composed graph, so every resident pod is recomposed together, never patched
-/// in individually. Resident pods keep their slots/generations via the
+/// Upsert `workload` into the node's persisted desired state and recompose ALL
+/// running workloads into the next generation — one device runs exactly ONE
+/// composed graph, so every resident workload is recomposed together, never patched
+/// in individually. Resident workloads keep their slots/generations via the
 /// committed-plan snapshot. Returns the committed plan and its generation id.
-pub fn upsert_pod_and_commit<S: Storage>(
+pub fn upsert_workload_and_commit<S: Storage>(
     store: &mut GenStore<S>,
-    pod: PodDesired,
+    workload: WorkloadDesired,
     cap: &NodeCapacity,
 ) -> Result<(CompositionPlan, u64), AgentError> {
-    let mut pods = load_desired(store).map_err(AgentError::Store)?;
-    pods.retain(|p| p.pod_uid != pod.pod_uid);
-    pods.push(pod);
-    recompose(store, pods, cap, &[])
+    let mut workloads = load_desired(store).map_err(AgentError::Store)?;
+    workloads.retain(|p| p.workload_uid != workload.workload_uid);
+    workloads.push(workload);
+    recompose(store, workloads, cap, &[])
 }
 
-/// Remove a pod from the desired state and recompose the remainder. With a
-/// non-zero `grace_secs` the departing pod leaves through a bounded drain
+/// Remove a workload from the desired state and recompose the remainder. With a
+/// non-zero `grace_secs` the departing workload leaves through a bounded drain
 /// window: its revocation record (deadline = now + grace) rides the same single
 /// generation, and the runtime drains-then-revokes against it.
 /// `grace_secs == 0` revokes immediately —
 /// the same code path, with an already-past deadline.
-pub fn remove_pod_and_commit<S: Storage>(
+pub fn remove_workload_and_commit<S: Storage>(
     store: &mut GenStore<S>,
-    pod_uid: [u8; 16],
+    workload_uid: [u8; 16],
     grace_secs: u16,
     cap: &NodeCapacity,
 ) -> Result<(CompositionPlan, u64), AgentError> {
-    let mut pods = load_desired(store).map_err(AgentError::Store)?;
-    pods.retain(|p| p.pod_uid != pod_uid);
-    recompose(store, pods, cap, &[(pod_uid, grace_secs)])
+    let mut workloads = load_desired(store).map_err(AgentError::Store)?;
+    workloads.retain(|p| p.workload_uid != workload_uid);
+    recompose(store, workloads, cap, &[(workload_uid, grace_secs)])
 }
 
 fn recompose<S: Storage>(
     store: &mut GenStore<S>,
-    pods: Vec<PodDesired>,
+    workloads: Vec<WorkloadDesired>,
     cap: &NodeCapacity,
     revoke_graces: &[([u8; 16], u16)],
 ) -> Result<(CompositionPlan, u64), AgentError> {
     let gen_id = store.committed().map(|g| g.id + 1).unwrap_or(1);
-    let running: Vec<PodDesired> = pods
+    let running: Vec<WorkloadDesired> = workloads
         .iter()
         .filter(|p| p.desired_phase == DesiredPhase::Running)
         .cloned()
@@ -807,7 +816,7 @@ fn recompose<S: Storage>(
     let desired = DeviceDesiredState {
         generation: gen_id,
         system_revision: 1,
-        pods: running,
+        workloads: running,
     };
     let prior = snapshot_from_committed(store, cap.max_owners).map_err(AgentError::Store)?;
     let policy = load_node_policy(store).map_err(AgentError::Store)?;
@@ -835,7 +844,7 @@ fn recompose<S: Storage>(
     // a bookkeeping failure leaves nothing committed and the caller's error is
     // consistent with the unchanged prior generation — never "error returned but
     // a new generation is already live".
-    save_desired(store, &pods).map_err(AgentError::Store)?;
+    save_desired(store, &workloads).map_err(AgentError::Store)?;
     let mut gens = load_slot_gens(store).map_err(AgentError::Store)?;
     let mut bump = |slot: u16, generation: u32| {
         let idx = slot as usize;
@@ -860,7 +869,7 @@ fn recompose<S: Storage>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compose::{DesiredPhase, PodDesired, ResourceProfile};
+    use crate::compose::{DesiredPhase, ResourceProfile, WorkloadDesired};
     use crate::genstore::MemStorage;
 
     fn uid(n: u8) -> [u8; 16] {
@@ -869,11 +878,11 @@ mod tests {
         u
     }
 
-    fn pod(n: u8, modules: u16) -> PodDesired {
-        PodDesired {
-            pod_uid: uid(n),
+    fn workload(n: u8, modules: u16) -> WorkloadDesired {
+        WorkloadDesired {
+            workload_uid: uid(n),
             namespace: "default".into(),
-            name: format!("pod-{n}"),
+            name: format!("workload-{n}"),
             workload_digest: [n; 32],
             config_generation: 1,
             desired_phase: DesiredPhase::Running,
@@ -901,18 +910,18 @@ mod tests {
         }
     }
 
-    fn desired(pods: Vec<PodDesired>) -> DeviceDesiredState {
+    fn desired(workloads: Vec<WorkloadDesired>) -> DeviceDesiredState {
         DeviceDesiredState {
             generation: 1,
             system_revision: 1,
-            pods,
+            workloads,
         }
     }
 
     #[test]
     fn reconcile_commits_and_round_trips_the_plan() {
         let mut store = GenStore::new(MemStorage::default());
-        let ds = desired(vec![pod(1, 4), pod(2, 8)]);
+        let ds = desired(vec![workload(1, 4), workload(2, 8)]);
 
         let plan = reconcile_and_commit(&mut store, &ds, &cap(), &OwnerSnapshot::empty(16), 1)
             .expect("reconcile");
@@ -931,7 +940,7 @@ mod tests {
         let mut store = GenStore::new(MemStorage::default());
         reconcile_and_commit(
             &mut store,
-            &desired(vec![pod(1, 4)]),
+            &desired(vec![workload(1, 4)]),
             &cap(),
             &OwnerSnapshot::empty(16),
             1,
@@ -939,7 +948,7 @@ mod tests {
         .unwrap();
         let plan2 = reconcile_and_commit(
             &mut store,
-            &desired(vec![pod(1, 4), pod(3, 2)]),
+            &desired(vec![workload(1, 4), workload(3, 2)]),
             &cap(),
             &OwnerSnapshot::empty(16),
             2,
@@ -962,7 +971,7 @@ mod tests {
             let mut store = GenStore::new(FsStorage::open(&dir).unwrap());
             reconcile_and_commit(
                 &mut store,
-                &desired(vec![pod(1, 4)]),
+                &desired(vec![workload(1, 4)]),
                 &cap(),
                 &OwnerSnapshot::empty(16),
                 1,
@@ -990,17 +999,17 @@ mod tests {
     fn node_policy_reserved_ports_gate_every_recompose() {
         use crate::compose::ExportDecl;
         let mut store = GenStore::new(MemStorage::default());
-        // No policy written → default (empty set): an exporting pod admits.
+        // No policy written → default (empty set): an exporting workload admits.
         assert_eq!(load_node_policy(&store).unwrap(), NodePolicy::default());
-        let mut exporting = pod(1, 4);
+        let mut exporting = workload(1, 4);
         exporting.exports = vec![ExportDecl {
             protocol: "udp".into(),
             port: 53,
         }];
-        upsert_pod_and_commit(&mut store, exporting.clone(), &cap()).unwrap();
-        let (_, g) = remove_pod_and_commit(&mut store, uid(1), 0, &cap()).unwrap();
+        upsert_workload_and_commit(&mut store, exporting.clone(), &cap()).unwrap();
+        let (_, g) = remove_workload_and_commit(&mut store, uid(1), 0, &cap()).unwrap();
 
-        // Reserve 53 → the SAME pod is now refused at admission, and the
+        // Reserve 53 → the SAME workload is now refused at admission, and the
         // failure leaves the committed generation untouched.
         save_node_policy(
             &mut store,
@@ -1010,23 +1019,23 @@ mod tests {
             },
         )
         .unwrap();
-        let err = upsert_pod_and_commit(&mut store, exporting, &cap()).unwrap_err();
+        let err = upsert_workload_and_commit(&mut store, exporting, &cap()).unwrap_err();
         assert_eq!(err, AgentError::Compose(ComposeError::EndpointConflict));
         assert_eq!(store.committed().unwrap().id, g);
 
         // A non-intersecting export still admits under the policy.
-        let mut ok = pod(2, 4);
+        let mut ok = workload(2, 4);
         ok.exports = vec![ExportDecl {
             protocol: "tcp".into(),
             port: 8080,
         }];
-        upsert_pod_and_commit(&mut store, ok, &cap()).unwrap();
+        upsert_workload_and_commit(&mut store, ok, &cap()).unwrap();
     }
 
     #[test]
-    fn node_policy_system_modules_offset_pod_ranges() {
+    fn node_policy_system_modules_offset_workload_ranges() {
         // A substrate whose platform stack prepends one module (linux_net at
-        // compiled index 0): pod ranges must start past the prefix, and a
+        // compiled index 0): workload ranges must start past the prefix, and a
         // policy set AFTER a commit applies from the next recompose.
         let mut store = GenStore::new(MemStorage::default());
         save_node_policy(
@@ -1037,52 +1046,63 @@ mod tests {
             },
         )
         .unwrap();
-        let (plan, _) = upsert_pod_and_commit(&mut store, pod(1, 2), &cap()).unwrap();
+        let (plan, _) = upsert_workload_and_commit(&mut store, workload(1, 2), &cap()).unwrap();
         assert_eq!(
             plan.assignments[0].module_base, 1,
             "range skips the platform prefix"
         );
-        let (plan2, _) = upsert_pod_and_commit(&mut store, pod(2, 1), &cap()).unwrap();
+        let (plan2, _) = upsert_workload_and_commit(&mut store, workload(2, 1), &cap()).unwrap();
         let b = plan2
             .assignments
             .iter()
-            .find(|a| a.pod_uid == uid(2))
+            .find(|a| a.workload_uid == uid(2))
             .unwrap();
-        assert_eq!(b.module_base, 3, "second pod first-fits after the first");
+        assert_eq!(
+            b.module_base, 3,
+            "second workload first-fits after the first"
+        );
     }
 
     #[test]
     fn upsert_recompose_keeps_resident_slots_stable() {
         let mut store = GenStore::new(MemStorage::default());
-        // Pod A alone → slot 1, gen 1.
-        let (p1, g1) = upsert_pod_and_commit(&mut store, pod(1, 4), &cap()).unwrap();
+        // Workload A alone → slot 1, gen 1.
+        let (p1, g1) = upsert_workload_and_commit(&mut store, workload(1, 4), &cap()).unwrap();
         assert_eq!(g1, 1);
         assert_eq!(p1.assignments[0].slot, 1);
 
-        // Add pod B → BOTH pods in gen 2; A keeps slot 1 + owner generation.
-        let (p2, g2) = upsert_pod_and_commit(&mut store, pod(2, 8), &cap()).unwrap();
+        // Add workload B → BOTH workloads in gen 2; A keeps slot 1 + owner generation.
+        let (p2, g2) = upsert_workload_and_commit(&mut store, workload(2, 8), &cap()).unwrap();
         assert_eq!(g2, 2);
         assert_eq!(p2.assignments.len(), 2, "co-resident recompose");
-        let a = p2.assignments.iter().find(|a| a.pod_uid == uid(1)).unwrap();
-        let b = p2.assignments.iter().find(|a| a.pod_uid == uid(2)).unwrap();
+        let a = p2
+            .assignments
+            .iter()
+            .find(|a| a.workload_uid == uid(1))
+            .unwrap();
+        let b = p2
+            .assignments
+            .iter()
+            .find(|a| a.workload_uid == uid(2))
+            .unwrap();
         assert_eq!(
             (a.slot, a.generation),
             (p1.assignments[0].slot, p1.assignments[0].generation),
-            "resident pod's slot/generation stable across recompose"
+            "resident workload's slot/generation stable across recompose"
         );
         assert_eq!(b.slot, 2);
 
         // Remove A → ONE generation: A moves to the revocation section (its
         // last assignment verbatim, deadline stamped), B untouched in slot 2
         // B's record is byte-identical.
-        let (p3, g3) = remove_pod_and_commit(&mut store, uid(1), 0, &cap()).unwrap();
+        let (p3, g3) = remove_workload_and_commit(&mut store, uid(1), 0, &cap()).unwrap();
         assert_eq!(g3, 3);
         assert_eq!(p3.assignments.len(), 1);
         assert_eq!(p3.assignments[0].slot, 2);
         assert_eq!(p3.assignments[0], *b, "survivor untouched by removal");
         assert_eq!(p3.revocations.len(), 1);
         let rev = &p3.revocations[0];
-        assert_eq!(rev.assignment.pod_uid, uid(1));
+        assert_eq!(rev.assignment.workload_uid, uid(1));
         assert_eq!(
             (rev.assignment.slot, rev.assignment.generation),
             (a.slot, a.generation)
@@ -1090,10 +1110,14 @@ mod tests {
         assert_eq!(rev.grace_secs, 0);
 
         // Re-add during the drain window → the revocation still occupies slot 1,
-        // so the new pod takes the next free slot with its own fresh identity —
+        // so the new workload takes the next free slot with its own fresh identity —
         // a clean admission alongside the drain, never a resurrection.
-        let (p4, _) = upsert_pod_and_commit(&mut store, pod(3, 2), &cap()).unwrap();
-        let c = p4.assignments.iter().find(|a| a.pod_uid == uid(3)).unwrap();
+        let (p4, _) = upsert_workload_and_commit(&mut store, workload(3, 2), &cap()).unwrap();
+        let c = p4
+            .assignments
+            .iter()
+            .find(|a| a.workload_uid == uid(3))
+            .unwrap();
         assert_eq!(c.slot, 3, "drain window holds slot 1");
         // The revocation rides along until expiry.
         assert_eq!(p4.revocations.len(), 1);
@@ -1106,8 +1130,8 @@ mod tests {
     #[test]
     fn capacity_overflow_propagates_without_committing() {
         let mut store = GenStore::new(MemStorage::default());
-        // One pod needing more modules than the node has.
-        let ds = desired(vec![pod(1, 200)]);
+        // One workload needing more modules than the node has.
+        let ds = desired(vec![workload(1, 200)]);
         let r = reconcile_and_commit(&mut store, &ds, &cap(), &OwnerSnapshot::empty(16), 1);
         assert!(matches!(
             r,
@@ -1121,13 +1145,13 @@ mod tests {
     #[test]
     fn corrupt_desired_state_is_a_hard_error() {
         let mut store = GenStore::new(MemStorage::default());
-        // Commit a live pod so persisted desired state exists.
-        upsert_pod_and_commit(&mut store, pod(1, 4), &cap()).unwrap();
+        // Commit a live workload so persisted desired state exists.
+        upsert_workload_and_commit(&mut store, workload(1, 4), &cap()).unwrap();
         // Corrupt the persisted desired set.
         store.storage.write(DESIRED_KEY, b"not json").unwrap();
-        // The next reconcile must ERROR — not silently drop the live pod by
+        // The next reconcile must ERROR — not silently drop the live workload by
         // treating corrupt state as an empty desired set.
-        let r = upsert_pod_and_commit(&mut store, pod(2, 8), &cap());
+        let r = upsert_workload_and_commit(&mut store, workload(2, 8), &cap());
         assert!(matches!(
             r,
             Err(AgentError::Store(StoreError::CorruptState))
@@ -1180,7 +1204,7 @@ mod tests {
         // write (desired set) that fails BEFORE it must leave the store with no
         // new committed generation — never "error returned but generation live".
         let mut store = GenStore::new(KeyFailStorage::fail_write(DESIRED_KEY));
-        let r = upsert_pod_and_commit(&mut store, pod(1, 4), &cap());
+        let r = upsert_workload_and_commit(&mut store, workload(1, 4), &cap());
         assert!(matches!(r, Err(AgentError::Store(StoreError::WriteFailed))));
         assert!(
             store.committed().is_none(),
@@ -1196,7 +1220,7 @@ mod tests {
         // generation — never report success, never advance the pointer.
         let mut store = GenStore::new(KeyFailStorage::fail_write("ptr.a"));
         // No pointer exists yet, so the first commit targets ptr.a → it fails.
-        let r = upsert_pod_and_commit(&mut store, pod(1, 4), &cap());
+        let r = upsert_workload_and_commit(&mut store, workload(1, 4), &cap());
         assert!(matches!(r, Err(AgentError::Store(StoreError::WriteFailed))));
         assert!(
             store.committed().is_none(),
@@ -1206,23 +1230,23 @@ mod tests {
 
     #[test]
     fn read_fault_on_desired_state_is_not_treated_as_empty() {
-        // A committed pod exists; a transient I/O fault reading the desired set
-        // must be a hard error, NOT an empty set (which would drop the pod).
+        // A committed workload exists; a transient I/O fault reading the desired set
+        // must be a hard error, NOT an empty set (which would drop the workload).
         let mut store = GenStore::new(KeyFailStorage {
             inner: MemStorage::default(),
             fail_write_key: None,
             fail_read_key: None,
         });
-        upsert_pod_and_commit(&mut store, pod(1, 4), &cap()).unwrap();
+        upsert_workload_and_commit(&mut store, workload(1, 4), &cap()).unwrap();
         // Now make reads of the desired set fault.
         store.storage.fail_read_key = Some(DESIRED_KEY.to_string());
-        let r = upsert_pod_and_commit(&mut store, pod(2, 8), &cap());
+        let r = upsert_workload_and_commit(&mut store, workload(2, 8), &cap());
         assert!(matches!(r, Err(AgentError::Store(StoreError::StorageIo))));
-        // The prior generation is untouched — the resident pod is not dropped.
+        // The prior generation is untouched — the resident workload is not dropped.
         assert_eq!(store.committed().unwrap().id, 1);
     }
 
-    /// Render a runtime-written `owner_status.json` body for one pod
+    /// Render a runtime-written `owner_status.json` body for one workload
     /// (mirrors the linux runtime writer's fixed emission), with every
     /// join-key field overridable so tests can stage mismatches.
     fn runtime_status_json_at(
@@ -1237,24 +1261,24 @@ mod tests {
         format!(
             "{{\"version\":1,\"pid\":{pid},\"pid_start_ticks\":{pid_start_ticks},\
              \"plan_generation\":{plan_generation},\
-             \"written_at\":\"2026-07-07T00:00:00Z\",\"pods\":[\
-             {{\"pod_uid_hex\":\"{uid_hex}\",\"slot\":{slot},\
+             \"written_at\":\"2026-07-07T00:00:00Z\",\"workloads\":[\
+             {{\"owner_uid_hex\":\"{uid_hex}\",\"slot\":{slot},\
              \"owner_generation\":{owner_generation},\
              \"runtime\":{runtime_body}}}]}}"
         )
     }
 
     /// [`runtime_status_json_at`] with every join-key field matching what
-    /// [`store_with_published_pod`] commits (generation 1, slot 1, owner
+    /// [`store_with_published_workload`] commits (generation 1, slot 1, owner
     /// generation 1) and this test process as the live writer.
     fn runtime_status_json(pid: u32, uid_hex: &str, runtime_body: &str) -> String {
         let ticks = proc_start_ticks(std::process::id()).unwrap_or(0);
         runtime_status_json_at(pid, ticks, 1, uid_hex, 1, 1, runtime_body)
     }
 
-    /// FsStorage-backed store in a fresh temp dir with pod 1 committed and
+    /// FsStorage-backed store in a fresh temp dir with workload 1 committed and
     /// the plan published + publish-path recorded (the full agent flow).
-    fn store_with_published_pod(
+    fn store_with_published_workload(
         tag: &str,
     ) -> (GenStore<crate::genstore::FsStorage>, std::path::PathBuf) {
         use crate::genstore::FsStorage;
@@ -1262,7 +1286,7 @@ mod tests {
             std::env::temp_dir().join(format!("fluxor-agent-rt-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut store = GenStore::new(FsStorage::open(&dir).unwrap());
-        upsert_pod_and_commit(&mut store, pod(1, 4), &cap()).unwrap();
+        upsert_workload_and_commit(&mut store, workload(1, 4), &cap()).unwrap();
         let publish = dir.join("current.plan");
         publish_committed_plan(&store, &publish).unwrap().unwrap();
         record_publish_path(&mut store, &publish).unwrap();
@@ -1271,9 +1295,34 @@ mod tests {
 
     const UID1_HEX: &str = "01000000000000000000000000000000";
 
+    /// The fixture above stands in for the runtime's writer, so it must use
+    /// the keys that writer emits. A reader keyed on anything else parses no
+    /// real status file and reports every runtime as absent.
     #[test]
-    fn status_joins_live_runtime_by_pod_uid() {
-        let (store, dir) = store_with_published_pod("join");
+    fn the_runtime_status_fixture_uses_the_writers_keys() {
+        let writer = include_str!("../../src/platform/linux/owner_status.rs");
+        let fixture = runtime_status_json(1, UID1_HEX, "{}");
+        for key in [
+            "owner_uid_hex",
+            "slot",
+            "owner_generation",
+            "plan_generation",
+            "workloads",
+        ] {
+            assert!(
+                writer.contains(&format!("\\\"{key}\\\":")),
+                "the writer emits `{key}`"
+            );
+            assert!(
+                fixture.contains(&format!("\"{key}\":")),
+                "the fixture carries `{key}`"
+            );
+        }
+    }
+
+    #[test]
+    fn status_joins_live_runtime_by_workload_uid() {
+        let (store, dir) = store_with_published_workload("join");
         let rt = "{\"phase\":\"Terminated\",\"ready\":false,\"started\":false,\
                   \"restart_count\":2,\"started_at\":\"2026-07-07T00:00:01Z\",\
                   \"terminated\":{\"reason\":\"GraphNodeFault\",\"exit_code\":2,\
@@ -1285,7 +1334,11 @@ mod tests {
         .unwrap();
 
         let st = node_status_with_runtime(&store).unwrap();
-        let p = st.pods.iter().find(|p| p.pod_uid_hex == UID1_HEX).unwrap();
+        let p = st
+            .workloads
+            .iter()
+            .find(|p| p.workload_uid_hex == UID1_HEX)
+            .unwrap();
         let rt = p.runtime.as_ref().expect("runtime joined");
         assert_eq!(rt.phase, RuntimePhase::Terminated);
         assert_eq!(rt.restart_count, 2);
@@ -1297,8 +1350,8 @@ mod tests {
         // The JSON stays additive: durable fields unchanged, `runtime` is a
         // nested optional object with the exact status-vocabulary field names.
         let v = serde_json::to_value(&st).unwrap();
-        let pj = &v["pods"][0];
-        assert_eq!(pj["pod_uid_hex"], UID1_HEX);
+        let pj = &v["workloads"][0];
+        assert_eq!(pj["workload_uid_hex"], UID1_HEX);
         assert!(pj["committed"].as_bool().unwrap());
         assert_eq!(pj["runtime"]["phase"], "Terminated");
         assert_eq!(pj["runtime"]["terminated"]["reason"], "GraphNodeFault");
@@ -1307,7 +1360,7 @@ mod tests {
 
     #[test]
     fn dead_writer_pid_means_runtime_absent() {
-        let (store, dir) = store_with_published_pod("deadpid");
+        let (store, dir) = store_with_published_workload("deadpid");
         let rt = "{\"phase\":\"Running\",\"ready\":true,\"started\":true,\"restart_count\":0}";
         // PID far above pid_max: the writer is gone; its file is history,
         // not live state.
@@ -1318,17 +1371,17 @@ mod tests {
         .unwrap();
 
         let st = node_status_with_runtime(&store).unwrap();
-        assert!(st.pods[0].runtime.is_none(), "stale file not surfaced");
+        assert!(st.workloads[0].runtime.is_none(), "stale file not surfaced");
 
         // Existing consumers see no `runtime` key at all.
         let v = serde_json::to_value(&st).unwrap();
-        assert!(v["pods"][0].get("runtime").is_none());
+        assert!(v["workloads"][0].get("runtime").is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn recycled_writer_pid_means_runtime_absent() {
-        let (store, dir) = store_with_published_pod("recycled");
+        let (store, dir) = store_with_published_workload("recycled");
         let rt = "{\"phase\":\"Running\",\"ready\":true,\"started\":true,\"restart_count\":0}";
         // The writer's PID is alive (it's ours) but the recorded start time
         // belongs to a different, earlier process: the PID was recycled.
@@ -1340,17 +1393,20 @@ mod tests {
         .unwrap();
 
         let st = node_status_with_runtime(&store).unwrap();
-        assert!(st.pods[0].runtime.is_none(), "recycled PID not trusted");
+        assert!(
+            st.workloads[0].runtime.is_none(),
+            "recycled PID not trusted"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn stale_plan_generation_drops_the_runtime_join() {
-        let (store, dir) = store_with_published_pod("stalegen");
+        let (store, dir) = store_with_published_workload("stalegen");
         let rt = "{\"phase\":\"Running\",\"ready\":true,\"started\":true,\"restart_count\":0}";
         // Live state derived under a different plan generation (runtime not
         // yet rebuilt onto the current commit) must not attach to the new
-        // durable records — same PID, same pod UID, wrong generation.
+        // durable records — same PID, same workload UID, wrong generation.
         let ticks = proc_start_ticks(std::process::id()).unwrap_or(0);
         std::fs::write(
             dir.join("owner_status.json"),
@@ -1360,7 +1416,7 @@ mod tests {
 
         let st = node_status_with_runtime(&store).unwrap();
         assert!(
-            st.pods[0].runtime.is_none(),
+            st.workloads[0].runtime.is_none(),
             "cross-generation join refused"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -1371,19 +1427,19 @@ mod tests {
         let rt = "{\"phase\":\"Running\",\"ready\":true,\"started\":true,\"restart_count\":0}";
         let ticks = proc_start_ticks(std::process::id()).unwrap_or(0);
 
-        // Right pod UID, wrong slot.
-        let (store, dir) = store_with_published_pod("wrongslot");
+        // Right workload UID, wrong slot.
+        let (store, dir) = store_with_published_workload("wrongslot");
         std::fs::write(
             dir.join("owner_status.json"),
             runtime_status_json_at(std::process::id(), ticks, 1, UID1_HEX, 9, 1, rt),
         )
         .unwrap();
         let st = node_status_with_runtime(&store).unwrap();
-        assert!(st.pods[0].runtime.is_none(), "slot mismatch refused");
+        assert!(st.workloads[0].runtime.is_none(), "slot mismatch refused");
         let _ = std::fs::remove_dir_all(&dir);
 
-        // Right pod UID and slot, wrong owner generation.
-        let (store, dir) = store_with_published_pod("wrongogen");
+        // Right workload UID and slot, wrong owner generation.
+        let (store, dir) = store_with_published_workload("wrongogen");
         std::fs::write(
             dir.join("owner_status.json"),
             runtime_status_json_at(std::process::id(), ticks, 1, UID1_HEX, 1, 9, rt),
@@ -1391,7 +1447,7 @@ mod tests {
         .unwrap();
         let st = node_status_with_runtime(&store).unwrap();
         assert!(
-            st.pods[0].runtime.is_none(),
+            st.workloads[0].runtime.is_none(),
             "owner-generation mismatch refused"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -1399,7 +1455,7 @@ mod tests {
 
     #[test]
     fn out_of_vocabulary_reason_drops_the_runtime_join() {
-        let (store, dir) = store_with_published_pod("vocab");
+        let (store, dir) = store_with_published_workload("vocab");
         let rt = "{\"phase\":\"Terminated\",\"ready\":false,\"started\":false,\
                   \"restart_count\":0,\"terminated\":{\"reason\":\"SomethingNew\",\
                   \"exit_code\":1,\"signal\":null,\"finished_at\":\"2026-07-07T00:00:02Z\"}}";
@@ -1412,7 +1468,7 @@ mod tests {
         // Reasons outside the closed set are never emitted — a file
         // carrying one fails strict parse and the join is dropped.
         let st = node_status_with_runtime(&store).unwrap();
-        assert!(st.pods[0].runtime.is_none());
+        assert!(st.workloads[0].runtime.is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1420,14 +1476,14 @@ mod tests {
     fn missing_status_file_or_publish_record_is_not_an_error() {
         // No publish path recorded at all (MemStorage, no publish).
         let mut store = GenStore::new(MemStorage::default());
-        upsert_pod_and_commit(&mut store, pod(1, 4), &cap()).unwrap();
+        upsert_workload_and_commit(&mut store, workload(1, 4), &cap()).unwrap();
         let st = node_status_with_runtime(&store).unwrap();
-        assert!(st.pods[0].runtime.is_none());
+        assert!(st.workloads[0].runtime.is_none());
 
         // Publish recorded but no owner_status.json written yet.
-        let (store, dir) = store_with_published_pod("nofile");
+        let (store, dir) = store_with_published_workload("nofile");
         let st = node_status_with_runtime(&store).unwrap();
-        assert!(st.pods[0].runtime.is_none());
+        assert!(st.workloads[0].runtime.is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1439,7 +1495,7 @@ mod tests {
     fn status_surfaces_abi_pin_and_mismatch() {
         let mut store = GenStore::new(MemStorage::default());
         let cap = cap();
-        upsert_pod_and_commit(&mut store, pod(1, 1), &cap).expect("commit");
+        upsert_workload_and_commit(&mut store, workload(1, 1), &cap).expect("commit");
 
         let st = node_status(&store).expect("status");
         assert_eq!(st.committed_abi_surface.as_ref(), Some(&st.abi_surface));

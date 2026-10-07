@@ -108,7 +108,7 @@ const MAX_PACER_INSTANCES: usize = MAX_DOMAINS;
 
 /// Bounded MULTI-graph pacer-instance table size — mirrors the kernel's
 /// `scheduler::MAX_GRAPH_PACERS`. When more than one resident graph is admitted
-/// (a base graph plus `pods:`), the live pacer instances are the
+/// (a base graph plus `workloads:`), the live pacer instances are the
 /// `(graph_instance, domain)` pairs across all resident graphs, capped by this
 /// static table.
 const MAX_GRAPH_PACER_INSTANCES: usize = 16;
@@ -382,37 +382,37 @@ fn validate_scheduler_budgets(
 /// accepts both styles (schema.rs:298-335), so the raft liveness and multi-node
 /// gates must read both too — otherwise the normal top-level style silently
 /// bypasses them.
-/// Resident-graph (pod) pacer-table admission. Counts the base graph's
-/// domains plus each `pods:` entry's distinct module domains and rejects configs
+/// Resident-graph (workload) pacer-table admission. Counts the base graph's
+/// domains plus each `workloads:` entry's distinct module domains and rejects configs
 /// that would exceed the kernel's static `GRAPH_PACERS` table. Runs regardless of
 /// `adaptive_flags` — the runtime keys/steps the resident-graph table for ANY
 /// multi-graph config (fixed-tick included), and an overflow is silently dropped
 /// at runtime, so it must fail the build.
 fn validate_resident_workload_table(config: &Value, domain_count: usize) -> Result<()> {
-    let Some(pods) = config.get("pods").and_then(|p| p.as_array()) else {
+    let Some(workloads) = config.get("workloads").and_then(|p| p.as_array()) else {
         return Ok(());
     };
     let mut total = domain_count.max(1);
-    for pod in pods.iter() {
-        // A pod's pacer instances = the number of distinct module domains it
+    for workload in workloads.iter() {
+        // A workload's pacer instances = the number of distinct module domains it
         // declares (a self-contained subgraph), default 1.
         let mut seen = [false; MAX_DOMAINS];
-        let mut pod_domains = 0usize;
-        let mods = pod
+        let mut workload_domains = 0usize;
+        let mods = workload
             .get("modules")
             .and_then(|m| m.as_array())
             .cloned()
-            .unwrap_or_else(|| vec![pod.clone()]);
+            .unwrap_or_else(|| vec![workload.clone()]);
         for m in &mods {
             // Domain resolved by NAME against execution.domains (hard-errors on an
             // undeclared domain, like base modules); numeric/absent ⇒ domain 0.
             let d = resolve_domain_id(m, config)? as usize;
             if !seen[d] {
                 seen[d] = true;
-                pod_domains += 1;
+                workload_domains += 1;
             }
         }
-        total += pod_domains.max(1);
+        total += workload_domains.max(1);
     }
     if total > MAX_GRAPH_PACER_INSTANCES {
         return Err(Error::Config(format!(
@@ -420,8 +420,8 @@ fn validate_resident_workload_table(config: &Value, domain_count: usize) -> Resu
              exceeding the kernel's static pacer table ({MAX_GRAPH_PACER_INSTANCES}, \
              scheduler::MAX_GRAPH_PACERS). The runtime never allocates pacer state on \
              a hot path, so resident graphs are statically capped. Reduce the number \
-             of pods, or the number of distinct domains they place modules in.",
-            pods.len() + 1
+             of workloads, or the number of distinct domains they place modules in.",
+            workloads.len() + 1
         )));
     }
     Ok(())
@@ -530,9 +530,9 @@ fn validate_adaptive_tick(
         }
     }
     // Multi-graph pacer-table admission runs BEFORE the adaptive-only early
-    // return: resident pods are admitted and the resident-graph table is
+    // return: resident workloads are admitted and the resident-graph table is
     // keyed/stepped regardless of `adaptive_flags`
-    // (fixed-tick multi-graph still uses it), so an overflowing `pods:` set must
+    // (fixed-tick multi-graph still uses it), so an overflowing `workloads:` set must
     // be rejected at build time even with no adaptive domain — otherwise a
     // graph/domain instance would just be silently dropped at runtime.
     validate_resident_workload_table(config, domain_count)?;

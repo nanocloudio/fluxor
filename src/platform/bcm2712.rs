@@ -3112,11 +3112,12 @@ static BCM2712_HAL_OPS: HalOps = HalOps {
     restore_interrupts: bcm_restore_interrupts,
     wake_scheduler: bcm_wake_scheduler,
     now_millis: bcm_now_millis,
-    now_unix_millis: || 0, // no RTC on this platform
-    // No RTC, so nothing to say about its synchronisation either.
-    // `None` rather than `Some((false, _))`: this board cannot tell, which
-    // is a different fact from telling us the clock is unsynchronised.
-    clock_sync_status: || None,
+    // No RTC: the wall clock is the network-disciplined one (`time_sync`),
+    // anchored by an in-graph time client through `timer::DISCIPLINE`. Until
+    // the first anchor it reads 0 and the sync status is `None` — this board
+    // cannot tell, which is a different fact from an unsynchronised clock.
+    now_unix_millis: || fluxor::kernel::sys::time_sync::unix_millis(bcm_now_micros()),
+    clock_sync_status: || fluxor::kernel::sys::time_sync::status(bcm_now_micros()),
     // No sealing on this platform yet.
     //
     // `None` rather than a host-readable stand-in: a sealing key stored in
