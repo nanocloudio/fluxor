@@ -503,9 +503,14 @@ mod profile_embedded {
         pub const STATE_ARENA_SIZE: usize = 240 * 1024;
         #[cfg(fluxor_silicon = "rp2040")]
         pub const STATE_ARENA_SIZE: usize = 64 * 1024;
-        /// Loader sanity ceiling for a single module's code segment.
-        /// 384 KiB — an MCU profile can't host MiB-class media
-        /// modules anyway.
+        /// Loader sanity ceiling for a single module's code segment. Code
+        /// executes in place from flash, so this costs no RAM and is set by
+        /// the part's flash: 1 MiB on the 4 MiB RP2350, which a JavaScript
+        /// engine (~440 KiB) fits; 384 KiB on the 2 MiB RP2040.
+        /// `module_code_kb` in the silicon TOML mirrors it for the packer.
+        #[cfg(not(fluxor_silicon = "rp2040"))]
+        pub const MAX_MODULE_CODE_SIZE: usize = 1024 * 1024;
+        #[cfg(fluxor_silicon = "rp2040")]
         pub const MAX_MODULE_CODE_SIZE: usize = 384 * 1024;
         #[cfg(not(fluxor_silicon = "rp2040"))]
         pub const BUFFER_ARENA_SIZE: usize = 64 * 1024;

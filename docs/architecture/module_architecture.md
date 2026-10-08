@@ -318,7 +318,7 @@ symbol, and the module does not link.
 
 | Construct | rp2040 | rp2350 | bcm2712 | Write instead |
 |---|---|---|---|---|
-| `f32` arithmetic | does not link (soft-float) | **links, then faults the whole node** — see below | native | scaled integers (fixed-point) |
+| `f32` arithmetic | does not link (soft-float) | does not link (soft-float) — see below | native | scaled integers (fixed-point) |
 | `f64` arithmetic | does not link | does not link | native | scaled integers (fixed-point) |
 | `a / b`, `a % b` on any integer type, divisor not provably non-zero | does not link | does not link | does not link | a `NonZero*` divisor, or `checked_div` / `checked_rem` |
 | signed `a / b`, `a % b` with zero ruled out | does not link | does not link | does not link | `checked_div` / `checked_rem`, or divide the magnitudes unsigned and restore the sign |
@@ -338,15 +338,21 @@ answers its panic with a trap that spins: an out-of-bounds index does not
 fault, the step simply never returns. Use `get(..)` wherever the index is not
 provably in range.
 
-On rp2350 `f32` is a trap of a different kind, and a worse one. The target
-is `thumbv8m.main-none-eabihf`, so the compiler lowers `f32` to VFP
-instructions rather than calls, and the module links. The RP kernel does not
-grant the coprocessor, so the first such instruction is a NOCP UsageFault
-(CFSR bit 19); the fault handler reports it and parks the node. One `f32` operation in any module stops every module on the board,
-not just its own. The FPU stays off by design: enabling it means lazy FP
-context stacking on every exception (72 more bytes on the kernel stack each
-time) and scrubbing the FP registers between modules, for no module that
-needs it. A rig scenario holds this on the silicon.
+On rp2350 the kernel is built `thumbv8m.main-none-eabihf` but modules are
+built `thumbv8m.main-none-eabi`, the soft-float ABI. The RP kernel does not
+grant the coprocessor, so any VFP instruction a module reached would be a
+NOCP UsageFault (CFSR bit 19) that parks the node — every module on the
+board, not just its own. Under the hard-float ABI a module reached them
+without asking: `f32` lowers to VFP instructions and links, and every `f64`
+passed between functions moves through VFP registers, so even a module that
+supplies its own soft-float routines faulted. Under the soft-float ABI `f32`
+is an undefined symbol at link, as on rp2040, and a module that needs
+floating point brings its own `__aeabi_*` routines and runs. Nothing floating
+crosses the module boundary, so the two ABIs never meet. The FPU stays off by
+design: enabling it means lazy FP context stacking on every exception (72
+more bytes on the kernel stack each time) and scrubbing the FP registers
+between modules, for no module that needs it. A rig scenario holds this on
+the silicon, issuing the one VFP instruction by hand.
 
 The build holds this table true: a check builds one module per construct
 for each die and fails the moment any row stops matching, so a toolchain
@@ -467,7 +473,11 @@ call remains bounded and non-blocking.
 `module_deferred_ready` (header flag bit 2) gates its downstream consumers
 until it returns `Ready` from a step. This is how drivers like cyw43 and
 the IP module signal "I am initialised" without the kernel needing to
-know what initialisation means for any specific device.
+know what initialisation means for any specific device. A module that
+requires a contract a deferred-ready module provides is gated the same
+way, though no edge joins them: a store that mounts its disk after the
+graph starts stepping answers `EAGAIN` until it is ready, and its
+consumers wait for `Ready` rather than reading that as a refusal.
 
 ### Drain Contract (Live Reconfigure)
 

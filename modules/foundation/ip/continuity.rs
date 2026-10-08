@@ -369,7 +369,7 @@ pub(super) unsafe fn after_segment(
         return;
     }
     let (state_after, rcv_after) = {
-        let c = &*s.tcp_conns.as_ptr().add(idx);
+        let c = &*s.tcp_conns.ptr(idx);
         (c.state, c.rcv_nxt)
     };
     let fin_before = matches!(
@@ -407,7 +407,7 @@ pub fn codec_digest() -> [u8; 32] {
 
 /// The flow identity of connection `idx`.
 pub(super) unsafe fn flow_id_of(s: &IpState, idx: usize) -> [u8; 16] {
-    let c = &*s.tcp_conns.as_ptr().add(idx);
+    let c = &*s.tcp_conns.ptr(idx);
     let local = local_ip_for_slot(s, c.local_slot);
     let mut f = [0u8; 16];
     f[..4].copy_from_slice(&local.to_be_bytes());
@@ -608,7 +608,7 @@ pub(super) unsafe fn encode_record(
     idx: usize,
     out: &mut [u8; TCP_RECORD_MAX],
 ) -> usize {
-    let c = &*s.tcp_conns.as_ptr().add(idx);
+    let c = &*s.tcp_conns.ptr(idx);
     let local = local_ip_for_slot(s, c.local_slot);
     let slot = if c.local_slot == tcp::LOCAL_SLOT_ANY {
         0
@@ -1067,7 +1067,7 @@ pub(super) unsafe fn fin_gate(s: &mut IpState, idx: usize) -> bool {
     let Some(mi) = mirror_of_conn(s, idx) else {
         return true;
     };
-    let seq = (*s.tcp_conns.as_ptr().add(idx)).snd_nxt;
+    let seq = (*s.tcp_conns.ptr(idx)).snd_nxt;
     {
         let m = &s.cont.mirrors[mi];
         if m.live == 0 || m.profile != sc::PROFILE_CRASH_CONTINUOUS {
@@ -1104,7 +1104,7 @@ pub(super) unsafe fn on_acked(s: &mut IpState, idx: usize) {
     if s.cont.mirrors[mi].live == 0 {
         return;
     }
-    let c = &*s.tcp_conns.as_ptr().add(idx);
+    let c = &*s.tcp_conns.ptr(idx);
     let mut body = [0u8; 10];
     body[..4].copy_from_slice(&c.snd_una.to_le_bytes());
     body[4..6].copy_from_slice(&c.snd_wnd.to_le_bytes());
@@ -1124,7 +1124,7 @@ pub(super) unsafe fn on_state(s: &mut IpState, idx: usize) {
     if s.cont.mirrors[mi].live == 0 {
         return;
     }
-    let c = &*s.tcp_conns.as_ptr().add(idx);
+    let c = &*s.tcp_conns.ptr(idx);
     let mut body = [0u8; 11];
     body[0] = state_code(c.state);
     body[1..3].copy_from_slice(&c.rto.to_le_bytes());
@@ -1357,7 +1357,7 @@ unsafe fn cmd_pair_prepare(s: &mut IpState, flow: &[u8; 16], epoch: u32, p: &[u8
             );
             return;
         };
-        let state = (*s.tcp_conns.as_ptr().add(idx)).state;
+        let state = (*s.tcp_conns.ptr(idx)).state;
         if !state_exportable(state) {
             reply(
                 s,
@@ -1369,7 +1369,7 @@ unsafe fn cmd_pair_prepare(s: &mut IpState, flow: &[u8; 16], epoch: u32, p: &[u8
             );
             return;
         }
-        let rcv_nxt = (*s.tcp_conns.as_ptr().add(idx)).rcv_nxt;
+        let rcv_nxt = (*s.tcp_conns.ptr(idx)).rcv_nxt;
         s.cont.mirrors[mi].clear();
         let m = &mut s.cont.mirrors[mi];
         m.in_use = 1;
@@ -1437,7 +1437,7 @@ unsafe fn cmd_pair_prepare(s: &mut IpState, flow: &[u8; 16], epoch: u32, p: &[u8
         );
         return;
     };
-    (*s.tcp_conns.as_mut_ptr().add(idx)).pending_close_notify = NOTIFY_SHADOW_RESERVED;
+    (*s.tcp_conns.ptr_mut(idx)).pending_close_notify = NOTIFY_SHADOW_RESERVED;
     s.cont.shadows[si].clear();
     let sh = &mut s.cont.shadows[si];
     sh.in_use = 1;
@@ -1480,8 +1480,8 @@ fn mirror_for(s: &IpState, flow: &[u8; 16], epoch: u32) -> Result<usize, u8> {
 
 unsafe fn discard_shadow(s: &mut IpState, si: usize) {
     let idx = s.cont.shadows[si].conn_idx;
-    if (idx as usize) < tcp::MAX_TCP_CONNS {
-        let c = &mut *s.tcp_conns.as_mut_ptr().add(idx as usize);
+    if (idx as usize) < s.tcp_conns.len() {
+        let c = &mut *s.tcp_conns.ptr_mut(idx as usize);
         if c.pending_close_notify == NOTIFY_SHADOW_RESERVED {
             c.pending_close_notify = NOTIFY_NONE;
         }
@@ -2008,7 +2008,7 @@ unsafe fn cmd_delta_ack(s: &mut IpState, flow: &[u8; 16], epoch: u32, p: &[u8]) 
         }
         m.recv_ring_len = kept as u8;
     }
-    if ack_moved && idx < tcp::MAX_TCP_CONNS {
+    if ack_moved && idx < s.tcp_conns.len() {
         // The horizon moved: show the peer the acknowledgement it earns.
         send_tcp_control(s, idx, tcp::ACK, false);
     }
@@ -2032,7 +2032,7 @@ unsafe fn cmd_quiesce_begin(s: &mut IpState, flow: &[u8; 16], epoch: u32, p: &[u
     m.quiescing = 1;
     m.quiesce_deadline_ms = now.wrapping_add(deadline).max(1);
     // Close the receive window so the peer stops sending into the cut.
-    (*s.tcp_conns.as_mut_ptr().add(idx)).rcv_wnd = 0;
+    (*s.tcp_conns.ptr_mut(idx)).rcv_wnd = 0;
     send_tcp_control(s, idx, tcp::ACK, false);
     quiesce_reply(s, mi);
 }
@@ -2041,7 +2041,7 @@ unsafe fn quiesce_reply(s: &mut IpState, mi: usize) {
     let (flow, epoch) = (s.cont.mirrors[mi].flow_id, s.cont.mirrors[mi].epoch);
     let drained = mirror_drained(s, mi);
     let idx = s.cont.mirrors[mi].conn_idx as usize;
-    let c = &*s.tcp_conns.as_ptr().add(idx);
+    let c = &*s.tcp_conns.ptr(idx);
     let pending_out = c.snd_nxt.wrapping_sub(c.snd_una);
     let pending_in = if s.pending_cmd_valid != 0 && s.pending_cmd_conn as usize == idx {
         u32::from(s.pending_cmd_len)
@@ -2071,7 +2071,7 @@ unsafe fn cmd_cut_export(s: &mut IpState, flow: &[u8; 16], epoch: u32) {
         }
     };
     let idx = s.cont.mirrors[mi].conn_idx as usize;
-    let state = (*s.tcp_conns.as_ptr().add(idx)).state;
+    let state = (*s.tcp_conns.ptr(idx)).state;
     if !state_exportable(state) {
         reply(
             s,
@@ -2104,7 +2104,7 @@ unsafe fn cmd_cut_export(s: &mut IpState, flow: &[u8; 16], epoch: u32) {
     m.export_off = 0;
     m.export_digest = digest;
     m.export_active = 1;
-    m.recv_horizon = (*s.tcp_conns.as_ptr().add(idx)).rcv_nxt;
+    m.recv_horizon = (*s.tcp_conns.ptr(idx)).rcv_nxt;
     // BEGIN goes out now; chunks and COMMIT follow as the channel admits.
     let (gen, flow_id) = (s.cont.mirrors[mi].ckpt_gen, s.cont.mirrors[mi].flow_id);
     let mut hdr = [0u8; sc::CHECKPOINT_BEGIN_PAYLOAD_LEN];
@@ -2249,7 +2249,7 @@ unsafe fn cmd_emission_arm(s: &mut IpState, flow: &[u8; 16], epoch: u32) {
         reply(s, flow, epoch, sc::CR_ARMED, sc::STATUS_NOT_READY, &[0]);
         return;
     }
-    if conn_idx >= tcp::MAX_TCP_CONNS || !slot_is_reserved(s, conn_idx) {
+    if conn_idx >= s.tcp_conns.len() || !slot_is_reserved(s, conn_idx) {
         reply(s, flow, epoch, sc::CR_ARMED, sc::STATUS_NO_CAPACITY, &[0]);
         return;
     }
@@ -2318,7 +2318,7 @@ unsafe fn cmd_activate(s: &mut IpState, flow: &[u8; 16], epoch_new: u32, p: &[u8
         );
         return;
     }
-    if idx >= tcp::MAX_TCP_CONNS || !slot_is_reserved(s, idx) {
+    if idx >= s.tcp_conns.len() || !slot_is_reserved(s, idx) {
         reply(
             s,
             flow,
@@ -2336,9 +2336,9 @@ unsafe fn cmd_activate(s: &mut IpState, flow: &[u8; 16], epoch_new: u32, p: &[u8
     let mut conn: tcp::TcpConn = core::ptr::read(&s.cont.shadows[si].conn);
     let _ = convert_timers(s, &mut conn, age_ticks);
     conn.pending_close_notify = NOTIFY_NONE;
-    *s.tcp_conns.as_mut_ptr().add(idx) = conn;
+    *s.tcp_conns.ptr_mut(idx) = conn;
     conn_index_insert(s, idx);
-    let remote_ip = (*s.tcp_conns.as_ptr().add(idx)).remote_ip;
+    let remote_ip = (*s.tcp_conns.ptr(idx)).remote_ip;
     arp::pin(&mut s.arp_table, remote_ip);
     // The window the primary advertised at its cut was closed for the
     // quiesce; this side's consumer decides the window from here.
@@ -2353,7 +2353,7 @@ unsafe fn cmd_activate(s: &mut IpState, flow: &[u8; 16], epoch_new: u32, p: &[u8
 }
 
 fn slot_is_reserved(s: &IpState, idx: usize) -> bool {
-    let c = unsafe { &*s.tcp_conns.as_ptr().add(idx) };
+    let c = unsafe { &*s.tcp_conns.ptr(idx) };
     c.state == tcp::TcpState::Closed && c.pending_close_notify == NOTIFY_SHADOW_RESERVED
 }
 
@@ -2374,8 +2374,8 @@ unsafe fn cmd_retire(s: &mut IpState, flow: &[u8; 16], epoch: u32) {
     if s.pending_close_valid != 0 && s.pending_close_conn as usize == idx {
         s.pending_close_valid = 0;
     }
-    if idx < tcp::MAX_TCP_CONNS {
-        let remote_ip = (*s.tcp_conns.as_ptr().add(idx)).remote_ip;
+    if idx < s.tcp_conns.len() {
+        let remote_ip = (*s.tcp_conns.ptr(idx)).remote_ip;
         if remote_ip != 0 {
             arp::unpin(&mut s.arp_table, remote_ip);
         }
@@ -2399,7 +2399,7 @@ unsafe fn cmd_abort(s: &mut IpState, flow: &[u8; 16], epoch: u32, p: &[u8]) {
             let idx = s.cont.mirrors[mi].conn_idx as usize;
             let quiescing = s.cont.mirrors[mi].quiescing != 0;
             s.cont.mirrors[mi].clear();
-            if quiescing && idx < tcp::MAX_TCP_CONNS {
+            if quiescing && idx < s.tcp_conns.len() {
                 // Reopen what the quiesce closed.
                 update_rcv_wnd(s, idx);
             }

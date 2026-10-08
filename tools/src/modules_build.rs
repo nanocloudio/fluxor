@@ -57,7 +57,9 @@ const SILICON_SPECS: &[SiliconSpec] = &[
     },
     SiliconSpec {
         silicon_id: "rp2350",
-        module_target: "thumbv8m.main-none-eabihf",
+        // Soft-float, though the kernel is `eabihf`: see `module_target` in
+        // targets/silicon/rp2350.toml.
+        module_target: "thumbv8m.main-none-eabi",
         extra_rustflags: &[],
         linker: Some(LinkerSpec {
             program: "arm-none-eabi-ld",
@@ -905,7 +907,13 @@ fn build_one_target(
             continue;
         }
         let out_path = out_dir.join(format!("{}.fmod", cand.name));
-        if is_up_to_date(cand, &out_path, &opts.project_root, opts.strict) {
+        if is_up_to_date(
+            cand,
+            &out_path,
+            &opts.project_root,
+            opts.strict,
+            spec.module_target,
+        ) {
             report.up_to_date.push(cand.name.clone());
             continue;
         }
@@ -941,7 +949,7 @@ fn build_one_target(
             Ok(BuildOutcome::Built) => {
                 // Beside the artefact, so a later run can tell a lenient
                 // build from a strict one (they are byte-identical).
-                write_stamp(&out_path, opts.strict);
+                write_stamp(&out_path, opts.strict, spec.module_target);
                 report.built.push(name);
             }
             Ok(BuildOutcome::Skipped(reason)) => {
@@ -968,6 +976,7 @@ fn is_up_to_date(
     out_path: &Path,
     project_root: &Path,
     want_strict: bool,
+    module_target: &str,
 ) -> bool {
     let out_mtime = match mtime(out_path) {
         Some(m) => m,
@@ -984,6 +993,13 @@ fn is_up_to_date(
     // Ordered, not equal: an artefact built strictly satisfies a lenient
     // request, so only lenient-then-strict invalidates.
     if want_strict && !stamped_strict(out_path) {
+        return false;
+    }
+    // The target is part of the compile as well, and nothing else here can
+    // see it: a silicon whose module target changes (rp2350 moving from
+    // `eabihf` to soft-float) leaves every source older than every object,
+    // and the objects would be re-packed in the old ABI.
+    if stamped_target(out_path).as_deref() != Some(module_target) {
         return false;
     }
     if !sources_older_than(cand, out_mtime, project_root) {
@@ -1176,9 +1192,20 @@ fn stamped_strict(out_path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// The target triple the artefact at `out_path` was compiled for, if stamped.
+///
+/// A stamp from before the target was recorded answers `None`, so such an
+/// artefact is rebuilt once rather than trusted.
+fn stamped_target(out_path: &Path) -> Option<String> {
+    std::fs::read_to_string(stamp_path(out_path))
+        .ok()?
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("target=").map(str::to_string))
+}
+
 /// Record how this artefact was built, beside it.
-fn write_stamp(out_path: &Path, strict: bool) {
-    let body = format!("strict={}\n", u8::from(strict));
+fn write_stamp(out_path: &Path, strict: bool, module_target: &str) {
+    let body = format!("strict={}\ntarget={module_target}\n", u8::from(strict));
     let _ = std::fs::write(stamp_path(out_path), body);
 }
 
@@ -2251,7 +2278,7 @@ pub static RS_NAMES: [&[u8]; 2] = [b"src/a.rs", b"src/b.rs"];
     fn the_lint_refuses_every_table_code_reads_and_nothing_else() {
         for (target, match_table_absolute) in [
             ("thumbv6m-none-eabi", true),
-            ("thumbv8m.main-none-eabihf", true),
+            ("thumbv8m.main-none-eabi", true),
             ("aarch64-unknown-none", false),
         ] {
             let found = absolute_relocations(&compiled(target)).expect("parses");
@@ -2443,14 +2470,19 @@ pub static RS_NAMES: [&[u8]; 2] = [b"src/a.rs", b"src/b.rs"];
             "a missing stamp must read as not-strict, not as strict"
         );
 
-        write_stamp(&out, false);
+        write_stamp(&out, false, "thumbv8m.main-none-eabi");
         assert!(!stamped_strict(&out), "a lenient build records lenient");
 
-        write_stamp(&out, true);
+        write_stamp(&out, true, "thumbv8m.main-none-eabi");
         assert!(stamped_strict(&out), "a strict build records strict");
         assert_eq!(
             std::fs::read_to_string(stamp_path(&out)).unwrap(),
-            "strict=1\n"
+            "strict=1\ntarget=thumbv8m.main-none-eabi\n"
+        );
+        assert_eq!(
+            stamped_target(&out).as_deref(),
+            Some("thumbv8m.main-none-eabi"),
+            "the target is part of the key: a changed module target rebuilds"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

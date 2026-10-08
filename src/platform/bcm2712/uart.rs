@@ -5,9 +5,11 @@
 //!     log ring; the platform debug drain ([`Bcm2712UartSink`]) drains
 //!     to the wire from core 0 once per scheduler tick.
 //!   * **Raw** (`uart_raw_*`): synchronous direct MMIO writes used only
-//!     by the exception / panic handler, which cannot rely on the
-//!     scheduler still being alive. Gated on [`UART_READY`] so panics
-//!     before `uart_init` don't poke an unmapped peripheral.
+//!     by the boot fail-stop and the exception / panic handler, which
+//!     cannot rely on the scheduler still being alive. Callers gate on
+//!     [`UART_READY`] so a panic before `uart_init` doesn't poke an
+//!     unmapped peripheral. On the Pi 5 the raw path writes every byte to
+//!     the debug UART as well, and writes off a port that stops draining.
 //!
 //! Register layout (PL011, board-pi5 only; QEMU's PL011 ignores FR for
 //! TX-readiness so the `#[cfg]` branches collapse to "always-write"):
@@ -112,10 +114,70 @@ pub fn uart_raw_putc(c: u8) {
     unsafe {
         #[cfg(feature = "board-pi5")]
         {
-            while core::ptr::read_volatile(UART_FR) & UART_FR_TXFF != 0 {}
+            raw_put(RAW_PORT_RP1, UART_FR, UART_DR, c);
+            raw_put(
+                RAW_PORT_DEBUG,
+                (DEBUG_UART_BASE + 0x18) as *const u32,
+                DEBUG_UART_BASE as *mut u32,
+                c,
+            );
         }
+        #[cfg(not(feature = "board-pi5"))]
         core::ptr::write_volatile(UART_DR, c as u32);
     }
+}
+
+/// The Pi 5's dedicated debug UART: the 3-pin JST header, `uart10` in the
+/// board's device tree, and the console a bench cable is usually on. The
+/// raw path writes every byte to it as well as to RP1 UART0 on GPIO14/15,
+/// so a board that halts before its network is up says why on whichever
+/// port is wired. Nothing here configures it: it is used as the firmware
+/// left it, and a port left unclocked is written off by [`raw_put`].
+#[cfg(feature = "board-pi5")]
+const DEBUG_UART_BASE: usize = 0x10_7d00_1000;
+/// Spin bound for one byte's FIFO-full wait on the raw path. Device-memory
+/// reads are on the order of 100 ns, so this is about 20 ms: hundreds of
+/// character times at 115200 baud, long enough for any live FIFO to drain
+/// and the whole cost of finding a dead port.
+#[cfg(feature = "board-pi5")]
+const RAW_SPIN_MAX: u32 = 200_000;
+
+#[cfg(feature = "board-pi5")]
+const RAW_PORT_RP1: usize = 0;
+#[cfg(feature = "board-pi5")]
+const RAW_PORT_DEBUG: usize = 1;
+/// A port that held its FIFO full for a whole spin bound is written off for
+/// the rest of the run: its clock is gated or nothing drains it, and
+/// waiting the bound again for every byte would turn the fail-stop's log
+/// dump into minutes. The raw path alone sets this; the normal path never
+/// spins.
+#[cfg(feature = "board-pi5")]
+static RAW_STALLED: [core::sync::atomic::AtomicBool; 2] = [
+    core::sync::atomic::AtomicBool::new(false),
+    core::sync::atomic::AtomicBool::new(false),
+];
+
+/// Write `c` to the PL011 at `dr` once its FIFO has room, or write the port
+/// off if it never makes room.
+///
+/// # Safety
+/// `fr` and `dr` are the FR and DR registers of a PL011 in the SoC or RP1
+/// peripheral aperture, mapped as device memory by boot_mmu.
+#[cfg(feature = "board-pi5")]
+unsafe fn raw_put(port: usize, fr: *const u32, dr: *mut u32, c: u8) {
+    use core::sync::atomic::Ordering::Relaxed;
+    if RAW_STALLED[port].load(Relaxed) {
+        return;
+    }
+    let mut spins = 0u32;
+    while core::ptr::read_volatile(fr) & UART_FR_TXFF != 0 {
+        spins += 1;
+        if spins >= RAW_SPIN_MAX {
+            RAW_STALLED[port].store(true, Relaxed);
+            return;
+        }
+    }
+    core::ptr::write_volatile(dr, c as u32);
 }
 
 pub fn uart_raw_puts(s: &[u8]) {

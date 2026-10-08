@@ -71,6 +71,58 @@ pub(crate) fn compute_upstream_mask(edges: &[Edge], edge_count: usize) {
     }
 }
 
+/// The contract-readiness gate: a module that requires a contract whose
+/// default provider is a deferred-ready MODULE waits for that provider to
+/// signal `Ready`, exactly as a module downstream of it on an edge would.
+///
+/// The edge gate above cannot see this dependency: a consumer reaches its
+/// provider through `provider_call`, not a channel. And it matters wherever a
+/// provider cannot be ready at construction — a store whose disk mounts only
+/// once the graph steps (bare metal: nvme, then fat32, then the store) answers
+/// `EAGAIN` until then, and a consumer that subscribes or reads once at its
+/// first step concludes it was refused and never asks again.
+///
+/// Runs after instantiation, when providers have registered (the edge mask
+/// is computed before it). Deferred-ready consumers are left ungated, as the
+/// edge gate leaves them, so providers that require each other's contracts
+/// still step to readiness. Returns how many consumer→provider gates it set.
+pub(crate) fn gate_contract_consumers() -> usize {
+    // SAFETY: scheduler-thread context, after instantiation.
+    let sched = unsafe {
+        let p = &raw mut SCHED;
+        &mut *p
+    };
+    let mut gated = 0usize;
+    // One bit per contract in `required_caps`.
+    for contract in 0..u64::BITS as usize {
+        let Some(provider) = crate::kernel::module::provider::default_module_provider(contract)
+        else {
+            continue;
+        };
+        if provider >= MAX_MODULES || !sched.deferred_ready[provider] {
+            continue;
+        }
+        let mut n = 0usize;
+        for m in 0..MAX_MODULES {
+            if m == provider
+                || sched.deferred_ready[m]
+                || sched.required_caps[m] & (1u64 << contract) == 0
+            {
+                continue;
+            }
+            sched.upstream_mask[m].set(provider);
+            n += 1;
+        }
+        if n > 0 {
+            log::info!(
+                "[ready] contract 0x{contract:02x}: {n} consumer(s) wait on provider module {provider}"
+            );
+            gated += n;
+        }
+    }
+    gated
+}
+
 /// After this, EXEC_ORDER contains module indices in dependency order:
 /// sources first, sinks last. This ensures that within a single scheduler pass,
 /// data flows through an entire chain (e.g. sequencer → synth → effects → i2s)

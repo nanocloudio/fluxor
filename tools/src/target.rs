@@ -38,6 +38,7 @@ struct TomlSiliconFile {
 #[derive(Deserialize, Default)]
 struct TomlKernelConfig {
     state_arena_kb: Option<u32>,
+    module_code_kb: Option<u32>,
     ram_static_max_kb: Option<u32>,
     kernel_stack_reserve_kb: Option<u32>,
     kernel_stack_kb: Option<u32>,
@@ -400,6 +401,9 @@ pub struct TargetDescriptor {
         std::collections::HashMap<String, std::collections::HashMap<String, String>>,
     /// State arena size in KB (from [kernel] section, default 256)
     pub state_arena_kb: u32,
+    /// The loader's ceiling on one module's code, in KiB (`[kernel]
+    /// module_code_kb`); `None` where the silicon states none.
+    pub module_code_kb: Option<u32>,
     /// Ceiling on the kernel image's static RAM — `.data` + `.bss` +
     /// `.uninit` — in KiB (`[kernel] ram_static_max_kb`). `None` where the
     /// silicon declares none, which is every target whose image is not
@@ -798,6 +802,7 @@ fn load_silicon_target(path: &Path, kind: TargetKind) -> Result<TargetDescriptor
             .as_ref()
             .and_then(|k| k.state_arena_kb)
             .unwrap_or(256),
+        module_code_kb: silicon.kernel.as_ref().and_then(|k| k.module_code_kb),
         ram_static_max_kb: silicon.kernel.as_ref().and_then(|k| k.ram_static_max_kb),
         kernel_stack_reserve_kb: silicon
             .kernel

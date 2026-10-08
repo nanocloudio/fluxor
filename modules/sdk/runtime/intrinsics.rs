@@ -30,16 +30,16 @@ mod _pic_intrinsics {
     // The compiler emits mangled calls into core::slice::index and core::panicking.
     // Hash suffixes are toolchain-dependent. If a toolchain upgrade changes them,
     // extract new hashes: readelf -Ws module.o | grep UND
-    // thumbv8m (RP2350):
+    // thumbv8m soft-float (RP2350 modules; the kernel alone is eabihf):
     #[no_mangle]
-    pub extern "C" fn _ZN4core5slice5index16slice_index_fail17h4ded73b0c5f4c0cfE(
+    pub extern "C" fn _ZN4core5slice5index16slice_index_fail17h5a64794299811427E(
         _: usize,
         _: usize,
     ) -> ! {
         loop {}
     }
     #[no_mangle]
-    pub extern "C" fn _ZN4core9panicking18panic_bounds_check17h974ddc284291fde1E(
+    pub extern "C" fn _ZN4core9panicking18panic_bounds_check17h268a8c2aa49f45fbE(
         _: usize,
         _: usize,
     ) -> ! {
@@ -79,29 +79,6 @@ mod _pic_intrinsics {
     // ============================================================================
     // Compiler Runtime Intrinsics
     // ============================================================================
-
-    // Use write_volatile in all memset/memclr implementations to prevent LLVM's
-    // loop idiom recognition from converting the loop into a call to memset/memclr,
-    // which would create infinite recursion (the function calling itself).
-
-    #[no_mangle]
-    pub unsafe extern "C" fn __aeabi_memclr(dest: *mut u8, n: usize) {
-        let mut i = 0;
-        while i < n {
-            core::ptr::write_volatile(dest.add(i), 0);
-            i += 1;
-        }
-    }
-
-    #[no_mangle]
-    pub unsafe extern "C" fn __aeabi_memclr4(dest: *mut u8, n: usize) {
-        __aeabi_memclr(dest, n);
-    }
-
-    #[no_mangle]
-    pub unsafe extern "C" fn __aeabi_memclr8(dest: *mut u8, n: usize) {
-        __aeabi_memclr(dest, n);
-    }
 
     // Count leading zeros, 32-bit.
     //
@@ -149,27 +126,131 @@ mod _pic_intrinsics {
         n
     }
 
-    #[no_mangle]
-    #[link_section = ".text.aeabi_memset"]
-    pub unsafe extern "C" fn __aeabi_memset(dest: *mut u8, n: usize, val: i32) {
-        let byte = val as u8;
+    // The memory routines move a machine word at a time wherever the two ends
+    // share an alignment, and a byte at a time only at the edges: a struct a
+    // module copies by value costs a load and a store per word, not per
+    // byte, and a module that moves a lot of memory (a JavaScript engine
+    // spends much of its time here) runs at the bus's pace.
+    //
+    // Three bodies do all of it — `fill`, `copy_up`, `copy_down` — and every
+    // exported name is a call into one of them. They are never inlined: these
+    // routines are linked into every module, and a body copied into each name
+    // that reaches it would cost a small module more flash than its own code. The accesses stay volatile, so the compiler can
+    // recognise none of these loops as the routine it is in and call it from
+    // itself.
+
+    /// Bytes in the widest access every target here makes in one instruction.
+    const WORD: usize = core::mem::size_of::<usize>();
+
+    /// Set `n` bytes at `dest` to `byte`.
+    #[inline(never)]
+    unsafe fn fill(dest: *mut u8, n: usize, byte: u8) {
+        let word = usize::from(byte).wrapping_mul(usize::MAX / 0xFF);
         let mut i = 0;
+        while i < n && !(dest as usize + i).is_multiple_of(WORD) {
+            core::ptr::write_volatile(dest.add(i), byte);
+            i += 1;
+        }
+        while i + WORD <= n {
+            core::ptr::write_volatile(dest.add(i).cast::<usize>(), word);
+            i += WORD;
+        }
         while i < n {
             core::ptr::write_volatile(dest.add(i), byte);
             i += 1;
         }
     }
 
+    /// Copy `n` bytes upwards, for non-overlapping ranges or `dest` below `src`.
+    #[inline(never)]
+    unsafe fn copy_up(dest: *mut u8, src: *const u8, n: usize) {
+        let mut i = 0;
+        if (dest as usize ^ src as usize).is_multiple_of(WORD) {
+            while i < n && !(dest as usize + i).is_multiple_of(WORD) {
+                core::ptr::write_volatile(dest.add(i), core::ptr::read_volatile(src.add(i)));
+                i += 1;
+            }
+            while i + WORD <= n {
+                core::ptr::write_volatile(
+                    dest.add(i).cast::<usize>(),
+                    core::ptr::read_volatile(src.add(i).cast::<usize>()),
+                );
+                i += WORD;
+            }
+        }
+        while i < n {
+            core::ptr::write_volatile(dest.add(i), core::ptr::read_volatile(src.add(i)));
+            i += 1;
+        }
+    }
+
+    /// Copy `n` bytes downwards, for overlapping ranges with `dest` above `src`.
+    #[inline(never)]
+    unsafe fn copy_down(dest: *mut u8, src: *const u8, n: usize) {
+        let mut i = n;
+        if (dest as usize ^ src as usize).is_multiple_of(WORD) {
+            while i > 0 && !(dest as usize + i).is_multiple_of(WORD) {
+                i -= 1;
+                core::ptr::write_volatile(dest.add(i), core::ptr::read_volatile(src.add(i)));
+            }
+            while i >= WORD {
+                i -= WORD;
+                core::ptr::write_volatile(
+                    dest.add(i).cast::<usize>(),
+                    core::ptr::read_volatile(src.add(i).cast::<usize>()),
+                );
+            }
+        }
+        while i > 0 {
+            i -= 1;
+            core::ptr::write_volatile(dest.add(i), core::ptr::read_volatile(src.add(i)));
+        }
+    }
+
+    /// Copy `n` bytes from `src` to `dest`, whichever way they overlap.
+    #[inline(always)]
+    unsafe fn move_bytes(dest: *mut u8, src: *const u8, n: usize) {
+        if (dest as usize) < (src as usize) {
+            copy_up(dest, src, n);
+        } else {
+            copy_down(dest, src, n);
+        }
+    }
+
+    // ARM EABI names. The `4` and `8` forms promise an aligned `dest`; the
+    // shared bodies find the alignment themselves, so they take the same path.
+
+    #[no_mangle]
+    pub unsafe extern "C" fn __aeabi_memclr(dest: *mut u8, n: usize) {
+        fill(dest, n, 0);
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn __aeabi_memclr4(dest: *mut u8, n: usize) {
+        fill(dest, n, 0);
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn __aeabi_memclr8(dest: *mut u8, n: usize) {
+        fill(dest, n, 0);
+    }
+
+    #[no_mangle]
+    #[link_section = ".text.aeabi_memset"]
+    pub unsafe extern "C" fn __aeabi_memset(dest: *mut u8, n: usize, val: i32) {
+        fill(dest, n, val as u8);
+    }
+
     #[no_mangle]
     #[link_section = ".text.aeabi_memset4"]
     pub unsafe extern "C" fn __aeabi_memset4(dest: *mut u8, n: usize, val: i32) {
-        __aeabi_memset(dest, n, val);
+        fill(dest, n, val as u8);
     }
 
     #[no_mangle]
     #[link_section = ".text.aeabi_memset8"]
     pub unsafe extern "C" fn __aeabi_memset8(dest: *mut u8, n: usize, val: i32) {
-        __aeabi_memset(dest, n, val);
+        fill(dest, n, val as u8);
     }
 
     // Force retention of memset symbols that LTO might otherwise eliminate
@@ -177,56 +258,37 @@ mod _pic_intrinsics {
     static _KEEP_MEMSET: [unsafe extern "C" fn(*mut u8, usize, i32); 3] =
         [__aeabi_memset, __aeabi_memset4, __aeabi_memset8];
 
-    // Use read_volatile/write_volatile in memcpy/memmove too — while LLVM
-    // currently doesn't self-recurse these, future compiler versions might.
-
     #[no_mangle]
     pub unsafe extern "C" fn __aeabi_memcpy(dest: *mut u8, src: *const u8, n: usize) {
-        let mut i = 0;
-        while i < n {
-            core::ptr::write_volatile(dest.add(i), core::ptr::read_volatile(src.add(i)));
-            i += 1;
-        }
+        copy_up(dest, src, n);
     }
 
     #[no_mangle]
     pub unsafe extern "C" fn __aeabi_memcpy4(dest: *mut u8, src: *const u8, n: usize) {
-        __aeabi_memcpy(dest, src, n);
+        copy_up(dest, src, n);
     }
 
     #[no_mangle]
     pub unsafe extern "C" fn __aeabi_memcpy8(dest: *mut u8, src: *const u8, n: usize) {
-        __aeabi_memcpy(dest, src, n);
+        copy_up(dest, src, n);
     }
 
     #[no_mangle]
     #[link_section = ".text.aeabi_memmove"]
     pub unsafe extern "C" fn __aeabi_memmove(dest: *mut u8, src: *const u8, n: usize) {
-        if (dest as usize) < (src as usize) {
-            let mut i = 0;
-            while i < n {
-                core::ptr::write_volatile(dest.add(i), core::ptr::read_volatile(src.add(i)));
-                i += 1;
-            }
-        } else {
-            let mut i = n;
-            while i > 0 {
-                i -= 1;
-                core::ptr::write_volatile(dest.add(i), core::ptr::read_volatile(src.add(i)));
-            }
-        }
+        move_bytes(dest, src, n);
     }
 
     #[no_mangle]
     #[link_section = ".text.aeabi_memmove4"]
     pub unsafe extern "C" fn __aeabi_memmove4(dest: *mut u8, src: *const u8, n: usize) {
-        __aeabi_memmove(dest, src, n);
+        move_bytes(dest, src, n);
     }
 
     #[no_mangle]
     #[link_section = ".text.aeabi_memmove8"]
     pub unsafe extern "C" fn __aeabi_memmove8(dest: *mut u8, src: *const u8, n: usize) {
-        __aeabi_memmove(dest, src, n);
+        move_bytes(dest, src, n);
     }
 
     #[used]
@@ -239,19 +301,19 @@ mod _pic_intrinsics {
 
     #[no_mangle]
     pub unsafe extern "C" fn memset(dest: *mut u8, val: i32, n: usize) -> *mut u8 {
-        __aeabi_memset(dest, n, val);
+        fill(dest, n, val as u8);
         dest
     }
 
     #[no_mangle]
     pub unsafe extern "C" fn memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut u8 {
-        __aeabi_memcpy(dest, src, n);
+        copy_up(dest, src, n);
         dest
     }
 
     #[no_mangle]
     pub unsafe extern "C" fn memmove(dest: *mut u8, src: *const u8, n: usize) -> *mut u8 {
-        __aeabi_memmove(dest, src, n);
+        move_bytes(dest, src, n);
         dest
     }
 

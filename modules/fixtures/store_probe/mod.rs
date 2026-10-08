@@ -9,7 +9,8 @@
 //! It walks the whole contract surface a store consumer uses, in order, and
 //! stops at the first failure so the heartbeat names the step that broke. Keys
 //! under `/probe/` are its own — it proves the contracts against state it
-//! created, so it depends on nothing else in the graph:
+//! created, so it depends on nothing else in the graph. It empties the
+//! prefix first: a store on a disk keeps whatever an earlier boot left.
 //!
 //!   1 PUT      two objects under one prefix
 //!   2 GET      read one back and byte-compare it
@@ -30,6 +31,11 @@
 //! produced. The probe supplies the counting; the graph supplies the prefixes,
 //! and what they mean is the graph's business, not this fixture's. Unset
 //! prefixes are not listed and report 0.
+//!
+//! `after_ms` holds the probe until that long after boot, so its calls land
+//! once the board's telemetry is up. `op_gap_ms` pauses between calls, each
+//! announced by a heartbeat first: on a board that dies inside a call, the
+//! last line that arrives names it.
 
 #![no_std]
 #![allow(
@@ -115,6 +121,16 @@ struct State {
     wit_a_len: u32,
     wit_b_pfx: [u8; MAX_WITNESS],
     wit_b_len: u32,
+    /// Start no earlier than this, in ms since boot (`after_ms`).
+    after_ms: u32,
+    /// Pause between store calls, in ms (`op_gap_ms`), each announced by a
+    /// heartbeat first: on a board that dies inside a call, the last line
+    /// that arrives names the call. 0 = no pause.
+    op_gap_ms: u32,
+    next_at: u64,
+    /// Set once the prefix is empty: a durable store keeps what an
+    /// earlier boot left under it, which the LIST would count.
+    cleared: u32,
     /// Subscribed in state 3: a write asked again does not subscribe again.
     subscribed: u32,
     /// Where a write's fence lands. In the state, not on the stack, so a
@@ -148,6 +164,12 @@ mod params_def {
                 s.wit_b_len = n as u32;
                 if n > 0 { ptr_copy(s.wit_b_pfx.as_mut_ptr(), d, n); }
             };
+
+        3, after_ms, u32, 0
+            => |s, d, len| { s.after_ms = super::p_u32(d, len, 0, 0); };
+
+        4, op_gap_ms, u32, 0
+            => |s, d, len| { s.op_gap_ms = super::p_u32(d, len, 0, 0); };
     }
 }
 
@@ -282,6 +304,77 @@ unsafe fn list_count(sys: &SyscallTable, prefix: &[u8], page: &mut [u8]) -> i32 
     E_INVAL
 }
 
+/// One LIST page of `prefix`, from its first entry, into `page`: the bytes
+/// written, or a negative errno.
+unsafe fn list_page(sys: &SyscallTable, prefix: &[u8], page: &mut [u8]) -> i32 {
+    use abi::contracts::storage::namespace::list;
+    let mut fence = [0u8; abi::fence::WIRE_MAX_LEN];
+    let req = list::Request {
+        prefix,
+        cursor: &[],
+        out_ptr: page.as_mut_ptr() as u64,
+        out_cap: page.len() as u32,
+        fence_out_ptr: fence.as_mut_ptr() as u64,
+        fence_out_cap: fence.len() as u16,
+    };
+    let mut arg =
+        [0u8; list::REQUEST_FIXED_LEN + 2 * abi::contracts::storage::handle::STORAGE_KEY_MAX];
+    let Some(len) = list::encode_request(&mut arg, &req) else {
+        return E_INVAL;
+    };
+    (sys.provider_call)(-1, NS_LIST, arg.as_mut_ptr(), len)
+}
+
+/// The key of the first entry LIST returns under `prefix`, copied into
+/// `out`: its length, 0 when the prefix is empty, or a negative errno. An
+/// entry is named relative to the prefix, so the key is the two joined; a
+/// child that is itself a namespace is not an object and answers `EINVAL`.
+unsafe fn first_key(sys: &SyscallTable, prefix: &[u8], page: &mut [u8], out: &mut [u8]) -> i32 {
+    use abi::contracts::storage::namespace::{list, KIND_OBJECT};
+    let n = list_page(sys, prefix, page);
+    if n < 0 {
+        return n;
+    }
+    let Some(decoded) = list::decode_page(&page[..n as usize]) else {
+        return E_INVAL;
+    };
+    match decoded.entries().next() {
+        None => 0,
+        Some(e) if e.kind == KIND_OBJECT && prefix.len() + e.name.len() <= out.len() => {
+            out[..prefix.len()].copy_from_slice(prefix);
+            out[prefix.len()..prefix.len() + e.name.len()].copy_from_slice(e.name);
+            (prefix.len() + e.name.len()) as i32
+        }
+        Some(_) => E_INVAL,
+    }
+}
+
+/// Log the names on the first LIST page of `prefix` — what a count that
+/// came out wrong actually counted.
+unsafe fn log_names(sys: &SyscallTable, prefix: &[u8], page: &mut [u8]) {
+    use abi::contracts::storage::namespace::list;
+    let n = list_page(sys, prefix, page);
+    if n < 0 {
+        return;
+    }
+    let Some(decoded) = list::decode_page(&page[..n as usize]) else {
+        return;
+    };
+    let mut line = [0u8; 160];
+    let head = b"[stp] listed:";
+    line[..head.len()].copy_from_slice(head);
+    let mut pos = head.len();
+    for e in decoded.entries() {
+        if pos + 1 + e.name.len() > line.len() {
+            break;
+        }
+        line[pos] = b' ';
+        line[pos + 1..pos + 1 + e.name.len()].copy_from_slice(e.name);
+        pos += 1 + e.name.len();
+    }
+    dev_log(sys, 3, line.as_ptr(), pos);
+}
+
 unsafe fn subscribe(sys: &SyscallTable, prefix: &[u8], sink: i32) -> i32 {
     // [prefix_len:u16][prefix][sink_chan:u32][flags:u8]
     let mut arg = [0u8; 224];
@@ -369,8 +462,8 @@ pub unsafe extern "C" fn module_new(
     in_chan: i32,
     out_chan: i32,
     _ctrl_chan: i32,
-    _params: *const u8,
-    _params_len: usize,
+    params: *const u8,
+    params_len: usize,
     state: *mut u8,
     state_size: usize,
     syscalls: *const c_void,
@@ -398,6 +491,14 @@ pub unsafe extern "C" fn module_new(
         s.wit_a = 0;
         s.wit_b = 0;
         s.done = 0;
+        s.wit_a_len = 0;
+        s.wit_b_len = 0;
+        s.after_ms = 0;
+        s.op_gap_ms = 0;
+        s.next_at = 0;
+        s.cleared = 0;
+        params_def::set_defaults(s);
+        params_def::parse_tlv(s, params, params_len);
         0
     }
 }
@@ -414,9 +515,50 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             return 0;
         }
         let sys = &*s.syscalls;
+        if s.after_ms != 0 && dev_millis(sys) < u64::from(s.after_ms) {
+            return 0;
+        }
+        if s.op_gap_ms != 0 && s.done == 0 && s.state != 99 {
+            let now = dev_millis(sys);
+            if s.next_at == 0 {
+                // Announce the call, then make it once the line is away.
+                emit(s);
+                s.next_at = now + u64::from(s.op_gap_ms);
+                return 0;
+            }
+            if now < s.next_at {
+                return 0;
+            }
+            s.next_at = 0;
+        }
         s.step = s.step.wrapping_add(1);
 
         match s.state {
+            0 if s.cleared == 0 => {
+                // 0. Start from an empty prefix: a store on a disk keeps
+                // whatever an earlier boot left under it. One key per
+                // step, the first LIST returns, until the LIST is empty.
+                let mut key = [0u8; MAX_WITNESS];
+                let n = first_key(sys, PREFIX, &mut s.scratch, &mut key);
+                if n < 0 {
+                    s.err = -10;
+                    s.state = 99;
+                    emit(s);
+                    return 0;
+                }
+                if n == 0 {
+                    s.cleared = 1;
+                    return 0;
+                }
+                match delete(sys, &key[..n as usize], &mut s.fence) {
+                    WriteAnswer::Pending | WriteAnswer::Decided(0) => {}
+                    WriteAnswer::Decided(_) => {
+                        s.err = -11;
+                        s.state = 99;
+                        emit(s);
+                    }
+                }
+            }
             0 => {
                 // 1. PUT two objects. A write the store has not decided yet
                 // is asked again next step, with the same request.
@@ -460,6 +602,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 }
                 s.listed = n as u32;
                 if s.listed != 2 {
+                    log_names(sys, PREFIX, &mut s.scratch);
                     s.err = -5;
                     s.state = 99;
                     emit(s);

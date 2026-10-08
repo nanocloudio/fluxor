@@ -1019,6 +1019,10 @@ pub fn register_isr_tier_modules_from_graph() -> usize {
 /// all rather than with a cap to raise.
 pub fn finalize_instantiation_accounting() {
     charge_resident_owner_state();
+    // Providers registered during instantiation: gate their consumers on
+    // them (`gate_contract_consumers`). Here because every platform runs
+    // this once its instantiation loop is done — boot and rebuild alike.
+    super::exec_order::gate_contract_consumers();
     let (state_used, state_cap) = crate::kernel::module::loader::arena_usage();
     let (cfg_used, cfg_cap) = crate::kernel::boot::config::config_arena_usage();
     let (buf_used, buf_cap) = crate::kernel::ipc::buffer_pool::arena_usage();

@@ -123,6 +123,8 @@ include!("../../sdk/cores/session_handoff.rs");
     reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
 )]
 mod arp;
+/// The connection table's storage: inline first block, elastic growth.
+mod conn_arena;
 /// TCP transport continuity: checkpoint codec, mirror stream, cut-over.
 pub mod continuity;
 #[allow(
@@ -392,7 +394,7 @@ const SWEEP_SLICE_MAX: usize = 1024;
 const ARP_WAIT_MAX: usize = 64;
 
 /// Wildcard local-address slot — re-exported from `tcp` so the two modules
-/// agree on the sentinel used by `TcpConn::local_slot` / `find_conn`.
+/// agree on the sentinel used by `TcpConn::local_slot` / `find_conn_indexed`.
 use tcp::LOCAL_SLOT_ANY;
 
 /// `LocalAddr::flags` bits.
@@ -643,7 +645,7 @@ unsafe fn half_open_leave(s: &mut IpState, ip: u32) {
 /// list it if it listens, count its port, count it if half-open.
 unsafe fn conn_index_insert(s: &mut IpState, idx: usize) {
     let (keyed, hash, listens, local_port, half_open, remote_ip) = {
-        let c = &*s.tcp_conns.as_ptr().add(idx);
+        let c = &*s.tcp_conns.ptr(idx);
         (
             conn_is_keyed(c),
             conn_key_of(c).hash(s.index_seed),
@@ -663,14 +665,14 @@ unsafe fn conn_index_insert(s: &mut IpState, idx: usize) {
         port_ref_inc(s, local_port);
     }
     if half_open {
-        (*s.tcp_conns.as_mut_ptr().add(idx)).half_open_counted = true;
+        (*s.tcp_conns.ptr_mut(idx)).half_open_counted = true;
         half_open_enter(s, remote_ip);
     }
 }
 
 /// A half-open connection completed or was abandoned: stop counting it.
 unsafe fn conn_leave_half_open(s: &mut IpState, idx: usize) {
-    let c = &mut *s.tcp_conns.as_mut_ptr().add(idx);
+    let c = &mut *s.tcp_conns.ptr_mut(idx);
     if c.half_open_counted {
         c.half_open_counted = false;
         let ip = c.remote_ip;
@@ -683,7 +685,7 @@ unsafe fn conn_leave_half_open(s: &mut IpState, idx: usize) {
 /// pending notification is still indexed until here.
 unsafe fn conn_reset(s: &mut IpState, idx: usize) {
     let (is_datagram, remote_ip, local_port, hash, half_open) = {
-        let c = &*s.tcp_conns.as_ptr().add(idx);
+        let c = &*s.tcp_conns.ptr(idx);
         (
             c.is_datagram,
             c.remote_ip,
@@ -697,10 +699,10 @@ unsafe fn conn_reset(s: &mut IpState, idx: usize) {
         // are slots — so the table is read through a raw pointer taken
         // before the index is borrowed. The two do not overlap: the index
         // holds slot numbers, never connections.
-        let conns = s.tcp_conns.as_ptr();
+        let conns = &s.tcp_conns;
         let seed = s.index_seed;
         let _ = index::remove(&mut s.conn_index, hash, idx, |slot| {
-            conn_key_of(&*conns.add(slot)).hash(seed)
+            conn_key_of(&*conns.ptr(slot)).hash(seed)
         });
     }
     if !is_datagram && local_port != 0 {
@@ -713,7 +715,7 @@ unsafe fn conn_reset(s: &mut IpState, idx: usize) {
         half_open_leave(s, remote_ip);
     }
     continuity::on_conn_released(s, idx);
-    *s.tcp_conns.as_mut_ptr().add(idx) = tcp::TcpConn::new();
+    *s.tcp_conns.ptr_mut(idx) = tcp::TcpConn::new();
     free_push(s, idx);
 }
 
@@ -740,7 +742,7 @@ const fn tcp_slot_lo() -> usize {
 
 /// Return a released TCP slot to the free stack.
 unsafe fn free_push(s: &mut IpState, idx: usize) {
-    if idx < tcp_slot_lo() || idx >= tcp::MAX_TCP_CONNS {
+    if idx < tcp_slot_lo() || idx >= s.tcp_conns.len() {
         return;
     }
     let top = s.free_top as usize;
@@ -756,11 +758,28 @@ unsafe fn free_pop(s: &mut IpState) -> Option<usize> {
     while s.free_top > 0 {
         s.free_top -= 1;
         let idx = *s.free_slots.as_ptr().add(s.free_top as usize) as usize;
-        if idx < tcp::MAX_TCP_CONNS && slot_is_free(&*s.tcp_conns.as_ptr().add(idx)) {
+        if idx < s.tcp_conns.len() && slot_is_free(&*s.tcp_conns.ptr(idx)) {
             return Some(idx);
         }
     }
     None
+}
+
+/// Back one more chunk of the connection table from the elastic region
+/// and put every slot in it on the free stack. `false` at the ceiling or
+/// on a denial (counted in `tcp_conns.denials`).
+unsafe fn grow_conn_table(s: &mut IpState) -> bool {
+    let old_len = s.tcp_conns.len();
+    if !s.tcp_conns.grow(&*s.syscalls) {
+        return false;
+    }
+    // Pushed high to low so the chunk hands out its lowest slot first.
+    let mut i = s.tcp_conns.len();
+    while i > old_len {
+        i -= 1;
+        free_push(s, i);
+    }
+    true
 }
 
 /// A free connection slot for TCP, in constant time: the free stack is
@@ -778,13 +797,14 @@ unsafe fn alloc_free_slot(s: &mut IpState) -> Option<usize> {
     }
     s.alloc_scan_step = s.step_count;
     let lo = tcp_slot_lo();
-    let span = tcp::MAX_TCP_CONNS - lo;
+    // The backed span only: slots past `len()` have no storage yet.
+    let span = s.tcp_conns.len() - lo;
     if span > 0 {
         let start = s.alloc_scan_cursor as usize % span;
         let mut n = 0;
         while n < ALLOC_SCAN_SLICE.min(span) {
             let i = lo + (start + n) % span;
-            if slot_is_free(&*s.tcp_conns.as_ptr().add(i)) {
+            if slot_is_free(&*s.tcp_conns.ptr(i)) {
                 free_push(s, i);
             }
             n += 1;
@@ -795,10 +815,18 @@ unsafe fn alloc_free_slot(s: &mut IpState) -> Option<usize> {
             return Some(i);
         }
     }
+    // Every backed slot beyond the window is taken: back one more chunk
+    // (all of it free) before falling into the window. Control-plane only
+    // — this runs once the stack and its rebuild slice are both empty.
+    if grow_conn_table(s) {
+        if let Some(i) = free_pop(s) {
+            return Some(i);
+        }
+    }
     // The datagram window, last.
     let mut i = 0;
     while i < lo {
-        if slot_is_free(&*s.tcp_conns.as_ptr().add(i)) {
+        if slot_is_free(&*s.tcp_conns.ptr(i)) {
             s.alloc_scanned = s.alloc_scanned.wrapping_add(i as u32 + 1);
             return Some(i);
         }
@@ -808,9 +836,15 @@ unsafe fn alloc_free_slot(s: &mut IpState) -> Option<usize> {
     None
 }
 
-/// The connection an inbound segment belongs to, by index. A connection
-/// on a concrete local slot matches only that slot; one on the wildcard
-/// slot matches any, so both keys are tried.
+/// The connection an inbound segment belongs to, by index.
+///
+/// `local_slot` adds the local-address axis: the same 4-tuple reached at two
+/// different local addresses is two distinct connections. A connection on a
+/// concrete local slot matches only that slot; one carrying
+/// `LOCAL_SLOT_ANY` (a wildcard listener's accept) matches any, so both keys
+/// are tried. With a single configured address every connection latches
+/// slot 0 and every inbound segment resolves to slot 0, so the axis is inert
+/// and the match is the port-only one.
 unsafe fn find_conn_indexed(
     s: &IpState,
     remote_ip: u32,
@@ -818,9 +852,9 @@ unsafe fn find_conn_indexed(
     local_port: u16,
     local_slot: u16,
 ) -> Option<usize> {
-    let conns = s.tcp_conns.as_ptr();
+    let conns = &s.tcp_conns;
     let matches = |slot: usize, want_slot: u16| {
-        let c = &*conns.add(slot);
+        let c = &*conns.ptr(slot);
         c.is_active()
             && c.remote_ip == remote_ip
             && c.remote_port == remote_port
@@ -851,9 +885,16 @@ unsafe fn find_conn_indexed(
     })
 }
 
-/// The listener for a SYN, by list. Same admission rule as before: a
-/// concrete-slot listener serves its slot; a wildcard listener serves slot 0
-/// and unowned secondaries, never an owned one.
+/// The listener for a SYN, by list.
+///
+/// Datagram endpoints share the connection table and also sit in `Listen`,
+/// so the match excludes `is_datagram` slots: a TCP SYN never lands on a
+/// UDP-bound endpoint. Bind admission: a listener bound to a concrete slot
+/// serves only that slot; a wildcard listener (`LOCAL_SLOT_ANY`) serves slot
+/// 0 and UNOWNED secondaries but never an OWNED one (`dst_owned`) — an owned
+/// workload address is reachable only through a listener explicitly bound to
+/// it. With no owned secondary configured, `dst_owned` is always false and
+/// the wildcard matches every slot as a port-only match would.
 unsafe fn find_listener_indexed(
     s: &IpState,
     local_port: u16,
@@ -865,7 +906,7 @@ unsafe fn find_listener_indexed(
         let e = s.listeners[i];
         if e != 0 {
             let idx = (e - 1) as usize;
-            let c = &*s.tcp_conns.as_ptr().add(idx);
+            let c = &*s.tcp_conns.ptr(idx);
             if c.state == tcp::TcpState::Listen
                 && !c.is_datagram
                 && c.local_port == local_port
@@ -1149,8 +1190,9 @@ struct IpState {
     // DHCP client
     dhcp: dhcp::DhcpClient,
 
-    // TCP connections
-    tcp_conns: [tcp::TcpConn; tcp::MAX_TCP_CONNS],
+    // TCP connections. Ceiling `tcp::MAX_TCP_CONNS`; backed slots
+    // `tcp_conns.len()`, growing on demand (`conn_arena.rs`).
+    tcp_conns: conn_arena::ConnArena,
 
     // Lookup structures over the tables (`index.rs`); maintained at
     // `conn_index_insert` / `conn_reset` and the address-control paths.
@@ -2196,7 +2238,7 @@ unsafe fn net_send_accepted(s: &mut IpState, conn_id: u16, local_port: u16) -> b
     // the telemetry port is unwired, so tracing is zero-cost when disabled.
     if ok && dev_telemetry_enabled(&*s.syscalls) {
         let idx = conn_id as usize;
-        if idx < tcp::MAX_TCP_CONNS {
+        if idx < s.tcp_conns.len() {
             let sys = &*s.syscalls;
             let now = dev_micros(sys);
             // `0` means "no span"; clamp a (boot-impossible) 0 to 1 so a real
@@ -2232,7 +2274,7 @@ unsafe fn net_send_closed(s: &mut IpState, conn_id: u16) -> bool {
     // (server-accepted, telemetry wired); client connects never set it.
     let idx = conn_id as usize;
     if dev_telemetry_enabled(&*s.syscalls)
-        && idx < tcp::MAX_TCP_CONNS
+        && idx < s.tcp_conns.len()
         && s.tcp_conns[idx].span_start_us != 0
     {
         emit_conn_span(s, idx);
@@ -2322,7 +2364,7 @@ unsafe fn net_send_bound(s: &mut IpState, conn_id: u16, local_port: u16) {
 unsafe fn net_send_connected(s: &mut IpState, conn_id: u16) -> bool {
     // Payload `[conn_id:2 LE][requester_tag]` — the tag echoes the connecting
     // module's dial tag so a fanned net_out routes the event back to it.
-    let tag = if (conn_id as usize) < tcp::MAX_TCP_CONNS {
+    let tag = if (conn_id as usize) < s.tcp_conns.len() {
         s.tcp_conns[conn_id as usize].connect_tag
     } else {
         0
@@ -2549,7 +2591,7 @@ unsafe fn update_rcv_wnd(s: &mut IpState, conn_idx: usize) {
     } else {
         wnd.min(tcp::MAX_RCV_WND as u32) as u16
     };
-    let conn = &mut *s.tcp_conns.as_mut_ptr().add(conn_idx);
+    let conn = &mut *s.tcp_conns.ptr_mut(conn_idx);
     let wnd = tcp::hold_right_edge(
         conn.rcv_wnd,
         conn.delivered_bytes.wrapping_sub(conn.consumed_bytes),
@@ -2562,12 +2604,12 @@ unsafe fn update_rcv_wnd(s: &mut IpState, conn_idx: usize) {
 /// Unchecked TCP conn access (avoids bounds check panic in PIC).
 #[inline(always)]
 unsafe fn tcp_conn(s: &IpState, idx: usize) -> &tcp::TcpConn {
-    &*s.tcp_conns.as_ptr().add(idx)
+    &*s.tcp_conns.ptr(idx)
 }
 
 #[inline(always)]
 unsafe fn tcp_conn_mut(s: &mut IpState, idx: usize) -> &mut tcp::TcpConn {
-    &mut *s.tcp_conns.as_mut_ptr().add(idx)
+    &mut *s.tcp_conns.ptr_mut(idx)
 }
 
 /// Ephemeral port range (IANA dynamic range, upper end kept clear of the
@@ -2642,12 +2684,12 @@ enum DgBind {
 /// unowned address, so it overlaps every concrete slot. Two concrete slots
 /// never overlap, which is why the same port bound at two local addresses is
 /// two sockets. TCP listeners are a different protocol and never conflict
-/// here — `find_listener` already excludes datagram slots in the other
-/// direction.
+/// here — `find_listener_indexed` already excludes datagram slots in the
+/// other direction.
 unsafe fn dg_bind_admission(s: &IpState, port: u16, slot: u16, owner_tag: u16) -> DgBind {
     let mut i = 0;
     while i < MAX_DG_ENDPOINTS {
-        let c = &*s.tcp_conns.as_ptr().add(i);
+        let c = &*s.tcp_conns.ptr(i);
         if c.is_active() && c.is_datagram && c.local_port == port {
             if c.local_slot == slot {
                 if c.owner_tag == owner_tag {
@@ -2688,7 +2730,7 @@ unsafe fn alloc_dg_slot(s: &mut IpState) -> Option<usize> {
     let mut n = 0;
     while n < MAX_DG_ENDPOINTS {
         let ci = (start + n) % MAX_DG_ENDPOINTS;
-        if slot_is_free(&*s.tcp_conns.as_ptr().add(ci)) {
+        if slot_is_free(&*s.tcp_conns.ptr(ci)) {
             return Some(ci);
         }
         n += 1;
@@ -2707,8 +2749,8 @@ unsafe fn port_in_use(s: &IpState, port: u16) -> bool {
         return *s.port_ref.as_ptr().add(port as usize) != 0;
     }
     let mut i = 0;
-    while i < tcp::MAX_TCP_CONNS {
-        let c = &*s.tcp_conns.as_ptr().add(i);
+    while i < s.tcp_conns.len() {
+        let c = &*s.tcp_conns.ptr(i);
         if c.is_active() && c.local_port == port {
             return true;
         }
@@ -3096,12 +3138,9 @@ pub unsafe extern "C" fn module_new(
         // Initialize DHCP
         s.dhcp = dhcp::DhcpClient::new();
 
-        // Initialize TCP connections
-        i = 0;
-        while i < tcp::MAX_TCP_CONNS {
-            *s.tcp_conns.as_mut_ptr().add(i) = tcp::TcpConn::new();
-            i += 1;
-        }
+        // Initialize TCP connections: the inline block. Further slots
+        // are backed, and initialised, as `alloc_free_slot` grows the table.
+        s.tcp_conns.init();
         index::clear(&mut s.conn_index);
         index::clear(&mut s.addr_index);
         // Taken here and nowhere else: both indexes are searched under the
@@ -3153,7 +3192,7 @@ pub unsafe extern "C" fn module_new(
             // Pushed high to low so allocation hands out the lowest slot
             // first.
             let lo = tcp_slot_lo();
-            let mut i = tcp::MAX_TCP_CONNS;
+            let mut i = s.tcp_conns.len();
             while i > lo {
                 i -= 1;
                 free_push(s, i);
@@ -3633,7 +3672,8 @@ unsafe fn emit_report_line(s: &mut IpState) {
             dev_log(sys, 3, buf, pos);
             // Inbound-stream health, on its own line (the drop line is full):
             // TCP checksum failures, straddling retransmits trimmed, reopened
-            // windows announced, and how many receivers share the ring.
+            // windows announced, and how many receivers share the ring; then
+            // the connection table's elastic growth.
             pos = 0;
             emit(b"[ip] rx cktcp=", &mut pos);
             num(s.drops.cksum_tcp, &mut pos);
@@ -3643,6 +3683,14 @@ unsafe fn emit_report_line(s: &mut IpState) {
             num(s.drops.tcp_window_update, &mut pos);
             emit(b" sharers=", &mut pos);
             num(s.rx_active_prev as u32, &mut pos);
+            // Connection-table growth: elastic chunks granted and refused,
+            // and the slots now backed (`conn_arena.rs`).
+            emit(b" cgrow=", &mut pos);
+            num(s.tcp_conns.grants, &mut pos);
+            emit(b" cdeny=", &mut pos);
+            num(s.tcp_conns.denials, &mut pos);
+            emit(b" cslots=", &mut pos);
+            num(s.tcp_conns.len() as u32, &mut pos);
             dev_log(sys, 3, buf, pos);
         }
         5 => {
@@ -3962,7 +4010,7 @@ unsafe fn retry_unsent_handshake(s: &mut IpState, resolved_ip: u32) {
     while k < n {
         let i = s.arp_wait[k] as usize;
         let (state, unsent, remote_ip) = {
-            let conn = &*s.tcp_conns.as_ptr().add(i);
+            let conn = &*s.tcp_conns.ptr(i);
             (conn.state, conn.snd_nxt == conn.iss, conn.remote_ip)
         };
         let waiting =
@@ -4819,7 +4867,7 @@ unsafe fn process_udp_packet(
     let dst_owned = slot_is_owned(s, local_slot);
     let mut i = 0;
     while i < MAX_DG_ENDPOINTS {
-        let conn = &*s.tcp_conns.as_ptr().add(i);
+        let conn = &*s.tcp_conns.ptr(i);
         if conn.is_datagram
             && conn.state == tcp::TcpState::Listen
             && conn.local_port == udp_hdr.dst_port
@@ -4901,7 +4949,7 @@ unsafe fn process_tcp_segment(
                     // `conn_reset`), so it is current here.
                     let half_open = s.tcp_half_open;
                     if half_open >= u32::from(tcp::SYN_COOKIE_WATERMARK) {
-                        let listener_port = (*s.tcp_conns.as_ptr().add(li)).local_port;
+                        let listener_port = (*s.tcp_conns.ptr(li)).local_port;
                         let local_src = local_ip_for_slot(s, local_slot);
                         if !tcp::cookie_mode_admissible(&tcp_hdr) {
                             // A cookie carries no option state, so a SYN that
@@ -4943,7 +4991,7 @@ unsafe fn process_tcp_segment(
                         return;
                     }
                     let idx = accept_idx as usize;
-                    let listener_port = (*s.tcp_conns.as_ptr().add(li)).local_port;
+                    let listener_port = (*s.tcp_conns.ptr(li)).local_port;
                     let iss = compute_iss(
                         s,
                         local_ip_for_slot(s, local_slot),
@@ -4951,7 +4999,7 @@ unsafe fn process_tcp_segment(
                         ip_hdr.src_ip,
                         tcp_hdr.src_port,
                     );
-                    let conn = &mut *s.tcp_conns.as_mut_ptr().add(idx);
+                    let conn = &mut *s.tcp_conns.ptr_mut(idx);
                     *conn = tcp::TcpConn::new();
                     conn.local_port = listener_port;
                     // Latch the local address this SYN arrived at so replies
@@ -5003,7 +5051,7 @@ unsafe fn process_tcp_segment(
     };
 
     let (state_before, rcv_before) = {
-        let c = &*s.tcp_conns.as_ptr().add(conn_idx);
+        let c = &*s.tcp_conns.ptr(conn_idx);
         (c.state, c.rcv_nxt)
     };
     let mut acked_new = false;
@@ -5047,7 +5095,7 @@ unsafe fn process_tcp_segment(
     let mut net_send_fast_retransmit_seq: u32 = 0;
 
     {
-        let conn = &mut (*s.tcp_conns.as_mut_ptr().add(conn_idx));
+        let conn = &mut (*s.tcp_conns.ptr_mut(conn_idx));
 
         match conn.state {
             tcp::TcpState::SynSent => {
@@ -5287,15 +5335,15 @@ unsafe fn process_tcp_segment(
             // Latch the connected-notification for retry if it couldn't be
             // delivered now, so a waiter always learns the connect succeeded.
             if !net_send_connected(s, conn_idx as u16) {
-                (*s.tcp_conns.as_mut_ptr().add(conn_idx)).pending_close_notify = NOTIFY_CONNECTED;
+                (*s.tcp_conns.ptr_mut(conn_idx)).pending_close_notify = NOTIFY_CONNECTED;
             }
-            let remote_ip = (*s.tcp_conns.as_ptr().add(conn_idx)).remote_ip;
+            let remote_ip = (*s.tcp_conns.ptr(conn_idx)).remote_ip;
             arp::pin(&mut s.arp_table, remote_ip);
         }
         ACTION_COMPLETE_REFUSED => {
-            let tag = (*s.tcp_conns.as_ptr().add(conn_idx)).connect_tag;
+            let tag = (*s.tcp_conns.ptr(conn_idx)).connect_tag;
             let delivered = net_send_error(s, conn_idx as u16, -111i8, tag);
-            let conn = &mut *s.tcp_conns.as_mut_ptr().add(conn_idx);
+            let conn = &mut *s.tcp_conns.ptr_mut(conn_idx);
             if delivered {
                 conn_reset(s, conn_idx);
             } else {
@@ -5308,9 +5356,9 @@ unsafe fn process_tcp_segment(
             }
         }
         ACTION_SET_CLOSED => {
-            let remote_ip = (*s.tcp_conns.as_ptr().add(conn_idx)).remote_ip;
+            let remote_ip = (*s.tcp_conns.ptr(conn_idx)).remote_ip;
             let delivered = net_send_closed(s, conn_idx as u16);
-            let conn = &mut *s.tcp_conns.as_mut_ptr().add(conn_idx);
+            let conn = &mut *s.tcp_conns.ptr_mut(conn_idx);
             if delivered {
                 if remote_ip != 0 {
                     arp::unpin(&mut s.arp_table, remote_ip);
@@ -5326,7 +5374,7 @@ unsafe fn process_tcp_segment(
         ACTION_SET_CLOSING => {
             send_tcp_control(s, conn_idx, tcp::ACK, false);
             if !net_send_closed(s, conn_idx as u16) {
-                let conn = &mut *s.tcp_conns.as_mut_ptr().add(conn_idx);
+                let conn = &mut *s.tcp_conns.ptr_mut(conn_idx);
                 conn.pending_close_notify = NOTIFY_CLOSED;
             }
         }
@@ -5340,14 +5388,14 @@ unsafe fn process_tcp_segment(
             // peer's retransmit re-deliver once the consumer drains.
             let delivered = net_send_data(s, conn_idx as u16, payload, rx_payload_len);
             if !delivered {
-                let conn = &mut *s.tcp_conns.as_mut_ptr().add(conn_idx);
+                let conn = &mut *s.tcp_conns.ptr_mut(conn_idx);
                 conn.rcv_wnd = 0;
                 send_tcp_control(s, conn_idx, tcp::ACK, false);
                 continuity::after_segment(s, conn_idx, state_before, rcv_before, acked_new);
                 return;
             }
             {
-                let conn = &mut *s.tcp_conns.as_mut_ptr().add(conn_idx);
+                let conn = &mut *s.tcp_conns.ptr_mut(conn_idx);
                 conn.rcv_nxt = conn.rcv_nxt.wrapping_add(rx_payload_len as u32);
                 conn.delivered_bytes = conn.delivered_bytes.wrapping_add(rx_payload_len as u32);
                 conn.idle_timer = 0;
@@ -5357,7 +5405,7 @@ unsafe fn process_tcp_segment(
             // the slot for the next retry — only consume after a
             // successful `net_send_data`.
             loop {
-                let conn = &*s.tcp_conns.as_ptr().add(conn_idx);
+                let conn = &*s.tcp_conns.ptr(conn_idx);
                 let rcv_nxt = conn.rcv_nxt;
                 let peeked = tcp::reorder_peek_next(conn, rcv_nxt);
                 match peeked {
@@ -5367,7 +5415,7 @@ unsafe fn process_tcp_segment(
                         if !net_send_data(s, conn_idx as u16, ptr, len) {
                             break;
                         }
-                        let conn2 = &mut *s.tcp_conns.as_mut_ptr().add(conn_idx);
+                        let conn2 = &mut *s.tcp_conns.ptr_mut(conn_idx);
                         tcp::reorder_consume_at(conn2, rcv_nxt);
                         conn2.rcv_nxt = next_seq;
                         conn2.delivered_bytes = conn2.delivered_bytes.wrapping_add(len as u32);
@@ -5380,14 +5428,14 @@ unsafe fn process_tcp_segment(
             // happens before the ACK so the ACK carries the correct
             // ack_num.
             if action == ACTION_RX_DATA_FIN {
-                let conn = &mut *s.tcp_conns.as_mut_ptr().add(conn_idx);
+                let conn = &mut *s.tcp_conns.ptr_mut(conn_idx);
                 conn.rcv_nxt = conn.rcv_nxt.wrapping_add(1);
                 conn.state = tcp::TcpState::CloseWait;
             }
             update_rcv_wnd(s, conn_idx);
             send_tcp_control(s, conn_idx, tcp::ACK, false);
             if action == ACTION_RX_DATA_FIN && !net_send_closed(s, conn_idx as u16) {
-                let conn = &mut *s.tcp_conns.as_mut_ptr().add(conn_idx);
+                let conn = &mut *s.tcp_conns.ptr_mut(conn_idx);
                 conn.pending_close_notify = NOTIFY_CLOSED;
             }
         }
@@ -5396,9 +5444,9 @@ unsafe fn process_tcp_segment(
             // always has space for MSG_ACCEPTED here. The `_` discard
             // documents the contract: callers MUST have queue
             // headroom before progressing past Established.
-            let remote_ip = (*s.tcp_conns.as_ptr().add(conn_idx)).remote_ip;
+            let remote_ip = (*s.tcp_conns.ptr(conn_idx)).remote_ip;
             arp::pin(&mut s.arp_table, remote_ip);
-            let local_port = (*s.tcp_conns.as_ptr().add(conn_idx)).local_port;
+            let local_port = (*s.tcp_conns.ptr(conn_idx)).local_port;
             let _ = net_send_accepted(s, conn_idx as u16, local_port);
             // Piggybacked data (e.g. HTTP GET on the third handshake
             // ACK). Same gate as the regular RX_DATA path: don't ACK
@@ -5406,12 +5454,12 @@ unsafe fn process_tcp_segment(
             if rx_payload_len > 0 {
                 let payload = data.add(rx_payload_offset);
                 if net_send_data(s, conn_idx as u16, payload, rx_payload_len) {
-                    let conn = &mut *s.tcp_conns.as_mut_ptr().add(conn_idx);
+                    let conn = &mut *s.tcp_conns.ptr_mut(conn_idx);
                     conn.rcv_nxt = conn.rcv_nxt.wrapping_add(rx_payload_len as u32);
                     conn.delivered_bytes = conn.delivered_bytes.wrapping_add(rx_payload_len as u32);
                     send_tcp_control(s, conn_idx, tcp::ACK, false);
                 } else {
-                    let conn = &mut *s.tcp_conns.as_mut_ptr().add(conn_idx);
+                    let conn = &mut *s.tcp_conns.ptr_mut(conn_idx);
                     conn.rcv_wnd = 0;
                     send_tcp_control(s, conn_idx, tcp::ACK, false);
                 }
@@ -5432,12 +5480,12 @@ unsafe fn process_tcp_segment(
     // Buffer an out-of-order segment if one was flagged.
     if reorder_pending {
         let payload = data.add(reorder_offset);
-        let conn = &mut *s.tcp_conns.as_mut_ptr().add(conn_idx);
+        let conn = &mut *s.tcp_conns.ptr_mut(conn_idx);
         tcp::reorder_insert(conn, reorder_seq, payload, reorder_len);
     }
 
     // A mirrored flow reports what this segment changed.
-    if (*s.tcp_conns.as_ptr().add(conn_idx)).is_active() {
+    if (*s.tcp_conns.ptr(conn_idx)).is_active() {
         continuity::after_segment(s, conn_idx, state_before, rcv_before, acked_new);
     }
 
@@ -5461,13 +5509,13 @@ unsafe fn process_tcp_segment(
 /// exchange one-sided. A suppressed challenge is counted rather than logged
 /// — under a flood the log itself would be the amplifier.
 unsafe fn send_challenge_ack(s: &mut IpState, conn_idx: usize) -> bool {
-    let peer_budget = (*s.tcp_conns.as_ptr().add(conn_idx)).chal_budget;
+    let peer_budget = (*s.tcp_conns.ptr(conn_idx)).chal_budget;
     if peer_budget == 0 || s.chal_ack_budget == 0 {
         s.drops.tcp_challenge_suppressed = s.drops.tcp_challenge_suppressed.wrapping_add(1);
         return false;
     }
     s.chal_ack_budget = s.chal_ack_budget.saturating_sub(1);
-    (*s.tcp_conns.as_mut_ptr().add(conn_idx)).chal_budget = peer_budget.saturating_sub(1);
+    (*s.tcp_conns.ptr_mut(conn_idx)).chal_budget = peer_budget.saturating_sub(1);
     s.drops.tcp_challenge_sent = s.drops.tcp_challenge_sent.wrapping_add(1);
     send_tcp_control(s, conn_idx, tcp::ACK, false)
 }
@@ -5493,11 +5541,11 @@ enum Admission {
 ///
 /// `SynSent` is excluded — it has no receive sequence space yet and RFC 9293
 /// §3.10.7.3 gives it separate rules, applied in its own branch. `Listen` and
-/// `Closed` slots are never reached here: `find_conn` matches on a concrete
-/// remote tuple.
+/// `Closed` slots are never reached here: `find_conn_indexed` matches on a
+/// concrete remote tuple.
 unsafe fn admit_tcp_segment(s: &mut IpState, conn_idx: usize, hdr: &tcp::TcpHeader) -> Admission {
     let (state, rcv_nxt, rcv_wnd, snd_una, snd_nxt) = {
-        let c = &*s.tcp_conns.as_ptr().add(conn_idx);
+        let c = &*s.tcp_conns.ptr(conn_idx);
         (c.state, c.rcv_nxt, c.rcv_wnd, c.snd_una, c.snd_nxt)
     };
     if !state.is_synchronised() {
@@ -5556,7 +5604,7 @@ unsafe fn admit_tcp_segment(s: &mut IpState, conn_idx: usize, hdr: &tcp::TcpHead
         // since drained. Re-poll before refusing the peer's retransmit: this
         // is the path by which a backpressured stream resumes.
         update_rcv_wnd(s, conn_idx);
-        let reopened = (*s.tcp_conns.as_ptr().add(conn_idx)).rcv_wnd;
+        let reopened = (*s.tcp_conns.ptr(conn_idx)).rcv_wnd;
         acceptable = tcp::segment_acceptable(rcv_nxt, reopened, hdr.seq_num, span);
     }
     if !acceptable {
@@ -5601,11 +5649,11 @@ unsafe fn admit_tcp_segment(s: &mut IpState, conn_idx: usize, hdr: &tcp::TcpHead
 /// RFC 9293 §3.10.7.4).
 unsafe fn note_window_update(s: &mut IpState, conn_idx: usize, hdr: &tcp::TcpHeader) {
     let allowed = {
-        let conn = &*s.tcp_conns.as_ptr().add(conn_idx);
+        let conn = &*s.tcp_conns.ptr(conn_idx);
         tcp::window_update_allowed(conn, hdr.seq_num, hdr.ack_num)
     };
     if allowed {
-        let conn = &mut *s.tcp_conns.as_mut_ptr().add(conn_idx);
+        let conn = &mut *s.tcp_conns.ptr_mut(conn_idx);
         tcp::apply_window_update(conn, hdr.seq_num, hdr.ack_num, hdr.window);
     } else {
         s.drops.tcp_stale_window = s.drops.tcp_stale_window.wrapping_add(1);
@@ -5764,7 +5812,7 @@ unsafe fn try_cookie_accept(
         Some(i) => i,
         None => return CookieAccept::NotACookie,
     };
-    let listener_port = (*s.tcp_conns.as_ptr().add(li)).local_port;
+    let listener_port = (*s.tcp_conns.ptr(li)).local_port;
     let local_src = local_ip_for_slot(s, local_slot);
     let cookie = tcp_hdr.ack_num.wrapping_sub(1);
     if !validate_syn_cookie(
@@ -5792,7 +5840,7 @@ unsafe fn try_cookie_accept(
     // construction. The block is installed one step short of `Established`
     // so the shared admissibility gate and state machine complete it.
     let idx = accept_idx as usize;
-    let conn = &mut *s.tcp_conns.as_mut_ptr().add(idx);
+    let conn = &mut *s.tcp_conns.ptr_mut(idx);
     *conn = tcp::TcpConn::new();
     conn.local_port = listener_port;
     conn.local_slot = local_slot;
@@ -5901,7 +5949,7 @@ unsafe fn send_tcp_control(s: &mut IpState, conn_idx: usize, flags: u8, retransm
         return false;
     }
 
-    let conn = &*s.tcp_conns.as_ptr().add(conn_idx);
+    let conn = &*s.tcp_conns.ptr(conn_idx);
     let remote_ip = conn.remote_ip;
     let local_port = conn.local_port;
     let remote_port = conn.remote_port;
@@ -5972,7 +6020,7 @@ unsafe fn send_tcp_control(s: &mut IpState, conn_idx: usize, flags: u8, retransm
         return false;
     }
     if consumes_seq {
-        let conn = &mut *s.tcp_conns.as_mut_ptr().add(conn_idx);
+        let conn = &mut *s.tcp_conns.ptr_mut(conn_idx);
         // Advance only if this byte hasn't already been credited.
         // `snd_nxt == seq` is true for a fresh send and for the first
         // successful retry after a failed initial attempt; it's false
@@ -6007,15 +6055,15 @@ unsafe fn send_tcp_data(
     }
 
     // Extract conn fields
-    let remote_ip = (*s.tcp_conns.as_mut_ptr().add(conn_idx)).remote_ip;
-    let local_port = (*s.tcp_conns.as_mut_ptr().add(conn_idx)).local_port;
-    let remote_port = (*s.tcp_conns.as_mut_ptr().add(conn_idx)).remote_port;
-    let snd_nxt = (*s.tcp_conns.as_mut_ptr().add(conn_idx)).snd_nxt;
-    let rcv_nxt = (*s.tcp_conns.as_mut_ptr().add(conn_idx)).rcv_nxt;
+    let remote_ip = (*s.tcp_conns.ptr_mut(conn_idx)).remote_ip;
+    let local_port = (*s.tcp_conns.ptr_mut(conn_idx)).local_port;
+    let remote_port = (*s.tcp_conns.ptr_mut(conn_idx)).remote_port;
+    let snd_nxt = (*s.tcp_conns.ptr_mut(conn_idx)).snd_nxt;
+    let rcv_nxt = (*s.tcp_conns.ptr_mut(conn_idx)).rcv_nxt;
     let rcv_nxt = continuity::ack_exposed(s, conn_idx, rcv_nxt);
-    let rcv_wnd = (*s.tcp_conns.as_mut_ptr().add(conn_idx)).rcv_wnd;
+    let rcv_wnd = (*s.tcp_conns.ptr_mut(conn_idx)).rcv_wnd;
     let rcv_wnd = continuity::rcv_wnd_exposed(s, conn_idx, rcv_wnd);
-    let local_slot = (*s.tcp_conns.as_ptr().add(conn_idx)).local_slot;
+    let local_slot = (*s.tcp_conns.ptr(conn_idx)).local_slot;
     let local_src = local_ip_for_slot(s, local_slot);
 
     let dst_mac = resolve_mac(s, remote_ip);
@@ -6071,7 +6119,7 @@ unsafe fn send_tcp_data(
     if !send_frame(s, s.tx_frame.as_ptr(), total) {
         return false;
     }
-    (*s.tcp_conns.as_mut_ptr().add(conn_idx)).snd_nxt = (*s.tcp_conns.as_mut_ptr().add(conn_idx))
+    (*s.tcp_conns.ptr_mut(conn_idx)).snd_nxt = (*s.tcp_conns.ptr_mut(conn_idx))
         .snd_nxt
         .wrapping_add(payload_len as u32);
     true
@@ -6735,7 +6783,7 @@ unsafe fn connect_loopback(s: &mut IpState, port: u16, requester_tag: u8) {
     // `remote_ip` stays 0 so no close path ever touches the ARP table
     // and no incoming segment's 4-tuple can match these slots.
     {
-        let c = &mut *s.tcp_conns.as_mut_ptr().add(ci);
+        let c = &mut *s.tcp_conns.ptr_mut(ci);
         c.state = tcp::TcpState::Established;
         c.remote_ip = 0;
         c.remote_port = port;
@@ -6745,7 +6793,7 @@ unsafe fn connect_loopback(s: &mut IpState, port: u16, requester_tag: u8) {
         c.retransmit_timer = 0;
     }
     {
-        let v = &mut *s.tcp_conns.as_mut_ptr().add(si);
+        let v = &mut *s.tcp_conns.ptr_mut(si);
         v.state = tcp::TcpState::Established;
         v.remote_ip = 0;
         v.remote_port = local_port;
@@ -6803,35 +6851,35 @@ unsafe fn close_loopback(s: &mut IpState, conn_id: usize) {
 }
 
 unsafe fn process_cmd_close(s: &mut IpState, conn_id: usize) -> bool {
-    if conn_id >= tcp::MAX_TCP_CONNS {
+    if conn_id >= s.tcp_conns.len() {
         return true;
     }
     if s.loopback_peer[conn_id] >= 0 {
         close_loopback(s, conn_id);
         return true;
     }
-    let conn_state = (*s.tcp_conns.as_ptr().add(conn_id)).state;
+    let conn_state = (*s.tcp_conns.ptr(conn_id)).state;
     match conn_state {
         tcp::TcpState::Established => {
-            let seq = (*s.tcp_conns.as_ptr().add(conn_id)).snd_nxt;
+            let seq = (*s.tcp_conns.ptr(conn_id)).snd_nxt;
             if !continuity::fin_gate(s, conn_id)
                 || !send_tcp_control(s, conn_id, tcp::FIN | tcp::ACK, false)
             {
                 return false;
             }
-            (*s.tcp_conns.as_mut_ptr().add(conn_id)).state = tcp::TcpState::FinWait1;
+            (*s.tcp_conns.ptr_mut(conn_id)).state = tcp::TcpState::FinWait1;
             continuity::on_sent(s, conn_id, seq, 0, true);
             continuity::on_state(s, conn_id);
             true
         }
         tcp::TcpState::CloseWait => {
-            let seq = (*s.tcp_conns.as_ptr().add(conn_id)).snd_nxt;
+            let seq = (*s.tcp_conns.ptr(conn_id)).snd_nxt;
             if !continuity::fin_gate(s, conn_id)
                 || !send_tcp_control(s, conn_id, tcp::FIN | tcp::ACK, false)
             {
                 return false;
             }
-            (*s.tcp_conns.as_mut_ptr().add(conn_id)).state = tcp::TcpState::LastAck;
+            (*s.tcp_conns.ptr_mut(conn_id)).state = tcp::TcpState::LastAck;
             continuity::on_sent(s, conn_id, seq, 0, true);
             continuity::on_state(s, conn_id);
             true
@@ -6844,7 +6892,7 @@ unsafe fn process_cmd_close(s: &mut IpState, conn_id: usize) -> bool {
         }
         _ => {
             // Already closing/closed — reset and notify
-            let remote_ip = (*s.tcp_conns.as_ptr().add(conn_id)).remote_ip;
+            let remote_ip = (*s.tcp_conns.ptr(conn_id)).remote_ip;
             if remote_ip != 0 {
                 arp::unpin(&mut s.arp_table, remote_ip);
             }
@@ -6898,11 +6946,11 @@ unsafe fn try_send_cmd_payload(
         return payload_len;
     }
     while data_off < payload_len {
-        let conn_state = (*s.tcp_conns.as_ptr().add(conn_id)).state;
+        let conn_state = (*s.tcp_conns.ptr(conn_id)).state;
         if !state_allows_send(conn_state) {
             return payload_len;
         }
-        let conn = &*s.tcp_conns.as_ptr().add(conn_id);
+        let conn = &*s.tcp_conns.ptr(conn_id);
         let eff_wnd = tcp::effective_snd_wnd(conn) as usize;
         let in_flight = conn.snd_nxt.wrapping_sub(conn.snd_una) as usize;
         let avail_wnd = eff_wnd.saturating_sub(in_flight);
@@ -6929,7 +6977,7 @@ unsafe fn try_send_cmd_payload(
             return data_off;
         }
         continuity::on_sent(s, conn_id, seq, chunk as u16, false);
-        let conn2 = &mut *s.tcp_conns.as_mut_ptr().add(conn_id);
+        let conn2 = &mut *s.tcp_conns.ptr_mut(conn_id);
         tcp::rtt_arm(conn2, seq, tick);
         data_off += chunk;
     }
@@ -6941,7 +6989,7 @@ unsafe fn try_send_cmd_payload(
 /// owner/prefix are refreshed then), or if the table is full. Sends a single
 /// same-subnet gratuitous ARP on first insertion. owner_tag stamps the
 /// slot's owner and is enforced on bind (see `slot_for_owner` /
-/// `find_listener`).
+/// `find_listener_indexed`).
 unsafe fn addr_ctl_add(
     s: &mut IpState,
     addr16: *const u8,
@@ -7230,7 +7278,7 @@ unsafe fn service_net_channels(s: &mut IpState) {
                         let e = s.listeners[li];
                         if e != 0 {
                             let idx = (e - 1) as usize;
-                            let conn = &*s.tcp_conns.as_ptr().add(idx);
+                            let conn = &*s.tcp_conns.ptr(idx);
                             if conn.state == tcp::TcpState::Listen
                                 && !conn.is_datagram
                                 && conn.local_port == port
@@ -7248,7 +7296,7 @@ unsafe fn service_net_channels(s: &mut IpState) {
                     } else {
                         let found = alloc_free_slot(s);
                         if let Some(ci) = found {
-                            let conn = &mut *s.tcp_conns.as_mut_ptr().add(ci);
+                            let conn = &mut *s.tcp_conns.ptr_mut(ci);
                             conn.state = tcp::TcpState::Listen;
                             conn.local_port = port;
                             conn.remote_ip = 0;
@@ -7329,12 +7377,12 @@ unsafe fn service_net_channels(s: &mut IpState) {
                     let conn_id =
                         u16::from_le_bytes([*buf.as_ptr(), *buf.as_ptr().add(1)]) as usize;
                     let total_len = plen;
-                    if conn_id < tcp::MAX_TCP_CONNS && total_len <= PENDING_CMD_BUF_SIZE {
-                        let conn_state = (*s.tcp_conns.as_ptr().add(conn_id)).state;
+                    if conn_id < s.tcp_conns.len() && total_len <= PENDING_CMD_BUF_SIZE {
+                        let conn_state = (*s.tcp_conns.ptr(conn_id)).state;
                         if state_allows_send(conn_state) {
                             // A payload the consumer sends is activity for
                             // the idle close, whether or not it ships now.
-                            (*s.tcp_conns.as_mut_ptr().add(conn_id)).idle_timer = 0;
+                            (*s.tcp_conns.ptr_mut(conn_id)).idle_timer = 0;
                             let new_off =
                                 try_send_cmd_payload(s, conn_id, buf.as_ptr(), total_len, 2);
                             if new_off < total_len {
@@ -7371,7 +7419,7 @@ unsafe fn service_net_channels(s: &mut IpState) {
                 if plen >= 2 {
                     let conn_id =
                         u16::from_le_bytes([*buf.as_ptr(), *buf.as_ptr().add(1)]) as usize;
-                    if conn_id < tcp::MAX_TCP_CONNS
+                    if conn_id < s.tcp_conns.len()
                         && (s.pending_cmd_valid != 0 || !process_cmd_close(s, conn_id))
                     {
                         s.pending_close_valid = 1;
@@ -7455,7 +7503,7 @@ unsafe fn service_net_channels(s: &mut IpState) {
 
                     match alloc_dg_slot(s) {
                         Some(ci) => {
-                            let conn = &mut *s.tcp_conns.as_mut_ptr().add(ci);
+                            let conn = &mut *s.tcp_conns.ptr_mut(ci);
                             *conn = tcp::TcpConn::new();
                             conn.state = tcp::TcpState::Listen;
                             conn.local_port = port;
@@ -7498,7 +7546,7 @@ unsafe fn service_net_channels(s: &mut IpState) {
                         dg_send_error(s, ep_id as u8, -97); // EAFNOSUPPORT
                         None
                     } else {
-                        let conn = &*s.tcp_conns.as_ptr().add(ep_id);
+                        let conn = &*s.tcp_conns.ptr(ep_id);
                         if !(conn.is_datagram && conn.state == tcp::TcpState::Listen) {
                             // The slot exists but holds no live datagram
                             // endpoint: a stale handle whose endpoint was
@@ -7572,10 +7620,10 @@ unsafe fn service_net_channels(s: &mut IpState) {
                     let ep_id = *bp as usize;
                     let (claimed_tag, _) = dg_decode_owner_tag(bp, plen);
                     let live = ep_id < MAX_DG_ENDPOINTS && {
-                        let conn = &*s.tcp_conns.as_ptr().add(ep_id);
+                        let conn = &*s.tcp_conns.ptr(ep_id);
                         conn.is_datagram && conn.state == tcp::TcpState::Listen
                     };
-                    let owned = live && (*s.tcp_conns.as_ptr().add(ep_id)).owner_tag == claimed_tag;
+                    let owned = live && (*s.tcp_conns.ptr(ep_id)).owner_tag == claimed_tag;
                     if owned {
                         conn_reset(s, ep_id);
                         dg_send_closed(s, ep_id as u8);
@@ -7635,7 +7683,7 @@ unsafe fn connect_v4(s: &mut IpState, ip: u32, port: u16, requester_tag: u8) {
     };
     let iss = compute_iss(s, s.local_ip, local_port, ip, port);
 
-    let conn = &mut *s.tcp_conns.as_mut_ptr().add(ci);
+    let conn = &mut *s.tcp_conns.ptr_mut(ci);
     conn.state = tcp::TcpState::SynSent;
     conn.remote_ip = ip;
     conn.remote_port = port;
@@ -8076,7 +8124,9 @@ fn is_syn_retransmit_tick(timer: u16) -> bool {
 unsafe fn step_tcp_timers(s: &mut IpState) {
     let now = dev_millis(&*s.syscalls) as u32;
     let elapsed = now.wrapping_sub(s.sweep_window_ms);
-    let n = tcp::MAX_TCP_CONNS;
+    // The backed table: `len()` only grows, so a cursor left by a shorter
+    // window is still inside it.
+    let n = s.tcp_conns.len();
     let target = if elapsed >= TCP_SWEEP_WINDOW_MS {
         n
     } else {
@@ -8125,7 +8175,7 @@ unsafe fn sweep_range(s: &mut IpState, start: usize, end: usize) {
     {
         let mut ci = start;
         while ci < end {
-            let c = &*s.tcp_conns.as_ptr().add(ci);
+            let c = &*s.tcp_conns.ptr(ci);
             if c.rcv_wnd == 0
                 && matches!(
                     c.state,
@@ -8136,7 +8186,7 @@ unsafe fn sweep_range(s: &mut IpState, start: usize, end: usize) {
                 // Announce the reopened window (RFC 9293 §3.8.6.2.2): the
                 // peer otherwise learns of it only from its persist probe,
                 // which meets the rate-limited challenge path and backs off.
-                if (*s.tcp_conns.as_ptr().add(ci)).rcv_wnd != 0 {
+                if (*s.tcp_conns.ptr(ci)).rcv_wnd != 0 {
                     s.drops.tcp_window_update = s.drops.tcp_window_update.wrapping_add(1);
                     let _ = send_tcp_control(s, ci, tcp::ACK, false);
                 }
@@ -8154,7 +8204,7 @@ unsafe fn sweep_range(s: &mut IpState, start: usize, end: usize) {
     {
         let mut i = start;
         while i < end {
-            let conn = &mut *s.tcp_conns.as_mut_ptr().add(i);
+            let conn = &mut *s.tcp_conns.ptr_mut(i);
             let kind = conn.pending_close_notify;
             let tag = conn.connect_tag;
             if kind != NOTIFY_NONE && kind != continuity::NOTIFY_SHADOW_RESERVED {
@@ -8166,7 +8216,7 @@ unsafe fn sweep_range(s: &mut IpState, start: usize, end: usize) {
                     _ => true, // unknown code → drop the latch
                 };
                 if delivered {
-                    let conn = &mut *s.tcp_conns.as_mut_ptr().add(i);
+                    let conn = &mut *s.tcp_conns.ptr_mut(i);
                     if conn.state == tcp::TcpState::Closed {
                         let remote_ip = conn.remote_ip;
                         if remote_ip != 0 {
@@ -8184,7 +8234,7 @@ unsafe fn sweep_range(s: &mut IpState, start: usize, end: usize) {
 
     let mut i = start;
     while i < end {
-        let conn = &mut *s.tcp_conns.as_mut_ptr().add(i);
+        let conn = &mut *s.tcp_conns.ptr_mut(i);
         // Challenge-ACK refill lands on a connection when the sweep
         // reaches it, once per refill epoch.
         if conn.chal_epoch != s.chal_epoch {
@@ -8216,7 +8266,7 @@ unsafe fn sweep_range(s: &mut IpState, start: usize, end: usize) {
                     if net_send_error(s, i as u16, -110, tag) {
                         conn_reset(s, i);
                     } else {
-                        let conn = &mut *s.tcp_conns.as_mut_ptr().add(i);
+                        let conn = &mut *s.tcp_conns.ptr_mut(i);
                         conn.state = tcp::TcpState::Closed;
                         conn.pending_close_notify = NOTIFY_ERROR_TIMEOUT;
                     }
@@ -8250,7 +8300,7 @@ unsafe fn sweep_range(s: &mut IpState, start: usize, end: usize) {
                 if conn.closewait_timer >= CLOSE_WAIT_TICKS
                     && send_tcp_control(s, i, tcp::FIN | tcp::ACK, false)
                 {
-                    let conn = &mut *s.tcp_conns.as_mut_ptr().add(i);
+                    let conn = &mut *s.tcp_conns.ptr_mut(i);
                     conn.state = tcp::TcpState::LastAck;
                     conn.retransmit_timer = 0;
                     s.tcp_closewait_expired = s.tcp_closewait_expired.wrapping_add(1);
@@ -8300,7 +8350,7 @@ unsafe fn sweep_range(s: &mut IpState, start: usize, end: usize) {
                     if conn.idle_timer >= s.tcp_idle_ticks {
                         conn.idle_timer = 0;
                         if send_tcp_control(s, i, tcp::FIN | tcp::ACK, false) {
-                            let conn = &mut *s.tcp_conns.as_mut_ptr().add(i);
+                            let conn = &mut *s.tcp_conns.ptr_mut(i);
                             conn.state = tcp::TcpState::FinWait1;
                             s.tcp_idle_closed = s.tcp_idle_closed.wrapping_add(1);
                             let _ = net_send_error(s, i as u16, -110, 0);
@@ -8374,9 +8424,9 @@ pub mod test_helpers {
     #[must_use]
     pub unsafe fn keyed_conn_count(state: *const u8) -> usize {
         let s = &*(state as *const IpState);
-        (0..tcp::MAX_TCP_CONNS)
+        (0..s.tcp_conns.len())
             .filter(|i| {
-                let c = &*s.tcp_conns.as_ptr().add(*i);
+                let c = &*s.tcp_conns.ptr(*i);
                 c.is_active() && super::conn_is_keyed(c)
             })
             .count()
@@ -8504,9 +8554,9 @@ pub mod test_helpers {
             local_port,
             local_slot,
         };
-        let conns = s.tcp_conns.as_ptr();
+        let conns = &s.tcp_conns;
         super::index::lookup_counted(&s.conn_index, key.hash(s.index_seed), |slot| {
-            let c = &*conns.add(slot);
+            let c = &*conns.ptr(slot);
             c.is_active()
                 && c.remote_ip == remote_ip
                 && c.remote_port == remote_port
@@ -8521,7 +8571,7 @@ pub mod test_helpers {
     /// `state` must point to an initialised `IpState`.
     pub unsafe fn sweep_position(state: *const u8) -> (usize, usize) {
         let s = &*(state as *const IpState);
-        (s.sweep_cursor as usize, tcp::MAX_TCP_CONNS)
+        (s.sweep_cursor as usize, s.tcp_conns.len())
     }
 
     /// Half-open sources the table could not track.
@@ -8603,7 +8653,7 @@ pub mod test_helpers {
     /// # Safety
     /// `state` must point to an initialised `IpState`.
     pub unsafe fn conn_local_port(state: *const u8, idx: usize) -> u16 {
-        (*(state as *const IpState)).tcp_conns[idx].local_port
+        (&(*(state as *const IpState)).tcp_conns)[idx].local_port
     }
 
     /// Global challenge-ACK bucket: `(remaining, ticks_into_refill_window)`.
@@ -8716,7 +8766,7 @@ pub mod test_helpers {
         ssthresh: u16,
         in_recovery: bool,
     ) {
-        let c = &mut (*(state as *mut IpState)).tcp_conns[idx];
+        let c = &mut (&mut (*(state as *mut IpState)).tcp_conns)[idx];
         c.cwnd = cwnd;
         c.ssthresh = ssthresh;
         c.in_recovery = in_recovery;
@@ -8727,7 +8777,7 @@ pub mod test_helpers {
     /// # Safety
     /// `state` must point to an initialised `IpState`.
     pub unsafe fn set_retransmit_timer(state: *mut u8, idx: usize, ticks: u16) {
-        (*(state as *mut IpState)).tcp_conns[idx].retransmit_timer = ticks;
+        (&mut (*(state as *mut IpState)).tcp_conns)[idx].retransmit_timer = ticks;
     }
 
     /// The decoded connection held by shadow `i`.
@@ -8776,7 +8826,7 @@ pub mod test_helpers {
     /// # Safety
     /// `state` must point to an initialised `IpState`.
     pub unsafe fn conn_timers(state: *const u8, idx: usize) -> (u16, u16, bool, u16, u16) {
-        let c = &(*(state as *const IpState)).tcp_conns[idx];
+        let c = &(&(*(state as *const IpState)).tcp_conns)[idx];
         (c.cwnd, c.ssthresh, c.in_recovery, c.retransmit_timer, c.rto)
     }
 
@@ -8785,7 +8835,7 @@ pub mod test_helpers {
     /// # Safety
     /// `state` must point to an initialised `IpState`.
     pub unsafe fn conn_view(state: *const u8, idx: usize) -> ConnView {
-        let c = &(*(state as *const IpState)).tcp_conns[idx];
+        let c = &(&(*(state as *const IpState)).tcp_conns)[idx];
         ConnView {
             state: c.state as u8,
             local_port: c.local_port,
@@ -8811,7 +8861,7 @@ pub mod test_helpers {
     /// # Safety
     /// `state` must point to an initialised `IpState`.
     pub unsafe fn set_rcv_wnd(state: *mut u8, idx: usize, wnd: u16) {
-        (*(state as *mut IpState)).tcp_conns[idx].rcv_wnd = wnd;
+        (&mut (*(state as *mut IpState)).tcp_conns)[idx].rcv_wnd = wnd;
     }
 
     /// Initial send sequence number latched on a connection slot.
@@ -8819,7 +8869,7 @@ pub mod test_helpers {
     /// # Safety
     /// `state` must point to an initialised `IpState`.
     pub unsafe fn conn_iss(state: *const u8, idx: usize) -> u32 {
-        (*(state as *const IpState)).tcp_conns[idx].iss
+        (&(*(state as *const IpState)).tcp_conns)[idx].iss
     }
 
     /// ARP cache view for one address: `(mac, pinned, pin_count, revalidate)`.
@@ -8975,7 +9025,7 @@ pub mod test_helpers {
     /// # Safety
     /// `state` must point to an initialised `IpState`.
     pub unsafe fn conn_local_slot(state: *const u8, idx: usize) -> u16 {
-        (*(state as *const IpState)).tcp_conns[idx].local_slot
+        (&(*(state as *const IpState)).tcp_conns)[idx].local_slot
     }
 
     /// Inspect the local IP currently held by the IP stack.
@@ -9002,6 +9052,34 @@ pub mod test_helpers {
         (*(state as *const IpState)).alloc_scanned
     }
 
+    /// Connections the table holds inline, before any elastic grant.
+    pub const CONN_FIRST: usize = super::conn_arena::CONN_FIRST;
+
+    /// Connection-table growth: `(backed slots, chunks granted, grants
+    /// refused)`.
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `IpState`.
+    pub unsafe fn conn_arena_stats(state: *const u8) -> (usize, u32, u32) {
+        let a = &(*(state as *const IpState)).tcp_conns;
+        (a.len(), a.grants, a.denials)
+    }
+
+    /// Back the connection table up to `slots` (capped at the ceiling)
+    /// the way the allocator grows it, so a test can exercise a large
+    /// table without first filling it. Returns the slots now backed.
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `IpState`.
+    pub unsafe fn reserve_conn_slots(state: *mut u8, slots: usize) -> usize {
+        let s = &mut *(state as *mut IpState);
+        while s.tcp_conns.len() < slots && super::grow_conn_table(s) {}
+        s.tcp_conns.len()
+    }
+
+    /// Slots in use and slots backed: `(used, backed)`. The second is the
+    /// bound a test may index the table up to; the ceiling is
+    /// `MAX_TCP_CONNS`.
     pub unsafe fn conn_count(state: *const u8) -> (usize, usize) {
         let s = &*(state as *const IpState);
         let mut used = 0;
@@ -9010,7 +9088,7 @@ pub mod test_helpers {
                 used += 1;
             }
         }
-        (used, tcp::MAX_TCP_CONNS)
+        (used, s.tcp_conns.len())
     }
 
     /// Snapshot of the per-tick telemetry counters. Tests use this to

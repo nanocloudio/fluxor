@@ -3,9 +3,10 @@
 //! Logs `[fpu_probe] before f32`, then adds two `f32`s it cannot see the
 //! values of, then logs `[fpu_probe] f32 ran`. On rp2350 the second line never
 //! appears: the addition is a VFP instruction, the FPU is not enabled, and the
-//! node takes a NOCP fault. The addition lives in its own never-inlined
-//! function so no VFP instruction — not even a register save in a prologue —
-//! can be scheduled ahead of the first log line.
+//! node takes a NOCP fault. Modules build soft-float, where `f32` arithmetic
+//! does not link, so on Arm the addition is written as the instruction itself
+//! rather than left to the compiler. It lives in its own never-inlined
+//! function so nothing of it can be scheduled ahead of the first log line.
 
 #![no_std]
 #![allow(
@@ -81,6 +82,32 @@ pub extern "C" fn module_new(
 }
 
 /// One `f32` addition the compiler cannot fold, as the raw bits of its result.
+#[cfg(target_arch = "arm")]
+#[inline(never)]
+fn add_f32() -> u32 {
+    let mut bits = core::hint::black_box(1.5f32.to_bits());
+    let other = core::hint::black_box(2.5f32.to_bits());
+    // SAFETY: two moves into single-precision registers, one addition, one
+    // move back. The soft-float ABI gives the compiler no use of s0/s1, so
+    // nothing it holds is clobbered; with the FPU off the first instruction
+    // faults, which is the point.
+    unsafe {
+        core::arch::asm!(
+            ".fpu fpv5-sp-d16",
+            "vmov s0, {a}",
+            "vmov s1, {b}",
+            "vadd.f32 s0, s0, s1",
+            "vmov {a}, s0",
+            a = inout(reg) bits,
+            b = in(reg) other,
+            options(nomem, nostack),
+        );
+    }
+    bits
+}
+
+/// The same addition where the compiler may emit it.
+#[cfg(not(target_arch = "arm"))]
 #[inline(never)]
 fn add_f32() -> u32 {
     (core::hint::black_box(1.5f32) + core::hint::black_box(2.5f32)).to_bits()

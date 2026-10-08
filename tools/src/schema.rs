@@ -460,7 +460,16 @@ pub fn build_params_from_schema(
         }
 
         if param.ptype == ParamType::Blob {
-            if let Some(arr) = presets.as_ref() {
+            // A blob takes its value under its own name -- one source, or a
+            // list of them -- and only failing that from the module's
+            // `presets`, the shared list a module with several blob params
+            // (a synth's patches) draws them all from.
+            let named: Option<Vec<Value>> =
+                kv.get(&param.name).map(|value| match value.as_array() {
+                    Some(list) => list.clone(),
+                    None => vec![value.clone()],
+                });
+            if let Some(arr) = named.as_ref().or(presets.as_ref()) {
                 for preset_ref in arr.iter() {
                     let blob = resolve_preset_blob(preset_ref, data_section)
                         .map_err(|e| format!("module '{module_name}': {e}"))?;
@@ -470,7 +479,15 @@ pub fn build_params_from_schema(
                     // Self-delimiting blob: first chunk carries 2-byte LE total
                     // length header. Module uses this to know when one blob ends
                     // and the next begins, without needing a separate boundary tag.
-                    let total_len = blob.len() as u16;
+                    // A blob that cannot be carried whole is refused here: a
+                    // module handed a prefix of one has no way to know it.
+                    let Ok(total_len) = u16::try_from(blob.len()) else {
+                        return Err(format!(
+                            "module '{module_name}': blob for '{}' is {} bytes, over the 65535 a blob carries",
+                            param.name,
+                            blob.len()
+                        ));
+                    };
                     let header = total_len.to_le_bytes();
                     let mut off = 0;
                     let mut first = true;
@@ -479,7 +496,11 @@ pub fn build_params_from_schema(
                         let max_data = 255 - extra;
                         let chunk = std::cmp::min(max_data, blob.len() - off);
                         if pos + 2 + extra + chunk >= entry.len() {
-                            break;
+                            return Err(format!(
+                                "module '{module_name}': blob for '{}' ({} bytes) does not fit the module's config entry",
+                                param.name,
+                                blob.len()
+                            ));
                         }
                         entry[pos] = param.tag;
                         pos += 1;
@@ -1022,6 +1043,15 @@ fn resolve_preset_blob(
             .collect());
     }
 
+    // A file, by the same `${file:<path>}` spec a trust anchor is named by:
+    // its bytes are the blob, as they are, with nothing to decode.
+    if let Some(path) = preset_ref
+        .as_str()
+        .and_then(crate::trust_anchors::file_source)
+    {
+        return std::fs::read(path).map_err(|e| format!("blob file '{path}': {e}"));
+    }
+
     // String reference: look up in data section
     if let Some(name) = preset_ref.as_str() {
         if let Some(data) = data_section {
@@ -1554,6 +1584,65 @@ fn expand_routes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn blob_schema() -> ParamSchema {
+        let params = vec![SchemaParam {
+            tag: 7,
+            ptype: ParamType::Blob,
+            name: "image".into(),
+            default: 0,
+            enums: HashMap::new(),
+        }];
+        let name_map = HashMap::from([("image".to_string(), 0usize)]);
+        ParamSchema { params, name_map }
+    }
+
+    /// A blob named by its own parameter, from a `${file:}` source, arrives
+    /// whole: chunks under its tag, the first led by the total length, and
+    /// the bytes after the headers exactly the file's.
+    #[test]
+    fn a_blob_param_takes_a_file_under_its_own_name() {
+        let dir = std::env::temp_dir().join(format!("fluxor-blob-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("image.bin");
+        let bytes: Vec<u8> = (0..700u32).map(|i| (i * 7 % 251) as u8).collect();
+        std::fs::write(&path, &bytes).unwrap();
+        let module = serde_json::json!({ "image": format!("${{file:{}}}", path.display()) });
+        let mut entry = vec![0u8; 4096];
+        let end = build_params_from_schema(&module, &blob_schema(), &mut entry, 0, None, "isolate")
+            .expect("a file-backed blob encodes");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut pos = 4; // the TLV header
+        let mut carried = Vec::new();
+        let mut first = true;
+        while pos + 2 <= end && entry[pos] == 7 {
+            let length = entry[pos + 1] as usize;
+            let mut chunk = &entry[pos + 2..pos + 2 + length];
+            if first {
+                assert_eq!(u16::from_le_bytes([chunk[0], chunk[1]]), 700);
+                chunk = &chunk[2..];
+                first = false;
+            }
+            carried.extend_from_slice(chunk);
+            pos += 2 + length;
+        }
+        assert_eq!(
+            carried, bytes,
+            "the module is handed the file's bytes, whole"
+        );
+    }
+
+    /// A blob the entry cannot hold is refused at build, not cut short: a
+    /// module handed a prefix has no way to know it.
+    #[test]
+    fn a_blob_that_does_not_fit_is_refused() {
+        let module = serde_json::json!({ "image": [vec![1u8; 600]] });
+        let mut entry = vec![0u8; 256];
+        let refused =
+            build_params_from_schema(&module, &blob_schema(), &mut entry, 0, None, "isolate");
+        assert!(refused.is_err(), "a truncated blob must not encode");
+    }
 
     /// Derive the handler byte a `routes:` entry compiles to.
     fn handler_of(route: serde_json::Value) -> Option<u64> {

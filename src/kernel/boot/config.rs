@@ -535,19 +535,20 @@ pub const GRAPH_SLOTS_CODE: u8 = if MAX_GRAPH_EDGES == 128 {
     (MAX_GRAPH_EDGES / 128) as u8
 };
 
-/// Hard ceiling on the on-disk config blob size. Per-platform:
-/// - Embedded targets (rp/bcm) cap at 32 KiB — fits in their
-///   statically-sized flash regions; bumping requires re-validating
-///   the mapped config region + trailer's `config_size` field.
-/// - Host targets (linux/wasm) cap at 256 KiB — the synthesised
-///   wasm-scenario host inlines the canonical browser shell
-///   (runtime.html + host_shims.js, ~110 KiB combined) plus scenario.json as
-///   `body:` routes so the orchestrator stays self-contained per the
-///   shared-infra-in-orchestrator partition principle. Host targets have
-///   GiBs of RAM, so the cap is a sanity bound, not a memory constraint.
-#[cfg(any(target_os = "linux", target_arch = "wasm32"))]
+/// The largest config blob the parser accepts, keyed on the profile rather
+/// than on whether an OS is present:
+/// - 256 KiB on the hosted targets (linux, wasm) and on bare-metal aarch64
+///   (bcm2712), which carries the host profile's config arena. A graph of a
+///   few hundred modules composed from params needs well past 32 KiB, and a
+///   wasm scenario host inlines its browser shell as `body:` routes.
+/// - 32 KiB on the microcontroller targets.
+///
+/// `kernel_max_config_size` in `tools/src/cli/commands_a.rs` mirrors this, so
+/// an oversized config fails the build rather than halting the board before
+/// its logger runs.
+#[cfg(any(target_os = "linux", target_arch = "wasm32", target_arch = "aarch64"))]
 pub const MAX_CONFIG_SIZE: usize = 256 * 1024;
-#[cfg(not(any(target_os = "linux", target_arch = "wasm32")))]
+#[cfg(not(any(target_os = "linux", target_arch = "wasm32", target_arch = "aarch64")))]
 pub const MAX_CONFIG_SIZE: usize = 32 * 1024;
 
 /// Hardware section binary format sizes
@@ -1146,9 +1147,10 @@ pub fn read_config_from_slice(blob: &[u8], config: &mut Config) -> bool {
     // runtime.html + host_shims.js + scenario.json as http route
     // bodies) — same partition principle as `MAX_CONFIG_SIZE` above,
     // kept in lockstep with it and the CLI's MAX_MODULE_PARAMS_SIZE.
-    #[cfg(any(target_os = "linux", target_arch = "wasm32"))]
+    // As `MAX_CONFIG_SIZE`: keyed on the profile, not on an OS.
+    #[cfg(any(target_os = "linux", target_arch = "wasm32", target_arch = "aarch64"))]
     const MAX_MODULE_SECTION: usize = 256 * 1024;
-    #[cfg(not(any(target_os = "linux", target_arch = "wasm32")))]
+    #[cfg(not(any(target_os = "linux", target_arch = "wasm32", target_arch = "aarch64")))]
     const MAX_MODULE_SECTION: usize = 32 * 1024;
     if section_size > MAX_MODULE_SECTION {
         log::error!(

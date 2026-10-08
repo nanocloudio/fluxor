@@ -1,0 +1,15 @@
+version = "1.0.0"
+hardware_targets = ["bcm2712"]
+
+# Lists a volume's root on its heartbeat and, when told which suffixes,
+# removes the matching files. A board's disk outlives every graph that ran
+# on it; this is how a scenario starts from a known volume without a host
+# mounting the disk. A plain `fs` consumer: OPENDIR, READDIR, UNLINK.
+
+[[resources]]
+requires_contract = "fs"
+access = "write"
+
+# The heartbeat is the observable (`[fs_clean] files:` / `removed=`).
+[observability]
+exempt = "volume inventory fixture; its '[fs_clean]' heartbeat is consumed by rig scenarios"

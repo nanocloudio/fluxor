@@ -150,6 +150,17 @@ consumers do not run until it has returned `Ready` from a step. The
 gating is transitive: if A is gated on B and B is gated on C, then A's
 consumers wait until C reports ready, then B reports ready.
 
+The same gate covers a dependency no edge shows. A module that requires a
+contract (`requires_contract` in its manifest) whose default provider is
+a deferred-ready module waits for that provider's `Ready` exactly as a
+module downstream of it on an edge would: the consumer reaches the
+provider through `provider_call`, not a channel, but a store whose disk
+mounts only once the graph steps answers `EAGAIN` until then, and a
+consumer that subscribes or reads once at its first step would take that
+for a refusal. Deferred-ready consumers are left ungated, so providers
+that require each other's contracts still step to readiness. The gate is
+set once instantiation is complete, at boot and after a rebuild alike.
+
 ### Async I/O Pattern
 
 Hardware-facing operations use start/poll sequencing:

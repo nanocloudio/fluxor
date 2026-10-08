@@ -73,10 +73,10 @@ const _: () = assert!(KERNEL_POOL_COUNT == POOL_ELASTIC_REGION as usize);
 /// accounted denial against `POOL_ELASTIC_REGION` (region exhausted,
 /// chunk table full, or a zero-sized region on targets without one).
 ///
-/// Grants are monotonic-to-teardown (§3.6 "shrink deferred"): there is
-/// no individual free; every chunk a module holds is reclaimed when its
-/// owner is torn down. EL0-isolated modules are denied (their page
-/// tables map state/heap/channels only — mapping grants is future work).
+/// Grants are monotonic-to-teardown: there is no individual free; every
+/// chunk a module holds is reclaimed when its owner is torn down.
+/// EL0-isolated modules are denied: their page tables map state, heap and
+/// channels only, and a grant lies outside all three.
 pub const ELASTIC_ALLOC: u32 = 0x0C3F;
 
 // ── Capacity-envelope config section ───

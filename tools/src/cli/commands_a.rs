@@ -498,6 +498,36 @@ fn cmd_generate(
     Ok(())
 }
 
+/// Refuse a module whose code is over the loader's ceiling for the target.
+///
+/// The loader refuses it at boot ("code too large"), which on a board is a
+/// graph that never starts, found after a flash. The ceiling is the silicon's
+/// `module_code_kb`; a target that states none is not checked.
+fn check_code_ceiling(
+    modules: &[modules::ModuleInfo],
+    target: &crate::target::TargetDescriptor,
+) -> Result<()> {
+    let Some(ceiling_kb) = target.module_code_kb else {
+        return Ok(());
+    };
+    let ceiling = ceiling_kb as usize * 1024;
+    let over: Vec<String> = modules
+        .iter()
+        .filter(|m| m.code_size() > ceiling)
+        .map(|m| format!("{} ({} B)", m.name, m.code_size()))
+        .collect();
+    if over.is_empty() {
+        return Ok(());
+    }
+    Err(error::Error::Config(format!(
+        "{} over {}'s module code ceiling of {} B (module_code_kb in targets/silicon/{}.toml): the loader would refuse it at boot",
+        over.join(", "),
+        target.id,
+        ceiling,
+        target.module_silicon()
+    )))
+}
+
 /// Charge a graph's modules against the target's state arena and REFUSE an
 /// over-budget image.
 ///
@@ -601,6 +631,38 @@ fn check_state_budget(
             target.id,
             total - arena,
             target.id,
+        )));
+    }
+    Ok(())
+}
+
+/// The largest config blob the target's kernel parses — the mirror of
+/// `kernel::boot::config::MAX_CONFIG_SIZE`, which is keyed on the compile
+/// target: 256 KiB on Linux, wasm32 and aarch64 (bcm2712), 32 KiB on the
+/// microcontrollers. A config past it is refused at boot before the logger
+/// runs, so a board would halt without saying why; refuse it here, by name.
+fn kernel_max_config_size(target: &crate::target::TargetDescriptor) -> usize {
+    // A target with no kernel build of its own is hosted (Linux, wasm).
+    let Some(build) = target.build.as_ref() else {
+        return 256 * 1024;
+    };
+    let t = build.rust_target.as_str();
+    if t.starts_with("aarch64") || t.contains("linux") || t.starts_with("wasm32") {
+        256 * 1024
+    } else {
+        32 * 1024
+    }
+}
+
+/// Refuse a packed config the target's kernel would refuse at boot.
+fn check_config_size(len: usize, target: &crate::target::TargetDescriptor) -> Result<()> {
+    let max = kernel_max_config_size(target);
+    if len > max {
+        return Err(Error::Config(format!(
+            "config blob is {len} bytes; the {} kernel parses at most {max} \
+             (MAX_CONFIG_SIZE) and would refuse this graph at boot. Trim module \
+             params or split the graph.",
+            target.id
         )));
     }
     Ok(())
@@ -951,6 +1013,7 @@ fn cmd_combine(
         &crate::project::root_for_config(config_path),
     )?;
 
+    check_code_ceiling(&modules, &target_desc)?;
     check_state_budget(&modules, &config, &target_desc)?;
     check_stack_budget(&modules, &config, &target_desc)?;
     check_gated_admission(&modules, &config, &target_desc)?;
@@ -1250,6 +1313,8 @@ fn build_packaged_blobs(
         project_root,
     )?;
 
+    check_config_size(config_data.len(), target_desc)?;
+    check_code_ceiling(&modules, target_desc)?;
     check_state_budget(&modules, config, target_desc)?;
     check_stack_budget(&modules, config, target_desc)?;
     check_gated_admission(&modules, config, target_desc)?;

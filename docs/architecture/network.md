@@ -189,6 +189,20 @@ The connection handle is module-local, not a kernel resource. Two
 consumers attached to two different provider instances can both hold
 `conn_id 7` without conflict.
 
+The table behind the handles has a ceiling (`MAX_TCP_CONNS`, the id
+space on the host profile) and a lazily backed body (`ip/conn_arena.rs`).
+The first 512 connections live inline in module state; when they are all
+taken, the allocator asks the kernel elastic region for one more
+256-connection chunk and hands out its lowest slot. A chunk, once
+granted, is backed until the module is torn down, so a slot number once
+valid stays valid, and every bound that drives or guards an access into
+the table — a consumer's `conn_id`, the timer sweep, the free-slot scan —
+is the backed length, never the ceiling. A chunk the region refuses is
+counted and the arrival refused, exactly as a full table refuses it; the
+periodic report carries the growth as `cgrow=<chunks granted>
+cdeny=<chunks refused> cslots=<records backed>`. On the embedded
+profiles the inline block is the whole table.
+
 ### Fan-out and filtering
 
 The provider has a single net_proto pair: `net_in` (commands in) and

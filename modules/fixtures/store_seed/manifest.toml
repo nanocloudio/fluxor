@@ -1,9 +1,14 @@
 version = "1.0.0"
 hardware_targets = ["bcm2712", "linux"]
 
-# Seeds ONE key. A graph that needs several instantiates several — which keeps
-# the params flat and the wiring obvious, and matches how the Linux E2Es seed
-# (one store_put per object) rather than inventing a batch format.
+# Seeds ONE key (`value` text, or `value_hex` for a binary body). A graph
+# that needs several instantiates several — which keeps the params flat and
+# the wiring obvious, and matches how the Linux E2Es seed (one store_put per
+# object) rather than inventing a batch format.
+
+# `after_ms` holds the write until that long after boot (wall clock).
+timer_class = "wall_clock"
+
 [[resources]]
 requires_contract = "storage.object"
 access = "write"

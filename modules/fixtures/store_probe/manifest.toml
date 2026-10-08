@@ -1,6 +1,9 @@
 version = "1.0.0"
 hardware_targets = ["bcm2712"]
 
+# `after_ms` holds the probe until that long after boot (wall clock).
+timer_class = "wall_clock"
+
 # The store, on the board. Both contracts, because the point of the probe is
 # that a store-backed graph has BOTH: `storage.object` for the keyed bytes and
 # `storage.namespace` for the prefix walk and the change subscription that

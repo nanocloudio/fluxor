@@ -70,7 +70,13 @@ const TOTAL_SLOTS: usize = MAX_STREAM_SLOTS + MAX_CMD_SLOTS + MAX_RX_SLOTS;
 /// audio-rate streaming, and a die with 64 KiB of arena cannot host a media
 /// graph at all — on RP2040 this module drives LED strips, bit-banged buses and
 /// similar, which are orders of magnitude slower.
-const TINY_ARENA: bool = abi::config::kernel::STATE_ARENA_SIZE <= 64 * 1024;
+///
+/// The `small_stream` variant takes the same sizes on any die, for a graph
+/// whose state machines carry commands rather than streams -- a radio's gSPI
+/// bus, which uses the command slots only -- and whose arena has a better use
+/// for the 27 KiB the audio-rate buffers would hold.
+const TINY_ARENA: bool =
+    cfg!(feature = "small_stream") || abi::config::kernel::STATE_ARENA_SIZE <= 64 * 1024;
 
 /// TX stream buffer size in u32 words. Two per slot (front and back), so at
 /// 2048 words this pair is 16 KiB of every stream slot; 512 words on a 64 KiB

@@ -1466,6 +1466,21 @@ fn default_layer_index(entry: &ProviderEntry) -> Option<usize> {
     None
 }
 
+/// The module serving `contract` by default — its top-most unkeyed layer —
+/// or `None` when no module does (no provider, or only the kernel's own).
+/// The contract-readiness gate asks this once the graph is instantiated.
+pub fn default_module_provider(contract: usize) -> Option<usize> {
+    if contract >= MAX_PROVIDERS {
+        return None;
+    }
+    // SAFETY: scheduler thread, after instantiation; read-only.
+    unsafe {
+        let entry = &(*core::ptr::addr_of!(PROVIDERS))[contract];
+        let top = default_layer_index(entry)?;
+        entry.chain[top].as_ref().map(|l| l.module_idx as usize)
+    }
+}
+
 /// Call the provider of the opcode's contract selected by `sel`: an
 /// instance-keyed module layer (a volume name), or — for the reserved name
 /// [`PLATFORM_SELECTOR_NAME`] — the platform's own provider of that contract

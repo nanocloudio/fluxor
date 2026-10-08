@@ -12,6 +12,14 @@
 //! writes them, and seeding from a graph parameter is how a test supplies a
 //! precondition that would otherwise have to be created by that writer.
 //!
+//! `value` is the body as text; `value_hex` is the body as hex, for an object
+//! that is not text (a key frame, a binary record). Both are chunked, so a body
+//! may be longer than one parameter entry (up to 1 KiB).
+//!
+//! A store that is not ready yet (`EAGAIN` — a disk-backed store still
+//! mounting its volume) is asked again on later steps, like a write still in
+//! progress; any other answer is final.
+//!
 //! Writes ONCE, not every step: a repeated PUT bumps the revision each time,
 //! which would wake every watcher on the prefix forever and make an idle graph
 //! look busy.
@@ -68,8 +76,13 @@ struct State {
     too_long: u8,
     value: [u8; MAX_VALUE],
     value_len: u32,
+    /// The first digit of a `value_hex` byte whose second digit is still to
+    /// come (the next chunk), or `NO_NIBBLE`.
+    hex_pending: u8,
     written: u32,
     ticks: u32,
+    /// Write no earlier than this, in ms since boot (`after_ms`).
+    after_ms: u32,
     rc: i32,
     /// Where the write's fence lands. In the state, so a write asked again
     /// is the same request.
@@ -97,16 +110,63 @@ mod params_def {
                 }
             };
 
-        2, value, str, 0
+        // Both are chunked (`str_chunked`): a body past one parameter entry
+        // (255 bytes) arrives as several, each appended in order.
+        2, value, str_chunked, 0
             => |s, d, len| {
-                if len > MAX_VALUE {
+                let at = s.value_len as usize;
+                if at + len > MAX_VALUE {
                     s.too_long = 1;
-                    s.value_len = 0;
                 } else {
-                    s.value_len = len as u32;
-                    if len > 0 { ptr_copy(s.value.as_mut_ptr(), d, len); }
+                    if len > 0 { ptr_copy(s.value.as_mut_ptr().add(at), d, len); }
+                    s.value_len = (at + len) as u32;
                 }
             };
+
+        3, value_hex, str_chunked, 0
+            => |s, d, len| {
+                // Two digits per byte. A chunk may end between the two digits
+                // of a byte, so the odd digit waits in `hex_pending` for the
+                // next one; a non-hex digit is a params mistake, reported like
+                // an oversized value.
+                let mut i = 0usize;
+                while i < len {
+                    let Some(n) = super::hex_nibble(*d.add(i)) else {
+                        s.too_long = 1;
+                        return;
+                    };
+                    if s.hex_pending == super::NO_NIBBLE {
+                        s.hex_pending = n;
+                    } else {
+                        let at = s.value_len as usize;
+                        if at >= MAX_VALUE {
+                            s.too_long = 1;
+                            return;
+                        }
+                        s.value[at] = (s.hex_pending << 4) | n;
+                        s.value_len = (at + 1) as u32;
+                        s.hex_pending = super::NO_NIBBLE;
+                    }
+                    i += 1;
+                }
+            };
+
+        // Hold the write until this many wall-clock milliseconds after boot:
+        // a seed that changes what the graph does (a key, say) can wait until
+        // the board's telemetry is up, so whatever it sets off is observed.
+        4, after_ms, u32, 0
+            => |s, d, len| { s.after_ms = super::p_u32(d, len, 0, 0); };
+    }
+}
+
+const NO_NIBBLE: u8 = 0xFF;
+
+fn hex_nibble(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -150,12 +210,18 @@ pub unsafe extern "C" fn module_new(
         s.syscalls = syscalls as *const SyscallTable;
         s.key_len = 0;
         s.value_len = 0;
+        s.hex_pending = NO_NIBBLE;
         s.too_long = 0;
         s.written = 0;
         s.ticks = 0;
+        s.after_ms = 0;
         s.rc = 0;
         params_def::set_defaults(s);
         params_def::parse_tlv(s, params, params_len);
+        // An odd number of hex digits left half a byte.
+        if s.hex_pending != NO_NIBBLE {
+            s.too_long = 1;
+        }
         0
     }
 }
@@ -180,6 +246,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             dev_log(&*s.syscalls, 3, m.as_ptr(), m.len());
         }
         if s.written != 0 {
+            return 0;
+        }
+        if s.after_ms != 0 && dev_millis(&*s.syscalls) < u64::from(s.after_ms) {
             return 0;
         }
         if s.too_long != 0 {
@@ -230,6 +299,15 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         s.rc = match write_answer((sys.provider_call)(-1, OBJ_PUT, arg.as_mut_ptr(), p)) {
             // Not decided yet: asked again next step, with the same request.
             WriteAnswer::Pending => return 0,
+            // Not ready yet (a disk-backed store mounting its volume): ask
+            // again, saying so on the heartbeat's cadence.
+            WriteAnswer::Decided(rc) if rc == abi::kernel_abi::errno::EAGAIN => {
+                if s.ticks % 1000 == 1 {
+                    let m = b"[seed] store not ready (EAGAIN), retrying";
+                    dev_log(sys, 3, m.as_ptr(), m.len());
+                }
+                return 0;
+            }
             WriteAnswer::Decided(rc) => rc,
         };
         s.written = 1;

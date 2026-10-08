@@ -181,6 +181,9 @@ psm_wdsel = "0x40010008"
 psm_wdsel_mask = "0x0001fffc"
 boot2_src = "0x10000000"
 state_arena_kb = 64
+# The loader's ceiling on one module's code; see rp2350.toml. 384 KiB on the
+# 2 MiB part. Mirrors `MAX_MODULE_CODE_SIZE` in modules/sdk/abi/config.rs.
+module_code_kb = 384
 buffer_arena_kb = 16
 config_buffer_kb = 8
 config_arena_kb = 8

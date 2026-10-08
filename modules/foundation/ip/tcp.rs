@@ -130,8 +130,8 @@ pub struct TcpConn {
     /// conns latch the slot the inbound dst-IP matched; outbound connects use
     /// slot 0; listeners and datagram endpoints carry `LOCAL_SLOT_ANY`
     /// (wildcard — reachable at every local address). The tuple match
-    /// (`find_conn`) gains this axis so the same port at two addresses is two
-    /// distinct listeners.
+    /// (`find_conn_indexed`) gains this axis so the same port at two
+    /// addresses is two distinct listeners.
     pub local_slot: u16,
 
     /// Owner stamped on this endpoint at bind. `0` is the host wildcard. Part
@@ -449,76 +449,6 @@ pub unsafe fn parse_tcp(data: *const u8, len: usize) -> Option<TcpHeader> {
 #[inline]
 pub fn cookie_mode_admissible(hdr: &TcpHeader) -> bool {
     hdr.data_offset == TCP_HEADER_LEN
-}
-
-/// Find a TCP connection matching the incoming segment.
-///
-/// # Safety
-/// `conns` must point to a valid array of at least `MAX_TCP_CONNS` entries.
-/// `local_slot`
-/// adds the local-address axis: the same 4-tuple reached at two different
-/// local addresses is two distinct connections. A conn carrying
-/// `LOCAL_SLOT_ANY` matches any dst slot (a wildcard listener); a conn on a
-/// concrete slot matches only that slot. With a single configured address
-/// every conn latches slot 0 and every inbound segment resolves to slot 0, so
-/// the axis is inert — behaviour is identical to the pre-multi-address
-/// port-only match.
-pub unsafe fn find_conn(
-    conns: &[TcpConn; MAX_TCP_CONNS],
-    remote_ip: u32,
-    remote_port: u16,
-    local_port: u16,
-    local_slot: u16,
-) -> Option<usize> {
-    let mut i = 0;
-    while i < MAX_TCP_CONNS {
-        let c = &*conns.as_ptr().add(i);
-        if c.is_active()
-            && c.remote_ip == remote_ip
-            && c.remote_port == remote_port
-            && c.local_port == local_port
-            && (c.local_slot == LOCAL_SLOT_ANY || c.local_slot == local_slot)
-        {
-            return Some(i);
-        }
-        i += 1;
-    }
-    None
-}
-
-/// Find a listening TCP connection matching the destination port and the
-/// local address the segment arrived at.
-///
-/// Datagram endpoints share the same conn array and also sit in
-/// `Listen` state, so the match excludes `is_datagram` slots — a TCP
-/// SYN must never land on a UDP-bound endpoint.
-///
-/// Bind admission: a listener bound to a concrete slot serves only that
-/// slot; a wildcard listener (`LOCAL_SLOT_ANY`) serves slot 0 and UNOWNED
-/// secondaries but NEVER an OWNED secondary (`dst_owned`) — an owned
-/// workload address is reachable only through a listener explicitly bound
-/// to it (an owner-stamped bind). With no owned secondary configured
-/// `dst_owned` is always false, so the wildcard matches every slot exactly
-/// as a port-only match would.
-pub unsafe fn find_listener(
-    conns: &[TcpConn; MAX_TCP_CONNS],
-    local_port: u16,
-    local_slot: u16,
-    dst_owned: bool,
-) -> Option<usize> {
-    let mut i = 0;
-    while i < MAX_TCP_CONNS {
-        let c = &*conns.as_ptr().add(i);
-        if c.state == TcpState::Listen
-            && !c.is_datagram
-            && c.local_port == local_port
-            && (c.local_slot == local_slot || (c.local_slot == LOCAL_SLOT_ANY && !dst_owned))
-        {
-            return Some(i);
-        }
-        i += 1;
-    }
-    None
 }
 
 /// Build a TCP header at `dst`. Does NOT compute checksum — caller must

@@ -1815,13 +1815,16 @@ const MODULES_BLOB_MAGIC: [u8; 16] = *b"FLUXOR_MOD_BLOB\0";
 const CONFIG_BLOB_MAGIC: [u8; 16] = *b"FLUXOR_CFG_BLOB\0";
 
 /// Total placeholder size for `modules.bin`, including the 32-byte
-/// header. 1 MiB covers the largest module set observed — a browser
-/// app graph runs ~520 KiB, an app module able to carry hi-DPI font
-/// atlases (truffle_shell ships 32px+48px DejaVu coverage, ~235 KiB, for
-/// device-pixel supersampled text). Reproducible: the bundle tool fails
-/// fast if the real blob exceeds capacity, with a clear "rebuild kernel
-/// with larger placeholder" error.
-const MODULES_BLOB_TOTAL: usize = 1024 * 1024;
+/// header. A browser app graph runs ~520 KiB, and an app module able to
+/// carry hi-DPI font atlases (truffle_shell ships 32px+48px DejaVu coverage,
+/// ~235 KiB, for device-pixel supersampled text) more; a graph carrying a
+/// JavaScript engine and its compiler is past 1 MiB on its own (phasor's
+/// isolate is ~630 KiB as wasm, its compiler ~300 KiB). 2 MiB holds that;
+/// the cost is the same again in the kernel `.wasm`'s data section, zeros
+/// that compress away in transfer. Reproducible: the bundle tool fails fast
+/// if the real blob exceeds capacity, with a clear "rebuild kernel with
+/// larger placeholder" error.
+const MODULES_BLOB_TOTAL: usize = 2 * 1024 * 1024;
 const MODULES_BLOB_CAPACITY: usize = MODULES_BLOB_TOTAL - 32;
 
 /// Total placeholder size for `config.bin`, including the 32-byte

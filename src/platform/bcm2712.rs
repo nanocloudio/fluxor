@@ -782,6 +782,9 @@ fn poll_rebuild_bridge(domain_id: usize) {
                 Ok(bridges) => {
                     match instantiate_and_activate(&module_list, module_count) {
                         Ok(n) => {
+                            // As at boot: owner accounting and the
+                            // contract-readiness gate over the new graph.
+                            fluxor::kernel::exec::scheduler::finalize_instantiation_accounting();
                             let domains = active_domain_count();
                             log::warn!(
                                 "[reconfigure] rebuilt graph: {n} modules, {domains} domain(s), \
@@ -1010,10 +1013,7 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     };
     if !static_state_ok {
         uart_puts(b"[config] parse / loader failed\r\n");
-        loop {
-            // SAFETY: WFI is a hint to halt the core; safe as a fault path.
-            unsafe { core::arch::asm!("wfi") };
-        }
+        boot_fail_stop();
     }
     // SAFETY: scheduler-thread boot-time read.
     let cfg = unsafe { scheduler::static_config() };
@@ -1141,11 +1141,7 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
             uart_puts(b"[inst] REFUSING GRAPH: ");
             uart_put_u32(failed as u32);
             uart_puts(b" module(s) failed to instantiate\r\n");
-            loop {
-                // SAFETY: WFI is a hint to halt the core; the same fail-stop
-                // this file already uses for a failed config parse.
-                unsafe { core::arch::asm!("wfi") };
-            }
+            boot_fail_stop();
         }
     };
 
@@ -2894,22 +2890,31 @@ fn bcm_smp_quiesce_peers() -> bool {
 /// reports errors on some unbacked reads — see the UBUS REPLY_ERR_DIS note
 /// in `pcie.rs`); it is NOT a quiet guarantee, which is why the base is
 /// pinned against the DT rather than probed.
+#[cfg(feature = "board-pi5")]
 const VC_MBOX_BASE: usize = 0x10_7c01_3880;
 /// Mailbox 0 (VC→ARM): read register and status.
+#[cfg(feature = "board-pi5")]
 const VC_MBOX_READ: usize = VC_MBOX_BASE;
+#[cfg(feature = "board-pi5")]
 const VC_MBOX0_STATUS: usize = VC_MBOX_BASE + 0x18;
 /// Mailbox 1 (ARM→VC): write register and status.
+#[cfg(feature = "board-pi5")]
 const VC_MBOX_WRITE: usize = VC_MBOX_BASE + 0x20;
+#[cfg(feature = "board-pi5")]
 const VC_MBOX1_STATUS: usize = VC_MBOX_BASE + 0x38;
+#[cfg(feature = "board-pi5")]
 const VC_MBOX_FULL: u32 = 1 << 31;
+#[cfg(feature = "board-pi5")]
 const VC_MBOX_EMPTY: u32 = 1 << 30;
 /// The property-tags channel (ARM→VC).
+#[cfg(feature = "board-pi5")]
 const VC_CH_PROPERTY: u32 = 8;
 /// Status reads per wait before giving up. Device-memory reads are on the
 /// order of 100 ns, so this is roughly a tenth of a second — far past the
 /// ~100 µs a property call takes, and it runs on a lazy provider call
 /// (`TIER`/`DESCRIBE`), never on the boot path, so the worst case is one
 /// slow syscall that answers `false`.
+#[cfg(feature = "board-pi5")]
 const VC_MBOX_POLL_BOUND: u32 = 1_000_000;
 
 /// The property buffer, and the invariant that makes the cache maintenance
@@ -2924,8 +2929,10 @@ const VC_MBOX_POLL_BOUND: u32 = 1_000_000;
 /// lines are 64) and padded to a whole number of lines. 32 words = 128
 /// bytes = exactly its own lines; also headroom for any future tag (the
 /// OTP exchange needs 16).
+#[cfg(feature = "board-pi5")]
 #[repr(C, align(128))]
 struct VcMboxBuf([u32; 32]);
+#[cfg(feature = "board-pi5")]
 static mut VC_MBOX_BUF: VcMboxBuf = VcMboxBuf([0; 32]);
 
 /// One caller at a time; the loser answers `false` (fail-safe) rather than
@@ -2935,6 +2942,7 @@ static mut VC_MBOX_BUF: VcMboxBuf = VcMboxBuf([0; 32]);
 /// Acquire/Release so the winner's buffer writes are ordered against the
 /// flag; every exit path below releases it, because in a kernel with no
 /// RAII a leaked flag would be a permanent SOFTWARE tier until reboot.
+#[cfg(feature = "board-pi5")]
 static VC_MBOX_BUSY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Clean+invalidate the buffer's lines to PoC. Same idiom as the
@@ -2943,6 +2951,7 @@ static VC_MBOX_BUSY: core::sync::atomic::AtomicBool = core::sync::atomic::Atomic
 ///
 /// # Safety
 /// `addr..addr+len` must be valid mapped memory owned by the caller.
+#[cfg(feature = "board-pi5")]
 unsafe fn vc_cache_civac(addr: usize, len: usize) {
     let mut ptr = addr & !63;
     let end = (addr + len + 63) & !63;
@@ -2964,6 +2973,7 @@ unsafe fn vc_cache_civac(addr: usize, len: usize) {
 /// # Safety
 /// Kernel context; MMIO to the mailbox block; exclusive buffer access is
 /// guaranteed by `VC_MBOX_BUSY` (taken by the caller).
+#[cfg(feature = "board-pi5")]
 unsafe fn vc_property_exchange(words: usize) -> bool {
     // Identity map: VA == PA for kernel DRAM on this platform (boot_mmu maps
     // all of DRAM 1:1), so the buffer's address IS its physical address. The
@@ -3034,6 +3044,7 @@ unsafe fn vc_property_exchange(words: usize) -> bool {
 /// Provisioning is a separate act and is not this function's business:
 /// blowing fuses is irreversible and belongs to a deliberate, audited step,
 /// not to a boot path. This only ever READS.
+#[cfg(feature = "board-pi5")]
 fn bcm_read_device_seal_key(out: &mut [u8; 32]) -> bool {
     use fluxor::kernel::sys::hal as k;
 
@@ -3074,6 +3085,29 @@ fn bcm_read_device_seal_key(out: &mut [u8; 32]) -> bool {
     ok
 }
 
+/// Halt at boot, saying why. The boot's own log lines (`[config] ...`,
+/// `[inst] module N error ...`) are queued in the log ring, which nothing
+/// drains until the scheduler runs, and a fail-stop never reaches it. The
+/// ring's tail goes out over the raw UART first (the exception handler's
+/// path), so a refused graph says what refused it; then the core parks.
+fn boot_fail_stop() -> ! {
+    // Static, not stack: wide enough that a graph's long `[domain]` order
+    // line does not push the failing module's own line out of the tail.
+    static mut TAIL: [u8; 16384] = [0; 16384];
+    // SAFETY: single core, boot path, never re-entered (we halt below).
+    let buf = unsafe { &mut *core::ptr::addr_of_mut!(TAIL) };
+    let n = fluxor::kernel::sys::log_ring::read_tail(buf);
+    uart_raw_puts(b"\r\n--- boot halted; log tail (");
+    uart_raw_put_u32(n as u32);
+    uart_raw_puts(b" bytes) ---\r\n");
+    uart_raw_puts(&buf[..n]);
+    uart_raw_puts(b"\r\n--- end ---\r\n");
+    loop {
+        // SAFETY: WFI is a hint to halt the core.
+        unsafe { core::arch::asm!("wfi") };
+    }
+}
+
 /// This board's sealing provenance, memoized on SUCCESS only.
 ///
 /// `key_vault` asks on every `TIER` and every `DESCRIBE`, and each ask is a
@@ -3085,6 +3119,22 @@ fn bcm_read_device_seal_key(out: &mut [u8; 32]) -> bool {
 /// cached, because "the mailbox was busy" must not become "this board has
 /// no device key" for the rest of the boot.
 fn bcm_seal_provenance() -> fluxor::kernel::sys::hal::SealProvenance {
+    // The customer OTP is read through the Pi 5's VideoCore mailbox; a
+    // bcm2712 kernel on another board (QEMU virt) has no mailbox at that
+    // address, and touching it is an external abort. No mailbox, no device
+    // key: the honest answer is that there is none.
+    #[cfg(not(feature = "board-pi5"))]
+    {
+        fluxor::kernel::sys::hal::SealProvenance::None
+    }
+    #[cfg(feature = "board-pi5")]
+    {
+        bcm_seal_provenance_pi5()
+    }
+}
+
+#[cfg(feature = "board-pi5")]
+fn bcm_seal_provenance_pi5() -> fluxor::kernel::sys::hal::SealProvenance {
     use core::sync::atomic::{AtomicU8, Ordering};
     static CONFIRMED: AtomicU8 = AtomicU8::new(0);
     if CONFIRMED.load(Ordering::Acquire) == 1 {

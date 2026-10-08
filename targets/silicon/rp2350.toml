@@ -11,7 +11,14 @@ description = "RP2350 (dual Cortex-M33)"
 rust_target = "thumbv8m.main-none-eabihf"
 cargo_features = ["chip-rp2350b"]
 uf2_family_id = "0xe48bff59"
-module_target = "thumbv8m.main-none-eabihf"
+# Modules take the soft-float ABI although the kernel is `eabihf`. The RP
+# kernel never grants the FPU, so a module built hard-float links its `f32`
+# and then faults the whole node at the first VFP instruction -- and it moves
+# every `f64` it passes through VFP registers, so a module that brings its
+# own soft-float routines faults too. Soft-float makes `f32` an undefined
+# symbol at link, as it is on rp2040. Nothing floating crosses the module
+# boundary, so the two ABIs never meet.
+module_target = "thumbv8m.main-none-eabi"
 
 [gpio]
 max_pin = 47
@@ -222,6 +229,12 @@ boot2_src = "0x400e0000"
 # Their sum is what the die can spare, so the two move against each other;
 # `ram_static_max_kb` below binds the sum, not either half.
 state_arena_kb = 240
+# The loader's ceiling on one module's code. Modules execute in place from
+# flash, so this costs no RAM: it is a sanity bound, set by the 4 MiB part's
+# flash rather than by a guess at what an MCU module needs. A JavaScript
+# engine is some 440 KiB of code. Mirrors `MAX_MODULE_CODE_SIZE` in
+# modules/sdk/abi/config.rs, which the kernel's loader enforces.
+module_code_kb = 1024
 buffer_arena_kb = 64
 config_buffer_kb = 16
 config_arena_kb = 16
