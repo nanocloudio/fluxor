@@ -212,6 +212,20 @@ pages, and drives erase → write → activate, reporting progress on its
 kinds `0x01` erased, `0x02` written, `0x03` activated, `0xFF` failed.
 The slot content is the packed (single-blob) graph-image form.
 
+`graph_slot` never erases or programs the slot the kernel booted from:
+module code runs in place from flash on RP, and a rebuild
+re-instantiates the graph from that slot, so it is in use until reset.
+It finds that slot from the address of its own code, and every erase
+and write targets the other one; a second OTA before a reset replaces
+the pending image, not the running one. The header page (offset 0,
+which carries the magic and epoch the boot selector reads) is held in
+RAM when written and programmed only by `gs.activate`, after the epoch,
+the ABI pin and the SHA-256 over the rest of the slot check out. A
+slot that was half-written or failed its digest therefore has no magic
+and cannot be selected at boot. `gs.query_cfg` answers the running
+slot's config address, which stays readable until the next reset;
+`gs.query_active` answers the slot the next boot selects.
+
 ## Security Model
 
 Content trust on the OTA path is digest pinning end to end: the

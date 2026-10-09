@@ -272,7 +272,16 @@ pub use abi::config::ip::MAX_PACKET_HOLD;
 /// Datagram endpoints occupy the first `MAX_DG_ENDPOINTS` connection slots:
 /// the wire's `ep_id` is a u8, so the id space binds the endpoint count,
 /// not the connection table.
+#[cfg(not(feature = "small_table"))]
 pub use abi::config::ip::MAX_DG_ENDPOINTS;
+/// The `small_table` variant's: DHCP, a log or telemetry sink, and one more,
+/// or the profile's count where that is smaller.
+#[cfg(feature = "small_table")]
+pub const MAX_DG_ENDPOINTS: usize = if abi::config::ip::MAX_DG_ENDPOINTS < 3 {
+    abi::config::ip::MAX_DG_ENDPOINTS
+} else {
+    3
+};
 
 /// Stub-resolver tables (`abi::config::ip`): names held with their address
 /// until the answer's TTL runs out, and dials parked on a query in flight.

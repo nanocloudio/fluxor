@@ -386,11 +386,13 @@ unsafe fn begin_migrating(s: &mut State, sys: &SyscallTable) {
         elapsed as u16
     };
     emit_status(s, sys, STATUS_MIGRATING_ENTERED, 0, elapsed_u16);
-    // If graph_slot is wired and an activation succeeds, the kernel's
-    // boot-time layout scan will pick the newly-live slot on the next
-    // rebuild. Fire-and-forget over the graph_slot request channel —
-    // if nothing is wired, or if the staged slot fails SHA-256, the
-    // rebuild falls back to the running STATIC_CONFIG (idempotent).
+    // If graph_slot is wired, ask it to activate the staged slot. An
+    // activated slot is what the kernel's boot-time layout scan selects at
+    // the next reset; the rebuild below re-instantiates the running
+    // STATIC_CONFIG on RP, from the slot that was running, which
+    // graph_slot never writes. Fire-and-forget: if nothing is wired, or
+    // the staged slot fails SHA-256, there is nothing activated and the
+    // next boot keeps the running slot (ACTIVATE is idempotent).
     if s.gs_req_chan >= 0 {
         let mut frame = [0u8; GS_FRAME_HDR];
         frame[0] = (REQ_ACTIVATE & 0xFF) as u8;

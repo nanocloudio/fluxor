@@ -4,9 +4,26 @@
 //! (`abi::contracts::storage::graph_slot::SLOT_{A,B}_OFFSET`). Each slot
 //! holds a full graph bundle (module table + static config) preceded by
 //! a 256-byte header. The slot with a valid magic and the higher epoch
-//! is live; writes target the other slot and become live when
-//! ACTIVATE increments the epoch and validates the SHA-256 recorded in
-//! the header.
+//! is the one the next boot selects.
+//!
+//! ## The running slot is never written
+//!
+//! Module code runs in place from flash on RP, so the slot the kernel
+//! booted from is being fetched from for as long as the graph runs, and a
+//! rebuild re-instantiates the graph from that same slot. This module
+//! finds it from the address of its own code and never erases or
+//! programs it: every ERASE and WRITE targets the other slot, however the
+//! epochs stand. A second OTA before a reboot replaces the pending slot;
+//! it cannot reach the running one.
+//!
+//! ## A slot is valid only once activated
+//!
+//! The header page — offset 0, which carries the magic and the epoch the
+//! boot selector reads — is held in RAM when it is written, not
+//! programmed. ACTIVATE checks it (epoch above the running slot's, ABI
+//! pin, SHA-256 over the bytes already in flash) and only then programs
+//! it. So a slot that was erased, half-written, or failed its digest has
+//! no magic, and the boot selector cannot pick it.
 //!
 //! ## Channel protocol
 //!
@@ -35,9 +52,13 @@
 //!
 //! `value` is the operation result:
 //! - ERASE / WRITE / ACTIVATE: 0 on success, negative errno on failure.
-//! - ACTIVE: 0 or 1 (live slot index), -1 if neither slot is live.
-//! - CFG: XIP absolute address of the live slot's config blob (u32
-//!   cast to i32), or -1 if neither slot is live.
+//! - ACTIVE: the slot the next boot selects, 0 or 1, or -1 if neither slot
+//!   is valid.
+//! - CFG: XIP absolute address of the config blob of the slot the kernel
+//!   is running (u32 cast to i32), or -1 if it did not boot from a slot.
+//!   The address is readable until the next reset: that slot is never
+//!   erased or programmed while it runs (see above). A consumer may hold
+//!   it across an ACTIVATE and a rebuild; after a reset it asks again.
 //!
 //! The `req_type` echo lets consumers correlate responses to requests
 //! when issuing multiple commands in flight.
@@ -124,6 +145,16 @@ struct State {
     /// This build's ABI-surface digest, computed once at `module_new` —
     /// live-slot selection and activation both gate on it.
     own_digest: [u8; 32],
+    /// The slot this module's own code runs from — the slot the kernel
+    /// booted — or 0xFF when it did not boot from a slot.
+    running_slot: u8,
+    /// Whether `header` holds a written header page awaiting ACTIVATE.
+    header_held: u8,
+    /// The slot the last successful ACTIVATE made live, or 0xFF. A repeat
+    /// ACTIVATE answers by it; ERASE clears it.
+    activated: u8,
+    /// The pending slot's header page, programmed by ACTIVATE.
+    header: [u8; PAGE_SIZE],
 }
 
 // ============================================================================
@@ -237,6 +268,41 @@ fn inactive_slot(live: u8) -> u8 {
     }
 }
 
+/// The slot whose aperture holds this module's code, if any.
+fn slot_of_own_code() -> u8 {
+    let at = module_step as usize as u32;
+    let in_slot = |offset: u32| {
+        let base = XIP_BASE + offset;
+        at >= base && at < base + SLOT_SIZE
+    };
+    if in_slot(SLOT_A_OFFSET) {
+        0
+    } else if in_slot(SLOT_B_OFFSET) {
+        1
+    } else {
+        0xFF
+    }
+}
+
+/// The slot ERASE, WRITE and ACTIVATE act on: never the running one.
+unsafe fn pending_slot(s: &mut State) -> u8 {
+    if s.running_slot <= 1 {
+        return inactive_slot(s.running_slot);
+    }
+    refresh_live(s);
+    inactive_slot(s.live_slot)
+}
+
+/// The epoch a pending slot must exceed: the running slot's, or with no
+/// running slot, the other slot's if it is admissible.
+unsafe fn epoch_to_beat(s: &State, pending: u8) -> Option<u64> {
+    let other = inactive_slot(pending);
+    let base = (XIP_BASE + slot_offset(other)) as *const u8;
+    decode_header(base)
+        .filter(|_| slot_pin_admits(base, &s.own_digest))
+        .map(|h| h.epoch)
+}
+
 // ============================================================================
 // Raw flash bridge
 // ============================================================================
@@ -268,8 +334,9 @@ unsafe fn sys_program_page(sys: &SyscallTable, offset: u32, page: *const u8) -> 
 // ============================================================================
 
 unsafe fn do_erase(s: &mut State, sys: &SyscallTable) -> i32 {
-    refresh_live(s);
-    let target = slot_offset(inactive_slot(s.live_slot));
+    s.header_held = 0;
+    s.activated = 0xFF;
+    let target = slot_offset(pending_slot(s));
     let mut off = target;
     let end = target + SLOT_SIZE;
     while off < end {
@@ -291,12 +358,17 @@ unsafe fn do_write(
     if payload.is_null() || payload_len < 4 + PAGE_SIZE {
         return E_INVAL;
     }
-    refresh_live(s);
     let in_slot_off = read_u32_le(payload);
     if in_slot_off + PAGE_SIZE as u32 > SLOT_SIZE {
         return E_INVAL;
     }
-    let target = slot_offset(inactive_slot(s.live_slot)) + in_slot_off;
+    if in_slot_off == 0 {
+        // The header page is programmed by ACTIVATE, once it checks out.
+        core::ptr::copy_nonoverlapping(payload.add(4), s.header.as_mut_ptr(), PAGE_SIZE);
+        s.header_held = 1;
+        return 0;
+    }
+    let target = slot_offset(pending_slot(s)) + in_slot_off;
     sys_program_page(sys, target, payload.add(4))
 }
 
@@ -326,16 +398,32 @@ unsafe fn slot_pin_admits(base_xip: *const u8, own: &[u8; 32]) -> bool {
     ct_eq32(&pin, own)
 }
 
-unsafe fn do_activate(s: &mut State) -> i32 {
-    refresh_live(s);
-    let candidate = inactive_slot(s.live_slot);
+unsafe fn do_activate(s: &mut State, sys: &SyscallTable) -> i32 {
+    if s.header_held == 0 {
+        // Nothing pending: a repeat of an ACTIVATE that already succeeded
+        // (`ota_ingest` and then `reconfigure` both send one) answers as it
+        // did while that slot is still the one the next boot selects, and
+        // anything else has nothing to activate.
+        refresh_live(s);
+        return if s.activated <= 1 && s.live_slot == s.activated {
+            0
+        } else {
+            E_IO
+        };
+    }
+    let candidate = pending_slot(s);
     let base_xip = (XIP_BASE + slot_offset(candidate)) as *const u8;
-    let hdr = match decode_header(base_xip) {
+    let header = s.header.as_ptr();
+    let hdr = match decode_header(header) {
         Some(h) => h,
         None => return E_IO,
     };
-    let have_live = s.live_slot <= 1;
-    if have_live && hdr.epoch <= s.live_epoch {
+    // The digest covers what follows the header page, which is all in
+    // flash by now; ranges that reach into the page cannot be checked.
+    if hdr.modules_offset < PAGE_SIZE as u32 || hdr.config_offset < PAGE_SIZE as u32 {
+        return E_INVAL;
+    }
+    if epoch_to_beat(s, candidate).is_some_and(|epoch| hdr.epoch <= epoch) {
         return E_AGAIN;
     }
 
@@ -343,7 +431,7 @@ unsafe fn do_activate(s: &mut State) -> i32 {
     // reporting success here and then losing the graph at the next reboot
     // is the worst outcome — fail the activation now, with the old slot
     // still live.
-    if !slot_pin_admits(base_xip, &s.own_digest) {
+    if !slot_pin_admits(header, &s.own_digest) {
         return E_INVAL;
     }
 
@@ -355,8 +443,16 @@ unsafe fn do_activate(s: &mut State) -> i32 {
         return E_IO;
     }
 
-    s.live_slot = candidate;
-    s.live_epoch = hdr.epoch;
+    let rc = sys_program_page(sys, slot_offset(candidate), header);
+    if rc < 0 {
+        return rc;
+    }
+    s.header_held = 0;
+    refresh_live(s);
+    if s.live_slot != candidate {
+        return E_IO;
+    }
+    s.activated = candidate;
     0
 }
 
@@ -370,11 +466,10 @@ unsafe fn query_active(s: &mut State) -> i32 {
 }
 
 unsafe fn query_cfg(s: &mut State) -> i32 {
-    refresh_live(s);
-    if s.live_slot > 1 {
+    if s.running_slot > 1 {
         return NO_LIVE_SLOT;
     }
-    let base = XIP_BASE + slot_offset(s.live_slot);
+    let base = XIP_BASE + slot_offset(s.running_slot);
     match decode_header(base as *const u8) {
         Some(h) => (base + h.config_offset) as i32,
         None => NO_LIVE_SLOT,
@@ -480,7 +575,7 @@ unsafe fn pump_requests(s: &mut State, sys: &SyscallTable) -> i32 {
         let rc = match ty {
             REQ_ERASE => do_erase(s, sys),
             REQ_WRITE => do_write(s, sys, payload_ptr, len),
-            REQ_ACTIVATE => do_activate(s),
+            REQ_ACTIVATE => do_activate(s, sys),
             REQ_ACTIVE => query_active(s),
             REQ_CFG => query_cfg(s),
             _ => E_INVAL,
@@ -547,6 +642,9 @@ pub extern "C" fn module_new(
         s._pad = [0; 2];
         s.frame_fill = 0;
         s.own_digest = own_abi_surface_digest();
+        s.running_slot = slot_of_own_code();
+        s.header_held = 0;
+        s.activated = 0xFF;
         refresh_live(s);
         0
     }

@@ -868,6 +868,10 @@ struct Fat32State {
     /// orphans the chain instead (logged) — the same safe posture as
     /// create-truncate, namespace removal always wins over reclaim.
     unlink_free: [u32; UNLINK_FREE_SLOTS],
+    /// Reads served as whole-sector runs straight to the caller, and
+    /// single-sector refills (telemetry).
+    rd_runs: u32,
+    rd_sectors: u32,
 
     /// Outstanding asynchronous durability fences (`FSYNC_SUBMIT` /
     /// `FSYNC_POLL`). One table for the whole provider: a ticket names a
@@ -1015,6 +1019,8 @@ impl Fat32State {
         self.sync_rc = 0;
         self.fmt = FormatPlan::EMPTY;
         self.unlink_free = [0; UNLINK_FREE_SLOTS];
+        self.rd_runs = 0;
+        self.rd_sectors = 0;
         self.fences = [FenceSlot::empty(); MAX_FENCES];
         self.file_count = 0;
         self.dir_cluster = 0;
@@ -2399,6 +2405,53 @@ unsafe fn fs_op_read(s: &mut Fat32State, handle: i32, arg: *mut u8, arg_len: usi
         if remaining_in_file == 0 {
             break;
         }
+        if of.scratch_avail == 0 && of.offset.is_multiple_of(bps) {
+            // Whole sectors wanted from a sector boundary: read the run of
+            // them left in this cluster straight into the caller's buffer,
+            // one device request instead of one per sector. Each request is
+            // a synchronous round trip to the device, so a multi-sector read
+            // costs one trip rather than one per sector.
+            let want_bytes = core::cmp::min((max - written) as u32, remaining_in_file);
+            let left_in_cluster = spc - of.sector_in_cluster as u32;
+            let dev_max = s.blk.max_blocks();
+            // `max_blocks` is known once the device's caps have been read
+            // (any earlier read did); unknown, take the sector path.
+            let n = core::cmp::min(core::cmp::min(want_bytes / bps, left_in_cluster), dev_max);
+            if n >= 2 && s.blk.block_size() == bps {
+                let sector = cluster_to_sector(s, s.open_files[slot_idx].current_cluster)
+                    + (s.open_files[slot_idx].sector_in_cluster as u32);
+                let rc = s
+                    .blk
+                    .read(&*s.syscalls, fs_abs_lba(s, sector), n, arg.add(written));
+                if rc != 0 {
+                    return rc;
+                }
+                let bytes = n * bps;
+                s.rd_runs = s.rd_runs.wrapping_add(1);
+                let of2 = &mut s.open_files[slot_idx];
+                // scratch_block mirrors nothing now: the bytes went past it.
+                of2.scratch_pos = 0;
+                of2.scratch_lba = 0;
+                of2.scratch_span = 0;
+                of2.scratch_cluster = 0;
+                of2.offset = of2.offset.wrapping_add(bytes);
+                written += bytes as usize;
+                of2.sector_in_cluster = of2.sector_in_cluster.wrapping_add(n as u8);
+                if (of2.sector_in_cluster as u32) >= spc {
+                    of2.sector_in_cluster = 0;
+                    let cur = of2.current_cluster;
+                    let next = fs_read_fat_entry(s, cur);
+                    let of4 = &mut s.open_files[slot_idx];
+                    if next >= FAT32_EOC {
+                        of4.offset = of4.size;
+                    } else {
+                        of4.current_cluster = next;
+                    }
+                }
+                continue;
+            }
+        }
+        let of = &mut s.open_files[slot_idx];
         if of.scratch_avail == 0 {
             // Fetch the current sector.
             let sector = cluster_to_sector(s, s.open_files[slot_idx].current_cluster)
@@ -2408,9 +2461,16 @@ unsafe fn fs_op_read(s: &mut Fat32State, handle: i32, arg: *mut u8, arg_len: usi
             if rc != 0 {
                 return rc;
             }
+            s.rd_sectors = s.rd_sectors.wrapping_add(1);
             let of2 = &mut s.open_files[slot_idx];
-            of2.scratch_avail = bps as u16;
-            of2.scratch_pos = 0;
+            // The cursor may stand partway into this sector: a seek on a
+            // writable fd positions `offset` without fetching (the
+            // same-cluster shortcut), so the sector's first bytes are
+            // behind the cursor, not ahead of it, and the copy starts at
+            // the cursor's place in the sector.
+            let within = of2.offset % bps;
+            of2.scratch_avail = (bps - within) as u16;
+            of2.scratch_pos = within as u16;
             // Keep the write-back cache tag coherent: scratch_block now holds
             // `sector` alone, not whatever a prior write run left. A
             // read-established mirror carries no cluster, so a later write
@@ -2459,8 +2519,9 @@ unsafe fn fs_op_read(s: &mut Fat32State, handle: i32, arg: *mut u8, arg_len: usi
     written as i32
 }
 
-/// FS_SEEK: rewind to start_cluster, walk forward to the target
-/// cluster, set sector + scratch position. `arg` is `[offset: i32 LE]`
+/// FS_SEEK: walk the cluster chain to the target cluster — from the
+/// cursor's own cluster when a read-only cursor moves forward, from the
+/// chain head otherwise — and set sector + scratch position. `arg` is `[offset: i32 LE]`
 /// (matching the Linux FS dispatch). Returns the resulting offset on
 /// success or negative errno.
 unsafe fn fs_op_seek(s: &mut Fat32State, handle: i32, arg: *const u8, arg_len: usize) -> i32 {
@@ -2558,6 +2619,23 @@ unsafe fn fs_op_seek(s: &mut Fat32State, handle: i32, arg: *const u8, arg_len: u
     let start = s.open_files[slot_idx].start_cluster;
     let mut cluster = start;
     let mut walked = 0u32;
+    // A reader moving forward walks on from where it stands, not from the
+    // chain head: a read-only cursor inside the file always holds the
+    // cluster containing its offset (a read advances it only once a
+    // cluster is consumed), so a file read block by block with a seek
+    // before each walks the chain once in all, not once per block.
+    {
+        let of = &s.open_files[slot_idx];
+        let here = of.offset / cluster_bytes;
+        if of.writable == 0
+            && of.offset < of.size
+            && here <= target_cluster_idx
+            && of.current_cluster >= 2
+        {
+            cluster = of.current_cluster;
+            walked = here;
+        }
+    }
     while walked < target_cluster_idx {
         let next = fs_read_fat_entry(s, cluster);
         if next >= FAT32_EOC {
@@ -7298,6 +7376,20 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
             let mut msg = [0u8; 64];
             let p = msg.as_mut_ptr();
+            {
+                // Read path telemetry: whole-sector runs handed straight to the
+                // caller, and single-sector refills through the scratch sector.
+                let mut rd = [0u8; 64];
+                let head = b"[fat32] rd runs=";
+                rd[..head.len()].copy_from_slice(head);
+                let mut rp = head.len();
+                rp += fmt_u32_raw(rd.as_mut_ptr().add(rp), s.rd_runs);
+                let mid = b" sectors=";
+                rd[rp..rp + mid.len()].copy_from_slice(mid);
+                rp += mid.len();
+                rp += fmt_u32_raw(rd.as_mut_ptr().add(rp), s.rd_sectors);
+                dev_log(s.sys(), 3, rd.as_ptr(), rp);
+            }
             let prefix = b"[fat32] hb init=";
             core::ptr::copy_nonoverlapping(prefix.as_ptr(), p, prefix.len());
             let mut pos = prefix.len();

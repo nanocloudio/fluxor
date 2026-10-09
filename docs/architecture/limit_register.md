@@ -686,6 +686,7 @@ the coverage report here, each with the reason it is not a row.
 
 ```limit-register-exempt
 BODY_MAX | modules/sdk/contracts/exchange.rs | derived: one RECORD_MAX record less its 16-byte prefix
+MAX_DG_ENDPOINTS | modules/foundation/ip/mod.rs | variant: the `small_table` override of the registered abi::config::ip ceiling, never above it — DHCP, a log or telemetry sink and one more, within that variant's four-slot table
 CTRL_CAP | modules/foundation/nbd_serve/mod.rs | derived: the longest handshake answer, EXPORT_NAME's 134 bytes with the pad, or GO's two infos and ACK
 INFO_BLOCK_SIZE | modules/foundation/nbd_serve/mod.rs | protocol: the NBD info type number for block-size constraints
 NET_CMD_RECORD_CAPACITY | modules/foundation/tls/mod.rs | derived: the frame scratch less overhead, capped by net_proto MAX_CMD_DATA

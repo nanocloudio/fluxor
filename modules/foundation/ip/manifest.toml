@@ -140,3 +140,18 @@ max_step_us = 500
 max_dispatch_us = 200
 profile = "measured_envelope"
 evidence = "tests/harness/tests/execution_envelope_ip.rs"
+
+# A connection table sized for a graph whose traffic is a few datagrams --
+# DHCP and a log sink -- rather than the profile's. Datagram endpoints take
+# whole connection slots, so on RP2350 the default table is eight slots of
+# some 2.2 KiB each whatever they carry; `small_table` holds four, inline on
+# every target. Where the profile's table is already smaller (RP2040's two),
+# it is the profile's.
+[[variant]]
+name     = "full"
+features = []
+default  = true
+
+[[variant]]
+name     = "small_table"
+features = ["small_table"]

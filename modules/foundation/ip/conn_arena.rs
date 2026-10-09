@@ -31,17 +31,18 @@
 
 use super::{abi, tcp, SyscallTable, MAX_DG_ENDPOINTS};
 
-/// Connections held inline in module state.
-#[cfg(target_arch = "aarch64")]
+/// Connections held inline in module state. The `small_table` variant holds
+/// its whole table inline on every target, as an embedded one does.
+#[cfg(all(target_arch = "aarch64", not(feature = "small_table")))]
 pub const CONN_FIRST: usize = 512;
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(any(not(target_arch = "aarch64"), feature = "small_table"))]
 pub const CONN_FIRST: usize = tcp::MAX_TCP_CONNS;
 
 /// Connections per elastic grant (~563 KiB, which the kernel rounds up to
 /// nine 64 KiB quanta).
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", not(feature = "small_table")))]
 const CONN_CHUNK: usize = 256;
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(any(not(target_arch = "aarch64"), feature = "small_table"))]
 const CONN_CHUNK: usize = 1;
 
 /// Elastic chunks past the inline block, at most.

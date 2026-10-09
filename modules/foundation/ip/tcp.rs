@@ -361,7 +361,19 @@ pub const RTO_MAX: u16 = 6000;
 /// the per-board profile. Tied to `http::MAX_CONCURRENT_CONNS` —
 /// the http module's slot count must not exceed this (compile-time
 /// invariant in `modules/sdk/config.rs`).
+#[cfg(not(feature = "small_table"))]
 pub use super::abi::config::ip::MAX_TCP_CONNS;
+/// The `small_table` variant's table: four slots — three datagram endpoints
+/// and one TCP connection — or the profile's table where that is smaller.
+/// Every slot is a whole connection record, some 2.2 KiB with its reorder
+/// buffer, whatever it ends up carrying, so a graph whose traffic is a few
+/// datagrams pays for four rather than the profile's table.
+#[cfg(feature = "small_table")]
+pub const MAX_TCP_CONNS: usize = if super::abi::config::ip::MAX_TCP_CONNS < 4 {
+    super::abi::config::ip::MAX_TCP_CONNS
+} else {
+    4
+};
 
 /// Data-offset byte written into every emitted TCP header: five 32-bit
 /// words, a 20-byte header, no option area. This stack negotiates no TCP

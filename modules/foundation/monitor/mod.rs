@@ -15,8 +15,8 @@
 //!
 //! Parameters:
 //!   `interval_ms` — how often to emit a round of histograms (default
-//!                   5000 ms). A full round is all active modules back to
-//!                   back.
+//!                   5000 ms). A round is up to 64 modules back to back;
+//!                   a larger graph is covered over successive rounds.
 
 #![no_std]
 #![allow(
@@ -73,7 +73,16 @@ struct MonitorState {
     countdown_ticks: u32,
     /// Ticks per round, derived from interval_ms in module_new.
     round_ticks: u32,
+    /// First module the next round reports. A round reports at most
+    /// `ROUND_MODULES`, so a graph larger than that is covered over
+    /// successive rounds rather than cut off.
+    cursor: u32,
 }
+
+/// Modules reported per round: a bounded burst on the log transport.
+const ROUND_MODULES: i32 = 64;
+/// Module indices the state query can name (`build_*` take a `u8`).
+const MAX_INDEX: i32 = 256;
 
 impl MonitorState {
     fn init(&mut self, syscalls: *const SyscallTable) {
@@ -81,6 +90,7 @@ impl MonitorState {
         self.interval_ms = 5000;
         self.countdown_ticks = 0;
         self.round_ticks = 0;
+        self.cursor = 0;
     }
 }
 
@@ -344,20 +354,24 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         }
 
         let mut line = [0u8; LINE_BUF];
-        let mut idx: i32 = 0;
-        while idx < count && idx < 64 {
-            let n = build_mon_hist(&*sys_ptr, idx as u8, &mut line);
+        let count = count.min(MAX_INDEX);
+        let mut idx = (s.cursor as i32) % count;
+        let end = idx + ROUND_MODULES.min(count);
+        s.cursor = (end % count) as u32;
+        while idx < end {
+            let i = idx % count;
+            idx += 1;
+            let n = build_mon_hist(&*sys_ptr, i as u8, &mut line);
             if n > 0 {
                 // Level 3 = info. LOG_WRITE routes through `syscall_log`
                 // which calls `log::info!` — bytes land in the ring and
                 // flow out the active transport overlay.
                 ((*sys_ptr).provider_call)(3, SYSTEM_LOG, line.as_mut_ptr(), n);
             }
-            let n = build_mon_state(&*sys_ptr, idx as u8, &mut line);
+            let n = build_mon_state(&*sys_ptr, i as u8, &mut line);
             if n > 0 {
                 ((*sys_ptr).provider_call)(3, SYSTEM_LOG, line.as_mut_ptr(), n);
             }
-            idx += 1;
         }
 
         0
