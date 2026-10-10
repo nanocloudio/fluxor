@@ -4271,6 +4271,20 @@ unsafe fn record_drain_inbound_one(s: &mut TlsState, idx: usize) -> bool {
             s.last_err_site = 11;
             return false;
         }
+        // The peer's Finished is verified but the application keys are not
+        // installed yet (the pump's DeriveAppKeys / ClientDeriveAppKeys step
+        // runs next). A record already buffered behind that Finished is
+        // sealed under the peer's APPLICATION keys — a client sends its
+        // first request straight after its Finished, often in the same
+        // segment — so decrypting it now, under the handshake keys still in
+        // `read_keys`, would fail its tag and kill the session. Stall, as at
+        // the initial level, and let the pump install the keys first.
+        if matches!(
+            sess.driver.hs_state,
+            HandshakeState::DeriveAppKeys | HandshakeState::ClientDeriveAppKeys
+        ) {
+            return false;
+        }
         // `decrypt_record` advances the AEAD sequence, and this path
         // consumes the record only after the plaintext has been placed.
         // A record decrypted but not consumed would be retried against
@@ -4340,6 +4354,13 @@ unsafe fn record_drain_inbound_one(s: &mut TlsState, idx: usize) -> bool {
             None => {
                 sess.state = SessionState::Error;
                 s.last_err_site = 16;
+                let (st, seq, inl, rv) = (
+                    sess.driver.hs_state as u8 as u32,
+                    sess.read_keys.seq as u32,
+                    sess.driver.in_len as u32,
+                    sess.recv_len as u32,
+                );
+                log_decrypt_fail(&*s.syscalls, st, rec_len as u32, seq, inl, rv);
                 return false;
             }
         }
@@ -5257,6 +5278,26 @@ unsafe fn hs_stall_note(s: &mut TlsState, idx: usize) {
         pos += fmt_u32_dec(v, buf.as_mut_ptr().add(pos));
     }
     let sys = &*s.syscalls;
+    dev_log(sys, 2, buf.as_ptr(), pos);
+}
+
+/// `[tls] hs decrypt FAIL st=<hs_state> len=<record> seq=<read seq>
+/// in=<handshake bytes buffered> rv=<bytes in recv_buf>`: the record the
+/// handshake path could not authenticate (error site 16), with what the
+/// session held when it arrived. Written field by field: no table of
+/// labels (a slice-literal array is not relocated in a PIC module).
+unsafe fn log_decrypt_fail(sys: &SyscallTable, st: u32, len: u32, seq: u32, inl: u32, rv: u32) {
+    let mut buf = [0u8; 112];
+    let mut pos = put_text(&mut buf, 0, b"[tls] hs decrypt FAIL st=");
+    pos += fmt_u32_dec(st, buf.as_mut_ptr().add(pos));
+    pos = put_text(&mut buf, pos, b" len=");
+    pos += fmt_u32_dec(len, buf.as_mut_ptr().add(pos));
+    pos = put_text(&mut buf, pos, b" seq=");
+    pos += fmt_u32_dec(seq, buf.as_mut_ptr().add(pos));
+    pos = put_text(&mut buf, pos, b" in=");
+    pos += fmt_u32_dec(inl, buf.as_mut_ptr().add(pos));
+    pos = put_text(&mut buf, pos, b" rv=");
+    pos += fmt_u32_dec(rv, buf.as_mut_ptr().add(pos));
     dev_log(sys, 2, buf.as_ptr(), pos);
 }
 

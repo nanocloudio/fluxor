@@ -132,6 +132,9 @@ pub fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i3
     crate::kernel::backing_provider::unregister();
     crate::kernel::module::provider::reset_handle_tracking();
     crate::kernel::module::provider::reset_module_layers();
+    // A module net provider and the lanes queued for it belong to the old
+    // graph; a built-in one registers again as the new graph instantiates.
+    crate::kernel::workload::net_attach::reset_queued();
     // Tear down any prior graph's ISR-tier registrations and bridge
     // slots before walking the new module table. Without this, the
     // post-instantiation `register_isr_tier_modules_from_graph`

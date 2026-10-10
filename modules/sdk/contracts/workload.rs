@@ -96,6 +96,71 @@ pub const LANES: u32 = 0x1A0D;
 /// Most caller lanes one workload holds.
 pub const MAX_CALLER_LANES: usize = 8;
 
+// ---- network lanes served by a provider module ----
+//
+// A staged workload joins the node's network through lanes (`Endpoint::Net`
+// edges): a command channel it writes and an event channel it reads. The
+// kernel hands each lane to the node's net provider. A provider built into
+// the kernel is called directly; a provider that is a module (the bare-metal
+// `ip`) claims the role with `NET_PROVIDE` and takes the lane changes the
+// kernel queues for it with `NET_LANE_TAKE`. Only the provider may call
+// `NET_LANE_TAKE` and `NET_LANE_ADMIT`; none of the three creates anything,
+// so they need the workload contract grant but not `platform_raw`.
+
+/// `NET_PROVIDE` — claim the net-provider role for workload lanes. `handle`
+/// = -1, no argument. Returns 0, or `EBUSY` when another provider holds the
+/// role (a node has one network). Claiming it again from the same module is
+/// 0.
+pub const NET_PROVIDE: u32 = 0x1A0E;
+/// `NET_LANE_TAKE` — the next lane change queued for the provider, as one
+/// [`net_lane`] record into `arg` (at least [`net_lane::RECORD_LEN`] bytes).
+/// Returns `RECORD_LEN`, 0 when none is queued, or `EACCES` for a caller
+/// that is not the provider. A lane's detach is queued after its attach and
+/// before any attach that reuses its channels, so a provider that takes every
+/// queued change before touching a lane never writes a channel the kernel
+/// has handed to someone else.
+pub const NET_LANE_TAKE: u32 = 0x1A0F;
+/// `NET_LANE_ADMIT` — may a lane's owner bind a new endpoint? `arg` is a
+/// [`net_lane::ADMIT_LEN`]-byte request: `[owner slot:u16 LE][0:u16]
+/// [owner generation:u32 LE][protocol:u8][0:u8][port:u16 LE]`, protocol
+/// [`NET_PROTO_TCP`] or [`NET_PROTO_UDP`]. Returns 0; -1 (`EPERM`) when the
+/// owner is gone or draining (it admits nothing new); `EACCES` when the node's
+/// committed plan grants that owner no lease on the port, or for a caller
+/// that is not the provider. The same gate a built-in provider applies.
+pub const NET_LANE_ADMIT: u32 = 0x1A10;
+
+/// The record [`NET_LANE_TAKE`] writes, little-endian:
+/// ```text
+/// off  size  field
+///   0    1   op          OP_ATTACH or OP_DETACH
+///   1    1   key         the lane's `Endpoint::Net` key (attach)
+///   2    2   0
+///   4    2   owner slot
+///   6    2   0
+///   8    4   owner generation
+///  12    4   commands    channel the provider reads (attach; -1 on detach)
+///  16    4   events      channel the provider writes (attach; -1 on detach)
+/// ```
+/// A detach names the owner only: every lane of that owner is gone, and the
+/// provider closes every endpoint they opened.
+pub mod net_lane {
+    pub const RECORD_LEN: usize = 20;
+    pub const OP_ATTACH: u8 = 1;
+    pub const OP_DETACH: u8 = 2;
+    pub const OFF_OP: usize = 0;
+    pub const OFF_KEY: usize = 1;
+    pub const OFF_OWNER_SLOT: usize = 4;
+    pub const OFF_OWNER_GEN: usize = 8;
+    pub const OFF_COMMANDS: usize = 12;
+    pub const OFF_EVENTS: usize = 16;
+    /// [`super::NET_LANE_ADMIT`]'s request length.
+    pub const ADMIT_LEN: usize = 12;
+    /// Most lanes the provider holds at once; the kernel refuses an attach
+    /// past it (`ENOSPC`), so every lane it queues is one the provider has
+    /// room for.
+    pub const LANES_MAX: usize = 16;
+}
+
 /// `CAPS` (`0x1AFF`) — backend capability discovery. Writes the fixed prefix
 /// `[postures:u8][source_kinds:u8][ops:u16 LE][net:u8]` then a
 /// namespace-directory the caller consults *before* flagging a Tier-2 entry

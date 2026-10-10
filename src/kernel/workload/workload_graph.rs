@@ -727,6 +727,26 @@ unsafe fn dispatch_op(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) ->
     if opcode == wl::CAPS {
         return workload_caps(arg, arg_len);
     }
+    // A net provider that is a module (the bare-metal `ip`): it claims the
+    // role, takes the lanes staged workloads attach, and asks whether a
+    // lane's owner may bind (see `net_attach`).
+    if opcode == wl::NET_PROVIDE {
+        return crate::kernel::workload::net_attach::provide_queued(
+            scheduler::current_module_index(),
+        );
+    }
+    if opcode == wl::NET_LANE_TAKE || opcode == wl::NET_LANE_ADMIT {
+        if arg.is_null() {
+            return errno::EINVAL;
+        }
+        let slot = scheduler::current_module_index();
+        let buf = core::slice::from_raw_parts_mut(arg, arg_len);
+        return if opcode == wl::NET_LANE_TAKE {
+            crate::kernel::workload::net_attach::take_queued(slot, buf)
+        } else {
+            crate::kernel::workload::net_attach::admit_queued(slot, buf)
+        };
+    }
 
     let raw = slot_of(handle);
     let owner_opt = slot_owner(raw);

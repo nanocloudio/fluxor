@@ -10,6 +10,14 @@ capabilities = ["fence.enforceable"]
 [capability_facts."fence.enforceable"]
 cutoff = "ring_handoff"
 
+# Workload network lanes (NET_PROVIDE / NET_LANE_TAKE / NET_LANE_ADMIT): on
+# a kernel with no built-in lane provider (bare metal), ip serves each staged
+# workload's `Net(key)` edges as a lane of its own. Where no workload backend
+# exists the claim fails and ip serves its own net_in/net_out alone.
+[[resources]]
+requires_contract = "workload"
+access = "write"
+
 [[ports]]
 name = "frames_rx"
 direction = "input"

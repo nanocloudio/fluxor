@@ -149,7 +149,10 @@ pub struct TcpConn {
     pub half_open_counted: bool,
     /// Challenge-ACK refill epoch last applied to `chal_budget`.
     pub chal_epoch: u8,
-    pub _dg_pad: [u8; 1],
+    /// The workload network lane this endpoint was opened from (1-based;
+    /// 0 = the node's own shared `net_in`/`net_out`). Its events go to that
+    /// lane alone, and only that lane may command it.
+    pub lane: u8,
 
     // Send sequence variables
     pub snd_una: u32, // oldest unacknowledged
@@ -260,7 +263,7 @@ impl TcpConn {
             is_datagram: false,
             half_open_counted: false,
             chal_epoch: 0,
-            _dg_pad: [0; 1],
+            lane: 0,
             snd_una: 0,
             snd_nxt: 0,
             snd_wnd: 0,

@@ -530,9 +530,31 @@ Each key becomes one lane:
 | Isolation | A lane sends on and closes only what it opened; the node's own lanes cannot touch a workload's connections either |
 | Teardown | Freeing the owner detaches its lanes and closes everything they opened |
 
-The stream surface is complete on a lane; the datagram surface is refused
-(`EOPNOTSUPP`). `linux_net` implements lanes; the first instance in a graph
-is the provider.
+Two providers implement lanes. On Linux, `linux_net` is the provider (the
+first instance in a graph); it serves the stream surface on a lane and
+refuses the datagram surface (`EOPNOTSUPP`). On bare metal, `ip` is: it
+claims the provider role from the kernel's workload backend
+(`workload::NET_PROVIDE`) and takes each lane change the kernel queues for
+it (`NET_LANE_TAKE`) before it touches any lane, so a channel the kernel
+freed and handed on is never written by the lane that held it. `ip` serves
+both surfaces on a lane:
+
+- A bind lands as the lane's owner: on that owner's own address when it
+  has one, on the node's shared addresses otherwise, never as an owner a
+  command names. The kernel admits it (`NET_LANE_ADMIT`) by the gate a
+  built-in provider applies — refused while the owner drains or is gone,
+  and refused for a port the committed plan does not lease to it.
+- A port another lane listens on at an overlapping address is
+  `EADDRINUSE`, so no two lanes are offered the same connections.
+- Control frames for every lane share one outbound queue, drained per
+  channel: a lane that stops reading holds up only its own frames, and
+  holds at most its share of the queue (four frames; the lanes together at
+  most half), so the node's own events and its receive path never wait on
+  it. A connection whose accept cannot be announced on its lane is
+  refused, as by a full accept backlog.
+- When a lane detaches, `ip` resets what it opened, drops frames still
+  queued for its events, and cancels the dials it parked on a lookup, so a
+  lane that later takes the same channels or index inherits nothing.
 
 ## TLS as a Channel Transformer
 

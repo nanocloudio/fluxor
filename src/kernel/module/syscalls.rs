@@ -1006,6 +1006,20 @@ fn privileged_op_permission(op: u32) -> Option<u16> {
     // Isolated-workload surface (workload, 0x1Axx) — spawning owner-bound
     // isolated workloads is privileged; gated by the same
     // platform_raw bit as raw DMA/MMIO/PCIe.
+    //
+    // Except the network provider's side of a workload's net lanes
+    // (NET_PROVIDE / NET_LANE_TAKE / NET_LANE_ADMIT), which `ip` calls on
+    // bare metal — a parser of untrusted frames that must not hold
+    // platform_raw. They create nothing: the first claimant becomes the lane
+    // provider (EBUSY while another holds the role), only it may take a
+    // queued lane or ask an admission, and the caller still needs the
+    // declared workload contract grant.
+    {
+        use crate::abi::contracts::workload as wl;
+        if op == wl::NET_PROVIDE || op == wl::NET_LANE_TAKE || op == wl::NET_LANE_ADMIT {
+            return None;
+        }
+    }
     if (0x1A00..=0x1AFF).contains(&op) {
         return Some(PLATFORM_RAW);
     }

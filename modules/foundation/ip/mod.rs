@@ -332,6 +332,29 @@ struct DnsCacheEntry {
     expires_ms: u32,
 }
 
+/// Workload network lanes this provider holds: a staged workload's own
+/// command/event channel pair, attached by the kernel. The kernel admits at
+/// most as many, so a lane it attaches is one this module has room for.
+const NET_LANES: usize = abi::contracts::workload::net_lane::LANES_MAX;
+use abi::contracts::workload::{net_lane, NET_LANE_ADMIT, NET_LANE_TAKE, NET_PROVIDE};
+
+/// One workload lane. Its index (1-based) is the `lane` stamped on every
+/// endpoint it opens and every dial it parks; everything keyed by it is
+/// cleared when the lane detaches (`lane_close`), so a lane that later takes
+/// the same index inherits nothing.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct NetLane {
+    active: u8,
+    key: u8,
+    owner_slot: u16,
+    owner_gen: u32,
+    /// The workload writes commands here (this module reads it).
+    cmd: i32,
+    /// The workload reads events here (this module writes it).
+    evt: i32,
+}
+
 /// One dial (or cache warm) waiting on a query.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -349,6 +372,8 @@ struct DnsPending {
     id: u16,
     /// Wall clock at which the leader retransmits or gives up.
     deadline_ms: u32,
+    /// The lane the dial came from (see `NetLane`).
+    lane: u8,
 }
 
 /// Hash index over the connection table: twice the table, so chains stay
@@ -513,6 +538,8 @@ const PKT_DECISION_PRE_TRANSPORT: u8 = 1;
 /// `MSG_ACK`).
 const NET_OUT_FRAME_MAX: usize = 9;
 const NET_OUT_QUEUE_SLOTS: usize = 32;
+/// Queued frames one workload lane may hold (`net_send_or_queue_to`).
+const LANE_QUEUE_SHARE: usize = 4;
 
 /// `TcpConn::pending_close_notify` codes — non-zero values identify
 /// which helper `step_tcp_timers` retries once `net_out_chan` has
@@ -1360,6 +1387,20 @@ struct IpState {
     /// own per-conn path because it's variable-length and large.
     pending_net_out_frames: [[u8; NET_OUT_FRAME_MAX]; NET_OUT_QUEUE_SLOTS],
     pending_net_out_lens: [u8; NET_OUT_QUEUE_SLOTS],
+    /// The channel each queued frame is for (its endpoint's lane, or
+    /// `net_out_chan`).
+    pending_net_out_chans: [i32; NET_OUT_QUEUE_SLOTS],
+    /// Workload network lanes (see `NetLane`), the lane whose commands are
+    /// being served (1-based; 0 = `net_in_chan`), and the provider claim:
+    /// 0 not asked, 1 held, 2 refused (another provider, or no kernel support).
+    lanes: [NetLane; NET_LANES],
+    cur_lane: u8,
+    lane_provider: u8,
+    /// Lane telemetry: attached, detached, commands refused for naming an
+    /// endpoint another lane opened.
+    lane_attached: u32,
+    lane_detached: u32,
+    lane_refused: u32,
     pending_net_out_head: u8,
     pending_net_out_tail: u8,
     pending_net_out_count: u8,
@@ -2114,9 +2155,54 @@ unsafe fn ip_net_read_frame(
 /// `delivered_bytes` advancement and the outbound ACK on the return:
 /// ACKing data the consumer never received makes the peer think it
 /// landed and stop retransmitting, permanently losing payload.
+/// The event channel of lane `lane` (0 = `net_out_chan`), -1 for a lane
+/// that is gone.
+#[inline(always)]
+unsafe fn lane_evt(s: &IpState, lane: u8) -> i32 {
+    if lane == 0 {
+        return s.net_out_chan;
+    }
+    match s.lanes.get(lane as usize - 1) {
+        Some(l) if l.active != 0 => l.evt,
+        _ => -1,
+    }
+}
+
+/// The event channel for endpoint `idx`: its lane's.
+#[inline(always)]
+unsafe fn out_chan_conn(s: &IpState, idx: usize) -> i32 {
+    if idx < s.tcp_conns.len() {
+        lane_evt(s, (*s.tcp_conns.ptr(idx)).lane)
+    } else {
+        lane_evt(s, s.cur_lane)
+    }
+}
+
+/// The channel a ready-built endpoint frame is for: its endpoint's lane (a
+/// datagram frame names the endpoint by `ep_id`, byte 3; the rest by
+/// `conn_id`, bytes 3-4). Errors are not routed here: an error can name no
+/// endpoint (`conn_id` 0, which is also a real endpoint), so its sender
+/// says where it goes.
+unsafe fn out_chan_frame(s: &IpState, frame: &[u8]) -> i32 {
+    if frame.len() < 4 {
+        return lane_evt(s, s.cur_lane);
+    }
+    let t = frame[0];
+    let dg = t == DG_MSG_BOUND || t == DG_MSG_RX_FROM || t == DG_MSG_CLOSED;
+    let idx = if dg {
+        frame[3] as usize
+    } else if frame.len() >= 5 {
+        u16::from_le_bytes([frame[3], frame[4]]) as usize
+    } else {
+        return lane_evt(s, s.cur_lane);
+    };
+    out_chan_conn(s, idx)
+}
+
 #[inline(always)]
 unsafe fn net_send_data(s: &mut IpState, conn_id: u16, data: *const u8, data_len: usize) -> bool {
-    if s.net_out_chan < 0 || data_len == 0 {
+    let ch = out_chan_conn(s, conn_id as usize);
+    if ch < 0 || data_len == 0 {
         return true;
     }
     let sys = &*s.syscalls;
@@ -2135,7 +2221,7 @@ unsafe fn net_send_data(s: &mut IpState, conn_id: u16, data: *const u8, data_len
     core::ptr::write_volatile(scratch.add(4), cb[1]);
     core::ptr::copy_nonoverlapping(data, scratch.add(5), data_len);
     let total = NET_FRAME_HDR + payload_len;
-    let n = (sys.channel_write)(s.net_out_chan, scratch, total);
+    let n = (sys.channel_write)(ch, scratch, total);
     if n == total as i32 {
         s.out_items = s.out_items.wrapping_add(1);
         true
@@ -2150,21 +2236,37 @@ unsafe fn net_send_data(s: &mut IpState, conn_id: u16, data: *const u8, data_len
 /// full. Callers MUST gate any state transition the consumer needs
 /// to learn about on this return.
 unsafe fn net_send_or_queue(s: &mut IpState, frame: &[u8]) -> bool {
-    if s.net_out_chan < 0 {
+    let ch = out_chan_frame(s, frame);
+    net_send_or_queue_to(s, ch, frame)
+}
+
+/// [`net_send_or_queue`] to an explicit channel.
+unsafe fn net_send_or_queue_to(s: &mut IpState, ch: i32, frame: &[u8]) -> bool {
+    if ch < 0 {
         return true;
     }
     if frame.is_empty() || frame.len() > NET_OUT_FRAME_MAX {
         return false;
     }
     let sys = &*s.syscalls;
-    // Drain anything already queued first so FIFO ordering is
-    // preserved across senders and across step boundaries.
+    // Drain what is already queued first, so frames for one channel leave
+    // in the order they were made; a frame goes straight out only when
+    // nothing for its channel is still waiting.
     drain_pending_net_out_inner(s, sys);
-    if s.pending_net_out_count == 0 {
-        let n = (sys.channel_write)(s.net_out_chan, frame.as_ptr(), frame.len());
+    let (for_ch, for_lanes) = pending_counts(s, ch);
+    if for_ch == 0 {
+        let n = (sys.channel_write)(ch, frame.as_ptr(), frame.len());
         if n == frame.len() as i32 {
             return true;
         }
+    }
+    // A workload lane holds at most its share of the queue, and the lanes
+    // together at most half of it: a workload that stops reading its events
+    // fills only its own share, and the node's own frames — and the receive
+    // path, which pauses when the queue has no headroom — never wait on it.
+    if ch != s.net_out_chan && (for_ch >= LANE_QUEUE_SHARE || for_lanes >= NET_OUT_QUEUE_SLOTS / 2)
+    {
+        return false;
     }
     if s.pending_net_out_count as usize >= NET_OUT_QUEUE_SLOTS {
         log_info(s, b"[ip] net out queue full");
@@ -2175,26 +2277,81 @@ unsafe fn net_send_or_queue(s: &mut IpState, frame: &[u8]) -> bool {
     let n = frame.len();
     dst[..n].copy_from_slice(frame);
     s.pending_net_out_lens[slot] = n as u8;
+    s.pending_net_out_chans[slot] = ch;
     s.pending_net_out_tail = ((slot + 1) % NET_OUT_QUEUE_SLOTS) as u8;
     s.pending_net_out_count += 1;
     true
 }
 
-unsafe fn drain_pending_net_out_inner(s: &mut IpState, sys: &SyscallTable) {
-    while s.pending_net_out_count > 0 && s.net_out_chan >= 0 {
-        let slot = s.pending_net_out_head as usize;
-        let len = s.pending_net_out_lens[slot] as usize;
-        let n = (sys.channel_write)(s.net_out_chan, s.pending_net_out_frames[slot].as_ptr(), len);
-        if n != len as i32 {
-            return;
+/// Frames queued for `ch`, and for workload lanes in all (any channel but the
+/// node's own `net_out_chan`).
+fn pending_counts(s: &IpState, ch: i32) -> (usize, usize) {
+    let (mut for_ch, mut for_lanes) = (0usize, 0usize);
+    let mut k = 0usize;
+    while k < s.pending_net_out_count as usize {
+        let c =
+            s.pending_net_out_chans[(s.pending_net_out_head as usize + k) % NET_OUT_QUEUE_SLOTS];
+        if c == ch {
+            for_ch += 1;
         }
-        s.pending_net_out_head = ((slot + 1) % NET_OUT_QUEUE_SLOTS) as u8;
-        s.pending_net_out_count -= 1;
+        if c >= 0 && c != s.net_out_chan {
+            for_lanes += 1;
+        }
+        k += 1;
     }
+    (for_ch, for_lanes)
+}
+
+/// Write out what the queue holds, oldest first, per channel: a channel that
+/// is full keeps its frames, in order, and every frame behind it for another
+/// channel still goes. One workload that stops reading holds up nothing but
+/// its own events. A frame whose channel has gone (`-1`) is dropped.
+unsafe fn drain_pending_net_out_inner(s: &mut IpState, sys: &SyscallTable) {
+    let count = s.pending_net_out_count as usize;
+    if count == 0 {
+        return;
+    }
+    let head = s.pending_net_out_head as usize;
+    // Channels found full in this pass: nothing more is written to them, so
+    // their order holds.
+    let mut full = [-1i32; NET_OUT_QUEUE_SLOTS];
+    let mut nfull = 0usize;
+    let mut kept = 0usize;
+    let mut k = 0usize;
+    while k < count {
+        let from = (head + k) % NET_OUT_QUEUE_SLOTS;
+        let ch = s.pending_net_out_chans[from];
+        let len = s.pending_net_out_lens[from] as usize;
+        let mut keep = false;
+        if ch >= 0 {
+            if full[..nfull].contains(&ch) {
+                keep = true;
+            } else {
+                let n = (sys.channel_write)(ch, s.pending_net_out_frames[from].as_ptr(), len);
+                if n != len as i32 {
+                    full[nfull] = ch;
+                    nfull += 1;
+                    keep = true;
+                }
+            }
+        }
+        if keep {
+            let to = (head + kept) % NET_OUT_QUEUE_SLOTS;
+            if to != from {
+                s.pending_net_out_frames[to] = s.pending_net_out_frames[from];
+                s.pending_net_out_lens[to] = s.pending_net_out_lens[from];
+                s.pending_net_out_chans[to] = ch;
+            }
+            kept += 1;
+        }
+        k += 1;
+    }
+    s.pending_net_out_count = kept as u8;
+    s.pending_net_out_tail = ((head + kept) % NET_OUT_QUEUE_SLOTS) as u8;
 }
 
 unsafe fn drain_pending_net_out(s: &mut IpState) {
-    if s.pending_net_out_count == 0 || s.net_out_chan < 0 {
+    if s.pending_net_out_count == 0 {
         return;
     }
     let sys = &*s.syscalls;
@@ -2263,7 +2420,7 @@ unsafe fn net_send_accepted(s: &mut IpState, conn_id: u16, local_port: u16) -> b
             let mut scratch = [0u8; NET_FRAME_HDR + abi::contracts::net::net_proto::TRACE_CTX_LEN];
             dev_net_send_trace_ctx(
                 sys,
-                s.net_out_chan,
+                out_chan_conn(s, conn_id as usize),
                 conn_id,
                 &trace_id,
                 &span_id,
@@ -2394,6 +2551,26 @@ unsafe fn net_send_connected(s: &mut IpState, conn_id: u16) -> bool {
 /// accept failure use the bool to know whether the latch is needed.
 #[inline(always)]
 unsafe fn net_send_error(s: &mut IpState, conn_id: u16, errno: i8, tag: u8) -> bool {
+    let ch = out_chan_conn(s, conn_id as usize);
+    net_send_error_to(s, ch, conn_id, errno, tag)
+}
+
+/// An error answering the command being served, naming no endpoint
+/// (`conn_id` 0): a refused bind or dial. It goes to the lane that sent the
+/// command.
+unsafe fn net_send_reply_error(s: &mut IpState, errno: i8, tag: u8) -> bool {
+    let ch = lane_evt(s, s.cur_lane);
+    net_send_error_to(s, ch, 0, errno, tag)
+}
+
+/// An error about the node itself, naming no endpoint: the node's own
+/// consumer hears it, no workload lane does.
+unsafe fn net_send_node_error(s: &mut IpState, errno: i8) -> bool {
+    let ch = s.net_out_chan;
+    net_send_error_to(s, ch, 0, errno, 0)
+}
+
+unsafe fn net_send_error_to(s: &mut IpState, ch: i32, conn_id: u16, errno: i8, tag: u8) -> bool {
     // Payload `[conn_id:2 LE][errno][requester_tag]`. The tag echoes the
     // failing dial's tag so a consumer sharing a fanned net_out
     // attributes a connect failure to the right requester (it has no conn_id
@@ -2407,7 +2584,7 @@ unsafe fn net_send_error(s: &mut IpState, conn_id: u16, errno: i8, tag: u8) -> b
     core::ptr::write_volatile(frame.as_mut_ptr().add(4), cb[1]);
     core::ptr::write_volatile(frame.as_mut_ptr().add(5), errno as u8);
     core::ptr::write_volatile(frame.as_mut_ptr().add(6), tag);
-    net_send_or_queue(s, &frame)
+    net_send_or_queue_to(s, ch, &frame)
 }
 
 /// Emit a MSG_RETRANSMIT frame. Payload: `[conn_id:2 LE][from_seq:4 LE]`.
@@ -2483,7 +2660,8 @@ unsafe fn dg_send_rx_from_v4(
     data: *const u8,
     data_len: usize,
 ) {
-    if s.net_out_chan < 0 || data_len == 0 {
+    let ch = out_chan_conn(s, ep_id as usize);
+    if ch < 0 || data_len == 0 {
         return;
     }
     let sys = &*s.syscalls;
@@ -2509,7 +2687,7 @@ unsafe fn dg_send_rx_from_v4(
     wv(scratch.add(9), port_bytes[0]);
     wv(scratch.add(10), port_bytes[1]);
     core::ptr::copy_nonoverlapping(data, scratch.add(11), data_len);
-    (sys.channel_write)(s.net_out_chan, scratch, NET_FRAME_HDR + payload_len);
+    (sys.channel_write)(ch, scratch, NET_FRAME_HDR + payload_len);
 }
 
 /// MSG_DG_CLOSED payload: `[ep_id:1]`.
@@ -2526,7 +2704,10 @@ unsafe fn dg_send_closed(s: &mut IpState, ep_id: u8) {
 
 /// MSG_DG_ERROR payload: `[ep_id:1][errno:i8]`.
 #[inline(always)]
+/// A datagram error answers the command being served — a refused bind or
+/// send — so it goes to the lane that sent it.
 unsafe fn dg_send_error(s: &mut IpState, ep_id: u8, errno: i8) {
+    let ch = lane_evt(s, s.cur_lane);
     let mut frame = [0u8; 5];
     use core::ptr::write_volatile as wv;
     wv(frame.as_mut_ptr(), DG_MSG_ERROR);
@@ -2534,7 +2715,7 @@ unsafe fn dg_send_error(s: &mut IpState, ep_id: u8, errno: i8) {
     wv(frame.as_mut_ptr().add(2), 0u8);
     wv(frame.as_mut_ptr().add(3), ep_id);
     wv(frame.as_mut_ptr().add(4), errno as u8);
-    net_send_or_queue(s, &frame);
+    net_send_or_queue_to(s, ch, &frame);
 }
 
 /// Length of a receive-window sharing epoch (`rx_seen`).
@@ -2573,17 +2754,24 @@ unsafe fn update_rcv_wnd(s: &mut IpState, conn_idx: usize) {
     let bit = conn_idx & 255;
     s.rx_seen[bit >> 6] |= 1u64 << (bit & 63);
     let seen_now: u32 = s.rx_seen.iter().map(|w| w.count_ones()).sum();
-    let sharers = seen_now.max(s.rx_active_prev as u32).max(1);
+    // A lane's event channel is the endpoint's own ring, not one shared.
+    let on_lane = (*s.tcp_conns.ptr(conn_idx)).lane != 0;
+    let sharers = if on_lane {
+        1
+    } else {
+        seen_now.max(s.rx_active_prev as u32).max(1)
+    };
+    let out_ch = out_chan_conn(s, conn_idx);
 
     let mut free = [0u8; 4];
-    let rc = dev_channel_ioctl(sys, s.net_out_chan, IOCTL_WRITABLE, free.as_mut_ptr(), 4);
+    let rc = dev_channel_ioctl(sys, out_ch, IOCTL_WRITABLE, free.as_mut_ptr(), 4);
     let free = u32::from_le_bytes(free);
     let wnd = if rc < 0 || free == 0 {
         // Zero free bytes is either a full ring or a channel with no ring
         // to measure (a mailbox reports 0 yet accepts a write), and a refused
         // ioctl measures nothing. Readiness tells them apart: a full ring is
         // not writable.
-        let poll_out = (sys.channel_poll)(s.net_out_chan, POLL_OUT);
+        let poll_out = (sys.channel_poll)(out_ch, POLL_OUT);
         if poll_out > 0 && (poll_out as u32 & POLL_OUT) != 0 {
             tcp::MAX_RCV_WND as u32
         } else {
@@ -2695,13 +2883,17 @@ enum DgBind {
 /// two sockets. TCP listeners are a different protocol and never conflict
 /// here — `find_listener_indexed` already excludes datagram slots in the
 /// other direction.
-unsafe fn dg_bind_admission(s: &IpState, port: u16, slot: u16, owner_tag: u16) -> DgBind {
+unsafe fn dg_bind_admission(s: &IpState, port: u16, slot: u16, owner_tag: u16, lane: u8) -> DgBind {
     let mut i = 0;
     while i < MAX_DG_ENDPOINTS {
         let c = &*s.tcp_conns.ptr(i);
         if c.is_active() && c.is_datagram && c.local_port == port {
             if c.local_slot == slot {
-                if c.owner_tag == owner_tag {
+                // A retry by the holder: the same owner, from the same lane.
+                // Another lane of the same owner is a second claimant, and
+                // handing it this endpoint would leave it unable to command
+                // the endpoint it was given.
+                if c.owner_tag == owner_tag && c.lane == lane {
                     return DgBind::Existing(i);
                 }
                 return DgBind::Conflict;
@@ -3591,6 +3783,21 @@ unsafe fn emit_report_line(s: &mut IpState) {
             num(s.tx_cmd_items, &mut pos);
             emit(b" pendcmd=", &mut pos);
             num(s.pend_cmd_steps, &mut pos);
+            // Workload network lanes: provider claim (0 unasked, 1 held, 2
+            // refused), lanes live, attached, detached, commands refused.
+            emit(b" lp=", &mut pos);
+            num(s.lane_provider as u32, &mut pos);
+            emit(b" ln=", &mut pos);
+            num(
+                s.lanes.iter().filter(|l| l.active != 0).count() as u32,
+                &mut pos,
+            );
+            emit(b" la=", &mut pos);
+            num(s.lane_attached, &mut pos);
+            emit(b" ld=", &mut pos);
+            num(s.lane_detached, &mut pos);
+            emit(b" lr=", &mut pos);
+            num(s.lane_refused, &mut pos);
             dev_log(sys, 3, buf, pos);
         }
         2 => {
@@ -3937,7 +4144,7 @@ unsafe fn process_arp(s: &mut IpState, data: *const u8, len: usize) {
         if s.mac_valid {
             send_gratuitous_arp(s, sender_ip);
         }
-        net_send_error(s, 0, -1, 0);
+        net_send_node_error(s, -1);
         return;
     }
 
@@ -5008,9 +5215,12 @@ unsafe fn process_tcp_segment(
                         ip_hdr.src_ip,
                         tcp_hdr.src_port,
                     );
+                    let lane = (*s.tcp_conns.ptr(li)).lane;
                     let conn = &mut *s.tcp_conns.ptr_mut(idx);
                     *conn = tcp::TcpConn::new();
                     conn.local_port = listener_port;
+                    // An accepted connection belongs to its listener's lane.
+                    conn.lane = lane;
                     // Latch the local address this SYN arrived at so replies
                     // source from it and the demux axis distinguishes it.
                     conn.local_slot = local_slot;
@@ -5449,14 +5659,20 @@ unsafe fn process_tcp_segment(
             }
         }
         ACTION_COMPLETE_ACCEPT => {
-            // RX is gated on NET_OUT_QUEUE_HEADROOM, so the queue
-            // always has space for MSG_ACCEPTED here. The `_` discard
-            // documents the contract: callers MUST have queue
-            // headroom before progressing past Established.
+            // RX is gated on NET_OUT_QUEUE_HEADROOM, so the node's own
+            // consumer always has room for MSG_ACCEPTED here. A workload
+            // lane may not: it holds only its share of the queue. A
+            // connection that cannot be announced is refused, as by a full
+            // accept backlog, rather than left established with nobody told.
+            let local_port = (*s.tcp_conns.ptr(conn_idx)).local_port;
+            if !net_send_accepted(s, conn_idx as u16, local_port) {
+                log_info(s, b"[ip] accept refused: lane backlog full");
+                let _ = send_tcp_control(s, conn_idx, tcp::RST | tcp::ACK, false);
+                conn_reset(s, conn_idx);
+                return;
+            }
             let remote_ip = (*s.tcp_conns.ptr(conn_idx)).remote_ip;
             arp::pin(&mut s.arp_table, remote_ip);
-            let local_port = (*s.tcp_conns.ptr(conn_idx)).local_port;
-            let _ = net_send_accepted(s, conn_idx as u16, local_port);
             // Piggybacked data (e.g. HTTP GET on the third handshake
             // ACK). Same gate as the regular RX_DATA path: don't ACK
             // payload the consumer didn't receive.
@@ -5849,9 +6065,11 @@ unsafe fn try_cookie_accept(
     // construction. The block is installed one step short of `Established`
     // so the shared admissibility gate and state machine complete it.
     let idx = accept_idx as usize;
+    let lane = (*s.tcp_conns.ptr(li)).lane;
     let conn = &mut *s.tcp_conns.ptr_mut(idx);
     *conn = tcp::TcpConn::new();
     conn.local_port = listener_port;
+    conn.lane = lane;
     conn.local_slot = local_slot;
     conn.remote_ip = ip_hdr.src_ip;
     conn.remote_port = tcp_hdr.src_port;
@@ -6762,7 +6980,7 @@ fn state_allows_send(state: tcp::TcpState) -> bool {
 unsafe fn connect_loopback(s: &mut IpState, port: u16, requester_tag: u8) {
     // A listener must exist BEFORE the pair is allocated.
     if find_listener_indexed(s, port, tcp::LOCAL_SLOT_ANY, false).is_none() {
-        let _ = net_send_error(s, 0, -111, requester_tag); // ECONNREFUSED
+        let _ = net_send_reply_error(s, -111, requester_tag); // ECONNREFUSED
         return;
     }
 
@@ -6776,14 +6994,14 @@ unsafe fn connect_loopback(s: &mut IpState, port: u16, requester_tag: u8) {
         }
     }
     if ci < 0 || si < 0 {
-        let _ = net_send_error(s, 0, -12, requester_tag); // ENOMEM
+        let _ = net_send_reply_error(s, -12, requester_tag); // ENOMEM
         return;
     }
     let (ci, si) = (ci as usize, si as usize);
     let local_port = match next_port(s) {
         Some(p) => p,
         None => {
-            let _ = net_send_error(s, 0, -99, requester_tag); // EADDRNOTAVAIL
+            let _ = net_send_reply_error(s, -99, requester_tag); // EADDRNOTAVAIL
             return;
         }
     };
@@ -6837,7 +7055,7 @@ unsafe fn connect_loopback(s: &mut IpState, port: u16, requester_tag: u8) {
         s.loopback_peer[si] = -1;
         conn_reset(s, ci);
         conn_reset(s, si);
-        let _ = net_send_error(s, 0, -12, requester_tag);
+        let _ = net_send_reply_error(s, -12, requester_tag);
         return;
     }
     log_info(s, b"[ip] loopback pair");
@@ -7151,8 +7369,191 @@ unsafe fn service_addr_ctl(s: &mut IpState) {
     }
 }
 
-/// Read and dispatch net protocol commands from the consumer channel.
+/// Serve the node's own command channel, then every workload lane's: the
+/// lane changes the kernel queued are taken first, before any lane I/O, so a
+/// channel it freed and reused within this tick is never touched by the lane
+/// that held it.
 unsafe fn service_net_channels(s: &mut IpState) {
+    lanes_take(s);
+    s.cur_lane = 0;
+    service_net_channel(s);
+    let shared_in = s.net_in_chan;
+    let mut i = 0;
+    while i < NET_LANES {
+        if s.lanes[i].active != 0 {
+            s.net_in_chan = s.lanes[i].cmd;
+            s.cur_lane = (i + 1) as u8;
+            service_net_channel(s);
+        }
+        i += 1;
+    }
+    s.net_in_chan = shared_in;
+    s.cur_lane = 0;
+}
+
+/// True when the command (if it names an endpoint) names one opened from
+/// the lane being served.
+unsafe fn lane_may_command(s: &IpState, msg_type: u8, p: *const u8, plen: usize) -> bool {
+    let idx = match msg_type {
+        NET_CMD_SEND | NET_CMD_CLOSE if plen >= 2 => u16::from_le_bytes([*p, *p.add(1)]) as usize,
+        DG_CMD_SEND_TO | DG_CMD_CLOSE if plen >= 1 => *p as usize,
+        _ => return true,
+    };
+    idx >= s.tcp_conns.len() || (*s.tcp_conns.ptr(idx)).lane == s.cur_lane
+}
+
+/// Where a lane's bind lands, and as whom: `(owner_tag, local slot)`, or the
+/// errno that refuses it.
+///
+/// A lane's bind is stamped with the lane's own owner, never with an owner
+/// tag its payload names: a workload cannot bind as another. It lands on the
+/// owner's own address when the owner has one, and on the wildcard (the
+/// node's shared addresses) when it does not. The kernel then admits it as
+/// it admits a bind for a built-in provider (`NET_LANE_ADMIT`): refused while
+/// the owner drains or is gone, and refused for a port the committed plan
+/// does not lease to it.
+unsafe fn lane_bind_target(s: &IpState, protocol: u8, port: u16) -> Result<(u16, u16), i8> {
+    let l = s.lanes[s.cur_lane as usize - 1];
+    let mut req = [0u8; net_lane::ADMIT_LEN];
+    req[0..2].copy_from_slice(&l.owner_slot.to_le_bytes());
+    req[4..8].copy_from_slice(&l.owner_gen.to_le_bytes());
+    req[8] = protocol;
+    req[10..12].copy_from_slice(&port.to_le_bytes());
+    let rc = ((*s.syscalls).provider_call)(-1, NET_LANE_ADMIT, req.as_mut_ptr(), req.len());
+    if rc < 0 {
+        return Err(rc as i8);
+    }
+    match slot_for_owner(s, l.owner_slot) {
+        Some(slot) => Ok((l.owner_slot, slot)),
+        None => Ok((0, LOCAL_SLOT_ANY)),
+    }
+}
+
+/// Whether listeners on `a` and `b` would both be offered the same SYN: the
+/// same slot, or the wildcard against a slot no owner holds (the wildcard is
+/// never served on an owned address).
+fn listen_slots_overlap(s: &IpState, a: u16, b: u16) -> bool {
+    a == b
+        || (a == LOCAL_SLOT_ANY && !slot_is_owned(s, b))
+        || (b == LOCAL_SLOT_ANY && !slot_is_owned(s, a))
+}
+
+/// Take the lane changes the kernel queued (`net_attach`): claim the
+/// provider role once, then attach and detach as recorded.
+unsafe fn lanes_take(s: &mut IpState) {
+    let sys = &*s.syscalls;
+    if s.lane_provider == 0 {
+        let rc = (sys.provider_call)(-1, NET_PROVIDE, core::ptr::null_mut(), 0);
+        s.lane_provider = if rc == 0 { 1 } else { 2 };
+        if rc == 0 {
+            log_info(s, b"[ip] net lanes: provider");
+        }
+    }
+    if s.lane_provider != 1 {
+        return;
+    }
+    let mut n = 0;
+    while n < NET_LANES {
+        let mut r = [0u8; net_lane::RECORD_LEN];
+        let rc = (sys.provider_call)(-1, NET_LANE_TAKE, r.as_mut_ptr(), net_lane::RECORD_LEN);
+        if rc != net_lane::RECORD_LEN as i32 {
+            return;
+        }
+        let rd16 = |o: usize| u16::from_le_bytes([r[o], r[o + 1]]);
+        let rd32 = |o: usize| [r[o], r[o + 1], r[o + 2], r[o + 3]];
+        let owner_slot = rd16(net_lane::OFF_OWNER_SLOT);
+        let owner_gen = u32::from_le_bytes(rd32(net_lane::OFF_OWNER_GEN));
+        match r[net_lane::OFF_OP] {
+            net_lane::OP_ATTACH => {
+                let cmd = i32::from_le_bytes(rd32(net_lane::OFF_COMMANDS));
+                let evt = i32::from_le_bytes(rd32(net_lane::OFF_EVENTS));
+                let mut j = 0;
+                while j < NET_LANES && s.lanes[j].active != 0 {
+                    j += 1;
+                }
+                if j < NET_LANES {
+                    s.lanes[j] = NetLane {
+                        active: 1,
+                        key: r[net_lane::OFF_KEY],
+                        owner_slot,
+                        owner_gen,
+                        cmd,
+                        evt,
+                    };
+                    s.lane_attached = s.lane_attached.wrapping_add(1);
+                    log_info(s, b"[ip] net lane attached");
+                } else {
+                    // The kernel admits no more lanes than this table holds.
+                    log_error(s, b"[ip] net lane attach with no free lane");
+                }
+            }
+            net_lane::OP_DETACH => {
+                let mut j = 0;
+                while j < NET_LANES {
+                    let l = s.lanes[j];
+                    if l.active != 0 && l.owner_slot == owner_slot && l.owner_gen == owner_gen {
+                        lane_close(s, (j + 1) as u8);
+                        s.lanes[j].active = 0;
+                        s.lane_detached = s.lane_detached.wrapping_add(1);
+                        log_info(s, b"[ip] net lane detached");
+                    }
+                    j += 1;
+                }
+            }
+            _ => {}
+        }
+        n += 1;
+    }
+}
+
+/// Close every endpoint lane `lane` opened: its workload has gone, and so
+/// have the channels its events went to. A connection with a peer is reset.
+/// Frames still queued for the lane's event channel are dropped, and dials it
+/// parked on a lookup are cancelled: the kernel may hand that channel, and
+/// the next lane this index, to another workload, which must receive nothing
+/// of this one's.
+unsafe fn lane_close(s: &mut IpState, lane: u8) {
+    let evt = lane_evt(s, lane);
+    let mut q = 0;
+    while q < NET_OUT_QUEUE_SLOTS {
+        if evt >= 0 && s.pending_net_out_chans[q] == evt {
+            s.pending_net_out_chans[q] = -1;
+        }
+        q += 1;
+    }
+    let mut d = 0;
+    while d < MAX_DNS_PENDING {
+        let e = &*s.dns_pending.as_ptr().add(d);
+        if e.flags & DNS_PEND_ACTIVE != 0 && e.lane == lane {
+            resolver_clear(s, d);
+        }
+        d += 1;
+    }
+    let mut idx = 0;
+    while idx < s.tcp_conns.len() {
+        let (mine, live, dg) = {
+            let c = &*s.tcp_conns.ptr(idx);
+            (
+                c.lane == lane,
+                c.state != tcp::TcpState::Closed,
+                c.is_datagram,
+            )
+        };
+        if mine && live {
+            if !dg && (*s.tcp_conns.ptr(idx)).remote_ip != 0 {
+                let _ = send_tcp_control(s, idx, tcp::RST | tcp::ACK, false);
+            }
+            conn_reset(s, idx);
+        } else if mine {
+            (*s.tcp_conns.ptr_mut(idx)).lane = 0;
+        }
+        idx += 1;
+    }
+}
+
+/// Read and dispatch net protocol commands from the channel being served
+/// (`net_in_chan`: the node's own, or a lane's while `cur_lane` names it).
+unsafe fn service_net_channel(s: &mut IpState) {
     if s.net_in_chan < 0 {
         return;
     }
@@ -7230,6 +7631,14 @@ unsafe fn service_net_channels(s: &mut IpState) {
 
         let plen = payload_len as usize;
 
+        // A command naming an endpoint acts only on one its own lane opened
+        // (the shared `net_in` is lane 0, and owns lane 0's).
+        if !lane_may_command(s, msg_type, buf.as_ptr(), plen) {
+            s.lane_refused = s.lane_refused.wrapping_add(1);
+            count += 1;
+            continue;
+        }
+
         match msg_type {
             NET_CMD_BIND => {
                 // Payload: [port: u16 LE]                        host/wildcard
@@ -7242,17 +7651,34 @@ unsafe fn service_net_channels(s: &mut IpState) {
                 // ingress path. Absent or 0 ⇒ host wildcard.
                 if plen >= 2 {
                     let port = u16::from_le_bytes([*buf.as_ptr(), *buf.as_ptr().add(1)]);
-                    let owner_tag = if plen >= 4 {
+                    let payload_tag = if plen >= 4 {
                         u16::from_le_bytes([*buf.as_ptr().add(2), *buf.as_ptr().add(3)])
                     } else {
                         0
                     };
+                    // A lane binds as its own owner (`lane_bind_target`).
+                    let lane_target = if s.cur_lane != 0 {
+                        match lane_bind_target(s, abi::contracts::workload::NET_PROTO_TCP, port) {
+                            Ok(t) => Some(t),
+                            Err(errno) => {
+                                log_info(s, b"[ip] net bind: lane bind refused");
+                                net_send_reply_error(s, errno, 0);
+                                count += 1;
+                                continue;
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    let owner_tag = lane_target.map_or(payload_tag, |t| t.0);
                     // Resolve the target local-address slot for this bind.
                     // owner 0 → wildcard (host). A nonzero owner must own a
                     // configured address here; if it does not, the bind is
                     // refused — the metal analogue of the Linux lease-owner
                     // gate.
-                    let target_slot = if owner_tag == 0 {
+                    let target_slot = if let Some((_, slot)) = lane_target {
+                        slot
+                    } else if owner_tag == 0 {
                         LOCAL_SLOT_ANY
                     } else {
                         match slot_for_owner(s, owner_tag) {
@@ -7264,7 +7690,7 @@ unsafe fn service_net_channels(s: &mut IpState) {
                                 // ([conn_id=0][errno][tag]), the ip module's
                                 // established bind-failure channel (matches the
                                 // no-free-conn ENOMEM path below).
-                                net_send_error(s, 0, -13, 0);
+                                net_send_reply_error(s, -13, 0);
                                 count += 1;
                                 continue;
                             }
@@ -7281,7 +7707,11 @@ unsafe fn service_net_channels(s: &mut IpState) {
                     // The listener list is the whole search space, and
                     // datagram endpoints are never on it, so a UDP slot on
                     // the same port cannot satisfy a TCP bind.
+                    // A listener another lane holds on an overlapping address
+                    // refuses the bind: both would be offered its SYNs, and
+                    // one would take connections meant for the other.
                     let mut existing: Option<usize> = None;
+                    let mut taken = false;
                     let mut li = 0;
                     while li < MAX_LISTENERS {
                         let e = s.listeners[li];
@@ -7291,15 +7721,24 @@ unsafe fn service_net_channels(s: &mut IpState) {
                             if conn.state == tcp::TcpState::Listen
                                 && !conn.is_datagram
                                 && conn.local_port == port
-                                && conn.local_slot == target_slot
                             {
-                                existing = Some(idx);
-                                break;
+                                if conn.lane != s.cur_lane {
+                                    if listen_slots_overlap(s, conn.local_slot, target_slot) {
+                                        taken = true;
+                                        break;
+                                    }
+                                } else if conn.local_slot == target_slot {
+                                    existing = Some(idx);
+                                    break;
+                                }
                             }
                         }
                         li += 1;
                     }
-                    if let Some(idx) = existing {
+                    if taken {
+                        log_info(s, b"[ip] net bind: port held by another lane");
+                        net_send_reply_error(s, -98, 0); // EADDRINUSE
+                    } else if let Some(idx) = existing {
                         log_info(s, b"[ip] net bind: existing listener");
                         net_send_bound(s, idx as u16, port);
                     } else {
@@ -7315,12 +7754,14 @@ unsafe fn service_net_channels(s: &mut IpState) {
                             // Reset explicitly — this path reuses a slot
                             // without a full `TcpConn::new()`.
                             conn.local_slot = target_slot;
+                            conn.owner_tag = owner_tag;
+                            conn.lane = s.cur_lane;
                             conn_index_insert(s, ci);
                             log_info(s, b"[ip] net bind");
                             net_send_bound(s, ci as u16, port);
                         } else {
                             log_info(s, b"[ip] net bind: no free conn");
-                            net_send_error(s, 0, -12, 0); // ENOMEM (bind — untagged)
+                            net_send_reply_error(s, -12, 0); // ENOMEM (bind — untagged)
                         }
                     }
                 }
@@ -7333,7 +7774,7 @@ unsafe fn service_net_channels(s: &mut IpState) {
                     s,
                     b"[ip] CMD_CONNECT (0x13) is unsupported; dial with CMD_CONNECT_TO (0x14)",
                 );
-                net_send_error(s, 0, -38, tag); // ENOSYS
+                net_send_reply_error(s, -38, tag); // ENOSYS
             }
             NET_CMD_CONNECT_TO => {
                 // Stream Surface v1: open a TCP outbound connection to a
@@ -7345,7 +7786,7 @@ unsafe fn service_net_channels(s: &mut IpState) {
                     Some((sock_type, port, target, tag)) => {
                         let requester_tag = tag.unwrap_or(REQUESTER_TAG_NONE);
                         if sock_type != SOCK_TYPE_STREAM {
-                            net_send_error(s, 0, -22, requester_tag); // EINVAL
+                            net_send_reply_error(s, -22, requester_tag); // EINVAL
                         } else {
                             match target {
                                 Target::V4(a) => {
@@ -7353,7 +7794,8 @@ unsafe fn service_net_channels(s: &mut IpState) {
                                 }
                                 // No IPv6 stack: a v6 literal cannot be dialled.
                                 Target::V6(_) => {
-                                    net_send_error(s, 0, -22, requester_tag); // EINVAL
+                                    net_send_reply_error(s, -22, requester_tag);
+                                    // EINVAL
                                 }
                                 Target::Name(name) => {
                                     connect_by_name(s, name, port, requester_tag);
@@ -7371,7 +7813,7 @@ unsafe fn service_net_channels(s: &mut IpState) {
                         } else {
                             REQUESTER_TAG_NONE
                         };
-                        net_send_error(s, 0, -22, tag);
+                        net_send_reply_error(s, -22, tag);
                     }
                 }
             }
@@ -7446,15 +7888,35 @@ unsafe fn service_net_channels(s: &mut IpState) {
                 // absent or 0 ⇒ host wildcard.
                 if plen >= 2 {
                     let req_port = u16::from_le_bytes([*buf.as_ptr(), *buf.as_ptr().add(1)]);
-                    let owner_tag = if plen >= 5 {
+                    let payload_tag = if plen >= 5 {
                         u16::from_le_bytes([*buf.as_ptr().add(3), *buf.as_ptr().add(4)])
                     } else {
                         0
                     };
+                    // A lane binds as its own owner (`lane_bind_target`); an
+                    // ephemeral request (port 0) claims no endpoint and is
+                    // admitted as such.
+                    let lane_target = if s.cur_lane != 0 {
+                        match lane_bind_target(s, abi::contracts::workload::NET_PROTO_UDP, req_port)
+                        {
+                            Ok(t) => Some(t),
+                            Err(errno) => {
+                                log_info(s, b"[ip] dg bind: lane bind refused");
+                                dg_send_error(s, 0, errno);
+                                count += 1;
+                                continue;
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    let owner_tag = lane_target.map_or(payload_tag, |t| t.0);
                     // Resolve the owner's address slot before drawing a port:
                     // a bind that is going to be refused must not consume an
                     // ephemeral allocation.
-                    let target_slot = if owner_tag == 0 {
+                    let target_slot = if let Some((_, slot)) = lane_target {
+                        Some(slot)
+                    } else if owner_tag == 0 {
                         Some(LOCAL_SLOT_ANY)
                     } else {
                         slot_for_owner(s, owner_tag)
@@ -7493,7 +7955,7 @@ unsafe fn service_net_channels(s: &mut IpState) {
                     // both stand; anything whose reachability overlaps is a
                     // conflict, because delivery picks one and the other would
                     // silently never receive.
-                    match dg_bind_admission(s, port, target_slot, owner_tag) {
+                    match dg_bind_admission(s, port, target_slot, owner_tag, s.cur_lane) {
                         DgBind::Existing(idx) => {
                             log_info(s, b"[ip] dg bind: existing endpoint");
                             dg_send_bound(s, idx as u8, port);
@@ -7522,6 +7984,7 @@ unsafe fn service_net_channels(s: &mut IpState) {
                             // secondaries (see `process_udp_packet`).
                             conn.local_slot = target_slot;
                             conn.owner_tag = owner_tag;
+                            conn.lane = s.cur_lane;
                             conn_index_insert(s, ci);
                             log_info(s, b"[ip] dg bind");
                             dg_send_bound(s, ci as u8, port);
@@ -7676,18 +8139,18 @@ unsafe fn connect_v4(s: &mut IpState, ip: u32, port: u16, requester_tag: u8) {
     }
 
     let Some(ci) = alloc_free_slot(s) else {
-        net_send_error(s, 0, -12, requester_tag); // ENOMEM
+        net_send_reply_error(s, -12, requester_tag); // ENOMEM
         return;
     };
     if !ensure_isn_secret(s) {
         // EAGAIN — entropy may arrive later; the caller may retry, but the
         // stack will not substitute a predictable sequence in the meantime.
-        net_send_error(s, 0, -11, requester_tag);
+        net_send_reply_error(s, -11, requester_tag);
         return;
     }
     let Some(local_port) = next_port(s) else {
         // EADDRNOTAVAIL — no ephemeral port available.
-        net_send_error(s, 0, -99, requester_tag);
+        net_send_reply_error(s, -99, requester_tag);
         return;
     };
     let iss = compute_iss(s, s.local_ip, local_port, ip, port);
@@ -7702,6 +8165,8 @@ unsafe fn connect_v4(s: &mut IpState, ip: u32, port: u16, requester_tag: u8) {
     // Reset explicitly — this path reuses a slot in place.
     conn.local_slot = 0;
     conn.connect_tag = requester_tag;
+    // The lane whose command this is: the connection's events go to it.
+    conn.lane = s.cur_lane;
     conn.iss = iss;
     conn.snd_nxt = iss;
     conn.snd_una = iss;
@@ -7816,7 +8281,7 @@ unsafe fn connect_by_name(s: &mut IpState, name: &[u8], port: u16, requester_tag
     let mut held = [0u8; DNS_NAME_CAP];
     let len = resolver_normalise(name, &mut held);
     if len == 0 {
-        net_send_error(s, 0, -22, requester_tag); // EINVAL
+        net_send_reply_error(s, -22, requester_tag); // EINVAL
         return;
     }
     let now_ms = dev_millis(&*s.syscalls) as u32;
@@ -7826,7 +8291,7 @@ unsafe fn connect_by_name(s: &mut IpState, name: &[u8], port: u16, requester_tag
     }
     if let Err(errno) = resolver_start(s, &held[..len], port, requester_tag, false, now_ms) {
         s.drops.dns_unresolved = s.drops.dns_unresolved.wrapping_add(1);
-        net_send_error(s, 0, errno, requester_tag);
+        net_send_reply_error(s, errno, requester_tag);
     }
 }
 
@@ -7959,6 +8424,7 @@ unsafe fn resolver_start(
         e.name_len = name.len() as u8;
         e.flags = 0;
         e.tag = tag;
+        e.lane = s.cur_lane;
         e.retries = 0;
         e.port = port;
         e.id = id;
@@ -7987,14 +8453,18 @@ unsafe fn resolver_clear(s: &mut IpState, slot: usize) {
 unsafe fn resolver_complete_group(s: &mut IpState, id: u16, addr: u32) {
     let mut i = 0;
     while i < MAX_DNS_PENDING {
-        let (flags, port, tag) = {
+        let (flags, port, tag, lane) = {
             let e = &*s.dns_pending.as_ptr().add(i);
-            (e.flags, e.port, e.tag)
+            (e.flags, e.port, e.tag, e.lane)
         };
         if flags & DNS_PEND_ACTIVE != 0 && (*s.dns_pending.as_ptr().add(i)).id == id {
             resolver_clear(s, i);
             if flags & DNS_PEND_CACHE_ONLY == 0 {
+                // The dial's lane, not whichever is being served now.
+                let was = s.cur_lane;
+                s.cur_lane = lane;
                 connect_v4(s, addr, port, tag);
+                s.cur_lane = was;
             }
         }
         i += 1;
@@ -8005,15 +8475,18 @@ unsafe fn resolver_complete_group(s: &mut IpState, id: u16, addr: u32) {
 unsafe fn resolver_fail_group(s: &mut IpState, id: u16, errno: i8) {
     let mut i = 0;
     while i < MAX_DNS_PENDING {
-        let (flags, tag) = {
+        let (flags, tag, lane) = {
             let e = &*s.dns_pending.as_ptr().add(i);
-            (e.flags, e.tag)
+            (e.flags, e.tag, e.lane)
         };
         if flags & DNS_PEND_ACTIVE != 0 && (*s.dns_pending.as_ptr().add(i)).id == id {
             resolver_clear(s, i);
             s.drops.dns_unresolved = s.drops.dns_unresolved.wrapping_add(1);
             if flags & DNS_PEND_CACHE_ONLY == 0 {
-                net_send_error(s, 0, errno, tag);
+                let was = s.cur_lane;
+                s.cur_lane = lane;
+                net_send_reply_error(s, errno, tag);
+                s.cur_lane = was;
             }
         }
         i += 1;
