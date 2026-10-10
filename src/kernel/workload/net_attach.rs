@@ -113,7 +113,11 @@ pub unsafe fn detach(owner: OwnerHandle) {
 // take on whichever core steps it; one lock orders them.
 
 use crate::abi::contracts::workload::{self as wl, net_lane};
-use core::sync::atomic::{AtomicBool, Ordering};
+// `portable_atomic`, not `core::sync::atomic`: the lane lock's
+// compare-exchange does not exist on ARMv6-M (RP2040), which has no
+// LDREX/STREX; `portable_atomic` provides it there over a critical section
+// and compiles to the native instruction everywhere else.
+use portable_atomic::{AtomicBool, Ordering};
 
 /// The provider's lanes at most: the kernel refuses an attach past it.
 pub const LANES_MAX: usize = net_lane::LANES_MAX;

@@ -71,8 +71,22 @@ const SILICON_SPECS: &[SiliconSpec] = &[
         // Cortex-A76 — AES + SHA2 + NEON enabled so the inline-asm
         // crypto paths in `modules/sdk/crypto/aes_gcm.rs` activate;
         // without them the scalar paths are compiled instead.
+        //
+        // `-strict-align`: `aarch64-unknown-none` assumes the MMU may be
+        // off, where every access is Device memory and an unaligned one
+        // faults, so by default LLVM never emits one — a struct copy it
+        // cannot prove aligned becomes a call to memcpy, a word read from a
+        // byte slice a chain of byte loads. Module code never runs that
+        // way: on the Pi 5 and on QEMU virt the kernel enables the MMU, with
+        // alignment checking off, before any module is loaded
+        // (`bcm2712/boot_mmu.rs`), and under `fluxor-linux` a module is
+        // ordinary user memory. Device memory reaches a module only through
+        // BAR, device-window or peripheral addresses, which drivers touch
+        // with aligned scalar volatile accesses — the compiler knows their
+        // alignment either way. Allowed unaligned access, a struct copy or a
+        // word read from a byte slice is one load and one store.
         module_target: "aarch64-unknown-none",
-        extra_rustflags: &["-C", "target-feature=+aes,+sha2,+neon"],
+        extra_rustflags: &["-C", "target-feature=+aes,+sha2,+neon,-strict-align"],
         linker: Some(LinkerSpec {
             program: "rust-lld",
             flavor: Some("gnu"),
@@ -912,7 +926,7 @@ fn build_one_target(
             &out_path,
             &opts.project_root,
             opts.strict,
-            spec.module_target,
+            &compile_key(spec),
         ) {
             report.up_to_date.push(cand.name.clone());
             continue;
@@ -949,7 +963,7 @@ fn build_one_target(
             Ok(BuildOutcome::Built) => {
                 // Beside the artefact, so a later run can tell a lenient
                 // build from a strict one (they are byte-identical).
-                write_stamp(&out_path, opts.strict, spec.module_target);
+                write_stamp(&out_path, opts.strict, &compile_key(spec));
                 report.built.push(name);
             }
             Ok(BuildOutcome::Skipped(reason)) => {
@@ -998,7 +1012,8 @@ fn is_up_to_date(
     // The target is part of the compile as well, and nothing else here can
     // see it: a silicon whose module target changes (rp2350 moving from
     // `eabihf` to soft-float) leaves every source older than every object,
-    // and the objects would be re-packed in the old ABI.
+    // and the objects would be re-packed in the old ABI. The key carries the
+    // silicon's target features too (`compile_key`), for the same reason.
     if stamped_target(out_path).as_deref() != Some(module_target) {
         return false;
     }
@@ -1201,6 +1216,19 @@ fn stamped_target(out_path: &Path) -> Option<String> {
         .ok()?
         .lines()
         .find_map(|l| l.trim().strip_prefix("target=").map(str::to_string))
+}
+
+/// What the stamp records as the compile's target: the triple, and the
+/// target features a silicon adds to it. A feature change — `-strict-align`
+/// on bcm2712, say — changes the code as surely as a new triple does and
+/// leaves every source older than every object, so it has to invalidate
+/// the same way. Equal to the bare triple where a silicon adds nothing.
+fn compile_key(spec: &SiliconSpec) -> String {
+    if spec.extra_rustflags.is_empty() {
+        spec.module_target.to_string()
+    } else {
+        format!("{} {}", spec.module_target, spec.extra_rustflags.join(" "))
+    }
 }
 
 /// Record how this artefact was built, beside it.

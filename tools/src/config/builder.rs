@@ -85,7 +85,9 @@ fn parse_broker_addr(s: &str) -> (u32, u16) {
 /// rather than imported so this tool stays independent of the kernel
 /// crate's `no_std` feature set; the silicon-config drift guard in
 /// `tools/tests/silicon_toml_shape.rs` pattern can be extended to
-/// pin this if it ever needs to change.
+/// pin this if it ever needs to change. The kernel's QEMU virt build uses
+/// ten times this (emulation is that much slower); the hardware figure is
+/// the conservative one for the burst-only validation below, so it stands.
 const DEFAULT_STEP_DEADLINE_US: u32 = 2000;
 
 /// Maximum number of scheduling domains the kernel supports.

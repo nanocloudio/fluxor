@@ -170,8 +170,15 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         }
         let s = &mut *(state as *mut DebugState);
 
-        if s.syscalls.is_null() || s.in_chan < 0 {
+        if s.syscalls.is_null() {
             return -1;
+        }
+        // An unwired input is a supported way to run this module (see the
+        // manifest): the smoke test that the runtime loads and steps a
+        // module. Nothing will ever arrive, so the module is done — not in
+        // error.
+        if s.in_chan < 0 {
+            return 1;
         }
 
         // Read into buffer at current accumulation offset

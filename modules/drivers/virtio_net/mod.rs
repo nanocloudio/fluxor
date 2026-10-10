@@ -106,6 +106,9 @@ const VQ_LEGACY_SIZE: usize = 4096 + VQ_USED_SIZE; // 4230
 // State layout offsets (computed in module_new for alignment)
 // Metadata (256 bytes) → RXQ (page-aligned) → TXQ (page-aligned) → RX_BUFS → TX_BUF
 const META_SIZE: usize = 256;
+// The virtqueues start at the first page boundary past `META_SIZE`, so the
+// state struct must fit inside it or its tail would overlap the rings.
+const _: () = assert!(core::mem::size_of::<VirtioNetState>() <= META_SIZE);
 const RX_BUFS_TOTAL: usize = QUEUE_SIZE * BUF_SIZE; // 16 * 1524 = 24384
 const TX_BUF_TOTAL: usize = BUF_SIZE; // 1524
 
@@ -136,6 +139,8 @@ struct VirtioNetState {
     mac_addr: [u8; 6],
     initialized: u8,
     mac_announced: u8,
+    /// TX records dropped as malformed (`note_tx_malformed`).
+    tx_malformed: u32,
     // Virtqueues
     rxq: VirtQueue,
     txq: VirtQueue,
@@ -395,11 +400,18 @@ unsafe fn poll_rx(s: &mut VirtioNetState) {
         let total_len = used_ring_len(s.rxq.used, slot) as usize;
 
         if total_len > NET_HDR_SIZE && desc_idx < QUEUE_SIZE {
-            let frame_ptr = (s.rx_bufs_ptr + desc_idx * BUF_SIZE + NET_HDR_SIZE) as *const u8;
+            // A frame reaches `ip` as one record, `[len:u16 LE][frame]`. The
+            // two length bytes go in the virtio-net header just ahead of the
+            // frame, which the device wrote and nothing reads now, so the
+            // record is written whole without copying the frame.
+            let frame_ptr = (s.rx_bufs_ptr + desc_idx * BUF_SIZE + NET_HDR_SIZE) as *mut u8;
             let frame_len = total_len - NET_HDR_SIZE;
+            let record = frame_ptr.sub(2);
+            write_volatile(record, frame_len as u8);
+            write_volatile(record.add(1), (frame_len >> 8) as u8);
             let poll = (sys.channel_poll)(s.out_chan, POLL_OUT);
             if poll > 0 && (poll as u32 & POLL_OUT) != 0 {
-                (sys.channel_write)(s.out_chan, frame_ptr, frame_len);
+                (sys.channel_write)(s.out_chan, record as *const u8, 2 + frame_len);
             }
         }
 
@@ -414,6 +426,20 @@ unsafe fn poll_rx(s: &mut VirtioNetState) {
         mmio_write(s.device_base, QUEUE_NOTIFY, 0);
 
         count += 1;
+    }
+}
+
+/// Count a malformed TX record, and say so: on the first, and at every
+/// power of two after, so a stream gone out of step is visible without
+/// flooding the log.
+unsafe fn note_tx_malformed(s: &mut VirtioNetState, sys: &SyscallTable) {
+    s.tx_malformed = s.tx_malformed.wrapping_add(1);
+    if s.tx_malformed.is_power_of_two() {
+        let mut line = [0u8; 48];
+        let head = b"[virtio_net] tx malformed n=";
+        line[..head.len()].copy_from_slice(head);
+        let n = head.len() + fmt_u32_raw(line.as_mut_ptr().add(head.len()), s.tx_malformed);
+        dev_log(sys, 2, line.as_ptr(), n);
     }
 }
 
@@ -436,13 +462,34 @@ unsafe fn poll_tx(s: &mut VirtioNetState) {
         write_volatile(tx_buf.add(i), 0);
         i += 1;
     }
-    // Read frame after header
-    let r = (sys.channel_read)(s.in_chan, tx_buf.add(NET_HDR_SIZE), MAX_FRAME_SIZE);
-    if r <= 0 {
+    // One record, `[len:u16 LE][frame]`, the frame landing after the
+    // virtio-net header. `ip` writes each record whole in one channel write,
+    // so a short header, a length no ethernet frame has, or a short body
+    // means a malformed stream, not a record still arriving: it is dropped
+    // and counted (`tx_malformed`, logged) rather than sent as noise. A
+    // byte stream that has gone out of step does not find its records
+    // again, which is why it is reported.
+    let mut fhdr = [0u8; 2];
+    let hn = (sys.channel_read)(s.in_chan, fhdr.as_mut_ptr(), 2);
+    if hn <= 0 {
+        return;
+    }
+    let want = if hn == 2 {
+        (fhdr[0] as usize) | ((fhdr[1] as usize) << 8)
+    } else {
+        0
+    };
+    if want == 0 || want > MAX_FRAME_SIZE {
+        note_tx_malformed(s, sys);
+        return;
+    }
+    let r = (sys.channel_read)(s.in_chan, tx_buf.add(NET_HDR_SIZE), want);
+    if r as usize != want {
+        note_tx_malformed(s, sys);
         return;
     }
 
-    let total = NET_HDR_SIZE + r as usize;
+    let total = NET_HDR_SIZE + want;
 
     // Submit to TX queue
     desc_set(s.txq.desc, 0, tx_buf as u64, total as u32, 0);
@@ -574,9 +621,10 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     let s = &mut *(state as *mut VirtioNetState);
     s.step_count = s.step_count.wrapping_add(1);
 
-    // ACK any pending virtio interrupt.
-    // TODO: once IRQ_BIND is verified working, remove this MMIO poll and
-    // let the kernel ISR handle ACK. For now, always ACK from step as fallback.
+    // Acknowledge any pending interrupt status. With the interrupt bound
+    // (IRQ_BIND) the kernel's handler acknowledges it first and this reads
+    // zero; with the binding refused nothing else would, and the device
+    // would stop raising interrupts the used ring still needs.
     if s.device_base != 0 {
         let isr = mmio_read(s.device_base, INTERRUPT_STATUS);
         if isr != 0 {
@@ -589,8 +637,10 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
         let mac = s.mac_addr.as_ptr();
         if *mac != 0 || *mac.add(1) != 0 {
             let sys = &*s.syscalls;
-            let mut frame = [0u8; 14];
-            let fp = frame.as_mut_ptr();
+            // `[len:u16 LE = 14][frame]`, as every frame record is.
+            let mut record = [0u8; 16];
+            record[0] = 14;
+            let fp = record.as_mut_ptr().add(2);
             let mut m = 0usize;
             while m < 6 {
                 let b = *mac.add(m);
@@ -601,19 +651,17 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
             // EtherType 0x0000 = MAC announcement (bytes 12-13 already zero)
             let poll = (sys.channel_poll)(s.out_chan, POLL_OUT);
             if poll > 0 && (poll as u32 & POLL_OUT) != 0 {
-                (sys.channel_write)(s.out_chan, fp as *const u8, 14);
+                (sys.channel_write)(s.out_chan, record.as_ptr(), 16);
                 s.mac_announced = 1;
                 dev_log(sys, 3, b"[virtio_net] mac announced".as_ptr(), 26);
             }
         }
     }
 
-    // RX: poll the used ring for received frames.
-    // With interrupt-driven mode, the kernel ISR ACKs the virtio device —
-    // no MMIO polling overhead here. We just check the used ring in memory.
+    // RX: the used ring, in memory, for frames the device has written.
     poll_rx(s);
 
-    // TX: always poll (sends pending frames from IP module)
+    // TX: one frame record from `ip`, if one is waiting.
     poll_tx(s);
 
     0 // Continue

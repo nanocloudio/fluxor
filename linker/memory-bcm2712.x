@@ -12,9 +12,8 @@ ENTRY(_start)
 EXTERN(_start)
 
 /* LENGTH must hold .bss, which is dominated by the profile_host arenas
- * (abi::config::kernel: STATE_ARENA_SIZE 256M + BUFFER_ARENA_SIZE 8M — the
- * state arena is sized around the ip module's 65,536-slot connection
- * table) plus the fixed tables/pools and the 16M-aligned .bss window. 512M
+ * (abi::config::kernel: STATE_ARENA_SIZE 256M + BUFFER_ARENA_SIZE 8M) plus
+ * the fixed tables/pools and the 16M-aligned .bss window. 512M
  * leaves headroom and both backings cover it: QEMU virt runs with -m 1G
  * (origin 0x4008_0000 → region ends 0x6008_0000, ~511M left for the
  * relocated package payload above __end_block_addr) and Pi 5 has 8 GiB. */

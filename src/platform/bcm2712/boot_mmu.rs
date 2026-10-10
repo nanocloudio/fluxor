@@ -1,4 +1,4 @@
-//! Boot-time MMU page tables — Pi 5 board only.
+//! Boot-time MMU page tables — Pi 5 and QEMU virt.
 //!
 //! Distinct from `fluxor::platform::mmu`, which programmes per-module
 //! page tables for EL0 hardware isolation at runtime. This module
@@ -296,6 +296,10 @@ mod pi5_impl {
             "isb",
             // Enable MMU (SCTLR_EL1: M=1, C=1, I=1)
             "mrs {tmp}, sctlr_el1",
+            // A: alignment checking off. The firmware's value is not ours
+            // to assume, and modules are built to emit unaligned accesses
+            // over Normal memory.
+            "bic {tmp}, {tmp}, #(1 << 1)",
             "orr {tmp}, {tmp}, #(1 << 0)",  // M: MMU enable
             "orr {tmp}, {tmp}, #(1 << 2)",  // C: Data cache enable
             "orr {tmp}, {tmp}, #(1 << 12)", // I: Instruction cache enable
@@ -333,9 +337,121 @@ mod pi5_impl {
 #[cfg(feature = "board-pi5")]
 pub use pi5_impl::{enable, init_page_tables};
 
-// On QEMU virt, no MMU setup needed (identity mapped by QEMU firmware).
+// QEMU virt: the same identity map in 1 GB blocks, after the virt
+// machine's layout rather than the Pi 5's. Without it the MMU stays off,
+// every access is Device-nGnRnE, and module code — built for a part that
+// runs with the MMU on, so free to emit unaligned loads and stores over
+// Normal memory — would alignment-fault on the first unaligned access.
 #[cfg(not(feature = "board-pi5"))]
-pub unsafe fn init_page_tables() {}
+mod qemu_impl {
+    const VALID: u64 = 1;
+    const BLOCK: u64 = 0;
+    const ATTR_IDX_SHIFT: u64 = 2;
+    const AP_RW: u64 = 0 << 6;
+    const SH_INNER: u64 = 3 << 8;
+    const AF: u64 = 1 << 10;
+    const NG: u64 = 1 << 11;
+    const PXN: u64 = 1 << 53;
+    const UXN: u64 = 1 << 54;
+
+    /// Index 0 Normal WB-WA, 1 Device-nGnRE, 2 Normal Non-cacheable: the
+    /// Pi 5's indices, so descriptors mean the same on both boards.
+    pub const MAIR_VALUE: u64 = 0xFF | (0x04 << 8) | (0x44 << 16);
+
+    /// 39-bit VA from L1, 4 KB granule, TTBR1 walks off, 40-bit PA: the
+    /// Pi 5's translation regime.
+    pub const TCR_VALUE: u64 =
+        25 | (0b01 << 8) | (0b01 << 10) | (0b11 << 12) | (1 << 23) | (0b010u64 << 32);
+
+    /// RAM on the virt machine starts at 1 GB, and `fluxor run` gives the
+    /// machine 1 GB of it (`-m 1G`, `targets/boards/qemu-virt.toml`). Only
+    /// that is mapped Normal: address space with no memory behind it is
+    /// never mapped as memory, where a speculative fetch could reach it.
+    const RAM_FIRST_GB: usize = 1;
+    const RAM_GBS: usize = 1;
+
+    const fn dram_block(addr: u64) -> u64 {
+        addr | VALID | BLOCK | (0 << ATTR_IDX_SHIFT) | AP_RW | SH_INNER | AF | NG
+    }
+
+    const fn device_block(addr: u64) -> u64 {
+        addr | VALID | BLOCK | (1 << ATTR_IDX_SHIFT) | AP_RW | AF | NG | PXN | UXN
+    }
+
+    #[repr(C, align(4096))]
+    pub struct PageTable([u64; 512]);
+
+    #[link_section = ".bss"]
+    pub static mut L1_TABLE: PageTable = PageTable([0; 512]);
+
+    /// Every gigabyte below 512 GB is Device except the RAM: the first holds
+    /// the flash, GIC, UART, virtio-mmio and low PCIe windows, and the
+    /// gigabyte at 256 GB the PCIe ECAM. The 64-bit PCIe window, at 512 GB,
+    /// is outside a 39-bit address space and is not mapped; nothing here
+    /// places a BAR there.
+    ///
+    /// # Safety
+    /// Called once, early in boot, with the MMU off.
+    pub unsafe fn init_page_tables() {
+        let l1_ptr = &raw mut L1_TABLE.0;
+        let table = &mut *l1_ptr;
+        let mut gb = 0usize;
+        while gb < 512 {
+            let addr = (gb as u64) << 30;
+            table[gb] = if (RAM_FIRST_GB..RAM_FIRST_GB + RAM_GBS).contains(&gb) {
+                dram_block(addr)
+            } else {
+                device_block(addr)
+            };
+            gb += 1;
+        }
+        core::arch::asm!("dsb ish", "isb", options(nostack));
+    }
+
+    /// Enable the MMU over the identity map, with alignment checking off.
+    ///
+    /// # Safety
+    /// Called once, after `init_page_tables`.
+    pub unsafe fn enable() {
+        let ttbr = &raw const L1_TABLE as u64;
+        core::arch::asm!(
+            "tlbi vmalle1",
+            "dsb ish",
+            "msr mair_el1, {mair}",
+            "msr tcr_el1, {tcr}",
+            "msr ttbr0_el1, {ttbr}",
+            "dsb ish",
+            "isb",
+            "mrs {tmp}, sctlr_el1",
+            "bic {tmp}, {tmp}, #(1 << 1)",  // A: alignment checking off
+            "orr {tmp}, {tmp}, #(1 << 0)",  // M
+            "orr {tmp}, {tmp}, #(1 << 2)",  // C
+            "orr {tmp}, {tmp}, #(1 << 12)", // I
+            "msr sctlr_el1, {tmp}",
+            "isb",
+            mair = in(reg) MAIR_VALUE,
+            tcr = in(reg) TCR_VALUE,
+            ttbr = in(reg) ttbr,
+            tmp = out(reg) _,
+        );
+        let mair_p = core::ptr::addr_of_mut!(fluxor::platform::multicore::SECONDARY_MMU_MAIR);
+        let tcr_p = core::ptr::addr_of_mut!(fluxor::platform::multicore::SECONDARY_MMU_TCR);
+        let ttbr_p = core::ptr::addr_of_mut!(fluxor::platform::multicore::SECONDARY_MMU_TTBR0);
+        core::ptr::write_volatile(mair_p, MAIR_VALUE);
+        core::ptr::write_volatile(tcr_p, TCR_VALUE);
+        core::ptr::write_volatile(ttbr_p, ttbr);
+        core::arch::asm!(
+            "dc cvac, {m}",
+            "dc cvac, {t}",
+            "dc cvac, {b}",
+            "dsb sy",
+            m = in(reg) mair_p,
+            t = in(reg) tcr_p,
+            b = in(reg) ttbr_p,
+            options(nostack),
+        );
+    }
+}
 
 #[cfg(not(feature = "board-pi5"))]
-pub unsafe fn enable() {}
+pub use qemu_impl::{enable, init_page_tables};

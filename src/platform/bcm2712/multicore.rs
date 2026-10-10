@@ -717,6 +717,7 @@ unsafe extern "C" fn secondary_core_trampoline() -> ! {
         "dsb ish",
         "isb",
         "mrs x1, sctlr_el1",
+        "bic x1, x1, #(1 << 1)",        // A: as core 0 (see boot_mmu::enable)
         "orr x1, x1, #(1 << 0)",        // M
         "orr x1, x1, #(1 << 2)",        // C
         "orr x1, x1, #(1 << 12)",       // I

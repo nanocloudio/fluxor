@@ -1284,32 +1284,32 @@ fn cmd_run(
                 std::fs::write(&config_blob, &config_data)?;
                 std::fs::write(&modules_blob, &modules_data)?;
 
-                // Extract HTTP port from config YAML for QEMU port forwarding
+                // Forward every TCP port a module in the graph listens on —
+                // a `port` given directly on the module or under its
+                // `params` — not just the `http` module's: `conn_sink`,
+                // `tls` or any other listener is reachable from the host the
+                // same way. A port below 1024 is forwarded from 18000 above
+                // it, so the host side needs no privilege. A graph naming no
+                // port keeps the old default, guest 80 from host 18080.
                 let yaml_text = std::fs::read_to_string(config_path)?;
                 let yaml: serde_yaml::Value = serde_yaml::from_str(&yaml_text)
                     .map_err(|e| Error::Config(format!("YAML parse: {e}")))?;
-                let guest_port = yaml
-                    .get("modules")
-                    .and_then(|m| m.as_sequence())
-                    .and_then(|mods| {
-                        mods.iter()
-                            .find(|m| m.get("name").and_then(|n| n.as_str()) == Some("http"))
-                    })
-                    .and_then(|http| http.get("port"))
-                    .and_then(|p| p.as_u64())
-                    .unwrap_or(80);
-                let host_port = if guest_port < 1024 {
-                    guest_port + 18000
-                } else {
-                    guest_port
-                };
-                let hostfwd = format!("user,id=net0,hostfwd=tcp::{host_port}-:{guest_port}");
+                let guest_ports = qemu_guest_ports(&yaml);
+                let mut hostfwd = String::from("user,id=net0");
+                for guest_port in &guest_ports {
+                    let host_port = if *guest_port < 1024 {
+                        guest_port + 18000
+                    } else {
+                        *guest_port
+                    };
+                    hostfwd.push_str(&format!(",hostfwd=tcp::{host_port}-:{guest_port}"));
+                    eprintln!("  Forwarding host tcp {host_port} -> guest {guest_port}");
+                }
 
                 eprintln!(
                     "Running: qemu-system-aarch64 -kernel {}",
                     elf_path.display()
                 );
-                eprintln!("  Port forward: host {host_port} -> guest {guest_port}");
                 eprintln!(
                     "  Side-load: config={} @ 0x{:08x}, modules={} @ 0x{:08x}",
                     config_blob.display(),
@@ -2321,4 +2321,53 @@ fn cmd_id_table(yaml_path: &Path, out: Option<&Path>, extra_roots: &[PathBuf]) -
         None => println!("{json}"),
     }
     Ok(())
+}
+
+/// The TCP ports a graph's modules listen on, in order, without repeats:
+/// each module's `port`, given directly or under `params`. `[80]` when none
+/// names one.
+fn qemu_guest_ports(yaml: &serde_yaml::Value) -> Vec<u64> {
+    let mut ports: Vec<u64> = Vec::new();
+    if let Some(modules) = yaml.get("modules").and_then(|m| m.as_sequence()) {
+        for module in modules {
+            let port = module
+                .get("port")
+                .or_else(|| module.get("params").and_then(|p| p.get("port")))
+                .and_then(serde_yaml::Value::as_u64);
+            if let Some(port) = port.filter(|p| (1..=65535).contains(p)) {
+                if !ports.contains(&port) {
+                    ports.push(port);
+                }
+            }
+        }
+    }
+    if ports.is_empty() {
+        ports.push(80);
+    }
+    ports
+}
+
+#[cfg(test)]
+mod qemu_port_tests {
+    use super::qemu_guest_ports;
+
+    fn ports(text: &str) -> Vec<u64> {
+        qemu_guest_ports(&serde_yaml::from_str(text).unwrap())
+    }
+
+    #[test]
+    fn a_listener_not_named_http_is_forwarded() {
+        assert_eq!(ports("modules:\n  - name: conn_sink\n    port: 9000\n"), vec![9000]);
+    }
+
+    #[test]
+    fn a_port_under_params_counts_and_repeats_collapse() {
+        let text = "modules:\n  - name: http\n    params:\n      port: 80\n  - name: tls\n    port: 443\n  - name: other\n    port: 80\n";
+        assert_eq!(ports(text), vec![80, 443]);
+    }
+
+    #[test]
+    fn a_graph_without_a_port_keeps_the_old_default() {
+        assert_eq!(ports("modules:\n  - name: debug\n"), vec![80]);
+    }
 }

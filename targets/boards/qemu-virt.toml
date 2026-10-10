@@ -8,9 +8,10 @@ description = "QEMU aarch64 virt machine"
 
 # The QEMU virt machine's memory map (a board/emulator fact, not silicon).
 [memory]
-# QEMU virt: RAM at 0x4000_0000, 2 GB
+# QEMU virt: RAM at 0x4000_0000, 1 GB — the machine `fluxor run` launches
+# (`-m 1G`), and what the kernel's identity map covers as memory.
 ram_base = "0x40000000"
-ram_size = "0x80000000"
+ram_size = "0x40000000"
 # No XIP flash — kernel loaded to RAM by bootloader
 flash_base = "0x00000000"
 flash_size = "0x00000000"
