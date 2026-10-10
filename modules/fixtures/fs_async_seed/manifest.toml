@@ -1,0 +1,24 @@
+name = "fs_async_seed"
+version = "1.0.0"
+hardware_targets = ["bcm2712"]
+
+# Writes `count` files through the fs contract's ASYNC fence tier —
+# OPEN_CREATE, WRITE, FSYNC_SUBMIT, FSYNC_POLL until Durable, CLOSE — the
+# tier a store's flush uses, and logs each name once its fence has landed.
+# A scenario cuts the power after `DONE`; a second boot with `verify = 1`
+# reads every file back and logs `verify ok=<n> bad=<m>`: every name logged
+# durable must be there, whole, with the last pass's bytes. The host suite
+# (fat32_async_fence_contract) proves this against a modelled write cache;
+# this asks the device the graph runs on.
+#
+# Params: 1 prefix (str, e.g. "/ASY" — names are <prefix><nnnn>.DAT, 8.3 on
+# FAT), 2 count (u32, default 8), 3 size (u32 bytes per file, default 4096),
+# 4 rounds (u32, default 1; passes past the first rewrite each file in
+# place), 5 verify (u32, default 0; 1 = read back and compare instead).
+
+[[resources]]
+requires_contract = "fs"
+access = "write"
+
+[observability]
+exempt = "self-contained fixture; its DONE/FAIL log lines are the verdict"

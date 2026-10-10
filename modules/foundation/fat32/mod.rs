@@ -860,6 +860,9 @@ struct Fat32State {
     /// Position of a directory walk that ran out of step budget, so the
     /// next call continues instead of starting over. See [`DirCursor`].
     dir_cursor: DirCursor,
+    /// Parked walks (see [`DIR_CURSOR_POOL`]): a walk that yielded `Pending`
+    /// is kept here so another name's lookup in between does not restart it.
+    dir_cursor_pool: [DirCursor; DIR_CURSOR_POOL],
 
     /// Chain heads queued by `FS_UNLINK` for lazy freeing, drained by
     /// `fs_step_free_chains` one FAT-sector batch per step. Each slot is
@@ -1014,6 +1017,7 @@ impl Fat32State {
         self.fs_settle_pending = 0;
         self.cache_defeated = 0;
         self.dir_cursor = DirCursor::empty();
+        self.dir_cursor_pool = [DirCursor::empty(); DIR_CURSOR_POOL];
         self.format = 0;
         self.sync_src = 0;
         self.sync_rc = 0;
@@ -3823,6 +3827,7 @@ unsafe fn fs_op_rmdir(s: &mut Fat32State, arg: *const u8, arg_len: usize) -> i32
 /// short entry with a half-cleared name in front of it, which a reader
 /// resolves as a corrupt name rather than an absent one.
 unsafe fn fs_dirent_retire(s: &mut Fat32State, loc: &DirentLoc) -> i32 {
+    fs_dir_changed(s, loc.parent);
     let rc = fs_read_blockbuf(s, loc.lba);
     if rc != 0 {
         return rc;
@@ -3844,6 +3849,7 @@ unsafe fn fs_lfn_retire(s: &mut Fat32State, loc: &DirentLoc) -> i32 {
     if loc.lfn_run == 0 || loc.lfn_lba == 0 {
         return 0;
     }
+    fs_dir_changed(s, loc.parent);
     let spc = u32::from(s.sectors_per_cluster);
     if spc == 0 {
         return 0;
@@ -4483,14 +4489,47 @@ enum DirScan {
 /// which the fs contract already defines as "ask again".
 const DIR_SCAN_BUDGET_SECTORS: u32 = 32;
 
+/// Parked walks the working cursor spills into when it yields `Pending`.
+///
+/// One working cursor, and this many parked ones. With a single cursor, two
+/// callers looking up different names in one directory larger than the
+/// budget restart each other on every call and neither ever finishes; a
+/// volume root that holds a store's runs and a log's segments is such a
+/// directory. A parked walk resumes where it stopped when the same arguments
+/// come back, whatever ran in between — unless the directory's names or
+/// free slots changed meanwhile ([`fs_dir_changed`]).
+const DIR_CURSOR_POOL: usize = 4;
+
+/// Drop every walk, working or parked, over `dir_cluster`.
+///
+/// A walk carries what it learned from the sectors behind it: where the
+/// free run it would claim starts, where the long-name companions in front
+/// of the current entry begin, and that the name was not among them. A
+/// change to that directory's names or free slots — an entry minted,
+/// retired or renamed, its companions written or retired — can make any of
+/// that false, and a walk resumed across it could answer "absent" for a
+/// name created behind it or hand a create a slot that is no longer free.
+/// So those writes drop the directory's walks, and the next call starts
+/// over. A size or first-cluster update to an existing entry changes
+/// neither, and does not.
+fn fs_dir_changed(s: &mut Fat32State, dir_cluster: u32) {
+    if s.dir_cursor.dir_cluster == dir_cluster {
+        s.dir_cursor.dir_cluster = 0;
+    }
+    let mut i = 0usize;
+    while i < DIR_CURSOR_POOL {
+        if s.dir_cursor_pool[i].dir_cluster == dir_cluster {
+            s.dir_cursor_pool[i].dir_cluster = 0;
+        }
+        i += 1;
+    }
+}
+
 /// Resumable position of a bounded directory walk.
 ///
-/// One cursor for the whole provider. Two concurrent walks looking for
-/// different names in different directories simply restart each other,
-/// which costs a rescan and never a wrong answer — the alternative, a
-/// cursor per open handle, buys throughput for a case (two callers racing
-/// to create in one large directory) that does not arise, at the cost of
-/// state in every FD.
+/// One working cursor for the whole provider, plus the parked ones above.
+/// A walk that is neither the working cursor nor parked starts over, which
+/// costs a rescan and never a wrong answer.
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct DirCursor {
@@ -4556,12 +4595,28 @@ impl DirCursor {
     }
 
     /// Does this cursor describe the walk the caller is asking for?
+    /// Whether this cursor is the walk for these arguments. The long name is
+    /// held upper-cased (FAT long names compare without case), so the
+    /// caller's is folded the same way before comparing: compared as given,
+    /// a name with a lowercase letter would never meet its own walk again,
+    /// and in a directory longer than one call's budget it would restart on
+    /// every call and never finish.
     fn matches(&self, dir_cluster: u32, want: &[u8; 11], need: u8, want_long: &[u8]) -> bool {
-        self.dir_cluster == dir_cluster
-            && self.need == need
-            && name_eq(&self.want, want)
-            && usize::from(self.want_long_len) == want_long.len()
-            && self.want_long[..want_long.len()] == *want_long
+        if self.dir_cluster != dir_cluster
+            || self.need != need
+            || !name_eq(&self.want, want)
+            || usize::from(self.want_long_len) != want_long.len()
+        {
+            return false;
+        }
+        let mut i = 0usize;
+        while i < want_long.len() {
+            if self.want_long[i] != to_upper(want_long[i]) {
+                return false;
+            }
+            i += 1;
+        }
+        true
     }
 }
 
@@ -4626,6 +4681,23 @@ unsafe fn fs_dir_walk_long(
     }
     let spc = u32::from(s.sectors_per_cluster);
     let need = need.max(1);
+    // A parked walk for these arguments resumes, and its slot is freed
+    // either way: when the working cursor is still this walk (nothing ran
+    // in between) the parked copy is stale, and a stale copy kept would fill
+    // the pool with walks that already finished.
+    let mut i = 0usize;
+    while i < DIR_CURSOR_POOL {
+        if s.dir_cursor_pool[i].dir_cluster != 0
+            && s.dir_cursor_pool[i].matches(dir_cluster, want, need, want_long)
+        {
+            if !s.dir_cursor.matches(dir_cluster, want, need, want_long) {
+                s.dir_cursor = s.dir_cursor_pool[i];
+            }
+            s.dir_cursor_pool[i].dir_cluster = 0;
+            break;
+        }
+        i += 1;
+    }
     if !s.dir_cursor.matches(dir_cluster, want, need, want_long) {
         let mut c = DirCursor {
             dir_cluster,
@@ -4665,6 +4737,19 @@ unsafe fn fs_dir_walk_long(
             s.dir_cursor.sector = 0;
         }
         if budget == 0 {
+            // Park the walk in a free slot. With none free it is NOT parked
+            // and restarts when asked again: evicting a parked walk instead
+            // lets more walkers than slots evict each other every round and
+            // none ever finishes, while the parked ones here finish, free
+            // their slots, and the rest take them.
+            let mut i = 0usize;
+            while i < DIR_CURSOR_POOL {
+                if s.dir_cursor_pool[i].dir_cluster == 0 {
+                    s.dir_cursor_pool[i] = s.dir_cursor;
+                    break;
+                }
+                i += 1;
+            }
             return DirScan::Pending;
         }
         budget -= 1;
@@ -4890,10 +4975,9 @@ fn fs_dir_free_result(s: &Fat32State) -> Option<DirentLoc> {
 /// first slot in it.
 ///
 /// A FAT32 directory is an ordinary cluster chain; nothing in the format
-/// caps its length. Refusing when the last cluster fills — which is what
-/// this provider did — turns a directory that has accumulated enough names
-/// into a hard wall that no amount of deleting elsewhere on the volume
-/// relieves.
+/// caps its length. Refusing when the last cluster fills would turn a
+/// directory that has accumulated enough names into a hard wall that no
+/// amount of deleting elsewhere on the volume relieves.
 ///
 /// The new cluster is zero-filled BEFORE it is linked. Zero bytes are the
 /// end-of-directory marker, so a reader that reaches the new cluster over a
@@ -5491,6 +5575,7 @@ unsafe fn fs_dirent_mint(
     // record of "where this file's entry lives" is the slot computed here,
     // not the one it asked from.
     *short_loc = *loc;
+    fs_dir_changed(s, loc.parent);
     let companions = name.lfn_entries();
     if companions > 0 {
         // The companion set comes first, because it is stored in front of
@@ -5577,6 +5662,7 @@ unsafe fn fs_dirent_advance(
 /// stops a stale run being read as naming whatever entry later occupies the
 /// slot after it.
 unsafe fn fs_lfn_write(s: &mut Fat32State, loc: &DirentLoc, name: &PathName, count: u8) -> i32 {
+    fs_dir_changed(s, loc.parent);
     let sum = fs_lfn_checksum(&name.short);
     let n = usize::from(name.long_len);
     let mut lba = loc.lba;
@@ -6604,6 +6690,8 @@ unsafe fn fs_op_rename(s: &mut Fat32State, arg: *const u8, arg_len: usize) -> i3
         n += 1;
     }
 
+    fs_dir_changed(s, src.parent);
+    fs_dir_changed(s, dst.parent);
     if src.lba == dst.lba {
         // Both entries live in the one sector, so publication and
         // retirement are a single failure-atomic write. No intent record
@@ -6755,6 +6843,9 @@ unsafe fn fs_rename_recover(s: &mut Fat32State) {
         Some(l) => l,
         None => return,
     };
+    // The intent record names sectors, not directories: drop every walk.
+    s.dir_cursor.dir_cluster = 0;
+    s.dir_cursor_pool = [DirCursor::empty(); DIR_CURSOR_POOL];
     let mut rec = [0u8; BLOCK_SIZE];
     if fs_sync_read_sector(s, intent_lba, rec.as_mut_ptr()) != 0 {
         return;
