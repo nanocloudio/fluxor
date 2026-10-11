@@ -8,13 +8,13 @@
 //!
 //! ```yaml
 //! wiring:
-//!   - from: http_client.body     # or whatever feeds the bundle bytes
-//!     to:   ota_ingest.in
+//!   - from: stream_intake.bytes  # or whatever feeds the bundle bytes
+//!     to:   ota_ingest.stream
 //!   - from: ota_ingest.status    # optional status records
 //!     to:   log.in
 //!   - from: ota_ingest.gs_req    # (out port 1) OTA → graph_slot requests
-//!     to:   graph_slot.in
-//!   - from: graph_slot.out       # graph_slot responses
+//!     to:   graph_slot.requests
+//!   - from: graph_slot.results   # graph_slot responses
 //!     to:   ota_ingest.gs_resp   # (in port 1)
 //! ```
 //!
@@ -152,6 +152,7 @@ unsafe fn read_u32_le(p: *const u8) -> u32 {
 }
 
 unsafe fn emit_status(s: &State, sys: &SyscallTable, kind: u8, rc: i32) {
+    log_status(sys, kind, rc);
     if s.status_chan < 0 {
         return;
     }
@@ -163,6 +164,44 @@ unsafe fn emit_status(s: &State, sys: &SyscallTable, kind: u8, rc: i32) {
     core::ptr::write_volatile(p.add(2), rb[0]);
     core::ptr::write_volatile(p.add(3), rb[1]);
     let _ = (sys.channel_write)(s.status_chan, rec.as_ptr(), STATUS_RECORD_SIZE);
+}
+
+/// Say a status record in the log as well, so a board with nothing wired to
+/// `status` still shows how far an image got.
+unsafe fn log_status(sys: &SyscallTable, kind: u8, rc: i32) {
+    let text: &[u8] = match kind {
+        STATUS_ERASED => b"[ota] erased",
+        STATUS_WRITTEN => b"[ota] written kib=",
+        STATUS_ACTIVATED => b"[ota] activated",
+        _ => b"[ota] failed rc=-",
+    };
+    let mut line = [0u8; 40];
+    let mut len = 0usize;
+    let mut i = 0usize;
+    while i < text.len() && len < line.len() {
+        line[len] = text[i];
+        len += 1;
+        i += 1;
+    }
+    if kind == STATUS_WRITTEN || kind == STATUS_FAILED {
+        let mut v = rc.unsigned_abs();
+        let mut digits = [0u8; 10];
+        let mut n = 0usize;
+        loop {
+            digits[n] = b'0' + (v % 10) as u8;
+            n += 1;
+            v /= 10;
+            if v == 0 || n == digits.len() {
+                break;
+            }
+        }
+        while n > 0 && len < line.len() {
+            n -= 1;
+            line[len] = digits[n];
+            len += 1;
+        }
+    }
+    dev_log(sys, 3, line.as_ptr(), len);
 }
 
 unsafe fn send_bare_request(s: &State, sys: &SyscallTable, req_type: u32) -> bool {

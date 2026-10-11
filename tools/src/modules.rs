@@ -1682,9 +1682,12 @@ fn validate_param_schema(data: &[u8], start: usize) -> Option<usize> {
         if pos + 6 > data.len() {
             return None;
         }
-        let ptype = data[pos + 1];
-        // ParamType ids: 0=u8, 1=u16, 2=u32, 3=str, 4=u16_array, 5=blob.
-        if ptype > 5 {
+        // ParamType ids (`schema::ParamType`): 0=u8, 1=u16, 2=u32, 3=str,
+        // 4=u16_array, 5=blob, 6=str_chunked. This copy once stopped at
+        // `blob`, so a module with a `str_chunked` param lost its whole
+        // schema on wasm and every param it took packed empty; the test
+        // below holds the two together.
+        if data[pos + 1] > 6 {
             return None;
         }
         pos += 6;
@@ -1732,6 +1735,24 @@ fn validate_param_schema(data: &[u8], start: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A wasm module whose schema has a `str_chunked` param keeps its
+    /// schema: the scanner knows every type id the schema table does.
+    #[test]
+    fn wasm_schema_with_a_chunked_string_is_found() {
+        let mut blob = vec![0u8, 1, 2, 3];
+        let start = blob.len();
+        blob.extend_from_slice(&[0x53, 0x50, 0x01, 2]);
+        for (tag, ptype, name) in [(2u8, 3u8, &b"namespace"[..]), (4, 6, &b"capability"[..])] {
+            blob.extend_from_slice(&[tag, ptype, 0, 0, 0, 0, name.len() as u8]);
+            blob.extend_from_slice(name);
+            blob.push(0);
+        }
+        let end = blob.len();
+        blob.extend_from_slice(&[9, 9, 9]);
+        let found = find_param_schema_in_wasm(&blob).expect("the schema is found");
+        assert_eq!(found, blob[start..end].to_vec());
+    }
 
     /// Two module entries of one type naming different variants is a
     /// hard config error — the image carries

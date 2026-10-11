@@ -2,3 +2,17 @@ version = "1.0.0"
 hardware_targets = ["rp2350", "rp2040"]
 
 permissions = ["flash_raw"]
+
+# Channel-served: FMP-framed requests in, `gs.result` answers out
+# (`contracts/storage/graph_slot.rs`). Its consumers are `ota_ingest` and
+# `reconfigure`.
+[[ports]]
+name = "requests"
+direction = "input"
+content_type = "FmpMessage"
+required = true
+
+[[ports]]
+name = "results"
+direction = "output"
+content_type = "FmpMessage"

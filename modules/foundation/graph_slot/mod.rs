@@ -155,6 +155,18 @@ struct State {
     activated: u8,
     /// The pending slot's header page, programmed by ACTIVATE.
     header: [u8; PAGE_SIZE],
+    /// An ERASE in progress: the next sector's flash offset and the end of
+    /// the slot. `erase_end == 0` when none is.
+    erase_next: u32,
+    erase_end: u32,
+    /// An ACTIVATE in progress: which range is being hashed (`ACT_*`), the
+    /// slot, where the next window starts in it, how much of the range is
+    /// left, and the digest so far.
+    act_phase: u8,
+    act_slot: u8,
+    act_cursor: u32,
+    act_remaining: u32,
+    act_hasher: Sha256,
 }
 
 // ============================================================================
@@ -268,9 +280,30 @@ fn inactive_slot(live: u8) -> u8 {
     }
 }
 
+/// Where this module's code is executing. Read from the program counter: a
+/// function pointer taken in position-independent code is its link-time
+/// offset, not where the loader placed it, so it never falls in a slot.
+#[inline(never)]
+fn own_code_address() -> u32 {
+    #[cfg(target_arch = "arm")]
+    {
+        let pc: u32;
+        // SAFETY: reads the program counter into a register; no memory,
+        // stack or flags are touched.
+        unsafe {
+            core::arch::asm!("mov {0}, pc", out(reg) pc, options(nomem, nostack, preserves_flags))
+        };
+        pc
+    }
+    #[cfg(not(target_arch = "arm"))]
+    {
+        module_step as usize as u32
+    }
+}
+
 /// The slot whose aperture holds this module's code, if any.
 fn slot_of_own_code() -> u8 {
-    let at = module_step as usize as u32;
+    let at = own_code_address();
     let in_slot = |offset: u32| {
         let base = XIP_BASE + offset;
         at >= base && at < base + SLOT_SIZE
@@ -333,20 +366,65 @@ unsafe fn sys_program_page(sys: &SyscallTable, offset: u32, page: *const u8) -> 
 // result that gets echoed back on the response channel.
 // ============================================================================
 
-unsafe fn do_erase(s: &mut State, sys: &SyscallTable) -> i32 {
+/// ERASE taken and under way; answered when the last sector is done.
+const ERASE_UNDER_WAY: i32 = 1;
+/// Blank sectors checked per step before one that needs erasing. Reading a
+/// sector back through XIP costs a few hundred microseconds uncached, so a
+/// step reads two at most.
+const BLANK_CHECKS_PER_STEP: u32 = 2;
+
+/// Start erasing the pending slot. A whole slot is 128 sectors, and a sector
+/// that holds data takes the flash tens of milliseconds -- with the chip
+/// stalled, since XIP is detached -- so the slot is erased a sector a step
+/// (`erase_step`), and the ERASE is answered once it is all blank.
+unsafe fn do_erase(s: &mut State, _sys: &SyscallTable) -> i32 {
     s.header_held = 0;
     s.activated = 0xFF;
     let target = slot_offset(pending_slot(s));
-    let mut off = target;
-    let end = target + SLOT_SIZE;
-    while off < end {
-        let rc = sys_erase_sector(sys, off);
-        if rc < 0 {
-            return rc;
+    s.erase_next = target;
+    s.erase_end = target + SLOT_SIZE;
+    ERASE_UNDER_WAY
+}
+
+/// Whether the sector at flash offset `off` already reads as erased.
+unsafe fn sector_blank(off: u32) -> bool {
+    let base = (XIP_BASE + off) as *const u32;
+    let mut i = 0usize;
+    while i < SECTOR_SIZE as usize / 4 {
+        if core::ptr::read_volatile(base.add(i)) != u32::MAX {
+            return false;
         }
-        off += SECTOR_SIZE;
+        i += 1;
     }
-    0
+    true
+}
+
+/// One step of an erase under way: skip sectors already blank, erase at most
+/// one that is not, and answer the ERASE when the slot is done. Answers
+/// whether the erase is still under way.
+unsafe fn erase_step(s: &mut State, sys: &SyscallTable) -> bool {
+    let mut checked = 0;
+    while s.erase_next < s.erase_end && checked < BLANK_CHECKS_PER_STEP {
+        let off = s.erase_next;
+        if !sector_blank(off) {
+            let rc = sys_erase_sector(sys, off);
+            if rc < 0 {
+                s.erase_end = 0;
+                emit_response(s, sys, REQ_ERASE, rc);
+                return false;
+            }
+            s.erase_next += SECTOR_SIZE;
+            return true;
+        }
+        s.erase_next += SECTOR_SIZE;
+        checked += 1;
+    }
+    if s.erase_next < s.erase_end {
+        return true;
+    }
+    s.erase_end = 0;
+    emit_response(s, sys, REQ_ERASE, 0);
+    false
 }
 
 unsafe fn do_write(
@@ -398,7 +476,7 @@ unsafe fn slot_pin_admits(base_xip: *const u8, own: &[u8; 32]) -> bool {
     ct_eq32(&pin, own)
 }
 
-unsafe fn do_activate(s: &mut State, sys: &SyscallTable) -> i32 {
+unsafe fn do_activate(s: &mut State, _sys: &SyscallTable) -> i32 {
     if s.header_held == 0 {
         // Nothing pending: a repeat of an ACTIVATE that already succeeded
         // (`ota_ingest` and then `reconfigure` both send one) answers as it
@@ -412,7 +490,6 @@ unsafe fn do_activate(s: &mut State, sys: &SyscallTable) -> i32 {
         };
     }
     let candidate = pending_slot(s);
-    let base_xip = (XIP_BASE + slot_offset(candidate)) as *const u8;
     let header = s.header.as_ptr();
     let hdr = match decode_header(header) {
         Some(h) => h,
@@ -435,13 +512,63 @@ unsafe fn do_activate(s: &mut State, sys: &SyscallTable) -> i32 {
         return E_INVAL;
     }
 
-    let mut hasher = Sha256::new();
-    hash_xip_range(&mut hasher, base_xip, hdr.modules_offset, hdr.modules_size);
-    hash_xip_range(&mut hasher, base_xip, hdr.config_offset, hdr.config_size);
-    let out = hasher.finalize();
+    // The digest is over up to a whole slot, read back through XIP: far
+    // more than one step, so it is taken a window a step (`activate_step`)
+    // and the ACTIVATE is answered once it is done.
+    s.act_hasher = Sha256::new();
+    s.act_slot = candidate;
+    s.act_phase = ACT_MODULES;
+    s.act_cursor = hdr.modules_offset;
+    s.act_remaining = hdr.modules_size;
+    ACTIVATE_UNDER_WAY
+}
+
+/// ACTIVATE taken and its digest under way; answered when it is decided.
+const ACTIVATE_UNDER_WAY: i32 = 1;
+const ACT_IDLE: u8 = 0;
+const ACT_MODULES: u8 = 1;
+const ACT_CONFIG: u8 = 2;
+/// Bytes of the slot hashed per step.
+const ACT_WINDOW: u32 = 4096;
+
+/// One step of an ACTIVATE under way: hash the next window, and once the
+/// whole image is hashed, decide. Answers whether it is still under way.
+unsafe fn activate_step(s: &mut State, sys: &SyscallTable) -> bool {
+    let base_xip = (XIP_BASE + slot_offset(s.act_slot)) as *const u8;
+    if s.act_remaining > 0 {
+        let n = core::cmp::min(s.act_remaining, ACT_WINDOW);
+        let mut hasher = s.act_hasher.clone();
+        hash_xip_range(&mut hasher, base_xip, s.act_cursor, n);
+        s.act_hasher = hasher;
+        s.act_cursor += n;
+        s.act_remaining -= n;
+        return true;
+    }
+    let Some(hdr) = decode_header(s.header.as_ptr()) else {
+        s.act_phase = ACT_IDLE;
+        emit_response(s, sys, REQ_ACTIVATE, E_IO);
+        return false;
+    };
+    if s.act_phase == ACT_MODULES {
+        s.act_phase = ACT_CONFIG;
+        s.act_cursor = hdr.config_offset;
+        s.act_remaining = hdr.config_size;
+        return true;
+    }
+    s.act_phase = ACT_IDLE;
+    let rc = activate_finish(s, sys, &hdr);
+    emit_response(s, sys, REQ_ACTIVATE, rc);
+    false
+}
+
+/// The image is hashed: compare, and program the header if it matches.
+unsafe fn activate_finish(s: &mut State, sys: &SyscallTable, hdr: &HeaderFields) -> i32 {
+    let out = s.act_hasher.clone().finalize();
     if !ct_eq32(&out, &hdr.sha256) {
         return E_IO;
     }
+    let candidate = s.act_slot;
+    let header = s.header.as_ptr();
 
     let rc = sys_program_page(sys, slot_offset(candidate), header);
     if rc < 0 {
@@ -453,7 +580,68 @@ unsafe fn do_activate(s: &mut State, sys: &SyscallTable) -> i32 {
         return E_IO;
     }
     s.activated = candidate;
+    let mut line = Line::new();
+    line.put(b"[graph_slot] activated slot=");
+    line.slot(candidate);
+    line.put(b" epoch=");
+    line.num(hdr.epoch);
+    line.emit(sys);
     0
+}
+
+/// One log line, built without formatting machinery: a loaded module links
+/// none.
+struct Line {
+    buf: [u8; 64],
+    len: usize,
+}
+
+impl Line {
+    fn new() -> Self {
+        Self {
+            buf: [0; 64],
+            len: 0,
+        }
+    }
+
+    fn put(&mut self, bytes: &[u8]) {
+        let mut i = 0;
+        while i < bytes.len() && self.len < self.buf.len() {
+            self.buf[self.len] = bytes[i];
+            self.len += 1;
+            i += 1;
+        }
+    }
+
+    fn num(&mut self, mut v: u64) {
+        let mut digits = [0u8; 20];
+        let mut n = 0;
+        loop {
+            digits[n] = b'0' + (v % 10) as u8;
+            n += 1;
+            v /= 10;
+            if v == 0 || n == digits.len() {
+                break;
+            }
+        }
+        while n > 0 {
+            n -= 1;
+            self.put(&[digits[n]]);
+        }
+    }
+
+    /// A slot index as the boot selector names it, or `none`.
+    fn slot(&mut self, slot: u8) {
+        match slot {
+            0 => self.put(b"A"),
+            1 => self.put(b"B"),
+            _ => self.put(b"none"),
+        }
+    }
+
+    unsafe fn emit(&self, sys: &SyscallTable) {
+        dev_log(sys, 3, self.buf.as_ptr(), self.len);
+    }
 }
 
 unsafe fn query_active(s: &mut State) -> i32 {
@@ -543,6 +731,14 @@ unsafe fn pump_requests(s: &mut State, sys: &SyscallTable) -> i32 {
     if s.in_chan < 0 {
         return CONTINUE;
     }
+    // No request is taken while an erase is under way: the next one is
+    // about the slot being erased.
+    if s.erase_end != 0 && erase_step(s, sys) {
+        return CONTINUE;
+    }
+    if s.act_phase != ACT_IDLE && activate_step(s, sys) {
+        return CONTINUE;
+    }
 
     // Best-effort fill of the request buffer.
     let room = REQ_FRAME_MAX - s.frame_fill as usize;
@@ -580,7 +776,11 @@ unsafe fn pump_requests(s: &mut State, sys: &SyscallTable) -> i32 {
             REQ_CFG => query_cfg(s),
             _ => E_INVAL,
         };
-        emit_response(s, sys, ty, rc);
+        let under_way = (ty == REQ_ERASE && rc == ERASE_UNDER_WAY)
+            || (ty == REQ_ACTIVATE && rc == ACTIVATE_UNDER_WAY);
+        if !under_way {
+            emit_response(s, sys, ty, rc);
+        }
 
         // Shift tail down to reclaim the consumed frame.
         let leftover = s.frame_fill as usize - total;
@@ -592,6 +792,9 @@ unsafe fn pump_requests(s: &mut State, sys: &SyscallTable) -> i32 {
             );
         }
         s.frame_fill = leftover as u16;
+        if under_way {
+            return CONTINUE;
+        }
     }
 }
 
@@ -645,6 +848,13 @@ pub extern "C" fn module_new(
         s.running_slot = slot_of_own_code();
         s.header_held = 0;
         s.activated = 0xFF;
+        s.erase_next = 0;
+        s.erase_end = 0;
+        s.act_phase = ACT_IDLE;
+        s.act_slot = 0;
+        s.act_cursor = 0;
+        s.act_remaining = 0;
+        core::ptr::write(&mut s.act_hasher, Sha256::new());
         refresh_live(s);
         0
     }
@@ -665,6 +875,16 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
         if s.signaled_ready == 0 {
             s.signaled_ready = 1;
+            // Which slot this graph runs from, and which the next boot
+            // selects: the two an OTA moves apart and a reset brings
+            // together again.
+            refresh_live(s);
+            let mut line = Line::new();
+            line.put(b"[graph_slot] running=");
+            line.slot(s.running_slot);
+            line.put(b" next=");
+            line.slot(s.live_slot);
+            line.emit(sys);
             return READY;
         }
         pump_requests(s, sys)

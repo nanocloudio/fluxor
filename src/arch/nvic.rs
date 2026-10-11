@@ -14,6 +14,8 @@
 pub const NVIC_ISER: usize = 0xE000_E100;
 /// Interrupt Clear-Enable Registers.
 pub const NVIC_ICER: usize = 0xE000_E180;
+/// Interrupt Clear-Pending Registers (write-1-to-clear).
+pub const NVIC_ICPR: usize = 0xE000_E280;
 
 /// Split an IRQ number into `(register index, bit mask)` for an NVIC with
 /// `registers` architected ISER/ICER pairs, or `None` when the number is

@@ -55,6 +55,32 @@ mod guard {
         step_guard::set_armed(false);
     }
 
+    /// Move a live deadline `us` later. For time the kernel spent with
+    /// interrupts off on the stepping module's behalf -- a flash erase holds
+    /// XIP detached for tens of milliseconds -- which is not the module's
+    /// code running away. An alarm that came due meanwhile is withdrawn,
+    /// both at the timer and at the NVIC, so it is not taken as a timeout
+    /// once interrupts are back. Called with interrupts disabled.
+    pub fn defer(us: u32) {
+        if !step_guard::is_armed() {
+            return;
+        }
+        alarm::set_enabled(IDX, false);
+        alarm::ack(IDX);
+        crate::arch::cortex_m::nvic_unpend(crate::platform::chip::TIMER_IRQ_STEP_GUARD);
+        let target = alarm::target(IDX).wrapping_add(us);
+        // A target the counter has already passed would never fire: the
+        // remaining budget is at least a microsecond.
+        let now = alarm::now_raw_lo();
+        let target = if target.wrapping_sub(now) > i32::MAX as u32 {
+            now.wrapping_add(1)
+        } else {
+            target
+        };
+        alarm::set_target(IDX, target);
+        alarm::set_enabled(IDX, true);
+    }
+
     pub fn on_timer_irq() {
         alarm::ack(IDX);
         alarm::set_enabled(IDX, false);
@@ -87,6 +113,11 @@ pub fn rp_step_guard_arm(deadline_us: u32) {
 
 pub fn rp_step_guard_disarm() {
     guard::disarm();
+}
+
+/// Move the live step deadline `us` later; see `guard::defer`.
+pub fn rp_step_guard_defer(us: u32) {
+    guard::defer(us);
 }
 
 // ── ISR vector entry points ───────────────────────────────────────────

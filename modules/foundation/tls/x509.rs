@@ -130,16 +130,29 @@ pub mod suite {
     /// Highest suite id this registry defines.
     pub const MAX_ID: u16 = RSA_PSS;
 
+    /// Whether an Ed25519 signature is verified on this target.
+    ///
+    /// An Ed25519 verification is done whole — two scalar multiplications
+    /// in one call — where the ECDSA and RSA verifications are stepped
+    /// across the pump. On the Cortex-M target that whole call does not fit
+    /// a step, so that build neither offers `ed25519` nor accepts an
+    /// Ed25519-signed chain link or CertificateVerify: both are refused as
+    /// unsupported, as any suite this build does not verify is.
+    pub const ED25519_VERIFIED: bool = !cfg!(target_arch = "arm");
+
     /// Whether this build can actually verify a signature in `suite`.
     ///
-    /// Both ECDSA curves, the three ML-DSA parameter sets and the RSA
-    /// suites. Ed25519 and RSA-PSS are named but not verified here: the
-    /// ids exist so sizes, policies and error reporting are suite-shaped
-    /// ahead of the primitives, and `verify_chain` refuses anything this
-    /// returns false for rather than treating an unrecognised algorithm
-    /// as an unchecked one.
+    /// Both ECDSA curves, Ed25519 where [`ED25519_VERIFIED`], the three
+    /// ML-DSA parameter sets and the RSA suites. RSA-PSS is named but not
+    /// verified here: the ids exist so sizes, policies and error reporting
+    /// are suite-shaped ahead of the primitives, and `verify_chain` refuses
+    /// anything this returns false for rather than treating an unrecognised
+    /// algorithm as an unchecked one.
     #[must_use]
     pub const fn is_implemented(suite: u16) -> bool {
+        if suite == ED25519 {
+            return ED25519_VERIFIED;
+        }
         matches!(
             suite,
             ECDSA_P256_SHA256
@@ -661,6 +674,9 @@ pub fn parse_certificate(cert: &[u8]) -> Option<X509Cert<'_>> {
     }
     let (_sa_start, _sa_len, sa_total) = der_tlv(cert, sig_alg_pos)?;
     let sig_alg = extract_oid(cert, sig_alg_pos)?;
+    if !alg_id_params_admitted(cert, sig_alg_pos, sig_alg) {
+        return None;
+    }
     let sig_suite = suite_from_signature_oid(sig_alg);
 
     // Parse signatureValue (BIT STRING)
@@ -755,6 +771,9 @@ fn parse_tbs(cert: &[u8], start: usize, len: usize) -> Option<Tbs<'_>> {
         return None;
     }
     let inner_sig_alg = extract_oid(cert, pos)?;
+    if !alg_id_params_admitted(cert, pos, inner_sig_alg) {
+        return None;
+    }
     let (_, _, total) = der_tlv(cert, pos)?;
     pos += total;
     // issuer Name
@@ -951,6 +970,32 @@ fn extract_oid(data: &[u8], seq_pos: usize) -> Option<&[u8]> {
         pos += tlv_total;
     }
     None
+}
+
+/// Whether the signature AlgorithmIdentifier at `seq_pos`, naming `oid`,
+/// carries the parameters its algorithm admits. ECDSA (RFC 5758 §3.2),
+/// Ed25519 (RFC 8410 §3) and ML-DSA take none: for them the SEQUENCE must
+/// hold the OID alone, as the subject key's AlgorithmIdentifier already
+/// must. Any other algorithm is not judged here — the PKCS#1 v1.5 ones
+/// carry their NULL, and one this build does not verify still parses, so
+/// that the refusal names it rather than calling the certificate malformed.
+fn alg_id_params_admitted(data: &[u8], seq_pos: usize, oid: &[u8]) -> bool {
+    let takes_none = oid == OID_ECDSA_SHA256
+        || oid == OID_ECDSA_SHA384
+        || oid == OID_ED25519
+        || oid == OID_ML_DSA_44
+        || oid == OID_ML_DSA_65
+        || oid == OID_ML_DSA_87;
+    if !takes_none {
+        return true;
+    }
+    let Some((seq_start, seq_len, _)) = der_tlv(data, seq_pos) else {
+        return false;
+    };
+    match der_tlv(data, seq_start) {
+        Some((_, _, oid_total)) => oid_total == seq_len,
+        None => false,
+    }
 }
 
 /// Extract the EC public key bytes from SubjectPublicKeyInfo.
@@ -1600,6 +1645,9 @@ pub fn key_is_valid(suite: u16, key: &[u8]) -> bool {
             Some(k) => rsa_key_suite_for_bits(rsa_public_key_bits(&k)) == suite,
             None => false,
         },
+        // An Ed25519 key is a point encoding; whether it decodes, and to a
+        // point of prime order, is what `ed25519_verify` checks strictly.
+        suite::ED25519 => key.len() == suite::max_public_key_len(suite::ED25519),
         suite::ML_DSA_44 | suite::ML_DSA_65 | suite::ML_DSA_87 => {
             // A lattice public key has no structure to check beyond its
             // length: every byte string of the right size decodes, and
@@ -1640,6 +1688,7 @@ pub fn verify_cert_signature(
         suite::ECDSA_P256_SHA256 => verify_ecdsa_p256(&cert, issuer_pubkey),
         suite::ECDSA_P384_SHA384 => verify_ecdsa_p384(&cert, issuer_pubkey),
         suite::RSA_PKCS1_SHA256 | suite::RSA_PKCS1_SHA384 => verify_rsa(&cert, issuer_pubkey),
+        suite::ED25519 => verify_ed25519(&cert, issuer_pubkey),
         suite::ML_DSA_44 | suite::ML_DSA_65 | suite::ML_DSA_87 => {
             verify_ml_dsa(&cert, issuer_pubkey)
         }
@@ -1691,6 +1740,26 @@ fn verify_rsa(cert: &X509Cert<'_>, issuer_pubkey: &[u8]) -> bool {
         let tbs_hash = sha384(cert.tbs_raw);
         rsa_pkcs1_v15_verify(&mut job, &key, RsaHash::Sha384, &tbs_hash, cert.signature)
     }
+}
+
+#[inline(never)]
+fn verify_ed25519(cert: &X509Cert<'_>, issuer_pubkey: &[u8]) -> bool {
+    // RFC 8410: id-Ed25519 names the algorithm with no parameters, and the
+    // signature is the BIT STRING contents — R ‖ S, 64 bytes — over the
+    // tbsCertificate bytes themselves. Pure Ed25519 hashes inside the
+    // algorithm, so there is no digest step here. One verification of two
+    // scalar multiplications, done whole like ML-DSA's: it is not a job
+    // worth stepping.
+    if cert.sig_alg != OID_ED25519 {
+        return false;
+    }
+    let (Ok(key), Ok(signature)) = (
+        <&[u8; 32]>::try_from(issuer_pubkey),
+        <&[u8; 64]>::try_from(cert.signature),
+    ) else {
+        return false;
+    };
+    ed25519_verify(key, cert.tbs_raw, signature)
 }
 
 #[inline(never)]

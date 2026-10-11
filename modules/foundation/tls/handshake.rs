@@ -76,8 +76,26 @@ const SIG_RSA_PSS_RSAE_SHA384: u16 = 0x0805;
 /// a CertificateVerify.
 const SIG_RSA_PKCS1_SHA256: u16 = 0x0401;
 const SIG_RSA_PKCS1_SHA384: u16 = 0x0501;
+/// ed25519 (RFC 8446 §4.2.3): signs the CertificateVerify content itself,
+/// not a digest of it, so it is verified where the content is built rather
+/// than by the stepped pump — whole, and therefore only where that fits a
+/// step (`suite::ED25519_VERIFIED`).
+pub const SIG_ED25519: u16 = 0x0807;
 
 /// The schemes this build offers, in preference order.
+#[cfg(not(target_arch = "arm"))]
+const OFFERED_SIGNATURE_SCHEMES: [u16; 7] = [
+    SIG_ECDSA_SECP256R1_SHA256,
+    SIG_ECDSA_SECP384R1_SHA384,
+    SIG_ED25519,
+    SIG_RSA_PSS_RSAE_SHA256,
+    SIG_RSA_PSS_RSAE_SHA384,
+    SIG_RSA_PKCS1_SHA256,
+    SIG_RSA_PKCS1_SHA384,
+];
+/// The Cortex-M build does not verify Ed25519 (`suite::ED25519_VERIFIED`),
+/// so it does not offer it.
+#[cfg(target_arch = "arm")]
 const OFFERED_SIGNATURE_SCHEMES: [u16; 6] = [
     SIG_ECDSA_SECP256R1_SHA256,
     SIG_ECDSA_SECP384R1_SHA384,
@@ -113,6 +131,7 @@ pub fn scheme_for_peer_key(key_suite: u16, scheme: u16) -> Option<u16> {
     match key_suite {
         suite::ECDSA_P256_SHA256 if scheme == SIG_ECDSA_SECP256R1_SHA256 => Some(scheme),
         suite::ECDSA_P384_SHA384 if scheme == SIG_ECDSA_SECP384R1_SHA384 => Some(scheme),
+        suite::ED25519 if scheme == SIG_ED25519 && suite::ED25519_VERIFIED => Some(scheme),
         suite::RSA_2048 | suite::RSA_3072 | suite::RSA_4096
             if scheme == SIG_RSA_PSS_RSAE_SHA256 || scheme == SIG_RSA_PSS_RSAE_SHA384 =>
         {

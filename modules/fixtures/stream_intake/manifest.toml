@@ -1,0 +1,42 @@
+version = "1.0.0"
+hardware_targets = ["rp2350", "bcm2712", "linux"]
+# Forwards bytes as they arrive; no tick-based timing.
+timer_class = "agnostic"
+
+# Fixture source for the on-board OTA scenario: binds one port, accepts one
+# connection at a time, and writes what arrives on it to `bytes`, holding a
+# frame the consumer has no room for so the transport's window closes rather
+# than a byte being lost. `ota_ingest` reads the image from `bytes`.
+#
+#   [intake] bound port=<p>
+#   [intake] open
+#   [intake] closed bytes=<n>
+#
+# are what a rig reads.
+
+[[ports]]
+name = "net_in"
+direction = "input"
+content_type = "NetProto"
+required = true
+
+[[ports]]
+name = "net_out"
+direction = "output"
+content_type = "NetProto"
+required = true
+
+[[ports]]
+name = "bytes"
+index = 1
+direction = "output"
+content_type = "OctetStream"
+required = true
+
+[[resources]]
+requires_contract = "channel"
+access = "read"
+
+# Module-scope observability — exempt (standards/observability.md §6).
+[observability]
+exempt = "OTA fixture; its `[intake]` lines carry the byte count, and the transport (ip) and the consumer (ota_ingest) are the instrumented surfaces"

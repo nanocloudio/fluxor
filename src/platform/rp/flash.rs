@@ -511,7 +511,13 @@ pub mod store {
                 // than presenting as a hang.
                 return Err(());
             }
+            // The op stalls the whole chip, so its time is the kernel's,
+            // not the stepping module's: the step guard's deadline moves
+            // past it rather than firing the moment interrupts return.
+            let started = crate::platform::rp_timer::alarm::now_raw_lo();
             op();
+            let took = crate::platform::rp_timer::alarm::now_raw_lo().wrapping_sub(started);
+            crate::platform::rp_step_guard::rp_step_guard_defer(took);
             Ok(())
         })
     }

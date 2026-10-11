@@ -186,6 +186,18 @@ pub fn nvic_unmask(irq: u16) -> bool {
     true
 }
 
+/// Clear one external interrupt's pending state. Returns `false` if `irq` is
+/// outside the NVIC window, having written nothing.
+#[inline]
+pub fn nvic_unpend(irq: u16) -> bool {
+    let Some((reg, bit)) = nvic::slot(irq, NVIC_REGISTERS) else {
+        return false;
+    };
+    // SAFETY: as `nvic_unmask`; ICPR is write-1-to-clear.
+    unsafe { core::ptr::write_volatile((nvic::NVIC_ICPR + reg * 4) as *mut u32, bit) };
+    true
+}
+
 /// Mask one external interrupt. Returns `false` if `irq` is outside the
 /// NVIC window, having written nothing.
 ///

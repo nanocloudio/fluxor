@@ -54,7 +54,7 @@ use abi::internal::reconfigure::{
 };
 
 // Optional graph_slot integration. When a graph_slot provider is
-// registered (wire `reconfigure.gs_req` → `graph_slot.in`), the
+// registered (wire `reconfigure.gs_req` → `graph_slot.requests`), the
 // reconfigure module activates the staged slot via the graph_slot
 // channel protocol so the post-rebuild boot loads its modules and
 // config. The activation is fire-and-forget; if graph_slot is not

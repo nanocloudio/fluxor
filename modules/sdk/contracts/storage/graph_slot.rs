@@ -37,20 +37,34 @@
 /// | ERASE   | 0 on success, negative errno on failure                 |
 /// | WRITE   | 0 on success, negative errno on failure                 |
 /// | ACTIVATE| 0 on success, negative errno on failure                 |
-/// | ACTIVE  | 0 or 1 (slot index), -1 if neither slot is live         |
-/// | CFG     | XIP absolute address of live config blob, -1 if no live |
+/// | ACTIVE  | slot the next boot selects (0 or 1), -1 if neither valid|
+/// | CFG     | XIP address of the RUNNING slot's config, -1 if none    |
+///
+/// Two slots matter and they are not the same one. The RUNNING slot is the
+/// one the kernel booted from; module code executes in place from it, so it
+/// is never erased or programmed while it runs. Every ERASE, WRITE and
+/// ACTIVATE targets the other slot, whatever the epochs say. The SELECTED
+/// slot is the one the next boot picks: the valid slot with the higher
+/// epoch. After an ACTIVATE the two differ until a reset, which is why
+/// ACTIVE and CFG answer different questions. CFG's address stays readable
+/// until the next reset, so a consumer may hold it across an ACTIVATE and a
+/// rebuild, and asks again after a reset.
 pub mod channel {
-    /// Erase the inactive slot's 128 sectors in one pass. Payload: empty.
+    /// Erase the non-running slot's 128 sectors in one pass. Payload: empty.
     pub const REQ_ERASE: u32 = super::fnv1a_const(b"gs.erase");
-    /// Program one 256-byte page into the inactive slot.
+    /// Program one 256-byte page into the non-running slot. The header page
+    /// (offset 0) is held in RAM and programmed only by ACTIVATE, so a slot
+    /// that was not activated has no magic and is never selected.
     /// Payload: `[offset_in_slot: u32 LE][page: 256 bytes]` (260 bytes).
     pub const REQ_WRITE: u32 = super::fnv1a_const(b"gs.write");
-    /// Validate the candidate slot's SHA-256 and (if valid) promote it.
-    /// Payload: empty.
+    /// Check the non-running slot (epoch above the running slot's, ABI pin,
+    /// SHA-256 over its bytes) and, if valid, program its header so the
+    /// next boot selects it. Payload: empty.
     pub const REQ_ACTIVATE: u32 = super::fnv1a_const(b"gs.activate");
-    /// Query which slot is currently live. Payload: empty.
+    /// Query which slot the next boot selects. Payload: empty.
     pub const REQ_ACTIVE: u32 = super::fnv1a_const(b"gs.query_active");
-    /// Query the XIP address of the live slot's config blob. Payload: empty.
+    /// Query the XIP address of the running slot's config blob. Payload:
+    /// empty.
     pub const REQ_CFG: u32 = super::fnv1a_const(b"gs.query_cfg");
     /// Response frame type. Payload: `[req_type: u32 LE][value: i32 LE]`.
     pub const RESP_RESULT: u32 = super::fnv1a_const(b"gs.result");

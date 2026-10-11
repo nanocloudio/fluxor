@@ -543,6 +543,26 @@ pub unsafe fn pump_recv_certificate_verify_core(driver: &mut HandshakeDriver) ->
     } else {
         HandshakeState::RecvFinished
     };
+    // Ed25519 signs the content itself, which is here and nowhere later:
+    // one verification, done now, and the message joins the transcript only
+    // if it holds.
+    if scheme == SIG_ED25519 {
+        let pk = &driver.peer_cert_pubkey[..driver.peer_cert_pubkey_len as usize];
+        let (Ok(key), Ok(signature)) = (<&[u8; 32]>::try_from(pk), <&[u8; 64]>::try_from(sig))
+        else {
+            driver.hs_state = HandshakeState::Error;
+            return true;
+        };
+        if !ed25519_verify(key, &vc[..vc_len], signature) {
+            driver.hs_state = HandshakeState::Error;
+            return true;
+        }
+        if let Some(ref mut t) = driver.transcript {
+            t.update(&data[..len]);
+        }
+        driver.hs_state = next;
+        return true;
+    }
     // The signature check is a stepped job — RSA-PSS on the instance's
     // exponentiation, ECDSA on the driver's ladders — so the message is
     // held in `scratch`: the job reads the signature from it and the
