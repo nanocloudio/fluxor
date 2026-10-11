@@ -1,5 +1,5 @@
 version = "1.0.0"
-hardware_targets = ["bcm2712"]
+hardware_targets = ["bcm2712", "linux"]
 
 # The body of the churn workload (tests/hardware/pi5_workload_churn.toml).
 # `mode: source` writes a little-endian u32 step counter on `data_out` every step;

@@ -1,6 +1,6 @@
 name = "stateful_probe"
 version = "1.0.0"
-hardware_targets = ["bcm2712"]
+hardware_targets = ["bcm2712", "linux"]
 
 # The smallest stateful workload: on its block source's first block it
 # keeps a magic and an epoch; every start reads the epoch back, adds one,

@@ -17,8 +17,9 @@
 // Completion (the CLI-ness): cli_in returns Done once argv is emitted and
 // stdin has hit EOF fully flushed; cli_out returns Done when an exit record
 // arrives, or when every upstream producer is finished and its inputs and
-// bridges are drained. The plain-run completion branch then exits the
-// process with CLI_EXIT_CODE.
+// bridges are drained, or when stdout's reader has gone (exit 141, as a
+// shell reports for a writer whose pipe closed). The plain-run completion
+// branch then exits the process with CLI_EXIT_CODE.
 
 use fluxor::kernel::workload::extbridge::{ExtBridge, OverloadPolicy, PushOutcome};
 use fluxor::platform::builtin_param_tags::cli_in as cli_in_tags;
@@ -61,6 +62,18 @@ pub(crate) static CLI_EXIT_LATCHED: core::sync::atomic::AtomicBool =
 /// retires, having no output that could be over.
 pub(crate) static CLI_RUN_COMPLETE: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
+
+/// Set by the stdout sink worker when the reader has gone (`| head -1`):
+/// nothing more the applet prints can be delivered, so the run is over, as
+/// it is for any program writing to a pipe whose reader left.
+static STDOUT_GONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// As [`STDOUT_GONE`], for stderr: diagnostics nobody reads are dropped, and
+/// the run goes on.
+static STDERR_GONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// The status a shell reports for a writer its reader left (128 + SIGPIPE).
+const EXIT_READER_GONE: i32 = 128 + libc::SIGPIPE;
 
 // ── Interactive terminal (raw stdin) ────────────────────────────────────────
 //
@@ -377,13 +390,27 @@ fn cli_out_step(state: *mut u8) -> i32 {
     // SAFETY: kernel-owned arena sized to `CliOutState` by the loader.
     let st = unsafe { instance_state::<CliOutState>(state) };
 
+    if STDOUT_GONE.load(Ordering::Acquire) {
+        CLI_EXIT_CODE.store(EXIT_READER_GONE, Ordering::Release);
+        CLI_EXIT_LATCHED.store(true, Ordering::Release);
+        CLI_RUN_COMPLETE.store(true, Ordering::Release);
+        log::info!("[cli] stdout's reader has gone; ending the run");
+        return 1;
+    }
+    let stderr_gone = STDERR_GONE.load(Ordering::Acquire);
+    if stderr_gone && st.err_in >= 0 {
+        let mut buf = [0u8; CLI_CHUNK];
+        // SAFETY: stack buffer of CLI_CHUNK bytes.
+        while unsafe { channel::channel_read(st.err_in, buf.as_mut_ptr(), buf.len()) } > 0 {}
+    }
+
     let mut moved = false;
     if let (true, Some(b)) = (st.bytes_in >= 0, st.stdout_bridge.as_ref()) {
         // drain_to_bridge proves per-chunk capacity itself, so a full ring
         // leaves bytes in the channel rather than dropping them.
         moved |= drain_to_bridge(st.bytes_in, b);
     }
-    if let (true, Some(b)) = (st.err_in >= 0, st.stderr_bridge.as_ref()) {
+    if let (true, false, Some(b)) = (st.err_in >= 0, stderr_gone, st.stderr_bridge.as_ref()) {
         moved |= drain_to_bridge(st.err_in, b);
     }
 
@@ -412,7 +439,7 @@ fn cli_out_step(state: *mut u8) -> i32 {
     // Bridges must be empty so the worker threads have written the tail to the fds.
     let upstream_done = scheduler::module_completion_predecessors_finished(st.module_idx);
     let flushed = st.stdout_bridge.as_ref().is_none_or(|b| b.is_empty())
-        && st.stderr_bridge.as_ref().is_none_or(|b| b.is_empty());
+        && (stderr_gone || st.stderr_bridge.as_ref().is_none_or(|b| b.is_empty()));
     // A sink nothing feeds carries no such claim. `cli` is a platform
     // stanza, so a graph that names it for its stdin alone still gets a
     // `cli_out`, and an unwired one has no predecessors at all —
@@ -433,6 +460,7 @@ fn cli_out_step(state: *mut u8) -> i32 {
 fn spawn_sink_worker<W: std::io::Write + Send + 'static>(
     bridge: Arc<ExtBridge<CLI_BRIDGE_CAP>>,
     mut sink: W,
+    gone: &'static core::sync::atomic::AtomicBool,
 ) {
     std::thread::spawn(move || {
         let mut frame = [0u8; CLI_CHUNK];
@@ -440,7 +468,10 @@ fn spawn_sink_worker<W: std::io::Write + Send + 'static>(
             match bridge.pop_frame(&mut frame) {
                 Some(n) => {
                     if sink.write_all(&frame[..n]).is_err() {
-                        return; // consumer hung up (broken pipe)
+                        // The reader hung up (broken pipe): say so, or the
+                        // sink waits for ever on a bridge nobody empties.
+                        gone.store(true, Ordering::Release);
+                        return;
                     }
                     let _ = sink.flush();
                 }
@@ -459,12 +490,12 @@ fn build_cli_out(module_idx: usize) -> scheduler::BuiltInModule {
 
     let stdout_bridge = (bytes_in >= 0).then(|| {
         let b: Arc<ExtBridge<CLI_BRIDGE_CAP>> = Arc::new(ExtBridge::new(OverloadPolicy::Block));
-        spawn_sink_worker(Arc::clone(&b), std::io::stdout());
+        spawn_sink_worker(Arc::clone(&b), std::io::stdout(), &STDOUT_GONE);
         b
     });
     let stderr_bridge = (err_in >= 0).then(|| {
         let b: Arc<ExtBridge<CLI_BRIDGE_CAP>> = Arc::new(ExtBridge::new(OverloadPolicy::Block));
-        spawn_sink_worker(Arc::clone(&b), std::io::stderr());
+        spawn_sink_worker(Arc::clone(&b), std::io::stderr(), &STDERR_GONE);
         b
     });
 

@@ -773,6 +773,22 @@ fn main() {
         log::warn!("[sched] no modules loaded, nothing to do");
         process::exit(0);
     }
+    // An applet is one program: with a module missing it cannot finish, and
+    // running the rest would wait for output that never comes. A service
+    // keeps serving with what loaded; an applet stops and says why, on the
+    // terminal, since its log goes to the applet's log directory.
+    if let Ok(applet) = env::var("FLUXOR_EXEC") {
+        if loaded_count < module_count {
+            eprintln!(
+                "error: applet '{applet}': {} of {module_count} modules failed to load \
+                 (the applet's log says which and why; a module built for another runtime \
+                 means the applet needs reinstalling)",
+                module_count - loaded_count
+            );
+            restore_terminal();
+            process::exit(1);
+        }
+    }
 
     // Admit resident workloads declared in the config's `[FXPD]` section
     // (`workloads:` / `combine <two-graph.yaml>`) as workload owners via
