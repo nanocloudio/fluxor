@@ -527,7 +527,7 @@ fn run_modules_build(s: &Shape, verbose: bool) -> Result<()> {
         println!(
             "  Modules ({}/{}): built {} of {}, up-to-date {}, skipped {}, failed {}",
             tr.target,
-            tr.silicon,
+            tr.abi,
             tr.built.len(),
             tr.built.len() + tr.up_to_date.len() + tr.skipped.len() + tr.failed.len(),
             tr.up_to_date.len(),

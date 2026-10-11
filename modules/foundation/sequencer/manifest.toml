@@ -2,7 +2,7 @@ version = "1.0.0"
 # Logic is platform-agnostic (timer + preset lookup with a millis
 # fallback for the frame-accurate path). Available on hosts and
 # bare-metal targets that load PIC modules.
-hardware_targets = ["rp2350", "bcm2712", "linux"]
+hardware_targets = ["rp2350", "bcm2712", "linux", "rp2040"]
 
 [[ports]]
 name = "control"

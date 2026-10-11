@@ -613,7 +613,38 @@ fn stage_plan_from(path: &str) {
     }
 }
 
+/// Refuse to start below the `aarch64` module ABI floor (ARMv8.0-A with
+/// AES, SHA2 and NEON): every module this runtime loads is compiled for it,
+/// and so is the runtime itself, so a CPU without them would fault later on
+/// an instruction it does not have. Named here, once, instead.
+#[cfg(target_arch = "aarch64")]
+fn check_abi_floor() {
+    // SAFETY: getauxval reads the process's auxiliary vector; no memory is
+    // passed in.
+    let hwcap = unsafe { libc::getauxval(libc::AT_HWCAP) };
+    let missing: Vec<&str> = [
+        (libc::HWCAP_ASIMD, "NEON"),
+        (libc::HWCAP_AES, "AES"),
+        (libc::HWCAP_SHA2, "SHA2"),
+    ]
+    .into_iter()
+    .filter(|(bit, _)| hwcap & bit == 0)
+    .map(|(_, name)| name)
+    .collect();
+    if !missing.is_empty() {
+        eprintln!(
+            "error: this CPU lacks {} — the aarch64 module ABI needs ARMv8.0-A with AES, SHA2 \
+             and NEON",
+            missing.join(", ")
+        );
+        process::exit(1);
+    }
+}
+
 fn main() {
+    #[cfg(target_arch = "aarch64")]
+    check_abi_floor();
+
     // Initialize boot instant for monotonic clock
     // SAFETY: main runs before any other thread; first write to BOOT_INSTANT
     // happens-before any reader observes it.

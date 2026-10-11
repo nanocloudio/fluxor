@@ -1166,12 +1166,8 @@ fn cmd_mktable_config(
     stack_expand::expand_platform_stacks(&mut config, &target_desc, &project_root)?;
 
     let module_root = target_module_root(module_root, &project_root, &target_desc)?;
-    // Pins are SILICON-tagged, and for the linux host that silicon is not its
-    // own id — it loads the aarch64 modules built for `bcm2712`. Filter to the
-    // silicon the .fmods actually come from, else a store-composed provider
-    // never resolves for a host `fluxor run`.
-    let pin_silicon = target_desc.module_silicon();
-    let store_fb = store_cli::lock_store_resolver(&project_root, pin_silicon, None);
+    // Pins are tagged by module ABI: filter to the ABI the .fmods come from.
+    let store_fb = store_cli::lock_store_resolver(&project_root, target_desc.module_abi(), None);
     let modules = parse_modules_from_config_multi(
         &config,
         &module_root,
@@ -1285,9 +1281,9 @@ fn build_one_from(
     let project_root = crate::project::root_for_config(yaml_path);
     stack_expand::expand_platform_stacks(&mut config, &target_desc, &project_root)?;
     let family = target_desc.family.clone();
-    // Silicon the PIC modules come from — the target's own for firmware
-    // families, `bcm2712` for the aarch64 linux host.
-    let module_silicon = target_desc.module_silicon().to_string();
+    // The target `fluxor modules build --target` takes to fill this shelf:
+    // the silicon or host id (a board builds its silicon's modules).
+    let module_build_target = target_desc.id.clone();
     let build_id = target_desc.build_id().to_string();
     let board_id = target_desc.board_id.clone();
 
@@ -1374,7 +1370,7 @@ fn build_one_from(
                     "Modules not found at {}. Run 'fluxor modules build --target {}' from the \
                      project root (`fluxor inspect` shows where that is) to produce them.",
                     modules_dir.display(),
-                    module_silicon
+                    module_build_target
                 )));
             }
             cmd_combine(
@@ -1394,9 +1390,8 @@ fn build_one_from(
             let config_bin_path = out_dir.join("config.bin");
             let modules_bin_path = out_dir.join("modules.bin");
 
-            // The host loads whichever silicon's PIC modules the descriptor
-            // names (`module_silicon`, bcm2712 for the aarch64 host). The
-            // default root is anchored to the resolved project root (not the
+            // The host loads its module ABI's shelf. The default root is
+            // anchored to the resolved project root (not the
             // caller's cwd) so `fluxor run <path>` finds the same modules from
             // any directory.
             if !crate::modules_build::holds_fmod(&modules_dir) {
@@ -1404,7 +1399,7 @@ fn build_one_from(
                     "Modules not found at {}. Run 'fluxor modules build --target {}' from the \
                      project root (`fluxor inspect` shows where that is) first.",
                     modules_dir.display(),
-                    module_silicon
+                    module_build_target
                 )));
             }
             // Cross-check the YAML against the linux binary's

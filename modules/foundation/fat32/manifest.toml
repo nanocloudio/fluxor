@@ -1,5 +1,5 @@
 version = "2.0.0"
-hardware_targets = ["rp2350", "bcm2712"]
+hardware_targets = ["rp2350", "bcm2712", "linux"]
 # Filesystem state machines are readiness-driven; diagnostic/native telemetry
 # cadence uses dev_millis and contains no scheduler-step deadline.
 timer_class = "wall_clock"

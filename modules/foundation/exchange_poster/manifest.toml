@@ -1,7 +1,7 @@
 version          = "1.0.0"
 type             = "Transformer"
 entry            = "mod.rs"
-hardware_targets = ["bcm2712", "rp2350"]
+hardware_targets = ["bcm2712", "rp2350", "linux"]
 # Reacts to channel readiness only; nothing here measures time.
 timer_class      = "agnostic"
 
@@ -35,7 +35,7 @@ index        = 0
 direction    = "input"
 content_type = "OctetStream"
 max_record   = 8500
-buffer_size  = { default = 8704, rp2350 = 4352 }
+buffer_size  = { default = 8704, thumbv8m = 4352 }
 
 [[ports]]
 name         = "request_out"

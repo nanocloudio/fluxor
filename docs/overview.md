@@ -31,6 +31,7 @@ How the system works. These are the authoritative references.
 - [architecture/reconfigure.md](architecture/reconfigure.md) — live graph reconfigure and the drain-then-reset model
 - [architecture/hal_architecture.md](architecture/hal_architecture.md) — kernel/module split, syscall table, per-silicon HAL
 - [architecture/abi_layers.md](architecture/abi_layers.md) — ABI layers, contract inventory, provider dispatch, permissions
+- [architecture/runtimes_and_abis.md](architecture/runtimes_and_abis.md) — runtimes vs module ABIs: placement, shelves, store tags, CPU floors
 - [architecture/abi_surface.md](architecture/abi_surface.md) — the ABI-surface digest, artefact provenance digests, and how a surface change propagates
 - [architecture/limit_register.md](architecture/limit_register.md) — the register of hard capacity ceilings and their defining constants
 - [architecture/capability_surface.md](architecture/capability_surface.md) — capability vocabulary, content-type registry, platform stack expansion, validation

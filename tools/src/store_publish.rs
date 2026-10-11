@@ -294,9 +294,23 @@ pub fn publish_project_with_mode(
         BTreeMap::new()
     };
 
+    // What this project DECLARES it builds, not what happens to be on
+    // disk. The two diverge, and the divergence is one-way: `modules build
+    // --all` refreshes the declared targets, while a shelf left behind by a
+    // retired target or a one-off `--target X` is refreshed by nothing. A
+    // sweep over the directory listing therefore meets artefacts that no
+    // verb in the project can bring up to date, and a stale one of those
+    // blocks every publish with advice that cannot succeed — `build --all`
+    // does not reach it.
+    let declared = if want("fmod") {
+        crate::modules_build::declared_shelves(&pr)?
+    } else {
+        std::collections::BTreeSet::new()
+    };
+
     let txn = store.begin_publish()?;
     let retire = if want("fmod") {
-        modules_to_retire(&store, &pr, &identity.name, &withheld)?
+        modules_to_retire(&store, &pr, &identity.name, &withheld, &declared)?
     } else {
         Vec::new()
     };
@@ -340,22 +354,16 @@ pub fn publish_project_with_mode(
         // Ownership map: only fmods whose module directory lives in
         // this project's own tree are published; synced upstream
         // copies in the same shelf are not ours.
-        let owned: BTreeMap<String, PathBuf> = crate::modules_build::list(&pr)?
+        let owned: BTreeMap<String, (PathBuf, Vec<String>)> = crate::modules_build::list(&pr)?
             .into_iter()
-            .filter_map(|m| m.manifest.parent().map(|d| (m.name, d.to_path_buf())))
+            .filter_map(|m| {
+                m.manifest
+                    .parent()
+                    .map(|d| (m.name, (d.to_path_buf(), m.hardware_targets)))
+            })
             .collect();
-        // What this project DECLARES it builds, not what happens to be on
-        // disk. The two diverge, and the divergence is one-way: `modules build
-        // --all` refreshes the declared targets, while a shelf left behind by a
-        // retired target or a one-off `--target X` is refreshed by nothing. A
-        // sweep over the directory listing therefore meets artefacts that no
-        // verb in the project can bring up to date, and a stale one of those
-        // blocks every publish with advice that cannot succeed — `build --all`
-        // does not reach it.
-        //
-        // Skipped rather than failed, and reported below so it is visible
-        // rather than silent.
-        let declared = crate::modules_build::declared_shelves(&pr)?;
+        // A shelf on disk outside the declared set is skipped rather than
+        // failed, and reported below so it is visible rather than silent.
         let mut orphaned: Vec<String> = Vec::new();
         // Every (artefact, shelf) actually prepared, checked below against
         // every one the project declares.
@@ -404,10 +412,17 @@ pub fn publish_project_with_mode(
                         .file_stem()
                         .map(|s| s.to_string_lossy().to_string())
                         .unwrap_or_default();
-                    let Some(src_dir) = owned.get(&name) else {
+                    let Some((src_dir, runtimes)) = owned.get(&name) else {
                         continue;
                     };
                     if withheld.contains_key(&name) {
+                        continue;
+                    }
+                    // The build's own rule: a module belongs on a shelf only
+                    // when a runtime it names loads that ABI. An artefact the
+                    // build left there before the manifest narrowed is not
+                    // this project's current output.
+                    if !crate::runtime_abi::module_on_abi(runtimes, &target) {
                         continue;
                     }
                     let bytes = std::fs::read(&fmod).map_err(Error::Io)?;
@@ -487,14 +502,13 @@ pub fn publish_project_with_mode(
             if m.builtin || withheld.contains_key(&m.name) {
                 continue;
             }
-            for token in &m.hardware_targets {
-                let Ok(silicon) = crate::modules_build::resolve_silicon(token, &pr) else {
-                    continue;
-                };
-                if declared.contains(&silicon)
-                    && !prepared_fmods.contains(&(m.name.clone(), silicon.clone()))
+            // The same rule the build uses: a module belongs on every
+            // declared shelf a runtime it names loads.
+            for abi in &declared {
+                if crate::runtime_abi::module_on_abi(&m.hardware_targets, abi)
+                    && !prepared_fmods.contains(&(m.name.clone(), abi.clone()))
                 {
-                    missing.push(format!("{silicon}/{}", m.name));
+                    missing.push(format!("{abi}/{}", m.name));
                 }
             }
         }
@@ -687,16 +701,24 @@ fn withheld_artifacts(project_root: &Path) -> Result<BTreeMap<String, String>> {
 ///
 /// A withheld module must not stay resolvable at whatever digest it was last
 /// published with: consumers would keep syncing an artefact the project has
-/// stopped vouching for.
+/// stopped vouching for. Nor may a tag on a shelf the project no longer
+/// declares, or one for a module no longer built for that ABI: this publish
+/// prepares nothing to repoint it, so without retirement it would sit in
+/// the project index beside the current artefacts at whatever inputs and
+/// epoch it was last built with, and every reader of the index — the ci
+/// staleness gate first — would take it for the module's current state.
+/// After a publish, this project's module tags are exactly the set it
+/// prepared.
 fn modules_to_retire(
     store: &OciStore,
     project_root: &Path,
     project: &str,
     withheld: &BTreeMap<String, String>,
+    declared: &std::collections::BTreeSet<String>,
 ) -> Result<Vec<(String, &'static str)>> {
-    let live: std::collections::BTreeSet<String> = crate::modules_build::list(project_root)?
+    let live: BTreeMap<String, Vec<String>> = crate::modules_build::list(project_root)?
         .into_iter()
-        .map(|m| m.name)
+        .map(|m| (m.name, m.hardware_targets))
         .collect();
     // An empty module list means "this project builds no modules", which is
     // true of plenty of them — but it is also what a failed enumeration
@@ -733,7 +755,15 @@ fn modules_to_retire(
         }
         if withheld.contains_key(name) {
             stale.push((reference.clone(), "module withheld"));
-        } else if !live.contains(name) {
+        } else if let Some(runtimes) = live.get(name) {
+            // A project that declares no shelf publishes no fmods and has no
+            // opinion about which shelves exist.
+            if !declared.is_empty() && !declared.contains(shelf) {
+                stale.push((reference.clone(), "shelf no longer declared"));
+            } else if !crate::runtime_abi::module_on_abi(runtimes, shelf) {
+                stale.push((reference.clone(), "module no longer built for this ABI"));
+            }
+        } else {
             stale.push((reference.clone(), "module no longer in the source tree"));
         }
     }
@@ -833,7 +863,7 @@ mod tests {
             silicon.join("bcm2712.toml"),
         )
         .unwrap();
-        let shelf = pr.join("target/fluxor/bcm2712/modules");
+        let shelf = pr.join("target/fluxor/aarch64/modules");
         std::fs::create_dir_all(&shelf).unwrap();
         std::fs::write(shelf.join("kept.fmod"), b"kept-bytes").unwrap();
         std::fs::write(shelf.join("held.fmod"), b"held-bytes").unwrap();
@@ -844,7 +874,7 @@ mod tests {
         std::env::set_var("FLUXOR_WORKSPACE", scratch.path().join("no-workspace.toml"));
 
         let first = publish_project_to_store(&pr, &[], false).unwrap();
-        assert!(first.iter().any(|t| t == "bcm2712/held:0.0.1"), "{first:?}");
+        assert!(first.iter().any(|t| t == "aarch64/held:0.0.1"), "{first:?}");
 
         std::fs::write(
             pr.join("modules/app/held/manifest.toml"),
@@ -864,17 +894,17 @@ mod tests {
         .unwrap();
         let held_after_dry_run = crate::oci_store::OciStore::open(&store_dir)
             .unwrap()
-            .resolve("bcm2712/held:0.0.1")
+            .resolve("aarch64/held:0.0.1")
             .is_ok();
         let second = publish_project_to_store(&pr, &[], false).unwrap();
         let digests = super::project_input_digests(&pr).unwrap();
         let store = crate::oci_store::OciStore::open(&store_dir).unwrap();
-        let held_resolves = store.resolve("bcm2712/held:0.0.1").is_ok();
+        let held_resolves = store.resolve("aarch64/held:0.0.1").is_ok();
         std::env::remove_var("FLUXOR_STORE");
         std::env::remove_var("FLUXOR_WORKSPACE");
 
         assert!(
-            second.iter().any(|t| t == "bcm2712/kept:0.0.1"),
+            second.iter().any(|t| t == "aarch64/kept:0.0.1"),
             "{second:?}"
         );
         assert!(!second.iter().any(|t| t.contains("/held:")), "{second:?}");
@@ -885,6 +915,91 @@ mod tests {
         );
         assert!(digests.contains_key("kept"));
         assert!(!digests.contains_key("held"));
+    }
+
+    /// A module tag on a shelf this publish prepares nothing for is retired:
+    /// one for an ABI the module is no longer built for, and one on a shelf
+    /// the project no longer declares. Left in place, either would sit in the
+    /// project index beside the current artefacts and read as the module's
+    /// state.
+    #[test]
+    fn tags_on_shelves_the_publish_no_longer_fills_retire() {
+        let scratch = tempfile::tempdir().unwrap();
+        let pr = scratch.path().join("proj");
+        let dir = pr.join("modules/app/kept");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("mod.rs"), "pub fn v() {}\n").unwrap();
+        let silicon = pr.join("targets/silicon");
+        std::fs::create_dir_all(&silicon).unwrap();
+        for chip in ["bcm2712", "rp2350"] {
+            std::fs::copy(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join(format!("../targets/silicon/{chip}.toml")),
+                silicon.join(format!("{chip}.toml")),
+            )
+            .unwrap();
+        }
+        for abi in ["aarch64", "thumbv8m"] {
+            let shelf = pr.join("target/fluxor").join(abi).join("modules");
+            std::fs::create_dir_all(&shelf).unwrap();
+            std::fs::write(shelf.join("kept.fmod"), format!("{abi}-bytes")).unwrap();
+        }
+        let declare = |targets: &str| {
+            std::fs::write(
+                pr.join("fluxor.toml"),
+                format!(
+                    "[project]\nname = \"shelfproj\"\nversion = \"0.0.1\"\n\n[ci]\ntargets = [{targets}]\n"
+                ),
+            )
+            .unwrap();
+        };
+        let name_runtimes = |runtimes: &str| {
+            std::fs::write(
+                dir.join("manifest.toml"),
+                format!("version = \"0.1.0\"\nhardware_targets = [{runtimes}]\n"),
+            )
+            .unwrap();
+        };
+
+        let store_dir = scratch.path().join("store");
+        let _env = crate::oci_store::test_env_lock();
+        let _scope = crate::oci_store::EnvScope::set(&[
+            ("FLUXOR_STORE", &store_dir),
+            (
+                "FLUXOR_WORKSPACE",
+                &scratch.path().join("no-workspace.toml"),
+            ),
+        ]);
+        let store = crate::oci_store::OciStore::open(&store_dir).unwrap();
+        let on_shelf = |abi: &str| store.resolve(&format!("{abi}/kept:0.0.1")).is_ok();
+
+        declare("\"bcm2712\", \"rp2350\"");
+        name_runtimes("\"bcm2712\", \"rp2350\"");
+        publish_project_to_store(&pr, &[], false).unwrap();
+        assert!(on_shelf("aarch64") && on_shelf("thumbv8m"));
+
+        // The module stops naming rp2350. Its thumbv8m artefact is still on
+        // disk, which is not the same as being its current output.
+        name_runtimes("\"bcm2712\"");
+        publish_project_to_store(&pr, &[], false).unwrap();
+        assert!(on_shelf("aarch64"), "the aarch64 tag stays");
+        assert!(
+            !on_shelf("thumbv8m"),
+            "a tag for an ABI the module is no longer built for retires"
+        );
+
+        name_runtimes("\"bcm2712\", \"rp2350\"");
+        publish_project_to_store(&pr, &[], false).unwrap();
+        assert!(on_shelf("thumbv8m"));
+
+        // The project stops declaring rp2350 altogether.
+        declare("\"bcm2712\"");
+        publish_project_to_store(&pr, &[], false).unwrap();
+        assert!(on_shelf("aarch64"));
+        assert!(
+            !on_shelf("thumbv8m"),
+            "a tag on a shelf the project no longer declares retires"
+        );
     }
 
     /// Every file under `root`, by relative path, with its bytes.
@@ -936,7 +1051,7 @@ mod tests {
             silicon.join("bcm2712.toml"),
         )
         .unwrap();
-        let shelf = pr.join("target/fluxor/bcm2712/modules");
+        let shelf = pr.join("target/fluxor/aarch64/modules");
         std::fs::create_dir_all(&shelf).unwrap();
         std::fs::write(shelf.join("kept.fmod"), b"kept-bytes").unwrap();
         std::fs::write(shelf.join("held.fmod"), b"held-bytes").unwrap();
@@ -950,7 +1065,7 @@ mod tests {
         ]);
         publish_project_to_store(&pr, &[], false).unwrap();
         let store = crate::oci_store::OciStore::open(&store_dir).unwrap();
-        let held = store.resolve("bcm2712/held:0.0.1").unwrap().digest;
+        let held = store.resolve("aarch64/held:0.0.1").unwrap().digest;
 
         // Another checkout pins the module about to be withheld.
         let outsider = scratch.path().join("outsider");
@@ -959,7 +1074,7 @@ mod tests {
             outsider.join("fluxor.lock"),
             format!(
                 "[[artifact]]\nkind = \"module\"\nname = \"held\"\nproject = \"heldproj\"\n\
-                 target = \"bcm2712\"\ndigest = \"{held}\"\nreference = \"bcm2712/held:0.0.1\"\n"
+                 target = \"aarch64\"\ndigest = \"{held}\"\nreference = \"aarch64/held:0.0.1\"\n"
             ),
         )
         .unwrap();
@@ -1000,7 +1115,7 @@ mod tests {
 
         // The same publish without the gate retires the tag in its one swap.
         publish_project_to_store(&pr, &[], false).unwrap();
-        assert!(store.resolve("bcm2712/held:0.0.1").is_err());
+        assert!(store.resolve("aarch64/held:0.0.1").is_err());
         assert!(
             store.has_blob(&held),
             "the outsider's pin still holds the bytes"
@@ -1036,7 +1151,7 @@ mod tests {
             silicon.join("bcm2712.toml"),
         )
         .unwrap();
-        let shelf = pr.join("target/fluxor/bcm2712/modules");
+        let shelf = pr.join("target/fluxor/aarch64/modules");
         std::fs::create_dir_all(&shelf).unwrap();
         std::fs::write(shelf.join("built.fmod"), b"built-bytes").unwrap();
 
@@ -1049,12 +1164,12 @@ mod tests {
             .to_string();
         let store_exists = store_dir.join("index.json").exists()
             && crate::oci_store::OciStore::open(&store_dir)
-                .and_then(|s| s.resolve("bcm2712/built:0.0.1"))
+                .and_then(|s| s.resolve("aarch64/built:0.0.1"))
                 .is_ok();
         std::env::remove_var("FLUXOR_STORE");
         std::env::remove_var("FLUXOR_WORKSPACE");
 
-        assert!(err.contains("bcm2712/unbuilt"), "{err}");
+        assert!(err.contains("aarch64/unbuilt"), "{err}");
         assert!(
             !store_exists,
             "nothing may be published when one artefact is missing"

@@ -381,7 +381,7 @@ needs — a provider it calls that calls back, inline assembly that moves the
 stack pointer — the module declares it:
 
 ```rust
-declare_module_stack_bytes!(if cfg!(fluxor_silicon = "bcm2712") { 16 * 1024 } else { 5 * 1024 });
+declare_module_stack_bytes!(if cfg!(fluxor_abi = "aarch64") { 16 * 1024 } else { 5 * 1024 });
 ```
 
 A declaration is a floor: the manifest records the larger of it and the

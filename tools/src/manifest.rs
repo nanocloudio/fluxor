@@ -351,10 +351,10 @@ fn fact_scalar(capability: &str, fact: &str, value: toml::Value) -> Result<Strin
 /// Read `[capability_facts]` TOML values into their written shape.
 ///
 /// A per-target table must be complete: it either carries `default` or names
-/// every silicon the module is built for (`hardware_targets`, where `linux`
-/// loads the `bcm2712` build). A partial table is refused here, whichever
-/// target is being loaded, so a gap cannot hide behind a build for a target
-/// the table happens to name.
+/// every module ABI the module is built for (the buildable ABIs of the
+/// runtimes in `hardware_targets`). A partial table is refused here, whichever
+/// ABI is being packed, so a gap cannot hide behind a build for an ABI the
+/// table happens to name.
 fn normalise_capability_facts(
     raw: Option<
         std::collections::BTreeMap<String, std::collections::BTreeMap<String, toml::Value>>,
@@ -404,7 +404,7 @@ fn per_target_fact(
         map.insert(key, fact_scalar(capability, fact, value)?);
     }
     if !map.contains_key("default") {
-        let missing: Vec<&str> = module_silicons(hardware_targets)
+        let missing: Vec<&str> = module_abis(hardware_targets)
             .filter(|s| !map.contains_key(*s))
             .collect();
         if !missing.is_empty() {
@@ -418,29 +418,23 @@ fn per_target_fact(
     Ok(map)
 }
 
-/// The silicon ids a module is built for, from its `hardware_targets` mask.
-/// The `linux` host loads the `bcm2712` build.
-fn module_silicons(hardware_targets: u16) -> impl Iterator<Item = &'static str> {
-    [
-        (0x01u16, "rp2350"),
-        (0x02, "rp2040"),
-        (0x04 | 0x10, "bcm2712"),
-        (0x08, "wasm"),
-    ]
-    .into_iter()
-    .filter(move |(bits, _)| hardware_targets & bits != 0)
-    .map(|(_, silicon)| silicon)
+/// The buildable module ABIs a module is built for, from its runtime mask.
+fn module_abis(hardware_targets: u16) -> impl Iterator<Item = &'static str> {
+    let mut abis: Vec<&'static str> = crate::runtime_abi::runtimes_in(hardware_targets)
+        .flat_map(|r| r.abis.iter().copied())
+        .filter(|a| crate::runtime_abi::abi(a).is_some_and(|x| x.buildable))
+        .collect();
+    abis.sort_unstable();
+    abis.dedup();
+    abis.into_iter()
 }
 
-/// Resolve every fact for `silicon`: a per-target value takes that silicon's
-/// entry, else the table's explicit `default`. A `None` silicon resolves
+/// Resolve every fact for module ABI `abi`: a per-target value takes that
+/// ABI's entry, else the table's explicit `default`. A `None` ABI resolves
 /// `default` only. A target the table does not answer for is refused rather
 /// than dropped, since a missing fact would skip the compose-time checks that
 /// read it.
-fn resolve_capability_facts(
-    raw: RawCapabilityFacts,
-    silicon: Option<&str>,
-) -> Result<CapabilityFacts> {
+fn resolve_capability_facts(raw: RawCapabilityFacts, abi: Option<&str>) -> Result<CapabilityFacts> {
     let mut out = CapabilityFacts::new();
     for (capability, facts) in raw {
         let mut flat = std::collections::BTreeMap::new();
@@ -448,14 +442,14 @@ fn resolve_capability_facts(
             let text = match value {
                 FactValue::Flat(v) => v,
                 FactValue::PerTarget(mut map) => {
-                    let hit = silicon.and_then(|s| map.remove(s));
+                    let hit = abi.and_then(|s| map.remove(s));
                     match hit.or_else(|| map.remove("default")) {
                         Some(v) => v,
                         None => {
                             return Err(Error::Module(format!(
                                 "per-target fact `{fact}` on capability `{capability}` has no \
                                  entry for target {:?} and no `default`.",
-                                silicon.unwrap_or("<none>"),
+                                abi.unwrap_or("<none>"),
                             )))
                         }
                     }
@@ -829,19 +823,20 @@ fn parse_semver(s: &str) -> Result<(u8, u8, u8)> {
 
 // ── Hardware target mapping ─────────────────────────────────────────────────
 
-fn hardware_targets_from_list(targets: &[String]) -> u16 {
-    let mut mask = 0u16;
-    for t in targets {
-        match t.to_ascii_lowercase().as_str() {
-            "rp2350" => mask |= 0x01,
-            "rp2040" => mask |= 0x02,
-            "bcm2712" => mask |= 0x04,
-            "wasm" => mask |= 0x08,
-            "linux" => mask |= 0x10,
-            _ => {} // ignore unknown targets
-        }
+fn hardware_targets_from_list(targets: &[String]) -> Result<u16> {
+    let unknown = crate::runtime_abi::unknown_runtimes(targets);
+    if !unknown.is_empty() {
+        return Err(Error::Module(format!(
+            "`hardware_targets` names {} which is not a runtime (known: {})",
+            unknown.join(", "),
+            crate::runtime_abi::RUNTIMES
+                .iter()
+                .map(|r| r.id)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
     }
-    mask
+    Ok(crate::runtime_abi::runtime_mask(targets))
 }
 
 // ── Core types ──────────────────────────────────────────────────────────────
@@ -2044,15 +2039,15 @@ impl Manifest {
     }
 
     /// Target-aware TOML load: per-target capacity tables resolve
-    /// against `silicon` (falling back to their `default` key). A
-    /// `None` silicon resolves `default` only.
-    pub fn from_toml_for_target(path: &Path, silicon: Option<&str>) -> Result<Self> {
+    /// against `abi` (falling back to their `default` key). A
+    /// `None` abi resolves `default` only.
+    pub fn from_toml_for_target(path: &Path, abi: Option<&str>) -> Result<Self> {
         let content = std::fs::read_to_string(path)
             .map_err(|e| Error::Module(format!("cannot read {}: {}", path.display(), e)))?;
         // Name the manifest in every diagnostic: the module identity lives in
         // the path, not in the TOML, so a bare parse error would otherwise
         // leave the reader guessing which of ~40 manifests failed.
-        Self::from_toml_str_for_target(&content, silicon)
+        Self::from_toml_str_for_target(&content, abi)
             .map_err(|e| Error::Module(format!("{}: {e}", path.display())))
     }
 
@@ -2061,7 +2056,7 @@ impl Manifest {
     /// manifest that never sits on disk — notably the `manifest.toml`
     /// layer of a pinned `[[artifact]]` module entry, which is fetched from
     /// the OCI store rather than a source tree.
-    pub fn from_toml_str_for_target(content: &str, silicon: Option<&str>) -> Result<Self> {
+    pub fn from_toml_str_for_target(content: &str, abi: Option<&str>) -> Result<Self> {
         let toml_val: TomlManifest = toml::from_str(content)
             .map_err(|e| Error::Module(format!("invalid manifest TOML: {e}")))?;
 
@@ -2069,10 +2064,13 @@ impl Manifest {
         let module_version = encode_semver(major, minor, patch);
 
         let hardware_target_names: Vec<String> = toml_val.hardware_targets.unwrap_or_default();
+        // No runtime named: the module is portable and runs everywhere.
         let hardware_targets = if hardware_target_names.is_empty() {
-            0x01
+            crate::runtime_abi::RUNTIMES
+                .iter()
+                .fold(0, |m, r| m | r.bit)
         } else {
-            hardware_targets_from_list(&hardware_target_names)
+            hardware_targets_from_list(&hardware_target_names)?
         };
 
         let state_bytes_64 = toml_val.state_bytes_64.unwrap_or(0);
@@ -2130,11 +2128,11 @@ impl Manifest {
                 name: p.name,
                 index,
                 buffer_size: match &p.buffer_size {
-                    Some(v) => v.resolve(silicon, "buffer_size")?,
+                    Some(v) => v.resolve(abi, "buffer_size")?,
                     None => 0,
                 },
                 max_record: match &p.max_record {
-                    Some(v) => v.resolve(silicon, "max_record")?,
+                    Some(v) => v.resolve(abi, "max_record")?,
                     None => 0,
                 },
                 rate_class_max: match &p.rate_class_max {
@@ -2228,7 +2226,7 @@ impl Manifest {
             .filter_map(|p| p.requires_capability.clone())
             .collect();
         validate_capability_facts(&capability_facts, &capabilities, &required_caps)?;
-        let capability_facts = resolve_capability_facts(capability_facts, silicon)?;
+        let capability_facts = resolve_capability_facts(capability_facts, abi)?;
         let requires_when = validate_requires_when(toml_val.requires_when.unwrap_or_default())?;
         // Read for publication by `publish_withheld`; checked here so a
         // reasonless withholding fails the build, not only the publish.
@@ -2543,12 +2541,12 @@ impl Manifest {
                 .collect();
         }
 
-        // Module-scope capacities resolve against the same silicon the port
+        // Module-scope capacities resolve against the same abi the port
         // capacities do, so one manifest read yields every bound the build
         // needs for this target.
         let mut capacities = std::collections::BTreeMap::new();
         for (name, value) in toml_val.capacities.unwrap_or_default() {
-            let resolved = value.resolve(silicon, &format!("capacities.{name}"))?;
+            let resolved = value.resolve(abi, &format!("capacities.{name}"))?;
             capacities.insert(name, resolved);
         }
 
@@ -3326,13 +3324,13 @@ impl TomlExecution {
                     .into(),
             ));
         }
-        for silicon in hardware_targets {
-            let budget = crate::target_facts::TargetFacts::for_silicon(silicon).step_budget_us;
+        for runtime in hardware_targets {
+            let budget = crate::target_facts::TargetFacts::for_runtime(runtime).step_budget_us;
             if max_step_us > budget {
                 return Err(err(format!(
                     "max_step_us = {max_step_us} exceeds the {budget} us step budget of \
-                     hardware target `{silicon}`; a step that cannot fit one scheduler \
-                     pass there has no envelope on that silicon"
+                     runtime `{runtime}`; a step that cannot fit one scheduler pass there \
+                     has no envelope on that runtime"
                 )));
             }
         }
@@ -3462,12 +3460,12 @@ impl TargetCapabilities {
     /// true` will reject placement until the name is added here.
     ///
     /// Board names must be resolved to silicon through the `targets/`
-    /// registry BEFORE this call (`TargetDescriptor::module_silicon()`);
+    /// registry BEFORE this call (`TargetDescriptor::runtime()`);
     /// this table deliberately carries no board rows.
-    pub fn for_silicon(name: &str) -> Self {
+    pub fn for_runtime(name: &str) -> Self {
         // Silicon and host tokens only — board names resolve through the
         // `targets/` registry BEFORE reaching this table (callers pass
-        // `TargetDescriptor::module_silicon()`). No alias rows: the
+        // `TargetDescriptor::runtime()`). No alias rows: the
         // registry is the single board→silicon mapping.
         match name {
             // Cortex-M0+, no FPU, no SIMD, no MMU.
@@ -3519,10 +3517,10 @@ impl TargetCapabilities {
 ///
 /// Designed to be called from the config-validation path against the
 /// resolved per-module target after `parse_modules_from_config`. The
-/// resulting error message is operator-facing (cites silicon id and
+/// resulting error message is operator-facing (cites the runtime and
 /// the missing caps).
-pub fn check_target_capabilities(manifest_requires: TomlRequires, silicon: &str) -> Result<()> {
-    let caps = TargetCapabilities::for_silicon(silicon);
+pub fn check_target_capabilities(manifest_requires: TomlRequires, runtime: &str) -> Result<()> {
+    let caps = TargetCapabilities::for_runtime(runtime);
     let mut missing: Vec<&str> = Vec::new();
     if manifest_requires.fpu && !caps.fpu {
         missing.push("fpu");
@@ -3537,11 +3535,11 @@ pub fn check_target_capabilities(manifest_requires: TomlRequires, silicon: &str)
         Ok(())
     } else {
         Err(Error::Module(format!(
-            "module's `[requires]` declares {} but silicon `{}` does not provide them. \
+            "module's `[requires]` declares {} but runtime `{}` does not provide them. \
              Either place this module on a target with those caps, or drop the requirement \
              if the module does not need it.",
             missing.join(", "),
-            silicon,
+            runtime,
         )))
     }
 }
@@ -3572,11 +3570,11 @@ struct TomlParam {
 }
 
 /// A capacity value in port TOML: either flat (`buffer_size = 4096`)
-/// or per-target (`buffer_size = { default = 2048, bcm2712 = 16384 }`),
-/// resolved at pack time — the packer knows which silicon it is
-/// packing for. Keys are silicon ids (`rp2040`, `rp2350`, `bcm2712`,
-/// `wasm`) plus `default`; unknown keys are rejected so a typo can't
-/// silently fall back to `default`.
+/// or per-target (`buffer_size = { default = 2048, aarch64 = 16384 }`),
+/// resolved at pack time — the packer knows which module ABI it is
+/// packing for. Keys are module ABI ids (`crate::runtime_abi::ABIS`) plus
+/// `default`; unknown keys are rejected so a typo can't silently fall back
+/// to `default`.
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum CapacityValue {
@@ -3584,10 +3582,18 @@ enum CapacityValue {
     PerTarget(std::collections::BTreeMap<String, u32>),
 }
 
-const CAPACITY_TARGET_KEYS: &[&str] = &["default", "rp2040", "rp2350", "bcm2712", "wasm"];
+const CAPACITY_TARGET_KEYS: &[&str] = &[
+    "default",
+    "thumbv6m",
+    "thumbv8m",
+    "aarch64",
+    "x86_64",
+    "wasm32",
+    "xtensa-lx6",
+];
 
 impl CapacityValue {
-    fn resolve(&self, silicon: Option<&str>, field: &str) -> Result<u32> {
+    fn resolve(&self, abi: Option<&str>, field: &str) -> Result<u32> {
         match self {
             CapacityValue::Flat(v) => Ok(*v),
             CapacityValue::PerTarget(map) => {
@@ -3599,15 +3605,15 @@ impl CapacityValue {
                         )));
                     }
                 }
-                if let Some(sil) = silicon {
-                    if let Some(v) = map.get(sil) {
+                if let Some(a) = abi {
+                    if let Some(v) = map.get(a) {
                         return Ok(*v);
                     }
                 }
                 map.get("default").copied().ok_or_else(|| {
                     Error::Module(format!(
                         "per-target `{field}` has no entry for target {:?} and no `default`",
-                        silicon.unwrap_or("<none>")
+                        abi.unwrap_or("<none>")
                     ))
                 })
             }
@@ -4213,37 +4219,49 @@ required = true
         assert!(Manifest::from_bytes(&bytes[..bytes.len() - 1]).is_err());
     }
 
-    /// Module-scope `[capacities]` resolve per silicon like port capacities do,
-    /// fall back to `default` for an unlisted silicon, and reject an unknown
-    /// silicon key so a typo can't silently hand back `default`.
+    /// Module-scope `[capacities]` resolve per module ABI like port
+    /// capacities do, fall back to `default` for an unlisted ABI, and reject
+    /// an unknown key so a typo can't silently hand back `default`.
     #[test]
-    fn module_capacities_resolve_per_silicon() {
+    fn module_capacities_resolve_per_abi() {
         const TOML: &str = r#"
 version = "1.0.0"
 hardware_targets = ["bcm2712", "rp2350"]
 
 [capacities]
-idtable = { default = 2048, bcm2712 = 4096 }
+idtable = { default = 2048, aarch64 = 4096 }
 scratch = 512
 "#;
-        let big = Manifest::from_toml_str_for_target(TOML, Some("bcm2712")).expect("bcm2712");
+        let big = Manifest::from_toml_str_for_target(TOML, Some("aarch64")).expect("aarch64");
         assert_eq!(big.capacities["idtable"], 4096);
         assert_eq!(big.capacities["scratch"], 512);
 
-        let small = Manifest::from_toml_str_for_target(TOML, Some("rp2350")).expect("rp2350");
+        let small = Manifest::from_toml_str_for_target(TOML, Some("thumbv8m")).expect("thumbv8m");
         assert_eq!(small.capacities["idtable"], 2048);
 
-        let none = Manifest::from_toml_str_for_target(TOML, None).expect("no silicon");
+        let none = Manifest::from_toml_str_for_target(TOML, None).expect("no ABI");
         assert_eq!(none.capacities["idtable"], 2048);
 
-        let typo = "version = \"1.0.0\"\n[capacities]\nidtable = { default = 1, bcm2711 = 2 }\n";
-        let err = Manifest::from_toml_str_for_target(typo, Some("bcm2712"))
-            .expect_err("unknown silicon key is rejected")
+        let silicon = "version = \"1.0.0\"\n[capacities]\nidtable = { default = 1, bcm2712 = 2 }\n";
+        let err = Manifest::from_toml_str_for_target(silicon, Some("aarch64"))
+            .expect_err("a silicon key is not an ABI key")
             .to_string();
         assert!(
             err.contains("capacities.idtable"),
             "error should name the offending capacity: {err}"
         );
+    }
+
+    /// `hardware_targets` names runtimes; anything else is refused.
+    #[test]
+    fn hardware_targets_must_name_runtimes() {
+        let err = Manifest::from_toml_str_for_target(
+            "version = \"1.0.0\"\nhardware_targets = [\"esp32s3\"]\n",
+            None,
+        )
+        .expect_err("not a runtime")
+        .to_string();
+        assert!(err.contains("not a runtime"), "{err}");
     }
 
     // ── Built-in parameter schema lock ──────────────────────────────────

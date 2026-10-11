@@ -88,13 +88,13 @@ impl TcpState {
 // throughput under loss for resident memory rather than correctness. Four
 // 512-byte slots are 2 KiB per connection, which on RP2040 is the difference
 // between `ip` at 28,352 B and 20,600 B — measured.
-#[cfg(not(fluxor_silicon = "rp2040"))]
+#[cfg(not(fluxor_abi = "thumbv6m"))]
 pub const REORDER_SLOTS: usize = 4;
-#[cfg(fluxor_silicon = "rp2040")]
+#[cfg(fluxor_abi = "thumbv6m")]
 pub const REORDER_SLOTS: usize = 2;
-#[cfg(not(fluxor_silicon = "rp2040"))]
+#[cfg(not(fluxor_abi = "thumbv6m"))]
 pub const REORDER_SLOT_BYTES: usize = 512;
-#[cfg(fluxor_silicon = "rp2040")]
+#[cfg(fluxor_abi = "thumbv6m")]
 pub const REORDER_SLOT_BYTES: usize = 256;
 
 /// A single out-of-order segment held for reassembly.

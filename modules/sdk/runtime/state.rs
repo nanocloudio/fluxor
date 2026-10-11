@@ -65,7 +65,7 @@ macro_rules! declare_module_state_bytes {
 // The argument is a const expression, so it can differ per silicon from one
 // site, the way state sizes do:
 //
-//     declare_module_stack_bytes!(if cfg!(fluxor_silicon = "bcm2712") { 16 * 1024 } else { 5 * 1024 });
+//     declare_module_stack_bytes!(if cfg!(fluxor_abi = "aarch64") { 16 * 1024 } else { 5 * 1024 });
 //
 // Mangled for the same reason as `FLUXOR_MODULE_STATE_BYTES`. A module that has
 // not declared records 0, which the composer refuses on a target without an

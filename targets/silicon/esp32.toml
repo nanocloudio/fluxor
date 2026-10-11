@@ -1,0 +1,45 @@
+# ESP32 (ESP32-WROOM-32): dual Xtensa LX6. Validation only: no kernel or
+# module build yet. GPIO matrix allows flexible pin assignment for most
+# peripherals; GPIO 34-39 are input-only.
+
+[target]
+id = "esp32"
+family = "esp32"
+description = "ESP32 (dual Xtensa LX6, validation only)"
+runtime = "esp32"
+module_abi = "xtensa-lx6"
+
+# No [build] section — validation only, no kernel build support yet.
+
+[gpio]
+max_pin = 39
+# GPIO 6-11 drive the module's SPI flash.
+reserved_pins = [6, 7, 8, 9, 10, 11]
+
+[peripherals]
+spi_count = 2
+i2c_count = 2
+uart_count = 3
+adc_channels = 18
+pwm_slices = 16
+pio_count = 0
+pio_state_machines = 0
+dma_channels = 0
+
+[peripherals.spi0]
+valid_pins = "any"
+
+[peripherals.spi1]
+valid_pins = "any"
+
+[peripherals.i2c0]
+valid_pins = "any"
+
+[peripherals.i2c1]
+valid_pins = "any"
+
+[memory]
+flash_base = "0x400d0000"
+flash_size = "0x400000"
+ram_base = "0x3ffb0000"
+ram_size = "0x50000"

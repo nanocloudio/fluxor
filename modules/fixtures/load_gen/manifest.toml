@@ -1,5 +1,5 @@
 version = "1.0.0"
-hardware_targets = ["bcm2712", "rp2350"]
+hardware_targets = ["bcm2712", "rp2350", "linux"]
 
 # Drives its busy/idle phase off real wall-clock time (dev_millis), so a
 # variable scheduler cadence only changes when it samples, not its behaviour —

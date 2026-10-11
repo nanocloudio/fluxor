@@ -495,26 +495,26 @@ mod profile_embedded {
     pub mod kernel {
         // The embedded profile covers BOTH RP parts, whose state arenas differ
         // by 3.75x — 64 KiB on RP2040 against 240 KiB on RP2350
-        // (`targets/silicon/*.toml`). Keyed on `fluxor_silicon`, which the
+        // (`targets/silicon/*.toml`). Keyed on `fluxor_abi`, which the
         // module build passes, because `target_arch` cannot tell thumbv6m from
         // thumbv8m and one arm would otherwise charge the smaller die the
         // larger one's sizes.
-        #[cfg(not(fluxor_silicon = "rp2040"))]
+        #[cfg(not(fluxor_abi = "thumbv6m"))]
         pub const STATE_ARENA_SIZE: usize = 240 * 1024;
-        #[cfg(fluxor_silicon = "rp2040")]
+        #[cfg(fluxor_abi = "thumbv6m")]
         pub const STATE_ARENA_SIZE: usize = 64 * 1024;
         /// Loader sanity ceiling for a single module's code segment. Code
         /// executes in place from flash, so this costs no RAM and is set by
         /// the part's flash: 1 MiB on the 4 MiB RP2350, which a JavaScript
         /// engine (~440 KiB) fits; 384 KiB on the 2 MiB RP2040.
         /// `module_code_kb` in the silicon TOML mirrors it for the packer.
-        #[cfg(not(fluxor_silicon = "rp2040"))]
+        #[cfg(not(fluxor_abi = "thumbv6m"))]
         pub const MAX_MODULE_CODE_SIZE: usize = 1024 * 1024;
-        #[cfg(fluxor_silicon = "rp2040")]
+        #[cfg(fluxor_abi = "thumbv6m")]
         pub const MAX_MODULE_CODE_SIZE: usize = 384 * 1024;
-        #[cfg(not(fluxor_silicon = "rp2040"))]
+        #[cfg(not(fluxor_abi = "thumbv6m"))]
         pub const BUFFER_ARENA_SIZE: usize = 64 * 1024;
-        #[cfg(fluxor_silicon = "rp2040")]
+        #[cfg(fluxor_abi = "thumbv6m")]
         pub const BUFFER_ARENA_SIZE: usize = 16 * 1024;
         pub const MAX_MODULES: usize = 32;
         /// ISR-tier bridge slots; see profile_host. Eight is the ISR edges
@@ -524,13 +524,13 @@ mod profile_embedded {
         /// arenas above: the RP kernel takes this from `config_buffer_kb` in the
         /// silicon TOML, so a single value here would describe one die and
         /// misreport the other.
-        #[cfg(not(fluxor_silicon = "rp2040"))]
+        #[cfg(not(fluxor_abi = "thumbv6m"))]
         pub const MAX_MODULE_CONFIG_SIZE: usize = 16 * 1024;
-        #[cfg(fluxor_silicon = "rp2040")]
+        #[cfg(fluxor_abi = "thumbv6m")]
         pub const MAX_MODULE_CONFIG_SIZE: usize = 8 * 1024;
-        #[cfg(not(fluxor_silicon = "rp2040"))]
+        #[cfg(not(fluxor_abi = "thumbv6m"))]
         pub const CONFIG_ARENA_SIZE: usize = 16 * 1024;
-        #[cfg(fluxor_silicon = "rp2040")]
+        #[cfg(fluxor_abi = "thumbv6m")]
         pub const CONFIG_ARENA_SIZE: usize = 8 * 1024;
         pub const LOG_RING_CAPACITY: usize = 8192;
         /// No Tier B on MCU-class targets: elasticity compiles out
@@ -551,13 +551,13 @@ mod profile_embedded {
         // a single-page local UI, not a browser opening parallel sockets. The
         // SDK asserts `MAX_CONCURRENT_CONNS <= ip::MAX_TCP_CONNS`, so this moves
         // with the connection table below.
-        #[cfg(not(fluxor_silicon = "rp2040"))]
+        #[cfg(not(fluxor_abi = "thumbv6m"))]
         pub const MAX_CONCURRENT_CONNS: usize = 4;
-        #[cfg(fluxor_silicon = "rp2040")]
+        #[cfg(fluxor_abi = "thumbv6m")]
         pub const MAX_CONCURRENT_CONNS: usize = 1;
-        #[cfg(not(fluxor_silicon = "rp2040"))]
+        #[cfg(not(fluxor_abi = "thumbv6m"))]
         pub const ARENA_WORKING_SET_CONNS: usize = 4;
-        #[cfg(fluxor_silicon = "rp2040")]
+        #[cfg(fluxor_abi = "thumbv6m")]
         pub const ARENA_WORKING_SET_CONNS: usize = 1;
         pub const RECV_BUF_SIZE: usize = 2048;
         pub const SEND_BUF_SIZE: usize = 4100;
@@ -584,12 +584,12 @@ mod profile_embedded {
         /// of this die's 240 KiB state arena, and the four connection slots
         /// and the module's own state take 53 KiB more, so the pool is the
         /// remainder that leaves the arena room to breathe.
-        #[cfg(not(fluxor_silicon = "rp2040"))]
+        #[cfg(not(fluxor_abi = "thumbv6m"))]
         pub const DEFAULT_BODY_POOL_SIZE: usize = 16 * 1024;
         /// Four KiB on RP2040: a status page and a small JSON reply. Sixteen
         /// would be a quarter of the whole arena for staging that a
         /// `fs_path` route streams without touching this pool at all.
-        #[cfg(fluxor_silicon = "rp2040")]
+        #[cfg(fluxor_abi = "thumbv6m")]
         pub const DEFAULT_BODY_POOL_SIZE: usize = 4 * 1024;
     }
 
@@ -599,16 +599,16 @@ mod profile_embedded {
         // 41,656 B of RP2040's 65,536 B arena. Two slots is what a sensor node
         // holds at once — one broker session and one inbound request — and
         // measures 20,600 B with the reorder cut below.
-        #[cfg(not(fluxor_silicon = "rp2040"))]
+        #[cfg(not(fluxor_abi = "thumbv6m"))]
         pub const MAX_TCP_CONNS: usize = 8;
-        #[cfg(fluxor_silicon = "rp2040")]
+        #[cfg(fluxor_abi = "thumbv6m")]
         pub const MAX_TCP_CONNS: usize = 2;
         /// Datagram endpoints; see profile_host.
         /// Endpoints are allocated from the connection table's first slots, and
         /// the SDK asserts the bound, so this follows `MAX_TCP_CONNS`.
-        #[cfg(not(fluxor_silicon = "rp2040"))]
+        #[cfg(not(fluxor_abi = "thumbv6m"))]
         pub const MAX_DG_ENDPOINTS: usize = 8;
-        #[cfg(fluxor_silicon = "rp2040")]
+        #[cfg(fluxor_abi = "thumbv6m")]
         pub const MAX_DG_ENDPOINTS: usize = 2;
         /// Transport-continuity shadows; see profile_host.
         pub const MAX_TCP_SHADOWS: usize = 1;

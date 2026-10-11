@@ -1,5 +1,5 @@
 version = "1.0.0"
-hardware_targets = ["bcm2712", "rp2350"]
+hardware_targets = ["bcm2712", "rp2350", "linux"]
 
 # Connection-level demultiplexer. Sits on a single shared `ip` module's
 # `net_out` (NetProto stream) and routes each net_proto frame to one of N

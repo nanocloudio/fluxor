@@ -4,7 +4,7 @@
 #
 # The host CPU must carry the ARMv8 Cryptography Extension (FEAT_AES,
 # FEAT_SHA256). Everything fluxor builds for this triple is compiled with
-# `+aes,+sha2,+neon` — the bcm2712 modules this host loads, its own kernel
+# `+aes,+sha2,+neon` — the aarch64 modules this host loads, its own kernel
 # binary, and the `fluxor` CLI and launcher, which are published artefacts
 # that ship alongside that runtime. The flags are declared once, in
 # `.cargo/config.toml`, so that every invocation agrees: a host that cannot
@@ -15,9 +15,10 @@
 id = "linux"
 family = "linux"
 description = "Linux hosted (aarch64 userspace)"
-# The host process loads the aarch64 PIC modules built for bcm2712, so its
-# .fmods and its fluxor.lock pins are tagged `bcm2712`, not `linux`.
-module_silicon = "bcm2712"
+# The hosted runtime on aarch64 loads `aarch64` modules: the same bytes
+# bare-metal bcm2712 runs, placed by the runtime each module names.
+runtime = "linux"
+module_abi = "aarch64"
 
 [build]
 rust_target = "aarch64-unknown-linux-gnu"

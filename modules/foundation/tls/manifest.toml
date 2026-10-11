@@ -152,14 +152,14 @@ name = "cont_in"
 direction = "input"
 index = 2
 content_type = "OctetStream"
-buffer_size = { default = 32768, rp2350 = 16384, bcm2712 = 65536 }
+buffer_size = { default = 32768, thumbv8m = 16384, aarch64 = 65536 }
 
 [[ports]]
 name = "cont_out"
 direction = "output"
 index = 3
 content_type = "OctetStream"
-buffer_size = { default = 65536, rp2350 = 16384, bcm2712 = 65536 }
+buffer_size = { default = 65536, thumbv8m = 16384, aarch64 = 65536 }
 
 # Module-scope observability (optional); wired to observe.telemetry.
 [observability]

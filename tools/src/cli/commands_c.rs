@@ -2020,14 +2020,14 @@ fn cmd_modules_build(
     let mut had_failure = false;
     for tr in &report.per_target {
         println!(
-            "Modules ({target}/{silicon}): built {} of {}, up-to-date {}, skipped {}, failed {}",
+            "Modules ({target}/{abi}): built {} of {}, up-to-date {}, skipped {}, failed {}",
             tr.built.len(),
             tr.built.len() + tr.up_to_date.len() + tr.skipped.len() + tr.failed.len(),
             tr.up_to_date.len(),
             tr.skipped.len(),
             tr.failed.len(),
             target = tr.target,
-            silicon = tr.silicon,
+            abi = tr.abi,
         );
         for (name, reason) in &tr.skipped {
             println!("  skipped: {name} — {reason}");

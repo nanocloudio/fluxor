@@ -35,8 +35,8 @@ wasm         | target_arch = "wasm32"
 embedded     | not(any(target_arch = "aarch64", target_arch = "wasm32"))
 large-config | any(target_os = "linux", target_arch = "wasm32", target_arch = "aarch64")
 small-config | not(any(target_os = "linux", target_arch = "wasm32", target_arch = "aarch64"))
-rp2040       | fluxor_silicon = "rp2040"
-rp2350       | not(fluxor_silicon = "rp2040")
+rp2040       | fluxor_abi = "thumbv6m"
+rp2350       | not(fluxor_abi = "thumbv6m")
 multitenant  | feature = "multitenant"
 single-owner | not(feature = "multitenant")
 chip-rp2040  | feature = "chip-rp2040"

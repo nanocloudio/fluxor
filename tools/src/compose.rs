@@ -1683,7 +1683,7 @@ mod tests {
     /// arena demand needs and fail silently on the board". On the RP targets there
     /// are necessarily two: a PIC module compiles against the materialised SDK
     /// alone and never sees `build.rs`'s output or the TOML, so the SDK restates
-    /// each number and `--cfg fluxor_silicon` selects the arm.
+    /// each number and `--cfg fluxor_abi` selects the arm.
     ///
     /// That second copy is the one this pins. Nothing else did, and both
     /// `STATE_ARENA_SIZE` (240 KiB, published as 256) and
@@ -1744,7 +1744,7 @@ mod tests {
 
     /// Resolve `konst` for `silicon` out of the embedded profile's source.
     ///
-    /// Honours the `fluxor_silicon` cfg arms: an unconditional declaration answers
+    /// Honours the `fluxor_abi` cfg arms: an unconditional declaration answers
     /// for both dies, a guarded one only for the die it names. Returns `None` when
     /// the constant is absent, which the caller reports as a missing declaration
     /// rather than treating as agreement.
@@ -1761,10 +1761,8 @@ mod tests {
             if let Some(rest) = t.strip_prefix(&decl) {
                 let applies = match cfg {
                     None => true,
-                    Some(c) if c.contains("not(fluxor_silicon = \"rp2040\")") => {
-                        silicon != "rp2040"
-                    }
-                    Some(c) if c.contains("fluxor_silicon = \"rp2040\"") => silicon == "rp2040",
+                    Some(c) if c.contains("not(fluxor_abi = \"thumbv6m\")") => silicon != "rp2040",
+                    Some(c) if c.contains("fluxor_abi = \"thumbv6m\"") => silicon == "rp2040",
                     // A cfg this test does not understand: refuse to guess.
                     Some(_) => false,
                 };

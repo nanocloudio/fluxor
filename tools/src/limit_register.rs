@@ -204,7 +204,7 @@ fn consumes_attrs(line: &str) -> bool {
 ///
 /// The profile a value belongs to is not a property of the declaration alone:
 /// `MAX_TCP_CONNS = 2` is the rp2040 value only because it sits inside
-/// `mod profile_embedded` AND behind `cfg(fluxor_silicon = "rp2040")`. So the
+/// `mod profile_embedded` AND behind `cfg(fluxor_abi = "thumbv6m")`. So the
 /// scan carries a stack of enclosing item `cfg`s alongside the attributes
 /// immediately above each declaration, and a declaration's guard set is the
 /// join. A gate that read only the nearest attribute would call the embedded
@@ -536,7 +536,7 @@ fn parse_ref(s: &str) -> Option<(String, String)> {
 /// ````text
 /// ```limit-register-profiles
 /// host     | target_arch = "aarch64"
-/// rp2040   | fluxor_silicon = "rp2040"
+/// rp2040   | fluxor_abi = "thumbv6m"
 /// ```
 /// ````
 pub fn parse_profiles(block: &str) -> BTreeMap<String, String> {
@@ -964,9 +964,9 @@ mod tests {
             "}\n",
             "#[cfg(not(target_arch = \"aarch64\"))]\n",
             "mod profile_embedded {\n",
-            "    #[cfg(not(fluxor_silicon = \"rp2040\"))]\n",
+            "    #[cfg(not(fluxor_abi = \"thumbv6m\"))]\n",
             "    pub const MAX_A: usize = 8;\n",
-            "    #[cfg(fluxor_silicon = \"rp2040\")]\n",
+            "    #[cfg(fluxor_abi = \"thumbv6m\")]\n",
             "    pub const MAX_A: usize = 2;\n",
             "}\n",
         );
@@ -974,8 +974,8 @@ mod tests {
             "```limit-register-profiles\n",
             "host | target_arch = \"aarch64\"\n",
             "embedded | not(target_arch = \"aarch64\")\n",
-            "rp2350 | not(fluxor_silicon = \"rp2040\")\n",
-            "rp2040 | fluxor_silicon = \"rp2040\"\n",
+            "rp2350 | not(fluxor_abi = \"thumbv6m\")\n",
+            "rp2040 | fluxor_abi = \"thumbv6m\"\n",
             "```\n",
         );
         let agreeing = project(
@@ -1047,12 +1047,12 @@ mod tests {
             &[(
                 SRC,
                 "#[cfg(target_arch = \"aarch64\")]\npub const MAX_A: usize = 4;\n\
-                 #[cfg(fluxor_silicon = \"rp2040\")]\npub const MAX_A: usize = 1;\n",
+                 #[cfg(fluxor_abi = \"thumbv6m\")]\npub const MAX_A: usize = 1;\n",
             )],
         );
         let r = run(&d);
         assert_eq!(r.failures.len(), 1, "{:?}", r.failures);
-        assert!(r.failures[0].contains("rp2040"), "{:?}", r.failures);
+        assert!(r.failures[0].contains("thumbv6m"), "{:?}", r.failures);
         assert!(
             r.failures[0].contains("limit-register-profiles"),
             "{:?}",

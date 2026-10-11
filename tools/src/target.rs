@@ -240,10 +240,10 @@ struct TomlTargetMeta {
     id: String,
     family: String,
     description: String,
-    /// Silicon whose PIC modules this target loads, when it differs from
-    /// the target's own id (the linux host runs the aarch64 `bcm2712`
-    /// modules). Absent means "my own silicon".
-    module_silicon: Option<String>,
+    /// The runtime this target is (`crate::runtime_abi::RUNTIMES`).
+    runtime: String,
+    /// The module ABI it loads: its artefact shelf, store tag and pin.
+    module_abi: String,
 }
 
 #[derive(Deserialize)]
@@ -365,10 +365,12 @@ pub struct TargetDescriptor {
     pub description: String,
     /// Board id, if loaded via board file (e.g. "pico2w")
     pub board_id: Option<String>,
-    /// `[target].module_silicon` from the descriptor TOML — set only when
-    /// the target's PIC modules come from another silicon. Read through
-    /// `module_silicon()`, which falls back to this target's own silicon.
-    pub module_silicon_override: Option<String>,
+    /// `[target].runtime`: where modules run, which decides the contracts
+    /// they may reach and the modules that may be placed here.
+    pub runtime: String,
+    /// `[target].module_abi`: the bytes this target loads — its artefact
+    /// shelf (`target/fluxor/<abi>/modules`), store tag and pin.
+    pub module_abi: String,
     /// Board description, if loaded via board file
     pub board_description: Option<String>,
     /// Build configuration (None for validation-only targets)
@@ -540,42 +542,20 @@ impl TargetDescriptor {
         self.board_id.as_deref().unwrap_or(&self.id)
     }
 
-    /// Silicon whose PIC modules (`.fmod`s) and OCI pins this target uses.
-    ///
-    /// Single source for "where do my modules come from": both the
-    /// `target/fluxor/<silicon>/modules` directory and the silicon tag on
-    /// `fluxor.lock` pins key off this. Most targets answer with their own
-    /// silicon; the linux host answers `bcm2712` because it loads the same
-    /// aarch64 PIC modules. Declare the exception in the target TOML
-    /// (`[target].module_silicon`) so a new host family never has to touch
-    /// this code. There are no alias tables: boards resolve through their
-    /// `[board].silicon` field, so `self.id` IS the silicon id here.
-    pub fn module_silicon(&self) -> &str {
-        match self.module_silicon_override {
-            Some(ref s) => s,
-            None => &self.id,
-        }
+    /// The module ABI this target loads (`crate::runtime_abi::ABIS`).
+    pub fn module_abi(&self) -> &str {
+        &self.module_abi
+    }
+
+    /// The runtime this target is (`crate::runtime_abi::RUNTIMES`).
+    pub fn runtime(&self) -> &str {
+        &self.runtime
     }
 
     /// True for host-level targets (`linux`, `wasm`) — fluxor as a
     /// process on an OS/runtime rather than a board or bare silicon.
     pub fn is_host(&self) -> bool {
         self.kind == TargetKind::Host
-    }
-
-    /// Manifest `hardware_targets` strings this target accepts: its
-    /// module silicon, plus its own token when it is a host (host-capable
-    /// modules declare `linux`/`wasm` directly). Boards never appear —
-    /// a board id in `hardware_targets` is a validation error.
-    pub fn accepted_hardware_targets(&self) -> Vec<String> {
-        let mut v = vec![self.module_silicon().to_string()];
-        if self.is_host() {
-            let own = self.build_id().to_string();
-            if !v.contains(&own) {
-                v.push(own);
-            }
-        }
-        v
     }
 
     /// Display name: "pico2w (RP2350 (dual Cortex-M33))" or "rp2350 (...)"
@@ -771,6 +751,30 @@ fn load_silicon_target(path: &Path, kind: TargetKind) -> Result<TargetDescriptor
 
     let p = &silicon.peripherals;
     let isolation = IsolationFacts::from_toml(silicon.isolation.as_ref(), &silicon.target.id)?;
+    // A target names a runtime from the table and an ABI that runtime
+    // loads; anything else would send its modules to a shelf nothing
+    // builds and admit modules that cannot run there.
+    let Some(rt) = crate::runtime_abi::runtime(&silicon.target.runtime) else {
+        return Err(Error::Config(format!(
+            "{}: `runtime = \"{}\"` is not a runtime (known: {})",
+            path.display(),
+            silicon.target.runtime,
+            crate::runtime_abi::RUNTIMES
+                .iter()
+                .map(|r| r.id)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    };
+    if !rt.abis.contains(&silicon.target.module_abi.as_str()) {
+        return Err(Error::Config(format!(
+            "{}: runtime `{}` does not load module ABI `{}` (it loads {})",
+            path.display(),
+            rt.id,
+            silicon.target.module_abi,
+            rt.abis.join(", ")
+        )));
+    }
 
     Ok(TargetDescriptor {
         kind,
@@ -779,7 +783,8 @@ fn load_silicon_target(path: &Path, kind: TargetKind) -> Result<TargetDescriptor
         description: silicon.target.description,
         board_id: None,
         board_description: None,
-        module_silicon_override: silicon.target.module_silicon,
+        runtime: silicon.target.runtime,
+        module_abi: silicon.target.module_abi,
         build,
         max_pin: silicon.gpio.max_pin.unwrap_or(29),
         reserved_pins: Vec::new(),
@@ -977,44 +982,76 @@ mod tests {
         p
     }
 
-    /// Pins the "where do my modules come from" answer for every shipped
-    /// target. A new target that gets this wrong loads `.fmod`s from a
-    /// directory nothing writes, and resolves `fluxor.lock` pins tagged
-    /// with a silicon nothing publishes.
+    /// Pins every shipped target's runtime and module ABI. A target that
+    /// gets the ABI wrong loads `.fmod`s from a shelf nothing writes and
+    /// resolves pins tagged with an ABI nothing publishes; one that gets the
+    /// runtime wrong admits modules that cannot run there.
     #[test]
-    fn module_silicon_pins_shipped_targets() {
+    fn shipped_targets_declare_their_runtime_and_abi() {
         let root = repo_root();
-        for (target, want) in [
-            ("linux", "bcm2712"),
-            ("pi5", "bcm2712"),
-            ("bcm2712", "bcm2712"),
-            ("qemu-virt", "bcm2712"),
-            ("rp2350", "rp2350"),
-            ("pico2w", "rp2350"),
-            ("waveshare-lcd4", "rp2350"),
-            ("rp2040", "rp2040"),
-            ("pico", "rp2040"),
-            ("picow", "rp2040"),
-            ("wasm", "wasm"),
+        for (target, runtime, abi) in [
+            ("linux", "linux", "aarch64"),
+            ("pi5", "bcm2712", "aarch64"),
+            ("bcm2712", "bcm2712", "aarch64"),
+            ("qemu-virt", "bcm2712", "aarch64"),
+            ("rp2350", "rp2350", "thumbv8m"),
+            ("pico2w", "rp2350", "thumbv8m"),
+            ("waveshare-lcd4", "rp2350", "thumbv8m"),
+            ("rp2040", "rp2040", "thumbv6m"),
+            ("pico", "rp2040", "thumbv6m"),
+            ("picow", "rp2040", "thumbv6m"),
+            ("wasm", "wasm", "wasm32"),
+            ("esp32", "esp32", "xtensa-lx6"),
         ] {
             let desc = super::load_target(target, &root).expect("target loads");
-            assert_eq!(
-                desc.module_silicon(),
-                want,
-                "target `{target}` must load modules built for `{want}`"
+            assert_eq!(desc.runtime(), runtime, "target `{target}` runtime");
+            assert_eq!(desc.module_abi(), abi, "target `{target}` module ABI");
+        }
+    }
+
+    /// Every target names a runtime and ABI the table knows, and the
+    /// runtime loads that ABI.
+    #[test]
+    fn every_target_agrees_with_the_runtime_table() {
+        let root = repo_root();
+        for name in super::list_targets(&root) {
+            let desc = super::load_target(&name, &root).expect("target loads");
+            let rt = crate::runtime_abi::runtime(desc.runtime())
+                .unwrap_or_else(|| panic!("`{name}` names unknown runtime `{}`", desc.runtime()));
+            assert!(
+                rt.abis.contains(&desc.module_abi()),
+                "`{name}`: runtime `{}` does not load ABI `{}`",
+                rt.id,
+                desc.module_abi()
             );
         }
     }
 
-    /// Only the linux host declares an override; every other descriptor
-    /// answers with its own silicon, so the mapping stays data-driven
-    /// rather than a family match in code.
+    /// A target file naming a runtime the table does not know, or an ABI
+    /// its runtime does not load, is refused when it loads.
     #[test]
-    fn module_silicon_override_is_declared_in_toml() {
-        let root = repo_root();
-        let linux = super::load_target("linux", &root).expect("linux target loads");
-        assert_eq!(linux.module_silicon_override.as_deref(), Some("bcm2712"));
-        let bcm = super::load_target("bcm2712", &root).expect("bcm2712 target loads");
-        assert_eq!(bcm.module_silicon_override, None);
+    fn a_target_naming_an_unknown_runtime_or_a_foreign_abi_is_refused() {
+        let scratch = tempfile::tempdir().unwrap();
+        let silicon = scratch.path().join("targets/silicon");
+        std::fs::create_dir_all(&silicon).unwrap();
+        let base =
+            std::fs::read_to_string(repo_root().join("targets/silicon/rp2350.toml")).unwrap();
+        let write = |runtime: &str, abi: &str| {
+            std::fs::write(
+                silicon.join("rp2350.toml"),
+                base.replace("runtime = \"rp2350\"", &format!("runtime = \"{runtime}\""))
+                    .replace(
+                        "module_abi = \"thumbv8m\"",
+                        &format!("module_abi = \"{abi}\""),
+                    ),
+            )
+            .unwrap();
+            super::load_target("rp2350", scratch.path())
+        };
+        assert!(write("rp2350", "thumbv8m").is_ok());
+        let err = write("rp2350b", "thumbv8m").unwrap_err().to_string();
+        assert!(err.contains("not a runtime"), "{err}");
+        let err = write("rp2350", "aarch64").unwrap_err().to_string();
+        assert!(err.contains("does not load module ABI `aarch64`"), "{err}");
     }
 }

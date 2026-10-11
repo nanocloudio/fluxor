@@ -1296,14 +1296,13 @@ pub fn write_merged_component_yaml(
 /// strings the runtime accepts.
 ///
 /// Delegates to the `targets/` registry: a module is placeable when its
-/// `hardware_targets` names the target's module silicon, or the host
-/// token itself for host targets (linux fluxor-linux reuses bcm2712 PIC
-/// modules, so `["bcm2712"]` is legal under `runtime_override: linux`).
-/// Boards never appear in `hardware_targets` — a board id there is the
-/// level error this validator exists to catch.
+/// `hardware_targets` names the target's runtime (`crate::runtime_abi`).
+/// Sharing a module ABI is not enough — bare-metal `["bcm2712"]` modules
+/// do not run under `linux`. Boards never appear in `hardware_targets` — a
+/// board id there is the level error this validator exists to catch.
 fn target_aliases(target: &str) -> Vec<String> {
     match crate::target::load_target(target, &crate::project::root()) {
-        Ok(desc) => desc.accepted_hardware_targets(),
+        Ok(desc) => vec![desc.runtime().to_string()],
         Err(_) => Vec::new(),
     }
 }

@@ -151,9 +151,9 @@ pub const MAX_JOURNAL_RECORDS: usize = 64;
 /// journal cycle writes it home without reading it back from the lower
 /// device: over a remote volume that read is a round trip per unit. The
 /// rp2350 keeps none; the cache is a quarter of a megabyte.
-#[cfg(not(fluxor_silicon = "rp2350"))]
+#[cfg(not(fluxor_abi = "thumbv8m"))]
 const JOURNAL_CACHE: usize = MAX_JOURNAL_RECORDS;
-#[cfg(fluxor_silicon = "rp2350")]
+#[cfg(fluxor_abi = "thumbv8m")]
 const JOURNAL_CACHE: usize = 0;
 /// Nonce sequences reserved per superblock write.
 pub const NONCE_STRIDE: u64 = 1 << 20;

@@ -84,6 +84,7 @@ mod project;
 pub mod reconfigure;
 mod render_template;
 pub mod rig;
+mod runtime_abi;
 mod scenario;
 mod schema;
 mod stack_expand;

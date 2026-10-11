@@ -2671,7 +2671,7 @@ mod tests {
             store,
             &ModulePublish {
                 name,
-                target: "bcm2712",
+                target: "aarch64",
                 fmod_bytes: bytes,
                 manifest_toml: Some("version = \"1.0.0\"\n"),
                 provenance: PROVENANCE_LOCAL,
@@ -3207,7 +3207,7 @@ mod tests {
                         &store,
                         &ModulePublish {
                             name: "m",
-                            target: "bcm2712",
+                            target: "aarch64",
                             fmod_bytes: format!("bytes-{i}").as_bytes(),
                             manifest_toml: None,
                             provenance: PROVENANCE_LOCAL,
@@ -3408,7 +3408,7 @@ mod tests {
         };
         let txn = store.begin_publish().expect("begin publish");
         let prepared = store
-            .prepare_module("tls", "rp2350", "0.0.1", fmod, Some(TOML), &meta)
+            .prepare_module("tls", "thumbv8m", "0.0.1", fmod, Some(TOML), &meta)
             .expect("prepare");
         let descs = store
             .commit_publish(&txn, "fluxor", "0.0.1", vec![prepared], None)
@@ -3416,7 +3416,7 @@ mod tests {
         descs
             .into_iter()
             .find(|d| {
-                d.annotations.get(ANN_REF_NAME).map(String::as_str) == Some("rp2350/tls:0.0.1")
+                d.annotations.get(ANN_REF_NAME).map(String::as_str) == Some("thumbv8m/tls:0.0.1")
             })
             .expect("versioned tag in the publish result")
     }
@@ -3428,8 +3428,8 @@ mod tests {
             fx.outsider.join("fluxor.lock"),
             format!(
                 "[[artifact]]\nkind = \"module\"\nname = \"tls\"\n\
-                 project = \"fluxor\"\ntarget = \"rp2350\"\n\
-                 digest = \"{digest}\"\nreference = \"rp2350/tls:0.0.1\"\n"
+                 project = \"fluxor\"\ntarget = \"thumbv8m\"\n\
+                 digest = \"{digest}\"\nreference = \"thumbv8m/tls:0.0.1\"\n"
             ),
         )
         .unwrap();
@@ -3532,7 +3532,7 @@ mod tests {
         let txn = fx.store.begin_publish().unwrap();
         let prepared = fx
             .store
-            .prepare_module("tls", "rp2350", "0.0.1", b"v2-bytes", None, &meta)
+            .prepare_module("tls", "thumbv8m", "0.0.1", b"v2-bytes", None, &meta)
             .unwrap();
         let index = fx.store.read_index().unwrap();
         let plan = fx
@@ -3557,10 +3557,10 @@ mod tests {
             1,
             "one MANIFEST is displaced, though it wears two tags: {report:?}"
         );
-        assert_eq!(report[0].reference(), "rp2350/tls:0.0.1");
+        assert_eq!(report[0].reference(), "thumbv8m/tls:0.0.1");
         assert_eq!(
             report[0].references,
-            vec!["rp2350/tls:0.0.1", "rp2350/tls:latest"]
+            vec!["thumbv8m/tls:0.0.1", "thumbv8m/tls:latest"]
         );
         assert_eq!(report[0].old_digest, first.digest);
         assert!(!report[0].content_unchanged, "the bytes did change");
@@ -3573,7 +3573,7 @@ mod tests {
 
         // Nothing was written: the plan is pure, so the dry run is honest.
         assert_eq!(
-            fx.store.resolve("rp2350/tls:0.0.1").unwrap().digest,
+            fx.store.resolve("thumbv8m/tls:0.0.1").unwrap().digest,
             first.digest
         );
         drop(txn);

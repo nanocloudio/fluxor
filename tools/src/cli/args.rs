@@ -68,7 +68,7 @@ enum Commands {
         #[arg(long)]
         firmware: Option<PathBuf>,
         /// Directory holding the `.fmod` modules to use, instead of the
-        /// project's `target/fluxor/<silicon>/modules`. Falls back to
+        /// project's `target/fluxor/<abi>/modules`. Falls back to
         /// `$FLUXOR_MODULE_ROOT`, then that default. A root given here
         /// or by the variable must be an existing directory containing
         /// at least one `.fmod`; it is never silently replaced.
@@ -180,7 +180,7 @@ enum Commands {
         ca: Option<PathBuf>,
         /// Directory holding the `.fmod` modules to use (graph, scenario or
         /// `--replicas` runs; every replica gets the same root), instead of the
-        /// project's `target/fluxor/<silicon>/modules`. Falls back to
+        /// project's `target/fluxor/<abi>/modules`. Falls back to
         /// `$FLUXOR_MODULE_ROOT`, then that default. A root given here
         /// or by the variable must be an existing directory containing
         /// at least one `.fmod`; it is never silently replaced.
@@ -235,7 +235,7 @@ enum Commands {
         /// Config file (YAML)
         config: PathBuf,
         /// Directory holding the `.fmod` modules to use, instead of the
-        /// project's `target/fluxor/<silicon>/modules`. Falls back to
+        /// project's `target/fluxor/<abi>/modules`. Falls back to
         /// `$FLUXOR_MODULE_ROOT`, then that default. A root given here
         /// or by the variable must be an existing directory containing
         /// at least one `.fmod`; it is never silently replaced.
@@ -498,7 +498,7 @@ enum Commands {
     },
 
     /// Materialise `fluxor.lock` into the tree from the OCI store:
-    /// fmods → `target/fluxor/<silicon>/modules/`, source trees →
+    /// fmods → `target/fluxor/<abi>/modules/`, source trees →
     /// `target/fluxor/<name>/`, runtimes → `target/<triple>/release/`.
     /// Workspace members' pins re-resolve `:latest` (write-through);
     /// everyone else's pins replay verbatim. Digest- and
@@ -848,9 +848,9 @@ enum ModulesAction {
         /// with `--target`.
         #[arg(long, conflicts_with = "target")]
         all: bool,
-        /// Output root for `<silicon>/modules/<name>.fmod`. Defaults
+        /// Output root for `<abi>/modules/<name>.fmod`. Defaults
         /// to `target/fluxor`. A consumer reads artefacts from another
-        /// root through `--module-root <out>/<silicon>/modules` (or
+        /// root through `--module-root <out>/<abi>/modules` (or
         /// `$FLUXOR_MODULE_ROOT`).
         #[arg(long, default_value = "target/fluxor")]
         out: PathBuf,
@@ -885,9 +885,9 @@ enum ModulesAction {
         json: bool,
     },
     /// Print the module root for a target: `--module-root`, else
-    /// `$FLUXOR_MODULE_ROOT`, else `<out>/<silicon>/modules` (the
-    /// target's silicon, so a board resolves to its silicon's
-    /// directory). Lets Makefiles and harness scripts refer to the
+    /// `$FLUXOR_MODULE_ROOT`, else `<out>/<abi>/modules` (the module
+    /// ABI the target loads, so a board resolves to its silicon's
+    /// shelf). Lets Makefiles and harness scripts refer to the
     /// artefact dir without hard-coding the layout.
     Resolve {
         /// Target whose modules directory to print (silicon, host or
@@ -899,7 +899,7 @@ enum ModulesAction {
         #[arg(long, default_value = "target/fluxor")]
         out: PathBuf,
         /// Directory holding the `.fmod` modules to use, instead of the
-        /// project's `target/fluxor/<silicon>/modules`. Falls back to
+        /// project's `target/fluxor/<abi>/modules`. Falls back to
         /// `$FLUXOR_MODULE_ROOT`, then that default. A root given here
         /// or by the variable must be an existing directory containing
         /// at least one `.fmod`; it is never silently replaced.

@@ -75,18 +75,18 @@ fn generate_config_impl(
         .get("modules")
         .ok_or_else(|| Error::Config("modules section required".into()))?;
 
-    // The silicon `modules_dir` holds artefacts for, which tags the pins
+    // The module ABI `modules_dir` holds artefacts for, which tags the pins
     // consulted when a `.fmod` is absent from it. Stated here from the
     // target, never read off the directory: `--module-root` can name any
     // path. A graph naming no resolvable target consults no pins.
-    let module_silicon = resolved_target
+    let module_abi = resolved_target
         .or_else(|| config.get("target").and_then(|t| t.as_str()))
         .and_then(|t| crate::target::load_target(t, project_root).ok())
-        .map(|d| d.module_silicon().to_string())
+        .map(|d| d.module_abi().to_string())
         .unwrap_or_default();
     let loc = schema::ModuleLocation {
         dir: modules_dir,
-        silicon: &module_silicon,
+        abi: &module_abi,
         project_root,
     };
 
@@ -380,8 +380,8 @@ fn generate_config_impl(
     )?;
 
     // Hardware-capability validation. Each module's `[requires]`
-    // block declares what the silicon must provide (FPU / NEON /
-    // MMU). Reject placement on a silicon that doesn't satisfy the
+    // block declares what the runtime must provide (FPU / NEON /
+    // MMU). Reject placement on a runtime that doesn't satisfy the
     // request BEFORE generating a binary that would silently
     // soft-float on RP2040 or fail to link NEON on Cortex-M.
     //
@@ -389,35 +389,20 @@ fn generate_config_impl(
     // YAML — that's the contract that lets `--target` override a
     // checked-in default. A config with neither omits the check
     // entirely; that's by design, since the default `requires`
-    // is all-false and satisfies every silicon.
-    // YAML `target:` carries a board or host token; capability lookup is
-    // silicon-keyed, so resolve through the registry first. Falls back to
-    // the raw token (which then fails closed in `for_silicon`) when the
-    // registry doesn't know the name.
+    // is all-false and satisfies every runtime.
+    // YAML `target:` carries a board, silicon or host token; capabilities,
+    // facts and placement are all properties of the RUNTIME it resolves to
+    // (`crate::runtime_abi`). Falls back to the raw token (which then fails
+    // closed in `for_runtime`) when the registry doesn't know the name.
     let target_opt = resolved_target.or_else(|| config.get("target").and_then(|t| t.as_str()));
-    let silicon_owned = target_opt.map(|t| {
+    let runtime_owned = target_opt.map(|t| {
         crate::target::load_target(t, &crate::project::root())
-            .map(|d| d.module_silicon().to_string())
+            .map(|d| d.runtime().to_string())
             .unwrap_or_else(|_| t.to_string())
     });
-    // Target-provided facts are keyed by the platform the kernel runs on,
-    // not by the silicon its modules are compiled for: a hosted target
-    // (`linux`, `wasm`) shares bcm2712's module builds but has its own
-    // clock, vault and driver rows.
-    let facts_owned = target_opt.map(|t| {
-        crate::target::load_target(t, &crate::project::root())
-            .map(|d| {
-                if d.is_host() {
-                    d.id.clone()
-                } else {
-                    d.module_silicon().to_string()
-                }
-            })
-            .unwrap_or_else(|_| t.to_string())
-    });
-    if let Some(silicon) = silicon_owned.as_deref() {
-        // Cover base AND workload modules — a workload module runs on the same silicon and
-        // must satisfy the same `[requires]` (FPU/NEON/MMU).
+    if let Some(runtime) = runtime_owned.as_deref() {
+        // Cover base AND workload modules — a workload module runs on the same runtime and
+        // must satisfy the same placement and `[requires]` (FPU/NEON/MMU).
         for (i, m) in validation_list.iter().enumerate() {
             let name = m
                 .get("name")
@@ -435,18 +420,26 @@ fn generate_config_impl(
                     crate::trust_anchors::KEY_LABELS,
                 )
                 .map_err(|e| Error::Config(format!("modules[{i}] ({name}): key_file: {e}")))?;
-                let facts_key = facts_owned.as_deref().unwrap_or(silicon);
-                let facts = crate::target_facts::TargetFacts::for_silicon(facts_key);
+                let facts = crate::target_facts::TargetFacts::for_runtime(runtime);
                 let key = crate::identity_key::classify(&der);
                 if let Err(e) =
-                    crate::identity_key::admit_identity(key, facts_key, facts.vault_suites)
+                    crate::identity_key::admit_identity(key, runtime, facts.vault_suites)
                 {
                     return Err(Error::Config(format!("modules[{i}] ({name}): {e}")));
                 }
             }
             if let Some(manifest) = manifests.get(name) {
+                // Placement: the module's signed runtime mask must name this
+                // runtime.
+                if let Some(why) = crate::runtime_abi::placement_refusal(
+                    name,
+                    manifest.hardware_targets,
+                    runtime,
+                ) {
+                    return Err(Error::Config(format!("modules[{i}] ({name}): {why}")));
+                }
                 if let Err(e) =
-                    crate::manifest::check_target_capabilities(manifest.requires, silicon)
+                    crate::manifest::check_target_capabilities(manifest.requires, runtime)
                 {
                     return Err(Error::Config(format!("modules[{i}] ({name}): {e}")));
                 }
@@ -458,8 +451,7 @@ fn generate_config_impl(
                 if !manifest.requires_when.is_empty() {
                     let mtype = m.get("type").and_then(|t| t.as_str()).unwrap_or(name);
                     let param_schema = schema::load_schema_for_module(mtype, loc)?;
-                    let facts_key = facts_owned.as_deref().unwrap_or(silicon);
-                    let facts = crate::target_facts::TargetFacts::for_silicon(facts_key);
+                    let facts = crate::target_facts::TargetFacts::for_runtime(runtime);
                     for rw in &manifest.requires_when {
                         let resolutions: Vec<crate::target_facts::ParamResolution> = rw
                             .when
@@ -476,7 +468,7 @@ fn generate_config_impl(
                             &resolutions,
                             rw,
                             &facts,
-                            silicon,
+                            runtime,
                         ) {
                             return Err(Error::Config(format!("modules[{i}] ({name}): {e}")));
                         }
@@ -509,10 +501,9 @@ fn generate_config_impl(
 
     // Per-edge capacity + rate-class validation.
     {
-        // `silicon_owned` is the registry-resolved silicon id (board
-        // "pico2w" → silicon "rp2350"); the small-buffer-arena profile
-        // is the rp2 family.
-        let embedded = silicon_owned
+        // The registry-resolved runtime (board "pico2w" → "rp2350"); the
+        // small-buffer-arena profile is the rp2 family.
+        let embedded = runtime_owned
             .as_deref()
             .map(|s| s == "rp2040" || s == "rp2350")
             .unwrap_or(false);

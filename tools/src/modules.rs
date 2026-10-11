@@ -1067,8 +1067,8 @@ fn verify_written(path: &Path, expected: usize) -> std::io::Result<()> {
 /// What the build knows about an artefact beyond its ELF.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PackContext<'a> {
-    /// The silicon the module was built for, when the build knows it.
-    pub silicon: Option<&'a str>,
+    /// The module ABI the module was built for, when the build knows it.
+    pub abi: Option<&'a str>,
     /// The variant this artefact is, if it is one.
     pub variant: Option<&'a str>,
     /// Worst-case stack depth the build measured from the call graph.
@@ -1085,7 +1085,7 @@ pub fn pack_fmod(
     ctx: PackContext<'_>,
 ) -> Result<PackResult> {
     let PackContext {
-        silicon: target_silicon,
+        abi: target_abi,
         variant,
         measured_stack,
     } = ctx;
@@ -1231,7 +1231,7 @@ pub fn pack_fmod(
 
     // Load or create manifest
     let mut module_manifest = if let Some(mp) = manifest_path {
-        Manifest::from_toml_for_target(mp, target_silicon)?
+        Manifest::from_toml_for_target(mp, target_abi)?
     } else {
         // Auto-detect: look for manifest.toml next to the input ELF
         let auto_path = input
@@ -1239,7 +1239,7 @@ pub fn pack_fmod(
             .unwrap_or(Path::new("."))
             .join("manifest.toml");
         if auto_path.exists() {
-            Manifest::from_toml_for_target(&auto_path, target_silicon)?
+            Manifest::from_toml_for_target(&auto_path, target_abi)?
         } else {
             Manifest::default()
         }
@@ -1501,7 +1501,7 @@ pub fn pack_fmod_wasm(
     name: &str,
     module_type: u8,
     manifest_path: Option<&Path>,
-    target_silicon: Option<&str>,
+    target_abi: Option<&str>,
     variant: Option<&str>,
 ) -> Result<PackResult> {
     let wasm_data = std::fs::read(input)?;
@@ -1524,14 +1524,14 @@ pub fn pack_fmod_wasm(
 
     // Load or create manifest.
     let mut module_manifest = if let Some(mp) = manifest_path {
-        Manifest::from_toml_for_target(mp, target_silicon)?
+        Manifest::from_toml_for_target(mp, target_abi)?
     } else {
         let auto_path = input
             .parent()
             .unwrap_or(Path::new("."))
             .join("manifest.toml");
         if auto_path.exists() {
-            Manifest::from_toml_for_target(&auto_path, target_silicon)?
+            Manifest::from_toml_for_target(&auto_path, target_abi)?
         } else {
             Manifest::default()
         }

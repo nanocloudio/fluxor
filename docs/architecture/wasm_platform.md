@@ -71,7 +71,7 @@ defines). Outputs:
 
 - `target/wasm/firmware.wasm` — the kernel as a single WASM module
   (built with the `host-wasm` cargo feature)
-- `target/fluxor/wasm/modules/<name>.fmod` — each module's `.fmod`
+- `target/fluxor/wasm32/modules/<name>.fmod` — each module's `.fmod`
   envelope, with a wasm32 module as its code payload
 
 The wasm32 build is selected via the Cargo target plus the
@@ -285,7 +285,7 @@ which host drives it.
 The user-visible commands parallel the other targets:
 
 ```sh
-fluxor modules build --target wasm    # → target/fluxor/wasm/modules/*.fmod
+fluxor modules build --target wasm    # → target/fluxor/wasm32/modules/*.fmod
 make firmware   TARGET=wasm           # → target/wasm/firmware.wasm
 fluxor build    config.yaml           # → target/wasm/<config>.wasm  (with target: wasm)
 ```

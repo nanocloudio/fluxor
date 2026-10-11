@@ -1,5 +1,5 @@
 version = "1.0.0"
-hardware_targets = ["bcm2712", "rp2350", "rp2040"]
+hardware_targets = ["bcm2712", "rp2350", "rp2040", "linux"]
 permissions = ["platform_raw"]
 # Cadence-independent telemetry forwarder (drains the log ring → UDP); its emit
 # cadence is cosmetic, not correctness-bearing. Explicit attestation to run on a
@@ -25,7 +25,7 @@ direction = "input"
 content_type = "NetProto"
 required = true
 rate_class_default = "control"
-buffer_size = { default = 2048, bcm2712 = 8192 }
+buffer_size = { default = 2048, aarch64 = 8192 }
 
 [[ports]]
 name = "net_out"
@@ -33,7 +33,7 @@ direction = "output"
 content_type = "NetProto"
 required = true
 rate_class_default = "control"
-buffer_size = { default = 2048, bcm2712 = 8192 }
+buffer_size = { default = 2048, aarch64 = 8192 }
 max_record = 2048
 
 # Module-scope observability — exempt (see standards/observability.md §6).

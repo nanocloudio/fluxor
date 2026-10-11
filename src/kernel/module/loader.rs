@@ -177,6 +177,9 @@ pub enum LoaderError {
     BelowSigningFloor,
     /// The platform could not build the gated module's protection domain.
     ProtectionUnavailable,
+    /// The module's signed manifest does not name this kernel's runtime:
+    /// it shares the module ABI, not the contracts.
+    WrongRuntime { allowed: u16 },
 }
 impl LoaderError {
     /// Log the error with appropriate level.
@@ -197,6 +200,12 @@ impl LoaderError {
             Self::NewFailed(code) => log::warn!("[loader] {context}: new failed rc={code}"),
             Self::AbiVersionMismatch { expected, found } => {
                 log::error!("[loader] {context}: abi mismatch expected={expected} found={found}")
+            }
+            Self::WrongRuntime { allowed } => {
+                let own = OWN_RUNTIME_BIT;
+                log::error!(
+                    "[loader] {context}: built for runtimes 0x{allowed:04x}, not this one (0x{own:04x})"
+                )
             }
             Self::IntegrityMismatch => log::error!("[loader] {context}: integrity hash mismatch"),
             Self::SignatureInvalid => log::error!("[loader] {context}: signature invalid"),
@@ -1497,6 +1506,14 @@ impl LoadedModule {
         }
     }
 
+    /// The runtimes the module may run under: the signed manifest's
+    /// `hardware_targets` mask (bytes 10..12), `None` without a manifest.
+    pub fn manifest_runtime_mask(&self) -> Option<u16> {
+        let (p, _, _, _) = self.manifest_view()?;
+        // SAFETY: bytes 10..12 of a manifest of at least 17 bytes.
+        Some(unsafe { u16::from_le_bytes([*p.add(10), *p.add(11)]) })
+    }
+
     /// The module's resident state in bytes, from the manifest head, or
     /// `None` when it declares none — or declares the most the 16-bit field
     /// can hold, which says only "at least this much" and is not a size.
@@ -1966,6 +1983,29 @@ pub enum Signing {
     Unverified,
 }
 
+/// This kernel's runtime (`abi::wire::runtime_bit`). Module ABIs are shared
+/// between runtimes — hosted Linux on aarch64 loads the bytes bare-metal
+/// bcm2712 runs — so the ABI alone does not say a module may run here.
+#[cfg(feature = "host-linux")]
+pub const OWN_RUNTIME_BIT: u16 = crate::abi::wire::runtime_bit::LINUX;
+#[cfg(feature = "host-wasm")]
+pub const OWN_RUNTIME_BIT: u16 = crate::abi::wire::runtime_bit::WASM;
+#[cfg(feature = "chip-bcm2712")]
+pub const OWN_RUNTIME_BIT: u16 = crate::abi::wire::runtime_bit::BCM2712;
+#[cfg(feature = "chip-rp2350b")]
+pub const OWN_RUNTIME_BIT: u16 = crate::abi::wire::runtime_bit::RP2350;
+#[cfg(feature = "chip-rp2040")]
+pub const OWN_RUNTIME_BIT: u16 = crate::abi::wire::runtime_bit::RP2040;
+/// A kernel built for no runtime admits no module.
+#[cfg(not(any(
+    feature = "host-linux",
+    feature = "host-wasm",
+    feature = "chip-bcm2712",
+    feature = "chip-rp2350b",
+    feature = "chip-rp2040"
+)))]
+pub const OWN_RUNTIME_BIT: u16 = 0;
+
 /// Validate a loaded module's base address and header, and report what its
 /// signature establishes.
 pub fn validate_module(module: &LoadedModule, name: &str) -> Result<Signing, LoaderError> {
@@ -2007,6 +2047,16 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<Signing, Loa
             expected: EXPECTED_MODULE_VERSION,
             found: module.header.version,
         });
+    }
+    // Placement: the signed manifest names the runtimes the module runs
+    // under. A module with no manifest makes no claim and is judged by the
+    // integrity and signing rules alone.
+    if let Some(allowed) = module.manifest_runtime_mask() {
+        if allowed & OWN_RUNTIME_BIT == 0 {
+            let e = LoaderError::WrongRuntime { allowed };
+            e.log(name);
+            return Err(e);
+        }
     }
     // Sanity ceiling for the code segment (profile-tuned: media modules
     // like the unified codec carry large decoder tables; protocol

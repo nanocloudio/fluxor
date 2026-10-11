@@ -6,6 +6,8 @@
 id = "rp2350"
 family = "rp2"
 description = "RP2350 (dual Cortex-M33)"
+runtime = "rp2350"
+module_abi = "thumbv8m"
 
 [build]
 rust_target = "thumbv8m.main-none-eabihf"

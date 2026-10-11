@@ -25,27 +25,27 @@ content_type = "EthernetFrame"
 required = true
 # ETH rings are the per-tick burst budget for the IP pipeline. aarch64 uses
 # 32 KiB (~21 MSS); rp2350/wasm keep 4 KiB.
-buffer_size = { default = 4096, bcm2712 = 32768 }
+buffer_size = { default = 4096, aarch64 = 32768 }
 
 [[ports]]
 name = "frames_tx"
 direction = "output"
 content_type = "EthernetFrame"
 required = true
-buffer_size = { default = 4096, bcm2712 = 32768 }
+buffer_size = { default = 4096, aarch64 = 32768 }
 
 [[ports]]
 name = "net_out"
 direction = "output"
 content_type = "NetProto"
 # net rings match http's per-call stage: 16 KiB on aarch64, 2 KiB else.
-buffer_size = { default = 2048, bcm2712 = 16384 }
+buffer_size = { default = 2048, aarch64 = 16384 }
 
 [[ports]]
 name = "net_in"
 direction = "input"
 content_type = "NetProto"
-buffer_size = { default = 2048, bcm2712 = 16384 }
+buffer_size = { default = 2048, aarch64 = 16384 }
 
 # Address-control port (in[2]). Single writer: the platform workload backend.
 # Carries IP_ADDR_ADD / IP_ADDR_DEL as net-proto-framed control messages.
@@ -56,7 +56,7 @@ name = "addr_ctl"
 direction = "input"
 index = 2
 content_type = "NetProto"
-buffer_size = { default = 512, bcm2712 = 512 }
+buffer_size = { default = 512, aarch64 = 512 }
 
 # Emission events back to the address-control writer (out[5]): the token
 # minted at each install (`MSG_ADDR_ADDED`), arm and fence outcomes, and
@@ -71,7 +71,7 @@ name = "addr_evt"
 direction = "output"
 index = 5
 content_type = "NetProto"
-buffer_size = { default = 512, bcm2712 = 1024 }
+buffer_size = { default = 512, aarch64 = 1024 }
 
 # Pre-transport decision seam (in[3] / out[3] / out[4]), on only when
 # `packet_decision = pre_transport`: every validated inbound IPv4 packet is
@@ -87,21 +87,21 @@ name = "packet_in"
 direction = "input"
 index = 3
 content_type = "NetProto"
-buffer_size = { default = 512, bcm2712 = 2048 }
+buffer_size = { default = 512, aarch64 = 2048 }
 
 [[ports]]
 name = "packet_out"
 direction = "output"
 index = 3
 content_type = "NetProto"
-buffer_size = { default = 512, bcm2712 = 2048 }
+buffer_size = { default = 512, aarch64 = 2048 }
 
 [[ports]]
 name = "packet_fwd"
 direction = "output"
 index = 4
 content_type = "NetProto"
-buffer_size = { default = 4096, bcm2712 = 32768 }
+buffer_size = { default = 4096, aarch64 = 32768 }
 
 # Transport continuity (in[4] / out[6]), the `session_ctrl` §Transport
 # continuity surface for the TCP connections this module owns: a
@@ -116,14 +116,14 @@ name = "cont_in"
 direction = "input"
 index = 4
 content_type = "OctetStream"
-buffer_size = { default = 2048, bcm2712 = 8192 }
+buffer_size = { default = 2048, aarch64 = 8192 }
 
 [[ports]]
 name = "cont_out"
 direction = "output"
 index = 6
 content_type = "OctetStream"
-buffer_size = { default = 4096, bcm2712 = 16384 }
+buffer_size = { default = 4096, aarch64 = 16384 }
 
 # Module-scope observability. Optional 3rd output (out[2]); wired to
 # `observe.telemetry` when the debug stack's observe overlay is on. Emits

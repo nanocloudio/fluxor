@@ -5,8 +5,8 @@
 //! Output layout:
 //!
 //! ```text
-//! <out>/<silicon>/modules/<name>.{o,elf,fmod}      (PIC targets)
-//! <out>/<silicon>/modules/<name>.{wasm,fmod}       (wasm target)
+//! <out>/<abi>/modules/<name>.{o,elf,fmod}      (PIC module ABIs)
+//! <out>/<abi>/modules/<name>.{wasm,fmod}       (wasm32)
 //! ```
 //!
 //! `<out>` defaults to `<project_root>/target/fluxor`. The flat
@@ -20,12 +20,13 @@ use std::time::SystemTime;
 use crate::error::{Error, Result};
 use crate::modules::{pack_fmod, pack_fmod_wasm};
 
-/// Per-silicon compile recipe — target triple, extra rustflags, and
-/// linker invocation. Will move into `TargetDescriptor` once
-/// `targets/silicon/*.toml` grows a `module_rustflags` field.
+/// Per-ABI compile recipe — target triple, extra rustflags, and linker
+/// invocation. One recipe per buildable module ABI
+/// (`crate::runtime_abi::ABIS`); every runtime that loads the ABI loads
+/// the same bytes.
 #[derive(Debug, Clone)]
-struct SiliconSpec {
-    silicon_id: &'static str,
+struct AbiSpec {
+    abi_id: &'static str,
     /// `rustc --target` triple for module compilation.
     module_target: &'static str,
     /// Extra `rustc` flags appended after the standard `-O -C
@@ -45,9 +46,9 @@ struct LinkerSpec {
     flavor: Option<&'static str>,
 }
 
-const SILICON_SPECS: &[SiliconSpec] = &[
-    SiliconSpec {
-        silicon_id: "rp2040",
+const ABI_SPECS: &[AbiSpec] = &[
+    AbiSpec {
+        abi_id: "thumbv6m",
         module_target: "thumbv6m-none-eabi",
         extra_rustflags: &[],
         linker: Some(LinkerSpec {
@@ -55,8 +56,8 @@ const SILICON_SPECS: &[SiliconSpec] = &[
             flavor: None,
         }),
     },
-    SiliconSpec {
-        silicon_id: "rp2350",
+    AbiSpec {
+        abi_id: "thumbv8m",
         // Soft-float, though the kernel is `eabihf`: see `module_target` in
         // targets/silicon/rp2350.toml.
         module_target: "thumbv8m.main-none-eabi",
@@ -66,11 +67,10 @@ const SILICON_SPECS: &[SiliconSpec] = &[
             flavor: None,
         }),
     },
-    SiliconSpec {
-        silicon_id: "bcm2712",
-        // Cortex-A76 — AES + SHA2 + NEON enabled so the inline-asm
-        // crypto paths in `modules/sdk/crypto/aes_gcm.rs` activate;
-        // without them the scalar paths are compiled instead.
+    AbiSpec {
+        abi_id: "aarch64",
+        // The ABI floor: AES + SHA2 + NEON, so the inline-asm crypto
+        // paths in `modules/sdk/crypto/aes_gcm.rs` activate.
         //
         // `-strict-align`: `aarch64-unknown-none` assumes the MMU may be
         // off, where every access is Device memory and an unaligned one
@@ -92,8 +92,8 @@ const SILICON_SPECS: &[SiliconSpec] = &[
             flavor: Some("gnu"),
         }),
     },
-    SiliconSpec {
-        silicon_id: "wasm",
+    AbiSpec {
+        abi_id: "wasm32",
         module_target: "wasm32-unknown-unknown",
         // wasm modules build as cdylib with `-C opt-level=z -C
         // strip=symbols`. Added below in `compile_module_wasm`.
@@ -102,28 +102,26 @@ const SILICON_SPECS: &[SiliconSpec] = &[
     },
 ];
 
-fn silicon_spec(silicon: &str) -> Option<&'static SiliconSpec> {
-    SILICON_SPECS.iter().find(|s| s.silicon_id == silicon)
+fn abi_spec(abi: &str) -> Option<&'static AbiSpec> {
+    ABI_SPECS.iter().find(|s| s.abi_id == abi)
 }
 
-/// Resolve a user-supplied module-build target name to the silicon id
-/// used for module artefacts, via the `targets/` registry (the ONLY
-/// board→silicon mapping).
+/// Resolve a user-supplied module-build target name to the module ABI
+/// its artefacts are built for, via the `targets/` registry.
 ///
 /// Module builds take silicon and host ids only: a board name is a
-/// level error (build the board's silicon instead). Hosts redirect via
-/// `[target].module_silicon` (linux → bcm2712). Modules are
-/// byte-identical across boards that share silicon + module_target.
-pub fn resolve_silicon(target: &str, project_root: &Path) -> Result<String> {
+/// level error (build the board's silicon instead). Every target that
+/// shares an ABI shares its artefacts (`crate::runtime_abi`).
+pub fn resolve_abi(target: &str, project_root: &Path) -> Result<String> {
     let desc = crate::target::load_target(target, project_root)?;
     if let Some(board) = &desc.board_id {
         return Err(Error::Config(format!(
-            "'{board}' is a board id; module builds take silicon ids only \
+            "'{board}' is a board id; module builds take silicon and host ids only \
              (use `--target {}`)",
-            desc.module_silicon()
+            desc.id
         )));
     }
-    Ok(desc.module_silicon().to_string())
+    Ok(desc.module_abi().to_string())
 }
 
 /// Caller-facing build options.
@@ -138,7 +136,7 @@ pub struct BuildOpts {
 
 #[derive(Debug, Clone)]
 pub enum TargetSelector {
-    /// Build for a single target. Resolved via `resolve_silicon`.
+    /// Build for a single target. Resolved via `resolve_abi`.
     One(String),
     /// Build for every target listed in `fluxor.toml::[ci].targets`.
     All,
@@ -164,7 +162,7 @@ impl BuildReport {
 #[derive(Debug)]
 pub struct TargetReport {
     pub target: String,
-    pub silicon: String,
+    pub abi: String,
     pub built: Vec<String>,
     pub up_to_date: Vec<String>,
     pub skipped: Vec<(String, String)>,
@@ -444,10 +442,10 @@ fn discover(project_root: &Path) -> Result<Vec<Candidate>> {
 /// may name it, so it is always an accepted `--check-cfg` value.
 const HOST_TEST_FEATURE: &str = "host-test";
 
-/// `--cfg fluxor_silicon="<id>"` plus its accepted-value list.
+/// `--cfg fluxor_abi="<id>"` plus its accepted-value list.
 ///
 /// Emitted for EVERY module, unlike `cfg_feature_args` which is empty for
-/// non-variant candidates. Without it a module cannot discover which silicon it
+/// non-variant candidates. Without it a module cannot discover which module ABI it
 /// is being compiled for, so capacity constants that differ per die have to be
 /// keyed on `target_arch` — and that makes thumbv6m indistinguishable from
 /// thumbv8m, handing RP2040 the RP2350 table sizes. The two parts' state arenas
@@ -458,7 +456,7 @@ const HOST_TEST_FEATURE: &str = "host-test";
 ///
 /// A distinct cfg from the kernel's `fluxor_platform` rather than a reuse of
 /// the name: the kernel's value set separates `host-linux` from `host-wasm`,
-/// while modules are compiled per silicon shelf. One name admitting two
+/// while modules are compiled per module ABI. One name admitting two
 /// different value sets would be worse than two accurate names.
 ///
 /// Because this changes every module's rustc invocation, the first build after
@@ -470,17 +468,17 @@ const HOST_TEST_FEATURE: &str = "host-test";
 /// for ours. Modules carry `#[cfg(test)]` blocks that the host harness
 /// compiles, so without this line every one of them is an unexpected-cfg
 /// error under `--strict`.
-fn cfg_silicon_args(spec: &SiliconSpec) -> Vec<String> {
-    let values = SILICON_SPECS
+fn cfg_abi_args(spec: &AbiSpec) -> Vec<String> {
+    let values = crate::runtime_abi::ABIS
         .iter()
-        .map(|s| format!("\"{}\"", s.silicon_id))
+        .map(|a| format!("\"{}\"", a.id))
         .collect::<Vec<_>>()
         .join(", ");
     vec![
         "--cfg".to_string(),
-        format!("fluxor_silicon=\"{}\"", spec.silicon_id),
+        format!("fluxor_abi=\"{}\"", spec.abi_id),
         "--check-cfg".to_string(),
-        format!("cfg(fluxor_silicon, values({values}))"),
+        format!("cfg(fluxor_abi, values({values}))"),
         "--check-cfg".to_string(),
         "cfg(test)".to_string(),
     ]
@@ -559,13 +557,8 @@ fn legacy_type_by_name(name: &str) -> u8 {
     }
 }
 
-fn matches_target(c: &Candidate, target: &str, silicon: &str) -> bool {
-    if c.hardware_targets.is_empty() {
-        return true;
-    }
-    c.hardware_targets
-        .iter()
-        .any(|t| t == target || t == silicon)
+fn matches_abi(c: &Candidate, abi: &str) -> bool {
+    crate::runtime_abi::module_on_abi(&c.hardware_targets, abi)
 }
 
 /// Public entry point. Drives discovery, per-target compile, and pack.
@@ -595,7 +588,12 @@ pub fn run(opts: &BuildOpts) -> Result<BuildReport> {
         TargetSelector::All => resolve_all_targets(&opts.project_root)?,
     };
     let mut report = BuildReport::default();
+    // Targets that share a module ABI share its shelf: build it once.
+    let mut shelves = std::collections::BTreeSet::new();
     for target in targets {
+        if !shelves.insert(resolve_abi(&target, &opts.project_root)?) {
+            continue;
+        }
         report
             .per_target
             .push(build_one_target(&target, &candidates, opts)?);
@@ -741,14 +739,14 @@ pub fn clippy_check_modules(project_root: &Path, verbose: bool) -> Result<Module
     // sources have moved since their `.rmeta` was written. Without that
     // freshness check this sweep is a second full type-check of the whole
     // tree on every run, on top of the build.
-    let mut jobs: Vec<(&Candidate, String, &SiliconSpec, PathBuf)> = Vec::new();
+    let mut jobs: Vec<(&Candidate, String, &AbiSpec, PathBuf)> = Vec::new();
     for cand in &candidates {
         // Lint against the first configured target this module builds for.
         let Some((target, spec)) = targets.iter().find_map(|t| {
-            let silicon = resolve_silicon(t, project_root).ok()?;
-            let spec = silicon_spec(&silicon)?;
+            let abi = resolve_abi(t, project_root).ok()?;
+            let spec = abi_spec(&abi)?;
             // wasm builds as a cdylib and has no PIC lint surface here.
-            if spec.linker.is_none() || !matches_target(cand, t, &silicon) {
+            if spec.linker.is_none() || !matches_abi(cand, &abi) {
                 None
             } else {
                 Some((t.clone(), spec))
@@ -793,7 +791,7 @@ pub fn clippy_check_modules(project_root: &Path, verbose: bool) -> Result<Module
             .arg("-C")
             .arg("relocation-model=pic")
             .args(spec.extra_rustflags)
-            .args(cfg_silicon_args(spec))
+            .args(cfg_abi_args(spec))
             .args(cfg_feature_args(cand))
             .arg("-A")
             .arg("clippy::empty_loop")
@@ -826,10 +824,10 @@ pub fn clippy_check_modules(project_root: &Path, verbose: bool) -> Result<Module
     Ok(report)
 }
 
-/// The silicon shelf directory each declared target builds into.
+/// The ABI shelf each declared target builds into.
 ///
-/// `target/fluxor/<silicon>/modules/` is keyed by SILICON, while `[ci].targets`
-/// names targets — which may be boards, several of which share one die — so the
+/// `target/fluxor/<abi>/modules/` is keyed by module ABI, while `[ci].targets`
+/// names targets — silicon and hosts, several of which share an ABI — so the
 /// mapping is many-to-one and has to be resolved rather than assumed.
 ///
 /// A consumer of the built artefacts wants exactly this set: a shelf outside it
@@ -851,7 +849,7 @@ pub fn declared_shelves(project_root: &Path) -> Result<std::collections::BTreeSe
     };
     let mut out = std::collections::BTreeSet::new();
     for target in targets {
-        out.insert(resolve_silicon(&target, project_root)?);
+        out.insert(resolve_abi(&target, project_root)?);
     }
     Ok(out)
 }
@@ -887,23 +885,23 @@ fn build_one_target(
     candidates: &[Candidate],
     opts: &BuildOpts,
 ) -> Result<TargetReport> {
-    let silicon = resolve_silicon(target, &opts.project_root)?;
-    let spec = silicon_spec(&silicon).ok_or_else(|| {
+    let abi = resolve_abi(target, &opts.project_root)?;
+    let spec = abi_spec(&abi).ok_or_else(|| {
         Error::Module(format!(
-            "unknown silicon `{silicon}` for target `{target}` — recognised: {}",
-            SILICON_SPECS
+            "module ABI `{abi}` (target `{target}`) is not buildable yet — buildable: {}",
+            ABI_SPECS
                 .iter()
-                .map(|s| s.silicon_id)
+                .map(|s| s.abi_id)
                 .collect::<Vec<_>>()
                 .join(", ")
         ))
     })?;
-    let out_dir = opts.out_root.join(&silicon).join("modules");
+    let out_dir = opts.out_root.join(&abi).join("modules");
     std::fs::create_dir_all(&out_dir)?;
 
     let mut report = TargetReport {
         target: target.to_string(),
-        silicon: silicon.clone(),
+        abi: abi.clone(),
         built: Vec::new(),
         up_to_date: Vec::new(),
         skipped: Vec::new(),
@@ -917,7 +915,7 @@ fn build_one_target(
     // ran.
     let mut pending: Vec<(&Candidate, PathBuf)> = Vec::new();
     for cand in candidates {
-        if !matches_target(cand, target, &silicon) {
+        if !matches_abi(cand, &abi) {
             continue;
         }
         let out_path = out_dir.join(format!("{}.fmod", cand.name));
@@ -1223,7 +1221,7 @@ fn stamped_target(out_path: &Path) -> Option<String> {
 /// on bcm2712, say — changes the code as surely as a new triple does and
 /// leaves every source older than every object, so it has to invalidate
 /// the same way. Equal to the bare triple where a silicon adds nothing.
-fn compile_key(spec: &SiliconSpec) -> String {
+fn compile_key(spec: &AbiSpec) -> String {
     if spec.extra_rustflags.is_empty() {
         spec.module_target.to_string()
     } else {
@@ -1401,7 +1399,7 @@ fn source_ref_macro_paths(src: &str) -> Vec<String> {
 
 fn compile_module_pic(
     cand: &Candidate,
-    spec: &SiliconSpec,
+    spec: &AbiSpec,
     out_dir: &Path,
     opts: &BuildOpts,
 ) -> Result<BuildOutcome> {
@@ -1430,7 +1428,7 @@ fn compile_module_pic(
         .arg("-C")
         .arg("relocation-model=pic")
         .args(spec.extra_rustflags)
-        .args(cfg_silicon_args(spec))
+        .args(cfg_abi_args(spec))
         .args(cfg_feature_args(cand));
     if opts.strict {
         // `-D warnings` upgrades unfulfilled `#[expect(...)]` and
@@ -1543,7 +1541,7 @@ fn compile_module_pic(
         cand.type_id,
         Some(&cand.manifest),
         crate::modules::PackContext {
-            silicon: Some(spec.silicon_id),
+            abi: Some(spec.abi_id),
             variant: cand.variant.as_deref(),
             measured_stack,
         },
@@ -1794,7 +1792,7 @@ fn absolute_relocations(obj: &[u8]) -> Result<Vec<String>> {
 
 fn compile_module_wasm(
     cand: &Candidate,
-    spec: &SiliconSpec,
+    spec: &AbiSpec,
     out_dir: &Path,
     opts: &BuildOpts,
 ) -> Result<BuildOutcome> {
@@ -1815,9 +1813,7 @@ fn compile_module_wasm(
         ))
         .arg("-C")
         .arg("strip=symbols");
-    rustc
-        .args(cfg_silicon_args(spec))
-        .args(cfg_feature_args(cand));
+    rustc.args(cfg_abi_args(spec)).args(cfg_feature_args(cand));
     if opts.strict {
         rustc.arg("-D").arg("warnings");
     } else {
@@ -1874,7 +1870,7 @@ fn compile_module_wasm(
         &cand.embed_name,
         cand.type_id,
         Some(&cand.manifest),
-        Some(spec.silicon_id),
+        Some(spec.abi_id),
         cand.variant.as_deref(),
     )?;
     Ok(BuildOutcome::Built)
@@ -2017,43 +2013,30 @@ pub struct ModuleSummary {
     pub builtin: bool,
 }
 
-/// The project-relative `target/fluxor/<silicon>/modules` directory whose
+/// The project-relative `target/fluxor/<abi>/modules` directory whose
 /// artefacts a target LOADS, from a descriptor the caller already holds: the
-/// default [`select_module_root`] falls back to.
-///
-/// Takes the descriptor rather than a target name because the two differ
-/// exactly where it matters: a host target loads the artefacts of the silicon
-/// it runs on — `linux` loads `bcm2712`'s — and a directory named after the
-/// host has no artefact tree and never will. The rule is stated here once
-/// rather than rebuilt from `target_desc.id` at each call site.
+/// default [`select_module_root`] falls back to. Every target sharing an ABI
+/// shares the directory.
 pub fn modules_dir_for(desc: &crate::target::TargetDescriptor) -> PathBuf {
     PathBuf::from("target/fluxor")
-        .join(desc.module_silicon())
+        .join(desc.module_abi())
         .join("modules")
 }
 
-/// The default location of a target's modules: `<out_root>/<silicon>/modules`,
-/// where `<silicon>` is the silicon whose artefacts the target loads.
+/// The default location of a target's modules: `<out_root>/<abi>/modules`.
 ///
 /// This is the layout alone. A consumer that reads `.fmod` bytes must go
 /// through [`module_root`] (or [`select_module_root`]), which puts the
 /// explicit `--module-root` and `$FLUXOR_MODULE_ROOT` ahead of it.
 pub fn resolve(project_root: &Path, out_root: &Path, target: &str) -> PathBuf {
     // A BOARD is a legitimate subject here even though it is not a
-    // legitimate build target: its modules live in its silicon's
-    // directory, and where they live is the whole question. Going
-    // through `resolve_silicon` would take the board's level error and
-    // fall back to the board's own name — a directory that is always
-    // empty, handed to the callers who use this verb precisely so they
-    // need not know the layout.
-    //
-    // The raw-name fallback stays for a genuinely unknown target: the
-    // caller is printing a path, not building, and an unknown name
-    // still gets a deterministic answer.
-    let silicon = crate::target::load_target(target, project_root)
-        .map(|d| d.module_silicon().to_string())
+    // legitimate build target: its modules live on its silicon's ABI
+    // shelf, and where they live is the whole question. An unknown name
+    // still gets a deterministic answer: the caller is printing a path.
+    let abi = crate::target::load_target(target, project_root)
+        .map(|d| d.module_abi().to_string())
         .unwrap_or_else(|_| target.to_string());
-    out_root.join(silicon).join("modules")
+    out_root.join(abi).join("modules")
 }
 
 /// Environment variable naming the module root: the directory holding
@@ -2077,7 +2060,7 @@ pub fn module_root(
 ///
 ///   1. the explicit `--module-root <path>`;
 ///   2. `$FLUXOR_MODULE_ROOT` (an empty value counts as unset);
-///   3. `default_dir`, the project's `target/fluxor/<silicon>/modules`.
+///   3. `default_dir`, the project's `target/fluxor/<abi>/modules`.
 ///
 /// A root chosen by 1 or 2 is a statement of intent, so it is validated
 /// and never replaced: it must name an existing directory that holds at
@@ -2419,20 +2402,20 @@ pub static RS_NAMES: [&[u8]; 2] = [b"src/a.rs", b"src/b.rs"];
         );
     }
 
-    /// `modules_dir_for` sends a HOST target to the silicon whose artefacts
-    /// it loads, not to a directory named after itself.
-    ///
-    /// A path built from `target_desc.id` would be
-    /// `target/fluxor/linux/modules`, which is never created: every .fmod
-    /// lookup under it would miss, and a config check would report the
-    /// modules as carrying no parameter schema.
+    /// `modules_dir_for` and `resolve` send every target — silicon, host
+    /// or board — to its module ABI's shelf. A path built from the target's
+    /// own name (`target/fluxor/linux/modules`) is never written.
     #[test]
-    fn modules_dir_for_sends_a_host_target_to_its_silicon() {
+    fn every_target_loads_from_its_abi_shelf() {
         let root = repo_root();
+        let out = root.join("target/fluxor");
         for (target, want) in [
-            ("linux", "bcm2712"),
-            ("bcm2712", "bcm2712"),
-            ("rp2350", "rp2350"),
+            ("linux", "aarch64"),
+            ("bcm2712", "aarch64"),
+            ("pi5", "aarch64"),
+            ("rp2350", "thumbv8m"),
+            ("rp2040", "thumbv6m"),
+            ("wasm", "wasm32"),
         ] {
             let desc = crate::target::load_target(target, &root)
                 .unwrap_or_else(|e| panic!("{target} target loads: {e}"));
@@ -2441,30 +2424,8 @@ pub static RS_NAMES: [&[u8]; 2] = [b"src/a.rs", b"src/b.rs"];
                 PathBuf::from("target/fluxor").join(want).join("modules"),
                 "{target} must load {want}'s modules"
             );
+            assert_eq!(resolve(&root, &out, target), out.join(want).join("modules"));
         }
-    }
-
-    /// `resolve` answers for a BOARD, which `resolve_silicon` rejects.
-    /// The two differ on purpose: you build silicon, but you ask where a
-    /// board's modules are, and the answer is its silicon's directory.
-    #[test]
-    fn resolve_maps_a_board_onto_its_silicon_directory() {
-        let root = repo_root();
-        let out = root.join("target/fluxor");
-        assert_eq!(
-            resolve(&root, &out, "pi5"),
-            out.join("bcm2712").join("modules"),
-            "a board must not resolve to a directory that never holds modules"
-        );
-        // Silicon and hosts are unchanged.
-        assert_eq!(
-            resolve(&root, &out, "bcm2712"),
-            out.join("bcm2712").join("modules")
-        );
-        assert_eq!(
-            resolve(&root, &out, "rp2350"),
-            out.join("rp2350").join("modules")
-        );
         // An unknown name still gets a deterministic answer.
         assert_eq!(
             resolve(&root, &out, "not-a-target"),
@@ -2517,16 +2478,15 @@ pub static RS_NAMES: [&[u8]; 2] = [b"src/a.rs", b"src/b.rs"];
     }
 
     #[test]
-    fn resolve_silicon_uses_registry() {
+    fn resolve_abi_uses_registry() {
         let root = repo_root();
-        assert_eq!(resolve_silicon("rp2350", &root).unwrap(), "rp2350");
-        assert_eq!(resolve_silicon("rp2040", &root).unwrap(), "rp2040");
-        assert_eq!(resolve_silicon("wasm", &root).unwrap(), "wasm");
-        assert_eq!(resolve_silicon("bcm2712", &root).unwrap(), "bcm2712");
-        // Hosts redirect via [target].module_silicon.
-        assert_eq!(resolve_silicon("linux", &root).unwrap(), "bcm2712");
+        assert_eq!(resolve_abi("rp2350", &root).unwrap(), "thumbv8m");
+        assert_eq!(resolve_abi("rp2040", &root).unwrap(), "thumbv6m");
+        assert_eq!(resolve_abi("wasm", &root).unwrap(), "wasm32");
+        assert_eq!(resolve_abi("bcm2712", &root).unwrap(), "aarch64");
+        assert_eq!(resolve_abi("linux", &root).unwrap(), "aarch64");
         // Boards are a level error in module-build slots.
-        let err = resolve_silicon("pi5", &root).unwrap_err().to_string();
+        let err = resolve_abi("pi5", &root).unwrap_err().to_string();
         assert!(err.contains("board id"), "{err}");
         assert!(err.contains("bcm2712"), "{err}");
     }
@@ -2600,21 +2560,19 @@ pub static RS_NAMES: [&[u8]; 2] = [b"src/a.rs", b"src/b.rs"];
     }
 
     #[test]
-    fn silicon_spec_lookup_covers_all_documented_targets() {
-        for s in ["rp2040", "rp2350", "bcm2712", "wasm"] {
-            assert!(silicon_spec(s).is_some(), "missing spec for {s}");
+    fn every_buildable_abi_has_a_recipe() {
+        for a in crate::runtime_abi::ABIS {
+            assert_eq!(abi_spec(a.id).is_some(), a.buildable, "{}", a.id);
         }
-        assert!(silicon_spec("unknown").is_none());
     }
 
-    #[test]
-    fn matches_target_empty_means_all() {
-        let c = Candidate {
+    fn candidate(targets: &[&str]) -> Candidate {
+        Candidate {
             name: "x".into(),
             dir: PathBuf::new(),
             entry: PathBuf::new(),
             manifest: PathBuf::new(),
-            hardware_targets: vec![],
+            hardware_targets: targets.iter().map(|t| t.to_string()).collect(),
             type_id: 2,
             edition: "2021".into(),
             embed_name: "x".into(),
@@ -2624,58 +2582,20 @@ pub static RS_NAMES: [&[u8]; 2] = [b"src/a.rs", b"src/b.rs"];
             wasm_opt_level: None,
             opt_level: None,
             builtin: false,
-        };
-        assert!(matches_target(&c, "rp2350", "rp2350"));
-        assert!(matches_target(&c, "linux", "bcm2712"));
+        }
     }
 
+    /// A module is built onto every shelf a runtime it names loads: a
+    /// hosted-only module lands on the aarch64 shelf like a bare-metal one,
+    /// whichever target asked for the shelf.
     #[test]
-    fn matches_target_by_silicon_id() {
-        let c = Candidate {
-            name: "x".into(),
-            dir: PathBuf::new(),
-            entry: PathBuf::new(),
-            manifest: PathBuf::new(),
-            hardware_targets: vec!["bcm2712".into()],
-            type_id: 2,
-            edition: "2021".into(),
-            embed_name: "x".into(),
-            variant: None,
-            features: Vec::new(),
-            check_cfg_features: Vec::new(),
-            wasm_opt_level: None,
-            opt_level: None,
-            builtin: false,
-        };
-        // Host target "linux" matches via its module silicon (bcm2712).
-        assert!(matches_target(&c, "linux", "bcm2712"));
-        assert!(matches_target(&c, "bcm2712", "bcm2712"));
-        assert!(!matches_target(&c, "rp2350", "rp2350"));
-    }
-
-    #[test]
-    fn matches_target_by_raw_target_token() {
-        let c = Candidate {
-            name: "x".into(),
-            dir: PathBuf::new(),
-            entry: PathBuf::new(),
-            manifest: PathBuf::new(),
-            hardware_targets: vec!["linux".into()],
-            type_id: 2,
-            edition: "2021".into(),
-            embed_name: "x".into(),
-            variant: None,
-            features: Vec::new(),
-            check_cfg_features: Vec::new(),
-            wasm_opt_level: None,
-            opt_level: None,
-            builtin: false,
-        };
-        // Manifest pinned to the raw host token — the target-string
-        // match lets it through when the user invokes `--target linux`.
-        assert!(matches_target(&c, "linux", "bcm2712"));
-        // But the silicon alone doesn't imply the host token.
-        assert!(!matches_target(&c, "bcm2712", "bcm2712"));
+    fn a_module_is_built_for_every_abi_its_runtimes_load() {
+        assert!(matches_abi(&candidate(&[]), "thumbv8m"));
+        assert!(matches_abi(&candidate(&["linux"]), "aarch64"));
+        assert!(!matches_abi(&candidate(&["linux"]), "thumbv8m"));
+        assert!(matches_abi(&candidate(&["bcm2712"]), "aarch64"));
+        assert!(!matches_abi(&candidate(&["bcm2712"]), "thumbv6m"));
+        assert!(matches_abi(&candidate(&["rp2350", "wasm"]), "wasm32"));
     }
 
     #[test]

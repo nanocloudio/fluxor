@@ -700,19 +700,17 @@ bindings:
 
     #[test]
     fn target_aliases_table_is_sensible() {
-        let has = |t: &str, want: &str| target_aliases(t).iter().any(|a| a == want);
-        // Linux reuses bcm2712 PIC modules — that's the whole point
-        // of `runtime_override: linux` working for pi5 graphs.
-        assert!(has("linux", "bcm2712"));
-        assert!(has("linux", "linux"));
-        // pi5 board uses bcm2712 silicon; the board id itself is NOT
-        // a legal `hardware_targets` token (§2 rule 1).
-        assert!(has("pi5", "bcm2712"));
-        assert!(!has("pi5", "pi5"));
-        assert!(has("qemu-virt", "bcm2712"));
-        assert!(has("pico2w", "rp2350"));
-        // wasm is wasm — no aliasing.
-        assert_eq!(target_aliases("wasm"), vec!["wasm".to_string()]);
+        let aliases = |t: &str| target_aliases(t);
+        // A target places exactly the modules that name its runtime: the
+        // linux host shares bcm2712's module ABI, not its contracts, so a
+        // bare-metal `["bcm2712"]` module is not placed under it.
+        assert_eq!(aliases("linux"), vec!["linux".to_string()]);
+        // A board resolves to its silicon's runtime; the board id itself is
+        // NOT a legal `hardware_targets` token (§2 rule 1).
+        assert_eq!(aliases("pi5"), vec!["bcm2712".to_string()]);
+        assert_eq!(aliases("qemu-virt"), vec!["bcm2712".to_string()]);
+        assert_eq!(aliases("pico2w"), vec!["rp2350".to_string()]);
+        assert_eq!(aliases("wasm"), vec!["wasm".to_string()]);
         // Unknown target → empty (no aliases means strict
         // never-matches; the build path will surface this with its
         // own error).

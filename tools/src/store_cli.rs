@@ -672,6 +672,8 @@ fn read_module_pins(project_root: &Path) -> Result<Option<Vec<ModulePin>>> {
     // is where a consumer that has not run `fluxor update` since the
     // ledger existed registers itself. Idempotent and cheap: an
     // unchanged pin set rewrites nothing.
+    store_resolve::check_module_pin_targets(&lock.artifacts)
+        .map_err(|e| Error::Config(e.to_string()))?;
     store_resolve::register_pins(project_root, &lock.artifacts);
     let pins: Vec<ModulePin> = lock
         .artifacts
@@ -851,7 +853,7 @@ pub fn lock_store_resolver(
 /// reachable through a pin as well.
 pub fn lock_store_manifest_resolver(
     project_root: &Path,
-    silicon: Option<&str>,
+    abi: Option<&str>,
     store_dir: Option<&Path>,
 ) -> Option<BoxedManifestResolver> {
     use crate::modules::ManifestPin;
@@ -865,12 +867,7 @@ pub fn lock_store_manifest_resolver(
             }));
         }
     };
-    // Whether the requested target is a host (`linux`, `wasm`) rather than a
-    // silicon or board. Resolved through the target descriptor so the set lives
-    // in one place (`TargetKind::Host`) instead of being restated here.
-    let is_host = silicon
-        .is_some_and(|s| crate::target::load_target(s, project_root).is_ok_and(|t| t.is_host()));
-    let silicon = silicon.map(|s| s.to_string());
+    let abi = abi.map(|s| s.to_string());
     let store = match open_store(store_dir) {
         Ok(s) => s,
         Err(e) => {
@@ -889,28 +886,23 @@ pub fn lock_store_manifest_resolver(
         if named.is_empty() {
             return ManifestPin::NotPinned;
         }
-        let silicon_match = silicon
+        let abi_match = abi
             .as_deref()
             .and_then(|want| named.iter().find(|p| p.target.as_deref() == Some(want)));
         let unambiguous = named.iter().all(|p| p.digest == named[0].digest);
-        let pin = match silicon_match {
+        let pin = match abi_match {
             Some(p) => *p,
-            // One digest across every target: the artifact is
-            // target-agnostic, so any pin is the right pin.
+            // One digest across every ABI: the artifact is ABI-agnostic,
+            // so any pin is the right pin.
             None if unambiguous => named[0],
-            // Nothing for a pin to bind: a host graph loads modules built
-            // from source into `modules.bin`, never store bytes. Validating
-            // against a silicon pin would check wiring against a surface
-            // this run will not load.
-            None if is_host => return ManifestPin::NotPinned,
-            // A silicon does need the artifact for it, so the right one is
+            // The ABI needs the artifact built for it, so the right one is
             // missing rather than ambiguous. Falling through would validate
-            // against another silicon's surface.
+            // against another ABI's surface.
             None => {
                 return ManifestPin::Failed(format!(
                     "module '{name}' is pinned for several targets at differing digests \
                      and none matches {}; pin it for this target",
-                    silicon.as_deref().unwrap_or("the requested target")
+                    abi.as_deref().unwrap_or("the requested target")
                 ))
             }
         };
@@ -1038,12 +1030,12 @@ mod tests {
             &store,
             &ModulePublish {
                 name: "codec",
-                target: "bcm2712",
+                target: "aarch64",
                 fmod_bytes: b"fake-fmod-bytes",
                 manifest_toml: None,
                 provenance: PROVENANCE_LOCAL,
                 source_rev: None,
-                ref_name: "bcm2712/codec:1.0.0",
+                ref_name: "aarch64/codec:1.0.0",
             },
         )
         .expect("publish");
@@ -1057,15 +1049,15 @@ mod tests {
         std::fs::create_dir_all(&proj).unwrap();
         let (_store, digest) = store_with_module(tmp.path());
 
-        pin_module(&proj, "codec", "bcm2712", &digest, "bcm2712/codec:1.0.0");
+        pin_module(&proj, "codec", "aarch64", &digest, "aarch64/codec:1.0.0");
         // Re-pin with the same key replaces, not duplicates.
-        pin_module(&proj, "codec", "bcm2712", &digest, "bcm2712/codec:1.0.0");
+        pin_module(&proj, "codec", "aarch64", &digest, "aarch64/codec:1.0.0");
         let lock = store_resolve::read_store_lock(&proj).unwrap().unwrap();
         assert_eq!(lock.artifacts.len(), 1);
 
         let store_dir = tmp.path().join("store");
         let resolver =
-            lock_store_resolver(&proj, "bcm2712", Some(&store_dir)).expect("resolver present");
+            lock_store_resolver(&proj, "aarch64", Some(&store_dir)).expect("resolver present");
         let crate::modules::StorePin::Resolved(path) = resolver("codec") else {
             panic!("codec must resolve from store");
         };
@@ -1075,7 +1067,7 @@ mod tests {
             crate::modules::StorePin::NotPinned
         ));
         // Wrong target -> no resolver.
-        assert!(lock_store_resolver(&proj, "rp2350", Some(&store_dir)).is_none());
+        assert!(lock_store_resolver(&proj, "thumbv8m", Some(&store_dir)).is_none());
     }
 
     #[test]
@@ -1089,9 +1081,9 @@ mod tests {
         let fmod_digest = sha256_hex_prefixed(b"fake-fmod-bytes");
         std::fs::write(store.blob_path(&fmod_digest).unwrap(), b"tampered").unwrap();
 
-        pin_module(&proj, "codec", "bcm2712", &digest, "bcm2712/codec:1.0.0");
+        pin_module(&proj, "codec", "aarch64", &digest, "aarch64/codec:1.0.0");
         let store_dir = tmp.path().join("store");
-        let resolver = lock_store_resolver(&proj, "bcm2712", Some(&store_dir)).unwrap();
+        let resolver = lock_store_resolver(&proj, "aarch64", Some(&store_dir)).unwrap();
         assert!(
             matches!(resolver("codec"), crate::modules::StorePin::Failed(_)),
             "tampered blob must be a hard failure, not a silent fall-through"
@@ -1130,19 +1122,19 @@ mod tests {
         let store = OciStore::open(tmp.path().join("store")).expect("open store");
 
         let toml = "version = \"0.1.0\"\ntype = \"Protocol\"\nentry = \"mod.rs\"\n";
-        let digest = publish_with_manifest(&store, "redis_client", "bcm2712", b"fmodA", toml);
+        let digest = publish_with_manifest(&store, "redis_client", "aarch64", b"fmodA", toml);
         pin_module(
             &proj,
             "redis_client",
-            "bcm2712",
+            "aarch64",
             &digest,
-            "bcm2712/redis_client:0.1.0",
+            "aarch64/redis_client:0.1.0",
         );
 
         let store_dir = tmp.path().join("store");
 
         // Exact silicon match resolves the pinned manifest as UTF-8 text.
-        let r = lock_store_manifest_resolver(&proj, Some("bcm2712"), Some(&store_dir))
+        let r = lock_store_manifest_resolver(&proj, Some("aarch64"), Some(&store_dir))
             .expect("resolver present");
         match r("redis_client") {
             ManifestPin::Resolved(text) => assert_eq!(text, toml),
@@ -1152,7 +1144,7 @@ mod tests {
 
         // Callers pass the module-silicon id (a pi5 graph resolves to
         // `bcm2712` before pin lookup), so the pin matches by string.
-        let r_bcm = lock_store_manifest_resolver(&proj, Some("bcm2712"), Some(&store_dir))
+        let r_bcm = lock_store_manifest_resolver(&proj, Some("aarch64"), Some(&store_dir))
             .expect("resolver present");
         match r_bcm("redis_client") {
             ManifestPin::Resolved(text) => assert_eq!(text, toml),
@@ -1177,26 +1169,26 @@ mod tests {
                    [[ports]]\nname = \"big\"\ndirection = \"out\"\n";
         let rp = "version = \"0.1.0\"\ntype = \"Protocol\"\nentry = \"mod.rs\"\n\
                   [[ports]]\nname = \"small\"\ndirection = \"out\"\n";
-        let d_bcm = publish_with_manifest(&store, "mqtt_client", "bcm2712", b"fmodA", bcm);
-        let d_rp = publish_with_manifest(&store, "mqtt_client", "rp2350", b"fmodB", rp);
+        let d_bcm = publish_with_manifest(&store, "mqtt_client", "aarch64", b"fmodA", bcm);
+        let d_rp = publish_with_manifest(&store, "mqtt_client", "thumbv8m", b"fmodB", rp);
         assert_ne!(d_bcm, d_rp);
         pin_module(
             &proj,
             "mqtt_client",
-            "bcm2712",
+            "aarch64",
             &d_bcm,
-            "bcm2712/mqtt_client:0.1.0",
+            "aarch64/mqtt_client:0.1.0",
         );
         pin_module(
             &proj,
             "mqtt_client",
-            "rp2350",
+            "thumbv8m",
             &d_rp,
-            "rp2350/mqtt_client:0.1.0",
+            "thumbv8m/mqtt_client:0.1.0",
         );
 
         let store_dir = tmp.path().join("store");
-        for (silicon, want) in [("rp2350", rp), ("bcm2712", bcm)] {
+        for (silicon, want) in [("thumbv8m", rp), ("aarch64", bcm)] {
             let r = lock_store_manifest_resolver(&proj, Some(silicon), Some(&store_dir))
                 .expect("resolver present");
             match r("mqtt_client") {
@@ -1215,13 +1207,13 @@ mod tests {
         let store = OciStore::open(tmp.path().join("store")).expect("open store");
 
         let toml = "version = \"0.1.0\"\ntype = \"Protocol\"\nentry = \"mod.rs\"\n";
-        let digest = publish_with_manifest(&store, "redis_client", "bcm2712", b"fmodA", toml);
+        let digest = publish_with_manifest(&store, "redis_client", "aarch64", b"fmodA", toml);
         pin_module(
             &proj,
             "redis_client",
-            "bcm2712",
+            "aarch64",
             &digest,
-            "bcm2712/redis_client:0.1.0",
+            "aarch64/redis_client:0.1.0",
         );
 
         // Tamper with the manifest.toml blob: the digest no longer matches,
@@ -1230,20 +1222,20 @@ mod tests {
         std::fs::write(store.blob_path(&toml_digest).unwrap(), [0xffu8, 0xfe, 0x00]).unwrap();
 
         let store_dir = tmp.path().join("store");
-        let r = lock_store_manifest_resolver(&proj, Some("bcm2712"), Some(&store_dir))
+        let r = lock_store_manifest_resolver(&proj, Some("aarch64"), Some(&store_dir))
             .expect("resolver present");
         let why = match r("redis_client") {
             ManifestPin::Failed(why) => why,
             other => panic!("corrupt manifest layer must fail hard, got {other:?}"),
         };
         assert!(
-            why.contains("bcm2712/redis_client:0.1.0"),
+            why.contains("aarch64/redis_client:0.1.0"),
             "failure must name the pin: {why}"
         );
     }
 
     #[test]
-    fn ambiguous_multi_target_pins_refuse_without_silicon_match() {
+    fn ambiguous_multi_target_pins_refuse_without_abi_match() {
         use crate::modules::ManifestPin;
         let tmp = tempfile::tempdir().unwrap();
         let proj = tmp.path().join("proj");
@@ -1254,68 +1246,45 @@ mod tests {
         let d1 = publish_with_manifest(
             &store,
             "amqp_client",
-            "bcm2712",
+            "aarch64",
             b"fmodA",
             "version=\"1\"\n",
         );
-        let d2 =
-            publish_with_manifest(&store, "amqp_client", "rp2350", b"fmodB", "version=\"2\"\n");
+        let d2 = publish_with_manifest(
+            &store,
+            "amqp_client",
+            "thumbv8m",
+            b"fmodB",
+            "version=\"2\"\n",
+        );
         assert_ne!(d1, d2);
         pin_module(
             &proj,
             "amqp_client",
-            "bcm2712",
+            "aarch64",
             &d1,
-            "bcm2712/amqp_client:0.1.0",
+            "aarch64/amqp_client:0.1.0",
         );
         pin_module(
             &proj,
             "amqp_client",
-            "rp2350",
+            "thumbv8m",
             &d2,
-            "rp2350/amqp_client:0.1.0",
+            "thumbv8m/amqp_client:0.1.0",
         );
 
         let store_dir = tmp.path().join("store");
-        let r = lock_store_manifest_resolver(&proj, Some("bcm2712"), Some(&store_dir)).unwrap();
-        // Requested silicon matches one pin -> its manifest.
+        let r = lock_store_manifest_resolver(&proj, Some("aarch64"), Some(&store_dir)).unwrap();
+        // The requested ABI matches one pin -> its manifest. Every runtime on
+        // that ABI (bcm2712 and the linux host) resolves the same pin.
         match r("amqp_client") {
             ManifestPin::Resolved(text) => assert_eq!(text, "version=\"1\"\n"),
-            other => panic!("expected Resolved bcm2712, got {other:?}"),
+            other => panic!("expected Resolved aarch64, got {other:?}"),
         }
-        // A silicon with NO matching pin and divergent digests -> refuse.
-        let r_other = lock_store_manifest_resolver(&proj, Some("stm32"), Some(&store_dir)).unwrap();
+        // An ABI with NO matching pin and divergent digests -> refuse.
+        let r_other =
+            lock_store_manifest_resolver(&proj, Some("x86_64"), Some(&store_dir)).unwrap();
         assert!(matches!(r_other("amqp_client"), ManifestPin::Failed(_)));
-    }
-
-    /// A HOST target with no matching pin falls through instead of refusing.
-    ///
-    /// Sibling of `ambiguous_multi_target_pins_refuse_without_silicon_match`,
-    /// and the pair is the whole rule: a pin binds the target it names, so a
-    /// silicon that should have an artifact and does not is an error, while a
-    /// host — whose modules are built from source into `modules.bin` and never
-    /// fetched from the store — has nothing for the pin to bind and takes the
-    /// on-disk manifest.
-    #[test]
-    fn ambiguous_multi_target_pins_fall_through_for_a_host_target() {
-        use crate::modules::ManifestPin;
-        let tmp = tempfile::tempdir().unwrap();
-        let proj = tmp.path().join("proj");
-        std::fs::create_dir_all(&proj).unwrap();
-        let store = OciStore::open(tmp.path().join("store")).expect("open store");
-
-        let d1 = publish_with_manifest(&store, "tls", "bcm2712", b"fmodA", "version=\"1\"\n");
-        let d2 = publish_with_manifest(&store, "tls", "rp2350", b"fmodB", "version=\"2\"\n");
-        assert_ne!(d1, d2);
-        pin_module(&proj, "tls", "bcm2712", &d1, "bcm2712/tls:0.1.0");
-        pin_module(&proj, "tls", "rp2350", &d2, "rp2350/tls:0.1.0");
-
-        let store_dir = tmp.path().join("store");
-        let r = lock_store_manifest_resolver(&proj, Some("linux"), Some(&store_dir)).unwrap();
-        assert!(
-            matches!(r("tls"), ManifestPin::NotPinned),
-            "a host target must fall through to the on-disk manifest, not refuse"
-        );
     }
 
     #[test]
@@ -1326,9 +1295,9 @@ mod tests {
         std::fs::create_dir_all(&proj).unwrap();
         // Published with manifest_toml: None — no metadata layer.
         let (_store, digest) = store_with_module(tmp.path());
-        pin_module(&proj, "codec", "bcm2712", &digest, "bcm2712/codec:1.0.0");
+        pin_module(&proj, "codec", "aarch64", &digest, "aarch64/codec:1.0.0");
         let store_dir = tmp.path().join("store");
-        let resolver = lock_store_manifest_resolver(&proj, Some("bcm2712"), Some(&store_dir))
+        let resolver = lock_store_manifest_resolver(&proj, Some("aarch64"), Some(&store_dir))
             .expect("resolver present");
         // No manifest layer => NotPinned so an on-disk source manifest can fill in.
         assert!(matches!(resolver("codec"), ManifestPin::NotPinned));

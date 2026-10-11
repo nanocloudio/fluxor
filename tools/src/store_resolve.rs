@@ -37,7 +37,7 @@ pub struct Artifact {
     pub name: String,
     /// Publishing project (`io.fluxor.project`).
     pub project: String,
-    /// Silicon target for modules, host triple for runtimes; absent
+    /// Module ABI for modules, host triple for runtimes; absent
     /// for sources and bundles.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
@@ -183,6 +183,33 @@ pub fn read_store_lock(project_root: &Path) -> Result<Option<StoreLock>> {
         ))
     })?;
     Ok(Some(parsed))
+}
+
+/// Refuse module pins whose `target` is not a module ABI
+/// (`crate::runtime_abi::ABIS`): a pin taken under another naming of the
+/// shelves resolves nothing now, and consuming the lock as though it had no
+/// pin would build from whatever happens to be on disk. `fluxor update`
+/// replaces every module pin and is the way out.
+pub fn check_module_pin_targets(artifacts: &[Artifact]) -> Result<()> {
+    let stale: Vec<String> = artifacts
+        .iter()
+        .filter(|a| a.kind == "module")
+        .filter(|a| {
+            a.target
+                .as_deref()
+                .is_some_and(|t| crate::runtime_abi::abi(t).is_none())
+        })
+        .map(|a| format!("{} ({})", a.name, a.target.as_deref().unwrap_or("")))
+        .collect();
+    if stale.is_empty() {
+        return Ok(());
+    }
+    Err(Error::Config(format!(
+        "fluxor.lock pins {} module(s) for a target that is not a module ABI: {} — \
+         run `fluxor update` to re-pin them",
+        stale.len(),
+        stale.join(", ")
+    )))
 }
 
 /// Stable lockfile order: sort by (kind, project, name, target) and
@@ -369,12 +396,10 @@ pub fn artifact_from_descriptor(d: &Descriptor) -> Result<Option<Artifact>> {
 
 // ── Resolution ────────────────────────────────────────────────────────
 
-/// The silicon set this project builds modules for, from
-/// `fluxor.toml::[ci].targets` (each mapped through
-/// `resolve_silicon`; unmappable names pass through raw). `None` when
-/// the list is absent or empty — the caller then pins every module
-/// child rather than guessing.
-fn ci_target_silicons(project_root: &Path) -> Result<Option<BTreeSet<String>>> {
+/// The module ABIs this project builds for, from `fluxor.toml::[ci].targets`
+/// (each mapped through `resolve_abi`). `None` when the list is absent or
+/// empty — the caller then pins every module child rather than guessing.
+fn ci_target_abis(project_root: &Path) -> Result<Option<BTreeSet<String>>> {
     let path = project_root.join("fluxor.toml");
     if !path.exists() {
         return Ok(None);
@@ -394,18 +419,11 @@ fn ci_target_silicons(project_root: &Path) -> Result<Option<BTreeSet<String>>> {
     if targets.is_empty() {
         return Ok(None);
     }
-    let mut silicons = BTreeSet::new();
+    let mut abis = BTreeSet::new();
     for t in targets {
-        // Target names and silicon ids both appear in [ci].targets
-        // downstream; resolve where possible, pass through otherwise
-        // (an unresolvable name never silently drops a module pin —
-        // both forms stay in the accept set).
-        silicons.insert(
-            crate::modules_build::resolve_silicon(&t, project_root).unwrap_or_else(|_| t.clone()),
-        );
-        silicons.insert(t);
+        abis.insert(crate::modules_build::resolve_abi(&t, project_root)?);
     }
-    Ok(Some(silicons))
+    Ok(Some(abis))
 }
 
 fn read_image_index(store: &OciStore, digest: &str) -> Result<ImageIndex> {
@@ -416,11 +434,11 @@ fn read_image_index(store: &OciStore, digest: &str) -> Result<ImageIndex> {
 
 /// Resolve one dependency's pinnable artifacts from its project index
 /// (`<dep>/meta:latest`): every source and runtime child, plus module
-/// children whose target is in `silicons` (all of them when `None`).
+/// children whose target is in `abis` (all of them when `None`).
 pub(crate) fn resolve_dependency(
     store: &OciStore,
     dep: &str,
-    silicons: Option<&BTreeSet<String>>,
+    abis: Option<&BTreeSet<String>>,
 ) -> Result<Vec<Artifact>> {
     let meta_ref = format!("{dep}/meta:latest");
     let desc = store.resolve(&meta_ref).map_err(|_| {
@@ -438,7 +456,7 @@ pub(crate) fn resolve_dependency(
         match a.kind.as_str() {
             "source" | "runtime" => out.push(a),
             "module" => {
-                let wanted = match (silicons, a.target.as_deref()) {
+                let wanted = match (abis, a.target.as_deref()) {
                     (Some(set), Some(t)) => set.contains(t),
                     // No target list, or an untargeted module child:
                     // pin rather than silently drop.
@@ -464,10 +482,10 @@ pub(crate) fn resolve_dependency(
 pub fn resolve_project(project_root: &Path) -> Result<Vec<Artifact>> {
     let deps = crate::project::dependencies(project_root).map_err(Error::Config)?;
     let store = OciStore::open(crate::oci_store::store_root()?)?;
-    let silicons = ci_target_silicons(project_root)?;
+    let abis = ci_target_abis(project_root)?;
     let mut out = Vec::new();
     for dep in deps {
-        out.extend(resolve_dependency(&store, &dep.name, silicons.as_ref())?);
+        out.extend(resolve_dependency(&store, &dep.name, abis.as_ref())?);
     }
     sort_entries(&mut out);
     Ok(out)
@@ -855,6 +873,27 @@ mod tests {
             reference: format!("{project}/{name}:0.0.1"),
             content: None,
         }
+    }
+
+    #[test]
+    fn a_module_pin_for_a_non_abi_target_is_refused() {
+        let pin = |target: &str| Artifact {
+            kind: "module".into(),
+            name: "tls".into(),
+            project: "fluxor".into(),
+            target: Some(target.into()),
+            digest: "sha256:00".into(),
+            reference: format!("{target}/tls:0.0.1"),
+            content: None,
+        };
+        assert!(check_module_pin_targets(&[pin("aarch64"), pin("thumbv8m")]).is_ok());
+        let err = check_module_pin_targets(&[pin("aarch64"), pin("bcm2712")])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("tls (bcm2712)") && err.contains("fluxor update"),
+            "{err}"
+        );
     }
 
     #[test]

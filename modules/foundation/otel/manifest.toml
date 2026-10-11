@@ -2,7 +2,7 @@ version = "1.0.0"
 # timer_class: flush cadence and reliable-mode ack deadlines gate on
 # dev_micros (wall-clock), not per-step counting.
 timer_class = "wall_clock"
-hardware_targets = ["rp2350", "bcm2712"]
+hardware_targets = ["rp2350", "bcm2712", "linux"]
 
 # OTEL export engine. A telemetry-ring consumer that drains records, batches
 # them, and emits request-ready payloads on `export` for a transport-blind

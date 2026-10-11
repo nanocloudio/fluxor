@@ -9,6 +9,8 @@
 id = "wasm"
 family = "wasm"
 description = "WASM (wasm32, host-instantiated)"
+runtime = "wasm"
+module_abi = "wasm32"
 
 [build]
 rust_target = "wasm32-unknown-unknown"

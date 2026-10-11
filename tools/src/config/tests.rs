@@ -4,7 +4,7 @@
 fn test_loc(dir: &std::path::Path) -> crate::schema::ModuleLocation<'_> {
     crate::schema::ModuleLocation {
         dir,
-        silicon: "",
+        abi: "",
         project_root: std::path::Path::new("/nonexistent"),
     }
 }
@@ -1515,31 +1515,35 @@ mod scheduler_validation_tests {
     }
 
     #[test]
-    fn target_aware_manifest_loader_resolves_silicon_capacity() {
+    fn target_aware_manifest_loader_resolves_the_targets_abi_capacity() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mod_dir = dir.path().join("sized_stream");
         std::fs::create_dir_all(&mod_dir).expect("mkdir");
         std::fs::write(
             mod_dir.join("manifest.toml"),
-            "version = \"0.1.0\"\nhardware_targets = [\"bcm2712\"]\n\
+            "version = \"0.1.0\"\nhardware_targets = [\"bcm2712\", \"linux\"]\n\
              [[ports]]\nname = \"stream_out\"\ndirection = \"output\"\n\
              content_type = \"OctetStream\"\n\
-             buffer_size = { default = 2048, bcm2712 = 8192 }\n",
+             buffer_size = { default = 2048, aarch64 = 8192 }\n",
         )
         .expect("write manifest");
 
+        // The registry resolves each target to its module ABI: bcm2712 and
+        // the linux host both load the aarch64 value.
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
         let modules = json!([{"name": "sized_stream", "type": "sized_stream"}]);
         let extras: Vec<&std::path::Path> = vec![dir.path()];
         let default_manifest = load_module_manifests_with_extra(&modules, &extras, dir.path());
-        let bcm_manifest = load_module_manifests_with_extra_for_target(
-            &modules,
-            &extras,
-            Some("bcm2712"),
-            dir.path(),
-        );
-
         assert_eq!(default_manifest["sized_stream"].ports[0].buffer_size, 2048);
-        assert_eq!(bcm_manifest["sized_stream"].ports[0].buffer_size, 8192);
+        for target in ["bcm2712", "linux"] {
+            let m = load_module_manifests_with_extra_for_target(
+                &modules,
+                &extras,
+                Some(target),
+                &repo,
+            );
+            assert_eq!(m["sized_stream"].ports[0].buffer_size, 8192, "{target}");
+        }
     }
 
     #[test]
@@ -3218,10 +3222,10 @@ mod port_capability_tests {
         [[ports]]\nname = \"request_out\"\ndirection = \"output\"\n\
         content_type = \"OctetStream\"\nrequires_capability = \"stream.publish\"\n\n\
         [capability_facts.\"stream.publish\"]\n\
-        max_payload = { bcm2712 = 8192, rp2350 = 4096, rp2040 = 512 }\n";
+        max_payload = { aarch64 = 8192, thumbv8m = 4096, thumbv6m = 512 }\n";
 
     /// The composer checks the value for the graph's target: the same pump
-    /// fits a 1024-byte backend on rp2040 and is refused by it on bcm2712.
+    /// fits a 1024-byte backend on thumbv6m and is refused by it on aarch64.
     #[test]
     fn a_per_target_payload_is_checked_for_the_graphs_target() {
         let graph = |silicon: &str| {
@@ -3236,10 +3240,10 @@ mod port_capability_tests {
             );
             validate_port_capabilities(&edge(), &m)
         };
-        graph("rp2040").expect("512 fits a 1024-byte ceiling");
-        let msg = format!("{:?}", graph("bcm2712").unwrap_err());
+        graph("thumbv6m").expect("512 fits a 1024-byte ceiling");
+        let msg = format!("{:?}", graph("aarch64").unwrap_err());
         assert!(msg.contains("8192") && msg.contains("1024"), "got: {msg}");
-        let msg = format!("{:?}", graph("rp2350").unwrap_err());
+        let msg = format!("{:?}", graph("thumbv8m").unwrap_err());
         assert!(msg.contains("4096"), "got: {msg}");
     }
 
@@ -3466,16 +3470,16 @@ mod port_fact_tests {
     #[test]
     fn a_per_target_fact_resolves_for_each_target() {
         let src = per_target_fact_manifest(
-            "max_payload = { bcm2712 = 8192, rp2350 = 4096, rp2040 = 512 }",
+            "max_payload = { aarch64 = 8192, thumbv8m = 4096, thumbv6m = 512 }",
         );
-        for (silicon, want) in [("bcm2712", "8192"), ("rp2350", "4096"), ("rp2040", "512")] {
+        for (silicon, want) in [("aarch64", "8192"), ("thumbv8m", "4096"), ("thumbv6m", "512")] {
             assert_eq!(
                 resolved_fact(&src, Some(silicon)).unwrap(),
                 want,
                 "{silicon}"
             );
         }
-        let m = Manifest::from_toml_str_for_target(&src, Some("rp2040")).unwrap();
+        let m = Manifest::from_toml_str_for_target(&src, Some("thumbv6m")).unwrap();
         assert_eq!(
             m.capability_facts["stream.ordered_ack.sink"]["ack"],
             "transport"
@@ -3486,10 +3490,10 @@ mod port_fact_tests {
     /// name, including a load for no target.
     #[test]
     fn a_per_target_fact_takes_its_explicit_default() {
-        let src = per_target_fact_manifest("max_payload = { default = 8192, rp2040 = 512 }");
-        assert_eq!(resolved_fact(&src, Some("rp2040")).unwrap(), "512");
-        assert_eq!(resolved_fact(&src, Some("rp2350")).unwrap(), "8192");
-        assert_eq!(resolved_fact(&src, Some("bcm2712")).unwrap(), "8192");
+        let src = per_target_fact_manifest("max_payload = { default = 8192, thumbv6m = 512 }");
+        assert_eq!(resolved_fact(&src, Some("thumbv6m")).unwrap(), "512");
+        assert_eq!(resolved_fact(&src, Some("thumbv8m")).unwrap(), "8192");
+        assert_eq!(resolved_fact(&src, Some("aarch64")).unwrap(), "8192");
         assert_eq!(resolved_fact(&src, None).unwrap(), "8192");
     }
 
@@ -3497,7 +3501,7 @@ mod port_fact_tests {
     #[test]
     fn flat_facts_stay_valid() {
         let src = per_target_fact_manifest("max_payload = 8192");
-        assert_eq!(resolved_fact(&src, Some("rp2040")).unwrap(), "8192");
+        assert_eq!(resolved_fact(&src, Some("thumbv6m")).unwrap(), "8192");
         let src = per_target_fact_manifest("max_payload = \"8192\"");
         assert_eq!(resolved_fact(&src, None).unwrap(), "8192");
     }
@@ -3509,52 +3513,52 @@ mod port_fact_tests {
         let refused = |fact: &str, silicon: Option<&str>| {
             resolved_fact(&per_target_fact_manifest(fact), silicon).unwrap_err()
         };
-        // Partial: rp2040 is a hardware target with no entry and no default,
+        // Partial: thumbv6m is a hardware target with no entry and no default,
         // refused even when loading for a target the table does name.
         let e = refused(
-            "max_payload = { bcm2712 = 8192, rp2350 = 4096 }",
-            Some("bcm2712"),
+            "max_payload = { aarch64 = 8192, thumbv8m = 4096 }",
+            Some("aarch64"),
         );
         assert!(
-            e.contains("no value for rp2040") && e.contains("no `default`"),
+            e.contains("no value for thumbv6m") && e.contains("no `default`"),
             "{e}"
         );
         // Complete for the module's targets, but a load for no target has
         // nothing to resolve.
         let e = refused(
-            "max_payload = { bcm2712 = 8192, rp2350 = 4096, rp2040 = 512 }",
+            "max_payload = { aarch64 = 8192, thumbv8m = 4096, thumbv6m = 512 }",
             None,
         );
         assert!(e.contains("no entry for target \"<none>\""), "{e}");
-        let e = refused("max_payload = {}", Some("rp2040"));
+        let e = refused("max_payload = {}", Some("thumbv6m"));
         assert!(e.contains("empty table"), "{e}");
         let e = refused(
             "max_payload = { default = 8192, rp2O40 = 512 }",
-            Some("rp2040"),
+            Some("thumbv6m"),
         );
         assert!(e.contains("unknown target `rp2O40`"), "{e}");
         // Every entry is schema-checked, not only the resolved one.
         let e = refused(
-            "max_payload = { default = 8192, rp2040 = \"small\" }",
-            Some("bcm2712"),
+            "max_payload = { default = 8192, thumbv6m = \"small\" }",
+            Some("aarch64"),
         );
         assert!(e.contains("takes a u32, got `small`"), "{e}");
         let e = refused(
-            "max_payload = { default = 8192, rp2040 = -1 }",
-            Some("bcm2712"),
+            "max_payload = { default = 8192, thumbv6m = -1 }",
+            Some("aarch64"),
         );
         assert!(e.contains("negative"), "{e}");
         let e = refused(
-            "max_payload = { default = 8192, rp2040 = true }",
-            Some("bcm2712"),
+            "max_payload = { default = 8192, thumbv6m = true }",
+            Some("aarch64"),
         );
         assert!(e.contains("must be a string, an integer"), "{e}");
         let e = refused(
-            "max_payload = { default = { rp2040 = 512 } }",
-            Some("rp2040"),
+            "max_payload = { default = { thumbv6m = 512 } }",
+            Some("thumbv6m"),
         );
         assert!(e.contains("got a table"), "{e}");
-        let e = refused("max_payload = [512, 4096]", Some("rp2040"));
+        let e = refused("max_payload = [512, 4096]", Some("thumbv6m"));
         assert!(e.contains("got a array"), "{e}");
     }
 

@@ -649,7 +649,7 @@ pub fn validate_continuity_on(
                             let ty = instance_type(config, name);
                             if ty == "ip" {
                                 return target.map(|t| {
-                                    crate::target_facts::TargetFacts::for_silicon(t)
+                                    crate::target_facts::TargetFacts::for_runtime(t)
                                         .ip_fence_cutoff()
                                         .to_string()
                                 });

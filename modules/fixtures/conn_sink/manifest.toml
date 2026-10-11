@@ -19,14 +19,14 @@ name = "net_in"
 direction = "input"
 content_type = "NetProto"
 required = true
-buffer_size = { default = 4096, bcm2712 = 65536 }
+buffer_size = { default = 4096, aarch64 = 65536 }
 
 [[ports]]
 name = "net_out"
 direction = "output"
 content_type = "NetProto"
 required = true
-buffer_size = { default = 4096, bcm2712 = 65536 }
+buffer_size = { default = 4096, aarch64 = 65536 }
 
 [[resources]]
 requires_contract = "channel"

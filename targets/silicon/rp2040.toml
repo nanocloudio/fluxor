@@ -4,6 +4,8 @@
 id = "rp2040"
 family = "rp2"
 description = "RP2040 (Dual Cortex-M0+, 30 GPIO)"
+runtime = "rp2040"
+module_abi = "thumbv6m"
 
 [build]
 rust_target = "thumbv6m-none-eabi"

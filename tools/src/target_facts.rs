@@ -12,7 +12,7 @@
 //!
 //! Every value here mirrors the kernel source cited beside it, every fact
 //! value is one `CAPABILITY_FACTS` admits for its capability, and the silicon
-//! keys are those of `manifest::TargetCapabilities::for_silicon` — board names
+//! keys are those of `manifest::TargetCapabilities::for_runtime` — board names
 //! resolve through the `targets/` registry before reaching here.
 
 use fluxor_contracts::vocabulary::TARGET_CAPABILITIES;
@@ -147,10 +147,10 @@ pub struct TargetFacts {
 }
 
 impl TargetFacts {
-    /// Facts for a silicon or host id. Unknown names answer the weakest
+    /// Facts for a runtime id. Unknown names answer the weakest
     /// row — no clock, base suites, software tier — so a requirement on an
     /// unregistered target fails closed.
-    pub fn for_silicon(name: &str) -> Self {
+    pub fn for_runtime(name: &str) -> Self {
         match name {
             // Hosted on an operating system that runs a time protocol:
             // `adjtimex(2)` says whether the clock is disciplined.
@@ -284,7 +284,7 @@ pub fn check_requires_when(
     resolutions: &[ParamResolution],
     rw: &crate::manifest::RequiresWhen,
     facts: &TargetFacts,
-    silicon: &str,
+    runtime: &str,
 ) -> Result<()> {
     let mut triggered = true;
     for ((param, values), resolution) in rw.when.iter().zip(resolutions) {
@@ -318,12 +318,12 @@ pub fn check_requires_when(
             .collect();
         let params: Vec<&str> = rw.when.iter().map(|(p, _)| p.as_str()).collect();
         return Err(Error::Config(format!(
-            "{} requires target capability `{}`, which silicon `{}` does not provide. Either \
+            "{} requires target capability `{}`, which runtime `{}` does not provide. Either \
              place this module on a target that does, or choose a value of {} that does not \
              need it.",
             posture.join(" with "),
             rw.capability,
-            silicon,
+            runtime,
             params.join(" / "),
         )));
     }

@@ -149,7 +149,7 @@ process.
 | **RP2040** | thumbv6m-none-eabi (Cortex-M0+) | XIP execution |
 | **RP2350** | thumbv8m.main-none-eabihf (Cortex-M33) | XIP execution |
 | **BCM2712** | aarch64-unknown-none (Cortex-A76) | DRAM-resident, MMU + page tables |
-| **ESP32-S3** | xtensa-esp32s3-none-elf | Validation only (no kernel build) |
+| **ESP32** | xtensa-esp32-none-elf (dual Xtensa LX6) | Validation only (no kernel build) |
 
 ### Boards and hosts
 
@@ -165,7 +165,9 @@ process.
 
 Silicon definitions live in `targets/silicon/*.toml`, board definitions
 in `targets/boards/*.toml`, and host definitions in
-`targets/host/*.toml`. `fluxor inspect` lists every target the checkout
+`targets/host/*.toml`. Each target names the runtime it is and the
+module ABI it loads; see
+[docs/architecture/runtimes_and_abis.md](docs/architecture/runtimes_and_abis.md). `fluxor inspect` lists every target the checkout
 knows about.
 
 ## Quick Start

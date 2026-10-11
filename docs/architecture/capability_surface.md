@@ -336,22 +336,23 @@ ordering unit. The admitted facts and their values are
 `CAPABILITY_FACTS` in `contracts/src/vocabulary.rs`; unknown names and
 unadmitted values are rejected at manifest parse.
 
-A fact whose value depends on the silicon takes the same per-target table
-as a port's `buffer_size`:
+A fact whose value depends on the module ABI takes the same per-target
+table as a port's `buffer_size`:
 
 ```toml
 [capability_facts."stream.ordered_ack"]
-max_payload = { default = 4096, rp2040 = 512 }
+max_payload = { default = 4096, thumbv6m = 512 }
 ```
 
-Keys are the silicon ids `rp2040`, `rp2350`, `bcm2712` and `wasm` (a
-`linux` host loads the `bcm2712` build), plus an optional `default`. The
-composer resolves the value for the graph's target, so compose-time checks
-such as a producer's `max_payload` against a provider's compare the
-numbers that target runs with. A table without `default` must name every
-silicon in the module's `hardware_targets`; a partial table, an empty
-table, an unknown key, or an entry the fact's schema does not admit is
-refused at manifest parse, whichever target is being built. Plain string
+Keys are module ABI ids (`thumbv6m`, `thumbv8m`, `aarch64`, `wasm32`, …;
+see [runtimes_and_abis.md](runtimes_and_abis.md)), plus an optional
+`default`. The composer resolves the value for the ABI the graph's target
+loads, so compose-time checks such as a producer's `max_payload` against
+a provider's compare the numbers that target runs with. A table without
+`default` must name every buildable ABI the runtimes in the module's
+`hardware_targets` load; a partial table, an empty table, an unknown key,
+or an entry the fact's schema does not admit is refused at manifest
+parse, whichever ABI is being built. Plain string
 and integer facts hold for every target.
 
 `replication.state_machine` sits one layer above the storage

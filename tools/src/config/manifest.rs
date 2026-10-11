@@ -210,15 +210,29 @@ pub fn load_module_manifests_with_extra(
     load_module_manifests_with_extra_for_target(modules_config, extra_dirs, None, project_root)
 }
 
+/// The module ABI a target name loads, for resolving per-ABI manifest
+/// values and pins. An unknown name passes through: it then matches no
+/// per-ABI key and no pin, and the caller's own checks name it.
+fn target_module_abi(target: Option<&str>, project_root: &std::path::Path) -> Option<String> {
+    target.map(|t| {
+        crate::target::load_target(t, project_root)
+            .map(|d| d.module_abi().to_string())
+            .unwrap_or_else(|_| t.to_string())
+    })
+}
+
 /// Target-aware variant used by config generation. Capacity tables in module
-/// manifests are deployment inputs, so resolving them without the silicon id
-/// silently selects `default` even when the graph targets a larger host.
+/// manifests are deployment inputs, so resolving them without the target's
+/// module ABI silently selects `default` even when the graph targets a
+/// larger host.
 pub fn load_module_manifests_with_extra_for_target(
     modules_config: &Value,
     extra_dirs: &[&std::path::Path],
-    target_silicon: Option<&str>,
+    target: Option<&str>,
     project_root: &std::path::Path,
 ) -> HashMap<String, Manifest> {
+    let module_abi = target_module_abi(target, project_root);
+    let target_abi = module_abi.as_deref();
     let mut manifests = HashMap::new();
     let list = match modules_config.as_array() {
         Some(l) => l,
@@ -241,7 +255,7 @@ pub fn load_module_manifests_with_extra_for_target(
     // validation and fmod packaging consult different pins. Silicon-scoped
     // so wiring binds to the exact artifact being packaged.
     let store_manifests =
-        crate::store_cli::lock_store_manifest_resolver(project_root, target_silicon, None);
+        crate::store_cli::lock_store_manifest_resolver(project_root, target_abi, None);
 
     for module in list {
         let name = match module["name"].as_str() {
@@ -253,7 +267,7 @@ pub fn load_module_manifests_with_extra_for_target(
         if let Some(resolver) = &store_manifests {
             match resolver(type_name) {
                 crate::modules::ManifestPin::Resolved(toml) => {
-                    match Manifest::from_toml_str_for_target(&toml, target_silicon) {
+                    match Manifest::from_toml_str_for_target(&toml, target_abi) {
                         Ok(mut m) => {
                             if let Some(variant) = module["variant"].as_str() {
                                 if let Err(e) = m.apply_variant(variant) {
@@ -311,7 +325,7 @@ pub fn load_module_manifests_with_extra_for_target(
         if !manifest_path.exists() {
             continue;
         }
-        match Manifest::from_toml_for_target(&manifest_path, target_silicon) {
+        match Manifest::from_toml_for_target(&manifest_path, target_abi) {
             Ok(mut m) => {
                 // Variant-selected node (RFC module_variants): the
                 // manifest wiring validates against is the VARIANT's —
@@ -375,14 +389,16 @@ pub fn load_module_manifests_with_extra_for_target(
 /// project with no pins resolves no resolver and this is a no-op.
 pub fn assert_pinned_manifests_resolvable(
     modules_config: &Value,
-    target_silicon: Option<&str>,
+    target: Option<&str>,
     project_root: &std::path::Path,
 ) -> Result<()> {
+    let module_abi = target_module_abi(target, project_root);
+    let target_abi = module_abi.as_deref();
     let Some(list) = modules_config.as_array() else {
         return Ok(());
     };
     let Some(resolver) =
-        crate::store_cli::lock_store_manifest_resolver(project_root, target_silicon, None)
+        crate::store_cli::lock_store_manifest_resolver(project_root, target_abi, None)
     else {
         return Ok(());
     };
@@ -395,7 +411,7 @@ pub fn assert_pinned_manifests_resolvable(
             crate::modules::ManifestPin::NotPinned => continue,
             crate::modules::ManifestPin::Failed(why) => why,
             crate::modules::ManifestPin::Resolved(toml) => {
-                match Manifest::from_toml_str_for_target(&toml, target_silicon) {
+                match Manifest::from_toml_str_for_target(&toml, target_abi) {
                     Ok(mut m) => match module["variant"].as_str() {
                         Some(variant) => match m.apply_variant(variant) {
                             Ok(()) => continue,

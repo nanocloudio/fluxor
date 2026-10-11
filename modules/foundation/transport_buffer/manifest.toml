@@ -1,5 +1,5 @@
 version = "1.0.0"
-hardware_targets = ["bcm2712", "rp2350", "rp2040"]
+hardware_targets = ["bcm2712", "rp2350", "rp2040", "linux"]
 permissions = ["platform_raw"]
 # Cadence-independent byte forwarder (framed payloads → a selected transport);
 # its emit cadence is cosmetic, not correctness-bearing. Explicit attestation to
@@ -13,7 +13,7 @@ index = 0
 direction = "input"
 content_type = "OctetStream"
 required = true
-buffer_size = { default = 2048, bcm2712 = 8192 }
+buffer_size = { default = 2048, aarch64 = 8192 }
 
 # net_in / net_out are used only by the `udp` transport (the ip datagram
 # surface). The `uart` transport leaves them unwired.
@@ -23,7 +23,7 @@ index = 1
 direction = "input"
 content_type = "NetProto"
 required = false
-buffer_size = { default = 2048, bcm2712 = 8192 }
+buffer_size = { default = 2048, aarch64 = 8192 }
 
 [[ports]]
 name = "net_out"
@@ -31,7 +31,7 @@ index = 0
 direction = "output"
 content_type = "NetProto"
 required = false
-buffer_size = { default = 2048, bcm2712 = 8192 }
+buffer_size = { default = 2048, aarch64 = 8192 }
 max_record = 2048
 
 # Module-scope observability — exempt (see standards/observability.md §6).

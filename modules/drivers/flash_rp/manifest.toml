@@ -1,5 +1,5 @@
 version = "1.0.0"
-hardware_targets = ["rp2350"]
+hardware_targets = ["rp2350", "rp2040"]
 permissions = ["flash_raw", "backing_provider"]
 
 # BOOTSEL button driver — reads the QSPI CS pin via the flash

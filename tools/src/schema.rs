@@ -1215,8 +1215,8 @@ fn pack_voice_inner(
 /// in from a sibling project: resolve it from the OCI store exactly as the
 /// module TABLE builder (`parse_modules_from_config_multi`) does, else the
 /// provider's params (e.g. a connector `authority`) silently drop and the
-/// module runs unconfigured. `loc.silicon` is the build's
-/// `TargetDescriptor::module_silicon()`, the silicon tag on the `fluxor.lock`
+/// module runs unconfigured. `loc.abi` is the build's
+/// `TargetDescriptor::module_abi()`, the ABI tag on the `fluxor.lock`
 /// pins consulted below.
 ///
 /// Three outcomes, deliberately distinguishable:
@@ -1251,14 +1251,14 @@ pub fn load_schema_for_module(
 }
 
 /// Where one build reads module artefacts from, and what that location
-/// means: `dir` holds the `.fmod`s of `silicon` (the silicon tag on the
+/// means: `dir` holds the `.fmod`s of `abi` (the abi tag on the
 /// `fluxor.lock` pins consulted when one is absent), for the project at
 /// `project_root`. The three are stated by the caller, never inferred from
 /// the directory's name or position: `--module-root` can name any path.
 #[derive(Debug, Clone, Copy)]
 pub struct ModuleLocation<'a> {
     pub dir: &'a Path,
-    pub silicon: &'a str,
+    pub abi: &'a str,
     pub project_root: &'a Path,
 }
 
@@ -1270,22 +1270,22 @@ struct PinnedFmod {
 }
 
 /// `pin <reference> (<digest>)` for the `[[artifact]]` module entry
-/// covering `module_type` on `silicon` — the same label the
+/// covering `module_type` on `abi` — the same label the
 /// manifest-side resolver quotes, so a broken artifact reports one
-/// identity from both halves. Degrades to the silicon alone when the
+/// identity from both halves. Degrades to the abi alone when the
 /// lockfile can't be re-read.
-fn pin_label(project_root: &Path, module_type: &str, silicon: &str) -> String {
+fn pin_label(project_root: &Path, module_type: &str, abi: &str) -> String {
     let pin = fluxor_tools::store_resolve::read_store_lock(project_root)
         .ok()
         .flatten()
         .and_then(|l| {
             l.artifacts.into_iter().find(|a| {
-                a.kind == "module" && a.name == module_type && a.target.as_deref() == Some(silicon)
+                a.kind == "module" && a.name == module_type && a.target.as_deref() == Some(abi)
             })
         });
     match pin {
         Some(p) => format!("pin {} ({})", p.reference, p.digest),
-        None => format!("pin target '{silicon}'"),
+        None => format!("pin target '{abi}'"),
     }
 }
 
@@ -1299,34 +1299,33 @@ fn pinned_schema_error(module_type: &str, why: &str) -> crate::Error {
 }
 
 /// Resolve a module's `.fmod` path from the project's `[[artifact]]` module pins when
-/// it is absent on disk, for `loc.silicon` in the project at `loc.project_root`.
+/// it is absent on disk, for `loc.abi` in the project at `loc.project_root`.
 ///
 /// `Ok(None)` means no pin covers this name (or the location names no
-/// silicon); `Err` means one does and it is unresolvable (missing/corrupt
+/// abi); `Err` means one does and it is unresolvable (missing/corrupt
 /// blob, integrity failure, unreadable store or lockfile), which is a hard
 /// error rather than a silent drop to "no params".
 fn resolve_pinned_fmod(
     module_type: &str,
     loc: ModuleLocation<'_>,
 ) -> crate::Result<Option<PinnedFmod>> {
-    if loc.silicon.is_empty() {
+    if loc.abi.is_empty() {
         return Ok(None);
     }
-    let silicon = loc.silicon.to_string();
+    let abi = loc.abi.to_string();
     let project_root = loc.project_root.to_path_buf();
-    let Some(resolver) = crate::store_cli::lock_store_resolver(&project_root, &silicon, None)
-    else {
+    let Some(resolver) = crate::store_cli::lock_store_resolver(&project_root, &abi, None) else {
         return Ok(None);
     };
     match resolver(module_type) {
         crate::modules::StorePin::Resolved(path) => Ok(Some(PinnedFmod {
             path,
-            pin_label: pin_label(&project_root, module_type, &silicon),
+            pin_label: pin_label(&project_root, module_type, &abi),
         })),
         crate::modules::StorePin::NotPinned => Ok(None),
         crate::modules::StorePin::Failed(why) => Err(pinned_schema_error(
             module_type,
-            &format!("{}: {why}", pin_label(&project_root, module_type, &silicon)),
+            &format!("{}: {why}", pin_label(&project_root, module_type, &abi)),
         )),
     }
 }
@@ -1792,7 +1791,7 @@ mod tests {
              kind = \"module\"\n\
              name = \"pinned_conn\"\n\
              project = \"local\"\n\
-             target = \"bcm2712\"\n\
+             target = \"aarch64\"\n\
              digest = \"sha256:\
              0000000000000000000000000000000000000000000000000000000000000000\"\n\
              reference = \"local/pinned_conn:1\"\n",
@@ -1802,7 +1801,7 @@ mod tests {
             .path()
             .join("target")
             .join("fluxor")
-            .join("bcm2712")
+            .join("aarch64")
             .join("modules");
         std::fs::create_dir_all(&modules_dir).expect("modules dir");
         (project, store, modules_dir)
@@ -1821,7 +1820,7 @@ mod tests {
 
         let loc = ModuleLocation {
             dir: &modules_dir,
-            silicon: "bcm2712",
+            abi: "aarch64",
             project_root: project.path(),
         };
         let err = load_schema_for_module("pinned_conn", loc)
@@ -1850,19 +1849,19 @@ mod tests {
 
         let loc = ModuleLocation {
             dir: &modules_dir,
-            silicon: "bcm2712",
+            abi: "aarch64",
             project_root: project.path(),
         };
         let schema = load_schema_for_module("not_pinned_anywhere", loc).expect("not a hard error");
         assert!(schema.is_none(), "no pin, no .fmod → no schema");
     }
 
-    /// The silicon and project come from the caller, not from where the
+    /// The abi and project come from the caller, not from where the
     /// directory sits: a `--module-root` named `anything` still resolves the
-    /// pin for the silicon the build is for, and a location naming no
-    /// silicon consults no pin.
+    /// pin for the abi the build is for, and a location naming no
+    /// abi consults no pin.
     #[test]
-    fn the_pin_silicon_comes_from_the_caller_not_the_directory_name() {
+    fn the_pin_abi_comes_from_the_caller_not_the_directory_name() {
         let (project, store, _modules_dir) = pinned_but_missing_fixture();
         let _env = crate::config::test_env::EnvGuard::set(&[("FLUXOR_STORE", store.path())]);
         let elsewhere = project.path().join("anything");
@@ -1870,21 +1869,21 @@ mod tests {
 
         let loc = ModuleLocation {
             dir: &elsewhere,
-            silicon: "bcm2712",
+            abi: "aarch64",
             project_root: project.path(),
         };
         let err = load_schema_for_module("pinned_conn", loc)
-            .expect_err("the bcm2712 pin applies wherever the directory is");
+            .expect_err("the aarch64 pin applies wherever the directory is");
         assert!(err.to_string().contains("pinned in fluxor.lock"), "{err}");
 
         let other = ModuleLocation {
-            silicon: "rp2350",
+            abi: "thumbv8m",
             ..loc
         };
         assert!(load_schema_for_module("pinned_conn", other)
             .unwrap()
             .is_none());
-        let none = ModuleLocation { silicon: "", ..loc };
+        let none = ModuleLocation { abi: "", ..loc };
         assert!(load_schema_for_module("pinned_conn", none)
             .unwrap()
             .is_none());

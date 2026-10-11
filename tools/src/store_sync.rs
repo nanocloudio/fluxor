@@ -140,6 +140,7 @@ pub fn sync_project(project_root: &Path, dry_run: bool) -> Result<SyncReport> {
     let existing = read_store_lock(project_root)?
         .map(|l| l.artifacts)
         .unwrap_or_default();
+    crate::store_resolve::check_module_pin_targets(&existing)?;
     let mut entries: Vec<Artifact> = Vec::new();
     for e in &existing {
         if let Some(member_path) = members.get(&e.project) {
@@ -743,6 +744,7 @@ pub fn ensure_synced(project_root: &Path) -> Result<Vec<String>> {
     let entries = read_store_lock(project_root)?
         .map(|l| l.artifacts)
         .unwrap_or_default();
+    crate::store_resolve::check_module_pin_targets(&entries)?;
     let deps = crate::project::dependencies(project_root).map_err(Error::Config)?;
     for dep in &deps {
         if !entries.iter().any(|e| e.project == dep.name) {
@@ -878,12 +880,13 @@ struct PublishedArtifact {
     epoch: Option<String>,
 }
 
-/// Published per-artifact build state from `<project>/meta:latest`;
-/// `None` when the project has never been published.
+/// Published build state from `<project>/meta:latest`, every child of
+/// each artifact name (a module has one per ABI shelf); `None` when the
+/// project has never been published.
 fn published_artifacts(
     store: &OciStore,
     project: &str,
-) -> Result<Option<BTreeMap<String, PublishedArtifact>>> {
+) -> Result<Option<BTreeMap<String, Vec<PublishedArtifact>>>> {
     let Ok(desc) = store.resolve(&format!("{project}/meta:latest")) else {
         return Ok(None);
     };
@@ -895,13 +898,12 @@ fn published_artifacts(
         let Some(a) = crate::store_resolve::artifact_from_descriptor(child)? else {
             continue;
         };
-        out.insert(
-            a.name,
-            PublishedArtifact {
+        out.entry(a.name)
+            .or_insert_with(Vec::new)
+            .push(PublishedArtifact {
                 input_digest: child.annotations.get(ANN_INPUT_DIGEST).cloned(),
                 epoch: child.annotations.get(ANN_ABI_SURFACE).cloned(),
-            },
-        );
+            });
     }
     Ok(Some(out))
 }
@@ -934,11 +936,13 @@ impl StaleReason {
 
 /// Compare a checkout's current artifact inputs against what is
 /// published, at `epoch`. Returns one entry per artifact that is not
-/// current, in artifact-name order.
+/// current, in artifact-name order. An artifact is current only when
+/// every published child of it is: a module whose shelves were published
+/// at different inputs or epochs has at least one shelf behind.
 fn stale_artifacts(
     current: &BTreeMap<String, String>,
     epoch: &str,
-    published: Option<&BTreeMap<String, PublishedArtifact>>,
+    published: Option<&BTreeMap<String, Vec<PublishedArtifact>>>,
 ) -> Vec<(String, StaleReason)> {
     let Some(published) = published else {
         // No published index at all: every artifact is a first publish.
@@ -949,13 +953,19 @@ fn stale_artifacts(
     };
     let mut out = Vec::new();
     for (name, digest) in current {
-        let Some(entry) = published.get(name) else {
+        let Some(entries) = published.get(name).filter(|e| !e.is_empty()) else {
             out.push((name.clone(), StaleReason::Absent));
             continue;
         };
-        if entry.input_digest.as_deref() != Some(digest.as_str()) {
+        if entries
+            .iter()
+            .any(|e| e.input_digest.as_deref() != Some(digest.as_str()))
+        {
             out.push((name.clone(), StaleReason::Inputs));
-        } else if entry.epoch.as_deref().is_some_and(|e| e != epoch) {
+        } else if entries
+            .iter()
+            .any(|e| e.epoch.as_deref().is_some_and(|e| e != epoch))
+        {
             // Source artifacts carry no epoch; only modules do, so a
             // missing annotation is not drift.
             out.push((name.clone(), StaleReason::Epoch));
@@ -1855,15 +1865,13 @@ mod tests {
     /// modules would each report a source change nobody made.
     #[test]
     fn epoch_drift_is_a_distinct_reason_from_an_edit() {
+        let child = |input: &str, epoch: &str| PublishedArtifact {
+            input_digest: Some(input.to_string()),
+            epoch: Some(epoch.to_string()),
+        };
         let published = |input: &str, epoch: &str| {
             let mut m = BTreeMap::new();
-            m.insert(
-                "mod_a".to_string(),
-                PublishedArtifact {
-                    input_digest: Some(input.to_string()),
-                    epoch: Some(epoch.to_string()),
-                },
-            );
+            m.insert("mod_a".to_string(), vec![child(input, epoch)]);
             m
         };
         let mut current = BTreeMap::new();
@@ -1891,8 +1899,24 @@ mod tests {
         // A source artifact carries no epoch annotation; a missing one is
         // not drift.
         let mut map = published("aaaa", "e0");
-        map.get_mut("mod_a").unwrap().epoch = None;
+        map.get_mut("mod_a").unwrap()[0].epoch = None;
         assert!(stale_artifacts(&current, "e1", Some(&map)).is_empty());
+
+        // A module publishes one child per ABI shelf. It is current only
+        // when every one of them is: a shelf left behind at older inputs
+        // is a shelf a consumer may resolve, whichever child reads first.
+        let mut map = published("aaaa", "e1");
+        map.get_mut("mod_a").unwrap().push(child("bbbb", "e0"));
+        assert_eq!(
+            stale_artifacts(&current, "e1", Some(&map)),
+            vec![("mod_a".to_string(), StaleReason::Inputs)]
+        );
+        let mut map = published("aaaa", "e1");
+        map.get_mut("mod_a").unwrap().push(child("aaaa", "e0"));
+        assert_eq!(
+            stale_artifacts(&current, "e1", Some(&map)),
+            vec![("mod_a".to_string(), StaleReason::Epoch)]
+        );
     }
 
     /// A whole module set going stale for one reason must read as one

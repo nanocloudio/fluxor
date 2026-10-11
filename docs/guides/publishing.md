@@ -18,11 +18,14 @@ make publish   # fluxor publish
 
 In fluxor's checkout. `fluxor publish` writes what is built into the
 local OCI store in one transaction: blobs staged first, then every
-`:ver` and `:latest` tag plus the project index repointed, and the
-tags of deleted or withheld modules retired, in a single locked
-`index.json` write, so the publish lands whole or not at all. It
+`:ver` and `:latest` tag plus the project index repointed, and every
+module tag the publish prepares nothing for retired — a deleted or
+withheld module's, one on a shelf the project no longer declares, one
+for an ABI the module is no longer built for — in a single locked
+`index.json` write, so the publish lands whole or not at all. After a
+publish, a project's module tags are exactly the set it prepared. It
 never builds. A declared module with no
-artefact on a declared silicon shelf, or one built against a stale
+artefact on a declared ABI shelf, or one built against a stale
 ABI surface, refuses the whole publish; a runtime binary that is not
 built is skipped.
 
@@ -43,7 +46,7 @@ project index (`fluxor/meta`) lists:
 |---|---|---|
 | SDK source tree | canonical tar of `modules/sdk/**` mapped under a `sdk/` path prefix — everything a `#[path]`/`include!` consumer reads; extraction preserves `target/fluxor/fluxor-abi/sdk/abi.rs` | `fluxor/src/fluxor-abi:<ver>` |
 | Contracts source tree | canonical tar of `contracts/src/**` mapped under a `src/` path prefix | `fluxor/src/fluxor-contracts:<ver>` |
-| fmod palette | compiled `.fmod` + manifest for every module this repo owns (every tier under `modules/`), per declared silicon shelf | `<target>/<name>:<ver>` |
+| fmod palette | compiled `.fmod` + manifest for every module this repo owns (every tier under `modules/`), per declared module ABI shelf | `<abi>/<name>:<ver>` |
 | Runtimes | `fluxor-linux` and the `fluxor` CLI itself, one binary layer per host triple | `fluxor/run/<name>-<triple>:<ver>` |
 | Project index | standard OCI index over the artefact manifests above; annotations carry fluxor's dependency declarations | `fluxor/meta:<ver>` |
 
@@ -237,16 +240,16 @@ bundle staging) takes its module root from one rule, first match wins:
 
 1. `--module-root <dir>`;
 2. `$FLUXOR_MODULE_ROOT` (an empty value counts as unset);
-3. `target/fluxor/<silicon>/modules/` under the project root, where
+3. `target/fluxor/<abi>/modules/` under the project root, where
    `fluxor sync` and `fluxor modules build` put them.
 
 A root named by 1 or 2 must be an existing directory holding at least
 one `.fmod`; a missing or empty one is an error, never a fallback to
 the next rule. Relative paths are taken against the current directory.
-The root is one silicon's directory, so a graph run for another
-silicon needs its own. `fluxor modules resolve --target T` prints the
-answer for a target (a board resolves to its silicon's directory), so
-scripts need not spell the layout.
+The root is one module ABI's directory, so a graph run for a target
+on another ABI needs its own. `fluxor modules resolve --target T`
+prints the answer for a target (a board resolves to its silicon's ABI
+shelf), so scripts need not spell the layout.
 
 ### Forgotten-publish safety net
 

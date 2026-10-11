@@ -1,5 +1,5 @@
 version = "1.0.0"
-hardware_targets = ["bcm2712", "linux"]
+hardware_targets = ["linux"]
 
 # Fixture for stopping a graph by draining it. It exports `module_drain`,
 # answers 0 (work in flight), and finishes that work over

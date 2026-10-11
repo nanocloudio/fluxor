@@ -1,5 +1,5 @@
 version = "1.0.0"
-hardware_targets = ["rp2350", "bcm2712"]
+hardware_targets = ["rp2350", "bcm2712", "linux"]
 
 # Synthetic byte source: emits `size` bytes on every IOCTL_NOTIFY
 # received on its output channel, then signals IOCTL_SET_HUP. Used
@@ -22,9 +22,9 @@ required = true
 # consumer is one tick behind. The downstream (http) typically requests
 # 65536; the kernel takes max(producer, consumer) hints, so this value
 # matters only when the downstream isn't http.
-buffer_size = { default = 4096, bcm2712 = 65536 }
+buffer_size = { default = 4096, aarch64 = 65536 }
 # MAX_CHUNK_SIZE — largest single chunk emit.
-max_record = { default = 4096, bcm2712 = 32768 }
+max_record = { default = 4096, aarch64 = 32768 }
 
 # Module-scope observability — exempt (see standards/observability.md §6).
 [observability]

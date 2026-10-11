@@ -39,7 +39,7 @@ name = "transport_in"
 direction = "input"
 content_type = "OctetStream"
 required = true
-buffer_size = { default = 4096, bcm2712 = 16384 }
+buffer_size = { default = 4096, aarch64 = 16384 }
 
 # tls `peer_identity` (`net` with `require_peer`).
 [[ports]]
@@ -92,7 +92,7 @@ name = "transport_out"
 direction = "output"
 content_type = "OctetStream"
 required = true
-buffer_size = { default = 8192, bcm2712 = 16384 }
+buffer_size = { default = 8192, aarch64 = 16384 }
 
 [[ports]]
 name = "ch0_rx"

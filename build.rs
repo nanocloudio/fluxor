@@ -987,29 +987,34 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(fluxor_platform, values(\"host-linux\", \"host-wasm\", \"bcm2712\", \"rp2040\", \"rp2350\"))");
     println!("cargo:rustc-cfg=fluxor_platform=\"{platform_str}\"");
 
-    // The die, under the name the module build uses.
+    // The module ABI, under the name the module build uses.
     //
     // `modules/sdk/abi/config.rs` is mounted by BOTH the kernel and every PIC
     // module, and its `profile_embedded` block picks arena and connection
-    // ceilings by `fluxor_silicon`: the RP parts differ by 3.75x and
-    // `target_arch` cannot tell thumbv6m from thumbv8m. The kernel sizes its
-    // own arenas from `platform::chip` instead, so today nothing in the kernel
-    // image turns on this cfg — but shared source that resolves one way under
-    // one mount and another way under the other is a trap waiting for the
-    // first kernel-side reader of those constants, and leaving the name
-    // undeclared makes every use of it in that file an unexpected-cfg error
-    // under `-D warnings`.
+    // ceilings by `fluxor_abi`: the RP parts differ by 3.75x and `target_arch`
+    // cannot tell thumbv6m from thumbv8m. The kernel sizes its own arenas from
+    // `platform::chip` instead, so nothing in the kernel image reads this
+    // cfg — but shared source that resolves one way under one mount and
+    // another way under the other is a trap waiting for the first kernel-side
+    // reader of those constants, and leaving the name undeclared makes every
+    // use of it in that file an unexpected-cfg error under `-D warnings`.
     //
     // A separate name from `fluxor_platform` because the value sets differ:
-    // `fluxor_platform` separates `host-linux` from `host-wasm`, while this
-    // names a silicon shelf. The hosted platforms set no value — their
+    // `fluxor_platform` names the kernel's platform, this the module ABI
+    // (`tools/src/runtime_abi.rs`). The hosted platforms set no value — their
     // profiles are selected by `target_arch` and never read this — but the
     // accepted-value list is declared for every build so the name is known.
     println!(
-        "cargo:rustc-check-cfg=cfg(fluxor_silicon, values(\"rp2040\", \"rp2350\", \"bcm2712\", \"wasm\"))"
+        "cargo:rustc-check-cfg=cfg(fluxor_abi, values(\"thumbv6m\", \"thumbv8m\", \"aarch64\", \"x86_64\", \"wasm32\", \"xtensa-lx6\"))"
     );
-    if let Platform::Bcm2712 | Platform::Rp2040 | Platform::Rp2350 = platform {
-        println!("cargo:rustc-cfg=fluxor_silicon=\"{platform_str}\"");
+    let module_abi = match platform {
+        Platform::Bcm2712 => Some("aarch64"),
+        Platform::Rp2040 => Some("thumbv6m"),
+        Platform::Rp2350 => Some("thumbv8m"),
+        _ => None,
+    };
+    if let Some(abi) = module_abi {
+        println!("cargo:rustc-cfg=fluxor_abi=\"{abi}\"");
     }
 
     // M-profile variant. Rust has no built-in cfg distinguishing ARMv6-M

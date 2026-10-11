@@ -14,6 +14,8 @@
 id = "bcm2712"
 family = "bcm"
 description = "BCM2712 (Cortex-A76, aarch64)"
+runtime = "bcm2712"
+module_abi = "aarch64"
 
 [build]
 rust_target = "aarch64-unknown-none"

@@ -75,6 +75,7 @@ pub mod project;
 pub mod protection;
 pub mod publish;
 pub mod render_template;
+pub mod runtime_abi;
 pub mod service_params;
 // The consolidated store flow: `store_publish` (the single store-write
 // path), `store_resolve` (uniform `[[artifact]]` lockfile resolution),

@@ -22,6 +22,21 @@ pub const ABI_VERSION: u8 = 1;
 /// capacity section: `[buffer_size u32 LE][max_record u32 LE]`.
 pub const CHANNEL_HINT_WIRE_BYTES: usize = 8;
 
+/// Runtime bits in a module manifest's `hardware_targets` mask (manifest
+/// bytes 10..12, u16 LE): the runtimes a module may run under. A loader
+/// refuses a module whose mask lacks its own runtime's bit. The tools'
+/// runtime table (`tools/src/runtime_abi.rs`) names these same values.
+pub mod runtime_bit {
+    pub const RP2350: u16 = 0x01;
+    pub const RP2040: u16 = 0x02;
+    pub const BCM2712: u16 = 0x04;
+    pub const WASM: u16 = 0x08;
+    pub const LINUX: u16 = 0x10;
+    pub const MACOS: u16 = 0x20;
+    pub const WINDOWS: u16 = 0x40;
+    pub const ESP32: u16 = 0x80;
+}
+
 /// FNV-1a 32-bit hash. Identifies modules and exports by name (string
 /// → u32 lookup key) at both runtime and compile time. `const fn` so
 /// module-name hash constants can be evaluated at build time without

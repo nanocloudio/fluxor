@@ -389,7 +389,7 @@ fn inline_route_body_files(
 
 /// The module root a build for `desc` reads `.fmod` artefacts from: the
 /// explicit `--module-root`, else `$FLUXOR_MODULE_ROOT`, else the project's
-/// `target/fluxor/<silicon>/modules` (see `modules_build::select_module_root`).
+/// `target/fluxor/<abi>/modules` (see `modules_build::select_module_root`).
 fn target_module_root(
     explicit: Option<&std::path::Path>,
     project_root: &std::path::Path,
@@ -524,7 +524,7 @@ fn check_code_ceiling(
         over.join(", "),
         target.id,
         ceiling,
-        target.module_silicon()
+        target.id
     )))
 }
 
@@ -978,7 +978,7 @@ fn cmd_combine(
     // symmetric with the manifest resolver.
     let store_fb = store_cli::lock_store_resolver(
         &crate::project::root_for_config(config_path),
-        &target_desc.id,
+        target_desc.module_abi(),
         None,
     );
     let modules = parse_modules_from_config_multi(
@@ -1282,7 +1282,7 @@ fn build_packaged_blobs(
 ) -> Result<(Option<Vec<u8>>, Vec<u8>)> {
     // `project_root` is config-anchored by the caller: fmod packaging and
     // pinned-manifest resolution must consult the same fluxor.lock.
-    let store_fb = store_cli::lock_store_resolver(project_root, &target_desc.id, None);
+    let store_fb = store_cli::lock_store_resolver(project_root, target_desc.module_abi(), None);
     let modules = parse_modules_from_config_multi(
         config,
         modules_dir,
