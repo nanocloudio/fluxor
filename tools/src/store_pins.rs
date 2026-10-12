@@ -23,12 +23,14 @@
 //! checkout advances its own pins — correct, unremarkable, unannounced.
 //!
 //! So the ledger records a fact rather than a list. Every checkout that
-//! writes a lockfile or resolves a pin registers itself here, and the
-//! root set is what actually happened rather than who was invited. One
-//! file per checkout, named by the hash of its canonical path, written
-//! atomically: two sessions registering
-//! different checkouts never touch the same file, and two registering
-//! the SAME checkout are already serialized by the lockfile guard.
+//! writes a lockfile registers itself here, `fluxor store adopt`
+//! registers one whose lockfile was written elsewhere, and the root set
+//! is what actually happened rather than who was invited. Reading pins
+//! registers nothing: a graph run from a copy of a lockfile holds no
+//! root. One file per checkout, named by the hash of its canonical path,
+//! written atomically: two sessions registering different checkouts
+//! never touch the same file, and two registering the SAME checkout are
+//! already serialized by the lockfile guard.
 //!
 //! Offline-first: nothing here touches the network.
 
@@ -129,7 +131,9 @@ fn try_register(store_root: &Path, checkout: &Path, digests: &BTreeSet<String>) 
     let path = entry_path(store_root, checkout);
     let mut body = String::new();
     body.push_str("# fluxor store pin ledger — generated, one file per checkout.\n");
-    body.push_str("# Registered by `fluxor update`, `fluxor store pin` and pin resolution.\n");
+    body.push_str(
+        "# Registered by whatever wrote the checkout's lockfile, or by `fluxor store adopt`.\n",
+    );
     body.push_str("# Every digest listed here is a garbage-collection root.\n\n");
     body.push_str(&format!("checkout = \"{}\"\n", canonical.display()));
     body.push_str("digests = [\n");

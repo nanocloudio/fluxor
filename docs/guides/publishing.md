@@ -133,16 +133,20 @@ A `fluxor.lock` pins a manifest digest precisely so it stops moving
 with the tag, which makes pins a garbage-collection root class the
 store cannot see by looking at itself. It keeps a **ledger** of
 them: `pins/<hash>.toml` in the store, one file per checkout,
-written whenever a checkout writes a lockfile or resolves a pin.
-Registration is automatic — there is no list to maintain.
+written whenever a checkout writes its lockfile. Registration is
+automatic — there is no list to maintain. Reading pins registers
+nothing, so a graph run from a copy of a lockfile (a test sandbox)
+holds no root; and a checkout under the system temporary directory
+never registers, because it is made to be deleted and the ledger
+lists what a collection must spare.
 
 Anything any checkout pins is a root. Membership of
 `~/.fluxor/workspace.toml` decides who is epoch- and
 currency-checked; it has nothing to do with who is allowed to hold a
 digest, so a consumer missing from it is protected all the same.
 
-Register a checkout that has not resolved a pin or written a lockfile
-yet:
+Register a checkout whose lockfile was written elsewhere — a fresh
+clone:
 
 ```sh
 fluxor store adopt /path/to/checkout   # or, with no argument, this one

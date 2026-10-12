@@ -295,8 +295,8 @@ bindings:
     }
 
     // -------------------------------------------------------------
-    // PR 2 tests: synthesiser shape, route merger, conflict
-    // detection, host-FS gate.
+    // Synthesiser shape, route merger, conflict detection, host-FS
+    // gate.
     // -------------------------------------------------------------
 
     fn make_split_tree(
@@ -333,11 +333,9 @@ bindings:
 
     #[test]
     fn synthesised_host_opts_into_accept_cycles() {
-        // PR 6: the synthesised host's `http <-> linux_net` wiring is
-        // a 2-cycle that the v1 scheduler would otherwise reject.
-        // The synthesiser sets `scheduler.accept_cycles: true` so the
-        // kernel's prepare_graph accepts it under the explicit
-        // attestation.
+        // The synthesised host's `http <-> linux_net` wiring is a
+        // 2-cycle the scheduler rejects unless the graph attests to it,
+        // so the synthesiser sets `scheduler.accept_cycles: true`.
         let (_tmp, path) = make_temp_tree(
             "synth_accept_cycles",
             "\
@@ -605,8 +603,7 @@ bindings:
     }
 
     // -------------------------------------------------------------
-    // PR 4 tests: effective_target, extract_http_port,
-    // write_merged_component_yaml.
+    // effective_target, extract_http_port, write_merged_component_yaml.
     // -------------------------------------------------------------
 
     #[test]
@@ -648,8 +645,28 @@ bindings:
         assert_eq!(extract_http_port(&v_no_http), None);
     }
 
+    /// The crate's one lock for the process working directory.
+    ///
+    /// The working directory is process-global: a test that changes it moves
+    /// it for every other test running at that moment, and a test that writes
+    /// or reads a relative path — `target/scenarios/…`, `modules/…` — lands
+    /// wherever the last change left it. So every test that changes it AND
+    /// every test that depends on it hold the same lock. A lock of its own in
+    /// one module would exclude that module's tests from each other and from
+    /// nothing else: a change made under `project`'s lock would still move the
+    /// directory out from under a test here, and that surfaced as a merged YAML
+    /// written into a temporary root another test had just removed.
+    fn cwd_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::project::tests::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     #[test]
     fn write_merged_component_yaml_lands_under_target_scenarios() {
+        // The merged YAML lands under `target/scenarios/`, relative to the
+        // working directory.
+        let _g = cwd_lock();
         let (_tmp, path) = make_split_tree(
             "wmc_yaml",
             "\
@@ -685,18 +702,8 @@ bindings:
     }
 
     // -------------------------------------------------------------
-    // PR 5 tests: target_aliases, manifest hardware_targets check.
+    // target_aliases, manifest hardware_targets check.
     // -------------------------------------------------------------
-
-    /// Process-wide mutex serialising tests that mutate
-    /// `std::env::set_current_dir`. Without this they race against
-    /// each other and against tests that read CWD (e.g.
-    /// `wasm_bundle_target_path` via `std::env::current_dir`),
-    /// surfacing as `cargo test`-only intermittent failures.
-    /// `validate_module_targets`'s manifest lookup walks
-    /// `std::env::current_dir().join("modules/...")`, so the test
-    /// has to pin CWD to the project root.
-    static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn target_aliases_table_is_sensible() {
@@ -721,6 +728,7 @@ bindings:
     fn read_manifest_hardware_targets_walks_real_manifests() {
         // Sanity-check against an actual repo manifest so a refactor
         // of `ManifestTargetsOnly` is caught early.
+        let _g = cwd_lock();
         let path = std::env::current_dir()
             .unwrap()
             .join("../modules/foundation/http/manifest.toml");
@@ -761,7 +769,7 @@ bindings:
 
         // Must run from the repo root so find_manifest_for can locate
         // wifi's manifest under modules/foundation/wifi/manifest.toml.
-        let _g = CWD_LOCK.lock().unwrap();
+        let _g = cwd_lock();
         let repo_root = std::env::current_dir().unwrap();
         let project_root = if repo_root.ends_with("tools") {
             repo_root.parent().unwrap().to_path_buf()
@@ -821,7 +829,7 @@ bindings:
         .unwrap();
         let s = parse(&scenario).unwrap();
 
-        let _g = CWD_LOCK.lock().unwrap();
+        let _g = cwd_lock();
         let repo_root = std::env::current_dir().unwrap();
         let project_root = if repo_root.ends_with("tools") {
             repo_root.parent().unwrap().to_path_buf()

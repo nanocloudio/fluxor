@@ -1971,7 +1971,7 @@ unsafe fn tcp_module_step(s: &mut TlsState) -> i32 {
     let diag_on = s.diag_phase_timing != 0;
     let t0 = if diag_on { dev_micros(sys) } else { 0 };
 
-    // ── Phase 1: Drive active handshake sessions ──
+    // ── Drive active handshake sessions ──
     //
     // For each handshaking session, the queue bridge runs:
     //   record_drain_inbound  — drain records → driver.in_buf
@@ -2090,7 +2090,7 @@ unsafe fn tcp_module_step(s: &mut TlsState) -> i32 {
 
     let t1 = if diag_on { dev_micros(sys) } else { 0 };
 
-    // ── Phase 2: Read from cipher_in (downstream: IP → TLS) ──
+    // ── Read from cipher_in (downstream: IP → TLS) ──
     //
     // Frozen while a mirrored transition awaits the standby: the record
     // it covers stays where it is and the producer, not a queue, absorbs
@@ -2567,7 +2567,7 @@ unsafe fn tcp_module_step(s: &mut TlsState) -> i32 {
 
     let t2 = if diag_on { dev_micros(sys) } else { 0 };
 
-    // ── Phase 3: Read from clear_in (upstream: HTTP → TLS) ──
+    // ── Read from clear_in (upstream: HTTP → TLS) ──
     let clear_in_frozen = continuity_gate_clear_in(s);
     let mut cl_drained = 0u32;
     // A record cipher_out had no room for goes first, then the rest of
@@ -2847,7 +2847,7 @@ unsafe fn tcp_module_step(s: &mut TlsState) -> i32 {
 
     let t3 = if diag_on { dev_micros(sys) } else { 0 };
 
-    // ── Phase 4: For Ready sessions, try to decrypt any buffered data ──
+    // ── For Ready sessions, try to decrypt any buffered data ──
     i = 0;
     while i < s.sessions.len() {
         if s.sessions[i].state == SessionState::Ready {
@@ -5381,10 +5381,15 @@ unsafe fn forward_held_completion(s: &mut TlsState, idx: usize) {
     let conn_id = s.sessions[idx].conn_id;
     let held = s.sessions[idx].held_msg_type;
     if held != 0 {
-        let g = s.sessions[idx].generation.to_le_bytes();
+        let generation = s.sessions[idx].generation;
+        // `tls_write_or_count` writes the connection id itself, so a tail
+        // starts after it: the fixed part less the id, then the generation.
         let ok = if held == NET_MSG_CONNECTED {
-            let tail = [s.sessions[idx].downstream_tag, g[0], g[1]];
-            tls_write_or_count(s, s.clear_out, held, conn_id, tail.as_ptr(), 3)
+            const AT: usize = net_proto::CONNECTED_FIXED - net_proto::CONN_ID_LEN;
+            let mut tail = [0u8; AT + net_proto::SESSION_GENERATION_LEN];
+            tail[0] = s.sessions[idx].downstream_tag;
+            let n = net_proto::put_session_generation(&mut tail, AT, generation).unwrap_or(AT);
+            tls_write_or_count(s, s.clear_out, held, conn_id, tail.as_ptr(), n as u16)
         } else {
             // NET_MSG_ACCEPTED: carry the listener port the connection was
             // accepted on (`[conn_id][local_port:2 LE]`, net_proto §
@@ -5395,13 +5400,11 @@ unsafe fn forward_held_completion(s: &mut TlsState, idx: usize) {
             // The session's generation follows the port
             // (`net_proto::session_generation`).
             if s.accept_port != 0 {
-                let tail = [
-                    (s.accept_port & 0xFF) as u8,
-                    (s.accept_port >> 8) as u8,
-                    g[0],
-                    g[1],
-                ];
-                tls_write_or_count(s, s.clear_out, held, conn_id, tail.as_ptr(), 4)
+                const AT: usize = net_proto::ACCEPTED_FIXED - net_proto::CONN_ID_LEN;
+                let mut tail = [0u8; AT + net_proto::SESSION_GENERATION_LEN];
+                tail[..AT].copy_from_slice(&s.accept_port.to_le_bytes());
+                let n = net_proto::put_session_generation(&mut tail, AT, generation).unwrap_or(AT);
+                tls_write_or_count(s, s.clear_out, held, conn_id, tail.as_ptr(), n as u16)
             } else {
                 tls_write_or_count(s, s.clear_out, held, conn_id, core::ptr::null(), 0)
             }

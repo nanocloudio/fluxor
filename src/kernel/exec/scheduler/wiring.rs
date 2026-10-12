@@ -51,11 +51,31 @@ fn fanned_port_frame_kind(
     let direction_byte = manifest_direction_byte(dir, port_key);
     let index = port_key & 0x0F;
     if let Ok(module) = loader.find_by_name_hash(name_hash) {
-        if let Some(ct) = module.port_content_type(direction_byte, index) {
+        if let Some((ct, flags)) = module.port_spec(direction_byte, index) {
+            if module_types::port_is_framed(ct, flags) {
+                return module_types::FRAME_KIND_RECORD;
+            }
             return port_frame_kind_from_content_type(ct);
         }
     }
     FRAME_KIND_NONE
+}
+
+/// The first `buffer_group` fan insertion may give an edge of its own.
+/// Groups below it are the config tool's: in-place chains numbered up from 1
+/// and framed edges numbered down from 31, all inside the config's 5-bit
+/// field. A group the kernel mints for a record fan is above every one of
+/// them, so it can never alias an edge the graph grouped.
+const RECORD_FAN_GROUP_FIRST: u8 = 32;
+
+/// A `buffer_group` no edge uses yet, for one edge around a record fan.
+///
+/// An edge in a group shares that group's channel with the group's other
+/// edges — the group IS the aliasing — so an edge that must be a mailbox of
+/// its own needs a group nobody else is in.
+fn fresh_record_group(edges: &[Edge; MAX_CHANNELS], edge_count: usize) -> Option<u8> {
+    (RECORD_FAN_GROUP_FIRST..128)
+        .find(|g| !edges.iter().take(edge_count).any(|e| e.buffer_group == *g))
 }
 
 /// Compute port grouping key for fan insertion.
@@ -201,20 +221,6 @@ fn insert_fan(
                 }
             }
 
-            // Invariant: buffer aliasing (buffer_group) is incompatible with tee/merge.
-            // In-place modification through an aliased buffer would corrupt data for
-            // other consumers in the fan. Strip and log at error level.
-            for &ei in group.iter().take(group_count) {
-                if edges[ei].buffer_group != 0 {
-                    log::error!(
-                        "[graph] fan module={} buffer_group={} cleared (incompatible)",
-                        module_idx,
-                        edges[ei].buffer_group
-                    );
-                    edges[ei].buffer_group = 0;
-                }
-            }
-
             // Insert tee/merge module for this port group
             if *edge_count + 1 > MAX_CHANNELS {
                 log::error!("[graph] channel limit for {name} module={entry_id}");
@@ -259,6 +265,38 @@ fn insert_fan(
                     }
                 }
             }
+            // A buffer group is aliasing: every edge in one shares one channel.
+            // No fan can keep that, since one producer feeding several
+            // consumers, or several producers one consumer, would do in-place
+            // work on a buffer every party sees at once.
+            //
+            // What the edges become depends on what the port carries. A
+            // record that states no length is whole only on a mailbox, so a
+            // record fan gives every edge around it a mailbox of its own and
+            // moves one record per transfer (`FRAME_KIND_RECORD`); on byte
+            // FIFOs a reader could not find where one record ends and the
+            // next begins. Every other kind is a byte stream or carries its
+            // own length, and its edges are FIFOs.
+            let record = fan_kind == module_types::FRAME_KIND_RECORD;
+            for &ei in group.iter().take(group_count) {
+                if record {
+                    let Some(g) = fresh_record_group(edges, *edge_count) else {
+                        log::error!(
+                            "[graph] record fan module={module_idx} has no buffer group left"
+                        );
+                        return false;
+                    };
+                    edges[ei].buffer_group = g;
+                } else if edges[ei].buffer_group != 0 {
+                    log::error!(
+                        "[graph] fan module={} buffer_group={} cleared (incompatible)",
+                        module_idx,
+                        edges[ei].buffer_group
+                    );
+                    edges[ei].buffer_group = 0;
+                }
+            }
+
             let fan_idx = match push_internal_module(
                 module_list,
                 module_count,
@@ -297,6 +335,14 @@ fn insert_fan(
                     e
                 }
             };
+            let mut new_edge = new_edge;
+            if record {
+                let Some(g) = fresh_record_group(edges, *edge_count) else {
+                    log::error!("[graph] record fan module={module_idx} has no buffer group left");
+                    return false;
+                };
+                new_edge.buffer_group = g;
+            }
             edges[*edge_count] = new_edge;
             *edge_count += 1;
 

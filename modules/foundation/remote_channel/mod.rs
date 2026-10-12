@@ -24,7 +24,10 @@
 //!   bind a peer identity is closed before a byte of it is used.
 //! - Authentication is decided once, when a session attaches, from a
 //!   record that names that session — on `net`, by its connection id and
-//!   the generation the transport numbered it with. The module does not
+//!   the generation the transport numbered it with. The transport reports
+//!   a handshake when it completes, before the session it opened arrives
+//!   here, so a record is kept per connection until its session is
+//!   decided (`Identities`). The module does not
 //!   read a peer's validity window or re-authenticate a live session; a
 //!   transport that must end a session when a credential expires closes
 //!   it, and the module treats that like any other close. It holds no
@@ -72,6 +75,7 @@ use core::ffi::c_void;
 
 #[path = "../../sdk/abi.rs"]
 mod abi;
+use abi::config::tls::MAX_SESSIONS as TLS_SESSIONS;
 use abi::contracts::mesh::remote_session;
 use abi::contracts::net::{mux, net_proto, peer_identity};
 use abi::{errno, SyscallTable};
@@ -149,6 +153,9 @@ const SETUP_TIMEOUT_MS: u32 = 10_000;
 /// will not use and the transport has not yet taken. Transport input pauses
 /// while the queue is full, so none is dropped.
 const CLOSES_OWED: usize = 4;
+/// Peer-identity records held, one per connection: as many as the
+/// transport can seat sessions. See `Identities`.
+const IDENTITIES: usize = TLS_SESSIONS;
 
 const RX_SCRATCH: usize = 3 + mux::MUX_QUIC_STREAM_RX_FRAME_MAX + 64;
 const TX_PREFIX: usize = 3 + mux::STREAM_DATA_PREFIX;
@@ -223,6 +230,103 @@ struct Slot {
     parser: Parser,
 }
 
+/// The peer-identity records the transport has reported, one per
+/// connection.
+///
+/// `tls` reports every handshake it completes, on every connection it
+/// seats, whichever port the connection was accepted on. The report
+/// reaches this module directly, when the handshake completes; the
+/// session it names reaches this module later, through whatever stands
+/// between — `http`'s upgrade, say — or never, when the connection was
+/// for something else. So a record waits here for its session, beside
+/// the records of every other connection whose handshake completed
+/// meanwhile, and a session arriving finds its own by connection id and
+/// generation.
+///
+/// A connection id outlives its sessions, and of the sessions on one id
+/// only the newest can still arrive, so a record replaces the one its
+/// connection held. A record is spent once its session is decided —
+/// bound, refused, or ended — and only then: the id's next record can be
+/// here before the close of the session before it, which comes the long
+/// way round, so spending goes by generation, and a close the transport
+/// reports for a connection this module never served spends nothing.
+///
+/// The table holds one record for every session the transport can seat
+/// at once. A record whose connection was never served stays until its
+/// id is reused, so on a transport whose connection ids outnumber its
+/// seats the table can fill, and the record that has waited longest is
+/// displaced.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Identity {
+    conn: u16,
+    generation: u16,
+    bound: bool,
+    used: bool,
+    /// When the record arrived, by `Identities::clock`.
+    arrived: u32,
+}
+
+#[repr(C)]
+struct Identities {
+    slots: [Identity; IDENTITIES],
+    /// Counts records in; a record's age is its distance from this.
+    clock: u32,
+}
+
+impl Identities {
+    fn find(&self, conn: u16) -> Option<usize> {
+        self.slots.iter().position(|e| e.used && e.conn == conn)
+    }
+
+    /// Keep `conn`'s record, in place of any it held.
+    fn put(&mut self, conn: u16, generation: u16, bound: bool) {
+        self.clock = self.clock.wrapping_add(1);
+        let i = self
+            .find(conn)
+            .or_else(|| self.slots.iter().position(|e| !e.used))
+            .unwrap_or_else(|| self.oldest());
+        self.slots[i] = Identity {
+            conn,
+            generation,
+            bound,
+            used: true,
+            arrived: self.clock,
+        };
+    }
+
+    /// The slot whose record has waited longest.
+    fn oldest(&self) -> usize {
+        let mut oldest = 0;
+        for (i, e) in self.slots.iter().enumerate() {
+            if self.clock.wrapping_sub(e.arrived)
+                > self.clock.wrapping_sub(self.slots[oldest].arrived)
+            {
+                oldest = i;
+            }
+        }
+        oldest
+    }
+
+    /// Whether the record naming (`conn`, `generation`) bound its peer;
+    /// None when no record names that session.
+    fn get(&self, conn: u16, generation: u16) -> Option<bool> {
+        self.find(conn)
+            .filter(|&i| self.slots[i].generation == generation)
+            .map(|i| self.slots[i].bound)
+    }
+
+    /// Spend the record naming (`conn`, `generation`). A record naming a
+    /// later session on the same connection is that session's, and stays.
+    fn spend(&mut self, conn: u16, generation: u16) {
+        if let Some(i) = self.find(conn) {
+            if self.slots[i].generation == generation {
+                self.slots[i].used = false;
+            }
+        }
+    }
+}
+
 #[repr(C)]
 pub struct State {
     syscalls: *const SyscallTable,
@@ -259,11 +363,7 @@ pub struct State {
     refuse_owed: u8,
     opening: u8,
     open_pending: bool,
-    /// The latest peer-identity record seen: whose and whether it bound.
-    id_conn: u16,
-    id_generation: u16,
-    id_bound: bool,
-    id_seen: bool,
+    ids: Identities,
     net_parser: Parser,
     chans: [Chan; MAX_CHANNELS],
     slots: [Slot; MAX_CHANNELS],
@@ -578,9 +678,7 @@ unsafe fn end_session(s: &mut State, why: &[u8]) {
             command(s, mux::CMD_MUX_SESSION_CLOSE, &p);
         }
         // This session's identity record is spent with it.
-        if s.id_seen && s.id_conn == s.conn && s.id_generation == s.generation {
-            s.id_seen = false;
-        }
+        s.ids.spend(s.conn, s.generation);
     }
     let sys = &*s.syscalls;
     for i in 0..n_channels(s) {
@@ -1121,19 +1219,21 @@ unsafe fn read_identity(s: &mut State) {
             continue;
         }
         let p = &buf[3..3 + n];
-        s.id_conn = peer_identity::conn_id(p);
-        s.id_generation = peer_identity::generation(p);
-        s.id_bound = peer_identity::binds_identity(p);
-        s.id_seen = true;
+        s.ids.put(
+            peer_identity::conn_id(p),
+            peer_identity::generation(p),
+            peer_identity::binds_identity(p),
+        );
     }
 }
 
-/// Settle a net session's identity from the latest record. A record binds
-/// only the session its connection id and generation both name: a
+/// Settle a net session's identity from the record naming it. A record
+/// binds only the session its connection id and generation both name: a
 /// connection id outlives its sessions, and a record that arrives after its
 /// session closed must not authenticate the next one on that id. A
 /// transport that numbers no sessions gives nothing to tie a record to, so
-/// its sessions cannot be authenticated.
+/// its sessions cannot be authenticated. The record is spent whichever way
+/// it decides the session: nothing else can use it.
 unsafe fn check_net_identity(s: &mut State) {
     if s.phase != PH_ATTACHING || s.peer_bound {
         return;
@@ -1145,10 +1245,11 @@ unsafe fn check_net_identity(s: &mut State) {
         );
         return;
     }
-    if !s.id_seen || s.id_conn != s.conn || s.id_generation != s.generation {
+    let Some(bound) = s.ids.get(s.conn, s.generation) else {
         return;
-    }
-    if s.id_bound {
+    };
+    s.ids.spend(s.conn, s.generation);
+    if bound {
         s.peer_bound = true;
     } else {
         end_session(

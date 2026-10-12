@@ -346,10 +346,13 @@ impl Edge {
 /// At most one `in_place_writer` module per buffer_group is allowed (enforced
 /// at setup by `validate_buffer_groups`).
 ///
-/// Aliased mailbox chains are incompatible with fan-out/fan-in (tee/merge).
-/// `insert_fan` explicitly clears `buffer_group` on edges that require a tee
-/// or merge, because in-place modification through an aliased buffer would
-/// corrupt data for other consumers in the fan.
+/// No aliased chain passes through a fan (tee/merge): in-place modification
+/// through a shared buffer would reach every party in the fan at once.
+/// `insert_fan` decides by what the fanned port carries. Over a record-
+/// carrying port (`FRAME_KIND_RECORD`) it gives every edge around the fan a
+/// `buffer_group` of its own, above the config's range, so each edge is a
+/// mailbox and the fan moves one record per transfer; over any other port it
+/// clears `buffer_group` and the edges are FIFOs.
 ///
 /// ## Buffer sizing for groups
 ///
@@ -739,7 +742,7 @@ impl NameArena {
 pub mod module_types;
 pub use module_types::{
     BuiltInModule, DummyModule, MergeModule, ModuleSlot, TeeModule, FAN_FRAMES_PER_STEP,
-    FRAME_KIND_NET,
+    FRAME_KIND_NET, FRAME_KIND_RECORD,
 };
 
 /// Live graph mutation (add owner / free owner). Multi-tenant only —

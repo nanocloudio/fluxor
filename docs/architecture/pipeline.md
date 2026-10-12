@@ -313,8 +313,11 @@ config's mailbox chains are consistent; a module without
 
 - At most one in-place transform per alias chain (the `READY_PROCESSED`
   state prevents double-processing)
-- `buffer_group` is incompatible with tee/merge helpers; the runner
-  clears `buffer_group` on inserted fan edges
+- No alias chain passes through a tee/merge helper. Over a port whose
+  content type is `Framed` (or a port declared `framed = true`) the runner
+  gives every edge around the helper a `buffer_group` of its own, so each
+  is a mailbox and the helper moves one record per transfer; over any
+  other port it clears `buffer_group` and the edges are FIFOs
 - Buffer sizing for grouped edges is the maximum of all port hints
   across the group, so the channel is large enough for the most
   demanding consumer
@@ -375,8 +378,19 @@ Tee and merge are kernel-built modules (`TeeModule`, `MergeModule`)
 that share per-domain fan scratch buffers. They are not visible in the
 config, but the inserted instances do occupy module slots, so a
 heavily fanned graph consumes more of `MAX_MODULES` than its config
-lists. They are incompatible with mailbox `buffer_group` aliasing;
-fan helpers always copy.
+lists.
+
+A helper always copies, and what it copies per transfer is set by the
+fanned port's content type. Over a byte stream it moves whatever is
+waiting. Over a length-prefixed type (`EthernetFrame`, `NetProto`) or a
+self-sizing one (`Telemetry`) it peeks the header and moves one whole
+frame, once every output has room for it. Over a `Framed` type, or a
+port declared `framed = true`, every edge around the helper is a mailbox
+of its own and the helper moves one record per transfer, taking it from
+the input only once every output is free; a record larger than the
+fan scratch is a topology error the helper reports rather than retries.
+No alias chain passes through a helper: the mailboxes a record fan uses
+are never shared, and over every other type `buffer_group` is cleared.
 
 ## Module Instantiation
 

@@ -93,10 +93,28 @@ pub fn connected_parts(payload: &[u8]) -> (u16, u8) {
 /// can tell a connection id's current session from a closed one's.
 #[inline]
 pub fn session_generation(payload: &[u8], fixed: usize) -> u16 {
-    match payload.get(fixed..fixed + 2) {
+    match payload.get(fixed..fixed + SESSION_GENERATION_LEN) {
         Some(g) => u16::from_le_bytes([g[0], g[1]]),
         None => 0,
     }
+}
+
+/// Bytes a session generation occupies after a record's fixed part.
+pub const SESSION_GENERATION_LEN: usize = 2;
+
+/// Write a session generation at `fixed`, where [`session_generation`] reads
+/// it, and return the length of the record through it: `None` when `buf`
+/// cannot hold it.
+///
+/// The writer and the reader take the same offset, so where the number sits
+/// is stated once: a stage that numbers sessions appends the number after the
+/// fixed fields, and a consumer reads it back from the same place.
+#[inline]
+pub fn put_session_generation(buf: &mut [u8], fixed: usize, generation: u16) -> Option<usize> {
+    let end = fixed.checked_add(SESSION_GENERATION_LEN)?;
+    buf.get_mut(fixed..end)?
+        .copy_from_slice(&generation.to_le_bytes());
+    Some(end)
 }
 
 /// `MSG_ACCEPTED`'s fixed part: `[conn_id][local_port]`.

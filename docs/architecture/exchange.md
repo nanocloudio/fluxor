@@ -21,7 +21,9 @@ Both content types are `Framed`: a reader must receive each record whole. The
 build gives every framed edge a mailbox `buffer_group` of its own, so a graph
 wires `requester.request_out -> provider.request_in` and
 `provider.response_out -> requester.response_in` and writes nothing else. A
-group the wiring names explicitly is kept.
+group the wiring names explicitly is kept. Fanning one of these ports keeps
+every edge a mailbox of its own: the inserted tee or merge moves one record
+per transfer.
 
 ## Records
 

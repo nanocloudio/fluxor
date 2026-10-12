@@ -1410,6 +1410,16 @@ impl LoadedModule {
     /// match the byte against the `CONTENT_TYPES` table in
     /// `tools::manifest`.
     pub fn port_content_type(&self, direction: u8, index: u8) -> Option<u8> {
+        self.port_spec(direction, index)
+            .map(|(content_type, _)| content_type)
+    }
+
+    /// A port's `content_type` byte and its flags byte, by direction and the
+    /// per-direction index — the two halves of the port record a fan needs to
+    /// decide whether the port carries records that state no length (flags
+    /// bit 1 is the port's own `framed = true`). Same lookup and same `None`
+    /// cases as [`Self::port_content_type`].
+    pub fn port_spec(&self, direction: u8, index: u8) -> Option<(u8, u8)> {
         let manifest_size = self.header.manifest_size() as usize;
         if manifest_size < 17 {
             return None;
@@ -1438,7 +1448,7 @@ impl LoadedModule {
             for i in 0..port_count {
                 let entry = p.add(17 + i * 4);
                 if *entry == direction && *entry.add(3) == index {
-                    return Some(*entry.add(1));
+                    return Some((*entry.add(1), *entry.add(2)));
                 }
             }
             None

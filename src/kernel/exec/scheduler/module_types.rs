@@ -188,7 +188,7 @@ impl Module for BuiltInModule {
 // ============================================================================
 
 /// Wire format of frames flowing through a fan module's input port.
-/// `port_frame_kind_from_content_type` (in `scheduler::mod`) maps a
+/// `port_frame_kind_from_content_type` (in `scheduler::wiring`) maps a
 /// fanned port's manifest `content_type` byte to one of these
 /// values; the fan reads the per-frame length prefix accordingly so
 /// a transfer covers one whole frame and preserves producer
@@ -208,6 +208,37 @@ pub const FRAME_KIND_NET: u8 = 2;
 /// bytes and transfer the whole record. Without this, a fan splits a
 /// record mid-body and the `observe`/exporter drain mis-frames the tail.
 pub const FRAME_KIND_TELEMETRY: u8 = 3;
+/// A record that states no length of its own — content types whose framing is
+/// `Framed` (`fluxor_contracts::CONTENT_FRAMING`), or a port declared
+/// `framed = true`. Where one record ends is the channel's record boundary, so
+/// the only edge that carries it whole is a mailbox, and a byte FIFO cannot:
+/// two records queued back to back are indistinguishable from one.
+///
+/// A fan over such a port therefore keeps every edge around it a mailbox of
+/// its own, and moves exactly one buffer — one record — per transfer. Unlike
+/// the length-prefixed kinds above there is nothing to peek: a mailbox holds
+/// one record or none, and the poll says which.
+pub const FRAME_KIND_RECORD: u8 = 4;
+
+/// The manifest `content_type` bytes whose framing is `Framed`: each type's
+/// position in `fluxor_contracts::CONTENT_TYPES`, mirrored for the reason
+/// [`CONTENT_TYPE_NET_PROTO`] is — the kernel cannot link the contracts crate
+/// on every target. Pinned, index by index, to `CONTENT_FRAMING` in
+/// `graph_unification::framed_content_types_mirror_the_contract`, so a type
+/// whose framing changes there cannot keep its old treatment here.
+pub const FRAMED_CONTENT_TYPES: [u8; 6] = [21, 33, 34, 35, 38, 39];
+
+/// Whether a port carries records that state no length — by its content
+/// type's framing, or by the port's own `framed` flag (manifest port flags
+/// bit 1), the escape hatch for a record carried over an otherwise streamed
+/// type.
+pub fn port_is_framed(content_type: u8, flags: u8) -> bool {
+    FRAMED_CONTENT_TYPES.contains(&content_type) || flags & PORT_FLAG_FRAMED != 0
+}
+
+/// Manifest port flags bit: the port carries whole records regardless of its
+/// content type. Matches the packer in `tools/src/manifest.rs`.
+pub const PORT_FLAG_FRAMED: u8 = 0x02;
 
 /// Manifest `content_type` byte values that map to a non-NONE
 /// `FRAME_KIND_*`: each name's position in `fluxor_contracts::CONTENT_TYPES`,
@@ -221,12 +252,6 @@ pub const CONTENT_TYPE_ETHERNET_FRAME: u8 = 14;
 pub const CONTENT_TYPE_NET_PROTO: u8 = 25;
 pub const CONTENT_TYPE_TELEMETRY: u8 = 30;
 
-/// Total length of a `TelemetryRecord` from its 2-byte `signal`+`kind`
-/// prefix. A kernel-side mirror of
-/// `abi::contracts::telemetry::record_len` — the fan can't link the
-/// module SDK, so the few stable sizes are duplicated here and pinned by
-/// `graph_unification::telemetry_record_len_mirrors_contract`. Returns 0
-/// for an unrecognised header (a malformed record the fan rejects).
 /// Largest `TelemetryRecord` the ring reserves atomically — kernel mirror of
 /// `abi::contracts::telemetry::MAX_RECORD_SIZE` (a 16-bucket histogram,
 /// 144 B), pinned by the same harness test that pins the record lengths. A
@@ -234,6 +259,12 @@ pub const CONTENT_TYPE_TELEMETRY: u8 = 30;
 /// syscall, so the widest record kind is what this must track.
 pub const TELEMETRY_MAX_RECORD: usize = 144;
 
+/// Total length of a `TelemetryRecord` from its 2-byte `signal`+`kind`
+/// prefix. A kernel-side mirror of
+/// `abi::contracts::telemetry::record_len` — the fan can't link the
+/// module SDK, so the few stable sizes are duplicated here and pinned by
+/// `graph_unification::telemetry_record_len_mirrors_contract`. Returns 0
+/// for an unrecognised header (a malformed record the fan rejects).
 pub fn telemetry_record_len(signal: u8, kind: u8) -> usize {
     // Mirror of contracts/telemetry.rs: SIGNAL_METRIC=2, SIGNAL_SPAN=3,
     // SIGNAL_PSTATUS=4; METRIC_HISTOGRAM=3, METRIC_HISTOGRAM_16=4;
@@ -311,6 +342,11 @@ impl Module for TeeModule {
             return Err(-1);
         }
 
+        if self.frame_kind == FRAME_KIND_RECORD {
+            // SAFETY: as `step_framed` below — `FAN_BUFS[domain]` is
+            // exclusive under the per-domain serialisation.
+            return unsafe { self.step_record() };
+        }
         if self.frame_kind != FRAME_KIND_NONE {
             // SAFETY: `step_framed` is unsafe only because it touches
             // `FAN_BUFS` via raw pointers; the scheduler serialises calls
@@ -377,6 +413,68 @@ impl Module for TeeModule {
 }
 
 impl TeeModule {
+    /// Record step body: every edge around this tee is a mailbox, so a buffer
+    /// is a record and is moved whole.
+    ///
+    /// The record is taken off the input only once EVERY output is free to
+    /// take it, so it is written to all of them in the same step and never
+    /// held across one — the same rule `step_framed` keeps, for the same
+    /// reason: a tee that read a record and then found one output full would
+    /// have to keep it, and a fan module holds nothing between steps.
+    unsafe fn step_record(&mut self) -> Result<StepOutcome, i32> {
+        for _ in 0..FAN_FRAMES_PER_STEP {
+            // SAFETY: `move_one_record` touches `FAN_BUFS` via raw pointers;
+            // the scheduler serialises calls per `self.domain`.
+            if !unsafe { self.move_one_record()? } {
+                break;
+            }
+        }
+        Ok(StepOutcome::Continue)
+    }
+
+    /// Move one record from the input to every output. `Ok(false)` means
+    /// nothing moved — no record waiting, or an output still holding its
+    /// last one — and nothing was consumed.
+    unsafe fn move_one_record(&mut self) -> Result<bool, i32> {
+        if channel::channel_poll(self.in_chan, channel::POLL_IN) <= 0 {
+            return Ok(false);
+        }
+        for idx in 0..self.out_count {
+            if channel::channel_poll(self.out_chans[idx], channel::POLL_OUT) <= 0 {
+                return Ok(false);
+            }
+        }
+        // SAFETY: `FAN_BUFS[domain]` is the per-domain scratch; the
+        // scheduler serialises calls per domain.
+        let buf = unsafe {
+            let p = &raw mut FAN_BUFS[self.domain as usize];
+            &mut *p
+        };
+        // A mailbox releases its record whole or refuses the read and keeps
+        // it; a record larger than the scratch is a topology error, as it is
+        // for a framed fan, and is reported rather than spun on.
+        // SAFETY: `buf` is `FAN_BUF_SIZE` bytes.
+        let read =
+            unsafe { channel::syscall_channel_read(self.in_chan, buf.as_mut_ptr(), buf.len()) };
+        if read == channel::CHAN_EINVAL {
+            return Err(-4);
+        }
+        if read <= 0 {
+            return Ok(false);
+        }
+        let len = read as usize;
+        for idx in 0..self.out_count {
+            // SAFETY: `len <= buf.len()`; every output was polled free above
+            // and this tee is its only producer, so the write lands whole.
+            let wrote =
+                unsafe { channel::syscall_channel_write(self.out_chans[idx], buf.as_ptr(), len) };
+            if wrote != read {
+                return Err(-2);
+            }
+        }
+        Ok(true)
+    }
+
     /// Frame-aware step body. Inspects the input ring's length-prefixed
     /// header via `channel_peek` (no consume), validates that every
     /// output ring has space for the full frame, then commits the
@@ -580,6 +678,11 @@ impl Module for MergeModule {
             return Err(-1);
         }
 
+        if self.frame_kind == FRAME_KIND_RECORD {
+            // SAFETY: as `step_framed` below — `FAN_BUFS[domain]` is
+            // exclusive under the per-domain serialisation.
+            return unsafe { self.step_record() };
+        }
         if self.frame_kind != FRAME_KIND_NONE {
             // SAFETY: `step_framed` is unsafe only because it touches
             // `FAN_BUFS` via raw pointers; the scheduler serialises calls
@@ -664,6 +767,64 @@ impl Module for MergeModule {
 }
 
 impl MergeModule {
+    /// Record step body: every edge around this merge is a mailbox, so a
+    /// buffer is a record and is moved whole, one input after another.
+    ///
+    /// Nothing is read until the output is free, and the output is this
+    /// merge's alone, so a record read is a record written in the same step.
+    /// Round-robin across the inputs, so a producer that always has a record
+    /// waiting cannot keep the others' out.
+    unsafe fn step_record(&mut self) -> Result<StepOutcome, i32> {
+        for _ in 0..FAN_FRAMES_PER_STEP {
+            // SAFETY: as for `TeeModule::step_record`.
+            if !unsafe { self.move_one_record()? } {
+                break;
+            }
+        }
+        Ok(StepOutcome::Continue)
+    }
+
+    /// One round-robin pass, moving the first record waiting. `Ok(false)`
+    /// means the pass moved nothing.
+    unsafe fn move_one_record(&mut self) -> Result<bool, i32> {
+        if channel::channel_poll(self.out_chan, channel::POLL_OUT) <= 0 {
+            return Ok(false);
+        }
+        // SAFETY: `FAN_BUFS[domain]` is the per-domain scratch; the
+        // scheduler serialises calls per domain.
+        let buf = unsafe {
+            let p = &raw mut FAN_BUFS[self.domain as usize];
+            &mut *p
+        };
+        for _ in 0..self.in_count {
+            let idx = self.next_idx % self.in_count;
+            self.next_idx = (self.next_idx + 1) % self.in_count;
+            let chan = self.in_chans[idx];
+            if channel::channel_poll(chan, channel::POLL_IN) <= 0 {
+                continue;
+            }
+            // SAFETY: `buf` is `FAN_BUF_SIZE` bytes; see the tee for why a
+            // refused read is an error and not a retry.
+            let read = unsafe { channel::syscall_channel_read(chan, buf.as_mut_ptr(), buf.len()) };
+            if read == channel::CHAN_EINVAL {
+                return Err(-4);
+            }
+            if read <= 0 {
+                continue;
+            }
+            // SAFETY: the output was polled free above and is this merge's
+            // alone, so the write lands whole.
+            let wrote = unsafe {
+                channel::syscall_channel_write(self.out_chan, buf.as_ptr(), read as usize)
+            };
+            if wrote != read {
+                return Err(-2);
+            }
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     /// Frame-aware step body. Round-robins across inputs; the first
     /// one with a complete frame whose entire size fits in the output
     /// ring gets transferred atomically. Like `TeeModule::step_framed`

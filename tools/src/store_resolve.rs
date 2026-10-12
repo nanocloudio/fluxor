@@ -276,20 +276,16 @@ fn write_store_lock_stamped(
 /// Tell the store which digests this checkout is now holding.
 ///
 /// Every writer of a lockfile comes through here, so a checkout
-/// registers itself the first time it resolves anything — no list to
-/// maintain, and no way to be a consumer the collector cannot see.
+/// registers itself when it first writes one — no list to maintain, and
+/// no way to be a consumer the collector cannot see. A checkout under
+/// the system temporary directory registers nothing: it is made to be
+/// deleted, and the ledger lists what a collection must spare, so an
+/// entry for it would only ever name a directory that is gone.
 /// Registration never fails the caller: it is a liveness improvement,
 /// and a store whose ledger cannot be written is not a reason to fail an
 /// update.
 pub fn register_pins(project_root: &Path, artifacts: &[Artifact]) {
-    // A unit test writing a lockfile in a temp directory must not
-    // register that directory in the DEVELOPER's real store: without
-    // this, `store_root()` falls back to `~/.local/share/fluxor/store`
-    // and every such test leaves a permanent ledger entry naming a
-    // tempdir that no longer exists — which `fluxor store fsck` then
-    // correctly reports as a dead pin. A test that means to exercise
-    // registration opts in by setting `$FLUXOR_STORE`.
-    if cfg!(test) && std::env::var_os("FLUXOR_STORE").is_none() {
+    if is_transient(project_root) {
         return;
     }
     let Ok(store_root) = crate::oci_store::store_root() else {
@@ -297,6 +293,16 @@ pub fn register_pins(project_root: &Path, artifacts: &[Artifact]) {
     };
     let digests = artifacts.iter().map(|a| a.digest.clone()).collect();
     crate::store_pins::register(&store_root, project_root, &digests);
+}
+
+/// Whether `checkout` lives under the system temporary directory.
+fn is_transient(checkout: &Path) -> bool {
+    let temp = std::env::temp_dir();
+    let temp = temp.canonicalize().unwrap_or(temp);
+    checkout
+        .canonicalize()
+        .unwrap_or_else(|_| checkout.to_path_buf())
+        .starts_with(temp)
 }
 
 /// Fill in each entry's content address from the manifest it pins.
@@ -873,6 +879,24 @@ mod tests {
             reference: format!("{project}/{name}:0.0.1"),
             content: None,
         }
+    }
+
+    /// A checkout under the temporary directory is made to be deleted;
+    /// registering it would only ever name a directory that is gone.
+    #[test]
+    fn a_checkout_under_the_temp_dir_registers_nothing() {
+        let scratch = tempfile::tempdir().unwrap();
+        let store = scratch.path().join("store");
+        crate::oci_store::OciStore::open(&store).unwrap();
+        let _lock = crate::oci_store::test_env_lock();
+        let _env = crate::oci_store::EnvScope::set(&[("FLUXOR_STORE", store.as_path())]);
+        let checkout = scratch.path().join("checkout");
+        std::fs::create_dir_all(&checkout).unwrap();
+        register_pins(
+            &checkout,
+            &[entry("module", "fluxor", "tls", Some("aarch64"))],
+        );
+        assert!(crate::store_pins::entries(&store).unwrap().is_empty());
     }
 
     #[test]

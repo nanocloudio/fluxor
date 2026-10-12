@@ -100,13 +100,11 @@ pub enum StoreCommand {
     /// Register a checkout's `fluxor.lock` pins with the store, so its
     /// digests are garbage-collection roots.
     ///
-    /// Every checkout registers itself the first time it resolves
-    /// anything; this is the bootstrap for one that has not, and the
-    /// answer to "my repo is not in workspace.toml". Membership is about
-    /// epoch and currency checking and has nothing to do with whether
-    /// somebody is holding a digest — treating it as the root set is
-    /// what destroyed artifacts belonging to checkouts nobody had
-    /// remembered to add.
+    /// A checkout registers itself whenever it writes its lockfile; this
+    /// registers one whose lockfile was written elsewhere — a fresh
+    /// clone — and is the answer to "my repo is not in workspace.toml".
+    /// Membership is about epoch and currency checking and has nothing
+    /// to do with whether somebody is holding a digest.
     Adopt {
         /// Checkouts to register (default: the current project root).
         checkouts: Vec<PathBuf>,
@@ -668,13 +666,11 @@ fn read_module_pins(project_root: &Path) -> Result<Option<Vec<ModulePin>>> {
     else {
         return Ok(None);
     };
-    // Reading a lockfile to build with it IS holding its pins, so this
-    // is where a consumer that has not run `fluxor update` since the
-    // ledger existed registers itself. Idempotent and cheap: an
-    // unchanged pin set rewrites nothing.
+    // Reading pins registers nothing with the store's ledger: a
+    // checkout is a root by the lockfile it wrote, and a copy of that
+    // lockfile run elsewhere — a test sandbox — holds nothing.
     store_resolve::check_module_pin_targets(&lock.artifacts)
         .map_err(|e| Error::Config(e.to_string()))?;
-    store_resolve::register_pins(project_root, &lock.artifacts);
     let pins: Vec<ModulePin> = lock
         .artifacts
         .into_iter()
