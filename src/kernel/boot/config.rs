@@ -268,7 +268,7 @@ pub struct FlashLayout {
     pub modules_addr: u32,
     /// Known byte length of the module-table region, or 0 if the layout
     /// source doesn't carry one. Flash A/B graph slots record it (and
-    /// bound-check it against the slot aperture); the legacy firmware
+    /// bound-check it against the slot aperture); the firmware
     /// trailer has no length field, so it reports 0 and the loader falls
     /// back to the hard `MAX_MODULES_BLOB_SIZE` cap. Preserved so the
     /// loader can give the shared table validator a real mapping bound
@@ -325,32 +325,66 @@ pub fn kernel_abi_surface_digest() -> [u8; 32] {
 }
 
 /// Does a slot's ABI-surface pin admit it under `own` (the running
-/// kernel's digest)? Strict equality, no legacy grandfather: an
-/// all-0xFF (pre-pinning) slot is as unprovable as a mismatched one,
-/// and grandfathering it would leave incompatible graphs bootable
-/// forever after an ABI change — the exact failure the pin exists to
-/// prevent. Legacy slots are rejected like corrupt headers; rewrite
-/// them with a current `fluxor slot-image`.
+/// kernel's digest)? Strict equality: a slot whose pin is erased
+/// (all 0xFF) is as unprovable as a mismatched one, and is refused like
+/// a corrupt header. Rebuild it with `fluxor build --emit=image`.
 #[cfg(feature = "rp")]
 fn slot_pin_admits(pin: &[u8; 32], own: &[u8; 32]) -> bool {
     pin == own
 }
 
+/// The slot selection, made once per boot and held in `SLOT_CHOICE`: with a
+/// slot root it verifies and hashes up to both slots, and boot asks for the
+/// layout more than once. 0 = not yet chosen, 1 = chosen.
+#[cfg(feature = "rp")]
+static SLOT_CHOSEN: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+#[cfg(feature = "rp")]
+static mut SLOT_CHOICE: Option<FlashLayout> = None;
+/// The slots the selector admitted, bit 0 = A, bit 1 = B: what
+/// `kernel_abi::SLOT_ADMITTED` answers.
+#[cfg(feature = "rp")]
+static SLOT_ADMITTED: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// The slots this boot's selector admitted, choosing first if boot has not.
+#[cfg(feature = "rp")]
+pub fn admitted_slots() -> u8 {
+    let _ = read_layout_from_slots();
+    SLOT_ADMITTED.load(core::sync::atomic::Ordering::Acquire)
+}
+
 #[cfg(feature = "rp")]
 fn read_layout_from_slots() -> Option<FlashLayout> {
+    use core::sync::atomic::Ordering;
+    if SLOT_CHOSEN.load(Ordering::Acquire) == 1 {
+        // SAFETY: written once below before the flag is released, and never
+        // again; the Acquire load orders this read after that write.
+        return unsafe { *core::ptr::addr_of!(SLOT_CHOICE) };
+    }
+    let choice = choose_slot();
+    // SAFETY: the first read of the layout is boot's, on core 0 before any
+    // other core or module runs, so nothing reads or writes this concurrently.
+    unsafe { *core::ptr::addr_of_mut!(SLOT_CHOICE) = choice };
+    SLOT_CHOSEN.store(1, Ordering::Release);
+    choice
+}
+
+#[cfg(feature = "rp")]
+fn choose_slot() -> Option<FlashLayout> {
     use crate::abi::platform::rp::flash_layout;
     let slot_a = (flash_layout::XIP_BASE + flash_layout::GRAPH_SLOT_A_OFFSET) as *const u8;
     let slot_b = (flash_layout::XIP_BASE + flash_layout::GRAPH_SLOT_B_OFFSET) as *const u8;
 
     let own_digest = kernel_abi_surface_digest();
-    // SAFETY: slot_a and slot_b point into the XIP-mapped flash region;
-    // `decode_slot_header` reads 256 bytes per slot (header incl. the
-    // ABI-surface pin at GRAPH_SLOT_ABI_SURFACE_OFFSET), which fits
-    // within the GRAPH_SLOT_*_OFFSET aperture sizing defined by
-    // flash_layout.
+    // SAFETY: slot_a and slot_b are the bases of the two XIP-mapped slot
+    // apertures; `decode_slot_header` reads the 256-byte header and, under
+    // a slot root, regions it has bounded inside the slot.
     let a = unsafe { decode_slot_header(slot_a, &own_digest) };
     // SAFETY: as above; slot_b is the secondary slot at a fixed offset.
     let b = unsafe { decode_slot_header(slot_b, &own_digest) };
+    SLOT_ADMITTED.store(
+        u8::from(a.is_some()) | (u8::from(b.is_some()) << 1),
+        core::sync::atomic::Ordering::Release,
+    );
     let (base, hdr) = match (a, b) {
         (Some(ha), Some(hb)) => {
             if ha.epoch >= hb.epoch {
@@ -423,6 +457,34 @@ unsafe fn decode_slot_header(base: *const u8, own_digest: &[u8; 32]) -> Option<S
     }
     if !slot_pin_admits(&pin, own_digest) {
         return None;
+    }
+
+    // A kernel built with a slot root selects only a slot signed by it whose
+    // payload is what the signature vouches for: the signature covers the
+    // digest, not the payload, so the payload is hashed here too. The
+    // modules then run in place from the bytes hashed. Without a root the
+    // slot is selected on its structure and pin; its payload is checked by
+    // `graph_slot` before it activates the slot.
+    if let Some(root) = crate::kernel::security::slot_signature::slot_root() {
+        let header = core::slice::from_raw_parts(base, flash_layout::GRAPH_SLOT_HEADER_SIZE);
+        if let Err(why) = crate::kernel::security::slot_signature::admits(header, Some(&root)) {
+            log::warn!("[boot] slot at {base:p} refused: {why:?}");
+            return None;
+        }
+        let mut h = crate::kernel::security::crypto::sha256::Sha256::new();
+        h.update(core::slice::from_raw_parts(
+            base.add(modules_offset as usize),
+            modules_size as usize,
+        ));
+        h.update(core::slice::from_raw_parts(
+            base.add(config_offset as usize),
+            config_size as usize,
+        ));
+        let digest = h.finalize();
+        if header[32..64] != digest {
+            log::warn!("[boot] slot at {base:p} refused: payload digest");
+            return None;
+        }
     }
 
     Some(SlotHeader {

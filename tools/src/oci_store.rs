@@ -77,6 +77,9 @@ pub const MT_FLUXOR_FIRMWARE: &str = "application/vnd.nanocloud.fluxor.firmware.
 pub const MT_FLUXOR_IMAGE_SKELETON: &str = "application/vnd.nanocloud.fluxor.image.skeleton.v1";
 /// Compiled binary graph config.
 pub const MT_FLUXOR_CONFIG_BIN: &str = "application/vnd.nanocloud.fluxor.config.v1+bin";
+/// The program section of a graph image: per-module program blobs after
+/// the module table (`kernel_abi::program`).
+pub const MT_FLUXOR_PROGRAMS: &str = "application/vnd.nanocloud.fluxor.programs.v1";
 /// Byte offset of a layer within its reassembled graph image (decimal).
 pub const ANN_IMAGE_OFFSET: &str = "io.fluxor.image.offset";
 /// Staged source tree (canonical uncompressed tar) — the SDK /
@@ -893,7 +896,8 @@ pub struct ImageLayer<'a> {
 }
 
 /// Explode a packed graph image into its layered form: skeleton (all
-/// bytes before the first fmod), one layer per fmod, one config layer.
+/// bytes before the first fmod or the program section), one layer per
+/// fmod, the program section when there is one, and one config layer.
 /// Pure function over the FXSL/FXMT formats — returns borrowed slices
 /// into `image`. The layers, placed at their offsets with zero-filled
 /// gaps, reproduce the hashed regions of `image` byte-for-byte (the
@@ -936,21 +940,54 @@ pub fn explode_image(image: &[u8]) -> Result<Vec<ImageLayer<'_>>> {
         }
         fmods.push((off, size));
     }
-    let first_fmod = fmods.iter().map(|&(o, _)| o).min().unwrap_or(table.len());
+    // The program section, when the table names one (`kernel_abi::program`):
+    // a layer of its own, or reassembly would zero-fill it and the image's
+    // digest would not match.
+    use crate::modules::{sdk_layout::kernel_abi::program as pg, TABLE_PROGRAMS_AT};
+    let programs_at = u32::from_le_bytes(
+        table[TABLE_PROGRAMS_AT..TABLE_PROGRAMS_AT + 4]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let programs = if programs_at != 0 {
+        if programs_at + pg::HEADER_LEN > table.len() {
+            return Err(Error::Config("program section out of bounds".into()));
+        }
+        let size = u32::from_le_bytes(table[programs_at + 8..programs_at + 12].try_into().unwrap())
+            as usize;
+        if programs_at + size > table.len() {
+            return Err(Error::Config("program section out of bounds".into()));
+        }
+        Some((programs_at, size))
+    } else {
+        None
+    };
+    let skeleton_end = fmods
+        .iter()
+        .map(|&(o, _)| o)
+        .chain(programs.map(|(at, _)| at))
+        .min()
+        .unwrap_or(table.len());
     layers.push(ImageLayer {
         media_type: MT_FLUXOR_IMAGE_SKELETON,
-        bytes: &image[0..modules_offset + first_fmod],
+        bytes: &image[0..modules_offset + skeleton_end],
         offset: 0,
         title: "skeleton",
     });
-    for (i, &(off, size)) in fmods.iter().enumerate() {
-        let e = TABLE_HEADER_SIZE + i * ENTRY_SIZE;
-        let _name_hash = u32::from_le_bytes(table[e..e + 4].try_into().unwrap());
+    for &(off, size) in &fmods {
         layers.push(ImageLayer {
             media_type: MT_FLUXOR_MODULE,
             bytes: &table[off..off + size],
             offset: modules_offset + off,
             title: "fmod",
+        });
+    }
+    if let Some((at, size)) = programs {
+        layers.push(ImageLayer {
+            media_type: MT_FLUXOR_PROGRAMS,
+            bytes: &table[at..at + size],
+            offset: modules_offset + at,
+            title: "programs",
         });
     }
     layers.push(ImageLayer {
@@ -964,8 +1001,8 @@ pub fn explode_image(image: &[u8]) -> Result<Vec<ImageLayer<'_>>> {
     Ok(layers)
 }
 
-/// Publish a LAYERED graph image: skeleton + per-fmod + config
-/// layers, each layer annotated with its byte offset in the
+/// Publish a LAYERED graph image: skeleton + per-fmod + program section +
+/// config layers, each layer annotated with its byte offset in the
 /// reassembled image so a consumer can rebuild the exact bytes. Fmod
 /// layer blobs are byte-identical to individually published module
 /// artifacts, so the store (and any registry) deduplicates them.
@@ -2589,6 +2626,51 @@ mod tests {
         // Fmod layer blobs are the raw fmod bytes (store-dedup contract).
         assert_eq!(layers[1].bytes, &fmod_a[..]);
         assert_eq!(layers[2].bytes, &fmod_b[..]);
+    }
+
+    /// An image whose table names a program section explodes with a
+    /// layer for it, and reassembly reproduces the section.
+    #[test]
+    fn explode_image_keeps_the_program_section() {
+        let modules_offset = 4096usize;
+        let section = {
+            let mut sec = vec![0u8; 4096];
+            sec[0..4].copy_from_slice(b"FXPG");
+            sec[4] = 1;
+            sec[8..12].copy_from_slice(&4096u32.to_le_bytes());
+            sec[100..110].copy_from_slice(b"programmed");
+            sec
+        };
+        let mut table = vec![0u8; 4096];
+        table[0..4].copy_from_slice(&0x544D_5846u32.to_le_bytes());
+        table[4] = 1;
+        table[10..14].copy_from_slice(&4096u32.to_le_bytes());
+        table.extend_from_slice(&section);
+        let config = vec![0xCCu8; 64];
+        let config_offset = (modules_offset + table.len()).div_ceil(256) * 256;
+        let mut image = vec![0xFFu8; config_offset + config.len()];
+        image[0..4].copy_from_slice(&0x4C53_5846u32.to_le_bytes());
+        image[4] = 1;
+        image[16..20].copy_from_slice(&(modules_offset as u32).to_le_bytes());
+        image[20..24].copy_from_slice(&(table.len() as u32).to_le_bytes());
+        image[24..28].copy_from_slice(&(config_offset as u32).to_le_bytes());
+        image[28..32].copy_from_slice(&(config.len() as u32).to_le_bytes());
+        image[modules_offset..modules_offset + table.len()].copy_from_slice(&table);
+        image[config_offset..config_offset + config.len()].copy_from_slice(&config);
+        let layers = explode_image(&image).unwrap();
+        let p = layers
+            .iter()
+            .find(|l| l.media_type == MT_FLUXOR_PROGRAMS)
+            .expect("a programs layer");
+        assert_eq!(p.offset, modules_offset + 4096);
+        let mut out = vec![0u8; image.len()];
+        for l in &layers {
+            out[l.offset..l.offset + l.bytes.len()].copy_from_slice(l.bytes);
+        }
+        assert_eq!(
+            out[modules_offset..modules_offset + table.len()],
+            image[modules_offset..modules_offset + table.len()]
+        );
     }
 
     fn temp_store() -> (tempfile::TempDir, OciStore) {

@@ -198,14 +198,11 @@ pub const READDIR: u32 = 0x0908;
 ///
 /// # Capability discovery — query `CAPS` first
 ///
-/// `OPEN_CREATE` is part of the FS contract's *write tier*. Not
-/// every storage backend implements write — bare-metal FAT32
-/// would need a cluster allocator + FAT-table writeback +
-/// directory-entry emit that's not in v1, and the wasm provider
-/// maps to browser storage primitives whose create semantics
-/// vary by host. Callers MUST query `CAPS` (see below) and
-/// branch on `caps::OPEN_CREATE` before invoking this opcode if
-/// they want a portable result.
+/// `OPEN_CREATE` is part of the FS contract's *write tier*, which a
+/// provider may not offer: a read-only volume, or a host whose storage
+/// cannot create a file. Callers MUST query `CAPS` (see below) and
+/// branch on `caps::OPEN_CREATE` before invoking this opcode if they
+/// want a portable result.
 ///
 /// Providers without write support return `ENOSYS` (`-38`) here,
 /// so callers that skip the `CAPS` check still get a clean error

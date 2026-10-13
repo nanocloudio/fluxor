@@ -44,7 +44,7 @@ data came from, it has crossed the line into being a driver.
 
 The foundation layer covers:
 
-- **Storage and filesystems** (`fat32`, `sd`, `mount`)
+- **Storage and filesystems** (`fat32`, `sd`, `mount`, `fs_object`)
 - **Networking** (`ip` — which includes the DHCP client — plus `dns`,
   `tls`, `quic`); application-protocol clients and servers (`http`,
   `mqtt`, …) live in sibling projects that consume them

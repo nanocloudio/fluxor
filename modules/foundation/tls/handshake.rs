@@ -77,28 +77,15 @@ const SIG_RSA_PSS_RSAE_SHA384: u16 = 0x0805;
 const SIG_RSA_PKCS1_SHA256: u16 = 0x0401;
 const SIG_RSA_PKCS1_SHA384: u16 = 0x0501;
 /// ed25519 (RFC 8446 §4.2.3): signs the CertificateVerify content itself,
-/// not a digest of it, so it is verified where the content is built rather
-/// than by the stepped pump — whole, and therefore only where that fits a
-/// step (`suite::ED25519_VERIFIED`).
+/// not a digest of it, so its job is begun where the content is built and
+/// then stepped by the pump like ECDSA's.
 pub const SIG_ED25519: u16 = 0x0807;
 
 /// The schemes this build offers, in preference order.
-#[cfg(not(target_arch = "arm"))]
 const OFFERED_SIGNATURE_SCHEMES: [u16; 7] = [
     SIG_ECDSA_SECP256R1_SHA256,
     SIG_ECDSA_SECP384R1_SHA384,
     SIG_ED25519,
-    SIG_RSA_PSS_RSAE_SHA256,
-    SIG_RSA_PSS_RSAE_SHA384,
-    SIG_RSA_PKCS1_SHA256,
-    SIG_RSA_PKCS1_SHA384,
-];
-/// The Cortex-M build does not verify Ed25519 (`suite::ED25519_VERIFIED`),
-/// so it does not offer it.
-#[cfg(target_arch = "arm")]
-const OFFERED_SIGNATURE_SCHEMES: [u16; 6] = [
-    SIG_ECDSA_SECP256R1_SHA256,
-    SIG_ECDSA_SECP384R1_SHA384,
     SIG_RSA_PSS_RSAE_SHA256,
     SIG_RSA_PSS_RSAE_SHA384,
     SIG_RSA_PKCS1_SHA256,
@@ -131,7 +118,7 @@ pub fn scheme_for_peer_key(key_suite: u16, scheme: u16) -> Option<u16> {
     match key_suite {
         suite::ECDSA_P256_SHA256 if scheme == SIG_ECDSA_SECP256R1_SHA256 => Some(scheme),
         suite::ECDSA_P384_SHA384 if scheme == SIG_ECDSA_SECP384R1_SHA384 => Some(scheme),
-        suite::ED25519 if scheme == SIG_ED25519 && suite::ED25519_VERIFIED => Some(scheme),
+        suite::ED25519 if scheme == SIG_ED25519 => Some(scheme),
         suite::RSA_2048 | suite::RSA_3072 | suite::RSA_4096
             if scheme == SIG_RSA_PSS_RSAE_SHA256 || scheme == SIG_RSA_PSS_RSAE_SHA384 =>
         {
@@ -1571,41 +1558,25 @@ pub fn parse_new_session_ticket_is_well_formed(body: &[u8]) -> bool {
     pos == body.len()
 }
 
-/// Build CertificateVerify signing content
-/// context_string: "TLS 1.3, server CertificateVerify" or "TLS 1.3, client CertificateVerify"
+/// Build the content a CertificateVerify signs (RFC 8446 §4.4.3) into
+/// `out`: 64 spaces, the context string ("TLS 1.3, server
+/// CertificateVerify" or "TLS 1.3, client CertificateVerify"), a zero
+/// byte, then the first `hash_len` bytes of `transcript_hash`. Returns the
+/// length written.
 pub fn build_verify_content(
     context: &[u8],
     transcript_hash: &[u8],
     hash_len: usize,
     out: &mut [u8],
 ) -> usize {
-    // 64 spaces + context_string + 0x00 + transcript_hash
-    let mut pos = 0;
-    let mut i = 0;
-    while i < 64 {
-        out[pos] = 0x20;
-        pos += 1;
-        i += 1;
-    }
-    // SAFETY: pointer arithmetic over the handshake-state buffer; bounds
-    // checked against the message length before each deref.
-    unsafe {
-        core::ptr::copy_nonoverlapping(context.as_ptr(), out.as_mut_ptr().add(pos), context.len());
-    }
+    out[..64].fill(0x20);
+    let mut pos = 64;
+    out[pos..pos + context.len()].copy_from_slice(context);
     pos += context.len();
     out[pos] = 0x00;
     pos += 1;
-    // SAFETY: pointer arithmetic over the handshake-state buffer; bounds
-    // checked against the message length before each deref.
-    unsafe {
-        core::ptr::copy_nonoverlapping(
-            transcript_hash.as_ptr(),
-            out.as_mut_ptr().add(pos),
-            hash_len,
-        );
-    }
-    pos += hash_len;
-    pos
+    out[pos..pos + hash_len].copy_from_slice(&transcript_hash[..hash_len]);
+    pos + hash_len
 }
 
 // ============================================================================

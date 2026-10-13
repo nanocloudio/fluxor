@@ -17,43 +17,23 @@ use crate::kernel::boot::config::read_layout;
 use crate::kernel::sys::hal;
 use crate::modules::{Module, StepOutcome};
 
-/// Read the root-of-trust Ed25519 signing pubkey provisioned at BUILD TIME via
-/// the `FLUXOR_SIGNING_PUBKEY_HEX` environment variable (64 hex chars → 32
-/// bytes) into `out`. Returns true iff a valid key is provisioned; false (with
-/// `enforce_signatures`, the caller then refuses every module) otherwise.
+/// The root-of-trust Ed25519 public key modules are signed against: the
+/// `FLUXOR_SIGNING_PUBKEY_HEX` build variable, 64 hex digits, compiled in.
+/// Any other value fails the build. `None` on a build without one, which
+/// verifies no module signature (and, with `enforce_signatures`, refuses
+/// every module).
 ///
-/// This is build-config key provisioning, not a hardware mechanism, so it lives
-/// here with its sole consumer (the signature check below) rather than in the
-/// generic HAL.
-/// Whether this kernel was built with a root signing key.
-fn root_key_provisioned() -> bool {
-    signing_pubkey_from_build_env(&mut [0u8; 32])
-}
-
-fn signing_pubkey_from_build_env(out: &mut [u8; 32]) -> bool {
-    match option_env!("FLUXOR_SIGNING_PUBKEY_HEX") {
-        Some(hex) if hex.len() == 64 => {
-            let bytes = hex.as_bytes();
-            for i in 0..32 {
-                let hi = match bytes[i * 2] {
-                    b'0'..=b'9' => bytes[i * 2] - b'0',
-                    b'a'..=b'f' => bytes[i * 2] - b'a' + 10,
-                    b'A'..=b'F' => bytes[i * 2] - b'A' + 10,
-                    _ => return false,
-                };
-                let lo = match bytes[i * 2 + 1] {
-                    b'0'..=b'9' => bytes[i * 2 + 1] - b'0',
-                    b'a'..=b'f' => bytes[i * 2 + 1] - b'a' + 10,
-                    b'A'..=b'F' => bytes[i * 2 + 1] - b'A' + 10,
-                    _ => return false,
-                };
-                out[i] = (hi << 4) | lo;
-            }
-            true
+/// This is build-config key provisioning, not a hardware mechanism, so it
+/// lives here with its sole consumer (the signature check below) rather than
+/// in the generic HAL.
+const MODULE_SIGNING_ROOT: Option<[u8; 32]> =
+    match crate::kernel::security::build_time_key(option_env!("FLUXOR_SIGNING_PUBKEY_HEX")) {
+        Ok(key) => key,
+        Err(crate::kernel::security::MalformedKey) => {
+            panic!("FLUXOR_SIGNING_PUBKEY_HEX must be 64 hex digits: a 32-byte Ed25519 public key")
         }
-        _ => false,
-    }
-}
+    };
+
 // ============================================================================
 // Constants
 // ============================================================================
@@ -1656,6 +1636,23 @@ pub struct ModuleLoader {
     /// (matches the bare-metal `init` path); `init_from_blob` sets
     /// it to `Embedded`. Read-only after init.
     source: LoadSource,
+    /// How far past `table_base` the mapped bundle is known to extend: the
+    /// slot's or blob's length, or the hard cap for a trailer that states
+    /// none. Bounds the program section as it bounds the table.
+    blob_bound: usize,
+}
+
+/// One program the bundle carries for a module instance
+/// (`kernel_abi::program`).
+#[derive(Debug, Clone, Copy)]
+pub struct ProgramRef {
+    pub addr: *const u8,
+    pub size: usize,
+    pub kind: u32,
+    /// The owner's run of programs: what an isolated reader is granted.
+    pub region: *const u8,
+    pub region_len: usize,
+    pub format: [u8; 32],
 }
 impl Default for ModuleLoader {
     fn default() -> Self {
@@ -1673,7 +1670,145 @@ impl ModuleLoader {
             // (RP, Pi 5) never re-set this; hosted targets calling
             // `init_from_blob` get the right value automatically.
             source: LoadSource::Flash,
+            blob_bound: 0,
         }
+    }
+
+    /// The program section the table names, as (base, length), once its
+    /// header and every entry check out against the mapped bound and the
+    /// layout `kernel_abi::program` documents. `None` when there is none or
+    /// it does not check out: a program a module asks for is then absent,
+    /// never read out of bounds or out of its owner's region.
+    ///
+    /// Beyond bounds, the section must start and end on owner boundaries
+    /// from the table, and its entries must run in owner order with each
+    /// owner's programs inside one region shared by all of them, every region
+    /// starting on an owner boundary past the entries and after the previous
+    /// owner's. So owners' regions are disjoint, and a region granted to an
+    /// isolated module -- rounded out to whole pages where the protection is
+    /// paged -- holds its own programs and padding, nothing of another
+    /// owner's and nothing past the section.
+    pub fn program_section(&self) -> Option<(*const u8, usize)> {
+        use crate::abi::kernel_abi::program as pg;
+        let header = self.header?;
+        let at = u32::from_le_bytes([
+            header.reserved[0],
+            header.reserved[1],
+            header.reserved[2],
+            header.reserved[3],
+        ]) as usize;
+        if at == 0 || self.table_base.is_null() {
+            return None;
+        }
+        let total = ((header.total_size_hi as usize) << 16) | header.total_size_lo as usize;
+        if at < total
+            || !at.is_multiple_of(pg::OWNER_ALIGN)
+            || at.checked_add(pg::HEADER_LEN)? > self.blob_bound
+        {
+            return None;
+        }
+        // SAFETY: `at + HEADER_LEN` is within the mapped bound checked above.
+        let base = unsafe { self.table_base.add(at) };
+        // SAFETY: as above, `HEADER_LEN` readable bytes from `base`.
+        let hdr = unsafe { core::slice::from_raw_parts(base, pg::HEADER_LEN) };
+        let magic = u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
+        let count = hdr[5] as usize;
+        let size = u32::from_le_bytes([hdr[8], hdr[9], hdr[10], hdr[11]]) as usize;
+        let entries_end = pg::HEADER_LEN + count * pg::ENTRY_LEN;
+        if magic != pg::SECTION_MAGIC
+            || hdr[4] != pg::SECTION_VERSION
+            || at.checked_add(size)? > self.blob_bound
+            || !size.is_multiple_of(pg::OWNER_ALIGN)
+            || entries_end > size
+        {
+            return None;
+        }
+        // SAFETY: the whole section lies within the mapped bound.
+        let sec = unsafe { core::slice::from_raw_parts(base, size) };
+        // The previous entry's (owner, slot) and its owner's region.
+        let mut prev: Option<((u32, u8, u8), usize, usize)> = None;
+        for i in 0..count {
+            let e = &sec[pg::HEADER_LEN + i * pg::ENTRY_LEN..][..pg::ENTRY_LEN];
+            let r = |o: usize| u32::from_le_bytes([e[o], e[o + 1], e[o + 2], e[o + 3]]) as usize;
+            let key = (r(0) as u32, e[4], e[5]);
+            let (off, len, roff, rlen) = (r(12), r(16), r(20), r(24));
+            let region_end = roff.checked_add(rlen)?;
+            if off.checked_add(len)? > region_end
+                || off < roff
+                || region_end > size
+                || roff < entries_end
+                || !roff.is_multiple_of(pg::OWNER_ALIGN)
+                || !rlen.is_multiple_of(pg::PROGRAM_ALIGN)
+            {
+                return None;
+            }
+            if let Some((pkey, proff, prlen)) = prev {
+                if key <= pkey {
+                    return None;
+                }
+                let same_owner = (key.0, key.1) == (pkey.0, pkey.1);
+                if same_owner && (roff, rlen) != (proff, prlen) {
+                    return None;
+                }
+                if !same_owner && roff < proff + prlen {
+                    return None;
+                }
+            }
+            prev = Some((key, roff, rlen));
+        }
+        Some((base, size))
+    }
+
+    /// A checked program section: its base, its bytes and its entry count.
+    fn program_entries(&self) -> Option<(*const u8, &[u8], usize)> {
+        let (base, size) = self.program_section()?;
+        // SAFETY: `program_section` bounded the whole section.
+        let sec = unsafe { core::slice::from_raw_parts(base, size) };
+        Some((base, sec, sec[5] as usize))
+    }
+
+    /// The program in `slot` of the module instance `(type_hash, ordinal)`.
+    pub fn find_program(&self, type_hash: u32, ordinal: u8, slot: u8) -> Option<ProgramRef> {
+        use crate::abi::kernel_abi::program as pg;
+        let (base, sec, count) = self.program_entries()?;
+        for i in 0..count {
+            let e = &sec[pg::HEADER_LEN + i * pg::ENTRY_LEN..][..pg::ENTRY_LEN];
+            let r = |o: usize| u32::from_le_bytes([e[o], e[o + 1], e[o + 2], e[o + 3]]);
+            if r(0) != type_hash || e[4] != ordinal || e[5] != slot {
+                continue;
+            }
+            let mut format = [0u8; 32];
+            format.copy_from_slice(&e[32..64]);
+            // SAFETY: offsets were bounded by `program_section`.
+            return Some(unsafe {
+                ProgramRef {
+                    addr: base.add(r(12) as usize),
+                    size: r(16) as usize,
+                    kind: r(8),
+                    region: base.add(r(20) as usize),
+                    region_len: r(24) as usize,
+                    format,
+                }
+            });
+        }
+        None
+    }
+
+    /// The region holding every program of the module instance
+    /// `(type_hash, ordinal)`, as (base, length): what an isolated instance
+    /// is granted. `None` when it has no program.
+    pub fn program_region(&self, type_hash: u32, ordinal: u8) -> Option<(*const u8, usize)> {
+        use crate::abi::kernel_abi::program as pg;
+        let (base, sec, count) = self.program_entries()?;
+        for i in 0..count {
+            let e = &sec[pg::HEADER_LEN + i * pg::ENTRY_LEN..][..pg::ENTRY_LEN];
+            let r = |o: usize| u32::from_le_bytes([e[o], e[o + 1], e[o + 2], e[o + 3]]) as usize;
+            if r(0) as u32 == type_hash && e[4] == ordinal {
+                // SAFETY: the region was bounded by `program_section`.
+                return Some((unsafe { base.add(r(20)) }, r(24)));
+            }
+        }
+        None
     }
 
     /// Return the source this loader was initialised from.
@@ -1710,6 +1845,7 @@ impl ModuleLoader {
             MAX_MODULES_BLOB_SIZE
         };
         Self::validate_table_layout(self.table_base, bound, &header)?;
+        self.blob_bound = bound;
         log::debug!(
             "[loader] {} modules at 0x{:08x}",
             header.module_count,
@@ -1825,6 +1961,7 @@ impl ModuleLoader {
 
         self.table_base = blob;
         self.header = Some(header);
+        self.blob_bound = blob_len;
         self.source = LoadSource::Embedded;
         log::info!("[loader] {} modules from blob", header.module_count);
         Ok(())
@@ -2305,8 +2442,7 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<Signing, Loa
                         h.copy_from_slice(&d);
                         h
                     };
-                    let mut pubkey = [0u8; 32];
-                    if signing_pubkey_from_build_env(&mut pubkey) {
+                    if let Some(pubkey) = MODULE_SIGNING_ROOT {
                         if !crate::kernel::security::crypto::ed25519::verify(&pubkey, &hash, &sig) {
                             log::error!("[loader] {name}: signature invalid");
                             return Err(LoaderError::SignatureInvalid);
@@ -2912,7 +3048,7 @@ impl DynamicModule {
         // The signature sets a floor the graph cannot lower: where this
         // kernel carries a root key, a module that does not verify against it
         // runs gated or not at all.
-        if !gated && signing == Signing::Unverified && root_key_provisioned() {
+        if !gated && signing == Signing::Unverified && MODULE_SIGNING_ROOT.is_some() {
             return Err(LoaderError::BelowSigningFloor);
         }
         // Isolation this kernel cannot give is refused, never run without it.

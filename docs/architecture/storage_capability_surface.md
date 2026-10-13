@@ -30,8 +30,8 @@ compose the family; every provider declares one or more.
 |---------------------|-----------------------------------------------------------------|--------------------------------------------------------------|
 | `storage.block`     | Raw block I/O                                                   | nvme, sd (read-only), file_block, crypt_block provide; fat32, crypt_block and nbd_serve consume |
 | `file.data`         | Byte-stream file access (open, read, seek, stat, write, fsync)  | fat32 and the mount router provide; player / viewer modules consume |
-| `storage.namespace` | Name-keyed directory surface (lookup, stat, list, rename, delete, bind, subscribe) | host platform providers (§5); scanners and stores consume |
-| `storage.object`    | Whole-blob byte-addressed surface (put, get, head, range_get, delete, list) | host platform providers (§5); object_bank consumes     |
+| `storage.namespace` | Name-keyed directory surface (lookup, stat, list, rename, delete, bind, subscribe) | host platform providers and fs_object (§5); scanners and stores consume |
+| `storage.object`    | Whole-blob byte-addressed surface (put, get, head, range_get, delete, list) | host platform providers and fs_object (§5); object_bank consumes |
 
 Multipart object upload is deliberately not part of `storage.object`.
 Large writes compose via the `event.log` pattern in §4 and finalise with
@@ -70,8 +70,8 @@ Loadable modules carrying `provides = [...]` in their `manifest.toml`:
 |---------------------|-----------------------------------------------------|
 | `storage.block`     | `drivers/nvme`, `foundation/sd`, `foundation/file_block`, `foundation/crypt_block` |
 | `file.data`         | `foundation/fat32`, `foundation/mount`              |
-| `storage.namespace` | `fixtures/mem_ns` (a RAM test fixture)              |
-| `storage.object`    | no loadable module                                  |
+| `storage.namespace` | `foundation/fs_object`, `fixtures/mem_ns` (a RAM test fixture) |
+| `storage.object`    | `foundation/fs_object`                              |
 
 The hosts carry no `provides` rows: on Linux and wasm these surfaces are
 served by platform dispatchers inside the runtime (§5) rather than by
@@ -151,8 +151,8 @@ the chain-aware allowlist (`CHAIN_AWARE_PROVIDES` in
 `tools/src/config/validate.rs`): a contract on that list tolerates
 multiple providers in one graph because its callers fan through the
 providers via the `CHAIN_NEXT` flag rather than letting the last
-registration win. Nothing declares chain-awareness today, so the list is
-empty and every duplicate provider is an error.
+registration win. No contract is on the list, so every duplicate
+provider is an error.
 
 Multi-volume routing covers the `fs` contract (`file.data`) only: the
 `mount` module routes `fs` opcodes, and nothing routes
@@ -653,8 +653,8 @@ refuses it entirely rather than list what a scope hides.
 Roots come from `FLUXOR_MESH_ROOTS`: up to two comma-separated 64-hex
 Ed25519 public keys, the second for a rotation. Roots that do not parse
 fail the store, rather than open it unguarded. Without roots the store is
-an unguarded local store: `PRESENT` answers `ENOSYS` and `handle = -1` ops
-run as before. The bcm2712 store has no roots and answers `PRESENT` with
+an unguarded local store: `PRESENT` answers `ENOSYS` and an op with
+`handle = -1` is served without a grant. The bcm2712 store has no roots and answers `PRESENT` with
 `ENOSYS`.
 
 `HandleKind::Stream` is the kind issued for either `file.data` reads or
@@ -867,13 +867,45 @@ consumers share it.
 | Linux filesystem provider (`namespace.rs`) | — | served, immediate children of a directory in name order; a name that is not UTF-8 is not listed |
 | wasm (`object.rs`, `namespace.rs`) | `ENOSYS` | served by the host index, in UTF-8 byte order |
 | `mem_ns` fixture | — | served, over its binding table |
+| `fs_object` | served, by a scan of its directory | served, same scan |
 
 On bare metal, `foundation/fat32` provides `file.data` over a
 `storage.block` channel: random-access reads through the FS contract,
 reads and writes both riding `storage.block` requests on its `blocks` input
 port (typically wired from `nvme.blocks`), and directory listing served
 through the FS contract's `OPENDIR` / `READDIR`. It does not implement
-the `storage.namespace` contract.
+the `storage.namespace` contract. Every directory or FAT walk is bounded
+per call, by sectors read (`DIR_SCAN_BUDGET_SECTORS`,
+`FAT_SCAN_BUDGET_SECTORS`) and by time (`CALL_BUDGET_US`), and answers
+`EAGAIN` with its position saved, so a caller asks again with the same
+arguments; the directories a path passes through are remembered between
+calls, so one operation's paths under a long directory resolve together.
+Once mounted, it settles the volume a step at a time — the free-cluster
+summary, the clean bit, then the rename replay — and an operation that
+arrives first settles the rest before it runs.
+
+### A store over a filesystem: `fs_object`
+
+`foundation/fs_object` gives a board a store without a storage cluster:
+it provides `storage.object` and a key-shaped `storage.namespace` (`LIST`
+and `CAPS` only) over whatever serves the `fs` contract — `fat32` on bare
+metal, the host directory on Linux. Each object is one file under its
+`root` directory (default `/objects`), named by an 8.3 name drawn from 50
+bits of SHA-256 of the key, with the key, content type and etag (SHA-256
+of the body) in a header in front of the body. The name only finds the
+file; the header says whose it is, so two keys that collide are told apart
+and the second is refused `EEXIST`.
+
+| Property | Behaviour |
+| --- | --- |
+| Keys | 1..=255 bytes of UTF-8 (`STORAGE_KEY_MAX`); any other key is `EINVAL` |
+| Writes | `PUT` writes a temporary, fsyncs it and renames it over the object, answering `LocalDurable`; it needs `OPEN_CREATE`, `WRITE`, `FSYNC`, `UNLINK` and `RENAME` from the filesystem and is `ENOSYS` without them. `DELETE` unlinks and, with `FSYNC_NAME`, fences the removal |
+| Preconditions | `ANY` and `ABSENT`; `ETAG` is `ENOSYS` |
+| Crash | the old object or the new one, never a torn one; at worst a leftover temporary, which nothing reads and the next `PUT` of that key removes |
+| Pacing | a write answers `EINPROGRESS` and is asked again with the same bytes; each ask does at most one filesystem operation that walks or writes. Reads and listings answer `EAGAIN` while the filesystem does |
+| Concurrency | one write in flight (another is refused `EBUSY`) and one listing scan (another is answered `EAGAIN`); a request whose caller stops asking is superseded after `SUPERSEDE_AFTER` refusals |
+| Listing | a page of at most `PAGE_KEYS` keys in key order, resumed after a cursor, each page a `Volatile` fence; a page opens every object in the store, so it suits tens or hundreds of keys |
+| Not offered | grants (`PRESENT` is `ENOSYS`), streamed puts, change subscription, namespace `LOOKUP` / `STAT` |
 
 These are one adapter family; content-addressed, replicated, and
 object-store adapters can use the same surface vocabulary. Providers

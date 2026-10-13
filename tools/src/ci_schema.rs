@@ -68,6 +68,7 @@ const ALLOWED: &[(&str, &[&str])] = &[
     ("ci.lints.exemption", &["crate", "reason"]),
     ("ci.templates", &["dir", "vars", "template"]),
     ("ci.templates.template", &["file", "vars"]),
+    ("ci.setup", &["scripts"]),
     ("ci.test", &["scripts"]),
 ];
 
@@ -650,5 +651,23 @@ mod tests {
         assert!(e.contains("unknown key `[ci.test] script`"), "{e}");
         assert!(e.contains("keys under `[ci.test]`: scripts"), "{e}");
         assert!(!e.contains("SELF_ID"), "{e}");
+    }
+
+    /// `[ci.setup]` takes `scripts`, like `[ci.test]`, and nothing else.
+    #[test]
+    fn ci_setup_takes_scripts() {
+        let f = Fixture::new("setup");
+        f.write(
+            "fluxor.toml",
+            "[project]\nname = \"p\"\nversion = \"0\"\n[ci.setup]\nscripts = [\"a.sh\"]\n",
+        );
+        check(&f.0).unwrap();
+
+        f.write(
+            "fluxor.toml",
+            "[project]\nname = \"p\"\nversion = \"0\"\n[ci.setup]\nscript = [\"a.sh\"]\n",
+        );
+        let e = f.err();
+        assert!(e.contains("unknown key `[ci.setup] script`"), "{e}");
     }
 }

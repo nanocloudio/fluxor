@@ -348,9 +348,10 @@ fn cmd_run_dispatch(config_path: Option<&PathBuf>, flags: RunFlags, verbose: boo
     } else {
         Some(workload_src::pinned_bundle(&config_path.to_string_lossy())?)
     };
-    if let Some(bundle) = pinned.as_deref().or_else(|| {
-        workload_src::is_bundle_path(config_path).then_some(config_path.as_path())
-    }) {
+    if let Some(bundle) = pinned
+        .as_deref()
+        .or_else(|| workload_src::is_bundle_path(config_path).then_some(config_path.as_path()))
+    {
         if flags.any_scenario_flag() {
             return Err(Error::Config(
                 "fluxor run <bundle>: scenario-only flags do not apply to a workload bundle".into(),
@@ -1522,11 +1523,13 @@ fn cmd_flash(config_path: &Path, module_root: Option<&Path>, verbose: bool) -> R
     Ok(())
 }
 
-/// Generate / inspect an Ed25519 module-signing keypair. Ensures a 32-byte
-/// private seed exists at `key_path` (generated 0600 from the OS RNG if absent,
-/// or `--force`d), then prints the matching 64-hex-char PUBLIC key to stdout —
-/// the value the kernel embeds via `FLUXOR_SIGNING_PUBKEY_HEX`. Human notes go
-/// to stderr so stdout is exactly the pubkey (capturable in `$(...)`).
+/// Generate / inspect an Ed25519 signing keypair. Ensures a 32-byte private
+/// seed exists at `key_path` (generated 0600 from the OS RNG if absent, or
+/// `--force`d), then prints the matching 64-hex-char PUBLIC key to stdout —
+/// the value a kernel embeds as `FLUXOR_SIGNING_PUBKEY_HEX` (module
+/// signatures) or `FLUXOR_SLOT_ROOT_HEX` (graph-image signatures). Human
+/// notes go to stderr so stdout is exactly the pubkey (capturable in
+/// `$(...)`).
 fn cmd_keygen(key_path: &PathBuf, force: bool) -> Result<()> {
     use std::fs;
     use std::io::Write as _;
@@ -2184,6 +2187,7 @@ struct BuildFlags {
     module_root: Option<PathBuf>,
     target: Option<String>,
     epoch: u64,
+    sign_key: Option<PathBuf>,
 }
 
 /// `fluxor build` — the whole project (no argument), or one named
@@ -2197,6 +2201,7 @@ fn cmd_build_dispatch(path: Option<&PathBuf>, flags: BuildFlags, verbose: bool) 
             || flags.firmware.is_some()
             || flags.module_root.is_some()
             || flags.target.is_some()
+            || flags.sign_key.is_some()
         {
             return Err(Error::Config(
                 "`fluxor build`'s flags belong to the config form — name a config file or \
@@ -2209,6 +2214,13 @@ fn cmd_build_dispatch(path: Option<&PathBuf>, flags: BuildFlags, verbose: bool) 
             verbose,
         ));
     };
+    // Only a graph image carries a signature: asking to sign anything else
+    // is refused rather than answered with an unsigned artifact.
+    if flags.sign_key.is_some() && flags.emit.as_deref() != Some("image") {
+        return Err(Error::Config(
+            "--sign-key signs a graph image; use it with --emit=image".into(),
+        ));
+    }
     if flags.check {
         if flags.emit.is_some() {
             return Err(Error::Config(
@@ -2248,7 +2260,13 @@ fn cmd_build_dispatch(path: Option<&PathBuf>, flags: BuildFlags, verbose: bool) 
                 .as_ref()
                 .ok_or_else(|| Error::Config("--emit=combined requires --firmware <UF2>".into()))?;
             let output = require_output("combined")?;
-            cmd_combine(firmware, path, &output, flags.module_root.as_deref(), verbose)
+            cmd_combine(
+                firmware,
+                path,
+                &output,
+                flags.module_root.as_deref(),
+                verbose,
+            )
         }
         Some("image") => {
             let output = require_output("image")?;
@@ -2257,6 +2275,7 @@ fn cmd_build_dispatch(path: Option<&PathBuf>, flags: BuildFlags, verbose: bool) 
                 &output,
                 flags.target.as_deref(),
                 flags.epoch,
+                flags.sign_key.as_deref(),
                 flags.module_root.as_deref(),
                 verbose,
             )
@@ -2357,7 +2376,10 @@ mod qemu_port_tests {
 
     #[test]
     fn a_listener_not_named_http_is_forwarded() {
-        assert_eq!(ports("modules:\n  - name: conn_sink\n    port: 9000\n"), vec![9000]);
+        assert_eq!(
+            ports("modules:\n  - name: conn_sink\n    port: 9000\n"),
+            vec![9000]
+        );
     }
 
     #[test]

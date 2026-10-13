@@ -1,10 +1,10 @@
 //! A/B graph slot store (PIC module, channel-served).
 //!
 //! Owns the on-flash format of the two 512 KB OTA slots
-//! (`abi::contracts::storage::graph_slot::SLOT_{A,B}_OFFSET`). Each slot
-//! holds a full graph bundle (module table + static config) preceded by
-//! a 256-byte header. The slot with a valid magic and the higher epoch
-//! is the one the next boot selects.
+//! (`abi::platform::rp::flash_layout::GRAPH_SLOT_*`). Each slot holds a
+//! graph image: a 256-byte header, then the module table (with its program
+//! section) and the static config. Of the slots the boot selector admits,
+//! the one with the higher epoch is the one the next boot selects.
 //!
 //! ## The running slot is never written
 //!
@@ -21,9 +21,23 @@
 //! The header page — offset 0, which carries the magic and the epoch the
 //! boot selector reads — is held in RAM when it is written, not
 //! programmed. ACTIVATE checks it (epoch above the running slot's, ABI
-//! pin, SHA-256 over the bytes already in flash) and only then programs
-//! it. So a slot that was erased, half-written, or failed its digest has
-//! no magic, and the boot selector cannot pick it.
+//! pin, SHA-256 over the bytes already in flash, and on a kernel built with
+//! a slot root, the header's signature against that root) and only then
+//! programs it. So a slot that was erased, half-written, or failed a check
+//! has no magic, and the boot selector cannot pick it.
+//!
+//! ## Signed slots
+//!
+//! On a kernel built with a slot root (`FLUXOR_SLOT_ROOT_HEX`, read here
+//! through `SLOT_SIGNING_ROOT`) the boot selector admits only a slot whose
+//! header is signed by that root and whose payload matches the header's
+//! digest. This module checks the same before it activates a slot, so an
+//! ACTIVATE that succeeds is one the next boot honours. It also counts a
+//! slot live only if the selector would admit it: verifying a signature
+//! costs many steps, so it starts from the slots this boot's selector
+//! admitted (`SLOT_ADMITTED`) and tracks the changes it makes itself --
+//! a slot it erases or writes into leaves the set, a slot it activates
+//! joins it. A slot planted in flash by other means is never counted.
 //!
 //! ## Channel protocol
 //!
@@ -91,6 +105,14 @@ use abi::SyscallTable;
 
 include!("../../sdk/runtime.rs");
 include!("../../sdk/crypto/sha256.rs");
+// Ed25519 for slot signatures, verified a few bits a step as TLS verifies
+// it (`ed25519_job.rs`): `ed25519.rs` needs SHA-512 (`sha384.rs`) and the
+// field helpers in `p256.rs` (which needs `hmac.rs`) in scope.
+include!("../../sdk/crypto/sha384.rs");
+include!("../../sdk/crypto/hmac.rs");
+include!("../../sdk/crypto/p256.rs");
+include!("../../sdk/crypto/ed25519.rs");
+include!("../tls/ed25519_job.rs");
 
 // ============================================================================
 // Constants
@@ -167,6 +189,18 @@ struct State {
     act_cursor: u32,
     act_remaining: u32,
     act_hasher: Sha256,
+    /// The root slots must be signed by, from the kernel; `has_root` 0 when
+    /// it was built with none, which checks no signature.
+    root: [u8; 32],
+    has_root: u8,
+    /// Under a root, the slots known to be signed by it and to match their
+    /// digest (bit 0 = A, bit 1 = B): those the kernel's boot selector
+    /// admitted, less any since erased or written into, plus any this module
+    /// has activated. A slot outside it is no more live here than it is to
+    /// the next boot.
+    admitted: u8,
+    /// The signature check of an ACTIVATE under way.
+    act_sig: Ed25519VerifyJob,
 }
 
 // ============================================================================
@@ -206,6 +240,11 @@ unsafe fn decode_header(base_xip: *const u8) -> Option<HeaderFields> {
     let config_offset = read_u32_le(base_xip.add(24));
     let config_size = read_u32_le(base_xip.add(28));
 
+    // As the boot selector: a module table is at least its 16-byte
+    // header, and both regions lie inside the slot.
+    if modules_size < 16 {
+        return None;
+    }
     if (modules_offset as u64) + (modules_size as u64) > SLOT_SIZE as u64 {
         return None;
     }
@@ -230,6 +269,12 @@ unsafe fn decode_header(base_xip: *const u8) -> Option<HeaderFields> {
     })
 }
 
+/// Whether the boot selector would take `slot` (at `base`): its pin matches,
+/// and under a root it is one known to be signed.
+unsafe fn slot_admits(s: &State, slot: u8, base: *const u8) -> bool {
+    slot_pin_admits(base, &s.own_digest) && (s.has_root == 0 || s.admitted & (1 << slot) != 0)
+}
+
 unsafe fn refresh_live(s: &mut State) {
     let a = (XIP_BASE + SLOT_A_OFFSET) as *const u8;
     let b = (XIP_BASE + SLOT_B_OFFSET) as *const u8;
@@ -237,8 +282,8 @@ unsafe fn refresh_live(s: &mut State) {
     // kernel would reject at reboot must never be reported live (or have
     // its config served) here either — an incompatible higher-epoch slot
     // left behind by an older writer is invisible, not authoritative.
-    let ha = decode_header(a).filter(|_| slot_pin_admits(a, &s.own_digest));
-    let hb = decode_header(b).filter(|_| slot_pin_admits(b, &s.own_digest));
+    let ha = decode_header(a).filter(|_| slot_admits(s, 0, a));
+    let hb = decode_header(b).filter(|_| slot_admits(s, 1, b));
     match (ha, hb) {
         (Some(ha), Some(hb)) => {
             if ha.epoch >= hb.epoch {
@@ -332,7 +377,7 @@ unsafe fn epoch_to_beat(s: &State, pending: u8) -> Option<u64> {
     let other = inactive_slot(pending);
     let base = (XIP_BASE + slot_offset(other)) as *const u8;
     decode_header(base)
-        .filter(|_| slot_pin_admits(base, &s.own_digest))
+        .filter(|_| slot_admits(s, other, base))
         .map(|h| h.epoch)
 }
 
@@ -380,7 +425,9 @@ const BLANK_CHECKS_PER_STEP: u32 = 2;
 unsafe fn do_erase(s: &mut State, _sys: &SyscallTable) -> i32 {
     s.header_held = 0;
     s.activated = 0xFF;
-    let target = slot_offset(pending_slot(s));
+    let pending = pending_slot(s);
+    s.admitted &= !(1 << pending);
+    let target = slot_offset(pending);
     s.erase_next = target;
     s.erase_end = target + SLOT_SIZE;
     ERASE_UNDER_WAY
@@ -446,7 +493,14 @@ unsafe fn do_write(
         s.header_held = 1;
         return 0;
     }
-    let target = slot_offset(pending_slot(s)) + in_slot_off;
+    // The slot's payload changes, so it no longer matches whatever header
+    // was activated or admitted over it.
+    let pending = pending_slot(s);
+    s.admitted &= !(1 << pending);
+    if s.activated == pending {
+        s.activated = 0xFF;
+    }
+    let target = slot_offset(pending) + in_slot_off;
     sys_program_page(sys, target, payload.add(4))
 }
 
@@ -528,11 +582,16 @@ const ACTIVATE_UNDER_WAY: i32 = 1;
 const ACT_IDLE: u8 = 0;
 const ACT_MODULES: u8 = 1;
 const ACT_CONFIG: u8 = 2;
+const ACT_SIGN: u8 = 3;
+/// Walk bits of the signature check per step.
+const SIG_BITS_PER_STEP: u8 = 4;
 /// Bytes of the slot hashed per step.
 const ACT_WINDOW: u32 = 4096;
 
-/// One step of an ACTIVATE under way: hash the next window, and once the
-/// whole image is hashed, decide. Answers whether it is still under way.
+/// One step of an ACTIVATE under way: hash the next window; once the whole
+/// payload is hashed, compare it with the header's digest; under a root,
+/// verify the header's signature a few bits a step; then program the
+/// header. Answers whether it is still under way.
 unsafe fn activate_step(s: &mut State, sys: &SyscallTable) -> bool {
     let base_xip = (XIP_BASE + slot_offset(s.act_slot)) as *const u8;
     if s.act_remaining > 0 {
@@ -555,18 +614,86 @@ unsafe fn activate_step(s: &mut State, sys: &SyscallTable) -> bool {
         s.act_remaining = hdr.config_size;
         return true;
     }
+    if s.act_phase == ACT_CONFIG {
+        // The payload is hashed: it must be what the header names, since a
+        // signature over the header vouches for the payload only through
+        // that digest.
+        let out = s.act_hasher.clone().finalize();
+        if !ct_eq32(&out, &hdr.sha256) {
+            s.act_phase = ACT_IDLE;
+            emit_response(s, sys, REQ_ACTIVATE, E_IO);
+            return false;
+        }
+        if s.has_root != 0 {
+            match signature_job(s) {
+                Some(job) => {
+                    s.act_sig = job;
+                    s.act_phase = ACT_SIGN;
+                    return true;
+                }
+                None => {
+                    s.act_phase = ACT_IDLE;
+                    say_refused(sys);
+                    emit_response(s, sys, REQ_ACTIVATE, E_ACCES);
+                    return false;
+                }
+            }
+        }
+    }
+    if s.act_phase == ACT_SIGN {
+        if !s.act_sig.step() {
+            return true;
+        }
+        if !ed25519_verify_finalise(&s.act_sig) {
+            s.act_phase = ACT_IDLE;
+            say_refused(sys);
+            emit_response(s, sys, REQ_ACTIVATE, E_ACCES);
+            return false;
+        }
+    }
     s.act_phase = ACT_IDLE;
     let rc = activate_finish(s, sys, &hdr);
     emit_response(s, sys, REQ_ACTIVATE, rc);
     false
 }
 
-/// The image is hashed: compare, and program the header if it matches.
-unsafe fn activate_finish(s: &mut State, sys: &SyscallTable, hdr: &HeaderFields) -> i32 {
-    let out = s.act_hasher.clone().finalize();
-    if !ct_eq32(&out, &hdr.sha256) {
-        return E_IO;
+/// A slot whose signature does not answer to the root is refused.
+const E_ACCES: i32 = -13;
+
+/// The signature check for the held header, begun: its record names the
+/// root's key and carries a signature over the header's signed bytes.
+/// `None` for a header with no record, one for another key, or a
+/// signature whose `S` is not below the group order.
+fn signature_job(s: &State) -> Option<Ed25519VerifyJob> {
+    use abi::platform::rp::flash_layout as fl;
+    let h = &s.header;
+    let at = fl::GRAPH_SLOT_SIGNATURE_OFFSET;
+    let magic = u32::from_le_bytes([h[at], h[at + 1], h[at + 2], h[at + 3]]);
+    if magic != fl::GRAPH_SLOT_SIGNATURE_MAGIC {
+        return None;
     }
+    let id = sha256(&s.root);
+    if h[at + 4..at + 8] != id[..4] {
+        return None;
+    }
+    let mut sig = [0u8; 64];
+    sig.copy_from_slice(&h[at + 8..at + 72]);
+    ed25519_verify_init(
+        &s.root,
+        &h[..fl::GRAPH_SLOT_SIGNED_LEN],
+        &sig,
+        SIG_BITS_PER_STEP,
+    )
+}
+
+unsafe fn say_refused(sys: &SyscallTable) {
+    let mut line = Line::new();
+    line.put(b"[graph_slot] refused: signature");
+    line.emit(sys);
+}
+
+/// The slot checks out: program its header, so the next boot selects it.
+unsafe fn activate_finish(s: &mut State, sys: &SyscallTable, hdr: &HeaderFields) -> i32 {
     let candidate = s.act_slot;
     let header = s.header.as_ptr();
 
@@ -575,6 +702,8 @@ unsafe fn activate_finish(s: &mut State, sys: &SyscallTable, hdr: &HeaderFields)
         return rc;
     }
     s.header_held = 0;
+    // Its digest, and under a root its signature, were checked above.
+    s.admitted |= 1 << candidate;
     refresh_live(s);
     if s.live_slot != candidate {
         return E_IO;
@@ -855,6 +984,26 @@ pub extern "C" fn module_new(
         s.act_cursor = 0;
         s.act_remaining = 0;
         core::ptr::write(&mut s.act_hasher, Sha256::new());
+        core::ptr::write(&mut s.act_sig, Ed25519VerifyJob::empty());
+        // The slot root the kernel was built with, if any.
+        let mut root = [0u8; 32];
+        let rc = ((*s.syscalls).provider_call)(
+            -1,
+            abi::kernel_abi::SLOT_SIGNING_ROOT,
+            root.as_mut_ptr(),
+            32,
+        );
+        s.root = root;
+        s.has_root = u8::from(rc == 32);
+        let admitted = ((*s.syscalls).provider_call)(
+            -1,
+            abi::kernel_abi::SLOT_ADMITTED,
+            core::ptr::null_mut(),
+            0,
+        );
+        // Under a root, a kernel that cannot say which slots it admitted
+        // leaves none counted live rather than all.
+        s.admitted = if admitted >= 0 { admitted as u8 & 3 } else { 0 };
         refresh_live(s);
         0
     }
@@ -884,6 +1033,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             line.slot(s.running_slot);
             line.put(b" next=");
             line.slot(s.live_slot);
+            if s.has_root != 0 {
+                // Slots must be signed by the firmware's root.
+                line.put(b" signed");
+            }
             line.emit(sys);
             return READY;
         }

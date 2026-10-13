@@ -27,6 +27,9 @@ pub enum RegionModel {
 pub enum Access {
     /// Read and execute: code, the gateway's veneers.
     ReadExec,
+    /// Read only, never execute: data a module owns but must not change or
+    /// run, such as the programs its bundle carries for it.
+    Read,
     /// Read and write, never execute: state, heap, stack.
     ReadWrite,
     /// Device registers: read and write, never execute, device ordering.

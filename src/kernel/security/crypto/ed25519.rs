@@ -2,8 +2,9 @@
 //!
 //! Ported from TweetNaCl (public domain, Bernstein/Janssen/Lange/Schwabe/others),
 //! which is the reference small-footprint implementation. Pure Rust, no_std,
-//! no external dependencies. `verify` is used by the loader to check
-//! per-module signatures before PIC code is admitted; `sign` /
+//! no external dependencies. `verify` checks module signatures before the
+//! loader admits PIC code, graph-image signatures at boot, store records and
+//! USB recovery requests; it is strict (see [`verify`]). `sign` /
 //! `public_key` back the key_vault Ed25519 `key_type` (software backend).
 //!
 //! Field arithmetic is over GF(2^255 - 19) using a 16-limb signed
@@ -288,6 +289,12 @@ fn unpack_neg(r: &mut Point, p: &[u8; 32]) -> bool {
     if neq25519(&chk, &num) {
         return false;
     }
+    // x = 0 has one encoding, with the sign bit clear (RFC 8032 §5.1.3).
+    let mut x_bytes = [0u8; 32];
+    pack25519(&mut x_bytes, &r[0]);
+    if x_bytes == [0u8; 32] && p[31] >> 7 == 1 {
+        return false;
+    }
     // Negate if the parity matches the sign bit (so we can add -A in verify).
     if par25519(&r[0]) == (p[31] >> 7) {
         let r0_copy = r[0];
@@ -459,10 +466,78 @@ fn ct_eq_32(a: &[u8; 32], b: &[u8; 32]) -> bool {
     }
     d == 0
 }
+/// p = 2^255 - 19, little-endian.
+const P_BYTES: [u8; 32] = {
+    let mut p = [0xffu8; 32];
+    p[0] = 0xed;
+    p[31] = 0x7f;
+    p
+};
+
+/// The encoding of the identity: y = 1, x = 0.
+const IDENTITY: [u8; 32] = {
+    let mut e = [0u8; 32];
+    e[0] = 1;
+    e
+};
+
+/// Whether little-endian `a` is below little-endian `b`.
+fn below(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    for i in (0..32).rev() {
+        if a[i] != b[i] {
+            return a[i] < b[i];
+        }
+    }
+    false
+}
+
+/// Whether `p`'s order divides 8: [8]P is the identity. The addition law is
+/// complete, so adding a point to itself doubles it.
+fn is_small_order(p: &Point) -> bool {
+    let mut q = *p;
+    for _ in 0..3 {
+        let c = q;
+        point_add(&mut q, &c);
+    }
+    let mut e = [0u8; 32];
+    pack_point(&mut e, &q);
+    e == IDENTITY
+}
+
+/// Verify a 64-byte signature `R ‖ S` over `msg` (RFC 8032 §5.1.7, the
+/// unbatched equation [S]B = R + [k]A). Variable-time: every input is
+/// public. Strict, with the same rules as the SDK verifier
+/// (`modules/sdk/crypto/ed25519.rs`), so a signature verifies in the kernel
+/// exactly when it verifies in a module. It is refused when:
+///   - S ≥ L (a second encoding of the same signature),
+///   - A's y is not canonical (≥ p), A is off the curve, or A encodes x = 0
+///     with the sign bit set,
+///   - A or R has order dividing 8, for which forgeries are trivial.
+///
+/// R's encoding needs no separate check: the computed point is packed
+/// canonically and compared with R's bytes, so a non-canonical R never
+/// matches.
 pub fn verify(public_key: &[u8; 32], msg: &[u8], signature: &[u8; 64]) -> bool {
+    let mut s_bytes = [0u8; 32];
+    s_bytes.copy_from_slice(&signature[32..]);
+    let l: [u8; 32] = core::array::from_fn(|i| L[i] as u8);
+    if !below(&s_bytes, &l) {
+        return false;
+    }
+    let mut a_y = *public_key;
+    a_y[31] &= 0x7f;
+    if !below(&a_y, &P_BYTES) {
+        return false;
+    }
     // Unpack -A (tweetnacl negates during unpack so we can add instead of subtract).
     let mut q: Point = [GF0; 4];
-    if !unpack_neg(&mut q, public_key) {
+    if !unpack_neg(&mut q, public_key) || is_small_order(&q) {
+        return false;
+    }
+    let mut r_enc = [0u8; 32];
+    r_enc.copy_from_slice(&signature[..32]);
+    let mut r_point: Point = [GF0; 4];
+    if !unpack_neg(&mut r_point, &r_enc) || is_small_order(&r_point) {
         return false;
     }
     // h = SHA-512(R || A || M), reduced mod L.
@@ -477,15 +552,11 @@ pub fn verify(public_key: &[u8; 32], msg: &[u8], signature: &[u8; 64]) -> bool {
     scalarmult(&mut p, &q, &h_reduced);
     // q = s * B
     let mut sb: Point = [GF0; 4];
-    let mut s_bytes = [0u8; 32];
-    s_bytes.copy_from_slice(&signature[32..]);
     scalarbase(&mut sb, &s_bytes);
     // p = p + q = h*(-A) + s*B
     point_add(&mut p, &sb);
     // Pack and compare to R.
     let mut t = [0u8; 32];
     pack_point(&mut t, &p);
-    let mut r = [0u8; 32];
-    r.copy_from_slice(&signature[..32]);
-    ct_eq_32(&r, &t)
+    ct_eq_32(&r_enc, &t)
 }

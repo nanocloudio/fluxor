@@ -1119,6 +1119,43 @@ pub fn module_type_hash(idx: usize) -> u32 {
     unsafe { SCHED.type_hash[idx] }
 }
 
+/// The owner the bundle's program section names the module in slot `idx`
+/// by: its type and its ordinal among the modules of that type in lower
+/// slots, which is the order the packer counts instances in
+/// (`tools/src/modules.rs::collect_programs`). `None` for an empty slot.
+fn program_owner(idx: usize) -> Option<(u32, u8)> {
+    if idx >= MAX_MODULES {
+        return None;
+    }
+    let ty = module_type_hash(idx);
+    if ty == 0 {
+        return None;
+    }
+    let mut ordinal = 0u8;
+    for j in 0..idx {
+        if module_type_hash(j) == ty {
+            ordinal = ordinal.checked_add(1)?;
+        }
+    }
+    Some((ty, ordinal))
+}
+
+/// The program in `slot` that the bundle carries for the module in slot
+/// `idx`.
+pub fn module_program(idx: usize, slot: u8) -> Option<crate::kernel::module::loader::ProgramRef> {
+    let (ty, ordinal) = program_owner(idx)?;
+    // SAFETY: scheduler-thread read of the loader, which is set at boot.
+    unsafe { static_storage::static_loader() }.find_program(ty, ordinal, slot)
+}
+
+/// The region holding every program the bundle carries for the module in
+/// slot `idx`, as (base, length): what the module is granted when isolated.
+pub fn module_program_region(idx: usize) -> Option<(*const u8, usize)> {
+    let (ty, ordinal) = program_owner(idx)?;
+    // SAFETY: scheduler-thread read of the loader, which is set at boot.
+    unsafe { static_storage::static_loader() }.program_region(ty, ordinal)
+}
+
 /// The generation of slot `idx`: bumped whenever the slot is reset,
 /// restarted or given another module, so a pair (slot, generation) names
 /// one module occupancy.

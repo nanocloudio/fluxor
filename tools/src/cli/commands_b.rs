@@ -1137,11 +1137,7 @@ fn inspect_config(config_path: &Path, project_root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn cmd_mktable_config(
-    config_path: &Path,
-    module_root: Option<&Path>,
-    output: &Path,
-) -> Result<()> {
+fn cmd_mktable_config(config_path: &Path, module_root: Option<&Path>, output: &Path) -> Result<()> {
     let content = substitute_env_vars(&std::fs::read_to_string(config_path)?)?;
     let mut config: serde_json::Value = if config_path
         .extension()
@@ -1177,7 +1173,8 @@ fn cmd_mktable_config(
     // All-builtin configs (e.g. linux_display + host_image_codec) leave
     // `modules` empty; emit a valid 16-byte header-only table so the
     // host loader sees module_count=0 and instantiates only built-ins.
-    let table = build_module_table(&modules)?;
+    let programs = crate::modules::collect_programs(&config)?;
+    let table = crate::modules::build_module_table_with_programs(&modules, &programs)?;
     std::fs::write(output, &table)?;
 
     println!(

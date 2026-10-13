@@ -44,6 +44,7 @@ state to enforce, and loads modules at the level the graph gives them.
 | Its private region | read, write, never execute | One allocation, laid out `[stack \| state \| heap]` |
 | The gateway | read, execute | The veneer table it was handed as its `SyscallTable` |
 | Its device window | read, write, device ordering | Only if the graph grants one (see below) |
+| Its programs | read, never execute | Only if the graph gives it programs (see below) |
 
 Nothing else is mapped for it: kernel memory, other modules, channel buffers
 and peripherals all fault. The fault is attributed to the module, reported as
@@ -79,8 +80,10 @@ module controls. Before dispatch it checks every call three ways:
 | Handles | Every provider handle is one the gateway minted for this caller | `EACCES` |
 
 Provider opcodes pass through a default-deny rule table:
-- The time, entropy, log, telemetry, report, event, arena and `storage.object`
-  opcodes are listed, each with its direction and handle kind.
+- The time, entropy, log, telemetry, report, event, arena, program
+  (`PROGRAM_INFO`, `PROGRAM_READ`), slot (`SLOT_SIGNING_ROOT`,
+  `SLOT_ADMITTED`) and `storage.object` opcodes are listed, each with its
+  direction and handle kind.
 - An opcode the table does not name is refused with `EACCES`.
 - A struct that carries pointers (the `storage.object` `PUT`, `HEAD`,
   `RANGE_GET`, `DELETE` and `LIST` requests) is copied into kernel memory,
@@ -139,7 +142,7 @@ state and stack budgets.
 | | rp2040 (Cortex-M0+) | rp2350 (Cortex-M33) | bcm2712 (Cortex-A76) |
 |---|---|---|---|
 | Mechanism | PMSAv7 MPU, thread unprivileged | PMSAv8 MPU, thread unprivileged | EL0 under a per-module page table and ASID |
-| Regions per module | code, gateway, private (+ window) | code, gateway, private (+ window) | pages |
+| Regions per module | code, gateway, private (+ window, + programs) | code, gateway, private (+ window, + programs) | pages |
 | Stack bound | the end of the private region (HardFault) | `PSPLIM` | an unmapped guard page under a 64 KiB stack |
 | Forced out at deadline | PendSV from the step-guard alarm | PendSV from the step-guard alarm | lower-EL IRQ |
 | Trap | SVC, PendSV and faults enter one trap; the kernel serves it in privileged thread mode | same | SVC from EL0; dispatch under the kernel's table with IRQs open |
@@ -189,6 +192,30 @@ On rp2350, ACCESSCTRL is a second layer under the MPU:
 - A block's unprivileged bit is set again only while a gated module holds it
   as its window, and cleared when that module is released.
 - An MPU mistake therefore still cannot reach a peripheral.
+
+## Programs
+
+The programs a graph gives a module instance (see
+[module_architecture.md](module_architecture.md#programs)) sit together in
+one region of the bundle's program section, and an isolated module is
+granted exactly that region, read-only and never executable, so it reads
+them in place and reaches no other owner's:
+
+- **rp2350.** One MPU region over exactly the region's span, which is
+  32-byte granular at both ends; a read past its end faults.
+- **rp2040.** One MPU region, which PMSAv7 can draw only as a power of
+  two aligned to its size with eighths disabled. A region it cannot draw
+  exactly is refused, and the module is not loaded.
+- **bcm2712.** The region's pages, EL0 read-only and never executable.
+  The region starts on a page and the next owner's starts on a later
+  page, so the tail of its last page is its own padding; a region that
+  does not start on a page is refused and the module is not loaded.
+
+The loader grants a region only from a section whose layout it has
+checked: entries in owner order, every owner's programs inside one
+region, and regions disjoint and starting on 4 KiB boundaries. A
+`contained` module on an RP die reads all of flash, its programs
+included, and gets no separate region.
 
 ## Liveness
 

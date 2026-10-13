@@ -58,8 +58,9 @@ pub mod channel {
     /// Payload: `[offset_in_slot: u32 LE][page: 256 bytes]` (260 bytes).
     pub const REQ_WRITE: u32 = super::fnv1a_const(b"gs.write");
     /// Check the non-running slot (epoch above the running slot's, ABI pin,
-    /// SHA-256 over its bytes) and, if valid, program its header so the
-    /// next boot selects it. Payload: empty.
+    /// SHA-256 over its bytes, and — on a firmware built with a slot root —
+    /// the header's signature by that root) and, if valid, program its header
+    /// so the next boot selects it. Payload: empty.
     pub const REQ_ACTIVATE: u32 = super::fnv1a_const(b"gs.activate");
     /// Query which slot the next boot selects. Payload: empty.
     pub const REQ_ACTIVE: u32 = super::fnv1a_const(b"gs.query_active");

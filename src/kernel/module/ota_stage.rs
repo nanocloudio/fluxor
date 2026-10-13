@@ -6,11 +6,16 @@
 //! the inactive one of two RAM staging buffers via `OTA_STAGE_WRITE`,
 //! then commits it with `OTA_STAGE_CTRL`. Commit validates the image —
 //! header shape, SHA-256 over the payload, ABI-surface pin against the
-//! running kernel, epoch monotonicity — flips the region executable
-//! (cache maintenance / page permissions via `hal::ota_stage_protect`),
-//! re-points the static loader + config at the staged blobs
-//! (`populate_static_state_with_len`, the same population boot uses)
-//! and requests a graph rebuild through the proven rebuild bridge.
+//! running kernel, on a kernel built with a slot root its signature
+//! (`security::slot_signature`), and an epoch above the live one — flips
+//! the region executable (cache maintenance / page permissions via
+//! `hal::ota_stage_protect`), re-points the static loader + config at the
+//! staged blobs (`populate_static_state_with_len`, the same population
+//! boot uses) and requests a graph rebuild through the rebuild bridge.
+//!
+//! The live epoch is RAM state that starts at 0 each boot: an image must
+//! beat the last one committed since boot, so refusing an older epoch holds
+//! within a boot, not across one.
 //!
 //! Two buffers alternate (A/B in RAM): after a commit the staged buffer
 //! IS the live modules region, so the next update stages into the other
@@ -32,18 +37,15 @@ use crate::kernel::sys::hal;
 /// realistic graph bundle.
 pub const STAGE_CAPACITY: usize = 8 * 1024 * 1024;
 
-// FXSL graph-image header layout. Format-pinned to the header the
-// pack tool emits (`fluxor build --emit=image`, tools/src/cli/
-// commands_a.rs::cmd_graph_image) and the RP boot slot selector reads
-// (`modules/sdk/platform/rp/flash_layout.rs` — an RP flash A/B slot
-// holds exactly this image format; "FXSL" is a fixed on-disk constant
-// and its mnemonic does not describe the format). The constants are
-// restated here because this surface
-// compiles on targets that do not mount the RP platform tables.
-const IMAGE_MAGIC: u32 = 0x4C53_5846; // "FXSL"
-const IMAGE_VERSION: u8 = 1;
-const IMAGE_HEADER_SIZE: usize = 256;
-const IMAGE_ABI_SURFACE_OFFSET: usize = 64;
+// The graph-image header: the format `fluxor build --emit=image` writes
+// (tools/src/cli/commands_a.rs::cmd_graph_image) and an RP flash slot
+// holds, defined once in `modules/sdk/platform/rp/flash_layout.rs`
+// (`GRAPH_SLOT_*`). The RAM stage holds the same image unpadded.
+use crate::abi::platform::rp::flash_layout as image_layout;
+const IMAGE_MAGIC: u32 = image_layout::GRAPH_SLOT_MAGIC;
+const IMAGE_VERSION: u8 = image_layout::GRAPH_SLOT_VERSION;
+const IMAGE_HEADER_SIZE: usize = image_layout::GRAPH_SLOT_HEADER_SIZE;
+const IMAGE_ABI_SURFACE_OFFSET: usize = image_layout::GRAPH_SLOT_ABI_SURFACE_OFFSET;
 
 /// Page-aligned staging buffer. 16 KiB covers the largest page size a
 /// hosted kernel uses (Raspberry Pi OS aarch64 runs 16 KiB pages, and
@@ -205,6 +207,16 @@ fn commit() -> i32 {
         log::error!(
             "[ota] commit: ABI-surface pin mismatch (rebuild the image against this kernel)"
         );
+        return errno::EACCES;
+    }
+
+    // Signature: a kernel built with a slot root stages only an image signed
+    // by it. The signature covers the header, and through the digest checked
+    // above, the payload; validation and the load below read the same
+    // buffer, which nothing writes until the next stage begins in the other.
+    let root = crate::kernel::security::slot_signature::slot_root();
+    if let Err(why) = crate::kernel::security::slot_signature::admits(image, root.as_ref()) {
+        log::error!("[ota] commit: image refused: {why:?}");
         return errno::EACCES;
     }
 

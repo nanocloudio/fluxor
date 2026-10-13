@@ -1058,7 +1058,8 @@ fn privileged_op_permission(op: u32) -> Option<u16> {
         // ARENA_GET / BIND_IRQ / REPORT_LATENCY family, LOG_WRITE,
         // HANDLE_POLL, RANDOM_FILL, SYS_CLOCK_HZ, paged-arena GET/PREFAULT,
         // BOOT_INCARNATION.
-        0x0C2F // BOOT_INCARNATION
+        0x0C2B..=0x0C2E // PROGRAM_INFO / PROGRAM_READ / SLOT_SIGNING_ROOT / SLOT_ADMITTED
+        | 0x0C2F // BOOT_INCARNATION
         | 0x0C30
         | 0x0C31
         | 0x0C33
@@ -1617,6 +1618,76 @@ unsafe fn resolve_register_target(arg: *mut u8, arg_len: usize) -> Option<(usize
     Some((resolved, state))
 }
 
+/// `PROGRAM_INFO`, `PROGRAM_READ`, `SLOT_SIGNING_ROOT` and `SLOT_ADMITTED`:
+/// the calling module's own programs, the root graph slots are signed
+/// against, and the slots this boot admitted. A module names a program only
+/// by its slot among its own; whose programs they are comes from which module
+/// is running, never from the request.
+unsafe fn handle_program_op(opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
+    use crate::abi::kernel_abi::{
+        program as pg, PROGRAM_INFO, PROGRAM_READ, SLOT_ADMITTED, SLOT_SIGNING_ROOT,
+    };
+    use crate::kernel::exec::scheduler;
+    if opcode == SLOT_ADMITTED {
+        #[cfg(feature = "rp")]
+        return i32::from(crate::kernel::boot::config::admitted_slots());
+        #[cfg(not(feature = "rp"))]
+        return errno::ENOSYS;
+    }
+    // The least each op's buffer must hold: the root; the program's
+    // description; a read's request `[slot][0; 3][offset: u32 LE]`.
+    let need = match opcode {
+        SLOT_SIGNING_ROOT => 32,
+        PROGRAM_INFO => pg::INFO_LEN,
+        PROGRAM_READ => 8,
+        _ => return errno::ENOSYS,
+    };
+    if arg.is_null() || arg_len < need {
+        return E_INVAL;
+    }
+    if opcode == SLOT_SIGNING_ROOT {
+        return match crate::kernel::security::slot_signature::slot_root() {
+            Some(root) => {
+                core::ptr::copy_nonoverlapping(root.as_ptr(), arg, 32);
+                32
+            }
+            None => errno::ENOENT,
+        };
+    }
+    let slot = *arg;
+    let Some(p) = scheduler::module_program(scheduler::current_module_index(), slot) else {
+        return errno::ENOENT;
+    };
+    if opcode == PROGRAM_INFO {
+        // Where the module may read the bytes in place; 0 where it cannot
+        // dereference kernel memory and reads through PROGRAM_READ instead.
+        let (addr, region) = if cfg!(target_arch = "wasm32") {
+            (0u64, 0u64)
+        } else {
+            (p.addr as usize as u64, p.region as usize as u64)
+        };
+        let out = core::slice::from_raw_parts_mut(arg, pg::INFO_LEN);
+        out.fill(0);
+        out[0..8].copy_from_slice(&addr.to_le_bytes());
+        out[8..12].copy_from_slice(&(p.size as u32).to_le_bytes());
+        out[12..16].copy_from_slice(&p.kind.to_le_bytes());
+        out[16..24].copy_from_slice(&region.to_le_bytes());
+        out[24..28].copy_from_slice(&(p.region_len as u32).to_le_bytes());
+        out[32..64].copy_from_slice(&p.format);
+        return pg::INFO_LEN as i32;
+    }
+    let offset = u32::from_le_bytes([*arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7)]) as usize;
+    if offset >= p.size {
+        return 0;
+    }
+    let n = (p.size - offset).min(arg_len).min(i32::MAX as usize);
+    // SAFETY: `offset + n <= size`, inside the section the loader bounded;
+    // the caller's buffer holds `arg_len >= n` bytes, and the request in it
+    // was read above, before it is overwritten.
+    core::ptr::copy_nonoverlapping(p.addr.add(offset), arg, n);
+    n as i32
+}
+
 unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
     use crate::abi::contracts::resource;
     use crate::abi::contracts::telemetry;
@@ -1649,6 +1720,10 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
         | MODULE_FLOW_BUDGET
         | bridge::SELF_BRIDGES
         | monitor::ISR_METRICS => handle_core_primitive(handle, opcode, arg, arg_len),
+        crate::abi::kernel_abi::PROGRAM_INFO
+        | crate::abi::kernel_abi::PROGRAM_READ
+        | crate::abi::kernel_abi::SLOT_SIGNING_ROOT
+        | crate::abi::kernel_abi::SLOT_ADMITTED => handle_program_op(opcode, arg, arg_len),
         // ── Telemetry ring. The
         //    OBSERVE gate for the consumer ops is applied upstream by
         //    `check_privileged_internal_op`; TLM_EMIT is ungated. ──
@@ -2545,10 +2620,9 @@ unsafe fn kernel_query_dispatch(handle: i32, key: u32, out: *mut u8, out_len: us
             dev_query_key::HEAP_STATS => {
                 // Accept any `out_len >= HEAP_STATS_MIN` and copy up
                 // to `out_len` bytes from the struct, returning the
-                // actual bytes written. This lets the SDK grow the
-                // `HeapStats` struct forward without breaking
-                // pre-existing PIC modules whose SDK helper passes
-                // only a 16-byte prefix buffer.
+                // actual bytes written: a module whose buffer holds
+                // only a prefix of `HeapStats` is answered with that
+                // prefix, so the struct can grow at its end.
                 const HEAP_STATS_MIN: usize = 16;
                 let stats_size = core::mem::size_of::<crate::kernel::mem::heap::HeapStats>();
                 if out.is_null() || out_len < HEAP_STATS_MIN {

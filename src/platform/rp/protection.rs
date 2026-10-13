@@ -41,7 +41,7 @@
 //! and the privilege drop.
 //!
 //! Anything else that traps with the core privileged, or on MSP, is the
-//! kernel's own fault and parks the node as before.
+//! kernel's own fault and parks the node.
 
 use portable_atomic::{AtomicU32, Ordering};
 
@@ -64,6 +64,11 @@ pub const MODEL: RegionModel = if chip::ISOLATION_PMSAV8 {
 /// Bytes an exception frame takes on a gated module's stack: the basic
 /// frame and the alignment pad (the FPU is off, so never the extended frame).
 pub const EXCEPTION_FRAME_BYTES: usize = 32 + 4;
+
+/// CFSR.MMARVALID: MMFAR holds the address of the MemManage fault.
+const CFSR_MMARVALID: u32 = 1 << 7;
+/// CFSR.STKOF (UFSR bit 4): a stack-limit (PSPLIM/MSPLIM) violation.
+const CFSR_STKOF: u32 = 1 << 20;
 
 mod reg {
     pub const ICSR: usize = 0xE000_ED04;
@@ -170,9 +175,9 @@ pub fn gateway_table() -> *const crate::abi::SyscallTable {
 
 // ── Per-module domains ──────────────────────────────────────────────
 
-/// Most regions any gated module needs: code, gateway block, private region
-/// and a device window.
-const DOMAIN_REGIONS: usize = 4;
+/// Most regions any gated module needs: code, gateway block, private region,
+/// a device window, and its programs.
+const DOMAIN_REGIONS: usize = 5;
 
 /// A module's domain as the MPU is programmed with it: each region's two
 /// register values (RBAR, and RLAR on PMSAv8 or RASR on PMSAv7), encoded
@@ -251,6 +256,7 @@ fn encode(rg: &fluxor_contracts::isolation::Region) -> (u32, u32) {
         // RBAR: base | SH=0 | AP | XN;  RLAR: limit | AttrIndx | EN.
         let (ap, xn) = match rg.access {
             Access::ReadExec => (0b11, 0),  // RO, any privilege
+            Access::Read => (0b11, 1),      // RO, any privilege, never execute
             Access::ReadWrite => (0b01, 1), // RW, any privilege
             Access::Device => (0b01, 1),
             Access::Guard => (0b00, 1), // RW privileged only
@@ -265,6 +271,7 @@ fn encode(rg: &fluxor_contracts::isolation::Region) -> (u32, u32) {
         // SRD | SIZE | EN.
         let (ap, xn) = match rg.access {
             Access::ReadExec => (0b110, 0),  // RO, any privilege
+            Access::Read => (0b110, 1),      // RO, any privilege, never execute
             Access::ReadWrite => (0b011, 1), // RW, any privilege
             Access::Device => (0b011, 1),
             Access::Guard => (0b001, 1), // RW privileged only
@@ -354,6 +361,22 @@ pub fn register(module: usize) -> bool {
             return false;
         }
     }
+    // The programs the bundle carries for this instance, read-only and never
+    // executable: an isolated module reads them in place and nothing else of
+    // the section. The loader admits a section only when each owner's
+    // programs share one region disjoint from every other owner's, so the
+    // span is exactly its own; the planner refuses one the MPU cannot draw
+    // exactly, which fails the load. A contained module already reads all of
+    // flash.
+    let programs = if contained {
+        None
+    } else {
+        crate::kernel::exec::scheduler::module_program_region(module).map(|(base, len)| Span {
+            base: base as usize as u64,
+            len: len as u64,
+            access: Access::Read,
+        })
+    };
     let mut spans_buf = [code_span; DOMAIN_REGIONS];
     let mut n = 0;
     for sp in [
@@ -361,6 +384,7 @@ pub fn register(module: usize) -> bool {
         (!contained).then_some(gateway_span),
         Some(private_span),
         window,
+        programs,
     ]
     .into_iter()
     .flatten()
@@ -766,12 +790,20 @@ unsafe extern "C" fn fluxor_rp_serve(cb: *mut Cb) -> u32 {
             let (cfsr, mmfar) = if chip::ISOLATION_PMSAV8 {
                 // SAFETY: fault status registers present on ARMv8-M.
                 unsafe {
+                    // MMFAR holds the faulting address only while
+                    // CFSR.MMARVALID (bit 7) is set, so it is read before
+                    // the write-one-to-clear below drops that bit.
                     let c = r(reg::CFSR);
-                    w(reg::CFSR, c); // write-one-to-clear
-                    (c, r(reg::MMFAR))
+                    let a = if c & CFSR_MMARVALID != 0 {
+                        Some(r(reg::MMFAR))
+                    } else {
+                        None
+                    };
+                    w(reg::CFSR, c);
+                    (c, a)
                 }
             } else {
-                (0, 0)
+                (0, None)
             };
             let pc = if in_stack(frame, 32) {
                 // SAFETY: inside the module's stack (checked).
@@ -779,14 +811,19 @@ unsafe extern "C" fn fluxor_rp_serve(cb: *mut Cb) -> u32 {
             } else {
                 0
             };
-            let what = if cfsr & (1 << 20) != 0 {
+            let what = if cfsr & CFSR_STKOF != 0 {
                 "stack overflow (PSPLIM)"
             } else {
                 "protection fault"
             };
-            log::error!(
-                "[mpu] module {module} {what}: exc={kind} cfsr=0x{cfsr:08x} mmfar=0x{mmfar:08x} pc=0x{pc:08x}"
-            );
+            match mmfar {
+                Some(addr) => log::error!(
+                    "[mpu] module {module} {what}: exc={kind} cfsr=0x{cfsr:08x} mmfar=0x{addr:08x} pc=0x{pc:08x}"
+                ),
+                None => log::error!(
+                    "[mpu] module {module} {what}: exc={kind} cfsr=0x{cfsr:08x} mmfar=none pc=0x{pc:08x}"
+                ),
+            }
             crate::kernel::exec::step_guard::record_mpu_fault(module);
             finish(0)
         }

@@ -456,6 +456,55 @@ resulting TLV bytes; built-in vs PIC is invisible at the wire layer.
 See `src/kernel/module/loader.rs`, `modules/sdk/module.ld`, and
 `tools/src/modules.rs` for the loader, linker script, and pack tool.
 
+### Programs
+
+A graph can give a module instance data of its own — a compiled script, a
+model, a lookup table — without putting it in params or in the module's
+code. The instance names it with `program:` (one) or `programs:` (a list);
+each is a `${file:<path>}` spec, a bare path, or a map with `file`, an
+optional `kind` (a name, carried as its FNV-1a hash) and an optional
+`format` (64 hex digits, a digest the producer names its format by):
+
+```yaml
+modules:
+  - name: scorer
+    type: model_runner
+    programs:
+      - "${file:models/a.bin}"
+      - { file: models/b.bin, kind: weights, format: "<64 hex digits>" }
+```
+
+The packer (`tools/src/modules.rs::collect_programs`,
+`build_program_section`) places the programs in a **program section**
+after the module table, on the first 4 KiB boundary past it; the table
+header's first reserved word (bytes 10..14) holds the section's offset
+from the table start. The section is part of the modules region of a
+graph image, so the image digest, and a graph-image signature, cover it.
+Its layout is `kernel_abi::program`: a 16-byte header (`FXPG`), one
+64-byte entry per program naming its owner, slot, kind, offset, size,
+format and its owner's region, then the data. Each owner's programs share
+one region that starts on a 4 KiB boundary and is a whole number of
+32-byte granules, so no two owners share a page.
+
+An owner is a module type and the instance's ordinal among modules of
+that type in graph order; a program's slot is its position in the list.
+The kernel finds a caller's programs from which module is running, so a
+module can only read its own:
+
+| Opcode | Use |
+|---|---|
+| `PROGRAM_INFO` (`0x0C2B`) | `arg[0]` = slot in; out: in-place address (0 on wasm), size, kind, region address and length, format (`program::INFO_LEN` bytes). `ENOENT` for no program in that slot. |
+| `PROGRAM_READ` (`0x0C2C`) | `arg` = `[slot][0; 3][offset: u32 LE]` in, program bytes from `offset` out; answers the count, 0 at the end. |
+
+Both are ungated and need no capability. The kernel bounds the section
+against the mapped bundle and checks its layout — entries in owner
+order, each owner's programs inside its region, regions disjoint and
+page-aligned within the section — and reads no program from a section
+that fails. A module reads in place where the address is non-zero; a
+gated module that is isolated is granted its region read-only and never
+executable (see [module_isolation.md](module_isolation.md)), and reaches
+nothing else of the section.
+
 ### Step Outcome Contract
 
 `module_step` uses a compact result model:

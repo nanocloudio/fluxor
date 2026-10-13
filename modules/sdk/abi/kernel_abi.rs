@@ -709,6 +709,93 @@ pub const NET_IDENT_PROVIDER: u32 = 0x0C4C;
 /// every caller holding no observe capability.
 pub const BOOT_INCARNATION: u32 = 0x0C2F;
 
+/// Describe one of the calling module's programs: an opaque blob the
+/// graph bundled for this module instance (a compiled script, a model, a
+/// table), carried in the bundle's program section beside the module table
+/// and covered by the same digest and signature as the modules.
+/// `handle = -1`; `arg` is a buffer of at least [`program::INFO_LEN`] bytes
+/// whose first byte names the program's slot (0 for the first) on entry. On
+/// success it receives the description [`program::INFO_LEN`] lays out and
+/// the call answers the bytes written; `ENOENT` when this instance has no
+/// program in that slot. Ungated self-query: the kernel finds the programs by the calling
+/// module, so a module can only ever name its own.
+///
+/// The address is where the bytes can be read in place: flash on an XIP
+/// board, the loaded bundle elsewhere, and 0 where the module cannot
+/// dereference kernel memory (wasm), which reads through [`PROGRAM_READ`]
+/// instead. An isolated module is granted read-only, never-executable
+/// access to its region (`region_addr`, `region_len`): an MPU region of
+/// exactly that span on RP, its pages EL0 read-only on the Pi 5.
+pub const PROGRAM_INFO: u32 = 0x0C2B;
+
+/// Copy bytes of one of the calling module's programs into `arg`.
+/// `handle = -1`; on entry `arg` holds `[slot: u8][0; 3][offset: u32 LE]`
+/// and `arg_len` is the bytes wanted (at least 8); on return the buffer
+/// holds program bytes from `offset` and the call answers how many (0 at
+/// the end). The request rides in the buffer it is answered in, so the call
+/// carries no pointer and is served the same through the isolation gateway
+/// and across the wasm memory split. `ENOENT` for no program in that slot.
+pub const PROGRAM_READ: u32 = 0x0C2C;
+
+/// The root this kernel verifies graph-slot signatures against: the 32-byte
+/// Ed25519 public key compiled into the firmware. `handle = -1`, `arg`
+/// receives 32 bytes; `ENOENT` on a build with no slot root, which checks no
+/// slot signature. Ungated: the key is public, and a slot writer
+/// (`graph_slot`) checks a signature before it activates a slot rather than
+/// leaving a bad image for the next boot to discover.
+pub const SLOT_SIGNING_ROOT: u32 = 0x0C2D;
+
+/// Which graph slots this boot's slot selector admitted: `handle = -1`, the
+/// answer is a mask (bit 0 = slot A, bit 1 = slot B), on an RP board only
+/// (`ENOSYS` elsewhere). A slot is admitted when its header decodes, its ABI
+/// pin matches, and -- on a build with a slot root -- its signature verifies
+/// and its payload matches its digest. A slot writer that cannot afford to
+/// verify a signature every time it asks which slot is live (`graph_slot`)
+/// starts from this, and tracks the slots it erases and activates itself.
+pub const SLOT_ADMITTED: u32 = 0x0C2E;
+
+/// The program section: per-module-instance program blobs carried after
+/// the module table. Its offset from the table's start, a multiple of
+/// 4 KiB, is the table header's first reserved word (bytes 10..14); 0
+/// means none.
+///
+/// ```text
+///   header (16): [magic "FXPG": u32][version: u8][count: u8][0: u16]
+///                [total_size: u32][0: u32]
+///   entries (count x 64):
+///     [type_hash: u32]   FNV-1a of the owning module's type name
+///     [ordinal: u8]      which instance of that type, in graph order
+///     [slot: u8]         which of its programs
+///     [0: u16]
+///     [kind: u32]        FNV-1a of a kind name, or 0
+///     [offset: u32]      from the section's start
+///     [size: u32]        the program's bytes
+///     [region_off: u32]  the owner's run of programs, from the section's
+///     [region_len: u32]  start: what an isolated reader is granted
+///     [0: u32]
+///     [format: 32]       a digest the producer names its format by, or 0
+///   data: each owner's programs together in one region that starts on a
+///         4 KiB boundary and is a whole number of 32-byte granules (so an
+///         MPU region, or the pages a page table maps, covers exactly one
+///         owner's), each program on a 32-byte boundary.
+/// ```
+///
+/// Entries run in (type_hash, ordinal, slot) order, every entry of an
+/// owner names the same region, regions follow the entries and each other
+/// without overlap, and `total_size` is a whole number of 4 KiB. The kernel
+/// reads no program from a section that breaks any of this.
+pub mod program {
+    pub const SECTION_MAGIC: u32 = 0x4750_5846; // "FXPG"
+    pub const SECTION_VERSION: u8 = 1;
+    pub const HEADER_LEN: usize = 16;
+    pub const ENTRY_LEN: usize = 64;
+    pub const OWNER_ALIGN: usize = 4096;
+    pub const PROGRAM_ALIGN: usize = 32;
+    /// Bytes `PROGRAM_INFO` writes: `[addr: u64][size: u32][kind: u32]
+    /// [region_addr: u64][region_len: u32][0: u32][format: 32]`.
+    pub const INFO_LEN: usize = 64;
+}
+
 /// Per-step flow-budget grant for one of the calling module's ports.
 /// `arg[0] = port index`; optional `arg[1] = direction` (`0` output,
 /// `1` input). Input requests may carry the raw channel descriptor in

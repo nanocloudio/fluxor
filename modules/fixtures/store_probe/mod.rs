@@ -18,11 +18,21 @@
 //!   4 SUBSCRIBE + PUT, then drain the sink — the PUSH a source depends on
 //!   5 DELETE   remove one, LIST again, expect one
 //!
-//! **Acceptance:** `[stp] state=5 pass=1 put=2 got=1 listed=2 pushed=N del=1
-//! err=0`. Any `pass=0` names the state it stopped in. `pushed` is the count of
-//! namespace.change events that ARRIVED. It is reported separately rather than
-//! folded into the PUT's pass/fail: a PUT that lands and a watcher that is
-//! never told are different failures, and only the second is silent.
+//! A write the store has not decided (`EINPROGRESS`) is asked again next
+//! step with the same request, and a read or a listing the store answers
+//! "not yet" (`EAGAIN` -- `fs_object` over FAT32 does while it walks a large
+//! directory) is asked again the same way rather than called a failure.
+//!
+//! `subscribe` (default 1) can be set 0 for a store with no change events,
+//! such as `fs_object`: step 4 then writes without subscribing, and the
+//! verdict does not ask for a push.
+//!
+//! **Acceptance:** `[stp] state=5 pass=1 put=3 got=1 listed=2 pushed=N del=1
+//! wit_a=A wit_b=B err=0`. Any `state=99` names the failure in `err`.
+//! `pushed` is the count of namespace.change events that ARRIVED. It is
+//! reported separately rather than folded into the PUT's pass/fail: a PUT
+//! that lands and a watcher that is never told are different failures, and
+//! only the second is silent.
 //!
 //! WITNESS PREFIXES. `witness_a` / `witness_b` are optional graph params: each
 //! is a prefix this probe LISTs on every heartbeat and reports the count of.
@@ -37,7 +47,7 @@
 //! announced by a heartbeat first: on a board that dies inside a call, the
 //! last line that arrives names it.
 
-#![no_std]
+#![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
     dead_code,
     reason = "the PIC build mounts the whole of modules/sdk/* via include!, so every \
@@ -75,6 +85,8 @@ const OBJ_RANGE_GET: u32 = abi::contracts::storage::object::RANGE_GET;
 const OBJ_DELETE: u32 = abi::contracts::storage::object::DELETE;
 const OBJ_CLOSE: u32 = abi::contracts::storage::object::CLOSE;
 use abi::contracts::storage::object::{write_answer, WriteAnswer};
+
+const ENOENT: i32 = abi::kernel_abi::errno::ENOENT;
 /// Room for an encoded fence (`fence::WIRE_MAX_LEN`).
 const FENCE_CAP: usize = 64;
 const NS_LIST: u32 = abi::contracts::storage::namespace::LIST;
@@ -131,8 +143,18 @@ struct State {
     /// Set once the prefix is empty: a durable store keeps what an
     /// earlier boot left under it, which the LIST would count.
     cleared: u32,
+    /// The key being deleted while the prefix is emptied, held until its
+    /// DELETE is decided so the write is asked again with the same request
+    /// (a LIST in between no longer names a key whose unlink has happened).
+    /// Empty when none is in flight.
+    clear_key: [u8; MAX_WITNESS],
+    clear_len: u32,
     /// Subscribed in state 3: a write asked again does not subscribe again.
     subscribed: u32,
+    /// Whether to prove SUBSCRIBE (`subscribe`, default 1). A store with no
+    /// change events -- `fs_object` -- is walked with it 0: step 4 then
+    /// writes without subscribing, and the verdict does not ask for a push.
+    want_push: u32,
     /// Where a write's fence lands. In the state, not on the stack, so a
     /// write asked again names the same buffer: the same request.
     fence: [u8; FENCE_CAP],
@@ -170,6 +192,9 @@ mod params_def {
 
         4, op_gap_ms, u32, 0
             => |s, d, len| { s.op_gap_ms = super::p_u32(d, len, 0, 0); };
+
+        5, subscribe, u8, 1
+            => |s, d, len| { s.want_push = u32::from(super::p_u8(d, len, 0, 1)); };
     }
 }
 
@@ -178,24 +203,25 @@ unsafe fn ptr_copy(dst: *mut u8, src: *const u8, n: usize) {
     core::ptr::copy_nonoverlapping(src, dst, n);
 }
 
-/// LIST both witness prefixes and return their counts. An unset prefix is not
-/// listed and counts 0 — the graph that named none is simply not witnessed.
-unsafe fn witness_counts(sys: &SyscallTable, s: &mut State) -> (u32, u32) {
+/// LIST both witness prefixes and record their counts. An unset prefix is
+/// not listed and counts 0 — the graph that named none is simply not
+/// witnessed. A listing that fails or is not yet answered keeps the last
+/// count rather than reporting an empty prefix.
+unsafe fn witness_counts(sys: &SyscallTable, s: &mut State) {
     let mut scratch = [0u8; 1024];
-    let mut one = |pfx: &[u8]| -> u32 {
+    let mut one = |pfx: &[u8], last: u32| -> u32 {
         if pfx.is_empty() {
             return 0;
         }
         let n = list_count(sys, pfx, &mut scratch);
-        if n > 0 {
+        if n >= 0 {
             n as u32
         } else {
-            0
+            last
         }
     };
-    let a = one(&s.wit_a_pfx[..s.wit_a_len as usize]);
-    let b = one(&s.wit_b_pfx[..s.wit_b_len as usize]);
-    (a, b)
+    s.wit_a = one(&s.wit_a_pfx[..s.wit_a_len as usize], s.wit_a);
+    s.wit_b = one(&s.wit_b_pfx[..s.wit_b_len as usize], s.wit_b);
 }
 
 unsafe fn put(
@@ -338,12 +364,24 @@ unsafe fn first_key(sys: &SyscallTable, prefix: &[u8], page: &mut [u8], out: &mu
     let Some(decoded) = list::decode_page(&page[..n as usize]) else {
         return E_INVAL;
     };
+    // A directory-shaped store names an entry relative to the prefix; a
+    // key-shaped one names the whole key. The contract says which by
+    // `CHILD_NAMES`, and a provider that answers no `CAPS` is key-shaped.
+    let caps = (sys.provider_call)(
+        -1,
+        abi::contracts::storage::namespace::CAPS,
+        core::ptr::null_mut(),
+        0,
+    );
+    let child_names =
+        caps >= 0 && (caps as u32) & abi::contracts::storage::namespace::caps::CHILD_NAMES != 0;
+    let head = if child_names { prefix } else { &[][..] };
     match decoded.entries().next() {
         None => 0,
-        Some(e) if e.kind == KIND_OBJECT && prefix.len() + e.name.len() <= out.len() => {
-            out[..prefix.len()].copy_from_slice(prefix);
-            out[prefix.len()..prefix.len() + e.name.len()].copy_from_slice(e.name);
-            (prefix.len() + e.name.len()) as i32
+        Some(e) if e.kind == KIND_OBJECT && head.len() + e.name.len() <= out.len() => {
+            out[..head.len()].copy_from_slice(head);
+            out[head.len()..head.len() + e.name.len()].copy_from_slice(e.name);
+            (head.len() + e.name.len()) as i32
         }
         Some(_) => E_INVAL,
     }
@@ -444,20 +482,20 @@ unsafe fn emit(s: &State) {
     dev_log(&*s.syscalls, 3, p, pos);
 }
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
+#[cfg_attr(not(feature = "host-test"), no_mangle)]
+#[cfg_attr(not(feature = "host-test"), link_section = ".text.module_state_size")]
 pub extern "C" fn module_state_size() -> u32 {
     core::mem::size_of::<State>() as u32
 }
 
-#[no_mangle]
-#[link_section = ".text.module_init"]
+#[cfg_attr(not(feature = "host-test"), no_mangle)]
+#[cfg_attr(not(feature = "host-test"), link_section = ".text.module_init")]
 pub extern "C" fn module_init(_syscalls: *const c_void) {}
 
 /// # Safety
 /// Kernel module-ABI entry point.
-#[no_mangle]
-#[link_section = ".text.module_new"]
+#[cfg_attr(not(feature = "host-test"), no_mangle)]
+#[cfg_attr(not(feature = "host-test"), link_section = ".text.module_new")]
 pub unsafe extern "C" fn module_new(
     in_chan: i32,
     out_chan: i32,
@@ -497,14 +535,16 @@ pub unsafe extern "C" fn module_new(
         s.op_gap_ms = 0;
         s.next_at = 0;
         s.cleared = 0;
+        s.clear_len = 0;
+        s.subscribed = 0;
         params_def::set_defaults(s);
         params_def::parse_tlv(s, params, params_len);
         0
     }
 }
 
-#[no_mangle]
-#[link_section = ".text.module_step"]
+#[cfg_attr(not(feature = "host-test"), no_mangle)]
+#[cfg_attr(not(feature = "host-test"), link_section = ".text.module_step")]
 pub extern "C" fn module_step(state: *mut u8) -> i32 {
     unsafe {
         if state.is_null() {
@@ -536,22 +576,35 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         match s.state {
             0 if s.cleared == 0 => {
                 // 0. Start from an empty prefix: a store on a disk keeps
-                // whatever an earlier boot left under it. One key per
-                // step, the first LIST returns, until the LIST is empty.
-                let mut key = [0u8; MAX_WITNESS];
-                let n = first_key(sys, PREFIX, &mut s.scratch, &mut key);
-                if n < 0 {
-                    s.err = -10;
-                    s.state = 99;
-                    emit(s);
-                    return 0;
+                // whatever an earlier boot left under it. The first key the
+                // LIST returns is deleted, asked again until decided, then
+                // the next, until the LIST is empty.
+                if s.clear_len == 0 {
+                    let mut key = [0u8; MAX_WITNESS];
+                    let n = first_key(sys, PREFIX, &mut s.scratch, &mut key);
+                    if n == E_AGAIN {
+                        return 0;
+                    }
+                    if n < 0 {
+                        s.err = -10;
+                        s.state = 99;
+                        emit(s);
+                        return 0;
+                    }
+                    if n == 0 {
+                        s.cleared = 1;
+                        return 0;
+                    }
+                    s.clear_key = key;
+                    s.clear_len = n as u32;
                 }
-                if n == 0 {
-                    s.cleared = 1;
-                    return 0;
-                }
-                match delete(sys, &key[..n as usize], &mut s.fence) {
-                    WriteAnswer::Pending | WriteAnswer::Decided(0) => {}
+                let key = s.clear_key;
+                match delete(sys, &key[..s.clear_len as usize], &mut s.fence) {
+                    WriteAnswer::Pending => {}
+                    // Gone either way: clearing wants the key absent, and a
+                    // DELETE whose answer a fault lost finds it so when asked
+                    // again.
+                    WriteAnswer::Decided(0 | ENOENT) => s.clear_len = 0,
                     WriteAnswer::Decided(_) => {
                         s.err = -11;
                         s.state = 99;
@@ -582,6 +635,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 // length without the bytes passes a shallower check than this.
                 let mut buf = [0u8; 256];
                 let n = get(sys, KEY_A, &mut buf);
+                if n == E_AGAIN {
+                    return 0;
+                }
                 if n as usize != VAL_A.len() || &buf[..VAL_A.len()] != VAL_A {
                     s.err = -3;
                     s.state = 99;
@@ -594,6 +650,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             2 => {
                 // 3. LIST the prefix.
                 let n = list_count(sys, PREFIX, &mut s.scratch);
+                if n == E_AGAIN {
+                    return 0;
+                }
                 if n < 0 {
                     s.err = -4;
                     s.state = 99;
@@ -612,6 +671,22 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
             3 => {
                 // 4. SUBSCRIBE, then write — the PUSH every source depends on.
+                // A store with no change events writes and moves on.
+                if s.want_push == 0 {
+                    match put(sys, KEY_C, VAL_C, &mut s.fence) {
+                        WriteAnswer::Pending => return 0,
+                        WriteAnswer::Decided(0) => {}
+                        WriteAnswer::Decided(_) => {
+                            s.err = -8;
+                            s.state = 99;
+                            emit(s);
+                            return 0;
+                        }
+                    }
+                    s.put += 1;
+                    s.state = 5;
+                    return 0;
+                }
                 if s.sink < 0 {
                     s.err = -6;
                     s.state = 99;
@@ -657,19 +732,25 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 }
             }
             5 if s.done == 0 => {
-                // 5. DELETE one, LIST again.
-                match delete(sys, KEY_B, &mut s.fence) {
-                    WriteAnswer::Pending => return 0,
-                    WriteAnswer::Decided(0) => {}
-                    WriteAnswer::Decided(_) => {
-                        s.err = -9;
-                        s.state = 99;
-                        emit(s);
-                        return 0;
+                // 5. DELETE one, LIST again. A LIST the store defers is asked
+                // again without deleting again.
+                if s.del == 0 {
+                    match delete(sys, KEY_B, &mut s.fence) {
+                        WriteAnswer::Pending => return 0,
+                        WriteAnswer::Decided(0) => {}
+                        WriteAnswer::Decided(_) => {
+                            s.err = -9;
+                            s.state = 99;
+                            emit(s);
+                            return 0;
+                        }
                     }
+                    s.del = 1;
                 }
-                s.del = 1;
                 let n = list_count(sys, PREFIX, &mut s.scratch);
+                if n == E_AGAIN {
+                    return 0;
+                }
                 if n != 2 {
                     // a and c remain
                     s.err = -10;
@@ -678,10 +759,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     return 0;
                 }
                 s.listed = n as u32;
-                let (a, b) = witness_counts(sys, s);
-                s.wit_a = a;
-                s.wit_b = b;
-                s.pass = u32::from(s.pushed > 0);
+                witness_counts(sys, s);
+                s.pass = u32::from(s.pushed > 0 || s.want_push == 0);
                 s.state = 5;
                 emit(s);
                 s.done = 1;
@@ -690,10 +769,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 // Re-emit sparsely so a late UDP listener still catches the
                 // verdict — log_net needs time to warm up. Re-COUNT each time:
                 // the interesting number is produced by another chain, later.
-                if s.step % 1000 == 0 {
-                    let (a, b) = witness_counts(sys, s);
-                    s.wit_a = a;
-                    s.wit_b = b;
+                if s.step.is_multiple_of(1000) {
+                    witness_counts(sys, s);
                     emit(s);
                 }
             }

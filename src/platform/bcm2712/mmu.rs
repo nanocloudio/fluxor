@@ -288,102 +288,6 @@ mod bcm2712_impl {
         }
     }
 
-    /// Build a module's page table.
-    ///
-    /// Creates an L2 table that maps:
-    /// - Kernel code as RO+X at EL0 (for syscall stubs)
-    /// - Module code as RO+X at EL0
-    /// - Module state as RW at EL0
-    /// - Module heap as RW at EL0
-    /// - Channel buffers as RW at EL0
-    /// - Kernel data: NOT mapped at EL0 (will fault)
-    // Stack guard page is deferred: modules currently execute at EL1 on the
-    // kernel stack, so there is no per-module stack region to protect. Once
-    // modules run at EL0 with their own stacks, leave the lowest 4 KB of
-    // the stack region as an invalid L3 entry — `handle_data_abort` already
-    // routes translation faults into the fault state machine.
-    pub fn build_module_page_table(module_idx: usize) {
-        if module_idx >= MAX_MODULES {
-            return;
-        }
-        // SAFETY: per-module page-table build runs during instantiation;
-        // no other thread accesses this module's MODULE_REGION_INFO /
-        // MODULE_L1 / MODULE_L2 entry yet. module_idx bounded above.
-        unsafe {
-            let r = &MODULE_REGION_INFO[module_idx];
-            let l2 = &mut MODULE_L2[module_idx];
-            let l1 = &mut MODULE_L1[module_idx];
-
-            // Start with all entries invalid (EL0 will fault on access)
-            for entry in l2.0.iter_mut() {
-                *entry = 0;
-            }
-            for entry in l1.0.iter_mut() {
-                *entry = 0;
-            }
-
-            // Map module code region (RO+X at EL0)
-            if r.code_size > 0 {
-                let start = align_down_2mb(r.code_base);
-                let end = align_up_2mb(r.code_base + r.code_size);
-                let mut addr = start;
-                while addr < end {
-                    let idx = l2_index(addr);
-                    if idx < TABLE_ENTRIES {
-                        l2.0[idx] = make_block_desc(
-                            addr,
-                            ATTR_IDX_NORMAL,
-                            AP_EL0_RO, // EL0 RO
-                            false,     // UXN=0 (EL0 can execute)
-                            true,      // PXN=1 (EL1 shouldn't execute module code)
-                        );
-                    }
-                    addr += L2_BLOCK_SIZE;
-                }
-            }
-
-            // Map module state (RW at EL0, no execute)
-            if r.state_size > 0 {
-                let start = align_down_2mb(r.state_base);
-                let end = align_up_2mb(r.state_base + r.state_size);
-                let mut addr = start;
-                while addr < end {
-                    let idx = l2_index(addr);
-                    if idx < TABLE_ENTRIES {
-                        l2.0[idx] = make_block_desc(
-                            addr,
-                            ATTR_IDX_NORMAL,
-                            AP_EL0_RW,
-                            true,
-                            true, // No execute
-                        );
-                    }
-                    addr += L2_BLOCK_SIZE;
-                }
-            }
-
-            // Map module heap (RW at EL0, no execute)
-            if r.heap_size > 0 {
-                let start = align_down_2mb(r.heap_base);
-                let end = align_up_2mb(r.heap_base + r.heap_size);
-                let mut addr = start;
-                while addr < end {
-                    let idx = l2_index(addr);
-                    if idx < TABLE_ENTRIES {
-                        l2.0[idx] = make_block_desc(addr, ATTR_IDX_NORMAL, AP_EL0_RW, true, true);
-                    }
-                    addr += L2_BLOCK_SIZE;
-                }
-            }
-
-            // L1: point to module's L2
-            let l2_addr = l2 as *const _ as u64;
-            l1.0[0] = make_table_desc(l2_addr);
-            // Also map the RAM region for QEMU (L1 index 1)
-            l1.0[1] = make_table_desc(l2_addr);
-        }
-    }
-
     /// Register module regions (called during module instantiation).
     pub fn register_module_regions(
         module_idx: usize,
@@ -487,7 +391,7 @@ mod bcm2712_impl {
     /// Routes to the real EL0 walking-skeleton transition (`el0::enter`)
     /// when isolation is enabled AND the current module has a built
     /// isolated page table. Otherwise falls through to a direct EL1
-    /// call so non-isolated modules keep the exact pre-existing path.
+    /// call for non-isolated modules.
     ///
     /// The current module index is resolved from the scheduler — the
     /// caller (`DynamicModule::step`) runs inside `m.step()` where
@@ -1262,6 +1166,27 @@ mod bcm2712_impl {
                 }
                 // Trampoline page: RO + X at EL0.
                 mapped &= map_region(slot, tramp, PAGE, AP_EL0_RO, false);
+                // The programs the bundle carries for this instance, EL0
+                // read-only and never executable. The loader admits a
+                // section only when each owner's programs share one region
+                // that starts on a page and ends before the page the next
+                // owner's starts on, so the mapping, rounded up to whole
+                // pages, reaches its own programs and their padding only. A
+                // region not on a page boundary would expose the page before
+                // it, and fails the table closed.
+                if let Some((base, len)) =
+                    crate::kernel::exec::scheduler::module_program_region(module_idx)
+                {
+                    let base = base as usize as u64;
+                    if base & (PAGE - 1) != 0 {
+                        log::error!(
+                            "[el0] module {module_idx}: program region 0x{base:x} is not page-aligned"
+                        );
+                        mapped = false;
+                    } else {
+                        mapped &= map_region(slot, base, len as u64, AP_EL0_RO, true);
+                    }
+                }
                 // The device window the graph granted: its peripheral's
                 // registers, Device memory, EL0 RW and never executable.
                 if let Some((wb, wz)) =

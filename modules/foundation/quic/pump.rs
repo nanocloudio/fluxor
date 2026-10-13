@@ -1606,11 +1606,30 @@ unsafe fn pump_recv_certificate(s: &mut QuicState, idx: usize) -> bool {
     true
 }
 
+/// Whether connection `holder` (an `rsa_owner` value) is still a live
+/// handshake in `VerifyChain` or `VerifyPeerSignature`.
+///
+/// The instance has one verification job, so the connection holding it must
+/// give it up when it stops verifying. One that errors, closes or is reset
+/// mid-verification never reaches the pump's release, so its claim lapses
+/// here instead; the next holder starts a job of its own, because a driver
+/// reset clears `rsa_job_active`.
+fn rsa_holder_verifying(s: &QuicState, holder: i32) -> bool {
+    let Some(conn) = usize::try_from(holder).ok().and_then(|i| s.conns.get(i)) else {
+        return false;
+    };
+    conn.phase == ConnPhase::Handshaking
+        && matches!(
+            conn.driver.hs_state,
+            HandshakeState::VerifyChain | HandshakeState::VerifyPeerSignature
+        )
+}
+
 /// Drive the instance job for a connection in `VerifyChain` or
 /// `VerifyPeerSignature`.
 unsafe fn pump_rsa_verify(s: &mut QuicState, idx: usize) -> bool {
     let owner = idx as i32;
-    if !(s.rsa_owner < 0 || s.rsa_owner == owner) {
+    if s.rsa_owner >= 0 && s.rsa_owner != owner && rsa_holder_verifying(s, s.rsa_owner) {
         return false;
     }
     s.rsa_owner = owner;

@@ -87,19 +87,15 @@ const OID_ML_DSA_87: [u8; 9] = [0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 
 
 /// Certificate suites: a key type paired with the hash it signs under.
 ///
-/// A suite id is what the rest of the stack carries instead of an OID. It
-/// exists so a size, a policy decision or a capability check is a lookup
-/// rather than a constant someone chose when only one algorithm existed.
-/// Every bound below was a literal `64`, `65` or `4` somewhere; those
-/// numbers are true for P-256 and wrong for everything else, and an
+/// A suite id is what the rest of the stack carries instead of an OID, so
+/// a size, a policy decision or a capability check is a lookup keyed by
+/// algorithm: a P-256 signature is 64 bytes and its key 65, while an
 /// ML-DSA-65 certificate is roughly 4 KB against P-256's few hundred bytes.
 ///
 /// **Naming a suite is not implementing it.** [`is_implemented`] is the
 /// only thing that says whether this build can verify one, and
 /// `verify_chain` refuses anything else with
-/// [`CERT_ERR_UNSUPPORTED_SUITE`]. The ids exist so the interfaces do not
-/// have to change when the primitives arrive; they do not make a
-/// post-quantum certificate verifiable today.
+/// [`CERT_ERR_UNSUPPORTED_SUITE`].
 pub mod suite {
     /// An algorithm this build could not resolve to a suite at all.
     ///
@@ -130,32 +126,19 @@ pub mod suite {
     /// Highest suite id this registry defines.
     pub const MAX_ID: u16 = RSA_PSS;
 
-    /// Whether an Ed25519 signature is verified on this target.
-    ///
-    /// An Ed25519 verification is done whole — two scalar multiplications
-    /// in one call — where the ECDSA and RSA verifications are stepped
-    /// across the pump. On the Cortex-M target that whole call does not fit
-    /// a step, so that build neither offers `ed25519` nor accepts an
-    /// Ed25519-signed chain link or CertificateVerify: both are refused as
-    /// unsupported, as any suite this build does not verify is.
-    pub const ED25519_VERIFIED: bool = !cfg!(target_arch = "arm");
-
     /// Whether this build can actually verify a signature in `suite`.
     ///
-    /// Both ECDSA curves, Ed25519 where [`ED25519_VERIFIED`], the three
-    /// ML-DSA parameter sets and the RSA suites. RSA-PSS is named but not
-    /// verified here: the ids exist so sizes, policies and error reporting
-    /// are suite-shaped ahead of the primitives, and `verify_chain` refuses
-    /// anything this returns false for rather than treating an unrecognised
-    /// algorithm as an unchecked one.
+    /// Both ECDSA curves, Ed25519, the three ML-DSA parameter sets and the
+    /// RSA suites, on every target. RSA-PSS is named but not verified: its
+    /// id lets the log and the policy say what was met, and `verify_chain`
+    /// refuses anything this returns false for rather than treating an
+    /// unrecognised algorithm as an unchecked one.
     #[must_use]
     pub const fn is_implemented(suite: u16) -> bool {
-        if suite == ED25519 {
-            return ED25519_VERIFIED;
-        }
         matches!(
             suite,
-            ECDSA_P256_SHA256
+            ED25519
+                | ECDSA_P256_SHA256
                 | ECDSA_P384_SHA384
                 | ML_DSA_44
                 | ML_DSA_65
@@ -323,26 +306,6 @@ pub mod suite {
         }
         allowed
     };
-
-    /// Short stable token for a suite, for the operator-facing log line.
-    #[must_use]
-    pub const fn text(suite: u16) -> &'static [u8] {
-        match suite {
-            ECDSA_P256_SHA256 => b"ecdsa-p256-sha256",
-            ECDSA_P384_SHA384 => b"ecdsa-p384-sha384",
-            ED25519 => b"ed25519",
-            ML_DSA_44 => b"ml-dsa-44",
-            ML_DSA_65 => b"ml-dsa-65",
-            ML_DSA_87 => b"ml-dsa-87",
-            RSA_2048 => b"rsa-2048",
-            RSA_3072 => b"rsa-3072",
-            RSA_4096 => b"rsa-4096",
-            RSA_PKCS1_SHA256 => b"rsa-pkcs1-sha256",
-            RSA_PKCS1_SHA384 => b"rsa-pkcs1-sha384",
-            RSA_PSS => b"rsa-pss",
-            _ => b"unknown",
-        }
-    }
 }
 
 /// The key suite an RSA modulus of `bits` belongs to, or `UNKNOWN` for a
@@ -1747,9 +1710,9 @@ fn verify_ed25519(cert: &X509Cert<'_>, issuer_pubkey: &[u8]) -> bool {
     // RFC 8410: id-Ed25519 names the algorithm with no parameters, and the
     // signature is the BIT STRING contents — R ‖ S, 64 bytes — over the
     // tbsCertificate bytes themselves. Pure Ed25519 hashes inside the
-    // algorithm, so there is no digest step here. One verification of two
-    // scalar multiplications, done whole like ML-DSA's: it is not a job
-    // worth stepping.
+    // algorithm, so there is no digest step here. Verified whole, for a
+    // link the walk does not defer (`LinkMode::signature`); a deferred link
+    // is stepped as an `Ed25519VerifyJob`.
     if cert.sig_alg != OID_ED25519 {
         return false;
     }
@@ -1956,15 +1919,15 @@ fn check_suites(cert: &X509Cert<'_>, policy: &ChainPolicy<'_>) -> u32 {
     CERT_OK
 }
 
-/// Where the bytes of a deferred RSA link live: in the Certificate
+/// Where the issuer key of a deferred link lives: in the Certificate
 /// message the peer sent, or in the configured anchor.
 pub const LINK_IN_MESSAGE: u8 = 0;
 pub const LINK_IN_ANCHOR: u8 = 1;
 
 /// One signature the chain walk left for a stepped job — RSA PKCS#1 with
-/// SHA-256 or SHA-384, or ECDSA P-256 / P-384, the four suites the stepped
-/// verifier drives: the certificate it is over, the key that made it, and
-/// the suite. Offsets rather than slices, because the job outlives the call
+/// SHA-256 or SHA-384, ECDSA P-256 / P-384, or Ed25519, the five suites the
+/// stepped verifier drives: the certificate it is over, the key that made
+/// it, and the suite. Offsets rather than slices, because the job outlives the call
 /// that found them and the message buffer is the only place the bytes are.
 #[derive(Clone, Copy)]
 pub struct DeferredLink {
@@ -1972,7 +1935,7 @@ pub struct DeferredLink {
     /// where the issuer key is read from.
     pub issuer_source: u8,
     /// The signature suite: `RSA_PKCS1_SHA256`, `RSA_PKCS1_SHA384`,
-    /// `ECDSA_P256_SHA256` or `ECDSA_P384_SHA384`.
+    /// `ECDSA_P256_SHA256`, `ECDSA_P384_SHA384` or `ED25519`.
     pub sig_suite: u16,
     /// `tbsCertificate` of the subject, within the message.
     pub tbs_off: u16,
@@ -2053,8 +2016,9 @@ fn span_of(outer: &[u8], inner: &[u8]) -> Option<(u16, u16)> {
     Some((off as u16, inner.len() as u16))
 }
 
-/// What a link check may do with an RSA or ECDSA signature: verify it
-/// now, or record it for a stepped job. ML-DSA is verified now either way.
+/// What a link check may do with an RSA, ECDSA or Ed25519 signature:
+/// verify it now, or record it for a stepped job. ML-DSA is verified now
+/// either way.
 struct LinkMode<'a> {
     message: &'a [u8],
     anchor: &'a [u8],
@@ -2068,9 +2032,9 @@ struct LinkMode<'a> {
 }
 
 impl LinkMode<'_> {
-    /// Check `subject`'s signature under `issuer`, deferring an RSA one
-    /// when the mode asks for it. `issuer_source` says where the issuer's
-    /// bytes live.
+    /// Check `subject`'s signature under `issuer`, deferring a steppable
+    /// one when the mode asks for it. `issuer_source` says where the
+    /// issuer's bytes live.
     fn signature(
         &mut self,
         subject: &X509Cert<'_>,
@@ -2084,6 +2048,7 @@ impl LinkMode<'_> {
                 | suite::RSA_PKCS1_SHA384
                 | suite::ECDSA_P256_SHA256
                 | suite::ECDSA_P384_SHA384
+                | suite::ED25519
         );
         let defer = steppable
             && self.deferred.is_some()
@@ -2095,9 +2060,9 @@ impl LinkMode<'_> {
                 CERT_ERR_SIGNATURE
             };
         }
-        // Everything the job will not re-derive is checked here: the key
-        // is one that makes this signature, is well formed, and the
-        // signature is the key's width.
+        // What the job does not re-derive is checked here: the key is one
+        // that makes this signature, and is well formed. The signature's
+        // own shape (its width, its DER) is checked when its job begins.
         if !suite::key_signs(issuer.key_suite, subject.suite)
             || !key_is_valid(issuer.key_suite, issuer.public_key)
         {
@@ -2154,7 +2119,8 @@ pub fn deferred_link_bytes<'a>(
     ))
 }
 
-/// Verify one deferred link in full, for a caller with no step budget.
+/// Verify one deferred link in full: the whole-call counterpart of the
+/// stepped jobs `rsa_verify_pump_core` drives.
 pub fn verify_deferred_link(link: &DeferredLink, message: &[u8], anchor: &[u8]) -> bool {
     let Some((tbs, sig, key)) = deferred_link_bytes(link, message, anchor) else {
         return false;
@@ -2167,6 +2133,10 @@ pub fn verify_deferred_link(link: &DeferredLink, message: &[u8], anchor: &[u8]) 
         suite::ECDSA_P384_SHA384 => match parse_der_signature384(sig) {
             Some(raw) => ecdsa384_verify(key, &sha384(tbs), &raw),
             None => false,
+        },
+        suite::ED25519 => match (<&[u8; 32]>::try_from(key), <&[u8; 64]>::try_from(sig)) {
+            (Ok(key), Ok(signature)) => ed25519_verify(key, tbs, signature),
+            _ => false,
         },
         suite::RSA_PKCS1_SHA256 | suite::RSA_PKCS1_SHA384 => {
             let Some(key) = rsa_public_key_parse(key) else {
@@ -2208,10 +2178,12 @@ pub fn verify_chain(cert_msg_body: &[u8], policy: &ChainPolicy<'_>) -> u32 {
     verify_chain_with(cert_msg_body, policy, None)
 }
 
-/// As [`verify_chain`], but with `deferred` given, every RSA-signed link
-/// is recorded there instead of verified, and [`CERT_OK`] means "accepted
+/// As [`verify_chain`], but with `deferred` given, every RSA-, ECDSA- or
+/// Ed25519-signed link is recorded there instead of verified (save the link
+/// into an anchor that shares its subject with another, verified here so
+/// the walk can try the next candidate), and [`CERT_OK`] means "accepted
 /// once every deferred link verifies". Everything else — shape, names,
-/// policy, lifetimes, and every non-RSA signature — is decided here, so a
+/// policy, lifetimes, and every ML-DSA signature — is decided here, so a
 /// caller stepping the deferred links has nothing left to check but them.
 ///
 /// Every anchor in the policy is tried under one rule, in configured
@@ -2696,7 +2668,8 @@ pub fn verify_cert_chain(
     verify_cert_chain_with(cert_msg_body, anchors, expected_hostname, &[], None)
 }
 
-/// As [`verify_cert_chain`], deferring RSA links (see [`verify_chain_with`]).
+/// As [`verify_cert_chain`], deferring steppable links (see
+/// [`verify_chain_with`]).
 /// `expected_hostname` is a DNS name; a peer reached by address passes the
 /// address bytes as `expected_ip` and an empty hostname.
 pub fn verify_cert_chain_with(

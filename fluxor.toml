@@ -34,7 +34,9 @@ limit_register_coverage = "fail"
 # `tests/host/service_bundle_e2e.sh` publishes the example service bundle
 # into an isolated store, pins and syncs it in a scratch consumer, runs it
 # with parameters and asserts the refusals.
-scripts = ["tools/ci/deps_budget.sh", "tests/host/service_bundle_e2e.sh"]
+# `tests/host/program_section.sh` builds a graph whose modules own programs
+# and checks each instance reads its own, through the kernel and in place.
+scripts = ["tools/ci/deps_budget.sh", "tests/host/service_bundle_e2e.sh", "tests/host/program_section.sh"]
 
 [ci.cargo]
 # Where the cargo phase runs. fluxor's workspace root is the bare-metal

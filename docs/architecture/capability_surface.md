@@ -523,9 +523,13 @@ file.data           — byte-stream file access (open, read, seek, stat,
                       write, fsync). fat32 and the mount router provide;
                       the Linux host serves it as a platform provider.
 storage.namespace   — name-keyed directory surface (lookup, stat, list,
-                      rename, delete, bind, subscribe).
+                      rename, delete, bind, subscribe). The hosts serve
+                      it as platform providers; fs_object provides it
+                      over a filesystem.
 storage.object      — whole-blob byte-addressed surface (put, get, head,
-                      range_get, delete).
+                      range_get, delete, list). The hosts serve it as
+                      platform providers; fs_object provides it
+                      alongside its namespace.
 ```
 
 The orthogonal axis is `abi::fence::Fence`: every storage op that completes

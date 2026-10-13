@@ -4,6 +4,14 @@ hardware_targets = ["bcm2712"]
 # `after_ms` holds the probe until that long after boot (wall clock).
 timer_class = "wall_clock"
 
+# Resumable after a fault: a GET opens and closes its handle in one step, so
+# the probe holds no provider handle across steps, and every request it makes
+# is rebuilt from its state -- a write the store had not decided is asked
+# again with the same bytes, which the store recognises. With `subscribe: 0`
+# it holds no subscription either; a fault after SUBSCRIBE drops the
+# subscription, and the verdict then reports the push that never arrives.
+resume_after_fault = true
+
 # The store, on the board. Both contracts, because the point of the probe is
 # that a store-backed graph has BOTH: `storage.object` for the keyed bytes and
 # `storage.namespace` for the prefix walk and the change subscription that

@@ -1,0 +1,21 @@
+version = "1.0.0"
+hardware_targets = ["rp2350", "bcm2712", "linux", "wasm"]
+
+# Fixture for the bundle's program section: reads its own program through
+# PROGRAM_INFO and PROGRAM_READ, and in place where the kernel gives an
+# address, and logs what it found so a lane or a rig can compare it with the
+# file the graph named:
+#
+#   [prog] slot=0 size=<n> kind=<hex> format=<hex8> read=<sha8> inplace=<sha8|none>
+#   [prog] none                     (no program in slot 0)
+#
+# With `poke: 1` it then reads the first byte it is not granted: the end of
+# its program region under an MPU, the end of the region's last page under
+# a page table. An isolated module must fault there, so `[prog] poked`
+# appearing is the failure a rig scenario looks for. `delay: <steps>` holds
+# the start, for a board whose log reaches the bench only once its network
+# is up.
+timer_class = "agnostic"
+
+[observability]
+exempt = "fixture whose evidence is its one log line"

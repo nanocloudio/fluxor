@@ -46,6 +46,7 @@ pub struct Shape {
     /// before cargo reads the mount.
     pub mounts_staged: bool,
     /// `[ci.test] scripts` globs — the project's runtime gate.
+    pub setup_scripts: Vec<String>,
     pub test_scripts: Vec<String>,
     /// A root `tests/` directory exists, so the root package may carry
     /// integration tests. The unit-test phase selects target kinds and so
@@ -192,6 +193,7 @@ pub fn shape(project_root: &Path) -> Shape {
         host_tools,
         has_modules: project_root.join("modules").is_dir() && !ci_targets(project_root).is_empty(),
         mounts_staged: mounts_staged_tree(project_root),
+        setup_scripts: ci::load_setup_scripts(project_root).unwrap_or_default(),
         test_scripts: ci::load_test_scripts(project_root).unwrap_or_default(),
         has_root_tests: project_root.join("tests").is_dir(),
         has_harness_crate: project_root.join("tests/harness").exists(),
@@ -373,6 +375,15 @@ pub fn test(project_root: &Path, _verbose: bool) -> Result<()> {
     // skips makes `make test` quietly weaker than `make ci`; a lane this verb
     // covers and the gate skips is worse, because then the gate is the weaker
     // of the two. One definition is what rules out both.
+    // Setup first, as in the gate: the suites below read what it provides.
+    if !s.setup_scripts.is_empty() {
+        step(&format!(
+            "[ci.setup] scripts: {}",
+            s.setup_scripts.join(", ")
+        ));
+        ci::run_setup_scripts(&s.project_root, &s.setup_scripts, true).map_err(Error::Config)?;
+    }
+
     if let Some((dir, args)) = s.unit_site() {
         let argv: Vec<&str> = args.clone();
         step(&cargo_label(&s, &dir, &argv));
@@ -817,11 +828,12 @@ fn project_scripts(project_root: &Path) -> Vec<String> {
     out
 }
 
-/// Which of those scripts `[ci.test] scripts` actually runs — the
-/// difference between "in the gate" and "advertised as in the gate".
+/// Which of those scripts the gate actually runs (`[ci.setup] scripts` and
+/// `[ci.test] scripts`) — the difference between "in the gate" and
+/// "advertised as in the gate".
 fn ci_gated_scripts(s: &Shape) -> std::collections::BTreeSet<String> {
     let mut paths = Vec::new();
-    for glob in &s.test_scripts {
+    for glob in s.setup_scripts.iter().chain(&s.test_scripts) {
         ci::expand_glob(&s.project_root, glob, &mut paths);
     }
     paths
@@ -916,6 +928,7 @@ mod tests {
                 host_tools: host_tools.clone(),
                 has_modules: false,
                 mounts_staged: false,
+                setup_scripts: Vec::new(),
                 test_scripts: Vec::new(),
                 has_root_tests,
                 has_harness_crate: has_harness,
@@ -998,6 +1011,7 @@ mod tests {
             host_tools: Some(dir.join("tools")),
             has_modules: false,
             mounts_staged: false,
+            setup_scripts: Vec::new(),
             test_scripts: Vec::new(),
             has_root_tests: true,
             has_harness_crate: true,
@@ -1039,6 +1053,7 @@ mod tests {
             host_tools: None,
             has_modules: true,
             mounts_staged: false,
+            setup_scripts: Vec::new(),
             test_scripts: vec!["tools/ci/host_crates.sh".into()],
             has_root_tests: false,
             has_harness_crate: false,
@@ -1062,6 +1077,7 @@ mod tests {
             host_tools: Some(root.join("tools")),
             has_modules: false,
             mounts_staged: false,
+            setup_scripts: Vec::new(),
             test_scripts: Vec::new(),
             has_root_tests: false,
             has_harness_crate: false,
@@ -1079,6 +1095,7 @@ mod tests {
             host_tools: None,
             has_modules: false,
             mounts_staged: false,
+            setup_scripts: Vec::new(),
             test_scripts: Vec::new(),
             has_root_tests: false,
             has_harness_crate: false,
@@ -1095,6 +1112,7 @@ mod tests {
             host_tools: None,
             has_modules: true,
             mounts_staged: false,
+            setup_scripts: Vec::new(),
             test_scripts: vec!["tools/e2e/*.sh".into()],
             has_root_tests: false,
             has_harness_crate: false,
@@ -1122,6 +1140,7 @@ mod tests {
             host_tools: None,
             has_modules: true,
             mounts_staged: false,
+            setup_scripts: Vec::new(),
             test_scripts: Vec::new(),
             has_root_tests: false,
             has_harness_crate: true,
@@ -1145,6 +1164,7 @@ mod tests {
             host_tools: None,
             has_modules: false,
             mounts_staged: false,
+            setup_scripts: Vec::new(),
             test_scripts: Vec::new(),
             has_root_tests: false,
             has_harness_crate: false,

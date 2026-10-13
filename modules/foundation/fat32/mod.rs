@@ -871,6 +871,17 @@ struct Fat32State {
     /// orphans the chain instead (logged) — the same safe posture as
     /// create-truncate, namespace removal always wins over reclaim.
     unlink_free: [u32; UNLINK_FREE_SLOTS],
+    /// When the current dispatch or step began (`dev_micros`), so a walk can
+    /// stop on elapsed time as well as on sectors read (see
+    /// [`CALL_BUDGET_US`]).
+    call_t0: u64,
+    /// How far the steps have settled the mount: 0 nothing, 1 FSINFO read,
+    /// 2 clean bit read; the rename replay, which sets `rename_recovered`,
+    /// ends it.
+    settle_stage: u8,
+    /// Recently resolved directory components (see [`DIR_CACHE`]).
+    dir_cache: [DirCacheEntry; DIR_CACHE],
+    dir_cache_next: u8,
     /// Reads served as whole-sector runs straight to the caller, and
     /// single-sector refills (telemetry).
     rd_runs: u32,
@@ -1023,6 +1034,10 @@ impl Fat32State {
         self.sync_rc = 0;
         self.fmt = FormatPlan::EMPTY;
         self.unlink_free = [0; UNLINK_FREE_SLOTS];
+        self.call_t0 = 0;
+        self.settle_stage = 0;
+        self.dir_cache = [DirCacheEntry::EMPTY; DIR_CACHE];
+        self.dir_cache_next = 0;
         self.rd_runs = 0;
         self.rd_sectors = 0;
         self.fences = [FenceSlot::empty(); MAX_FENCES];
@@ -2196,31 +2211,32 @@ unsafe fn fs_resolve_path(s: &mut Fat32State, path: &[u8]) -> Option<ResolvedFil
         if !fs_path_component(comp, &mut want) {
             return None;
         }
-        let found = fs_dir_lookup(s, cur_cluster, &want)?;
-        let (sc, sz, attr, mt) = (found.start_cluster, found.size, found.attr, found.mtime);
         // Skip trailing slashes.
         while pos < path.len() && path[pos] == b'/' {
             pos += 1;
         }
         let is_final = pos >= path.len();
-        if is_final {
-            // The terminal component must be a regular file —
-            // directories aren't openable through FS_OPEN.
-            if (attr & ATTR_DIRECTORY) != 0 {
+        if !is_final {
+            // An intermediate component must be a directory.
+            let (sc, attr) = fs_dir_component(s, cur_cluster, &want)?;
+            if (attr & ATTR_DIRECTORY) == 0 {
                 return None;
             }
-            return Some(ResolvedFile {
-                start_cluster: sc,
-                size: sz,
-                mtime: mt,
-                name: want.short,
-            });
+            cur_cluster = sc;
+            continue;
         }
-        // Intermediate component must be a directory.
-        if (attr & ATTR_DIRECTORY) == 0 {
+        let found = fs_dir_lookup(s, cur_cluster, &want)?;
+        // The terminal component must be a regular file — directories
+        // aren't openable through FS_OPEN.
+        if (found.attr & ATTR_DIRECTORY) != 0 {
             return None;
         }
-        cur_cluster = sc;
+        return Some(ResolvedFile {
+            start_cluster: found.start_cluster,
+            size: found.size,
+            mtime: found.mtime,
+            name: want.short,
+        });
     }
 }
 
@@ -2868,8 +2884,7 @@ unsafe fn fs_resolve_dir_path(s: &mut Fat32State, path: &[u8]) -> Option<u32> {
         if !fs_path_component(comp, &mut want) {
             return None;
         }
-        let found = fs_dir_lookup(s, cur_cluster, &want)?;
-        let (sc, attr) = (found.start_cluster, found.attr);
+        let (sc, attr) = fs_dir_component(s, cur_cluster, &want)?;
         // Every intermediate AND the terminal component must be a dir.
         if (attr & ATTR_DIRECTORY) == 0 {
             return None;
@@ -3369,7 +3384,7 @@ unsafe fn fs_scan_free_clusters(
     }
     let mut c = if lo < 2 { 2 } else { lo };
     while c < hi {
-        if *budget == 0 {
+        if *budget == 0 || (*budget < FAT_SCAN_BUDGET_SECTORS && fs_out_of_time(s)) {
             s.free_scan_cursor = c;
             return FreeScan::Yield;
         }
@@ -3708,7 +3723,7 @@ unsafe fn fs_dir_is_empty(s: &mut Fat32State, cluster: u32) -> Option<bool> {
     let mut lba = cluster_to_sector(s, cluster);
     let mut budget = DIR_SCAN_BUDGET_SECTORS;
     loop {
-        if budget == 0 {
+        if budget == 0 || (budget < DIR_SCAN_BUDGET_SECTORS && fs_out_of_time(s)) {
             return None;
         }
         if fs_read_blockbuf(s, lba) != 0 {
@@ -3973,15 +3988,22 @@ unsafe fn fs_background_step(s: &mut Fat32State) -> bool {
     // Both are one sector write and only happen on the edge into quiescence,
     // so a busy volume never pays for them.
     if s.fs_settle_pending != 0 {
-        s.fs_settle_pending = 0;
         if fs_has_writable_handle(s) {
             // Still in use: record where the allocator got to, but do not
             // stand behind a count that the next write invalidates.
+            s.fs_settle_pending = 0;
             let _ = fs_write_fsinfo(s, false);
-        } else {
-            // Quiescent. Publish the count first, then the clean mark: a
-            // reader that trusts the mark must find a count that matches.
+        } else if s.fs_settle_pending != SETTLE_MARK {
+            // Quiescent. Publish the count first, then the clean mark on the
+            // next step: a reader that trusts the mark must find a count that
+            // matches, and one sector write is what a step can afford. A
+            // mutation in between retracts the count and re-arms the settle
+            // (`fs_begin_mutation`).
             let _ = fs_write_fsinfo(s, true);
+            s.fs_settle_pending = SETTLE_MARK;
+            return true;
+        } else {
+            s.fs_settle_pending = 0;
             let _ = fs_mark_volume_clean(s, true);
         }
     }
@@ -4248,6 +4270,10 @@ unsafe fn fs_begin_mutation(s: &mut Fat32State) {
         // "unknown" rather than a number that no longer describes the FAT.
         let _ = fs_write_fsinfo(s, false);
         let _ = fs_mark_volume_clean(s, false);
+    } else if s.fs_settle_pending == SETTLE_MARK {
+        // The settle published the count and has not yet written the clean
+        // mark: retract the count the same way.
+        let _ = fs_write_fsinfo(s, false);
     }
     s.fs_settle_pending = 1;
 }
@@ -4489,6 +4515,29 @@ enum DirScan {
 /// which the fs contract already defines as "ask again".
 const DIR_SCAN_BUDGET_SECTORS: u32 = 32;
 
+/// `fs_settle_pending` once the settle has published the free count and the
+/// clean mark is what remains (1 = a settle is due).
+const SETTLE_MARK: u8 = 2;
+
+/// Time one `provider_call` or step may spend walking before it yields, in
+/// microseconds, alongside the sector budgets. A sector count alone assumes
+/// a device speed, and a single-sector read costs anywhere from a few
+/// microseconds to milliseconds depending on the device and its power state,
+/// so 32 of them can pass a step's deadline several times over. A walk
+/// always reads at least one sector per call, so a slow device still makes
+/// progress; the budget is well under a step because the read that crosses
+/// it still completes.
+const CALL_BUDGET_US: u64 = 400;
+
+/// Whether the current call has spent its time budget ([`CALL_BUDGET_US`]),
+/// measured from `call_t0`; never before the first call has set it.
+unsafe fn fs_out_of_time(s: &Fat32State) -> bool {
+    if s.call_t0 == 0 || s.syscalls.is_null() {
+        return false;
+    }
+    dev_micros(&*s.syscalls).wrapping_sub(s.call_t0) > CALL_BUDGET_US
+}
+
 /// Parked walks the working cursor spills into when it yields `Pending`.
 ///
 /// One working cursor, and this many parked ones. With a single cursor, two
@@ -4500,7 +4549,90 @@ const DIR_SCAN_BUDGET_SECTORS: u32 = 32;
 /// free slots changed meanwhile ([`fs_dir_changed`]).
 const DIR_CURSOR_POOL: usize = 4;
 
-/// Drop every walk, working or parked, over `dir_cluster`.
+/// Directory components resolved recently, so the paths of one operation --
+/// a rename's source and destination share a parent -- do not each walk the
+/// directories above it. Two lookups of one name in one call do not share a
+/// walk: the first resumes the parked walk and finishes it, and the second
+/// finds none and starts over. Under a directory too long to walk in one
+/// call, every call would then resolve the first path and run out on the
+/// second, and the operation would answer "not yet" for ever. A cached
+/// component is dropped when its parent directory's names change
+/// ([`fs_dir_changed`]), when a rename intent is replayed, and when the
+/// volume is formatted.
+const DIR_CACHE: usize = 2;
+
+#[derive(Clone, Copy)]
+struct DirCacheEntry {
+    /// The directory the component was found in; 0 = empty.
+    parent: u32,
+    short: [u8; 11],
+    long: [u8; LFN_MAX_CHARS],
+    long_len: u8,
+    start_cluster: u32,
+    attr: u8,
+}
+
+impl DirCacheEntry {
+    const EMPTY: Self = Self {
+        parent: 0,
+        short: [0; 11],
+        long: [0; LFN_MAX_CHARS],
+        long_len: 0,
+        start_cluster: 0,
+        attr: 0,
+    };
+}
+
+/// Resolve one directory component of a path in `parent`: from the cache
+/// when it holds it, else by a walk, cached when it names a directory. Only
+/// directories are cached -- a file's size and time change without its
+/// parent's names changing -- and a component is looked up through here only
+/// where it must be a directory: one a path continues past, or the directory
+/// `OPENDIR` names. A miss costs a walk, never a wrong answer: the cache
+/// matches a name only in the spelling it was asked in.
+unsafe fn fs_dir_component(s: &mut Fat32State, parent: u32, want: &PathName) -> Option<(u32, u8)> {
+    if let Some(hit) = fs_dir_cache_get(s, parent, want) {
+        return Some(hit);
+    }
+    let found = fs_dir_lookup(s, parent, want)?;
+    if (found.attr & ATTR_DIRECTORY) != 0 {
+        fs_dir_cache_put(s, parent, want, found.start_cluster, found.attr);
+    }
+    Some((found.start_cluster, found.attr))
+}
+
+fn fs_dir_cache_get(s: &Fat32State, parent: u32, want: &PathName) -> Option<(u32, u8)> {
+    let mut c = 0usize;
+    while c < DIR_CACHE {
+        let e = &s.dir_cache[c];
+        if e.parent != 0
+            && e.parent == parent
+            && e.short == want.short
+            && e.long_len == want.long_len
+            && e.long[..e.long_len as usize] == want.long[..want.long_len as usize]
+        {
+            return Some((e.start_cluster, e.attr));
+        }
+        c += 1;
+    }
+    None
+}
+
+fn fs_dir_cache_put(s: &mut Fat32State, parent: u32, want: &PathName, cluster: u32, attr: u8) {
+    let slot = s.dir_cache_next as usize % DIR_CACHE;
+    s.dir_cache_next = s.dir_cache_next.wrapping_add(1);
+    s.dir_cache[slot] = DirCacheEntry {
+        parent,
+        short: want.short,
+        long: want.long,
+        long_len: want.long_len,
+        start_cluster: cluster,
+        attr,
+    };
+}
+
+/// Drop every walk, working or parked, over `dir_cluster`, and every cached
+/// component found in it.
 ///
 /// A walk carries what it learned from the sectors behind it: where the
 /// free run it would claim starts, where the long-name companions in front
@@ -4511,8 +4643,17 @@ const DIR_CURSOR_POOL: usize = 4;
 /// name created behind it or hand a create a slot that is no longer free.
 /// So those writes drop the directory's walks, and the next call starts
 /// over. A size or first-cluster update to an existing entry changes
-/// neither, and does not.
+/// neither, and does not. A cached component goes with them: the entry it
+/// was read from may be the one retired or renamed, and its cluster may be
+/// handed to another directory.
 fn fs_dir_changed(s: &mut Fat32State, dir_cluster: u32) {
+    let mut c = 0usize;
+    while c < DIR_CACHE {
+        if s.dir_cache[c].parent == dir_cluster {
+            s.dir_cache[c].parent = 0;
+        }
+        c += 1;
+    }
     if s.dir_cursor.dir_cluster == dir_cluster {
         s.dir_cursor.dir_cluster = 0;
     }
@@ -4736,7 +4877,7 @@ unsafe fn fs_dir_walk_long(
             s.dir_cursor.cluster = next;
             s.dir_cursor.sector = 0;
         }
-        if budget == 0 {
+        if budget == 0 || (budget < DIR_SCAN_BUDGET_SECTORS && fs_out_of_time(s)) {
             // Park the walk in a free slot. With none free it is NOT parked
             // and restarts when asked again: evicting a parked walk instead
             // lets more walkers than slots evict each other every round and
@@ -5209,8 +5350,7 @@ unsafe fn fs_split_parent(s: &mut Fat32State, path: &[u8]) -> Option<(u32, PathN
         if is_final {
             return Some((cur, want));
         }
-        let found = fs_dir_lookup(s, cur, &want)?;
-        let (sc, attr) = (found.start_cluster, found.attr);
+        let (sc, attr) = fs_dir_component(s, cur, &want)?;
         if (attr & ATTR_DIRECTORY) == 0 {
             return None;
         }
@@ -6846,6 +6986,7 @@ unsafe fn fs_rename_recover(s: &mut Fat32State) {
     // The intent record names sectors, not directories: drop every walk.
     s.dir_cursor.dir_cluster = 0;
     s.dir_cursor_pool = [DirCursor::empty(); DIR_CURSOR_POOL];
+    s.dir_cache = [DirCacheEntry::EMPTY; DIR_CACHE];
     let mut rec = [0u8; BLOCK_SIZE];
     if fs_sync_read_sector(s, intent_lba, rec.as_mut_ptr()) != 0 {
         return;
@@ -7147,6 +7288,9 @@ pub unsafe extern "C" fn fat32_fs_dispatch(
         return E_INVAL;
     }
     let s = &mut *(state as *mut Fat32State);
+    if !s.syscalls.is_null() {
+        s.call_t0 = dev_micros(&*s.syscalls);
+    }
     // `contracts::fence::QUERY_OP` — fence introspection. A handle reports
     // `LocalDurable` ONLY after a writable handle's bytes have been committed
     // past the device's volatile cache by a successful FS_FSYNC (`durable`
@@ -7190,13 +7334,12 @@ pub unsafe extern "C" fn fat32_fs_dispatch(
     // `reserved_sectors` is 0 and that bit would read clear — so CAPS
     // answers `E_AGAIN` until the mount resolves, exactly like every
     // other opcode. Returning a pessimistic bitmap instead would be
-    // worse than useless: the contract has consumers probe CAPS once
-    // and latch the answer, so a boot-order probe would permanently
-    // record a capability the volume does in fact have, and the
-    // consumer would run its degraded tier forever with nothing to
-    // distinguish that from a volume that genuinely cannot carry the
-    // record. A capability answer is only meaningful once there is a
-    // volume to answer about.
+    // worse than useless: a consumer may latch the bitmap it reads, so a
+    // boot-order probe would record as absent a capability the volume
+    // does in fact have, and the consumer would run its degraded tier
+    // forever with nothing to distinguish that from a volume that
+    // genuinely cannot carry the record. A capability answer is only
+    // meaningful once there is a volume to answer about.
     if opcode == FS_CAPS {
         if arg.is_null() || arg_len < 4 {
             return E_INVAL;
@@ -7229,10 +7372,15 @@ pub unsafe extern "C" fn fat32_fs_dispatch(
     // that runs before the free summary is read would start from a default
     // rather than from where the last mount left off.
     if s.rename_recovered == 0 && s.init_phase == Fat32InitPhase::Done {
-        s.rename_recovered = 1;
-        fs_read_fsinfo(s);
-        fs_read_clean_bit(s);
+        // The steps had not finished settling it: the rest happens here.
+        if s.settle_stage == 0 {
+            fs_read_fsinfo(s);
+        }
+        if s.settle_stage <= 1 {
+            fs_read_clean_bit(s);
+        }
         fs_rename_recover(s);
+        s.rename_recovered = 1;
     }
     // A graph that named a volume gets that volume or nothing. Refusing
     // every operation — rather than only the destructive ones — is the point:
@@ -7442,6 +7590,24 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         }
 
         s.tick_count = s.tick_count.wrapping_add(1);
+        s.call_t0 = dev_micros(&*s.syscalls);
+        // Settle the mount once it is mounted, one stage a step: the free
+        // summary, the clean bit, then the rename replay. Each is a device
+        // read or a few, and the first consumer call would otherwise pay for
+        // all of them inside its own step. A call that arrives before the
+        // steps finish settles the rest inline (see the dispatch).
+        if s.rename_recovered == 0 && s.init_phase == Fat32InitPhase::Done {
+            match s.settle_stage {
+                0 => fs_read_fsinfo(s),
+                1 => fs_read_clean_bit(s),
+                _ => {
+                    fs_rename_recover(s);
+                    s.rename_recovered = 1;
+                }
+            }
+            s.settle_stage = s.settle_stage.saturating_add(1);
+            return 0;
+        }
         let now_ms = dev_millis(&*s.syscalls);
         let observe_due = now_ms.wrapping_sub(s.last_observe_ms) >= FAT32_OBSERVE_INTERVAL_MS;
         if observe_due {
@@ -7956,7 +8122,9 @@ unsafe fn format_meta_step(s: &mut Fat32State) -> i32 {
         s.fmt.cursor += 1;
     }
     log_info(s, b"[fat32] formatted");
-    // Mount what was just written, through the same path as any volume.
+    // Mount what was just written, through the same path as any volume. No
+    // directory resolved on the old volume names anything on this one.
+    s.dir_cache = [DirCacheEntry::EMPTY; DIR_CACHE];
     s.init_phase = Fat32InitPhase::Idle;
     0
 }

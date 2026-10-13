@@ -96,6 +96,21 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
     }
     let mut results = Vec::new();
 
+    // ───── setup ─────────────────────────────────────────────────────────
+    //
+    // `[ci.setup] scripts` run before every other phase. What they
+    // provision — a certificate an example graph names, a generated input —
+    // is read from the examples check onward, and a phase must read what
+    // this run provided, never what an earlier run happened to leave
+    // behind. Not skippable: the phases after it depend on it.
+    match load_setup_scripts(project_root) {
+        Ok(setup) if setup.is_empty() => {}
+        Ok(setup) => results.push(run_step("setup", verbose, || {
+            run_setup_scripts(project_root, &setup, verbose)
+        })),
+        Err(e) => results.push(run_step("setup", verbose, move || Err(e))),
+    }
+
     // A fmod-only project (all PIC modules, no host crate) has no `Cargo.toml`,
     // so `cargo fmt` / `cargo clippy` have nothing to drive. Rather than skip
     // the lint gate there, clippy runs directly on the PIC module sources
@@ -2469,29 +2484,41 @@ fn modules_clippy_check(project_root: &Path, verbose: bool) -> std::result::Resu
 /// exists but can't be read or parsed is an error — a broken config must
 /// fail the phase, never silently omit it.
 pub(crate) fn load_test_scripts(project_root: &Path) -> std::result::Result<Vec<String>, String> {
+    load_scripts(project_root, "test")
+}
+
+/// Read `[ci.setup] scripts` from `fluxor.toml` — the globs of shell
+/// scripts that provision what the other phases read (a certificate an
+/// example graph names, a generated input), run before any of them. Empty
+/// when unconfigured; a broken fluxor.toml is an error, as for
+/// [`load_test_scripts`].
+pub(crate) fn load_setup_scripts(project_root: &Path) -> std::result::Result<Vec<String>, String> {
+    load_scripts(project_root, "setup")
+}
+
+/// `[ci.<table>] scripts` from `fluxor.toml`.
+fn load_scripts(project_root: &Path, table: &str) -> std::result::Result<Vec<String>, String> {
     let fp = project_root.join("fluxor.toml");
     if !fp.exists() {
         return Ok(Vec::new());
     }
     #[derive(serde::Deserialize)]
     struct Top {
-        ci: Option<Ci>,
+        ci: Option<std::collections::BTreeMap<String, toml::Value>>,
     }
     #[derive(serde::Deserialize)]
-    struct Ci {
-        test: Option<Test>,
-    }
-    #[derive(serde::Deserialize)]
-    struct Test {
+    struct Scripts {
         scripts: Option<Vec<String>>,
     }
     let raw = std::fs::read_to_string(&fp).map_err(|e| format!("{}: {e}", fp.display()))?;
     let top: Top = toml::from_str(&raw).map_err(|e| format!("parsing fluxor.toml: {e}"))?;
-    Ok(top
-        .ci
-        .and_then(|c| c.test)
-        .and_then(|t| t.scripts)
-        .unwrap_or_default())
+    let Some(value) = top.ci.and_then(|mut c| c.remove(table)) else {
+        return Ok(Vec::new());
+    };
+    let section: Scripts = value
+        .try_into()
+        .map_err(|e| format!("parsing fluxor.toml [ci.{table}]: {e}"))?;
+    Ok(section.scripts.unwrap_or_default())
 }
 
 /// Expand a `dir/pattern` glob (single `*` wildcard in the filename
@@ -2541,6 +2568,29 @@ pub(crate) fn run_test_scripts(
     globs: &[String],
     verbose: bool,
 ) -> std::result::Result<(), String> {
+    run_scripts(project_root, "test", "project-e2e", "e2e", globs, verbose)
+}
+
+/// Run each configured setup script, as [`run_test_scripts`] runs the
+/// test scripts.
+pub(crate) fn run_setup_scripts(
+    project_root: &Path,
+    globs: &[String],
+    verbose: bool,
+) -> std::result::Result<(), String> {
+    run_scripts(project_root, "setup", "setup", "setup", globs, verbose)
+}
+
+/// Run the `[ci.<table>] scripts` globs as phase `phase`; `what` names the
+/// scripts in the verdict ("2 of 9 e2e scripts failed").
+fn run_scripts(
+    project_root: &Path,
+    table: &str,
+    phase: &str,
+    what: &str,
+    globs: &[String],
+    verbose: bool,
+) -> std::result::Result<(), String> {
     let mut scripts = Vec::new();
     let mut unmatched = Vec::new();
     for g in globs {
@@ -2555,17 +2605,17 @@ pub(crate) fn run_test_scripts(
         // nothing means a moved/renamed script would silently drop out of
         // the gate.
         return Err(format!(
-            "[ci.test] scripts matched no files: {}",
+            "[ci.{table}] scripts matched no files: {}",
             unmatched.join(", ")
         ));
     }
     scripts.sort();
     scripts.dedup();
     vacuity(
-        "project-e2e",
+        phase,
         scripts.len(),
         globs.len(),
-        "`[ci.test] scripts` glob(s) are declared",
+        &format!("`[ci.{table}] scripts` glob(s) are declared"),
         "every glob expanded to nothing — the scripts were moved, renamed, or are not in \
          this checkout",
     )?;
@@ -2577,7 +2627,7 @@ pub(crate) fn run_test_scripts(
             .unwrap_or("?")
             .to_string();
         if verbose {
-            eprintln!("[ci] project-e2e: {name}");
+            eprintln!("[ci] {phase}: {name}");
         }
         // The script runs against the CLI running this gate, so it exercises
         // the tree under test rather than whatever `fluxor` is on PATH.
@@ -2592,7 +2642,7 @@ pub(crate) fn run_test_scripts(
                 let mut combined = String::from_utf8_lossy(&o.stdout).into_owned();
                 combined.push_str(&String::from_utf8_lossy(&o.stderr));
                 let tail: Vec<&str> = combined.lines().rev().take(20).collect();
-                eprintln!("== project-e2e FAIL: {name} ==");
+                eprintln!("== {phase} FAIL: {name} ==");
                 for line in tail.into_iter().rev() {
                     eprintln!("  {line}");
                 }
@@ -2604,7 +2654,7 @@ pub(crate) fn run_test_scripts(
         Ok(())
     } else {
         Err(format!(
-            "{} of {} e2e scripts failed: {}",
+            "{} of {} {what} scripts failed: {}",
             failed.len(),
             scripts.len(),
             failed.join(", ")
@@ -3025,8 +3075,8 @@ fn preview(items: &[String]) -> String {
 mod tests {
     use super::{
         classify_staleness, cli_dir_for, host_binary_build_args, live_staleness_scope,
-        path_with_first, release_cli_dir, shim_dir, with_running_cli, PhaseStatus, RunningCli,
-        HARNESS_TARGET,
+        load_setup_scripts, path_with_first, release_cli_dir, run, run_setup_scripts, shim_dir,
+        with_running_cli, PhaseStatus, RunningCli, SkipSet, HARNESS_TARGET,
     };
     use crate::store_sync::StalenessScope;
 
@@ -3065,6 +3115,55 @@ mod tests {
             assert_eq!(status, PhaseStatus::Ok, "{scope:?}");
             assert!(message.is_empty(), "{scope:?}");
         }
+    }
+
+    /// A project whose `[ci.setup]` script writes `marker` into the root.
+    fn setup_project() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("fluxor.toml"),
+            "[project]\nname = \"x\"\nversion = \"0\"\n[ci.setup]\nscripts = [\"setup.sh\"]\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("setup.sh"), "echo provisioned > marker\n").unwrap();
+        dir
+    }
+
+    /// `[ci.setup] scripts` load from `fluxor.toml` and run with the project
+    /// root as their working directory; a project without the table has none.
+    #[test]
+    fn setup_scripts_load_and_run_in_the_project_root() {
+        let bare = tempfile::tempdir().unwrap();
+        std::fs::write(bare.path().join("fluxor.toml"), "[project]\nname = \"x\"\n").unwrap();
+        assert!(load_setup_scripts(bare.path()).unwrap().is_empty());
+
+        let dir = setup_project();
+        let setup = load_setup_scripts(dir.path()).unwrap();
+        assert_eq!(setup, ["setup.sh"]);
+        run_setup_scripts(dir.path(), &setup, false).unwrap();
+        assert!(
+            dir.path().join("marker").is_file(),
+            "the script ran in the project root"
+        );
+    }
+
+    /// Setup is the gate's first phase, so every later phase reads what this
+    /// run provisioned; it runs even when every skippable phase is skipped.
+    #[test]
+    fn setup_is_the_gates_first_phase() {
+        let dir = setup_project();
+        let skip = SkipSet {
+            cargo: true,
+            modules: true,
+            lint: true,
+            hygiene: true,
+            templates: true,
+            kernel: true,
+        };
+        let results = run(dir.path(), &skip, false).unwrap();
+        assert_eq!(results.first().map(|r| r.name), Some("setup"));
+        assert_eq!(results[0].status, PhaseStatus::Ok, "{}", results[0].message);
+        assert!(dir.path().join("marker").is_file());
     }
 
     /// The `[ci] live_staleness` key: absent or unreadable → the safe

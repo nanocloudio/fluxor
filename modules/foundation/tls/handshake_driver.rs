@@ -117,19 +117,23 @@ pub struct HandshakeDriver {
     /// CertificateVerify schemes it may sign with and how its bytes are read.
     pub peer_cert_key_suite: u16,
 
-    /// RSA signatures the chain walk deferred to the instance's stepped
-    /// job, and the CertificateVerify awaiting the same job. While either
-    /// is pending the received message is held in `scratch` (its length in
-    /// `held_len`), because the job reads the signature and the signed
-    /// bytes from there across ticks.
+    /// Chain-link signatures the walk deferred to a stepped verification,
+    /// and the CertificateVerify awaiting one. While either is pending the
+    /// received message is held in `scratch` (its length in `held_len`),
+    /// because the verification reads the signature and the signed bytes
+    /// from there across ticks.
     pub deferred_links: DeferredLinks,
-    /// The ECDSA half of the same job: per driver, since it is two ladder
-    /// states rather than kilobytes.
+    /// A P-256 ECDSA signature in verification: per driver, since it is
+    /// two ladder states rather than the kilobytes of the instance's RSA
+    /// job.
     pub ecdsa_verify: EcdsaVerifyJob,
     /// The same for a P-384 signature.
     pub ecdsa_verify384: Ecdsa384VerifyJob,
+    /// The same for an Ed25519 signature.
+    pub ed25519_verify: Ed25519VerifyJob,
     pub held_len: u16,
-    /// Whether the instance job currently holds this driver's work.
+    /// Whether the signature in hand has its verification begun: on the
+    /// instance's RSA job, or on one of the driver's own jobs above.
     pub rsa_job_active: u8,
     /// Pump calls the deferred verification has taken so far, for the
     /// line that reports it.
@@ -215,6 +219,7 @@ impl HandshakeDriver {
             deferred_links: DeferredLinks::empty(),
             ecdsa_verify: EcdsaVerifyJob::empty(),
             ecdsa_verify384: Ecdsa384VerifyJob::empty(),
+            ed25519_verify: Ed25519VerifyJob::empty(),
             held_len: 0,
             rsa_job_active: 0,
             verify_steps: 0,
@@ -241,8 +246,9 @@ impl HandshakeDriver {
     }
 
     pub fn reset(&mut self) {
-        // SAFETY: pointer arithmetic over the handshake-state buffer; bounds
-        // checked against the driver-message length.
+        // Volatile, so the wipe of the secrets is not elided as dead stores.
+        // SAFETY: each pointer comes from a live `&mut` to an element of a
+        // 32-byte array, and `i < 32` indexes it in bounds.
         unsafe {
             let mut i = 0;
             while i < 32 {
@@ -264,6 +270,7 @@ impl HandshakeDriver {
         self.deferred_links.clear();
         self.ecdsa_verify = EcdsaVerifyJob::empty();
         self.ecdsa_verify384 = Ecdsa384VerifyJob::empty();
+        self.ed25519_verify = Ed25519VerifyJob::empty();
         self.ecdsa_sign_state384.zeroise_secrets();
         self.ecdsa_sign_state384 = Ecdsa384SignState::empty();
         self.held_len = 0;
@@ -312,15 +319,7 @@ impl HandshakeDriver {
         if n == 0 {
             return 0;
         }
-        // SAFETY: pointer arithmetic over the handshake-state buffer; bounds
-        // checked against the driver-message length.
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                bytes.as_ptr(),
-                self.in_buf.as_mut_ptr().add(self.in_len),
-                n,
-            );
-        }
+        self.in_buf[self.in_len..self.in_len + n].copy_from_slice(&bytes[..n]);
         self.in_len += n;
         n
     }
@@ -340,19 +339,8 @@ impl HandshakeDriver {
         } else {
             self.out_len
         };
-        // SAFETY: pointer arithmetic over the handshake-state buffer; bounds
-        // checked against the driver-message length.
-        unsafe {
-            core::ptr::copy_nonoverlapping(self.out_buf.as_ptr(), out.as_mut_ptr(), n);
-            let remain = self.out_len - n;
-            if remain > 0 {
-                core::ptr::copy(
-                    self.out_buf.as_ptr().add(n),
-                    self.out_buf.as_mut_ptr(),
-                    remain,
-                );
-            }
-        }
+        out[..n].copy_from_slice(&self.out_buf[..n]);
+        self.out_buf.copy_within(n..self.out_len, 0);
         self.out_len -= n;
         n
     }
@@ -543,31 +531,28 @@ pub unsafe fn pump_recv_certificate_verify_core(driver: &mut HandshakeDriver) ->
     } else {
         HandshakeState::RecvFinished
     };
-    // Ed25519 signs the content itself, which is here and nowhere later:
-    // one verification, done now, and the message joins the transcript only
-    // if it holds.
-    if scheme == SIG_ED25519 {
+    // The signature check is a stepped job — RSA-PSS on the instance's
+    // exponentiation, ECDSA and Ed25519 on the driver's own jobs — so the
+    // message is held in `scratch`: the job reads the signature from it
+    // and the transcript takes the message once it verifies. RSA-PSS and
+    // ECDSA sign a digest of the content, kept in `cv_hash` for the pump to
+    // begin the job with. Ed25519 signs the content itself, which exists
+    // only here, so its job is begun here (hashing the content into its
+    // challenge) and the pump paces and steps it.
+    let ed25519 = scheme == SIG_ED25519;
+    if ed25519 {
         let pk = &driver.peer_cert_pubkey[..driver.peer_cert_pubkey_len as usize];
         let (Ok(key), Ok(signature)) = (<&[u8; 32]>::try_from(pk), <&[u8; 64]>::try_from(sig))
         else {
             driver.hs_state = HandshakeState::Error;
             return true;
         };
-        if !ed25519_verify(key, &vc[..vc_len], signature) {
+        let Some(started) = ed25519_verify_init(key, &vc[..vc_len], signature, 0) else {
             driver.hs_state = HandshakeState::Error;
             return true;
-        }
-        if let Some(ref mut t) = driver.transcript {
-            t.update(&data[..len]);
-        }
-        driver.hs_state = next;
-        return true;
-    }
-    // The signature check is a stepped job — RSA-PSS on the instance's
-    // exponentiation, ECDSA on the driver's ladders — so the message is
-    // held in `scratch`: the job reads the signature from it and the
-    // transcript takes the message once it verifies.
-    if scheme_hash_len(scheme) == 48 {
+        };
+        driver.ed25519_verify = started;
+    } else if scheme_hash_len(scheme) == 48 {
         driver.cv_hash[..48].copy_from_slice(&sha384(&vc[..vc_len]));
     } else {
         driver.cv_hash[..32].copy_from_slice(&sha256(&vc[..vc_len]));
@@ -578,7 +563,7 @@ pub unsafe fn pump_recv_certificate_verify_core(driver: &mut HandshakeDriver) ->
     driver.cv_scheme = scheme;
     driver.cv_sig_off = sig_off as u16;
     driver.cv_sig_len = sig.len() as u16;
-    driver.rsa_job_active = 0;
+    driver.rsa_job_active = u8::from(ed25519);
     driver.after_verify = next;
     driver.verify_steps = 0;
     driver.hs_state = HandshakeState::VerifyPeerSignature;
@@ -621,9 +606,10 @@ pub enum RsaPump {
 /// Drive the verify jobs for `driver`, which is in `VerifyChain`
 /// (deferred chain links, read from the held message and `anchor`) or
 /// `VerifyPeerSignature` (the held CertificateVerify). An RSA signature
-/// spends up to `rows` units of the instance job `job`; an ECDSA one spends
-/// one `ec_bits`-bit step of the driver's own ladders. The caller has
-/// already decided this driver may use the instance job.
+/// spends up to `rows` units of the instance job `job`; an ECDSA or
+/// Ed25519 one spends one step of the driver's own job, walking `ec_bits`
+/// scalar bits (0: the whole walk). The caller has already decided this
+/// driver may use the instance job.
 pub unsafe fn rsa_verify_pump_core(
     driver: &mut HandshakeDriver,
     job: &mut RsaVerifyJob,
@@ -646,13 +632,24 @@ pub unsafe fn rsa_verify_pump_core(
             let link = driver.deferred_links.links[driver.deferred_links.next as usize];
             let ecdsa = link.sig_suite == suite::ECDSA_P256_SHA256;
             let ecdsa384 = link.sig_suite == suite::ECDSA_P384_SHA384;
+            let ed25519 = link.sig_suite == suite::ED25519;
             if driver.rsa_job_active == 0 {
                 let message = &driver.scratch[4..held];
                 let Some((tbs, sig, key_bytes)) = deferred_link_bytes(&link, message, anchor)
                 else {
                     return RsaPump::Failed;
                 };
-                if ecdsa {
+                if ed25519 {
+                    let (Ok(key), Ok(signature)) =
+                        (<&[u8; 32]>::try_from(key_bytes), <&[u8; 64]>::try_from(sig))
+                    else {
+                        return RsaPump::Failed;
+                    };
+                    let Some(started) = ed25519_verify_init(key, tbs, signature, ec_bits) else {
+                        return RsaPump::Failed;
+                    };
+                    driver.ed25519_verify = started;
+                } else if ecdsa {
                     let Some(raw) = parse_der_signature(sig) else {
                         return RsaPump::Failed;
                     };
@@ -681,7 +678,12 @@ pub unsafe fn rsa_verify_pump_core(
                 }
                 driver.rsa_job_active = 1;
             }
-            let ok = if ecdsa {
+            let ok = if ed25519 {
+                if !driver.ed25519_verify.step() {
+                    return RsaPump::Progress;
+                }
+                ed25519_verify_finalise(&driver.ed25519_verify)
+            } else if ecdsa {
                 if !driver.ecdsa_verify.step() {
                     return RsaPump::Progress;
                 }
@@ -713,6 +715,12 @@ pub unsafe fn rsa_verify_pump_core(
         HandshakeState::VerifyPeerSignature => {
             let ecdsa = driver.cv_scheme == SIG_ECDSA_SECP256R1_SHA256;
             let ecdsa384 = driver.cv_scheme == SIG_ECDSA_SECP384R1_SHA384;
+            let ed25519 = driver.cv_scheme == SIG_ED25519;
+            if ed25519 {
+                // Begun when the message arrived; paced here, where the
+                // budget is known, before every step.
+                driver.ed25519_verify.pace(ec_bits);
+            }
             if driver.rsa_job_active == 0 {
                 let Some(sig) = driver.scratch.get(
                     driver.cv_sig_off as usize..(driver.cv_sig_off + driver.cv_sig_len) as usize,
@@ -749,7 +757,12 @@ pub unsafe fn rsa_verify_pump_core(
                 }
                 driver.rsa_job_active = 1;
             }
-            let ok = if ecdsa {
+            let ok = if ed25519 {
+                if !driver.ed25519_verify.step() {
+                    return RsaPump::Progress;
+                }
+                ed25519_verify_finalise(&driver.ed25519_verify)
+            } else if ecdsa {
                 if !driver.ecdsa_verify.step() {
                     return RsaPump::Progress;
                 }

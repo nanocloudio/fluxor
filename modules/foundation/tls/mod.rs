@@ -76,6 +76,8 @@ include!("../../sdk/crypto/aes_gcm.rs");
 include!("../../sdk/crypto/p256.rs");
 include!("../../sdk/crypto/p384.rs");
 include!("../../sdk/crypto/ed25519.rs");
+// The stepped Ed25519 verifier, over the helpers just mounted.
+include!("ed25519_job.rs");
 include!("../../sdk/crypto/sha3.rs");
 // ml_dsa.rs needs sha3.rs's SHAKE in scope; x509.rs needs ml_dsa.rs for
 // post-quantum certificate suites. Order matters for all three.
@@ -1240,21 +1242,17 @@ define_params! {
 
     // How many ephemeral ECDH keys to mint before this module is ready.
     //
-    // The pool exists to keep a synchronous keygen off a SERVER's hot accept
-    // path. Minting all of it at `module_new` made every deployment pay a
-    // busy server's warm-up: 64 keys at ~7.6 ms each is roughly half a
-    // second, before a line of anything else runs, and a CLI client that
-    // opens one connection threw 63 of them away. That was the whole of the
-    // phasor applet's startup time.
-    //
-    // A few are minted here so the first handshakes are instant, and
-    // `pump_ecdh_refill` fills the rest in the background at
+    // The pool keeps a synchronous keygen off a SERVER's hot accept path.
+    // Minting all of it at `module_new` would charge every deployment a
+    // busy server's warm-up, a full ladder per key before anything else
+    // runs, and a client that opens one connection would discard all but
+    // one of them. So a few are minted here, making the first handshakes
+    // instant, and `pump_ecdh_refill` fills the rest in the background at
     // `ecdh_bits_per_step` a tick. A deployment that accepts many
     // simultaneous handshakes from cold sets this higher and pays for what
     // it asked for; one that does not is not charged for it. Beyond the
-    // warm count a handshake takes the `fallback_keygen` path, which is the
-    // same path the pool has always fallen back to and is counted in the
-    // heartbeat.
+    // warm count a handshake takes the `fallback_keygen` path, counted in
+    // the heartbeat.
     18, ecdh_pool_warm, u16, 4
         => |s, d, len| {
             let v = p_u16(d, len, 0, 4);
@@ -1613,7 +1611,7 @@ pub unsafe extern "C" fn module_new(
             let h = (sys.provider_call)(-1, KV_STORE, store_arg.as_mut_ptr(), store_arg.len());
             if h >= 0 {
                 s.key_vault_handle = h;
-                // Vault now holds the authoritative copy; wipe the
+                // The vault holds the authoritative copy; wipe the
                 // in-module key material so pump_send_certificate_verify
                 // must sign through the vault (and can't silently fall
                 // back to a plaintext key).
@@ -2017,7 +2015,7 @@ unsafe fn tcp_module_step(s: &mut TlsState) -> i32 {
             // keeps one transition per tick unless it opts in.
             let mut steps = 0;
             // Floor at 1 here as well as in the param decoder. `set_defaults`
-            // covers the no-params case today, but a zero reaching this loop
+            // covers the no-params case, but a zero reaching this loop
             // means `steps < 0` is false on entry and NO session ever advances
             // a handshake — a total, silent failure to serve. Too severe a
             // failure mode to leave resting on an initialisation order.
@@ -3506,10 +3504,10 @@ unsafe fn trusted_now_secs(sys: &SyscallTable) -> u64 {
 ///
 /// Called only after [`peer_cert_reason`] returned [`CERT_OK`], so
 /// downstream code's use of `peer_cert_pubkey_len > 0` as the marker that a
-/// real identity was bound stays true. When the walk deferred RSA or ECDSA
-/// links the key is bound at that acceptance, while those links are still
-/// stepping; the session stays in `VerifyChain` until they verify, so no
-/// handshake completes on a key the chain has not yet proved.
+/// real identity was bound stays true. When the walk deferred links the key
+/// is bound at that acceptance, while those links are still stepping; the
+/// session stays in `VerifyChain` until they verify, so no handshake
+/// completes on a key the chain has not yet proved.
 unsafe fn bind_peer_cert_key(driver: &mut HandshakeDriver, hs_body: &[u8]) -> u32 {
     let cert_der = match parse_certificate_msg(hs_body) {
         Some(d) => d,
@@ -3570,7 +3568,7 @@ unsafe fn session_verify_peer_cert(s: &mut TlsState, idx: usize, hs_body: &[u8])
 }
 
 /// After a chain was accepted: either move to `next`, or — when the walk
-/// deferred RSA links — hold the message and go verify them first.
+/// deferred links — hold the message and go verify them first.
 unsafe fn after_peer_cert(driver: &mut HandshakeDriver, msg: &[u8], next: HandshakeState) {
     if driver.deferred_links.pending() {
         driver.scratch[..msg.len()].copy_from_slice(msg);
@@ -3588,14 +3586,38 @@ unsafe fn after_peer_cert(driver: &mut HandshakeDriver, msg: &[u8], next: Handsh
 /// owner ids are offset so the two index spaces cannot collide.
 const RSA_OWNER_DTLS: i32 = 0x1000;
 
-/// Whether `owner` may use the instance job now: it holds it, or nobody
-/// does.
+/// Whether `owner` may use the instance job now: it holds it, nobody does,
+/// or its holder is no longer verifying. A session or DTLS peer that is
+/// closed or reset mid-verification never reports `Done` or `Failed`, so
+/// its hold lapses with it rather than stalling every other handshake's
+/// verification; the next holder begins its own job afresh.
 fn rsa_job_available(s: &TlsState, owner: i32) -> bool {
-    s.rsa_owner < 0 || s.rsa_owner == owner
+    s.rsa_owner < 0 || s.rsa_owner == owner || !rsa_holder_verifying(s, s.rsa_owner)
 }
 
-/// The ladder bits one step spends on an ECDSA verification: the same
-/// knob that paces the ECDH ladder, since both are the P-256 ladder.
+/// Whether `holder` (an `rsa_owner` value) is a live handshake in
+/// `VerifyChain` or `VerifyPeerSignature`.
+fn rsa_holder_verifying(s: &TlsState, holder: i32) -> bool {
+    let driver = if holder >= RSA_OWNER_DTLS {
+        match s.peer_sessions.get((holder - RSA_OWNER_DTLS) as usize) {
+            Some(peer) if peer.phase == DtlsPhase::Handshaking => &peer.endpoint.driver,
+            _ => return false,
+        }
+    } else {
+        let idx = holder as usize;
+        if idx >= s.sessions.len() || s.sessions[idx].state != SessionState::Handshaking {
+            return false;
+        }
+        &s.sessions[idx].driver
+    };
+    matches!(
+        driver.hs_state,
+        HandshakeState::VerifyChain | HandshakeState::VerifyPeerSignature
+    )
+}
+
+/// The scalar bits one step walks on an ECDSA or Ed25519 verification
+/// (0: the whole walk): the same knob that paces the ECDH ladder.
 fn ec_bits_per_step(s: &TlsState) -> u8 {
     if s.ecdh_bits_per_step >= 256 {
         0
@@ -3708,6 +3730,14 @@ unsafe fn log_chain_verified(s: &mut TlsState, idx: usize, suite: u16) {
         log_chain_verified_line(s, b"[tls] chain verified suite=ecdsa_p256", links, steps);
     } else if suite == suite::ECDSA_P384_SHA384 {
         log_chain_verified_line(s, b"[tls] chain verified suite=ecdsa_p384", links, steps);
+    } else if suite == suite::ED25519 {
+        log_chain_verified_line(s, b"[tls] chain verified suite=ed25519", links, steps);
+    } else if suite == suite::ML_DSA_44 {
+        log_chain_verified_line(s, b"[tls] chain verified suite=ml_dsa_44", links, steps);
+    } else if suite == suite::ML_DSA_65 {
+        log_chain_verified_line(s, b"[tls] chain verified suite=ml_dsa_65", links, steps);
+    } else if suite == suite::ML_DSA_87 {
+        log_chain_verified_line(s, b"[tls] chain verified suite=ml_dsa_87", links, steps);
     } else {
         log_chain_verified_line(s, b"[tls] chain verified suite=unknown", links, steps);
     }
@@ -3990,24 +4020,16 @@ unsafe fn assign_fresh_ecdh_key(
     true
 }
 
-/// Mint the X25519 agreement keypair into `driver`.
-///
-/// The private value is the raw CSPRNG output: `x25519_public_key` and
-/// `x25519_shared_secret` clamp it internally (RFC 7748 §5), so keeping
-/// a pre-clamped copy would give one scalar two encodings. There is no
-/// pool to draw from — a single ladder is cheap enough to run inline,
-/// which is also why it needs no resumable state.
-/// Whether this build offers and accepts X25519 key shares. The X25519
-/// ladder runs to completion in one call, which is a few hundred
-/// microseconds on an A76 and a few hundred milliseconds on a Cortex-M33,
-/// where it is longer than the step guard. Embedded builds negotiate
-/// P-256 only, whose ladders are stepped at `ecdh_bits_per_step`.
+/// Whether this build offers and accepts X25519 key shares: the aarch64
+/// builds do; the others negotiate P-256 only.
 const X25519_OFFERED: bool = cfg!(target_arch = "aarch64");
 
 /// Advance the X25519 key-pair generation for `driver`, `bits_per_step`
 /// ladder bits per call: true once `x25519_public` is ready. The scalar
 /// is drawn on the first call and the ladder runs over the following
-/// steps, so the hello that carries the share is built when it is.
+/// steps, so the hello that carries the share is built when it is. The
+/// private value is the raw CSPRNG output: the ladder clamps it (RFC 7748
+/// §5), so keeping a pre-clamped copy would give one scalar two encodings.
 unsafe fn x25519_keygen_step(
     sys: &SyscallTable,
     driver: &mut HandshakeDriver,
@@ -4602,7 +4624,7 @@ unsafe fn pump_session(s: &mut TlsState, idx: usize) -> bool {
         HandshakeState::RecvClientFinished => pump_recv_client_finished(s, idx),
         HandshakeState::DeriveAppKeys => pump_derive_app_keys(s, idx),
 
-        // ── Either role: a deferred RSA signature ──
+        // ── Either role: a stepped signature verification ──
         HandshakeState::VerifyChain | HandshakeState::VerifyPeerSignature => {
             pump_rsa_verify(s, idx)
         }
@@ -7057,6 +7079,108 @@ pub mod test_helpers {
     pub unsafe fn aes_variable_time_selected(state: *const u8) -> u32 {
         let s = &*(state as *const TlsState);
         s.aes_variable_time_selected
+    }
+
+    // ── The instance verification job ─────────────────────────────
+
+    /// Make TCP session `idx` (or, with `dtls`, DTLS peer `idx`) a live
+    /// handshake in `VerifyChain` (`VerifyPeerSignature` with
+    /// `peer_signature`) that holds the instance verification job.
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `TlsState`; `idx` names a slot.
+    pub unsafe fn verify_job_hold(state: *mut u8, dtls: bool, idx: usize, peer_signature: bool) {
+        let s = &mut *(state as *mut TlsState);
+        let hs = if peer_signature {
+            super::HandshakeState::VerifyPeerSignature
+        } else {
+            super::HandshakeState::VerifyChain
+        };
+        if dtls {
+            s.peer_sessions[idx].phase = super::DtlsPhase::Handshaking;
+            s.peer_sessions[idx].endpoint.driver.hs_state = hs;
+            s.rsa_owner = super::RSA_OWNER_DTLS + idx as i32;
+        } else {
+            s.sessions[idx].state = SessionState::Handshaking;
+            s.sessions[idx].driver.hs_state = hs;
+            s.rsa_owner = idx as i32;
+        }
+    }
+
+    /// The job's holder (`rsa_owner`): a TCP session index, a DTLS peer
+    /// index offset by `dtls_owner_base()`, or -1.
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `TlsState`.
+    pub unsafe fn verify_job_owner(state: *const u8) -> i32 {
+        (*(state as *const TlsState)).rsa_owner
+    }
+
+    /// Name `owner` as the job's holder as-is, whatever slot it names.
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `TlsState`.
+    pub unsafe fn verify_job_set_owner(state: *mut u8, owner: i32) {
+        (*(state as *mut TlsState)).rsa_owner = owner;
+    }
+
+    /// The offset of DTLS peer indices in `rsa_owner`.
+    pub fn dtls_owner_base() -> i32 {
+        super::RSA_OWNER_DTLS
+    }
+
+    /// Slot counts: `(TCP sessions, DTLS peers)`.
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `TlsState`.
+    pub unsafe fn verify_job_slots(state: *const u8) -> (usize, usize) {
+        let s = &*(state as *const TlsState);
+        (s.sessions.len(), s.peer_sessions.len())
+    }
+
+    /// Move a slot on: `0` resets it, `1` puts it in its ready phase, `2`
+    /// closed, `3` errored — leaving the driver untouched — and `4` keeps
+    /// it handshaking with its driver in `Error`.
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `TlsState`; `idx` names a slot.
+    pub unsafe fn verify_job_leave(state: *mut u8, dtls: bool, idx: usize, how: u8) {
+        let s = &mut *(state as *mut TlsState);
+        if dtls {
+            let peer = &mut s.peer_sessions[idx];
+            match how {
+                0 => peer.reset(),
+                1 => peer.phase = super::DtlsPhase::Ready,
+                2 => peer.phase = super::DtlsPhase::Closed,
+                3 => peer.phase = super::DtlsPhase::Errored,
+                _ => peer.endpoint.driver.hs_state = super::HandshakeState::Error,
+            }
+        } else {
+            let sess = &mut s.sessions[idx];
+            match how {
+                0 => sess.reset(),
+                1 => sess.state = SessionState::Ready,
+                2 => sess.state = SessionState::Closed,
+                3 => sess.state = SessionState::Error,
+                _ => sess.driver.hs_state = super::HandshakeState::Error,
+            }
+        }
+    }
+
+    /// Pump the job for TCP session `idx` (or DTLS peer `idx`) once, through
+    /// the production pump. `false`: the job is held by another handshake
+    /// and nothing ran; `true`: the slot took the job and its pump ran.
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `TlsState`, inside the module's
+    /// syscall scope; `idx` names a slot.
+    pub unsafe fn verify_job_pump(state: *mut u8, dtls: bool, idx: usize) -> bool {
+        let s = &mut *(state as *mut TlsState);
+        if dtls {
+            super::dtls_pump_rsa_verify(s, idx)
+        } else {
+            super::pump_rsa_verify(s, idx)
+        }
     }
 
     // ── Transport continuity ──────────────────────────────────────

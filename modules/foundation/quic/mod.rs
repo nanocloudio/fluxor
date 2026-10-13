@@ -90,6 +90,8 @@ include!("../../sdk/crypto/ml_dsa.rs");
 include!("../../sdk/crypto/rsa.rs");
 // The handshake driver carries the X25519 ladder every transport shares.
 include!("../../sdk/crypto/ed25519.rs");
+// The TLS driver mounted below steps Ed25519 with this job.
+include!("../tls/ed25519_job.rs");
 
 // Shared TLS / DTLS source — QUIC drives the same TLS 1.3 handshake
 // state machine via CRYPTO frames instead of records.
@@ -4120,6 +4122,69 @@ pub mod test_helpers {
             return 255;
         }
         s.conns[idx].driver.hs_state as u8
+    }
+
+    /// Make connection `idx` a live handshake in `VerifyChain`
+    /// (`VerifyPeerSignature` with `peer_signature`) that holds the instance
+    /// verification job.
+    ///
+    /// # Safety
+    /// `state` points to an initialised `QuicState`; `idx < MAX_CONNS`.
+    pub unsafe fn verify_job_hold(state: *mut u8, idx: usize, peer_signature: bool) {
+        let s = &mut *(state as *mut QuicState);
+        s.conns[idx].phase = ConnPhase::Handshaking;
+        s.conns[idx].driver.hs_state = if peer_signature {
+            super::HandshakeState::VerifyPeerSignature
+        } else {
+            super::HandshakeState::VerifyChain
+        };
+        s.rsa_owner = idx as i32;
+    }
+
+    /// The job's holder (`rsa_owner`): a connection index, or -1.
+    ///
+    /// # Safety
+    /// `state` points to an initialised `QuicState`.
+    pub unsafe fn verify_job_owner(state: *const u8) -> i32 {
+        (*(state as *const QuicState)).rsa_owner
+    }
+
+    /// Name `owner` as the job's holder as-is, whatever slot it names.
+    ///
+    /// # Safety
+    /// `state` points to an initialised `QuicState`.
+    pub unsafe fn verify_job_set_owner(state: *mut u8, owner: i32) {
+        (*(state as *mut QuicState)).rsa_owner = owner;
+    }
+
+    /// Move connection `idx` on: `0` resets it, `1` idle, `2` established,
+    /// `3` closed, `4` errored — leaving the driver untouched — and `5`
+    /// keeps it handshaking with its driver in `Error`.
+    ///
+    /// # Safety
+    /// `state` points to an initialised `QuicState`; `idx < MAX_CONNS`.
+    pub unsafe fn verify_job_leave(state: *mut u8, idx: usize, how: u8) {
+        let s = &mut *(state as *mut QuicState);
+        let conn = &mut s.conns[idx];
+        match how {
+            0 => conn.reset(),
+            1 => conn.phase = ConnPhase::Idle,
+            2 => conn.phase = ConnPhase::Established,
+            3 => conn.phase = ConnPhase::Closed,
+            4 => conn.phase = ConnPhase::Errored,
+            _ => conn.driver.hs_state = super::HandshakeState::Error,
+        }
+    }
+
+    /// Pump the job for connection `idx` once, through the production pump.
+    /// `false`: the job is held by another handshake and nothing ran;
+    /// `true`: the connection took the job and its pump ran.
+    ///
+    /// # Safety
+    /// `state` points to an initialised `QuicState`, inside the module's
+    /// syscall scope; `idx < MAX_CONNS`.
+    pub unsafe fn verify_job_pump(state: *mut u8, idx: usize) -> bool {
+        super::pump_rsa_verify(&mut *(state as *mut QuicState), idx)
     }
 
     // ── Reservation + continuity helpers ──────────────

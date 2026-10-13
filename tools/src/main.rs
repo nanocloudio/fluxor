@@ -122,7 +122,7 @@ use std::path::{Path, PathBuf};
 
 use crate::config::{decode_config, generate_config_ext, ConfigBuilder, ModuleCaps};
 use crate::error::{Error, Result};
-use crate::modules::{build_module_table, pack_fmod, parse_modules_from_config_multi};
+use crate::modules::{pack_fmod, parse_modules_from_config_multi};
 use crate::uf2::{create_uf2_blocks, fix_uf2_block_numbers, parse_uf2, UF2_FAMILY_RP2350};
 
 /// Flash layout constants
@@ -168,6 +168,7 @@ fn main() {
             module_root,
             target,
             epoch,
+            sign_key,
         } => cmd_build_dispatch(
             path.as_ref(),
             BuildFlags {
@@ -178,6 +179,7 @@ fn main() {
                 module_root,
                 target,
                 epoch,
+                sign_key,
             },
             verbose,
         ),

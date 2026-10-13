@@ -1707,6 +1707,10 @@ const NON_PARAM_KEYS: &[&str] = &[
     // (`parse_modules_from_config_multi`) and the manifest loader,
     // never a wire param.
     "variant",
+    // Program blobs the module instance owns: packed into the bundle's
+    // program section (`modules::collect_programs`), never a wire param.
+    "program",
+    "programs",
     "wiring",
     "preset",
     "presets",

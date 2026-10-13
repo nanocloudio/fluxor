@@ -1017,8 +1017,9 @@ fn cmd_combine(
     check_state_budget(&modules, &config, &target_desc)?;
     check_stack_budget(&modules, &config, &target_desc)?;
     check_gated_admission(&modules, &config, &target_desc)?;
+    let programs = crate::modules::collect_programs(&config)?;
 
-    let modules_data = if !modules.is_empty() {
+    let modules_data = if !modules.is_empty() || !programs.is_empty() {
         if verbose {
             eprintln!("Embedding {} module(s):", modules.len());
             for module in &modules {
@@ -1030,7 +1031,9 @@ fn cmd_combine(
                 );
             }
         }
-        Some(build_module_table(&modules)?)
+        Some(crate::modules::build_module_table_with_programs(
+            &modules, &programs,
+        )?)
     } else {
         None
     };
@@ -1318,8 +1321,9 @@ fn build_packaged_blobs(
     check_state_budget(&modules, config, target_desc)?;
     check_stack_budget(&modules, config, target_desc)?;
     check_gated_admission(&modules, config, target_desc)?;
+    let programs = crate::modules::collect_programs(config)?;
 
-    let modules_data = if !modules.is_empty() {
+    let modules_data = if !modules.is_empty() || !programs.is_empty() {
         if verbose {
             eprintln!("Embedding {} module(s):", modules.len());
             for module in &modules {
@@ -1331,7 +1335,9 @@ fn build_packaged_blobs(
                 );
             }
         }
-        Some(build_module_table(&modules)?)
+        Some(crate::modules::build_module_table_with_programs(
+            &modules, &programs,
+        )?)
     } else {
         None
     };
@@ -1339,30 +1345,36 @@ fn build_packaged_blobs(
     Ok((modules_data, config_data))
 }
 
-/// Emit a graph image: 256-byte header + modules table + static config,
-/// padded to the slot size. Layout mirrors `abi::graph_slot`.
+/// Emit a graph image: a 256-byte header, the module table (with the
+/// graph's program section after it) from the first 4 KiB boundary, and the
+/// static config from the next 256-byte boundary. An RP image is padded with
+/// 0xFF to the flash slot size; any other is as long as its payload. The
+/// header layout is `flash_layout::GRAPH_SLOT_*`.
 ///
 /// The header records the epoch, the in-image offsets and sizes of the
-/// modules and config regions, and a SHA-256 over their concatenation.
-/// `graph_slot::ACTIVATE` recomputes the hash from flash and rejects
-/// mismatches.
+/// modules and config regions, a SHA-256 over their concatenation, and the
+/// ABI-surface pin; with `sign_key`, an Ed25519 signature over those bytes.
+/// `graph_slot`'s ACTIVATE and the OTA staging commit recompute the digest
+/// before they accept the image, and the RP boot selector does too on a
+/// kernel built with a slot root.
 fn cmd_graph_image(
     config_path: &PathBuf,
     output_path: &PathBuf,
     target_override: Option<&str>,
     epoch: u64,
+    sign_key: Option<&std::path::Path>,
     module_root: Option<&std::path::Path>,
     verbose: bool,
 ) -> Result<()> {
-    // Image layout constants mirror modules/sdk/abi.rs :: graph_slot
-    // (the RP flash A/B slot holds exactly this graph-image format).
-    const HEADER_SIZE: usize = 256;
+    // The graph-image header, as the kernel and `graph_slot` read it
+    // (`modules/sdk/platform/rp/flash_layout.rs`, `GRAPH_SLOT_*`; an RP
+    // flash A/B slot holds exactly this format).
+    use crate::modules::sdk_layout::flash_layout as fl;
+    const HEADER_SIZE: usize = fl::GRAPH_SLOT_HEADER_SIZE;
     const MODULES_ALIGN: usize = 4096;
     const SECTION_ALIGN: usize = 256;
-    const MAGIC: u32 = 0x4C53_5846; // "FXSL"
-    const VERSION: u8 = 1;
     /// RP flash A/B aperture (`GRAPH_SLOT_SIZE`) — the image fills it.
-    const FLASH_SLOT_SIZE: usize = 0x0008_0000;
+    const FLASH_SLOT_SIZE: usize = fl::GRAPH_SLOT_SIZE as usize;
     /// RAM-staged image ceiling for targets without a flash aperture
     /// (Pi 5 OTA staging region; mirrors the kernel's
     /// `MAX_MODULES_BLOB_SIZE` reasoning).
@@ -1463,8 +1475,8 @@ fn cmd_graph_image(
     let emit_len = if flash_slot { image_size } else { config_end };
     let mut out = vec![0xFFu8; emit_len];
     // Header.
-    out[0..4].copy_from_slice(&MAGIC.to_le_bytes());
-    out[4] = VERSION;
+    out[0..4].copy_from_slice(&fl::GRAPH_SLOT_MAGIC.to_le_bytes());
+    out[4] = fl::GRAPH_SLOT_VERSION;
     out[8..16].copy_from_slice(&epoch.to_le_bytes());
     out[16..20].copy_from_slice(&(modules_offset as u32).to_le_bytes());
     out[20..24].copy_from_slice(&(modules_data.len() as u32).to_le_bytes());
@@ -1473,11 +1485,24 @@ fn cmd_graph_image(
     out[32..64].copy_from_slice(&digest);
     // ABI-surface pin (header 64..96): the wire-surface digest of the
     // substrate this image was built against (`hash::abi_surface_digest`).
-    // The RP boot slot selector and the OTA staging commit both enforce
-    // it: an image built for an incompatible kernel fails closed (to the
-    // other flash slot, or with -EACCES at commit) instead of loading
+    // The RP boot slot selector, `graph_slot` and the OTA staging commit
+    // all enforce it: an image built for an incompatible kernel fails
+    // closed (to the other flash slot, or with -EACCES) instead of loading
     // modules with stale hardcoded wire values.
-    out[64..96].copy_from_slice(&hash::abi_surface_digest());
+    let pin = fl::GRAPH_SLOT_ABI_SURFACE_OFFSET;
+    out[pin..pin + 32].copy_from_slice(&hash::abi_surface_digest());
+    // Signature record (header 96..168): "SIG1", the key id (the first
+    // four bytes of SHA-256 of the public key), and Ed25519 over the
+    // header's first 96 bytes, which bind the payload through its digest.
+    // Left erased when no key is given: an unsigned image, which only a
+    // device built without a slot root accepts.
+    let signed = match sign_key {
+        Some(key_path) => Some(sign_graph_image_header(
+            &mut out[..HEADER_SIZE],
+            &read_signing_seed(key_path)?,
+        )),
+        None => None,
+    };
     // Payload.
     out[modules_offset..modules_offset + modules_data.len()].copy_from_slice(&modules_data);
     out[config_offset..config_offset + config_data.len()].copy_from_slice(&config_data);
@@ -1494,14 +1519,89 @@ fn cmd_graph_image(
         );
     }
     println!(
-        "\x1b[1;32mSuccess\x1b[0m {} modules={}K config={}K size={}K epoch={}",
+        "\x1b[1;32mSuccess\x1b[0m {} modules={}K config={}K size={}K epoch={} {}",
         output_path.display(),
         modules_data.len() / 1024,
         config_data.len() / 1024,
         emit_len / 1024,
         epoch,
+        match signed {
+            Some(pk) => format!("signed by {}", hash::hex(&pk)),
+            None => "unsigned".to_string(),
+        },
     );
     Ok(())
+}
+
+/// Sign a graph-image header in place: the signature record
+/// (`flash_layout::GRAPH_SLOT_SIGNATURE_*`) over the signed bytes before it.
+/// Answers the signer's public key.
+fn sign_graph_image_header(header: &mut [u8], seed: &[u8; 32]) -> [u8; 32] {
+    use crate::modules::sdk_layout::flash_layout as fl;
+    let (pk, sig) = crate::crypto::sign(seed, &header[..fl::GRAPH_SLOT_SIGNED_LEN]);
+    let key_id = {
+        use sha2::Digest;
+        sha2::Sha256::digest(pk)
+    };
+    let at = fl::GRAPH_SLOT_SIGNATURE_OFFSET;
+    header[at..at + 4].copy_from_slice(&fl::GRAPH_SLOT_SIGNATURE_MAGIC.to_le_bytes());
+    header[at + 4..at + 8].copy_from_slice(&key_id[..4]);
+    header[at + 8..at + fl::GRAPH_SLOT_SIGNATURE_LEN].copy_from_slice(&sig);
+    pk
+}
+
+#[cfg(test)]
+mod graph_image_signature_tests {
+    use super::sign_graph_image_header;
+    use crate::modules::sdk_layout::flash_layout as fl;
+
+    /// The record lands where the kernel reads it, names the key, and
+    /// verifies over exactly the signed bytes: changing the epoch breaks it,
+    /// and the bytes after the record are not covered.
+    #[test]
+    fn a_signed_header_verifies_over_its_signed_bytes() {
+        let mut h = vec![0xFFu8; fl::GRAPH_SLOT_HEADER_SIZE];
+        h[0..4].copy_from_slice(&fl::GRAPH_SLOT_MAGIC.to_le_bytes());
+        h[8..16].copy_from_slice(&3u64.to_le_bytes());
+        let pk = sign_graph_image_header(&mut h, &[9u8; 32]);
+        let at = fl::GRAPH_SLOT_SIGNATURE_OFFSET;
+        assert_eq!(&h[at..at + 4], b"SIG1");
+        let id = {
+            use sha2::Digest;
+            sha2::Sha256::digest(pk)
+        };
+        assert_eq!(&h[at + 4..at + 8], &id[..4]);
+        let sig: [u8; 64] = h[at + 8..at + 72].try_into().unwrap();
+        assert!(crate::crypto::verify(
+            &pk,
+            &h[..fl::GRAPH_SLOT_SIGNED_LEN],
+            &sig
+        ));
+        let mut raised = h.clone();
+        raised[8] = 4;
+        assert!(!crate::crypto::verify(
+            &pk,
+            &raised[..fl::GRAPH_SLOT_SIGNED_LEN],
+            &sig
+        ));
+        assert!(h[at + fl::GRAPH_SLOT_SIGNATURE_LEN..]
+            .iter()
+            .all(|&b| b == 0xFF));
+    }
+}
+
+/// The 32-byte Ed25519 seed at `path` (`fluxor modules keygen` writes one).
+/// Errors name the file, never its bytes.
+fn read_signing_seed(path: &std::path::Path) -> Result<[u8; 32]> {
+    let bytes = std::fs::read(path)
+        .map_err(|e| Error::Config(format!("--sign-key {}: {e}", path.display())))?;
+    bytes.as_slice().try_into().map_err(|_| {
+        Error::Config(format!(
+            "--sign-key {}: {} bytes, not a 32-byte Ed25519 seed",
+            path.display(),
+            bytes.len()
+        ))
+    })
 }
 
 fn cmd_pack(

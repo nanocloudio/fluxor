@@ -141,6 +141,7 @@ CAPACITY >= PSTATUS_ROUND | src/kernel/sys/telemetry_ring.rs
 | fat32 directory-walk budget | `DIR_SCAN_BUDGET_SECTORS` | modules/foundation/fat32/mod.rs | 32 | Policy: directory sectors one `provider_call` reads before returning EAGAIN with its position saved. A directory with thousands of entries is not exotic — a WAL that segments per snapshot fills one — so an unbounded walk is a latent stall of every module sharing the lane, not a slow path |
 | fat32 long-name length | `LFN_MAX_CHARS` | modules/foundation/fat32/mod.rs | 64 | Policy: the format allows 255, but a buffer for that is carried in the directory cursor and in every wanted-name argument, on a board whose whole module state is measured against a 240 KiB arena. A longer name is refused at creation, not clipped. Names longer than this that were written elsewhere are still preserved and retired correctly — preservation walks the companion run without decoding it, so only matching and generation are bounded |
 | fat32 free-cluster scan | `FAT_SCAN_BUDGET_SECTORS` | modules/foundation/fat32/mod.rs | 32 | Policy: FAT sectors one `provider_call` reads looking for a free cluster before returning EAGAIN with its cursor saved. Matches `DIR_SCAN_BUDGET_SECTORS` for the same reason — a synchronous device read inside a dispatch is charged to the cooperative step budget, and the FAT of a large volume is far too big to walk in one |
+| fat32 walk time | `CALL_BUDGET_US` | modules/foundation/fat32/mod.rs | 400 | Policy: microseconds one `provider_call` or step spends walking a directory or the FAT before returning EAGAIN, alongside the two sector budgets. A sector count alone assumes a device speed, and one sector read costs from microseconds to milliseconds by device and power state. Every walk reads at least one sector per call, so a slow device still makes progress |
 | fat32 outstanding fences | `MAX_FENCES` | modules/foundation/fat32/mod.rs | — | Policy: equals `MAX_OPEN_FILES`. A fence table smaller than the handle table would let a consumer open a handle it cannot fence, which reads as a durability failure rather than a resource limit. `FSYNC_SUBMIT` past the table is refused EAGAIN (backpressure) |
 | nvme channel write pipeline | `MAX_INFLIGHT` | modules/drivers/nvme/mod.rs | — | Policy, per-profile (32 aarch64 / 8 elsewhere): writes in flight per I/O queue on the channel write path, each holding one 4 KiB DMA page. The command-id layout carries the slot in `CID_SLOT_BITS`, which moves with it |
 | nvme block requests in flight | `V1_SLOTS` | modules/drivers/nvme/mod.rs | 8 | Policy: `storage.block` requests one namespace holds between `SUBMIT` and `REAP`, each with its own command id and 4 KiB DMA page. It is the `queue_depth` the source reports. They share I/O queue 0 with the channel pipeline, the bulk ring and the synchronous paths, and the sum stays below `IO_Q_ENTRIES` |
@@ -325,6 +326,14 @@ cannot be evaluated from its own file reads `—` and says why.
 | fat32 enumeration | `MAX_FILES` | modules/foundation/fat32/mod.rs | 128 | Policy: entries one LIST returns; a larger directory is paged by the caller |
 | fat32 unlink free-list | `UNLINK_FREE_SLOTS` | modules/foundation/fat32/mod.rs | 8 | Deliberate cap with a stated degradation: sized for WAL segment compaction retiring a handful of segments per snapshot; overflow degrades to orphaning clusters, which fsck reclaims |
 | fat32 directory chain | `MAX_DIR_CLUSTERS` | modules/foundation/fat32/mod.rs | 65536 | Sanity bound: far past any real directory and far short of walking a cyclic chain for ever |
+| fat32 resolved directories | `DIR_CACHE` | modules/foundation/fat32/mod.rs | 2 | Policy: directory components a path walk remembers, so a rename whose source and destination share a parent resolves both paths under a parent too long to walk in one call. Dropped when the parent's names change, when a rename is replayed and when the volume is formatted |
+| fs_object store directory | `ROOT_MAX` | modules/foundation/fs_object/mod.rs | 96 | Policy: bytes of the `root` parameter; a longer one fails `module_new` rather than being cut to a different directory |
+| fs_object read handles | `READS` | modules/foundation/fs_object/mod.rs | 8 | Policy: `GET` handles open at once, each an open file underneath; past it `GET` answers EBUSY |
+| fs_object listing page | `PAGE_KEYS` | modules/foundation/fs_object/mod.rs | 16 | Policy: keys one `LIST` page carries, whatever `max_keys` asks; the cursor resumes after the last |
+| fs_object headers per listing call | `SCAN_OPENS_PER_CALL` | modules/foundation/fs_object/mod.rs | 8 | Budget: object headers one listing call opens before it answers EAGAIN and resumes on the same request; a page costs an open per object in the store |
+| fs_object write chunk | `WRITE_CHUNK` | modules/foundation/fs_object/mod.rs | 4096 | Budget: bytes one `PUT` ask writes to the filesystem |
+| fs_object hash chunk | `HASH_CHUNK` | modules/foundation/fs_object/mod.rs | 4096 | Budget: body bytes one `PUT` ask hashes while it computes the etag |
+| fs_object abandoned request | `SUPERSEDE_AFTER` | modules/foundation/fs_object/mod.rs | 64 | Policy: refusals of other requests (EBUSY for a write, EAGAIN for a listing) before the write or scan in flight counts as abandoned and is superseded, so a caller that stops asking cannot hold the store |
 | Mounts | `MAX_MOUNTS` | modules/foundation/mount/mod.rs | 8 | Policy: volumes one mount module routes; a backend registering past it fails EBUSY and its mounts resolve ENODEV |
 | QUIC peer unidirectional stream credit | `PEER_UNI_CREDIT` | modules/foundation/quic/connection.rs | 6 | Policy, advertised as `initial_max_streams_uni` and re-granted as each finishes: HTTP/3's three critical streams with room for WebTransport's. The cumulative credit is held under the finished-stream window (64 past the lowest unfinished index) so a late frame for any index the peer may use is recognised; the stream holding the window's base ending releases it. A stream past the credit closes the connection with STREAM_LIMIT_ERROR |
 | QUIC peer bidirectional stream credit | `PEER_BIDI_CREDIT` | modules/foundation/quic/connection.rs | 3 | Policy, advertised as `initial_max_streams_bidi`: as the unidirectional credit, its window included, lower because each bidirectional stream carries state in both directions |
@@ -453,6 +462,7 @@ MAX_OPEN_FILES | modules/foundation/fat32/mod.rs | 8 | off-host
 DIR_SCAN_BUDGET_SECTORS | modules/foundation/fat32/mod.rs | 32 | *
 LFN_MAX_CHARS | modules/foundation/fat32/mod.rs | 64 | *
 FAT_SCAN_BUDGET_SECTORS | modules/foundation/fat32/mod.rs | 32 | *
+CALL_BUDGET_US | modules/foundation/fat32/mod.rs | 400 | *
 MAX_FENCES | modules/foundation/fat32/mod.rs | MAX_OPEN_FILES | *
 MAX_INFLIGHT | modules/drivers/nvme/mod.rs | 32 | host
 MAX_INFLIGHT | modules/drivers/nvme/mod.rs | 8 | off-host
@@ -563,6 +573,14 @@ MAX_ALLOW_TYPES | modules/foundation/dns/mod.rs | 8 | *
 MAX_FILES | modules/foundation/fat32/mod.rs | 128 | *
 UNLINK_FREE_SLOTS | modules/foundation/fat32/mod.rs | 8 | *
 MAX_DIR_CLUSTERS | modules/foundation/fat32/mod.rs | 65_536 | *
+DIR_CACHE | modules/foundation/fat32/mod.rs | 2 | *
+ROOT_MAX | modules/foundation/fs_object/mod.rs | 96 | *
+READS | modules/foundation/fs_object/mod.rs | 8 | *
+PAGE_KEYS | modules/foundation/fs_object/mod.rs | 16 | *
+SCAN_OPENS_PER_CALL | modules/foundation/fs_object/mod.rs | 8 | *
+WRITE_CHUNK | modules/foundation/fs_object/mod.rs | 4096 | *
+HASH_CHUNK | modules/foundation/fs_object/mod.rs | 4096 | *
+SUPERSEDE_AFTER | modules/foundation/fs_object/mod.rs | 64 | *
 MAX_MOUNTS | modules/foundation/mount/mod.rs | 8 | *
 PEER_UNI_CREDIT | modules/foundation/quic/connection.rs | 6 | *
 PEER_BIDI_CREDIT | modules/foundation/quic/connection.rs | 3 | *
@@ -802,4 +820,8 @@ SIGNATURE_BLOCK_SIZE | tools/src/manifest.rs | signature block layout
 MAX_AUTHORITY_LEN | modules/foundation/remote_channel/mod.rs | holds the `authority` parameter as written; the provider's own name ceiling binds the dial
 TABLE_TEXT_MAX | modules/foundation/remote_channel/mod.rs | holds the `channels` parameter text; MAX_CHANNELS and CT_NAME_MAX bind the table it parses to
 EVENT_HEADER_SIZE | src/platform/linux/store.rs | protocol: the mesh event header's fixed length, not a ceiling
+KEY_MAX | modules/foundation/fs_object/mod.rs | mirror of the contract's STORAGE_KEY_MAX, the longest key a listing carries
+CT_MAX | modules/foundation/fs_object/mod.rs | format: the content type's u8 length prefix
+HDR_MAX | modules/foundation/fs_object/mod.rs | derived: the longest object header, from KEY_MAX and CT_MAX
+PATH_MAX | modules/foundation/fs_object/mod.rs | derived: ROOT_MAX, a separator and an 8.3 name
 ```

@@ -82,6 +82,14 @@ enum Commands {
         /// exceed the live image's epoch for activation to succeed.
         #[arg(long, default_value = "1")]
         epoch: u64,
+        /// --emit=image: sign the image with this key -- a 32-byte Ed25519
+        /// seed file, as `fluxor modules keygen --key <file>` makes and
+        /// whose public key it prints. The signature covers the header's
+        /// first 96 bytes (epoch, regions, payload digest, ABI pin); a
+        /// device whose kernel was built with `FLUXOR_SLOT_ROOT_HEX` set to
+        /// that public key accepts only images it verifies.
+        #[arg(long)]
+        sign_key: Option<PathBuf>,
     },
     /// Recompute and rewrite the ABI-surface pin in all checked-in sites
     /// (`abi_surface_srcpin.rs` src-hash + digest, the `tools/src/hash.rs`
@@ -412,7 +420,7 @@ enum Commands {
     },
 
     /// Full CI gate. Phases run in this order, each only where the project
-    /// has what it checks: fmt-check, clippy, workspace-lint-opt-in,
+    /// has what it checks: setup (`[ci.setup] scripts`), fmt-check, clippy, workspace-lint-opt-in,
     /// hygiene, observability, presentation, makefile, fluxor-toml-schema,
     /// template-render, version-skew, lockfile-consistency, catalog-drift,
     /// sdk-materialisation, live-staleness, limit-register,
@@ -940,12 +948,14 @@ enum ModulesAction {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
-    /// Generate / inspect an Ed25519 module-signing keypair.
+    /// Generate / inspect an Ed25519 signing keypair.
     ///
     /// Prints the 64-hex-char PUBLIC key to stdout (for the kernel's
-    /// `FLUXOR_SIGNING_PUBKEY_HEX` build env) and ensures the 32-byte private
-    /// seed exists at `--key` (generated 0600 from the OS RNG if absent). The
-    /// matching seed is what `fluxor modules sign` consumes. Idempotent:
+    /// `FLUXOR_SIGNING_PUBKEY_HEX` or `FLUXOR_SLOT_ROOT_HEX` build variable)
+    /// and ensures the 32-byte private seed exists at `--key` (generated 0600
+    /// from the OS RNG if absent). The matching seed is what
+    /// `fluxor modules sign` and `fluxor build --emit=image --sign-key`
+    /// consume. Idempotent:
     /// re-running with an existing key just re-prints its pubkey (use
     /// `--force` to rotate).
     Keygen {

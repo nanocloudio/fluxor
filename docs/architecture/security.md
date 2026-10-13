@@ -53,13 +53,12 @@ The loader path, implemented in `validate_module`:
    unsigned or the device has no provisioned pubkey, reject.
 
 Key provisioning is build-time configuration, not a hardware mechanism:
-`signing_pubkey_from_build_env` in the loader reads the
-`FLUXOR_SIGNING_PUBKEY_HEX` environment variable at compile time (64 hex
-chars → 32 bytes baked into the kernel image). It lives with its sole
-consumer, the signature check, rather than in the generic HAL. A board
-with an on-silicon OTP bank would replace this function without touching
-the loader logic around it. Status: OTP-backed provisioning is a design
-target, not wired.
+the loader's `MODULE_SIGNING_ROOT` is the `FLUXOR_SIGNING_PUBKEY_HEX`
+environment variable, parsed at compile time (64 hex digits → 32 bytes
+baked into the kernel image). A value that is not 64 hex digits fails the
+build rather than producing a kernel that verifies nothing. The key lives
+with its sole consumer, the signature check, rather than in the generic
+HAL. No board reads it from OTP.
 
 ### Load-source trust profiles
 
@@ -82,10 +81,24 @@ checks to every non-built-in source.
 ### Signing Tool
 
 `fluxor modules sign <module.fmod> --key <seed>` rewrites the `.fmod` with a
-manifest carrying a fresh signature. The tool uses the same Ed25519 code as
-the kernel verifier, so a kernel rebuilt from source and a tool-signed
-module always agree. The private key is a raw 32-byte seed on disk
-(`head -c 32 /dev/urandom > key.raw`).
+manifest carrying a fresh RFC 8032 Ed25519 signature. The private key is a
+raw 32-byte seed on disk; `fluxor modules keygen --key <seed>` creates one
+(mode 0600) and prints its public key, the value for
+`FLUXOR_SIGNING_PUBKEY_HEX`.
+
+### Graph-image signatures
+
+Source: `src/kernel/security/slot_signature.rs`.
+
+A graph image — what an RP flash slot holds and what the Pi 5 stages in RAM
+— can carry an Ed25519 signature over its header, which names the payload
+by its SHA-256. A kernel built with `FLUXOR_SLOT_ROOT_HEX` (a public key,
+64 hex digits; any other value fails the build) boots, stages and
+activates only images signed by that key whose payload matches the
+digest. This root is separate from the module signing root: one vouches
+for individual modules, the other for a whole graph. The image format,
+the signing command and what is refused are in
+[network_boot.md](network_boot.md#graph-image-signatures).
 
 ### Crypto in the admission path
 
@@ -327,16 +340,43 @@ PKCS#1 or PKCS#8 form and stores the PKCS#1 body; its CertificateVerify is
 protocol with the same digest each call.
 
 Peer verification is a stepped job in every transport (tls, dtls, quic):
-the chain walk records each RSA or ECDSA link it accepts on shape and
-policy, and the handshake pump verifies them one at a time from the held
-Certificate message — an RSA exponentiation `rsa_rows_per_step` Montgomery
-rows per step on one job the instance owns, an ECDSA verification, P-256
-or P-384, `ecdh_bits_per_step` ladder bits per step on the session's own
-ladders — with the peer's CertificateVerify checked the same way. A P-384
-identity signs `ecdsa_secp384r1_sha384` in the module on the same stepped
-ladder; an ECDSA suite is a curve with its hash, so a P-384 key signing
-under SHA-256 is refused as a signature the key does not make, and a
-P-256 authority over a P-384 subject as a downgrade. A signature that
+the chain walk records each RSA, ECDSA or Ed25519 link it accepts on shape
+and policy, and the handshake pump verifies them one at a time from the
+held Certificate message, with the peer's CertificateVerify checked the
+same way:
+
+- an RSA exponentiation, `rsa_rows_per_step` Montgomery rows per step on
+  one job the instance owns;
+- an ECDSA verification, P-256 or P-384, `ecdh_bits_per_step` ladder bits
+  per step on the session's own ladders;
+- an Ed25519 verification (`modules/foundation/tls/ed25519_job.rs`) on the
+  session's own job: each of the two point decodes takes a setup step and
+  then its square root 32 exponent bits a step, and the joint
+  `[S]B - [k]A` walk takes `ecdh_bits_per_step` bits of both scalars a
+  step. Its verdict is `ed25519_verify`'s: S below the group order,
+  canonical on-curve encodings, small-order keys and R refused, and the
+  cofactorless equation `[S]B = R + [k]A`.
+
+An ML-DSA link is verified whole when the chain is walked, as is the link
+into an anchor that shares its subject with another anchor (so the walk can
+move to the next candidate). With `ecdh_bits_per_step` at 256, its default,
+each ECDSA or Ed25519 verification runs whole in one step. One handshake
+per instance verifies at a time; the others wait their turn.
+
+Every target verifies the same certificate suites — ECDSA P-256 and P-384,
+Ed25519, ML-DSA-44/65/87 and RSA PKCS#1 v1.5 under SHA-256 or SHA-384 —
+and offers the same `signature_algorithms`, in preference order:
+`ecdsa_secp256r1_sha256`, `ecdsa_secp384r1_sha384`, `ed25519`,
+`rsa_pss_rsae_sha256`, `rsa_pss_rsae_sha384`, `rsa_pkcs1_sha256`,
+`rsa_pkcs1_sha384`. The PKCS#1 schemes are offered for certificate
+signatures only; a CertificateVerify must use a scheme its key makes
+(RFC 8446 §4.4.3), so a P-256 key answers with `ecdsa_secp256r1_sha256`, an
+Ed25519 key with `ed25519`, an RSA key with RSA-PSS.
+
+A P-384 identity signs `ecdsa_secp384r1_sha384` in the module on the same
+stepped ladder; an ECDSA suite is a curve with its hash, so a P-384 key
+signing under SHA-256 is refused as a signature the key does not make, and
+a P-256 authority over a P-384 subject as a downgrade. A signature that
 does not verify fails the session with `CERT_ERR_SIGNATURE` and a log line
 naming the stage. The key exchange is stepped at the same budget: the
 P-256 and X25519 ladders advance `ecdh_bits_per_step` bits per step, and
@@ -346,12 +386,10 @@ values and uses a binary extended Euclid for them.
 
 The MCU-class targets run the embedded profile of the module: one session,
 one DTLS peer, no continuity shadow, and P-256 as the only key-exchange
-group offered. The X25519 implementation there is a single unsteppable
-call, long enough on a Cortex-M33 to overrun any step budget, so the group
-is not offered rather than offered and unable to complete. What bounds a
-handshake on such a target is its ladders, which is why the step budget is
-expressed in ladder bits. An RSA chain verifies faster than an ECDSA one
-on that core.
+group offered (X25519 is offered on the aarch64 builds). What bounds a
+handshake on such a target is its ladders and walks, which is why the step
+budget is expressed in scalar bits. An RSA chain verifies faster than an
+ECDSA one on that core.
 
 ## Entropy
 

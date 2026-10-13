@@ -350,7 +350,14 @@ pub static RULES: &[Rule] = &[
     rule(0x060A, HandleUse::Global, Arg::In(20)), // timer::DISCIPLINE
     // Identity and entropy.
     rule(0x0C2F, HandleUse::Global, Arg::Out(16)), // BOOT_INCARNATION
-    rule(0x0C3C, HandleUse::Global, Arg::Out(ANY)), // CSPRNG_FILL
+    // A module's own programs, the public slot root and the admitted-slot
+    // mask. A program request (slot, and for a read the offset) rides in
+    // the buffer it is answered in, so it carries no pointer.
+    rule(0x0C2B, HandleUse::Global, Arg::InOut(64)), // PROGRAM_INFO
+    rule(0x0C2C, HandleUse::Global, Arg::InOut(ANY)), // PROGRAM_READ
+    rule(0x0C2D, HandleUse::Global, Arg::Out(32)),   // SLOT_SIGNING_ROOT
+    rule(0x0C2E, HandleUse::Global, Arg::None),      // SLOT_ADMITTED
+    rule(0x0C3C, HandleUse::Global, Arg::Out(ANY)),  // CSPRNG_FILL
     // Log and telemetry.
     rule(0x0C40, HandleUse::Value, Arg::In(ANY)), // LOG_WRITE (level in handle)
     rule(0x0C3E, HandleUse::Global, Arg::In(ANY)), // telemetry::TLM_EMIT

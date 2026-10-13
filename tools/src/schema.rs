@@ -249,6 +249,10 @@ pub(crate) const SKIP_KEYS: &[&str] = &[
     "type",
     // `[[variant]]` selection — resolution input, never a wire param.
     "variant",
+    // Program blobs the module instance owns: packed into the bundle's
+    // program section (`modules::collect_programs`), never a wire param.
+    "program",
+    "programs",
     "wiring",
     "preset",
     "presets",

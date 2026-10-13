@@ -18,28 +18,78 @@ Two delivery paths exist:
 ## The Graph Image
 
 Source: `tools/src/cli/commands_a.rs` (writer),
-`src/kernel/module/ota_stage.rs` (reader).
+`modules/sdk/platform/rp/flash_layout.rs` (layout),
+`src/kernel/module/ota_stage.rs`, `src/kernel/boot/config.rs` and
+`modules/foundation/graph_slot/` (readers).
 
-`fluxor build <config> --emit=image` produces a graph image: a 256-byte
-FXSL header, the module table (FXMT format, one FXMD entry per
-module), and the compiled config blob. The header fields are
+`fluxor build <config> --emit=image --output <file>` produces a graph
+image: a 256-byte FXSL header; from the first 4 KiB boundary, the module
+table (FXMT format, one FXMD entry per module) followed by the graph's
+program section when its modules own programs (see
+[module_architecture.md](module_architecture.md#programs)); and from the
+next 256-byte boundary, the compiled config blob. The header fields are
 little-endian:
 
 | Offset | Field |
 |--------|-------|
 | 0..4 | magic `FXSL` (`0x4C53_5846`) |
 | 4 | version (1) |
+| 5..8 | unused (0xFF) |
 | 8..16 | epoch (`u64`) |
-| 16..24 | modules offset and size |
+| 16..24 | modules offset and size (the size covers the program section) |
 | 24..32 | config offset and size |
-| 32..64 | SHA-256 over modules ‖ config |
+| 32..64 | SHA-256 over the modules region, then the config region |
 | 64..96 | ABI-surface digest of the kernel the graph was built against |
+| 96..168 | signature record, or erased (0xFF) when the image is unsigned |
+| 168..256 | unused (0xFF) |
 
 The header pins kernel and graph to each other: a device refuses an
 image whose ABI-surface digest does not equal the running kernel's.
 The image excludes firmware; it is the only sanctioned module-delivery
-path for OTA devices. RP targets pad the image to the 512 KB flash
-slot aperture; other targets emit it unpadded with an 8 MiB ceiling.
+path for OTA devices. RP targets pad the image with 0xFF to the 512 KB
+flash slot aperture; other targets emit it unpadded with an 8 MiB
+ceiling.
+
+### Graph-image signatures
+
+Source: `src/kernel/security/slot_signature.rs`.
+
+The signature record is `[magic "SIG1" (u32 LE 0x3147_4953)][key id: the
+first four bytes of SHA-256 of the public key][Ed25519 signature R ‖ S:
+64 bytes]`, and the signature is over header bytes 0..96: magic, version,
+epoch, both regions, the payload digest and the ABI pin. The payload is
+bound through its digest, so one signature vouches for every module, the
+program section and the config together, and the epoch cannot be raised
+without breaking it.
+
+Signing an image takes a 32-byte Ed25519 seed:
+
+```sh
+fluxor modules keygen --key slot.key        # creates the seed, prints the public key
+fluxor build graph.yaml --emit=image --output graph.img --sign-key slot.key
+```
+
+`--sign-key` is refused with any other `--emit` form, and the tool never
+prints the seed. A device trusts a signer when its kernel is built with
+that public key as the slot root: `FLUXOR_SLOT_ROOT_HEX`, 64 hex digits,
+read at compile time. A value that is not 64 hex digits fails the kernel
+build. A kernel built with a root:
+
+- boots from a flash slot only when its header carries a record for the
+  root that verifies and its payload matches the digest; otherwise it falls
+  back to the other slot, then to the firmware's own graph. Verification is
+  strict (S below the group order, canonical encodings, no small-order
+  points) and is the same in the kernel and in `graph_slot`, so the boot
+  selector and ACTIVATE agree on every image;
+- stages a RAM image only when the same holds (`-EACCES` otherwise);
+- tells `graph_slot` the root (`SLOT_SIGNING_ROOT`), which then activates
+  a slot only when the same holds, so a successful activation is one the
+  next boot honours.
+
+A kernel built without a root checks no signature: signed and unsigned
+images are admitted alike, on their structure, ABI pin, digest and epoch.
+The firmware's own graph (the one in the boot image) is never
+signature-checked; it is as trusted as the kernel it ships in.
 
 ## Publish and Distribution
 
@@ -51,9 +101,12 @@ Graph images and boot images are OCI artefacts in the local store:
 - `fluxor publish image <file>` publishes a built graph image (media
   type `application/vnd.nanocloud.fluxor.image.v1`). By default the
   image is exploded into layers — a skeleton (header + module-table
-  header), one layer per `.fmod`, and a config layer, each annotated
-  with its `io.fluxor.image.offset` — so registries deduplicate module
-  content and devices fetch only what changed. `--packed` keeps the
+  header), one layer per `.fmod`, the program section
+  (`application/vnd.nanocloud.fluxor.programs.v1`) when there is one, and
+  a config layer, each annotated with its `io.fluxor.image.offset` — so
+  registries deduplicate module content and devices fetch only what
+  changed. The skeleton carries the header, so a signed image stays
+  signed. `--packed` keeps the
   single-blob form used by the RP flash-slot path. Epoch and ABI pin
   are mirrored from the header into the `io.fluxor.image.epoch` and
   `io.fluxor.abi-surface` annotations so a consumer can admit an image
@@ -68,8 +121,8 @@ Graph images and boot images are OCI artefacts in the local store:
   are refused.
 
 Devices are targeted by tag (for example `devices/<device-id>:latest`)
-on an ordinary OCI-distribution registry. In the current model the
-device pull is anonymous; the registry does not authenticate devices
+on an ordinary OCI-distribution registry. The device pull is
+anonymous; the registry does not authenticate devices
 or select per-device content beyond the tag.
 
 ## Boot Image and Netboot
@@ -133,7 +186,7 @@ through `tls`. Params (TLV tags): `authority` (10, `host[:port]`, port
 `Host:` header), `repo` (4), `tag` (5), `poll_s` (6, 0 = pull once),
 `boot_delay_ms` (7, default 2000), `chunk_bytes` (8, 0 = whole blob),
 `directive_pubkey` (9, 64 hex chars of an Ed25519 public key). Tags 1,
-2 and 3 are retired.
+2 and 3 are not assigned.
 
 The pull cycle:
 
@@ -177,18 +230,22 @@ The stage is RAM: two 8 MiB, 16 KiB-aligned static buffers used
 alternately A/B. `COMMIT` validates the staged image — FXSL magic and
 version, region bounds, SHA-256 over modules ‖ config against the
 header, strict ABI-surface-pin equality against the running kernel
-(`-EACCES` on mismatch), and epoch monotonicity (`-EBUSY`) — then
-flips the region non-writable and executable via the platform HAL,
-re-points the static loader at it, and requests a scheduler graph
-rebuild. Staged code is never executed before validation.
+(`-EACCES` on mismatch), on a kernel built with a slot root the
+header's signature (`-EACCES`), and an epoch above the live one
+(`-EBUSY`) — then flips the region non-writable and executable via the
+platform HAL, re-points the static loader at it, and requests a
+scheduler graph rebuild. Staged code is never executed before
+validation, and is loaded from the same buffer that was validated.
 
 Failure posture: a validation failure leaves the running graph
 untouched; a failure during the rebuild itself leaves the graph idle,
 recoverable by power cycle back into the netboot image. Staging never
 writes the boot image, so the netboot/SD image is the fallback by
-construction. Rollback to an older epoch is refused; recovering an
-older version means a power cycle and a re-pull, or publishing it
-under a newer epoch. On targets without the RAM stage (RP, WASM) the
+construction. The live epoch is held in RAM and starts at 0 each boot:
+within a boot an older or equal epoch is refused, and after a power
+cycle any image with an epoch of 1 or more is accepted. Recovering an
+older version means a power cycle and a re-pull, or publishing it under
+a newer epoch. On targets without the RAM stage (RP, WASM) the
 surface returns `ENOSYS`.
 
 Activating a new graph image restarts the graph. For graphs holding
@@ -220,11 +277,29 @@ and write targets the other one; a second OTA before a reset replaces
 the pending image, not the running one. The header page (offset 0,
 which carries the magic and epoch the boot selector reads) is held in
 RAM when written and programmed only by `gs.activate`, after the epoch,
-the ABI pin and the SHA-256 over the rest of the slot check out. A
-slot that was half-written or failed its digest therefore has no magic
+the ABI pin, the SHA-256 over the rest of the slot and, on a kernel
+built with a slot root, the header's signature check out (a refused
+signature answers `-EACCES` and logs `[graph_slot] refused: signature`).
+A slot that was half-written or failed a check therefore has no magic
 and cannot be selected at boot. `gs.query_cfg` answers the running
 slot's config address, which stays readable until the next reset;
 `gs.query_active` answers the slot the next boot selects.
+
+On a kernel built with a slot root, `graph_slot` counts a slot live
+(for `gs.query_active`, and as the epoch an activation must beat) only
+when the boot selector would admit it. Verifying a signature takes many
+steps, so it does not re-verify on every query: it starts from the
+slots this boot's selector admitted (`SLOT_ADMITTED`, a mask) and tracks
+its own changes — a slot it erases or writes into leaves the set, a slot
+it activates joins it. A higher-epoch slot planted in flash by other
+means is neither booted nor counted live.
+
+The boot selector reads a slot in place from flash: under a root it
+verifies the header and hashes the payload, then runs the modules from
+those same flash bytes. Nothing but `graph_slot` programs a slot while
+the board runs, and it never programs the running one; an attacker who
+can rewrite flash between that check and use has physical access, which
+this does not defend against.
 
 ## Security Model
 
@@ -233,12 +308,16 @@ manifest names layer digests, every fetched blob is hashed as it
 streams, and commit re-verifies the whole-image hash from the FXSL
 header. Transport trust is TLS with the deployment CA pinned in the
 base graph's `tls` module. Binding to the running kernel is the
-ABI-surface pin; downgrade resistance is epoch monotonicity. Graph
-images are not signature-verified on this path; module-level Ed25519
-signature enforcement exists in the loader as a build-time option and
-is described in `security.md`. Registry compromise is therefore
-bounded by the TLS trust root and the digest/ABI/epoch checks, not by
-a content signature.
+ABI-surface pin; downgrade resistance is epoch monotonicity (within a
+boot on the RAM stage; against the slot it replaces on flash).
+
+On a kernel built with a slot root, the image's signature is what makes
+a registry or transport compromise insufficient: a device boots, stages
+and activates only images the root's key signed, and the signed epoch
+cannot be raised to replay an old one. On a kernel built without one,
+registry compromise is bounded by the TLS trust root and the
+digest/ABI/epoch checks only. Module-level Ed25519 signatures are a
+separate, per-module check in the loader, described in `security.md`.
 
 ## Where It Fits
 

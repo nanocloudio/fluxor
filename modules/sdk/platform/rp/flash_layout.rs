@@ -3,7 +3,7 @@
 // Layer: platform/rp (chip-specific, unstable).
 //
 // The RP-family runtime uses a 4 MB XIP flash (0x1000_0000 base),
-// partitioned end-to-end as:
+// partitioned as:
 //
 //   0x000000 - 0x2FCFFF   firmware + modules + static config (~3 MB)
 //   0x2FD000 - 0x37CFFF   graph slot A (512 KB)
@@ -22,27 +22,54 @@ pub const XIP_BASE: u32 = 0x1000_0000;
 
 // ── Graph slot A/B (OTA reconfigure) ──────────────────────────────────
 //
-// Two 512 KB regions at the top of flash. Each holds one version of the
-// graph bundle (modules table + static config); the slot with a valid
-// magic and higher epoch is live. Consumed by `src/kernel/config.rs`
-// (boot-time read) and `modules/foundation/graph_slot/mod.rs` (writer).
+// Two 512 KB regions near the top of flash. Each holds one graph image
+// (`fluxor build --emit=image`): this header, the module table with its
+// program section, and the static config. Of the slots the boot selector
+// admits, the one with the higher epoch is live. Consumed by
+// `src/kernel/boot/config.rs` (boot-time selection),
+// `modules/foundation/graph_slot/mod.rs` (writer) and, for the same image
+// staged in RAM, `src/kernel/module/ota_stage.rs`.
+//
+// Header (256 bytes, little-endian):
+//
+//   0..4     magic "FXSL"
+//   4        version
+//   5..8     unused (0xFF)
+//   8..16    epoch (u64)
+//   16..20   modules offset    20..24  modules size
+//   24..28   config offset     28..32  config size
+//   32..64   SHA-256 over the modules region then the config region
+//   64..96   ABI-surface pin
+//   96..168  signature record (below), or erased (0xFF) when unsigned
+//   168..256 unused
 
 pub const GRAPH_SLOT_A_OFFSET: u32 = 0x002F_D000;
 pub const GRAPH_SLOT_B_OFFSET: u32 = 0x0037_D000;
 pub const GRAPH_SLOT_SIZE: u32 = 0x0008_0000; // 512 KB
 pub const GRAPH_SLOT_MAGIC: u32 = 0x4C53_5846; // "FXSL"
 pub const GRAPH_SLOT_VERSION: u8 = 1;
-/// Bytes reserved at the start of each slot for the slot header
-/// (magic/epoch/sizes/sha256). See `contracts/storage/graph_slot.rs`
-/// for the on-flash field layout.
+/// Bytes reserved at the start of each slot for the header laid out above.
 pub const GRAPH_SLOT_HEADER_SIZE: usize = 256;
 /// Header offset of the 32-byte ABI-surface pin (`abi_surface.rs` digest
-/// of the substrate the slot was built against). `fluxor slot-image`
-/// writes it; the slot selector accepts a slot only when the pin equals
-/// the running kernel's own surface digest — strict equality, no legacy
-/// grandfather (pre-pin slots must be rewritten with a current
-/// slot-image).
+/// of the substrate the image was built against). `fluxor build
+/// --emit=image` writes it; every reader accepts an image only when the
+/// pin equals the running kernel's own surface digest.
 pub const GRAPH_SLOT_ABI_SURFACE_OFFSET: usize = 64;
+/// The header bytes a slot signature covers: magic through the ABI pin
+/// (`[0..96]`) -- the epoch, both regions' offsets and sizes, the payload's
+/// SHA-256 and the pin. The payload is bound through its digest, so one
+/// signature over these bytes vouches for every module, the config and the
+/// program section together.
+pub const GRAPH_SLOT_SIGNED_LEN: usize = 96;
+/// Header offset of the signature record: `[magic "SIG1"][key id: 4 bytes =
+/// the first four of SHA-256(public key)][Ed25519 signature R ‖ S: 64
+/// bytes]`, 72 bytes in all. An unsigned image leaves these bytes erased
+/// (0xFF). A kernel built with a slot root (`FLUXOR_SLOT_ROOT_HEX`) accepts
+/// only an image whose record verifies against it; one built without checks
+/// no signature.
+pub const GRAPH_SLOT_SIGNATURE_OFFSET: usize = 96;
+pub const GRAPH_SLOT_SIGNATURE_MAGIC: u32 = 0x3147_4953; // "SIG1"
+pub const GRAPH_SLOT_SIGNATURE_LEN: usize = 72;
 
 // ── Runtime parameter store ──────────────────────────────────────────
 //

@@ -258,6 +258,246 @@ pub fn build_module_table(modules: &[ModuleInfo]) -> Result<Vec<u8>> {
     Ok(result)
 }
 
+/// Layouts the kernel reads, mounted from the SDK so the packer writes the
+/// one definition the kernel and modules compile against: the program
+/// section (`kernel_abi::program`) and the graph-image header
+/// (`flash_layout::GRAPH_SLOT_*`).
+#[allow(
+    dead_code,
+    reason = "the packer reads a few constants of each mounted file"
+)]
+pub mod sdk_layout {
+    /// `kernel_abi.rs` names `super::wire`.
+    pub(crate) use crate::wire;
+    pub mod kernel_abi {
+        include!("../../modules/sdk/abi/kernel_abi.rs");
+    }
+    pub mod flash_layout {
+        include!("../../modules/sdk/platform/rp/flash_layout.rs");
+    }
+}
+
+use sdk_layout::kernel_abi::program as pg;
+
+/// One program a module instance owns, as the graph declared it.
+#[derive(Debug, Clone)]
+pub struct ProgramBlob {
+    /// FNV-1a of the owning module's type name.
+    pub type_hash: u32,
+    /// Which instance of that type, counting from 0 in graph order.
+    pub ordinal: u8,
+    /// Which of the instance's programs (its position in `programs:`).
+    pub slot: u8,
+    /// FNV-1a of the declared kind, or 0.
+    pub kind: u32,
+    /// The digest the producer names its format by, or zeros.
+    pub format: [u8; 32],
+    pub bytes: Vec<u8>,
+}
+
+/// The programs a graph's modules own, in graph order.
+///
+/// A module entry names them with `program:` (one) or `programs:` (a list).
+/// Each is a `${file:<path>}` spec, a bare path, or a map
+/// `{ file, kind, format }`: `kind` a name hashed into the section, `format`
+/// 64 hex digits the producer names its format by. Paths resolve as every
+/// other `${file:}` does, from where the build runs. The owner is the
+/// module's type (`type:`, or its `name:` when it gives none) and its
+/// ordinal among modules of that type in graph order, which is how the
+/// kernel finds a caller's programs.
+pub fn collect_programs(config: &serde_json::Value) -> Result<Vec<ProgramBlob>> {
+    let mut out = Vec::new();
+    let Some(mods) = config.get("modules").and_then(|m| m.as_array()) else {
+        return Ok(out);
+    };
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for m in mods {
+        let Some(name) = m.get("name").and_then(|n| n.as_str()) else {
+            continue;
+        };
+        // The module's type: `type:` when the entry names one (its `name:` is
+        // then the instance's), else the name. The kernel records the type.
+        let ty = m.get("type").and_then(|t| t.as_str()).unwrap_or(name);
+        let ordinal = {
+            let c = seen.entry(ty.to_string()).or_insert(0);
+            let o = *c;
+            *c += 1;
+            o
+        };
+        let list: Vec<&serde_json::Value> = match (m.get("program"), m.get("programs")) {
+            (Some(_), Some(_)) => {
+                return Err(Error::Config(format!(
+                    "module '{name}': name its programs with `program` or `programs`, not both"
+                )))
+            }
+            (Some(p), None) => vec![p],
+            (None, Some(serde_json::Value::Array(ps))) => ps.iter().collect(),
+            (None, Some(_)) => {
+                return Err(Error::Config(format!(
+                    "module '{name}': `programs` is a list"
+                )))
+            }
+            (None, None) => continue,
+        };
+        let Ok(ordinal) = u8::try_from(ordinal) else {
+            return Err(Error::Config(format!(
+                "module '{name}': more than 256 instances of type '{ty}' before it; \
+                 a program's owner is named by a one-byte ordinal"
+            )));
+        };
+        if list.len() > 256 {
+            return Err(Error::Config(format!(
+                "module '{name}': more than 256 programs"
+            )));
+        }
+        for (slot, spec) in list.into_iter().enumerate() {
+            let (path, kind, format) = match spec {
+                serde_json::Value::String(s) => (s.clone(), None, None),
+                serde_json::Value::Object(o) => (
+                    o.get("file")
+                        .and_then(|f| f.as_str())
+                        .ok_or_else(|| {
+                            Error::Config(format!("module '{name}': a program map needs `file`"))
+                        })?
+                        .to_string(),
+                    o.get("kind").and_then(|k| k.as_str()).map(str::to_string),
+                    o.get("format").and_then(|f| f.as_str()).map(str::to_string),
+                ),
+                _ => {
+                    return Err(Error::Config(format!(
+                        "module '{name}': a program is a path or a map"
+                    )))
+                }
+            };
+            let path = crate::trust_anchors::file_source(&path)
+                .map(str::to_string)
+                .unwrap_or(path);
+            let bytes = std::fs::read(&path)
+                .map_err(|e| Error::Config(format!("module '{name}': program '{path}': {e}")))?;
+            let format = match format {
+                Some(hex) => parse_format_digest(&hex).ok_or_else(|| {
+                    Error::Config(format!(
+                        "module '{name}': program format '{hex}' is not 64 hex digits"
+                    ))
+                })?,
+                None => [0u8; 32],
+            };
+            out.push(ProgramBlob {
+                type_hash: fnv1a_hash(ty.as_bytes()),
+                ordinal,
+                slot: slot as u8,
+                kind: kind.map_or(0, |k| fnv1a_hash(k.as_bytes())),
+                format,
+                bytes,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// A program's `format`: 32 bytes as 64 hex digits.
+fn parse_format_digest(hex: &str) -> Option<[u8; 32]> {
+    let hex = hex.as_bytes();
+    if hex.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, b) in out.iter_mut().enumerate() {
+        let pair = std::str::from_utf8(&hex[2 * i..2 * i + 2]).ok()?;
+        *b = u8::from_str_radix(pair, 16).ok()?;
+    }
+    Some(out)
+}
+
+/// The program section for `programs`, laid out as `kernel_abi::program`
+/// documents: the entries in owner order, each owner's programs together in
+/// a region that starts on a 4 KiB boundary and is a whole number of 32-byte
+/// granules, each program on a 32-byte boundary, and the section a whole
+/// number of 4 KiB pages. The kernel refuses a section that is not laid out
+/// this way. Empty when there are no programs.
+pub fn build_program_section(programs: &[ProgramBlob]) -> Result<Vec<u8>> {
+    if programs.is_empty() {
+        return Ok(Vec::new());
+    }
+    if programs.len() > 255 {
+        return Err(Error::Config("more than 255 programs in one graph".into()));
+    }
+    // Entries in owner order, so an owner's programs are contiguous.
+    let mut order: Vec<usize> = (0..programs.len()).collect();
+    order.sort_by_key(|&i| (programs[i].type_hash, programs[i].ordinal, programs[i].slot));
+    let mut data_at = pg::HEADER_LEN + programs.len() * pg::ENTRY_LEN;
+    let mut placed = vec![(0usize, 0usize, 0usize); programs.len()]; // offset, region_off, region_len
+    let mut k = 0;
+    while k < order.len() {
+        let owner = (programs[order[k]].type_hash, programs[order[k]].ordinal);
+        let start = data_at.next_multiple_of(pg::OWNER_ALIGN);
+        let mut at = start;
+        let mut j = k;
+        while j < order.len() && (programs[order[j]].type_hash, programs[order[j]].ordinal) == owner
+        {
+            at = at.next_multiple_of(pg::PROGRAM_ALIGN);
+            placed[order[j]].0 = at;
+            at += programs[order[j]].bytes.len();
+            j += 1;
+        }
+        // A region is never empty, so an MPU can draw it.
+        let region_len = (at - start).max(1).next_multiple_of(pg::PROGRAM_ALIGN);
+        for &i in &order[k..j] {
+            placed[i].1 = start;
+            placed[i].2 = region_len;
+        }
+        data_at = start + region_len;
+        k = j;
+    }
+    let total = data_at.next_multiple_of(pg::OWNER_ALIGN);
+    if total > u32::MAX as usize {
+        return Err(Error::Config("program section larger than 4 GiB".into()));
+    }
+    let mut out = vec![0u8; total];
+    out[0..4].copy_from_slice(&pg::SECTION_MAGIC.to_le_bytes());
+    out[4] = pg::SECTION_VERSION;
+    out[5] = programs.len() as u8;
+    out[8..12].copy_from_slice(&(total as u32).to_le_bytes());
+    for (n, &i) in order.iter().enumerate() {
+        let p = &programs[i];
+        let e = pg::HEADER_LEN + n * pg::ENTRY_LEN;
+        out[e..e + 4].copy_from_slice(&p.type_hash.to_le_bytes());
+        out[e + 4] = p.ordinal;
+        out[e + 5] = p.slot;
+        out[e + 8..e + 12].copy_from_slice(&p.kind.to_le_bytes());
+        out[e + 12..e + 16].copy_from_slice(&(placed[i].0 as u32).to_le_bytes());
+        out[e + 16..e + 20].copy_from_slice(&(p.bytes.len() as u32).to_le_bytes());
+        out[e + 20..e + 24].copy_from_slice(&(placed[i].1 as u32).to_le_bytes());
+        out[e + 24..e + 28].copy_from_slice(&(placed[i].2 as u32).to_le_bytes());
+        out[e + 32..e + 64].copy_from_slice(&p.format);
+        out[placed[i].0..placed[i].0 + p.bytes.len()].copy_from_slice(&p.bytes);
+    }
+    Ok(out)
+}
+
+/// Byte offset, in the module-table header, of the program section's offset
+/// from the table's start (the header's first reserved word; 0 = none).
+pub const TABLE_PROGRAMS_AT: usize = 10;
+
+/// The module table with the graph's program section after it: the
+/// section starts on the first 4 KiB boundary at or past the table's end,
+/// and the table header names its offset at [`TABLE_PROGRAMS_AT`].
+pub fn build_module_table_with_programs(
+    modules: &[ModuleInfo],
+    programs: &[ProgramBlob],
+) -> Result<Vec<u8>> {
+    let mut table = build_module_table(modules)?;
+    let section = build_program_section(programs)?;
+    if section.is_empty() {
+        return Ok(table);
+    }
+    let at = table.len().next_multiple_of(pg::OWNER_ALIGN);
+    table.resize(at, 0);
+    table[TABLE_PROGRAMS_AT..TABLE_PROGRAMS_AT + 4].copy_from_slice(&(at as u32).to_le_bytes());
+    table.extend_from_slice(&section);
+    Ok(table)
+}
+
 /// Check if a module type is a kernel built-in (has `builtin = true` in its manifest).
 /// Built-in modules don't have .fmod files — they're compiled into the kernel binary.
 pub fn is_builtin_module(module_type: &str) -> bool {
@@ -1734,6 +1974,105 @@ fn validate_param_schema(data: &[u8], start: usize) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
+
+    fn blob(type_hash: u32, ordinal: u8, slot: u8, bytes: &[u8]) -> ProgramBlob {
+        ProgramBlob {
+            type_hash,
+            ordinal,
+            slot,
+            kind: 7,
+            format: [slot; 32],
+            bytes: bytes.to_vec(),
+        }
+    }
+
+    /// The section names every program by owner and slot, each owner's run
+    /// starts on a page, each program on 32 bytes, and the bytes are there.
+    #[test]
+    fn program_section_lays_owners_out_on_pages() {
+        let ps = [
+            blob(0xB, 0, 0, b"second owner"),
+            blob(0xA, 0, 1, &[2u8; 100]),
+            blob(0xA, 0, 0, &[1u8; 33]),
+        ];
+        let sec = build_program_section(&ps).unwrap();
+        assert_eq!(&sec[0..4], b"FXPG");
+        assert_eq!(sec[4], 1);
+        assert_eq!(sec[5], 3);
+        assert_eq!(
+            u32::from_le_bytes(sec[8..12].try_into().unwrap()) as usize,
+            sec.len()
+        );
+        assert_eq!(sec.len() % 4096, 0);
+        let entry = |n: usize| {
+            let e = &sec[16 + n * 64..16 + (n + 1) * 64];
+            let r = |o: usize| u32::from_le_bytes(e[o..o + 4].try_into().unwrap()) as usize;
+            (r(0) as u32, e[4], e[5], r(12), r(16), r(20), r(24), e[32])
+        };
+        // Owner order, then slot.
+        let (t0, _, s0, off0, len0, roff0, rlen0, f0) = entry(0);
+        let (t1, _, s1, off1, len1, roff1, rlen1, _) = entry(1);
+        let (t2, _, _, off2, len2, roff2, _, _) = entry(2);
+        assert_eq!((t0, s0, t1, s1, t2), (0xA, 0, 0xA, 1, 0xB));
+        assert_eq!(f0, 0);
+        assert_eq!(roff0 % 4096, 0);
+        assert_eq!((roff0, rlen0), (roff1, rlen1), "one region per owner");
+        assert_eq!(off1 % 32, 0);
+        assert!(off1 >= off0 + len0 && off1 + len1 <= roff1 + rlen1);
+        assert_eq!(rlen0 % 32, 0);
+        assert_eq!(roff2 % 4096, 0);
+        assert!(roff2 >= roff0 + rlen0, "owners never share a page");
+        assert_eq!(&sec[off0..off0 + len0], &[1u8; 33][..]);
+        assert_eq!(&sec[off2..off2 + len2], b"second owner");
+    }
+
+    /// The table names the section by its first reserved word, and the
+    /// section starts on the page after the table.
+    #[test]
+    fn module_table_points_at_its_program_section() {
+        let t = build_module_table_with_programs(&[], &[blob(1, 0, 0, b"x")]).unwrap();
+        let at = u32::from_le_bytes(t[10..14].try_into().unwrap()) as usize;
+        assert_eq!(at, 4096);
+        assert_eq!(&t[at..at + 4], b"FXPG");
+        let none = build_module_table_with_programs(&[], &[]).unwrap();
+        assert_eq!(&none[10..14], &[0u8; 4]);
+    }
+
+    /// Programs come from the graph: one or a list, a path or a map, owned
+    /// by the module's type and its ordinal among modules of that type.
+    #[test]
+    fn programs_are_collected_with_their_owners() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.bin");
+        let b = dir.path().join("b.bin");
+        std::fs::write(&a, b"aaa").unwrap();
+        std::fs::write(&b, b"bbbb").unwrap();
+        let cfg = serde_json::json!({ "modules": [
+            { "name": "x", "program": format!("${{file:{}}}", a.display()) },
+            { "name": "y" },
+            { "name": "x2", "type": "x", "programs": [
+                b.display().to_string(),
+                { "file": a.display().to_string(), "kind": "phasor", "format": "11".repeat(32) }
+            ] }
+        ]});
+        let ps = collect_programs(&cfg).unwrap();
+        assert_eq!(ps.len(), 3);
+        assert_eq!(
+            (ps[0].ordinal, ps[0].slot, ps[0].bytes.as_slice()),
+            (0, 0, &b"aaa"[..])
+        );
+        assert_eq!(
+            (ps[1].ordinal, ps[1].slot, ps[1].bytes.as_slice()),
+            (1, 0, &b"bbbb"[..])
+        );
+        assert_eq!((ps[2].ordinal, ps[2].slot), (1, 1));
+        assert_eq!(ps[2].kind, fnv1a_hash(b"phasor"));
+        assert_eq!(ps[2].format, [0x11; 32]);
+        assert_eq!(ps[0].type_hash, fnv1a_hash(b"x"));
+        let both = serde_json::json!({ "modules": [ { "name": "x", "program": "a", "programs": ["b"] } ] });
+        assert!(collect_programs(&both).is_err());
+    }
+
     use super::*;
 
     /// A wasm module whose schema has a `str_chunked` param keeps its
