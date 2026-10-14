@@ -1214,12 +1214,10 @@ unsafe fn rp_system_extension_dispatch(
                 1
             };
 
-            // Both directions at once, on their own channels, and return.
-            //
-            // The transfer used to run to completion inside this call: TX,
-            // spin, RX, spin. At 25 MHz a full gSPI frame is half a
-            // millisecond of the core doing nothing, and the module calling
-            // this does several per step during association — steps of
+            // Both directions at once, on their own channels, and return
+            // without waiting. At 25 MHz a full gSPI frame is half a
+            // millisecond, and the module calling this does several per step
+            // during association: spinning on each would put a step at
             // 1-1.6 ms, over the scheduler's budget at the default tick.
             // The caller already has the shape for waiting (its
             // `TxnStep::WaitPio`); this makes the wait real. RX is armed
@@ -1412,8 +1410,7 @@ unsafe fn rp_system_extension_dispatch(
             let dr_addr: u32 = if bus == 0 { 0x4008_0008 } else { 0x4009_0008 };
             let tx_dreq: u8 = if bus == 0 { 16 } else { 18 };
             let rx_dreq: u8 = if bus == 0 { 17 } else { 19 };
-            // SPI's ceiling is Fsys/2, so it moves with the system clock
-            // rather than with a literal that happens to match today's.
+            // SPI's ceiling is Fsys/2, so it moves with the system clock.
             let max_freq: u32 = crate::platform::chip::SYS_CLK_HZ / 2;
             let dr = dr_addr.to_le_bytes();
             *arg = dr[0];
@@ -1718,7 +1715,7 @@ unsafe fn rp_system_extension_dispatch(
                     }
                     let offset =
                         u32::from_le_bytes([*arg.add(1), *arg.add(2), *arg.add(3), *arg.add(4)]);
-                    const FLASH_SIZE: u32 = 0x0040_0000;
+                    const FLASH_SIZE: u32 = crate::platform::chip::FLASH_SIZE;
                     let data_len = arg_len - 5;
                     if offset >= FLASH_SIZE {
                         return E_INVAL;

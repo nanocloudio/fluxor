@@ -1065,15 +1065,17 @@ fn cmd_combine(
         trailer_addr + UF2_BLOCK_ALIGN
     };
 
-    // Ensure combined image doesn't overlap any reserved flash region:
-    // graph slot A (OTA), graph slot B (OTA), blob store, or the runtime
-    // parameter store. Only applies to flash-based targets.
-    if !is_aarch64 {
-        const SLOT_A_ADDR: u32 = 0x1000_0000 + 0x002F_D000;
+    // Ensure the combined image ends below the regions the board's flash is
+    // partitioned into above it: the two graph slots and the parameter
+    // store, which start at slot A (`flash_layout::graph_flash`, from the
+    // board's flash size). Only applies to flash-based targets.
+    if let Some(layout) = target_desc.graph_flash() {
+        let slot_a_addr = XIP_BASE + layout.slot_a;
         let config_end = config_addr + config_data.len() as u32;
-        if config_end > SLOT_A_ADDR {
+        if config_end > slot_a_addr {
             return Err(error::Error::Config(format!(
-                "Combined image end ({config_end:#010x}) overlaps reserved OTA/store region at {SLOT_A_ADDR:#010x}. Reduce firmware/config size."
+                "Combined image end ({config_end:#010x}) overlaps the graph slots and parameter store from {slot_a_addr:#010x} (a {} KiB flash). Reduce firmware/config size.",
+                layout.flash_size / 1024
             )));
         }
     }
@@ -1373,8 +1375,6 @@ fn cmd_graph_image(
     const HEADER_SIZE: usize = fl::GRAPH_SLOT_HEADER_SIZE;
     const MODULES_ALIGN: usize = 4096;
     const SECTION_ALIGN: usize = 256;
-    /// RP flash A/B aperture (`GRAPH_SLOT_SIZE`) — the image fills it.
-    const FLASH_SLOT_SIZE: usize = fl::GRAPH_SLOT_SIZE as usize;
     /// RAM-staged image ceiling for targets without a flash aperture
     /// (Pi 5 OTA staging region; mirrors the kernel's
     /// `MAX_MODULES_BLOB_SIZE` reasoning).
@@ -1439,16 +1439,21 @@ fn cmd_graph_image(
     let modules_data = modules_data
         .ok_or_else(|| error::Error::Config("A graph image requires at least one module".into()))?;
 
-    // Image geometry is per-target: RP targets fill their fixed flash
-    // A/B slot aperture (padded to size, 0xFF like erased flash);
-    // everything else is a RAM-staged image — same header, bounded by
-    // the staging ceiling, emitted unpadded so the wire artifact is
-    // only as big as its payload.
-    let flash_slot = matches!(target_desc.id.as_str(), "rp2040" | "rp2350");
-    let image_size = if flash_slot {
-        FLASH_SLOT_SIZE
-    } else {
-        RAM_IMAGE_SIZE
+    // Image geometry is per-target: an RP image is bounded by the board's
+    // graph slot (`flash_layout::graph_flash`, from its flash size), and
+    // everything else by the RAM staging ceiling. Either way it is emitted
+    // only as long as its payload: the header says where the payload ends,
+    // which is where `ota_ingest` stops reading, so no padding crosses the
+    // wire.
+    let flash_slot = target_desc.graph_flash();
+    let image_size = match flash_slot {
+        Some(layout) if layout.slot_size == 0 => return Err(error::Error::Config(format!(
+            "{} has no graph slots: its {} KiB of flash leave no room for two beside the kernel",
+            target_desc.board_id.as_deref().unwrap_or(&target_desc.id),
+            layout.flash_size / 1024
+        ))),
+        Some(layout) => layout.slot_size as usize,
+        None => RAM_IMAGE_SIZE,
     };
 
     // Lay out the image: header | pad → 4KB | modules | pad → 256B | config.
@@ -1471,8 +1476,13 @@ fn cmd_graph_image(
         sha2::Sha256::digest(&payload)
     };
 
-    // Compose the final image (flash builds pad to the slot aperture).
-    let emit_len = if flash_slot { image_size } else { config_end };
+    // Compose the final image. A flash image ends on a whole page, which is
+    // what `graph_slot` programs.
+    let emit_len = if flash_slot.is_some() {
+        config_end.div_ceil(256) * 256
+    } else {
+        config_end
+    };
     let mut out = vec![0xFFu8; emit_len];
     // Header.
     out[0..4].copy_from_slice(&fl::GRAPH_SLOT_MAGIC.to_le_bytes());

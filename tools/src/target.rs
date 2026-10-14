@@ -297,6 +297,9 @@ struct TomlMemoryConfig {
     flash_size: String,
     ram_base: String,
     ram_size: String,
+    /// Flash the kernel keeps at the bottom (RP), which the graph-slot
+    /// partition leaves it.
+    kernel_flash_reserve: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -332,6 +335,14 @@ struct TomlBoardBuild {
 struct TomlBoardHardware {
     spi: Option<Vec<toml::Value>>,
     pio: Option<Vec<toml::Value>>,
+    flash: Option<TomlBoardFlash>,
+}
+
+/// `[hardware.flash]`: the flash the board fits, which overrides the
+/// silicon's default.
+#[derive(Deserialize, Clone)]
+struct TomlBoardFlash {
+    size: String,
 }
 
 #[derive(Deserialize)]
@@ -456,11 +467,29 @@ pub struct MemoryConfig {
     pub flash_size: u32,
     pub ram_base: u32,
     pub ram_size: u32,
+    /// Flash the kernel keeps at the bottom (RP); 0 where none is declared.
+    pub kernel_flash_reserve: u32,
 }
 
 // ── Implementation ──────────────────────────────────────────────────────────
 
 impl TargetDescriptor {
+    /// How an RP board's flash is partitioned: where the firmware region
+    /// ends, the two graph slots, the parameter store. The kernel built for
+    /// this board computes the same (`flash_layout::graph_flash`, from the
+    /// board's flash size and the silicon's kernel reserve). `None` for a
+    /// target with no XIP flash to partition.
+    pub fn graph_flash(&self) -> Option<crate::modules::sdk_layout::flash_layout::GraphFlash> {
+        if !matches!(self.id.as_str(), "rp2040" | "rp2350") {
+            return None;
+        }
+        let m = self.memory.as_ref()?;
+        Some(crate::modules::sdk_layout::flash_layout::graph_flash(
+            m.flash_size,
+            m.kernel_flash_reserve,
+        ))
+    }
+
     /// The stack a module at `level` steps on, in bytes, and what it is. An
     /// isolated module on an MMU target has its own fixed stack; every other
     /// module — and on an MPU target a gated one too, whose process stack is
@@ -747,6 +776,11 @@ fn load_silicon_target(path: &Path, kind: TargetKind) -> Result<TargetDescriptor
         flash_size: parse_hex_u32(&m.flash_size).unwrap_or(0),
         ram_base: parse_hex_u32(&m.ram_base).unwrap_or(0),
         ram_size: parse_hex_u32(&m.ram_size).unwrap_or(0),
+        kernel_flash_reserve: m
+            .kernel_flash_reserve
+            .as_deref()
+            .and_then(parse_hex_u32)
+            .unwrap_or(0),
     });
 
     let p = &silicon.peripherals;
@@ -850,11 +884,17 @@ fn load_board_target(board_path: &Path, targets_dir: &Path) -> Result<TargetDesc
     // the board/emulator places RAM/flash). A board without its own [memory]
     // keeps whatever the silicon declared (typically none).
     if let Some(m) = board.memory {
+        let reserve = desc.memory.as_ref().map_or(0, |m| m.kernel_flash_reserve);
         desc.memory = Some(MemoryConfig {
             flash_base: parse_hex_u32(&m.flash_base).unwrap_or(0),
             flash_size: parse_hex_u32(&m.flash_size).unwrap_or(0),
             ram_base: parse_hex_u32(&m.ram_base).unwrap_or(0),
             ram_size: parse_hex_u32(&m.ram_size).unwrap_or(0),
+            kernel_flash_reserve: m
+                .kernel_flash_reserve
+                .as_deref()
+                .and_then(parse_hex_u32)
+                .unwrap_or(reserve),
         });
     }
 
@@ -884,6 +924,19 @@ fn load_board_target(board_path: &Path, targets_dir: &Path) -> Result<TargetDesc
                 .into_iter()
                 .filter_map(|(k, v)| k.parse::<u8>().ok().map(|pin| (pin, v)))
                 .collect();
+        }
+    }
+
+    // The flash the board fits overrides the silicon's default, as the
+    // kernel build takes it (build.rs): both partition the same flash.
+    if let Some(size) = board
+        .hardware
+        .as_ref()
+        .and_then(|hw| hw.flash.as_ref())
+        .and_then(|f| parse_hex_u32(&f.size))
+    {
+        if let Some(m) = desc.memory.as_mut() {
+            m.flash_size = size;
         }
     }
 
@@ -1006,6 +1059,34 @@ mod tests {
             let desc = super::load_target(target, &root).expect("target loads");
             assert_eq!(desc.runtime(), runtime, "target `{target}` runtime");
             assert_eq!(desc.module_abi(), abi, "target `{target}` module ABI");
+        }
+    }
+
+    /// The flash each RP board is partitioned from is the board's own, and
+    /// the partition is the one the kernel built for it computes: a Pico W's
+    /// 2 MB is not a Pico 2 W's 4 MB, and neither puts a slot past its end.
+    /// Targets with no XIP flash have no partition.
+    #[test]
+    fn rp_boards_partition_their_own_flash() {
+        let root = repo_root();
+        for (target, flash, slot_a, slot_size) in [
+            ("pico2w", 0x40_0000u32, 0x1C_1000u32, 0x11_F000u32),
+            ("rp2350", 0x40_0000, 0x1C_1000, 0x11_F000),
+            ("picow", 0x20_0000, 0x10_1000, 0x7_F000),
+            ("pico", 0x20_0000, 0x10_1000, 0x7_F000),
+        ] {
+            let g = super::load_target(target, &root)
+                .expect("target loads")
+                .graph_flash()
+                .unwrap_or_else(|| panic!("`{target}` has a partition"));
+            assert_eq!(g.flash_size, flash, "`{target}` flash");
+            assert_eq!(g.slot_a, slot_a, "`{target}` slot A");
+            assert_eq!(g.slot_size, slot_size, "`{target}` slot size");
+            assert_eq!(g.param_store + 4096, flash, "`{target}` parameter store");
+        }
+        for target in ["linux", "pi5", "wasm"] {
+            let desc = super::load_target(target, &root).expect("target loads");
+            assert!(desc.graph_flash().is_none(), "`{target}` has no XIP flash");
         }
     }
 

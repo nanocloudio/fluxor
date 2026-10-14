@@ -76,8 +76,6 @@ const PARAM_DELETE_OP: u32 = 0x0C35;
 const PARAM_CLEAR_ALL_OP: u32 = 0x0C36;
 
 const XIP_BASE: u32 = abi::platform::rp::flash_layout::XIP_BASE;
-const STORE_OFFSET: u32 = abi::platform::rp::flash_layout::PARAM_STORE_OFFSET;
-const STORE_XIP: u32 = XIP_BASE + STORE_OFFSET;
 const SECTOR_SIZE: usize = abi::platform::rp::flash_layout::PARAM_STORE_SIZE;
 const HEADER_SIZE: usize = 8;
 const ENTRY_HEADER_SIZE: usize = 4;
@@ -150,6 +148,10 @@ struct FlashState {
     // --- Error tracking ---
     error_count: u32,
     // --- Flash store provider ---
+    /// The parameter store's sector, as the kernel partitioned this board's
+    /// flash (`FLASH_LAYOUT`): its last. 0 until known, and then every
+    /// parameter op is refused rather than aimed at the firmware.
+    store_offset: u32,
     registered: u8,
     signaled_ready: u8,
     _pad3: [u8; 2],
@@ -411,7 +413,20 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 return result;
             }
             s.registered = 1;
-            init_free_offset(s);
+            // Where this board's parameter store is.
+            let mut layout = [0u8; abi::platform::rp::flash_layout::GRAPH_FLASH_LEN];
+            let rc = (sys.provider_call)(
+                -1,
+                abi::kernel_abi::FLASH_LAYOUT,
+                layout.as_mut_ptr(),
+                layout.len(),
+            );
+            s.store_offset = abi::platform::rp::flash_layout::GraphFlash::decode(&layout)
+                .filter(|_| rc >= 0)
+                .map_or(0, |g| g.param_store);
+            if s.store_offset != 0 {
+                init_free_offset(s);
+            }
         }
 
         // ---- Signal ready (once) — gates downstream modules ----
@@ -582,6 +597,10 @@ pub unsafe extern "C" fn flash_store_dispatch(
         return -22;
     }
     let sys = &*s.syscalls;
+    if s.store_offset == 0 {
+        // The kernel did not say where the store is.
+        return -38;
+    }
 
     match opcode {
         PARAM_STORE_OP => {
@@ -699,7 +718,7 @@ unsafe fn clear_all(s: &mut FlashState, sys: &SyscallTable, module_id: u8) -> i3
 
 /// Erase the entire runtime store (factory reset).
 unsafe fn erase_store(s: &mut FlashState, sys: &SyscallTable) -> i32 {
-    let result = raw_flash_erase(sys, STORE_OFFSET);
+    let result = raw_flash_erase(sys, s.store_offset);
     if result < 0 {
         return result;
     }
@@ -713,7 +732,7 @@ unsafe fn erase_store(s: &mut FlashState, sys: &SyscallTable) -> i32 {
 
 /// Write sector header + first entry to a virgin sector.
 unsafe fn write_header_and_entry(
-    _s: &mut FlashState,
+    s: &mut FlashState,
     sys: &SyscallTable,
     module_id: u8,
     tag: u8,
@@ -754,13 +773,13 @@ unsafe fn write_header_and_entry(
     }
 
     // Erase first (sector may have garbage)
-    let r = raw_flash_erase(sys, STORE_OFFSET);
+    let r = raw_flash_erase(sys, s.store_offset);
     if r < 0 {
         return r;
     }
 
     // Program first page
-    let r = raw_flash_program(sys, STORE_OFFSET, pb);
+    let r = raw_flash_program(sys, s.store_offset, pb);
     if r < 0 {
         return r;
     }
@@ -775,7 +794,7 @@ unsafe fn write_header_and_entry(
             *p2.add(j) = *value.add(remaining_start + j);
             j += 1;
         }
-        let r = raw_flash_program(sys, STORE_OFFSET + PAGE_SIZE as u32, p2);
+        let r = raw_flash_program(sys, s.store_offset + PAGE_SIZE as u32, p2);
         if r < 0 {
             return r;
         }
@@ -830,7 +849,7 @@ unsafe fn append_entry(
         i += 1;
     }
 
-    let r = raw_flash_program(sys, STORE_OFFSET + page_start as u32, pb);
+    let r = raw_flash_program(sys, s.store_offset + page_start as u32, pb);
     if r < 0 {
         return r;
     }
@@ -845,7 +864,7 @@ unsafe fn append_entry(
             *p2.add(j) = *value.add(first_chunk + j);
             j += 1;
         }
-        let r = raw_flash_program(sys, STORE_OFFSET + page_end_entry as u32, p2);
+        let r = raw_flash_program(sys, s.store_offset + page_end_entry as u32, p2);
         if r < 0 {
             return r;
         }
@@ -861,7 +880,7 @@ unsafe fn append_entry(
 /// Compact the sector: scan active entries, copy values to compact_arena,
 /// erase sector, rewrite entries page-by-page.
 unsafe fn compact(s: &mut FlashState, sys: &SyscallTable) -> i32 {
-    let sector = STORE_XIP as *const u8;
+    let sector = (XIP_BASE + s.store_offset) as *const u8;
     let magic = read_u32_xip(sector);
     if magic != STORE_MAGIC {
         s.free_offset = 0;
@@ -962,7 +981,7 @@ unsafe fn compact(s: &mut FlashState, sys: &SyscallTable) -> i32 {
     }
 
     // Erase sector
-    let r = raw_flash_erase(sys, STORE_OFFSET);
+    let r = raw_flash_erase(sys, s.store_offset);
     if r < 0 {
         return r;
     }
@@ -1020,7 +1039,7 @@ unsafe fn compact(s: &mut FlashState, sys: &SyscallTable) -> i32 {
             // Flush page if full
             if (write_off & (PAGE_SIZE - 1)) == 0 {
                 let page_off = write_off - PAGE_SIZE;
-                let r = raw_flash_program(sys, STORE_OFFSET + page_off as u32, pb);
+                let r = raw_flash_program(sys, s.store_offset + page_off as u32, pb);
                 if r < 0 {
                     return r;
                 }
@@ -1039,7 +1058,7 @@ unsafe fn compact(s: &mut FlashState, sys: &SyscallTable) -> i32 {
     // Flush final partial page
     if (write_off & (PAGE_SIZE - 1)) != 0 {
         let page_start = write_off & !(PAGE_SIZE - 1);
-        let r = raw_flash_program(sys, STORE_OFFSET + page_start as u32, pb);
+        let r = raw_flash_program(sys, s.store_offset + page_start as u32, pb);
         if r < 0 {
             return r;
         }
@@ -1080,7 +1099,7 @@ unsafe fn raw_flash_program(sys: &SyscallTable, offset: u32, page: *const u8) ->
 
 /// Initialize free_offset by scanning XIP sector.
 unsafe fn init_free_offset(s: &mut FlashState) {
-    let sector = STORE_XIP as *const u8;
+    let sector = (XIP_BASE + s.store_offset) as *const u8;
     let magic = read_u32_xip(sector);
     if magic != STORE_MAGIC {
         s.free_offset = if magic == 0xFFFF_FFFF { 0 } else { 0 };

@@ -4,6 +4,14 @@
 //! HTTP or net-tap source), accumulates it into 256-byte pages, and
 //! forwards each page to the graph_slot service via channels.
 //!
+//! An image is as long as its header says, not as long as a slot: the
+//! header page names where the modules and the config end, the image is
+//! activated once that much is written, and one longer than this board's
+//! slot (`FLASH_LAYOUT`) is refused before anything is erased. Nothing is
+//! erased until a whole header page has arrived, and bytes that do not
+//! start with the image magic ("FXSL") -- the padding after an image, the
+//! rest of one that was refused -- are dropped until one does.
+//!
 //! ## Wiring
 //!
 //! ```yaml
@@ -35,7 +43,7 @@
 //! - `kind=0x03` ACTIVATED rc=0
 //! - `kind=0xFF` FAILED    rc=negative errno
 
-#![no_std]
+#![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
     dead_code,
     reason = "the PIC build mounts the whole of modules/sdk/* via include!, so every \
@@ -62,7 +70,7 @@ mod abi;
 use abi::contracts::storage::graph_slot::channel::{
     FRAME_HDR, REQ_ACTIVATE, REQ_ERASE, REQ_WRITE, RESP_FRAME_LEN, RESP_PAYLOAD, RESP_RESULT,
 };
-use abi::platform::rp::flash_layout::GRAPH_SLOT_SIZE as SLOT_SIZE;
+use abi::platform::rp::flash_layout::{GraphFlash, GRAPH_FLASH_LEN, GRAPH_SLOT_MAGIC};
 use abi::SyscallTable;
 
 include!("../../sdk/runtime.rs");
@@ -72,6 +80,8 @@ include!("../../sdk/runtime.rs");
 // ============================================================================
 
 const PAGE_SIZE: usize = 256;
+/// A graph image's first four bytes, "FXSL".
+const MAGIC: [u8; 4] = GRAPH_SLOT_MAGIC.to_le_bytes();
 
 const CONTINUE: i32 = 0;
 const READY: i32 = 3;
@@ -119,6 +129,13 @@ struct State {
     byte_count: u32,
     /// Current page-aligned write offset inside the slot.
     write_offset: u32,
+    /// This board's slot size, from the kernel (`FLASH_LAYOUT`); 0 when it
+    /// has no slots, and every image is refused.
+    slot_size: u32,
+    /// Where the image being written ends, page-aligned, as its header says:
+    /// it is activated once that much is written, so it is sent unpadded.
+    /// 0 until the header page has arrived.
+    image_end: u32,
     /// Page assembly buffer.
     page: [u8; PAGE_SIZE],
     /// Partial response frame accumulator.
@@ -129,6 +146,22 @@ struct State {
 // ============================================================================
 // Helpers
 // ============================================================================
+
+/// Where an image ends, from its header page: the further of its two
+/// regions, rounded up to a whole page. `None` for a header that names no
+/// region past itself, or one longer than this board's slot.
+fn declared_end(header: &[u8; PAGE_SIZE], slot_size: u32) -> Option<u32> {
+    let word = |at: usize| {
+        u32::from_le_bytes([header[at], header[at + 1], header[at + 2], header[at + 3]]) as u64
+    };
+    let modules_end = word(16) + word(20);
+    let config_end = word(24) + word(28);
+    let end = modules_end.max(config_end).div_ceil(PAGE_SIZE as u64) * PAGE_SIZE as u64;
+    if end <= PAGE_SIZE as u64 || end > slot_size as u64 {
+        return None;
+    }
+    Some(end as u32)
+}
 
 fn write_u32_le(dst: &mut [u8], offset: usize, value: u32) {
     let b = value.to_le_bytes();
@@ -270,6 +303,7 @@ fn reset_ingest(s: &mut State) {
     s.page_fill = 0;
     s.byte_count = 0;
     s.write_offset = 0;
+    s.image_end = 0;
     s.resp_fill = 0;
 }
 
@@ -286,25 +320,14 @@ fn fail(s: &mut State, sys: &SyscallTable, rc: i32) {
 // ============================================================================
 
 unsafe fn pump(s: &mut State, sys: &SyscallTable) -> i32 {
-    // ST_FAILED is sticky until the caller resets by sending fresh data
-    // — we re-arm to IDLE on the next byte so a new attempt can start.
+    // A failure is reported once and the ingest goes back to waiting for an
+    // image: what follows on the stream (the rest of the one refused) is
+    // not one, and the idle state drops it until a header's magic arrives.
     if s.state == ST_FAILED {
         // Drain any lingering response frames so they don't confuse
         // subsequent runs.
         let _ = poll_response(s, sys);
-        // Peek input; any byte clears the failed flag and restarts.
-        let mut peek = [0u8; 1];
-        if s.in_chan >= 0 && (sys.channel_read)(s.in_chan, peek.as_mut_ptr(), 1) > 0 {
-            // Restart: treat the peeked byte as the first byte of a new
-            // stream. We need to re-enqueue it into the page buffer.
-            reset_ingest(s);
-            core::ptr::write_volatile(s.page.as_mut_ptr(), peek[0]);
-            s.page_fill = 1;
-            s.byte_count = 1;
-            // Fall through to IDLE → request erase.
-        } else {
-            return CONTINUE;
-        }
+        reset_ingest(s);
     }
 
     match s.state {
@@ -312,16 +335,43 @@ unsafe fn pump(s: &mut State, sys: &SyscallTable) -> i32 {
             if s.in_chan < 0 {
                 return CONTINUE;
             }
-            // On the first byte, send ERASE and transition.
-            if s.page_fill == 0 {
-                let mut peek = [0u8; 1];
-                let n = (sys.channel_read)(s.in_chan, peek.as_mut_ptr(), 1);
-                if n <= 0 {
+            // Gather the header page before erasing anything. An image
+            // starts with its magic, so bytes that do not -- the padding
+            // after one, the rest of one refused -- are dropped as they
+            // come, and an image that follows them is found wherever it
+            // starts.
+            let room = PAGE_SIZE - s.page_fill as usize;
+            let mut tmp = [0u8; PAGE_SIZE];
+            let n = (sys.channel_read)(s.in_chan, tmp.as_mut_ptr(), room);
+            let mut i = 0usize;
+            while n > 0 && i < n as usize {
+                let b = core::ptr::read(tmp.as_ptr().add(i));
+                i += 1;
+                let at = s.page_fill as usize;
+                if at < 4 && b != MAGIC[at] {
+                    // Out of step with the magic: start again at this byte
+                    // if it could begin one ("FXSL" repeats no prefix).
+                    s.page_fill = u16::from(b == MAGIC[0]);
+                    if b == MAGIC[0] {
+                        core::ptr::write_volatile(s.page.as_mut_ptr(), b);
+                    }
+                    continue;
+                }
+                core::ptr::write_volatile(s.page.as_mut_ptr().add(at), b);
+                s.page_fill += 1;
+            }
+            if (s.page_fill as usize) < PAGE_SIZE {
+                return CONTINUE;
+            }
+            s.byte_count = PAGE_SIZE as u32;
+            // Where the image ends; graph_slot judges the rest of the header
+            // at ACTIVATE.
+            match declared_end(&s.page, s.slot_size) {
+                Some(end) => s.image_end = end,
+                None => {
+                    fail(s, sys, if s.slot_size == 0 { E_NOSYS } else { E_INVAL });
                     return CONTINUE;
                 }
-                core::ptr::write_volatile(s.page.as_mut_ptr(), peek[0]);
-                s.page_fill = 1;
-                s.byte_count = 1;
             }
             if !send_bare_request(s, sys, REQ_ERASE) {
                 fail(s, sys, E_AGAIN);
@@ -387,7 +437,7 @@ unsafe fn pump(s: &mut State, sys: &SyscallTable) -> i32 {
                 if s.write_offset & 0x3FFF == 0 {
                     emit_status(s, sys, STATUS_WRITTEN, (s.byte_count >> 10) as i32);
                 }
-                if s.byte_count == SLOT_SIZE {
+                if s.image_end != 0 && s.write_offset >= s.image_end {
                     if !send_bare_request(s, sys, REQ_ACTIVATE) {
                         fail(s, sys, E_AGAIN);
                         return CONTINUE;
@@ -426,8 +476,8 @@ unsafe fn pump(s: &mut State, sys: &SyscallTable) -> i32 {
 // Module entry points
 // ============================================================================
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
+#[cfg_attr(not(feature = "host-test"), no_mangle)]
+#[cfg_attr(not(feature = "host-test"), link_section = ".text.module_state_size")]
 pub extern "C" fn module_state_size() -> u32 {
     core::mem::size_of::<State>() as u32
 }
@@ -436,12 +486,12 @@ pub extern "C" fn module_state_size() -> u32 {
 // state-arena demand is summable host-side.
 declare_module_state_bytes!(State);
 
-#[no_mangle]
-#[link_section = ".text.module_init"]
+#[cfg_attr(not(feature = "host-test"), no_mangle)]
+#[cfg_attr(not(feature = "host-test"), link_section = ".text.module_init")]
 pub extern "C" fn module_init(_syscalls: *const c_void) {}
 
-#[no_mangle]
-#[link_section = ".text.module_new"]
+#[cfg_attr(not(feature = "host-test"), no_mangle)]
+#[cfg_attr(not(feature = "host-test"), link_section = ".text.module_new")]
 pub extern "C" fn module_new(
     in_chan: i32,
     out_chan: i32,
@@ -468,7 +518,19 @@ pub extern "C" fn module_new(
         s.page_fill = 0;
         s.byte_count = 0;
         s.write_offset = 0;
+        s.image_end = 0;
         s.resp_fill = 0;
+        // This board's slot size, as the kernel partitioned its flash.
+        let mut layout = [0u8; GRAPH_FLASH_LEN];
+        let rc = ((*s.syscalls).provider_call)(
+            -1,
+            abi::kernel_abi::FLASH_LAYOUT,
+            layout.as_mut_ptr(),
+            layout.len(),
+        );
+        s.slot_size = GraphFlash::decode(&layout)
+            .filter(|_| rc >= 0)
+            .map_or(0, |g| g.slot_size);
         // Extra ports resolved in module_step when we know the syscall table is live.
         s.gs_req_chan = -1;
         s.gs_resp_chan = -1;
@@ -476,8 +538,8 @@ pub extern "C" fn module_new(
     }
 }
 
-#[no_mangle]
-#[link_section = ".text.module_step"]
+#[cfg_attr(not(feature = "host-test"), no_mangle)]
+#[cfg_attr(not(feature = "host-test"), link_section = ".text.module_step")]
 pub extern "C" fn module_step(state: *mut u8) -> i32 {
     unsafe {
         if state.is_null() {

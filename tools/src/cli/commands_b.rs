@@ -597,6 +597,17 @@ fn config_inspection_json(config_path: &Path, project_root: &Path) -> serde_json
                 "validation"
             },
             "board_id": desc.board_id.as_ref(),
+            // How an RP board's flash is partitioned, as the kernel built for
+            // it partitions it: offsets from the XIP base. What a bench needs
+            // to erase or write a slot without hard-coding where it is.
+            "flash": desc.graph_flash().map(|g| serde_json::json!({
+                "xip_base": crate::modules::sdk_layout::flash_layout::XIP_BASE,
+                "size": g.flash_size,
+                "slot_a": g.slot_a,
+                "slot_b": g.slot_b,
+                "slot_size": g.slot_size,
+                "param_store": g.param_store,
+            })),
         })),
         Err(_) => None,
     };
@@ -1068,6 +1079,17 @@ fn inspect_config(config_path: &Path, project_root: &Path) -> Result<()> {
             if let Some(board_id) = &desc.board_id {
                 println!("  resolved target:      {board_id} (board)");
                 println!("  via board → silicon:  {}", desc.id);
+                if let Some(g) = desc.graph_flash() {
+                    println!(
+                        "  flash:                {} KiB; firmware below {:#x}, slots A {:#x} and B {:#x} of {} KiB, parameter store {:#x}",
+                        g.flash_size / 1024,
+                        g.slot_a,
+                        g.slot_a,
+                        g.slot_b,
+                        g.slot_size / 1024,
+                        g.param_store
+                    );
+                }
             } else {
                 let kind = if desc.build.is_some() {
                     "silicon"

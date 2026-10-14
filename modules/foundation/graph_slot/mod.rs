@@ -1,7 +1,9 @@
 //! A/B graph slot store (PIC module, channel-served).
 //!
-//! Owns the on-flash format of the two 512 KB OTA slots
-//! (`abi::platform::rp::flash_layout::GRAPH_SLOT_*`). Each slot holds a
+//! Owns the on-flash format of the two OTA slots
+//! (`abi::platform::rp::flash_layout::GRAPH_SLOT_*`), which lie where the
+//! kernel partitioned this board's flash (`FLASH_LAYOUT`): their size is
+//! the board's, a third each of what the kernel leaves. Each slot holds a
 //! graph image: a 256-byte header, then the module table (with its program
 //! section) and the static config. Of the slots the boot selector admits,
 //! the one with the higher epoch is the one the next boot selects.
@@ -119,9 +121,6 @@ include!("../tls/ed25519_job.rs");
 // ============================================================================
 
 const XIP_BASE: u32 = abi::platform::rp::flash_layout::XIP_BASE;
-const SLOT_A_OFFSET: u32 = abi::platform::rp::flash_layout::GRAPH_SLOT_A_OFFSET;
-const SLOT_B_OFFSET: u32 = abi::platform::rp::flash_layout::GRAPH_SLOT_B_OFFSET;
-const SLOT_SIZE: u32 = abi::platform::rp::flash_layout::GRAPH_SLOT_SIZE;
 const SLOT_MAGIC: u32 = abi::platform::rp::flash_layout::GRAPH_SLOT_MAGIC;
 const SLOT_VERSION: u8 = abi::platform::rp::flash_layout::GRAPH_SLOT_VERSION;
 
@@ -199,6 +198,12 @@ struct State {
     /// has activated. A slot outside it is no more live here than it is to
     /// the next boot.
     admitted: u8,
+    /// This board's slots, from the kernel (`FLASH_LAYOUT`): offsets from
+    /// the XIP base, and each slot's size. `slot_size` 0 when the board has
+    /// none, or the kernel would not say, and then nothing is written.
+    slot_a: u32,
+    slot_b: u32,
+    slot_size: u32,
     /// The signature check of an ACTIVATE under way.
     act_sig: Ed25519VerifyJob,
 }
@@ -227,7 +232,7 @@ unsafe fn read_u64_le(p: *const u8) -> u64 {
     (read_u32_le(p) as u64) | ((read_u32_le(p.add(4)) as u64) << 32)
 }
 
-unsafe fn decode_header(base_xip: *const u8) -> Option<HeaderFields> {
+unsafe fn decode_header(base_xip: *const u8, slot_size: u32) -> Option<HeaderFields> {
     if read_u32_le(base_xip) != SLOT_MAGIC {
         return None;
     }
@@ -245,10 +250,10 @@ unsafe fn decode_header(base_xip: *const u8) -> Option<HeaderFields> {
     if modules_size < 16 {
         return None;
     }
-    if (modules_offset as u64) + (modules_size as u64) > SLOT_SIZE as u64 {
+    if (modules_offset as u64) + (modules_size as u64) > slot_size as u64 {
         return None;
     }
-    if (config_offset as u64) + (config_size as u64) > SLOT_SIZE as u64 {
+    if (config_offset as u64) + (config_size as u64) > slot_size as u64 {
         return None;
     }
 
@@ -276,14 +281,14 @@ unsafe fn slot_admits(s: &State, slot: u8, base: *const u8) -> bool {
 }
 
 unsafe fn refresh_live(s: &mut State) {
-    let a = (XIP_BASE + SLOT_A_OFFSET) as *const u8;
-    let b = (XIP_BASE + SLOT_B_OFFSET) as *const u8;
+    let a = (XIP_BASE + s.slot_a) as *const u8;
+    let b = (XIP_BASE + s.slot_b) as *const u8;
     // Pin admission mirrors the kernel's boot selector exactly: a slot the
     // kernel would reject at reboot must never be reported live (or have
     // its config served) here either — an incompatible higher-epoch slot
     // left behind by an older writer is invisible, not authoritative.
-    let ha = decode_header(a).filter(|_| slot_admits(s, 0, a));
-    let hb = decode_header(b).filter(|_| slot_admits(s, 1, b));
+    let ha = decode_header(a, s.slot_size).filter(|_| slot_admits(s, 0, a));
+    let hb = decode_header(b, s.slot_size).filter(|_| slot_admits(s, 1, b));
     match (ha, hb) {
         (Some(ha), Some(hb)) => {
             if ha.epoch >= hb.epoch {
@@ -309,11 +314,11 @@ unsafe fn refresh_live(s: &mut State) {
     }
 }
 
-fn slot_offset(idx: u8) -> u32 {
+fn slot_offset(s: &State, idx: u8) -> u32 {
     if idx == 0 {
-        SLOT_A_OFFSET
+        s.slot_a
     } else {
-        SLOT_B_OFFSET
+        s.slot_b
     }
 }
 
@@ -347,15 +352,15 @@ fn own_code_address() -> u32 {
 }
 
 /// The slot whose aperture holds this module's code, if any.
-fn slot_of_own_code() -> u8 {
+fn slot_of_own_code(s: &State) -> u8 {
     let at = own_code_address();
     let in_slot = |offset: u32| {
         let base = XIP_BASE + offset;
-        at >= base && at < base + SLOT_SIZE
+        s.slot_size != 0 && at >= base && at < base + s.slot_size
     };
-    if in_slot(SLOT_A_OFFSET) {
+    if in_slot(s.slot_a) {
         0
-    } else if in_slot(SLOT_B_OFFSET) {
+    } else if in_slot(s.slot_b) {
         1
     } else {
         0xFF
@@ -375,8 +380,8 @@ unsafe fn pending_slot(s: &mut State) -> u8 {
 /// running slot, the other slot's if it is admissible.
 unsafe fn epoch_to_beat(s: &State, pending: u8) -> Option<u64> {
     let other = inactive_slot(pending);
-    let base = (XIP_BASE + slot_offset(other)) as *const u8;
-    decode_header(base)
+    let base = (XIP_BASE + slot_offset(s, other)) as *const u8;
+    decode_header(base, s.slot_size)
         .filter(|_| slot_admits(s, other, base))
         .map(|h| h.epoch)
 }
@@ -423,13 +428,17 @@ const BLANK_CHECKS_PER_STEP: u32 = 2;
 /// stalled, since XIP is detached -- so the slot is erased a sector a step
 /// (`erase_step`), and the ERASE is answered once it is all blank.
 unsafe fn do_erase(s: &mut State, _sys: &SyscallTable) -> i32 {
+    if s.slot_size == 0 {
+        // No slots on this board: nothing to erase, or to write after.
+        return E_NOSYS;
+    }
     s.header_held = 0;
     s.activated = 0xFF;
     let pending = pending_slot(s);
     s.admitted &= !(1 << pending);
-    let target = slot_offset(pending);
+    let target = slot_offset(s, pending);
     s.erase_next = target;
-    s.erase_end = target + SLOT_SIZE;
+    s.erase_end = target + s.slot_size;
     ERASE_UNDER_WAY
 }
 
@@ -484,7 +493,7 @@ unsafe fn do_write(
         return E_INVAL;
     }
     let in_slot_off = read_u32_le(payload);
-    if in_slot_off + PAGE_SIZE as u32 > SLOT_SIZE {
+    if (in_slot_off as u64) + (PAGE_SIZE as u64) > s.slot_size as u64 {
         return E_INVAL;
     }
     if in_slot_off == 0 {
@@ -500,7 +509,7 @@ unsafe fn do_write(
     if s.activated == pending {
         s.activated = 0xFF;
     }
-    let target = slot_offset(pending) + in_slot_off;
+    let target = slot_offset(s, pending) + in_slot_off;
     sys_program_page(sys, target, payload.add(4))
 }
 
@@ -545,7 +554,7 @@ unsafe fn do_activate(s: &mut State, _sys: &SyscallTable) -> i32 {
     }
     let candidate = pending_slot(s);
     let header = s.header.as_ptr();
-    let hdr = match decode_header(header) {
+    let hdr = match decode_header(header, s.slot_size) {
         Some(h) => h,
         None => return E_IO,
     };
@@ -593,7 +602,7 @@ const ACT_WINDOW: u32 = 4096;
 /// verify the header's signature a few bits a step; then program the
 /// header. Answers whether it is still under way.
 unsafe fn activate_step(s: &mut State, sys: &SyscallTable) -> bool {
-    let base_xip = (XIP_BASE + slot_offset(s.act_slot)) as *const u8;
+    let base_xip = (XIP_BASE + slot_offset(s, s.act_slot)) as *const u8;
     if s.act_remaining > 0 {
         let n = core::cmp::min(s.act_remaining, ACT_WINDOW);
         let mut hasher = s.act_hasher.clone();
@@ -603,7 +612,7 @@ unsafe fn activate_step(s: &mut State, sys: &SyscallTable) -> bool {
         s.act_remaining -= n;
         return true;
     }
-    let Some(hdr) = decode_header(s.header.as_ptr()) else {
+    let Some(hdr) = decode_header(s.header.as_ptr(), s.slot_size) else {
         s.act_phase = ACT_IDLE;
         emit_response(s, sys, REQ_ACTIVATE, E_IO);
         return false;
@@ -697,7 +706,7 @@ unsafe fn activate_finish(s: &mut State, sys: &SyscallTable, hdr: &HeaderFields)
     let candidate = s.act_slot;
     let header = s.header.as_ptr();
 
-    let rc = sys_program_page(sys, slot_offset(candidate), header);
+    let rc = sys_program_page(sys, slot_offset(s, candidate), header);
     if rc < 0 {
         return rc;
     }
@@ -786,8 +795,8 @@ unsafe fn query_cfg(s: &mut State) -> i32 {
     if s.running_slot > 1 {
         return NO_LIVE_SLOT;
     }
-    let base = XIP_BASE + slot_offset(s.running_slot);
-    match decode_header(base as *const u8) {
+    let base = XIP_BASE + slot_offset(s, s.running_slot);
+    match decode_header(base as *const u8, s.slot_size) {
         Some(h) => (base + h.config_offset) as i32,
         None => NO_LIVE_SLOT,
     }
@@ -974,7 +983,27 @@ pub extern "C" fn module_new(
         s._pad = [0; 2];
         s.frame_fill = 0;
         s.own_digest = own_abi_surface_digest();
-        s.running_slot = slot_of_own_code();
+        // This board's slots, as the kernel partitioned its flash.
+        let mut layout = [0u8; abi::platform::rp::flash_layout::GRAPH_FLASH_LEN];
+        let rc = ((*s.syscalls).provider_call)(
+            -1,
+            abi::kernel_abi::FLASH_LAYOUT,
+            layout.as_mut_ptr(),
+            layout.len(),
+        );
+        match abi::platform::rp::flash_layout::GraphFlash::decode(&layout).filter(|_| rc >= 0) {
+            Some(g) => {
+                s.slot_a = g.slot_a;
+                s.slot_b = g.slot_b;
+                s.slot_size = g.slot_size;
+            }
+            None => {
+                s.slot_a = 0;
+                s.slot_b = 0;
+                s.slot_size = 0;
+            }
+        }
+        s.running_slot = slot_of_own_code(s);
         s.header_held = 0;
         s.activated = 0xFF;
         s.erase_next = 0;

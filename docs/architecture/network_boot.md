@@ -46,9 +46,11 @@ little-endian:
 The header pins kernel and graph to each other: a device refuses an
 image whose ABI-surface digest does not equal the running kernel's.
 The image excludes firmware; it is the only sanctioned module-delivery
-path for OTA devices. RP targets pad the image with 0xFF to the 512 KB
-flash slot aperture; other targets emit it unpadded with an 8 MiB
-ceiling.
+path for OTA devices. An image is emitted as long as its payload, on a
+whole 256-byte page: the header says where the payload ends, which is
+where `ota_ingest` stops reading, so nothing is padded across the wire.
+Its ceiling is the board's graph slot on an RP target (below) and 8 MiB
+of RAM staging elsewhere.
 
 ### Graph-image signatures
 
@@ -258,16 +260,58 @@ Source: `modules/foundation/ota_ingest/`,
 `modules/foundation/graph_slot/`,
 `modules/sdk/platform/rp/flash_layout.rs`.
 
-RP2040/RP2350 targets stage into two 512 KB on-flash A/B graph slots
-instead of RAM. `graph_slot` owns the flash aperture and exposes an
-FMP channel protocol (`gs.erase`, `gs.write`, `gs.activate`,
-`gs.query_active`, `gs.query_cfg`; responses are
-`[req_type: u32 LE][value: i32 LE]`). `ota_ingest` accepts a graph
-image as a byte stream on its `stream` input, buffers it into 256-byte
-pages, and drives erase → write → activate, reporting progress on its
-`status` output as 4-byte records `[kind: u8][pad][rc: i16 LE]` with
-kinds `0x01` erased, `0x02` written, `0x03` activated, `0xFF` failed.
-The slot content is the packed (single-blob) graph-image form.
+RP2040/RP2350 targets stage into two on-flash A/B graph slots instead
+of RAM.
+
+### The flash partition
+
+An RP board's XIP flash is partitioned by `flash_layout::graph_flash`
+from two numbers: the flash the board fits (`[hardware.flash] size` in
+the board TOML, the silicon's `[memory] flash_size` when a board names
+none) and the flash the silicon reserves for the kernel (`[memory]
+kernel_flash_reserve`). From the top: the last 4 KiB sector is the
+runtime parameter store; below it lie slot B and then slot A, equal in
+size; from offset 0 up to slot A lies the firmware region, the kernel
+and the graph it was deployed with. Each slot is a third of what the
+kernel's reserve leaves, sector-aligned, so the firmware region holds the
+kernel and a graph as large as a slot: any graph a board can be deployed
+with can also be sent over the air, and the reverse. A 4 MB Pico 2 W has
+two 1,148 KiB slots at `0x1C1000` and `0x2E0000`; a 2 MB Pico W two of
+508 KiB at `0x101000` and `0x180000`; a 16 MB board two of some 5 MiB. A
+flash too small to leave two slots has none, and every OTA request on
+such a board is refused.
+
+The kernel is built for one board and computes its partition from that
+board's size, so it is the one authority: `FLASH_LAYOUT` answers it to a
+module as `[flash_size][slot_a][slot_b][slot_size][param_store]`, each a
+`u32` LE offset from the XIP base, and `graph_slot`, `ota_ingest` and
+`flash_rp` ask rather than compile a geometry in, so one module build
+serves every board of a silicon. The tool computes the same partition
+from the same TOMLs: it bounds the graph image it emits by the board's
+slot, refuses a combined firmware image that reaches slot A, and
+`fluxor inspect <config>` prints the partition (`--json`:
+`config.resolved_target.flash`), which is what a bench reads to erase or
+plant a slot. The CI gate holds every board's kernel image under the
+silicon's reserve, since a kernel past it eats into the graph the
+firmware region carries.
+
+### The modules
+
+`graph_slot` owns the slots and exposes an FMP channel protocol
+(`gs.erase`, `gs.write`, `gs.activate`, `gs.query_active`,
+`gs.query_cfg`; responses are `[req_type: u32 LE][value: i32 LE]`).
+`ota_ingest` accepts a graph image as a byte stream on its `stream`
+input, buffers it into 256-byte pages, and drives erase → write →
+activate, reporting progress on its `status` output as 4-byte records
+`[kind: u8][pad][rc: i16 LE]` with kinds `0x01` erased, `0x02` written,
+`0x03` activated, `0xFF` failed. An image is as long as its header says:
+the header page names where the modules and the config end, the image
+is activated once that much is written, and one longer than the board's
+slot is refused before anything is erased. Nothing is erased until a
+whole header page has arrived, and bytes that do not begin with the
+image magic (`FXSL`) — what follows an image, or the rest of one that
+was refused — are dropped until an image begins. The slot content is the
+packed (single-blob) graph-image form.
 
 `graph_slot` never erases or programs the slot the kernel booted from:
 module code runs in place from flash on RP, and a rebuild

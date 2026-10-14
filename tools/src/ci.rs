@@ -619,10 +619,13 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
     // coverage is a type-check is a target whose image nothing builds.
     //
     // It also holds each image under the static-RAM ceiling its silicon
-    // declares (`[kernel] ram_static_max_kb`). The linker already refuses
-    // an image that cannot fit at all; the budget binds earlier, so a few
-    // KiB of creep per month fails here with a number attached instead of
-    // arriving one day as a link error at the cliff.
+    // declares (`[kernel] ram_static_max_kb`) and under the flash the silicon
+    // reserves for the kernel (`[memory] kernel_flash_reserve`), which sizes
+    // every board's graph slots. The linker already refuses an image that
+    // cannot fit at all; the budgets bind earlier, so a few KiB of creep per
+    // month fails here with a number attached instead of arriving one day as
+    // a link error at the cliff, or as a slot that no longer holds the graph
+    // the firmware region does.
     results.push(
         if skip.kernel || !is_fluxor_kernel_workspace(project_root) {
             skipped("kernel-link (rp)")
@@ -2663,7 +2666,8 @@ fn run_scripts(
 }
 
 /// Build (and therefore link) each RP board's kernel image, then hold its
-/// static RAM against the ceiling its silicon declares.
+/// static RAM against the ceiling its silicon declares and the image itself
+/// against the flash reserve its silicon partitions the graph slots around.
 ///
 /// The build goes through `tools/firmware.sh` on purpose: per-board feature
 /// and triple resolution lives there, and a gate that reimplemented it would
@@ -2739,6 +2743,39 @@ fn run_kernel_link_budget(project_root: &Path, verbose: bool) -> std::result::Re
                  creep this gate is here to catch.",
                 used - budget
             ));
+        }
+
+        // The kernel's flash reserve (`[memory] kernel_flash_reserve`) is
+        // what the graph-slot partition leaves it before it splits the rest
+        // into two slots and the firmware region's share, so a kernel image
+        // past it eats into the graph the firmware region carries. The image
+        // is the raw binary `firmware.sh` wrote, which is what the board's
+        // flash holds from offset 0.
+        let reserve = target
+            .memory
+            .as_ref()
+            .map_or(0, |m| u64::from(m.kernel_flash_reserve));
+        if reserve > 0 {
+            let bin = project_root.join(format!("target/{board}/firmware.bin"));
+            let image = std::fs::metadata(&bin)
+                .map_err(|e| format!("{}: {e}", bin.display()))?
+                .len();
+            if verbose {
+                let slack = reserve as i64 - image as i64;
+                println!(
+                    "  {board} ({silicon}): {image} of {reserve} bytes kernel flash reserve, {slack:+} slack"
+                );
+            }
+            if image > reserve {
+                failures.push(format!(
+                    "{board} ({silicon}): the kernel image is {image} B, past the {reserve} B \
+                     ({} KiB) flash reserve the graph slots are partitioned around, by {} B. \
+                     Either raise kernel_flash_reserve and say why — every board of this \
+                     silicon loses that much slot — or it is creep.",
+                    reserve / 1024,
+                    image - reserve
+                ));
+            }
         }
     }
 

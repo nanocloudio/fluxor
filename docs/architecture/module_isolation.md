@@ -80,10 +80,10 @@ module controls. Before dispatch it checks every call three ways:
 | Handles | Every provider handle is one the gateway minted for this caller | `EACCES` |
 
 Provider opcodes pass through a default-deny rule table:
-- The time, entropy, log, telemetry, report, event, arena, program
-  (`PROGRAM_INFO`, `PROGRAM_READ`), slot (`SLOT_SIGNING_ROOT`,
-  `SLOT_ADMITTED`) and `storage.object` opcodes are listed, each with its
-  direction and handle kind.
+- The time, entropy, log, telemetry, report, event, arena, flash partition
+  (`FLASH_LAYOUT`), program (`PROGRAM_INFO`, `PROGRAM_READ`), slot
+  (`SLOT_SIGNING_ROOT`, `SLOT_ADMITTED`) and `storage.object` opcodes are
+  listed, each with its direction and handle kind.
 - An opcode the table does not name is refused with `EACCES`.
 - A struct that carries pointers (the `storage.object` `PUT`, `HEAD`,
   `RANGE_GET`, `DELETE` and `LIST` requests) is copied into kernel memory,

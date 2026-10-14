@@ -125,6 +125,17 @@ modules step one at a time), from the depth each `.fmod` carries — see
 | Deepest module admitted | 32 KiB | 40 KiB |
 | Hardware limit | none — M0+ has no stack-limit register | `MSPLIM`, set at reset: an overflow faults |
 
+### RP flash
+
+The flash an RP board fits is a board fact — the die has none, and
+boards over one silicon differ — so a board TOML declares it as
+`[hardware.flash] size`, and the silicon's `[memory] flash_size` is only
+the default for a board that names none. The silicon declares `[memory]
+kernel_flash_reserve`, the flash the kernel keeps at the bottom; the CI
+gate holds every board's kernel image under it. The two together
+partition the flash into the firmware region, two OTA graph slots and the
+parameter store — see [network_boot.md](network_boot.md#the-flash-partition).
+
 On the device the check is repeated two ways. Reset paints the free stack, and
 the scheduler reports the deepest it has been — `[stack] peak= entry= region=
 budget= reserve=` every few seconds, where `entry` is the kernel's own depth at

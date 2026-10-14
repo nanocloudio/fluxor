@@ -1058,7 +1058,7 @@ fn privileged_op_permission(op: u32) -> Option<u16> {
         // ARENA_GET / BIND_IRQ / REPORT_LATENCY family, LOG_WRITE,
         // HANDLE_POLL, RANDOM_FILL, SYS_CLOCK_HZ, paged-arena GET/PREFAULT,
         // BOOT_INCARNATION.
-        0x0C2B..=0x0C2E // PROGRAM_INFO / PROGRAM_READ / SLOT_SIGNING_ROOT / SLOT_ADMITTED
+        0x0C2A..=0x0C2E // FLASH_LAYOUT / PROGRAM_INFO / PROGRAM_READ / SLOT_SIGNING_ROOT / SLOT_ADMITTED
         | 0x0C2F // BOOT_INCARNATION
         | 0x0C30
         | 0x0C31
@@ -1625,8 +1625,9 @@ unsafe fn resolve_register_target(arg: *mut u8, arg_len: usize) -> Option<(usize
 /// is running, never from the request.
 unsafe fn handle_program_op(opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
     use crate::abi::kernel_abi::{
-        program as pg, PROGRAM_INFO, PROGRAM_READ, SLOT_ADMITTED, SLOT_SIGNING_ROOT,
+        program as pg, FLASH_LAYOUT, PROGRAM_INFO, PROGRAM_READ, SLOT_ADMITTED, SLOT_SIGNING_ROOT,
     };
+    use crate::abi::platform::rp::flash_layout::GRAPH_FLASH_LEN;
     use crate::kernel::exec::scheduler;
     if opcode == SLOT_ADMITTED {
         #[cfg(feature = "rp")]
@@ -1634,9 +1635,11 @@ unsafe fn handle_program_op(opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
         #[cfg(not(feature = "rp"))]
         return errno::ENOSYS;
     }
-    // The least each op's buffer must hold: the root; the program's
-    // description; a read's request `[slot][0; 3][offset: u32 LE]`.
+    // The least each op's buffer must hold: the flash partition; the root;
+    // the program's description; a read's request `[slot][0; 3][offset: u32
+    // LE]`.
     let need = match opcode {
+        FLASH_LAYOUT => GRAPH_FLASH_LEN,
         SLOT_SIGNING_ROOT => 32,
         PROGRAM_INFO => pg::INFO_LEN,
         PROGRAM_READ => 8,
@@ -1644,6 +1647,16 @@ unsafe fn handle_program_op(opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
     };
     if arg.is_null() || arg_len < need {
         return E_INVAL;
+    }
+    if opcode == FLASH_LAYOUT {
+        #[cfg(feature = "rp")]
+        {
+            let answer = crate::platform::chip::GRAPH_FLASH.encode();
+            core::ptr::copy_nonoverlapping(answer.as_ptr(), arg, GRAPH_FLASH_LEN);
+            return GRAPH_FLASH_LEN as i32;
+        }
+        #[cfg(not(feature = "rp"))]
+        return errno::ENOSYS;
     }
     if opcode == SLOT_SIGNING_ROOT {
         return match crate::kernel::security::slot_signature::slot_root() {
@@ -1723,7 +1736,8 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
         crate::abi::kernel_abi::PROGRAM_INFO
         | crate::abi::kernel_abi::PROGRAM_READ
         | crate::abi::kernel_abi::SLOT_SIGNING_ROOT
-        | crate::abi::kernel_abi::SLOT_ADMITTED => handle_program_op(opcode, arg, arg_len),
+        | crate::abi::kernel_abi::SLOT_ADMITTED
+        | crate::abi::kernel_abi::FLASH_LAYOUT => handle_program_op(opcode, arg, arg_len),
         // ── Telemetry ring. The
         //    OBSERVE gate for the consumer ops is applied upstream by
         //    `check_privileged_internal_op`; TLM_EMIT is ungated. ──

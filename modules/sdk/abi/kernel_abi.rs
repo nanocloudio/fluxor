@@ -754,6 +754,17 @@ pub const SLOT_SIGNING_ROOT: u32 = 0x0C2D;
 /// starts from this, and tracks the slots it erases and activates itself.
 pub const SLOT_ADMITTED: u32 = 0x0C2E;
 
+/// How this board's flash is partitioned: `handle = -1`, `arg` receives
+/// `flash_layout::GRAPH_FLASH_LEN` bytes, `flash_layout::GraphFlash::encode`
+/// of the kernel's own partition (where the firmware region ends, the two
+/// graph slots and their size, the parameter store). On an RP board only;
+/// `ENOSYS` elsewhere. The kernel is built for one board and computes it from
+/// that board's flash size (`flash_layout::graph_flash`), so a module asks
+/// rather than compiling a geometry in, and one module build serves every
+/// board of its silicon. Ungated: it is the shape of the flash, not its
+/// contents.
+pub const FLASH_LAYOUT: u32 = 0x0C2A;
+
 /// The program section: per-module-instance program blobs carried after
 /// the module table. Its offset from the table's start, a multiple of
 /// 4 KiB, is the table header's first reserved word (bytes 10..14); 0

@@ -10,6 +10,13 @@
 // Generated constants from silicon TOML (RP targets only).
 include!(concat!(env!("OUT_DIR"), "/chip_generated.rs"));
 
+/// How this board's flash is partitioned: the firmware region, the two graph
+/// slots, the parameter store. Computed once from the board's flash size and
+/// the kernel's reserve, both from the target TOMLs; `FLASH_LAYOUT` answers
+/// it, and the tool computes the same for the images it builds.
+pub const GRAPH_FLASH: crate::abi::platform::rp::flash_layout::GraphFlash =
+    crate::abi::platform::rp::flash_layout::graph_flash(FLASH_SIZE, KERNEL_FLASH_RESERVE);
+
 /// Whether PIO GPIOBASE register is available.
 #[inline(always)]
 pub const fn has_pio_gpiobase() -> bool {

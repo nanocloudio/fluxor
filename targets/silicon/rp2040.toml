@@ -169,7 +169,14 @@ valid_pins = [[2,3], [6,7], [10,11], [14,15], [18,19], [22,23], [26,27]]
 
 [memory]
 flash_base = "0x10000000"
+# The flash a board fits, by default: the die has none, and a board says
+# what it has in `[hardware.flash] size`. 2 MB is the Pico family's.
 flash_size = "0x200000"
+# Flash the kernel keeps at the bottom, which the graph-slot partition
+# (`flash_layout::graph_flash`) leaves it before it splits the rest three
+# ways: two slots and the firmware region's own graph. The gate holds every
+# board's kernel image under it; raising it costs each board that much slot.
+kernel_flash_reserve = "0x80000"
 ram_base = "0x20000000"
 # The striped 256 KiB the linker's RAM region covers, where the kernel's
 # statics and its stack live. SRAM4 and SRAM5 sit outside it.

@@ -54,6 +54,9 @@ struct MemoryToml {
     ram_size: String,
     flash_base: Option<String>,
     flash_size: Option<String>,
+    /// Flash the kernel keeps for itself at the bottom, which the graph-slot
+    /// partition (`flash_layout::graph_flash`) leaves it.
+    kernel_flash_reserve: Option<String>,
 }
 
 // Board TOML — only the [platform.pcie] topology this script generates.
@@ -67,6 +70,14 @@ struct BoardToml {
 struct BoardHardware {
     xosc: Option<BoardXosc>,
     console_uart: Option<BoardConsoleUart>,
+    flash: Option<BoardFlash>,
+}
+
+/// The flash a board fits: the die has none of its own, and boards over one
+/// silicon differ (a Pico W 2 MB, a Pico 2 W 4 MB, larger boards 16 MB).
+#[derive(Deserialize)]
+struct BoardFlash {
+    size: String,
 }
 
 #[derive(Deserialize)]
@@ -1391,11 +1402,26 @@ fn emit_rp(out: &Path, family: Rp) {
         "Option<(u32, u32, u32)>",
         &gate,
     );
-    // The whole XIP flash, which a contained module may read and execute.
+    // The whole XIP flash, which a contained module may read and execute,
+    // and which the graph slots and the parameter store are partitioned from.
+    // Its size is the board's when the build names one: the silicon's figure
+    // is only the default a board without a `[hardware.flash]` keeps.
     if let Some(m) = &silicon.memory {
         if let (Some(b), Some(z)) = (&m.flash_base, &m.flash_size) {
+            let board_flash = std::env::var("FLUXOR_BOARD").ok().and_then(|board| {
+                let path = format!("targets/boards/{board}.toml");
+                println!("cargo:rerun-if-changed={path}");
+                let text = fs::read_to_string(&path).ok()?;
+                toml::from_str::<BoardToml>(&text).ok()?.hardware?.flash
+            });
             emit_hex_const(&mut generated, "FLASH_BASE", b);
-            emit_hex_const(&mut generated, "FLASH_SIZE", z);
+            match &board_flash {
+                Some(f) => emit_hex_const(&mut generated, "FLASH_SIZE", &f.size),
+                None => emit_hex_const(&mut generated, "FLASH_SIZE", z),
+            }
+            if let Some(r) = &m.kernel_flash_reserve {
+                emit_hex_const(&mut generated, "KERNEL_FLASH_RESERVE", r);
+            }
         }
     }
     File::create(out.join("chip_generated.rs"))

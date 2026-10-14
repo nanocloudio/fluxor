@@ -22,6 +22,14 @@ baud = 115200
 [hardware.xosc]
 hz = 12000000
 
+
+# The flash this board fits -- a BOARD fact: the die has none, and two boards
+# over one silicon differ. The graph slots and the parameter store are
+# partitioned from it (`flash_layout::graph_flash`), so it must not be more
+# than the part has: XIP aliases past the end, into the firmware.
+[hardware.flash]
+size = "0x200000"
+
 [gpio]
 reserved_pins = []
 

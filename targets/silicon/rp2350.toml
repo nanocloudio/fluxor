@@ -197,7 +197,14 @@ valid_pins = [
 
 [memory]
 flash_base = "0x10000000"
+# The flash a board fits, by default: the die has none, and a board says
+# what it has in `[hardware.flash] size`. 4 MB is the Pico 2 family's.
 flash_size = "0x400000"
+# Flash the kernel keeps at the bottom, which the graph-slot partition
+# (`flash_layout::graph_flash`) leaves it before it splits the rest three
+# ways: two slots and the firmware region's own graph. The gate holds every
+# board's kernel image under it; raising it costs each board that much slot.
+kernel_flash_reserve = "0xA0000"
 ram_base = "0x20000000"
 ram_size = "0x80000"
 
@@ -213,12 +220,9 @@ boot2_src = "0x400e0000"
 # ip stack wants sixteen of them and does not fit in 32 KiB. Module state
 # is sized by the same graph with tls on top.
 #
-# MEASURED (2026-09-22), by reading `module_state_size` out of the linked
-# artefacts rather than estimating — the figures here were previously
-# "cyw43, wifi and ip take ~104 KiB", which was wrong by 58% and, being the
-# only number anyone had, was taken as proof that a networked graph could not
-# fit RP2040's 64 KiB arena at all. It can; see
-# `chronicle/.context/rfc_tiny_device.md` §13.
+# The figures are read from `module_state_size` in the linked artefacts,
+# never estimated: a networked graph fits RP2040's 64 KiB arena, which an
+# estimate overstated by half.
 #
 #   cyw43   5,616      wifi      784      ip  59,400   → 65,800  (64.3 KiB)
 #   tls   126,368  (one session)

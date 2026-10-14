@@ -18,8 +18,9 @@ pub mod store {
     // Constants
     // ============================================================================
 
-    const STORE_XIP: *const u8 =
-        (flash_layout::XIP_BASE + flash_layout::PARAM_STORE_OFFSET) as *const u8;
+    /// The board's partition (`chip::GRAPH_FLASH`).
+    const LAYOUT: flash_layout::GraphFlash = crate::platform::chip::GRAPH_FLASH;
+    const STORE_XIP: *const u8 = (flash_layout::XIP_BASE + LAYOUT.param_store) as *const u8;
     const SECTOR_SIZE: usize = flash_layout::PARAM_STORE_SIZE; // 4096
     const HEADER_SIZE: usize = 8;
     const ENTRY_HEADER_SIZE: usize = 4; // module_id + tag + flags + value_len
@@ -421,21 +422,19 @@ pub mod store {
         let end = offset.saturating_add(size);
 
         // Runtime parameter store — one sector.
-        if offset >= flash_layout::PARAM_STORE_OFFSET
-            && end <= flash_layout::PARAM_STORE_OFFSET + SECTOR_SIZE as u32
-        {
+        if offset >= LAYOUT.param_store && end <= LAYOUT.param_store + SECTOR_SIZE as u32 {
             return true;
         }
 
-        // Graph slots A and B — OTA-writable bundles.
-        if offset >= flash_layout::GRAPH_SLOT_A_OFFSET
-            && end <= flash_layout::GRAPH_SLOT_A_OFFSET + flash_layout::GRAPH_SLOT_SIZE
-        {
+        // Graph slots A and B — OTA-writable bundles, as this board's flash
+        // is partitioned. A board with no room for slots has none.
+        if LAYOUT.slot_size == 0 {
+            return false;
+        }
+        if offset >= LAYOUT.slot_a && end <= LAYOUT.slot_a + LAYOUT.slot_size {
             return true;
         }
-        if offset >= flash_layout::GRAPH_SLOT_B_OFFSET
-            && end <= flash_layout::GRAPH_SLOT_B_OFFSET + flash_layout::GRAPH_SLOT_SIZE
-        {
+        if offset >= LAYOUT.slot_b && end <= LAYOUT.slot_b + LAYOUT.slot_size {
             return true;
         }
 

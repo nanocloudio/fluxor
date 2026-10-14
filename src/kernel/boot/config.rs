@@ -371,15 +371,20 @@ fn read_layout_from_slots() -> Option<FlashLayout> {
 #[cfg(feature = "rp")]
 fn choose_slot() -> Option<FlashLayout> {
     use crate::abi::platform::rp::flash_layout;
-    let slot_a = (flash_layout::XIP_BASE + flash_layout::GRAPH_SLOT_A_OFFSET) as *const u8;
-    let slot_b = (flash_layout::XIP_BASE + flash_layout::GRAPH_SLOT_B_OFFSET) as *const u8;
+    // This board's slots; a flash with no room for them has none to choose.
+    let layout = crate::platform::chip::GRAPH_FLASH;
+    if layout.slot_size == 0 {
+        return None;
+    }
+    let slot_a = (flash_layout::XIP_BASE + layout.slot_a) as *const u8;
+    let slot_b = (flash_layout::XIP_BASE + layout.slot_b) as *const u8;
 
     let own_digest = kernel_abi_surface_digest();
     // SAFETY: slot_a and slot_b are the bases of the two XIP-mapped slot
     // apertures; `decode_slot_header` reads the 256-byte header and, under
     // a slot root, regions it has bounded inside the slot.
     let a = unsafe { decode_slot_header(slot_a, &own_digest) };
-    // SAFETY: as above; slot_b is the secondary slot at a fixed offset.
+    // SAFETY: as above, for this board's slot B.
     let b = unsafe { decode_slot_header(slot_b, &own_digest) };
     SLOT_ADMITTED.store(
         u8::from(a.is_some()) | (u8::from(b.is_some()) << 1),
@@ -441,10 +446,11 @@ unsafe fn decode_slot_header(base: *const u8, own_digest: &[u8; 32]) -> Option<S
         return None;
     }
     // Both regions must fit inside the slot.
-    if (modules_offset as u64) + (modules_size as u64) > flash_layout::GRAPH_SLOT_SIZE as u64 {
+    let slot_size = crate::platform::chip::GRAPH_FLASH.slot_size as u64;
+    if (modules_offset as u64) + (modules_size as u64) > slot_size {
         return None;
     }
-    if (config_offset as u64) + (config_size as u64) > flash_layout::GRAPH_SLOT_SIZE as u64 {
+    if (config_offset as u64) + (config_size as u64) > slot_size {
         return None;
     }
 
@@ -997,11 +1003,11 @@ pub fn read_config_at(config_addr: u32) -> Option<Config> {
 /// This avoids allocating a large Config struct on the stack.
 pub fn read_config_at_into(config_addr: u32, config: &mut Config) -> bool {
     // Bare-metal flash-trailer path: the trailer reader already
-    // validates `config_offset + config_size <= GRAPH_SLOT_SIZE` in
+    // validates `config_offset + config_size` against the slot size in
     // `read_slot_header`, so passing the parser's `MAX_CONFIG_SIZE`
     // cap here is safe — the underlying flash region is guaranteed
-    // by the slot layout (`flash_layout::GRAPH_SLOT_SIZE` is 64 KiB
-    // on RP, well above the 32 KiB cap).
+    // by the slot layout (`chip::GRAPH_FLASH.slot_size` is hundreds of
+    // KiB on any board with slots, well above the 32 KiB cap).
     // SAFETY: the trailer reader guarantees `[config_addr, config_addr +
     // MAX_CONFIG_SIZE)` lies inside the flash slot.
     unsafe { read_config_from_ptr_with_len(config_addr as *const u8, MAX_CONFIG_SIZE, config) }
