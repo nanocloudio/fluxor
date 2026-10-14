@@ -563,6 +563,14 @@ fn cmd_publish(
             store.as_deref(),
         );
     }
+    if let Some(PublishAction::Workload {
+        ref dir,
+        ref tag,
+        ref store,
+    }) = action
+    {
+        return store_cli::cmd_workload_image_publish(dir, tag.as_deref(), store.as_deref());
+    }
     if let Some(PublishAction::Firmware {
         ref file,
         ref name,
@@ -594,9 +602,10 @@ fn cmd_publish(
         Some(
             PublishAction::Bundle { .. }
             | PublishAction::Image { .. }
+            | PublishAction::Workload { .. }
             | PublishAction::Firmware { .. },
         ) => {
-            unreachable!("publish bundle/image/firmware handled above")
+            unreachable!("publish bundle/image/workload/firmware handled above")
         }
         None => {
             let mut kinds = Vec::new();

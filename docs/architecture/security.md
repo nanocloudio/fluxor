@@ -233,6 +233,23 @@ A labelled key asked to persist is sealed through the platform HAL.
   not be written durably refuses the key rather than reporting it persisted.
   Linux writes a temporary file, flushes it, renames it, and flushes the
   directory.
+- **Where records live.** On Linux, one file per label under
+  `FLUXOR_VAULT_DIR`, or `vault/` under `FLUXOR_STORE_DIR`. On a bare-metal
+  Pi 5 whose graph holds a backing provider (the `nvme` module), in the
+  NVMe's reserved backing pages: two 16 KiB slots, A/B. A write builds the
+  whole new image, writes it to the slot not in use, flushes, and only then
+  makes it live, so a power cut leaves the previous image whole; each image
+  carries a sequence number and a SHA-256 over itself, and a boot takes the
+  valid image with the higher sequence. Records there are sealed with
+  ChaCha20-Poly1305 under a key derived from the board's OTP device key. A
+  Pi 5 whose OTP holds no device key cannot seal: its vault keeps every key
+  in RAM, writes nothing to the store, and says so once in the boot log.
+- **A store not yet readable.** A durable store that exists but cannot be
+  read yet (the NVMe still coming up at boot) is not an empty one. Until it
+  reads, a labelled open of a key not already open, an import and a destroy
+  by label answer `EAGAIN`, and the caller asks again: answered as empty, an
+  open would generate a fresh key over the stored one, and a destroy would
+  leave the record to come back.
 - **Destroy.** Destroying a label removes its record, so the key does not
   come back.
 - **Provisioning.** `fluxor-linux vault-import --module <type>` provisions a
@@ -330,6 +347,19 @@ handle, and then wipes the in-module key bytes with volatile writes, so
 `CertificateVerify` signs only through the vault (`SIGN`). The in-module
 path is retained only as the explicit not-present fallback — a module
 arena dump on a vault-enabled build does not reveal the identity key.
+
+An identity can also be born in the vault. With `identity_label` set, the
+TLS module opens a P-256 key under that label, or generates and persists it
+the first time (`OPEN_OR_GENERATE`), and the private half never exists
+outside the vault. The certificate cannot be part of the graph, since the
+key did not exist when the graph was built, so the instance asks for one:
+it writes the key's SEC1 public point on `identity_req` until a chain
+arrives on `identity_cert`, and again at two thirds of the held
+certificate's lifetime. A chain is taken only when its leaf certifies this
+key; any other is dropped and counted. Until one is taken, a handshake that
+reaches its Certificate is refused rather than presenting nothing honest.
+A label identity is refused at construction alongside `cert_file` or
+`key_file`, without a vault, or with either port unwired.
 
 An RSA identity always signs through the vault: the module carries no RSA
 signer of its own, so on a target whose vault holds no RSA suite the

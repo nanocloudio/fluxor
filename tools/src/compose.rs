@@ -111,7 +111,7 @@ pub fn capacity_for_profile(profile: &str) -> Option<NodeCapacity> {
             max_modules: crate::capacity::kernel_max_modules(profile) as u16,
             max_edges: crate::capacity::kernel_max_edges(profile) as u16,
             state_bytes: 256 * 1024 * 1024, // profile_host STATE_ARENA_SIZE
-            buffer_bytes: 8 * 1024 * 1024,  // profile_host BUFFER_ARENA_SIZE
+            buffer_bytes: 16 * 1024 * 1024, // profile_host BUFFER_ARENA_SIZE
             max_endpoints: 64,              // agent admission policy
             max_domains: 4,                 // scheduler MAX_DOMAINS
         }),

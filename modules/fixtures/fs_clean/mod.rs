@@ -7,8 +7,12 @@
 //!
 //! ```text
 //! [fs_clean] files=<n> <name> <name> ...      (one or more lines)
+//! [fs_clean] census krn=<n> kmn=<n> klg=<n> wal=<n> snp=<n> other=<n>
 //! [fs_clean] removed=<k> failed=<f> last_rc=-<errno>
 //! ```
+//!
+//! The census counts every file by name ending, past the names the listing
+//! has room for: a root too large to name is still described.
 //!
 //! Params: `suffixes` — comma-separated, case-insensitive name endings to
 //! remove (`.WAL,.RUN`); empty lists only. Nothing outside the root is
@@ -63,6 +67,8 @@ const RETRY_STEPS: u32 = 250;
 /// Steps between heartbeats: about five seconds at a 1 ms tick.
 const BEAT_STEPS: u32 = 5000;
 
+const CENSUS_KINDS: usize = 5;
+
 #[repr(C)]
 struct CleanState {
     syscalls: *const SyscallTable,
@@ -78,6 +84,10 @@ struct CleanState {
     since_beat: u32,
     /// The listing ran out of room for names (more files than recorded).
     truncated: u32,
+    /// Every file listed, by name ending: `.krn .kmn .klg .wal .snp`, then
+    /// any other. Counted over the whole listing, past the names recorded,
+    /// so a root too large to name is still described.
+    census: [u32; CENSUS_KINDS + 1],
     /// Attempts at the current name, and steps to wait before the next.
     tries: u32,
     backoff: u32,
@@ -153,6 +163,45 @@ unsafe fn emit_listing(s: &CleanState) {
     log(s, &out[..pos]);
 }
 
+/// Which census bucket a name falls in.
+fn census_kind(name: &[u8]) -> usize {
+    if name.len() < 4 || name[name.len() - 4] != b'.' {
+        return CENSUS_KINDS;
+    }
+    let e = [
+        lower(name[name.len() - 3]),
+        lower(name[name.len() - 2]),
+        lower(name[name.len() - 1]),
+    ];
+    match &e {
+        b"krn" => 0,
+        b"kmn" => 1,
+        b"klg" => 2,
+        b"wal" => 3,
+        b"snp" => 4,
+        _ => CENSUS_KINDS,
+    }
+}
+
+unsafe fn emit_census(s: &CleanState) {
+    let mut out = [0u8; 128];
+    let mut pos = 0usize;
+    let parts: [&[u8]; 6] = [
+        b"[fs_clean] census krn=",
+        b" kmn=",
+        b" klg=",
+        b" wal=",
+        b" snp=",
+        b" other=",
+    ];
+    for (i, p) in parts.iter().enumerate() {
+        core::ptr::copy_nonoverlapping(p.as_ptr(), out.as_mut_ptr().add(pos), p.len());
+        pos += p.len();
+        pos += fmt_u32_raw(out.as_mut_ptr().add(pos), s.census[i]);
+    }
+    log(s, &out[..pos]);
+}
+
 unsafe fn emit_result(s: &CleanState) {
     let mut out = [0u8; 96];
     let head = b"[fs_clean] removed=";
@@ -190,6 +239,8 @@ unsafe fn take_batch(s: &mut CleanState, n: usize) {
         if kind != 0 {
             continue;
         }
+        let k = census_kind(name);
+        s.census[k] = s.census[k].wrapping_add(1);
         if (s.count as usize) < MAX_NAMES && len <= MAX_NAME {
             let i = s.count as usize;
             s.names[i][..len].copy_from_slice(name);
@@ -262,6 +313,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
         s.since_beat = 0;
         if s.phase >= PH_REMOVE {
             emit_listing(s);
+            emit_census(s);
             emit_result(s);
         }
     }
@@ -297,6 +349,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
                 s.last_rc = rc;
             }
             emit_listing(s);
+            emit_census(s);
             s.phase = PH_REMOVE;
         }
         PH_REMOVE => {

@@ -175,6 +175,11 @@ unsafe fn dtls_pump_session(s: &mut TlsState, idx: usize) -> bool {
         }
         HandshakeState::DeriveHandshakeKeys => dtls_pump_derive_handshake_keys(s, idx),
         HandshakeState::SendEncryptedExtensions => dtls_pump_send_encrypted_extensions(s, idx),
+        HandshakeState::SendCertificate if !identity_presentable(s) => {
+            identity_refuse_early(s);
+            s.peer_sessions[idx].endpoint.driver.hs_state = HandshakeState::Error;
+            false
+        }
         HandshakeState::SendCertificate => {
             let cert_len = if s.cert_len <= MAX_CERT_CHAIN_BYTES {
                 s.cert_len
@@ -379,7 +384,6 @@ unsafe fn dtls_pump_send_certificate_verify(s: &mut TlsState, idx: usize) -> boo
 
     // Sign via kernel KEY_VAULT when the identity key is held there; fall
     // back to the in-module signer on ENOSYS.
-    const KV_SIGN: u32 = 0x1003;
     if s.identity_rsa_suite != 0 {
         // RSASSA-PSS-SHA256 from the vault's resumable job: the same digest
         // each call until it answers, since the transcript does not move.
@@ -395,7 +399,7 @@ unsafe fn dtls_pump_send_certificate_verify(s: &mut TlsState, idx: usize) -> boo
         let rc = if s.key_vault_handle >= 0 {
             (sys.provider_call)(
                 s.key_vault_handle,
-                KV_SIGN,
+                kv::SIGN,
                 sign_arg.as_mut_ptr(),
                 sign_arg.len(),
             )
@@ -484,7 +488,7 @@ unsafe fn dtls_pump_send_certificate_verify(s: &mut TlsState, idx: usize) -> boo
         sign_arg[46..48].copy_from_slice(&64u16.to_le_bytes());
         let rc = (sys.provider_call)(
             s.key_vault_handle,
-            KV_SIGN,
+            kv::SIGN,
             sign_arg.as_mut_ptr(),
             sign_arg.len(),
         );
@@ -1140,6 +1144,7 @@ unsafe fn dtls_discard_bytes(sys: &SyscallTable, ch: i32, mut count: usize) {
 // inlined the two would share one frame holding both paths' buffers.
 #[inline(never)]
 unsafe fn dtls_module_step(s: &mut TlsState) -> i32 {
+    identity_step(s);
     let sys = &*s.syscalls;
 
     // Drive the bind handshake (shared core): emits CMD_DG_BIND while unbound,

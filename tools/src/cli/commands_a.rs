@@ -1347,6 +1347,117 @@ fn build_packaged_blobs(
     Ok((modules_data, config_data))
 }
 
+/// `fluxor build <graph> --emit=workload -o <dir>` — a workload image: the
+/// graph's one `workloads:` entry as the artefacts a node needs to run it as
+/// a workload that brings its own modules (`SOURCE_FMOD_PACK`):
+///
+/// ```text
+/// <dir>/graph.flxa            the subgraph (FLXA), as the kernel admits it
+/// <dir>/modules/<name>.fmod   every module it names, byte for byte
+/// <dir>/workload-image.json   name, target, module ABI, ABI-surface pin,
+///                             and each module's name_hash and sha256
+/// ```
+///
+/// A module's sha256 is the pin the kernel admits it by, and the digest the
+/// module's layer has once published (`fluxor publish workload <dir>`).
+pub fn cmd_workload_image(
+    config_path: &Path,
+    output_dir: &Path,
+    module_root: Option<&Path>,
+    verbose: bool,
+) -> error::Result<()> {
+    let content = substitute_env_vars(&std::fs::read_to_string(config_path)?)?;
+    let mut config: serde_json::Value = if config_path
+        .extension()
+        .is_some_and(|ext| ext == "yaml" || ext == "yml")
+    {
+        serde_yaml::from_str(&content)?
+    } else {
+        serde_json::from_str(&content)?
+    };
+    let target_desc = resolve_target(&config, None)?;
+    let project_root = crate::project::root_for_config(config_path);
+    stack_expand::expand_platform_stacks(&mut config, &target_desc, &project_root)?;
+    let module_root = target_module_root(module_root, &project_root, &target_desc)?;
+    let abi = target_desc.module_abi();
+
+    let workloads_yaml = config
+        .get("workloads")
+        .and_then(|w| w.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if workloads_yaml.len() != 1 {
+        return Err(error::Error::Config(format!(
+            "a workload image is one workload: {} declares {} under `workloads:`",
+            config_path.display(),
+            workloads_yaml.len()
+        )));
+    }
+    // Only the workload: the base graph's modules are the node's, not this
+    // workload's.
+    let mut only = config.clone();
+    only["modules"] = serde_json::Value::Array(Vec::new());
+    let loc = crate::schema::ModuleLocation {
+        dir: module_root.as_path(),
+        abi,
+        project_root: project_root.as_path(),
+    };
+    let workloads = crate::config::build_workloads(&only, loc, &[])?;
+    let flxa = crate::add_subgraph::encode_add_subgraph(&workloads[0]).map_err(error::Error::Config)?;
+    let store_fb = store_cli::lock_store_resolver(&project_root, abi, None);
+    let modules = parse_modules_from_config_multi(
+        &only,
+        &module_root,
+        &[],
+        store_fb.as_deref().map(|f| f as _),
+    )?;
+    if modules.is_empty() {
+        return Err(error::Error::Config("a workload image needs at least one module".into()));
+    }
+
+    let mods_dir = output_dir.join("modules");
+    std::fs::create_dir_all(&mods_dir)?;
+    std::fs::write(output_dir.join("graph.flxa"), &flxa)?;
+    let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+    let sha = |b: &[u8]| {
+        use sha2::Digest;
+        hex(&sha2::Sha256::digest(b))
+    };
+    let mut entries = Vec::new();
+    for m in &modules {
+        std::fs::write(mods_dir.join(format!("{}.fmod", m.name)), &m.data)?;
+        entries.push(serde_json::json!({
+            "name": m.name,
+            "name_hash": m.name_hash,
+            "sha256": sha(&m.data),
+            "size": m.data.len(),
+        }));
+    }
+    let name = workloads_yaml[0]
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .or_else(|| config_path.file_stem().and_then(|s| s.to_str()).map(str::to_string))
+        .unwrap_or_else(|| "workload".into());
+    let doc = serde_json::json!({
+        "name": name,
+        "target": target_desc.id,
+        "module_abi": abi,
+        "abi_surface": hex(&hash::abi_surface_digest()),
+        "flxa_sha256": sha(&flxa),
+        "modules": entries,
+    });
+    std::fs::write(
+        output_dir.join("workload-image.json"),
+        serde_json::to_string_pretty(&doc)?,
+    )?;
+    if verbose {
+        println!("workload image {name}: {} module(s), FLXA {} bytes", modules.len(), flxa.len());
+    }
+    println!("{}", output_dir.display());
+    Ok(())
+}
+
 /// Emit a graph image: a 256-byte header, the module table (with the
 /// graph's program section after it) from the first 4 KiB boundary, and the
 /// static config from the next 256-byte boundary. An RP image is padded with

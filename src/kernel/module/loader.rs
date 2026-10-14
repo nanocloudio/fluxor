@@ -1864,6 +1864,28 @@ impl ModuleLoader {
         let hash = fnv1a32(name.as_bytes());
         self.find_by_name_hash(hash)
     }
+    /// Each module of the table: its `name_hash` and its full `.fmod` bytes
+    /// (the table entry's `[offset, offset + size)`), in table order.
+    pub fn for_each_entry(&self, mut f: impl FnMut(u32, &[u8])) {
+        let Some(header) = self.header else {
+            return;
+        };
+        // SAFETY: table_base is valid and the header and every entry were
+        // bounds-checked against the mapping when the table was loaded
+        // (`validate_table_layout`).
+        unsafe {
+            let entries_base = offset_ptr(self.table_base, 16);
+            for i in 0..header.module_count as usize {
+                let entry = read_table_entry(entries_base, i);
+                let base = offset_ptr(self.table_base, entry.offset as usize);
+                f(
+                    entry.name_hash,
+                    core::slice::from_raw_parts(base, entry.size as usize),
+                );
+            }
+        }
+    }
+
     /// Find module by name hash
     pub fn find_by_name_hash(&self, name_hash: u32) -> Result<LoadedModule, LoaderError> {
         let header = self.header.ok_or(LoaderError::NoModules)?;

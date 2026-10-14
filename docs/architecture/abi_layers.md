@@ -143,10 +143,32 @@ code.
 `provider_open` returns `-ENOSYS` until a host-controller driver lands.
 First declared consumer: `modules/foundation/usb_midi_host`.
 
-`WORKLOAD` has two placement-resolved backends: an fmod-graph backend
-(MPU/EL0 + owner/lease, bare metal) and a host-process backend
-(namespaces/cgroups, Linux). It is gated by
-`requires_contract = "workload"` and `platform_raw`.
+`WORKLOAD` has two placement-resolved backends: an fmod-graph backend,
+which splices the workload's subgraph into the node's own graph under an
+owner and its leases, and a host-process backend (namespaces/cgroups,
+Linux). It is gated by `requires_contract = "workload"` and
+`platform_raw`.
+
+The fmod-graph backend realizes the shared posture only. A workload is a
+tenant of the node: `CREATE` refuses the null identity (`EINVAL`), since
+everything keyed on an owner's identity would see every such workload as
+one, and refuses a subgraph any of whose modules holds a permission other
+than `observe` (`EACCES`), checked before anything is allocated.
+
+A workload can bring its own modules (`SOURCE_FMOD_PACK`): an FXMT module
+table in the caller's memory, the SHA-256 pins its modules are admitted by,
+then the subgraph. The kernel copies the table into a page-aligned region
+of a code pool that is 16 MiB on a 64-bit node and absent elsewhere,
+validates it as it does the boot table, and admits each module only when
+its full `.fmod` bytes hash to one of the pins (the digest its OCI layer
+is addressed by) or the node's signing root verifies its signature;
+otherwise `CREATE` fails `EACCES`. The region is then made executable and
+the subgraph's names resolve in the pack first, the node's image second.
+The code is the owner's for as long as the owner lives, freed with it, on
+a rolled-back add, and on a rebuild. A node without a pool answers
+`ENOSYS`, and `CAPS` advertises packs only where there is one.
+`MODULE_DIGESTS` lists the node's own image, `name_hash` and SHA-256 per
+module, so an orchestrator pins a workload against what the node holds.
 
 `STREAM_CLOCK` is where hosts register a dedicated clock provider. On
 bare-metal RP the clock is a property of the active PIO stream, so no

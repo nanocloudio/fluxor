@@ -64,6 +64,19 @@ A workload bundle is published on its own, not by the sweep:
 one transaction. Parameterised service bundles are covered in
 [service-bundles.md](service-bundles.md).
 
+A workload that brings its own modules is published the same way, on its
+own. `fluxor build <graph> --emit=workload --output <dir>` takes the graph's
+one `workloads:` entry and writes `graph.flxa` (the subgraph as the kernel
+admits it), `modules/<name>.fmod` for every module it names, and
+`workload-image.json` (name, target, module ABI, ABI-surface digest, and
+each module's `name_hash` and SHA-256). `fluxor publish workload <dir>`
+tags it in the local store as `<name>:latest` (or `--tag`): an OCI
+artifact whose first layer is the FLXA and whose other layers are the
+modules, one each. A module layer's digest is the SHA-256 of its bytes,
+which is exactly the pin the node's kernel admits it by, so a node pins
+what the manifest names. `fluxor store push` serves it onward like any
+other tag.
+
 ## Withholding a module
 
 A module that builds and runs but must not ship — a licence question

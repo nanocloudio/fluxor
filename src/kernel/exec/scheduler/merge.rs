@@ -1041,6 +1041,17 @@ pub fn current_module_permissions() -> u16 {
     unsafe { SCHED.permissions[idx] }
 }
 
+/// Whether any module of the graph holds `bit` (a `permission` category):
+/// what the graph can do, read from the manifests the loader instantiated.
+pub fn graph_holds_permission(bit: u16) -> bool {
+    // SAFETY: scheduler-owned table; a stale read is answered again on the
+    // next call.
+    unsafe {
+        let p = &raw const SCHED.permissions;
+        (*p).iter().any(|&m| m & bit != 0)
+    }
+}
+
 /// Return the export table info for a module by index.
 /// Used by loader::resolve_export_for_module to resolve export hashes.
 pub fn get_module_exports(idx: usize) -> (usize, *const u8, u16) {

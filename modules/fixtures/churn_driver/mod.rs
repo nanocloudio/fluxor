@@ -43,6 +43,8 @@ const EP_CALLER: u8 = 4;
 
 /// CREATE header + an FLXA blob of at most two modules and two edges.
 const ARG_BYTES: usize = 256;
+/// The largest module pack `pack_hex` carries (pack mode).
+const PACK_MAX: usize = 16 * 1024;
 
 const PH_WAIT_START: u8 = 0;
 const PH_IDLE: u8 = 1;
@@ -79,6 +81,18 @@ struct State {
     last_step_ms: u64,
     last_hb_ms: u64,
     arg: [u8; ARG_BYTES],
+    /// Pack mode: the module pack (an FXMT table) every churn workload
+    /// brings with it, and the pin its module is admitted by. Empty = the
+    /// workload's modules come from the node's own image.
+    pack_len: u32,
+    pin_set: u8,
+    /// A hex digit of `pack_hex` whose pair continues in the next chunk:
+    /// its value + 1 (0 = none). The encoder's chunks are 255 bytes, an odd
+    /// length, so every chunk boundary splits a pair.
+    half: u8,
+    _pad2: [u8; 2],
+    pin: [u8; 32],
+    pack: [u8; PACK_MAX],
 }
 
 mod params_def {
@@ -103,6 +117,39 @@ mod params_def {
 
         5, fault, u8, 1
             => |s, d, len| { s.fault = p_u8(d, len, 0, 1); };
+
+        // Pack mode: the module pack as hex, appended chunk by chunk (the TLV
+        // encoder splits a long string into repeated entries).
+        6, pack_hex, str_chunked, 0
+            => |s, d, len| {
+                let mut i = 0usize;
+                while i < len {
+                    let Some(v) = super::hexv(*d.add(i)) else { return; };
+                    i += 1;
+                    if s.half == 0 {
+                        s.half = v + 1;
+                        continue;
+                    }
+                    let at = s.pack_len as usize;
+                    if at >= super::PACK_MAX { return; }
+                    *s.pack.as_mut_ptr().add(at) = ((s.half - 1) << 4) | v;
+                    s.pack_len = (at + 1) as u32;
+                    s.half = 0;
+                }
+            };
+
+        // Pack mode: the SHA-256 pin of the pack's module, as 64 hex digits.
+        7, pin_hex, str, 0
+            => |s, d, len| {
+                if len != 64 { return; }
+                let mut i = 0usize;
+                while i < 32 {
+                    let (Some(hi), Some(lo)) = (super::hexv(*d.add(2 * i)), super::hexv(*d.add(2 * i + 1))) else { return; };
+                    *s.pin.as_mut_ptr().add(i) = (hi << 4) | lo;
+                    i += 1;
+                }
+                s.pin_set = 1;
+            };
     }
 }
 
@@ -228,11 +275,35 @@ fn build(s: &mut State, id: u32, fault_mode: Option<u8>) -> usize {
     for (i, &c) in idb.iter().enumerate() {
         s.arg[12 + i] = c;
     }
+    // Pack mode: the churn workload brings its modules — the pack reference
+    // and its pin come first in the source section, the FLXA after them.
+    let pack = fault_mode.is_none() && s.pack_len > 0 && s.pin_set != 0;
+    let pack_ptr = s.pack.as_ptr() as u64;
+    let pack_len = s.pack_len;
+    let pin = s.pin;
+    if pack {
+        s.arg[17] = wl::SOURCE_FMOD_PACK;
+    }
     let mut o = Out {
         buf: &mut s.arg[wl::CREATE_HEADER_SIZE..],
         n: 0,
         ok: true,
     };
+    if pack {
+        for b in pack_ptr.to_le_bytes() {
+            o.u8(b);
+        }
+        for b in pack_len.to_le_bytes() {
+            o.u8(b);
+        }
+        o.u8(1); // pin_count
+        o.u8(0);
+        o.u8(0);
+        o.u8(0);
+        for b in pin {
+            o.u8(b);
+        }
+    }
     o.be32(FLXA_MAGIC);
     o.be16(FLXA_VERSION);
     o.be16(0);
@@ -264,6 +335,16 @@ fn build(s: &mut State, id: u32, fault_mode: Option<u8>) -> usize {
     s.arg[40] = l[0];
     s.arg[41] = l[1];
     wl::CREATE_HEADER_SIZE + src_len
+}
+
+/// A hex digit's value.
+fn hexv(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// Append `v` as decimal at `msg[len..]`; returns the new length.
@@ -418,6 +499,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     (b"exh", s.exhausted as i64),
                     (b"f1", s.fault_state[0] as i64),
                     (b"f0", s.fault_state[1] as i64),
+                    (b"pack", s.pack_len as i64),
                 ],
             );
         }

@@ -804,14 +804,14 @@ fn digest_eq(a: &[u8; 32], b: &[u8]) -> bool {
 /// `OPEN_OR_GENERATE` an AEAD key under `label`; the handle, or -1.
 unsafe fn cont_vault_open_or_generate_aead(sys: &SyscallTable, label: &[u8]) -> i32 {
     let mut arg = [0u8; 8 + 64 + 12];
-    arg[0..2].copy_from_slice(&8u16.to_le_bytes()); // suite::AEAD_KEY
-    let usage: u32 = (1 << 6) | (1 << 7) | (1 << 4) | (1 << 5); // SEAL|OPEN|PERSIST|WRAP
+    arg[0..2].copy_from_slice(&kv::suite::AEAD_KEY.to_le_bytes());
+    let usage = kv::usage::SEAL | kv::usage::OPEN | kv::usage::PERSIST | kv::usage::WRAP;
     arg[2..6].copy_from_slice(&usage.to_le_bytes());
     arg[6] = 0;
     arg[7] = label.len() as u8;
     arg[8..8 + label.len()].copy_from_slice(label);
     let n = 8 + label.len() + 12;
-    let rc = (sys.provider_call)(-1, 0x1009, arg.as_mut_ptr(), n);
+    let rc = (sys.provider_call)(-1, kv::OPEN_OR_GENERATE, arg.as_mut_ptr(), n);
     if rc < 0 {
         -1
     } else {

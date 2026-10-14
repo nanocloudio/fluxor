@@ -1,0 +1,21 @@
+name = "vault_probe"
+version = "1.0.0"
+hardware_targets = ["bcm2712", "linux"]
+
+# Does a node keep its keys? Opens one persistent Ed25519 key by label
+# (OPEN_OR_GENERATE, SIGN|EXPORT_PUBLIC|PERSIST) the way a node's CA is
+# opened, asking again while the vault answers EAGAIN (its durable store not
+# readable yet), then reports, and repeats the report every 5 s:
+#
+#   [vault_probe] key waits=<EAGAIN answers> pub=<first 8 bytes, hex>
+#                 tier=<vault tier> persisted=<0|1>
+#   [vault_probe] FAIL rc=-<errno>
+#
+# Two boots of one node logging the same `pub=` prove the key outlived the
+# reboot; `persisted=1` says the vault holds it durably, `tier=` how well it
+# is protected (2 = sealed by a device key).
+#
+# Params: 1 label (str, default "fluxor/vault_probe").
+
+[observability]
+exempt = "self-contained fixture; its key/FAIL log lines are the verdict"

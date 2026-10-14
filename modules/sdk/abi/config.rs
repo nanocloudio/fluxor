@@ -124,10 +124,13 @@ mod profile_host {
         /// connection table, above that peak. Zero-initialised, so it costs
         /// kernel `.bss` rather than image size.
         pub const STATE_ARENA_SIZE: usize = 256 * 1024 * 1024;
-        /// Per-channel buffer pool. 8 MiB lets graphs size
-        /// individual channels at 16-64 KiB without exhausting
-        /// the arena under sustained gigabit-class loads.
-        pub const BUFFER_ARENA_SIZE: usize = 8 * 1024 * 1024;
+        /// Per-channel buffer pool. A node's own graph and the workload
+        /// subgraphs it hosts share it: the bare-metal node's base graph
+        /// (control plane, kubelet slice, its PKI) alone holds ~8 MiB of
+        /// channels, and at 8 MiB a stateful Pod's two 128 KiB block edges
+        /// found no room ("[buf] arena full", pi5-a 2026-10-15). 16 MiB
+        /// leaves room for several such Pods; zero-initialised `.bss`.
+        pub const BUFFER_ARENA_SIZE: usize = 16 * 1024 * 1024;
         // Multi-workload: the system substrate plus several workload subgraphs
         // co-resident on aarch64 (bcm2712 / linux). Every module index stays
         // within the scheduler's u8 index domain (`exec_order: [u8; _]`,

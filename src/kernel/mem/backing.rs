@@ -84,7 +84,13 @@ pub mod backing_store {
     /// carves `virtual_pages` from this counter and hands the starting
     /// page index back as `backing_offset`. The driver interprets that
     /// abstract page index in its own addressing (LBA, sector, …).
-    static mut EXTERNAL_ARENA_NEXT_PAGE: u32 = 0;
+    static mut EXTERNAL_ARENA_NEXT_PAGE: u32 = RESERVED_EXTERNAL_PAGES;
+
+    /// Pages at the start of the External space no arena is carved from:
+    /// the platform's sealed-blob store (the key vault's durable records)
+    /// lives there, at a place that does not move with the order arenas
+    /// register in on each boot. Two 16 KiB slots.
+    pub const RESERVED_EXTERNAL_PAGES: u32 = 8;
 
     // ============================================================================
     // Public API
@@ -102,7 +108,7 @@ pub mod backing_store {
             {
                 RAMDISK_NEXT_OFFSET = 0;
             }
-            EXTERNAL_ARENA_NEXT_PAGE = 0;
+            EXTERNAL_ARENA_NEXT_PAGE = RESERVED_EXTERNAL_PAGES;
         }
     }
 
@@ -246,7 +252,7 @@ pub mod backing_store {
                         return crate::kernel::sys::errno::ENODEV;
                     }
                     let mut arg = build_backing_arg(info.backing_offset, vpage_idx, buf as u64);
-                    crate::kernel::backing_provider::dispatch(
+                    crate::kernel::backing_provider::dispatch_patient(
                         crate::kernel::backing_provider::op::READ_PAGE,
                         arg.as_mut_ptr(),
                         arg.len(),
@@ -306,7 +312,7 @@ pub mod backing_store {
                         return crate::kernel::sys::errno::ENODEV;
                     }
                     let mut arg = build_backing_arg(info.backing_offset, vpage_idx, buf as u64);
-                    crate::kernel::backing_provider::dispatch(
+                    crate::kernel::backing_provider::dispatch_patient(
                         crate::kernel::backing_provider::op::WRITE_PAGE,
                         arg.as_mut_ptr(),
                         arg.len(),

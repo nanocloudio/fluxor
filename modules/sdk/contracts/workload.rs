@@ -30,8 +30,9 @@
 //     implementation vocabulary. They live in the host-scoped class
 //     `abi::platform::linux::host_process` (0x1B) — registered only where a
 //     host platform exists; an unregistered class returns ENOSYS. The
-//     `source_kind` byte here defines only the native artifact
-//     (`SOURCE_FMOD_GRAPH = 0`); nonzero kinds are backend-defined.
+//     `source_kind` byte here defines only the native artifacts
+//     (`SOURCE_FMOD_GRAPH = 0`, `SOURCE_FMOD_PACK = 2`); other kinds are
+//     backend-defined.
 //
 // Two tiers:
 //   * Tier 1 — typed portable fields (the CREATE header): identity, posture,
@@ -186,7 +187,47 @@ pub const POSTURE_HARDENED: u8 = 2;
 /// A fluxor graph/fmod artifact — resolves to the MPU/EL0 backend on a metal
 /// node.
 pub const SOURCE_FMOD_GRAPH: u8 = 0;
-// Nonzero source kinds are backend-defined (the linux host bundle kind is
+
+/// A fluxor graph that brings its own modules: `.fmod`s the node's boot image
+/// does not hold, staged as the workload's own code for as long as it lives.
+/// The source section is a [`PackRef`] header, `pin_count` 32-byte SHA-256
+/// pins, then the FLXA subgraph whose modules resolve in the pack first and
+/// the node's image second.
+///
+/// The pack is an FXMT module table (`fluxor build`'s modules blob) in the
+/// caller's memory, copied during CREATE. Every module in it is admitted only
+/// when its full `.fmod` bytes hash to one of the pins — the digest an OCI
+/// layer is addressed by — or it carries a signature the node's signing root
+/// verifies; otherwise CREATE fails `EACCES`. A node without code space for
+/// packs answers `ENOSYS`; a pack past it `E2BIG` or `ENOMEM`.
+pub const SOURCE_FMOD_PACK: u8 = 2;
+
+/// The head of a [`SOURCE_FMOD_PACK`] source section, little-endian:
+/// ```text
+/// off  size  field
+///   0    8   pack_ptr    address of the FXMT module table
+///   8    4   pack_len    its length in bytes
+///  12    2   pin_count   SHA-256 pins that follow, 32 bytes each
+///  14    2   0
+/// ```
+/// Then `pin_count * 32` pin bytes, then the FLXA subgraph.
+pub mod pack_ref {
+    pub const SIZE: usize = 16;
+    pub const PTR: usize = 0;
+    pub const LEN: usize = 8;
+    pub const PIN_COUNT: usize = 12;
+    pub const PIN_SIZE: usize = 32;
+}
+
+/// `MODULE_DIGESTS` — what the node's own image holds, so an orchestrator can
+/// pin a workload against it: writes `[count:u16 LE][0:u16]` then `count`
+/// records `[name_hash:u32 LE][sha256 of the module's full .fmod bytes:32]`
+/// into the caller's buffer (`arg`, `arg_len`), as many as fit; returns the
+/// total count. Not workload-scoped (handle -1).
+pub const MODULE_DIGESTS: u32 = 0x1A11;
+/// One [`MODULE_DIGESTS`] record.
+pub const MODULE_DIGEST_RECORD: usize = 36;
+// Every other source kind is backend-defined (the linux host bundle kind is
 // `abi::platform::linux::host_process::SOURCE_HOST_PROCESS`).
 
 // ---- WAIT state byte ----
@@ -286,8 +327,10 @@ pub mod caps {
 
     // `source_kinds` bitmap
     pub const SOURCE_FMOD_GRAPH: u8 = 1 << 0;
-    // bit 1+ backend-defined (the linux bundle bit is
-    // `abi::platform::linux::host_process::CAPS_SOURCE_HOST_PROCESS`).
+    // bit 1: the linux host-process bundle
+    // (`abi::platform::linux::host_process::CAPS_SOURCE_HOST_PROCESS`).
+    pub const SOURCE_FMOD_PACK: u8 = 1 << 2;
+    // bits 3+ backend-defined.
 
     // `ops` bitmap — optional opcodes beyond the mandatory create/start/wait/
     // signal/destroy set. SIGNAL itself is mandatory to *accept*; its bit

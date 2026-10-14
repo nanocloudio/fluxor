@@ -161,6 +161,27 @@ index = 3
 content_type = "OctetStream"
 buffer_size = { default = 65536, thumbv8m = 16384, aarch64 = 65536 }
 
+# The identity named by `identity_label` (identity.rs): the key is born in
+# the vault, and its certificate is asked for and delivered at runtime.
+# `identity_req` carries `[0x5B][len:2 LE = 65][SEC1 point]` — the key to be
+# certified — every second until a chain arrives, and again at two thirds of
+# its lifetime; `identity_cert` takes `[0x5C][len:2 LE][leaf DER ‖ issuer
+# DER ‖ …]`, which is presented only when its leaf certifies this key.
+# Unwired, a label identity refuses to construct; with no label both ports
+# are inert.
+[[ports]]
+name = "identity_cert"
+direction = "input"
+index = 3
+content_type = "OctetStream"
+buffer_size = 4096
+
+[[ports]]
+name = "identity_req"
+direction = "output"
+index = 4
+content_type = "OctetStream"
+
 # Module-scope observability (optional); wired to observe.telemetry.
 [observability]
 # `bytes_in` / `bytes_out` are the cipher-side (ip seam) byte counters that

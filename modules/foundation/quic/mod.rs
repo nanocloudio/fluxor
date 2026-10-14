@@ -185,6 +185,7 @@ const PATH_VALIDATE_TIMEOUT_MS: u64 = 3_000;
 // (The transparent-echo path — no `alpn` configured at all — is a
 // different channel ENCODING, not a different protocol: it keeps its
 // net_proto MSG_DATA 0x02 framing and carries one raw byte stream.)
+use abi::contracts::key_vault as kv;
 use abi::contracts::net::mux;
 use abi::contracts::net::net_proto::Target;
 const MAX_CERT_LEN: usize = 1024;
@@ -363,6 +364,9 @@ pub(crate) struct QuicState {
     /// Parity of the generation sealing new tickets.
     ticket_parity: u8,
     ticket_vault_warned: bool,
+    /// The vault answered `E_AGAIN` (its durable store not readable yet):
+    /// the ticket keys are asked for again.
+    ticket_keys_pending: bool,
     /// Seconds between key rotations; 0 = never.
     ticket_rotate_s: u32,
     ticket_rotated_ms: u64,
@@ -665,6 +669,7 @@ pub unsafe extern "C" fn module_new(
     s.ticket_key = [-1, -1];
     s.ticket_parity = 0;
     s.ticket_vault_warned = false;
+    s.ticket_keys_pending = false;
     s.ticket_rotate_s = 3600;
     s.ticket_rotated_ms = 0;
     s.ticket_seen = [TicketClaim::EMPTY; TICKET_SEEN];
@@ -1070,29 +1075,25 @@ unsafe fn parse_extended_params(s: &mut QuicState, params: *const u8, params_len
 // The vault holds the sealing key; this module holds two handles and a
 // parity. `KEY_VAULT` is a kernel contract class every module may call.
 
-/// `OPEN_OR_GENERATE` an AEAD key under `label`; the handle, or -1.
+/// `OPEN_OR_GENERATE` an AEAD key under `label`; the handle, or the vault's
+/// negative errno (`E_AGAIN` while its durable store is not readable yet).
 unsafe fn vault_open_or_generate_aead(sys: &SyscallTable, label: &[u8]) -> i32 {
     let mut arg = [0u8; 8 + 64 + 12];
-    arg[0..2].copy_from_slice(&8u16.to_le_bytes()); // suite::AEAD_KEY
-    let usage: u32 = (1 << 6) | (1 << 7) | (1 << 4) | (1 << 5); // SEAL|OPEN|PERSIST|WRAP
+    arg[0..2].copy_from_slice(&kv::suite::AEAD_KEY.to_le_bytes());
+    let usage = kv::usage::SEAL | kv::usage::OPEN | kv::usage::PERSIST | kv::usage::WRAP;
     arg[2..6].copy_from_slice(&usage.to_le_bytes());
     arg[6] = 0;
     arg[7] = label.len() as u8;
     arg[8..8 + label.len()].copy_from_slice(label);
     let n = 8 + label.len() + 12;
-    let rc = (sys.provider_call)(-1, 0x1009, arg.as_mut_ptr(), n);
-    if rc < 0 {
-        -1
-    } else {
-        rc
-    }
+    (sys.provider_call)(-1, kv::OPEN_OR_GENERATE, arg.as_mut_ptr(), n)
 }
 
 unsafe fn vault_destroy_by_label(sys: &SyscallTable, label: &[u8]) {
     let mut arg = [0u8; 1 + 64];
     arg[0] = label.len() as u8;
     arg[1..1 + label.len()].copy_from_slice(label);
-    let _ = (sys.provider_call)(-1, 0x100B, arg.as_mut_ptr(), 1 + label.len());
+    let _ = (sys.provider_call)(-1, kv::DESTROY_BY_LABEL, arg.as_mut_ptr(), 1 + label.len());
 }
 
 /// `AEAD_SEAL` `pt` under `handle` with `aad`; bytes written to `out`, or 0.
@@ -1115,7 +1116,7 @@ unsafe fn vault_seal(
     p += pt.len();
     arg[p..p + 8].copy_from_slice(&(out.as_mut_ptr() as u64).to_le_bytes());
     arg[p + 8..p + 10].copy_from_slice(&(out.len() as u16).to_le_bytes());
-    let rc = (sys.provider_call)(handle, 0x1012, arg.as_mut_ptr(), p + 12);
+    let rc = (sys.provider_call)(handle, kv::AEAD_SEAL, arg.as_mut_ptr(), p + 12);
     if rc < 0 {
         return 0;
     }
@@ -1142,7 +1143,7 @@ unsafe fn vault_open(
     p += blob.len();
     arg[p..p + 8].copy_from_slice(&(out.as_mut_ptr() as u64).to_le_bytes());
     arg[p + 8..p + 10].copy_from_slice(&(out.len() as u16).to_le_bytes());
-    let rc = (sys.provider_call)(handle, 0x1013, arg.as_mut_ptr(), p + 12);
+    let rc = (sys.provider_call)(handle, kv::AEAD_OPEN, arg.as_mut_ptr(), p + 12);
     if rc < 0 {
         return 0;
     }
@@ -1150,29 +1151,59 @@ unsafe fn vault_open(
 }
 
 /// Open both ticket-key generations. Without a vault no ticket is ever
-/// issued: resumption that cannot be sealed is not offered.
+/// issued: resumption that cannot be sealed is not offered. A vault whose
+/// durable store is not readable yet answers `E_AGAIN`, and the keys are
+/// asked for again (`ticket_rotate_if_due`) until it answers; any other
+/// refusal is final for the life of the instance.
 unsafe fn ticket_keys_open(s: &mut QuicState) {
     if s.mode != 1 {
         return;
     }
     let sys = &*s.syscalls;
-    s.ticket_key[0] = vault_open_or_generate_aead(sys, TICKET_LABEL.get(0));
-    s.ticket_key[1] = vault_open_or_generate_aead(sys, TICKET_LABEL.get(1));
+    let k0 = vault_open_or_generate_aead(sys, TICKET_LABEL.get(0));
+    let k1 = vault_open_or_generate_aead(sys, TICKET_LABEL.get(1));
     s.ticket_rotated_ms = dev_millis(sys);
-    if s.ticket_key[0] < 0 || s.ticket_key[1] < 0 {
-        s.ticket_key = [-1, -1];
-        if !s.ticket_vault_warned {
-            s.ticket_vault_warned = true;
-            let msg = b"[quic] no vault ticket key: resumption not offered";
-            dev_log(sys, 2, msg.as_ptr(), msg.len());
+    if k0 >= 0 && k1 >= 0 {
+        s.ticket_key = [k0, k1];
+        s.ticket_keys_pending = false;
+        return;
+    }
+    // One generation alone seals nothing: release the handle that opened
+    // (the persisted key stays in the vault's store).
+    for h in [k0, k1] {
+        if h >= 0 {
+            let _ = (sys.provider_call)(h, kv::DESTROY, core::ptr::null_mut(), 0);
         }
+    }
+    s.ticket_key = [-1, -1];
+    s.ticket_keys_pending = k0 == E_AGAIN || k1 == E_AGAIN;
+    if !s.ticket_keys_pending && !s.ticket_vault_warned {
+        s.ticket_vault_warned = true;
+        let msg = b"[quic] no vault ticket key: resumption not offered";
+        dev_log(sys, 2, msg.as_ptr(), msg.len());
     }
 }
 
 /// Rotate the sealing key when due: the other parity gets a fresh key
 /// and becomes current; tickets under the old current stay openable.
 unsafe fn ticket_rotate_if_due(s: &mut QuicState) {
-    if s.mode != 1 || s.ticket_rotate_s == 0 || s.ticket_key[0] < 0 {
+    if s.mode != 1 {
+        return;
+    }
+    // The vault's durable store was not readable when the keys were asked
+    // for: ask again once a second rather than never offering resumption
+    // for the life of the server.
+    if s.ticket_keys_pending {
+        let now = dev_millis(&*s.syscalls);
+        if now.saturating_sub(s.ticket_rotated_ms) >= 1000 {
+            ticket_keys_open(s);
+        }
+        return;
+    }
+    if s.ticket_key[0] < 0 && s.ticket_key[1] < 0 {
+        return;
+    }
+    if s.ticket_rotate_s == 0 {
         return;
     }
     let sys = &*s.syscalls;
@@ -1184,6 +1215,11 @@ unsafe fn ticket_rotate_if_due(s: &mut QuicState) {
     vault_destroy_by_label(sys, TICKET_LABEL.get(next));
     let h = vault_open_or_generate_aead(sys, TICKET_LABEL.get(next));
     if h < 0 {
+        // The old generation is gone with its label; its handle names
+        // nothing now. The current one keeps sealing, and the rotation is
+        // tried again a period from now.
+        s.ticket_key[next] = -1;
+        s.ticket_rotated_ms = now;
         return;
     }
     s.ticket_key[next] = h;

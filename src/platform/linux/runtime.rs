@@ -535,6 +535,8 @@ static LINUX_HAL_OPS: HalOps = HalOps {
     seal_blob_store: linux_seal_blob_store,
     seal_blob_delete: linux_seal_blob_delete,
     seal_blob_read: linux_seal_blob_read,
+    // The vault directory is a filesystem path: readable whenever it exists.
+    seal_blob_ready: || true,
     seal: linux_seal,
     unseal: linux_unseal,
     now_micros: linux_now_micros,

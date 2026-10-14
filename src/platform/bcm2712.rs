@@ -51,6 +51,8 @@ mod rp1;
 mod timer;
 #[path = "bcm2712/uart.rs"]
 mod uart;
+#[path = "bcm2712/vault_store.rs"]
+mod vault_store;
 
 // Bring UART + GIC + exception names into the binary's namespace so
 // existing callsites (`uart_puts(b"…")`, `irq_bind(…)`, `GICD_BASE`,
@@ -3140,24 +3142,124 @@ fn bcm_seal_provenance_pi5() -> fluxor::kernel::sys::hal::SealProvenance {
     if CONFIRMED.load(Ordering::Acquire) == 1 {
         return fluxor::kernel::sys::hal::SealProvenance::DeviceUnique;
     }
+    static REPORTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
     let mut blob = [0u8; 32];
     let ok = bcm_read_device_seal_key(&mut blob);
     let p = fluxor::kernel::sys::hal::provenance_from_hardware_key(ok, &blob);
     if matches!(p, fluxor::kernel::sys::hal::SealProvenance::DeviceUnique) {
+        // The sealing key: the OTP's key bytes (rows 1..8, after the KSK1
+        // magic) expanded under this platform's context, as the provenance
+        // rule asks of a key shorter than 32 bytes.
+        let mut h = fluxor::kernel::security::crypto::sha256::Sha256::new();
+        h.update(b"fluxor/seal/bcm2712/v1");
+        h.update(&blob[4..32]);
+        let key = h.finalize();
+        // SAFETY: written once, before CONFIRMED publishes it.
+        unsafe {
+            *core::ptr::addr_of_mut!(SEAL_KEY) = key;
+        }
         CONFIRMED.store(1, Ordering::Release);
+    }
+    blob.fill(0);
+    if !REPORTED.swap(true, Ordering::AcqRel) {
+        // Said once: whether this board can seal at all is the first thing a
+        // reader of its log needs to know about its keys.
+        let what = if matches!(p, fluxor::kernel::sys::hal::SealProvenance::DeviceUnique) {
+            "device key in OTP: keys sealed and kept on the node's store"
+        } else {
+            "no device key in OTP: keys are not sealed, and live only until reboot"
+        };
+        log::info!("[seal] {what}");
     }
     p
 }
 
+/// The sealing key derived from the OTP, once `bcm_seal_provenance_pi5` has
+/// confirmed a device key (never written otherwise).
+#[cfg(feature = "board-pi5")]
+static mut SEAL_KEY: [u8; 32] = [0; 32];
+
+/// The sealing key, when this board has a device key.
+fn bcm_seal_key() -> Option<[u8; 32]> {
+    #[cfg(feature = "board-pi5")]
+    {
+        if matches!(
+            bcm_seal_provenance(),
+            fluxor::kernel::sys::hal::SealProvenance::DeviceUnique
+        ) {
+            // SAFETY: published before CONFIRMED, never written again.
+            return Some(unsafe { *core::ptr::addr_of!(SEAL_KEY) });
+        }
+    }
+    None
+}
+
+/// `HalOps::seal`: ChaCha20-Poly1305 under the OTP-derived key, a fresh
+/// nonce from the TRNG; `[nonce:12][ciphertext][tag:16]`. `None` on a board
+/// without a device key: nothing is sealed with anything weaker.
+fn bcm_seal(aad: &[u8], input: &[u8], out: &mut [u8]) -> Option<usize> {
+    use fluxor::kernel::security::crypto::chacha20::chacha20_poly1305_encrypt;
+    let key = bcm_seal_key()?;
+    let n = input.len();
+    if out.len() < 12 + n + 16 {
+        return None;
+    }
+    let mut nonce = [0u8; 12];
+    if bcm_csprng_fill(nonce.as_mut_ptr(), 12) != 0 {
+        return None;
+    }
+    out[..12].copy_from_slice(&nonce);
+    out[12..12 + n].copy_from_slice(input);
+    let tag = chacha20_poly1305_encrypt(&key, &nonce, aad, &mut out[12..12 + n]);
+    out[12 + n..12 + n + 16].copy_from_slice(&tag);
+    Some(12 + n + 16)
+}
+
+/// `HalOps::unseal`: the inverse; `None` on any failure, a wrong `aad` among
+/// them, with nothing of a failed open left in `out`.
+fn bcm_unseal(aad: &[u8], input: &[u8], out: &mut [u8]) -> Option<usize> {
+    use fluxor::kernel::security::crypto::chacha20::chacha20_poly1305_decrypt;
+    let key = bcm_seal_key()?;
+    if input.len() < 28 {
+        return None;
+    }
+    let n = input.len() - 28;
+    if out.len() < n {
+        return None;
+    }
+    let mut nonce = [0u8; 12];
+    nonce.copy_from_slice(&input[..12]);
+    let mut tag = [0u8; 16];
+    tag.copy_from_slice(&input[12 + n..]);
+    out[..n].copy_from_slice(&input[12..12 + n]);
+    if chacha20_poly1305_decrypt(&key, &nonce, aad, &mut out[..n], &tag) {
+        Some(n)
+    } else {
+        out[..n].fill(0);
+        None
+    }
+}
+
+/// `HalOps::seal_blob_store`: this node has a durable store for sealed blobs
+/// when its graph holds a backing provider (the `nvme` module). That is
+/// known from the graph before the medium is up, so a key is never
+/// generated over one the store already holds just because it was asked
+/// for early.
+fn bcm_seal_blob_store() -> bool {
+    fluxor::kernel::exec::scheduler::graph_holds_permission(
+        fluxor::kernel::module::syscalls::permission::BACKING_PROVIDER,
+    )
+}
+
 static BCM2712_HAL_OPS: HalOps = HalOps {
-    // No durable home for a sealed blob on this platform yet, and saying so
-    // is the point: the vault keeps its in-RAM entry and behaves exactly as
-    // before. A platform gains cold-restart persistence by implementing
-    // these two and loses nothing by not.
-    seal_blob_write: |_, _| false,
-    seal_blob_store: || false,
-    seal_blob_delete: |_| true,
-    seal_blob_read: |_, _| None,
+    // The vault's durable store: the NVMe's reserved backing pages, A/B
+    // slots (`vault_store`). Readable once the backing provider is up; until
+    // then the vault answers a labelled open EAGAIN.
+    seal_blob_write: vault_store::write,
+    seal_blob_store: bcm_seal_blob_store,
+    seal_blob_delete: vault_store::delete,
+    seal_blob_read: vault_store::read,
+    seal_blob_ready: vault_store::ready,
     disable_interrupts: bcm_disable_interrupts,
     restore_interrupts: bcm_restore_interrupts,
     wake_scheduler: bcm_wake_scheduler,
@@ -3168,18 +3270,14 @@ static BCM2712_HAL_OPS: HalOps = HalOps {
     // cannot tell, which is a different fact from an unsynchronised clock.
     now_unix_millis: || fluxor::kernel::sys::time_sync::unix_millis(bcm_now_micros()),
     clock_sync_status: || fluxor::kernel::sys::time_sync::status(bcm_now_micros()),
-    // No sealing on this platform yet.
-    //
-    // `None` rather than a host-readable stand-in: a sealing key stored in
-    // flash beside the blob it seals protects nothing and would still read
-    // as `HostReadable`, which is a stronger claim than the truth. bcm2712
-    // has OTP fuses that could back `DeviceUnique` — claiming it requires
-    // actually deriving from them, and a provenance that overstates itself
-    // raises a vault's isolation tier and with it what a deployment
-    // believes about keys it has not protected.
+    // Sealing derives from the OTP's device key and nothing else: a sealing
+    // key stored beside the blob it seals protects nothing and would still
+    // read as `HostReadable`, a stronger claim than the truth. A board whose
+    // OTP holds no device key cannot seal (`None`), and its vault keeps keys
+    // in RAM only: the honest outcome, not a weaker stand-in.
     seal_provenance: bcm_seal_provenance,
-    seal: |_, _, _| None,
-    unseal: |_, _, _| None,
+    seal: bcm_seal,
+    unseal: bcm_unseal,
     now_micros: bcm_now_micros,
     tick_count: bcm_tick_count,
     flash_base: bcm_flash_base,

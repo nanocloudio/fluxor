@@ -34,6 +34,7 @@ use super::{
     SCHED,
 };
 use crate::kernel::boot::config::ModuleEntry;
+use crate::kernel::module::loader::ModuleLoader;
 use crate::kernel::workload::owner::{OwnerHandle, OwnerState, OWNER_SYSTEM};
 
 /// Largest subgraph one `apply_add` admits. Bounded, stack-only working set.
@@ -490,7 +491,11 @@ pub fn apply_add(
         let loader = unsafe { super::static_loader() };
         for (local, m) in sub.modules.iter().enumerate().take(n) {
             if let ModuleSource::Pic(entry) = &m.source {
-                super::collect_one_module_hints(loader, entry, local_to_global[local]);
+                super::collect_one_module_hints(
+                    resolving_loader(entry.name_hash, loader),
+                    entry,
+                    local_to_global[local],
+                );
             }
         }
     }
@@ -718,7 +723,7 @@ pub fn apply_add(
 fn instantiate_pic(slot: usize, entry: &ModuleEntry) -> Result<(), AddError> {
     // SAFETY: scheduler-thread graph-mutation context; mirrors the Linux boot
     // instantiation path (disjoint sub-borrows of SCHED passed in).
-    let loader = unsafe { super::static_loader() };
+    let loader = resolving_loader(entry.name_hash, unsafe { super::static_loader() });
     let s = sched();
     match super::instantiate_one_module(
         loader,
@@ -1101,6 +1106,12 @@ pub fn free_owner(handle: OwnerHandle) -> Result<(), FreeError> {
 
     // 5. Revoke the handle. The generation guard now rejects it.
     sched().owners.free(handle);
+    // The owner's own modules' code, when it brought a pack: nothing of the
+    // owner runs any more (its modules are unspliced, their handles and
+    // provider layers released), and a module whose state is quarantined
+    // for a lend keeps only that state.
+    #[cfg(feature = "multitenant")]
+    crate::kernel::workload::code_pack::release_owner(handle.slot);
     // Drop the freed owner from the resident-graph index. A later slot reuse
     // bumps the generation, so its §7 pacer instance resets (§7.1) and the
     // re-added entry is re-primed.
@@ -1313,6 +1324,50 @@ pub fn caller_edges(blob: &[u8], out: &mut [CallerEdge]) -> Option<usize> {
         }
     }
     Some(n)
+}
+
+/// The loader a staged module named `name_hash` resolves from: a
+/// workload's own pack while its CREATE stages it (`code_pack`), else the
+/// node's.
+fn resolving_loader(name_hash: u32, node: &ModuleLoader) -> &ModuleLoader {
+    #[cfg(feature = "multitenant")]
+    {
+        crate::kernel::workload::code_pack::resolve(name_hash, node)
+    }
+    #[cfg(not(feature = "multitenant"))]
+    {
+        let _ = name_hash;
+        node
+    }
+}
+
+/// The union of the manifest permissions of the modules an `AddSubgraph`
+/// blob names, each resolved by `name_hash` against the node's loader; a
+/// name the loader cannot resolve adds nothing (the add itself refuses it).
+/// `None` for a malformed blob. Read before the add, so a policy on what a
+/// subgraph may hold is decided before anything is allocated.
+pub fn module_permissions(blob: &[u8]) -> Option<u16> {
+    let mut c = Cur::new(blob);
+    if c.u32()? != ADD_MAGIC || c.u16()? != ADD_VERSION {
+        return None;
+    }
+    c.u16()?;
+    c.take(16 + 4 + 4)?;
+    let mc = c.u8()? as usize;
+    c.u8()?;
+    // SAFETY: scheduler-thread context, as every caller of the add.
+    let loader = unsafe { super::static_loader() };
+    let mut perms = 0u16;
+    for _ in 0..mc {
+        let name_hash = c.u32()?;
+        c.u8()?;
+        let plen = c.u16()? as usize;
+        c.take(plen)?;
+        if let Ok(m) = resolving_loader(name_hash, loader).find_by_name_hash(name_hash) {
+            perms |= m.manifest_permissions();
+        }
+    }
+    Some(perms)
 }
 
 /// Decode a bounded binary `AddSubgraph` and apply it. On success writes the

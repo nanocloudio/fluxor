@@ -408,6 +408,91 @@ pub fn cmd_device_artifact_publish(
     Ok(())
 }
 
+/// `fluxor publish workload <dir>`: the workload image `--emit=workload`
+/// wrote, as an OCI artifact in the local store.
+pub fn cmd_workload_image_publish(
+    dir: &Path,
+    tag: Option<&str>,
+    store_dir: Option<&Path>,
+) -> Result<()> {
+    let read = |p: &Path| fs::read(p).map_err(|e| Error::Config(format!("{}: {e}", p.display())));
+    let doc: serde_json::Value = serde_json::from_slice(&read(&dir.join("workload-image.json"))?)
+        .map_err(|e| Error::Config(format!("workload-image.json: {e}")))?;
+    let field = |k: &str| -> Result<String> {
+        match doc.get(k).and_then(|v| v.as_str()) {
+            Some(v) if !v.is_empty() => Ok(v.to_string()),
+            _ => Err(Error::Config(format!("workload-image.json: no `{k}`"))),
+        }
+    };
+    let name = field("name")?;
+    let target = field("target")?;
+    let module_abi = field("module_abi")?;
+    let abi_surface = field("abi_surface")?;
+    let flxa = read(&dir.join("graph.flxa"))?;
+    // Every module the image lists, read back and checked against the
+    // digest the image recorded for it: the layer digest is the pin a node
+    // admits the module by, so a module that changed since the image was
+    // written must not be published under it.
+    let listed = doc
+        .get("modules")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if listed.is_empty() {
+        return Err(Error::Config("workload-image.json lists no modules".into()));
+    }
+    let mut modules = Vec::with_capacity(listed.len());
+    for m in &listed {
+        let mname = m.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let hash = m.get("name_hash").and_then(|v| v.as_u64());
+        let sha = m.get("sha256").and_then(|v| v.as_str());
+        let (Some(hash), Some(sha), false) = (hash, sha, mname.is_empty()) else {
+            return Err(Error::Config(format!(
+                "workload-image.json: a module entry lacks name, name_hash or sha256: {m}"
+            )));
+        };
+        let name_hash = u32::try_from(hash).map_err(|_| {
+            Error::Config(format!(
+                "workload-image.json: {mname}: name_hash {hash} is not a u32"
+            ))
+        })?;
+        let bytes = read(&dir.join("modules").join(format!("{mname}.fmod")))?;
+        let actual = sha256_hex_prefixed(&bytes);
+        if actual.trim_start_matches("sha256:") != sha {
+            return Err(Error::Config(format!(
+                "{mname}.fmod is not the module the image recorded (sha256 {sha}, the file is {actual}); rebuild the image"
+            )));
+        }
+        modules.push(oci_store::WorkloadModule {
+            name: mname.to_string(),
+            name_hash,
+            bytes,
+        });
+    }
+    let ref_name = tag
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{name}:latest"));
+    let store = open_store(store_dir)?;
+    let source_rev = git_source_rev(&resolve_project_root(None));
+    let desc = oci_store::publish_workload_image(
+        &store,
+        &oci_store::WorkloadImagePublish {
+            name: &name,
+            target: &target,
+            module_abi: &module_abi,
+            abi_surface_hex: &abi_surface,
+            flxa: &flxa,
+            modules: &modules,
+            provenance: PROVENANCE_LOCAL,
+            source_rev: source_rev.as_deref(),
+            ref_name: &ref_name,
+        },
+    )
+    .map_err(|e| Error::Config(e.to_string()))?;
+    println!("{ref_name} -> {}", desc.digest);
+    Ok(())
+}
+
 // ── fluxor store ls|inspect|rm ────────────────────────────────────────
 
 pub fn dispatch_store(args: StoreArgs) -> Result<()> {

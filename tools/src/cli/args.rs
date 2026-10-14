@@ -656,6 +656,23 @@ enum PublishAction {
         #[arg(long)]
         published: bool,
     },
+    /// Publish a workload image (`fluxor build <graph> --emit=workload -o
+    /// <dir>`): a workload that brings its own modules, as a node pulls it.
+    /// One layer per `.fmod`, so a module's layer digest is the sha256 pin
+    /// the kernel admits it by, plus the FLXA subgraph; target, module ABI
+    /// and ABI-surface pin are annotations for pre-fetch admission.
+    /// `fluxor store push` serves it onward.
+    Workload {
+        /// The workload image directory.
+        dir: PathBuf,
+        /// Tag (default: `<name>:latest`, the name from workload-image.json).
+        #[arg(long)]
+        tag: Option<String>,
+        /// Store directory (default: $XDG_DATA_HOME/fluxor/store,
+        /// override with $FLUXOR_STORE).
+        #[arg(long)]
+        store: Option<PathBuf>,
+    },
 }
 
 /// Offline GPU program packs (`modules/sdk/cores/gpu_pack.rs`).

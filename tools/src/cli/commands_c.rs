@@ -2284,8 +2284,12 @@ fn cmd_build_dispatch(path: Option<&PathBuf>, flags: BuildFlags, verbose: bool) 
             let output = require_output("table")?;
             cmd_mktable_config(path, flags.module_root.as_deref(), &output)
         }
+        Some("workload") => {
+            let output = require_output("workload")?;
+            cmd_workload_image(path, &output, flags.module_root.as_deref(), verbose)
+        }
         Some(other) => Err(Error::Config(format!(
-            "unknown --emit form '{other}' (expected uf2|bin|combined|image|table)"
+            "unknown --emit form '{other}' (expected uf2|bin|combined|image|table|workload)"
         ))),
     }
 }

@@ -518,6 +518,7 @@ static RP_HAL_OPS: HalOps = HalOps {
     seal_blob_store: || false,
     seal_blob_delete: |_| true,
     seal_blob_read: |_, _| None,
+    seal_blob_ready: || true,
     disable_interrupts: rp_disable_interrupts,
     restore_interrupts: rp_restore_interrupts,
     wake_scheduler: rp_wake_scheduler,

@@ -658,6 +658,13 @@ struct NvmeState {
     /// on a full `blk_out` channel.
     tlm: TlmCounters,
     tlm_scratch: [u8; TLM_LINE_BUF_SIZE],
+    /// Who holds the I/O queue: 0 nobody, 1 this module's step, 2 a backing
+    /// dispatch (the kernel pager, the key vault's store). The two run on
+    /// whichever cores call them, and both drive one SQ/CQ pair; a dispatch
+    /// arriving while the step holds it answers `E_AGAIN` (the kernel's
+    /// patient dispatch waits it out), and a step arriving while a dispatch
+    /// holds it yields. Accessed as an `AtomicU8`.
+    io_owner: u8,
 }
 
 const RESCAN_INTERVAL_MS: u64 = 5_000;
@@ -3069,6 +3076,20 @@ unsafe extern "C" fn nvme_blocks_ioctl_handler(state: *mut c_void, cmd: u32, arg
     if arg.is_null() {
         return E_INVAL;
     }
+    // Every command but CAPS drives the I/O queue, from the consumer's
+    // core: it holds the queue as a dispatch does (see `io_owner`).
+    if cmd == blk::ioctl::CAPS {
+        return blocks_ioctl_body(s, cmd, arg);
+    }
+    if !io_claim(s, IO_DISPATCH) {
+        return E_AGAIN;
+    }
+    let rc = blocks_ioctl_body(&mut *(state as *mut NvmeState), cmd, arg);
+    io_release(&mut *(state as *mut NvmeState));
+    rc
+}
+
+unsafe fn blocks_ioctl_body(s: &mut NvmeState, cmd: u32, arg: *mut u8) -> i32 {
     match cmd {
         blk::ioctl::CAPS => {
             let Some(c) = v1_caps_of(s) else {
@@ -4632,6 +4653,16 @@ pub unsafe extern "C" fn backing_provider_dispatch(
         return E_INVAL;
     }
     let s = &mut *(state as *mut NvmeState);
+    if !io_claim(s, IO_DISPATCH) {
+        return E_AGAIN; // the step holds the queue; the caller waits it out
+    }
+    let rc = dispatch_body(state, opcode, arg, arg_len);
+    io_release(&mut *(state as *mut NvmeState));
+    rc
+}
+
+unsafe fn dispatch_body(state: *mut u8, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
+    let s = &mut *(state as *mut NvmeState);
 
     if opcode == PAGER_OP_FLUSH {
         return device_flush(s);
@@ -4928,6 +4959,40 @@ pub extern "C" fn module_new(
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_step"]
 pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
+    let s = &mut *(state as *mut NvmeState);
+    if !io_claim(s, IO_STEP) {
+        return 0; // a dispatch holds the queue; next step
+    }
+    let rc = step_body(state);
+    io_release(&mut *(state as *mut NvmeState));
+    rc
+}
+
+const IO_STEP: u8 = 1;
+const IO_DISPATCH: u8 = 2;
+
+unsafe fn io_owner(s: &mut NvmeState) -> &core::sync::atomic::AtomicU8 {
+    // SAFETY: AtomicU8 has u8's size and alignment; the field is only ever
+    // accessed through this view.
+    &*(core::ptr::addr_of_mut!(s.io_owner) as *const core::sync::atomic::AtomicU8)
+}
+
+unsafe fn io_claim(s: &mut NvmeState, who: u8) -> bool {
+    io_owner(s)
+        .compare_exchange(
+            0,
+            who,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+}
+
+unsafe fn io_release(s: &mut NvmeState) {
+    io_owner(s).store(0, core::sync::atomic::Ordering::Release);
+}
+
+unsafe fn step_body(state: *mut c_void) -> i32 {
     let s = &mut *(state as *mut NvmeState);
 
     s.step_count = s.step_count.wrapping_add(1);

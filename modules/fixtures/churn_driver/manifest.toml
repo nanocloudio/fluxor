@@ -27,6 +27,13 @@ permissions = ["platform_raw"]
 #           cf= exh=<1 if exhausted> f1=<WAIT state, mode error> f0=<WAIT state,
 #           mode infinite_loop> (0xFF = not reached; 2 = SIGNALLED)
 
+# Pack mode (`pack_hex`, `pin_hex`): every churn workload brings its modules
+# with it (SOURCE_FMOD_PACK) — `pack_hex` an FXMT module table holding
+# churn_probe, `pin_hex` the SHA-256 of churn_probe's .fmod bytes — so the
+# node's image need not hold churn_probe at all (leave it out of
+# `workload_modules:`). Every cycle then stages the pack as the workload's own
+# code, runs it, and frees it with the workload.
+
 timer_class = "wall_clock"
 
 [[resources]]

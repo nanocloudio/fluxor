@@ -224,13 +224,13 @@ boot2_src = "0x400e0000"
 # never estimated: a networked graph fits RP2040's 64 KiB arena, which an
 # estimate overstated by half.
 #
-#   cyw43   5,616      wifi      784      ip  59,400   → 65,800  (64.3 KiB)
-#   tls   126,368  (one session)
+#   cyw43   5,632      wifi      832      ip  42,176   → 48,640  (47.5 KiB)
+#   tls   133,632  (one session)
 #
-# So the arena has to clear ~188 KiB for the wireless-plus-tls graph, not
-# ~229 KiB. The slack is real but it is not spare: `ip`'s 59,400 is dominated
-# by a 16-entry TCP table at ~2.2 KiB per connection, which is what a
-# per-silicon profile should be cutting on the small parts.
+# in the arena's 64-byte units. So the arena has to clear ~178 KiB for the
+# wireless-plus-tls graph. The slack is real but it is not spare: `ip` is
+# dominated by its 8-slot TCP table at ~2.2 KiB per connection, which is what
+# a per-silicon profile should be cutting on the small parts.
 #
 # Their sum is what the die can spare, so the two move against each other;
 # `ram_static_max_kb` below binds the sum, not either half.

@@ -101,3 +101,25 @@ pub fn dispatch(opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
         }
     }
 }
+
+/// How long [`dispatch_patient`] asks again while the provider is busy.
+pub const PATIENT_MS: u64 = 100;
+
+/// [`dispatch`], asking again for up to [`PATIENT_MS`] while the provider
+/// answers `EAGAIN`. A provider whose own step is running on another core
+/// answers `EAGAIN` rather than racing it on one queue; the step ends in
+/// microseconds, so a page fault or a vault write waits it out instead of
+/// failing. A provider not up yet still answers `EAGAIN` once the time is
+/// spent.
+pub fn dispatch_patient(opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
+    let start = crate::kernel::sys::hal::now_millis();
+    loop {
+        let rc = dispatch(opcode, arg, arg_len);
+        if rc != crate::kernel::sys::errno::EAGAIN
+            || crate::kernel::sys::hal::now_millis().saturating_sub(start) >= PATIENT_MS
+        {
+            return rc;
+        }
+        core::hint::spin_loop();
+    }
+}

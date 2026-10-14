@@ -98,6 +98,7 @@ include!("dtls_state.rs");
 include!("../../sdk/cores/session_handoff.rs");
 // Transport continuity: CT_TLS codec, shadow lifecycle, emission horizons.
 include!("continuity.rs");
+include!("identity.rs");
 
 // ============================================================================
 // Module constants
@@ -129,6 +130,7 @@ include!("continuity.rs");
 // concurrent TLS connections, and an accept it cannot seat is closed before
 // http ever sees it.
 use abi::config::tls::MAX_SESSIONS;
+use abi::contracts::key_vault as kv;
 
 // ── Tier B session storage ────────────
 //
@@ -1023,6 +1025,14 @@ struct TlsState {
     /// vault and falls back to the in-module `key` on ENOSYS.
     key_vault_handle: i32,
 
+    /// The identity named by `identity_label` (identity.rs): its key in the
+    /// vault, its certificate from `identity_cert`. Inert without a label.
+    label_id: LabelIdentity,
+    /// in[3]: the certificate chain for a label identity.
+    identity_cert_in: i32,
+    /// out[4]: the label identity's certificate requests.
+    identity_req_out: i32,
+
     // Sessions — Tier B chunked pool (see `SessionArena`).
     sessions: SessionArena,
 
@@ -1323,6 +1333,13 @@ define_params! {
     // length-high byte, and this parameter emits neither.
     16, trust, str, 0
         => |_s, _d, _len| {};
+
+    // A server identity held in the key vault under this label, certified
+    // at runtime (identity.rs): the key is opened or generated there and
+    // never leaves it, and the certificate arrives on `identity_cert` in
+    // answer to `identity_req`. Replaces `cert_file` / `key_file`.
+    19, identity_label, str, 0
+        => |s, d, len| { s.label_id.set_label(core::slice::from_raw_parts(d, len)); };
 }
 
 // ============================================================================
@@ -1429,6 +1446,8 @@ pub unsafe extern "C" fn module_new(
     s.peer_identity = dev_channel_port(sys, 1, 2);
     s.cont_in = dev_channel_port(sys, 0, 2);
     s.cont_out = dev_channel_port(sys, 1, 3);
+    s.identity_cert_in = dev_channel_port(sys, 0, 3);
+    s.identity_req_out = dev_channel_port(sys, 1, 4);
     s.cont_vault_handle = -1;
     let mut i = 0;
     while i < MAX_TLS_SHADOWS {
@@ -1461,6 +1480,10 @@ pub unsafe extern "C" fn module_new(
     // at its first byte. An anchor the module could not take is refused the
     // same way: the instance was given a trust set, and it either holds all
     // of it or does not run.
+    if let Some(msg) = identity_admit(s) {
+        dev_log(sys, 1, msg.as_ptr(), msg.len());
+        return -1;
+    }
     if s.anchor_refused {
         let msg = b"[tls] refusing to construct: a trust anchor does not parse, exceeds MAX_CERT_LEN, or the bundle exceeds MAX_ANCHORS";
         dev_log(sys, 1, msg.as_ptr(), msg.len());
@@ -1535,12 +1558,10 @@ pub unsafe extern "C" fn module_new(
     }
 
     // Deposit the private scalar into the kernel KEY_VAULT so
-    // CertificateVerify signs via `KV_SIGN` and `s.key` can be
-    // wiped. Bypassed when `ecdh_bits_per_step < 256` — KV_SIGN
+    // CertificateVerify signs via `kv::SIGN` and `s.key` can be
+    // wiped. Bypassed when `ecdh_bits_per_step < 256` — kv::SIGN
     // runs to completion in one syscall, which would short-circuit
     // the in-module incremental signer the user opted into.
-    const KV_PROBE: u32 = 0x1000;
-    const KV_STORE: u32 = 0x1001;
     // An RSA identity always signs through the vault: the module carries no
     // in-module RSA signer, and the vault's is resumable. A target whose
     // vault does not hold RSA refuses the key here, which the composer
@@ -1548,7 +1569,7 @@ pub unsafe extern "C" fn module_new(
     s.identity_rsa_suite = 0;
     if s.key_len > 0 {
         if let Some(suite) = rsa_identity_suite(&s.key[..s.key_len]) {
-            let present = (sys.provider_call)(-1, KV_PROBE, core::ptr::null_mut(), 0);
+            let present = (sys.provider_call)(-1, kv::PROBE, core::ptr::null_mut(), 0);
             let mut handle = -1;
             if present == 1 {
                 // STORE v1: [suite:u16][usage_mask:u32][key_len:u32][key]
@@ -1562,7 +1583,7 @@ pub unsafe extern "C" fn module_new(
                 let n = pkcs1.len();
                 store_arg[6..10].copy_from_slice(&(n as u32).to_le_bytes());
                 store_arg[10..10 + n].copy_from_slice(pkcs1);
-                handle = (sys.provider_call)(-1, KV_STORE, store_arg.as_mut_ptr(), 10 + n);
+                handle = (sys.provider_call)(-1, kv::STORE, store_arg.as_mut_ptr(), 10 + n);
                 let mut j = 0;
                 while j < store_arg.len() {
                     core::ptr::write_volatile(&mut store_arg[j], 0);
@@ -1586,7 +1607,7 @@ pub unsafe extern "C" fn module_new(
     }
     let use_vault = s.ecdh_bits_per_step >= 256;
     if use_vault && s.key_len >= 32 && identity_is_p256(s) {
-        let present = (sys.provider_call)(-1, KV_PROBE, core::ptr::null_mut(), 0);
+        let present = (sys.provider_call)(-1, kv::PROBE, core::ptr::null_mut(), 0);
         if present == 1 {
             let mut raw = [0u8; 32];
             if s.key_len == 32 {
@@ -1608,7 +1629,7 @@ pub unsafe extern "C" fn module_new(
             store_arg[2..6].copy_from_slice(&USAGE_SIGN.to_le_bytes());
             store_arg[6..10].copy_from_slice(&32u32.to_le_bytes());
             core::ptr::copy_nonoverlapping(raw.as_ptr(), store_arg.as_mut_ptr().add(10), 32);
-            let h = (sys.provider_call)(-1, KV_STORE, store_arg.as_mut_ptr(), store_arg.len());
+            let h = (sys.provider_call)(-1, kv::STORE, store_arg.as_mut_ptr(), store_arg.len());
             if h >= 0 {
                 s.key_vault_handle = h;
                 // The vault holds the authoritative copy; wipe the
@@ -1804,6 +1825,7 @@ unsafe fn tcp_module_step(s: &mut TlsState) -> i32 {
     // first so quiet steps cost a single syscall per latched
     // session.
     service_pending_peer_identity(s);
+    let id_work = identity_step(s);
 
     // Hot-path telemetry snapshots. Taken after the DTLS early-return so
     // `tlm` describes the TCP record path only, and before any work so the
@@ -1814,7 +1836,7 @@ unsafe fn tcp_module_step(s: &mut TlsState) -> i32 {
     s.fwd_pre_step = s.frame_write_dropped;
 
     let sys = &*s.syscalls;
-    let mut did_work = false;
+    let mut did_work = id_work;
 
     // Keep the ephemeral ECDH pool warm: regenerate one consumed slot per
     // tick in the background so fresh accepts hit the pool (a memcpy) instead
@@ -4987,6 +5009,11 @@ unsafe fn pump_send_encrypted_extensions(s: &mut TlsState, idx: usize) -> bool {
 }
 
 unsafe fn pump_send_certificate(s: &mut TlsState, idx: usize) -> bool {
+    if !identity_presentable(s) {
+        identity_refuse_early(s);
+        s.sessions[idx].driver.hs_state = HandshakeState::Error;
+        return false;
+    }
     let cert_len = if s.cert_len <= MAX_CERT_CHAIN_BYTES {
         s.cert_len
     } else {
@@ -5050,7 +5077,6 @@ unsafe fn pump_send_certificate_verify(s: &mut TlsState, idx: usize) -> bool {
         // 64-byte raw signature directly and is responsible for its
         // own scheduler discipline — no resumable contract on the
         // vault side yet.
-        const KV_SIGN: u32 = 0x1003;
         if s.key_vault_handle >= 0 {
             // SIGN v1: [mode:u8][_pad:u8][input_len:u32][input]
             //          [sig_ptr:u64][sig_cap:u16][sig_len_out:u16]
@@ -5070,7 +5096,7 @@ unsafe fn pump_send_certificate_verify(s: &mut TlsState, idx: usize) -> bool {
             sign_arg[46..48].copy_from_slice(&64u16.to_le_bytes());
             let rc = (sys.provider_call)(
                 s.key_vault_handle,
-                KV_SIGN,
+                kv::SIGN,
                 sign_arg.as_mut_ptr(),
                 sign_arg.len(),
             );
@@ -5237,7 +5263,6 @@ unsafe fn pump_send_certificate_verify_rsa(s: &mut TlsState, idx: usize) -> bool
         s.sessions[idx].driver.hs_state = HandshakeState::Error;
         return true;
     }
-    const KV_SIGN: u32 = 0x1003;
     const SIGN_MODE_DIGEST: u8 = 1;
     let mut sig = [0u8; RSA_BYTES_MAX];
     let mut sign_arg = [0u8; 6 + 32 + 12];
@@ -5249,7 +5274,7 @@ unsafe fn pump_send_certificate_verify_rsa(s: &mut TlsState, idx: usize) -> bool
     sign_arg[46..48].copy_from_slice(&(RSA_BYTES_MAX as u16).to_le_bytes());
     let rc = (sys.provider_call)(
         s.key_vault_handle,
-        KV_SIGN,
+        kv::SIGN,
         sign_arg.as_mut_ptr(),
         sign_arg.len(),
     );
@@ -6876,6 +6901,21 @@ pub mod test_helpers {
     //! Host-side introspection for the harness. Not compiled into PIC firmware.
 
     use super::{find_session_by_conn_id, SessionState, TlsState};
+
+    /// The label identity: `(state, chains refused, handshakes refused
+    /// early, held chain length)`. State is identity.rs's `ID_*`.
+    ///
+    /// # Safety
+    /// `state` points to an initialised `TlsState`.
+    pub unsafe fn label_identity(state: *const u8) -> (u8, u32, u32, usize) {
+        let s = &*(state as *const TlsState);
+        (
+            s.label_id.state,
+            s.label_id.refused,
+            s.label_id.early,
+            s.cert_len,
+        )
+    }
 
     /// Whether the session's mirror was abandoned and the abort is still
     /// owed on `cont_out`.

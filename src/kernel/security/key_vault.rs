@@ -20,9 +20,7 @@
 //! isolates against a compromised *module*, not a compromised
 //! host/kernel.
 use crate::abi::contracts::key_vault as dev_key_vault;
-#[cfg(feature = "rsa-vault")]
-use crate::abi::errno::EAGAIN;
-use crate::abi::errno::{EACCES, EBUSY, EINVAL, ENOENT, ENOMEM, ENOSYS, ERANGE, ERROR};
+use crate::abi::errno::{EACCES, EAGAIN, EBUSY, EINVAL, ENOENT, ENOMEM, ENOSYS, ERANGE, ERROR};
 
 /// Read a little-endian `u64` from `p`.
 ///
@@ -501,6 +499,15 @@ fn blob_name(namespace: u32, label: &[u8], out: &mut [u8; MAX_BLOB_NAME]) -> usi
     4 + label.len()
 }
 
+/// The platform has a durable store and it cannot be read yet (its medium
+/// still coming up). Such a store is not an empty one: answered as empty, a
+/// labelled open would generate a fresh key over the one already stored,
+/// and a delete would leave the record to come back. Those paths answer
+/// `EAGAIN` until it reads.
+fn store_not_ready() -> bool {
+    crate::kernel::sys::hal::seal_blob_store() && !crate::kernel::sys::hal::seal_blob_ready()
+}
+
 /// Find a persisted entry by namespace and label: `Ok(None)` when no such
 /// key exists, `Err(ENOMEM)` when one does but the RAM table has no entry
 /// free to hold it. The two must not be confused: a caller that takes the
@@ -759,6 +766,9 @@ pub unsafe fn import_persisted(
     if usage == 0 || usage & !suite_usage(suite) != 0 || usage & dev_key_vault::usage::PERSIST == 0
     {
         return Err(EINVAL);
+    }
+    if store_not_ready() {
+        return Err(EAGAIN);
     }
     match persist_key(namespace, label, suite, usage, key) {
         Persist::Durable => Ok(()),
@@ -2486,6 +2496,13 @@ pub unsafe fn provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
                 }
             }
 
+            // A durable store that cannot be read yet is not an empty one:
+            // reading it as empty would generate a fresh key over one
+            // already stored (a node's CA, minted anew on every boot). The
+            // caller asks again once the medium is up.
+            if existing.is_none() && store_not_ready() {
+                return EAGAIN;
+            }
             let idx = match existing {
                 Some(i) => i,
                 None => match find_persisted(who.namespace, label) {
@@ -2595,6 +2612,11 @@ pub unsafe fn provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
                 *b = *arg.add(1 + j);
             }
             let label = &label[..label_len];
+            // The blob may be in a store that cannot be read yet: a delete
+            // answered there would leave it to come back once it can.
+            if store_not_ready() {
+                return EAGAIN;
+            }
             let mut found = false;
             // The live slot AND the sealed blob. Destroying only the handle
             // would free a slot and leave the blob, which comes back on the

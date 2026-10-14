@@ -1007,6 +1007,22 @@ fn build_workload_section(
     loc: schema::ModuleLocation<'_>,
     extra_module_dirs: &[&Path],
 ) -> Result<Vec<u8>> {
+    let workloads = build_workloads(config, loc, extra_module_dirs)?;
+    if workloads.is_empty() {
+        return Ok(Vec::new());
+    }
+    crate::add_subgraph::encode_workload_section(&workloads).map_err(Error::Config)
+}
+
+/// The graph's `workloads:` section, each as the subgraph the kernel admits
+/// (`add_subgraph::Workload`): modules by name_hash with their params, and
+/// the edges between them. Empty when the graph declares none. The resident
+/// workload section and a workload image (`--emit=workload`) encode these.
+pub fn build_workloads(
+    config: &Value,
+    loc: schema::ModuleLocation<'_>,
+    extra_module_dirs: &[&Path],
+) -> Result<Vec<crate::add_subgraph::Workload>> {
     let Some(workloads_yaml) = config.get("workloads").and_then(|p| p.as_array()) else {
         return Ok(Vec::new());
     };
@@ -1212,7 +1228,7 @@ fn build_workload_section(
             idle_safe,
         });
     }
-    crate::add_subgraph::encode_workload_section(&workloads).map_err(Error::Config)
+    Ok(workloads)
 }
 
 /// Assign buffer group IDs for aliasable edge chains.

@@ -280,7 +280,7 @@ cannot be evaluated from its own file reads `—` and says why.
 
 | Cap | Symbol | Source | Value | Reason |
 |---|---|---|---|---|
-| Channel buffer arena | `BUFFER_ARENA_SIZE` | modules/sdk/abi/config.rs | 8388608 | Sized: the largest host graph's channels at 16–64 KiB each under gigabit-class load; the wasm arena is paged lazily by `memory.grow` so it costs nothing until used. 64 KiB on embedded, where the whole envelope is different. Exhaustion refuses the channel open at compose time, never at runtime |
+| Channel buffer arena | `BUFFER_ARENA_SIZE` | modules/sdk/abi/config.rs | 16777216 | Sized (host): a node's own graph (the bare-metal control plane holds ~8 MiB of channels) plus the workload subgraphs it hosts, at 16–128 KiB per channel; 8 MiB on wasm; the wasm arena is paged lazily by `memory.grow` so it costs nothing until used. 64 KiB on embedded, where the whole envelope is different. Exhaustion refuses the channel open at compose time, never at runtime |
 | Tier B elastic region | `ELASTIC_REGION_SIZE` | modules/sdk/abi/config.rs | 16777216 | Policy: the oversubscribable region every elastic pool draws 64 KiB-quantum chunks from; 128 chunks on the host, which is the same depth as the kernel's chunk table. Zero on MCU-class targets, where `ELASTIC_ALLOC` denies and elasticity compiles out 2 MiB on wasm. |
 | Config arena | `CONFIG_ARENA_SIZE` | modules/sdk/abi/config.rs | 262144 | Sized against the largest per-module params section (~95 KiB for an http module on the host) with headroom for the rest of the graph. A packed config larger than this is refused at boot 32 KiB on wasm, 16 KiB on embedded. |
 | One module's params section | `MAX_MODULE_CONFIG_SIZE` | modules/sdk/abi/config.rs | 262144 | Sanity bound on one module's slice of the config arena; kept in lockstep with the kernel's `MAX_MODULE_SECTION` and the CLI's params cap so the three refuse the same blob. 16 KiB on wasm; on the RP parts 16 KiB (rp2350) and 8 KiB (rp2040), taken from `[kernel] config_buffer_kb` in the silicon TOML, which the RP kernels generate their own copy from — the two must state the same size |
@@ -597,7 +597,7 @@ MAX_STREAM_IDS | modules/foundation/smmu/mod.rs | 8 | *
 CKPT_SNI_MAX | modules/foundation/tls/continuity.rs | 64 | *
 CKPT_ALPN_MAX | modules/foundation/tls/continuity.rs | 16 | *
 CONT_DRAIN_BUDGET | modules/foundation/tls/continuity.rs | 8 | *
-BUFFER_ARENA_SIZE | modules/sdk/abi/config.rs | 8 * 1024 * 1024 | host
+BUFFER_ARENA_SIZE | modules/sdk/abi/config.rs | 16 * 1024 * 1024 | host
 BUFFER_ARENA_SIZE | modules/sdk/abi/config.rs | 8 * 1024 * 1024 | wasm
 BUFFER_ARENA_SIZE | modules/sdk/abi/config.rs | 64 * 1024 | embedded+rp2350
 BUFFER_ARENA_SIZE | modules/sdk/abi/config.rs | 16 * 1024 | embedded+rp2040

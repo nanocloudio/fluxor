@@ -205,6 +205,7 @@ pub static WASM_HAL_OPS: HalOps = HalOps {
     seal_blob_store: || false,
     seal_blob_delete: |_| true,
     seal_blob_read: |_, _| None,
+    seal_blob_ready: || true,
     disable_interrupts: wasm_disable_interrupts,
     restore_interrupts: wasm_restore_interrupts,
     wake_scheduler: wasm_wake_scheduler,

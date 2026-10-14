@@ -37,6 +37,7 @@ use crate::kernel::exec::step_guard::fault_type;
 use crate::kernel::ipc::channel::channel_write;
 use crate::kernel::ipc::fd::{slot_of, tag_fd, FD_TAG_WORKLOAD};
 use crate::kernel::sys::errno;
+use crate::kernel::workload::code_pack;
 use crate::kernel::workload::owner::{OwnerHandle, MAX_OWNERS, OWNER_SYSTEM};
 use crate::kernel::workload::owner_plan::{lease_gate, LeaseGate};
 
@@ -335,7 +336,7 @@ unsafe fn workload_create(arg: *mut u8, arg_len: usize) -> i32 {
     //    fail-closed: this backend realizes only what CAPS advertises.
     // Backend selection is by source kind: only the fmod-graph source resolves
     // to the metal backend (a bundle → the Linux host-process backend).
-    if source_kind != wl::SOURCE_FMOD_GRAPH {
+    if source_kind != wl::SOURCE_FMOD_GRAPH && source_kind != wl::SOURCE_FMOD_PACK {
         return errno::ENOSYS;
     }
     // Only POSTURE_SHARED is realized; ISOLATED/HARDENED need EL0 wiring.
@@ -370,8 +371,100 @@ unsafe fn workload_create(arg: *mut u8, arg_len: usize) -> i32 {
         }
     }
 
-    if source_ref_len < FLXA_MIN_LEN {
+    // Where the FLXA subgraph lies in the source section: all of it for a
+    // graph; past the pack reference and its pins for a pack.
+    let (flxa_off, flxa_len, pack) = if source_kind == wl::SOURCE_FMOD_PACK {
+        use wl::pack_ref;
+        if source_ref_len < pack_ref::SIZE {
+            return errno::EINVAL;
+        }
+        let r = &buf[src_start..src_start + pack_ref::SIZE];
+        let ptr = u64::from_le_bytes([r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]]) as usize;
+        let len = rd_u32(r, pack_ref::LEN) as usize;
+        let pins = rd_u16(r, pack_ref::PIN_COUNT) as usize;
+        let head = pack_ref::SIZE + pins * pack_ref::PIN_SIZE;
+        if ptr == 0 || len == 0 || source_ref_len < head {
+            return errno::EINVAL;
+        }
+        (
+            src_start + head,
+            source_ref_len - head,
+            Some((ptr, len, pins)),
+        )
+    } else {
+        (src_start, source_ref_len, None)
+    };
+    if flxa_len < FLXA_MIN_LEN {
         return errno::EINVAL; // not a well-formed FLXA subgraph
+    }
+
+    // ── Who the workload is, and what it may hold.
+    //
+    // The identity is what the owner is allocated by, and what an owner's
+    // resources key on (storage scoped by `mount`, a volume's grant). The
+    // null identity names no one — every workload created with it would be
+    // the same owner to anything keyed on it — so it is refused.
+    if buf[..16].iter().all(|&b| b == 0) {
+        return errno::EINVAL;
+    }
+
+    // ── A pack: the workload's own modules, staged as its code. Each must be
+    //    the module asked for — its bytes match a pin — or one the node's
+    //    signing root signed; then the region is made executable, and the
+    //    subgraph's names resolve in it first (until the add is decided).
+    let staged = match pack {
+        Some((ptr, len, pins)) => {
+            let bytes = core::slice::from_raw_parts(ptr as *const u8, len);
+            let staged = match code_pack::stage(bytes) {
+                Ok(s) => s,
+                Err(e) => return e,
+            };
+            let pin_bytes = &buf[src_start + wl::pack_ref::SIZE
+                ..src_start + wl::pack_ref::SIZE + pins * wl::pack_ref::PIN_SIZE];
+            let mut ok = true;
+            let ldr = code_pack::loader(staged);
+            code_pack::for_each_module(staged, |hash, fmod| {
+                let pinned = |p: &[u8; 32]| -> bool { pin_matches(pin_bytes, p) };
+                let module = ldr.find_by_name_hash(hash);
+                ok &= match module {
+                    Ok(m) => code_pack::admitted_with(fmod, &m, pinned),
+                    Err(_) => false,
+                };
+            });
+            if !ok {
+                code_pack::release(staged);
+                return errno::EACCES;
+            }
+            if !code_pack::seal(staged) {
+                code_pack::release(staged);
+                return errno::EFAULT;
+            }
+            code_pack::begin_staging(staged);
+            Some(staged)
+        }
+        None => None,
+    };
+    // Every return from here to the add's verdict releases what was staged.
+    let unstage = |staged: Option<code_pack::Staged>| {
+        code_pack::end_staging();
+        if let Some(s) = staged {
+            code_pack::release(s);
+        }
+    };
+    // A workload is a tenant of the node, not part of it: none of its
+    // modules may hold a node privilege. `platform_raw` reads any register
+    // (the seal key's OTP rows among them), `dma` and `pcie_device` reach
+    // memory behind the kernel, `reconfigure`/`monitor`/`bridge`/`flash_raw`/
+    // `backing_provider`/`usb_host` act on the node itself. Only `observe` —
+    // a read-only telemetry drain — is admitted. Checked before any owner is
+    // allocated, against the modules the node would instantiate.
+    let Some(perms) = live::module_permissions(&buf[flxa_off..flxa_off + flxa_len]) else {
+        unstage(staged);
+        return errno::EINVAL;
+    };
+    if perms & !crate::kernel::module::syscalls::permission::OBSERVE != 0 {
+        unstage(staged);
+        return errno::EACCES;
     }
 
     // ── Bridge the durable workload identity into the FLXA blob so `apply_add`'s
@@ -379,14 +472,14 @@ unsafe fn workload_create(arg: *mut u8, arg_len: usize) -> i32 {
     //    and clamp the FLXA caps to the envelope memory ceiling (caps, never a
     //    new meter). Both edits are in place within
     //    the `source_ref` region, which we validated is >= FLXA_MIN_LEN long.
-    buf.copy_within(0..16, src_start + FLXA_OWNER_UID_OFF);
+    buf.copy_within(0..16, flxa_off + FLXA_OWNER_UID_OFF);
     let mem_ceil = if memory_bytes == 0 {
         None
     } else {
         Some(memory_bytes.min(u32::MAX as u64) as u32)
     };
-    clamp_cap_be(buf, src_start + FLXA_STATE_CAP_OFF, mem_ceil);
-    clamp_cap_be(buf, src_start + FLXA_BUFFER_CAP_OFF, mem_ceil);
+    clamp_cap_be(buf, flxa_off + FLXA_STATE_CAP_OFF, mem_ceil);
+    clamp_cap_be(buf, flxa_off + FLXA_BUFFER_CAP_OFF, mem_ceil);
 
     // ── Stage the subgraph. `apply_add_encoded` decodes the FLXA blob (PIC
     //    modules, edges, caps), allocates the owner, instantiates + splices —
@@ -407,7 +500,8 @@ unsafe fn workload_create(arg: *mut u8, arg_len: usize) -> i32 {
     //    with a sentinel present fails `ENOMEM` before anything is allocated.
     //    A host-shared workload carries no sentinel and takes the plain path,
     //    byte-identical.
-    let src_ptr = arg.add(src_start);
+    let src_ptr = arg.add(flxa_off);
+    let source_ref_len = flxa_len;
     // The creator's own lanes (FLXA `Caller` edges) are found before the add,
     // which overwrites the blob's head; each lands at the edge count before
     // the add plus its position.
@@ -416,6 +510,7 @@ unsafe fn workload_create(arg: *mut u8, arg_len: usize) -> i32 {
         core::slice::from_raw_parts(src_ptr, source_ref_len),
         &mut caller_edges,
     ) else {
+        unstage(staged);
         return errno::EINVAL;
     };
     let edge_base = scheduler::sched_mut().edge_count;
@@ -428,6 +523,7 @@ unsafe fn workload_create(arg: *mut u8, arg_len: usize) -> i32 {
     };
     live::set_caller(None);
     if rc != 0 {
+        unstage(staged);
         return rc; // negative AddError::code, -ENOMEM (no spare lane), or -EINVAL
     }
     let hb = core::slice::from_raw_parts(src_ptr, 6);
@@ -435,6 +531,12 @@ unsafe fn workload_create(arg: *mut u8, arg_len: usize) -> i32 {
         slot: u16::from_le_bytes([hb[0], hb[1]]),
         generation: u32::from_le_bytes([hb[2], hb[3], hb[4], hb[5]]),
     };
+    // The pack is the owner's now: freed with it (`live::free_owner`), so
+    // every later failure's `free_owner` takes the code too.
+    code_pack::end_staging();
+    if let Some(s) = staged {
+        code_pack::bind(s, owner.slot);
+    }
 
     // ── Lease-gate each declared endpoint against the owner's retained plan
     //    (as `linux/workload.rs` does). A refusal fails CREATE
@@ -598,8 +700,15 @@ unsafe fn workload_caps(arg: *mut u8, arg_len: usize) -> i32 {
     let out = core::slice::from_raw_parts_mut(arg, arg_len);
     // Postures: SHARED only. ISOLATED/HARDENED need EL0-per-workload.
     out[0] = wl::caps::POSTURE_SHARED;
-    // Source kinds: fmod-graph (metal has no rootfs bundle transport).
-    out[1] = wl::caps::SOURCE_FMOD_GRAPH;
+    // Source kinds: an fmod graph, and a graph bringing its own modules where
+    // the node has code space for packs. Never a host bundle: metal has no
+    // rootfs to unpack one into.
+    out[1] = wl::caps::SOURCE_FMOD_GRAPH
+        | if code_pack::POOL_SIZE > 0 {
+            wl::caps::SOURCE_FMOD_PACK
+        } else {
+            0
+        };
     // Ops: PAUSE only. READ (no metal owner-log tee), EXEC/TTY (no process to
     // exec into) stay clear; the SIGNAL bit asserts real process-group signal
     // delivery this backend does not provide (TERM→drain, KILL→free).
@@ -724,6 +833,13 @@ unsafe fn dispatch_op(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) ->
     if opcode == wl::CREATE {
         return workload_create(arg, arg_len);
     }
+    if opcode == wl::MODULE_DIGESTS {
+        if arg.is_null() {
+            return errno::EINVAL;
+        }
+        let out = core::slice::from_raw_parts_mut(arg, arg_len);
+        return code_pack::node_digests(scheduler::static_loader(), out);
+    }
     if opcode == wl::CAPS {
         return workload_caps(arg, arg_len);
     }
@@ -837,4 +953,9 @@ unsafe fn dispatch_op(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) ->
         }
         _ => errno::ENOSYS,
     }
+}
+
+/// Does `pins` (32-byte SHA-256 pins, back to back) hold `digest`?
+fn pin_matches(pins: &[u8], digest: &[u8; 32]) -> bool {
+    pins.chunks_exact(32).any(|p| p == digest)
 }

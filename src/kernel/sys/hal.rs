@@ -111,6 +111,14 @@ pub struct HalOps {
     /// and the vault then generates one rather than proceeding with a
     /// partial read.
     pub seal_blob_read: fn(&[u8], &mut [u8]) -> Option<usize>,
+    /// Whether the durable store [`seal_blob_store`](HalOps::seal_blob_store)
+    /// names can be read yet. A store that exists but is not readable (its
+    /// medium still coming up at boot) must not be read as empty: a key
+    /// already stored there would be generated afresh over it. While this is
+    /// `false` the vault answers a labelled open `EAGAIN`, and the caller
+    /// asks again. A platform with no store, or one always readable, answers
+    /// `true`.
+    pub seal_blob_ready: fn() -> bool,
     /// Monotonic tick count (wrapping).
     pub tick_count: fn() -> u32,
 
@@ -510,6 +518,11 @@ pub fn seal_blob_delete(label: &[u8]) -> bool {
 #[inline(always)]
 pub fn seal_blob_read(label: &[u8], out: &mut [u8]) -> Option<usize> {
     (ops().seal_blob_read)(label, out)
+}
+
+/// See [`HalOps::seal_blob_ready`].
+pub fn seal_blob_ready() -> bool {
+    (ops().seal_blob_ready)()
 }
 
 /// See [`HalOps::seal_provenance`].

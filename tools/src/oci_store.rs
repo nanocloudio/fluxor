@@ -63,6 +63,14 @@ pub const MT_FLUXOR_MODULE_META: &str = "application/vnd.nanocloud.fluxor.module
 /// annotations mirror target/epoch so admission can happen from the
 /// manifest alone, before the layer is fetched.
 pub const MT_FLUXOR_IMAGE: &str = "application/vnd.nanocloud.fluxor.image.v1";
+/// A workload that brings its own modules: the artifact type, and its FLXA
+/// subgraph layer. Each module is a `MT_FLUXOR_MODULE` layer.
+pub const MT_FLUXOR_WORKLOAD_IMAGE: &str = "application/vnd.nanocloud.fluxor.workload-image.v1";
+pub const MT_FLUXOR_FLXA: &str = "application/vnd.nanocloud.fluxor.flxa.v1";
+/// A workload-image module layer's FNV-1a name hash, as the FLXA names it.
+pub const ANN_MODULE_NAME_HASH: &str = "io.fluxor.module.name-hash";
+/// A workload image's module ABI (`aarch64`, …).
+pub const ANN_MODULE_ABI: &str = "io.fluxor.module.abi";
 /// A complete boot image (e.g. Pi 5 `kernel_2712.img`): kernel +
 /// embedded graph, delivered to a staging host (TFTP root, SD writer),
 /// never consumed by a running device directly.
@@ -1056,6 +1064,83 @@ pub fn publish_layered_image(
         )?;
         Ok(desc)
     }
+}
+
+/// One module of a workload image.
+pub struct WorkloadModule {
+    pub name: String,
+    pub name_hash: u32,
+    pub bytes: Vec<u8>,
+}
+
+pub struct WorkloadImagePublish<'a> {
+    pub name: &'a str,
+    pub target: &'a str,
+    pub module_abi: &'a str,
+    pub abi_surface_hex: &'a str,
+    pub flxa: &'a [u8],
+    pub modules: &'a [WorkloadModule],
+    pub provenance: &'a str,
+    pub source_rev: Option<&'a str>,
+    pub ref_name: &'a str,
+}
+
+/// Publish a workload image: the FLXA subgraph, then one layer per module in
+/// the order the image lists them. A module layer's digest is the sha256 of
+/// its `.fmod` bytes, which is the pin a node's kernel admits it by — so a
+/// node pins exactly what the manifest names, and a registry stores a module
+/// shared by many images once.
+pub fn publish_workload_image(
+    store: &OciStore,
+    a: &WorkloadImagePublish<'_>,
+) -> Result<Descriptor> {
+    let _index_lock = store.lock_index()?;
+    let (config_digest, config_size) = store.put_blob(EMPTY_CONFIG)?;
+    let mut layers = Vec::with_capacity(a.modules.len() + 1);
+    let (fd, fsz) = store.put_blob(a.flxa)?;
+    layers.push(Descriptor {
+        media_type: MT_FLUXOR_FLXA.into(),
+        digest: fd,
+        size: fsz,
+        annotations: one_annotation(ANN_TITLE, "graph.flxa"),
+    });
+    for m in a.modules {
+        let (d, sz) = store.put_blob(&m.bytes)?;
+        let mut ann = one_annotation(ANN_TITLE, &format!("{}.fmod", m.name));
+        ann.insert(ANN_MODULE_NAME.into(), m.name.clone());
+        ann.insert(ANN_MODULE_NAME_HASH.into(), m.name_hash.to_string());
+        layers.push(Descriptor {
+            media_type: MT_FLUXOR_MODULE.into(),
+            digest: d,
+            size: sz,
+            annotations: ann,
+        });
+    }
+    let mut annotations = Annotations::new();
+    annotations.insert(ANN_KIND.into(), "workload-image".into());
+    annotations.insert(ANN_MODULE_NAME.into(), a.name.into());
+    annotations.insert(ANN_TARGET.into(), a.target.into());
+    annotations.insert(ANN_MODULE_ABI.into(), a.module_abi.into());
+    annotations.insert(ANN_ABI_SURFACE.into(), a.abi_surface_hex.into());
+    let manifest = ImageManifest {
+        schema_version: 2,
+        media_type: MT_OCI_MANIFEST.into(),
+        artifact_type: Some(MT_FLUXOR_WORKLOAD_IMAGE.into()),
+        config: Descriptor {
+            media_type: MT_OCI_EMPTY.into(),
+            digest: config_digest,
+            size: config_size,
+            annotations: Annotations::new(),
+        },
+        layers,
+        annotations,
+    };
+    let desc = store.tag_manifest_locked(&manifest, a.ref_name)?;
+    store.record_provenance(
+        &desc.digest,
+        &ProvenanceRow::new(a.provenance).with_rev(a.source_rev),
+    )?;
+    Ok(desc)
 }
 
 /// Publish a device artifact (graph image / firmware image) as a
