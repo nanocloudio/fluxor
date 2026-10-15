@@ -76,7 +76,11 @@
 //! first module that produces whole buffers; prior stages use FIFO copy. See
 //! `docs/architecture/pipeline.md` §FIFO→Mailbox for the full pattern.
 
-use portable_atomic::{AtomicBool, AtomicI16, AtomicU32, AtomicU8, AtomicUsize, Ordering};
+use portable_atomic::{
+    AtomicBool, AtomicI16, AtomicU16, AtomicU32, AtomicU8, AtomicUsize, Ordering,
+};
+
+use crate::kernel::exec::scheduler::{ModuleId, NO_MODULE};
 
 use crate::kernel::ipc::channel::MAX_CHANNELS;
 use crate::kernel::sys::errno;
@@ -407,9 +411,9 @@ struct BufferRegistrySlot {
     owner_channel: AtomicI16,
     /// Set when current PRODUCER was acquired via in-place (not fresh write)
     inplace_flag: AtomicU8,
-    /// Producer module index (0xFF if unknown). The scheduler reads this to
+    /// Producer module index (`NO_MODULE` if unknown). The scheduler reads this to
     /// compute a per-module channel-buffer range for an MPU/MMU region.
-    producer_module: AtomicU8,
+    producer_module: AtomicU16,
 }
 
 // SAFETY: The `data_ptr` UnsafeCell is mutated only via dedicated
@@ -427,7 +431,7 @@ impl BufferRegistrySlot {
             state: AtomicU8::new(STATE_FREE),
             owner_channel: AtomicI16::new(-1),
             inplace_flag: AtomicU8::new(0),
-            producer_module: AtomicU8::new(0xFF),
+            producer_module: AtomicU16::new(NO_MODULE),
         }
     }
 
@@ -569,7 +573,7 @@ impl BufferRegistrySlot {
         self.capacity.store(0, Ordering::Release);
         self.len.store(0, Ordering::Release);
         self.inplace_flag.store(0, Ordering::Release);
-        self.producer_module.store(0xFF, Ordering::Release);
+        self.producer_module.store(NO_MODULE, Ordering::Release);
         // SAFETY: the slot's channel has detached it (`ChannelSlot::reset`
         // under the ring lock) or the whole graph is being torn down; nothing
         // reaches the slot through a channel any more.
@@ -601,11 +605,11 @@ fn valid_slot(slot: i32) -> bool {
 /// `capacity` specifies the buffer size in bytes (e.g. 2048 for audio, 256 for events).
 /// Returns buffer slot index, or -1 if no slot or arena space available.
 pub fn alloc_streaming(channel: i16, capacity: usize) -> i32 {
-    alloc_streaming_for_module(channel, capacity, 0xFF)
+    alloc_streaming_for_module(channel, capacity, NO_MODULE)
 }
 
 /// Allocate a streaming buffer tagged with its producer module.
-pub fn alloc_streaming_for_module(channel: i16, capacity: usize, producer_module: u8) -> i32 {
+pub fn alloc_streaming_for_module(channel: i16, capacity: usize, producer_module: ModuleId) -> i32 {
     for (i, slot) in BUFFER_REGISTRY.iter().enumerate() {
         if slot
             .state

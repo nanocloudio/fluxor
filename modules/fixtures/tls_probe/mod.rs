@@ -79,7 +79,7 @@ pub struct ProbeState {
     net_in: i32,
     net_out: i32,
     phase: u8,
-    my_tag: u8,
+    my_tag: net_proto::RequesterTag,
     conn: u16,
     /// The peer's port: the authority's, or `DEFAULT_PORT`.
     port: u16,
@@ -321,7 +321,12 @@ unsafe fn service_net(s: &mut ProbeState, now: u32) {
             NO_CONN
         };
         match msg {
-            NET_MSG_CONNECTED if plen >= 3 && s.phase == PH_DIALING && *p.add(2) == s.my_tag => {
+            NET_MSG_CONNECTED
+                if plen >= net_proto::CONNECTED_FIXED
+                    && s.phase == PH_DIALING
+                    && net_proto::connected_parts(core::slice::from_raw_parts(p, plen)).1
+                        == s.my_tag =>
+            {
                 s.conn = id;
                 s.phase = PH_WAIT_PONG;
                 send_ping(s);

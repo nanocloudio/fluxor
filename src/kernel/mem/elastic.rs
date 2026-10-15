@@ -19,6 +19,7 @@
 //! never on the packet path; a grant zeroes at most one chunk.
 
 use crate::kernel::config::{ELASTIC_QUANTUM, ELASTIC_REGION_SIZE};
+use crate::kernel::exec::scheduler::{ModuleId, NO_MODULE};
 use crate::kernel::sys::guard::KernelGuard;
 
 /// Chunk bookkeeping entries. Chunks are quantum-multiples, so a full
@@ -30,11 +31,11 @@ const MAX_CHUNKS: usize = 128;
 struct Chunk {
     offset: u32,
     len: u32,
-    /// Owning module index; `u8::MAX` = free (reusable exact-fit).
-    owner: u8,
+    /// Owning module index; `FREE` (`NO_MODULE`) = free (reusable exact-fit).
+    owner: ModuleId,
 }
 
-const FREE: u8 = u8::MAX;
+const FREE: ModuleId = NO_MODULE;
 
 struct ElasticState {
     chunks: [Chunk; MAX_CHUNKS],
@@ -59,7 +60,7 @@ static mut STATE: ElasticState = ElasticState {
 /// Grant a chunk of at least `bytes` to `module_idx`. Returns the chunk
 /// `(ptr, len)` — `len` is `bytes` rounded up to [`ELASTIC_QUANTUM`] —
 /// or `None` (the caller counts the denial and returns `ENOSPC`).
-pub fn alloc(module_idx: u8, bytes: usize) -> Option<(*mut u8, usize)> {
+pub fn alloc(module_idx: ModuleId, bytes: usize) -> Option<(*mut u8, usize)> {
     if ELASTIC_REGION_SIZE == 0 || bytes == 0 || module_idx == FREE {
         return None;
     }
@@ -100,7 +101,7 @@ pub fn alloc(module_idx: u8, bytes: usize) -> Option<(*mut u8, usize)> {
 
 /// Release every chunk `module_idx` holds — the owner-teardown reclaim.
 /// Teardown is the reclaim path; there is no individual free.
-pub fn reclaim_module(module_idx: u8) {
+pub fn reclaim_module(module_idx: ModuleId) {
     if ELASTIC_REGION_SIZE == 0 {
         return;
     }

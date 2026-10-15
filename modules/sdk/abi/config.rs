@@ -113,45 +113,32 @@ mod profile_host {
     pub mod kernel {
         /// Pool used by `loader::alloc_state` to back every loaded
         /// module's `module_state` and `module_arena`. It must hold every
-        /// module of the busiest graph at once. The `ip` module's
-        /// connection table dominates: a `TcpConn` is ~2.2 KiB (its bounded
-        /// reorder buffer is the bulk of that) and `MAX_TCP_CONNS` is
-        /// 65,536 here, so `ip` alone asks for ~137 MiB. Beside it sit a
-        /// 64-module graph at ~100 KiB of state each plus the http module's
-        /// peak heap at full `ARENA_WORKING_SET_CONNS` activity, a
-        /// console-emulator core's ~39 MiB working set, and a media-app host
-        /// graph that peaks past 64 MiB. 256 MiB leaves ~117 MiB beside the
-        /// connection table, above that peak. Zero-initialised, so it costs
-        /// kernel `.bss` rather than image size.
-        pub const STATE_ARENA_SIZE: usize = 256 * 1024 * 1024;
+        /// module of the busiest graph at once. A node hosts workload
+        /// subgraphs beside its own graph, and they draw on the same pool:
+        /// a bare-metal node's control plane seats ~253 MiB on its own, and
+        /// one key-value Pod's state worker asks 15-23 MiB. 1 GiB holds the
+        /// node plane and several such Pods. It costs no image bytes and is
+        /// never zeroed whole (the loader zeroes each allocation); the
+        /// bcm2712 kernel gives it a region of its own above 1 GB, so a
+        /// Pi 5 running this profile needs 2 GB of DRAM.
+        pub const STATE_ARENA_SIZE: usize = 1024 * 1024 * 1024;
         /// Per-channel buffer pool. A node's own graph and the workload
         /// subgraphs it hosts share it: the bare-metal node's base graph
         /// (control plane, kubelet slice, its PKI) alone holds ~8 MiB of
-        /// channels, and at 8 MiB a stateful Pod's two 128 KiB block edges
-        /// found no room ("[buf] arena full", pi5-a 2026-10-15). 16 MiB
+        /// channels, and a stateful Pod adds two 128 KiB block edges. 16 MiB
         /// leaves room for several such Pods; zero-initialised `.bss`.
         pub const BUFFER_ARENA_SIZE: usize = 16 * 1024 * 1024;
-        // Multi-workload: the system substrate plus several workload subgraphs
-        // co-resident on aarch64 (bcm2712 / linux). Every module index stays
-        // within the scheduler's u8 index domain (`exec_order: [u8; _]`,
-        // `module_idx as u8`), and 0xFF is the "no module" sentinel in the
-        // page pool, the step guard and the elastic allocator — which is what
-        // bounds this at 255 (slots 0..=254); past that the ids widen to u16.
-        // The `ModuleMask` bitmaps scale to match (MODULE_MASK_WORDS == 4
-        // here). Edge capacity is MAX_GRAPH_EDGES.
-        //
-        // 128 -> 192: a control plane whose controllers are PARAMS is counted
-        // in decisions and connectors rather than in modules. nanocloud's
-        // all-in-one graph is 100 nodes of control plane plus a 35-node node
-        // plane, and the two cannot be split across processes — the linux store
-        // is deliberately single-writer with no `flock`, so one runtime owns
-        // the WAL. This is per-target (wasm32 48, Cortex-M 32 below), so the
-        // scheduler's static tables grow on aarch64 only.
-        //
-        // 192 -> 255: the control plane converted its remaining controllers
-        // (IP allocation, RBAC, probes) to params and passed 192 slots; the
-        // scheduler's fan-in merges occupy slots too. 255 is the u8 ceiling.
-        pub const MAX_MODULES: usize = 255;
+        // Multi-workload: a node's own graph plus the workload subgraphs it
+        // hosts, all in one scheduler on aarch64 (bcm2712 / linux). A
+        // bare-metal node's control plane and image plane seat ~250 modules
+        // before any workload, and one message-broker workload is ~17 more.
+        // Module ids are u16 throughout the kernel and on the wire, with
+        // 0xFFFF the no-module sentinel, so the ceiling is a sizing choice:
+        // the scheduler's per-module tables, the `ModuleMask` bitmaps
+        // (MODULE_MASK_WORDS == 16 here) and the edge capacity
+        // (MAX_GRAPH_EDGES) scale with it. Per-target: wasm32 48, Cortex-M
+        // 32 below.
+        pub const MAX_MODULES: usize = 1024;
         /// ISR-tier bridge slots: one per edge that crosses into an
         /// ISR-tier domain, each holding its ring inline (~2 KiB).
         pub const MAX_BRIDGES: usize = 16;

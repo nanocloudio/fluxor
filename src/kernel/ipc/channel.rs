@@ -69,7 +69,11 @@
 
 use core::cell::UnsafeCell;
 use core::ffi::c_void;
-use portable_atomic::{AtomicBool, AtomicI16, AtomicI32, AtomicPtr, AtomicU32, AtomicU8, Ordering};
+use portable_atomic::{
+    AtomicBool, AtomicI16, AtomicI32, AtomicPtr, AtomicU16, AtomicU32, AtomicU8, Ordering,
+};
+
+use crate::kernel::exec::scheduler::{ModuleId, NO_MODULE};
 
 use crate::kernel::boot::config::MAX_GRAPH_EDGES;
 use crate::kernel::ipc::buffer_pool::{self, BUFFER_SIZE};
@@ -244,13 +248,13 @@ struct ChannelSlot {
     /// `ioctl_handler`. See `channel_register_ioctl_handler`.
     ioctl_state: AtomicPtr<()>,
     /// Module index that registered the current `ioctl_handler`, or
-    /// `u8::MAX` if no handler is set. Recorded at registration so the
+    /// `NO_MODULE` if no handler is set. Recorded at registration so the
     /// kernel can clear the handler on
     /// `release_module_handlers(module_idx)` — without per-slot owner
     /// tracking, a module's function and state pointers would survive
     /// module unload / restart / finalisation and point into freed
     /// memory.
-    ioctl_owner: AtomicU8,
+    ioctl_owner: AtomicU16,
     /// A tap: the channel every successful write here is also copied into,
     /// or -1. Lossy by design — a copy that does not fit whole is dropped,
     /// so an observer can never back-pressure or stall the producer. Set by
@@ -293,12 +297,17 @@ impl ChannelSlot {
             fifo: UnsafeCell::new(FifoState::new()),
             ioctl_handler: AtomicPtr::new(core::ptr::null_mut()),
             ioctl_state: AtomicPtr::new(core::ptr::null_mut()),
-            ioctl_owner: AtomicU8::new(u8::MAX),
+            ioctl_owner: AtomicU16::new(NO_MODULE),
             mirror: AtomicI32::new(-1),
         }
     }
 
-    fn try_allocate(&self, idx: usize, buf_capacity: usize, producer_module: u8) -> SlotClaim {
+    fn try_allocate(
+        &self,
+        idx: usize,
+        buf_capacity: usize,
+        producer_module: ModuleId,
+    ) -> SlotClaim {
         if self
             .state
             .compare_exchange(
@@ -358,7 +367,7 @@ impl ChannelSlot {
         self.wake_module.store(-1, Ordering::Release);
         self.ioctl_handler
             .store(core::ptr::null_mut(), Ordering::Release);
-        self.ioctl_owner.store(u8::MAX, Ordering::Release);
+        self.ioctl_owner.store(NO_MODULE, Ordering::Release);
         self.ioctl_state
             .store(core::ptr::null_mut(), Ordering::Release);
         self.mirror.store(-1, Ordering::Release);
@@ -434,7 +443,7 @@ pub fn in_use_count() -> usize {
 // ============================================================================
 
 pub fn channel_open(chan_type: u8, config: *const u8, config_len: usize) -> i32 {
-    channel_open_for_module(chan_type, config, config_len, 0xFF)
+    channel_open_for_module(chan_type, config, config_len, NO_MODULE)
 }
 
 /// Same as `channel_open`, but tags the buffer with its producer module
@@ -443,7 +452,7 @@ pub fn channel_open_for_module(
     chan_type: u8,
     config: *const u8,
     config_len: usize,
-    producer_module: u8,
+    producer_module: ModuleId,
 ) -> i32 {
     // ISR-tier (Tier 1b / Tier 2) modules must not open generic
     // PIPE channels — their I/O rides bridge channels, registered
@@ -623,14 +632,14 @@ pub fn reset_all() {
 /// state are left intact. The slot itself is torn down when its
 /// channel closes (`channel_close`) or at the next graph rebuild
 /// (`reset_all`).
-pub fn release_module_handlers(module_idx: u8) {
+pub fn release_module_handlers(module_idx: ModuleId) {
     for slot in CHANNELS.iter() {
         if slot.ioctl_owner.load(Ordering::Acquire) == module_idx {
             slot.ioctl_handler
                 .store(core::ptr::null_mut(), Ordering::Release);
             slot.ioctl_state
                 .store(core::ptr::null_mut(), Ordering::Release);
-            slot.ioctl_owner.store(u8::MAX, Ordering::Release);
+            slot.ioctl_owner.store(NO_MODULE, Ordering::Release);
         }
     }
 }
@@ -1111,7 +1120,7 @@ pub fn channel_ioctl(handle: i32, cmd: u32, arg: *mut u8) -> i32 {
             // the handler's own opaque pointer paired with `h` at register
             // time.
             let call = || unsafe { handler(state as *mut c_void, cmd, arg) };
-            if owner == u8::MAX {
+            if owner == NO_MODULE {
                 call()
             } else {
                 crate::kernel::module::provider::in_provider_frame(owner as usize, call)
@@ -1160,15 +1169,10 @@ pub fn channel_register_ioctl_handler(
     // on `handler == None` so a module can voluntarily unregister
     // without taking ownership of an empty slot.
     if handler.is_some() {
-        let owner = crate::kernel::exec::scheduler::current_module_index();
-        let owner_u8 = if owner < u8::MAX as usize {
-            owner as u8
-        } else {
-            u8::MAX
-        };
-        slot.ioctl_owner.store(owner_u8, Ordering::Release);
+        let owner = crate::kernel::exec::scheduler::current_module_id();
+        slot.ioctl_owner.store(owner, Ordering::Release);
     } else {
-        slot.ioctl_owner.store(u8::MAX, Ordering::Release);
+        slot.ioctl_owner.store(NO_MODULE, Ordering::Release);
     }
     match handler {
         Some(h) => slot.ioctl_handler.store(h as *mut (), Ordering::Release),

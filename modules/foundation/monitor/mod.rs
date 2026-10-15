@@ -57,7 +57,6 @@ use abi::internal::monitor::{
     module_state_flags, MODULE_STATE_LEN, MODULE_STATE_MAX, MODULE_STATE_QUERY,
     STEP_HISTOGRAM_QUERY,
 };
-use abi::internal::reconfigure::MODULE_COUNT as RECONFIGURE_MODULE_COUNT;
 use abi::kernel_abi::LOG_WRITE as SYSTEM_LOG;
 
 /// Small stack buffer for building one MON_HIST line. 8 buckets × up to
@@ -80,9 +79,11 @@ struct MonitorState {
 }
 
 /// Modules reported per round: a bounded burst on the log transport.
-const ROUND_MODULES: i32 = 64;
-/// Module indices the state query can name (`build_*` take a `u8`).
-const MAX_INDEX: i32 = 256;
+const ROUND_MODULES: usize = 64;
+/// Module slots the kernel's profile holds: the index domain a round walks.
+/// Slots are not contiguous (a workload's modules sit wherever its add
+/// placed them), so a round walks slots and reports the present ones.
+const MAX_INDEX: usize = abi::config::kernel::MAX_MODULES;
 
 impl MonitorState {
     fn init(&mut self, syscalls: *const SyscallTable) {
@@ -166,7 +167,7 @@ fn emit_bytes(s: &[u8], out: &mut [u8], pos: &mut usize) {
 
 /// Build one MON_HIST line for module `mod_idx` into `out`. Returns bytes
 /// written, or 0 if the query failed (caller should skip this module).
-unsafe fn build_mon_hist(sys: &SyscallTable, mod_idx: u8, out: &mut [u8]) -> usize {
+unsafe fn build_mon_hist(sys: &SyscallTable, mod_idx: u16, out: &mut [u8]) -> usize {
     let mut buckets = [0u32; 8];
     let bp = buckets.as_mut_ptr() as *mut u8;
     let rc = (sys.provider_call)(mod_idx as i32, STEP_HISTOGRAM_QUERY, bp, 32);
@@ -194,7 +195,8 @@ unsafe fn build_mon_hist(sys: &SyscallTable, mod_idx: u8, out: &mut [u8]) -> usi
 
 /// Build one MON_STATE line for module `mod_idx` into `out`. Returns
 /// bytes written, or 0 if the query failed (caller should skip).
-unsafe fn build_mon_state(sys: &SyscallTable, mod_idx: u8, out: &mut [u8]) -> usize {
+unsafe fn build_mon_state(sys: &SyscallTable, mod_idx: u16, out: &mut [u8]) -> usize {
+    use abi::internal::monitor::module_state_off as o;
     let mut st = [0u8; MODULE_STATE_MAX];
     let rc = (sys.provider_call)(
         mod_idx as i32,
@@ -207,7 +209,7 @@ unsafe fn build_mon_state(sys: &SyscallTable, mod_idx: u8, out: &mut [u8]) -> us
     if rc < MODULE_STATE_LEN as i32 {
         return 0;
     }
-    let flags = st[1];
+    let flags = st[o::FLAGS];
     // An empty slot has no state worth a line; reporting one would make
     // every unused slot look like a stalled module.
     if flags & module_state_flags::PRESENT == 0 {
@@ -228,7 +230,7 @@ unsafe fn build_mon_state(sys: &SyscallTable, mod_idx: u8, out: &mut [u8]) -> us
     emit_decimal(mod_idx as u32, out, &mut pos);
     // `name` and `state` are the keys the host dashboard reads; the rest
     // are the diagnostic fields, which it ignores as unknown keys.
-    let name_len = st[18] as usize;
+    let name_len = st[o::NAME_LEN] as usize;
     if name_len > 0 && MODULE_STATE_LEN + name_len <= rc as usize {
         emit_bytes(b" name=", out, &mut pos);
         emit_bytes(
@@ -238,25 +240,33 @@ unsafe fn build_mon_state(sys: &SyscallTable, mod_idx: u8, out: &mut [u8]) -> us
         );
     }
     emit_bytes(b" state=", out, &mut pos);
-    emit_bytes(STATE_NAMES.get(st[2].min(3) as usize), out, &mut pos);
+    emit_bytes(
+        STATE_NAMES.get(st[o::FAULT_STATE].min(3) as usize),
+        out,
+        &mut pos,
+    );
     emit_bytes(b" ready=", out, &mut pos);
     emit_decimal(bit(module_state_flags::READY), out, &mut pos);
     emit_bytes(b" finished=", out, &mut pos);
     emit_decimal(bit(module_state_flags::FINISHED), out, &mut pos);
     emit_bytes(b" restarts=", out, &mut pos);
-    emit_decimal(u16_at(8), out, &mut pos);
+    emit_decimal(u16_at(o::RESTART_COUNT), out, &mut pos);
     emit_bytes(b" domain=", out, &mut pos);
-    emit_decimal(st[7] as u32, out, &mut pos);
+    emit_decimal(st[o::DOMAIN_ID] as u32, out, &mut pos);
     emit_bytes(b" period=", out, &mut pos);
-    emit_decimal(st[6] as u32, out, &mut pos);
+    emit_decimal(st[o::STEP_PERIOD] as u32, out, &mut pos);
     // The field that answers "why is it not stepping": non-zero means
     // the readiness gate has been refusing it for that many ticks.
     emit_bytes(b" inactive=", out, &mut pos);
-    emit_decimal(u32_at(10), out, &mut pos);
+    emit_decimal(u32_at(o::INACTIVE_FOR_TICKS), out, &mut pos);
     emit_bytes(b" gen=", out, &mut pos);
-    emit_decimal(u32_at(14), out, &mut pos);
+    emit_decimal(u32_at(o::SLOT_GENERATION), out, &mut pos);
     emit_bytes(b" prot=", out, &mut pos);
-    emit_bytes(PROTECTION_NAMES.get(st[19].min(3) as usize), out, &mut pos);
+    emit_bytes(
+        PROTECTION_NAMES.get(st[o::PROTECTION].min(3) as usize),
+        out,
+        &mut pos,
+    );
     pos
 }
 
@@ -346,33 +356,32 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         s.countdown_ticks = s.round_ticks;
 
         let sys_ptr = s.syscalls;
-        let count =
-            (((*sys_ptr).provider_call)(-1, RECONFIGURE_MODULE_COUNT, core::ptr::null_mut(), 0))
-                as i32;
-        if count <= 0 {
-            return 0;
-        }
-
         let mut line = [0u8; LINE_BUF];
-        let count = count.min(MAX_INDEX);
-        let mut idx = (s.cursor as i32) % count;
-        let end = idx + ROUND_MODULES.min(count);
-        s.cursor = (end % count) as u32;
-        while idx < end {
-            let i = idx % count;
-            idx += 1;
-            let n = build_mon_hist(&*sys_ptr, i as u8, &mut line);
-            if n > 0 {
-                // Level 3 = info. LOG_WRITE routes through `syscall_log`
-                // which calls `log::info!` — bytes land in the ring and
-                // flow out the active transport overlay.
-                ((*sys_ptr).provider_call)(3, SYSTEM_LOG, line.as_mut_ptr(), n);
+        // Walk slots from the cursor, reporting up to ROUND_MODULES present
+        // modules; an empty slot answers MON_STATE with nothing and is
+        // skipped. The cursor carries the walk across rounds.
+        let mut reported = 0usize;
+        let mut walked = 0usize;
+        let mut i = (s.cursor as usize) % MAX_INDEX;
+        while walked < MAX_INDEX && reported < ROUND_MODULES {
+            let idx = i as u16;
+            i = (i + 1) % MAX_INDEX;
+            walked += 1;
+            let n = build_mon_state(&*sys_ptr, idx, &mut line);
+            if n == 0 {
+                continue;
             }
-            let n = build_mon_state(&*sys_ptr, i as u8, &mut line);
+            reported += 1;
+            // Level 3 = info. LOG_WRITE routes through `syscall_log` which
+            // calls `log::info!` — bytes land in the ring and flow out the
+            // active transport overlay.
+            ((*sys_ptr).provider_call)(3, SYSTEM_LOG, line.as_mut_ptr(), n);
+            let n = build_mon_hist(&*sys_ptr, idx, &mut line);
             if n > 0 {
                 ((*sys_ptr).provider_call)(3, SYSTEM_LOG, line.as_mut_ptr(), n);
             }
         }
+        s.cursor = i as u32;
 
         0
     }

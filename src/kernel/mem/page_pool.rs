@@ -5,6 +5,8 @@
 //! Eviction uses the clock (second-chance) algorithm.
 
 /// Page size in bytes (4KB, matching AArch64 granule).
+use crate::kernel::exec::scheduler::{ModuleId, NO_MODULE};
+
 pub const PAGE_SIZE: usize = 4096;
 
 /// Maximum number of pages in the pool. 256 pages = 1MB.
@@ -43,8 +45,8 @@ pub mod page_flags {
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct PageDescriptor {
-    /// Module that owns this page (0xFF = free).
-    pub owner_module: u8,
+    /// Module that owns this page (`NO_MODULE` = free).
+    pub owner_module: ModuleId,
     /// Current page state.
     pub state: u8,
     /// Flags (DIRTY, PINNED, LOADING, ACCESSED).
@@ -62,7 +64,7 @@ pub struct PageDescriptor {
 impl PageDescriptor {
     pub const fn free() -> Self {
         Self {
-            owner_module: 0xFF,
+            owner_module: NO_MODULE,
             state: PageState::Free as u8,
             flags: 0,
             arena_id: 0,
@@ -192,7 +194,7 @@ impl PagePool {
     /// Allocate a free page for a module.
     ///
     /// Returns Some(page_index) on success, None if pool is empty.
-    pub fn alloc(&mut self, module_idx: u8) -> Option<usize> {
+    pub fn alloc(&mut self, module_idx: ModuleId) -> Option<usize> {
         if self.free_head == u32::MAX {
             return None;
         }
@@ -220,7 +222,7 @@ impl PagePool {
         }
 
         let desc = &mut self.descriptors[page_idx];
-        desc.owner_module = 0xFF;
+        desc.owner_module = NO_MODULE;
         desc.state = PageState::Free as u8;
         desc.flags = 0;
         desc.vpage_idx = 0;
@@ -283,12 +285,12 @@ impl PagePool {
     /// On first pass, clears ACCESSED bit. On second encounter with
     /// ACCESSED cleared, selects the page for eviction.
     ///
-    /// If `prefer_module` is not 0xFF, prefer evicting from that module
+    /// If `prefer_module` is not `NO_MODULE`, prefer evicting from that module
     /// first (for per-module pressure). Falls back to global eviction.
     ///
     /// Returns Some(page_index) of the evicted page (now in Evicting state),
     /// or None if no evictable page found.
-    pub fn evict_clock(&mut self, prefer_module: u8) -> Option<usize> {
+    pub fn evict_clock(&mut self, prefer_module: ModuleId) -> Option<usize> {
         if self.page_count == 0 {
             return None;
         }
@@ -313,7 +315,7 @@ impl PagePool {
             }
 
             // Prefer the specified module
-            if prefer_module != 0xFF && desc.owner_module != prefer_module {
+            if prefer_module != NO_MODULE && desc.owner_module != prefer_module {
                 continue;
             }
 
@@ -329,15 +331,15 @@ impl PagePool {
         }
 
         // If prefer_module was set and we found nothing, try global
-        if prefer_module != 0xFF {
-            return self.evict_clock(0xFF);
+        if prefer_module != NO_MODULE {
+            return self.evict_clock(NO_MODULE);
         }
 
         None
     }
 
     /// Free all pages owned by a module (called on module teardown).
-    pub fn free_module_pages(&mut self, module_idx: u8) {
+    pub fn free_module_pages(&mut self, module_idx: ModuleId) {
         let mut i = 0;
         while i < self.page_count {
             if self.descriptors[i].owner_module == module_idx
@@ -350,7 +352,7 @@ impl PagePool {
     }
 
     /// Count resident (mapped) pages for a module.
-    pub fn resident_count(&self, module_idx: u8) -> usize {
+    pub fn resident_count(&self, module_idx: ModuleId) -> usize {
         let mut count = 0;
         let mut i = 0;
         while i < self.page_count {
@@ -363,7 +365,7 @@ impl PagePool {
     }
 
     /// Count dirty pages for a module.
-    pub fn dirty_count(&self, module_idx: u8) -> usize {
+    pub fn dirty_count(&self, module_idx: ModuleId) -> usize {
         let mut count = 0;
         let mut i = 0;
         while i < self.page_count {
@@ -400,7 +402,7 @@ impl PagePool {
     }
 
     /// Find a mapped page by (module, vpage_idx). Returns page index or None.
-    pub fn find_page(&self, module_idx: u8, vpage_idx: u32) -> Option<usize> {
+    pub fn find_page(&self, module_idx: ModuleId, vpage_idx: u32) -> Option<usize> {
         let mut i = 0;
         while i < self.page_count {
             let d = &self.descriptors[i];
@@ -443,7 +445,7 @@ pub fn pool_init(base_addr: usize, page_count: usize) {
 }
 
 /// Allocate a page for a module.
-pub fn pool_alloc(module_idx: u8) -> Option<usize> {
+pub fn pool_alloc(module_idx: ModuleId) -> Option<usize> {
     // SAFETY: see file-scope POOL comment.
     unsafe { (*pool()).alloc(module_idx) }
 }
@@ -457,7 +459,7 @@ pub fn pool_free(page_idx: usize) {
 }
 
 /// Evict using clock algorithm, preferring pages from the given module.
-pub fn pool_evict_clock(module_idx: u8) -> Option<usize> {
+pub fn pool_evict_clock(module_idx: ModuleId) -> Option<usize> {
     // SAFETY: see file-scope POOL comment.
     unsafe { (*pool()).evict_clock(module_idx) }
 }
@@ -487,7 +489,7 @@ pub fn pool_mark_accessed(page_idx: usize) {
 }
 
 /// Free all pages for a module.
-pub fn pool_free_module(module_idx: u8) {
+pub fn pool_free_module(module_idx: ModuleId) {
     // SAFETY: see file-scope POOL comment.
     unsafe {
         (*pool()).free_module_pages(module_idx);
@@ -495,13 +497,13 @@ pub fn pool_free_module(module_idx: u8) {
 }
 
 /// Count resident pages for a module.
-pub fn pool_resident_count(module_idx: u8) -> usize {
+pub fn pool_resident_count(module_idx: ModuleId) -> usize {
     // SAFETY: see file-scope POOL comment.
     unsafe { (*pool()).resident_count(module_idx) }
 }
 
 /// Count dirty pages for a module.
-pub fn pool_dirty_count(module_idx: u8) -> usize {
+pub fn pool_dirty_count(module_idx: ModuleId) -> usize {
     // SAFETY: see file-scope POOL comment.
     unsafe { (*pool()).dirty_count(module_idx) }
 }
@@ -537,7 +539,7 @@ pub fn pool_page_ptr(page_idx: usize) -> *mut u8 {
 }
 
 /// Find a mapped page.
-pub fn pool_find_page(module_idx: u8, vpage_idx: u32) -> Option<usize> {
+pub fn pool_find_page(module_idx: ModuleId, vpage_idx: u32) -> Option<usize> {
     // SAFETY: see file-scope POOL comment.
     unsafe { (*pool()).find_page(module_idx, vpage_idx) }
 }

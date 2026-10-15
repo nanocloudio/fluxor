@@ -33,15 +33,15 @@ unsafe fn dev_owner_tag(sys: &SyscallTable) -> u16 {
 
 /// Stream-surface requester tag for this module: `module index + 1`, so the
 /// "untagged" sentinel `REQUESTER_TAG_NONE` (0) never collides with a valid
-/// zero-based module index. Saturates at `u8::MAX`. Used to tag `CMD_CONNECT_TO`
-/// and to recognise the matching `MSG_CONNECTED` when `ip.net_out` is fanned to
-/// several stream consumers. Returns 0 only if the index is unavailable.
-unsafe fn dev_requester_tag(sys: &SyscallTable) -> u8 {
+/// zero-based module index. Used to tag `CMD_CONNECT_TO` and to recognise the
+/// matching `MSG_CONNECTED` when `ip.net_out` is fanned to several stream
+/// consumers. Returns 0 only if the index is unavailable.
+unsafe fn dev_requester_tag(sys: &SyscallTable) -> abi::contracts::net::net_proto::RequesterTag {
     let idx = dev_self_index(sys);
     if idx < 0 {
-        0
+        abi::contracts::net::net_proto::REQUESTER_TAG_NONE
     } else {
-        ((idx as u32).saturating_add(1)).min(u8::MAX as u32) as u8
+        (idx as u16).wrapping_add(1)
     }
 }
 

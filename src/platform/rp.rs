@@ -438,7 +438,7 @@ fn rp_init_providers() {
     fluxor::platform::rp_providers::init();
 }
 
-fn rp_release_module_handles(module_idx: u8) {
+fn rp_release_module_handles(module_idx: fluxor::kernel::exec::scheduler::ModuleId) {
     fluxor::platform::rp_providers::release_handles(module_idx);
 }
 
@@ -717,7 +717,7 @@ fn rp_setup_graph() -> i32 {
             }
         }
 
-        fluxor::platform::rp_io::gpio::grant_pending_pins(walk.instantiated() as u8);
+        fluxor::platform::rp_io::gpio::grant_pending_pins(walk.instantiated() as fluxor::kernel::exec::scheduler::ModuleId);
         walk.advance_instantiated();
         rp_spin_ms(1);
     }

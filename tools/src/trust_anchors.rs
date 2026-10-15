@@ -302,7 +302,7 @@ const ENTRY_HEADER: usize = 10;
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Widened {
     /// Module ids of the client instances that gained the anchors.
-    pub instances: Vec<u8>,
+    pub instances: Vec<u16>,
 }
 
 /// Append `anchors` to every CLIENT-MODE `tls` and `quic` instance in a
@@ -406,7 +406,7 @@ pub fn append_operator_identity(
 
 /// An entry rewriter for [`extend_entries`]: module type hash, module id and
 /// params in; the extended entry to append (or `None`) out.
-type Extend<'a> = dyn FnMut(u32, u8, &[u8]) -> Result<Option<Vec<u8>>, String> + 'a;
+type Extend<'a> = dyn FnMut(u32, u16, &[u8]) -> Result<Option<Vec<u8>>, String> + 'a;
 
 /// Rewrite the module entries of a built FXWR config blob and re-seal it.
 /// `extend` sees each entry's module type, id and params, and answers the
@@ -419,7 +419,8 @@ fn extend_entries(blob: &[u8], extend: &mut Extend<'_>) -> Result<(Vec<u8>, Wide
     if u32::from_le_bytes([blob[0], blob[1], blob[2], blob[3]]) != FXWR_MAGIC {
         return Err("config blob has no FXWR header".to_string());
     }
-    let module_count = blob[HEADER_SIZE] as usize;
+    // Module section header: count low byte, count high byte, section size.
+    let module_count = u16::from_le_bytes([blob[HEADER_SIZE], blob[HEADER_SIZE + 1]]) as usize;
     let section_size = u32::from_le_bytes([
         blob[HEADER_SIZE + 2],
         blob[HEADER_SIZE + 3],
@@ -446,7 +447,8 @@ fn extend_entries(blob: &[u8], extend: &mut Extend<'_>) -> Result<(Vec<u8>, Wide
         }
         let entry = &blob[off..off + entry_len];
         let name_hash = u32::from_le_bytes([entry[4], entry[5], entry[6], entry[7]]);
-        let id = entry[8];
+        // Module id: low byte at 8, bits 8-9 at byte 9 bits 5-6.
+        let id = u16::from(entry[8]) | (u16::from((entry[9] >> 5) & 0x03) << 8);
         let params = &entry[ENTRY_HEADER..];
         match extend(name_hash, id, params)? {
             Some(ext) => {

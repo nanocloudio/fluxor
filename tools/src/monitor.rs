@@ -60,14 +60,14 @@ fn parse_kv(line: &str) -> BTreeMap<String, String> {
     map
 }
 
-fn apply_line(rows: &mut BTreeMap<u8, ModuleRow>, line: &str) {
+fn apply_line(rows: &mut BTreeMap<u16, ModuleRow>, line: &str) {
     let trimmed = line.trim();
     if trimmed.is_empty() {
         return;
     }
     let tag = trimmed.split_whitespace().next().unwrap_or("");
     let kv = parse_kv(trimmed);
-    let module_idx = match kv.get("mod").and_then(|s| s.parse::<u8>().ok()) {
+    let module_idx = match kv.get("mod").and_then(|s| s.parse::<u16>().ok()) {
         Some(i) => i,
         None => return,
     };
@@ -110,7 +110,7 @@ fn apply_line(rows: &mut BTreeMap<u8, ModuleRow>, line: &str) {
     }
 }
 
-fn render(rows: &BTreeMap<u8, ModuleRow>) {
+fn render(rows: &BTreeMap<u16, ModuleRow>) {
     // Clear screen (ANSI) and move cursor to top-left.
     print!("\x1b[2J\x1b[H");
     println!("fluxor rig monitor  —  {} modules", rows.len());
@@ -172,7 +172,7 @@ pub fn cmd_monitor(port: &str, _baud: u32, refresh_ms: u64) -> Result<()> {
     let file = std::fs::File::open(port)
         .map_err(|e| Error::Config(format!("failed to open {port}: {e}")))?;
     let mut reader = BufReader::new(file);
-    let mut rows: BTreeMap<u8, ModuleRow> = BTreeMap::new();
+    let mut rows: BTreeMap<u16, ModuleRow> = BTreeMap::new();
     let mut last_render = Instant::now();
     let refresh = Duration::from_millis(refresh_ms);
     let mut line = String::new();
@@ -226,7 +226,7 @@ pub fn cmd_monitor_udp(bind: &str, refresh_ms: u64) -> Result<()> {
             .map_or_else(|_| bind.to_string(), |a| a.to_string())
     );
 
-    let mut rows: BTreeMap<u8, ModuleRow> = BTreeMap::new();
+    let mut rows: BTreeMap<u16, ModuleRow> = BTreeMap::new();
     let mut last_render = Instant::now();
     let refresh = Duration::from_millis(refresh_ms);
     let mut buf = [0u8; 4096];
@@ -264,7 +264,7 @@ mod tests {
 
     #[test]
     fn parse_fault_line() {
-        let mut rows: BTreeMap<u8, ModuleRow> = BTreeMap::new();
+        let mut rows: BTreeMap<u16, ModuleRow> = BTreeMap::new();
         apply_line(
             &mut rows,
             "MON_FAULT mod=3 kind=1 fault_count=2 restart_count=1 tick=500",
@@ -275,9 +275,21 @@ mod tests {
         assert_eq!(r.restart_count, 1);
     }
 
+    /// A module past index 255 is a row like any other: the host profile
+    /// holds 1024 modules.
+    #[test]
+    fn a_module_past_a_byte_is_reported() {
+        let mut rows: BTreeMap<u16, ModuleRow> = BTreeMap::new();
+        apply_line(
+            &mut rows,
+            "MON_FAULT mod=700 kind=2 fault_count=1 restart_count=0 tick=9",
+        );
+        assert_eq!(rows[&700].last_fault_kind, 2);
+    }
+
     #[test]
     fn parse_hist_line() {
-        let mut rows: BTreeMap<u8, ModuleRow> = BTreeMap::new();
+        let mut rows: BTreeMap<u16, ModuleRow> = BTreeMap::new();
         apply_line(
             &mut rows,
             "MON_HIST mod=0 b0=10 b1=5 b2=1 b3=0 b4=0 b5=0 b6=0 b7=0",
@@ -287,7 +299,7 @@ mod tests {
 
     #[test]
     fn parse_state_line() {
-        let mut rows: BTreeMap<u8, ModuleRow> = BTreeMap::new();
+        let mut rows: BTreeMap<u16, ModuleRow> = BTreeMap::new();
         apply_line(
             &mut rows,
             "MON_STATE mod=2 name=audio_out state=running ready=1 finished=0 \

@@ -1156,7 +1156,7 @@ pub struct DomainExecState {
     /// Which core this domain runs on (0 = boot core).
     pub core_id: u8,
     /// Number of modules in this domain.
-    pub module_count: u8,
+    pub module_count: u16,
     /// Whether this domain is active.
     pub active: bool,
     /// Tick counter for this domain's loop.
@@ -1209,14 +1209,14 @@ pub fn domain_state_ref(domain_id: usize) -> &'static DomainExecState {
 pub struct CrossDomainEdge {
     /// Source domain.
     pub from_domain: u8,
-    /// Source module index within its domain.
-    pub from_module: u8,
+    /// Source module index.
+    pub from_module: crate::kernel::exec::scheduler::ModuleId,
     /// Source output port index.
     pub from_port: u8,
     /// Destination domain.
     pub to_domain: u8,
-    /// Destination module index within its domain.
-    pub to_module: u8,
+    /// Destination module index.
+    pub to_module: crate::kernel::exec::scheduler::ModuleId,
     /// Destination input port index.
     pub to_port: u8,
     /// Index into CROSS_CHANNELS.

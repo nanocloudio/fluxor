@@ -141,7 +141,7 @@ state and stack budgets.
 
 | | rp2040 (Cortex-M0+) | rp2350 (Cortex-M33) | bcm2712 (Cortex-A76) |
 |---|---|---|---|
-| Mechanism | PMSAv7 MPU, thread unprivileged | PMSAv8 MPU, thread unprivileged | EL0 under a per-module page table and ASID |
+| Mechanism | PMSAv7 MPU, thread unprivileged | PMSAv8 MPU, thread unprivileged | EL0 under a per-module page table and a 16-bit ASID (module index + 1) |
 | Regions per module | code, gateway, private (+ window, + programs) | code, gateway, private (+ window, + programs) | pages |
 | Stack bound | the end of the private region (HardFault) | `PSPLIM` | an unmapped guard page under a 64 KiB stack |
 | Forced out at deadline | PendSV from the step-guard alarm | PendSV from the step-guard alarm | lower-EL IRQ |

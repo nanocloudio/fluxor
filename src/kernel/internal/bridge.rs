@@ -540,10 +540,9 @@ pub struct BridgeSlot {
     /// Bridge type (None = unused).
     pub bridge_type: BridgeType,
     /// Source module index (for diagnostics/validation).
-    pub from_module: u8,
+    pub from_module: crate::kernel::exec::scheduler::ModuleId,
     /// Destination module index.
-    pub to_module: u8,
-    _reserved: u8,
+    pub to_module: crate::kernel::exec::scheduler::ModuleId,
     /// The actual bridge data. Reinterpreted based on bridge_type.
     /// Sized to hold the largest bridge type.
     inner: BridgeInner,
@@ -574,13 +573,17 @@ impl BridgeSlot {
             bridge_type: BridgeType::None,
             from_module: 0,
             to_module: 0,
-            _reserved: 0,
             inner: BridgeInner::None,
         }
     }
 
     /// Initialize as a SnapshotBridge.
-    pub fn init_snapshot(&mut self, data_size: usize, from: u8, to: u8) {
+    pub fn init_snapshot(
+        &mut self,
+        data_size: usize,
+        from: crate::kernel::exec::scheduler::ModuleId,
+        to: crate::kernel::exec::scheduler::ModuleId,
+    ) {
         self.bridge_type = BridgeType::Snapshot;
         self.from_module = from;
         self.to_module = to;
@@ -590,7 +593,12 @@ impl BridgeSlot {
     }
 
     /// Initialize as a RingBridge.
-    pub fn init_ring(&mut self, elem_size: usize, from: u8, to: u8) {
+    pub fn init_ring(
+        &mut self,
+        elem_size: usize,
+        from: crate::kernel::exec::scheduler::ModuleId,
+        to: crate::kernel::exec::scheduler::ModuleId,
+    ) {
         self.bridge_type = BridgeType::Ring;
         self.from_module = from;
         self.to_module = to;
@@ -600,7 +608,12 @@ impl BridgeSlot {
     }
 
     /// Initialize as a CommandBridge.
-    pub fn init_command(&mut self, data_size: usize, from: u8, to: u8) {
+    pub fn init_command(
+        &mut self,
+        data_size: usize,
+        from: crate::kernel::exec::scheduler::ModuleId,
+        to: crate::kernel::exec::scheduler::ModuleId,
+    ) {
         self.bridge_type = BridgeType::Command;
         self.from_module = from;
         self.to_module = to;
@@ -802,29 +815,31 @@ pub fn bridge_dispatch(slot: usize, op: u32, arg: *mut u8, arg_len: usize) -> i3
                 BridgeInner::None => crate::kernel::sys::errno::EINVAL,
             }
         }
-        // BRIDGE_INFO = 3: return [type:u8, from:u8, to:u8, reserved:u8, drops:u32, seq:u32]
+        // BRIDGE_INFO = 3: return [type:u8, 0:u8, from:u16, to:u16, 0:u16,
+        // drops:u32, seq:u32]
         3 => {
-            if arg.is_null() || arg_len < 12 {
+            if arg.is_null() || arg_len < 16 {
                 return crate::kernel::sys::errno::EINVAL;
             }
-            // SAFETY: `arg_len >= 12` (checked above) so 12-byte slice in-bounds.
-            let out = unsafe { core::slice::from_raw_parts_mut(arg, 12) };
+            // SAFETY: `arg_len >= 16` (checked above) so 16-byte slice in-bounds.
+            let out = unsafe { core::slice::from_raw_parts_mut(arg, 16) };
             out[0] = bridge.bridge_type as u8;
-            out[1] = bridge.from_module;
-            out[2] = bridge.to_module;
-            out[3] = 0;
+            out[1] = 0;
+            out[2..4].copy_from_slice(&bridge.from_module.to_le_bytes());
+            out[4..6].copy_from_slice(&bridge.to_module.to_le_bytes());
+            out[6..8].copy_from_slice(&[0, 0]);
             let drops = match &bridge.inner {
                 BridgeInner::Ring(b) => b.drops(),
                 _ => 0,
             };
-            out[4..8].copy_from_slice(&drops.to_le_bytes());
+            out[8..12].copy_from_slice(&drops.to_le_bytes());
             let seq = match &bridge.inner {
                 BridgeInner::Snapshot(b) => b.sequence(),
                 BridgeInner::Command(b) => b.write_sequence(),
                 _ => 0,
             };
-            out[8..12].copy_from_slice(&seq.to_le_bytes());
-            12
+            out[12..16].copy_from_slice(&seq.to_le_bytes());
+            16
         }
         _ => crate::kernel::sys::errno::ENOSYS,
     }

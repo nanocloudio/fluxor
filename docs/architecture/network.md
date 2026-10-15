@@ -126,7 +126,7 @@ so the stream stays frame-aligned.
 | `0x11` | `CMD_SEND` | `[conn_id: u16 LE][data…]` — send bytes on a connection |
 | `0x12` | `CMD_CLOSE` | `[conn_id: u16 LE]` — tear down a connection |
 | `0x13` | `CMD_CONNECT` | reserved, unsupported — every provider answers `MSG_ERROR` ENOSYS on the requester tag |
-| `0x14` | `CMD_CONNECT_TO` | `[sock_type: u8][af: u8][port: u16 LE][addr…][requester_tag: u8?]` |
+| `0x14` | `CMD_CONNECT_TO` | `[sock_type: u8][af: u8][port: u16 LE][addr…][requester_tag: u16 LE?]` |
 
 `CMD_CONNECT_TO` carries one of three address families: `AF_INET` (4,
 `addr` is 4 bytes in network order), `AF_INET6` (6, 16 bytes), or
@@ -151,8 +151,8 @@ the provider re-segments to MSS on the wire.
 | `0x02` | `MSG_DATA` | `[conn_id: u16 LE][data…]` — received bytes |
 | `0x03` | `MSG_CLOSED` | `[conn_id: u16 LE]` — connection torn down |
 | `0x04` | `MSG_BOUND` | `[conn_id: u16 LE][local_port: u16 LE]` — listener ready |
-| `0x05` | `MSG_CONNECTED` | `[conn_id: u16 LE][requester_tag: u8]` — outbound connection established |
-| `0x06` | `MSG_ERROR` | `[conn_id: u16 LE][errno: i8][requester_tag: u8?]` |
+| `0x05` | `MSG_CONNECTED` | `[conn_id: u16 LE][requester_tag: u16 LE]` — outbound connection established |
+| `0x06` | `MSG_ERROR` | `[conn_id: u16 LE][errno: i8][requester_tag: u16 LE?]` |
 | `0x09` | `MSG_TRACE_CTX` | `[conn_id: u16 LE][trace_id: 16][parent_span_id: 8][trace_flags: u8]` |
 
 Opcodes `0x07` and `0x08` are reserved: the IP module uses them
@@ -521,7 +521,22 @@ A subgraph staged by a `workload` CREATE (an fmod-graph source) joins the
 network through lanes of its own rather than the fanned `net_out`. Its
 FLXA names the provider as an endpoint, `Net(key)`: one edge from a module
 into it (commands) and one edge out of it to a module (events) per key.
-Each key becomes one lane:
+Each key becomes one lane. A graph writes it in a workload's `wiring:` as
+the end `net:<key>` (decimal 0..=255), which `fluxor build` encodes as FLXA
+endpoint kind 3 and refuses unless each key has exactly one edge of each
+direction, both to modules of the workload:
+
+```yaml
+workloads:
+  - modules:
+      - name: front
+        type: tls
+    wiring:
+      - from: "net:0"     # the lane's events (accepts, data) into the module
+        to: front
+      - from: front       # the module's net commands out to the lane
+        to: "net:0"
+```
 
 | Rule | Effect |
 |---|---|

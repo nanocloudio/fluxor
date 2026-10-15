@@ -505,7 +505,7 @@ fn linux_init_providers() {
 /// require the runtime to track each `.fmod` → mmap mapping by
 /// module index; v1 leaves the process model as the outer cleanup
 /// boundary.
-fn linux_release_module_handles(_module_idx: u8) {
+fn linux_release_module_handles(_module_idx: fluxor::kernel::exec::scheduler::ModuleId) {
     // Generic kernel cleanup in `syscalls::release_module_handles`
     // covers event/timer/provider resources; Linux mmap mappings
     // live for the process.

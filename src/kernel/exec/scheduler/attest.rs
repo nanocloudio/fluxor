@@ -14,7 +14,7 @@
 //! [instance_count u16] per instantiated module, config order:
 //!                      [name_hash u32][domain u8][params_sha256 32]
 //! [edge_count u16]     per graph edge, config order:
-//!                      [from_id u8][from_port u8][to_id u8][to_port_kind u8][to_port u8]
+//!                      [from_id u16][from_port u8][to_id u16][to_port_kind u8][to_port u8]
 //! [vault_tier u8]
 //! ```
 //!
@@ -144,17 +144,11 @@ pub fn write_record(challenge: &[u8; 32], tier: u8, out: &mut [u8]) -> Option<us
     let mut i = 0;
     while i < config.graph_edges.len() && n < edge_count {
         if let Some(e) = &config.graph_edges[i] {
-            if !put(
-                out,
-                &mut pos,
-                &[
-                    e.from_id,
-                    e.from_port_index,
-                    e.to_id,
-                    e.to_port,
-                    e.to_port_index,
-                ],
-            ) {
+            if !put(out, &mut pos, &e.from_id.to_le_bytes())
+                || !put(out, &mut pos, &[e.from_port_index])
+                || !put(out, &mut pos, &e.to_id.to_le_bytes())
+                || !put(out, &mut pos, &[e.to_port, e.to_port_index])
+            {
                 return None;
             }
             n += 1;

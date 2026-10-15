@@ -39,6 +39,7 @@
 use core::ptr::null_mut;
 
 use crate::abi::{SyscallTable, ABI_VERSION};
+use crate::kernel::exec::scheduler::ModuleId;
 use crate::kernel::ipc::channel;
 use crate::kernel::module::block_lend;
 use crate::kernel::sys::errno;
@@ -1925,7 +1926,7 @@ unsafe fn handle_elastic_alloc(arg: *mut u8, arg_len: usize) -> i32 {
             return crate::kernel::sys::errno::ENOSPC;
         }
     }
-    match crate::kernel::mem::elastic::alloc(idx as u8, bytes) {
+    match crate::kernel::mem::elastic::alloc(idx as ModuleId, bytes) {
         Some((ptr, len)) => {
             let addr = (ptr as usize as u64).to_le_bytes();
             for (i, b) in addr.iter().enumerate() {
@@ -2088,11 +2089,11 @@ unsafe fn handle_core_primitive(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             if idx >= scheduler::MAX_MODULES {
                 return crate::kernel::sys::errno::ENODEV;
             }
-            let (in_b, out_b) = match crate::kernel::exec::isr_tier::module_bridge_slots(idx as u8)
-            {
-                Some(b) => b,
-                None => return crate::kernel::sys::errno::ENODEV,
-            };
+            let (in_b, out_b) =
+                match crate::kernel::exec::isr_tier::module_bridge_slots(idx as ModuleId) {
+                    Some(b) => b,
+                    None => return crate::kernel::sys::errno::ENODEV,
+                };
             let in_n = in_b.iter().filter(|s| **s >= 0).count();
             let out_n = out_b.iter().filter(|s| **s >= 0).count();
             let need = 4 + (in_n + out_n) * 4;
@@ -2289,6 +2290,18 @@ unsafe fn handle_core_primitive(handle: i32, opcode: u32, arg: *mut u8, arg_len:
     }
 }
 
+/// The `[module_idx:u16 LE]` that leads a reconfigure or monitor argument.
+/// `None` when the argument is too short to hold one.
+///
+/// # Safety
+/// `arg` is null or valid for `arg_len` bytes.
+unsafe fn module_arg(arg: *const u8, arg_len: usize) -> Option<usize> {
+    if arg.is_null() || arg_len < 2 {
+        return None;
+    }
+    Some(usize::from(u16::from_le_bytes([*arg, *arg.add(1)])))
+}
+
 unsafe fn handle_reconfigure_op(opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
     use crate::abi::internal::reconfigure;
     use crate::kernel::exec::scheduler;
@@ -2309,55 +2322,53 @@ unsafe fn handle_reconfigure_op(opcode: u32, arg: *mut u8, arg_len: usize) -> i3
             0
         }
         reconfigure::CALL_DRAIN => {
-            if arg.is_null() || arg_len < 1 {
+            let Some(idx) = module_arg(arg, arg_len) else {
                 return E_INVAL;
-            }
-            let idx = core::ptr::read(arg) as usize;
+            };
             scheduler::call_module_drain(idx)
         }
         reconfigure::MARK_FINISHED => {
-            if arg.is_null() || arg_len < 1 {
+            let Some(idx) = module_arg(arg, arg_len) else {
                 return E_INVAL;
-            }
-            let idx = core::ptr::read(arg) as usize;
+            };
             scheduler::mark_module_finished(idx);
             0
         }
         reconfigure::MODULE_COUNT => scheduler::active_module_count() as i32,
         reconfigure::MODULE_INFO => {
-            if arg.is_null() || arg_len < 1 {
+            let Some(idx) = module_arg(arg, arg_len) else {
                 return E_INVAL;
-            }
-            let idx = core::ptr::read(arg) as usize;
+            };
             scheduler::module_info_flags(idx) as i32
         }
         reconfigure::MODULE_UPSTREAM => {
-            // Arg layout: in `[module_idx:u8]`, out `[mask word u64 LE × W]`
-            // (low word first), where the kernel writes
-            // `W = min(MODULE_MASK_WORDS, (arg_len - 1) / 8)` words and
+            // Arg layout: in `[module_idx:u16 LE]`, out `[mask word u64 LE × W]`
+            // from offset 2 (low word first), where the kernel writes
+            // `W = min(MODULE_MASK_WORDS, (arg_len - 2) / 8)` words and
             // returns `MODULE_MASK_WORDS` — so a caller whose buffer is
             // narrower than the full mask can detect the truncation from
-            // the return value. `arg_len >= 9` (index byte + one word).
-            if arg.is_null() || arg_len < 9 {
+            // the return value. `arg_len >= 10` (index + one word).
+            if arg_len < 10 {
                 return E_INVAL;
             }
-            let idx = core::ptr::read(arg) as usize;
+            let Some(idx) = module_arg(arg, arg_len) else {
+                return E_INVAL;
+            };
             let mut words = [0u64; crate::kernel::workload::bitmask::MODULE_MASK_WORDS];
             let total = scheduler::module_upstream_words(idx, &mut words);
-            let fit = ((arg_len - 1) / 8).min(total);
+            let fit = ((arg_len - 2) / 8).min(total);
             for (w, word) in words.iter().enumerate().take(fit) {
                 let bytes = word.to_le_bytes();
                 for (i, b) in bytes.iter().enumerate() {
-                    *arg.add(1 + w * 8 + i) = *b;
+                    *arg.add(2 + w * 8 + i) = *b;
                 }
             }
             total as i32
         }
         reconfigure::MODULE_DONE => {
-            if arg.is_null() || arg_len < 1 {
+            let Some(idx) = module_arg(arg, arg_len) else {
                 return E_INVAL;
-            }
-            let idx = core::ptr::read(arg) as usize;
+            };
             if scheduler::module_is_finished(idx) {
                 1
             } else {
@@ -2413,11 +2424,13 @@ unsafe fn handle_fault_monitor_op(handle: i32, opcode: u32, arg: *mut u8, arg_le
             0
         }
         monitor::FAULT_RAISE => {
-            if arg.is_null() || arg_len < 2 {
+            if arg_len < 3 {
                 return E_INVAL;
             }
-            let idx = core::ptr::read(arg) as usize;
-            let kind = core::ptr::read(arg.add(1));
+            let Some(idx) = module_arg(arg, arg_len) else {
+                return E_INVAL;
+            };
+            let kind = core::ptr::read(arg.add(2));
             scheduler::raise_module_fault(idx, kind);
             0
         }
@@ -2850,7 +2863,7 @@ unsafe extern "C" fn stub_channel_peek(_handle: i32, _buf: *mut u8, _len: usize)
 
 /// Release all hardware handles owned by a module.
 /// Called when a module finishes (done or error) to prevent resource leaks.
-pub fn release_module_handles(module_idx: u8) {
+pub fn release_module_handles(module_idx: ModuleId) {
     // Release platform-specific handles (GPIO, DMA FDs, etc.)
     hal::release_platform_handles(module_idx);
     // Release events

@@ -154,7 +154,7 @@ unsafe fn wasm_net_policy_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
 /// resource directly. Per-handle cleanup happens through
 /// `provider_close` / the channel HUP path; this hook would only
 /// matter if WASM ever grew kernel-side per-module bookkeeping.
-fn wasm_release_module_handles(_id: u8) {
+fn wasm_release_module_handles(_id: crate::kernel::exec::scheduler::ModuleId) {
     // See docstring — no kernel-side resources to release on the
     // WASM target. The browser shim owns its own lifetimes.
 }

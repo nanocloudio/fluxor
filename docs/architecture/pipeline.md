@@ -223,7 +223,9 @@ if ready & POLL_IN != 0 {
 
 A channel is a ring buffer between exactly one producer and one
 consumer. Fan-out and fan-in are handled by tee/merge helper modules
-inserted by the runner when wiring requires them. The kernel allocates
+inserted by the runner when wiring requires them: at boot for the graph,
+and when a workload's subgraph is staged at runtime for the ports of that
+subgraph's own modules, by the same rules. The kernel allocates
 channel buffers from a dedicated buffer arena, separate from module
 state, so that channel sizing does not compete with module memory.
 
@@ -502,11 +504,11 @@ per-architecture profiles in `modules/sdk/abi/config.rs`:
 
 | Resource | Constant | Values |
 |----------|----------|--------|
-| Modules | `MAX_MODULES` | 32 (embedded profile), 48 (wasm), 255 (aarch64) |
-| Channel edges | `MAX_GRAPH_EDGES` | 128, or 384 where `MAX_MODULES` exceeds 128 (`src/kernel/boot/config.rs`) |
+| Modules | `MAX_MODULES` | 32 (embedded profile), 48 (wasm), 1024 (aarch64) |
+| Channel edges | `MAX_GRAPH_EDGES` | 128, or 1536 where `MAX_MODULES` exceeds 128 (`src/kernel/boot/config.rs`) |
 | Event slots | `MAX_EVENTS` | 32 (`src/kernel/ipc/event.rs`) |
-| State arena | `STATE_ARENA_SIZE` | 64 KiB (rp2040), 240 KiB (rp2350), 96 MiB (wasm), 256 MiB (aarch64) |
-| Buffer arena | `BUFFER_ARENA_SIZE` | 16 KiB (rp2040), 64 KiB (rp2350), 8 MiB (wasm, aarch64) |
+| State arena | `STATE_ARENA_SIZE` | 64 KiB (rp2040), 240 KiB (rp2350), 96 MiB (wasm), 1 GiB (aarch64) |
+| Buffer arena | `BUFFER_ARENA_SIZE` | 16 KiB (rp2040), 64 KiB (rp2350), 8 MiB (wasm), 16 MiB (aarch64) |
 | Buffer slots | `MAX_BUFFER_SLOTS` | one per channel: `MAX_GRAPH_EDGES` (`src/kernel/ipc/buffer_pool.rs`) |
 
 These are sized per silicon: small embedded targets have tight

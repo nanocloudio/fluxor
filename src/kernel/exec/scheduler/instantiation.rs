@@ -235,7 +235,7 @@ pub(crate) fn push_internal_module(
     let idx = *module_count;
     module_list[idx] = Some(ModuleEntry {
         name_hash,
-        id: idx as u8,
+        id: idx as ModuleId,
         domain_id,
         pre_tick_drain: false,
         frame_kind,
@@ -316,7 +316,7 @@ pub(crate) fn finalize_module(
         }
         p += 1;
     }
-    syscalls::release_module_handles(module_idx as u8);
+    syscalls::release_module_handles(module_idx as ModuleId);
     sched.finished[module_idx] = true;
 }
 
@@ -431,8 +431,8 @@ pub fn maybe_emit_alive(tick: u64, domain_id: Option<usize>) {
 }
 
 /// How many modules are faulted or terminated, and the index of the lowest
-/// such module (`u8::MAX` when none). Used by the heartbeat above.
-fn down_module_summary() -> (u32, u8) {
+/// such module (`NO_MODULE` when none). Used by the heartbeat above.
+fn down_module_summary() -> (u32, ModuleId) {
     use crate::kernel::exec::step_guard::FaultState;
     // SAFETY: scheduler-thread read.
     let sched = unsafe {
@@ -440,13 +440,13 @@ fn down_module_summary() -> (u32, u8) {
         &*p
     };
     let mut down = 0u32;
-    let mut first = u8::MAX;
+    let mut first = NO_MODULE;
     for i in 0..MAX_MODULES {
         match sched.fault_info[i].state {
             FaultState::Faulted | FaultState::Terminated => {
                 down += 1;
-                if first == u8::MAX {
-                    first = i as u8;
+                if first == NO_MODULE {
+                    first = i as ModuleId;
                 }
             }
             _ => {}
@@ -600,7 +600,7 @@ static LAST_ALIVE_MS: [portable_atomic::AtomicU64; MAX_DOMAINS] =
 const ALIVE_INTERVAL_MS: u64 = 30_000;
 /// Last module index attempted before a crash — readable by HardFault handler
 #[no_mangle]
-pub static mut DBG_STEP_MODULE: u8 = 0xFF;
+pub static mut DBG_STEP_MODULE: ModuleId = NO_MODULE;
 
 /// Crash data buffer in .uninit section — NOT zeroed at startup,
 /// survives SYSRESETREQ software resets. Written by HardFault handler, read at tick 500.
@@ -725,7 +725,7 @@ pub fn params_request_isolation(params: &[u8]) -> bool {
 /// - 0xF4: trust_tier (u8)
 /// - 0xF5: protection (u8)
 /// - 0xF6: step_deadline_burst_us (u32 LE)
-/// - 0xF7: quarantine_partner (u8 module index, 0xFF = none)
+/// - 0xF7: quarantine_partner (u16 LE module index)
 /// - 0xF8: heap_zero_on_free (u8 bool)
 /// - 0xF9: heap_fault_on_alloc_failure (u8 bool)
 /// - 0xFA: heap_canary_enabled (u8 bool)
@@ -825,9 +825,9 @@ pub fn parse_protection_config(module_idx: usize, params: &[u8]) {
                 ]);
                 fi.step_deadline_burst_us = val;
             }
-            0xF7 if len == 1 => {
-                // quarantine_partner (u8 module index, 0xFF = none)
-                fi.quarantine_partner = params[pos];
+            0xF7 if len == 2 => {
+                // quarantine_partner (u16 LE module index)
+                fi.quarantine_partner = u16::from_le_bytes([params[pos], params[pos + 1]]);
             }
             0xF8 if len == 1 => {
                 // heap.zero_on_free (u8 bool). Heap setter touches

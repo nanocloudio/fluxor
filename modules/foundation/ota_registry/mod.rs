@@ -1007,11 +1007,11 @@ unsafe fn pump_net(s: &mut State) -> bool {
     let payload = core::slice::from_raw_parts(nbuf.add(3), payload_len);
     match msg_type {
         NET_MSG_CONNECTED => {
-            // [conn_id: u16][requester_tag: u8]
-            if s.phase == Phase::WaitConnect && payload_len >= 2 {
-                let tag = if payload_len >= 3 { payload[2] } else { 0 };
-                if tag == 0 || tag == dev_requester_tag(sys) {
-                    s.conn_id = u16::from_le_bytes([payload[0], payload[1]]);
+            // [conn_id: u16 LE][requester_tag: u16 LE]
+            if s.phase == Phase::WaitConnect && payload_len >= net_proto::CONN_ID_LEN {
+                let (cid, tag) = net_proto::connected_parts(payload);
+                if tag == net_proto::REQUESTER_TAG_NONE || tag == dev_requester_tag(sys) {
+                    s.conn_id = cid;
                     s.conn_present = 1;
                     let len = build_request(s);
                     s.tx_len = len as u16;
@@ -1106,7 +1106,7 @@ unsafe fn pump_net(s: &mut State) -> bool {
             }
         }
         NET_MSG_ERROR => {
-            // Payload: [conn_id u16][errno][tag]. Claim only errors for
+            // Payload: [conn_id u16][errno][tag u16?]. Claim only errors for
             // the CURRENT connection (established) or a connect-phase
             // failure that isn't a late event from the previous conn.
             let cid = if payload_len >= 2 {

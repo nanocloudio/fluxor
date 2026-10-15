@@ -10,8 +10,9 @@ pub const WRITE: u32 = 0x0CE0;
 pub const READ: u32 = 0x0CE1;
 /// Poll bridge readiness. handle=bridge_fd. Returns 1 if readable, 0 if not.
 pub const POLL: u32 = 0x0CE2;
-/// Get bridge info. handle=bridge_fd, arg=12-byte output buffer.
-/// Returns: [type:u8, from:u8, to:u8, _:u8, drops:u32 LE, seq:u32 LE]
+/// Get bridge info. handle=bridge_fd, arg=16-byte output buffer.
+/// Returns: [type:u8, 0:u8, from:u16 LE, to:u16 LE, 0:u16, drops:u32 LE,
+/// seq:u32 LE]
 pub const INFO: u32 = 0x0CE3;
 
 /// Enumerate the *calling* module's own bridge endpoints. handle is ignored

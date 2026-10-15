@@ -149,7 +149,7 @@ pub(crate) fn compute_exec_order(edges: &[Edge], edge_count: usize, module_count
     };
 
     // Compute in-degree for each module
-    let mut in_degree = [0u8; MAX_MODULES];
+    let mut in_degree = [0u16; MAX_MODULES];
     for e in edges.iter().take(edge_count) {
         if e.channel >= 0 && e.to_module < module_count {
             in_degree[e.to_module] = in_degree[e.to_module].saturating_add(1);
@@ -157,12 +157,12 @@ pub(crate) fn compute_exec_order(edges: &[Edge], edge_count: usize, module_count
     }
 
     // BFS queue: start with modules that have no incoming edges (sources)
-    let mut queue = [0u8; MAX_MODULES];
+    let mut queue = [0 as ModuleId; MAX_MODULES];
     let mut qhead: usize = 0;
     let mut qtail: usize = 0;
     for (i, &deg) in in_degree.iter().take(module_count).enumerate() {
         if deg == 0 {
-            queue[qtail] = i as u8;
+            queue[qtail] = i as ModuleId;
             qtail += 1;
         }
     }
@@ -171,7 +171,7 @@ pub(crate) fn compute_exec_order(edges: &[Edge], edge_count: usize, module_count
     while qhead < qtail {
         let m = queue[qhead] as usize;
         qhead += 1;
-        exec_order[count] = m as u8;
+        exec_order[count] = m as ModuleId;
         count += 1;
 
         // Decrement in-degree of all successors
@@ -179,7 +179,7 @@ pub(crate) fn compute_exec_order(edges: &[Edge], edge_count: usize, module_count
             if e.channel >= 0 && e.from_module == m && e.to_module < module_count {
                 in_degree[e.to_module] -= 1;
                 if in_degree[e.to_module] == 0 {
-                    queue[qtail] = e.to_module as u8;
+                    queue[qtail] = e.to_module as ModuleId;
                     qtail += 1;
                 }
             }
@@ -198,7 +198,7 @@ pub(crate) fn compute_exec_order(edges: &[Edge], edge_count: usize, module_count
         for i in 0..module_count {
             let mut found = false;
             for &m in exec_order.iter().take(count) {
-                if m == i as u8 {
+                if m == i as ModuleId {
                     found = true;
                     break;
                 }
@@ -207,7 +207,7 @@ pub(crate) fn compute_exec_order(edges: &[Edge], edge_count: usize, module_count
                 if first_unordered < 0 {
                     first_unordered = i as i32;
                 }
-                exec_order[count] = i as u8;
+                exec_order[count] = i as ModuleId;
                 count += 1;
             }
         }
@@ -258,7 +258,7 @@ pub(crate) fn compute_domain_exec_orders_static(_module_count: usize) {
         if sched.pre_tick_drain[module_idx] {
             let pcount = sched.domain_pre_tick_count[domain] as usize;
             if pcount < MAX_PRE_TICK_PER_DOMAIN {
-                sched.domain_pre_tick_order[domain][pcount] = module_idx as u8;
+                sched.domain_pre_tick_order[domain][pcount] = module_idx as ModuleId;
                 sched.domain_pre_tick_count[domain] = (pcount + 1) as u8;
             } else {
                 log::error!(
@@ -271,8 +271,8 @@ pub(crate) fn compute_domain_exec_orders_static(_module_count: usize) {
 
         let count = sched.domain_module_count[domain] as usize;
         if count < MAX_MODULES {
-            sched.domain_exec_order[domain][count] = module_idx as u8;
-            sched.domain_module_count[domain] = (count + 1) as u8;
+            sched.domain_exec_order[domain][count] = module_idx as ModuleId;
+            sched.domain_module_count[domain] = (count + 1) as ModuleId;
         }
     }
 
@@ -372,14 +372,14 @@ pub fn recompute_domain_orders(affected_mask: u32) {
         if sched.pre_tick_drain[module_idx] {
             let pcount = sched.domain_pre_tick_count[domain] as usize;
             if pcount < MAX_PRE_TICK_PER_DOMAIN {
-                sched.domain_pre_tick_order[domain][pcount] = module_idx as u8;
+                sched.domain_pre_tick_order[domain][pcount] = module_idx as ModuleId;
                 sched.domain_pre_tick_count[domain] = (pcount + 1) as u8;
             }
         } else {
             let count = sched.domain_module_count[domain] as usize;
             if count < MAX_MODULES {
-                sched.domain_exec_order[domain][count] = module_idx as u8;
-                sched.domain_module_count[domain] = (count + 1) as u8;
+                sched.domain_exec_order[domain][count] = module_idx as ModuleId;
+                sched.domain_module_count[domain] = (count + 1) as ModuleId;
             }
         }
     }

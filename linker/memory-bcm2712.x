@@ -11,14 +11,23 @@
 ENTRY(_start)
 EXTERN(_start)
 
-/* LENGTH must hold .bss, which is dominated by the profile_host arenas
- * (abi::config::kernel: STATE_ARENA_SIZE 256M + BUFFER_ARENA_SIZE 8M) plus
- * the fixed tables/pools and the 16M-aligned .bss window. 512M
- * leaves headroom and both backings cover it: QEMU virt runs with -m 1G
- * (origin 0x4008_0000 → region ends 0x6008_0000, ~511M left for the
- * relocated package payload above __end_block_addr) and Pi 5 has 8 GiB. */
+/* RAM holds the image, .bss (the buffer arena, elastic region, fixed tables
+ * and pools, ~100 MiB on the host profile) and the stack, with the relocated
+ * package payload above __end_block_addr.
+ *
+ * The module state arena (abi::config::kernel::STATE_ARENA_SIZE, 1 GiB) is
+ * a region of its own at ARENA_ORIGIN, never zeroed at boot: the loader
+ * zeroes each allocation as it hands it out. It cannot sit in RAM. On the
+ * Pi 5 the firmware's memory map (the DTB's /memory node) is
+ * 0..0x3FC0_0000 and 0x4000_0000 up: the top 4 MiB of the first GB is the
+ * firmware's (its nvram copy sits at 0x3FD2_xxxx), and the firmware places
+ * the DTB and initramfs near 0x2E00_0000. A boot that writes over either
+ * never comes up, so RAM stays below them and the arena takes the DRAM above
+ * 1 GB. QEMU virt (-m 2G: RAM 0x4000_0000..0xC000_0000) takes the arena in
+ * its upper half. Both are mapped as DRAM by the boot page tables. */
 MEMORY {
     RAM : ORIGIN = RAM_ORIGIN, LENGTH = 512M
+    ARENA : ORIGIN = ARENA_ORIGIN, LENGTH = 1024M
 }
 
 SECTIONS {
@@ -90,6 +99,12 @@ SECTIONS {
 
     /* End of runtime-reserved RAM. Relocated package payload lives above this. */
     __end_block_addr = .;
+
+    /* Placed last: the location counter moves into ARENA here, and every
+       symbol above is a RAM address. */
+    .state_arena (NOLOAD) : ALIGN(4096) {
+        *(.state_arena)
+    } > ARENA
 
     /DISCARD/ : {
         *(.ARM.exidx .ARM.exidx.*)

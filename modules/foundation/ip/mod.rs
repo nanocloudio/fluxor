@@ -363,7 +363,7 @@ struct DnsPending {
     name_len: u8,
     flags: u8,
     /// Requester tag the dial's `MSG_CONNECTED` / `MSG_ERROR` carries.
-    tag: u8,
+    tag: RequesterTag,
     /// Retransmissions the leader has made.
     retries: u8,
     /// Destination port of the dial.
@@ -2528,21 +2528,24 @@ unsafe fn net_send_bound(s: &mut IpState, conn_id: u16, local_port: u16) {
 #[inline(always)]
 #[must_use]
 unsafe fn net_send_connected(s: &mut IpState, conn_id: u16) -> bool {
-    // Payload `[conn_id:2 LE][requester_tag]` — the tag echoes the connecting
-    // module's dial tag so a fanned net_out routes the event back to it.
+    // Payload `[conn_id:2 LE][requester_tag:2 LE]` — the tag echoes the
+    // connecting module's dial tag so a fanned net_out routes the event back
+    // to it.
     let tag = if (conn_id as usize) < s.tcp_conns.len() {
         s.tcp_conns[conn_id as usize].connect_tag
     } else {
-        0
+        REQUESTER_TAG_NONE
     };
-    let mut frame = [0u8; 6];
+    let mut frame = [0u8; 7];
     let cb = conn_id.to_le_bytes();
+    let tb = tag.to_le_bytes();
     core::ptr::write_volatile(frame.as_mut_ptr(), NET_MSG_CONNECTED);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(1), 3u8);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(1), 4u8);
     core::ptr::write_volatile(frame.as_mut_ptr().add(2), 0u8);
     core::ptr::write_volatile(frame.as_mut_ptr().add(3), cb[0]);
     core::ptr::write_volatile(frame.as_mut_ptr().add(4), cb[1]);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(5), tag);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(5), tb[0]);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(6), tb[1]);
     net_send_or_queue(s, &frame)
 }
 
@@ -2550,7 +2553,7 @@ unsafe fn net_send_connected(s: &mut IpState, conn_id: u16) -> bool {
 /// or queued; callers latching `pending_close_notify` on connect /
 /// accept failure use the bool to know whether the latch is needed.
 #[inline(always)]
-unsafe fn net_send_error(s: &mut IpState, conn_id: u16, errno: i8, tag: u8) -> bool {
+unsafe fn net_send_error(s: &mut IpState, conn_id: u16, errno: i8, tag: RequesterTag) -> bool {
     let ch = out_chan_conn(s, conn_id as usize);
     net_send_error_to(s, ch, conn_id, errno, tag)
 }
@@ -2558,7 +2561,7 @@ unsafe fn net_send_error(s: &mut IpState, conn_id: u16, errno: i8, tag: u8) -> b
 /// An error answering the command being served, naming no endpoint
 /// (`conn_id` 0): a refused bind or dial. It goes to the lane that sent the
 /// command.
-unsafe fn net_send_reply_error(s: &mut IpState, errno: i8, tag: u8) -> bool {
+unsafe fn net_send_reply_error(s: &mut IpState, errno: i8, tag: RequesterTag) -> bool {
     let ch = lane_evt(s, s.cur_lane);
     net_send_error_to(s, ch, 0, errno, tag)
 }
@@ -2567,23 +2570,31 @@ unsafe fn net_send_reply_error(s: &mut IpState, errno: i8, tag: u8) -> bool {
 /// consumer hears it, no workload lane does.
 unsafe fn net_send_node_error(s: &mut IpState, errno: i8) -> bool {
     let ch = s.net_out_chan;
-    net_send_error_to(s, ch, 0, errno, 0)
+    net_send_error_to(s, ch, 0, errno, REQUESTER_TAG_NONE)
 }
 
-unsafe fn net_send_error_to(s: &mut IpState, ch: i32, conn_id: u16, errno: i8, tag: u8) -> bool {
-    // Payload `[conn_id:2 LE][errno][requester_tag]`. The tag echoes the
+unsafe fn net_send_error_to(
+    s: &mut IpState,
+    ch: i32,
+    conn_id: u16,
+    errno: i8,
+    tag: RequesterTag,
+) -> bool {
+    // Payload `[conn_id:2 LE][errno][requester_tag:2 LE]`. The tag echoes the
     // failing dial's tag so a consumer sharing a fanned net_out
     // attributes a connect failure to the right requester (it has no conn_id
     // yet). Errors not tied to an outbound connect pass tag 0 (untagged).
-    let mut frame = [0u8; 7];
+    let mut frame = [0u8; 8];
     let cb = conn_id.to_le_bytes();
+    let tb = tag.to_le_bytes();
     core::ptr::write_volatile(frame.as_mut_ptr(), NET_MSG_ERROR);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(1), 4u8);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(1), 5u8);
     core::ptr::write_volatile(frame.as_mut_ptr().add(2), 0u8);
     core::ptr::write_volatile(frame.as_mut_ptr().add(3), cb[0]);
     core::ptr::write_volatile(frame.as_mut_ptr().add(4), cb[1]);
     core::ptr::write_volatile(frame.as_mut_ptr().add(5), errno as u8);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(6), tag);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(6), tb[0]);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(7), tb[1]);
     net_send_or_queue_to(s, ch, &frame)
 }
 
@@ -6977,7 +6988,7 @@ fn state_allows_send(state: tcp::TcpState) -> bool {
 /// and notify both consumers. Failure surfaces exactly like the TCP
 /// path's: ECONNREFUSED when nothing listens, ENOMEM when the table
 /// is full — a consumer cannot tell the fastpath from a real connect.
-unsafe fn connect_loopback(s: &mut IpState, port: u16, requester_tag: u8) {
+unsafe fn connect_loopback(s: &mut IpState, port: u16, requester_tag: RequesterTag) {
     // A listener must exist BEFORE the pair is allocated.
     if find_listener_indexed(s, port, tcp::LOCAL_SLOT_ANY, false).is_none() {
         let _ = net_send_reply_error(s, -111, requester_tag); // ECONNREFUSED
@@ -7026,7 +7037,7 @@ unsafe fn connect_loopback(s: &mut IpState, port: u16, requester_tag: u8) {
         v.remote_port = local_port;
         v.local_port = port;
         v.local_slot = 0;
-        v.connect_tag = 0;
+        v.connect_tag = REQUESTER_TAG_NONE;
         v.retransmit_timer = 0;
     }
     // Both slots go through the same admission `conn_reset` undoes. A
@@ -7805,14 +7816,11 @@ unsafe fn service_net_channel(s: &mut IpState) {
                     }
                     None => {
                         // Malformed: a truncated address, an unknown family,
-                        // a name past the ceiling. EINVAL goes to the
-                        // record's last byte — the one a tag would occupy —
-                        // as `read_connect_to` states.
-                        let tag = if plen > 0 {
-                            buf[plen - 1]
-                        } else {
-                            REQUESTER_TAG_NONE
-                        };
+                        // a name past the ceiling. EINVAL goes to the tag
+                        // the record's last two bytes spell, as
+                        // `read_connect_to` states.
+                        let tag =
+                            abi::contracts::net::net_proto::malformed_connect_to_tag(&buf[..plen]);
                         net_send_reply_error(s, -22, tag);
                     }
                 }
@@ -8124,13 +8132,15 @@ unsafe fn service_net_channel(s: &mut IpState) {
 // ============================================================================
 
 /// No routing tag on a connect (`net_proto::REQUESTER_TAG_NONE`).
-const REQUESTER_TAG_NONE: u8 = abi::contracts::net::net_proto::REQUESTER_TAG_NONE;
+const REQUESTER_TAG_NONE: RequesterTag = abi::contracts::net::net_proto::REQUESTER_TAG_NONE;
+/// A dial's routing tag (`net_proto::RequesterTag`).
+type RequesterTag = abi::contracts::net::net_proto::RequesterTag;
 
 /// Open a TCP connection to a literal address (host order, as `remote_ip`
 /// holds it). A connect to this host's own address is served in-module by
 /// the local-delivery fastpath; anything else takes a slot, an ephemeral
 /// port and a SYN. Failure is reported as `MSG_ERROR` on `requester_tag`.
-unsafe fn connect_v4(s: &mut IpState, ip: u32, port: u16, requester_tag: u8) {
+unsafe fn connect_v4(s: &mut IpState, ip: u32, port: u16, requester_tag: RequesterTag) {
     // LOCAL-DELIVERY FASTPATH: a connect to this host's own address (or
     // 127.0.0.1) is served entirely in-module — see `loopback_peer`.
     if ip == 0x7F00_0001 || (s.local_ip != 0 && ip == s.local_ip) {
@@ -8277,7 +8287,7 @@ unsafe fn dns_cache_put(s: &mut IpState, name: &[u8], addr: u32, ttl_s: u32, now
 /// Dial a name: from the cache when it is in hand, otherwise parked on a
 /// lookup until the answer lands. Refusals and failures are reported as
 /// `MSG_ERROR` on `requester_tag`.
-unsafe fn connect_by_name(s: &mut IpState, name: &[u8], port: u16, requester_tag: u8) {
+unsafe fn connect_by_name(s: &mut IpState, name: &[u8], port: u16, requester_tag: RequesterTag) {
     let mut held = [0u8; DNS_NAME_CAP];
     let len = resolver_normalise(name, &mut held);
     if len == 0 {
@@ -8371,7 +8381,7 @@ unsafe fn resolver_start(
     s: &mut IpState,
     name: &[u8],
     port: u16,
-    tag: u8,
+    tag: RequesterTag,
     cache_only: bool,
     now_ms: u32,
 ) -> Result<(), i8> {

@@ -794,7 +794,7 @@ fn unknown_module_in_wiring(name: &str, declared_names: &[String]) -> String {
 
 /// One entry per wire: `(from_id, to_id, to_port, from_port_index, to_port_index)`.
 /// `to_port`: 0 = data input, 1 = control input.
-type WireTuple = (u8, u8, u8, u8, u8);
+type WireTuple = (u16, u16, u8, u8, u8);
 
 /// Result bundle from `parse_wiring_edges`: tuples, force flags,
 /// and the original source/destination spec strings (parallel arrays).
@@ -835,12 +835,12 @@ fn parse_wiring_edges(
             .iter()
             .position(|n| n == from_name)
             .ok_or_else(|| Error::Config(unknown_module_in_wiring(from_name, names)))?
-            as u8;
+            as u16;
         let to_id = names
             .iter()
             .position(|n| n == to_name)
             .ok_or_else(|| Error::Config(unknown_module_in_wiring(to_name, names)))?
-            as u8;
+            as u16;
 
         edges.push((from_id, to_id, to_port, from_port_index, to_port_index));
         force_flags.push(force);
@@ -1064,10 +1064,10 @@ fn build_hardware_section(
             _ => 1u8,
         };
 
-        // Owner module: resolve name to index, 0xFF = kernel-owned
-        let owner_module_id: u8 = if let Some(owner_name) = gpio["owner"].as_str() {
+        // Owner module: resolve name to index, 0xFFFF = kernel-owned
+        let owner_module_id: u16 = if let Some(owner_name) = gpio["owner"].as_str() {
             match module_names.iter().position(|n| n == owner_name) {
-                Some(idx) => idx as u8,
+                Some(idx) => idx as u16,
                 None => {
                     return Err(Error::Config(format!(
                         "hardware.gpio[{i}].owner: unknown module '{owner_name}'"
@@ -1075,7 +1075,7 @@ fn build_hardware_section(
                 }
             }
         } else {
-            0xFF // kernel-owned (default)
+            0xFFFF // kernel-owned (default)
         };
 
         // flags: bit0 = direction (0=in, 1=out), bit1-2 = pull (0=none, 1=up, 2=down)
@@ -1084,8 +1084,7 @@ fn build_hardware_section(
         result.push(pin);
         result.push(flags);
         result.push(initial);
-        result.push(owner_module_id);
-        result.push(0); // reserved
+        result.extend_from_slice(&owner_module_id.to_le_bytes());
     }
 
     // PIO configs (4 bytes each): pio_idx, data_pin, clk_pin, extra_pin

@@ -482,7 +482,7 @@ pub fn free_module_state(module_idx: usize) {
     } else {
         // Elastic-region chunks the module grew into: teardown IS the reclaim
         // path — release them before the slot is reused.
-        crate::kernel::mem::elastic::reclaim_module(module_idx as u8);
+        crate::kernel::mem::elastic::reclaim_module(module_idx as ModuleId);
         // SAFETY: the module is unspliced and never stepped again, and no
         // source holds a buffer inside its memory.
         unsafe { memory.release() };

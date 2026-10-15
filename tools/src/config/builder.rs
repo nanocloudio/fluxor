@@ -2212,7 +2212,7 @@ fn expand_compound_yaml_fields(type_name: &str, module: &Value, config: &Value) 
 fn build_module_entry(
     name: &str,
     module: &Value,
-    id: u8,
+    id: u16,
     data_section: Option<&Value>,
     config: &Value,
     loc: schema::ModuleLocation<'_>,
@@ -2232,16 +2232,22 @@ fn build_module_entry(
     // This allows multiple instances: name: seq_kick, type: sequencer
     let name_hash = fnv1a_hash(type_name.as_bytes());
     // Header layout (10 bytes total):
-    //   bytes 0-3: entry_length (u32, patched in below at line ~1953)
+    //   bytes 0-3: entry_length (u32, patched in once the params are sized)
     //   bytes 4-7: name_hash (u32)
-    //   byte 8:    module id
+    //   byte 8:    module id, low byte
     //   byte 9:    bits 0-2 = domain_id (0..7), bit 4 = pre_tick_drain
-    //              (Tier 1c opt-in). Mirrored from
-    //              `manifest.pre_tick_drain`. Kept on the module entry
-    //              (not the .fmod manifest) so the kernel reads it
-    //              during `prepare_graph` without a second loader pass.
+    //              (Tier 1c opt-in), bits 5-6 = module id bits 8-9.
+    //              `pre_tick_drain` is mirrored from the manifest and kept
+    //              on the module entry (not the .fmod manifest) so the
+    //              kernel reads it during `prepare_graph` without a second
+    //              loader pass.
+    if id >= 1024 {
+        return Err(Error::Config(format!(
+            "module `{name}` has id {id}; a module id carries 10 bits"
+        )));
+    }
     entry[4..8].copy_from_slice(&name_hash.to_le_bytes());
-    entry[8] = id;
+    entry[8] = (id & 0xFF) as u8;
     let domain_id = resolve_domain_id(module, config)?;
     if domain_id > 7 {
         return Err(Error::Config(format!(
@@ -2249,16 +2255,12 @@ fn build_module_entry(
         )));
     }
     // `manifests` was populated by `load_module_manifests_with_extra`
-    // against the SAME resolver chain that admission validation
-    // uses (project root, install root, caller-supplied extras).
-    // The previous version called `Manifest::from_source_tree`
-    // here, which used a hard-coded `SOURCE_DIRS` list — modules
-    // outside that list (e.g. an installed driver with
-    // `pre_tick_drain = true`) would pass admission but emit a
-    // config blob with the bit clear, silently demoting the module
-    // out of `domain_pre_tick_order` at runtime.
+    // against the same resolver chain that admission validation uses
+    // (project root, install root, caller-supplied extras), so a module
+    // admission finds — an installed driver among them — carries its
+    // `pre_tick_drain` bit here too.
     let pre_tick_drain = manifests.get(name).is_some_and(|m| m.pre_tick_drain);
-    entry[9] = domain_id | (if pre_tick_drain { 0x10 } else { 0 });
+    entry[9] = domain_id | (if pre_tick_drain { 0x10 } else { 0 }) | (((id >> 8) as u8 & 0x03) << 5);
 
     // Track actual params length used
     let params_len: usize;
@@ -2643,7 +2645,7 @@ fn build_module_entry(
         }
     }
 
-    // Tag 0xF7: quarantine_partner (u8 module index, 0xFF = none).
+    // Tag 0xF7: quarantine_partner (u16 LE module index).
     // Accepts either the partner's index directly (`quarantine_partner:
     // 3`) or its name (`quarantine_partner: "tls_handshake"`). Name
     // resolution happens in the wiring pass once the module-name →
@@ -2670,11 +2672,12 @@ fn build_module_entry(
                     max_modules - 1
                 )));
             }
-            if base + extra_len + 3 < entry.len() {
+            if base + extra_len + 4 < entry.len() {
                 entry[base + extra_len] = 0xF7;
-                entry[base + extra_len + 1] = 1;
-                entry[base + extra_len + 2] = partner as u8;
-                extra_len += 3;
+                entry[base + extra_len + 1] = 2;
+                entry[base + extra_len + 2..base + extra_len + 4]
+                    .copy_from_slice(&(partner as u16).to_le_bytes());
+                extra_len += 4;
             }
         }
     }
@@ -3051,13 +3054,13 @@ pub(crate) fn parse_modules_map(
     // declaration order. Forward and backward partner references both
     // resolve here. Modules using `quarantine_partner_idx: N`
     // (numeric form) bypass this entirely.
-    let mut name_to_idx: std::collections::HashMap<String, u8> = std::collections::HashMap::new();
+    let mut name_to_idx: std::collections::HashMap<String, u16> = std::collections::HashMap::new();
     for (idx, m) in list.iter().enumerate() {
         if idx >= max_modules {
             break;
         }
         if let Some(n) = m.get("name").and_then(|v| v.as_str()) {
-            name_to_idx.entry(n.to_string()).or_insert(idx as u8);
+            name_to_idx.entry(n.to_string()).or_insert(idx as u16);
         }
     }
 
@@ -3095,7 +3098,7 @@ pub(crate) fn parse_modules_map(
         // rest of the build.
         let mut module_owned = module.clone();
         let partner_val = module.get("quarantine_partner");
-        let resolved_idx: Option<u8> = match partner_val {
+        let resolved_idx: Option<u16> = match partner_val {
             Some(v) if v.is_string() => {
                 let partner_name = v.as_str().unwrap();
                 let idx = name_to_idx.get(partner_name).copied().ok_or_else(|| {
@@ -3113,7 +3116,7 @@ pub(crate) fn parse_modules_map(
                         max_modules - 1
                     )));
                 }
-                Some(n as u8)
+                Some(n as u16)
             }
             Some(_) => {
                 return Err(Error::Config(format!(
@@ -3132,7 +3135,7 @@ pub(crate) fn parse_modules_map(
             }
         }
 
-        let id = idx as u8;
+        let id = idx as u16;
         let entry = build_module_entry(
             name,
             &module_owned,

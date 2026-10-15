@@ -548,7 +548,7 @@ fn resolve_port_spec<'a>(
 /// If a need surfaces to enforce required ctrl inputs too, this
 /// validator extends easily.
 fn validate_required_inputs_wired(
-    edges: &[(u8, u8, u8, u8, u8)],
+    edges: &[(u16, u16, u8, u8, u8)],
     module_names: &[String],
     manifests: &HashMap<String, Manifest>,
 ) -> Result<()> {
@@ -560,7 +560,7 @@ fn validate_required_inputs_wired(
     // manifest's direction byte.
     //   wire_to_port 0 + manifest direction 0 → data input.
     //   wire_to_port 1 + manifest direction 2 → ctrl input.
-    let mut covered_data: BTreeSet<(u8, u8)> = BTreeSet::new();
+    let mut covered_data: BTreeSet<(u16, u8)> = BTreeSet::new();
     for &(_, to_id, to_port, _, to_port_index) in edges {
         if to_port == 0 {
             covered_data.insert((to_id, to_port_index));
@@ -582,14 +582,13 @@ fn validate_required_inputs_wired(
             if port.direction != 0 {
                 continue;
             }
-            // flags bit 0 = required (per `Manifest::from_toml` at
-            // tools/src/manifest.rs line ~760). A non-required
+            // flags bit 0 = required (`Manifest::from_toml`). A non-required
             // input left unconnected is fine — module handles
             // empty input by design.
             if port.flags & 0x01 == 0 {
                 continue;
             }
-            if covered_data.contains(&(module_id as u8, port.index)) {
+            if covered_data.contains(&(module_id as u16, port.index)) {
                 continue;
             }
             // Build the most actionable label: prefer the port's
@@ -672,7 +671,7 @@ fn resolve_edge_rate_class(
 /// byte-stream edge. An edge is framed when either end's port is: by its
 /// content type's framing, or by the port's own `framed = true`.
 fn edge_framed_type(
-    edge: &(u8, u8, u8, u8, u8),
+    edge: &(u16, u16, u8, u8, u8),
     module_names: &[String],
     manifests: &HashMap<String, Manifest>,
 ) -> Option<u8> {
@@ -726,7 +725,7 @@ fn edge_framed_type(
 /// buffer-group max, validated by the runtime group pass.
 fn validate_wiring_capacity(
     config: &Value,
-    edges: &[(u8, u8, u8, u8, u8)],
+    edges: &[(u16, u16, u8, u8, u8)],
     module_names: &[String],
     manifests: &HashMap<String, Manifest>,
     from_specs: &[String],
@@ -905,7 +904,7 @@ fn validate_wiring_capacity(
 }
 
 fn validate_wiring_types(
-    edges: &[(u8, u8, u8, u8, u8)],
+    edges: &[(u16, u16, u8, u8, u8)],
     force_flags: &[bool],
     module_names: &[String],
     manifests: &HashMap<String, Manifest>,

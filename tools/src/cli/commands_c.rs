@@ -1327,7 +1327,7 @@ fn cmd_run(
                     "-smp",
                     "1",
                     "-m",
-                    "1G",
+                    "2G",
                     "-nographic",
                 ];
                 qemu_args.extend_from_slice(&[

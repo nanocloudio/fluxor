@@ -23,16 +23,29 @@ use portable_atomic::{AtomicBool, AtomicU32, Ordering};
 /// and filter word: `observe` + one `otel` per export destination + a spare.
 pub const CONSUMERS: usize = 4;
 
-// Capacity per target family, power of two. Telemetry records are denser than
-// log text, so this sits below the log ring's 4/64 KiB split. The `rp` MCUs
-// are RAM-constrained (the USB and network stacks + kernel share ~256/520 KiB), so they get
-// a modest ring; only the bcm2712 application processor gets the full 32 KiB.
+// Capacity per target family, power of two. The `rp` MCUs are RAM-constrained
+// (the USB and network stacks + kernel share ~256/520 KiB), so they get a
+// modest ring. Elsewhere the ring holds at least 32 KiB and always one whole
+// PSTATUS round, which grows with the module ceiling: 128 KiB on the host
+// profile's 1024 slots.
 #[cfg(feature = "chip-rp2040")]
 const CAPACITY: usize = 4096;
 #[cfg(all(feature = "rp", not(feature = "chip-rp2040")))]
 const CAPACITY: usize = 8192; // rp2350
 #[cfg(not(feature = "rp"))]
-const CAPACITY: usize = 32768; // bcm2712 / host
+const CAPACITY: usize = round_capacity(PSTATUS_ROUND);
+
+/// A ring for one PSTATUS round of `round` bytes: the next power of two,
+/// and never under 32 KiB.
+#[cfg(not(feature = "rp"))]
+const fn round_capacity(round: usize) -> usize {
+    let p = round.next_power_of_two();
+    if p > 32768 {
+        p
+    } else {
+        32768
+    }
+}
 const MASK: usize = CAPACITY - 1;
 
 /// One PSTATUS round: a `STEP` (52 B) and a `RES` (28 B) for every module slot,

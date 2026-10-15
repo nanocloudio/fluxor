@@ -82,26 +82,25 @@ const DS_PENDING_TERMINATE: u8 = 3;
 // Bits returned by RECONFIGURE_MODULE_INFO.
 const INFO_DRAIN_CAPABLE: u32 = 0x01;
 
-// Module-local drain-state capacity (2-bit state × N in the packed ds_
-// table below). Independent of the kernel's upstream-mask width — a graph
-// with more modules than this cannot be live-drained by this module and
-// falls back to the timeout path.
-const MAX_TRACKED_MODULES: usize = 32;
+// Drain-state capacity: one state byte per module slot the kernel's profile
+// holds, so every module of the graph is classified and drained.
+const MAX_TRACKED_MODULES: usize = abi::config::kernel::MAX_MODULES;
 
 // StepOutcome return values.
 const CONTINUE: i32 = 0;
 const READY: i32 = 3;
 
 // Sentinel for "self index not yet resolved".
-const SELF_IDX_UNKNOWN: u8 = 0xFF;
+const SELF_IDX_UNKNOWN: u16 = 0xFFFF;
 
 // Status event kinds emitted on the output channel. Each record is
-// 8 bytes: `[kind:u8, module_idx:u8, extra:u16 LE, tick:u32 LE]`.
+// 12 bytes: `[kind:u8, 0:u8, module_idx:u16 LE, extra:u16 LE, 0:u16,
+// tick:u32 LE]`.
 const STATUS_DRAINING_ENTERED: u8 = 0x01;
 const STATUS_MODULE_DRAINED: u8 = 0x02;
 const STATUS_MODULE_FORCED: u8 = 0x03;
 const STATUS_MIGRATING_ENTERED: u8 = 0x04;
-const STATUS_RECORD_SIZE: usize = 8;
+const STATUS_RECORD_SIZE: usize = 12;
 
 // ============================================================================
 // State
@@ -117,9 +116,8 @@ struct State {
     /// Output port 1 — graph_slot request channel. `-1` when unwired.
     gs_req_chan: i32,
     phase: u8,
-    self_idx: u8,
     signaled_ready: u8,
-    _pad0: u8,
+    self_idx: u16,
     tick_count: u32,
     drain_start_tick: u32,
     drain_timeout_ms: u32,
@@ -139,39 +137,33 @@ unsafe fn sys_set_phase(sys: &SyscallTable, phase: u8) {
     (sys.provider_call)(-1, SYS_RECONFIG_SET_PHASE, arg.as_mut_ptr(), 1);
 }
 
-unsafe fn sys_call_drain(sys: &SyscallTable, idx: u8) -> i32 {
-    let mut arg = [idx];
-    (sys.provider_call)(-1, SYS_RECONFIG_CALL_DRAIN, arg.as_mut_ptr(), 1)
+unsafe fn sys_call_drain(sys: &SyscallTable, idx: u16) -> i32 {
+    let mut arg = idx.to_le_bytes();
+    (sys.provider_call)(-1, SYS_RECONFIG_CALL_DRAIN, arg.as_mut_ptr(), 2)
 }
 
-unsafe fn sys_mark_finished(sys: &SyscallTable, idx: u8) {
-    let mut arg = [idx];
-    (sys.provider_call)(-1, SYS_RECONFIG_MARK_FINISHED, arg.as_mut_ptr(), 1);
+unsafe fn sys_mark_finished(sys: &SyscallTable, idx: u16) {
+    let mut arg = idx.to_le_bytes();
+    (sys.provider_call)(-1, SYS_RECONFIG_MARK_FINISHED, arg.as_mut_ptr(), 2);
 }
 
-unsafe fn sys_fault_raise(sys: &SyscallTable, idx: u8, kind: u8) {
-    let mut arg = [idx, kind];
-    (sys.provider_call)(-1, SYS_FAULT_RAISE, arg.as_mut_ptr(), 2);
+unsafe fn sys_fault_raise(sys: &SyscallTable, idx: u16, kind: u8) {
+    let i = idx.to_le_bytes();
+    let mut arg = [i[0], i[1], kind];
+    (sys.provider_call)(-1, SYS_FAULT_RAISE, arg.as_mut_ptr(), 3);
 }
 
-/// Write a single 8-byte status record to the output channel. Silently
+/// Write a single 12-byte status record to the output channel. Silently
 /// drops the event if the channel is not wired or the ring is full.
-unsafe fn emit_status(s: &State, sys: &SyscallTable, kind: u8, module_idx: u8, extra: u16) {
+unsafe fn emit_status(s: &State, sys: &SyscallTable, kind: u8, module_idx: u16, extra: u16) {
     if s.status_chan < 0 {
         return;
     }
     let mut rec = [0u8; STATUS_RECORD_SIZE];
-    let p = rec.as_mut_ptr();
-    core::ptr::write_volatile(p.add(0), kind);
-    core::ptr::write_volatile(p.add(1), module_idx);
-    let eb = extra.to_le_bytes();
-    core::ptr::write_volatile(p.add(2), eb[0]);
-    core::ptr::write_volatile(p.add(3), eb[1]);
-    let tb = s.tick_count.to_le_bytes();
-    core::ptr::write_volatile(p.add(4), tb[0]);
-    core::ptr::write_volatile(p.add(5), tb[1]);
-    core::ptr::write_volatile(p.add(6), tb[2]);
-    core::ptr::write_volatile(p.add(7), tb[3]);
+    rec[0] = kind;
+    rec[2..4].copy_from_slice(&module_idx.to_le_bytes());
+    rec[4..6].copy_from_slice(&extra.to_le_bytes());
+    rec[8..12].copy_from_slice(&s.tick_count.to_le_bytes());
     let _ = (sys.channel_write)(s.status_chan, rec.as_ptr(), STATUS_RECORD_SIZE);
 }
 
@@ -179,9 +171,9 @@ unsafe fn sys_module_count(sys: &SyscallTable) -> i32 {
     (sys.provider_call)(-1, SYS_RECONFIG_MODULE_COUNT, core::ptr::null_mut(), 0)
 }
 
-unsafe fn sys_module_info(sys: &SyscallTable, idx: u8) -> u32 {
-    let mut arg = [idx];
-    let rc = (sys.provider_call)(-1, SYS_RECONFIG_MODULE_INFO, arg.as_mut_ptr(), 1);
+unsafe fn sys_module_info(sys: &SyscallTable, idx: u16) -> u32 {
+    let mut arg = idx.to_le_bytes();
+    let rc = (sys.provider_call)(-1, SYS_RECONFIG_MODULE_INFO, arg.as_mut_ptr(), 2);
     if rc < 0 {
         0
     } else {
@@ -189,16 +181,16 @@ unsafe fn sys_module_info(sys: &SyscallTable, idx: u8) -> u32 {
     }
 }
 
-/// Upstream-mask words per the `MODULE_UPSTREAM` wire contract: 4 × u64
-/// covers the whole u8 module-index domain (256 modules) on every profile.
-const UPSTREAM_WORDS: usize = 4;
+/// Upstream-mask words per the `MODULE_UPSTREAM` wire contract: one bit per
+/// module slot of the kernel's profile.
+const UPSTREAM_WORDS: usize = MAX_TRACKED_MODULES.div_ceil(64);
 
-unsafe fn sys_module_upstream(sys: &SyscallTable, idx: u8) -> [u64; UPSTREAM_WORDS] {
-    // Arg layout: arg[0] = module idx in, arg[1..] = mask words u64 LE
-    // out (low word first); the kernel writes as many words as fit and
-    // returns its full word count.
-    let mut arg = [0u8; 1 + 8 * UPSTREAM_WORDS];
-    arg[0] = idx;
+unsafe fn sys_module_upstream(sys: &SyscallTable, idx: u16) -> [u64; UPSTREAM_WORDS] {
+    // Arg layout: arg[0..2] = module idx in (u16 LE), arg[2..] = mask words
+    // u64 LE out (low word first); the kernel writes as many words as fit
+    // and returns its full word count.
+    let mut arg = [0u8; 2 + 8 * UPSTREAM_WORDS];
+    arg[0..2].copy_from_slice(&idx.to_le_bytes());
     let rc = (sys.provider_call)(
         -1,
         SYS_RECONFIG_MODULE_UPSTREAM,
@@ -208,7 +200,7 @@ unsafe fn sys_module_upstream(sys: &SyscallTable, idx: u8) -> [u64; UPSTREAM_WOR
     let mut mask = [0u64; UPSTREAM_WORDS];
     if rc > 0 {
         for (w, word) in mask.iter_mut().enumerate().take(rc as usize) {
-            let off = 1 + w * 8;
+            let off = 2 + w * 8;
             let mut bytes = [0u8; 8];
             bytes.copy_from_slice(&arg[off..off + 8]);
             *word = u64::from_le_bytes(bytes);
@@ -222,9 +214,9 @@ fn upstream_bit(mask: &[u64; UPSTREAM_WORDS], j: usize) -> bool {
     j < UPSTREAM_WORDS * 64 && (mask[j / 64] >> (j % 64)) & 1 != 0
 }
 
-unsafe fn sys_module_done(sys: &SyscallTable, idx: u8) -> bool {
-    let mut arg = [idx];
-    (sys.provider_call)(-1, SYS_RECONFIG_MODULE_DONE, arg.as_mut_ptr(), 1) == 1
+unsafe fn sys_module_done(sys: &SyscallTable, idx: u16) -> bool {
+    let mut arg = idx.to_le_bytes();
+    (sys.provider_call)(-1, SYS_RECONFIG_MODULE_DONE, arg.as_mut_ptr(), 2) == 1
 }
 
 unsafe fn sys_trigger_rebuild(sys: &SyscallTable, ptr: usize, len: usize) {
@@ -286,7 +278,7 @@ unsafe fn begin_draining(s: &mut State, sys: &SyscallTable) {
     let mut draining = 0u16;
     let mut i = 0;
     while i < count {
-        let idx = i as u8;
+        let idx = i as u16;
         if idx == s.self_idx {
             ds_set(s, i, DS_SURVIVING);
         } else {
@@ -304,10 +296,10 @@ unsafe fn begin_draining(s: &mut State, sys: &SyscallTable) {
 
     // Signal drain-start to every drain-capable module. Ordering between
     // producers and consumers is handled in `check_drain` via the upstream
-    // mask (RFC Section 3.2: drain completion follows forward topo order).
+    // mask: drain completion follows forward topological order.
     let mut i = 0;
     while i < count {
-        let idx = i as u8;
+        let idx = i as u16;
         if ds_get(s, i) == DS_DRAINING {
             let _ = sys_call_drain(sys, idx);
         }
@@ -339,7 +331,7 @@ unsafe fn check_drain(s: &mut State, sys: &SyscallTable) -> bool {
     let mut i = 0;
     while i < count {
         if ds_get(s, i) == DS_DRAINING {
-            let idx = i as u8;
+            let idx = i as u16;
             if sys_module_done(sys, idx) {
                 let upstream = sys_module_upstream(sys, idx);
                 let mut upstream_ok = true;
@@ -501,7 +493,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             s.signaled_ready = 1;
             let rc = sys_self_index(sys);
             if rc >= 0 && rc < MAX_TRACKED_MODULES as i32 {
-                s.self_idx = rc as u8;
+                s.self_idx = rc as u16;
             }
             // Resolve graph_slot request channel (out port 1). -1 if unwired.
             let mut port_arg = [1u8, 1u8]; // port_type=1(out), index=1

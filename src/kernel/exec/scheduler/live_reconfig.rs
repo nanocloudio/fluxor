@@ -68,7 +68,7 @@ pub fn exec_order_count() -> usize {
 /// Return the module slot scheduled at position `pos` in `exec_order`, or
 /// `None` if `pos` is past `exec_order_count`. Lets tests confirm a live
 /// mutation left existing modules at their original schedule positions.
-pub fn exec_order_slot(pos: usize) -> Option<u8> {
+pub fn exec_order_slot(pos: usize) -> Option<ModuleId> {
     // SAFETY: scheduler-thread read.
     unsafe {
         if pos < SCHED.exec_order_count {
@@ -222,7 +222,7 @@ pub fn raise_module_fault(module_idx: usize, fault_kind: u8) {
     sched.fault_info[module_idx].record_fault(fault_kind, tick);
     let fi = &mut sched.fault_info[module_idx];
     step_guard::push_fault(FaultRecord {
-        module_idx: module_idx as u8,
+        module_idx: module_idx as ModuleId,
         fault_kind,
         caused_by,
         last_input_ct,

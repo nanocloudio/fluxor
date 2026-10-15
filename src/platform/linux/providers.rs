@@ -1167,12 +1167,12 @@ const MSG_BIND_REFUSED: u8 = 0x07;
 const CMD_BIND: u8 = 0x10;
 const CMD_SEND: u8 = 0x11;
 const CMD_CLOSE: u8 = 0x12;
-/// Reserved dial (`[sock_type][ip u32 LE][port][tag?]`), unsupported. Answered with
+/// Reserved dial (`[sock_type][ip u32 LE][port][tag u16 LE?]`), unsupported. Answered with
 /// `MSG_ERROR ENOSYS` on its tag so a stale emitter fails on its first dial
 /// rather than dialling the address its bytes would decode to under the
 /// live shape.
 const CMD_CONNECT: u8 = 0x13;
-/// The dial: `[sock_type][af][port u16 LE][addr…][tag?]`, decoded by the
+/// The dial: `[sock_type][af][port u16 LE][addr…][tag u16 LE?]`, decoded by the
 /// contract's `read_connect_to`. A name is resolved here — the provider is
 /// the resolver on every platform — through `getaddrinfo(3)` on a thread,
 /// so `/etc/hosts`, `resolv.conf`, nsswitch and systemd-resolved all apply
@@ -1274,7 +1274,7 @@ struct LinuxNetConn {
     write_len: u32,
     /// Requester tag from `CMD_CONNECT_TO`, echoed in `MSG_CONNECTED` /
     /// connect-failure `MSG_ERROR` so a fanned net_out routes the event back.
-    connect_tag: u8,
+    connect_tag: crate::abi::contracts::net::net_proto::RequesterTag,
     /// `state == 5` (resolving, no fd yet): the lookup this slot is waiting
     /// on. A result whose id does not match is stale — the slot was revoked
     /// and possibly retaken while the lookup ran — and is dropped.
@@ -1350,8 +1350,12 @@ impl LinuxNetConn {
     }
 }
 
+/// Largest control frame a lane queue holds: a tagged `MSG_ERROR`
+/// (`[type][len: u16][conn_id: u16][errno][requester_tag: u16]`).
+const CTRL_FRAME_MAX: usize = 3 + 2 + 1 + 2;
+
 /// Control frames waiting for room on one destination channel, in order.
-type PendingCtrl = std::collections::VecDeque<([u8; 8], usize)>;
+type PendingCtrl = std::collections::VecDeque<([u8; CTRL_FRAME_MAX], usize)>;
 
 /// A lane a runtime-staged workload attached (`net_attach`): its own
 /// command channel, read like a boot lane, and its own events channel,
@@ -2158,23 +2162,44 @@ unsafe fn linux_net_send_msg(st: &mut LinuxNetState, lane: usize, data: &[u8]) {
     let total = 3 + payload.len();
     // Preserve ordering: if anything is already queued, OR this write doesn't
     // fully land, enqueue for retry rather than dropping the terminal result.
-    // Small control frames (≤8 B) fit the queue slot; larger frames (datagram
+    // Small control frames (≤ CTRL_FRAME_MAX) fit the queue slot; larger frames (datagram
     // RX) fall back to best-effort (they're not terminal results).
     // Ordering is per destination: only this lane's queue stands in front.
     let queued_empty = st.flush_lane(lane);
     if queued_empty && channel::channel_write(events, frame.as_ptr(), total) == total as i32 {
         return;
     }
-    if total <= 8 {
+    if total <= CTRL_FRAME_MAX {
         if let Some(q) = st.lane_queue(lane) {
             if q.len() >= PENDING_CTRL_CAP {
                 q.pop_front(); // bounded — drop oldest under sustained wedge
             }
-            let mut slot = [0u8; 8];
+            let mut slot = [0u8; CTRL_FRAME_MAX];
             slot[..total].copy_from_slice(&frame[..total]);
             q.push_back((slot, total));
         }
     }
+}
+
+/// `MSG_ERROR [conn_id: u16 LE][errno][requester_tag: u16 LE]`: the tagged
+/// terminal result of a failed dial.
+fn connect_error_frame(
+    conn_id: u16,
+    errno: u8,
+    tag: crate::abi::contracts::net::net_proto::RequesterTag,
+) -> [u8; 6] {
+    let c = conn_id.to_le_bytes();
+    let t = tag.to_le_bytes();
+    [MSG_ERROR, c[0], c[1], errno, t[0], t[1]]
+}
+
+/// `MSG_CONNECTED [conn_id: u16 LE][requester_tag: u16 LE]`.
+fn connected_frame(
+    conn_id: [u8; 2],
+    tag: crate::abi::contracts::net::net_proto::RequesterTag,
+) -> [u8; 5] {
+    let t = tag.to_le_bytes();
+    [MSG_CONNECTED, conn_id[0], conn_id[1], t[0], t[1]]
 }
 
 /// Emit `MSG_BIND_REFUSED [port:2 LE][errno:1]` so a bind failure/refusal is
@@ -2610,7 +2635,7 @@ unsafe fn linux_net_cmd_connect_to(
     sock_type: u8,
     port: u16,
     target: crate::abi::contracts::net::net_proto::Target<'_>,
-    tag: u8,
+    tag: crate::abi::contracts::net::net_proto::RequesterTag,
     lane: usize,
 ) {
     use crate::abi::contracts::net::net_proto::Target;
@@ -2620,7 +2645,7 @@ unsafe fn linux_net_cmd_connect_to(
     // and the public contract.
     const SOCK_TYPE_STREAM: u8 = 1;
     if sock_type != SOCK_TYPE_STREAM {
-        let msg = [MSG_ERROR, 0u8, 0u8, 22u8, tag]; // EINVAL, no slot allocated (conn 0, u16 LE)
+        let msg = connect_error_frame(0, 22u8, tag); // EINVAL, no slot allocated (conn 0, u16 LE)
         linux_net_send_msg(st, lane, &msg);
         return;
     }
@@ -2633,7 +2658,7 @@ unsafe fn linux_net_cmd_connect_to(
     if slot < 0 {
         log::error!("[linux_net] no free connection slots");
         // Tagged terminal result (ENOMEM) so the requester completes.
-        let msg = [MSG_ERROR, 0u8, 0u8, 12u8, tag];
+        let msg = connect_error_frame(0, 12u8, tag);
         linux_net_send_msg(st, lane, &msg);
         return;
     }
@@ -2676,7 +2701,7 @@ unsafe fn linux_net_cmd_connect_to(
                 }
                 None => {
                     st.conns[idx] = LinuxNetConn::empty();
-                    let msg = [MSG_ERROR, 0u8, 0u8, 2u8, tag]; // ENOENT
+                    let msg = connect_error_frame(0, 2u8, tag); // ENOENT
                     linux_net_send_msg(st, lane, &msg);
                 }
             }
@@ -2741,12 +2766,12 @@ unsafe fn linux_net_drain_resolved(st: &mut LinuxNetState) -> bool {
             }
             Ok(_) => {
                 st.conns[idx] = LinuxNetConn::empty();
-                let msg = [MSG_ERROR, 0u8, 0u8, libc::ENOENT as u8, tag];
+                let msg = connect_error_frame(0, libc::ENOENT as u8, tag);
                 linux_net_send_msg(st, lane as usize, &msg);
             }
             Err(errno) => {
                 st.conns[idx] = LinuxNetConn::empty();
-                let msg = [MSG_ERROR, 0u8, 0u8, errno as u8, tag];
+                let msg = connect_error_frame(0, errno as u8, tag);
                 linux_net_send_msg(st, lane as usize, &msg);
             }
         }
@@ -2768,7 +2793,7 @@ unsafe fn linux_net_drain_resolved(st: &mut LinuxNetState) -> bool {
             let lane = st.conns[i].lane as usize;
             st.conns[i] = LinuxNetConn::empty();
             st.resolving = st.resolving.saturating_sub(1);
-            let msg = [MSG_ERROR, 0u8, 0u8, 2u8, tag]; // ENOENT
+            let msg = connect_error_frame(0, 2u8, tag); // ENOENT
             linux_net_send_msg(st, lane, &msg);
             had_work = true;
         }
@@ -2830,7 +2855,7 @@ struct Dial {
     alts: Vec<Resolved>,
     port: u16,
     /// The requester's tag, echoed on the single terminal result.
-    tag: u8,
+    tag: crate::abi::contracts::net::net_proto::RequesterTag,
     owner: crate::kernel::workload::owner::OwnerHandle,
     /// The lane that asked, which every result of the dial answers.
     lane: u16,
@@ -2980,7 +3005,7 @@ unsafe fn linux_net_dial(st: &mut LinuxNetState, idx: usize, addr: Resolved, dia
         };
         st.watch(fd, idx, libc::EPOLLIN as u32);
         let cb = (idx as u16).to_le_bytes();
-        let msg = [MSG_CONNECTED, cb[0], cb[1], dial.tag];
+        let msg = connected_frame(cb, dial.tag);
         linux_net_send_msg(st, dial.lane as usize, &msg);
     }
 }
@@ -3002,8 +3027,7 @@ unsafe fn linux_net_dial_failed(st: &mut LinuxNetState, idx: usize, mut dial: Di
     }
     log::error!("[linux_net] connect() failed errno={errno}");
     st.conns[idx] = LinuxNetConn::empty();
-    let cb = (idx as u16).to_le_bytes();
-    let msg = [MSG_ERROR, cb[0], cb[1], errno as u8, dial.tag];
+    let msg = connect_error_frame(idx as u16, errno as u8, dial.tag);
     linux_net_send_msg(st, dial.lane as usize, &msg);
 }
 
@@ -3592,7 +3616,7 @@ unsafe fn linux_net_poll_recv(st: &mut LinuxNetState) -> bool {
                     c.attempt_started = None;
                     st.rewatch(fd, i, libc::EPOLLIN as u32);
                     let cb = (i as u16).to_le_bytes();
-                    let msg = [MSG_CONNECTED, cb[0], cb[1], tag];
+                    let msg = connected_frame(cb, tag);
                     let lane = st.conns[i].lane as usize;
                     linux_net_send_msg(st, lane, &msg);
                     had_work = true;
@@ -3815,7 +3839,7 @@ pub fn linux_net_step(state: *mut u8) -> i32 {
                             log::warn!(
                                 "[linux_net] CMD_CONNECT (0x13) is unsupported; dial with CMD_CONNECT_TO (0x14) [tag {tag}]"
                             );
-                            let msg = [MSG_ERROR, 0u8, 0u8, 38u8, tag]; // ENOSYS
+                            let msg = connect_error_frame(0, 38u8, tag); // ENOSYS
                             linux_net_send_msg(st, lane, &msg);
                             had_work = true;
                         }
@@ -3836,18 +3860,16 @@ pub fn linux_net_step(state: *mut u8) -> i32 {
                                 }
                                 _ => {
                                     // Malformed: a name past 253 bytes, an unknown family,
-                                    // a truncated address. EINVAL goes to the record's last
-                                    // byte — the one a tag would occupy — as
-                                    // `read_connect_to` states.
-                                    let tag = if payload_len > 0 {
-                                        st.cmd_buf[payload_len - 1]
-                                    } else {
-                                        0
-                                    };
+                                    // a truncated address. EINVAL goes to the tag the
+                                    // record's last two bytes spell, as `read_connect_to`
+                                    // states.
+                                    let tag = crate::abi::contracts::net::net_proto::malformed_connect_to_tag(
+                                        &st.cmd_buf[..payload_len],
+                                    );
                                     log::warn!(
                                         "[linux_net] malformed CMD_CONNECT_TO ({payload_len} B)"
                                     );
-                                    let msg = [MSG_ERROR, 0u8, 0u8, 22u8, tag];
+                                    let msg = connect_error_frame(0, 22u8, tag);
                                     linux_net_send_msg(st, lane, &msg);
                                 }
                             }

@@ -546,7 +546,7 @@ fn instantiate_and_activate(
             unsafe {
                 let ds = multicore::domain_state(d);
                 ds.core_id = d as u8; // Domain N runs on core N
-                ds.module_count = mod_count as u8;
+                ds.module_count = mod_count as u16;
                 ds.active = true;
             }
             uart_puts(b"[domain] ");
@@ -666,10 +666,10 @@ fn bridge_cross_domain_edges() -> Result<usize, &'static str> {
         let registered = unsafe {
             multicore::register_cross_edge(multicore::CrossDomainEdge {
                 from_domain,
-                from_module: from as u8,
+                from_module: from as fluxor::kernel::exec::scheduler::ModuleId,
                 from_port: edge_snapshot.from_port_index,
                 to_domain,
-                to_module: to as u8,
+                to_module: to as fluxor::kernel::exec::scheduler::ModuleId,
                 to_port: to_port_marker,
                 channel_idx: cross_ch_idx as u8,
                 local_out_handle: edge_snapshot.channel,
@@ -2426,12 +2426,9 @@ unsafe fn bcm_workload_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
 /// `prepare_graph` performs on every reconfigure
 /// (`channel::reset_all` + `provider::reset_handle_tracking` +
 /// `buffer_pool::reset_all`). A meaningful per-module release would
-/// require adding `owner_module: u8` to each of those tables; until
-/// then the empty body is deliberate, not a TODO.
-fn bcm_release_module_handles(_module_idx: u8) {
-    // See docstring above — intentional no-op pending per-resource
-    // ownership tracking in nic_ring / pcie / dma arenas.
-}
+/// require an owner field in each of those tables, which they do not
+/// carry: the body is empty by design.
+fn bcm_release_module_handles(_module_idx: fluxor::kernel::exec::scheduler::ModuleId) {}
 fn bcm_boot_scan() {}
 fn bcm_merge_runtime_overrides(_module_id: u16, _buf: *mut u8, len: usize, _max: usize) -> usize {
     len
@@ -2744,7 +2741,7 @@ unsafe fn bcm_system_extension_dispatch(
                 1 => fluxor::kernel::backing_store::WritebackPolicy::WriteThrough,
                 _ => return -22,
             };
-            let idx = fluxor::kernel::exec::scheduler::current_module_index() as u8;
+            let idx = fluxor::kernel::exec::scheduler::current_module_id();
             fluxor::kernel::backing_store::backing_register(idx, vpages, rmax, bt, wb)
         }
         paged_arena::ARENA_READ => {

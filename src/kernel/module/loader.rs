@@ -14,6 +14,7 @@
 use crate::abi::SyscallTable;
 use crate::fnv1a32;
 use crate::kernel::boot::config::read_layout;
+use crate::kernel::exec::scheduler::ModuleId;
 use crate::kernel::sys::hal;
 use crate::modules::{Module, StepOutcome};
 
@@ -417,7 +418,7 @@ impl ProviderAutoRegister {
         })
     }
     /// Register this module as a provider. Called after module_new() Ready.
-    unsafe fn register(&self, module_idx: u8, state_ptr: *mut u8, name: &'static str) {
+    unsafe fn register(&self, module_idx: ModuleId, state_ptr: *mut u8, name: &'static str) {
         let mut list = [0u16; MAX_CONTRACTS_PER_PROVIDER];
         let n = match (self.contracts_fn, self.contract_fn) {
             (Some(f), _) => (f(
@@ -607,9 +608,15 @@ pub fn pic_irq_disabled_count() -> u32 {
 /// Must be 4-byte aligned so aligned offsets produce 4-byte-aligned
 /// pointers (ARM requires aligned access for struct fields like pointers
 /// and u32).
+///
+/// The pool holds no initial value: every allocation zeroes the bytes it
+/// hands out, and nothing reads the pool before that. On the bcm2712 kernel
+/// it is a linker region of its own (`.state_arena`, above the boot image's
+/// RAM) that boot does not zero; see `linker/memory-bcm2712.x`.
 #[repr(C, align(4))]
 struct AlignedArena([u8; STATE_ARENA_SIZE]);
-static mut STATE_ARENA: AlignedArena = AlignedArena([0; STATE_ARENA_SIZE]);
+#[cfg_attr(feature = "chip-bcm2712", link_section = ".state_arena")]
+static mut STATE_ARENA: core::mem::MaybeUninit<AlignedArena> = core::mem::MaybeUninit::uninit();
 /// Bump offset — high-water mark. Memory at `[0, STATE_ARENA_OFFSET)`
 /// has been handed out at some point; free holes in that range are
 /// recorded in `FREE_LIST`.
@@ -713,7 +720,7 @@ pub fn alloc_private(size: usize, align: usize) -> Result<*mut u8, LoaderError> 
     // state arena with checked arithmetic against its compiled capacity and
     // the deployment envelope.
     unsafe {
-        let base = core::ptr::addr_of_mut!(STATE_ARENA.0).cast::<u8>() as usize;
+        let base = core::ptr::addr_of_mut!(STATE_ARENA).cast::<u8>() as usize;
         let cur = base + STATE_ARENA_OFFSET;
         let start = cur.next_multiple_of(align);
         let end = start
@@ -898,7 +905,7 @@ pub fn alloc_state(size: usize) -> Result<*mut u8, LoaderError> {
                         size: remainder as u32,
                     };
                 }
-                let ptr = core::ptr::addr_of_mut!(STATE_ARENA.0)
+                let ptr = core::ptr::addr_of_mut!(STATE_ARENA)
                     .cast::<u8>()
                     .add(offset);
                 core::ptr::write_bytes(ptr, 0, size);
@@ -967,7 +974,7 @@ pub fn alloc_state(size: usize) -> Result<*mut u8, LoaderError> {
                 return Err(LoaderError::StatePoolExhausted);
             }
         };
-        let ptr = core::ptr::addr_of_mut!(STATE_ARENA.0)
+        let ptr = core::ptr::addr_of_mut!(STATE_ARENA)
             .cast::<u8>()
             .add(aligned);
         core::ptr::write_bytes(ptr, 0, size);
@@ -1035,7 +1042,7 @@ pub unsafe fn free_state_range(ptr: *mut u8, size: usize) {
     if is_iso_ptr(ptr as *const u8) {
         return;
     }
-    let base = core::ptr::addr_of_mut!(STATE_ARENA.0).cast::<u8>();
+    let base = core::ptr::addr_of_mut!(STATE_ARENA).cast::<u8>();
     let offset = ptr as usize - base as usize;
     // Checked arithmetic mirrors `alloc_state`. A wrapping
     // `size + STATE_CANARY_SIZE` would compute a tiny `need` and
@@ -2781,7 +2788,7 @@ pub struct DynamicModulePending {
     name: &'static str,
     drain_fn: Option<ModuleDrainFn>,
     auto_register: Option<ProviderAutoRegister>,
-    module_idx: u8,
+    module_idx: ModuleId,
     /// Carried through from `ModuleExports` so the completed
     /// `DynamicModule` exposes the Tier 2 ISR entry. See
     /// `DynamicModule::isr_entry_fn`.
@@ -3380,7 +3387,7 @@ impl DynamicModule {
             NewStatus::Ready => {
                 log::info!("[inst] loaded {name}");
                 if let Some(ar) = auto_register.as_ref() {
-                    ar.register(inst_idx as u8, state_ptr, name);
+                    ar.register(inst_idx as ModuleId, state_ptr, name);
                 }
                 Ok(StartNewResult::Ready(DynamicModule {
                     step_fn: exports.step_fn,
@@ -3414,7 +3421,7 @@ impl DynamicModule {
                     name,
                     drain_fn,
                     auto_register,
-                    module_idx: inst_idx as u8,
+                    module_idx: inst_idx as ModuleId,
                     isr_entry_fn: exports.isr_entry_fn,
                     stack_bytes: module.manifest_stack_bytes(),
                 };

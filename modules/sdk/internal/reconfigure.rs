@@ -13,16 +13,16 @@ pub const SELF_INDEX: u32 = 0x0C67;
 /// handle=-1, arg=[phase:u8]. 0=Running, 1=Draining, 2=Migrating.
 pub const SET_PHASE: u32 = 0x0C68;
 /// Invoke module_drain() on module N.
-/// handle=-1, arg=[module_idx:u8]. Returns module's drain return code, or -1.
+/// handle=-1, arg=[module_idx:u16 LE]. Returns module's drain return code, or -1.
 pub const CALL_DRAIN: u32 = 0x0C69;
 /// Mark module N as finished so the scheduler skips it.
-/// handle=-1, arg=[module_idx:u8]. Returns 0.
+/// handle=-1, arg=[module_idx:u16 LE]. Returns 0.
 pub const MARK_FINISHED: u32 = 0x0C6A;
 /// Query active module count.
 /// handle=-1, arg=NULL. Returns module count (>=0) or negative errno.
 pub const MODULE_COUNT: u32 = 0x0C6B;
 /// Query module capability flags.
-/// handle=-1, arg=[module_idx:u8]. Returns flags bitmask:
+/// handle=-1, arg=[module_idx:u16 LE]. Returns flags bitmask:
 ///   bit 0 = drain_capable, bit 1 = deferred_ready,
 ///   bit 2 = mailbox_safe,  bit 3 = in_place_writer.
 pub const MODULE_INFO: u32 = 0x0C6C;
@@ -32,17 +32,17 @@ pub const MODULE_INFO: u32 = 0x0C6C;
 /// Returns 0.
 pub const TRIGGER_REBUILD: u32 = 0x0C6D;
 /// Query the upstream-module bitmask for module N (for topological drain
-/// ordering). handle=-1, arg layout: in `[module_idx:u8]`, out
-/// `[mask word u64 LE × W]` (low word first). The kernel writes
-/// `W = min(MODULE_MASK_WORDS, (arg_len - 1) / 8)` words and returns the
-/// kernel's full word count (positive), so a caller can detect a buffer
-/// narrower than the mask. Pass `arg_len >= 1 + 8 × 4` to cover the whole
-/// u8 module-index domain (256 modules = 4 words) on every profile.
-/// Returns -EINVAL if the arg is null or shorter than one word. Bit `i`
+/// ordering). handle=-1, arg layout: in `[module_idx:u16 LE]`, out
+/// `[mask word u64 LE × W]` from offset 2 (low word first). The kernel
+/// writes `W = min(MODULE_MASK_WORDS, (arg_len - 2) / 8)` words and returns
+/// the kernel's full word count (positive), so a caller can detect a
+/// buffer narrower than the mask. Pass `arg_len >= 2 + 8 × 16` to cover the
+/// largest profile (1024 modules = 16 words). Returns -EINVAL if the arg is
+/// null or shorter than one word. Bit `i`
 /// of the flattened words means "module `i` is upstream of `module_idx`".
 pub const MODULE_UPSTREAM: u32 = 0x0C6E;
 /// Query whether module N has returned StepOutcome::Done (finished).
-/// handle=-1, arg=[module_idx:u8]. Returns 1 if finished, 0 otherwise.
+/// handle=-1, arg=[module_idx:u16 LE]. Returns 1 if finished, 0 otherwise.
 pub const MODULE_DONE: u32 = 0x0C6F;
 
 // ── Live graph mutation (add owner / free owner) ────────────────────────────

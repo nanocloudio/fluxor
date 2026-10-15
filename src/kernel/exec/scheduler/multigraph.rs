@@ -1352,23 +1352,26 @@ pub unsafe fn query_module_state(module_idx: usize, out_buf: *mut u8, out_cap: u
     let s = module_state_snapshot(module_idx);
 
     let mut buf = [0u8; MODULE_STATE_MAX];
-    buf[0] = s.idx;
-    buf[1] = (if s.present { f::PRESENT } else { 0 })
+    use crate::abi::internal::monitor::module_state_off as o;
+    buf[o::IDX..o::IDX + 2].copy_from_slice(&s.idx.to_le_bytes());
+    buf[o::FLAGS] = (if s.present { f::PRESENT } else { 0 })
         | (if s.ready { f::READY } else { 0 })
         | (if s.finished { f::FINISHED } else { 0 });
-    buf[2] = s.fault_state as u8;
-    buf[3] = s.cap_class;
-    buf[4..6].copy_from_slice(&s.permissions.to_le_bytes());
-    buf[6] = s.step_period;
-    buf[7] = s.domain_id;
-    buf[8..10].copy_from_slice(&s.restart_count.to_le_bytes());
-    buf[10..14].copy_from_slice(&s.inactive_for_ticks.to_le_bytes());
-    buf[14..18].copy_from_slice(&s.slot_generation.to_le_bytes());
+    buf[o::FAULT_STATE] = s.fault_state as u8;
+    buf[o::CAP_CLASS] = s.cap_class;
+    buf[o::STEP_PERIOD] = s.step_period;
+    buf[o::PERMISSIONS..o::PERMISSIONS + 2].copy_from_slice(&s.permissions.to_le_bytes());
+    buf[o::DOMAIN_ID] = s.domain_id;
     // SAFETY: scheduler-thread-only read; module_idx bounded above.
-    buf[19] = unsafe {
+    buf[o::PROTECTION] = unsafe {
         let p = &raw const SCHED;
         (*p).protection[module_idx]
     };
+    buf[o::RESTART_COUNT..o::RESTART_COUNT + 2].copy_from_slice(&s.restart_count.to_le_bytes());
+    buf[o::INACTIVE_FOR_TICKS..o::INACTIVE_FOR_TICKS + 4]
+        .copy_from_slice(&s.inactive_for_ticks.to_le_bytes());
+    buf[o::SLOT_GENERATION..o::SLOT_GENERATION + 4]
+        .copy_from_slice(&s.slot_generation.to_le_bytes());
 
     // The name goes in only if the caller left room for it; a caller
     // that asked for the header alone gets `name_len = 0` rather than a
@@ -1384,7 +1387,7 @@ pub unsafe fn query_module_state(module_idx: usize, out_buf: *mut u8, out_cap: u
         let room = core::cmp::min(out_cap - MODULE_STATE_LEN, MODULE_STATE_NAME_MAX);
         let n = core::cmp::min(name.len(), room);
         buf[MODULE_STATE_LEN..MODULE_STATE_LEN + n].copy_from_slice(&name[..n]);
-        buf[18] = n as u8;
+        buf[o::NAME_LEN] = n as u8;
         written += n;
     }
 
@@ -1455,10 +1458,10 @@ pub fn set_module_step_deadline_burst(module_idx: usize, deadline_us: u32) {
 
 /// Declare a quarantine partner for `module_idx`. When this module
 /// faults AND the partner has faulted within `QUARANTINE_WINDOW_MS`,
-/// both transition to `Terminated`. Pass `0xFF` to clear the pairing.
+/// both transition to `Terminated`. Pass `NO_MODULE` to clear the pairing.
 /// Sourced from the module manifest's `quarantine_partner` setting;
 /// the kernel does not infer pairings from channel wiring.
-pub fn set_module_quarantine_partner(module_idx: usize, partner: u8) {
+pub fn set_module_quarantine_partner(module_idx: usize, partner: ModuleId) {
     if module_idx >= MAX_MODULES {
         return;
     }
@@ -1602,7 +1605,7 @@ pub fn module_is_ready(module_idx: usize) -> bool {
 #[derive(Debug, Clone, Copy)]
 pub struct ModuleStateSnapshot {
     /// Module slot index in the scheduler's `modules` array.
-    pub idx: u8,
+    pub idx: ModuleId,
     /// `true` if the module's slot is non-empty in the scheduler.
     pub present: bool,
     /// Whether the module has signaled `StepOutcome::Ready`.
@@ -1661,7 +1664,7 @@ pub fn module_state_snapshot(module_idx: usize) -> ModuleStateSnapshot {
     };
     let present = !matches!(sched.modules[module_idx], ModuleSlot::Empty);
     ModuleStateSnapshot {
-        idx: module_idx as u8,
+        idx: module_idx as ModuleId,
         present,
         ready: sched.ready[module_idx],
         finished: sched.finished[module_idx],

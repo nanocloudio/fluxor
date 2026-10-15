@@ -190,11 +190,20 @@ pub(crate) unsafe fn dma_restart_raw(ch: u8, read_addr: u32, count: u32) -> i32 
 use portable_atomic::AtomicBool;
 use portable_atomic::AtomicU8;
 
+use crate::kernel::exec::scheduler::{ModuleId, NO_MODULE};
+
+/// The byte the flash param store keys a module's records by: RP graphs hold
+/// at most `MAX_MODULES` (32) modules, so a module index fits it.
+fn param_store_module_id() -> u8 {
+    const _: () = assert!(crate::kernel::exec::scheduler::MAX_MODULES <= u8::MAX as usize);
+    crate::kernel::exec::scheduler::current_module_index() as u8
+}
+
 const MAX_DMA_FDS: usize = 8;
 
 struct DmaFdSlot {
     allocated: AtomicBool,
-    owner: AtomicU8,
+    owner: AtomicU16,
     channel_a: AtomicU8,
     channel_b: AtomicU8,
     active_is_b: AtomicBool,
@@ -205,7 +214,7 @@ impl DmaFdSlot {
     const fn new() -> Self {
         Self {
             allocated: AtomicBool::new(false),
-            owner: AtomicU8::new(0xFF),
+            owner: AtomicU16::new(NO_MODULE),
             channel_a: AtomicU8::new(0xFF),
             channel_b: AtomicU8::new(0xFF),
             active_is_b: AtomicBool::new(false),
@@ -242,7 +251,7 @@ pub fn dma_fd_create() -> i32 {
         dma_free_channel(ch_a as u8);
         return ch_b;
     }
-    let owner = crate::kernel::exec::scheduler::current_module_index() as u8;
+    let owner = crate::kernel::exec::scheduler::current_module_id();
     for (i, dma) in DMA_FD_SLOTS.iter().enumerate() {
         if dma
             .allocated
@@ -382,7 +391,7 @@ pub fn dma_fd_free(fd_handle: i32) -> i32 {
     dma.channel_b.store(0xFF, Ordering::Release);
     dma.pending.store(false, Ordering::Release);
     dma.active_is_b.store(false, Ordering::Release);
-    dma.owner.store(0xFF, Ordering::Release);
+    dma.owner.store(NO_MODULE, Ordering::Release);
     dma.allocated.store(false, Ordering::Release);
     0
 }
@@ -413,7 +422,7 @@ fn dma_fd_poll_ready(slot: i32) -> bool {
     true
 }
 
-pub fn release_dma_fds_owned_by(module_idx: u8) {
+pub fn release_dma_fds_owned_by(module_idx: ModuleId) {
     for dma in DMA_FD_SLOTS.iter() {
         if !dma.allocated.load(Ordering::Acquire) {
             continue;
@@ -435,7 +444,7 @@ pub fn release_dma_fds_owned_by(module_idx: u8) {
         dma.channel_b.store(0xFF, Ordering::Release);
         dma.pending.store(false, Ordering::Release);
         dma.active_is_b.store(false, Ordering::Release);
-        dma.owner.store(0xFF, Ordering::Release);
+        dma.owner.store(NO_MODULE, Ordering::Release);
         dma.allocated.store(false, Ordering::Release);
     }
 }
@@ -456,7 +465,7 @@ pub fn init() {
     register_dev_query_extension(rp_dev_query_extension);
 }
 
-pub fn release_handles(module_idx: u8) {
+pub fn release_handles(module_idx: ModuleId) {
     release_rp_handles(module_idx);
     release_dma_fds_owned_by(module_idx);
 }
@@ -494,10 +503,7 @@ pub unsafe extern "C" fn syscall_gpio_request_output(pin_num: u8) -> i32 {
         log::error!("[gpio] request_output pin {pin_num} claim failed rc={handle}");
         return handle;
     }
-    gpio::gpio_set_owner(
-        pin_num,
-        crate::kernel::exec::scheduler::current_module_index() as u8,
-    );
+    gpio::gpio_set_owner(pin_num, crate::kernel::exec::scheduler::current_module_id());
     let result = gpio::gpio_set_mode(handle, gpio::PinMode::Output, true);
     if result < 0 {
         log::error!("[gpio] request_output pin {pin_num} set_mode failed rc={result}");
@@ -523,10 +529,7 @@ pub unsafe extern "C" fn syscall_gpio_request_input(pin_num: u8, pull: u8) -> i3
     if handle < 0 {
         return handle;
     }
-    gpio::gpio_set_owner(
-        pin_num,
-        crate::kernel::exec::scheduler::current_module_index() as u8,
-    );
+    gpio::gpio_set_owner(pin_num, crate::kernel::exec::scheduler::current_module_id());
     // Set pull configuration
     let pin_pull = match pull {
         1 => gpio::PinPull::Up,
@@ -571,10 +574,7 @@ unsafe fn gpio_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len
             }
             let result = gpio::syscall_gpio_claim(*arg);
             if result >= 0 {
-                gpio::gpio_set_owner(
-                    *arg,
-                    crate::kernel::exec::scheduler::current_module_index() as u8,
-                );
+                gpio::gpio_set_owner(*arg, crate::kernel::exec::scheduler::current_module_id());
             }
             result
         }
@@ -1734,7 +1734,7 @@ unsafe fn rp_system_extension_dispatch(
             if arg.is_null() || arg_len < 1 {
                 return E_INVAL;
             }
-            let module_id = crate::kernel::exec::scheduler::current_module_index() as u8;
+            let module_id = param_store_module_id();
             let mut fwd = [0u8; 252];
             fwd[0] = module_id;
             let n = if arg_len > 251 { 251 } else { arg_len };
@@ -1749,7 +1749,7 @@ unsafe fn rp_system_extension_dispatch(
             if arg.is_null() || arg_len < 1 {
                 return E_INVAL;
             }
-            let module_id = crate::kernel::exec::scheduler::current_module_index() as u8;
+            let module_id = param_store_module_id();
             let mut fwd = [module_id, *arg];
             crate::platform::rp_flash::store::dispatch_param_op(
                 runtime_params::DELETE,
@@ -1766,7 +1766,7 @@ unsafe fn rp_system_extension_dispatch(
                     1,
                 )
             } else {
-                let module_id = crate::kernel::exec::scheduler::current_module_index() as u8;
+                let module_id = param_store_module_id();
                 let mut fwd = [module_id];
                 crate::platform::rp_flash::store::dispatch_param_op(
                     runtime_params::CLEAR_ALL,
@@ -1932,7 +1932,7 @@ static GPIO_VTABLE: crate::kernel::module::provider::ProviderVTable =
     };
 
 /// Release all RP-specific hardware handles owned by a module.
-fn release_rp_handles(module_idx: u8) {
+fn release_rp_handles(module_idx: ModuleId) {
     // PIO handles released by PIC pio_stream module provider
     // Release GPIO pins
     gpio::release_owned_by(module_idx);

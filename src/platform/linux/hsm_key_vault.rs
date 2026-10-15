@@ -148,7 +148,7 @@ struct HsmSlot {
     private: ObjectHandle,
     public: ObjectHandle,
     /// The module that generated this key: scheduler slot and occupancy.
-    owner: (u8, u32),
+    owner: (crate::kernel::exec::scheduler::ModuleId, u32),
     /// Permitted uses, sealed at generation and checked per operation.
     usage: u32,
 }

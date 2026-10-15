@@ -11,7 +11,7 @@
 pub fn kernel_max_modules(target: &str) -> usize {
     match target {
         // aarch64 profile_host (linux host + bcm2712-family boards).
-        "linux" | "pi5" | "bcm2712" | "cm5" | "qemu-virt" => 255,
+        "linux" | "pi5" | "bcm2712" | "cm5" | "qemu-virt" => 1024,
         // wasm32 profile_wasm.
         "wasm" => 48,
         // Everything else (rp2040/rp2350 boards): profile_embedded.
@@ -20,15 +20,25 @@ pub fn kernel_max_modules(target: &str) -> usize {
 }
 
 /// Kernel `MAX_GRAPH_EDGES` for the arch profile a target compiles
-/// (`src/kernel/boot/config.rs`): 384 on the host profile, 128 elsewhere. The
-/// config blob's graph section is laid out for exactly this many edge slots.
+/// (`src/kernel/boot/config.rs`): 1536 on the host profile, 128 elsewhere.
+/// The config blob's graph section is laid out for exactly this many edge
+/// slots.
 pub fn kernel_max_edges(target: &str) -> usize {
     if kernel_max_modules(target) > 128 {
-        384
+        1536
     } else {
         128
     }
 }
+
+/// profile_host `STATE_ARENA_SIZE` (`modules/sdk/abi/config.rs`).
+pub const HOST_STATE_ARENA: u64 = 1024 * 1024 * 1024;
+/// profile_host `BUFFER_ARENA_SIZE`.
+pub const HOST_BUFFER_ARENA: u64 = 16 * 1024 * 1024;
+/// profile_wasm `STATE_ARENA_SIZE`.
+pub const WASM_STATE_ARENA: u64 = 96 * 1024 * 1024;
+/// profile_wasm `BUFFER_ARENA_SIZE`.
+pub const WASM_BUFFER_ARENA: u64 = 8 * 1024 * 1024;
 
 /// Graph-section byte 3 for a target: the edge-slot count in units of 128,
 /// with 0 meaning 128 (see `kernel::config::GRAPH_SLOTS_CODE`).
@@ -86,8 +96,10 @@ pub fn kernel_pool_static_cap(target: &str, pool: &str) -> Option<u64> {
         "owners" => Some(if host { 64 } else { 1 }),
         // Arch-profile arenas (abi/config.rs). RP arenas come from the
         // silicon TOML — not mirrored here; kernel clamps at boot.
-        "state_arena" if host || wasm => Some(256 * 1024 * 1024),
-        "buffer_arena" if host || wasm => Some(8 * 1024 * 1024),
+        "state_arena" if host => Some(HOST_STATE_ARENA),
+        "state_arena" if wasm => Some(WASM_STATE_ARENA),
+        "buffer_arena" if host => Some(HOST_BUFFER_ARENA),
+        "buffer_arena" if wasm => Some(WASM_BUFFER_ARENA),
         "config_arena" if host => Some(256 * 1024),
         "config_arena" if wasm => Some(32 * 1024),
         // Tier B elastic region (abi/config.rs ELASTIC_REGION_SIZE).

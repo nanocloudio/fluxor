@@ -26,10 +26,11 @@ const MAX_HW_UART: usize = 2;
 const MAX_HW_GPIO: usize = 8;
 const MAX_HW_PIO: usize = 3;
 
-/// Fixed header: magic u32, version u16, checksum u16, module_count u8,
-/// edge_count low byte u8, tick_us u16, graph_sample_rate u32.
+/// Fixed header: magic u32, version u16, checksum u16, module_count low byte
+/// u8, edge_count low byte u8, tick_us u16, graph_sample_rate u32.
 const FXWR_HEADER_SIZE: usize = 16;
-/// Module-section header: module_count u8, reserved u8, section_size u32.
+/// Module-section header: module_count low byte u8, module_count high byte
+/// u8, section_size u32.
 const FXWR_MODULE_SECTION_HEADER: usize = 6;
 
 /// `len` bytes of `data` at `at`, or an error naming what was cut short.
@@ -67,8 +68,15 @@ fn decode_graph_edge(entry: &[u8]) -> Value {
     let rate_class = entry[8];
     let wake = entry[9] & 0x01 != 0;
     let mut edge = Map::new();
-    edge.insert("from_id".into(), json!(entry[0]));
-    edge.insert("to_id".into(), json!(entry[1]));
+    // Endpoint ids: low bytes at 0-1, high bytes at 10-11.
+    edge.insert(
+        "from_id".into(),
+        json!(u16::from_le_bytes([entry[0], entry[10]])),
+    );
+    edge.insert(
+        "to_id".into(),
+        json!(u16::from_le_bytes([entry[1], entry[11]])),
+    );
     edge.insert(
         "to_port".into(),
         json!(if to_port == 1 { "ctrl" } else { "in" }),
@@ -143,7 +151,13 @@ pub fn decode_config(data: &[u8]) -> Result<Value> {
         FXWR_MODULE_SECTION_HEADER,
         "the module section header",
     )?;
-    let module_count = msec[0] as usize;
+    let module_count = u16::from_le_bytes([msec[0], msec[1]]) as usize;
+    if msec[0] != header[8] {
+        return Err(Error::Config(format!(
+            "FXWR module count disagrees: header says {} (low byte), module section {}",
+            header[8], msec[0]
+        )));
+    }
     let section_size = le_u32(&msec[2..6]) as usize;
     let entries_start = FXWR_HEADER_SIZE + FXWR_MODULE_SECTION_HEADER;
     let entries = fxwr_slice(data, entries_start, section_size, "the module section")?;
@@ -164,7 +178,10 @@ pub fn decode_config(data: &[u8]) -> Result<Value> {
         }
         let meta = head[9];
         let mut m = Map::new();
-        m.insert("id".into(), json!(head[8]));
+        m.insert(
+            "id".into(),
+            json!(u16::from(head[8]) | (u16::from((meta >> 5) & 0x03) << 8)),
+        );
         m.insert(
             "name_hash".into(),
             json!(format!("0x{:08x}", le_u32(&head[4..8]))),

@@ -624,14 +624,21 @@ pub mod xip_lock {
     //! interrupts disabled, release. The QSPI CS read technique follows the
     //! same approach as the pico-sdk.
 
+    use crate::kernel::exec::scheduler::{ModuleId, MAX_MODULES, NO_MODULE};
     use crate::kernel::sys::errno;
-    use portable_atomic::{AtomicU32, AtomicU8, Ordering};
+    use portable_atomic::{AtomicU16, AtomicU32, AtomicU8, Ordering};
 
     /// Maximum number of lockable resources.
     const MAX_RESOURCES: usize = 4;
 
     /// Free / no owner marker.
-    const OWNER_FREE: u8 = 0xFF;
+    const OWNER_FREE: ModuleId = NO_MODULE;
+
+    /// Who takes a lock: the module being stepped, or, in kernel context,
+    /// `MAX_MODULES` — an owner of its own, never mistaken for a free slot.
+    fn lock_owner() -> ModuleId {
+        crate::kernel::exec::scheduler::current_module_index().min(MAX_MODULES) as ModuleId
+    }
 
     /// Resource IDs (must match abi::resource_id).
     const RESOURCE_FLASH_XIP: usize = 0;
@@ -639,13 +646,13 @@ pub mod xip_lock {
     /// Resource lock slot.
     struct ResourceSlot {
         /// Owner module index, or OWNER_FREE if unlocked.
-        owner: AtomicU8,
+        owner: AtomicU16,
     }
 
     impl ResourceSlot {
         const fn new() -> Self {
             Self {
-                owner: AtomicU8::new(OWNER_FREE),
+                owner: AtomicU16::new(OWNER_FREE),
             }
         }
     }
@@ -663,7 +670,7 @@ pub mod xip_lock {
         if idx >= MAX_RESOURCES {
             return errno::EINVAL;
         }
-        let owner = crate::kernel::exec::scheduler::current_module_index() as u8;
+        let owner = lock_owner();
         match RESOURCE_SLOTS[idx].owner.compare_exchange(
             OWNER_FREE,
             owner,
@@ -681,7 +688,7 @@ pub mod xip_lock {
             return errno::EINVAL;
         }
         let slot = &RESOURCE_SLOTS[handle as usize];
-        let owner = crate::kernel::exec::scheduler::current_module_index() as u8;
+        let owner = lock_owner();
         match slot
             .owner
             .compare_exchange(owner, OWNER_FREE, Ordering::AcqRel, Ordering::Acquire)
@@ -721,7 +728,7 @@ pub mod xip_lock {
             return CACHED_RESULT.load(Ordering::Relaxed) as i32;
         }
 
-        let owner = crate::kernel::exec::scheduler::current_module_index() as u8;
+        let owner = lock_owner();
         let slot = &RESOURCE_SLOTS[RESOURCE_FLASH_XIP];
 
         // Atomic short-term lock: try-lock, do the read, then unlock.

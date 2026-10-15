@@ -1221,12 +1221,17 @@ fn emit_bcm2712(out: &Path) {
     // `targets/silicon/bcm2712.toml` carries non-capacity metadata only.
     let is_pi5 = env::var("CARGO_FEATURE_BOARD_PI5").is_ok();
     let ram_origin = if is_pi5 { "0x80000" } else { "0x40080000" };
+    // The module state arena's own region (see linker/memory-bcm2712.x): the
+    // Pi 5's DRAM above 1 GB, clear of the firmware's top-of-first-GB
+    // reservation; QEMU virt's upper GB.
+    let arena_origin = if is_pi5 { "0x40000000" } else { "0x80000000" };
     File::create(out.join("memory-bcm2712.x"))
         .unwrap()
         .write_all(include_bytes!("linker/memory-bcm2712.x"))
         .unwrap();
     println!("cargo:rustc-link-arg=-T{}/memory-bcm2712.x", out.display());
     println!("cargo:rustc-link-arg=--defsym=RAM_ORIGIN={ram_origin}");
+    println!("cargo:rustc-link-arg=--defsym=ARENA_ORIGIN={arena_origin}");
     println!("cargo:rerun-if-changed=linker/memory-bcm2712.x");
     println!("cargo:rerun-if-changed=targets/silicon/bcm2712.toml");
 

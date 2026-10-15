@@ -11,7 +11,9 @@
 //! The scheduler checks `EVENT_WAKE_PENDING` and steps only the affected
 //! modules via `step_woken_modules()`, providing intra-tick wake response.
 
-use portable_atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use portable_atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
+
+use crate::kernel::exec::scheduler::{ModuleId, NO_MODULE};
 
 use crate::kernel::sys::errno;
 use crate::kernel::sys::hal;
@@ -29,8 +31,8 @@ struct EventSlot {
     allocated: AtomicBool,
     /// The signaled flag — set by signal(), cleared by poll().
     signaled: AtomicBool,
-    /// Owning module index (0..MAX_MODULES-1), or 0xFF if unowned.
-    owner: AtomicU8,
+    /// Owning module index (0..MAX_MODULES-1), or `NO_MODULE` if unowned.
+    owner: AtomicU16,
 }
 
 impl EventSlot {
@@ -38,7 +40,7 @@ impl EventSlot {
         Self {
             allocated: AtomicBool::new(false),
             signaled: AtomicBool::new(false),
-            owner: AtomicU8::new(0xFF),
+            owner: AtomicU16::new(NO_MODULE),
         }
     }
 }
@@ -200,8 +202,8 @@ fn check_event_access(handle: i32) -> Result<&'static EventSlot, i32> {
         return Err(errno::EINVAL);
     }
     let owner = slot.owner.load(Ordering::Acquire);
-    let caller = crate::kernel::exec::scheduler::current_module_index() as u8;
-    if owner != 0xFF && owner != caller {
+    let caller = crate::kernel::exec::scheduler::current_module_id();
+    if owner != NO_MODULE && owner != caller {
         return Err(errno::EINVAL);
     }
     Ok(slot)
@@ -220,7 +222,7 @@ pub fn event_create() -> i32 {
         ledger::deny(POOL_EVENTS);
         return errno::ENOSPC;
     }
-    let owner = crate::kernel::exec::scheduler::current_module_index() as u8;
+    let owner = crate::kernel::exec::scheduler::current_module_id();
     for (i, slot) in EVENT_SLOTS.iter().enumerate() {
         if slot
             .allocated
@@ -327,7 +329,7 @@ pub fn event_destroy(handle: i32) -> i32 {
         Err(e) => return e,
     };
     slot.signaled.store(false, Ordering::Release);
-    slot.owner.store(0xFF, Ordering::Release);
+    slot.owner.store(NO_MODULE, Ordering::Release);
     slot.allocated.store(false, Ordering::Release);
     0
 }
@@ -444,7 +446,7 @@ pub fn take_wake_in_mask(mask: &ModuleMask) -> ModuleMask {
 /// Release all events owned by a specific module. Called on module finish.
 /// Note: Device providers (GPIO etc.) clean up their own bindings via
 /// their own release_owned_by — this only frees event slots.
-pub fn release_owned_by(module_idx: u8) {
+pub fn release_owned_by(module_idx: ModuleId) {
     for slot in EVENT_SLOTS.iter() {
         if !slot.allocated.load(Ordering::Acquire) {
             continue;
@@ -453,7 +455,7 @@ pub fn release_owned_by(module_idx: u8) {
             continue;
         }
         slot.signaled.store(false, Ordering::Release);
-        slot.owner.store(0xFF, Ordering::Release);
+        slot.owner.store(NO_MODULE, Ordering::Release);
         slot.allocated.store(false, Ordering::Release);
     }
 }
@@ -481,7 +483,7 @@ pub fn reset_all() {
     for slot in EVENT_SLOTS.iter() {
         if slot.allocated.load(Ordering::Acquire) {
             slot.signaled.store(false, Ordering::Release);
-            slot.owner.store(0xFF, Ordering::Release);
+            slot.owner.store(NO_MODULE, Ordering::Release);
             slot.allocated.store(false, Ordering::Release);
         }
     }

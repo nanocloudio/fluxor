@@ -13,6 +13,7 @@ pub mod backing_store {
     //!     and the driver maps that to its own addressing (LBA, sector,
     //!     offset, …) in its dispatch handler.
 
+    use crate::kernel::exec::scheduler::{ModuleId, NO_MODULE};
     use crate::kernel::mem::page_pool::PAGE_SIZE;
 
     // ============================================================================
@@ -46,7 +47,7 @@ pub mod backing_store {
     pub struct ArenaBackingInfo {
         pub backing_type: BackingType,
         pub writeback: WritebackPolicy,
-        pub module_idx: u8,
+        pub module_idx: ModuleId,
         pub virtual_pages: u32,
         pub resident_max_pages: u32,
         pub backing_offset: u32,
@@ -58,7 +59,7 @@ pub mod backing_store {
             Self {
                 backing_type: BackingType::None,
                 writeback: WritebackPolicy::Deferred,
-                module_idx: 0xFF,
+                module_idx: NO_MODULE,
                 virtual_pages: 0,
                 resident_max_pages: 0,
                 backing_offset: 0,
@@ -113,7 +114,7 @@ pub mod backing_store {
     }
 
     pub fn backing_register(
-        module_idx: u8,
+        module_idx: ModuleId,
         virtual_pages: u32,
         resident_max_pages: u32,
         backing_type: BackingType,
@@ -491,7 +492,7 @@ pub mod pager {
     //! Dirty page writeback is performed on eviction or via explicit sync.
 
     use crate::kernel::backing_store;
-    use crate::kernel::exec::scheduler::MAX_MODULES;
+    use crate::kernel::exec::scheduler::{ModuleId, MAX_MODULES};
     use crate::kernel::mem::page_pool::{self, page_flags, PAGE_SIZE};
 
     // ============================================================================
@@ -655,7 +656,7 @@ pub mod pager {
         }
 
         // Check if page is already mapped (spurious fault / race)
-        if page_pool::pool_find_page(module_idx as u8, vpage_idx).is_some() {
+        if page_pool::pool_find_page(module_idx as ModuleId, vpage_idx).is_some() {
             // Already present — just needs TLB invalidation
             #[cfg(feature = "kernel-vm")]
             tlbi_page(fault_vaddr);
@@ -665,11 +666,11 @@ pub mod pager {
         }
 
         // Allocate a physical page
-        let page_idx = match page_pool::pool_alloc(module_idx as u8) {
+        let page_idx = match page_pool::pool_alloc(module_idx as ModuleId) {
             Some(idx) => idx,
             None => {
                 // Pool is full — evict
-                match evict_one(module_idx as u8, config.arena_id) {
+                match evict_one(module_idx as ModuleId, config.arena_id) {
                     Some(idx) => idx,
                     None => return Err(FaultError::NoPages),
                 }
@@ -704,7 +705,7 @@ pub mod pager {
     }
 
     /// Evict one page to make room, writing back if dirty.
-    fn evict_one(module_idx: u8, arena_id: u8) -> Option<usize> {
+    fn evict_one(module_idx: ModuleId, arena_id: u8) -> Option<usize> {
         let page_idx = page_pool::pool_evict_clock(module_idx)?;
 
         let desc = page_pool::pool_descriptor(page_idx);
@@ -821,7 +822,7 @@ pub mod pager {
         let mut i = 0;
         while i < total && written < max_pages {
             let desc = pool.descriptor(i);
-            if desc.owner_module == module_idx as u8
+            if desc.owner_module == module_idx as ModuleId
                 && desc.is_mapped()
                 && desc.is_dirty()
                 && !desc.is_pinned()
@@ -883,7 +884,7 @@ pub mod pager {
 
         // Register with backing store
         let arena_id = backing_store::backing_register(
-            module_idx as u8,
+            module_idx as ModuleId,
             virtual_pages,
             spec.resident_max_pages,
             spec.backing_type,
@@ -939,14 +940,14 @@ pub mod pager {
         let mut vpage = start_vpage;
         while vpage < start_vpage + count && vpage < config.virtual_pages() {
             // Check if already mapped
-            if page_pool::pool_find_page(module_idx as u8, vpage).is_some() {
+            if page_pool::pool_find_page(module_idx as ModuleId, vpage).is_some() {
                 vpage += 1;
                 loaded += 1;
                 continue;
             }
 
             // Allocate physical page
-            let page_idx = match page_pool::pool_alloc(module_idx as u8) {
+            let page_idx = match page_pool::pool_alloc(module_idx as ModuleId) {
                 Some(idx) => idx,
                 None => break,
             };
@@ -1004,7 +1005,7 @@ pub mod pager {
         sync_all(module_idx);
 
         // Free all physical pages
-        page_pool::pool_free_module(module_idx as u8);
+        page_pool::pool_free_module(module_idx as ModuleId);
 
         // Release backing store
         backing_store::backing_release(config.arena_id as usize);
@@ -1069,8 +1070,8 @@ pub mod pager {
         // SAFETY: as above.
         let stats = unsafe { &PAGER_STATS[module_idx] };
 
-        let resident = page_pool::pool_resident_count(module_idx as u8) as u32;
-        let dirty = page_pool::pool_dirty_count(module_idx as u8) as u32;
+        let resident = page_pool::pool_resident_count(module_idx as ModuleId) as u32;
+        let dirty = page_pool::pool_dirty_count(module_idx as ModuleId) as u32;
 
         PagedArenaStats {
             resident,

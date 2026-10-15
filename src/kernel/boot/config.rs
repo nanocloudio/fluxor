@@ -105,9 +105,9 @@ pub struct GpioConfig {
     pub pull: GpioPull,
     /// Initial level (for outputs)
     pub initial: GpioLevel,
-    /// Owner module index (0xFF = kernel-owned, 0-7 = module index)
-    /// Set by config; kernel grants pin to module at instantiation.
-    pub owner_module_id: u8,
+    /// Owner module index (`NO_MODULE` = kernel-owned). Set by config;
+    /// the kernel grants the pin to the module at instantiation.
+    pub owner_module_id: ModuleId,
 }
 
 /// PIO instance configuration
@@ -558,20 +558,18 @@ fn read_layout_from_trailer() -> Option<FlashLayout> {
 /// 32. The event-wake bitmap in `kernel/event.rs` is u64, so any profile
 /// value up to 64 is safe; >64 needs the bitmap widened first.
 pub use crate::abi::config::kernel::MAX_MODULES;
+use crate::kernel::exec::scheduler::ModuleId;
 
-// The event-wake bitmap and scheduler readiness/upstream bitmaps are
-// `ModuleMask`-backed, so they scale with MAX_MODULES.
-// The residual ceiling is the scheduler's u8 module-index domain
-// (`exec_order: [u8; _]`, `module_idx as u8`, fault-attribution ids) with 0xFF
-// reserved as the no-module sentinel; 255 is the boundary. See the matching
-// assert in `kernel/scheduler`.
+// A module id is 10 bits on the wire: the low byte in its own field and the
+// high bits in spare bits beside it (module entry byte 9, edge bytes 10-11,
+// module-section header byte 1). The ceiling must fit them.
 const _: () = assert!(
-    MAX_MODULES <= 255,
-    "MAX_MODULES > 255 requires widening scheduler module ids past u8"
+    MAX_MODULES <= 1024,
+    "module ids carry 10 bits in the config blob"
 );
 
 /// Edge ceiling, keyed on the module ceiling so the two cannot drift apart.
-/// The host profile (255 modules) carries 384 edges: a control plane whose
+/// The host profile (1024 modules) carries 1536 edges: a control plane whose
 /// controllers are PARAMS is a long chain of decision and connector nodes, one
 /// edge each, and nanocloud's all-in-one graph passes 120 edges on its own —
 /// and it cannot split across processes, because the linux store is
@@ -589,7 +587,7 @@ pub const MAX_GRAPH_EDGES: usize = if MAX_MODULES > 128 {
 };
 /// Literal halves of [`MAX_GRAPH_EDGES`], named so the tools' capacity mirror
 /// can pin them against this source text.
-pub const HOST_GRAPH_EDGES: usize = 384;
+pub const HOST_GRAPH_EDGES: usize = 1536;
 pub const SMALL_GRAPH_EDGES: usize = 128;
 /// Graph-section byte 3: how many edge SLOTS the blob was laid out for, in
 /// units of 128, with 0 meaning 128 so that a blob stating no code reads as
@@ -632,9 +630,9 @@ pub const PIO_CONFIG_BIN_SIZE: usize = 4;
 
 /// Graph section binary format sizes.
 ///
-/// Edge layout (8 bytes):
-///   byte 0:    from_id
-///   byte 1:    to_id
+/// Edge layout (12 bytes):
+///   byte 0:    from_id, low byte
+///   byte 1:    to_id, low byte
 ///   byte 2:    bit 7    = to_port (0 = data, 1 = ctrl)
 ///              bits 6:5 = edge_class
 ///              bits 4:0 = buffer_group
@@ -644,6 +642,10 @@ pub const PIO_CONFIG_BIN_SIZE: usize = 4;
 ///              `0` falls back to module hints / `BUFFER_SIZE`.
 ///              Otherwise `max(module_hint, buffer_bytes)` is the
 ///              size requested from `channel_open_for_module`.
+///   byte 8:    rate_class
+///   byte 9:    bit 0 = wake_on_write; bits 1-7 reserved
+///   byte 10:   from_id, high byte
+///   byte 11:   to_id, high byte
 pub const GRAPH_EDGE_SIZE: usize = 12;
 /// Per-domain metadata entry, bytes: `tick_us:u16 | exec_mode:u8 |
 /// adaptive_flags:u8` = 4. Byte 3 carries `adaptive_flags`.
@@ -738,16 +740,17 @@ pub fn config_arena_usage() -> (usize, usize) {
 /// - Bytes 0-3: entry_length (u32) - total entry size including the header;
 ///   u32 so one module's params may exceed 64 KiB
 /// - Bytes 4-7: name_hash (fnv1a32)
-/// - Byte 8: id
+/// - Byte 8: id, low byte
 /// - Byte 9: bit-packed metadata —
 ///   bits 0-2 = domain_id (0..7, 0 = default domain),
 ///   bit  4   = pre_tick_drain (Tier 1c opt-in),
-///   bits 3, 5-7 reserved.
+///   bits 5-6 = id bits 8-9,
+///   bits 3, 7 reserved.
 /// - Bytes 10+: params (entry_length - 10 bytes)
 #[derive(Debug, Clone, Copy)]
 pub struct ModuleEntry {
     pub name_hash: u32,
-    pub id: u8,
+    pub id: ModuleId,
     /// Execution domain ID (0 = default domain)
     pub domain_id: u8,
     /// Module opts into the Tier 1c pre-pass drain slot. Set by the
@@ -823,8 +826,8 @@ pub enum EdgeClass {
 /// Graph edge connecting two modules
 #[derive(Debug, Clone, Copy)]
 pub struct GraphEdge {
-    pub from_id: u8,
-    pub to_id: u8,
+    pub from_id: ModuleId,
+    pub to_id: ModuleId,
     /// Destination port type: 0 = in (data), 1 = ctrl (control)
     pub to_port: u8,
     /// Source port index (high nibble of byte 3). 0 = primary output.
@@ -889,7 +892,8 @@ pub struct Config {
     pub header: ConfigHeader,
     pub modules: [Option<ModuleEntry>; MAX_MODULES],
     pub graph_edges: [Option<GraphEdge>; MAX_GRAPH_EDGES],
-    pub module_count: u8,
+    /// Low byte from the header, high byte from the module section's byte 1.
+    pub module_count: u16,
     /// Low byte from the header, high byte from the graph section — see
     /// `MAX_GRAPH_EDGES`.
     pub edge_count: u16,
@@ -1112,15 +1116,6 @@ pub fn read_config_from_slice(blob: &[u8], config: &mut Config) -> bool {
     // header that promises more modules/edges than the kernel can hold is
     // either a tool-version mismatch or a malformed blob — either way the
     // right answer is to refuse the load with a clear log line.
-    if header.module_count as usize > MAX_MODULES {
-        log::error!(
-            "[config] module_count={} exceeds MAX_MODULES={}",
-            header.module_count,
-            MAX_MODULES
-        );
-        return false;
-    }
-    config.module_count = header.module_count;
     // The LOW byte. The high byte lives in the graph section header and is
     // folded in (and the total bounded) once that section is located below.
     config.edge_count = u16::from(header.edge_count);
@@ -1130,8 +1125,8 @@ pub fn read_config_from_slice(blob: &[u8], config: &mut Config) -> bool {
     // points past the header inside the blob.
     let modules_base = unsafe { flash_ptr.add(16) };
 
-    // Module section header: module_count (u8), reserved (u8),
-    // section_size (u32). u32 lets multi-component scenarios (split
+    // Module section header: module_count low byte (u8), module_count high
+    // byte (u8), section_size (u32). u32 lets multi-component scenarios (split
     // deployments where producer + viewer/player both embed the
     // canonical wasm shell as http body routes) clear 64 KiB without
     // overflowing the section size; embedded targets (rp/bcm) still
@@ -1147,6 +1142,21 @@ pub fn read_config_from_slice(blob: &[u8], config: &mut Config) -> bool {
     // SAFETY: `blob_len >= HEADER_SIZE + 6` (checked above); section_size
     // u32 lives at offset 16+2 inside `blob`.
     let section_size = unsafe { read_u32(modules_base.add(2)) } as usize;
+
+    // The module count's high byte rides the module section header. A
+    // header that promises more modules than the kernel can hold is either
+    // a tool-version mismatch or a malformed blob: refuse, never clamp.
+    // SAFETY: byte 1 of the 6-byte section header, in bounds as above.
+    let count_hi = unsafe { *modules_base.add(1) };
+    config.module_count = u16::from(header.module_count) | (u16::from(count_hi) << 8);
+    if config.module_count as usize > MAX_MODULES {
+        log::error!(
+            "[config] module_count={} exceeds MAX_MODULES={}",
+            config.module_count,
+            MAX_MODULES
+        );
+        return false;
+    }
 
     // Validate CRC16-CCITT checksum over body (bytes 8 onwards).
     // Body = header tail (8) + module section (6+section_size) + graph (64) + hw (variable).
@@ -1534,10 +1544,10 @@ fn parse_module_entry(ptr: *const u8, entry_len: usize) -> Option<ModuleEntry> {
     // lies inside the config blob. All inner reads are bounded by `entry_len`.
     unsafe {
         let name_hash = read_u32(ptr.add(4));
-        let id = *ptr.add(8);
         // Byte 9 is multiplexed (see ModuleEntry docs): bits 0-2 carry
-        // domain_id (0..7), bit 4 carries pre_tick_drain.
+        // domain_id (0..7), bit 4 pre_tick_drain, bits 5-6 the id's bits 8-9.
         let byte9 = *ptr.add(9);
+        let id = ModuleId::from(*ptr.add(8)) | (ModuleId::from((byte9 >> 5) & 0x03) << 8);
         let domain_id = byte9 & 0x07;
         let pre_tick_drain = (byte9 & 0x10) != 0;
 
@@ -1598,8 +1608,9 @@ fn parse_graph_edge(ptr: *const u8) -> GraphEdge {
     // SAFETY: `ptr..ptr+GRAPH_EDGE_SIZE (= 12)` is in-bounds (caller is
     // the edge-loop which bounds-checked `edge_count * GRAPH_EDGE_SIZE`).
     unsafe {
-        let from_id = *ptr;
-        let to_id = *ptr.add(1);
+        // Low bytes at 0-1, high bytes at 10-11.
+        let from_id = ModuleId::from(*ptr) | (ModuleId::from(*ptr.add(10)) << 8);
+        let to_id = ModuleId::from(*ptr.add(1)) | (ModuleId::from(*ptr.add(11)) << 8);
         let byte2 = *ptr.add(2);
         let to_port = (byte2 >> 7) & 1;
         let edge_class_raw = (byte2 >> 5) & 0x03;
@@ -1648,9 +1659,9 @@ fn parse_graph_edge(ptr: *const u8) -> GraphEdge {
 /// Then: uart_configs[uart_count] (8 bytes each)
 ///           - bus (u8), tx_pin (u8), rx_pin (u8), reserved (u8), baudrate (u32)
 /// Then: gpio_configs[gpio_count] (5 bytes each)
-///           - pin (u8), flags (u8), initial (u8), owner_module_id (u8), reserved (u8)
+///           - pin (u8), flags (u8), initial (u8), owner_module_id (u16 LE)
 ///           - flags: bit0 = direction (0=in, 1=out), bit1-2 = pull (0=none, 1=up, 2=down)
-///           - owner_module_id: 0xFF = kernel-owned, 0-7 = module index to grant to
+///           - owner_module_id: 0xFFFF = kernel-owned, else the module index to grant to
 /// Then: pio_configs[pio_count] (4 bytes each)
 ///           - pio_idx (u8), data_pin (u8), clk_pin (u8), extra_pin (u8)
 ///           - extra_pin: 0xFF = unused
@@ -1751,13 +1762,13 @@ fn parse_hardware_section(ptr: *const u8) -> Option<HardwareConfig> {
         }
 
         // Parse GPIO configs (5 bytes each):
-        // byte 0: pin, byte 1: flags, byte 2: initial, byte 3: owner_module_id, byte 4: reserved
+        // byte 0: pin, byte 1: flags, byte 2: initial, bytes 3-4: owner_module_id
         for i in 0..gpio_count {
             let entry = ptr.add(offset);
             let pin = *entry;
             let flags = *entry.add(1);
             let initial = *entry.add(2);
-            let owner_module_id = *entry.add(3);
+            let owner_module_id = read_u16(entry.add(3));
 
             let direction = if flags & 0x01 != 0 {
                 GpioDirection::Output

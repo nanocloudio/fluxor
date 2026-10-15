@@ -172,7 +172,7 @@ sum(module_state_size[i] + heap_arena_size[i]) <= STATE_ARENA_SIZE
 |--------|-------------|---------------------|
 | RP2040 | 64 KiB | 1-4 KiB per module |
 | RP2350 | 240 KiB | 4-32 KiB per module |
-| BCM2712 | 96 MiB (host profile) | KiB to MiB per module |
+| BCM2712 | 1 GiB (host profile) | KiB to MiB per module |
 
 The heap is opt-in and bounded. Modules that do not use it pay
 nothing.

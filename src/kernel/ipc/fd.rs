@@ -16,7 +16,9 @@
 //! `fd_poll` provides non-destructive (peek) readiness checks across all handle types.
 //! Modules use `fd_poll` for readiness, then the per-type API for consumption.
 
-use portable_atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
+use portable_atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
+
+use crate::kernel::exec::scheduler::{ModuleId, NO_MODULE};
 
 use crate::kernel::ipc::channel::{self, POLL_IN};
 use crate::kernel::ipc::event;
@@ -47,7 +49,7 @@ pub const MAX_TIMERS: usize = 16;
 struct TimerSlot {
     allocated: AtomicBool,
     active: AtomicBool,
-    owner: AtomicU8,
+    owner: AtomicU16,
     /// Deadline in milliseconds (from Instant epoch), wrapping-safe comparison
     deadline_ms: AtomicU32,
     /// The owner has been woken for THIS arming. A timer is an fd: the
@@ -63,7 +65,7 @@ impl TimerSlot {
         Self {
             allocated: AtomicBool::new(false),
             active: AtomicBool::new(false),
-            owner: AtomicU8::new(0xFF),
+            owner: AtomicU16::new(NO_MODULE),
             deadline_ms: AtomicU32::new(0),
             woken: AtomicBool::new(false),
         }
@@ -85,7 +87,7 @@ pub fn timer_create() -> i32 {
         ledger::deny(POOL_TIMERS);
         return errno::ENOSPC;
     }
-    let owner = crate::kernel::exec::scheduler::current_module_index() as u8;
+    let owner = crate::kernel::exec::scheduler::current_module_id();
     for (i, timer) in TIMER_SLOTS.iter().enumerate() {
         if timer
             .allocated
@@ -156,7 +158,7 @@ pub fn timer_destroy(fd: i32) -> i32 {
     }
     timer.active.store(false, Ordering::Release);
     timer.woken.store(false, Ordering::Release);
-    timer.owner.store(0xFF, Ordering::Release);
+    timer.owner.store(NO_MODULE, Ordering::Release);
     timer.allocated.store(false, Ordering::Release);
     0
 }
@@ -184,7 +186,7 @@ pub fn timer_pump(domain_id: u8) -> Option<u32> {
             continue;
         }
         let owner = timer.owner.load(Ordering::Acquire) as usize;
-        if owner == 0xFF {
+        if owner == usize::from(NO_MODULE) {
             continue;
         }
         let deadline = timer.deadline_ms.load(Ordering::Acquire);
@@ -220,7 +222,7 @@ fn timer_is_expired(slot: i32) -> bool {
 }
 
 /// Release all timer slots owned by a specific module. Called on module finish.
-pub fn release_timers_owned_by(module_idx: u8) {
+pub fn release_timers_owned_by(module_idx: ModuleId) {
     for timer in TIMER_SLOTS.iter() {
         if !timer.allocated.load(Ordering::Acquire) {
             continue;
@@ -230,7 +232,7 @@ pub fn release_timers_owned_by(module_idx: u8) {
         }
         timer.active.store(false, Ordering::Release);
         timer.woken.store(false, Ordering::Release);
-        timer.owner.store(0xFF, Ordering::Release);
+        timer.owner.store(NO_MODULE, Ordering::Release);
         timer.allocated.store(false, Ordering::Release);
     }
 }

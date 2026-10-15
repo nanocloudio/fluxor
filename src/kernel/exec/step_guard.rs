@@ -22,9 +22,10 @@
 //! not observed at all. The forced-return trampoline that rewrites a stacked
 //! PC belongs to the memory-protection fault path, not to this timer.
 
+use crate::kernel::exec::scheduler::{ModuleId, NO_MODULE};
 use crate::kernel::sys::hal;
 use core::cell::UnsafeCell;
-use portable_atomic::{AtomicBool, AtomicI32, AtomicU16, AtomicU8, Ordering};
+use portable_atomic::{AtomicBool, AtomicI32, AtomicU16, Ordering};
 
 // ============================================================================
 // Fault state machine
@@ -149,10 +150,10 @@ pub struct ModuleFaultInfo {
     /// Index of a paired module. When this module faults and the
     /// partner has also faulted within `QUARANTINE_WINDOW_MS`,
     /// both are terminated regardless of individual `FaultPolicy`.
-    /// `0xFF` means no partner declared. Used by tightly-coupled
+    /// `NO_MODULE` means no partner declared. Used by tightly-coupled
     /// pairs (TLS handshake + transport, codec pair-stream) where
     /// one half's failure invalidates the other.
-    pub quarantine_partner: u8,
+    pub quarantine_partner: ModuleId,
 }
 
 impl Default for ModuleFaultInfo {
@@ -176,7 +177,7 @@ impl ModuleFaultInfo {
             backoff_remaining: 0,
             step_deadline_us: 0,
             step_deadline_burst_us: 0,
-            quarantine_partner: 0xFF,
+            quarantine_partner: NO_MODULE,
         }
     }
 
@@ -294,12 +295,12 @@ static STEP_TIMED_OUT: [AtomicBool; MAX_STEP_GUARD_CORES] = [
 ];
 
 /// Per-core module index that the guard is armed for (for ISR
-/// context). `0xFF` means no module is currently guarded on that core.
-static GUARDED_MODULE: [AtomicU8; MAX_STEP_GUARD_CORES] = [
-    AtomicU8::new(0xFF),
-    AtomicU8::new(0xFF),
-    AtomicU8::new(0xFF),
-    AtomicU8::new(0xFF),
+/// context). `NO_MODULE` means no module is currently guarded on that core.
+static GUARDED_MODULE: [AtomicU16; MAX_STEP_GUARD_CORES] = [
+    AtomicU16::new(NO_MODULE),
+    AtomicU16::new(NO_MODULE),
+    AtomicU16::new(NO_MODULE),
+    AtomicU16::new(NO_MODULE),
 ];
 
 /// Per-core armed flag. The platform `step_guard_arm` sets this
@@ -342,7 +343,7 @@ pub fn check_and_clear_timeout() -> bool {
 pub fn record_mpu_fault(module_idx: usize) {
     let c = cur_core();
     MPU_FAULT_PENDING[c].store(true, Ordering::Release);
-    GUARDED_MODULE[c].store(module_idx as u8, Ordering::Release);
+    GUARDED_MODULE[c].store(module_idx as ModuleId, Ordering::Release);
 }
 
 /// Record that a gated module was forced out of an entry for running past
@@ -351,7 +352,7 @@ pub fn record_mpu_fault(module_idx: usize) {
 pub fn record_forced_timeout(module_idx: usize) {
     let c = cur_core();
     STEP_TIMED_OUT[c].store(true, Ordering::Release);
-    GUARDED_MODULE[c].store(module_idx as u8, Ordering::Release);
+    GUARDED_MODULE[c].store(module_idx as ModuleId, Ordering::Release);
 }
 
 /// Check if an MPU fault is pending on the current core (and clear).
@@ -406,7 +407,7 @@ pub fn init() {
 #[inline]
 pub fn arm(deadline_us: u32) {
     GUARDED_MODULE[cur_core()].store(
-        crate::kernel::exec::scheduler::current_module_index() as u8,
+        crate::kernel::exec::scheduler::current_module_id(),
         Ordering::Release,
     );
     hal::step_guard_arm(deadline_us);
@@ -431,48 +432,50 @@ pub fn post_step_check() {
 
 /// Externally-visible fault record. Kept compact; serialised LE for monitors.
 ///
-/// Wire layout (12 bytes):
-///   byte 0:    module_idx
-///   byte 1:    fault_kind
-///   byte 2:    caused_by — module index of the upstream that faulted
-///              within the cascade window, or `0xFF` if independent.
-///   byte 3:    last_input_ct — content_type of the module's most
-///              recent consumed input, or `0` for unknown.
-///   bytes 4-7: tick (u32 LE)
-///   bytes 8-9: fault_count (u16 LE)
-///   bytes 10-11: restart_count (u16 LE)
+/// Wire layout (16 bytes):
+///   bytes 0-1:   module_idx (u16 LE)
+///   bytes 2-3:   caused_by (u16 LE) — module index of the upstream that
+///                faulted within the cascade window, or `NO_MODULE` (0xFFFF)
+///                if independent.
+///   byte 4:      fault_kind
+///   byte 5:      last_input_ct — content_type of the module's most recent
+///                consumed input, or `0` for unknown.
+///   bytes 6-7:   fault_count (u16 LE)
+///   bytes 8-11:  tick (u32 LE)
+///   bytes 12-13: restart_count (u16 LE)
+///   bytes 14-15: 0
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FaultRecord {
     /// Module index (0..MAX_MODULES).
-    pub module_idx: u8,
+    pub module_idx: ModuleId,
+    /// Cascade origin — upstream module index that faulted within
+    /// `CASCADE_WINDOW_TICKS` of this fault, or `NO_MODULE` for independent.
+    pub caused_by: ModuleId,
     /// Fault type (fault_type::*).
     pub fault_kind: u8,
-    /// Cascade origin — upstream module index that faulted within
-    /// `CASCADE_WINDOW_TICKS` of this fault, or `0xFF` for independent.
-    pub caused_by: u8,
     /// Content_type of the last consumed input, or `0` if unknown.
     pub last_input_ct: u8,
-    /// Tick at which the fault was observed.
-    pub tick: u32,
     /// Cumulative fault count for this module after this event.
     pub fault_count: u16,
+    /// Tick at which the fault was observed.
+    pub tick: u32,
     /// Cumulative restart count for this module after this event.
     pub restart_count: u16,
 }
 
 impl FaultRecord {
-    pub const SIZE: usize = 12;
+    pub const SIZE: usize = 16;
 
     pub fn to_bytes(&self) -> [u8; Self::SIZE] {
         let mut b = [0u8; Self::SIZE];
-        b[0] = self.module_idx;
-        b[1] = self.fault_kind;
-        b[2] = self.caused_by;
-        b[3] = self.last_input_ct;
-        b[4..8].copy_from_slice(&self.tick.to_le_bytes());
-        b[8..10].copy_from_slice(&self.fault_count.to_le_bytes());
-        b[10..12].copy_from_slice(&self.restart_count.to_le_bytes());
+        b[0..2].copy_from_slice(&self.module_idx.to_le_bytes());
+        b[2..4].copy_from_slice(&self.caused_by.to_le_bytes());
+        b[4] = self.fault_kind;
+        b[5] = self.last_input_ct;
+        b[6..8].copy_from_slice(&self.fault_count.to_le_bytes());
+        b[8..12].copy_from_slice(&self.tick.to_le_bytes());
+        b[12..14].copy_from_slice(&self.restart_count.to_le_bytes());
         b
     }
 }
@@ -498,11 +501,11 @@ static FAULT_RING: FaultRing = FaultRing {
     records: UnsafeCell::new(
         [FaultRecord {
             module_idx: 0,
+            caused_by: NO_MODULE,
             fault_kind: 0,
-            caused_by: 0xFF,
             last_input_ct: 0,
-            tick: 0,
             fault_count: 0,
+            tick: 0,
             restart_count: 0,
         }; FAULT_RING_CAP],
     ),

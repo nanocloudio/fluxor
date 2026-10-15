@@ -153,7 +153,9 @@ The fmod-graph backend realizes the shared posture only. A workload is a
 tenant of the node: `CREATE` refuses the null identity (`EINVAL`), since
 everything keyed on an owner's identity would see every such workload as
 one, and refuses a subgraph any of whose modules holds a permission other
-than `observe` (`EACCES`), checked before anything is allocated.
+than `observe` (`EACCES`), checked before anything is allocated. One
+subgraph holds at most 64 modules and 128 edges (`MAX_ADD_MODULES`,
+`MAX_ADD_EDGES`); the build refuses a workload past either.
 
 A workload can bring its own modules (`SOURCE_FMOD_PACK`): an FXMT module
 table in the caller's memory, the SHA-256 pins its modules are admitted by,
@@ -408,9 +410,9 @@ one of which is selected at compile time via `cfg(target_arch)`:
 
 | Profile | Selected for | Sample sizes |
 |---|---|---|
-| `profile_host` | `target_arch = "aarch64"` (Pi 5, Linux host, BCM2712 bare-metal) | `STATE_ARENA_SIZE = 96 MiB`, `BUFFER_ARENA_SIZE = 8 MiB`, `MAX_MODULES = 128`, http `MAX_CONCURRENT_CONNS = 256`, `ELASTIC_REGION_SIZE = 8 MiB` |
+| `profile_host` | `target_arch = "aarch64"` (Pi 5, Linux host, BCM2712 bare-metal) | `STATE_ARENA_SIZE = 1 GiB`, `BUFFER_ARENA_SIZE = 16 MiB`, `MAX_MODULES = 1024`, http `MAX_CONCURRENT_CONNS = 256`, `ELASTIC_REGION_SIZE = 16 MiB` |
 | `profile_wasm` | `target_arch = "wasm32"` | `STATE_ARENA_SIZE = 96 MiB`, `BUFFER_ARENA_SIZE = 8 MiB`, `MAX_MODULES = 48`, http `MAX_CONCURRENT_CONNS = 256`, `ELASTIC_REGION_SIZE = 2 MiB` |
-| `profile_embedded` | anything else (`thumbv*`) | `STATE_ARENA_SIZE = 256 KiB`, `BUFFER_ARENA_SIZE = 64 KiB`, `MAX_MODULES = 32`, http `MAX_CONCURRENT_CONNS = 1`, `ELASTIC_REGION_SIZE = 0` |
+| `profile_embedded` | anything else (`thumbv*`) | `STATE_ARENA_SIZE = 240 KiB` (rp2350) / `64 KiB` (rp2040), `BUFFER_ARENA_SIZE = 64 KiB` / `16 KiB`, `MAX_MODULES = 32`, http `MAX_CONCURRENT_CONNS = 4` / `1`, `ELASTIC_REGION_SIZE = 0` |
 
 On RP silicon the kernel's arena sizes are overridden per chip by the
 silicon TOMLs (`targets/silicon/rp2040.toml`: 64 KiB state / 16 KiB

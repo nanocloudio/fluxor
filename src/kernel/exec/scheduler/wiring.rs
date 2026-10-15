@@ -41,7 +41,7 @@ fn manifest_direction_byte(dir: FanDirection, port_key: u8) -> u8 {
 /// `FRAME_KIND_NONE` when the module isn't in the loader table (host
 /// built-in without a packed manifest) or the manifest doesn't
 /// describe a port at the requested direction+index.
-fn fanned_port_frame_kind(
+pub(crate) fn fanned_port_frame_kind(
     loader: &ModuleLoader,
     name_hash: u32,
     dir: FanDirection,
@@ -73,9 +73,10 @@ const RECORD_FAN_GROUP_FIRST: u8 = 32;
 /// An edge in a group shares that group's channel with the group's other
 /// edges — the group IS the aliasing — so an edge that must be a mailbox of
 /// its own needs a group nobody else is in.
-fn fresh_record_group(edges: &[Edge; MAX_CHANNELS], edge_count: usize) -> Option<u8> {
-    (RECORD_FAN_GROUP_FIRST..128)
-        .find(|g| !edges.iter().take(edge_count).any(|e| e.buffer_group == *g))
+pub(crate) fn fresh_record_group(edges: &[Edge]) -> Option<u8> {
+    (RECORD_FAN_GROUP_FIRST as usize..BUFFER_GROUPS)
+        .map(|g| g as u8)
+        .find(|g| !edges.iter().any(|e| e.buffer_group == *g))
 }
 
 /// Compute port grouping key for fan insertion.
@@ -280,7 +281,7 @@ fn insert_fan(
             let record = fan_kind == module_types::FRAME_KIND_RECORD;
             for &ei in group.iter().take(group_count) {
                 if record {
-                    let Some(g) = fresh_record_group(edges, *edge_count) else {
+                    let Some(g) = fresh_record_group(&edges[..*edge_count]) else {
                         log::error!(
                             "[graph] record fan module={module_idx} has no buffer group left"
                         );
@@ -337,7 +338,7 @@ fn insert_fan(
             };
             let mut new_edge = new_edge;
             if record {
-                let Some(g) = fresh_record_group(edges, *edge_count) else {
+                let Some(g) = fresh_record_group(&edges[..*edge_count]) else {
                     log::error!("[graph] record fan module={module_idx} has no buffer group left");
                     return false;
                 };
@@ -693,7 +694,7 @@ pub fn instantiate_one_module(
         // Overlay any runtime parameter overrides from flash store
         {
             let new_len = hal::merge_runtime_overrides(
-                entry.id as u16,
+                entry.id,
                 pb.as_mut_ptr(),
                 pb.len(),
                 MAX_MODULE_CONFIG_SIZE,

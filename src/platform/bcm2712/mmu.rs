@@ -97,21 +97,30 @@ mod bcm2712_impl {
     const MAIR_VALUE: u64 = 0xFF |          // Attr0: Normal memory, WB-WA
         (0x44 << 16); // Attr2: Normal non-cacheable
 
-    /// TCR_EL1 value for 4KB granule, 39-bit VA (512GB), ASID 8-bit.
+    /// TCR_EL1 value for 4KB granule, 39-bit VA (512GB), 16-bit ASIDs.
     /// T0SZ = 25 (64-25=39 bit VA space)
     /// IRGN0 = 0b01 (inner WB-WA cacheable)
     /// ORGN0 = 0b01 (outer WB-WA cacheable)
     /// SH0 = 0b11 (inner shareable)
     /// TG0 = 0b00 (4KB granule)
     /// A1 = 0 (TTBR0 ASID)
-    /// AS = 0 (8-bit ASID)
+    /// AS = 1 (16-bit ASID: one per module index, see `module_asid`)
     // TG0 (4KB granule) encodes as 0b00, so its slot contributes nothing to
     // the bitmask; only the non-zero fields are spelled out below.
     const TCR_VALUE: u64 = 25 |             // T0SZ = 25 → 39-bit VA
         (0b01 << 8) |   // IRGN0 = WB-WA
         (0b01 << 10) |  // ORGN0 = WB-WA
         (0b11 << 12) |  // SH0 = Inner-shareable
-        (0b1 << 23); // EPD1 = 1 (disable TTBR1 walks)
+        (0b1 << 23) |   // EPD1 = 1 (disable TTBR1 walks)
+        (1u64 << 36); // AS = 1 (16-bit ASIDs)
+
+    /// The ASID a module's translations are tagged with: its index + 1, so
+    /// ASID 0 stays the kernel's. 16-bit ASIDs (`TCR_EL1.AS`) hold every
+    /// index the module ceiling allows, so no two modules share one.
+    const fn module_asid(module_idx: usize) -> u64 {
+        module_idx as u64 + 1
+    }
+    const _: () = assert!(module_asid(MAX_MODULES - 1) <= 0xFFFF);
 
     // ========================================================================
     // Page table storage
@@ -337,7 +346,7 @@ mod bcm2712_impl {
         // is per-CPU and the scheduler thread is the sole writer.
         unsafe {
             let l1_addr = &MODULE_L1[module_idx] as *const _ as u64;
-            let asid = (module_idx as u64 + 1) & 0xFF;
+            let asid = module_asid(module_idx);
             let ttbr0 = l1_addr | (asid << 48);
 
             core::arch::asm!(
@@ -628,9 +637,9 @@ mod bcm2712_impl {
     // pointer, handle and opcode before anything is dereferenced.
     pub mod el0 {
         use super::{
-            make_block_desc, make_page_desc, L3PageTable, PageTable, AP_EL0_RO, AP_EL0_RW,
-            AP_EL1_RW, ATTR_IDX_DEVICE, ATTR_IDX_NORMAL, DESC_TABLE, DESC_VALID, L1_BLOCK_SIZE,
-            L2_BLOCK_SIZE, MODULE_REGION_INFO, TABLE_ENTRIES,
+            make_block_desc, make_page_desc, module_asid, L3PageTable, PageTable, AP_EL0_RO,
+            AP_EL0_RW, AP_EL1_RW, ATTR_IDX_DEVICE, ATTR_IDX_NORMAL, DESC_TABLE, DESC_VALID,
+            L1_BLOCK_SIZE, L2_BLOCK_SIZE, MODULE_REGION_INFO, TABLE_ENTRIES,
         };
         use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -1263,7 +1272,7 @@ mod bcm2712_impl {
                 ISO_BUILT[slot] = false;
                 ISO_SLOT_OWNER[slot].store(usize::MAX, Ordering::Release);
                 // The module's ASID must not resolve to its old pages.
-                let asid = (module_idx as u64 + 1) & 0xFF;
+                let asid = module_asid(module_idx);
                 core::arch::asm!(
                     "dsb ishst",
                     "tlbi aside1is, {a}",
@@ -1567,7 +1576,7 @@ mod bcm2712_impl {
             core::ptr::write_volatile(core::ptr::addr_of_mut!((*cb).module_idx), module_idx as u32);
             // Module TTBR0: ISO_L1 base | ASID (module_idx+1) in [63:48].
             let l1 = core::ptr::addr_of!(ISO_L1[slot]) as u64;
-            let asid = (module_idx as u64 + 1) & 0xFF;
+            let asid = module_asid(module_idx);
             let ttbr0 = (l1 & 0x0000_FFFF_FFFF_FFFF) | (asid << 48);
 
             // Params go to the top of the module's own stack, 16-aligned, so

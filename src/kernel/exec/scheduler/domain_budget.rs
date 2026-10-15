@@ -553,7 +553,7 @@ pub(crate) fn step_domain_pipeline_refill(
         set_current_module(module_idx);
         // SAFETY: debug-only volatile write to a scalar static; scheduler-thread only.
         unsafe {
-            core::ptr::write_volatile(&raw mut DBG_STEP_MODULE, module_idx as u8);
+            core::ptr::write_volatile(&raw mut DBG_STEP_MODULE, module_idx as ModuleId);
         }
         let deadline = sched.fault_info[module_idx].effective_deadline_us();
         step_guard::arm(deadline);
@@ -626,7 +626,7 @@ pub(crate) fn step_domain_post_tick_flush(
         set_current_module(module_idx);
         // SAFETY: debug-only volatile write to a scalar static; scheduler-thread only.
         unsafe {
-            core::ptr::write_volatile(&raw mut DBG_STEP_MODULE, module_idx as u8);
+            core::ptr::write_volatile(&raw mut DBG_STEP_MODULE, module_idx as ModuleId);
         }
         let deadline = sched.fault_info[module_idx].effective_deadline_us();
         step_guard::arm(deadline);
@@ -869,11 +869,11 @@ pub(crate) fn step_one_module(
         // Set current_module so channel_port works during module_step
         set_current_module(module_idx);
         // Track for HardFault diagnosis
-        // SAFETY: DBG_STEP_MODULE is a u8 diagnostic — single writer
+        // SAFETY: DBG_STEP_MODULE is a ModuleId diagnostic — single writer
         // (this scheduler thread); the fault handler reads it via
         // `read_volatile`.
         unsafe {
-            core::ptr::write_volatile(&raw mut DBG_STEP_MODULE, module_idx as u8);
+            core::ptr::write_volatile(&raw mut DBG_STEP_MODULE, module_idx as ModuleId);
         }
 
         // Arm step guard timer

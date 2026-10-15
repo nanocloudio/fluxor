@@ -67,12 +67,12 @@ pub(crate) fn enforce_drain_timeout(
 /// is captured.
 const CASCADE_WINDOW_TICKS: u32 = 4;
 
-pub(crate) fn detect_caused_by(sched: &SchedulerState, module_idx: usize, tick: u32) -> u8 {
+pub(crate) fn detect_caused_by(sched: &SchedulerState, module_idx: usize, tick: u32) -> ModuleId {
     let mask = sched.upstream_mask[module_idx];
     if mask.is_empty() {
-        return 0xFF;
+        return NO_MODULE;
     }
-    let mut best: u8 = 0xFF;
+    let mut best = NO_MODULE;
     let mut best_elapsed: u32 = CASCADE_WINDOW_TICKS + 1;
     for i in mask.iter_set() {
         let fi = &sched.fault_info[i];
@@ -81,7 +81,7 @@ pub(crate) fn detect_caused_by(sched: &SchedulerState, module_idx: usize, tick: 
         }
         let elapsed = tick.wrapping_sub(fi.last_fault_tick);
         if elapsed <= CASCADE_WINDOW_TICKS && elapsed < best_elapsed {
-            best = i as u8;
+            best = i as ModuleId;
             best_elapsed = elapsed;
         }
     }
@@ -233,7 +233,7 @@ pub(crate) fn handle_step_timeout(
         fi.fault_count
     );
     step_guard::push_fault(FaultRecord {
-        module_idx: module_idx as u8,
+        module_idx: module_idx as ModuleId,
         fault_kind: fault_type::TIMEOUT,
         caused_by,
         last_input_ct,
@@ -285,7 +285,7 @@ pub(crate) fn handle_step_error(
     let fi = &mut sched.fault_info[module_idx];
     fi.record_fault(fault_type::STEP_ERROR, tick);
     step_guard::push_fault(FaultRecord {
-        module_idx: module_idx as u8,
+        module_idx: module_idx as ModuleId,
         fault_kind: fault_type::STEP_ERROR,
         caused_by,
         last_input_ct,
@@ -338,7 +338,7 @@ pub(crate) fn handle_mpu_fault(
         fi.fault_count
     );
     step_guard::push_fault(FaultRecord {
-        module_idx: module_idx as u8,
+        module_idx: module_idx as ModuleId,
         fault_kind: fault_type::MPU_FAULT,
         caused_by,
         last_input_ct,
@@ -397,7 +397,7 @@ pub(crate) fn handle_module_restart(
     );
 
     // Release owned handles (events, timers, DMA, providers, etc.)
-    syscalls::release_module_handles(module_idx as u8);
+    syscalls::release_module_handles(module_idx as ModuleId);
 
     // Drain/flush all connected channels (both in and out)
     let ports = &sched.ports[module_idx];

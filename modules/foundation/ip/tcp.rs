@@ -219,11 +219,11 @@ pub struct TcpConn {
     /// latch a queue-full at the moment of close would lose the
     /// consumer event entirely.
     pub pending_close_notify: u8,
-    /// Requester tag from `CMD_CONNECT_TO` (the connecting module's index),
-    /// echoed in `MSG_CONNECTED` so a fanned `net_out` routes the event back
-    /// to the consumer that opened the connection. `0` = untagged. Only set
-    /// for outbound (client) conns; inbound accepts leave it `0`.
-    pub connect_tag: u8,
+    /// Requester tag from `CMD_CONNECT_TO` (the connecting module's index
+    /// + 1), echoed in `MSG_CONNECTED` so a fanned `net_out` routes the event
+    /// back to the consumer that opened the connection. `0` = untagged. Only
+    /// set for outbound (client) conns; inbound accepts leave it `0`.
+    pub connect_tag: super::abi::contracts::net::net_proto::RequesterTag,
     /// Head-sampling decision latched ONCE at accept: the W3C trace-flags
     /// (`TRACE_FLAGS_SAMPLED` or 0) emitted for this connection's span AND
     /// propagated downstream. Read — never recomputed — at span close.

@@ -172,7 +172,7 @@ pub struct HalOps {
     /// Platform-specific provider initialization (GPIO, SPI, etc.).
     pub init_providers: fn(),
     /// Release platform-specific handles for a module.
-    pub release_module_handles: fn(u8),
+    pub release_module_handles: fn(crate::kernel::exec::scheduler::ModuleId),
     /// Boot-time scan of flash parameter store (no-op on aarch64).
     pub boot_scan: fn(),
     /// Merge runtime parameter overrides into param buffer.
@@ -712,7 +712,7 @@ pub fn init_providers() {
 }
 
 #[inline(always)]
-pub fn release_platform_handles(module_idx: u8) {
+pub fn release_platform_handles(module_idx: crate::kernel::exec::scheduler::ModuleId) {
     (ops().release_module_handles)(module_idx)
 }
 

@@ -51,17 +51,28 @@ use crate::modules::StepOutcome;
 /// Maximum number of modules in a graph.
 pub const MAX_MODULES: usize = CONFIG_MAX_MODULES;
 
-// Compile-time gate: readiness, upstream, event-wake, and domain-step bitmaps
-// are `ModuleMask`-backed, so they scale past 64.
-// The residual ceiling is fault-cascade attribution (`detect_caused_by` keeps
-// the caused-by module id in a `u8`) and the u16 module-index domain; 256 is
-// the validated multi-workload profile (Pi 5). Raising it further requires widening
-// those id fields.
+/// A module's index in the graph. Every table, owner field and wire field
+/// that names a module carries one of these.
+pub type ModuleId = u16;
+
+/// No module: the sentinel an owner field holds when nothing owns it, and
+/// what a fault with no upstream cause names.
+pub const NO_MODULE: ModuleId = ModuleId::MAX;
+
+// Readiness, upstream, event-wake and domain-step bitmaps are
+// `ModuleMask`-backed and scale with the ceiling; every index is a
+// `ModuleId`, whose top value is reserved as `NO_MODULE`.
 const _: () = assert!(
-    MAX_MODULES <= 255,
-    "MAX_MODULES > 255 requires widening module ids past u8 (0xFF is the \
-     no-module sentinel in the page pool, step guard and elastic allocator)."
+    MAX_MODULES < NO_MODULE as usize,
+    "MAX_MODULES must leave NO_MODULE outside the module-index domain"
 );
+
+/// The `buffer_group` values the tables keyed by group span. Groups above
+/// the config's 5-bit range are the kernel's, one per edge around a record
+/// fan, so the span sizes how many such edges a graph holds: the whole byte
+/// on the host profile's graph, half of it on the small parts, where these
+/// tables are on the stack.
+pub(crate) const BUFFER_GROUPS: usize = if MAX_GRAPH_EDGES > 128 { 256 } else { 128 };
 
 /// Maximum number of channels (edges) in a graph.
 /// Matches MAX_GRAPH_EDGES from config to support fan-in/out expansion.
@@ -392,10 +403,10 @@ pub fn open_channels(edges: &mut [Edge]) -> i32 {
     // This ensures the shared channel is large enough for the most
     // demanding consumer (e.g. I2S requiring exactly 2048 bytes) and
     // for any sized YAML override on a member edge.
-    let mut group_max_size: [u32; 128] = [0; 128];
+    let mut group_max_size = [0u32; BUFFER_GROUPS];
     for edge in edges.iter() {
         let group = edge.buffer_group as usize;
-        if group == 0 || group >= 128 {
+        if group == 0 {
             continue;
         }
         let edge_max = edge_min_size(edge);
@@ -405,7 +416,7 @@ pub fn open_channels(edges: &mut [Edge]) -> i32 {
     }
 
     // Map buffer_group -> channel handle for aliasing
-    let mut group_channels: [i32; 128] = [-1; 128];
+    let mut group_channels = [-1i32; BUFFER_GROUPS];
     let mut count = 0;
     for edge in edges.iter_mut() {
         // Attachable-lane edge: `channel` is a pre-existing shared spare lane
@@ -418,7 +429,7 @@ pub fn open_channels(edges: &mut [Edge]) -> i32 {
         }
         // Check for buffer group aliasing
         let group = edge.buffer_group as usize;
-        if group > 0 && group < 128 && group_channels[group] >= 0 {
+        if group > 0 && group_channels[group] >= 0 {
             // Verify destination module can safely consume from mailbox
             // SAFETY: SCHED is scheduler-thread owned; `edge.to_module`
             // is bounded against MAX_MODULES by config validation.
@@ -436,7 +447,7 @@ pub fn open_channels(edges: &mut [Edge]) -> i32 {
 
         // Determine buffer size: grouped edges use pre-computed max,
         // ungrouped edges use the same combined signal directly.
-        let buf_size = if group > 0 && group < 128 && group_max_size[group] > 0 {
+        let buf_size = if group > 0 && group_max_size[group] > 0 {
             group_max_size[group]
         } else {
             edge_min_size(edge)
@@ -501,7 +512,7 @@ pub fn open_channels(edges: &mut [Edge]) -> i32 {
             }
         }
 
-        let producer_mod = edge.from_module as u8;
+        let producer_mod = edge.from_module as ModuleId;
         let chan = if buf_size > 0 {
             // `channel_open` accepts only an exact 4-byte LE u32 that
             // is already a power of two and in `[64, 256 KiB]`. Module
@@ -539,7 +550,7 @@ pub fn open_channels(edges: &mut [Edge]) -> i32 {
         // Record channel handle and enable mailbox mode for grouped edges.
         // buffer_group != 0 means the config tool determined this edge should
         // use zero-copy semantics, even for a single edge in the group.
-        if group > 0 && group < 128 {
+        if group > 0 {
             group_channels[group] = chan;
             channel_set_mailbox(chan);
         }
@@ -560,7 +571,7 @@ pub fn validate_buffer_groups(edges: &[Edge]) -> bool {
         let p = &raw const SCHED;
         &*p
     };
-    let mut group_writers: [u8; 128] = [0; 128];
+    let mut group_writers = [0u8; BUFFER_GROUPS];
     let mut valid = true;
 
     for edge in edges.iter() {
@@ -568,7 +579,7 @@ pub fn validate_buffer_groups(edges: &[Edge]) -> bool {
             continue;
         }
         let group = edge.buffer_group as usize;
-        if group == 0 || group >= 128 {
+        if group == 0 {
             continue;
         }
         if edge.is_ctrl() {

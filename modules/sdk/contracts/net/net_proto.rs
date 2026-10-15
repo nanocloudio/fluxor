@@ -76,11 +76,10 @@ pub fn put_conn_id(payload: &mut [u8], conn_id: u16) {
 /// Callers bounds-check `payload.len() >= CONN_ID_LEN` first (frame
 /// validation), as with `conn_id`.
 #[inline]
-pub fn connected_parts(payload: &[u8]) -> (u16, u8) {
-    let tag = if payload.len() > CONN_ID_LEN {
-        payload[CONN_ID_LEN]
-    } else {
-        REQUESTER_TAG_NONE
+pub fn connected_parts(payload: &[u8]) -> (u16, RequesterTag) {
+    let tag = match payload.get(CONN_ID_LEN..CONNECTED_FIXED) {
+        Some(t) => u16::from_le_bytes([t[0], t[1]]),
+        None => REQUESTER_TAG_NONE,
     };
     (conn_id(payload), tag)
 }
@@ -119,8 +118,13 @@ pub fn put_session_generation(buf: &mut [u8], fixed: usize, generation: u16) -> 
 
 /// `MSG_ACCEPTED`'s fixed part: `[conn_id][local_port]`.
 pub const ACCEPTED_FIXED: usize = CONN_ID_LEN + 2;
+/// Bytes a requester tag occupies on the wire (`u16` LE).
+pub const REQUESTER_TAG_LEN: usize = 2;
 /// `MSG_CONNECTED`'s fixed part: `[conn_id][requester_tag]`.
-pub const CONNECTED_FIXED: usize = CONN_ID_LEN + 1;
+pub const CONNECTED_FIXED: usize = CONN_ID_LEN + REQUESTER_TAG_LEN;
+
+/// `MSG_ERROR`'s untagged form: `[conn_id][errno]`.
+pub const ERROR_FIXED: usize = CONN_ID_LEN + 1;
 
 /// Parts of a `MSG_ERROR` payload: `(conn_id, errno, requester_tag)`.
 ///
@@ -133,12 +137,11 @@ pub const CONNECTED_FIXED: usize = CONN_ID_LEN + 1;
 /// module claims another module's connect failure. Callers bounds-check
 /// `payload.len() >= CONN_ID_LEN + 1` first.
 #[inline]
-pub fn error_parts(payload: &[u8]) -> (u16, i8, u8) {
+pub fn error_parts(payload: &[u8]) -> (u16, i8, RequesterTag) {
     let errno = payload[CONN_ID_LEN] as i8;
-    let tag = if payload.len() > CONN_ID_LEN + 1 {
-        payload[CONN_ID_LEN + 1]
-    } else {
-        REQUESTER_TAG_NONE
+    let tag = match payload.get(ERROR_FIXED..ERROR_FIXED + REQUESTER_TAG_LEN) {
+        Some(t) => u16::from_le_bytes([t[0], t[1]]),
+        None => REQUESTER_TAG_NONE,
     };
     (conn_id(payload), errno, tag)
 }
@@ -205,16 +208,16 @@ pub const CLOSED_ID_GRACE_MS: u32 = 5_000;
 /// multi-anchor consumer records it and matches it against the
 /// `local_port` in subsequent `MSG_ACCEPTED` frames (see `MSG_ACCEPTED`).
 pub const MSG_BOUND: u8 = 0x04;
-/// Outbound connect completed. Payload: `[conn_id: u16 LE][requester_tag: u8]`.
+/// Outbound connect completed. Payload: `[conn_id: u16 LE][requester_tag: u16 LE]`.
 /// `requester_tag` echoes the tag the consumer put on its `CMD_CONNECT_TO` (its
 /// module index **+ 1** — the `dev_requester_tag` wire encoding, NOT the raw
 /// index) so that when `ip.net_out` is fanned to several stream consumers (e.g.
 /// TLS + an OTLP exporter), each claims only the connections it opened. A
 /// consumer that doesn't filter just reads `conn_id` and ignores the trailing
-/// byte; untagged connects echo tag `0` (`REQUESTER_TAG_NONE`). A session
+/// tag; untagged connects echo tag `0` (`REQUESTER_TAG_NONE`). A session
 /// stage appends `[generation: u16 LE]` ([`session_generation`]).
 pub const MSG_CONNECTED: u8 = 0x05;
-/// Error. Payload: `[conn_id: u16 LE][errno: i8][requester_tag: u8?]`. For a
+/// Error. Payload: `[conn_id: u16 LE][errno: i8][requester_tag: u16 LE?]`. For a
 /// connect-phase failure the trailing `requester_tag` echoes the failing
 /// `CMD_CONNECT_TO`'s tag so a consumer that has no conn_id yet can recognise its
 /// own failure on a fanned `net_out`; established-connection errors carry the
@@ -264,9 +267,10 @@ pub const MAX_CMD_DATA: usize = 8192;
 /// is still the consumer's — and a no-op on an id the transport has already
 /// released.
 pub const CMD_CLOSE: u8 = 0x12;
-/// Reserved and unsupported: the 7/8-byte `[sock_type][ip: u32 LE][port: u16 LE][tag?]`
-/// dial shape. Every provider answers it with `MSG_ERROR` `ENOSYS` on the
-/// requester tag (byte 7 when present) and one log line naming
+/// Reserved and unsupported: the 7/9-byte
+/// `[sock_type][ip: u32 LE][port: u16 LE][requester_tag: u16 LE?]` dial shape.
+/// Every provider answers it with `MSG_ERROR` `ENOSYS` on the requester tag
+/// (bytes 7..9 when present) and one log line naming
 /// [`CMD_CONNECT_TO`], so a stale emitter fails loudly on its first dial
 /// instead of dialling a garbage address: byte 1 of this payload is the
 /// address's last octet, which would alias `af` if the two shapes shared
@@ -274,7 +278,7 @@ pub const CMD_CLOSE: u8 = 0x12;
 pub const CMD_CONNECT: u8 = 0x13;
 
 /// Initiate an outbound connection to a target.
-/// Payload: `[sock_type: u8][af: u8][port: u16 LE][addr…][requester_tag: u8?]`
+/// Payload: `[sock_type: u8][af: u8][port: u16 LE][addr…][requester_tag: u16 LE?]`
 ///
 /// - `af = AF_INET (4)`: `addr` is 4 bytes, network order.
 /// - `af = AF_INET6 (6)`: `addr` is 16 bytes, network order.
@@ -312,7 +316,7 @@ pub const MAX_NAME_LEN: usize = 253;
 /// Bytes before `addr…` in a `CMD_CONNECT_TO` payload.
 pub const CONNECT_TO_HEAD: usize = 1 + 1 + 2;
 /// Largest `CMD_CONNECT_TO` payload: head, a name with its length, a tag.
-pub const CONNECT_TO_MAX: usize = CONNECT_TO_HEAD + 1 + MAX_NAME_LEN + 1;
+pub const CONNECT_TO_MAX: usize = CONNECT_TO_HEAD + 1 + MAX_NAME_LEN + REQUESTER_TAG_LEN;
 
 /// Where a connection is opened to. The name variant borrows the caller's
 /// bytes: nothing here allocates, and a provider that resolves copies the
@@ -634,9 +638,9 @@ pub fn write_connect_to(
     sock_type: u8,
     port: u16,
     t: &Target<'_>,
-    tag: Option<u8>,
+    tag: Option<RequesterTag>,
 ) -> usize {
-    let n = CONNECT_TO_HEAD + t.wire_len() + usize::from(tag.is_some());
+    let n = CONNECT_TO_HEAD + t.wire_len() + if tag.is_some() { REQUESTER_TAG_LEN } else { 0 };
     if buf.len() < n {
         return 0;
     }
@@ -664,8 +668,8 @@ pub fn write_connect_to(
         }
     }
     if let Some(tag) = tag {
-        buf[at] = tag;
-        at += 1;
+        buf[at..at + REQUESTER_TAG_LEN].copy_from_slice(&tag.to_le_bytes());
+        at += REQUESTER_TAG_LEN;
     }
     at
 }
@@ -673,13 +677,15 @@ pub fn write_connect_to(
 /// Read a `CMD_CONNECT_TO` payload: `(sock_type, port, target, tag)`.
 /// `None` for a malformed record — a truncated address, an unknown `af`,
 /// a name of 0 or over 253 bytes or holding a NUL or a non-ASCII byte, or
-/// trailing bytes past the tag — which the provider answers `EINVAL` on
-/// the record's last byte, the one a tag would occupy: the emitter is
-/// broken either way, and that byte is the closest thing to its name.
+/// trailing bytes after the address that are neither none nor exactly a
+/// tag — which the provider answers `EINVAL` on the record's last two
+/// bytes read as a tag (`REQUESTER_TAG_NONE` when the record is shorter):
+/// the emitter is broken either way, and those bytes are the closest thing
+/// to its name.
 ///
 /// The tag is `None` when the record carries none; a provider treats that
 /// as `REQUESTER_TAG_NONE`.
-pub fn read_connect_to(payload: &[u8]) -> Option<(u8, u16, Target<'_>, Option<u8>)> {
+pub fn read_connect_to(payload: &[u8]) -> Option<(u8, u16, Target<'_>, Option<RequesterTag>)> {
     if payload.len() < CONNECT_TO_HEAD {
         return None;
     }
@@ -713,18 +719,28 @@ pub fn read_connect_to(payload: &[u8]) -> Option<(u8, u16, Target<'_>, Option<u8
     };
     let tag = match rest.len() - used {
         0 => None,
-        1 => Some(rest[used]),
+        REQUESTER_TAG_LEN => Some(u16::from_le_bytes([rest[used], rest[used + 1]])),
         _ => return None,
     };
     Some((sock_type, port, target, tag))
 }
 
+/// The tag a provider answers a malformed `CMD_CONNECT_TO` on: the
+/// record's last two bytes LE, where a tag would sit, or
+/// `REQUESTER_TAG_NONE` when the record is shorter than a tag.
+pub fn malformed_connect_to_tag(payload: &[u8]) -> RequesterTag {
+    match payload.len().checked_sub(REQUESTER_TAG_LEN) {
+        Some(at) => u16::from_le_bytes([payload[at], payload[at + 1]]),
+        None => REQUESTER_TAG_NONE,
+    }
+}
+
 /// The requester tag of an unsupported [`CMD_CONNECT`] payload, so a provider
-/// can address its `ENOSYS` to the emitter that dialled. Byte 7 when the
-/// 8-byte form was sent; `REQUESTER_TAG_NONE` otherwise.
-pub fn retired_connect_tag(payload: &[u8]) -> u8 {
-    match payload.get(7) {
-        Some(&t) => t,
+/// can address its `ENOSYS` to the emitter that dialled. Bytes 7..9 LE when
+/// the 9-byte form was sent; `REQUESTER_TAG_NONE` otherwise.
+pub fn retired_connect_tag(payload: &[u8]) -> RequesterTag {
+    match payload.get(7..9) {
+        Some(t) => u16::from_le_bytes([t[0], t[1]]),
         None => REQUESTER_TAG_NONE,
     }
 }
@@ -733,6 +749,10 @@ pub fn retired_connect_tag(payload: &[u8]) -> u8 {
 /// surface. Datagram traffic uses the `datagram` surface (`CMD_DG_BIND` /
 /// `CMD_DG_SEND_TO`); a dial with any other `sock_type` fails EINVAL.
 pub const SOCK_TYPE_STREAM: u8 = 1;
+
+/// A requester tag: the requesting module's index **+ 1**, carried as
+/// `u16` LE wherever it appears on the wire.
+pub type RequesterTag = u16;
 
 /// `requester_tag` value meaning "no routing tag" — an untagged
 /// `CMD_CONNECT_TO` and any consumer that doesn't tag its connects.
@@ -743,7 +763,7 @@ pub const SOCK_TYPE_STREAM: u8 = 1;
 /// `dev_requester_tag`; a filtering consumer claims a frame iff its tag equals
 /// the consumer's own `dev_requester_tag` OR is `REQUESTER_TAG_NONE`
 /// (sole-consumer graphs).
-pub const REQUESTER_TAG_NONE: u8 = 0;
+pub const REQUESTER_TAG_NONE: RequesterTag = 0;
 
 // Netif state propagation: drivers emit state transitions as
 // `MSG_NETIF_STATE` frames on a dedicated `netif_state` output port;

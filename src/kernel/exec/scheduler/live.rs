@@ -30,17 +30,36 @@
 //! (host-linux + bcm2712 enable it; bare-metal rp compiles it out at zero cost).
 
 use super::{
-    BuiltInModule, Edge, InstantiateResult, ModuleSlot, SchedulerState, MAX_CHANNELS, MAX_MODULES,
-    SCHED,
+    BuiltInModule, Edge, FanDirection, InstantiateResult, ModuleId, ModuleSlot, SchedulerState,
+    MAX_CHANNELS, MAX_MODULES, SCHED,
 };
 use crate::kernel::boot::config::ModuleEntry;
 use crate::kernel::module::loader::ModuleLoader;
 use crate::kernel::workload::owner::{OwnerHandle, OwnerState, OWNER_SYSTEM};
 
-/// Largest subgraph one `apply_add` admits. Bounded, stack-only working set.
-pub const MAX_ADD_MODULES: usize = 16;
+/// Largest subgraph one `apply_add` admits. The working set is stack-only
+/// and bounded by these caps: decoding an encoded add holds every module and
+/// edge record at once (~7 KiB at 64 / 128), well inside the kernel stack of
+/// the targets that compile live mutation (bcm2712 and linux). A message
+/// broker with durable storage is ~14 modules and ~49 edges.
+pub const MAX_ADD_MODULES: usize = 64;
 /// Largest edge count one `apply_add` admits.
-pub const MAX_ADD_EDGES: usize = 32;
+pub const MAX_ADD_EDGES: usize = 128;
+// The FLXA wire carries both counts in a byte.
+const _: () = assert!(MAX_ADD_MODULES <= u8::MAX as usize);
+const _: () = assert!(MAX_ADD_EDGES <= u8::MAX as usize);
+
+/// Tees and merges the add inserts where a port of the subgraph's own
+/// modules carries several edges, as the boot graph does. Each fanned port
+/// takes at least two edges, and an edge sits in at most one output fan and
+/// one input fan, so the edges bound the fans.
+const MAX_FAN_MODULES: usize = MAX_ADD_EDGES;
+/// The subgraph as apply_add stages it: the caller's modules and edges, then
+/// one tee or merge per fanned port and the edge joining it to that port.
+const WORK_MODULES: usize = MAX_ADD_MODULES + MAX_FAN_MODULES;
+const WORK_EDGES: usize = MAX_ADD_EDGES + MAX_FAN_MODULES;
+// `Endpoint::New` names a staged module in a byte.
+const _: () = assert!(WORK_MODULES <= u8::MAX as usize + 1);
 
 /// Reserved `Endpoint::Existing` global index marking a **net-facing
 /// spare-lane edge** in a FLXA blob ( option A). The workload manager composes
@@ -148,6 +167,18 @@ pub struct AddEdge {
     /// `apply_add_encoded` always decodes it as `false`; only direct
     /// [`apply_add`] callers can set it.
     pub wake_on_write: bool,
+}
+
+impl AddEdge {
+    /// A slot of a staging array no edge occupies.
+    const UNUSED: AddEdge = AddEdge {
+        from: Endpoint::New(0),
+        from_port_index: 0,
+        to: Endpoint::New(0),
+        to_port_index: 0,
+        buffer_bytes: 0,
+        wake_on_write: false,
+    };
 }
 
 /// A new owner's subgraph. `modules` is `&mut` because the sources are moved
@@ -328,6 +359,44 @@ pub fn apply_add(
     if e > MAX_ADD_EDGES {
         return Err(AddError::TooManyEdges);
     }
+    // Stage the subgraph, then give every port of its own modules that
+    // carries several edges a tee or merge, as the boot graph does: two
+    // edges on one port would otherwise land the second at an index past
+    // the module's ports.
+    let mut mods: [AddModule; WORK_MODULES] = core::array::from_fn(|_| AddModule {
+        source: ModuleSource::Pic(ModuleEntry::default()),
+        domain_id: 0,
+    });
+    for (w, m) in mods.iter_mut().zip(sub.modules.iter_mut()) {
+        w.source = core::mem::replace(&mut m.source, ModuleSource::Pic(ModuleEntry::default()));
+        w.domain_id = m.domain_id;
+    }
+    let mut edges = [AddEdge::UNUSED; WORK_EDGES];
+    edges[..e].copy_from_slice(sub.edges);
+    let mut mailbox = [false; WORK_EDGES];
+    let (n, e) = expand_fans(&mut mods, n, &mut edges, e, &mut mailbox);
+    add_staged(
+        AddSubgraph {
+            owner_uid: sub.owner_uid,
+            modules: &mut mods[..n],
+            edges: &edges[..e],
+            state_cap: sub.state_cap,
+            buffer_cap: sub.buffer_cap,
+        },
+        &mailbox[..e],
+        assignment,
+    )
+}
+
+/// [`apply_add`] over the staged subgraph: `mailbox[i]` marks an edge around
+/// a record-carrying fan, which gets a channel of its own in mailbox mode.
+fn add_staged(
+    sub: AddSubgraph<'_>,
+    mailbox: &[bool],
+    assignment: Option<(u16, u32)>,
+) -> Result<OwnerHandle, AddError> {
+    let n = sub.modules.len();
+    let e = sub.edges.len();
 
     // 1. Reserve the owner (lowest-free slot + monotonic generation — the same
     //    rule the host composer uses, so kernel-side allocation matches a plan).
@@ -347,7 +416,7 @@ pub fn apply_add(
 
     // 2. Assign each new module the lowest-free `Empty` slot. NOT a watermark:
     //    freeing a non-last owner leaves holes, so we scan.
-    let mut local_to_global = [0usize; MAX_ADD_MODULES];
+    let mut local_to_global = [0usize; WORK_MODULES];
     {
         let s = sched();
         let mut scan = 0usize;
@@ -480,6 +549,17 @@ pub fn apply_add(
         edge.tap_source = tap_source;
         edge.buffer_bytes = ae.buffer_bytes;
         edge.wake_on_write = ae.wake_on_write;
+        if mailbox[i] {
+            // Its own group, distinct from every other edge this add opens:
+            // the group is what makes the channel a mailbox, and a shared
+            // group would alias two edges onto one channel.
+            let Some(g) = super::fresh_record_group(&sched().edges[edge_base..edge_base + i])
+            else {
+                sched().owners.free(handle);
+                return Err(AddError::ChannelOpenFailed);
+            };
+            edge.buffer_group = g;
+        }
         sched().edges[edge_base + i] = edge;
     }
 
@@ -644,7 +724,7 @@ pub fn apply_add(
         let s = sched();
         for &slot in order.iter().take(n) {
             let pos = s.exec_order_count;
-            s.exec_order[pos] = slot as u8;
+            s.exec_order[pos] = slot as ModuleId;
             s.exec_order_count = pos + 1;
         }
         s.active_module_count += n;
@@ -809,7 +889,7 @@ fn rollback_add(handle: OwnerHandle, slots: &[usize], edge_base: usize, e: usize
     for &slot in slots {
         // What a module that instantiated registered or opened (provider
         // layer, ioctl handler, events, timers) goes before its state does.
-        crate::kernel::module::syscalls::release_module_handles(slot as u8);
+        crate::kernel::module::syscalls::release_module_handles(slot as ModuleId);
         // The module never stepped, so it lent nothing and its memory goes
         // back at once, with its protection domain and slot bookkeeping.
         super::free_module_state(slot);
@@ -830,13 +910,237 @@ fn rollback_add(handle: OwnerHandle, slots: &[usize], edge_base: usize, e: usize
     s.owners.free(handle);
 }
 
+/// Give every port of the subgraph's own modules (`New`, below `n`) that
+/// carries several edges a tee (an output) or a merge (an input), as the boot
+/// graph's fan pass does: one internal module per port, an edge joining it to
+/// the port, and the fanned edges repacked onto its ports from 0. Ports the
+/// boot graph leaves unfanned are left so here: a multi-inbound consumer's
+/// data inputs, and a multi-outbound producer whose fan reaches exactly the
+/// modules feeding it. A port carrying records (`FRAME_KIND_RECORD`) marks
+/// every edge around its fan in `mailbox`. Returns the staged counts.
+fn expand_fans(
+    mods: &mut [AddModule; WORK_MODULES],
+    n: usize,
+    edges: &mut [AddEdge; WORK_EDGES],
+    e: usize,
+    mailbox: &mut [bool; WORK_EDGES],
+) -> (usize, usize) {
+    // SAFETY: scheduler-thread graph-mutation context, as every add.
+    let node = unsafe { super::static_loader() };
+    let (mut n2, mut e2) = (n, e);
+    for dir in [FanDirection::Out, FanDirection::In] {
+        for l in 0..n {
+            // The edges staged before this module's pass. The joining edge
+            // a fan adds is the port's only edge, so it never fans again.
+            let scan = e2;
+            let mut taken = [false; WORK_EDGES];
+            for start in 0..scan {
+                if taken[start] || !fan_touches(&edges[start], l, dir) {
+                    continue;
+                }
+                let key = fan_port_key(&edges[start], dir);
+                let mut group = [0usize; WORK_EDGES];
+                let mut g = 0usize;
+                for j in start..scan {
+                    if !taken[j]
+                        && fan_touches(&edges[j], l, dir)
+                        && fan_port_key(&edges[j], dir) == key
+                    {
+                        taken[j] = true;
+                        group[g] = j;
+                        g += 1;
+                    }
+                }
+                if g < 2 || fan_exempt(mods, l, edges, scan, &group[..g], dir, key) {
+                    continue;
+                }
+                let kind = fan_frame_kind(node, mods, edges, &group[..g], l, dir, key);
+                let record = kind == super::module_types::FRAME_KIND_RECORD;
+                let f = n2;
+                n2 += 1;
+                mods[f] = AddModule {
+                    source: ModuleSource::Pic(ModuleEntry {
+                        name_hash: match dir {
+                            FanDirection::Out => super::INTERNAL_TEE_HASH,
+                            FanDirection::In => super::INTERNAL_MERGE_HASH,
+                        },
+                        domain_id: mods[l].domain_id,
+                        frame_kind: kind,
+                        ..ModuleEntry::default()
+                    }),
+                    domain_id: mods[l].domain_id,
+                };
+                let wake = group[..g].iter().any(|&ei| edges[ei].wake_on_write);
+                edges[e2] = match dir {
+                    FanDirection::Out => AddEdge {
+                        from: Endpoint::New(l as u8),
+                        from_port_index: key,
+                        to: Endpoint::New(f as u8),
+                        ..AddEdge::UNUSED
+                    },
+                    FanDirection::In => AddEdge {
+                        from: Endpoint::New(f as u8),
+                        to: Endpoint::New(l as u8),
+                        to_port_index: key,
+                        wake_on_write: wake,
+                        ..AddEdge::UNUSED
+                    },
+                };
+                mailbox[e2] = record;
+                e2 += 1;
+                for (k, &ei) in group[..g].iter().enumerate() {
+                    match dir {
+                        FanDirection::Out => {
+                            edges[ei].from = Endpoint::New(f as u8);
+                            edges[ei].from_port_index = k as u8;
+                        }
+                        // Into the merge as plain data, whatever the port it
+                        // fans into: the merge re-emits to that port.
+                        FanDirection::In => {
+                            edges[ei].to = Endpoint::New(f as u8);
+                            edges[ei].to_port_index = k as u8;
+                        }
+                    }
+                    mailbox[ei] |= record;
+                }
+            }
+        }
+    }
+    (n2, e2)
+}
+
+/// Whether `edge` leaves (`Out`) or enters (`In`) the staged module `l`.
+fn fan_touches(edge: &AddEdge, l: usize, dir: FanDirection) -> bool {
+    let ep = match dir {
+        FanDirection::Out => edge.from,
+        FanDirection::In => edge.to,
+    };
+    matches!(ep, Endpoint::New(x) if x as usize == l)
+}
+
+/// The port an edge occupies on the fanned side: the output index, or the
+/// input index with [`CTRL_PORT_BIT`] for a ctrl input.
+fn fan_port_key(edge: &AddEdge, dir: FanDirection) -> u8 {
+    match dir {
+        FanDirection::Out => edge.from_port_index,
+        FanDirection::In => edge.to_port_index,
+    }
+}
+
+/// A staged module's type hash, or 0 for a built-in.
+fn staged_hash(m: &AddModule) -> u32 {
+    match &m.source {
+        ModuleSource::Pic(entry) => entry.name_hash,
+        ModuleSource::Builtin(_) => 0,
+    }
+}
+
+/// The ports the boot graph's fan pass leaves unfanned: a multi-inbound
+/// consumer keeps one channel per data edge, and a multi-outbound producer
+/// keeps one per edge when its fan reaches exactly the modules feeding its
+/// data input, each once.
+fn fan_exempt(
+    mods: &[AddModule; WORK_MODULES],
+    l: usize,
+    edges: &[AddEdge; WORK_EDGES],
+    e: usize,
+    group: &[usize],
+    dir: FanDirection,
+    key: u8,
+) -> bool {
+    let hash = staged_hash(&mods[l]);
+    match dir {
+        FanDirection::In => key & CTRL_PORT_BIT == 0 && super::is_multi_inbound(hash),
+        FanDirection::Out => {
+            if !super::is_multi_outbound(hash) {
+                return false;
+            }
+            let into_l = |ae: &AddEdge| {
+                matches!(ae.to, Endpoint::New(x) if x as usize == l)
+                    && ae.to_port_index & CTRL_PORT_BIT == 0
+            };
+            let feeds = |c: Endpoint| {
+                edges[..e]
+                    .iter()
+                    .any(|ae| into_l(ae) && same_endpoint(ae.from, c))
+            };
+            for (k, &ei) in group.iter().enumerate() {
+                let c = edges[ei].to;
+                if !feeds(c) || group[..k].iter().any(|&ej| same_endpoint(edges[ej].to, c)) {
+                    return false;
+                }
+            }
+            edges[..e].iter().all(|ae| {
+                !into_l(ae) || group.iter().any(|&ei| same_endpoint(edges[ei].to, ae.from))
+            })
+        }
+    }
+}
+
+/// Whether two endpoints name the same module or lane.
+fn same_endpoint(a: Endpoint, b: Endpoint) -> bool {
+    match (a, b) {
+        (Endpoint::New(x), Endpoint::New(y)) => x == y,
+        (Endpoint::Existing(x), Endpoint::Existing(y)) => x == y,
+        (Endpoint::Tap(x), Endpoint::Tap(y)) => x == y,
+        (Endpoint::ExistingChannel(x), Endpoint::ExistingChannel(y)) => x == y,
+        (Endpoint::Net(x), Endpoint::Net(y)) => x == y,
+        (Endpoint::Caller(x), Endpoint::Caller(y)) => x == y,
+        _ => false,
+    }
+}
+
+/// The frame kind of a fanned port, read from the fanned module's manifest
+/// and, when it names none, from a peer's across the fan (both ends of an
+/// edge declare compatible content), as the boot fan pass reads it.
+fn fan_frame_kind(
+    node: &ModuleLoader,
+    mods: &[AddModule; WORK_MODULES],
+    edges: &[AddEdge; WORK_EDGES],
+    group: &[usize],
+    l: usize,
+    dir: FanDirection,
+    key: u8,
+) -> u8 {
+    // The boot pass keys a ctrl input with bit 0x10.
+    let boot_key = |k: u8| {
+        if k & CTRL_PORT_BIT != 0 {
+            0x10 | (k & 0x0F)
+        } else {
+            k
+        }
+    };
+    let kind_of = |hash: u32, d: FanDirection, k: u8| {
+        super::fanned_port_frame_kind(resolving_loader(hash, node), hash, d, boot_key(k))
+    };
+    let kind = kind_of(staged_hash(&mods[l]), dir, key);
+    if kind != super::module_types::FRAME_KIND_NONE {
+        return kind;
+    }
+    for &ei in group {
+        let ae = &edges[ei];
+        let (peer, peer_dir, peer_key) = match dir {
+            FanDirection::Out => (ae.to, FanDirection::In, ae.to_port_index),
+            FanDirection::In => (ae.from, FanDirection::Out, ae.from_port_index),
+        };
+        let Endpoint::New(p) = peer else {
+            continue;
+        };
+        let k = kind_of(staged_hash(&mods[p as usize]), peer_dir, peer_key);
+        if k != super::module_types::FRAME_KIND_NONE {
+            return k;
+        }
+    }
+    super::module_types::FRAME_KIND_NONE
+}
+
 /// Topologically order the new modules over their subgraph-internal edges so
 /// producers precede consumers within the owner. Falls back to declaration
 /// order on a cycle (the running graph already rejects cycles elsewhere; an
 /// added subgraph is expected acyclic).
-fn topo_order_new(slots: &[usize], edges: &[AddEdge]) -> [usize; MAX_ADD_MODULES] {
+fn topo_order_new(slots: &[usize], edges: &[AddEdge]) -> [usize; WORK_MODULES] {
     let n = slots.len();
-    let mut indeg = [0u8; MAX_ADD_MODULES];
+    let mut indeg = [0u8; WORK_MODULES];
     for ae in edges {
         if let (Endpoint::New(_), Endpoint::New(t)) = (ae.from, ae.to) {
             let t = t as usize;
@@ -845,10 +1149,10 @@ fn topo_order_new(slots: &[usize], edges: &[AddEdge]) -> [usize; MAX_ADD_MODULES
             }
         }
     }
-    let mut out = [0usize; MAX_ADD_MODULES];
-    let mut visited = [false; MAX_ADD_MODULES];
+    let mut out = [0usize; WORK_MODULES];
+    let mut visited = [false; WORK_MODULES];
     let mut w = 0usize;
-    // Kahn over local indices; O(n^2) is fine for n <= MAX_ADD_MODULES.
+    // Kahn over local indices; O(n^2) is fine for n <= WORK_MODULES.
     while w < n {
         let mut progressed = false;
         for local in 0..n {
@@ -1083,7 +1387,7 @@ pub fn free_owner(handle: OwnerHandle) -> Result<(), FreeError> {
             // or a later dispatch would call into freed code. Boot modules
             // reach this through the finish path; the live-splice teardown
             // does it explicitly.
-            crate::kernel::module::syscalls::release_module_handles(i as u8);
+            crate::kernel::module::syscalls::release_module_handles(i as ModuleId);
             // Memory, protection domain and per-slot bookkeeping, as one
             // teardown. A module with buffers lent to a block source keeps its
             // memory until they are back.

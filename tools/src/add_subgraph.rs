@@ -36,10 +36,10 @@ pub const WORKLOAD_SECTION_MAGIC: u32 = 0x4658_5044;
 
 /// Largest subgraph one `apply_add` admits — mirrors
 /// `kernel::scheduler::live::MAX_ADD_MODULES`.
-pub const MAX_ADD_MODULES: usize = 16;
+pub const MAX_ADD_MODULES: usize = 64;
 /// Largest edge count one `apply_add` admits — mirrors
 /// `kernel::scheduler::live::MAX_ADD_EDGES`.
-pub const MAX_ADD_EDGES: usize = 32;
+pub const MAX_ADD_EDGES: usize = 128;
 /// Largest resident-workload section the kernel will map — mirrors
 /// `kernel::config::MAX_WORKLOAD_SECTION_BYTES`. The encoder rejects output beyond
 /// this so a config that builds always admits ALL its workloads (the kernel caps the
@@ -54,13 +54,64 @@ pub struct WorkloadModule {
     pub params: Vec<u8>,
 }
 
-/// One intra-workload edge (producer → consumer, both workload-local indices).
+/// An end of a workload edge: one of the workload's own modules, or the
+/// node's network through a lane of the workload's (FLXA endpoint kind 3,
+/// the kernel's `Endpoint::Net`). A key names one lane: at most one edge into
+/// it (the module's net commands) and one out of it (its net events).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkloadEnd {
+    Local(u8),
+    Net(u8),
+}
+
+/// One workload edge (producer → consumer).
 pub struct WorkloadEdge {
-    pub from_local: u8,
+    pub from: WorkloadEnd,
     pub from_port: u8,
-    pub to_local: u8,
+    pub to: WorkloadEnd,
     pub to_port: u8,
     pub buffer_bytes: u32,
+}
+
+/// The kernel's lane rule (`net_keys_paired`): every net key names exactly
+/// one edge into the network (from a workload module) and one out of it (to
+/// a workload module); a lane joined to another lane is refused.
+pub fn check_net_lanes(edges: &[WorkloadEdge]) -> Result<(), String> {
+    for e in edges {
+        let key = match (e.from, e.to) {
+            (WorkloadEnd::Net(_), WorkloadEnd::Net(_)) => {
+                return Err(
+                    "a net lane connects to a module of the workload, not to another lane".into(),
+                )
+            }
+            (WorkloadEnd::Net(k), _) | (_, WorkloadEnd::Net(k)) => k,
+            _ => continue,
+        };
+        let into = edges
+            .iter()
+            .filter(|x| x.to == WorkloadEnd::Net(key))
+            .count();
+        let out = edges
+            .iter()
+            .filter(|x| x.from == WorkloadEnd::Net(key))
+            .count();
+        if into != 1 || out != 1 {
+            return Err(format!(
+                "net lane {key} has {into} edge(s) into it and {out} out of it; a lane is exactly one of each \
+                 (a module's commands in, its events out)"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn encode_end(b: &mut Vec<u8>, end: WorkloadEnd) {
+    let (kind, idx) = match end {
+        WorkloadEnd::Local(i) => (0u8, i),
+        WorkloadEnd::Net(k) => (3u8, k),
+    };
+    b.push(kind);
+    b.extend_from_slice(&(idx as u16).to_be_bytes());
 }
 
 /// One resident workload (a workload-owner subgraph admitted via `apply_add`).
@@ -121,12 +172,11 @@ pub fn encode_add_subgraph(workload: &Workload) -> Result<Vec<u8>, String> {
         b.extend_from_slice(&m.params);
     }
     for e in &workload.edges {
-        // Endpoint kind 0 = New (workload-local). v1 emits intra-workload edges only.
-        b.push(0);
-        b.extend_from_slice(&(e.from_local as u16).to_be_bytes());
+        // Endpoint kind 0 = New (workload-local), 3 = Net (a lane to the node's
+        // network).
+        encode_end(&mut b, e.from);
         b.push(e.from_port);
-        b.push(0);
-        b.extend_from_slice(&(e.to_local as u16).to_be_bytes());
+        encode_end(&mut b, e.to);
         b.push(e.to_port);
         b.extend_from_slice(&e.buffer_bytes.to_be_bytes());
     }
@@ -224,6 +274,82 @@ mod tests {
         assert_eq!(b[38], 0); // domain_id
         assert_eq!(&b[39..41], &0u16.to_be_bytes()); // params_len
         assert_eq!(b.len(), 41);
+    }
+
+    #[test]
+    fn net_lane_edges_encode_as_endpoint_kind_three() {
+        let workload = Workload {
+            workload_uid: [0u8; 16],
+            state_cap: 0,
+            buffer_cap: 0,
+            modules: vec![WorkloadModule {
+                name_hash: 1,
+                domain_id: 0,
+                params: vec![],
+            }],
+            edges: vec![
+                WorkloadEdge {
+                    from: WorkloadEnd::Net(2),
+                    from_port: 0,
+                    to: WorkloadEnd::Local(0),
+                    to_port: 0,
+                    buffer_bytes: 0,
+                },
+                WorkloadEdge {
+                    from: WorkloadEnd::Local(0),
+                    from_port: 0,
+                    to: WorkloadEnd::Net(2),
+                    to_port: 0,
+                    buffer_bytes: 4096,
+                },
+            ],
+            idle_safe: false,
+        };
+        assert!(check_net_lanes(&workload.edges).is_ok());
+        let b = encode_add_subgraph(&workload).unwrap();
+        assert_eq!(b[33], 2); // edge_count
+        let e = &b[41..];
+        // from Net(2) port 0 -> to New(0) port 0, 0 bytes.
+        assert_eq!(&e[0..12], &[3, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        // from New(0) port 0 -> to Net(2) port 0, 4096 bytes.
+        assert_eq!(&e[12..24], &[0, 0, 0, 0, 3, 0, 2, 0, 0, 0, 0x10, 0]);
+        // The resident section carries the same blob after its frame.
+        let s = encode_workload_section(&[workload]).unwrap();
+        assert_eq!(&s[17..], &b[..]);
+    }
+
+    #[test]
+    fn net_lanes_are_refused_unless_paired() {
+        let edge = |from, to| WorkloadEdge {
+            from,
+            from_port: 0,
+            to,
+            to_port: 0,
+            buffer_bytes: 0,
+        };
+        // Commands in, no events out.
+        let one_way = [edge(WorkloadEnd::Local(0), WorkloadEnd::Net(1))];
+        assert!(check_net_lanes(&one_way)
+            .unwrap_err()
+            .contains("net lane 1"));
+        // Two command edges into one lane.
+        let doubled = [
+            edge(WorkloadEnd::Local(0), WorkloadEnd::Net(1)),
+            edge(WorkloadEnd::Local(1), WorkloadEnd::Net(1)),
+            edge(WorkloadEnd::Net(1), WorkloadEnd::Local(0)),
+        ];
+        assert!(check_net_lanes(&doubled).is_err());
+        // A lane into a lane.
+        let net_net = [edge(WorkloadEnd::Net(1), WorkloadEnd::Net(2))];
+        assert!(check_net_lanes(&net_net).is_err());
+        // Two lanes, each paired.
+        let two = [
+            edge(WorkloadEnd::Local(0), WorkloadEnd::Net(1)),
+            edge(WorkloadEnd::Net(1), WorkloadEnd::Local(0)),
+            edge(WorkloadEnd::Local(1), WorkloadEnd::Net(2)),
+            edge(WorkloadEnd::Net(2), WorkloadEnd::Local(1)),
+        ];
+        assert!(check_net_lanes(&two).is_ok());
     }
 
     #[test]

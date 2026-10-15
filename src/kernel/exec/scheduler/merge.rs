@@ -106,7 +106,7 @@ pub fn provision_spare_lane_merge(
     // attach at the tail later). Boot / pre-SMP, so no quiesce.
     let pos = sched.exec_order_count;
     if pos < MAX_MODULES {
-        sched.exec_order[pos] = merge_slot as u8;
+        sched.exec_order[pos] = merge_slot as ModuleId;
         sched.exec_order_count = pos + 1;
         sched.active_module_count += 1;
     }
@@ -440,9 +440,9 @@ pub struct SchedulerState {
     /// BCM multi-domain graphs with one overrunning module per
     /// domain would permanently starve every later position in that
     /// domain's exec_order.
-    pub(crate) domain_exec_order_offset: [u8; MAX_DOMAINS],
+    pub(crate) domain_exec_order_offset: [ModuleId; MAX_DOMAINS],
     /// Topological execution order (Kahn's algorithm output)
-    pub(crate) exec_order: [u8; MAX_MODULES],
+    pub(crate) exec_order: [ModuleId; MAX_MODULES],
     /// Number of entries in exec_order
     pub(crate) exec_order_count: usize,
     /// Graph-level sample rate from config (0 = not set)
@@ -463,9 +463,9 @@ pub struct SchedulerState {
     /// without re-reading the config blob.
     pub(crate) pre_tick_drain: [bool; MAX_MODULES],
     /// Per-domain topological execution order
-    pub(crate) domain_exec_order: [[u8; MAX_MODULES]; MAX_DOMAINS],
+    pub(crate) domain_exec_order: [[ModuleId; MAX_MODULES]; MAX_DOMAINS],
     /// Number of modules in each domain's execution order
-    pub(crate) domain_module_count: [u8; MAX_DOMAINS],
+    pub(crate) domain_module_count: [ModuleId; MAX_DOMAINS],
     /// Number of domains configured (0 or 1 = single default domain)
     pub(crate) domain_count: u8,
     /// Per-domain tick_us (0 = use global tick_us). Index 0 = default domain.
@@ -547,7 +547,7 @@ pub struct SchedulerState {
     /// indices are populated by `prepare_graph` from
     /// `ModuleEntry::pre_tick_drain` (which mirrors the manifest
     /// flag).
-    pub(crate) domain_pre_tick_order: [[u8; MAX_PRE_TICK_PER_DOMAIN]; MAX_DOMAINS],
+    pub(crate) domain_pre_tick_order: [[ModuleId; MAX_PRE_TICK_PER_DOMAIN]; MAX_DOMAINS],
     /// Number of pre-tick modules in each domain.
     pub(crate) domain_pre_tick_count: [u8; MAX_DOMAINS],
     /// Cumulative count of times the per-domain pre-tick combined
@@ -825,6 +825,19 @@ static CURRENT_MODULE_PER_CORE: [portable_atomic::AtomicU32; MAX_DOMAINS] =
 pub fn current_module_index() -> usize {
     let core = crate::kernel::sys::hal::core_id();
     CURRENT_MODULE_PER_CORE[core].load(portable_atomic::Ordering::Relaxed) as usize
+}
+
+/// The module currently being stepped on this core, as the id an owner
+/// field records: `NO_MODULE` in kernel context (between steps the index is
+/// parked at `MAX_MODULES`), so what the kernel allocates for itself is
+/// owned by no module rather than by whichever slot the parked value aliases.
+pub fn current_module_id() -> ModuleId {
+    let idx = current_module_index();
+    if idx < MAX_MODULES {
+        idx as ModuleId
+    } else {
+        NO_MODULE
+    }
 }
 
 /// Return the module index a specific core is currently stepping. Lets a

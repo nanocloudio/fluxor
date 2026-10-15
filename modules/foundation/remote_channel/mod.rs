@@ -343,7 +343,7 @@ pub struct State {
     retry_at_ms: u32,
     /// When an attaching session is given up on; see `SETUP_TIMEOUT_MS`.
     setup_deadline_ms: u32,
-    my_tag: u8,
+    my_tag: net_proto::RequesterTag,
     peer_af: u8,
     peer_host_len: u8,
     authority_len: u8,
@@ -1330,7 +1330,10 @@ unsafe fn net_input(s: &mut State) {
                     close_unused(s, id as u32);
                 }
             }
-            net_proto::MSG_CONNECTED if plen >= 3 && p[2] == s.my_tag => {
+            net_proto::MSG_CONNECTED
+                if plen >= net_proto::CONNECTED_FIXED
+                    && net_proto::connected_parts(p).1 == s.my_tag =>
+            {
                 if s.phase == PH_DIALING {
                     s.conn = id;
                     s.generation = net_proto::session_generation(p, net_proto::CONNECTED_FIXED);
@@ -1354,7 +1357,10 @@ unsafe fn net_input(s: &mut State) {
                 }
             }
             net_proto::MSG_ERROR => {
-                if s.phase == PH_DIALING && plen >= 4 && p[3] == s.my_tag {
+                if s.phase == PH_DIALING
+                    && plen >= net_proto::ERROR_FIXED + net_proto::REQUESTER_TAG_LEN
+                    && net_proto::error_parts(p).2 == s.my_tag
+                {
                     s.phase = PH_IDLE;
                     s.retry_at_ms = later(dev_millis(sys) as u32, s.redial_ms);
                 } else if id == s.conn && s.phase >= PH_ATTACHING {

@@ -598,8 +598,8 @@ fn wire_isr_bridges(edges: &mut [Edge]) {
         if let Some(bs) = crate::kernel::bridge::bridge_slot_mut(slot_idx) {
             bs.init_ring(
                 ISR_BRIDGE_ELEM_SIZE,
-                edge.from_module as u8,
-                edge.to_module as u8,
+                edge.from_module as ModuleId,
+                edge.to_module as ModuleId,
             );
         }
         edge.bridge_slot = slot as i8;
@@ -879,7 +879,7 @@ pub fn register_isr_tier_modules_from_graph() -> usize {
                                 isr_entry,
                                 state_ptr: m.state_ptr(),
                                 irq_number: irq,
-                                module_index: module_idx as u8,
+                                module_index: module_idx as ModuleId,
                                 budget_cycles: budget,
                                 uses_fpu: false,
                                 in_bridges: &in_arr[..in_n],
@@ -902,7 +902,7 @@ pub fn register_isr_tier_modules_from_graph() -> usize {
                             isr_entry: builtin_tier1b_trampoline,
                             state_ptr: module_idx as *mut u8,
                             irq_number: irq,
-                            module_index: module_idx as u8,
+                            module_index: module_idx as ModuleId,
                             budget_cycles: budget,
                             uses_fpu: false,
                             in_bridges: &in_arr[..in_n],
@@ -971,7 +971,7 @@ pub fn register_isr_tier_modules_from_graph() -> usize {
                 crate::kernel::exec::isr_tier::register_tier1b_module(
                     m.step_fn(),
                     m.state_ptr(),
-                    module_idx as u8,
+                    module_idx as ModuleId,
                     budget,
                     in_slice,
                     out_slice,
@@ -984,7 +984,7 @@ pub fn register_isr_tier_modules_from_graph() -> usize {
                 crate::kernel::exec::isr_tier::register_tier1b_module(
                     builtin_tier1b_trampoline,
                     module_idx as *mut u8,
-                    module_idx as u8,
+                    module_idx as ModuleId,
                     budget,
                     in_slice,
                     out_slice,

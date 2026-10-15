@@ -30,6 +30,7 @@
 
 use portable_atomic::{AtomicBool, AtomicU32, Ordering};
 
+use crate::kernel::exec::scheduler::{ModuleId, NO_MODULE};
 use crate::kernel::module::loader::ModuleStepFn;
 use crate::kernel::sys::hal;
 
@@ -125,7 +126,7 @@ struct IsrModule {
     /// Metrics for this module.
     metrics: IsrMetrics,
     /// Module index in the main scheduler (for diagnostics).
-    module_index: u8,
+    module_index: ModuleId,
     /// Whether this slot is active.
     active: bool,
 }
@@ -138,7 +139,7 @@ impl IsrModule {
             in_bridges: [-1; MAX_ISR_BRIDGES],
             out_bridges: [-1; MAX_ISR_BRIDGES],
             metrics: IsrMetrics::new(),
-            module_index: 0xFF,
+            module_index: NO_MODULE,
             active: false,
         }
     }
@@ -178,7 +179,7 @@ struct IsrModuleTier2 {
     /// Metrics for this module.
     metrics: IsrMetrics,
     /// Module index in the main scheduler (for diagnostics).
-    module_index: u8,
+    module_index: ModuleId,
     /// Whether this slot is active.
     active: bool,
     /// Whether this module uses FPU (affects stacking overhead on Cortex-M33).
@@ -194,7 +195,7 @@ impl IsrModuleTier2 {
             in_bridges: [-1; MAX_ISR_BRIDGES],
             out_bridges: [-1; MAX_ISR_BRIDGES],
             metrics: IsrMetrics::new(),
-            module_index: 0xFF,
+            module_index: NO_MODULE,
             active: false,
             uses_fpu: false,
         }
@@ -257,7 +258,7 @@ static TIER2_DISPATCH_COUNT: AtomicU32 = AtomicU32::new(0);
 pub fn register_tier1b_module(
     step_fn: ModuleStepFn,
     state_ptr: *mut u8,
-    module_index: u8,
+    module_index: ModuleId,
     budget_cycles: u32,
     in_bridges: &[i8],
     out_bridges: &[i8],
@@ -309,7 +310,7 @@ pub struct Tier2Registration<'a> {
     pub isr_entry: ModuleIsrEntryFn,
     pub state_ptr: *mut u8,
     pub irq_number: u16,
-    pub module_index: u8,
+    pub module_index: ModuleId,
     pub budget_cycles: u32,
     pub uses_fpu: bool,
     pub in_bridges: &'a [i8],
@@ -559,7 +560,7 @@ pub const MODULE_MAX_BRIDGES: usize = MAX_ISR_BRIDGES;
 /// without routing through `provider_call`, which the §D7 gate denies for
 /// ISR-tier callers.
 pub fn module_bridge_slots(
-    module_index: u8,
+    module_index: ModuleId,
 ) -> Option<([i8; MAX_ISR_BRIDGES], [i8; MAX_ISR_BRIDGES])> {
     // SAFETY: the ISR slot arrays are populated only at graph bring-up
     // (single-threaded) and are read-only thereafter; this is a shared read of

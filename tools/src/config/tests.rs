@@ -3591,7 +3591,7 @@ mod gated_edge_tests {
     /// the kernel never sees a zero-copy edge at one.
     #[test]
     fn an_auto_group_at_a_gated_module_is_dropped_whole() {
-        let edges = [(0u8, 1u8, 0u8, 0u8, 0u8), (1, 2, 0, 0, 0)];
+        let edges = [(0u16, 1u16, 0u8, 0u8, 0u8), (1, 2, 0, 0, 0)];
         let mut groups = vec![1u8, 1];
         ungroup_gated_edges(
             &edges,
@@ -3610,7 +3610,7 @@ mod gated_edge_tests {
 
     #[test]
     fn a_written_group_at_a_gated_module_is_refused() {
-        let edges = [(0u8, 1u8, 0u8, 0u8, 0u8)];
+        let edges = [(0u16, 1u16, 0u8, 0u8, 0u8)];
         let mut groups = vec![3u8];
         let e = ungroup_gated_edges(
             &edges,
@@ -3625,7 +3625,7 @@ mod gated_edge_tests {
 
     #[test]
     fn groups_away_from_gated_modules_are_kept() {
-        let edges = [(0u8, 1u8, 0u8, 0u8, 0u8), (1, 2, 0, 0, 0)];
+        let edges = [(0u16, 1u16, 0u8, 0u8, 0u8), (1, 2, 0, 0, 0)];
         let mut groups = vec![2u8, 2];
         ungroup_gated_edges(
             &edges,
@@ -3718,7 +3718,7 @@ mod framed_edge_tests {
             {"from": "req.request_out", "to": "prov.request_in"},
             {"from": "req.bytes", "to": "prov.bytes"},
         ]});
-        let edges = [(0u8, 1u8, 0u8, 0u8, 0u8), (0, 1, 0, 1, 1)];
+        let edges = [(0u16, 1u16, 0u8, 0u8, 0u8), (0, 1, 0, 1, 1)];
         let out = group_framed_edges(&config, &edges, &names(), &manifests()).unwrap();
         assert_eq!(groups(&out), vec![Some(31), None]);
     }
@@ -3732,7 +3732,7 @@ mod framed_edge_tests {
             {"from": "req.records", "to": "prov.records"},
             {"from": "req.bytes", "to": "prov.bytes", "buffer_group": 30},
         ]});
-        let edges = [(0u8, 1u8, 0u8, 0u8, 0u8), (0, 1, 0, 2, 2), (0, 1, 0, 1, 1)];
+        let edges = [(0u16, 1u16, 0u8, 0u8, 0u8), (0, 1, 0, 2, 2), (0, 1, 0, 1, 1)];
         let out = group_framed_edges(&config, &edges, &names(), &manifests()).unwrap();
         assert_eq!(groups(&out), vec![Some(31), Some(29), Some(30)]);
     }
@@ -3743,7 +3743,7 @@ mod framed_edge_tests {
         let config = json!({"wiring": [
             {"from": "req.request_out", "to": "prov.request_in", "buffer_group": 4},
         ]});
-        let edges = [(0u8, 1u8, 0u8, 0u8, 0u8)];
+        let edges = [(0u16, 1u16, 0u8, 0u8, 0u8)];
         let out = group_framed_edges(&config, &edges, &names(), &manifests()).unwrap();
         assert_eq!(groups(&out), vec![Some(4)]);
     }

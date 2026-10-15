@@ -575,7 +575,7 @@ struct TlsSession {
     /// to TLS's own tag toward IP. Echoed when TLS forwards `MSG_CONNECTED`
     /// downstream so the original requester routes it on a fanned clear_out.
     /// `0` for inbound (server) sessions.
-    downstream_tag: u8,
+    downstream_tag: net_proto::RequesterTag,
     span_id: [u8; 8],
 }
 
@@ -913,7 +913,7 @@ struct TlsState {
     /// Downstream requester tag of the in-flight clear-side `CMD_CONNECT`,
     /// transferred to a session's `downstream_tag` on `MSG_CONNECTED` or used to
     /// translate a connect-failure `MSG_ERROR` back downstream.
-    pending_downstream_tag: u8,
+    pending_downstream_tag: net_proto::RequesterTag,
     /// True while a clear-side `CMD_CONNECT_TO` is forwarded but not yet
     /// completed (`MSG_CONNECTED` or `MSG_ERROR`). TLS serialises outbound
     /// connects through its single tag, so a SECOND concurrent connect is
@@ -2177,13 +2177,13 @@ unsafe fn tcp_module_step(s: &mut TlsState) -> i32 {
                 // socket would corrupt it. Inbound accepts (MSG_ACCEPTED) are
                 // unaffected: TLS is the sole accept-claimant on its channel.
                 let claim = if t == NET_MSG_CONNECTED {
-                    let tag = if pl > CONN_ID_LEN {
-                        payload[CONN_ID_LEN]
+                    let (_, tag) = if pl >= CONN_ID_LEN {
+                        net_proto::connected_parts(&payload[..pl.min(payload.len())])
                     } else {
-                        0
+                        (0, net_proto::REQUESTER_TAG_NONE)
                     };
                     let me = dev_requester_tag(sys);
-                    tag == 0 || tag == me
+                    tag == net_proto::REQUESTER_TAG_NONE || tag == me
                 } else if s.mode == 0 {
                     // Client-mode TLS never listens (it only active-opens),
                     // so an inbound accept on the shared net adapter belongs
@@ -2223,13 +2223,19 @@ unsafe fn tcp_module_step(s: &mut TlsState) -> i32 {
                     s.pending_downstream_tag = 0;
                     set_passthrough(s, conn_id);
                     // Forward MSG_CONNECTED to the clear side with the original
-                    // downstream requester tag at payload[1], matching the
+                    // downstream requester tag after the conn id, matching the
                     // session path's `forward_held_completion` framing so the
                     // relay routes it on a fanned clear_out.
                     let cb = conn_id.to_le_bytes();
-                    let out = [cb[0], cb[1], dtag];
-                    let _ =
-                        tls_write_raw_frame(sys, s.clear_out, NET_MSG_CONNECTED, out.as_ptr(), 3);
+                    let tb = dtag.to_le_bytes();
+                    let out = [cb[0], cb[1], tb[0], tb[1]];
+                    let _ = tls_write_raw_frame(
+                        sys,
+                        s.clear_out,
+                        NET_MSG_CONNECTED,
+                        out.as_ptr(),
+                        out.len() as u16,
+                    );
                 } else if claim {
                     match alloc_session_for_conn(s, conn_id) {
                         Some(idx) => {
@@ -2260,7 +2266,7 @@ unsafe fn tcp_module_step(s: &mut TlsState) -> i32 {
                                 s.pending_expected_is_ip = false;
                                 dt
                             } else {
-                                0
+                                net_proto::REQUESTER_TAG_NONE
                             };
                             // Observability: start the `tls.handshake` span and
                             // mint this session's own span id (used for the span
@@ -2319,7 +2325,8 @@ unsafe fn tcp_module_step(s: &mut TlsState) -> i32 {
                                 s.pending_connect_active = false;
                                 s.pending_downstream_tag = 0;
                                 s.pending_expected_len = 0;
-                                let err = [(-12i8) as u8, dtag]; // ENOMEM + tag
+                                let tb = dtag.to_le_bytes();
+                                let err = [(-12i8) as u8, tb[0], tb[1]]; // ENOMEM + tag
                                 let _ = tls_write_or_count(
                                     s,
                                     s.clear_out,
@@ -2469,7 +2476,7 @@ unsafe fn tcp_module_step(s: &mut TlsState) -> i32 {
                         bound_is_ours = false;
                     }
                 }
-                // MSG_ERROR `[conn_id][errno][tag]` carries IP's tag (TLS's own
+                // MSG_ERROR `[conn_id][errno][tag: u16 LE]` carries IP's tag (TLS's own
                 // tag). TRANSLATE it to the original downstream tag so the
                 // clear-side requester recognises the failure — otherwise it
                 // ignores the error and waits for a timeout. For an established
@@ -2477,21 +2484,25 @@ unsafe fn tcp_module_step(s: &mut TlsState) -> i32 {
                 // (no session yet) from the pending connect slot. MSG_BOUND has
                 // no tag and passes through unchanged.
                 let mut forward = bound_is_ours;
-                if t == NET_MSG_ERROR && rd >= 4 {
-                    let conn_id = u16::from_le_bytes([s.net_scratch[0], s.net_scratch[1]]);
-                    let in_tag = s.net_scratch[3]; // IP-echoed requester tag
+                const ERR_TAG_AT: usize = net_proto::ERROR_FIXED;
+                const ERR_TAGGED: usize = ERR_TAG_AT + net_proto::REQUESTER_TAG_LEN;
+                if t == NET_MSG_ERROR && rd >= ERR_TAGGED {
+                    // IP-echoed requester tag.
+                    let (conn_id, _, in_tag) = net_proto::error_parts(&s.net_scratch[..rd]);
                     let si = find_session_by_conn_id(s, conn_id);
                     if si >= 0 {
                         // Established-connection error → its session's tag.
-                        s.net_scratch[3] = s.sessions[si as usize].downstream_tag;
+                        let dt = s.sessions[si as usize].downstream_tag.to_le_bytes();
+                        s.net_scratch[ERR_TAG_AT..ERR_TAGGED].copy_from_slice(&dt);
                     } else if s.pending_connect_active && in_tag == dev_requester_tag(sys) {
                         // A CONNECT failure routed to TLS carries TLS's own
                         // tag (TLS stamped it). Only THEN consume the pending
                         // slot — a co-wired consumer's failure (different tag)
                         // must not cancel our connect.
                         s.pending_connect_active = false;
-                        s.net_scratch[3] = s.pending_downstream_tag;
-                        s.pending_downstream_tag = 0;
+                        let dt = s.pending_downstream_tag.to_le_bytes();
+                        s.net_scratch[ERR_TAG_AT..ERR_TAGGED].copy_from_slice(&dt);
+                        s.pending_downstream_tag = net_proto::REQUESTER_TAG_NONE;
                         // The dial that named this identity failed; no later
                         // session inherits it.
                         s.pending_expected_len = 0;
@@ -2727,7 +2738,8 @@ unsafe fn tcp_module_step(s: &mut TlsState) -> i32 {
                 let msg =
                     b"[tls] CMD_CONNECT (0x13) is unsupported; dial with CMD_CONNECT_TO (0x14)";
                 dev_log(sys, 1, msg.as_ptr(), msg.len());
-                let err = [(-38i8) as u8, tag]; // ENOSYS + downstream tag
+                let tb = tag.to_le_bytes();
+                let err = [(-38i8) as u8, tb[0], tb[1]]; // ENOSYS + downstream tag
                 let _ = tls_write_or_count(
                     s,
                     s.clear_out,
@@ -2761,7 +2773,7 @@ unsafe fn tcp_module_step(s: &mut TlsState) -> i32 {
                 // For a CMD_CONNECT_TO we're about to forward: the downstream
                 // tag to latch, deferred until the upstream write actually
                 // lands.
-                let mut arm_pending: Option<u8> = None;
+                let mut arm_pending: Option<net_proto::RequesterTag> = None;
                 if t == NET_CMD_CONNECT_TO {
                     let decoded = if pl == rd {
                         net_proto::read_connect_to(&s.net_scratch[..rd])
@@ -2770,11 +2782,12 @@ unsafe fn tcp_module_step(s: &mut TlsState) -> i32 {
                     };
                     match decoded {
                         None => {
-                            // Malformed: EINVAL goes to the record's last
-                            // byte — the one a tag would occupy — as
-                            // `read_connect_to` states.
-                            let tag = if rd > 0 { s.net_scratch[rd - 1] } else { 0 };
-                            let err = [(-22i8) as u8, tag]; // EINVAL + downstream tag
+                            // Malformed: EINVAL goes to the tag the record's
+                            // last two bytes spell, as `read_connect_to`
+                            // states.
+                            let tag = net_proto::malformed_connect_to_tag(&s.net_scratch[..rd]);
+                            let tb = tag.to_le_bytes();
+                            let err = [(-22i8) as u8, tb[0], tb[1]]; // EINVAL + downstream tag
                             let _ = tls_write_or_count(
                                 s,
                                 s.clear_out,
@@ -2786,7 +2799,8 @@ unsafe fn tcp_module_step(s: &mut TlsState) -> i32 {
                             forward = false;
                         }
                         Some((_, _, target, tag)) => {
-                            let new_tag = tag.unwrap_or(0);
+                            let new_tag = tag.unwrap_or(net_proto::REQUESTER_TAG_NONE);
+                            let ntb = new_tag.to_le_bytes();
                             let tagged = tag.is_some();
                             // What the session opened by this dial will
                             // expect of its peer. The override wins; else the
@@ -2794,7 +2808,7 @@ unsafe fn tcp_module_step(s: &mut TlsState) -> i32 {
                             // backend dial in cleartext and expects nothing.
                             let (exp, exp_len, exp_ip) = connect_expected(s, &target);
                             if !connect_admissible(s, exp_len) {
-                                let err = [(-1i8) as u8, new_tag]; // EPERM + downstream tag
+                                let err = [(-1i8) as u8, ntb[0], ntb[1]]; // EPERM + downstream tag
                                 let _ = tls_write_or_count(
                                     s,
                                     s.clear_out,
@@ -2812,7 +2826,7 @@ unsafe fn tcp_module_step(s: &mut TlsState) -> i32 {
                                 // it downstream with EAGAIN (translated to the
                                 // new request's tag) and DON'T forward — the
                                 // clear-side consumer retries.
-                                let err = [(-11i8) as u8, new_tag]; // EAGAIN + downstream tag
+                                let err = [(-11i8) as u8, ntb[0], ntb[1]]; // EAGAIN + downstream tag
                                 let _ = tls_write_or_count(
                                     s,
                                     s.clear_out,
@@ -2822,18 +2836,22 @@ unsafe fn tcp_module_step(s: &mut TlsState) -> i32 {
                                     err.len() as u16,
                                 );
                                 forward = false;
-                            } else if !tagged && rd + 1 > NET_SCRATCH_SIZE {
+                            } else if !tagged
+                                && rd + net_proto::REQUESTER_TAG_LEN > NET_SCRATCH_SIZE
+                            {
                                 forward = false;
                             } else {
                                 // Remember the clear-side consumer's original
                                 // tag, then stamp TLS's own so IP routes the
                                 // completion to TLS. An untagged record grows
-                                // a tag byte. Defer marking the connect pending
+                                // a tag. Defer marking the connect pending
                                 // until the forward below actually succeeds.
                                 if !tagged {
-                                    rd += 1;
+                                    rd += net_proto::REQUESTER_TAG_LEN;
                                 }
-                                s.net_scratch[rd - 1] = dev_requester_tag(sys);
+                                let me = dev_requester_tag(sys).to_le_bytes();
+                                s.net_scratch[rd - net_proto::REQUESTER_TAG_LEN..rd]
+                                    .copy_from_slice(&me);
                                 s.pending_expected = exp;
                                 s.pending_expected_len = exp_len;
                                 s.pending_expected_is_ip = exp_ip;
@@ -5482,7 +5500,7 @@ unsafe fn forward_held_completion(s: &mut TlsState, idx: usize) {
         let ok = if held == NET_MSG_CONNECTED {
             const AT: usize = net_proto::CONNECTED_FIXED - net_proto::CONN_ID_LEN;
             let mut tail = [0u8; AT + net_proto::SESSION_GENERATION_LEN];
-            tail[0] = s.sessions[idx].downstream_tag;
+            tail[..AT].copy_from_slice(&s.sessions[idx].downstream_tag.to_le_bytes());
             let n = net_proto::put_session_generation(&mut tail, AT, generation).unwrap_or(AT);
             tls_write_or_count(s, s.clear_out, held, conn_id, tail.as_ptr(), n as u16)
         } else {

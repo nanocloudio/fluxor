@@ -43,6 +43,7 @@ use portable_atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::abi::contracts::storage::block::{caps, cpl, ioctl, req, Req};
 use crate::kernel::boot::config::MAX_MODULES;
+use crate::kernel::exec::scheduler::ModuleId;
 use crate::kernel::module::loader::ModuleMemory;
 use crate::kernel::sys::errno;
 
@@ -85,7 +86,7 @@ struct Lend {
     chan: i32,
     tag: u64,
     /// The module whose memory the buffer is in.
-    holder: u8,
+    holder: ModuleId,
     /// The holder is being torn down: the kernel reaps this lend itself.
     dying: bool,
 }
@@ -101,7 +102,7 @@ impl Lend {
 }
 
 struct Quarantined {
-    module: u8,
+    module: ModuleId,
     memory: ModuleMemory,
     since_ms: u64,
     reported: bool,
@@ -226,7 +227,7 @@ pub unsafe fn begin(
                     phase: Phase::Reserved,
                     chan,
                     tag: r.tag,
-                    holder: holder as u8,
+                    holder: holder as ModuleId,
                     dying: false,
                 };
                 Ok(Pending(Some(i)))
@@ -311,7 +312,7 @@ pub fn quarantine(module: usize, memory: ModuleMemory) {
     let kept = with(|l| match l.quarantined.iter_mut().find(|q| q.is_none()) {
         Some(q) => {
             *q = Some(Quarantined {
-                module: module as u8,
+                module: module as ModuleId,
                 memory,
                 since_ms: crate::kernel::sys::hal::now_millis(),
                 reported: false,
@@ -421,7 +422,8 @@ fn pump_locked() {
     // Release every module whose lends are all back, and close the channels
     // that carried them.
     let now = crate::kernel::sys::hal::now_millis();
-    let mut done: [Option<(u8, ModuleMemory)>; MAX_QUARANTINED] = [const { None }; MAX_QUARANTINED];
+    let mut done: [Option<(ModuleId, ModuleMemory)>; MAX_QUARANTINED] =
+        [const { None }; MAX_QUARANTINED];
     let mut close = [NO_CHAN; MAX_ADOPTED];
     with(|l| {
         let Ledger {

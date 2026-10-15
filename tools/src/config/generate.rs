@@ -2,11 +2,14 @@
 ///
 /// Layout:
 /// - Header (8 bytes): magic (u32), version (u16), checksum (u16)
-/// - Counts (8 bytes): module_count, edge_count, reserved[6]
-/// - Module section header (6 bytes): module_count, reserved, section_size (u32)
+/// - Counts (8 bytes): module_count low byte, edge_count low byte,
+///   tick_us (u16), graph_sample_rate (u32)
+/// - Module section header (6 bytes): module_count low byte, module_count
+///   high byte, section_size (u32)
 /// - Module entries (variable length each)
-/// - Graph section (64 bytes): edge_count, flags, reserved[2], edges[15]
-/// - Hardware section: spi_count, i2c_count, gpio_count, reserved, configs...
+/// - Graph section: edge_count low byte, flags, edge_count high byte, edge-slot
+///   code, then `max_edges` fixed-size edge slots and the per-domain metadata
+/// - Hardware section: spi/i2c/gpio/pio/uart counts, then their configs
 ///
 /// Module capability info for buffer aliasing and manifest validation.
 pub struct ModuleCaps {
@@ -641,8 +644,10 @@ fn generate_config_impl(
     result.extend_from_slice(&version.to_le_bytes());
     result.extend_from_slice(&0u16.to_le_bytes()); // checksum (computed later)
 
-    // Counts (8 bytes): module_count(1), edge_count(1), tick_us(2), graph_sample_rate(4)
-    result.push(module_entries.len() as u8); // module_count
+    // Counts (8 bytes): module_count low byte(1), edge_count low byte(1),
+    // tick_us(2), graph_sample_rate(4). The high bytes ride the module
+    // section header and the graph section header.
+    result.push((module_entries.len() & 0xFF) as u8); // module_count
     // edge_count LOW byte; the high byte rides graph-section byte 2.
     result.push((edges.len() & 0xFF) as u8); // edge_count
     result.extend_from_slice(&tick_us.to_le_bytes()); // tick_us (u16, bytes 10-11)
@@ -658,8 +663,8 @@ fn generate_config_impl(
     // module data when both halves' http modules inline their
     // shells. Embedded targets (rp/bcm) still fit in u16 worth of
     // bytes in practice; the wider field costs 2 bytes per config.
-    result.push(module_entries.len() as u8); // module_count
-    result.push(0); // reserved
+    result.push((module_entries.len() & 0xFF) as u8); // module_count, low byte
+    result.push((module_entries.len() >> 8) as u8); // module_count, high byte
     result.extend_from_slice(&(module_section_size as u32).to_le_bytes()); // section_size
 
     // Module entries (variable length)
@@ -788,8 +793,8 @@ fn generate_config_impl(
     //
     // Edge format (GRAPH_EDGE_SIZE bytes; mirrors
     // `kernel::config::parse_graph_edge`):
-    //   byte 0:    from_id
-    //   byte 1:    to_id
+    //   byte 0:    from_id, low byte
+    //   byte 1:    to_id, low byte
     //   byte 2:    bit 7    = to_port
     //              bits 6:5 = edge_class (2 bits)
     //              bits 4:0 = buffer_group (5 bits, 0..31)
@@ -803,7 +808,8 @@ fn generate_config_impl(
     //              MODULE_FLOW_BUDGET query.
     //   byte 9:    bit 0 = wake_on_write (`wake: true` — control and
     //              transaction classes only); bits 1-7 reserved
-    //   bytes 10-11: reserved (0)
+    //   byte 10:   from_id, high byte
+    //   byte 11:   to_id, high byte
     //
     // Both ports get 4 bits; the runtime cap is `MAX_PORTS=16`. The
     // 5-bit `buffer_group` ceiling (31) is enforced by
@@ -831,16 +837,16 @@ fn generate_config_impl(
         let group = buffer_groups.get(i).copied().unwrap_or(0);
         let ec = edge_classes.get(i).copied().unwrap_or(0);
         let buffer_bytes = edge_buffer_bytes.get(i).copied().unwrap_or(0);
-        graph_section.push(*from_id);
-        graph_section.push(*to_id);
+        graph_section.push((*from_id & 0xFF) as u8);
+        graph_section.push((*to_id & 0xFF) as u8);
         graph_section.push((to_port << 7) | ((ec & 0x03) << 5) | (group & 0x1F));
         graph_section.push(((from_port_index & 0x0F) << 4) | (to_port_index & 0x0F));
         graph_section.extend_from_slice(&buffer_bytes.to_le_bytes());
         graph_section.push(edge_rate_classes.get(i).copied().unwrap_or(0));
-        // byte 9: bit 0 = wake_on_write; bits 1-7
-        // reserved. bytes 10-11 reserved.
+        // byte 9: bit 0 = wake_on_write; bits 1-7 reserved.
         graph_section.push(edge_wake_flags.get(i).copied().unwrap_or(0) & 0x01);
-        graph_section.extend_from_slice(&[0u8; 2]);
+        graph_section.push((*from_id >> 8) as u8);
+        graph_section.push((*to_id >> 8) as u8);
     }
     // Pad edge entries to fixed offset, then write domain metadata
     while graph_section.len() < 4 + max_edges * GRAPH_EDGE_SIZE {
@@ -1018,6 +1024,8 @@ fn build_workload_section(
 /// (`add_subgraph::Workload`): modules by name_hash with their params, and
 /// the edges between them. Empty when the graph declares none. The resident
 /// workload section and a workload image (`--emit=workload`) encode these.
+use crate::add_subgraph::WorkloadEnd;
+
 pub fn build_workloads(
     config: &Value,
     loc: schema::ModuleLocation<'_>,
@@ -1162,21 +1170,48 @@ pub fn build_workloads(
         let mut edges = Vec::new();
         if let Some(wiring) = workload_yaml.get("wiring").and_then(|w| w.as_array()) {
             for (ei, e) in wiring.iter().enumerate() {
-                let resolve = |key: &str| -> Result<u8> {
+                // An end is one of the workload's modules, or `net:<key>` —
+                // the node's network through a lane of the workload's own.
+                let resolve = |key: &str| -> Result<WorkloadEnd> {
                     let n = e.get(key).and_then(|v| v.as_str()).ok_or_else(|| {
                         Error::Config(format!(
-                            "workload {pi} wiring {ei}: `{key}` must be a module name"
+                            "workload {pi} wiring {ei}: `{key}` must be a module name or net:<key>"
                         ))
                     })?;
-                    name_to_local.get(n).copied().ok_or_else(|| {
+                    if let Some(k) = n.strip_prefix("net:") {
+                        // Decimal digits only (no sign, no hex): the kernel
+                        // decodes a key as 0..=255.
+                        let bad = || {
+                            Error::Config(format!(
+                                "workload {pi} wiring {ei}: `{n}`: a net lane key is decimal 0..=255"
+                            ))
+                        };
+                        if k.is_empty() || k.len() > 3 || !k.bytes().all(|c| c.is_ascii_digit()) {
+                            return Err(bad());
+                        }
+                        return k.parse::<u8>().map(WorkloadEnd::Net).map_err(|_| bad());
+                    }
+                    name_to_local.get(n).copied().map(WorkloadEnd::Local).ok_or_else(|| {
                         Error::Config(format!(
                             "workload {pi} wiring {ei}: unknown module `{n}` (cross-workload edges are not \
-                             supported in v1 — workloads are self-contained)"
+                             supported — workloads are self-contained; the node's network is `net:<key>`)"
                         ))
                     })
                 };
-                let from_local = resolve("from")?;
-                let to_local = resolve("to")?;
+                let from = resolve("from")?;
+                let to = resolve("to")?;
+                // The domain check applies between two of the workload's
+                // modules; a lane has no domain of its own.
+                let (from_local, to_local) = match (from, to) {
+                    (WorkloadEnd::Local(f), WorkloadEnd::Local(t)) => (f, t),
+                    (WorkloadEnd::Local(l), WorkloadEnd::Net(_))
+                    | (WorkloadEnd::Net(_), WorkloadEnd::Local(l)) => (l, l),
+                    (WorkloadEnd::Net(_), WorkloadEnd::Net(_)) => {
+                        return Err(Error::Config(format!(
+                            "workload {pi} wiring {ei}: a net lane connects to a module of the workload, not to another lane"
+                        )))
+                    }
+                };
                 // Reject cross-domain workload edges (v1). On bcm2712 a cross-domain
                 // edge needs the SPSC bridge provisioned at boot (base edges get
                 // it before workload admission, bcm2712.rs); `apply_add` opens an
@@ -1194,15 +1229,20 @@ pub fn build_workloads(
                     )));
                 }
                 edges.push(crate::add_subgraph::WorkloadEdge {
-                    from_local,
+                    from,
                     from_port: e.get("from_port").and_then(|v| v.as_u64()).unwrap_or(0) as u8,
-                    to_local,
+                    to,
                     to_port: e.get("to_port").and_then(|v| v.as_u64()).unwrap_or(0) as u8,
                     buffer_bytes: e.get("buffer_bytes").and_then(|v| v.as_u64()).unwrap_or(0)
                         as u32,
                 });
             }
         }
+        // Each net lane key names exactly one edge into the lane (a module's
+        // commands) and one out of it (its events) — the kernel's rule,
+        // refused here by key rather than at the node's CREATE.
+        crate::add_subgraph::check_net_lanes(&edges)
+            .map_err(|why| Error::Config(format!("workload {pi}: {why}")))?;
         let state_cap = workload_yaml
             .get("state_cap")
             .and_then(|v| v.as_u64())
@@ -1263,13 +1303,13 @@ fn gated_modules(
 /// a graph at load. A group the auto-assign pass formed is an optimisation
 /// and is dropped whole; a `buffer_group:` the graph wrote is refused.
 fn ungroup_gated_edges(
-    edges: &[(u8, u8, u8, u8, u8)],
+    edges: &[(u16, u16, u8, u8, u8)],
     groups: &mut [u8],
     explicit: &[bool],
     gated: &[bool],
     module_names: &[String],
 ) -> Result<()> {
-    let is_gated = |id: u8| gated.get(id as usize).copied().unwrap_or(false);
+    let is_gated = |id: u16| gated.get(id as usize).copied().unwrap_or(false);
     let mut dropped = [false; 32];
     for (i, &(from, to, ..)) in edges.iter().enumerate() {
         let g = groups[i];
@@ -1307,7 +1347,7 @@ fn ungroup_gated_edges(
 /// [`assign_buffer_groups`] numbers up from 1. A group the wiring names is kept.
 fn group_framed_edges(
     config: &Value,
-    edges: &[(u8, u8, u8, u8, u8)],
+    edges: &[(u16, u16, u8, u8, u8)],
     module_names: &[String],
     manifests: &HashMap<String, Manifest>,
 ) -> Result<Value> {
@@ -1354,7 +1394,7 @@ fn group_framed_edges(
 }
 
 fn assign_buffer_groups(
-    edges: &[(u8, u8, u8, u8, u8)],
+    edges: &[(u16, u16, u8, u8, u8)],
     module_names: &[String],
     module_caps: &[ModuleCaps],
 ) -> Result<Vec<u8>> {
@@ -1367,7 +1407,7 @@ fn assign_buffer_groups(
     }
 
     // Build lookups: module_name -> capability flags
-    let is_chain_interior_capable = |module_id: u8| -> bool {
+    let is_chain_interior_capable = |module_id: u16| -> bool {
         let id = module_id as usize;
         if id >= module_names.len() {
             return false;
@@ -1404,7 +1444,7 @@ fn assign_buffer_groups(
 
     // Chain interior: 1-in, 1-out, mailbox_safe AND in_place_writer.
     // These modules read+write the same aliased buffer via acquire_inplace.
-    let is_chain_interior = |module_id: u8| -> bool {
+    let is_chain_interior = |module_id: u16| -> bool {
         let idx = module_id as usize;
         idx < num_modules
             && data_in_count[idx] == 1
@@ -1413,7 +1453,7 @@ fn assign_buffer_groups(
     };
 
     // Find the single data-out edge of a module.
-    let find_out_edge = |module_id: u8| -> Option<usize> {
+    let find_out_edge = |module_id: u16| -> Option<usize> {
         edges
             .iter()
             .position(|(from_id, _, to_port, _, _)| *from_id == module_id && *to_port == 0)
@@ -1632,7 +1672,7 @@ mod buffer_group_tests {
             caps("filter", true),
             caps("sink", false),
         ];
-        let edges = [(0u8, 1u8, 0u8, 0u8, 0u8), (1, 2, 0, 0, 0)];
+        let edges = [(0u16, 1u16, 0u8, 0u8, 0u8), (1, 2, 0, 0, 0)];
         let groups = assign_buffer_groups(&edges, &names, &caps).unwrap();
         assert_eq!(groups, vec![1, 1]);
     }
@@ -1648,7 +1688,7 @@ mod buffer_group_tests {
             caps("sink", false),
             caps("monitor", false),
         ];
-        let edges = [(1u8, 3u8, 1u8, 1u8, 0u8), (0, 1, 0, 0, 0), (1, 2, 0, 0, 0)];
+        let edges = [(1u16, 3u16, 1u8, 1u8, 0u8), (0, 1, 0, 0, 0), (1, 2, 0, 0, 0)];
         let groups = assign_buffer_groups(&edges, &names, &caps).unwrap();
         assert_eq!(groups, vec![0, 1, 1]);
     }
@@ -1663,7 +1703,7 @@ mod buffer_group_tests {
             caps("a", false),
             caps("b", false),
         ];
-        let edges = [(0u8, 1u8, 0u8, 0u8, 0u8), (1, 2, 0, 0, 0), (1, 3, 0, 1, 0)];
+        let edges = [(0u16, 1u16, 0u8, 0u8, 0u8), (1, 2, 0, 0, 0), (1, 3, 0, 1, 0)];
         let groups = assign_buffer_groups(&edges, &names, &caps).unwrap();
         assert_eq!(groups, vec![0, 0, 0]);
     }

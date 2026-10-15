@@ -433,7 +433,12 @@ pub unsafe fn linux_workload_dispatch(
     use crate::kernel::workload::workload_graph;
 
     if opcode == wl::CREATE {
-        if !arg.is_null() && arg_len > 17 && *arg.add(17) == wl::SOURCE_FMOD_GRAPH {
+        // An fmod graph, and a graph bringing its own modules, are the
+        // graph backend's; everything else is a host process.
+        if !arg.is_null()
+            && arg_len > 17
+            && (*arg.add(17) == wl::SOURCE_FMOD_GRAPH || *arg.add(17) == wl::SOURCE_FMOD_PACK)
+        {
             let rc = workload_graph::workload_dispatch(-1, opcode, arg, arg_len);
             if rc < 0 {
                 return rc;
@@ -444,6 +449,10 @@ pub unsafe fn linux_workload_dispatch(
     }
     if opcode == wl::CAPS {
         return workload_caps(arg, arg_len);
+    }
+    // What the node's own image holds, for pinning a pack against it.
+    if opcode == wl::MODULE_DIGESTS {
+        return workload_graph::workload_dispatch(-1, opcode, arg, arg_len);
     }
 
     let raw = slot_of(handle);
@@ -492,8 +501,15 @@ unsafe fn workload_caps(arg: *mut u8, arg_len: usize) -> i32 {
     let out = core::slice::from_raw_parts_mut(arg, arg_len);
     out[0] = wl::caps::POSTURE_SHARED | wl::caps::POSTURE_ISOLATED;
     // Both backends: a host-process bundle, and an fmod graph staged into
-    // the live graph. Each refuses at CREATE what it cannot honour.
-    out[1] = hp::CAPS_SOURCE_HOST_PROCESS | wl::caps::SOURCE_FMOD_GRAPH;
+    // the live graph — with its own modules where the kernel has code space
+    // for packs. Each refuses at CREATE what it cannot honour.
+    out[1] = hp::CAPS_SOURCE_HOST_PROCESS
+        | wl::caps::SOURCE_FMOD_GRAPH
+        | if crate::kernel::workload::code_pack::POOL_SIZE > 0 {
+            wl::caps::SOURCE_FMOD_PACK
+        } else {
+            0
+        };
     // Implemented optional ops: READ + EXEC + the TTY set + real-signal SIGNAL
     // delivery (process-group). PAUSE is
     // advertised iff the host can freeze at all (cgroup2 present); a workload

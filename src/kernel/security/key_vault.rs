@@ -33,6 +33,7 @@ unsafe fn read_u64(p: *const u8) -> u64 {
     }
     u64::from_le_bytes(b)
 }
+use crate::kernel::exec::scheduler::{ModuleId, NO_MODULE};
 use crate::kernel::ipc::fd;
 #[cfg(feature = "rsa-vault")]
 use crate::kernel::security::crypto::rsa;
@@ -199,8 +200,8 @@ struct Slot {
     label: [u8; MAX_LABEL],
     label_len: u8,
     /// Scheduler slot of the module that owns this key, or `KERNEL_OWNER`.
-    owner: u8,
-    _pad: [u8; 2],
+    owner: ModuleId,
+    _pad: u8,
     /// Which occupancy of that scheduler slot: a module restarted or
     /// replaced in the same slot is another owner.
     owner_generation: u32,
@@ -223,7 +224,7 @@ impl Slot {
             label: [0; MAX_LABEL],
             label_len: 0,
             owner: KERNEL_OWNER,
-            _pad: [0; 2],
+            _pad: 0,
             owner_generation: 0,
             namespace: 0,
             generation: 0,
@@ -259,7 +260,7 @@ static mut SLOTS: [Slot; MAX_SLOTS] = [Slot::empty(); MAX_SLOTS];
 // checks all of that before anything touches key material.
 
 /// Owner of a key created by kernel code outside any module.
-const KERNEL_OWNER: u8 = u8::MAX;
+const KERNEL_OWNER: ModuleId = NO_MODULE;
 /// Handle bits naming the slot; the generation sits above them.
 const SLOT_BITS: u32 = 6;
 const SLOT_MASK: i32 = (1 << SLOT_BITS) - 1;
@@ -271,7 +272,7 @@ const _: () = assert!(MAX_SLOTS <= 1 << SLOT_BITS);
 /// Who is asking.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Caller {
-    slot: u8,
+    slot: ModuleId,
     generation: u32,
     namespace: u32,
 }
@@ -280,7 +281,7 @@ struct Caller {
 fn caller() -> Caller {
     use crate::kernel::exec::scheduler;
     let idx = scheduler::current_module_index();
-    if idx >= scheduler::MAX_MODULES || idx >= KERNEL_OWNER as usize {
+    if idx >= scheduler::MAX_MODULES {
         return Caller {
             slot: KERNEL_OWNER,
             generation: 0,
@@ -288,7 +289,7 @@ fn caller() -> Caller {
         };
     }
     Caller {
-        slot: idx as u8,
+        slot: idx as ModuleId,
         generation: scheduler::module_slot_generation(idx),
         namespace: scheduler::module_type_hash(idx),
     }
@@ -297,7 +298,7 @@ fn caller() -> Caller {
 /// The calling module as a key owner, `(scheduler slot, occupancy)`: what
 /// another backend records so its handles are owner-scoped the same way.
 #[cfg(feature = "host-hsm")]
-pub(crate) fn caller_owner() -> (u8, u32) {
+pub(crate) fn caller_owner() -> (ModuleId, u32) {
     let c = caller();
     (c.slot, c.generation)
 }
@@ -306,7 +307,7 @@ pub(crate) fn caller_owner() -> (u8, u32) {
 /// scheduler slot holds a new occupancy after a restart, a replacement or a
 /// graph rebuild, and everything the old one owned is unreachable. Kernel
 /// code has no scheduler slot and is always live.
-pub(crate) fn owner_is_live(slot: u8, generation: u32) -> bool {
+pub(crate) fn owner_is_live(slot: ModuleId, generation: u32) -> bool {
     slot == KERNEL_OWNER
         || crate::kernel::exec::scheduler::module_slot_generation(slot as usize) == generation
 }

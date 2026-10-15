@@ -47,10 +47,10 @@ kernel_stack_kb = 1024
 # non-isolated module is admitted against the stack less this.
 kernel_stack_reserve_kb = 256
 # The pool every loaded module's state and arena come from: the SDK's aarch64
-# `kernel::STATE_ARENA_SIZE` (`modules/sdk/abi/config.rs`), 256 MiB. The kernel
+# `kernel::STATE_ARENA_SIZE` (`modules/sdk/abi/config.rs`), 1 GiB. The kernel
 # allocates that constant; this states it for the graph builder, which admits a
 # graph against the sum of its modules' published state sizes.
-state_arena_kb = 262144
+state_arena_kb = 1048576
 
 [isolation]
 # What the kernel implements here (`kernel-vm`, EL0 under a per-module page

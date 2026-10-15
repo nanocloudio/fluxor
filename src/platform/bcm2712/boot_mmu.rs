@@ -82,7 +82,8 @@ mod pi5_impl {
         | (0b01 << 10)    // ORGN0: WB-WA
         | (0b11 << 12)    // SH0: inner shareable
         | (1 << 23)       // EPD1: disable TTBR1_EL1 walks (kernel-only, no upper VA)
-        | (0b010u64 << 32); // IPS = 0b010 → 40-bit PA (1TB, covers RP1 BAR at 0x1f_xxxx_xxxx)
+        | (0b010u64 << 32) // IPS = 0b010 → 40-bit PA (1TB, covers RP1 BAR at 0x1f_xxxx_xxxx)
+        | (1u64 << 36);   // AS: 16-bit ASIDs, one per module index (up to 1024)
 
     // Block descriptor for DRAM: Normal Cacheable, RW, Inner Shareable, nG.
     // nG so kernel (ASID 0) DRAM blocks never shadow an isolated module's
@@ -358,17 +359,23 @@ mod qemu_impl {
     /// Pi 5's indices, so descriptors mean the same on both boards.
     pub const MAIR_VALUE: u64 = 0xFF | (0x04 << 8) | (0x44 << 16);
 
-    /// 39-bit VA from L1, 4 KB granule, TTBR1 walks off, 40-bit PA: the
-    /// Pi 5's translation regime.
-    pub const TCR_VALUE: u64 =
-        25 | (0b01 << 8) | (0b01 << 10) | (0b11 << 12) | (1 << 23) | (0b010u64 << 32);
+    /// 39-bit VA from L1, 4 KB granule, TTBR1 walks off, 40-bit PA, 16-bit
+    /// ASIDs: the Pi 5's translation regime.
+    pub const TCR_VALUE: u64 = 25
+        | (0b01 << 8)
+        | (0b01 << 10)
+        | (0b11 << 12)
+        | (1 << 23)
+        | (0b010u64 << 32)
+        | (1u64 << 36);
 
     /// RAM on the virt machine starts at 1 GB, and `fluxor run` gives the
-    /// machine 1 GB of it (`-m 1G`, `targets/boards/qemu-virt.toml`). Only
-    /// that is mapped Normal: address space with no memory behind it is
-    /// never mapped as memory, where a speculative fetch could reach it.
+    /// machine 2 GB of it (`-m 2G`, `targets/boards/qemu-virt.toml`), which
+    /// holds the kernel's 1 GiB state arena. Only that is mapped Normal:
+    /// address space with no memory behind it is never mapped as memory,
+    /// where a speculative fetch could reach it.
     const RAM_FIRST_GB: usize = 1;
-    const RAM_GBS: usize = 1;
+    const RAM_GBS: usize = 2;
 
     const fn dram_block(addr: u64) -> u64 {
         addr | VALID | BLOCK | (0 << ATTR_IDX_SHIFT) | AP_RW | SH_INNER | AF | NG

@@ -6,7 +6,9 @@ pub mod gpio {
     //! Trades compile-time pin types for runtime handles using AnyPin.
     //! Allows full GPIO configuration from config without hard-coded pin types.
 
-    use portable_atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU8, Ordering};
+    use portable_atomic::{AtomicBool, AtomicI32, AtomicU16, AtomicU32, AtomicU8, Ordering};
+
+    use crate::kernel::exec::scheduler::{ModuleId, NO_MODULE};
 
     use crate::kernel::sys::errno;
 
@@ -92,14 +94,15 @@ pub mod gpio {
     /// Owner module index for each pin (0xFF = kernel/unowned).
     /// Set by syscall entry points when a module claims a pin.
     /// Kernel-claimed pins (via init_from_config) keep the default 0xFF.
-    const OWNER_KERNEL: u8 = 0xFF;
-    static OWNER: [AtomicU8; MAX_GPIO] = [const { AtomicU8::new(OWNER_KERNEL) }; MAX_GPIO];
+    const OWNER_KERNEL: ModuleId = NO_MODULE;
+    static OWNER: [AtomicU16; MAX_GPIO] = [const { AtomicU16::new(OWNER_KERNEL) }; MAX_GPIO];
 
     /// Intended owner for each pin (set by init_from_config, consumed at module instantiation).
     /// 0xFF = kernel-owned (no handoff), 0-7 = module index to grant to.
     /// This is a staging area: init_from_config stores the intended owner here,
     /// and grant_pending_pins() transfers ownership when the module is instantiated.
-    static PENDING_OWNER: [AtomicU8; MAX_GPIO] = [const { AtomicU8::new(OWNER_KERNEL) }; MAX_GPIO];
+    static PENDING_OWNER: [AtomicU16; MAX_GPIO] =
+        [const { AtomicU16::new(OWNER_KERNEL) }; MAX_GPIO];
 
     /// GPIO slots — one per pin.
     ///
@@ -190,7 +193,7 @@ pub mod gpio {
 
     /// Set the owner module for a GPIO pin.
     /// Called from syscall entry points after a successful claim.
-    pub fn gpio_set_owner(pin_num: u8, owner: u8) {
+    pub fn gpio_set_owner(pin_num: u8, owner: ModuleId) {
         if (pin_num as usize) < MAX_GPIO {
             OWNER[pin_num as usize].store(owner, Ordering::Release);
         }
@@ -199,7 +202,7 @@ pub mod gpio {
     /// Check if the current module owns the given GPIO handle.
     ///
     /// Returns true if:
-    ///   - the pin is kernel-owned (owner == 0xFF) — allows kernel internal use
+    ///   - the pin is kernel-owned (owner == NO_MODULE) — allows kernel internal use
     ///   - the pin is owned by the currently executing module
     ///
     /// Returns false otherwise (another module owns this pin).
@@ -208,13 +211,12 @@ pub mod gpio {
             return false;
         }
         let owner = OWNER[handle as usize].load(Ordering::Acquire);
-        owner == OWNER_KERNEL
-            || owner == crate::kernel::exec::scheduler::current_module_index() as u8
+        owner == OWNER_KERNEL || owner == crate::kernel::exec::scheduler::current_module_id()
     }
 
     /// Release all GPIO pins owned by a specific module.
     /// Called on module termination to prevent resource leaks.
-    pub fn release_owned_by(module_idx: u8) {
+    pub fn release_owned_by(module_idx: ModuleId) {
         for i in 0..MAX_GPIO {
             if OWNER[i].load(Ordering::Acquire) == module_idx && CLAIMED[i].load(Ordering::Acquire)
             {
@@ -245,7 +247,7 @@ pub mod gpio {
     ///
     /// After this, the module owns the pin and can use it without calling GPIO::CLAIM.
     /// The pin was already configured (direction, pull, initial level) by init_from_config().
-    pub fn grant_pending_pins(module_idx: u8) {
+    pub fn grant_pending_pins(module_idx: ModuleId) {
         for pin in 0..MAX_GPIO {
             let pending = PENDING_OWNER[pin].load(Ordering::Acquire);
             if pending == module_idx && CLAIMED[pin].load(Ordering::Acquire) {
@@ -675,7 +677,7 @@ pub mod gpio {
     ///
     /// Claims the pin, sets up mode/pull/level, and records intended owner.
     /// The pin is initially kernel-owned (owner=0xFF). If config specifies
-    /// owner_module_id != 0xFF, that value is stored in PENDING_OWNER and
+    /// owner_module_id != NO_MODULE, that value is stored in PENDING_OWNER and
     /// grant_pending_pins() will transfer ownership when the module instantiates.
     ///
     /// Returns handle on success, <0 on error.

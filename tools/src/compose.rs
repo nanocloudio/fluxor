@@ -110,10 +110,10 @@ pub fn capacity_for_profile(profile: &str) -> Option<NodeCapacity> {
             // admit a graph the kernel has no slots for.
             max_modules: crate::capacity::kernel_max_modules(profile) as u16,
             max_edges: crate::capacity::kernel_max_edges(profile) as u16,
-            state_bytes: 256 * 1024 * 1024, // profile_host STATE_ARENA_SIZE
-            buffer_bytes: 16 * 1024 * 1024, // profile_host BUFFER_ARENA_SIZE
-            max_endpoints: 64,              // agent admission policy
-            max_domains: 4,                 // scheduler MAX_DOMAINS
+            state_bytes: crate::capacity::HOST_STATE_ARENA as u32,
+            buffer_bytes: crate::capacity::HOST_BUFFER_ARENA as u32,
+            max_endpoints: 64, // agent admission policy
+            max_domains: 4,    // scheduler MAX_DOMAINS
         }),
         // MCU silicon. Without a capacity row here, composition has no model
         // for an RP target: a graph is admitted blind and discovers its
@@ -1915,12 +1915,41 @@ mod tests {
         assert_eq!(cap.max_modules as u64, extract(&sdk, "MAX_MODULES"));
         assert_eq!(cap.state_bytes as u64, extract(&sdk, "STATE_ARENA_SIZE"));
         assert_eq!(cap.buffer_bytes as u64, extract(&sdk, "BUFFER_ARENA_SIZE"));
+        // The pool caps the composer enforces come from the same constants,
+        // and wasm's are its own profile's, not the host's.
+        use crate::capacity::kernel_pool_static_cap as pool;
+        assert_eq!(
+            pool("linux", "state_arena"),
+            Some(extract(&sdk, "STATE_ARENA_SIZE"))
+        );
+        assert_eq!(
+            pool("linux", "buffer_arena"),
+            Some(extract(&sdk, "BUFFER_ARENA_SIZE"))
+        );
+        assert_eq!(
+            pool("wasm", "state_arena"),
+            Some(extract_nth(&sdk, "STATE_ARENA_SIZE", 2))
+        );
+        assert_eq!(
+            pool("wasm", "buffer_arena"),
+            Some(extract_nth(&sdk, "BUFFER_ARENA_SIZE", 2))
+        );
         assert_eq!(cap.max_edges as u64, extract(&kcfg, "HOST_GRAPH_EDGES"));
         assert_eq!(
             crate::capacity::kernel_max_edges("rp2350") as u64,
             extract(&kcfg, "SMALL_GRAPH_EDGES")
         );
         assert_eq!(cap.max_domains as u64, extract(&sched, "MAX_DOMAINS"));
+        // The subgraph caps the workload encoder refuses past.
+        let live = read("src/kernel/exec/scheduler/live.rs");
+        assert_eq!(
+            crate::add_subgraph::MAX_ADD_MODULES as u64,
+            extract(&live, "MAX_ADD_MODULES")
+        );
+        assert_eq!(
+            crate::add_subgraph::MAX_ADD_EDGES as u64,
+            extract(&live, "MAX_ADD_EDGES")
+        );
         // pi5/bcm2712 alias the same aarch64 profile.
         for alias in ["pi5", "bcm2712"] {
             let c = capacity_for_profile(alias).expect(alias);

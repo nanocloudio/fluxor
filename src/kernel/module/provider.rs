@@ -46,6 +46,7 @@
 //! routed handle that names its minting provider, so its handle-bound ops
 //! reach that provider however the default layer changes (see `Route`).
 
+use crate::kernel::exec::scheduler::{ModuleId, NO_MODULE};
 use crate::kernel::ipc::fd;
 use crate::kernel::sys::errno;
 
@@ -827,7 +828,7 @@ pub const CHAIN_NEXT: u32 = 0x0001_0000;
 
 /// A single layer in a provider chain.
 struct ProviderLayer {
-    module_idx: u8,
+    module_idx: ModuleId,
     dispatch: ModuleProviderDispatchFn,
     state: *mut u8,
     /// Instance selector (FNV-1a hash of a short volume/instance string,
@@ -913,7 +914,7 @@ fn is_module_providable(contract: ContractId) -> bool {
 /// chain is full.
 pub fn register_module_provider(
     contract: ContractId,
-    module_idx: u8,
+    module_idx: ModuleId,
     dispatch: ModuleProviderDispatchFn,
     state: *mut u8,
     selector: u32,
@@ -1056,7 +1057,7 @@ pub fn reset_module_layers() {
 /// Release all module providers owned by a given module index.
 /// Called on module finish (Done/Error) for cleanup.
 /// Compacts chains to maintain stack ordering.
-pub fn release_module_providers(module_idx: u8) {
+pub fn release_module_providers(module_idx: ModuleId) {
     // A freed slot must not stay subscribed: the slot is reused, and the next
     // module to land in it would inherit a subscription it never asked for.
     clear_owner_release_observer(module_idx);
@@ -1127,7 +1128,7 @@ static mut OWNER_RELEASE_OBSERVERS: crate::kernel::workload::bitmask::ModuleMask
 /// Mark `module_idx` as an owner-release observer. Called by the loader after
 /// the module's provider registration succeeds; a module that is not a
 /// registered provider has no dispatch to notify, so it is refused.
-pub fn register_owner_release_observer(module_idx: u8) -> i32 {
+pub fn register_owner_release_observer(module_idx: ModuleId) -> i32 {
     let idx = module_idx as usize;
     if idx >= crate::kernel::boot::config::MAX_MODULES {
         return errno::EINVAL;
@@ -1150,7 +1151,7 @@ pub fn register_owner_release_observer(module_idx: u8) -> i32 {
 /// Drop `module_idx` from the observer set. Called alongside
 /// `release_module_providers` so a freed slot cannot be notified, and a later
 /// module reusing the slot does not inherit the subscription.
-pub fn clear_owner_release_observer(module_idx: u8) {
+pub fn clear_owner_release_observer(module_idx: ModuleId) {
     let idx = module_idx as usize;
     if idx >= crate::kernel::boot::config::MAX_MODULES {
         return;
@@ -1163,7 +1164,7 @@ pub fn clear_owner_release_observer(module_idx: u8) {
 }
 
 /// Whether `module_idx` holds at least one registered provider layer.
-fn module_has_provider_layer(module_idx: u8) -> bool {
+fn module_has_provider_layer(module_idx: ModuleId) -> bool {
     module_dispatch_entry(module_idx).is_some()
 }
 
@@ -1237,7 +1238,7 @@ pub fn notify_owner_released(owner: crate::kernel::workload::owner::OwnerHandle)
         // Re-resolve per module, in a borrow that ends before the call. If an
         // earlier handler tore this one's layer out, it is simply skipped —
         // there is nothing left to notify.
-        let Some((dispatch, state)) = module_dispatch_entry(midx as u8) else {
+        let Some((dispatch, state)) = module_dispatch_entry(midx as ModuleId) else {
             continue;
         };
         // A fresh record per handler: one provider scribbling on the buffer
@@ -1262,7 +1263,7 @@ pub fn notify_owner_released(owner: crate::kernel::workload::owner::OwnerHandle)
 /// The first registered `(dispatch, state)` pair for `module_idx`, or `None`
 /// when it holds no provider layer. The borrow of `PROVIDERS` ends with the
 /// call, so the caller may safely run module code with the result.
-fn module_dispatch_entry(module_idx: u8) -> Option<(ModuleProviderDispatchFn, *mut u8)> {
+fn module_dispatch_entry(module_idx: ModuleId) -> Option<(ModuleProviderDispatchFn, *mut u8)> {
     // SAFETY: scheduler-thread read; nothing here calls into module code.
     unsafe {
         let p = &raw const PROVIDERS;
@@ -1380,7 +1381,7 @@ pub unsafe fn dispatch(
 /// # Safety
 /// Same requirements as `dispatch`.
 pub unsafe fn dispatch_next(
-    caller_module: u8,
+    caller_module: ModuleId,
     contract: ContractId,
     handle: i32,
     opcode: u32,
@@ -1613,13 +1614,13 @@ const MAX_ROUTES: usize = 128;
 const _: () = assert!(MAX_ROUTES <= 1 << ROUTE_IDX_BITS);
 
 /// `module_idx` of a route whose owner is the platform provider.
-const ROUTE_PLATFORM: u8 = u8::MAX;
+const ROUTE_PLATFORM: ModuleId = NO_MODULE;
 
 /// Which provider serves a selector.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Target {
     Platform,
-    Module(u8),
+    Module(ModuleId),
 }
 
 /// One routed handle.
@@ -1631,10 +1632,10 @@ struct Route {
     /// platform).
     selector: u32,
     /// Owning layer's module index, or [`ROUTE_PLATFORM`].
-    module_idx: u8,
+    module_idx: ModuleId,
     /// Module that was running when the handle was minted: its handles are
     /// closed when it is released.
-    minter: u8,
+    minter: ModuleId,
     generation: u16,
     /// The handle as the owning provider minted it.
     inner: i32,
@@ -1795,14 +1796,9 @@ fn mint_route(contract: ContractId, selector: u32, target: Target, rc: i32) -> i
     if rc_slot & ROUTED_SLOT_BIT != 0 {
         return rc;
     }
-    let minter = {
-        let m = crate::kernel::exec::scheduler::current_module_index();
-        if m < ROUTE_PLATFORM as usize {
-            m as u8
-        } else {
-            ROUTE_PLATFORM
-        }
-    };
+    // A handle minted in kernel context has no module minter: the
+    // platform's sentinel, which nothing releases.
+    let minter = crate::kernel::exec::scheduler::current_module_id();
     // SAFETY: scheduler-thread mutation; no module code runs in this block.
     let claimed = unsafe {
         let p = &raw mut ROUTES;
@@ -1903,7 +1899,7 @@ fn retire_route(idx: usize, generation: u16) {
 /// owner is gone names nothing and is dropped. A route the departing module
 /// minted on a provider that stays is closed there, so the provider does not
 /// hold the file open for a consumer that no longer exists.
-fn release_routes_of(module_idx: u8) {
+fn release_routes_of(module_idx: ModuleId) {
     // The platform's sentinel is not a module: nothing releases it.
     if module_idx == ROUTE_PLATFORM {
         return;
