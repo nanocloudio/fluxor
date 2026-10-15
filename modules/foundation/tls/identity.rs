@@ -59,6 +59,10 @@ struct LabelIdentity {
     refused: u32,
     /// Handshakes refused because no certificate was held yet.
     early: u32,
+    /// `trust_issuer`: the held chain's issuer is also a trust anchor.
+    trust_issuer: u8,
+    /// Anchors the graph configured; an adopted issuer sits after them.
+    static_anchors: u8,
     inbox: [u8; MAX_CERT_CHAIN_BYTES],
 }
 
@@ -187,6 +191,12 @@ unsafe fn identity_take_chain(s: &mut TlsState, now: u64) -> bool {
         dev_log(sys, 1, msg.as_ptr(), msg.len());
         return true;
     }
+    if s.label_id.trust_issuer != 0 && !identity_adopt_issuer(s, pl) {
+        s.label_id.refused = s.label_id.refused.wrapping_add(1);
+        let msg = b"[tls] identity: dropped a chain whose issuer cannot be an anchor";
+        dev_log(sys, 1, msg.as_ptr(), msg.len());
+        return true;
+    }
     core::ptr::copy_nonoverlapping(s.label_id.inbox.as_ptr(), s.cert.as_mut_ptr(), pl);
     s.cert_len = pl;
     s.label_id.state = ID_CERTIFIED;
@@ -205,6 +215,40 @@ unsafe fn identity_take_chain(s: &mut TlsState, now: u64) -> bool {
     w += fmt_u32_raw(l.add(w), (lifetime * 2 / 3).min(u32::MAX as u64) as u32);
     w = id_put(l, w, b" s");
     dev_log(sys, 3, l, w);
+    true
+}
+
+/// `trust_issuer`: make the last certificate of the chain in the inbox (its
+/// issuer) the trust anchor after the configured ones, replacing one an
+/// earlier chain adopted. An authority minted at runtime — a node's own —
+/// is what the instance's peers chain to, and the graph could not name it.
+/// False, and nothing changed, when the chain has no issuer that parses.
+unsafe fn identity_adopt_issuer(s: &mut TlsState, pl: usize) -> bool {
+    let chain = core::slice::from_raw_parts(s.label_id.inbox.as_ptr(), pl);
+    let (mut pos, mut last, mut count) = (0usize, (0usize, 0usize), 0u32);
+    while pos < pl {
+        let Some((_, _, total)) = der_tlv(chain, pos) else {
+            return false;
+        };
+        if total == 0 || pos + total > pl {
+            return false;
+        }
+        last = (pos, total);
+        count += 1;
+        pos += total;
+    }
+    let (at, len) = last;
+    let base = s.label_id.static_anchors as usize;
+    if count < 2 || len > MAX_CERT_LEN || base >= MAX_ANCHORS {
+        return false;
+    }
+    let issuer = core::slice::from_raw_parts(chain.as_ptr().add(at), len);
+    if parse_certificate(issuer).is_none() {
+        return false;
+    }
+    core::ptr::copy_nonoverlapping(issuer.as_ptr(), s.anchors[base].as_mut_ptr(), len);
+    s.anchor_lens[base] = len as u16;
+    s.anchor_count = (base + 1) as u8;
     true
 }
 
@@ -267,6 +311,9 @@ unsafe fn identity_admit(s: &mut TlsState) -> Option<&'static [u8]> {
         return Some(b"[tls] refusing to construct: identity_label exceeds 64 bytes");
     }
     if !s.label_id.configured() {
+        if s.label_id.trust_issuer != 0 {
+            return Some(b"[tls] refusing to construct: trust_issuer takes its authority from an identity_label chain, and there is none");
+        }
         return None;
     }
     if s.cert_len > 0 || s.key_len > 0 {
@@ -279,6 +326,13 @@ unsafe fn identity_admit(s: &mut TlsState) -> Option<&'static [u8]> {
     if s.identity_cert_in < 0 || s.identity_req_out < 0 {
         return Some(b"[tls] refusing to construct: identity_label needs identity_req and identity_cert wired to an issuer");
     }
+    if s.label_id.trust_issuer != 0
+        && s.peer_auth != PROFILE_CA_DNS
+        && s.peer_auth != PROFILE_CA_URI
+    {
+        return Some(b"[tls] refusing to construct: trust_issuer adopts an authority, and only a CA profile (ca_dns, ca_uri) verifies chains against one");
+    }
+    s.label_id.static_anchors = s.anchor_count;
     s.label_id.state = ID_OPENING;
     s.label_id.next_at = 0;
     None

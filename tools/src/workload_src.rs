@@ -664,7 +664,15 @@ impl RunParams {
 /// `fluxor sync` would). `fluxor exec` is the applet form, see
 /// [`exec_applet`].
 pub fn run_bundle(path: &Path, params: &RunParams, ca: Option<&Path>, verbose: bool) -> Result<()> {
-    launch_bundle(path, &[], None, None, ca, params, verbose)
+    launch_bundle(
+        path,
+        &[],
+        None,
+        None,
+        Operator { ca, identity: None },
+        params,
+        verbose,
+    )
 }
 
 /// The directory of the bundle `fluxor.lock` pins under `name`, or a refusal
@@ -739,6 +747,64 @@ pub fn write_widened_config(config_bin: &Path, out: &Path, pem: &Path) -> Result
     Ok(())
 }
 
+/// What the operator brings to one run, beside the bundle: trust anchors to
+/// widen client instances with (`--ca`), and a client identity (`--identity`).
+#[derive(Clone, Copy)]
+struct Operator<'a> {
+    ca: Option<&'a Path>,
+    identity: Option<&'a (PathBuf, PathBuf)>,
+}
+
+/// The operator identity a run of applet `name` brings: `CERT,KEY` when
+/// given, else `$HOME/.config/<name>/client.der` + `client.key.der` when
+/// both exist, else none.
+fn operator_identity(name: &str, given: Option<&str>) -> Result<Option<(PathBuf, PathBuf)>> {
+    if let Some(spec) = given {
+        let (cert, key) = spec.split_once(',').ok_or_else(|| {
+            Error::Config(format!(
+                "--identity takes CERT,KEY (DER files), got '{spec}'"
+            ))
+        })?;
+        return Ok(Some((PathBuf::from(cert), PathBuf::from(key))));
+    }
+    let Some(home) = std::env::var_os("HOME") else {
+        return Ok(None);
+    };
+    let dir = PathBuf::from(home).join(".config").join(name);
+    let (cert, key) = (dir.join("client.der"), dir.join("client.key.der"));
+    Ok((cert.is_file() && key.is_file()).then_some((cert, key)))
+}
+
+/// Write `config_bin` to `out` with the operator's identity given to every
+/// client-mode tls instance that names none, and say so when asked.
+fn write_identity_config(
+    config_bin: &Path,
+    out: &Path,
+    cert: &Path,
+    key: &Path,
+    verbose: bool,
+) -> Result<()> {
+    let read = |p: &Path| {
+        std::fs::read(p).map_err(|e| {
+            Error::Config(format!("--identity: could not read '{}': {e}", p.display()))
+        })
+    };
+    let (cert_der, key_der) = (read(cert)?, read(key)?);
+    let blob = std::fs::read(config_bin)?;
+    let (given, report) =
+        crate::trust_anchors::append_operator_identity(&blob, &cert_der, &key_der)
+            .map_err(|e| Error::Config(format!("--identity: {e}")))?;
+    std::fs::write(out, &given)?;
+    if verbose {
+        eprintln!(
+            "  --identity: '{}' given to {} client instance(s)",
+            cert.display(),
+            report.instances.len()
+        );
+    }
+    Ok(())
+}
+
 /// Where an applet's runtime binary lives relative to the project that
 /// built its bundle. Recorded in the catalogue at install time so `exec`
 /// runs the runtime the bundle was built against, wherever it is invoked.
@@ -802,11 +868,12 @@ fn launch_bundle(
     app_args: &[String],
     runtime: Option<&Path>,
     applet: Option<&str>,
-    ca: Option<&Path>,
+    operator: Operator<'_>,
     params: &RunParams,
     verbose: bool,
 ) -> Result<()> {
     use fluxor_tools::workload::select_implementation;
+    let Operator { ca, identity } = operator;
 
     // A source manifest builds first; running is then resolving the fresh
     // bundle it emitted. Its values are checked before that build.
@@ -866,7 +933,7 @@ fn launch_bundle(
     // Scratch holds what this launch writes: a rendered graph and its blobs,
     // a widened config. Parameter values reach all of them, so the directory
     // is private and goes away on every exit path.
-    let scratch = if !prebuilt || ca.is_some() {
+    let scratch = if !prebuilt || ca.is_some() || identity.is_some() {
         Some(Scratch::create(&project_root, &manifest.name)?)
     } else {
         None
@@ -945,6 +1012,12 @@ fn launch_bundle(
         let widened = scratch.dir.join("config.operator.bin");
         write_widened_config(&config_bin, &widened, pem)?;
         config_bin = widened;
+    }
+    // The operator's identity is given the same way: to this run's copy.
+    if let (Some((cert, key)), Some(scratch)) = (identity, &scratch) {
+        let given = scratch.dir.join("config.identity.bin");
+        write_identity_config(&config_bin, &given, cert, key, verbose)?;
+        config_bin = given;
     }
     // A recorded runtime is the one this bundle's modules were packed
     // against. If it has gone, say so and name it: running the bundle
@@ -1203,7 +1276,15 @@ pub fn install_applet(
 /// project (`target/fluxor/<name>/`), else an error listing the applets
 /// that ARE known. No compilation on the hot path: the cached bundle
 /// execs as-is.
-pub fn exec_applet(name: &str, args: &[String], ca: Option<&Path>, verbose: bool) -> Result<()> {
+pub fn exec_applet(
+    name: &str,
+    args: &[String],
+    ca: Option<&Path>,
+    identity: Option<&str>,
+    verbose: bool,
+) -> Result<()> {
+    let identity = operator_identity(name, identity)?;
+    let identity = identity.as_ref();
     let reg = load_registry()?;
     if let Some(entry) = reg.get(name) {
         if entry.bundle.join("workload.json").is_file() {
@@ -1212,7 +1293,7 @@ pub fn exec_applet(name: &str, args: &[String], ca: Option<&Path>, verbose: bool
                 args,
                 entry.runtime.as_deref(),
                 Some(name),
-                ca,
+                Operator { ca, identity },
                 &RunParams::default(),
                 verbose,
             );
@@ -1232,7 +1313,7 @@ pub fn exec_applet(name: &str, args: &[String], ca: Option<&Path>, verbose: bool
             args,
             None,
             Some(name),
-            ca,
+            Operator { ca, identity },
             &RunParams::default(),
             verbose,
         );

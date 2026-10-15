@@ -1340,6 +1340,13 @@ define_params! {
     // answer to `identity_req`. Replaces `cert_file` / `key_file`.
     19, identity_label, str, 0
         => |s, d, len| { s.label_id.set_label(core::slice::from_raw_parts(d, len)); };
+
+    // With `identity_label`: the issuer of the chain the instance is
+    // certified with (its last certificate) is also a trust anchor — the
+    // authority its peers chain to, minted at runtime where the graph could
+    // not name it. Re-adopted on every renewal. Requires a CA profile.
+    20, trust_issuer, u8, 0
+        => |s, d, len| { s.label_id.trust_issuer = p_u8(d, len, 0, 0); };
 }
 
 // ============================================================================
@@ -3205,7 +3212,12 @@ fn peer_auth_admissible(s: &TlsState) -> bool {
     // anchors HERE: the platform holds them and answers about them. Counting
     // this instance's empty table would refuse the one configuration that
     // most certainly has trust material behind it.
-    let has_trust = s.anchor_count > 0 || s.trust_system;
+    // An authority adopted from the instance's own certified chain
+    // (`trust_issuer`) is trust that arrives at runtime: until it does, a
+    // chain verifies against nothing and the handshake fails closed.
+    let has_trust = s.anchor_count > 0
+        || s.trust_system
+        || (s.label_id.trust_issuer != 0 && s.label_id.configured());
     match s.peer_auth {
         // Pinning is a statement about a specific key, which is this
         // module's to hold and not the platform's to answer.
@@ -3538,6 +3550,37 @@ unsafe fn bind_peer_cert_key(driver: &mut HandshakeDriver, hs_body: &[u8]) -> u3
     bind_peer_cert_key_core(driver, cert_der)
 }
 
+// A peer's reported principal is bounded by the contract's MAX_PRINCIPAL.
+const _: () = assert!(PEER_PRINCIPAL_MAX == abi::contracts::net::peer_identity::MAX_PRINCIPAL);
+
+/// Under `ca_uri`, after the chain was accepted: the leaf's URI SAN that
+/// satisfied `verify_uri` (`expected`), as the session's principal. The
+/// policy has just matched one; this reads it back from the same
+/// certificate. Length 0 when none fits the report.
+fn verified_principal(expected: &[u8], hs_body: &[u8]) -> ([u8; PEER_PRINCIPAL_MAX], u8) {
+    let mut out = [0u8; PEER_PRINCIPAL_MAX];
+    let mut len = 0u8;
+    if expected.is_empty() {
+        return (out, 0);
+    }
+    let Some(leaf) = parse_certificate_msg(hs_body) else {
+        return (out, 0);
+    };
+    let Some(cert) = parse_certificate(leaf) else {
+        return (out, 0);
+    };
+    cert.san_uris(leaf, &mut |uri| {
+        let hit = uri_matches(expected, uri);
+        if hit && uri.len() <= PEER_PRINCIPAL_MAX {
+            // SAFETY: `uri.len() <= PEER_PRINCIPAL_MAX`, the size of `out`.
+            unsafe { core::ptr::copy_nonoverlapping(uri.as_ptr(), out.as_mut_ptr(), uri.len()) };
+            len = uri.len() as u8;
+        }
+        hit
+    });
+    (out, len)
+}
+
 /// TCP-TLS adapter: validate, bind, and report. Returns false when the peer
 /// is refused, leaving the session for the caller to fail.
 unsafe fn session_verify_peer_cert(s: &mut TlsState, idx: usize, hs_body: &[u8]) -> bool {
@@ -3570,6 +3613,11 @@ unsafe fn session_verify_peer_cert(s: &mut TlsState, idx: usize, hs_body: &[u8])
     s.sessions[idx].driver.chain_by_platform = by_platform;
     if rc == CERT_OK {
         rc = bind_peer_cert_key(&mut s.sessions[idx].driver, hs_body);
+    }
+    if rc == CERT_OK && s.peer_auth == PROFILE_CA_URI {
+        let (p, n) = verified_principal(&s.expected_uri[..s.expected_uri_len], hs_body);
+        s.sessions[idx].driver.peer_principal = p;
+        s.sessions[idx].driver.peer_principal_len = n;
     }
     if rc != CERT_OK {
         let conn_id = s.sessions[idx].conn_id;
@@ -5773,13 +5821,25 @@ unsafe fn emit_peer_identity(s: &mut TlsState, idx: usize) {
         (peer_result::OK, peer_credential::X509_MTLS, f)
     };
 
-    // No principal yet: emitting a name means having matched a SAN against
-    // the configured profile, and this module's server path applies no name
-    // rule to a client (an mTLS client is identified by its issuer, not by a
-    // hostname it does not serve). `build_peer_identity_envelope` enforces
-    // that anyway — it drops a principal unless SAN was checked — so this is
-    // the honest input rather than a value the formatter would discard.
-    let principal: &[u8] = &[];
+    // The principal is a name this handshake matched against the profile:
+    // under `ca_uri`, the leaf's URI SAN that satisfied `verify_uri`, with
+    // the SAN flag saying that check ran. Every other profile reports none:
+    // `ca_dns` matches the dialled host, which the consumer already knows,
+    // and a client is identified by its issuer, not by a hostname it does
+    // not serve. `build_peer_identity_envelope` drops a principal unless
+    // SAN was checked, so this is the honest input rather than a value the
+    // formatter would discard.
+    let pl = s.sessions[idx].driver.peer_principal_len as usize;
+    let principal: &[u8] = if pk_len > 0 && pl > 0 {
+        &s.sessions[idx].driver.peer_principal[..pl]
+    } else {
+        &[]
+    };
+    let flags = if principal.is_empty() {
+        flags
+    } else {
+        flags | peer_check::SAN
+    };
 
     let identity = PeerIdentity {
         session_id: u32::from(s.sessions[idx].conn_id)

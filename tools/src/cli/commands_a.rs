@@ -638,17 +638,17 @@ fn check_state_budget(
 
 /// The largest config blob the target's kernel parses — the mirror of
 /// `kernel::boot::config::MAX_CONFIG_SIZE`, which is keyed on the compile
-/// target: 256 KiB on Linux, wasm32 and aarch64 (bcm2712), 32 KiB on the
+/// target: 512 KiB on Linux, wasm32 and aarch64 (bcm2712), 32 KiB on the
 /// microcontrollers. A config past it is refused at boot before the logger
 /// runs, so a board would halt without saying why; refuse it here, by name.
 fn kernel_max_config_size(target: &crate::target::TargetDescriptor) -> usize {
     // A target with no kernel build of its own is hosted (Linux, wasm).
     let Some(build) = target.build.as_ref() else {
-        return 256 * 1024;
+        return 512 * 1024;
     };
     let t = build.rust_target.as_str();
     if t.starts_with("aarch64") || t.contains("linux") || t.starts_with("wasm32") {
-        256 * 1024
+        512 * 1024
     } else {
         32 * 1024
     }

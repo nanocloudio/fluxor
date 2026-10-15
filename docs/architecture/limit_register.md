@@ -122,7 +122,7 @@ CAPACITY >= PSTATUS_ROUND | src/kernel/sys/telemetry_ring.rs
 | Instrument dimension cardinality | `DIM_MAX_PRODUCT` | modules/sdk/contracts/telemetry.rs | 65534 | Policy: the product of one instrument's declared dimension domains, enforced at build so every composite index stays below the reserved `DIM_OTHER` (`0xFFFF`). Cardinality is a declared resource bound — an instrument that would exceed it shrinks a domain rather than discovering the ceiling at runtime |
 | Single module code segment | `MAX_MODULE_CODE_SIZE` | modules/sdk/abi/config.rs | 1048576 | Sanity bound: catches a corrupt or runaway blob, not a budget; 393216 on RP2040. Code runs in place from flash on RP parts, so it is set by the part's flash; `module_code_kb` in the silicon TOML mirrors it and the packer refuses a module over it |
 | Whole modules blob | `MAX_MODULES_BLOB_SIZE` | src/kernel/module/loader.rs | 8388608 | Sanity bound: a boot-image module table past this is refused at load |
-| Boot config blob | `MAX_CONFIG_SIZE` | src/kernel/boot/config.rs | 262144 | Sanity bound on the packed config: 256 KiB on linux, wasm and bcm2712, 32 KiB on the RP parts; an oversize blob is refused as `TooLarge`, and the CLI refuses to build one (`kernel_max_config_size`) |
+| Boot config blob | `MAX_CONFIG_SIZE` | src/kernel/boot/config.rs | 524288 | Sanity bound on the packed config: 512 KiB on linux, wasm and bcm2712 (a Kubernetes control plane as Chronicle params is ~270 KiB), 32 KiB on the RP parts; an oversize blob is refused as `TooLarge`, and the CLI refuses to build one (`kernel_max_config_size`) |
 | OTA staging area (per A/B stage) | `STAGE_CAPACITY` | src/kernel/module/ota_stage.rs | 8388608 | Policy: a graph image larger than one stage is refused ENOSPC at stage write |
 | Module state arena | `STATE_ARENA_SIZE` | modules/sdk/abi/config.rs | 268435456 | Policy: it must hold every module of the busiest graph at once, with headroom. The media-app host graph peaks at 64 MiB; the `ip` connection table holds its first 512 records inline (~1.1 MiB) and backs the rest from the elastic region, so no single module approaches the arena. 240 KiB on rp2350 and 64 KiB on rp2040, from the silicon TOML, where the whole envelope is different. Zero-initialised, so it costs kernel `.bss`, not image size. Exhaustion is refused at module load, not at the allocation that overruns |
 | Single channel ring | `MAX_CHAN_BYTES` | src/kernel/ipc/channel.rs | 4194304 | Sanity bound on one ring's share of the buffer arena |
@@ -284,7 +284,7 @@ cannot be evaluated from its own file reads `—` and says why.
 | Tier B elastic region | `ELASTIC_REGION_SIZE` | modules/sdk/abi/config.rs | 16777216 | Policy: the oversubscribable region every elastic pool draws 64 KiB-quantum chunks from; 128 chunks on the host, which is the same depth as the kernel's chunk table. Zero on MCU-class targets, where `ELASTIC_ALLOC` denies and elasticity compiles out 2 MiB on wasm. |
 | Config arena | `CONFIG_ARENA_SIZE` | modules/sdk/abi/config.rs | 262144 | Sized against the largest per-module params section (~95 KiB for an http module on the host) with headroom for the rest of the graph. A packed config larger than this is refused at boot 32 KiB on wasm, 16 KiB on embedded. |
 | One module's params section | `MAX_MODULE_CONFIG_SIZE` | modules/sdk/abi/config.rs | 262144 | Sanity bound on one module's slice of the config arena; kept in lockstep with the kernel's `MAX_MODULE_SECTION` and the CLI's params cap so the three refuse the same blob. 16 KiB on wasm; on the RP parts 16 KiB (rp2350) and 8 KiB (rp2040), taken from `[kernel] config_buffer_kb` in the silicon TOML, which the RP kernels generate their own copy from — the two must state the same size |
-| Kernel module-section bound | `MAX_MODULE_SECTION` | src/kernel/boot/config.rs | 262144 | The kernel-side bound on the module section: 256 KiB on linux, wasm and bcm2712, 32 KiB on the RP parts. A section past it is refused while parsing, before any module is instantiated. Registered separately from `MAX_MODULE_CONFIG_SIZE`, the per-module cap it must hold, so the pair cannot drift apart unnoticed |
+| Kernel module-section bound | `MAX_MODULE_SECTION` | src/kernel/boot/config.rs | 524288 | The kernel-side bound on the module section: 512 KiB on linux, wasm and bcm2712 — the same as `MAX_CONFIG_SIZE`, since the section is nearly all of a large graph's config — 32 KiB on the RP parts. A section past it is refused while parsing, before any module is instantiated. Registered separately from `MAX_MODULE_CONFIG_SIZE`, the per-module cap it must hold, so the pair cannot drift apart unnoticed |
 | Store read slots | `STORE_MAX_READS` | src/platform/linux/store.rs | 32 | Policy: `GET`-opened read slots on the Linux store at once. A slot holds one value snapshot the caller drains by `RANGE_GET`, so the table bounds how many reads a node can have in flight; an open past it is `ENOMEM` |
 | Store streaming-write slots | `STORE_MAX_WRITES` | src/platform/linux/store.rs | 32 | Policy: `PUT_STREAMED_OPEN`-opened write slots at once, matched to `STORE_MAX_READS` and for the same reason — one slot per operation in flight. An S3 server fronting this store streams every object write, so writes need the depth reads have; an open past it is `ENOMEM` |
 | HTTP concurrent connections | `MAX_CONCURRENT_CONNS` | modules/sdk/abi/config.rs | 256 | Policy: the http module's own table, below `MAX_TCP_CONNS`; an accept past it is closed before any request is read. The embedded 4 is sized against the 8-slot TCP table in that profile; the one-session TLS table beneath it bounds HTTPS. 4 on embedded. |
@@ -425,7 +425,7 @@ MAX_MODULE_CODE_SIZE | modules/sdk/abi/config.rs | 1024 * 1024 | embedded+rp2350
 MAX_MODULE_CODE_SIZE | modules/sdk/abi/config.rs | 384 * 1024 | embedded+rp2040
 MAX_MODULES_BLOB_SIZE | src/kernel/module/loader.rs | 8 * 1024 * 1024 | *
 MAX_CONTRACTS_PER_PROVIDER | src/kernel/module/loader.rs | 4 | *
-MAX_CONFIG_SIZE | src/kernel/boot/config.rs | 256 * 1024 | large-config
+MAX_CONFIG_SIZE | src/kernel/boot/config.rs | 512 * 1024 | large-config
 MAX_CONFIG_SIZE | src/kernel/boot/config.rs | 32 * 1024 | small-config
 STAGE_CAPACITY | src/kernel/module/ota_stage.rs | 8 * 1024 * 1024 | *
 STATE_ARENA_SIZE | modules/sdk/abi/config.rs | 256 * 1024 * 1024 | host
@@ -612,7 +612,7 @@ MAX_MODULE_CONFIG_SIZE | modules/sdk/abi/config.rs | 256 * 1024 | host
 MAX_MODULE_CONFIG_SIZE | modules/sdk/abi/config.rs | 16 * 1024 | wasm
 MAX_MODULE_CONFIG_SIZE | modules/sdk/abi/config.rs | 16 * 1024 | embedded+rp2350
 MAX_MODULE_CONFIG_SIZE | modules/sdk/abi/config.rs | 8 * 1024 | embedded+rp2040
-MAX_MODULE_SECTION | src/kernel/boot/config.rs | 256 * 1024 | large-config
+MAX_MODULE_SECTION | src/kernel/boot/config.rs | 512 * 1024 | large-config
 MAX_MODULE_SECTION | src/kernel/boot/config.rs | 32 * 1024 | small-config
 MAX_CONCURRENT_CONNS | modules/sdk/abi/config.rs | 256 | host
 MAX_CONCURRENT_CONNS | modules/sdk/abi/config.rs | 256 | wasm

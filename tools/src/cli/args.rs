@@ -213,6 +213,14 @@ enum Commands {
         /// modified.
         #[arg(long, value_name = "PEM")]
         ca: Option<PathBuf>,
+        /// The operator's client identity for this run, `CERT,KEY` (DER
+        /// certificate chain, leaf first, and DER private key), given to
+        /// every CLIENT-MODE `tls` instance that names no identity of its
+        /// own. Without it, `$HOME/.config/<NAME>/client.der` and
+        /// `client.key.der` are used when both exist. A published applet
+        /// carries no operator credential; each run brings its operator's.
+        #[arg(long, value_name = "CERT,KEY")]
+        identity: Option<String>,
         /// App argv, after `--`.
         #[arg(last = true)]
         args: Vec<String>,

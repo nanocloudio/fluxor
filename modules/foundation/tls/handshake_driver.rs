@@ -56,6 +56,11 @@ pub const PEER_KEY_MAX: usize = suite::max_public_key_len(suite::RSA_4096);
 const _: () = assert!(HS_IN_BUF_SIZE >= SCRATCH_SIZE + HS_RECORD_PLAINTEXT_MAX);
 const _: () = assert!(HS_OUT_BUF_SIZE >= SCRATCH_SIZE);
 
+/// The longest principal a verified peer is reported under — the
+/// `peer_identity` contract's MAX_PRINCIPAL (tls asserts the two agree): a
+/// longer URI is verified but not reported, and so names no one.
+pub const PEER_PRINCIPAL_MAX: usize = 128;
+
 /// All record-agnostic TLS 1.3 handshake state.
 pub struct HandshakeDriver {
     pub hs_state: HandshakeState,
@@ -113,6 +118,10 @@ pub struct HandshakeDriver {
     /// VALIDITY check flag's to say).
     pub peer_cert_not_before: u64,
     pub peer_cert_not_after: u64,
+    /// Under `ca_uri`: the leaf's URI SAN that satisfied `verify_uri` — the
+    /// principal `peer_identity` reports (empty: none verified).
+    pub peer_principal: [u8; PEER_PRINCIPAL_MAX],
+    pub peer_principal_len: u8,
     /// The suite the peer's leaf key belongs to, which decides which
     /// CertificateVerify schemes it may sign with and how its bytes are read.
     pub peer_cert_key_suite: u16,
@@ -215,6 +224,8 @@ impl HandshakeDriver {
             peer_cert_pubkey_len: 0,
             peer_cert_not_before: 0,
             peer_cert_not_after: 0,
+            peer_principal: [0; PEER_PRINCIPAL_MAX],
+            peer_principal_len: 0,
             peer_cert_key_suite: suite::UNKNOWN,
             deferred_links: DeferredLinks::empty(),
             ecdsa_verify: EcdsaVerifyJob::empty(),
@@ -266,6 +277,7 @@ impl HandshakeDriver {
         self.peer_cert_pubkey_len = 0;
         self.peer_cert_not_before = 0;
         self.peer_cert_not_after = 0;
+        self.peer_principal_len = 0;
         self.peer_cert_key_suite = suite::UNKNOWN;
         self.deferred_links.clear();
         self.ecdsa_verify = EcdsaVerifyJob::empty();

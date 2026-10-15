@@ -383,6 +383,18 @@ pub fn build_params_from_schema(
                 continue;
             }
 
+            // A blob param's inline `{hex: …}` / `{bytes: […]}` entry is ONE
+            // value, not a group of params: kept whole, never flattened.
+            let is_blob = |name: &str| {
+                schema
+                    .name_map
+                    .get(name)
+                    .is_some_and(|&i| schema.params[i].ptype == ParamType::Blob)
+            };
+            if value.is_object() && is_blob(key) {
+                kv.insert(key.clone(), value.clone());
+                continue;
+            }
             if value.is_object() {
                 if let Some(inner_obj) = value.as_object() {
                     // `params: { ... }` is a transparent wrapper — its
@@ -1035,6 +1047,8 @@ fn resolve_preset_values(
 /// - Inline array of byte values: `[0x42, 0x4D, ...]`
 /// - String reference to data section entry with `hex:` field (hex string)
 /// - String reference to data section entry with `bytes:` field (byte array)
+/// - Inline mapping of the same shape: `{hex: "…"}` or `{bytes: […]}`
+/// - A file: `${file:<path>}`
 fn resolve_preset_blob(
     preset_ref: &Value,
     data_section: Option<&Value>,
@@ -1045,6 +1059,14 @@ fn resolve_preset_blob(
             .iter()
             .filter_map(|v| v.as_u64().map(|n| n as u8))
             .collect());
+    }
+
+    // An inline entry, `{hex: "…"}` or `{bytes: […]}`: the same shape a
+    // `data:` entry has, given where the blob is used rather than named —
+    // so a param that is a program (a Chronicle decision, say) sits beside
+    // the line saying where it came from.
+    if preset_ref.is_object() {
+        return blob_entry_bytes(preset_ref, "inline blob");
     }
 
     // A file, by the same `${file:<path>}` spec a trust anchor is named by:
@@ -1058,28 +1080,31 @@ fn resolve_preset_blob(
 
     // String reference: look up in data section
     if let Some(name) = preset_ref.as_str() {
-        if let Some(data) = data_section {
-            if let Some(entry) = data.get(name) {
-                // Try hex string first
-                if let Some(hex_str) = entry.get("hex").and_then(|v| v.as_str()) {
-                    return decode_hex(hex_str).map_err(|e| format!("blob '{name}': {e}"));
-                }
-                // Try bytes array
-                if let Some(bytes_arr) = entry.get("bytes").and_then(|v| v.as_array()) {
-                    return Ok(bytes_arr
-                        .iter()
-                        .filter_map(|v| v.as_u64().map(|n| n as u8))
-                        .collect());
-                }
-                return Err(format!(
-                    "blob '{name}' in data section has no 'hex' or 'bytes' field"
-                ));
-            }
+        if let Some(entry) = data_section.and_then(|data| data.get(name)) {
+            return blob_entry_bytes(entry, &format!("blob '{name}' in data section"));
         }
         return Err(format!("blob '{name}' not found in data section"));
     }
 
-    Err("blob preset must be a string name or array of byte values".into())
+    Err(
+        "blob preset must be a string name, an array of byte values, or a {hex}/{bytes} mapping"
+            .into(),
+    )
+}
+
+/// The bytes of one blob entry — a `data:` entry or an inline mapping:
+/// its `hex` string, or failing that its `bytes` array.
+fn blob_entry_bytes(entry: &Value, what: &str) -> Result<Vec<u8>, String> {
+    if let Some(hex_str) = entry.get("hex").and_then(|v| v.as_str()) {
+        return decode_hex(hex_str).map_err(|e| format!("{what}: {e}"));
+    }
+    if let Some(bytes_arr) = entry.get("bytes").and_then(|v| v.as_array()) {
+        return Ok(bytes_arr
+            .iter()
+            .filter_map(|v| v.as_u64().map(|n| n as u8))
+            .collect());
+    }
+    Err(format!("{what} has no 'hex' or 'bytes' field"))
 }
 
 /// Decode a hex string (with optional spaces) into bytes.
@@ -1633,6 +1658,80 @@ mod tests {
         assert_eq!(
             carried, bytes,
             "the module is handed the file's bytes, whole"
+        );
+    }
+
+    /// The bytes a blob param carried, chunks joined and the length header
+    /// checked.
+    fn carried_blob(entry: &[u8], end: usize, tag: u8) -> Vec<u8> {
+        let mut pos = 4; // the TLV header
+        let mut carried = Vec::new();
+        let mut total = None;
+        while pos + 2 <= end && entry[pos] == tag {
+            let length = entry[pos + 1] as usize;
+            let mut chunk = &entry[pos + 2..pos + 2 + length];
+            if total.is_none() {
+                total = Some(u16::from_le_bytes([chunk[0], chunk[1]]) as usize);
+                chunk = &chunk[2..];
+            }
+            carried.extend_from_slice(chunk);
+            pos += 2 + length;
+        }
+        assert_eq!(
+            total,
+            Some(carried.len()),
+            "the header states the whole length"
+        );
+        carried
+    }
+
+    /// An inline `{hex: …}` mapping — a data entry's shape, given in place —
+    /// is decoded and carried whole, past one chunk; `{bytes: […]}` too.
+    #[test]
+    fn a_blob_param_takes_an_inline_hex_or_bytes_entry() {
+        let bytes: Vec<u8> = (0..600u32).map(|i| (i * 13 % 256) as u8).collect();
+        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let module = serde_json::json!({ "image": { "hex": hex } });
+        let mut entry = vec![0u8; 4096];
+        let end = build_params_from_schema(&module, &blob_schema(), &mut entry, 0, None, "isolate")
+            .expect("an inline hex blob encodes");
+        assert_eq!(
+            carried_blob(&entry, end, 7),
+            bytes,
+            "decoded, not carried as text"
+        );
+
+        let module = serde_json::json!({ "image": { "bytes": [1, 2, 3] } });
+        let mut entry = vec![0u8; 256];
+        let end = build_params_from_schema(&module, &blob_schema(), &mut entry, 0, None, "isolate")
+            .expect("an inline bytes blob encodes");
+        assert_eq!(carried_blob(&entry, end, 7), vec![1, 2, 3]);
+    }
+
+    /// An inline entry at the module's top level (not under `params:`) is the
+    /// blob param's value — not flattened into `image.hex`, which no param
+    /// is named.
+    #[test]
+    fn a_top_level_inline_blob_is_one_value() {
+        let module = serde_json::json!({ "name": "m", "image": { "hex": "0a0b0c" } });
+        let mut entry = vec![0u8; 256];
+        let end = build_params_from_schema(&module, &blob_schema(), &mut entry, 0, None, "isolate")
+            .expect("a top-level inline blob encodes");
+        assert_eq!(carried_blob(&entry, end, 7), vec![0x0a, 0x0b, 0x0c]);
+    }
+
+    /// A bare hex STRING is not a blob: it names a data entry, and a graph
+    /// that still carries a program as text fails its build rather than
+    /// handing the module characters it would read as bytes.
+    #[test]
+    fn a_blob_param_refuses_a_bare_hex_string() {
+        let module = serde_json::json!({ "image": "0a0b0c" });
+        let mut entry = vec![0u8; 256];
+        let refused =
+            build_params_from_schema(&module, &blob_schema(), &mut entry, 0, None, "isolate");
+        assert!(
+            refused.is_err(),
+            "a hex string for a blob param must not encode"
         );
     }
 

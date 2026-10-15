@@ -176,6 +176,14 @@ either that the platform verified it, or how many anchors the instance
 held and where they came from (`source=deployment`,
 `deployment+operator`, or `operator`).
 
+A client identity is the operator's, not the publisher's: `fluxor exec
+--identity CERT,KEY` gives a DER certificate chain and key to every
+client-mode `tls` instance of the run that names no identity of its own
+(no `cert_file`, no `identity_label`), and without the flag
+`$HOME/.config/<applet>/client.der` and `client.key.der` are used when
+both exist. A published applet therefore carries no credential, and one
+bundle serves every operator. Server instances are never given one.
+
 ## The Registry Puller: ota_registry
 
 Source: `modules/foundation/ota_registry/mod.rs` and its

@@ -145,7 +145,7 @@ fn main() {
     if let Some(stem) = argv0_stem {
         if stem != "fluxor" {
             let args: Vec<String> = std::env::args().skip(1).collect();
-            match workload_src::exec_applet(&stem, &args, None, false) {
+            match workload_src::exec_applet(&stem, &args, None, None, false) {
                 Ok(()) => std::process::exit(0),
                 Err(e) => {
                     eprintln!("\x1b[1;31mError:\x1b[0m {e}");
@@ -258,9 +258,12 @@ fn main() {
                 ),
             }
         })(),
-        Commands::Exec { name, ca, args } => {
-            workload_src::exec_applet(&name, &args, ca.as_deref(), verbose)
-        }
+        Commands::Exec {
+            name,
+            ca,
+            identity,
+            args,
+        } => workload_src::exec_applet(&name, &args, ca.as_deref(), identity.as_deref(), verbose),
         Commands::Applet { action } => match action {
             AppletAction::Logs { name, tail, all } => workload_src::applet_logs(&name, tail, all),
         },

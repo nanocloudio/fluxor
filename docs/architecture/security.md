@@ -361,6 +361,21 @@ reaches its Certificate is refused rather than presenting nothing honest.
 A label identity is refused at construction alongside `cert_file` or
 `key_file`, without a vault, or with either port unwired.
 
+With `trust_issuer`, the issuer of the chain the instance is certified
+with — its last certificate — is also a trust anchor, placed after the
+configured ones and re-adopted on every renewal: the authority a node's
+peers chain to, minted at runtime where the graph could not name it. It
+needs a CA profile, since a pinned profile names keys and not an
+authority, and until a chain has arrived there is no anchor, so a peer's
+chain fails closed.
+
+Under `ca_uri`, a `verify_uri` ending in `/` accepts any URI strictly
+under that path — a cluster's replicas, each its own name, by one
+listener; a path segment that is `.`, `..` or empty never matches. The
+URI SAN that satisfied the check is reported as the session's principal
+in its `peer_identity` record, with the SAN check flag; every other
+profile reports none.
+
 An RSA identity always signs through the vault: the module carries no RSA
 signer of its own, so on a target whose vault holds no RSA suite the
 instance refuses to construct, and the composer refuses the graph first

@@ -324,6 +324,95 @@ pub fn append_operator_anchors(
         return Err("no anchors to append".to_string());
     }
     check_limits(anchors)?;
+    let tls_hash = fnv1a_hash(b"tls");
+    let quic_hash = fnv1a_hash(b"quic");
+    let ext = encode_ext(TAG_OPERATOR_TRUST, anchors);
+    extend_entries(blob, &mut |name_hash, id, params| {
+        // The mode tag and its default differ per module: tls tag 1
+        // (default client), quic tag 2 (default server).
+        let client = if name_hash == tls_hash {
+            basic_param_u8(params, 1).unwrap_or(0) == 0
+        } else if name_hash == quic_hash {
+            basic_param_u8(params, 2).unwrap_or(1) == 0
+        } else {
+            false
+        };
+        if !client {
+            return Ok(None);
+        }
+        let held = ext_blob(params, TAG_TRUST)
+            .map(|b| der_certificates(b).map(|c| c.len()).unwrap_or(MAX_ANCHORS))
+            .unwrap_or(0);
+        if held + anchors.len() > MAX_ANCHORS {
+            return Err(format!(
+                "module id {id}: {held} configured anchor(s) plus {} from --ca exceed the \
+                 {MAX_ANCHORS} an instance holds",
+                anchors.len()
+            ));
+        }
+        Ok(Some(ext.clone()))
+    })
+}
+
+/// The tls extended tags an operator identity rides: the certificate chain
+/// and the private key, as `cert_file` / `key_file` put them.
+pub const TAG_CERT: u8 = 10;
+pub const TAG_KEY: u8 = 11;
+/// The longest certificate chain a tls instance holds (its
+/// `MAX_CERT_CHAIN_BYTES`); a longer one refuses to construct.
+pub const MAX_CHAIN_DER: usize = 3072;
+/// tls's `identity_label` (basic tag 19): an identity the vault holds.
+const TAG_IDENTITY_LABEL: u8 = 19;
+
+/// Give every CLIENT-MODE `tls` instance that carries no identity of its
+/// own the operator's: `cert` (DER chain, leaf first) under [`TAG_CERT`]
+/// and `key` (DER) under [`TAG_KEY`]. A published applet then holds no
+/// operator credential — each run brings its operator's. A server instance
+/// is never given one, and an instance the graph already named an identity
+/// for (a certificate, or a vault label) keeps it.
+pub fn append_operator_identity(
+    blob: &[u8],
+    cert: &[u8],
+    key: &[u8],
+) -> Result<(Vec<u8>, Widened), String> {
+    if cert.is_empty() || key.is_empty() {
+        return Err("an identity needs a certificate and a key".to_string());
+    }
+    if cert.len() > MAX_CHAIN_DER {
+        return Err(format!(
+            "the certificate chain is {} bytes, over the {MAX_CHAIN_DER} a tls instance holds",
+            cert.len()
+        ));
+    }
+    if key.len() > u16::MAX as usize {
+        return Err("the key is larger than a parameter holds".to_string());
+    }
+    let tls_hash = fnv1a_hash(b"tls");
+    let mut ext = Vec::with_capacity(8 + cert.len() + key.len());
+    for (tag, bytes) in [(TAG_CERT, cert), (TAG_KEY, key)] {
+        ext.push(tag);
+        ext.push(0x00);
+        ext.push((bytes.len() >> 8) as u8);
+        ext.push(bytes.len() as u8);
+        ext.extend_from_slice(bytes);
+    }
+    extend_entries(blob, &mut |name_hash, _id, params| {
+        let client = name_hash == tls_hash && basic_param_u8(params, 1).unwrap_or(0) == 0;
+        let named = ext_blob(params, TAG_CERT).is_some()
+            || basic_param_len(params, TAG_IDENTITY_LABEL).unwrap_or(0) > 0;
+        Ok((client && !named).then(|| ext.clone()))
+    })
+}
+
+/// An entry rewriter for [`extend_entries`]: module type hash, module id and
+/// params in; the extended entry to append (or `None`) out.
+type Extend<'a> = dyn FnMut(u32, u8, &[u8]) -> Result<Option<Vec<u8>>, String> + 'a;
+
+/// Rewrite the module entries of a built FXWR config blob and re-seal it.
+/// `extend` sees each entry's module type, id and params, and answers the
+/// bytes to append to that entry's params (an extended TLV entry), or
+/// `None` to leave it as it was.
+fn extend_entries(blob: &[u8], extend: &mut Extend<'_>) -> Result<(Vec<u8>, Widened), String> {
     if blob.len() < HEADER_SIZE + 6 {
         return Err("config blob too short".to_string());
     }
@@ -343,11 +432,7 @@ pub fn append_operator_anchors(
         return Err("module section runs past the blob".to_string());
     }
 
-    let tls_hash = fnv1a_hash(b"tls");
-    let quic_hash = fnv1a_hash(b"quic");
-    let ext = encode_ext(TAG_OPERATOR_TRUST, anchors);
-
-    let mut entries: Vec<u8> = Vec::with_capacity(section_size + ext.len() * module_count);
+    let mut entries: Vec<u8> = Vec::with_capacity(section_size + 4096);
     let mut widened = Widened::default();
     let mut off = entries_start;
     for _ in 0..module_count {
@@ -363,33 +448,15 @@ pub fn append_operator_anchors(
         let name_hash = u32::from_le_bytes([entry[4], entry[5], entry[6], entry[7]]);
         let id = entry[8];
         let params = &entry[ENTRY_HEADER..];
-        // The mode tag and its default differ per module: tls tag 1
-        // (default client), quic tag 2 (default server).
-        let client = if name_hash == tls_hash {
-            basic_param_u8(params, 1).unwrap_or(0) == 0
-        } else if name_hash == quic_hash {
-            basic_param_u8(params, 2).unwrap_or(1) == 0
-        } else {
-            false
-        };
-        if client {
-            let held = ext_blob(params, TAG_TRUST)
-                .map(|b| der_certificates(b).map(|c| c.len()).unwrap_or(MAX_ANCHORS))
-                .unwrap_or(0);
-            if held + anchors.len() > MAX_ANCHORS {
-                return Err(format!(
-                    "module id {id}: {held} configured anchor(s) plus {} from --ca exceed the \
-                     {MAX_ANCHORS} an instance holds",
-                    anchors.len()
-                ));
+        match extend(name_hash, id, params)? {
+            Some(ext) => {
+                let new_len = entry_len + ext.len();
+                entries.extend_from_slice(&(new_len as u32).to_le_bytes());
+                entries.extend_from_slice(&entry[4..]);
+                entries.extend_from_slice(&ext);
+                widened.instances.push(id);
             }
-            let new_len = entry_len + ext.len();
-            entries.extend_from_slice(&(new_len as u32).to_le_bytes());
-            entries.extend_from_slice(&entry[4..]);
-            entries.extend_from_slice(&ext);
-            widened.instances.push(id);
-        } else {
-            entries.extend_from_slice(entry);
+            None => entries.extend_from_slice(entry),
         }
         off += entry_len;
     }
@@ -414,7 +481,7 @@ pub fn append_operator_anchors(
         return Err("hardware section runs past the blob".to_string());
     }
 
-    let mut out = Vec::with_capacity(blob.len() + ext.len() * widened.instances.len());
+    let mut out = Vec::with_capacity(blob.len() + entries.len() - section_size);
     out.extend_from_slice(&blob[..HEADER_SIZE]);
     out.push(blob[HEADER_SIZE]);
     out.push(blob[HEADER_SIZE + 1]);
@@ -431,6 +498,16 @@ pub fn append_operator_anchors(
 /// `[0xFE][0x01][payload_len u16 LE]` then `[tag][len][value…]` entries up
 /// to the `0xFF` end marker.
 fn basic_param_u8(params: &[u8], want: u8) -> Option<u8> {
+    basic_param(params, want)?.first().copied()
+}
+
+/// The length of a basic TLV entry's value, when the entry is present.
+fn basic_param_len(params: &[u8], want: u8) -> Option<usize> {
+    basic_param(params, want).map(<[u8]>::len)
+}
+
+/// A basic TLV entry's value, when the entry is present.
+fn basic_param(params: &[u8], want: u8) -> Option<&[u8]> {
     let end = basic_end(params)?;
     let mut pos = 4;
     while pos + 2 <= end {
@@ -442,8 +519,8 @@ fn basic_param_u8(params: &[u8], want: u8) -> Option<u8> {
         if pos + 2 + len > end {
             break;
         }
-        if tag == want && len >= 1 {
-            return Some(params[pos + 2]);
+        if tag == want {
+            return Some(&params[pos + 2..pos + 2 + len]);
         }
         pos += 2 + len;
     }
@@ -667,6 +744,80 @@ mod tests {
             after[o..o + l1].to_vec()
         };
         assert_eq!(server_after, server);
+    }
+
+    /// The extended entries of the `n`th module entry: (id, cert, key).
+    fn identity_of(after: &[u8], n: usize) -> (u8, Option<Vec<u8>>, Option<Vec<u8>>) {
+        let mut off = HEADER_SIZE + 6;
+        for i in 0.. {
+            let len =
+                u32::from_le_bytes([after[off], after[off + 1], after[off + 2], after[off + 3]])
+                    as usize;
+            if i == n {
+                let e = &after[off..off + len];
+                let params = &e[ENTRY_HEADER..];
+                return (
+                    e[8],
+                    ext_blob(params, TAG_CERT).map(<[u8]>::to_vec),
+                    ext_blob(params, TAG_KEY).map(<[u8]>::to_vec),
+                );
+            }
+            off += len;
+        }
+        unreachable!()
+    }
+
+    #[test]
+    fn an_operator_identity_reaches_only_clients_that_name_none() {
+        let cert = seq(40, 3);
+        let key = seq(30, 4);
+        let mine = {
+            let mut e = vec![TAG_CERT, 0, 0, 3];
+            e.extend_from_slice(&[9, 9, 9]);
+            e
+        };
+        let bare_client = entry("tls", 1, &[(1, 0), (11, 2)], &[]);
+        let server = entry("tls", 2, &[(1, 1)], &[]);
+        let own_client = entry("tls", 3, &[(1, 0)], &mine);
+        let labelled = entry("tls", 4, &[(1, 0), (19, 7)], &[]);
+        let quic_client = entry("quic", 5, &[(2, 0)], &[]);
+        let before = blob(&[
+            bare_client,
+            server.clone(),
+            own_client,
+            labelled,
+            quic_client,
+        ]);
+
+        let (after, given) = append_operator_identity(&before, &cert, &key).unwrap();
+        assert_eq!(given.instances, vec![1]);
+        assert_eq!(
+            identity_of(&after, 0),
+            (1, Some(cert.clone()), Some(key.clone()))
+        );
+        assert_eq!(
+            identity_of(&after, 1),
+            (2, None, None),
+            "a server is never given one"
+        );
+        assert_eq!(
+            identity_of(&after, 2),
+            (3, Some(vec![9, 9, 9]), None),
+            "a named identity is kept"
+        );
+        assert_eq!(
+            identity_of(&after, 3),
+            (4, None, None),
+            "a vault-label identity is kept"
+        );
+        assert_eq!(identity_of(&after, 4), (5, None, None));
+        assert!(after.ends_with(b"TAIL"));
+        let body_end = after.len() - 16 - 4;
+        assert_eq!(
+            u16::from_le_bytes([after[6], after[7]]),
+            crc16_ccitt(&after[8..body_end])
+        );
+        assert!(append_operator_identity(&before, &[], &key).is_err());
     }
 
     #[test]

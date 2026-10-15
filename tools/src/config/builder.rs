@@ -33,7 +33,9 @@ const MODULE_ENTRY_HEADER_SIZE: usize = 10;
 /// routes per the shared-infra-in-orchestrator partition principle.
 /// A 128 KiB cap truncates the later route bodies silently (clipped
 /// JS / empty scenario.json in the browser). Kept in lockstep with the
-/// runtime `MAX_CONFIG_SIZE` / http `DEFAULT_BODY_POOL_SIZE` host caps.
+/// runtime's per-module `MAX_MODULE_CONFIG_SIZE` / http
+/// `DEFAULT_BODY_POOL_SIZE` host caps; the whole blob's `MAX_CONFIG_SIZE`
+/// is larger (512 KiB), because a graph is many modules.
 /// Generation runs host-side, so this is a sanity bound, not a memory
 /// constraint. Wavetables and large sequences fit comfortably within.
 const MAX_MODULE_PARAMS_SIZE: usize = 256 * 1024;
@@ -1876,6 +1878,16 @@ fn validate_yaml_params(
             continue;
         }
 
+        // A blob param's inline `{hex: …}` / `{bytes: […]}` entry is its one
+        // value, not a group of nested params (see
+        // `schema::build_params_from_schema`).
+        if value.is_object()
+            && schema
+                .find(key)
+                .is_some_and(|p| p.ptype == schema::ParamType::Blob)
+        {
+            continue;
+        }
         if let Some(inner_obj) = value.as_object() {
             // `params: { ... }` is a transparent wrapper (see
             // `schema::build_params_from_schema`): inner keys map to
@@ -3137,4 +3149,29 @@ pub(crate) fn parse_modules_map(
     }
 
     Ok((entries, names))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A one-param schema as an `.fmod` embeds it: `decision`, a blob (tag 15).
+    fn blob_param_schema() -> schema::ParamSchema {
+        let mut b = vec![b'S', b'P', 1, 1, 15, 5, 0, 0, 0, 0, 8];
+        b.extend_from_slice(b"decision");
+        b.push(0); // no enum values
+        schema::ParamSchema::from_bytes(&b).expect("schema bytes")
+    }
+
+    /// A blob param's inline `{hex: …}` entry is its value, not a group of
+    /// nested params named `decision.hex`; any other mapping still has to name
+    /// a param.
+    #[test]
+    fn an_inline_blob_entry_is_the_params_value() {
+        let schema = blob_param_schema();
+        let ok = serde_json::json!({ "name": "s", "decision": { "hex": "00" } });
+        assert!(validate_yaml_params(&ok, &schema, "store_big").is_ok());
+        let unknown = serde_json::json!({ "name": "s", "verdict": { "hex": "00" } });
+        assert!(validate_yaml_params(&unknown, &schema, "store_big").is_err());
+    }
 }

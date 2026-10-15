@@ -1384,6 +1384,22 @@ fn walk_san_dns(
     any
 }
 
+/// Does `uri` satisfy `expected`? Byte for byte — or, when `expected` ends
+/// in `/`, any URI strictly under that path: a trust domain whose replicas
+/// are each their own name, accepted by one listener. A path segment that
+/// is `.`, `..` or empty is under nothing and never matches.
+pub fn uri_matches(expected: &[u8], uri: &[u8]) -> bool {
+    if uri == expected {
+        return true;
+    }
+    if expected.last() != Some(&b'/') || uri.len() <= expected.len() || !uri.starts_with(expected) {
+        return false;
+    }
+    uri[expected.len()..]
+        .split(|&b| b == b'/')
+        .all(|segment| !matches!(segment, b"" | b"." | b".."))
+}
+
 /// Walk a SAN extension value yielding each `uniformResourceIdentifier`.
 /// `callback` returning true stops the walk. Returns true if at least one
 /// URI was present.
@@ -2478,7 +2494,7 @@ fn verify_chain_against(
         };
         let mut matched = false;
         let any = walk_san_uri(leaf_der, san_start, san_len, &mut |uri| {
-            if uri == policy.expected_uri {
+            if uri_matches(policy.expected_uri, uri) {
                 matched = true;
                 return true;
             }
