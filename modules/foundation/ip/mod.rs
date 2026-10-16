@@ -7590,8 +7590,7 @@ unsafe fn service_net_channel(s: &mut IpState) {
             break;
         }
         let mut frame = [0u8; NET_FRAME_HDR + PENDING_CMD_BUF_SIZE];
-        let (msg_type, plen) =
-            net_read_frame(sys, s.net_in_chan, frame.as_mut_ptr(), frame.len());
+        let (msg_type, plen) = net_read_frame(sys, s.net_in_chan, frame.as_mut_ptr(), frame.len());
         if msg_type == 0 {
             break;
         }

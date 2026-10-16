@@ -176,6 +176,7 @@ CAPACITY >= PSTATUS_ROUND | src/kernel/sys/telemetry_ring.rs
 | nbd_serve completions per step | `STEP_REAP_BUDGET` | modules/foundation/nbd_serve/mod.rs | 16 | Policy: completions one step reaps from the source; covers `MAX_SLOTS` twice |
 | resolver name held | `DNS_NAME_CAP` | modules/foundation/ip/mod.rs | 64 | Policy: the longest name the stub resolver holds, in a cache entry and in a pending dial. It is what bounds those tables on an MCU-class profile, so a dial naming something longer is refused EINVAL rather than truncated to a name that resolves to somewhere else |
 | OTA registry authority | `MAX_AUTHORITY_LEN` | modules/foundation/ota_registry/mod.rs | 128 | Policy: the `host[:port]` the puller dials and sends as `Host:`. A longer one is refused at construction, naming the parameter — a truncated authority would dial a different registry |
+| OTA directive record | `DIRECTIVE_RECORD_MAX` | modules/foundation/ota_registry/mod.rs | 256 | Policy: the longest signed directive record one frame carries, the counter, a tag of `MAX_TAG_LEN` and the signature with room to spare. A larger frame is dropped whole by the reader and never parsed |
 | TLS/DTLS peer certificate | `MAX_CERT_LEN` | modules/foundation/tls/mod.rs | 2048 | Policy: the longest single certificate the module retains — each trust anchor, and the leaf inside a configured chain. An anchor past it refuses the instance rather than being stored truncated, because a truncated certificate is one that verifies nothing |
 | TLS/DTLS presented chain | `MAX_CERT_CHAIN_BYTES` | modules/foundation/tls/mod.rs | 3072 | Policy: the leaf plus whatever issuers it needs to reach the peer's anchor, as concatenated DER. A bare leaf is the one-element case |
 | TLS/DTLS identity key | `MAX_KEY_LEN` | modules/foundation/tls/mod.rs | 2400 | Policy: a PKCS#1 RSAPrivateKey of 4096 bits with its CRT fields is about 2.4 KB, and a PKCS#8 P-256 key is under 200 bytes, so this admits the largest identity the module signs with |
@@ -498,6 +499,7 @@ STEP_SEND_BUDGET | modules/foundation/nbd_serve/mod.rs | 16 | *
 STEP_REAP_BUDGET | modules/foundation/nbd_serve/mod.rs | 16 | *
 DNS_NAME_CAP | modules/foundation/ip/mod.rs | 64 | *
 MAX_AUTHORITY_LEN | modules/foundation/ota_registry/mod.rs | 128 | *
+DIRECTIVE_RECORD_MAX | modules/foundation/ota_registry/mod.rs | 256 | *
 MAX_CERT_LEN | modules/foundation/tls/mod.rs | 2048 | *
 MAX_CERT_CHAIN_BYTES | modules/foundation/tls/mod.rs | 3072 | *
 MAX_KEY_LEN | modules/foundation/tls/mod.rs | 2400 | *

@@ -464,8 +464,7 @@ unsafe fn dg_recv(
     if !net_in_readable(sys, net_in) {
         return None;
     }
-    let (msg_type, payload_len, full_len) =
-        net_read_frame_sized(sys, net_in, scratch, scratch_max);
+    let (msg_type, payload_len, full_len) = net_read_frame_sized(sys, net_in, scratch, scratch_max);
     if msg_type == DG_MSG_BOUND && payload_len >= 1 {
         // MSG_DG_BOUND payload: [ep_id:1][local_port:2 LE]. The local port is
         // informational (the endpoint routes by ep_id); tolerate its absence.

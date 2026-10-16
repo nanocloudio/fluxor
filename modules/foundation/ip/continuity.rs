@@ -1185,8 +1185,7 @@ pub(super) unsafe fn service(s: &mut IpState) {
         }
         let mut frame =
             [0u8; NET_FRAME_HDR + sc::DELTA_APPLY_HEADER_LEN + sc::CHECKPOINT_CHUNK_MAX];
-        let (msg_type, plen) =
-            net_read_frame(sys, s.cont.in_chan, frame.as_mut_ptr(), frame.len());
+        let (msg_type, plen) = net_read_frame(sys, s.cont.in_chan, frame.as_mut_ptr(), frame.len());
         if msg_type == 0 {
             break;
         }
@@ -1197,7 +1196,7 @@ pub(super) unsafe fn service(s: &mut IpState) {
         }
         let mut flow = [0u8; 16];
         flow.copy_from_slice(&buf[..16]);
-        let epoch = rd_u32(&buf, 16);
+        let epoch = rd_u32(buf, 16);
         let p = &buf[..plen];
         match msg_type {
             sc::CMD_SC_PAIR_PREPARE if plen >= sc::PAIR_PREPARE_PAYLOAD_LEN => {
