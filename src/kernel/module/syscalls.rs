@@ -86,7 +86,16 @@ pub fn init_syscall_table() {
         provider_close: syscall_provider_close,
         channel_peek: syscall_channel_peek,
         provider_call_sel: syscall_provider_call_sel,
+        channel_discard: syscall_channel_discard,
     });
+}
+
+unsafe extern "C" fn syscall_channel_discard(handle: i32, len: usize) -> i32 {
+    // ISR-tier gate at the wrapper boundary, as for `channel_peek`.
+    if crate::kernel::exec::scheduler::deny_isr_tier_syscall("channel_discard") {
+        return crate::kernel::sys::errno::EACCES;
+    }
+    channel::channel_discard(handle, len)
 }
 
 unsafe extern "C" fn syscall_channel_peek(handle: i32, buf: *mut u8, len: usize) -> i32 {
@@ -2849,11 +2858,16 @@ impl SyscallTable {
             provider_close: stub_provider_close,
             channel_peek: stub_channel_peek,
             provider_call_sel: stub_provider_call_sel,
+            channel_discard: stub_channel_discard,
         }
     }
 }
 
 unsafe extern "C" fn stub_channel_peek(_handle: i32, _buf: *mut u8, _len: usize) -> i32 {
+    -1
+}
+
+unsafe extern "C" fn stub_channel_discard(_handle: i32, _len: usize) -> i32 {
     -1
 }
 

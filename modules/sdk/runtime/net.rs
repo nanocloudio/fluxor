@@ -39,51 +39,47 @@ unsafe fn net_write_frame(
     }
 }
 
-/// Read a net protocol frame from channel into buf.
-/// Returns (msg_type, payload_len) or (0, 0) if no data.
-/// Payload starts at buf[3]. Caller must provide buf >= FRAME_HDR + max payload.
+/// Read one whole net protocol frame from `chan` into `buf`, or nothing.
 ///
-/// Two-step read: first the 3-byte TLV header, then exactly payload_len bytes.
-/// This prevents consuming multiple frames from the byte-stream FIFO in one call.
+/// Returns `(msg_type, payload_len)` with the payload at `buf[3..]`, or
+/// `(0, 0)` when no whole frame is buffered yet. A frame is consumed only
+/// once all of it is buffered and it fits `buf`, so a frame that arrives
+/// over several steps is left on the channel until it is complete, and a
+/// read never consumes part of one frame or the start of the next. A frame
+/// larger than `buf`, or larger than the channel's ring, cannot be
+/// delivered: it is dropped whole, now and as the rest of it arrives, logged,
+/// and reported as `(0, 0)`. A consumer that must not lose a frame reads with
+/// [`net_read_frame_sized`], which reports the drop.
+///
+/// `buf` must hold `NET_FRAME_HDR` plus the largest payload the port
+/// carries.
 unsafe fn net_read_frame(
     sys: &SyscallTable,
     chan: i32,
     buf: *mut u8,
     buf_max: usize,
 ) -> (u8, usize) {
-    if chan < 0 || buf_max < NET_FRAME_HDR {
+    let (msg_type, copied, payload_len) = net_read_frame_sized(sys, chan, buf, buf_max);
+    if msg_type != 0 && copied < payload_len {
+        let m = b"[net] frame larger than its reader's buffer dropped";
+        dev_log(sys, 2, m.as_ptr(), m.len());
         return (0, 0);
     }
-    // Step 1: read just the 3-byte TLV header
-    let n = (sys.channel_read)(chan, buf, NET_FRAME_HDR);
-    if n < NET_FRAME_HDR as i32 {
-        return (0, 0);
-    }
-    let msg_type = *buf;
-    let payload_len = (*buf.add(1) as u16 | ((*buf.add(2) as u16) << 8)) as usize;
-    if payload_len == 0 {
-        return (msg_type, 0);
-    }
-    // Step 2: read exactly payload_len bytes into buf[3..]
-    let max_payload = buf_max - NET_FRAME_HDR;
-    let to_read = if payload_len < max_payload {
-        payload_len
-    } else {
-        max_payload
-    };
-    let n2 = (sys.channel_read)(chan, buf.add(NET_FRAME_HDR), to_read);
-    let actual = if n2 > 0 { n2 as usize } else { 0 };
-    (msg_type, actual)
+    (msg_type, copied)
 }
 
-/// Like [`net_read_frame`] but **stays frame-aligned** when a frame's payload is
-/// larger than `buf`: after copying `min(payload_len, buf-3)` bytes, it discards
-/// the remaining `payload_len - copied` bytes from the channel so the next read
-/// starts on a real frame header rather than mid-payload. Returns
-/// `(msg_type, copied_len, payload_len)` — `copied_len < payload_len` signals the
-/// frame was truncated into `buf` (the tail was dropped, not left to desync the
-/// FIFO). A consumer that must not lose bytes can compare the two and reconnect.
-unsafe fn net_read_frame_aligned(
+/// [`net_read_frame`] that reports what it could not deliver. Returns
+/// `(msg_type, copied_len, payload_len)`:
+///
+/// - `(0, 0, 0)`: no whole frame is buffered yet; nothing was consumed.
+/// - `copied_len == payload_len`: the frame is in `buf`, payload at `buf[3..]`.
+/// - `copied_len < payload_len`: the frame was larger than `buf` or than the
+///   ring, so it could not be delivered. Its head, `copied_len` payload
+///   bytes, is in `buf`, and the whole frame is dropped, now and as the rest
+///   of it arrives, so the channel is still frame-aligned. A consumer of a
+///   reliable stream treats this as a lost frame and reconnects; a datagram
+///   consumer has the datagram's head and its true length.
+unsafe fn net_read_frame_sized(
     sys: &SyscallTable,
     chan: i32,
     buf: *mut u8,
@@ -92,41 +88,57 @@ unsafe fn net_read_frame_aligned(
     if chan < 0 || buf_max < NET_FRAME_HDR {
         return (0, 0, 0);
     }
-    let n = (sys.channel_read)(chan, buf, NET_FRAME_HDR);
+    let n = (sys.channel_peek)(chan, buf, NET_FRAME_HDR);
+    if n < 0 {
+        // A mailbox channel cannot be peeked; its read is one whole record,
+        // so a frame on it is whole by construction.
+        return net_read_frame_mailbox(sys, chan, buf, buf_max);
+    }
     if n < NET_FRAME_HDR as i32 {
         return (0, 0, 0);
     }
     let msg_type = *buf;
     let payload_len = (*buf.add(1) as u16 | ((*buf.add(2) as u16) << 8)) as usize;
-    if payload_len == 0 {
-        return (msg_type, 0, 0);
-    }
-    let max_payload = buf_max - NET_FRAME_HDR;
-    let to_read = if payload_len < max_payload {
-        payload_len
-    } else {
-        max_payload
-    };
-    let n2 = (sys.channel_read)(chan, buf.add(NET_FRAME_HDR), to_read);
-    let copied = if n2 > 0 { n2 as usize } else { 0 };
-    // Drain any tail beyond what fit, so the FIFO stays frame-aligned.
-    let mut leftover = payload_len.saturating_sub(copied);
-    if leftover > 0 {
-        let mut scratch = [0u8; 64];
-        while leftover > 0 {
-            let take = if leftover < scratch.len() {
-                leftover
-            } else {
-                scratch.len()
-            };
-            let got = (sys.channel_read)(chan, scratch.as_mut_ptr(), take);
-            if got <= 0 {
-                break; // nothing more buffered yet — avoid a busy spin.
-            }
-            leftover -= got as usize;
+    let total = NET_FRAME_HDR + payload_len;
+    if total <= buf_max {
+        let got = (sys.channel_peek)(chan, buf, total);
+        if got == total as i32 {
+            (sys.channel_discard)(chan, total);
+            return (msg_type, payload_len, payload_len);
+        }
+        // Incomplete. It completes only if the ring has room for more; a
+        // full ring holding less than the frame can never hold all of it.
+        if (sys.channel_poll)(chan, POLL_OUT) & POLL_OUT as i32 != 0 {
+            return (0, 0, 0);
         }
     }
+    // Undeliverable: hand over the head that is buffered and fits, and drop
+    // the whole frame, now and as the rest of it arrives.
+    let got = (sys.channel_peek)(chan, buf, total.min(buf_max));
+    let copied = (got.max(0) as usize).saturating_sub(NET_FRAME_HDR);
+    (sys.channel_discard)(chan, total);
     (msg_type, copied, payload_len)
+}
+
+/// The mailbox half of [`net_read_frame_sized`]: one record per read, whole
+/// or not at all. A record that is not one frame is dropped and reported as
+/// an undeliverable frame.
+unsafe fn net_read_frame_mailbox(
+    sys: &SyscallTable,
+    chan: i32,
+    buf: *mut u8,
+    buf_max: usize,
+) -> (u8, usize, usize) {
+    let n = (sys.channel_read)(chan, buf, buf_max);
+    if n < NET_FRAME_HDR as i32 {
+        return (0, 0, 0);
+    }
+    let msg_type = *buf;
+    let payload_len = (*buf.add(1) as u16 | ((*buf.add(2) as u16) << 8)) as usize;
+    if NET_FRAME_HDR + payload_len != n as usize {
+        return (msg_type, 0, payload_len);
+    }
+    (msg_type, payload_len, payload_len)
 }
 
 /// Fill buffer with cryptographically secure random bytes.

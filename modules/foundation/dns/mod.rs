@@ -2474,12 +2474,17 @@ unsafe fn parse_question(
 }
 
 /// Process a DNS query received on the server socket.
+/// `pkt_len` is what `pkt` holds; `wire_len` is the datagram's length as
+/// sent. They differ when the datagram was larger than the receive buffer:
+/// such a query is dropped, and such an update is refused by the UDP
+/// ceiling with the id and question its head carries.
 unsafe fn handle_query(
     s: &mut DnsState,
     client_ip: u32,
     client_port: u16,
     pkt: *const u8,
     pkt_len: usize,
+    wire_len: usize,
 ) {
     if pkt_len < DNS_HEADER_LEN {
         return;
@@ -2495,6 +2500,9 @@ unsafe fn handle_query(
     // dropped.
     let opcode = ((flags & FLAG_OPCODE_MASK) >> FLAG_OPCODE_SHIFT) as u8;
     if (flags & FLAG_QR) != 0 || (opcode != OPCODE_QUERY && opcode != OPCODE_UPDATE) {
+        return;
+    }
+    if opcode == OPCODE_QUERY && wire_len > pkt_len {
         return;
     }
     // The supported profile is exactly one question per query: local answers
@@ -2519,6 +2527,7 @@ unsafe fn handle_query(
             client_port,
             pkt,
             pkt_len,
+            wire_len,
             question_end,
             name_buf.as_ptr(),
             name_len,
@@ -5151,6 +5160,7 @@ unsafe fn handle_update(
     client_port: u16,
     pkt: *const u8,
     pkt_len: usize,
+    wire_len: usize,
     question_end: usize,
     zone_name: *const u8,
     zone_len: usize,
@@ -5159,7 +5169,7 @@ unsafe fn handle_update(
 ) {
     let state = s as *mut DnsState;
     let tx = s.tx_buf.as_mut_ptr();
-    if s.update_enabled == 0 || pkt_len > DNS_MAX_PACKET {
+    if s.update_enabled == 0 || wire_len > DNS_MAX_PACKET {
         let n = begin_update_response(pkt, question_end, RCODE_REFUSED, tx);
         if n > 0 {
             send_server_reply(state, client_ip, client_port, tx as *const u8, n);
@@ -5607,12 +5617,14 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     src_port,
                     data,
                     len,
+                    full_len,
                 } => {
                     if len >= DNS_HEADER_LEN {
                         s.tlm.bytes_in = s.tlm.bytes_in.wrapping_add(len as u32);
                         if s.server_ep.owns(ep_id) {
-                            handle_query(s, src_ip, src_port, data, len);
-                        } else if s.upstream_ep.owns(ep_id) {
+                            handle_query(s, src_ip, src_port, data, len, full_len);
+                        } else if s.upstream_ep.owns(ep_id) && len == full_len {
+                            // A truncated answer is no answer.
                             handle_upstream_response(s, src_ip, src_port, data, len);
                         }
                         did_work = true;

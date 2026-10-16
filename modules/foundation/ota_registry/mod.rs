@@ -102,6 +102,8 @@ const MAX_AUTHORITY_LEN: usize = 128;
 const DEFAULT_PORT: u16 = 5000;
 const MAX_REPO_LEN: usize = 64;
 const MAX_TAG_LEN: usize = 32;
+/// Longest directive record a frame carries.
+const DIRECTIVE_RECORD_MAX: usize = 256;
 
 const CONNECT_TIMEOUT_MS: u64 = 10_000;
 const RESPONSE_TIMEOUT_MS: u64 = 30_000;
@@ -1147,27 +1149,18 @@ unsafe fn pump_directives(s: &mut State) {
         if poll <= 0 || ((poll as u32) & POLL_IN) == 0 {
             return;
         }
-        // FMP-style frame: [type u8][len u16 LE][payload]. Accept the
-        // payload as the raw directive record.
-        let mut hdr = [0u8; 3];
-        if (sys.channel_read)(s.directive_chan, hdr.as_mut_ptr(), 3) < 3 {
+        // One net_proto frame carries one raw directive record. A frame
+        // larger than a record is dropped whole by the reader.
+        let mut frame = [0u8; NET_FRAME_HDR + DIRECTIVE_RECORD_MAX];
+        let (_, len, full) =
+            net_read_frame_sized(sys, s.directive_chan, frame.as_mut_ptr(), frame.len());
+        if full == 0 {
             return;
         }
-        let len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
-        let mut rec = [0u8; 256];
-        if len == 0 || len > rec.len() {
-            // Drain and drop an oversized frame to stay aligned.
-            let mut left = len;
-            while left > 0 {
-                let take = left.min(rec.len());
-                (sys.channel_read)(s.directive_chan, rec.as_mut_ptr(), take);
-                left -= take;
-            }
+        if len != full {
             continue;
         }
-        if ((sys.channel_read)(s.directive_chan, rec.as_mut_ptr(), len) as usize) < len {
-            return;
-        }
+        let rec = &frame[NET_FRAME_HDR..NET_FRAME_HDR + len];
         // Record: [0x44][counter u64 LE][tag_len u8][tag][sig 64].
         if len < 1 + 8 + 1 + 1 + 64 || rec[0] != DIRECTIVE_MAGIC {
             continue;

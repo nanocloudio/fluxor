@@ -2168,6 +2168,18 @@ pub unsafe extern "C" fn channel_peek(handle: i32, buf: *mut u8, len: usize) -> 
     (table.channel_peek)(handle, buf, len)
 }
 
+/// Channel discard: consume `len` bytes whole or none; no buffer crosses
+/// the bridge.
+#[allow(
+    clippy::missing_safety_doc,
+    reason = "low-level platform shim; safety contract documented at call site"
+)]
+#[no_mangle]
+pub unsafe extern "C" fn channel_discard(handle: i32, len: usize) -> i32 {
+    let table = crate::kernel::module::syscalls::get_syscall_table();
+    (table.channel_discard)(handle, len)
+}
+
 /// Heap alloc — child-module-scoped arenas. Each instantiated module
 /// has its own arena; the kernel's scheduler tracks which module is
 /// the current caller via `set_current_module` (called by the bridge

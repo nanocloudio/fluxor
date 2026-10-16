@@ -1183,12 +1183,14 @@ pub(super) unsafe fn service(s: &mut IpState) {
         if !flush_reply(s) {
             return;
         }
-        let mut buf = [0u8; sc::DELTA_APPLY_HEADER_LEN + sc::CHECKPOINT_CHUNK_MAX];
-        let (msg_type, plen) = ip_net_read_frame(sys, s.cont.in_chan, buf.as_mut_ptr(), buf.len());
+        let mut frame =
+            [0u8; NET_FRAME_HDR + sc::DELTA_APPLY_HEADER_LEN + sc::CHECKPOINT_CHUNK_MAX];
+        let (msg_type, plen) =
+            net_read_frame(sys, s.cont.in_chan, frame.as_mut_ptr(), frame.len());
         if msg_type == 0 {
             break;
         }
-        let plen = plen as usize;
+        let buf = &frame[NET_FRAME_HDR..];
         if plen < sc::FLOW_HEADER_LEN {
             count += 1;
             continue;

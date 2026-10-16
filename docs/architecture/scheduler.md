@@ -200,7 +200,7 @@ Source: `src/kernel/module/syscalls.rs`,
    `errno::EACCES`, emitting `MON_PERM_DENIED domain=N mod=M
    op=<syscall>`. The deny surface:
    - **Channels:** `channel_open`, `channel_read`, `channel_write`,
-     `channel_peek`, `channel_poll`.
+     `channel_peek`, `channel_discard`, `channel_poll`.
    - **Providers:** `provider_open`, `provider_call`,
      `provider_call_sel`, `provider_query`, `provider_close`, with
      the ISR-safe bridge ops exempted as described above. The gate

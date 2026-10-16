@@ -364,7 +364,7 @@ unsafe fn service(s: &mut DirState) {
         // message this role answers is far smaller than the buffer, so a
         // short read is a malformed writer, not a message to act on.
         let (msg, copied, payload_len) =
-            net_read_frame_aligned(sys, s.ctrl_in, s.buf.as_mut_ptr(), 128);
+            net_read_frame_sized(sys, s.ctrl_in, s.buf.as_mut_ptr(), 128);
         if msg == 0 {
             break;
         }

@@ -1041,6 +1041,10 @@ mod bcm2712_impl {
                         usize,
                         unsafe extern "C" fn(*const u8, usize, i32, u32, *mut u8, usize) -> i32,
                     >(veneer(op::PROVIDER_CALL_SEL)),
+                    channel_discard: core::mem::transmute::<
+                        usize,
+                        unsafe extern "C" fn(i32, usize) -> i32,
+                    >(veneer(op::CHANNEL_DISCARD)),
                     // A word the kernel writes cannot be both mapped read-only
                     // to EL0 and kept current; the SDK treats null as "ask".
                     telemetry_enabled: core::ptr::null(),

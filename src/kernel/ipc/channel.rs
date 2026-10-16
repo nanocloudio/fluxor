@@ -220,6 +220,10 @@ struct ChannelSlot {
     /// Set by the scheduler for aliased channels (buffer_group != 0).
     /// When false, the buffer acquires refuse with `ENOTSUP`, forcing FIFO mode.
     mailbox: AtomicBool,
+    /// Bytes `channel_discard` still owes the stream: dropped from the front
+    /// of each write as it arrives, before anything lands in the ring. Read
+    /// and written only under the ring lock.
+    discard_owed: AtomicU32,
     /// Auxiliary u32 value (module-defined: seek position, file index, etc.)
     /// NO_AUX_PENDING if none pending.
     aux_u32: AtomicU32,
@@ -291,6 +295,7 @@ impl ChannelSlot {
             ever_written: AtomicBool::new(false),
             reader_gone: AtomicBool::new(false),
             mailbox: AtomicBool::new(false),
+            discard_owed: AtomicU32::new(0),
             aux_u32: AtomicU32::new(NO_AUX_PENDING),
             buffer_slot: AtomicI16::new(-1),
             wake_module: AtomicI16::new(-1),
@@ -350,6 +355,7 @@ impl ChannelSlot {
         // it.
         let buf_slot = self.with_lock(|fifo, _| {
             *fifo = FifoState::new();
+            self.discard_owed.store(0, Ordering::Relaxed);
             self.buffer_slot.swap(-1, Ordering::AcqRel)
         });
         if buf_slot >= 0 {
@@ -768,6 +774,58 @@ pub unsafe fn channel_peek(handle: i32, buf: *mut u8, len: usize) -> i32 {
     }
 }
 
+/// Drop the next `len` bytes of a FIFO channel's stream without copying
+/// them: what is buffered now goes at once, and the rest is dropped from the
+/// front of each later write as it arrives, before it lands in the ring.
+/// Returns `len`, or `CHAN_EINVAL` for a bad handle, a mailbox channel, or a
+/// `len` the owed count cannot hold.
+///
+/// With `channel_peek` this gives a frame-aware consumer a whole-frame
+/// read: peek the header, then the frame, then discard what it copied; and
+/// a whole-frame drop for a frame it cannot hold, including one larger than
+/// the ring, which could never be buffered whole. Neither path can leave
+/// part of a frame on the channel.
+pub fn channel_discard(handle: i32, len: usize) -> i32 {
+    if crate::kernel::exec::scheduler::deny_isr_tier_syscall("channel_discard") {
+        return crate::kernel::sys::errno::EACCES;
+    }
+    if handle < 0 {
+        return CHAN_EINVAL;
+    }
+    let idx = handle as usize;
+    if idx >= MAX_CHANNELS {
+        return CHAN_EINVAL;
+    }
+    let slot = &CHANNELS[idx];
+    if !slot.is_pipe() {
+        return CHAN_EINVAL;
+    }
+    if slot.mailbox.load(Ordering::Acquire) {
+        return CHAN_EINVAL;
+    }
+    let ok = slot.with_lock(|fifo, storage| {
+        if storage.is_none() {
+            return false;
+        }
+        let now = len.min(fifo.len());
+        let owed = slot.discard_owed.load(Ordering::Relaxed) as usize;
+        let Some(total_owed) = owed.checked_add(len - now) else {
+            return false;
+        };
+        let Ok(total_owed) = u32::try_from(total_owed) else {
+            return false;
+        };
+        fifo.skip(now);
+        slot.discard_owed.store(total_owed, Ordering::Relaxed);
+        true
+    });
+    if ok {
+        len as i32
+    } else {
+        CHAN_EINVAL
+    }
+}
+
 /// # Safety
 /// `data` must be valid for reads of `len` bytes (or null, which is
 /// rejected). The function reads through `data` into the channel's
@@ -831,20 +889,38 @@ pub unsafe fn channel_write(handle: i32, data: *const u8, len: usize) -> i32 {
         return len as i32;
     }
     let input = core::slice::from_raw_parts(data, len);
-    let written = slot.with_lock(|fifo, storage| {
+    // Bytes a `channel_discard` owes the stream are dropped from the front of
+    // this write; a write swallowed whole is reported done, as it was for the
+    // producer. The rest lands whole or not at all, and the owed count moves
+    // only when it does.
+    let landed = slot.with_lock(|fifo, storage| {
         let Some(storage) = storage else { return -1i32 };
-        fifo.write(storage, input) as i32
+        let owed = slot.discard_owed.load(Ordering::Relaxed) as usize;
+        if owed >= len {
+            slot.discard_owed
+                .store((owed - len) as u32, Ordering::Relaxed);
+            return -2i32;
+        }
+        let rest = &input[owed..];
+        let written = fifo.write(storage, rest);
+        if written == rest.len() {
+            slot.discard_owed.store(0, Ordering::Relaxed);
+        }
+        written as i32
     });
-    if written < 0 {
+    if landed == -2 {
+        return len as i32;
+    }
+    if landed < 0 {
         return CHAN_EINVAL; // Channel buffer not allocated
     }
-    if written == 0 {
+    if landed == 0 {
         CHAN_EAGAIN
     } else {
         slot.ever_written.store(true, Ordering::Release);
         wake_consumer_if_flagged(slot);
-        mirror_write(slot, &input[..written as usize]);
-        written
+        mirror_write(slot, &input[len - landed as usize..]);
+        len as i32
     }
 }
 
@@ -1338,6 +1414,11 @@ pub extern "C" fn syscall_channel_close(handle: i32) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn syscall_channel_read(handle: i32, buf: *mut u8, len: usize) -> i32 {
     channel_read(handle, buf, len)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn syscall_channel_discard(handle: i32, len: usize) -> i32 {
+    channel_discard(handle, len)
 }
 
 /// # Safety

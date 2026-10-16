@@ -1486,7 +1486,7 @@ unsafe fn service_net(s: &mut NbdState) {
         }
         frames += 1;
         let sys = &*s.syscalls;
-        let (msg, plen, full) = net_read_frame_aligned(sys, s.net_in, s.rx.as_mut_ptr(), IN_FRAME);
+        let (msg, plen, full) = net_read_frame_sized(sys, s.net_in, s.rx.as_mut_ptr(), IN_FRAME);
         if msg == 0 {
             return;
         }

@@ -2302,6 +2302,7 @@ registerProcessor('pcm-ring', PcmRing);
               return n;
             },
             channel_poll: (h, e) => getKernel().exports.channel_poll(h, e),
+            channel_discard: (h, l) => getKernel().exports.channel_discard(h, l),
             channel_peek: (h, p, l) => {
               const k = getKernel().exports.kernel_heap_alloc(l);
               if (!k) return -1;

@@ -609,9 +609,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     src_port,
                     data,
                     len,
+                    full_len,
                     ..
                 } => {
-                    if src_port != NTP_PORT || len < NTP_LEN || data.is_null() {
+                    if src_port != NTP_PORT || len < NTP_LEN || len < full_len || data.is_null() {
                         continue;
                     }
                     let t4 = dev_micros(sys);

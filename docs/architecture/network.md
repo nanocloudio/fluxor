@@ -111,12 +111,19 @@ The TLV format is:
 ```
 
 The header is three bytes. `len` is the payload length, not the total
-frame length. Reading a frame is a two-step operation: read the 3-byte
-header, then read exactly `len` bytes of payload, so one `channel_read`
-never consumes the next frame's header. The SDK helpers `net_read_frame`
-and `net_write_frame` in `modules/sdk/runtime/net.rs` implement this;
-`net_read_frame_aligned` additionally discards an oversized payload tail
-so the stream stays frame-aligned.
+frame length. A producer writes a frame with one `channel_write`, which
+commits it whole or not at all. A consumer reads a frame whole or not at
+all: it peeks the header, peeks the frame once every byte of it is
+buffered, and consumes it with `channel_discard`. A frame still arriving
+stays on the channel until it is complete, so a frame carried over a raw
+byte-stream fan is never returned short, and a read never consumes the
+next frame's header. A frame larger than the consumer's buffer, or than
+the channel's ring, is discarded whole, now and as the rest of it arrives,
+which keeps the stream aligned. The SDK helpers
+`net_read_frame`, `net_read_frame_sized` and `net_write_frame` in
+`modules/sdk/runtime/net.rs` implement this; the sized reader reports a
+dropped frame's length so a consumer of a reliable stream can treat it
+as a lost frame and reconnect, where the plain reader logs it.
 
 ### Upstream messages (consumer → provider)
 

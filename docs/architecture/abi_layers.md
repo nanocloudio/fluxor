@@ -25,6 +25,7 @@ Every PIC module receives a `SyscallTable` at init. It holds exactly:
 
 - `channel_read` / `channel_write` / `channel_poll` — direct ring-buffer I/O
 - `channel_peek` — copy from a FIFO channel head without advancing the read pointer (frame-aware consumers inspect a header before committing to consume)
+- `channel_discard` — drop the next `len` bytes of a FIFO channel's stream without copying, what is buffered now and the rest as it arrives (the consuming half of a whole-frame read, and a whole-frame drop)
 - `heap_alloc` / `heap_free` / `heap_realloc` — per-module heap
 - `provider_open` / `provider_call` / `provider_query` / `provider_close` — handle-scoped contract dispatch
 - `provider_call_sel` — selector-routed provider call: the op names its

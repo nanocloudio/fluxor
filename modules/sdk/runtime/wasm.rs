@@ -20,6 +20,7 @@ mod wasm_syscalls {
         pub fn channel_write(handle: i32, data: *const u8, len: usize) -> i32;
         pub fn channel_poll(handle: i32, events: u32) -> i32;
         pub fn channel_peek(handle: i32, buf: *mut u8, len: usize) -> i32;
+        pub fn channel_discard(handle: i32, len: usize) -> i32;
         pub fn provider_open(
             contract: u32,
             open_op: u32,
@@ -163,6 +164,7 @@ pub static WASM_SYSCALLS: SyscallTable = SyscallTable {
     // The browser host has no multi-volume mount routing; instance-keyed
     // calls are unsupported (ENOSYS) — every wasm provider is the default one.
     provider_call_sel: wasm_provider_call_sel,
+    channel_discard: wasm_syscalls::channel_discard,
 };
 
 #[cfg(target_arch = "wasm32")]

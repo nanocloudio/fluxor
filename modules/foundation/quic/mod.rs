@@ -2787,7 +2787,7 @@ unsafe fn mux_pump_upstream(s: &mut QuicState) {
         let mut buf =
             [0u8; NET_FRAME_HDR + mux::STREAM_DATA_PREFIX + mux::MUX_QUIC_STREAM_SEND_MAX];
         let (mt, plen, full_plen) =
-            net_read_frame_aligned(sys, s.app_in, buf.as_mut_ptr(), buf.len());
+            net_read_frame_sized(sys, s.app_in, buf.as_mut_ptr(), buf.len());
         if plen == 0 && full_plen == 0 {
             return;
         }

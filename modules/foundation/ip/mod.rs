@@ -210,9 +210,8 @@ const E_NETUNREACH: i8 = -101;
 
 /// CMD_SEND stash capacity. Must match the largest single-frame
 /// payload an upstream consumer can write — `NET_BUF_SIZE` per
-/// target. Anything smaller would truncate `ip_net_read_frame`'s
-/// body, leaving tail bytes in the ring that the next header parse
-/// would mistake for a frame.
+/// target. A frame larger than the reader's buffer is dropped whole,
+/// so anything smaller would lose commands.
 #[cfg(target_arch = "aarch64")]
 const PENDING_CMD_BUF_SIZE: usize = 8192;
 #[cfg(not(target_arch = "aarch64"))]
@@ -2104,49 +2103,6 @@ unsafe fn ip_net_write_frame(
     } else {
         0
     }
-}
-
-/// Read a net_proto frame (header + payload) into the caller's buffer.
-/// Returns `(msg_type, payload_len)` on success, or `(0, 0)` if no
-/// header is available, the body is short-read, or the body exceeds
-/// `buf_cap`. In the oversize case the whole body is drained from
-/// the ring so the next read aligns to the next frame.
-#[inline(always)]
-unsafe fn ip_net_read_frame(
-    sys: &SyscallTable,
-    chan: i32,
-    buf: *mut u8,
-    buf_cap: usize,
-) -> (u8, u16) {
-    let mut hdr = [0u8; 3];
-    let n = (sys.channel_read)(chan, hdr.as_mut_ptr(), 3);
-    if n < 3 {
-        return (0, 0);
-    }
-    let msg_type = *hdr.as_ptr();
-    let payload_len = (*hdr.as_ptr().add(1) as u16) | ((*hdr.as_ptr().add(2) as u16) << 8);
-    if payload_len == 0 || buf_cap == 0 {
-        return (msg_type, payload_len);
-    }
-    if (payload_len as usize) <= buf_cap {
-        let body_n = (sys.channel_read)(chan, buf, payload_len as usize);
-        if body_n != payload_len as i32 {
-            return (0, 0);
-        }
-        return (msg_type, payload_len);
-    }
-    // Body too large for the caller's buffer — drain it in chunks so
-    // the next header parse doesn't read into the leftover body.
-    let mut remaining = payload_len as usize;
-    while remaining > 0 {
-        let chunk = remaining.min(buf_cap);
-        let drained = (sys.channel_read)(chan, buf, chunk);
-        if drained <= 0 {
-            break;
-        }
-        remaining -= drained as usize;
-    }
-    (0, 0)
 }
 
 /// Send a MSG_DATA frame to the net consumer channel. Returns
@@ -4909,9 +4865,9 @@ unsafe fn service_packet_in(s: &mut IpState) {
         if poll <= 0 || (poll as u32 & POLL_IN) == 0 {
             break;
         }
-        let mut buf = [0u8; 16];
-        let (msg, plen) = ip_net_read_frame(sys, s.pkt_in_chan, buf.as_mut_ptr(), buf.len());
-        let plen = plen as usize;
+        let mut frame = [0u8; NET_FRAME_HDR + 16];
+        let (msg, plen) = net_read_frame(sys, s.pkt_in_chan, frame.as_mut_ptr(), frame.len());
+        let buf = &frame[NET_FRAME_HDR..];
         match msg {
             pkt::CMD_PKT_DISPOSE if plen >= 5 => {
                 let id = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
@@ -7334,13 +7290,13 @@ unsafe fn service_addr_ctl(s: &mut IpState) {
     // waits for the next tick (the port is low-rate control, not data).
     let mut count = 0;
     while count <= MAX_LOCAL_ADDRS {
-        let mut buf = [0u8; 32];
-        let (msg_type, payload_len) =
-            ip_net_read_frame(sys, s.addr_ctl_chan, buf.as_mut_ptr(), buf.len());
+        let mut frame = [0u8; NET_FRAME_HDR + 32];
+        let (msg_type, plen) =
+            net_read_frame(sys, s.addr_ctl_chan, frame.as_mut_ptr(), frame.len());
         if msg_type == 0 {
             break;
         }
-        let plen = payload_len as usize;
+        let buf = &frame[NET_FRAME_HDR..];
         match msg_type {
             // [addr:16][prefix_len:1][owner_tag:2 LE][flags:1]?
             IP_ADDR_ADD if plen >= netid::ADDR_ADD_PAYLOAD_LEN => {
@@ -7633,14 +7589,13 @@ unsafe fn service_net_channel(s: &mut IpState) {
         if NET_OUT_QUEUE_SLOTS - s.pending_net_out_count as usize <= NET_OUT_QUEUE_HEADROOM {
             break;
         }
-        let mut buf = [0u8; PENDING_CMD_BUF_SIZE];
-        let (msg_type, payload_len) =
-            ip_net_read_frame(sys, s.net_in_chan, buf.as_mut_ptr(), buf.len());
+        let mut frame = [0u8; NET_FRAME_HDR + PENDING_CMD_BUF_SIZE];
+        let (msg_type, plen) =
+            net_read_frame(sys, s.net_in_chan, frame.as_mut_ptr(), frame.len());
         if msg_type == 0 {
             break;
         }
-
-        let plen = payload_len as usize;
+        let buf = &frame[NET_FRAME_HDR..];
 
         // A command naming an endpoint acts only on one its own lane opened
         // (the shared `net_in` is lane 0, and owns lane 0's).

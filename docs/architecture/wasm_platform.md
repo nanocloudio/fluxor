@@ -232,6 +232,8 @@ of the same name:
 env.channel_read   →  kernel.exports.channel_read
 env.channel_write  →  kernel.exports.channel_write
 env.channel_poll   →  kernel.exports.channel_poll
+env.channel_peek   →  kernel.exports.channel_peek
+env.channel_discard →  kernel.exports.channel_discard
 env.provider_open  →  kernel.exports.provider_open
 env.provider_call  →  kernel.exports.provider_call
 env.provider_query →  kernel.exports.provider_query

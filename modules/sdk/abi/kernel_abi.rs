@@ -184,6 +184,18 @@ pub struct SyscallTable {
         arg: *mut u8,
         arg_len: usize,
     ) -> i32,
+
+    /// Drop the next `len` bytes of a FIFO channel's stream without copying
+    /// them: what is buffered goes at once, and the rest is dropped from the
+    /// front of each later write as it arrives. Returns `len`, or `EINVAL`
+    /// for a bad handle or a mailbox channel.
+    ///
+    /// The consuming half of a whole-frame read: a frame-aware consumer
+    /// peeks the header, peeks the frame once it is all buffered, and
+    /// discards what it copied; a frame it cannot hold, or that is larger
+    /// than the ring, it discards whole. Nothing it does can leave part of a
+    /// frame on the channel.
+    pub channel_discard: unsafe extern "C" fn(handle: i32, len: usize) -> i32,
 }
 
 // SAFETY: apart from the `telemetry_enabled` raw pointer, `SyscallTable` is
@@ -206,8 +218,9 @@ unsafe impl Sync for SyscallTable {}
 // offset it knows and simply never reaches the new tail slots — an
 // extension, not a version break. Layout is one `u32` slot
 // (version, padded to pointer width), 11 function pointers, a telemetry gate
-// pointer, and 1 provider-instance routing pointer = 14 pointer-sized slots,
-// which holds on both 64-bit (native) and 32-bit wasm builds.
+// pointer, 1 provider-instance routing pointer and the channel discard
+// pointer = 15 pointer-sized slots, which holds on both 64-bit (native) and
+// 32-bit wasm builds.
 const _: () = {
     // Every positional field is pinned, not just the first/last + size — a
     // size-preserving reorder (e.g. swapping channel_read and channel_write)
@@ -227,7 +240,8 @@ const _: () = {
     assert!(core::mem::offset_of!(SyscallTable, channel_peek) == p * 11);
     assert!(core::mem::offset_of!(SyscallTable, telemetry_enabled) == p * 12);
     assert!(core::mem::offset_of!(SyscallTable, provider_call_sel) == p * 13);
-    assert!(core::mem::size_of::<SyscallTable>() == p * 14);
+    assert!(core::mem::offset_of!(SyscallTable, channel_discard) == p * 14);
+    assert!(core::mem::size_of::<SyscallTable>() == p * 15);
 };
 
 /// Poll event flags (used with `handle_poll` / `channel_poll`).

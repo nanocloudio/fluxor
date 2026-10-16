@@ -249,7 +249,7 @@ unsafe fn pump(s: &mut TransportBufferState) {
             break; // sink not ready — retry next step; nothing lost.
         }
         let (_msg, copied, _payload_len) =
-            net_read_frame_aligned(sys, chan, s.net_buf.as_mut_ptr(), NET_BUF_SIZE);
+            net_read_frame_sized(sys, chan, s.net_buf.as_mut_ptr(), NET_BUF_SIZE);
         if copied == 0 {
             break; // no full frame available.
         }
@@ -284,7 +284,7 @@ unsafe fn discard_net_in(s: &mut TransportBufferState) {
     let poll = (sys.channel_poll)(chan, 0x01 /* POLL_IN */);
     if poll > 0 && (poll & 0x01) != 0 {
         let buf = s.net_buf.as_mut_ptr();
-        let _ = net_read_frame_aligned(sys, chan, buf, NET_BUF_SIZE);
+        let _ = net_read_frame_sized(sys, chan, buf, NET_BUF_SIZE);
     }
 }
 

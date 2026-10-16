@@ -37,8 +37,9 @@ pub mod op {
     pub const PROVIDER_CLOSE: u32 = 9;
     pub const CHANNEL_PEEK: u32 = 10;
     pub const PROVIDER_CALL_SEL: u32 = 11;
+    pub const CHANNEL_DISCARD: u32 = 12;
     /// Number of operations; veneers exist for `0..COUNT`.
-    pub const COUNT: u32 = 12;
+    pub const COUNT: u32 = 13;
     /// The module's entry returned. Not a table slot: the return veneer sits
     /// after the operation veneers, and its outcome is the step's.
     pub const RETURN: u32 = COUNT;
@@ -702,7 +703,7 @@ pub fn authorise(
             }
             check_arg(&g, Arg::In(ANY), a[1], a[2])
         }
-        op::CHANNEL_POLL => {
+        op::CHANNEL_POLL | op::CHANNEL_DISCARD => {
             if owns_channel(module, h) {
                 Ok(())
             } else {
@@ -818,6 +819,7 @@ pub unsafe fn dispatch(module: usize, op: u32, a: [usize; 6]) -> isize {
             op::CHANNEL_WRITE => (sys.channel_write)(h, a[1] as *const u8, a[2]) as isize,
             op::CHANNEL_POLL => (sys.channel_poll)(h, a[1] as u32) as isize,
             op::CHANNEL_PEEK => (sys.channel_peek)(h, a[1] as *mut u8, a[2]) as isize,
+            op::CHANNEL_DISCARD => (sys.channel_discard)(h, a[1]) as isize,
             op::HEAP_ALLOC => {
                 let p = (sys.heap_alloc)(a[0] as u32);
                 heap_result(module, p)

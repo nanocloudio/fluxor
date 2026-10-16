@@ -113,12 +113,12 @@ core::arch::global_asm!(
     // the region base; each table entry adds the Thumb bit itself.
     ".global fluxor_rp_gateway",
     "fluxor_rp_gateway:",
-    ".irp op, 0,1,2,3,4,5,6,7,8,9,10,11",
+    ".irp op, 0,1,2,3,4,5,6,7,8,9,10,11,12",
     "svc #\\op",
     "bx lr",
     ".endr",
     // The return veneer: entry points return here.
-    "svc #12",
+    "svc #13",
     "b .",
     ".p2align 2",
     ".global fluxor_rp_gateway_table",
@@ -139,6 +139,7 @@ core::arch::global_asm!(
     // module and current at once; the SDK treats null as "ask".
     ".word 0",
     ".word fluxor_rp_gateway + 11*4 + 1", // provider_call_sel
+    ".word fluxor_rp_gateway + 12*4 + 1", // channel_discard
     ".p2align 8",
     version = const crate::abi::ABI_VERSION,
 );
@@ -150,7 +151,7 @@ unsafe extern "C" {
 
 const GATEWAY_BLOCK: u32 = 256;
 const RETURN_OP: u32 = gateway::op::RETURN;
-const _: () = assert!(gateway::op::COUNT == 12 && RETURN_OP == 12);
+const _: () = assert!(gateway::op::COUNT == 13 && RETURN_OP == 13);
 /// The immediate of the SVC the kernel issues, on MSP, to launch or resume
 /// a gated module. A veneer's immediate is its op, which is below
 /// `RETURN_OP`; a module has no SVC of its own the trap honours.

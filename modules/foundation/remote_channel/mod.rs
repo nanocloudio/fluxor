@@ -1291,7 +1291,7 @@ unsafe fn net_input(s: &mut State) {
             break;
         }
         let (msg, plen, full) =
-            net_read_frame_aligned(sys, s.transport_in, s.rx.as_mut_ptr(), RX_SCRATCH);
+            net_read_frame_sized(sys, s.transport_in, s.rx.as_mut_ptr(), RX_SCRATCH);
         if msg == 0 {
             break;
         }
@@ -1381,7 +1381,7 @@ unsafe fn mux_input(s: &mut State) {
             break;
         }
         let (msg, plen, full) =
-            net_read_frame_aligned(sys, s.transport_in, s.rx.as_mut_ptr(), RX_SCRATCH);
+            net_read_frame_sized(sys, s.transport_in, s.rx.as_mut_ptr(), RX_SCRATCH);
         if msg == 0 {
             break;
         }

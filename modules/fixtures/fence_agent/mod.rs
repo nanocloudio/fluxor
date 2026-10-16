@@ -451,7 +451,7 @@ unsafe fn service_ctl(s: &mut AgentState) {
         // Frame-aligned: a payload too large for `buf` is dropped whole
         // rather than left to desync the control channel for good.
         let (msg, copied, payload_len) =
-            net_read_frame_aligned(sys, s.addr_ctl, s.buf.as_mut_ptr(), 64);
+            net_read_frame_sized(sys, s.addr_ctl, s.buf.as_mut_ptr(), 64);
         if msg == 0 {
             break;
         }

@@ -164,6 +164,27 @@ impl RingBufState {
         }
         total
     }
+    /// Drop exactly `n` bytes from the head of the ring without copying
+    /// them. All or nothing: returns `true` and advances the head when `n`
+    /// bytes are buffered, `false` and leaves the ring untouched when fewer
+    /// are. A frame-aware consumer uses it to consume a frame it has peeked,
+    /// or to drop one it cannot hold, once the whole frame is present.
+    pub fn skip(&mut self, n: usize) -> bool {
+        let cap = self.cap;
+        if cap == 0 {
+            return false;
+        }
+        self.head &= self.cap_mask;
+        if self.len > cap {
+            self.len = cap;
+        }
+        if n > self.len {
+            return false;
+        }
+        self.head = (self.head + n) & self.cap_mask;
+        self.len -= n;
+        true
+    }
     /// Bytes available to read. Clamps to `cap` so a corrupted
     /// `len > cap` cannot propagate an oversized "readable" report
     /// through `channel_readable_bytes` to module code.

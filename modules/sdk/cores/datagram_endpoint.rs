@@ -38,7 +38,7 @@
 //       while let Some(ev) = dg_recv(sys, net_in, scratch, max) {
 //           match ev {
 //               DgEvent::Bound { ep_id, local_port } => awaiting_ep.on_bound(ep_id, local_port),
-//               DgEvent::Rx { ep_id, src_ip, src_port, data, len } => { /* route by ep_id / DCID / 4-tuple */ }
+//               DgEvent::Rx { ep_id, src_ip, src_port, data, len, full_len } => { /* route by ep_id / DCID / 4-tuple */ }
 //               DgEvent::Err { .. } => ep.on_error(sys),
 //               DgEvent::Closed { .. } => { /* teardown */ }
 //           }
@@ -95,6 +95,10 @@ enum DgEvent {
         src_port: u16,
         data: *const u8,
         len: usize,
+        /// The datagram's length as sent. `len < full_len` means the
+        /// datagram was larger than the scratch buffer or the channel's
+        /// ring: `data` holds its head and the rest was dropped.
+        full_len: usize,
     },
     Err {
         ep_id: u8,
@@ -426,7 +430,9 @@ impl DatagramEndpoint {
 /// Returns `None` when the channel is empty or the frame is malformed / of an
 /// unknown opcode. `DgEvent::Rx.data` points into `scratch` and is valid until
 /// the next `net_in` read. The consumer feeds `Bound`/`Err` to the owning
-/// endpoint and routes `Rx` by its own key (ep_id / DCID / 4-tuple).
+/// endpoint and routes `Rx` by its own key (ep_id / DCID / 4-tuple). A
+/// datagram larger than `scratch` arrives as its head with `full_len` saying
+/// how long it was; the consumer decides what a truncated datagram means.
 ///
 /// # Safety
 /// `scratch` must be valid for `scratch_max` writes; `sys` is the live syscall
@@ -458,7 +464,8 @@ unsafe fn dg_recv(
     if !net_in_readable(sys, net_in) {
         return None;
     }
-    let (msg_type, payload_len) = net_read_frame(sys, net_in, scratch, scratch_max);
+    let (msg_type, payload_len, full_len) =
+        net_read_frame_sized(sys, net_in, scratch, scratch_max);
     if msg_type == DG_MSG_BOUND && payload_len >= 1 {
         // MSG_DG_BOUND payload: [ep_id:1][local_port:2 LE]. The local port is
         // informational (the endpoint routes by ep_id); tolerate its absence.
@@ -478,6 +485,7 @@ unsafe fn dg_recv(
                 src_port,
                 data,
                 len,
+                full_len: full_len - DG_V4_PREFIX,
             }
         })
     } else if msg_type == DG_MSG_ERROR && payload_len >= 2 {
