@@ -258,6 +258,17 @@ unsafe fn ns_close(raw: i32) -> i32 {
 /// unchanged (mirrors the FS/object siblings); strip to the raw slot. LIST is
 /// prefix-driven from `arg`, so a tagged or -1 handle is both fine.
 unsafe fn linux_namespace_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
+    // A workload's namespace is its own store's: never the host filesystem
+    // and never the node's store.
+    let owner = fluxor::kernel::exec::scheduler::caller_owner();
+    if !owner.is_system() {
+        let Some(store) = fluxor::platform::linux::owner_root::store_for(owner) else {
+            return errno::EACCES;
+        };
+        return fluxor::platform::linux::store::dispatch_namespace_on(
+            store, handle, opcode, arg, arg_len,
+        );
+    }
     // Control-plane store mode (FLUXOR_STORE_DIR set): the versioned store backs
     // storage.namespace here (LIST/SUBSCRIBE + revision fence). Otherwise this
     // provider is the filesystem-backed enumeration surface below.

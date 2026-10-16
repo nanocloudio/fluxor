@@ -758,6 +758,48 @@ into the runtime rather than loadable modules:
   enumerated, and a listing of the written tier alone would omit objects
   `GET` serves.
 
+### What a workload reaches
+
+A workload is a tenant of the node, and the platform providers above are
+the node's. A module whose owner is not the system reaches them only
+inside a root of the owner's own, and a provider layer a workload's own
+module registers (its `fat32`, its `fs_object`, its `mount`) serves that
+workload alone: the resolution of a contract skips every layer whose
+owner is neither the system nor the caller, so a workload can neither
+reach the node through its own provider nor stand in as the node's.
+
+- **Linux `file.data`** resolves a workload's paths beneath
+  `$FLUXOR_OWNER_ROOT/<owner uid>/files/` (default
+  `/var/lib/fluxor/owners`) with `openat2` and `RESOLVE_BENEATH`, `
+  RESOLVE_NO_SYMLINKS` and `RESOLVE_NO_MAGICLINKS`: a leading `/` is the
+  root, `..` never leaves it, and a symlink planted inside it leads
+  nowhere. A path that would leave the root is `EACCES`. The ops that
+  name an entry rather than open it (`UNLINK`, `MKDIR`, `RMDIR`, `LINK`,
+  `RENAME`, `FSYNC_NAME`) open the parent beneath the root the same way and
+  act on the name inside it.
+- **Linux `storage.object` and `storage.namespace`** reach a versioned
+  store of the owner's own, under `<root>/store/`, with the node store's
+  semantics and durability and no grants (`PRESENT` is `ENOSYS`). The
+  host filesystem, the HTTP origin and the node's control-plane store are
+  never a workload's.
+- **bcm2712** keeps one store, whose entries, history and watches carry
+  their owner: each owner sees and changes its own keys, and its watches
+  carry its own changes.
+
+Every handle one of these providers mints is the opener's: the kernel
+tracks file, namespace and object handles to the owner that opened them,
+refuses them to any other owner (`EACCES`), and closes them when the
+owner is released. The bytes an owner holds, its files and its store
+values, are charged to its storage ledger against the `storage_bytes` its
+`CREATE` admitted (0 is unlimited): a write that would grow a file, a
+`PREALLOCATE`, or a `PUT` past the cap is `ENOSPC`, and an unlink,
+truncate or delete gives the bytes back. The root is made when the owner
+first touches storage and removed when the owner is released: a `DESTROY`,
+a `KILL`, or a rolled-back admission. Nothing else removes it, so a root
+survives a runtime restart, and an owner admitted again under the same
+identity finds what it held, charged to its ledger. Data that must
+outlive the owner itself belongs to a volume.
+
 ### The versioned watchable key store
 
 Some consumers do not want a filesystem or a byte range; they want keys they

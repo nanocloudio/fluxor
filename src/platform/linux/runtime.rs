@@ -410,6 +410,8 @@ fn linux_init_providers() {
     use fluxor::kernel::module::provider;
     use fluxor::kernel::module::provider::contract as dev_class;
     provider::register(dev_class::FS, linux_fs_dispatch);
+    // An owner's storage root goes with the owner.
+    provider::register_owner_release_hook(fluxor::platform::linux::owner_root::release);
     provider::register(dev_class::STREAM_CLOCK, linux_stream_time_dispatch);
     // The platform's verdict on a certificate chain. Registered only where
     // the verifier is built in; without it nothing answers class 0x1D and a

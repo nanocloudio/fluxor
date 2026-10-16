@@ -60,6 +60,17 @@ struct HttpResult {
 /// Dispatch entry registered for the STORAGE_OBJECT contract from
 /// `linux_init_providers`.
 unsafe fn linux_object_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
+    // A workload's objects are its own store's: never the HTTP origin and
+    // never the node's store.
+    let owner = fluxor::kernel::exec::scheduler::caller_owner();
+    if !owner.is_system() {
+        let Some(store) = fluxor::platform::linux::owner_root::store_for(owner) else {
+            return obj_errno::EACCES;
+        };
+        return fluxor::platform::linux::store::dispatch_object_on(
+            store, false, handle, opcode, arg, arg_len,
+        );
+    }
     // Control-plane store mode (FLUXOR_STORE_DIR set): the versioned store backs
     // storage.object here (PUT/GET/HEAD/DELETE/CAS + revision fence). Otherwise
     // this provider is the HTTP-backed object surface below.

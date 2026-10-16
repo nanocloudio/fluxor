@@ -253,6 +253,11 @@ unsafe fn workload_create(arg: *const u8, arg_len: usize) -> i32 {
     if !crate::kernel::exec::scheduler::owners().authorize_admit(owner) {
         return errno::EACCES; // draining/revoked owner cannot admit new work
     }
+    // What the owner may hold in the node's storage.
+    let storage_bytes = u64::from_le_bytes([
+        buf[68], buf[69], buf[70], buf[71], buf[72], buf[73], buf[74], buf[75],
+    ]);
+    crate::kernel::exec::scheduler::owners_mut().set_storage_cap(owner, storage_bytes);
 
     // Lease-gate each declared endpoint against the owner's lease before any
     // mechanism runs. A refusal blocks admission. The workload-level net_iso
@@ -454,6 +459,44 @@ pub unsafe fn linux_workload_dispatch(
     if opcode == wl::MODULE_DIGESTS {
         return workload_graph::workload_dispatch(-1, opcode, arg, arg_len);
     }
+    // By identity: the graph backend first (a staged CREATE, or a graph
+    // workload), then the host-process slots.
+    if opcode == wl::LOOKUP || (opcode == wl::DESTROY && handle < 0) {
+        let rc = workload_graph::workload_dispatch(-1, opcode, arg, arg_len);
+        if rc != errno::ENOENT {
+            return if opcode == wl::LOOKUP && rc >= 0 {
+                tag_fd(FD_TAG_WORKLOAD, GRAPH_SLOT_BASE + slot_of(rc))
+            } else {
+                rc
+            };
+        }
+        if arg.is_null() || arg_len < 16 {
+            return errno::EINVAL;
+        }
+        let mut identity = [0u8; 16];
+        identity.copy_from_slice(core::slice::from_raw_parts(arg, 16));
+        let slots = &*core::ptr::addr_of!(LINUX_WORKLOADS);
+        let owners = crate::kernel::exec::scheduler::owners();
+        let Some(idx) = (0..MAX_WORKLOADS).find(|&i| {
+            slots[i].in_use
+                && owners
+                    .lookup(slots[i].owner)
+                    .is_some_and(|e| e.owner_uid == identity)
+        }) else {
+            return errno::ENOENT;
+        };
+        if opcode == wl::LOOKUP {
+            let owner = slots[idx].owner;
+            let out = core::slice::from_raw_parts_mut(arg, 6);
+            out[0..2].copy_from_slice(&owner.slot.to_le_bytes());
+            out[2..6].copy_from_slice(&owner.generation.to_le_bytes());
+            return tag_fd(FD_TAG_WORKLOAD, idx as i32);
+        }
+        let bidx = slots[idx].backend_idx;
+        let rc = hp_destroy(bidx);
+        (*core::ptr::addr_of_mut!(LINUX_WORKLOADS))[idx] = WORKLOAD_EMPTY;
+        return rc;
+    }
 
     let raw = slot_of(handle);
     if raw >= GRAPH_SLOT_BASE {
@@ -515,7 +558,7 @@ unsafe fn workload_caps(arg: *mut u8, arg_len: usize) -> i32 {
     // advertised iff the host can freeze at all (cgroup2 present); a workload
     // whose own cgroup setup failed still gets per-workload ENOSYS.
     // READ/EXEC/TTY are the host-process class's ops, not this contract's.
-    let mut ops = wl::caps::SIGNAL;
+    let mut ops = wl::caps::SIGNAL | wl::caps::LOOKUP;
     if host_backend_can_freeze() {
         ops |= wl::caps::PAUSE;
     }

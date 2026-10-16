@@ -158,6 +158,24 @@ than `observe` (`EACCES`), checked before anything is allocated. One
 subgraph holds at most 64 modules and 128 edges (`MAX_ADD_MODULES`,
 `MAX_ADD_EDGES`); the build refuses a workload past either.
 
+A workload's `CREATE` header carries its quotas: `memory_bytes` for its
+state and buffers, and `storage_bytes` for what it may hold in the node's
+storage, its files and its store values, charged by the platform providers
+and refused with `ENOSPC` past the cap (0 is unlimited; see
+[storage](storage_capability_surface.md#what-a-workload-reaches)).
+
+One identity is one workload. `CREATE` for an identity that is already
+live, or still being staged, answers `EEXIST`, so a caller that lost its
+handle recovers it with `LOOKUP` by identity rather than creating a
+second owner. The graph backend stages a subgraph a few modules per call
+(`ADD_MODULES_PER_CALL`): `CREATE` reserves the owner, opens the channels
+and instantiates the first batch, then answers `EINPROGRESS`, and the
+caller asks again each step with the same spec until the handle comes
+back, so no single call holds the scheduler for longer than a few module
+loads. `LOOKUP` on an identity being staged answers `EINPROGRESS`, and
+`DESTROY` with no handle and the identity as its argument abandons a
+staged `CREATE` or destroys a live workload.
+
 A workload can bring its own modules (`SOURCE_FMOD_PACK`): an FXMT module
 table in the caller's memory, the SHA-256 pins its modules are admitted by,
 then the subgraph. The kernel copies the table into a page-aligned region

@@ -53,7 +53,15 @@
 /// tagged `WorkloadHandle` fd, or a negative errno. The caller must hold the
 /// workload-admit grant (`requires_contract = "workload"` + `platform_raw`).
 /// Identity in the spec is mapped to an owner and lease-gated before any
-/// backend mechanism runs.
+/// backend mechanism runs. One identity is one workload: a `CREATE` for an
+/// identity that is already live, or being staged, answers `EEXIST`.
+///
+/// A graph backend stages a subgraph a few modules per call: `CREATE`
+/// answers `EINPROGRESS` until the last module is in, and the caller asks
+/// again each step with the same spec, byte for byte, until it gets the
+/// handle. The spec is scratch once the handle is returned. A different spec
+/// while one is being staged answers `EBUSY`; [`LOOKUP`] finds the staged
+/// identity and [`DESTROY`] by identity abandons it.
 pub const CREATE: u32 = 0x1A00;
 
 /// `START` — release the create/start barrier so the workload begins executing.
@@ -73,6 +81,10 @@ pub const SIGNAL: u32 = 0x1A03;
 
 /// `DESTROY` — stop (graceful → forced), reap, release the owner/lease and any
 /// backend resources (isolation domain, arena). Idempotent. Returns `0`.
+///
+/// With `handle = -1` and `arg` = the 16-byte identity, destroys by identity:
+/// a live workload as above, or a `CREATE` still being staged, which is rolled
+/// back. `ENOENT` when nothing carries the identity.
 pub const DESTROY: u32 = 0x1A04;
 
 // ---- 0x1A05..0x1A0A: retired to `abi::platform::linux::host_process` ----
@@ -219,6 +231,13 @@ pub mod pack_ref {
     pub const PIN_SIZE: usize = 32;
 }
 
+/// `LOOKUP` — the workload an identity names, for a caller that lost its
+/// handle (a restart mid-`CREATE`, or after it). `handle = -1`; `arg` is the
+/// 16-byte identity, and on success it receives `[slot:u16 LE][generation:u32
+/// LE]` of the owner. Returns the tagged `WorkloadHandle`, `EINPROGRESS` when
+/// the identity's `CREATE` is still being staged (continue it with the same
+/// spec, or abandon it with [`DESTROY`] by identity), or `ENOENT`.
+pub const LOOKUP: u32 = 0x1A12;
 /// `MODULE_DIGESTS` — what the node's own image holds, so an orchestrator can
 /// pin a workload against it: writes `[count:u16 LE][0:u16]` then `count`
 /// records `[name_hash:u32 LE][sha256 of the module's full .fmod bytes:32]`
@@ -271,6 +290,9 @@ pub const SIG_KILL: u32 = 2;
 ///  49     1  net_prefix_len  address prefix length in bits (family-scoped)
 ///  50     2  net_segment     segment/lane id the identity belongs to (0 = default)
 ///  52    16  net_addr        address bytes (IPv4 in bytes 0..4, rest zero)
+///  68     8  storage_bytes   storage quota: the bytes the workload may hold
+///                            in the node's storage, its files and its store
+///                            (0 = unlimited)
 /// ```
 /// Then: `source_ref[source_ref_len]`, `endpoints[endpoint_count]` (each
 /// [`NET_ENDPOINT_SIZE`] bytes), `options[options_len]` (TLV, §5.2).
@@ -281,7 +303,7 @@ pub const SIG_KILL: u32 = 2;
 /// veth, no netns vocabulary). `NET_FAM_NONE` means no identity was assigned;
 /// combined with every endpoint at [`NET_ISO_SHARED`] the workload shares the
 /// host/system network domain.
-pub const CREATE_HEADER_SIZE: usize = 68;
+pub const CREATE_HEADER_SIZE: usize = 76;
 
 /// Network-identity family values (`net_family`).
 pub const NET_FAM_NONE: u8 = 0;
@@ -344,6 +366,9 @@ pub mod caps {
     /// bit claims the backend can freeze AT ALL; a specific workload whose
     /// freeze mechanism could not be set up may still return `ENOSYS`.
     pub const PAUSE: u16 = 1 << 4;
+    /// Backend answers [`super::LOOKUP`] and [`super::DESTROY`] by identity,
+    /// and its `CREATE` may answer `EINPROGRESS` between batches.
+    pub const LOOKUP: u16 = 1 << 5;
 
     // `net` bitmap — which Tier-1 network fields the backend realizes. A
     // CREATE that asks for an unadvertised bit fails admission (`ENOSYS`),

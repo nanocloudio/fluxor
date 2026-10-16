@@ -147,6 +147,10 @@ const MAX_WORKLOADS: usize = MAX_OWNERS;
 
 static mut FMOD_WORKLOADS: [WorkloadSlot; MAX_WORKLOADS] = [WL_EMPTY; MAX_WORKLOADS];
 
+/// The pack of the `CREATE` being staged across calls, until the add is
+/// published (bound to its owner) or abandoned (released).
+static mut STAGED_PACK: Option<code_pack::Staged> = None;
+
 #[inline]
 fn rd_u16(b: &[u8], off: usize) -> u16 {
     u16::from_le_bytes([b[off], b[off + 1]])
@@ -311,6 +315,9 @@ unsafe fn workload_create(arg: *mut u8, arg_len: usize) -> i32 {
     let memory_bytes = u64::from_le_bytes([
         buf[24], buf[25], buf[26], buf[27], buf[28], buf[29], buf[30], buf[31],
     ]);
+    let storage_bytes = u64::from_le_bytes([
+        buf[68], buf[69], buf[70], buf[71], buf[72], buf[73], buf[74], buf[75],
+    ]);
     let source_ref_len = rd_u16(buf, 40) as usize;
     let endpoint_count = rd_u16(buf, 42) as usize;
     let options_len = rd_u32(buf, 44) as usize;
@@ -407,42 +414,56 @@ unsafe fn workload_create(arg: *mut u8, arg_len: usize) -> i32 {
     if buf[..16].iter().all(|&b| b == 0) {
         return errno::EINVAL;
     }
+    let mut identity = [0u8; 16];
+    identity.copy_from_slice(&buf[..16]);
+    // A CREATE still being staged is continued by the same spec; a CREATE
+    // for anyone else waits until it is published or abandoned.
+    let continuing = match live::staged_add_identity() {
+        Some(id) if id == identity => true,
+        Some(_) => return errno::EBUSY,
+        None => false,
+    };
 
     // ── A pack: the workload's own modules, staged as its code. Each must be
     //    the module asked for — its bytes match a pin — or one the node's
     //    signing root signed; then the region is made executable, and the
     //    subgraph's names resolve in it first (until the add is decided).
-    let staged = match pack {
-        Some((ptr, len, pins)) => {
-            let bytes = core::slice::from_raw_parts(ptr as *const u8, len);
-            let staged = match code_pack::stage(bytes) {
-                Ok(s) => s,
-                Err(e) => return e,
-            };
-            let pin_bytes = &buf[src_start + wl::pack_ref::SIZE
-                ..src_start + wl::pack_ref::SIZE + pins * wl::pack_ref::PIN_SIZE];
-            let mut ok = true;
-            let ldr = code_pack::loader(staged);
-            code_pack::for_each_module(staged, |hash, fmod| {
-                let pinned = |p: &[u8; 32]| -> bool { pin_matches(pin_bytes, p) };
-                let module = ldr.find_by_name_hash(hash);
-                ok &= match module {
-                    Ok(m) => code_pack::admitted_with(fmod, &m, pinned),
-                    Err(_) => false,
+    let staged = if continuing {
+        // Staged by the first call and still resolving the subgraph's names.
+        (*core::ptr::addr_of_mut!(STAGED_PACK)).take()
+    } else {
+        match pack {
+            Some((ptr, len, pins)) => {
+                let bytes = core::slice::from_raw_parts(ptr as *const u8, len);
+                let staged = match code_pack::stage(bytes) {
+                    Ok(s) => s,
+                    Err(e) => return e,
                 };
-            });
-            if !ok {
-                code_pack::release(staged);
-                return errno::EACCES;
+                let pin_bytes = &buf[src_start + wl::pack_ref::SIZE
+                    ..src_start + wl::pack_ref::SIZE + pins * wl::pack_ref::PIN_SIZE];
+                let mut ok = true;
+                let ldr = code_pack::loader(staged);
+                code_pack::for_each_module(staged, |hash, fmod| {
+                    let pinned = |p: &[u8; 32]| -> bool { pin_matches(pin_bytes, p) };
+                    let module = ldr.find_by_name_hash(hash);
+                    ok &= match module {
+                        Ok(m) => code_pack::admitted_with(fmod, &m, pinned),
+                        Err(_) => false,
+                    };
+                });
+                if !ok {
+                    code_pack::release(staged);
+                    return errno::EACCES;
+                }
+                if !code_pack::seal(staged) {
+                    code_pack::release(staged);
+                    return errno::EFAULT;
+                }
+                code_pack::begin_staging(staged);
+                Some(staged)
             }
-            if !code_pack::seal(staged) {
-                code_pack::release(staged);
-                return errno::EFAULT;
-            }
-            code_pack::begin_staging(staged);
-            Some(staged)
+            None => None,
         }
-        None => None,
     };
     // Every return from here to the add's verdict releases what was staged.
     let unstage = |staged: Option<code_pack::Staged>| {
@@ -513,7 +534,6 @@ unsafe fn workload_create(arg: *mut u8, arg_len: usize) -> i32 {
         unstage(staged);
         return errno::EINVAL;
     };
-    let edge_base = scheduler::sched_mut().edge_count;
     live::set_caller(Some(scheduler::current_module_index()));
     let rc = if wants_identity {
         let spare_lane = provider_net_in_spare_lane();
@@ -522,15 +542,23 @@ unsafe fn workload_create(arg: *mut u8, arg_len: usize) -> i32 {
         live::apply_add_encoded(src_ptr, source_ref_len)
     };
     live::set_caller(None);
+    if rc == errno::EINPROGRESS {
+        // A batch is in; the pack stays staged for the next call.
+        *core::ptr::addr_of_mut!(STAGED_PACK) = staged;
+        return rc;
+    }
     if rc != 0 {
         unstage(staged);
         return rc; // negative AddError::code, -ENOMEM (no spare lane), or -EINVAL
     }
+    let edge_base = live::last_add_edge_base();
     let hb = core::slice::from_raw_parts(src_ptr, 6);
     let owner = OwnerHandle {
         slot: u16::from_le_bytes([hb[0], hb[1]]),
         generation: u32::from_le_bytes([hb[2], hb[3], hb[4], hb[5]]),
     };
+    // What the owner may hold in the node's storage.
+    scheduler::owners_mut().set_storage_cap(owner, storage_bytes);
     // The pack is the owner's now: freed with it (`live::free_owner`), so
     // every later failure's `free_owner` takes the code too.
     code_pack::end_staging();
@@ -712,7 +740,7 @@ unsafe fn workload_caps(arg: *mut u8, arg_len: usize) -> i32 {
     // Ops: PAUSE only. READ (no metal owner-log tee), EXEC/TTY (no process to
     // exec into) stay clear; the SIGNAL bit asserts real process-group signal
     // delivery this backend does not provide (TERM→drain, KILL→free).
-    out[2..4].copy_from_slice(&wl::caps::PAUSE.to_le_bytes());
+    out[2..4].copy_from_slice(&(wl::caps::PAUSE | wl::caps::LOOKUP).to_le_bytes());
     // Net: NET_ISO_OWN | NET_IDENTITY — a `net=own` workload's own IPv4
     // address is installed into the net-identity provider and ARP-answered.
     // Owner-scoped *binds* to that address are not resolved here (the
@@ -785,7 +813,9 @@ unsafe fn live_stats_record(opcode: u32, rc: i32, us: u64) {
     let st = &mut *core::ptr::addr_of_mut!(LIVE_STATS);
     let us = us.min(u32::MAX as u64) as u32;
     let due = if opcode == wl::CREATE {
-        if rc < 0 {
+        if rc == errno::EINPROGRESS {
+            false
+        } else if rc < 0 {
             st.create_fails = st.create_fails.wrapping_add(1);
             true
         } else {
@@ -861,6 +891,45 @@ unsafe fn dispatch_op(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) ->
             crate::kernel::workload::net_attach::take_queued(slot, buf)
         } else {
             crate::kernel::workload::net_attach::admit_queued(slot, buf)
+        };
+    }
+
+    if opcode == wl::LOOKUP {
+        if arg.is_null() || arg_len < 16 {
+            return errno::EINVAL;
+        }
+        let out = core::slice::from_raw_parts_mut(arg, arg_len);
+        let mut identity = [0u8; 16];
+        identity.copy_from_slice(&out[..16]);
+        if live::staged_add_identity() == Some(identity) {
+            return errno::EINPROGRESS;
+        }
+        let Some(widx) = slot_by_identity(&identity) else {
+            return errno::ENOENT;
+        };
+        let owner = (*core::ptr::addr_of!(FMOD_WORKLOADS))[widx].owner;
+        out[0..2].copy_from_slice(&owner.slot.to_le_bytes());
+        out[2..6].copy_from_slice(&owner.generation.to_le_bytes());
+        return tag_fd(FD_TAG_WORKLOAD, widx as i32);
+    }
+    if opcode == wl::DESTROY && handle < 0 {
+        if arg.is_null() || arg_len < 16 {
+            return errno::EINVAL;
+        }
+        let mut identity = [0u8; 16];
+        identity.copy_from_slice(core::slice::from_raw_parts(arg, 16));
+        if live::staged_add_identity() == Some(identity) {
+            // Abandon the staged CREATE: its add rolls back and its pack goes.
+            live::abandon_staged_add();
+            code_pack::end_staging();
+            if let Some(s) = (*core::ptr::addr_of_mut!(STAGED_PACK)).take() {
+                code_pack::release(s);
+            }
+            return 0;
+        }
+        return match slot_by_identity(&identity) {
+            Some(widx) => destroy_slot(widx),
+            None => errno::ENOENT,
         };
     }
 
@@ -941,18 +1010,32 @@ unsafe fn dispatch_op(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) ->
             }
             need as i32
         }
-        wl::DESTROY => {
-            // Remove the net identity (ADDR_DEL) before freeing the
-            // owner; a zero/cleared address is a no-op (host-shared, or already
-            // removed by SIG_KILL).
-            let slots = &mut *core::ptr::addr_of_mut!(FMOD_WORKLOADS);
-            remove_identity(&slots[raw as usize].net_addr);
-            let _ = live::free_owner(owner); // idempotent — stale handle is fine
-            slots[raw as usize] = WL_EMPTY;
-            0
-        }
+        wl::DESTROY => destroy_slot(raw as usize),
         _ => errno::ENOSYS,
     }
+}
+
+/// Tear workload slot `widx` down: remove its net identity (ADDR_DEL) before
+/// freeing the owner (a zero or cleared address is a no-op: host-shared, or
+/// already removed by SIG_KILL), then free the slot.
+unsafe fn destroy_slot(widx: usize) -> i32 {
+    let slots = &mut *core::ptr::addr_of_mut!(FMOD_WORKLOADS);
+    remove_identity(&slots[widx].net_addr);
+    let _ = live::free_owner(slots[widx].owner); // idempotent — stale handle is fine
+    slots[widx] = WL_EMPTY;
+    0
+}
+
+/// The live workload slot whose owner carries `identity`.
+unsafe fn slot_by_identity(identity: &[u8; 16]) -> Option<usize> {
+    let slots = &*core::ptr::addr_of!(FMOD_WORKLOADS);
+    let owners = scheduler::owners();
+    (0..MAX_WORKLOADS).find(|&i| {
+        slots[i].in_use
+            && owners
+                .lookup(slots[i].owner)
+                .is_some_and(|e| e.owner_uid == *identity)
+    })
 }
 
 /// Does `pins` (32-byte SHA-256 pins, back to back) hold `digest`?

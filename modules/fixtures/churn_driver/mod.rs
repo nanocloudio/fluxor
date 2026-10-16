@@ -427,7 +427,12 @@ unsafe fn progress(sys: &SyscallTable, s: &State) {
 /// CREATE + START the workload laid in `s.arg`; the handle, or a negative errno.
 unsafe fn admit(sys: &SyscallTable, s: &mut State, len: usize) -> i32 {
     let t0 = dev_micros(sys);
-    let h = (sys.provider_call)(-1, wl::CREATE, s.arg.as_mut_ptr(), len);
+    // A large subgraph is staged a batch of modules per call; ask again with
+    // the same spec until the handle comes back.
+    let mut h = (sys.provider_call)(-1, wl::CREATE, s.arg.as_mut_ptr(), len);
+    while h == abi::kernel_abi::errno::EINPROGRESS {
+        h = (sys.provider_call)(-1, wl::CREATE, s.arg.as_mut_ptr(), len);
+    }
     let dt = dev_micros(sys).saturating_sub(t0).min(u32::MAX as u64) as u32;
     if h < 0 {
         return h;

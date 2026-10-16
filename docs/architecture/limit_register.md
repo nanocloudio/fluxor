@@ -310,7 +310,7 @@ cannot be evaluated from its own file reads `—` and says why.
 | Buffer-arena free-region list | `MAX_FREE_REGIONS` | src/kernel/ipc/buffer_pool.rs | 128 | Deliberate cap with a stated degradation: returned regions are kept coalesced, so the list holds one entry per gap in the arena, not per closed channel; a region returned while it is full is leaked (reported by `buffer_free_list_usage`) until the next `reset_buffer_arena` |
 | State-arena free-region list | `MAX_FREE_REGIONS` | src/kernel/module/loader.rs | 32 | Deliberate cap with a stated degradation: when the list is full a freed region is leaked until the next full arena reset, which is what a reconfigure does anyway |
 | Isolated-image arena | `ISO_ARENA_SIZE` | src/kernel/module/loader.rs | 2097152 | Policy (`kernel-vm`): all isolated module state and heap of one image; exhaustion refuses the load |
-| Tracked provider handles | `MAX_TRACKED` | src/kernel/module/provider.rs | 128 | Policy: handle-to-owner bindings the kernel keeps for cross-owner checks; an open past it is refused, and the table is scanned on every provider call, so it is kept small on purpose |
+| Tracked provider handles | `MAX_TRACKED` | src/kernel/module/provider.rs | — | Policy, per profile (512 multitenant / 128 single-owner): handle-to-owner bindings the kernel keeps for cross-owner checks and for closing what an owner held when it is released. A multi-tenant kernel tracks every file, namespace and object handle besides the untagged ones, so the table is sized to the platform's slot tables; a single-tenant kernel scopes nothing by owner and keeps the table small. An open past it is refused, and the table is scanned on every provider call |
 | Provider vtables | `MAX_PROVIDERS` | src/kernel/module/provider.rs | 64 | Derived, not chosen: one vtable slot per contract id, so a contract registerable in one and not the other is impossible by construction |
 | Contracts per provider module | `MAX_CONTRACTS_PER_PROVIDER` | src/kernel/module/loader.rs | 4 | Policy: the contracts one provider state may serve through `module_provides_contracts` (a store owning its objects and their namespace needs two); entries past it are not registered |
 | Dynamic tag routes | `MAX_DYN_TAG_ROUTES` | src/kernel/module/provider.rs | 4 | Policy: keyed provider routes a policy module may add at runtime |
@@ -656,7 +656,8 @@ TICK_BOUND_MAX | src/kernel/boot/config.rs | 50_000 | *
 MAX_FREE_REGIONS | src/kernel/ipc/buffer_pool.rs | 128 | *
 MAX_FREE_REGIONS | src/kernel/module/loader.rs | 32 | *
 ISO_ARENA_SIZE | src/kernel/module/loader.rs | 2 * 1024 * 1024 | kernel-vm
-MAX_TRACKED | src/kernel/module/provider.rs | 128 | *
+MAX_TRACKED | src/kernel/module/provider.rs | 512 | multitenant
+MAX_TRACKED | src/kernel/module/provider.rs | 128 | single-owner
 MAX_PROVIDERS | src/kernel/module/provider.rs | MAX_CONTRACTS | *
 MAX_DYN_TAG_ROUTES | src/kernel/module/provider.rs | 4 | *
 MAX_KEY_BYTES | src/kernel/security/key_vault.rs | 64 | *

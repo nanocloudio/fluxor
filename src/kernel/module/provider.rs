@@ -276,6 +276,12 @@ fn vtable_for(contract: ContractId) -> Option<&'static ProviderVTable> {
 // (event / timer / DMA-fd) identify their contract via tag bits and
 // don't consume a slot.
 
+/// A multi-tenant kernel tracks every storage handle to its owner besides
+/// the untagged ones, so the table is sized to the platform's slot tables;
+/// a single-tenant kernel scopes nothing by owner and keeps it small.
+#[cfg(feature = "multitenant")]
+const MAX_TRACKED: usize = 512;
+#[cfg(not(feature = "multitenant"))]
 const MAX_TRACKED: usize = 128;
 
 struct HandleBinding {
@@ -306,10 +312,10 @@ fn track_handle(handle: i32, contract: ContractId) -> Result<(), ()> {
     }
     // Tagged fds (event / timer / dma) are self-identifying — the FD
     // tag carries the contract id, so `lookup_contract` resolves them
-    // without a tracking table entry. Skip tracking to keep the table
-    // available for untagged handles (GPIO pins, DMA channel numbers,
-    // HAL handles) that genuinely need an entry.
-    if fd_tag_contract(handle).is_some() {
+    // without a tracking table entry. They are not tracked, keeping the
+    // table for untagged handles (GPIO pins, DMA channel numbers, HAL
+    // handles) and for the storage handles an owner must not share.
+    if fd_tag_contract(handle).is_some_and(|c| !is_owner_scoped_contract(c)) {
         return Ok(());
     }
     // SAFETY: HANDLE_BINDINGS is scheduler-thread-owned; track_handle
@@ -345,7 +351,25 @@ fn track_handle(handle: i32, contract: ContractId) -> Result<(), ()> {
 /// stamps per-workload owners (every module is the system owner until then).
 #[cfg(feature = "multitenant")]
 fn deny_cross_owner_handle(handle: i32, syscall: &str) -> bool {
-    if handle < 0 || fd_tag_contract(handle).is_some() {
+    if handle < 0 {
+        return false;
+    }
+    let caller = crate::kernel::exec::scheduler::caller_owner();
+    // A routed handle is its minting module's, so its owner's.
+    if let RouteLookup::Live(idx) = route_lookup(handle) {
+        let r = route_at(idx);
+        if r.minter != crate::kernel::exec::scheduler::NO_MODULE {
+            let minted_by = crate::kernel::exec::scheduler::module_owner(r.minter as usize);
+            if !crate::kernel::workload::owner::same_or_system(caller, minted_by) {
+                log::warn!(
+                    "[provider] {syscall}: owner slot {} denied routed handle {handle:#x} \
+                     (minted by owner slot {})",
+                    caller.slot,
+                    minted_by.slot,
+                );
+                return true;
+            }
+        }
         return false;
     }
     // SAFETY: HANDLE_BINDINGS is scheduler-thread-owned (see `track_handle`).
@@ -357,7 +381,6 @@ fn deny_cross_owner_handle(handle: i32, syscall: &str) -> bool {
     let Some(bound_owner) = bound_owner else {
         return false;
     };
-    let caller = crate::kernel::exec::scheduler::caller_owner();
     if crate::kernel::workload::owner::same_or_system(caller, bound_owner) {
         false
     } else {
@@ -561,7 +584,7 @@ pub fn provider_open(
     match contract_to_tag(contract) {
         Some(expected) => {
             let (actual, slot) = fd::untag_fd(handle);
-            if actual == expected {
+            let tagged = if actual == expected {
                 handle
             } else if actual == 0 {
                 fd::tag_fd(expected, slot)
@@ -569,8 +592,22 @@ pub fn provider_open(
                 log::error!(
                     "[provider] contract {contract:#x} open returned handle with tag={actual} (expected {expected}); refusing",
                 );
-                errno::ENOSYS
+                return errno::ENOSYS;
+            };
+            // A storage handle is the opener's: tracked to its owner, so no
+            // other owner can use it, and closed with the owner.
+            if is_owner_scoped_contract(contract) && track_handle(tagged, contract).is_err() {
+                if let Some(vt) = vtable_for(contract) {
+                    if vt.default_close_op != 0 {
+                        // SAFETY: the registered close op; null arg, zero len.
+                        unsafe {
+                            (vt.call)(tagged, vt.default_close_op, core::ptr::null_mut(), 0);
+                        }
+                    }
+                }
+                return errno::ENOMEM;
             }
+            tagged
         }
         None => {
             // Untagged contract (CHANNEL): class-byte dispatch looks
@@ -698,6 +735,13 @@ pub fn provider_close(handle: i32) -> i32 {
     if deny_cross_owner_handle(handle, "provider_close") {
         return errno::EACCES;
     }
+    close_tracked(handle)
+}
+
+/// Close `handle` through its provider and drop its tracking: the body of
+/// [`provider_close`], for a caller that has already been checked, or the
+/// kernel closing on an owner's behalf.
+fn close_tracked(handle: i32) -> i32 {
     match route_lookup(handle) {
         RouteLookup::Live(idx) => {
             let r = route_at(idx);
@@ -728,6 +772,55 @@ pub fn provider_close(handle: i32) -> i32 {
     };
     release_handle(handle);
     result
+}
+
+/// Close every tracked handle `owner` opened. Run at the owner's release,
+/// after its modules are torn down: a file or store handle a workload held
+/// does not outlive it.
+#[cfg(feature = "multitenant")]
+pub fn release_owner_handles(owner: crate::kernel::workload::owner::OwnerHandle) {
+    if owner.is_system() {
+        return;
+    }
+    let mut held = [-1i32; MAX_TRACKED];
+    let mut n = 0usize;
+    // SAFETY: scheduler-thread read; the closes below run after it.
+    unsafe {
+        let p = &raw const HANDLE_BINDINGS;
+        for slot in (*p).iter() {
+            if slot.handle >= 0 && slot.owner == owner {
+                held[n] = slot.handle;
+                n += 1;
+            }
+        }
+    }
+    for &h in held.iter().take(n) {
+        // The kernel closes on the owner's behalf: no caller to check.
+        let rc = close_tracked(h);
+        if rc < 0 {
+            log::warn!(
+                "[provider] owner slot {} released with handle {h:#x} that would not close: {rc}",
+                owner.slot
+            );
+            release_handle(h);
+        }
+    }
+}
+
+/// Single-tenant: no owner holds handles of its own.
+#[cfg(not(feature = "multitenant"))]
+pub fn release_owner_handles(_owner: crate::kernel::workload::owner::OwnerHandle) {}
+
+/// What the platform does when an owner is released: close the owner's
+/// stores and drop its roots. Registered by the platform at init; called
+/// from `notify_owner_released` after the module observers, while the
+/// owner's entry still resolves.
+static mut OWNER_RELEASE_HOOK: Option<fn(crate::kernel::workload::owner::OwnerHandle)> = None;
+
+/// Register the platform's owner-release hook. One hook; the last wins.
+pub fn register_owner_release_hook(hook: fn(crate::kernel::workload::owner::OwnerHandle)) {
+    // SAFETY: platform init, before any owner is released.
+    unsafe { *core::ptr::addr_of_mut!(OWNER_RELEASE_HOOK) = Some(hook) };
 }
 
 /// Clear all handle tracking. Called on `scheduler::reset` so new
@@ -831,6 +924,11 @@ struct ProviderLayer {
     module_idx: ModuleId,
     dispatch: ModuleProviderDispatchFn,
     state: *mut u8,
+    /// The owner of the module that registered the layer. A layer is
+    /// visible to the system and to its own owner: a workload's own
+    /// filesystem serves it alone, and no workload can stand in for the
+    /// node's.
+    owner: crate::kernel::workload::owner::OwnerHandle,
     /// Instance selector (FNV-1a hash of a short volume/instance string,
     /// shared with modules via `abi::provider_selector::hash`). `0` =
     /// unkeyed / default provider — the target of the class-byte
@@ -1017,6 +1115,7 @@ pub fn register_module_provider(
             dispatch,
             state,
             selector,
+            owner: crate::kernel::exec::scheduler::module_owner(module_idx as usize),
         });
         entry.depth += 1;
         log::info!(
@@ -1200,6 +1299,16 @@ pub(crate) fn encode_owner_record(owner: crate::kernel::workload::owner::OwnerHa
 /// provider frame, so `caller_module_index` reports whoever is tearing down
 /// rather than leaving a stale frame behind.
 pub fn notify_owner_released(owner: crate::kernel::workload::owner::OwnerHandle) {
+    notify_module_observers(owner);
+    // SAFETY: scheduler-thread read of a hook set at platform init.
+    if let Some(hook) = unsafe { *core::ptr::addr_of!(OWNER_RELEASE_HOOK) } {
+        hook(owner);
+    }
+}
+
+/// The module half of [`notify_owner_released`]: every provider module that
+/// subscribed is told once.
+fn notify_module_observers(owner: crate::kernel::workload::owner::OwnerHandle) {
     // SAFETY: scheduler-thread read of the observer set.
     let observers = unsafe {
         let p = &raw const OWNER_RELEASE_OBSERVERS;
@@ -1427,16 +1536,20 @@ pub unsafe fn dispatch_next(
             };
         }
 
-        // Dispatch to layer below
-        let below = pos - 1;
-        if let Some(ref layer) = entry.chain[below] {
-            let result = in_provider_frame(layer.module_idx as usize, || {
-                (layer.dispatch)(layer.state, handle, opcode, arg, arg_len)
-            });
-            return result;
+        // Dispatch to the nearest layer below the caller may reach.
+        for below in (0..pos).rev() {
+            if let Some(ref layer) = entry.chain[below] {
+                if !layer_visible(layer) {
+                    continue;
+                }
+                let result = in_provider_frame(layer.module_idx as usize, || {
+                    (layer.dispatch)(layer.state, handle, opcode, arg, arg_len)
+                });
+                return result;
+            }
         }
 
-        // Gap in chain — shouldn't happen but fall back to kernel
+        // Nothing below the caller it may reach: the kernel provider.
         match entry.kernel_dispatch {
             Some(handler) => handler(handle, opcode, arg, arg_len),
             None => errno::ENOSYS,
@@ -1459,12 +1572,34 @@ pub unsafe fn dispatch_next(
 fn default_layer_index(entry: &ProviderEntry) -> Option<usize> {
     for i in (0..entry.depth as usize).rev() {
         if let Some(ref layer) = entry.chain[i] {
-            if layer.selector == 0 {
+            if layer.selector == 0 && layer_visible(layer) {
                 return Some(i);
             }
         }
     }
     None
+}
+
+/// Whether the calling module may reach `layer`: a system-owned layer serves
+/// everyone, and a workload's layer serves that workload alone.
+#[inline]
+fn layer_visible(layer: &ProviderLayer) -> bool {
+    crate::kernel::workload::owner::same_or_system(
+        crate::kernel::exec::scheduler::caller_owner(),
+        layer.owner,
+    )
+}
+
+/// The contracts whose handles name storage a workload owns: every one is
+/// tracked to the owner that opened it, so no other owner can use it. A
+/// single-tenant kernel has no other owner, and tracks none of them.
+#[inline]
+fn is_owner_scoped_contract(contract: ContractId) -> bool {
+    cfg!(feature = "multitenant")
+        && matches!(
+            contract,
+            contract::FS | contract::STORAGE_NAMESPACE | contract::STORAGE_OBJECT
+        )
 }
 
 /// The module serving `contract` by default — its top-most unkeyed layer —
@@ -1724,7 +1859,7 @@ fn target_of(contract: ContractId, selector: u32) -> Option<Target> {
     }
     for i in 0..entry.depth as usize {
         if let Some(ref layer) = entry.chain[i] {
-            if layer.selector == selector {
+            if layer.selector == selector && layer_visible(layer) {
                 return Some(Target::Module(layer.module_idx));
             }
         }

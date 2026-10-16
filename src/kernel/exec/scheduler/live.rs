@@ -213,6 +213,9 @@ pub enum AddError {
     StateCapExceeded,
     /// The node's net provider refused a lane.
     NetAttachFailed,
+    /// An owner already carries the subgraph's identity: live, or staged by
+    /// an add still in progress. One identity is one owner.
+    OwnerExists,
 }
 
 impl AddError {
@@ -230,6 +233,7 @@ impl AddError {
             AddError::WouldBlock => -11, // -EAGAIN
             AddError::StateCapExceeded => -9,
             AddError::NetAttachFailed => -10,
+            AddError::OwnerExists => crate::kernel::sys::errno::EEXIST,
         }
     }
 }
@@ -351,6 +355,20 @@ pub fn apply_add(
     sub: AddSubgraph<'_>,
     assignment: Option<(u16, u32)>,
 ) -> Result<OwnerHandle, AddError> {
+    let mut staged = begin_add(sub, assignment)?;
+    instantiate_batch(&mut staged, usize::MAX)?;
+    finish_staged(staged)
+}
+
+/// Stage `sub`'s subgraph: its fans expanded, its owner reserved, its slots
+/// assigned and its channels open, with no module instantiated yet. The
+/// caller instantiates with [`instantiate_batch`] and publishes with
+/// [`finish_staged`], so a large subgraph can be admitted a few modules per
+/// scheduler step.
+pub fn begin_add(
+    sub: AddSubgraph<'_>,
+    assignment: Option<(u16, u32)>,
+) -> Result<StagedAdd, AddError> {
     let n = sub.modules.len();
     let e = sub.edges.len();
     if n > MAX_ADD_MODULES {
@@ -359,10 +377,6 @@ pub fn apply_add(
     if e > MAX_ADD_EDGES {
         return Err(AddError::TooManyEdges);
     }
-    // Stage the subgraph, then give every port of its own modules that
-    // carries several edges a tee or merge, as the boot graph does: two
-    // edges on one port would otherwise land the second at an index past
-    // the module's ports.
     let mut mods: [AddModule; WORK_MODULES] = core::array::from_fn(|_| AddModule {
         source: ModuleSource::Pic(ModuleEntry::default()),
         domain_id: 0,
@@ -375,31 +389,91 @@ pub fn apply_add(
     edges[..e].copy_from_slice(sub.edges);
     let mut mailbox = [false; WORK_EDGES];
     let (n, e) = expand_fans(&mut mods, n, &mut edges, e, &mut mailbox);
-    add_staged(
-        AddSubgraph {
-            owner_uid: sub.owner_uid,
-            modules: &mut mods[..n],
-            edges: &edges[..e],
-            state_cap: sub.state_cap,
-            buffer_cap: sub.buffer_cap,
-        },
+    begin_staged(
+        sub.owner_uid,
+        sub.state_cap,
+        sub.buffer_cap,
+        mods,
+        n,
+        edges,
+        e,
         &mailbox[..e],
         assignment,
     )
 }
 
-/// [`apply_add`] over the staged subgraph: `mailbox[i]` marks an edge around
-/// a record-carrying fan, which gets a channel of its own in mailbox mode.
-fn add_staged(
-    sub: AddSubgraph<'_>,
+/// A live add between its staging and its publication: the owner is
+/// reserved, the slots are assigned, the edges and channels are open, and
+/// the modules instantiate a batch at a time.
+pub struct StagedAdd {
+    handle: OwnerHandle,
+    owner_uid: [u8; 16],
+    n: usize,
+    e: usize,
+    edge_base: usize,
+    local_to_global: [usize; WORK_MODULES],
+    mods: [AddModule; WORK_MODULES],
+    edges: [AddEdge; WORK_EDGES],
+    /// Modules instantiated so far: the next local index.
+    done: usize,
+}
+
+impl StagedAdd {
+    /// The owner the add reserved.
+    pub fn handle(&self) -> OwnerHandle {
+        self.handle
+    }
+
+    /// The identity the add is for.
+    pub fn owner_uid(&self) -> [u8; 16] {
+        self.owner_uid
+    }
+
+    /// Where the add's edges begin in the scheduler's edge table.
+    pub fn edge_base(&self) -> usize {
+        self.edge_base
+    }
+
+    /// Whether every module has instantiated.
+    pub fn complete(&self) -> bool {
+        self.done == self.n
+    }
+}
+
+/// Steps 1 to 5 of an add over the staged (fan-expanded) subgraph:
+/// `mailbox[i]` marks an edge around a record-carrying fan, which gets a
+/// channel of its own in mailbox mode.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::large_types_passed_by_value,
+    reason = "the staged subgraph's parts, moved in so the add owns them until it is published or rolled back"
+)]
+fn begin_staged(
+    owner_uid: [u8; 16],
+    state_cap: u32,
+    buffer_cap: u32,
+    mut mods: [AddModule; WORK_MODULES],
+    n: usize,
+    edges: [AddEdge; WORK_EDGES],
+    e: usize,
     mailbox: &[bool],
     assignment: Option<(u16, u32)>,
-) -> Result<OwnerHandle, AddError> {
-    let n = sub.modules.len();
-    let e = sub.edges.len();
+) -> Result<StagedAdd, AddError> {
+    let sub = AddSubgraph {
+        owner_uid,
+        modules: &mut mods[..n],
+        edges: &edges[..e],
+        state_cap,
+        buffer_cap,
+    };
 
     // 1. Reserve the owner (lowest-free slot + monotonic generation — the same
     //    rule the host composer uses, so kernel-side allocation matches a plan).
+    //    One identity is one owner: an identity already live, or staged by an
+    //    add in progress, is refused rather than given a second owner.
+    if sched().owners.find_by_uid(sub.owner_uid).is_some() {
+        return Err(AddError::OwnerExists);
+    }
     let handle = match sched().owners.alloc(sub.owner_uid) {
         Some(h) => h,
         None => return Err(AddError::OwnerSlotsExhausted),
@@ -627,9 +701,34 @@ fn add_staged(
         }
     }
 
-    // 6. Instantiate each module synchronously and stamp it with the owner.
-    for (local, m) in sub.modules.iter_mut().enumerate().take(n) {
-        let slot = local_to_global[local];
+    let _ = sub;
+    Ok(StagedAdd {
+        handle,
+        owner_uid,
+        n,
+        e,
+        edge_base,
+        local_to_global,
+        mods,
+        edges,
+        done: 0,
+    })
+}
+
+/// Step 6 of an add, `max` modules at a time: instantiate each module and
+/// stamp it with the owner. `Ok(true)` once every module is in. An error
+/// rolls the whole add back; the staged add is then gone.
+pub fn instantiate_batch(st: &mut StagedAdd, max: usize) -> Result<bool, AddError> {
+    let n = st.n;
+    let e = st.e;
+    let handle = st.handle;
+    let edge_base = st.edge_base;
+    let last = n.min(st.done.saturating_add(max));
+    while st.done < last {
+        let local = st.done;
+        let slot = st.local_to_global[local];
+        let local_to_global = st.local_to_global;
+        let m = &mut st.mods[local];
         let source = core::mem::replace(&mut m.source, ModuleSource::Pic(ModuleEntry::default()));
         let res = match source {
             ModuleSource::Builtin(b) => {
@@ -641,7 +740,8 @@ fn add_staged(
         if let Err(err) = res {
             // Roll back: free this and any earlier instantiated slots, close
             // the new channels, drop the appended edges, revoke the owner.
-            rollback_add(handle, &local_to_global[..n], edge_base, e);
+            rollback_add(handle, &local_to_global[..=local], edge_base, e);
+            st.done = n;
             return Err(err);
         }
         super::set_module_owner(slot, handle);
@@ -662,26 +762,43 @@ fn add_staged(
                 footprint,
             );
             rollback_add(handle, &local_to_global[..=local], edge_base, e);
+            st.done = n;
             return Err(AddError::StateCapExceeded);
         }
+        let domain_id = m.domain_id;
         let s = sched();
         s.ready[slot] = true;
         s.finished[slot] = false;
-        s.domain_id[slot] = m.domain_id;
+        s.domain_id[slot] = domain_id;
         // Ready-gate only on NEW upstream modules — never gate on existing ones,
         // and never modify an existing module's mask (isolation).
         s.upstream_mask[slot].clear_all();
+        st.done = local + 1;
     }
+    Ok(st.done == n)
+}
+
+/// Steps 7 and 8 of an add whose every module has instantiated: hand its
+/// net lanes to the provider, gate the new modules on each other, splice
+/// them into the schedule and activate the owner. A refused lane rolls the
+/// whole add back.
+pub fn finish_staged(st: StagedAdd) -> Result<OwnerHandle, AddError> {
+    debug_assert!(st.complete());
+    let n = st.n;
+    let e = st.e;
+    let handle = st.handle;
+    let edge_base = st.edge_base;
+    let local_to_global = st.local_to_global;
+    let sub_edges = &st.edges[..e];
     // Hand each net key's two channels to the node's net provider as one lane
     // of this owner's. Every module has instantiated, so nothing it opens can
     // precede its lane; a refused lane rolls the whole add back.
-    for (i, ae) in sub.edges.iter().enumerate() {
+    for (i, ae) in sub_edges.iter().enumerate() {
         let Endpoint::Net(key) = ae.to else {
             continue;
         };
         let commands = sched().edges[edge_base + i].channel;
-        let events = sub
-            .edges
+        let events = sub_edges
             .iter()
             .position(|x| matches!(x.from, Endpoint::Net(k) if k == key))
             .map(|j| sched().edges[edge_base + j].channel)
@@ -701,9 +818,12 @@ fn add_staged(
     }
     // Fill new modules' upstream masks from intra-owner edges (after all slots
     // are known) for deterministic ready-gating among the added modules.
-    for ae in sub.edges.iter() {
-        if let (Endpoint::New(_), Endpoint::New(_)) = (ae.from, ae.to) {
-            if let (Some(from), Some(to)) = (resolve(ae.from), resolve(ae.to)) {
+    for ae in sub_edges.iter() {
+        if let (Endpoint::New(a), Endpoint::New(b)) = (ae.from, ae.to) {
+            if let (Some(&from), Some(&to)) = (
+                local_to_global[..n].get(a as usize),
+                local_to_global[..n].get(b as usize),
+            ) {
                 sched().upstream_mask[to].set(from);
             }
         }
@@ -719,7 +839,7 @@ fn add_staged(
 
     //    Splice into the execution order: topo-sort the new modules over their
     //    internal edges, then append. Existing entries are untouched.
-    let order = topo_order_new(&local_to_global[..n], sub.edges);
+    let order = topo_order_new(&local_to_global[..n], sub_edges);
     {
         let s = sched();
         for &slot in order.iter().take(n) {
@@ -795,7 +915,29 @@ fn add_staged(
     super::rebuild_resident_graph_index();
     // Publication complete — release the parked peer cores (no-op if none).
     release_peers(parked);
+    // SAFETY: scheduler thread, like the add.
+    unsafe { *core::ptr::addr_of_mut!(LAST_ADD_EDGE_BASE) = edge_base };
     Ok(handle)
+}
+
+/// Where the last published add's edges begin in the scheduler's edge
+/// table, for a caller that finds its own lanes among them.
+pub fn last_add_edge_base() -> usize {
+    // SAFETY: scheduler thread.
+    unsafe { *core::ptr::addr_of!(LAST_ADD_EDGE_BASE) }
+}
+
+static mut LAST_ADD_EDGE_BASE: usize = 0;
+
+/// Roll a staged add back: what instantiated is freed, its channels close,
+/// its edges go and its owner is revoked, as a failed add's would.
+pub fn abandon_staged(st: StagedAdd) {
+    rollback_add(
+        st.handle,
+        &st.local_to_global[..st.done],
+        st.edge_base,
+        st.e,
+    );
 }
 
 /// Instantiate a PIC module into `slot`. Synchronous only: an async
@@ -897,6 +1039,7 @@ fn rollback_add(handle: OwnerHandle, slots: &[usize], edge_base: usize, e: usize
         s.slot_generation[slot] = s.slot_generation[slot].wrapping_add(1);
         super::set_module_owner(slot, OWNER_SYSTEM);
     }
+    crate::kernel::module::provider::release_owner_handles(handle);
     if e > 0 {
         detach_taps(edge_base, e);
         super::close_channels(&s.edges[edge_base..edge_base + e]);
@@ -1409,6 +1552,8 @@ pub fn free_owner(handle: OwnerHandle) -> Result<(), FreeError> {
     super::recompute_domain_orders(affected);
 
     // 5. Revoke the handle. The generation guard now rejects it.
+    // What the owner opened on the platform closes with it.
+    crate::kernel::module::provider::release_owner_handles(handle);
     sched().owners.free(handle);
     // The owner's own modules' code, when it brought a pack: nothing of the
     // owner runs any more (its modules are unspliced, their handles and
@@ -1855,28 +2000,147 @@ unsafe fn apply_add_encoded_inner(arg: *mut u8, arg_len: usize, spare_lane: Opti
         state_cap,
         buffer_cap,
     };
-    match apply_add(sub, None) {
-        Ok(handle) => {
-            if arg_len < 6 {
-                // Applied, but no room to report the handle — caller can still
-                // free by owner_uid via a future op; treat as success.
-                return 0;
+    // A single-tenant kernel admits no owner, so no add is ever staged
+    // across calls; the whole add runs in one call, as the composer's does.
+    #[cfg(not(feature = "multitenant"))]
+    {
+        let _ = bytes;
+        return match apply_add(sub, None) {
+            Ok(handle) => {
+                if arg_len >= 6 {
+                    // SAFETY: arg has >= 6 writable bytes (checked).
+                    unsafe {
+                        let slot = handle.slot.to_le_bytes();
+                        let gen = handle.generation.to_le_bytes();
+                        *arg = slot[0];
+                        *arg.add(1) = slot[1];
+                        *arg.add(2) = gen[0];
+                        *arg.add(3) = gen[1];
+                        *arg.add(4) = gen[2];
+                        *arg.add(5) = gen[3];
+                    }
+                }
+                0
             }
-            // SAFETY: arg has >= 6 writable bytes (checked).
-            unsafe {
-                let slot = handle.slot.to_le_bytes();
-                let gen = handle.generation.to_le_bytes();
-                *arg = slot[0];
-                *arg.add(1) = slot[1];
-                *arg.add(2) = gen[0];
-                *arg.add(3) = gen[1];
-                *arg.add(4) = gen[2];
-                *arg.add(5) = gen[3];
-            }
-            0
-        }
-        Err(e) => e.code(),
+            Err(e) => e.code(),
+        };
     }
+    // One add is staged at a time, and continued by the same blob: a caller
+    // asks again with the same bytes until the add is published. A different
+    // blob while one is staged is refused; the staged add is finished or
+    // abandoned first.
+    #[cfg(feature = "multitenant")]
+    let hash = blob_hash(bytes);
+    #[cfg(feature = "multitenant")]
+    {
+        // SAFETY: scheduler thread, like every add.
+        let pending = unsafe { &mut *core::ptr::addr_of_mut!(STAGED_ADD) };
+        match pending {
+            Some((h, _)) if *h != hash => return crate::kernel::sys::errno::EBUSY,
+            Some(_) => {}
+            None => match begin_add(sub, None) {
+                Ok(st) => *pending = Some((hash, st)),
+                Err(e) => return e.code(),
+            },
+        }
+        let Some((_, mut st)) = pending.take() else {
+            return EINVAL;
+        };
+        match instantiate_batch(&mut st, ADD_MODULES_PER_CALL) {
+            Err(e) => e.code(),
+            Ok(false) => {
+                *pending = Some((hash, st));
+                crate::kernel::sys::errno::EINPROGRESS
+            }
+            Ok(true) => match finish_staged(st) {
+                Ok(handle) => {
+                    if arg_len < 6 {
+                        // Applied, but no room to report the handle — caller can
+                        // still free by owner_uid via a future op; treat as success.
+                        return 0;
+                    }
+                    // SAFETY: arg has >= 6 writable bytes (checked).
+                    unsafe {
+                        let slot = handle.slot.to_le_bytes();
+                        let gen = handle.generation.to_le_bytes();
+                        *arg = slot[0];
+                        *arg.add(1) = slot[1];
+                        *arg.add(2) = gen[0];
+                        *arg.add(3) = gen[1];
+                        *arg.add(4) = gen[2];
+                        *arg.add(5) = gen[3];
+                    }
+                    0
+                }
+                Err(e) => e.code(),
+            },
+        }
+    }
+}
+
+/// Modules an encoded add instantiates per call. A `CREATE` that stages a
+/// large subgraph answers `EINPROGRESS` between batches, so no single call
+/// holds the scheduler for longer than a few module loads.
+pub const ADD_MODULES_PER_CALL: usize = 4;
+
+/// The encoded add in progress, keyed by its blob's hash. Only a kernel
+/// that admits owners stages one.
+#[cfg(feature = "multitenant")]
+static mut STAGED_ADD: Option<(u64, StagedAdd)> = None;
+
+/// FNV-1a over an add's blob: what tells a continuation from a new add.
+#[cfg(feature = "multitenant")]
+fn blob_hash(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// The identity of the encoded add in progress, if any.
+pub fn staged_add_identity() -> Option<[u8; 16]> {
+    #[cfg(feature = "multitenant")]
+    // SAFETY: scheduler thread.
+    unsafe {
+        (*core::ptr::addr_of!(STAGED_ADD))
+            .as_ref()
+            .map(|(_, st)| st.owner_uid())
+    }
+    #[cfg(not(feature = "multitenant"))]
+    None
+}
+
+/// The owner the encoded add in progress reserved, if any.
+pub fn staged_add_handle() -> Option<OwnerHandle> {
+    #[cfg(feature = "multitenant")]
+    // SAFETY: scheduler thread.
+    unsafe {
+        (*core::ptr::addr_of!(STAGED_ADD))
+            .as_ref()
+            .map(|(_, st)| st.handle())
+    }
+    #[cfg(not(feature = "multitenant"))]
+    None
+}
+
+/// Roll the encoded add in progress back. `false` when none is staged.
+pub fn abandon_staged_add() -> bool {
+    #[cfg(feature = "multitenant")]
+    {
+        // SAFETY: scheduler thread.
+        let pending = unsafe { (*core::ptr::addr_of_mut!(STAGED_ADD)).take() };
+        match pending {
+            Some((_, st)) => {
+                abandon_staged(st);
+                true
+            }
+            None => false,
+        }
+    }
+    #[cfg(not(feature = "multitenant"))]
+    false
 }
 
 /// Decode `[slot:u16 LE, generation:u32 LE]` and free that owner.

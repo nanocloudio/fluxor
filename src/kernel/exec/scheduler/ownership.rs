@@ -76,6 +76,10 @@ pub fn authorize_module_access(caller: OwnerHandle, target_idx: usize) -> bool {
 /// single-tenant builds this is always the system owner.
 #[inline]
 pub fn caller_owner() -> OwnerHandle {
+    // Before the platform is up no module runs: the caller is the kernel.
+    if !crate::kernel::sys::hal::is_initialised() {
+        return OWNER_SYSTEM;
+    }
     module_owner(current_module_index())
 }
 

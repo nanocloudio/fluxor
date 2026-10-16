@@ -44,6 +44,13 @@ struct LinuxFileSlot {
     /// success; `provider_query(handle, query_key::LAST_FENCE, …)`
     /// reads it back and encodes it on the wire.
     last_fence: Fence,
+    /// Who opened the slot: the owner whose storage ledger a write that
+    /// grows the file is charged to.
+    owner: crate::kernel::workload::owner::OwnerHandle,
+    /// The file offset and size as this provider last left them, so a
+    /// write knows how far past the end it reaches without asking the OS.
+    pos: u64,
+    size: u64,
 }
 
 static mut LINUX_FILES: [LinuxFileSlot; MAX_OPEN_FILES] = {
@@ -52,9 +59,362 @@ static mut LINUX_FILES: [LinuxFileSlot; MAX_OPEN_FILES] = {
         dir_ptr: 0,
         in_use: false,
         last_fence: Fence::Volatile,
+        owner: crate::kernel::workload::owner::OWNER_SYSTEM,
+        pos: 0,
+        size: 0,
     };
     [EMPTY; MAX_OPEN_FILES]
 };
+
+/// Claim a file slot for `fd` on behalf of `owner`, its size read from the
+/// descriptor. The tagged handle, or `ENOMEM` with `fd` closed.
+unsafe fn claim_file_slot(fd: i32, owner: crate::kernel::workload::owner::OwnerHandle) -> i32 {
+    use crate::kernel::ipc::fd::{tag_fd, FD_TAG_FS};
+    use crate::kernel::sys::errno;
+    let files = &mut *core::ptr::addr_of_mut!(LINUX_FILES);
+    let Some(slot_idx) = files.iter().position(|s| !s.in_use) else {
+        libc::close(fd);
+        return errno::ENOMEM;
+    };
+    let mut st: libc::stat = core::mem::zeroed();
+    let size = if libc::fstat(fd, &mut st) == 0 {
+        st.st_size as u64
+    } else {
+        0
+    };
+    files[slot_idx] = LinuxFileSlot {
+        fd,
+        dir_ptr: 0,
+        in_use: true,
+        last_fence: Fence::Volatile,
+        owner,
+        pos: 0,
+        size,
+    };
+    tag_fd(FD_TAG_FS, slot_idx as i32)
+}
+
+/// Claim a directory slot for `dir` on behalf of `owner`.
+unsafe fn claim_dir_slot(
+    dir: *mut libc::DIR,
+    owner: crate::kernel::workload::owner::OwnerHandle,
+) -> i32 {
+    use crate::kernel::ipc::fd::{tag_fd, FD_TAG_FS};
+    use crate::kernel::sys::errno;
+    let files = &mut *core::ptr::addr_of_mut!(LINUX_FILES);
+    let Some(slot_idx) = files.iter().position(|s| !s.in_use) else {
+        libc::closedir(dir);
+        return errno::ENOMEM;
+    };
+    files[slot_idx] = LinuxFileSlot {
+        fd: -1,
+        dir_ptr: dir as usize,
+        in_use: true,
+        last_fence: Fence::Volatile,
+        owner,
+        pos: 0,
+        size: 0,
+    };
+    tag_fd(FD_TAG_FS, slot_idx as i32)
+}
+
+/// The path-taking `fs` ops for a workload: each resolves beneath the
+/// owner's files root (`owner_root`), so the owner reaches what it owns
+/// and nothing else. `None` for an op that works on a handle, which the
+/// shared arms serve for every owner.
+///
+/// # Safety
+/// As `linux_fs_dispatch`.
+unsafe fn tenant_fs_path_op(
+    owner: crate::kernel::workload::owner::OwnerHandle,
+    opcode: u32,
+    arg: *mut u8,
+    arg_len: usize,
+) -> Option<i32> {
+    use crate::abi::contracts::storage::fs as dev_fs;
+    use crate::kernel::sys::errno;
+    use crate::platform::linux::owner_root as root;
+
+    let path_arg = |ptr: *const u8, len: usize| -> Result<&[u8], i32> {
+        if ptr.is_null() || len == 0 {
+            return Err(errno::EINVAL);
+        }
+        if len > LINUX_FS_PATH_MAX {
+            return Err(errno::E2BIG);
+        }
+        Ok(core::slice::from_raw_parts(ptr, len))
+    };
+    Some(match opcode {
+        dev_fs::OPEN => {
+            let path = match path_arg(arg, arg_len) {
+                Ok(p) => p,
+                Err(e) => return Some(e),
+            };
+            // As the host's OPEN: read-write on an existing file, never a
+            // create; read-only when the file cannot be written.
+            let mut fd = root::open_beneath(owner, path, libc::O_RDWR, 0);
+            if fd < 0 {
+                fd = root::open_beneath(owner, path, libc::O_RDONLY, 0);
+                if fd < 0 {
+                    return Some(fd);
+                }
+            }
+            claim_file_slot(fd, owner)
+        }
+        dev_fs::OPEN_CREATE => {
+            let path = match path_arg(arg, arg_len) {
+                Ok(p) => p,
+                Err(e) => return Some(e),
+            };
+            let fd = root::open_beneath(owner, path, libc::O_RDWR | libc::O_CREAT, 0o600);
+            if fd < 0 {
+                return Some(fd);
+            }
+            claim_file_slot(fd, owner)
+        }
+        dev_fs::OPENDIR => {
+            let path = match path_arg(arg, arg_len) {
+                Ok(p) => p,
+                Err(e) => return Some(e),
+            };
+            let fd = root::open_beneath(owner, path, libc::O_RDONLY | libc::O_DIRECTORY, 0);
+            if fd < 0 {
+                return Some(fd);
+            }
+            let dir = libc::fdopendir(fd);
+            if dir.is_null() {
+                libc::close(fd);
+                return Some(errno::ENODEV);
+            }
+            claim_dir_slot(dir, owner)
+        }
+        dev_fs::UNLINK => {
+            let path = match path_arg(arg, arg_len) {
+                Ok(p) => p,
+                Err(e) => return Some(e),
+            };
+            let (dirfd, name) = match root::parent_beneath(owner, path) {
+                Ok(v) => v,
+                Err(e) => return Some(e),
+            };
+            let size = root::file_size_at(dirfd, &name);
+            let rc = libc::unlinkat(dirfd, name.as_ptr() as *const libc::c_char, 0);
+            let err = *libc::__errno_location();
+            libc::close(dirfd);
+            if rc < 0 {
+                -err
+            } else {
+                root::release_bytes(owner, size);
+                errno::OK
+            }
+        }
+        dev_fs::MKDIR => {
+            let path = match path_arg(arg, arg_len) {
+                Ok(p) => p,
+                Err(e) => return Some(e),
+            };
+            let (dirfd, name) = match root::parent_beneath(owner, path) {
+                Ok(v) => v,
+                Err(e) => return Some(e),
+            };
+            let rc = libc::mkdirat(dirfd, name.as_ptr() as *const libc::c_char, 0o755);
+            let err = *libc::__errno_location();
+            libc::close(dirfd);
+            // Idempotent, as the host's MKDIR.
+            if rc < 0 && err != libc::EEXIST {
+                -err
+            } else {
+                errno::OK
+            }
+        }
+        dev_fs::RMDIR => {
+            let path = match path_arg(arg, arg_len) {
+                Ok(p) => p,
+                Err(e) => return Some(e),
+            };
+            let (dirfd, name) = match root::parent_beneath(owner, path) {
+                Ok(v) => v,
+                Err(e) => return Some(e),
+            };
+            let rc = libc::unlinkat(
+                dirfd,
+                name.as_ptr() as *const libc::c_char,
+                libc::AT_REMOVEDIR,
+            );
+            let err = *libc::__errno_location();
+            let out = if rc < 0 {
+                -err
+            } else if libc::fsync(dirfd) < 0 {
+                -*libc::__errno_location()
+            } else {
+                errno::OK
+            };
+            libc::close(dirfd);
+            out
+        }
+        dev_fs::LINK => {
+            let Some((existing, existing_len, new, new_len)) = two_paths(arg, arg_len) else {
+                return Some(errno::EINVAL);
+            };
+            let (d1, n1) = match root::parent_beneath(owner, &existing[..existing_len]) {
+                Ok(v) => v,
+                Err(e) => return Some(e),
+            };
+            let (d2, n2) = match root::parent_beneath(owner, &new[..new_len]) {
+                Ok(v) => v,
+                Err(e) => {
+                    libc::close(d1);
+                    return Some(e);
+                }
+            };
+            let mut st: libc::stat = core::mem::zeroed();
+            let out = if libc::fstatat(
+                d1,
+                n1.as_ptr() as *const libc::c_char,
+                &mut st,
+                libc::AT_SYMLINK_NOFOLLOW,
+            ) == 0
+                && st.st_mode & libc::S_IFMT == libc::S_IFDIR
+            {
+                errno::EISDIR
+            } else if libc::linkat(
+                d1,
+                n1.as_ptr() as *const libc::c_char,
+                d2,
+                n2.as_ptr() as *const libc::c_char,
+                0,
+            ) < 0
+            {
+                -*libc::__errno_location()
+            } else {
+                errno::OK
+            };
+            libc::close(d1);
+            libc::close(d2);
+            out
+        }
+        dev_fs::READLINK => {
+            if arg.is_null() || arg_len < 2 {
+                return Some(errno::EINVAL);
+            }
+            let path_len = usize::from(u16::from_le_bytes([*arg, *arg.add(1)]));
+            if path_len == 0 || arg_len < 2 + path_len {
+                return Some(errno::EINVAL);
+            }
+            let path = match path_arg(arg.add(2), path_len) {
+                Ok(p) => p,
+                Err(e) => return Some(e),
+            };
+            let fd = root::open_beneath(owner, path, libc::O_PATH | libc::O_NOFOLLOW, 0);
+            if fd < 0 {
+                return Some(fd);
+            }
+            let mut target = [0u8; 512];
+            let n = libc::readlinkat(
+                fd,
+                c"".as_ptr(),
+                target.as_mut_ptr() as *mut libc::c_char,
+                target.len(),
+            );
+            let err = *libc::__errno_location();
+            libc::close(fd);
+            if n < 0 {
+                return Some(-err);
+            }
+            let n = n as usize;
+            if n == target.len() || n > arg_len {
+                return Some(errno::E2BIG);
+            }
+            core::ptr::copy_nonoverlapping(target.as_ptr(), arg, n);
+            n as i32
+        }
+        dev_fs::TRUNCATE => {
+            if arg.is_null() || arg_len < 9 {
+                return Some(errno::EINVAL);
+            }
+            let a = core::slice::from_raw_parts(arg, arg_len);
+            let len = u64::from_le_bytes([a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]]);
+            if len > i64::MAX as u64 {
+                return Some(errno::EINVAL);
+            }
+            let path = match path_arg(arg.add(8), arg_len - 8) {
+                Ok(p) => p,
+                Err(e) => return Some(e),
+            };
+            let fd = root::open_beneath(owner, path, libc::O_WRONLY, 0);
+            if fd < 0 {
+                return Some(fd);
+            }
+            let mut st: libc::stat = core::mem::zeroed();
+            let out = if libc::fstat(fd, &mut st) < 0 {
+                -*libc::__errno_location()
+            } else if st.st_mode & libc::S_IFMT == libc::S_IFDIR {
+                -libc::EISDIR
+            } else if len > st.st_size as u64 {
+                errno::EINVAL
+            } else if libc::ftruncate(fd, len as i64) < 0 {
+                -*libc::__errno_location()
+            } else {
+                root::release_bytes(owner, st.st_size as u64 - len);
+                errno::OK
+            };
+            libc::close(fd);
+            out
+        }
+        dev_fs::FSYNC_NAME => {
+            let path = match path_arg(arg, arg_len) {
+                Ok(p) => p,
+                Err(e) => return Some(e),
+            };
+            let (dirfd, _) = match root::parent_beneath(owner, path) {
+                Ok(v) => v,
+                Err(e) => return Some(e),
+            };
+            let out = if libc::fsync(dirfd) < 0 {
+                -*libc::__errno_location()
+            } else {
+                errno::OK
+            };
+            libc::close(dirfd);
+            out
+        }
+        dev_fs::RENAME => {
+            let Some((src, src_len, dst, dst_len)) = two_paths(arg, arg_len) else {
+                return Some(errno::EINVAL);
+            };
+            let (d1, n1) = match root::parent_beneath(owner, &src[..src_len]) {
+                Ok(v) => v,
+                Err(e) => return Some(e),
+            };
+            let (d2, n2) = match root::parent_beneath(owner, &dst[..dst_len]) {
+                Ok(v) => v,
+                Err(e) => {
+                    libc::close(d1);
+                    return Some(e);
+                }
+            };
+            // Atomic against a reader, durable once both parents are synced,
+            // the destination first.
+            let out = if libc::renameat(
+                d1,
+                n1.as_ptr() as *const libc::c_char,
+                d2,
+                n2.as_ptr() as *const libc::c_char,
+            ) < 0
+                || libc::fsync(d2) < 0
+                || libc::fsync(d1) < 0
+            {
+                -*libc::__errno_location()
+            } else {
+                errno::OK
+            };
+            libc::close(d1);
+            libc::close(d2);
+            out
+        }
+        _ => return None,
+    })
+}
 
 /// Record the strongest `Fence` the provider just achieved for
 /// `slot`. The dispatcher's i32 return carries errno / count; the
@@ -247,7 +607,6 @@ unsafe fn fsync_parent_dir(path: &[u8]) -> i32 {
 pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
     use crate::abi::contracts::storage::fs as dev_fs;
     use crate::abi::fence as dev_fence;
-    use crate::kernel::ipc::fd::{tag_fd, FD_TAG_FS};
     use crate::kernel::sys::errno;
 
     // Cross-cutting fence-introspection opcode. Public surface:
@@ -302,6 +661,15 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
         return 4;
     }
 
+    // A workload names paths inside a root of its own; the host's paths are
+    // the system owner's. Handle ops below serve both.
+    let owner = crate::kernel::exec::scheduler::caller_owner();
+    if !owner.is_system() {
+        if let Some(rc) = tenant_fs_path_op(owner, opcode, arg, arg_len) {
+            return rc;
+        }
+    }
+
     match opcode {
         dev_fs::OPEN => {
             if arg.is_null() || arg_len == 0 {
@@ -337,17 +705,13 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
                     // must not initialise a new world after a failed existing-file read.
                     return -*libc::__errno_location();
                 }
-                files[slot_idx].fd = fd_raw;
-                files[slot_idx].in_use = true;
-                files[slot_idx].last_fence = Fence::Volatile;
+                let _ = slot_idx;
                 // FS handles carry their contract in the tag; the
                 // vtable wrapper strips it on re-entry.
-                return tag_fd(FD_TAG_FS, slot_idx as i32);
+                return claim_file_slot(fd_raw, owner);
             }
-            files[slot_idx].fd = fd_raw;
-            files[slot_idx].in_use = true;
-            files[slot_idx].last_fence = Fence::Volatile;
-            tag_fd(FD_TAG_FS, slot_idx as i32)
+            let _ = slot_idx;
+            claim_file_slot(fd_raw, owner)
         }
         dev_fs::OPEN_CREATE => {
             let mut path_buf = [0u8; 256];
@@ -372,10 +736,8 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             if fd_raw < 0 {
                 return errno::ENODEV;
             }
-            files[slot_idx].fd = fd_raw;
-            files[slot_idx].in_use = true;
-            files[slot_idx].last_fence = Fence::Volatile;
-            tag_fd(FD_TAG_FS, slot_idx as i32)
+            let _ = slot_idx;
+            claim_file_slot(fd_raw, owner)
         }
         dev_fs::UNLINK => {
             let mut path_buf = [0u8; 256];
@@ -574,9 +936,22 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
                 return errno::EINVAL;
             }
             let fd = files[slot_idx].fd;
+            // The capacity past the file's size is the owner's to hold.
+            let growth = u64::from(capacity).saturating_sub(files[slot_idx].size);
+            if growth > 0
+                && !crate::platform::linux::owner_root::charge(files[slot_idx].owner, growth)
+            {
+                return errno::ENOSPC;
+            }
             let rc = libc::posix_fallocate(fd, 0, capacity as libc::off_t);
             if rc != 0 {
+                crate::platform::linux::owner_root::release_bytes(files[slot_idx].owner, growth);
                 return -rc;
+            }
+            {
+                let files = &mut *core::ptr::addr_of_mut!(LINUX_FILES);
+                files[slot_idx].size = files[slot_idx].size.max(u64::from(capacity));
+                files[slot_idx].pos = 0;
             }
             if libc::ftruncate(fd, capacity as libc::off_t) != 0 {
                 return -*libc::__errno_location();
@@ -614,6 +989,8 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             if n < 0 {
                 errno::ERROR
             } else {
+                let files = &mut *core::ptr::addr_of_mut!(LINUX_FILES);
+                files[slot_idx].pos += n as u64;
                 // Reads reflect the kernel page cache; no
                 // durability claim. Recording overwrites any prior
                 // `LocalDurable` so the slot's fence stays honest.
@@ -623,17 +1000,44 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
         }
         dev_fs::WRITE => {
             let slot_idx = handle as usize;
-            let files = &*core::ptr::addr_of!(LINUX_FILES);
+            let files = &mut *core::ptr::addr_of_mut!(LINUX_FILES);
             if slot_idx >= MAX_OPEN_FILES || !files[slot_idx].in_use {
                 return errno::EINVAL;
             }
             if arg.is_null() || arg_len == 0 {
                 return errno::EINVAL;
             }
+            // What this write adds past the end of the file is the owner's
+            // to hold; a write its storage cap refuses lands nothing.
+            let end = files[slot_idx].pos.saturating_add(arg_len as u64);
+            let growth = end.saturating_sub(files[slot_idx].size);
+            if growth > 0
+                && !crate::platform::linux::owner_root::charge(files[slot_idx].owner, growth)
+            {
+                return errno::ENOSPC;
+            }
             let n = libc::write(files[slot_idx].fd, arg as *const libc::c_void, arg_len);
             if n < 0 {
+                if growth > 0 {
+                    crate::platform::linux::owner_root::release_bytes(
+                        files[slot_idx].owner,
+                        growth,
+                    );
+                }
                 errno::ERROR
             } else {
+                let written = n as u64;
+                let landed_end = files[slot_idx].pos + written;
+                if landed_end < end && growth > 0 {
+                    // A short write grew the file less than was charged.
+                    let unused = end - landed_end.max(files[slot_idx].size);
+                    crate::platform::linux::owner_root::release_bytes(
+                        files[slot_idx].owner,
+                        unused,
+                    );
+                }
+                files[slot_idx].pos = landed_end;
+                files[slot_idx].size = files[slot_idx].size.max(landed_end);
                 // Page-cache hand-off; not durable until FSYNC.
                 record_slot_fence(slot_idx, Fence::Volatile);
                 n as i32
@@ -669,6 +1073,7 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             if pos < 0 {
                 errno::ERROR
             } else {
+                (*core::ptr::addr_of_mut!(LINUX_FILES))[slot_idx].pos = pos as u64;
                 // Seek doesn't change durability, but it's a
                 // successful op on this handle — record Volatile so
                 // the slot fence describes the latest op.
@@ -786,11 +1191,8 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             if dir.is_null() {
                 return errno::ENODEV;
             }
-            files[slot_idx].fd = -1;
-            files[slot_idx].dir_ptr = dir as usize;
-            files[slot_idx].in_use = true;
-            files[slot_idx].last_fence = Fence::Volatile;
-            tag_fd(FD_TAG_FS, slot_idx as i32)
+            let _ = slot_idx;
+            claim_dir_slot(dir, owner)
         }
         dev_fs::READDIR => {
             let slot_idx = handle as usize;

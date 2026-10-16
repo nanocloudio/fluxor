@@ -82,6 +82,10 @@ pub struct OwnerAccounting {
     pub state_cap: u32,
     pub buffer_bytes: u32,
     pub buffer_cap: u32,
+    /// Bytes the owner holds in the platform's storage: its files and its
+    /// store. Charged by the platform providers against `storage_cap`.
+    pub storage_bytes: u64,
+    pub storage_cap: u64,
     pub modules: u16,
     pub edges: u16,
     pub endpoints: u16,
@@ -96,6 +100,8 @@ impl OwnerAccounting {
         state_cap: 0,
         buffer_bytes: 0,
         buffer_cap: 0,
+        storage_bytes: 0,
+        storage_cap: 0,
         modules: 0,
         edges: 0,
         endpoints: 0,
@@ -390,6 +396,45 @@ impl OwnerTable {
                 true
             }
             None => false,
+        }
+    }
+
+    /// Install the admitted storage byte cap for an owner (0 = unlimited).
+    pub fn set_storage_cap(&mut self, h: OwnerHandle, cap: u64) -> bool {
+        match self.lookup_mut(h) {
+            Some(e) => {
+                e.acct.storage_cap = cap;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Charge `bytes` of storage to `h`. `Err(())` when the owner's storage
+    /// cap would be exceeded (the provider refuses the write), or `h` is
+    /// stale. The system owner is never charged.
+    #[allow(
+        clippy::result_unit_err,
+        reason = "the failure is a payload-free cap-exceeded/stale signal; the \
+                  caller only branches on success vs failure"
+    )]
+    pub fn charge_storage(&mut self, h: OwnerHandle, bytes: u64) -> Result<(), ()> {
+        if h.is_system() {
+            return Ok(());
+        }
+        let e = self.lookup_mut(h).ok_or(())?;
+        let next = e.acct.storage_bytes.saturating_add(bytes);
+        if e.acct.storage_cap != 0 && next > e.acct.storage_cap {
+            return Err(());
+        }
+        e.acct.storage_bytes = next;
+        Ok(())
+    }
+
+    /// Give `bytes` of storage back to `h`'s ledger.
+    pub fn release_storage(&mut self, h: OwnerHandle, bytes: u64) {
+        if let Some(e) = self.lookup_mut(h) {
+            e.acct.storage_bytes = e.acct.storage_bytes.saturating_sub(bytes);
         }
     }
 
