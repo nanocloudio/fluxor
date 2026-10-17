@@ -9,13 +9,12 @@
 // orchestration lives in `internal/*`; chip-specific raw registers
 // live in `platform/*`.
 //
-// Vocabulary note (F11): the POSIX-derived low-level
-// terms here — `fd` (tagged handle), `errno` (negative error code), poll
-// flags — are RETAINED deliberately. They are universally-understood OS
-// primitives at the kernel/module boundary, not orchestrator (K8s/OCI)
-// vocabulary; nativizing them would churn the whole ABI for no architectural
-// gain. Higher-level orchestration vocabulary is native Fluxor (`owner`,
-// `workload`, `lease`, `posture`, `endpoint`); K8s terms stay in nanocloud.
+// Vocabulary: the POSIX-derived low-level terms here — `fd` (tagged handle),
+// `errno` (negative error code), poll flags — are universally understood
+// primitives at the kernel/module boundary, not an orchestrator's
+// vocabulary. Tenancy is Fluxor's own: `owner`, `workload`, `lease`,
+// `posture`, `endpoint`, `grant`. No user, group or mode bit crosses this
+// boundary; those belong to the host-process platform contract alone.
 //
 // This file is `include!`'d by `abi.rs` into `pub mod kernel_abi`.
 

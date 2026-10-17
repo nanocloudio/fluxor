@@ -657,6 +657,12 @@ fn begin_staged(
     sched()
         .owners
         .set_caps(handle, sub.state_cap, sub.buffer_cap);
+    // The default grant: a root of the owner's own. A workload `CREATE`
+    // states its own grant over this before any of its modules runs.
+    sched().owners.set_storage_grant(
+        handle,
+        crate::kernel::workload::storage::StorageGrant::OwnRoot,
+    );
 
     // 2. Assign each new module the lowest-free `Empty` slot. NOT a watermark:
     //    freeing a non-last owner leaves holes, so we scan.

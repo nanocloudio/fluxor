@@ -29,6 +29,26 @@
 //   argv     command + args (required, non-empty)
 //   rootfs   container root to pivot into (optional)
 //   isolate  unshare MOUNT|UTS|IPC|PID (needs CAP_SYS_ADMIN)
+// and [`ProcessParams`] the process itself (`plan_process`):
+//   env      the WHOLE environment, `NAME=VALUE` each. Nothing of the
+//            runtime's own environment reaches a workload: the runtime holds
+//            secrets in its (a node's seal key), and a workload is not it.
+//            `HOME` is added when absent, as OCI runtimes do: the user's home
+//            in the root's /etc/passwd, else `/`. A bare argv[0] is looked up
+//            on the env's own `PATH` (or a default search path when it has
+//            none — never the runtime's), inside the workload's root
+//   cwd      where it starts, absolute, in its own view of the filesystem
+//            (`/` when empty); created inside an isolated rootfs, as an OCI
+//            runtime creates a missing working directory
+//   user     who it runs as, the OCI spelling: `uid[:gid]`, or a name (and
+//            group) resolved in the root's /etc/passwd and /etc/group — the
+//            only files this backend reads, and only the workload's own. A
+//            name the root does not have refuses the spawn (ENOENT). Applied
+//            in the child with setgroups/setresgid/setresuid before exec.
+//            Changing identity needs a privileged runtime: an unprivileged
+//            one REFUSES (EACCES) any user other than its own rather than run
+//            the workload as itself — the same fail-closed rule as `isolate`
+//            (a namespaced spawn fails rather than runs unisolated)
 // cgroup.v2 limits come from the portable `ResourceEnvelope` (mapped in
 // `hp_spawn`), not from any file. The orchestrator (nanocloud) owns the
 // mapping from its container/OCI world to these parameters.
@@ -81,6 +101,10 @@ struct HpSlot {
     paused: bool,
     exit_state: u8,
     exit_code: i32,
+    /// What a process of this workload is — its environment, where it
+    /// starts, who it runs as: the spawn's, so an EXEC or a TTY session runs
+    /// as the workload does and never as the runtime.
+    proc: ProcCtx,
 }
 
 const HP_EMPTY: HpSlot = HpSlot {
@@ -97,6 +121,7 @@ const HP_EMPTY: HpSlot = HpSlot {
     paused: false,
     exit_state: HP_STATE_RUNNING,
     exit_code: 0,
+    proc: PROC_EMPTY,
 };
 
 static mut LINUX_SANDBOXES: [HpSlot; MAX_SANDBOXES] = [HP_EMPTY; MAX_SANDBOXES];
@@ -126,6 +151,292 @@ pub struct SpawnPlan {
     /// Bind mounts, resolved against the rootfs BEFORE the fork: the child
     /// only issues syscalls, it never allocates.
     binds: Vec<PlannedBind>,
+    /// The process: its environment, cwd and credentials ([`plan_process`]).
+    /// Empty until planned — a plan nobody gave an environment runs with
+    /// none, never with the runtime's.
+    proc: ProcCtx,
+    /// `proc.envp` as the NULL-terminated pointer array execve takes.
+    envp_ptrs: Vec<*const libc::c_char>,
+}
+
+/// The process of a workload, as it will be exec'd: built before the fork
+/// (the child only reads it) and kept on the slot for EXEC and TTY sessions.
+pub struct ProcCtx {
+    /// The whole environment, `NAME=VALUE` each.
+    envp: Vec<CString>,
+    /// Where a bare argv[0] is looked up: the env's `PATH`, else
+    /// [`DEFAULT_SEARCH_PATH`]. None until planned.
+    search: Option<CString>,
+    /// Where the process starts, as the child sees the filesystem.
+    cwd: Option<CString>,
+    /// The directories to create, outermost first, when `cwd` is missing
+    /// inside an isolated rootfs (the workload's own; never on the host).
+    cwd_dirs: Vec<CString>,
+    /// Who it runs as; None = the runtime's own identity.
+    cred: Option<Cred>,
+}
+
+const PROC_EMPTY: ProcCtx = ProcCtx {
+    envp: Vec::new(),
+    search: None,
+    cwd: None,
+    cwd_dirs: Vec::new(),
+    cred: None,
+};
+
+impl ProcCtx {
+    /// The environment as the NULL-terminated array execve takes; it borrows
+    /// `envp`, so it is valid while this context is.
+    fn envp_ptrs(&self) -> Vec<*const libc::c_char> {
+        let mut v: Vec<*const libc::c_char> = self.envp.iter().map(|c| c.as_ptr()).collect();
+        v.push(core::ptr::null());
+        v
+    }
+}
+
+/// The search path a bare argv[0] is looked up on when the workload's
+/// environment names no `PATH` — the one container runtimes default to.
+pub const DEFAULT_SEARCH_PATH: &str =
+    "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+/// A workload's identity: the uid and gid it runs as, and its supplementary
+/// groups (the primary first).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Cred {
+    pub uid: u32,
+    pub gid: u32,
+    pub groups: Vec<u32>,
+}
+
+/// The process half of a spawn (see the module header): the environment,
+/// the working directory and the user, each as the orchestrator states it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProcessParams {
+    /// `NAME=VALUE` entries — the whole environment.
+    pub env: Vec<String>,
+    /// Absolute; empty is `/`.
+    pub cwd: String,
+    /// `uid[:gid]` or `name[:group]`; empty is the runtime's own identity.
+    pub user: String,
+}
+
+/// A user resolved against a root: who to run as (None = the runtime's own
+/// identity, unchanged), and that user's home.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedUser {
+    pub cred: Option<Cred>,
+    pub home: String,
+}
+
+/// One `/etc/passwd` entry: name, uid, gid, home.
+fn passwd_entries(root: &str) -> Vec<(String, u32, u32, String)> {
+    let path = format!("{}/etc/passwd", root.trim_end_matches('/'));
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    text.lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split(':').collect();
+            if f.len() < 7 || l.starts_with('#') {
+                return None;
+            }
+            Some((
+                f[0].to_string(),
+                f[2].parse().ok()?,
+                f[3].parse().ok()?,
+                f[5].to_string(),
+            ))
+        })
+        .collect()
+}
+
+/// One `/etc/group` entry: name, gid, members.
+fn group_entries(root: &str) -> Vec<(String, u32, Vec<String>)> {
+    let path = format!("{}/etc/group", root.trim_end_matches('/'));
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    text.lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split(':').collect();
+            if f.len() < 4 || l.starts_with('#') {
+                return None;
+            }
+            let members = f[3]
+                .split(',')
+                .filter(|m| !m.is_empty())
+                .map(str::to_string)
+                .collect();
+            Some((f[0].to_string(), f[2].parse().ok()?, members))
+        })
+        .collect()
+}
+
+fn all_digits(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Resolve an OCI user string against `root` (the workload's root: its
+/// rootfs, or `/` for a workload without one). `uid` alone takes the gid of
+/// that uid's passwd entry, or 0 when it has none (as OCI runtimes do); a
+/// name must be in the root's passwd (`root` is uid 0 even without one), a
+/// group name in its group file (ENOENT otherwise); a malformed one is
+/// EINVAL. Supplementary groups are
+/// the primary plus every group the user's name is a member of. An empty
+/// user is the runtime's own identity (`cred: None`), its home looked up by
+/// the runtime's uid.
+pub fn resolve_user(user: &str, root: &str) -> Result<ResolvedUser, i32> {
+    use crate::kernel::sys::errno;
+    let pw = passwd_entries(root);
+    if user.is_empty() {
+        // SAFETY: geteuid has no preconditions.
+        let me = unsafe { libc::geteuid() };
+        let home = pw
+            .iter()
+            .find(|e| e.1 == me)
+            .map(|e| e.3.clone())
+            .unwrap_or_else(|| "/".into());
+        return Ok(ResolvedUser { cred: None, home });
+    }
+    let (u, g) = match user.split_once(':') {
+        Some((u, g)) => (u, Some(g)),
+        None => (user, None),
+    };
+    if u.is_empty() || g.is_some_and(str::is_empty) {
+        return Err(errno::EINVAL);
+    }
+    let entry = if all_digits(u) {
+        let uid: u32 = u.parse().map_err(|_| errno::EINVAL)?;
+        pw.iter()
+            .find(|e| e.1 == uid)
+            .cloned()
+            .unwrap_or((String::new(), uid, 0, "/".into()))
+    } else {
+        match pw.iter().find(|e| e.0 == u) {
+            Some(e) => e.clone(),
+            // `root` is uid 0 in any root, with a user database or without
+            // (a `FROM scratch` image saying `USER root`).
+            None if u == "root" => ("root".into(), 0, 0, "/root".into()),
+            None => return Err(errno::ENOENT),
+        }
+    };
+    let groups_db = group_entries(root);
+    let gid = match g {
+        None => entry.2,
+        Some(g) if all_digits(g) => g.parse().map_err(|_| errno::EINVAL)?,
+        Some(g) => groups_db
+            .iter()
+            .find(|e| e.0 == g)
+            .map(|e| e.1)
+            .ok_or(errno::ENOENT)?,
+    };
+    let mut groups = vec![gid];
+    if !entry.0.is_empty() {
+        for (_, id, members) in &groups_db {
+            if members.contains(&entry.0) && !groups.contains(id) {
+                groups.push(*id);
+            }
+        }
+    }
+    let home = if entry.3.is_empty() {
+        "/".into()
+    } else {
+        entry.3.clone()
+    };
+    Ok(ResolvedUser {
+        cred: Some(Cred {
+            uid: entry.1,
+            gid,
+            groups,
+        }),
+        home,
+    })
+}
+
+/// Plan the process half of a spawn into `plan`: the environment (with
+/// `HOME` when it has none), the search path, the working directory as the
+/// child will see it, and the identity. EINVAL for an entry that is not
+/// `NAME=VALUE`, a relative cwd, or one that could leave a non-isolated
+/// rootfs; ENOENT for a user the root does not have; EACCES for a user other
+/// than its own on an unprivileged runtime.
+pub fn plan_process(plan: &mut SpawnPlan, p: &ProcessParams) -> Result<(), i32> {
+    use crate::kernel::sys::errno;
+    let rootfs = plan
+        .rootfs
+        .as_ref()
+        .map(|c| c.to_string_lossy().into_owned())
+        .filter(|r| !r.is_empty());
+    let root = rootfs.as_deref().unwrap_or("/");
+    let resolved = resolve_user(&p.user, root)?;
+    let mut cred = resolved.cred;
+    // SAFETY: the id getters have no preconditions.
+    let (euid, egid) = unsafe { (libc::geteuid(), libc::getegid()) };
+    if euid != 0 {
+        match &cred {
+            Some(c) if c.uid == euid && c.gid == egid => cred = None,
+            Some(_) => return Err(errno::EACCES),
+            None => {}
+        }
+    }
+    let mut envp = Vec::with_capacity(p.env.len() + 1);
+    let mut path = None;
+    let mut has_home = false;
+    for e in &p.env {
+        let Some((name, value)) = e.split_once('=') else {
+            return Err(errno::EINVAL);
+        };
+        if name.is_empty() {
+            return Err(errno::EINVAL);
+        }
+        if name == "PATH" {
+            path = Some(value.to_string());
+        }
+        has_home |= name == "HOME";
+        envp.push(CString::new(e.as_str()).map_err(|_| errno::EINVAL)?);
+    }
+    if !has_home {
+        envp.push(CString::new(format!("HOME={}", resolved.home)).map_err(|_| errno::EINVAL)?);
+    }
+    let search = path.unwrap_or_else(|| DEFAULT_SEARCH_PATH.to_string());
+    let cwd = if p.cwd.is_empty() {
+        "/"
+    } else {
+        p.cwd.as_str()
+    };
+    if !cwd.starts_with('/') {
+        return Err(errno::EINVAL);
+    }
+    let mut cwd_dirs = Vec::new();
+    let child_cwd = match (rootfs.as_deref(), plan.isolate) {
+        // Pivoted: the path is the workload's own, created when missing.
+        (Some(_), true) => {
+            let mut acc = String::new();
+            for seg in cwd.split('/').filter(|s| !s.is_empty()) {
+                acc.push('/');
+                acc.push_str(seg);
+                cwd_dirs.push(CString::new(acc.clone()).map_err(|_| errno::EINVAL)?);
+            }
+            cwd.to_string()
+        }
+        // Not pivoted: the rootfs is only a directory, so the path is
+        // joined under it and may not climb out of it.
+        (Some(r), false) => {
+            if cwd.split('/').any(|s| s == "..") {
+                return Err(errno::EINVAL);
+            }
+            format!(
+                "{}{}",
+                r.trim_end_matches('/'),
+                if cwd == "/" { "" } else { cwd }
+            )
+        }
+        (None, _) => cwd.to_string(),
+    };
+    plan.proc = ProcCtx {
+        envp,
+        search: Some(CString::new(search).map_err(|_| errno::EINVAL)?),
+        cwd: Some(CString::new(child_cwd).map_err(|_| errno::EINVAL)?),
+        cwd_dirs,
+        cred,
+    };
+    plan.envp_ptrs = plan.proc.envp_ptrs();
+    Ok(())
 }
 
 /// A volume the workload sees at `dst` inside its root: the host path `src`
@@ -230,6 +541,8 @@ pub fn build_plan(
         mem_max: None,
         pids_max: None,
         cpu_max: None,
+        proc: PROC_EMPTY,
+        envp_ptrs: vec![core::ptr::null()],
     })
 }
 
@@ -530,10 +843,9 @@ unsafe fn hp_container_body(plan: &SpawnPlan, start_r: i32, out_w: i32) -> ! {
                 core::ptr::null(),
             );
         }
-    } else if let Some(rootfs) = plan.rootfs.as_ref() {
-        // Null sandbox with a rootfs: chroot only (no mount ns). chdir first.
-        libc::chdir(rootfs.as_ptr());
     }
+    // A null sandbox with a rootfs is not rooted in it (no mount namespace to
+    // pivot in): it only STARTS there — `proc.cwd` is joined under it.
 
     // stdio → the out pipe; stdin from /dev/null.
     libc::dup2(out_w, libc::STDOUT_FILENO);
@@ -566,9 +878,127 @@ unsafe fn hp_container_body(plan: &SpawnPlan, start_r: i32, out_w: i32) -> ! {
     }
     libc::close(start_r);
 
-    libc::execvp(plan.argv_ptrs[0], plan.argv_ptrs.as_ptr());
-    // execvp only returns on failure.
-    libc::_exit(127);
+    // Where it starts: missing inside an isolated rootfs, it is created
+    // there (the workload's own filesystem) and entered again.
+    let cwd = plan.proc.cwd.as_ref().map_or(c"/".as_ptr(), |c| c.as_ptr());
+    if libc::chdir(cwd) != 0 {
+        for d in &plan.proc.cwd_dirs {
+            libc::mkdir(d.as_ptr(), 0o755);
+        }
+        if libc::chdir(cwd) != 0 {
+            libc::_exit(116);
+        }
+    }
+    // Who it runs as, last: the mounts and the cwd above may need the
+    // runtime's privilege.
+    if let Some(c) = plan.proc.cred.as_ref() {
+        if !apply_cred(c) {
+            libc::_exit(115);
+        }
+    }
+    exec_with(&plan.argv_ptrs, &plan.envp_ptrs, &plan.proc);
+}
+
+/// Become `c`: supplementary groups, then gid, then uid (all three ids of
+/// each, so nothing can be regained). Raw syscalls: they change this thread
+/// only, which in a forked child is the process — glibc's wrappers would
+/// try to broadcast to threads the child does not have. False on any
+/// refusal.
+unsafe fn apply_cred(c: &Cred) -> bool {
+    libc::syscall(libc::SYS_setgroups, c.groups.len(), c.groups.as_ptr()) == 0
+        && libc::syscall(libc::SYS_setresgid, c.gid, c.gid, c.gid) == 0
+        && libc::syscall(libc::SYS_setresuid, c.uid, c.uid, c.uid) == 0
+}
+
+/// A process joining a live workload (EXEC, TTY): into its cwd (it stays at
+/// the root it entered when that is gone), then its identity — a refused one
+/// exits 115 rather than run as the runtime.
+unsafe fn enter_as_workload(proc: &ProcCtx) {
+    if let Some(c) = proc.cwd.as_ref() {
+        libc::chdir(c.as_ptr());
+    }
+    if let Some(c) = proc.cred.as_ref() {
+        if !apply_cred(c) {
+            libc::_exit(115);
+        }
+    }
+}
+
+/// execve `argv` with exactly `envp` — never the runtime's environment. A
+/// bare argv[0] is looked up on the workload's own search path, in its own
+/// root, by execvp's rules (an empty entry is the cwd; a hit that is not
+/// executable is remembered, the search goes on). Exits 127 when nothing
+/// was found, 126 when something was but could not be run. Async-signal-
+/// safe: the candidate path is built on the stack.
+unsafe fn exec_with(
+    argv: &[*const libc::c_char],
+    envp: &[*const libc::c_char],
+    proc: &ProcCtx,
+) -> ! {
+    let file = argv[0];
+    let flen = libc::strlen(file);
+    if flen == 0 {
+        libc::_exit(127);
+    }
+    if !libc::strchr(file, b'/' as libc::c_int).is_null() {
+        libc::execve(file, argv.as_ptr(), envp.as_ptr());
+        let e = *libc::__errno_location();
+        libc::_exit(if e == libc::ENOENT || e == libc::ENOTDIR {
+            127
+        } else {
+            126
+        });
+    }
+    // A plan given no environment still searches the default path, never
+    // the runtime's.
+    const DEFAULT: &core::ffi::CStr =
+        c"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+    let search = proc
+        .search
+        .as_deref()
+        .unwrap_or(DEFAULT)
+        .as_ptr()
+        .cast::<u8>();
+    let mut buf = [0u8; 4096];
+    let mut found = false;
+    let mut p = search;
+    loop {
+        let mut q = p;
+        while *q != 0 && *q != b':' {
+            q = q.add(1);
+        }
+        let seg = q.offset_from(p) as usize;
+        let (dir, dlen) = if seg == 0 {
+            (b".".as_ptr(), 1)
+        } else {
+            (p, seg)
+        };
+        if dlen + 1 + flen < buf.len() {
+            core::ptr::copy_nonoverlapping(dir, buf.as_mut_ptr(), dlen);
+            buf[dlen] = b'/';
+            core::ptr::copy_nonoverlapping(file.cast::<u8>(), buf.as_mut_ptr().add(dlen + 1), flen);
+            buf[dlen + 1 + flen] = 0;
+            libc::execve(
+                buf.as_ptr() as *const libc::c_char,
+                argv.as_ptr(),
+                envp.as_ptr(),
+            );
+            let e = *libc::__errno_location();
+            if e != libc::ENOENT
+                && e != libc::ENOTDIR
+                && e != libc::ESTALE
+                && e != libc::ELOOP
+                && e != libc::ENAMETOOLONG
+            {
+                found = true;
+            }
+        }
+        if *q == 0 {
+            break;
+        }
+        p = q.add(1);
+    }
+    libc::_exit(if found { 126 } else { 127 });
 }
 
 /// pivot_root into `new_root` (a mount point). Mirrors nanocloud
@@ -643,16 +1073,30 @@ pub unsafe fn hp_spawn(
     own_netns: bool,
     ident: Option<&super::net_identity::NetIdentity>,
 ) -> i32 {
-    hp_spawn_with_binds(argv_tokens, rootfs, isolate, env, own_netns, ident, &[])
+    hp_spawn_with_binds(
+        argv_tokens,
+        rootfs,
+        isolate,
+        env,
+        own_netns,
+        ident,
+        &[],
+        &ProcessParams::default(),
+    )
 }
 
-/// [`hp_spawn`] with volumes: each [`VolumeBind`] is bind-mounted into the
-/// rootfs before the pivot. A bind needs an isolated sandbox with a rootfs
-/// (EINVAL otherwise) — without its own mount namespace the mount would land
-/// on the host.
+/// [`hp_spawn`] with volumes and the process: each [`VolumeBind`] is
+/// bind-mounted into the rootfs before the pivot, and the workload runs with
+/// exactly `proc`'s environment, in its cwd, as its user ([`plan_process`]).
+/// A bind needs an isolated sandbox with a rootfs (EINVAL otherwise) —
+/// without its own mount namespace the mount would land on the host.
 ///
 /// # Safety
 /// As [`hp_spawn`].
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one spawn: the plan's parts as the provider parsed them"
+)]
 pub unsafe fn hp_spawn_with_binds(
     argv_tokens: &[&str],
     rootfs: Option<&str>,
@@ -661,6 +1105,7 @@ pub unsafe fn hp_spawn_with_binds(
     own_netns: bool,
     ident: Option<&super::net_identity::NetIdentity>,
     binds: &[VolumeBind],
+    proc: &ProcessParams,
 ) -> i32 {
     use crate::kernel::sys::errno;
 
@@ -668,6 +1113,9 @@ pub unsafe fn hp_spawn_with_binds(
         Ok(p) => p,
         Err(e) => return e,
     };
+    if let Err(e) = plan_process(&mut plan, proc) {
+        return e;
+    }
     if !binds.is_empty() && !isolate {
         return errno::EINVAL;
     }
@@ -765,6 +1213,8 @@ pub unsafe fn hp_spawn_with_binds(
     slot.paused = false;
     slot.exit_state = HP_STATE_RUNNING;
     slot.exit_code = 0;
+    // The child has its copy; the slot keeps the process for EXEC and TTY.
+    slot.proc = core::mem::replace(&mut plan.proc, PROC_EMPTY);
     // Apply resource limits before START releases the container (best-effort).
     let (cgrouped, contained) = hp_apply_cgroup(idx, container_pid, &plan);
     slot.cgrouped = cgrouped;
@@ -903,15 +1353,18 @@ pub unsafe fn hp_tty_open(raw: i32, arg: *const u8, arg_len: usize) -> i32 {
     let mut argv_ptrs: Vec<*const libc::c_char> = cargs.iter().map(|c| c.as_ptr()).collect();
     argv_ptrs.push(core::ptr::null());
 
-    let (container_pid, isolated, started) = {
+    let (container_pid, isolated, started, proc) = {
         let Some(slot) = slot_for(raw) else {
             return errno::EINVAL;
         };
-        (slot.container_pid, slot.isolated, slot.started)
+        (slot.container_pid, slot.isolated, slot.started, &slot.proc)
     };
     if !started {
         return errno::EINVAL;
     }
+    // The session runs as the workload does: its environment, its cwd, its
+    // user.
+    let envp = proc.envp_ptrs();
 
     let sessions = &mut *core::ptr::addr_of_mut!(LINUX_TTYS);
     let sid = match sessions.iter().position(|s| !s.in_use) {
@@ -991,8 +1444,8 @@ pub unsafe fn hp_tty_open(raw: i32, arg: *const u8, arg_len: usize) -> i32 {
         if slave > 2 {
             libc::close(slave);
         }
-        libc::execvp(argv_ptrs[0], argv_ptrs.as_ptr());
-        libc::_exit(127);
+        enter_as_workload(proc);
+        exec_with(&argv_ptrs, &envp, proc);
     }
     // Parent: keep the master (non-blocking), drop the slave + ns fds.
     libc::close(slave);
@@ -1204,15 +1657,17 @@ pub unsafe fn hp_exec(raw: i32, arg: *mut u8, arg_len: usize) -> i32 {
     let mut argv_ptrs: Vec<*const libc::c_char> = cargs.iter().map(|c| c.as_ptr()).collect();
     argv_ptrs.push(core::ptr::null());
 
-    let (container_pid, isolated, started) = {
+    let (container_pid, isolated, started, proc) = {
         let Some(slot) = slot_for(raw) else {
             return errno::EINVAL;
         };
-        (slot.container_pid, slot.isolated, slot.started)
+        (slot.container_pid, slot.isolated, slot.started, &slot.proc)
     };
     if !started {
         return errno::EINVAL; // nothing to exec into until the container runs
     }
+    // The command runs as the workload does: its environment, cwd and user.
+    let envp = proc.envp_ptrs();
 
     // Pre-open the container's namespace fds on the PARENT side — malloc is safe
     // here, but the post-fork child must not allocate. setns order: ipc, uts,
@@ -1274,8 +1729,8 @@ pub unsafe fn hp_exec(raw: i32, arg: *mut u8, arg_len: usize) -> i32 {
         if w > 2 {
             libc::close(w);
         }
-        libc::execvp(argv_ptrs[0], argv_ptrs.as_ptr());
-        libc::_exit(127); // execvp only returns on failure
+        enter_as_workload(proc);
+        exec_with(&argv_ptrs, &envp, proc);
     }
 
     // Parent: close the write end + the ns fds, drain the pipe into arg[4..]

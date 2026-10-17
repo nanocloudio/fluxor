@@ -282,7 +282,8 @@ pub const SIG_KILL: u32 = 2;
 ///                            OWN here or on any endpoint puts the workload in its
 ///                            own network domain (a workload can have an identity
 ///                            and no declared endpoints)
-///  19     1  _reserved
+///  19     1  storage         STORAGE_* — what the workload is granted of the
+///                            node's storage
 ///  20     4  compute_milli   milli core-equivalents (0 = unlimited)
 ///  24     8  memory_bytes    memory quota           (0 = unlimited)
 ///  32     4  max_tasks       max concurrent tasks   (0 = unlimited)
@@ -309,6 +310,18 @@ pub const SIG_KILL: u32 = 2;
 /// combined with every endpoint at [`NET_ISO_SHARED`] the workload shares the
 /// host/system network domain.
 pub const CREATE_HEADER_SIZE: usize = 76;
+
+/// Storage grant values (`storage`). A workload reaches the node's storage
+/// only through its grant: the platform's `fs`, `storage.object` and
+/// `storage.namespace` contracts serve it inside what the grant names, and
+/// nothing else of the node's. Any other value is `EINVAL`.
+///
+/// A root of the workload's own, made on first use, charged to
+/// `storage_bytes`, and removed when the workload is destroyed. The default.
+pub const STORAGE_OWN_ROOT: u8 = 0;
+/// No node storage: those contracts answer the workload `EACCES`. What it
+/// keeps, it keeps in a provider of its own, over a volume lent to it.
+pub const STORAGE_NONE: u8 = 1;
 
 /// Network-identity family values (`net_family`).
 pub const NET_FAM_NONE: u8 = 0;

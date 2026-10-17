@@ -116,17 +116,18 @@ mod profile_host {
         /// module of the busiest graph at once. A node hosts workload
         /// subgraphs beside its own graph, and they draw on the same pool:
         /// a bare-metal node's control plane seats ~253 MiB on its own, and
-        /// one key-value Pod's state worker asks 15-23 MiB. 1 GiB holds the
-        /// node plane and several such Pods. It costs no image bytes and is
+        /// one key-value workload's state worker asks 15-23 MiB. 1 GiB holds
+        /// the node plane and several such workloads. It costs no image bytes and is
         /// never zeroed whole (the loader zeroes each allocation); the
         /// bcm2712 kernel gives it a region of its own above 1 GB, so a
         /// Pi 5 running this profile needs 2 GB of DRAM.
         pub const STATE_ARENA_SIZE: usize = 1024 * 1024 * 1024;
         /// Per-channel buffer pool. A node's own graph and the workload
         /// subgraphs it hosts share it: the bare-metal node's base graph
-        /// (control plane, kubelet slice, its PKI) alone holds ~8 MiB of
-        /// channels, and a stateful Pod adds two 128 KiB block edges. 16 MiB
-        /// leaves room for several such Pods; zero-initialised `.bss`.
+        /// (control plane, node agent, its PKI) alone holds ~8 MiB of
+        /// channels, and a stateful workload adds two 128 KiB block edges.
+        /// 16 MiB leaves room for several such workloads; zero-initialised
+        /// `.bss`.
         pub const BUFFER_ARENA_SIZE: usize = 16 * 1024 * 1024;
         // Multi-workload: a node's own graph plus the workload subgraphs it
         // hosts, all in one scheduler on aarch64 (bcm2712 / linux). A

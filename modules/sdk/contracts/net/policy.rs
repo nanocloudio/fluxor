@@ -107,8 +107,8 @@ pub mod rule {
     /// [port_lo:u16 BE][port_hi:u16 BE]          DESTINATION port range (0/0 = any)
     /// ```
     /// The port is always the destination's: the subject's own port for
-    /// ingress, the peer's for egress — which is what a Kubernetes
-    /// NetworkPolicy's `ports` means in both directions.
+    /// ingress, the peer's for egress, in both directions alike, as
+    /// orchestrator network policies define a rule's ports.
     pub const ALLOW: u8 = 1;
     /// Drop matching traffic. Same body as [`ALLOW`].
     pub const DROP: u8 = 2;

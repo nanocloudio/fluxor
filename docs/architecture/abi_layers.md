@@ -762,8 +762,10 @@ orchestrator vocabulary; renaming them to invented equivalents
 (handle/readiness/control-op) would churn the entire ABI and every
 consumer for no architectural gain. Higher-level orchestration
 vocabulary is native Fluxor (`owner`, `workload`, `lease`, `posture`,
-`endpoint`, `drain`); Kubernetes vocabulary lives in nanocloud, which
-translates at its boundary.
+`endpoint`, `drain`, `grant`); an orchestrator's vocabulary lives in the
+orchestrator, which translates at its boundary. No user, group or mode bit
+crosses the portable surface: those are the host-process platform contract's
+alone, and the `tenancy-vocabulary` hygiene rule refuses them elsewhere.
 
 Reopens if: Fluxor grows a public API audience for whom POSIX
 vocabulary actively misleads (e.g. an `fd` that stops behaving like a

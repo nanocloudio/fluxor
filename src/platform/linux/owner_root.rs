@@ -17,9 +17,14 @@
 //! A file's charge is kept per inode and read from the inode itself, so it
 //! follows the file whichever handle or path changes it.
 //!
+//! An owner reaches a root only by its grant
+//! (`kernel::workload::storage::StorageGrant`): one whose `CREATE` granted no
+//! node storage is answered `EACCES`, and the costs it is charged are the
+//! ones every platform charges.
+//!
 //! The base is `$FLUXOR_OWNER_ROOT`, default `/var/lib/fluxor/owners`. A root
-//! is made when an admitted owner first touches storage, and removed when the
-//! owner is released. Nothing else removes it: a root survives a runtime
+//! is made when an owner granted one first touches storage, and removed when
+//! the owner is released. Nothing else removes it: a root survives a runtime
 //! restart, and an owner admitted again under the same identity finds what it
 //! held, charged to its ledger again. A root for an identity the node agent
 //! will not admit again is the agent's to remove. Data that must outlive the
@@ -30,7 +35,8 @@ use std::path::{Path, PathBuf};
 
 use crate::kernel::exec::scheduler;
 use crate::kernel::sys::errno;
-use crate::kernel::workload::owner::{OwnerHandle, OwnerState};
+use crate::kernel::workload::owner::OwnerHandle;
+use crate::kernel::workload::storage::{file_cost, may_hold_storage, ENTRY_COST};
 use crate::platform::linux::store::{Served, Store};
 
 /// Where owner roots live when `FLUXOR_OWNER_ROOT` is unset.
@@ -41,9 +47,6 @@ const OWNER_STORE_HISTORY: usize = 4096;
 const OWNER_STORE_RING: usize = 1024;
 /// Longest path an owner names, matching the `fs` provider's own bound.
 const PATH_MAX: usize = 255;
-/// What a name costs its owner besides a file's bytes: an inode and a
-/// directory entry.
-pub const ENTRY_COST: u64 = 4096;
 
 /// One owner's root: its files directory, held open, its store with the
 /// handles on it, opened on first use, and what each inode is charged.
@@ -71,7 +74,7 @@ fn hex(uid: &[u8; 16]) -> String {
 /// [`ENTRY_COST`], anything else [`ENTRY_COST`].
 pub fn inode_cost(st: &libc::stat) -> u64 {
     if st.st_mode & libc::S_IFMT == libc::S_IFREG {
-        ENTRY_COST + st.st_size as u64
+        file_cost(st.st_size as u64)
     } else {
         ENTRY_COST
     }
@@ -89,7 +92,7 @@ fn walk_inodes(dir: &Path, into: &mut BTreeMap<u64, u64>) {
             continue;
         };
         let cost = if meta.is_file() {
-            ENTRY_COST + meta.len()
+            file_cost(meta.len())
         } else {
             ENTRY_COST
         };
@@ -98,18 +101,6 @@ fn walk_inodes(dir: &Path, into: &mut BTreeMap<u64, u64>) {
             walk_inodes(&entry.path(), into);
         }
     }
-}
-
-/// Whether `owner` may come to hold storage: one being admitted or running.
-/// An owner being drained or revoked makes no root, so nothing it does on
-/// its way out can bring back a root its release removed.
-fn may_hold_storage(owner: OwnerHandle) -> bool {
-    scheduler::owners().lookup(owner).is_some_and(|e| {
-        matches!(
-            e.state,
-            OwnerState::Reserved | OwnerState::Active | OwnerState::Paused
-        )
-    })
 }
 
 /// The owner's root, made on first use. `None` for the system owner (which

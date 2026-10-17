@@ -605,10 +605,9 @@ pub const GRAPH_SLOTS_CODE: u8 = if MAX_GRAPH_EDGES == 128 {
 /// than on whether an OS is present:
 /// - 512 KiB on the hosted targets (linux, wasm) and on bare-metal aarch64
 ///   (bcm2712), which carries the host profile's config arena. A graph of a
-///   few hundred modules composed from params needs well past 32 KiB — a
-///   whole Kubernetes control plane as Chronicle params is ~270 KiB, past the
-///   256 KiB this was — and a wasm scenario host inlines its browser shell as
-///   `body:` routes. The blob is parsed in place and only module params are
+///   few hundred modules composed from params needs well past 32 KiB — an
+///   orchestrator's whole control plane as params is ~270 KiB — and a wasm
+///   scenario host inlines its browser shell as `body:` routes. The blob is parsed in place and only module params are
 ///   copied out (into the config arena, sized separately), so this bounds a
 ///   read, not an allocation.
 /// - 32 KiB on the microcontroller targets.

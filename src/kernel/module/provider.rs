@@ -1532,6 +1532,71 @@ fn layer_visible(layer: &ProviderLayer) -> bool {
     layer.owner == crate::kernel::exec::scheduler::caller_owner()
 }
 
+/// The node's own default layer of `contract`: the top-most unkeyed layer a
+/// system-owned module registered, whoever is calling. `None` when the node
+/// has none.
+fn node_default_layer(entry: &ProviderEntry) -> Option<&ProviderLayer> {
+    (0..entry.depth as usize).rev().find_map(|i| {
+        entry.chain[i]
+            .as_ref()
+            .filter(|l| l.selector == 0 && l.owner.is_system())
+    })
+}
+
+/// Deliver an op to the node's own default provider of `contract` (the
+/// node's `fat32` for `fs`), in that provider's frame, whoever the caller
+/// is. `ENOSYS` when the node has none.
+///
+/// This is the one way past [`layer_visible`], and it is the platform's: a
+/// platform rooting layer (the bare-metal owner roots) answers a workload's
+/// call by rewriting it beneath the workload's own root and handing it to
+/// the node's provider here. No syscall, contract op or module export
+/// reaches it, and the only caller is a kernel-registered provider handing
+/// down a request it has already confined: a path to it from anywhere else
+/// would hand a workload the node's whole namespace.
+/// `tests/harness/tests/node_default_reach_lint.rs` holds every caller to
+/// the platform rooting layers.
+///
+/// # Safety
+/// `arg` must satisfy the provider's requirements for `opcode`.
+pub unsafe fn dispatch_node_default(
+    contract: ContractId,
+    handle: i32,
+    opcode: u32,
+    arg: *mut u8,
+    arg_len: usize,
+) -> i32 {
+    let idx = contract as usize;
+    if idx >= MAX_PROVIDERS {
+        return errno::ENOSYS;
+    }
+    // SAFETY: scheduler-thread read; the layer's pair is copied out before
+    // module code runs.
+    let target = unsafe {
+        let entry = &(*core::ptr::addr_of!(PROVIDERS))[idx];
+        node_default_layer(entry).map(|l| (l.module_idx, l.dispatch, l.state))
+    };
+    match target {
+        Some((midx, dispatch, state)) => in_provider_frame(midx as usize, || {
+            // SAFETY: the pair the module registered; caller's `arg` contract.
+            unsafe { dispatch(state, handle, opcode, arg, arg_len) }
+        }),
+        None => errno::ENOSYS,
+    }
+}
+
+/// The module serving the node's own default layer of `contract`, if any.
+pub fn node_default_module(contract: usize) -> Option<usize> {
+    if contract >= MAX_PROVIDERS {
+        return None;
+    }
+    // SAFETY: scheduler-thread read.
+    unsafe {
+        let entry = &(*core::ptr::addr_of!(PROVIDERS))[contract];
+        node_default_layer(entry).map(|l| l.module_idx as usize)
+    }
+}
+
 /// The module serving `contract` by default — its top-most unkeyed layer —
 /// or `None` when no module does (no provider, or only the kernel's own).
 /// The contract-readiness gate asks this once the graph is instantiated.

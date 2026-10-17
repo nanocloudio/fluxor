@@ -48,6 +48,12 @@ pub mod multicore;
 #[cfg(feature = "chip-bcm2712")]
 #[path = "bcm2712/net.rs"]
 pub mod nic_ring;
+/// Owner-rooted storage on bare metal (bcm2712): a workload's `fs` calls,
+/// served beneath `/owners/<uid hex>/files/` on the node's own volume, with
+/// the owner's storage quota, and the root removed when the owner is.
+#[cfg(feature = "chip-bcm2712")]
+#[path = "bcm2712/owner_root.rs"]
+pub mod owner_root;
 /// PCIe root-complex bring-up (bcm2712 → RP1 over PCIe).
 #[cfg(feature = "chip-bcm2712")]
 #[path = "bcm2712/pcie.rs"]

@@ -50,6 +50,7 @@ pub enum Rule {
     ConsumerNaming,
     CrateRootAllow,
     PendingWrite,
+    TenancyVocabulary,
 }
 
 impl Rule {
@@ -101,6 +102,7 @@ impl Rule {
             Rule::RepoFiles => "repo-files",
             Rule::ConsumerNaming => "consumer-naming",
             Rule::PendingWrite => "pending-write",
+            Rule::TenancyVocabulary => "tenancy-vocabulary",
         }
     }
 }
@@ -325,6 +327,7 @@ pub fn scan(project_root: &Path, config: &Config) -> Result<Report, ScanError> {
         // is not its to rename.
         if sdk_owner {
             file_violations.extend(scan_consumer_naming(&rel, &content));
+            file_violations.extend(scan_tenancy_vocabulary(&rel, &content));
         }
         if !sdk_owner {
             file_violations.extend(scan_sdk_mounts(&rel, &content));
@@ -1102,6 +1105,85 @@ fn scan_consumer_naming(rel: &Path, src: &str) -> Vec<Violation> {
     out
 }
 
+/// Unix credentials: what a portable contract must never carry. A workload
+/// reaches what its owner was granted, inside a root of its own; a user,
+/// group, mode bit or identity switch is a host-process mechanism, and lives
+/// only in that platform's own contract (`modules/sdk/platform/linux/`).
+const UNIX_CREDENTIAL_WORDS: &[&str] = &[
+    "gid",
+    "setuid",
+    "setgid",
+    "setresuid",
+    "setresgid",
+    "setgroups",
+    "initgroups",
+    "passwd",
+    "chmod",
+    "chown",
+    "umask",
+    "st_uid",
+    "st_gid",
+    "st_mode",
+];
+
+/// An orchestrator's nouns: they belong to the orchestrator built on the
+/// portable surface, not to the surface itself, which says workload, owner
+/// and node agent.
+const ORCHESTRATOR_WORDS: &[&str] = &["pod", "pods", "kubelet", "kubernetes", "k8s"];
+
+/// Whether `rel` is part of the portable surface: the normative surface
+/// less a platform's own contracts, which may name that platform's
+/// mechanisms.
+fn is_portable_surface(rel: &Path) -> bool {
+    let p = rel.to_string_lossy().replace('\\', "/");
+    is_normative_surface(rel) && !p.starts_with("modules/sdk/platform/")
+}
+
+/// The portable surface speaks of owners and grants, never of Unix
+/// credentials or an orchestrator's nouns. Either is a sign of a contract
+/// taking the shape of one host or one consumer: a portable `fs` that
+/// reported a uid would invite every provider to enforce one, and none of
+/// the bare-metal ones has a user to enforce.
+fn scan_tenancy_vocabulary(rel: &Path, src: &str) -> Vec<Violation> {
+    if !is_portable_surface(rel) {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for (i, line) in src.lines().enumerate() {
+        let lower = line.to_ascii_lowercase();
+        for word in UNIX_CREDENTIAL_WORDS {
+            if word_appears(&lower, word) {
+                out.push(Violation {
+                    path: rel.to_path_buf(),
+                    line: i + 1,
+                    rule: Rule::TenancyVocabulary,
+                    message: format!(
+                        "names the Unix credential `{word}` in the portable surface — what a \
+                         workload may reach is a grant on its owner, made real inside a root of \
+                         its own; a credential belongs to the host-process platform contract \
+                         (`modules/sdk/platform/linux/`)"
+                    ),
+                });
+            }
+        }
+        for word in ORCHESTRATOR_WORDS {
+            if word_appears(&lower, word) {
+                out.push(Violation {
+                    path: rel.to_path_buf(),
+                    line: i + 1,
+                    rule: Rule::TenancyVocabulary,
+                    message: format!(
+                        "names the orchestrator noun `{word}` in the portable surface — say \
+                         workload, owner or node agent; an orchestrator's vocabulary lives in \
+                         the orchestrator"
+                    ),
+                });
+            }
+        }
+    }
+    out
+}
+
 /// Whether `needle` appears in `hay` as a whole word.
 fn word_appears(hay: &str, needle: &str) -> bool {
     let bytes = hay.as_bytes();
@@ -1661,6 +1743,26 @@ mod tests {
 
     fn scan_str(src: &str, tier: Tier, config: &Config) -> Vec<Violation> {
         scan_file(Path::new("dummy.rs"), src, tier, config)
+    }
+
+    #[test]
+    fn tenancy_vocabulary_is_refused_on_the_portable_surface_only() {
+        let src =
+            "/// mode: u32, uid: u32, gid: u32\n/// a Pod's state\nconst OWNER_UID: u8 = 0;\n";
+        let v = scan_tenancy_vocabulary(Path::new("modules/sdk/contracts/storage/fs.rs"), src);
+        let words: Vec<_> = v.iter().map(|v| (v.line, v.message.clone())).collect();
+        assert_eq!(v.len(), 2, "{words:?}");
+        assert!(v[0].line == 1 && v[0].message.contains("`gid`"));
+        assert!(v[1].line == 2 && v[1].message.contains("`pod`"));
+        assert!(
+            scan_tenancy_vocabulary(Path::new("modules/sdk/platform/linux/host_process.rs"), src)
+                .is_empty(),
+            "a platform's own contract names its own mechanisms"
+        );
+        assert!(
+            scan_tenancy_vocabulary(Path::new("src/platform/linux/host_backend.rs"), src)
+                .is_empty()
+        );
     }
 
     fn strict() -> Config {

@@ -599,6 +599,7 @@ use crate::kernel::ipc::channel::channel_write;
 use crate::kernel::ipc::fd::{slot_of, tag_fd, FD_TAG_STORAGE_NAMESPACE, FD_TAG_STORAGE_OBJECT};
 use crate::kernel::sys::errno;
 use crate::kernel::workload::owner::OwnerHandle;
+use crate::kernel::workload::storage::store_entry_cost;
 
 /// `CONTENT_TYPES` byte for `NamespaceChange` (`contracts/src/lib.rs`). A
 /// watcher routes on this to tell a store change from anything else sharing
@@ -738,11 +739,11 @@ impl Served {
     }
 
     /// What the store's live entries cost an owner holding them: see
-    /// [`entry_cost`].
+    /// [`store_entry_cost`].
     pub fn held_bytes(&self) -> u64 {
         self.store
             .scan(b"", None)
-            .map(|(key, size, _)| entry_cost(key.len(), size as usize))
+            .map(|(key, size, _)| store_entry_cost(key.len(), size as usize))
             .sum()
     }
 }
@@ -753,17 +754,6 @@ const OWNER_MAX_SUBS: usize = 16;
 const OWNER_MAX_READS: usize = 8;
 const OWNER_MAX_WRITES: usize = 4;
 const OWNER_STAGE_MAX: usize = 16 * 1024 * 1024;
-
-/// What an entry of `key_len` and `value_len` bytes costs the owner holding
-/// it: its key and value, and a fixed record overhead, so an owner cannot
-/// fill a store with keys or empty values it is never charged for.
-pub fn entry_cost(key_len: usize, value_len: usize) -> u64 {
-    (STORE_ENTRY_OVERHEAD + key_len + value_len) as u64
-}
-
-/// The fixed cost of one entry: its log record's framing and its place in
-/// the index.
-const STORE_ENTRY_OVERHEAD: usize = 64;
 
 /// Streaming writes open at once. Matched to `STORE_MAX_READS`, and for the
 /// same reason: one slot per operation a node has in flight, and an S3 server
@@ -1090,9 +1080,9 @@ struct PutCharge {
 fn charge_put(store: &Store, owner: OwnerHandle, key: &str, len: usize) -> Option<PutCharge> {
     let old = store
         .get(key)
-        .map(|(v, _)| entry_cost(key.len(), v.len()))
+        .map(|(v, _)| store_entry_cost(key.len(), v.len()))
         .unwrap_or(0);
-    let new = entry_cost(key.len(), len);
+    let new = store_entry_cost(key.len(), len);
     let c = PutCharge {
         add: new.saturating_sub(old),
         give: old.saturating_sub(new),
@@ -1337,7 +1327,7 @@ pub unsafe fn dispatch_object(handle: i32, opcode: u32, arg: *mut u8, arg_len: u
 }
 
 /// [`dispatch_object`] against `served`: the node's store, or an owner's
-/// own, which is never guarded. What an entry costs (see [`entry_cost`]) is
+/// own, which is never guarded. What an entry costs (see [`store_entry_cost`]) is
 /// charged to the caller's owner as it is written, staged bytes while they
 /// are staged, and a `DELETE` gives it back.
 ///
@@ -1727,7 +1717,7 @@ pub unsafe fn dispatch_object_on(
             };
             let held = store
                 .get(&key)
-                .map(|(v, _)| entry_cost(key.len(), v.len()))
+                .map(|(v, _)| store_entry_cost(key.len(), v.len()))
                 .unwrap_or(0);
             match store.delete(&key, precondition) {
                 Ok(opt) => {

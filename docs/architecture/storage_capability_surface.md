@@ -476,13 +476,18 @@ when the bit it needs is clear.
 
 ### The object-model tier
 
-`STAT_OBJECT`, `OWNERSHIP`, `LINK` and `SYMLINK` cover what an inode-based
-filesystem carries and FAT32 does not: `STAT`'s 48-byte form (`ino`, `nlink`,
-`mode`, `uid`, `gid`), a second name for a file, and symbolic links. A
-provider answers only what its format holds and clears the bit otherwise —
-FAT32 clears all four, which is honest rather than degraded. The host
-provider serves all of `STAT_OBJECT`, `OWNERSHIP`, `RMDIR`, `LINK` and
-`SYMLINK` because `fstat`, `link(2)` and `readlink(2)` already answer them.
+`STAT_OBJECT`, `LINK` and `SYMLINK` cover what an inode-based filesystem
+carries and FAT32 does not: `STAT`'s 32-byte form (`ino`, `nlink`), a second
+name for a file, and symbolic links. A provider answers only what its format
+holds and clears the bit otherwise — FAT32 clears all three, which is honest
+rather than degraded. The host provider serves `STAT_OBJECT`, `RMDIR`,
+`LINK` and `SYMLINK` to the node because `fstat`, `link(2)` and
+`readlink(2)` already answer them.
+
+The contract carries no permission model: no user, group or mode bits. Who
+may reach a file is decided by which owner's root the provider resolves it in
+(§5, "What a workload reaches"), never by credentials stored on the file. A
+format's own permission fields stay inside its provider.
 
 `ino = 0` is defined as "this volume has no stable file identity", not as a
 valid identity, and nothing may infer identity from anything else — a start
@@ -766,9 +771,24 @@ and no one else: a contract resolves only through layers of the caller's
 own owner. The node's provider modules (its `fat32`, its `fs_object`, its
 `mount`) are invisible to a workload, and a workload's own provider modules
 serve that workload alone, so a workload can neither reach the node through
-the node's providers nor stand in as the node's. Where no layer of its own
-serves a contract, a workload falls through to the platform provider, which
-confines it as follows.
+the node's providers nor stand in as the node's.
+
+What a workload reaches of the node's storage is what its admission
+granted, recorded on its owner. A `CREATE` names the grant in its header's
+`storage` byte; an owner admitted by the node's own plan or a live add holds
+the default grant:
+
+- **`STORAGE_OWN_ROOT`** (the default): a root of the owner's own, made on
+  first use and removed when the owner is released.
+- **`STORAGE_NONE`**: nothing of the node's. The platform's `fs`,
+  `storage.object` and `storage.namespace` answer `EACCES`, and what the
+  workload keeps it keeps in a provider of its own over a volume lent to it.
+
+No grant names a node path, and none carries a user, group or mode bit:
+what a workload may reach is decided by its owner's grant, and the platform
+makes the grant real inside a root it resolves for that owner. Where no
+layer of its own serves a contract, a workload falls through to the
+platform provider, which confines it as follows.
 
 - **Linux `file.data`** resolves a workload's paths beneath
   `$FLUXOR_OWNER_ROOT/<owner uid>/files/` (default
@@ -780,7 +800,7 @@ confines it as follows.
   `FSYNC_NAME`) open the parent beneath the root the same way and act on
   the name inside it. `LINK` is `ENOSYS` and absent from the caps a
   workload is answered: a second name for an inode would let a file be
-  charged once and held twice. An owner holds at most 32 files open.
+  charged once and held twice.
 - **Linux `storage.object` and `storage.namespace`** reach a versioned
   store of the owner's own, under `<root>/store/`, with the node store's
   semantics and durability, handle tables of its own (16 watches, 8 open
@@ -789,32 +809,42 @@ confines it as follows.
   only, so a handle value from another owner's tables reaches nothing, and
   a watch sees only its owner's changes. The host filesystem, the HTTP
   origin and the node's control-plane store are never a workload's.
-- **bcm2712** serves its store to the node alone (`EACCES` to a workload).
-  It is one fixed table with one history and one revision clock: a
-  workload sharing it could fill the table, flood the history the node's
-  watchers read, and read the rate of other owners' writes off the clock.
-  A workload on that board keeps its objects in a store provider of its
-  own, over a volume lent to it.
+- **bcm2712 `file.data`** resolves a workload's paths beneath
+  `/owners/<owner uid>/files/` on the node's own volume, refusing `..`, a
+  backslash or a NUL, and hands the request down to the node's `fat32`
+  rewritten beneath that root. Every handle is a slot of the rooting
+  layer's own table, stamped with its opener (`EBADF` to anyone else).
+  Nothing in the layer waits: making, charging and removing a root are
+  bounded background jobs, and a call that finds its root not yet ready is
+  `EAGAIN`.
+- **bcm2712 `storage.object` and `storage.namespace`** serve the node alone
+  (`EACCES` to a workload). The store is one fixed table with one history
+  and one revision clock: a workload sharing it could fill the table, flood
+  the history the node's watchers read, and read the rate of other owners'
+  writes off the clock.
 
-What an owner holds on Linux is charged to its storage ledger against the
-`storage_bytes` its `CREATE` admitted (0 is unlimited). A file costs its
-size plus 4096 bytes for its inode and directory entry, a directory or
-any other name 4096, a store entry its key, its value and a 64-byte record
-overhead, and a streamed write the bytes it has staged. The charge is kept
-per inode and read from the inode itself, so it follows a file through
-every handle and path that changes it. A `WRITE` that would grow a file,
-a `PREALLOCATE`, an `OPEN_CREATE` or `MKDIR` of a new name, or a `PUT`
-past the cap is `ENOSPC`; an unlink, a truncate, a shrinking `PUT` or a
-delete gives the bytes back.
+Both platforms charge an owner by the same costs
+(`src/kernel/workload/storage.rs`), against the `storage_bytes` its `CREATE`
+admitted (0 is unlimited). A file costs its size plus 4096 bytes for its
+inode and directory entry, a directory or any other name 4096, a store entry
+its key, its value and a 64-byte record overhead, and a streamed write the
+bytes it has staged. An owner holds at most 32 files open through its root.
+A `WRITE` that would grow a file, a `PREALLOCATE`, an `OPEN_CREATE` or
+`MKDIR` of a new name, or a `PUT` past the cap is `ENOSPC`; an unlink, a
+truncate, a rmdir, a shrinking `PUT` or a delete gives the bytes back. On
+Linux the charge is kept per inode and read from the inode itself, so it
+follows a file through every handle and path that changes it.
 
-The root is made when an admitted owner first touches storage, and removed
+A root is made when an owner granted one first touches storage, and removed
 when the owner is released: a `DESTROY`, a `KILL`, or a rolled-back
 admission. The release also closes every file, read, write and watch the
-owner holds. Nothing else removes a root, so it survives a runtime
-restart, and an owner admitted again under the same identity finds what it
-held, charged to its ledger again; past its cap if need be, in which case
-it can shrink but not grow until it is back under. Data that must outlive
-the owner itself belongs to a volume.
+owner holds. On bcm2712 the removal is tombstoned before its first unlink,
+so a root half removed by a power cut is finished rather than reused.
+Nothing else removes a root, so it survives a restart, and an owner admitted
+again under the same identity finds what it held, charged to its ledger
+again; past its cap if need be, in which case it can shrink but not grow
+until it is back under. Data that must outlive the owner itself belongs to
+a volume.
 
 ### The versioned watchable key store
 

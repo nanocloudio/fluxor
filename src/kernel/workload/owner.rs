@@ -19,6 +19,8 @@
 //! on graph objects are themselves `#[cfg(feature = "multitenant")]`, so
 //! bare-metal targets carry no per-object ownership state.
 
+use crate::kernel::workload::storage::StorageGrant;
+
 /// Maximum number of concurrently resident owners, including the system slot.
 #[cfg(feature = "multitenant")]
 pub const MAX_OWNERS: usize = 64;
@@ -86,6 +88,11 @@ pub struct OwnerAccounting {
     /// store. Charged by the platform providers against `storage_cap`.
     pub storage_bytes: u64,
     pub storage_cap: u64,
+    /// What the owner was granted of the node's storage. Every admission
+    /// states it: a live add and a planned owner hold the default grant (a
+    /// root of its own), a workload `CREATE` the grant its header names. An
+    /// owner allocated by none of them holds none.
+    pub storage_grant: StorageGrant,
     pub modules: u16,
     pub edges: u16,
     pub endpoints: u16,
@@ -102,6 +109,7 @@ impl OwnerAccounting {
         buffer_cap: 0,
         storage_bytes: 0,
         storage_cap: 0,
+        storage_grant: StorageGrant::None,
         modules: 0,
         edges: 0,
         endpoints: 0,
@@ -224,6 +232,8 @@ impl OwnerTable {
         let mut acct = OwnerAccounting::ZERO;
         acct.state_cap = state_cap;
         acct.buffer_cap = buffer_cap;
+        // A planned owner holds the default grant: a root of its own.
+        acct.storage_grant = StorageGrant::OwnRoot;
         self.entries[s] = OwnerEntry {
             owner_uid,
             generation,
@@ -392,6 +402,17 @@ impl OwnerTable {
             Some(e) => {
                 e.acct.state_cap = state_cap;
                 e.acct.buffer_cap = buffer_cap;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Install what an owner's `CREATE` granted it of the node's storage.
+    pub fn set_storage_grant(&mut self, h: OwnerHandle, grant: StorageGrant) -> bool {
+        match self.lookup_mut(h) {
+            Some(e) => {
+                e.acct.storage_grant = grant;
                 true
             }
             None => false,

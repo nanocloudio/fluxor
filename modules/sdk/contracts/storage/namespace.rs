@@ -305,8 +305,8 @@ pub const CLOSE: u32 = 0x1306;
 /// push-based `SUBSCRIBE`. Where `SUBSCRIBE` streams live events onto a channel,
 /// `CHANGES` answers "what changed under `prefix` since revision `since`?" in one
 /// call, into a caller buffer. This is the primitive a long-poll watch server
-/// (k8s `?watch`/resourceVersion) is a direct projection of: LIST-at-a-fence
-/// then the changes since it, both synchronous.
+/// (a watch resumed from a revision) is a direct projection of:
+/// LIST-at-a-fence then the changes since it, both synchronous.
 ///
 /// `handle = -1`; `arg` is:
 ///

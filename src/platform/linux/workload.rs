@@ -52,13 +52,40 @@ struct WorkloadSlot {
     in_use: bool,
     owner: OwnerHandle,
     backend_idx: i32,
+    /// This backend allocated the owner at CREATE (its identity named no
+    /// owner the plan holds), so its DESTROY frees it.
+    allocated: bool,
 }
 
 const WORKLOAD_EMPTY: WorkloadSlot = WorkloadSlot {
     in_use: false,
     owner: crate::kernel::workload::owner::OWNER_SYSTEM,
     backend_idx: -1,
+    allocated: false,
 };
+
+/// End the slot's workload: its sandbox goes, and an owner this backend
+/// allocated is freed with its storage root, as the graph backend frees one
+/// at DESTROY. Returns the sandbox's answer.
+unsafe fn release_slot(idx: usize) -> i32 {
+    let slots = &mut *core::ptr::addr_of_mut!(LINUX_WORKLOADS);
+    let slot = slots[idx];
+    let rc = hp_destroy(slot.backend_idx);
+    slots[idx] = WORKLOAD_EMPTY;
+    if slot.allocated {
+        free_allocated_owner(slot.owner);
+    }
+    rc
+}
+
+/// Free an owner this backend allocated. It holds no modules and no net
+/// lanes (those are the graph backend's), so its release is the providers'
+/// edge — open files closed, its store dropped, its storage root removed —
+/// then the slot.
+unsafe fn free_allocated_owner(owner: OwnerHandle) {
+    crate::kernel::module::provider::notify_owner_released(owner);
+    crate::kernel::exec::scheduler::owners_mut().free(owner);
+}
 
 static mut LINUX_WORKLOADS: [WorkloadSlot; MAX_WORKLOADS] = [WORKLOAD_EMPTY; MAX_WORKLOADS];
 
@@ -174,10 +201,103 @@ unsafe fn validate_options(
     Ok(())
 }
 
+/// The host-process source section (`SOURCE_HOST_PROCESS`), little-endian,
+/// every part length-prefixed and present, in this order:
+/// ```text
+///   [isolate:u8]                       1 = own namespaces (needs privilege)
+///   [rootfs_len:u16][rootfs]           the root to pivot into; empty = none
+///   [argv_len:u16][argv]               NUL-separated tokens, at least one
+///   [env_len:u16][env]                 NUL-separated `NAME=VALUE` — the WHOLE
+///                                      environment; empty = none at all
+///   [cwd_len:u16][cwd]                 absolute; empty = `/`
+///   [user_len:u16][user]               `uid[:gid]` | `name[:group]`; empty =
+///                                      the runtime's own identity
+/// ```
+/// Nothing may follow the last part. The backend's rules for each are
+/// `host_backend`'s (`plan_process`).
+pub struct HostSource<'a> {
+    pub isolate: bool,
+    pub rootfs: Option<&'a str>,
+    pub argv: std::vec::Vec<&'a str>,
+    pub process: super::host_backend::ProcessParams,
+}
+
+/// Parse a host-process source section; EINVAL for anything malformed —
+/// a part that overruns, bytes past the last part, text that is not UTF-8,
+/// or no argv.
+pub fn parse_host_source(src: &[u8]) -> Result<HostSource<'_>, i32> {
+    fn text(b: &[u8]) -> Result<&str, i32> {
+        core::str::from_utf8(b).map_err(|_| crate::kernel::sys::errno::EINVAL)
+    }
+    use crate::kernel::sys::errno;
+    let mut p = 1usize;
+    let isolate = match src.first() {
+        Some(0) => false,
+        Some(1) => true,
+        _ => return Err(errno::EINVAL),
+    };
+    let mut part = || -> Result<&[u8], i32> {
+        let n = src
+            .get(p..p + 2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]) as usize)
+            .ok_or(errno::EINVAL)?;
+        let v = src.get(p + 2..p + 2 + n).ok_or(errno::EINVAL)?;
+        p += 2 + n;
+        Ok(v)
+    };
+    let rootfs = part()?;
+    let argv = part()?;
+    let env = part()?;
+    let cwd = part()?;
+    let user = part()?;
+    if p != src.len() {
+        return Err(errno::EINVAL);
+    }
+    let rootfs = Some(text(rootfs)?).filter(|r| !r.is_empty());
+    let mut args = std::vec::Vec::new();
+    for tok in argv.split(|b| *b == 0).filter(|t| !t.is_empty()) {
+        args.push(text(tok)?);
+    }
+    if args.is_empty() {
+        return Err(errno::EINVAL);
+    }
+    let mut vars = std::vec::Vec::new();
+    for e in env.split(|b| *b == 0).filter(|t| !t.is_empty()) {
+        vars.push(text(e)?.to_string());
+    }
+    Ok(HostSource {
+        isolate,
+        rootfs,
+        argv: args,
+        process: super::host_backend::ProcessParams {
+            env: vars,
+            cwd: text(cwd)?.to_string(),
+            user: text(user)?.to_string(),
+        },
+    })
+}
+
 /// WORKLOAD_CREATE: admit + instantiate a workload from the Tier-1 header + the
 /// variable-length source-ref / endpoint / options sections. Returns a tagged
 /// `FD_TAG_WORKLOAD` handle or a negative errno.
+/// `CREATE` on the host-process backend. An owner this call allocates is
+/// freed again when the call refuses, so a refused CREATE leaves nothing.
 unsafe fn workload_create(arg: *const u8, arg_len: usize) -> i32 {
+    let mut allocated: Option<OwnerHandle> = None;
+    let rc = workload_create_as(arg, arg_len, &mut allocated);
+    if rc < 0 {
+        if let Some(owner) = allocated {
+            free_allocated_owner(owner);
+        }
+    }
+    rc
+}
+
+unsafe fn workload_create_as(
+    arg: *const u8,
+    arg_len: usize,
+    allocated: &mut Option<OwnerHandle>,
+) -> i32 {
     use crate::kernel::ipc::fd::{tag_fd, FD_TAG_WORKLOAD};
     use crate::kernel::sys::errno;
 
@@ -194,6 +314,10 @@ unsafe fn workload_create(arg: *const u8, arg_len: usize) -> i32 {
     if net_iso > wl::NET_ISO_OWN {
         return errno::EINVAL;
     }
+    let Some(storage_grant) = crate::kernel::workload::storage::StorageGrant::from_wire(buf[19])
+    else {
+        return errno::EINVAL;
+    };
     let envelope = ResourceEnvelope {
         compute_milli: rd_u32(buf, 20),
         memory_bytes: u64::from_le_bytes([
@@ -238,22 +362,38 @@ unsafe fn workload_create(arg: *const u8, arg_len: usize) -> i32 {
 
     // Identity → owner. A workload names who it is: the null identity names
     // no one, and everything keyed on an owner would see every such workload
-    // as one, so it is refused. The identity must resolve to a plan-allocated
-    // owner — the provider references it, it does not allocate (the plan is
-    // authoritative for owners). One identity is one workload, whichever
-    // backend runs it.
+    // as one, so it is refused. An identity the plan allocated runs as that
+    // owner. Any other is given an owner of its own here, the same rule the
+    // graph backend allocates by (lowest free slot, monotonic generation),
+    // and that owner lives as long as the workload: DESTROY frees it with
+    // its storage root. One identity is one workload, whichever backend runs
+    // it.
     if identity == [0u8; 16] {
         return errno::EINVAL;
     }
-    let Some(owner) = crate::kernel::exec::scheduler::owners().find_by_uid(identity) else {
-        return errno::EACCES; // no admitted workload for this uid
-    };
-    let slots = &*core::ptr::addr_of!(LINUX_WORKLOADS);
-    if slots.iter().any(|s| s.in_use && s.owner == owner)
-        || crate::kernel::workload::workload_graph::holds_identity(&identity)
-    {
+    if crate::kernel::workload::workload_graph::holds_identity(&identity) {
         return errno::EEXIST;
     }
+    let owner = match crate::kernel::exec::scheduler::owners().find_by_uid(identity) {
+        Some(h) => {
+            let slots = &*core::ptr::addr_of!(LINUX_WORKLOADS);
+            if slots.iter().any(|s| s.in_use && s.owner == h) {
+                return errno::EEXIST;
+            }
+            h
+        }
+        None => match crate::kernel::exec::scheduler::owners_mut().alloc(identity) {
+            Some(h) => {
+                // Admitted in this one call, so active at once; a refusal
+                // below frees it (`workload_create`).
+                crate::kernel::exec::scheduler::owners_mut()
+                    .set_state(h, crate::kernel::workload::owner::OwnerState::Active);
+                *allocated = Some(h);
+                h
+            }
+            None => return errno::ENOMEM, // every owner slot is taken
+        },
+    };
     if !crate::kernel::exec::scheduler::owners().authorize_admit(owner) {
         return errno::EACCES; // draining/revoked owner cannot admit new work
     }
@@ -262,6 +402,7 @@ unsafe fn workload_create(arg: *const u8, arg_len: usize) -> i32 {
         buf[68], buf[69], buf[70], buf[71], buf[72], buf[73], buf[74], buf[75],
     ]);
     crate::kernel::exec::scheduler::owners_mut().set_storage_cap(owner, storage_bytes);
+    crate::kernel::exec::scheduler::owners_mut().set_storage_grant(owner, storage_grant);
 
     // Lease-gate each declared endpoint against the owner's lease before any
     // mechanism runs. A refusal blocks admission. The workload-level net_iso
@@ -337,43 +478,35 @@ unsafe fn workload_create(arg: *const u8, arg_len: usize) -> i32 {
 
     // Spawn on the host-process backend, bound to the owner. The source section
     // carries EXPLICIT spawn params (the orchestrator composes them from its own
-    // bundle/OCI format — this backend has no bundle knowledge):
-    //   [isolate:u8][rootfs_len:u16 LE][rootfs bytes][argv: rest, NUL-separated]
-    let src = &buf[src_start..ep_start];
-    if src.len() < 3 {
-        return errno::EINVAL;
-    }
-    let isolate = src[0] == 1;
-    let rootfs_len = u16::from_le_bytes([src[1], src[2]]) as usize;
-    let rootfs_end = 3 + rootfs_len;
-    if rootfs_end > src.len() {
-        return errno::EINVAL;
-    }
-    let rootfs = match core::str::from_utf8(&src[3..rootfs_end]) {
-        Ok(s) if !s.is_empty() => Some(s),
-        Ok(_) => None,
-        Err(_) => return errno::EINVAL,
+    // bundle/OCI format — this backend has no bundle knowledge), see
+    // `parse_host_source`.
+    let src = match parse_host_source(&buf[src_start..ep_start]) {
+        Ok(s) => s,
+        Err(e) => return e,
     };
-    let argv_bytes = &src[rootfs_end..];
-    let mut argv: std::vec::Vec<&str> = std::vec::Vec::new();
-    for tok in argv_bytes.split(|b| *b == 0) {
-        if tok.is_empty() {
-            continue;
-        }
-        match core::str::from_utf8(tok) {
-            Ok(s) => argv.push(s),
-            Err(_) => return errno::EINVAL,
-        }
-    }
     let backend_idx = hp_spawn_with_binds(
-        &argv,
-        rootfs,
-        isolate,
+        &src.argv,
+        src.rootfs,
+        src.isolate,
         &envelope,
         own_netns,
         net_ident.as_ref(),
         &binds,
+        &src.process,
     );
+    // What the owner may hold, beside what it was asked to run: the line an
+    // operator reads to see a workload's envelope arrive.
+    if backend_idx >= 0 {
+        log::info!(
+            "[workload] host workload {}.{}: compute_milli={} memory_bytes={} max_tasks={} storage_bytes={}",
+            owner.slot,
+            owner.generation,
+            envelope.compute_milli,
+            envelope.memory_bytes,
+            envelope.max_tasks,
+            storage_bytes
+        );
+    }
     if backend_idx < 0 {
         return backend_idx;
     }
@@ -391,6 +524,7 @@ unsafe fn workload_create(arg: *const u8, arg_len: usize) -> i32 {
         in_use: true,
         owner,
         backend_idx,
+        allocated: allocated.is_some(),
     };
     tag_fd(FD_TAG_WORKLOAD, widx as i32)
 }
@@ -496,10 +630,7 @@ pub unsafe fn linux_workload_dispatch(
             out[2..6].copy_from_slice(&owner.generation.to_le_bytes());
             return tag_fd(FD_TAG_WORKLOAD, idx as i32);
         }
-        let bidx = slots[idx].backend_idx;
-        let rc = hp_destroy(bidx);
-        (*core::ptr::addr_of_mut!(LINUX_WORKLOADS))[idx] = WORKLOAD_EMPTY;
-        return rc;
+        return release_slot(idx);
     }
 
     let raw = slot_of(handle);
@@ -526,12 +657,7 @@ pub unsafe fn linux_workload_dispatch(
             let s = [hostsig];
             hp_signal(bidx, s.as_ptr(), 1)
         }
-        wl::DESTROY => {
-            let rc = hp_destroy(bidx);
-            let slots = &mut *core::ptr::addr_of_mut!(LINUX_WORKLOADS);
-            slots[raw as usize] = WORKLOAD_EMPTY;
-            rc
-        }
+        wl::DESTROY => release_slot(raw as usize),
         _ => errno::ENOSYS,
     }
 }
@@ -582,7 +708,8 @@ unsafe fn workload_caps(arg: *mut u8, arg_len: usize) -> i32 {
 }
 
 /// Drain/revocation hook: destroy every workload belonging to a revoked owner.
-/// Mirrors `linux_net_close_owner_conns`; called from the owner-drain path.
+/// Mirrors `linux_net_close_owner_conns`; called from the owner-drain path,
+/// which frees the owner itself, so the slot is only cleared here.
 pub fn linux_workload_close_owner(owner: OwnerHandle) {
     // SAFETY: platform-thread single-writer access to the workload table and the
     // backend slots it owns; mirrors `linux_net_close_owner_conns`.

@@ -1658,6 +1658,17 @@ fn domain_step_all(domain_id: usize) {
     // is stashed for the arm-after-step write below.
     let (_result, deadline_us) =
         scheduler::step_resident_graphs_domain(&mut sched.modules, domain_id);
+    // Owner roots' background jobs (making, charging, removing a workload's
+    // root) ride the domain that steps the node's own `fs` provider, so they
+    // never race its step.
+    let fs_domain = fluxor::kernel::module::provider::node_default_module(
+        fluxor::kernel::module::provider::contract::FS as usize,
+    )
+    .map(|m| scheduler::module_domain_id(m) as usize);
+    if fs_domain == Some(domain_id) {
+        // SAFETY: on the domain that steps the node's `fs` provider.
+        unsafe { fluxor::platform::owner_root::step() };
+    }
     if domain_id < multicore::MAX_DOMAINS {
         DOMAIN_RUNNER_DEADLINE_US[domain_id].store(deadline_us, Ordering::Relaxed);
     }
@@ -2400,6 +2411,13 @@ fn bcm_init_providers() {
     // nothing, which is the failure that looks like no failure.
     // SAFETY: single-threaded boot, before any provider dispatch.
     unsafe { fluxor::platform::store::init() };
+    // `fs` (0x09) for workloads: the node's own `fat32` layer serves the node
+    // alone, so a workload's call reaches this kernel provider, which serves
+    // it beneath the workload's own root on that volume, charges it to the
+    // workload's storage quota, and removes the root when the workload is
+    // released. Without it every workload `fs` call answers ENOSYS.
+    // SAFETY: single-threaded boot, before any provider dispatch.
+    unsafe { fluxor::platform::owner_root::init(fluxor::platform::owner_root::node_fs) };
 }
 
 /// Metal `workload` (0x1A) provider dispatch — the thin bcm registration hook.

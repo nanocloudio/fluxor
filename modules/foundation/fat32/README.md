@@ -42,9 +42,9 @@ Served: `OPEN`, `OPENDIR`, `OPEN_CREATE`, `WRITE`, `FSYNC`, `UNLINK`,
 `TRUNCATE`, `MKDIR`, `RMDIR`, `PREALLOCATE`, `FSYNC_ASYNC`, `FSYNC_NAME`,
 and `RENAME` where the volume permits.
 
-Not served, and the bits stay clear: `STAT_OBJECT`, `OWNERSHIP`, `LINK` and
-`SYMLINK`. FAT32 has no inode, no owner and no second name for a file, so a
-48-byte `STAT` gets 16 bytes back and the count saying so — which is what
+Not served, and the bits stay clear: `STAT_OBJECT`, `LINK` and `SYMLINK`.
+FAT32 has no inode and no second name for a file, so a 32-byte `STAT` gets
+16 bytes back and the count saying so — which is what
 lets a caller tell "not answered" from a zero. In particular a start cluster
 is **not** an inode number: this provider reuses freed clusters, so two files
 that never coexisted share one.
@@ -280,9 +280,9 @@ mismatch reports what is on the device against what was expected.
   generation is held with the slot: a reused owner slot is a different owner.
   Without a ceiling the tables are still provider-wide, and a diagnostic
   names the holders when one fills.
-- **No object model.** FAT32 has no inode, no owner and no hard links, so
-  `STAT`'s 48-byte form is not served and `STAT_OBJECT`, `OWNERSHIP`, `LINK`
-  and `SYMLINK` stay clear. A 48-byte request gets 16 bytes and the count
+- **No object model.** FAT32 has no inode and no hard links, so `STAT`'s
+  32-byte form is not served and `STAT_OBJECT`, `LINK` and `SYMLINK` stay
+  clear. A 32-byte request gets 16 bytes and the count
   saying so, which is what lets a caller tell "not answered" from a zero.
   Nothing here fabricates an identity — in particular a start cluster is not
   an inode number, because this provider reuses freed clusters.

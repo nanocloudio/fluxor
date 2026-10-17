@@ -60,10 +60,6 @@ static mut LINUX_FILES: [LinuxFileSlot; MAX_OPEN_FILES] = {
     [EMPTY; MAX_OPEN_FILES]
 };
 
-/// Slots one workload may hold at once, so no tenant can take the table the
-/// node and every other tenant open files from.
-const OWNER_MAX_OPEN_FILES: usize = 32;
-
 /// Whether `slot` is open and its caller's: the opener alone reaches a slot.
 fn owned(slot: &LinuxFileSlot) -> bool {
     slot.in_use && slot.owner == crate::kernel::exec::scheduler::caller_owner()
@@ -80,7 +76,7 @@ fn free_slot_for(
             .iter()
             .filter(|s| s.in_use && s.owner == owner)
             .count()
-            >= OWNER_MAX_OPEN_FILES
+            >= crate::kernel::workload::storage::OWNER_MAX_OPEN_FILES
     {
         return None;
     }
@@ -189,7 +185,7 @@ unsafe fn tenant_fs_path_op(
                 return Some(fd);
             }
             // A new name: its entry is charged before it exists.
-            if !root::reserve(owner, root::ENTRY_COST) {
+            if !root::reserve(owner, crate::kernel::workload::storage::ENTRY_COST) {
                 return Some(errno::ENOSPC);
             }
             let fd = root::open_beneath(
@@ -198,7 +194,7 @@ unsafe fn tenant_fs_path_op(
                 libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
                 0o600,
             );
-            root::unreserve(owner, root::ENTRY_COST);
+            root::unreserve(owner, crate::kernel::workload::storage::ENTRY_COST);
             if fd < 0 {
                 return Some(fd);
             }
@@ -257,17 +253,22 @@ unsafe fn tenant_fs_path_op(
                 Ok(v) => v,
                 Err(e) => return Some(e),
             };
-            if !root::reserve(owner, root::ENTRY_COST) {
+            if !root::reserve(owner, crate::kernel::workload::storage::ENTRY_COST) {
                 libc::close(dirfd);
                 return Some(errno::ENOSPC);
             }
             let rc = libc::mkdirat(dirfd, name.as_ptr() as *const libc::c_char, 0o755);
             let err = *libc::__errno_location();
-            root::unreserve(owner, root::ENTRY_COST);
+            root::unreserve(owner, crate::kernel::workload::storage::ENTRY_COST);
             let made = (rc == 0).then(|| root::stat_at(dirfd, &name)).flatten();
             libc::close(dirfd);
             if let Some(st) = made {
-                root::charge_inode(owner, st.st_ino, root::ENTRY_COST, false);
+                root::charge_inode(
+                    owner,
+                    st.st_ino,
+                    crate::kernel::workload::storage::ENTRY_COST,
+                    false,
+                );
             }
             // Idempotent, as the host's MKDIR.
             if rc < 0 && err != libc::EEXIST {
@@ -738,7 +739,6 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             // answers all of it, plus `rmdir(2)`, `link(2)` and
             // `readlink(2)`.
             | dev_fs::caps::STAT_OBJECT
-            | dev_fs::caps::OWNERSHIP
             | dev_fs::caps::RMDIR
             | dev_fs::caps::LINK
             | dev_fs::caps::SYMLINK;
@@ -1037,7 +1037,7 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
                 && !crate::platform::linux::owner_root::charge_inode(
                     slot_owner,
                     st.st_ino,
-                    crate::platform::linux::owner_root::ENTRY_COST + size,
+                    crate::kernel::workload::storage::file_cost(size),
                     true,
                 )
             {
@@ -1118,7 +1118,12 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
                 };
                 let pos = libc::lseek(fd, 0, libc::SEEK_CUR).max(0) as u64;
                 let end = (st.st_size as u64).max(pos.saturating_add(arg_len as u64));
-                if !root::charge_inode(slot_owner, st.st_ino, root::ENTRY_COST + end, true) {
+                if !root::charge_inode(
+                    slot_owner,
+                    st.st_ino,
+                    crate::kernel::workload::storage::ENTRY_COST + end,
+                    true,
+                ) {
                     return errno::ENOSPC;
                 }
                 ino = Some(st.st_ino);
@@ -1212,21 +1217,18 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             let mtime = stat.st_mtime as u64;
             // Metadata read; no durability claim.
             record_slot_fence(slot_idx, Fence::Volatile);
-            if arg_len >= 48 {
+            if arg_len >= 32 {
                 // This backend is the one that genuinely has an object model
                 // to report: `fstat` already answered every field. A provider
                 // that has the answer and returns the short form instead
                 // makes the wide form untestable.
-                let out = core::slice::from_raw_parts_mut(arg, 48);
+                let out = core::slice::from_raw_parts_mut(arg, 32);
                 out[..8].copy_from_slice(&size.to_le_bytes());
                 out[8..16].copy_from_slice(&mtime.to_le_bytes());
                 out[16..24].copy_from_slice(&(stat.st_ino as u64).to_le_bytes());
                 out[24..28].copy_from_slice(&(stat.st_nlink as u32).to_le_bytes());
-                out[28..32].copy_from_slice(&(stat.st_mode as u32).to_le_bytes());
-                out[32..36].copy_from_slice(&(stat.st_uid as u32).to_le_bytes());
-                out[36..40].copy_from_slice(&(stat.st_gid as u32).to_le_bytes());
-                out[40..48].copy_from_slice(&0u64.to_le_bytes());
-                return 48;
+                out[28..32].copy_from_slice(&0u32.to_le_bytes());
+                return 32;
             }
             if arg_len >= 16 {
                 let out = core::slice::from_raw_parts_mut(arg, 16);

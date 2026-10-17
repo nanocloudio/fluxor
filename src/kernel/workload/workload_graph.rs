@@ -40,6 +40,7 @@ use crate::kernel::sys::errno;
 use crate::kernel::workload::code_pack;
 use crate::kernel::workload::owner::{OwnerHandle, MAX_OWNERS, OWNER_SYSTEM};
 use crate::kernel::workload::owner_plan::{lease_gate, LeaseGate};
+use crate::kernel::workload::storage::StorageGrant;
 
 // ── Metal net identity install ───────────────────────────────────
 //
@@ -376,6 +377,7 @@ unsafe fn begin_create(
     src_start: usize,
     memory_bytes: u64,
     storage_bytes: u64,
+    storage_grant: StorageGrant,
     wants_identity: bool,
     identity: [u8; 16],
     spec: [u8; 32],
@@ -485,6 +487,13 @@ unsafe fn begin_create(
     // What the owner may hold in the node's storage, set before any of its
     // modules runs.
     scheduler::owners_mut().set_storage_cap(staged_add.handle(), storage_bytes);
+    scheduler::owners_mut().set_storage_grant(staged_add.handle(), storage_grant);
+    log::info!(
+        "[workload] graph workload {}.{}: storage_bytes={}",
+        staged_add.handle().slot,
+        staged_add.handle().generation,
+        storage_bytes
+    );
     *core::ptr::addr_of_mut!(PENDING) = Some(PendingCreate {
         identity,
         spec,
@@ -519,6 +528,9 @@ unsafe fn workload_create(arg: *mut u8, arg_len: usize) -> i32 {
     let storage_bytes = u64::from_le_bytes([
         buf[68], buf[69], buf[70], buf[71], buf[72], buf[73], buf[74], buf[75],
     ]);
+    let Some(storage_grant) = StorageGrant::from_wire(buf[19]) else {
+        return errno::EINVAL;
+    };
     let source_ref_len = rd_u16(buf, 40) as usize;
     let endpoint_count = rd_u16(buf, 42) as usize;
     let options_len = rd_u32(buf, 44) as usize;
@@ -643,6 +655,7 @@ unsafe fn workload_create(arg: *mut u8, arg_len: usize) -> i32 {
             src_start,
             memory_bytes,
             storage_bytes,
+            storage_grant,
             wants_identity,
             identity,
             spec,

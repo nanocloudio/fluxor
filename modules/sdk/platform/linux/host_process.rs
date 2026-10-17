@@ -33,10 +33,29 @@ pub const TTY_RESIZE: u32 = 0x1B05;
 pub const TTY_CLOSE: u32 = 0x1B06;
 
 /// Host-only `source_kind` for the workload CREATE header: the source-ref
-/// carries explicit host-process spawn params (argv, optional rootfs path,
-/// isolate flag — see `workload.rs`), realized by the linux host-process
-/// backend. NOT a bundle/OCI format: the backend reads no files; the
-/// orchestrator composes the params. The native contract defines only
+/// carries explicit host-process spawn params, realized by the linux
+/// host-process backend. Little-endian, every part length-prefixed and
+/// present, nothing after the last:
+/// ```text
+///   [isolate:u8]                  1 = own namespaces (needs privilege)
+///   [rootfs_len:u16][rootfs]      the root to pivot into; empty = none
+///   [argv_len:u16][argv]          NUL-separated tokens, at least one
+///   [env_len:u16][env]            NUL-separated `NAME=VALUE`: the WHOLE
+///                                 environment — nothing of the runtime's
+///                                 own reaches the process (`HOME` is added
+///                                 when absent); a bare argv[0] is looked up
+///                                 on this `PATH`
+///   [cwd_len:u16][cwd]            absolute; empty = `/`
+///   [user_len:u16][user]          `uid[:gid]` | `name[:group]` (resolved in
+///                                 the root's /etc/passwd, /etc/group);
+///                                 empty = the runtime's own identity. Only
+///                                 a privileged runtime changes identity: an
+///                                 unprivileged one refuses (`EACCES`) any
+///                                 other user
+/// ```
+/// NOT a bundle/OCI format: the backend reads no files but the user
+/// databases of the workload's own root; the orchestrator composes the
+/// params. Malformed → `EINVAL`. The native contract defines only
 /// `SOURCE_FMOD_GRAPH = 0`; nonzero kinds are backend-defined.
 pub const SOURCE_HOST_PROCESS: u8 = 1;
 

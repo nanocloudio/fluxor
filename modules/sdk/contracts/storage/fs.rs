@@ -10,7 +10,7 @@
 // random-access file I/O (seek+read, stat-then-read, etc.) where
 // channels would require expensive out-of-band coordination.
 //
-// STAT's output buffer selects its own shape by width — 8, 16 or 48
+// STAT's output buffer selects its own shape by width — 8, 16 or 32
 // bytes. See `STAT`.
 //
 // ## No call waits on the device
@@ -176,8 +176,8 @@ pub const CLOSE: u32 = 0x0903;
 ///
 /// `arg` points at an output buffer. Its width selects the shape:
 ///
-///   - `arg_len >= 48` → `[size: u64 LE, mtime: u64 LE, ino: u64 LE,
-///     nlink: u32 LE, mode: u32 LE, uid: u32 LE, gid: u32 LE]`
+///   - `arg_len >= 32` → `[size: u64 LE, mtime: u64 LE, ino: u64 LE,
+///     nlink: u32 LE, reserved: u32 LE = 0]`
 ///   - `arg_len >= 16` → `[size: u64 LE, mtime: u64 LE]`
 ///   - `arg_len >= 8` → `[size: u32 LE, mtime: u32 LE]`
 ///
@@ -195,8 +195,8 @@ pub const CLOSE: u32 = 0x0903;
 ///
 /// # The object-model fields
 ///
-/// The 48-byte form carries what an inode-based filesystem has and FAT32
-/// does not. A provider serves it only with [`caps::STAT_OBJECT`] set; the
+/// The 32-byte form carries what an inode-based filesystem has and FAT32
+/// does not: a file's identity and its number of names. A provider serves it only with [`caps::STAT_OBJECT`] set; the
 /// rules for what it may put there are not optional:
 ///
 ///   - **`ino` is opaque, and 0 means "this volume has no stable file
@@ -205,11 +205,11 @@ pub const CLOSE: u32 = 0x0903;
 ///     start cluster is NOT an inode number, because FAT32 reuses freed
 ///     clusters and two files that never coexisted share one. A consumer
 ///     caching by it returns the wrong file.
-///   - **`uid`/`gid`/`mode` are reported, not enforced.** A provider whose
-///     format has no permission model reports the mount's declared defaults
-///     and clears [`caps::OWNERSHIP`]; it does NOT report 0, which reads as
-///     root. Enforcement needs an owner identity on the dispatch, which
-///     `provider_call` does not carry.
+///   - **No permission model is carried.** Who may reach a file is decided
+///     by which owner's root the provider resolves it in (the caller's
+///     owner, `query_key::CALLER_OWNER`), never by credentials stored on the
+///     file: a format's own user, group and mode bits stay inside the
+///     provider.
 ///   - **`nlink` is the number of names.** [`UNLINK`] removes a name and
 ///     queues storage for reclamation when the last one goes. A provider
 ///     without hard links reports 1, which is true.
@@ -794,13 +794,10 @@ pub mod caps {
     // ── Object-model tier ───────────────────────────────────
     // What an inode-based filesystem carries and FAT32 does not. A provider
     // whose format has no answer clears the bit rather than fabricating one.
-    /// [`STAT`]'s 48-byte form is served — `ino`, `nlink`, `mode`, `uid`,
-    /// `gid` in addition to size and mtime.
+    /// [`STAT`]'s 32-byte form is served — `ino` and `nlink` in addition to
+    /// size and mtime.
     pub const STAT_OBJECT: u32 = 1 << 12;
-    /// `uid`/`gid`/`mode` describe a real permission model rather than the
-    /// mount's declared defaults. Reporting only; enforcement needs an owner
-    /// identity on the dispatch, which `provider_call` does not carry.
-    pub const OWNERSHIP: u32 = 1 << 13;
+    // Bit 13 is unassigned.
     /// A name can be added to an existing file, and `nlink` counts names.
     pub const LINK: u32 = 1 << 14;
     /// [`RMDIR`] (0x0915) — remove an empty directory by path.
