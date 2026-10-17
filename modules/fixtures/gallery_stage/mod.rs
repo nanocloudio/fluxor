@@ -275,7 +275,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 let n = if remaining > CHUNK { CHUNK } else { remaining };
                 s.chunk[..n].copy_from_slice(&payload[s.off..s.off + n]);
                 let rc = call(sys, s.fd, fs::WRITE, s.chunk.as_mut_ptr(), n);
-                if rc == E_AGAIN {
+                if rc == E_AGAIN || rc == E_INPROGRESS {
                     return 0; // block-ring backpressure — retry next tick
                 }
                 if rc < 0 {
@@ -289,7 +289,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
             PHASE_FSYNC => {
                 let rc = call(sys, s.fd, fs::FSYNC, core::ptr::null_mut(), 0);
-                if rc == E_AGAIN {
+                if rc == E_AGAIN || rc == E_INPROGRESS {
                     return 0;
                 }
                 if rc != 0 {
@@ -300,7 +300,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
             PHASE_CLOSE => {
                 let rc = call(sys, s.fd, fs::CLOSE, core::ptr::null_mut(), 0);
-                if rc == E_AGAIN {
+                if rc == E_AGAIN || rc == E_INPROGRESS {
                     return 0;
                 }
                 if rc != 0 {

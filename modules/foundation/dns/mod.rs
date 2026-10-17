@@ -43,7 +43,13 @@
 //! current generation untouched. `update_durability = durable` commits the
 //! candidate through the `fs` contract (temp → write → fsync → rename)
 //! before acknowledging and recovers the last complete committed generation
-//! at construct; `volatile` acknowledges immediately and loses the zone on
+//! at construct. Both run as step machines over the non-blocking `fs`
+//! contract: `EAGAIN` is asked again on a later step, `EINPROGRESS` is
+//! re-asked with the identical request, and a commit resumes at the call
+//! it stopped on. The response to a durable update is held until the
+//! commit is decided; another update arriving meanwhile is dropped
+//! unanswered (its client retries, and a retry of the update in flight is
+//! answered from the transaction cache once it lands); `volatile` acknowledges immediately and loses the zone on
 //! restart. A repeated authenticated transaction (same key and MAC) inside
 //! `TXN_RETAIN_MS` is answered from the cached response.
 //!
@@ -379,8 +385,36 @@ const ZONE_FILE_MAGIC: [u8; 4] = *b"FXDZ";
 const ZONE_RECORD_MAX: usize = 1 + MAX_ZONE_NAME + 2 + 2 + 4 + 2 + MAX_ZONE_RDATA;
 const MAX_ZONE_FILE: usize = 4 + 4 + 2 + MAX_ZONE_RRS * ZONE_RECORD_MAX + 4;
 
-/// Writes issued for one commit before it is refused as stalled.
-const MAX_COMMIT_WRITES: usize = 64;
+/// `fs` calls one step may issue for the commit or the recovery. Each call
+/// is decided now or answers `EAGAIN`/`EINPROGRESS`, which ends the step's
+/// share; the bound keeps a run of short counts from monopolising a step.
+const MAX_ZIO_CALLS_PER_STEP: usize = 64;
+
+/// A commit not decided within this long is refused SERVFAIL, unless its
+/// `RENAME` was taken (`EINPROGRESS`): that one is awaited to its decision,
+/// since abandoning it would answer SERVFAIL for a generation that lands.
+const COMMIT_DEADLINE_MS: u32 = 10_000;
+
+/// The echoed header and zone section of the update whose response waits
+/// on the commit: a 12-byte header, a wire name and type + class.
+const PEND_Q_MAX: usize = DNS_HEADER_LEN + MAX_NAME_LEN + 1 + 4;
+
+/// Phases of the zone file I/O machine (`zio_phase`). Recovery runs before
+/// `durable_ready`, the commit after it, so the two never overlap.
+const ZIO_IDLE: u8 = 0;
+const ZIO_REC_OPEN: u8 = 1;
+const ZIO_REC_READ: u8 = 2;
+const ZIO_REC_PROBE: u8 = 3;
+const ZIO_COM_UNLINK: u8 = 10;
+const ZIO_COM_OPEN: u8 = 11;
+const ZIO_COM_WRITE: u8 = 12;
+const ZIO_COM_FSYNC: u8 = 13;
+const ZIO_COM_CLOSE: u8 = 14;
+const ZIO_COM_RENAME: u8 = 15;
+
+/// `evaluate_update`'s answer when the candidate is ready and the durable
+/// commit has to run before the rcode is known.
+const RCODE_COMMIT_PENDING: u16 = 0xFFFF;
 
 /// Vault label prefix for TSIG keys: `dns/tsig/<keyname>`.
 const TSIG_LABEL_PREFIX: &[u8] = b"dns/tsig/";
@@ -916,6 +950,25 @@ struct DnsState {
     txn_cache: [TxnEntry; MAX_TXN_CACHE],
     /// Serialization scratch for the committed-generation file.
     zone_file: [u8; MAX_ZONE_FILE],
+    /// The zone file I/O machine: phase, the `fs` handle it holds (-1 for
+    /// none), bytes the file holds / has moved, and for the commit when it
+    /// began and whether its current call was taken (`EINPROGRESS`).
+    zio_phase: u8,
+    zio_taken: u8,
+    _pad_z: [u8; 2],
+    zio_fd: i32,
+    zio_len: u32,
+    zio_done: u32,
+    zio_start_ms: u32,
+    /// The update waiting on the commit: client endpoint, its TSIG, and its
+    /// header + zone section to echo.
+    pend_ip: u32,
+    pend_port: u16,
+    pend_q_len: u16,
+    pend_info: TsigInfo,
+    pend_q: [u8; PEND_Q_MAX],
+    /// Updates dropped because a commit was in flight.
+    updates_deferred: u32,
     /// TSIG MAC-input scratch.
     mac_buf: [u8; MAC_INPUT_MAX],
 
@@ -1010,6 +1063,24 @@ impl DnsState {
         }
         self.zone = Zone::empty();
         self.candidate = Zone::empty();
+        self.zio_phase = ZIO_IDLE;
+        self.zio_taken = 0;
+        self.zio_fd = -1;
+        self.zio_len = 0;
+        self.zio_done = 0;
+        self.zio_start_ms = 0;
+        self.pend_ip = 0;
+        self.pend_port = 0;
+        self.pend_q_len = 0;
+        self.pend_info = TsigInfo {
+            tsig_off: 0,
+            key_idx: 0,
+            time_signed: 0,
+            fudge: 0,
+            orig_id: 0,
+            mac: [0; TSIG_MAC_LEN],
+        };
+        self.updates_deferred = 0;
         i = 0;
         while i < MAX_TXN_CACHE {
             self.txn_cache[i] = TxnEntry::empty();
@@ -4951,56 +5022,219 @@ unsafe fn zone_paths(s: &DnsState, tmp: *mut u8) -> (usize, usize) {
     (n, n + 4)
 }
 
-/// Commit the candidate through the `fs` contract: temp → write → fsync →
-/// close → rename. Returns false, with the final name untouched, on any
-/// refusal along the way.
-unsafe fn zone_commit_durable(s: &mut DnsState) -> bool {
-    use abi::contracts::storage::fs;
-    let len = zone_serialize(s, true);
-    let sys = &*s.syscalls;
+/// Build the `RENAME` argument, temp → final:
+/// `[src_len:u16][src][dst_len:u16][dst]`, little-endian lengths. The same
+/// paths give the same bytes, so a re-ask after `EINPROGRESS` is identical.
+unsafe fn zone_rename_arg(s: &DnsState, arg: *mut u8) -> usize {
     let mut tmp = [0u8; MAX_ZONE_PATH + 4];
     let (path_len, tmp_len) = zone_paths(s, tmp.as_mut_ptr());
-    // A previous interrupted commit may have left the temporary behind.
-    let _ = (sys.provider_call)(-1, fs::UNLINK, tmp.as_mut_ptr(), tmp_len);
-    let fd = (sys.provider_call)(-1, fs::OPEN_CREATE, tmp.as_mut_ptr(), tmp_len);
-    if fd < 0 {
-        return false;
-    }
-    let buf = s.zone_file.as_mut_ptr();
-    let mut done = 0usize;
-    let mut writes = 0usize;
-    while done < len {
-        if writes >= MAX_COMMIT_WRITES {
-            (sys.provider_call)(fd, fs::CLOSE, core::ptr::null_mut(), 0);
-            return false;
-        }
-        let n = (sys.provider_call)(fd, fs::WRITE, buf.add(done), len - done);
-        if n <= 0 {
-            (sys.provider_call)(fd, fs::CLOSE, core::ptr::null_mut(), 0);
-            return false;
-        }
-        done += n as usize;
-        writes += 1;
-    }
-    if (sys.provider_call)(fd, fs::FSYNC, core::ptr::null_mut(), 0) < 0 {
-        (sys.provider_call)(fd, fs::CLOSE, core::ptr::null_mut(), 0);
-        return false;
-    }
-    if (sys.provider_call)(fd, fs::CLOSE, core::ptr::null_mut(), 0) < 0 {
-        return false;
-    }
-    // RENAME: [src_len:u16][src][dst_len:u16][dst], little-endian lengths.
-    let mut arg = [0u8; 2 * (MAX_ZONE_PATH + 4) + 4];
     let mut p = 0;
-    arg[p..p + 2].copy_from_slice(&(tmp_len as u16).to_le_bytes());
+    copy_bytes(arg, (tmp_len as u16).to_le_bytes().as_ptr(), 2);
     p += 2;
-    copy_bytes(arg.as_mut_ptr().add(p), tmp.as_ptr(), tmp_len);
+    copy_bytes(arg.add(p), tmp.as_ptr(), tmp_len);
     p += tmp_len;
-    arg[p..p + 2].copy_from_slice(&(path_len as u16).to_le_bytes());
+    copy_bytes(arg.add(p), (path_len as u16).to_le_bytes().as_ptr(), 2);
     p += 2;
-    copy_bytes(arg.as_mut_ptr().add(p), s.update_path.as_ptr(), path_len);
-    p += path_len;
-    (sys.provider_call)(-1, fs::RENAME, arg.as_mut_ptr(), p) >= 0
+    copy_bytes(arg.add(p), s.update_path.as_ptr(), path_len);
+    p + path_len
+}
+
+/// Whether an `fs` answer means "not decided yet": `EAGAIN` (nothing was
+/// taken, ask again) or `EINPROGRESS` (taken, re-ask the same request).
+#[inline(always)]
+fn zio_pending(rc: i32) -> bool {
+    rc == abi::errno::EAGAIN || rc == abi::errno::EINPROGRESS
+}
+
+/// Begin the durable commit of the candidate: temp → write → fsync → close
+/// → rename. The update's response waits in `pend_*` for the decision.
+unsafe fn zone_commit_begin(s: &mut DnsState) {
+    s.zio_len = zone_serialize(s, true) as u32;
+    s.zio_done = 0;
+    s.zio_fd = -1;
+    s.zio_taken = 0;
+    s.zio_start_ms = dev_millis(s.sys()) as u32;
+    s.zio_phase = ZIO_COM_UNLINK;
+}
+
+/// Close the commit's handle, if it holds one. `CLOSE` never waits and
+/// always releases the handle.
+unsafe fn zone_commit_release(s: &mut DnsState) {
+    use abi::contracts::storage::fs;
+    if s.zio_fd >= 0 {
+        let _ = (s.sys().provider_call)(s.zio_fd, fs::CLOSE, core::ptr::null_mut(), 0);
+        s.zio_fd = -1;
+    }
+}
+
+/// Advance the commit as far as the provider decides this step. Each call
+/// either decides (and the machine moves on), or answers `EAGAIN` /
+/// `EINPROGRESS` and the step ends with the machine parked on that call —
+/// it resumes there next step, never from the beginning. Returns true when
+/// the commit moved (a phase, a byte, or its decision); a machine parked on
+/// an undecided call reports no work.
+unsafe fn zone_commit_drive(s: &mut DnsState) -> bool {
+    if s.zio_phase < ZIO_COM_UNLINK {
+        return false;
+    }
+    let before = (s.zio_phase, s.zio_done);
+    zone_commit_advance(s);
+    (s.zio_phase, s.zio_done) != before
+}
+
+unsafe fn zone_commit_advance(s: &mut DnsState) {
+    use abi::contracts::storage::fs;
+    let now = dev_millis(s.sys()) as u32;
+    let renaming_taken = s.zio_phase == ZIO_COM_RENAME && s.zio_taken != 0;
+    if !renaming_taken && now.wrapping_sub(s.zio_start_ms) > COMMIT_DEADLINE_MS {
+        log_info(s, b"[dns] zone: commit stalled past its deadline");
+        zone_commit_release(s);
+        zone_commit_finish(s, false);
+        return;
+    }
+    let mut tmp = [0u8; MAX_ZONE_PATH + 4];
+    let (_, tmp_len) = zone_paths(s, tmp.as_mut_ptr());
+    let mut calls = 0usize;
+    while calls < MAX_ZIO_CALLS_PER_STEP {
+        calls += 1;
+        let pc = s.sys().provider_call;
+        match s.zio_phase {
+            ZIO_COM_UNLINK => {
+                // A previous interrupted commit may have left the temporary
+                // behind; absent is as good as removed.
+                let rc = pc(-1, fs::UNLINK, tmp.as_mut_ptr(), tmp_len);
+                if zio_pending(rc) {
+                    s.zio_taken = u8::from(rc == abi::errno::EINPROGRESS);
+                    return;
+                }
+                s.zio_taken = 0;
+                if rc < 0 && rc != abi::errno::ENOENT {
+                    zone_commit_finish(s, false);
+                    return;
+                }
+                s.zio_phase = ZIO_COM_OPEN;
+            }
+            ZIO_COM_OPEN => {
+                let rc = pc(-1, fs::OPEN_CREATE, tmp.as_mut_ptr(), tmp_len);
+                if zio_pending(rc) {
+                    s.zio_taken = u8::from(rc == abi::errno::EINPROGRESS);
+                    return;
+                }
+                s.zio_taken = 0;
+                if rc < 0 {
+                    zone_commit_finish(s, false);
+                    return;
+                }
+                s.zio_fd = rc;
+                s.zio_phase = ZIO_COM_WRITE;
+            }
+            ZIO_COM_WRITE => {
+                if s.zio_done >= s.zio_len {
+                    s.zio_phase = ZIO_COM_FSYNC;
+                    continue;
+                }
+                let done = s.zio_done as usize;
+                let n = pc(
+                    s.zio_fd,
+                    fs::WRITE,
+                    s.zone_file.as_mut_ptr().add(done),
+                    s.zio_len as usize - done,
+                );
+                if n == abi::errno::EAGAIN {
+                    return;
+                }
+                if n <= 0 || n as usize > s.zio_len as usize - done {
+                    zone_commit_release(s);
+                    zone_commit_finish(s, false);
+                    return;
+                }
+                // A short count is progress: advance by what moved.
+                s.zio_done += n as u32;
+            }
+            ZIO_COM_FSYNC => {
+                let rc = pc(s.zio_fd, fs::FSYNC, core::ptr::null_mut(), 0);
+                if zio_pending(rc) {
+                    s.zio_taken = u8::from(rc == abi::errno::EINPROGRESS);
+                    return;
+                }
+                s.zio_taken = 0;
+                if rc < 0 {
+                    zone_commit_release(s);
+                    zone_commit_finish(s, false);
+                    return;
+                }
+                s.zio_phase = ZIO_COM_CLOSE;
+            }
+            ZIO_COM_CLOSE => {
+                let rc = pc(s.zio_fd, fs::CLOSE, core::ptr::null_mut(), 0);
+                s.zio_fd = -1;
+                if rc < 0 {
+                    zone_commit_finish(s, false);
+                    return;
+                }
+                s.zio_phase = ZIO_COM_RENAME;
+            }
+            ZIO_COM_RENAME => {
+                let mut arg = [0u8; 2 * (MAX_ZONE_PATH + 4) + 4];
+                let n = zone_rename_arg(s, arg.as_mut_ptr());
+                let rc = pc(-1, fs::RENAME, arg.as_mut_ptr(), n);
+                if zio_pending(rc) {
+                    // Once taken, the rename lands whether or not it is
+                    // collected, so it is awaited past the deadline.
+                    if rc == abi::errno::EINPROGRESS {
+                        s.zio_taken = 1;
+                    }
+                    return;
+                }
+                s.zio_taken = 0;
+                zone_commit_finish(s, rc >= 0);
+                return;
+            }
+            _ => {
+                s.zio_phase = ZIO_IDLE;
+                return;
+            }
+        }
+    }
+}
+
+/// The commit is decided: publish the candidate on success, then answer
+/// the update that waited on it, retain the answer, and free the machine.
+unsafe fn zone_commit_finish(s: &mut DnsState, committed: bool) {
+    s.zio_phase = ZIO_IDLE;
+    s.zio_taken = 0;
+    let rcode = if committed {
+        s.zone = s.candidate;
+        RCODE_NOERROR
+    } else {
+        log_info(s, b"[dns] zone: commit refused, generation unchanged");
+        RCODE_SERVFAIL
+    };
+    let state = s as *mut DnsState;
+    let tx = s.tx_buf.as_mut_ptr();
+    let info = s.pend_info;
+    let n = begin_update_response(s.pend_q.as_ptr(), s.pend_q_len as usize, rcode, tx);
+    if n == 0 {
+        return;
+    }
+    let len = append_tsig(
+        s,
+        info.key_idx,
+        true,
+        &info.mac,
+        info.time_signed,
+        info.fudge,
+        0,
+        &[],
+        tx,
+        n,
+    );
+    if len == 0 {
+        return;
+    }
+    let now_ms = dev_millis(s.sys()) as u32;
+    txn_store(s, info.key_idx, &info.mac, tx as *const u8, len, now_ms);
+    send_server_reply(state, s.pend_ip, s.pend_port, tx as *const u8, len);
 }
 
 /// Probe the storage provider's write tier. `None` while it has no answer
@@ -5023,48 +5257,106 @@ unsafe fn zone_storage_ready(s: &DnsState) -> Option<bool> {
 
 /// Recover the last committed generation. An absent file is an empty zone;
 /// a file that does not verify is refused and logged, and the zone starts
-/// empty rather than from a partial read.
-unsafe fn zone_recover(s: &mut DnsState) {
+/// empty rather than from a partial read. A step machine like the commit:
+/// `EAGAIN` on the open is "not yet", never "absent", and the file is
+/// verified only once a `READ` answers 0 (end of file), so a short or
+/// deferred read is never taken for the whole generation. Returns true
+/// once recovery is decided.
+unsafe fn zone_recover_drive(s: &mut DnsState) -> bool {
     use abi::contracts::storage::fs;
-    let sys = &*s.syscalls;
-    let mut path = [0u8; MAX_ZONE_PATH];
-    let n = s.update_path_len as usize;
-    copy_bytes(path.as_mut_ptr(), s.update_path.as_ptr(), n);
-    let fd = (sys.provider_call)(-1, fs::OPEN, path.as_mut_ptr(), n);
-    if fd < 0 {
-        log_info(s, b"[dns] zone: no committed generation, starting empty");
-        return;
-    }
-    let buf = s.zone_file.as_mut_ptr();
-    let mut got = 0usize;
-    let mut reads = 0usize;
-    let mut overflow = false;
-    while reads < MAX_COMMIT_WRITES {
-        if got >= MAX_ZONE_FILE {
-            // Anything past the ceiling is not a generation this profile
-            // wrote.
-            let mut probe = [0u8; 1];
-            if (sys.provider_call)(fd, fs::READ, probe.as_mut_ptr(), 1) > 0 {
-                overflow = true;
+    let mut calls = 0usize;
+    while calls < MAX_ZIO_CALLS_PER_STEP {
+        calls += 1;
+        let pc = s.sys().provider_call;
+        match s.zio_phase {
+            ZIO_REC_OPEN => {
+                let mut path = [0u8; MAX_ZONE_PATH];
+                let n = s.update_path_len as usize;
+                copy_bytes(path.as_mut_ptr(), s.update_path.as_ptr(), n);
+                let fd = pc(-1, fs::OPEN, path.as_mut_ptr(), n);
+                if zio_pending(fd) {
+                    return false;
+                }
+                if fd == abi::errno::ENOENT {
+                    log_info(s, b"[dns] zone: no committed generation, starting empty");
+                    s.zio_phase = ZIO_IDLE;
+                    return true;
+                }
+                if fd < 0 {
+                    log_info(
+                        s,
+                        b"[dns] zone: committed generation unreadable, starting empty",
+                    );
+                    s.zio_phase = ZIO_IDLE;
+                    return true;
+                }
+                s.zio_fd = fd;
+                s.zio_done = 0;
+                s.zio_phase = ZIO_REC_READ;
             }
-            break;
+            ZIO_REC_READ => {
+                let got = s.zio_done as usize;
+                if got >= MAX_ZONE_FILE {
+                    // Anything past the ceiling is not a generation this
+                    // profile wrote.
+                    s.zio_phase = ZIO_REC_PROBE;
+                    continue;
+                }
+                let r = pc(
+                    s.zio_fd,
+                    fs::READ,
+                    s.zone_file.as_mut_ptr().add(got),
+                    MAX_ZONE_FILE - got,
+                );
+                if r == abi::errno::EAGAIN {
+                    return false;
+                }
+                if r < 0 || r as usize > MAX_ZONE_FILE - got {
+                    zone_recover_finish(s, false);
+                    return true;
+                }
+                if r == 0 {
+                    let ok = zone_deserialize(s, got);
+                    zone_recover_finish(s, ok);
+                    return true;
+                }
+                s.zio_done += r as u32;
+            }
+            ZIO_REC_PROBE => {
+                let mut probe = [0u8; 1];
+                let r = pc(s.zio_fd, fs::READ, probe.as_mut_ptr(), 1);
+                if r == abi::errno::EAGAIN {
+                    return false;
+                }
+                let ok = r == 0 && zone_deserialize(s, s.zio_done as usize);
+                zone_recover_finish(s, ok);
+                return true;
+            }
+            _ => {
+                s.zio_phase = ZIO_IDLE;
+                return true;
+            }
         }
-        let r = (sys.provider_call)(fd, fs::READ, buf.add(got), MAX_ZONE_FILE - got);
-        if r <= 0 {
-            break;
-        }
-        got += r as usize;
-        reads += 1;
     }
-    (sys.provider_call)(fd, fs::CLOSE, core::ptr::null_mut(), 0);
-    if overflow || !zone_deserialize(s, got) {
+    false
+}
+
+/// Recovery is decided: release the handle and log the outcome.
+unsafe fn zone_recover_finish(s: &mut DnsState, recovered: bool) {
+    use abi::contracts::storage::fs;
+    if s.zio_fd >= 0 {
+        let _ = (s.sys().provider_call)(s.zio_fd, fs::CLOSE, core::ptr::null_mut(), 0);
+        s.zio_fd = -1;
+    }
+    s.zio_phase = ZIO_IDLE;
+    if recovered {
+        log_info(s, b"[dns] zone: recovered committed generation");
+    } else {
         log_info(
             s,
             b"[dns] zone: committed generation rejected, starting empty",
         );
-        return;
     }
-    log_info(s, b"[dns] zone: recovered committed generation");
 }
 
 // ============================================================================
@@ -5273,6 +5565,14 @@ unsafe fn handle_update(
         return;
     }
 
+    // One commit at a time: the candidate is in use until it is decided.
+    // The update is dropped unanswered; the client's retry finds the
+    // machine free, or (a retry of this very update) the cached answer.
+    if s.zio_phase >= ZIO_COM_UNLINK {
+        s.updates_deferred = s.updates_deferred.wrapping_add(1);
+        return;
+    }
+
     let rcode = evaluate_update(
         s,
         &info,
@@ -5283,6 +5583,24 @@ unsafe fn handle_update(
         zone_qtype,
         zone_qclass,
     );
+    if rcode == RCODE_COMMIT_PENDING {
+        // The response waits on the commit; keep what it needs.
+        if question_end > PEND_Q_MAX {
+            let n = begin_update_response(pkt, question_end, RCODE_SERVFAIL, tx);
+            if n > 0 {
+                send_server_reply(state, client_ip, client_port, tx as *const u8, n);
+            }
+            return;
+        }
+        copy_bytes(s.pend_q.as_mut_ptr(), pkt, question_end);
+        s.pend_q_len = question_end as u16;
+        s.pend_ip = client_ip;
+        s.pend_port = client_port;
+        s.pend_info = info;
+        zone_commit_begin(s);
+        zone_commit_drive(s);
+        return;
+    }
     let n = begin_update_response(pkt, question_end, rcode, tx);
     if n == 0 {
         return;
@@ -5323,7 +5641,9 @@ unsafe fn find_key_named_in_request(
 }
 
 /// Zone section, prerequisites, update section, commit, publish. Returns
-/// the rcode; the current generation changes only on NOERROR.
+/// the rcode; the current generation changes only on NOERROR. In durable
+/// mode a ready candidate answers `RCODE_COMMIT_PENDING`: the commit runs
+/// across steps and publishes on its own decision.
 #[allow(
     clippy::too_many_arguments,
     reason = "the parsed zone section is passed as its fields"
@@ -5368,9 +5688,9 @@ unsafe fn evaluate_update(
         return rc;
     }
     s.candidate.generation = s.zone.generation.wrapping_add(1);
-    if s.update_durability == DURABILITY_DURABLE && !zone_commit_durable(s) {
-        log_info(s, b"[dns] zone: commit refused, generation unchanged");
-        return RCODE_SERVFAIL;
+    if s.update_durability == DURABILITY_DURABLE {
+        // Published by `zone_commit_finish` once the commit lands.
+        return RCODE_COMMIT_PENDING;
     }
     s.zone = s.candidate;
     RCODE_NOERROR
@@ -5554,23 +5874,28 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             && s.update_durability == DURABILITY_DURABLE
             && s.durable_ready == 0
         {
-            match zone_storage_ready(s) {
-                Some(true) => {
-                    zone_recover(s);
-                    s.durable_ready = 1;
+            if s.zio_phase == ZIO_IDLE {
+                match zone_storage_ready(s) {
+                    Some(true) => s.zio_phase = ZIO_REC_OPEN,
+                    Some(false) => {
+                        log_info(
+                            s,
+                            b"[dns] zone: storage lacks the write tier, durable updates refused",
+                        );
+                        // Asked again each step; the answer is per provider
+                        // and does not change, so the log line is the
+                        // once-only cost.
+                        s.durable_ready = 2;
+                    }
+                    None => {}
                 }
-                Some(false) => {
-                    log_info(
-                        s,
-                        b"[dns] zone: storage lacks the write tier, durable updates refused",
-                    );
-                    // Asked again each step; the answer is per provider and
-                    // does not change, so the log line is the once-only cost.
-                    s.durable_ready = 2;
-                }
-                None => {}
+            }
+            if s.zio_phase != ZIO_IDLE && zone_recover_drive(s) {
+                s.durable_ready = 1;
             }
         }
+        // A durable commit in flight resumes where it stopped.
+        let commit_moved = zone_commit_drive(s);
 
         // Drive the two binds sequentially — server on `listen_port`, then the
         // ephemeral upstream once the server is up — so each MSG_DG_BOUND routes
@@ -5596,7 +5921,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             s.upstream_ep.poll_bind(sys, net_out, 0, buf, NET_BUF_SIZE);
         }
 
-        let mut did_work = false;
+        let mut did_work = commit_moved;
         if let Some(ev) = dg_recv(sys, net_in, buf, NET_BUF_SIZE) {
             match ev {
                 DgEvent::Bound { ep_id, .. } => {

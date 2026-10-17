@@ -37,10 +37,21 @@ longer than 16 bytes is refused at open (`EINVAL`), never clipped.
 
 ## Behaviour
 
-- `CAPS`: write, flush, discard (reads back zeros), pipelined, copies write
-  data at `SUBMIT`; up to 64 blocks per request; queue depth 8.
-- Every request runs inside the call that carries it. `SUBMIT` queues the
-  completion for `REAP`.
+- `CAPS`: write, flush, discard (reads back zeros), pipelined; up to 64
+  blocks per request; queue depth 8. No `F_WRITE_COPIES`: a queued write's
+  buffer is read when its turn comes, so it stays lent until reaped.
+- The `fs` contract never waits on the device inside a call, so a request
+  is a resumable job. `SUBMIT` queues it; the queue runs in submission
+  order, advanced inside `SUBMIT`/`REAP` and by the module's own step. A
+  job parked on `EAGAIN` (nothing moved) or `EINPROGRESS` (a taken `FSYNC`,
+  re-asked identically) resumes where it stopped; short counts advance by
+  what moved. `REAP` answers 0 until the job is decided.
+- `EXEC` runs the same job inside the call and answers `EAGAIN` while it is
+  undecided, or while queued requests hold the job. Re-asking the
+  identical request resumes it; a different request starts over (block
+  requests are idempotent, so a parked job left behind is harmless).
+- Opening is a step machine too: `OPEN_CREATE`, `STAT`, the extending
+  write and its `FSYNC` each resume across steps.
 - Writes complete `Volatile`; `FLUSH` and `FUA` run the file's `FSYNC` and
   complete `LocalDurable`, naming a device id hashed from the path (and the
   `volume`, when one is named).

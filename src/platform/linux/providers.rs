@@ -1178,7 +1178,8 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             let slot_idx = handle as usize;
             let files = &mut *core::ptr::addr_of_mut!(LINUX_FILES);
             if slot_idx >= MAX_OPEN_FILES || !owned(&files[slot_idx]) {
-                return errno::EINVAL;
+                // The fs contract's CLOSE answers 0 or EBADF.
+                return -9; // EBADF
             }
             // Dispatch on whether this slot is a file (fd >= 0) or a
             // directory (dir_ptr != 0). They share the slot table so

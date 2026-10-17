@@ -101,6 +101,31 @@
 //
 // A provider that decides inside the call never answers `EINPROGRESS`.
 // "Taken but not yet durable" is a success carrying `Fence::Volatile`.
+//
+// ### Streamed writes: `EAGAIN` is backpressure
+//
+// `PUT_STREAMED_OPEN` and `PUT_STREAMED_WRITE` MAY return `EAGAIN` when the
+// provider cannot take the request now without waiting: no stream slot is
+// free yet (one is still being released), or the chunk fits neither the
+// staging area nor the provider's bounded spill. `EAGAIN` here means
+// nothing was taken and no state moved: no handle was opened, and no byte
+// of the chunk was consumed, so the stream's length, its digest and its
+// order are as they were before the call.
+//
+// The caller MUST keep the chunk and send the same chunk again on a later
+// step, ahead of any byte that follows it in the body, and MUST NOT treat
+// `EAGAIN` as a failure, an end of stream or a reason to abort. It MUST
+// NOT re-send within the same step: the provider frees room only between
+// steps, so asking again inside a step spins. A caller fed by a flow (an
+// HTTP body, a socket) holds the flow while the chunk waits — it stops
+// reading more until the chunk is taken — rather than drop or buffer
+// without bound. A `PUT_STREAMED_WRITE` is all or nothing: 0 means the
+// whole chunk was taken, and there is no short count.
+//
+// `PUT_STREAMED_COMMIT` keeps the write path's meanings: `EINPROGRESS` is
+// "taken, ask again byte-identical" and `EAGAIN` is the decision that a
+// `precondition::ETAG` lost. `PUT_STREAMED_ABORT` and `CLOSE` decide inside
+// the call and release the handle whatever they answer.
 
 /// What a storage write answered: decided, or not yet.
 ///
@@ -322,8 +347,10 @@ pub const IMG_CLOSE: u32 = 0x1432;
 /// ```
 ///
 /// Returns a non-negative streaming-write handle or negative errno.
-/// The handle's fence is `Fence::Volatile` until
-/// `PUT_STREAMED_COMMIT` succeeds.
+/// `EAGAIN` means no handle was opened yet — ask again on a later step
+/// (see "Streamed writes: `EAGAIN` is backpressure" above); `ENOMEM` means
+/// every stream slot is open. The handle's fence is `Fence::Volatile`
+/// until `PUT_STREAMED_COMMIT` succeeds.
 ///
 /// The condition is stated at OPEN and evaluated at
 /// [`PUT_STREAMED_COMMIT`], not here: a streamed write is open across many
@@ -337,10 +364,16 @@ pub const PUT_STREAMED_OPEN: u32 = 0x1426;
 /// Append a chunk of body bytes to a streaming-write handle.
 ///
 /// `handle` is a `PUT_STREAMED_OPEN`-returned handle; `arg` points
-/// at the chunk bytes, `arg_len` is the chunk size. Returns 0 or
-/// negative errno. Each successful WRITE corresponds to one Event
-/// appended on the provider's staging event-log stream. Fence on
-/// the handle remains `Volatile`.
+/// at the chunk bytes, `arg_len` is the chunk size. Returns 0 (the whole
+/// chunk was taken) or negative errno. Each successful WRITE corresponds
+/// to one Event appended on the provider's staging event-log stream. Fence
+/// on the handle remains `Volatile`.
+///
+/// `EAGAIN` is backpressure: nothing of this chunk was consumed, and the
+/// caller sends the same chunk again on a later step, before any later
+/// byte, never within the same step (see "Streamed writes: `EAGAIN` is
+/// backpressure" above). Any other negative answer is a failure of the
+/// stream, which the caller aborts.
 pub const PUT_STREAMED_WRITE: u32 = 0x1427;
 
 /// Atomically finalise a streaming write into an object PUT.

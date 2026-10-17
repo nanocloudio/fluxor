@@ -292,7 +292,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     match s.phase {
         PH_CREATE => {
             let rc = (sys.provider_call)(-1, FS_OPEN_CREATE, path.as_ptr().cast_mut(), path.len());
-            if rc == -11 {
+            if rc == -11 || rc == -36 {
                 return 0;
             }
             if rc < 0 {
@@ -331,7 +331,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
                 i += 1;
             }
             let rc = (sys.provider_call)(s.fd, FS_WRITE, chunk.as_mut_ptr(), n);
-            if rc == -11 {
+            if rc == -11 || rc == -36 {
                 return 0;
             }
             if rc < 0 {
@@ -344,7 +344,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
 
         PH_FSYNC => {
             let rc = (sys.provider_call)(s.fd, FS_FSYNC, core::ptr::null_mut(), 0);
-            if rc == -11 {
+            if rc == -11 || rc == -36 {
                 return 0;
             }
             if rc < 0 {
@@ -370,7 +370,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
             // The bytes are durable; the NAME that finds them is not until
             // this fence lands.
             let rc = (sys.provider_call)(-1, FS_FSYNC_NAME, path.as_ptr().cast_mut(), path.len());
-            if rc == -11 {
+            if rc == -11 || rc == -36 {
                 return 0;
             }
             if rc < 0 {

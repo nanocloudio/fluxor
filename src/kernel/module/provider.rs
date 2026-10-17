@@ -709,6 +709,12 @@ pub fn provider_query(handle: i32, key: u32, out: *mut u8, out_len: usize) -> i3
 /// Close an open handle using the contract's default close opcode.
 /// For contracts whose vtable declares `default_close_op = 0`,
 /// `provider_close` only releases the tracking entry and returns 0.
+///
+/// The handle is released whatever the provider answers: a close never
+/// waits and always releases (the `fs` contract's `CLOSE`), and a provider
+/// with write-back left to do finishes it in its own step. The answer is
+/// passed through for the caller to see, never as a reason to keep the
+/// handle.
 pub fn provider_close(handle: i32) -> i32 {
     if crate::kernel::exec::scheduler::deny_isr_tier_syscall("provider_close") {
         return errno::EACCES;

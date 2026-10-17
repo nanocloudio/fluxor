@@ -19,13 +19,19 @@
 //
 //   unsafe fn backend_close(s: &mut BankState);
 //   unsafe fn backend_open_handle(s: &mut BankState, path: *mut u8, len: usize) -> i32;
-//   unsafe fn backend_scan(s: &mut BankState);
+//   unsafe fn backend_scan(s: &mut BankState) -> bool;
 //   unsafe fn backend_stream(s: &mut BankState) -> ReadOutcome;
 //   unsafe fn hb_extra(s: &mut BankState, p: *mut u8, q: usize) -> usize;
 //
 // The consumer's `backend_scan` populates `paths[]` via the shared
 // `append_path` / `matches_format` helpers and calls `finish_scan` to
-// sort + derive the count.
+// sort + derive the count. It answers true once the scan is decided (done,
+// or failed for real) and false while the backend answered "not yet"
+// (`EAGAIN`): the core then asks again on the very next step, and a
+// backend that holds a listing cursor (`scan_handle`) resumes from it.
+// `backend_open_handle` answering `EAGAIN` is likewise re-asked on the
+// next step; only decided failures (a missing file or directory) wait for
+// the slow retry.
 
 // ============================================================================
 // Constants
@@ -126,8 +132,9 @@ struct BankState {
     /// from a successful `dir:` scan. When 0, the player runs in
     /// preset-selector mode (no reads).
     path_count: u8,
-    /// 1 once `dir`-mode init has completed (success or failure) so we
-    /// don't re-scan on every tick if the backend isn't ready yet.
+    /// 1 once `dir`-mode init has been decided (success or a real
+    /// failure). 0 while the scan is still running or the backend has
+    /// answered "not yet": it is re-asked every step until decided.
     dir_scanned: u8,
     /// Length of `dir_path`; 0 means dir-scan mode is disabled and the
     /// player uses enumerated `path_*` params.
@@ -158,6 +165,14 @@ struct BankState {
     buf: [u8; BUF_SIZE],
     /// Scratch for FMP message payloads (commands).
     msg_buf: [u8; 16],
+
+    /// The backend's listing handle while a `dir:` scan is in progress
+    /// (-1 otherwise), so a scan the backend interrupted resumes at its
+    /// cursor instead of starting over.
+    scan_handle: i32,
+    /// 1 when the last open answered `EAGAIN`: re-asked next step.
+    open_again: u8,
+    _pad_scan: [u8; 3],
 
     /// Tick counter for periodic diagnostics. Wraps freely.
     tick_count: u32,
@@ -314,6 +329,9 @@ unsafe fn fs_open_index(s: &mut BankState, idx: u16) -> bool {
     let mut path = [0u8; MAX_PATH_LEN];
     path[..n].copy_from_slice(&s.paths[idx as usize][..n]);
     let fd = backend_open_handle(s, path.as_mut_ptr(), n);
+    // "Not yet" is asked again on the next step; a decided failure waits
+    // for the slow retry.
+    s.open_again = u8::from(fd == E_AGAIN);
     if fd < 0 {
         return false;
     }
@@ -610,6 +628,7 @@ pub extern "C" fn module_new(
         s.out_count = if s.out_chans[1] >= 0 { 2 } else { 1 };
         s.ctrl_chan = ctrl_chan;
         s.fs_fd = -1;
+        s.scan_handle = -1;
         s.phase = BankPhase::Init;
         s.mode = MODE_LOOP;
         s.auto_advance = 1;
@@ -739,8 +758,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             // explicit `path_*` entries. Runs once; failure (backend
             // not ready, missing dir) is silent — `path_count` stays 0
             // and the consumer just sees EOF.
-            if s.dir_path_len > 0 && s.dir_scanned == 0 {
-                backend_scan(s);
+            if s.dir_path_len > 0 && s.dir_scanned == 0 && backend_scan(s) {
                 s.dir_scanned = 1;
             }
             if s.path_count > 0 && s.count > 0 {
@@ -752,30 +770,40 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             return 0;
         }
 
-        // Lazy retry — on bare-metal targets the provider (fat32)
-        // reads the boot sector + GPT entries + FAT chain before
-        // reaching `Done`, which can take several hundred ms. The
-        // player's `Init` may fire before the provider is ready; the
-        // open/enumerate returns E_AGAIN, fs_fd stays -1 and path_count
-        // stays 0. Without retry the player sits idle forever waiting
-        // for a nav command that never comes. Retry every 500 ticks
-        // (~50 ms at tick_us=100) until we get a real fd / path list.
+        // Prompt continuation — on bare-metal targets the provider
+        // (fat32) reads the boot sector + GPT entries + FAT chain before
+        // it can answer, and its directory walks and opens answer
+        // `EAGAIN` ("not yet, ask again") while their sectors are fetched
+        // between steps. A scan or open answered that way is re-asked on
+        // the very next step; the scan resumes at its cursor.
+        if s.dir_path_len > 0 && s.dir_scanned == 0 && backend_scan(s) {
+            s.dir_scanned = 1;
+            if s.count == 0 && s.path_count > 0 {
+                s.count = s.path_count as u16;
+            }
+            if s.path_count > 0 && s.count > 0 {
+                // A scan decided after `Init` opens its first selection
+                // now, as `Init` would have.
+                fs_open_index(s, s.index);
+                emit_notification(s);
+            }
+        }
+        if s.fs_fd < 0 && s.open_again != 0 && s.path_count > 0 && s.count > 0 {
+            fs_open_index(s, s.index);
+        }
+
+        // Slow retry for decided failures — a directory that was missing
+        // or empty, a file that did not open — every 500 ticks (~50 ms at
+        // tick_us=100), so one that appears later is picked up.
         if s.tick_count.is_multiple_of(500) {
-            // Dir-mode retry: re-scan the configured directory until
-            // it returns at least one entry. `dir_scanned` is reset
-            // here to force a fresh enumeration pass — the prior
-            // failed scan latched it to 1.
-            if s.dir_path_len > 0 && s.path_count == 0 {
+            // Dir-mode retry: a decided scan that found nothing is run
+            // afresh (the continuation above drives it from next step).
+            if s.dir_path_len > 0 && s.path_count == 0 && s.dir_scanned != 0 {
                 s.dir_scanned = 0;
-                backend_scan(s);
-                s.dir_scanned = 1;
-                if s.count == 0 && s.path_count > 0 {
-                    s.count = s.path_count as u16;
-                }
             }
             // Path-mode retry: re-open the selected index when fs_fd
             // is unset and we have at least one configured path.
-            if s.fs_fd < 0 && s.path_count > 0 && s.count > 0 {
+            if s.fs_fd < 0 && s.open_again == 0 && s.path_count > 0 && s.count > 0 {
                 fs_open_index(s, s.index);
             }
         }

@@ -369,7 +369,9 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
                     return 0;
                 }
                 let rc = (sys.provider_call)(-1, FS_UNLINK, path.as_mut_ptr(), n);
-                if rc == EAGAIN {
+                // Not yet, or taken and not yet decided: the same name, with
+                // the same bytes, on the next step.
+                if rc == EAGAIN || rc == abi::kernel_abi::errno::EINPROGRESS {
                     s.cursor -= 1; // the same name, next step
                     return 0;
                 }

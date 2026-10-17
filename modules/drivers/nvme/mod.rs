@@ -3160,7 +3160,16 @@ use abi::contracts::storage::block::{self as blk, Caps, Cpl, Req};
 use abi::fence::Fence;
 
 /// Requests the v1 surface holds in flight.
-pub const V1_SLOTS: usize = 8;
+///
+/// Sixteen, not eight: a filesystem provider answering inside its callers'
+/// steps keeps every request it has on this surface in flight at once —
+/// metadata read-ahead, metadata write-back, file data runs and the flush of
+/// a durability fence — and the depth reported here is shared by all of
+/// them. At eight a fence's flush and one data run could leave a directory
+/// walk a single read at a time. Each slot owns one 4 KiB DMA page, and queue
+/// 0's worst case stays under `IO_Q_ENTRIES` (see the harness's
+/// `v1_queue_zero_cannot_overflow`).
+pub const V1_SLOTS: usize = 16;
 /// CIDs of v1 requests: `CID_V1_BASE + slot`.
 pub const CID_V1_BASE: u16 = 0x0500;
 /// Flushes an `F_PREFLUSH` request can have outstanding at once.
@@ -3185,14 +3194,18 @@ const V1_INFLIGHT: u8 = 1;
 const V1_DONE: u8 = 2;
 /// An `EXEC` gave up waiting; the slot frees itself when its CQE lands.
 const V1_ABANDONED: u8 = 3;
+/// An `F_PREFLUSH` request parked behind its Flush (preflush slot `pf`). It
+/// is put on the queue when that Flush retires, or completes `EIO` when the
+/// Flush fails. Nothing waits for it: whichever CQE loop retires the Flush
+/// issues it.
+const V1_PARKED: u8 = 4;
 
 /// Preflush slot states. A slot is free only once its CQE has been seen, so
 /// a CID is never on the queue twice.
 const PF_FREE: u8 = 0;
 const PF_INFLIGHT: u8 = 1;
-const PF_OK: u8 = 2;
-const PF_FAILED: u8 = 3;
-/// The wait gave up; the slot frees itself when its CQE lands.
+/// Kept for the CID discipline: a slot whose Flush is still the
+/// controller's is never handed out, whatever waited on it.
 const PF_ABANDONED: u8 = 4;
 
 #[derive(Clone, Copy)]
@@ -3203,12 +3216,16 @@ struct V1Slot {
     buf: u64,
     /// This slot's DMA page, allocated on first use.
     dma: u64,
+    /// First block, kept so a parked request can be issued later.
+    lba: u64,
     status: i32,
     nblocks: u32,
     state: u8,
     op: u8,
     flags: u8,
-    _pad: [u8; 5],
+    /// Preflush slot a `V1_PARKED` request waits on.
+    pf: u8,
+    _pad: [u8; 4],
 }
 
 /// FNV-1a 64 over the controller serial number and the namespace id: the
@@ -3317,10 +3334,13 @@ pub fn is_v1_cid(cid: u16) -> bool {
 /// the driver has outstanding: it is counted and dropped, never matched.
 unsafe fn retire_v1_cqe(s: &mut NvmeState, cid: u16, sc: u16) {
     if !is_v1_slot_cid(cid) {
-        let f = &mut s.v1_flush[(cid - CID_V1_FLUSH_BASE) as usize];
-        match *f {
-            PF_ABANDONED => *f = PF_FREE,
-            PF_INFLIGHT => *f = if sc == 0 { PF_OK } else { PF_FAILED },
+        let pf = (cid - CID_V1_FLUSH_BASE) as usize;
+        match s.v1_flush[pf] {
+            PF_ABANDONED => s.v1_flush[pf] = PF_FREE,
+            PF_INFLIGHT => {
+                s.v1_flush[pf] = PF_FREE;
+                v1_release_parked(s, pf, sc == 0);
+            }
             _ => s.stale_cqes = s.stale_cqes.wrapping_add(1),
         }
         return;
@@ -3398,48 +3418,22 @@ fn v1_flush_slot(s: &NvmeState) -> Option<usize> {
         .find(|&i| s.v1_flush[i] == PF_FREE)
 }
 
-/// Flush the volatile write cache and wait. Nothing to do without one.
-///
-/// Every call submits its own Flush under a CID no outstanding command
-/// carries. A wait that gives up leaves its Flush with the controller, so
-/// the retry takes another slot instead of reusing the CID, and the first
-/// Flush frees its slot when its completion lands. The retry does not wait
-/// on that first Flush: it covers only the writes completed before it was
-/// submitted, and writes may have completed since. `EAGAIN` when every slot
-/// is still the controller's.
-unsafe fn v1_flush_sync(s: &mut NvmeState) -> i32 {
-    if !s.needs_flush {
-        return 0;
-    }
-    let mut slot = v1_flush_slot(s);
-    if slot.is_none() {
-        v1_harvest(s);
-        slot = v1_flush_slot(s);
-    }
-    let Some(i) = slot else {
-        return E_AGAIN;
-    };
-    s.v1_flush_next = ((i + 1) % V1_FLUSH_SLOTS) as u8;
-    s.v1_flush[i] = PF_INFLIGHT;
-    submit_io_flush(s, 0, CID_V1_FLUSH_BASE + i as u16, s.namespace);
-    let start = now_ms(s);
-    loop {
-        v1_harvest(s);
-        match s.v1_flush[i] {
-            PF_OK => {
-                s.v1_flush[i] = PF_FREE;
-                return 0;
+/// The requests parked behind preflush slot `pf`, now that its Flush has
+/// retired: each goes on the queue when the Flush succeeded, or completes
+/// `EIO` when it failed — a write whose preflush failed must not run, or the
+/// barrier it asked for would silently be absent.
+unsafe fn v1_release_parked(s: &mut NvmeState, pf: usize, ok: bool) {
+    let mut i = 0usize;
+    while i < V1_SLOTS {
+        if s.v1[i].state == V1_PARKED && usize::from(s.v1[i].pf) == pf {
+            if ok {
+                v1_issue(s, i);
+            } else {
+                s.v1[i].status = E_IO;
+                s.v1[i].state = V1_DONE;
             }
-            PF_FAILED => {
-                s.v1_flush[i] = PF_FREE;
-                return E_IO;
-            }
-            _ => {}
         }
-        if now_ms(s).saturating_sub(start) > PAGER_SUBMIT_BUDGET_MS {
-            s.v1_flush[i] = PF_ABANDONED;
-            return E_AGAIN;
-        }
+        i += 1;
     }
 }
 
@@ -3474,18 +3468,29 @@ unsafe fn v1_start(s: &mut NvmeState, r: &Req) -> Result<usize, i32> {
         v1_harvest(s);
         return Err(E_AGAIN);
     }
-    if r.flags & blk::F_PREFLUSH != 0 {
-        let rc = v1_flush_sync(s);
-        if rc != 0 {
-            return Err(rc);
-        }
-    }
     // Pages are allocated in `step_ready`, in this module's own context: a
     // request runs in its consumer's dispatch, whose permissions may not
-    // include DMA allocation.
+    // include DMA allocation. Checked before a preflush is taken, so a
+    // refused request leaves no Flush behind it.
     let dma = s.v1[idx].dma;
     if dma == 0 && r.op != blk::op::FLUSH {
         return Err(E_AGAIN);
+    }
+    // `F_PREFLUSH` takes a preflush slot of its own: every Flush runs under
+    // a CID no outstanding command carries. A request whose Flush cannot be
+    // sent is refused now, with nothing on the queue.
+    let preflush = r.flags & blk::F_PREFLUSH != 0 && s.needs_flush;
+    let mut pf = 0usize;
+    if preflush {
+        let mut slot = v1_flush_slot(s);
+        if slot.is_none() {
+            v1_harvest(s);
+            slot = v1_flush_slot(s);
+        }
+        let Some(i) = slot else {
+            return Err(E_AGAIN);
+        };
+        pf = i;
     }
     let bytes = r.buf_len as usize;
     if r.op == blk::op::WRITE {
@@ -3506,39 +3511,60 @@ unsafe fn v1_start(s: &mut NvmeState, r: &Req) -> Result<usize, i32> {
             i += 1;
         }
     }
-    let cid = CID_V1_BASE + idx as u16;
-    let prp = dma | PCI_DMA_OFFSET;
-    let (opc, prp1, cdw10, cdw11, cdw12) = match r.op {
-        blk::op::READ => (
-            OPC_READ,
-            prp,
-            r.lba as u32,
-            (r.lba >> 32) as u32,
-            v1_rw_cdw12(r.nblocks, false),
-        ),
-        blk::op::WRITE => (
-            OPC_WRITE,
-            prp,
-            r.lba as u32,
-            (r.lba >> 32) as u32,
-            v1_rw_cdw12(r.nblocks, r.flags & blk::F_FUA != 0),
-        ),
-        blk::op::DISCARD => (OPC_DSM, prp, 0, DSM_AD, 0),
-        _ => (OPC_FLUSH, 0, 0, 0, 0),
-    };
     let slot = &mut s.v1[idx];
     slot.tag = r.tag;
     slot.buf = r.buf_ptr;
+    slot.lba = r.lba;
     slot.status = 0;
     slot.nblocks = r.nblocks;
     slot.op = r.op;
     slot.flags = r.flags;
-    // A flush with no volatile cache has nothing to wait for.
-    if r.op == blk::op::FLUSH && !s.needs_flush {
-        slot.state = V1_DONE;
+    if preflush {
+        // Never waited for here. The Flush goes on the queue now and the
+        // request is parked behind it; whichever CQE loop retires the Flush
+        // issues the request (`v1_release_parked`). The data is already in
+        // the slot's page, so the caller's buffer is free on return, as
+        // `F_WRITE_COPIES` promises.
+        slot.pf = pf as u8;
+        slot.state = V1_PARKED;
+        s.v1_flush_next = ((pf + 1) % V1_FLUSH_SLOTS) as u8;
+        s.v1_flush[pf] = PF_INFLIGHT;
+        submit_io_flush(s, 0, CID_V1_FLUSH_BASE + pf as u16, s.namespace);
         return Ok(idx);
     }
-    slot.state = V1_INFLIGHT;
+    v1_issue(s, idx);
+    Ok(idx)
+}
+
+/// Put slot `idx`'s request on queue 0, from what the slot holds.
+unsafe fn v1_issue(s: &mut NvmeState, idx: usize) {
+    let slot = s.v1[idx];
+    // A flush with no volatile cache has nothing to wait for.
+    if slot.op == blk::op::FLUSH && !s.needs_flush {
+        s.v1[idx].state = V1_DONE;
+        return;
+    }
+    let cid = CID_V1_BASE + idx as u16;
+    let prp = slot.dma | PCI_DMA_OFFSET;
+    let (opc, prp1, cdw10, cdw11, cdw12) = match slot.op {
+        blk::op::READ => (
+            OPC_READ,
+            prp,
+            slot.lba as u32,
+            (slot.lba >> 32) as u32,
+            v1_rw_cdw12(slot.nblocks, false),
+        ),
+        blk::op::WRITE => (
+            OPC_WRITE,
+            prp,
+            slot.lba as u32,
+            (slot.lba >> 32) as u32,
+            v1_rw_cdw12(slot.nblocks, slot.flags & blk::F_FUA != 0),
+        ),
+        blk::op::DISCARD => (OPC_DSM, prp, 0, DSM_AD, 0),
+        _ => (OPC_FLUSH, 0, 0, 0, 0),
+    };
+    s.v1[idx].state = V1_INFLIGHT;
     v1_submit_sqe(
         s,
         [
@@ -3560,7 +3586,6 @@ unsafe fn v1_start(s: &mut NvmeState, r: &Req) -> Result<usize, i32> {
             0,
         ],
     );
-    Ok(idx)
 }
 
 /// Hand back slot `idx`'s completion and free it. A read's data is copied
@@ -3615,12 +3640,23 @@ unsafe fn v1_exec(s: &mut NvmeState, arg: *mut u8) -> i32 {
         Err(rc) => return rc,
     };
     let start = now_ms(s);
-    while s.v1[idx].state == V1_INFLIGHT {
+    // `EXEC` is the one v1 path that waits, preflush included; `SUBMIT`
+    // never does.
+    while s.v1[idx].state == V1_INFLIGHT || s.v1[idx].state == V1_PARKED {
         v1_harvest(s);
-        if s.v1[idx].state == V1_INFLIGHT && now_ms(s).saturating_sub(start) > IO_READ_BUDGET_MS {
-            // The command is still the controller's: its page stays with
-            // the slot until the CQE lands.
-            s.v1[idx].state = V1_ABANDONED;
+        let st = s.v1[idx].state;
+        if (st == V1_INFLIGHT || st == V1_PARKED)
+            && now_ms(s).saturating_sub(start) > IO_READ_BUDGET_MS
+        {
+            if st == V1_PARKED {
+                // Never issued: nothing of it is the controller's. Its
+                // Flush frees its own slot when its CQE lands.
+                s.v1[idx].state = V1_FREE;
+            } else {
+                // The command is still the controller's: its page stays
+                // with the slot until the CQE lands.
+                s.v1[idx].state = V1_ABANDONED;
+            }
             return E_AGAIN;
         }
     }

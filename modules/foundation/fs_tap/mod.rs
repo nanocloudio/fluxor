@@ -46,6 +46,9 @@ const MAX_PATH_LEN: usize = 96;
 const FS_OPEN: u32 = 0x0900;
 const FS_READ: u32 = 0x0901;
 const FS_CLOSE: u32 = 0x0903;
+/// Decided `FS_OPEN` answers about the path itself.
+const ERR_NOENT: i32 = -2;
+const ERR_NOTDIR: i32 = -20;
 
 #[repr(C)]
 struct FsTapState {
@@ -65,6 +68,9 @@ struct FsTapState {
     /// Length of `path` in bytes.
     path_len: u8,
     _pad0: [u8; 3],
+    /// The last `FS_OPEN` failure reported (0 = none), so a failure that
+    /// repeats is logged once rather than every step.
+    open_rc: i32,
     /// Absolute path passed to FS_OPEN at first step.
     path: [u8; MAX_PATH_LEN],
 
@@ -92,6 +98,15 @@ mod params_def {
                 s.have_path = 1;
             };
     }
+}
+
+/// Log `prefix` followed by `-rc` in decimal.
+unsafe fn report_errno(sys: &SyscallTable, prefix: &[u8], rc: i32) {
+    let mut out = [0u8; 48];
+    let n = prefix.len().min(out.len() - 11);
+    core::ptr::copy_nonoverlapping(prefix.as_ptr(), out.as_mut_ptr(), n);
+    let m = fmt_u32_raw(out.as_mut_ptr().add(n), rc.unsigned_abs());
+    dev_log(sys, 3, out.as_ptr(), n + m);
 }
 
 unsafe fn flush_line(s: &mut FsTapState) {
@@ -184,6 +199,8 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
             b"[fs_tap] drained"
         } else if s.have_path == 0 {
             b"[fs_tap] no path configured"
+        } else if s.fs_fd < 0 && s.open_rc != 0 {
+            b"[fs_tap] open refused; retrying"
         } else if s.fs_fd < 0 {
             b"[fs_tap] waiting on FS provider"
         } else {
@@ -196,17 +213,34 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
         return 0;
     }
 
-    // First step (or after a transient FS_OPEN failure): try to open
-    // the configured path. Failure is non-fatal — we'll retry on the
-    // next tick (the FS provider may not be ready yet).
+    // First step (or until the open is decided): try to open the
+    // configured path.
+    //   - `EAGAIN` is the contract's "not yet" (mount not up, directory
+    //     sectors being fetched): asked again next step, silently.
+    //   - `ENOENT` / `ENOTDIR` / `EINVAL` are decided answers about the
+    //     path: reported once, and the tap stops — there is nothing to
+    //     read and asking again cannot change that without a writer.
+    //   - anything else (no provider registered yet, `EIO`, …) is
+    //     reported once per distinct errno and asked again next step.
     if s.fs_fd < 0 {
         let mut path = [0u8; MAX_PATH_LEN];
         let n = s.path_len as usize;
         path[..n].copy_from_slice(&s.path[..n]);
         let fd = (sys.provider_call)(-1, FS_OPEN, path.as_mut_ptr(), n);
-        if fd < 0 {
+        if fd == E_AGAIN {
             return 0;
         }
+        if fd < 0 {
+            if fd != s.open_rc {
+                s.open_rc = fd;
+                report_errno(sys, b"[fs_tap] open failed errno=", fd);
+            }
+            if fd == ERR_NOENT || fd == ERR_NOTDIR || fd == E_INVAL {
+                s.done = 1;
+            }
+            return 0;
+        }
+        s.open_rc = 0;
         s.fs_fd = fd;
     }
 
@@ -230,7 +264,11 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
         (sys.provider_call)(s.fs_fd, FS_CLOSE, core::ptr::null_mut(), 0);
         s.fs_fd = -1;
         s.done = 1;
-        dev_log(sys, 3, b"[fs_tap] eof\0".as_ptr(), 12);
+        if n == 0 {
+            dev_log(sys, 3, b"[fs_tap] eof\0".as_ptr(), 12);
+        } else {
+            report_errno(sys, b"[fs_tap] read failed errno=", n);
+        }
         return 0;
     }
 

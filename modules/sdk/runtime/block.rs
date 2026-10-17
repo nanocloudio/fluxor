@@ -2,11 +2,21 @@
 // storage.block client
 // ============================================================================
 //
-// The consumer half of `abi::contracts::storage::block`: synchronous
-// requests through `EXEC`, pipelined writes through `SUBMIT`/`REAP`, and
-// durability fences built from them. A consumer that keeps requests of every
-// op in flight under its own tags (a device frontend) uses `submit` /
-// `reap_one` instead of the write pipeline.
+// The consumer half of `abi::contracts::storage::block`. Two families:
+//
+// - Non-blocking, for anything that runs inside a step: tagged reads
+//   (`submit_read` / `take_read`), tracked writes and discards
+//   (`submit_write` / `submit_discard` / `write_state`), and durability
+//   fences (`flush_submit` / `flush_poll`). None of them waits on the
+//   device: a call submits, reaps what has finished, and returns.
+// - Blocking `EXEC` helpers (`read`, `write`, `exec`, `flush`), for a
+//   consumer that runs outside any step's deadline. `EXEC` may wait on the
+//   device (see the contract), so a provider answering inside a caller's
+//   step never uses them.
+//
+// A consumer that keeps requests of every op in flight under its own tags (a
+// device frontend) uses `submit` / `reap_one` instead; the two styles do not
+// share one client.
 //
 // A fence names every write submitted before it opened. It is durable once
 // each of those writes has completed without error and, on a source with a
@@ -14,16 +24,29 @@
 // completed. Completions arrive in any order, so the client tracks the
 // individual writes in flight rather than a count: a later write finishing
 // first proves nothing about an earlier one.
+//
+// The non-blocking family needs a source that queues (`F_ASYNC`); against
+// one that does not, every call of it answers `ENOSYS`. It never falls back
+// to `EXEC`, which may wait. Every source in this tree that can sit under a
+// provider answering inside a step reports `F_ASYNC`: nvme, `file_block`,
+// `crypt_block` and `sd`.
 
-/// Writes one client keeps in flight at most.
+/// Writes one client keeps in flight at most, and reads likewise.
 pub const BLK_CLIENT_SLOTS: usize = 32;
 
 /// Tag bit marking a completion as the client's own `FLUSH`. The rest of
 /// the tag is the write sequence the flush covers.
 const BLK_FLUSH_TAG: u64 = 1 << 63;
 
-/// Rounds `flush_sync` spends reaping before reporting `EAGAIN`.
-const BLK_DRAIN_ROUNDS: u32 = 1 << 20;
+/// Tag bit marking a completion as a caller-tagged read.
+const BLK_READ_TAG: u64 = 1 << 62;
+
+/// Largest tag a caller may give `submit_read`.
+pub const BLK_READ_TAG_MAX: u64 = BLK_READ_TAG - 1;
+
+/// Failed write sequences remembered exactly. Past this many, every write
+/// at or after the first failure reads as failed.
+const BLK_FAILED_SLOTS: usize = 4;
 
 /// State for one block source, zero-initialisable in a module's state.
 #[repr(C)]
@@ -46,6 +69,17 @@ pub struct BlockClient {
     outstanding: [u64; BLK_CLIENT_SLOTS],
     /// Lowest sequence that completed with an error; 0 = none.
     first_fail: u64,
+    /// Failed sequences, exactly, while they fit.
+    failed: [u64; BLK_FAILED_SLOTS],
+    /// More writes failed than `failed` holds.
+    failed_overflow: u8,
+    _pad1: [u8; 1],
+    /// Caller-tagged reads submitted and not yet reaped.
+    reads_inflight: u16,
+    /// Reaped read completions not yet taken: `done_len` entries from
+    /// `done_head`, ring of `BLK_CLIENT_SLOTS`.
+    done_head: u16,
+    done_len: u16,
     /// Sequence a `FLUSH` in flight covers; 0 = none in flight.
     flush_inflight: u64,
     /// Highest sequence a completed `FLUSH` proved durable.
@@ -53,6 +87,8 @@ pub struct BlockClient {
     /// A `FLUSH` failed: no fence may report durable again.
     flush_err: i32,
     _pad2: [u8; 4],
+    done_tag: [u64; BLK_CLIENT_SLOTS],
+    done_status: [i32; BLK_CLIENT_SLOTS],
 }
 
 impl BlockClient {
@@ -91,6 +127,12 @@ impl BlockClient {
     /// The source's capability flags, once `caps` has answered.
     pub fn flags(&self) -> u32 {
         self.flags.get()
+    }
+
+    /// Whether the source queues requests (`F_ASYNC`), once `caps` has
+    /// answered. Without it the non-blocking calls answer `ENOSYS`.
+    pub fn is_async(&self) -> bool {
+        self.has(abi::contracts::storage::block::caps::F_ASYNC)
     }
 
     /// Ask the source for its capabilities once. Returns 0, `EAGAIN` while
@@ -137,8 +179,8 @@ impl BlockClient {
     ///
     /// The client does not track caller-tagged requests: a consumer that
     /// submits them collects its completions with [`BlockClient::reap_one`].
-    /// [`BlockClient::reap`] would take them and discard every tag it does
-    /// not know, so the two styles do not share one client.
+    /// [`BlockClient::reap`] would take them and drop every tag it does not
+    /// know, so the two styles do not share one client.
     ///
     /// # Safety
     /// `sys` must be the syscall table this module was started with.
@@ -194,7 +236,8 @@ impl BlockClient {
         }
     }
 
-    /// Run one request to completion. Returns its status.
+    /// Run one request to completion. Returns its status. May wait on the
+    /// device: not for a provider answering inside a caller's step.
     ///
     /// # Safety
     /// `sys` must be the syscall table this module was started with.
@@ -243,8 +286,8 @@ impl BlockClient {
         }
     }
 
-    /// Read `nblocks` blocks at `lba` into `buf`, which holds exactly
-    /// `nblocks * lbs` bytes.
+    /// Read `nblocks` blocks at `lba` into `buf` through `EXEC`, which may
+    /// wait on the device.
     ///
     /// # Safety
     /// `sys` must be the syscall table this module was started with.
@@ -262,8 +305,9 @@ impl BlockClient {
         )
     }
 
-    /// Write `nblocks` blocks at `lba` from `buf` and wait for completion.
-    /// `fua` makes the write durable before it completes.
+    /// Write `nblocks` blocks at `lba` from `buf` through `EXEC`, which may
+    /// wait on the device. `fua` makes the write durable before it
+    /// completes.
     ///
     /// # Safety
     /// `sys` must be the syscall table this module was started with.
@@ -289,8 +333,11 @@ impl BlockClient {
         )
     }
 
-    /// Make every write submitted so far durable: wait for the pipelined
-    /// ones, then flush the volatile cache if the source has one.
+    /// Flush the volatile cache through `EXEC`, which may wait on the
+    /// device. Returns `EAGAIN` without flushing while a tracked write is
+    /// still in flight: this reaps once and never spins on the device. For
+    /// a consumer outside any step's deadline; inside one, use
+    /// [`BlockClient::flush_submit`] / [`BlockClient::flush_poll`].
     ///
     /// # Safety
     /// `sys` must be the syscall table this module was started with.
@@ -300,13 +347,9 @@ impl BlockClient {
         if rc != 0 {
             return rc;
         }
-        let mut rounds = 0u32;
-        while self.in_flight() != 0 {
-            self.reap(sys);
-            rounds += 1;
-            if rounds >= BLK_DRAIN_ROUNDS {
-                return E_AGAIN;
-            }
+        self.reap(sys);
+        if self.writes_in_flight() != 0 {
+            return E_AGAIN;
         }
         if self.first_fail != 0 {
             return E_IO;
@@ -321,21 +364,62 @@ impl BlockClient {
         rc
     }
 
-    fn in_flight(&self) -> usize {
-        self.outstanding.iter().filter(|&&s| s != 0).count()
+    fn writes_in_flight(&self) -> usize {
+        let mut n = 0usize;
+        let mut i = 0usize;
+        while i < BLK_CLIENT_SLOTS {
+            if self.outstanding[i] != 0 {
+                n += 1;
+            }
+            i += 1;
+        }
+        n
     }
 
-    /// Queue a write of `nblocks` blocks at `lba` without waiting. The
-    /// source copies `buf` before returning. Returns 0, or `EAGAIN` when
-    /// nothing more can be in flight.
-    ///
-    /// # Safety
-    /// `sys` must be the syscall table this module was started with.
-    /// `buf` must be readable for `nblocks` logical blocks for the call; the
-    /// source copies it before returning.
-    pub unsafe fn submit_write(
+    /// Requests of this client the source holds right now.
+    pub fn in_flight(&self) -> usize {
+        self.writes_in_flight()
+            + usize::from(self.reads_inflight)
+            + usize::from(self.flush_inflight != 0)
+    }
+
+    /// Whether another request fits the source's queue now.
+    fn queue_room(&self) -> bool {
+        let depth = usize::from(self.queue_depth.get().max(1));
+        self.in_flight() < depth
+    }
+
+    fn free_write_slot(&self) -> Option<usize> {
+        let mut i = 0usize;
+        while i < BLK_CLIENT_SLOTS {
+            if self.outstanding[i] == 0 {
+                return Some(i);
+            }
+            i += 1;
+        }
+        None
+    }
+
+    fn note_write_failure(&mut self, seq: u64) {
+        if self.first_fail == 0 || seq < self.first_fail {
+            self.first_fail = seq;
+        }
+        let mut i = 0usize;
+        while i < BLK_FAILED_SLOTS {
+            if self.failed[i] == 0 {
+                self.failed[i] = seq;
+                return;
+            }
+            i += 1;
+        }
+        self.failed_overflow = 1;
+    }
+
+    /// Queue a tracked write (`op::WRITE`) or discard (`op::DISCARD`).
+    unsafe fn submit_tracked(
         &mut self,
         sys: &SyscallTable,
+        op: u8,
         lba: u64,
         nblocks: u32,
         buf: *const u8,
@@ -345,20 +429,24 @@ impl BlockClient {
         if rc != 0 {
             return rc;
         }
-        if !self.has(blk::caps::F_ASYNC) || !self.has(blk::caps::F_WRITE_COPIES) {
+        let len = if op == blk::op::WRITE {
+            nblocks.saturating_mul(self.lbs.get())
+        } else {
+            0
+        };
+        let bufp = if op == blk::op::WRITE { buf as u64 } else { 0 };
+        if !self.has(blk::caps::F_ASYNC) {
             return E_NOSYS;
         }
         self.reap(sys);
-        let limit = (self.queue_depth.get() as usize).min(BLK_CLIENT_SLOTS);
-        if self.in_flight() >= limit {
+        if !self.queue_room() {
             return E_AGAIN;
         }
-        let Some(slot) = self.outstanding.iter().position(|&s| s == 0) else {
+        let Some(slot) = self.free_write_slot() else {
             return E_AGAIN;
         };
         let seq = self.next_seq + 1;
-        let len = nblocks.saturating_mul(self.lbs.get());
-        let r = Self::data_req(blk::op::WRITE, 0, lba, nblocks, buf as u64, len, seq);
+        let r = Self::data_req(op, 0, lba, nblocks, bufp, len, seq);
         let mut rb = [0u8; blk::req::LEN];
         r.encode(&mut rb);
         let rc = dev_channel_ioctl(
@@ -375,13 +463,192 @@ impl BlockClient {
         rc
     }
 
-    /// Open a fence over every write submitted so far.
+    /// Queue a write of `nblocks` blocks at `lba` without waiting. Returns
+    /// 0, or `EAGAIN` when nothing more can be in flight; its sequence is
+    /// [`BlockClient::last_seq`] once it returns 0.
+    ///
+    /// # Safety
+    /// `sys` must be the syscall table this module was started with. `buf`
+    /// must be readable for `nblocks` logical blocks, and stay valid and
+    /// unchanged until [`BlockClient::write_state`] stops reporting the write
+    /// in flight — unless the source reports `F_WRITE_COPIES`, in which case
+    /// it is free when this returns.
+    pub unsafe fn submit_write(
+        &mut self,
+        sys: &SyscallTable,
+        lba: u64,
+        nblocks: u32,
+        buf: *const u8,
+    ) -> i32 {
+        self.submit_tracked(
+            sys,
+            abi::contracts::storage::block::op::WRITE,
+            lba,
+            nblocks,
+            buf,
+        )
+    }
+
+    /// Queue a discard of `nblocks` blocks at `lba`, tracked and fenced like
+    /// a write.
+    ///
+    /// # Safety
+    /// `sys` must be the syscall table this module was started with.
+    pub unsafe fn submit_discard(&mut self, sys: &SyscallTable, lba: u64, nblocks: u32) -> i32 {
+        self.submit_tracked(
+            sys,
+            abi::contracts::storage::block::op::DISCARD,
+            lba,
+            nblocks,
+            core::ptr::null(),
+        )
+    }
+
+    /// Sequence of the most recent tracked write or discard.
+    pub fn last_seq(&self) -> u64 {
+        self.next_seq
+    }
+
+    /// Where tracked write `seq` stands: 1 while in flight, 0 once it
+    /// completed, `EIO` when it failed. Reflects completions reaped so far.
+    pub fn write_state(&self, seq: u64) -> i32 {
+        if seq == 0 {
+            return 0;
+        }
+        let mut i = 0usize;
+        while i < BLK_CLIENT_SLOTS {
+            if self.outstanding[i] == seq {
+                return 1;
+            }
+            i += 1;
+        }
+        let mut k = 0usize;
+        while k < BLK_FAILED_SLOTS {
+            if self.failed[k] == seq {
+                return E_IO;
+            }
+            k += 1;
+        }
+        if self.failed_overflow != 0 && self.first_fail != 0 && seq >= self.first_fail {
+            return E_IO;
+        }
+        0
+    }
+
+    /// Queue a read of `nblocks` blocks at `lba` into `buf` under `tag`
+    /// (at most [`BLK_READ_TAG_MAX`]). Returns 0 when queued, `EAGAIN` when
+    /// nothing more can be in flight, or the source's refusal. Its
+    /// completion comes back through [`BlockClient::take_read`].
+    ///
+    /// # Safety
+    /// `sys` must be the syscall table this module was started with. `buf`
+    /// must be writable for `nblocks` logical blocks and stay valid,
+    /// unmoved and unread by anyone else until `take_read` hands back this
+    /// tag: the source writes it until then.
+    pub unsafe fn submit_read(
+        &mut self,
+        sys: &SyscallTable,
+        lba: u64,
+        nblocks: u32,
+        buf: *mut u8,
+        tag: u64,
+    ) -> i32 {
+        use abi::contracts::storage::block as blk;
+        let rc = self.caps(sys);
+        if rc != 0 {
+            return rc;
+        }
+        if tag > BLK_READ_TAG_MAX {
+            return E_INVAL;
+        }
+        // Every read submitted ends up in the ring, so admitting it only
+        // while the ring has room for it means the ring never overflows.
+        if usize::from(self.reads_inflight) + usize::from(self.done_len) >= BLK_CLIENT_SLOTS {
+            return E_AGAIN;
+        }
+        let len = nblocks.saturating_mul(self.lbs.get());
+        if !self.has(blk::caps::F_ASYNC) {
+            return E_NOSYS;
+        }
+        self.reap(sys);
+        if !self.queue_room() {
+            return E_AGAIN;
+        }
+        let r = Self::data_req(
+            blk::op::READ,
+            0,
+            lba,
+            nblocks,
+            buf as u64,
+            len,
+            tag | BLK_READ_TAG,
+        );
+        let mut rb = [0u8; blk::req::LEN];
+        r.encode(&mut rb);
+        let rc = dev_channel_ioctl(
+            sys,
+            self.chan,
+            blk::ioctl::SUBMIT,
+            rb.as_mut_ptr(),
+            rb.len(),
+        );
+        if rc == 0 {
+            self.reads_inflight += 1;
+        }
+        rc
+    }
+
+    fn push_done(&mut self, tag: u64, status: i32) {
+        if usize::from(self.done_len) >= BLK_CLIENT_SLOTS {
+            return;
+        }
+        let at = (usize::from(self.done_head) + usize::from(self.done_len)) % BLK_CLIENT_SLOTS;
+        self.done_tag[at] = tag;
+        self.done_status[at] = status;
+        self.done_len += 1;
+    }
+
+    /// Take one finished read: `(tag, status)`. Call [`BlockClient::reap`]
+    /// first to collect what the source has finished.
+    pub fn take_read(&mut self) -> Option<(u64, i32)> {
+        if self.done_len == 0 {
+            return None;
+        }
+        let at = usize::from(self.done_head) % BLK_CLIENT_SLOTS;
+        let out = (self.done_tag[at], self.done_status[at]);
+        self.done_head = ((at + 1) % BLK_CLIENT_SLOTS) as u16;
+        self.done_len -= 1;
+        Some(out)
+    }
+
+    /// Reads submitted whose completion has not been taken yet.
+    pub fn reads_pending(&self) -> usize {
+        usize::from(self.reads_inflight) + usize::from(self.done_len)
+    }
+
+    /// Open a fence over every write submitted so far. Never touches the
+    /// device.
     pub fn fence_open(&self) -> u64 {
         self.next_seq
     }
 
+    /// Non-blocking flush: open a fence over every tracked write submitted
+    /// so far. Its ticket is polled with [`BlockClient::flush_poll`].
+    pub fn flush_submit(&self) -> u64 {
+        self.fence_open()
+    }
+
+    /// Poll a fence from [`BlockClient::flush_submit`]. Never waits.
+    ///
+    /// # Safety
+    /// `sys` must be the syscall table this module was started with.
+    pub unsafe fn flush_poll(&mut self, sys: &SyscallTable, ticket: u64) -> i32 {
+        self.fence_poll(sys, ticket)
+    }
+
     /// Poll a fence. Returns 0 when durable, 1 while pending, or a negative
-    /// errno when it never can be.
+    /// errno when it never can be. Never waits on the device: it reaps,
+    /// and submits a `FLUSH` once every covered write has been reaped.
     ///
     /// # Safety
     /// `sys` must be the syscall table this module was started with.
@@ -391,8 +658,13 @@ impl BlockClient {
         if self.first_fail != 0 && self.first_fail <= ticket {
             return E_IO;
         }
-        if self.outstanding.iter().any(|&s| s != 0 && s <= ticket) {
-            return 1;
+        let mut i = 0usize;
+        while i < BLK_CLIENT_SLOTS {
+            let s = self.outstanding[i];
+            if s != 0 && s <= ticket {
+                return 1;
+            }
+            i += 1;
         }
         if !self.has(blk::caps::F_FLUSH) {
             return 0;
@@ -408,11 +680,23 @@ impl BlockClient {
         }
         // Every write up to the lowest one still in flight has been reaped,
         // so a flush submitted now covers them.
-        let covers = match self.outstanding.iter().filter(|&&s| s != 0).min() {
-            Some(&low) => low - 1,
-            None => self.next_seq,
-        };
+        let mut low = 0u64;
+        let mut k = 0usize;
+        while k < BLK_CLIENT_SLOTS {
+            let s = self.outstanding[k];
+            if s != 0 && (low == 0 || s < low) {
+                low = s;
+            }
+            k += 1;
+        }
+        let covers = if low == 0 { self.next_seq } else { low - 1 };
         let r = Self::data_req(blk::op::FLUSH, 0, 0, 0, 0, 0, BLK_FLUSH_TAG | covers);
+        if !self.has(blk::caps::F_ASYNC) {
+            return E_NOSYS;
+        }
+        if !self.queue_room() {
+            return 1;
+        }
         let mut rb = [0u8; blk::req::LEN];
         r.encode(&mut rb);
         let rc = dev_channel_ioctl(
@@ -431,12 +715,17 @@ impl BlockClient {
         1
     }
 
-    /// Collect every finished completion.
+    /// Collect every finished completion: tracked writes and the client's
+    /// flushes are settled here, and caller-tagged reads are kept for
+    /// [`BlockClient::take_read`].
     ///
     /// # Safety
     /// `sys` must be the syscall table this module was started with.
     pub unsafe fn reap(&mut self, sys: &SyscallTable) {
         use abi::contracts::storage::block as blk;
+        if self.lbs.get() == 0 || !self.has(blk::caps::F_ASYNC) {
+            return;
+        }
         loop {
             let mut cb = [0u8; blk::cpl::LEN];
             let rc = dev_channel_ioctl(sys, self.chan, blk::ioctl::REAP, cb.as_mut_ptr(), cb.len());
@@ -458,11 +747,23 @@ impl BlockClient {
                 self.flush_inflight = 0;
                 continue;
             }
-            if let Some(slot) = self.outstanding.iter().position(|&s| s == c.tag) {
-                self.outstanding[slot] = 0;
-                if c.status != 0 && (self.first_fail == 0 || c.tag < self.first_fail) {
-                    self.first_fail = c.tag;
+            if c.tag & BLK_READ_TAG != 0 {
+                if self.reads_inflight > 0 {
+                    self.reads_inflight -= 1;
+                    self.push_done(c.tag & BLK_READ_TAG_MAX, c.status);
                 }
+                continue;
+            }
+            let mut i = 0usize;
+            while i < BLK_CLIENT_SLOTS {
+                if self.outstanding[i] == c.tag && c.tag != 0 {
+                    self.outstanding[i] = 0;
+                    if c.status != 0 {
+                        self.note_write_failure(c.tag);
+                    }
+                    break;
+                }
+                i += 1;
             }
         }
     }

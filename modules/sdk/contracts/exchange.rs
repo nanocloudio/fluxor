@@ -786,19 +786,21 @@ impl<'a> Iterator for HeaderLines<'a> {
                 .windows(2)
                 .position(|w| w == b"\r\n")
                 .unwrap_or(self.rest.len());
-            let line = &self.rest[..end];
+            // Checked slicing throughout: a PIC module links no panic path.
+            let line = self.rest.get(..end).unwrap_or(self.rest);
             self.rest = self.rest.get(end + 2..).unwrap_or(&[]);
             let Some(colon) = line.iter().position(|&c| c == b':') else {
                 continue;
             };
-            let mut v = &line[colon + 1..];
+            let name = line.get(..colon).unwrap_or(&[]);
+            let mut v = line.get(colon + 1..).unwrap_or(&[]);
             while let [b' ' | b'\t', tail @ ..] = v {
                 v = tail;
             }
             while let [head @ .., b' ' | b'\t'] = v {
                 v = head;
             }
-            return Some((&line[..colon], v));
+            return Some((name, v));
         }
         None
     }

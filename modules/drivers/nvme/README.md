@@ -73,11 +73,17 @@ stay claimed until the completion lands.
 | Barrier Flush | `0x0202` | a call waits out an earlier Flush, then submits its own |
 | Bulk read | `0x0300 + slot` | a call waits for every slot before reusing any |
 | Bulk write | `0x0400 + slot` | ring slot, freed in order |
-| v1 request | `0x0500 + slot` | slot freed when its completion is reaped (or abandoned and then landed) |
-| v1 preflush Flush | `0x0508 + slot` (4 slots) | rotating allocation; a slot is free only after its completion; `EAGAIN` when all are outstanding |
+| v1 request | `0x0500 + slot` (16 slots) | slot freed when its completion is reaped (or abandoned and then landed) |
+| v1 preflush Flush | `0x0510 + slot` (4 slots) | rotating allocation; a slot is free only after its completion; `EAGAIN` when all are outstanding |
 
-A preflush that times out is retried with a new Flush under another CID.
-It does not attach to the first one, which covers only the writes completed
+`SUBMIT` never waits on a preflush. It puts the Flush on the queue under a
+preflush CID of its own, parks the request in its slot, and returns; the CQE
+loop that retires the Flush issues the request, or completes it `EIO` when
+the Flush failed. Only `EXEC` waits, for the Flush and the request together,
+within its budget; an `EXEC` that gives up on a request still parked frees
+the slot (nothing of it reached the controller) and leaves the Flush to free
+its own slot when it lands. A retry takes a new Flush under another CID: it
+does not attach to the first one, which covers only the writes completed
 before it was submitted. A completion for a CID with no outstanding command
 is counted and dropped; it never completes a request.
 

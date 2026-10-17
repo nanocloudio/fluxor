@@ -143,9 +143,9 @@ unsafe fn backend_open_handle(s: &mut BankState, path: *mut u8, len: usize) -> i
 /// Sub-namespaces are skipped. Called once during `BankPhase::Init`;
 /// failures (provider not ready, prefix missing) just leave
 /// `path_count == 0`.
-unsafe fn backend_scan(s: &mut BankState) {
+unsafe fn backend_scan(s: &mut BankState) -> bool {
     if s.dir_path_len == 0 {
-        return;
+        return true;
     }
     let dlen = s.dir_path_len as usize;
     // Snapshot dir_path into a local so append_path's mutable borrow
@@ -164,8 +164,10 @@ unsafe fn backend_scan(s: &mut BankState) {
     if handle < 0 {
         if handle != -11 {
             log_info(s, b"[object_bank] LOOKUP fail");
+            return true;
         }
-        return;
+        // Not ready yet: asked again on the next step.
+        return false;
     }
     // The shape of the names LIST returns: a directory-shaped provider names
     // the prefix's children, joined to it to make a key; a key-shaped one
@@ -251,6 +253,7 @@ unsafe fn backend_scan(s: &mut BankState) {
     (s.sys().provider_close)(handle);
 
     finish_scan(s);
+    true
 }
 
 /// Stream one chunk via OBJ_RANGE_GET at the current cursor into s.buf.

@@ -4,12 +4,20 @@
 //! is a loop device over a FAT32 file on bare metal and a disk image on a
 //! Linux host. Blocks map to byte offsets `lba * block_size`.
 //!
-//! Every request runs inside the call that carries it. A `SUBMIT` executes at
-//! once and queues its completion for `REAP`, so write data is consumed
-//! before `SUBMIT` returns. Writes reach the file but not necessarily the
-//! medium under it: they complete `Volatile`, and `FLUSH` (or `FUA`) runs the
-//! file's `FSYNC`. `DISCARD` writes zeros, so a discarded block reads back as
-//! zeros.
+//! The `fs` contract never waits on the device inside a call, so a request
+//! is a resumable job, not a loop. `SUBMIT` queues it and `REAP` hands back
+//! its completion; the queue runs strictly in submission order, advanced
+//! inside `SUBMIT`/`REAP` and by the module's own step, and a job parked on
+//! `EAGAIN` (nothing moved) or `EINPROGRESS` (a taken `FSYNC`, re-asked
+//! byte-identically) resumes exactly where it stopped: short counts advance
+//! by what moved. A queued write's buffer is therefore read when its turn
+//! comes, so it stays lent until reaped (no `F_WRITE_COPIES`). `EXEC` runs
+//! the same job inside the call and answers `EAGAIN` while it is undecided;
+//! re-asking the identical request resumes it.
+//!
+//! Writes reach the file but not necessarily the medium under it: they
+//! complete `Volatile`, and `FLUSH` (or `FUA`) fences them with the file's
+//! `FSYNC`. `DISCARD` writes zeros, so a discarded block reads back as zeros.
 //!
 //! Parameters:
 //! - `path`: the image file, created when absent.
@@ -46,8 +54,10 @@ use abi::contracts::storage::block::{self as blk, Caps, Cpl, Req};
 use abi::contracts::storage::fs;
 use abi::fence::Fence;
 
-/// Requests whose completions wait for `REAP`.
+/// Requests in flight: queued, running, or done and waiting for `REAP`.
 pub const QUEUE_DEPTH: usize = 8;
+/// `fs` calls one pump may issue. Each is decided now or parks the job.
+const PUMP_CALLS: u32 = 32;
 /// Blocks one request may carry.
 pub const MAX_BLOCKS: u32 = 64;
 /// Longest image path.
@@ -79,13 +89,28 @@ struct FileBlockState {
     /// The image is open and sized; `caps_of` answers.
     ready: u8,
     _pad: u8,
-    /// Completions waiting for `REAP`, oldest at `head`.
+    /// The request ring, oldest at `head`: `count` slots in use, of which
+    /// the first `ndone` are finished and wait for `REAP`; the slot after
+    /// them is the one `job` is running.
     head: u8,
     count: u8,
+    ndone: u8,
+    /// Phase of the open machine (`OPEN_*`).
+    open_phase: u8,
+    /// `1` while an `EXEC` job is parked in `job`, undecided; `exec_req` is
+    /// the request it runs, so only the identical request resumes it.
+    exec_parked: u8,
+    /// `1` when `fd_pos` is the handle's file offset.
+    fd_pos_valid: u8,
     _pad2: [u8; 2],
+    /// The handle's file offset, as this module last set or advanced it.
+    fd_pos: u64,
+    job: Job,
+    exec_req: Req,
     path: [u8; PATH_CAP],
     /// Selector of the fs provider the image lives on.
     volume: [u8; VOLUME_CAP],
+    reqs: [Req; QUEUE_DEPTH],
     done: [Cpl; QUEUE_DEPTH],
     /// One block of zeros, for extending the image and for `DISCARD`.
     zeros: [u8; 512],
@@ -192,43 +217,99 @@ fn caps_of(s: &FileBlockState) -> Option<Caps> {
             | blk::caps::F_FLUSH
             | blk::caps::F_DISCARD
             | blk::caps::F_DISCARD_ZEROES
-            | blk::caps::F_ASYNC
-            | blk::caps::F_WRITE_COPIES,
+            | blk::caps::F_ASYNC,
         device_id: s.device_id,
     })
 }
 
-unsafe fn seek(s: &FileBlockState, off: u64) -> i32 {
-    let mut arg = off.to_le_bytes();
-    let rc = s.fs(s.fd, fs::SEEK, arg.as_mut_ptr(), 8);
-    if rc < 0 {
-        rc
-    } else {
-        0
+/// Progress of the one request being run.
+#[derive(Clone, Copy)]
+struct Job {
+    /// `JOB_*`.
+    phase: u8,
+    _pad: [u8; 7],
+    /// Bytes moved so far.
+    done: u64,
+}
+
+impl Job {
+    const fn new() -> Job {
+        Job {
+            phase: JOB_PREFLUSH,
+            _pad: [0; 7],
+            done: 0,
+        }
     }
 }
 
-/// Read or write exactly `len` bytes at `off`, looping over short transfers.
-unsafe fn transfer(s: &FileBlockState, write: bool, off: u64, buf: *mut u8, len: usize) -> i32 {
-    let rc = seek(s, off);
+/// `F_PREFLUSH`'s fence, then the transfer, then the `FLUSH`/`FUA` fence.
+const JOB_PREFLUSH: u8 = 0;
+const JOB_XFER: u8 = 1;
+const JOB_FENCE: u8 = 2;
+
+/// The open machine (`open_phase`): open, size, extend, fence the extension.
+const OPEN_OPEN: u8 = 0;
+const OPEN_STAT: u8 = 1;
+const OPEN_EXTEND: u8 = 2;
+const OPEN_FSYNC: u8 = 3;
+
+/// Whether an `fs` answer is "not decided yet": `EAGAIN` (nothing moved,
+/// ask again) or `EINPROGRESS` (taken; the identical re-ask collects it).
+fn undecided(rc: i32) -> bool {
+    rc == E_AGAIN || rc == E_INPROGRESS
+}
+
+/// Make the handle's offset `off`. `SEEK` answers or `EAGAIN`; the offset
+/// is remembered so an uninterrupted run of transfers seeks once.
+unsafe fn position(s: &mut FileBlockState, off: u64) -> i32 {
+    if s.fd_pos_valid != 0 && s.fd_pos == off {
+        return 0;
+    }
+    let mut arg = off.to_le_bytes();
+    let rc = s.fs(s.fd, fs::SEEK, arg.as_mut_ptr(), 8);
+    if rc < 0 {
+        return rc;
+    }
+    s.fd_pos = off;
+    s.fd_pos_valid = 1;
+    0
+}
+
+/// One `READ`/`WRITE` of at most `len` bytes at `off`. Answers the count
+/// moved (never 0 for `len > 0`: an empty transfer is `E_IO`), `EAGAIN`, or
+/// a negative errno.
+unsafe fn transfer_once(
+    s: &mut FileBlockState,
+    write: bool,
+    off: u64,
+    buf: *mut u8,
+    len: usize,
+) -> i32 {
+    let rc = position(s, off);
     if rc < 0 {
         return rc;
     }
     let op = if write { fs::WRITE } else { fs::READ };
-    let mut done = 0usize;
-    while done < len {
-        let rc = s.fs(s.fd, op, buf.add(done), len - done);
-        if rc < 0 {
-            return rc;
-        }
-        if rc == 0 {
-            return E_IO;
-        }
-        done += rc as usize;
+    let n = s.fs(s.fd, op, buf, len);
+    if n == E_AGAIN {
+        return n;
     }
-    0
+    if n < 0 {
+        // Whatever the failure did to the offset, it is not known now.
+        s.fd_pos_valid = 0;
+        return n;
+    }
+    if n == 0 || n as usize > len {
+        s.fd_pos_valid = 0;
+        return E_IO;
+    }
+    s.fd_pos = off + n as u64;
+    n
 }
 
+/// The file's byte-durability fence. 0 once durable; `EAGAIN` /
+/// `EINPROGRESS` while undecided — the re-ask (same handle, no argument) is
+/// identical by construction.
 unsafe fn fsync(s: &FileBlockState) -> i32 {
     let rc = s.fs(s.fd, fs::FSYNC, core::ptr::null_mut(), 0);
     if rc < 0 {
@@ -238,49 +319,96 @@ unsafe fn fsync(s: &FileBlockState) -> i32 {
     }
 }
 
-/// Write zeros over `nblocks` blocks from `lba`.
-unsafe fn zero_blocks(s: &mut FileBlockState, lba: u64, nblocks: u32) -> i32 {
-    let chunk = s.zeros.len().min(s.block_size as usize);
-    let z = s.zeros.as_mut_ptr();
-    let mut b = 0u64;
-    let total = u64::from(nblocks) * u64::from(s.block_size);
-    while b < total {
-        let n = (total - b).min(chunk as u64) as usize;
-        let rc = transfer(s, true, lba * u64::from(s.block_size) + b, z, n);
-        if rc < 0 {
-            return rc;
-        }
-        b += n as u64;
+/// Bytes request `r` moves.
+fn req_bytes(s: &FileBlockState, r: &Req) -> u64 {
+    match r.op {
+        blk::op::READ | blk::op::WRITE => u64::from(r.buf_len),
+        blk::op::DISCARD => u64::from(r.nblocks) * u64::from(s.block_size),
+        _ => 0,
     }
-    0
 }
 
-/// Run `r` and build its completion.
-unsafe fn execute(s: &mut FileBlockState, r: &Req) -> Cpl {
-    let mut c = Cpl::bare(r.tag, 0);
-    if r.flags & blk::F_PREFLUSH != 0 {
-        c.status = fsync(s);
-        if c.status < 0 {
-            return c;
+/// Advance `job` running `r` by at most `*calls` `fs` calls. `Some(status)`
+/// once decided; `None` while parked on an undecided call, to be resumed
+/// with the same `r` and `job`.
+unsafe fn job_advance(
+    s: &mut FileBlockState,
+    r: &Req,
+    job: &mut Job,
+    calls: &mut u32,
+) -> Option<i32> {
+    loop {
+        if *calls == 0 {
+            return None;
         }
-    }
-    let off = r.lba * u64::from(s.block_size);
-    let len = r.buf_len as usize;
-    c.status = match r.op {
-        blk::op::READ => transfer(s, false, off, r.buf_ptr as *mut u8, len),
-        blk::op::WRITE => {
-            let rc = transfer(s, true, off, r.buf_ptr as *mut u8, len);
-            if rc == 0 && r.flags & blk::F_FUA != 0 {
-                fsync(s)
-            } else {
-                rc
+        match job.phase {
+            JOB_PREFLUSH => {
+                if r.flags & blk::F_PREFLUSH != 0 {
+                    *calls -= 1;
+                    let rc = fsync(s);
+                    if undecided(rc) {
+                        return None;
+                    }
+                    if rc < 0 {
+                        return Some(rc);
+                    }
+                }
+                if !matches!(
+                    r.op,
+                    blk::op::READ | blk::op::WRITE | blk::op::DISCARD | blk::op::FLUSH
+                ) {
+                    return Some(E_INVAL);
+                }
+                job.phase = JOB_XFER;
+            }
+            JOB_XFER => {
+                let total = req_bytes(s, r);
+                if job.done >= total {
+                    job.phase = JOB_FENCE;
+                    continue;
+                }
+                let off = r.lba * u64::from(s.block_size) + job.done;
+                let left = (total - job.done) as usize;
+                let (write, buf, len) = match r.op {
+                    blk::op::READ => (false, (r.buf_ptr as *mut u8).add(job.done as usize), left),
+                    blk::op::WRITE => (true, (r.buf_ptr as *mut u8).add(job.done as usize), left),
+                    _ => {
+                        let chunk = s.zeros.len().min(s.block_size as usize);
+                        (true, s.zeros.as_mut_ptr(), left.min(chunk))
+                    }
+                };
+                *calls -= 1;
+                let n = transfer_once(s, write, off, buf, len);
+                if n == E_AGAIN {
+                    return None;
+                }
+                if n < 0 {
+                    return Some(n);
+                }
+                // A short count is progress: advance by what moved.
+                job.done += n as u64;
+            }
+            _ => {
+                let fence =
+                    r.op == blk::op::FLUSH || (r.op == blk::op::WRITE && r.flags & blk::F_FUA != 0);
+                if fence {
+                    *calls -= 1;
+                    let rc = fsync(s);
+                    if undecided(rc) {
+                        return None;
+                    }
+                    return Some(rc);
+                }
+                return Some(0);
             }
         }
-        blk::op::DISCARD => zero_blocks(s, r.lba, r.nblocks),
-        blk::op::FLUSH => fsync(s),
-        _ => E_INVAL,
-    };
-    if c.status != 0 {
+    }
+}
+
+/// The completion of `r` decided with `status`.
+fn completion(s: &FileBlockState, r: &Req, status: i32) -> Cpl {
+    let mut c = Cpl::bare(r.tag, status);
+    if status != 0 {
         return c;
     }
     let durable = r.op == blk::op::FLUSH || r.flags & blk::F_FUA != 0;
@@ -297,6 +425,65 @@ unsafe fn execute(s: &mut FileBlockState, r: &Req) -> Cpl {
         }
     }
     c
+}
+
+/// Run the queue in order, as far as the provider decides now. A queued
+/// request takes the job from a parked `EXEC`, which then starts over when
+/// it is asked again.
+unsafe fn pump(s: &mut FileBlockState) {
+    if s.ready == 0 {
+        return;
+    }
+    let mut calls = PUMP_CALLS;
+    while s.ndone < s.count && calls > 0 {
+        if s.exec_parked != 0 {
+            s.exec_parked = 0;
+            s.job = Job::new();
+        }
+        let i = (s.head as usize + s.ndone as usize) % QUEUE_DEPTH;
+        let r = s.reqs[i];
+        let mut job = s.job;
+        let out = job_advance(s, &r, &mut job, &mut calls);
+        match out {
+            Some(status) => {
+                s.done[i] = completion(s, &r, status);
+                s.ndone += 1;
+                s.job = Job::new();
+            }
+            None => {
+                s.job = job;
+                return;
+            }
+        }
+    }
+}
+
+/// `EXEC`: run `r` inside the call. Answers its status, or `EAGAIN` while
+/// it is undecided (the job stays parked for the identical re-ask) or while
+/// queued requests hold the job.
+unsafe fn exec(s: &mut FileBlockState, r: &Req, c: &mut Cpl) -> i32 {
+    pump(s);
+    if s.ndone < s.count {
+        return E_AGAIN;
+    }
+    if s.exec_parked == 0 || s.exec_req != *r {
+        s.job = Job::new();
+        s.exec_req = *r;
+    }
+    s.exec_parked = 1;
+    let mut calls = PUMP_CALLS;
+    let mut job = s.job;
+    let out = job_advance(s, r, &mut job, &mut calls);
+    s.job = job;
+    match out {
+        Some(status) => {
+            s.exec_parked = 0;
+            s.job = Job::new();
+            *c = completion(s, r, status);
+            status
+        }
+        None => E_AGAIN,
+    }
 }
 
 unsafe fn admitted(s: &FileBlockState, body: &[u8]) -> Result<Req, i32> {
@@ -328,12 +515,13 @@ unsafe extern "C" fn file_block_ioctl(state: *mut c_void, cmd: u32, arg: *mut u8
                 Ok(r) => r,
                 Err(rc) => return rc,
             };
-            let c = execute(s, &r);
+            let mut c = Cpl::bare(r.tag, E_AGAIN);
+            let rc = exec(s, &r, &mut c);
             c.encode(core::slice::from_raw_parts_mut(
                 arg.add(blk::req::LEN),
                 blk::cpl::LEN,
             ));
-            c.status
+            rc
         }
         blk::ioctl::SUBMIT => {
             let r = match admitted(s, core::slice::from_raw_parts(arg, blk::req::LEN)) {
@@ -343,24 +531,21 @@ unsafe extern "C" fn file_block_ioctl(state: *mut c_void, cmd: u32, arg: *mut u8
             if s.count as usize >= QUEUE_DEPTH {
                 return E_AGAIN;
             }
-            let c = execute(s, &r);
-            if c.status == E_AGAIN {
-                // The provider was busy. Every op is idempotent, so the
-                // caller submits it again rather than reaping a failure.
-                return E_AGAIN;
-            }
             let tail = (s.head as usize + s.count as usize) % QUEUE_DEPTH;
-            s.done[tail] = c;
+            s.reqs[tail] = r;
             s.count += 1;
+            pump(s);
             0
         }
         blk::ioctl::REAP => {
-            if s.count == 0 {
+            pump(s);
+            if s.ndone == 0 {
                 return 0;
             }
             let c = s.done[s.head as usize];
             s.head = ((s.head as usize + 1) % QUEUE_DEPTH) as u8;
             s.count -= 1;
+            s.ndone -= 1;
             c.encode(core::slice::from_raw_parts_mut(arg, blk::cpl::LEN));
             1
         }
@@ -368,9 +553,10 @@ unsafe extern "C" fn file_block_ioctl(state: *mut c_void, cmd: u32, arg: *mut u8
     }
 }
 
-/// Open the image, and extend it to `min_blocks` if it is shorter. `E_AGAIN`
-/// means the provider was busy: the call is repeated, and resumes after an
-/// open that already succeeded.
+/// Open the image, and extend it to `min_blocks` if it is shorter: a step
+/// machine that resumes at the call it stopped on. `E_AGAIN` means not
+/// decided yet (the provider answered `EAGAIN`, or `EINPROGRESS` for a call
+/// it took and that is re-asked identically next step).
 unsafe fn open_image(s: &mut FileBlockState) -> i32 {
     if s.path_len == 0 || s.path_len as usize > PATH_CAP || s.volume_len as usize > VOLUME_CAP {
         return E_INVAL;
@@ -379,34 +565,81 @@ unsafe fn open_image(s: &mut FileBlockState) -> i32 {
     if bs < 512 || !bs.is_power_of_two() {
         return E_INVAL;
     }
-    if s.fd < 0 {
-        let path = s.path.as_mut_ptr();
-        let fd = s.fs(-1, fs::OPEN_CREATE, path, s.path_len as usize);
-        if fd < 0 {
-            return fd;
+    let mut calls = PUMP_CALLS;
+    let mut sized = false;
+    while !sized {
+        if calls == 0 {
+            // The step's share ran out mid-open; the next step resumes it.
+            return E_AGAIN;
         }
-        s.fd = fd;
-    }
-    let mut st = [0u8; 16];
-    let rc = s.fs(s.fd, fs::STAT, st.as_mut_ptr(), 16);
-    if rc < 0 {
-        return rc;
-    }
-    let mut size = u64::from_le_bytes([st[0], st[1], st[2], st[3], st[4], st[5], st[6], st[7]]);
-    let want = s.min_blocks * u64::from(bs);
-    if size < want {
-        // Write the last block; the file system fills the gap.
-        let rc = zero_blocks(s, s.min_blocks - 1, 1);
-        if rc < 0 {
-            return rc;
+        calls -= 1;
+        match s.open_phase {
+            OPEN_OPEN => {
+                let path = s.path.as_mut_ptr();
+                let fd = s.fs(-1, fs::OPEN_CREATE, path, s.path_len as usize);
+                if undecided(fd) {
+                    return E_AGAIN;
+                }
+                if fd < 0 {
+                    return fd;
+                }
+                s.fd = fd;
+                s.fd_pos_valid = 0;
+                s.open_phase = OPEN_STAT;
+            }
+            OPEN_STAT => {
+                let mut st = [0u8; 16];
+                let rc = s.fs(s.fd, fs::STAT, st.as_mut_ptr(), 16);
+                if rc == E_AGAIN {
+                    return E_AGAIN;
+                }
+                if rc < 0 {
+                    return rc;
+                }
+                let size =
+                    u64::from_le_bytes([st[0], st[1], st[2], st[3], st[4], st[5], st[6], st[7]]);
+                let want = s.min_blocks * u64::from(bs);
+                if size < want {
+                    s.job = Job::new();
+                    s.open_phase = OPEN_EXTEND;
+                    continue;
+                }
+                s.block_count = size / u64::from(bs);
+                sized = true;
+            }
+            OPEN_EXTEND => {
+                // Write the last block; the file system fills the gap.
+                let off = (s.min_blocks - 1) * u64::from(bs);
+                if s.job.done >= u64::from(bs) {
+                    s.open_phase = OPEN_FSYNC;
+                    continue;
+                }
+                let left = (u64::from(bs) - s.job.done) as usize;
+                let len = left.min(s.zeros.len());
+                let z = s.zeros.as_mut_ptr();
+                let n = transfer_once(s, true, off + s.job.done, z, len);
+                if n == E_AGAIN {
+                    return E_AGAIN;
+                }
+                if n < 0 {
+                    return n;
+                }
+                s.job.done += n as u64;
+            }
+            _ => {
+                let rc = fsync(s);
+                if undecided(rc) {
+                    return E_AGAIN;
+                }
+                if rc < 0 {
+                    return rc;
+                }
+                s.job = Job::new();
+                s.block_count = s.min_blocks;
+                sized = true;
+            }
         }
-        let rc = fsync(s);
-        if rc < 0 {
-            return rc;
-        }
-        size = want;
     }
-    s.block_count = size / u64::from(bs);
     s.device_id = image_id(s);
     s.ready = 1;
     0
@@ -480,7 +713,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             return -1;
         }
         let s = &mut *(state as *mut FileBlockState);
-        if s.ready != 0 || s.open_err < 0 {
+        if s.ready != 0 {
+            // Queued requests advance between their consumer's calls too.
+            pump(s);
+            return 0;
+        }
+        if s.open_err < 0 {
             return 0;
         }
         match open_image(s) {

@@ -13,6 +13,70 @@
 // STAT's output buffer selects its own shape by width — 8, 16 or 48
 // bytes. See `STAT`.
 //
+// ## No call waits on the device
+//
+// A provider answers inside its caller's `provider_call`, so inside the
+// caller's step. No operation of this contract waits on the device inside
+// a call: a call does only bounded CPU work and answers in one of three
+// ways.
+//
+//   - **A result** — 0, a count, a handle, or a real errno — decided now.
+//   - **`EAGAIN` (-11): not now, ask again.** Nothing was consumed and no
+//     state moved: no cursor, no file offset, no directory change. The
+//     caller may re-ask later with any arguments. Causes include the mount
+//     not being up, a bounded resource being exhausted, the device being
+//     busy, the data not yet being in the provider's cache, or another
+//     operation holding the provider's slot for taken operations.
+//   - **`EINPROGRESS` (-36): taken, not yet decided.** Only for the
+//     multi-step operations listed below, with the wording of
+//     `storage/object.rs`. The provider has started the operation. The
+//     caller re-asks with **byte-identical** (opcode, handle, arg bytes);
+//     the answer to a later ask is the decision. Progress continues in the
+//     provider's own step whether or not the caller re-asks, so an abandoned
+//     operation still completes, in order. An uncollected decision is
+//     dropped once a different operation needs the slot after the first has
+//     finished. A provider that decides inside the call never answers
+//     `EINPROGRESS`. A provider recognises a re-ask by the request's bytes
+//     in full; one whose argument is longer than it can keep whole refuses
+//     it at once (`E2BIG`) rather than risk handing it another request's
+//     decision.
+//
+// Per operation:
+//
+//   - `READ` and `WRITE` (and `WRITE_ASYNC`) answer the number of bytes
+//     moved, which may be short. They answer `EAGAIN` only when zero bytes
+//     moved; once any byte has moved they answer the short count, never
+//     `EAGAIN`. A written prefix belongs to the provider from then on: it
+//     holds it and writes it back in the background. A `READ` whose sectors
+//     are not cached starts fetching them and answers `EAGAIN` (or the short
+//     count of what was already cached). A provider never keeps a pointer
+//     into a caller's buffer past the call.
+//   - `SEEK`, `STAT`, `OPEN`, `OPENDIR`, `READDIR` and `READLINK` answer the
+//     result or `EAGAIN`, with the data they need being fetched meanwhile.
+//     Directory walks keep resumable cursors.
+//   - `FSYNC`, `FSYNC_NAME`, `RENAME`, `MKDIR`, `RMDIR`, `UNLINK`, `LINK`,
+//     `TRUNCATE`, `PREALLOCATE` and `OPEN_CREATE` may answer `EINPROGRESS`
+//     and decide on a later ask. Every durability and ordering guarantee
+//     stated for them below holds **on the final 0 answer**.
+//   - `FSYNC_SUBMIT` / `FSYNC_POLL` keep their pipelined-ticket semantics.
+//     `FSYNC_SUBMIT` does no synchronous device work: it answers `EAGAIN`
+//     when it cannot open a fence without waiting.
+//   - `CLOSE` never waits and always releases the handle (the kernel's
+//     `provider_close` releases it whatever the provider answers). Dirty
+//     data and metadata are written back in the provider's step after the
+//     close. It answers 0 or `EBADF`, and does not report write-back
+//     failures: durability comes only from `FSYNC`, `FSYNC_SUBMIT`/`POLL` or
+//     `FSYNC_NAME`, so a caller that needs it fences before closing.
+//
+// A consumer never treats `EAGAIN` or `EINPROGRESS` as a failure, as the
+// end of the data, or as absence (see `errno_classes`). On `EINPROGRESS`
+// it keeps the exact request and re-asks on a later step; on `EAGAIN` it
+// retries on a later step. A multi-call sequence (write a file, fsync,
+// rename) is a step machine that resumes where it stopped, never restarting
+// from the beginning. `READ`/`WRITE` callers advance by what moved. A
+// blocking-style loop ("call until done" inside one step) is not allowed:
+// it would spin for ever, because the device only progresses between steps.
+//
 // ## Handle identity
 //
 // `OPEN` and `OPENDIR` return a tagged FD: providers encode the
@@ -28,7 +92,7 @@
 // separate because a consumer's recovery depends on both:
 //
 //   - **Byte durability** — the file's contents, plus the size metadata
-//     of its own entry. Fenced by `FSYNC` (blocking) or by
+//     of its own entry. Fenced by `FSYNC` (decided on a re-ask) or by
 //     `FSYNC_SUBMIT`/`FSYNC_POLL` (pipelined). `WRITE` and `WRITE_ASYNC`
 //     are both submission only: bytes are volatile until a fence.
 //   - **Name durability** — the entry in the parent directory that lets
@@ -51,8 +115,8 @@
 //      all-or-nothing (a snapshot, a pointer record, a content-addressed
 //      body).
 //
-// Each achieves `Fence::LocalDurable { device_id }` at its final step,
-// and nothing weaker at the steps before it. `MKDIR` and `UNLINK`
+// Each achieves `Fence::LocalDurable { device_id }` at its final step's
+// final 0 answer, and nothing weaker at the steps before it. `MKDIR` and `UNLINK`
 // likewise publish a name only once `FSYNC_NAME` covers the path.
 //
 // Both `FSYNC_NAME` and `RENAME` are optional capabilities. A consumer
@@ -75,7 +139,15 @@
 // binds: `FSYNC_NAME` after `OPEN_CREATE`, and `RENAME` here, achieve
 // the same fence as `BIND` and `RENAME` there.
 
+/// Open a file by path. `handle = -1`; `arg` is the UTF-8 path. Returns a
+/// tagged FD, a negative errno, or `EAGAIN` while what the walk needs is
+/// still being fetched.
 pub const OPEN: u32 = 0x0900;
+/// Read from the FD's offset. `handle=file`, `arg` is the output buffer.
+/// Returns the bytes read — possibly short — 0 at end of file, or `EAGAIN`
+/// when no byte could be read yet (the data is being fetched). Once a byte
+/// has moved the answer is the short count, never `EAGAIN`; the offset
+/// advances by exactly what was answered.
 pub const READ: u32 = 0x0901;
 /// Set the absolute read/write offset. `handle=file`.
 ///
@@ -88,7 +160,16 @@ pub const READ: u32 = 0x0901;
 /// return 0 or the resulting absolute offset. A provider whose backing
 /// format cannot address the requested offset returns `EINVAL`; `fat32`
 /// does so past 4 GiB, which is the format's own file-size ceiling.
+///
+/// `EAGAIN` while the chain walk to the offset needs data still being
+/// fetched; the offset has not moved.
 pub const SEEK: u32 = 0x0902;
+/// Release a handle. Never waits and always releases: the handle is gone
+/// whatever the answer. Returns 0, or `EBADF` for a handle that is not open.
+/// Unwritten data and size metadata are written back by the provider's step
+/// after the close; their failure is not reported here. A caller that needs
+/// durability fences (`FSYNC`, `FSYNC_SUBMIT`/`FSYNC_POLL`, `FSYNC_NAME`)
+/// before closing.
 pub const CLOSE: u32 = 0x0903;
 
 /// Report a handle's size and modification time.
@@ -133,15 +214,23 @@ pub const CLOSE: u32 = 0x0903;
 ///     queues storage for reclamation when the last one goes. A provider
 ///     without hard links reports 1, which is true.
 pub const STAT: u32 = 0x0904;
-/// Blocking byte-durability fence: commit this file's contents and its
-/// own recorded size past the device's volatile cache. `handle=file`.
-/// Returns 0 or negative errno; the achieved fence is
-/// `LocalDurable { device_id }`.
+/// Byte-durability fence: commit this file's contents and its own recorded
+/// size past the device's volatile cache. `handle=file`.
+///
+/// May answer `EINPROGRESS`: the fence is taken and the caller re-asks with
+/// the same request until it is decided. The final 0 means the FD's bytes
+/// written before the fence was taken, and size metadata covering them, are
+/// durable — data reaching media before the size that describes it — and the
+/// achieved fence is `LocalDurable { device_id }`. A negative errno is a
+/// failed fence.
 ///
 /// It does NOT publish the name that finds the file — see [`FSYNC_NAME`]
 /// and the durability vocabulary at the top of this file.
 pub const FSYNC: u32 = 0x0905;
-/// Write data. handle=file, arg=data, arg_len=data_len. Returns bytes written.
+/// Write data. handle=file, arg=data, arg_len=data_len. Returns the bytes
+/// taken, which may be short; `EAGAIN` only when none were. The caller
+/// advances by the answer. Taken bytes belong to the provider, which writes
+/// them back in the background; they are volatile until a fence.
 pub const WRITE: u32 = 0x0906;
 
 /// Open a directory for enumeration.
@@ -243,9 +332,10 @@ pub const MKDIR: u32 = 0x090B;
 /// do not change file size, allowing append logs to use an in-band terminator
 /// without rewriting size metadata at every durability fence.
 ///
-/// Returns `0` on success or a negative errno. The operation is deliberately
-/// distinct from sparse truncate: success promises that the capacity is
-/// physically backed and crash-visible. Providers without that guarantee
+/// Returns `0` on success or a negative errno, and may answer `EINPROGRESS`
+/// first: reserving a large capacity takes many steps. The operation is
+/// deliberately distinct from sparse truncate: the final 0 promises that the
+/// capacity is physically backed and crash-visible. Providers without that guarantee
 /// return `ENOSYS` and leave [`caps::PREALLOCATE`] clear.
 pub const PREALLOCATE: u32 = 0x090E;
 
@@ -261,8 +351,8 @@ pub const PREALLOCATE: u32 = 0x090E;
 /// to live there. A caller that wants capacity asks for [`PREALLOCATE`],
 /// which allocates it.
 ///
-/// The new size is durable when the call returns; releasing the storage
-/// behind it may be deferred, so a crash can leave a correct shorter file
+/// The new size is durable on the final 0 answer (the call may answer
+/// `EINPROGRESS` first); releasing the storage behind it may be deferred, so a crash can leave a correct shorter file
 /// with storage still attached. Returns `EBUSY` when a writable handle is
 /// open on the file, `EISDIR` for a directory. Providers that do not
 /// support it return `ENOSYS` and leave [`caps::TRUNCATE`] clear.
@@ -280,16 +370,19 @@ pub const TRUNCATE: u32 = 0x090C;
 /// and leave [`caps::FSYNC_ASYNC`] clear; callers fall back to `WRITE`.
 ///
 /// A short return is backpressure, not an error: the provider accepted
-/// the returned prefix and the caller rewinds and retries the rest.
+/// the returned prefix and the caller writes the rest later. Like every
+/// call of this contract it never waits on the device.
 pub const WRITE_ASYNC: u32 = 0x090F;
 
 /// Open a non-blocking durability fence over every write issued on this
 /// FD so far. `handle=file`; `arg` is a ≥8-byte output buffer that
-/// receives an opaque `u64` LE ticket. Returns 0, or `EAGAIN` when the
-/// provider has no free fence slot (bounded pipelining depth — retry the
-/// submit on a later step). The caller polls the ticket with
-/// [`FSYNC_POLL`] until it reports durable. Any pending deferred sector
-/// is submitted first so the fence covers it.
+/// receives an opaque `u64` LE ticket. Returns 0, or `EAGAIN` — nothing
+/// consumed — when the provider cannot open a fence without waiting: no
+/// free fence slot (bounded pipelining depth), or the pending data cannot
+/// be submitted yet. Retry the submit on a later step. The caller polls the
+/// ticket with [`FSYNC_POLL`] until it reports durable. Any pending
+/// deferred data is submitted first so the fence covers it; no device work
+/// is waited for.
 ///
 /// ## The ticket snapshots a frontier
 ///
@@ -347,7 +440,8 @@ pub const FSYNC_POLL: u32 = 0x0911;
 /// Durably publish the parent-directory entry naming `path`.
 ///
 /// `handle = -1`; `arg` points at the UTF-8 path (no NUL terminator),
-/// `arg_len` is its length. Returns `0` on success or a negative errno.
+/// `arg_len` is its length. Returns `0` on success or a negative errno, and
+/// may answer `EINPROGRESS` first: 0 means the parent entry is durable.
 ///
 /// ## Why the byte tier needs this opcode
 ///
@@ -456,15 +550,15 @@ pub const READLINK: u32 = 0x0914;
 ///   [dst: dst_len bytes UTF-8]
 /// ```
 ///
-/// Returns `0` on success or a negative errno. Normatively
-/// `storage.namespace::RENAME` fused into the byte tier — see
-/// `namespace.rs::RENAME`.
+/// Returns `0` on success or a negative errno, and may answer
+/// `EINPROGRESS` first. Normatively `storage.namespace::RENAME` fused into
+/// the byte tier — see `namespace.rs::RENAME`.
 ///
 /// ## Guarantee
 ///
 /// Success means a later mount observes either the old name or the new
 /// name, never a state where the bytes exist under no name. Both parent
-/// directories are durable on return, so the achieved fence is
+/// directories are durable on the final 0 answer, so the achieved fence is
 /// `LocalDurable { device_id }` and no follow-up [`FSYNC_NAME`] is
 /// required.
 ///
@@ -496,12 +590,12 @@ pub const READLINK: u32 = 0x0914;
 ///   - The source name is not guaranteed gone until the volume has been
 ///     mounted through this contract once. A consumer that treats the
 ///     absence of the source as proof of publication must obtain it from
-///     a fresh lookup after mount, not from the rename's return.
+///     a fresh lookup after mount, not from the rename's answer.
 ///
 /// Both are absent on a backend whose rename is a single atomic
 /// operation. Neither weakens the guarantee above: the artefact is never
 /// reachable by no name, and the destination is authoritative from the
-/// moment `RENAME` returns.
+/// moment `RENAME` answers 0.
 pub const RENAME: u32 = 0x090D;
 
 /// FS provider capability bitmap. `provider_call(handle, CAPS,
@@ -577,9 +671,16 @@ pub const CAPS: u32 = 0x09FF;
 ///     consumer that probes CAPS should never see it.
 ///   - **`EAGAIN` — not yet, ask again.** Transient: the mount has not
 ///     resolved, a bounded internal resource (fence slots, submission
-///     ring) is momentarily exhausted, or the device is busy. Retry on
-///     a later step. Never a fallback trigger and never an error to
-///     report upward.
+///     ring, the provider's operation slots) is momentarily exhausted, the
+///     device is busy, or the data is not cached yet. Nothing was consumed.
+///     Retry on a later step, with any arguments. Never a fallback trigger
+///     and never an error to report upward.
+///   - **`EINPROGRESS` — taken, not yet decided: ask again with the same
+///     request.** The operation was started; the caller re-asks with
+///     byte-identical (opcode, handle, arg bytes) on a later step and the
+///     answer to that ask is the decision. Never a failure, never
+///     "capability absent", never permission to issue a different request
+///     in its place.
 ///   - **Everything else (`EIO`, `ENODEV`, `ENOSPC`, `ENOENT`,
 ///     `EBUSY`, …) — a real failure of this call.** In particular
 ///     `ENODEV` means the provider or its device is *gone*, which is a
@@ -588,14 +689,18 @@ pub const CAPS: u32 = 0x09FF;
 ///     a silent durability downgrade.
 ///
 /// The distinction is load-bearing on [`PREALLOCATE`] specifically,
-/// where all three are reachable: `ENOSYS` selects a dynamically
-/// growing file, `EAGAIN` means retry, and `ENODEV`/`ENOSPC`/`EIO`
-/// MUST fail whatever admission the preallocation was gating.
+/// where all of them are reachable: `ENOSYS` selects a dynamically
+/// growing file, `EAGAIN` means retry, `EINPROGRESS` means re-ask the same
+/// request, and `ENODEV`/`ENOSPC`/`EIO` MUST fail whatever admission the
+/// preallocation was gating.
 pub mod errno_classes {
     /// Opcode not implemented by this provider. The only fallback trigger.
     pub const UNSUPPORTED: i32 = -38;
     /// Not yet — retry on a later step. Never a fallback trigger.
     pub const TRANSIENT: i32 = -11;
+    /// Taken, not yet decided — re-ask with the same request on a later
+    /// step. Never a failure and never a fallback trigger.
+    pub const IN_PROGRESS: i32 = -36;
 
     /// True when `rc` permits a consumer to select a compatibility
     /// fallback for the opcode that returned it. Deliberately narrow:
@@ -605,10 +710,24 @@ pub mod errno_classes {
         rc == UNSUPPORTED
     }
 
-    /// True when `rc` means the call should simply be retried.
+    /// True when `rc` means the call should simply be retried (`EAGAIN`).
     #[must_use]
     pub const fn is_transient(rc: i32) -> bool {
         rc == TRANSIENT
+    }
+
+    /// True when `rc` means the request was taken and must be re-asked with
+    /// byte-identical arguments (`EINPROGRESS`).
+    #[must_use]
+    pub const fn is_reask(rc: i32) -> bool {
+        rc == IN_PROGRESS
+    }
+
+    /// True when `rc` is not an answer yet — `EAGAIN` or `EINPROGRESS` — so
+    /// it is neither a failure, nor the end of the data, nor absence.
+    #[must_use]
+    pub const fn is_pending(rc: i32) -> bool {
+        is_transient(rc) || is_reask(rc)
     }
 }
 

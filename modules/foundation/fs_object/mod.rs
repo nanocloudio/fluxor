@@ -345,12 +345,38 @@ impl Fs {
         self.call(-1, op, path.as_mut_ptr(), path.len())
     }
 
+    /// A call the filesystem may take and decide later (`MKDIR`, `UNLINK`,
+    /// `OPEN_CREATE`, `FSYNC`, `FSYNC_NAME`, `RENAME`). Its `EINPROGRESS`
+    /// ("taken, re-ask the same request") is answered as `ERR_AGAIN`: every
+    /// caller is a write-slot stage that stays where it is and, on the next
+    /// ask, issues the byte-identical call again, which collects the
+    /// decision. Never a failure.
+    fn settle(self, handle: i32, op: u32, arg: *mut u8, len: usize) -> i32 {
+        let rc = self.call(handle, op, arg, len);
+        if rc == ERR_INPROGRESS {
+            ERR_AGAIN
+        } else {
+            rc
+        }
+    }
+
+    /// [`Fs::settle`] on a path.
+    fn settle_path(self, op: u32, path: &mut [u8]) -> i32 {
+        self.settle(-1, op, path.as_mut_ptr(), path.len())
+    }
+
     fn close(self, fd: i32) {
         let _ = self.call(fd, fs::CLOSE, core::ptr::null_mut(), 0);
     }
 
     /// Read exactly `len` bytes from `fd` into `out`, stopping early only at
     /// the end of the file: the count, or an errno.
+    ///
+    /// `ERR_AGAIN` once the filesystem defers, even after a short count: the
+    /// bytes already read are not a whole answer, and the file offset has
+    /// moved past them, so the caller must CLOSE `fd` and ask again from a
+    /// fresh open (`read_header`'s callers do). For a read that can answer
+    /// what it has, see [`Fs::read_some`].
     fn read_full(self, fd: i32, out: *mut u8, len: usize) -> i32 {
         let mut got = 0usize;
         while got < len {
@@ -361,6 +387,34 @@ impl Fs {
             }
             if rc == 0 {
                 break;
+            }
+            if rc as usize > len - got {
+                return ERR_IO;
+            }
+            got += rc as usize;
+        }
+        got as i32
+    }
+
+    /// Read up to `len` bytes from `fd` into `out`: the count moved (short
+    /// when the filesystem defers part-way or the file ends — progress is
+    /// never discarded), `ERR_AGAIN` only when nothing moved, or an errno.
+    fn read_some(self, fd: i32, out: *mut u8, len: usize) -> i32 {
+        let mut got = 0usize;
+        while got < len {
+            // SAFETY: `out` is writable for `len` bytes.
+            let rc = self.call(fd, fs::READ, unsafe { out.add(got) }, len - got);
+            if rc == ERR_AGAIN && got > 0 {
+                break;
+            }
+            if rc < 0 {
+                return rc;
+            }
+            if rc == 0 {
+                break;
+            }
+            if rc as usize > len - got {
+                return ERR_IO;
             }
             got += rc as usize;
         }
@@ -806,7 +860,7 @@ fn put_step(s: &mut State, key: &[u8], ct: &[u8], body: &[u8], pre: u8) -> i32 {
             // A deferred MKDIR stays at this stage and is asked again; an
             // existing directory is success.
             let mut root = s.root;
-            let rc = io.path(fs::MKDIR, &mut root[..s.root_len]);
+            let rc = io.settle_path(fs::MKDIR, &mut root[..s.root_len]);
             if rc < 0 && rc != ERR_EXIST {
                 s.write.stage = PUT_ROOT;
                 return rc;
@@ -846,7 +900,7 @@ fn put_step(s: &mut State, key: &[u8], ct: &[u8], body: &[u8], pre: u8) -> i32 {
         PUT_CLEAR => {
             // A temporary left by an interrupted attempt is removed, not
             // written over: OPEN_CREATE does not truncate.
-            let rc = io.path(fs::UNLINK, &mut tmp[..tn]);
+            let rc = io.settle_path(fs::UNLINK, &mut tmp[..tn]);
             if rc < 0 && rc != ERR_NOENT {
                 return rc;
             }
@@ -854,7 +908,7 @@ fn put_step(s: &mut State, key: &[u8], ct: &[u8], body: &[u8], pre: u8) -> i32 {
             ERR_AGAIN
         }
         PUT_CREATE => {
-            let fd = io.path(fs::OPEN_CREATE, &mut tmp[..tn]);
+            let fd = io.settle_path(fs::OPEN_CREATE, &mut tmp[..tn]);
             if fd < 0 {
                 return fd;
             }
@@ -894,7 +948,7 @@ fn put_step(s: &mut State, key: &[u8], ct: &[u8], body: &[u8], pre: u8) -> i32 {
             ERR_AGAIN
         }
         PUT_FSYNC => {
-            let rc = io.call(s.write.fd, fs::FSYNC, core::ptr::null_mut(), 0);
+            let rc = io.settle(s.write.fd, fs::FSYNC, core::ptr::null_mut(), 0);
             if rc < 0 {
                 return rc;
             }
@@ -918,10 +972,10 @@ fn put_step(s: &mut State, key: &[u8], ct: &[u8], body: &[u8], pre: u8) -> i32 {
             arg[2..2 + tn].copy_from_slice(&tmp[..tn]);
             arg[2 + tn..4 + tn].copy_from_slice(&(fname as u16).to_le_bytes());
             arg[4 + tn..4 + tn + fname].copy_from_slice(&fin[..fname]);
-            io.call(-1, fs::RENAME, arg.as_mut_ptr(), 4 + tn + fname)
+            io.settle(-1, fs::RENAME, arg.as_mut_ptr(), 4 + tn + fname)
         }
         PUT_DISCARD => {
-            let rc = io.path(fs::UNLINK, &mut tmp[..tn]);
+            let rc = io.settle_path(fs::UNLINK, &mut tmp[..tn]);
             if rc == ERR_AGAIN {
                 return ERR_AGAIN;
             }
@@ -1011,7 +1065,7 @@ fn op_delete(s: &mut State, a: &[u8]) -> i32 {
             }
         }
         DEL_UNLINK => {
-            let rc = io.path(fs::UNLINK, &mut path[..n]);
+            let rc = io.settle_path(fs::UNLINK, &mut path[..n]);
             if rc < 0 {
                 rc
             } else if caps & fs::caps::FSYNC_NAME != 0 {
@@ -1025,7 +1079,7 @@ fn op_delete(s: &mut State, a: &[u8]) -> i32 {
             }
         }
         DEL_FENCE => {
-            let rc = io.path(fs::FSYNC_NAME, &mut path[..n]);
+            let rc = io.settle_path(fs::FSYNC_NAME, &mut path[..n]);
             if rc == ERR_AGAIN {
                 return ERR_INPROGRESS;
             }
@@ -1118,7 +1172,9 @@ fn op_range(s: &mut State, handle: i32, a: &[u8]) -> i32 {
     if rc < 0 {
         return rc;
     }
-    io.read_full(r.fd, out as *mut u8, len)
+    // A short count is an answer: the caller asks for the rest at the
+    // offset it reaches.
+    io.read_some(r.fd, out as *mut u8, len)
 }
 
 fn op_close(s: &mut State, handle: i32) -> i32 {

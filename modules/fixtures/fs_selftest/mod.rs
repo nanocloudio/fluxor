@@ -16,12 +16,13 @@
 //! [fs_selftest] FAIL <phase> rc=<errno>
 //! ```
 //!
-//! One operation per step is not politeness. The surface under test is
-//! synchronous device I/O inside a `provider_call`, and a fixture that ran
-//! the whole script in one step would hide precisely the stalls it should be
-//! surfacing.
+//! One operation per step is not politeness. The provider answers inside
+//! the `provider_call` and waits on nothing, so the device only progresses
+//! between steps: a fixture that ran the whole script in one step would spin
+//! for ever, and would hide precisely the stalls it should be surfacing.
 //!
-//! `EAGAIN` is retried rather than failed. The contract defines it as "ask
+//! `EAGAIN` and `EINPROGRESS` are asked again — `EINPROGRESS` with the
+//! same request — rather than failed. The contract defines both as "ask
 //! again" — a mount that has not resolved, a bounded internal table that is
 //! momentarily full — and a fixture that treated it as failure would report a
 //! defect every time it started before the device did.
@@ -368,7 +369,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
             // degraded tier forever. Ask until there is an answer.
             let mut caps = [0u8; 4];
             let rc = (sys.provider_call)(-1, FS_CAPS, caps.as_mut_ptr(), 4);
-            if rc == E_AGAIN {
+            if rc == E_AGAIN || rc == E_INPROGRESS {
                 return 0;
             }
             if rc < 0 {
@@ -388,7 +389,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
 
         PH_MKDIR => {
             let rc = (sys.provider_call)(-1, FS_MKDIR, DIR.as_ptr().cast_mut(), DIR.len());
-            if rc == E_AGAIN {
+            if rc == E_AGAIN || rc == E_INPROGRESS {
                 return 0;
             }
             // An existing directory is success, per the contract.
@@ -406,7 +407,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
                 TMP_PATH.as_ptr().cast_mut(),
                 TMP_PATH.len(),
             );
-            if rc == E_AGAIN {
+            if rc == E_AGAIN || rc == E_INPROGRESS {
                 return 0;
             }
             if rc < 0 {
@@ -418,9 +419,8 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
         }
 
         PH_WRITE => {
-            // One chunk per step. The provider's write path is synchronous,
-            // so a fixture that pushed 9 KB in one call would be measuring
-            // how long the device takes rather than whether it is correct.
+            // One chunk per step, advancing by what the provider took (a
+            // write may answer short; it never waits on the device).
             let off = s.progress as usize;
             if off >= PAYLOAD {
                 advance(s);
@@ -434,7 +434,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
                 i += 1;
             }
             let rc = (sys.provider_call)(s.fd, FS_WRITE, chunk.as_mut_ptr(), n);
-            if rc == E_AGAIN {
+            if rc == E_AGAIN || rc == E_INPROGRESS {
                 return 0;
             }
             if rc < 0 {
@@ -447,7 +447,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
 
         PH_FSYNC => {
             let rc = (sys.provider_call)(s.fd, FS_FSYNC, core::ptr::null_mut(), 0);
-            if rc == E_AGAIN {
+            if rc == E_AGAIN || rc == E_INPROGRESS {
                 return 0;
             }
             if rc < 0 {
@@ -477,7 +477,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
                 TMP_PATH.as_ptr().cast_mut(),
                 TMP_PATH.len(),
             );
-            if rc == E_AGAIN {
+            if rc == E_AGAIN || rc == E_INPROGRESS {
                 return 0;
             }
             if rc < 0 {
@@ -493,7 +493,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
             let mut arg = [0u8; 64];
             let n = rename_arg(&mut arg, TMP_PATH, FINAL_PATH);
             let rc = (sys.provider_call)(-1, FS_RENAME, arg.as_mut_ptr(), n);
-            if rc == E_AGAIN {
+            if rc == E_AGAIN || rc == E_INPROGRESS {
                 return 0;
             }
             if rc < 0 {
@@ -512,7 +512,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
             let mut arg = [0u8; 64];
             let n = truncate_arg(&mut arg, TRUNC_TO, FINAL_PATH);
             let rc = (sys.provider_call)(-1, FS_TRUNCATE, arg.as_mut_ptr(), n);
-            if rc == E_AGAIN {
+            if rc == E_AGAIN || rc == E_INPROGRESS {
                 return 0;
             }
             if rc < 0 {
@@ -531,7 +531,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
                 FINAL_PATH.as_ptr().cast_mut(),
                 FINAL_PATH.len(),
             );
-            if rc == E_AGAIN {
+            if rc == E_AGAIN || rc == E_INPROGRESS {
                 return 0;
             }
             if rc < 0 {
@@ -548,7 +548,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
                 FINAL_PATH.as_ptr().cast_mut(),
                 FINAL_PATH.len(),
             );
-            if rc == E_AGAIN {
+            if rc == E_AGAIN || rc == E_INPROGRESS {
                 return 0;
             }
             if rc >= 0 {
@@ -571,7 +571,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
                 FINAL_PATH.as_ptr().cast_mut(),
                 FINAL_PATH.len(),
             );
-            if rc == E_AGAIN {
+            if rc == E_AGAIN || rc == E_INPROGRESS {
                 return 0;
             }
             if rc < 0 {
@@ -594,7 +594,7 @@ unsafe fn verify(s: &mut SelfTestState, path: &[u8], len: usize) -> i32 {
     let sys = &*s.syscalls;
     if s.fd < 0 {
         let rc = (sys.provider_call)(-1, FS_OPEN, path.as_ptr().cast_mut(), path.len());
-        if rc == E_AGAIN {
+        if rc == E_AGAIN || rc == E_INPROGRESS {
             return 0;
         }
         if rc < 0 {
@@ -626,7 +626,7 @@ unsafe fn verify(s: &mut SelfTestState, path: &[u8], len: usize) -> i32 {
     }
     let want = core::cmp::min(512, len - off);
     let rc = (sys.provider_call)(s.fd, FS_READ, s.buf.as_mut_ptr(), want);
-    if rc == E_AGAIN {
+    if rc == E_AGAIN || rc == E_INPROGRESS {
         return 0;
     }
     if rc <= 0 {

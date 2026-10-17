@@ -27,9 +27,20 @@
 // record. The same records serve both execution styles:
 //
 // - `EXEC` runs one request to completion inside the call and writes its
-//   completion. For a consumer that must answer within its own dispatch.
+//   completion. It MAY WAIT on the device — for the request, and for the
+//   flush an `F_PREFLUSH` asks for — so it is for a consumer outside any
+//   caller's step deadline (a pager, a vault, a fixture's own step).
 // - `SUBMIT` queues one request and returns; `REAP` hands back one finished
 //   completion. For a consumer that keeps several requests in flight.
+//   `SUBMIT` never waits, `F_PREFLUSH` included: the source queues the
+//   flush and starts the request once it completes.
+//
+// A provider answering inside a caller's step — an fs provider serving the
+// `fs` contract — uses only `SUBMIT`/`REAP` and non-blocking flush fences
+// (a `FLUSH` submitted and reaped), never `EXEC`: the `fs` contract does not
+// let a call wait on the device. Such a provider therefore requires a source
+// that reports `F_ASYNC` and refuses one that does not; every source that
+// can sit under one does report it.
 //
 // A source that cannot queue reports no [`caps::F_ASYNC`] and answers
 // `SUBMIT` with `ENOSYS`.

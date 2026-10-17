@@ -120,48 +120,69 @@ unsafe fn backend_open_handle(s: &mut BankState, path: *mut u8, len: usize) -> i
     (s.sys().provider_call)(-1, FS_OPEN, path, len)
 }
 
-/// One-shot directory scan via FS_OPENDIR + FS_READDIR (repeat until
-/// empty) + FS_CLOSE. Populates `paths[]` with files under `dir_path`
-/// whose names match `formats`. Subdirectories are skipped. Called
-/// once during `BankPhase::Init`; failures (provider not ready,
-/// directory missing) just leave `path_count == 0`.
-unsafe fn backend_scan(s: &mut BankState) {
+/// `READDIR` batches one step may take before the scan yields.
+const SCAN_BATCHES_PER_STEP: usize = 16;
+
+/// Directory scan via FS_OPENDIR + FS_READDIR (until it answers 0) +
+/// FS_CLOSE. Populates `paths[]` with files under `dir_path` whose names
+/// match `formats`; subdirectories are skipped.
+///
+/// Resumable: `OPENDIR` or `READDIR` answering `EAGAIN` ("not yet":
+/// nothing was consumed, the cursor did not move) parks the scan with its
+/// directory handle in `scan_handle`, and the core re-invokes it next step
+/// to continue from the same cursor. `EAGAIN` is never end-of-directory.
+/// Answers true once decided: drained, the path table full, or a real
+/// failure (logged; whatever was listed before it stays).
+unsafe fn backend_scan(s: &mut BankState) -> bool {
     if s.dir_path_len == 0 {
-        return;
+        return true;
     }
     let dlen = s.dir_path_len as usize;
     // Snapshot dir_path into a local so append_path's mutable borrow
     // doesn't clash with reading it back inside the readdir loop.
     let mut dir_path = [0u8; MAX_PATH_LEN];
     dir_path[..dlen].copy_from_slice(&s.dir_path[..dlen]);
-    let dir_fd = (s.sys().provider_call)(-1, FS_OPENDIR, dir_path.as_mut_ptr(), dlen);
-    if dir_fd < 0 {
-        // E_AGAIN is the transient "FS provider not yet Done" reply
-        // from fat32 during boot; the retry block re-invokes us so
-        // logging it would flood log_net. Real errors (ENOENT,
-        // ENFILE, …) still surface.
-        if dir_fd != -11 {
-            log_info(s, b"[fs_bank] OPENDIR fail");
+    if s.scan_handle < 0 {
+        let dir_fd = (s.sys().provider_call)(-1, FS_OPENDIR, dir_path.as_mut_ptr(), dlen);
+        if dir_fd == E_AGAIN {
+            // The provider is not up yet, or the directory's sectors are
+            // being fetched: ask again next step.
+            return false;
         }
-        return;
+        if dir_fd < 0 {
+            log_info(s, b"[fs_bank] OPENDIR fail");
+            return true;
+        }
+        s.scan_handle = dir_fd;
+        // Reset path table — the scan owns it.
+        s.path_count = 0;
+        let mut i = 0;
+        while i < MAX_PATHS {
+            s.path_lens[i] = 0;
+            i += 1;
+        }
     }
-    // Reset path table — the scan owns it.
-    s.path_count = 0;
-    let mut i = 0;
-    while i < MAX_PATHS {
-        s.path_lens[i] = 0;
-        i += 1;
-    }
-    let mut full = false;
-    loop {
-        // Use `s.buf` as the readdir output buffer; the working
-        // buffer is unused during init.
+    let dir_fd = s.scan_handle;
+    let mut drained = false;
+    let mut batches = 0usize;
+    while !drained {
+        if batches >= SCAN_BATCHES_PER_STEP {
+            return false;
+        }
+        batches += 1;
+        // Use `s.buf` as the readdir output buffer; nothing streams
+        // while the path table is being built.
         let n = (s.sys().provider_call)(dir_fd, FS_READDIR, s.buf.as_mut_ptr(), BUF_SIZE);
-        if n <= 0 {
+        if n == E_AGAIN {
+            return false;
+        }
+        if n < 0 {
+            log_info(s, b"[fs_bank] READDIR fail");
             break;
         }
         let n = n as usize;
         if n < 2 {
+            // 0: the directory is fully drained.
             break;
         }
         let count = u16::from_le_bytes([s.buf[0], s.buf[1]]) as usize;
@@ -185,22 +206,20 @@ unsafe fn backend_scan(s: &mut BankState) {
                 continue;
             }
             if !append_path(s, &dir_path[..dlen], name) {
-                full = true;
+                drained = true;
                 break;
             }
         }
-        if full {
-            break;
-        }
-        // Provider returned 0 entries with bytes < BUF_SIZE means it
-        // just signalled "drained" — leave the loop.
+        // A batch of 0 entries also signals "drained".
         if count == 0 {
-            break;
+            drained = true;
         }
     }
     (s.sys().provider_call)(dir_fd, FS_CLOSE, core::ptr::null_mut(), 0);
+    s.scan_handle = -1;
 
     finish_scan(s);
+    true
 }
 
 /// Stream one budget's worth of FS_READ chunks to `out_chans[0]`.

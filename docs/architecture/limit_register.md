@@ -138,21 +138,27 @@ CAPACITY >= PSTATUS_ROUND | src/kernel/sys/telemetry_ring.rs
 | RSA modulus width | `RSA_MODULUS_BITS_MAX` | modules/sdk/crypto/rsa.rs | 4096 | Policy: the widest key the core verifies or signs with. It sizes every buffer in the core and every job's step cost; no public issuer signs with more, and 8192 would double both for a key nothing presents |
 | RSA public exponent width | `RSA_EXPONENT_BITS_MAX` | modules/sdk/crypto/rsa.rs | 32 | Policy: the exponent a public operation walks; 65537 needs 17 bits, and a key whose exponent is wider is refused rather than exponentiated at length |
 | fat32 open files | `MAX_OPEN_FILES` | modules/foundation/fat32/mod.rs | — | Policy, per-profile (256 aarch64 / 8 elsewhere): a multi-tenant node runs several independent consumers against one volume at once, where a microcontroller's consumer set is fixed and each handle costs a scratch buffer. An open past the table is refused ENFILE, with a log line naming the handles that hold it. The `max_open_per_owner` parameter adds a per-owner ceiling on top, refusing the owner that is over its share while the table still has room, so the failure lands on the workload at fault rather than on whoever asks next |
-| fat32 directory-walk budget | `DIR_SCAN_BUDGET_SECTORS` | modules/foundation/fat32/mod.rs | 32 | Policy: directory sectors one `provider_call` reads before returning EAGAIN with its position saved. A directory with thousands of entries is not exotic — a WAL that segments per snapshot fills one — so an unbounded walk is a latent stall of every module sharing the lane, not a slow path |
+| fat32 directory-walk budget | `DIR_SCAN_BUDGET_SECTORS` | modules/foundation/fat32/mod.rs | — | Policy, per-profile (32 aarch64 / 6 elsewhere, a quarter of `CACHE_SLOTS`): cached directory sectors one `provider_call` walks before returning EAGAIN with its position saved; a sector not cached parks the walk on it while its read lands. A walk pins the slots it touched for the rest of its call, so the budget leaves the rest of the cache to the commit that follows. A directory with thousands of entries is not exotic — a WAL that segments per snapshot fills one — so an unbounded walk is a latent stall of every module sharing the lane, not a slow path |
 | fat32 long-name length | `LFN_MAX_CHARS` | modules/foundation/fat32/mod.rs | 64 | Policy: the format allows 255, but a buffer for that is carried in the directory cursor and in every wanted-name argument, on a board whose whole module state is measured against a 240 KiB arena. A longer name is refused at creation, not clipped. Names longer than this that were written elsewhere are still preserved and retired correctly — preservation walks the companion run without decoding it, so only matching and generation are bounded |
 | fat32 free-cluster scan | `FAT_SCAN_BUDGET_SECTORS` | modules/foundation/fat32/mod.rs | 32 | Policy: FAT sectors one `provider_call` reads looking for a free cluster before returning EAGAIN with its cursor saved. Matches `DIR_SCAN_BUDGET_SECTORS` for the same reason — a synchronous device read inside a dispatch is charged to the cooperative step budget, and the FAT of a large volume is far too big to walk in one |
 | fat32 walk time | `CALL_BUDGET_US` | modules/foundation/fat32/mod.rs | 400 | Policy: microseconds one `provider_call` or step spends walking a directory or the FAT before returning EAGAIN, alongside the two sector budgets. A sector count alone assumes a device speed, and one sector read costs from microseconds to milliseconds by device and power state. Every walk reads at least one sector per call, so a slow device still makes progress |
 | fat32 outstanding fences | `MAX_FENCES` | modules/foundation/fat32/mod.rs | — | Policy: equals `MAX_OPEN_FILES`. A fence table smaller than the handle table would let a consumer open a handle it cannot fence, which reads as a durability failure rather than a resource limit. `FSYNC_SUBMIT` past the table is refused EAGAIN (backpressure) |
+| fat32 sector cache | `CACHE_SLOTS` | modules/foundation/fat32/mod.rs | — | Policy, per-profile (128 aarch64 = 64 KiB / 24 elsewhere = 12 KiB): metadata sectors (FAT, directory, FSINFO, the rename intent record) held in memory. Every metadata read goes through it — a miss submits the read and the operation answers EAGAIN — and every metadata write lands in it, to be written back in epoch order. It must hold one call's working set: a walk's budget plus the largest commit (a rename's two directory sectors, their companions, the intent record twice, two FAT sectors and their copies) plus write-back not yet done. A slot it cannot find is a miss: the transaction aborts with nothing changed |
+| fat32 taken operations | `FS_OP_SLOTS` | modules/foundation/fat32/mod.rs | 4 | Policy: operations answered EINPROGRESS and held at once (FSYNC_NAME, RENAME, TRUNCATE, PREALLOCATE; FSYNC is held per handle). A new one while all hold undecided operations is EAGAIN; an uncollected decision is dropped when a new one needs its slot |
+| fat32 zero runs | `ZERO_RUN_SLOTS` | modules/foundation/fat32/mod.rs | 4 | Policy: sector ranges queued to be zeroed (a new directory cluster, a preallocated file's first sector), written from one zero buffer rather than through cache slots. A fifth before one completes is a miss: the operation answers EAGAIN |
+| fat32 write-back window | `EPOCH_WINDOW` | modules/foundation/fat32/mod.rs | 56 | Policy: ordering epochs written but not yet behind the write-back at once. Below 64, so the durable-boundary bits never alias. Past it a new boundary is a miss (EAGAIN) until the device catches up |
+| fat32 boundaries per transaction | `TX_BARRIER_MAX` | modules/foundation/fat32/mod.rs | 24 | Policy: ordering boundaries one transaction may close. Below `EPOCH_WINDOW`, so a transaction that misses on a full window always fits once the write-back drains and every transaction can commit. The largest real one (a rename that grows its directory) takes about a dozen; work that would need more — a large `clear_free_region` — runs as transactions of one FAT sector each. One that asked for more would be refused E2BIG, never retried for ever |
+| fat32 taken-request argument | `OP_ARG_MAX` | modules/foundation/fat32/mod.rs | 512 | Policy: argument bytes a taken (EINPROGRESS) request keeps whole, so a re-ask is matched exactly and no request is ever handed another's decision. RENAME's two length-prefixed 254-byte paths fill it; a longer argument is refused E2BIG at once |
 | nvme channel write pipeline | `MAX_INFLIGHT` | modules/drivers/nvme/mod.rs | — | Policy, per-profile (32 aarch64 / 8 elsewhere): writes in flight per I/O queue on the channel write path, each holding one 4 KiB DMA page. The command-id layout carries the slot in `CID_SLOT_BITS`, which moves with it |
-| nvme block requests in flight | `V1_SLOTS` | modules/drivers/nvme/mod.rs | 8 | Policy: `storage.block` requests one namespace holds between `SUBMIT` and `REAP`, each with its own command id and 4 KiB DMA page. It is the `queue_depth` the source reports. They share I/O queue 0 with the channel pipeline, the bulk ring and the synchronous paths, and the sum stays below `IO_Q_ENTRIES` |
+| nvme block requests in flight | `V1_SLOTS` | modules/drivers/nvme/mod.rs | 16 | Policy: `storage.block` requests one namespace holds between `SUBMIT` and `REAP`, each with its own command id and 4 KiB DMA page. It is the `queue_depth` the source reports. They share I/O queue 0 with the channel pipeline, the bulk ring and the synchronous paths, and the sum stays below `IO_Q_ENTRIES` |
 | nvme preflush flushes in flight | `V1_FLUSH_SLOTS` | modules/drivers/nvme/mod.rs | 4 | Policy: Flushes the `F_PREFLUSH` requests of one namespace can have outstanding at once, each its own command identifier. Past it a preflush request is `EAGAIN` before anything is submitted, so a retry never reuses an identifier still on the controller |
 | nvme I/O queue pairs | `MAX_IO_QUEUES` | modules/drivers/nvme/mod.rs | 4 | Policy: submission/completion queue pairs created at bring-up; the channel write pipeline stripes across them and every other path runs on queue 0 |
 | nvme blocks per command | `MAX_NLB` | modules/drivers/nvme/mod.rs | 8 | Sanity bound: one PRP1 page of 512-byte sectors, so no command needs a PRP list on the channel and synchronous paths |
 | nvme pager bulk ring | `ASYNC_BULK_SLOTS` | modules/drivers/nvme/mod.rs | 8 | Policy: pager bulk commands in flight, each owning `MAX_BULK_PAGES` of contiguous DMA |
 | nvme held completions | `HELD_MAX` | modules/drivers/nvme/mod.rs | 8 | Policy: completions a synchronous request takes off queue 0 and holds for their owner (a stream read's) to reach its own behind them; past it the request waits for the owner to consume them |
 | nvme pager bulk transfer | `MAX_BULK_PAGES` | modules/drivers/nvme/mod.rs | 32 | Policy: 4 KiB pages one pager bulk command moves through its PRP list (128 KiB) |
-| file_block requests awaiting reap | `QUEUE_DEPTH` | modules/foundation/file_block/mod.rs | 8 | Policy: completions a `SUBMIT` queues for `REAP`; the queue depth the source reports. A `SUBMIT` past it is refused EAGAIN |
-| file_block blocks per request | `MAX_BLOCKS` | modules/foundation/file_block/mod.rs | 64 | Policy: bounds the file I/O one request runs inside its caller's dispatch |
+| file_block requests in flight | `QUEUE_DEPTH` | modules/foundation/file_block/mod.rs | 8 | Policy: requests a `SUBMIT` has queued — waiting, running, or done and awaiting `REAP`; the queue depth the source reports. A `SUBMIT` past it is refused EAGAIN |
+| file_block blocks per request | `MAX_BLOCKS` | modules/foundation/file_block/mod.rs | 64 | Policy: bounds the file I/O one request's resumable job moves |
 | file_block image path | `PATH_CAP` | modules/foundation/file_block/mod.rs | 96 | Policy: the longest image path the `path` parameter holds; a longer one is truncated at parse and fails to open |
 | file_block fs volume name | `VOLUME_CAP` | modules/foundation/file_block/mod.rs | 16 | Policy: the longest selector the `volume` parameter holds; a longer one is refused at open (EINVAL), never clipped into another provider's name |
 | crypt_block authentication unit | `MAX_UNIT` | modules/foundation/crypt_block/mod.rs | 4096 | Policy: the largest authentication unit, which sizes the module's unit, ciphertext and journal-header scratch buffers |
@@ -219,7 +225,8 @@ CAPACITY >= PSTATUS_ROUND | src/kernel/sys/telemetry_ring.rs
 | DNS TSIG signing window (seconds) | `MAX_TSIG_FUDGE_S` | modules/foundation/dns/mod.rs | 300 | Policy: the widest fudge honoured whatever the request asks (RFC 8945 §5.2.3); outside it is BADTIME |
 | DNS retained update transactions | `MAX_TXN_CACHE` | modules/foundation/dns/mod.rs | 4 | Policy: a repeated authenticated transaction (same key and MAC) inside retention is answered from the cache; the oldest entry is displaced |
 | DNS update-transaction retention (ms) | `TXN_RETAIN_MS` | modules/foundation/dns/mod.rs | 30000 | Policy: past retention a repeated transaction has its prerequisites evaluated anew |
-| DNS zone-file commit writes | `MAX_COMMIT_WRITES` | modules/foundation/dns/mod.rs | 64 | Sanity: `WRITE` / `READ` calls per commit or recovery before the operation is refused as stalled |
+| DNS zone-file calls per step | `MAX_ZIO_CALLS_PER_STEP` | modules/foundation/dns/mod.rs | 64 | Sanity: `fs` calls one step issues for the zone commit or recovery step machine; a run of short counts resumes on the next step rather than monopolising this one |
+| DNS durable-update response echo | `PEND_Q_MAX` | modules/foundation/dns/mod.rs | — | Derived: header + the longest wire name + type and class — the zone section an UPDATE's held response repeats while its commit is undecided; a longer one (unreachable after parsing) is answered SERVFAIL at once |
 | mount open handles | `MAX_OPEN` | modules/foundation/mount/mod.rs | 64 | Policy: an open past the router table is refused ENFILE |
 | OTA image layers | `MAX_LAYERS` | modules/foundation/ota_registry/mod.rs | 48 | Policy: sized to the 48-module fleet profile; a larger manifest is refused whole |
 | SMMU DMA map table | `MAX_DMA_MAPS` | modules/foundation/smmu/mod.rs | 32 | Policy: a map past the translation table is refused ENOMEM before any MMIO write |
@@ -464,14 +471,22 @@ RSA_MODULUS_BITS_MAX | modules/sdk/crypto/rsa.rs | 4096 | *
 RSA_EXPONENT_BITS_MAX | modules/sdk/crypto/rsa.rs | 32 | *
 MAX_OPEN_FILES | modules/foundation/fat32/mod.rs | 256 | host
 MAX_OPEN_FILES | modules/foundation/fat32/mod.rs | 8 | off-host
-DIR_SCAN_BUDGET_SECTORS | modules/foundation/fat32/mod.rs | 32 | *
+DIR_SCAN_BUDGET_SECTORS | modules/foundation/fat32/mod.rs | 32 | host
+DIR_SCAN_BUDGET_SECTORS | modules/foundation/fat32/mod.rs | 6 | off-host
 LFN_MAX_CHARS | modules/foundation/fat32/mod.rs | 64 | *
 FAT_SCAN_BUDGET_SECTORS | modules/foundation/fat32/mod.rs | 32 | *
 CALL_BUDGET_US | modules/foundation/fat32/mod.rs | 400 | *
 MAX_FENCES | modules/foundation/fat32/mod.rs | MAX_OPEN_FILES | *
+CACHE_SLOTS | modules/foundation/fat32/mod.rs | 128 | host
+CACHE_SLOTS | modules/foundation/fat32/mod.rs | 24 | off-host
+FS_OP_SLOTS | modules/foundation/fat32/mod.rs | 4 | *
+ZERO_RUN_SLOTS | modules/foundation/fat32/mod.rs | 4 | *
+EPOCH_WINDOW | modules/foundation/fat32/mod.rs | 56 | *
+TX_BARRIER_MAX | modules/foundation/fat32/mod.rs | 24 | *
+OP_ARG_MAX | modules/foundation/fat32/mod.rs | 512 | *
 MAX_INFLIGHT | modules/drivers/nvme/mod.rs | 32 | host
 MAX_INFLIGHT | modules/drivers/nvme/mod.rs | 8 | off-host
-V1_SLOTS | modules/drivers/nvme/mod.rs | 8 | *
+V1_SLOTS | modules/drivers/nvme/mod.rs | 16 | *
 V1_FLUSH_SLOTS | modules/drivers/nvme/mod.rs | 4 | *
 MAX_IO_QUEUES | modules/drivers/nvme/mod.rs | 4 | *
 MAX_NLB | modules/drivers/nvme/mod.rs | 8 | *
@@ -549,7 +564,8 @@ MAX_UPDATE_KEYS | modules/foundation/dns/mod.rs | 4 | *
 MAX_TSIG_FUDGE_S | modules/foundation/dns/mod.rs | 300 | *
 MAX_TXN_CACHE | modules/foundation/dns/mod.rs | 4 | *
 TXN_RETAIN_MS | modules/foundation/dns/mod.rs | 30000 | *
-MAX_COMMIT_WRITES | modules/foundation/dns/mod.rs | 64 | *
+MAX_ZIO_CALLS_PER_STEP | modules/foundation/dns/mod.rs | 64 | *
+PEND_Q_MAX | modules/foundation/dns/mod.rs | DNS_HEADER_LEN + MAX_NAME_LEN + 1 + 4 | *
 MAX_OPEN | modules/foundation/mount/mod.rs | 64 | *
 MAX_LAYERS | modules/foundation/ota_registry/mod.rs | 48 | *
 MAX_DMA_MAPS | modules/foundation/smmu/mod.rs | 32 | *
@@ -766,6 +782,7 @@ EPHEMERAL_SCAN_MAX | modules/foundation/ip/mod.rs | derived: a port scan bounded
 PREFIX_MAX | modules/foundation/mount/mod.rs | control-message field width, bounded by its u8 length prefix
 VOLUME_MAX | modules/foundation/mount/mod.rs | control-message field width, bounded by its u8 length prefix
 PATH_MAX | modules/foundation/mount/mod.rs | path scratch for prefix rewriting
+SCRATCH_MAX | modules/foundation/mount/mod.rs | derived from PATH_MAX: two length-prefixed paths of a RENAME / LINK
 CTL_MSG_MAX | modules/foundation/mount/mod.rs | derived from the control-message field widths
 NET_BUF_SIZE | modules/foundation/ota_registry/mod.rs | scratch: one MSG_DATA fragment plus its framing
 HDR_BUF_SIZE | modules/foundation/ota_registry/mod.rs | HTTP response header accumulator scratch

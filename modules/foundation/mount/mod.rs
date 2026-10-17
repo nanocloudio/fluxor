@@ -79,6 +79,11 @@ const FS_READDIR: u32 = 0x0908;
 const FS_OPEN_CREATE: u32 = 0x0909;
 const FS_UNLINK: u32 = 0x090A;
 const FS_MKDIR: u32 = 0x090B;
+const FS_TRUNCATE: u32 = 0x090C;
+const FS_RENAME: u32 = 0x090D;
+const FS_FSYNC_NAME: u32 = 0x0912;
+const FS_LINK: u32 = 0x0913;
+const FS_RMDIR: u32 = 0x0915;
 const FS_CAPS: u32 = 0x09FF;
 const CONTRACT_FS: u32 = 0x0009;
 
@@ -87,6 +92,8 @@ const EINVAL: i32 = -22;
 const ENODEV: i32 = -19;
 const EBADF: i32 = -9;
 const ENFILE: i32 = -23;
+/// A two-path op whose paths live on different volumes.
+const EXDEV: i32 = -18;
 
 /// Mount-table entries. Several prefixes may share one volume, so this bounds
 /// prefixes, not backends. The number of DISTINCT volumes is capped lower, by
@@ -99,6 +106,8 @@ const MAX_OPEN: usize = 64;
 const PREFIX_MAX: usize = 48;
 const VOLUME_MAX: usize = 15;
 const PATH_MAX: usize = 256;
+/// `[len:u16][src][len:u16][dst]`, or `[len:u64][path]`.
+const SCRATCH_MAX: usize = 2 * (2 + PATH_MAX);
 
 // Hotplug / removable-media control. A low-rate control channel
 // (in[0]) carries add/remove commands, mirroring the IP `addr_ctl` port:
@@ -163,8 +172,9 @@ struct MountState {
     /// Optional hotplug control channel (in[0]); `-1` when unwired.
     ctl_chan: i32,
     opens: [OpenSlot; MAX_OPEN],
-    /// Scratch buffer for the prefix-stripped in-volume path.
-    scratch: [u8; PATH_MAX],
+    /// Scratch for the forwarded argument: the prefix-stripped in-volume
+    /// path, or for a two-path op both paths with their length prefixes.
+    scratch: [u8; SCRATCH_MAX],
 
     /// Cumulative FS ops forwarded to a volume backend (metric id 0).
     ops_routed: u64,
@@ -427,24 +437,81 @@ unsafe fn longest_prefix_match(s: &MountState, path: *const u8, path_len: usize)
 /// in-volume absolute path. Root mount (`/`) passes the path through; an
 /// exact-prefix match yields `/`. Returns the rewritten length.
 unsafe fn rewrite_path(s: &mut MountState, mi: usize, path: *const u8, path_len: usize) -> usize {
+    rewrite_path_at(s, mi, path, path_len, 0)
+}
+
+/// [`rewrite_path`] into `s.scratch[at..]`. The same path and mount table
+/// always give the same bytes, so a re-ask after `EINPROGRESS` reaches the
+/// backend byte-identical.
+unsafe fn rewrite_path_at(
+    s: &mut MountState,
+    mi: usize,
+    path: *const u8,
+    path_len: usize,
+    at: usize,
+) -> usize {
     let pl = s.mounts[mi].prefix_len as usize;
-    let src = core::slice::from_raw_parts(path, path_len);
+    let room = core::cmp::min(PATH_MAX, SCRATCH_MAX.saturating_sub(at));
+    let dst = s.scratch.as_mut_ptr().add(at);
     // Root mount, or prefix that is just "/": pass through unchanged.
     if pl == 1 && s.mounts[mi].prefix[0] == b'/' {
-        let n = core::cmp::min(path_len, PATH_MAX);
-        s.scratch[..n].copy_from_slice(&src[..n]);
+        let n = core::cmp::min(path_len, room);
+        core::ptr::copy_nonoverlapping(path, dst, n);
         return n;
     }
     // Remainder after the prefix (which had a boundary at pl).
-    let rem = &src[pl..];
-    if rem.is_empty() {
-        s.scratch[0] = b'/';
+    if path_len <= pl {
+        if room == 0 {
+            return 0;
+        }
+        *dst = b'/';
         return 1;
     }
-    // `rem` starts with '/' (the boundary char); copy it verbatim.
-    let n = core::cmp::min(rem.len(), PATH_MAX);
-    s.scratch[..n].copy_from_slice(&rem[..n]);
+    // The remainder starts with '/' (the boundary char); copy it verbatim.
+    let n = core::cmp::min(path_len - pl, room);
+    core::ptr::copy_nonoverlapping(path.add(pl), dst, n);
     n
+}
+
+/// Route a two-path op (`RENAME`, `LINK`: `[src_len:u16][src][dst_len:u16]
+/// [dst]`). Both paths must live on one mount — a volume cannot rename onto
+/// another (`EXDEV`). The forwarded argument is both paths prefix-stripped,
+/// in the same layout.
+unsafe fn route_two_paths(s: &mut MountState, op: u32, arg: *mut u8, arg_len: usize) -> i32 {
+    if arg.is_null() || arg_len < 4 {
+        return EINVAL;
+    }
+    let sl = u16::from_le_bytes([*arg, *arg.add(1)]) as usize;
+    if sl == 0 || sl > PATH_MAX || 2 + sl + 2 > arg_len {
+        return EINVAL;
+    }
+    let dl = u16::from_le_bytes([*arg.add(2 + sl), *arg.add(3 + sl)]) as usize;
+    if dl == 0 || dl > PATH_MAX || 4 + sl + dl > arg_len {
+        return EINVAL;
+    }
+    let src = arg.add(2) as *const u8;
+    let dst = arg.add(4 + sl) as *const u8;
+    let (Some(ms), Some(md)) = (
+        longest_prefix_match(s, src, sl),
+        longest_prefix_match(s, dst, dl),
+    ) else {
+        s.route_misses = s.route_misses.wrapping_add(1);
+        return ENODEV;
+    };
+    if ms != md {
+        return EXDEV;
+    }
+    let n1 = rewrite_path_at(s, ms, src, sl, 2);
+    let at = 2 + n1;
+    let n2 = rewrite_path_at(s, ms, dst, dl, at + 2);
+    let out = s.scratch.as_mut_ptr();
+    let l1 = (n1 as u16).to_le_bytes();
+    let l2 = (n2 as u16).to_le_bytes();
+    *out = l1[0];
+    *out.add(1) = l1[1];
+    *out.add(at) = l2[0];
+    *out.add(at + 1) = l2[1];
+    call_volume(s, ms, -1, op, out, at + 2 + n2)
 }
 
 /// Forward one op to the backend for mount `mi`, selecting the volume by
@@ -483,6 +550,13 @@ unsafe fn alloc_slot(s: &mut MountState, mount_idx: u8, backend_handle: i32) -> 
 
 /// The FS provider dispatch. Routes open-family and one-shot ops by path
 /// prefix; routes handle-bound ops by the mount slot recorded at open.
+///
+/// Every answer of the backend passes through unchanged, `EAGAIN` and
+/// `EINPROGRESS` included: a caller re-asking after `EINPROGRESS` sends the
+/// same bytes, and the deterministic prefix rewrite and the handle the slot
+/// recorded hand the backend the same bytes too, so the backend sees the
+/// identical request it took. An open answered `EINPROGRESS` takes no
+/// mount slot until the re-ask that decides it returns a handle.
 unsafe fn mount_dispatch(
     s: &mut MountState,
     handle: i32,
@@ -517,7 +591,7 @@ unsafe fn mount_dispatch(
                 }
             }
         }
-        FS_UNLINK | FS_MKDIR => {
+        FS_UNLINK | FS_MKDIR | FS_RMDIR | FS_FSYNC_NAME => {
             let mi = match longest_prefix_match(s, arg, arg_len) {
                 Some(i) => i,
                 None => {
@@ -528,6 +602,25 @@ unsafe fn mount_dispatch(
             let n = rewrite_path(s, mi, arg, arg_len);
             let p = s.scratch.as_mut_ptr();
             call_volume(s, mi, -1, op, p, n)
+        }
+        FS_RENAME | FS_LINK => route_two_paths(s, op, arg, arg_len),
+        FS_TRUNCATE => {
+            // `[len:u64][path]`: route by the path, forward the length.
+            if arg.is_null() || arg_len <= 8 || arg_len - 8 > PATH_MAX {
+                return EINVAL;
+            }
+            let path = arg.add(8);
+            let mi = match longest_prefix_match(s, path, arg_len - 8) {
+                Some(i) => i,
+                None => {
+                    s.route_misses = s.route_misses.wrapping_add(1);
+                    return ENODEV;
+                }
+            };
+            let n = rewrite_path_at(s, mi, path, arg_len - 8, 8);
+            core::ptr::copy_nonoverlapping(arg as *const u8, s.scratch.as_mut_ptr(), 8);
+            let p = s.scratch.as_mut_ptr();
+            call_volume(s, mi, -1, op, p, 8 + n)
         }
         FS_CAPS => {
             // Report the first active volume's caps as representative; a
