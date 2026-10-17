@@ -568,6 +568,167 @@ mod scheduler_validation_tests {
         );
     }
 
+    /// A workload module's YAML step budget reaches its FLXA module record.
+    #[test]
+    fn workload_module_step_budget_rides_the_flxa_record() {
+        let tmp = std::env::temp_dir();
+        let cfg = json!({
+            "execution": {"domains": [{"name": "coop", "cores": [0], "tick_us": 1000}]},
+            "workloads": [{"modules": [
+                {"name": "kv", "type": "workload_pic_mod", "domain": "coop",
+                 "step_deadline_us": 12000, "step_deadline_burst_us": 16000,
+                 "fault_policy": "tolerate"},
+                {"name": "plain", "type": "workload_pic_mod2", "domain": "coop"}
+            ]}]
+        });
+        let w = build_workloads(&cfg, test_loc(&tmp), &[]).expect("admitted budget builds");
+        let m = &w[0].modules;
+        assert_eq!(
+            m[0].budget,
+            crate::add_subgraph::StepBudget {
+                deadline_us: 12_000,
+                burst_us: 16_000,
+                fault_policy: crate::add_subgraph::FAULT_POLICY_TOLERATE,
+            }
+        );
+        assert_eq!(m[1].budget, crate::add_subgraph::StepBudget::default());
+        let blob = crate::add_subgraph::encode_add_subgraph(&w[0]).unwrap();
+        // First module record: name_hash, domain, then the budget.
+        assert_eq!(&blob[39..43], &12_000u32.to_be_bytes());
+        assert_eq!(&blob[43..47], &16_000u32.to_be_bytes());
+        assert_eq!(blob[47], crate::add_subgraph::FAULT_POLICY_TOLERATE);
+    }
+
+    /// What the kernel refuses a workload, the build refuses first: a
+    /// policy that reaches past the module, and a deadline over 16 × the
+    /// domain's shortest tick.
+    #[test]
+    fn workload_module_step_budget_refusals() {
+        let tmp = std::env::temp_dir();
+        let build = |module: Value, domain: Value| {
+            let cfg = json!({
+                "execution": {"domains": [domain]},
+                "workloads": [{"modules": [module]}]
+            });
+            build_workloads(&cfg, test_loc(&tmp), &[])
+                .map(|_| ())
+                .map_err(|e| format!("{e:?}"))
+        };
+        let dom = json!({"name": "coop", "cores": [0], "tick_us": 1000});
+        let m = |extra: Value| {
+            let mut base = json!({"name": "kv", "type": "workload_pic_mod", "domain": "coop"});
+            for (k, v) in extra.as_object().unwrap() {
+                base[k] = v.clone();
+            }
+            base
+        };
+        for policy in ["restart", "restart_graph"] {
+            let err = build(m(json!({"fault_policy": policy})), dom.clone()).unwrap_err();
+            assert!(err.contains("not available to a workload module"), "{err}");
+        }
+        let err = build(m(json!({"fault_policy": "forever"})), dom.clone()).unwrap_err();
+        assert!(err.contains("is invalid"), "{err}");
+        let err = build(
+            m(json!({"step_deadline_us": 20000, "step_deadline_burst_us": 16000})),
+            dom.clone(),
+        )
+        .unwrap_err();
+        assert!(err.contains("step_deadline_us = 20000 exceeds the 16000 us"), "{err}");
+        // No explicit burst: 3000 × 8 = 24 ms is over.
+        let err = build(m(json!({"step_deadline_us": 3000})), dom.clone()).unwrap_err();
+        assert!(err.contains("burst deadline 24000 us"), "{err}");
+        let err = build(m(json!({"step_deadline_us": -1})), dom.clone()).unwrap_err();
+        assert!(err.contains("must be a non-negative integer"), "{err}");
+        // On an adaptive-cadence domain the ceiling follows tick_min_us.
+        let adaptive = json!({"name": "coop", "cores": [0], "tick_us": 1000,
+                              "adaptive_flags": 2, "tick_min_us": 500, "tick_max_us": 1000});
+        let err = build(
+            m(json!({"step_deadline_us": 1000, "step_deadline_burst_us": 12000})),
+            adaptive.clone(),
+        )
+        .unwrap_err();
+        assert!(err.contains("exceeds the 8000 us"), "{err}");
+        build(
+            m(json!({"step_deadline_us": 1000, "step_deadline_burst_us": 8000})),
+            adaptive,
+        )
+        .expect("within 16 × tick_min_us");
+        // The hard cap holds on a slow domain: 16 × 50 ms is still 100 ms.
+        let slow = json!({"name": "coop", "cores": [0], "tick_us": 50000});
+        let err = build(
+            m(json!({"step_deadline_us": 50000, "step_deadline_burst_us": 150000})),
+            slow,
+        )
+        .unwrap_err();
+        assert!(err.contains("exceeds the 100000 us"), "{err}");
+    }
+
+    /// A workload module may not declare what a base graph turns into a node
+    /// tag; the heap flags and its step budget stay available.
+    #[test]
+    fn workload_module_node_keys_refused() {
+        let tmp = std::env::temp_dir();
+        let build = |extra: Value| {
+            let mut m = json!({"name": "kv", "type": "workload_pic_mod", "domain": "coop"});
+            for (k, v) in extra.as_object().unwrap() {
+                m[k] = v.clone();
+            }
+            let cfg = json!({
+                "execution": {"domains": [{"name": "coop", "cores": [0]}]},
+                "workloads": [{"modules": [m]}]
+            });
+            build_workloads(&cfg, test_loc(&tmp), &[])
+                .map(|_| ())
+                .map_err(|e| format!("{e:?}"))
+        };
+        for (key, v) in [
+            ("trust_tier", json!("platform")),
+            ("protection", json!("isolated")),
+            ("device_window", json!("uart0")),
+            ("isr_budget_cycles", json!(1000)),
+            ("irq", json!(33)),
+            ("quarantine_partner", json!("other")),
+            ("quarantine_partner_idx", json!(0)),
+            ("max_restarts", json!(3)),
+            ("restart_backoff_ms", json!(10)),
+            ("voices", json!(["lead"])),
+        ] {
+            let err = build(json!({ key: v })).unwrap_err();
+            assert!(
+                err.contains(&format!("`{key}` is not available to a workload module")),
+                "{key}: {err}"
+            );
+        }
+        build(json!({"heap": {"zero_on_free": true, "canary_enabled": true}}))
+            .expect("heap flags act on the module's own heap");
+        let err = build(json!({"heap": {"zero_on_fre": true}})).unwrap_err();
+        assert!(err.contains("unknown heap key"), "{err}");
+    }
+
+    /// The heap flags reach a workload module's params as the base graph
+    /// encodes them, inside the TLV, before its end marker.
+    #[test]
+    fn workload_heap_flags_join_the_params_tlv() {
+        let m = json!({"heap": {"zero_on_free": true, "alloc_failure_policy": "fault",
+                                "canary_enabled": true}});
+        // No schema params: a TLV of their own.
+        let p = insert_workload_heap_tags(Vec::new(), &m, "kv").unwrap();
+        assert_eq!(
+            p,
+            vec![0xFE, 0x01, 11, 0, 0xF8, 1, 1, 0xF9, 1, 1, 0xFA, 1, 1, 0xFF, 0x00]
+        );
+        // Schema params: the flags go before the end marker, the length grows.
+        let schema_tlv = vec![0xFE, 0x01, 5, 0, 1, 1, 7, 0xFF, 0x00];
+        let p = insert_workload_heap_tags(schema_tlv, &m, "kv").unwrap();
+        assert_eq!(&p[..7], &[0xFE, 0x01, 14, 0, 1, 1, 7]);
+        assert_eq!(&p[7..16], &[0xF8, 1, 1, 0xF9, 1, 1, 0xFA, 1, 1]);
+        assert_eq!(&p[16..], &[0xFF, 0x00]);
+        assert_eq!(crate::add_subgraph::params_node_tag(&p), None);
+        // No heap key: untouched.
+        let p = insert_workload_heap_tags(vec![1, 2, 3], &json!({}), "kv").unwrap();
+        assert_eq!(p, vec![1, 2, 3]);
+    }
+
     #[test]
     fn replicated_clock_idle_clamp_enforced() {
         // Demand-driven idle must not widen tick_max_us past the

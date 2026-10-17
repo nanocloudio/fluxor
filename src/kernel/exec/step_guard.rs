@@ -72,6 +72,31 @@ pub enum FaultPolicy {
     Tolerate = 3,
 }
 
+impl FaultPolicy {
+    /// The policy a wire byte names: the numbering of the params TLV tag
+    /// `0xF1` and of the FLXA module record (`0` skip, `1` restart, `2`
+    /// restart_graph, `3` tolerate). `None` for any other byte, so a decoder
+    /// can refuse it rather than guess.
+    pub const fn from_wire(b: u8) -> Option<Self> {
+        match b {
+            0 => Some(FaultPolicy::Skip),
+            1 => Some(FaultPolicy::Restart),
+            2 => Some(FaultPolicy::RestartGraph),
+            3 => Some(FaultPolicy::Tolerate),
+            _ => None,
+        }
+    }
+
+    /// Whether the policy's whole effect stays on the faulting module, so a
+    /// workload may choose it. `Skip` terminates the module and `Tolerate`
+    /// only records the overrun. `Restart` releases the module's provider
+    /// layers and flushes its channels, which other owners may hold, and
+    /// `RestartGraph` names the whole graph: neither is confined.
+    pub const fn confined_to_module(self) -> bool {
+        matches!(self, FaultPolicy::Skip | FaultPolicy::Tolerate)
+    }
+}
+
 /// Fault type codes for last_fault_type.
 pub mod fault_type {
     /// No fault.

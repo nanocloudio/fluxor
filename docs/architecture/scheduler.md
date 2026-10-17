@@ -80,6 +80,97 @@ hosts, where the guard never fires. Deadline behaviour observed on a
 host does not carry over to the embedded targets, and on no target
 does the deadline bound the duration of a single step.
 
+## Workload step budgets
+
+Source: `src/kernel/exec/scheduler/live.rs` (`StepBudget`,
+`admit_step_budget`), `tools/src/add_subgraph.rs`,
+`tools/src/config/builder.rs` (`workload_step_budget`)
+
+A module in a workload declares `step_deadline_us`,
+`step_deadline_burst_us` and `fault_policy` with the same YAML keys and
+the same value checks as a base-graph module:
+
+```yaml
+workloads:
+  - name: kv
+    modules:
+      - name: kv_state_worker
+        type: kv_state_worker
+        step_deadline_us: 12000
+        step_deadline_burst_us: 16000
+        fault_policy: tolerate
+```
+
+`fluxor build --emit=workload` (and the resident `workloads:` section of a
+base config) carries them in the module's FLXA record, not in its params:
+
+```text
+module  name_hash u32 | domain_id u8
+        step_deadline_us u32 | step_deadline_burst_us u32 | fault_policy u8
+        params_len u16 | params [params_len]
+```
+
+All fields are big-endian. A deadline of `0` is the node's default
+(`DEFAULT_STEP_DEADLINE_US`), a burst of `0` is `step_deadline_us ×
+BURST_MULTIPLIER`, and the policy byte uses the numbering of the params
+TLV's tag `0xF1` (0 skip, 1 restart, 2 restart_graph, 3 tolerate). A
+policy byte outside that set fails the decode with `EINVAL`.
+
+The kernel admits a workload's budgets against its own node policy before
+it allocates anything, and refuses the whole add with `EINVAL` rather than
+clamping, as the build refuses an over-ceiling base graph:
+
+- `fault_policy` must be `skip` or `tolerate`, the policies whose effect
+  stays on the faulting module. `restart` releases the module's provider
+  layers and flushes its channels, which other owners may hold, and
+  `restart_graph` names the whole graph, so a workload cannot have either.
+- When a deadline is declared, the step deadline and the effective burst
+  deadline must each fit `16 ×` the domain's shortest tick (its
+  `tick_min_us` on an adaptive-cadence domain, else its tick), and never
+  more than 100 ms. The node's ticks are the ones that count, not those the
+  image was built against. A module that declares neither deadline runs on
+  the node's defaults and is not checked against this ceiling.
+
+The admitted budget is put on the module's fault record before it
+instantiates. The record starts empty, so a reused slot keeps nothing from
+its last occupant. For a live-added module the FLXA record is the only
+source of its deadline and fault policy. The build rejects the same things
+first (`workload_step_budget`), so an image that builds is one a node with
+the same domain ticks will admit.
+
+### Node tags in a workload's params
+
+A base graph's builder adds tags to a module's params TLV that grant the
+module something of the node's. A module in a workload is a tenant, so the
+add refuses its params with `EINVAL`, before anything is allocated, if the
+TLV carries any of these node tags (`scheduler::is_node_param_tag`):
+
+| Tag | Setting | Why a workload cannot set it |
+|-----|---------|------------------------------|
+| `0xF0`–`0xF3`, `0xF6` | step deadline, fault policy, restart count, restart backoff, burst deadline | Declared in the FLXA module record and admitted there |
+| `0xF4` | trust tier | The loader's signature check decides it |
+| `0xF5` | protection level | Gating turns the platform's protection regime on for the whole node, and isolation draws a private region from the shared allocator |
+| `0xF7` | quarantine partner | A global module index, which would tie the module's faults to another owner's module |
+| `0xFB`, `0xFC` | ISR cycle budget, hardware IRQ | Interrupt resources of the node |
+| `0xFD` | device window | Maps a register block into the module's domain |
+
+The walk is the one `parse_protection_config` uses: entries after the
+`0xFE` header, up to the `0xFF` end marker. A node tag with any length
+counts. Extended entries after the end marker (`[tag][0][len BE]`, such as
+`tls` credentials) are not read as tags.
+
+The heap flags `0xF8` (zero on free), `0xF9` (fault on alloc failure) and
+`0xFA` (canary) are allowed. They change how the module's own heap behaves
+and size nothing. That heap is the module's arena, and the add charges the
+module's state plus arena to its owner's `state_cap`.
+
+The build refuses the same things first. A workload module may not declare
+`trust_tier`, `protection`, `device_window`, `isr_budget_cycles`, `irq`
+(unless the module's schema has an `irq` param of its own),
+`quarantine_partner`, `max_restarts`, `restart_backoff_ms` or `voices`.
+`voices` presets are packed under tag `0xFD`. The build also checks the
+packed params bytes with the same walk the kernel uses.
+
 ## Where tier is declared
 
 YAML graphs declare tier on the domain:

@@ -34,6 +34,9 @@ use super::{
     MAX_CHANNELS, MAX_MODULES, SCHED,
 };
 use crate::kernel::boot::config::ModuleEntry;
+use crate::kernel::exec::step_guard::{
+    FaultPolicy, ModuleFaultInfo, BURST_MULTIPLIER, DEFAULT_STEP_DEADLINE_US,
+};
 use crate::kernel::module::loader::ModuleLoader;
 use crate::kernel::workload::owner::{OwnerHandle, OwnerState, OWNER_SYSTEM};
 
@@ -64,7 +67,7 @@ const _: () = assert!(WORK_MODULES <= u8::MAX as usize + 1);
 /// Reserved `Endpoint::Existing` global index marking a **net-facing
 /// spare-lane edge** in a FLXA blob ( option A). The workload manager composes
 /// a `net=own` workload's FLXA off-node and CANNOT express
-/// `Endpoint::ExistingChannel` — the FLXA v1 wire has no channel-endpoint
+/// `Endpoint::ExistingChannel` — the FLXA wire has no channel-endpoint
 /// kind, and the spare-lane channel id is a kernel runtime value unknowable
 /// off-node. So a `net=own` template emits its net-facing producer edge with
 /// `to = Existing(SPARE_LANE_SENTINEL)`; the metal backend
@@ -72,7 +75,7 @@ const _: () = assert!(WORK_MODULES <= u8::MAX as usize + 1);
 /// next free spare lane and rewrites the edge to `ExistingChannel(lane)` (via
 /// [`apply_add_encoded_spare_lane`]). `0xFFFF` is never a real live module
 /// slot (`MAX_MODULES` ≪ `0xFFFF`), so the marker is unambiguous and rides the
-/// EXISTING FLXA v1 wire with NO codec/ABI change (`decode_endpoint(1,
+/// FLXA wire with no codec change (`decode_endpoint(1,
 /// 0xFFFF)` round-trips to `Existing(0xFFFF)`).
 pub const SPARE_LANE_SENTINEL: u16 = 0xFFFF;
 
@@ -93,6 +96,136 @@ pub enum ModuleSource {
 pub struct AddModule {
     pub source: ModuleSource,
     pub domain_id: u8,
+    /// The step budget the subgraph declares for this module, admitted by
+    /// [`admit_step_budget`] before anything is allocated and seated on the
+    /// module's fault record when it instantiates. It is the module's only
+    /// source of deadline and fault policy: an add refuses params that
+    /// carry a fault tag, or any other node tag
+    /// ([`super::is_node_param_tag`]).
+    pub budget: StepBudget,
+}
+
+/// A module's step budget as a subgraph declares it: the same three settings
+/// a base graph's YAML gives a module (`step_deadline_us`,
+/// `step_deadline_burst_us`, `fault_policy`), carried per module by the FLXA
+/// module record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StepBudget {
+    /// Step deadline in microseconds; `0` is the node's default
+    /// (`DEFAULT_STEP_DEADLINE_US`).
+    pub deadline_us: u32,
+    /// Burst re-step deadline in microseconds; `0` is
+    /// `deadline × BURST_MULTIPLIER`.
+    pub burst_us: u32,
+    /// What an overrun or step error does. A workload is admitted only a
+    /// policy confined to the faulting module
+    /// ([`FaultPolicy::confined_to_module`]).
+    pub policy: FaultPolicy,
+}
+
+impl StepBudget {
+    /// No declaration: the node's default deadline, the multiplier burst,
+    /// `Skip`. What a module gets when its graph says nothing.
+    pub const NODE_DEFAULT: StepBudget = StepBudget {
+        deadline_us: 0,
+        burst_us: 0,
+        policy: FaultPolicy::Skip,
+    };
+
+    /// Whether the budget declares a deadline of either kind. An undeclared
+    /// budget runs on the node's defaults and is never measured against the
+    /// ceiling, as a base-graph module that declares none is not.
+    pub const fn declares_deadline(&self) -> bool {
+        self.deadline_us != 0 || self.burst_us != 0
+    }
+
+    /// The burst deadline the budget runs under: the declared one, else the
+    /// declared (or default) step deadline × `BURST_MULTIPLIER` — the figure
+    /// the burst path uses at run time.
+    pub const fn effective_burst_us(&self) -> u32 {
+        if self.burst_us != 0 {
+            self.burst_us
+        } else {
+            let d = if self.deadline_us != 0 {
+                self.deadline_us
+            } else {
+                DEFAULT_STEP_DEADLINE_US
+            };
+            d.saturating_mul(BURST_MULTIPLIER)
+        }
+    }
+}
+
+/// Absolute ceiling on any declared deadline, step or burst, in
+/// microseconds. Mirrors the build's `HARD_BURST_CAP_US`: no module can
+/// authorise stalling the scheduler longer than this.
+pub const STEP_BUDGET_HARD_CAP_US: u32 = 100_000;
+
+/// The burst ceiling, in domain ticks: a declared deadline fits in this many
+/// of the domain's ticks. Mirrors the build's `16 × domain tick_us` rule.
+pub const STEP_BUDGET_TICKS: u32 = 16;
+
+/// The longest deadline, step or burst, a module in `domain_id` may declare
+/// on this node: `STEP_BUDGET_TICKS` of the domain's shortest tick (its
+/// `tick_min_us` when the domain runs adaptive cadence, else its tick),
+/// never above [`STEP_BUDGET_HARD_CAP_US`]. The figures are the node's, not
+/// the ones the subgraph's author built against.
+pub fn step_budget_ceiling_us(domain_id: u8) -> u32 {
+    let d = domain_id as usize;
+    let tick = if super::domain_adaptive_flags(d) & super::ADAPTIVE_FLAG_CADENCE != 0 {
+        super::domain_tick_min_us(d)
+    } else {
+        super::domain_tick_us(d)
+    };
+    let tick = if tick == 0 { super::tick_us() } else { tick };
+    tick.saturating_mul(STEP_BUDGET_TICKS)
+        .min(STEP_BUDGET_HARD_CAP_US)
+}
+
+/// Why a declared step budget was not admitted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BudgetRefusal {
+    /// The policy reaches past the faulting module (`Restart`,
+    /// `RestartGraph`).
+    Policy,
+    /// The step deadline is above the domain's ceiling.
+    Deadline { ceiling_us: u32 },
+    /// The effective burst deadline is above the domain's ceiling.
+    Burst { ceiling_us: u32 },
+}
+
+/// Admit `b` for a module of a workload in `domain_id`, bounded by the
+/// node's policy: a policy confined to the module, and a step and burst
+/// deadline each within [`step_budget_ceiling_us`]. Refuses rather than
+/// clamps, as the build refuses a base graph's over-ceiling deadline — a
+/// module silently given less time than its graph declared would fault for
+/// a budget nobody chose.
+pub fn admit_step_budget(b: &StepBudget, domain_id: u8) -> Result<(), BudgetRefusal> {
+    if !b.policy.confined_to_module() {
+        return Err(BudgetRefusal::Policy);
+    }
+    if !b.declares_deadline() {
+        return Ok(());
+    }
+    let ceiling_us = step_budget_ceiling_us(domain_id);
+    if b.deadline_us > ceiling_us {
+        return Err(BudgetRefusal::Deadline { ceiling_us });
+    }
+    if b.effective_burst_us() > ceiling_us {
+        return Err(BudgetRefusal::Burst { ceiling_us });
+    }
+    Ok(())
+}
+
+/// Seat an admitted budget on `slot`'s fault record: a fresh record (a slot
+/// a freed owner left keeps nothing of its fault history) carrying the
+/// budget's deadlines and policy.
+fn seat_step_budget(slot: usize, b: StepBudget) {
+    let mut fi = ModuleFaultInfo::new();
+    fi.step_deadline_us = b.deadline_us;
+    fi.step_deadline_burst_us = b.burst_us;
+    fi.policy = b.policy;
+    sched().fault_info[slot] = fi;
 }
 
 /// An endpoint of an [`AddEdge`]: a new module (subgraph-local index) or a
@@ -107,7 +240,7 @@ pub enum Endpoint {
     /// merge already reads — instead of `apply_add` opening a fresh ring. This
     /// is how a runtime `net=own` workload reaches the node's one shared `ip`
     /// through the merge without any runtime merge-state mutation.
-    /// Direct-API only: the FLXA v1 wire has no channel-endpoint kind,
+    /// Direct-API only: the FLXA wire has no channel-endpoint kind,
     /// mirroring `AddEdge::wake_on_write`'s direct-only status.
     ExistingChannel(i32),
     /// A **tap** on a live module's output port (global slot index), valid
@@ -163,7 +296,7 @@ pub struct AddEdge {
     /// semantics as `wake: true` on a base-graph wiring entry, bound with
     /// the same rules as `prepare_graph`'s wiring pass (same-domain
     /// direct edges only). NOT expressible through the FLXA wire codec:
-    /// the v1 per-edge record has no reserved space, so
+    /// the per-edge record has no reserved space, so
     /// `apply_add_encoded` always decodes it as `false`; only direct
     /// [`apply_add`] callers can set it.
     pub wake_on_write: bool,
@@ -216,6 +349,14 @@ pub enum AddError {
     /// An owner already carries the subgraph's identity: live, or staged by
     /// an add still in progress. One identity is one owner.
     OwnerExists,
+    /// A module's declared step budget is outside what the node admits a
+    /// workload ([`admit_step_budget`]). Refused before anything is
+    /// allocated.
+    BudgetRefused,
+    /// A module's params carry a node tag
+    /// ([`super::is_node_param_tag`]): a grant only the node's own graph
+    /// makes. Refused before anything is allocated.
+    NodeParamRefused,
 }
 
 impl AddError {
@@ -234,6 +375,8 @@ impl AddError {
             AddError::StateCapExceeded => -9,
             AddError::NetAttachFailed => -10,
             AddError::OwnerExists => crate::kernel::sys::errno::EEXIST,
+            AddError::BudgetRefused => crate::kernel::sys::errno::EINVAL,
+            AddError::NodeParamRefused => crate::kernel::sys::errno::EINVAL,
         }
     }
 }
@@ -377,13 +520,39 @@ pub fn begin_add(
     if e > MAX_ADD_EDGES {
         return Err(AddError::TooManyEdges);
     }
+    // Every declared step budget is admitted before anything is allocated:
+    // one module over the node's ceiling refuses the whole subgraph.
+    for (i, m) in sub.modules.iter().enumerate() {
+        if let Err(why) = admit_step_budget(&m.budget, m.domain_id) {
+            log::warn!(
+                "[live] module {} of the add refused its step budget (deadline {} us, burst {} us, \
+                 policy {:?}): {:?}",
+                i,
+                m.budget.deadline_us,
+                m.budget.burst_us,
+                m.budget.policy,
+                why,
+            );
+            return Err(AddError::BudgetRefused);
+        }
+        if let ModuleSource::Pic(entry) = &m.source {
+            if let Some(tag) = super::params_node_tag(entry.params()) {
+                log::warn!(
+                    "[live] module {i} of the add refused: its params carry node tag {tag:#04x}"
+                );
+                return Err(AddError::NodeParamRefused);
+            }
+        }
+    }
     let mut mods: [AddModule; WORK_MODULES] = core::array::from_fn(|_| AddModule {
         source: ModuleSource::Pic(ModuleEntry::default()),
         domain_id: 0,
+        budget: StepBudget::NODE_DEFAULT,
     });
     for (w, m) in mods.iter_mut().zip(sub.modules.iter_mut()) {
         w.source = core::mem::replace(&mut m.source, ModuleSource::Pic(ModuleEntry::default()));
         w.domain_id = m.domain_id;
+        w.budget = m.budget;
     }
     let mut edges = [AddEdge::UNUSED; WORK_EDGES];
     edges[..e].copy_from_slice(sub.edges);
@@ -730,6 +899,10 @@ pub fn instantiate_batch(st: &mut StagedAdd, max: usize) -> Result<bool, AddErro
         let local_to_global = st.local_to_global;
         let m = &mut st.mods[local];
         let source = core::mem::replace(&mut m.source, ModuleSource::Pic(ModuleEntry::default()));
+        // The admitted budget is in place before the module's first
+        // instruction. Its params carry no fault tag (`begin_add` refused
+        // any node tag), so the load leaves the record as seated.
+        seat_step_budget(slot, m.budget);
         let res = match source {
             ModuleSource::Builtin(b) => {
                 super::store_builtin_module(slot, b);
@@ -1112,6 +1285,7 @@ fn expand_fans(
                         ..ModuleEntry::default()
                     }),
                     domain_id: mods[l].domain_id,
+                    budget: StepBudget::NODE_DEFAULT,
                 };
                 let wake = group[..g].iter().any(|&ei| edges[ei].wake_on_write);
                 edges[e2] = match dir {
@@ -1677,11 +1851,38 @@ pub fn owner_resume(handle: OwnerHandle) -> Result<(), PauseError> {
 // Integrity/signature verification of the blob is the signing
 // layer's job and the channel is authenticated (the node agent's), so this
 // decoder validates structure and bounds, not a content digest.
+//
+// FLXA layout (all integers big-endian):
+//
+//   header   magic u32 "FLXA" | version u16 = 1 | reserved u16 = 0
+//            owner_uid [16] | state_cap u32 | buffer_cap u32
+//            module_count u8 | edge_count u8
+//   module   name_hash u32 | domain_id u8
+//            step_deadline_us u32 | step_deadline_burst_us u32 | fault_policy u8
+//            params_len u16 | params [params_len]
+//   edge     from_kind u8 | from_idx u16 | from_port u8
+//            to_kind u8 | to_idx u16 | to_port u8 | buffer_bytes u32
+//
+// The module record's step budget is the base graph's three per-module YAML
+// settings: a deadline of `0` is the node's default, a burst of `0` is
+// `deadline × BURST_MULTIPLIER`, and `fault_policy` is numbered as the params
+// TLV's tag `0xF1` (0 skip, 1 restart, 2 restart_graph, 3 tolerate). A policy
+// byte outside that set fails the decode (`EINVAL`); a known policy or a
+// deadline the node does not admit a workload refuses the add
+// ([`admit_step_budget`], also `EINVAL`).
+//
+// A module's params are its own: an add refuses (`EINVAL`) params whose TLV
+// carries a node tag (`is_node_param_tag`: the fault tags, trust tier,
+// protection level, quarantine partner, ISR budget, IRQ, device window),
+// before anything is allocated. Only the node's own graph grants those.
 
 /// Wire magic: "FLXA".
 pub const ADD_MAGIC: u32 = 0x464C_5841;
 /// Wire version.
 pub const ADD_VERSION: u16 = 1;
+/// Bytes of a module record before its params: name_hash, domain_id,
+/// step_deadline_us, step_deadline_burst_us, fault_policy, params_len.
+pub const ADD_MODULE_FIXED_BYTES: usize = 4 + 1 + 4 + 4 + 1 + 2;
 
 /// Minimal big-endian reading cursor over the encoded blob.
 struct Cur<'a> {
@@ -1724,6 +1925,20 @@ fn decode_endpoint(kind: u8, idx: u16) -> Option<Endpoint> {
     }
 }
 
+/// A module record's step budget: deadline, burst, policy. `None` for a
+/// short record or a policy byte no [`FaultPolicy`] names — the decode fails
+/// closed rather than reading an unknown policy as some default.
+fn decode_step_budget(c: &mut Cur<'_>) -> Option<StepBudget> {
+    let deadline_us = c.u32()?;
+    let burst_us = c.u32()?;
+    let policy = FaultPolicy::from_wire(c.u8()?)?;
+    Some(StepBudget {
+        deadline_us,
+        burst_us,
+        policy,
+    })
+}
+
 /// One `Endpoint::Caller` edge of an encoded subgraph: its position among
 /// the blob's edges, its key, and whether it runs into the caller.
 #[derive(Clone, Copy, Default)]
@@ -1747,7 +1962,7 @@ pub fn caller_edges(blob: &[u8], out: &mut [CallerEdge]) -> Option<usize> {
     let mc = c.u8()? as usize;
     let ec = c.u8()? as usize;
     for _ in 0..mc {
-        c.take(4 + 1)?;
+        c.take(ADD_MODULE_FIXED_BYTES - 2)?;
         let plen = c.u16()? as usize;
         c.take(plen)?;
     }
@@ -1809,7 +2024,7 @@ pub fn module_permissions(blob: &[u8]) -> Option<u16> {
     let mut perms = 0u16;
     for _ in 0..mc {
         let name_hash = c.u32()?;
-        c.u8()?;
+        c.take(ADD_MODULE_FIXED_BYTES - 4 - 2)?;
         let plen = c.u16()? as usize;
         c.take(plen)?;
         if let Ok(m) = resolving_loader(name_hash, loader).find_by_name_hash(name_hash) {
@@ -1904,6 +2119,7 @@ unsafe fn apply_add_encoded_inner(arg: *mut u8, arg_len: usize, spare_lane: Opti
     let mut mods: [AddModule; MAX_ADD_MODULES] = core::array::from_fn(|_| AddModule {
         source: ModuleSource::Pic(ModuleEntry::default()),
         domain_id: 0,
+        budget: StepBudget::NODE_DEFAULT,
     });
     for m in mods.iter_mut().take(mc) {
         let name_hash = match c.u32() {
@@ -1912,6 +2128,10 @@ unsafe fn apply_add_encoded_inner(arg: *mut u8, arg_len: usize, spare_lane: Opti
         };
         let domain_id = match c.u8() {
             Some(v) => v,
+            None => return EINVAL,
+        };
+        let budget = match decode_step_budget(&mut c) {
+            Some(b) => b,
             None => return EINVAL,
         };
         let plen = match c.u16() {
@@ -1935,6 +2155,7 @@ unsafe fn apply_add_encoded_inner(arg: *mut u8, arg_len: usize, spare_lane: Opti
         };
         m.source = ModuleSource::Pic(entry);
         m.domain_id = domain_id;
+        m.budget = budget;
     }
 
     let mut edges = [AddEdge {
@@ -1943,7 +2164,7 @@ unsafe fn apply_add_encoded_inner(arg: *mut u8, arg_len: usize, spare_lane: Opti
         to: Endpoint::New(0),
         to_port_index: 0,
         buffer_bytes: 0,
-        // The v1 per-edge wire record (kind/idx/port ×2 + buffer_bytes) has
+        // The per-edge wire record (kind/idx/port ×2 + buffer_bytes) has
         // no reserved space to carry the wake flag; encoded edges are never
         // wake-flagged. See the field doc on `AddEdge::wake_on_write`.
         wake_on_write: false,

@@ -1411,6 +1411,16 @@ pub fn get_fault_stats(module_idx: usize) -> FaultStats {
     }
 }
 
+/// A copy of a module's fault record: its policy, deadlines and fault
+/// state as the step guard reads them. `None` past `MAX_MODULES`.
+pub fn module_fault_info(module_idx: usize) -> Option<ModuleFaultInfo> {
+    if module_idx >= MAX_MODULES {
+        return None;
+    }
+    // SAFETY: scheduler-thread-only read; module_idx bounded above.
+    unsafe { Some(SCHED.fault_info[module_idx]) }
+}
+
 /// Get mutable fault info for a module (for config-time setup).
 pub fn set_module_fault_policy(
     module_idx: usize,

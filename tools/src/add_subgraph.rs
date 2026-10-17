@@ -24,12 +24,121 @@
 //! edges and `apply_add` does not open. Module params are the inline TLV
 //! produced by `schema::build_params_from_schema`; a workload module cannot
 //! reference a `data:`-section blob.
+//!
+//! FLXA layout (big-endian):
+//!
+//! ```text
+//! header  magic u32 "FLXA" | version u16 = 1 | reserved u16 = 0
+//!         owner_uid [16] | state_cap u32 | buffer_cap u32
+//!         module_count u8 | edge_count u8
+//! module  name_hash u32 | domain_id u8
+//!         step_deadline_us u32 | step_deadline_burst_us u32 | fault_policy u8
+//!         params_len u16 | params [params_len]
+//! edge    from_kind u8 | from_idx u16 | from_port u8
+//!         to_kind u8 | to_idx u16 | to_port u8 | buffer_bytes u32
+//! ```
+//!
+//! The module record's step budget carries the module's YAML
+//! `step_deadline_us`, `step_deadline_burst_us` and `fault_policy`, as a
+//! base-graph module declares them (`0` deadline = the node's default, `0`
+//! burst = `deadline × BURST_MULTIPLIER`; the policy byte is numbered as the
+//! params TLV's tag `0xF1`). A workload's fault tags never ride in its params:
+//! the kernel takes a live-added module's budget from this record alone, and
+//! admits it only within the node's ceiling and with a policy confined to the
+//! module (see `config::workload_step_budget`, which refuses at build time
+//! what the kernel would refuse at admission).
 
 /// Wire magic for an `AddSubgraph` blob: "FLXA". Mirrors
 /// `kernel::scheduler::live::ADD_MAGIC`.
 pub const ADD_MAGIC: u32 = 0x464C_5841;
 /// `AddSubgraph` wire version. Mirrors `kernel::scheduler::live::ADD_VERSION`.
 pub const ADD_VERSION: u16 = 1;
+/// Bytes of a module record before its params. Mirrors
+/// `kernel::scheduler::live::ADD_MODULE_FIXED_BYTES`.
+pub const ADD_MODULE_FIXED_BYTES: usize = 4 + 1 + 4 + 4 + 1 + 2;
+
+/// Fault-policy wire bytes, as the kernel's `FaultPolicy::from_wire` reads
+/// them (the params TLV tag `0xF1` uses the same numbering).
+pub const FAULT_POLICY_SKIP: u8 = 0;
+pub const FAULT_POLICY_RESTART: u8 = 1;
+pub const FAULT_POLICY_RESTART_GRAPH: u8 = 2;
+pub const FAULT_POLICY_TOLERATE: u8 = 3;
+
+/// Whether a params TLV tag is a node tag — mirrors the kernel's
+/// `scheduler::is_node_param_tag`: the fault tags (0xF0–0xF3, 0xF6), trust
+/// tier (0xF4), protection level (0xF5), quarantine partner (0xF7), ISR
+/// budget (0xFB), IRQ (0xFC) and device window (0xFD). Only the node's own
+/// graph grants them; a node refuses a workload module whose params carry
+/// one. The heap flags 0xF8–0xFA act on the module's own heap and are not
+/// node tags.
+pub const fn is_node_param_tag(tag: u8) -> bool {
+    matches!(tag, 0xF0..=0xF7 | 0xFB..=0xFD)
+}
+
+/// The first node tag in a params TLV, walked as the kernel walks it
+/// (`scheduler::params_node_tag`): after the `0xFE` header when present, up
+/// to the `0xFF` end marker; extended entries after the marker are not read.
+pub fn params_node_tag(params: &[u8]) -> Option<u8> {
+    if params.len() < 4 {
+        return None;
+    }
+    let mut pos = if params[0] == 0xFE { 4 } else { 0 };
+    while pos + 2 <= params.len() {
+        let tag = params[pos];
+        let len = params[pos + 1] as usize;
+        pos += 2;
+        if tag == 0xFF {
+            break;
+        }
+        if pos + len > params.len() {
+            break;
+        }
+        if is_node_param_tag(tag) {
+            return Some(tag);
+        }
+        pos += len;
+    }
+    None
+}
+
+/// Burst multiplier — mirrors `kernel::step_guard::BURST_MULTIPLIER`.
+const BURST_MULTIPLIER: u32 = 8;
+/// Default step deadline — mirrors
+/// `kernel::step_guard::DEFAULT_STEP_DEADLINE_US` (hardware figure).
+const DEFAULT_STEP_DEADLINE_US: u32 = 2000;
+
+/// A workload module's step budget, as its FLXA record carries it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct StepBudget {
+    /// `step_deadline_us`; `0` = the node's default.
+    pub deadline_us: u32,
+    /// `step_deadline_burst_us`; `0` = `deadline × BURST_MULTIPLIER`.
+    pub burst_us: u32,
+    /// `fault_policy` wire byte (`FAULT_POLICY_*`).
+    pub fault_policy: u8,
+}
+
+impl StepBudget {
+    /// Whether a deadline of either kind is declared. An undeclared budget
+    /// runs on the node's defaults and is not measured against a ceiling.
+    pub fn declares_deadline(&self) -> bool {
+        self.deadline_us != 0 || self.burst_us != 0
+    }
+
+    /// The burst deadline the kernel runs the module under: the declared
+    /// burst, else the declared (or default) deadline × `BURST_MULTIPLIER`.
+    pub fn effective_burst_us(&self) -> u32 {
+        if self.burst_us != 0 {
+            return self.burst_us;
+        }
+        let d = if self.deadline_us != 0 {
+            self.deadline_us
+        } else {
+            DEFAULT_STEP_DEADLINE_US
+        };
+        d.saturating_mul(BURST_MULTIPLIER)
+    }
+}
 /// Resident-workload config-section magic: "FXPD". Mirrors
 /// `kernel::config::WORKLOAD_SECTION_MAGIC`.
 pub const WORKLOAD_SECTION_MAGIC: u32 = 0x4658_5044;
@@ -51,6 +160,8 @@ pub const MAX_WORKLOAD_SECTION_BYTES: usize = 8 * 1024;
 pub struct WorkloadModule {
     pub name_hash: u32,
     pub domain_id: u8,
+    /// The module's declared step budget (FLXA module record).
+    pub budget: StepBudget,
     pub params: Vec<u8>,
 }
 
@@ -160,8 +271,12 @@ pub fn encode_add_subgraph(workload: &Workload) -> Result<Vec<u8>, String> {
     b.push(workload.modules.len() as u8);
     b.push(workload.edges.len() as u8);
     for m in &workload.modules {
+        let record_start = b.len();
         b.extend_from_slice(&m.name_hash.to_be_bytes());
         b.push(m.domain_id);
+        b.extend_from_slice(&m.budget.deadline_us.to_be_bytes());
+        b.extend_from_slice(&m.budget.burst_us.to_be_bytes());
+        b.push(m.budget.fault_policy);
         if m.params.len() > u16::MAX as usize {
             return Err(format!(
                 "workload module params {} bytes exceed u16",
@@ -169,6 +284,7 @@ pub fn encode_add_subgraph(workload: &Workload) -> Result<Vec<u8>, String> {
             ));
         }
         b.extend_from_slice(&(m.params.len() as u16).to_be_bytes());
+        debug_assert_eq!(b.len() - record_start, ADD_MODULE_FIXED_BYTES);
         b.extend_from_slice(&m.params);
     }
     for e in &workload.edges {
@@ -254,6 +370,7 @@ mod tests {
             modules: vec![WorkloadModule {
                 name_hash: 0x1234_5678,
                 domain_id: 0,
+                budget: StepBudget::default(),
                 params: vec![],
             }],
             edges: vec![],
@@ -269,11 +386,93 @@ mod tests {
         assert_eq!(&b[28..32], &0u32.to_be_bytes()); // buffer_cap
         assert_eq!(b[32], 1); // module_count
         assert_eq!(b[33], 0); // edge_count
-                              // module 0: name_hash (BE), domain, params_len (BE) = 0
+                              // module 0: name_hash (BE), domain, step budget, params_len (BE) = 0
         assert_eq!(&b[34..38], &0x1234_5678u32.to_be_bytes());
         assert_eq!(b[38], 0); // domain_id
-        assert_eq!(&b[39..41], &0u16.to_be_bytes()); // params_len
-        assert_eq!(b.len(), 41);
+        assert_eq!(&b[39..43], &0u32.to_be_bytes()); // step_deadline_us
+        assert_eq!(&b[43..47], &0u32.to_be_bytes()); // step_deadline_burst_us
+        assert_eq!(b[47], FAULT_POLICY_SKIP); // fault_policy
+        assert_eq!(&b[48..50], &0u16.to_be_bytes()); // params_len
+        assert_eq!(b.len(), 34 + ADD_MODULE_FIXED_BYTES);
+    }
+
+    #[test]
+    fn module_record_carries_its_step_budget() {
+        let workload = Workload {
+            workload_uid: [0u8; 16],
+            state_cap: 0,
+            buffer_cap: 0,
+            modules: vec![WorkloadModule {
+                name_hash: 0xAABB_CCDD,
+                domain_id: 1,
+                budget: StepBudget {
+                    deadline_us: 12_000,
+                    burst_us: 16_000,
+                    fault_policy: FAULT_POLICY_TOLERATE,
+                },
+                params: vec![0xFE, 0x01],
+            }],
+            edges: vec![],
+            idle_safe: false,
+        };
+        let b = encode_add_subgraph(&workload).unwrap();
+        let m = &b[34..];
+        assert_eq!(&m[0..4], &0xAABB_CCDDu32.to_be_bytes());
+        assert_eq!(m[4], 1);
+        assert_eq!(&m[5..9], &12_000u32.to_be_bytes());
+        assert_eq!(&m[9..13], &16_000u32.to_be_bytes());
+        assert_eq!(m[13], FAULT_POLICY_TOLERATE);
+        assert_eq!(&m[14..16], &2u16.to_be_bytes());
+        assert_eq!(&m[16..18], &[0xFE, 0x01]);
+        assert_eq!(b.len(), 34 + ADD_MODULE_FIXED_BYTES + 2);
+    }
+
+    #[test]
+    fn node_tags_are_found_where_the_kernel_reads_them() {
+        let tlv = |entries: &[u8], ext: &[u8]| {
+            let mut b = vec![0xFE, 0x01, 0, 0];
+            b.extend_from_slice(entries);
+            b.extend_from_slice(&[0xFF, 0x00]);
+            b.extend_from_slice(ext);
+            b
+        };
+        // Schema params and heap flags only.
+        assert_eq!(
+            params_node_tag(&tlv(&[1, 1, 7, 12, 2, 0, 0, 0xF8, 1, 1], &[])),
+            None
+        );
+        // Each node tag, behind an ordinary entry.
+        for tag in [0xF0, 0xF1, 0xF4, 0xF5, 0xF7, 0xFB, 0xFC, 0xFD] {
+            assert_eq!(params_node_tag(&tlv(&[1, 1, 0, tag, 1, 0], &[])), Some(tag));
+        }
+        // A wrong length still counts.
+        assert_eq!(params_node_tag(&tlv(&[0xFD, 1, 0], &[])), Some(0xFD));
+        // Extended entries past the end marker are not node tags, whatever
+        // their tag byte (tls's credentials use [tag][0][len BE]).
+        assert_eq!(params_node_tag(&tlv(&[1, 1, 0], &[0xFD, 0, 0, 1, 9])), None);
+        // A node tag's value bytes are skipped, not read as tags.
+        assert_eq!(params_node_tag(&tlv(&[3, 2, 0xF5, 0xFD], &[])), None);
+    }
+
+    #[test]
+    fn effective_burst_follows_the_kernel_rule() {
+        let none = StepBudget::default();
+        assert!(!none.declares_deadline());
+        assert_eq!(
+            none.effective_burst_us(),
+            DEFAULT_STEP_DEADLINE_US * BURST_MULTIPLIER
+        );
+        let d = StepBudget {
+            deadline_us: 1_500,
+            ..StepBudget::default()
+        };
+        assert_eq!(d.effective_burst_us(), 12_000);
+        let b = StepBudget {
+            deadline_us: 1_500,
+            burst_us: 4_000,
+            ..StepBudget::default()
+        };
+        assert_eq!(b.effective_burst_us(), 4_000);
     }
 
     #[test]
@@ -285,6 +484,7 @@ mod tests {
             modules: vec![WorkloadModule {
                 name_hash: 1,
                 domain_id: 0,
+                budget: StepBudget::default(),
                 params: vec![],
             }],
             edges: vec![
@@ -308,7 +508,7 @@ mod tests {
         assert!(check_net_lanes(&workload.edges).is_ok());
         let b = encode_add_subgraph(&workload).unwrap();
         assert_eq!(b[33], 2); // edge_count
-        let e = &b[41..];
+        let e = &b[34 + ADD_MODULE_FIXED_BYTES..];
         // from Net(2) port 0 -> to New(0) port 0, 0 bytes.
         assert_eq!(&e[0..12], &[3, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
         // from New(0) port 0 -> to Net(2) port 0, 4096 bytes.
@@ -391,6 +591,7 @@ mod tests {
             modules: vec![WorkloadModule {
                 name_hash: 1,
                 domain_id: 0,
+                budget: StepBudget::default(),
                 params: vec![0u8; MAX_WORKLOAD_SECTION_BYTES], // > cap on its own
             }],
             edges: vec![],
@@ -409,6 +610,7 @@ mod tests {
                 .map(|_| WorkloadModule {
                     name_hash: 0,
                     domain_id: 0,
+                    budget: StepBudget::default(),
                     params: vec![],
                 })
                 .collect(),

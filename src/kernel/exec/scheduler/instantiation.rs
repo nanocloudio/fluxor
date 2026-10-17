@@ -715,6 +715,58 @@ pub fn params_request_isolation(params: &[u8]) -> bool {
     params_protection_level(params) >= protection_level::CONTAINED
 }
 
+/// Whether a params TLV tag is a node tag: one only the node's own graph
+/// may give a module, because what it sets is a grant of the node's or
+/// reaches past the module.
+///
+/// - 0xF0–0xF3, 0xF6: step deadline, fault policy, restart count and backoff,
+///   burst deadline. A workload declares these in its FLXA module record,
+///   where they are admitted against the node's ceiling.
+/// - 0xF4: trust tier. The loader's signature check decides it.
+/// - 0xF5: protection level. Gating a module switches the platform's
+///   protection regime on for the whole node, and an isolated module takes
+///   its private region from the shared allocator.
+/// - 0xF7: quarantine partner, a global module index. It would tie the
+///   module's faults to another owner's module.
+/// - 0xFB, 0xFC: ISR cycle budget and hardware IRQ.
+/// - 0xFD: device window, a register block mapped into the module's domain.
+///
+/// The heap flags 0xF8–0xFA (zero on free, fault on alloc failure, canary)
+/// are not node tags. They change how the module's own heap behaves, and
+/// that heap is the module's arena, which is charged to its owner's state
+/// cap.
+pub const fn is_node_param_tag(tag: u8) -> bool {
+    matches!(tag, 0xF0..=0xF7 | 0xFB..=0xFD)
+}
+
+/// The first node tag ([`is_node_param_tag`]) in a params TLV, found by
+/// walking the TLV exactly as [`parse_protection_config`] does: after the
+/// `0xFE` header when one is present, up to the `0xFF` end marker. Any
+/// length counts, including one the parser would skip. `None` when the
+/// params carry no node tag.
+pub fn params_node_tag(params: &[u8]) -> Option<u8> {
+    if params.len() < 4 {
+        return None;
+    }
+    let mut pos = if params[0] == 0xFE { 4 } else { 0 };
+    while pos + 2 <= params.len() {
+        let tag = params[pos];
+        let len = params[pos + 1] as usize;
+        pos += 2;
+        if tag == 0xFF {
+            break;
+        }
+        if pos + len > params.len() {
+            break;
+        }
+        if is_node_param_tag(tag) {
+            return Some(tag);
+        }
+        pos += len;
+    }
+    None
+}
+
 /// Parse protection configuration from module params TLV.
 ///
 /// Recognised tags in the schema-packed params blob:
@@ -731,6 +783,12 @@ pub fn params_request_isolation(params: &[u8]) -> bool {
 /// - 0xFA: heap_canary_enabled (u8 bool)
 /// - 0xFC: irq (u16 LE)
 /// - 0xFD: device window (u64 base LE, u32 size LE)
+///
+/// A module a live add instantiates never reaches this with a node tag
+/// ([`is_node_param_tag`]): the add refuses such params before anything is
+/// allocated, and takes the module's step budget from its FLXA record. What
+/// this can still set for it is the heap flags (0xF8–0xFA), which act on the
+/// module's own heap only.
 pub fn parse_protection_config(module_idx: usize, params: &[u8]) {
     if params.len() < 4 {
         return;
@@ -779,13 +837,7 @@ pub fn parse_protection_config(module_idx: usize, params: &[u8]) {
             }
             0xF1 if len >= 1 => {
                 // fault_policy
-                fi.policy = match params[pos] {
-                    0 => FaultPolicy::Skip,
-                    1 => FaultPolicy::Restart,
-                    2 => FaultPolicy::RestartGraph,
-                    3 => FaultPolicy::Tolerate,
-                    _ => FaultPolicy::Skip,
-                };
+                fi.policy = FaultPolicy::from_wire(params[pos]).unwrap_or(FaultPolicy::Skip);
             }
             0xF2 if len == 2 => {
                 // max_restarts (u16 LE)

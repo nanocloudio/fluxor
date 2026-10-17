@@ -69,7 +69,11 @@ own. `fluxor build <graph> --emit=workload --output <dir>` takes the graph's
 one `workloads:` entry and writes `graph.flxa` (the subgraph as the kernel
 admits it), `modules/<name>.fmod` for every module it names, and
 `workload-image.json` (name, target, module ABI, ABI-surface digest, and
-each module's `name_hash` and SHA-256). `fluxor publish workload <dir>`
+each module's `name_hash` and SHA-256). Each module's `step_deadline_us`,
+`step_deadline_burst_us` and `fault_policy` go in its FLXA record, and the
+node admits them within its own ceiling (see
+[Workload step budgets](../architecture/scheduler.md#workload-step-budgets)).
+`fluxor publish workload <dir>`
 tags it in the local store as `<name>:latest` (or `--tag`): an OCI
 artifact whose first layer is the FLXA and whose other layers are the
 modules, one each. A module layer's digest is the SHA-256 of its bytes,

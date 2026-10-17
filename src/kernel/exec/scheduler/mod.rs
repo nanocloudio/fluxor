@@ -763,7 +763,7 @@ pub mod live;
 #[cfg(feature = "multitenant")]
 pub use live::{
     apply_add, free_owner, AddEdge, AddError, AddModule, AddSubgraph, Endpoint, FreeError,
-    ModuleSource,
+    ModuleSource, StepBudget,
 };
 
 // ============================================================================

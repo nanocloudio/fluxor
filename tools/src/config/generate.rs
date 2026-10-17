@@ -1144,8 +1144,10 @@ pub fn build_workloads(
             }
             // Inline-TLV params — identical packing to base modules, so the kernel
             // reads them via `params_ptr` exactly the same way.
+            let param_schema = schema::load_schema_for_module(mtype, loc)?;
+            refuse_workload_node_keys(m, param_schema.as_ref(), pi, mname)?;
             let params =
-                if let Some(param_schema) = schema::load_schema_for_module(mtype, loc)? {
+                if let Some(param_schema) = param_schema {
                     let mut buf = vec![0u8; MAX_MODULE_PARAMS_SIZE];
                     let plen = schema::build_params_from_schema(
                         m,
@@ -1161,9 +1163,30 @@ pub fn build_workloads(
                 } else {
                     Vec::new()
                 };
+            // The heap flags act on the module's own heap: a workload module
+            // takes them as a base-graph module does, in its params TLV.
+            let params = insert_workload_heap_tags(params, m, mname)?;
+            // What the kernel refuses in a workload's params, refused here by
+            // the bytes it would read.
+            if let Some(tag) = crate::add_subgraph::params_node_tag(&params) {
+                return Err(Error::Config(format!(
+                    "workload {pi} module '{mname}': its params carry node tag {tag:#04x}, \
+                     which a node refuses in a workload (see `is_node_param_tag`)"
+                )));
+            }
+            // The step budget rides the FLXA module record, never the params
+            // TLV: the kernel takes a live-added module's deadline and fault
+            // policy from the record alone, and refuses one outside what it
+            // admits a workload — refused here first, with the reason.
+            let budget = workload_step_budget(
+                m,
+                config,
+                &format!("workload {pi} module '{mname}'"),
+            )?;
             modules.push(crate::add_subgraph::WorkloadModule {
                 name_hash,
                 domain_id,
+                budget,
                 params,
             });
         }
@@ -1269,6 +1292,104 @@ pub fn build_workloads(
         });
     }
     Ok(workloads)
+}
+
+/// YAML keys a base-graph module turns into node tags (the params TLV's
+/// trust tier, protection level, device window, ISR budget, IRQ, quarantine
+/// partner and restart settings), or that would emit one (`voices:` packs
+/// each voice under tag 0xFD, the device-window tag). A workload module is
+/// a tenant of the node: these grants are the node's to make, and a node
+/// refuses a workload module whose params carry any of them. `irq` is a
+/// node key only when the module's schema has no `irq` param of its own.
+const WORKLOAD_NODE_KEYS: &[&str] = &[
+    "trust_tier",
+    "protection",
+    "device_window",
+    "isr_budget_cycles",
+    "irq",
+    "quarantine_partner",
+    "quarantine_partner_idx",
+    "max_restarts",
+    "restart_backoff_ms",
+    "voices",
+];
+
+/// A workload module's `heap:` flags as params TLV entries (0xF8 zero on
+/// free, 0xF9 fault on alloc failure, 0xFA canary), with the base graph's
+/// validation and encoding, inserted before the TLV's end marker. A module
+/// with no schema params gets a TLV of its own for them.
+fn insert_workload_heap_tags(params: Vec<u8>, module: &Value, mname: &str) -> Result<Vec<u8>> {
+    let Some(heap) = module.get("heap") else {
+        return Ok(params);
+    };
+    validate_heap_subtree(module, mname)?;
+    let mut entries = Vec::new();
+    if let Some(v) = heap.get("zero_on_free").and_then(|v| v.as_bool()) {
+        entries.extend_from_slice(&[0xF8, 1, u8::from(v)]);
+    }
+    if heap.get("alloc_failure_policy").and_then(|v| v.as_str()) == Some("fault") {
+        entries.extend_from_slice(&[0xF9, 1, 1]);
+    }
+    if heap.get("canary_enabled").and_then(|v| v.as_bool()) == Some(true) {
+        entries.extend_from_slice(&[0xFA, 1, 1]);
+    }
+    if entries.is_empty() {
+        return Ok(params);
+    }
+    let mut params = if params.is_empty() {
+        vec![0xFE, 0x01, 2, 0, 0xFF, 0x00]
+    } else {
+        params
+    };
+    // The end marker: the first `0xFF` tag of the TLV walk.
+    let mut pos = 4;
+    while pos + 2 <= params.len() && params[pos] != 0xFF {
+        pos += 2 + params[pos + 1] as usize;
+    }
+    if params.first() != Some(&0xFE) || pos + 2 > params.len() {
+        return Err(Error::Config(format!(
+            "workload module '{mname}': its params are not a TLV the heap flags can join"
+        )));
+    }
+    let len = u16::from_le_bytes([params[2], params[3]]) as usize + entries.len();
+    let len = u16::try_from(len).map_err(|_| {
+        Error::Config(format!("workload module '{mname}': params exceed the TLV length"))
+    })?;
+    params.splice(pos..pos, entries);
+    params[2..4].copy_from_slice(&len.to_le_bytes());
+    Ok(params)
+}
+
+/// Refuse a workload module that declares a [`WORKLOAD_NODE_KEYS`] key.
+fn refuse_workload_node_keys(
+    module: &Value,
+    param_schema: Option<&schema::ParamSchema>,
+    pi: usize,
+    mname: &str,
+) -> Result<()> {
+    for key in WORKLOAD_NODE_KEYS {
+        let Some(v) = module.get(*key) else {
+            continue;
+        };
+        if v.is_null() {
+            continue;
+        }
+        if *key == "irq" && param_schema.is_some_and(|s| s.find("irq").is_some()) {
+            continue;
+        }
+        let why = match *key {
+            "voices" => "voice presets are packed under params tag 0xFD, the device-window tag, \
+                         which a node refuses in a workload",
+            "max_restarts" | "restart_backoff_ms" => {
+                "a workload module's fault policy is skip or tolerate, and neither restarts"
+            }
+            _ => "it is a grant of the node's, which only the node's own graph makes",
+        };
+        return Err(Error::Config(format!(
+            "workload {pi} module '{mname}': `{key}` is not available to a workload module: {why}"
+        )));
+    }
+    Ok(())
 }
 
 /// Assign buffer group IDs for aliasable edge chains.

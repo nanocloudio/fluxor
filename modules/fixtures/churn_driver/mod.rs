@@ -242,6 +242,9 @@ fn type_hash(name: &[u8]) -> u32 {
 fn module_u8(o: &mut Out<'_>, name: &[u8], tag1: u8) {
     o.be32(type_hash(name));
     o.u8(0); // domain
+    o.be32(0); // step_deadline_us: the node's default
+    o.be32(0); // step_deadline_burst_us: deadline × BURST_MULTIPLIER
+    o.u8(0); // fault_policy: skip
              // SDK TLV: [FE 01][payload_len LE] [tag][len][value] [FF 00]
     o.be16(9);
     for b in [0xFE, 0x01, 5, 0, 1, 1, tag1, 0xFF, 0x00] {

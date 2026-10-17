@@ -2205,6 +2205,159 @@ fn expand_compound_yaml_fields(type_name: &str, module: &Value, config: &Value) 
     clone
 }
 
+/// A module's u32 YAML setting (`step_deadline_us`,
+/// `step_deadline_burst_us`): `None` when absent or null, else the value
+/// range-checked as a u32. A non-integer or an overflowing value is an
+/// error, never a silent wrap or omission. Shared by the base-graph module
+/// entry and the workload module record, so both read a setting the same
+/// way.
+fn yaml_u32_setting(module: &Value, key: &str, name: &str) -> Result<Option<u32>> {
+    let Some(v) = module.get(key) else {
+        return Ok(None);
+    };
+    if v.is_null() {
+        return Ok(None);
+    }
+    match v.as_u64() {
+        Some(n) if n <= u32::MAX as u64 => Ok(Some(n as u32)),
+        Some(n) => Err(Error::Config(format!(
+            "module '{name}': {key} = {n} exceeds u32::MAX"
+        ))),
+        None => Err(Error::Config(format!(
+            "module '{name}': {key} must be a non-negative integer (got {v})"
+        ))),
+    }
+}
+
+/// A module's `fault_policy` as its wire byte (the params TLV tag `0xF1`
+/// and the FLXA module record share the numbering: 0 skip, 1 restart,
+/// 2 restart_graph, 3 tolerate), or `None` when absent or null.
+fn yaml_fault_policy(module: &Value, name: &str) -> Result<Option<u8>> {
+    let Some(v) = module.get("fault_policy") else {
+        return Ok(None);
+    };
+    if v.is_null() {
+        return Ok(None);
+    }
+    let policy_str = v.as_str().ok_or_else(|| {
+        Error::Config(format!(
+            "module '{name}': fault_policy must be a string \
+             (\"skip\" | \"restart\" | \"restart_graph\" | \"tolerate\"); got {v}"
+        ))
+    })?;
+    match policy_str {
+        "skip" => Ok(Some(crate::add_subgraph::FAULT_POLICY_SKIP)),
+        "restart" => Ok(Some(crate::add_subgraph::FAULT_POLICY_RESTART)),
+        "restart_graph" => Ok(Some(crate::add_subgraph::FAULT_POLICY_RESTART_GRAPH)),
+        // Overruns recorded but never fatal — for storage modules whose
+        // synchronous device ops have a legitimate heavy tail. Step errors
+        // still fault.
+        "tolerate" => Ok(Some(crate::add_subgraph::FAULT_POLICY_TOLERATE)),
+        _ => Err(Error::Config(format!(
+            "module '{name}': fault_policy = '{policy_str}' is invalid \
+             (use \"skip\", \"restart\", \"restart_graph\", or \"tolerate\")"
+        ))),
+    }
+}
+
+/// The step budget a workload module declares, admitted as the node's
+/// kernel admits it (`scheduler::live::admit_step_budget`), so an image
+/// that builds is one a node with the graph's domains takes:
+///
+///   * `fault_policy` is `skip` or `tolerate`. `restart` releases the
+///     module's provider layers and flushes its channels, and
+///     `restart_graph` names the whole graph; both reach past the faulting
+///     module, so a workload is refused them.
+///   * A declared `step_deadline_us` and the effective burst deadline
+///     (`step_deadline_burst_us`, else `step_deadline_us ×
+///     BURST_MULTIPLIER`) each fit `16 ×` the domain's shortest tick
+///     (`tick_min_us` on an adaptive-cadence domain) and the absolute
+///     `HARD_BURST_CAP_US`. The burst rule is the base graph's
+///     (`validate_scheduler_budgets`); the step deadline is held to the
+///     same ceiling because the kernel holds a workload to it.
+///
+/// The node checks again against its own ticks: the domains this image was
+/// built against are the author's, not necessarily the node's.
+pub(crate) fn workload_step_budget(
+    module: &Value,
+    config: &Value,
+    label: &str,
+) -> Result<crate::add_subgraph::StepBudget> {
+    let deadline = yaml_u32_setting(module, "step_deadline_us", label)?;
+    let burst = yaml_u32_setting(module, "step_deadline_burst_us", label)?;
+    let policy = yaml_fault_policy(module, label)?.unwrap_or(crate::add_subgraph::FAULT_POLICY_SKIP);
+    if policy == crate::add_subgraph::FAULT_POLICY_RESTART
+        || policy == crate::add_subgraph::FAULT_POLICY_RESTART_GRAPH
+    {
+        return Err(Error::Config(format!(
+            "{label}: fault_policy {} is not available to a workload module: it reaches past \
+             the faulting module (restart releases its provider layers and flushes channels \
+             other owners may hold; restart_graph names the whole graph), and a node admits a \
+             workload only a policy confined to the module. Use \"skip\" or \"tolerate\".",
+            module.get("fault_policy").map(|v| v.to_string()).unwrap_or_default()
+        )));
+    }
+    let budget = crate::add_subgraph::StepBudget {
+        deadline_us: deadline.unwrap_or(0),
+        burst_us: burst.unwrap_or(0),
+        fault_policy: policy,
+    };
+    if !budget.declares_deadline() {
+        return Ok(budget);
+    }
+    let domain = resolve_domain_id(module, config)? as usize;
+    let domains = config
+        .get("execution")
+        .and_then(|e| e.get("domains"))
+        .and_then(|d| d.as_array());
+    let dom = domains.and_then(|d| d.get(domain));
+    let graph_tick = config
+        .get("tick_us")
+        .or_else(|| config.get("execution").and_then(|e| e.get("tick_us")))
+        .and_then(|v| v.as_u64())
+        .filter(|t| *t > 0)
+        .unwrap_or(DEFAULT_TICK_US as u64);
+    let domain_tick = dom
+        .and_then(|d| d.get("tick_us"))
+        .and_then(|v| v.as_u64())
+        .filter(|t| *t > 0)
+        .unwrap_or(graph_tick);
+    let cadence = dom
+        .and_then(|d| d.get("adaptive_flags"))
+        .and_then(|v| v.as_u64())
+        .is_some_and(|f| f & ADAPTIVE_FLAG_CADENCE as u64 != 0);
+    let floor_tick = if cadence {
+        dom.and_then(|d| d.get("tick_min_us"))
+            .and_then(|v| v.as_u64())
+            .filter(|t| *t > 0)
+            .unwrap_or(domain_tick)
+    } else {
+        domain_tick
+    };
+    let ceiling = floor_tick
+        .saturating_mul(16)
+        .min(HARD_BURST_CAP_US as u64);
+    if budget.deadline_us as u64 > ceiling {
+        return Err(Error::Config(format!(
+            "{label}: step_deadline_us = {} exceeds the {ceiling} us a workload module may \
+             declare in its domain (16 × its shortest tick of {floor_tick} us, at most \
+             {HARD_BURST_CAP_US} us)",
+            budget.deadline_us
+        )));
+    }
+    let burst_eff = budget.effective_burst_us();
+    if burst_eff as u64 > ceiling {
+        return Err(Error::Config(format!(
+            "{label}: burst deadline {burst_eff} us (step_deadline_burst_us, else \
+             step_deadline_us × {BURST_DEADLINE_MULTIPLIER}) exceeds the {ceiling} us a workload \
+             module may declare in its domain (16 × its shortest tick of {floor_tick} us, at \
+             most {HARD_BURST_CAP_US} us). Declare step_deadline_burst_us explicitly, or lower \
+             step_deadline_us."
+        )));
+    }
+    Ok(budget)
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "module-entry compilation threads the resolved graph context (config, manifests, modules_dir); splitting it into a context struct is a larger refactor than the argument count warrants"
@@ -2471,64 +2624,25 @@ fn build_module_entry(
     // explicitly so a malformed YAML value can't disable the field.
 
     // Tag 0xF0: step_deadline_us (u32, 4 bytes)
-    if let Some(v) = module.get("step_deadline_us") {
-        if !v.is_null() {
-            let deadline = match v.as_u64() {
-                Some(n) if n <= u32::MAX as u64 => n as u32,
-                Some(n) => {
-                    return Err(Error::Config(format!(
-                        "module '{name}': step_deadline_us = {n} exceeds u32::MAX"
-                    )));
-                }
-                None => {
-                    return Err(Error::Config(format!(
-                        "module '{name}': step_deadline_us must be a non-negative \
-                         integer (got {v})"
-                    )));
-                }
-            };
-            if base + extra_len + 6 < entry.len() {
-                entry[base + extra_len] = 0xF0;
-                entry[base + extra_len + 1] = 4;
-                let bytes = deadline.to_le_bytes();
-                entry[base + extra_len + 2..base + extra_len + 6].copy_from_slice(&bytes);
-                extra_len += 6;
-            }
+    if let Some(deadline) = yaml_u32_setting(module, "step_deadline_us", name)? {
+        if base + extra_len + 6 < entry.len() {
+            entry[base + extra_len] = 0xF0;
+            entry[base + extra_len + 1] = 4;
+            let bytes = deadline.to_le_bytes();
+            entry[base + extra_len + 2..base + extra_len + 6].copy_from_slice(&bytes);
+            extra_len += 6;
         }
     }
 
-    // Tag 0xF1: fault_policy (u8: 0=skip, 1=restart, 2=restart_graph).
-    // Unknown policy strings error explicitly; the accepted set
-    // mirrors the kernel-side `FaultPolicy` enum.
-    if let Some(v) = module.get("fault_policy") {
-        if !v.is_null() {
-            let policy_str = v.as_str().ok_or_else(|| {
-                Error::Config(format!(
-                    "module '{name}': fault_policy must be a string \
-                     (\"skip\" | \"restart\" | \"restart_graph\" | \"tolerate\"); got {v}"
-                ))
-            })?;
-            let policy_val: u8 = match policy_str {
-                "skip" => 0,
-                "restart" => 1,
-                "restart_graph" => 2,
-                // Overruns recorded but never fatal — for storage
-                // modules whose synchronous device ops have a
-                // legitimate heavy tail. Step errors still fault.
-                "tolerate" => 3,
-                _ => {
-                    return Err(Error::Config(format!(
-                        "module '{name}': fault_policy = '{policy_str}' is invalid \
-                         (use \"skip\", \"restart\", \"restart_graph\", or \"tolerate\")"
-                    )));
-                }
-            };
-            if base + extra_len + 3 < entry.len() {
-                entry[base + extra_len] = 0xF1;
-                entry[base + extra_len + 1] = 1;
-                entry[base + extra_len + 2] = policy_val;
-                extra_len += 3;
-            }
+    // Tag 0xF1: fault_policy (u8: 0=skip, 1=restart, 2=restart_graph,
+    // 3=tolerate). Unknown policy strings error explicitly; the accepted
+    // set mirrors the kernel-side `FaultPolicy` enum.
+    if let Some(policy_val) = yaml_fault_policy(module, name)? {
+        if base + extra_len + 3 < entry.len() {
+            entry[base + extra_len] = 0xF1;
+            entry[base + extra_len + 1] = 1;
+            entry[base + extra_len + 2] = policy_val;
+            extra_len += 3;
         }
     }
 
@@ -2619,29 +2733,13 @@ fn build_module_entry(
     // values, but `build_module_entry` runs in paths that bypass the
     // validator (e.g. built-in packing tests); enforcing here too
     // keeps the wire tag from ever being silently wrapped.
-    if let Some(v) = module.get("step_deadline_burst_us") {
-        if !v.is_null() {
-            let burst_us = match v.as_u64() {
-                Some(n) if n <= u32::MAX as u64 => n as u32,
-                Some(n) => {
-                    return Err(Error::Config(format!(
-                        "module '{name}': step_deadline_burst_us = {n} exceeds u32::MAX"
-                    )));
-                }
-                None => {
-                    return Err(Error::Config(format!(
-                        "module '{name}': step_deadline_burst_us must be a non-negative \
-                         integer (got {v})"
-                    )));
-                }
-            };
-            let burst = burst_us.to_le_bytes();
-            if base + extra_len + 6 < entry.len() {
-                entry[base + extra_len] = 0xF6;
-                entry[base + extra_len + 1] = 4;
-                entry[base + extra_len + 2..base + extra_len + 6].copy_from_slice(&burst);
-                extra_len += 6;
-            }
+    if let Some(burst_us) = yaml_u32_setting(module, "step_deadline_burst_us", name)? {
+        let burst = burst_us.to_le_bytes();
+        if base + extra_len + 6 < entry.len() {
+            entry[base + extra_len] = 0xF6;
+            entry[base + extra_len + 1] = 4;
+            entry[base + extra_len + 2..base + extra_len + 6].copy_from_slice(&burst);
+            extra_len += 6;
         }
     }
 
