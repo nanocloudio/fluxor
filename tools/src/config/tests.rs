@@ -577,7 +577,7 @@ mod scheduler_validation_tests {
             "workloads": [{"modules": [
                 {"name": "kv", "type": "workload_pic_mod", "domain": "coop",
                  "step_deadline_us": 12000, "step_deadline_burst_us": 16000,
-                 "fault_policy": "tolerate"},
+                 "fault_policy": "skip"},
                 {"name": "plain", "type": "workload_pic_mod2", "domain": "coop"}
             ]}]
         });
@@ -588,7 +588,7 @@ mod scheduler_validation_tests {
             crate::add_subgraph::StepBudget {
                 deadline_us: 12_000,
                 burst_us: 16_000,
-                fault_policy: crate::add_subgraph::FAULT_POLICY_TOLERATE,
+                fault_policy: crate::add_subgraph::FAULT_POLICY_SKIP,
             }
         );
         assert_eq!(m[1].budget, crate::add_subgraph::StepBudget::default());
@@ -596,7 +596,7 @@ mod scheduler_validation_tests {
         // First module record: name_hash, domain, then the budget.
         assert_eq!(&blob[39..43], &12_000u32.to_be_bytes());
         assert_eq!(&blob[43..47], &16_000u32.to_be_bytes());
-        assert_eq!(blob[47], crate::add_subgraph::FAULT_POLICY_TOLERATE);
+        assert_eq!(blob[47], crate::add_subgraph::FAULT_POLICY_SKIP);
     }
 
     /// What the kernel refuses a workload, the build refuses first: a
@@ -622,10 +622,11 @@ mod scheduler_validation_tests {
             }
             base
         };
-        for policy in ["restart", "restart_graph"] {
+        for policy in ["restart", "restart_graph", "tolerate"] {
             let err = build(m(json!({"fault_policy": policy})), dom.clone()).unwrap_err();
             assert!(err.contains("not available to a workload module"), "{err}");
         }
+        build(m(json!({"fault_policy": "skip"})), dom.clone()).expect("skip is admitted");
         let err = build(m(json!({"fault_policy": "forever"})), dom.clone()).unwrap_err();
         assert!(err.contains("is invalid"), "{err}");
         let err = build(

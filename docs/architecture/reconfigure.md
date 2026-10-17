@@ -119,12 +119,13 @@ Each subscriber is called once per released owner, whatever number of contracts
 it serves. The return value is ignored: a provider with nothing to release may
 answer `-ENOSYS`.
 
-After the subscribers, the platform's own hook runs with the same handle: on
-Linux it closes the owner's store and removes its storage root, on bcm2712 it
-drops the owner's keys and watches. Once the owner's modules are torn down,
-the kernel closes every tracked provider handle the owner still held, file,
-namespace and object handles among them, so nothing a workload opened
-outlives it.
+After the subscribers, the platform's own hook runs with the same handle. On
+Linux it closes every file the owner holds open, drops its store with the
+reads, writes and watches on it, and removes its storage root. The kernel
+keeps no table of storage handles: each platform provider records which owner
+opened each handle and refuses it to any other, so the hook alone is enough
+for nothing a workload opened to outlive it. On bcm2712 the store is the
+node's alone, so a workload holds nothing there to release.
 
 ## Modules for Workloads Staged at Runtime
 

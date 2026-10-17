@@ -288,6 +288,10 @@ cannot be evaluated from its own file reads `—` and says why.
 | Kernel module-section bound | `MAX_MODULE_SECTION` | src/kernel/boot/config.rs | 524288 | The kernel-side bound on the module section: 512 KiB on linux, wasm and bcm2712 — the same as `MAX_CONFIG_SIZE`, since the section is nearly all of a large graph's config — 32 KiB on the RP parts. A section past it is refused while parsing, before any module is instantiated. Registered separately from `MAX_MODULE_CONFIG_SIZE`, the per-module cap it must hold, so the pair cannot drift apart unnoticed |
 | Store read slots | `STORE_MAX_READS` | src/platform/linux/store.rs | 32 | Policy: `GET`-opened read slots on the Linux store at once. A slot holds one value snapshot the caller drains by `RANGE_GET`, so the table bounds how many reads a node can have in flight; an open past it is `ENOMEM` |
 | Store streaming-write slots | `STORE_MAX_WRITES` | src/platform/linux/store.rs | 32 | Policy: `PUT_STREAMED_OPEN`-opened write slots at once, matched to `STORE_MAX_READS` and for the same reason — one slot per operation in flight. An S3 server fronting this store streams every object write, so writes need the depth reads have; an open past it is `ENOMEM` |
+| Workload store watches | `OWNER_MAX_SUBS` | src/platform/linux/store.rs | 16 | Policy: `SUBSCRIBE` watches one workload's own store holds at once. Each owner's store has handle tables of its own, sized for one tenant rather than the node; a watch past it is `ENOMEM` |
+| Workload store reads | `OWNER_MAX_READS` | src/platform/linux/store.rs | 8 | Policy: `GET` read slots one workload's own store holds open at once; a read past it is `ENOMEM` |
+| Workload store streaming writes | `OWNER_MAX_WRITES` | src/platform/linux/store.rs | 4 | Policy: `PUT_STREAMED_OPEN` write slots one workload's own store holds at once; an open past it is `ENOMEM` |
+| Workload staged streaming write | `OWNER_STAGE_MAX` | src/platform/linux/store.rs | 16777216 | Policy: 16 MiB, the bytes one of a workload's streamed writes may stage before its commit. Staged bytes are also charged to the owner's storage ledger, so its `storage_bytes` cap bounds them first when it is lower; past either the write is `ENOSPC` |
 | HTTP concurrent connections | `MAX_CONCURRENT_CONNS` | modules/sdk/abi/config.rs | 256 | Policy: the http module's own table, below `MAX_TCP_CONNS`; an accept past it is closed before any request is read. The embedded 4 is sized against the 8-slot TCP table in that profile; the one-session TLS table beneath it bounds HTTPS. 4 on embedded. |
 | HTTP per-connection receive buffer | `RECV_BUF_SIZE` | modules/sdk/abi/config.rs | 8192 | Policy: a whole request line, headers and a small body in one read; a request that does not fit is refused 431, not spilled 4096 on wasm, 2048 on embedded. |
 | HTTP per-connection send buffer | `SEND_BUF_SIZE` | modules/sdk/abi/config.rs | 4100 | Policy, deliberately 4 KiB + 4: a WebSocket frame of exactly 4096 bytes of payload plus its header fits in one write, so the RFC 6455 fragmentation path is taken only by frames that genuinely exceed it |
@@ -310,7 +314,7 @@ cannot be evaluated from its own file reads `—` and says why.
 | Buffer-arena free-region list | `MAX_FREE_REGIONS` | src/kernel/ipc/buffer_pool.rs | 128 | Deliberate cap with a stated degradation: returned regions are kept coalesced, so the list holds one entry per gap in the arena, not per closed channel; a region returned while it is full is leaked (reported by `buffer_free_list_usage`) until the next `reset_buffer_arena` |
 | State-arena free-region list | `MAX_FREE_REGIONS` | src/kernel/module/loader.rs | 32 | Deliberate cap with a stated degradation: when the list is full a freed region is leaked until the next full arena reset, which is what a reconfigure does anyway |
 | Isolated-image arena | `ISO_ARENA_SIZE` | src/kernel/module/loader.rs | 2097152 | Policy (`kernel-vm`): all isolated module state and heap of one image; exhaustion refuses the load |
-| Tracked provider handles | `MAX_TRACKED` | src/kernel/module/provider.rs | — | Policy, per profile (512 multitenant / 128 single-owner): handle-to-owner bindings the kernel keeps for cross-owner checks and for closing what an owner held when it is released. A multi-tenant kernel tracks every file, namespace and object handle besides the untagged ones, so the table is sized to the platform's slot tables; a single-tenant kernel scopes nothing by owner and keeps the table small. An open past it is refused, and the table is scanned on every provider call |
+| Tracked provider handles | `MAX_TRACKED` | src/kernel/module/provider.rs | 128 | Policy: handle-to-owner bindings the kernel keeps for cross-owner checks on untagged handles (GPIO pins, DMA channels, HAL handles). A tagged handle's provider keeps its own slots and answers each to its opener, so it takes no entry. An open past the table is refused, and the table is scanned on every provider call, so it is kept small on purpose |
 | Provider vtables | `MAX_PROVIDERS` | src/kernel/module/provider.rs | 64 | Derived, not chosen: one vtable slot per contract id, so a contract registerable in one and not the other is impossible by construction |
 | Contracts per provider module | `MAX_CONTRACTS_PER_PROVIDER` | src/kernel/module/loader.rs | 4 | Policy: the contracts one provider state may serve through `module_provides_contracts` (a store owning its objects and their namespace needs two); entries past it are not registered |
 | Dynamic tag routes | `MAX_DYN_TAG_ROUTES` | src/kernel/module/provider.rs | 4 | Policy: keyed provider routes a policy module may add at runtime |
@@ -656,8 +660,7 @@ TICK_BOUND_MAX | src/kernel/boot/config.rs | 50_000 | *
 MAX_FREE_REGIONS | src/kernel/ipc/buffer_pool.rs | 128 | *
 MAX_FREE_REGIONS | src/kernel/module/loader.rs | 32 | *
 ISO_ARENA_SIZE | src/kernel/module/loader.rs | 2 * 1024 * 1024 | kernel-vm
-MAX_TRACKED | src/kernel/module/provider.rs | 512 | multitenant
-MAX_TRACKED | src/kernel/module/provider.rs | 128 | single-owner
+MAX_TRACKED | src/kernel/module/provider.rs | 128 | *
 MAX_PROVIDERS | src/kernel/module/provider.rs | MAX_CONTRACTS | *
 MAX_DYN_TAG_ROUTES | src/kernel/module/provider.rs | 4 | *
 MAX_KEY_BYTES | src/kernel/security/key_vault.rs | 64 | *
@@ -698,6 +701,10 @@ STORE_MAX_READS | src/platform/linux/store.rs | 32 | *
 STORE_MAX_WRITES | src/platform/linux/store.rs | 32 | *
 STORE_STAGE_MAX | src/platform/linux/store.rs | 64 * 1024 * 1024 | *
 STORE_STAGE_RESERVE_MAX | src/platform/linux/store.rs | 1024 * 1024 | *
+OWNER_MAX_SUBS | src/platform/linux/store.rs | 16 | *
+OWNER_MAX_READS | src/platform/linux/store.rs | 8 | *
+OWNER_MAX_WRITES | src/platform/linux/store.rs | 4 | *
+OWNER_STAGE_MAX | src/platform/linux/store.rs | 16 * 1024 * 1024 | *
 ```
 
 Constants in these files that are shaped like ceilings but are not
@@ -726,7 +733,7 @@ IO_READ_BUDGET | modules/drivers/nvme/mod.rs | mirror of IO_READ_BUDGET_MS, a ti
 PAGER_SUBMIT_BUDGET | modules/drivers/nvme/mod.rs | mirror of PAGER_SUBMIT_BUDGET_MS, a timeout and not a capacity, re-exported to the host-test controller model
 MAX_HEADER | src/kernel/security/key_vault.rs | derived: the persisted-record header, magic through the longest label
 MAX_BLOB_NAME | src/kernel/security/key_vault.rs | derived: the durable name, namespace and the longest label
-PEER_MAX | src/kernel/security/key_share.rs | derived: an uncompressed P-256 point, the one encapsulation a v1 envelope carries
+PEER_MAX | src/kernel/security/key_share.rs | derived: an uncompressed P-256 point, the one encapsulation an envelope carries
 MUX_DATA_MAX | modules/foundation/quic/mod.rs | derived: mux::MUX_QUIC_STREAM_RX_MAX, the contract's published bound
 NET_BUF_SIZE | modules/foundation/quic/mod.rs | scratch: one net frame around one QUIC packet
 ERR_STREAM_LIMIT | modules/foundation/quic/connection.rs | RFC 9000 §20.1 transport error code STREAM_LIMIT_ERROR, a protocol constant

@@ -65,18 +65,18 @@ const WORK_EDGES: usize = MAX_ADD_EDGES + MAX_FAN_MODULES;
 const _: () = assert!(WORK_MODULES <= u8::MAX as usize + 1);
 
 /// Reserved `Endpoint::Existing` global index marking a **net-facing
-/// spare-lane edge** in a FLXA blob ( option A). The workload manager composes
-/// a `net=own` workload's FLXA off-node and CANNOT express
-/// `Endpoint::ExistingChannel` — the FLXA wire has no channel-endpoint
-/// kind, and the spare-lane channel id is a kernel runtime value unknowable
+/// spare-lane edge** in a FLXA blob. The workload manager composes a
+/// `net=own` workload's FLXA off-node and cannot express
+/// `Endpoint::ExistingChannel`: the FLXA wire has no channel-endpoint kind,
+/// and the spare-lane channel id is a kernel runtime value unknowable
 /// off-node. So a `net=own` template emits its net-facing producer edge with
 /// `to = Existing(SPARE_LANE_SENTINEL)`; the metal backend
-/// (`workload_graph.rs`), between decode and apply, resolves the boot merge's
-/// next free spare lane and rewrites the edge to `ExistingChannel(lane)` (via
-/// [`apply_add_encoded_spare_lane`]). `0xFFFF` is never a real live module
-/// slot (`MAX_MODULES` ≪ `0xFFFF`), so the marker is unambiguous and rides the
-/// FLXA wire with no codec change (`decode_endpoint(1,
-/// 0xFFFF)` round-trips to `Existing(0xFFFF)`).
+/// (`workload_graph.rs`) resolves the boot merge's next free spare lane, and
+/// the decode rewrites the edge to `ExistingChannel(lane)` (see
+/// [`begin_add_encoded`] and [`apply_add_encoded_spare_lane`]). `0xFFFF` is
+/// never a live module slot (`MAX_MODULES` ≪ `0xFFFF`), so the marker is
+/// unambiguous, and the wire carries it as an ordinary existing endpoint
+/// (`decode_endpoint(1, 0xFFFF)` is `Existing(0xFFFF)`).
 pub const SPARE_LANE_SENTINEL: u16 = 0xFFFF;
 
 /// How a new module is instantiated.
@@ -360,23 +360,24 @@ pub enum AddError {
 }
 
 impl AddError {
-    /// Negative errno-style code for the syscall surface.
+    /// The negative errno the syscall surface answers. A malformed subgraph
+    /// is `EINVAL` before any of these: each refusal here is distinct from
+    /// it, and from every other, wherever the meaning differs.
     pub fn code(self) -> i32 {
+        use crate::kernel::sys::errno;
         match self {
-            AddError::TooManyModules => -1,
-            AddError::TooManyEdges => -2,
-            AddError::OwnerSlotsExhausted => -3,
-            AddError::PlanMismatch => -4,
-            AddError::NoFreeSlot => -5,
-            AddError::BadEndpoint => -6,
-            AddError::ChannelOpenFailed => -7,
-            AddError::Instantiate => -8,
-            AddError::WouldBlock => -11, // -EAGAIN
-            AddError::StateCapExceeded => -9,
-            AddError::NetAttachFailed => -10,
-            AddError::OwnerExists => crate::kernel::sys::errno::EEXIST,
-            AddError::BudgetRefused => crate::kernel::sys::errno::EINVAL,
-            AddError::NodeParamRefused => crate::kernel::sys::errno::EINVAL,
+            AddError::TooManyModules | AddError::TooManyEdges => errno::E2BIG,
+            AddError::OwnerSlotsExhausted | AddError::NoFreeSlot | AddError::StateCapExceeded => {
+                errno::ENOSPC
+            }
+            AddError::PlanMismatch | AddError::BadEndpoint => errno::EINVAL,
+            AddError::ChannelOpenFailed => errno::ENOMEM,
+            AddError::Instantiate => errno::ENOEXEC,
+            AddError::WouldBlock => errno::EAGAIN,
+            AddError::NetAttachFailed => errno::EBUSY,
+            AddError::OwnerExists => errno::EEXIST,
+            AddError::BudgetRefused => errno::ERANGE,
+            AddError::NodeParamRefused => errno::EACCES,
         }
     }
 }
@@ -1088,19 +1089,8 @@ pub fn finish_staged(st: StagedAdd) -> Result<OwnerHandle, AddError> {
     super::rebuild_resident_graph_index();
     // Publication complete — release the parked peer cores (no-op if none).
     release_peers(parked);
-    // SAFETY: scheduler thread, like the add.
-    unsafe { *core::ptr::addr_of_mut!(LAST_ADD_EDGE_BASE) = edge_base };
     Ok(handle)
 }
-
-/// Where the last published add's edges begin in the scheduler's edge
-/// table, for a caller that finds its own lanes among them.
-pub fn last_add_edge_base() -> usize {
-    // SAFETY: scheduler thread.
-    unsafe { *core::ptr::addr_of!(LAST_ADD_EDGE_BASE) }
-}
-
-static mut LAST_ADD_EDGE_BASE: usize = 0;
 
 /// Roll a staged add back: what instantiated is freed, its channels close,
 /// its edges go and its owner is revoked, as a failed add's would.
@@ -1212,7 +1202,6 @@ fn rollback_add(handle: OwnerHandle, slots: &[usize], edge_base: usize, e: usize
         s.slot_generation[slot] = s.slot_generation[slot].wrapping_add(1);
         super::set_module_owner(slot, OWNER_SYSTEM);
     }
-    crate::kernel::module::provider::release_owner_handles(handle);
     if e > 0 {
         detach_taps(edge_base, e);
         super::close_channels(&s.edges[edge_base..edge_base + e]);
@@ -1726,8 +1715,6 @@ pub fn free_owner(handle: OwnerHandle) -> Result<(), FreeError> {
     super::recompute_domain_orders(affected);
 
     // 5. Revoke the handle. The generation guard now rejects it.
-    // What the owner opened on the platform closes with it.
-    crate::kernel::module::provider::release_owner_handles(handle);
     sched().owners.free(handle);
     // The owner's own modules' code, when it brought a pack: nothing of the
     // owner runs any more (its modules are unspliced, their handles and
@@ -2005,6 +1992,10 @@ fn resolving_loader(name_hash: u32, node: &ModuleLoader) -> &ModuleLoader {
     }
 }
 
+/// The fmod header's module type that runs at `CAP_FULL` (see the loader's
+/// cap-class mapping in `wiring.rs`).
+const MODULE_TYPE_PROTOCOL: u8 = 5;
+
 /// The union of the manifest permissions of the modules an `AddSubgraph`
 /// blob names, each resolved by `name_hash` against the node's loader; a
 /// name the loader cannot resolve adds nothing (the add itself refuses it).
@@ -2028,7 +2019,13 @@ pub fn module_permissions(blob: &[u8]) -> Option<u16> {
         let plen = c.u16()? as usize;
         c.take(plen)?;
         if let Ok(m) = resolving_loader(name_hash, loader).find_by_name_hash(name_hash) {
-            perms |= m.manifest_permissions();
+            // A `Protocol` module runs at `CAP_FULL`, which reaches every
+            // contract and passes every permission check: it holds them all.
+            perms |= if m.header.module_type == MODULE_TYPE_PROTOCOL {
+                u16::MAX
+            } else {
+                m.manifest_permissions()
+            };
         }
     }
     Some(perms)
@@ -2079,41 +2076,90 @@ pub unsafe fn apply_add_encoded_spare_lane(arg: *mut u8, arg_len: usize, spare_l
 }
 
 /// Shared decode+apply body for [`apply_add_encoded`] /
-/// [`apply_add_encoded_spare_lane`]. `spare_lane`:
-///   * `None`         — no metal rewrite (sentinel → `BadEndpoint`),
-///   * `Some(l)` l>=0 — rewrite a sentinel `to` to `ExistingChannel(l)`,
-///   * `Some(l)` l<0  — a sentinel with no resolved lane → `-ENOMEM`.
+/// [`apply_add_encoded_spare_lane`]: the whole add in this call.
 ///
 /// # Safety
 /// As [`apply_add_encoded`].
 unsafe fn apply_add_encoded_inner(arg: *mut u8, arg_len: usize, spare_lane: Option<i32>) -> i32 {
-    const EINVAL: i32 = -22;
-    const ENOMEM: i32 = -12;
     if arg.is_null() {
-        return EINVAL;
+        return crate::kernel::sys::errno::EINVAL;
     }
     // SAFETY: caller guarantees `arg`/`arg_len` describe a valid buffer.
     let bytes = unsafe { core::slice::from_raw_parts(arg, arg_len) };
+    // SAFETY: the modules' params are borrowed from `bytes`, which outlives
+    // the add: it completes within this call.
+    match unsafe { decode_add(bytes, spare_lane, |sub| apply_add(sub, None)) } {
+        Ok(Ok(handle)) => {
+            // SAFETY: a decoded blob is longer than the handle's 6 bytes.
+            unsafe { write_handle(core::slice::from_raw_parts_mut(arg, 6), handle) };
+            0
+        }
+        Ok(Err(e)) => e.code(),
+        Err(e) => e,
+    }
+}
+
+/// Decode an encoded subgraph and stage it, for an add its caller finishes
+/// over several calls (see [`StagedAdd`]). `spare_lane` as for
+/// [`apply_add_encoded_spare_lane`]. `EINVAL` for a malformed blob, or the
+/// negative [`AddError::code`].
+///
+/// # Safety
+/// `bytes` must stay valid and unchanged until the staged add is published
+/// or abandoned: its modules' params are read from it as they instantiate.
+pub unsafe fn begin_add_encoded(bytes: &[u8], spare_lane: Option<i32>) -> Result<StagedAdd, i32> {
+    // SAFETY: forwarded contract.
+    match unsafe { decode_add(bytes, spare_lane, |sub| begin_add(sub, None)) } {
+        Ok(Ok(st)) => Ok(st),
+        Ok(Err(e)) => Err(e.code()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Write an owner handle as an add reports it: `[slot:u16 LE][generation:u32
+/// LE]` into `out[0..6]`.
+pub fn write_handle(out: &mut [u8], handle: OwnerHandle) {
+    out[0..2].copy_from_slice(&handle.slot.to_le_bytes());
+    out[2..6].copy_from_slice(&handle.generation.to_le_bytes());
+}
+
+/// Decode an encoded subgraph and hand it to `f`. `spare_lane`:
+///   * `None`         — no metal rewrite (sentinel → `BadEndpoint`),
+///   * `Some(l)` l>=0 — rewrite a sentinel `to` to `ExistingChannel(l)`,
+///   * `Some(l)` l<0  — a sentinel with no resolved lane → `-ENOMEM`.
+///
+/// `Err(EINVAL)` for a malformed blob, before `f` runs.
+///
+/// # Safety
+/// The decoded modules' params borrow `bytes`; `f` and whatever it keeps
+/// must not outlive it.
+unsafe fn decode_add<R>(
+    bytes: &[u8],
+    spare_lane: Option<i32>,
+    f: impl FnOnce(AddSubgraph<'_>) -> R,
+) -> Result<R, i32> {
+    const EINVAL: i32 = -22;
+    const ENOMEM: i32 = -12;
     let mut c = Cur::new(bytes);
 
     if c.u32() != Some(ADD_MAGIC) || c.u16() != Some(ADD_VERSION) || c.u16().is_none() {
-        return EINVAL;
+        return Err(EINVAL);
     }
     let owner_uid: [u8; 16] = match c.take(16) {
         Some(s) => s.try_into().unwrap(),
-        None => return EINVAL,
+        None => return Err(EINVAL),
     };
     let (state_cap, buffer_cap) = match (c.u32(), c.u32()) {
         (Some(s), Some(b)) => (s, b),
-        _ => return EINVAL,
+        _ => return Err(EINVAL),
     };
     let mc = match c.u8() {
         Some(n) if (n as usize) <= MAX_ADD_MODULES => n as usize,
-        _ => return EINVAL,
+        _ => return Err(EINVAL),
     };
     let ec = match c.u8() {
         Some(n) if (n as usize) <= MAX_ADD_EDGES => n as usize,
-        _ => return EINVAL,
+        _ => return Err(EINVAL),
     };
 
     let mut mods: [AddModule; MAX_ADD_MODULES] = core::array::from_fn(|_| AddModule {
@@ -2124,23 +2170,23 @@ unsafe fn apply_add_encoded_inner(arg: *mut u8, arg_len: usize, spare_lane: Opti
     for m in mods.iter_mut().take(mc) {
         let name_hash = match c.u32() {
             Some(v) => v,
-            None => return EINVAL,
+            None => return Err(EINVAL),
         };
         let domain_id = match c.u8() {
             Some(v) => v,
-            None => return EINVAL,
+            None => return Err(EINVAL),
         };
         let budget = match decode_step_budget(&mut c) {
             Some(b) => b,
-            None => return EINVAL,
+            None => return Err(EINVAL),
         };
         let plen = match c.u16() {
             Some(v) => v as usize,
-            None => return EINVAL,
+            None => return Err(EINVAL),
         };
         let params = match c.take(plen) {
             Some(s) => s,
-            None => return EINVAL,
+            None => return Err(EINVAL),
         };
         let entry = ModuleEntry {
             name_hash,
@@ -2186,10 +2232,10 @@ unsafe fn apply_add_encoded_inner(arg: *mut u8, arg_len: usize, spare_lane: Opti
             to_port,
             buffer_bytes,
         ) else {
-            return EINVAL;
+            return Err(EINVAL);
         };
         let (Some(from), Some(mut to)) = (decode_endpoint(fk, fi), decode_endpoint(tk, ti)) else {
-            return EINVAL;
+            return Err(EINVAL);
         };
         // Net-facing spare-lane sentinel: the composer marks the
         // net-facing producer's `to` as `Existing(SPARE_LANE_SENTINEL)` because
@@ -2201,7 +2247,7 @@ unsafe fn apply_add_encoded_inner(arg: *mut u8, arg_len: usize, spare_lane: Opti
                 Some(l) if l >= 0 => to = Endpoint::ExistingChannel(l),
                 // net=own with no free spare lane / no boot merge — fail closed
                 // before anything is allocated (clean, no rollback needed).
-                Some(_) => return ENOMEM,
+                Some(_) => return Err(ENOMEM),
                 // Plain apply (host-shared): leave the sentinel; it resolves to
                 // no module and `apply_add` rejects it (BadEndpoint), unchanged.
                 None => {}
@@ -2214,154 +2260,13 @@ unsafe fn apply_add_encoded_inner(arg: *mut u8, arg_len: usize, spare_lane: Opti
         edge.buffer_bytes = bb;
     }
 
-    let sub = AddSubgraph {
+    Ok(f(AddSubgraph {
         owner_uid,
         modules: &mut mods[..mc],
         edges: &edges[..ec],
         state_cap,
         buffer_cap,
-    };
-    // A single-tenant kernel admits no owner, so no add is ever staged
-    // across calls; the whole add runs in one call, as the composer's does.
-    #[cfg(not(feature = "multitenant"))]
-    {
-        let _ = bytes;
-        return match apply_add(sub, None) {
-            Ok(handle) => {
-                if arg_len >= 6 {
-                    // SAFETY: arg has >= 6 writable bytes (checked).
-                    unsafe {
-                        let slot = handle.slot.to_le_bytes();
-                        let gen = handle.generation.to_le_bytes();
-                        *arg = slot[0];
-                        *arg.add(1) = slot[1];
-                        *arg.add(2) = gen[0];
-                        *arg.add(3) = gen[1];
-                        *arg.add(4) = gen[2];
-                        *arg.add(5) = gen[3];
-                    }
-                }
-                0
-            }
-            Err(e) => e.code(),
-        };
-    }
-    // One add is staged at a time, and continued by the same blob: a caller
-    // asks again with the same bytes until the add is published. A different
-    // blob while one is staged is refused; the staged add is finished or
-    // abandoned first.
-    #[cfg(feature = "multitenant")]
-    let hash = blob_hash(bytes);
-    #[cfg(feature = "multitenant")]
-    {
-        // SAFETY: scheduler thread, like every add.
-        let pending = unsafe { &mut *core::ptr::addr_of_mut!(STAGED_ADD) };
-        match pending {
-            Some((h, _)) if *h != hash => return crate::kernel::sys::errno::EBUSY,
-            Some(_) => {}
-            None => match begin_add(sub, None) {
-                Ok(st) => *pending = Some((hash, st)),
-                Err(e) => return e.code(),
-            },
-        }
-        let Some((_, mut st)) = pending.take() else {
-            return EINVAL;
-        };
-        match instantiate_batch(&mut st, ADD_MODULES_PER_CALL) {
-            Err(e) => e.code(),
-            Ok(false) => {
-                *pending = Some((hash, st));
-                crate::kernel::sys::errno::EINPROGRESS
-            }
-            Ok(true) => match finish_staged(st) {
-                Ok(handle) => {
-                    if arg_len < 6 {
-                        // Applied, but no room to report the handle — caller can
-                        // still free by owner_uid via a future op; treat as success.
-                        return 0;
-                    }
-                    // SAFETY: arg has >= 6 writable bytes (checked).
-                    unsafe {
-                        let slot = handle.slot.to_le_bytes();
-                        let gen = handle.generation.to_le_bytes();
-                        *arg = slot[0];
-                        *arg.add(1) = slot[1];
-                        *arg.add(2) = gen[0];
-                        *arg.add(3) = gen[1];
-                        *arg.add(4) = gen[2];
-                        *arg.add(5) = gen[3];
-                    }
-                    0
-                }
-                Err(e) => e.code(),
-            },
-        }
-    }
-}
-
-/// Modules an encoded add instantiates per call. A `CREATE` that stages a
-/// large subgraph answers `EINPROGRESS` between batches, so no single call
-/// holds the scheduler for longer than a few module loads.
-pub const ADD_MODULES_PER_CALL: usize = 4;
-
-/// The encoded add in progress, keyed by its blob's hash. Only a kernel
-/// that admits owners stages one.
-#[cfg(feature = "multitenant")]
-static mut STAGED_ADD: Option<(u64, StagedAdd)> = None;
-
-/// FNV-1a over an add's blob: what tells a continuation from a new add.
-#[cfg(feature = "multitenant")]
-fn blob_hash(bytes: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for &b in bytes {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    h
-}
-
-/// The identity of the encoded add in progress, if any.
-pub fn staged_add_identity() -> Option<[u8; 16]> {
-    #[cfg(feature = "multitenant")]
-    // SAFETY: scheduler thread.
-    unsafe {
-        (*core::ptr::addr_of!(STAGED_ADD))
-            .as_ref()
-            .map(|(_, st)| st.owner_uid())
-    }
-    #[cfg(not(feature = "multitenant"))]
-    None
-}
-
-/// The owner the encoded add in progress reserved, if any.
-pub fn staged_add_handle() -> Option<OwnerHandle> {
-    #[cfg(feature = "multitenant")]
-    // SAFETY: scheduler thread.
-    unsafe {
-        (*core::ptr::addr_of!(STAGED_ADD))
-            .as_ref()
-            .map(|(_, st)| st.handle())
-    }
-    #[cfg(not(feature = "multitenant"))]
-    None
-}
-
-/// Roll the encoded add in progress back. `false` when none is staged.
-pub fn abandon_staged_add() -> bool {
-    #[cfg(feature = "multitenant")]
-    {
-        // SAFETY: scheduler thread.
-        let pending = unsafe { (*core::ptr::addr_of_mut!(STAGED_ADD)).take() };
-        match pending {
-            Some((_, st)) => {
-                abandon_staged(st);
-                true
-            }
-            None => false,
-        }
-    }
-    #[cfg(not(feature = "multitenant"))]
-    false
+    }))
 }
 
 /// Decode `[slot:u16 LE, generation:u32 LE]` and free that owner.

@@ -475,7 +475,7 @@ unsafe fn dtls_pump_send_certificate_verify(s: &mut TlsState, idx: usize) -> boo
     let mut raw_sig = [0u8; 64];
     let mut signed_via_vault = false;
     if s.key_vault_handle >= 0 {
-        // SIGN v1, `DIGEST` explicitly: `vc_hash` IS the digest. Leaving the
+        // SIGN, `DIGEST` explicitly: `vc_hash` IS the digest. Leaving the
         // mode to be inferred from the key type is how a message passed here
         // gets signed as though it were one.
         const SIGN_MODE_DIGEST: u8 = 1;
@@ -630,25 +630,17 @@ unsafe fn dtls_pump_recv_encrypted_extensions(s: &mut TlsState, idx: usize) -> b
     true
 }
 
-unsafe fn dtls_pump_recv_certificate(s: &mut TlsState, idx: usize) -> bool {
-    let (data, len, msg_type, is_server) = {
-        let endpoint = &mut s.peer_sessions[idx].endpoint;
-        let is_server = endpoint.driver.is_server;
-        match endpoint.driver.read_handshake_message() {
-            Some((d, l, t)) => (d, l, t, is_server),
-            None => return false,
-        }
-    };
-    if msg_type != HT_CERTIFICATE {
-        s.peer_sessions[idx].endpoint.driver.hs_state = HandshakeState::Error;
-        return true;
-    }
-    if let Some(ref mut t) = s.peer_sessions[idx].endpoint.driver.transcript {
-        t.update(&data[..len]);
-    }
-    // The same acceptance decision the TCP path makes, from the same module
-    // policy: a datagram transport does not get a weaker peer identity.
-    let body = &data[4..len];
+/// The DTLS peer's Certificate message `body`, judged by the same
+/// acceptance decision the TCP path makes, from the same module policy: a
+/// datagram transport does not get a weaker peer identity. On acceptance
+/// the leaf's key and principal are bound to the peer's driver; a refusal
+/// is logged. Returns [`CERT_OK`] or the reason.
+unsafe fn dtls_accept_peer_certificate(
+    s: &mut TlsState,
+    idx: usize,
+    is_server: bool,
+    body: &[u8],
+) -> u32 {
     let mut deferred = core::mem::replace(
         &mut s.peer_sessions[idx].endpoint.driver.deferred_links,
         DeferredLinks::empty(),
@@ -681,10 +673,36 @@ unsafe fn dtls_pump_recv_certificate(s: &mut TlsState, idx: usize) -> bool {
     if rc == CERT_OK {
         rc = bind_peer_cert_key(&mut s.peer_sessions[idx].endpoint.driver, body);
     }
+    if rc == CERT_OK {
+        let (p, n) = peer_principal_of(s, body);
+        s.peer_sessions[idx].endpoint.driver.peer_principal = p;
+        s.peer_sessions[idx].endpoint.driver.peer_principal_len = n;
+    }
     if rc != CERT_OK {
         // DTLS peers have no IP-module conn_id; the peer-slot index is the
         // stable per-transport identifier, as for MSG_PEER_IDENTITY.
         log_peer_auth_failure(s, idx as u16, rc);
+    }
+    rc
+}
+
+unsafe fn dtls_pump_recv_certificate(s: &mut TlsState, idx: usize) -> bool {
+    let (data, len, msg_type, is_server) = {
+        let endpoint = &mut s.peer_sessions[idx].endpoint;
+        let is_server = endpoint.driver.is_server;
+        match endpoint.driver.read_handshake_message() {
+            Some((d, l, t)) => (d, l, t, is_server),
+            None => return false,
+        }
+    };
+    if msg_type != HT_CERTIFICATE {
+        s.peer_sessions[idx].endpoint.driver.hs_state = HandshakeState::Error;
+        return true;
+    }
+    if let Some(ref mut t) = s.peer_sessions[idx].endpoint.driver.transcript {
+        t.update(&data[..len]);
+    }
+    if dtls_accept_peer_certificate(s, idx, is_server, &data[4..len]) != CERT_OK {
         s.peer_sessions[idx].endpoint.driver.hs_state = HandshakeState::Error;
         return true;
     }
@@ -706,10 +724,7 @@ unsafe fn dtls_pump_rsa_verify(s: &mut TlsState, idx: usize) -> bool {
     }
     s.rsa_owner = owner;
     let rows = rsa_rows(s);
-    let selected = selected_anchor(
-        s,
-        s.peer_sessions[idx].endpoint.driver.deferred_links.anchor,
-    );
+    let selected = selected_anchor(s, &s.peer_sessions[idx].endpoint.driver.deferred_links);
     let anchor = core::slice::from_raw_parts(selected.as_ptr(), selected.len());
     let job: *mut RsaVerifyJob = &mut s.rsa_verify;
     let ec_bits = ec_bits_per_step(s);
@@ -966,10 +981,21 @@ unsafe fn emit_peer_identity_dtls(s: &mut TlsState, idx: usize) {
         (peer_result::NO_CREDENTIAL, peer_credential::NONE, 0u32)
     } else {
         let mut f = peer_check::CHAIN | peer_check::KEY_POSSESSION | peer_check::EKU;
-        if s.clock_policy == CLOCK_POLICY_REQUIRE && s.peer_auth == PROFILE_CA_DNS {
+        if validity_enforced(s) {
             f |= peer_check::VALIDITY;
         }
         (peer_result::OK, peer_credential::X509_MTLS, f)
+    };
+    let pl = s.peer_sessions[idx].endpoint.driver.peer_principal_len as usize;
+    let principal: &[u8] = if pk_len > 0 && pl > 0 {
+        &s.peer_sessions[idx].endpoint.driver.peer_principal[..pl]
+    } else {
+        &[]
+    };
+    let flags = if principal.is_empty() {
+        flags
+    } else {
+        flags | peer_check::SAN
     };
     let identity = PeerIdentity {
         session_id: idx as u32,
@@ -981,7 +1007,7 @@ unsafe fn emit_peer_identity_dtls(s: &mut TlsState, idx: usize) {
         verification_flags: flags,
         key_fp_alg: peer_fp_alg::SHA256,
         key_fingerprint: fingerprint,
-        principal: &[],
+        principal,
     };
     let mut envelope = [0u8; PEER_IDENTITY_MAX_TOTAL];
     let total = build_peer_identity_envelope(&identity, &mut envelope);

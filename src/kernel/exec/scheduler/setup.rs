@@ -124,7 +124,10 @@ pub fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i3
     // A rebuild drops every workload, and with them the code packs they
     // brought.
     #[cfg(feature = "multitenant")]
-    crate::kernel::workload::code_pack::reset();
+    {
+        crate::kernel::workload::workload_graph::reset_pending();
+        crate::kernel::workload::code_pack::reset();
+    }
     // Drop any EL0-isolation page tables from a previous graph so a
     // reconfigure rebuilds them from the new graph's regions. No-op on
     // non-BCM2712 platforms.

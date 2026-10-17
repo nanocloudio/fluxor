@@ -364,19 +364,26 @@ fn linux_verify_integrity(computed: &[u8], expected: &[u8]) -> bool {
     computed == expected
 }
 
-/// OTA staging page-permission flip: RW while staging bytes land, RX
-/// once committed (W^X — the staged region is only ever writable OR
-/// executable). The staging buffer is 16 KiB-aligned static BSS —
-/// covering the host kernel's actual page size (Raspberry Pi OS
-/// aarch64 runs 16 KiB pages), which is also what the range is
-/// rounded to here; a 4 KiB assumption made `mprotect` fail EINVAL on
-/// such kernels.
+/// Staged-code page-permission flip, for the OTA staging buffers and the
+/// workload code pool: RW while bytes land, RX once committed (W^X — a
+/// staged region is only ever writable OR executable). `base` must start a
+/// host page, and the caller owns its buffer out to the end of the last
+/// page `len` reaches: the range is rounded up, never down, so no change
+/// reaches a neighbour before `base`. A base that is not page-aligned is
+/// refused rather than rounded onto a neighbour.
 fn linux_ota_stage_protect(base: *mut u8, len: usize, executable: bool) -> bool {
-    // SAFETY: sysconf on a valid selector; falls back defensively.
+    // SAFETY: sysconf on a valid selector.
     let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    let page = if page > 0 { page as usize } else { 16384 };
-    let start = (base as usize) & !(page - 1);
-    let end = (base as usize + len + page - 1) & !(page - 1);
+    if page <= 0 {
+        return false;
+    }
+    let page = page as usize;
+    let start = base as usize;
+    if !start.is_multiple_of(page) {
+        log::error!("[ota] stage protect: base {start:#x} is not aligned to the host's {page}-byte page");
+        return false;
+    }
+    let end = (start + len + page - 1) & !(page - 1);
     let prot = if executable {
         libc::PROT_READ | libc::PROT_EXEC
     } else {

@@ -899,7 +899,7 @@ unsafe fn write_dec3(p: *mut u8, pos: &mut usize, v: u32) {
 /// Prints the fields that stay meaningful in steady state: state-machine
 /// position, fault code, admin queue indices, current LBA, block-phase.
 ///
-/// Takes `&mut` because `walk_pcie_caps` now caches the discovered MSI-X
+/// Takes `&mut` because `walk_pcie_caps` caches the discovered MSI-X
 /// capability offset into state so step_create_io_cq doesn't have to
 /// re-walk the cap list.
 unsafe fn heartbeat(s: &mut NvmeState) {

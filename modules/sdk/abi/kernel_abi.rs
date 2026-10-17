@@ -137,21 +137,16 @@ pub struct SyscallTable {
     /// Release a handle, invoking the contract's close hook if any.
     pub provider_close: unsafe extern "C" fn(handle: i32) -> i32,
 
-    /// Copy up to `len` bytes from the head of a FIFO channel into
-    /// `buf` WITHOUT advancing the read pointer. Returns the number
-    /// of bytes copied (0 if empty), or a negative errno (`EINVAL`
-    /// for null buf, mailbox channels, or invalid handles).
+    /// Copy up to `len` bytes from the head of a channel into `buf`
+    /// without consuming them: from a FIFO, the head of its stream; from a
+    /// mailbox, the head of its pending record, which stays pending.
+    /// Returns the number of bytes copied (0 when nothing is buffered), or
+    /// `EINVAL` for a null buffer or an invalid handle.
     ///
-    /// Used by frame-aware consumers that need to inspect a header
-    /// (e.g. message type + payload length + conn_id) before
-    /// committing to consume the frame. Lets the consumer leave a
-    /// non-deliverable frame on the channel so the producer's
-    /// flow-control kicks in instead of the consumer silently
-    /// dropping bytes.
-    ///
-    /// Mailbox channels are not peekable (the payload is delivered
-    /// as an opaque buffer reference, not a byte stream); peek
-    /// returns `EINVAL` on those.
+    /// Used by frame-aware consumers that inspect a header (message type,
+    /// payload length, connection id) before committing to consume the
+    /// frame, so a frame that cannot be delivered yet stays on the channel
+    /// and the producer's flow control holds.
     pub channel_peek: unsafe extern "C" fn(handle: i32, buf: *mut u8, len: usize) -> i32,
     /// Producer-side telemetry enabled gate. Points at a kernel-published
     /// `u32` that is non-zero when at least one telemetry consumer is
@@ -185,10 +180,12 @@ pub struct SyscallTable {
         arg_len: usize,
     ) -> i32,
 
-    /// Drop the next `len` bytes of a FIFO channel's stream without copying
-    /// them: what is buffered goes at once, and the rest is dropped from the
-    /// front of each later write as it arrives. Returns `len`, or `EINVAL`
-    /// for a bad handle or a mailbox channel.
+    /// Drop the next `len` bytes of a channel's stream without copying
+    /// them. On a FIFO, what is buffered goes at once and the rest is
+    /// dropped from the front of each later write as it arrives; returns
+    /// `len`, or `EINVAL` for a bad handle or a `len` past `i32::MAX`. On a
+    /// mailbox the unit is the record: a non-zero `len` releases the pending
+    /// record whole and returns its length, or `EAGAIN` when none is pending.
     ///
     /// The consuming half of a whole-frame read: a frame-aware consumer
     /// peeks the header, peeks the frame once it is all buffered, and
@@ -329,6 +326,9 @@ pub mod errno {
     pub const EBUSY: i32 = -16;
     /// No such device.
     pub const ENODEV: i32 = -19;
+    /// A module that cannot be brought up: no module of that name, or one
+    /// whose constructor refused.
+    pub const ENOEXEC: i32 = -8;
     /// Invalid argument.
     pub const EINVAL: i32 = -22;
     /// Operation in progress (async not yet complete).

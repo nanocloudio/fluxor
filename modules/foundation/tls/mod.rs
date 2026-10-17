@@ -960,7 +960,8 @@ struct TlsState {
 
     /// Configured trust anchors, DER, in configured order: the
     /// deployment's bundle (`trust`) first, then any the operator appended
-    /// at launch (`fluxor run --ca`). Under `pinned` each is a certificate
+    /// at launch (`fluxor run --ca`), then the issuer adopted under
+    /// `trust_issuer` once a certified chain has arrived. Under `pinned` each is a certificate
     /// whose subject public key is pinned; under `ca_dns` / `ca_uri` each
     /// is a certificate authority. Retained whole because closing a path
     /// needs an anchor's subject name as well as its key. A handshake
@@ -989,8 +990,8 @@ struct TlsState {
     clear_pending_len: usize,
     clear_pending_conn: u16,
     clear_pending_idx: u16,
-    /// How many of `anchors`, counted from the tail, the operator
-    /// appended. Reported with every accepted chain so a log reader can
+    /// How many of the configured `anchors`, counted back from the last
+    /// configured one, the operator appended. Reported with every accepted chain so a log reader can
     /// tell a deployment's trust from a launch-time widening.
     anchor_operator: u8,
     /// A configured anchor was refused — it did not parse under the
@@ -998,6 +999,9 @@ struct TlsState {
     /// then declines to construct rather than run with fewer anchors than
     /// it was given.
     anchor_refused: bool,
+    /// The `key_file` entry was longer than `MAX_KEY_LEN`. A truncated key
+    /// is not a key, so the instance declines to construct.
+    key_refused: bool,
 
     /// `verify_hostname`: the OVERRIDE of the peer identity a client expects.
     /// A stream session takes its name from the target of the
@@ -1337,7 +1341,8 @@ define_params! {
     // A server identity held in the key vault under this label, certified
     // at runtime (identity.rs): the key is opened or generated there and
     // never leaves it, and the certificate arrives on `identity_cert` in
-    // answer to `identity_req`. Replaces `cert_file` / `key_file`.
+    // answer to `identity_req`. Refused beside `cert_file` / `key_file`,
+    // which would name a second identity.
     19, identity_label, str, 0
         => |s, d, len| { s.label_id.set_label(core::slice::from_raw_parts(d, len)); };
 
@@ -1391,6 +1396,7 @@ pub unsafe extern "C" fn module_new(
     s.clear_pending_len = 0;
     s.anchor_operator = 0;
     s.anchor_refused = false;
+    s.key_refused = false;
     s.expected_dns_len = 0;
     s.expected_uri_len = 0;
     s.last_peer_auth_error = 0;
@@ -1496,6 +1502,11 @@ pub unsafe extern "C" fn module_new(
         dev_log(sys, 1, msg.as_ptr(), msg.len());
         return -1;
     }
+    if s.key_refused {
+        let msg = b"[tls] refusing to construct: the identity key exceeds MAX_KEY_LEN (2400 bytes)";
+        dev_log(sys, 1, msg.as_ptr(), msg.len());
+        return -1;
+    }
     // The DTLS client's peer. A datagram session is keyed by the address
     // its records arrive from, so this one is a literal; a peer known only
     // by name has nothing to key on until it answers. A stream instance
@@ -1579,7 +1590,7 @@ pub unsafe extern "C" fn module_new(
             let present = (sys.provider_call)(-1, kv::PROBE, core::ptr::null_mut(), 0);
             let mut handle = -1;
             if present == 1 {
-                // STORE v1: [suite:u16][usage_mask:u32][key_len:u32][key]
+                // STORE: [suite:u16][usage_mask:u32][key_len:u32][key]
                 const USAGE_SIGN: u32 = 1 << 0;
                 let mut store_arg = [0u8; 10 + MAX_KEY_LEN];
                 store_arg[0..2].copy_from_slice(&suite.to_le_bytes());
@@ -1622,7 +1633,7 @@ pub unsafe extern "C" fn module_new(
             } else {
                 extract_ec_private_key(&s.key[..s.key_len], &mut raw);
             }
-            // STORE v1: [suite:u16][usage_mask:u32][key_len:u32][key]
+            // STORE: [suite:u16][usage_mask:u32][key_len:u32][key]
             //
             // The mask is SIGN only. This key exists to sign
             // CertificateVerify and nothing else — not to agree keys (the
@@ -1744,13 +1755,18 @@ unsafe fn parse_extended_params(s: &mut TlsState, params: *const u8, params_len:
                     }
                 }
                 11 => {
-                    let n = if len < MAX_KEY_LEN { len } else { MAX_KEY_LEN };
-                    core::ptr::copy_nonoverlapping(
-                        data.as_ptr().add(data_start),
-                        s.key.as_mut_ptr(),
-                        n,
-                    );
-                    s.key_len = n;
+                    // The identity key, whole or not at all: a truncated
+                    // key is not a key, and construction refuses it.
+                    if len <= MAX_KEY_LEN {
+                        core::ptr::copy_nonoverlapping(
+                            data.as_ptr().add(data_start),
+                            s.key.as_mut_ptr(),
+                            len,
+                        );
+                        s.key_len = len;
+                    } else {
+                        s.key_refused = true;
+                    }
                 }
                 12 | 16 => {
                     // Trust anchors, one bundle per origin: the deployment's
@@ -2212,11 +2228,11 @@ unsafe fn tcp_module_step(s: &mut TlsState) -> i32 {
                 // in server mode is set ONLY by a clear-side CMD_CONNECT (there
                 // is no client-side active-open), so this MSG_CONNECTED completes
                 // that backend dial. It must NOT become a TLS session — the
-                // backend speaks plaintext (backend hops are cleartext
-                // in v1). Mark the conn passthrough and relay MSG_CONNECTED down
-                // RAW; no session alloc, no ClientHello. Client-mode TLS
-                // (mode==0, real outbound TLS) is untouched — it falls through
-                // to the session-allocating path below exactly as before.
+                // backend speaks plaintext (a server instance's backend hops
+                // are cleartext). Mark the conn passthrough and relay
+                // MSG_CONNECTED down RAW; no session alloc, no ClientHello.
+                // Client-mode TLS (mode==0, real outbound TLS) falls through
+                // to the session-allocating path below.
                 if claim && t == NET_MSG_CONNECTED && s.mode == 1 && s.pending_connect_active {
                     let dtag = s.pending_downstream_tag;
                     s.pending_connect_active = false;
@@ -3203,14 +3219,21 @@ fn anchor_set(s: &TlsState) -> AnchorSet<'_> {
 
 /// The anchor a walked chain was accepted under, for the stepped links
 /// that read their issuer key from it. Empty for an index the table does
-/// not hold, which the step then refuses as a signature failure.
-fn selected_anchor(s: &TlsState, index: u8) -> &[u8] {
-    let i = index as usize;
-    if i < s.anchor_count as usize && i < MAX_ANCHORS {
-        &s.anchors[i][..s.anchor_lens[i] as usize]
-    } else {
-        &[]
+/// not hold, and for the adopted issuer's slot when a renewal replaced it
+/// after the walk chose it; the step then refuses either as a signature
+/// failure, so no link verifies against an anchor the walk did not judge.
+fn selected_anchor<'a>(s: &'a TlsState, links: &DeferredLinks) -> &'a [u8] {
+    let i = links.anchor as usize;
+    if i >= s.anchor_count as usize || i >= MAX_ANCHORS {
+        return &[];
     }
+    if s.label_id.trust_issuer != 0
+        && i == s.label_id.static_anchors as usize
+        && links.generation != s.label_id.adopted_generation
+    {
+        return &[];
+    }
+    &s.anchors[i][..s.anchor_lens[i] as usize]
 }
 
 /// Does this instance carry a complete peer-authentication profile for the
@@ -3232,7 +3255,8 @@ fn peer_auth_admissible(s: &TlsState) -> bool {
     // most certainly has trust material behind it.
     // An authority adopted from the instance's own certified chain
     // (`trust_issuer`) is trust that arrives at runtime: until it does, a
-    // chain verifies against nothing and the handshake fails closed.
+    // chain the platform cannot place verifies against nothing and the
+    // handshake fails closed.
     let has_trust = s.anchor_count > 0
         || s.trust_system
         || (s.label_id.trust_issuer != 0 && s.label_id.configured());
@@ -3244,8 +3268,9 @@ fn peer_auth_admissible(s: &TlsState) -> bool {
         // server under `ca_dns` legitimately has no name to expect of a
         // client, whereas under `ca_uri` the URI is the whole
         // authorisation and a policy that names none authorises everyone
-        // the CA ever signed.
-        PROFILE_CA_URI => has_trust && s.expected_uri_len > 0,
+        // the CA ever signed. A name no URI could satisfy under
+        // `uri_matches` is no name either.
+        PROFILE_CA_URI => has_trust && uri_well_formed(&s.expected_uri[..s.expected_uri_len]),
         PROFILE_CA_DNS => {
             if !has_trust {
                 return false;
@@ -3353,20 +3378,23 @@ fn chain_policy<'a>(
         expected_dns,
         expected_ip,
         expected_uri: &s.expected_uri[..s.expected_uri_len],
-        // Only what this build can actually verify. A configured subset is
-        // a policy decision the graph does not express yet; when it does,
-        // this narrows rather than widens — a suite the code cannot check
-        // must never become permitted by configuration.
+        // Every suite this build can verify, and no other: the graph names
+        // no subset, and a suite the code cannot check is never permitted
+        // by configuration.
         allowed_suites: suite::IMPLEMENTED,
         now_unix_secs,
-        // Pinning carries its own lifetime policy: the operator rotates the
-        // pin. Pinning carries its own lifetime policy, but both CA
-        // profiles chain to an anchor whose certificates have real validity
-        // windows.
-        require_clock: s.clock_policy == CLOCK_POLICY_REQUIRE
-            && (s.peer_auth == PROFILE_CA_DNS || s.peer_auth == PROFILE_CA_URI),
+        require_clock: validity_enforced(s),
         require_eku,
     }
+}
+
+/// Whether certificate lifetimes are enforced: under `clock_policy =
+/// require`, for the two CA profiles, which chain to an anchor whose
+/// certificates have real validity windows. Pinning carries its own
+/// lifetime policy: the operator rotates the pin.
+fn validity_enforced(s: &TlsState) -> bool {
+    s.clock_policy == CLOCK_POLICY_REQUIRE
+        && (s.peer_auth == PROFILE_CA_DNS || s.peer_auth == PROFILE_CA_URI)
 }
 
 /// Validate a peer's Certificate message.
@@ -3395,22 +3423,34 @@ unsafe fn peer_cert_reason(
     if s.trust_system {
         // The platform decides about every chain it can place. Its verdict
         // stands whenever it knew the issuer: a weaker verifier must never
-        // overrule a stronger one. The one thing it cannot know about is an
-        // anchor the operator added with `--ca` — those are this instance's
-        // alone, so a chain the platform refused only for its unknown issuer
-        // is walked against them, as it would be with no system trust at all.
+        // overrule a stronger one. What it cannot know about are the
+        // anchors this instance holds itself — those the operator added
+        // with `--ca`, and the issuer adopted under `trust_issuer` — so a
+        // chain the platform refused only for its unknown issuer is walked
+        // against them, as it would be with no system trust at all.
         let (rc, unknown_ca) =
             platform_cert_reason(s, is_server, expected, expected_is_ip, hs_body, now);
-        if !unknown_ca || s.anchor_operator == 0 {
+        if !unknown_ca || s.anchor_count == 0 {
             *by_platform = true;
+            // The platform judges a chain and a host name; the URI rule
+            // is this profile's alone, and is applied to the leaf it
+            // accepted exactly as the walk would apply it.
+            if rc == CERT_OK && s.peer_auth == PROFILE_CA_URI {
+                return leaf_uri_reason(hs_body, &s.expected_uri[..s.expected_uri_len]);
+            }
             return rc;
         }
     }
-    verify_chain_with(
+    let mut deferred = deferred;
+    let rc = verify_chain_with(
         hs_body,
         &chain_policy(s, expected, expected_is_ip, require_eku, now),
-        deferred,
-    )
+        deferred.as_deref_mut(),
+    );
+    if let Some(d) = deferred {
+        d.generation = s.label_id.adopted_generation;
+    }
+    rc
 }
 
 /// Ask the `trust` contract whether this chain is good.
@@ -3420,8 +3460,9 @@ unsafe fn peer_cert_reason(
 /// the same whichever verifier decided. A transport failure is NOT a
 /// refusal: it becomes `CERT_ERR_NO_ANCHOR`, because a consumer that could
 /// not ask must not behave as though it asked and was told yes. The flag is
-/// set only when the platform refused because it knew no issuer for the
-/// chain.
+/// set when the platform refused because it knew no issuer for the chain,
+/// and for a question it is not asked at all: a client certificate, or a
+/// peer dialled by address.
 unsafe fn platform_cert_reason(
     s: &TlsState,
     is_server: bool,
@@ -3431,11 +3472,11 @@ unsafe fn platform_cert_reason(
     now: u64,
 ) -> (u32, bool) {
     use abi::contracts::trust as tw;
-    // An IP literal has no name to give the platform, and a server checking
-    // a client certificate is not what this provider is wired for; both are
-    // the local verifier's job and reaching here with one is a compose bug.
+    // An IP literal has no name to give the platform, and the provider
+    // judges server certificates only; both are questions for this
+    // instance's own anchors, so the platform knows no issuer for them.
     if is_server || expected_is_ip {
-        return (CERT_ERR_NO_ANCHOR, false);
+        return (CERT_ERR_NO_ANCHOR, true);
     }
     let mut chain: [&[u8]; MAX_CHAIN_LEN] = [&[]; MAX_CHAIN_LEN];
     let count = match parse_cert_chain(hs_body, &mut chain) {
@@ -3574,7 +3615,8 @@ const _: () = assert!(PEER_PRINCIPAL_MAX == abi::contracts::net::peer_identity::
 /// Under `ca_uri`, after the chain was accepted: the leaf's URI SAN that
 /// satisfied `verify_uri` (`expected`), as the session's principal. The
 /// policy has just matched one; this reads it back from the same
-/// certificate. Length 0 when none fits the report.
+/// certificate. A URI longer than `PEER_PRINCIPAL_MAX` never matches
+/// (`uri_well_formed`), so every accepted leaf has a principal to report.
 fn verified_principal(expected: &[u8], hs_body: &[u8]) -> ([u8; PEER_PRINCIPAL_MAX], u8) {
     let mut out = [0u8; PEER_PRINCIPAL_MAX];
     let mut len = 0u8;
@@ -3597,6 +3639,17 @@ fn verified_principal(expected: &[u8], hs_body: &[u8]) -> ([u8; PEER_PRINCIPAL_M
         hit
     });
     (out, len)
+}
+
+/// The principal an accepted chain names: under `ca_uri` the URI SAN that
+/// satisfied `verify_uri`, and under every other profile none. The same for
+/// every transport.
+fn peer_principal_of(s: &TlsState, hs_body: &[u8]) -> ([u8; PEER_PRINCIPAL_MAX], u8) {
+    if s.peer_auth == PROFILE_CA_URI {
+        verified_principal(&s.expected_uri[..s.expected_uri_len], hs_body)
+    } else {
+        ([0u8; PEER_PRINCIPAL_MAX], 0)
+    }
 }
 
 /// TCP-TLS adapter: validate, bind, and report. Returns false when the peer
@@ -3632,8 +3685,8 @@ unsafe fn session_verify_peer_cert(s: &mut TlsState, idx: usize, hs_body: &[u8])
     if rc == CERT_OK {
         rc = bind_peer_cert_key(&mut s.sessions[idx].driver, hs_body);
     }
-    if rc == CERT_OK && s.peer_auth == PROFILE_CA_URI {
-        let (p, n) = verified_principal(&s.expected_uri[..s.expected_uri_len], hs_body);
+    if rc == CERT_OK {
+        let (p, n) = peer_principal_of(s, hs_body);
         s.sessions[idx].driver.peer_principal = p;
         s.sessions[idx].driver.peer_principal_len = n;
     }
@@ -3734,7 +3787,7 @@ unsafe fn pump_rsa_verify(s: &mut TlsState, idx: usize) -> bool {
     // The anchor the walk selected for this session, read from the table
     // by index: the job and the driver are the other two borrows, and raw
     // pointers keep the three apart for the call.
-    let selected = selected_anchor(s, s.sessions[idx].driver.deferred_links.anchor);
+    let selected = selected_anchor(s, &s.sessions[idx].driver.deferred_links);
     let anchor = core::slice::from_raw_parts(selected.as_ptr(), selected.len());
     let job: *mut RsaVerifyJob = &mut s.rsa_verify;
     let ec_bits = ec_bits_per_step(s);
@@ -3842,15 +3895,32 @@ unsafe fn log_chain_verified_line(s: &TlsState, head: &[u8], links: u32, steps: 
     pos = put_text(&mut buf, pos, b" anchors=");
     pos += fmt_u32_dec(s.anchor_count as u32, buf.as_mut_ptr().add(pos));
     pos = put_text(&mut buf, pos, b" source=");
-    let deployment = s.anchor_count > s.anchor_operator;
+    // The configured anchors come first (the deployment's, then the
+    // operator's); an issuer adopted under `trust_issuer` sits after them.
+    let configured = if s.label_id.trust_issuer != 0 {
+        s.label_id.static_anchors.min(s.anchor_count)
+    } else {
+        s.anchor_count
+    };
+    // Each name is written at its own call: an array of the literals
+    // would be a table of their addresses, which a flat module image never
+    // relocates.
+    let deployment = configured > s.anchor_operator;
+    let operator = s.anchor_operator > 0;
     if deployment {
         pos = put_text(&mut buf, pos, b"deployment");
     }
-    if s.anchor_operator > 0 {
+    if operator {
         if deployment {
             pos = put_text(&mut buf, pos, b"+");
         }
         pos = put_text(&mut buf, pos, b"operator");
+    }
+    if s.anchor_count > configured {
+        if deployment || operator {
+            pos = put_text(&mut buf, pos, b"+");
+        }
+        pos = put_text(&mut buf, pos, b"issuer");
     }
     dev_log(sys, 3, buf.as_ptr(), pos);
 }
@@ -5144,7 +5214,7 @@ unsafe fn pump_send_certificate_verify(s: &mut TlsState, idx: usize) -> bool {
         // own scheduler discipline — no resumable contract on the
         // vault side yet.
         if s.key_vault_handle >= 0 {
-            // SIGN v1: [mode:u8][_pad:u8][input_len:u32][input]
+            // SIGN: [mode:u8][_pad:u8][input_len:u32][input]
             //          [sig_ptr:u64][sig_cap:u16][sig_len_out:u16]
             //
             // `DIGEST` explicitly, because `vc_hash` IS the digest. Leaving
@@ -5532,7 +5602,7 @@ unsafe fn forward_held_completion(s: &mut TlsState, idx: usize) {
     }
     // The accept is on the wire (now or on a prior step). Emit the queued
     // parent trace context AFTER it, so HTTP's slot exists and parents
-    // under this session's span. Retried until the write lands (F4).
+    // under this session's span. Retried until the write lands.
     if s.sessions[idx].trace_ctx_pending {
         let trace = s.sessions[idx].trace_ctx_trace;
         let own = s.sessions[idx].span_id;
@@ -5581,7 +5651,7 @@ unsafe fn pump_derive_app_keys(s: &mut TlsState, idx: usize) -> bool {
         // session's span). Latching it — rather than emitting inline here —
         // means a back-pressured clear_out that defers the accept to a
         // later Ready-loop step still carries the parent trace with it,
-        // instead of dropping it (F4). Only when IP propagated a trace.
+        // instead of dropping it. Only when IP propagated a trace.
         if dev_telemetry_enabled(&*s.syscalls) && s.sessions[idx].trace_ctx_trace != [0u8; 16] {
             s.sessions[idx].trace_ctx_pending = true;
         }
@@ -5822,15 +5892,15 @@ unsafe fn emit_peer_identity(s: &mut TlsState, idx: usize) {
     // The flags say which checks RAN, and they are derived from the
     // configured profile rather than assumed: `verify_chain` was reached
     // only if a certificate was presented, and the validity window was
-    // enforced only when `clock_policy` demanded it AND the profile was
-    // `ca_dns` — which is precisely the combination `chain_policy` uses.
+    // enforced only when `clock_policy` demanded it under a CA profile —
+    // `validity_enforced`, which is what `chain_policy` uses.
     // A consumer can therefore tell "trusted chain, lifetime unchecked"
     // from "fully verified" — the distinction a single boolean erases.
     let (result, credential_kind, flags) = if pk_len == 0 {
         (peer_result::NO_CREDENTIAL, peer_credential::NONE, 0u32)
     } else {
         let mut f = peer_check::CHAIN | peer_check::KEY_POSSESSION;
-        if s.clock_policy == CLOCK_POLICY_REQUIRE && s.peer_auth == PROFILE_CA_DNS {
+        if validity_enforced(s) {
             f |= peer_check::VALIDITY;
         }
         // The EKU is required by `chain_policy` for every profile that
@@ -6979,6 +7049,22 @@ pub mod test_helpers {
     //! Host-side introspection for the harness. Not compiled into PIC firmware.
 
     use super::{find_session_by_conn_id, SessionState, TlsState};
+
+    /// Judge `cert_msg_body` as DTLS peer slot `idx`'s Certificate message
+    /// — the acceptance `dtls_pump_recv_certificate` runs — and, when it is
+    /// accepted, write the slot's `peer_identity` record. The reason code.
+    ///
+    /// # Safety
+    /// `state` points to an initialised `TlsState`; `idx < MAX_PEERS`.
+    pub unsafe fn dtls_accept_certificate(state: *mut u8, idx: usize, cert_msg_body: &[u8]) -> u32 {
+        let s = &mut *(state as *mut TlsState);
+        let is_server = s.peer_sessions[idx].endpoint.driver.is_server;
+        let rc = super::dtls_accept_peer_certificate(s, idx, is_server, cert_msg_body);
+        if rc == super::CERT_OK {
+            super::emit_peer_identity_dtls(s, idx);
+        }
+        rc
+    }
 
     /// The label identity: `(state, chains refused, handshakes refused
     /// early, held chain length)`. State is identity.rs's `ID_*`.

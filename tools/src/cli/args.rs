@@ -321,7 +321,7 @@ enum Commands {
         subject: Option<String>,
         /// Emit machine-readable JSON instead of the default
         /// human-friendly text. For project/config subjects the shape
-        /// is stable v1: a top-level object with `project_root`,
+        /// is stable: a top-level object with `project_root`,
         /// `install_root`, `targets`, `stacks`, `rig`, `scenarios`
         /// keys (plus `config` when a config subject is supplied).
         #[arg(long)]
@@ -958,7 +958,7 @@ enum ModulesAction {
     },
     /// Sign a packed .fmod module with an Ed25519 private key.
     ///
-    /// Overwrites the module's manifest with a v2 manifest carrying a valid
+    /// Overwrites the module's manifest with one carrying a valid
     /// Ed25519 signature over the existing SHA-256 integrity hash plus the
     /// signer's public-key fingerprint. The module's code/data/export
     /// sections are unchanged.

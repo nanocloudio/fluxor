@@ -758,9 +758,20 @@ pub unsafe fn channel_peek(handle: i32, buf: *mut u8, len: usize) -> i32 {
         return CHAN_EINVAL;
     }
     if slot.mailbox.load(Ordering::Acquire) {
-        // Mailbox channels deliver an opaque buffer reference, not a
-        // byte stream — no meaningful peek semantics.
-        return CHAN_EINVAL;
+        // A mailbox holds one record at a time: peek copies the head of the
+        // pending record and leaves it pending.
+        let buf_slot = slot.buffer_slot.load(Ordering::Acquire) as i32;
+        if buf_slot < 0 {
+            return 0;
+        }
+        let (rec, rec_len) = buffer_pool::mailbox_acquire_read(buf_slot);
+        if rec.is_null() {
+            return 0;
+        }
+        let n = len.min(rec_len as usize);
+        core::ptr::copy_nonoverlapping(rec, buf, n);
+        buffer_pool::mailbox_cancel_read(buf_slot);
+        return n as i32;
     }
     let out = core::slice::from_raw_parts_mut(buf, len);
     let n = slot.with_lock(|fifo, storage| {
@@ -774,11 +785,16 @@ pub unsafe fn channel_peek(handle: i32, buf: *mut u8, len: usize) -> i32 {
     }
 }
 
-/// Drop the next `len` bytes of a FIFO channel's stream without copying
-/// them: what is buffered now goes at once, and the rest is dropped from the
-/// front of each later write as it arrives, before it lands in the ring.
-/// Returns `len`, or `CHAN_EINVAL` for a bad handle, a mailbox channel, or a
-/// `len` the owed count cannot hold.
+/// Drop the next `len` bytes of a channel's stream without copying them.
+///
+/// On a FIFO, what is buffered now goes at once, and the rest is dropped
+/// from the front of each later write as it arrives, before it lands in the
+/// ring. Returns `len`, or `CHAN_EINVAL` for a bad handle or a `len` past
+/// `i32::MAX` or the owed count's width.
+///
+/// On a mailbox the unit is the record: a non-zero `len` releases the
+/// pending record whole and returns its length, or `CHAN_EAGAIN` when none
+/// is pending.
 ///
 /// With `channel_peek` this gives a frame-aware consumer a whole-frame
 /// read: peek the header, then the frame, then discard what it copied; and
@@ -800,8 +816,23 @@ pub fn channel_discard(handle: i32, len: usize) -> i32 {
     if !slot.is_pipe() {
         return CHAN_EINVAL;
     }
-    if slot.mailbox.load(Ordering::Acquire) {
+    if len > i32::MAX as usize {
         return CHAN_EINVAL;
+    }
+    if slot.mailbox.load(Ordering::Acquire) {
+        if len == 0 {
+            return 0;
+        }
+        let buf_slot = slot.buffer_slot.load(Ordering::Acquire) as i32;
+        if buf_slot < 0 {
+            return CHAN_EAGAIN;
+        }
+        let (rec, rec_len) = buffer_pool::mailbox_acquire_read(buf_slot);
+        if rec.is_null() {
+            return CHAN_EAGAIN;
+        }
+        buffer_pool::mailbox_release_read(buf_slot);
+        return rec_len as i32;
     }
     let ok = slot.with_lock(|fifo, storage| {
         if storage.is_none() {
@@ -889,39 +920,47 @@ pub unsafe fn channel_write(handle: i32, data: *const u8, len: usize) -> i32 {
         return len as i32;
     }
     let input = core::slice::from_raw_parts(data, len);
-    // Bytes a `channel_discard` owes the stream are dropped from the front of
-    // this write; a write swallowed whole is reported done, as it was for the
-    // producer. The rest lands whole or not at all, and the owed count moves
-    // only when it does.
-    let landed = slot.with_lock(|fifo, storage| {
-        let Some(storage) = storage else { return -1i32 };
-        let owed = slot.discard_owed.load(Ordering::Relaxed) as usize;
-        if owed >= len {
-            slot.discard_owed
-                .store((owed - len) as u32, Ordering::Relaxed);
-            return -2i32;
-        }
-        let rest = &input[owed..];
-        let written = fifo.write(storage, rest);
-        if written == rest.len() {
-            slot.discard_owed.store(0, Ordering::Relaxed);
-        }
-        written as i32
+    if input.is_empty() {
+        return CHAN_EAGAIN;
+    }
+    let took = slot.with_lock(|fifo, storage| match storage {
+        Some(storage) => land(slot, fifo, storage, input) as i32,
+        None => -1,
     });
-    if landed == -2 {
-        return len as i32;
+    match took {
+        1 => {
+            slot.ever_written.store(true, Ordering::Release);
+            wake_consumer_if_flagged(slot);
+            // The tap observes the producer: it is handed the whole write,
+            // whatever the consumer had asked to have dropped of it.
+            mirror_write(slot, input);
+            len as i32
+        }
+        0 => CHAN_EAGAIN,
+        _ => CHAN_EINVAL, // Channel buffer not allocated
     }
-    if landed < 0 {
-        return CHAN_EINVAL; // Channel buffer not allocated
+}
+
+/// Take `bytes` into `slot`'s ring, after the bytes a `channel_discard` owes
+/// the stream: the owed bytes are dropped from the front of `bytes`, and the
+/// rest lands whole or not at all. `true` when every byte was taken, dropped
+/// or landed; `false`, with nothing changed, when what remains does not fit.
+/// Every writer of a FIFO ring goes through here, so a consumer that dropped
+/// a frame ahead never sees its tail. Called under the ring lock.
+fn land(slot: &ChannelSlot, fifo: &mut FifoState, storage: &mut [u8], bytes: &[u8]) -> bool {
+    let owed = slot.discard_owed.load(Ordering::Relaxed) as usize;
+    if owed >= bytes.len() {
+        slot.discard_owed
+            .store((owed - bytes.len()) as u32, Ordering::Relaxed);
+        return true;
     }
-    if landed == 0 {
-        CHAN_EAGAIN
-    } else {
-        slot.ever_written.store(true, Ordering::Release);
-        wake_consumer_if_flagged(slot);
-        mirror_write(slot, &input[len - landed as usize..]);
-        len as i32
+    let rest = &bytes[owed..];
+    if fifo.space() < rest.len() {
+        return false;
     }
+    fifo.write(storage, rest);
+    slot.discard_owed.store(0, Ordering::Relaxed);
+    true
 }
 
 /// Copy what was just written to `slot` into its tap, if it has one: whole or
@@ -938,12 +977,9 @@ fn mirror_write(slot: &ChannelSlot, bytes: &[u8]) {
     if !tap.is_pipe() || tap.mailbox.load(Ordering::Acquire) {
         return;
     }
-    let copied = tap.with_lock(|fifo, storage| {
-        let Some(storage) = storage else { return false };
-        if fifo.space() < bytes.len() {
-            return false;
-        }
-        fifo.write(storage, bytes) == bytes.len()
+    let copied = tap.with_lock(|fifo, storage| match storage {
+        Some(storage) => land(tap, fifo, storage, bytes),
+        None => false,
     });
     if copied {
         tap.ever_written.store(true, Ordering::Release);
@@ -1139,9 +1175,11 @@ pub fn channel_ioctl(handle: i32, cmd: u32, arg: *mut u8) -> i32 {
                     buffer_pool::mailbox_flush(buf_slot as i32);
                 }
             } else {
-                // FIFO: flush ring buffer
+                // FIFO: flush ring buffer. The stream starts over, so
+                // nothing a discard owed it is owed any more.
                 slot.with_lock(|fifo, _storage| {
                     fifo.clear();
+                    slot.discard_owed.store(0, Ordering::Relaxed);
                 });
             }
             slot.hup_flag.store(false, Ordering::Release);

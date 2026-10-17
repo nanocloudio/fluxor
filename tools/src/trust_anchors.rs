@@ -361,6 +361,9 @@ pub const TAG_KEY: u8 = 11;
 /// The longest certificate chain a tls instance holds (its
 /// `MAX_CERT_CHAIN_BYTES`); a longer one refuses to construct.
 pub const MAX_CHAIN_DER: usize = 3072;
+/// The longest identity key a tls instance holds (its `MAX_KEY_LEN`); a
+/// longer one refuses to construct.
+pub const MAX_KEY_DER: usize = 2400;
 /// tls's `identity_label` (basic tag 19): an identity the vault holds.
 const TAG_IDENTITY_LABEL: u8 = 19;
 
@@ -369,7 +372,7 @@ const TAG_IDENTITY_LABEL: u8 = 19;
 /// and `key` (DER) under [`TAG_KEY`]. A published applet then holds no
 /// operator credential — each run brings its operator's. A server instance
 /// is never given one, and an instance the graph already named an identity
-/// for (a certificate, or a vault label) keeps it.
+/// for (a certificate, a key, or a vault label) keeps it.
 pub fn append_operator_identity(
     blob: &[u8],
     cert: &[u8],
@@ -384,8 +387,11 @@ pub fn append_operator_identity(
             cert.len()
         ));
     }
-    if key.len() > u16::MAX as usize {
-        return Err("the key is larger than a parameter holds".to_string());
+    if key.len() > MAX_KEY_DER {
+        return Err(format!(
+            "the key is {} bytes, over the {MAX_KEY_DER} a tls instance holds",
+            key.len()
+        ));
     }
     let tls_hash = fnv1a_hash(b"tls");
     let mut ext = Vec::with_capacity(8 + cert.len() + key.len());
@@ -399,6 +405,7 @@ pub fn append_operator_identity(
     extend_entries(blob, &mut |name_hash, _id, params| {
         let client = name_hash == tls_hash && basic_param_u8(params, 1).unwrap_or(0) == 0;
         let named = ext_blob(params, TAG_CERT).is_some()
+            || ext_blob(params, TAG_KEY).is_some()
             || basic_param_len(params, TAG_IDENTITY_LABEL).unwrap_or(0) > 0;
         Ok((client && !named).then(|| ext.clone()))
     })
@@ -783,12 +790,19 @@ mod tests {
         let own_client = entry("tls", 3, &[(1, 0)], &mine);
         let labelled = entry("tls", 4, &[(1, 0), (19, 7)], &[]);
         let quic_client = entry("quic", 5, &[(2, 0)], &[]);
+        let own_key = {
+            let mut e = vec![TAG_KEY, 0, 0, 2];
+            e.extend_from_slice(&[8, 8]);
+            e
+        };
+        let keyed_client = entry("tls", 6, &[(1, 0)], &own_key);
         let before = blob(&[
             bare_client,
             server.clone(),
             own_client,
             labelled,
             quic_client,
+            keyed_client,
         ]);
 
         let (after, given) = append_operator_identity(&before, &cert, &key).unwrap();
@@ -813,6 +827,11 @@ mod tests {
             "a vault-label identity is kept"
         );
         assert_eq!(identity_of(&after, 4), (5, None, None));
+        assert_eq!(
+            identity_of(&after, 5),
+            (6, None, Some(vec![8, 8])),
+            "a named key is kept, and no second key is appended"
+        );
         assert!(after.ends_with(b"TAIL"));
         let body_end = after.len() - 16 - 4;
         assert_eq!(
@@ -820,6 +839,15 @@ mod tests {
             crc16_ccitt(&after[8..body_end])
         );
         assert!(append_operator_identity(&before, &[], &key).is_err());
+    }
+
+    #[test]
+    fn an_operator_key_longer_than_an_instance_holds_is_refused() {
+        let before = blob(&[entry("tls", 1, &[(1, 0)], &[])]);
+        let cert = seq(40, 3);
+        assert!(append_operator_identity(&before, &cert, &seq(MAX_KEY_DER - 4, 4)).is_ok());
+        let err = append_operator_identity(&before, &cert, &seq(MAX_KEY_DER, 4)).unwrap_err();
+        assert!(err.contains("2400"), "the limit is named: {err}");
     }
 
     #[test]

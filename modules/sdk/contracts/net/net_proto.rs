@@ -19,6 +19,9 @@
 // in the modules.
 
 /// Frame header size (msg_type + len).
+///
+/// No surface assigns message type 0: a frame reader answers 0 for "no
+/// frame".
 pub const FRAME_HDR: usize = 3;
 
 /// Wire width of a connection id (u16 LE — see the limit register:

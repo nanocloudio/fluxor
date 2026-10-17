@@ -98,7 +98,7 @@ workloads:
         type: kv_state_worker
         step_deadline_us: 12000
         step_deadline_burst_us: 16000
-        fault_policy: tolerate
+        fault_policy: skip
 ```
 
 `fluxor build --emit=workload` (and the resident `workloads:` section of a
@@ -117,13 +117,15 @@ TLV's tag `0xF1` (0 skip, 1 restart, 2 restart_graph, 3 tolerate). A
 policy byte outside that set fails the decode with `EINVAL`.
 
 The kernel admits a workload's budgets against its own node policy before
-it allocates anything, and refuses the whole add with `EINVAL` rather than
+it allocates anything, and refuses the whole add with `ERANGE` rather than
 clamping, as the build refuses an over-ceiling base graph:
 
-- `fault_policy` must be `skip` or `tolerate`, the policies whose effect
-  stays on the faulting module. `restart` releases the module's provider
-  layers and flushes its channels, which other owners may hold, and
-  `restart_graph` names the whole graph, so a workload cannot have either.
+- `fault_policy` must be `skip`, the one policy whose effect stays on the
+  faulting module. `tolerate` records an overrun and lets the module run
+  on, so the deadline it was admitted under would never bind it and the
+  domain's other modules would pay for every late step; `restart` releases
+  the module's provider layers and flushes its channels, which other
+  owners may hold; and `restart_graph` names the whole graph.
 - When a deadline is declared, the step deadline and the effective burst
   deadline must each fit `16 ×` the domain's shortest tick (its
   `tick_min_us` on an adaptive-cadence domain, else its tick), and never
@@ -142,7 +144,7 @@ the same domain ticks will admit.
 
 A base graph's builder adds tags to a module's params TLV that grant the
 module something of the node's. A module in a workload is a tenant, so the
-add refuses its params with `EINVAL`, before anything is allocated, if the
+add refuses its params with `EACCES`, before anything is allocated, if the
 TLV carries any of these node tags (`scheduler::is_node_param_tag`):
 
 | Tag | Setting | Why a workload cannot set it |
@@ -167,7 +169,8 @@ module's state plus arena to its owner's `state_cap`.
 The build refuses the same things first. A workload module may not declare
 `trust_tier`, `protection`, `device_window`, `isr_budget_cycles`, `irq`
 (unless the module's schema has an `irq` param of its own),
-`quarantine_partner`, `max_restarts`, `restart_backoff_ms` or `voices`.
+`quarantine_partner`, `quarantine_partner_idx`, `max_restarts`,
+`restart_backoff_ms` or `voices`.
 `voices` presets are packed under tag `0xFD`. The build also checks the
 packed params bytes with the same walk the kernel uses.
 

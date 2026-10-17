@@ -356,7 +356,9 @@ key did not exist when the graph was built, so the instance asks for one:
 it writes the key's SEC1 public point on `identity_req` until a chain
 arrives on `identity_cert`, and again at two thirds of the held
 certificate's lifetime. A chain is taken only when its leaf certifies this
-key; any other is dropped and counted. Until one is taken, a handshake that
+key; any other is dropped and counted. The port carries net_proto frames,
+and a chain is read only once its whole frame has arrived; a frame larger
+than the instance holds is dropped whole. Until one is taken, a handshake that
 reaches its Certificate is refused rather than presenting nothing honest.
 A label identity is refused at construction alongside `cert_file` or
 `key_file`, without a vault, or with either port unwired.
@@ -364,17 +366,48 @@ A label identity is refused at construction alongside `cert_file` or
 With `trust_issuer`, the issuer of the chain the instance is certified
 with — its last certificate — is also a trust anchor, placed after the
 configured ones and re-adopted on every renewal: the authority a node's
-peers chain to, minted at runtime where the graph could not name it. It
-needs a CA profile, since a pinned profile names keys and not an
-authority, and until a chain has arrived there is no anchor, so a peer's
-chain fails closed.
+peers chain to, minted at runtime where the graph could not name it. The
+chain is adopted only when it is a certification path from the leaf up to
+that certificate: each certificate names the next as its issuer and
+carries its signature, and every certificate above the leaf is a CA
+permitted to sign certificates within its path-length constraint. Any
+other chain is dropped whole, so it is neither presented nor trusted.
+`trust_issuer` needs a CA profile, since a pinned profile names keys and
+not an authority, and a free anchor slot: with the configured anchors
+already filling the table of eight, the instance refuses to construct.
+Until a chain has arrived there is no anchor, so a peer's chain fails
+closed. A renewal writes the adopted anchor over its slot; a handshake
+still verifying a chain against the earlier one fails that verification
+cleanly rather than reading the renewed anchor's key, and the peer
+retries.
 
-Under `ca_uri`, a `verify_uri` ending in `/` accepts any URI strictly
-under that path — a cluster's replicas, each its own name, by one
-listener; a path segment that is `.`, `..` or empty never matches. The
-URI SAN that satisfied the check is reported as the session's principal
-in its `peer_identity` record, with the SAN check flag; every other
-profile reports none.
+Under `trust: system` the adopted issuer adds to the platform's store as
+the operator's `--ca` anchors do: the platform judges each chain first,
+and one it refuses for an unknown issuer — as it refuses a node's runtime
+authority — is walked against the instance's own anchors, the adopted
+issuer among them. A client certificate, and a peer dialled by address,
+are never put to the platform; they are walked against the instance's own
+anchors directly.
+
+Under `ca_uri`, `verify_uri` is either one URI, matched byte for byte, or
+a path ending in `/`, which accepts any URI strictly under it — a
+cluster's replicas, each its own name, by one listener; a path segment
+that is `.`, `..` or empty never matches. Both the expectation and every
+presented URI must be spelled in RFC 3986 unreserved characters,
+sub-delims, `:`, `@` and `/` (no percent-encoding, query or fragment, any
+of which would give one identity a second spelling), shaped
+`scheme://authority/path` with a non-empty authority, and at most 128
+bytes, the longest principal a session reports. A presented URI longer
+than that never matches, so a peer is never accepted under a name its
+session could not report. The build refuses a `verify_uri` outside this
+rule, and so does the module at construction. The rule applies whatever
+the trust source: a chain the platform vouches for under `trust: system`
+is held to it on its leaf all the same. The URI SAN that satisfied the
+check is reported as the session's principal in its `peer_identity`
+record, on TLS and DTLS alike, with the SAN check flag; every other
+profile reports none. The validity flag is set whenever the lifetime was
+enforced: under `clock_policy: require`, for both `ca_dns` and
+`ca_uri`.
 
 An RSA identity always signs through the vault: the module carries no RSA
 signer of its own, so on a target whose vault holds no RSA suite the

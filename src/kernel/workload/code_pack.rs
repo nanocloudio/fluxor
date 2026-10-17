@@ -26,9 +26,10 @@ use crate::kernel::module::loader::{self, ModuleLoader};
 use crate::kernel::sys::errno;
 use crate::kernel::sys::hal;
 
-/// Page granularity of a region: the largest page size a hosted kernel uses
-/// (`mprotect` needs it); bare metal needs only cache-line alignment.
-pub const PAGE: usize = 16 * 1024;
+/// Page granularity of a region: the largest page an aarch64 Linux kernel
+/// uses (64 KiB), so protecting one region never changes a neighbour's on any
+/// host; bare metal needs only cache-line alignment.
+pub const PAGE: usize = 64 * 1024;
 
 /// The pool every pack is staged into. 16 MiB on a 64-bit node — several
 /// workloads' worth of modules at the 1 MiB per-module code ceiling — and
@@ -43,7 +44,7 @@ const PAGES: usize = POOL_SIZE / PAGE;
 /// Regions at once: one per owner, and one being staged.
 const REGIONS: usize = crate::kernel::workload::owner::MAX_OWNERS + 1;
 
-#[repr(C, align(16384))]
+#[repr(C, align(65536))]
 struct Pool {
     bytes: [u8; POOL_SIZE],
 }
@@ -233,6 +234,7 @@ pub fn reset() {
     }
     // SAFETY: scheduler-thread state.
     unsafe {
+        STAGING = None;
         DIGESTS_READY = false;
     }
 }

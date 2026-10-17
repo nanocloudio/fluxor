@@ -598,6 +598,7 @@ use crate::abi::fence::{Fence, QUERY_OP, WIRE_MAX_LEN};
 use crate::kernel::ipc::channel::channel_write;
 use crate::kernel::ipc::fd::{slot_of, tag_fd, FD_TAG_STORAGE_NAMESPACE, FD_TAG_STORAGE_OBJECT};
 use crate::kernel::sys::errno;
+use crate::kernel::workload::owner::OwnerHandle;
 
 /// `CONTENT_TYPES` byte for `NamespaceChange` (`contracts/src/lib.rs`). A
 /// watcher routes on this to tell a store change from anything else sharing
@@ -684,6 +685,86 @@ const WRITE_EMPTY: WriteSlot = WriteSlot {
     grant: None,
 };
 
+/// A store and the handles its callers hold on it: the `GET` reads, streamed
+/// writes and subscriptions a handle names. Every store has tables of its
+/// own, so a handle names a slot only of the store its caller is served by:
+/// one owner's handle, forged by another, reaches nothing of the first's.
+pub struct Served {
+    store: Store,
+    subs: Vec<Sub>,
+    reads: Vec<ReadSlot>,
+    writes: Vec<WriteSlot>,
+    /// Bytes one streaming write may stage before `COMMIT`.
+    stage_max: usize,
+}
+
+impl Served {
+    fn with_tables(
+        store: Store,
+        subs: usize,
+        reads: usize,
+        writes: usize,
+        stage_max: usize,
+    ) -> Self {
+        Self {
+            store,
+            subs: vec![SUB_EMPTY; subs],
+            reads: (0..reads).map(|_| READ_EMPTY).collect(),
+            writes: (0..writes).map(|_| WRITE_EMPTY).collect(),
+            stage_max,
+        }
+    }
+
+    /// The node's control-plane store.
+    fn node(store: Store) -> Self {
+        Self::with_tables(
+            store,
+            STORE_MAX_SUBS,
+            STORE_MAX_READS,
+            STORE_MAX_WRITES,
+            STORE_STAGE_MAX,
+        )
+    }
+
+    /// A workload's own store, with tables sized for one tenant.
+    pub fn owner(store: Store) -> Self {
+        Self::with_tables(
+            store,
+            OWNER_MAX_SUBS,
+            OWNER_MAX_READS,
+            OWNER_MAX_WRITES,
+            OWNER_STAGE_MAX,
+        )
+    }
+
+    /// What the store's live entries cost an owner holding them: see
+    /// [`entry_cost`].
+    pub fn held_bytes(&self) -> u64 {
+        self.store
+            .scan(b"", None)
+            .map(|(key, size, _)| entry_cost(key.len(), size as usize))
+            .sum()
+    }
+}
+
+/// Subscriptions, `GET` reads and streamed writes one workload's store holds
+/// at once, and the bytes one of its streamed writes may stage.
+const OWNER_MAX_SUBS: usize = 16;
+const OWNER_MAX_READS: usize = 8;
+const OWNER_MAX_WRITES: usize = 4;
+const OWNER_STAGE_MAX: usize = 16 * 1024 * 1024;
+
+/// What an entry of `key_len` and `value_len` bytes costs the owner holding
+/// it: its key and value, and a fixed record overhead, so an owner cannot
+/// fill a store with keys or empty values it is never charged for.
+pub fn entry_cost(key_len: usize, value_len: usize) -> u64 {
+    (STORE_ENTRY_OVERHEAD + key_len + value_len) as u64
+}
+
+/// The fixed cost of one entry: its log record's framing and its place in
+/// the index.
+const STORE_ENTRY_OVERHEAD: usize = 64;
+
 /// Streaming writes open at once. Matched to `STORE_MAX_READS`, and for the
 /// same reason: one slot per operation a node has in flight, and an S3 server
 /// fronting this store streams every object write.
@@ -740,10 +821,8 @@ impl cap::CapCrypto for KernelCrypto {
     }
 }
 
-static mut LINUX_STORE: Option<Store> = None;
-static mut LINUX_SUBS: [Sub; STORE_MAX_SUBS] = [SUB_EMPTY; STORE_MAX_SUBS];
-static mut LINUX_READS: [ReadSlot; STORE_MAX_READS] = [READ_EMPTY; STORE_MAX_READS];
-static mut LINUX_WRITES: [WriteSlot; STORE_MAX_WRITES] = [WRITE_EMPTY; STORE_MAX_WRITES];
+/// The node's control-plane store and its handle tables.
+static mut LINUX_STORE: Option<Served> = None;
 
 /// What `store_init_from_env` found: three outcomes, not two, because "no
 /// store was asked for" and "a store was asked for and could not be opened"
@@ -787,7 +866,7 @@ pub unsafe fn store_init_from_env() -> StoreInit {
     }
     match Store::open(std::path::Path::new(&dir), 65536, 4096) {
         Ok(s) => {
-            LINUX_STORE = Some(s);
+            LINUX_STORE = Some(Served::node(s));
             StoreInit::Opened
         }
         Err(_) => StoreInit::Failed,
@@ -832,17 +911,17 @@ fn grant_handle(i: usize) -> i32 {
     tag_fd(FD_TAG_STORAGE_OBJECT, (GRANT_SLOT_BASE + i) as i32)
 }
 
-/// The streaming-write slot `handle` names, if it is a live one.
-unsafe fn write_of(handle: i32) -> Option<usize> {
+/// The streaming-write slot `handle` names in `writes`, if it is a live one.
+fn write_of(writes: &[WriteSlot], handle: i32) -> Option<usize> {
     if handle < 0 {
         return None;
     }
     let slot = slot_of(handle) as usize;
     let i = slot.checked_sub(WRITE_SLOT_BASE)?;
-    if slot >= GRANT_SLOT_BASE || i >= STORE_MAX_WRITES {
+    if slot >= GRANT_SLOT_BASE || i >= writes.len() {
         return None;
     }
-    (*core::ptr::addr_of!(LINUX_WRITES))[i].in_use.then_some(i)
+    writes[i].in_use.then_some(i)
 }
 
 /// The grant `handle` names, if it is a live one the caller owns.
@@ -938,14 +1017,19 @@ fn op_key(opcode: u32, a: &[u8]) -> Option<&[u8]> {
 /// Admit an op on a guarded store: `Ok(Some(grant))` for an op run under a
 /// grant, `Ok(None)` for one no grant covers (a read handle's own ops,
 /// `CLOSE`), `Err(errno)` to refuse it.
-unsafe fn admit(handle: i32, opcode: u32, a: &[u8]) -> Result<Option<usize>, i32> {
+unsafe fn admit(
+    reads: &[ReadSlot],
+    writes: &[WriteSlot],
+    handle: i32,
+    opcode: u32,
+    a: &[u8],
+) -> Result<Option<usize>, i32> {
     let Some(access) = obj_op::grant::access_of(opcode) else {
         return Ok(None);
     };
     if opcode == obj_op::RANGE_GET {
         // A read handle carries the grant it was opened under.
         let idx = slot_of(handle) as usize;
-        let reads = &*core::ptr::addr_of!(LINUX_READS);
         return match reads.get(idx).and_then(|r| r.grant) {
             Some(g) if grant_live(g) => Ok(None),
             _ => Err(errno::EACCES),
@@ -958,8 +1042,7 @@ unsafe fn admit(handle: i32, opcode: u32, a: &[u8]) -> Result<Option<usize>, i32
         // Likewise a write handle: the key was scoped once at OPEN, and the
         // grant is re-checked for life on every call so closing it stops a
         // stream already running.
-        let writes = &*core::ptr::addr_of!(LINUX_WRITES);
-        return match write_of(handle).and_then(|i| writes[i].grant) {
+        return match write_of(writes, handle).and_then(|i| writes[i].grant) {
             Some(g) if grant_live(g) => Ok(None),
             _ => Err(errno::EACCES),
         };
@@ -990,38 +1073,65 @@ pub unsafe fn store_active() -> bool {
     (*core::ptr::addr_of!(LINUX_STORE)).is_some()
 }
 
-unsafe fn store_ref() -> Option<&'static mut Store> {
+unsafe fn store_ref() -> Option<&'static mut Served> {
     (*core::ptr::addr_of_mut!(LINUX_STORE)).as_mut()
 }
 
-/// Charge the bytes a `PUT` of `len` for `key` adds over what the key holds
-/// to `owner`'s storage. The amount charged, to give back if the write does
-/// not land; `None` when the owner's cap refuses.
-fn charge_put(
-    store: &Store,
-    owner: crate::kernel::workload::owner::OwnerHandle,
-    key: &str,
-    len: usize,
-) -> Option<u64> {
-    let held = store.get(key).map(|(v, _)| v.len() as u64).unwrap_or(0);
-    let growth = (len as u64).saturating_sub(held);
-    if growth > 0
-        && crate::kernel::exec::scheduler::owners_mut()
-            .charge_storage(owner, growth)
-            .is_err()
-    {
-        return None;
-    }
-    if (len as u64) < held {
-        crate::kernel::exec::scheduler::owners_mut().release_storage(owner, held - len as u64);
-    }
-    Some(growth)
+/// What a `PUT` changes in its owner's charge: the cost of the new entry
+/// over the one it replaces, or the other way round.
+struct PutCharge {
+    add: u64,
+    give: u64,
 }
 
-fn uncharge_put(owner: crate::kernel::workload::owner::OwnerHandle, charged: u64) {
-    if charged > 0 {
-        crate::kernel::exec::scheduler::owners_mut().release_storage(owner, charged);
+/// Charge `owner` for a `PUT` of a `len`-byte value under `key` before it
+/// runs: the growth is charged now, and a shrink is given back only once the
+/// write lands. `None` when the owner's cap refuses the growth.
+fn charge_put(store: &Store, owner: OwnerHandle, key: &str, len: usize) -> Option<PutCharge> {
+    let old = store
+        .get(key)
+        .map(|(v, _)| entry_cost(key.len(), v.len()))
+        .unwrap_or(0);
+    let new = entry_cost(key.len(), len);
+    let c = PutCharge {
+        add: new.saturating_sub(old),
+        give: old.saturating_sub(new),
+    };
+    if c.add > 0 && !charge(owner, c.add) {
+        return None;
     }
+    Some(c)
+}
+
+/// Settle a `PUT`'s charge once it is decided: a landed write gives back
+/// what the replaced entry cost over the new one, a refused one what was
+/// charged for it.
+fn settle_put(owner: OwnerHandle, c: PutCharge, landed: bool) {
+    release(owner, if landed { c.give } else { c.add });
+}
+
+/// Charge `bytes` to `owner`'s storage; `false` when its cap refuses.
+fn charge(owner: OwnerHandle, bytes: u64) -> bool {
+    bytes == 0
+        || crate::kernel::exec::scheduler::owners_mut()
+            .charge_storage(owner, bytes)
+            .is_ok()
+}
+
+/// Give `bytes` of storage back to `owner`.
+fn release(owner: OwnerHandle, bytes: u64) {
+    if bytes > 0 {
+        crate::kernel::exec::scheduler::owners_mut().release_storage(owner, bytes);
+    }
+}
+
+/// Free a streamed write's slot, giving back what it had staged and not
+/// committed.
+fn drop_write(owner: OwnerHandle, w: &mut WriteSlot) {
+    if !w.committed {
+        release(owner, w.staged.len() as u64);
+    }
+    *w = WRITE_EMPTY;
 }
 
 // ---- etag ⇄ revision bridge (the object contract's 32-byte etag carries the
@@ -1157,8 +1267,7 @@ fn encode_event(seq: u32, ch: &Change) -> Vec<u8> {
 /// full channel (`EAGAIN`) the undelivered tail is requeued for the next pump.
 /// Takes the store by `&mut` (never re-acquires the singleton) so it never
 /// aliases the caller's borrow.
-unsafe fn pump_subscriptions(store: &mut Store) {
-    let subs = &mut *core::ptr::addr_of_mut!(LINUX_SUBS);
+unsafe fn pump_subscriptions(store: &mut Store, subs: &mut [Sub]) {
     for s in subs.iter_mut() {
         if !s.in_use {
             continue;
@@ -1221,20 +1330,21 @@ unsafe fn pump_subscriptions(store: &mut Store) {
 /// state without synchronization. `arg` must be null or valid for reads
 /// and writes of `arg_len` bytes for the duration of the call.
 pub unsafe fn dispatch_object(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
-    let Some(store) = store_ref() else {
+    let Some(served) = store_ref() else {
         return errno::ENOSYS;
     };
-    dispatch_object_on(store, guarded(), handle, opcode, arg, arg_len)
+    dispatch_object_on(served, guarded(), handle, opcode, arg, arg_len)
 }
 
-/// [`dispatch_object`] against `store`: the node's, or an owner's own, which
-/// is never guarded. Every byte a `PUT` adds is charged to the caller's
-/// owner, and a `DELETE` gives it back.
+/// [`dispatch_object`] against `served`: the node's store, or an owner's
+/// own, which is never guarded. What an entry costs (see [`entry_cost`]) is
+/// charged to the caller's owner as it is written, staged bytes while they
+/// are staged, and a `DELETE` gives it back.
 ///
 /// # Safety
 /// As [`dispatch_object`].
 pub unsafe fn dispatch_object_on(
-    store: &mut Store,
+    served: &mut Served,
     guarded: bool,
     handle: i32,
     opcode: u32,
@@ -1242,6 +1352,11 @@ pub unsafe fn dispatch_object_on(
     arg_len: usize,
 ) -> i32 {
     let owner = crate::kernel::exec::scheduler::caller_owner();
+    let stage_max = served.stage_max;
+    let store = &mut served.store;
+    let subs = &mut served.subs;
+    let reads = &mut served.reads;
+    let writes = &mut served.writes;
 
     // Per-handle fence introspection for a GET-opened read slot.
     if opcode == QUERY_OP {
@@ -1249,8 +1364,7 @@ pub unsafe fn dispatch_object_on(
             return errno::EINVAL;
         }
         let idx = slot_of(handle) as usize;
-        let reads = &*core::ptr::addr_of!(LINUX_READS);
-        if idx >= STORE_MAX_READS || !reads[idx].in_use {
+        if idx >= reads.len() || !reads[idx].in_use {
             return errno::ENOSYS;
         }
         let buf = core::slice::from_raw_parts_mut(arg, arg_len);
@@ -1287,20 +1401,20 @@ pub unsafe fn dispatch_object_on(
         (&mut *core::ptr::addr_of_mut!(GRANTS))[i] = None;
         // Read and write handles opened under it die with it; a staged
         // write that is never committed is dropped, not landed.
-        for r in (*core::ptr::addr_of_mut!(LINUX_READS)).iter_mut() {
+        for r in reads.iter_mut() {
             if r.grant == Some(i) {
                 *r = READ_EMPTY;
             }
         }
-        for w in (*core::ptr::addr_of_mut!(LINUX_WRITES)).iter_mut() {
+        for w in writes.iter_mut() {
             if w.grant == Some(i) {
-                *w = WRITE_EMPTY;
+                drop_write(owner, w);
             }
         }
         return 0;
     }
     let grant = if guarded {
-        match admit(handle, opcode, a) {
+        match admit(reads, writes, handle, opcode, a) {
             Ok(g) => g,
             Err(e) => return e,
         }
@@ -1349,6 +1463,7 @@ pub unsafe fn dispatch_object_on(
             };
             match store.put(&key, body, precondition) {
                 Ok(rev) => {
+                    settle_put(owner, charged, true);
                     // `Log::append` does write_all → flush → sync_data, and
                     // it runs BEFORE `apply_local`, so a returned `Ok` means
                     // the record is on disk. That is `LocalDurable`, and
@@ -1376,7 +1491,7 @@ pub unsafe fn dispatch_object_on(
                         }
                     };
                     write_fence(achieved, fence_ptr, fence_cap);
-                    pump_subscriptions(store);
+                    pump_subscriptions(store, subs);
                     0
                 }
                 // Two answers, because they ask the caller to do two
@@ -1384,7 +1499,7 @@ pub unsafe fn dispatch_object_on(
                 // so a create-only caller has LOST. `EAGAIN`: the key moved
                 // under a compare-and-swap, so re-read and retry.
                 Err(e) => {
-                    uncharge_put(owner, charged);
+                    settle_put(owner, charged, false);
                     match e {
                         WriteError::Conflict(_) if absent => errno::EEXIST,
                         WriteError::Conflict(_) => errno::EAGAIN,
@@ -1417,7 +1532,6 @@ pub unsafe fn dispatch_object_on(
             let Some(precondition) = read_precondition(a, &mut p) else {
                 return errno::EINVAL;
             };
-            let writes = &mut *core::ptr::addr_of_mut!(LINUX_WRITES);
             let Some(idx) = writes.iter().position(|w| !w.in_use) else {
                 return errno::ENOMEM;
             };
@@ -1433,14 +1547,13 @@ pub unsafe fn dispatch_object_on(
         }
         obj_op::PUT_STREAMED_WRITE => {
             // arg = the chunk; appended to the staged body.
-            let Some(idx) = write_of(handle) else {
+            let Some(idx) = write_of(writes, handle) else {
                 return errno::EINVAL;
             };
-            let writes = &mut *core::ptr::addr_of_mut!(LINUX_WRITES);
             if writes[idx].committed {
                 return errno::EINVAL;
             }
-            if writes[idx].staged.len() + a.len() > STORE_STAGE_MAX {
+            if writes[idx].staged.len() + a.len() > stage_max || !charge(owner, a.len() as u64) {
                 return errno::ENOSPC;
             }
             writes[idx].staged.extend_from_slice(a);
@@ -1448,13 +1561,12 @@ pub unsafe fn dispatch_object_on(
         }
         obj_op::PUT_STREAMED_COMMIT => {
             // [fence_out_ptr:u64][fence_out_cap:u16]
-            let Some(idx) = write_of(handle) else {
+            let Some(idx) = write_of(writes, handle) else {
                 return errno::EINVAL;
             };
             let Some((fence_ptr, fence_cap)) = fence_out(a, 0) else {
                 return errno::EINVAL;
             };
-            let writes = &mut *core::ptr::addr_of_mut!(LINUX_WRITES);
             if writes[idx].committed {
                 return errno::EINVAL;
             }
@@ -1464,11 +1576,18 @@ pub unsafe fn dispatch_object_on(
             let precondition = writes[idx].precondition;
             let absent = precondition == Precondition::Absent;
             let key = writes[idx].key.clone();
+            // The staged bytes stop being staged and become the entry.
+            release(owner, body.len() as u64);
             let Some(charged) = charge_put(store, owner, &key, body.len()) else {
+                // Still staged: the caller may abort, or commit once room is
+                // made. Re-charging what was just given back always fits.
+                charge(owner, body.len() as u64);
+                writes[idx].staged = body;
                 return errno::ENOSPC;
             };
             match store.put(&key, body, precondition) {
                 Ok(rev) => {
+                    settle_put(owner, charged, true);
                     // One `put`, so the same durability the single-shot path
                     // reports: the log record is synced before this returns.
                     let achieved = if store.is_durable() {
@@ -1482,8 +1601,8 @@ pub unsafe fn dispatch_object_on(
                         }
                     };
                     write_fence(achieved, fence_ptr, fence_cap);
-                    pump_subscriptions(store);
-                    (*core::ptr::addr_of_mut!(LINUX_WRITES))[idx].committed = true;
+                    pump_subscriptions(store, subs);
+                    writes[idx].committed = true;
                     0
                 }
                 // As for `PUT`: a create-only caller has lost the key, or a
@@ -1491,7 +1610,7 @@ pub unsafe fn dispatch_object_on(
                 // bytes are gone either way — the stream is finished, and a
                 // retry is a new one.
                 Err(e) => {
-                    uncharge_put(owner, charged);
+                    settle_put(owner, charged, false);
                     match e {
                         WriteError::Conflict(_) if absent => errno::EEXIST,
                         WriteError::Conflict(_) => errno::EAGAIN,
@@ -1503,10 +1622,10 @@ pub unsafe fn dispatch_object_on(
         obj_op::PUT_STREAMED_ABORT => {
             // The staged bytes are dropped and the handle released, so no
             // CLOSE follows.
-            let Some(idx) = write_of(handle) else {
+            let Some(idx) = write_of(writes, handle) else {
                 return errno::EINVAL;
             };
-            (*core::ptr::addr_of_mut!(LINUX_WRITES))[idx] = WRITE_EMPTY;
+            drop_write(owner, &mut writes[idx]);
             0
         }
         obj_op::GET => {
@@ -1518,7 +1637,6 @@ pub unsafe fn dispatch_object_on(
                 return errno::ENXIO;
             };
             let val = val.to_vec();
-            let reads = &mut *core::ptr::addr_of_mut!(LINUX_READS);
             let Some(idx) = reads.iter().position(|r| !r.in_use) else {
                 return errno::ENOMEM;
             };
@@ -1533,8 +1651,7 @@ pub unsafe fn dispatch_object_on(
         obj_op::RANGE_GET => {
             // [offset:u64][length:u32][out_ptr:u64]
             let idx = slot_of(handle) as usize;
-            let reads = &*core::ptr::addr_of!(LINUX_READS);
-            if idx >= STORE_MAX_READS || !reads[idx].in_use {
+            if idx >= reads.len() || !reads[idx].in_use {
                 return errno::ENOSYS;
             }
             let Some(offset) = get_u64(a, 0).map(|v| v as usize) else {
@@ -1608,10 +1725,13 @@ pub unsafe fn dispatch_object_on(
             let Some((fptr, fcap)) = fence_out(a, p) else {
                 return errno::EINVAL;
             };
-            let held = store.get(&key).map(|(v, _)| v.len() as u64).unwrap_or(0);
+            let held = store
+                .get(&key)
+                .map(|(v, _)| entry_cost(key.len(), v.len()))
+                .unwrap_or(0);
             match store.delete(&key, precondition) {
                 Ok(opt) => {
-                    crate::kernel::exec::scheduler::owners_mut().release_storage(owner, held);
+                    release(owner, held);
                     let rev = opt.unwrap_or_else(|| store.revision());
                     // As `PUT`: the delete is logged and fsynced before it
                     // applies, so a logged store achieved `LocalDurable`.
@@ -1629,7 +1749,7 @@ pub unsafe fn dispatch_object_on(
                         }
                     };
                     write_fence(achieved, fptr, fcap);
-                    pump_subscriptions(store);
+                    pump_subscriptions(store, subs);
                     0
                 }
                 Err(WriteError::Conflict(_)) => errno::EAGAIN,
@@ -1683,13 +1803,12 @@ pub unsafe fn dispatch_object_on(
             n as i32
         }
         obj_op::CLOSE => {
-            if let Some(i) = write_of(handle) {
-                (*core::ptr::addr_of_mut!(LINUX_WRITES))[i] = WRITE_EMPTY;
+            if let Some(i) = write_of(writes, handle) {
+                drop_write(owner, &mut writes[i]);
                 return 0;
             }
             let idx = slot_of(handle) as usize;
-            let reads = &mut *core::ptr::addr_of_mut!(LINUX_READS);
-            if idx < STORE_MAX_READS {
+            if idx < reads.len() {
                 reads[idx] = READ_EMPTY;
             }
             0
@@ -1713,23 +1832,26 @@ pub unsafe fn dispatch_namespace(handle: i32, opcode: u32, arg: *mut u8, arg_len
     if guarded() {
         return errno::EACCES;
     }
-    let Some(store) = store_ref() else {
+    let Some(served) = store_ref() else {
         return errno::ENOSYS;
     };
-    dispatch_namespace_on(store, handle, opcode, arg, arg_len)
+    dispatch_namespace_on(served, handle, opcode, arg, arg_len)
 }
 
-/// [`dispatch_namespace`] against `store`: the node's, or an owner's own.
+/// [`dispatch_namespace`] against `served`: the node's store, or an owner's
+/// own.
 ///
 /// # Safety
 /// As [`dispatch_namespace`].
 pub unsafe fn dispatch_namespace_on(
-    store: &mut Store,
+    served: &mut Served,
     handle: i32,
     opcode: u32,
     arg: *mut u8,
     arg_len: usize,
 ) -> i32 {
+    let store = &mut served.store;
+    let subs = &mut served.subs;
     // Per-handle fence introspection (LOOKUP/SUBSCRIBE handle): a view fence at
     // the current store revision.
     if opcode == QUERY_OP {
@@ -1821,7 +1943,6 @@ pub unsafe fn dispatch_namespace_on(
                 let wid = store.subscribe(&prefix, watermark);
                 // Feed the current state as history-shaped Added events by
                 // pushing them straight to the channel ahead of the live ring.
-                let subs = &mut *core::ptr::addr_of_mut!(LINUX_SUBS);
                 let Some(idx) = subs.iter().position(|s| !s.in_use) else {
                     store.unsubscribe(wid);
                     return errno::ENOMEM;
@@ -1856,7 +1977,6 @@ pub unsafe fn dispatch_namespace_on(
             } else {
                 store.subscribe(&prefix, watermark)
             };
-            let subs = &mut *core::ptr::addr_of_mut!(LINUX_SUBS);
             let Some(idx) = subs.iter().position(|s| !s.in_use) else {
                 store.unsubscribe(watch);
                 return errno::ENOMEM;
@@ -1961,8 +2081,7 @@ pub unsafe fn dispatch_namespace_on(
         ns_op::LOOKUP | ns_op::STAT => errno::ENOSYS,
         ns_op::CLOSE => {
             let idx = slot_of(handle) as usize;
-            let subs = &mut *core::ptr::addr_of_mut!(LINUX_SUBS);
-            if idx < STORE_MAX_SUBS && subs[idx].in_use {
+            if idx < subs.len() && subs[idx].in_use {
                 store.unsubscribe(subs[idx].watch);
                 subs[idx] = SUB_EMPTY;
             }

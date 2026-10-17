@@ -179,10 +179,16 @@ held and where they came from (`source=deployment`,
 A client identity is the operator's, not the publisher's: `fluxor exec
 --identity CERT,KEY` gives a DER certificate chain and key to every
 client-mode `tls` instance of the run that names no identity of its own
-(no `cert_file`, no `identity_label`), and without the flag
+(no `cert_file`, no `key_file`, no `identity_label`), and without the flag
 `$HOME/.config/<applet>/client.der` and `client.key.der` are used when
 both exist. A published applet therefore carries no credential, and one
-bundle serves every operator. Server instances are never given one.
+bundle serves every operator. Server instances are never given one. A key
+longer than a `tls` instance holds (2400 bytes) is refused. The config the
+run writes with the key in it is created `0600` in a directory only the
+operator can enter, outside the project tree — under `$XDG_RUNTIME_DIR`
+when it is set, else under a per-user directory in the system temporary
+directory — and removed when the run ends; the next run removes any left
+by a run that was killed.
 
 ## The Registry Puller: ota_registry
 

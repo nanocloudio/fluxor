@@ -15,9 +15,15 @@
 //   identity_cert in[3]   [0x5C][len:2 LE][leaf DER ‖ issuer DER ‖ …]
 //                         the chain presented to peers, leaf first
 //
+// Both ports carry net_proto-framed messages. A chain is read off
+// `identity_cert` only once its whole frame is buffered, and a frame larger
+// than the inbox is dropped whole, so the port never holds part of one.
+//
 // A chain is taken only when its leaf parses and certifies THIS key; any
 // other is dropped and counted, so a confused or hostile issuer cannot make
-// the instance present a certificate it cannot prove possession of. Until a
+// the instance present a certificate it cannot prove possession of. Under
+// `trust_issuer` it must also be a certification path from the leaf up to
+// its last certificate, which becomes a trust anchor. Until a
 // chain is taken no handshake proceeds past the point where one would be
 // presented: there is nothing honest to present.
 //
@@ -63,7 +69,13 @@ struct LabelIdentity {
     trust_issuer: u8,
     /// Anchors the graph configured; an adopted issuer sits after them.
     static_anchors: u8,
-    inbox: [u8; MAX_CERT_CHAIN_BYTES],
+    /// Bumped each time an issuer is written to the adopted slot. A walk
+    /// records it with the anchor it chose (`DeferredLinks::generation`),
+    /// so a link still stepping when a renewal writes over the slot fails
+    /// cleanly instead of reading key bytes from a different anchor.
+    adopted_generation: u32,
+    /// One `identity_cert` frame: its net_proto header, then the chain.
+    inbox: [u8; NET_FRAME_HDR + MAX_CERT_CHAIN_BYTES],
 }
 
 impl LabelIdentity {
@@ -122,6 +134,12 @@ unsafe fn identity_open(s: &mut TlsState, now: u64) -> bool {
         return false;
     }
     let got = u16::from_le_bytes([*a.add(tail + 10), *a.add(tail + 11)]) as usize;
+    if rc >= 0 && (got != ID_POINT_LEN || point[0] != 0x04) {
+        // A key opened under the label that is not an uncompressed P-256
+        // point is no use here; its slot is freed (the persisted key stays)
+        // before the open is retried.
+        (sys.provider_call)(rc, kv::DESTROY, core::ptr::null_mut(), 0);
+    }
     if rc < 0 || got != ID_POINT_LEN || point[0] != 0x04 {
         // A refusal (another suite under the label, a vault without room) is
         // the operator's to fix; retried slowly so a fix takes without a
@@ -146,33 +164,17 @@ unsafe fn identity_open(s: &mut TlsState, now: u64) -> bool {
 unsafe fn identity_take_chain(s: &mut TlsState, now: u64) -> bool {
     let sys = &*s.syscalls;
     let port = s.identity_cert_in;
-    let poll = (sys.channel_poll)(port, POLL_IN);
-    if poll <= 0 || (poll as u32 & POLL_IN) == 0 {
-        return false;
-    }
-    let (msg_type, payload_len) = tls_read_header(sys, port);
+    let cap = s.label_id.inbox.len();
+    let (msg_type, copied, pl) =
+        net_read_frame_sized(sys, port, s.label_id.inbox.as_mut_ptr(), cap);
     if msg_type == 0 {
         return false;
     }
-    let pl = payload_len as usize;
-    if msg_type != ID_MSG_CERT || pl == 0 || pl > MAX_CERT_CHAIN_BYTES {
-        tls_discard(sys, port, pl);
+    if msg_type != ID_MSG_CERT || copied != pl || pl == 0 || s.label_id.state < ID_UNCERTIFIED {
         s.label_id.refused = s.label_id.refused.wrapping_add(1);
         return true;
     }
-    let mut got = 0usize;
-    while got < pl {
-        let n = (sys.channel_read)(port, s.label_id.inbox.as_mut_ptr().add(got), pl - got);
-        if n <= 0 {
-            break;
-        }
-        got += n as usize;
-    }
-    if got != pl || s.label_id.state < ID_UNCERTIFIED {
-        s.label_id.refused = s.label_id.refused.wrapping_add(1);
-        return true;
-    }
-    let chain = core::slice::from_raw_parts(s.label_id.inbox.as_ptr(), pl);
+    let chain = core::slice::from_raw_parts(s.label_id.inbox.as_ptr().add(NET_FRAME_HDR), pl);
     let leaf_len = match der_tlv(chain, 0) {
         Some((_, _, consumed)) if consumed > 0 && consumed <= pl => consumed,
         _ => 0,
@@ -191,13 +193,13 @@ unsafe fn identity_take_chain(s: &mut TlsState, now: u64) -> bool {
         dev_log(sys, 1, msg.as_ptr(), msg.len());
         return true;
     }
-    if s.label_id.trust_issuer != 0 && !identity_adopt_issuer(s, pl) {
+    if s.label_id.trust_issuer != 0 && !identity_adopt_issuer(s, chain) {
         s.label_id.refused = s.label_id.refused.wrapping_add(1);
-        let msg = b"[tls] identity: dropped a chain whose issuer cannot be an anchor";
+        let msg = b"[tls] identity: dropped a chain that is not a path to an issuer that can be an anchor";
         dev_log(sys, 1, msg.as_ptr(), msg.len());
         return true;
     }
-    core::ptr::copy_nonoverlapping(s.label_id.inbox.as_ptr(), s.cert.as_mut_ptr(), pl);
+    core::ptr::copy_nonoverlapping(chain.as_ptr(), s.cert.as_mut_ptr(), pl);
     s.cert_len = pl;
     s.label_id.state = ID_CERTIFIED;
     // Renewed at two thirds of its lifetime, measured from now rather than
@@ -218,35 +220,71 @@ unsafe fn identity_take_chain(s: &mut TlsState, now: u64) -> bool {
     true
 }
 
-/// `trust_issuer`: make the last certificate of the chain in the inbox (its
-/// issuer) the trust anchor after the configured ones, replacing one an
-/// earlier chain adopted. An authority minted at runtime — a node's own —
-/// is what the instance's peers chain to, and the graph could not name it.
-/// False, and nothing changed, when the chain has no issuer that parses.
-unsafe fn identity_adopt_issuer(s: &mut TlsState, pl: usize) -> bool {
-    let chain = core::slice::from_raw_parts(s.label_id.inbox.as_ptr(), pl);
-    let (mut pos, mut last, mut count) = (0usize, (0usize, 0usize), 0u32);
-    while pos < pl {
-        let Some((_, _, total)) = der_tlv(chain, pos) else {
-            return false;
-        };
-        if total == 0 || pos + total > pl {
-            return false;
+/// The span of the last certificate of `chain` (concatenated DER, leaf
+/// first) when the chain is a certification path up to it, else `None`.
+///
+/// Each certificate must name the next as its issuer and carry that
+/// issuer's signature, and every certificate above the leaf must be a CA
+/// permitted to sign certificates within its path-length constraint (RFC
+/// 5280 §4.2.1.3, §4.2.1.9) and no weaker than what it signs. Lifetimes are
+/// left to the peers' walks, which judge the anchor's under their own clock
+/// policy. The signatures are verified whole, within the step: a renewal
+/// is rare and its chain is the node's own, short and of the issuer's suite.
+fn identity_issuer_path(chain: &[u8]) -> Option<(usize, usize)> {
+    let mut spans = [(0usize, 0usize); MAX_CHAIN_LEN];
+    let (mut pos, mut count) = (0usize, 0usize);
+    while pos < chain.len() {
+        let (_, _, total) = der_tlv(chain, pos)?;
+        if total == 0 || pos + total > chain.len() || count >= MAX_CHAIN_LEN {
+            return None;
         }
-        last = (pos, total);
+        spans[count] = (pos, total);
         count += 1;
         pos += total;
     }
-    let (at, len) = last;
+    if count < 2 {
+        return None;
+    }
+    let mut i = 0;
+    while i + 1 < count {
+        let (sa, sl) = spans[i];
+        let (ia, il) = spans[i + 1];
+        let subject_der = &chain[sa..sa + sl];
+        let issuer_der = &chain[ia..ia + il];
+        let subject = parse_certificate(subject_der)?;
+        let issuer = parse_certificate(issuer_der)?;
+        if !der_bytes_eq(subject.issuer_raw, issuer.subject_raw)
+            || check_ca_shape(&issuer, issuer_der, i) != CERT_OK
+            || !suite::is_implemented(issuer.key_suite)
+            || suite::is_downgrade(issuer.key_suite, subject.key_suite)
+            || !verify_cert_signature(subject_der, issuer.key_suite, issuer.public_key)
+        {
+            return None;
+        }
+        i += 1;
+    }
+    Some(spans[count - 1])
+}
+
+/// `trust_issuer`: make the last certificate of `chain` (its issuer) the
+/// trust anchor after the configured ones, replacing one an earlier chain
+/// adopted. An authority minted at runtime — a node's own — is what the
+/// instance's peers chain to, and the graph could not name it. False, and
+/// nothing changed, unless the chain is a certification path from its leaf
+/// up to that issuer ([`identity_issuer_path`]) and the issuer fits a slot.
+unsafe fn identity_adopt_issuer(s: &mut TlsState, chain: &[u8]) -> bool {
+    let Some((at, len)) = identity_issuer_path(chain) else {
+        return false;
+    };
     let base = s.label_id.static_anchors as usize;
-    if count < 2 || len > MAX_CERT_LEN || base >= MAX_ANCHORS {
+    if len > MAX_CERT_LEN || base >= MAX_ANCHORS {
         return false;
     }
-    let issuer = core::slice::from_raw_parts(chain.as_ptr().add(at), len);
-    if parse_certificate(issuer).is_none() {
-        return false;
-    }
-    core::ptr::copy_nonoverlapping(issuer.as_ptr(), s.anchors[base].as_mut_ptr(), len);
+    let issuer = &chain[at..at + len];
+    // A session still stepping links read from the slot fails them on the
+    // generation, never on bytes of the replacement.
+    s.label_id.adopted_generation = s.label_id.adopted_generation.wrapping_add(1);
+    s.anchors[base][..len].copy_from_slice(issuer);
     s.anchor_lens[base] = len as u16;
     s.anchor_count = (base + 1) as u8;
     true
@@ -331,6 +369,9 @@ unsafe fn identity_admit(s: &mut TlsState) -> Option<&'static [u8]> {
         && s.peer_auth != PROFILE_CA_URI
     {
         return Some(b"[tls] refusing to construct: trust_issuer adopts an authority, and only a CA profile (ca_dns, ca_uri) verifies chains against one");
+    }
+    if s.label_id.trust_issuer != 0 && s.anchor_count as usize >= MAX_ANCHORS {
+        return Some(b"[tls] refusing to construct: trust_issuer adopts an anchor after the configured ones, and they already fill MAX_ANCHORS");
     }
     s.label_id.static_anchors = s.anchor_count;
     s.label_id.state = ID_OPENING;

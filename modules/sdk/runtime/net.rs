@@ -89,11 +89,6 @@ unsafe fn net_read_frame_sized(
         return (0, 0, 0);
     }
     let n = (sys.channel_peek)(chan, buf, NET_FRAME_HDR);
-    if n < 0 {
-        // A mailbox channel cannot be peeked; its read is one whole record,
-        // so a frame on it is whole by construction.
-        return net_read_frame_mailbox(sys, chan, buf, buf_max);
-    }
     if n < NET_FRAME_HDR as i32 {
         return (0, 0, 0);
     }
@@ -106,8 +101,9 @@ unsafe fn net_read_frame_sized(
             (sys.channel_discard)(chan, total);
             return (msg_type, payload_len, payload_len);
         }
-        // Incomplete. It completes only if the ring has room for more; a
-        // full ring holding less than the frame can never hold all of it.
+        // Incomplete. It completes only if the channel has room for more:
+        // a full ring holding less than the frame can never hold all of it,
+        // and a mailbox record shorter than its header claims never grows.
         if (sys.channel_poll)(chan, POLL_OUT) & POLL_OUT as i32 != 0 {
             return (0, 0, 0);
         }
@@ -118,27 +114,6 @@ unsafe fn net_read_frame_sized(
     let copied = (got.max(0) as usize).saturating_sub(NET_FRAME_HDR);
     (sys.channel_discard)(chan, total);
     (msg_type, copied, payload_len)
-}
-
-/// The mailbox half of [`net_read_frame_sized`]: one record per read, whole
-/// or not at all. A record that is not one frame is dropped and reported as
-/// an undeliverable frame.
-unsafe fn net_read_frame_mailbox(
-    sys: &SyscallTable,
-    chan: i32,
-    buf: *mut u8,
-    buf_max: usize,
-) -> (u8, usize, usize) {
-    let n = (sys.channel_read)(chan, buf, buf_max);
-    if n < NET_FRAME_HDR as i32 {
-        return (0, 0, 0);
-    }
-    let msg_type = *buf;
-    let payload_len = (*buf.add(1) as u16 | ((*buf.add(2) as u16) << 8)) as usize;
-    if NET_FRAME_HDR + payload_len != n as usize {
-        return (msg_type, 0, payload_len);
-    }
-    (msg_type, payload_len, payload_len)
 }
 
 /// Fill buffer with cryptographically secure random bytes.

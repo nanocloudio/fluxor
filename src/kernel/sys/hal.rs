@@ -413,10 +413,6 @@ pub fn init(ops: &'static HalOps) {
     }
 }
 
-/// Get the HAL ops table. Boot order guarantees `init()` runs before
-/// any kernel code that touches the HAL; calling `ops()` before
-/// `init()` panics with a useful diagnostic so a misordered
-/// refactor fails loudly instead of trapping as undefined behaviour.
 /// Whether the platform has installed its HAL: before that, nothing but
 /// the kernel's own boot code runs.
 #[inline]
@@ -425,6 +421,10 @@ pub fn is_initialised() -> bool {
     unsafe { (*core::ptr::addr_of!(HAL_OPS)).is_some() }
 }
 
+/// Get the HAL ops table. Boot order guarantees `init()` runs before any
+/// kernel code that touches the HAL; calling `ops()` before `init()` panics
+/// with a diagnostic, so an ordering mistake fails loudly instead of trapping
+/// as undefined behaviour.
 #[inline(always)]
 fn ops() -> &'static HalOps {
     // SAFETY: `HAL_OPS` is set once at boot by `init`; the panic-on-None

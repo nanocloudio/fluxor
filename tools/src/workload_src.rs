@@ -794,7 +794,7 @@ fn write_identity_config(
     let (given, report) =
         crate::trust_anchors::append_operator_identity(&blob, &cert_der, &key_der)
             .map_err(|e| Error::Config(format!("--identity: {e}")))?;
-    std::fs::write(out, &given)?;
+    write_private(out, &given)?;
     if verbose {
         eprintln!(
             "  --identity: '{}' given to {} client instance(s)",
@@ -848,6 +848,101 @@ impl Drop for Scratch {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.dir);
     }
+}
+
+/// Where a launch keeps what carries the operator's private key: a
+/// directory only its owner can enter, outside the project tree — under
+/// `$XDG_RUNTIME_DIR` (per user, in memory, cleared at logout) when that is
+/// set, else under a per-user directory in the system temporary directory.
+/// A project tree is backed up, synced and committed; a key written there
+/// by a launch killed before its cleanup would stay with it.
+struct SecretScratch {
+    dir: PathBuf,
+}
+
+impl SecretScratch {
+    fn create(name: &str) -> Result<Self> {
+        use std::os::unix::fs::DirBuilderExt;
+        let root = secret_root()?;
+        sweep_dead_launches(&root);
+        let dir = root.join(format!("{name}-{}", std::process::id()));
+        // A directory a crashed launch with this pid left behind.
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
+        Ok(SecretScratch { dir })
+    }
+}
+
+impl Drop for SecretScratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// The per-user root [`SecretScratch`] directories live under, created
+/// `0700` and refused unless it is a real directory this user owns that no
+/// one else can enter: in a shared temporary directory another user could
+/// have made the name first.
+fn secret_root() -> Result<PathBuf> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    // SAFETY: `geteuid` takes no arguments and cannot fail.
+    let uid = unsafe { libc::geteuid() };
+    let root = match std::env::var_os("XDG_RUNTIME_DIR").filter(|d| !d.is_empty()) {
+        Some(runtime) => PathBuf::from(runtime).join("fluxor-run"),
+        None => std::env::temp_dir().join(format!("fluxor-run-{uid}")),
+    };
+    match std::fs::DirBuilder::new().mode(0o700).create(&root) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e.into()),
+    }
+    let meta = std::fs::symlink_metadata(&root)?;
+    if !meta.is_dir() || meta.uid() != uid || meta.mode() & 0o077 != 0 {
+        return Err(Error::Config(format!(
+            "{}: not a private directory of this user; refusing to write an identity there",
+            root.display()
+        )));
+    }
+    Ok(root)
+}
+
+/// Remove the directories of launches whose process is gone: a launch
+/// killed outright never ran its cleanup.
+fn sweep_dead_launches(root: &Path) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name
+            .to_str()
+            .and_then(|n| n.rsplit_once('-'))
+            .and_then(|(_, pid)| pid.parse::<libc::pid_t>().ok())
+        else {
+            continue;
+        };
+        // SAFETY: signal 0 only asks whether `pid` exists.
+        let gone = pid > 0
+            && unsafe { libc::kill(pid, 0) } != 0
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+        if gone {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+/// Write `bytes` to a new file at `path` that only its owner can read.
+fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let _ = std::fs::remove_file(path);
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    f.write_all(bytes)?;
+    Ok(())
 }
 
 /// Launch a bundle's linux implementation. `runtime` names the binary to
@@ -932,8 +1027,9 @@ fn launch_bundle(
     let prebuilt = manifest.params.is_empty() && target_dir.join("config.bin").is_file();
     // Scratch holds what this launch writes: a rendered graph and its blobs,
     // a widened config. Parameter values reach all of them, so the directory
-    // is private and goes away on every exit path.
-    let scratch = if !prebuilt || ca.is_some() || identity.is_some() {
+    // is private and goes away on every exit path. A config carrying the
+    // operator's key goes to a `SecretScratch` instead, outside the tree.
+    let scratch = if !prebuilt || ca.is_some() {
         Some(Scratch::create(&project_root, &manifest.name)?)
     } else {
         None
@@ -1013,9 +1109,14 @@ fn launch_bundle(
         write_widened_config(&config_bin, &widened, pem)?;
         config_bin = widened;
     }
-    // The operator's identity is given the same way: to this run's copy.
-    if let (Some((cert, key)), Some(scratch)) = (identity, &scratch) {
-        let given = scratch.dir.join("config.identity.bin");
+    // The operator's identity is given the same way: to this run's copy,
+    // held where a key may be written.
+    let secret = match identity {
+        Some(_) => Some(SecretScratch::create(&manifest.name)?),
+        None => None,
+    };
+    if let (Some((cert, key)), Some(secret)) = (identity, &secret) {
+        let given = secret.dir.join("config.identity.bin");
         write_identity_config(&config_bin, &given, cert, key, verbose)?;
         config_bin = given;
     }
@@ -1100,6 +1201,7 @@ fn launch_bundle(
     let status = crate::run_tied(&mut cmd);
     // `exit` below skips destructors.
     drop(scratch);
+    drop(secret);
     let status = status?;
     crate::exit_if_signalled(&status);
     // A CLI bundle's exit code IS the deliverable: propagate it verbatim

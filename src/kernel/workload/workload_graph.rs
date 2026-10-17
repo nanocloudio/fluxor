@@ -147,9 +147,69 @@ const MAX_WORKLOADS: usize = MAX_OWNERS;
 
 static mut FMOD_WORKLOADS: [WorkloadSlot; MAX_WORKLOADS] = [WL_EMPTY; MAX_WORKLOADS];
 
-/// The pack of the `CREATE` being staged across calls, until the add is
-/// published (bound to its owner) or abandoned (released).
-static mut STAGED_PACK: Option<code_pack::Staged> = None;
+/// A `CREATE` whose subgraph is being instantiated a batch per call. The
+/// backend owns everything the add reads between calls: its own copy of the
+/// subgraph (the modules' params are read from it as they instantiate), and
+/// the pack its names resolve in. One is pending at a time.
+struct PendingCreate {
+    identity: [u8; 16],
+    /// SHA-256 of the spec as the caller sent it: a continuation sends the
+    /// same bytes.
+    spec: [u8; 32],
+    staged: live::StagedAdd,
+    pack: Option<code_pack::Staged>,
+    caller_edges: [live::CallerEdge; wl::MAX_CALLER_LANES * 2],
+    caller_edge_count: usize,
+}
+
+static mut PENDING: Option<PendingCreate> = None;
+
+/// The pending `CREATE`'s copy of its subgraph. An FLXA source is at most a
+/// `u16` long (the header's `source_ref_len`).
+static mut PENDING_BLOB: [u8; u16::MAX as usize] = [0; u16::MAX as usize];
+
+/// Modules a `CREATE` instantiates per call. A subgraph with more answers
+/// `EINPROGRESS` between batches, so no call holds the scheduler for longer
+/// than a few module loads.
+pub const CREATE_MODULES_PER_CALL: usize = 4;
+
+/// Forget the pending `CREATE` without rolling it back: a rebuild has
+/// already dropped every workload, the half-added one with them, and freed
+/// the code pool its pack lived in.
+pub fn reset_pending() {
+    // SAFETY: rebuild path, scheduler thread.
+    unsafe { *core::ptr::addr_of_mut!(PENDING) = None };
+}
+
+/// Roll the pending `CREATE` back: its add, and the pack it brought.
+unsafe fn abandon_pending() {
+    if let Some(p) = (*core::ptr::addr_of_mut!(PENDING)).take() {
+        live::abandon_staged(p.staged);
+        if let Some(s) = p.pack {
+            code_pack::release(s);
+        }
+    }
+}
+
+/// Whether a workload of this backend carries `identity`: a live one, or
+/// the `CREATE` being staged. Another backend asks before it admits one.
+pub fn holds_identity(identity: &[u8; 16]) -> bool {
+    // SAFETY: scheduler thread.
+    pending_identity() == Some(*identity) || unsafe { slot_by_identity(identity) }.is_some()
+}
+
+/// The identity of the pending `CREATE`, if any.
+fn pending_identity() -> Option<[u8; 16]> {
+    // SAFETY: scheduler thread.
+    unsafe { (*core::ptr::addr_of!(PENDING)).as_ref().map(|p| p.identity) }
+}
+
+/// SHA-256 of a `CREATE` spec.
+fn spec_digest(spec: &[u8]) -> [u8; 32] {
+    let mut h = crate::kernel::security::crypto::sha256::Sha256::new();
+    h.update(spec);
+    h.finalize()
+}
 
 #[inline]
 fn rd_u16(b: &[u8], off: usize) -> u16 {
@@ -295,6 +355,147 @@ unsafe fn remove_identity(addr16: &[u8; 16]) {
     let _ = write_addr_ctl_frame(ch, netid::ADDR_DEL, addr16);
 }
 
+/// Admit a new `CREATE` and stage its subgraph as the pending one: stage and
+/// admit its pack, refuse a module holding a node privilege, copy the
+/// subgraph into the backend's own memory (carrying the header's identity
+/// and the memory ceiling there, never into the caller's spec), and reserve
+/// its owner with the storage the header admits. 0, or a negative errno with
+/// nothing left staged.
+///
+/// # Safety
+/// Scheduler thread; `buf` is the caller's whole spec.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the parsed header fields CREATE admits by; a struct would restate the header under a second name"
+)]
+unsafe fn begin_create(
+    buf: &[u8],
+    flxa_off: usize,
+    flxa_len: usize,
+    pack: Option<(usize, usize, usize)>,
+    src_start: usize,
+    memory_bytes: u64,
+    storage_bytes: u64,
+    wants_identity: bool,
+    identity: [u8; 16],
+    spec: [u8; 32],
+) -> i32 {
+    // ── A pack: the workload's own modules, staged as its code. Each must be
+    //    the module asked for — its bytes match a pin — or one the node's
+    //    signing root signed; then the region is made executable, and the
+    //    subgraph's names resolve in it first while the add instantiates.
+    let staged = match pack {
+        Some((ptr, len, pins)) => {
+            let bytes = core::slice::from_raw_parts(ptr as *const u8, len);
+            let staged = match code_pack::stage(bytes) {
+                Ok(s) => s,
+                Err(e) => return e,
+            };
+            let pin_bytes = &buf[src_start + wl::pack_ref::SIZE
+                ..src_start + wl::pack_ref::SIZE + pins * wl::pack_ref::PIN_SIZE];
+            let mut ok = true;
+            let ldr = code_pack::loader(staged);
+            code_pack::for_each_module(staged, |hash, fmod| {
+                let pinned = |p: &[u8; 32]| -> bool { pin_matches(pin_bytes, p) };
+                let module = ldr.find_by_name_hash(hash);
+                ok &= match module {
+                    Ok(m) => code_pack::admitted_with(fmod, &m, pinned),
+                    Err(_) => false,
+                };
+            });
+            if !ok {
+                code_pack::release(staged);
+                return errno::EACCES;
+            }
+            if !code_pack::seal(staged) {
+                code_pack::release(staged);
+                return errno::EFAULT;
+            }
+            Some(staged)
+        }
+        None => None,
+    };
+    let unstage = |staged: Option<code_pack::Staged>| {
+        code_pack::end_staging();
+        if let Some(s) = staged {
+            code_pack::release(s);
+        }
+    };
+    if let Some(s) = staged {
+        code_pack::begin_staging(s);
+    }
+    let flxa = &buf[flxa_off..flxa_off + flxa_len];
+    // A workload is a tenant of the node, not part of it: none of its
+    // modules may hold a node privilege. `platform_raw` reads any register
+    // (the seal key's OTP rows among them), `dma` and `pcie_device` reach
+    // memory behind the kernel, `reconfigure`/`monitor`/`bridge`/`flash_raw`/
+    // `backing_provider`/`usb_host` act on the node itself. Only `observe` —
+    // a read-only telemetry drain — is admitted. Checked before any owner is
+    // allocated, against the modules the node would instantiate.
+    let Some(perms) = live::module_permissions(flxa) else {
+        unstage(staged);
+        return errno::EINVAL;
+    };
+    if perms & !crate::kernel::module::syscalls::permission::OBSERVE != 0 {
+        unstage(staged);
+        return errno::EACCES;
+    }
+    // The creator's own lanes (FLXA `Caller` edges): each lands at the add's
+    // first edge plus its position.
+    let mut caller_edges = [live::CallerEdge::default(); wl::MAX_CALLER_LANES * 2];
+    let Some(caller_edge_count) = live::caller_edges(flxa, &mut caller_edges) else {
+        unstage(staged);
+        return errno::EINVAL;
+    };
+
+    // ── The backend's own copy of the subgraph, carrying the header's
+    //    identity (what `apply_add` allocates the owner by) and the memory
+    //    ceiling clamped onto the subgraph's caps.
+    let blob = &mut (&mut *core::ptr::addr_of_mut!(PENDING_BLOB))[..flxa_len];
+    blob.copy_from_slice(flxa);
+    blob[FLXA_OWNER_UID_OFF..FLXA_OWNER_UID_OFF + 16].copy_from_slice(&identity);
+    let mem_ceil = if memory_bytes == 0 {
+        None
+    } else {
+        Some(memory_bytes.min(u32::MAX as u64) as u32)
+    };
+    clamp_cap_be(blob, FLXA_STATE_CAP_OFF, mem_ceil);
+    clamp_cap_be(blob, FLXA_BUFFER_CAP_OFF, mem_ceil);
+
+    // ── Stage the subgraph: decode it, reserve the owner, assign slots and
+    //    open its channels. A `net=own` workload's net-facing producer names
+    //    `SPARE_LANE_SENTINEL` (the workload manager cannot name a kernel
+    //    channel off-node); it is wired into the boot merge's next free spare
+    //    lane on the net provider's ingress, and with no free lane the
+    //    CREATE is refused `ENOMEM` before anything is allocated.
+    live::set_caller(Some(scheduler::current_module_index()));
+    let spare_lane = wants_identity.then(provider_net_in_spare_lane);
+    let begun = live::begin_add_encoded(blob, spare_lane);
+    live::set_caller(None);
+    code_pack::end_staging();
+    let staged_add = match begun {
+        Ok(st) => st,
+        Err(e) => {
+            if let Some(s) = staged {
+                code_pack::release(s);
+            }
+            return e;
+        }
+    };
+    // What the owner may hold in the node's storage, set before any of its
+    // modules runs.
+    scheduler::owners_mut().set_storage_cap(staged_add.handle(), storage_bytes);
+    *core::ptr::addr_of_mut!(PENDING) = Some(PendingCreate {
+        identity,
+        spec,
+        staged: staged_add,
+        pack: staged,
+        caller_edges,
+        caller_edge_count,
+    });
+    0
+}
+
 /// WORKLOAD_CREATE: stage a fmod-graph workload as a new owner subgraph. Returns
 /// a tagged `FD_TAG_WORKLOAD` handle, or a negative errno.
 ///
@@ -307,7 +508,7 @@ unsafe fn workload_create(arg: *mut u8, arg_len: usize) -> i32 {
     if arg.is_null() || arg_len < wl::CREATE_HEADER_SIZE {
         return errno::EINVAL;
     }
-    let buf = core::slice::from_raw_parts_mut(arg, arg_len);
+    let buf = core::slice::from_raw_parts(arg, arg_len);
 
     let posture = buf[16];
     let source_kind = buf[17];
@@ -346,7 +547,8 @@ unsafe fn workload_create(arg: *mut u8, arg_len: usize) -> i32 {
     if source_kind != wl::SOURCE_FMOD_GRAPH && source_kind != wl::SOURCE_FMOD_PACK {
         return errno::ENOSYS;
     }
-    // Only POSTURE_SHARED is realized; ISOLATED/HARDENED need EL0 wiring.
+    // Only POSTURE_SHARED is realized; this backend gives a workload no
+    // protection domain of its own, so ISOLATED and HARDENED are refused.
     if posture != wl::POSTURE_SHARED {
         return errno::ENOSYS;
     }
@@ -357,7 +559,7 @@ unsafe fn workload_create(arg: *mut u8, arg_len: usize) -> i32 {
     //   * net_iso beyond OWN is malformed,
     //   * own-iso XOR a family (one without the other) is a half-specified
     //     identity — not realized,
-    //   * IPv6 and non-default segments are deferred with net_identity (ENOSYS).
+    //   * IPv6 and non-default segments are not realized (ENOSYS).
     if net_iso > wl::NET_ISO_OWN {
         return errno::EINVAL;
     }
@@ -416,153 +618,81 @@ unsafe fn workload_create(arg: *mut u8, arg_len: usize) -> i32 {
     }
     let mut identity = [0u8; 16];
     identity.copy_from_slice(&buf[..16]);
-    // A CREATE still being staged is continued by the same spec; a CREATE
-    // for anyone else waits until it is published or abandoned.
-    let continuing = match live::staged_add_identity() {
-        Some(id) if id == identity => true,
-        Some(_) => return errno::EBUSY,
-        None => false,
-    };
+    let spec = spec_digest(&buf[..opt_end]);
 
-    // ── A pack: the workload's own modules, staged as its code. Each must be
-    //    the module asked for — its bytes match a pin — or one the node's
-    //    signing root signed; then the region is made executable, and the
-    //    subgraph's names resolve in it first (until the add is decided).
-    let staged = if continuing {
-        // Staged by the first call and still resolving the subgraph's names.
-        (*core::ptr::addr_of_mut!(STAGED_PACK)).take()
+    // A CREATE being staged is continued by its own identity with the same
+    // spec; anything else waits until it is published or abandoned.
+    if let Some(id) = pending_identity() {
+        let same = id == identity
+            && (*core::ptr::addr_of!(PENDING))
+                .as_ref()
+                .is_some_and(|p| p.spec == spec);
+        if !same {
+            return errno::EBUSY;
+        }
     } else {
-        match pack {
-            Some((ptr, len, pins)) => {
-                let bytes = core::slice::from_raw_parts(ptr as *const u8, len);
-                let staged = match code_pack::stage(bytes) {
-                    Ok(s) => s,
-                    Err(e) => return e,
-                };
-                let pin_bytes = &buf[src_start + wl::pack_ref::SIZE
-                    ..src_start + wl::pack_ref::SIZE + pins * wl::pack_ref::PIN_SIZE];
-                let mut ok = true;
-                let ldr = code_pack::loader(staged);
-                code_pack::for_each_module(staged, |hash, fmod| {
-                    let pinned = |p: &[u8; 32]| -> bool { pin_matches(pin_bytes, p) };
-                    let module = ldr.find_by_name_hash(hash);
-                    ok &= match module {
-                        Ok(m) => code_pack::admitted_with(fmod, &m, pinned),
-                        Err(_) => false,
-                    };
-                });
-                if !ok {
-                    code_pack::release(staged);
-                    return errno::EACCES;
+        // One identity is one workload.
+        if scheduler::owners().find_by_uid(identity).is_some() {
+            return errno::EEXIST;
+        }
+        let rc = begin_create(
+            buf,
+            flxa_off,
+            flxa_len,
+            pack,
+            src_start,
+            memory_bytes,
+            storage_bytes,
+            wants_identity,
+            identity,
+            spec,
+        );
+        if rc != 0 {
+            return rc;
+        }
+    }
+
+    // ── One batch of the pending add; the rest of CREATE once its last
+    //    module is in.
+    let p = (*core::ptr::addr_of_mut!(PENDING))
+        .as_mut()
+        .expect("pending CREATE");
+    if let Some(s) = p.pack {
+        code_pack::begin_staging(s);
+    }
+    let batch = live::instantiate_batch(&mut p.staged, CREATE_MODULES_PER_CALL);
+    code_pack::end_staging();
+    match batch {
+        Ok(false) => return errno::EINPROGRESS,
+        Ok(true) => {}
+        Err(e) => {
+            // The add rolled itself back; its pack goes with it.
+            if let Some(p) = (*core::ptr::addr_of_mut!(PENDING)).take() {
+                if let Some(s) = p.pack {
+                    code_pack::release(s);
                 }
-                if !code_pack::seal(staged) {
-                    code_pack::release(staged);
-                    return errno::EFAULT;
-                }
-                code_pack::begin_staging(staged);
-                Some(staged)
             }
-            None => None,
+            return e.code();
         }
-    };
-    // Every return from here to the add's verdict releases what was staged.
-    let unstage = |staged: Option<code_pack::Staged>| {
-        code_pack::end_staging();
-        if let Some(s) = staged {
-            code_pack::release(s);
-        }
-    };
-    // A workload is a tenant of the node, not part of it: none of its
-    // modules may hold a node privilege. `platform_raw` reads any register
-    // (the seal key's OTP rows among them), `dma` and `pcie_device` reach
-    // memory behind the kernel, `reconfigure`/`monitor`/`bridge`/`flash_raw`/
-    // `backing_provider`/`usb_host` act on the node itself. Only `observe` —
-    // a read-only telemetry drain — is admitted. Checked before any owner is
-    // allocated, against the modules the node would instantiate.
-    let Some(perms) = live::module_permissions(&buf[flxa_off..flxa_off + flxa_len]) else {
-        unstage(staged);
+    }
+    let Some(p) = (*core::ptr::addr_of_mut!(PENDING)).take() else {
         return errno::EINVAL;
     };
-    if perms & !crate::kernel::module::syscalls::permission::OBSERVE != 0 {
-        unstage(staged);
-        return errno::EACCES;
-    }
-
-    // ── Bridge the durable workload identity into the FLXA blob so `apply_add`'s
-    //    `owners.alloc(owner_uid)` / `find_by_uid` carries the header identity,
-    //    and clamp the FLXA caps to the envelope memory ceiling (caps, never a
-    //    new meter). Both edits are in place within
-    //    the `source_ref` region, which we validated is >= FLXA_MIN_LEN long.
-    buf.copy_within(0..16, flxa_off + FLXA_OWNER_UID_OFF);
-    let mem_ceil = if memory_bytes == 0 {
-        None
-    } else {
-        Some(memory_bytes.min(u32::MAX as u64) as u32)
+    let edge_base = p.staged.edge_base();
+    let caller_edges = p.caller_edges;
+    let caller_edge_count = p.caller_edge_count;
+    let owner = match live::finish_staged(p.staged) {
+        Ok(owner) => owner,
+        Err(e) => {
+            if let Some(s) = p.pack {
+                code_pack::release(s);
+            }
+            return e.code();
+        }
     };
-    clamp_cap_be(buf, flxa_off + FLXA_STATE_CAP_OFF, mem_ceil);
-    clamp_cap_be(buf, flxa_off + FLXA_BUFFER_CAP_OFF, mem_ceil);
-
-    // ── Stage the subgraph. `apply_add_encoded` decodes the FLXA blob (PIC
-    //    modules, edges, caps), allocates the owner, instantiates + splices —
-    //    the complete admission gate (name_hash resolvable in flash, bounds,
-    //    atomic rollback). On metal this is the first runtime `apply_add`, which
-    //    drives the per-domain splice + multicore quiesce. On success
-    //    it writes `[slot:u16 LE][generation:u32 LE]` into the blob's first 6
-    //    bytes; we read the owner handle back from there.
-    //
-    //    Spare-lane injection seam. A `net=own`
-    //    workload composes its net-facing producer edge with a
-    //    `SPARE_LANE_SENTINEL` `to` (the workload manager cannot name a kernel runtime
-    //    channel off-node). Resolve the boot merge's next free spare lane on
-    //    the provider's `net_in` and hand it to the decode→inject→apply variant, which
-    //    rewrites the sentinel to `ExistingChannel(lane)` so the producer edges
-    //    straight into the merge. A free lane read is side-effect-free (the
-    //    attach commits inside `apply_add`), so a `-1` (no merge / exhausted)
-    //    with a sentinel present fails `ENOMEM` before anything is allocated.
-    //    A host-shared workload carries no sentinel and takes the plain path,
-    //    byte-identical.
-    let src_ptr = arg.add(flxa_off);
-    let source_ref_len = flxa_len;
-    // The creator's own lanes (FLXA `Caller` edges) are found before the add,
-    // which overwrites the blob's head; each lands at the edge count before
-    // the add plus its position.
-    let mut caller_edges = [live::CallerEdge::default(); wl::MAX_CALLER_LANES * 2];
-    let Some(caller_edge_count) = live::caller_edges(
-        core::slice::from_raw_parts(src_ptr, source_ref_len),
-        &mut caller_edges,
-    ) else {
-        unstage(staged);
-        return errno::EINVAL;
-    };
-    live::set_caller(Some(scheduler::current_module_index()));
-    let rc = if wants_identity {
-        let spare_lane = provider_net_in_spare_lane();
-        live::apply_add_encoded_spare_lane(src_ptr, source_ref_len, spare_lane)
-    } else {
-        live::apply_add_encoded(src_ptr, source_ref_len)
-    };
-    live::set_caller(None);
-    if rc == errno::EINPROGRESS {
-        // A batch is in; the pack stays staged for the next call.
-        *core::ptr::addr_of_mut!(STAGED_PACK) = staged;
-        return rc;
-    }
-    if rc != 0 {
-        unstage(staged);
-        return rc; // negative AddError::code, -ENOMEM (no spare lane), or -EINVAL
-    }
-    let edge_base = live::last_add_edge_base();
-    let hb = core::slice::from_raw_parts(src_ptr, 6);
-    let owner = OwnerHandle {
-        slot: u16::from_le_bytes([hb[0], hb[1]]),
-        generation: u32::from_le_bytes([hb[2], hb[3], hb[4], hb[5]]),
-    };
-    // What the owner may hold in the node's storage.
-    scheduler::owners_mut().set_storage_cap(owner, storage_bytes);
     // The pack is the owner's now: freed with it (`live::free_owner`), so
     // every later failure's `free_owner` takes the code too.
-    code_pack::end_staging();
-    if let Some(s) = staged {
+    if let Some(s) = p.pack {
         code_pack::bind(s, owner.slot);
     }
 
@@ -901,7 +1031,7 @@ unsafe fn dispatch_op(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) ->
         let out = core::slice::from_raw_parts_mut(arg, arg_len);
         let mut identity = [0u8; 16];
         identity.copy_from_slice(&out[..16]);
-        if live::staged_add_identity() == Some(identity) {
+        if pending_identity() == Some(identity) {
             return errno::EINPROGRESS;
         }
         let Some(widx) = slot_by_identity(&identity) else {
@@ -918,13 +1048,9 @@ unsafe fn dispatch_op(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) ->
         }
         let mut identity = [0u8; 16];
         identity.copy_from_slice(core::slice::from_raw_parts(arg, 16));
-        if live::staged_add_identity() == Some(identity) {
+        if pending_identity() == Some(identity) {
             // Abandon the staged CREATE: its add rolls back and its pack goes.
-            live::abandon_staged_add();
-            code_pack::end_staging();
-            if let Some(s) = (*core::ptr::addr_of_mut!(STAGED_PACK)).take() {
-                code_pack::release(s);
-            }
+            abandon_pending();
             return 0;
         }
         return match slot_by_identity(&identity) {

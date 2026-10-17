@@ -2311,10 +2311,11 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<Signing, Loa
                 return Ok(Signing::Unverified);
             }
             {
-                // Manifest-format envelope version. v1-only; an unknown
-                // version means the field offsets below can't be trusted,
-                // so mirror the unrecognised-magic posture above: reject
-                // under enforcement, otherwise treat as "no manifest".
+                // Manifest-format envelope version. The offsets below are
+                // those of the one layout this loader reads; any other
+                // version means they can't be trusted, so mirror the
+                // unrecognised-magic posture above: reject under
+                // enforcement, otherwise treat as "no manifest".
                 let manifest_version = manifest_data[4];
                 if manifest_version != EXPECTED_MANIFEST_VERSION {
                     if cfg!(feature = "enforce_signatures") {

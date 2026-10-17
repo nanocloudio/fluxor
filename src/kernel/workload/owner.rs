@@ -384,8 +384,7 @@ impl OwnerTable {
     //
     // Caps are the admitted hard limits from the signed resource profile,
     // installed by the node agent at reservation. A cap of 0 means
-    // "unset/unlimited"; the system owner is never charged or capped. While
-    // every allocation is system-owned, this accounting is inert.
+    // "unset/unlimited"; the system owner is never charged or capped.
 
     /// Install the admitted state/buffer byte caps for an owner.
     pub fn set_caps(&mut self, h: OwnerHandle, state_cap: u32, buffer_cap: u32) -> bool {
@@ -429,6 +428,18 @@ impl OwnerTable {
         }
         e.acct.storage_bytes = next;
         Ok(())
+    }
+
+    /// Charge `bytes` of storage `h` already holds, past its cap if need be:
+    /// storage found on disk is the owner's whatever its cap, and an owner
+    /// over its cap can shrink but not grow.
+    pub fn charge_storage_held(&mut self, h: OwnerHandle, bytes: u64) {
+        if h.is_system() {
+            return;
+        }
+        if let Some(e) = self.lookup_mut(h) {
+            e.acct.storage_bytes = e.acct.storage_bytes.saturating_add(bytes);
+        }
     }
 
     /// Give `bytes` of storage back to `h`'s ledger.

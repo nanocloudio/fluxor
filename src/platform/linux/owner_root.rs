@@ -7,22 +7,31 @@
 //! - `fs` resolves inside `<base>/<owner uid>/files/`, through `openat2` with
 //!   `RESOLVE_BENEATH`, so no path, symlink or magic link leads out of it;
 //! - `storage.object` and `storage.namespace` reach a versioned store of the
-//!   owner's own, under `<base>/<owner uid>/store/`;
-//! - every byte it holds is charged to the owner's storage ledger against the
-//!   `storage_bytes` its `CREATE` admitted.
+//!   owner's own, under `<base>/<owner uid>/store/`, with handle tables of its
+//!   own;
+//! - what it holds is charged to the owner's storage ledger against the
+//!   `storage_bytes` its `CREATE` admitted: each file its size plus
+//!   [`ENTRY_COST`], each directory [`ENTRY_COST`], and each store entry its
+//!   key, its value and a record overhead.
+//!
+//! A file's charge is kept per inode and read from the inode itself, so it
+//! follows the file whichever handle or path changes it.
 //!
 //! The base is `$FLUXOR_OWNER_ROOT`, default `/var/lib/fluxor/owners`. A root
-//! is made when the owner first touches storage and removed when the owner is
-//! released. Nothing else removes it: a root survives a runtime restart, and
-//! an owner admitted again under the same identity finds what it held. Data
-//! that must outlive the owner itself belongs to a volume.
+//! is made when an admitted owner first touches storage, and removed when the
+//! owner is released. Nothing else removes it: a root survives a runtime
+//! restart, and an owner admitted again under the same identity finds what it
+//! held, charged to its ledger again. A root for an identity the node agent
+//! will not admit again is the agent's to remove. Data that must outlive the
+//! owner itself belongs to a volume.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::kernel::exec::scheduler;
 use crate::kernel::sys::errno;
-use crate::kernel::workload::owner::OwnerHandle;
-use crate::platform::linux::store::Store;
+use crate::kernel::workload::owner::{OwnerHandle, OwnerState};
+use crate::platform::linux::store::{Served, Store};
 
 /// Where owner roots live when `FLUXOR_OWNER_ROOT` is unset.
 const DEFAULT_BASE: &str = "/var/lib/fluxor/owners";
@@ -32,14 +41,18 @@ const OWNER_STORE_HISTORY: usize = 4096;
 const OWNER_STORE_RING: usize = 1024;
 /// Longest path an owner names, matching the `fs` provider's own bound.
 const PATH_MAX: usize = 255;
+/// What a name costs its owner besides a file's bytes: an inode and a
+/// directory entry.
+pub const ENTRY_COST: u64 = 4096;
 
-/// One owner's root: its files directory, held open, and its store, opened
-/// on first use.
+/// One owner's root: its files directory, held open, its store with the
+/// handles on it, opened on first use, and what each inode is charged.
 struct Root {
     owner: OwnerHandle,
     dir: PathBuf,
     files_fd: i32,
-    store: Option<Store>,
+    store: Option<Served>,
+    inodes: BTreeMap<u64, u64>,
 }
 
 static mut ROOTS: Vec<Root> = Vec::new();
@@ -54,28 +67,54 @@ fn hex(uid: &[u8; 16]) -> String {
     uid.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Bytes a directory tree holds in regular files.
-fn tree_bytes(dir: &Path) -> u64 {
+/// What an inode costs its owner: a regular file its size plus
+/// [`ENTRY_COST`], anything else [`ENTRY_COST`].
+pub fn inode_cost(st: &libc::stat) -> u64 {
+    if st.st_mode & libc::S_IFMT == libc::S_IFREG {
+        ENTRY_COST + st.st_size as u64
+    } else {
+        ENTRY_COST
+    }
+}
+
+/// Every inode under `dir`, with its cost, by `lstat`: a symlink is charged
+/// as a name and never followed.
+fn walk_inodes(dir: &Path, into: &mut BTreeMap<u64, u64>) {
+    use std::os::unix::fs::MetadataExt;
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return 0;
+        return;
     };
-    let mut total = 0u64;
     for entry in entries.flatten() {
-        let Ok(meta) = entry.metadata() else {
+        let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
             continue;
         };
+        let cost = if meta.is_file() {
+            ENTRY_COST + meta.len()
+        } else {
+            ENTRY_COST
+        };
+        into.insert(meta.ino(), cost);
         if meta.is_dir() {
-            total += tree_bytes(&entry.path());
-        } else if meta.is_file() {
-            total += meta.len();
+            walk_inodes(&entry.path(), into);
         }
     }
-    total
+}
+
+/// Whether `owner` may come to hold storage: one being admitted or running.
+/// An owner being drained or revoked makes no root, so nothing it does on
+/// its way out can bring back a root its release removed.
+fn may_hold_storage(owner: OwnerHandle) -> bool {
+    scheduler::owners().lookup(owner).is_some_and(|e| {
+        matches!(
+            e.state,
+            OwnerState::Reserved | OwnerState::Active | OwnerState::Paused
+        )
+    })
 }
 
 /// The owner's root, made on first use. `None` for the system owner (which
-/// has no root: the host is its own), an owner that no longer resolves, or a
-/// root that cannot be made.
+/// has no root: the host is its own), an owner that no longer resolves or is
+/// on its way out, or a root that cannot be made.
 ///
 /// # Safety
 /// Single-threaded platform dispatch only: touches the `static mut` table.
@@ -86,6 +125,9 @@ unsafe fn root_for(owner: OwnerHandle) -> Option<&'static mut Root> {
     let roots = &mut *core::ptr::addr_of_mut!(ROOTS);
     if let Some(i) = roots.iter().position(|r| r.owner == owner) {
         return roots.get_mut(i);
+    }
+    if !may_hold_storage(owner) {
+        return None;
     }
     let uid = scheduler::owners().lookup(owner)?.owner_uid;
     let dir = base_dir().join(hex(&uid));
@@ -108,26 +150,28 @@ unsafe fn root_for(owner: OwnerHandle) -> Option<&'static mut Root> {
     if files_fd < 0 {
         return None;
     }
-    // What the root already holds is the owner's to carry: an owner
-    // re-admitted under the same identity finds its scratch charged.
-    let held = tree_bytes(&dir);
-    if held > 0 {
-        let _ = scheduler::owners_mut().charge_storage(owner, held);
-    }
+    // What the root already holds is the owner's to carry: an owner admitted
+    // again under the same identity is charged for it, past its cap if need
+    // be, so it can shrink but not grow until it is back under.
+    let mut inodes = BTreeMap::new();
+    walk_inodes(&files, &mut inodes);
+    scheduler::owners_mut().charge_storage_held(owner, inodes.values().sum());
     roots.push(Root {
         owner,
         dir,
         files_fd,
         store: None,
+        inodes,
     });
     roots.last_mut()
 }
 
-/// The owner's own versioned store, opened on first use.
+/// The owner's own versioned store with its handle tables, opened on first
+/// use and charged for what it already holds.
 ///
 /// # Safety
 /// As [`root_for`].
-pub unsafe fn store_for(owner: OwnerHandle) -> Option<&'static mut Store> {
+pub unsafe fn store_for(owner: OwnerHandle) -> Option<&'static mut Served> {
     let root = root_for(owner)?;
     if root.store.is_none() {
         match Store::open(
@@ -135,7 +179,11 @@ pub unsafe fn store_for(owner: OwnerHandle) -> Option<&'static mut Store> {
             OWNER_STORE_HISTORY,
             OWNER_STORE_RING,
         ) {
-            Ok(s) => root.store = Some(s),
+            Ok(s) => {
+                let served = Served::owner(s);
+                scheduler::owners_mut().charge_storage_held(owner, served.held_bytes());
+                root.store = Some(served);
+            }
             Err(e) => {
                 log::error!(
                     "[owner_root] owner slot {} store would not open: {e}",
@@ -148,35 +196,93 @@ pub unsafe fn store_for(owner: OwnerHandle) -> Option<&'static mut Store> {
     root.store.as_mut()
 }
 
-/// The platform's owner-release hook: close the owner's store and files
-/// directory and remove its root. Registered with the kernel at init.
+/// The platform's owner-release hook: close the files the owner holds open,
+/// drop its store and the handles on it, close its files directory and
+/// remove its root. A root the owner never opened in this run, one a
+/// previous run left, is removed all the same. Registered with the kernel at
+/// init; it runs before the owner is freed, so the owner still resolves.
 pub fn release(owner: OwnerHandle) {
+    if owner.is_system() {
+        return;
+    }
     // SAFETY: owner release runs on the scheduler thread, as every dispatch.
-    unsafe {
+    let dir = unsafe {
         let roots = &mut *core::ptr::addr_of_mut!(ROOTS);
-        let Some(i) = roots.iter().position(|r| r.owner == owner) else {
-            return;
-        };
-        let root = roots.swap_remove(i);
-        drop(root.store);
-        libc::close(root.files_fd);
-        if let Err(e) = std::fs::remove_dir_all(&root.dir) {
-            log::warn!(
-                "[owner_root] owner slot {} root {} not removed: {e}",
-                owner.slot,
-                root.dir.display()
-            );
+        match roots.iter().position(|r| r.owner == owner) {
+            Some(i) => {
+                let root = roots.swap_remove(i);
+                crate::platform::linux::providers::release_owner_files(owner);
+                drop(root.store);
+                libc::close(root.files_fd);
+                root.dir
+            }
+            None => match scheduler::owners().lookup(owner) {
+                Some(e) => base_dir().join(hex(&e.owner_uid)),
+                None => return,
+            },
         }
+    };
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => log::warn!(
+            "[owner_root] owner slot {} root {} not removed: {e}",
+            owner.slot,
+            dir.display()
+        ),
     }
 }
 
-/// Charge `bytes` of storage to `owner`; `false` when its cap refuses.
-pub fn charge(owner: OwnerHandle, bytes: u64) -> bool {
+/// Set what inode `ino` is charged to `owner` to `cost`, charging or giving
+/// back the difference. A growth is refused (`false`, nothing changed) when
+/// `within_cap` and the owner's cap would be passed; settling what an inode
+/// already holds (`within_cap` false) is never refused. A cost of 0 forgets
+/// the inode.
+///
+/// # Safety
+/// As [`root_for`].
+pub unsafe fn charge_inode(owner: OwnerHandle, ino: u64, cost: u64, within_cap: bool) -> bool {
+    let Some(root) = root_for(owner) else {
+        return !within_cap;
+    };
+    let had = root.inodes.get(&ino).copied().unwrap_or(0);
+    if cost > had {
+        let grow = cost - had;
+        if within_cap {
+            if scheduler::owners_mut().charge_storage(owner, grow).is_err() {
+                return false;
+            }
+        } else {
+            scheduler::owners_mut().charge_storage_held(owner, grow);
+        }
+    } else if had > cost {
+        scheduler::owners_mut().release_storage(owner, had - cost);
+    }
+    if cost == 0 {
+        root.inodes.remove(&ino);
+    } else {
+        root.inodes.insert(ino, cost);
+    }
+    true
+}
+
+/// What inode `ino` is charged to `owner`.
+///
+/// # Safety
+/// As [`root_for`].
+pub unsafe fn inode_charge(owner: OwnerHandle, ino: u64) -> u64 {
+    root_for(owner)
+        .and_then(|r| r.inodes.get(&ino).copied())
+        .unwrap_or(0)
+}
+
+/// Charge `bytes` to `owner` ahead of creating something, within its cap.
+pub fn reserve(owner: OwnerHandle, bytes: u64) -> bool {
     scheduler::owners_mut().charge_storage(owner, bytes).is_ok()
 }
 
-/// Give `bytes` of storage back to `owner`.
-pub fn release_bytes(owner: OwnerHandle, bytes: u64) {
+/// Give back `bytes` reserved and not used.
+pub fn unreserve(owner: OwnerHandle, bytes: u64) {
     scheduler::owners_mut().release_storage(owner, bytes);
 }
 
@@ -289,21 +395,26 @@ pub unsafe fn parent_beneath(owner: OwnerHandle, path: &[u8]) -> Result<(i32, [u
     Ok((dirfd, name))
 }
 
-/// Size of the regular file `name` in `dirfd`, 0 for anything else.
+/// `lstat` of `name` in `dirfd`.
 ///
 /// # Safety
 /// `dirfd` open; `name` NUL-terminated.
-pub unsafe fn file_size_at(dirfd: i32, name: &[u8; 256]) -> u64 {
+pub unsafe fn stat_at(dirfd: i32, name: &[u8; 256]) -> Option<libc::stat> {
     let mut st: libc::stat = core::mem::zeroed();
-    if libc::fstatat(
+    (libc::fstatat(
         dirfd,
         name.as_ptr() as *const libc::c_char,
         &mut st,
         libc::AT_SYMLINK_NOFOLLOW,
-    ) != 0
-        || st.st_mode & libc::S_IFMT != libc::S_IFREG
-    {
-        return 0;
-    }
-    st.st_size as u64
+    ) == 0)
+        .then_some(st)
+}
+
+/// `fstat` of an open descriptor.
+///
+/// # Safety
+/// `fd` is a descriptor this provider holds.
+pub unsafe fn stat_fd(fd: i32) -> Option<libc::stat> {
+    let mut st: libc::stat = core::mem::zeroed();
+    (libc::fstat(fd, &mut st) == 0).then_some(st)
 }

@@ -1384,11 +1384,76 @@ fn walk_san_dns(
     any
 }
 
-/// Does `uri` satisfy `expected`? Byte for byte — or, when `expected` ends
-/// in `/`, any URI strictly under that path: a trust domain whose replicas
-/// are each their own name, accepted by one listener. A path segment that
-/// is `.`, `..` or empty is under nothing and never matches.
+/// Whether `b` may appear in a URI a peer is named by: RFC 3986 unreserved
+/// characters, sub-delims, `:`, `@` and `/`. A percent-encoded octet, a
+/// query and a fragment are outside the set: the first gives one name a
+/// second spelling, and the other two carry something that is not part of
+/// the name at all.
+fn uri_byte_admitted(b: u8) -> bool {
+    b.is_ascii_alphanumeric()
+        || matches!(
+            b,
+            b'-' | b'.'
+                | b'_'
+                | b'~'
+                | b'!'
+                | b'$'
+                | b'&'
+                | b'\''
+                | b'('
+                | b')'
+                | b'*'
+                | b'+'
+                | b','
+                | b';'
+                | b'='
+                | b':'
+                | b'@'
+                | b'/'
+        )
+}
+
+/// Whether `uri` is a URI a peer can be named by, and so a well-formed
+/// `verify_uri`: at most [`PEER_PRINCIPAL_MAX`] bytes (the longest principal
+/// a session reports), every byte admitted by [`uri_byte_admitted`], and the
+/// shape `scheme://authority/path` — a scheme of RFC 3986 scheme characters
+/// starting with a letter, a non-empty authority, and a path starting `/`.
+/// A bare `spiffe://` names no authority and is refused rather than read as
+/// "every URI of the scheme".
+pub fn uri_well_formed(uri: &[u8]) -> bool {
+    if uri.is_empty() || uri.len() > PEER_PRINCIPAL_MAX {
+        return false;
+    }
+    if !uri.iter().all(|&b| uri_byte_admitted(b)) {
+        return false;
+    }
+    let Some(colon) = uri.iter().position(|&b| b == b':') else {
+        return false;
+    };
+    let scheme = &uri[..colon];
+    let scheme_ok = scheme.first().is_some_and(u8::is_ascii_alphabetic)
+        && scheme
+            .iter()
+            .all(|&b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'));
+    if !scheme_ok || !uri[colon..].starts_with(b"://") {
+        return false;
+    }
+    let rest = &uri[colon + 3..];
+    match rest.iter().position(|&b| b == b'/') {
+        Some(slash) => slash > 0,
+        None => false,
+    }
+}
+
+/// Does `uri` satisfy `expected`? Both must be [`uri_well_formed`]; then
+/// byte for byte — or, when `expected` ends in `/`, any URI strictly under
+/// that path: a trust domain whose replicas are each their own name,
+/// accepted by one listener. A path segment that is `.`, `..` or empty is
+/// under nothing and never matches.
 pub fn uri_matches(expected: &[u8], uri: &[u8]) -> bool {
+    if !uri_well_formed(expected) || !uri_well_formed(uri) {
+        return false;
+    }
     if uri == expected {
         return true;
     }
@@ -1398,6 +1463,55 @@ pub fn uri_matches(expected: &[u8], uri: &[u8]) -> bool {
     uri[expected.len()..]
         .split(|&b| b == b'/')
         .all(|segment| !matches!(segment, b"" | b"." | b".."))
+}
+
+/// The `PROFILE_CA_URI` name rule on a leaf whose SAN extension value is at
+/// `san` within `leaf_der`: some URI SAN must satisfy `expected_uri` under
+/// [`uri_matches`]. An empty expectation cannot be satisfied and is refused
+/// rather than treated as "match anything" — under this profile the name IS
+/// the authorisation.
+fn uri_rule(leaf_der: &[u8], san: Option<(usize, usize)>, expected_uri: &[u8]) -> u32 {
+    if expected_uri.is_empty() {
+        return CERT_ERR_NAME_ABSENT;
+    }
+    let Some((san_start, san_len)) = san else {
+        return CERT_ERR_NAME_ABSENT;
+    };
+    let mut matched = false;
+    let any = walk_san_uri(leaf_der, san_start, san_len, &mut |uri| {
+        if uri_matches(expected_uri, uri) {
+            matched = true;
+            return true;
+        }
+        false
+    });
+    if !any {
+        return CERT_ERR_NAME_ABSENT;
+    }
+    if !matched {
+        return CERT_ERR_NAME_MISMATCH;
+    }
+    CERT_OK
+}
+
+/// The `PROFILE_CA_URI` name rule applied to the leaf of a Certificate
+/// message whose chain was decided by another verifier (the platform's
+/// `trust` provider), which knows nothing of URIs.
+pub fn leaf_uri_reason(cert_msg_body: &[u8], expected_uri: &[u8]) -> u32 {
+    let Some(leaf_der) = parse_certificate_msg(cert_msg_body) else {
+        return CERT_ERR_MSG_MALFORMED;
+    };
+    let Some(leaf) = parse_certificate(leaf_der) else {
+        return CERT_ERR_MALFORMED;
+    };
+    if leaf.ext_len == 0 {
+        return uri_rule(leaf_der, None, expected_uri);
+    }
+    let exts = parse_extensions(leaf_der, leaf.ext_off, leaf.ext_len);
+    if exts.malformed {
+        return CERT_ERR_MALFORMED;
+    }
+    uri_rule(leaf_der, exts.san, expected_uri)
 }
 
 /// Walk a SAN extension value yielding each `uniformResourceIdentifier`.
@@ -1801,12 +1915,12 @@ pub const MAX_CHAIN_LEN: usize = 4;
 pub const PROFILE_NONE: u8 = 0;
 pub const PROFILE_PINNED: u8 = 1;
 pub const PROFILE_CA_DNS: u8 = 2;
-/// Chain to a CA, then match a URI SAN exactly.
+/// Chain to a CA, then match a URI SAN under [`uri_matches`].
 ///
 /// The SPIFFE case. A SPIFFE ID is a URI and its comparison is byte
-/// equality — none of `PROFILE_CA_DNS`'s wildcard or label rules apply,
-/// and applying them to a URI would make `spiffe://a.b/x` match things it
-/// must not. A separate profile rather than a flag, so a policy cannot be
+/// equality, or a path prefix ending in `/` — none of `PROFILE_CA_DNS`'s
+/// wildcard or label rules apply, and applying them to a URI would make
+/// `spiffe://a.b/x` match things it must not. A separate profile rather than a flag, so a policy cannot be
 /// written that asks for both name rules and gets whichever the code
 /// checks first.
 pub const PROFILE_CA_URI: u8 = 3;
@@ -1894,9 +2008,10 @@ pub struct ChainPolicy<'a> {
     /// dNSName fallback. Empty means the DNS rule applies instead. A
     /// policy naming both is refused: a connection is to one authority.
     pub expected_ip: &'a [u8],
-    /// Expected URI SAN, for `PROFILE_CA_URI`. Compared as bytes: a URI is
-    /// not a hostname and admits no wildcard, no case folding and no
-    /// trailing-dot equivalence.
+    /// Expected URI SAN, for `PROFILE_CA_URI`, matched under [`uri_matches`]:
+    /// as bytes, or as a path prefix when it ends in `/`. A URI is not a
+    /// hostname and admits no wildcard, no case folding and no trailing-dot
+    /// equivalence.
     ///
     /// Empty under `PROFILE_CA_URI` is a refusal, not "no name rule". A
     /// profile whose entire purpose is to match a name cannot be satisfied
@@ -1995,6 +2110,13 @@ pub struct DeferredLinks {
     /// the chain is walked, and held here for as long as the links are
     /// stepped.
     pub anchor: u8,
+    /// The generation of the anchor at `anchor` when the walk chose it, as
+    /// the caller that owns the anchor table counts replacements of that
+    /// slot. A link stepped after the slot was replaced reads no key and
+    /// fails as a signature failure, rather than verifying against an
+    /// anchor the walk never judged. Left 0 by a caller whose anchors are
+    /// never replaced.
+    pub generation: u32,
 }
 
 impl DeferredLinks {
@@ -2004,6 +2126,7 @@ impl DeferredLinks {
             len: 0,
             next: 0,
             anchor: 0,
+            generation: 0,
         }
     }
 
@@ -2011,6 +2134,7 @@ impl DeferredLinks {
         self.len = 0;
         self.next = 0;
         self.anchor = 0;
+        self.generation = 0;
     }
 
     pub fn pending(&self) -> bool {
@@ -2482,29 +2606,11 @@ fn verify_chain_against(
 
     // --- name rule ------------------------------------------------------
     if policy.profile == PROFILE_CA_URI {
-        // A URI SAN, matched byte-for-byte. An empty expectation cannot be
-        // satisfied and is refused rather than treated as "match
-        // anything" — under this profile the name IS the authorisation.
-        if policy.expected_uri.is_empty() {
-            return CERT_ERR_NAME_ABSENT;
-        }
-        let (san_start, san_len) = match leaf_exts.san {
-            Some(v) => v,
-            None => return CERT_ERR_NAME_ABSENT,
-        };
-        let mut matched = false;
-        let any = walk_san_uri(leaf_der, san_start, san_len, &mut |uri| {
-            if uri_matches(policy.expected_uri, uri) {
-                matched = true;
-                return true;
-            }
-            false
-        });
-        if !any {
-            return CERT_ERR_NAME_ABSENT;
-        }
-        if !matched {
-            return CERT_ERR_NAME_MISMATCH;
+        // A URI SAN satisfying `expected_uri` under `uri_matches`: the name
+        // itself, or one strictly under an expectation ending in `/`.
+        let rc = uri_rule(leaf_der, leaf_exts.san, policy.expected_uri);
+        if rc != CERT_OK {
+            return rc;
         }
     } else if !policy.expected_ip.is_empty() {
         // Reached by address: only an `iPAddress` SAN equal to the address

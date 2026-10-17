@@ -44,13 +44,9 @@ struct LinuxFileSlot {
     /// success; `provider_query(handle, query_key::LAST_FENCE, …)`
     /// reads it back and encodes it on the wire.
     last_fence: Fence,
-    /// Who opened the slot: the owner whose storage ledger a write that
-    /// grows the file is charged to.
+    /// Who opened the slot. Only that owner reaches it: a handle names a
+    /// slot, and a slot answers its opener alone.
     owner: crate::kernel::workload::owner::OwnerHandle,
-    /// The file offset and size as this provider last left them, so a
-    /// write knows how far past the end it reaches without asking the OS.
-    pos: u64,
-    size: u64,
 }
 
 static mut LINUX_FILES: [LinuxFileSlot; MAX_OPEN_FILES] = {
@@ -60,27 +56,47 @@ static mut LINUX_FILES: [LinuxFileSlot; MAX_OPEN_FILES] = {
         in_use: false,
         last_fence: Fence::Volatile,
         owner: crate::kernel::workload::owner::OWNER_SYSTEM,
-        pos: 0,
-        size: 0,
     };
     [EMPTY; MAX_OPEN_FILES]
 };
 
-/// Claim a file slot for `fd` on behalf of `owner`, its size read from the
-/// descriptor. The tagged handle, or `ENOMEM` with `fd` closed.
+/// Slots one workload may hold at once, so no tenant can take the table the
+/// node and every other tenant open files from.
+const OWNER_MAX_OPEN_FILES: usize = 32;
+
+/// Whether `slot` is open and its caller's: the opener alone reaches a slot.
+fn owned(slot: &LinuxFileSlot) -> bool {
+    slot.in_use && slot.owner == crate::kernel::exec::scheduler::caller_owner()
+}
+
+/// A free slot `owner` may take: any, for the system; within its quota, for
+/// a workload.
+fn free_slot_for(
+    files: &[LinuxFileSlot],
+    owner: crate::kernel::workload::owner::OwnerHandle,
+) -> Option<usize> {
+    if !owner.is_system()
+        && files
+            .iter()
+            .filter(|s| s.in_use && s.owner == owner)
+            .count()
+            >= OWNER_MAX_OPEN_FILES
+    {
+        return None;
+    }
+    files.iter().position(|s| !s.in_use)
+}
+
+/// Claim a file slot for `fd` on behalf of `owner`. The tagged handle, or
+/// `ENOMEM` with `fd` closed when the table, or the owner's share of it, is
+/// full.
 unsafe fn claim_file_slot(fd: i32, owner: crate::kernel::workload::owner::OwnerHandle) -> i32 {
     use crate::kernel::ipc::fd::{tag_fd, FD_TAG_FS};
     use crate::kernel::sys::errno;
     let files = &mut *core::ptr::addr_of_mut!(LINUX_FILES);
-    let Some(slot_idx) = files.iter().position(|s| !s.in_use) else {
+    let Some(slot_idx) = free_slot_for(files, owner) else {
         libc::close(fd);
         return errno::ENOMEM;
-    };
-    let mut st: libc::stat = core::mem::zeroed();
-    let size = if libc::fstat(fd, &mut st) == 0 {
-        st.st_size as u64
-    } else {
-        0
     };
     files[slot_idx] = LinuxFileSlot {
         fd,
@@ -88,8 +104,6 @@ unsafe fn claim_file_slot(fd: i32, owner: crate::kernel::workload::owner::OwnerH
         in_use: true,
         last_fence: Fence::Volatile,
         owner,
-        pos: 0,
-        size,
     };
     tag_fd(FD_TAG_FS, slot_idx as i32)
 }
@@ -102,7 +116,7 @@ unsafe fn claim_dir_slot(
     use crate::kernel::ipc::fd::{tag_fd, FD_TAG_FS};
     use crate::kernel::sys::errno;
     let files = &mut *core::ptr::addr_of_mut!(LINUX_FILES);
-    let Some(slot_idx) = files.iter().position(|s| !s.in_use) else {
+    let Some(slot_idx) = free_slot_for(files, owner) else {
         libc::closedir(dir);
         return errno::ENOMEM;
     };
@@ -112,16 +126,17 @@ unsafe fn claim_dir_slot(
         in_use: true,
         last_fence: Fence::Volatile,
         owner,
-        pos: 0,
-        size: 0,
     };
     tag_fd(FD_TAG_FS, slot_idx as i32)
 }
 
 /// The path-taking `fs` ops for a workload: each resolves beneath the
-/// owner's files root (`owner_root`), so the owner reaches what it owns
-/// and nothing else. `None` for an op that works on a handle, which the
-/// shared arms serve for every owner.
+/// owner's files root (`owner_root`), so the owner reaches what it owns and
+/// nothing else, and each keeps the owner's per-inode charge in step with
+/// the inodes it creates, changes and removes. A hard link is not offered:
+/// one inode under two names would be charged once and could be released
+/// twice. `None` for an op that works on a handle, which the shared arms
+/// serve for every owner.
 ///
 /// # Safety
 /// As `linux_fs_dispatch`.
@@ -166,9 +181,29 @@ unsafe fn tenant_fs_path_op(
                 Ok(p) => p,
                 Err(e) => return Some(e),
             };
-            let fd = root::open_beneath(owner, path, libc::O_RDWR | libc::O_CREAT, 0o600);
+            let fd = root::open_beneath(owner, path, libc::O_RDWR, 0);
+            if fd >= 0 {
+                return Some(claim_file_slot(fd, owner));
+            }
+            if fd != errno::ENOENT {
+                return Some(fd);
+            }
+            // A new name: its entry is charged before it exists.
+            if !root::reserve(owner, root::ENTRY_COST) {
+                return Some(errno::ENOSPC);
+            }
+            let fd = root::open_beneath(
+                owner,
+                path,
+                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
+                0o600,
+            );
+            root::unreserve(owner, root::ENTRY_COST);
             if fd < 0 {
                 return Some(fd);
+            }
+            if let Some(st) = root::stat_fd(fd) {
+                root::charge_inode(owner, st.st_ino, root::inode_cost(&st), false);
             }
             claim_file_slot(fd, owner)
         }
@@ -197,16 +232,21 @@ unsafe fn tenant_fs_path_op(
                 Ok(v) => v,
                 Err(e) => return Some(e),
             };
-            let size = root::file_size_at(dirfd, &name);
+            let st = root::stat_at(dirfd, &name);
             let rc = libc::unlinkat(dirfd, name.as_ptr() as *const libc::c_char, 0);
             let err = *libc::__errno_location();
             libc::close(dirfd);
             if rc < 0 {
-                -err
-            } else {
-                root::release_bytes(owner, size);
-                errno::OK
+                return Some(-err);
             }
+            // The name is gone. An inode a handle still holds keeps its
+            // charge until that handle closes.
+            if let Some(st) = st {
+                if !open_by(owner, st.st_ino) {
+                    root::charge_inode(owner, st.st_ino, 0, false);
+                }
+            }
+            errno::OK
         }
         dev_fs::MKDIR => {
             let path = match path_arg(arg, arg_len) {
@@ -217,9 +257,18 @@ unsafe fn tenant_fs_path_op(
                 Ok(v) => v,
                 Err(e) => return Some(e),
             };
+            if !root::reserve(owner, root::ENTRY_COST) {
+                libc::close(dirfd);
+                return Some(errno::ENOSPC);
+            }
             let rc = libc::mkdirat(dirfd, name.as_ptr() as *const libc::c_char, 0o755);
             let err = *libc::__errno_location();
+            root::unreserve(owner, root::ENTRY_COST);
+            let made = (rc == 0).then(|| root::stat_at(dirfd, &name)).flatten();
             libc::close(dirfd);
+            if let Some(st) = made {
+                root::charge_inode(owner, st.st_ino, root::ENTRY_COST, false);
+            }
             // Idempotent, as the host's MKDIR.
             if rc < 0 && err != libc::EEXIST {
                 -err
@@ -236,6 +285,7 @@ unsafe fn tenant_fs_path_op(
                 Ok(v) => v,
                 Err(e) => return Some(e),
             };
+            let st = root::stat_at(dirfd, &name);
             let rc = libc::unlinkat(
                 dirfd,
                 name.as_ptr() as *const libc::c_char,
@@ -244,55 +294,20 @@ unsafe fn tenant_fs_path_op(
             let err = *libc::__errno_location();
             let out = if rc < 0 {
                 -err
-            } else if libc::fsync(dirfd) < 0 {
-                -*libc::__errno_location()
             } else {
-                errno::OK
+                if let Some(st) = st {
+                    root::charge_inode(owner, st.st_ino, 0, false);
+                }
+                if libc::fsync(dirfd) < 0 {
+                    -*libc::__errno_location()
+                } else {
+                    errno::OK
+                }
             };
             libc::close(dirfd);
             out
         }
-        dev_fs::LINK => {
-            let Some((existing, existing_len, new, new_len)) = two_paths(arg, arg_len) else {
-                return Some(errno::EINVAL);
-            };
-            let (d1, n1) = match root::parent_beneath(owner, &existing[..existing_len]) {
-                Ok(v) => v,
-                Err(e) => return Some(e),
-            };
-            let (d2, n2) = match root::parent_beneath(owner, &new[..new_len]) {
-                Ok(v) => v,
-                Err(e) => {
-                    libc::close(d1);
-                    return Some(e);
-                }
-            };
-            let mut st: libc::stat = core::mem::zeroed();
-            let out = if libc::fstatat(
-                d1,
-                n1.as_ptr() as *const libc::c_char,
-                &mut st,
-                libc::AT_SYMLINK_NOFOLLOW,
-            ) == 0
-                && st.st_mode & libc::S_IFMT == libc::S_IFDIR
-            {
-                errno::EISDIR
-            } else if libc::linkat(
-                d1,
-                n1.as_ptr() as *const libc::c_char,
-                d2,
-                n2.as_ptr() as *const libc::c_char,
-                0,
-            ) < 0
-            {
-                -*libc::__errno_location()
-            } else {
-                errno::OK
-            };
-            libc::close(d1);
-            libc::close(d2);
-            out
-        }
+        dev_fs::LINK => errno::ENOSYS,
         dev_fs::READLINK => {
             if arg.is_null() || arg_len < 2 {
                 return Some(errno::EINVAL);
@@ -345,18 +360,19 @@ unsafe fn tenant_fs_path_op(
             if fd < 0 {
                 return Some(fd);
             }
-            let mut st: libc::stat = core::mem::zeroed();
-            let out = if libc::fstat(fd, &mut st) < 0 {
-                -*libc::__errno_location()
-            } else if st.st_mode & libc::S_IFMT == libc::S_IFDIR {
-                -libc::EISDIR
-            } else if len > st.st_size as u64 {
-                errno::EINVAL
-            } else if libc::ftruncate(fd, len as i64) < 0 {
-                -*libc::__errno_location()
-            } else {
-                root::release_bytes(owner, st.st_size as u64 - len);
-                errno::OK
+            let out = match root::stat_fd(fd) {
+                None => -*libc::__errno_location(),
+                Some(st) if st.st_mode & libc::S_IFMT == libc::S_IFDIR => -libc::EISDIR,
+                // Shrink only, as the host's TRUNCATE.
+                Some(st) if len > st.st_size as u64 => errno::EINVAL,
+                Some(st) => {
+                    if libc::ftruncate(fd, len as i64) < 0 {
+                        -*libc::__errno_location()
+                    } else {
+                        settle_inode(owner, fd, st.st_ino);
+                        errno::OK
+                    }
+                }
             };
             libc::close(fd);
             out
@@ -393,6 +409,8 @@ unsafe fn tenant_fs_path_op(
                     return Some(e);
                 }
             };
+            let moved = root::stat_at(d1, &n1);
+            let replaced = root::stat_at(d2, &n2);
             // Atomic against a reader, durable once both parents are synced,
             // the destination first.
             let out = if libc::renameat(
@@ -401,12 +419,21 @@ unsafe fn tenant_fs_path_op(
                 d2,
                 n2.as_ptr() as *const libc::c_char,
             ) < 0
-                || libc::fsync(d2) < 0
-                || libc::fsync(d1) < 0
             {
                 -*libc::__errno_location()
             } else {
-                errno::OK
+                // The entry the destination named, if any, is gone with its
+                // charge.
+                if let (Some(m), Some(r)) = (moved, replaced) {
+                    if m.st_ino != r.st_ino && !open_by(owner, r.st_ino) {
+                        root::charge_inode(owner, r.st_ino, 0, false);
+                    }
+                }
+                if libc::fsync(d2) < 0 || libc::fsync(d1) < 0 {
+                    -*libc::__errno_location()
+                } else {
+                    errno::OK
+                }
             };
             libc::close(d1);
             libc::close(d2);
@@ -414,6 +441,61 @@ unsafe fn tenant_fs_path_op(
         }
         _ => return None,
     })
+}
+
+/// Close a file slot's descriptor. A workload's inode whose last name went
+/// while the slot held it open gives its charge back now.
+unsafe fn close_file_slot(slot: &mut LinuxFileSlot) {
+    use crate::platform::linux::owner_root as root;
+    if !slot.owner.is_system() {
+        if let Some(st) = root::stat_fd(slot.fd) {
+            if st.st_nlink == 0 {
+                root::charge_inode(slot.owner, st.st_ino, 0, false);
+            }
+        }
+    }
+    libc::close(slot.fd);
+    slot.fd = -1;
+}
+
+/// Close every slot `owner` holds. Part of the platform's owner-release
+/// hook: what a workload opened goes with it.
+///
+/// # Safety
+/// Single-threaded platform dispatch only.
+pub unsafe fn release_owner_files(owner: crate::kernel::workload::owner::OwnerHandle) {
+    let files = &mut *core::ptr::addr_of_mut!(LINUX_FILES);
+    for slot in files.iter_mut().filter(|s| s.in_use && s.owner == owner) {
+        if slot.dir_ptr != 0 {
+            libc::closedir(slot.dir_ptr as *mut libc::DIR);
+            slot.dir_ptr = 0;
+        } else if slot.fd >= 0 {
+            libc::close(slot.fd);
+            slot.fd = -1;
+        }
+        slot.in_use = false;
+        slot.last_fence = Fence::Volatile;
+    }
+}
+
+/// Whether a slot `owner` holds is open on inode `ino`.
+unsafe fn open_by(owner: crate::kernel::workload::owner::OwnerHandle, ino: u64) -> bool {
+    let files = &*core::ptr::addr_of!(LINUX_FILES);
+    files.iter().any(|s| {
+        s.in_use
+            && s.owner == owner
+            && s.fd >= 0
+            && crate::platform::linux::owner_root::stat_fd(s.fd).is_some_and(|st| st.st_ino == ino)
+    })
+}
+
+/// Charge `owner` what the inode `fd` is open on holds now, whatever it was
+/// charged before.
+unsafe fn settle_inode(owner: crate::kernel::workload::owner::OwnerHandle, fd: i32, ino: u64) {
+    use crate::platform::linux::owner_root as root;
+    if let Some(st) = root::stat_fd(fd) {
+        root::charge_inode(owner, ino, root::inode_cost(&st), false);
+    }
 }
 
 /// Record the strongest `Fence` the provider just achieved for
@@ -442,7 +524,7 @@ pub fn slot_fence(slot: i32) -> Option<Fence> {
     // array of plain-old-data `OpenFile` entries owned by this module.
     unsafe {
         let files = &*core::ptr::addr_of!(LINUX_FILES);
-        if !files[slot as usize].in_use {
+        if !owned(&files[slot as usize]) {
             return None;
         }
         Some(files[slot as usize].last_fence)
@@ -628,11 +710,15 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
         };
     }
 
+    // A workload names paths inside a root of its own; the host's paths are
+    // the system owner's.
+    let owner = crate::kernel::exec::scheduler::caller_owner();
+
     // FS capability bitmap (modules/sdk/contracts/storage/fs.rs::CAPS).
-    // Linux implements the full read-tier, the write-tier, and both
-    // name-publication ops (RENAME 0x090D, FSYNC_NAME 0x0912). TRUNCATE
-    // stays 0 — that opcode isn't assigned yet. FSYNC_ASYNC stays 0:
-    // this provider fences with a blocking `fsync(2)`.
+    // Linux implements the full read-tier, the write-tier, both
+    // name-publication ops (RENAME 0x090D, FSYNC_NAME 0x0912) and TRUNCATE.
+    // FSYNC_ASYNC stays clear: this provider fences with a blocking
+    // `fsync(2)`. A workload's root offers no hard links.
     if opcode == dev_fs::CAPS {
         if arg.is_null() || arg_len < 4 {
             return errno::EINVAL;
@@ -656,14 +742,17 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             | dev_fs::caps::RMDIR
             | dev_fs::caps::LINK
             | dev_fs::caps::SYMLINK;
+        let caps = if owner.is_system() {
+            caps
+        } else {
+            caps & !dev_fs::caps::LINK
+        };
         let bytes = caps.to_le_bytes();
         core::ptr::copy_nonoverlapping(bytes.as_ptr(), arg, 4);
         return 4;
     }
 
-    // A workload names paths inside a root of its own; the host's paths are
-    // the system owner's. Handle ops below serve both.
-    let owner = crate::kernel::exec::scheduler::caller_owner();
+    // Handle ops below serve both, each slot its opener alone.
     if !owner.is_system() {
         if let Some(rc) = tenant_fs_path_op(owner, opcode, arg, arg_len) {
             return rc;
@@ -925,7 +1014,7 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
         dev_fs::PREALLOCATE => {
             let slot_idx = handle as usize;
             let files = &*core::ptr::addr_of!(LINUX_FILES);
-            if slot_idx >= MAX_OPEN_FILES || !files[slot_idx].in_use {
+            if slot_idx >= MAX_OPEN_FILES || !owned(&files[slot_idx]) {
                 return errno::EINVAL;
             }
             if arg.is_null() || arg_len < 4 {
@@ -936,25 +1025,36 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
                 return errno::EINVAL;
             }
             let fd = files[slot_idx].fd;
-            // The capacity past the file's size is the owner's to hold.
-            let growth = u64::from(capacity).saturating_sub(files[slot_idx].size);
-            if growth > 0
-                && !crate::platform::linux::owner_root::charge(files[slot_idx].owner, growth)
+            let slot_owner = files[slot_idx].owner;
+            let Some(st) = crate::platform::linux::owner_root::stat_fd(fd) else {
+                return -*libc::__errno_location();
+            };
+            // Reserving never shrinks: a file already past the capacity keeps
+            // its bytes.
+            let size = (st.st_size as u64).max(u64::from(capacity));
+            // A workload is charged for the capacity before it is reserved.
+            if !slot_owner.is_system()
+                && !crate::platform::linux::owner_root::charge_inode(
+                    slot_owner,
+                    st.st_ino,
+                    crate::platform::linux::owner_root::ENTRY_COST + size,
+                    true,
+                )
             {
                 return errno::ENOSPC;
             }
             let rc = libc::posix_fallocate(fd, 0, capacity as libc::off_t);
-            if rc != 0 {
-                crate::platform::linux::owner_root::release_bytes(files[slot_idx].owner, growth);
-                return -rc;
+            let grew = rc == 0 && libc::ftruncate(fd, size as libc::off_t) == 0;
+            let err = if rc != 0 {
+                -rc
+            } else {
+                -*libc::__errno_location()
+            };
+            if !slot_owner.is_system() {
+                settle_inode(slot_owner, fd, st.st_ino);
             }
-            {
-                let files = &mut *core::ptr::addr_of_mut!(LINUX_FILES);
-                files[slot_idx].size = files[slot_idx].size.max(u64::from(capacity));
-                files[slot_idx].pos = 0;
-            }
-            if libc::ftruncate(fd, capacity as libc::off_t) != 0 {
-                return -*libc::__errno_location();
+            if !grew {
+                return err;
             }
             if libc::lseek(fd, 0, libc::SEEK_SET) < 0 {
                 return -*libc::__errno_location();
@@ -979,7 +1079,7 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
         dev_fs::READ => {
             let slot_idx = handle as usize;
             let files = &*core::ptr::addr_of!(LINUX_FILES);
-            if slot_idx >= MAX_OPEN_FILES || !files[slot_idx].in_use {
+            if slot_idx >= MAX_OPEN_FILES || !owned(&files[slot_idx]) {
                 return errno::EINVAL;
             }
             if arg.is_null() || arg_len == 0 {
@@ -989,8 +1089,6 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             if n < 0 {
                 errno::ERROR
             } else {
-                let files = &mut *core::ptr::addr_of_mut!(LINUX_FILES);
-                files[slot_idx].pos += n as u64;
                 // Reads reflect the kernel page cache; no
                 // durability claim. Recording overwrites any prior
                 // `LocalDurable` so the slot's fence stays honest.
@@ -1001,43 +1099,37 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
         dev_fs::WRITE => {
             let slot_idx = handle as usize;
             let files = &mut *core::ptr::addr_of_mut!(LINUX_FILES);
-            if slot_idx >= MAX_OPEN_FILES || !files[slot_idx].in_use {
+            if slot_idx >= MAX_OPEN_FILES || !owned(&files[slot_idx]) {
                 return errno::EINVAL;
             }
             if arg.is_null() || arg_len == 0 {
                 return errno::EINVAL;
             }
-            // What this write adds past the end of the file is the owner's
-            // to hold; a write its storage cap refuses lands nothing.
-            let end = files[slot_idx].pos.saturating_add(arg_len as u64);
-            let growth = end.saturating_sub(files[slot_idx].size);
-            if growth > 0
-                && !crate::platform::linux::owner_root::charge(files[slot_idx].owner, growth)
-            {
-                return errno::ENOSPC;
-            }
-            let n = libc::write(files[slot_idx].fd, arg as *const libc::c_void, arg_len);
-            if n < 0 {
-                if growth > 0 {
-                    crate::platform::linux::owner_root::release_bytes(
-                        files[slot_idx].owner,
-                        growth,
-                    );
+            let fd = files[slot_idx].fd;
+            let slot_owner = files[slot_idx].owner;
+            // A workload is charged for what the write can make the inode
+            // hold before it runs; a write its storage cap refuses lands
+            // nothing. What the inode holds afterwards is what it keeps.
+            let mut ino = None;
+            if !slot_owner.is_system() {
+                use crate::platform::linux::owner_root as root;
+                let Some(st) = root::stat_fd(fd) else {
+                    return errno::ERROR;
+                };
+                let pos = libc::lseek(fd, 0, libc::SEEK_CUR).max(0) as u64;
+                let end = (st.st_size as u64).max(pos.saturating_add(arg_len as u64));
+                if !root::charge_inode(slot_owner, st.st_ino, root::ENTRY_COST + end, true) {
+                    return errno::ENOSPC;
                 }
+                ino = Some(st.st_ino);
+            }
+            let n = libc::write(fd, arg as *const libc::c_void, arg_len);
+            if let Some(ino) = ino {
+                settle_inode(slot_owner, fd, ino);
+            }
+            if n < 0 {
                 errno::ERROR
             } else {
-                let written = n as u64;
-                let landed_end = files[slot_idx].pos + written;
-                if landed_end < end && growth > 0 {
-                    // A short write grew the file less than was charged.
-                    let unused = end - landed_end.max(files[slot_idx].size);
-                    crate::platform::linux::owner_root::release_bytes(
-                        files[slot_idx].owner,
-                        unused,
-                    );
-                }
-                files[slot_idx].pos = landed_end;
-                files[slot_idx].size = files[slot_idx].size.max(landed_end);
                 // Page-cache hand-off; not durable until FSYNC.
                 record_slot_fence(slot_idx, Fence::Volatile);
                 n as i32
@@ -1046,7 +1138,7 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
         dev_fs::SEEK => {
             let slot_idx = handle as usize;
             let files = &*core::ptr::addr_of!(LINUX_FILES);
-            if slot_idx >= MAX_OPEN_FILES || !files[slot_idx].in_use {
+            if slot_idx >= MAX_OPEN_FILES || !owned(&files[slot_idx]) {
                 return errno::EINVAL;
             }
             if arg.is_null() || arg_len < 4 {
@@ -1073,18 +1165,19 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             if pos < 0 {
                 errno::ERROR
             } else {
-                (*core::ptr::addr_of_mut!(LINUX_FILES))[slot_idx].pos = pos as u64;
                 // Seek doesn't change durability, but it's a
                 // successful op on this handle — record Volatile so
                 // the slot fence describes the latest op.
                 record_slot_fence(slot_idx, Fence::Volatile);
-                pos as i32
+                // Any non-negative value is success; an offset past what an
+                // `i32` carries is reported as 0 rather than as an errno.
+                i32::try_from(pos).unwrap_or(0)
             }
         }
         dev_fs::CLOSE => {
             let slot_idx = handle as usize;
             let files = &mut *core::ptr::addr_of_mut!(LINUX_FILES);
-            if slot_idx >= MAX_OPEN_FILES || !files[slot_idx].in_use {
+            if slot_idx >= MAX_OPEN_FILES || !owned(&files[slot_idx]) {
                 return errno::EINVAL;
             }
             // Dispatch on whether this slot is a file (fd >= 0) or a
@@ -1094,8 +1187,7 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
                 libc::closedir(files[slot_idx].dir_ptr as *mut libc::DIR);
                 files[slot_idx].dir_ptr = 0;
             } else if files[slot_idx].fd >= 0 {
-                libc::close(files[slot_idx].fd);
-                files[slot_idx].fd = -1;
+                close_file_slot(&mut files[slot_idx]);
             }
             files[slot_idx].in_use = false;
             files[slot_idx].last_fence = Fence::Volatile;
@@ -1104,7 +1196,7 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
         dev_fs::STAT => {
             let slot_idx = handle as usize;
             let files = &*core::ptr::addr_of!(LINUX_FILES);
-            if slot_idx >= MAX_OPEN_FILES || !files[slot_idx].in_use {
+            if slot_idx >= MAX_OPEN_FILES || !owned(&files[slot_idx]) {
                 return errno::EINVAL;
             }
             if arg.is_null() || arg_len < 8 {
@@ -1156,7 +1248,7 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
         dev_fs::FSYNC => {
             let slot_idx = handle as usize;
             let files = &*core::ptr::addr_of!(LINUX_FILES);
-            if slot_idx >= MAX_OPEN_FILES || !files[slot_idx].in_use {
+            if slot_idx >= MAX_OPEN_FILES || !owned(&files[slot_idx]) {
                 return errno::EINVAL;
             }
             let ret = libc::fsync(files[slot_idx].fd);
@@ -1197,7 +1289,9 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
         dev_fs::READDIR => {
             let slot_idx = handle as usize;
             let files = &*core::ptr::addr_of!(LINUX_FILES);
-            if slot_idx >= MAX_OPEN_FILES || !files[slot_idx].in_use || files[slot_idx].dir_ptr == 0
+            if slot_idx >= MAX_OPEN_FILES
+                || !owned(&files[slot_idx])
+                || files[slot_idx].dir_ptr == 0
             {
                 return errno::EINVAL;
             }

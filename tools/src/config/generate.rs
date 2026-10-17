@@ -1020,12 +1020,12 @@ fn build_workload_section(
     crate::add_subgraph::encode_workload_section(&workloads).map_err(Error::Config)
 }
 
+use crate::add_subgraph::WorkloadEnd;
+
 /// The graph's `workloads:` section, each as the subgraph the kernel admits
 /// (`add_subgraph::Workload`): modules by name_hash with their params, and
 /// the edges between them. Empty when the graph declares none. The resident
 /// workload section and a workload image (`--emit=workload`) encode these.
-use crate::add_subgraph::WorkloadEnd;
-
 pub fn build_workloads(
     config: &Value,
     loc: schema::ModuleLocation<'_>,
@@ -1118,8 +1118,8 @@ pub fn build_workloads(
             if exec_mode == 2 || exec_mode == 4 {
                 return Err(Error::Config(format!(
                     "workload {pi} module '{mtype}' targets an ISR-tier domain (tier 1b/2). Resident \
-                     workloads are cooperative-only in v1: the FLXA codec carries no ISR metadata and \
-                     workload admission runs after ISR registration, so an ISR-tier workload would never \
+                     workloads are cooperative: the FLXA codec carries no ISR metadata and workload \
+                     admission runs after ISR registration, so an ISR-tier workload would never \
                      execute. Place ISR-tier modules in the base graph."
                 )));
             }

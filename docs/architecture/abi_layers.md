@@ -24,8 +24,8 @@ Source: `modules/sdk/abi/kernel_abi.rs`.
 Every PIC module receives a `SyscallTable` at init. It holds exactly:
 
 - `channel_read` / `channel_write` / `channel_poll` — direct ring-buffer I/O
-- `channel_peek` — copy from a FIFO channel head without advancing the read pointer (frame-aware consumers inspect a header before committing to consume)
-- `channel_discard` — drop the next `len` bytes of a FIFO channel's stream without copying, what is buffered now and the rest as it arrives (the consuming half of a whole-frame read, and a whole-frame drop)
+- `channel_peek` — copy from the head of a channel without consuming: a FIFO's stream, or a mailbox's pending record (frame-aware consumers inspect a header before committing to consume)
+- `channel_discard` — drop the next `len` bytes of a FIFO's stream without copying, what is buffered now and the rest as it arrives, or release a mailbox's pending record whole (the consuming half of a whole-frame read, and a whole-frame drop)
 - `heap_alloc` / `heap_free` / `heap_realloc` — per-module heap
 - `provider_open` / `provider_call` / `provider_query` / `provider_close` — handle-scoped contract dispatch
 - `provider_call_sel` — selector-routed provider call: the op names its
@@ -123,7 +123,7 @@ platform) implements the vtable, and consumers reach it through
 | `PCIE_DEVICE` | `0x0012` | Kernel (platform) | Handle-scoped PCIe device binding; also requires the `pcie_device` permission. |
 | `STORAGE_NAMESPACE` | `0x0013` | PIC / platform | Directory-like name-keyed storage surface (opcode class 0x13xx). See [storage_capability_surface.md](storage_capability_surface.md). |
 | `STORAGE_OBJECT` | `0x0014` | PIC / platform | Whole-blob byte-addressed storage surface (opcode class 0x14xx). See [storage_capability_surface.md](storage_capability_surface.md). |
-| `USB_HOST` | `0x0015` | Kernel (platform) — scaffold only | Handle-scoped USB host controller binding, reserved but not yet implemented. |
+| `USB_HOST` | `0x0015` | Kernel (platform) — scaffold only | Handle-scoped USB host controller binding. The id is reserved and no platform serves it. |
 | `WORKLOAD` | `0x001A` | Kernel (platform backends) | Platform-neutral isolated-workload surface (opcode class 0x1Axx): run an isolated workload with a declared capability envelope. |
 | `STREAM_CLOCK` | `0x001C` | Kernel (platform) | Generic stream-clock capability (opcode class 0x1Cxx) answering the `STREAM_TIME` audio-clock query independently of PIO hardware. |
 | `TRUST` | `0x001D` | Kernel (platform) | Platform certificate-chain verification (opcode class 0x1Dxx): the platform answers for a chain, or refuses every chain. Registered where a system trust store exists and absent otherwise, which is why a graph names it in `[[requires_when]]`. |
@@ -140,8 +140,8 @@ topology lives in `src/platform/<chip>/pcie_aliases.rs`, not in driver
 code.
 
 `USB_HOST` opcodes (`BIND`, `OPEN_ENDPOINT`, `BULK_READ` / `WRITE`,
-`INTERRUPT_POLL`, `RELEASE`) are reserved but not implemented;
-`provider_open` returns `-ENOSYS` until a host-controller driver lands.
+`INTERRUPT_POLL`, `RELEASE`) are reserved, and no platform registers a
+host-controller driver, so `provider_open` answers `-ENOSYS`.
 First declared consumer: `modules/foundation/usb_midi_host`.
 
 `WORKLOAD` has two placement-resolved backends: an fmod-graph backend,
@@ -151,12 +151,14 @@ Linux). It is gated by `requires_contract = "workload"` and
 `platform_raw`.
 
 The fmod-graph backend realizes the shared posture only. A workload is a
-tenant of the node: `CREATE` refuses the null identity (`EINVAL`), since
-everything keyed on an owner's identity would see every such workload as
-one, and refuses a subgraph any of whose modules holds a permission other
-than `observe` (`EACCES`), checked before anything is allocated. One
-subgraph holds at most 64 modules and 128 edges (`MAX_ADD_MODULES`,
-`MAX_ADD_EDGES`); the build refuses a workload past either.
+tenant of the node: both backends refuse the null identity (`EINVAL`),
+since everything keyed on an owner's identity would see every such
+workload as one. The graph backend refuses a subgraph any of whose modules
+holds a permission other than `observe`, or is a `Protocol` module (which
+runs at `CAP_FULL` and so passes every permission check), with `EACCES`,
+checked before anything is allocated. One subgraph holds at most 64
+modules and 128 edges (`MAX_ADD_MODULES`, `MAX_ADD_EDGES`); the build
+refuses a workload past either.
 
 A workload's `CREATE` header carries its quotas: `memory_bytes` for its
 state and buffers, and `storage_bytes` for what it may hold in the node's
@@ -164,17 +166,21 @@ storage, its files and its store values, charged by the platform providers
 and refused with `ENOSPC` past the cap (0 is unlimited; see
 [storage](storage_capability_surface.md#what-a-workload-reaches)).
 
-One identity is one workload. `CREATE` for an identity that is already
-live, or still being staged, answers `EEXIST`, so a caller that lost its
-handle recovers it with `LOOKUP` by identity rather than creating a
-second owner. The graph backend stages a subgraph a few modules per call
-(`ADD_MODULES_PER_CALL`): `CREATE` reserves the owner, opens the channels
-and instantiates the first batch, then answers `EINPROGRESS`, and the
-caller asks again each step with the same spec until the handle comes
-back, so no single call holds the scheduler for longer than a few module
-loads. `LOOKUP` on an identity being staged answers `EINPROGRESS`, and
-`DESTROY` with no handle and the identity as its argument abandons a
-staged `CREATE` or destroys a live workload.
+One identity is one workload, whichever backend runs it. `CREATE` for an
+identity that already has a live workload answers `EEXIST`, so a caller
+that lost its handle recovers it with `LOOKUP` by identity rather than
+creating a second owner. The graph backend stages a subgraph a few
+modules per call (`CREATE_MODULES_PER_CALL`, 4): the first call admits
+the spec, copies the subgraph into the backend's own memory, reserves the
+owner, opens the channels and instantiates the first batch, then answers
+`EINPROGRESS`; the caller asks again each step with the same spec, byte
+for byte, until the handle comes back, so no single call holds the
+scheduler for longer than a few module loads. The backend never writes
+into the spec. One `CREATE` is staged at a time: any other spec answers
+`EBUSY` until it is published or abandoned. `LOOKUP` on the identity being
+staged answers `EINPROGRESS`, and `DESTROY` with no handle and the
+identity as its argument abandons the staged `CREATE` or destroys a live
+workload. A rebuild drops a staged `CREATE` with every workload.
 
 A workload can bring its own modules (`SOURCE_FMOD_PACK`): an FXMT module
 table in the caller's memory, the SHA-256 pins its modules are admitted by,
@@ -183,8 +189,12 @@ of a code pool that is 16 MiB on a 64-bit node and absent elsewhere,
 validates it as it does the boot table, and admits each module only when
 its full `.fmod` bytes hash to one of the pins (the digest its OCI layer
 is addressed by) or the node's signing root verifies its signature;
-otherwise `CREATE` fails `EACCES`. The region is then made executable and
-the subgraph's names resolve in the pack first, the node's image second.
+otherwise `CREATE` fails `EACCES`; a kernel built to enforce signatures
+also requires a valid signature of a pinned module. Once admitted, the
+region is sealed: on Linux it is mapped read-execute, never writable and
+executable at once; on bare metal its caches are made coherent for
+execution, the kernel's memory being writable and executable throughout.
+The subgraph's names resolve in the pack first, the node's image second.
 The code is the owner's for as long as the owner lives, freed with it, on
 a rolled-back add, and on a rebuild. A node without a pool answers
 `ENOSYS`, and `CAPS` advertises packs only where there is one.

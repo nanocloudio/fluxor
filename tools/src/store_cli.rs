@@ -456,6 +456,14 @@ pub fn cmd_workload_image_publish(
                 "workload-image.json: {mname}: name_hash {hash} is not a u32"
             ))
         })?;
+        // A module name becomes one file name inside the image's
+        // `modules/`: it names no directory and leads nowhere else.
+        if !fluxor_tools::workload::is_module_name(mname) {
+            return Err(Error::Config(format!(
+                "workload-image.json: {mname:?} is not a module name (a letter or digit, then \
+                 letters, digits, '_' or '-', at most 64 bytes)"
+            )));
+        }
         let bytes = read(&dir.join("modules").join(format!("{mname}.fmod")))?;
         let actual = sha256_hex_prefixed(&bytes);
         if actual.trim_start_matches("sha256:") != sha {

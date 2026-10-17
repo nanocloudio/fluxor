@@ -53,15 +53,17 @@
 /// tagged `WorkloadHandle` fd, or a negative errno. The caller must hold the
 /// workload-admit grant (`requires_contract = "workload"` + `platform_raw`).
 /// Identity in the spec is mapped to an owner and lease-gated before any
-/// backend mechanism runs. One identity is one workload: a `CREATE` for an
-/// identity that is already live, or being staged, answers `EEXIST`.
+/// backend mechanism runs. The null identity names no one and is refused
+/// (`EINVAL`). One identity is one workload: a `CREATE` for an identity that
+/// already has a live workload answers `EEXIST`.
 ///
 /// A graph backend stages a subgraph a few modules per call: `CREATE`
 /// answers `EINPROGRESS` until the last module is in, and the caller asks
 /// again each step with the same spec, byte for byte, until it gets the
-/// handle. The spec is scratch once the handle is returned. A different spec
-/// while one is being staged answers `EBUSY`; [`LOOKUP`] finds the staged
-/// identity and [`DESTROY`] by identity abandons it.
+/// handle. The backend works from its own copy of the subgraph and never
+/// writes into the spec. While one `CREATE` is being staged, any other
+/// spec, for its identity or another, answers `EBUSY`; [`LOOKUP`] finds the
+/// staged identity and [`DESTROY`] by identity abandons it.
 pub const CREATE: u32 = 0x1A00;
 
 /// `START` — release the create/start barrier so the workload begins executing.
@@ -87,8 +89,9 @@ pub const SIGNAL: u32 = 0x1A03;
 /// back. `ENOENT` when nothing carries the identity.
 pub const DESTROY: u32 = 0x1A04;
 
-// ---- 0x1A05..0x1A0A: retired to `abi::platform::linux::host_process` ----
-// (0x1B class). Do not reuse these opcode values.
+// ---- 0x1A05..0x1A0A: unassigned ----
+// The host-process mechanics (exec, PTY, read) are the 0x1B class,
+// `abi::platform::linux::host_process`. These values stay unassigned.
 
 /// `PAUSE` — freeze a workload (reversible; not a terminal state). Each
 /// backend realizes it with its own freeze mechanism (host-process: the
@@ -210,8 +213,10 @@ pub const SOURCE_FMOD_GRAPH: u8 = 0;
 /// caller's memory, copied during CREATE. Every module in it is admitted only
 /// when its full `.fmod` bytes hash to one of the pins — the digest an OCI
 /// layer is addressed by — or it carries a signature the node's signing root
-/// verifies; otherwise CREATE fails `EACCES`. A node without code space for
-/// packs answers `ENOSYS`; a pack past it `E2BIG` or `ENOMEM`.
+/// verifies; otherwise CREATE fails `EACCES`. A kernel built to enforce
+/// signatures requires a valid signature of every module it loads, a pinned
+/// one included. A node without code space for packs answers `ENOSYS`; a
+/// pack past it `E2BIG` or `ENOMEM`.
 pub const SOURCE_FMOD_PACK: u8 = 2;
 
 /// The head of a [`SOURCE_FMOD_PACK`] source section, little-endian:
@@ -270,7 +275,7 @@ pub const SIG_KILL: u32 = 2;
 /// Layout (all little-endian):
 /// ```text
 /// off  size  field
-///   0    16  identity        owner_uid → owner alloc/reuse
+///   0    16  identity        owner_uid: the one owner the workload runs as
 ///  16     1  posture         POSTURE_*
 ///  17     1  source_kind     SOURCE_*
 ///  18     1  net_iso         NET_ISO_* — workload-level network isolation;

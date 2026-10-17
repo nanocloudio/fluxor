@@ -51,12 +51,12 @@ pub enum FaultState {
 pub enum FaultPolicy {
     /// Terminate module, graph continues without it.
     Skip = 0,
-    /// **v1 limitation — partial restart**: channels are flushed and the
-    /// fault state machine moves back to `Running`, but state is *not*
-    /// zeroed and `module_new()` is *not* re-called. See
-    /// `scheduler::handle_module_restart` for the exact behaviour. Safe
-    /// for stateless / idempotent modules; modules with stateful invariants
-    /// should use `Skip` and rely on the graph operator to drain+reload.
+    /// Partial restart: channels are flushed and the fault state machine
+    /// moves back to `Running`, but state is *not* zeroed and
+    /// `module_new()` is *not* re-called. See
+    /// `scheduler::handle_module_restart` for the exact behaviour. Safe for
+    /// stateless / idempotent modules; modules with stateful invariants
+    /// should use `Skip` and rely on the graph operator to drain and reload.
     Restart = 1,
     /// Tear down and re-instantiate entire graph.
     RestartGraph = 2,
@@ -88,12 +88,14 @@ impl FaultPolicy {
     }
 
     /// Whether the policy's whole effect stays on the faulting module, so a
-    /// workload may choose it. `Skip` terminates the module and `Tolerate`
-    /// only records the overrun. `Restart` releases the module's provider
-    /// layers and flushes its channels, which other owners may hold, and
-    /// `RestartGraph` names the whole graph: neither is confined.
+    /// workload may choose it. Only `Skip` is: it terminates the module.
+    /// `Tolerate` records an overrun and lets the module run on, so the
+    /// domain's other modules pay for every late step and the deadline it
+    /// was admitted under never binds it. `Restart` releases the module's
+    /// provider layers and flushes its channels, which other owners may
+    /// hold, and `RestartGraph` names the whole graph.
     pub const fn confined_to_module(self) -> bool {
-        matches!(self, FaultPolicy::Skip | FaultPolicy::Tolerate)
+        matches!(self, FaultPolicy::Skip)
     }
 }
 

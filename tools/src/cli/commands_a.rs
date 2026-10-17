@@ -238,7 +238,7 @@ fn cmd_info(file: &PathBuf) -> Result<()> {
                                     "      type: {type_str} ({mod_type}), abi: v{abi}, size: {fmod_size} bytes"
                                 );
 
-                                // Read manifest from fmod (ABI v2)
+                                // Read the manifest the fmod carries (a header abi of 2 or more)
                                 if abi >= 2 {
                                     let code_size = u32::from_le_bytes([
                                         fmod_header[8],

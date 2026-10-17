@@ -761,44 +761,60 @@ into the runtime rather than loadable modules:
 ### What a workload reaches
 
 A workload is a tenant of the node, and the platform providers above are
-the node's. A module whose owner is not the system reaches them only
-inside a root of the owner's own, and a provider layer a workload's own
-module registers (its `fat32`, its `fs_object`, its `mount`) serves that
-workload alone: the resolution of a contract skips every layer whose
-owner is neither the system nor the caller, so a workload can neither
-reach the node through its own provider nor stand in as the node's.
+the node's. A provider layer serves the owner whose module registered it
+and no one else: a contract resolves only through layers of the caller's
+own owner. The node's provider modules (its `fat32`, its `fs_object`, its
+`mount`) are invisible to a workload, and a workload's own provider modules
+serve that workload alone, so a workload can neither reach the node through
+the node's providers nor stand in as the node's. Where no layer of its own
+serves a contract, a workload falls through to the platform provider, which
+confines it as follows.
 
 - **Linux `file.data`** resolves a workload's paths beneath
   `$FLUXOR_OWNER_ROOT/<owner uid>/files/` (default
-  `/var/lib/fluxor/owners`) with `openat2` and `RESOLVE_BENEATH`, `
-  RESOLVE_NO_SYMLINKS` and `RESOLVE_NO_MAGICLINKS`: a leading `/` is the
+  `/var/lib/fluxor/owners`) with `openat2` and `RESOLVE_BENEATH`,
+  `RESOLVE_NO_SYMLINKS` and `RESOLVE_NO_MAGICLINKS`: a leading `/` is the
   root, `..` never leaves it, and a symlink planted inside it leads
   nowhere. A path that would leave the root is `EACCES`. The ops that
-  name an entry rather than open it (`UNLINK`, `MKDIR`, `RMDIR`, `LINK`,
-  `RENAME`, `FSYNC_NAME`) open the parent beneath the root the same way and
-  act on the name inside it.
+  name an entry rather than open it (`UNLINK`, `MKDIR`, `RMDIR`, `RENAME`,
+  `FSYNC_NAME`) open the parent beneath the root the same way and act on
+  the name inside it. `LINK` is `ENOSYS` and absent from the caps a
+  workload is answered: a second name for an inode would let a file be
+  charged once and held twice. An owner holds at most 32 files open.
 - **Linux `storage.object` and `storage.namespace`** reach a versioned
   store of the owner's own, under `<root>/store/`, with the node store's
-  semantics and durability and no grants (`PRESENT` is `ENOSYS`). The
-  host filesystem, the HTTP origin and the node's control-plane store are
-  never a workload's.
-- **bcm2712** keeps one store, whose entries, history and watches carry
-  their owner: each owner sees and changes its own keys, and its watches
-  carry its own changes.
+  semantics and durability, handle tables of its own (16 watches, 8 open
+  reads, 4 streamed writes staging at most 16 MiB each) and no grants
+  (`PRESENT` is `ENOSYS`). A handle names an entry in its owner's tables
+  only, so a handle value from another owner's tables reaches nothing, and
+  a watch sees only its owner's changes. The host filesystem, the HTTP
+  origin and the node's control-plane store are never a workload's.
+- **bcm2712** serves its store to the node alone (`EACCES` to a workload).
+  It is one fixed table with one history and one revision clock: a
+  workload sharing it could fill the table, flood the history the node's
+  watchers read, and read the rate of other owners' writes off the clock.
+  A workload on that board keeps its objects in a store provider of its
+  own, over a volume lent to it.
 
-Every handle one of these providers mints is the opener's: the kernel
-tracks file, namespace and object handles to the owner that opened them,
-refuses them to any other owner (`EACCES`), and closes them when the
-owner is released. The bytes an owner holds, its files and its store
-values, are charged to its storage ledger against the `storage_bytes` its
-`CREATE` admitted (0 is unlimited): a write that would grow a file, a
-`PREALLOCATE`, or a `PUT` past the cap is `ENOSPC`, and an unlink,
-truncate or delete gives the bytes back. The root is made when the owner
-first touches storage and removed when the owner is released: a `DESTROY`,
-a `KILL`, or a rolled-back admission. Nothing else removes it, so a root
-survives a runtime restart, and an owner admitted again under the same
-identity finds what it held, charged to its ledger. Data that must
-outlive the owner itself belongs to a volume.
+What an owner holds on Linux is charged to its storage ledger against the
+`storage_bytes` its `CREATE` admitted (0 is unlimited). A file costs its
+size plus 4096 bytes for its inode and directory entry, a directory or
+any other name 4096, a store entry its key, its value and a 64-byte record
+overhead, and a streamed write the bytes it has staged. The charge is kept
+per inode and read from the inode itself, so it follows a file through
+every handle and path that changes it. A `WRITE` that would grow a file,
+a `PREALLOCATE`, an `OPEN_CREATE` or `MKDIR` of a new name, or a `PUT`
+past the cap is `ENOSPC`; an unlink, a truncate, a shrinking `PUT` or a
+delete gives the bytes back.
+
+The root is made when an admitted owner first touches storage, and removed
+when the owner is released: a `DESTROY`, a `KILL`, or a rolled-back
+admission. The release also closes every file, read, write and watch the
+owner holds. Nothing else removes a root, so it survives a runtime
+restart, and an owner admitted again under the same identity finds what it
+held, charged to its ledger again; past its cap if need be, in which case
+it can shrink but not grow until it is back under. Data that must outlive
+the owner itself belongs to a volume.
 
 ### The versioned watchable key store
 

@@ -57,8 +57,9 @@ const _: () = assert!(HS_IN_BUF_SIZE >= SCRATCH_SIZE + HS_RECORD_PLAINTEXT_MAX);
 const _: () = assert!(HS_OUT_BUF_SIZE >= SCRATCH_SIZE);
 
 /// The longest principal a verified peer is reported under — the
-/// `peer_identity` contract's MAX_PRINCIPAL (tls asserts the two agree): a
-/// longer URI is verified but not reported, and so names no one.
+/// `peer_identity` contract's MAX_PRINCIPAL (tls asserts the two agree). A
+/// longer URI is refused by the URI rule (`uri_well_formed`): a peer is
+/// never accepted under a name its session could not report.
 pub const PEER_PRINCIPAL_MAX: usize = 128;
 
 /// All record-agnostic TLS 1.3 handshake state.

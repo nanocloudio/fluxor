@@ -29,7 +29,6 @@ use crate::abi::fence::{Fence, WIRE_MAX_LEN};
 use crate::kernel::ipc::channel::channel_write;
 use crate::kernel::ipc::fd::{slot_of, tag_fd, FD_TAG_STORAGE_NAMESPACE, FD_TAG_STORAGE_OBJECT};
 use crate::kernel::sys::errno;
-use crate::kernel::workload::owner::{OwnerHandle, OWNER_SYSTEM};
 
 /// Objects the store can hold — one machine's worth of state, not a fleet's.
 /// Exceeding it is refused (`ENOMEM`) rather than evicting: a consumer reads a
@@ -69,9 +68,6 @@ enum Kind {
 #[derive(Clone, Copy)]
 struct Entry {
     in_use: bool,
-    /// Whose entry it is: the store is one table, but each owner sees and
-    /// changes only its own keys.
-    owner: OwnerHandle,
     key: [u8; STORAGE_KEY_MAX],
     key_len: u16,
     val: [u8; MAX_VALUE],
@@ -81,7 +77,6 @@ struct Entry {
 
 const ENTRY_EMPTY: Entry = Entry {
     in_use: false,
-    owner: OWNER_SYSTEM,
     key: [0; STORAGE_KEY_MAX],
     key_len: 0,
     val: [0; MAX_VALUE],
@@ -92,7 +87,6 @@ const ENTRY_EMPTY: Entry = Entry {
 #[derive(Clone, Copy)]
 struct HistEntry {
     revision: u64,
-    owner: OwnerHandle,
     kind: Kind,
     key: [u8; STORAGE_KEY_MAX],
     key_len: u16,
@@ -102,7 +96,6 @@ struct HistEntry {
 
 const HIST_EMPTY: HistEntry = HistEntry {
     revision: 0,
-    owner: OWNER_SYSTEM,
     kind: Kind::Added,
     key: [0; STORAGE_KEY_MAX],
     key_len: 0,
@@ -113,8 +106,6 @@ const HIST_EMPTY: HistEntry = HistEntry {
 #[derive(Clone, Copy)]
 struct Sub {
     in_use: bool,
-    /// Whose watch it is: it sees that owner's changes alone.
-    owner: OwnerHandle,
     prefix: [u8; STORAGE_KEY_MAX],
     prefix_len: u16,
     sink_chan: u32,
@@ -125,7 +116,6 @@ struct Sub {
 
 const SUB_EMPTY: Sub = Sub {
     in_use: false,
-    owner: OWNER_SYSTEM,
     prefix: [0; STORAGE_KEY_MAX],
     prefix_len: 0,
     sink_chan: 0,
@@ -249,34 +239,24 @@ unsafe fn telemetry(store: &Store) {
 }
 
 impl Store {
-    fn find(&self, owner: OwnerHandle, key: &[u8]) -> Option<usize> {
+    fn find(&self, key: &[u8]) -> Option<usize> {
         self.entries
             .iter()
-            .position(|e| e.in_use && e.owner == owner && &e.key[..e.key_len as usize] == key)
+            .position(|e| e.in_use && &e.key[..e.key_len as usize] == key)
     }
 
-    fn get(&self, owner: OwnerHandle, key: &[u8]) -> Option<(&[u8], u64)> {
-        let i = self.find(owner, key)?;
+    fn get(&self, key: &[u8]) -> Option<(&[u8], u64)> {
+        let i = self.find(key)?;
         let e = &self.entries[i];
         Some((&e.val[..e.val_len as usize], e.revision))
-    }
-
-    /// Drop every entry of `owner`: its keys go with it.
-    fn release_owner(&mut self, owner: OwnerHandle) {
-        for e in self.entries.iter_mut() {
-            if e.in_use && e.owner == owner {
-                *e = ENTRY_EMPTY;
-            }
-        }
     }
 
     /// Record a change in the bounded history. The oldest is overwritten; a
     /// watcher behind the window is told to relist rather than handed a gap,
     /// which is why the window's floor is tracked rather than assumed.
-    fn push_hist(&mut self, owner: OwnerHandle, revision: u64, kind: Kind, key: &[u8], val: &[u8]) {
+    fn push_hist(&mut self, revision: u64, kind: Kind, key: &[u8], val: &[u8]) {
         let h = &mut self.hist[self.hist_head];
         h.revision = revision;
-        h.owner = owner;
         h.kind = kind;
         h.key_len = key.len().min(STORAGE_KEY_MAX) as u16;
         h.key[..h.key_len as usize].copy_from_slice(&key[..h.key_len as usize]);
@@ -298,19 +278,19 @@ impl Store {
         self.hist[self.hist_head].revision
     }
 
-    fn put(&mut self, owner: OwnerHandle, key: &[u8], val: &[u8]) -> Result<u64, i32> {
+    fn put(&mut self, key: &[u8], val: &[u8]) -> Result<u64, i32> {
         if key.len() > STORAGE_KEY_MAX || val.len() > MAX_VALUE {
             return Err(errno::EINVAL);
         }
         self.revision += 1;
         let rev = self.revision;
-        match self.find(owner, key) {
+        match self.find(key) {
             Some(i) => {
                 let e = &mut self.entries[i];
                 e.val_len = val.len() as u16;
                 e.val[..val.len()].copy_from_slice(val);
                 e.revision = rev;
-                self.push_hist(owner, rev, Kind::Modified, key, val);
+                self.push_hist(rev, Kind::Modified, key, val);
             }
             None => {
                 let Some(i) = self.entries.iter().position(|e| !e.in_use) else {
@@ -322,24 +302,23 @@ impl Store {
                 };
                 let e = &mut self.entries[i];
                 e.in_use = true;
-                e.owner = owner;
                 e.key_len = key.len() as u16;
                 e.key[..key.len()].copy_from_slice(key);
                 e.val_len = val.len() as u16;
                 e.val[..val.len()].copy_from_slice(val);
                 e.revision = rev;
-                self.push_hist(owner, rev, Kind::Added, key, val);
+                self.push_hist(rev, Kind::Added, key, val);
             }
         }
         Ok(rev)
     }
 
-    fn delete(&mut self, owner: OwnerHandle, key: &[u8]) -> Option<u64> {
-        let i = self.find(owner, key)?;
+    fn delete(&mut self, key: &[u8]) -> Option<u64> {
+        let i = self.find(key)?;
         self.revision += 1;
         let rev = self.revision;
         self.entries[i] = ENTRY_EMPTY;
-        self.push_hist(owner, rev, Kind::Deleted, key, &[]);
+        self.push_hist(rev, Kind::Deleted, key, &[]);
         Some(rev)
     }
 }
@@ -388,15 +367,11 @@ impl Store {
     /// strictly after `after` (any key when `after` is `None`). The table is
     /// in slot order, not key order, so a listing selects its next entry
     /// by key each step.
-    fn next_after(&self, owner: OwnerHandle, prefix: &[u8], after: Option<&[u8]>) -> Option<usize> {
+    fn next_after(&self, prefix: &[u8], after: Option<&[u8]>) -> Option<usize> {
         let mut pick: Option<usize> = None;
         for (i, e) in self.entries.iter().enumerate() {
             let key = &e.key[..e.key_len as usize];
-            if !e.in_use
-                || e.owner != owner
-                || !has_prefix(key, prefix)
-                || after.is_some_and(|a| key <= a)
-            {
+            if !e.in_use || !has_prefix(key, prefix) || after.is_some_and(|a| key <= a) {
                 continue;
             }
             match pick {
@@ -441,22 +416,16 @@ pub unsafe fn init() {
     ENABLED = true;
     provider::register(dev_class::STORAGE_OBJECT, dispatch_object);
     provider::register(dev_class::STORAGE_NAMESPACE, dispatch_namespace);
-    provider::register_owner_release_hook(release_owner);
 }
 
-/// An owner's keys and watches go with it.
-fn release_owner(owner: OwnerHandle) {
-    // SAFETY: owner release runs on the scheduler thread, as every dispatch.
-    unsafe {
-        if let Some(store) = store_ref() {
-            store.release_owner(owner);
-        }
-        for s in (*core::ptr::addr_of_mut!(SUBS)).iter_mut() {
-            if s.in_use && s.owner == owner {
-                *s = SUB_EMPTY;
-            }
-        }
-    }
+/// Whether the caller is the node. The store is one fixed table with one
+/// history and one revision clock: a workload sharing it could fill the
+/// table, flood the history the node's watchers read, and read the rate of
+/// other owners' writes off the clock, so it is the node's alone. A workload
+/// on this board keeps its objects in a store provider of its own, over a
+/// volume lent to it.
+fn node_caller() -> bool {
+    crate::kernel::exec::scheduler::caller_owner().is_system()
 }
 
 unsafe fn store_ref() -> Option<&'static mut Store> {
@@ -576,7 +545,7 @@ unsafe fn pump_subscriptions(store: &mut Store) {
         loop {
             let mut pick: Option<usize> = None;
             for (i, h) in store.hist.iter().enumerate() {
-                if h.revision <= s.cursor || h.owner != s.owner {
+                if h.revision <= s.cursor {
                     continue;
                 }
                 let key = &h.key[..h.key_len as usize];
@@ -622,10 +591,12 @@ unsafe fn pump_subscriptions(store: &mut Store) {
 /// Single-threaded platform dispatch; `arg` must be null or valid for
 /// `arg_len` bytes.
 pub unsafe fn dispatch_object(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
+    if !node_caller() {
+        return errno::EACCES;
+    }
     let Some(store) = store_ref() else {
         return errno::ENOSYS;
     };
-    let owner = crate::kernel::exec::scheduler::caller_owner();
     let a = if arg.is_null() {
         &[][..]
     } else {
@@ -668,7 +639,7 @@ pub unsafe fn dispatch_object(handle: i32, opcode: u32, arg: *mut u8, arg_len: u
                 return errno::EINVAL;
             }
 
-            let existing = store.get(owner, key).map(|(_, r)| r);
+            let existing = store.get(key).map(|(_, r)| r);
             if condition.refuses(existing) {
                 // `EEXIST`: somebody created this key, so a create-only caller
                 // has LOST. `EAGAIN`: the key moved or is gone under a
@@ -685,26 +656,8 @@ pub unsafe fn dispatch_object(handle: i32, opcode: u32, arg: *mut u8, arg_len: u
             } else {
                 core::slice::from_raw_parts(body_ptr as *const u8, body_len as usize)
             };
-            // What the value adds over what the key holds is the owner's to
-            // hold; a put its storage cap refuses lands nothing.
-            let held = store
-                .get(owner, key)
-                .map(|(v, _)| v.len() as u64)
-                .unwrap_or(0);
-            let growth = (body.len() as u64).saturating_sub(held);
-            if growth > 0
-                && crate::kernel::exec::scheduler::owners_mut()
-                    .charge_storage(owner, growth)
-                    .is_err()
-            {
-                return errno::ENOSPC;
-            }
-            match store.put(owner, key, body) {
+            match store.put(key, body) {
                 Ok(rev) => {
-                    if (body.len() as u64) < held {
-                        crate::kernel::exec::scheduler::owners_mut()
-                            .release_storage(owner, held - body.len() as u64);
-                    }
                     TLM_PUTS = TLM_PUTS.wrapping_add(1);
                     // RevisionMonotone, never LocalDurable: this store is RAM.
                     // Ordering holds; survival does not, and saying otherwise
@@ -720,14 +673,11 @@ pub unsafe fn dispatch_object(handle: i32, opcode: u32, arg: *mut u8, arg_len: u
                     pump_subscriptions(store);
                     0
                 }
-                Err(e) => {
-                    crate::kernel::exec::scheduler::owners_mut().release_storage(owner, growth);
-                    e
-                }
+                Err(e) => e,
             }
         }
         obj_op::GET => {
-            let Some((val, rev)) = store.get(owner, a) else {
+            let Some((val, rev)) = store.get(a) else {
                 return errno::ENXIO;
             };
             let vlen = val.len();
@@ -777,7 +727,7 @@ pub unsafe fn dispatch_object(handle: i32, opcode: u32, arg: *mut u8, arg_len: u
             let Some((fptr, fcap)) = fence_out(a, 2 + kl + 12) else {
                 return errno::EINVAL;
             };
-            let Some((val, rev)) = store.get(owner, &a[2..2 + kl]) else {
+            let Some((val, rev)) = store.get(&a[2..2 + kl]) else {
                 return errno::ENXIO;
             };
             let vlen = val.len();
@@ -823,15 +773,10 @@ pub unsafe fn dispatch_object(handle: i32, opcode: u32, arg: *mut u8, arg_len: u
             let Some((fptr, fcap)) = fence_out(a, p) else {
                 return errno::EINVAL;
             };
-            if condition.refuses(store.get(owner, key).map(|(_, r)| r)) {
+            if condition.refuses(store.get(key).map(|(_, r)| r)) {
                 return errno::EAGAIN;
             }
-            let held = store
-                .get(owner, key)
-                .map(|(v, _)| v.len() as u64)
-                .unwrap_or(0);
-            let rev = store.delete(owner, key).unwrap_or(store.revision);
-            crate::kernel::exec::scheduler::owners_mut().release_storage(owner, held);
+            let rev = store.delete(key).unwrap_or(store.revision);
             TLM_DELS = TLM_DELS.wrapping_add(1);
             write_fence(
                 Fence::RevisionMonotone {
@@ -860,7 +805,6 @@ pub unsafe fn dispatch_object(handle: i32, opcode: u32, arg: *mut u8, arg_len: u
             let mut last_len = 0usize;
             let mut more = false;
             while let Some(i) = store.next_after(
-                owner,
                 req.prefix,
                 if last_len > 0 {
                     Some(&last[..last_len])
@@ -921,10 +865,12 @@ pub unsafe fn dispatch_object(handle: i32, opcode: u32, arg: *mut u8, arg_len: u
 /// Single-threaded platform dispatch; `arg` must be null or valid for
 /// `arg_len` bytes.
 pub unsafe fn dispatch_namespace(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
+    if !node_caller() {
+        return errno::EACCES;
+    }
     let Some(store) = store_ref() else {
         return errno::ENOSYS;
     };
-    let owner = crate::kernel::exec::scheduler::caller_owner();
     let a = if arg.is_null() {
         &[][..]
     } else {
@@ -949,7 +895,6 @@ pub unsafe fn dispatch_namespace(handle: i32, opcode: u32, arg: *mut u8, arg_len
             let mut last_len = 0usize;
             let mut more = false;
             while let Some(i) = store.next_after(
-                owner,
                 req.prefix,
                 if last_len > 0 {
                     Some(&last[..last_len])
@@ -1007,7 +952,6 @@ pub unsafe fn dispatch_namespace(handle: i32, opcode: u32, arg: *mut u8, arg_len
             };
             subs[idx] = SUB_EMPTY;
             subs[idx].in_use = true;
-            subs[idx].owner = owner;
             subs[idx].prefix_len = pl as u16;
             subs[idx].prefix[..pl].copy_from_slice(&a[2..2 + pl]);
             subs[idx].sink_chan = sink_chan;
@@ -1019,7 +963,6 @@ pub unsafe fn dispatch_namespace(handle: i32, opcode: u32, arg: *mut u8, arg_len
                 // between the two where a change could be missed.
                 for e in store.entries.iter() {
                     if !e.in_use
-                        || e.owner != owner
                         || !has_prefix(&e.key[..e.key_len as usize], &subs[idx].prefix[..pl])
                     {
                         continue;
@@ -1089,10 +1032,7 @@ pub unsafe fn dispatch_namespace(handle: i32, opcode: u32, arg: *mut u8, arg_len
             if since == 0 {
                 fence_rev = store.revision;
                 for e in store.entries.iter() {
-                    if !e.in_use
-                        || e.owner != owner
-                        || !has_prefix(&e.key[..e.key_len as usize], prefix)
-                    {
+                    if !e.in_use || !has_prefix(&e.key[..e.key_len as usize], prefix) {
                         continue;
                     }
                     if !push(
@@ -1125,7 +1065,7 @@ pub unsafe fn dispatch_namespace(handle: i32, opcode: u32, arg: *mut u8, arg_len
                 loop {
                     let mut pick: Option<usize> = None;
                     for (i, h) in store.hist.iter().enumerate() {
-                        if h.revision <= cursor || h.owner != owner {
+                        if h.revision <= cursor {
                             continue;
                         }
                         if !has_prefix(&h.key[..h.key_len as usize], prefix) {

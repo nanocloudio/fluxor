@@ -1293,10 +1293,9 @@ fn validate_isr_tier_admission(
             // build instead of getting refused on the rig. (Tier 1b —
             // `exec_mode == 2` — dispatches the cooperative step from a
             // polled timer and needs no ISR entry. `module_isr_init` is
-            // a reserved ABI symbol with no consumer today — Tier 2
-            // construction goes through the normal cooperative
-            // `module_new`, same as Tier 1b — so it is intentionally not
-            // required here.)
+            // a reserved ABI symbol nothing calls — Tier 2 construction
+            // goes through the normal cooperative `module_new`, same as
+            // Tier 1b — so it is intentionally not required here.)
             if exec_mode == 4 {
                 if let Err(e) = crate::manifest::check_module_exports_isr_entry(&root) {
                     return Err(Error::Config(format!(
@@ -1373,7 +1372,7 @@ fn validate_isr_tier_admission(
 
     // ── Rule 2: edges touching ISR-tier modules are rejected ────
     //
-    // v1 reality: the kernel-side bridge wiring works — `wire_isr_bridges`
+    // The kernel-side bridge wiring works — `wire_isr_bridges`
     // + `pump_isr_bridges` shuttle bytes
     // between cooperative PIPE channels and bridge rings — but PIC
     // modules have NO documented way to read their own bridge slot
@@ -1383,9 +1382,9 @@ fn validate_isr_tier_admission(
     // slot allocated, the kernel would drain bytes into the ring,
     // and the ISR module would have no supported way to read them.
     //
-    // Until the module-facing bridge ABI lands (see
-    // `docs/architecture/scheduler.md` §"ISR-tier I/O contract"),
-    // reject ANY YAML edge with an ISR-tier endpoint. Tests that
+    // With no module-facing bridge ABI (see
+    // `docs/architecture/scheduler.md` §"ISR-tier I/O contract"), the
+    // build rejects ANY YAML edge with an ISR-tier endpoint. Tests that
     // bypass YAML (e.g. `tests/harness/tests/scheduler_isr_bridges.rs`)
     // continue to exercise the kernel-side mechanism through
     // `install_static_config` + `set_domain_exec_mode`, but a real
@@ -1419,14 +1418,13 @@ fn validate_isr_tier_admission(
         if from_isr || to_isr {
             return Err(Error::Config(format!(
                 "wiring[{i}] (from '{from_mod}' to '{to_mod}'): an edge touching an \
-                 ISR-tier endpoint cannot be wired in v1 — PIC modules have no \
+                 ISR-tier endpoint cannot be wired — PIC modules have no \
                  module-facing API to read/write their bridge slots from inside \
                  `module_step`. The kernel-side bridge mechanism is wired and \
                  tested, but the SDK surface is not. Drop the edge from your YAML \
-                 (Tier 1b modules in v1 do private-state work only), or move both \
-                 endpoints to cooperative tiers. Track \
-                 `docs/architecture/scheduler.md` §\"ISR-tier I/O contract\" \
-                 for the lift."
+                 (Tier 1b modules do private-state work only), or move both \
+                 endpoints to cooperative tiers. See \
+                 `docs/architecture/scheduler.md` §\"ISR-tier I/O contract\"."
             )));
         }
         // Past this point both endpoints are cooperative. Any
@@ -1693,10 +1691,11 @@ fn load_builtin_param_schema(
     Some((m, s))
 }
 
-/// Reject any YAML key on a built-in module entry that the schema doesn't
-/// know about. PIC modules currently silently ignore unknown keys; here we
-/// hard-fail because the manifest is the contract and a typo will otherwise
-/// silently use the default. Skips structural metadata (name, type, …).
+/// Any YAML key on a built-in module entry that the schema does not know
+/// is rejected: a PIC module ignores a key it does not know, so the
+/// manifest is the contract and a typo would otherwise silently use the
+/// default. Structural metadata (name, type, …) is skipped.
+///
 /// Top-level YAML keys that are structural metadata, not module params.
 /// Mirrors `schema.rs::SKIP_KEYS` plus the protection/policy/trust tier
 /// fields that `build_module_entry` writes as reserved TLV tags
@@ -2161,7 +2160,7 @@ fn lift_trust_source(name: &str, module: Value) -> Result<(Value, Value, Option<
 /// returning a clone with the flat fields in place. Pure YAML-level
 /// rewrite — schema lookup runs unchanged afterwards.
 ///
-/// Currently handles:
+/// Handles:
 ///   - mqtt `broker: "host:port"` → `broker_ip: u32` + `broker_port: u16`
 ///   - mqtt derived `subscribe_topic` from top-level `device_uuid` if
 ///     the YAML didn't set one explicitly
@@ -2264,10 +2263,13 @@ fn yaml_fault_policy(module: &Value, name: &str) -> Result<Option<u8>> {
 /// kernel admits it (`scheduler::live::admit_step_budget`), so an image
 /// that builds is one a node with the graph's domains takes:
 ///
-///   * `fault_policy` is `skip` or `tolerate`. `restart` releases the
-///     module's provider layers and flushes its channels, and
-///     `restart_graph` names the whole graph; both reach past the faulting
-///     module, so a workload is refused them.
+///   * `fault_policy` is `skip`, the one policy whose whole effect stays on
+///     the faulting module: it terminates the module. `restart` releases the
+///     module's provider layers and flushes its channels, which other owners
+///     may hold. `restart_graph` names the whole graph. `tolerate` records an
+///     overrun and lets the module run on, so the domain's other modules pay
+///     for every late step and the deadline it was admitted under never
+///     binds it. A workload is refused all three.
 ///   * A declared `step_deadline_us` and the effective burst deadline
 ///     (`step_deadline_burst_us`, else `step_deadline_us ×
 ///     BURST_MULTIPLIER`) each fit `16 ×` the domain's shortest tick
@@ -2285,16 +2287,20 @@ pub(crate) fn workload_step_budget(
 ) -> Result<crate::add_subgraph::StepBudget> {
     let deadline = yaml_u32_setting(module, "step_deadline_us", label)?;
     let burst = yaml_u32_setting(module, "step_deadline_burst_us", label)?;
-    let policy = yaml_fault_policy(module, label)?.unwrap_or(crate::add_subgraph::FAULT_POLICY_SKIP);
-    if policy == crate::add_subgraph::FAULT_POLICY_RESTART
-        || policy == crate::add_subgraph::FAULT_POLICY_RESTART_GRAPH
-    {
+    let policy =
+        yaml_fault_policy(module, label)?.unwrap_or(crate::add_subgraph::FAULT_POLICY_SKIP);
+    if policy != crate::add_subgraph::FAULT_POLICY_SKIP {
         return Err(Error::Config(format!(
-            "{label}: fault_policy {} is not available to a workload module: it reaches past \
-             the faulting module (restart releases its provider layers and flushes channels \
-             other owners may hold; restart_graph names the whole graph), and a node admits a \
-             workload only a policy confined to the module. Use \"skip\" or \"tolerate\".",
-            module.get("fault_policy").map(|v| v.to_string()).unwrap_or_default()
+            "{label}: fault_policy {} is not available to a workload module; a node admits a \
+             workload only \"skip\", which terminates the faulting module and touches nothing \
+             else. restart releases the module's provider layers and flushes its channels, \
+             which other owners may hold. restart_graph names the whole graph. tolerate \
+             records an overrun and lets the module run on, so the domain's other modules pay \
+             for every late step and the deadline it was admitted under never binds it.",
+            module
+                .get("fault_policy")
+                .map(|v| v.to_string())
+                .unwrap_or_default()
         )));
     }
     let budget = crate::add_subgraph::StepBudget {
@@ -2334,9 +2340,7 @@ pub(crate) fn workload_step_budget(
     } else {
         domain_tick
     };
-    let ceiling = floor_tick
-        .saturating_mul(16)
-        .min(HARD_BURST_CAP_US as u64);
+    let ceiling = floor_tick.saturating_mul(16).min(HARD_BURST_CAP_US as u64);
     if budget.deadline_us as u64 > ceiling {
         return Err(Error::Config(format!(
             "{label}: step_deadline_us = {} exceeds the {ceiling} us a workload module may \
@@ -2413,7 +2417,8 @@ fn build_module_entry(
     // admission finds — an installed driver among them — carries its
     // `pre_tick_drain` bit here too.
     let pre_tick_drain = manifests.get(name).is_some_and(|m| m.pre_tick_drain);
-    entry[9] = domain_id | (if pre_tick_drain { 0x10 } else { 0 }) | (((id >> 8) as u8 & 0x03) << 5);
+    entry[9] =
+        domain_id | (if pre_tick_drain { 0x10 } else { 0 }) | (((id >> 8) as u8 & 0x03) << 5);
 
     // Track actual params length used
     let params_len: usize;
@@ -2561,7 +2566,8 @@ fn build_module_entry(
     // The on-device `presentation_resolver` can't parse `presentation.shell`,
     // so inject the serialized control-intent table as its `intents` blob (TLV
     // tag 1) directly from the config — the same intents the host lint resolves.
-    // One TLV entry (≤255 bytes); a larger shell would need chunking (not v1).
+    // One TLV entry (≤255 bytes); a larger shell is refused, since the
+    // resolver takes no chunked table.
     if type_name == "presentation_resolver" {
         let intents = crate::presentation_resolver::intents_from_shell(config);
         if !intents.is_empty() {
@@ -3020,34 +3026,31 @@ fn build_module_entry(
         }
     }
 
-    // Tag 15: verify_uri (ASCII URI, extended TLV). The name a peer leaf's
-    // URI SAN must equal under the tls module's `ca_uri` peer-auth profile
-    // — the SPIFFE case. Separate from `verify_hostname` because a URI is
-    // matched byte-for-byte where a hostname has wildcard and label rules;
+    // Tag 15: verify_uri (ASCII URI, extended TLV). The URI a peer leaf's
+    // URI SAN must satisfy under the tls module's `ca_uri` peer-auth
+    // profile — the SPIFFE case: the URI itself, or, when it ends in `/`,
+    // any URI strictly under that path. Separate from `verify_hostname`
+    // because a URI admits none of a hostname's wildcard and label rules;
     // one key feeding both would apply whichever rule the code reached
-    // first.
+    // first. Checked here under the module's own rule
+    // (`check_verify_uri`), so an expectation the module would refuse at
+    // construction is refused at build with the reason.
     if let Some(uri) = module.get("verify_uri").and_then(|v| v.as_str()) {
+        check_verify_uri(uri).map_err(|e| Error::Config(format!("module '{name}': {e}")))?;
         let bytes = uri.as_bytes();
         let n = bytes.len();
-        // The module drops an over-long value rather than truncate it — a
-        // prefix of a SPIFFE ID is another valid SPIFFE ID — so refuse
-        // here instead, where the operator can still see why.
-        const VERIFY_URI_MAX: usize = 256;
-        if n > VERIFY_URI_MAX {
+        if base + extra_len + 4 + n >= entry.len() {
             return Err(Error::Config(format!(
-                "verify_uri is {n} bytes, over the {VERIFY_URI_MAX}-byte limit: \
-                 truncating it would authenticate a different identity"
+                "module '{name}': verify_uri does not fit in the module entry"
             )));
         }
-        if n > 0 && base + extra_len + 4 + n < entry.len() {
-            entry[base + extra_len] = 15;
-            entry[base + extra_len + 1] = 0x00;
-            entry[base + extra_len + 2] = (n >> 8) as u8;
-            entry[base + extra_len + 3] = n as u8;
-            entry[base + extra_len + 4..base + extra_len + 4 + n].copy_from_slice(bytes);
-            extra_len += 4 + n;
-            eprintln!("  verify_uri: {uri}");
-        }
+        entry[base + extra_len] = 15;
+        entry[base + extra_len + 1] = 0x00;
+        entry[base + extra_len + 2] = (n >> 8) as u8;
+        entry[base + extra_len + 3] = n as u8;
+        entry[base + extra_len + 4..base + extra_len + 4 + n].copy_from_slice(bytes);
+        extra_len += 4 + n;
+        eprintln!("  verify_uri: {uri}");
     }
 
     // Tag 14: alpn (RFC 7301 ALPN list, comma-separated ASCII tokens
@@ -3252,6 +3255,60 @@ pub(crate) fn parse_modules_map(
     Ok((entries, names))
 }
 
+/// The longest `verify_uri` the tls module accepts: its `PEER_PRINCIPAL_MAX`,
+/// the longest principal a session reports. A peer is never accepted under
+/// a URI its session could not report, so a longer expectation could never
+/// be satisfied.
+const VERIFY_URI_MAX: usize = 128;
+
+/// The tls module's rule for a `verify_uri` (its `uri_well_formed`): at most
+/// [`VERIFY_URI_MAX`] bytes of RFC 3986 unreserved characters, sub-delims,
+/// `:`, `@` and `/` — no percent-encoding, query or fragment, which would
+/// give one identity several spellings — shaped `scheme://authority/path`
+/// with a non-empty scheme and authority. A bare `spiffe://` names no
+/// authority, and is refused rather than read as every URI of the scheme.
+fn check_verify_uri(uri: &str) -> std::result::Result<(), String> {
+    let b = uri.as_bytes();
+    if b.is_empty() {
+        return Err("verify_uri is empty: under ca_uri the URI is the whole authorisation".into());
+    }
+    if b.len() > VERIFY_URI_MAX {
+        return Err(format!(
+            "verify_uri is {} bytes, over the {VERIFY_URI_MAX}-byte limit: no peer \
+             could be accepted under it, and truncating it would authenticate a \
+             different identity",
+            b.len()
+        ));
+    }
+    if let Some(c) = uri
+        .chars()
+        .find(|&c| !(c.is_ascii_alphanumeric() || "-._~!$&'()*+,;=:@/".contains(c)))
+    {
+        return Err(format!(
+            "verify_uri '{uri}' contains '{c}': only RFC 3986 unreserved characters, \
+             sub-delims, ':', '@' and '/' are matched (no percent-encoding, query or fragment)"
+        ));
+    }
+    let shape = || {
+        format!(
+            "verify_uri '{uri}' must be scheme://authority/path (an exact URI, or a \
+             path prefix ending in '/'), e.g. spiffe://example.org/peers/"
+        )
+    };
+    let (scheme, rest) = uri.split_once("://").ok_or_else(shape)?;
+    let scheme_ok = scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+        && scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c));
+    if !scheme_ok || scheme.contains(':') {
+        return Err(shape());
+    }
+    match rest.find('/') {
+        Some(slash) if slash > 0 => Ok(()),
+        _ => Err(shape()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3274,5 +3331,37 @@ mod tests {
         assert!(validate_yaml_params(&ok, &schema, "store_big").is_ok());
         let unknown = serde_json::json!({ "name": "s", "verdict": { "hex": "00" } });
         assert!(validate_yaml_params(&unknown, &schema, "store_big").is_err());
+    }
+
+    /// `verify_uri` is held to the tls module's URI rule at build: a bare
+    /// scheme, an encoded or query-bearing URI, and one no session could
+    /// report are refused with the reason; a SPIFFE ID or a path prefix
+    /// ending in `/` is taken.
+    #[test]
+    fn verify_uri_is_checked_under_the_modules_rule() {
+        for ok in [
+            "spiffe://example.org/peers/",
+            "spiffe://example.org/workload/a",
+            "spiffe://cluster.test/tenant/peers/device/",
+        ] {
+            assert!(check_verify_uri(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "",
+            "spiffe://",
+            "spiffe://example.org",
+            "spiffe:///peers/",
+            "://example.org/peers/",
+            "1spiffe://example.org/x",
+            "spiffe://example.org/a%2Fb",
+            "spiffe://example.org/a?x=1",
+            "spiffe://example.org/a#frag",
+            "spiffe://example.org/a b",
+        ] {
+            assert!(check_verify_uri(bad).is_err(), "{bad:?} was taken");
+        }
+        let long = format!("spiffe://example.org/{}", "a".repeat(VERIFY_URI_MAX));
+        let err = check_verify_uri(&long).unwrap_err();
+        assert!(err.contains("128"), "the limit is named: {err}");
     }
 }

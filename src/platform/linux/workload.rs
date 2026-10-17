@@ -236,20 +236,24 @@ unsafe fn workload_create(arg: *const u8, arg_len: usize) -> i32 {
         return errno::ENOSYS; // e.g. HARDENED before seccomp/caps land
     }
 
-    // Identity → owner. The null uid is the single-tenant / system workload:
-    // a single-tenant device runs entirely as owner 0, and
-    // when MAX_OWNERS == 1 there are no workload slots to admit into, so the
-    // system owner (slot 0, permanently Active) is the only owner. A non-null
-    // uid must resolve to a plan-allocated owner — the provider references it, it
-    // does not allocate (the plan is authoritative for owners).
-    let owner = if identity == [0u8; 16] {
-        crate::kernel::workload::owner::OWNER_SYSTEM
-    } else {
-        match crate::kernel::exec::scheduler::owners().find_by_uid(identity) {
-            Some(h) => h,
-            None => return errno::EACCES, // no admitted workload for this uid
-        }
+    // Identity → owner. A workload names who it is: the null identity names
+    // no one, and everything keyed on an owner would see every such workload
+    // as one, so it is refused. The identity must resolve to a plan-allocated
+    // owner — the provider references it, it does not allocate (the plan is
+    // authoritative for owners). One identity is one workload, whichever
+    // backend runs it.
+    if identity == [0u8; 16] {
+        return errno::EINVAL;
+    }
+    let Some(owner) = crate::kernel::exec::scheduler::owners().find_by_uid(identity) else {
+        return errno::EACCES; // no admitted workload for this uid
     };
+    let slots = &*core::ptr::addr_of!(LINUX_WORKLOADS);
+    if slots.iter().any(|s| s.in_use && s.owner == owner)
+        || crate::kernel::workload::workload_graph::holds_identity(&identity)
+    {
+        return errno::EEXIST;
+    }
     if !crate::kernel::exec::scheduler::owners().authorize_admit(owner) {
         return errno::EACCES; // draining/revoked owner cannot admit new work
     }

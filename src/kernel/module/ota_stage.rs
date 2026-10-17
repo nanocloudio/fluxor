@@ -47,11 +47,12 @@ const IMAGE_VERSION: u8 = image_layout::GRAPH_SLOT_VERSION;
 const IMAGE_HEADER_SIZE: usize = image_layout::GRAPH_SLOT_HEADER_SIZE;
 const IMAGE_ABI_SURFACE_OFFSET: usize = image_layout::GRAPH_SLOT_ABI_SURFACE_OFFSET;
 
-/// Page-aligned staging buffer. 16 KiB covers the largest page size a
-/// hosted kernel uses (Raspberry Pi OS aarch64 runs 16 KiB pages, and
-/// `mprotect` demands page-aligned addresses); bare-metal targets need
-/// only cache-line alignment, which this satisfies trivially.
-#[repr(C, align(16384))]
+/// Page-aligned staging buffer. 64 KiB is the largest page an aarch64 Linux
+/// kernel uses (`mprotect` works on whole pages, and the buffer's capacity
+/// is a multiple of it, so a protection change never reaches past the
+/// buffer); bare-metal targets need only cache-line alignment, which this
+/// satisfies trivially.
+#[repr(C, align(65536))]
 struct StageBuf {
     bytes: [u8; STAGE_CAPACITY],
 }
