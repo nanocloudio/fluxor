@@ -1274,7 +1274,7 @@ unsafe fn step_reset(s: &mut NvmeState) -> i32 {
                 return fault(s, 3, b"[nvme] CSTS.CFS during reset\0");
             }
             if csts & CSTS_RDY == 0 {
-                dev_log(&*s.syscalls, 3, b"[nvme] Reset: RDY=0\0".as_ptr(), 19);
+                dev_log(&*s.syscalls, 3, c"[nvme] Reset: RDY=0".as_ptr().cast(), 19);
                 s.state = S_CONFIG_QUEUES;
                 s.substate = 0;
                 return 0;
@@ -1360,7 +1360,7 @@ unsafe fn step_enable(s: &mut NvmeState) -> i32 {
                 return fault(s, 8, b"[nvme] CSTS.CFS during enable\0");
             }
             if csts & CSTS_RDY != 0 {
-                dev_log(&*s.syscalls, 3, b"[nvme] Enable: RDY=1\0".as_ptr(), 20);
+                dev_log(&*s.syscalls, 3, c"[nvme] Enable: RDY=1".as_ptr().cast(), 20);
                 s.state = S_IDENTIFY_CONTROLLER;
                 s.substate = 0;
                 s.sq_tail = 0;
@@ -2239,7 +2239,7 @@ unsafe fn poll_io_cqe(s: &mut NvmeState, expected_cid: u16) -> CqeResult {
                         dev_log(
                             &*s.syscalls,
                             2,
-                            b"[nvme] write CQE on wrong queue\0".as_ptr(),
+                            c"[nvme] write CQE on wrong queue".as_ptr().cast(),
                             31,
                         );
                     }
@@ -2272,7 +2272,7 @@ unsafe fn poll_io_cqe(s: &mut NvmeState, expected_cid: u16) -> CqeResult {
                 // A CID nothing here is waiting on: count it and drop it
                 // rather than match it to a request.
                 s.stale_cqes = s.stale_cqes.wrapping_add(1);
-                dev_log(&*s.syscalls, 2, b"[nvme] stray io cqe\0".as_ptr(), 20);
+                dev_log(&*s.syscalls, 2, c"[nvme] stray io cqe".as_ptr().cast(), 20);
             }
         }
 
@@ -2481,7 +2481,7 @@ unsafe fn pump_requests(s: &mut NvmeState) -> bool {
                 ]);
                 if op != 1 {
                     s.req_fill = 0;
-                    dev_log(sys, 3, b"[nvme] req: unknown op\0".as_ptr(), 22);
+                    dev_log(sys, 3, c"[nvme] req: unknown op".as_ptr().cast(), 22);
                     continue;
                 }
                 if nlb == 0 || nlb > MAX_NLB as u32 {
@@ -2579,7 +2579,12 @@ unsafe fn walk_pcie_caps(s: &mut NvmeState) {
     // has no cap list at all.
     let status_cmd = dev_pcie_device_cfg_read32(sys, s.pcie_handle, 0x04);
     if status_cmd == 0xFFFF_FFFF || (status_cmd & 0x0010_0000) == 0 {
-        dev_log(sys, 2, b"[nvme] cap: no capability list\0".as_ptr(), 30);
+        dev_log(
+            sys,
+            2,
+            c"[nvme] cap: no capability list".as_ptr().cast(),
+            30,
+        );
         return;
     }
 
@@ -2730,7 +2735,12 @@ unsafe fn enable_msix(s: &mut NvmeState) -> bool {
     if s.msix_event < 0 {
         let ev = dev_event_create(sys);
         if ev < 0 {
-            dev_log(sys, 2, b"[nvme] msix: event_create failed\0".as_ptr(), 32);
+            dev_log(
+                sys,
+                2,
+                c"[nvme] msix: event_create failed".as_ptr().cast(),
+                32,
+            );
             return false;
         }
         s.msix_event = ev;
@@ -2742,7 +2752,12 @@ unsafe fn enable_msix(s: &mut NvmeState) -> bool {
     let (vec, addr, data) = match dev_pcie_device_msi_alloc(sys, s.pcie_handle, s.msix_event) {
         Some(t) => t,
         None => {
-            dev_log(sys, 2, b"[nvme] msix: alloc_vector failed\0".as_ptr(), 32);
+            dev_log(
+                sys,
+                2,
+                c"[nvme] msix: alloc_vector failed".as_ptr().cast(),
+                32,
+            );
             return false;
         }
     };
@@ -2753,13 +2768,18 @@ unsafe fn enable_msix(s: &mut NvmeState) -> bool {
     // supported; refuse anything else explicitly.
     let tbl_word = dev_pcie_device_cfg_read32(sys, s.pcie_handle, s.msix_cap_offset + 4);
     if tbl_word == 0xFFFF_FFFF {
-        dev_log(sys, 2, b"[nvme] msix: cap read failed\0".as_ptr(), 29);
+        dev_log(sys, 2, c"[nvme] msix: cap read failed".as_ptr().cast(), 29);
         return false;
     }
     let tbl_bir = tbl_word & 0x7;
     let tbl_off = tbl_word & !0x7;
     if tbl_bir != 0 {
-        dev_log(sys, 2, b"[nvme] msix: table not in BAR0\0".as_ptr(), 31);
+        dev_log(
+            sys,
+            2,
+            c"[nvme] msix: table not in BAR0".as_ptr().cast(),
+            31,
+        );
         return false;
     }
     let tbl_virt = s.bar0_virt + tbl_off as u64;
@@ -2779,18 +2799,23 @@ unsafe fn enable_msix(s: &mut NvmeState) -> bool {
     // bit 15 of Msg Ctrl is bit 31 of the dword.
     let cap_word = dev_pcie_device_cfg_read32(sys, s.pcie_handle, s.msix_cap_offset);
     if cap_word == 0xFFFF_FFFF {
-        dev_log(sys, 2, b"[nvme] msix: ctrl read failed\0".as_ptr(), 30);
+        dev_log(sys, 2, c"[nvme] msix: ctrl read failed".as_ptr().cast(), 30);
         return false;
     }
     let new_word = cap_word | (1u32 << 31);
     let w_rc = dev_pcie_device_cfg_write32(sys, s.pcie_handle, s.msix_cap_offset, new_word);
     if w_rc != 0 {
-        dev_log(sys, 2, b"[nvme] msix: ctrl write failed\0".as_ptr(), 31);
+        dev_log(
+            sys,
+            2,
+            c"[nvme] msix: ctrl write failed".as_ptr().cast(),
+            31,
+        );
         return false;
     }
 
     s.msix_enabled = 1;
-    dev_log(sys, 3, b"[nvme] msix enabled\0".as_ptr(), 20);
+    dev_log(sys, 3, c"[nvme] msix enabled".as_ptr().cast(), 20);
     true
 }
 
@@ -2816,7 +2841,12 @@ unsafe fn step_ready(s: &mut NvmeState) -> i32 {
         let rc = (sys.provider_call)(-1, BACKING_PROVIDER_ENABLE, arg.as_mut_ptr(), arg.len());
         if rc == 0 {
             s.pager_registered = 1;
-            dev_log(sys, 3, b"[nvme] pager dispatch registered\0".as_ptr(), 31);
+            dev_log(
+                sys,
+                3,
+                c"[nvme] pager dispatch registered".as_ptr().cast(),
+                31,
+            );
         }
         // On failure: leave `pager_registered = 0` and retry on the
         // next step. This lets us recover from transient issues (e.g.
@@ -3056,7 +3086,12 @@ unsafe fn step_fault(s: &mut NvmeState) -> i32 {
             s.substate = 0;
             s.fault_code = 0;
             s.logged_state = 0xFE;
-            dev_log(sys, 3, b"[nvme] link up, retrying Reset\0".as_ptr(), 30);
+            dev_log(
+                sys,
+                3,
+                c"[nvme] link up, retrying Reset".as_ptr().cast(),
+                30,
+            );
         }
     }
     0
@@ -3834,7 +3869,12 @@ unsafe fn pager_spin(
                 // Any other CID names nothing this driver submitted: count
                 // it and keep spinning.
                 s.stale_cqes = s.stale_cqes.wrapping_add(1);
-                dev_log(&*s.syscalls, 2, b"[nvme] pager: stray cqe\0".as_ptr(), 22);
+                dev_log(
+                    &*s.syscalls,
+                    2,
+                    c"[nvme] pager: stray cqe".as_ptr().cast(),
+                    22,
+                );
             }
         }
         if !made_progress && now_ms(s).saturating_sub(start) > PAGER_SUBMIT_BUDGET_MS {
@@ -4643,7 +4683,7 @@ unsafe fn pager_read_pipelined(
                 dev_log(
                     &*s.syscalls,
                     2,
-                    b"[nvme] pager read: stray cqe\0".as_ptr(),
+                    c"[nvme] pager read: stray cqe".as_ptr().cast(),
                     28,
                 );
             }
@@ -4677,6 +4717,10 @@ unsafe fn pager_read_pipelined(
     0
 }
 
+/// # Safety
+/// Kernel provider-dispatch entry point: `state` is the instance block this
+/// module's `module_new` initialised, and `arg` points to `arg_len` bytes
+/// (may be null when `arg_len` is 0) valid for the call.
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.backing_provider_dispatch"]
 pub unsafe extern "C" fn backing_provider_dispatch(
@@ -4894,13 +4938,20 @@ pub extern "C" fn module_state_size() -> usize {
     core::mem::size_of::<NvmeState>()
 }
 
+/// # Safety
+/// Kernel module-ABI entry point: `syscalls` is the kernel's syscall table,
+/// valid for the module's lifetime.
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_init"]
 pub unsafe extern "C" fn module_init(_syscalls: *const c_void) {}
 
+/// # Safety
+/// Kernel module-ABI entry point: `state` is the loader-owned instance block
+/// of `state_size` bytes, `syscalls` the kernel's syscall table, and `params`
+/// the config TLV blob of `params_len` bytes (may be null when it is empty).
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_new"]
-pub extern "C" fn module_new(
+pub unsafe extern "C" fn module_new(
     _in_chan: i32,
     out_chan: i32,
     ctrl_chan: i32,
@@ -4987,11 +5038,14 @@ pub extern "C" fn module_new(
         s.last_heartbeat_ms = now;
         s.last_tlm_ms = now;
 
-        dev_log(&*s.syscalls, 3, b"[nvme] init\0".as_ptr(), 11);
+        dev_log(&*s.syscalls, 3, c"[nvme] init".as_ptr().cast(), 11);
         0
     }
 }
 
+/// # Safety
+/// Kernel module-ABI entry point: `state` is the instance block this module's
+/// `module_new` initialised, live and exclusively this module's for the call.
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_step"]
 pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {

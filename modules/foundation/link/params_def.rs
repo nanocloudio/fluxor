@@ -17,7 +17,7 @@ define_params! {
     4, jitter_depth, u8, 3
         => |s, d, len| {
             let v = p_u8(d, len, 0, 3);
-            s.jitter_depth = if v > 6 { 6 } else if v < 2 { 2 } else { v };
+            s.jitter_depth = v.clamp(2, 6);
         };
 
     5, pipeline_latency, u16, 1024

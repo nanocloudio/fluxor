@@ -179,6 +179,18 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
             }
         })
     });
+    // As with fmt-check: the cargo clippy above reaches the workspace's
+    // members, and PIC module sources are not members of it. A project with
+    // both lints both, or its modules are the half nothing lints.
+    if has_cargo && has_modules {
+        results.push(if skip.lint {
+            skipped("clippy (modules)")
+        } else {
+            run_step("clippy (modules)", verbose, || {
+                modules_clippy_check(project_root, verbose)
+            })
+        });
+    }
 
     // ───── workspace [lints] opt-in audit ────────────────────────────────
     // Audits the workspace `Cargo.toml` for `[lints] workspace = true`;
@@ -2458,8 +2470,10 @@ fn modules_fmt_check(project_root: &Path, verbose: bool) -> std::result::Result<
     }
 }
 
-/// clippy phase for fmod-only projects: run `clippy-driver` over every
-/// module source with the strict-build target flags.
+/// clippy phase for PIC module sources: run `clippy-driver` over every
+/// module source with the strict-build target flags. The whole lint for
+/// projects without a `Cargo.toml`; alongside the cargo clippy phase for
+/// projects with both, since module sources are not workspace members.
 fn modules_clippy_check(project_root: &Path, verbose: bool) -> std::result::Result<(), String> {
     let report =
         modules_build::clippy_check_modules(project_root, verbose).map_err(|e| e.to_string())?;

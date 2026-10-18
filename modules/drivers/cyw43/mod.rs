@@ -399,9 +399,13 @@ declare_module_state_bytes!(Cyw43State);
 #[link_section = ".text.module_init"]
 pub extern "C" fn module_init(_syscalls: *const c_void) {}
 
+/// # Safety
+/// Kernel module-ABI entry point: `state` is the loader-owned instance block
+/// of `state_size` bytes, `syscalls` the kernel's syscall table, and `params`
+/// the config TLV blob of `params_len` bytes (may be null when it is empty).
 #[no_mangle]
 #[link_section = ".text.module_new"]
-pub extern "C" fn module_new(
+pub unsafe extern "C" fn module_new(
     in_chan: i32,
     out_chan: i32,
     ctrl_chan: i32,
@@ -2882,9 +2886,7 @@ unsafe fn step_rx(s: &mut Cyw43State) {
     // Handle F3 (BT) frame read completion — stub: log and discard
     if s.substep == 11 {
         let r = gspi::txn_poll(s);
-        if r > 0 {
-            s.substep = 0;
-        } else if r < 0 {
+        if r != 0 {
             s.substep = 0;
         }
     }
@@ -3827,11 +3829,7 @@ unsafe fn process_rx_frame(s: &mut Cyw43State) {
                                     + EVT_ETH_HDR_LEN
                                     + EVT_MSG_PREAMBLE
                                     + EVT_MSG_MIN_LEN;
-                                let remaining = if frame_len > evt_data_start {
-                                    frame_len - evt_data_start
-                                } else {
-                                    0
-                                };
+                                let remaining = frame_len.saturating_sub(evt_data_start);
 
                                 if remaining >= ESCAN_RESULT_HDR_LEN + BSS_RSSI_OFF + 2 {
                                     let erp = payload.add(evt_data_start);

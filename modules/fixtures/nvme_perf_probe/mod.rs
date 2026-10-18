@@ -596,13 +596,20 @@ pub extern "C" fn module_state_size() -> usize {
     core::mem::size_of::<NppState>()
 }
 
+/// # Safety
+/// Kernel module-ABI entry point: `syscalls` is the kernel's syscall table,
+/// valid for the module's lifetime.
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_init"]
 pub unsafe extern "C" fn module_init(_syscalls: *const c_void) {}
 
+/// # Safety
+/// Kernel module-ABI entry point: `state` is the loader-owned instance block
+/// of `state_size` bytes, `syscalls` the kernel's syscall table, and `params`
+/// the config TLV blob of `params_len` bytes (may be null when it is empty).
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_new"]
-pub extern "C" fn module_new(
+pub unsafe extern "C" fn module_new(
     _in_chan: i32,
     _out_chan: i32,
     _ctrl_chan: i32,
@@ -642,6 +649,9 @@ pub extern "C" fn module_new(
     }
 }
 
+/// # Safety
+/// Kernel module-ABI entry point: `state` is the instance block this module's
+/// `module_new` initialised, live and exclusively this module's for the call.
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_step"]
 pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
@@ -649,7 +659,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     let sys = &*s.syscalls;
 
     s.step_count = s.step_count.wrapping_add(1);
-    if s.step_count % 1000 == 0 {
+    if s.step_count.is_multiple_of(1000) {
         emit_heartbeat(s);
     }
 
@@ -660,7 +670,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     // that attaches after the workload completes still captures
     // the full table.
     if s.phase == PHASE_DONE {
-        if s.step_count % 5000 == 0 {
+        if s.step_count.is_multiple_of(5000) {
             replay_perf_lines(s);
         }
         return 0;
@@ -686,7 +696,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
             }
             s.err = rc;
             s.phase = PHASE_ERR;
-            dev_log(sys, 1, b"[npp] arena register failed\0".as_ptr(), 27);
+            dev_log(sys, 1, c"[npp] arena register failed".as_ptr().cast(), 27);
             return 0;
         }
         s.arena_id = rc as u8;
@@ -730,7 +740,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
             if verified != s.pages as u32 {
                 s.err = -5; // EIO
                 s.phase = PHASE_ERR;
-                dev_log(sys, 1, b"[npp] seq_r32 verify mismatch\0".as_ptr(), 29);
+                dev_log(sys, 1, c"[npp] seq_r32 verify mismatch".as_ptr().cast(), 29);
                 return 0;
             }
             s.seq_verify_ok = 1;
@@ -761,7 +771,12 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
             if verified != s.pages as u32 {
                 s.err = -5;
                 s.phase = PHASE_ERR;
-                dev_log(sys, 1, b"[npp] seq_r128 verify mismatch\0".as_ptr(), 30);
+                dev_log(
+                    sys,
+                    1,
+                    c"[npp] seq_r128 verify mismatch".as_ptr().cast(),
+                    30,
+                );
                 return 0;
             }
             let m = mbps_from(us, bytes);
@@ -792,13 +807,13 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
             if verified < expected {
                 s.err = -5;
                 s.phase = PHASE_ERR;
-                dev_log(sys, 1, b"[npp] rand_r verify mismatch\0".as_ptr(), 28);
+                dev_log(sys, 1, c"[npp] rand_r verify mismatch".as_ptr().cast(), 28);
                 return 0;
             }
             let m = mbps_from(us, bytes);
             record_phase(s, phase, us, bytes, m);
             s.phase = PHASE_DONE;
-            dev_log(sys, 3, b"[npp] all phases complete\0".as_ptr(), 25);
+            dev_log(sys, 3, c"[npp] all phases complete".as_ptr().cast(), 25);
             3
         }
         _ => 0,

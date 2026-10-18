@@ -172,7 +172,7 @@ unsafe fn smmu_init(s: &mut SmmuCfgState) {
         // MMIO_READ32 returned 0 — probably QEMU (no SMMU)
         s.is_qemu = 1;
         s.initialized = 1;
-        dev_log(sys, 3, b"[smmu_cfg] QEMU stub: no-op\0".as_ptr(), 25);
+        dev_log(sys, 3, c"[smmu_cfg] QEMU stub: no-op".as_ptr().cast(), 25);
         return;
     }
 
@@ -204,7 +204,7 @@ unsafe fn smmu_init(s: &mut SmmuCfgState) {
     mmio_write32(sys, SMMU_BASE + SCR0, scr0);
 
     s.initialized = 1;
-    dev_log(sys, 3, b"[smmu_cfg] initialized\0".as_ptr(), 21);
+    dev_log(sys, 3, c"[smmu_cfg] initialized".as_ptr().cast(), 21);
 }
 
 // ============================================================================
@@ -310,7 +310,7 @@ unsafe fn check_faults(s: &mut SmmuCfgState) {
     let _far_hi = mmio_read32(sys, SMMU_BASE + GFAR_HI);
     let _synr0 = mmio_read32(sys, SMMU_BASE + GFSYNR0);
 
-    dev_log(sys, 1, b"[smmu_cfg] FAULT detected\0".as_ptr(), 25);
+    dev_log(sys, 1, c"[smmu_cfg] FAULT detected".as_ptr().cast(), 25);
 
     // Clear fault
     mmio_write32(sys, SMMU_BASE + GFSR, gfsr_val);
@@ -320,6 +320,10 @@ unsafe fn check_faults(s: &mut SmmuCfgState) {
 // Provider dispatch
 // ============================================================================
 
+/// # Safety
+/// Kernel provider-dispatch entry point: `state` is the instance block this
+/// module's `module_new` initialised, and `arg` points to `arg_len` bytes
+/// (may be null when `arg_len` is 0) valid for the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn smmu_cfg_dispatch(
     state: *mut u8,
@@ -421,13 +425,20 @@ pub extern "C" fn module_state_size() -> usize {
     core::mem::size_of::<SmmuCfgState>()
 }
 
+/// # Safety
+/// Kernel module-ABI entry point: `syscalls` is the kernel's syscall table,
+/// valid for the module's lifetime.
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_init"]
 pub unsafe extern "C" fn module_init(_syscalls: *const c_void) {}
 
+/// # Safety
+/// Kernel module-ABI entry point: `state` is the loader-owned instance block
+/// of `state_size` bytes, `syscalls` the kernel's syscall table, and `params`
+/// the config TLV blob of `params_len` bytes (may be null when it is empty).
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_new"]
-pub extern "C" fn module_new(
+pub unsafe extern "C" fn module_new(
     in_chan: i32,
     out_chan: i32,
     ctrl_chan: i32,
@@ -454,11 +465,14 @@ pub extern "C" fn module_new(
         // Initialize SMMU
         smmu_init(s);
 
-        dev_log(&*s.syscalls, 3, b"[smmu_cfg] ready\0".as_ptr(), 15);
+        dev_log(&*s.syscalls, 3, c"[smmu_cfg] ready".as_ptr().cast(), 15);
         0
     }
 }
 
+/// # Safety
+/// Kernel module-ABI entry point: `state` is the instance block this module's
+/// `module_new` initialised, live and exclusively this module's for the call.
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_step"]
 pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {

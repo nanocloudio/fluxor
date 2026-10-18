@@ -120,14 +120,17 @@ pub extern "C" fn module_new(
         s.step_count = 0;
         s.delay_steps = 3;
         s.cycles = 0;
-        dev_log(&*s.syscalls, 3, b"[iso_heap] init\0".as_ptr(), 16);
+        dev_log(&*s.syscalls, 3, c"[iso_heap] init".as_ptr().cast(), 16);
         0 // Ready
     }
 }
 
+/// # Safety
+/// Kernel module-ABI entry point: `state` is the instance block this module's
+/// `module_new` initialised, live and exclusively this module's for the call.
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
     unsafe {
         let s = &mut *(state as *mut IsoHeapState);
         let sys = &*s.syscalls;
@@ -166,7 +169,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         (sys.heap_free)(q);
 
         s.cycles += 1;
-        if s.cycles <= 4 || s.cycles % 256 == 0 {
+        if s.cycles <= 4 || s.cycles.is_multiple_of(256) {
             let mut line = [0u8; 64];
             let prefix = b"[iso_heap] cycle ok ptr=0x";
             line[..prefix.len()].copy_from_slice(prefix);

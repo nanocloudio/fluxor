@@ -135,9 +135,13 @@ pub extern "C" fn module_state_size() -> u32 {
 #[link_section = ".text.module_init"]
 pub extern "C" fn module_init(_syscalls: *const c_void) {}
 
+/// # Safety
+/// Kernel module-ABI entry point: `state` is the loader-owned instance block
+/// of `state_size` bytes, `syscalls` the kernel's syscall table, and `params`
+/// the config TLV blob of `params_len` bytes (may be null when it is empty).
 #[no_mangle]
 #[link_section = ".text.module_new"]
-pub extern "C" fn module_new(
+pub unsafe extern "C" fn module_new(
     in_chan: i32,
     _out_chan: i32,
     _ctrl_chan: i32,
@@ -184,9 +188,12 @@ pub extern "C" fn module_new(
     }
 }
 
+/// # Safety
+/// Kernel module-ABI entry point: `state` is the instance block this module's
+/// `module_new` initialised, live and exclusively this module's for the call.
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
     // Reports via the return value and via deliberately-raised faults.
     unsafe {
         let s = &mut *(state as *mut IsoProbeState);

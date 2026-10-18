@@ -866,6 +866,10 @@ unsafe fn copy_program(
 // Provider dispatch
 // ============================================================================
 
+/// # Safety
+/// Kernel provider-dispatch entry point: `state` is the instance block this
+/// module's `module_new` initialised, and `arg` points to `arg_len` bytes
+/// (may be null when `arg_len` is 0) valid for the call.
 #[link_section = ".text.module_provider_dispatch"]
 #[export_name = "module_provider_dispatch"]
 pub unsafe extern "C" fn pio_dispatch(
@@ -1746,13 +1750,20 @@ pub extern "C" fn module_state_size() -> usize {
 // state-arena demand is summable host-side.
 declare_module_state_bytes!(PioState);
 
+/// # Safety
+/// Kernel module-ABI entry point: `syscalls` is the kernel's syscall table,
+/// valid for the module's lifetime.
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_init"]
 pub unsafe extern "C" fn module_init(_syscalls: *const c_void) {}
 
+/// # Safety
+/// Kernel module-ABI entry point: `state` is the loader-owned instance block
+/// of `state_size` bytes, `syscalls` the kernel's syscall table, and `params`
+/// the config TLV blob of `params_len` bytes (may be null when it is empty).
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_new"]
-pub extern "C" fn module_new(
+pub unsafe extern "C" fn module_new(
     in_chan: i32,
     out_chan: i32,
     ctrl_chan: i32,
@@ -1789,6 +1800,9 @@ pub extern "C" fn module_provides_contract() -> u32 {
     0x0004 // HAL_PIO
 }
 
+/// # Safety
+/// Kernel module-ABI entry point: `state` is the instance block this module's
+/// `module_new` initialised, live and exclusively this module's for the call.
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_step"]
 pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
@@ -1903,19 +1917,17 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
             }
 
             // Check DMA completion
-            if (*rp).dma_active != 0 && (*rp).dma_fd >= 0 {
-                if dma_fd_poll(sys, (*rp).dma_fd) {
-                    // DMA buffer full
-                    if (*rp).pull_ready != 0 {
-                        // Overflow — module hasn't read previous buffer
-                        (*rp).overflow_count = (*rp).overflow_count.wrapping_add(1);
-                    }
-                    // Swap: module can now read the completed buffer
-                    (*rp).active_buf ^= 1;
-                    (*rp).pull_ready = 1;
-                    (*rp).pull_count = RX_BUF_WORDS as u16;
-                    (*rp).dma_active = 0;
+            if (*rp).dma_active != 0 && (*rp).dma_fd >= 0 && dma_fd_poll(sys, (*rp).dma_fd) {
+                // DMA buffer full
+                if (*rp).pull_ready != 0 {
+                    // Overflow — module hasn't read previous buffer
+                    (*rp).overflow_count = (*rp).overflow_count.wrapping_add(1);
                 }
+                // Swap: module can now read the completed buffer
+                (*rp).active_buf ^= 1;
+                (*rp).pull_ready = 1;
+                (*rp).pull_count = RX_BUF_WORDS as u16;
+                (*rp).dma_active = 0;
             }
 
             // Start next DMA capture if idle

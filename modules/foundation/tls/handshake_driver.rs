@@ -433,6 +433,9 @@ impl HandshakeDriver {
         total <= SCRATCH_SIZE && self.in_len >= total
     }
 
+    /// # Safety
+    /// No obligation beyond the signature: both raw copies are bounded by
+    /// `total <= SCRATCH_SIZE` and `total <= in_len`, checked above.
     pub unsafe fn read_handshake_message(&mut self) -> Option<([u8; SCRATCH_SIZE], usize, u8)> {
         if self.in_len < 4 {
             return None;
@@ -498,6 +501,10 @@ impl HandshakeDriver {
 /// RecvClientFinished; client-side (verifying the server) goes to
 /// RecvFinished. Caller picks the next state via `driver.is_server`
 /// implicitly.
+///
+/// # Safety
+/// No obligation beyond the signature; unsafe only because it reads the
+/// message through [`HandshakeDriver::read_handshake_message`].
 pub unsafe fn pump_recv_certificate_verify_core(driver: &mut HandshakeDriver) -> bool {
     let (data, len, msg_type) = match driver.read_handshake_message() {
         Some(t) => t,
@@ -587,7 +594,7 @@ pub unsafe fn pump_recv_certificate_verify_core(driver: &mut HandshakeDriver) ->
 /// Called only after the chain was accepted, so downstream code's use of
 /// `peer_cert_pubkey_len > 0` as the marker that a real identity was bound
 /// stays true.
-pub unsafe fn bind_peer_cert_key_core(driver: &mut HandshakeDriver, cert_der: &[u8]) -> u32 {
+pub fn bind_peer_cert_key_core(driver: &mut HandshakeDriver, cert_der: &[u8]) -> u32 {
     let cert = match parse_certificate(cert_der) {
         Some(c) => c,
         None => return CERT_ERR_MALFORMED,
@@ -623,7 +630,7 @@ pub enum RsaPump {
 /// Ed25519 one spends one step of the driver's own job, walking `ec_bits`
 /// scalar bits (0: the whole walk). The caller has already decided this
 /// driver may use the instance job.
-pub unsafe fn rsa_verify_pump_core(
+pub fn rsa_verify_pump_core(
     driver: &mut HandshakeDriver,
     job: &mut RsaVerifyJob,
     anchor: &[u8],

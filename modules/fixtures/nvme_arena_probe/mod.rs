@@ -311,13 +311,20 @@ pub extern "C" fn module_state_size() -> usize {
     core::mem::size_of::<NapState>()
 }
 
+/// # Safety
+/// Kernel module-ABI entry point: `syscalls` is the kernel's syscall table,
+/// valid for the module's lifetime.
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_init"]
 pub unsafe extern "C" fn module_init(_syscalls: *const c_void) {}
 
+/// # Safety
+/// Kernel module-ABI entry point: `state` is the loader-owned instance block
+/// of `state_size` bytes, `syscalls` the kernel's syscall table, and `params`
+/// the config TLV blob of `params_len` bytes (may be null when it is empty).
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_new"]
-pub extern "C" fn module_new(
+pub unsafe extern "C" fn module_new(
     _in_chan: i32,
     _out_chan: i32,
     _ctrl_chan: i32,
@@ -354,6 +361,9 @@ pub extern "C" fn module_new(
     }
 }
 
+/// # Safety
+/// Kernel module-ABI entry point: `state` is the instance block this module's
+/// `module_new` initialised, live and exclusively this module's for the call.
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_step"]
 pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
@@ -363,7 +373,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     // Sparse heartbeat — every ~1000 steps so we don't flood log_net.
     // At tick_us=1000 that's once per second.
     s.step_count = s.step_count.wrapping_add(1);
-    if s.step_count % 1000 == 0 {
+    if s.step_count.is_multiple_of(1000) {
         emit_heartbeat(s);
     }
 
@@ -388,7 +398,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
             if rc < 0 {
                 s.err = rc;
                 s.state = ST_ERR;
-                dev_log(sys, 1, b"[nap] register failed\0".as_ptr(), 21);
+                dev_log(sys, 1, c"[nap] register failed".as_ptr().cast(), 21);
                 return 0;
             }
             s.arena_id = rc as u8;
@@ -548,7 +558,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
             // Re-emit hb + perf every ~5 s so a late-attaching log
             // observer eventually catches the success line. The cadence
             // matches the rest of the project's heartbeat period.
-            if s.step_count % 5000 == 0 {
+            if s.step_count.is_multiple_of(5000) {
                 emit_heartbeat(s);
                 emit_perf(s);
             }
@@ -556,7 +566,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
         }
         _ => {
             // ST_ERR — re-emit failure state on the same cadence.
-            if s.step_count % 5000 == 0 {
+            if s.step_count.is_multiple_of(5000) {
                 emit_heartbeat(s);
             }
             0

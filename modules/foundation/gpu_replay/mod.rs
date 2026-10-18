@@ -180,13 +180,20 @@ pub extern "C" fn module_arena_size() -> u32 {
     HEAP_BYTES
 }
 
+/// # Safety
+/// Kernel module-ABI entry point: `syscalls` is the kernel's syscall table,
+/// valid for the module's lifetime.
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[cfg_attr(not(feature = "host-test"), link_section = ".text.module_init")]
 pub unsafe extern "C" fn module_init(_syscalls: *const c_void) {}
 
+/// # Safety
+/// Kernel module-ABI entry point: `state` is the loader-owned instance block
+/// of `state_size` bytes, `syscalls` the kernel's syscall table, and `params`
+/// the config TLV blob of `params_len` bytes (may be null when it is empty).
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[cfg_attr(not(feature = "host-test"), link_section = ".text.module_new")]
-pub extern "C" fn module_new(
+pub unsafe extern "C" fn module_new(
     in_chan: i32,
     out_chan: i32,
     _ctrl_chan: i32,
@@ -241,6 +248,9 @@ pub extern "C" fn module_new(
     0
 }
 
+/// # Safety
+/// Kernel module-ABI entry point: `state` is the instance block this module's
+/// `module_new` initialised, live and exclusively this module's for the call.
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[cfg_attr(not(feature = "host-test"), link_section = ".text.module_step")]
 pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {

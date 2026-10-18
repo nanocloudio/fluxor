@@ -215,9 +215,13 @@ pub extern "C" fn module_state_size() -> u32 {
 #[link_section = ".text.module_init"]
 pub extern "C" fn module_init(_syscalls: *const c_void) {}
 
+/// # Safety
+/// Kernel module-ABI entry point: `state` is the loader-owned instance block
+/// of `state_size` bytes, `syscalls` the kernel's syscall table, and `params`
+/// the config TLV blob of `params_len` bytes (may be null when it is empty).
 #[no_mangle]
 #[link_section = ".text.module_new"]
-pub extern "C" fn module_new(
+pub unsafe extern "C" fn module_new(
     in_chan: i32,
     out_chan: i32,
     _ctrl_chan: i32,
@@ -317,7 +321,7 @@ pub extern "C" fn module_new(
             dev_log(
                 &*seq.syscalls,
                 1,
-                b"[seq] error: no presets provided\0".as_ptr(),
+                c"[seq] error: no presets provided".as_ptr().cast(),
                 31,
             );
             return -10;
@@ -569,7 +573,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     if roll < seq.humanize_prob {
                         let jitter_frames = (seq.timing_jitter_ms as u32 * seq.sample_rate) / 1000;
                         if jitter_frames > 0 {
-                            let span = (jitter_frames * 2 + 1) as u32;
+                            let span = jitter_frames * 2 + 1;
                             let r = (lfsr_next(&mut seq.lfsr) % span) as i32;
                             let jitter = r - (jitter_frames as i32);
                             abs_frame = (abs_frame as i32 + jitter).max(0) as u32;
@@ -633,7 +637,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             // --- Conditional: play every N loops ---
             if !is_fill && seq.play_every_n_loops > 1 {
                 let n = seq.play_every_n_loops as u32;
-                if n > 0 && (seq.loop_count % n) != 0 {
+                if n > 0 && !seq.loop_count.is_multiple_of(n) {
                     seq.last_value_sent = seq.current_value;
                     seq.started = 1;
                     seq.loop_just_ended = 0;
@@ -721,7 +725,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     if roll < seq.humanize_prob {
                         let jitter_frames = (seq.timing_jitter_ms as u32 * seq.sample_rate) / 1000;
                         if jitter_frames > 0 {
-                            let span = (jitter_frames * 2 + 1) as u32;
+                            let span = jitter_frames * 2 + 1;
                             let r = (lfsr_next(&mut seq.lfsr) % span) as i32;
                             let jitter = r - (jitter_frames as i32);
                             abs_frame = (abs_frame as i32 + jitter).max(0) as u32;

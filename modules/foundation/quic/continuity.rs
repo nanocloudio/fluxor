@@ -1674,6 +1674,10 @@ unsafe fn mirror_delta(
 }
 
 /// Mirror a 1-RTT packet about to go out: its number and ciphertext.
+///
+/// # Safety
+/// `sys` is the kernel's syscall table and `cont_out` a channel this
+/// module owns (or negative when unwired); the delta is written through it.
 pub unsafe fn mirror_send(
     sys: &SyscallTable,
     cont_out: i32,
@@ -1689,6 +1693,10 @@ pub unsafe fn mirror_send(
 }
 
 /// Mirror the consumption of an inbound 1-RTT packet.
+///
+/// # Safety
+/// `sys` is the kernel's syscall table and `cont_out` a channel this
+/// module owns (or negative when unwired); the delta is written through it.
 pub unsafe fn mirror_recv(
     sys: &SyscallTable,
     cont_out: i32,
@@ -1708,6 +1716,10 @@ pub unsafe fn mirror_recv(
 /// the secrets it already holds; the delta carries only the phase the
 /// primary is now in, so a shadow that has drifted is caught rather than
 /// realigned.
+///
+/// # Safety
+/// `sys` is the kernel's syscall table and `cont_out` a channel this
+/// module owns (or negative when unwired); the delta is written through it.
 pub unsafe fn mirror_key_phase(
     sys: &SyscallTable,
     cont_out: i32,
@@ -1728,6 +1740,10 @@ pub fn mirror_strict(conn: &QuicConnection) -> bool {
 /// number is held until the standby confirms the delta, and released by
 /// [`cont_apply_delta_ack`]. A hold that overflows abandons the mirror —
 /// the coordinator learns of it — rather than silently dropping a number.
+///
+/// # Safety
+/// `sys` is the kernel's syscall table and `cont_out` a channel this
+/// module owns (or negative when unwired); deltas are written through it.
 pub unsafe fn on_one_rtt_received(
     sys: &SyscallTable,
     cont_out: i32,
@@ -1760,6 +1776,10 @@ pub unsafe fn on_one_rtt_received(
 /// behind it protects nothing; and the coordinator is owed an abort so the
 /// stale shadow is never activated. The abort rides the channel that just
 /// refused a delta, so it is marked and sent from the step until it goes.
+///
+/// # Safety
+/// `sys` is the kernel's syscall table and `cont_out` a channel this
+/// module owns (or negative when unwired); the abort is written through it.
 pub unsafe fn mirror_abandon(sys: &SyscallTable, cont_out: i32, conn: &mut QuicConnection) {
     conn.cont_mirror = false;
     conn.cont_horizon_steps = 0;
@@ -1893,7 +1913,7 @@ unsafe fn cont_service(s: &mut QuicState) {
 /// current, and the phase after that is derived. One definition, because
 /// the standby applying a mirrored flip and the primary that flipped must
 /// arrive at identical keys.
-pub unsafe fn promote_key_phase(c: &mut QuicConnection) {
+pub fn promote_key_phase(c: &mut QuicConnection) {
     let hl = c.one_rtt.secret_len as usize;
     if hl == 0 {
         return;

@@ -110,9 +110,13 @@ pub extern "C" fn module_state_size() -> u32 {
 #[link_section = ".text.module_init"]
 pub extern "C" fn module_init(_syscalls: *const c_void) {}
 
+/// # Safety
+/// Kernel module-ABI entry point: `state` is the loader-owned instance block
+/// of `state_size` bytes, `syscalls` the kernel's syscall table, and `params`
+/// the config TLV blob of `params_len` bytes (may be null when it is empty).
 #[no_mangle]
 #[link_section = ".text.module_new"]
-pub extern "C" fn module_new(
+pub unsafe extern "C" fn module_new(
     _in_chan: i32,
     _out_chan: i32,
     _ctrl_chan: i32,
@@ -162,7 +166,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         s.phys = phys;
 
         if phys == 0 {
-            dev_log(sys, 1, b"[dma_probe] allocation failed\0".as_ptr(), 28);
+            dev_log(sys, 1, c"[dma_probe] allocation failed".as_ptr().cast(), 28);
             return 1;
         }
 
@@ -207,9 +211,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         dev_log(sys, 3, mp, pos);
 
         if readback != MAGIC {
-            dev_log(sys, 1, b"[dma_probe] MAGIC MISMATCH\0".as_ptr(), 25);
+            dev_log(sys, 1, c"[dma_probe] MAGIC MISMATCH".as_ptr().cast(), 25);
         } else {
-            dev_log(sys, 3, b"[dma_probe] OK\0".as_ptr(), 14);
+            dev_log(sys, 3, c"[dma_probe] OK".as_ptr().cast(), 14);
         }
 
         1 // Done

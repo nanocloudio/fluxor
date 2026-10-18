@@ -199,9 +199,13 @@ pub extern "C" fn module_state_size() -> u32 {
 #[link_section = ".text.module_init"]
 pub extern "C" fn module_init(_syscalls: *const c_void) {}
 
+/// # Safety
+/// Kernel module-ABI entry point: `state` is the loader-owned instance block
+/// of `state_size` bytes, `syscalls` the kernel's syscall table, and `params`
+/// the config TLV blob of `params_len` bytes (may be null when it is empty).
 #[no_mangle]
 #[link_section = ".text.module_new"]
-pub extern "C" fn module_new(
+pub unsafe extern "C" fn module_new(
     in_chan: i32,
     _out_chan: i32,
     _ctrl_chan: i32,
@@ -359,7 +363,7 @@ unsafe fn step_init(s: &mut I2sState) -> i32 {
     }
 
     // Set stream consumption rate for stream_time (Q16.16: sample_rate << 16)
-    let rate_q16 = (s.sample_rate as u32) << 16;
+    let rate_q16 = s.sample_rate << 16;
     let mut rate_arg = rate_q16.to_le_bytes();
     (provider_call)(handle, DEV_PIO_STREAM_SET_RATE, rate_arg.as_mut_ptr(), 4);
 

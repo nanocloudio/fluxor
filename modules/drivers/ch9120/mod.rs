@@ -495,7 +495,7 @@ unsafe fn step_configure(s: &mut Ch9120State) -> i32 {
             let handle = s.uart_handle;
             let sys = &*s.syscalls;
             let result = dev_uart_poll(sys, handle);
-            if result > 0 || result == 0 {
+            if result >= 0 {
                 // CH9120 may not echo all commands — advance regardless.
                 s.cmd_substep = CmdSubstep::Next;
             } else {
@@ -549,7 +549,7 @@ unsafe fn step_save_exit(s: &mut Ch9120State) -> i32 {
             let handle = s.uart_handle;
             let sys = &*s.syscalls;
             let result = dev_uart_poll(sys, handle);
-            if result > 0 || result == 0 {
+            if result >= 0 {
                 // CMD_EXEC triggers chip reset; may not get response
                 s.phase = Ch9120Phase::ReopenUart;
             } else {
@@ -610,7 +610,7 @@ unsafe fn step_running(s: &mut Ch9120State) -> i32 {
     // 1. Drain any pending UART TX from previous step
     if s.tx_pending > 0 {
         let result = dev_uart_poll(sys, uart);
-        if result > 0 || result < 0 {
+        if result != 0 {
             s.tx_pending = 0;
             s.tx_offset = 0;
         }
@@ -669,9 +669,13 @@ declare_module_state_bytes!(Ch9120State);
 #[link_section = ".text.module_init"]
 pub extern "C" fn module_init(_syscalls: *const c_void) {}
 
+/// # Safety
+/// Kernel module-ABI entry point: `state` is the loader-owned instance block
+/// of `state_size` bytes, `syscalls` the kernel's syscall table, and `params`
+/// the config TLV blob of `params_len` bytes (may be null when it is empty).
 #[no_mangle]
 #[link_section = ".text.module_new"]
-pub extern "C" fn module_new(
+pub unsafe extern "C" fn module_new(
     in_chan: i32,
     out_chan: i32,
     _ctrl_chan: i32,
@@ -747,12 +751,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 }
 
 #[no_mangle]
-pub extern "C" fn module_drop(state: *mut u8, _state_size: usize, _syscalls: *const c_void) {
+pub extern "C" fn module_drop(_state: *mut u8, _state_size: usize, _syscalls: *const c_void) {
     // Kernel's release_module_handles() cleans up UART and GPIO handles
     // automatically on module finish. Nothing extra needed here.
-    if state.is_null() {
-        return;
-    }
 }
 
 // Wasm entry-point wrappers — no-op on non-wasm targets. See

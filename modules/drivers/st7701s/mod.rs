@@ -16,6 +16,7 @@
 //! Uses 4 autonomous PIO state machines across 2 PIO blocks:
 //!   - Sync PIO (param `pio_sync`, default 1): hsync SM0 + vsync SM1
 //!   - Data PIO (param `pio_data`, default 2): rgb_de SM0 + rgb SM1
+//!
 //! All frame timing is handled by PIO hardware with IRQ coordination.
 //! CPU only feeds pixel data via DMA to the rgb SM's TX FIFO.
 
@@ -302,7 +303,7 @@ mod params_def {
         16, source_rows, u16, 32
             => |s, d, len| {
                 let v = p_u16(d, len, 0, 32);
-                s.src_rows = if v < 1 { 1 } else if v > 32 { 32 } else { v };
+                s.src_rows = v.clamp(1, 32);
             };
     }
 }
@@ -585,8 +586,9 @@ fn build_pinctrl(
     val
 }
 
-/// Build SHIFTCTRL register value.
-fn build_shiftctrl(
+/// The SHIFTCTRL fields one state machine is configured with.
+#[derive(Clone, Copy)]
+struct ShiftCtrl {
     autopull: bool,
     autopush: bool,
     pull_thresh: u8,
@@ -595,7 +597,34 @@ fn build_shiftctrl(
     in_shiftdir: bool,
     fjoin_tx: bool,
     fjoin_rx: bool,
-) -> u32 {
+}
+
+impl ShiftCtrl {
+    /// Every field clear: the register's reset layout.
+    const RESET: Self = Self {
+        autopull: false,
+        autopush: false,
+        pull_thresh: 0,
+        push_thresh: 0,
+        out_shiftdir: false,
+        in_shiftdir: false,
+        fjoin_tx: false,
+        fjoin_rx: false,
+    };
+}
+
+/// Build SHIFTCTRL register value.
+fn build_shiftctrl(c: ShiftCtrl) -> u32 {
+    let ShiftCtrl {
+        autopull,
+        autopush,
+        pull_thresh,
+        push_thresh,
+        out_shiftdir,
+        in_shiftdir,
+        fjoin_tx,
+        fjoin_rx,
+    } = c;
     // SHIFTCTRL layout:
     // [15:0]  _reserved
     // [16]    AUTOPUSH
@@ -739,9 +768,13 @@ pub extern "C" fn module_state_size() -> u32 {
 #[link_section = ".text.module_init"]
 pub extern "C" fn module_init(_syscalls: *const c_void) {}
 
+/// # Safety
+/// Kernel module-ABI entry point: `state` is the loader-owned instance block
+/// of `state_size` bytes, `syscalls` the kernel's syscall table, and `params`
+/// the config TLV blob of `params_len` bytes (may be null when it is empty).
 #[no_mangle]
 #[link_section = ".text.module_new"]
-pub extern "C" fn module_new(
+pub unsafe extern "C" fn module_new(
     in_chan: i32,
     _out_chan: i32,
     _ctrl_chan: i32,
@@ -974,7 +1007,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     pio,
                     0,
                     REG_SHIFTCTRL,
-                    build_shiftctrl(false, false, 0, 0, false, false, true, false),
+                    build_shiftctrl(ShiftCtrl {
+                        fjoin_tx: true,
+                        ..ShiftCtrl::RESET
+                    }),
                 );
                 // fjoin_tx=true for 8-deep TX FIFO
 
@@ -1008,7 +1044,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     pio,
                     1,
                     REG_SHIFTCTRL,
-                    build_shiftctrl(false, false, 0, 0, false, false, true, false),
+                    build_shiftctrl(ShiftCtrl {
+                        fjoin_tx: true,
+                        ..ShiftCtrl::RESET
+                    }),
                 );
 
                 // Setup pin funcsel for PIO
@@ -1140,7 +1179,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     pio,
                     0,
                     REG_SHIFTCTRL,
-                    build_shiftctrl(false, false, 0, 0, false, false, true, false),
+                    build_shiftctrl(ShiftCtrl {
+                        fjoin_tx: true,
+                        ..ShiftCtrl::RESET
+                    }),
                 );
 
                 // Configure SM1 (rgb): no sideset, OUT 16 pins
@@ -1167,7 +1209,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     pio,
                     1,
                     REG_SHIFTCTRL,
-                    build_shiftctrl(false, false, 0, 0, false, false, true, false),
+                    build_shiftctrl(ShiftCtrl {
+                        fjoin_tx: true,
+                        ..ShiftCtrl::RESET
+                    }),
                 );
                 // autopull=false, pull_thresh=0(default), out_shiftdir=LEFT/MSB(vendor default), fjoin_tx=true
 

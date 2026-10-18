@@ -818,6 +818,11 @@ pub fn clippy_check_modules(project_root: &Path, verbose: bool) -> Result<Module
                 .find(|l| l.starts_with("error") || l.starts_with("warning"))
                 .unwrap_or("clippy reported errors")
                 .to_string();
+            // The summary carries one line per module; `--verbose` shows
+            // the whole diagnostic so a failure can be fixed from the log.
+            if verbose {
+                eprintln!("[modules] clippy {name}:\n{stderr}");
+            }
             report.failed.push((name, first));
         }
     }

@@ -107,7 +107,7 @@ pub extern "C" fn module_new(
         s.out_buf = [0u8; BUF_LEN];
         s.out_head = 0;
         s.out_len = 0;
-        dev_log(&*s.syscalls, 3, b"[iso_transform] init\0".as_ptr(), 20);
+        dev_log(&*s.syscalls, 3, c"[iso_transform] init".as_ptr().cast(), 20);
         0 // Ready
     }
 }

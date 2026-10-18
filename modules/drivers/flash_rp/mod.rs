@@ -21,7 +21,7 @@
 //!
 //! **Outputs:**
 //!   - out[0]: `input::button` raw transitions (OctetStream, 1 byte
-//!             per debounced edge; 0x01=pressed, 0x00=released)
+//!     per debounced edge; 0x01=pressed, 0x00=released)
 //!   - out[1]: Blob stream (IOCTL_NOTIFY indexed, 512B chunks, IOCTL_EOF)
 
 #![no_std]
@@ -278,9 +278,13 @@ pub extern "C" fn module_deferred_ready() -> i32 {
     1
 }
 
+/// # Safety
+/// Kernel module-ABI entry point: `state` is the loader-owned instance block
+/// of `state_size` bytes, `syscalls` the kernel's syscall table, and `params`
+/// the config TLV blob of `params_len` bytes (may be null when it is empty).
 #[no_mangle]
 #[link_section = ".text.module_new"]
-pub extern "C" fn module_new(
+pub unsafe extern "C" fn module_new(
     _in_chan: i32,
     out_chan: i32,
     _ctrl_chan: i32,
@@ -444,7 +448,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
         if level < 0 {
             s.error_count = s.error_count.wrapping_add(1);
-            if s.error_count == 1 || s.error_count % 5000 == 0 {
+            if s.error_count == 1 || s.error_count.is_multiple_of(5000) {
                 let mut lb = [0u8; 32];
                 let bp = lb.as_mut_ptr();
                 let mut p = 0usize;
@@ -581,6 +585,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 /// Provider dispatch function — called by kernel when modules use
 /// PARAM_STORE/DELETE/CLEAR_ALL syscalls. The kernel prepends the caller's
 /// module_id to the arg buffer before forwarding here.
+///
+/// # Safety
+/// Kernel provider-dispatch entry point: `state` is the instance block this
+/// module's `module_new` initialised, and `arg` points to `arg_len` bytes
+/// (may be null when `arg_len` is 0) valid for the call.
 #[export_name = "module_flash_store_dispatch"]
 #[link_section = ".text.flash_store_dispatch"]
 pub unsafe extern "C" fn flash_store_dispatch(
@@ -686,10 +695,8 @@ unsafe fn delete_param(s: &mut FlashState, sys: &SyscallTable, module_id: u8, ta
     if s.free_offset == 0 {
         return 0; // nothing to delete in virgin sector
     }
-    if (s.free_offset as usize) + entry_size > SECTOR_SIZE {
-        if compact(s, sys) < 0 {
-            return -12;
-        }
+    if (s.free_offset as usize) + entry_size > SECTOR_SIZE && compact(s, sys) < 0 {
+        return -12;
     }
     if append_entry(s, sys, module_id, tag, FLAG_TOMBSTONE, core::ptr::null(), 0) < 0 {
         return -1;
@@ -704,10 +711,8 @@ unsafe fn clear_all(s: &mut FlashState, sys: &SyscallTable, module_id: u8) -> i3
     if s.free_offset == 0 {
         return 0;
     }
-    if (s.free_offset as usize) + entry_size > SECTOR_SIZE {
-        if compact(s, sys) < 0 {
-            return -12;
-        }
+    if (s.free_offset as usize) + entry_size > SECTOR_SIZE && compact(s, sys) < 0 {
+        return -12;
     }
     if append_entry(s, sys, module_id, 0, FLAG_CLEAR_ALL, core::ptr::null(), 0) < 0 {
         return -1;
@@ -1102,7 +1107,8 @@ unsafe fn init_free_offset(s: &mut FlashState) {
     let sector = (XIP_BASE + s.store_offset) as *const u8;
     let magic = read_u32_xip(sector);
     if magic != STORE_MAGIC {
-        s.free_offset = if magic == 0xFFFF_FFFF { 0 } else { 0 };
+        // Erased (all-ones) or foreign: either way the store starts empty.
+        s.free_offset = 0;
         return;
     }
     let mut off = HEADER_SIZE;

@@ -137,13 +137,20 @@ pub extern "C" fn module_state_size() -> usize {
     core::mem::size_of::<FsTapState>()
 }
 
+/// # Safety
+/// Kernel module-ABI entry point: `syscalls` is the kernel's syscall table,
+/// valid for the module's lifetime.
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_init"]
 pub unsafe extern "C" fn module_init(_syscalls: *const c_void) {}
 
+/// # Safety
+/// Kernel module-ABI entry point: `state` is the loader-owned instance block
+/// of `state_size` bytes, `syscalls` the kernel's syscall table, and `params`
+/// the config TLV blob of `params_len` bytes (may be null when it is empty).
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_new"]
-pub extern "C" fn module_new(
+pub unsafe extern "C" fn module_new(
     _in_chan: i32,
     _out_chan: i32,
     _ctrl_chan: i32,
@@ -176,11 +183,14 @@ pub extern "C" fn module_new(
         } else {
             params_def::set_defaults(s);
         }
-        dev_log(&*s.syscalls, 3, b"[fs_tap] init\0".as_ptr(), 13);
+        dev_log(&*s.syscalls, 3, c"[fs_tap] init".as_ptr().cast(), 13);
         0
     }
 }
 
+/// # Safety
+/// Kernel module-ABI entry point: `state` is the instance block this module's
+/// `module_new` initialised, live and exclusively this module's for the call.
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_step"]
 pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
@@ -193,7 +203,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     // trailing newline would otherwise sit in the line buffer until
     // it filled. The status line doubles as a liveness ping when no
     // data is flowing.
-    if s.step_count % 5000 == 0 {
+    if s.step_count.is_multiple_of(5000) {
         flush_line(s);
         let msg: &[u8] = if s.done != 0 {
             b"[fs_tap] drained"
@@ -265,7 +275,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
         s.fs_fd = -1;
         s.done = 1;
         if n == 0 {
-            dev_log(sys, 3, b"[fs_tap] eof\0".as_ptr(), 12);
+            dev_log(sys, 3, c"[fs_tap] eof".as_ptr().cast(), 12);
         } else {
             report_errno(sys, b"[fs_tap] read failed errno=", n);
         }

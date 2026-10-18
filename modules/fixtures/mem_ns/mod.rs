@@ -515,6 +515,10 @@ pub extern "C" fn module_provides_contract() -> u32 {
     0x0013 // STORAGE_NAMESPACE
 }
 
+/// # Safety
+/// Kernel provider-dispatch entry point: `state` is the instance block this
+/// module's `module_new` initialised, and `arg` points to `arg_len` bytes
+/// (may be null when `arg_len` is 0) valid for the call.
 #[cfg_attr(
     not(feature = "host-test"),
     link_section = ".text.module_provider_dispatch"

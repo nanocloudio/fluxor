@@ -830,7 +830,7 @@ pub unsafe fn build_ioctl_header(
     // Layout: cmd(u32) + len(u32) + flags(u16) + id(u16) + status(u32)
     let c = SDPCM_HEADER_LEN;
     // cmd: u32 LE [0..4]
-    *p.add(c + 0) = (cmd & 0xFF) as u8;
+    *p.add(c) = (cmd & 0xFF) as u8;
     *p.add(c + 1) = ((cmd >> 8) & 0xFF) as u8;
     *p.add(c + 2) = ((cmd >> 16) & 0xFF) as u8;
     *p.add(c + 3) = ((cmd >> 24) & 0xFF) as u8;
@@ -886,7 +886,7 @@ pub unsafe fn build_ioctl_header_get(
 
     // CDC header (16 bytes) — GET: flags = interface bits only (no SET bit)
     let c = SDPCM_HEADER_LEN;
-    *p.add(c + 0) = (cmd & 0xFF) as u8;
+    *p.add(c) = (cmd & 0xFF) as u8;
     *p.add(c + 1) = ((cmd >> 8) & 0xFF) as u8;
     *p.add(c + 2) = ((cmd >> 16) & 0xFF) as u8;
     *p.add(c + 3) = ((cmd >> 24) & 0xFF) as u8;
@@ -937,7 +937,7 @@ pub unsafe fn build_data_header(
 
     // BDC header (4 bytes)
     let b = SDPCM_HEADER_LEN;
-    *p.add(b + 0) = 0x20; // BDC version 2
+    *p.add(b) = 0x20; // BDC version 2
     *p.add(b + 1) = 0;
     *p.add(b + 2) = 0;
     *p.add(b + 3) = 0;

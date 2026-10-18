@@ -67,6 +67,10 @@ pub const QUIC_V1_RETRY_INTEGRITY_NONCE: [u8; 12] = [
 /// Pseudo-Packet (RFC 9000 §17.2.5.1). Pseudo-packet = 1-byte ODCID
 /// length + ODCID + the entire Retry packet up to (but not including)
 /// the integrity tag.
+///
+/// # Safety
+/// No obligation beyond the signature: each copy into the AAD buffer is
+/// guarded by a length check against it.
 pub unsafe fn compute_retry_integrity_tag(odcid: &[u8], retry_packet_no_tag: &[u8]) -> [u8; 16] {
     // Build the pseudo-packet AAD into a stack buffer.
     let mut aad = [0u8; 256];
@@ -103,6 +107,10 @@ pub unsafe fn compute_retry_integrity_tag(odcid: &[u8], retry_packet_no_tag: &[u
 ///
 /// `odcid` is the client's first-Initial DCID, used for the integrity
 /// tag's AAD.
+///
+/// # Safety
+/// No obligation beyond the signature: every copy lands inside the
+/// `total <= out.len()` bound checked first.
 pub unsafe fn build_retry_packet(
     odcid: &[u8],
     dcid: &[u8],
@@ -156,6 +164,10 @@ pub struct ParsedRetry {
 /// (`expected_odcid`). On success returns offsets/lengths into `pkt`
 /// for the DCID, SCID, and Retry Token. Verifies the integrity tag
 /// (RFC 9001 §5.8) using AES-128-GCM with the fixed key/nonce.
+///
+/// # Safety
+/// No obligation beyond the signature: the tag copy reads the last 16
+/// bytes of `pkt`, whose length is checked first.
 pub unsafe fn parse_retry_packet(pkt: &[u8], expected_odcid: &[u8]) -> Option<ParsedRetry> {
     if pkt.len() < 1 + 4 + 1 + 1 + 16 {
         return None;
@@ -226,6 +238,10 @@ pub unsafe fn parse_retry_packet(pkt: &[u8], expected_odcid: &[u8]) -> Option<Pa
 /// We list QUIC v1 (`0x00000001`) plus one reserved-greasing version
 /// (RFC 9000 §6.3) so an implementation that mirrors back the
 /// negotiated set sees that we'd accept v1.
+///
+/// # Safety
+/// No obligation beyond the signature: every copy lands inside the
+/// `total <= out.len()` bound checked first.
 pub unsafe fn build_version_negotiation(dcid: &[u8], scid: &[u8], out: &mut [u8]) -> usize {
     let total = 1 + 4 + 1 + dcid.len() + 1 + scid.len() + 4 + 4;
     if out.len() < total {
@@ -266,6 +282,10 @@ pub unsafe fn build_version_negotiation(dcid: &[u8], scid: &[u8], out: &mut [u8]
 /// Build + protect an Initial packet. `crypto_frame_payload` is a
 /// pre-built sequence of frames (CRYPTO + PADDING etc.). Returns
 /// total bytes written into `out`, or 0 on overflow.
+///
+/// # Safety
+/// No obligation beyond the signature: the shared long-header builder
+/// writes only inside the `total_len <= out.len()` bound it checks first.
 #[allow(
     clippy::too_many_arguments,
     reason = "arguments are the RFC 9000 packet-header fields in wire order; a params struct would rename the spec's own vocabulary"
@@ -295,6 +315,9 @@ pub unsafe fn build_initial_packet(
     )
 }
 
+/// # Safety
+/// No obligation beyond the signature: the shared long-header builder
+/// writes only inside the `total_len <= out.len()` bound it checks first.
 #[allow(
     clippy::too_many_arguments,
     reason = "arguments are the RFC 9000 packet-header fields in wire order; a params struct would rename the spec's own vocabulary"
@@ -457,6 +480,9 @@ pub struct ParsedLongPacket {
     pub total_consumed: usize,
 }
 
+/// # Safety
+/// No obligation beyond the signature: the raw reads and copies are
+/// bounded by the header lengths validated against `pkt` first.
 pub unsafe fn parse_long_packet(
     keys: &QuicKeys,
     hp: &Aes128Hp,
@@ -588,6 +614,9 @@ pub unsafe fn parse_long_packet(
 //   payload (AEAD-protected)
 // --------------------------------------------------------------------
 
+/// # Safety
+/// No obligation beyond the signature: the raw copies are bounded by the
+/// overflow check against `out` made first.
 #[allow(
     clippy::too_many_arguments,
     reason = "arguments are the RFC 9000 packet-header fields in wire order; a params struct would rename the spec's own vocabulary"
@@ -647,6 +676,9 @@ pub unsafe fn build_one_rtt_packet(
     total
 }
 
+/// # Safety
+/// No obligation beyond the signature: the raw reads and copies are
+/// bounded by the header lengths validated against `pkt` first.
 pub unsafe fn parse_one_rtt_packet(
     keys: &QuicKeys,
     hp: &Aes128Hp,

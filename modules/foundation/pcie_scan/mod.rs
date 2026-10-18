@@ -272,7 +272,12 @@ unsafe fn enumerate(s: &mut PcieScanState) {
         (*dp).bar_sizes[0] = 0x0040_0000; // 4MB
         (*dp).nic_type = NIC_RP1_GEM;
         s.device_count = 1;
-        dev_log(sys, 3, b"[pcie_scan] QEMU stub: fake RP1\0".as_ptr(), 30);
+        dev_log(
+            sys,
+            3,
+            c"[pcie_scan] QEMU stub: fake RP1".as_ptr().cast(),
+            30,
+        );
         return;
     }
 
@@ -365,7 +370,7 @@ unsafe fn enumerate(s: &mut PcieScanState) {
         dev_log(sys, 2, p, pos);
     }
 
-    dev_log(sys, 3, b"[pcie_scan] enumeration done\0".as_ptr(), 27);
+    dev_log(sys, 3, c"[pcie_scan] enumeration done".as_ptr().cast(), 27);
 }
 
 // ============================================================================
@@ -462,6 +467,10 @@ unsafe fn bar_unmap(s: &mut PcieScanState, arg: *mut u8, arg_len: usize) -> i32 
 // Provider dispatch
 // ============================================================================
 
+/// # Safety
+/// Kernel provider-dispatch entry point: `state` is the instance block this
+/// module's `module_new` initialised, and `arg` points to `arg_len` bytes
+/// (may be null when `arg_len` is 0) valid for the call.
 #[link_section = ".text.module_provider_dispatch"]
 #[export_name = "module_provider_dispatch"]
 pub unsafe extern "C" fn pcie_scan_dispatch(
@@ -504,6 +513,9 @@ pub extern "C" fn module_state_size() -> usize {
     core::mem::size_of::<PcieScanState>()
 }
 
+/// # Safety
+/// Kernel module-ABI entry point: `syscalls` is the kernel's syscall table,
+/// valid for the module's lifetime.
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_init"]
 pub unsafe extern "C" fn module_init(_syscalls: *const c_void) {}
@@ -515,9 +527,13 @@ unsafe fn bases_for_controller(ctrl: u8) -> (u64, u64) {
     }
 }
 
+/// # Safety
+/// Kernel module-ABI entry point: `state` is the loader-owned instance block
+/// of `state_size` bytes, `syscalls` the kernel's syscall table, and `params`
+/// the config TLV blob of `params_len` bytes (may be null when it is empty).
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_new"]
-pub extern "C" fn module_new(
+pub unsafe extern "C" fn module_new(
     in_chan: i32,
     out_chan: i32,
     ctrl_chan: i32,
@@ -563,11 +579,16 @@ pub extern "C" fn module_new(
             dev_log(
                 sys,
                 3,
-                b"[pcie_scan] controller=PCIe1 (external)\0".as_ptr(),
+                c"[pcie_scan] controller=PCIe1 (external)".as_ptr().cast(),
                 37,
             );
         } else {
-            dev_log(sys, 3, b"[pcie_scan] controller=PCIe2 (RP1)\0".as_ptr(), 33);
+            dev_log(
+                sys,
+                3,
+                c"[pcie_scan] controller=PCIe2 (RP1)".as_ptr().cast(),
+                33,
+            );
         }
 
         // Probe: if ECAM read returns 0xFFFFFFFF, fall back to QEMU stub.
@@ -581,7 +602,9 @@ pub extern "C" fn module_new(
                 dev_log(
                     sys,
                     2,
-                    b"[pcie_scan] PCIe1 ECAM unreadable (pciex1 enabled?)\0".as_ptr(),
+                    c"[pcie_scan] PCIe1 ECAM unreadable (pciex1 enabled?)"
+                        .as_ptr()
+                        .cast(),
                     51,
                 );
                 // Leave device_count = 0; do NOT fabricate QEMU stub.
@@ -597,11 +620,14 @@ pub extern "C" fn module_new(
         }
         s.scan_done = 1;
 
-        dev_log(sys, 3, b"[pcie_scan] ready\0".as_ptr(), 16);
+        dev_log(sys, 3, c"[pcie_scan] ready".as_ptr().cast(), 16);
         0
     }
 }
 
+/// # Safety
+/// Kernel module-ABI entry point: `state` is the instance block this module's
+/// `module_new` initialised, live and exclusively this module's for the call.
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_step"]
 pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {

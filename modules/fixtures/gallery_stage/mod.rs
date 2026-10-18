@@ -184,7 +184,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // the rig's pass rule matches no matter when telemetry
         // attaches; same pattern as codec's last_err replay.
         s.tick = s.tick.wrapping_add(1);
-        if s.tick % 5000 == 0 {
+        if s.tick.is_multiple_of(5000) {
             let msg: &[u8] = match s.phase {
                 PHASE_OPEN => b"[gallery] hb phase=open",
                 PHASE_WRITE => b"[gallery] hb phase=write",

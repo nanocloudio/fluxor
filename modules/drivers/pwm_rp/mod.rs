@@ -172,6 +172,10 @@ unsafe fn get_slot_mut(s: &mut PwmState, handle: i32) -> *mut PwmSlot {
 // provider_call on a HAL_PWM handle.
 // ============================================================================
 
+/// # Safety
+/// Kernel provider-dispatch entry point: `state` is the instance block this
+/// module's `module_new` initialised, and `arg` points to `arg_len` bytes
+/// (may be null when `arg_len` is 0) valid for the call.
 #[export_name = "module_provider_dispatch"]
 #[link_section = ".text.pwm_provider_dispatch"]
 pub unsafe extern "C" fn pwm_provider_dispatch(

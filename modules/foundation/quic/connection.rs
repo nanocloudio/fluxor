@@ -2491,7 +2491,7 @@ pub fn next_server_bidi_id(idx: u64) -> u64 {
 /// client's first Initial packet (== our_cid from server's perspective
 /// since the client populated DCID with what it picked for "us"). The
 /// keys derived this way are byte-identical on both sides.
-pub unsafe fn install_initial_keys(conn: &mut QuicConnection, dcid: &[u8]) {
+pub fn install_initial_keys(conn: &mut QuicConnection, dcid: &[u8]) {
     let (client_keys, server_keys) = derive_initial_keys(dcid);
     if conn.is_server {
         conn.initial.read_keys = client_keys;
@@ -2505,7 +2505,7 @@ pub unsafe fn install_initial_keys(conn: &mut QuicConnection, dcid: &[u8]) {
 
 /// After TLS DeriveHandshakeKeys, install QUIC Handshake-level keys
 /// derived from the TLS handshake-traffic secrets.
-pub unsafe fn install_handshake_keys(conn: &mut QuicConnection) {
+pub fn install_handshake_keys(conn: &mut QuicConnection) {
     if let Some(read_secret) = conn.driver.read_secret(EncLevel::Handshake, false) {
         conn.handshake.read_keys = secret_to_keys(read_secret);
     }
@@ -2518,7 +2518,7 @@ pub unsafe fn install_handshake_keys(conn: &mut QuicConnection) {
 /// After TLS DeriveAppKeys, install QUIC 1-RTT keys derived from
 /// the TLS application-traffic secrets. Also captures the secrets
 /// for key update (RFC 9001 §6) and pre-derives the next-phase keys.
-pub unsafe fn install_one_rtt_keys(conn: &mut QuicConnection) {
+pub fn install_one_rtt_keys(conn: &mut QuicConnection) {
     let mut hl = 32usize;
     if let Some(read_secret) = conn.driver.read_secret(EncLevel::OneRtt, false) {
         conn.one_rtt.read_keys = secret_to_keys(read_secret);
@@ -2618,6 +2618,11 @@ unsafe fn tp_put_int(out: &mut [u8], pos: &mut usize, id: u64, value: u64) {
 /// §18.2 mandates `initial_source_connection_id`. We also advertise
 /// flow-control / stream-limit ceilings so the peer can use them
 /// before we add explicit MAX_DATA / MAX_STREAMS frames.
+///
+/// # Safety
+/// The encoder writes without bounds checks of its own: `out` must hold
+/// the whole encoding. [`TP_BUF_LEN`] bytes suffices for a `scid` of at
+/// most 20 bytes (RFC 9000's connection-ID maximum).
 pub unsafe fn build_transport_params_client(
     scid: &[u8],
     disable_migration: bool,
@@ -2685,6 +2690,11 @@ pub unsafe fn build_transport_params_client(
 /// top of the same set the client emits. If a Retry was issued for
 /// this connection, also emits `retry_source_connection_id` (RFC 9000
 /// §7.3 — required when the server has issued a Retry).
+///
+/// # Safety
+/// The encoder writes without bounds checks of its own: `out` must hold
+/// the whole encoding. [`TP_BUF_LEN`] bytes suffices for connection IDs
+/// of at most 20 bytes each (RFC 9000's maximum).
 pub unsafe fn build_transport_params_server(
     scid: &[u8],
     original_dcid: &[u8],
@@ -2792,6 +2802,10 @@ impl PeerTransportLimits {
 /// Walk a transport_parameters payload, capturing the limits above.
 /// Lenient about unknown parameters (they are skipped, per §7.4.2);
 /// returns the defaults on a decode error.
+///
+/// # Safety
+/// No obligation beyond the signature: every varint read is handed a
+/// subslice of `payload` and its length.
 pub unsafe fn parse_peer_transport_limits(payload: &[u8]) -> PeerTransportLimits {
     let mut out = PeerTransportLimits::defaults();
     let mut pos = 0;
@@ -2880,6 +2894,10 @@ pub fn apply_peer_transport_limits(conn: &mut QuicConnection, lim: &PeerTranspor
 /// Extract the peer's `max_datagram_frame_size` (RFC 9221 §3) from a
 /// transport_parameters payload. Returns 0 if absent (peer won't accept
 /// DATAGRAMs) or on any decode error. Lenient: unknown params skipped.
+///
+/// # Safety
+/// No obligation beyond the signature: every varint read is handed a
+/// subslice of `payload` and its length.
 pub unsafe fn parse_peer_max_datagram_frame_size(payload: &[u8]) -> u64 {
     let mut pos = 0;
     while pos < payload.len() {
@@ -2924,6 +2942,10 @@ pub unsafe fn parse_peer_max_datagram_frame_size(payload: &[u8]) -> u64 {
 ///
 /// Other parameters are accepted as-is — this is enough to conform
 /// to RFC 9000 §7.3 + RFC 9001 §8.2 minimum compliance.
+///
+/// # Safety
+/// No obligation beyond the signature: every varint read is handed a
+/// subslice of `payload` and its length.
 pub unsafe fn validate_transport_params(
     payload: &[u8],
     expected_isc_cid: &[u8],

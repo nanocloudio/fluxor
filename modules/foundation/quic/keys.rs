@@ -45,7 +45,7 @@ impl QuicKeys {
 /// Derive Initial-level keys for both directions from a Destination
 /// Connection ID (typically the one the client put in the first
 /// Initial packet's DCID field). Returns (client_initial, server_initial).
-pub unsafe fn derive_initial_keys(dcid: &[u8]) -> (QuicKeys, QuicKeys) {
+pub fn derive_initial_keys(dcid: &[u8]) -> (QuicKeys, QuicKeys) {
     let mut initial_secret = [0u8; 32];
     hkdf_extract(
         HashAlg::Sha256,
@@ -79,7 +79,7 @@ pub unsafe fn derive_initial_keys(dcid: &[u8]) -> (QuicKeys, QuicKeys) {
 /// Derive QUIC packet protection keys (key/iv/hp) from a TLS 1.3
 /// traffic secret. Used for Initial / Handshake / 1-RTT levels —
 /// same derivation, the caller picks the source secret per level.
-pub unsafe fn secret_to_keys(secret: &[u8]) -> QuicKeys {
+pub fn secret_to_keys(secret: &[u8]) -> QuicKeys {
     let mut keys = QuicKeys::empty();
     hkdf_expand_label(HashAlg::Sha256, secret, b"quic key", &[], &mut keys.key);
     hkdf_expand_label(HashAlg::Sha256, secret, b"quic iv", &[], &mut keys.iv);
@@ -91,7 +91,7 @@ pub unsafe fn secret_to_keys(secret: &[u8]) -> QuicKeys {
 /// the current secret via `HKDF-Expand-Label(secret, "quic ku", "",
 /// hash_len)`. The HP key is NOT updated (RFC 9001 §6.1: header
 /// protection key remains unchanged across key updates).
-pub unsafe fn next_traffic_secret(current: &[u8], out: &mut [u8]) {
+pub fn next_traffic_secret(current: &[u8], out: &mut [u8]) {
     let hl = current.len().min(out.len());
     let mut tmp = [0u8; 48];
     hkdf_expand_label(HashAlg::Sha256, current, b"quic ku", &[], &mut tmp[..hl]);
@@ -100,7 +100,7 @@ pub unsafe fn next_traffic_secret(current: &[u8], out: &mut [u8]) {
 
 /// Derive next-phase keys: key + iv update; hp_key inherited from
 /// `prev_hp` per RFC 9001 §6.1.
-pub unsafe fn next_keys(next_secret: &[u8], prev_hp: [u8; QUIC_HP_KEY_LEN]) -> QuicKeys {
+pub fn next_keys(next_secret: &[u8], prev_hp: [u8; QUIC_HP_KEY_LEN]) -> QuicKeys {
     let mut keys = QuicKeys::empty();
     hkdf_expand_label(
         HashAlg::Sha256,
@@ -131,6 +131,10 @@ pub unsafe fn next_keys(next_secret: &[u8], prev_hp: [u8; QUIC_HP_KEY_LEN]) -> Q
 /// offset into `pkt` where the PN bytes begin; `pn_len` is the
 /// number of PN bytes (1-4). The caller has already encoded the PN.
 /// `is_long` selects the first-byte mask (4 or 5 bits).
+///
+/// # Safety
+/// No obligation beyond the signature: the sample copy is bounded by the
+/// `pn_offset + 4 + 16 <= pkt.len()` check above.
 pub unsafe fn apply_header_protection(
     hp: &Aes128Hp,
     pkt: &mut [u8],
@@ -161,6 +165,10 @@ pub unsafe fn apply_header_protection(
 /// Remove header protection from a received packet — reverses the
 /// XORs applied by `apply_header_protection`. Returns the recovered
 /// pn_len (1-4) so the caller can read the cleartext PN bytes.
+///
+/// # Safety
+/// No obligation beyond the signature: the sample copy is bounded by the
+/// `pn_offset + 4 + 16 <= pkt.len()` check above.
 pub unsafe fn remove_header_protection(
     hp: &Aes128Hp,
     pkt: &mut [u8],

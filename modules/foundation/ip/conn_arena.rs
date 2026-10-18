@@ -99,7 +99,7 @@ impl ConnArena {
             self.first.as_ptr().add(i)
         } else {
             let k = i - CONN_FIRST;
-            (*self.extra.as_ptr().add(k / CONN_CHUNK)).add(k % CONN_CHUNK)
+            (*self.extra.as_ptr().add(k / CONN_CHUNK)).add(k.rem_euclid(CONN_CHUNK))
         }
     }
 
@@ -113,7 +113,7 @@ impl ConnArena {
             self.first.as_mut_ptr().add(i)
         } else {
             let k = i - CONN_FIRST;
-            (*self.extra.as_ptr().add(k / CONN_CHUNK)).add(k % CONN_CHUNK)
+            (*self.extra.as_ptr().add(k / CONN_CHUNK)).add(k.rem_euclid(CONN_CHUNK))
         }
     }
 
@@ -130,7 +130,7 @@ impl ConnArena {
     /// never per packet.
     pub fn grow(&mut self, sys: &SyscallTable) -> bool {
         let next = self.extra_allocated as usize;
-        if next >= EXTRA_CHUNKS {
+        if next >= self.extra.len() {
             return false;
         }
         let bytes = (CONN_CHUNK * core::mem::size_of::<tcp::TcpConn>()) as u32;

@@ -154,9 +154,13 @@ pub extern "C" fn module_state_size() -> u32 {
 #[link_section = ".text.module_init"]
 pub extern "C" fn module_init(_syscalls: *const c_void) {}
 
+/// # Safety
+/// Kernel module-ABI entry point: `state` is the loader-owned instance block
+/// of `state_size` bytes, `syscalls` the kernel's syscall table, and `params`
+/// the config TLV blob of `params_len` bytes (may be null when it is empty).
 #[no_mangle]
 #[link_section = ".text.module_new"]
-pub extern "C" fn module_new(
+pub unsafe extern "C" fn module_new(
     in_chan: i32,
     out_chan: i32,
     _ctrl_chan: i32,
@@ -265,7 +269,7 @@ unsafe fn handle_frames(s: &mut EchoState) -> bool {
         if body + plen > s.buf_len {
             return true; // partial trailing frame — wait for the rest
         }
-        let done = if t == mux::MSG_MUX_SESSION_OPENED && plen >= mux::SESSION_OPENED_BODY_MIN + 1 {
+        let done = if t == mux::MSG_MUX_SESSION_OPENED && plen > mux::SESSION_OPENED_BODY_MIN {
             latch_session(s, body, plen);
             true
         } else if s.role == ROLE_DRIVE {

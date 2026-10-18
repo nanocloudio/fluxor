@@ -193,9 +193,13 @@ pub extern "C" fn module_state_size() -> u32 {
 #[link_section = ".text.module_init"]
 pub extern "C" fn module_init(_syscalls: *const c_void) {}
 
+/// # Safety
+/// Kernel module-ABI entry point: `state` is the loader-owned instance block
+/// of `state_size` bytes, `syscalls` the kernel's syscall table, and `params`
+/// the config TLV blob of `params_len` bytes (may be null when it is empty).
 #[no_mangle]
 #[link_section = ".text.module_new"]
-pub extern "C" fn module_new(
+pub unsafe extern "C" fn module_new(
     in_chan: i32,
     out_chan: i32,
     _ctrl_chan: i32,
@@ -265,7 +269,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // Periodic heartbeat — surface in/out chans + counters so we
         // can tell whether bytes are reaching gesture at all.
         s.tick_count = s.tick_count.wrapping_add(1);
-        if s.tick_count % 5000 == 0 {
+        if s.tick_count.is_multiple_of(5000) {
             let mut buf = [0u8; 96];
             let p = buf.as_mut_ptr();
             let pfx = b"[gesture] hb in=";

@@ -9445,6 +9445,10 @@ unsafe fn fs_op_fsync_poll(s: &mut Fat32State, handle: i32, arg: *const u8, arg_
     1
 }
 
+/// # Safety
+/// Kernel provider-dispatch entry point: `state` is the instance block this
+/// module's `module_new` initialised, and `arg` points to `arg_len` bytes
+/// (may be null when `arg_len` is 0) valid for the call.
 #[cfg_attr(
     not(feature = "host-test"),
     link_section = ".text.module_provider_dispatch"
@@ -9923,9 +9927,13 @@ pub extern "C" fn module_state_size() -> u32 {
 #[cfg_attr(not(feature = "host-test"), link_section = ".text.module_init")]
 pub extern "C" fn module_init(_syscalls: *const c_void) {}
 
+/// # Safety
+/// Kernel module-ABI entry point: `state` is the loader-owned instance block
+/// of `state_size` bytes, `syscalls` the kernel's syscall table, and `params`
+/// the config TLV blob of `params_len` bytes (may be null when it is empty).
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[cfg_attr(not(feature = "host-test"), link_section = ".text.module_new")]
-pub extern "C" fn module_new(
+pub unsafe extern "C" fn module_new(
     in_chan: i32,
     _out_chan: i32,
     _ctrl_chan: i32,

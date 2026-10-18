@@ -103,7 +103,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // tick_us=4000) — separates "gated but woken" from "never
         // gated" without kernel instrumentation.
         s.steps = s.steps.wrapping_add(1);
-        if s.steps % 250 == 0 {
+        if s.steps.is_multiple_of(250) {
             dev_log(sys, 3, b"[wksnk] hb250".as_ptr(), 13);
         }
         let mut buf = [0u8; 12];

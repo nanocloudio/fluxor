@@ -5,6 +5,7 @@
 //!   - `MON_METRIC` / `MON_SPAN` from module-scope metric/span records,
 //!   - `MON_HIST` / `MON_RES` from the kernel-pushed PSTATUS step-histogram and
 //!     arena/fault records.
+//!
 //! `MON_FAULT` is emitted by the kernel directly. All lines ride the same
 //! transport-agnostic `log_ring` path as the rest of the `MON_*` protocol, so
 //! whatever debug transport is configured carries them.
@@ -307,9 +308,13 @@ declare_module_state_bytes!(ObserveState);
 #[link_section = ".text.module_init"]
 pub extern "C" fn module_init(_syscalls: *const c_void) {}
 
+/// # Safety
+/// Kernel module-ABI entry point: `state` is the loader-owned instance block
+/// of `state_size` bytes, `syscalls` the kernel's syscall table, and `params`
+/// the config TLV blob of `params_len` bytes (may be null when it is empty).
 #[no_mangle]
 #[link_section = ".text.module_new"]
-pub extern "C" fn module_new(
+pub unsafe extern "C" fn module_new(
     in_chan: i32,
     _out_chan: i32,
     _ctrl_chan: i32,

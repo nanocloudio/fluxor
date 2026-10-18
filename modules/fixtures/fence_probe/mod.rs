@@ -147,7 +147,6 @@ unsafe fn service_events(s: &mut ProbeState) {
         if msg == 0 {
             break;
         }
-        let plen = plen as usize;
         let p = s.buf.as_ptr().add(3);
         let ours = plen >= 16 && core::slice::from_raw_parts(p, 16) == addr16(s.vip);
         match msg {
@@ -228,6 +227,10 @@ pub extern "C" fn module_state_size() -> u32 {
 #[link_section = ".text.module_init"]
 pub extern "C" fn module_init(_syscalls: *const c_void) {}
 
+/// # Safety
+/// Kernel module-ABI entry point: `state` is the loader-owned instance block
+/// of `state_size` bytes, `syscalls` the kernel's syscall table, and `params`
+/// the config TLV blob of `params_len` bytes (may be null when it is empty).
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_new"]
 pub unsafe extern "C" fn module_new(
@@ -268,6 +271,9 @@ pub unsafe extern "C" fn module_new(
     0
 }
 
+/// # Safety
+/// Kernel module-ABI entry point: `state` is the instance block this module's
+/// `module_new` initialised, live and exclusively this module's for the call.
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_step"]
 pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
@@ -278,14 +284,15 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
         PHASE_WAIT_NET => {
             // Install once the stack has had time to bind its primary; the
             // install is retried on the same period until it is answered.
-            if now.wrapping_sub(s.boot_ms) >= s.install_after_s * 1000 && (now / 1000) % 2 == 0 {
-                if s.token == [0; 16] {
-                    send_install(s);
-                    // One request per two-second window.
-                    s.boot_ms = now
-                        .wrapping_sub(s.install_after_s * 1000)
-                        .wrapping_add(1000);
-                }
+            if now.wrapping_sub(s.boot_ms) >= s.install_after_s * 1000
+                && (now / 1000).is_multiple_of(2)
+                && s.token == [0; 16]
+            {
+                send_install(s);
+                // One request per two-second window.
+                s.boot_ms = now
+                    .wrapping_sub(s.install_after_s * 1000)
+                    .wrapping_add(1000);
             }
         }
         PHASE_INSTALLED => {

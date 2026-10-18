@@ -263,7 +263,7 @@ unsafe fn spi_read_byte(s: &Enc28State) -> i32 {
     let sys = s.sys();
     let result = dev_spi_poll_byte(sys, s.spi_handle);
     if result >= 0x100 {
-        return (result - 0x100) as i32;
+        return result - 0x100;
     }
     if result == 0 {
         let r = dev_spi_transfer_start(
@@ -280,7 +280,7 @@ unsafe fn spi_read_byte(s: &Enc28State) -> i32 {
         loop {
             let poll = dev_spi_poll_byte(sys, s.spi_handle);
             if poll >= 0x100 {
-                return (poll - 0x100) as i32;
+                return poll - 0x100;
             }
             if poll < 0 {
                 return poll;
@@ -332,9 +332,13 @@ declare_module_state_bytes!(Enc28State);
 #[link_section = ".text.module_init"]
 pub extern "C" fn module_init(_syscalls: *const c_void) {}
 
+/// # Safety
+/// Kernel module-ABI entry point: `state` is the loader-owned instance block
+/// of `state_size` bytes, `syscalls` the kernel's syscall table, and `params`
+/// the config TLV blob of `params_len` bytes (may be null when it is empty).
 #[no_mangle]
 #[link_section = ".text.module_new"]
-pub extern "C" fn module_new(
+pub unsafe extern "C" fn module_new(
     in_chan: i32,
     out_chan: i32,
     _ctrl_chan: i32,

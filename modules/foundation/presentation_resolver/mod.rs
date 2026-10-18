@@ -281,8 +281,7 @@ fn resolve(s: &State, surf: &Surface) -> Resolution {
         a += 1;
     }
 
-    for idx in 0..need_n {
-        let i = need_plane[idx];
+    for &i in need_plane.iter().take(need_n) {
         // Eligible planes in the control's preference order, auto-extending a
         // chrome-only control to content on a chrome-less-but-displayed surface.
         let mut prefs = [0u8; 2];
@@ -414,14 +413,14 @@ fn encode_layout(s: &State, r: &Resolution, epoch: u32) -> ([u8; OUT_BUF], usize
     for b in epoch.to_le_bytes() {
         put(b, &mut buf, &mut o);
     }
-    for i in 0..n * 4 {
-        put(entries[i], &mut buf, &mut o);
+    for &e in entries.iter().take(n * 4) {
+        put(e, &mut buf, &mut o);
     }
     for j in 0..legend_n {
         let l = legend_len[j] as usize;
         put(l as u8, &mut buf, &mut o);
-        for k in 0..l {
-            put(legend[j][k], &mut buf, &mut o);
+        for &c in legend[j].iter().take(l) {
+            put(c, &mut buf, &mut o);
         }
     }
     (buf, o)
@@ -439,10 +438,14 @@ pub extern "C" fn module_state_size() -> u32 {
 #[link_section = ".text.module_init"]
 pub extern "C" fn module_init(_syscalls: *const c_void) {}
 
+/// # Safety
+/// Kernel module-ABI entry point: `state` is the loader-owned instance block
+/// of `state_size` bytes, `syscalls` the kernel's syscall table, and `params`
+/// the config TLV blob of `params_len` bytes (may be null when it is empty).
 #[no_mangle]
 #[link_section = ".text.module_new"]
 #[allow(clippy::too_many_arguments, reason = "fixed module_new ABI signature")]
-pub extern "C" fn module_new(
+pub unsafe extern "C" fn module_new(
     _in_chan: i32,
     _out_chan: i32,
     _ctrl_chan: i32,
@@ -512,10 +515,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         }
 
         // Retry an undelivered layout first (all-or-nothing channel write).
-        if s.pending {
-            if !try_emit(s, sys) {
-                return 0;
-            }
+        if s.pending && !try_emit(s, sys) {
+            return 0;
         }
 
         // Drain traits records; coalesce to the most recent (resolution is a

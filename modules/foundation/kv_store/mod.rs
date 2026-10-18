@@ -12,7 +12,7 @@
 //!   0 = empty bucket.
 //! - Pages 1+: KV entries (fixed 256 bytes each = 16 entries per page)
 //!   Entry format: [key_len:u8, val_len:u8, flags:u8, _pad:u8,
-//!                  next_offset:u32 LE, key:120, value:128]
+//!   next_offset:u32 LE, key:120, value:128]
 //!
 //! # Protocol (input channel)
 //!
@@ -347,10 +347,17 @@ unsafe fn kv_delete(state: &State, key: *const u8, key_len: usize) -> bool {
 // Module ABI exports
 // ============================================================================
 
+/// # Safety
+/// Kernel module-ABI entry point: `syscalls` is the kernel's syscall table,
+/// valid for the module's lifetime.
 #[no_mangle]
 #[link_section = ".text.module_init"]
 pub unsafe extern "C" fn module_init(_syscalls: *const core::ffi::c_void) {}
 
+/// # Safety
+/// Kernel module-ABI entry point: `state` is the loader-owned instance block
+/// of `state_size` bytes, `syscalls` the kernel's syscall table, and `params`
+/// the config TLV blob of `params_len` bytes (may be null when it is empty).
 #[no_mangle]
 pub unsafe extern "C" fn module_new(
     in_ch: i32,
@@ -415,6 +422,9 @@ pub unsafe extern "C" fn module_new(
     0
 }
 
+/// # Safety
+/// Kernel module-ABI entry point: `state` is the instance block this module's
+/// `module_new` initialised, live and exclusively this module's for the call.
 #[no_mangle]
 pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
     let s = state as *mut State;
@@ -490,7 +500,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
 declare_module_arena_bytes!(65536);
 
 #[no_mangle]
-pub unsafe extern "C" fn module_arena_size() -> u32 {
+pub extern "C" fn module_arena_size() -> u32 {
     // Request 64KB resident arena as fallback (RP2350 without paged arena)
     // On BCM2712, the paged arena is used instead.
     65536

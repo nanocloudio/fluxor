@@ -399,6 +399,31 @@ The build holds this table true: a check builds one module per construct
 for each die and fails the moment any row stops matching, so a toolchain
 upgrade that moves a row is caught the day it lands.
 
+#### Lint gate
+
+`fluxor ci` runs a `clippy (modules)` phase over every module source, with
+the strict build's flags (`--crate-type=staticlib -C relocation-model=pie`,
+the module's target and features) and `-D warnings`; only
+`clippy::empty_loop` is allowed, because the runtime's traps spin. Module
+sources are not cargo workspace members, so the phase runs beside the
+workspace `clippy` in a project that has both — fluxor's own included — and
+in place of it in a fmod-only one. `fluxor ci -v` prints each failing
+module's full diagnostic.
+
+Two conventions it holds:
+
+- An entry point that dereferences a pointer argument (`module_new`,
+  `module_step`, a provider dispatch) is `pub unsafe extern "C" fn` with a
+  `/// # Safety` section naming what the loader guarantees. The ABI is the
+  same; host-side harnesses call it inside `unsafe { }` with a `SAFETY:`
+  comment.
+- A NUL-terminated log string is a `c"…"` literal passed as
+  `c"…".as_ptr().cast()`, not `b"…\0".as_ptr()`.
+
+Not every suggestion is safe to take: clippy's `contains` rewrite of a byte
+search lowers to `core::slice::memchr`, which the strict link refuses —
+write the loop (`iter().all(|&c| c != x)`) instead.
+
 #### Stack depth
 
 A module steps on a stack it did not size — the kernel's on an RP part, where

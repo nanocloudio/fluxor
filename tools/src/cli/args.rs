@@ -428,7 +428,9 @@ enum Commands {
     },
 
     /// Full CI gate. Phases run in this order, each only where the project
-    /// has what it checks: setup (`[ci.setup] scripts`), fmt-check, clippy, workspace-lint-opt-in,
+    /// has what it checks: setup (`[ci.setup] scripts`), fmt-check and
+    /// clippy (the cargo workspace, then the PIC module sources with the
+    /// strict-build flags), workspace-lint-opt-in,
     /// hygiene, observability, presentation, makefile, fluxor-toml-schema,
     /// template-render, version-skew, lockfile-consistency, catalog-drift,
     /// sdk-materialisation, live-staleness, limit-register,

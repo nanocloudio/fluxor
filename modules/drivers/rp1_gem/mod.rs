@@ -1037,13 +1037,20 @@ pub extern "C" fn module_state_size() -> usize {
     STATE_SIZE
 }
 
+/// # Safety
+/// Kernel module-ABI entry point: `syscalls` is the kernel's syscall table,
+/// valid for the module's lifetime.
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_init"]
 pub unsafe extern "C" fn module_init(_syscalls: *const c_void) {}
 
+/// # Safety
+/// Kernel module-ABI entry point: `state` is the loader-owned instance block
+/// of `state_size` bytes, `syscalls` the kernel's syscall table, and `params`
+/// the config TLV blob of `params_len` bytes (may be null when it is empty).
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_new"]
-pub extern "C" fn module_new(
+pub unsafe extern "C" fn module_new(
     in_chan: i32,
     out_chan: i32,
     ctrl_chan: i32,
@@ -1128,6 +1135,9 @@ unsafe extern "C" fn gem_tx_drain_ioctl(state: *mut c_void, cmd: u32, arg: *mut 
     0
 }
 
+/// # Safety
+/// Kernel module-ABI entry point: `state` is the instance block this module's
+/// `module_new` initialised, live and exclusively this module's for the call.
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_step"]
 pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
@@ -1182,7 +1192,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
             // reported once per 5 s against their 0.5 s, so a drop could not
             // be attributed to the burst that caused it. Stat-counter reads
             // are cheap (one MMIO word each) and touch no scheduler state.
-            if s.step_count % 5_000 == 0 {
+            if s.step_count.is_multiple_of(5_000) {
                 heartbeat(s);
             }
             0
@@ -1192,6 +1202,10 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
 
 /// Admit frames that arrived while the graph was running so another bounded
 /// pipeline pass can process them without waiting for the next outer tick.
+///
+/// # Safety
+/// Kernel module-ABI entry point: `state` is the instance block this module's
+/// `module_new` initialised, live and exclusively this module's for the call.
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_pipeline_refill"]
 pub unsafe extern "C" fn module_pipeline_refill(state: *mut c_void) -> i32 {
@@ -1205,6 +1219,10 @@ pub unsafe extern "C" fn module_pipeline_refill(state: *mut c_void) -> i32 {
 
 /// Flush frames produced by the graph pass without polling RX a second time.
 /// The scheduler calls this optional hook once after cooperative execution.
+///
+/// # Safety
+/// Kernel module-ABI entry point: `state` is the instance block this module's
+/// `module_new` initialised, live and exclusively this module's for the call.
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_post_tick_flush"]
 pub unsafe extern "C" fn module_post_tick_flush(state: *mut c_void) -> i32 {

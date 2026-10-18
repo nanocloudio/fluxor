@@ -108,7 +108,7 @@ unsafe fn crc16_update(crc: u16, byte: u8) -> u16 {
         if (c & 0x8000) != 0 {
             c = (c << 1) ^ 0x1021;
         } else {
-            c = c << 1;
+            c <<= 1;
         }
         i += 1;
     }
@@ -211,15 +211,18 @@ struct LinkFrameHeader {
 
 #[inline(never)]
 unsafe fn link_frame_encode(
-    msg_type: u8,
-    flags: u8,
-    seq: u16,
-    frame_id: u32,
+    hdr: LinkFrameHeader,
     payload: *const u8,
-    payload_len: u16,
     wire_buf: *mut u8,
     wire_buf_cap: usize,
 ) -> usize {
+    let LinkFrameHeader {
+        msg_type,
+        flags,
+        seq,
+        frame_id,
+        payload_len,
+    } = hdr;
     let raw_len = LINK_HDR_SIZE + payload_len as usize + LINK_CRC_SIZE;
     let cobs_needed = cobs_max_encoded(raw_len) + 2;
     if wire_buf_cap < cobs_needed {
@@ -474,9 +477,13 @@ pub extern "C" fn module_state_size() -> u32 {
 #[link_section = ".text.module_init"]
 pub extern "C" fn module_init(_syscalls: *const c_void) {}
 
+/// # Safety
+/// Kernel module-ABI entry point: `state` is the loader-owned instance block
+/// of `state_size` bytes, `syscalls` the kernel's syscall table, and `params`
+/// the config TLV blob of `params_len` bytes (may be null when it is empty).
 #[no_mangle]
 #[link_section = ".text.module_new"]
-pub extern "C" fn module_new(
+pub unsafe extern "C" fn module_new(
     in_chan: i32,
     out_chan: i32,
     ctrl_chan: i32,
@@ -681,12 +688,14 @@ unsafe fn step_running(s: &mut LinkState) -> i32 {
                 if !mailbox_ptr.is_null() && mailbox_len >= block_bytes as u32 {
                     let frame_id = compute_frame_id(s, dev_call);
                     let wire_len = link_frame_encode(
-                        LINK_MSG_AUDIO,
-                        0,
-                        s.tx_seq,
-                        frame_id,
+                        LinkFrameHeader {
+                            msg_type: LINK_MSG_AUDIO,
+                            flags: 0,
+                            seq: s.tx_seq,
+                            frame_id,
+                            payload_len: block_bytes as u16,
+                        },
                         mailbox_ptr,
-                        block_bytes as u16,
                         s.wire_buf.as_mut_ptr(),
                         MAX_WIRE_BUF,
                     );
@@ -706,12 +715,14 @@ unsafe fn step_running(s: &mut LinkState) -> i32 {
                     if read >= block_bytes as i32 {
                         let frame_id = compute_frame_id(s, dev_call);
                         let wire_len = link_frame_encode(
-                            LINK_MSG_AUDIO,
-                            0,
-                            s.tx_seq,
-                            frame_id,
+                            LinkFrameHeader {
+                                msg_type: LINK_MSG_AUDIO,
+                                flags: 0,
+                                seq: s.tx_seq,
+                                frame_id,
+                                payload_len: read as u16,
+                            },
                             audio_buf,
-                            read as u16,
                             s.wire_buf.as_mut_ptr(),
                             audio_offset,
                         );
@@ -751,12 +762,14 @@ unsafe fn step_running(s: &mut LinkState) -> i32 {
 
                     let total = 4 + fmp_payload_len as usize;
                     let wire_len = link_frame_encode(
-                        LINK_MSG_CONTROL,
-                        0,
-                        s.tx_seq,
-                        0,
+                        LinkFrameHeader {
+                            msg_type: LINK_MSG_CONTROL,
+                            flags: 0,
+                            seq: s.tx_seq,
+                            frame_id: 0,
+                            payload_len: total as u16,
+                        },
                         ctrl_buf,
-                        total as u16,
                         s.wire_buf.as_mut_ptr(),
                         ctrl_offset,
                     );
@@ -861,7 +874,7 @@ unsafe fn compute_frame_id(s: &LinkState, dev_call: DevCallFn) -> u32 {
         let elapsed_us = now_us.wrapping_sub(s.local_micros_at_sync);
         let rate = s.master_rate_q16 >> 16;
         let frames_elapsed = if rate > 0 {
-            let product = (elapsed_us as u64).wrapping_mul(rate as u64);
+            let product = elapsed_us.wrapping_mul(rate as u64);
             (((product >> 16).wrapping_mul(4295)) >> 16) as u32
         } else {
             0
@@ -1106,12 +1119,14 @@ unsafe fn maybe_send_beacon(s: &mut LinkState, dev_call: DevCallFn) {
     sync_beacon_encode(payload.as_mut_ptr(), consumed, queued, rate_q16, now_us);
 
     let wire_len = link_frame_encode(
-        LINK_MSG_SYNC,
-        0,
-        0,
-        consumed as u32,
+        LinkFrameHeader {
+            msg_type: LINK_MSG_SYNC,
+            flags: 0,
+            seq: 0,
+            frame_id: consumed as u32,
+            payload_len: SYNC_PAYLOAD_SIZE as u16,
+        },
         payload.as_ptr(),
-        SYNC_PAYLOAD_SIZE as u16,
         s.beacon_wire.as_mut_ptr(),
         BEACON_WIRE_SIZE,
     );
