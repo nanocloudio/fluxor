@@ -30,7 +30,7 @@ struct AbiSpec {
     /// `rustc --target` triple for module compilation.
     module_target: &'static str,
     /// Extra `rustc` flags appended after the standard `-O -C
-    /// relocation-model=pic` flags. Empty for most targets.
+    /// relocation-model=pie` flags. Empty for most targets.
     extra_rustflags: &'static [&'static str],
     /// Linker invocation. `None` selects the wasm path (cdylib
     /// crate-type, no separate linker step).
@@ -782,14 +782,14 @@ pub fn clippy_check_modules(project_root: &Path, verbose: bool) -> Result<Module
         // the check above on the next pass, so remove it before writing.
         let _ = std::fs::remove_file(rmeta);
         let out = Command::new("clippy-driver")
-            .arg("--crate-type=lib")
+            .arg(format!("--crate-type={PIC_CRATE_TYPE}"))
             .arg("--edition")
             .arg(&cand.edition)
             .arg("--target")
             .arg(spec.module_target)
             .arg("-O")
             .arg("-C")
-            .arg("relocation-model=pic")
+            .arg(format!("relocation-model={PIC_RELOCATION_MODEL}"))
             .args(spec.extra_rustflags)
             .args(cfg_abi_args(spec))
             .args(cfg_feature_args(cand))
@@ -1222,11 +1222,21 @@ fn stamped_target(out_path: &Path) -> Option<String> {
 /// leaves every source older than every object, so it has to invalidate
 /// the same way. Equal to the bare triple where a silicon adds nothing.
 fn compile_key(spec: &AbiSpec) -> String {
-    if spec.extra_rustflags.is_empty() {
-        spec.module_target.to_string()
-    } else {
-        format!("{} {}", spec.module_target, spec.extra_rustflags.join(" "))
+    // The crate type and relocation model are part of the compile (they
+    // decide how a module's data is reached, `PIC_CRATE_TYPE`), so an
+    // artefact built under others rebuilds. wasm builds as a cdylib whatever
+    // these say, and its key stays the target.
+    let mut key = spec.module_target.to_string();
+    if spec.linker.is_some() {
+        key.push_str(&format!(
+            " crate-type={PIC_CRATE_TYPE} relocation-model={PIC_RELOCATION_MODEL}"
+        ));
     }
+    for flag in spec.extra_rustflags {
+        key.push(' ');
+        key.push_str(flag);
+    }
+    key
 }
 
 /// Record how this artefact was built, beside it.
@@ -1397,6 +1407,33 @@ fn source_ref_macro_paths(src: &str) -> Vec<String> {
     out
 }
 
+/// The crate type a PIC module compiles as.
+///
+/// A module is a leaf: the kernel reaches it only through its `#[no_mangle]`
+/// C entry points, and no crate links against its Rust items. `staticlib`
+/// says exactly that, and with `PIC_RELOCATION_MODEL` it decides how the
+/// module's own data is reached. Under `lib`, every `pub` item reachable from
+/// the crate root is exported — and the SDK is mounted textually at every
+/// module's crate root, so every `pub static` it or the module declares is —
+/// and under `relocation-model=pic` an exported item is preemptible, so code
+/// reaches it through a GOT entry. The GOT holds link-time addresses that the
+/// loader never relocates, in a section the packer does not carry: the read
+/// faults (or, where the linker happens to relax the access, works — so the
+/// defect came and went with instruction scheduling). Under `staticlib` only
+/// the C entry points are exported; every other item is internal, and
+/// internal data is reached PC-relative like a `const`.
+const PIC_CRATE_TYPE: &str = "staticlib";
+
+/// The relocation model a PIC module compiles under.
+///
+/// `pie`, not `pic`: both keep every address the code forms relative to the
+/// code (and both make LLVM lower a `match` of literals on AArch64 to a table
+/// of relative offsets, where `static` would store absolute pointers), but
+/// under `pie` an item the module itself defines is never preemptible, so the
+/// C entry points the crate does export — `module_step`, whose address a
+/// module may take — are reached PC-relative too, not through a GOT.
+const PIC_RELOCATION_MODEL: &str = "pie";
+
 fn compile_module_pic(
     cand: &Candidate,
     spec: &AbiSpec,
@@ -1411,7 +1448,7 @@ fn compile_module_pic(
     // 1) Compile to relocatable object.
     let mut rustc = Command::new("rustc");
     rustc
-        .arg("--crate-type=lib")
+        .arg(format!("--crate-type={PIC_CRATE_TYPE}"))
         .arg("--edition")
         .arg(&cand.edition)
         .arg("--target")
@@ -1426,7 +1463,7 @@ fn compile_module_pic(
             cand.opt_level.as_deref().unwrap_or("2")
         ))
         .arg("-C")
-        .arg("relocation-model=pic")
+        .arg(format!("relocation-model={PIC_RELOCATION_MODEL}"))
         .args(spec.extra_rustflags)
         .args(cfg_abi_args(spec))
         .args(cfg_feature_args(cand));
@@ -1465,24 +1502,9 @@ fn compile_module_pic(
     compiled?;
     let obj = std::fs::read(&obj_path)
         .map_err(|e| Error::Module(format!("{}: {e}", obj_path.display())))?;
-    let absolute = absolute_relocations(&obj)?;
-    if !absolute.is_empty() {
-        // A warning in a lenient build, an error in a strict one — the same
-        // rule rustc's own warnings follow here.
-        let msg = format!(
-            "{}: absolute pointers in {} — a module is loaded at an arbitrary \
-             address with no relocation applied, so each reads a wrong address \
-             at run time. Usual cause: a `match` that RETURNS `&[u8]`/`&str` \
-             literals (it lowers to a table of pointers), or a `const`/`static` \
-             holding references. Hold names in a `name_table!` instead.",
-            cand.name,
-            absolute.join(", "),
-        );
-        if opts.strict {
-            return Err(Error::Module(msg));
-        }
-        eprintln!("warning: {msg}");
-    }
+    // Refused in a lenient build as well as a strict one: unlike a warning,
+    // each of these is an artefact that reads a wrong address at run time.
+    relocation_refusals(&obj)?.into_result(&cand.name)?;
 
     let stack = measure_stack(&asm_path, spec.module_target);
     // The object is what links; the assembly has been read.
@@ -1565,12 +1587,78 @@ fn measure_stack(
     crate::stack_depth::worst_case(&asm, isa, &roots)
 }
 
-/// The sections of a relocatable object that carry an ABSOLUTE relocation:
-/// a stored address the linker fills in for a fixed load address. A module is
-/// copied to wherever the kernel places it and nothing patches such an
-/// address, so each is wrong at run time.
+/// What a module object holds that cannot work once the kernel places the
+/// module: each a way the code would read a wrong address at run time. A
+/// module is copied to wherever the kernel puts it, the loader applies no
+/// relocation, and the image is mapped read-only and shared by every instance.
+#[derive(Debug, Default)]
+struct Refusals {
+    /// Sections carrying an ABSOLUTE relocation: a stored address the linker
+    /// fills in for a fixed load address (exemptions below).
+    absolute: Vec<String>,
+    /// Symbols the code reaches through a GOT entry. The entry is a stored
+    /// link-time address like any absolute one, in a `.got` the packer does
+    /// not carry. Under `PIC_CRATE_TYPE` and `PIC_RELOCATION_MODEL` nothing
+    /// the module defines goes this way, with one exception rustc makes: a
+    /// static exported by name (`#[no_mangle]`, `#[export_name]`) whose
+    /// initializer it emits as another type (any table not of bytes) loses
+    /// its local marking. The rest is what the module does not define.
+    got: Vec<String>,
+    /// Writable statics the code reaches (`static mut`, a static with
+    /// interior mutability, `.bss`, `COMMON`). The image is read-only — and
+    /// one copy serves every instance — and `.bss` is not in it at all.
+    writable: Vec<String>,
+}
+
+impl Refusals {
+    fn is_empty(&self) -> bool {
+        self.absolute.is_empty() && self.got.is_empty() && self.writable.is_empty()
+    }
+
+    /// `Err` naming every offence and its remedy, for module `name`.
+    fn into_result(self, name: &str) -> Result<()> {
+        if self.is_empty() {
+            return Ok(());
+        }
+        let mut why = Vec::new();
+        if !self.absolute.is_empty() {
+            why.push(format!(
+                "absolute pointers in {} — usual cause: a `match` that RETURNS \
+                 `&[u8]`/`&str` literals (it lowers to a table of pointers), or a \
+                 `const`/`static` holding references; hold names in a \
+                 `name_table!` instead",
+                self.absolute.join(", ")
+            ));
+        }
+        if !self.got.is_empty() {
+            why.push(format!(
+                "read through a GOT entry: {} — a GOT holds link-time addresses \
+                 the loader never relocates; drop `#[no_mangle]`/`#[export_name]` \
+                 from data the module reads, and define it in the module",
+                self.got.join(", ")
+            ));
+        }
+        if !self.writable.is_empty() {
+            why.push(format!(
+                "writable static {} — a module image is read-only and shared by \
+                 every instance; keep mutable state in the state block \
+                 (`module_state_size`), and declare read-only tables as a plain \
+                 `static` or `const` with no interior mutability",
+                self.writable.join(", ")
+            ));
+        }
+        Err(Error::Module(format!(
+            "{name}: {} (a module is loaded at an arbitrary address with no \
+             relocation applied; see docs/architecture/module_architecture.md, \
+             \"Position-independent data\")",
+            why.join("; ")
+        )))
+    }
+}
+
+/// The offences in a relocatable object (`Refusals`).
 ///
-/// Two shapes are exempt, each decided from the object's structure rather
+/// Of absolute relocations, two shapes are exempt, each decided from the object's structure rather
 /// than from a name, so neither can hide a table that code reads:
 ///
 /// - A data section nothing in the object references — a retention static
@@ -1585,7 +1673,11 @@ fn measure_stack(
 ///   pointer, so it cannot pass either.
 ///
 /// An executable section is never exempt.
-fn absolute_relocations(obj: &[u8]) -> Result<Vec<String>> {
+///
+/// GOT and writable-data references are judged from any allocated section, so
+/// code and data alike: a reference from a non-allocated section (debug info)
+/// is never executed.
+fn relocation_refusals(obj: &[u8]) -> Result<Refusals> {
     struct Shdr {
         name: u64,
         ty: u64,
@@ -1665,12 +1757,28 @@ fn absolute_relocations(obj: &[u8]) -> Result<Vec<String>> {
     let name = |off: u64| -> Result<String> {
         Ok(String::from_utf8_lossy(text(shstrndx, off)?).into_owned())
     };
-    // The absolute address types, per machine.
+    // The absolute address types, per machine: stored addresses, and the
+    // instruction forms that build one from immediates.
     let absolute = |ty: u64| match machine {
-        183 => ty == 257 || ty == 258,         // AArch64: ABS64, ABS32
-        40 => ty == 2,                         // ARM: ABS32
+        // ABS64, ABS32, ABS16; MOVW_UABS_G0..G3 (and _NC), MOVW_SABS_G0..G2.
+        183 => (257..=259).contains(&ty) || (263..=272).contains(&ty),
+        // ABS32, TARGET1 (ABS32 to every linker this build uses), MOVW_ABS_NC,
+        // MOVT_ABS, THM_MOVW_ABS_NC, THM_MOVT_ABS.
+        40 => matches!(ty, 2 | 38 | 43 | 44 | 47 | 48),
         62 => ty == 1 || ty == 10 || ty == 11, // x86-64: 64, 32, 32S
         243 => ty == 1 || ty == 2,             // RISC-V: 32, 64
+        _ => false,
+    };
+    // The types that make the linker build a GOT entry, or address the GOT.
+    let through_got = |ty: u64| match machine {
+        // MOVW_GOTOFF_G0..G3, GOTREL64/32, GOT_LD_PREL19, LD64_GOTOFF_LO15,
+        // ADR_GOT_PAGE, LD64_GOT_LO12_NC, LD64_GOTPAGE_LO15.
+        183 => (300..=313).contains(&ty),
+        // GOTOFF32, BASE_PREL, GOT_BREL, GOT_ABS, GOT_PREL, GOT_BREL12,
+        // GOTOFF12, GOTRELAX.
+        40 => matches!(ty, 24..=26 | 95..=99),
+        62 => matches!(ty, 3 | 9 | 41 | 42), // x86-64: GOT32, GOTPCREL(X)
+        243 => ty == 20,                     // RISC-V: GOT_HI20
         _ => false,
     };
     // One relocation entry: (offset in its target, type, symbol index, addend).
@@ -1695,6 +1803,23 @@ fn absolute_relocations(obj: &[u8]) -> Result<Vec<String>> {
         } else {
             (u32_at(s + 4)?, u16_at(s + 14)?)
         })
+    };
+    // A symbol's name as the source spells it: a section symbol is named by
+    // its section, every other by the symbol table's string table.
+    let symbol_name = |symtab: &Shdr, sym: u64| -> Result<String> {
+        let s = at(symtab.off, sym.checked_mul(symtab.entsize).ok_or_else(bad)?)?;
+        let (st_name, st_info) = if elf64 {
+            (u32_at(s)?, u64::from(*obj.get(s + 4).ok_or_else(bad)?))
+        } else {
+            (u32_at(s)?, u64::from(*obj.get(s + 12).ok_or_else(bad)?))
+        };
+        const STT_SECTION: u64 = 3;
+        if st_info & 0xf == STT_SECTION {
+            let (_, shndx) = symbol(symtab, sym)?;
+            return name(header(shndx)?.name);
+        }
+        let raw = String::from_utf8_lossy(text(symtab.link, st_name)?).into_owned();
+        Ok(crate::stack_depth::demangle(&raw))
     };
     // Relocation sections: SHT_RELA (4) or SHT_REL (9), with a usable entry size.
     let rel_sections = || -> Result<Vec<Shdr>> {
@@ -1730,9 +1855,57 @@ fn absolute_relocations(obj: &[u8]) -> Result<Vec<String>> {
         }
     }
 
+    const SHF_WRITE: u64 = 0x1;
+    const SHF_ALLOC: u64 = 0x2;
     const SHF_EXECINSTR: u64 = 0x4;
+    const SHT_NOBITS: u64 = 8;
+    const SHN_COMMON: u64 = 0xfff2;
+    let mut found = Refusals::default();
+
+    // GOT and writable-data references, from every allocated section.
+    for rel in &rels {
+        if header(rel.info)?.flags & SHF_ALLOC == 0 {
+            continue;
+        }
+        let symtab = header(rel.link)?;
+        let mut e = 0u64;
+        while e.checked_add(rel.entsize).is_some_and(|n| n <= rel.size) {
+            let (_, ty, sym, _) = entry(rel, e)?;
+            e += rel.entsize;
+            if sym == 0 {
+                continue;
+            }
+            if through_got(ty) {
+                found.got.push(symbol_name(&symtab, sym)?);
+                continue;
+            }
+            let (_, shndx) = symbol(&symtab, sym)?;
+            let writable = if shndx == SHN_COMMON {
+                true
+            } else if shndx == 0 || shndx >= 0xff00 || shndx == rel.info {
+                false
+            } else {
+                let h = header(shndx)?;
+                // `.data.rel.ro` is constant data LLVM marks writable only
+                // because a dynamic linker would patch its pointers; this
+                // build has none, its pointers are judged as absolute
+                // relocations, and the linker script places it in `.rodata`.
+                let relro = name(h.name)?.starts_with(".data.rel.ro");
+                h.flags & SHF_ALLOC != 0
+                    && (h.ty == SHT_NOBITS || (h.flags & SHF_WRITE != 0 && !relro))
+            };
+            if writable {
+                found.writable.push(symbol_name(&symtab, sym)?);
+            }
+        }
+    }
+    found.got.sort();
+    found.got.dedup();
+    found.writable.sort();
+    found.writable.dedup();
+
+    // Absolute relocations.
     let ptr = if elf64 { 8u64 } else { 4 };
-    let mut found = Vec::new();
     for rel in &rels {
         let target = header(rel.info)?;
         let symtab = header(rel.link)?;
@@ -1784,7 +1957,7 @@ fn absolute_relocations(obj: &[u8]) -> Result<Vec<String>> {
             Ok(len > 0 && inside && obj.get(from..to).is_some_and(|b| b.ends_with(b".rs")))
         };
         if executable || !(unreferenced || location()?) {
-            found.push(name(target.name)?);
+            found.absolute.push(name(target.name)?);
         }
     }
     Ok(found)
@@ -2255,14 +2428,22 @@ pub static RS_NAMES: [&[u8]; 2] = [b"src/a.rs", b"src/b.rs"];
 "#;
 
     fn compiled(target: &str) -> Vec<u8> {
-        let dir = std::env::temp_dir().join(format!("fluxor-lint-{}-{target}", std::process::id()));
+        compiled_source(target, "lint", LINT_CASES)
+    }
+
+    /// `source` compiled as `modules build` compiles a PIC module.
+    fn compiled_source(target: &str, tag: &str, source: &str) -> Vec<u8> {
+        let dir =
+            std::env::temp_dir().join(format!("fluxor-{tag}-{}-{target}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("scratch dir");
         let src = dir.join("cases.rs");
         let obj = dir.join("cases.o");
-        std::fs::write(&src, LINT_CASES).expect("write source");
+        std::fs::write(&src, source).expect("write source");
         let out = std::process::Command::new("rustc")
-            .args(["--target", target, "--crate-type", "lib", "-O"])
-            .args(["-C", "relocation-model=pic", "--emit", "obj", "-o"])
+            .args(["--target", target, "--crate-type", PIC_CRATE_TYPE, "-O"])
+            .arg("-C")
+            .arg(format!("relocation-model={PIC_RELOCATION_MODEL}"))
+            .args(["--emit", "obj", "-o"])
             .arg(&obj)
             .arg(&src)
             .output()
@@ -2292,7 +2473,9 @@ pub static RS_NAMES: [&[u8]; 2] = [b"src/a.rs", b"src/b.rs"];
             ("thumbv8m.main-none-eabi", true),
             ("aarch64-unknown-none", false),
         ] {
-            let found = absolute_relocations(&compiled(target)).expect("parses");
+            let found = relocation_refusals(&compiled(target))
+                .expect("parses")
+                .absolute;
             let has = |needle: &str| found.iter().any(|s| s.contains(needle));
             assert_eq!(
                 has("switch.table.name"),
@@ -2320,16 +2503,165 @@ pub static RS_NAMES: [&[u8]; 2] = [b"src/a.rs", b"src/b.rs"];
         }
     }
 
+    /// Read-only data of every shape a module declares, each read at an index
+    /// the compiler cannot see, so each read is a load from the table. Byte
+    /// values are not uniform, so no read folds to a constant.
+    const DATA_CASES: &str = r#"
+#![no_std]
+#[panic_handler] fn p(_: &core::panic::PanicInfo) -> ! { loop {} }
+const fn bytes<const N: usize>(seed: u8) -> [u8; N] {
+    let mut o = [0u8; N]; let mut i = 0;
+    while i < N { o[i] = (i as u8).wrapping_mul(seed).wrapping_add(i as u8 >> 3); i += 1; }
+    o
+}
+const fn words<const N: usize>() -> [u32; N] {
+    let mut o = [0u32; N]; let mut i = 0;
+    while i < N { o[i] = (i as u32).wrapping_mul(2_654_435_761); i += 1; }
+    o
+}
+pub static BIG_STATIC: [u8; 24155] = bytes(3);
+pub static SMALL_STATIC: [u8; 24] = bytes(5);
+pub static WORD_STATIC: [u32; 300] = words();
+static PRIVATE_STATIC: [u8; 300] = bytes(7);
+mod nested { pub static NESTED_STATIC: [u8; 300] = super::bytes(9); }
+pub const CONST_ARRAY: [u8; 300] = bytes(11);
+pub const CONST_SLICE: &[u8] = &bytes::<300>(13);
+#[no_mangle] pub extern "C" fn big(i: usize) -> u8 { BIG_STATIC[i % 24155] }
+#[no_mangle] pub extern "C" fn small(i: usize) -> u8 { SMALL_STATIC[i % 24] }
+#[no_mangle] pub extern "C" fn word(i: usize) -> u32 { WORD_STATIC[i % 300] }
+#[no_mangle] pub extern "C" fn private(i: usize) -> u8 { PRIVATE_STATIC[i % 300] }
+#[no_mangle] pub extern "C" fn nested(i: usize) -> u8 { nested::NESTED_STATIC[i % 300] }
+#[no_mangle] pub extern "C" fn array(i: usize) -> u8 { CONST_ARRAY[i % 300] }
+#[no_mangle] pub extern "C" fn slice(i: usize) -> u8 { CONST_SLICE[i % 300] }
+// The address of an entry point the crate exports, as a probe pokes its code.
+#[no_mangle] pub extern "C" fn module_step(s: *mut u8) -> i32 { s as i32 }
+#[no_mangle] pub extern "C" fn step_addr() -> *const u32 { module_step as *const u32 }
+"#;
+
+    /// The statics a module cannot have, each one the code reaches.
+    const REFUSED_CASES: &str = r#"
+#![no_std]
+#[panic_handler] fn p(_: &core::panic::PanicInfo) -> ! { loop {} }
+use core::sync::atomic::{AtomicU32, Ordering};
+pub static mut COUNTER_MUT: u32 = 7;
+pub static mut ZEROED_MUT: [u8; 64] = [0; 64];
+pub static TICKS_ATOMIC: AtomicU32 = AtomicU32::new(3);
+// Exported by name and not of bytes: rustc reaches it through the GOT.
+#[no_mangle] pub static EXPORTED_TABLE: [u32; 4] = [1, 2, 3, 4];
+#[no_mangle] pub extern "C" fn bump() -> u32 {
+    unsafe { COUNTER_MUT += 1; COUNTER_MUT }
+}
+#[no_mangle] pub extern "C" fn zero(i: usize, v: u8) -> u8 {
+    unsafe { ZEROED_MUT[i & 63] = v; ZEROED_MUT[(i >> 6) & 63] }
+}
+#[no_mangle] pub extern "C" fn tick() -> u32 {
+    let v = TICKS_ATOMIC.load(Ordering::Relaxed);
+    TICKS_ATOMIC.store(v.wrapping_add(1), Ordering::Relaxed);
+    v
+}
+#[no_mangle] pub extern "C" fn exported(i: usize) -> u32 { EXPORTED_TABLE[i & 3] }
+"#;
+
+    const PIC_TRIPLES: [&str; 3] = [
+        "thumbv6m-none-eabi",
+        "thumbv8m.main-none-eabi",
+        "aarch64-unknown-none",
+    ];
+
+    /// A pointer-free read-only table is reached PC-relative whatever it is
+    /// declared as: a `pub static` at the crate root (where the SDK's textual
+    /// mount puts every table) included — the shape that, built as a `lib`,
+    /// went through a GOT the image did not carry and faulted on first use.
+    #[test]
+    fn read_only_tables_of_every_shape_pass() {
+        for target in PIC_TRIPLES {
+            let found =
+                relocation_refusals(&compiled_source(target, "data", DATA_CASES)).expect("parses");
+            assert!(found.is_empty(), "{target}: {found:?}");
+        }
+    }
+
+    /// What the build refuses — in a lenient build as in a strict one — is
+    /// each writable static the code reaches, named, and data read through a
+    /// GOT entry, named; and the message carries the remedy.
+    #[test]
+    fn writable_statics_and_got_reads_are_refused_by_name() {
+        for target in PIC_TRIPLES {
+            let found = relocation_refusals(&compiled_source(target, "refused", REFUSED_CASES))
+                .expect("parses");
+            let writable = |n: &str| found.writable.iter().any(|s| s.contains(n));
+            for name in ["COUNTER_MUT", "ZEROED_MUT", "TICKS_ATOMIC"] {
+                assert!(writable(name), "{target}: {name} not refused: {found:?}");
+            }
+            assert!(
+                found.got.iter().any(|s| s.contains("EXPORTED_TABLE")),
+                "{target}: a `#[no_mangle]` table read through the GOT passed: {found:?}"
+            );
+            let msg = found.into_result("probe").expect_err("refused").to_string();
+            for needle in [
+                "probe: ",
+                "writable static",
+                "COUNTER_MUT",
+                "state block",
+                "read through a GOT entry",
+                "EXPORTED_TABLE",
+                "#[no_mangle]",
+                "Position-independent data",
+            ] {
+                assert!(msg.contains(needle), "{target}: no `{needle}` in: {msg}");
+            }
+        }
+    }
+
+    /// The build step itself refuses, strict or lenient, before it links: a
+    /// module whose code writes a `static mut` never becomes an artefact.
+    #[test]
+    fn the_build_refuses_a_writable_static_in_either_mode() {
+        let Some(spec) = abi_spec("aarch64") else {
+            panic!("aarch64 recipe");
+        };
+        for strict in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let entry = dir.path().join("mod.rs");
+            std::fs::write(&entry, REFUSED_CASES).unwrap();
+            let mut cand = candidate(&["bcm2712"]);
+            cand.name = "refused_probe".into();
+            cand.dir = dir.path().to_path_buf();
+            cand.entry = entry;
+            let opts = BuildOpts {
+                project_root: repo_root(),
+                selector: TargetSelector::One("bcm2712".into()),
+                out_root: dir.path().join("out"),
+                strict,
+                verbose: false,
+            };
+            let err = match compile_module_pic(&cand, spec, dir.path(), &opts) {
+                Ok(_) => panic!("strict={strict}: a writable static built"),
+                Err(e) => e.to_string(),
+            };
+            assert!(
+                err.contains("refused_probe: ")
+                    && err.contains("writable static")
+                    && err.contains("COUNTER_MUT"),
+                "strict={strict}: {err}"
+            );
+            assert!(
+                !dir.path().join("refused_probe.fmod").exists(),
+                "strict={strict}: an artefact was written"
+            );
+        }
+    }
+
     #[test]
     fn position_independent_relocations_pass() {
         // AArch64 PREL32 (261) and ARM REL32 (3) are position independent.
         assert!(
-            absolute_relocations(&object(true, 183, &[(".text.f", 261)], b""))
+            relocation_refusals(&object(true, 183, &[(".text.f", 261)], b""))
                 .unwrap()
                 .is_empty()
         );
         assert!(
-            absolute_relocations(&object(false, 40, &[(".text.f", 3)], b""))
+            relocation_refusals(&object(false, 40, &[(".text.f", 3)], b""))
                 .unwrap()
                 .is_empty()
         );
@@ -2339,9 +2671,9 @@ pub static RS_NAMES: [&[u8]; 2] = [b"src/a.rs", b"src/b.rs"];
     fn a_truncated_object_is_an_error_not_a_panic() {
         let o = object(true, 183, &[(".data.rel.ro.table", 257)], b"create");
         for cut in [0, 3, 20, 63, o.len() / 2] {
-            let _ = absolute_relocations(&o[..cut]);
+            let _ = relocation_refusals(&o[..cut]);
         }
-        assert!(absolute_relocations(b"not an elf").is_err());
+        assert!(relocation_refusals(b"not an elf").is_err());
     }
 
     fn repo_root() -> PathBuf {

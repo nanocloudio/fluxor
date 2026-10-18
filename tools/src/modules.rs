@@ -919,6 +919,8 @@ struct ElfSection {
         reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
     )]
     sh_type: u32,
+    /// `sh_flags` (`SHF_ALLOC` = 0x2: the section occupies the image).
+    flags: u64,
     addr: usize,
     data: Vec<u8>,
     size: usize,
@@ -1039,6 +1041,16 @@ fn parse_elf(data: &[u8]) -> Result<(Vec<ElfSection>, Vec<ElfSymbol>)> {
             data[sh_off + 7],
         ]);
         let (sh_offset, sh_size, sh_addr) = sh_offset_size_addr(sh_off);
+        let sh_flags = if elf64 {
+            u64::from_le_bytes(data[sh_off + 8..sh_off + 16].try_into().unwrap())
+        } else {
+            u64::from(u32::from_le_bytes([
+                data[sh_off + 8],
+                data[sh_off + 9],
+                data[sh_off + 10],
+                data[sh_off + 11],
+            ]))
+        };
 
         // Get section name
         let name_end = shstrtab[sh_name_idx..]
@@ -1067,6 +1079,7 @@ fn parse_elf(data: &[u8]) -> Result<(Vec<ElfSection>, Vec<ElfSymbol>)> {
         sections.push(ElfSection {
             name,
             sh_type,
+            flags: sh_flags,
             addr: sh_addr,
             data: section_data,
             size: sh_size,
@@ -1254,6 +1267,38 @@ fn read_embedded_arena_bytes(sections: &[ElfSection], symbols: &[ElfSymbol]) -> 
     Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
 }
 
+/// The output sections a module image carries: code and read-only data (laid
+/// out as linked), the data section after them, and the parameter schema.
+const CARRIED_SECTIONS: &[&str] = &[".text", ".rodata", ".data", ".param_schema"];
+
+/// Refuse a linked module that holds an allocated section the image does not
+/// carry. Code that reaches such a section — a `.got` above all, which holds
+/// link-time addresses and is what a `pub static` read under a `lib` build
+/// produced — reads whatever lies past the image's code at run time. The
+/// object-level check in `modules build` names the symbol; this is the
+/// backstop for an ELF linked by any other route or script.
+fn refuse_uncarried_sections(input: &Path, sections: &[ElfSection]) -> Result<()> {
+    const SHF_ALLOC: u64 = 0x2;
+    let stray: Vec<&str> = sections
+        .iter()
+        .filter(|s| s.flags & SHF_ALLOC != 0 && s.size > 0)
+        .map(|s| s.name.as_str())
+        .filter(|n| !CARRIED_SECTIONS.contains(n))
+        .collect();
+    if stray.is_empty() {
+        return Ok(());
+    }
+    Err(Error::Module(format!(
+        "{}: linked module holds {} outside the image it packs into ({}), so \
+         code that reaches it reads a wrong address at run time — a `.got` \
+         means data reached through a GOT entry; see \
+         docs/architecture/module_architecture.md, \"Position-independent data\"",
+        input.display(),
+        stray.join(", "),
+        CARRIED_SECTIONS.join(", "),
+    )))
+}
+
 /// Find a section by name
 fn find_section<'a>(sections: &'a [ElfSection], name: &str) -> Option<&'a ElfSection> {
     sections.iter().find(|s| s.name == name)
@@ -1331,6 +1376,7 @@ pub fn pack_fmod(
     } = ctx;
     let elf_data = std::fs::read(input)?;
     let (sections, symbols) = parse_elf(&elf_data)?;
+    refuse_uncarried_sections(input, &sections)?;
 
     // Extract section data
     let text_section = find_section(&sections, ".text");

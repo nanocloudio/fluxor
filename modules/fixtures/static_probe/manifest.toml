@@ -1,0 +1,19 @@
+version = "1.0.0"
+hardware_targets = ["rp2350", "bcm2712", "linux"]
+
+# Holds the claim that a module reads its pointer-free read-only data
+# correctly wherever the kernel places it, whether the table is a `const`
+# array, a `const` slice or a `static` — small or larger than a page, of
+# bytes or of words, `pub` at the crate root (where the SDK's textual mount
+# puts every table) or not. On its first step it sums each table through
+# loads the compiler cannot fold and compares the sum with one computed at
+# compile time. A table the code reaches through a wrong address either
+# faults the module or reads the wrong bytes, and the line says which.
+#
+#   [static_probe] read <table>          about to read it
+#   [static_probe] ok <table> <sum>      the bytes are the ones written
+#   [static_probe] BAD <table> <sum>     the bytes are not
+#   [static_probe] done                  every table read correctly
+
+[observability]
+exempt = "data-placement fixture; its '[static_probe]' lines are the observable, read by the static-data test"

@@ -265,16 +265,36 @@ The runtime loader enforces a concrete module binary contract:
 
 #### Position-independent data
 
-A module image is placed at a load-time address and the loader applies
-no relocations, so the image may contain no absolute address. Scalar
-data is safe: a `static` or `const` table of integers or bytes lives in
-`.rodata` and is reached PC-relative (`adrp` plus page offset on
-aarch64, a PC-relative literal on thumb, a fixed linear-memory offset
-on wasm32). The packer keeps every module's code page-aligned so the
-`adrp` pair resolves at any load address. What is not safe is data
-that *contains* an address: a `const` array of `&[u8]` or function
-pointers, and a `static` holding a reference — including a single `&str`.
-Each reads a wrong address at run time, on every target.
+A module image is placed at a load-time address, the loader applies no
+relocations, and the image is mapped read-only and shared by every instance
+of the module. So the image may contain no absolute address, and nothing in
+it may be written.
+
+**Read-only data without addresses works in every shape.** A `const` array, a
+`const` slice (`pub const T: &[u8] = &[...]`), and a `static` — small or many
+pages long, of bytes or of words, `pub` at the crate root or private — all
+land in `.rodata` and are reached PC-relative (`adrp` plus page offset on
+aarch64, a PC-relative literal on thumb, a fixed linear-memory offset on
+wasm32). The packer keeps every module's code page-aligned and `.rodata` at
+its linked offset from `.text`, so the `adrp` pair resolves at any load
+address. Choose between `static` and `const` on Rust's terms (one copy with an
+address versus a value inlined at each use), not on the loader's.
+
+That holds because of how `fluxor modules build` compiles a module:
+`--crate-type=staticlib -C relocation-model=pie`. A module is a leaf whose
+only exports are its `#[no_mangle]` entry points, and `staticlib` makes every
+other item internal; `pie` makes even those entry points non-preemptible.
+Built as a `lib` under `pic` — as modules once were — every `pub` item
+reachable from the crate root is exported and preemptible, and the SDK is
+mounted textually at each module's crate root, so code reached each
+`pub static` through a GOT entry: a link-time address the loader never
+relocates, in a `.got` the packer does not carry. The read faulted (or, where
+the linker happened to relax that particular access, worked, so the defect
+came and went with instruction scheduling).
+
+What is not safe is data that *contains* an address: a `const` array of
+`&[u8]` or function pointers, and a `static` holding a reference — including a
+single `&str`. Each reads a wrong address at run time, on every target.
 
 A `match` that returns literals differs by machine. On 32-bit Arm (both RP
 dies) LLVM lowers it to a switch lookup table of absolute pointers, so it
@@ -288,11 +308,28 @@ of bytes with integer end offsets, built at compile time, so the only
 address in play is the table's own. Otherwise act in each arm rather than
 returning the literal from it.
 
-`fluxor modules build` enforces this. It refuses (under `--strict`, as
-`fluxor ci` builds; warns otherwise) an object carrying an absolute
-relocation, naming the section. Two shapes are exempt, recognised from the
-object's structure rather than from a name, so neither can hide a table
-that code reads:
+**Writable statics are not supported, by design.** `static mut`, a static
+with interior mutability (`AtomicU32`, `Cell`, `UnsafeCell`), and a
+zero-initialised one (`.bss`, which the module linker script discards) have
+nowhere to live: the image is read-only and one copy serves every instance.
+Mutable state goes in the state block the kernel allocates from
+`module_state_size()` and hands to every entry point.
+
+`fluxor modules build` enforces all of this, in a lenient build as in a
+strict one (each is an artefact that reads a wrong address, not a style
+warning). Reading the object it compiled, it refuses, naming each offence:
+
+- a section carrying an absolute relocation (a stored address, or an
+  instruction pair that builds one from immediates);
+- a symbol the code reaches through a GOT entry — with the build's flags only
+  a static exported by name (`#[no_mangle]`, `#[export_name]`) that is not a
+  table of bytes, for which rustc drops the local marking; drop the
+  attribute from data the module reads;
+- a writable static the code reaches, as above.
+
+Two absolute-relocation shapes are exempt, recognised from the object's
+structure rather than from a name, so neither can hide a table that code
+reads:
 
 - a data section nothing in the object references — a retention static,
   kept alive by the linker script and never loaded by code;
@@ -304,6 +341,10 @@ that code reads:
 A table code reads is reached by a relocation from that code and is never
 exactly one `Location`, whatever it is named and whatever its strings end
 in.
+
+As a backstop for an ELF linked by any other route, packing refuses a linked
+module holding an allocated section the image does not carry (anything but
+`.text`, `.rodata`, `.data`, `.param_schema` — a `.got` above all).
 
 #### What a module cannot link
 
