@@ -149,8 +149,9 @@ pub(crate) fn apply_quarantine(
 
     // Reverse: any module that declared THIS module as its
     // partner AND has itself faulted within the window. Walks
-    // every fault_info slot once — MAX_MODULES is small (64), so
-    // the per-fault cost is bounded. Indexed loop because the body
+    // every fault_info slot once — up to MAX_MODULES (1024 on the
+    // host profiles, 32 on RP), a bounded walk that runs only when a
+    // module faults, never per step. Indexed loop because the body
     // reads from `sched.finished` and `sched.fault_info` and writes
     // to `targets` — three parallel arrays keyed by module index.
     #[expect(

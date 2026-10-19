@@ -1107,7 +1107,9 @@ fn privileged_op_permission(op: u32) -> Option<u16> {
         0x0C52..=0x0C5F | 0x0CF9 => Some(MONITOR),
 
         // ── reconfigure: graph slot commit, boot counter, FMP routing ──
-        0x0C67..=0x0C6F => Some(RECONFIGURE),
+        //    SLOT_CAPACITY (0x0C23) sits outside the full block, beside it in
+        //    kind: the module-slot count reconfigure and monitor size by. ──
+        0x0C23 | 0x0C67..=0x0C6F => Some(RECONFIGURE),
 
         // ── live-mutation block (APPLY_ADD/FREE_OWNER + owner PAUSE/
         //    RESUME, 0x0C47..=0x0C4A): dispatched by the reconfigure kernel
@@ -1787,7 +1789,8 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
         | reconfigure::MODULE_COUNT
         | reconfigure::MODULE_INFO
         | reconfigure::MODULE_UPSTREAM
-        | reconfigure::MODULE_DONE => handle_reconfigure_op(opcode, arg, arg_len),
+        | reconfigure::MODULE_DONE
+        | reconfigure::SLOT_CAPACITY => handle_reconfigure_op(opcode, arg, arg_len),
         // ── NVMe paged-arena backing registration (kernel-private
         //    dispatch registry for a private backing interface) ──
         provider_registry::BACKING_PROVIDER_ENABLE => handle_service_register(opcode, arg, arg_len),
@@ -2351,25 +2354,28 @@ unsafe fn handle_reconfigure_op(opcode: u32, arg: *mut u8, arg_len: usize) -> i3
             scheduler::module_info_flags(idx) as i32
         }
         reconfigure::MODULE_UPSTREAM => {
-            // Arg layout: in `[module_idx:u16 LE]`, out `[mask word u64 LE × W]`
-            // from offset 2 (low word first), where the kernel writes
-            // `W = min(MODULE_MASK_WORDS, (arg_len - 2) / 8)` words and
-            // returns `MODULE_MASK_WORDS` — so a caller whose buffer is
-            // narrower than the full mask can detect the truncation from
-            // the return value. `arg_len >= 10` (index + one word).
-            if arg_len < 10 {
+            // Arg layout: in `[module_idx:u16 LE][first_word:u16 LE]`, out
+            // `[mask word u64 LE × W]` from offset 4, starting at mask word
+            // `first_word`. The kernel writes
+            // `W = min(total - first_word, (arg_len - 4) / 8)` words and
+            // returns `total` (`MODULE_MASK_WORDS`), so a caller reads the
+            // mask in windows sized to its own buffer and never needs the
+            // kernel's slot count compiled in. `arg_len >= 12` (index, first
+            // word, one word).
+            if arg_len < 12 {
                 return E_INVAL;
             }
             let Some(idx) = module_arg(arg, arg_len) else {
                 return E_INVAL;
             };
+            let first = usize::from(u16::from_le_bytes([*arg.add(2), *arg.add(3)]));
             let mut words = [0u64; crate::kernel::workload::bitmask::MODULE_MASK_WORDS];
             let total = scheduler::module_upstream_words(idx, &mut words);
-            let fit = ((arg_len - 2) / 8).min(total);
-            for (w, word) in words.iter().enumerate().take(fit) {
+            let fit = ((arg_len - 4) / 8).min(total.saturating_sub(first));
+            for (w, word) in words.iter().skip(first).enumerate().take(fit) {
                 let bytes = word.to_le_bytes();
                 for (i, b) in bytes.iter().enumerate() {
-                    *arg.add(2 + w * 8 + i) = *b;
+                    *arg.add(4 + w * 8 + i) = *b;
                 }
             }
             total as i32
@@ -2384,6 +2390,7 @@ unsafe fn handle_reconfigure_op(opcode: u32, arg: *mut u8, arg_len: usize) -> i3
                 0
             }
         }
+        reconfigure::SLOT_CAPACITY => crate::kernel::config::MAX_MODULES as i32,
         _ => E_NOSYS,
     }
 }

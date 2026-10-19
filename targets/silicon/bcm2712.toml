@@ -46,8 +46,8 @@ kernel_stack_kb = 1024
 # syscall from the module runs (a key-vault signature, a flash write). A
 # non-isolated module is admitted against the stack less this.
 kernel_stack_reserve_kb = 256
-# The pool every loaded module's state and arena come from: the SDK's aarch64
-# `kernel::STATE_ARENA_SIZE` (`modules/sdk/abi/config.rs`), 1 GiB. The kernel
+# The pool every loaded module's state and arena come from: the bcm2712
+# kernel's `STATE_ARENA_SIZE` (`src/kernel/config.rs::profile_bcm2712`), 1 GiB. The kernel
 # allocates that constant; this states it for the graph builder, which admits a
 # graph against the sum of its modules' published state sizes.
 state_arena_kb = 1048576
@@ -74,13 +74,11 @@ isolated_stack_kb = 64
 # Isolated modules at once: the kernel's static page-table slots (`MAX_ISO`).
 isolated_slots = 2
 
-# [kernel] capacity tunables for BCM2712 live in
-# `modules/sdk/config.rs::profile_host` (selected at compile time via
-# `cfg(target_arch = "aarch64")`). build.rs does not emit a
-# `chip_generated.rs` for BCM; STATE_ARENA / BUFFER_ARENA / CONFIG_ARENA
-# are re-exported through `src/platform/bcm2712/chip.rs`. Editing values
-# in a [kernel] section here would have no effect — edit
-# `modules/sdk/config.rs::profile_host::kernel` instead.
+# Kernel capacity for BCM2712 lives in `src/kernel/config.rs::profile_bcm2712`,
+# selected by the `chip-bcm2712` feature. build.rs does not emit a
+# `chip_generated.rs` for BCM, so a [kernel] section here would have no
+# effect (state_arena_kb above restates the arena for the graph builder and
+# is pinned to the kernel by `compose::bcm2712_state_arena_is_the_bcm2712_kernel_arena`).
 
 # NOTE: no [memory] here — the memory map is a board/emulator fact, declared in
 # the board overlay (see the header). BCM2712 silicon does not fix RAM origin.

@@ -658,7 +658,9 @@ pub const RANDOM_FILL: u32 = 0x0C3C;
 pub const SYS_CLOCK_HZ: u32 = 0x0C3B;
 
 /// Query the calling module's own scheduler index. handle=-1, no arg.
-/// Returns u8 (0..MAX_MODULES-1) on success, negative errno on failure.
+/// Returns the index — a u16 value below the kernel's module-slot count
+/// (`internal::reconfigure::SLOT_CAPACITY`) — on success, negative errno on
+/// failure.
 /// Used by anchors / workers to render `mod=<idx>` in MON_SESSION
 /// telemetry lines. Distinct from `internal::reconfigure::SELF_INDEX`
 /// (0x0C67), which is gated by the `reconfigure` permission and is

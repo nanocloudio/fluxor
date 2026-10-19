@@ -97,9 +97,11 @@ pub struct NodeCapacity {
 /// mirror of the kernel's per-profile limits; `capacity_mirrors_kernel_sources`
 /// (below) textually extracts the kernel constants and fails when they drift.
 ///
-/// `linux` and `pi5`/`bcm2712` share values because both compile the aarch64
-/// `profile_host` block (`modules/sdk/config.rs`) with the `multitenant`
-/// feature (`src/kernel/workload/owner.rs` MAX_OWNERS). `max_endpoints` is agent-level
+/// `linux` and `pi5`/`bcm2712` share one row because their kernel profiles
+/// (`profile_linux`, `profile_bcm2712` in `src/kernel/config.rs`) state the
+/// same values today, and both build the `multitenant` feature
+/// (`src/kernel/workload/owner.rs` MAX_OWNERS); the drift test pins each
+/// profile separately, so the day they diverge it fails and the row splits. `max_endpoints` is agent-level
 /// admission policy — the kernel has no endpoint table constant yet.
 pub fn capacity_for_profile(profile: &str) -> Option<NodeCapacity> {
     match profile {
@@ -1674,81 +1676,25 @@ mod tests {
         );
     }
 
-    /// Every per-silicon size the SDK publishes to MODULES must equal the figure
-    /// the RP kernel takes from the silicon TOML.
-    ///
-    /// On aarch64 and wasm there is one definition: `platform::chip` re-exports
-    /// `abi::config::kernel`, and `bcm2712/chip.rs` says why — "a locally-defined
-    /// copy of a size such as `STATE_ARENA_SIZE` can drift below what a module's
-    /// arena demand needs and fail silently on the board". On the RP targets there
-    /// are necessarily two: a PIC module compiles against the materialised SDK
-    /// alone and never sees `build.rs`'s output or the TOML, so the SDK restates
-    /// each number and `--cfg fluxor_abi` selects the arm.
-    ///
-    /// That second copy is the one this pins. Nothing else did, and both
-    /// `STATE_ARENA_SIZE` (240 KiB, published as 256) and
-    /// `MAX_MODULE_CONFIG_SIZE` (16/8 KiB, published as a flat 4) were wrong in
-    /// the SDK while every behavioural test passed — the consumers use these as
-    /// coarse tier predicates, so a wrong value lands on the same side of
-    /// `<= 64 KiB` and `<= 512 KiB` and changes nothing observable.
-    #[test]
-    fn sdk_embedded_profile_mirrors_silicon_tomls() {
-        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
-        let sdk = std::fs::read_to_string(repo.join("modules/sdk/abi/config.rs"))
-            .expect("modules/sdk/abi/config.rs");
-
-        // The embedded profile only; the host and wasm arms are the single source
-        // for their targets and have nothing to mirror.
-        let start = sdk
-            .find("mod profile_embedded {")
-            .expect("profile_embedded module");
-        let body = &sdk[start..];
-
-        // TOML key -> the constant `build.rs` generates from it for the kernel.
-        const PAIRS: [(&str, &str); 5] = [
-            ("state_arena_kb", "STATE_ARENA_SIZE"),
-            ("buffer_arena_kb", "BUFFER_ARENA_SIZE"),
-            ("config_buffer_kb", "MAX_MODULE_CONFIG_SIZE"),
-            ("config_arena_kb", "CONFIG_ARENA_SIZE"),
-            ("log_ring_kb", "LOG_RING_CAPACITY"),
-        ];
-
-        for silicon in ["rp2040", "rp2350"] {
-            let toml =
-                std::fs::read_to_string(repo.join(format!("targets/silicon/{silicon}.toml")))
-                    .unwrap_or_else(|_| panic!("{silicon}: no silicon toml"));
-            for (key, konst) in PAIRS {
-                let kb: u64 = toml
-                    .lines()
-                    .find(|l| l.trim_start().starts_with(key))
-                    .unwrap_or_else(|| panic!("{silicon}: no {key}"))
-                    .split('=')
-                    .nth(1)
-                    .expect("value")
-                    .trim()
-                    .parse()
-                    .expect("integer");
-                let want = kb * 1024;
-                let got = sdk_embedded_value(body, konst, silicon).unwrap_or_else(|| {
-                    panic!("{konst} is not declared in the SDK's embedded profile")
-                });
-                assert_eq!(
-                    got, want,
-                    "{silicon}: SDK publishes {konst} = {got} but {key} makes the \
-                     kernel's {want}. A module sized against the SDK figure and a \
-                     kernel that allocates the TOML figure disagree on the die."
-                );
-            }
-        }
+    /// The body of `mod <profile> {` in `src/kernel/config.rs`, up to the
+    /// closing brace at column 0.
+    fn kernel_profile(src: &str, profile: &str) -> String {
+        let start = src
+            .find(&format!("mod {profile} {{"))
+            .unwrap_or_else(|| panic!("src/kernel/config.rs: no mod {profile}"));
+        let rest = &src[start..];
+        let end = rest.find("\n}\n").expect("profile block end");
+        rest[..end].to_string()
     }
 
-    /// Resolve `konst` for `silicon` out of the embedded profile's source.
+    /// Resolve `konst` out of a kernel profile body for `silicon`.
     ///
-    /// Honours the `fluxor_abi` cfg arms: an unconditional declaration answers
-    /// for both dies, a guarded one only for the die it names. Returns `None` when
-    /// the constant is absent, which the caller reports as a missing declaration
-    /// rather than treating as agreement.
-    fn sdk_embedded_value(body: &str, konst: &str, silicon: &str) -> Option<u64> {
+    /// Honours the `fluxor_abi` cfg arms profile_rp uses: an unconditional
+    /// declaration answers for every die, a guarded one only for the die it
+    /// names. A right-hand side that is not an integer product (profile_rp's
+    /// `crate::platform::chip::…` re-exports) answers `None`, as does an absent
+    /// constant, which the caller reports rather than treating as agreement.
+    fn kernel_value(body: &str, konst: &str, silicon: &str) -> Option<u64> {
         let decl = format!("pub const {konst}: usize = ");
         let mut cfg: Option<&str> = None;
         let mut found = None;
@@ -1768,14 +1714,11 @@ mod tests {
                 };
                 if applies {
                     let expr = rest.trim_end_matches(';').trim();
-                    // `N * 1024` or a bare integer; nothing else is used here.
-                    let v: u64 = match expr.split_once('*') {
-                        Some((a, b)) => {
-                            a.trim().parse::<u64>().ok()? * b.trim().parse::<u64>().ok()?
-                        }
-                        None => expr.parse().ok()?,
-                    };
-                    found = Some(v);
+                    let v: Option<u64> = expr
+                        .split('*')
+                        .map(|f| f.trim().parse::<u64>().ok())
+                        .try_fold(1u64, |acc, f| f.map(|f| acc * f));
+                    found = v;
                 }
                 cfg = None;
             } else if !t.is_empty() && !t.starts_with("//") && !t.starts_with("/*") {
@@ -1783,6 +1726,37 @@ mod tests {
             }
         }
         found
+    }
+
+    /// `konst` in kernel profile `profile` for `silicon`, or a panic naming
+    /// what is missing.
+    fn kernel_const(src: &str, profile: &str, konst: &str, silicon: &str) -> u64 {
+        kernel_value(&kernel_profile(src, profile), konst, silicon)
+            .unwrap_or_else(|| panic!("{konst} is not an integer constant in {profile}"))
+    }
+
+    /// The RP kernels' per-silicon sizes come from the silicon TOML, through
+    /// `platform::chip`, and nowhere else: profile_rp re-exports them rather
+    /// than restating a number that could drift from the die it describes.
+    #[test]
+    fn rp_kernel_profile_takes_silicon_sizes_from_the_toml() {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let src = std::fs::read_to_string(repo.join("src/kernel/config.rs"))
+            .expect("src/kernel/config.rs");
+        let body = kernel_profile(&src, "profile_rp");
+        for konst in [
+            "STATE_ARENA_SIZE",
+            "BUFFER_ARENA_SIZE",
+            "MAX_MODULE_CONFIG_SIZE",
+            "CONFIG_ARENA_SIZE",
+            "LOG_RING_CAPACITY",
+        ] {
+            let decl = format!("pub const {konst}: usize = crate::platform::chip::{konst};");
+            assert!(
+                body.contains(&decl),
+                "profile_rp must take {konst} from the silicon TOML (`{decl}`)"
+            );
+        }
     }
 
     /// The MCU rows of `capacity_for_profile` mirror the silicon TOMLs. Those
@@ -1826,12 +1800,12 @@ mod tests {
         }
     }
 
-    /// The bcm2712 silicon TOML states the arena the aarch64 kernel allocates:
-    /// the SDK's `STATE_ARENA_SIZE`, which `platform::chip` re-exports. The
-    /// graph builder admits against the TOML figure and the composer against
+    /// The bcm2712 silicon TOML states the arena the bcm2712 kernel allocates:
+    /// `kernel::config::profile_bcm2712`'s `STATE_ARENA_SIZE`. The graph builder
+    /// admits against the TOML figure and the composer against
     /// `capacity_for_profile`, so all three are one number.
     #[test]
-    fn bcm2712_state_arena_is_the_aarch64_kernel_arena() {
+    fn bcm2712_state_arena_is_the_bcm2712_kernel_arena() {
         let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
         let toml = std::fs::read_to_string(repo.join("targets/silicon/bcm2712.toml"))
             .expect("bcm2712 silicon toml");
@@ -1845,32 +1819,24 @@ mod tests {
             .trim()
             .parse()
             .expect("integer");
-        let sdk = std::fs::read_to_string(repo.join("modules/sdk/abi/config.rs"))
-            .expect("modules/sdk/abi/config.rs");
-        let host = &sdk[sdk.find("mod profile_host {").expect("profile_host module")..];
-        let decl = "pub const STATE_ARENA_SIZE: usize = ";
-        let expr = host[host.find(decl).expect("STATE_ARENA_SIZE") + decl.len()..]
-            .split(';')
-            .next()
-            .expect("expression");
-        let sdk_bytes: u64 = expr
-            .split('*')
-            .map(|f| f.trim().parse::<u64>().expect("integer factor"))
-            .product();
+        let src = std::fs::read_to_string(repo.join("src/kernel/config.rs"))
+            .expect("src/kernel/config.rs");
+        let kernel = kernel_const(&src, "profile_bcm2712", "STATE_ARENA_SIZE", "bcm2712");
         assert_eq!(
             kb * 1024,
-            sdk_bytes,
-            "bcm2712 state_arena_kb is not the SDK's aarch64 arena"
+            kernel,
+            "bcm2712 state_arena_kb is not the bcm2712 kernel's arena"
         );
         let cap = capacity_for_profile("bcm2712").expect("bcm2712 capacity row");
-        assert_eq!(cap.state_bytes as u64, sdk_bytes);
+        assert_eq!(cap.state_bytes as u64, kernel);
     }
 
-    /// Drift guard: `capacity_for_profile` mirrors kernel constants it cannot
-    /// import (they live behind target cfgs). Textual extraction is the
-    /// accepted pattern for cross-cfg drift guards in this repo (see the ABI
-    /// wire-surface guards); when a kernel limit changes, this fails loudly
-    /// and the mirror above is the single place to update.
+    /// Drift guard: `capacity.rs` and `capacity_for_profile` mirror kernel
+    /// constants they cannot import (they live behind kernel platform
+    /// features). Textual extraction is the accepted pattern for cross-cfg
+    /// drift guards in this repo. EVERY mirrored value is pinned here, per
+    /// kernel profile, so a kernel raise that forgets the mirror fails loudly
+    /// and the mirror is the single place to update.
     #[test]
     fn capacity_mirrors_kernel_sources() {
         let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
@@ -1888,58 +1854,118 @@ mod tests {
         }
 
         let owner = read("src/kernel/workload/owner.rs");
-        let sdk = read("modules/sdk/abi/config.rs");
+        let kernel = read("src/kernel/config.rs");
         let kcfg = read("src/kernel/boot/config.rs");
         let sched = read("src/kernel/exec/scheduler/mod.rs");
+        let k = |profile: &str, name: &str, silicon: &str| -> u64 {
+            kernel_const(&kernel, profile, name, silicon)
+        };
 
-        // All three per-profile MAX_MODULES values, in declaration order
-        // (host, wasm, embedded) — pins `kernel_max_modules` too.
-        use crate::capacity::kernel_max_modules;
+        use crate::capacity::kernel_pool_static_cap as pool;
+        use crate::capacity::{self as cap_mirror, kernel_max_modules};
+
+        // Module slots, per kernel profile, for every target that names it.
         assert_eq!(
             kernel_max_modules("linux") as u64,
-            extract_nth(&sdk, "MAX_MODULES", 1)
+            k("profile_linux", "MAX_MODULES", "linux")
         );
+        for t in ["pi5", "bcm2712", "cm5", "qemu-virt"] {
+            assert_eq!(
+                kernel_max_modules(t) as u64,
+                k("profile_bcm2712", "MAX_MODULES", t)
+            );
+        }
         assert_eq!(
             kernel_max_modules("wasm") as u64,
-            extract_nth(&sdk, "MAX_MODULES", 2)
+            k("profile_wasm", "MAX_MODULES", "wasm")
+        );
+        for t in ["rp2040", "rp2350", "pico", "pico2w"] {
+            assert_eq!(
+                kernel_max_modules(t) as u64,
+                k("profile_rp", "MAX_MODULES", t)
+            );
+        }
+
+        // Every arena the composer admits against, per profile.
+        for (target, profile) in [("linux", "profile_linux"), ("bcm2712", "profile_bcm2712")] {
+            for (pool_name, konst) in [
+                ("state_arena", "STATE_ARENA_SIZE"),
+                ("buffer_arena", "BUFFER_ARENA_SIZE"),
+                ("config_arena", "CONFIG_ARENA_SIZE"),
+                ("elastic_region", "ELASTIC_REGION_SIZE"),
+            ] {
+                assert_eq!(
+                    pool(target, pool_name),
+                    Some(k(profile, konst, target)),
+                    "{target} {pool_name} mirror disagrees with {profile}::{konst}"
+                );
+            }
+        }
+        for (pool_name, konst) in [
+            ("state_arena", "STATE_ARENA_SIZE"),
+            ("buffer_arena", "BUFFER_ARENA_SIZE"),
+            ("config_arena", "CONFIG_ARENA_SIZE"),
+            ("elastic_region", "ELASTIC_REGION_SIZE"),
+        ] {
+            assert_eq!(
+                pool("wasm", pool_name),
+                Some(k("profile_wasm", konst, "wasm")),
+                "wasm {pool_name} mirror disagrees with profile_wasm::{konst}"
+            );
+        }
+        for t in ["rp2040", "rp2350"] {
+            assert_eq!(
+                pool(t, "elastic_region"),
+                Some(k("profile_rp", "ELASTIC_REGION_SIZE", t))
+            );
+        }
+        // The named mirror constants themselves.
+        assert_eq!(
+            cap_mirror::HOST_STATE_ARENA,
+            k("profile_linux", "STATE_ARENA_SIZE", "linux")
         );
         assert_eq!(
-            kernel_max_modules("rp2350") as u64,
-            extract_nth(&sdk, "MAX_MODULES", 3)
+            cap_mirror::HOST_STATE_ARENA,
+            k("profile_bcm2712", "STATE_ARENA_SIZE", "bcm2712")
+        );
+        assert_eq!(
+            cap_mirror::HOST_BUFFER_ARENA,
+            k("profile_bcm2712", "BUFFER_ARENA_SIZE", "bcm2712")
+        );
+        assert_eq!(
+            cap_mirror::HOST_CONFIG_ARENA,
+            k("profile_bcm2712", "CONFIG_ARENA_SIZE", "bcm2712")
+        );
+        assert_eq!(
+            cap_mirror::HOST_ELASTIC_REGION,
+            k("profile_bcm2712", "ELASTIC_REGION_SIZE", "bcm2712")
         );
 
-        let cap = capacity_for_profile("linux").expect("linux profile");
-        // First MAX_OWNERS in owner.rs is the multitenant value.
-        assert_eq!(cap.max_owners as u64, extract(&owner, "MAX_OWNERS"));
-        // First profile block in sdk config.rs is profile_host (aarch64).
-        assert_eq!(cap.max_modules as u64, extract(&sdk, "MAX_MODULES"));
-        assert_eq!(cap.state_bytes as u64, extract(&sdk, "STATE_ARENA_SIZE"));
-        assert_eq!(cap.buffer_bytes as u64, extract(&sdk, "BUFFER_ARENA_SIZE"));
-        // The pool caps the composer enforces come from the same constants,
-        // and wasm's are its own profile's, not the host's.
-        use crate::capacity::kernel_pool_static_cap as pool;
-        assert_eq!(
-            pool("linux", "state_arena"),
-            Some(extract(&sdk, "STATE_ARENA_SIZE"))
-        );
-        assert_eq!(
-            pool("linux", "buffer_arena"),
-            Some(extract(&sdk, "BUFFER_ARENA_SIZE"))
-        );
-        assert_eq!(
-            pool("wasm", "state_arena"),
-            Some(extract_nth(&sdk, "STATE_ARENA_SIZE", 2))
-        );
-        assert_eq!(
-            pool("wasm", "buffer_arena"),
-            Some(extract_nth(&sdk, "BUFFER_ARENA_SIZE", 2))
-        );
-        assert_eq!(cap.max_edges as u64, extract(&kcfg, "HOST_GRAPH_EDGES"));
+        // The composer's node capacity rows.
+        for (target, profile) in [
+            ("linux", "profile_linux"),
+            ("pi5", "profile_bcm2712"),
+            ("bcm2712", "profile_bcm2712"),
+        ] {
+            let cap = capacity_for_profile(target).expect(target);
+            // First MAX_OWNERS in owner.rs is the multitenant value.
+            assert_eq!(cap.max_owners as u64, extract(&owner, "MAX_OWNERS"));
+            assert_eq!(cap.max_modules as u64, k(profile, "MAX_MODULES", target));
+            assert_eq!(
+                cap.state_bytes as u64,
+                k(profile, "STATE_ARENA_SIZE", target)
+            );
+            assert_eq!(
+                cap.buffer_bytes as u64,
+                k(profile, "BUFFER_ARENA_SIZE", target)
+            );
+            assert_eq!(cap.max_edges as u64, extract(&kcfg, "HOST_GRAPH_EDGES"));
+            assert_eq!(cap.max_domains as u64, extract(&sched, "MAX_DOMAINS"));
+        }
         assert_eq!(
             crate::capacity::kernel_max_edges("rp2350") as u64,
             extract(&kcfg, "SMALL_GRAPH_EDGES")
         );
-        assert_eq!(cap.max_domains as u64, extract(&sched, "MAX_DOMAINS"));
         // The subgraph caps the workload encoder refuses past.
         let live = read("src/kernel/exec/scheduler/live.rs");
         assert_eq!(
@@ -1950,92 +1976,18 @@ mod tests {
             crate::add_subgraph::MAX_ADD_EDGES as u64,
             extract(&live, "MAX_ADD_EDGES")
         );
-        // pi5/bcm2712 alias the same aarch64 profile.
-        for alias in ["pi5", "bcm2712"] {
-            let c = capacity_for_profile(alias).expect(alias);
-            assert_eq!(c.max_modules, cap.max_modules);
-            assert_eq!(c.max_owners, cap.max_owners);
-        }
         // The MCU rows exist but hand out no workload owner slots:
         // multitenancy is an aarch64 feature, so `max_owners` is the system
         // slot alone. Their arena figures are pinned against the silicon
         // TOMLs by `capacity_mirrors_silicon_tomls`; what belongs here is the
-        // half that mirrors a kernel source — the embedded module ceiling
-        // both dies share.
+        // half that mirrors a kernel source — profile_rp's module ceiling.
         for mcu in ["rp2040", "rp2350"] {
             let c = capacity_for_profile(mcu).unwrap_or_else(|| panic!("{mcu}: no capacity row"));
             assert_eq!(c.max_owners, 1, "{mcu} is single-tenant");
             assert_eq!(
                 c.max_modules as u64,
-                extract_nth(&sdk, "MAX_MODULES", 3),
-                "{mcu} uses profile_embedded's module ceiling"
-            );
-        }
-    }
-
-    /// The `n`th (1-based) `pub const <name>: usize = …;` in `src`, its
-    /// right-hand side evaluated as a product of integer terms.
-    ///
-    /// Per-profile constants are declared once each in host, wasm, embedded
-    /// order, so the occurrence index selects the profile. Textual because
-    /// the kernel cannot import a profile from behind its target cfg, which
-    /// is the same reason these guards exist at all.
-    fn extract_nth(src: &str, name: &str, n: usize) -> u64 {
-        let pat = format!("pub const {name}: usize = ");
-        let mut from = 0;
-        for _ in 0..n {
-            let at = src[from..]
-                .find(&pat)
-                .unwrap_or_else(|| panic!("{name} occurrence {n} not found"));
-            from += at + pat.len();
-        }
-        let rest = &src[from..];
-        rest[..rest.find(';').expect("terminator")]
-            .split('*')
-            .map(|t| t.trim().parse::<u64>().expect("integer term"))
-            .product()
-    }
-
-    /// Drift guard: the RP kernels size their log ring from the silicon
-    /// TOML (`[kernel] log_ring_kb` → `build.rs` → `chip_generated.rs`),
-    /// while `profile_embedded` publishes the same ceiling to the SDK and
-    /// composer. One number with two sources, so they are pinned to each
-    /// other here.
-    ///
-    /// What it prevents: an RP target taking the host-class 64 KiB ring,
-    /// which overflows `.bss` past the linker's RAM region on both parts
-    /// and surfaces as a link error naming no constant.
-    #[test]
-    fn log_ring_toml_mirrors_embedded_profile() {
-        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
-        let sdk =
-            std::fs::read_to_string(repo.join("modules/sdk/abi/config.rs")).expect("sdk config");
-        let embedded = extract_nth(&sdk, "LOG_RING_CAPACITY", 3);
-
-        for silicon in ["rp2040", "rp2350"] {
-            let toml =
-                std::fs::read_to_string(repo.join(format!("targets/silicon/{silicon}.toml")))
-                    .expect("silicon toml");
-            let line = toml
-                .lines()
-                .find(|l| l.trim_start().starts_with("log_ring_kb"))
-                .unwrap_or_else(|| panic!("{silicon}: no log_ring_kb"));
-            let kb: u64 = line
-                .split('=')
-                .nth(1)
-                .expect("value")
-                .trim()
-                .parse()
-                .expect("integer");
-            assert_eq!(
-                kb * 1024,
-                embedded,
-                "{silicon} log_ring_kb ({kb} KiB) disagrees with \
-                 profile_embedded LOG_RING_CAPACITY ({embedded} bytes)"
-            );
-            assert!(
-                (kb * 1024).is_power_of_two(),
-                "{silicon} log ring must be a power of two (MASK indexing)"
+                k("profile_rp", "MAX_MODULES", mcu),
+                "{mcu} uses profile_rp's module ceiling"
             );
         }
     }

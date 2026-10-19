@@ -31,19 +31,30 @@ pub const MODULE_INFO: u32 = 0x0C6C;
 /// handle=-1, arg=[config_ptr:usize, config_len:usize] (platform pointer size).
 /// Returns 0.
 pub const TRIGGER_REBUILD: u32 = 0x0C6D;
-/// Query the upstream-module bitmask for module N (for topological drain
-/// ordering). handle=-1, arg layout: in `[module_idx:u16 LE]`, out
-/// `[mask word u64 LE × W]` from offset 2 (low word first). The kernel
-/// writes `W = min(MODULE_MASK_WORDS, (arg_len - 2) / 8)` words and returns
-/// the kernel's full word count (positive), so a caller can detect a
-/// buffer narrower than the mask. Pass `arg_len >= 2 + 8 × 16` to cover the
-/// largest profile (1024 modules = 16 words). Returns -EINVAL if the arg is
-/// null or shorter than one word. Bit `i`
-/// of the flattened words means "module `i` is upstream of `module_idx`".
+/// Query a window of the upstream-module bitmask for module N (for
+/// topological drain ordering). handle=-1, arg layout: in
+/// `[module_idx:u16 LE][first_word:u16 LE]`, out `[mask word u64 LE × W]`
+/// from offset 4, starting at mask word `first_word` (bit `i` of word `w`
+/// means "module `64·w + i` is upstream of `module_idx`"). The kernel writes
+/// `W = min(total - first_word, (arg_len - 4) / 8)` words and returns its
+/// full word count `total` (positive), so a caller reads the mask in windows
+/// of any width and knows where it ends; a `first_word` at or past `total`
+/// writes nothing. Returns -EINVAL if the arg is null or shorter than one
+/// word.
 pub const MODULE_UPSTREAM: u32 = 0x0C6E;
 /// Query whether module N has returned StepOutcome::Done (finished).
 /// handle=-1, arg=[module_idx:u16 LE]. Returns 1 if finished, 0 otherwise.
 pub const MODULE_DONE: u32 = 0x0C6F;
+/// Query the kernel's module-slot capacity: one past the highest module
+/// index this kernel can hold. handle=-1, arg=NULL. Returns the count
+/// (positive).
+///
+/// Kernel capacity is not ABI: the figure is per kernel platform and may be
+/// raised without moving the ABI surface, so a module that keeps per-slot
+/// state sizes it from this answer at runtime and never from a compiled
+/// constant. Outside the full 0x0C67..=0x0C6F block, in the free
+/// 0x0C23..=0x0C29 run, and gated by the same `reconfigure` permission.
+pub const SLOT_CAPACITY: u32 = 0x0C23;
 
 // ── Live graph mutation (add owner / free owner) ────────────────────────────
 // Splice a self-contained subgraph into a running graph, and tear it down,

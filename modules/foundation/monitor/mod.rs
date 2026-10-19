@@ -57,6 +57,7 @@ use abi::internal::monitor::{
     module_state_flags, MODULE_STATE_LEN, MODULE_STATE_MAX, MODULE_STATE_QUERY,
     STEP_HISTOGRAM_QUERY,
 };
+use abi::internal::reconfigure::SLOT_CAPACITY;
 use abi::kernel_abi::LOG_WRITE as SYSTEM_LOG;
 
 /// Small stack buffer for building one MON_HIST line. 8 buckets × up to
@@ -76,14 +77,20 @@ struct MonitorState {
     /// `ROUND_MODULES`, so a graph larger than that is covered over
     /// successive rounds rather than cut off.
     cursor: u32,
+    /// The kernel's module-slot count (`SLOT_CAPACITY`): the index domain a
+    /// round walks. 0 until the first round reads it.
+    slot_capacity: u32,
 }
 
 /// Modules reported per round: a bounded burst on the log transport.
 const ROUND_MODULES: usize = 64;
-/// Module slots the kernel's profile holds: the index domain a round walks.
-/// Slots are not contiguous (a workload's modules sit wherever its add
-/// placed them), so a round walks slots and reports the present ones.
-const MAX_INDEX: usize = abi::config::kernel::MAX_MODULES;
+/// Slots walked per round at most: a round stops at `ROUND_MODULES` present
+/// modules or after this many slots, whichever comes first, and the cursor
+/// carries the walk on. Slots are not contiguous (a workload's modules sit
+/// wherever its add placed them), so a round walks slots and reports the
+/// present ones. The slot domain itself is the kernel's, read at runtime
+/// (`SLOT_CAPACITY`): kernel capacity is not compiled into this module.
+const ROUND_SLOTS: usize = 1024;
 
 impl MonitorState {
     fn init(&mut self, syscalls: *const SyscallTable) {
@@ -92,6 +99,7 @@ impl MonitorState {
         self.countdown_ticks = 0;
         self.round_ticks = 0;
         self.cursor = 0;
+        self.slot_capacity = 0;
     }
 }
 
@@ -360,16 +368,32 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         s.countdown_ticks = s.round_ticks;
 
         let sys_ptr = s.syscalls;
+        if s.slot_capacity == 0 {
+            let cap = ((*sys_ptr).provider_call)(-1, SLOT_CAPACITY, core::ptr::null_mut(), 0);
+            if cap <= 0 {
+                // No answer (a kernel without the query, or the permission
+                // withheld): nothing to walk. Ask again next round.
+                return 0;
+            }
+            s.slot_capacity = cap as u32;
+        }
+        let slots = s.slot_capacity as usize;
         let mut line = [0u8; LINE_BUF];
         // Walk slots from the cursor, reporting up to ROUND_MODULES present
         // modules; an empty slot answers MON_STATE with nothing and is
         // skipped. The cursor carries the walk across rounds.
         let mut reported = 0usize;
         let mut walked = 0usize;
-        let mut i = (s.cursor as usize) % MAX_INDEX;
-        while walked < MAX_INDEX && reported < ROUND_MODULES {
+        let mut i = s.cursor as usize;
+        if i >= slots {
+            i = 0;
+        }
+        while walked < slots && walked < ROUND_SLOTS && reported < ROUND_MODULES {
             let idx = i as u16;
-            i = (i + 1) % MAX_INDEX;
+            i += 1;
+            if i >= slots {
+                i = 0;
+            }
             walked += 1;
             let n = build_mon_state(&*sys_ptr, idx, &mut line);
             if n == 0 {

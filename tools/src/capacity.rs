@@ -1,23 +1,44 @@
 //! Per-target kernel capacity facts shared by the boot-blob builder and the
 //! composer. The single tools-side source for values the kernel defines per
-//! arch profile — pinned against kernel source text by
-//! `compose::capacity_mirrors_kernel_sources`.
+//! platform in `src/kernel/config.rs` — every one pinned against that source
+//! text by `compose::capacity_mirrors_kernel_sources`, so a kernel raise that
+//! forgets this mirror fails the tools tests rather than admitting graphs the
+//! kernel cannot hold (or refusing ones it can).
+//!
+//! Kernel capacity is not ABI: raising a value here and in the kernel
+//! rebuilds the CLI and the kernel, and moves no ABI epoch.
 
-/// Kernel `MAX_MODULES` for the arch profile a target compiles
-/// (`modules/sdk/abi/config.rs`): the module-count ceiling the boot blob
+/// Targets whose kernel compiles `profile_bcm2712` (`src/kernel/config.rs`).
+fn is_bcm2712(target: &str) -> bool {
+    matches!(target, "pi5" | "bcm2712" | "cm5" | "qemu-virt")
+}
+
+/// Kernel `MAX_MODULES` for the kernel platform a target compiles
+/// (`src/kernel/config.rs`): the module-count ceiling the boot blob
 /// builder enforces per target instead of one global constant. Unknown
-/// targets get the embedded floor — a graph that fits the smallest
-/// profile fits everywhere.
+/// targets get the RP floor — a graph that fits the smallest profile
+/// fits everywhere.
 pub fn kernel_max_modules(target: &str) -> usize {
     match target {
-        // aarch64 profile_host (linux host + bcm2712-family boards).
-        "linux" | "pi5" | "bcm2712" | "cm5" | "qemu-virt" => 1024,
-        // wasm32 profile_wasm.
-        "wasm" => 48,
-        // Everything else (rp2040/rp2350 boards): profile_embedded.
-        _ => 32,
+        // profile_linux.
+        "linux" => LINUX_MAX_MODULES,
+        // profile_bcm2712 (Pi 5, CM5, QEMU virt).
+        t if is_bcm2712(t) => BCM2712_MAX_MODULES,
+        // profile_wasm.
+        "wasm" => WASM_MAX_MODULES,
+        // Everything else (rp2040/rp2350 boards): profile_rp.
+        _ => RP_MAX_MODULES,
     }
 }
+
+/// profile_linux `MAX_MODULES`.
+pub const LINUX_MAX_MODULES: usize = 1024;
+/// profile_bcm2712 `MAX_MODULES`.
+pub const BCM2712_MAX_MODULES: usize = 1024;
+/// profile_wasm `MAX_MODULES`.
+pub const WASM_MAX_MODULES: usize = 48;
+/// profile_rp `MAX_MODULES`.
+pub const RP_MAX_MODULES: usize = 32;
 
 /// Kernel `MAX_GRAPH_EDGES` for the arch profile a target compiles
 /// (`src/kernel/boot/config.rs`): 1536 on the host profile, 128 elsewhere.
@@ -31,14 +52,26 @@ pub fn kernel_max_edges(target: &str) -> usize {
     }
 }
 
-/// profile_host `STATE_ARENA_SIZE` (`modules/sdk/abi/config.rs`).
+/// profile_linux and profile_bcm2712 `STATE_ARENA_SIZE`
+/// (`src/kernel/config.rs`); the two profiles agree today, and the mirror
+/// test pins each separately.
 pub const HOST_STATE_ARENA: u64 = 1024 * 1024 * 1024;
-/// profile_host `BUFFER_ARENA_SIZE`.
+/// profile_linux and profile_bcm2712 `BUFFER_ARENA_SIZE`.
 pub const HOST_BUFFER_ARENA: u64 = 16 * 1024 * 1024;
+/// profile_linux and profile_bcm2712 `CONFIG_ARENA_SIZE`.
+pub const HOST_CONFIG_ARENA: u64 = 256 * 1024;
+/// profile_linux and profile_bcm2712 `ELASTIC_REGION_SIZE`.
+pub const HOST_ELASTIC_REGION: u64 = 16 * 1024 * 1024;
 /// profile_wasm `STATE_ARENA_SIZE`.
 pub const WASM_STATE_ARENA: u64 = 96 * 1024 * 1024;
 /// profile_wasm `BUFFER_ARENA_SIZE`.
 pub const WASM_BUFFER_ARENA: u64 = 8 * 1024 * 1024;
+/// profile_wasm `CONFIG_ARENA_SIZE`.
+pub const WASM_CONFIG_ARENA: u64 = 32 * 1024;
+/// profile_wasm `ELASTIC_REGION_SIZE`.
+pub const WASM_ELASTIC_REGION: u64 = 2 * 1024 * 1024;
+/// profile_rp `ELASTIC_REGION_SIZE`: Tier B compiles out on the RP parts.
+pub const RP_ELASTIC_REGION: u64 = 0;
 
 /// Graph-section byte 3 for a target: the edge-slot count in units of 128,
 /// with 0 meaning 128 (see `kernel::config::GRAPH_SLOTS_CODE`).
@@ -83,7 +116,7 @@ pub const POOL_IDS: &[(&str, u16)] = &[
 /// an over-ask at boot and logs). Values are pinned against kernel source
 /// by `compose::capacity_mirrors_kernel_sources`.
 pub fn kernel_pool_static_cap(target: &str, pool: &str) -> Option<u64> {
-    let host = matches!(target, "linux" | "pi5" | "bcm2712" | "cm5" | "qemu-virt");
+    let host = target == "linux" || is_bcm2712(target);
     let wasm = target == "wasm";
     match pool {
         // Fixed across every profile.
@@ -94,18 +127,18 @@ pub fn kernel_pool_static_cap(target: &str, pool: &str) -> Option<u64> {
         // Multitenant is an aarch64 feature; other targets have no
         // workload slots to enforce.
         "owners" => Some(if host { 64 } else { 1 }),
-        // Arch-profile arenas (abi/config.rs). RP arenas come from the
+        // Platform arenas (src/kernel/config.rs). RP arenas come from the
         // silicon TOML — not mirrored here; kernel clamps at boot.
         "state_arena" if host => Some(HOST_STATE_ARENA),
         "state_arena" if wasm => Some(WASM_STATE_ARENA),
         "buffer_arena" if host => Some(HOST_BUFFER_ARENA),
         "buffer_arena" if wasm => Some(WASM_BUFFER_ARENA),
-        "config_arena" if host => Some(256 * 1024),
-        "config_arena" if wasm => Some(32 * 1024),
-        // Tier B elastic region (abi/config.rs ELASTIC_REGION_SIZE).
-        "elastic_region" if host => Some(8 * 1024 * 1024),
-        "elastic_region" if wasm => Some(2 * 1024 * 1024),
-        "elastic_region" => Some(0),
+        "config_arena" if host => Some(HOST_CONFIG_ARENA),
+        "config_arena" if wasm => Some(WASM_CONFIG_ARENA),
+        // Tier B elastic region (kernel ELASTIC_REGION_SIZE).
+        "elastic_region" if host => Some(HOST_ELASTIC_REGION),
+        "elastic_region" if wasm => Some(WASM_ELASTIC_REGION),
+        "elastic_region" => Some(RP_ELASTIC_REGION),
         _ => None,
     }
 }

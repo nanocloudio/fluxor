@@ -1,26 +1,33 @@
-// Canonical capacity / sizing tunables.
+// Module-facing capacity / sizing tunables.
 //
-// One coherent envelope per board profile. Adding a new target
+// One coherent envelope per module ABI profile. Adding a new target
 // means adding a `profile_*` module here, not editing 30 files.
 //
-// Why centralised: capacity knobs cross subsystem boundaries. The
+// Why centralised: capacity knobs cross module boundaries. The
 // HTTP module's `MAX_CONCURRENT_CONNS` only makes sense if the IP
-// module's `MAX_TCP_CONNS` is at least as large; the kernel's
-// `STATE_ARENA_SIZE` has to fit every loaded module's
-// `module_arena_size()`; `LOG_RING_CAPACITY` interacts with how
-// much trace volume the system can absorb under load. Spread
-// across their owning modules, any one change becomes a
-// coordinated edit across the tree. Centralising them lets a
-// reviewer see the full envelope on one screen and lets the
-// compiler enforce cross-subsystem invariants.
+// module's `MAX_TCP_CONNS` is at least as large. Spread across their
+// owning modules, any one change becomes a coordinated edit across
+// the tree. Centralising them lets a reviewer see the full envelope
+// on one screen and lets the compiler enforce cross-module
+// invariants.
 //
-// What lives here: cross-cutting capacity tunables. If a constant
-// is referenced by more than one subsystem, or interacts with
-// `STATE_ARENA_SIZE` or `module_arena_size()`, it belongs here.
+// What lives here: tunables that more than one module reads, and the
+// coarse `TARGET_CLASS` a module sizes its own tables by.
 //
-// What does NOT live here: module-private opcodes, RFC values,
-// internal struct offsets, per-chip register layouts. Those stay
-// in the module that owns them.
+// What does NOT live here: kernel capacity. The kernel's arenas,
+// module-slot count, bridge slots, config and log-ring sizes live in
+// `src/kernel/config.rs`, per kernel platform. Everything under
+// `modules/sdk` is hashed into the ABI-surface digest, so a kernel
+// size stated here would make raising it an ABI epoch and a
+// workspace republish, though no module reads it. A module that
+// needs one of those figures asks the kernel at runtime (the module
+// slot count is `internal::reconfigure::SLOT_CAPACITY`) or keys on
+// `TARGET_CLASS`. `tools/tests/kernel_capacity_gate.rs` fails CI if a
+// kernel capacity constant comes back into the SDK or into module
+// source.
+//
+// Module-private opcodes, RFC values, internal struct offsets and
+// per-chip register layouts stay in the module that owns them.
 //
 // Adding a tunable:
 // 1. Add it to all three profile modules below with values that
@@ -29,6 +36,24 @@
 // 3. If it interacts with another subsystem, add a
 //    `const _: () = assert!(...);` at the bottom.
 // 4. `pub use abi::config::<subsystem>::*` in the consumer.
+
+/// Coarse memory class of the target a module is compiled for: the value of
+/// [`TARGET_CLASS`].
+///
+/// A module that scales its own buffers with the memory the target has keys
+/// on this, never on the kernel's arena sizes, which are kernel capacity and
+/// not part of the module ABI. The classes are ordered, so `TARGET_CLASS <=
+/// target_class::SMALL` reads "an MCU of either size".
+pub mod target_class {
+    /// The smallest MCU class: a state arena of 64 KiB or less (RP2040).
+    pub const TINY: u8 = 0;
+    /// An MCU, but not the smallest: a state arena of 512 KiB or less
+    /// (RP2350).
+    pub const SMALL: u8 = 1;
+    /// Host class: Linux, bcm2712 and wasm, with arenas of tens of MiB or
+    /// more.
+    pub const HOST: u8 = 2;
+}
 
 /// The `handler` byte of a compiled route record.
 ///
@@ -110,74 +135,9 @@ pub use self::profile_embedded::*;
 
 #[cfg(target_arch = "aarch64")]
 mod profile_host {
-    pub mod kernel {
-        /// Pool used by `loader::alloc_state` to back every loaded
-        /// module's `module_state` and `module_arena`. It must hold every
-        /// module of the busiest graph at once. A node hosts workload
-        /// subgraphs beside its own graph, and they draw on the same pool:
-        /// a bare-metal node's control plane seats ~253 MiB on its own, and
-        /// one key-value workload's state worker asks 15-23 MiB. 1 GiB holds
-        /// the node plane and several such workloads. It costs no image bytes and is
-        /// never zeroed whole (the loader zeroes each allocation); the
-        /// bcm2712 kernel gives it a region of its own above 1 GB, so a
-        /// Pi 5 running this profile needs 2 GB of DRAM.
-        pub const STATE_ARENA_SIZE: usize = 1024 * 1024 * 1024;
-        /// Per-channel buffer pool. A node's own graph and the workload
-        /// subgraphs it hosts share it: the bare-metal node's base graph
-        /// (control plane, node agent, its PKI) alone holds ~8 MiB of
-        /// channels, and a stateful workload adds two 128 KiB block edges.
-        /// 16 MiB leaves room for several such workloads; zero-initialised
-        /// `.bss`.
-        pub const BUFFER_ARENA_SIZE: usize = 16 * 1024 * 1024;
-        // Multi-workload: a node's own graph plus the workload subgraphs it
-        // hosts, all in one scheduler on aarch64 (bcm2712 / linux). A
-        // bare-metal node's control plane and image plane seat ~250 modules
-        // before any workload, and one message-broker workload is ~17 more.
-        // Module ids are u16 throughout the kernel and on the wire, with
-        // 0xFFFF the no-module sentinel, so the ceiling is a sizing choice:
-        // the scheduler's per-module tables, the `ModuleMask` bitmaps
-        // (MODULE_MASK_WORDS == 16 here) and the edge capacity
-        // (MAX_GRAPH_EDGES) scale with it. Per-target: wasm32 48, Cortex-M
-        // 32 below.
-        pub const MAX_MODULES: usize = 1024;
-        /// ISR-tier bridge slots: one per edge that crosses into an
-        /// ISR-tier domain, each holding its ring inline (~2 KiB).
-        pub const MAX_BRIDGES: usize = 16;
-        /// Loader sanity ceiling for a single module's code segment.
-        /// 1 MiB fits media modules (the unified codec's decoder plus
-        /// its CAVLC/clip tables runs ~450 KiB) and protocol modules
-        /// that bundle firmware blobs.
-        pub const MAX_MODULE_CODE_SIZE: usize = 1024 * 1024;
-        // 256 KiB so the synth host can carry the inlined wasm browser shell
-        // (runtime.html ~83 KiB + host_shims.js ~56 KiB) as http `body:`
-        // routes. Smaller values silently truncate the http module's params
-        // blob (the kernel-side ParamBuffer copies up to this many bytes before
-        // passing to module_new). Aligned with `MAX_CONFIG_SIZE`,
-        // `MAX_MODULE_PARAMS_SIZE` (tools), and the http module section cap —
-        // keep this whole set in lockstep.
-        pub const MAX_MODULE_CONFIG_SIZE: usize = 256 * 1024;
-        // 256 KiB so split scenarios where both halves' http modules
-        // inline the canonical wasm shell as body routes
-        // (~95 KiB per http module) leave enough headroom for the
-        // other modules' params (codec, bank, ws_stream, ...).
-        pub const CONFIG_ARENA_SIZE: usize = 256 * 1024;
-        /// Capacity of the in-memory log ring (`kernel::sys::log_ring`).
-        /// Sized for moderate trace volume.
-        pub const LOG_RING_CAPACITY: usize = 65536;
-        /// Kernel elastic region backing Tier B chunk grants
-        /// (`resource::ELASTIC_ALLOC`).
-        /// 16 MiB: room for TLS-session growth to its compiled maximum
-        /// (~7.9 MiB at `tls::MAX_SESSIONS`, once 104 KiB chunks round up
-        /// to the quantum below) plus several workloads' worth of headroom,
-        /// and deliberately oversubscribable — Σ of pool maxima MAY exceed
-        /// it; contention is a counted denial, mins are load-time.
-        /// Zero-initialised, so the size costs kernel `.bss` rather than
-        /// image.
-        pub const ELASTIC_REGION_SIZE: usize = 16 * 1024 * 1024;
-        /// Grant granularity: chunks are rounded up to this quantum
-        /// (the 64 KiB platform quantum).
-        pub const ELASTIC_QUANTUM: usize = 64 * 1024;
-    }
+    /// Coarse memory class of every target this profile builds for. See
+    /// [`target_class`](super::target_class).
+    pub const TARGET_CLASS: u8 = super::target_class::HOST;
 
     pub mod http {
         /// Maximum simultaneous in-flight HTTP connections per
@@ -274,7 +234,7 @@ mod profile_host {
         /// terminated TCP connections. The net-proto `conn_id` is u16, so
         /// 65,536 slots is exactly the id space. A connection record is
         /// ~2.2 KiB — most of it the bounded reorder buffer — so the table
-        /// is ~137 MiB and is what `kernel::STATE_ARENA_SIZE` is sized
+        /// is ~137 MiB and is what the kernel's state arena is sized
         /// around. Lookup is by hash index (`ip/index.rs`), never a scan,
         /// and the timer sweep is sliced across the 50 ms window, so the
         /// a packet pays for the cluster it lands in rather than for the
@@ -326,7 +286,7 @@ mod profile_host {
         ///
         /// The ceiling is generous anyway because the pool is elastic:
         /// `SESSION_CHUNK` seats are inline and the rest arrive in
-        /// 8-session chunks from `kernel::ELASTIC_REGION_SIZE` as they are
+        /// 8-session chunks from the kernel's elastic region as they are
         /// needed, so an idle stack pays for eight. A grant the region
         /// denies is a counted refusal and the accept is closed, not a
         /// fault.
@@ -357,7 +317,7 @@ mod profile_host {
         /// remaining ~45 KiB is state a live connection genuinely needs —
         /// stream buffers, ACK and loss tracking, per-level keys — so this
         /// ceiling, unlike the TLS one, is not mostly scratch. Sixty-four
-        /// sits against the headroom `kernel::STATE_ARENA_SIZE` leaves
+        /// sits against the headroom the kernel's state arena leaves
         /// beside the connection table.
         pub const MAX_CONNS: usize = 64;
     }
@@ -375,48 +335,9 @@ mod profile_host {
 
 #[cfg(target_arch = "wasm32")]
 mod profile_wasm {
-    pub mod kernel {
-        // Sized to hold a console-emulator graph at a 32 MiB cartridge
-        // ceiling: the core streams the ROM straight into its emulated bus
-        // (~32 MiB ROM + machine RAM, no second full-ROM copy) and a file
-        // loader stages one framed copy (~32 MiB) to emit the load command —
-        // ~72 MiB of live state at peak, plus the small video / audio /
-        // mapper modules. 96 MiB covers it with margin; 64 MiB held only
-        // ≤12 MB payloads. Browser tabs have ample memory headroom; the
-        // arena is paged in lazily by `memory.grow`.
-        pub const STATE_ARENA_SIZE: usize = 96 * 1024 * 1024;
-        /// Loader sanity ceiling for a single module's code segment
-        /// (see the host profile's rationale).
-        pub const MAX_MODULE_CODE_SIZE: usize = 1024 * 1024;
-        // Holds ALL channel ring buffers for the live graph. GPU-offload graphs
-        // wire multi-MiB frame channels (a whole serialized frame — up to
-        // ~1.57 MiB dense — must cross child->kernel in one ring fill)
-        // PLUS the small audio/input/command channels (~24 KiB). An arena that
-        // cannot fit a graph's largest channel alongside the rest fails the
-        // channel open ("[buf] arena full need=... used=..."), and the graph
-        // never starts. 8 MiB is sized for chunk's GPU command ring, which
-        // wants a 4 MiB channel (a chunk mesh + the far-terrain LOD ring in one
-        // step; channel sizes are powers of two, so 4 MiB is the next step
-        // above 2 MiB) and alone fills a 4 MiB arena — 8 MiB holds it + the rest.
-        // Lazily paged by memory.grow, so it costs nothing until used.
-        pub const BUFFER_ARENA_SIZE: usize = 8 * 1024 * 1024;
-        // 48: a multi-emulator browser graph (music + Game Boy +
-        // Spectrum chains) declares ~22 modules and the kernel inserts
-        // an internal tee/merge per fan, which 32 cannot hold — the
-        // shortfall surfaces as "No room for internal module" at
-        // prepare_graph.
-        pub const MAX_MODULES: usize = 48;
-        /// ISR-tier bridge slots; see profile_host.
-        pub const MAX_BRIDGES: usize = 16;
-        pub const MAX_MODULE_CONFIG_SIZE: usize = 16 * 1024;
-        pub const CONFIG_ARENA_SIZE: usize = 32 * 1024;
-        pub const LOG_RING_CAPACITY: usize = 16384;
-        /// Tier B elastic region (see the host profile). Browser tabs
-        /// page lazily, but the region is still budgeted small.
-        pub const ELASTIC_REGION_SIZE: usize = 2 * 1024 * 1024;
-        /// Grant granularity: the wasm page.
-        pub const ELASTIC_QUANTUM: usize = 64 * 1024;
-    }
+    /// Coarse memory class; see [`target_class`](super::target_class). A
+    /// browser tab has host-class memory, paged in lazily.
+    pub const TARGET_CLASS: u8 = super::target_class::HOST;
 
     pub mod http {
         pub const MAX_CONCURRENT_CONNS: usize = 256;
@@ -483,52 +404,14 @@ mod profile_wasm {
 
 #[cfg(not(any(target_arch = "aarch64", target_arch = "wasm32")))]
 mod profile_embedded {
-    pub mod kernel {
-        // The embedded profile covers BOTH RP parts, whose state arenas differ
-        // by 3.75x — 64 KiB on RP2040 against 240 KiB on RP2350
-        // (`targets/silicon/*.toml`). Keyed on `fluxor_abi`, which the
-        // module build passes, because `target_arch` cannot tell thumbv6m from
-        // thumbv8m and one arm would otherwise charge the smaller die the
-        // larger one's sizes.
-        #[cfg(not(fluxor_abi = "thumbv6m"))]
-        pub const STATE_ARENA_SIZE: usize = 240 * 1024;
-        #[cfg(fluxor_abi = "thumbv6m")]
-        pub const STATE_ARENA_SIZE: usize = 64 * 1024;
-        /// Loader sanity ceiling for a single module's code segment. Code
-        /// executes in place from flash, so this costs no RAM and is set by
-        /// the part's flash: 1 MiB on the 4 MiB RP2350, which a JavaScript
-        /// engine (~440 KiB) fits; 384 KiB on the 2 MiB RP2040.
-        /// `module_code_kb` in the silicon TOML mirrors it for the packer.
-        #[cfg(not(fluxor_abi = "thumbv6m"))]
-        pub const MAX_MODULE_CODE_SIZE: usize = 1024 * 1024;
-        #[cfg(fluxor_abi = "thumbv6m")]
-        pub const MAX_MODULE_CODE_SIZE: usize = 384 * 1024;
-        #[cfg(not(fluxor_abi = "thumbv6m"))]
-        pub const BUFFER_ARENA_SIZE: usize = 64 * 1024;
-        #[cfg(fluxor_abi = "thumbv6m")]
-        pub const BUFFER_ARENA_SIZE: usize = 16 * 1024;
-        pub const MAX_MODULES: usize = 32;
-        /// ISR-tier bridge slots; see profile_host. Eight is the ISR edges
-        /// a graph of this size has, at ~2 KiB of static RAM each.
-        pub const MAX_BRIDGES: usize = 8;
-        /// Largest packed config one module may carry. Per-silicon like the
-        /// arenas above: the RP kernel takes this from `config_buffer_kb` in the
-        /// silicon TOML, so a single value here would describe one die and
-        /// misreport the other.
-        #[cfg(not(fluxor_abi = "thumbv6m"))]
-        pub const MAX_MODULE_CONFIG_SIZE: usize = 16 * 1024;
-        #[cfg(fluxor_abi = "thumbv6m")]
-        pub const MAX_MODULE_CONFIG_SIZE: usize = 8 * 1024;
-        #[cfg(not(fluxor_abi = "thumbv6m"))]
-        pub const CONFIG_ARENA_SIZE: usize = 16 * 1024;
-        #[cfg(fluxor_abi = "thumbv6m")]
-        pub const CONFIG_ARENA_SIZE: usize = 8 * 1024;
-        pub const LOG_RING_CAPACITY: usize = 8192;
-        /// No Tier B on MCU-class targets: elasticity compiles out
-        /// — `ELASTIC_ALLOC` denies.
-        pub const ELASTIC_REGION_SIZE: usize = 0;
-        pub const ELASTIC_QUANTUM: usize = 1024;
-    }
+    /// Coarse memory class; see [`target_class`](super::target_class).
+    /// Keyed on `fluxor_abi`, which the module build passes, because
+    /// `target_arch` cannot tell thumbv6m from thumbv8m: RP2040 is the tiny
+    /// die (264 KiB of SRAM), RP2350 the small one (520 KiB).
+    #[cfg(fluxor_abi = "thumbv6m")]
+    pub const TARGET_CLASS: u8 = super::target_class::TINY;
+    #[cfg(not(fluxor_abi = "thumbv6m"))]
+    pub const TARGET_CLASS: u8 = super::target_class::SMALL;
 
     pub mod http {
         /// Four, not one: a browser opens several connections to a page in

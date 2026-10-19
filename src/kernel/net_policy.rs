@@ -12,7 +12,7 @@
 use crate::abi::contracts::net::policy as wire;
 use crate::kernel::sys::errno;
 
-use crate::abi::config::kernel::MAX_MODULES;
+use crate::kernel::config::MAX_MODULES;
 
 /// Tables held at once, by profile. A controller owns one (`netpolicy`,
 /// `proxy`); a deployment needing more has more controllers than this platform

@@ -285,6 +285,10 @@ pub fn for_each_field(f: &mut impl FnMut(&str, i64)) {
         "reconfigure.MODULE_DONE",
         int::reconfigure::MODULE_DONE as i64,
     );
+    f(
+        "reconfigure.SLOT_CAPACITY",
+        int::reconfigure::SLOT_CAPACITY as i64,
+    );
     f("reconfigure.APPLY_ADD", int::reconfigure::APPLY_ADD as i64);
     f(
         "reconfigure.FREE_OWNER",

@@ -488,27 +488,26 @@ microsecond-scale audio modules.
 
 ## Static Memory
 
-Source: `src/kernel/exec/scheduler/merge.rs`, `src/kernel/config.rs`,
-`modules/sdk/abi/config.rs`
+Source: `src/kernel/exec/scheduler/merge.rs`, `src/kernel/config.rs`
 
 The runner consolidates per-module arrays into a single
 `SchedulerState` struct held in a `static mut SCHED`: edges, module
 slots, ports, channel hints, arenas, capability classes, permissions,
 and drain state all live in one struct with a single `reset()`.
 
-Capacity constants reach the kernel through one seam,
-`src/kernel/config.rs`, which pulls them from `platform::chip`. On RP
-targets the values come from the per-silicon TOML files under
-`targets/silicon/`; on aarch64 and wasm targets they come from the
-per-architecture profiles in `modules/sdk/abi/config.rs`:
+Kernel capacity is stated in one place, `src/kernel/config.rs`, one
+profile per kernel platform (linux, bcm2712, wasm, RP). On RP targets the
+arena sizes come from the per-silicon TOML files under
+`targets/silicon/`, through `platform::chip`. None of it is part of the
+module ABI (see `abi_layers.md`, "Kernel capacity is not ABI"):
 
 | Resource | Constant | Values |
 |----------|----------|--------|
-| Modules | `MAX_MODULES` | 32 (embedded profile), 48 (wasm), 1024 (aarch64) |
+| Modules | `MAX_MODULES` | 32 (RP), 48 (wasm), 1024 (linux, bcm2712) |
 | Channel edges | `MAX_GRAPH_EDGES` | 128, or 1536 where `MAX_MODULES` exceeds 128 (`src/kernel/boot/config.rs`) |
 | Event slots | `MAX_EVENTS` | 32 (`src/kernel/ipc/event.rs`) |
-| State arena | `STATE_ARENA_SIZE` | 64 KiB (rp2040), 240 KiB (rp2350), 96 MiB (wasm), 1 GiB (aarch64) |
-| Buffer arena | `BUFFER_ARENA_SIZE` | 16 KiB (rp2040), 64 KiB (rp2350), 8 MiB (wasm), 16 MiB (aarch64) |
+| State arena | `STATE_ARENA_SIZE` | 64 KiB (rp2040), 240 KiB (rp2350), 96 MiB (wasm), 1 GiB (linux, bcm2712) |
+| Buffer arena | `BUFFER_ARENA_SIZE` | 16 KiB (rp2040), 64 KiB (rp2350), 8 MiB (wasm), 16 MiB (linux, bcm2712) |
 | Buffer slots | `MAX_BUFFER_SLOTS` | one per channel: `MAX_GRAPH_EDGES` (`src/kernel/ipc/buffer_pool.rs`) |
 
 These are sized per silicon: small embedded targets have tight

@@ -624,6 +624,21 @@ pub fn instantiate_one_module(
         return InstantiateResult::Error(-1);
     }
 
+    // A params block the kernel cannot hold whole fails the instance, loudly,
+    // before any of its state is set up. Truncating it would hand the module
+    // a different config from the one the graph declares.
+    let params_len = entry.params().len();
+    if params_len > MAX_MODULE_CONFIG_SIZE {
+        log::error!(
+            "[inst] module={} ({}) params {} B exceed MAX_MODULE_CONFIG_SIZE={} B — instance refused",
+            entry.id,
+            static_name,
+            params_len,
+            MAX_MODULE_CONFIG_SIZE
+        );
+        return InstantiateResult::Error(-1);
+    }
+
     // Select capability-filtered syscall table based on module type
     let syscalls = get_table_for_module_type(found_module.header.module_type);
 
@@ -689,7 +704,16 @@ pub fn instantiate_one_module(
     // start_new below.
     unsafe {
         let pb = &mut *core::ptr::addr_of_mut!(PARAM_BUFFER);
-        pb.write(entry.params());
+        if let Err(len) = pb.write(entry.params()) {
+            log::error!(
+                "[inst] module={} ({}) params {} B do not fit the param buffer ({} B) — instance refused",
+                entry.id,
+                static_name,
+                len,
+                MAX_MODULE_CONFIG_SIZE
+            );
+            return InstantiateResult::Error(-1);
+        }
 
         // Overlay any runtime parameter overrides from flash store
         {

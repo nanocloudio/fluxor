@@ -26,7 +26,7 @@ use portable_atomic::{AtomicU32, Ordering};
 // ============================================================================
 
 /// Maximum number of bridge channels in the system, from the profile.
-pub const MAX_BRIDGES: usize = crate::abi::config::kernel::MAX_BRIDGES;
+pub const MAX_BRIDGES: usize = crate::kernel::config::MAX_BRIDGES;
 
 /// Maximum data size per bridge slot (bytes). Fits in one cache line.
 pub const MAX_BRIDGE_DATA: usize = 56;

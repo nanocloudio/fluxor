@@ -432,31 +432,20 @@ there is nothing in the YAML to check it against.
 
 Source: `modules/sdk/abi/config.rs`.
 
-Cross-cutting capacity tunables live in one Rust file, re-exported
-through `abi::config::*` so the kernel and every PIC module read from
-one source. The file is organised as three `profile_*` modules, exactly
-one of which is selected at compile time via `cfg(target_arch)`:
+Module-facing capacity tunables live in one Rust file, re-exported
+through `abi::config::*` so every PIC module reads one source. The file
+is organised as three `profile_*` modules, exactly one of which is
+selected at compile time via `cfg(target_arch)`:
 
 | Profile | Selected for | Sample sizes |
 |---|---|---|
-| `profile_host` | `target_arch = "aarch64"` (Pi 5, Linux host, BCM2712 bare-metal) | `STATE_ARENA_SIZE = 1 GiB`, `BUFFER_ARENA_SIZE = 16 MiB`, `MAX_MODULES = 1024`, http `MAX_CONCURRENT_CONNS = 256`, `ELASTIC_REGION_SIZE = 16 MiB` |
-| `profile_wasm` | `target_arch = "wasm32"` | `STATE_ARENA_SIZE = 96 MiB`, `BUFFER_ARENA_SIZE = 8 MiB`, `MAX_MODULES = 48`, http `MAX_CONCURRENT_CONNS = 256`, `ELASTIC_REGION_SIZE = 2 MiB` |
-| `profile_embedded` | anything else (`thumbv*`) | `STATE_ARENA_SIZE = 240 KiB` (rp2350) / `64 KiB` (rp2040), `BUFFER_ARENA_SIZE = 64 KiB` / `16 KiB`, `MAX_MODULES = 32`, http `MAX_CONCURRENT_CONNS = 4` / `1`, `ELASTIC_REGION_SIZE = 0` |
+| `profile_host` | `target_arch = "aarch64"` (Pi 5, Linux host, BCM2712 bare-metal) | `TARGET_CLASS = HOST`, http `MAX_CONCURRENT_CONNS = 256`, ip `MAX_TCP_CONNS = 65536`, tls `MAX_SESSIONS = 512` |
+| `profile_wasm` | `target_arch = "wasm32"` | `TARGET_CLASS = HOST`, http `MAX_CONCURRENT_CONNS = 256`, ip `MAX_TCP_CONNS = 256` |
+| `profile_embedded` | anything else (`thumbv*`) | `TARGET_CLASS = SMALL` (rp2350) / `TINY` (rp2040), http `MAX_CONCURRENT_CONNS = 4` / `1`, ip `MAX_TCP_CONNS = 8` / `2` |
 
-On RP silicon the kernel's arena sizes are overridden per chip by the
-silicon TOMLs (`targets/silicon/rp2040.toml`: 64 KiB state / 16 KiB
-buffer; `targets/silicon/rp2350.toml`: 240 KiB / 64 KiB);
-`profile_embedded`'s figures apply to thumbv targets with no TOML
-override.
-
-This is *not* a YAML overlay or a TOML-driven build artefact — it is a
-Rust file the SDK compiles into both the kernel and every module.
-`src/platform/{linux,wasm,bcm2712}/chip.rs` are thin `pub use` shims
-that re-export these constants under the platform's `super::chip::*`
-path. Only RP-family chips take chip constants from
-`targets/silicon/rp2*.toml`: build.rs reads that file's `[kernel]`
-section and emits `chip_generated.rs`, which `src/platform/rp/chip.rs`
-`include!`s.
+`TARGET_CLASS` (`abi::config::target_class::{TINY, SMALL, HOST}`) is the
+coarse memory class a module scales its own buffers by: TINY for a state
+arena of 64 KiB or less, SMALL for 512 KiB or less, HOST above that.
 
 Cross-subsystem invariants are enforced at compile time at the bottom of
 the same file, e.g. `http::MAX_CONCURRENT_CONNS <= ip::MAX_TCP_CONNS`.
@@ -464,11 +453,24 @@ Adding a tunable means adding it to every `profile_*` module; the
 `pub use ...::*` re-export is wildcarded so no extra plumbing is
 required at the call site.
 
-`src/kernel/config.rs::MAX_MODULES` is a `pub use` re-export of
-`abi::config::kernel::MAX_MODULES`, so the kernel's static module-slot
-arrays match what the SDK promises. A compile-time assert catches
-bumps that would outgrow the `u64` event-wake bitmap in
-`kernel/event.rs`.
+### Kernel capacity is not ABI
+
+The kernel's own capacity — state, buffer and config arenas, the
+per-module params ceiling, the log ring, the elastic region, module and
+bridge slots, the code-size ceiling — is NOT in this file. It lives in
+`src/kernel/config.rs`, one profile per kernel platform
+(`profile_linux`, `profile_bcm2712`, `profile_wasm`, `profile_rp`),
+selected by the platform feature; the RP arenas come from the silicon
+TOMLs through `build.rs` → `chip_generated.rs` → `platform::chip`.
+Everything under `modules/sdk` is hashed into the ABI-surface digest, so
+a kernel size stated here would make raising it an ABI epoch and a
+workspace republish though no module reads it.
+
+A module that needs a kernel figure asks at runtime: the module-slot
+count is `internal::reconfigure::SLOT_CAPACITY` (monitor and reconfigure
+size their per-slot walks by it). A tools gate (`kernel_capacity_gate`)
+fails if a kernel capacity constant reappears in the srcpin's file set
+or in module source.
 
 ## Platform layer — not public
 

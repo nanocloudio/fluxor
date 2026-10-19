@@ -15,7 +15,7 @@ EXTERN(_start)
  * and pools, ~100 MiB on the host profile) and the stack, with the relocated
  * package payload above __end_block_addr.
  *
- * The module state arena (abi::config::kernel::STATE_ARENA_SIZE, 1 GiB) is
+ * The module state arena (kernel::config STATE_ARENA_SIZE, 1 GiB) is
  * a region of its own at ARENA_ORIGIN, never zeroed at boot: the loader
  * zeroes each allocation as it hands it out. It cannot sit in RAM. On the
  * Pi 5 the firmware's memory map (the DTB's /memory node) is
@@ -113,3 +113,13 @@ SECTIONS {
 }
 
 __start_block_addr = 0;
+
+/* Everything the kernel reserves in RAM — image, .bss, the stack — must end
+ * below RAM_CEILING (build.rs: 0x2E00_0000 on the Pi 5, where the firmware
+ * places the DTB and initramfs; ARENA_ORIGIN on QEMU virt). On the Pi 5 a
+ * .bss grown past it does not fail: the boot writes over the firmware's
+ * region and the board stays dark with nothing on any console. A kernel
+ * capacity raise that would do that fails the link here instead. */
+ASSERT(__end_block_addr <= RAM_CEILING,
+       "kernel RAM (image + .bss + stack) runs past RAM_CEILING: on a Pi 5 it would overwrite the firmware's DTB/initramfs at 0x2E000000 and boot dark. Shrink a .bss table in kernel::config.")
+

@@ -1007,14 +1007,13 @@ fn main() {
     // The module ABI, under the name the module build uses.
     //
     // `modules/sdk/abi/config.rs` is mounted by BOTH the kernel and every PIC
-    // module, and its `profile_embedded` block picks arena and connection
-    // ceilings by `fluxor_abi`: the RP parts differ by 3.75x and `target_arch`
-    // cannot tell thumbv6m from thumbv8m. The kernel sizes its own arenas from
-    // `platform::chip` instead, so nothing in the kernel image reads this
-    // cfg — but shared source that resolves one way under one mount and
-    // another way under the other is a trap waiting for the first kernel-side
-    // reader of those constants, and leaving the name undeclared makes every
-    // use of it in that file an unexpected-cfg error under `-D warnings`.
+    // module, and its `profile_embedded` block picks connection ceilings and
+    // `TARGET_CLASS` by `fluxor_abi`: the RP parts differ by 3.75x and
+    // `target_arch` cannot tell thumbv6m from thumbv8m. The kernel's own
+    // `kernel::config::profile_rp` reads it too, for the per-die code-size
+    // ceiling, so the kernel build must set the same value the module build
+    // does; leaving the name undeclared would also make every use of it an
+    // unexpected-cfg error under `-D warnings`.
     //
     // A separate name from `fluxor_platform` because the value sets differ:
     // `fluxor_platform` names the kernel's platform, this the module ABI
@@ -1051,10 +1050,9 @@ fn main() {
 
     match platform {
         Platform::HostLinux => {
-            // Hosted targets: capacity tunables come from
-            // `abi::config::kernel` (per-profile, selected at compile
-            // time via `cfg(target_arch)` in `modules/sdk/config.rs`).
-            // No linker script, no chip_generated.rs.
+            // Hosted targets: kernel capacity comes from `kernel::config`
+            // (per platform, selected by the platform feature). No linker
+            // script, no chip_generated.rs.
             emit_builtin_param_tags(out, "modules/platform/linux");
         }
         Platform::HostWasm => emit_builtin_param_tags(out, "modules/platform/wasm"),
@@ -1257,9 +1255,10 @@ fn emit_uefi(out: &Path) {
 
 fn emit_bcm2712(out: &Path) {
     // BCM2712: single linker script with board-dependent RAM origin —
-    // real Pi 5 (board-pi5) vs QEMU virt — via --defsym. Capacity constants
-    // come from the centralised `abi::config::kernel::profile_host`;
-    // `targets/silicon/bcm2712.toml` carries non-capacity metadata only.
+    // real Pi 5 (board-pi5) vs QEMU virt — via --defsym. Kernel capacity
+    // comes from `kernel::config::profile_bcm2712`;
+    // `targets/silicon/bcm2712.toml` restates the state arena for the graph
+    // builder and otherwise carries non-capacity metadata.
     let is_pi5 = env::var("CARGO_FEATURE_BOARD_PI5").is_ok();
     let ram_origin = if is_pi5 { "0x80000" } else { "0x40080000" };
     // The module state arena's own region (see linker/memory-bcm2712.x): the
@@ -1273,6 +1272,12 @@ fn emit_bcm2712(out: &Path) {
     println!("cargo:rustc-link-arg=-T{}/memory-bcm2712.x", out.display());
     println!("cargo:rustc-link-arg=--defsym=RAM_ORIGIN={ram_origin}");
     println!("cargo:rustc-link-arg=--defsym=ARENA_ORIGIN={arena_origin}");
+    // Where the kernel's own RAM (image, .bss, stack) must end — asserted by
+    // the linker script. On the Pi 5 the firmware places the DTB and
+    // initramfs near 0x2E00_0000, and a boot that writes over them never
+    // comes up; on QEMU virt the arena's region is the bound.
+    let ram_ceiling = if is_pi5 { "0x2E000000" } else { arena_origin };
+    println!("cargo:rustc-link-arg=--defsym=RAM_CEILING={ram_ceiling}");
     println!("cargo:rerun-if-changed=linker/memory-bcm2712.x");
     println!("cargo:rerun-if-changed=targets/silicon/bcm2712.toml");
 

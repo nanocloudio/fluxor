@@ -76,7 +76,7 @@ const TOTAL_SLOTS: usize = MAX_STREAM_SLOTS + MAX_CMD_SLOTS + MAX_RX_SLOTS;
 /// bus, which uses the command slots only -- and whose arena has a better use
 /// for the 27 KiB the audio-rate buffers would hold.
 const TINY_ARENA: bool =
-    cfg!(feature = "small_stream") || abi::config::kernel::STATE_ARENA_SIZE <= 64 * 1024;
+    cfg!(feature = "small_stream") || abi::config::TARGET_CLASS == abi::config::target_class::TINY;
 
 /// TX stream buffer size in u32 words. Two per slot (front and back), so at
 /// 2048 words this pair is 16 KiB of every stream slot; 512 words on a 64 KiB

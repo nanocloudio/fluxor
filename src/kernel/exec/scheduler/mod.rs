@@ -621,7 +621,7 @@ pub fn close_channels(edges: &[Edge]) {
 // Parameter Buffer
 // ============================================================================
 
-/// Maximum module-specific config size — from silicon TOML [kernel] section.
+/// Largest params block one module instance may carry (`kernel::config`).
 const MAX_MODULE_CONFIG_SIZE: usize = crate::kernel::config::MAX_MODULE_CONFIG_SIZE;
 
 /// Buffer for module params.
@@ -661,11 +661,17 @@ impl ParamBuffer {
         self.len = len;
     }
 
-    /// Copy module-specific config bytes.
-    fn write(&mut self, config: &[u8]) {
-        let copy_len = config.len().min(MAX_MODULE_CONFIG_SIZE);
-        self.data[..copy_len].copy_from_slice(&config[..copy_len]);
-        self.len = copy_len;
+    /// Copy module-specific config bytes. A block larger than the buffer is
+    /// refused whole (`Err` carries its length), never cut short: a module
+    /// handed the front of its params parses a different config from the one
+    /// it was given, and nothing downstream could tell.
+    fn write(&mut self, config: &[u8]) -> Result<(), usize> {
+        let Some(dst) = self.data.get_mut(..config.len()) else {
+            return Err(config.len());
+        };
+        dst.copy_from_slice(config);
+        self.len = config.len();
+        Ok(())
     }
 }
 

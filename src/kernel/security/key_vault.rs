@@ -787,8 +787,8 @@ static mut SEAL_SCRATCH: [u8; MAX_SEAL_BYTES] = [0; MAX_SEAL_BYTES];
 /// profile admits — one blob and one instance entry per module slot, and
 /// one entry per graph edge.
 const MAX_ATTEST_RECORD: usize = 4096
-    + crate::abi::config::kernel::MAX_MODULES * 40
-    + crate::abi::config::kernel::MAX_MODULES * 37
+    + crate::kernel::config::MAX_MODULES * 40
+    + crate::kernel::config::MAX_MODULES * 37
     + crate::kernel::boot::config::MAX_GRAPH_EDGES * 5;
 static mut ATTEST_RECORD: [u8; MAX_ATTEST_RECORD] = [0; MAX_ATTEST_RECORD];
 

@@ -69,6 +69,41 @@ pub fn abi_surface_digest() -> [u8; 32] {
     out
 }
 
+/// Every source file the srcpin hashes: all `.rs` under `modules/sdk/**` and
+/// `contracts/src/**`, except build artifacts and the generated pin itself.
+///
+/// One definition, shared by the hash and by the kernel-capacity gate
+/// (`tools/tests/kernel_capacity_gate.rs`), so the gate inspects exactly the
+/// set that moves the ABI digest.
+#[allow(
+    dead_code,
+    reason = "consumed by the srcpin hash and the lib-side gate test; the bin mounts this file too"
+)]
+pub fn contracts_platform_src_files(repo_root: &Path) -> Result<Vec<std::path::PathBuf>> {
+    fn walk(dir: &Path, out: &mut Vec<std::path::PathBuf>) -> std::io::Result<()> {
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let p = entry.path();
+            if entry.file_type()?.is_dir() {
+                // Build artifacts never participate.
+                if p.file_name().is_some_and(|n| n == "target") {
+                    continue;
+                }
+                walk(&p, out)?;
+            } else if p.extension().is_some_and(|e| e == "rs")
+                && p.file_name().is_none_or(|n| n != "abi_surface_srcpin.rs")
+            {
+                out.push(p);
+            }
+        }
+        Ok(())
+    }
+    let mut files = Vec::new();
+    walk(&repo_root.join("modules/sdk"), &mut files)?;
+    walk(&repo_root.join("contracts/src"), &mut files)?;
+    Ok(files)
+}
+
 /// Recompute the canonical source hash over ALL of `modules/sdk` — the
 /// full SDK a module compiles against: kernel_abi (incl. SyscallTable
 /// layout and helper signatures), wire, config profiles, internal
@@ -99,27 +134,7 @@ pub fn abi_surface_digest() -> [u8; 32] {
     reason = "consumed by the lib-side drift test; the bin mounts this file too"
 )]
 pub fn compute_contracts_platform_src_hash(repo_root: &Path) -> Result<[u8; 32]> {
-    fn walk(dir: &Path, out: &mut Vec<std::path::PathBuf>) -> std::io::Result<()> {
-        for entry in fs::read_dir(dir)? {
-            let entry = entry?;
-            let p = entry.path();
-            if entry.file_type()?.is_dir() {
-                // Build artifacts never participate.
-                if p.file_name().is_some_and(|n| n == "target") {
-                    continue;
-                }
-                walk(&p, out)?;
-            } else if p.extension().is_some_and(|e| e == "rs")
-                && p.file_name().is_none_or(|n| n != "abi_surface_srcpin.rs")
-            {
-                out.push(p);
-            }
-        }
-        Ok(())
-    }
-    let mut files = Vec::new();
-    walk(&repo_root.join("modules/sdk"), &mut files)?;
-    walk(&repo_root.join("contracts/src"), &mut files)?;
+    let files = contracts_platform_src_files(repo_root)?;
     let mut rels: Vec<(String, std::path::PathBuf)> = files
         .into_iter()
         .map(|p| {
@@ -274,7 +289,7 @@ mod tests {
         );
         let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
-            hex, "4761304927fa8d802592551c52e963f557c66f19420f880a9147a3d9be0551af",
+            hex, "65e3ef9ae3d71e306f16408440675097ab1efbeb709b77b2982f5062222f8ce9",
             "ABI wire-surface changed — this is a deliberate wire break or it is \
              a mistake; see docs/architecture/abi_surface.md before updating"
         );

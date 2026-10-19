@@ -551,13 +551,15 @@ fn read_layout_from_trailer() -> Option<FlashLayout> {
 
 /// Maximum counts.
 ///
-/// `MAX_MODULES` is re-exported from `abi::config::kernel` (per-target
-/// profile in `modules/sdk/config.rs`) so kernel-side static arrays match
-/// what the SDK promises modules. Bumping it on aarch64-host accommodates
-/// graphs like Quantum (42 modules); the wasm/embedded profiles run with
-/// 32. The event-wake bitmap in `kernel/event.rs` is u64, so any profile
-/// value up to 64 is safe; >64 needs the bitmap widened first.
-pub use crate::abi::config::kernel::MAX_MODULES;
+/// `MAX_MODULES` is the kernel platform's module-slot count, stated in
+/// `kernel::config` (1024 on linux and bcm2712, 48 on wasm, 32 on RP). It is
+/// kernel capacity, not ABI: modules ask for it at runtime
+/// (`internal::reconfigure::SLOT_CAPACITY`). Every per-module set — the
+/// event-wake bitmap, owner and upstream masks — is a `ModuleMask` of
+/// `MODULE_MASK_WORDS` u64 words sized from it, so a profile value needs no
+/// bitmap widened by hand; the limits that do bind are the config blob's
+/// 10-bit module id (asserted below) and the `0xFFFF` no-module sentinel.
+pub use crate::kernel::config::MAX_MODULES;
 use crate::kernel::exec::scheduler::ModuleId;
 
 // A module id is 10 bits on the wire: the low byte in its own field and the

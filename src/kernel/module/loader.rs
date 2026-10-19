@@ -922,8 +922,8 @@ pub fn alloc_state(size: usize) -> Result<*mut u8, LoaderError> {
         let aligned = align_up(STATE_ARENA_OFFSET);
         // TWO ceilings guard this arena and they are reported apart, because
         // they are raised in different places by different people. The compiled
-        // `STATE_ARENA_SIZE` is a silicon fact, changed by editing the SDK
-        // config and rebuilding the kernel. The envelope capacity is a
+        // `STATE_ARENA_SIZE` is a platform fact, changed in `kernel::config` and
+        // by rebuilding the kernel (no ABI epoch). The envelope capacity is a
         // PACKAGING fact, computed by the composer from the graph that was
         // packed and installed from the boot config's FXEV section — and it is
         // usually the lower of the two, so it is usually the one that refuses.
@@ -937,7 +937,7 @@ pub fn alloc_state(size: usize) -> Result<*mut u8, LoaderError> {
                 log::error!(
                     "[loader] STATE ARENA EXHAUSTED (compiled capacity) — need={need} \
                      used={aligned} cap={STATE_ARENA_SIZE} (raise \
-                     abi::config::kernel::STATE_ARENA_SIZE for this silicon and rebuild the \
+                     STATE_ARENA_SIZE in kernel::config for this platform and rebuild the \
                      kernel, or reduce module arena demand; modules without a heap arena will \
                      silently fail every heap_alloc call)"
                 );
@@ -2237,7 +2237,7 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<Signing, Loa
     // Sanity ceiling for the code segment (profile-tuned: media modules
     // like the unified codec carry large decoder tables; protocol
     // modules may bundle firmware+NVRAM).
-    if module.header.code_size as usize > crate::abi::config::kernel::MAX_MODULE_CODE_SIZE {
+    if module.header.code_size as usize > crate::kernel::config::MAX_MODULE_CODE_SIZE {
         log::error!(
             "[loader] {}: code too large size={}",
             name,
@@ -3273,7 +3273,7 @@ impl DynamicModule {
                     Err(e) => {
                         log::error!(
                             "[loader] {}: heap arena alloc failed need={} (state used={}, cap={}); \
-                             bump STATE_ARENA_SIZE in abi::config::kernel or shrink the module's \
+                             bump STATE_ARENA_SIZE in kernel::config or shrink the module's \
                              ARENA_WORKING_SET_CONNS",
                             name,
                             arena_size,

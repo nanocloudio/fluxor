@@ -50,7 +50,7 @@ use abi::internal::reconfigure::{
     MODULE_COUNT as SYS_RECONFIG_MODULE_COUNT, MODULE_DONE as SYS_RECONFIG_MODULE_DONE,
     MODULE_INFO as SYS_RECONFIG_MODULE_INFO, MODULE_UPSTREAM as SYS_RECONFIG_MODULE_UPSTREAM,
     SELF_INDEX as SYS_RECONFIG_SELF_INDEX, SET_PHASE as SYS_RECONFIG_SET_PHASE,
-    TRIGGER_REBUILD as SYS_RECONFIG_TRIGGER_REBUILD,
+    SLOT_CAPACITY as SYS_RECONFIG_SLOT_CAPACITY, TRIGGER_REBUILD as SYS_RECONFIG_TRIGGER_REBUILD,
 };
 
 // Optional graph_slot integration. When a graph_slot provider is
@@ -82,9 +82,21 @@ const DS_PENDING_TERMINATE: u8 = 3;
 // Bits returned by RECONFIGURE_MODULE_INFO.
 const INFO_DRAIN_CAPABLE: u32 = 0x01;
 
-// Drain-state capacity: one state byte per module slot the kernel's profile
-// holds, so every module of the graph is classified and drained.
-const MAX_TRACKED_MODULES: usize = abi::config::kernel::MAX_MODULES;
+// Drain round width: the modules one round classifies and drains, one state
+// byte each. The kernel's module-slot count is kernel capacity, not ABI, so it
+// is not compiled in: the module asks for it (`SLOT_CAPACITY`) and the graph's
+// size (`MODULE_COUNT`) at runtime, and a graph wider than one round is
+// drained over successive rounds in index order — every module is drained,
+// none is cut off. Within a round, drain completion follows the upstream
+// masks; a module waits only on upstream peers of its own round, because
+// earlier rounds have finished and later ones have not yet been asked to
+// drain. Each round has the full `drain_timeout_ms`. One round covers every
+// graph today's kernels can hold on host-class targets.
+const DRAIN_WINDOW: usize = if abi::config::TARGET_CLASS == abi::config::target_class::HOST {
+    1024
+} else {
+    32
+};
 
 // StepOutcome return values.
 const CONTINUE: i32 = 0;
@@ -121,7 +133,18 @@ struct State {
     tick_count: u32,
     drain_start_tick: u32,
     drain_timeout_ms: u32,
-    drain_state: [u8; MAX_TRACKED_MODULES],
+    /// The kernel's module-slot count (`SLOT_CAPACITY`), read on the first
+    /// step; 0 until then.
+    slot_capacity: u32,
+    /// Modules in the graph when the drain began (`MODULE_COUNT`).
+    drain_count: u32,
+    /// First module index of the current drain round.
+    round_base: u32,
+    /// One past the last module index of the current drain round.
+    round_end: u32,
+    /// Drain state of modules `round_base..round_end`, indexed from the
+    /// round's base.
+    drain_state: [u8; DRAIN_WINDOW],
 }
 
 // ============================================================================
@@ -171,6 +194,10 @@ unsafe fn sys_module_count(sys: &SyscallTable) -> i32 {
     (sys.provider_call)(-1, SYS_RECONFIG_MODULE_COUNT, core::ptr::null_mut(), 0)
 }
 
+unsafe fn sys_slot_capacity(sys: &SyscallTable) -> i32 {
+    (sys.provider_call)(-1, SYS_RECONFIG_SLOT_CAPACITY, core::ptr::null_mut(), 0)
+}
+
 unsafe fn sys_module_info(sys: &SyscallTable, idx: u16) -> u32 {
     let mut arg = idx.to_le_bytes();
     let rc = (sys.provider_call)(-1, SYS_RECONFIG_MODULE_INFO, arg.as_mut_ptr(), 2);
@@ -181,37 +208,54 @@ unsafe fn sys_module_info(sys: &SyscallTable, idx: u16) -> u32 {
     }
 }
 
-/// Upstream-mask words per the `MODULE_UPSTREAM` wire contract: one bit per
-/// module slot of the kernel's profile.
-const UPSTREAM_WORDS: usize = MAX_TRACKED_MODULES.div_ceil(64);
+/// Upstream-mask words one read covers: every module of a drain round, which
+/// need not start on a word boundary.
+const UPSTREAM_WORDS: usize = DRAIN_WINDOW.div_ceil(64) + 1;
 
-unsafe fn sys_module_upstream(sys: &SyscallTable, idx: u16) -> [u64; UPSTREAM_WORDS] {
-    // Arg layout: arg[0..2] = module idx in (u16 LE), arg[2..] = mask words
-    // u64 LE out (low word first); the kernel writes as many words as fit
-    // and returns its full word count.
-    let mut arg = [0u8; 2 + 8 * UPSTREAM_WORDS];
-    arg[0..2].copy_from_slice(&idx.to_le_bytes());
-    let rc = (sys.provider_call)(
-        -1,
-        SYS_RECONFIG_MODULE_UPSTREAM,
-        arg.as_mut_ptr(),
-        arg.len(),
-    );
-    let mut mask = [0u64; UPSTREAM_WORDS];
-    if rc > 0 {
-        for (w, word) in mask.iter_mut().enumerate().take(rc as usize) {
-            let off = 2 + w * 8;
-            let mut bytes = [0u8; 8];
-            bytes.copy_from_slice(&arg[off..off + 8]);
-            *word = u64::from_le_bytes(bytes);
-        }
+/// Read the window of module `idx`'s upstream mask that starts at mask word
+/// `first_word`, `UPSTREAM_WORDS` wide. Words past the kernel's mask read as 0.
+unsafe fn sys_module_upstream(
+    sys: &SyscallTable,
+    idx: u16,
+    first_word: u16,
+    mask: &mut [u64; UPSTREAM_WORDS],
+) {
+    // Arg layout: in `[module_idx:u16 LE][first_word:u16 LE]`, out mask words
+    // u64 LE from offset 4; the kernel writes as many words as fit and returns
+    // its full word count.
+    let mut arg = [0u8; 4 + 8 * UPSTREAM_WORDS];
+    let i = idx.to_le_bytes();
+    let f = first_word.to_le_bytes();
+    let p = arg.as_mut_ptr();
+    core::ptr::write(p, i[0]);
+    core::ptr::write(p.add(1), i[1]);
+    core::ptr::write(p.add(2), f[0]);
+    core::ptr::write(p.add(3), f[1]);
+    let rc = (sys.provider_call)(-1, SYS_RECONFIG_MODULE_UPSTREAM, p, arg.len());
+    let avail = if rc > first_word as i32 {
+        (rc - first_word as i32) as usize
+    } else {
+        0
+    };
+    for (w, word) in mask.iter_mut().enumerate() {
+        *word = if w < avail {
+            u64::from_le_bytes(core::ptr::read_unaligned(p.add(4 + w * 8) as *const [u8; 8]))
+        } else {
+            0
+        };
     }
-    mask
 }
 
-/// Bit `j` of a flattened upstream mask.
-fn upstream_bit(mask: &[u64; UPSTREAM_WORDS], j: usize) -> bool {
-    j < UPSTREAM_WORDS * 64 && (mask[j / 64] >> (j % 64)) & 1 != 0
+/// Bit `j` (a module index) of a mask window that starts at word `first_word`.
+fn upstream_bit(mask: &[u64; UPSTREAM_WORDS], first_word: usize, j: usize) -> bool {
+    let w = j / 64;
+    if w < first_word {
+        return false;
+    }
+    match mask.get(w - first_word) {
+        Some(word) => (word >> (j % 64)) & 1 != 0,
+        None => false,
+    }
 }
 
 unsafe fn sys_module_done(sys: &SyscallTable, idx: u16) -> bool {
@@ -238,18 +282,23 @@ unsafe fn sys_trigger_rebuild(sys: &SyscallTable, ptr: usize, len: usize) {
 // Drain-state accessors (pointer arithmetic — PIC modules avoid array indexing)
 // ============================================================================
 
+/// Drain state of module `i`, which must lie in the current round; any other
+/// module reads as Surviving (an earlier round has finished it, a later one has
+/// not begun).
 unsafe fn ds_get(s: &State, i: usize) -> u8 {
-    if i >= MAX_TRACKED_MODULES {
+    let base = s.round_base as usize;
+    if i < base || i >= s.round_end as usize || i - base >= DRAIN_WINDOW {
         return DS_SURVIVING;
     }
-    core::ptr::read(s.drain_state.as_ptr().add(i))
+    core::ptr::read(s.drain_state.as_ptr().add(i - base))
 }
 
 unsafe fn ds_set(s: &mut State, i: usize, v: u8) {
-    if i >= MAX_TRACKED_MODULES {
+    let base = s.round_base as usize;
+    if i < base || i >= s.round_end as usize || i - base >= DRAIN_WINDOW {
         return;
     }
-    core::ptr::write_volatile(s.drain_state.as_mut_ptr().add(i), v);
+    core::ptr::write_volatile(s.drain_state.as_mut_ptr().add(i - base), v);
 }
 
 // ============================================================================
@@ -261,23 +310,37 @@ unsafe fn begin_draining(s: &mut State, sys: &SyscallTable) {
     if count <= 0 {
         return;
     }
-    let count = count as usize;
-    let count = if count > MAX_TRACKED_MODULES {
-        MAX_TRACKED_MODULES
-    } else {
-        count
-    };
 
     sys_set_phase(sys, PHASE_DRAINING);
     s.phase = PHASE_DRAINING;
-    s.drain_start_tick = s.tick_count;
+    s.drain_count = count as u32;
+    s.round_base = 0;
+    begin_round(s, sys);
+}
 
-    // Classify every module. The reconfigure module itself is marked
-    // Surviving so the scheduler keeps stepping it; drain-capable modules
-    // enter Draining; the rest are terminated immediately.
+/// Classify and signal the modules of the round that starts at `round_base`.
+unsafe fn begin_round(s: &mut State, sys: &SyscallTable) {
+    let base = s.round_base as usize;
+    let count = s.drain_count as usize;
+    let end = if count - base > DRAIN_WINDOW {
+        base + DRAIN_WINDOW
+    } else {
+        count
+    };
+    s.round_end = end as u32;
+    s.drain_start_tick = s.tick_count;
+    let mut k = 0;
+    while k < DRAIN_WINDOW {
+        core::ptr::write_volatile(s.drain_state.as_mut_ptr().add(k), DS_SURVIVING);
+        k += 1;
+    }
+
+    // Classify every module of the round. The reconfigure module itself is
+    // marked Surviving so the scheduler keeps stepping it; drain-capable
+    // modules enter Draining; the rest are terminated immediately.
     let mut draining = 0u16;
-    let mut i = 0;
-    while i < count {
+    let mut i = base;
+    while i < end {
         let idx = i as u16;
         if idx == s.self_idx {
             ds_set(s, i, DS_SURVIVING);
@@ -297,8 +360,8 @@ unsafe fn begin_draining(s: &mut State, sys: &SyscallTable) {
     // Signal drain-start to every drain-capable module. Ordering between
     // producers and consumers is handled in `check_drain` via the upstream
     // mask: drain completion follows forward topological order.
-    let mut i = 0;
-    while i < count {
+    let mut i = base;
+    while i < end {
         let idx = i as u16;
         if ds_get(s, i) == DS_DRAINING {
             let _ = sys_call_drain(sys, idx);
@@ -306,38 +369,40 @@ unsafe fn begin_draining(s: &mut State, sys: &SyscallTable) {
         i += 1;
     }
 
-    emit_status(s, sys, STATUS_DRAINING_ENTERED, 0, draining);
+    // `module_idx` carries the round's first module, so a multi-round drain
+    // reports one DRAINING_ENTERED per round.
+    emit_status(s, sys, STATUS_DRAINING_ENTERED, base as u16, draining);
 }
 
-/// Returns true once every non-surviving module is Drained or
-/// PendingTerminate.
+/// Returns true once every non-surviving module of every round is Drained or
+/// PendingTerminate. A finished round that is not the last starts the next.
 unsafe fn check_drain(s: &mut State, sys: &SyscallTable) -> bool {
-    let count = sys_module_count(sys);
-    if count <= 0 {
+    let base = s.round_base as usize;
+    let end = s.round_end as usize;
+    if end <= base {
         return true;
     }
-    let count = count as usize;
-    let count = if count > MAX_TRACKED_MODULES {
-        MAX_TRACKED_MODULES
-    } else {
-        count
-    };
+    let first_word = base / 64;
 
     let elapsed = s.tick_count.wrapping_sub(s.drain_start_tick);
     let timed_out = elapsed >= s.drain_timeout_ms;
 
     // Promote Draining → Drained when the module has returned Done and all
     // its upstream-draining peers are already Drained.
-    let mut i = 0;
-    while i < count {
+    let mut upstream = [0u64; UPSTREAM_WORDS];
+    let mut i = base;
+    while i < end {
         if ds_get(s, i) == DS_DRAINING {
             let idx = i as u16;
             if sys_module_done(sys, idx) {
-                let upstream = sys_module_upstream(sys, idx);
+                sys_module_upstream(sys, idx, first_word as u16, &mut upstream);
                 let mut upstream_ok = true;
-                let mut j = 0;
-                while j < count {
-                    if j != i && upstream_bit(&upstream, j) && ds_get(s, j) == DS_DRAINING {
+                let mut j = base;
+                while j < end {
+                    if j != i
+                        && upstream_bit(&upstream, first_word, j)
+                        && ds_get(s, j) == DS_DRAINING
+                    {
                         upstream_ok = false;
                         break;
                     }
@@ -358,12 +423,17 @@ unsafe fn check_drain(s: &mut State, sys: &SyscallTable) -> bool {
         i += 1;
     }
 
-    let mut i = 0;
-    while i < count {
+    let mut i = base;
+    while i < end {
         if ds_get(s, i) == DS_DRAINING {
             return false;
         }
         i += 1;
+    }
+    if end < s.drain_count as usize {
+        s.round_base = end as u32;
+        begin_round(s, sys);
+        return false;
     }
     true
 }
@@ -451,6 +521,10 @@ pub unsafe extern "C" fn module_new(
         s.tick_count = 0;
         s.drain_start_tick = 0;
         s.drain_timeout_ms = 5000;
+        s.slot_capacity = 0;
+        s.drain_count = 0;
+        s.round_base = 0;
+        s.round_end = 0;
 
         // TLV params: tag 1 (u32 LE) = drain_timeout_ms.
         if !params.is_null() && params_len >= 2 {
@@ -495,8 +569,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
         if s.signaled_ready == 0 {
             s.signaled_ready = 1;
+            let cap = sys_slot_capacity(sys);
+            s.slot_capacity = if cap > 0 { cap as u32 } else { 0 };
             let rc = sys_self_index(sys);
-            if rc >= 0 && rc < MAX_TRACKED_MODULES as i32 {
+            if rc >= 0 && (rc as u32) < s.slot_capacity && rc < SELF_IDX_UNKNOWN as i32 {
                 s.self_idx = rc as u16;
             }
             // Resolve graph_slot request channel (out port 1). -1 if unwired.

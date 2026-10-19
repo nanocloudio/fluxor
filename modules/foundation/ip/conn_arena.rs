@@ -19,11 +19,11 @@
 //! so `len()` never shrinks and a slot once valid stays valid.
 //!
 //! What can actually be granted is bounded by the elastic region, not by
-//! `MAX_TCP_CONNS`: at 16 MiB on aarch64 (`abi::config::kernel::
-//! ELASTIC_REGION_SIZE`, shared with every other Tier B pool, TLS sessions
-//! among them) a 256-slot chunk rounds to ~576 KiB, so roughly 28 chunks —
-//! ~7k slots on top of the inline block — until that profile constant is
-//! raised. A denial is counted and the arrival refused, never a fault.
+//! `MAX_TCP_CONNS`: at 16 MiB on linux and bcm2712 (the kernel's
+//! `ELASTIC_REGION_SIZE` in `kernel::config`, shared with every other Tier B
+//! pool, TLS sessions among them) a 256-slot chunk rounds to ~576 KiB, so
+//! roughly 28 chunks — ~7k slots on top of the inline block — until that
+//! kernel constant is raised. A denial is counted and the arrival refused, never a fault.
 //!
 //! On embedded targets the inline block IS the whole table (`CONN_FIRST ==
 //! MAX_TCP_CONNS`, no elastic chunks): identical behaviour to a static
