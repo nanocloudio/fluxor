@@ -104,6 +104,12 @@ open descriptor has no safe wrapper — and which prints its own diagnostics. Tw
 crate-level facts about a crate of one function."""
 
 [[ci.hygiene.allow_crate_root]]
+prefix = "crates/fluxor-uefi-loader/"
+reason = """A firmware application: everything it does is a call through a table of \
+foreign function pointers the firmware hands it, then a jump with the MMU off. \
+unsafe_code is what the crate is, not an exception within it."""
+
+[[ci.hygiene.allow_crate_root]]
 prefix = "tests/"
 reason = """Test drivers: unwrap/expect are how a failed expectation becomes a test \
 failure, and the harness mounts the module cores so it inherits modules/'s \

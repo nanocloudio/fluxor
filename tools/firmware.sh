@@ -97,6 +97,13 @@ fi
 [[ -n "$RUST_TARGET" ]] || { echo "firmware: no [build] rust_target for '$TARGET'" >&2; exit 2; }
 [[ -n "$FEATURES" ]]    || { echo "firmware: no [build] cargo_features for '$TARGET'" >&2; exit 2; }
 
+# A target the firmware boots through a loader (UEFI) names the loader's
+# triple in its host TOML; the loader is built with the kernel, below.
+LOADER_TARGET=""
+if [[ -f "$HOST_TOML" ]]; then
+    LOADER_TARGET="$(toml_get build loader_target "$HOST_TOML")"
+fi
+
 # Features layered on top of the target's own, for a build that differs
 # only by an opt-in (`EXTRA_FEATURES=enforce_signatures`, from
 # signed-image.sh) — so a variant does not fork the resolution above.
@@ -110,7 +117,7 @@ FEATURES="$FEATURES${EXTRA_FEATURES:+,$EXTRA_FEATURES}"
 # `target::load_target` for every board. A second copy of *parsing* is only
 # safe while something compares the results.
 if [[ -n "${FIRMWARE_PLAN_ONLY:-}" ]]; then
-    echo "target=$TARGET silicon=${SILICON:-} triple=$RUST_TARGET features=$FEATURES"
+    echo "target=$TARGET silicon=${SILICON:-} triple=$RUST_TARGET features=$FEATURES loader=$LOADER_TARGET"
     exit 0
 fi
 
@@ -162,6 +169,20 @@ esac
 # per-triple path remains whatever was built last and cannot be trusted to
 # belong to any particular board.
 cp "$RELEASE_DIR/fluxor" "target/$TARGET/firmware.elf"
+
+# The loader the firmware runs to reach this kernel: its own crate
+# (crates/fluxor-uefi-loader), a firmware application on the triple the
+# target names. Built with the kernel so the two cannot come from different
+# trees; `fluxor build` puts it on the boot disk at the target's
+# `loader_path`.
+if [[ -n "$LOADER_TARGET" ]]; then
+    rustup target list --installed 2>/dev/null | grep -qx "$LOADER_TARGET" || {
+        echo "firmware: the loader needs the $LOADER_TARGET target: rustup target add $LOADER_TARGET" >&2
+        exit 2
+    }
+    env -u RUSTFLAGS cargo build --release -p fluxor-uefi-loader --target "$LOADER_TARGET"
+    cp "target/$LOADER_TARGET/release/fluxor-uefi-loader.efi" "target/$TARGET/loader.efi"
+fi
 
 # An RP dependency tree must contain no third-party runtime crate. Asking
 # Cargo what resolved is the check that matters: a crate can be in the tree

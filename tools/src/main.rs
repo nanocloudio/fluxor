@@ -93,6 +93,7 @@ pub mod target;
 mod target_facts;
 mod text_distance;
 mod trust_anchors;
+mod uefi_disk;
 mod uf2;
 mod up;
 mod wasm_bundle;

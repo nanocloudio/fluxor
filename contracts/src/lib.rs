@@ -25,6 +25,7 @@ use alloc::vec::Vec;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
+pub mod boot;
 pub mod isolation;
 #[cfg(feature = "alloc")]
 pub mod log_ring;

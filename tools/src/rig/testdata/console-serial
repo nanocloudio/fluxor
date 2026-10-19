@@ -6,8 +6,8 @@ line `B:` and a bytes event for a line `T:<text>`, so a test drives the
 console from the other backends: the deploy double writes the previous
 image's output at stage, the power double writes a boot and the new
 image's output at cycle. Binding `boot_on_open` emits a boot event
-immediately on attach — what a backend must never do for a device that was
-already running, and what the orchestrator must ignore.
+on attach, before `ready` — what a backend must never do for a device that
+was already running, and what the orchestrator must ignore.
 """
 import base64
 import json
@@ -36,9 +36,11 @@ def main():
         STOP = True
 
     signal.signal(signal.SIGTERM, on_term)
-    emit({"kind": "ready"})
+    # What a backend reports on opening comes before `ready`: it is part of
+    # the open, and the orchestrator does not act until `ready`.
     if binding.get("boot_on_open"):
         emit({"kind": "boot"})
+    emit({"kind": "ready"})
     pos = 0
     while not STOP:
         if feed and os.path.exists(feed):

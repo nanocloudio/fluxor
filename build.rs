@@ -915,6 +915,7 @@ fn generate_chip_rs(
 enum Platform {
     HostLinux,
     HostWasm,
+    HostUefi,
     Bcm2712,
     Rp2040,
     Rp2350,
@@ -926,6 +927,7 @@ fn detect_platform() -> Platform {
     let bcm = env::var("CARGO_FEATURE_CHIP_BCM2712").is_ok();
     let host_linux = env::var("CARGO_FEATURE_HOST_LINUX").is_ok();
     let host_wasm = env::var("CARGO_FEATURE_HOST_WASM").is_ok();
+    let host_uefi = env::var("CARGO_FEATURE_HOST_UEFI").is_ok();
 
     let active: Vec<&str> = [
         ("chip-rp2040", rp2040),
@@ -933,6 +935,7 @@ fn detect_platform() -> Platform {
         ("chip-bcm2712", bcm),
         ("host-linux", host_linux),
         ("host-wasm", host_wasm),
+        ("host-uefi", host_uefi),
     ]
     .iter()
     .filter_map(|(n, on)| if *on { Some(*n) } else { None })
@@ -944,13 +947,14 @@ fn detect_platform() -> Platform {
         ["chip-bcm2712"] => Platform::Bcm2712,
         ["host-linux"] => Platform::HostLinux,
         ["host-wasm"] => Platform::HostWasm,
+        ["host-uefi"] => Platform::HostUefi,
         // Zero active features means the workspace default kicked in.
         // The default in Cargo.toml is `chip-rp2350b`, but emitting a
         // deterministic error here is friendlier than a Cortex-M linker
         // arg surprising a host build.
         [] => panic!(
             "build.rs: no platform feature selected. Pass exactly one of \
-             chip-rp2040 / chip-rp2350b / chip-bcm2712 / host-linux / host-wasm \
+             chip-rp2040 / chip-rp2350b / chip-bcm2712 / host-linux / host-wasm / host-uefi \
              with --no-default-features --features <name>. See `make targets`."
         ),
         _ => panic!(
@@ -985,17 +989,19 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_CHIP_BCM2712");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_HOST_LINUX");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_HOST_WASM");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_HOST_UEFI");
     // Downstream Rust code can match on this cfg to assert platform identity
     // (e.g. a `#[cfg(fluxor_platform = "wasm")]` block that statically rejects
     // a stray RP-only `include!` ever reaching the wasm crate graph).
     let platform_str = match platform {
         Platform::HostLinux => "host-linux",
         Platform::HostWasm => "host-wasm",
+        Platform::HostUefi => "host-uefi",
         Platform::Bcm2712 => "bcm2712",
         Platform::Rp2040 => "rp2040",
         Platform::Rp2350 => "rp2350",
     };
-    println!("cargo:rustc-check-cfg=cfg(fluxor_platform, values(\"host-linux\", \"host-wasm\", \"bcm2712\", \"rp2040\", \"rp2350\"))");
+    println!("cargo:rustc-check-cfg=cfg(fluxor_platform, values(\"host-linux\", \"host-wasm\", \"host-uefi\", \"bcm2712\", \"rp2040\", \"rp2350\"))");
     println!("cargo:rustc-cfg=fluxor_platform=\"{platform_str}\"");
 
     // The module ABI, under the name the module build uses.
@@ -1019,7 +1025,7 @@ fn main() {
         "cargo:rustc-check-cfg=cfg(fluxor_abi, values(\"thumbv6m\", \"thumbv8m\", \"aarch64\", \"x86_64\", \"wasm32\", \"xtensa-lx6\"))"
     );
     let module_abi = match platform {
-        Platform::Bcm2712 => Some("aarch64"),
+        Platform::Bcm2712 | Platform::HostUefi => Some("aarch64"),
         Platform::Rp2040 => Some("thumbv6m"),
         Platform::Rp2350 => Some("thumbv8m"),
         _ => None,
@@ -1052,6 +1058,7 @@ fn main() {
             emit_builtin_param_tags(out, "modules/platform/linux");
         }
         Platform::HostWasm => emit_builtin_param_tags(out, "modules/platform/wasm"),
+        Platform::HostUefi => emit_uefi(out),
         Platform::Bcm2712 => emit_bcm2712(out),
         Platform::Rp2040 => emit_rp(out, Rp::Rp2040),
         Platform::Rp2350 => emit_rp(out, Rp::Rp2350),
@@ -1212,6 +1219,40 @@ fn emit_builtin_param_tags(out: &Path, dir: &str) {
         g.push_str("}\n");
     }
     fs::write(out.join("builtin_param_tags.rs"), g).unwrap();
+}
+
+fn emit_uefi(out: &Path) {
+    // The image's link address and span are the target's (`[memory]` in
+    // `targets/host/uefi.toml`): the loader reads them back out of the
+    // image's header and reserves exactly that span from the firmware.
+    #[derive(Deserialize)]
+    struct MemoryOnly {
+        memory: UefiMemory,
+    }
+    #[derive(Deserialize)]
+    struct UefiMemory {
+        ram_base: String,
+        ram_size: String,
+    }
+    let path = "targets/host/uefi.toml";
+    let host: MemoryOnly =
+        toml::from_str(&fs::read_to_string(path).expect("targets/host/uefi.toml"))
+            .expect("targets/host/uefi.toml parses");
+    File::create(out.join("memory-uefi.x"))
+        .unwrap()
+        .write_all(include_bytes!("linker/memory-uefi.x"))
+        .unwrap();
+    println!("cargo:rustc-link-arg=-T{}/memory-uefi.x", out.display());
+    println!(
+        "cargo:rustc-link-arg=--defsym=RAM_ORIGIN={}",
+        host.memory.ram_base
+    );
+    println!(
+        "cargo:rustc-link-arg=--defsym=RAM_LENGTH={}",
+        host.memory.ram_size
+    );
+    println!("cargo:rerun-if-changed=linker/memory-uefi.x");
+    println!("cargo:rerun-if-changed={path}");
 }
 
 fn emit_bcm2712(out: &Path) {

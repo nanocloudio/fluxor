@@ -252,6 +252,10 @@ struct TomlBuildConfig {
     cargo_features: Vec<String>,
     uf2_family_id: String,
     module_target: String,
+    /// The boot loader's own triple, for a target booted through one.
+    loader_target: Option<String>,
+    /// Where the firmware looks for that loader on the boot volume.
+    loader_path: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -452,6 +456,11 @@ pub struct BuildConfig {
     pub cargo_features: Vec<String>,
     pub uf2_family_id: u32,
     pub module_target: String,
+    /// For a target the firmware boots through a loader (UEFI): the
+    /// loader's triple (`aarch64-unknown-uefi`) and its path on the boot
+    /// volume (`EFI/BOOT/BOOTAA64.EFI`, the firmware's default).
+    pub loader_target: Option<String>,
+    pub loader_path: Option<String>,
 }
 
 /// Pin assignment table for a peripheral bus.
@@ -773,6 +782,8 @@ fn load_silicon_target(path: &Path, kind: TargetKind) -> Result<TargetDescriptor
             cargo_features: b.cargo_features,
             uf2_family_id: uf2_id,
             module_target: b.module_target,
+            loader_target: b.loader_target,
+            loader_path: b.loader_path,
         }
     });
 
@@ -1089,6 +1100,8 @@ mod tests {
             ("picow", "rp2040", "thumbv6m"),
             ("wasm", "wasm", "wasm32"),
             ("esp32", "esp32", "xtensa-lx6"),
+            ("uefi", "uefi", "aarch64"),
+            ("qemu-uefi-arm64", "uefi", "aarch64"),
         ] {
             let desc = super::load_target(target, &root).expect("target loads");
             assert_eq!(desc.runtime(), runtime, "target `{target}` runtime");

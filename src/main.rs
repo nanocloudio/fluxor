@@ -24,3 +24,7 @@ include!("platform/rp.rs");
 // BCM2712 (Raspberry Pi 5) — Cortex-A76, bare-metal
 #[cfg(feature = "chip-bcm2712")]
 include!("platform/bcm2712.rs");
+
+// UEFI-booted bare metal (aarch64) — entered from the UEFI loader
+#[cfg(feature = "host-uefi")]
+include!("platform/uefi.rs");

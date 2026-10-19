@@ -920,6 +920,44 @@ fn clippy_matrix(project_root: &Path) -> std::result::Result<(), String> {
             feature_gate: None,
             package_gate: Some("fluxor-rig-observers"),
         },
+        // The UEFI loader, on the firmware's PE target: its own crate, so its
+        // own job, like the observers.
+        ClippyJob {
+            label: "uefi-loader",
+            cwd: "crates/fluxor-uefi-loader",
+            args: &[
+                "clippy",
+                "--release",
+                "--target",
+                "aarch64-unknown-uefi",
+                "--",
+                "-D",
+                "warnings",
+            ],
+            feature_gate: None,
+            package_gate: Some("fluxor-uefi-loader"),
+        },
+        // UEFI-booted bare-metal kernel.
+        ClippyJob {
+            label: "kernel host-uefi",
+            cwd: "",
+            args: &[
+                "clippy",
+                "--release",
+                "--target",
+                "aarch64-unknown-none",
+                "--no-default-features",
+                "--features",
+                "host-uefi",
+                "--",
+                "-D",
+                "warnings",
+                "-C",
+                "target-feature=+aes,+sha2,+neon",
+            ],
+            feature_gate: Some("host-uefi"),
+            package_gate: None,
+        },
         // Linux host kernel binary.
         ClippyJob {
             label: "kernel host-linux",

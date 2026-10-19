@@ -82,6 +82,7 @@ Each silicon target has its own HAL implementation under `src/platform/`:
 | RP2350 | `src/platform/rp.rs` | Cortex-M33; synchronous step loop |
 | BCM2712 | `src/platform/bcm2712.rs` | Synchronous polling (Cortex-A76, EL1) |
 | Pi 5 | `src/platform/bcm2712.rs` (board overlay) | Synchronous polling |
+| UEFI | `src/platform/uefi.rs` | Entered from the UEFI loader with `BootInfo`; aarch64, EL1 or EL2 |
 
 The two RP families share `rp.rs` because both run on a Cortex-M core with
 the same peripheral families. The aarch64 targets share `bcm2712.rs` because
@@ -464,6 +465,7 @@ with the union of every supported peripheral.
 | Chip abstraction | `src/platform/{rp,bcm2712,linux,wasm}/chip.rs` (RP includes the generated `chip_generated.rs`) |
 | RP HAL | `src/platform/rp.rs`, `src/platform/rp/` |
 | BCM2712 HAL | `src/platform/bcm2712.rs`, `src/platform/bcm2712/` |
+| UEFI kernel entry | `src/platform/uefi.rs`; the loader is `crates/fluxor-uefi-loader`, the handoff `contracts/src/boot.rs` |
 | AArch64 architecture | `src/arch/aarch64/` — exception vectors and IRQ dispatch, GICv2, generic timer, cores and the EL2 drop, PSCI, the boot identity map, EL0 isolation; each configured by the platform at boot |
 | Cortex-M architecture | `src/arch/` — vector table, NVIC, instruction primitives |
 | Silicon definitions | `targets/silicon/*.toml` |

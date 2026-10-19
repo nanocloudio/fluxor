@@ -5,6 +5,7 @@ Platform entrypoints stay at the top level:
 - `rp.rs`
 - `bcm2712.rs`
 - `linux.rs`
+- `uefi.rs`
 
 Supporting kernel-facing modules now live in per-platform subdirectories:
 

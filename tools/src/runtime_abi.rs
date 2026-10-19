@@ -70,6 +70,11 @@ pub const RUNTIMES: &[Runtime] = &[
         bit: crate::wire::runtime_bit::ESP32,
         abis: &["xtensa-lx6"],
     },
+    Runtime {
+        id: "uefi",
+        bit: crate::wire::runtime_bit::UEFI,
+        abis: &["aarch64", "x86_64"],
+    },
 ];
 
 /// One module ABI and the floor its artefacts assume.

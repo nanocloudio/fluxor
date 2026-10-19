@@ -1,0 +1,55 @@
+# UEFI — fluxor as the operating system of a machine its firmware describes.
+# Host-level target: not a silicon, not a board (targets/host/).
+#
+# The firmware is the runtime the kernel starts on: a cloud instance or an
+# emulated machine boots the fluxor loader from its EFI system partition, the
+# loader hands the kernel the machine as UEFI and ACPI describe it, and from
+# then on the kernel is the only thing running. One target covers every
+# architecture UEFI runs on, as `linux` does; this file is its aarch64 build,
+# loading the same `aarch64` modules bcm2712 and hosted linux run.
+#
+# Build: tools/firmware.sh uefi (or a board standing on it, `[board] host = "uefi"`)
+
+[target]
+id = "uefi"
+family = "uefi"
+description = "UEFI machine (ACPI-described bare metal)"
+runtime = "uefi"
+module_abi = "aarch64"
+
+[build]
+rust_target = "aarch64-unknown-none"
+cargo_features = ["host-uefi"]
+uf2_family_id = "0x00000000"
+module_target = "aarch64-unknown-none"
+# The loader is a firmware application on the firmware's own PE target, at
+# the path the firmware boots by default when nothing else is configured.
+loader_target = "aarch64-unknown-uefi"
+loader_path = "EFI/BOOT/BOOTAA64.EFI"
+
+# No GPIO and no fixed peripherals: whatever the machine has, ACPI says.
+[gpio]
+max_pin = 0
+
+[peripherals]
+spi_count = 0
+i2c_count = 0
+uart_count = 0
+adc_channels = 0
+pwm_slices = 0
+pio_count = 0
+pio_state_machines = 0
+dma_channels = 0
+
+# Where the kernel image runs: its link address and the RAM it uses from
+# there (the image, BSS on its 16 MiB boundary, the boot stack). The loader
+# reserves exactly this span from the firmware's map and refuses a busy page
+# in it, naming what holds it and the free spans that would do instead. On
+# QEMU `virt` with AAVMF the firmware's boot-services data sits at 1 GiB +
+# 64 MiB, so the span starts above it; the state arena is placed from the
+# firmware's map at boot, not linked.
+[memory]
+ram_base = "0x48000000"
+ram_size = "0x02000000"
+flash_base = "0x00000000"
+flash_size = "0x00000000"

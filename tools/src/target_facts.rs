@@ -177,6 +177,19 @@ impl TargetFacts {
                 step_budget_us: STEP_BUDGET_DEFAULT_TICK_US,
                 nic_tx_drain: true,
             },
+            // Bare metal on firmware that hands the wall clock over once, at
+            // handoff, and no sealing key — a cloud guest is offered none —
+            // so the vault stays software. No Fluxor driver owns a transmit
+            // ring yet.
+            "uefi" => Self {
+                time_wall_source: Some("network_sync"),
+                trust_system: false,
+                vault_suites: SUITES_PQ,
+                vault_tier_ceiling: vault_tier::SOFTWARE,
+                net: NET_HOST,
+                step_budget_us: STEP_BUDGET_DEFAULT_TICK_US,
+                nic_tx_drain: false,
+            },
             // No RTC, no room for the ML-DSA scratch, no sealing.
             "rp2040" | "rp2350" => Self {
                 time_wall_source: None,

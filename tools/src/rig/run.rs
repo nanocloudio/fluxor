@@ -572,6 +572,9 @@ struct MatchOutcome {
     reason: Option<String>,
 }
 
+/// How long `attach` waits for every transport to report `ready`.
+const ATTACH_READY_TIMEOUT: Duration = Duration::from_secs(10);
+
 struct Session<'a> {
     plan: &'a Plan,
     backends: &'a Backends<'a>,
@@ -779,7 +782,32 @@ impl<'a> Session<'a> {
             eprintln!("[rig] {label} attached: {}", handle.backend().slug());
             self.transports.push(handle);
         }
+        self.await_ready();
         Ok(())
+    }
+
+    /// Nothing touches the rig until every transport is observing: a console
+    /// still opening its tty when the power step runs would miss the first
+    /// bytes of the boot, and an event it reports on opening (a fresh boot
+    /// it found) would land after the power step and be taken for this
+    /// run's. Bounded, because `ready` is the backend's to send; a backend
+    /// that never sends it costs the bound and is named.
+    fn await_ready(&self) {
+        let deadline = Instant::now() + ATTACH_READY_TIMEOUT;
+        let handles = || self.deploy_watch.iter().chain(self.transports.iter());
+        while Instant::now() < deadline && !abort_requested() {
+            if handles().all(TransportHandle::is_ready) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        for h in handles().filter(|h| !h.is_ready()) {
+            eprintln!(
+                "[rig] {} did not report ready within {}s; going on without it",
+                h.backend().slug(),
+                ATTACH_READY_TIMEOUT.as_secs()
+            );
+        }
     }
 
     /// Whether console bytes from `source` describe this run's target.

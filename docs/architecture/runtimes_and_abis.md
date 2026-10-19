@@ -3,9 +3,10 @@
 Two names describe where a module goes, and they answer different
 questions.
 
-- A **runtime** is where a module runs: bare-metal silicon, or fluxor
-  hosted as a process. It decides which contracts and providers exist,
-  so it decides which modules may be placed there.
+- A **runtime** is where a module runs: bare-metal silicon, bare metal
+  a firmware describes (UEFI), or fluxor hosted as a process. It decides
+  which contracts and providers exist, so it decides which modules may be
+  placed there.
 - A **module ABI** is the bytes a module compiles to: an instruction
   set and a CPU-feature floor. It names the artefact shelf, the store
   tag and the `fluxor.lock` pin.
@@ -32,6 +33,16 @@ Source: `tools/src/runtime_abi.rs` (the table),
 | `macos` | `0x20` | `aarch64`, `x86_64` | name reserved |
 | `windows` | `0x40` | `aarch64`, `x86_64` | name reserved |
 | `esp32` | `0x80` | `xtensa-lx6` | target validation only |
+| `uefi` | `0x100` | `aarch64`, `x86_64` | kernel entry built on aarch64 |
+
+`uefi` is bare metal on a machine its firmware describes — a cloud
+instance, or QEMU with UEFI firmware. The fluxor loader
+(`crates/fluxor-uefi-loader`), a firmware application on the boot disk,
+reads the machine from UEFI and ACPI, places the kernel image and hands
+it a `BootInfo` (`contracts/src/boot.rs`); the kernel then runs with no
+firmware service and no knowledge of UEFI. Like `linux`, one target
+(`targets/host/uefi.toml`) covers every architecture, and boards stand
+on it with `[board] host = "uefi"`.
 
 ## Module ABIs
 

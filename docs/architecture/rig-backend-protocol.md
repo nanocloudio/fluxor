@@ -272,7 +272,7 @@ Event kinds:
 
 | `kind`  | Fields                                     | Meaning |
 |---------|---------------------------------------------|---------|
-| `ready` | —                                           | Setup finished; observation is live. Optional. |
+| `ready` | —                                           | Setup finished; observation is live. The orchestrator does not stage or power the rig until every attached transport has sent it (or exited), up to 10 s; a backend that never sends it costs that wait. Anything reported about the open itself (a `boot` found on opening) goes before it. |
 | `bytes` | `data` (base64 string)                      | Raw transport bytes. Base64 keeps the line `cat`-safe. |
 | `boot`  | —                                           | The machine behind this transport started again: a tty that enumerated anew, a serial console whose DTR dropped, a cloud instance that entered `running`. **Never on the first open** — the machine may have been running for hours. The orchestrator uses it to tell the new image's output from the old one's. |
 | `fetch` | `filename` (string), `client_ip` (optional string) | A deploy-adjacent fetch event (e.g. TFTP served a file). |

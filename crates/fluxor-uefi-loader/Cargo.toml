@@ -1,0 +1,21 @@
+[package]
+name = "fluxor-uefi-loader"
+version = "0.0.1"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = "UEFI loader: places the fluxor kernel image from the ESP and hands it the machine"
+
+[lints]
+workspace = true
+
+# A firmware application on the firmware's own PE target
+# (`[build] loader_target` in targets/host/uefi.toml), built by
+# tools/firmware.sh for the `uefi` target and its boards.
+[[bin]]
+name = "fluxor-uefi-loader"
+path = "src/main.rs"
+test = false
+
+[dependencies]
+fluxor-contracts = { path = "../../contracts", default-features = false }

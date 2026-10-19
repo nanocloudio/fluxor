@@ -35,6 +35,9 @@ pub mod runtime_bit {
     pub const MACOS: u16 = 0x20;
     pub const WINDOWS: u16 = 0x40;
     pub const ESP32: u16 = 0x80;
+    /// Bare metal booted by UEFI firmware — a cloud instance or an emulated
+    /// machine — its hardware described by ACPI rather than known at build.
+    pub const UEFI: u16 = 0x100;
 }
 
 /// FNV-1a 32-bit hash. Identifies modules and exports by name (string

@@ -892,13 +892,17 @@ fn cmd_combine(
     }
 
     // Detect aarch64 targets — they use raw binary output (no UF2).
-    // Pi 5 VPU loads kernel as a raw binary to 0x80000.
+    // Pi 5 VPU loads kernel as a raw binary to 0x80000. A `uefi` image runs
+    // where its target says (`[memory] ram_base`): the loader places it there.
     let is_aarch64 = target_desc
         .build
         .as_ref()
         .map(|b| b.rust_target.starts_with("aarch64"))
         .unwrap_or(false);
-    const AARCH64_LOAD_BASE: u32 = 0x0008_0000;
+    let aarch64_load_base: u32 = match (target_desc.runtime(), target_desc.memory.as_ref()) {
+        ("uefi", Some(m)) => m.ram_base,
+        _ => 0x0008_0000,
+    };
 
     // Read firmware - keep as UF2 blocks to preserve non-contiguous sections like .end_block
     // Use the target's UF2 family ID so the correct chip accepts the image (e.g. RP2040 vs RP2350).
@@ -906,7 +910,7 @@ fn cmd_combine(
         if firmware_path.extension().is_some_and(|ext| ext == "bin") {
             let data = std::fs::read(firmware_path)?;
             if is_aarch64 {
-                let end = AARCH64_LOAD_BASE + data.len() as u32;
+                let end = aarch64_load_base + data.len() as u32;
                 (data, end) // raw binary, not UF2
             } else {
                 let end = XIP_BASE + data.len() as u32;
@@ -1082,7 +1086,7 @@ fn cmd_combine(
 
     if verbose {
         let base_str = if is_aarch64 {
-            AARCH64_LOAD_BASE
+            aarch64_load_base
         } else {
             XIP_BASE
         };
@@ -1120,7 +1124,7 @@ fn cmd_combine(
     // aarch64: raw binary (firmware + padding + trailer + modules + config)
     // RP:      UF2 container with blocks for each section
     let (combined, firmware_size) = if is_aarch64 {
-        let base = AARCH64_LOAD_BASE;
+        let base = aarch64_load_base;
         let mut raw = firmware_data; // already raw bytes for aarch64
         let fw_size = raw.len();
 

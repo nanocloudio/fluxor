@@ -1275,6 +1275,39 @@ fn build_one(
 /// `.fmod` the graph names is loaded from, instead of the project's built
 /// modules (`$FLUXOR_MODULE_ROOT` applies when it is `None`). A service
 /// bundle builds from its own pinned modules this way.
+/// A bare-metal image is the firmware plus the modules: both must have been
+/// built, by the commands named here, before it can be packed.
+fn require_firmware_and_modules(
+    firmware_path: &std::path::Path,
+    modules_dir: &std::path::Path,
+    build_id: &str,
+    module_build_target: &str,
+) -> Result<()> {
+    if !firmware_path.exists() {
+        let abs = firmware_path.canonicalize().unwrap_or_else(|_| {
+            std::env::current_dir()
+                .unwrap_or_default()
+                .join(firmware_path)
+        });
+        return Err(Error::Config(format!(
+            "Firmware not found at {} (resolved to {}). Run 'make firmware TARGET={}' from the \
+             project root (`fluxor inspect` shows where that is) to produce it.",
+            firmware_path.display(),
+            abs.display(),
+            build_id
+        )));
+    }
+    if !modules_dir.exists() {
+        return Err(Error::Config(format!(
+            "Modules not found at {}. Run 'fluxor modules build --target {}' from the \
+             project root (`fluxor inspect` shows where that is) to produce them.",
+            modules_dir.display(),
+            module_build_target
+        )));
+    }
+    Ok(())
+}
+
 fn build_one_from(
     yaml_path: &std::path::Path,
     output_override: Option<&std::path::Path>,
@@ -1334,7 +1367,7 @@ fn build_one_from(
                 p.push(format!("{name}.uf2"));
                 p
             }
-            "bcm" => {
+            "bcm" | "uefi" => {
                 let mut p = PathBuf::from(format!("target/{build_id}/images"));
                 if !subdir.is_empty() {
                     p.push(&subdir);
@@ -1370,28 +1403,12 @@ fn build_one_from(
 
     match family.as_str() {
         "rp2" | "bcm" => {
-            if !firmware_path.exists() {
-                let abs = firmware_path.canonicalize().unwrap_or_else(|_| {
-                    std::env::current_dir()
-                        .unwrap_or_default()
-                        .join(&firmware_path)
-                });
-                return Err(Error::Config(format!(
-                    "Firmware not found at {} (resolved to {}). Run 'make firmware TARGET={}' from the \
-                     project root (`fluxor inspect` shows where that is) to produce it.",
-                    firmware_path.display(),
-                    abs.display(),
-                    build_id
-                )));
-            }
-            if !modules_dir.exists() {
-                return Err(Error::Config(format!(
-                    "Modules not found at {}. Run 'fluxor modules build --target {}' from the \
-                     project root (`fluxor inspect` shows where that is) to produce them.",
-                    modules_dir.display(),
-                    module_build_target
-                )));
-            }
+            require_firmware_and_modules(
+                &firmware_path,
+                &modules_dir,
+                &build_id,
+                &module_build_target,
+            )?;
             cmd_combine(
                 &firmware_path,
                 &yaml_path.to_path_buf(),
@@ -1399,6 +1416,72 @@ fn build_one_from(
                 module_root,
                 verbose,
             )?;
+        }
+        "uefi" => {
+            // The packed image, as for bcm2712, then the disk a UEFI machine
+            // boots: the loader where the firmware looks, the image beside it.
+            require_firmware_and_modules(
+                &firmware_path,
+                &modules_dir,
+                &build_id,
+                &module_build_target,
+            )?;
+            cmd_combine(
+                &firmware_path,
+                &yaml_path.to_path_buf(),
+                &output_path,
+                module_root,
+                verbose,
+            )?;
+            let loader_path = target_desc
+                .build
+                .as_ref()
+                .and_then(|b| b.loader_path.clone())
+                .ok_or_else(|| {
+                    Error::Config(format!(
+                        "target '{build_id}' has no [build] loader_path: the firmware needs to \
+                         know where the loader is"
+                    ))
+                })?;
+            let loader = PathBuf::from(format!("target/{build_id}/loader.efi"));
+            if !loader.exists() {
+                return Err(Error::Config(format!(
+                    "Loader not found at {}. Run 'make firmware TARGET={build_id}' from the \
+                     project root to build it with the kernel.",
+                    loader.display()
+                )));
+            }
+            let mut disk = PathBuf::from(format!("target/{build_id}/disks"));
+            if !subdir.is_empty() {
+                disk.push(&subdir);
+            }
+            disk.push(format!("{name}.disk"));
+            if let Some(parent) = disk.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let report = crate::uefi_disk::build(
+                &disk,
+                crate::uefi_disk::DISK_BYTES,
+                &[
+                    crate::uefi_disk::EspFile {
+                        esp_path: loader_path,
+                        source: loader,
+                    },
+                    crate::uefi_disk::EspFile {
+                        esp_path: "fluxor/fluxor.img".into(),
+                        source: output_path.clone(),
+                    },
+                ],
+            )?;
+            println!(
+                "  disk: {} ({} MiB, sparse, guid {})",
+                disk.display(),
+                crate::uefi_disk::DISK_BYTES >> 20,
+                report.disk_guid
+            );
+            for f in &report.files {
+                println!("    {} {} bytes sha256 {}", f.esp_path, f.bytes, f.sha256);
+            }
         }
         "linux" => {
             let out_dir = output_path

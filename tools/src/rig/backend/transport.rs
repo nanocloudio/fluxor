@@ -36,12 +36,20 @@ pub struct TransportHandle {
     child: Option<Child>,
     reader: Option<JoinHandle<()>>,
     shutdown: Arc<AtomicBool>,
+    /// Set when the backend reports `ready` (its observation is live), or
+    /// when it exits — a backend that is gone is not still getting ready.
+    ready: Arc<AtomicBool>,
     grace: Duration,
 }
 
 impl TransportHandle {
     pub fn backend(&self) -> &BackendRef {
         &self.backend
+    }
+
+    /// Whether the backend has said its observation is live, or exited.
+    pub fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::Acquire)
     }
 
     /// Whether the backend exited saying the verb is unsupported (exit
@@ -176,12 +184,21 @@ pub fn attach_with_grace(
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_thr = shutdown.clone();
+    let ready = Arc::new(AtomicBool::new(false));
+    let ready_thr = ready.clone();
     let slug_for_thread = backend.slug();
 
     let reader = std::thread::Builder::new()
         .name(format!("fluxor-rig/{}", backend.slug()))
         .spawn(move || {
-            run_reader_loop(stdout, events, source, shutdown_thr, slug_for_thread);
+            run_reader_loop(
+                stdout,
+                events,
+                source,
+                shutdown_thr,
+                ready_thr,
+                slug_for_thread,
+            );
         })
         .map_err(|e| Error::Config(format!("transport: spawning reader thread: {e}")))?;
 
@@ -190,6 +207,7 @@ pub fn attach_with_grace(
         child: Some(child),
         reader: Some(reader),
         shutdown,
+        ready,
         grace,
     })
 }
@@ -199,6 +217,7 @@ fn run_reader_loop(
     events: Sender<RunEvent>,
     source: Capability,
     shutdown: Arc<AtomicBool>,
+    ready: Arc<AtomicBool>,
     slug: String,
 ) {
     let reader = BufReader::new(stdout);
@@ -223,13 +242,20 @@ fn run_reader_loop(
             }
         };
 
+        // Everything the backend said before `ready` is already queued, so
+        // whoever waits on the flag sees it in order.
+        let is_ready = matches!(event, TransportEvent::Ready);
         if let Some(ev) = translate(event, source, &slug) {
             if events.send(ev).is_err() {
                 break;
             }
         }
+        if is_ready {
+            ready.store(true, Ordering::Release);
+        }
     }
 
+    ready.store(true, Ordering::Release);
     let _ = events.send(RunEvent::TransportClosed {
         source,
         reason: "transport backend exited".into(),
