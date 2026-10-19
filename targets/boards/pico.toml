@@ -41,5 +41,5 @@ preferred_deploy = "deploy.uf2_mount"
 console = ["console.usb_cdc", "console.serial"]
 preferred_console = "console.usb_cdc"
 observe = ["observe.console_regex", "observe.usb_enumeration"]
-power = ["power.cycle"]
+power = ["power.cycle", "power.off", "power.on"]
 default_timeout_s = 20

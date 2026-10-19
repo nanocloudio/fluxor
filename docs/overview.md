@@ -52,6 +52,7 @@ How the system works. These are the authoritative references.
 - [architecture/pin_allocation.md](architecture/pin_allocation.md) — GPIO allocation, pin validation, peripheral assignments
 - [architecture/owner_status.md](architecture/owner_status.md) — per-owner live status and `owner_status.json`
 - [architecture/monitor-protocol.md](architecture/monitor-protocol.md) — the monitor record stream and its vocabularies
+- [architecture/rig-backend-protocol.md](architecture/rig-backend-protocol.md) — how a rig backend executable is invoked and what it reports
 
 ## Guides
 

@@ -1,0 +1,77 @@
+#!/usr/bin/env python3
+"""power-recorder — a power backend that records what it was asked.
+
+A test double, never installed. Appends one line per invocation,
+`<verb> <phase>`, to the file named by binding `log`, and behaves as the
+binding says:
+
+  sleep_ms   (int)   how long `on`/`cycle` take, to leave a signal time to
+                     arrive while an actuator is in flight.
+  feed       (str)   a file the console double tails; `cycle` appends a
+                     fresh-boot marker and a line of output to it, the way a
+                     real reset makes a console reopen and the new image talk.
+  diagnose   (bool)  implement `diagnose` (default: exit 64, unsupported).
+  fail_off   (bool)  `off` exits 1.
+  residue    (bool)  `off` reports a leftover instance in `detail.residue`.
+  no_op_off  (bool)  `off` answers `no-op: …`.
+"""
+import json
+import os
+import sys
+import time
+
+UNSUPPORTED = 64
+
+
+def main():
+    raw = sys.stdin.read()
+    inv = json.loads(raw) if raw.strip() else {}
+    verb = sys.argv[1] if len(sys.argv) > 1 else ""
+    binding = inv.get("binding", {}) or {}
+    context = inv.get("context", {}) or {}
+    phase = context.get("phase", "run")
+    log = binding.get("log")
+    if log:
+        with open(log, "a") as f:
+            f.write(f"{verb} {phase}\n")
+
+    if verb in ("on", "cycle"):
+        delay = int(binding.get("sleep_ms", 0) or 0)
+        if delay:
+            time.sleep(delay / 1000.0)
+        feed = binding.get("feed")
+        if feed:
+            with open(feed, "a") as f:
+                f.write("B:\n")
+                f.write("T:fresh image alive\n")
+        json.dump({"ok": True, "info": f"{verb} done"}, sys.stdout)
+        return 0
+    if verb == "off":
+        if binding.get("fail_off"):
+            print("recorder: off refused", file=sys.stderr)
+            return 1
+        report = {"ok": True, "info": "no-op: nothing to switch" if binding.get("no_op_off") else "off done"}
+        if binding.get("residue"):
+            report["detail"] = {"residue": {"instances": ["i-leftover"], "volumes": []}}
+        else:
+            report["detail"] = {"residue": {"instances": [], "volumes": []}, "powered_s": 7}
+        json.dump(report, sys.stdout)
+        return 0
+    if verb == "diagnose":
+        if not binding.get("diagnose"):
+            return UNSUPPORTED
+        json.dump({"ok": True, "info": "diagnosed", "detail": {"registers": "x0=0"}}, sys.stdout)
+        return 0
+    if verb == "hold":
+        args = inv.get("args") or {}
+        json.dump({"ok": True, "info": f"holding {args.get('minutes')} min: gdb target remote /dev/null"}, sys.stdout)
+        return 0
+    if verb == "sweep":
+        json.dump({"ok": True, "info": "swept", "detail": {"residue": {"instances": []}}}, sys.stdout)
+        return 0
+    print(f"power-recorder: unknown verb {verb!r}", file=sys.stderr)
+    return UNSUPPORTED
+
+
+if __name__ == "__main__":
+    sys.exit(main())

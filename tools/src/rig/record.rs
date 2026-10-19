@@ -29,11 +29,108 @@ pub struct RunRecord {
     pub finished_at: Option<u64>,
     pub verdict: Verdict,
     pub primary_observation_source: Option<String>,
-    pub tool_version: &'static str,
+    /// Why the verdict is what it is: the rule that fired, the expectation
+    /// that was missed, or the error that aborted the run.
+    #[serde(default)]
+    pub reason: Option<String>,
+    pub tool_version: String,
+    /// The `fluxor` tool's own revision, baked in at its build.
     pub git_revision: Option<String>,
+    /// The built project's revision at build time, dirty-tree hash
+    /// included: what the artifact was made from.
+    #[serde(default)]
+    pub artifact_git: Option<GitIdentity>,
     pub scenario_sha256: String,
     pub profile_sha256: String,
     pub artifact_sha256: Option<String>,
+    /// What each actuator said, verbatim.
+    #[serde(default)]
+    pub reports: Reports,
+    /// How the rig was left. Present on every run that installed its guard.
+    #[serde(default)]
+    pub teardown: Option<TeardownRecord>,
+}
+
+/// One actuator call as the manifest records it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ActuatorRecord {
+    pub verb: String,
+    /// `ok`, `ok (no-op)`, `unsupported`, or `failed: <reason>`.
+    pub outcome: String,
+    #[serde(default)]
+    pub info: Option<String>,
+    #[serde(default)]
+    pub detail: Option<serde_json::Value>,
+}
+
+impl ActuatorRecord {
+    pub fn is_ok(&self) -> bool {
+        self.outcome.starts_with("ok")
+    }
+    pub fn is_clean(&self) -> bool {
+        self.is_ok() || self.outcome == "unsupported"
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Reports {
+    #[serde(default)]
+    pub stage: Option<ActuatorRecord>,
+    #[serde(default)]
+    pub power: Vec<ActuatorRecord>,
+}
+
+/// The teardown's three steps and whether the rig came out clean (every
+/// step `ok` or `unsupported`, no residue).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TeardownRecord {
+    pub diagnose: ActuatorRecord,
+    pub power: ActuatorRecord,
+    pub unstage: ActuatorRecord,
+    pub clean: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitIdentity {
+    pub commit: String,
+    /// SHA-256 of `git status --porcelain` when the tree was dirty.
+    #[serde(default)]
+    pub dirty_sha256: Option<String>,
+}
+
+impl GitIdentity {
+    /// Identify the checkout at `root`. `None` when it is not a git tree
+    /// or git is unavailable; a missing identity is recorded as such
+    /// rather than failing the run.
+    pub fn probe(root: &Path) -> Option<Self> {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let commit = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["status", "--porcelain=v1", "--untracked-files=no"])
+            .output()
+            .ok()?;
+        let dirty_sha256 = if status.status.success() && !status.stdout.is_empty() {
+            let mut h = Sha256::new();
+            h.update(&status.stdout);
+            Some(crate::hash::hex(&h.finalize()))
+        } else {
+            None
+        };
+        Some(Self {
+            commit,
+            dirty_sha256,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -69,11 +166,15 @@ impl RunRecord {
             finished_at: None,
             verdict: Verdict::Planned,
             primary_observation_source: None,
-            tool_version: env!("CARGO_PKG_VERSION"),
+            reason: None,
+            tool_version: env!("CARGO_PKG_VERSION").to_string(),
             git_revision: option_env!("FLUXOR_GIT_REV").map(|s| s.to_string()),
+            artifact_git: None,
             scenario_sha256: hash_scenario_file(scenario)?,
             profile_sha256: hash_profile(profile),
             artifact_sha256: artifact_digest,
+            reports: Reports::default(),
+            teardown: None,
         })
     }
 
@@ -243,6 +344,11 @@ pub fn canonical_profile(profile: &RigProfile) -> String {
     }
     if !profile.secrets.is_empty() {
         emit_binding("secrets", &profile.secrets, &mut lines);
+    }
+    // The build environment changes the image (an SSID decides which
+    // network the firmware joins), so it is part of the profile's identity.
+    if !profile.build_env.is_empty() {
+        emit_binding("build_env", &profile.build_env, &mut lines);
     }
     lines.sort();
     lines.join("\n")
@@ -415,6 +521,43 @@ regex = "kernel\\.img$"
         // hash-equal one with the field removed entirely.
         assert_ne!(hash_profile(&p1), hash_profile(&p2));
         std::env::remove_var("FLUXOR_PROFILE_HASH_T2");
+    }
+
+    /// `[build_env]` is part of the image, so it is part of the identity:
+    /// a different SSID is a different profile hash, while a secret's
+    /// value stays out of it.
+    #[test]
+    fn profile_hash_covers_build_env_but_not_secret_values() {
+        std::env::set_var("FLUXOR_PROFILE_HASH_T3", "one");
+        let head = r#"
+            [rig]
+            id = "x"
+            board = "pico2w"
+            [build_env]
+            WIFI_PASSWORD = "${env:FLUXOR_PROFILE_HASH_T3}"
+        "#;
+        let ssid_a = format!("{head}\n            WIFI_SSID = \"bench-a\"\n");
+        let ssid_b = format!("{head}\n            WIFI_SSID = \"bench-b\"\n");
+        let h_a = hash_profile(&parse_profile_str(&ssid_a, Path::new("/tmp/x.toml")).unwrap());
+        let h_b = hash_profile(&parse_profile_str(&ssid_b, Path::new("/tmp/x.toml")).unwrap());
+        assert_ne!(h_a, h_b, "a different SSID must change the profile hash");
+
+        std::env::set_var("FLUXOR_PROFILE_HASH_T3", "two");
+        let h_a2 = hash_profile(&parse_profile_str(&ssid_a, Path::new("/tmp/x.toml")).unwrap());
+        assert_eq!(
+            h_a, h_a2,
+            "a different secret value must not change the hash"
+        );
+        std::env::remove_var("FLUXOR_PROFILE_HASH_T3");
+    }
+
+    #[test]
+    fn git_identity_of_this_checkout_and_of_a_non_repo() {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let id = GitIdentity::probe(workspace).expect("this tree is a git checkout");
+        assert_eq!(id.commit.len(), 40, "{}", id.commit);
+        let scratch = tempfile::tempdir().unwrap();
+        assert!(GitIdentity::probe(scratch.path()).is_none());
     }
 
     #[test]

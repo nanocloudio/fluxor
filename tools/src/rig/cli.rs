@@ -1,12 +1,18 @@
 //! `fluxor rig …` subcommand entry points.
 //!
-//! Verbs currently implemented end-to-end:
+//! Verbs implemented end-to-end:
 //!   * `rig test` — full scenario run (build → stage → power → observe →
-//!     verdict → run record). `--plan` prints the resolved lifecycle
-//!     with no side effects.
-//!   * `rig power {on|off|cycle}` — ad-hoc power action; gated by the
-//!     board's declared `[rig].power` list and by the same rig lock the
-//!     `test` path uses. `--plan` previews the invocation.
+//!     verdict → teardown → run record). `--plan` prints the resolved
+//!     lifecycle with no side effects; `--hold <min>` keeps a failed run's
+//!     rig as it is for a while before the teardown.
+//!   * `rig power {on|off|cycle|diagnose|sweep}` — ad-hoc power action.
+//!     `on`/`off`/`cycle` are gated by the board's declared `[rig].power`
+//!     list; `diagnose` and `sweep` are verbs every backend may offer. All
+//!     take the same rig lock the `test` path uses. `--plan` previews the
+//!     invocation. `off` on a rig that still has a run's residue becomes
+//!     the full teardown.
+//!   * `rig teardown` — tear a rig down outside a run: whatever an
+//!     interrupted run left, or everything in a lab with `--all`.
 //!
 //! Not yet implemented (dispatcher returns a clear error pointing at
 //! the closest working alternative):
@@ -23,16 +29,23 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::error::{Error, Result};
 use crate::rig::backend::{
-    invoke_actuator, resolve as resolve_backend, wire_binding, BackendContext, BackendInvocation,
+    invoke_with, resolve as resolve_backend, wire_binding, ActuatorOutcome, BackendContext,
+    BackendInvocation, InvokeOptions, PHASE_ADHOC,
 };
-use crate::rig::lock::{acquire as acquire_lock, default_lock_path, AcquireOutcome, LockOwner};
+use crate::rig::lock::{
+    acquire as acquire_lock, default_lock_path, marker_path_for, rig_state_root, state_dir_for,
+    AcquireOutcome, LockGuard, LockOwner, TeardownMarker,
+};
+use crate::rig::plan::DEFAULT_ACTUATOR_TIMEOUT_S;
 use crate::rig::record::Verdict;
-use crate::rig::run::{execute_plan, RunOptions};
+use crate::rig::run::{
+    adhoc_power_under_guard, execute_plan, install_signal_handlers, teardown_rig, RunOptions,
+};
 use crate::rig::vocab::Surface;
 use crate::rig::{
-    build_plan, default_profile_path, enumerate_rigs, load_profile, load_scenario,
-    resolve_board_rig, validate_scenario_against_board, validate_tags, PlanInputs,
-    ProjectDescriptor,
+    build_plan, check_profile_against_board, default_profile_path, enumerate_rigs, load_profile,
+    load_scenario, resolve_board_rig, validate_scenario_against_board, validate_tags, BoardRig,
+    PlanInputs, ProjectDescriptor, RigProfile,
 };
 
 #[derive(Args, Debug)]
@@ -49,6 +62,8 @@ pub enum RigCommand {
     Run(RunArgs),
     /// Apply a power action to the rig.
     Power(PowerArgs),
+    /// Tear a rig down: power off, unstage, clear its teardown marker.
+    Teardown(TeardownArgs),
     /// Attach to the rig's primary console.
     Console(ConsoleArgs),
     /// Stream live fault stats, protection levels, and step timing
@@ -84,6 +99,14 @@ pub struct TestArgs {
     /// breadcrumb in the run log identifying the displaced owner.
     #[arg(long)]
     pub force: bool,
+    /// On a verdict other than pass, keep the rig as the run left it for
+    /// this many minutes (Enter or Ctrl-C ends it sooner), then tear down.
+    #[arg(long, value_name = "MIN")]
+    pub hold: Option<u64>,
+    /// Run the power backend's `diagnose` even when the run was aborted
+    /// by a signal (it runs on a failed or timed-out verdict regardless).
+    #[arg(long)]
+    pub diagnose: bool,
 }
 
 #[derive(Args, Debug)]
@@ -100,7 +123,7 @@ pub struct RunArgs {
 
 #[derive(Args, Debug)]
 pub struct PowerArgs {
-    /// Power verb. One of: `on`, `off`, `cycle`.
+    /// Power verb. One of: `on`, `off`, `cycle`, `diagnose`, `sweep`.
     pub action: String,
     /// Rig id. Optional when exactly one rig exists in the active lab.
     #[arg(long)]
@@ -112,6 +135,27 @@ pub struct PowerArgs {
     #[arg(long)]
     pub plan: bool,
     /// Force-release any existing rig lock before proceeding.
+    #[arg(long)]
+    pub force: bool,
+    /// For `on`/`cycle` on a board whose images leave the host: how many
+    /// minutes to keep the machine before tearing it down. Required there.
+    #[arg(long, value_name = "MIN")]
+    pub hold: Option<u64>,
+}
+
+#[derive(Args, Debug)]
+pub struct TeardownArgs {
+    /// Rig id. Optional when exactly one rig exists in the active lab, or
+    /// with `--all`.
+    #[arg(long)]
+    pub rig: Option<String>,
+    /// Lab namespace. Falls back to $FLUXOR_LAB, then "default".
+    #[arg(long)]
+    pub lab: Option<String>,
+    /// Every rig profile in the lab, then each power backend's `sweep`.
+    #[arg(long)]
+    pub all: bool,
+    /// Take over a held lock.
     #[arg(long)]
     pub force: bool,
 }
@@ -155,6 +199,7 @@ pub fn dispatch(args: RigArgs) -> Result<()> {
     match args.command {
         RigCommand::Test(a) => cmd_test(a),
         RigCommand::Power(a) => cmd_power(a),
+        RigCommand::Teardown(a) => cmd_teardown(a),
         RigCommand::Run(_) => Err(Error::Config(
             "rig run: not yet implemented — use `rig test --scenario <path>` \
              for scenario-driven runs"
@@ -252,6 +297,70 @@ fn profile_console_serial(
     Ok(Some((device, baud)))
 }
 
+/// `--rig`, or the single rig in the lab.
+fn resolve_rig_id(verb: &str, rig: Option<String>, lab: &str) -> Result<String> {
+    match rig {
+        Some(r) => Ok(r),
+        None => {
+            let rigs = enumerate_rigs(lab)?;
+            match rigs.len() {
+                1 => Ok(rigs.into_iter().next().unwrap()),
+                0 => Err(Error::Config(format!(
+                    "rig {verb}: no rig profiles found in ~/.config/fluxor/labs/{lab}/rigs/ — \
+                     create one or pass --rig <id>"
+                ))),
+                _ => Err(Error::Config(format!(
+                    "rig {verb}: multiple rigs in lab '{lab}': {rigs:?} — pass --rig <id>"
+                ))),
+            }
+        }
+    }
+}
+
+fn load_rig_profile(verb: &str, lab: &str, rig_id: &str) -> Result<RigProfile> {
+    let profile_path = default_profile_path(lab, rig_id).ok_or_else(|| {
+        Error::Config(format!(
+            "rig {verb}: cannot resolve $HOME for profile lookup"
+        ))
+    })?;
+    if !profile_path.is_file() {
+        return Err(Error::Config(format!(
+            "rig {verb}: profile not found at {} — a rig profile binds this \
+             lab's capabilities to one physical bench and is never checked in",
+            profile_path.display()
+        )));
+    }
+    load_profile(&profile_path)
+}
+
+/// Board descriptor by layered lookup (user override → project-local
+/// `targets/boards/` found upward from `anchor` → embedded defaults).
+fn load_board(verb: &str, board_id: &str, anchor: Option<&Path>) -> Result<(BoardRig, String)> {
+    let project_root_for_boards = anchor.and_then(|a| locate_workspace(a).ok());
+    let (rig, source) = resolve_board_rig(board_id, project_root_for_boards.as_deref())?;
+    let rig = rig.ok_or_else(|| {
+        Error::Config(format!(
+            "rig {verb}: board '{board_id}' has no [rig] section ({}); add one or pick \
+             a target that does",
+            source.display(),
+        ))
+    })?;
+    Ok((rig, source.display()))
+}
+
+fn fail_on_errors(verb: &str, what: &str, v: &crate::rig::RigValidation) -> Result<()> {
+    for w in &v.warnings {
+        eprintln!("warning: {w}");
+    }
+    if !v.is_ok() {
+        for e in &v.errors {
+            eprintln!("error: {e}");
+        }
+        return Err(Error::Config(format!("rig {verb}: {what}")));
+    }
+    Ok(())
+}
+
 fn cmd_test(args: TestArgs) -> Result<()> {
     let lab = resolve_lab(args.lab.as_deref());
 
@@ -263,74 +372,19 @@ fn cmd_test(args: TestArgs) -> Result<()> {
     })?;
     let scenario = load_scenario(&scenario_path)?;
 
-    // Board descriptor: layered lookup. User override wins
-    // over a project-local `targets/boards/` (when one exists upward
-    // from the scenario), which in turn wins over the defaults embedded
-    // in fluxor-tools. This lets the harness run from a sibling project
-    // that has no `targets/boards/` tree of its own.
-    let project_root_for_boards = locate_workspace(&scenario_path).ok();
-    let (board, board_source) = {
-        let (rig, source) =
-            resolve_board_rig(&scenario.target, project_root_for_boards.as_deref())?;
-        let rig = rig.ok_or_else(|| {
-            Error::Config(format!(
-                "rig test: board '{}' has no [rig] section ({}); add one or pick \
-                 a target that does",
-                scenario.target,
-                source.display(),
-            ))
-        })?;
-        (rig, source)
-    };
-    eprintln!("[rig] board descriptor: {}", board_source.display());
+    let (board, board_source) = load_board("test", &scenario.target, Some(&scenario_path))?;
+    eprintln!("[rig] board descriptor: {board_source}");
 
     // 1. Validate scenario against board (fail fast at plan time).
-    let v = validate_scenario_against_board(&scenario, &board);
-    for w in &v.warnings {
-        eprintln!("warning: {w}");
-    }
-    if !v.is_ok() {
-        for e in &v.errors {
-            eprintln!("error: {e}");
-        }
-        return Err(Error::Config(
-            "rig test: scenario is not compatible with board contract".into(),
-        ));
-    }
+    fail_on_errors(
+        "test",
+        "scenario is not compatible with board contract",
+        &validate_scenario_against_board(&scenario, &board),
+    )?;
 
-    // 2. Resolve the rig. If `--rig` isn't given and exactly one rig is
-    //    configured in the lab, use that.
-    let rig_id = match args.rig {
-        Some(r) => r,
-        None => {
-            let rigs = enumerate_rigs(&lab)?;
-            match rigs.len() {
-                1 => rigs.into_iter().next().unwrap(),
-                0 => {
-                    return Err(Error::Config(format!(
-                        "rig test: no rig profiles found in ~/.config/fluxor/labs/{lab}/rigs/ — \
-                         create one or pass --rig <id>"
-                    )))
-                }
-                _ => {
-                    return Err(Error::Config(format!(
-                        "rig test: multiple rigs in lab '{lab}': {rigs:?} — pass --rig <id>"
-                    )))
-                }
-            }
-        }
-    };
-
-    let profile_path = default_profile_path(&lab, &rig_id)
-        .ok_or_else(|| Error::Config("rig test: cannot resolve $HOME for profile lookup".into()))?;
-    if !profile_path.is_file() {
-        return Err(Error::Config(format!(
-            "rig test: profile not found at {} — a rig profile binds this \
-             lab's capabilities to one physical bench and is never checked in",
-            profile_path.display()
-        )));
-    }
-    let profile = load_profile(&profile_path)?;
+    // 2. Resolve the rig and its profile.
+    let rig_id = resolve_rig_id("test", args.rig, &lab)?;
+    let profile = load_rig_profile("test", &lab, &rig_id)?;
 
     // Sanity: profile says board X but scenario targets Y.
     if profile.rig.board != scenario.target {
@@ -339,17 +393,16 @@ fn cmd_test(args: TestArgs) -> Result<()> {
             profile.rig.id, profile.rig.board, scenario.name, scenario.target
         )));
     }
-
-    // Tag match.
-    let tv = validate_tags(&scenario, &profile.rig.tags);
-    if !tv.is_ok() {
-        for e in &tv.errors {
-            eprintln!("error: {e}");
-        }
-        return Err(Error::Config(
-            "rig test: profile tags do not satisfy scenario.requires_tags".into(),
-        ));
-    }
+    fail_on_errors(
+        "test",
+        "profile tags do not satisfy scenario.requires_tags",
+        &validate_tags(&scenario, &profile.rig.tags),
+    )?;
+    fail_on_errors(
+        "test",
+        "profile does not satisfy the board's build-env rules",
+        &check_profile_against_board(&profile, &board),
+    )?;
 
     // 3. Discover project descriptor, if any. Walk up from the scenario's
     //    directory and also from CWD — whichever finds one first.
@@ -371,9 +424,12 @@ fn cmd_test(args: TestArgs) -> Result<()> {
     }
 
     // Execute the plan.
+    install_signal_handlers();
     let options = RunOptions {
         skip_build: args.skip_build,
         force_lock: args.force,
+        hold: args.hold.map(|m| Duration::from_secs(m * 60)),
+        diagnose_on_abort: args.diagnose,
         ..RunOptions::default()
     };
     let outcome = execute_plan(&plan, &profile, &options)?;
@@ -384,60 +440,41 @@ fn cmd_test(args: TestArgs) -> Result<()> {
         | Verdict::Aborted
         | Verdict::Pending
         | Verdict::Planned => Err(Error::Config(format!(
-            "rig test: {} — see {}",
+            "rig test: {}{} — see {}",
             match outcome.record.verdict {
                 Verdict::Failed => "FAIL",
                 Verdict::TimedOut => "TIMEOUT",
                 Verdict::Aborted => "ABORTED",
                 _ => "INCOMPLETE",
             },
+            outcome
+                .record
+                .reason
+                .as_deref()
+                .map(|r| format!(" ({r})"))
+                .unwrap_or_default(),
             outcome.run_dir.display()
         ))),
     }
 }
 
+/// Verbs the board contract does not gate: any backend may offer them.
+const UNGATED_POWER_VERBS: &[&str] = &["diagnose", "sweep"];
+
 fn cmd_power(args: PowerArgs) -> Result<()> {
     let action = args.action.to_lowercase();
-    if !matches!(action.as_str(), "on" | "off" | "cycle") {
+    if !matches!(action.as_str(), "on" | "off" | "cycle")
+        && !UNGATED_POWER_VERBS.contains(&action.as_str())
+    {
         return Err(Error::Config(format!(
-            "rig power: unknown verb '{}' (expected one of: on, off, cycle)",
+            "rig power: unknown verb '{}' (expected one of: on, off, cycle, diagnose, sweep)",
             args.action
         )));
     }
 
     let lab = resolve_lab(args.lab.as_deref());
-
-    // Resolve rig: explicit --rig, or the single configured rig.
-    let rig_id = match args.rig {
-        Some(r) => r,
-        None => {
-            let rigs = enumerate_rigs(&lab)?;
-            match rigs.len() {
-                1 => rigs.into_iter().next().unwrap(),
-                0 => {
-                    return Err(Error::Config(format!(
-                        "rig power: no rig profiles in ~/.config/fluxor/labs/{lab}/rigs/ — \
-                         create one or pass --rig <id>"
-                    )))
-                }
-                _ => {
-                    return Err(Error::Config(format!(
-                        "rig power: multiple rigs in lab '{lab}': {rigs:?} — pass --rig <id>"
-                    )))
-                }
-            }
-        }
-    };
-
-    let profile_path = default_profile_path(&lab, &rig_id)
-        .ok_or_else(|| Error::Config("rig power: cannot resolve $HOME".into()))?;
-    if !profile_path.is_file() {
-        return Err(Error::Config(format!(
-            "rig power: profile not found at {}",
-            profile_path.display()
-        )));
-    }
-    let profile = load_profile(&profile_path)?;
+    let rig_id = resolve_rig_id("power", args.rig, &lab)?;
+    let profile = load_rig_profile("power", &lab, &rig_id)?;
 
     let power_binding = profile.power.as_ref().ok_or_else(|| {
         Error::Config(format!(
@@ -449,69 +486,58 @@ fn cmd_power(args: PowerArgs) -> Result<()> {
     let backend = resolve_backend(Surface::Power, backend_name)?;
 
     // The public board contract enumerates which power verbs a target
-    // supports (e.g. pi5 declares only power.cycle). `rig power` must
-    // honour that contract — invoking `on` / `off` on a board that only
-    // declares `cycle` would silently bypass the public surface.
-    //
-    // Resolve the board via the same layered lookup the scenario path
-    // uses so this works under a sibling project: project-local
-    // `targets/boards/` → embedded defaults. No scenario to anchor on,
-    // so walk upward from CWD for the optional project layer.
-    let project_root_for_boards = std::env::current_dir()
-        .ok()
-        .and_then(|cwd| locate_workspace(&cwd).ok());
-    let (board, board_source) = {
-        let (rig, source) =
-            crate::rig::resolve_board_rig(&profile.rig.board, project_root_for_boards.as_deref())?;
-        let rig = rig.ok_or_else(|| {
-            Error::Config(format!(
-                "rig power: board '{}' has no [rig] section ({})",
-                profile.rig.board,
-                source.display(),
-            ))
-        })?;
-        (rig, source)
-    };
-    validate_power_verb_on_board(&board, &action, &profile.rig.board)?;
+    // supports (e.g. picow declares cycle, off, on). `rig power` must
+    // honour that contract for the switching verbs — invoking `on` on a
+    // board that only declares `cycle` would silently bypass the public
+    // surface. No scenario to anchor on, so walk upward from CWD for the
+    // optional project layer.
+    let cwd = std::env::current_dir().ok();
+    let (board, board_source) = load_board("power", &profile.rig.board, cwd.as_deref())?;
+    if !UNGATED_POWER_VERBS.contains(&action.as_str()) {
+        validate_power_verb_on_board(&board, &action, &profile.rig.board)?;
+    }
+    fail_on_errors(
+        "power",
+        "profile does not satisfy the board's build-env rules",
+        &check_profile_against_board(&profile, &board),
+    )?;
 
-    // Synthetic context — no scenario, no build, no observers. The backend
-    // only needs enough metadata to correlate this invocation in logs.
-    // Sub-second precision in the run id keeps fast reruns from colliding.
-    let (now_secs, subsec_nanos) = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| (d.as_secs(), d.subsec_nanos()))
-        .unwrap_or((0, 0));
-    let run_id = format!("{now_secs:010}-{subsec_nanos:09}-{rig_id}-power-{action}");
-    let run_dir = ad_hoc_run_dir(&lab, &rig_id);
-
-    let invocation = BackendInvocation {
-        binding: wire_binding(power_binding),
-        context: BackendContext {
-            rig_id: profile.rig.id.clone(),
-            lab: lab.clone(),
-            run_id: run_id.clone(),
-            run_dir: run_dir.display().to_string(),
-            scenario_name: format!("power:{action}"),
-            board: profile.rig.board.clone(),
-            effective_timeout_ms: 60_000,
-        },
-        artifact: None,
+    let lock_path = default_lock_path(&lab, &profile.rig.id)
+        .ok_or_else(|| Error::Config("rig power: cannot resolve lock path".into()))?;
+    let marker_path = marker_path_for(&lock_path);
+    let residue_present =
+        marker_path.exists() || state_dir_for(&lock_path).join("live.json").exists();
+    let timeout = power_binding
+        .actuator_timeout()
+        .unwrap_or(Duration::from_secs(DEFAULT_ACTUATOR_TIMEOUT_S));
+    let options = RunOptions {
+        force_lock: args.force,
+        actuator_timeout: timeout,
+        ..RunOptions::default()
     };
 
     if args.plan {
         println!("rig power {action}");
         println!("  lab        {lab}");
         println!("  rig        {}", profile.rig.id);
-        println!(
-            "  board      {} ({})",
-            profile.rig.board,
-            board_source.display()
-        );
+        println!("  board      {} ({board_source})", profile.rig.board);
         println!(
             "  backend    {} ({})",
             backend.slug(),
             backend.executable.display()
         );
+        println!("  timeout    {}s", timeout.as_secs());
+        if residue_present && action == "off" {
+            println!(
+                "  note       a run's residue is on this rig; `off` becomes the full teardown"
+            );
+        }
+        if board.image_leaves_host && matches!(action.as_str(), "on" | "cycle") {
+            println!(
+                "  note       board images leave the host; `{action}` runs under a guard and \
+                 tears down after --hold"
+            );
+        }
         print!("  binding   ");
         for (k, v) in power_binding.iter() {
             print!(" {k}=");
@@ -526,30 +552,309 @@ fn cmd_power(args: PowerArgs) -> Result<()> {
         return Ok(());
     }
 
+    install_signal_handlers();
+
+    // `off` with a run's residue is a teardown, not a bare verb: it also
+    // unstages and clears the marker.
+    if action == "off" && residue_present {
+        eprintln!("[rig] residue from an earlier run on {rig_id}; running the full teardown");
+        return cmd_teardown(TeardownArgs {
+            rig: Some(rig_id),
+            lab: Some(lab),
+            all: false,
+            force: args.force,
+        });
+    }
+
     // Lock the rig so an ad-hoc power action can't race an in-progress run.
-    let lock_path = default_lock_path(&lab, &profile.rig.id)
-        .ok_or_else(|| Error::Config("rig power: cannot resolve lock path".into()))?;
     let owner = LockOwner::now(&profile.rig.id, &format!("command:power {action}"), 60);
-    let _guard = match acquire_lock(&lock_path, &owner, args.force)? {
+    let guard = match acquire_lock(&lock_path, &owner, args.force)? {
         AcquireOutcome::Acquired(g) => g,
-        AcquireOutcome::Held(c) => {
-            return Err(Error::Config(format!(
-                "rig power: {} is held by pid {} on {} running '{}' (stale={}). \
-                 Pass --force to take it over.",
-                c.path.display(),
-                c.existing.pid,
-                c.existing.hostname,
-                c.existing.task,
-                c.stale
-            )));
+        AcquireOutcome::Held(c) => return Err(held(&c, "power")),
+        AcquireOutcome::NeedsTeardown { guard, marker } => {
+            if matches!(action.as_str(), "on" | "cycle") {
+                drop(guard);
+                return Err(Error::Config(format!(
+                    "rig power: run {} on this rig never finished its teardown ({}); \
+                     `fluxor rig teardown --rig {}` first",
+                    marker.run_id,
+                    marker.last_error.as_deref().unwrap_or("interrupted"),
+                    profile.rig.id
+                )));
+            }
+            guard
         }
     };
 
-    let report = invoke_actuator(&backend, &action, &invocation, Duration::from_secs(60))?;
-    if let Some(info) = report.info.as_deref() {
-        eprintln!("[rig] {info}");
+    if board.image_leaves_host && matches!(action.as_str(), "on" | "cycle") {
+        let Some(minutes) = args.hold else {
+            return Err(Error::Config(format!(
+                "rig power: board '{}' builds images that leave the host, so `{action}` \
+                 would leave a machine running somewhere. Say how long with --hold <min>; \
+                 the rig is torn down when it ends.",
+                profile.rig.board
+            )));
+        };
+        let record = adhoc_power_under_guard(
+            &profile,
+            &lock_path,
+            &guard,
+            &action,
+            Duration::from_secs(minutes * 60),
+            &options,
+        )?;
+        drop(guard);
+        return if record.clean {
+            Ok(())
+        } else {
+            Err(Error::Config(format!(
+                "rig power: teardown after `{action}` did not complete; \
+                 `fluxor rig teardown --rig {}` once the cause is fixed",
+                profile.rig.id
+            )))
+        };
     }
-    Ok(())
+
+    // Synthetic context — no scenario, no build, no observers. The backend
+    // only needs enough metadata to correlate this invocation in logs.
+    // Sub-second precision in the run id keeps fast reruns from colliding.
+    let (now_secs, subsec_nanos) = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| (d.as_secs(), d.subsec_nanos()))
+        .unwrap_or((0, 0));
+    let run_id = format!("{now_secs:010}-{subsec_nanos:09}-{rig_id}-power-{action}");
+    let run_dir = ad_hoc_run_dir(&lab, &rig_id);
+    let invocation = BackendInvocation {
+        binding: wire_binding(power_binding),
+        context: BackendContext {
+            rig_id: profile.rig.id.clone(),
+            lab: lab.clone(),
+            run_id: run_id.clone(),
+            run_dir: run_dir.display().to_string(),
+            scenario_name: format!("power:{action}"),
+            board: profile.rig.board.clone(),
+            effective_timeout_ms: timeout.as_millis() as u64,
+            phase: PHASE_ADHOC.to_string(),
+        },
+        artifact: None,
+        args: None,
+    };
+    let invoke_options = InvokeOptions {
+        timeout,
+        grace: power_binding
+            .shutdown_grace()
+            .unwrap_or(Duration::from_secs(2)),
+        stderr_log: Some(run_dir.join(format!("power-{action}.stderr.log"))),
+    };
+    let outcome = invoke_with(&backend, &action, &invocation, &invoke_options)?;
+    drop(guard);
+    match outcome {
+        ActuatorOutcome::Ok(report) => {
+            if let Some(info) = report.info.as_deref() {
+                eprintln!("[rig] {info}");
+            }
+            Ok(())
+        }
+        ActuatorOutcome::Unsupported => Err(Error::Config(format!(
+            "rig power: {} does not implement `{action}`",
+            backend.slug()
+        ))),
+        ActuatorOutcome::Failed {
+            reason,
+            stderr_tail,
+            ..
+        } => Err(Error::Config(format!(
+            "rig power: {reason}{}",
+            if stderr_tail.is_empty() {
+                String::new()
+            } else {
+                format!(" — stderr: {stderr_tail}")
+            }
+        ))),
+    }
+}
+
+fn held(c: &crate::rig::LockConflict, verb: &str) -> Error {
+    Error::Config(format!(
+        "rig {verb}: {} is held by pid {} on {} running '{}' (stale={}). \
+         Pass --force to take it over.",
+        c.path.display(),
+        c.existing.pid,
+        c.existing.hostname,
+        c.existing.task,
+        c.stale
+    ))
+}
+
+fn cmd_teardown(args: TeardownArgs) -> Result<()> {
+    let lab = resolve_lab(args.lab.as_deref());
+    install_signal_handlers();
+    if !args.all {
+        let rig_id = resolve_rig_id("teardown", args.rig, &lab)?;
+        return teardown_one(&lab, &rig_id, args.force).map(|_| ());
+    }
+
+    let mut failed: Vec<String> = Vec::new();
+    let mut swept: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for rig_id in enumerate_rigs(&lab)? {
+        match teardown_one(&lab, &rig_id, args.force) {
+            Ok(profile) => {
+                if let Some(binding) = profile.power.as_ref() {
+                    // `sweep` once per distinct power binding: two rigs on
+                    // one plug, or one cloud account, share a sweep.
+                    let key = binding_key(binding);
+                    if swept.insert(key) {
+                        if let Err(e) = sweep(&lab, &profile) {
+                            eprintln!("[rig] sweep for {rig_id}: {e}");
+                            failed.push(format!("{rig_id} (sweep)"));
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("[rig] teardown {rig_id}: {e}");
+                failed.push(rig_id);
+            }
+        }
+    }
+
+    // Markers whose profile is gone can no longer be torn down by name;
+    // say so rather than forget them.
+    if let Some(root) = rig_state_root(&lab, "") {
+        let rigs_dir = root.parent().map(Path::to_path_buf).unwrap_or(root);
+        if let Ok(entries) = std::fs::read_dir(&rigs_dir) {
+            let known = enumerate_rigs(&lab).unwrap_or_default();
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let marker = entry.path().join("state").join("needs_teardown.json");
+                if marker.exists() && !known.contains(&name) {
+                    eprintln!(
+                        "[rig] {name}: teardown marker at {} but no profile in lab '{lab}' — \
+                         restore the profile or clean it up by hand",
+                        marker.display()
+                    );
+                    failed.push(format!("{name} (no profile)"));
+                }
+            }
+        }
+    }
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::Config(format!(
+            "rig teardown: not clean for {}",
+            failed.join(", ")
+        )))
+    }
+}
+
+/// Tear one rig down under its lock. Returns the profile so `--all` can
+/// sweep by power binding afterwards.
+fn teardown_one(lab: &str, rig_id: &str, force: bool) -> Result<RigProfile> {
+    let profile = load_rig_profile("teardown", lab, rig_id)?;
+    let lock_path = default_lock_path(lab, rig_id)
+        .ok_or_else(|| Error::Config("rig teardown: cannot resolve lock path".into()))?;
+    let owner = LockOwner::now(rig_id, "command:teardown", 60);
+    let (guard, marker): (LockGuard, Option<TeardownMarker>) =
+        match acquire_lock(&lock_path, &owner, force)? {
+            AcquireOutcome::Acquired(g) => (g, None),
+            AcquireOutcome::NeedsTeardown { guard, marker } => (guard, Some(marker)),
+            AcquireOutcome::Held(c) => return Err(held(&c, "teardown")),
+        };
+    let options = RunOptions {
+        actuator_timeout: profile
+            .power
+            .as_ref()
+            .and_then(|b| b.actuator_timeout())
+            .unwrap_or(Duration::from_secs(DEFAULT_ACTUATOR_TIMEOUT_S)),
+        ..RunOptions::default()
+    };
+    let record = teardown_rig(&profile, &lock_path, marker.as_ref(), &options)?;
+    drop(guard);
+    if record.clean {
+        Ok(profile)
+    } else {
+        Err(Error::Config(format!(
+            "rig teardown: {rig_id} is not clean; see its marker at {}",
+            marker_path_for(&lock_path).display()
+        )))
+    }
+}
+
+/// The power backend's `sweep`: everything of the lab's still running
+/// anywhere this binding can see. Unsupported is fine.
+fn sweep(lab: &str, profile: &RigProfile) -> Result<()> {
+    let binding = profile.power.as_ref().expect("caller checked");
+    let backend = resolve_backend(Surface::Power, binding.require_string("backend", "power")?)?;
+    let timeout = binding
+        .actuator_timeout()
+        .unwrap_or(Duration::from_secs(DEFAULT_ACTUATOR_TIMEOUT_S));
+    let run_dir = ad_hoc_run_dir(lab, &profile.rig.id);
+    let invocation = BackendInvocation {
+        binding: wire_binding(binding),
+        context: BackendContext {
+            rig_id: profile.rig.id.clone(),
+            lab: lab.to_string(),
+            run_id: format!("sweep-{}", crate::rig::lock::now_unix_secs()),
+            run_dir: run_dir.display().to_string(),
+            scenario_name: "teardown:sweep".to_string(),
+            board: profile.rig.board.clone(),
+            effective_timeout_ms: timeout.as_millis() as u64,
+            phase: crate::rig::backend::PHASE_TEARDOWN.to_string(),
+        },
+        artifact: None,
+        args: None,
+    };
+    let opts = InvokeOptions {
+        timeout,
+        grace: Duration::from_secs(2),
+        stderr_log: Some(run_dir.join("power-sweep.stderr.log")),
+    };
+    match invoke_with(&backend, "sweep", &invocation, &opts)? {
+        ActuatorOutcome::Ok(report) => {
+            if let Some(info) = report.info.as_deref() {
+                eprintln!("[rig] sweep ({}): {info}", backend.slug());
+            }
+            let residue = report
+                .detail
+                .as_ref()
+                .and_then(|d| d.get("residue"))
+                .and_then(|r| r.as_object())
+                .map(|r| {
+                    r.iter()
+                        .filter(|(_, v)| v.as_array().is_some_and(|a| !a.is_empty()))
+                        .map(|(k, v)| format!("{k}={v}"))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if residue.is_empty() {
+                Ok(())
+            } else {
+                Err(Error::Config(format!(
+                    "residue after sweep: {}",
+                    residue.join(", ")
+                )))
+            }
+        }
+        ActuatorOutcome::Unsupported => Ok(()),
+        ActuatorOutcome::Failed { reason, .. } => Err(Error::Config(reason)),
+    }
+}
+
+/// Identity of a power binding for `--all`'s sweep dedupe: the backend
+/// and every field, secrets by sentinel.
+fn binding_key(binding: &crate::rig::BindingTable) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for (k, v) in binding.iter() {
+        let rendered = match v {
+            crate::rig::profile::BindingValue::Secret(s) => s.for_hash().to_string(),
+            crate::rig::profile::BindingValue::Int(n) => n.to_string(),
+            crate::rig::profile::BindingValue::Float(f) => format!("{f:?}"),
+            crate::rig::profile::BindingValue::Bool(b) => b.to_string(),
+        };
+        parts.push(format!("{k}={rendered}"));
+    }
+    parts.join("\n")
 }
 
 fn ad_hoc_run_dir(lab: &str, rig_id: &str) -> PathBuf {
@@ -567,8 +872,8 @@ fn ad_hoc_run_dir(lab: &str, rig_id: &str) -> PathBuf {
 }
 
 /// Confirm the board declares `power.<verb>` in its `[rig].power` list.
-/// Called by `cmd_power` to refuse verbs the public board contract
-/// does not advertise.
+/// Called by `cmd_power` to refuse switching verbs the public board
+/// contract does not advertise.
 fn validate_power_verb_on_board(
     board: &crate::rig::BoardRig,
     verb: &str,
@@ -698,6 +1003,20 @@ mod tests {
             assert!(
                 validate_power_verb_on_board(&board, verb, "test").is_ok(),
                 "board declared {verb} but validator rejected it",
+            );
+        }
+    }
+
+    /// The in-tree boards all declare `power.off`: every rig can be
+    /// told to power down, and a backend that cannot says so with a no-op.
+    #[test]
+    fn every_embedded_board_declares_power_off() {
+        for id in ["pi5", "pico", "picow", "pico2w", "waveshare-lcd4"] {
+            let (rig, _) = crate::rig::resolve_board_rig(id, None).unwrap();
+            let rig = rig.unwrap();
+            assert!(
+                validate_power_verb_on_board(&rig, "off", id).is_ok(),
+                "{id} must declare power.off"
             );
         }
     }

@@ -29,9 +29,21 @@ pub struct BackendInvocation {
     pub context: BackendContext,
     /// Only populated for deploy actuators (`stage`). Describes the
     /// artifact the backend should place in its target.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact: Option<ArtifactRef>,
+    /// Arguments of the verb itself, when it takes any. `hold` receives
+    /// `{"minutes": N}`; every other verb today receives nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub args: Option<serde_json::Value>,
 }
+
+/// The lifecycle phase an invocation belongs to. A backend that behaves
+/// differently at the end of a run from in the middle of one (a `power off`
+/// that also stops a helper machine only when the run is over) reads this
+/// rather than guessing from the verb.
+pub const PHASE_RUN: &str = "run";
+pub const PHASE_TEARDOWN: &str = "teardown";
+pub const PHASE_ADHOC: &str = "adhoc";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackendContext {
@@ -42,6 +54,14 @@ pub struct BackendContext {
     pub scenario_name: String,
     pub board: String,
     pub effective_timeout_ms: u64,
+    /// One of [`PHASE_RUN`], [`PHASE_TEARDOWN`], [`PHASE_ADHOC`]. Absent
+    /// in an invocation written by an older core means `run`.
+    #[serde(default = "phase_run")]
+    pub phase: String,
+}
+
+fn phase_run() -> String {
+    PHASE_RUN.to_string()
 }
 
 /// JSON-friendly view of a resolved profile field. Strings have already
@@ -73,9 +93,10 @@ pub enum ArtifactRef {
 // ── Actuator result ────────────────────────────────────────────────────────
 
 /// Shape of the JSON object a successful actuator writes on stdout.
-/// Fields beyond `ok` are advisory; the core treats nonzero exit as
-/// failure regardless of what's on stdout.
-#[derive(Debug, Clone, Default, Deserialize)]
+/// The exit code is authoritative for success; `ok: false` on a zero
+/// exit is still read as a failure, so a backend that forgot its exit
+/// status cannot pass by accident.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ActuatorReport {
     #[serde(default = "bool_true")]
     pub ok: bool,
@@ -91,12 +112,19 @@ fn bool_true() -> bool {
     true
 }
 
+/// Exit status a backend uses for a verb it does not implement. The
+/// orchestrator tolerates it for the optional verbs (`diagnose`,
+/// `unstage`, `hold`, `sweep`, and the deploy `watch` transport) and
+/// treats it as a failure for every other verb.
+pub const EXIT_UNSUPPORTED_VERB: i32 = 64;
+
 // ── Transport events ───────────────────────────────────────────────────────
 
 /// Shape of one line of NDJSON on a transport backend's stdout.
 ///
 /// `kind` drives decoding:
 ///   * `"bytes"`  — raw transport bytes, base64 in `data`
+///   * `"boot"`   — what follows comes from a target started for this run
 ///   * `"fetch"`  — a deploy-side fetch happened (netboot/TFTP etc.)
 ///   * `"dhcp"`   — informational DHCP activity
 ///   * `"error"`  — backend surfaced a non-fatal error
@@ -110,6 +138,12 @@ pub enum TransportEvent {
     Bytes {
         data: String,
     },
+    /// The transport can show that the bytes after this point come from a
+    /// target started for this run: it reopened a device after a reset, or
+    /// it connected to a machine that did not exist before the run's power
+    /// step. A first open of a device that was already running is never a
+    /// boot — the old image is still talking.
+    Boot,
     /// A deploy-adjacent fetch event.
     Fetch {
         filename: String,

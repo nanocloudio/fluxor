@@ -272,7 +272,9 @@ async fn main() -> ExitCode {
         },
         other => {
             eprintln!("observe-https_load: unknown verb '{other}'");
-            ExitCode::from(2)
+            // 64: the verb is unsupported, which the orchestrator tolerates for
+            // optional verbs and treats as a failure for required ones.
+            ExitCode::from(64)
         }
     }
 }

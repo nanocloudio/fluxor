@@ -13,12 +13,13 @@ pub mod discover;
 pub mod protocol;
 pub mod transport;
 
-pub use actuator::invoke as invoke_actuator;
+pub use actuator::{invoke as invoke_actuator, invoke_with, ActuatorOutcome, InvokeOptions};
 pub use discover::{resolve, search_paths, BackendRef};
 pub use protocol::{
     ActuatorReport, ArtifactRef, BackendContext, BackendInvocation, BindingValue, TransportEvent,
+    EXIT_UNSUPPORTED_VERB, PHASE_ADHOC, PHASE_RUN, PHASE_TEARDOWN,
 };
-pub use transport::{attach as attach_transport, TransportHandle};
+pub use transport::{attach as attach_transport, attach_with_grace, TransportHandle};
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -28,8 +29,9 @@ use crate::rig::profile::{BindingTable, BindingValue as ProfileBindingValue};
 
 /// Build a [`BackendContext`] from plan state — every backend call gets
 /// the same run-identity header so logs and side-channel outputs can be
-/// correlated with the run manifest.
-pub fn context_from_plan(plan: &Plan, run_dir: &Path) -> BackendContext {
+/// correlated with the run manifest. `phase` is one of the `PHASE_*`
+/// constants.
+pub fn context_from_plan(plan: &Plan, run_dir: &Path, phase: &str) -> BackendContext {
     BackendContext {
         rig_id: plan.rig.clone(),
         lab: plan.lab.clone(),
@@ -38,6 +40,7 @@ pub fn context_from_plan(plan: &Plan, run_dir: &Path) -> BackendContext {
         scenario_name: plan.scenario_name.clone(),
         board: plan.board.clone(),
         effective_timeout_ms: (plan.effective_timeout_s as u64) * 1000,
+        phase: phase.to_string(),
     }
 }
 

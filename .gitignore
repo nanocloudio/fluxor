@@ -29,6 +29,12 @@ vm/
 /tools/tests/
 /examples/
 
+# Rig mechanisms: the backend executables `fluxor rig` discovers (a smart
+# plug, a TFTP root, picotool, a cloud account) and the bench tooling
+# beside them. They describe the benches this project is tested on, the
+# way `tests/hardware` describes the scenarios, and go the same way.
+/tools/rig/
+
 # The shadow repo's own git-dir. `/tests/` and `/tools/tests/` above are
 # versioned in it rather than here (standards/test-tracking.md §4), so
 # they are recoverable instead of existing only on one machine.

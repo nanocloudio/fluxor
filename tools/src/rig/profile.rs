@@ -144,6 +144,51 @@ impl BindingTable {
             _ => None,
         }
     }
+
+    /// `actuator_timeout_s`: how long this binding's backend may take per
+    /// verb. A cloud launch needs minutes; a plug needs seconds.
+    pub fn actuator_timeout(&self) -> Option<std::time::Duration> {
+        self.optional_int("actuator_timeout_s")
+            .filter(|n| *n > 0)
+            .map(|n| std::time::Duration::from_secs(n as u64))
+    }
+
+    /// `shutdown_grace_s`: time between SIGTERM and SIGKILL for this
+    /// binding's backend, for one that must flush or sync on the way out.
+    pub fn shutdown_grace(&self) -> Option<std::time::Duration> {
+        self.optional_int("shutdown_grace_s")
+            .filter(|n| *n >= 0)
+            .map(|n| std::time::Duration::from_secs(n as u64))
+    }
+
+    /// True if any value came from an indirection.
+    pub fn has_resolved_secret(&self) -> bool {
+        self.fields
+            .values()
+            .any(|v| matches!(v, BindingValue::Secret(s) if s.is_secret()))
+    }
+}
+
+/// Keys whose values are secrets whatever section they appear in: a
+/// literal under one of these is refused at load. Matched case-insensitively
+/// (`WIFI_PASSWORD` is a password).
+pub fn is_secret_key(key: &str) -> bool {
+    let k = key.to_ascii_lowercase();
+    const NAMES: &[&str] = &["password", "token", "secret", "passphrase", "psk"];
+    NAMES.contains(&k.as_str()) || NAMES.iter().any(|n| k.ends_with(&format!("_{n}")))
+}
+
+impl RigProfile {
+    /// True if any binding anywhere in the profile resolved an indirection.
+    pub fn has_resolved_secret(&self) -> bool {
+        self.power.as_ref().is_some_and(|p| p.has_resolved_secret())
+            || self.deploy.values().any(|b| b.has_resolved_secret())
+            || self.console.values().any(|b| b.has_resolved_secret())
+            || self.telemetry.values().any(|b| b.has_resolved_secret())
+            || self.observe.values().any(|b| b.has_resolved_secret())
+            || self.secrets.has_resolved_secret()
+            || self.build_env.has_resolved_secret()
+    }
 }
 
 // ── TOML deserialization ────────────────────────────────────────────────────
@@ -182,7 +227,27 @@ struct RigMetaToml {
 pub fn load_profile(path: &Path) -> Result<RigProfile> {
     let raw = std::fs::read_to_string(path)
         .map_err(|e| Error::Config(format!("rig: reading profile {}: {}", path.display(), e)))?;
-    parse_profile_str(&raw, path)
+    let profile = parse_profile_str(&raw, path)?;
+    // A profile that reaches a secret is itself private: the paths it
+    // names and the fact of the secret are not for other users on the
+    // host. `0600` is the same bar `${file:…}` targets must meet.
+    if profile.has_resolved_secret() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path)
+            .map_err(|e| Error::Config(format!("rig: stat {}: {e}", path.display())))?
+            .permissions()
+            .mode();
+        if mode & 0o077 != 0 {
+            return Err(Error::Config(format!(
+                "rig: profile {} carries a secret but is readable by others (mode {:04o}); \
+                 run `chmod 600 {}`",
+                path.display(),
+                mode & 0o777,
+                path.display()
+            )));
+        }
+    }
+    Ok(profile)
 }
 
 pub fn parse_profile_str(raw: &str, path: &Path) -> Result<RigProfile> {
@@ -197,15 +262,15 @@ pub fn parse_profile_str(raw: &str, path: &Path) -> Result<RigProfile> {
 
     let power = f
         .power
-        .map(|t| load_binding(t, &format!("{ctx} [power]")))
+        .map(|t| load_binding(t, &format!("{ctx} [power]"), false))
         .transpose()?;
 
     let deploy = load_surface_map(f.deploy, Surface::Deploy, &ctx)?;
     let console = load_surface_map(f.console, Surface::Console, &ctx)?;
     let telemetry = load_surface_map(f.telemetry, Surface::Telemetry, &ctx)?;
     let observe = load_surface_map(f.observe, Surface::Observe, &ctx)?;
-    let secrets = load_binding(f.secrets, &format!("{ctx} [secrets]"))?;
-    let build_env = load_binding(f.build_env, &format!("{ctx} [build_env]"))?;
+    let secrets = load_binding(f.secrets, &format!("{ctx} [secrets]"), true)?;
+    let build_env = load_binding(f.build_env, &format!("{ctx} [build_env]"), false)?;
 
     Ok(RigProfile {
         path: path.to_path_buf(),
@@ -242,18 +307,32 @@ fn load_surface_map(
                 )))
             }
         };
-        let binding = load_binding(inner, &format!("{ctx} [{qualified}]"))?;
+        let binding = load_binding(inner, &format!("{ctx} [{qualified}]"), false)?;
         out.insert(cap, binding);
     }
     Ok(out)
 }
 
-fn load_binding(table: toml::Table, ctx: &str) -> Result<BindingTable> {
+/// `secret_section` marks `[secrets]`, where every value is a secret by
+/// position. Elsewhere a value is a secret when its key says so
+/// ([`is_secret_key`]). Either way a literal is refused: the whole point
+/// of the indirection is that the value never sits in this file.
+fn load_binding(table: toml::Table, ctx: &str, secret_section: bool) -> Result<BindingTable> {
     let mut fields = BTreeMap::new();
     for (key, value) in table {
         let field_ctx = format!("{ctx}.{key}");
         let v = match value {
-            toml::Value::String(s) => BindingValue::Secret(resolve(&s, &field_ctx)?),
+            toml::Value::String(s) => {
+                let resolved = resolve(&s, &field_ctx)?;
+                if (secret_section || is_secret_key(&key)) && !resolved.is_secret() {
+                    return Err(Error::Config(format!(
+                        "{field_ctx}: a secret must not be written into the profile as a \
+                         literal; use `${{file:/absolute/path}}` (a 0600 file you own) or \
+                         `${{env:NAME}}`"
+                    )));
+                }
+                BindingValue::Secret(resolved)
+            }
             toml::Value::Integer(n) => BindingValue::Int(n),
             toml::Value::Boolean(b) => BindingValue::Bool(b),
             toml::Value::Float(f) => {
@@ -406,9 +485,6 @@ mod tests {
         [observe.netboot_fetch]
         match_serial = "4f3c2a11"
 
-        [secrets]
-        kasa_alias = "lamp-1"
-
         [build_env]
         WIFI_SSID = "bench-net"
     "#;
@@ -434,8 +510,137 @@ mod tests {
         let console_cap = Capability::parse("console.serial").unwrap();
         let ser = p.console.get(&console_cap).unwrap();
         assert_eq!(ser.require_int("baud", "console.serial").unwrap(), 115200);
+        assert!(p.secrets.is_empty());
+        assert!(!p.has_resolved_secret());
+    }
 
-        assert!(p.secrets.contains_key("kasa_alias"));
+    /// A literal under a secret-named key, or anywhere in `[secrets]`, is
+    /// refused: the file must hold a reference, never the value.
+    #[test]
+    fn plain_literal_secrets_are_refused_at_load() {
+        for (src, field) in [
+            (
+                r#"
+                [rig]
+                id = "x"
+                board = "pico2w"
+                [build_env]
+                WIFI_PASSWORD = "hunter2"
+                "#,
+                "WIFI_PASSWORD",
+            ),
+            (
+                r#"
+                [rig]
+                id = "x"
+                board = "pi5"
+                [power]
+                backend = "kasa_local"
+                password = "hunter2"
+                "#,
+                "password",
+            ),
+            (
+                r#"
+                [rig]
+                id = "x"
+                board = "pi5"
+                [secrets]
+                kasa_alias = "lamp-1"
+                "#,
+                "kasa_alias",
+            ),
+        ] {
+            let err = parse_profile_str(src, Path::new("/tmp/x.toml")).unwrap_err();
+            let msg = format!("{err}");
+            assert!(msg.contains(field), "{msg}");
+            assert!(
+                msg.contains("must not be written into the profile as a literal"),
+                "{msg}"
+            );
+            assert!(
+                !msg.contains("hunter2") && !msg.contains("lamp-1"),
+                "the value leaked: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn secret_key_names_are_matched_by_name_and_suffix_case_insensitively() {
+        for k in [
+            "password",
+            "TOKEN",
+            "WIFI_PASSWORD",
+            "api_token",
+            "wifi_psk",
+            "x_secret",
+        ] {
+            assert!(is_secret_key(k), "{k}");
+        }
+        for k in [
+            "host",
+            "serial",
+            "device",
+            "secret_sauce",
+            "tokens",
+            "passwords_file",
+        ] {
+            assert!(!is_secret_key(k), "{k}");
+        }
+    }
+
+    #[test]
+    fn profile_with_a_secret_must_be_private_on_disk() {
+        use std::os::unix::fs::PermissionsExt;
+        std::env::set_var("RIG_TEST_MODE_SECRET", "v");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rig.toml");
+        std::fs::write(
+            &path,
+            r#"
+            [rig]
+            id = "x"
+            board = "pi5"
+            [secrets]
+            tok = "${env:RIG_TEST_MODE_SECRET}"
+            "#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let err = load_profile(&path).unwrap_err();
+        assert!(format!("{err}").contains("chmod 600"), "{err}");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(load_profile(&path).is_ok());
+        std::env::remove_var("RIG_TEST_MODE_SECRET");
+    }
+
+    #[test]
+    fn actuator_timeout_and_grace_come_from_the_binding() {
+        let src = r#"
+            [rig]
+            id = "x"
+            board = "pi5"
+            [power]
+            backend = "manual"
+            actuator_timeout_s = 2400
+            shutdown_grace_s = 10
+        "#;
+        let p = parse_profile_str(src, Path::new("/tmp/x.toml")).unwrap();
+        let power = p.power.unwrap();
+        assert_eq!(
+            power.actuator_timeout(),
+            Some(std::time::Duration::from_secs(2400))
+        );
+        assert_eq!(
+            power.shutdown_grace(),
+            Some(std::time::Duration::from_secs(10))
+        );
+        let bare = parse_profile_str(
+            "[rig]\nid = \"x\"\nboard = \"pi5\"\n[power]\nbackend = \"manual\"\n",
+            Path::new("/tmp/x.toml"),
+        )
+        .unwrap();
+        assert_eq!(bare.power.unwrap().actuator_timeout(), None);
     }
 
     /// `[build_env]` reaches the profile, keyed by environment variable

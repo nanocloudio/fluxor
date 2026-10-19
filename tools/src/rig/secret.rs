@@ -135,6 +135,28 @@ fn resolve_file(path: &str, ctx: &str, raw: &str) -> Result<Secret> {
             "{ctx}: ${{file:…}} requires an absolute path (got '{path}' in '{raw}')"
         )));
     }
+    // The file is the secret's only home, so it must be the caller's and
+    // nobody else's to read: the rule ssh applies to a private key.
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata(path)
+            .map_err(|e| Error::Config(format!("{ctx}: stat '{path}' for '{raw}': {e}")))?;
+        // SAFETY: geteuid has no arguments and no side effects.
+        let me = unsafe { libc::geteuid() };
+        if meta.uid() != me {
+            return Err(Error::Config(format!(
+                "{ctx}: secret file '{path}' is owned by uid {}, not by you (uid {me})",
+                meta.uid()
+            )));
+        }
+        if meta.mode() & 0o077 != 0 {
+            return Err(Error::Config(format!(
+                "{ctx}: secret file '{path}' is readable by others (mode {:04o}); \
+                 run `chmod 600 {path}`",
+                meta.mode() & 0o777
+            )));
+        }
+    }
     let contents = std::fs::read_to_string(path)
         .map_err(|e| Error::Config(format!("{ctx}: reading '{path}' for '{raw}': {e}")))?;
     // Trim a single trailing newline — a `.token` file typically has one.
@@ -183,14 +205,30 @@ mod tests {
 
     #[test]
     fn file_indirection_reads_and_trims_newline() {
-        let dir = std::env::temp_dir();
-        let path = dir.join(format!("fluxor-rig-secret-{}.tok", std::process::id()));
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret.tok");
         std::fs::write(&path, "abc123\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         let raw = format!("${{file:{}}}", path.display());
         let s = resolve(&raw, "x").unwrap();
         assert_eq!(s.expose(), "abc123");
         assert!(s.is_secret());
-        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn file_indirection_refuses_a_file_others_can_read() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret.tok");
+        std::fs::write(&path, "abc123\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let raw = format!("${{file:{}}}", path.display());
+        let err = resolve(&raw, "ctx").unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("readable by others"), "{msg}");
+        assert!(msg.contains("chmod 600"), "{msg}");
+        assert!(!msg.contains("abc123"), "the value leaked: {msg}");
     }
 
     #[test]

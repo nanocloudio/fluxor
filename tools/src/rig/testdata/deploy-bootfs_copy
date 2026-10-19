@@ -1,0 +1,48 @@
+#!/usr/bin/env python3
+"""deploy-bootfs_copy — a deploy backend double that records its verbs.
+
+Never installed. Appends `<verb> <phase>` to binding `log`. `stage`
+appends a line of "previous image" output to binding `feed` (the console
+double tails it), the way staging with picotool starts the image before
+the power step. `watch` is unsupported (exit 64). `unstage` succeeds.
+Binding `fail_stage` makes `stage` exit 1; `stage_64` makes it exit 64.
+"""
+import json
+import sys
+
+UNSUPPORTED = 64
+
+
+def main():
+    raw = sys.stdin.read()
+    inv = json.loads(raw) if raw.strip() else {}
+    verb = sys.argv[1] if len(sys.argv) > 1 else ""
+    binding = inv.get("binding", {}) or {}
+    phase = (inv.get("context", {}) or {}).get("phase", "run")
+    log = binding.get("log")
+    if log:
+        with open(log, "a") as f:
+            f.write(f"{verb} {phase}\n")
+    if verb == "stage":
+        if binding.get("stage_64"):
+            return UNSUPPORTED
+        if binding.get("fail_stage"):
+            print("stage: artifact missing", file=sys.stderr)
+            return 1
+        feed = binding.get("feed")
+        if feed:
+            with open(feed, "a") as f:
+                f.write("T:old image alive\n")
+        json.dump({"ok": True, "info": "staged", "detail": {"bytes": 1234}}, sys.stdout)
+        return 0
+    if verb == "unstage":
+        json.dump({"ok": True, "info": "unstaged"}, sys.stdout)
+        return 0
+    if verb == "watch":
+        return UNSUPPORTED
+    print(f"deploy-bootfs_copy: unknown verb {verb!r}", file=sys.stderr)
+    return UNSUPPORTED
+
+
+if __name__ == "__main__":
+    sys.exit(main())

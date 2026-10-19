@@ -15,9 +15,25 @@ fluxor rig test --scenario <scenario>.toml --rig <rig>
 
 builds the scenario's config into an image, attaches the console, deploys
 the image, cycles power, and reports a verdict from the pass/fail rules.
-Every run is recorded under
+Then, whatever the verdict, it tears the rig down: power off, the staged
+image removed, every observer stopped. Every run is recorded under
 `~/.local/state/fluxor/labs/<lab>/rigs/<rig>/runs/`, console capture
-included.
+and the teardown's outcome included.
+
+A board that cannot be switched off — a Pico on USB — reports the power
+off as a no-op, and the record says so. A teardown that does not complete
+(the plug did not answer, a cloud machine is still running) leaves the
+rig marked; the next `fluxor rig test` on it finishes the teardown before
+doing anything else, and `fluxor rig teardown --rig <rig>` does it by
+hand. `fluxor rig teardown --all` goes through every rig in the lab and
+then asks each power backend to sweep for anything of the lab's it can
+still see running.
+
+A failed run can be kept for inspection: `--hold <minutes>` leaves the
+rig as the run left it until the time is up or Enter is pressed, then
+tears down. A board whose images leave the host (a cloud machine) needs
+`--hold` on `fluxor rig power on` too, because an `on` with no end would
+leave a machine running somewhere.
 
 ## Pico 2 W over USB
 
@@ -81,7 +97,7 @@ serial = "<chip-id>"
 [build_env]
 WIFI_SSID = "<your-ssid>"
 WIFI_PASSWORD = "${env:WIFI_PASSWORD}"
-# WIFI_PASSWORD = "${file:/etc/fluxor/wifi.psk}"
+# WIFI_PASSWORD = "${file:/home/me/.config/fluxor/secrets/wifi.psk}"
 ```
 
 The project recipe (`~/.config/fluxor/projects/fluxor/rig.toml`) must
@@ -94,7 +110,19 @@ Wifi credentials reach the build through `[build_env]` above. They can
 still come from the environment of the `fluxor rig` invocation, and a
 graph can name them directly, but the profile is where they belong: a
 run that depends on what the operator happened to have exported
-reproduces only in the shell that set it up.
+reproduces only in the shell that set it up. The board says which names
+it needs (`build_env_required`) and which are secrets
+(`build_env_secret`); a profile missing a required name is refused at
+plan time.
+
+A secret is never written in a profile. A key whose name says secret —
+`password`, `token`, `psk`, `passphrase`, `secret`, alone or as a
+suffix — and anything under `[secrets]` must be a `${file:…}` or
+`${env:…}` reference; a plain value is refused. The file behind
+`${file:…}` must belong to the user running `fluxor` and be mode 0600,
+and a profile that resolves any secret must be 0600 itself. The
+resolved value reaches the backend and the build and nothing else: plan
+output, run records and profile hashes show it redacted.
 
 Omitting the SSID is legal — the wifi module then scans instead of
 associating, which is a real mode — but the build warns, naming every
@@ -111,11 +139,11 @@ that needs the LED observed needs a person, or a camera.
 
 The Pi 5 rig netboots: the image is staged into a TFTP root, a switched
 supply cycles power, and the console is a UART adapter. The board
-declares that shape in `targets/boards/pi5.toml`, and the
-`deploy-netboot_tftp`, `power-kasa_local` and `console-serial` backends
-supply it. The profile again carries the bench's own values — the board's
-address, the TFTP root, the serial port, the power backend's credentials
-— and again lives outside the tree.
+declares that shape in `targets/boards/pi5.toml` as capabilities —
+`deploy.netboot_tftp`, `power.cycle`, `console.serial` — and the bench
+supplies a backend executable for each. The profile again carries the
+bench's own values — the board's address, the TFTP root, the serial port,
+the power backend's credentials — and again lives outside the tree.
 
 ## Writing a scenario
 
@@ -125,3 +153,22 @@ see. The console attaches because the rules read from it; only deploy
 and power need naming in `requires`. Keep the fail rules for things the
 kernel says when it has given up — `[fault] pc=`, `[cyw43] halt phase=`,
 `[fluxor] boot:` — so a failed run says why in the verdict.
+
+A `[[pass]]` that never arrives fails only when the whole timeout runs
+out, and the verdict then says nothing about where the boot stopped.
+`[[expect]]` rules put deadlines on the way: `within_s` says a line must
+appear that soon after power, `max_silence_s` says the source must not
+go quiet for longer than that, and a missed expectation fails the run at
+once, naming the rule.
+
+```toml
+[[expect]]
+source = "console.serial"
+regex = "\\[boot\\] stages="
+within_s = 10
+```
+
+Only output after the run's own power step counts. What the board was
+printing before — the previous image, still running while the new one
+is staged — is captured but never matched, so a stale pass line cannot
+pass a run.

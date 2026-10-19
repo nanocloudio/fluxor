@@ -11,7 +11,10 @@ use crate::rig::vocab::Capability;
 
 /// Unified event stream consumed by the matcher. Every transport backend
 /// the orchestrator attaches publishes into one shared channel so rule
-/// evaluation sees events in arrival order.
+/// evaluation sees events in arrival order. The orchestrator also pushes
+/// its own markers into the same channel, so "before the power step" and
+/// "after it" are positions in one ordered stream rather than a race
+/// between a clock and a queue.
 #[derive(Debug)]
 pub enum RunEvent {
     /// Raw bytes from a console transport, tagged with the source
@@ -21,15 +24,22 @@ pub enum RunEvent {
     /// against `console.usb_cdc` bytes that happened to arrive on the
     /// same channel.
     ConsoleBytes { source: Capability, bytes: Vec<u8> },
+    /// A transport reports that what follows comes from a target started
+    /// for this run (see `TransportEvent::Boot`).
+    Boot { source: Capability },
     /// Structured event from a deploy or similar transport.
     DeployProgress(DeployEvent),
-    /// A transport exited unexpectedly. The matcher keeps running (another
-    /// signal may still decide the verdict); the orchestrator logs this
-    /// for the run record.
-    TransportClosed {
-        source: &'static str,
-        reason: String,
-    },
+    /// A transport exited. The matcher keeps running (another signal may
+    /// still decide the verdict); `max_silence_s` rules see it as the
+    /// source going quiet, and the orchestrator logs it for the run record.
+    TransportClosed { source: Capability, reason: String },
+    /// Pushed by the orchestrator just before the first power verb. A
+    /// `Boot` that arrives after this marks its source as showing this
+    /// run's target; one before it does not.
+    PowerStarted,
+    /// Pushed by the orchestrator when the last power verb has returned.
+    /// Everything after it is this run's.
+    PowerDone,
 }
 
 #[derive(Debug, Clone)]

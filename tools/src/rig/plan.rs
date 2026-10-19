@@ -16,8 +16,11 @@ use crate::rig::lock::default_lock_path;
 use crate::rig::profile::{BindingTable, RigProfile};
 use crate::rig::project::{BuildOutput, ProjectDescriptor};
 use crate::rig::record::RunRecord;
-use crate::rig::scenario::{ObservationRule, Scenario};
+use crate::rig::scenario::{ExpectRule, ObservationRule, Scenario};
 use crate::rig::vocab::{Capability, Surface};
+
+/// Per-verb bound on a backend when its binding sets none.
+pub const DEFAULT_ACTUATOR_TIMEOUT_S: u64 = 60;
 
 /// Fully resolved run intent.
 #[derive(Debug, Clone)]
@@ -60,9 +63,15 @@ pub struct Plan {
     pub observers: Vec<ObserverSelection>,
     pub pass_rules: Vec<ObservationRule>,
     pub fail_rules: Vec<ObservationRule>,
+    pub expect_rules: Vec<ExpectRule>,
     pub artifact: ArtifactPlan,
     pub lock_path: Option<PathBuf>,
     pub run_record: RunRecord,
+    /// How long the run may take from guard to manifest: every actuator's
+    /// bound (stage, each power verb, the three teardown steps) plus the
+    /// match timeout and some slack. Written into the lock as
+    /// `expected_end` so another host can tell a long run from a dead one.
+    pub lifecycle_budget_s: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -171,6 +180,24 @@ pub fn build_plan(inputs: PlanInputs<'_>) -> Result<Plan> {
     let artifact = pick_artifact(scenario, board, inputs.project)?;
     let lock_path = default_lock_path(inputs.lab, &profile.rig.id);
 
+    let deploy_timeout_s = profile
+        .deploy
+        .get(&deploy.capability)
+        .and_then(|b| b.actuator_timeout())
+        .map(|d| d.as_secs())
+        .unwrap_or(DEFAULT_ACTUATOR_TIMEOUT_S);
+    let power_timeout_s = profile
+        .power
+        .as_ref()
+        .and_then(|b| b.actuator_timeout())
+        .map(|d| d.as_secs())
+        .unwrap_or(DEFAULT_ACTUATOR_TIMEOUT_S);
+    // stage + unstage, each power verb, then diagnose + off at teardown.
+    let lifecycle_budget_s = 2 * deploy_timeout_s
+        + power_timeout_s * (power_actions.len() as u64 + 2)
+        + effective_timeout_s as u64
+        + 30;
+
     // Artifact digests require on-disk bytes; the plan stops at the
     // resolved output path rather than triggering a build. The
     // orchestrator fills in the digest after the build runs.
@@ -196,10 +223,22 @@ pub fn build_plan(inputs: PlanInputs<'_>) -> Result<Plan> {
         observers,
         pass_rules: scenario.pass.clone(),
         fail_rules: scenario.fail.clone(),
+        expect_rules: scenario.expect.clone(),
         artifact,
         lock_path,
         run_record,
+        lifecycle_budget_s,
     })
+}
+
+/// Every capability a scenario's rules read from, pass/fail/expect alike.
+fn rule_sources(scenario: &Scenario) -> impl Iterator<Item = Capability> + '_ {
+    scenario
+        .pass
+        .iter()
+        .chain(scenario.fail.iter())
+        .map(|r| r.source)
+        .chain(scenario.expect.iter().map(|e| e.source))
 }
 
 /// Map the scenario's `power.*` requirements to the verbs the
@@ -354,9 +393,9 @@ fn pick_observe_transports(
             wanted.push(*cap);
         }
     }
-    for rule in scenario.pass.iter().chain(scenario.fail.iter()) {
-        if is_transport_observe(&rule.source) && !wanted.contains(&rule.source) {
-            wanted.push(rule.source);
+    for source in rule_sources(scenario) {
+        if is_transport_observe(&source) && !wanted.contains(&source) {
+            wanted.push(source);
         }
     }
     let mut out = Vec::with_capacity(wanted.len());
@@ -400,9 +439,9 @@ fn pick_consoles(
             wanted.push(*cap);
         }
     }
-    for rule in scenario.pass.iter().chain(scenario.fail.iter()) {
-        if rule.source.surface() == Surface::Console && !wanted.contains(&rule.source) {
-            wanted.push(rule.source);
+    for source in rule_sources(scenario) {
+        if source.surface() == Surface::Console && !wanted.contains(&source) {
+            wanted.push(source);
         }
     }
 
@@ -696,6 +735,20 @@ impl fmt::Display for Plan {
                 )?;
             }
         }
+        if !self.expect_rules.is_empty() {
+            writeln!(f, "  expectations:")?;
+            for e in &self.expect_rules {
+                let mut parts = Vec::new();
+                if let (Some(p), Some(w)) = (&e.regex, e.within_s) {
+                    parts.push(format!("regex={p:?} within {w}s"));
+                }
+                if let Some(ms) = e.max_silence_s {
+                    parts.push(format!("max silence {ms}s"));
+                }
+                writeln!(f, "    {} {}", e.source, parts.join(", "))?;
+            }
+        }
+        writeln!(f, "  lifecycle budget  {}s", self.lifecycle_budget_s)?;
         writeln!(f, "  run id            {}", self.run_record.run_id)?;
         writeln!(f, "  scenario sha256   {}", self.run_record.scenario_sha256)?;
         writeln!(f, "  profile sha256    {}", self.run_record.profile_sha256)?;
@@ -809,6 +862,48 @@ mod tests {
         assert_eq!(p.effective_timeout_s, 30);
         assert_eq!(p.pass_rules.len(), 1);
         assert_eq!(p.fail_rules.len(), 1);
+    }
+
+    #[test]
+    fn expect_sources_attach_their_consoles_and_show_in_the_plan() {
+        let board = parse_board_rig_str(PI5_BOARD, "pi5.toml").unwrap().unwrap();
+        let profile = parse_profile_str(PROFILE, std::path::Path::new("/tmp/pi5-a.toml")).unwrap();
+        // The only mention of console.serial is an expectation: the plan
+        // must still attach that console.
+        let scenario = parse_scenario_str(
+            r#"
+                name = "x"
+                target = "pi5"
+                config = "a.yaml"
+                requires = ["deploy.netboot_tftp", "power.cycle"]
+                [[pass]]
+                source = "observe.netboot_fetch"
+                [[expect]]
+                source = "console.serial"
+                regex = "stages="
+                within_s = 20
+            "#,
+            std::path::Path::new("/repo/tests/hardware"),
+            "s.toml",
+        )
+        .unwrap();
+        let p = build_plan(PlanInputs {
+            lab: "default",
+            scenario: &scenario,
+            board: &board,
+            profile: &profile,
+            project: None,
+            scenario_path: None,
+        })
+        .unwrap();
+        assert_eq!(p.consoles.len(), 1);
+        assert_eq!(p.consoles[0].capability.as_str(), "console.serial");
+        assert_eq!(p.expect_rules.len(), 1);
+        let rendered = format!("{p}");
+        assert!(rendered.contains("expectations:"), "{rendered}");
+        assert!(rendered.contains("within 20s"), "{rendered}");
+        // 2 × stage(60) + power(60) × (1 verb + 2 teardown) + 30 timeout + 30 slack
+        assert_eq!(p.lifecycle_budget_s, 120 + 180 + 30 + 30);
     }
 
     #[test]

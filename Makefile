@@ -99,14 +99,15 @@ install:
 	ln -snf $(CURDIR)/$(HOST_DIR)/observe-https_load   $(RIG_BACKEND_DIR)/observe-https_load
 	ln -snf $(CURDIR)/$(HOST_DIR)/observe-tls_load     $(RIG_BACKEND_DIR)/observe-tls_load
 	ln -snf $(CURDIR)/$(HOST_DIR)/observe-udp_capture  $(RIG_BACKEND_DIR)/observe-udp_capture
-	ln -snf $(CURDIR)/tools/rig/backends/observe-quic_mux  $(RIG_BACKEND_DIR)/observe-quic_mux
-	ln -snf $(CURDIR)/tools/rig/backends/console-usb_cdc   $(RIG_BACKEND_DIR)/console-usb_cdc
-	ln -snf $(CURDIR)/tools/rig/backends/deploy-picotool   $(RIG_BACKEND_DIR)/deploy-picotool
-	ln -snf $(CURDIR)/tools/rig/backends/power-picotool    $(RIG_BACKEND_DIR)/power-picotool
+	@# The mechanism backends are shadow-tracked (tools/rig/ is a bench
+	@# tree, like tests/hardware/); link whichever this checkout has.
+	@for b in $(CURDIR)/tools/rig/backends/*; do \
+	  [ -f "$$b" ] && ln -snf "$$b" $(RIG_BACKEND_DIR)/$$(basename "$$b"); \
+	done; true
 
 RIG_BACKEND_DIR := $(if $(XDG_DATA_HOME),$(XDG_DATA_HOME),$(HOME)/.local/share)/fluxor/backends
 
-# stage tests/ + tools/tests/ + examples/ into the shadow repo
+# stage tests/ + tools/tests/ + tools/rig/ + examples/ into the shadow repo
 #
 # The `-f` and the exclude pathspec are both required and neither is
 # memorable (standards/test-tracking.md §8): without `-f` this stages
@@ -116,7 +117,7 @@ RIG_BACKEND_DIR := $(if $(XDG_DATA_HOME),$(XDG_DATA_HOME),$(HOME)/.local/share)/
 # naming: `.gitignore` covers it for the parent repo and is outranked here.
 # `git shadow status` / `log` are single commands — type them.
 shadow-add:
-	@git shadow add -f -- tests tools/tests examples ':(exclude)**/target/**' ':(exclude)**/__pycache__/**'
+	@git shadow add -f -- tests tools/tests tools/rig examples ':(exclude)**/target/**' ':(exclude)**/__pycache__/**'
 
 # One kernel: build + objcopy to a raw boot image.
 #   make firmware TARGET=pico2w   # a BOARD id (targets/boards/), or a host token

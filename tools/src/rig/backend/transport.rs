@@ -1,7 +1,7 @@
 //! Transport dispatch — long-running subprocess that streams NDJSON events.
 //!
-//! Used for `console.*`, `telemetry.*`, and the `watch` side of `deploy.*`.
-//! Invocation:
+//! Used for `console.*`, `telemetry.*`, `observe.*` and the `watch` side of
+//! `deploy.*`. Invocation:
 //!
 //!   1. Spawn `<executable> <verb>` with stdin/stdout piped.
 //!   2. Write the JSON [`BackendInvocation`] to stdin; close stdin.
@@ -9,8 +9,9 @@
 //!      [`TransportEvent`](super::protocol::TransportEvent) per line from
 //!      stdout and forwards it (translated into a [`RunEvent`]) into the
 //!      matcher's channel.
-//!   4. On [`TransportHandle`] drop: send SIGTERM, wait up to 2s, then
-//!      SIGKILL. Join the reader thread.
+//!   4. On [`TransportHandle`] drop: send SIGTERM, wait the grace period
+//!      (2 s unless the binding set `shutdown_grace_s`), then SIGKILL.
+//!      Join the reader thread.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::process::CommandExt;
@@ -23,22 +24,43 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::error::{Error, Result};
 use crate::rig::backend::discover::BackendRef;
-use crate::rig::backend::protocol::{BackendInvocation, TransportEvent};
+use crate::rig::backend::protocol::{BackendInvocation, TransportEvent, EXIT_UNSUPPORTED_VERB};
 use crate::rig::events::{DeployEvent, RunEvent};
-use crate::rig::vocab::{Capability, Surface};
+use crate::rig::vocab::Capability;
 
 /// Handle to a running transport subprocess. Drop signals shutdown
-/// (SIGTERM → 2s grace → SIGKILL) and joins the reader thread.
+/// (SIGTERM → grace → SIGKILL) and joins the reader thread.
 pub struct TransportHandle {
     backend: BackendRef,
     child: Option<Child>,
     reader: Option<JoinHandle<()>>,
     shutdown: Arc<AtomicBool>,
+    grace: Duration,
 }
 
 impl TransportHandle {
     pub fn backend(&self) -> &BackendRef {
         &self.backend
+    }
+
+    /// Whether the backend exited saying the verb is unsupported (exit
+    /// 64) — a deploy backend with nothing to `watch`. Asked after its
+    /// stdout closed, which happens an instant before the process is
+    /// reapable, so a short wait for the status is part of the answer.
+    pub fn exited_unsupported(&mut self) -> bool {
+        let Some(child) = self.child.as_mut() else {
+            return false;
+        };
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => return status.code() == Some(EXIT_UNSUPPORTED_VERB),
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                _ => return false,
+            }
+        }
     }
 }
 
@@ -58,7 +80,7 @@ impl Drop for TransportHandle {
             unsafe {
                 libc::kill(-pid, libc::SIGTERM);
             }
-            let deadline = Instant::now() + Duration::from_secs(2);
+            let deadline = Instant::now() + self.grace;
             let exited = loop {
                 match child.try_wait() {
                     Ok(Some(_)) => break true,
@@ -86,11 +108,22 @@ impl Drop for TransportHandle {
     }
 }
 
+/// Attach with the default 2 s shutdown grace.
 pub fn attach(
     backend: BackendRef,
     verb: &str,
     invocation: &BackendInvocation,
     events: Sender<RunEvent>,
+) -> Result<TransportHandle> {
+    attach_with_grace(backend, verb, invocation, events, Duration::from_secs(2))
+}
+
+pub fn attach_with_grace(
+    backend: BackendRef,
+    verb: &str,
+    invocation: &BackendInvocation,
+    events: Sender<RunEvent>,
+    grace: Duration,
 ) -> Result<TransportHandle> {
     let mut child = Command::new(&backend.executable)
         .arg(verb)
@@ -122,42 +155,21 @@ pub fn attach(
         .take()
         .ok_or_else(|| Error::Config("transport: stdout missing".into()))?;
 
-    let surface = backend.surface;
-    // Static label used in TransportClosed events — owned by the backend.
-    let label: &'static str = match surface {
-        Surface::Console => "console",
-        Surface::Deploy => "deploy",
-        Surface::Telemetry => "telemetry",
-        Surface::Observe => "observe",
-        Surface::Power => "power",
-        Surface::Rig => "rig",
-    };
-
-    // For transports that emit bytes (console.*, telemetry.*, observe.*),
-    // compute the fully-qualified capability this backend speaks on.
-    // Byte events carry this tag so the matcher routes them to the
-    // correct per-source buffer and rules that name a specific
-    // capability match only their own traffic.
-    //
-    // Observe-surface backends (e.g. `observe-https_load`) emit
-    // synthesised NDJSON bytes summarising probe results so the same
-    // byte-buffer/regex pipeline used for console + telemetry can
-    // evaluate scenario rules against them. The `observe.netboot_fetch`
-    // capability is the exception — it produces structured deploy events
-    // via the deploy backend's `watch` verb, not a transport of its own,
-    // so it deliberately has no `attach_transport` path.
-    let byte_source: Option<Capability> = match surface {
-        Surface::Console | Surface::Telemetry | Surface::Observe => {
-            let qualified = format!("{}.{}", surface.as_str(), backend.name);
-            Some(Capability::parse(&qualified).map_err(|e| {
-                Error::Config(format!(
-                    "transport: cannot identify byte-source capability for backend '{}': {e}",
-                    backend.slug(),
-                ))
-            })?)
-        }
-        _ => None,
-    };
+    // Every transport speaks on behalf of one capability: the qualified
+    // `<surface>.<name>` of its backend. Byte events carry it so the
+    // matcher routes them to the correct per-source buffer, and a close
+    // names the source that went quiet. Observe-surface backends (e.g.
+    // `observe-https_load`) emit synthesised NDJSON bytes summarising
+    // probe results so the same byte-buffer/regex pipeline evaluates
+    // scenario rules against them; `observe.netboot_fetch` is produced by
+    // the deploy backend's `watch` verb, not a transport of its own.
+    let qualified = format!("{}.{}", backend.surface.as_str(), backend.name);
+    let source = Capability::parse(&qualified).map_err(|e| {
+        Error::Config(format!(
+            "transport: cannot identify the capability for backend '{}': {e}",
+            backend.slug(),
+        ))
+    })?;
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_thr = shutdown.clone();
@@ -166,14 +178,7 @@ pub fn attach(
     let reader = std::thread::Builder::new()
         .name(format!("fluxor-rig/{}", backend.slug()))
         .spawn(move || {
-            run_reader_loop(
-                stdout,
-                events,
-                byte_source,
-                label,
-                shutdown_thr,
-                slug_for_thread,
-            );
+            run_reader_loop(stdout, events, source, shutdown_thr, slug_for_thread);
         })
         .map_err(|e| Error::Config(format!("transport: spawning reader thread: {e}")))?;
 
@@ -182,14 +187,14 @@ pub fn attach(
         child: Some(child),
         reader: Some(reader),
         shutdown,
+        grace,
     })
 }
 
 fn run_reader_loop(
     stdout: ChildStdout,
     events: Sender<RunEvent>,
-    byte_source: Option<Capability>,
-    label: &'static str,
+    source: Capability,
     shutdown: Arc<AtomicBool>,
     slug: String,
 ) {
@@ -215,7 +220,7 @@ fn run_reader_loop(
             }
         };
 
-        if let Some(ev) = translate(event, byte_source, &slug) {
+        if let Some(ev) = translate(event, source, &slug) {
             if events.send(ev).is_err() {
                 break;
             }
@@ -223,37 +228,23 @@ fn run_reader_loop(
     }
 
     let _ = events.send(RunEvent::TransportClosed {
-        source: label,
+        source,
         reason: "transport backend exited".into(),
     });
 }
 
 /// Map a wire-format event to the in-process event type the matcher
-/// understands. Returns `None` for events that are diagnostics-only or
-/// for byte events emitted by backends that have no byte-source
-/// capability (non-transport surfaces — the spec forbids these).
-fn translate(
-    event: TransportEvent,
-    byte_source: Option<Capability>,
-    slug: &str,
-) -> Option<RunEvent> {
+/// understands. Returns `None` for events that are diagnostics-only.
+fn translate(event: TransportEvent, source: Capability, slug: &str) -> Option<RunEvent> {
     match event {
         TransportEvent::Bytes { data } => match crate::b64::decode(&data) {
-            Some(bytes) => {
-                let source = match byte_source {
-                    Some(s) => s,
-                    None => {
-                        eprintln!(
-                            "[rig] {slug}: backend emitted a bytes event but its surface has \
-                             no byte-source mapping; dropped"
-                        );
-                        return None;
-                    }
-                };
-                Some(RunEvent::ConsoleBytes { source, bytes })
+            Some(bytes) => Some(RunEvent::ConsoleBytes { source, bytes }),
+            None => {
+                eprintln!("[rig] {slug}: bytes event with malformed base64 (dropped)");
+                None
             }
-            None => None, // skip malformed base64 silently; stderr logged by the backend
         },
+        TransportEvent::Boot => Some(RunEvent::Boot { source }),
         TransportEvent::Fetch {
             filename,
             client_ip,
@@ -277,9 +268,9 @@ fn translate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rig::backend::protocol::BackendContext;
+    use crate::rig::backend::protocol::{BackendContext, PHASE_RUN};
+    use crate::rig::vocab::Surface;
     use std::collections::BTreeMap;
-    use std::os::unix::fs::PermissionsExt;
     use std::sync::mpsc;
 
     /// Returns (tmp dir, backend ref, exec-spawn lock guard).
@@ -299,6 +290,7 @@ mod tests {
         BackendRef,
         std::sync::MutexGuard<'static, ()>,
     ) {
+        use std::os::unix::fs::PermissionsExt;
         let guard = crate::rig::test_utils::lock_exec_spawn();
         let tmp = crate::rig::test_utils::unique_tmp_dir(&format!("transport-{name}"));
         let slug = format!("{}-{}", surface.as_str(), name);
@@ -327,20 +319,22 @@ mod tests {
                 scenario_name: "test".into(),
                 board: "pi5".into(),
                 effective_timeout_ms: 10_000,
+                phase: PHASE_RUN.into(),
             },
             artifact: None,
+            args: None,
         }
     }
 
     #[test]
-    fn streams_bytes_then_closes() {
+    fn streams_bytes_then_closes_naming_the_source() {
         // Backend emits one bytes event then exits. The matcher channel
-        // should receive ConsoleBytes + TransportClosed.
+        // should receive ConsoleBytes + TransportClosed, both tagged.
         let data = crate::b64::encode(b"hello");
         let script = format!(
             "#!/bin/sh\nread _input\nprintf '{{\"kind\":\"bytes\",\"data\":\"{data}\"}}\\n'\nexit 0\n"
         );
-        let (dir, backend, _exec_guard) = fixture("serial", Surface::Console, &script);
+        let (_dir, backend, _exec_guard) = fixture("serial", Surface::Console, &script);
         let (tx, rx) = mpsc::channel::<RunEvent>();
         let handle = attach(backend, "attach", &sample_invocation(), tx).unwrap();
 
@@ -353,9 +347,25 @@ mod tests {
             other => panic!("unexpected first event: {other:?}"),
         }
         let second = rx.recv_timeout(Duration::from_secs(2)).expect("closed");
-        assert!(matches!(second, RunEvent::TransportClosed { .. }));
+        match second {
+            RunEvent::TransportClosed { source, .. } => {
+                assert_eq!(source.as_str(), "console.serial");
+            }
+            other => panic!("unexpected second event: {other:?}"),
+        }
         drop(handle);
-        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn boot_event_translates_with_its_source() {
+        let script = "#!/bin/sh\nread _input\nprintf '{\"kind\":\"boot\"}\\n'\nexit 0\n";
+        let (_dir, backend, _exec_guard) = fixture("usb_cdc", Surface::Console, script);
+        let (tx, rx) = mpsc::channel::<RunEvent>();
+        let _h = attach(backend, "attach", &sample_invocation(), tx).unwrap();
+        match rx.recv_timeout(Duration::from_secs(2)).expect("boot") {
+            RunEvent::Boot { source } => assert_eq!(source.as_str(), "console.usb_cdc"),
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 
     #[test]
@@ -365,7 +375,7 @@ read _input
 printf '{"kind":"fetch","filename":"kernel8.img","client_ip":"10.0.0.2"}\n'
 exit 0
 "#;
-        let (dir, backend, _exec_guard) = fixture("netboot_tftp", Surface::Deploy, script);
+        let (_dir, backend, _exec_guard) = fixture("netboot_tftp", Surface::Deploy, script);
         let (tx, rx) = mpsc::channel::<RunEvent>();
         let _handle = attach(backend, "watch", &sample_invocation(), tx).unwrap();
 
@@ -381,7 +391,6 @@ exit 0
             }
             other => panic!("unexpected: {other:?}"),
         }
-        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
@@ -391,7 +400,7 @@ read _input
 echo 'not json'
 printf '{"kind":"dhcp"}\n'
 "#;
-        let (dir, backend, _exec_guard) = fixture("journal", Surface::Deploy, script);
+        let (_dir, backend, _exec_guard) = fixture("netboot_tftp", Surface::Deploy, script);
         let (tx, rx) = mpsc::channel::<RunEvent>();
         let _h = attach(backend, "watch", &sample_invocation(), tx).unwrap();
         let ev = rx.recv_timeout(Duration::from_secs(2)).expect("dhcp");
@@ -399,7 +408,16 @@ printf '{"kind":"dhcp"}\n'
             ev,
             RunEvent::DeployProgress(DeployEvent::DhcpActivity)
         ));
-        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn deploy_watch_that_exits_64_is_reported_unsupported() {
+        let script = "#!/bin/sh\nread _input\nexit 64\n";
+        let (_dir, backend, _exec_guard) = fixture("picotool", Surface::Deploy, script);
+        let (tx, rx) = mpsc::channel::<RunEvent>();
+        let mut h = attach(backend, "watch", &sample_invocation(), tx).unwrap();
+        let _closed = rx.recv_timeout(Duration::from_secs(2)).expect("closed");
+        assert!(h.exited_unsupported());
     }
 
     #[test]
@@ -418,10 +436,8 @@ CHILD=$!
 trap "kill $CHILD 2>/dev/null; exit 0" TERM
 wait $CHILD
 "#;
-        // Use the Deploy surface so the byte-source-capability check is
-        // skipped — these tests exercise process management, not bytes.
         // Distinct `name` per test so parallel runs get separate tmp dirs.
-        let (dir, backend, _exec_guard) = fixture("ssh_stage_reboot", Surface::Deploy, script);
+        let (_dir, backend, _exec_guard) = fixture("ssh_stage_reboot", Surface::Deploy, script);
         let (tx, _rx) = mpsc::channel::<RunEvent>();
         let handle = attach(backend, "attach", &sample_invocation(), tx).unwrap();
         std::thread::sleep(Duration::from_millis(100));
@@ -432,33 +448,35 @@ wait $CHILD
             elapsed < Duration::from_secs(3),
             "drop took too long: {elapsed:?}"
         );
-        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
     fn drop_kills_unresponsive_backend_after_grace_window() {
-        // Backend refuses SIGTERM entirely. Drop should SIGKILL it
-        // within 2s + a small buffer and still return promptly.
+        // Backend refuses SIGTERM entirely. With a short grace, drop
+        // should SIGKILL it and return promptly.
         let script = r#"#!/bin/sh
 read _input
 trap '' TERM
 # Use a short sleep so we exit even if SIGKILL somehow misses.
 sleep 30
 "#;
-        let (dir, backend, _exec_guard) = fixture("bootfs_copy", Surface::Deploy, script);
+        let (_dir, backend, _exec_guard) = fixture("bootfs_copy", Surface::Deploy, script);
         let (tx, _rx) = mpsc::channel::<RunEvent>();
-        let handle = attach(backend, "attach", &sample_invocation(), tx).unwrap();
+        let handle = attach_with_grace(
+            backend,
+            "attach",
+            &sample_invocation(),
+            tx,
+            Duration::from_millis(400),
+        )
+        .unwrap();
         std::thread::sleep(Duration::from_millis(100));
         let start = Instant::now();
         drop(handle);
         let elapsed = start.elapsed();
-        // SIGKILL fires after the 2s grace; allow some slack for the
-        // orphaned sleep's pipe to close. If the reader thread takes
-        // too long we'll notice here.
         assert!(
-            elapsed < Duration::from_secs(5),
+            elapsed < Duration::from_secs(3),
             "drop took too long: {elapsed:?}"
         );
-        std::fs::remove_dir_all(dir).ok();
     }
 }

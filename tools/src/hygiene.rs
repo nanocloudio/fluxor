@@ -520,8 +520,18 @@ fn push_repo_violation(report: &mut Report, rel: PathBuf, rule: Rule, message: S
 
 /// The tree tiers [`test-tracking.md §1`] shadow-tracks. `fuzz/` and
 /// `fixtures/` are listed by the standard and by the projects that use
-/// them; a tier only participates when it exists on disk.
-const SHADOW_TIERS: [&str; 5] = ["tests", "benches", "examples", "fixtures", "fuzz"];
+/// them; `tools/rig/` is the standard's named extra tree — the rig
+/// mechanism backends and bench tooling, which describe benches the way
+/// `tests/hardware/` does. A tier only participates when it exists on
+/// disk.
+const SHADOW_TIERS: [&str; 6] = [
+    "tests",
+    "benches",
+    "examples",
+    "fixtures",
+    "fuzz",
+    "tools/rig",
+];
 
 /// Shadow-tracking conformance —
 /// the native replacement for the per-repo `tools/ci-shadow-guard.sh`
@@ -2037,6 +2047,23 @@ extern crate alloc;
         let mut report = Report::default();
         scan_shadow_guard(root.path(), &mut report);
         report.violations
+    }
+
+    /// `tools/rig/` is a nested tier: its ignore lines are
+    /// `/tools/rig/` and `!/tools/rig/`, and both spellings resolve.
+    #[test]
+    fn shadow_guard_reads_a_nested_tier() {
+        assert!(ignore_file_lists_tier(
+            "/tests/\n/tools/rig/\n",
+            "tools/rig",
+            false
+        ));
+        assert!(ignore_file_lists_tier(
+            "/*\n!/tools/rig/\n",
+            "tools/rig",
+            true
+        ));
+        assert!(!ignore_file_lists_tier("/tools/\n", "tools/rig", false));
     }
 
     #[test]

@@ -1,10 +1,12 @@
-//! Cross-schema validator: scenario requirements vs. the target board's
-//! declared rig capabilities. Every failure is raised at parse and plan
-//! time, never after orchestration has started.
+//! Cross-schema validators: scenario requirements vs. the target board's
+//! declared rig capabilities, and the private profile vs. the board's
+//! secret rules. Every failure is raised at parse and plan time, never
+//! after orchestration has started.
 
 use crate::rig::board::BoardRig;
 use crate::rig::matcher::supports_rule_source;
-use crate::rig::scenario::{ObservationRule, Scenario};
+use crate::rig::profile::{BindingValue, RigProfile};
+use crate::rig::scenario::{ExpectRule, ObservationRule, Scenario};
 use crate::rig::vocab::{Capability, Surface};
 
 #[derive(Debug, Default)]
@@ -47,6 +49,7 @@ pub fn validate_scenario_against_board(s: &Scenario, board: &BoardRig) -> RigVal
     // 3. Every rule source must live on a transport the board declares.
     check_rules("pass", &s.pass, board, s, &mut v);
     check_rules("fail", &s.fail, board, s, &mut v);
+    check_expects(&s.expect, board, s, &mut v);
 
     // 4. At least one pass rule is needed to know what success means.
     if s.pass.is_empty() {
@@ -57,6 +60,7 @@ pub fn validate_scenario_against_board(s: &Scenario, board: &BoardRig) -> RigVal
     }
 
     // 5. Timeout sanity.
+    let effective_timeout = s.timeout_s.or(board.default_timeout_s);
     if let Some(t) = s.timeout_s {
         if t == 0 {
             v.errors.push(format!(
@@ -69,6 +73,43 @@ pub fn validate_scenario_against_board(s: &Scenario, board: &BoardRig) -> RigVal
             "scenario '{}': no timeout_s and board has no default_timeout_s",
             s.name
         ));
+    }
+    if let Some(t) = effective_timeout {
+        for (i, e) in s.expect.iter().enumerate() {
+            if let Some(w) = e.within_s {
+                if w > t {
+                    v.errors.push(format!(
+                        "scenario '{}': [[expect]][{i}] within_s = {w} exceeds the run's \
+                         timeout ({t}s) — the run would time out before the expectation \
+                         could fail by itself",
+                        s.name
+                    ));
+                }
+            }
+        }
+    }
+
+    // 6. The kernel's heartbeat comes every 30 s; a tighter silence bound on
+    //    a scenario that waits for it fails a healthy board.
+    let waits_for_heartbeat = s
+        .pass
+        .iter()
+        .chain(s.fail.iter())
+        .filter_map(|r| r.regex.as_deref())
+        .any(|p| p.contains("sched") && p.contains("alive"));
+    if waits_for_heartbeat {
+        for (i, e) in s.expect.iter().enumerate() {
+            if let Some(ms) = e.max_silence_s {
+                if ms < 35 {
+                    v.warnings.push(format!(
+                        "scenario '{}': [[expect]][{i}] max_silence_s = {ms} is shorter than \
+                         the 30 s heartbeat the scenario waits for; a quiet but healthy board \
+                         would fail it",
+                        s.name
+                    ));
+                }
+            }
+        }
     }
 
     v
@@ -93,6 +134,93 @@ pub fn validate_tags(s: &Scenario, rig_tags: &[String]) -> RigValidation {
     v
 }
 
+/// The board's rules for the profile's `[build_env]`:
+///
+///   * every key in `build_env_required` must be present;
+///   * every key in `build_env_secret` must be an indirection, never a
+///     literal in the file;
+///   * on a board whose image leaves the host (`image_leaves_host`), no
+///     secret may enter the build at all — a Wi-Fi PSK must never become
+///     a disk image that is uploaded somewhere.
+pub fn check_profile_against_board(profile: &RigProfile, board: &BoardRig) -> RigValidation {
+    let mut v = RigValidation::default();
+    for key in &board.build_env_required {
+        if !profile.build_env.contains_key(key) {
+            v.errors.push(format!(
+                "profile '{}': board '{}' needs [build_env].{key} and the profile does not \
+                 set it",
+                profile.rig.id, profile.rig.board
+            ));
+        }
+    }
+    for key in &board.build_env_secret {
+        if let Some(BindingValue::Secret(s)) = profile.build_env.get(key) {
+            if !s.is_secret() {
+                v.errors.push(format!(
+                    "profile '{}': [build_env].{key} is a secret on board '{}' and must be \
+                     written as an indirection (`${{file:/abs/path}}` or `${{env:NAME}}`), \
+                     not as a literal",
+                    profile.rig.id, profile.rig.board
+                ));
+            }
+        }
+    }
+    if board.image_leaves_host {
+        for (key, value) in profile.build_env.iter() {
+            let is_secret = board.build_env_secret.contains(key)
+                || matches!(value, BindingValue::Secret(s) if s.is_secret());
+            if is_secret {
+                v.errors.push(format!(
+                    "profile '{}': [build_env].{key} is a secret, and board '{}' builds \
+                     images that leave this host — a secret must not be built into them",
+                    profile.rig.id, profile.rig.board
+                ));
+            }
+        }
+    }
+    v
+}
+
+fn check_source(
+    kind: &str,
+    i: usize,
+    source: Capability,
+    board: &BoardRig,
+    s: &Scenario,
+    v: &mut RigValidation,
+) {
+    // Every rule source must be one the matcher can actually evaluate.
+    // The vocabulary lists capabilities that are legal to declare on a
+    // board but not every one of them has an orchestrator pipeline yet.
+    if !supports_rule_source(source) {
+        v.errors.push(format!(
+            "scenario '{}': [[{}]][{}] source = '{}' — this capability is in the \
+             vocabulary but the matcher has no evaluator for it yet. Supported rule \
+             sources: any `console.*` or `telemetry.*` (regex on the per-source \
+             byte stream) and `observe.netboot_fetch`.",
+            s.name,
+            kind,
+            i,
+            source.as_str(),
+        ));
+        return;
+    }
+    // Every rule source must correspond to a transport the board
+    // actually provides. For observe.* sources the board's observe list
+    // is the gate; for console.*/telemetry.* the matching transport list.
+    if !board.supports(source) {
+        v.errors.push(format!(
+            "scenario '{}': [[{}]][{}] source = '{}' but board does not declare this \
+             capability under its [rig].{} list",
+            s.name,
+            kind,
+            i,
+            source.as_str(),
+            surface_field_name(source)
+        ));
+    }
+}
+
 fn check_rules(
     kind: &str,
     rules: &[ObservationRule],
@@ -101,35 +229,18 @@ fn check_rules(
     v: &mut RigValidation,
 ) {
     for (i, r) in rules.iter().enumerate() {
-        // Every rule source must be one the matcher can actually evaluate.
-        // The vocabulary lists capabilities that are legal to declare on a
-        // board but not every one of them has an orchestrator pipeline yet.
-        if !supports_rule_source(r.source) {
+        check_source(kind, i, r.source, board, s, v);
+    }
+}
+
+fn check_expects(rules: &[ExpectRule], board: &BoardRig, s: &Scenario, v: &mut RigValidation) {
+    for (i, r) in rules.iter().enumerate() {
+        check_source("expect", i, r.source, board, s, v);
+        if r.source.as_str() == "observe.netboot_fetch" && r.max_silence_s.is_some() {
             v.errors.push(format!(
-                "scenario '{}': [[{}]][{}] source = '{}' — this capability is in the \
-                 vocabulary but the matcher has no evaluator for it yet. Supported rule \
-                 sources: any `console.*` or `telemetry.*` (regex on the per-source \
-                 byte stream) and `observe.netboot_fetch`.",
-                s.name,
-                kind,
-                i,
-                r.source.as_str(),
-            ));
-            continue;
-        }
-        // Every rule source must correspond to a transport the board
-        // actually provides. For observe.* sources the board's observe list
-        // is the gate; for console.*/telemetry.* the matching transport list.
-        let supported = board.supports(r.source);
-        if !supported {
-            v.errors.push(format!(
-                "scenario '{}': [[{}]][{}] source = '{}' but board does not declare this \
-                 capability under its [rig].{} list",
-                s.name,
-                kind,
-                i,
-                r.source.as_str(),
-                surface_field_name(r.source)
+                "scenario '{}': [[expect]][{i}] max_silence_s on observe.netboot_fetch — a \
+                 fetch is an event, not a byte stream, so it has no silence",
+                s.name
             ));
         }
     }
@@ -150,6 +261,7 @@ fn surface_field_name(c: Capability) -> &'static str {
 mod tests {
     use super::*;
     use crate::rig::board::parse_board_rig_str;
+    use crate::rig::profile::parse_profile_str;
     use crate::rig::scenario::parse_scenario_str;
     use std::path::Path;
 
@@ -295,6 +407,71 @@ mod tests {
     }
 
     #[test]
+    fn expect_rules_are_gated_like_pass_rules_and_bounded_by_the_timeout() {
+        let s = scn(r#"
+            name = "x"
+            target = "pi5"
+            config = "a.yaml"
+            timeout_s = 20
+
+            [[pass]]
+            source = "console.serial"
+            regex = "ok"
+
+            [[expect]]
+            source = "console.usb_cdc"
+            regex = "stage"
+            within_s = 5
+
+            [[expect]]
+            source = "console.serial"
+            regex = "stage"
+            within_s = 25
+        "#);
+        let v = validate_scenario_against_board(&s, &load_pi5());
+        assert!(!v.is_ok());
+        assert!(
+            v.errors
+                .iter()
+                .any(|e| e.contains("[[expect]][0]") && e.contains("console.usb_cdc")),
+            "{:?}",
+            v.errors
+        );
+        assert!(
+            v.errors
+                .iter()
+                .any(|e| e.contains("[[expect]][1]") && e.contains("exceeds the run's timeout")),
+            "{:?}",
+            v.errors
+        );
+    }
+
+    #[test]
+    fn short_silence_bound_on_a_heartbeat_scenario_warns() {
+        let s = scn(r#"
+            name = "x"
+            target = "pi5"
+            config = "a.yaml"
+            timeout_s = 120
+
+            [[pass]]
+            source = "console.serial"
+            regex = "\\[sched\\] alive"
+
+            [[expect]]
+            source = "console.serial"
+            max_silence_s = 10
+        "#);
+        let v = validate_scenario_against_board(&s, &load_pi5());
+        assert!(v.is_ok(), "{:?}", v.errors);
+        assert!(
+            v.warnings.iter().any(|w| w.contains("heartbeat")),
+            "{:?}",
+            v.warnings
+        );
+    }
+
+    #[test]
     fn tag_mismatch_fails() {
         let s = scn(r#"
             name = "x"
@@ -317,6 +494,73 @@ mod tests {
         let rig_tags: Vec<String> = vec![];
         let v = validate_tags(&s, &rig_tags);
         assert!(v.is_ok());
+    }
+
+    const PICO_BOARD: &str = r#"
+        [rig]
+        artifact = "uf2"
+        deploy = ["deploy.picotool"]
+        console = ["console.usb_cdc"]
+        power = ["power.cycle", "power.off"]
+        build_env_required = ["WIFI_SSID"]
+        build_env_secret = ["WIFI_PASSWORD"]
+    "#;
+
+    #[test]
+    fn profile_missing_required_build_env_key_fails() {
+        let board = parse_board_rig_str(PICO_BOARD, "pico2w.toml")
+            .unwrap()
+            .unwrap();
+        let profile = parse_profile_str(
+            r#"
+            [rig]
+            id = "pico2w-a"
+            board = "pico2w"
+            "#,
+            Path::new("/tmp/p.toml"),
+        )
+        .unwrap();
+        let v = check_profile_against_board(&profile, &board);
+        assert!(
+            v.errors.iter().any(|e| e.contains("WIFI_SSID")),
+            "{:?}",
+            v.errors
+        );
+    }
+
+    #[test]
+    fn profile_with_indirected_secret_passes_and_image_leaving_board_refuses_it() {
+        std::env::set_var("RIG_VALIDATE_PSK", "x");
+        let profile = parse_profile_str(
+            r#"
+            [rig]
+            id = "pico2w-a"
+            board = "pico2w"
+            [build_env]
+            WIFI_SSID = "bench"
+            WIFI_PASSWORD = "${env:RIG_VALIDATE_PSK}"
+            "#,
+            Path::new("/tmp/p.toml"),
+        )
+        .unwrap();
+        let board = parse_board_rig_str(PICO_BOARD, "pico2w.toml")
+            .unwrap()
+            .unwrap();
+        assert!(check_profile_against_board(&profile, &board).is_ok());
+
+        let leaving = parse_board_rig_str(
+            &format!("{PICO_BOARD}\n        image_leaves_host = true\n"),
+            "ec2.toml",
+        )
+        .unwrap()
+        .unwrap();
+        let v = check_profile_against_board(&profile, &leaving);
+        assert!(
+            v.errors.iter().any(|e| e.contains("leave this host")),
+            "{:?}",
+            v.errors
+        );
+        std::env::remove_var("RIG_VALIDATE_PSK");
     }
 
     /// Guard against the in-tree board descriptor and example scenario

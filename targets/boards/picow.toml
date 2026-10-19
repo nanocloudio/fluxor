@@ -72,8 +72,13 @@ preferred_deploy = "deploy.picotool"
 console = ["console.usb_cdc", "console.serial"]
 preferred_console = "console.usb_cdc"
 observe = ["observe.console_regex", "observe.usb_enumeration"]
-power = ["power.cycle"]
+power = ["power.cycle", "power.off", "power.on"]
 default_timeout_s = 20
+# What a profile must bring to build for this board, and what it must never
+# write down. The SSID of the bench's network is a fact of the room; the PSK
+# is a secret and may only be referenced (`${file:…}` / `${env:…}`).
+build_env_required = ["WIFI_SSID"]
+build_env_secret = ["WIFI_PASSWORD"]
 
 # Audio hardware fact: I2S out via PIO-driven pins (D-BOARD-STACK).
 [platform.audio]

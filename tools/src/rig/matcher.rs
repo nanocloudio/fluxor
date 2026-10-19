@@ -1,12 +1,26 @@
 //! Observation matcher.
 //!
 //! Consumes [`RunEvent`]s produced by the other adapters and evaluates the
-//! scenario's pass/fail rules. Semantics:
+//! scenario's pass/fail/expect rules. Semantics:
 //!
 //!   * all pass rules must succeed before timeout
 //!   * any fail rule causes immediate failure
 //!   * fail wins ties
 //!   * pass rules are sticky once matched
+//!   * every `[[expect]]` with a regex must also have been seen, by its
+//!     deadline; a missed one fails the run and names itself
+//!   * a source with `max_silence_s` must not go quiet for that long once
+//!     it has spoken
+//!
+//! Deadlines are measured from an **anchor**: the moment the power step
+//! finished (the orchestrator says so with [`RunEvent::PowerDone`]), or
+//! the start of matching when there was no power step. A source that
+//! reports a fresh boot after the power step started moves its own
+//! expectations' anchor to that boot, so a target that takes a while to
+//! come up is not timed against the rig's clock before it exists.
+//!
+//! Time is an argument, never read inside: `observe_at` and `tick` take
+//! `now`, so the deadline logic is tested with a clock the test controls.
 //!
 //! Console rules match against the accumulated tail of console bytes (the
 //! buffer is bounded to 16 KiB). Netboot-fetch rules match on the fetched
@@ -14,12 +28,13 @@
 //! satisfies the rule.
 
 use std::collections::{BTreeMap, HashSet};
+use std::time::{Duration, Instant};
 
 use regex::{Regex, RegexBuilder};
 
 use crate::error::{Error, Result};
 use crate::rig::events::{DeployEvent, RunEvent};
-use crate::rig::scenario::ObservationRule;
+use crate::rig::scenario::{ExpectRule, ObservationRule};
 use crate::rig::vocab::{Capability, Surface};
 
 /// Rule sources the matcher can actually evaluate today. The validator
@@ -84,6 +99,15 @@ pub struct CompiledRule {
 }
 
 #[derive(Debug)]
+struct CompiledExpect {
+    source: Capability,
+    pattern: Option<String>,
+    regex: Option<Regex>,
+    within: Option<Duration>,
+    max_silence: Option<Duration>,
+}
+
+#[derive(Debug)]
 pub enum MatcherOutcome {
     InProgress,
     /// All pass rules have matched. `primary_source` is the capability of
@@ -93,8 +117,9 @@ pub enum MatcherOutcome {
     Passed {
         primary_source: Capability,
     },
-    /// A fail rule fired. `primary_source` is the capability of that
-    /// specific rule, not of the first fail rule in the scenario list.
+    /// A fail rule fired, or an expectation was missed. `primary_source`
+    /// is the capability of that specific rule, not of the first fail rule
+    /// in the scenario list.
     Failed {
         rule_index: usize,
         primary_source: Capability,
@@ -105,6 +130,7 @@ pub enum MatcherOutcome {
 
 pub struct Matcher {
     rules: Vec<CompiledRule>,
+    expects: Vec<CompiledExpect>,
     /// Indices of pass rules that have already matched. Sticky: a rule that
     /// has matched stays matched.
     pass_hits: HashSet<usize>,
@@ -115,12 +141,23 @@ pub struct Matcher {
     pass_total: usize,
     /// First fail rule to match. Reported by `outcome`.
     fail_hit: Option<(usize, String)>,
+    /// Expectations (with a regex) that have been seen.
+    expect_hits: HashSet<usize>,
+    /// First expectation to be missed: (index into `expects`, reason).
+    expect_miss: Option<(usize, String)>,
     /// Rolling tail of console bytes, one buffer per source capability.
     /// Keeping them separate means a rule that names `console.serial` is
     /// only evaluated against `console.serial` bytes — output on another
     /// transport can't satisfy it, even when the board declares several
     /// and the run happens to attach more than one.
     console_bufs: BTreeMap<crate::rig::vocab::Capability, Vec<u8>>,
+    /// Deadline anchor: the end of the power step, else matching start.
+    anchor: Instant,
+    power_started: bool,
+    /// A source's own fresh boot after the power step started.
+    boot_at: BTreeMap<Capability, Instant>,
+    first_byte_at: BTreeMap<Capability, Instant>,
+    last_byte_at: BTreeMap<Capability, Instant>,
 }
 
 const CONSOLE_BUFFER_MAX: usize = 16 * 1024;
@@ -128,6 +165,15 @@ const CONSOLE_BUFFER_TRIM: usize = 8 * 1024;
 
 impl Matcher {
     pub fn new(pass: &[ObservationRule], fail: &[ObservationRule]) -> Result<Self> {
+        Self::with_expectations(pass, fail, &[], Instant::now())
+    }
+
+    pub fn with_expectations(
+        pass: &[ObservationRule],
+        fail: &[ObservationRule],
+        expect: &[ExpectRule],
+        now: Instant,
+    ) -> Result<Self> {
         let mut rules = Vec::with_capacity(pass.len() + fail.len());
         for r in pass {
             rules.push(compile_rule(r, RuleKind::Pass)?);
@@ -136,13 +182,25 @@ impl Matcher {
             rules.push(compile_rule(r, RuleKind::Fail)?);
         }
         let pass_total = rules.iter().filter(|r| r.kind == RuleKind::Pass).count();
+        let expects = expect
+            .iter()
+            .map(compile_expect)
+            .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             rules,
+            expects,
             pass_hits: HashSet::new(),
             pass_order: Vec::new(),
             pass_total,
             fail_hit: None,
+            expect_hits: HashSet::new(),
+            expect_miss: None,
             console_bufs: BTreeMap::new(),
+            anchor: now,
+            power_started: false,
+            boot_at: BTreeMap::new(),
+            first_byte_at: BTreeMap::new(),
+            last_byte_at: BTreeMap::new(),
         })
     }
 
@@ -151,18 +209,37 @@ impl Matcher {
     /// attach — every one referenced by a rule must be listening.
     pub fn console_sources(&self) -> Vec<Capability> {
         let mut out: Vec<Capability> = Vec::new();
-        for r in &self.rules {
-            if r.source.surface() == Surface::Console && !out.contains(&r.source) {
-                out.push(r.source);
+        for src in self
+            .rules
+            .iter()
+            .map(|r| r.source)
+            .chain(self.expects.iter().map(|e| e.source))
+        {
+            if src.surface() == Surface::Console && !out.contains(&src) {
+                out.push(src);
             }
         }
         out
     }
 
-    /// Observe one event and return the current outcome.
+    /// Start the deadline clock here. The orchestrator calls this when
+    /// matching begins without a power step; a `PowerDone` event does the
+    /// same thing from inside the stream.
+    pub fn set_anchor(&mut self, now: Instant) {
+        self.anchor = now;
+    }
+
+    /// Observe one event at the wall clock's "now" and return the current
+    /// outcome.
     pub fn observe(&mut self, event: &RunEvent) -> MatcherOutcome {
+        self.observe_at(event, Instant::now())
+    }
+
+    pub fn observe_at(&mut self, event: &RunEvent, now: Instant) -> MatcherOutcome {
         match event {
             RunEvent::ConsoleBytes { source, bytes } => {
+                self.first_byte_at.entry(*source).or_insert(now);
+                self.last_byte_at.insert(*source, now);
                 let buf = self.console_bufs.entry(*source).or_default();
                 buf.extend_from_slice(bytes);
                 if buf.len() > CONSOLE_BUFFER_MAX {
@@ -171,16 +248,36 @@ impl Matcher {
                 }
                 self.scan_console(*source);
             }
+            RunEvent::Boot { source } => {
+                if self.power_started {
+                    self.boot_at.insert(*source, now);
+                }
+            }
             RunEvent::DeployProgress(e) => {
                 self.scan_deploy(e);
             }
             RunEvent::TransportClosed { .. } => {
                 // Transport closure alone is not a fail condition — a
                 // disconnected serial line might still be accompanied by
-                // a successful TFTP fetch. Orchestrator decides what to
-                // do with diagnostics.
+                // a successful TFTP fetch. A `max_silence_s` rule sees the
+                // closed source go quiet and fails it in due course.
+            }
+            RunEvent::PowerStarted => {
+                self.power_started = true;
+            }
+            RunEvent::PowerDone => {
+                self.anchor = now;
             }
         }
+        self.check_deadlines(now);
+        self.current_outcome()
+    }
+
+    /// Re-evaluate deadlines with no new event. The run loop calls this at
+    /// least once a second so an expectation fails when its time is up,
+    /// not when the next byte happens to arrive.
+    pub fn tick(&mut self, now: Instant) -> MatcherOutcome {
+        self.check_deadlines(now);
         self.current_outcome()
     }
 
@@ -192,6 +289,49 @@ impl Matcher {
         }
     }
 
+    fn check_deadlines(&mut self, now: Instant) {
+        if self.expect_miss.is_some() || self.fail_hit.is_some() {
+            return;
+        }
+        for (i, e) in self.expects.iter().enumerate() {
+            if let Some(within) = e.within {
+                if !self.expect_hits.contains(&i) {
+                    let start = match self.boot_at.get(&e.source) {
+                        Some(boot) if *boot > self.anchor => *boot,
+                        _ => self.anchor,
+                    };
+                    if now.duration_since(start) >= within {
+                        self.expect_miss = Some((
+                            i,
+                            format!(
+                                "expected `{}` on {} within {}s; not seen",
+                                e.pattern.as_deref().unwrap_or("<no regex>"),
+                                e.source.as_str(),
+                                within.as_secs()
+                            ),
+                        ));
+                        return;
+                    }
+                }
+            }
+            if let Some(max_silence) = e.max_silence {
+                if let Some(last) = self.last_byte_at.get(&e.source) {
+                    if now.duration_since(*last) >= max_silence {
+                        self.expect_miss = Some((
+                            i,
+                            format!(
+                                "{} silent for {}s (max_silence_s)",
+                                e.source.as_str(),
+                                max_silence.as_secs()
+                            ),
+                        ));
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
     fn current_outcome(&self) -> MatcherOutcome {
         if let Some((idx, reason)) = &self.fail_hit {
             return MatcherOutcome::Failed {
@@ -200,7 +340,20 @@ impl Matcher {
                 reason: reason.clone(),
             };
         }
-        if self.pass_total > 0 && self.pass_hits.len() >= self.pass_total {
+        if let Some((idx, reason)) = &self.expect_miss {
+            return MatcherOutcome::Failed {
+                rule_index: self.rules.len() + *idx,
+                primary_source: self.expects[*idx].source,
+                reason: reason.clone(),
+            };
+        }
+        let expects_met = self
+            .expects
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.regex.is_some())
+            .all(|(i, _)| self.expect_hits.contains(&i));
+        if self.pass_total > 0 && self.pass_hits.len() >= self.pass_total && expects_met {
             // The pass set became complete when the LAST rule flipped to
             // matched. That rule is the one whose match finished the
             // verdict; cite it in the run record rather than whichever
@@ -264,6 +417,17 @@ impl Matcher {
                 self.pass_order.push(idx);
             }
         }
+
+        for (i, e) in self.expects.iter().enumerate() {
+            if e.source != source || self.expect_hits.contains(&i) {
+                continue;
+            }
+            if let Some(re) = &e.regex {
+                if re.is_match(&text) {
+                    self.expect_hits.insert(i);
+                }
+            }
+        }
     }
 
     fn scan_deploy(&mut self, event: &DeployEvent) {
@@ -292,6 +456,18 @@ impl Matcher {
                                     Some((idx, format!("netboot_fetch fail: {filename}")));
                             }
                         }
+                    }
+                }
+                for (i, e) in self.expects.iter().enumerate() {
+                    if e.source.as_str() != "observe.netboot_fetch" {
+                        continue;
+                    }
+                    let matched = match &e.regex {
+                        Some(re) => re.is_match(filename),
+                        None => false,
+                    };
+                    if matched {
+                        self.expect_hits.insert(i);
                     }
                 }
             }
@@ -325,7 +501,7 @@ impl Matcher {
     }
 }
 
-fn compile_rule(rule: &ObservationRule, kind: RuleKind) -> Result<CompiledRule> {
+fn build_regex(p: &str) -> Result<Regex> {
     // Anchors are per LINE. A console rule matches against the whole
     // accumulated buffer (see `scan_console`), not one line at a time, so
     // without this `$` binds to the end of everything received so far and `^`
@@ -337,13 +513,15 @@ fn compile_rule(rule: &ObservationRule, kind: RuleKind) -> Result<CompiledRule> 
     // not cross `\n`, so a pattern stays scoped to one line. Unanchored
     // patterns are unaffected: multi-line only adds match positions for the
     // anchors.
+    RegexBuilder::new(p)
+        .multi_line(true)
+        .build()
+        .map_err(|e| Error::Config(format!("rig rule: invalid regex {p:?}: {e}")))
+}
+
+fn compile_rule(rule: &ObservationRule, kind: RuleKind) -> Result<CompiledRule> {
     let regex = match &rule.regex {
-        Some(p) => Some(
-            RegexBuilder::new(p)
-                .multi_line(true)
-                .build()
-                .map_err(|e| Error::Config(format!("rig rule: invalid regex {p:?}: {e}")))?,
-        ),
+        Some(p) => Some(build_regex(p)?),
         None => None,
     };
     Ok(CompiledRule {
@@ -351,6 +529,20 @@ fn compile_rule(rule: &ObservationRule, kind: RuleKind) -> Result<CompiledRule> 
         source: rule.source,
         pattern: rule.regex.clone(),
         regex,
+    })
+}
+
+fn compile_expect(rule: &ExpectRule) -> Result<CompiledExpect> {
+    let regex = match &rule.regex {
+        Some(p) => Some(build_regex(p)?),
+        None => None,
+    };
+    Ok(CompiledExpect {
+        source: rule.source,
+        pattern: rule.regex.clone(),
+        regex,
+        within: rule.within_s.map(|s| Duration::from_secs(s as u64)),
+        max_silence: rule.max_silence_s.map(|s| Duration::from_secs(s as u64)),
     })
 }
 
@@ -392,6 +584,28 @@ mod tests {
             source: Capability::parse("console.usb_cdc").unwrap(),
             bytes: bytes.to_vec(),
         }
+    }
+
+    fn expect_within(pattern: &str, within_s: u32) -> ExpectRule {
+        ExpectRule {
+            source: Capability::parse("console.serial").unwrap(),
+            regex: Some(pattern.into()),
+            within_s: Some(within_s),
+            max_silence_s: None,
+        }
+    }
+
+    fn expect_silence(max_silence_s: u32) -> ExpectRule {
+        ExpectRule {
+            source: Capability::parse("console.serial").unwrap(),
+            regex: None,
+            within_s: None,
+            max_silence_s: Some(max_silence_s),
+        }
+    }
+
+    fn secs(n: u64) -> Duration {
+        Duration::from_secs(n)
     }
 
     #[test]
@@ -609,5 +823,140 @@ mod tests {
     fn no_rules_stays_in_progress() {
         let m = Matcher::new(&[], &[]).unwrap();
         assert!(matches!(m.finalize(), MatcherOutcome::TimedOut));
+    }
+
+    // ── expectations, on a controlled clock ───────────────────────────────
+
+    #[test]
+    fn missed_expectation_fails_by_absence_and_names_the_rule() {
+        let t0 = Instant::now();
+        let mut m = Matcher::with_expectations(
+            &[console_rule("alive")],
+            &[],
+            &[expect_within("\\[boot\\] stages=", 30)],
+            t0,
+        )
+        .unwrap();
+        // Nothing arrives; the clock advances past the deadline.
+        assert!(matches!(m.tick(t0 + secs(29)), MatcherOutcome::InProgress));
+        match m.tick(t0 + secs(30)) {
+            MatcherOutcome::Failed {
+                primary_source,
+                reason,
+                ..
+            } => {
+                assert_eq!(primary_source.as_str(), "console.serial");
+                assert!(reason.contains("\\[boot\\] stages="), "{reason}");
+                assert!(reason.contains("within 30s"), "{reason}");
+            }
+            other => panic!("expected a Failed outcome naming the rule, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn expectation_seen_in_time_does_not_fail_and_pass_needs_it() {
+        let t0 = Instant::now();
+        let mut m = Matcher::with_expectations(
+            &[console_rule("alive")],
+            &[],
+            &[expect_within("stages=", 30)],
+            t0,
+        )
+        .unwrap();
+        // The pass line alone is not enough while the expectation is unmet.
+        assert!(matches!(
+            m.observe_at(&serial_bytes(b"[sched] alive\n"), t0 + secs(5)),
+            MatcherOutcome::InProgress
+        ));
+        assert!(matches!(
+            m.observe_at(&serial_bytes(b"[boot] stages=a,b\n"), t0 + secs(10)),
+            MatcherOutcome::Passed { .. }
+        ));
+        // Long after the deadline, a met expectation never fails.
+        assert!(matches!(
+            m.tick(t0 + secs(100)),
+            MatcherOutcome::Passed { .. }
+        ));
+    }
+
+    #[test]
+    fn power_done_moves_the_anchor() {
+        let t0 = Instant::now();
+        let mut m = Matcher::with_expectations(&[], &[], &[expect_within("x", 10)], t0).unwrap();
+        // The power step takes 20 s; the deadline counts from its end.
+        assert!(matches!(
+            m.observe_at(&RunEvent::PowerStarted, t0),
+            MatcherOutcome::InProgress
+        ));
+        assert!(matches!(
+            m.observe_at(&RunEvent::PowerDone, t0 + secs(20)),
+            MatcherOutcome::InProgress
+        ));
+        assert!(matches!(m.tick(t0 + secs(29)), MatcherOutcome::InProgress));
+        assert!(matches!(
+            m.tick(t0 + secs(30)),
+            MatcherOutcome::Failed { .. }
+        ));
+    }
+
+    #[test]
+    fn a_fresh_boot_after_power_started_moves_its_sources_anchor_later() {
+        let t0 = Instant::now();
+        let boot = RunEvent::Boot {
+            source: Capability::parse("console.serial").unwrap(),
+        };
+        let mut m = Matcher::with_expectations(&[], &[], &[expect_within("x", 10)], t0).unwrap();
+        // A boot before PowerStarted is the old image: ignored.
+        m.observe_at(&boot, t0 + secs(1));
+        m.observe_at(&RunEvent::PowerStarted, t0 + secs(2));
+        m.observe_at(&RunEvent::PowerDone, t0 + secs(3));
+        // The machine only came up 40 s later; the expectation counts from then.
+        m.observe_at(&boot, t0 + secs(43));
+        assert!(matches!(m.tick(t0 + secs(52)), MatcherOutcome::InProgress));
+        assert!(matches!(
+            m.tick(t0 + secs(53)),
+            MatcherOutcome::Failed { .. }
+        ));
+    }
+
+    #[test]
+    fn max_silence_fails_only_after_the_first_byte_and_resets_on_output() {
+        let t0 = Instant::now();
+        let mut m =
+            Matcher::with_expectations(&[console_rule("done")], &[], &[expect_silence(10)], t0)
+                .unwrap();
+        // Silence before the first byte is not silence.
+        assert!(matches!(m.tick(t0 + secs(60)), MatcherOutcome::InProgress));
+        m.observe_at(&serial_bytes(b"hello\n"), t0 + secs(60));
+        assert!(matches!(m.tick(t0 + secs(69)), MatcherOutcome::InProgress));
+        m.observe_at(&serial_bytes(b"still here\n"), t0 + secs(69));
+        assert!(matches!(m.tick(t0 + secs(78)), MatcherOutcome::InProgress));
+        match m.tick(t0 + secs(79)) {
+            MatcherOutcome::Failed { reason, .. } => {
+                assert!(reason.contains("silent for 10s"), "{reason}")
+            }
+            other => panic!("expected silence failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fail_rule_beats_a_later_expectation_miss_and_vice_versa_is_first_wins() {
+        let t0 = Instant::now();
+        let mut m = Matcher::with_expectations(
+            &[],
+            &[console_rule("PANIC")],
+            &[expect_within("ok", 5)],
+            t0,
+        )
+        .unwrap();
+        match m.observe_at(&serial_bytes(b"PANIC\n"), t0 + secs(1)) {
+            MatcherOutcome::Failed { reason, .. } => assert!(reason.contains("PANIC")),
+            other => panic!("{other:?}"),
+        }
+        // The expectation's deadline passing does not rewrite the reason.
+        match m.tick(t0 + secs(10)) {
+            MatcherOutcome::Failed { reason, .. } => assert!(reason.contains("PANIC")),
+            other => panic!("{other:?}"),
+        }
     }
 }

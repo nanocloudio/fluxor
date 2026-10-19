@@ -25,6 +25,16 @@ pub struct BoardRig {
     pub observe: Vec<Capability>,
     pub power: Vec<Capability>,
     pub default_timeout_s: Option<u32>,
+    /// `[build_env]` keys a profile for this board must set: a Pico W
+    /// cannot be built for without the SSID of the network in the room.
+    pub build_env_required: Vec<String>,
+    /// `[build_env]` keys that are secrets on this board. The profile
+    /// loader refuses a literal for them; only an indirection is accepted.
+    pub build_env_secret: Vec<String>,
+    /// The images built for this board leave the host (a disk uploaded to
+    /// a cloud). No secret may be built into them, so the profile may not
+    /// carry one in `[build_env]` at all.
+    pub image_leaves_host: bool,
 }
 
 impl BoardRig {
@@ -62,6 +72,9 @@ struct BoardRigToml {
     observe: Option<Vec<String>>,
     power: Option<Vec<String>>,
     default_timeout_s: Option<u32>,
+    build_env_required: Option<Vec<String>>,
+    build_env_secret: Option<Vec<String>>,
+    image_leaves_host: Option<bool>,
 }
 
 /// Load the `[rig]` section from a board descriptor file.
@@ -242,6 +255,9 @@ fn parse_rig(t: BoardRigToml, ctx: &str) -> Result<BoardRig> {
         observe,
         power,
         default_timeout_s: t.default_timeout_s,
+        build_env_required: t.build_env_required.unwrap_or_default(),
+        build_env_secret: t.build_env_secret.unwrap_or_default(),
+        image_leaves_host: t.image_leaves_host.unwrap_or(false),
     })
 }
 
@@ -323,6 +339,26 @@ mod tests {
         assert_eq!(rig.default_timeout_s, Some(30));
         assert!(rig.supports(Capability::parse("deploy.netboot_tftp").unwrap()));
         assert!(!rig.supports(Capability::parse("deploy.uf2_mount").unwrap()));
+    }
+
+    #[test]
+    fn build_env_rules_and_image_flag_parse_with_defaults() {
+        let src = r#"
+            [rig]
+            artifact = "uf2"
+            deploy = ["deploy.picotool"]
+            build_env_required = ["WIFI_SSID"]
+            build_env_secret = ["WIFI_PASSWORD"]
+        "#;
+        let rig = parse_board_rig_str(src, "pico2w.toml").unwrap().unwrap();
+        assert_eq!(rig.build_env_required, vec!["WIFI_SSID"]);
+        assert_eq!(rig.build_env_secret, vec!["WIFI_PASSWORD"]);
+        assert!(!rig.image_leaves_host);
+        let plain = parse_board_rig_str("[rig]\nartifact = \"uf2\"\n", "x.toml")
+            .unwrap()
+            .unwrap();
+        assert!(plain.build_env_required.is_empty());
+        assert!(!plain.image_leaves_host);
     }
 
     #[test]

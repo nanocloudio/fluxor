@@ -23,6 +23,10 @@ pub struct Scenario {
     pub timeout_s: Option<u32>,
     pub pass: Vec<ObservationRule>,
     pub fail: Vec<ObservationRule>,
+    /// Deadlines: what must have appeared by when, and how long a source
+    /// may stay silent. A missed expectation fails the run and names
+    /// itself, so a timeout says where the boot stopped.
+    pub expect: Vec<ExpectRule>,
     /// Directory the scenario was loaded from. Exposed so callers resolving
     /// additional relative paths use the same anchor.
     pub scenario_dir: PathBuf,
@@ -45,6 +49,21 @@ pub struct ObservationRule {
     pub regex: Option<String>,
 }
 
+/// An `[[expect]]` entry. Two shapes, which may be combined:
+///
+///   * `regex` + `within_s`: the line must appear within `within_s` of the
+///     anchor (the end of the power step, or the source's own fresh boot
+///     if that is later);
+///   * `max_silence_s`: once the source has produced its first byte, it may
+///     never go quiet for longer than this.
+#[derive(Debug, Clone)]
+pub struct ExpectRule {
+    pub source: Capability,
+    pub regex: Option<String>,
+    pub within_s: Option<u32>,
+    pub max_silence_s: Option<u32>,
+}
+
 // ── TOML deserialization ────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -61,12 +80,22 @@ struct ScenarioFile {
     pass: Vec<RuleToml>,
     #[serde(default)]
     fail: Vec<RuleToml>,
+    #[serde(default)]
+    expect: Vec<ExpectToml>,
 }
 
 #[derive(Deserialize)]
 struct RuleToml {
     source: String,
     regex: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ExpectToml {
+    source: String,
+    regex: Option<String>,
+    within_s: Option<u32>,
+    max_silence_s: Option<u32>,
 }
 
 pub fn load_scenario(path: &Path) -> Result<Scenario> {
@@ -97,6 +126,7 @@ pub fn parse_scenario_str(raw: &str, scenario_dir: &Path, ctx: &str) -> Result<S
 
     let pass = parse_rules(&s.pass, ctx, "pass")?;
     let fail = parse_rules(&s.fail, ctx, "fail")?;
+    let expect = parse_expects(&s.expect, ctx)?;
 
     Ok(Scenario {
         name: s.name,
@@ -107,6 +137,7 @@ pub fn parse_scenario_str(raw: &str, scenario_dir: &Path, ctx: &str) -> Result<S
         timeout_s: s.timeout_s,
         pass,
         fail,
+        expect,
         scenario_dir: scenario_dir.to_path_buf(),
         source_path: None,
     })
@@ -122,27 +153,68 @@ fn parse_requires(values: &[String], ctx: &str) -> Result<Vec<Capability>> {
     Ok(out)
 }
 
+fn parse_rule_source(source: &str, ctx: &str, kind: &str, i: usize) -> Result<Capability> {
+    let source = Capability::parse(source)
+        .map_err(|e| Error::Config(format!("{ctx}: [[{kind}]][{i}].source: {e}")))?;
+    // Only transports that can produce observable bytes are valid rule
+    // sources. Power and rig-coordination surfaces cannot.
+    match source.surface() {
+        Surface::Console | Surface::Telemetry | Surface::Observe => Ok(source),
+        other => Err(Error::Config(format!(
+            "{ctx}: [[{kind}]][{i}].source: '{}' is a '{}' capability; \
+             only console/telemetry/observe sources may appear in rules",
+            source.as_str(),
+            other.as_str()
+        ))),
+    }
+}
+
 fn parse_rules(rules: &[RuleToml], ctx: &str, kind: &str) -> Result<Vec<ObservationRule>> {
     let mut out = Vec::with_capacity(rules.len());
     for (i, r) in rules.iter().enumerate() {
-        let source = Capability::parse(&r.source)
-            .map_err(|e| Error::Config(format!("{ctx}: [[{kind}]][{i}].source: {e}")))?;
-        // Only transports that can produce observable bytes are valid rule
-        // sources. Power and rig-coordination surfaces cannot.
-        match source.surface() {
-            Surface::Console | Surface::Telemetry | Surface::Observe => {}
-            other => {
-                return Err(Error::Config(format!(
-                    "{ctx}: [[{kind}]][{i}].source: '{}' is a '{}' capability; \
-                     only console/telemetry/observe sources may appear in rules",
-                    source.as_str(),
-                    other.as_str()
-                )));
-            }
-        }
+        let source = parse_rule_source(&r.source, ctx, kind, i)?;
         out.push(ObservationRule {
             source,
             regex: r.regex.clone(),
+        });
+    }
+    Ok(out)
+}
+
+fn parse_expects(rules: &[ExpectToml], ctx: &str) -> Result<Vec<ExpectRule>> {
+    let mut out = Vec::with_capacity(rules.len());
+    for (i, r) in rules.iter().enumerate() {
+        let source = parse_rule_source(&r.source, ctx, "expect", i)?;
+        match (r.regex.is_some(), r.within_s, r.max_silence_s) {
+            (false, Some(_), _) => {
+                return Err(Error::Config(format!(
+                    "{ctx}: [[expect]][{i}]: `within_s` needs a `regex` to wait for"
+                )))
+            }
+            (true, None, _) => {
+                return Err(Error::Config(format!(
+                    "{ctx}: [[expect]][{i}]: a `regex` needs `within_s` — the deadline is \
+                     what makes it an expectation rather than a [[pass]] rule"
+                )))
+            }
+            (false, None, None) => {
+                return Err(Error::Config(format!(
+                    "{ctx}: [[expect]][{i}]: nothing expected — give `regex` + `within_s`, \
+                     `max_silence_s`, or both"
+                )))
+            }
+            _ => {}
+        }
+        if r.within_s == Some(0) || r.max_silence_s == Some(0) {
+            return Err(Error::Config(format!(
+                "{ctx}: [[expect]][{i}]: a zero deadline can never be met"
+            )));
+        }
+        out.push(ExpectRule {
+            source,
+            regex: r.regex.clone(),
+            within_s: r.within_s,
+            max_silence_s: r.max_silence_s,
         });
     }
     Ok(out)
@@ -183,6 +255,7 @@ mod tests {
         assert_eq!(s.requires_tags, vec!["nvme"]);
         assert_eq!(s.pass.len(), 1);
         assert_eq!(s.fail.len(), 1);
+        assert!(s.expect.is_empty());
         assert_eq!(s.pass[0].source.as_str(), "console.serial");
     }
 
@@ -233,5 +306,50 @@ mod tests {
         "#;
         let s = parse_scenario_str(src, Path::new("/repo"), "x.toml").unwrap();
         assert!(s.requires_tags.is_empty());
+    }
+
+    #[test]
+    fn parses_expect_rules() {
+        let src = r#"
+            name = "x"
+            target = "pi5"
+            config = "x.yaml"
+            [[expect]]
+            source = "console.serial"
+            regex = "\\[boot\\] stages="
+            within_s = 30
+            [[expect]]
+            source = "console.serial"
+            max_silence_s = 40
+        "#;
+        let s = parse_scenario_str(src, Path::new("/repo"), "x.toml").unwrap();
+        assert_eq!(s.expect.len(), 2);
+        assert_eq!(s.expect[0].within_s, Some(30));
+        assert_eq!(s.expect[1].max_silence_s, Some(40));
+        assert!(s.expect[1].regex.is_none());
+    }
+
+    #[test]
+    fn expect_within_needs_regex_and_regex_needs_within() {
+        let base = r#"
+            name = "x"
+            target = "pi5"
+            config = "x.yaml"
+        "#;
+        let no_regex = format!("{base}\n[[expect]]\nsource = \"console.serial\"\nwithin_s = 5\n");
+        let err = parse_scenario_str(&no_regex, Path::new("/repo"), "x.toml").unwrap_err();
+        assert!(format!("{err}").contains("needs a `regex`"), "{err}");
+
+        let no_within =
+            format!("{base}\n[[expect]]\nsource = \"console.serial\"\nregex = \"ok\"\n");
+        let err = parse_scenario_str(&no_within, Path::new("/repo"), "x.toml").unwrap_err();
+        assert!(format!("{err}").contains("needs `within_s`"), "{err}");
+
+        let empty = format!("{base}\n[[expect]]\nsource = \"console.serial\"\n");
+        let err = parse_scenario_str(&empty, Path::new("/repo"), "x.toml").unwrap_err();
+        assert!(format!("{err}").contains("nothing expected"), "{err}");
+
+        let zero = format!("{base}\n[[expect]]\nsource = \"console.serial\"\nmax_silence_s = 0\n");
+        assert!(parse_scenario_str(&zero, Path::new("/repo"), "x.toml").is_err());
     }
 }

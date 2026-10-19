@@ -75,7 +75,9 @@ fn main() -> ExitCode {
         },
         other => {
             eprintln!("telemetry-monitor_udp: unknown verb '{other}'");
-            ExitCode::from(2)
+            // 64: the verb is unsupported, which the orchestrator tolerates for
+            // optional verbs and treats as a failure for required ones.
+            ExitCode::from(64)
         }
     }
 }
