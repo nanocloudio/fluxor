@@ -17,7 +17,7 @@ use crate::rig::profile::{BindingTable, RigProfile};
 use crate::rig::project::{BuildOutput, ProjectDescriptor};
 use crate::rig::record::RunRecord;
 use crate::rig::scenario::{ExpectRule, ObservationRule, Scenario};
-use crate::rig::vocab::{Capability, Surface};
+use crate::rig::vocab::{artifact_class_is_single_file, Capability, Surface};
 
 /// Per-verb bound on a backend when its binding sets none.
 pub const DEFAULT_ACTUATOR_TIMEOUT_S: u64 = 60;
@@ -584,13 +584,18 @@ fn pick_artifact(
     let command = crate::rig::template::substitute_command(&recipe.command, scenario)?;
     Ok(match &recipe.output {
         BuildOutput::File(path) => {
-            // Single-file artifacts only make sense when the board
-            // declares a single-file artifact class.
-            if matches!(board.artifact.as_deref(), Some("boot_bundle")) {
+            // A single-file recipe serves a single-file artifact class.
+            if board
+                .artifact
+                .as_deref()
+                .is_some_and(|c| !artifact_class_is_single_file(c))
+            {
                 ArtifactPlan::Unresolved {
-                    reason: "board artifact class is 'boot_bundle' but the project \
-                             recipe produces a single file — use 'artifact_bundle_dir'"
-                        .to_string(),
+                    reason: format!(
+                        "board artifact class is '{}' but the project recipe produces \
+                         a single file — use 'artifact_bundle_dir'",
+                        board.artifact.as_deref().unwrap_or("")
+                    ),
                 }
             } else {
                 ArtifactPlan::File {
@@ -601,11 +606,17 @@ fn pick_artifact(
             }
         }
         BuildOutput::Bundle(root) => {
-            if matches!(board.artifact.as_deref(), Some("uf2")) {
+            if board
+                .artifact
+                .as_deref()
+                .is_some_and(artifact_class_is_single_file)
+            {
                 ArtifactPlan::Unresolved {
-                    reason: "board artifact class is 'uf2' but the project recipe \
-                             produces a bundle — use 'artifact' (single file)"
-                        .to_string(),
+                    reason: format!(
+                        "board artifact class is '{}' but the project recipe produces a \
+                         bundle — use 'artifact' (single file)",
+                        board.artifact.as_deref().unwrap_or("")
+                    ),
                 }
             } else {
                 ArtifactPlan::Bundle {

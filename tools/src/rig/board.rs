@@ -121,6 +121,10 @@ const EMBEDDED_BOARDS: &[(&str, &str)] = &[
         include_str!("../../../targets/boards/qemu-virt.toml"),
     ),
     (
+        "ec2-linux-arm64",
+        include_str!("../../../targets/boards/ec2-linux-arm64.toml"),
+    ),
+    (
         "waveshare-lcd4",
         include_str!("../../../targets/boards/waveshare-lcd4.toml"),
     ),

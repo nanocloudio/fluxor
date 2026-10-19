@@ -1,0 +1,37 @@
+#!/usr/bin/env python3
+"""relay-echo — a relay double that runs the named backend locally.
+
+Never installed. Invoked as `relay-echo <surface>-<backend> <verb>` with the
+invocation on stdin; appends `relay <surface>-<backend> <verb> <relay
+binding keys>` to the relay binding's `log`, then runs the backend from
+`$FLUXOR_BACKEND_PATH` with the same verb and the same invocation, stdio
+passed through — what a relay to a bench host does over SSH.
+"""
+import json
+import os
+import subprocess
+import sys
+
+
+def main():
+    if len(sys.argv) < 3:
+        print("relay-echo: usage: relay-echo <surface>-<backend> <verb>", file=sys.stderr)
+        return 2
+    slug, verb = sys.argv[1], sys.argv[2]
+    raw = sys.stdin.read()
+    inv = json.loads(raw) if raw.strip() else {}
+    relay = inv.get("relay") or {}
+    log = relay.get("log")
+    if log:
+        with open(log, "a") as f:
+            f.write(f"relay {slug} {verb} {','.join(sorted(relay))}\n")
+    for d in os.environ.get("FLUXOR_BACKEND_PATH", "").split(":"):
+        exe = os.path.join(d, slug)
+        if d and os.access(exe, os.X_OK):
+            return subprocess.run([exe, verb], input=raw.encode()).returncode
+    print(f"relay-echo: no {slug} on FLUXOR_BACKEND_PATH", file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

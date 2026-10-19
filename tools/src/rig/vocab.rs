@@ -61,9 +61,29 @@ impl Surface {
                 "deploy.bootfs_copy",
                 "deploy.netboot_tftp",
                 "deploy.ssh_stage_reboot",
+                // A UEFI disk image becomes an AMI (EBS snapshot, then
+                // RegisterImage); the machine is the next `power.on`.
+                "deploy.ec2_ami",
+                // A hosted bundle disk becomes an EBS snapshot that the
+                // instance mounts beside a stock Linux image.
+                "deploy.ec2_hosted",
+                // A UEFI disk image gets a per-run qcow2 overlay for QEMU.
+                "deploy.qemu_disk",
             ],
-            Self::Console => &["console.serial", "console.usb_cdc", "console.netconsole"],
-            Self::Telemetry => &["telemetry.monitor_udp"],
+            Self::Console => &[
+                "console.serial",
+                "console.usb_cdc",
+                "console.netconsole",
+                // The EC2 serial console, over SSH with a per-run key.
+                "console.ec2_serial",
+                // A QEMU serial chardev's logfile, from its first byte.
+                "console.qemu_serial",
+            ],
+            Self::Telemetry => &[
+                "telemetry.monitor_udp",
+                // The telemetry ring over a QEMU virtio-console chardev.
+                "telemetry.qemu_virtio",
+            ],
             Self::Observe => &[
                 "observe.console_regex",
                 "observe.monitor_stream",
@@ -94,6 +114,10 @@ impl Surface {
                 // above them, nothing else, so an RSA identity is measured as
                 // the handshake it changes. Fluxor ships `observe-tls_load`.
                 "observe.tls_load",
+                // A packet capture delivered into `run_dir/network/`. Who
+                // captures (a bench host, the emulator's own tap) is the
+                // backend's business.
+                "observe.pcap",
             ],
             Self::Rig => &["rig.claim", "rig.release", "rig.lock"],
         }
@@ -157,7 +181,23 @@ impl std::fmt::Display for Capability {
 /// Kept as a closed set for the same reason capabilities are closed: a board
 /// that produces something genuinely new should extend this list, not invent
 /// a private string convention.
-pub const ARTIFACT_CLASSES: &[&str] = &["uf2", "kernel8_img", "boot_bundle"];
+pub const ARTIFACT_CLASSES: &[&str] = &[
+    "uf2",
+    "kernel8_img",
+    "boot_bundle",
+    // A GPT disk image with one FAT ESP: the UEFI stub and the packed
+    // kernel image. What a cloud or an emulator boots.
+    "uefi_disk",
+    // A small FAT disk image carrying a hosted runtime, its config and
+    // modules, for a machine that already runs an OS.
+    "hosted_bundle",
+];
+
+/// Every class but `boot_bundle` is one file; a recipe that produces a
+/// directory can only serve a bundle class.
+pub fn artifact_class_is_single_file(class: &str) -> bool {
+    class != "boot_bundle"
+}
 
 pub fn validate_artifact_class(s: &str) -> Result<()> {
     if ARTIFACT_CLASSES.contains(&s) {
@@ -172,6 +212,27 @@ pub fn validate_artifact_class(s: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cloud_and_emulator_names_are_in_the_vocabulary() {
+        for name in [
+            "deploy.ec2_ami",
+            "deploy.ec2_hosted",
+            "deploy.qemu_disk",
+            "console.ec2_serial",
+            "console.qemu_serial",
+            "telemetry.qemu_virtio",
+            "observe.pcap",
+        ] {
+            let c = Capability::parse(name).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(c.as_str(), name);
+        }
+        for class in ["uefi_disk", "hosted_bundle"] {
+            validate_artifact_class(class).unwrap();
+            assert!(artifact_class_is_single_file(class));
+        }
+        assert!(!artifact_class_is_single_file("boot_bundle"));
+    }
 
     #[test]
     fn parse_known_capability() {

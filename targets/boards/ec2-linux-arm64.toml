@@ -1,0 +1,30 @@
+# AWS EC2 arm64 instance running the hosted Linux runtime.
+#
+# A board that stands on a host rather than a silicon: the machine already
+# runs an operating system (a stock Debian image), and Fluxor runs on it as
+# the `linux` runtime, so the build is the host build. What the board adds is
+# the rig contract — how a run gets the runtime there, reads its console and
+# switches it off — and the fact that its images leave this host.
+#
+# Build: tools/firmware.sh ec2-linux-arm64 (the hosted runtime binary)
+
+[board]
+id = "ec2-linux-arm64"
+host = "linux"
+description = "AWS EC2 arm64 instance, hosted linux runtime"
+
+[rig]
+# A small FAT disk image: the runtime binary, its config and modules, and a
+# script that runs them. The deploy step turns it into a volume snapshot the
+# instance mounts beside its own image.
+artifact = "hosted_bundle"
+deploy = ["deploy.ec2_hosted"]
+console = ["console.ec2_serial"]
+observe = ["observe.console_regex"]
+power = ["power.cycle", "power.on", "power.off"]
+# After `running`: the cloud-init script mounts the bundle and starts the
+# runtime within a minute; the launch itself is the power step's own time.
+default_timeout_s = 180
+# The bundle is uploaded to a cloud account. No secret may be built into it,
+# so the profile may not carry one in [build_env].
+image_leaves_host = true

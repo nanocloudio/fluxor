@@ -15,7 +15,7 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::process::CommandExt;
-use std::process::{Child, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdout, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
@@ -25,6 +25,7 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::error::{Error, Result};
 use crate::rig::backend::discover::BackendRef;
 use crate::rig::backend::protocol::{BackendInvocation, TransportEvent, EXIT_UNSUPPORTED_VERB};
+use crate::rig::backend::with_relay;
 use crate::rig::events::{DeployEvent, RunEvent};
 use crate::rig::vocab::Capability;
 
@@ -125,8 +126,10 @@ pub fn attach_with_grace(
     events: Sender<RunEvent>,
     grace: Duration,
 ) -> Result<TransportHandle> {
-    let mut child = Command::new(&backend.executable)
-        .arg(verb)
+    let invocation = with_relay(invocation, &backend);
+    let invocation = &invocation;
+    let mut child = backend
+        .command(verb)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -137,8 +140,8 @@ pub fn attach_with_grace(
         .spawn()
         .map_err(|e| {
             Error::Config(format!(
-                "rig backend: spawning `{} {verb}`: {e}",
-                backend.executable.display()
+                "rig backend: spawning `{}`: {e}",
+                backend.describe(verb)
             ))
         })?;
 
@@ -303,6 +306,7 @@ mod tests {
                 surface,
                 name: name.to_string(),
                 executable: exe,
+                relay: None,
             },
             guard,
         )
@@ -320,9 +324,11 @@ mod tests {
                 board: "pi5".into(),
                 effective_timeout_ms: 10_000,
                 phase: PHASE_RUN.into(),
+                state_dir: "/tmp".into(),
             },
             artifact: None,
             args: None,
+            relay: None,
         }
     }
 

@@ -11,6 +11,7 @@
 //! A backend is an executable named `<surface>-<name>`, e.g.
 //! `power-kasa_local` or `deploy-netboot_tftp`.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
@@ -21,12 +22,78 @@ pub struct BackendRef {
     pub surface: Surface,
     pub name: String,
     pub executable: PathBuf,
+    /// Set when the binding said `relay = "<name>"`: the backend runs
+    /// through `relay-<name>` instead of directly.
+    pub relay: Option<RelayRef>,
+}
+
+/// A relay: an executable that runs a backend somewhere else (a bench
+/// host reached over SSH) with stdio passed through, so the backend
+/// protocol is unchanged. Invoked as `relay-<name> <surface>-<backend>
+/// <verb>`, with the relay's own `[relay.<name>]` binding in the
+/// invocation.
+#[derive(Debug, Clone)]
+pub struct RelayRef {
+    pub name: String,
+    pub executable: PathBuf,
+    pub binding: BTreeMap<String, super::BindingValue>,
 }
 
 impl BackendRef {
     pub fn slug(&self) -> String {
         format!("{}-{}", self.surface.as_str(), self.name)
     }
+
+    /// The process to spawn for `verb`: the backend itself, or the relay
+    /// told which backend to run.
+    pub fn command(&self, verb: &str) -> std::process::Command {
+        match &self.relay {
+            Some(relay) => {
+                let mut c = std::process::Command::new(&relay.executable);
+                c.arg(self.slug()).arg(verb);
+                c
+            }
+            None => {
+                let mut c = std::process::Command::new(&self.executable);
+                c.arg(verb);
+                c
+            }
+        }
+    }
+
+    /// What `command` runs, for messages.
+    pub fn describe(&self, verb: &str) -> String {
+        match &self.relay {
+            Some(relay) => format!("{} {} {verb}", relay.executable.display(), self.slug()),
+            None => format!("{} {verb}", self.executable.display()),
+        }
+    }
+
+    /// Run this backend through `relay`.
+    pub fn via(mut self, relay: RelayRef) -> Self {
+        self.relay = Some(relay);
+        self
+    }
+}
+
+/// Resolve a relay executable by name (`relay-<name>` on the search path).
+pub fn resolve_relay(name: &str) -> Result<PathBuf> {
+    let slug = format!("relay-{name}");
+    let paths = search_paths();
+    for dir in &paths {
+        let candidate = dir.join(&slug);
+        if is_executable(&candidate) {
+            return Ok(candidate);
+        }
+    }
+    let search_list = paths
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(Error::Config(format!(
+        "rig relay '{slug}' not found on any search path: [{search_list}]"
+    )))
 }
 
 /// Resolve a backend executable by (surface, name).
@@ -44,6 +111,7 @@ pub fn resolve(surface: Surface, name: &str) -> Result<BackendRef> {
                 surface,
                 name: name.to_string(),
                 executable: candidate,
+                relay: None,
             });
         }
     }

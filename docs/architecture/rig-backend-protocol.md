@@ -137,13 +137,15 @@ newline. The orchestrator closes stdin immediately afterwards.
     "scenario_name": "pi5_boot_banner",
     "board": "pi5",
     "effective_timeout_ms": 30000,
-    "phase": "run"
+    "phase": "run",
+    "state_dir": "/home/operator/.local/state/fluxor/labs/default/rigs/pi5-a/state"
   },
   "artifact": {
     "kind": "bundle",
     "path": "/home/operator/src/fluxor/target/bcm2712"
   },
-  "args": null
+  "args": null,
+  "relay": null
 }
 ```
 
@@ -174,6 +176,15 @@ of a scenario, `teardown` for the steps that put the rig back (also
 that behaves differently in a teardown (no retries, no waiting for a
 console) keys on it; most ignore it. Absent means `run`.
 
+`state_dir` is the rig's own directory (`0700`), kept across runs and
+serialised by the rig lock: where this rig's backends leave what a
+later step needs — the image a deploy registered, the machine a power
+step started, for the console to find. Files in it are written
+atomically (write to a temporary name, then rename) and carry
+`"schema": 1`, `run_id` and `rig`. A deploy's `unstage` and a power
+backend's `off` and `sweep` clean up what their counterparts left.
+`run_dir` is one run's record; `state_dir` is the rig's memory.
+
 ### 4.3 `artifact`
 
 Populated only for `deploy stage`. `kind` is `file` (single artifact)
@@ -184,6 +195,18 @@ or `bundle` (directory tree). `path` is absolute.
 Verb-specific input, `null` for most verbs. `hold` receives
 `{"minutes": N}`. New verbs add their own keys here rather than new
 top-level fields.
+
+### 4.5 `relay`
+
+A binding may say `relay = "<name>"`, naming a `[relay.<name>]` table
+of the same profile: the backend then runs somewhere else — a bench
+host beside the device under test — and the orchestrator spawns
+`relay-<name> <surface>-<backend> <verb>` in its place, with this
+field set to the relay's table. The relay carries the backend's stdio
+through and returns its exit code, so a backend needs no change to be
+relayed; a relay that copies `run_dir` back on shutdown gets the
+binding's `shutdown_grace_s` to do it in. The protocol is stdio-only
+for exactly this reason. `null` when the backend runs directly.
 
 ## 5. Actuator protocol
 

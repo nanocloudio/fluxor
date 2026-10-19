@@ -46,6 +46,18 @@ pub struct RigProfile {
     /// indirection is redacted in plan output, run records and profile
     /// hashes like any other secret.
     pub build_env: BindingTable,
+    /// `[relay.<name>]` tables: how to run a backend somewhere else. A
+    /// binding opts in with `relay = "<name>"`; the orchestrator spawns
+    /// `relay-<name> <surface>-<backend> <verb>` and hands the relay this
+    /// table in the invocation.
+    pub relay: BTreeMap<String, BindingTable>,
+    /// `[host]`: facts the BUILD reads from the operator's `host.toml`
+    /// (`host:…` references in a graph), overridden for this rig. The
+    /// pi5 bench's telemetry collector is one address; a cloud rig's is
+    /// another. Nested tables are allowed, as in `host.toml` itself; the
+    /// merged file is written per run and named to the build in
+    /// `FLUXOR_HOST_CONFIG`.
+    pub host: toml::Table,
 }
 
 #[derive(Debug, Clone)]
@@ -104,6 +116,11 @@ impl BindingTable {
             Some(BindingValue::Secret(s)) => Some(s.expose()),
             _ => None,
         }
+    }
+
+    /// The relay this binding runs through, when it names one.
+    pub fn relay(&self) -> Option<&str> {
+        self.optional_string("relay")
     }
 
     pub fn require_int(&self, key: &str, section: &str) -> Result<i64> {
@@ -181,13 +198,34 @@ pub fn is_secret_key(key: &str) -> bool {
 impl RigProfile {
     /// True if any binding anywhere in the profile resolved an indirection.
     pub fn has_resolved_secret(&self) -> bool {
-        self.power.as_ref().is_some_and(|p| p.has_resolved_secret())
-            || self.deploy.values().any(|b| b.has_resolved_secret())
-            || self.console.values().any(|b| b.has_resolved_secret())
-            || self.telemetry.values().any(|b| b.has_resolved_secret())
-            || self.observe.values().any(|b| b.has_resolved_secret())
+        self.bindings().any(|(_, b)| b.has_resolved_secret())
             || self.secrets.has_resolved_secret()
             || self.build_env.has_resolved_secret()
+            || self.relay.values().any(|b| b.has_resolved_secret())
+    }
+
+    /// Every backend binding with its section name: `power`,
+    /// `deploy.<cap>`, `console.<cap>`, `telemetry.<cap>`, `observe.<cap>`.
+    pub fn bindings(&self) -> impl Iterator<Item = (String, &BindingTable)> {
+        self.power
+            .iter()
+            .map(|p| ("power".to_string(), p))
+            .chain(self.deploy.iter().map(|(c, b)| (c.as_str().to_string(), b)))
+            .chain(
+                self.console
+                    .iter()
+                    .map(|(c, b)| (c.as_str().to_string(), b)),
+            )
+            .chain(
+                self.telemetry
+                    .iter()
+                    .map(|(c, b)| (c.as_str().to_string(), b)),
+            )
+            .chain(
+                self.observe
+                    .iter()
+                    .map(|(c, b)| (c.as_str().to_string(), b)),
+            )
     }
 }
 
@@ -214,6 +252,10 @@ struct ProfileFile {
     secrets: toml::Table,
     #[serde(default)]
     build_env: toml::Table,
+    #[serde(default)]
+    relay: toml::Table,
+    #[serde(default)]
+    host: toml::Table,
 }
 
 #[derive(Deserialize)]
@@ -271,8 +313,25 @@ pub fn parse_profile_str(raw: &str, path: &Path) -> Result<RigProfile> {
     let observe = load_surface_map(f.observe, Surface::Observe, &ctx)?;
     let secrets = load_binding(f.secrets, &format!("{ctx} [secrets]"), true)?;
     let build_env = load_binding(f.build_env, &format!("{ctx} [build_env]"), false)?;
+    let mut relay = BTreeMap::new();
+    for (name, value) in f.relay {
+        let inner = match value {
+            toml::Value::Table(t) => t,
+            other => {
+                return Err(Error::Config(format!(
+                    "{ctx} [relay.{name}]: expected a table, got {}",
+                    type_of(&other)
+                )))
+            }
+        };
+        relay.insert(
+            name.clone(),
+            load_binding(inner, &format!("{ctx} [relay.{name}]"), false)?,
+        );
+    }
+    check_host_table(&f.host, &format!("{ctx} [host]"))?;
 
-    Ok(RigProfile {
+    let profile = RigProfile {
         path: path.to_path_buf(),
         rig,
         power,
@@ -282,7 +341,49 @@ pub fn parse_profile_str(raw: &str, path: &Path) -> Result<RigProfile> {
         observe,
         secrets,
         build_env,
-    })
+        relay,
+        host: f.host,
+    };
+    // A binding's `relay` names a table of this profile, or the run would
+    // only find out at the one step that needs it.
+    for (section, binding) in profile.bindings() {
+        if let Some(name) = binding.relay() {
+            if !profile.relay.contains_key(name) {
+                return Err(Error::Config(format!(
+                    "{ctx} [{section}]: relay = \"{name}\" but the profile has no [relay.{name}]"
+                )));
+            }
+        }
+    }
+    Ok(profile)
+}
+
+/// `[host]` is host facts, not bindings: scalars and nested tables, no
+/// arrays (nothing in `host.toml` is a list) and no indirections — a
+/// secret has no business in a file the build reads.
+fn check_host_table(table: &toml::Table, ctx: &str) -> Result<()> {
+    for (key, value) in table {
+        match value {
+            toml::Value::Table(t) => check_host_table(t, &format!("{ctx}.{key}"))?,
+            toml::Value::String(s) if s.contains("${") => {
+                return Err(Error::Config(format!(
+                    "{ctx}.{key}: indirections are not allowed in [host]; it is written to a \
+                     file the build reads"
+                )))
+            }
+            toml::Value::String(_)
+            | toml::Value::Integer(_)
+            | toml::Value::Float(_)
+            | toml::Value::Boolean(_) => {}
+            other => {
+                return Err(Error::Config(format!(
+                    "{ctx}.{key}: unsupported value type {} in [host]",
+                    type_of(other)
+                )))
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Turn a surface-keyed table (`[deploy.netboot_tftp]`, `[deploy.uf2_mount]`,
@@ -685,6 +786,44 @@ mod tests {
             other => panic!("expected a string, got {other:?}"),
         }
         std::env::remove_var("RIG_TEST_WIFI_PASSWORD");
+    }
+
+    /// `[host]` is facts for the build: nested tables and scalars, no
+    /// indirections, no arrays.
+    #[test]
+    fn host_section_takes_nested_facts_and_refuses_indirections() {
+        let ok = r#"
+            [rig]
+            id = "rig-a"
+            board = "pi5"
+
+            [host.debug]
+            collector_ip = "10.0.0.9"
+            port = 6666
+        "#;
+        let p = parse_profile_str(ok, Path::new("/tmp/rig-a.toml")).unwrap();
+        assert_eq!(p.host["debug"]["collector_ip"].as_str(), Some("10.0.0.9"));
+
+        let secret = r#"
+            [rig]
+            id = "rig-a"
+            board = "pi5"
+
+            [host.debug]
+            collector_ip = "${env:HOME}"
+        "#;
+        let err = parse_profile_str(secret, Path::new("/tmp/rig-a.toml")).unwrap_err();
+        assert!(format!("{err}").contains("indirections"), "{err}");
+
+        let array = r#"
+            [rig]
+            id = "rig-a"
+            board = "pi5"
+
+            [host]
+            list = [1, 2]
+        "#;
+        assert!(parse_profile_str(array, Path::new("/tmp/rig-a.toml")).is_err());
     }
 
     #[test]

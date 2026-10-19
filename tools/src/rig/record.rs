@@ -350,8 +350,27 @@ pub fn canonical_profile(profile: &RigProfile) -> String {
     if !profile.build_env.is_empty() {
         emit_binding("build_env", &profile.build_env, &mut lines);
     }
+    for (name, binding) in &profile.relay {
+        emit_binding(&format!("relay.{name}"), binding, &mut lines);
+    }
+    // `[host]` changes what the build reads, so it is part of the identity
+    // in the same way `[build_env]` is.
+    emit_host_table("host", &profile.host, &mut lines);
     lines.sort();
     lines.join("\n")
+}
+
+fn emit_host_table(prefix: &str, table: &toml::Table, out: &mut Vec<String>) {
+    for (k, v) in table {
+        match v {
+            toml::Value::Table(t) => emit_host_table(&format!("{prefix}.{k}"), t, out),
+            toml::Value::String(s) => out.push(format!("{prefix}.{k}=string:{s}")),
+            toml::Value::Integer(n) => out.push(format!("{prefix}.{k}=int:{n}")),
+            toml::Value::Float(f) => out.push(format!("{prefix}.{k}=float:{f:?}")),
+            toml::Value::Boolean(b) => out.push(format!("{prefix}.{k}=bool:{b}")),
+            other => out.push(format!("{prefix}.{k}={other}")),
+        }
+    }
 }
 
 fn emit_binding(section: &str, table: &BindingTable, out: &mut Vec<String>) {
@@ -392,6 +411,31 @@ fn run_id_for(unix_secs: u64, subsec_nanos: u32, rig_id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// `[host]` and `[relay.*]` are part of what a run is built and run
+    /// with, so each changes the profile hash.
+    #[test]
+    fn host_and_relay_sections_change_the_profile_hash() {
+        use crate::rig::profile::parse_profile_str;
+        let base = "[rig]\nid = \"r\"\nboard = \"pi5\"\n\n[power]\nbackend = \"manual\"\n";
+        let plain = parse_profile_str(base, std::path::Path::new("/tmp/r.toml")).unwrap();
+        let with_host = parse_profile_str(
+            &format!("{base}\n[host.debug]\ncollector_ip = \"10.0.0.9\"\n"),
+            std::path::Path::new("/tmp/r.toml"),
+        )
+        .unwrap();
+        let with_relay = parse_profile_str(
+            &format!("{base}\n[relay.bench]\nhost = \"b\"\n"),
+            std::path::Path::new("/tmp/r.toml"),
+        )
+        .unwrap();
+        let h = |p| super::hash_profile(p);
+        assert_ne!(h(&plain), h(&with_host));
+        assert_ne!(h(&plain), h(&with_relay));
+        assert_ne!(h(&with_host), h(&with_relay));
+        assert!(super::canonical_profile(&with_host)
+            .contains("host.debug.collector_ip=string:10.0.0.9"));
+    }
+
     use super::*;
     use crate::rig::profile::parse_profile_str;
 

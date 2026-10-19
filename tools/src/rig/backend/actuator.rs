@@ -20,12 +20,13 @@
 use std::io::{Read, Write};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
 use crate::rig::backend::discover::BackendRef;
 use crate::rig::backend::protocol::{ActuatorReport, BackendInvocation, EXIT_UNSUPPORTED_VERB};
+use crate::rig::backend::with_relay;
 
 /// How to run one actuator call.
 #[derive(Debug, Clone)]
@@ -79,8 +80,10 @@ pub fn invoke_with(
     invocation: &BackendInvocation,
     options: &InvokeOptions,
 ) -> Result<ActuatorOutcome> {
-    let mut child = Command::new(&backend.executable)
-        .arg(verb)
+    let invocation = with_relay(invocation, backend);
+    let invocation = &invocation;
+    let mut child = backend
+        .command(verb)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -92,8 +95,8 @@ pub fn invoke_with(
         .spawn()
         .map_err(|e| {
             Error::Config(format!(
-                "rig backend: spawning `{} {verb}`: {e}",
-                backend.executable.display()
+                "rig backend: spawning `{}`: {e}",
+                backend.describe(verb)
             ))
         })?;
     let pgid = child.id() as libc::pid_t;
@@ -348,6 +351,7 @@ mod tests {
                 surface: Surface::Power,
                 name: name.to_string(),
                 executable: exe,
+                relay: None,
             },
             guard,
         )
@@ -367,9 +371,11 @@ mod tests {
                 board: "pi5".into(),
                 effective_timeout_ms: 10_000,
                 phase: PHASE_RUN.into(),
+                state_dir: "/tmp".into(),
             },
             artifact: None,
             args: None,
+            relay: None,
         }
     }
 

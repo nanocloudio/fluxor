@@ -32,9 +32,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::error::{Error, Result};
 use crate::rig::backend::{
-    attach_with_grace, context_from_plan, invoke_with, resolve as resolve_backend, wire_artifact,
-    wire_binding, ActuatorOutcome, BackendContext, BackendInvocation, BackendRef, InvokeOptions,
-    TransportHandle, PHASE_ADHOC, PHASE_RUN, PHASE_TEARDOWN,
+    attach_with_grace, context_from_plan, invoke_with, resolve as resolve_backend, resolve_relay,
+    wire_artifact, wire_binding, ActuatorOutcome, BackendContext, BackendInvocation, BackendRef,
+    InvokeOptions, RelayRef, TransportHandle, PHASE_ADHOC, PHASE_RUN, PHASE_TEARDOWN,
 };
 use crate::rig::events::{DeployEvent, RunEvent};
 use crate::rig::lock::{
@@ -141,7 +141,7 @@ pub fn execute_plan(plan: &Plan, profile: &RigProfile, options: &RunOptions) -> 
         plan.effective_timeout_s,
     );
     let lock_guard = claim(&lock_path, &owner, options.force_lock, profile, options)?;
-    ensure_state_dir(&lock_path)?;
+    let state_dir = ensure_state_dir(&lock_path)?;
 
     // Run dir (used by the backend context AND by the console log writer).
     let run_dir = run_dir_for(plan);
@@ -175,7 +175,7 @@ pub fn execute_plan(plan: &Plan, profile: &RigProfile, options: &RunOptions) -> 
             ),
         );
     }
-    let built = match run_build(plan, profile, options) {
+    let built = match run_build(plan, profile, options, &run_dir) {
         Ok(b) => b,
         Err(e) => return finish_aborted(record, &run_dir, lock_guard, e),
     };
@@ -192,7 +192,7 @@ pub fn execute_plan(plan: &Plan, profile: &RigProfile, options: &RunOptions) -> 
     TeardownMarker::new(&plan.rig, &record.run_id, &run_dir).write(&marker_path)?;
     lock_guard.set_expected_end(now_unix_secs() + plan.lifecycle_budget_s)?;
 
-    let mut session = Session::new(plan, &backends, &run_dir, options);
+    let mut session = Session::new(plan, &backends, &run_dir, &state_dir, options);
     let outcome = session.run();
     record.verdict = outcome.verdict.clone();
     record.primary_observation_source = outcome.primary_source;
@@ -328,7 +328,12 @@ impl<'a> Backends<'a> {
             ))
         })?;
         let deploy = (
-            resolve_backend(Surface::Deploy, capability_name(plan.deploy.capability))?,
+            resolve_bound(
+                Surface::Deploy,
+                capability_name(plan.deploy.capability),
+                deploy_binding,
+                profile,
+            )?,
             deploy_binding,
         );
         let mut consoles = Vec::new();
@@ -341,7 +346,12 @@ impl<'a> Backends<'a> {
             })?;
             consoles.push((
                 c.capability,
-                resolve_backend(Surface::Console, capability_name(c.capability))?,
+                resolve_bound(
+                    Surface::Console,
+                    capability_name(c.capability),
+                    binding,
+                    profile,
+                )?,
                 binding,
             ));
         }
@@ -355,7 +365,12 @@ impl<'a> Backends<'a> {
                 })?;
                 Some((
                     t.capability,
-                    resolve_backend(Surface::Telemetry, capability_name(t.capability))?,
+                    resolve_bound(
+                        Surface::Telemetry,
+                        capability_name(t.capability),
+                        binding,
+                        profile,
+                    )?,
                     binding,
                 ))
             }
@@ -371,14 +386,22 @@ impl<'a> Backends<'a> {
             })?;
             observers.push((
                 o.capability,
-                resolve_backend(Surface::Observe, capability_name(o.capability))?,
+                resolve_bound(
+                    Surface::Observe,
+                    capability_name(o.capability),
+                    binding,
+                    profile,
+                )?,
                 binding,
             ));
         }
         let power = match profile.power.as_ref() {
             Some(binding) => {
                 let name = binding.require_string("backend", "power")?;
-                Some((resolve_backend(Surface::Power, name)?, binding))
+                Some((
+                    resolve_bound(Surface::Power, name, binding, profile)?,
+                    binding,
+                ))
             }
             None => None,
         };
@@ -398,6 +421,34 @@ impl<'a> Backends<'a> {
             power,
         })
     }
+}
+
+/// Resolve a backend for a binding, through the relay the binding names
+/// (`relay = "<name>"`) when it names one. The relay's own `[relay.<name>]`
+/// binding rides along in every invocation.
+pub(crate) fn resolve_bound(
+    surface: Surface,
+    name: &str,
+    binding: &BindingTable,
+    profile: &RigProfile,
+) -> Result<BackendRef> {
+    let backend = resolve_backend(surface, name)?;
+    let Some(relay_name) = binding.relay() else {
+        return Ok(backend);
+    };
+    let relay_binding = profile.relay.get(relay_name).ok_or_else(|| {
+        Error::Config(format!(
+            "rig: {} runs through relay '{relay_name}' but the profile has no \
+             [relay.{relay_name}]",
+            backend.slug()
+        ))
+    })?;
+    let executable = resolve_relay(relay_name)?;
+    Ok(backend.via(RelayRef {
+        name: relay_name.to_string(),
+        executable,
+        binding: wire_binding(relay_binding),
+    }))
 }
 
 fn invoke_options(
@@ -525,6 +576,7 @@ struct Session<'a> {
     plan: &'a Plan,
     backends: &'a Backends<'a>,
     run_dir: &'a Path,
+    state_dir: &'a Path,
     options: &'a RunOptions,
     reports: crate::rig::record::Reports,
     rx: mpsc::Receiver<RunEvent>,
@@ -543,6 +595,7 @@ impl<'a> Session<'a> {
         plan: &'a Plan,
         backends: &'a Backends<'a>,
         run_dir: &'a Path,
+        state_dir: &'a Path,
         options: &'a RunOptions,
     ) -> Self {
         let (tx, rx) = mpsc::channel::<RunEvent>();
@@ -550,6 +603,7 @@ impl<'a> Session<'a> {
             plan,
             backends,
             run_dir,
+            state_dir,
             options,
             reports: Default::default(),
             rx,
@@ -566,7 +620,7 @@ impl<'a> Session<'a> {
     }
 
     fn context(&self, phase: &str) -> BackendContext {
-        context_from_plan(self.plan, self.run_dir, phase)
+        context_from_plan(self.plan, self.run_dir, self.state_dir, phase)
     }
 
     fn invocation(&self, binding: &BindingTable, phase: &str) -> BackendInvocation {
@@ -575,6 +629,7 @@ impl<'a> Session<'a> {
             context: self.context(phase),
             artifact: None,
             args: None,
+            relay: None,
         }
     }
 
@@ -592,6 +647,7 @@ impl<'a> Session<'a> {
             context: self.context(PHASE_RUN),
             artifact: wire_artifact(&self.plan.artifact),
             args: None,
+            relay: None,
         };
         let opts = invoke_options(
             self.backends.deploy.1,
@@ -970,6 +1026,7 @@ fn run_teardown_steps(
                 context: context.clone(),
                 artifact: None,
                 args: None,
+                relay: None,
             };
             let opts = invoke_options(
                 binding,
@@ -1000,6 +1057,7 @@ fn run_teardown_steps(
                 context: context.clone(),
                 artifact: None,
                 args: None,
+                relay: None,
             };
             let opts = invoke_options(
                 binding,
@@ -1029,6 +1087,7 @@ fn run_teardown_steps(
             context: context.clone(),
             artifact: None,
             args: None,
+            relay: None,
         };
         let opts = invoke_options(
             binding,
@@ -1082,6 +1141,7 @@ pub fn teardown_rig(
     };
     std::fs::create_dir_all(&run_dir)
         .map_err(|e| Error::Config(format!("rig teardown: creating {}: {e}", run_dir.display())))?;
+    let state_dir = ensure_state_dir(lock_path)?;
     let context = BackendContext {
         rig_id: profile.rig.id.clone(),
         lab,
@@ -1091,17 +1151,21 @@ pub fn teardown_rig(
         board: profile.rig.board.clone(),
         effective_timeout_ms: options.actuator_timeout.as_millis() as u64,
         phase: PHASE_TEARDOWN.to_string(),
+        state_dir: state_dir.display().to_string(),
     };
     let power_backend = match profile.power.as_ref() {
         Some(binding) => {
             let name = binding.require_string("backend", "power")?;
-            Some((resolve_backend(Surface::Power, name)?, binding))
+            Some((
+                resolve_bound(Surface::Power, name, binding, profile)?,
+                binding,
+            ))
         }
         None => None,
     };
     let mut deploy_backends: Vec<(BackendRef, &BindingTable)> = Vec::new();
     for (cap, binding) in &profile.deploy {
-        match resolve_backend(Surface::Deploy, capability_name(*cap)) {
+        match resolve_bound(Surface::Deploy, capability_name(*cap), binding, profile) {
             Ok(b) => deploy_backends.push((b, binding)),
             Err(e) => eprintln!("[rig] teardown: skipping {}: {e}", cap.as_str()),
         }
@@ -1192,7 +1256,12 @@ pub fn adhoc_power_under_guard(
         .power
         .as_ref()
         .ok_or_else(|| Error::Config("rig power: profile has no [power] section".into()))?;
-    let backend = resolve_backend(Surface::Power, binding.require_string("backend", "power")?)?;
+    let backend = resolve_bound(
+        Surface::Power,
+        binding.require_string("backend", "power")?,
+        binding,
+        profile,
+    )?;
     let marker_path = marker_path_for(lock_path);
     TeardownMarker::new(&profile.rig.id, &run_id, &run_dir).write(&marker_path)?;
     let timeout = binding
@@ -1209,12 +1278,14 @@ pub fn adhoc_power_under_guard(
         board: profile.rig.board.clone(),
         effective_timeout_ms: timeout.as_millis() as u64,
         phase: PHASE_ADHOC.to_string(),
+        state_dir: state_dir.display().to_string(),
     };
     let invocation = BackendInvocation {
         binding: wire_binding(binding),
         context: context.clone(),
         artifact: None,
         args: None,
+        relay: None,
     };
     let opts = invoke_options(
         binding,
@@ -1301,6 +1372,7 @@ fn run_build(
     plan: &Plan,
     profile: &RigProfile,
     options: &RunOptions,
+    run_dir: &Path,
 ) -> Result<Option<ArtifactOutput>> {
     if options.skip_build {
         return Ok(plan_artifact_to_output(plan));
@@ -1366,6 +1438,13 @@ fn run_build(
         names.sort_unstable();
         eprintln!("[rig] build env from profile: {}", names.join(", "));
     }
+    // Host facts the build reads (`host:…` in a graph), with this rig's
+    // `[host]` laid over the operator's file. Written per run, so the run
+    // record's directory holds exactly what the build saw.
+    if let Some(path) = write_host_config(profile, run_dir)? {
+        cmd.env("FLUXOR_HOST_CONFIG", &path);
+        eprintln!("[rig] host config for the build: {}", path.display());
+    }
     let status = cmd
         .status()
         .map_err(|e| Error::Config(format!("rig run: spawning build `{}`: {e}", &command[0])))?;
@@ -1375,6 +1454,43 @@ fn run_build(
         )));
     }
     Ok(Some(out))
+}
+
+/// `run_dir/host.toml`: the operator's host config with the profile's
+/// `[host]` merged over it, table by table. `None` when the profile has
+/// no `[host]` — the build then reads the operator's file as usual.
+fn write_host_config(profile: &RigProfile, run_dir: &Path) -> Result<Option<PathBuf>> {
+    if profile.host.is_empty() {
+        return Ok(None);
+    }
+    let mut merged = match crate::stack_expand::host_config_path() {
+        Some(p) if p.is_file() => {
+            let raw = std::fs::read_to_string(&p)
+                .map_err(|e| Error::Config(format!("rig run: reading {}: {e}", p.display())))?;
+            toml::from_str::<toml::Table>(&raw)
+                .map_err(|e| Error::Config(format!("rig run: parsing {}: {e}", p.display())))?
+        }
+        _ => toml::Table::new(),
+    };
+    merge_tables(&mut merged, &profile.host);
+    let path = run_dir.join("host.toml");
+    let text = toml::to_string(&merged)
+        .map_err(|e| Error::Config(format!("rig run: rendering host config: {e}")))?;
+    std::fs::write(&path, text)
+        .map_err(|e| Error::Config(format!("rig run: writing {}: {e}", path.display())))?;
+    Ok(Some(path))
+}
+
+/// Lay `over` on `base`: tables merge, anything else replaces.
+fn merge_tables(base: &mut toml::Table, over: &toml::Table) {
+    for (k, v) in over {
+        match (base.get_mut(k), v) {
+            (Some(toml::Value::Table(b)), toml::Value::Table(o)) => merge_tables(b, o),
+            _ => {
+                base.insert(k.clone(), v.clone());
+            }
+        }
+    }
 }
 
 fn plan_artifact_to_output(plan: &Plan) -> Option<ArtifactOutput> {

@@ -53,6 +53,7 @@ impl Bench {
                 include_str!("../testdata/deploy-bootfs_copy"),
             ),
             ("console-serial", include_str!("../testdata/console-serial")),
+            ("relay-echo", include_str!("../testdata/relay-echo")),
         ] {
             let p = backends.join(name);
             std::fs::write(&p, body).unwrap();
@@ -96,8 +97,21 @@ impl Bench {
         deploy_extra: &str,
         scenario_extra: &str,
     ) -> (Plan, RigProfile) {
+        self.plan_with(power_extra, deploy_extra, scenario_extra, "")
+    }
+
+    /// `plan`, plus whole sections appended to the profile.
+    fn plan_with(
+        &self,
+        power_extra: &str,
+        deploy_extra: &str,
+        scenario_extra: &str,
+        profile_extra: &str,
+    ) -> (Plan, RigProfile) {
         let profile_src = format!(
             r#"
+            {profile_extra}
+
             [rig]
             id = "rig-a"
             board = "stub"
@@ -539,4 +553,122 @@ fn teardown_rig_outside_a_run_uses_every_deploy_binding_and_writes_a_record() {
     assert!(record.clean);
     let log = bench.recorded();
     assert_eq!(log, vec!["off teardown", "unstage teardown"]);
+}
+
+/// Every backend is told the rig's state directory, and it exists before
+/// the first step: a deploy leaves what the power step needs there.
+#[test]
+fn backends_share_the_rig_state_dir() {
+    let bench = Bench::new("state-dir");
+    let (plan, profile) = bench.plan("", "", "");
+    let outcome = execute_plan(&plan, &profile, &RunOptions::default()).unwrap();
+    assert_eq!(outcome.record.verdict, Verdict::Passed);
+    let state_dir = crate::rig::lock::state_dir_for(&bench.lock_path());
+    let staged: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(state_dir.join("staged.json")).unwrap())
+            .unwrap();
+    assert_eq!(staged["run_id"], outcome.record.run_id);
+    let mode = std::fs::metadata(&state_dir).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o700, "state dir is private");
+}
+
+/// A binding that names a relay runs its backend through `relay-<name>`
+/// with the relay's own binding in the invocation — on every verb,
+/// teardown included.
+#[test]
+fn a_binding_through_a_relay_runs_its_backend_via_the_relay() {
+    let bench = Bench::new("relay");
+    let relay_log = bench.home.join("relay.log");
+    let (plan, profile) = bench.plan_with(
+        "relay = \"echo\"",
+        "",
+        "",
+        &format!(
+            "[relay.echo]\nlog = \"{}\"\nhost = \"bench\"",
+            relay_log.display()
+        ),
+    );
+    let outcome = execute_plan(&plan, &profile, &RunOptions::default()).unwrap();
+    assert_eq!(outcome.record.verdict, Verdict::Passed);
+    let relayed: Vec<String> = std::fs::read_to_string(&relay_log)
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        relayed,
+        vec![
+            "relay power-recorder cycle host,log",
+            "relay power-recorder off host,log",
+        ],
+        "{relayed:?}"
+    );
+    // The backend itself still ran, through the relay.
+    let log = bench.recorded();
+    assert!(position(&log, "cycle run") < position(&log, "off teardown"));
+    // The deploy binding named no relay and went direct.
+    assert!(
+        !relayed.iter().any(|l| l.contains("deploy-")),
+        "{relayed:?}"
+    );
+}
+
+/// A binding may only name a relay the profile defines.
+#[test]
+fn a_relay_the_profile_does_not_define_is_refused_at_load() {
+    let src = r#"
+        [rig]
+        id = "rig-a"
+        board = "stub"
+
+        [power]
+        backend = "recorder"
+        relay = "bench"
+    "#;
+    let err = parse_profile_str(src, Path::new("/tmp/rig-a.toml")).unwrap_err();
+    let msg = format!("{err}");
+    assert!(msg.contains("[relay.bench]"), "{msg}");
+}
+
+/// `[host]` is laid over the operator's host config, table by table, and
+/// the build is pointed at the result.
+#[test]
+fn profile_host_facts_override_the_operator_host_config_for_the_build() {
+    let bench = Bench::new("host-config");
+    let base = bench.home.join("host.toml");
+    std::fs::write(
+        &base,
+        "[debug]\ncollector_ip = \"192.0.2.1\"\nport = 6666\n\n[other]\nkeep = true\n",
+    )
+    .unwrap();
+    let saved = std::env::var_os("FLUXOR_HOST_CONFIG");
+    std::env::set_var("FLUXOR_HOST_CONFIG", &base);
+    let (_plan, profile) =
+        bench.plan_with("", "", "", "[host.debug]\ncollector_ip = \"10.0.0.9\"\n");
+    let run_dir = bench.home.join("run-x");
+    std::fs::create_dir_all(&run_dir).unwrap();
+    let written = super::write_host_config(&profile, &run_dir)
+        .unwrap()
+        .unwrap();
+    match saved {
+        Some(v) => std::env::set_var("FLUXOR_HOST_CONFIG", v),
+        None => std::env::remove_var("FLUXOR_HOST_CONFIG"),
+    }
+    let merged: toml::Table = toml::from_str(&std::fs::read_to_string(&written).unwrap()).unwrap();
+    assert_eq!(merged["debug"]["collector_ip"].as_str(), Some("10.0.0.9"));
+    assert_eq!(
+        merged["debug"]["port"].as_integer(),
+        Some(6666),
+        "sibling keys survive"
+    );
+    assert_eq!(
+        merged["other"]["keep"].as_bool(),
+        Some(true),
+        "other tables survive"
+    );
+    // A profile with no [host] leaves the build on the operator's file.
+    let (_plan, plain) = bench.plan("", "", "");
+    assert!(super::write_host_config(&plain, &run_dir)
+        .unwrap()
+        .is_none());
 }

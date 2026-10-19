@@ -29,8 +29,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::error::{Error, Result};
 use crate::rig::backend::{
-    invoke_with, resolve as resolve_backend, wire_binding, ActuatorOutcome, BackendContext,
-    BackendInvocation, InvokeOptions, PHASE_ADHOC,
+    invoke_with, wire_binding, ActuatorOutcome, BackendContext, BackendInvocation, InvokeOptions,
+    PHASE_ADHOC,
 };
 use crate::rig::lock::{
     acquire as acquire_lock, default_lock_path, marker_path_for, rig_state_root, state_dir_for,
@@ -39,7 +39,8 @@ use crate::rig::lock::{
 use crate::rig::plan::DEFAULT_ACTUATOR_TIMEOUT_S;
 use crate::rig::record::Verdict;
 use crate::rig::run::{
-    adhoc_power_under_guard, execute_plan, install_signal_handlers, teardown_rig, RunOptions,
+    adhoc_power_under_guard, execute_plan, install_signal_handlers, resolve_bound, teardown_rig,
+    RunOptions,
 };
 use crate::rig::vocab::Surface;
 use crate::rig::{
@@ -483,7 +484,7 @@ fn cmd_power(args: PowerArgs) -> Result<()> {
         ))
     })?;
     let backend_name = power_binding.require_string("backend", "power")?;
-    let backend = resolve_backend(Surface::Power, backend_name)?;
+    let backend = resolve_bound(Surface::Power, backend_name, power_binding, &profile)?;
 
     // The public board contract enumerates which power verbs a target
     // supports (e.g. picow declares cycle, off, on). `rig power` must
@@ -635,9 +636,11 @@ fn cmd_power(args: PowerArgs) -> Result<()> {
             board: profile.rig.board.clone(),
             effective_timeout_ms: timeout.as_millis() as u64,
             phase: PHASE_ADHOC.to_string(),
+            state_dir: state_dir_for(&lock_path).display().to_string(),
         },
         artifact: None,
         args: None,
+        relay: None,
     };
     let invoke_options = InvokeOptions {
         timeout,
@@ -785,7 +788,12 @@ fn teardown_one(lab: &str, rig_id: &str, force: bool) -> Result<RigProfile> {
 /// anywhere this binding can see. Unsupported is fine.
 fn sweep(lab: &str, profile: &RigProfile) -> Result<()> {
     let binding = profile.power.as_ref().expect("caller checked");
-    let backend = resolve_backend(Surface::Power, binding.require_string("backend", "power")?)?;
+    let backend = resolve_bound(
+        Surface::Power,
+        binding.require_string("backend", "power")?,
+        binding,
+        profile,
+    )?;
     let timeout = binding
         .actuator_timeout()
         .unwrap_or(Duration::from_secs(DEFAULT_ACTUATOR_TIMEOUT_S));
@@ -801,9 +809,13 @@ fn sweep(lab: &str, profile: &RigProfile) -> Result<()> {
             board: profile.rig.board.clone(),
             effective_timeout_ms: timeout.as_millis() as u64,
             phase: crate::rig::backend::PHASE_TEARDOWN.to_string(),
+            state_dir: default_lock_path(lab, &profile.rig.id)
+                .map(|l| state_dir_for(&l).display().to_string())
+                .unwrap_or_default(),
         },
         artifact: None,
         args: None,
+        relay: None,
     };
     let opts = InvokeOptions {
         timeout,

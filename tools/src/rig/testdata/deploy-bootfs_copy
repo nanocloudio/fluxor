@@ -8,6 +8,7 @@ the power step. `watch` is unsupported (exit 64). `unstage` succeeds.
 Binding `fail_stage` makes `stage` exit 1; `stage_64` makes it exit 64.
 """
 import json
+import os
 import sys
 
 UNSUPPORTED = 64
@@ -26,6 +27,12 @@ def main():
     if verb == "stage":
         if binding.get("stage_64"):
             return UNSUPPORTED
+        state_dir = (inv.get("context", {}) or {}).get("state_dir")
+        if state_dir:
+            # What a real deploy leaves for the power step: here, the
+            # proof that the directory was named and is writable.
+            with open(os.path.join(state_dir, "staged.json"), "w") as f:
+                json.dump({"schema": 1, "run_id": inv["context"]["run_id"]}, f)
         if binding.get("fail_stage"):
             print("stage: artifact missing", file=sys.stderr)
             return 1

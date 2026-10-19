@@ -348,7 +348,12 @@ struct TomlBoardFlash {
 #[derive(Deserialize)]
 struct TomlBoardMeta {
     id: String,
-    silicon: String,
+    /// The die under the board. Exactly one of `silicon` and `host`.
+    silicon: Option<String>,
+    /// The host target the board runs on, for a board that is a machine
+    /// with an operating system (a cloud instance running the hosted
+    /// runtime): it resolves through `targets/host/<host>.toml`.
+    host: Option<String>,
     description: String,
 }
 
@@ -860,20 +865,49 @@ fn load_board_target(board_path: &Path, targets_dir: &Path) -> Result<TargetDesc
     let board: TomlBoardFile = toml::from_str(&content)
         .map_err(|e| Error::Config(format!("Failed to parse {}: {}", board_path.display(), e)))?;
 
-    // Load referenced silicon target
-    let silicon_path = targets_dir
-        .join("silicon")
-        .join(format!("{}.toml", board.board.silicon));
-    if !silicon_path.exists() {
+    // Load the referenced silicon target — or, for a hosted board, the
+    // host target it runs on.
+    let (base_path, base_kind) = match (&board.board.silicon, &board.board.host) {
+        (Some(silicon), None) => (
+            targets_dir.join("silicon").join(format!("{silicon}.toml")),
+            TargetKind::Silicon,
+        ),
+        (None, Some(host)) => (
+            targets_dir.join("host").join(format!("{host}.toml")),
+            TargetKind::Host,
+        ),
+        (Some(_), Some(_)) => {
+            return Err(Error::Config(format!(
+                "Board '{}' names both a silicon and a host; a board stands on one",
+                board.board.id
+            )))
+        }
+        (None, None) => {
+            return Err(Error::Config(format!(
+                "Board '{}' names neither a silicon nor a host",
+                board.board.id
+            )))
+        }
+    };
+    if !base_path.exists() {
         return Err(Error::Config(format!(
-            "Board '{}' references silicon '{}', but {} not found",
+            "Board '{}' references {} '{}', but {} not found",
             board.board.id,
-            board.board.silicon,
-            silicon_path.display()
+            match base_kind {
+                TargetKind::Host => "host",
+                _ => "silicon",
+            },
+            board
+                .board
+                .silicon
+                .as_deref()
+                .or(board.board.host.as_deref())
+                .unwrap_or(""),
+            base_path.display()
         )));
     }
 
-    let mut desc = load_silicon_target(&silicon_path, TargetKind::Silicon)?;
+    let mut desc = load_silicon_target(&base_path, base_kind)?;
     desc.kind = TargetKind::Board;
 
     // Overlay board info
@@ -1088,6 +1122,23 @@ mod tests {
             let desc = super::load_target(target, &root).expect("target loads");
             assert!(desc.graph_flash().is_none(), "`{target}` has no XIP flash");
         }
+    }
+
+    /// A board that stands on a host (`[board] host = "linux"`) resolves
+    /// through `targets/host/`, builds as that host, and is still a board.
+    #[test]
+    fn a_hosted_board_resolves_through_its_host() {
+        let root = repo_root();
+        let desc = super::load_target("ec2-linux-arm64", &root).expect("hosted board loads");
+        let host = super::load_target("linux", &root).expect("host loads");
+        assert_eq!(desc.kind, super::TargetKind::Board);
+        assert_eq!(desc.board_id.as_deref(), Some("ec2-linux-arm64"));
+        assert_eq!(desc.runtime(), host.runtime());
+        assert_eq!(desc.module_abi(), host.module_abi());
+        assert_eq!(
+            desc.build.as_ref().map(|b| b.rust_target.clone()),
+            host.build.as_ref().map(|b| b.rust_target.clone())
+        );
     }
 
     /// Every target names a runtime and ABI the table knows, and the

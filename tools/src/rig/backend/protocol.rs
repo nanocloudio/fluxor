@@ -35,6 +35,11 @@ pub struct BackendInvocation {
     /// `{"minutes": N}`; every other verb today receives nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub args: Option<serde_json::Value>,
+    /// The `[relay.<name>]` binding when the backend runs through a relay
+    /// (the binding said `relay = "<name>"`). Filled in at spawn, from
+    /// the resolved backend, so no builder of an invocation needs to know.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay: Option<BTreeMap<String, BindingValue>>,
 }
 
 /// The lifecycle phase an invocation belongs to. A backend that behaves
@@ -58,6 +63,11 @@ pub struct BackendContext {
     /// in an invocation written by an older core means `run`.
     #[serde(default = "phase_run")]
     pub phase: String,
+    /// The rig's own directory, `0700`, kept across runs and serialised by
+    /// the rig lock: where this rig's backends leave what the next step
+    /// needs (the image a deploy made, the machine a power step started).
+    #[serde(default)]
+    pub state_dir: String,
 }
 
 fn phase_run() -> String {

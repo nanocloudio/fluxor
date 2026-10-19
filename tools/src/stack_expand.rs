@@ -119,7 +119,14 @@ fn load_host_config() -> Result<HostConfig> {
     }
 }
 
-fn host_config_path() -> Option<PathBuf> {
+/// Where the build reads host facts from: `$FLUXOR_HOST_CONFIG` when set
+/// (a rig run writes the merged file per run and names it here, so a
+/// rig's own collector address wins without redirecting every other
+/// `$XDG_CONFIG_HOME` lookup), else `$XDG_CONFIG_HOME/fluxor/host.toml`.
+pub fn host_config_path() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("FLUXOR_HOST_CONFIG").filter(|s| !s.is_empty()) {
+        return Some(PathBuf::from(p));
+    }
     let base = if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|s| !s.is_empty()) {
         Some(PathBuf::from(xdg))
     } else {

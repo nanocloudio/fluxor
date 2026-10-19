@@ -51,7 +51,19 @@ toml_get() {
     ' "$3"
 }
 
-if [[ -f "$BOARD_TOML" ]]; then
+# A board that stands on a host (`[board] host = "linux"`: a machine with
+# an operating system, running the hosted runtime) builds as that host.
+if [[ -f "$BOARD_TOML" && -n "$(toml_get board host "$BOARD_TOML")" ]]; then
+    HOST_TOML="targets/host/$(toml_get board host "$BOARD_TOML").toml"
+    [[ -f "$HOST_TOML" ]] || {
+        echo "firmware: board '$TARGET' names a host with no $HOST_TOML" >&2
+        exit 2
+    }
+    SILICON=""
+    RUST_TARGET="$(toml_get build rust_target "$HOST_TOML")"
+    FEATURES="$(toml_get build cargo_features "$BOARD_TOML")"
+    [[ -n "$FEATURES" ]] || FEATURES="$(toml_get build cargo_features "$HOST_TOML")"
+elif [[ -f "$BOARD_TOML" ]]; then
     SILICON="$(toml_get board silicon "$BOARD_TOML")"
     SILICON_TOML="targets/silicon/$SILICON.toml"
     [[ -n "$SILICON" && -f "$SILICON_TOML" ]] || {

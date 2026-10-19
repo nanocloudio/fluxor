@@ -115,6 +115,15 @@ it needs (`build_env_required`) and which are secrets
 (`build_env_secret`); a profile missing a required name is refused at
 plan time.
 
+A profile may also carry `[host]`: facts the build reads from your
+`host.toml` (`host:…` in a graph), overridden for this rig — a cloud
+rig's telemetry collector is not the address the bench next to you uses.
+The merged file is written into the run's directory and the build is
+pointed at it, so the run record holds exactly what the build saw. And a
+binding may say `relay = "<name>"` with a matching `[relay.<name>]` table
+to run its backend on another machine, for observers that must sit
+beside a device no cable reaches.
+
 A secret is never written in a profile. A key whose name says secret —
 `password`, `token`, `psk`, `passphrase`, `secret`, alone or as a
 suffix — and anything under `[secrets]` must be a `${file:…}` or
@@ -144,6 +153,19 @@ declares that shape in `targets/boards/pi5.toml` as capabilities —
 supplies a backend executable for each. The profile again carries the
 bench's own values — the board's address, the TFTP root, the serial port,
 the power backend's credentials — and again lives outside the tree.
+
+## A machine that is a process
+
+A rig need not be a board. The `qemu-uefi-arm64` board is a QEMU machine
+with UEFI firmware: `deploy.qemu_disk` lays a per-run overlay on the built
+disk image, `power.cycle` launches QEMU (the command it ran is kept in
+the run's directory), `console.qemu_serial` reads the serial console from
+its first byte, and `telemetry.qemu_virtio` carries the telemetry ring
+over a virtio-serial port. Power off is a QMP `quit`; a failed run's
+`diagnose` freezes the machine and keeps its registers, PCI tree and
+status, and `--hold` leaves it frozen with a `gdb` line to attach to. The
+same scenario shape, the same record, the same teardown — a virtual rig
+is just a rig whose backends talk to a process.
 
 ## Writing a scenario
 
