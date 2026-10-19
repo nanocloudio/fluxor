@@ -286,19 +286,10 @@ impl ModuleFaultInfo {
 // Step guard timer
 // ============================================================================
 
-/// Default step deadline: 2ms (2000 us).
-#[cfg(not(all(feature = "chip-bcm2712", not(feature = "board-pi5"))))]
-pub const DEFAULT_STEP_DEADLINE_US: u32 = 2000;
-
-/// QEMU virt (bcm2712 without `board-pi5`): ten times the hardware figure.
-/// The guard measures the generic timer, which runs at host speed, while
-/// QEMU executes guest code an order of magnitude slower than the
-/// Cortex-A76 the 2 ms default is sized for, so a step the Pi 5 finishes
-/// well inside 2 ms can take longer than that under emulation. A deadline is
-/// a fault threshold, not a budget, and it is scaled to the machine the code
-/// runs on so that it stays one.
-#[cfg(all(feature = "chip-bcm2712", not(feature = "board-pi5")))]
-pub const DEFAULT_STEP_DEADLINE_US: u32 = 20000;
+/// Default step deadline. A deadline is a fault threshold, not a budget,
+/// so it is sized to the machine the code runs on: the chip says
+/// (`platform::chip`), 2 ms on silicon.
+pub const DEFAULT_STEP_DEADLINE_US: u32 = crate::platform::chip::DEFAULT_STEP_DEADLINE_US;
 
 /// Burst multiplier — burst deadline = step_deadline * this.
 pub const BURST_MULTIPLIER: u32 = 8;

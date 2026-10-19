@@ -3120,7 +3120,7 @@ impl DynamicModule {
         #[cfg(feature = "kernel-vm")]
         if iso_requested {
             let declared = module.manifest_stack_bytes();
-            let available = crate::platform::mmu::ISOLATED_STACK_BYTES as u32;
+            let available = crate::arch::aarch64::isolation::ISOLATED_STACK_BYTES as u32;
             if declared > available {
                 return Err(LoaderError::StackTooSmall {
                     declared,

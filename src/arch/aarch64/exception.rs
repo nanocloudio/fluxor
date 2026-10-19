@@ -1,4 +1,4 @@
-//! Exception vectors + IRQ handler — BCM2712 (Pi 5 / QEMU virt).
+//! Exception vectors + IRQ handler — AArch64, EL1.
 //!
 //! The `global_asm!` block defines `exception_vectors:` (aligned to 2 KB)
 //! with 16 × 128 B entries per VBAR_EL1 layout. Synchronous / FIQ /
@@ -7,15 +7,18 @@
 //! `eret`.
 //!
 //! `irq_handler` reads `GICC_IAR`, EOIs, then either reloads the timer
-//! tick (PPI 30 on pi5 / PPI 27 on QEMU) or walks `IRQ_BINDINGS` to
-//! either fan out via `pcie::pcie1_msi_dispatch` or signal a single
-//! kernel event via `event_signal_from_isr`.
+//! tick (the platform's timer PPI) or walks `IRQ_BINDINGS` to either fan
+//! out through the platform's IRQ multiplexer or signal a single kernel
+//! event via `event_signal_from_isr`.
 //!
 //! `exception_dump` is `#[no_mangle]` — called from the `unhandled_*`
-//! assembly entry — and is gated on [`UART_READY`] (defined in
-//! `bcm2712/uart.rs`) so it never pokes an unmapped peripheral on an
-//! early-boot fault. State is also stashed at the fixed address
-//! 0x4007_0000 for offline QEMU monitor inspection.
+//! assembly entry. What it can safely write to is the platform's business:
+//! it prints through the sink the platform registered ([`set_dump_sink`]),
+//! which the platform leaves unset until its console can take raw bytes,
+//! so an early-boot fault never pokes an unmapped peripheral. The fault is
+//! also stashed at a fixed address the platform names
+//! ([`set_fault_stash`]) for an emulator's monitor to read. Which core is
+//! running is [`super::cpu`]'s answer.
 
 #![allow(
     dead_code,
@@ -23,13 +26,63 @@
 )]
 
 use core::arch::global_asm;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
-use super::gic::{
-    EVENT_HANDLE_PCIE1_MSI, GICC_EOIR, GICC_IAR, IRQ_BINDINGS, IRQ_BINDING_COUNT, TIMER_PPI,
-};
+use super::cpu::current_core_id;
+use super::gic::{self, EVENT_HANDLE_MUX, IRQ_BINDINGS, IRQ_BINDING_COUNT};
 use super::timer;
-use super::uart::{uart_raw_put_u32, uart_raw_putc, uart_raw_puts, UART_READY};
+
+/// How many cores the per-core latches cover.
+pub const MAX_CORES: usize = 4;
+
+static mut DUMP_SINK: Option<fn(&[u8])> = None;
+static FAULT_STASH: AtomicUsize = AtomicUsize::new(0);
+static mut STACK_GUARD_PROBE: Option<fn(u64) -> Option<usize>> = None;
+
+/// Where `exception_dump` writes its text: raw, synchronous, usable with
+/// the scheduler dead and the heap poisoned. Unset (the default) means the
+/// dump is latched but not printed; the platform sets it once its console
+/// hardware is initialised.
+pub fn set_dump_sink(sink: fn(&[u8])) {
+    // SAFETY: set at boot by the boot core before interrupts are enabled;
+    // read on the exception path afterwards.
+    unsafe { DUMP_SINK = Some(sink) };
+}
+
+/// A fixed RAM address where `exception_dump` stores ELR/ESR/FAR and a
+/// marker (4 × u64), so an emulator's monitor can read a fault that
+/// happened before any console worked. `0` disables it.
+pub fn set_fault_stash(addr: usize) {
+    FAULT_STASH.store(addr, Ordering::Relaxed);
+}
+
+/// How to tell whether a faulting address lies in a kernel stack's guard
+/// page: the platform owns the stacks, so it answers.
+pub fn set_stack_guard_probe(probe: fn(u64) -> Option<usize>) {
+    // SAFETY: set at boot before interrupts are enabled; read afterwards.
+    unsafe { STACK_GUARD_PROBE = Some(probe) };
+}
+
+#[inline(always)]
+fn dump_sink() -> Option<fn(&[u8])> {
+    // SAFETY: written once at boot, before this can run.
+    unsafe { DUMP_SINK }
+}
+
+#[inline(always)]
+fn stack_guard_core(addr: u64) -> Option<usize> {
+    // SAFETY: written once at boot, before this can run.
+    match unsafe { STACK_GUARD_PROBE } {
+        Some(probe) => probe(addr),
+        None => None,
+    }
+}
+
+fn dump(bytes: &[u8]) {
+    if let Some(sink) = dump_sink() {
+        sink(bytes);
+    }
+}
 
 global_asm!(
     ".section .text",
@@ -37,7 +90,7 @@ global_asm!(
     ".global exception_vectors",
     "exception_vectors:",
     // Current EL with SP_EL0 (4 entries). Tagged catch (`fluxor_el1_catch` in
-    // platform::mmu): a kernel-side or async fault taken while servicing an
+    // arch::aarch64::isolation): a kernel-side or async fault taken while servicing an
     // isolated module FAILS STOP — it latches ESR/FAR/SPSR/ELR (surfaced over
     // UDP by a sibling core) and spins, rather than longjmp-recovering out of a
     // possibly-held kernel lock. (Genuine EL0 module faults arrive at the
@@ -57,7 +110,7 @@ global_asm!(
     // Current EL with SP_ELx (4 entries)
     // Synchronous (EL1h): a fault in the kernel's own EL1 code — including
     // while servicing an isolated module's svc1/abort path — FAILS STOP via
-    // `fluxor_el1_sync_vec` (platform::mmu): latch syndrome + dump + spin. It is
+    // `fluxor_el1_sync_vec` (arch::aarch64::isolation): latch syndrome + dump + spin. It is
     // NOT recovered, because a fault inside kernel servicing may hold a lock
     // whose abandonment would deadlock the kernel.
     ".balign 128",
@@ -99,7 +152,7 @@ global_asm!(
     // Lower EL using AArch64 (4 entries)
     // Synchronous from a lower EL (EL0) — SVC return from an isolated
     // module_step, or a data/instruction abort while it runs. Routed to
-    // the EL0-isolation dispatcher in `platform::mmu` (fluxor_el0_lower_sync_vec)
+    // the EL0-isolation dispatcher in `arch::aarch64::isolation` (fluxor_el0_lower_sync_vec)
     // which longjmps back to the EL1 scheduler. The other three lower-EL
     // entries (IRQ/FIQ/SError) stay on the dump path: IRQs are masked for
     // the duration of an EL0 step, so they should not fire here.
@@ -122,7 +175,7 @@ global_asm!(
     "b unhandled_exception",
     ".balign 128",
     "b unhandled_exception",
-    // `.global` so the EL0-isolation dispatcher in `platform::mmu`
+    // `.global` so the EL0-isolation dispatcher in `arch::aarch64::isolation`
     // (a separate global_asm! block) can branch here when a lower-EL
     // synchronous exception arrives with no active EL0 step.
     ".global unhandled_exception",
@@ -144,21 +197,22 @@ pub static EXCEPTION_DEPTH: AtomicU32 = AtomicU32::new(0);
 
 /// Per-core fault latch. `exception_dump` records the faulting core's ESR/FAR
 /// and a count here so a sibling core (core 0, which owns the UDP debug drain)
-/// can surface secondary-core faults over network telemetry — the UART dump is
-/// invisible on benches without a wired debug UART. Indexed by core id (0..3).
-pub static CORE_FAULT_ESR: [AtomicU64; 4] = [
+/// can surface secondary-core faults over network telemetry — the console
+/// dump is invisible on benches without a wired debug console. Indexed by
+/// core id (0..MAX_CORES).
+pub static CORE_FAULT_ESR: [AtomicU64; MAX_CORES] = [
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
 ];
-pub static CORE_FAULT_FAR: [AtomicU64; 4] = [
+pub static CORE_FAULT_FAR: [AtomicU64; MAX_CORES] = [
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
 ];
-pub static CORE_FAULT_COUNT: [AtomicU32; 4] = [
+pub static CORE_FAULT_COUNT: [AtomicU32; MAX_CORES] = [
     AtomicU32::new(0),
     AtomicU32::new(0),
     AtomicU32::new(0),
@@ -166,14 +220,14 @@ pub static CORE_FAULT_COUNT: [AtomicU32; 4] = [
 ];
 /// SPSR_EL1 at the fault — M[3:0] gives the EL the fault was taken FROM
 /// (0=EL0t, 4=EL1t, 5=EL1h), which disambiguates an `svc` taken at EL0 vs EL1.
-pub static CORE_FAULT_SPSR: [AtomicU64; 4] = [
+pub static CORE_FAULT_SPSR: [AtomicU64; MAX_CORES] = [
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
 ];
 /// ELR_EL1 at the fault — the faulting instruction's address.
-pub static CORE_FAULT_ELR: [AtomicU64; 4] = [
+pub static CORE_FAULT_ELR: [AtomicU64; MAX_CORES] = [
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
@@ -181,7 +235,7 @@ pub static CORE_FAULT_ELR: [AtomicU64; 4] = [
 ];
 
 /// Fault counts `report_core_faults` has already logged, per core.
-static CORE_FAULT_REPORTED: [AtomicU32; 4] = [
+static CORE_FAULT_REPORTED: [AtomicU32; MAX_CORES] = [
     AtomicU32::new(0),
     AtomicU32::new(0),
     AtomicU32::new(0),
@@ -193,14 +247,14 @@ static CORE_FAULT_REPORTED: [AtomicU32; 4] = [
 /// though the faulting core has stopped. A fault whose address lies in a
 /// kernel stack guard page is named as the stack overflow it is.
 pub fn report_core_faults() {
-    for c in 1..4 {
+    for c in 1..MAX_CORES {
         let n = CORE_FAULT_COUNT[c].load(Ordering::Relaxed);
         if n == CORE_FAULT_REPORTED[c].load(Ordering::Relaxed) {
             continue;
         }
         CORE_FAULT_REPORTED[c].store(n, Ordering::Relaxed);
         let far = CORE_FAULT_FAR[c].load(Ordering::Relaxed);
-        let kind = match fluxor::platform::multicore::stack_guard_core(far) {
+        let kind = match stack_guard_core(far) {
             Some(_) => "kernel-stack-overflow",
             None => "kernel",
         };
@@ -216,12 +270,19 @@ pub fn report_core_faults() {
     }
 }
 
+/// The unrecoverable-exception report: latch the fault for this core, stash
+/// it, print it through the sink, and return to the spinning entry.
+///
+/// # Safety
+/// Called from the `unhandled_exception` assembly entry with the exception
+/// registers as arguments; writes the configured stash address.
 #[no_mangle]
 pub unsafe extern "C" fn exception_dump(elr: u64, esr: u64, far: u64) {
     // Latch the fault per-core BEFORE the recursion guard so a sibling core
-    // (core 0) can surface it over UDP telemetry even when this core's UART
-    // dump is invisible (no wired debug UART) or the core then hangs.
-    let c = (current_core_id() as usize) & 3;
+    // (core 0) can surface it over UDP telemetry even when this core's
+    // console dump is invisible (no wired debug console) or the core then
+    // hangs.
+    let c = (current_core_id() as usize).min(MAX_CORES - 1);
     let spsr: u64;
     // SAFETY: reading SPSR_EL1 in the exception handler is side-effect free.
     core::arch::asm!("mrs {}, spsr_el1", out(reg) spsr, options(nomem, nostack));
@@ -236,59 +297,78 @@ pub unsafe extern "C" fn exception_dump(elr: u64, esr: u64, far: u64) {
     if EXCEPTION_DEPTH.fetch_add(1, Ordering::Relaxed) > 0 {
         return;
     }
-    // Always store exception state at a fixed address for QEMU monitor inspection.
-    // Read with: (qemu) xp /4gx 0x40070000
-    // Useful when UART is not yet initialized (early boot / KVM).
-    core::ptr::write_volatile(0x4007_0000 as *mut u64, elr);
-    core::ptr::write_volatile(0x4007_0008 as *mut u64, esr);
-    core::ptr::write_volatile(0x4007_0010 as *mut u64, far);
-    core::ptr::write_volatile(0x4007_0018 as *mut u64, 0xDEAD_BEEF_CAFE_BABE);
+    // Store the exception state at the platform's fixed stash address, for
+    // an emulator monitor to read when no console works yet (early boot,
+    // KVM): `(qemu) xp /4gx <stash>`.
+    let stash = FAULT_STASH.load(Ordering::Relaxed);
+    if stash != 0 {
+        core::ptr::write_volatile(stash as *mut u64, elr);
+        core::ptr::write_volatile((stash + 8) as *mut u64, esr);
+        core::ptr::write_volatile((stash + 16) as *mut u64, far);
+        core::ptr::write_volatile((stash + 24) as *mut u64, 0xDEAD_BEEF_CAFE_BABE);
+    }
 
-    // Don't touch UART if it hasn't been initialised yet (early boot / KVM)
-    if UART_READY.load(Ordering::Relaxed) == 0 {
+    // No sink yet means the console hardware is not initialised (early
+    // boot): the latches above are all that can be done.
+    if dump_sink().is_none() {
         return;
     }
-    // Exception path writes directly to the UART hardware. The ring
-    // is unusable here — the scheduler may be dead, the log_uart
-    // overlay won't drain, and even the heap allocator might be
-    // poisoned. Raw MMIO is the only thing we can trust.
-    uart_raw_puts(b"\r\n!!! EXCEPTION\r\n");
-    uart_raw_puts(b"  ELR=0x");
+    // The exception path writes straight to the console hardware. The log
+    // ring is unusable here — the scheduler may be dead, the overlay won't
+    // drain, and even the heap allocator might be poisoned. Raw MMIO is the
+    // only thing we can trust.
+    dump(b"\r\n!!! EXCEPTION\r\n");
+    dump(b"  ELR=0x");
     exception_dump_hex64(elr);
-    uart_raw_puts(b"\r\n  ESR=0x");
+    dump(b"\r\n  ESR=0x");
     exception_dump_hex64(esr);
-    uart_raw_puts(b"\r\n  FAR=0x");
+    dump(b"\r\n  FAR=0x");
     exception_dump_hex64(far);
-    uart_raw_puts(b"\r\n");
-    if let Some(core) = fluxor::platform::multicore::stack_guard_core(far) {
-        uart_raw_puts(b"  kernel stack overflow: guard page of core ");
+    dump(b"\r\n");
+    if let Some(core) = stack_guard_core(far) {
+        dump(b"  kernel stack overflow: guard page of core ");
         exception_dump_hex64(core as u64);
-        uart_raw_puts(b"\r\n");
+        dump(b"\r\n");
     }
     // Recent log tail — helps correlate the fault with whatever the
     // system logged right before it. `read_tail` does not advance
     // the SPSC tail pointer, so a concurrent drain (if any remains)
     // still sees the same bytes.
     let mut buf = [0u8; 1024];
-    let n = fluxor::kernel::sys::log_ring::read_tail(&mut buf);
+    let n = crate::kernel::sys::log_ring::read_tail(&mut buf);
     if n > 0 {
-        uart_raw_puts(b"--- log tail (");
-        uart_raw_put_u32(n as u32);
-        uart_raw_puts(b" bytes) ---\r\n");
-        uart_raw_puts(&buf[..n]);
-        uart_raw_puts(b"\r\n--- end ---\r\n");
+        dump(b"--- log tail (");
+        exception_dump_u32(n as u32);
+        dump(b" bytes) ---\r\n");
+        dump(&buf[..n]);
+        dump(b"\r\n--- end ---\r\n");
     }
 }
 
-/// Hex dump for exception handler. Duplicates uart_put_hex64 but routes
-/// through uart_raw_putc — see exception_dump rationale.
+/// Hex dump for the exception handler, through the raw sink — see
+/// `exception_dump` for why nothing buffered is used here.
 pub fn exception_dump_hex64(val: u64) {
     let hex = b"0123456789abcdef";
-    let mut i = 60i32;
-    while i >= 0 {
-        uart_raw_putc(hex[((val >> i as u64) & 0xf) as usize]);
-        i -= 4;
+    let mut out = [0u8; 16];
+    for (k, slot) in out.iter_mut().enumerate() {
+        *slot = hex[((val >> (60 - 4 * k as u64)) & 0xf) as usize];
     }
+    dump(&out);
+}
+
+/// Decimal dump for the exception handler.
+fn exception_dump_u32(mut n: u32) {
+    let mut buf = [0u8; 10];
+    let mut i = buf.len();
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    dump(&buf[i..]);
 }
 
 /// Per-core generic-timer reload value, in timer ticks. The `TIMER_PPI`
@@ -307,7 +387,7 @@ pub fn exception_dump_hex64(val: u64) {
 /// global tick, every slot holds the same value the old global did. A future
 /// adaptive pacer (RFC mechanism (b)) rewrites a core's slot per pass
 /// (arm-after-step); fixed per-domain cadence only needs the seed.
-pub static NEXT_DEADLINE_TICKS: [AtomicU32; 4] = [
+pub static NEXT_DEADLINE_TICKS: [AtomicU32; MAX_CORES] = [
     AtomicU32::new(0),
     AtomicU32::new(0),
     AtomicU32::new(0),
@@ -317,7 +397,7 @@ pub static NEXT_DEADLINE_TICKS: [AtomicU32; 4] = [
 /// Per-core tick counters. Core 0 also reads `DBG_TICK` (legacy
 /// alias kept for the single-core diagnostic path); cores 1-3
 /// read only this array.
-pub static CORE_TICKS: [AtomicU32; 4] = [
+pub static CORE_TICKS: [AtomicU32; MAX_CORES] = [
     AtomicU32::new(0),
     AtomicU32::new(0),
     AtomicU32::new(0),
@@ -327,7 +407,7 @@ pub static CORE_TICKS: [AtomicU32; 4] = [
 /// Per-core last interrupted PC (ELR_EL1), latched by the timer IRQ. When a
 /// core's scheduler loop hangs but timer IRQs still fire, this is the PC of
 /// the spinning code — map it with `rust-objdump -d` on the firmware ELF.
-pub static CORE_LAST_ELR: [AtomicU64; 4] = [
+pub static CORE_LAST_ELR: [AtomicU64; MAX_CORES] = [
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
@@ -345,7 +425,7 @@ pub static CORE_LAST_ELR: [AtomicU64; 4] = [
 ///
 /// Opt-in, because it changes the most timing-critical path: enable it only
 /// where accumulated cross-domain skew has been measured over a long run on
-/// the hardware it will run on. Toggle via `bcm2712::set_absolute_rearm`.
+/// the hardware it will run on. The platform toggles it (`set_absolute_rearm`).
 pub static ABSOLUTE_REARM: AtomicBool = AtomicBool::new(false);
 
 /// Per-core last ABSOLUTE deadline programmed into `cntp_cval`, in counter
@@ -353,31 +433,26 @@ pub static ABSOLUTE_REARM: AtomicBool = AtomicBool::new(false);
 /// `LAST_DEADLINE_CVAL[core] + period` so the grid is drift-free; the resync
 /// guard overwrites it with `now + period` after a stall. Unused (stays 0)
 /// while `ABSOLUTE_REARM` is off.
-pub static LAST_DEADLINE_CVAL: [AtomicU64; 4] = [
+pub static LAST_DEADLINE_CVAL: [AtomicU64; MAX_CORES] = [
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
 ];
 
-/// Current core number (0-3). Pi 5 encodes it in MPIDR Aff1[15:8].
-#[inline(always)]
-pub fn current_core_id() -> u8 {
-    let mpidr: u64;
-    // SAFETY: `mrs mpidr_el1` reads a per-CPU system register; no operands.
-    unsafe {
-        core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr, options(nomem, nostack));
-    }
-    ((mpidr >> 8) & 0xFF) as u8
-}
-
+/// The IRQ entry: acknowledge, EOI, then the timer tick or the bound
+/// event.
+///
+/// # Safety
+/// Called from the IRQ vector with the caller-saved registers preserved;
+/// touches the configured GIC and the binding table the boot thread built.
 #[no_mangle]
 pub unsafe extern "C" fn irq_handler() {
-    let iar = core::ptr::read_volatile(GICC_IAR);
+    let iar = core::ptr::read_volatile(gic::gicc_iar());
     let irq_id = iar & 0x3FF;
-    core::ptr::write_volatile(GICC_EOIR, iar);
+    core::ptr::write_volatile(gic::gicc_eoir(), iar);
 
-    if irq_id == TIMER_PPI {
+    if irq_id == gic::timer_ppi() {
         // Timer tick — reload THIS core's deadline, then count. Reloading
         // from the per-core slot (not a shared global) is what lets each
         // core/domain pace at its own rate without a sibling clobbering it.
@@ -395,13 +470,9 @@ pub unsafe extern "C" fn irq_handler() {
         // resync guard avoids the post-long-ISR catch-up burst that a naive
         // absolute compare would emit. The relative path is the default; it is
         // self-resyncing and the absolute path is opt-in.
-        let core_id = {
-            let mpidr: u64;
-            core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr, options(nomem, nostack));
-            // Pi 5 has cores 0-3; clamp so the per-core slot/counter indexes
-            // stay in bounds even if a future part reports a higher Aff1.
-            (((mpidr >> 8) & 0xFF) as usize).min(NEXT_DEADLINE_TICKS.len() - 1)
-        };
+        // Clamp so the per-core slot/counter indexes stay in bounds even if
+        // a part reports a higher affinity than the latches cover.
+        let core_id = (current_core_id() as usize).min(NEXT_DEADLINE_TICKS.len() - 1);
         let period = NEXT_DEADLINE_TICKS[core_id].load(Ordering::Relaxed);
         if ABSOLUTE_REARM.load(Ordering::Relaxed) {
             // Drift-free absolute re-arm: next deadline =
@@ -427,7 +498,7 @@ pub unsafe extern "C" fn irq_handler() {
         // frozen (domain tick_count stuck) while CORE_TICKS keeps climbing,
         // every timer IRQ interrupts the spinning code at the same PC — so
         // CORE_LAST_ELR names exactly where it's stuck (map via objdump).
-        if core_id < 4 {
+        if core_id < MAX_CORES {
             let elr: u64;
             core::arch::asm!("mrs {}, elr_el1", out(reg) elr, options(nomem, nostack));
             CORE_LAST_ELR[core_id].store(elr, Ordering::Relaxed);
@@ -439,19 +510,20 @@ pub unsafe extern "C" fn irq_handler() {
         while i < n {
             let binding = &IRQ_BINDINGS[i];
             if binding.irq == irq_id {
-                if binding.event_handle == fluxor::kernel::exec::isr_tier::ISR_TIER2_EVENT {
+                if binding.event_handle == crate::kernel::exec::isr_tier::ISR_TIER2_EVENT {
                     // Tier 2 (IRQ-owned) dispatch: route this hardware IRQ
                     // straight into the module's `module_isr_entry` via the
                     // trampoline (which looks the module up by IRQ number and
                     // enforces the §D7 ISR-context syscall gate). This is the
                     // bcm2712 counterpart to RP's `DefaultHandler` routing.
-                    let _ = fluxor::kernel::exec::isr_tier::isr_tier2_trampoline(irq_id as u16);
-                } else if binding.event_handle == EVENT_HANDLE_PCIE1_MSI {
-                    // brcmstb MSI mux: read + clear MSI_INT_STATUS,
-                    // fan out per-vector events. Keeps total ISR
-                    // cost proportional to the number of pending
-                    // MSIs (typically 1).
-                    let _ = fluxor::platform::pcie::pcie1_msi_dispatch();
+                    let _ = crate::kernel::exec::isr_tier::isr_tier2_trampoline(irq_id as u16);
+                } else if binding.event_handle == EVENT_HANDLE_MUX {
+                    // The platform's multiplexer (a PCIe MSI mux: read +
+                    // clear the status, fan out per-vector events, so the
+                    // ISR cost is proportional to the MSIs pending).
+                    if let Some(mux) = gic::irq_mux() {
+                        mux();
+                    }
                 } else if binding.event_handle >= 0 {
                     // ACK device if mmio_base is set (virtio-mmio)
                     if binding.mmio_base != 0 {
@@ -461,7 +533,7 @@ pub unsafe extern "C" fn irq_handler() {
                             core::ptr::write_volatile((binding.mmio_base + 0x64) as *mut u32, isr);
                         }
                     }
-                    fluxor::kernel::ipc::event::event_signal_from_isr(binding.event_handle);
+                    crate::kernel::ipc::event::event_signal_from_isr(binding.event_handle);
                 }
             }
             i += 1;

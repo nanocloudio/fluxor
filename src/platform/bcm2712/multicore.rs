@@ -32,18 +32,6 @@
 //! then executes `sev` (send event). Consumer calls `wfe` (wait for event) and reads.
 //! The DMB ensures the consumer sees the data written before the index update.
 
-/// Core 0's MMU attributes, published after the primary has set up its page
-/// tables and referenced by `secondary_core_trampoline` to enable MMU with
-/// identical attributes on cores 1-3 (required so their accesses participate
-/// in inner-shareable cache coherency). Platform-owned: written by
-/// `boot_mmu`, read by the trampoline below.
-#[no_mangle]
-pub static mut SECONDARY_MMU_MAIR: u64 = 0;
-#[no_mangle]
-pub static mut SECONDARY_MMU_TCR: u64 = 0;
-#[no_mangle]
-pub static mut SECONDARY_MMU_TTBR0: u64 = 0;
-
 use core::sync::atomic::{AtomicU32, Ordering};
 
 // ============================================================================
@@ -409,17 +397,11 @@ impl CrossDomainChannel {
     }
 }
 
-/// Read MPIDR core number inline for SPSC enforcement. Pi 5 encodes
-/// the core ID in Aff1 (bits [15:8]); Aff0 is 0 on every core.
+/// The running core's number, for SPSC enforcement.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 fn current_core_id_inline() -> u32 {
-    let mpidr: u64;
-    // SAFETY: MRS MPIDR_EL1 is a read-only system register access.
-    unsafe {
-        core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr, options(nomem, nostack));
-    }
-    ((mpidr >> 8) & 0xFF) as u32
+    crate::arch::aarch64::cpu::current_core_id() as u32
 }
 
 // Static channel pool
@@ -550,18 +532,15 @@ pub fn last_psci_ret(core_id: u8) -> i32 {
     LAST_PSCI_RET[(core_id - 1) as usize].load(Ordering::Relaxed)
 }
 
-/// Wake a secondary core on Pi 5 (BCM2712) via PSCI CPU_ON.
-///
-/// Pi 5 firmware ships ATF at EL3 with PSCI configured for SMC. The
-/// kernel runs at EL1, SMC traps to EL3, and ATF jumps the target core
-/// to `entry_point` with MMU off at EL2. `target_cpu` must be the
-/// MPIDR of the requested core — Pi 5 encodes the core ID in Aff1
-/// (bits [15:8]), so for core N we pass `N << 8`.
+/// Wake a secondary core via PSCI `CPU_ON`, through the conduit the
+/// platform configured (`smc` to the Pi 5's firmware at EL3, `hvc` to a
+/// hypervisor). The firmware drops the core at `secondary_core_trampoline`
+/// with the MMU off; `target_cpu` is the core's MPIDR as this machine
+/// numbers its cores.
 ///
 /// `core_id`: 1, 2, or 3 (core 0 is the boot core).
 /// `entry`: function the secondary core will execute (never returns).
 /// Returns `true` if PSCI accepted the request.
-#[cfg(feature = "board-pi5")]
 pub fn wake_core(core_id: u8, entry: fn() -> !) -> bool {
     if core_id == 0 || core_id > 3 {
         return false;
@@ -578,10 +557,8 @@ pub fn wake_core(core_id: u8, entry: fn() -> !) -> bool {
         CORE_ENTRIES[idx] = Some(entry);
     }
 
-    let psci_cpu_on: u64 = 0xC4000003;
-    let target_cpu: u64 = (core_id as u64) << 8;
+    let target_cpu = crate::arch::aarch64::cpu::mpidr_for_core(core_id);
     let entry_point: u64 = secondary_core_trampoline as usize as u64;
-    let context_id: u64 = 0;
 
     // Publish CORE_ENTRIES before the woken core reads it.
     // SAFETY: DSB SY is an architectural barrier; no memory effects.
@@ -589,66 +566,17 @@ pub fn wake_core(core_id: u8, entry: fn() -> !) -> bool {
         core::arch::asm!("dsb sy", options(nomem, nostack));
     }
 
-    let ret: u64;
-    // SAFETY: PSCI CPU_ON via SMC; arch-mandated secure-monitor call.
-    unsafe {
-        core::arch::asm!(
-            "smc #0",
-            inout("x0") psci_cpu_on => ret,
-            in("x1") target_cpu,
-            in("x2") entry_point,
-            in("x3") context_id,
-            options(nomem, nostack),
-        );
-    }
+    // SAFETY: the trampoline is cold-core entry code and CORE_ENTRIES was
+    // published by the barrier above.
+    let ret = unsafe { crate::arch::aarch64::psci::cpu_on(target_cpu, entry_point, 0) };
 
-    LAST_PSCI_RET[idx].store(ret as i32, Ordering::Relaxed);
+    LAST_PSCI_RET[idx].store(ret, Ordering::Relaxed);
     ret == 0
 }
 
-/// Wake a secondary core on QEMU virt via PSCI CPU_ON (HVC).
-#[cfg(not(feature = "board-pi5"))]
-pub fn wake_core(core_id: u8, entry: fn() -> !) -> bool {
-    if core_id == 0 || core_id > 3 {
-        return false;
-    }
-    let idx = (core_id - 1) as usize;
-
-    if CORE_STARTED[idx].load(Ordering::Acquire) != 0 {
-        return false;
-    }
-
-    // SAFETY: boot-time slot publishing before the secondary core wakes;
-    // CORE_STARTED check above ensures we're the sole writer.
-    unsafe {
-        CORE_ENTRIES[idx] = Some(entry);
-    }
-
-    // PSCI CPU_ON via HVC (QEMU virt uses HVC for PSCI by default)
-    let psci_cpu_on: u64 = 0xC4000003; // PSCI CPU_ON (SMC64)
-    let target_cpu: u64 = core_id as u64; // MPIDR Aff0
-    let entry_point: u64 = secondary_core_trampoline as usize as u64;
-    let context_id: u64 = 0;
-
-    let ret: u64;
-    // SAFETY: PSCI CPU_ON via HVC; QEMU virt uses HVC for PSCI.
-    unsafe {
-        core::arch::asm!(
-            "hvc #0",
-            inout("x0") psci_cpu_on => ret,
-            in("x1") target_cpu,
-            in("x2") entry_point,
-            in("x3") context_id,
-            options(nomem, nostack),
-        );
-    }
-
-    // PSCI returns 0 on success
-    ret == 0
-}
-
-/// Secondary-core entry stub. PSCI (ATF) drops the core here at EL2
-/// with MMU off. The trampoline drops to EL1h, installs core 0's
+/// Secondary-core entry stub. PSCI drops the core here with the MMU off,
+/// at EL2 where the firmware hands cores over there. The trampoline drops
+/// to EL1h (`drop_to_el1`, the same drop `_start` makes), installs core 0's
 /// page tables (so the secondary participates in inner-shareable
 /// cache coherency), enables MMU/caches/NEON, sets up its per-core
 /// stack + exception vectors, and jumps into `secondary_core_entry`.
@@ -661,35 +589,16 @@ pub fn wake_core(core_id: u8, entry: fn() -> !) -> bool {
 #[unsafe(naked)]
 unsafe extern "C" fn secondary_core_trampoline() -> ! {
     core::arch::naked_asm!(
-        // core_id in x0 = MPIDR_EL1 Aff1.
+        // core_id in x0, from the MPIDR affinity field this machine numbers
+        // its cores by (the shift the platform configured in `cpu`).
         "mrs x0, mpidr_el1",
-        "lsr x0, x0, #8",
+        "ldr x9, ={core_id_shift}",
+        "ldr w9, [x9]",
+        "lsr x0, x0, x9",
         "and x0, x0, #0xFF",
 
         // Drop EL2 → EL1h if the firmware handed us off at EL2.
-        "mrs x9, CurrentEL",
-        "cmp x9, #(2 << 2)",
-        "b.ne 2f",
-        "mrs x9, sctlr_el2",
-        "bic x9, x9, #(1 << 0)",
-        "bic x9, x9, #(1 << 2)",
-        "bic x9, x9, #(1 << 12)",
-        "msr sctlr_el2, x9",
-        "isb",
-        "mrs x9, hcr_el2",
-        "mov x10, #(1 << 31)",
-        "orr x9, x9, x10",
-        "msr hcr_el2, x9",
-        "mrs x9, cnthctl_el2",
-        "orr x9, x9, #(1 << 0)",
-        "orr x9, x9, #(1 << 1)",
-        "msr cnthctl_el2, x9",
-        "msr cntvoff_el2, xzr",
-        "mov x9, #0x3c5",               // DAIF masked, EL1h
-        "msr spsr_el2, x9",
-        "adr x9, 2f",
-        "msr elr_el2, x9",
-        "eret",
+        crate::drop_to_el1!("x9", "x10", "2f"),
         "2:",
 
         // Clear any residual EL1 MMU/cache state before reinstalling.
@@ -752,9 +661,10 @@ unsafe extern "C" fn secondary_core_trampoline() -> ! {
         stack_base = sym CORE_STACKS,
         stack_size = const CORE_STACK_SLAB,
         entry = sym secondary_core_entry,
-        mair_ptr = sym crate::platform::multicore::SECONDARY_MMU_MAIR,
-        tcr_ptr = sym crate::platform::multicore::SECONDARY_MMU_TCR,
-        ttbr_ptr = sym crate::platform::multicore::SECONDARY_MMU_TTBR0,
+        core_id_shift = sym crate::arch::aarch64::cpu::CORE_ID_SHIFT,
+        mair_ptr = sym crate::arch::aarch64::boot_mmu::SECONDARY_MMU_MAIR,
+        tcr_ptr = sym crate::arch::aarch64::boot_mmu::SECONDARY_MMU_TCR,
+        ttbr_ptr = sym crate::arch::aarch64::boot_mmu::SECONDARY_MMU_TTBR0,
     );
 }
 

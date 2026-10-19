@@ -1,39 +1,72 @@
 //! GICv2 distributor + CPU interface + IRQ binding state.
 //!
-//! Boards covered:
-//!   * `board-pi5`: Pi 5 GIC-400 at 0x10_7fff_9000 (distributor) /
-//!     0x10_7fff_a000 (CPU interface). Timer is the physical counter
-//!     PPI 30 (no hypervisor → direct hardware access).
-//!   * QEMU virt (default): GICv2 distributor at 0x0800_0000 / CPU
-//!     interface at 0x0801_0000. Timer is the virtual counter PPI 27
-//!     to avoid KVM trap overhead.
+//! The controller's addresses and the timer's PPI are facts of the machine,
+//! not of the architecture: a Pi 5's GIC-400 sits at one address, a QEMU
+//! `virt` machine's GICv2 at another, and a UEFI machine says where in its
+//! MADT. The platform tells this module before anything else touches the
+//! controller ([`configure`]); every register access reads the configured
+//! base, so the same code serves every machine.
 //!
-//! Up to [`MAX_IRQ_BINDINGS`] hardware IRQs can be bound to fluxor
-//! event handles via [`irq_bind`]; the matching ISR fires
-//! `event_signal_from_isr` when the IRQ asserts. A sentinel
-//! `event_handle = EVENT_HANDLE_PCIE1_MSI` routes the IRQ into the
-//! brcmstb PCIe1 MSI mux dispatch instead of a single event.
+//! Up to [`MAX_IRQ_BINDINGS`] hardware IRQs can be bound to fluxor event
+//! handles via [`irq_bind`]; the matching ISR fires `event_signal_from_isr`
+//! when the IRQ asserts. A binding whose handle is [`EVENT_HANDLE_MUX`]
+//! routes the IRQ into the platform's registered multiplexer instead
+//! ([`set_irq_mux`]) — a PCIe MSI mux that services many vectors through one
+//! SPI, for instance.
 
 #![allow(
     dead_code,
     reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
 )]
 
-// GIC
-#[cfg(not(feature = "board-pi5"))]
-pub const GICD_BASE: usize = 0x0800_0000; // QEMU virt GICv2 distributor
-#[cfg(not(feature = "board-pi5"))]
-pub const GICC_BASE: usize = 0x0801_0000; // QEMU virt GICv2 CPU interface
-#[cfg(feature = "board-pi5")]
-pub const GICD_BASE: usize = 0x10_7fff_9000; // Pi 5 GIC-400 distributor
-#[cfg(feature = "board-pi5")]
-pub const GICC_BASE: usize = 0x10_7fff_a000; // Pi 5 GIC-400 CPU interface
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
-pub const GICC_IAR: *mut u32 = (GICC_BASE + 0x00C) as *mut u32;
-pub const GICC_EOIR: *mut u32 = (GICC_BASE + 0x010) as *mut u32;
+static GICD: AtomicUsize = AtomicUsize::new(0);
+static GICC: AtomicUsize = AtomicUsize::new(0);
+static TIMER_PPI: AtomicU32 = AtomicU32::new(0);
+
+/// Name the controller: distributor base, CPU-interface base, and the PPI
+/// the generic timer raises. Called once by the platform at boot, before
+/// [`init`] and before the first interrupt can be taken.
+pub fn configure(gicd_base: usize, gicc_base: usize, timer_ppi: u32) {
+    GICD.store(gicd_base, Ordering::Relaxed);
+    GICC.store(gicc_base, Ordering::Relaxed);
+    TIMER_PPI.store(timer_ppi, Ordering::Relaxed);
+}
+
+#[inline(always)]
+pub fn gicd_base() -> usize {
+    GICD.load(Ordering::Relaxed)
+}
+
+#[inline(always)]
+pub fn gicc_base() -> usize {
+    GICC.load(Ordering::Relaxed)
+}
+
+/// The PPI the generic timer raises on this machine.
+#[inline(always)]
+pub fn timer_ppi() -> u32 {
+    TIMER_PPI.load(Ordering::Relaxed)
+}
+
+/// GICC_IAR: acknowledge the highest-priority pending interrupt.
+#[inline(always)]
+pub fn gicc_iar() -> *mut u32 {
+    (gicc_base() + 0x00C) as *mut u32
+}
+
+/// GICC_EOIR: end of interrupt.
+#[inline(always)]
+pub fn gicc_eoir() -> *mut u32 {
+    (gicc_base() + 0x010) as *mut u32
+}
 
 /// GICv2 Software-Generated-Interrupt register (GICD_SGIR).
-pub const GICD_SGIR: *mut u32 = (GICD_BASE + 0xF00) as *mut u32;
+#[inline(always)]
+fn gicd_sgir() -> *mut u32 {
+    (gicd_base() + 0xF00) as *mut u32
+}
 
 /// SGI id used as the WFI wake doorbell. Tier 0/1a idle on **WFI**, which a
 /// global `SEV` does NOT break (SEV wakes WFE). Once mechanism (a) widens the
@@ -50,12 +83,11 @@ pub const WAKE_SGI: u32 = 0;
 ///
 /// # Safety
 /// Performs a single MMIO write to the (boot-mapped) GIC distributor.
-#[cfg(target_arch = "aarch64")]
 #[inline(always)]
 pub unsafe fn send_sgi_all(sgi_id: u32) {
     // [25:24] filter=00, [23:16] CPUTargetList=0xF (cores 0-3), [3:0] SGIINTID.
     let val = (0xF << 16) | (sgi_id & 0xF);
-    core::ptr::write_volatile(GICD_SGIR, val);
+    core::ptr::write_volatile(gicd_sgir(), val);
 }
 
 /// Send SGI `sgi_id` to a single target core (`CPUTargetList = 1<<core`,
@@ -64,19 +96,11 @@ pub unsafe fn send_sgi_all(sgi_id: u32) {
 ///
 /// # Safety
 /// Single MMIO write to the (boot-mapped) GIC distributor.
-#[cfg(target_arch = "aarch64")]
 #[inline(always)]
 pub unsafe fn send_sgi(core: u32, sgi_id: u32) {
     let val = ((1u32 << (core & 0x7)) << 16) | (sgi_id & 0xF);
-    core::ptr::write_volatile(GICD_SGIR, val);
+    core::ptr::write_volatile(gicd_sgir(), val);
 }
-
-// Pi 5 (board-pi5): physical timer PPI 30 — no hypervisor, direct access.
-// QEMU: virtual timer PPI 27 — avoids KVM trap overhead on physical timer.
-#[cfg(feature = "board-pi5")]
-pub const TIMER_PPI: u32 = 30;
-#[cfg(not(feature = "board-pi5"))]
-pub const TIMER_PPI: u32 = 27;
 
 /// IRQ-to-event binding table. When a bound IRQ fires, the kernel signals the
 /// associated event via event_signal_from_isr (ISR-safe, lock-free).
@@ -111,29 +135,28 @@ pub static mut IRQ_BINDINGS: [IrqBinding; MAX_IRQ_BINDINGS] = [
 ];
 pub static mut IRQ_BINDING_COUNT: usize = 0;
 
-/// Sentinel event_handle that tells `irq_handler` to fan out via
-/// `pcie::pcie1_msi_dispatch` instead of signalling a single event. Used
-/// by `register_pcie1_msi_spi` so the brcmstb MSI mux can service all
-/// 32 MSI vectors through one GIC SPI.
-pub const EVENT_HANDLE_PCIE1_MSI: i32 = -2;
+/// Sentinel event_handle that tells the IRQ handler to call the platform's
+/// multiplexer ([`set_irq_mux`]) instead of signalling a single event: one
+/// SPI behind which a device-side mux (a PCIe MSI controller) holds many
+/// vectors.
+pub const EVENT_HANDLE_MUX: i32 = -2;
 
-/// One-shot guard for `register_pcie1_msi_spi`. `irq_bind` appends a
-/// row on every call; without this flag a driver that allocates N
-/// MSI-X vectors would exhaust `IRQ_BINDINGS`.
-pub static mut PCIE1_MSI_SPI_REGISTERED: bool = false;
+static mut IRQ_MUX: Option<fn()> = None;
 
-/// Enable `spi_irq` in the GIC distributor and route its fires into
-/// `pcie::pcie1_msi_dispatch` (via the `EVENT_HANDLE_PCIE1_MSI`
-/// sentinel). Returns 0 on success, -ENOMEM if the binding table is
-/// full.
-#[cfg(feature = "board-pi5")]
-pub fn register_pcie1_msi_spi(spi_irq: u32) -> i32 {
-    irq_bind(spi_irq, EVENT_HANDLE_PCIE1_MSI, 0, 0)
+/// Register the multiplexer an [`EVENT_HANDLE_MUX`] binding fans out
+/// through. Boot-time, scheduler-thread-only, like the bindings.
+pub fn set_irq_mux(mux: fn()) {
+    // SAFETY: set once at boot before the binding that uses it exists, by
+    // the thread that owns the binding table.
+    unsafe { IRQ_MUX = Some(mux) };
 }
 
-#[cfg(not(feature = "board-pi5"))]
-pub fn register_pcie1_msi_spi(_spi_irq: u32) -> i32 {
-    fluxor::kernel::sys::errno::ENOSYS
+/// The registered multiplexer, for the IRQ handler.
+#[inline(always)]
+pub(crate) fn irq_mux() -> Option<fn()> {
+    // SAFETY: read on the IRQ path after boot; the writer ran before the
+    // first bound interrupt could fire.
+    unsafe { IRQ_MUX }
 }
 
 /// Bind an event to a hardware IRQ. Enables the IRQ in the GIC distributor.
@@ -151,14 +174,15 @@ pub fn irq_bind(irq: u32, event_handle: i32, mmio_base: usize, target_core: u8) 
     // build time — this is the runtime backstop). A larger value would also
     // index ISENABLER/IPRIORITYR/ITARGETSR past their banks.
     if irq > 1019 {
-        return fluxor::kernel::sys::errno::EINVAL;
+        return crate::kernel::sys::errno::EINVAL;
     }
+    let gicd = gicd_base();
     // SAFETY: IRQ_BINDINGS / IRQ_BINDING_COUNT are scheduler-thread-only
     // and only grow at boot/configure time; `idx` is range-checked above.
-    // GICD register addresses are fixed MMIO mapped by boot_mmu.
+    // GICD register addresses are fixed MMIO mapped by the boot page tables.
     unsafe {
         if IRQ_BINDING_COUNT >= MAX_IRQ_BINDINGS {
-            return fluxor::kernel::sys::errno::ENOMEM;
+            return crate::kernel::sys::errno::ENOMEM;
         }
         let idx = IRQ_BINDING_COUNT;
         IRQ_BINDINGS[idx] = IrqBinding {
@@ -170,19 +194,19 @@ pub fn irq_bind(irq: u32, event_handle: i32, mmio_base: usize, target_core: u8) 
 
         // Enable the SPI in the GIC distributor
         // SPIs start at IRQ 32. ISENABLER register: base + 0x100 + (irq/32)*4, bit = irq%32
-        let reg = GICD_BASE + 0x100 + (irq as usize / 32) * 4;
+        let reg = gicd + 0x100 + (irq as usize / 32) * 4;
         let bit = 1u32 << (irq % 32);
         core::ptr::write_volatile(
             reg as *mut u32,
             core::ptr::read_volatile(reg as *const u32) | bit,
         );
         // Set priority to 0 (highest)
-        core::ptr::write_volatile((GICD_BASE + 0x400 + irq as usize) as *mut u8, 0);
+        core::ptr::write_volatile((gicd + 0x400 + irq as usize) as *mut u8, 0);
         // Target the owning core (ITARGETSR is a byte per SPI; bit N = core N).
         // GIC-400 routes SPIs to at most 8 cores; clamp the shift so a bogus
         // core never aliases to a different target bit.
         let target = 1u8 << (target_core & 0x7);
-        core::ptr::write_volatile((GICD_BASE + 0x800 + irq as usize) as *mut u8, target);
+        core::ptr::write_volatile((gicd + 0x800 + irq as usize) as *mut u8, target);
 
         log::info!(
             "[irq] bind irq={irq} event={event_handle} mmio={mmio_base:#x} core={target_core}"
@@ -191,19 +215,33 @@ pub fn irq_bind(irq: u32, event_handle: i32, mmio_base: usize, target_core: u8) 
     0
 }
 
-pub unsafe fn gic_init() {
-    core::ptr::write_volatile(GICD_BASE as *mut u32, 1); // GICD_CTLR: enable
-    core::ptr::write_volatile((GICD_BASE + 0x100) as *mut u32, 1u32 << TIMER_PPI); // ISENABLER0
-    core::ptr::write_volatile((GICD_BASE + 0x400 + TIMER_PPI as usize) as *mut u8, 0); // priority 0 (highest)
-    core::ptr::write_volatile((GICC_BASE + 0x004) as *mut u32, 0xFF); // PMR: allow all
-    core::ptr::write_volatile(GICC_BASE as *mut u32, 1); // GICC_CTLR: enable
+/// Enable the distributor and this core's CPU interface, with the timer PPI
+/// enabled at the highest priority.
+///
+/// # Safety
+/// MMIO writes to the configured GIC; the bases must be mapped and
+/// [`configure`] must have run.
+pub unsafe fn init() {
+    let gicd = gicd_base();
+    let gicc = gicc_base();
+    let ppi = timer_ppi();
+    core::ptr::write_volatile(gicd as *mut u32, 1); // GICD_CTLR: enable
+    core::ptr::write_volatile((gicd + 0x100) as *mut u32, 1u32 << ppi); // ISENABLER0
+    core::ptr::write_volatile((gicd + 0x400 + ppi as usize) as *mut u8, 0); // priority 0 (highest)
+    core::ptr::write_volatile((gicc + 0x004) as *mut u32, 0xFF); // PMR: allow all
+    core::ptr::write_volatile(gicc as *mut u32, 1); // GICC_CTLR: enable
 }
 
 /// Initialize GIC CPU interface on a secondary core.
 /// Each core needs its own GICC setup for PPIs (like the timer).
-pub unsafe fn gic_init_secondary() {
-    core::ptr::write_volatile((GICC_BASE + 0x004) as *mut u32, 0xFF); // PMR
-    core::ptr::write_volatile(GICC_BASE as *mut u32, 1); // GICC_CTLR
-                                                         // Enable timer PPI for this core
-    core::ptr::write_volatile((GICD_BASE + 0x100) as *mut u32, 1u32 << TIMER_PPI);
+///
+/// # Safety
+/// As [`init`].
+pub unsafe fn init_secondary() {
+    let gicd = gicd_base();
+    let gicc = gicc_base();
+    core::ptr::write_volatile((gicc + 0x004) as *mut u32, 0xFF); // PMR
+    core::ptr::write_volatile(gicc as *mut u32, 1); // GICC_CTLR
+                                                    // Enable timer PPI for this core
+    core::ptr::write_volatile((gicd + 0x100) as *mut u32, 1u32 << timer_ppi());
 }

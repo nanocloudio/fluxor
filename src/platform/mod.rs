@@ -36,10 +36,6 @@ pub mod proc_executor;
 // The per-chip platform modules, selected by `#[cfg]`. The chip selection lives
 // here in the platform layer; the kernel reaches them via `crate::platform::<name>`.
 
-/// Stage-1/2 MMU + per-module region protection (bcm2712).
-#[cfg(feature = "chip-bcm2712")]
-#[path = "bcm2712/mmu.rs"]
-pub mod mmu;
 /// Secondary-core bring-up + RP1/DMA40 (bcm2712).
 #[cfg(feature = "chip-bcm2712")]
 #[path = "bcm2712/multicore.rs"]

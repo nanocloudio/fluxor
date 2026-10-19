@@ -88,6 +88,19 @@ the same peripheral families. The aarch64 targets share `bcm2712.rs` because
 both run on the same SoC; pi5 is a board overlay on top of the same chip
 support.
 
+What is the processor's rather than the chip's lives in `src/arch/`: on
+AArch64, the exception vectors and IRQ dispatch, the GICv2 driver, the
+generic timer, core numbering and the EL2 → EL1 drop, PSCI, the boot-time
+identity map and EL0 module isolation. None of it knows which machine it
+runs on. The facts that differ between machines — where the interrupt
+controller is, which PPI the timer raises, physical or virtual counter,
+`smc` or `hvc` to the firmware, which MPIDR field numbers the cores, where
+a fault dump may be written, which gigabytes a module table must carry for
+the kernel — are values the platform hands over at boot through each
+module's `configure` and `set_*` functions, before the first interrupt. A
+platform that learns them from firmware tables passes what it read; one
+that knows them at build time, like `bcm2712.rs`, passes constants.
+
 ### RP boot and runtime
 
 The reset path and vector table are this tree's own (`platform/rp/boot.rs`,
@@ -451,6 +464,8 @@ with the union of every supported peripheral.
 | Chip abstraction | `src/platform/{rp,bcm2712,linux,wasm}/chip.rs` (RP includes the generated `chip_generated.rs`) |
 | RP HAL | `src/platform/rp.rs`, `src/platform/rp/` |
 | BCM2712 HAL | `src/platform/bcm2712.rs`, `src/platform/bcm2712/` |
+| AArch64 architecture | `src/arch/aarch64/` — exception vectors and IRQ dispatch, GICv2, generic timer, cores and the EL2 drop, PSCI, the boot identity map, EL0 isolation; each configured by the platform at boot |
+| Cortex-M architecture | `src/arch/` — vector table, NVIC, instruction primitives |
 | Silicon definitions | `targets/silicon/*.toml` |
 | Board definitions | `targets/boards/*.toml` |
 

@@ -17,6 +17,9 @@ include!(concat!(env!("OUT_DIR"), "/chip_generated.rs"));
 pub const GRAPH_FLASH: crate::abi::platform::rp::flash_layout::GraphFlash =
     crate::abi::platform::rp::flash_layout::graph_flash(FLASH_SIZE, KERNEL_FLASH_RESERVE);
 
+/// Default step deadline: 2 ms.
+pub const DEFAULT_STEP_DEADLINE_US: u32 = 2000;
+
 /// Whether PIO GPIOBASE register is available.
 #[inline(always)]
 pub const fn has_pio_gpiobase() -> bool {

@@ -5,8 +5,9 @@
 //! and an NVIC are; `platform` knows what a UART is and where it lives.
 //! A file that reaches for both is a file doing two jobs.
 //!
-//! AArch64's equivalents live in `platform/bcm2712`. This module is
-//! Cortex-M-only rather than claiming a symmetry that does not yet exist.
+//! AArch64's bare-metal primitives — vectors, GICv2, generic timer — live
+//! in [`aarch64`], parameterised by the platform at boot; the Cortex-M
+//! half keeps its own shape below.
 
 /// Critical-section implementation for builds that do not link one.
 #[cfg(feature = "rp-critical-section")]
@@ -20,3 +21,9 @@ pub mod vector;
 /// Cortex-M instruction primitives. ARM-only: `core::arch::asm!` throughout.
 #[cfg(target_arch = "arm")]
 pub mod cortex_m;
+
+/// AArch64 EL1 primitives: exception vectors, GICv2, generic timer. Bare
+/// metal only — the vectors are `global_asm!` that a hosted binary must
+/// not carry — and only where the kernel exists to dispatch into.
+#[cfg(all(target_arch = "aarch64", target_os = "none", feature = "chip-bcm2712"))]
+pub mod aarch64;

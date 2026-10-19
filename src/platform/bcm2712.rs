@@ -20,16 +20,18 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use fluxor::kernel::boot::config::EdgeClass;
 use fluxor::kernel::exec::scheduler;
 use fluxor::kernel::module::loader;
-use fluxor::platform::mmu;
+use fluxor::arch::aarch64::isolation;
 use fluxor::platform::multicore;
 
 // ── Boot-time submodules (binary-private; not exposed via fluxor::kernel) ──
 //
-// Boot-only support code (UART driver, GIC distributor, ARM Generic
-// Timer, RP1 HAL, exception vectors, boot-time MMU page tables,
-// kernel `log` backend) is factored into focused submodules under
-// `src/platform/bcm2712/` and consumed by `main()`, the domain
-// loops, and the BCM HAL ops table.
+// Boot-only support code (UART driver, RP1 HAL, boot-time MMU page
+// tables, kernel `log` backend) is factored into focused submodules under
+// `src/platform/bcm2712/` and consumed by `main()`, the domain loops,
+// and the BCM HAL ops table. The exception vectors, the GICv2 driver and
+// the generic timer are the architecture's, in `fluxor::arch::aarch64`;
+// this file tells them the board's facts (`configure_arch`) before the
+// first interrupt.
 //
 // Submodules that hold shared kernel state (PCIe enumeration,
 // runtime MMU isolation, cross-domain channels, NIC DMA arena, paged
@@ -39,32 +41,117 @@ use fluxor::platform::multicore;
 // is the `fluxor::kernel` namespace, never `src/platform/*`.
 #[path = "bcm2712/boot_mmu.rs"]
 mod boot_mmu;
-#[path = "bcm2712/exception.rs"]
-mod exception;
-#[path = "bcm2712/gic.rs"]
-mod gic;
 #[path = "bcm2712/logger.rs"]
 mod logger;
 #[path = "bcm2712/rp1.rs"]
 mod rp1;
-#[path = "bcm2712/timer.rs"]
-mod timer;
 #[path = "bcm2712/uart.rs"]
 mod uart;
 #[path = "bcm2712/vault_store.rs"]
 mod vault_store;
 
-// Bring UART + GIC + exception names into the binary's namespace so
-// existing callsites (`uart_puts(b"…")`, `irq_bind(…)`, `GICD_BASE`,
-// `IRQ_BINDING_COUNT`, `NEXT_DEADLINE_TICKS`, `CORE_TICKS`,
-// `current_core_id()`, …) stay unchanged. The submodules own the MMIO
-// registers, log-ring drain, debug-tx sink, GIC distributor + CPU
-// interface init, IRQ binding state, exception vectors, and the IRQ
-// dispatch path.
+// Bring the UART, GIC and exception names into the binary's namespace so
+// the callsites (`uart_puts(b"…")`, `irq_bind(…)`, `IRQ_BINDING_COUNT`,
+// `NEXT_DEADLINE_TICKS`, `CORE_TICKS`, `current_core_id()`, …) read as
+// they always have.
 use exception::*;
+use fluxor::arch::aarch64::cpu::current_core_id;
+use fluxor::arch::aarch64::{cpu, exception, gic, psci, timer};
 use gic::*;
 use logger::RingLogger;
 use uart::*;
+
+// ── The board's facts for the architecture ──────────────────────────────────
+//
+// Where the interrupt controller is, which PPI the timer raises and which
+// counter it runs on differ between the Pi 5 (GIC-400, physical timer: no
+// hypervisor) and the QEMU `virt` machine (GICv2 at its own address, the
+// virtual timer, which avoids a KVM trap per access).
+#[cfg(feature = "board-pi5")]
+const GICD_BASE: usize = 0x10_7fff_9000; // Pi 5 GIC-400 distributor
+#[cfg(feature = "board-pi5")]
+const GICC_BASE: usize = 0x10_7fff_a000; // Pi 5 GIC-400 CPU interface
+#[cfg(feature = "board-pi5")]
+const TIMER_PPI: u32 = 30; // physical timer
+#[cfg(feature = "board-pi5")]
+const TIMER_COUNTER: timer::Counter = timer::Counter::Physical;
+#[cfg(feature = "board-pi5")]
+const PSCI_CONDUIT: psci::Conduit = psci::Conduit::Smc; // Trusted Firmware at EL3
+#[cfg(not(feature = "board-pi5"))]
+const GICD_BASE: usize = 0x0800_0000; // QEMU virt GICv2 distributor
+#[cfg(not(feature = "board-pi5"))]
+const GICC_BASE: usize = 0x0801_0000; // QEMU virt GICv2 CPU interface
+#[cfg(not(feature = "board-pi5"))]
+const TIMER_PPI: u32 = 27; // virtual timer
+#[cfg(not(feature = "board-pi5"))]
+const TIMER_COUNTER: timer::Counter = timer::Counter::Virtual;
+#[cfg(not(feature = "board-pi5"))]
+const PSCI_CONDUIT: psci::Conduit = psci::Conduit::Hvc; // QEMU virt: PSCI by HVC
+
+/// The 1 GB indices of MMIO the kernel reaches at EL1 while an isolated
+/// module's table is installed: the GIC-400 (timer IAR/EOIR on the IRQ
+/// path; 0x10_7fff_a000 is in gigabytes 64-65) and the RP1 PL011 (fault
+/// dump, debug drain; 0x1c_0003_0000 is gigabyte 112).
+#[cfg(feature = "board-pi5")]
+const KERNEL_MMIO_GB: &[usize] = &[64, 65, 112];
+/// QEMU virt's GIC and UART sit in the first gigabyte, inside the kernel
+/// base every module table already carries.
+#[cfg(not(feature = "board-pi5"))]
+const KERNEL_MMIO_GB: &[usize] = &[];
+
+/// Where `exception_dump` stashes ELR/ESR/FAR for an emulator's monitor
+/// (`(qemu) xp /4gx 0x40070000`): inside DRAM on both boards.
+const FAULT_STASH: usize = 0x4007_0000;
+
+/// Tell the architecture the board's facts. First thing in `main`, before
+/// the MMU, the timer or the GIC are touched: it only writes RAM.
+fn configure_arch() {
+    gic::configure(GICD_BASE, GICC_BASE, TIMER_PPI);
+    timer::configure(TIMER_COUNTER);
+    psci::configure(PSCI_CONDUIT);
+    // The core number sits in MPIDR Aff1 here (`_start` parks on the same
+    // field, by constant).
+    cpu::configure_core_id(8);
+    exception::set_fault_stash(FAULT_STASH);
+    exception::set_stack_guard_probe(fluxor::platform::multicore::stack_guard_core);
+    // Every module table maps the low 3 GB of DRAM EL1-only (kernel image,
+    // BSS, arenas, stacks, modules blob) plus the apertures the kernel
+    // touches while a module's table is live.
+    isolation::configure(3, KERNEL_MMIO_GB);
+    isolation::set_kernel_stack_guards(fluxor::platform::multicore::kernel_stack_guards);
+}
+
+/// The exception dump's sink: the PL011, raw, once `uart_init` has run.
+fn exception_dump_to_uart(bytes: &[u8]) {
+    if UART_READY.load(Ordering::Relaxed) != 0 {
+        uart_raw_puts(bytes);
+    }
+}
+
+/// One-shot guard for `register_pcie1_msi_spi`. `irq_bind` appends a
+/// row on every call; without this flag a driver that allocates N
+/// MSI-X vectors would exhaust `IRQ_BINDINGS`.
+static mut PCIE1_MSI_SPI_REGISTERED: bool = false;
+
+/// Enable `spi_irq` in the GIC distributor and route its fires into the
+/// brcmstb PCIe1 MSI mux (`pcie::pcie1_msi_dispatch`, the architecture's
+/// registered IRQ multiplexer), so all 32 MSI vectors are serviced through
+/// one GIC SPI. Returns 0 on success, -ENOMEM if the binding table is full.
+#[cfg(feature = "board-pi5")]
+fn register_pcie1_msi_spi(spi_irq: u32) -> i32 {
+    gic::set_irq_mux(|| {
+        // SAFETY: runs on the IRQ path after `pcie1_msi_init` succeeded (the
+        // caller checks it before registering), with the MSI controller's
+        // registers mapped by the boot page tables.
+        let _ = unsafe { fluxor::platform::pcie::pcie1_msi_dispatch() };
+    });
+    irq_bind(spi_irq, gic::EVENT_HANDLE_MUX, 0, 0)
+}
+
+#[cfg(not(feature = "board-pi5"))]
+fn register_pcie1_msi_spi(_spi_irq: u32) -> i32 {
+    fluxor::kernel::sys::errno::ENOSYS
+}
 
 // ============================================================================
 // Platform address constants (compile-time board selection)
@@ -74,10 +161,9 @@ use uart::*;
 // in the submodule block above brings UART_BASE/UART_DR/UART_FR/etc.
 // into this file's namespace alongside the read/write functions.
 
-// GIC base addresses, IAR/EOIR pointers, and TIMER_PPI live in
-// `bcm2712/gic.rs` (brought in via `use gic::*` near the top of this
-// file). The constants stay name-identical so existing references in
-// the boot path resolve through the glob import unchanged.
+// The GIC and the timer are the architecture's (`fluxor::arch::aarch64`);
+// their board facts are the constants above, handed over by
+// `configure_arch`.
 #[cfg(not(feature = "board-pi5"))]
 const QEMU_CONFIG_BLOB_ADDR: usize = 0x6100_0000;
 #[cfg(not(feature = "board-pi5"))]
@@ -257,10 +343,8 @@ mod eth {
     }
 }
 
-// Timer driver lives in `src/platform/bcm2712/timer.rs` — see
-// the `#[path = "bcm2712/timer.rs"] mod timer;` declaration at the
-// top of this file. Public surface: `timer::{timer_freq,
-// read_timer_count, timer_set}`.
+// The generic timer driver is `fluxor::arch::aarch64::timer`:
+// `timer::{timer_freq, read_timer_count, timer_set}`.
 
 // ============================================================================
 // Multi-core init signaling
@@ -305,35 +389,9 @@ global_asm!(
     "    ubfx x0, x0, #8, #8",
     "    cbnz x0, .Lpark_core",
     // ---- Primary core (core 0) continues ----
-    // Pi 5 firmware hands off at EL2. Our kernel runs as EL1, so we must
-    // drop down. If we're already at EL1 this short-circuits.
-    "    mrs x0, CurrentEL",
-    "    cmp x0, #(2 << 2)", // currently at EL2?
-    "    b.ne 2f",           // no → skip EL drop
-    // At EL2: disable EL2 MMU/caches and prepare an eret to EL1h.
-    "    mrs x0, sctlr_el2",
-    "    bic x0, x0, #(1 << 0)",  // M
-    "    bic x0, x0, #(1 << 2)",  // C
-    "    bic x0, x0, #(1 << 12)", // I
-    "    msr sctlr_el2, x0",
-    "    isb",
-    // HCR_EL2.RW = 1 → EL1 is aarch64
-    "    mrs x0, hcr_el2",
-    "    mov x1, #(1 << 31)",
-    "    orr x0, x0, x1",
-    "    msr hcr_el2, x0",
-    // CNTHCTL_EL2: allow EL1 physical timer / counter access
-    "    mrs x0, cnthctl_el2",
-    "    orr x0, x0, #(1 << 0)", // EL1PCTEN
-    "    orr x0, x0, #(1 << 1)", // EL1PCEN
-    "    msr cnthctl_el2, x0",
-    "    msr cntvoff_el2, xzr",
-    // Fake EL1h return state: DAIF all masked, SP_EL1 selected
-    "    mov x0, #0x3c5", // (D|A|I|F)<<6 | 0b0101 = EL1h
-    "    msr spsr_el2, x0",
-    "    adr x0, 2f",
-    "    msr elr_el2, x0",
-    "    eret",
+    // Pi 5 firmware hands off at EL2. Our kernel runs as EL1, so we drop
+    // down (the architecture's drop; at EL1 already it falls through).
+    fluxor::drop_to_el1!("x0", "x1", "2f"),
     "2:",
     // Now at EL1 (either originally or via eret).
     // Install exception vectors for EL1.
@@ -821,6 +879,7 @@ fn poll_rebuild_bridge(domain_id: usize) {
 
 #[no_mangle]
 pub extern "C" fn main(dtb_phys: u64) -> ! {
+    configure_arch();
     // Pi 5 bring-up sequence:
     //   1. MMU enable — DRAM cacheable, RP1 MMIO as Device-nGnRE at 0x1c.
     //   2. rp1_pcie_disable_aspm() — surgical ASPM disable on PCIe RC.
@@ -842,6 +901,7 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     // SAFETY: uart_init configures the PL011 MMIO pre-driver; single-threaded boot.
     unsafe { uart_init() };
     UART_READY.store(1, Ordering::Release);
+    exception::set_dump_sink(exception_dump_to_uart);
     // UART FIFO is always drained by hardware, so the local log-ring
     // consumer can activate immediately.
     fluxor::kernel::sys::log_ring::activate_local();
@@ -933,7 +993,7 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     // boot path is the sole writer of; DAIFCLR enables IRQs after vectors
     // and step_guard are wired.
     unsafe {
-        gic_init();
+        gic::init();
         timer::timer_set(default_ticks);
         core::arch::asm!("msr daifclr, #2"); // enable IRQs
     }
@@ -1898,7 +1958,7 @@ fn secondary_core_main(domain_id: usize) -> ! {
     // SAFETY: secondary-core init runs once before the domain pump starts;
     // GIC + generic-timer registers are per-CPU.
     unsafe {
-        gic_init_secondary();
+        gic::init_secondary();
         timer::timer_set(ticks_for_domain);
         // Enable IRQs (not needed for Tier 3 poll-mode, but harmless)
         core::arch::asm!("msr daifclr, #2");
@@ -2850,7 +2910,7 @@ unsafe fn bcm_system_extension_dispatch(
 /// Protection impls (HalOps seam). On BCM2712 module protection is the EL0
 /// MMU.
 fn bcm_protection_set_enabled(enabled: bool) {
-    mmu::set_enabled(enabled);
+    isolation::set_enabled(enabled);
 }
 fn bcm_protection_register_module(
     module_idx: usize,
@@ -2861,7 +2921,7 @@ fn bcm_protection_register_module(
     heap_ptr: *mut u8,
     heap_size: usize,
 ) -> bool {
-    mmu::register_module(
+    isolation::register_module(
         module_idx,
         code_base as u64,
         code_size as u64,
@@ -2872,10 +2932,10 @@ fn bcm_protection_register_module(
     )
 }
 fn bcm_protection_map_page(module_idx: usize, vaddr: usize, phys: usize, writable: bool) {
-    mmu::map_4k_page(module_idx, vaddr as u64, phys as u64, writable);
+    isolation::map_4k_page(module_idx, vaddr as u64, phys as u64, writable);
 }
 fn bcm_protection_unmap_page(module_idx: usize, vaddr: usize) {
-    mmu::unmap_4k_page(module_idx, vaddr as u64);
+    isolation::unmap_4k_page(module_idx, vaddr as u64);
 }
 
 /// Park online secondaries for a structural mutation (HalOps seam): no-op
@@ -3326,11 +3386,11 @@ static BCM2712_HAL_OPS: HalOps = HalOps {
     smp_release_peers: multicore::release_quiesce,
     smp_max_domains: || multicore::MAX_DOMAINS,
     protection_set_enabled: bcm_protection_set_enabled,
-    protection_reset: mmu::reset_isolation,
+    protection_reset: isolation::reset_isolation,
     protection_register_module: bcm_protection_register_module,
-    protection_release_module: mmu::release_module,
-    protection_gateway_table: mmu::gateway_table,
-    protected_call: mmu::protected_call,
+    protection_release_module: isolation::release_module,
+    protection_gateway_table: isolation::gateway_table,
+    protected_call: isolation::protected_call,
     protection_map_page: bcm_protection_map_page,
     protection_unmap_page: bcm_protection_unmap_page,
     // An isolated module's stack sits above an unmapped guard page; the
