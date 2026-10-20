@@ -4,8 +4,10 @@ pub mod store {
     //! Runtime parameter store — boot scan, merge, and flash hardware bridge.
     //!
     //! The store occupies the last 4KB sector of flash. At boot, `boot_scan()`
-    //! reads the sector and `merge_runtime_overrides()` appends matching entries
-    //! into PARAM_BUFFER before each module's `module_new()`.
+    //! reads the sector, and `runtime_params()` merges a module's matching
+    //! entries over its compiled params (borrowed from flash) into
+    //! `MERGE_BUFFER` before its `module_new()`. A module with no stored
+    //! override is handed its compiled params in place, with no copy.
     //!
     //! Domain logic (store, delete, clear, compact) lives in the flash PIC module.
     //! The kernel provides raw flash erase/program bridge syscalls and a dispatch
@@ -51,6 +53,68 @@ pub mod store {
 
     /// Cached free offset within the sector (set by boot_scan).
     static mut FREE_OFFSET: usize = 0;
+
+    /// Where a module's compiled params and its stored overrides are merged,
+    /// one instance at a time. Only an instance that HAS an override is
+    /// copied here; every other module borrows its params from flash. Sized
+    /// from the silicon TOML (`[kernel] config_buffer_kb`).
+    const MERGE_BUFFER_SIZE: usize = crate::kernel::config::MAX_MODULE_CONFIG_SIZE;
+    static mut MERGE_BUFFER: [u8; MERGE_BUFFER_SIZE] = [0u8; MERGE_BUFFER_SIZE];
+
+    /// Bytes the stored overrides for `module_id` add to its params: each
+    /// entry's `[tag][len][value]`, plus a TLV header and the end marker.
+    /// 0 when it has none.
+    fn override_bytes(module_id: u8) -> usize {
+        // SAFETY: BOOT_OVERRIDES is written once by boot_scan, before any
+        // module is instantiated; this is a read on the instantiating core.
+        unsafe {
+            let table = &raw const BOOT_OVERRIDES;
+            if !(*table).valid {
+                return 0;
+            }
+            let mut bytes = 0usize;
+            let mut i = 0;
+            while i < (*table).count {
+                let e = &(*table).entries[i];
+                if e.module_id == module_id {
+                    bytes += 2 + e.value_len as usize;
+                }
+                i += 1;
+            }
+            if bytes == 0 {
+                0
+            } else {
+                bytes + 4 + 1
+            }
+        }
+    }
+
+    /// The params module `module_id` is handed: its compiled params in place,
+    /// or a merge of them and its stored overrides in `MERGE_BUFFER`
+    /// (`kernel::sys::hal::RuntimeParams`).
+    pub fn runtime_params(
+        module_id: u8,
+        compiled: &[u8],
+    ) -> crate::kernel::sys::hal::RuntimeParams {
+        use crate::kernel::sys::hal::RuntimeParams;
+        let extra = override_bytes(module_id);
+        if extra == 0 {
+            return RuntimeParams::Compiled;
+        }
+        let need = compiled.len() + extra;
+        if need > MERGE_BUFFER_SIZE {
+            return RuntimeParams::TooLarge(need);
+        }
+        // SAFETY: one instantiation at a time on the scheduler core; the
+        // previous merge's consumer has finished with the buffer (see
+        // `RuntimeParams::Merged`). `need <= MERGE_BUFFER_SIZE` checked above.
+        unsafe {
+            let buf = core::ptr::addr_of_mut!(MERGE_BUFFER).cast::<u8>();
+            core::ptr::copy_nonoverlapping(compiled.as_ptr(), buf, compiled.len());
+            let len = merge_runtime_overrides(module_id, buf, compiled.len(), need);
+            RuntimeParams::Merged(buf as *const u8, len)
+        }
+    }
 
     // ============================================================================
     // Flash store dispatch — registered by flash module at runtime
@@ -306,7 +370,7 @@ pub mod store {
     /// `parse_tlv()` processes entries sequentially (last writer wins),
     /// overrides naturally take precedence.
     ///
-    /// `param_buf` points to PARAM_BUFFER data, `param_len` is current length.
+    /// `param_buf` points to `MERGE_BUFFER`, `param_len` is current length.
     /// Returns the new length.
     ///
     /// # Safety

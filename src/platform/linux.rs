@@ -663,11 +663,19 @@ fn main() {
 
     let args = parse_args();
 
-    // Read config from file (regular read — config is data, not code)
-    let config_data = fs::read(&args.config_path).unwrap_or_else(|e| {
-        eprintln!("error: failed to read config {}: {}", args.config_path, e);
-        process::exit(1);
-    });
+    // Read config from file (regular read — config is data, not code). The
+    // parsed config borrows every module's params from these bytes in place,
+    // so they are leaked: resident for the life of the process, as the
+    // config blob is on every platform. The file's length is the parser's
+    // only bound on it.
+    let config_data: &'static [u8] = Box::leak(
+        fs::read(&args.config_path)
+            .unwrap_or_else(|e| {
+                eprintln!("error: failed to read config {}: {}", args.config_path, e);
+                process::exit(1);
+            })
+            .into_boxed_slice(),
+    );
 
     // mmap modules with PROT_READ | PROT_EXEC — PIC modules contain executable code.
     // Using fs::read() would place code in non-executable heap memory, causing SEGV.
@@ -717,12 +725,12 @@ fn main() {
     // Length-aware: pass the file's exact byte count for both blobs
     // so the parser rejects any section that would extend past the
     // actual mappings.
-    // SAFETY: `config_data` is a Vec<u8>; `modules_ptr`/`modules_len` come from
+    // SAFETY: `config_data` is the leaked, resident config; `modules_ptr`/`modules_len` come from
     // the mmap above and cover the full file. `populate_static_state_with_len`
     // bounds-checks both blobs against the supplied lengths.
     if let Err(msg) = unsafe {
         scheduler::populate_static_state_with_len(
-            &config_data,
+            config_data,
             modules_ptr as *const u8,
             modules_len,
         )

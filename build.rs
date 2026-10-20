@@ -164,7 +164,6 @@ struct KernelConfig {
     state_arena_kb: u32,
     buffer_arena_kb: u32,
     config_buffer_kb: u32,
-    config_arena_kb: u32,
     log_ring_kb: u32,
     ram_static_max_kb: u32,
     kernel_stack_reserve_kb: u32,
@@ -335,12 +334,6 @@ fn generate_chip_rs(
         "MAX_MODULE_CONFIG_SIZE",
         "usize",
         &format!("{}", k.config_buffer_kb * 1024),
-    );
-    emit_const(
-        &mut g,
-        "CONFIG_ARENA_SIZE",
-        "usize",
-        &format!("{}", k.config_arena_kb * 1024),
     );
     emit_const(
         &mut g,

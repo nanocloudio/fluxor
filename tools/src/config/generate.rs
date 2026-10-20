@@ -1314,8 +1314,9 @@ const WORKLOAD_NODE_KEYS: &[&str] = &[
     "voices",
 ];
 
-/// A workload module's `heap:` flags as params TLV entries (0xF8 zero on
-/// free, 0xF9 fault on alloc failure, 0xFA canary), with the base graph's
+/// A workload module's `heap:` keys as params TLV entries (0xF8 zero on
+/// free, 0xF9 fault on alloc failure, 0xFA canary, 0xEF the instance's heap
+/// cap), with the base graph's
 /// validation and encoding, inserted before the TLV's end marker. A module
 /// with no schema params gets a TLV of its own for them.
 fn insert_workload_heap_tags(params: Vec<u8>, module: &Value, mname: &str) -> Result<Vec<u8>> {
@@ -1332,6 +1333,13 @@ fn insert_workload_heap_tags(params: Vec<u8>, module: &Value, mname: &str) -> Re
     }
     if heap.get("canary_enabled").and_then(|v| v.as_bool()) == Some(true) {
         entries.extend_from_slice(&[0xFA, 1, 1]);
+    }
+    if let Some(n) = heap
+        .get("arena_bytes")
+        .and_then(|v| heap_arena_bytes(v).ok())
+    {
+        entries.extend_from_slice(&[0xEF, 4]);
+        entries.extend_from_slice(&n.to_le_bytes());
     }
     if entries.is_empty() {
         return Ok(params);

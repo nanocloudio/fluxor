@@ -159,8 +159,11 @@ fn wasm_release_module_handles(_id: crate::kernel::exec::scheduler::ModuleId) {
     // WASM target. The browser shim owns its own lifetimes.
 }
 fn wasm_boot_scan() {}
-fn wasm_merge_runtime_overrides(_module_id: u16, _buf: *mut u8, len: usize, _max: usize) -> usize {
-    len
+fn wasm_runtime_params(
+    _module_id: u16,
+    _compiled: &[u8],
+) -> crate::kernel::sys::hal::RuntimeParams {
+    crate::kernel::sys::hal::RuntimeParams::Compiled
 }
 fn wasm_init_gpio(_gpio: &[Option<GpioConfig>]) -> usize {
     0
@@ -248,7 +251,7 @@ pub static WASM_HAL_OPS: HalOps = HalOps {
     init_providers: wasm_init_providers,
     release_module_handles: wasm_release_module_handles,
     boot_scan: wasm_boot_scan,
-    merge_runtime_overrides: wasm_merge_runtime_overrides,
+    runtime_params: wasm_runtime_params,
     init_gpio: wasm_init_gpio,
     csprng_fill: wasm_csprng_fill,
     core_id: wasm_core_id,

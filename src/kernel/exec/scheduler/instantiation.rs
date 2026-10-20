@@ -715,6 +715,40 @@ pub fn params_request_isolation(params: &[u8]) -> bool {
     params_protection_level(params) >= protection_level::CONTAINED
 }
 
+/// Params TLV tag carrying an instance's heap cap: the graph's
+/// `heap.arena_bytes`, a u32 LE. It overrides the module type's declared
+/// arena for this instance alone (tools `config::builder`, and the workload
+/// path's `insert_workload_heap_tags`).
+pub const HEAP_ARENA_TAG: u8 = 0xEF;
+
+/// The heap cap a module's params give this instance (tag
+/// [`HEAP_ARENA_TAG`]), found by walking the TLV as
+/// [`params_protection_level`] does. The loader reads it before it sizes the
+/// heap, which is before `parse_protection_config` runs. `None` when the
+/// params name none; a malformed entry (any length but 4) counts as none.
+pub fn params_heap_arena_bytes(params: &[u8]) -> Option<usize> {
+    if params.len() < 4 {
+        return None;
+    }
+    let mut pos = if params[0] == 0xFE { 4 } else { 0 };
+    while pos + 2 <= params.len() {
+        let tag = params[pos];
+        let len = params[pos + 1] as usize;
+        pos += 2;
+        if tag == 0xFF {
+            break;
+        }
+        let value = params.get(pos..pos + len)?;
+        if tag == HEAP_ARENA_TAG {
+            return <[u8; 4]>::try_from(value)
+                .ok()
+                .map(|b| u32::from_le_bytes(b) as usize);
+        }
+        pos += len;
+    }
+    None
+}
+
 /// Whether a params TLV tag is a node tag: one only the node's own graph
 /// may give a module, because what it sets is a grant of the node's or
 /// reaches past the module.
@@ -731,10 +765,10 @@ pub fn params_request_isolation(params: &[u8]) -> bool {
 /// - 0xFB, 0xFC: ISR cycle budget and hardware IRQ.
 /// - 0xFD: device window, a register block mapped into the module's domain.
 ///
-/// The heap flags 0xF8–0xFA (zero on free, fault on alloc failure, canary)
-/// are not node tags. They change how the module's own heap behaves, and
-/// that heap is the module's arena, which is charged to its owner's state
-/// cap.
+/// The heap tags 0xF8–0xFA (zero on free, fault on alloc failure, canary)
+/// and 0xEF (the instance's heap cap) are not node tags. They change how
+/// the module's own heap behaves and how large it may grow, and that heap is
+/// charged, at its cap, to its owner's state cap.
 pub const fn is_node_param_tag(tag: u8) -> bool {
     matches!(tag, 0xF0..=0xF7 | 0xFB..=0xFD)
 }

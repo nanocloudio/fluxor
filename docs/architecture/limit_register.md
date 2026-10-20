@@ -57,8 +57,8 @@ rp-large     | all(not(target_arch = "aarch64"),not(feature = "chip-rp2040"),not
 ## Kernel capacity is not ABI
 
 The kernel's own capacity — `STATE_ARENA_SIZE`, `BUFFER_ARENA_SIZE`,
-`CONFIG_ARENA_SIZE`, `MAX_MODULE_CONFIG_SIZE`, `LOG_RING_CAPACITY`,
-`ELASTIC_REGION_SIZE`, `MAX_MODULES`, `MAX_BRIDGES`, `MAX_MODULE_CODE_SIZE` —
+`MAX_MODULE_CONFIG_SIZE` (RP only), `LOG_RING_CAPACITY`, `ELASTIC_REGION_SIZE`,
+`HEAP_SEGMENTS`, `MAX_MODULES`, `MAX_BRIDGES`, `MAX_MODULE_CODE_SIZE` —
 is stated in `src/kernel/config.rs`, one profile per kernel platform
 (`profile_linux`, `profile_bcm2712`, `profile_wasm`, `profile_rp`; the RP
 arenas come from the silicon TOML through `platform::chip`). It is never
@@ -149,7 +149,6 @@ CAPACITY >= PSTATUS_ROUND | src/kernel/sys/telemetry_ring.rs
 | Instrument dimension cardinality | `DIM_MAX_PRODUCT` | modules/sdk/contracts/telemetry.rs | 65534 | Policy: the product of one instrument's declared dimension domains, enforced at build so every composite index stays below the reserved `DIM_OTHER` (`0xFFFF`). Cardinality is a declared resource bound — an instrument that would exceed it shrinks a domain rather than discovering the ceiling at runtime |
 | Single module code segment | `MAX_MODULE_CODE_SIZE` | src/kernel/config.rs | 1048576 | Sanity bound: catches a corrupt or runaway blob, not a budget; 393216 on RP2040. Code runs in place from flash on RP parts, so it is set by the part's flash; `module_code_kb` in the silicon TOML mirrors it and the packer refuses a module over it |
 | Whole modules blob | `MAX_MODULES_BLOB_SIZE` | src/kernel/module/loader.rs | 8388608 | Sanity bound: a boot-image module table past this is refused at load |
-| Boot config blob | `MAX_CONFIG_SIZE` | src/kernel/boot/config.rs | 524288 | Sanity bound on the packed config: 512 KiB on linux, wasm and bcm2712 (an orchestrator's whole control plane as params is ~270 KiB), 32 KiB on the RP parts; an oversize blob is refused as `TooLarge`, and the CLI refuses to build one (`kernel_max_config_size`) |
 | OTA staging area (per A/B stage) | `STAGE_CAPACITY` | src/kernel/module/ota_stage.rs | 8388608 | Policy: a graph image larger than one stage is refused ENOSPC at stage write |
 | Module state arena | `STATE_ARENA_SIZE` | src/kernel/config.rs | 1073741824 | Policy: it must hold every module of the busiest graph at once, with headroom. A node hosts workload subgraphs beside its own graph in the same pool: a bare-metal node's control plane seats ~253 MiB, and one key-value workload's state worker asks 15-23 MiB. The bcm2712 kernel places it in a linker region of its own, the Pi 5's DRAM above 1 GB (clear of the firmware's reservation at the top of the first GB, and of the DTB and initramfs it places near 0x2E00_0000) and the QEMU machine's upper GB, so a Pi 5 running the host profile needs 2 GB; the `ip` connection table holds its first 512 records inline (~1.1 MiB) and backs the rest from the elastic region, so no single module approaches the arena. 240 KiB on rp2350 and 64 KiB on rp2040, from the silicon TOML, where the whole envelope is different. It costs no image bytes and is never zeroed whole: the loader zeroes each allocation. Exhaustion is refused at module load, not at the allocation that overruns |
 | Single channel ring | `MAX_CHAN_BYTES` | src/kernel/ipc/channel.rs | 4194304 | Sanity bound on one ring's share of the buffer arena |
@@ -317,9 +316,8 @@ cannot be evaluated from its own file reads `—` and says why.
 |---|---|---|---|---|
 | Channel buffer arena | `BUFFER_ARENA_SIZE` | src/kernel/config.rs | 16777216 | Sized (host): a node's own graph (the bare-metal control plane holds ~8 MiB of channels) plus the workload subgraphs it hosts, at 16–128 KiB per channel; 8 MiB on wasm; the wasm arena is paged lazily by `memory.grow` so it costs nothing until used. 64 KiB on rp2350 and 16 KiB on rp2040, from the silicon TOML, where the whole envelope is different. Exhaustion refuses the channel open at compose time, never at runtime |
 | Tier B elastic region | `ELASTIC_REGION_SIZE` | src/kernel/config.rs | 16777216 | Policy: the oversubscribable region every elastic pool draws 64 KiB-quantum chunks from; 128 chunks on the host, which is the same depth as the kernel's chunk table. Zero on RP, where `ELASTIC_ALLOC` denies and elasticity compiles out; 2 MiB on wasm. The tools mirror (`capacity::HOST_ELASTIC_REGION`) is pinned to it per profile. |
-| Config arena | `CONFIG_ARENA_SIZE` | src/kernel/config.rs | 262144 | Sized against the largest per-module params section (~95 KiB for an http module on the host) with headroom for the rest of the graph. A packed config larger than this is refused at boot. 32 KiB on wasm; on RP 16 KiB (rp2350) and 8 KiB (rp2040), from the silicon TOML. |
-| One module's params section | `MAX_MODULE_CONFIG_SIZE` | src/kernel/config.rs | 262144 | Sanity bound on one module's slice of the config arena; kept in lockstep with the kernel's `MAX_MODULE_SECTION` and the CLI's params cap so the three refuse the same blob. 16 KiB on wasm; on the RP parts 16 KiB (rp2350) and 8 KiB (rp2040), taken from `[kernel] config_buffer_kb` in the silicon TOML, which `profile_rp` re-exports. An instance whose params exceed it fails to instantiate with a logged error; it is never truncated |
-| Kernel module-section bound | `MAX_MODULE_SECTION` | src/kernel/boot/config.rs | 524288 | The kernel-side bound on the module section: 512 KiB on linux, wasm and bcm2712 — the same as `MAX_CONFIG_SIZE`, since the section is nearly all of a large graph's config — 32 KiB on the RP parts. A section past it is refused while parsing, before any module is instantiated. Registered separately from `MAX_MODULE_CONFIG_SIZE`, the per-module cap it must hold, so the pair cannot drift apart unnoticed |
+| RP override-merge buffer | `MAX_MODULE_CONFIG_SIZE` | src/kernel/config.rs | — | RP only, 16 KiB (rp2350) and 8 KiB (rp2040), from `[kernel] config_buffer_kb` in the silicon TOML, which `profile_rp` re-exports. Module params are borrowed from the config blob in place on every platform, so no profile bounds a module's params or the config's size: the blob's mapped length is the only bound (the file on Linux, the payload window below `.bss` on a RAM-loaded aarch64 image, the graph slot or the flash below the slots on RP). This buffer is the one copy left: the RP flash parameter store merges a module's stored overrides over its compiled params here, and only for a module that has an override. A merge that does not fit refuses the instance with a logged error; it is never truncated. Linux merges into a buffer grown to the merge |
+| Module heap segments | `HEAP_SEGMENTS` | src/kernel/config.rs | 8 | Derived, not tuned: an elastic heap's first segment is `cap >> (HEAP_SEGMENTS - 1)` (at least the 64 KiB quantum) and every carve at least doubles what is committed, so eight carves reach any cap and the last slot takes what is left. Above 1 a module heap commits state-arena memory only as the module allocates, up to its cap (the type's declared arena, or the graph's per-instance `heap.arena_bytes`); growth past the cap, or past what the state arena holds, returns null, is counted (`grow_denied`) and logged. 8 on linux and bcm2712; 1 on wasm and RP, which commit every heap whole at instantiation as their state-arena budgets plan |
 | Store read slots | `STORE_MAX_READS` | src/platform/linux/store.rs | 32 | Policy: `GET`-opened read slots on the Linux store at once. A slot holds one value snapshot the caller drains by `RANGE_GET`, so the table bounds how many reads a node can have in flight; an open past it is `ENOMEM` |
 | Store streaming-write slots | `STORE_MAX_WRITES` | src/platform/linux/store.rs | 32 | Policy: `PUT_STREAMED_OPEN`-opened write slots at once, matched to `STORE_MAX_READS` and for the same reason — one slot per operation in flight. An S3 server fronting this store streams every object write, so writes need the depth reads have; an open past it is `ENOMEM` |
 | Workload open files | `OWNER_MAX_OPEN_FILES` | src/kernel/workload/storage.rs | 32 | Policy: files one workload holds open through its storage root at once, on every platform, so no workload can take the file table the node and every other workload open from; an open past it is `ENOMEM` |
@@ -358,7 +356,7 @@ cannot be evaluated from its own file reads `—` and says why.
 | Persisted vault keys | `MAX_PERSISTED` | src/kernel/security/key_vault.rs | — | Policy, per-profile (64 aarch64 / 8 elsewhere), like the slot table: a Pi-class node persists a master per Clustor group, replica and key epoch, per locally encrypted volume, and its identities. With none free, persisting is refused and the consumer refuses its operation rather than holding an unpersisted key |
 | One AEAD seal/open | `MAX_SEAL_BYTES` | src/kernel/security/key_vault.rs | 2048 | Policy: a resumption ticket or a checkpoint chunk in one call, never a bulk stream; a larger plaintext is refused EINVAL |
 | Consumed share envelopes | `MAX_CONSUMED` | src/kernel/security/key_share.rs | 32 | Policy: anti-replay ids of the last envelopes a reconstruction used, refused EACCES if presented again. An attachment envelope's recipient is a fresh key destroyed after the attach, which stops replay to any other opener; the ring covers the recipient's own lifetime, which spans one attach |
-| Parameter tag space | `PARAM_TAG_MAX` | tools/src/manifest.rs | 239 | Id width: a module parameter is addressed by a byte tag, and 0xF0–0xFF are reserved for protection and policy metadata (voice-preset blobs, TLV magic, the terminator among them) |
+| Parameter tag space | `PARAM_TAG_MAX` | tools/src/manifest.rs | 238 | Id width: a module parameter is addressed by a byte tag, and 0xEF–0xFF are reserved for kernel, protection and policy metadata (0xEF an instance's heap cap, the voice-preset blobs, TLV magic and the terminator among them) |
 | Transmit-side ethernet frame | `MAX_FRAME_SIZE` | modules/foundation/ip/mod.rs | 1536 | Policy: the frame ceiling every NIC driver and `ip` size their staging to — MTU plus headers, rounded to a 32-byte multiple. Every transmit-payload ceiling in `ip` derives from it |
 | Listening TCP sockets | `MAX_LISTENERS` | modules/foundation/ip/mod.rs | — | Policy, per-profile (derived from `MAX_TCP_CONNS`): a SYN is matched against the listener list, never the whole table |
 | Outbound net queue | `NET_OUT_QUEUE_SLOTS` | modules/foundation/ip/mod.rs | 32 | Policy: frames `ip` holds for a consumer that is not draining; the receive loop stops reading the NIC when fewer than the headroom remain, so back-pressure reaches the wire instead of dropping on the floor |
@@ -421,14 +419,11 @@ BUFFER_ARENA_SIZE | src/kernel/config.rs | 16 * 1024 * 1024 | linux
 BUFFER_ARENA_SIZE | src/kernel/config.rs | 16 * 1024 * 1024 | bcm2712
 BUFFER_ARENA_SIZE | src/kernel/config.rs | 8 * 1024 * 1024 | wasm-kernel
 BUFFER_ARENA_SIZE | src/kernel/config.rs | crate::platform::chip::BUFFER_ARENA_SIZE | rp
-CONFIG_ARENA_SIZE | src/kernel/config.rs | 256 * 1024 | linux
-CONFIG_ARENA_SIZE | src/kernel/config.rs | 256 * 1024 | bcm2712
-CONFIG_ARENA_SIZE | src/kernel/config.rs | 32 * 1024 | wasm-kernel
-CONFIG_ARENA_SIZE | src/kernel/config.rs | crate::platform::chip::CONFIG_ARENA_SIZE | rp
-MAX_MODULE_CONFIG_SIZE | src/kernel/config.rs | 256 * 1024 | linux
-MAX_MODULE_CONFIG_SIZE | src/kernel/config.rs | 256 * 1024 | bcm2712
-MAX_MODULE_CONFIG_SIZE | src/kernel/config.rs | 16 * 1024 | wasm-kernel
 MAX_MODULE_CONFIG_SIZE | src/kernel/config.rs | crate::platform::chip::MAX_MODULE_CONFIG_SIZE | rp
+HEAP_SEGMENTS | src/kernel/config.rs | 8 | linux
+HEAP_SEGMENTS | src/kernel/config.rs | 8 | bcm2712
+HEAP_SEGMENTS | src/kernel/config.rs | 1 | wasm-kernel
+HEAP_SEGMENTS | src/kernel/config.rs | 1 | rp
 LOG_RING_CAPACITY | src/kernel/config.rs | 65536 | linux
 LOG_RING_CAPACITY | src/kernel/config.rs | 65536 | bcm2712
 LOG_RING_CAPACITY | src/kernel/config.rs | 16384 | wasm-kernel
@@ -489,8 +484,6 @@ TELEMETRY_MAX_RECORD | src/kernel/exec/scheduler/module_types.rs | 144 | *
 DIM_MAX_PRODUCT | modules/sdk/contracts/telemetry.rs | 65534 | *
 MAX_MODULES_BLOB_SIZE | src/kernel/module/loader.rs | 8 * 1024 * 1024 | *
 MAX_CONTRACTS_PER_PROVIDER | src/kernel/module/loader.rs | 4 | *
-MAX_CONFIG_SIZE | src/kernel/boot/config.rs | 512 * 1024 | large-config
-MAX_CONFIG_SIZE | src/kernel/boot/config.rs | 32 * 1024 | small-config
 STAGE_CAPACITY | src/kernel/module/ota_stage.rs | 8 * 1024 * 1024 | *
 MAX_CHAN_BYTES | src/kernel/ipc/channel.rs | 4 * 1024 * 1024 | *
 MAX_CONNS | modules/sdk/abi/config.rs | 64 | host
@@ -667,8 +660,6 @@ MAX_STREAM_IDS | modules/foundation/smmu/mod.rs | 8 | *
 CKPT_SNI_MAX | modules/foundation/tls/continuity.rs | 64 | *
 CKPT_ALPN_MAX | modules/foundation/tls/continuity.rs | 16 | *
 CONT_DRAIN_BUDGET | modules/foundation/tls/continuity.rs | 8 | *
-MAX_MODULE_SECTION | src/kernel/boot/config.rs | 512 * 1024 | large-config
-MAX_MODULE_SECTION | src/kernel/boot/config.rs | 32 * 1024 | small-config
 MAX_CONCURRENT_CONNS | modules/sdk/abi/config.rs | 256 | host
 MAX_CONCURRENT_CONNS | modules/sdk/abi/config.rs | 256 | wasm
 MAX_CONCURRENT_CONNS | modules/sdk/abi/config.rs | 4 | embedded+rp2350
@@ -718,7 +709,7 @@ MAX_PERSISTED | src/kernel/security/key_vault.rs | 64 | host
 MAX_PERSISTED | src/kernel/security/key_vault.rs | 8 | off-host
 MAX_SEAL_BYTES | src/kernel/security/key_vault.rs | 2048 | *
 MAX_CONSUMED | src/kernel/security/key_share.rs | 32 | *
-PARAM_TAG_MAX | tools/src/manifest.rs | 0xEF | *
+PARAM_TAG_MAX | tools/src/manifest.rs | 0xEE | *
 MAX_CHAIN_LINKS | modules/sdk/contracts/mesh/capability.rs | 8 | *
 MAX_CHAIN_BYTES | modules/sdk/contracts/mesh/capability.rs | CHAIN_HDR + MAX_CHAIN_LINKS * LINK_LEN | *
 MAX_ROOTS | modules/sdk/contracts/mesh/capability.rs | 2 | *
@@ -866,7 +857,6 @@ ADAPTIVE_POST_SIZE | src/kernel/boot/config.rs | packed graph-section layout
 GRAPH_SECTION_SIZE | src/kernel/boot/config.rs | derived from MAX_GRAPH_EDGES and the layout sizes
 GRAPH_SLOTS_CODE | src/kernel/boot/config.rs | packed graph-section layout, derived from MAX_GRAPH_EDGES
 HEADER_SIZE | src/kernel/boot/config.rs | config blob header layout
-CONFIG_ARENA_SIZE | src/kernel/boot/config.rs | mirror of the platform config's CONFIG_ARENA_SIZE
 BUFFER_SIZE | src/kernel/ipc/buffer_pool.rs | mirror of CHANNEL_BUFFER_SIZE
 BUFFER_ARENA_SIZE | src/kernel/ipc/buffer_pool.rs | mirror of the platform config's BUFFER_ARENA_SIZE
 MODULE_STATE_SIZE | src/kernel/module/loader.rs | a parameter-name hash, not a size

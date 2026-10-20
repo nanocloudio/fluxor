@@ -523,13 +523,14 @@ fn linux_boot_scan() {
     param_store::boot_scan();
 }
 
-/// # Safety
-/// The HAL hook promises `buf` covers `max` writable bytes whose first `len`
-/// are the module's compiled parameters.
-fn linux_merge_runtime_overrides(module_id: u16, buf: *mut u8, len: usize, max: usize) -> usize {
-    // SAFETY: the contract above, which is the same one the RP
-    // implementation is written against.
-    unsafe { param_store::merge_runtime_overrides(module_id, buf, len, max) }
+/// The params a module is handed: compiled params in place unless the
+/// parameter store holds an override for it (`param_store::runtime_params`).
+fn linux_runtime_params(module_id: u16, compiled: &[u8]) -> fluxor::kernel::sys::hal::RuntimeParams {
+    use fluxor::kernel::sys::hal::RuntimeParams;
+    match param_store::merged_params(module_id, compiled) {
+        None => RuntimeParams::Compiled,
+        Some((ptr, len)) => RuntimeParams::Merged(ptr, len),
+    }
 }
 
 static LINUX_HAL_OPS: HalOps = HalOps {
@@ -571,7 +572,7 @@ static LINUX_HAL_OPS: HalOps = HalOps {
     init_providers: linux_init_providers,
     release_module_handles: linux_release_module_handles,
     boot_scan: linux_boot_scan,
-    merge_runtime_overrides: linux_merge_runtime_overrides,
+    runtime_params: linux_runtime_params,
     init_gpio: |_| 0,
     csprng_fill: linux_csprng_fill,
     core_id: || 0,

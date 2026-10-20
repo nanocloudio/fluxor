@@ -1748,7 +1748,6 @@ mod tests {
             "STATE_ARENA_SIZE",
             "BUFFER_ARENA_SIZE",
             "MAX_MODULE_CONFIG_SIZE",
-            "CONFIG_ARENA_SIZE",
             "LOG_RING_CAPACITY",
         ] {
             let decl = format!("pub const {konst}: usize = crate::platform::chip::{konst};");
@@ -1891,7 +1890,6 @@ mod tests {
             for (pool_name, konst) in [
                 ("state_arena", "STATE_ARENA_SIZE"),
                 ("buffer_arena", "BUFFER_ARENA_SIZE"),
-                ("config_arena", "CONFIG_ARENA_SIZE"),
                 ("elastic_region", "ELASTIC_REGION_SIZE"),
             ] {
                 assert_eq!(
@@ -1904,7 +1902,6 @@ mod tests {
         for (pool_name, konst) in [
             ("state_arena", "STATE_ARENA_SIZE"),
             ("buffer_arena", "BUFFER_ARENA_SIZE"),
-            ("config_arena", "CONFIG_ARENA_SIZE"),
             ("elastic_region", "ELASTIC_REGION_SIZE"),
         ] {
             assert_eq!(
@@ -1932,10 +1929,10 @@ mod tests {
             cap_mirror::HOST_BUFFER_ARENA,
             k("profile_bcm2712", "BUFFER_ARENA_SIZE", "bcm2712")
         );
-        assert_eq!(
-            cap_mirror::HOST_CONFIG_ARENA,
-            k("profile_bcm2712", "CONFIG_ARENA_SIZE", "bcm2712")
-        );
+        // No profile compiles a config arena: params are borrowed in place.
+        for t in ["linux", "bcm2712", "wasm", "rp2040", "rp2350"] {
+            assert_eq!(pool(t, "config_arena"), None, "{t} config_arena");
+        }
         assert_eq!(
             cap_mirror::HOST_ELASTIC_REGION,
             k("profile_bcm2712", "ELASTIC_REGION_SIZE", "bcm2712")

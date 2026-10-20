@@ -12,7 +12,7 @@
 //! ## Concurrency
 //!
 //! Most `static mut` storage here (`STATIC_CONFIG`, `STATIC_LOADER`,
-//! `SCHED`, `PARAM_BUFFER`, `NAME_STORAGE`, `INSTANTIATION_*`,
+//! `SCHED`, `NAME_STORAGE`, `INSTANTIATION_*`,
 //! `MODULE_STATE_PTR`) is populated on core 0 during graph compile,
 //! then treated as read-only across all cores during step.
 //! `FAN_BUFS[d]` is per-domain scratch indexed by tee/merge `domain_id`
@@ -614,64 +614,6 @@ pub fn close_channels(edges: &[Edge]) {
         if edge.channel >= 0 {
             syscalls::channel_close(edge.channel);
         }
-    }
-}
-
-// ============================================================================
-// Parameter Buffer
-// ============================================================================
-
-/// Largest params block one module instance may carry (`kernel::config`).
-const MAX_MODULE_CONFIG_SIZE: usize = crate::kernel::config::MAX_MODULE_CONFIG_SIZE;
-
-/// Buffer for module params.
-///
-/// Params are purely module-specific config from YAML.
-/// Channels are passed as direct arguments to module_new.
-///
-/// IMPORTANT: This is statically allocated to avoid inflating the async
-/// future size (16KB+ buffer would cause stack overflow when embedded
-/// in the async state machine).
-#[repr(C, align(4))]
-pub struct ParamBuffer {
-    data: [u8; MAX_MODULE_CONFIG_SIZE],
-    len: usize,
-}
-
-/// Static param buffer — only used during sequential module instantiation.
-static mut PARAM_BUFFER: ParamBuffer = ParamBuffer {
-    data: [0; MAX_MODULE_CONFIG_SIZE],
-    len: 0,
-};
-
-impl ParamBuffer {
-    fn as_ptr(&self) -> *const u8 {
-        self.data.as_ptr()
-    }
-
-    fn as_mut_ptr(&mut self) -> *mut u8 {
-        self.data.as_mut_ptr()
-    }
-
-    fn len(&self) -> usize {
-        self.len
-    }
-
-    fn set_len(&mut self, len: usize) {
-        self.len = len;
-    }
-
-    /// Copy module-specific config bytes. A block larger than the buffer is
-    /// refused whole (`Err` carries its length), never cut short: a module
-    /// handed the front of its params parses a different config from the one
-    /// it was given, and nothing downstream could tell.
-    fn write(&mut self, config: &[u8]) -> Result<(), usize> {
-        let Some(dst) = self.data.get_mut(..config.len()) else {
-            return Err(config.len());
-        };
-        dst.copy_from_slice(config);
-        self.len = config.len();
-        Ok(())
     }
 }
 

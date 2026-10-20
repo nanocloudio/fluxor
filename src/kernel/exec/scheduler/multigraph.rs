@@ -1741,8 +1741,18 @@ pub fn channel_port_lookup(port_type: u8, index: u8) -> i32 {
 pub unsafe extern "C" fn syscall_arena_get(size_out: *mut u32) -> *mut u8 {
     let cm = current_module_index();
     let arena = &SCHED.arenas[cm];
+    // An elastic heap has no arena until asked: commit its whole cap now, as
+    // one contiguous region, for a module that uses its arena raw.
+    let (ptr, size) = if arena.ptr.is_null() && arena.size > 0 {
+        match crate::kernel::mem::heap::commit_whole(cm) {
+            Some((p, n)) => (p, n as u32),
+            None => (core::ptr::null_mut(), 0),
+        }
+    } else {
+        (arena.ptr, arena.size)
+    };
     if !size_out.is_null() {
-        *size_out = arena.size;
+        *size_out = size;
     }
-    arena.ptr
+    ptr
 }

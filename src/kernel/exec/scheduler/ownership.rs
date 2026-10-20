@@ -476,11 +476,14 @@ pub fn free_module_state(module_idx: usize) {
         ModuleSlot::Dynamic(m) => m.into_state_range(),
         _ => (core::ptr::null_mut(), 0),
     };
+    // An elastic heap records a null arena (its cap is what the owner was
+    // charged) and owns the segments it carved; they go with the rest.
     let memory = crate::kernel::module::loader::ModuleMemory::new(
         state,
         (arena.ptr, arena.size as usize),
         private,
-    );
+    )
+    .with_heap(crate::kernel::mem::heap::detach_module_heap(module_idx));
     if crate::kernel::module::block_lend::holds_lends(module_idx) {
         crate::kernel::module::block_lend::quarantine(module_idx, memory);
     } else {

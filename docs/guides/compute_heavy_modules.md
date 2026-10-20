@@ -28,8 +28,9 @@ work in the same tick, but each burst step is still bounded.
 
 Use memory by role:
 
-- the module's heap arena (sized by `module_arena_size`, allocated from
-  `STATE_ARENA`) for persistent module state
+- the module's heap (capped by its declared arena or the instance's
+  `heap.arena_bytes`, committed from `STATE_ARENA`) for persistent module
+  state
 - channels and shared buffers for frame transport
 
 Large transient payloads flow through buffers and channels rather than being

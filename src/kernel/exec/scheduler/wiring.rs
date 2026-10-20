@@ -624,21 +624,6 @@ pub fn instantiate_one_module(
         return InstantiateResult::Error(-1);
     }
 
-    // A params block the kernel cannot hold whole fails the instance, loudly,
-    // before any of its state is set up. Truncating it would hand the module
-    // a different config from the one the graph declares.
-    let params_len = entry.params().len();
-    if params_len > MAX_MODULE_CONFIG_SIZE {
-        log::error!(
-            "[inst] module={} ({}) params {} B exceed MAX_MODULE_CONFIG_SIZE={} B — instance refused",
-            entry.id,
-            static_name,
-            params_len,
-            MAX_MODULE_CONFIG_SIZE
-        );
-        return InstantiateResult::Error(-1);
-    }
-
     // Select capability-filtered syscall table based on module type
     let syscalls = get_table_for_module_type(found_module.header.module_type);
 
@@ -699,33 +684,33 @@ pub fn instantiate_one_module(
         sched.arenas[instantiated] = ArenaInfo::empty();
     }
 
-    // Copy params to static buffer and merge runtime overrides
-    // SAFETY: PARAM_BUFFER is scheduler-thread owned; consumed by
-    // start_new below.
-    unsafe {
-        let pb = &mut *core::ptr::addr_of_mut!(PARAM_BUFFER);
-        if let Err(len) = pb.write(entry.params()) {
+    // The params the module is handed. Compiled params are never copied: the
+    // module gets a pointer into the resident config blob (or, for a live
+    // add, into the request that carries them). Only an instance the platform
+    // holds runtime overrides for gets a merged copy, in storage the platform
+    // sizes to the merge; one that cannot be merged whole is refused, loudly,
+    // before any of its state is set up — a truncated block would hand the
+    // module a different config from the one the graph declares.
+    let params = match hal::runtime_params(entry.id, entry.params()) {
+        hal::RuntimeParams::Compiled => crate::kernel::module::loader::ParamSlice {
+            ptr: entry.params().as_ptr(),
+            len: entry.params().len(),
+        },
+        hal::RuntimeParams::Merged(ptr, len) => {
+            crate::kernel::module::loader::ParamSlice { ptr, len }
+        }
+        hal::RuntimeParams::TooLarge(need) => {
             log::error!(
-                "[inst] module={} ({}) params {} B do not fit the param buffer ({} B) — instance refused",
+                "[inst] module={} ({}) params {} B with its runtime overrides need {} B, more \
+                 than the platform's merge buffer holds — instance refused",
                 entry.id,
                 static_name,
-                len,
-                MAX_MODULE_CONFIG_SIZE
+                entry.params().len(),
+                need
             );
             return InstantiateResult::Error(-1);
         }
-
-        // Overlay any runtime parameter overrides from flash store
-        {
-            let new_len = hal::merge_runtime_overrides(
-                entry.id,
-                pb.as_mut_ptr(),
-                pb.len(),
-                MAX_MODULE_CONFIG_SIZE,
-            );
-            pb.set_len(new_len);
-        }
-    }
+    };
 
     // Full instantiation via start_new, as the new module: any syscall made
     // from inside module_new() identifies it (state pointer, heap,
@@ -734,10 +719,10 @@ pub fn instantiate_one_module(
     // own syscall, or no module at boot — so result-handling logs are never
     // the new module's.
     let result = with_module_context(instantiated, || {
-        // SAFETY: PARAM_BUFFER lives for the duration of start_new; the
-        // pointer's lifetime is bounded by this scope.
+        // SAFETY: `params` points into the resident config blob, the live-add
+        // request, or the platform's merge storage, each valid until this
+        // instance's `module_new` has completed (pending retries included).
         let r = unsafe {
-            let pb = core::ptr::addr_of!(PARAM_BUFFER);
             DynamicModule::start_new(
                 &found_module,
                 syscalls,
@@ -746,10 +731,7 @@ pub fn instantiate_one_module(
                     out_chan,
                     ctrl_chan,
                 },
-                crate::kernel::module::loader::ParamSlice {
-                    ptr: (*pb).as_ptr(),
-                    len: (*pb).len(),
-                },
+                params,
                 static_name,
             )
         };

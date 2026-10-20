@@ -81,8 +81,9 @@ pub const MAX_MODULES_BLOB_SIZE: usize = 8 * 1024 * 1024;
 ///
 /// Module state arena size — the silicon TOML's `[kernel] state_arena_kb`.
 const STATE_ARENA_SIZE: usize = crate::kernel::config::STATE_ARENA_SIZE;
-// Pending modules hold a pointer to the static PARAM_BUFFER rather than a
-// copy, so no parameter blob is truncated to a fixed bound.
+// Pending modules hold a pointer to their params (in the resident config
+// blob, or the platform's override-merge storage) rather than a copy, so no
+// parameter blob is truncated to a fixed bound.
 // ============================================================================
 // Error types
 // ============================================================================
@@ -635,6 +636,39 @@ static mut FREE_LIST: [FreeRegion; MAX_FREE_REGIONS] =
     [FreeRegion { offset: 0, size: 0 }; MAX_FREE_REGIONS];
 static mut FREE_COUNT: usize = 0;
 
+/// Serialises the state arena's bookkeeping (`STATE_ARENA_OFFSET` and the
+/// free list). Instantiation and teardown run on core 0, but an elastic
+/// module heap grows from whichever core steps its module
+/// (`kernel::mem::heap`), so the allocator is shared across cores. Held only
+/// over the bounded bookkeeping — never while bytes are zeroed.
+static STATE_LOCK: portable_atomic::AtomicBool = portable_atomic::AtomicBool::new(false);
+
+/// `STATE_LOCK` held for the guard's lifetime.
+struct StateLock;
+
+impl StateLock {
+    fn acquire() -> Self {
+        while STATE_LOCK
+            .compare_exchange_weak(
+                false,
+                true,
+                portable_atomic::Ordering::Acquire,
+                portable_atomic::Ordering::Relaxed,
+            )
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+        StateLock
+    }
+}
+
+impl Drop for StateLock {
+    fn drop(&mut self) {
+        STATE_LOCK.store(false, portable_atomic::Ordering::Release);
+    }
+}
+
 // ============================================================================
 // Isolated-module arena (EL0 isolation, BCM2712)
 // ============================================================================
@@ -716,10 +750,11 @@ pub fn alloc_isolated(size: usize) -> Result<(*mut u8, usize), LoaderError> {
 /// alignment pad below it stays in the arena until the next graph reset.
 #[cfg(feature = "kernel-mpu")]
 pub fn alloc_private(size: usize, align: usize) -> Result<*mut u8, LoaderError> {
-    // SAFETY: single-threaded instantiation path; bump allocation on the
-    // state arena with checked arithmetic against its compiled capacity and
-    // the deployment envelope.
+    // SAFETY: bump allocation on the state arena under `STATE_LOCK`, with
+    // checked arithmetic against its compiled capacity and the deployment
+    // envelope.
     unsafe {
+        let _lock = StateLock::acquire();
         let base = core::ptr::addr_of_mut!(STATE_ARENA).cast::<u8>() as usize;
         let cur = base + STATE_ARENA_OFFSET;
         let start = cur.next_multiple_of(align);
@@ -759,12 +794,14 @@ pub unsafe fn free_private(ptr: *mut u8, size: usize) {
 }
 
 /// The memory a torn-down module held: its state buffer, the heap arena it
-/// declared, and on a protection-unit target the private region that holds
-/// all of them. Detached from its slot so the release can wait for whoever
-/// else may still be using a buffer inside it (see `block_lend`).
+/// declared (committed whole, or the segments an elastic heap carved), and
+/// on a protection-unit target the private region that holds all of them.
+/// Detached from its slot so the release can wait for whoever else may still
+/// be using a buffer inside it (see `block_lend`).
 pub struct ModuleMemory {
     state: (*mut u8, usize),
     arena: (*mut u8, usize),
+    heap: crate::kernel::mem::heap::HeapSegments,
     private: Option<(*mut u8, usize)>,
 }
 
@@ -779,6 +816,7 @@ impl ModuleMemory {
         Self {
             state: (core::ptr::null_mut(), 0),
             arena: (core::ptr::null_mut(), 0),
+            heap: crate::kernel::mem::heap::HeapSegments::none(),
             private: None,
         }
     }
@@ -794,8 +832,15 @@ impl ModuleMemory {
         Self {
             state,
             arena,
+            heap: crate::kernel::mem::heap::HeapSegments::none(),
             private,
         }
+    }
+
+    /// The same memory with the segments an elastic heap carved for it.
+    pub fn with_heap(mut self, heap: crate::kernel::mem::heap::HeapSegments) -> Self {
+        self.heap = heap;
+        self
     }
 
     /// Return every range to its pool.
@@ -818,6 +863,11 @@ impl ModuleMemory {
         if !self.arena.0.is_null() && self.arena.1 > 0 {
             // SAFETY: the arena `alloc_state` returned, per the caller's contract.
             unsafe { free_state_range(self.arena.0, self.arena.1) };
+        }
+        for (ptr, size) in self.heap.iter() {
+            // SAFETY: a segment the module's elastic heap carved with
+            // `alloc_state`, per the caller's contract.
+            unsafe { free_state_range(ptr, size) };
         }
         if !self.state.0.is_null() {
             // SAFETY: the state buffer `alloc_state` returned, per the
@@ -877,12 +927,29 @@ const STATE_CANARY_SIZE: usize = 4;
 /// `write_bytes(ptr, 0, size)` would then overrun by the original
 /// huge `size`.
 pub fn alloc_state(size: usize) -> Result<*mut u8, LoaderError> {
-    // SAFETY: core 0 only (module header), so nothing else touches the arena.
+    let ptr = reserve_state(size)?;
+    // Outside the lock: zero exactly the bytes handed out (the arena is never
+    // zeroed whole) and stamp the canary past them.
+    // SAFETY: `reserve_state` reserved `size + STATE_CANARY_SIZE` bytes at
+    // `ptr` for this caller alone.
+    unsafe {
+        core::ptr::write_bytes(ptr, 0, size);
+        core::ptr::write_unaligned(ptr.add(size) as *mut u32, STATE_CANARY);
+    }
+    Ok(ptr)
+}
+
+/// The bookkeeping half of [`alloc_state`]: reserve `size` bytes plus the
+/// canary, from the free list or the bump mark, under `STATE_LOCK`. The
+/// bytes are not touched.
+fn reserve_state(size: usize) -> Result<*mut u8, LoaderError> {
+    // SAFETY: the arena statics are touched only under `STATE_LOCK`.
     unsafe {
         let need = size
             .checked_add(STATE_CANARY_SIZE)
             .and_then(align_up_checked)
             .ok_or(LoaderError::StatePoolExhausted)?;
+        let _lock = StateLock::acquire();
         // 1. Scan free list for first-fit.
         let free_list = &raw mut FREE_LIST;
         let count = FREE_COUNT;
@@ -908,8 +975,6 @@ pub fn alloc_state(size: usize) -> Result<*mut u8, LoaderError> {
                 let ptr = core::ptr::addr_of_mut!(STATE_ARENA)
                     .cast::<u8>()
                     .add(offset);
-                core::ptr::write_bytes(ptr, 0, size);
-                core::ptr::write_unaligned(ptr.add(size) as *mut u32, STATE_CANARY);
                 return Ok(ptr);
             }
             i += 1;
@@ -977,8 +1042,6 @@ pub fn alloc_state(size: usize) -> Result<*mut u8, LoaderError> {
         let ptr = core::ptr::addr_of_mut!(STATE_ARENA)
             .cast::<u8>()
             .add(aligned);
-        core::ptr::write_bytes(ptr, 0, size);
-        core::ptr::write_unaligned(ptr.add(size) as *mut u32, STATE_CANARY);
         STATE_ARENA_OFFSET = next;
         Ok(ptr)
     }
@@ -1054,6 +1117,7 @@ pub unsafe fn free_state_range(ptr: *mut u8, size: usize) {
         log::error!("[loader] free_state_range: size={size} overflows");
         return;
     };
+    let _lock = StateLock::acquire();
     let free_list = &raw mut FREE_LIST;
     let mut new_offset = offset as u32;
     let mut new_size = need as u32;
@@ -1103,10 +1167,13 @@ pub unsafe fn free_state_range(ptr: *mut u8, size: usize) {
 /// Called from scheduler at the start of `prepare_graph`.
 pub fn reset_state_arena() {
     // Every module's memory goes at once, and the ledger of buffers lent
-    // from it with it.
+    // from it with it, and every heap's segments.
     crate::kernel::module::block_lend::reset();
-    // SAFETY: core 0 only (module header), at a rebuild: no module is live.
+    crate::kernel::mem::heap::reset_all();
+    // SAFETY: at a rebuild no module is live; the lock orders this against
+    // any allocation still finishing on another core.
     unsafe {
+        let _lock = StateLock::acquire();
         STATE_ARENA_OFFSET = 0;
         FREE_COUNT = 0;
         // Reclaim the isolated arena too; the next graph rebuilds its isolated
@@ -2770,9 +2837,11 @@ pub struct DynamicModule {
 ///
 /// `params_ptr` must remain valid for the lifetime of the pending state.
 /// In practice this is guaranteed because:
-/// - Params point to the static `PARAM_BUFFER` in scheduler.rs
+/// - Params point into the resident config blob, which outlives the graph,
+///   or into the platform's override-merge storage
+///   (`hal::RuntimeParams::Merged`)
 /// - The scheduler's instantiation loop blocks on the pending retry loop
-///   before overwriting `PARAM_BUFFER` for the next module
+///   before it asks for the next module's params
 pub struct DynamicModulePending {
     step_fn: ModuleStepFn,
     pipeline_refill_fn: Option<ModulePipelineRefillFn>,
@@ -2867,8 +2936,8 @@ impl DynamicModulePending {
             let params = if self.params_ptr.is_null() || self.params_len == 0 {
                 &[][..]
             } else {
-                // SAFETY: params_ptr points into the static PARAM_BUFFER,
-                // valid through the pending loop.
+                // SAFETY: params_ptr points into the resident config blob or
+                // the platform's merge storage, valid through the pending loop.
                 unsafe { core::slice::from_raw_parts(self.params_ptr, self.params_len) }
             };
             invoke_new_protected(idx, self.new_fn, &args, params)
@@ -3107,6 +3176,25 @@ impl DynamicModule {
                 ));
             }
         }
+        // The heap's cap: the graph's per-instance `heap.arena_bytes` (params
+        // tag 0xEF) when it gives one, else the type's — the manifest's
+        // figure, or (a trusted module only) what its `module_arena_size`
+        // export says.
+        let arena_size = match crate::kernel::exec::scheduler::params_heap_arena_bytes(params_slice)
+        {
+            Some(n) => n,
+            None => match module.manifest_arena_bytes() {
+                Some(n) => n,
+                None if gated => 0,
+                None => match module.get_export_addr(export_hashes::MODULE_ARENA_SIZE) {
+                    Ok(arena_addr) => {
+                        let arena_fn: ModuleStateSizeFn = fn_ptr_from_addr(arena_addr);
+                        call_state_size(arena_fn)
+                    }
+                    Err(_) => 0,
+                },
+            },
+        };
         // 3. Required state size: the manifest's figure, so no module code
         // runs to find it; a trusted module that declares none is asked.
         let required_size = match module.manifest_state_bytes() {
@@ -3137,7 +3225,7 @@ impl DynamicModule {
         // covers it exactly. (stack_len, whole region, heap pointer.)
         #[cfg(feature = "kernel-mpu")]
         let mpu_private: Option<(usize, usize, usize, *mut u8)> = if gated {
-            let arena = module.manifest_arena_bytes().unwrap_or(0);
+            let arena = arena_size;
             // The stack is sized from the manifest alone; a module that
             // carries no depth would get one too small to reach its first
             // call, so it is refused here rather than faulted there.
@@ -3218,21 +3306,27 @@ impl DynamicModule {
         // Footprint the MMU maps for the heap (page-padded for isolated modules);
         // the heap allocator still manages only `arena_size` usable bytes.
         let mut iso_heap_map_size: usize = 0;
-        // The heap arena: the manifest's figure, else (a trusted module only)
-        // what its `module_arena_size` export says.
-        let arena_size = match module.manifest_arena_bytes() {
-            Some(n) => n,
-            None if gated => 0,
-            None => match module.get_export_addr(export_hashes::MODULE_ARENA_SIZE) {
-                Ok(arena_addr) => {
-                    let arena_fn: ModuleStateSizeFn = fn_ptr_from_addr(arena_addr);
-                    call_state_size(arena_fn)
-                }
-                Err(_) => 0,
-            },
-        };
+        // Every instantiation sets the slot's heap, so none inherits the
+        // heap of whichever module held the slot before.
+        crate::kernel::mem::heap::reset_module_heap(inst_idx);
         {
-            if arena_size > 0 {
+            // An ungated module on a profile with elastic heaps commits its
+            // heap as it allocates (`kernel::mem::heap`): nothing is carved
+            // here, and its cap is recorded for owner accounting.
+            let elastic = arena_size > 0 && !gated && crate::kernel::mem::heap::elastic_heaps();
+            if elastic {
+                crate::kernel::mem::heap::init_module_heap_elastic(inst_idx, arena_size);
+                // SAFETY: instantiation context. A null base with the cap as
+                // size: `arena_get` asks the heap to commit, teardown frees
+                // the heap's own segments, and the owner is charged the cap.
+                unsafe {
+                    crate::kernel::exec::scheduler::set_module_arena(
+                        inst_idx,
+                        core::ptr::null_mut(),
+                        arena_size as u32,
+                    )
+                };
+            } else if arena_size > 0 {
                 #[cfg(feature = "kernel-mpu")]
                 let carved = mpu_private.map(|(_, _, _, heap)| (heap, arena_size));
                 #[cfg(not(feature = "kernel-mpu"))]
@@ -3404,8 +3498,9 @@ impl DynamicModule {
                 }))
             }
             NewStatus::Pending => {
-                // Store state for retry — params_ptr points to static
-                // PARAM_BUFFER which remains valid through the pending loop
+                // Store state for retry — params_ptr points into the
+                // resident config blob (or the platform's merge storage),
+                // which remains valid through the pending loop
                 let pending = DynamicModulePending {
                     step_fn: exports.step_fn,
                     pipeline_refill_fn: exports.pipeline_refill_fn,
@@ -3439,6 +3534,15 @@ impl DynamicModule {
 /// `state` and `private` are what this load allocated, and nothing
 /// references them any more.
 unsafe fn free_allocation(state: *mut u8, state_size: usize, private: Option<(*mut u8, usize)>) {
+    // Whatever the module's elastic heap carved while its init ran.
+    let heap = crate::kernel::mem::heap::detach_module_heap(
+        crate::kernel::exec::scheduler::current_module_index(),
+    );
+    for (ptr, size) in heap.iter() {
+        // SAFETY: a segment the heap carved with `alloc_state`; the module
+        // never ran past its failed load, so nothing references it.
+        unsafe { free_state_range(ptr, size) };
+    }
     match private {
         // SAFETY: the caller's contract, forwarded.
         #[cfg(feature = "kernel-mpu")]

@@ -455,9 +455,10 @@ required at the call site.
 
 ### Kernel capacity is not ABI
 
-The kernel's own capacity — state, buffer and config arenas, the
-per-module params ceiling, the log ring, the elastic region, module and
-bridge slots, the code-size ceiling — is NOT in this file. It lives in
+The kernel's own capacity — state and buffer arenas, the RP override-merge
+buffer, the log ring, the elastic region, heap segments, module and bridge
+slots, the code-size ceiling — is NOT in this file (there is no config arena:
+module params are borrowed from the config blob in place). It lives in
 `src/kernel/config.rs`, one profile per kernel platform
 (`profile_linux`, `profile_bcm2712`, `profile_wasm`, `profile_rp`),
 selected by the platform feature; the RP arenas come from the silicon

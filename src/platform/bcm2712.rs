@@ -1038,14 +1038,12 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
                 // SAFETY: caller upholds `# Safety` invariant — blobs at
                 // the QEMU known addresses remain mapped for the whole boot.
                 unsafe {
-                    // Cap the declared length to MAX_CONFIG_SIZE so the
-                    // parser slice doesn't span the full 16 MB gap
-                    // between QEMU_CONFIG_BLOB_ADDR and the modules
-                    // blob; the parser will reject any header that
-                    // declares more.
+                    // The config's window is the gap QEMU leaves it
+                    // before the module blob; the parser refuses any
+                    // header that declares more than that.
                     scheduler::populate_static_state(
                         QEMU_CONFIG_BLOB_ADDR as *const u8,
-                        config::MAX_CONFIG_SIZE,
+                        QEMU_MODULES_BLOB_ADDR - QEMU_CONFIG_BLOB_ADDR,
                         QEMU_MODULES_BLOB_ADDR as *const u8,
                     )
                 }
@@ -2508,8 +2506,10 @@ unsafe fn bcm_workload_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
 /// carry: the body is empty by design.
 fn bcm_release_module_handles(_module_idx: fluxor::kernel::exec::scheduler::ModuleId) {}
 fn bcm_boot_scan() {}
-fn bcm_merge_runtime_overrides(_module_id: u16, _buf: *mut u8, len: usize, _max: usize) -> usize {
-    len
+/// No runtime parameter store on bcm2712: every module gets its compiled
+/// params in place.
+fn bcm_runtime_params(_module_id: u16, _compiled: &[u8]) -> fluxor::kernel::sys::hal::RuntimeParams {
+    fluxor::kernel::sys::hal::RuntimeParams::Compiled
 }
 
 unsafe fn bcm_system_extension_dispatch(
@@ -3376,7 +3376,7 @@ static BCM2712_HAL_OPS: HalOps = HalOps {
     init_providers: bcm_init_providers,
     release_module_handles: bcm_release_module_handles,
     boot_scan: bcm_boot_scan,
-    merge_runtime_overrides: bcm_merge_runtime_overrides,
+    runtime_params: bcm_runtime_params,
     init_gpio: |_| 0, // no GPIO init on aarch64 (handled by PIC modules)
     csprng_fill: bcm_csprng_fill,
     core_id: || current_core_id() as usize,

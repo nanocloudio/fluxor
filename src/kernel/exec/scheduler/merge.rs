@@ -804,16 +804,6 @@ pub unsafe fn sched_modules() -> &'static mut [ModuleSlot; MAX_MODULES] {
     &mut (*p).modules
 }
 
-/// Get a mutable reference to the static param buffer.
-///
-/// # Safety
-/// Returns an exclusive `&mut` to the static `PARAM_BUFFER`. Caller
-/// must ensure single-threaded access — used during config-time param
-/// staging before modules are stepped.
-pub unsafe fn param_buffer_mut() -> &'static mut ParamBuffer {
-    &mut *core::ptr::addr_of_mut!(PARAM_BUFFER)
-}
-
 /// Per-core current module index (supports multi-core BCM2712).
 /// On single-core platforms, only index 0 is used. Avoids data races
 /// when multiple cores step modules concurrently.
@@ -870,7 +860,9 @@ pub unsafe fn set_module_arena(idx: usize, ptr: *mut u8, size: u32) {
 }
 
 /// State-arena bytes charged to whoever owns module `idx`: its state buffer
-/// plus the heap arena the loader allocated for it.
+/// plus its heap's cap. An elastic heap commits only what the module uses,
+/// but its owner is admitted for the most it may grow to, so a workload's
+/// `state_cap` bounds its worst case rather than a snapshot.
 ///
 /// Only PIC modules carry a measured footprint. A built-in's state is a static
 /// buffer in the kernel image rather than an arena allocation, and the

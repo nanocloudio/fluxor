@@ -1282,6 +1282,17 @@ fn cmd_run(
                 let modules_data = modules_data.ok_or_else(|| {
                     Error::Config("QEMU bare-metal run requires at least one module blob".into())
                 })?;
+                // The kernel bounds its config parse by the gap QEMU leaves
+                // the config before the module blob; refuse a config that
+                // would overlap the modules here, by name.
+                let config_window = (QEMU_MODULES_BLOB_ADDR - QEMU_CONFIG_BLOB_ADDR) as usize;
+                if config_data.len() > config_window {
+                    return Err(Error::Config(format!(
+                        "config blob is {} bytes; QEMU side-loads it at {QEMU_CONFIG_BLOB_ADDR:#x} \
+                         with {config_window} bytes before the module blob",
+                        config_data.len()
+                    )));
+                }
                 std::fs::write(&config_blob, &config_data)?;
                 std::fs::write(&modules_blob, &modules_data)?;
 

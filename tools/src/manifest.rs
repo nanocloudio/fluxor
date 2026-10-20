@@ -1032,10 +1032,11 @@ pub mod permission {
 /// parameter must not occupy them.
 pub const PARAM_TAG_MIN: u8 = 10;
 
-/// Highest tag a built-in `[[params]]` entry may claim. 0xF0..=0xFF are
-/// reserved for protection/policy metadata (0xFD voice-preset blobs,
-/// 0xFE TLV magic, 0xFF terminator among them).
-pub const PARAM_TAG_MAX: u8 = 0xEF;
+/// Highest tag a built-in `[[params]]` entry may claim. 0xEF..=0xFF are
+/// reserved for kernel, protection and policy metadata (0xEF the instance's
+/// heap cap, 0xFD voice-preset blobs, 0xFE TLV magic, 0xFF terminator among
+/// them).
+pub const PARAM_TAG_MAX: u8 = 0xEE;
 
 /// Param type categories declared in `[[params]]`. Matches the wire
 /// types used by the runtime TLV packer in `tools/src/schema.rs`.
@@ -1058,7 +1059,7 @@ pub struct ManifestParam {
     /// position, is the wire identity of the parameter, so entries may
     /// be reordered or inserted without changing any encoding.
     /// Legal range is [`PARAM_TAG_MIN`]..=[`PARAM_TAG_MAX`]; tags below
-    /// the minimum belong to the TLV framing and 0xF0..=0xFF are
+    /// the minimum belong to the TLV framing and 0xEF..=0xFF are
     /// reserved for protection/policy metadata.
     pub tag: u8,
     pub name: String,
@@ -2295,7 +2296,7 @@ impl Manifest {
                     "param '{}': tag {tag} out of range \
                      ({PARAM_TAG_MIN}..={PARAM_TAG_MAX}). Tags below \
                      {PARAM_TAG_MIN} belong to the TLV framing and \
-                     0xF0..=0xFF are reserved for protection metadata.",
+                     0xEF..=0xFF are reserved for kernel and protection metadata.",
                     p.name,
                 )));
             }

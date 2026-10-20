@@ -446,12 +446,8 @@ fn rp_boot_scan() {
     fluxor::platform::rp_flash::store::boot_scan();
 }
 
-fn rp_merge_runtime_overrides(module_id: u16, buf: *mut u8, len: usize, max: usize) -> usize {
-    // SAFETY: forwards buf/len/max from the kernel's persistent-storage
-    // caller; flash_store::merge_runtime_overrides documents the contract.
-    unsafe {
-        fluxor::platform::rp_flash::store::merge_runtime_overrides(module_id as u8, buf, len, max)
-    }
+fn rp_runtime_params(module_id: u16, compiled: &[u8]) -> fluxor::kernel::sys::hal::RuntimeParams {
+    fluxor::platform::rp_flash::store::runtime_params(module_id as u8, compiled)
 }
 
 // Module protection (HalOps seam): the MPU backend where it is compiled in;
@@ -563,7 +559,7 @@ static RP_HAL_OPS: HalOps = HalOps {
     init_providers: rp_init_providers,
     release_module_handles: rp_release_module_handles,
     boot_scan: rp_boot_scan,
-    merge_runtime_overrides: rp_merge_runtime_overrides,
+    runtime_params: rp_runtime_params,
     init_gpio: |gpio| fluxor::platform::rp_io::gpio::init_all_from_config(gpio),
     csprng_fill: rp_csprng_fill,
     core_id: || 0,

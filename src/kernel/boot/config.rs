@@ -8,9 +8,12 @@
 //!
 //! ## Concurrency
 //!
-//! `CONFIG_ARENA` and `ARENA_OFFSET` are boot-only: written by
-//! `populate_static_state` on core 0, then read by every core via the
-//! parsed `Config`. See `docs/architecture/concurrency.md`.
+//! The parsed `Config` is written by `populate_static_state` on core 0 at
+//! boot (and at a rebuild, with every other core parked), then read by every
+//! core. Module params are not copied out of the blob: each `ModuleEntry`
+//! borrows its params in place, so the config blob stays mapped for as long
+//! as the `Config` that points into it (every platform keeps it mapped for
+//! the life of the kernel). See `docs/architecture/concurrency.md`.
 //!
 //! ## Flash Layout
 //!
@@ -246,6 +249,10 @@ extern "C" {
     static __end_block_addr: u8;
     #[cfg(target_arch = "aarch64")]
     static __end_data_addr: u8;
+    /// First byte `_start` zeroes on a RAM-loaded aarch64 image: the end of
+    /// the payload window the trailer, module table and config sit in.
+    #[cfg(all(target_arch = "aarch64", target_os = "none"))]
+    static __bss_start: u8;
 }
 
 /// Trailer magic: "FXLT" (Fluxor Layout Trailer)
@@ -276,6 +283,11 @@ pub struct FlashLayout {
     pub modules_size: u32,
     /// Address of config
     pub config_addr: u32,
+    /// Bytes mapped from `config_addr` on: the window the config blob must
+    /// lie in, and so the parser's only bound. A graph slot records the
+    /// config's own length; the firmware trailer has none, so it reports the
+    /// region the image can hold the config in (`trailer_config_window`).
+    pub config_size: u32,
 }
 
 /// Compute trailer address from linker symbol.
@@ -407,6 +419,7 @@ fn choose_slot() -> Option<FlashLayout> {
         modules_addr: slot_base + hdr.modules_offset,
         modules_size: hdr.modules_size,
         config_addr: slot_base + hdr.config_offset,
+        config_size: hdr.config_size,
     })
 }
 
@@ -416,6 +429,7 @@ struct SlotHeader {
     modules_offset: u32,
     modules_size: u32,
     config_offset: u32,
+    config_size: u32,
 }
 
 #[cfg(feature = "rp")]
@@ -498,6 +512,7 @@ unsafe fn decode_slot_header(base: *const u8, own_digest: &[u8; 32]) -> Option<S
         modules_offset,
         modules_size,
         config_offset,
+        config_size,
     })
 }
 
@@ -545,7 +560,46 @@ fn read_layout_from_trailer() -> Option<FlashLayout> {
             // total_size.
             modules_size: 0,
             config_addr,
+            config_size: trailer_config_window(config_addr),
         })
+    }
+}
+
+/// Bytes the firmware-trailer layout can hold a config in from `config_addr`:
+/// what lies between it and the next thing the platform owns.
+///
+/// - A RAM-loaded aarch64 image (Pi 5, CM5, QEMU virt without side-loaded
+///   blobs) carries its payload between the end of its file-backed sections
+///   and `.bss`, which `_start` zeroes before `main`: the window ends at
+///   `__bss_start` (`linker/memory-bcm2712.x`, the payload window).
+/// - An RP image executes in place from flash, and the config sits below the
+///   graph slots (or, on a flash with no room for slots, below the parameter
+///   store sector).
+///
+/// 0 where `config_addr` is past the window or the target has no trailer
+/// layout; the parser refuses a zero-length blob by name.
+fn trailer_config_window(config_addr: u32) -> u32 {
+    #[cfg(all(target_arch = "aarch64", target_os = "none"))]
+    {
+        // SAFETY: a linker symbol; only its address is taken.
+        let end = unsafe { &__bss_start as *const u8 as usize };
+        (end as u32).saturating_sub(config_addr)
+    }
+    #[cfg(feature = "rp")]
+    {
+        use crate::abi::platform::rp::flash_layout;
+        let layout = crate::platform::chip::GRAPH_FLASH;
+        let below = if layout.slot_size != 0 {
+            layout.slot_a
+        } else {
+            layout.param_store
+        };
+        (flash_layout::XIP_BASE + below).saturating_sub(config_addr)
+    }
+    #[cfg(not(any(all(target_arch = "aarch64", target_os = "none"), feature = "rp")))]
+    {
+        let _ = config_addr;
+        0
     }
 }
 
@@ -603,25 +657,16 @@ pub const GRAPH_SLOTS_CODE: u8 = if MAX_GRAPH_EDGES == 128 {
     (MAX_GRAPH_EDGES / 128) as u8
 };
 
-/// The largest config blob the parser accepts, keyed on the profile rather
-/// than on whether an OS is present:
-/// - 512 KiB on the hosted targets (linux, wasm) and on bare-metal aarch64
-///   (bcm2712), which carries the host profile's config arena. A graph of a
-///   few hundred modules composed from params needs well past 32 KiB — an
-///   orchestrator's whole control plane as params is ~270 KiB — and a wasm
-///   scenario host inlines its browser shell as `body:` routes. The blob is parsed in place and only module params are
-///   copied out (into the config arena, sized separately), so this bounds a
-///   read, not an allocation.
-/// - 32 KiB on the microcontroller targets.
+/// There is no fixed ceiling on the config blob. The parser is handed the
+/// blob as a slice whose length is what the platform actually mapped, and
+/// that length is the only bound: a section that would run past it is refused
+/// by name. The platforms state their windows where they map the blob — the
+/// file on Linux, the payload window between the image and `.bss` on a
+/// RAM-loaded aarch64 image (`config_window`), the graph slot or the flash
+/// below the slots on RP, the gap to the module blob on QEMU virt — and the
+/// CLI refuses an image whose config would not fit the window it is packed
+/// into.
 ///
-/// `kernel_max_config_size` in `tools/src/cli/commands_a.rs` mirrors this, so
-/// an oversized config fails the build rather than halting the board before
-/// its logger runs.
-#[cfg(any(target_os = "linux", target_arch = "wasm32", target_arch = "aarch64"))]
-pub const MAX_CONFIG_SIZE: usize = 512 * 1024;
-#[cfg(not(any(target_os = "linux", target_arch = "wasm32", target_arch = "aarch64")))]
-pub const MAX_CONFIG_SIZE: usize = 32 * 1024;
-
 /// Hardware section binary format sizes
 pub const SPI_CONFIG_BIN_SIZE: usize = 8;
 pub const I2C_CONFIG_BIN_SIZE: usize = 8;
@@ -686,53 +731,22 @@ pub const GRAPH_SECTION_SIZE: usize = 4 + MAX_GRAPH_EDGES * GRAPH_EDGE_SIZE + DO
 // Graph Config (Version 1: Variable-Length Module Entries)
 // ============================================================================
 
-/// Config arena size for storing variable-length module params across
-/// all modules in the loaded graph. Sized per chip so embedded targets
-/// don't carry a host-class arena in `.bss`. See each platform's
-/// `chip` module.
-pub const CONFIG_ARENA_SIZE: usize = crate::kernel::config::CONFIG_ARENA_SIZE;
+/// Bytes of module params the parsed config borrows from its blob, and the
+/// blob's mapped length: `(params_bytes, blob_len)`. Written by the parser,
+/// read by `finalize_instantiation_accounting` and the resource ledger
+/// (`POOL_CONFIG_ARENA`). Params are not copied anywhere, so the pair is an
+/// observation of the graph, not a pool that can run out.
+static CONFIG_PARAMS_BYTES: portable_atomic::AtomicUsize = portable_atomic::AtomicUsize::new(0);
+static CONFIG_BLOB_LEN: portable_atomic::AtomicUsize = portable_atomic::AtomicUsize::new(0);
 
-/// Static arena for module params storage
-static mut CONFIG_ARENA: [u8; CONFIG_ARENA_SIZE] = [0; CONFIG_ARENA_SIZE];
-static mut ARENA_OFFSET: usize = 0;
-
-/// Allocate bytes from config arena (bump allocator)
-/// Returns None if arena is exhausted
-fn arena_alloc(size: usize) -> Option<&'static mut [u8]> {
-    // SAFETY: CONFIG_ARENA / ARENA_OFFSET are scheduler-thread owned;
-    // `offset + size <= CONFIG_ARENA_SIZE` is checked before slicing.
-    unsafe {
-        let offset = ARENA_OFFSET;
-        if offset + size > CONFIG_ARENA_SIZE
-            || !crate::kernel::sys::resource_ledger::enforced_allows(
-                crate::abi::contracts::resource::POOL_CONFIG_ARENA,
-                (offset + size) as u32,
-            )
-        {
-            crate::kernel::sys::resource_ledger::deny(
-                crate::abi::contracts::resource::POOL_CONFIG_ARENA,
-            );
-            return None;
-        }
-        ARENA_OFFSET = offset + size;
-        Some(&mut CONFIG_ARENA[offset..offset + size])
-    }
-}
-
-/// Reset arena (call before parsing new config)
-fn arena_reset() {
-    // SAFETY: called between graph rebuilds; no live arena slice.
-    unsafe {
-        ARENA_OFFSET = 0;
-    }
-}
-
-/// Current config-arena occupancy: `(used_bytes, total_bytes)`. Read
-/// by `scheduler::finalize_instantiation_accounting` so silicon-TOML sizing decisions
-/// can be validated against real workloads.
-pub fn config_arena_usage() -> (usize, usize) {
-    // SAFETY: word-sized read of static usize.
-    unsafe { (ARENA_OFFSET, CONFIG_ARENA_SIZE) }
+/// `(params_bytes, blob_len)` of the config last parsed: the module params
+/// borrowed in place from the blob, against the blob's mapped length.
+pub fn config_params_usage() -> (usize, usize) {
+    use portable_atomic::Ordering;
+    (
+        CONFIG_PARAMS_BYTES.load(Ordering::Relaxed),
+        CONFIG_BLOB_LEN.load(Ordering::Relaxed),
+    )
 }
 
 /// Parsed module entry with variable-length params
@@ -769,7 +783,9 @@ pub struct ModuleEntry {
     /// Set by `insert_fan` for ports that carry framed protocols;
     /// ignored for any other module type.
     pub frame_kind: u8,
-    /// Pointer to params in arena (stable for lifetime of config)
+    /// Pointer to the params inside the config blob, borrowed in place. Valid
+    /// for as long as the blob stays mapped, which every platform guarantees
+    /// for the life of the `Config` that holds this entry.
     pub params_ptr: *const u8,
     /// Length of params
     pub params_len: usize,
@@ -781,9 +797,10 @@ impl ModuleEntry {
         if self.params_ptr.is_null() || self.params_len == 0 {
             &[]
         } else {
-            // SAFETY: `params_ptr` is non-null + non-zero len; the loader
-            // wrote it from the config arena so the slice lives as long
-            // as the config blob (whole boot lifetime in practice).
+            // SAFETY: `params_ptr` is non-null + non-zero len; the parser
+            // pointed it into the config blob after bounding the entry
+            // inside it, and the blob stays mapped for the life of the
+            // config (see the module header).
             unsafe { core::slice::from_raw_parts(self.params_ptr, self.params_len) }
         }
     }
@@ -979,7 +996,8 @@ impl Config {
 /// Returns None if config is invalid or not present
 pub fn read_config() -> Option<Config> {
     let layout = read_layout()?;
-    read_config_at(layout.config_addr)
+    let mut config = Config::empty();
+    read_layout_config_into(&layout, &mut config).then_some(config)
 }
 
 /// Read config from flash directly into provided destination
@@ -991,10 +1009,27 @@ pub fn read_config_into(dest: &mut Config) -> bool {
         Some(l) => l,
         None => return false,
     };
-    read_config_at_into(layout.config_addr, dest)
+    read_layout_config_into(&layout, dest)
 }
 
-/// Read config from a specific flash address
+/// Parse the config a flash layout points at, bounded by the window the
+/// layout says is mapped there.
+fn read_layout_config_into(layout: &FlashLayout, dest: &mut Config) -> bool {
+    // SAFETY: the layout source guarantees `[config_addr, config_addr +
+    // config_size)` is mapped: a slot header was bounded against its slot by
+    // `decode_slot_header`, and the trailer window ends where the platform's
+    // own memory begins (`trailer_config_window`).
+    unsafe {
+        read_config_from_ptr_with_len(
+            layout.config_addr as usize as *const u8,
+            layout.config_size as usize,
+            dest,
+        )
+    }
+}
+
+/// Read the config at `config_addr` in the firmware-trailer layout, bounded
+/// by the window that layout leaves it (`trailer_config_window`).
 ///
 /// Returns None if config is invalid or not present
 pub fn read_config_at(config_addr: u32) -> Option<Config> {
@@ -1006,33 +1041,28 @@ pub fn read_config_at(config_addr: u32) -> Option<Config> {
     }
 }
 
-/// Read config from a specific flash address directly into provided destination
-///
-/// Returns true if config was read successfully, false otherwise.
-/// This avoids allocating a large Config struct on the stack.
+/// [`read_config_at`] into a caller-provided destination, which avoids a
+/// large `Config` on the stack.
 pub fn read_config_at_into(config_addr: u32, config: &mut Config) -> bool {
-    // Bare-metal flash-trailer path: the trailer reader already
-    // validates `config_offset + config_size` against the slot size in
-    // `read_slot_header`, so passing the parser's `MAX_CONFIG_SIZE`
-    // cap here is safe — the underlying flash region is guaranteed
-    // by the slot layout (`chip::GRAPH_FLASH.slot_size` is hundreds of
-    // KiB on any board with slots, well above the 32 KiB cap).
-    // SAFETY: the trailer reader guarantees `[config_addr, config_addr +
-    // MAX_CONFIG_SIZE)` lies inside the flash slot.
-    unsafe { read_config_from_ptr_with_len(config_addr as *const u8, MAX_CONFIG_SIZE, config) }
+    let layout = FlashLayout {
+        modules_addr: 0,
+        modules_size: 0,
+        config_addr,
+        config_size: trailer_config_window(config_addr),
+    };
+    read_layout_config_into(&layout, config)
 }
 
 /// Read config from a raw pointer plus caller-supplied length. The
 /// caller (platform boot path / flash trailer reader) must pass the
 /// mapped region size; the slice is constructed with
-/// `from_raw_parts(ptr, len)`. `len = 0` is rejected; `len`
-/// exceeding `MAX_CONFIG_SIZE` is rejected outright rather than
-/// silently narrowed — a source that promises more than the parser's
-/// logical maximum is either a tooling bug or a malformed blob.
+/// `from_raw_parts(ptr, len)`, and that length is the parser's only bound.
+/// `len = 0` is rejected.
 ///
 /// # Safety
-/// `flash_ptr..flash_ptr.add(len)` must be a valid, contiguous,
-/// readable memory region for the duration of the call.
+/// `flash_ptr..flash_ptr.add(len)` must be a valid, contiguous, readable
+/// memory region that stays mapped and unchanged for as long as the parsed
+/// `config` is in use: its module entries borrow their params from it.
 pub unsafe fn read_config_from_ptr_with_len(
     flash_ptr: *const u8,
     len: usize,
@@ -1042,13 +1072,9 @@ pub unsafe fn read_config_from_ptr_with_len(
         log::error!("[config] null pointer or zero length");
         return false;
     }
-    if len > MAX_CONFIG_SIZE {
-        log::error!("[config] source len={len} exceeds MAX_CONFIG_SIZE={MAX_CONFIG_SIZE}");
-        return false;
-    }
     // SAFETY: caller's `# Safety` contract — `flash_ptr` covers `len`
-    // contiguous readable bytes for the duration of the call. `len > 0`
-    // and `len <= MAX_CONFIG_SIZE` already checked above.
+    // contiguous readable bytes for as long as the parsed config is used
+    // (its module params are borrowed from them). `len > 0` checked above.
     let blob = unsafe { core::slice::from_raw_parts(flash_ptr, len) };
     read_config_from_slice(blob, config)
 }
@@ -1058,6 +1084,11 @@ pub unsafe fn read_config_from_ptr_with_len(
 /// `blob.len()` causes a deterministic rejection with a logged error, no
 /// silent truncation. Module / edge counts exceeding `MAX_MODULES` /
 /// `MAX_GRAPH_EDGES` are rejected, not clamped.
+///
+/// The parsed module entries BORROW their params from `blob` (nothing is
+/// copied), so the caller keeps `blob` mapped and unchanged for as long as
+/// `config` is used — every platform passes its resident config blob, which
+/// lives as long as the kernel does.
 pub fn read_config_from_slice(blob: &[u8], config: &mut Config) -> bool {
     let flash_ptr = blob.as_ptr();
     let blob_len = blob.len();
@@ -1096,10 +1127,11 @@ pub fn read_config_from_slice(blob: &[u8], config: &mut Config) -> bool {
         }
     };
 
-    // Reset config to empty state and arena
+    // Reset config to empty state.
     *config = Config::empty();
     config.header = header;
-    arena_reset();
+    CONFIG_PARAMS_BYTES.store(0, portable_atomic::Ordering::Relaxed);
+    CONFIG_BLOB_LEN.store(blob_len, portable_atomic::Ordering::Relaxed);
 
     // Kernel and tools always ship together, so any mismatch is an
     // upgrade-skipped or toolchain-mismatch bug rather than a
@@ -1143,6 +1175,13 @@ pub fn read_config_from_slice(blob: &[u8], config: &mut Config) -> bool {
     // SAFETY: `blob_len >= HEADER_SIZE + 6` (checked above); section_size
     // u32 lives at offset 16+2 inside `blob`.
     let section_size = unsafe { read_u32(modules_base.add(2)) } as usize;
+    // The module section must lie inside the blob before any size is derived
+    // from it: a u32 section size added to the fixed sections could wrap a
+    // 32-bit `usize`, and a wrapped total would pass every later bound.
+    if section_size > blob_len - (HEADER_SIZE + 6) {
+        log::error!("[config] module section size={section_size} exceeds blob_len={blob_len}");
+        return false;
+    }
 
     // The module count's high byte rides the module section header. A
     // header that promises more modules than the kernel can hold is either
@@ -1198,14 +1237,9 @@ pub fn read_config_from_slice(blob: &[u8], config: &mut Config) -> bool {
         + pio_n * PIO_CONFIG_BIN_SIZE;
     let body_size = body_before_hw + hw_size;
 
-    // Sanity-check total config size against (a) the existing hard MAX
-    // and (b) the caller-provided slice length. The caller's length is the
-    // physical upper bound — exceeding it would read past the mapped blob.
+    // The caller-provided slice length is the only bound: exceeding it
+    // would read past the mapped blob.
     let total_size = 8 + body_size;
-    if total_size > MAX_CONFIG_SIZE {
-        log::error!("[config] too large size={total_size} max={MAX_CONFIG_SIZE}");
-        return false;
-    }
     if total_size > blob_len {
         log::error!("[config] body size={total_size} exceeds caller blob length={blob_len}");
         return false;
@@ -1224,29 +1258,9 @@ pub fn read_config_from_slice(blob: &[u8], config: &mut Config) -> bool {
             return false;
         }
     }
-    // Bounds-check: module section size should be reasonable.
-    // Linux/wasm get a larger ceiling so the wasm-scenario synth
-    // host can carry the inlined browser shell (~140 KiB of
-    // runtime.html + host_shims.js + scenario.json as http route
-    // bodies) — same partition principle as `MAX_CONFIG_SIZE` above,
-    // and the same size: the section is nearly all of a large graph's
-    // config. (The CLI's MAX_MODULE_PARAMS_SIZE bounds ONE module's params,
-    // and stays at 256 KiB.) As `MAX_CONFIG_SIZE`: keyed on the profile,
-    // not on an OS.
-    #[cfg(any(target_os = "linux", target_arch = "wasm32", target_arch = "aarch64"))]
-    const MAX_MODULE_SECTION: usize = 512 * 1024;
-    #[cfg(not(any(target_os = "linux", target_arch = "wasm32", target_arch = "aarch64")))]
-    const MAX_MODULE_SECTION: usize = 32 * 1024;
-    if section_size > MAX_MODULE_SECTION {
-        log::error!(
-            "[config] module section too large size={section_size} max={MAX_MODULE_SECTION}"
-        );
-        return false;
-    }
-
     // Parse variable-length entries. A malformed module section
     // (truncation, undersized entry length, out-of-bounds extent,
-    // out-of-range id, arena-alloc failure) rejects the whole config
+    // out-of-range id) rejects the whole config
     // — partial graphs are never accepted.
     let mut offset = 6usize; // Skip 6-byte section header (count, reserved, section_size u32)
     for i in 0..config.module_count as usize {
@@ -1278,13 +1292,8 @@ pub fn read_config_from_slice(blob: &[u8], config: &mut Config) -> bool {
             return false;
         }
 
-        let entry = match parse_module_entry(entry_ptr, entry_len) {
-            Some(e) => e,
-            None => {
-                log::error!("[config] module entry {i} parse failed (arena allocation exhausted)");
-                return false;
-            }
-        };
+        let entry = parse_module_entry(entry_ptr, entry_len);
+        CONFIG_PARAMS_BYTES.fetch_add(entry.params_len, portable_atomic::Ordering::Relaxed);
         if (entry.id as usize) >= MAX_MODULES {
             log::error!(
                 "[config] module entry {} id={} out of range (MAX_MODULES={})",
@@ -1540,7 +1549,11 @@ fn parse_envelope_payload(payload: &[u8]) {
 /// The layout is [`ModuleEntry`]'s. `entry_length` is u32 because one
 /// module's params can exceed 64 KiB: the synthesised host's http module
 /// carries both halves of a split scenario's wasm shells as body routes.
-fn parse_module_entry(ptr: *const u8, entry_len: usize) -> Option<ModuleEntry> {
+///
+/// The params are borrowed in place: `params_ptr` points into the blob, so an
+/// entry costs nothing beyond its slot in `Config::modules` however large its
+/// params are.
+fn parse_module_entry(ptr: *const u8, entry_len: usize) -> ModuleEntry {
     // SAFETY: caller validated `entry_len >= 10` and that `ptr..ptr+entry_len`
     // lies inside the config blob. All inner reads are bounded by `entry_len`.
     unsafe {
@@ -1553,31 +1566,19 @@ fn parse_module_entry(ptr: *const u8, entry_len: usize) -> Option<ModuleEntry> {
         let pre_tick_drain = (byte9 & 0x10) != 0;
 
         let params_len = entry_len.saturating_sub(10);
-        if params_len == 0 {
-            return Some(ModuleEntry {
-                name_hash,
-                id,
-                domain_id,
-                pre_tick_drain,
-                frame_kind: 0,
-                params_ptr: core::ptr::null(),
-                params_len: 0,
-            });
-        }
-
-        // Allocate space in arena and copy params
-        let arena_buf = arena_alloc(params_len)?;
-        core::ptr::copy_nonoverlapping(ptr.add(10), arena_buf.as_mut_ptr(), params_len);
-
-        Some(ModuleEntry {
+        ModuleEntry {
             name_hash,
             id,
             domain_id,
             pre_tick_drain,
             frame_kind: 0,
-            params_ptr: arena_buf.as_ptr(),
+            params_ptr: if params_len == 0 {
+                core::ptr::null()
+            } else {
+                ptr.add(10)
+            },
             params_len,
-        })
+        }
     }
 }
 

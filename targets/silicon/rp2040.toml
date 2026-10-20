@@ -195,7 +195,6 @@ state_arena_kb = 64
 module_code_kb = 384
 buffer_arena_kb = 16
 config_buffer_kb = 8
-config_arena_kb = 8
 # Early-boot log ring: sized to hold a whole boot until a reader arrives —
 # the USB console opened after enumeration replays it from the oldest line,
 # so a rig reads this image's boot, not a tail of it. The host-class 64 KiB

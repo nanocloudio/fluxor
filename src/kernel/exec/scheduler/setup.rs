@@ -1034,10 +1034,15 @@ pub fn finalize_instantiation_accounting() {
     // this once its instantiation loop is done — boot and rebuild alike.
     super::exec_order::gate_contract_consumers();
     let (state_used, state_cap) = crate::kernel::module::loader::arena_usage();
-    let (cfg_used, cfg_cap) = crate::kernel::boot::config::config_arena_usage();
+    let (cfg_used, cfg_cap) = crate::kernel::boot::config::config_params_usage();
     let (buf_used, buf_cap) = crate::kernel::ipc::buffer_pool::arena_usage();
+    // `cfg` is the params the graph borrows in place against its blob's
+    // length; `heap` is what module heaps have committed against their caps
+    // (an elastic heap commits as it allocates).
+    let (heaps, heap_committed, heap_cap, _) = crate::kernel::mem::heap::heaps_usage();
     log::info!(
-        "[arena] state={state_used}/{state_cap} cfg={cfg_used}/{cfg_cap} buf={buf_used}/{buf_cap}"
+        "[arena] state={state_used}/{state_cap} cfg={cfg_used}/{cfg_cap} buf={buf_used}/{buf_cap} \
+         heap={heap_committed}/{heap_cap} heaps={heaps}"
     );
 }
 

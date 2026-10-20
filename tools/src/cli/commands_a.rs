@@ -636,36 +636,20 @@ fn check_state_budget(
     Ok(())
 }
 
-/// The largest config blob the target's kernel parses — the mirror of
-/// `kernel::boot::config::MAX_CONFIG_SIZE`, which is keyed on the compile
-/// target: 512 KiB on Linux, wasm32 and aarch64 (bcm2712), 32 KiB on the
-/// microcontrollers. A config past it is refused at boot before the logger
-/// runs, so a board would halt without saying why; refuse it here, by name.
-fn kernel_max_config_size(target: &crate::target::TargetDescriptor) -> usize {
-    // A target with no kernel build of its own is hosted (Linux, wasm).
-    let Some(build) = target.build.as_ref() else {
-        return 512 * 1024;
-    };
-    let t = build.rust_target.as_str();
-    if t.starts_with("aarch64") || t.contains("linux") || t.starts_with("wasm32") {
-        512 * 1024
-    } else {
-        32 * 1024
-    }
-}
+/// The 16 MiB alignment `.bss` starts on in a RAM-loaded aarch64 image
+/// (`linker/memory-bcm2712.x`, `linker/memory-uefi.x`): the image's trailer,
+/// module table and config sit between the end of its file-backed sections
+/// and that boundary, which `_start` zeroes from.
+const AARCH64_BSS_ALIGN: u32 = 0x0100_0000;
 
-/// Refuse a packed config the target's kernel would refuse at boot.
-fn check_config_size(len: usize, target: &crate::target::TargetDescriptor) -> Result<()> {
-    let max = kernel_max_config_size(target);
-    if len > max {
-        return Err(Error::Config(format!(
-            "config blob is {len} bytes; the {} kernel parses at most {max} \
-             (MAX_CONFIG_SIZE) and would refuse this graph at boot. Trim module \
-             params or split the graph.",
-            target.id
-        )));
-    }
-    Ok(())
+/// Where the payload window of a RAM-loaded aarch64 image ends: `__bss_start`,
+/// the first 16 MiB boundary at or past the image's file-backed end. The
+/// kernel bounds its config parse by the same address
+/// (`kernel::boot::config::trailer_config_window`), so a config that ends
+/// past it is refused here, by name, rather than erased by the boot's `.bss`
+/// clear and refused before the logger runs.
+fn aarch64_payload_window_end(firmware_end: u32) -> u64 {
+    (firmware_end as u64).div_ceil(AARCH64_BSS_ALIGN as u64) * AARCH64_BSS_ALIGN as u64
 }
 
 /// Admit each module's stack depth against the stack it will run on.
@@ -1069,6 +1053,20 @@ fn cmd_combine(
         trailer_addr + UF2_BLOCK_ALIGN
     };
 
+    // A RAM-loaded aarch64 image carries its payload below `.bss`: past that
+    // boundary `_start` zeroes it before the kernel reads it.
+    if is_aarch64 {
+        let window_end = aarch64_payload_window_end(firmware_max_addr);
+        let config_end = config_addr as u64 + config_data.len() as u64;
+        if config_end > window_end {
+            return Err(error::Error::Config(format!(
+                "Combined image payload ends at {config_end:#x}, past the payload window that \
+                 ends at {window_end:#x} where the kernel's .bss begins (the trailer, module \
+                 table and config must all lie below it). Shrink the module set or config."
+            )));
+        }
+    }
+
     // Ensure the combined image ends below the regions the board's flash is
     // partitioned into above it: the two graph slots and the parameter
     // store, which start at slot A (`flash_layout::graph_flash`, from the
@@ -1322,7 +1320,6 @@ fn build_packaged_blobs(
         project_root,
     )?;
 
-    check_config_size(config_data.len(), target_desc)?;
     check_code_ceiling(&modules, target_desc)?;
     check_state_budget(&modules, config, target_desc)?;
     check_stack_budget(&modules, config, target_desc)?;

@@ -32,10 +32,9 @@ const MODULE_ENTRY_HEADER_SIZE: usize = 10;
 /// substitution + host_shims.js ~56 KiB + scenario.json) as `body:`
 /// routes per the shared-infra-in-orchestrator partition principle.
 /// A 128 KiB cap truncates the later route bodies silently (clipped
-/// JS / empty scenario.json in the browser). Kept in lockstep with the
-/// runtime's per-module `MAX_MODULE_CONFIG_SIZE` / http
-/// `DEFAULT_BODY_POOL_SIZE` host caps; the whole blob's `MAX_CONFIG_SIZE`
-/// is larger (512 KiB), because a graph is many modules.
+/// JS / empty scenario.json in the browser). Kept in lockstep with the http
+/// `DEFAULT_BODY_POOL_SIZE` host cap. The kernel itself sets no per-module
+/// or whole-blob ceiling: it borrows params from the config blob in place.
 /// Generation runs host-side, so this is a sanity bound, not a memory
 /// constraint. Wavetables and large sequences fit comfortably within.
 const MAX_MODULE_PARAMS_SIZE: usize = 256 * 1024;
@@ -1741,7 +1740,8 @@ const NON_PARAM_KEYS: &[&str] = &[
     "step_deadline_burst_us",
     "quarantine_partner",     // name form, resolved at wiring pass
     "quarantine_partner_idx", // numeric form passed straight through
-    // `heap`: nested object { zero_on_free, alloc_failure_policy, canary_enabled }
+    // `heap`: nested object { zero_on_free, alloc_failure_policy, canary_enabled,
+    // arena_bytes }
     "heap",
     // Provenance recorded by stack expansion, not authored and not
     // emitted: which stack injected this module entry and which of its
@@ -1776,10 +1776,15 @@ fn validate_heap_subtree(module: &Value, module_name: &str) -> Result<()> {
     let heap_obj = value.as_object().ok_or_else(|| {
         Error::Config(format!(
             "module '{module_name}': `heap` must be an object \
-             (with `zero_on_free` / `alloc_failure_policy` / `canary_enabled`)"
+             (with `zero_on_free` / `alloc_failure_policy` / `canary_enabled` / `arena_bytes`)"
         ))
     })?;
-    const HEAP_KEYS: &[&str] = &["zero_on_free", "alloc_failure_policy", "canary_enabled"];
+    const HEAP_KEYS: &[&str] = &[
+        "zero_on_free",
+        "alloc_failure_policy",
+        "canary_enabled",
+        "arena_bytes",
+    ];
     for (subkey, subval) in heap_obj {
         if !HEAP_KEYS.contains(&subkey.as_str()) {
             return Err(Error::Config(format!(
@@ -1792,6 +1797,11 @@ fn validate_heap_subtree(module: &Value, module_name: &str) -> Result<()> {
         // leave the tag at its default — the canonical typo case is
         // `true`/`false` misspelled as `"yes"`/`"flase"`.
         match subkey.as_str() {
+            "arena_bytes" => {
+                heap_arena_bytes(subval).map_err(|why| {
+                    Error::Config(format!("module '{module_name}': heap.arena_bytes {why}"))
+                })?;
+            }
             "alloc_failure_policy" => {
                 let s = subval.as_str().ok_or_else(|| {
                     Error::Config(format!(
@@ -1816,6 +1826,25 @@ fn validate_heap_subtree(module: &Value, module_name: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The smallest heap cap the kernel can make a heap of: one block header and
+/// one minimum allocation (`kernel::mem::heap`).
+const MIN_HEAP_ARENA_BYTES: u64 = 24;
+
+/// A module entry's `heap.arena_bytes`: this instance's heap cap, in bytes,
+/// overriding the module type's declared arena. It travels as params tag
+/// 0xEF (u32 LE), which the kernel reads before it sizes the heap.
+fn heap_arena_bytes(v: &Value) -> std::result::Result<u32, String> {
+    let n = v
+        .as_u64()
+        .ok_or_else(|| format!("must be a positive integer number of bytes (got {v})"))?;
+    if n < MIN_HEAP_ARENA_BYTES {
+        return Err(format!(
+            "= {n} is below the {MIN_HEAP_ARENA_BYTES} bytes a heap needs for one allocation"
+        ));
+    }
+    u32::try_from(n).map_err(|_| format!("= {n} exceeds a heap's u32 size"))
 }
 
 /// Explain an unknown param that a STACK put there, not the author.
@@ -2818,6 +2847,18 @@ fn build_module_entry(
                 entry[base + extra_len + 1] = 1;
                 entry[base + extra_len + 2] = 1;
                 extra_len += 3;
+            }
+        }
+
+        // Tag 0xEF: heap.arena_bytes (u32 LE) — this instance's heap cap,
+        // overriding the module type's declared arena. Validated by
+        // `validate_heap_subtree`.
+        if let Some(n) = heap.get("arena_bytes").and_then(|v| heap_arena_bytes(v).ok()) {
+            if base + extra_len + 6 < entry.len() {
+                entry[base + extra_len] = 0xEF;
+                entry[base + extra_len + 1] = 4;
+                entry[base + extra_len + 2..base + extra_len + 6].copy_from_slice(&n.to_le_bytes());
+                extra_len += 6;
             }
         }
     }

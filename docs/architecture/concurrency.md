@@ -28,9 +28,8 @@ need no synchronisation:
 
 - `src/kernel/module/loader.rs`: `STATE_ARENA`, `STATE_ARENA_OFFSET`,
   `FREE_LIST`, `FREE_COUNT`, `PIC_IRQ_DISABLED_COUNT`
-- `src/kernel/boot/config.rs`: `CONFIG_ARENA`, `ARENA_OFFSET`
 - `src/kernel/exec/scheduler/`: `STATIC_CONFIG`, `STATIC_LOADER`,
-  `PARAM_BUFFER`, `NAME_STORAGE`, `NEXT_NAME_SLOT`,
+  `NAME_STORAGE`, `NEXT_NAME_SLOT`,
   `INSTANTIATION_STATE`, `INSTANTIATION_IDX`, `MODULE_STATE_PTR`
 - `src/kernel/module/syscalls.rs`: `SYSCALL_TABLE`, `HARDWARE_CONTEXT`,
   `SYSTEM_EXTENSION`, `DEV_QUERY_EXTENSION`
@@ -40,10 +39,15 @@ After init these are read-only. All four platforms publish
 `INIT_COMPLETE` (or its equivalent; for RP/Linux/WASM there is no
 secondary core to release) before any code reads them. Writes during
 reconfigure happen on core 0 with all secondaries parked, restoring
-boot-only semantics for the duration of the rebuild. The state arena
-allocator is also written after init, but only on core 0: live graph
-changes (peer cores quiesced) and the block-lend ledger releasing a
-quarantined module's memory. No other core allocates module state.
+boot-only semantics for the duration of the rebuild. The parsed config's
+module entries borrow their params from the resident config blob in place
+(nothing is copied at boot), so the blob stays mapped for as long as the
+config does. The state arena allocator is also written after init: on core 0
+for live graph changes (peer cores quiesced) and the block-lend ledger
+releasing a quarantined module's memory, and from any core when an elastic
+module heap grows (`kernel::mem::heap`). Its bookkeeping (`STATE_ARENA_OFFSET`,
+`FREE_LIST`, `FREE_COUNT`) is therefore serialised by `STATE_LOCK`, held only
+over the bounded bookkeeping and never while the carved bytes are zeroed.
 
 ### Per-core-sliced — steady state, no byte shared
 
@@ -52,7 +56,8 @@ so two cores never touch the same byte:
 
 - `MODULE_HEAPS[i]` (`src/kernel/mem/heap.rs`) — module *i*'s heap.
   Module *i* only steps on its assigned core, so each heap sees a
-  single writer.
+  single writer. Growing it carves from the shared state arena under
+  `STATE_LOCK`.
 - `FAN_BUFS[d]` (`src/kernel/exec/scheduler/module_types.rs`) —
   per-domain scratch for tee / merge. Tee and merge inherit their fan
   group's `domain_id`; a domain runs on exactly one core, so

@@ -405,9 +405,16 @@ PIC modules go through this sequence during graph setup:
 2. **Validate** — check magic bytes, ABI version, code bounds
 3. **Size query** — call `module_state_size()` for the state buffer size
 4. **Allocate** — reserve state from the state arena
-5. **Heap query** — call `module_arena_size()` if exported, reserve heap
+5. **Heap** — the cap is the graph's per-instance `heap.arena_bytes`, else the
+   type's declared arena (manifest, or `module_arena_size()`); a committed heap
+   is carved now, an elastic one as the module allocates
 6. **Init** — call `module_init(syscalls)` once
-7. **New** — call `module_new(in, out, ctrl, params, params_len, state, state_size, syscalls)`
+7. **New** — call `module_new(in, out, ctrl, params, params_len, state, state_size, syscalls)`.
+   `params` points into the resident config blob itself (or a live add's
+   request): the kernel borrows module params in place rather than copying
+   them, so neither a module's params nor the config has a fixed ceiling.
+   Only an instance the platform stores runtime overrides for is handed a
+   merged copy.
 8. **Wait for ready** — if `deferred_ready` flag is set, gate downstream until first `Ready` outcome
 
 State memory is zeroed by `alloc_state()` before `module_new` is
@@ -418,11 +425,13 @@ proceeds.
 
 ### Per-Module Heap
 
-Modules that need dynamic allocation export `module_arena_size()`. The
-kernel allocates a per-module heap arena alongside the state buffer
-during instantiation and the SDK helpers `heap_alloc`, `heap_free`,
-`heap_realloc` allocate within that arena. Modules that do not export
-the function get no heap and pay zero cost. See [heap.md](heap.md).
+Modules that need dynamic allocation declare an arena (manifest or
+`module_arena_size()`), which the graph may resize per instance with
+`heap.arena_bytes`. The SDK helpers `heap_alloc`, `heap_free`,
+`heap_realloc` allocate within that cap; on linux and bcm2712 the heap
+commits state-arena memory as it is used, elsewhere the cap is carved at
+instantiation. Modules with no arena get no heap and pay zero cost. See
+[heap.md](heap.md).
 
 ### Per-Module Sandboxing
 

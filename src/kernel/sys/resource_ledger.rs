@@ -51,8 +51,11 @@ fn sample(pool: u16) -> (u32, u32) {
             let (used, cap) = crate::kernel::ipc::buffer_pool::arena_usage();
             (cap as u32, used as u32)
         }
+        // No arena any more: module params are borrowed from the config blob
+        // in place, so the pool reports the params the graph carries against
+        // the blob's mapped length.
         res::POOL_CONFIG_ARENA => {
-            let (used, cap) = crate::kernel::boot::config::config_arena_usage();
+            let (used, cap) = crate::kernel::boot::config::config_params_usage();
             (cap as u32, used as u32)
         }
         res::POOL_CHANNELS => (

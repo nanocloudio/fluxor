@@ -175,9 +175,10 @@ pub struct HalOps {
     pub release_module_handles: fn(crate::kernel::exec::scheduler::ModuleId),
     /// Boot-time scan of flash parameter store (no-op on aarch64).
     pub boot_scan: fn(),
-    /// Merge runtime parameter overrides into param buffer.
-    /// Returns new length.
-    pub merge_runtime_overrides: fn(module_id: u16, buf: *mut u8, len: usize, max: usize) -> usize,
+    /// The params one module instance is handed: its compiled params in
+    /// place, or those params with the platform's stored runtime overrides
+    /// merged over them (see [`RuntimeParams`]).
+    pub runtime_params: fn(module_id: u16, compiled: &[u8]) -> RuntimeParams,
     /// Initialize GPIO pins from config. Returns count of pins initialized.
     pub init_gpio: fn(gpio: &[Option<crate::kernel::boot::config::GpioConfig>]) -> usize,
 
@@ -729,9 +730,31 @@ pub fn boot_scan() {
     (ops().boot_scan)()
 }
 
+/// What a platform answers when the kernel asks for one module instance's
+/// params ([`HalOps::runtime_params`]).
+///
+/// Compiled params are never copied: the kernel hands a module a pointer into
+/// the resident config blob. Only an instance with stored runtime overrides
+/// needs a merged copy, and the platform that stores the overrides owns the
+/// memory for it, sized to the merge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeParams {
+    /// No stored override for this module: it gets its compiled params in
+    /// place.
+    Compiled,
+    /// The compiled params with the overrides merged over them, in
+    /// platform-owned storage that stays valid until the next call. The
+    /// kernel instantiates one module at a time and completes a pending
+    /// `module_new` before it starts the next, so that is long enough.
+    Merged(*const u8, usize),
+    /// The merge needs this many bytes and the platform cannot hold them.
+    /// The instance is refused, never handed a truncated config.
+    TooLarge(usize),
+}
+
 #[inline(always)]
-pub fn merge_runtime_overrides(module_id: u16, buf: *mut u8, len: usize, max: usize) -> usize {
-    (ops().merge_runtime_overrides)(module_id, buf, len, max)
+pub fn runtime_params(module_id: u16, compiled: &[u8]) -> RuntimeParams {
+    (ops().runtime_params)(module_id, compiled)
 }
 
 #[inline(always)]

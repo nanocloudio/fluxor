@@ -116,6 +116,41 @@ fn table() -> &'static [Override] {
     TABLE.get().map(Vec::as_slice).unwrap_or(&[])
 }
 
+/// Where a module's compiled params and its stored overrides are merged, one
+/// instance at a time (`RuntimeParams::Merged`). Grown to the merge it holds:
+/// there is no fixed ceiling on a merged block.
+static MERGED: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
+
+/// The merged params of module `module_id`: `None` when the store holds no
+/// override for it (it gets its compiled params in place, with no copy),
+/// else `(ptr, len)` of its compiled params with the overrides merged over
+/// them, in `MERGED`, sized to what the merge needs and valid until the next
+/// call.
+pub fn merged_params(module_id: u16, compiled: &[u8]) -> Option<(*const u8, usize)> {
+    let id = u8::try_from(module_id).unwrap_or(u8::MAX);
+    let extra: usize = table()
+        .iter()
+        .filter(|o| o.module_id == id)
+        .map(|o| 2 + o.value.len())
+        .sum();
+    if extra == 0 {
+        return None;
+    }
+    // Room for a TLV header the compiled params may lack, every override
+    // entry, and the end marker.
+    let max = compiled.len().max(4) + extra + 1;
+    let mut buf = MERGED.lock().unwrap_or_else(|e| e.into_inner());
+    buf.clear();
+    buf.resize(max, 0);
+    buf[..compiled.len()].copy_from_slice(compiled);
+    // SAFETY: `buf` holds `max` writable bytes whose first `compiled.len()`
+    // are the compiled params.
+    let len = unsafe { merge_runtime_overrides(module_id, buf.as_mut_ptr(), compiled.len(), max) };
+    // The Vec's heap block outlives the guard: nothing touches it until the
+    // next call, which is the lifetime promised.
+    Some((buf.as_ptr(), len))
+}
+
 /// Append this module's overrides after its compiled parameters, so
 /// `parse_tlv`'s last-writer-wins gives the stored value.
 ///

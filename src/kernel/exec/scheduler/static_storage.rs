@@ -74,9 +74,11 @@ pub unsafe fn install_static_config(cfg: Config) {
 /// Populate the static config + loader from in-memory blobs.
 ///
 /// `config_ptr` points to an FXWR-format config blob; `modules_ptr` to a
-/// module-table blob. The caller must keep both memory ranges mapped
-/// until module instantiation completes. After this returns `Ok`,
-/// `prepare_graph()` is the next step.
+/// module-table blob. The caller must keep both memory ranges mapped for
+/// the life of `STATIC_CONFIG` (module code runs from the table, and every
+/// module's params are borrowed from the config blob in place, including at
+/// a later rebuild). After this returns `Ok`, `prepare_graph()` is the next
+/// step.
 ///
 /// **Length-aware variant**: callers that also know the module-table
 /// length (hosted targets reading from a file, wasm reading from a
@@ -99,9 +101,10 @@ pub unsafe fn populate_static_state(
     modules_ptr: *const u8,
 ) -> Result<(), &'static str> {
     // `config_len` is the platform's declared upper bound on the
-    // config blob's mapped region. QEMU virt passes the gap between
-    // QEMU_CONFIG_BLOB_ADDR and QEMU_MODULES_BLOB_ADDR; other
-    // bare-metal paths use the slot size from their flash trailer.
+    // config blob's mapped region, and the parser's only bound. QEMU
+    // virt passes the gap between QEMU_CONFIG_BLOB_ADDR and
+    // QEMU_MODULES_BLOB_ADDR. The parsed config borrows module params
+    // from the blob, so it stays mapped for the life of STATIC_CONFIG.
     // SAFETY: caller upholds `# Safety` — single-threaded boot/init.
     let loader = unsafe {
         let p = &raw mut STATIC_LOADER;
@@ -136,8 +139,9 @@ pub unsafe fn populate_static_state(
 ///
 /// # Safety
 /// `modules_ptr` must point at a valid module-table blob whose
-/// `modules_len` bytes are mapped and readable. `config_blob` may be
-/// any slice the caller has a valid reference for. Mutates the static
+/// `modules_len` bytes are mapped and readable. `config_blob` must stay
+/// mapped and unchanged for the life of `STATIC_CONFIG`: the parsed module
+/// entries borrow their params from it. Mutates the static
 /// config + loader; not safe to call after the scheduler has started
 /// stepping modules.
 pub unsafe fn populate_static_state_with_len(

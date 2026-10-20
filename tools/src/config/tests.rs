@@ -730,6 +730,54 @@ mod scheduler_validation_tests {
         assert_eq!(p, vec![1, 2, 3]);
     }
 
+    /// `heap.arena_bytes` is this instance's heap cap: tag 0xEF, a u32 LE,
+    /// in the base graph's entry and in a workload module's params alike.
+    #[test]
+    fn heap_arena_bytes_packs_as_tag_0xef() {
+        // Workload path.
+        let m = json!({"heap": {"arena_bytes": 2 * 1024 * 1024}});
+        let p = insert_workload_heap_tags(Vec::new(), &m, "kv").unwrap();
+        assert_eq!(
+            p,
+            vec![0xFE, 0x01, 8, 0, 0xEF, 4, 0x00, 0x00, 0x20, 0x00, 0xFF, 0x00]
+        );
+        assert_eq!(crate::add_subgraph::params_node_tag(&p), None);
+
+        // Base graph path: no schema source, so the entry's params are the
+        // TLV the kernel tags open themselves.
+        let manifests = HashMap::new();
+        let module = json!({"name": "reader", "type": "reader",
+                            "heap": {"arena_bytes": 65536, "zero_on_free": true}});
+        let entry = build_module_entry(
+            "reader",
+            &module,
+            0,
+            None,
+            &json!({}),
+            test_loc(std::path::Path::new("/nonexistent/modules")),
+            &manifests,
+            crate::capacity::kernel_max_modules("linux"),
+            &crate::target::IsolationFacts::default(),
+        )
+        .expect("emit module entry");
+        let params = &entry[MODULE_ENTRY_HEADER_SIZE..];
+        let at = params
+            .windows(6)
+            .position(|w| w == [0xEF, 4, 0x00, 0x00, 0x01, 0x00])
+            .expect("tag 0xEF carries 65536");
+        let end = params.iter().rposition(|&b| b == 0xFF).expect("end marker");
+        assert!(at < end, "the cap rides before the TLV end marker");
+
+        // Validation: a positive integer that fits a u32.
+        for bad in [json!(0), json!(16), json!("4MiB"), json!(-1), json!(1u64 << 33)] {
+            let m = json!({"heap": {"arena_bytes": bad.clone()}});
+            let err = validate_heap_subtree(&m, "reader").unwrap_err();
+            assert!(format!("{err:?}").contains("heap.arena_bytes"), "{bad}: {err:?}");
+        }
+        validate_heap_subtree(&json!({"heap": {"arena_bytes": 4194304}}), "reader")
+            .expect("4 MiB is a cap");
+    }
+
     #[test]
     fn replicated_clock_idle_clamp_enforced() {
         // Demand-driven idle must not widen tick_max_us past the

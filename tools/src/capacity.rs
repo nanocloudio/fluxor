@@ -58,16 +58,12 @@ pub fn kernel_max_edges(target: &str) -> usize {
 pub const HOST_STATE_ARENA: u64 = 1024 * 1024 * 1024;
 /// profile_linux and profile_bcm2712 `BUFFER_ARENA_SIZE`.
 pub const HOST_BUFFER_ARENA: u64 = 16 * 1024 * 1024;
-/// profile_linux and profile_bcm2712 `CONFIG_ARENA_SIZE`.
-pub const HOST_CONFIG_ARENA: u64 = 256 * 1024;
 /// profile_linux and profile_bcm2712 `ELASTIC_REGION_SIZE`.
 pub const HOST_ELASTIC_REGION: u64 = 16 * 1024 * 1024;
 /// profile_wasm `STATE_ARENA_SIZE`.
 pub const WASM_STATE_ARENA: u64 = 96 * 1024 * 1024;
 /// profile_wasm `BUFFER_ARENA_SIZE`.
 pub const WASM_BUFFER_ARENA: u64 = 8 * 1024 * 1024;
-/// profile_wasm `CONFIG_ARENA_SIZE`.
-pub const WASM_CONFIG_ARENA: u64 = 32 * 1024;
 /// profile_wasm `ELASTIC_REGION_SIZE`.
 pub const WASM_ELASTIC_REGION: u64 = 2 * 1024 * 1024;
 /// profile_rp `ELASTIC_REGION_SIZE`: Tier B compiles out on the RP parts.
@@ -133,8 +129,9 @@ pub fn kernel_pool_static_cap(target: &str, pool: &str) -> Option<u64> {
         "state_arena" if wasm => Some(WASM_STATE_ARENA),
         "buffer_arena" if host => Some(HOST_BUFFER_ARENA),
         "buffer_arena" if wasm => Some(WASM_BUFFER_ARENA),
-        "config_arena" if host => Some(HOST_CONFIG_ARENA),
-        "config_arena" if wasm => Some(WASM_CONFIG_ARENA),
+        // `config_arena` has no compiled size on any profile: module params
+        // are borrowed from the config blob in place, so the pool is the
+        // blob itself and the kernel reports it against the blob's length.
         // Tier B elastic region (kernel ELASTIC_REGION_SIZE).
         "elastic_region" if host => Some(HOST_ELASTIC_REGION),
         "elastic_region" if wasm => Some(WASM_ELASTIC_REGION),

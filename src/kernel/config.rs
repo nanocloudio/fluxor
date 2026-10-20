@@ -79,17 +79,6 @@ mod profile_linux {
     /// media modules (the unified codec's decoder plus its CAVLC/clip tables
     /// runs ~450 KiB) and protocol modules that bundle firmware blobs.
     pub const MAX_MODULE_CODE_SIZE: usize = 1024 * 1024;
-    /// Largest params block one module may carry. 256 KiB so the synth host
-    /// can carry the inlined wasm browser shell (runtime.html ~83 KiB +
-    /// host_shims.js ~56 KiB) as http `body:` routes. An instance whose
-    /// params exceed it fails to instantiate, loudly. Aligned with
-    /// `MAX_CONFIG_SIZE`, `MAX_MODULE_PARAMS_SIZE` (tools), and the http
-    /// module section cap.
-    pub const MAX_MODULE_CONFIG_SIZE: usize = 256 * 1024;
-    /// 256 KiB so split scenarios where both halves' http modules inline the
-    /// canonical wasm shell as body routes (~95 KiB per http module) leave
-    /// headroom for the other modules' params (codec, bank, ws_stream, ...).
-    pub const CONFIG_ARENA_SIZE: usize = 256 * 1024;
     /// Capacity of the in-memory log ring (`kernel::sys::log_ring`). Sized
     /// for moderate trace volume.
     pub const LOG_RING_CAPACITY: usize = 65536;
@@ -103,6 +92,13 @@ mod profile_linux {
     /// Grant granularity: chunks are rounded up to this quantum (the 64 KiB
     /// platform quantum).
     pub const ELASTIC_QUANTUM: usize = 64 * 1024;
+    /// Segments one module heap may carve (`kernel::mem::heap`). Above 1 a
+    /// heap is elastic: it commits state-arena memory as the module
+    /// allocates, up to its cap, rather than carving the cap at
+    /// instantiation. Eight is derived, not tuned: the first segment is
+    /// `cap >> 7` and each carve at least doubles what is committed, so
+    /// eight carves reach any cap.
+    pub const HEAP_SEGMENTS: usize = 8;
 }
 
 // ── BCM2712 bare metal (Raspberry Pi 5, QEMU virt) ─────────────────────────
@@ -131,10 +127,6 @@ mod profile_bcm2712 {
     /// Loader sanity ceiling for a single module's code segment (see the
     /// Linux profile).
     pub const MAX_MODULE_CODE_SIZE: usize = 1024 * 1024;
-    /// Largest params block one module may carry (see the Linux profile).
-    pub const MAX_MODULE_CONFIG_SIZE: usize = 256 * 1024;
-    /// Decoded boot configuration arena (see the Linux profile).
-    pub const CONFIG_ARENA_SIZE: usize = 256 * 1024;
     /// Early-boot log ring. Not raised past 64 KiB: the whole ring is
     /// replayed in one burst when a consumer attaches, and on the Pi 5 rig a
     /// 256 KiB ring outran the collector's socket buffer.
@@ -144,6 +136,10 @@ mod profile_bcm2712 {
     pub const ELASTIC_REGION_SIZE: usize = 16 * 1024 * 1024;
     /// Grant granularity: the 64 KiB platform quantum.
     pub const ELASTIC_QUANTUM: usize = 64 * 1024;
+    /// Segments one module heap may carve (see the Linux profile): elastic
+    /// heaps. Each carve comes from the state arena above 1 GB and is zeroed
+    /// as it is handed out, never a region wholesale.
+    pub const HEAP_SEGMENTS: usize = 8;
 }
 
 // ── wasm32 (browser, wasmtime, edge runtimes) ──────────────────────────────
@@ -176,10 +172,6 @@ mod profile_wasm {
     pub const MAX_MODULES: usize = 48;
     /// ISR-tier bridge slots (see the Linux profile).
     pub const MAX_BRIDGES: usize = 16;
-    /// Largest params block one module may carry.
-    pub const MAX_MODULE_CONFIG_SIZE: usize = 16 * 1024;
-    /// Decoded boot configuration arena.
-    pub const CONFIG_ARENA_SIZE: usize = 32 * 1024;
     /// Early-boot log ring.
     pub const LOG_RING_CAPACITY: usize = 16384;
     /// Tier B elastic region. Browser tabs page lazily, but the region is
@@ -187,6 +179,9 @@ mod profile_wasm {
     pub const ELASTIC_REGION_SIZE: usize = 2 * 1024 * 1024;
     /// Grant granularity: the wasm page.
     pub const ELASTIC_QUANTUM: usize = 64 * 1024;
+    /// One segment per module heap: every heap is committed whole at
+    /// instantiation.
+    pub const HEAP_SEGMENTS: usize = 1;
 }
 
 // ── RP (rp2040, rp2350) ────────────────────────────────────────────────────
@@ -202,11 +197,12 @@ mod profile_rp {
     pub const STATE_ARENA_SIZE: usize = crate::platform::chip::STATE_ARENA_SIZE;
     /// Channel buffer pool, from `[kernel] buffer_arena_kb`.
     pub const BUFFER_ARENA_SIZE: usize = crate::platform::chip::BUFFER_ARENA_SIZE;
-    /// Largest params block one module may carry, from `[kernel]
-    /// config_buffer_kb`.
+    /// The buffer a module's compiled params and its stored runtime
+    /// overrides are merged in, from `[kernel] config_buffer_kb`. Only an
+    /// instance the flash parameter store holds an override for is copied
+    /// there; every other module borrows its params from flash in place, at
+    /// any size. A merge that does not fit refuses the instance, loudly.
     pub const MAX_MODULE_CONFIG_SIZE: usize = crate::platform::chip::MAX_MODULE_CONFIG_SIZE;
-    /// Decoded boot configuration arena, from `[kernel] config_arena_kb`.
-    pub const CONFIG_ARENA_SIZE: usize = crate::platform::chip::CONFIG_ARENA_SIZE;
     /// Early-boot log ring, from `[kernel] log_ring_kb`. Must be a power of
     /// two.
     pub const LOG_RING_CAPACITY: usize = crate::platform::chip::LOG_RING_CAPACITY;
@@ -229,6 +225,9 @@ mod profile_rp {
     pub const ELASTIC_REGION_SIZE: usize = 0;
     /// Grant granularity (unused while the region is empty).
     pub const ELASTIC_QUANTUM: usize = 1024;
+    /// One segment per module heap: every heap is committed whole at
+    /// instantiation, as the silicon TOML's state-arena budget plans it.
+    pub const HEAP_SEGMENTS: usize = 1;
 }
 
 const _: () = assert!(
@@ -236,6 +235,6 @@ const _: () = assert!(
     "the log ring is indexed by mask"
 );
 const _: () = assert!(
-    MAX_MODULE_CONFIG_SIZE <= CONFIG_ARENA_SIZE,
-    "one module's params must fit the config arena"
+    HEAP_SEGMENTS >= 1 && HEAP_SEGMENTS <= 32,
+    "a heap's first segment is cap >> (HEAP_SEGMENTS - 1)"
 );
