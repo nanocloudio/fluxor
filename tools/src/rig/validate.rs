@@ -1,10 +1,10 @@
 //! Cross-schema validators: scenario requirements vs. the target board's
 //! declared rig capabilities, and the private profile vs. the board's
-//! secret rules. Every failure is raised at parse and plan time, never
-//! after orchestration has started.
+//! build-env rules. Every failure is raised at plan time, before the rig
+//! is touched.
 
 use crate::rig::board::BoardRig;
-use crate::rig::matcher::supports_rule_source;
+use crate::rig::matcher::{supports_rule_source, OBSERVE_RULE_SOURCES};
 use crate::rig::profile::{BindingValue, RigProfile};
 use crate::rig::scenario::{ExpectRule, ObservationRule, Scenario};
 use crate::rig::vocab::{Capability, Surface};
@@ -189,19 +189,22 @@ fn check_source(
     s: &Scenario,
     v: &mut RigValidation,
 ) {
-    // Every rule source must be one the matcher can actually evaluate.
-    // The vocabulary lists capabilities that are legal to declare on a
-    // board but not every one of them has an orchestrator pipeline yet.
+    // Every rule source must be one the matcher can evaluate. A board may
+    // declare capabilities that carry no stream a rule can read.
     if !supports_rule_source(source) {
         v.errors.push(format!(
-            "scenario '{}': [[{}]][{}] source = '{}' — this capability is in the \
-             vocabulary but the matcher has no evaluator for it yet. Supported rule \
-             sources: any `console.*` or `telemetry.*` (regex on the per-source \
-             byte stream) and `observe.netboot_fetch`.",
+            "scenario '{}': [[{}]][{}] source = '{}' — a board may declare this \
+             capability, but it carries no stream a rule can read. Rule sources: any \
+             `console.*` or `telemetry.*` (regex on the per-source byte stream), and {}.",
             s.name,
             kind,
             i,
             source.as_str(),
+            OBSERVE_RULE_SOURCES
+                .iter()
+                .map(|c| format!("`{c}`"))
+                .collect::<Vec<_>>()
+                .join(", "),
         ));
         return;
     }
@@ -340,8 +343,8 @@ mod tests {
 
     #[test]
     fn rule_source_unsupported_by_matcher_fails_at_plan_time() {
-        // `observe.monitor_stream` is declared by the board but has no
-        // matcher evaluator; the scenario must fail at validation.
+        // `observe.monitor_stream` is declared by the board but carries no
+        // stream a rule reads; the scenario must fail at validation.
         let s = scn(r#"
             name = "monitor_stream_scenario"
             target = "pi5"
@@ -355,7 +358,8 @@ mod tests {
         assert!(!v.is_ok());
         let msg = &v.errors[0];
         assert!(msg.contains("observe.monitor_stream"), "{msg}");
-        assert!(msg.contains("matcher has no evaluator"), "{msg}");
+        assert!(msg.contains("no stream a rule can read"), "{msg}");
+        assert!(msg.contains("`observe.udp_capture`"), "{msg}");
     }
 
     #[test]

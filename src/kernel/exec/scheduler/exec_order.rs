@@ -133,9 +133,9 @@ pub(crate) fn gate_contract_consumers() -> usize {
 /// graph cycle.
 ///
 /// **Cycle policy**:
-/// v1 has no typed feedback-edge concept, so cycles are appended at the end
-/// in index order AND a loud `log::error!` line is emitted so the cycle is
-/// visible in operator output. The fail-load path is owned by
+/// an edge carries no feedback marking, so nothing says where a cycle may
+/// be cut. Cycle members are appended at the end in index order AND a loud
+/// `log::error!` line is emitted so the cycle is visible in operator output. The fail-load path is owned by
 /// `prepare_graph` (which checks the returned `cycle_count`); silently
 /// shipping the post-cycle order would propagate non-deterministic stepping
 /// behaviour, and crashing the kernel on a valid-but-cyclic example graph

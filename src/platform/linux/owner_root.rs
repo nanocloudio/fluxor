@@ -189,14 +189,14 @@ pub unsafe fn store_for(owner: OwnerHandle) -> Option<&'static mut Served> {
     root.store.as_mut()
 }
 
-/// The platform's owner-release hook: close the files the owner holds open,
-/// drop its store and the handles on it, close its files directory and
-/// remove its root. A root the owner never opened in this run, one a
-/// previous run left, is removed all the same. An owner that acted with the
-/// node's authority has no root: the files, host processes and node-store
-/// handles it opened are closed, and nothing on the host is removed. Registered with the
-/// kernel at init; it runs before the owner is freed, so the owner still
-/// resolves.
+/// The owner-release half this library holds: close the files the owner
+/// holds open, drop its store and the handles on it, close its files
+/// directory and remove its root. A root the owner never opened in this run,
+/// one a previous run left, is removed all the same. An owner that acted
+/// with the node's authority has no root: the files, host processes and
+/// node-store handles it opened are closed, and nothing on the host is
+/// removed. The runtime's owner-release hook calls it, while the owner still
+/// resolves, beside the host namespace and HTTP object providers' own.
 pub fn release(owner: OwnerHandle) {
     if owner.is_system() {
         return;

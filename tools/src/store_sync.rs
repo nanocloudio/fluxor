@@ -390,6 +390,16 @@ fn materialize_artifact(store: &OciStore, project_root: &Path, e: &Artifact) -> 
             e,
             &bundle_dir(project_root, path_component("bundle name", &e.name)?),
         ),
+        // A stack is read from the store by the build that includes it;
+        // sync proves its layers are present and intact.
+        "stack" => {
+            let pinned = crate::stack::read_pinned(store, e)?;
+            Ok(format!(
+                "stack {} ({} module reference(s); included from the store)",
+                e.name,
+                pinned.modules.len()
+            ))
+        }
         other => Err(Error::Config(format!(
             "artifact '{}' has kind '{other}', which sync does not know how to materialise",
             e.name
@@ -779,7 +789,7 @@ pub enum MemberOutcome {
     Published(Vec<String>),
 }
 
-/// `fluxor workspace publish` (Decision 2): for every workspace member
+/// `fluxor workspace publish`: for every workspace member
 /// whose input digests differ from its published artifacts, run that
 /// member's module build and publish it — topologically ordered by the
 /// members' checkout-side `fluxor.toml` dependency declarations. Abort

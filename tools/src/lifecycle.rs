@@ -5,9 +5,9 @@
 //! in mind, so the same target name diverges repo by repo. The verbs
 //! here read the project's shape — root `Cargo.toml`,
 //! `[ci.cargo] host_tools_crate`, `modules/` + `[ci].targets`,
-//! `[ci.test] scripts`, declared module harnesses, and whether the cargo
-//! tree `#[path]`-mounts the staged `target/fluxor` tree — and do what
-//! that shape implies. A Makefile recipe becomes one delegation.
+//! `[ci.setup]` and `[ci.test] scripts`, `tests/harness/` and a root
+//! `tests/`, and whether the cargo tree `#[path]`-mounts the staged
+//! `target/fluxor` tree — and do what that shape implies. A Makefile recipe becomes one delegation.
 //!
 //! Every stage the shape does not call for is *omitted*, not skipped: a
 //! crate-less project's `build` is the module build alone, and that is
@@ -16,8 +16,7 @@
 //! These verbs are the **developer loop**, not the gate. `fluxor ci` is
 //! the gate: it runs every phase even after a failure, adds the lint /
 //! hygiene / template / lockfile / skew phases, and stamps its green
-//! digest. The lifecycle verbs fail fast, exactly like the `set -e`
-//! recipe they replace.
+//! digest. The lifecycle verbs fail fast, like a `set -e` recipe.
 
 use std::path::{Path, PathBuf};
 
@@ -45,8 +44,9 @@ pub struct Shape {
     /// `target/fluxor/`, so a wiped `target/` must be re-materialised
     /// before cargo reads the mount.
     pub mounts_staged: bool,
-    /// `[ci.test] scripts` globs — the project's runtime gate.
+    /// `[ci.setup] scripts` — what every suite reads is provisioned first.
     pub setup_scripts: Vec<String>,
+    /// `[ci.test] scripts` globs — the project's runtime gate.
     pub test_scripts: Vec<String>,
     /// A root `tests/` directory exists, so the root package may carry
     /// integration tests. The unit-test phase selects target kinds and so
@@ -301,8 +301,8 @@ fn lexical_join(base: &Path, rel: &str) -> PathBuf {
 
 // ── the verbs ───────────────────────────────────────────────────────────
 
-/// Announce a step before running it: the verbs replace recipes that
-/// echoed their commands, so the command must stay visible.
+/// Announce a step before running it: a verb stands where a recipe that
+/// echoes its commands would, so the command stays visible.
 fn step(cmd: &str) {
     println!("\x1b[1;36m+\x1b[0m {cmd}");
 }
@@ -359,12 +359,14 @@ pub fn build(project_root: &Path, verbose: bool) -> Result<()> {
     Ok(())
 }
 
-/// `fluxor test` — module harnesses, cargo tests, project e2e scripts.
+/// `fluxor test` — `[ci.setup] scripts`, then the cargo unit tests, the
+/// integration suites (`tests/harness/`, a root `tests/`) and the
+/// `[ci.test] scripts`.
 ///
-/// The three are the three places a fluxor-native project's tests can
-/// live; a project runs whichever it has. The e2e scripts run through
-/// `fluxor ci`'s own project-e2e runner, so `make test` and the gate
-/// agree on what "the scripts passed" means.
+/// A project runs whichever of these it has. Every lane is the one the
+/// gate runs, from the same definition, and the scripts run through
+/// `fluxor ci`'s own setup and project-e2e runners, so `make test` and
+/// the gate agree on what "the tests passed" means.
 pub fn test(project_root: &Path, _verbose: bool) -> Result<()> {
     let _cli = ci::RunningCli::hold();
     let s = shape(project_root);
@@ -405,21 +407,20 @@ pub fn test(project_root: &Path, _verbose: bool) -> Result<()> {
     }
 
     if !did_something {
-        println!(
-            "nothing to test: no module harnesses, no cargo tree, no tests/harness, \
-             no `[ci.test] scripts`"
-        );
+        println!("nothing to test: no cargo tree, no tests/harness, no `[ci.test] scripts`");
     }
     Ok(())
 }
 
-/// `fluxor lint` — the precise checks the gate runs, minus the ones that
-/// need a build.
+/// `fluxor lint` — the gate's host-tree lints, for the edit loop.
 ///
-/// `cargo fmt --all -- --check` and `cargo clippy … -D warnings` where a
-/// cargo tree exists, then `fluxor lint hygiene`, always. The module
-/// fmt and clippy phases stay in `fluxor ci`: they walk every PIC source
-/// per target and belong to the gate, not the edit loop.
+/// `cargo fmt --all -- --check` at the root and one `cargo clippy
+/// --all-targets --all-features -- -D warnings` at the cargo site (the
+/// host-tools crate, else the workspace root with `--workspace`) where a
+/// cargo tree exists, then `fluxor lint hygiene`, always. The gate's other
+/// lint phases stay in `fluxor ci`: the module fmt and clippy sweeps over
+/// every PIC source and, in the kernel workspace, the per-target clippy
+/// matrix.
 pub fn lint(project_root: &Path) -> Result<()> {
     let _cli = ci::RunningCli::hold();
     let s = shape(project_root);
@@ -461,8 +462,8 @@ pub fn lint(project_root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// `fluxor clean` — module artefacts, cargo's target tree, and the
-/// generated module-test crates.
+/// `fluxor clean` — module artefacts and the target dir of every cargo
+/// workspace the other verbs build in.
 pub fn clean(project_root: &Path) -> Result<()> {
     let _cli = ci::RunningCli::hold();
     let s = shape(project_root);
@@ -492,16 +493,6 @@ pub fn clean(project_root: &Path) -> Result<()> {
         };
         step(&label);
         ci::cargo_in(&site, &["clean"]).map_err(Error::Config)?;
-    }
-
-    // `fluxor modules test` generates disposable crates here. `cargo
-    // clean` removes them only when it owns `target/`; a crate-less
-    // project has no cargo clean at all, so remove them explicitly.
-    let moduletests = s.project_root.join("target/fluxor/moduletests");
-    if moduletests.exists() {
-        step("rm -rf target/fluxor/moduletests");
-        std::fs::remove_dir_all(&moduletests)
-            .map_err(|e| Error::Config(format!("{}: {e}", moduletests.display())))?;
     }
     Ok(())
 }
@@ -565,12 +556,6 @@ fn run_modules_build(s: &Shape, verbose: bool) -> Result<()> {
 
 // ── `fluxor help --make` ────────────────────────────────────────────────
 
-/// Generate the canonical `make help` block for this checkout.
-///
-/// A Makefile's `help:` target is `@fluxor help --make`, so the text can
-/// never drift from the CLI or fall behind the scripts in the tree: the
-/// script list is a directory walk, not a hand-kept list, and the
-/// lifecycle lines say what the verbs actually do for *this* shape.
 /// Non-lifecycle targets a project's Makefile defines, each with the
 /// first line of the comment block above it as its description.
 ///
@@ -607,6 +592,12 @@ fn project_targets(project_root: &Path) -> Vec<(String, String)> {
     out
 }
 
+/// Generate the canonical `make help` block for this checkout.
+///
+/// A Makefile's `help:` target is `@fluxor help --make`, so the text can
+/// never drift from the CLI or fall behind the scripts in the tree: the
+/// script list is a directory walk, not a hand-kept list, and the
+/// lifecycle lines say what the verbs actually do for *this* shape.
 pub fn make_help(project_root: &Path) -> String {
     let s = shape(project_root);
     let mut out = String::new();
@@ -652,21 +643,18 @@ pub fn make_help(project_root: &Path) -> String {
         ("fluxor modules list", "module inventory"),
         ("fluxor run <config>", "bring-up"),
         ("fluxor update / fluxor sync", "store consumption"),
-        ("fluxor build --check configs/…", "config validation"),
+        ("fluxor build --check <graph>", "graph validation"),
         ("fluxor inspect [subject]", "project / config / store info"),
         ("fluxor store ls", "local OCI store contents"),
     ] {
         line(&column(cmd, desc));
     }
-    for applet in applet_manifests(&s.project_root) {
+    for name in applet_names(&s.project_root) {
         line(&column(
-            &format!("fluxor install {applet}"),
+            &format!("fluxor install {name}"),
             "register the CLI applet",
         ));
-        line(&column(
-            &format!("fluxor exec {} -- <cmd>", s.name),
-            "run it",
-        ));
+        line(&column(&format!("fluxor exec {name} -- <cmd>"), "run it"));
     }
 
     let scripts = project_scripts(&s.project_root);
@@ -698,8 +686,8 @@ fn column(cmd: &str, desc: &str) -> String {
 }
 
 /// The fluxor checkout is the one that installs the CLI; everyone else
-/// consumes it. The discriminator is the tools crate's own package name
-/// in the root workspace's member list.
+/// consumes it. The discriminator is the tools crate itself: this source
+/// file, or a `tools/Cargo.toml` naming the `fluxor-tools` package.
 fn is_fluxor_itself(s: &Shape) -> bool {
     s.project_root.join("tools/src/lifecycle.rs").is_file()
         || std::fs::read_to_string(s.project_root.join("tools/Cargo.toml")).is_ok_and(|t| {
@@ -762,10 +750,12 @@ fn describe_clean(s: &Shape) -> String {
     if s.has_modules {
         parts.push("module artefacts".to_string());
     }
-    if s.has_cargo {
+    if !s.cargo_clean_sites().is_empty() {
         parts.push("cargo clean".to_string());
     }
-    parts.push("module-test crates".to_string());
+    if parts.is_empty() {
+        parts.push("nothing to clean".to_string());
+    }
     format!("fluxor clean — {}", parts.join(" + "))
 }
 
@@ -783,19 +773,19 @@ fn setup_line(s: &Shape) -> String {
     "make -C ../fluxor install".to_string()
 }
 
-/// `app.fluxor.toml` / `packaging/cli/workload.toml` — the product-CLI
-/// applet manifest, when this project ships one.
-fn applet_manifests(project_root: &Path) -> Vec<String> {
-    ["packaging/cli/workload.toml", "app.fluxor.toml"]
-        .iter()
-        .filter(|p| project_root.join(p).is_file())
-        .map(|p| (*p).to_string())
+/// The applets this project ships: `packaging/applet/<name>/`.
+fn applet_names(project_root: &Path) -> Vec<String> {
+    crate::packaging::discover(project_root)
+        .bundles
+        .into_iter()
+        .filter(|(k, _)| *k == crate::packaging::Kind::Applet)
+        .filter_map(|(_, p)| crate::packaging::read_bundle(&p).ok().map(|b| b.name))
         .collect()
 }
 
-/// Every shell script under `tools/` and `scripts/`, recursively, as
-/// repo-relative paths. A walk, not a list: help text that names six of
-/// thirty-eight scripts is how the other thirty-two became invisible.
+/// Every shell and Python script under `tools/` and `scripts/`,
+/// recursively, as repo-relative paths. A walk, not a list: a hand-kept
+/// list falls behind the tree, and a script it leaves out is invisible.
 fn project_scripts(project_root: &Path) -> Vec<String> {
     let mut out = Vec::new();
     for top in ["tools", "scripts"] {
@@ -828,9 +818,9 @@ fn project_scripts(project_root: &Path) -> Vec<String> {
     out
 }
 
-/// Which of those scripts the gate actually runs (`[ci.setup] scripts` and
-/// `[ci.test] scripts`) — the difference between "in the gate" and
-/// "advertised as in the gate".
+/// Which of those scripts the gate actually runs (`[ci.setup] scripts`,
+/// `[ci.test] scripts`, and the scripts a phase runs by name) — the
+/// difference between "in the gate" and "advertised as in the gate".
 fn ci_gated_scripts(s: &Shape) -> std::collections::BTreeSet<String> {
     let mut paths = Vec::new();
     for glob in s.setup_scripts.iter().chain(&s.test_scripts) {
@@ -843,12 +833,28 @@ fn ci_gated_scripts(s: &Shape) -> std::collections::BTreeSet<String> {
                 .ok()
                 .map(|r| r.to_string_lossy().into_owned())
         })
+        .chain(ci::runs_kernel_link(&s.project_root).then(|| ci::KERNEL_LINK_SCRIPT.to_string()))
         .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `make help` marks the kernel-link phase's build script as gated in
+    /// the kernel workspace, where that phase runs it.
+    #[test]
+    fn the_kernel_link_script_is_marked_gated_in_the_kernel_workspace() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("tools/ sits in the fluxor checkout");
+        assert!(ci_gated_scripts(&shape(root)).contains(ci::KERNEL_LINK_SCRIPT));
+        let other = tempfile::tempdir().unwrap();
+        assert!(
+            ci_gated_scripts(&shape(other.path())).is_empty(),
+            "a project that is not the kernel workspace runs no kernel-link phase"
+        );
+    }
 
     #[test]
     fn path_attr_value_reads_only_real_path_attributes() {
@@ -1064,6 +1070,11 @@ mod tests {
             vec![dir.join("tools/ci"), dir.join("tools/wire_lint")],
             "each standalone host crate owns a target dir"
         );
+        assert_eq!(
+            describe_clean(&s),
+            "fluxor clean — module artefacts + cargo clean",
+            "`make help` names the cargo clean a crate-less project still runs"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1120,6 +1131,12 @@ mod tests {
         assert_eq!(s.cargo_site(), None);
         assert_eq!(describe_build(&s), "fluxor build — PIC modules".to_string());
         assert_eq!(describe_test(&s), "fluxor test — e2e scripts".to_string());
+        assert_eq!(describe_clean(&s), "fluxor clean — module artefacts");
+        let bare = Shape {
+            has_modules: false,
+            ..s
+        };
+        assert_eq!(describe_clean(&bare), "fluxor clean — nothing to clean");
     }
 
     /// A project whose ONLY cargo tree is `tests/harness/` must still have it

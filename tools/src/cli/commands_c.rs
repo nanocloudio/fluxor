@@ -197,15 +197,8 @@ fn validate_linux_runtime_features(yaml_path: &std::path::Path) -> Result<()> {
 
     // Parse the YAML and walk modules. We don't reuse the full
     // generation pipeline — we just need module type + relevant fields.
-    let content = substitute_env_vars(&std::fs::read_to_string(yaml_path)?)?;
-    let mut config: serde_json::Value = if yaml_path
-        .extension()
-        .is_some_and(|ext| ext == "yaml" || ext == "yml")
-    {
-        serde_yaml::from_str(&content)?
-    } else {
-        serde_json::from_str(&content)?
-    };
+    let mut config: serde_json::Value =
+        stack_expand::load_graph(yaml_path, &crate::project::root_for_config(yaml_path))?;
     let target_desc = resolve_target(&config, None)?;
     // Resolve from the CONFIG's location, not the cwd: the rig and
     // cross-repo builds invoke this from another project's root, and a
@@ -346,7 +339,7 @@ fn cmd_run_dispatch(config_path: Option<&PathBuf>, flags: RunFlags, verbose: boo
     let pinned = if config_path.exists() {
         None
     } else {
-        Some(workload_src::pinned_bundle(&config_path.to_string_lossy())?)
+        Some(workload_src::bundle_by_name(&config_path.to_string_lossy())?)
     };
     if let Some(bundle) = pinned
         .as_deref()
@@ -359,12 +352,16 @@ fn cmd_run_dispatch(config_path: Option<&PathBuf>, flags: RunFlags, verbose: boo
         }
         return workload_src::run_bundle(bundle, &flags.params, flags.ca.as_deref(), verbose);
     }
-    if !flags.params.is_empty() {
-        return Err(Error::Config(format!(
-            "fluxor run {}: --param/--params apply to a service bundle, and this is not one",
-            config_path.display()
-        )));
+    // A graph renders with the run's values, as a bundle does: the graph's
+    // own `params:` declares what it takes. A graph carrying an inline
+    // `scenario:` block is still that graph; a scenario file composes
+    // graphs and takes none.
+    if !flags.params.is_empty() && scenario::is_scenario_file(config_path) {
+        return Err(Error::Config(
+            "fluxor run --param/--params apply to a graph or a bundle, not a scenario file".into(),
+        ));
     }
+    fluxor_tools::params::set_values(flags.params.values()?);
 
     if flags.ca.is_some()
         && (scenario::is_scenario_file(config_path)
@@ -1302,7 +1299,7 @@ fn cmd_run(
                 // `tls` or any other listener is reachable from the host the
                 // same way. A port below 1024 is forwarded from 18000 above
                 // it, so the host side needs no privilege. A graph naming no
-                // port keeps the old default, guest 80 from host 18080.
+                // port is forwarded guest 80 from host 18080.
                 let yaml_text = std::fs::read_to_string(config_path)?;
                 let yaml: serde_yaml::Value = serde_yaml::from_str(&yaml_text)
                     .map_err(|e| Error::Config(format!("YAML parse: {e}")))?;
@@ -2199,6 +2196,7 @@ struct BuildFlags {
     target: Option<String>,
     epoch: u64,
     sign_key: Option<PathBuf>,
+    params: workload_src::RunParams,
 }
 
 /// `fluxor build` — the whole project (no argument), or one named
@@ -2213,6 +2211,7 @@ fn cmd_build_dispatch(path: Option<&PathBuf>, flags: BuildFlags, verbose: bool) 
             || flags.module_root.is_some()
             || flags.target.is_some()
             || flags.sign_key.is_some()
+            || !flags.params.is_empty()
         {
             return Err(Error::Config(
                 "`fluxor build`'s flags belong to the config form — name a config file or \
@@ -2238,8 +2237,20 @@ fn cmd_build_dispatch(path: Option<&PathBuf>, flags: BuildFlags, verbose: bool) 
                 "--check validates without building; drop --emit".into(),
             ));
         }
+        if !flags.params.is_empty() {
+            return Err(Error::Config(
+                "--check renders each param's default, else its example; drop --param/--params"
+                    .into(),
+            ));
+        }
+        // A check renders a graph with each param's default, else its
+        // example.
+        fluxor_tools::params::set_values(fluxor_tools::params::Values::Check);
         return cmd_validate(path, flags.target.as_deref(), flags.module_root.as_deref());
     }
+    // A build renders with the values it was given, as a run does; with
+    // none, each param's default, and a missing required one is refused.
+    fluxor_tools::params::set_values(flags.params.values()?);
     let require_output = |what: &str| {
         flags
             .output
@@ -2315,15 +2326,8 @@ fn cmd_build_dispatch(path: Option<&PathBuf>, flags: BuildFlags, verbose: bool) 
 /// digest; the build's injected digest (stack_expand) uses the project's
 /// `modules/` only, so pass extras only when the build did the same.
 fn cmd_id_table(yaml_path: &Path, out: Option<&Path>, extra_roots: &[PathBuf]) -> Result<()> {
-    let content = substitute_env_vars(&std::fs::read_to_string(yaml_path)?)?;
-    let mut config: serde_json::Value = if yaml_path
-        .extension()
-        .is_some_and(|ext| ext == "yaml" || ext == "yml")
-    {
-        serde_yaml::from_str(&content)?
-    } else {
-        serde_json::from_str(&content)?
-    };
+    let mut config: serde_json::Value =
+        stack_expand::load_graph(yaml_path, &crate::project::root_for_config(yaml_path))?;
     let target_desc = resolve_target(&config, None)?;
     // Resolve from the CONFIG's location, not the cwd: the rig and
     // cross-repo builds invoke this from another project's root, and a

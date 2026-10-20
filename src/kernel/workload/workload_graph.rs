@@ -222,7 +222,7 @@ fn rd_u32(b: &[u8], off: usize) -> u32 {
 }
 
 // FLXA subgraph blob layout (big-endian, `scheduler::live` codec): magic(4) +
-// version(2) + reserved(2) + owner_uid(16) + state_cap(4) + buffer_cap(4) +
+// version(2) + flags(2) + owner_uid(16) + state_cap(4) + buffer_cap(4) +
 // module_count(1) + edge_count(1) then the module/edge records.
 const FLXA_OWNER_UID_OFF: usize = 8;
 const FLXA_STATE_CAP_OFF: usize = 24;

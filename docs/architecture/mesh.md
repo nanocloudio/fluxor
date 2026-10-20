@@ -395,6 +395,13 @@ multiplex up to eight local channels over one authenticated session.
   that must not wait for a member that is down refuses its requests
   toward that member on `MSG_SESSION_DOWN` rather than waiting out its
   own deadline.
+- **Exchanges cross as exchanges.** One instance may also carry one
+  exchange endpoint: the near side stands in for a provider on the peer,
+  the far side for the requester, so a requester reaches a remote provider
+  with the records it uses locally. A lost session reaches the requester
+  as the exchange contract's LINK DOWN and UP, and the far side aborts what
+  the provider held, so an exchange issued again never meets a stale
+  record (see [`exchange.md`](exchange.md#placement)).
 
 Mesh events and commands ride this fabric like every other cross-node
 channel.

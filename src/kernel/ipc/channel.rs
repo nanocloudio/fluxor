@@ -483,19 +483,15 @@ pub fn channel_open_for_module(
     //     default capacity (`BUFFER_SIZE`).
     //   * `config != NULL && config_len == 4` → the 4 bytes are a
     //     little-endian `u32` carrying the desired ring capacity in
-    //     bytes. The capacity must already be within
-    //     `[MIN_CHAN_BYTES, MAX_CHAN_BYTES]` and a power of two —
-    //     anything else is rejected with `CHAN_EINVAL`.
+    //     bytes. The capacity must already be a power of two within
+    //     `[MIN_RING_BYTES, MAX_RING_BYTES]` (`ring_size`, the bounds the
+    //     scheduler and the composer size rings by) — anything else is
+    //     rejected with `CHAN_EINVAL`.
     //
     // Every other shape (non-null pointer with the wrong length, null
     // pointer with non-zero length, capacity outside the range, non-
     // power-of-two capacity) is a wiring bug and gets a deterministic
     // rejection.
-    const MIN_CHAN_BYTES: usize = 64;
-    // Matches the scheduler's normalisation cap. 4 MiB lets a whole app
-    // video/GPU frame (emulator command streams run past 1 MiB) fit one ring;
-    // only channels that request more allocate more.
-    const MAX_CHAN_BYTES: usize = 4 * 1024 * 1024;
     let buf_capacity = if config.is_null() {
         if config_len != 0 {
             return CHAN_EINVAL;
@@ -510,7 +506,9 @@ pub fn channel_open_for_module(
         let size = unsafe {
             u32::from_le_bytes([*config, *config.add(1), *config.add(2), *config.add(3)]) as usize
         };
-        if !(MIN_CHAN_BYTES..=MAX_CHAN_BYTES).contains(&size) {
+        if !(super::ring_size::MIN_RING_BYTES as usize..=super::ring_size::MAX_RING_BYTES as usize)
+            .contains(&size)
+        {
             return CHAN_EINVAL;
         }
         if !size.is_power_of_two() {

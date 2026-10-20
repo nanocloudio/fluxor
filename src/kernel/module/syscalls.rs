@@ -335,10 +335,12 @@ unsafe extern "C" fn syscall_channel_port(port_type: u8, index: u8) -> i32 {
 /// Admission gate: true when the calling module's owner may NOT admit new
 /// work. Admission closes the moment a drain begins; existing-handle use
 /// stays state-blind (`authorize_use` semantics), which is what lets
-/// in-flight work run dry. System-owned modules always pass. Every
-/// module-facing create/open/accept/allocate/arm path consults this: provider
-/// open/bind, `channel_open`, open-style `provider_call` ops
-/// (`admission_class_op`), event create, heap allocation, timer arm.
+/// in-flight work run dry. It is open while the owner is being added, for
+/// its modules' `module_new` (`authorize_own_admit`). System-owned modules
+/// always pass. Every module-facing create/open/accept/allocate/arm path
+/// consults this: provider open/bind, `channel_open`, open-style
+/// `provider_call` ops (`admission_class_op`), event create, heap
+/// allocation, timer arm.
 fn admission_closed(surface: &'static str) -> bool {
     let owner = crate::kernel::exec::scheduler::module_owner(
         crate::kernel::exec::scheduler::current_module_index(),
@@ -346,7 +348,7 @@ fn admission_closed(surface: &'static str) -> bool {
     if owner.is_system() {
         return false;
     }
-    if crate::kernel::exec::scheduler::owners_mut().authorize_admit(owner) {
+    if crate::kernel::exec::scheduler::owners_mut().authorize_own_admit(owner) {
         return false;
     }
     log::warn!("[owner] {surface} refused: admission closed (owner draining/revoked)");

@@ -1,6 +1,5 @@
 //! `fluxor rig …` subcommand entry points.
 //!
-//! Verbs implemented end-to-end:
 //!   * `rig test` — full scenario run (build → stage → power → observe →
 //!     verdict → teardown → run record). `--plan` prints the resolved
 //!     lifecycle with no side effects; `--hold <min>` keeps a failed run's
@@ -9,38 +8,32 @@
 //!     `on`/`off`/`cycle` are gated by the board's declared `[rig].power`
 //!     list; `diagnose` and `sweep` are verbs every backend may offer. All
 //!     take the same rig lock the `test` path uses. `--plan` previews the
-//!     invocation. `off` on a rig that still has a run's residue becomes
+//!     invocation. `off` on a rig whose backends left state behind becomes
 //!     the full teardown.
 //!   * `rig teardown` — tear a rig down outside a run: whatever an
 //!     interrupted run left, or everything in a lab with `--all`.
-//!
-//! Not yet implemented (dispatcher returns a clear error pointing at
-//! the closest working alternative):
-//!   * `rig run` — scenario-less one-shot against an arbitrary config.
-//!     Use `rig test --scenario <path>` instead for now.
-//!   * `rig console` — interactive console attach. The OS-native
-//!     `tio <device> -b <baud>` covers this today.
+//!   * `rig monitor` — the live fault/histogram stream of a running device.
 
 use std::path::{Path, PathBuf};
 
 use clap::{Args, Subcommand};
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use crate::error::{Error, Result};
 use crate::rig::backend::{
-    invoke_with, wire_binding, ActuatorOutcome, BackendContext, BackendInvocation, InvokeOptions,
-    PHASE_ADHOC,
+    invoke_with, wire_binding, ActuatorOutcome, BackendContext, BackendInvocation, PHASE_ADHOC,
+    PHASE_TEARDOWN,
 };
 use crate::rig::lock::{
-    acquire as acquire_lock, default_lock_path, marker_path_for, rig_state_root, state_dir_for,
-    AcquireOutcome, LockGuard, LockOwner, TeardownMarker,
+    acquire as acquire_lock, default_lock_path, marker_path_for, now_unix_secs, rig_state_root,
+    state_dir_for, AcquireOutcome, LockGuard, LockOwner, TeardownMarker,
 };
 use crate::rig::plan::DEFAULT_ACTUATOR_TIMEOUT_S;
 use crate::rig::record::Verdict;
 use crate::rig::run::{
-    adhoc_power_under_guard, execute_plan, install_signal_handlers, resolve_bound, teardown_rig,
-    RunOptions,
+    adhoc_power_under_guard, adhoc_run, execute_plan, install_signal_handlers, invoke_options,
+    resolve_bound, teardown_rig, RunOptions,
 };
 use crate::rig::vocab::Surface;
 use crate::rig::{
@@ -59,14 +52,10 @@ pub struct RigArgs {
 pub enum RigCommand {
     /// Run a scenario against a rig.
     Test(TestArgs),
-    /// Run an ad-hoc config against a rig (no scenario, no pass/fail rules).
-    Run(RunArgs),
     /// Apply a power action to the rig.
     Power(PowerArgs),
     /// Tear a rig down: power off, unstage, clear its teardown marker.
     Teardown(TeardownArgs),
-    /// Attach to the rig's primary console.
-    Console(ConsoleArgs),
     /// Stream live fault stats, protection levels, and step timing
     /// histograms from a running Fluxor device (newline-framed
     /// `MON_FAULT` / `MON_HIST` / `MON_STATE` lines; see
@@ -93,33 +82,22 @@ pub struct TestArgs {
     /// Print the resolved lifecycle without any side effects.
     #[arg(long)]
     pub plan: bool,
-    /// Skip the build step (use previously built artifacts on disk).
+    /// Skip the build step (use the artifacts already on disk).
     #[arg(long)]
     pub skip_build: bool,
-    /// Force-release any existing rig lock before proceeding. Leaves a
-    /// breadcrumb in the run log identifying the displaced owner.
+    /// Take over the rig lock even when its owner is alive. The displaced
+    /// owner is named on stderr.
     #[arg(long)]
     pub force: bool,
     /// On a verdict other than pass, keep the rig as the run left it for
     /// this many minutes (Enter or Ctrl-C ends it sooner), then tear down.
+    /// A run ended by a signal is not held.
     #[arg(long, value_name = "MIN")]
     pub hold: Option<u64>,
     /// Run the power backend's `diagnose` even when the run was aborted
     /// by a signal (it runs on a failed or timed-out verdict regardless).
     #[arg(long)]
     pub diagnose: bool,
-}
-
-#[derive(Args, Debug)]
-pub struct RunArgs {
-    #[arg(short, long)]
-    pub config: PathBuf,
-    #[arg(long)]
-    pub rig: Option<String>,
-    #[arg(long)]
-    pub lab: Option<String>,
-    #[arg(long)]
-    pub plan: bool,
 }
 
 #[derive(Args, Debug)]
@@ -135,7 +113,7 @@ pub struct PowerArgs {
     /// Print the resolved invocation without invoking the backend.
     #[arg(long)]
     pub plan: bool,
-    /// Force-release any existing rig lock before proceeding.
+    /// Take over the rig lock even when its owner is alive.
     #[arg(long)]
     pub force: bool,
     /// For `on`/`cycle` on a board whose images leave the host: how many
@@ -156,17 +134,9 @@ pub struct TeardownArgs {
     /// Every rig profile in the lab, then each power backend's `sweep`.
     #[arg(long)]
     pub all: bool,
-    /// Take over a held lock.
+    /// Take over the rig lock even when its owner is alive.
     #[arg(long)]
     pub force: bool,
-}
-
-#[derive(Args, Debug)]
-pub struct ConsoleArgs {
-    #[arg(long)]
-    pub rig: Option<String>,
-    #[arg(long)]
-    pub lab: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -201,16 +171,6 @@ pub fn dispatch(args: RigArgs) -> Result<()> {
         RigCommand::Test(a) => cmd_test(a),
         RigCommand::Power(a) => cmd_power(a),
         RigCommand::Teardown(a) => cmd_teardown(a),
-        RigCommand::Run(_) => Err(Error::Config(
-            "rig run: not yet implemented — use `rig test --scenario <path>` \
-             for scenario-driven runs"
-                .into(),
-        )),
-        RigCommand::Console(_) => Err(Error::Config(
-            "rig console: not yet implemented — `tio /dev/ttyUSB0 -b 115200` \
-             or equivalent covers this for now"
-                .into(),
-        )),
         RigCommand::Monitor(a) => cmd_monitor(a),
     }
 }
@@ -405,8 +365,8 @@ fn cmd_test(args: TestArgs) -> Result<()> {
         &check_profile_against_board(&profile, &board),
     )?;
 
-    // 3. Discover project descriptor, if any. Walk up from the scenario's
-    //    directory and also from CWD — whichever finds one first.
+    // 3. Discover the project descriptor, if any: upward from the
+    //    scenario's directory, then upward from CWD.
     let project = discover_project_descriptor(&scenario_path)?;
 
     // 4. Build the plan.
@@ -436,26 +396,24 @@ fn cmd_test(args: TestArgs) -> Result<()> {
     let outcome = execute_plan(&plan, &profile, &options)?;
     match outcome.record.verdict {
         Verdict::Passed => Ok(()),
-        Verdict::Failed
-        | Verdict::TimedOut
-        | Verdict::Aborted
-        | Verdict::Pending
-        | Verdict::Planned => Err(Error::Config(format!(
-            "rig test: {}{} — see {}",
-            match outcome.record.verdict {
-                Verdict::Failed => "FAIL",
-                Verdict::TimedOut => "TIMEOUT",
-                Verdict::Aborted => "ABORTED",
-                _ => "INCOMPLETE",
-            },
-            outcome
-                .record
-                .reason
-                .as_deref()
-                .map(|r| format!(" ({r})"))
-                .unwrap_or_default(),
-            outcome.run_dir.display()
-        ))),
+        Verdict::Failed | Verdict::TimedOut | Verdict::Aborted | Verdict::Planned => {
+            Err(Error::Config(format!(
+                "rig test: {}{} — see {}",
+                match outcome.record.verdict {
+                    Verdict::Failed => "FAIL",
+                    Verdict::TimedOut => "TIMEOUT",
+                    Verdict::Aborted => "ABORTED",
+                    _ => "INCOMPLETE",
+                },
+                outcome
+                    .record
+                    .reason
+                    .as_deref()
+                    .map(|r| format!(" ({r})"))
+                    .unwrap_or_default(),
+                outcome.run_dir.display()
+            )))
+        }
     }
 }
 
@@ -505,15 +463,12 @@ fn cmd_power(args: PowerArgs) -> Result<()> {
 
     let lock_path = default_lock_path(&lab, &profile.rig.id)
         .ok_or_else(|| Error::Config("rig power: cannot resolve lock path".into()))?;
-    let marker_path = marker_path_for(&lock_path);
-    let residue_present =
-        marker_path.exists() || state_dir_for(&lock_path).join("live.json").exists();
+    let residue_present = rig_has_residue(&lock_path);
     let timeout = power_binding
         .actuator_timeout()
         .unwrap_or(Duration::from_secs(DEFAULT_ACTUATOR_TIMEOUT_S));
     let options = RunOptions {
         force_lock: args.force,
-        actuator_timeout: timeout,
         ..RunOptions::default()
     };
 
@@ -530,7 +485,7 @@ fn cmd_power(args: PowerArgs) -> Result<()> {
         println!("  timeout    {}s", timeout.as_secs());
         if residue_present && action == "off" {
             println!(
-                "  note       a run's residue is on this rig; `off` becomes the full teardown"
+                "  note       backends left state on this rig; `off` becomes the full teardown"
             );
         }
         if board.image_leaves_host && matches!(action.as_str(), "on" | "cycle") {
@@ -555,10 +510,10 @@ fn cmd_power(args: PowerArgs) -> Result<()> {
 
     install_signal_handlers();
 
-    // `off` with a run's residue is a teardown, not a bare verb: it also
-    // unstages and clears the marker.
+    // `off` on a rig whose backends left state behind is a teardown, not a
+    // bare verb: it also unstages and clears the marker.
     if action == "off" && residue_present {
-        eprintln!("[rig] residue from an earlier run on {rig_id}; running the full teardown");
+        eprintln!("[rig] {rig_id} holds backend state; running the full teardown");
         return cmd_teardown(TeardownArgs {
             rig: Some(rig_id),
             lab: Some(lab),
@@ -616,21 +571,16 @@ fn cmd_power(args: PowerArgs) -> Result<()> {
         };
     }
 
-    // Synthetic context — no scenario, no build, no observers. The backend
-    // only needs enough metadata to correlate this invocation in logs.
-    // Sub-second precision in the run id keeps fast reruns from colliding.
-    let (now_secs, subsec_nanos) = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| (d.as_secs(), d.subsec_nanos()))
-        .unwrap_or((0, 0));
-    let run_id = format!("{now_secs:010}-{subsec_nanos:09}-{rig_id}-power-{action}");
-    let run_dir = ad_hoc_run_dir(&lab, &rig_id);
+    // A bare verb: no scenario, no build, no transports. It still gets its
+    // own run directory, for its stderr and whatever the backend keeps.
+    guard.set_expected_end(now_unix_secs() + timeout.as_secs() + 30)?;
+    let (run_id, run_dir) = adhoc_run(&lock_path, &rig_id, &format!("power-{action}"))?;
     let invocation = BackendInvocation {
         binding: wire_binding(power_binding),
         context: BackendContext {
             rig_id: profile.rig.id.clone(),
             lab: lab.clone(),
-            run_id: run_id.clone(),
+            run_id,
             run_dir: run_dir.display().to_string(),
             scenario_name: format!("power:{action}"),
             board: profile.rig.board.clone(),
@@ -642,13 +592,14 @@ fn cmd_power(args: PowerArgs) -> Result<()> {
         args: None,
         relay: None,
     };
-    let invoke_options = InvokeOptions {
-        timeout,
-        grace: power_binding
-            .shutdown_grace()
-            .unwrap_or(Duration::from_secs(2)),
-        stderr_log: Some(run_dir.join(format!("power-{action}.stderr.log"))),
-    };
+    let invoke_options = invoke_options(
+        &backend,
+        power_binding,
+        options.actuator_timeout,
+        &run_dir,
+        &action,
+        PHASE_ADHOC,
+    );
     let outcome = invoke_with(&backend, &action, &invocation, &invoke_options)?;
     drop(guard);
     match outcome {
@@ -694,42 +645,53 @@ fn cmd_teardown(args: TeardownArgs) -> Result<()> {
     install_signal_handlers();
     if !args.all {
         let rig_id = resolve_rig_id("teardown", args.rig, &lab)?;
-        return teardown_one(&lab, &rig_id, args.force).map(|_| ());
+        let profile = load_rig_profile("teardown", &lab, &rig_id)?;
+        return teardown_one(&lab, &profile, args.force);
     }
 
+    // Every rig in the lab first, then `sweep` once per distinct power
+    // binding — two rigs on one plug, or one cloud account, share a sweep —
+    // whatever the rigs' own teardowns came to: the sweep is what finds
+    // what they could not stop.
     let mut failed: Vec<String> = Vec::new();
-    let mut swept: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for rig_id in enumerate_rigs(&lab)? {
-        match teardown_one(&lab, &rig_id, args.force) {
-            Ok(profile) => {
-                if let Some(binding) = profile.power.as_ref() {
-                    // `sweep` once per distinct power binding: two rigs on
-                    // one plug, or one cloud account, share a sweep.
-                    let key = binding_key(binding);
-                    if swept.insert(key) {
-                        if let Err(e) = sweep(&lab, &profile) {
-                            eprintln!("[rig] sweep for {rig_id}: {e}");
-                            failed.push(format!("{rig_id} (sweep)"));
-                        }
-                    }
-                }
-            }
+    let mut profiles: Vec<RigProfile> = Vec::new();
+    let known = enumerate_rigs(&lab)?;
+    for rig_id in &known {
+        let profile = match load_rig_profile("teardown", &lab, rig_id) {
+            Ok(p) => p,
             Err(e) => {
                 eprintln!("[rig] teardown {rig_id}: {e}");
-                failed.push(rig_id);
+                failed.push(rig_id.clone());
+                continue;
+            }
+        };
+        if let Err(e) = teardown_one(&lab, &profile, args.force) {
+            eprintln!("[rig] teardown {rig_id}: {e}");
+            failed.push(rig_id.clone());
+        }
+        profiles.push(profile);
+    }
+    let mut swept: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for profile in &profiles {
+        let Some(binding) = profile.power.as_ref() else {
+            continue;
+        };
+        if swept.insert(binding_key(binding)) {
+            if let Err(e) = sweep(&lab, profile) {
+                eprintln!("[rig] sweep for {}: {e}", profile.rig.id);
+                failed.push(format!("{} (sweep)", profile.rig.id));
             }
         }
     }
 
-    // Markers whose profile is gone can no longer be torn down by name;
-    // say so rather than forget them.
+    // A marker whose profile is gone cannot be torn down by name; say so
+    // rather than forget it.
     if let Some(root) = rig_state_root(&lab, "") {
         let rigs_dir = root.parent().map(Path::to_path_buf).unwrap_or(root);
         if let Ok(entries) = std::fs::read_dir(&rigs_dir) {
-            let known = enumerate_rigs(&lab).unwrap_or_default();
             for entry in entries.flatten() {
                 let name = entry.file_name().to_string_lossy().into_owned();
-                let marker = entry.path().join("state").join("needs_teardown.json");
+                let marker = marker_path_for(&entry.path().join("lock"));
                 if marker.exists() && !known.contains(&name) {
                     eprintln!(
                         "[rig] {name}: teardown marker at {} but no profile in lab '{lab}' — \
@@ -751,10 +713,9 @@ fn cmd_teardown(args: TeardownArgs) -> Result<()> {
     }
 }
 
-/// Tear one rig down under its lock. Returns the profile so `--all` can
-/// sweep by power binding afterwards.
-fn teardown_one(lab: &str, rig_id: &str, force: bool) -> Result<RigProfile> {
-    let profile = load_rig_profile("teardown", lab, rig_id)?;
+/// Tear one rig down under its lock.
+fn teardown_one(lab: &str, profile: &RigProfile, force: bool) -> Result<()> {
+    let rig_id = &profile.rig.id;
     let lock_path = default_lock_path(lab, rig_id)
         .ok_or_else(|| Error::Config("rig teardown: cannot resolve lock path".into()))?;
     let owner = LockOwner::now(rig_id, "command:teardown", 60);
@@ -764,24 +725,36 @@ fn teardown_one(lab: &str, rig_id: &str, force: bool) -> Result<RigProfile> {
             AcquireOutcome::NeedsTeardown { guard, marker } => (guard, Some(marker)),
             AcquireOutcome::Held(c) => return Err(held(&c, "teardown")),
         };
-    let options = RunOptions {
-        actuator_timeout: profile
-            .power
-            .as_ref()
-            .and_then(|b| b.actuator_timeout())
-            .unwrap_or(Duration::from_secs(DEFAULT_ACTUATOR_TIMEOUT_S)),
-        ..RunOptions::default()
-    };
-    let record = teardown_rig(&profile, &lock_path, marker.as_ref(), &options)?;
+    let record = teardown_rig(
+        profile,
+        &lock_path,
+        &guard,
+        marker.as_ref(),
+        &RunOptions::default(),
+    )?;
     drop(guard);
     if record.clean {
-        Ok(profile)
+        Ok(())
     } else {
         Err(Error::Config(format!(
             "rig teardown: {rig_id} is not clean; see its marker at {}",
             marker_path_for(&lock_path).display()
         )))
     }
+}
+
+/// Whether anything of an earlier run may still be on the rig: its
+/// teardown marker, or state a backend left in the rig's state directory
+/// (an image a deploy registered, a machine a power step started), which
+/// the matching `unstage` / `off` removes.
+fn rig_has_residue(lock_path: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(state_dir_for(lock_path)) else {
+        return false;
+    };
+    entries.flatten().any(|e| {
+        let name = e.file_name();
+        !name.to_string_lossy().ends_with(".tmp")
+    })
 }
 
 /// The power backend's `sweep`: everything of the lab's still running
@@ -794,33 +767,34 @@ fn sweep(lab: &str, profile: &RigProfile) -> Result<()> {
         binding,
         profile,
     )?;
-    let timeout = binding
-        .actuator_timeout()
-        .unwrap_or(Duration::from_secs(DEFAULT_ACTUATOR_TIMEOUT_S));
-    let run_dir = ad_hoc_run_dir(lab, &profile.rig.id);
+    let lock_path = default_lock_path(lab, &profile.rig.id)
+        .ok_or_else(|| Error::Config("rig teardown: cannot resolve lock path".into()))?;
+    let options = RunOptions::default();
+    let (run_id, run_dir) = adhoc_run(&lock_path, &profile.rig.id, "sweep")?;
+    let opts = invoke_options(
+        &backend,
+        binding,
+        options.actuator_timeout,
+        &run_dir,
+        "sweep",
+        PHASE_TEARDOWN,
+    );
     let invocation = BackendInvocation {
         binding: wire_binding(binding),
         context: BackendContext {
             rig_id: profile.rig.id.clone(),
             lab: lab.to_string(),
-            run_id: format!("sweep-{}", crate::rig::lock::now_unix_secs()),
+            run_id,
             run_dir: run_dir.display().to_string(),
             scenario_name: "teardown:sweep".to_string(),
             board: profile.rig.board.clone(),
-            effective_timeout_ms: timeout.as_millis() as u64,
-            phase: crate::rig::backend::PHASE_TEARDOWN.to_string(),
-            state_dir: default_lock_path(lab, &profile.rig.id)
-                .map(|l| state_dir_for(&l).display().to_string())
-                .unwrap_or_default(),
+            effective_timeout_ms: opts.timeout.as_millis() as u64,
+            phase: PHASE_TEARDOWN.to_string(),
+            state_dir: state_dir_for(&lock_path).display().to_string(),
         },
         artifact: None,
         args: None,
         relay: None,
-    };
-    let opts = InvokeOptions {
-        timeout,
-        grace: Duration::from_secs(2),
-        stderr_log: Some(run_dir.join("power-sweep.stderr.log")),
     };
     match invoke_with(&backend, "sweep", &invocation, &opts)? {
         ActuatorOutcome::Ok(report) => {
@@ -867,20 +841,6 @@ fn binding_key(binding: &crate::rig::BindingTable) -> String {
         parts.push(format!("{k}={rendered}"));
     }
     parts.join("\n")
-}
-
-fn ad_hoc_run_dir(lab: &str, rig_id: &str) -> PathBuf {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
-    home.join(".local")
-        .join("state")
-        .join("fluxor")
-        .join("labs")
-        .join(lab)
-        .join("rigs")
-        .join(rig_id)
-        .join("ad-hoc")
 }
 
 /// Confirm the board declares `power.<verb>` in its `[rig].power` list.
@@ -1019,17 +979,22 @@ mod tests {
         }
     }
 
-    /// The in-tree boards all declare `power.off`: every rig can be
-    /// told to power down, and a backend that cannot says so with a no-op.
+    /// Every embedded board with a rig contract declares `power.off`:
+    /// every rig can be told to power down, and a backend that cannot says
+    /// so with a no-op.
     #[test]
     fn every_embedded_board_declares_power_off() {
-        for id in ["pi5", "pico", "picow", "pico2w", "waveshare-lcd4"] {
-            let (rig, _) = crate::rig::resolve_board_rig(id, None).unwrap();
-            let rig = rig.unwrap();
+        let mut checked = 0;
+        for (id, src) in crate::rig::board::EMBEDDED_BOARDS {
+            let Some(rig) = parse_board_rig_str(src, id).unwrap() else {
+                continue;
+            };
             assert!(
                 validate_power_verb_on_board(&rig, "off", id).is_ok(),
                 "{id} must declare power.off"
             );
+            checked += 1;
         }
+        assert!(checked > 0, "no embedded board has a rig contract");
     }
 }

@@ -99,10 +99,11 @@ pub struct NodeCapacity {
 ///
 /// `linux` and `pi5`/`bcm2712` share one row because their kernel profiles
 /// (`profile_linux`, `profile_bcm2712` in `src/kernel/config.rs`) state the
-/// same values today, and both build the `multitenant` feature
+/// same values and both build the `multitenant` feature
 /// (`src/kernel/workload/owner.rs` MAX_OWNERS); the drift test pins each
-/// profile separately, so the day they diverge it fails and the row splits. `max_endpoints` is agent-level
-/// admission policy — the kernel has no endpoint table constant yet.
+/// profile separately, so a divergence fails it rather than passing silently.
+/// `max_endpoints` is agent-level admission policy: the kernel has no endpoint
+/// table.
 pub fn capacity_for_profile(profile: &str) -> Option<NodeCapacity> {
     match profile {
         "linux" | "pi5" | "bcm2712" => Some(NodeCapacity {

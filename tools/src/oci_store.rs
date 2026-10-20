@@ -54,6 +54,12 @@ pub const MT_FLUXOR_MODULE: &str = "application/vnd.nanocloud.fluxor.module.v1";
 pub const MT_FLUXOR_WORKLOAD: &str = "application/vnd.nanocloud.fluxor.workload.v1+json";
 pub const MT_FLUXOR_GRAPH: &str = "application/vnd.nanocloud.fluxor.graph.v1+yaml";
 pub const MT_FLUXOR_RESOURCES: &str = "application/vnd.nanocloud.fluxor.resources.v1+json";
+/// A published stack (`fluxor publish stack`): the artifact
+/// type, and its stack-document layer.
+pub const MT_FLUXOR_STACK: &str = "application/vnd.nanocloud.fluxor.stack.v1+yaml";
+/// A stack's module references: the module artifacts, per target, its
+/// modules resolve to, as `fluxor.lock` entries.
+pub const MT_FLUXOR_STACK_MODULES: &str = "application/vnd.nanocloud.fluxor.stack.modules.v1+json";
 /// Module manifest.toml metadata carried alongside the `.fmod` layer.
 pub const MT_FLUXOR_MODULE_META: &str = "application/vnd.nanocloud.fluxor.module.manifest.v1+toml";
 /// A GRAPH IMAGE (`fluxor build --emit=image`): FXSL header + modules
@@ -92,7 +98,7 @@ pub const MT_FLUXOR_PROGRAMS: &str = "application/vnd.nanocloud.fluxor.programs.
 pub const ANN_IMAGE_OFFSET: &str = "io.fluxor.image.offset";
 /// Staged source tree (canonical uncompressed tar) — the SDK /
 /// `<project>-common` trees that consumers `#[path]`/`include!` after
-/// `fluxor sync` extraction. Replaces the registry's `.crate` packages.
+/// `fluxor sync` extraction.
 pub const MT_FLUXOR_SOURCE: &str = "application/vnd.nanocloud.fluxor.source.v1+tar";
 /// Host runtime binary (one layer per host triple), `fluxor/run/`
 /// namespace only — including the `fluxor` CLI itself.
@@ -135,8 +141,8 @@ pub const PROVENANCE_PUBLISHED: &str = "published";
 /// manifest a pure function of content and identity, so re-publishing
 /// unchanged content yields byte-identical bytes, `put_blob` dedupes,
 /// nothing is displaced and no sweep runs. It also makes promotion
-/// `local-build` → `published` what this module always claimed it was: a
-/// re-tag of an existing digest rather than a rewrite.
+/// `local-build` → `published` a re-tag of an existing digest rather than a
+/// rewrite.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProvenanceRow {
     /// `local-build` or `published`.
@@ -727,9 +733,9 @@ impl OciStore {
             .iter()
             .find(|l| l.media_type == MT_FLUXOR_MODULE)
             .ok_or_else(|| Error::Config("module artifact has no .fmod layer".into()))?;
-        // Content verification, not an existence check: `store pin` relies
-        // on this to refuse a pin that would immediately fail at consume
-        // time. `read_blob` hashes the bytes against the digest.
+        // Content verification, not an existence check: a pinned module
+        // whose layer is damaged fails here rather than at consume time.
+        // `read_blob` hashes the bytes against the digest.
         self.read_blob(&layer.digest)?;
         Ok((layer.digest.clone(), self.blob_path(&layer.digest)?))
     }
@@ -1350,6 +1356,16 @@ pub struct BundleArtifact<'a> {
     pub ref_name: &'a str,
 }
 
+/// Everything a stack publish stages.
+pub struct StackArtifact<'a> {
+    /// The stack document, as written.
+    pub stack_yaml: &'a [u8],
+    /// Its module references (`fluxor.lock` entries, JSON).
+    pub modules_json: &'a [u8],
+    /// Canonical tag, `stack/<name>:<version>` unless overridden.
+    pub ref_name: &'a str,
+}
+
 /// A prepared-but-uncommitted artifact: the manifest is built and its
 /// blobs are held in memory, hashed but not yet written; the store is
 /// untouched until `commit_publish` writes the blobs and swaps the tags.
@@ -1734,6 +1750,75 @@ impl OciStore {
             manifest,
             staged,
             ref_name: b.ref_name.to_string(),
+            latest_ref: format!("{body}:latest"),
+            provenance: base_provenance(meta),
+        })
+    }
+
+    /// Stage a published stack: the document and its module references,
+    /// each a layer. A stack name is ecosystem-unique, as a bundle's is:
+    /// a consumer includes it by name.
+    pub fn prepare_stack(
+        &self,
+        stack: &StackArtifact<'_>,
+        meta: &ArtifactMeta<'_>,
+    ) -> Result<Prepared> {
+        let body = stack
+            .ref_name
+            .rsplit_once(':')
+            .map_or(stack.ref_name, |(body, _)| body);
+        for d in &self.read_index()?.manifests {
+            let is_stack = d.annotations.get(ANN_KIND).map(String::as_str) == Some("stack");
+            let same_name = d
+                .annotations
+                .get(ANN_REF_NAME)
+                .and_then(|r| r.rsplit_once(':'))
+                .is_some_and(|(rb, _)| rb == body);
+            let owner = d.annotations.get(ANN_PROJECT).map(String::as_str);
+            if is_stack && same_name && owner != Some(meta.project) {
+                return Err(Error::Config(format!(
+                    "stack '{}' is already published by project '{}'; refusing to \
+                     publish it from '{}' (stack names are ecosystem-unique)",
+                    body.strip_prefix(crate::stack::TAG_PREFIX).unwrap_or(body),
+                    owner.unwrap_or("<unannotated>"),
+                    meta.project
+                )));
+            }
+        }
+        let mut staged = Vec::new();
+        let (config_digest, config_size) = stage(&mut staged, EMPTY_CONFIG, false);
+        let (doc_digest, doc_size) = stage(&mut staged, stack.stack_yaml, false);
+        let (mods_digest, mods_size) = stage(&mut staged, stack.modules_json, false);
+        let manifest = ImageManifest {
+            schema_version: 2,
+            media_type: MT_OCI_MANIFEST.into(),
+            artifact_type: Some(MT_FLUXOR_STACK.into()),
+            config: Descriptor {
+                media_type: MT_OCI_EMPTY.into(),
+                digest: config_digest,
+                size: config_size,
+                annotations: Annotations::new(),
+            },
+            layers: vec![
+                Descriptor {
+                    media_type: MT_FLUXOR_STACK.into(),
+                    digest: doc_digest,
+                    size: doc_size,
+                    annotations: one_annotation(ANN_TITLE, "stack.yaml"),
+                },
+                Descriptor {
+                    media_type: MT_FLUXOR_STACK_MODULES.into(),
+                    digest: mods_digest,
+                    size: mods_size,
+                    annotations: one_annotation(ANN_TITLE, "modules.json"),
+                },
+            ],
+            annotations: base_annotations("stack", meta),
+        };
+        Ok(Prepared {
+            manifest,
+            staged,
+            ref_name: stack.ref_name.to_string(),
             latest_ref: format!("{body}:latest"),
             provenance: base_provenance(meta),
         })

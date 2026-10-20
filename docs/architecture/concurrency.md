@@ -41,7 +41,8 @@ secondary core to release) before any code reads them. Writes during
 reconfigure happen on core 0 with all secondaries parked, restoring
 boot-only semantics for the duration of the rebuild. The parsed config's
 module entries borrow their params from the resident config blob in place
-(nothing is copied at boot), so the blob stays mapped for as long as the
+(only an instance with stored runtime overrides is handed a merged copy, made
+on core 0 as it instantiates), so the blob stays mapped for as long as the
 config does. The state arena allocator is also written after init: on core 0
 for live graph changes (peer cores quiesced) and the block-lend ledger
 releasing a quarantined module's memory, and from any core when an elastic

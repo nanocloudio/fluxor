@@ -90,6 +90,15 @@ enum Commands {
         /// that public key accepts only images it verifies.
         #[arg(long)]
         sign_key: Option<PathBuf>,
+        /// One param value, typed by the graph's declared `params:`.
+        /// Repeatable; overrides `--params`. Without values a build renders
+        /// each param's default and refuses a missing required one.
+        #[arg(long = "param", value_name = "NAME=VALUE")]
+        params: Vec<String>,
+        /// A values file — one flat TOML table of `name = value`, typed
+        /// values checked against the declared `params:`.
+        #[arg(long = "params", value_name = "FILE")]
+        params_file: Option<PathBuf>,
     },
     /// Recompute and rewrite the ABI-surface pin in all checked-in sites
     /// (`abi_surface_srcpin.rs` src-hash + digest, the `tools/src/hash.rs`
@@ -126,9 +135,9 @@ enum Commands {
     Run {
         /// Config file (YAML), or `-` to read the config from stdin
         /// (heredoc-friendly; works with `--replicas` templates too); a
-        /// workload bundle (source manifest or bundle dir); or the name of
-        /// a bundle `fluxor.lock` pins. Optional only when `--list` is
-        /// given.
+        /// workload bundle (source manifest or bundle dir); or a bundle
+        /// name — the project's own `packaging/` bundle, else one its
+        /// `fluxor.lock` pins. Optional only when `--list` is given.
         config: Option<PathBuf>,
         /// Scenario only: dump the synthesised host graph YAML and exit.
         #[arg(long)]
@@ -170,12 +179,12 @@ enum Commands {
         /// applied uniformly to every replica. Repeat for multiple.
         #[arg(long = "var", value_name = "KEY=VALUE")]
         vars: Vec<String>,
-        /// Service bundle: one parameter value, typed by the bundle's
-        /// declared schema. Repeatable; overrides `--params`.
+        /// One param value, typed by the graph's (or bundle's) declared
+        /// `params:`. Repeatable; overrides `--params`.
         #[arg(long = "param", value_name = "NAME=VALUE")]
         params: Vec<String>,
-        /// Service bundle: a values file — one flat TOML table of
-        /// `name = value`, typed values checked against the schema.
+        /// A values file — one flat TOML table of `name = value`, typed
+        /// values checked against the declared `params:`.
         #[arg(long = "params", value_name = "FILE")]
         params_file: Option<PathBuf>,
         /// Append the certificates in this PEM file to the trust anchors
@@ -226,12 +235,12 @@ enum Commands {
         args: Vec<String>,
     },
     /// Register an applet: map a name to a workload bundle. Accepts
-    /// a store bundle reference (`<name>`, `<name>:<ver>`,
-    /// `sha256:…` digest or unambiguous prefix — resolved from the
-    /// local OCI store), a built bundle dir, or a source manifest
-    /// (`app.fluxor.toml` — builds first).
+    /// an applet name (the project's own `packaging/applet/<name>/`,
+    /// else the bundle `fluxor.lock` pins under that name), a built
+    /// bundle dir, or a source manifest (`workload.toml` — emitted
+    /// first).
     Install {
-        /// Store bundle reference, bundle dir, or app.fluxor.toml.
+        /// Applet name, bundle dir, or workload.toml.
         bundle: PathBuf,
         /// Applet name (default: the bundle's workload name).
         #[arg(long)]
@@ -350,11 +359,13 @@ enum Commands {
     /// lifecycle lint with no subcommand.
     ///
     /// With no subcommand this is **the lifecycle lint**, what `make
-    /// lint` delegates to: `cargo fmt --all -- --check` and `cargo
-    /// clippy … -D warnings` where a cargo tree exists, then `fluxor
-    /// lint hygiene`. Those are the precise checks the gate runs, minus
-    /// the ones that need a build — module fmt/clippy compile PIC
-    /// sources per target and stay `fluxor ci` phases.
+    /// lint` delegates to: `cargo fmt --all -- --check` and one `cargo
+    /// clippy --all-targets --all-features -- -D warnings` at the cargo
+    /// site (the host-tools crate, else the workspace root) where a cargo
+    /// tree exists, then `fluxor lint hygiene`. The gate's other lint
+    /// phases — the module fmt and clippy sweeps over every PIC source and
+    /// the kernel workspace's per-target clippy matrix — stay `fluxor ci`
+    /// phases.
     Lint {
         #[command(subcommand)]
         action: Option<LintAction>,
@@ -365,10 +376,11 @@ enum Commands {
 
     /// The lifecycle test stage — what `make test` delegates to.
     ///
-    /// Runs, for whichever of the three a project has: `fluxor modules
-    /// test` (declared module harnesses), `cargo test` over the cargo
-    /// tree, and the `[ci.test] scripts` globs through `fluxor ci`'s own
-    /// project-e2e runner. Fails fast, unlike the gate.
+    /// Runs whichever of these a project has, as the gate runs them:
+    /// `[ci.setup] scripts`, the cargo unit tests, the integration suites
+    /// (`tests/harness/`, a root `tests/`), and the `[ci.test] scripts`
+    /// globs through `fluxor ci`'s own project-e2e runner. Fails fast,
+    /// unlike the gate.
     Test {
         /// Project root override.
         #[arg(long)]
@@ -377,9 +389,9 @@ enum Commands {
 
     /// The lifecycle clean stage — what `make clean` delegates to.
     ///
-    /// Removes this project's module artefacts, runs `cargo clean`
-    /// where a cargo tree exists, and removes the generated module-test
-    /// crates under `target/fluxor/moduletests`. The staged source
+    /// Removes this project's module artefacts and runs `cargo clean` in
+    /// every cargo workspace the other verbs build in (the root, a
+    /// standalone host-tools crate, `tests/harness/`). The staged source
     /// trees under `target/fluxor/<name>/` are store-materialised, not
     /// build output, and survive.
     Clean {
@@ -407,10 +419,10 @@ enum Commands {
         command: Option<String>,
     },
 
-    /// PIC module build orchestration plus the module-artefact verbs
-    /// (`pack`, `sign`, `keygen`) and the hermetic module-core test
-    /// lane (`test`). In-process discovery + compile + pack pipeline;
-    /// flags are documented per subcommand.
+    /// PIC module build orchestration (`build`, `clean`, `list`,
+    /// `resolve`) plus the module-artefact verbs (`pack`, `sign`,
+    /// `keygen`). In-process discovery + compile + pack pipeline; flags
+    /// are documented per subcommand.
     Modules {
         #[command(subcommand)]
         action: ModulesAction,
@@ -435,7 +447,7 @@ enum Commands {
     /// template-render, version-skew, lockfile-consistency, catalog-drift,
     /// sdk-materialisation, live-staleness, limit-register,
     /// abi-surface-pin, modules-build (strict), host-binary, cargo unit
-    /// tests, wasm-host-shims (node), examples, service-bundles,
+    /// tests, wasm-host-shims (node), examples, packaging,
     /// kernel-link (rp), project-e2e, and the cargo integration tests.
     /// Every phase runs even when an earlier one fails; the summary lists
     /// every phase and the exit status is non-zero if any failed. A
@@ -453,7 +465,7 @@ enum Commands {
         /// `cargo` (unit, integration, node, host-binary and project-e2e
         /// tests), `modules` (strict module build), `lint` (fmt-check,
         /// clippy, workspace-lint-opt-in, presentation, makefile, examples,
-        /// service-bundles),
+        /// packaging),
         /// `hygiene` (hygiene, observability), `templates`
         /// (template-render), `kernel` (kernel-link). Rejected when
         /// `$CI` is set, so production CI always runs the full set; a run
@@ -472,25 +484,42 @@ enum Commands {
     /// manifest; tags and the project index repoint in one transactional
     /// index swap. Publishing writes what is built and never builds. In the fluxor repo, `runtime`
     /// includes the CLI itself (the launcher resolves it on the next
-    /// invocation). `publish bundle` publishes a built workload
-    /// bundle directory.
+    /// invocation).
+    ///
+    /// Bare `publish` sweeps everything the project ships, in dependency
+    /// order: its sources; its fmods and runtimes; its stacks
+    /// (`packaging/stack/<name>.yaml`), which record the module digests
+    /// they compose; and its bundles (`packaging/service/<name>/` and
+    /// `packaging/applet/<name>/`, which the `fluxor ci` packaging phase
+    /// checks), which may include those stacks. Every stack and bundle is
+    /// checked first, so one that cannot be published refuses the sweep
+    /// before anything is written.
+    ///
+    /// `publish stack <file>` and `publish bundle <manifest>` publish one
+    /// of each on its own.
     Publish {
         #[command(subcommand)]
         action: Option<PublishAction>,
         /// Restrict the publish sweep to artifact kinds:
-        /// `source` (aliases: abi, sdk, common), `fmod`, `runtime`.
-        /// Repeat or comma-separate. Empty = everything publishable.
-        /// Rejected alongside a subcommand (which already names the
-        /// kinds).
+        /// `source` (aliases: abi, sdk, common), `fmod`, `runtime`,
+        /// `stack`, `bundle`. Repeat or comma-separate. Empty = everything
+        /// publishable. Rejected alongside a subcommand (which already
+        /// names the kinds).
         #[arg(long, value_delimiter = ',')]
         only: Vec<String>,
+        /// Store directory for the sweep (default: $XDG_DATA_HOME/fluxor/store,
+        /// override with $FLUXOR_STORE). Rejected alongside a subcommand,
+        /// which takes its own `--store`.
+        #[arg(long)]
+        store: Option<PathBuf>,
         /// Project root override. Defaults to the directory resolved
         /// by `fluxor inspect`.
         #[arg(long)]
         project_root: Option<PathBuf>,
         /// Print the displacement report — which manifests this publish
         /// would move off their tags, and which checkouts on this
-        /// machine still pin them — and write nothing.
+        /// machine still pin them — and the stacks and bundles the sweep
+        /// would publish, and write nothing.
         #[arg(long)]
         dry_run: bool,
         /// Refuse the publish if it would displace a manifest another
@@ -502,9 +531,12 @@ enum Commands {
 
     /// Advance `fluxor.lock` pins: resolve every declared
     /// `[dependencies]` project against the store's project indexes
-    /// (`<dep>/meta:latest`) and rewrite the `[[artifact]]` pin set.
-    /// The deliberate "take upstream's new state" verb — `sync` only
-    /// re-resolves workspace members.
+    /// (`<dep>/meta:latest`) and rewrite the `[[artifact]]` pin set —
+    /// the dependencies' modules, sources and runtimes, plus every stack
+    /// a graph includes by name (with the module references it carries)
+    /// and every bundle `[uses] bundles` lists. The deliberate "take
+    /// upstream's new state" verb — `sync` only re-resolves workspace
+    /// members.
     Update {
         #[arg(long)]
         project_root: Option<PathBuf>,
@@ -517,7 +549,9 @@ enum Commands {
 
     /// Materialise `fluxor.lock` into the tree from the OCI store:
     /// fmods → `target/fluxor/<abi>/modules/`, source trees →
-    /// `target/fluxor/<name>/`, runtimes → `target/<triple>/release/`.
+    /// `target/fluxor/<name>/`, runtimes → `target/<triple>/release/`,
+    /// bundles → `target/fluxor/bundles/<name>/`; a pinned stack, which
+    /// the build reads from the store, is checked present and intact.
     /// Workspace members' pins re-resolve `:latest` (write-through);
     /// everyone else's pins replay verbatim. Digest- and
     /// epoch-verified; per-artifact staleness advisories warn and
@@ -532,8 +566,8 @@ enum Commands {
 
     /// Maintain the local OCI artifact store
     /// (`$XDG_DATA_HOME/fluxor/store`, override `$FLUXOR_STORE`):
-    /// `ls`, `rm`, `pin`, `snapshot`, `push`, `pull`, `adopt`, `fsck`,
-    /// `gc`. Modules and workload bundles publish into it as OCI
+    /// `ls`, `rm`, `snapshot`, `push`, `pull`, `adopt`, `fsck`,
+    /// `gc`. Modules, stacks and workload bundles publish into it as OCI
     /// artifacts; consume paths read only from it (offline-first), and
     /// `push`/`pull` are the only verbs that touch the network.
     /// Read-only artifact display lives on `fluxor inspect <ref>`.
@@ -650,7 +684,8 @@ enum PublishAction {
     },
     /// Publish a workload bundle into the local OCI store, under the
     /// project its tree belongs to. Takes a source manifest
-    /// (`workload.toml`, emitted first) or a bundle directory. The bundle
+    /// (`packaging/<service|applet>/<name>/workload.toml`, checked and
+    /// emitted first) or a bundle directory. The bundle
     /// carries the `.fmod` bytes of every module `workload.json` pins.
     Bundle {
         /// Source manifest or bundle directory.
@@ -660,6 +695,28 @@ enum PublishAction {
         #[arg(long)]
         store: Option<PathBuf>,
         /// Tag override (default: `<name>:<version>` from workload.json).
+        #[arg(long)]
+        tag: Option<String>,
+        /// Annotate provenance=published instead of local-build.
+        #[arg(long)]
+        published: bool,
+    },
+    /// Publish a stack: a reusable, parameterised piece of graph
+    /// (modules, wiring, typed params, exports) other projects' graphs
+    /// include by name. The document is the project's
+    /// `packaging/stack/<name>.yaml`, tagged `stack/<name>:<version>` under
+    /// the project. The stack carries its module references — the
+    /// module artifacts, per target, it composes — resolved through this
+    /// project's own published modules and its `fluxor.lock`.
+    Stack {
+        /// The stack document.
+        stack: PathBuf,
+        /// Store directory (default: $XDG_DATA_HOME/fluxor/store,
+        /// override with $FLUXOR_STORE).
+        #[arg(long)]
+        store: Option<PathBuf>,
+        /// Tag (default: `stack/<name>:<version>`); a given tag is
+        /// `stack/<name>:<t>`, under the stack's own name.
         #[arg(long)]
         tag: Option<String>,
         /// Annotate provenance=published instead of local-build.

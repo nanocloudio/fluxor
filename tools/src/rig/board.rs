@@ -28,8 +28,8 @@ pub struct BoardRig {
     /// `[build_env]` keys a profile for this board must set: a Pico W
     /// cannot be built for without the SSID of the network in the room.
     pub build_env_required: Vec<String>,
-    /// `[build_env]` keys that are secrets on this board. The profile
-    /// loader refuses a literal for them; only an indirection is accepted.
+    /// `[build_env]` keys that are secrets on this board. A literal for
+    /// one is refused at plan time; only an indirection is accepted.
     pub build_env_secret: Vec<String>,
     /// The images built for this board leave the host (a disk uploaded to
     /// a cloud). No secret may be built into them, so the profile may not
@@ -79,8 +79,8 @@ struct BoardRigToml {
 
 /// Load the `[rig]` section from a board descriptor file.
 ///
-/// Returns `Ok(None)` if the file has no `[rig]` table — some boards may not
-/// yet declare one. Returns `Err` for malformed capability names or artifact
+/// Returns `Ok(None)` if the file has no `[rig]` table — a board with no
+/// rig contract. Returns `Err` for malformed capability names or artifact
 /// classes so contract drift surfaces at load time, not at run time.
 pub fn load_board_rig(path: &Path) -> Result<Option<BoardRig>> {
     let raw = std::fs::read_to_string(path)
@@ -100,14 +100,13 @@ pub fn parse_board_rig_str(raw: &str, ctx: &str) -> Result<Option<BoardRig>> {
 }
 
 /// Default board descriptors compiled into fluxor-tools so the rig
-/// harness works when invoked from a sibling project without its own
-/// `targets/boards/` tree. The list is deliberately small and
-/// authoritative — user overrides and project-local copies always win
-/// over these.
+/// harness works when invoked from another project without its own
+/// `targets/boards/` tree. User overrides and project-local copies
+/// always win over these.
 ///
 /// Paths are relative to this file (`tools/src/rig/board.rs`) and reach
 /// up to the repo's `targets/boards/` directory at build time.
-const EMBEDDED_BOARDS: &[(&str, &str)] = &[
+pub(crate) const EMBEDDED_BOARDS: &[(&str, &str)] = &[
     ("pi5", include_str!("../../../targets/boards/pi5.toml")),
     ("linux", include_str!("../../../targets/host/linux.toml")),
     ("pico", include_str!("../../../targets/boards/pico.toml")),

@@ -370,11 +370,10 @@ fn push_unknown_verbs(
 
 /// Every retired CLI verb a shell script names.
 ///
-/// §3 sends recipe complexity into `tools/*.sh`, so the scripts are
-/// where per-target dispatch and multi-step pipelines now live — and a
-/// verb check that stopped at the Makefile would be checking the file
-/// the conditionals just left. This is the same check on the other side
-/// of that move; only the spelling of a command differs.
+/// Recipe complexity lives in `tools/*.sh`, so the scripts are where
+/// per-target dispatch and multi-step pipelines live, and a verb check
+/// that stopped at the Makefile would miss them. This is the same check
+/// applied to the scripts; only the spelling of a command differs.
 ///
 /// A script calls the CLI through a variable (`FLUXOR=…/fluxor`, then
 /// `"$FLUXOR" modules build`), so occurrences of a variable that holds

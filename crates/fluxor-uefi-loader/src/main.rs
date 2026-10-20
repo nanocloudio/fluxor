@@ -6,16 +6,16 @@
 //! itself loaded from. The image says where it must run and how much RAM it
 //! uses (`KernelHeader`); the loader reserves exactly that span and refuses a
 //! busy page rather than placing the kernel anywhere else. Then it leaves
-//! boot services, turns the MMU and data cache off the way the arm64 boot
-//! contract expects, and jumps to the image with x0 = `&BootInfo`. The
+//! boot services and enters the image in the state `fluxor_contracts::boot`
+//! defines: MMU and data cache off, interrupts masked, x0 = `&BootInfo`. The
 //! kernel never learns it was booted by UEFI.
 //!
 //! Every step says what it did on the firmware console as one
 //! `[loader] …` line, so a machine that stops early says where.
 //!
 //! An ESP with no kernel image (or an image without the header) leaves the
-//! loader nothing to hand over: it says so and shuts the machine down while
-//! the firmware can still do that for it.
+//! loader nothing to hand over: it says why on the console and powers the
+//! machine off.
 //!
 //! The few processor reads it makes (`CurrentEL`, `MPIDR`, cache
 //! maintenance) are its own: it runs as a firmware application, on another
@@ -32,31 +32,40 @@ mod efi;
 
 use core::ffi::c_void;
 use core::fmt::Write;
+use core::sync::atomic::{AtomicBool, Ordering};
 use efi::*;
 use fluxor_contracts::boot::{
-    BootInfo, KernelHeader, MemKind, MemRegion, Range, BOOT_INFO_MAGIC, CONSOLE_NONE,
+    BootInfo, KernelHeader, MemKind, MemRegion, Range, RegionList, BOOT_INFO_MAGIC, CONSOLE_NONE,
     KERNEL_HEADER_MAGIC,
 };
 
-/// The most memory-map regions the loader hands over. A firmware map with more
-/// is merged where adjacent regions are the same kind; past this the tail is
-/// reported, not silently dropped.
+/// The most memory-map regions the loader hands over, after merging adjacent
+/// regions of one kind. Regions past this are counted and reported on the
+/// console before boot services end.
 const MAX_REGIONS: usize = 256;
 
 const IMAGE_PATH: &str = "\\fluxor\\fluxor.img";
 
 static mut SYSTEM_TABLE: *mut SystemTable = core::ptr::null_mut();
 
+/// Cleared just before the first ExitBootServices call: from then on the
+/// console, a boot service, is not called, and anything said (a panic) is
+/// dropped.
+static CONSOLE_LIVE: AtomicBool = AtomicBool::new(true);
+
 // ── console ──────────────────────────────────────────────────────────────────
 
-/// The firmware console, line-buffered into UCS-2. Usable only while boot
-/// services exist.
+/// The firmware console: each write converted to UCS-2 and sent in chunks of
+/// up to 128 code units. Usable only while boot services exist.
 struct Console;
 
 impl Write for Console {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        // SAFETY: SYSTEM_TABLE is set before the first write and the console
-        // is only written while boot services exist.
+        if !CONSOLE_LIVE.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        // SAFETY: SYSTEM_TABLE is set before the first write, and
+        // CONSOLE_LIVE holds only while boot services exist.
         let out = unsafe { (*SYSTEM_TABLE).con_out };
         if out.is_null() {
             return Ok(());
@@ -117,10 +126,11 @@ fn ucs2<const N: usize>(s: &str) -> [u16; N] {
     out
 }
 
-/// Shut the machine down while boot services can still do it.
+/// Say why on the console while it is live, then power the machine off
+/// through the runtime services, which outlive ExitBootServices.
 fn shutdown(why: &str) -> ! {
     say!("[loader] shutdown: {why}");
-    // SAFETY: a runtime service, called before ExitBootServices.
+    // SAFETY: a runtime service, callable before and after ExitBootServices.
     unsafe { (rt().reset_system)(RESET_SHUTDOWN, SUCCESS, 0, core::ptr::null()) }
 }
 
@@ -156,9 +166,10 @@ fn find_rsdp() -> u64 {
     0
 }
 
-/// The console UART from ACPI's SPCR table: (interface type, register width
-/// in bytes, base address). RSDP → XSDT → the table signed `SPCR`; every
-/// table checked for its signature and a sane length, none trusted further.
+/// The console UART from ACPI's SPCR table: (interface type, register access
+/// width in bytes, base address). RSDP → XSDT → the table signed `SPCR`;
+/// every table checked for its signature and a sane length, none trusted
+/// further. A register block outside system memory is no console here.
 fn find_spcr(rsdp: u64) -> (u32, u32, u64) {
     let none = (CONSOLE_NONE, 0, 0);
     if rsdp == 0 {
@@ -188,9 +199,12 @@ fn find_spcr(rsdp: u64) -> (u32, u32, u64) {
             if tlen < 52 {
                 return none;
             }
-            // Interface type at 36; the base-address GAS at 40: space id,
-            // bit width, bit offset, access size (1..4 = 1, 2, 4, 8 bytes),
-            // then the 64-bit address.
+            // Interface type at 36; the base-address GAS at 40: space id
+            // (0 = system memory), bit width, bit offset, access size
+            // (1..4 = 1, 2, 4, 8 bytes), then the 64-bit address.
+            if *t.add(40) != 0 {
+                return none;
+            }
             let kind = *t.add(36) as u32;
             let access = match *t.add(43) {
                 n @ 1..=4 => 1u32 << (n - 1),
@@ -240,7 +254,8 @@ fn unix_millis() -> u64 {
     }
     let days = days_from_civil(t.year as i64, t.month as i64, t.day as i64);
     let secs = days * 86_400 + t.hour as i64 * 3600 + t.minute as i64 * 60 + t.second as i64;
-    // `time_zone` is minutes from UTC, 2047 meaning unspecified (local = UTC).
+    // `time_zone` is the offset from UTC in minutes; 2047
+    // (`EFI_UNSPECIFIED_TIMEZONE`) gives none, and the clock is taken as UTC.
     let tz = if t.time_zone == 2047 {
         0
     } else {
@@ -258,10 +273,11 @@ fn unix_millis() -> u64 {
 /// The image file, open.
 struct ImageFile(*mut File);
 
-/// Where the firmware loaded this loader: the code that turns the MMU off
-/// must itself be at the point of coherency, because once translation stops
-/// the core fetches it from memory, not from a cache the firmware only made
-/// coherent to the point of unification.
+/// Where the firmware loaded this loader. The code that turns the MMU off
+/// keeps executing as translation stops, under different memory attributes
+/// than the firmware's mapping gave it, and the firmware made the image
+/// coherent only to the point of unification; cleaned to the point of
+/// coherency, it reads the same whichever path the fetch takes.
 fn own_image(image_handle: Handle) -> Range {
     let mut li: *mut c_void = core::ptr::null_mut();
     // SAFETY: boot service with a valid out-pointer.
@@ -415,38 +431,15 @@ impl MapBuf {
         (0..n).map(move |i| unsafe { &*(base.add(i * step) as *const MemoryDescriptor) })
     }
 
-    /// Translate into `out`, merging adjacent runs of one kind, and marking
-    /// the kernel's span. Allocates nothing.
+    /// Translate into `out`: sorted, merged, the kernel's span cut out as
+    /// [`MemKind::Kernel`]. Allocates nothing. Returns the region count and
+    /// how many found no slot.
     fn translate(&self, out: &mut [MemRegion; MAX_REGIONS], kernel: Range) -> (usize, usize) {
-        let mut n = 0usize;
-        let mut dropped = 0usize;
+        let mut list = RegionList::new(out, kernel);
         for d in self.descriptors() {
-            let base = d.physical_start;
-            let len = d.number_of_pages * 4096;
-            let mut kind = kind_of(d.kind);
-            if base >= kernel.base && base + len <= kernel.base + kernel.len {
-                kind = MemKind::Kernel;
-            }
-            if n > 0 {
-                let last = &mut out[n - 1];
-                if last.kind == kind && last.base + last.len == base {
-                    last.len += len;
-                    continue;
-                }
-            }
-            if n == MAX_REGIONS {
-                dropped += 1;
-                continue;
-            }
-            out[n] = MemRegion {
-                base,
-                len,
-                kind,
-                reserved: 0,
-            };
-            n += 1;
+            list.add(d.physical_start, d.number_of_pages * 4096, kind_of(d.kind));
         }
-        (n, dropped)
+        (list.regions().len(), list.dropped())
     }
 }
 
@@ -484,11 +477,11 @@ fn mpidr() -> u64 {
 }
 
 /// Mask every interrupt, turn the MMU and data cache off at the current EL
-/// and jump to `entry` with x0 = `boot_info` — the arm64 boot contract.
-/// Identity-mapped by the firmware, so the code keeps running at the same
-/// address as translation stops. Masking comes first: the firmware's timer
-/// can still fire after it has left, and its vector table is in memory it
-/// no longer owns.
+/// and jump to `entry` with x0 = `boot_info`: the entry state
+/// `fluxor_contracts::boot` defines. The firmware's map is the identity, so
+/// the code keeps running at the same address as translation stops. Masking
+/// comes first: an interrupt the firmware left pending would be taken
+/// through its vector table, in memory it no longer owns.
 ///
 /// # Safety
 /// After ExitBootServices, with everything the kernel will read cleaned to
@@ -680,15 +673,19 @@ extern "efiapi" fn efi_main(image_handle: Handle, system_table: *mut SystemTable
     );
     say!("[loader] exit_boot_services");
 
-    // From here no console: printing allocates nothing, but a console write
-    // may still change the map on some firmware. Read the map, exit; on a
-    // stale key read it again and retry, calling nothing else in between.
+    // From here no console: a console write can allocate inside the
+    // firmware and so change the map key. Read the map, exit; on a stale key
+    // (`EFI_INVALID_PARAMETER`) read it again and retry. After the first
+    // attempt the firmware may have shut boot services down in part, and
+    // only the memory-allocation services (GetMemoryMap among them) and
+    // ExitBootServices may be called: the console goes quiet before it, and
+    // a failure after it powers off without saying why.
     let mut tries = 0;
     loop {
         if map.read() != SUCCESS {
-            // SAFETY: still in boot services; the console is usable.
             shutdown("GetMemoryMap failed at exit");
         }
+        CONSOLE_LIVE.store(false, Ordering::Relaxed);
         // SAFETY: the key from the read just made.
         let st = unsafe { (bs().exit_boot_services)(image_handle, map.key) };
         if st == SUCCESS {

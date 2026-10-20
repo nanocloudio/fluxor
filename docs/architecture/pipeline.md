@@ -246,11 +246,34 @@ A mailbox buffer still lent to a producer or consumer when its channel
 closes is not returned — the holder may still touch it — and stays spent
 until the next reconfigure.
 
-A port that declares no `buffer_size` gets the default 8192 bytes. The
-config tool validates that the sum of all channel buffers fits within
-the buffer arena for the target silicon. Typical hint choices: a few
-hundred bytes for control channels, 2048 bytes for PCM audio, several
-KiB for network frames, and tens of KiB for mailbox video frames.
+An edge's ring is the largest of its producer port's `buffer_size`, its
+consumer port's and the wiring entry's `buffer_bytes`, rounded up to a
+power of two (64 bytes at least); an edge that none of the three sizes
+gets the default 8192 bytes, and a request over 4 MiB is refused rather
+than clamped. A producer port whose `max_record` is larger than its ring
+is refused too: a write larger than the ring could never succeed. A
+mailbox group's ring is its largest member's, opened once and aliased by
+every member whose consumer is mailbox-safe; a member whose consumer is
+not opens a ring of its own at the group's size. The tee or merge on a
+fanned port adds the edge joining it to the port, sized by that port, and
+each fanned edge beyond it is sized by its other end and its
+`buffer_bytes`. On bcm2712 every edge between two domains, or of class
+`cross_core`, adds a default consumer-side ring.
+
+`src/kernel/ipc/ring_size.rs` states this rule once: the scheduler opens
+rings by it, `channel_open` bounds them by it, and `fluxor build` (and
+`--check`) replays graph preparation by it over the compiled config. It
+prints the largest rings beside the total, the share of the target's
+buffer arena and the slack, and refuses a graph whose rings do not fit,
+naming the edges that take the most. The limit is the kernel profile's
+arena, or the graph's `capacity: { buffer_arena }` envelope where that is
+lower; every ring also takes a channel slot, counted against the
+profile's channel table or `capacity: { channels }`. The harness test
+`ring_demand` boots graphs through the kernel and pins the arena they use
+and the channels they open to that replay. Typical hint choices: a few
+hundred bytes for control channels, 2048 bytes for PCM audio, several KiB
+for network frames, and tens of KiB for mailbox video frames — a ring
+sized to the records its edge carries.
 
 ### FIFO Mode
 
@@ -403,7 +426,8 @@ PIC modules go through this sequence during graph setup:
 
 1. **Find** — locate the module in flash by name hash
 2. **Validate** — check magic bytes, ABI version, code bounds
-3. **Size query** — call `module_state_size()` for the state buffer size
+3. **Size** — the manifest's state size; a trusted module that declares none is
+   asked through `module_state_size()`
 4. **Allocate** — reserve state from the state arena
 5. **Heap** — the cap is the graph's per-instance `heap.arena_bytes`, else the
    type's declared arena (manifest, or `module_arena_size()`); a committed heap
@@ -412,16 +436,16 @@ PIC modules go through this sequence during graph setup:
 7. **New** — call `module_new(in, out, ctrl, params, params_len, state, state_size, syscalls)`.
    `params` points into the resident config blob itself (or a live add's
    request): the kernel borrows module params in place rather than copying
-   them, so neither a module's params nor the config has a fixed ceiling.
-   Only an instance the platform stores runtime overrides for is handed a
-   merged copy.
+   them, so it sets no ceiling on a module's params or on the config; the
+   mapped blob is the only bound. Only an instance the platform stores
+   runtime overrides for is handed a merged copy.
 8. **Wait for ready** — if `deferred_ready` flag is set, gate downstream until first `Ready` outcome
 
 State memory is zeroed by `alloc_state()` before `module_new` is
 called, so modules do not need to re-zero their state struct.
-Instantiation is sequential: a module that returns a transient error
-from `module_new` is retried in a bounded loop before the next module
-proceeds.
+Instantiation is sequential: a module whose `module_new` answers pending
+is polled in a bounded loop until it is ready, or refused, before the next
+module proceeds.
 
 ### Per-Module Heap
 

@@ -3,8 +3,8 @@
 
 Never installed. Appends `<verb> <phase>` to binding `log`. `stage`
 appends a line of "previous image" output to binding `feed` (the console
-double tails it), the way staging with picotool starts the image before
-the power step. `watch` is unsupported (exit 64). `unstage` succeeds.
+double tails it): what a board already running an image prints while the
+new one is staged, before the power step. `watch` is unsupported (exit 64). `unstage` succeeds.
 Binding `fail_stage` makes `stage` exit 1; `stage_64` makes it exit 64.
 """
 import json

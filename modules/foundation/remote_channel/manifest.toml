@@ -5,8 +5,9 @@ hardware_targets = ["rp2350", "bcm2712", "linux", "wasm"]
 timer_class = "wall_clock"
 
 # Remote-channel multiplexer: up to eight local channels carried record for
-# record across one authenticated transport session. Wire protocol in
-# `wire.rs`; behaviour in `mod.rs`.
+# record across one authenticated transport session, and optionally one
+# exchange endpoint. Wire protocol in `wire.rs`; behaviour in `mod.rs`; the
+# exchange endpoint in README.md.
 #
 # ─── Parameters (TLV) ──────────────────────────────────────────────────
 # | Tag | Name         | Type | Default | Description |
@@ -15,9 +16,10 @@ timer_class = "wall_clock"
 # | 2   | role         | u8   | listen  | `net` only: `listen` binds `port` and adopts one session at a time; `dial` connects to `authority` and redials after a close. On `mux` the transport's own client/server mode decides, and the side that dialled opens the streams. |
 # | 3   | port         | u16  | 9100    | `listen`: the port bound. |
 # | 4   | authority    | str  | —       | `dial`: `host[:port]` (port 9100 when omitted) — a name the network provider resolves, or a literal. |
-# | 5   | channels     | str  | —       | The channel table, `content_type:framing:max_record;…`, channel index = position, at most 8. `framing` is how records are delimited on the channel's local ports: `tlv16` (`[type:1][len:2 LE][payload]`), `len32` (`[len:4 LE][payload]`), `mailbox` (the edge has a `buffer_group`; one buffer is one record, and an empty buffer is skipped), or `bytes` (a stream with no records, carried in order; `max_record` bounds one piece). `max_record` counts the whole local record, header included, up to `MAX_RECORD`. Both ends must state the same content types and maxima or the session is refused. |
+# | 5   | channels     | str  | —       | The channel table (may be empty with `exchange` set), `content_type:framing:max_record;…`, channel index = position, at most 8. `framing` is how records are delimited on the channel's local ports: `tlv16` (`[type:1][len:2 LE][payload]`), `len32` (`[len:4 LE][payload]`), `mailbox` (the edge has a `buffer_group`; one buffer is one record, and an empty buffer is skipped), or `bytes` (a stream with no records, carried in order; `max_record` bounds one piece). `max_record` counts the whole local record, header included, up to `MAX_RECORD`. Both ends must state the same content types and maxima or the session is refused. |
 # | 6   | require_peer | u8   | 1       | 1: a session is used only once the transport's peer identity binds (tls `peer_identity` wired to `peer_identity`, a record naming the session by connection id and generation; quic's in-band record). A `net` transport that numbers no sessions cannot bind one. 0: the transport is trusted as wired. |
 # | 7   | redial_ms    | u32  | 1000    | `dial`: wait after a close or a failed dial. |
+# | 8   | exchange     | u8   | none    | `near`: stand in for a provider on the peer — a requester wires `request_out -> request_in` and `response_out -> response_in` as it would to the provider. `far`: stand in for the peer's requester — wire `request_out` and `response_in` to the real provider. `none`: no exchange endpoint. One side's pair must be wired and the other's must not. The endpoint appends two channels (`ExchangeRequest`, `ExchangeResponse`, `mailbox`, 8192) after `channels`, which may then hold at most six. The peer must state the same `channels` and the other side. |
 #
 # Each channel's reassembly ring takes `max_record + 4` bytes, and a `mailbox`
 # channel a further `2 * max_record` for its send and delivery stages. The sum
@@ -33,6 +35,14 @@ timer_class = "wall_clock"
 # `session` (optional output) carries a frame each time a session opens or
 # ends, so a consumer can refuse work toward a member that is down at once
 # instead of waiting out its own deadline.
+#
+# An exchange endpoint's channels take only the half of a mailbox channel's
+# region they use: the side that sends a direction a send stage of 8192, the
+# side that receives it a ring and a delivery stage, 16388 — 24580 bytes a
+# side, which fits the embedded `REASSEMBLY_BYTES` beside a small table. One
+# endpoint per instance; a requester's id space crosses verbatim, so one
+# requester per near side. Session loss is the exchange contract's LINK: see
+# README.md.
 
 [[ports]]
 name = "transport_in"
@@ -140,6 +150,41 @@ content_type = "OctetStream"
 name = "session"
 direction = "output"
 content_type = "OctetStream"
+
+# ── Exchange endpoint (`exchange`) ─────────────────────────────────────────
+# Inputs 10–11 and outputs 10–11, after the channels and `session`.
+
+# `near`: the requester's requests.
+[[ports]]
+name = "request_in"
+direction = "input"
+content_type = "ExchangeRequest"
+max_record = 8192
+buffer_size = 8192
+
+# `far`: the provider's answers.
+[[ports]]
+name = "response_in"
+direction = "input"
+content_type = "ExchangeResponse"
+max_record = 8192
+buffer_size = 8192
+
+# `near`: the answers, and the LINK state, to the requester.
+[[ports]]
+name = "response_out"
+direction = "output"
+content_type = "ExchangeResponse"
+max_record = 8192
+buffer_size = 8192
+
+# `far`: the requests, and the ABORTs of a lost session, to the provider.
+[[ports]]
+name = "request_out"
+direction = "output"
+content_type = "ExchangeRequest"
+max_record = 8192
+buffer_size = 8192
 
 [[resources]]
 requires_contract = "channel"

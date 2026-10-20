@@ -39,8 +39,8 @@ pio_count = 0
 pio_state_machines = 0
 dma_channels = 0
 
-# Kernel capacity for the Linux host (arenas, module slots, config and
-# log-ring sizes) lives in `src/kernel/config.rs::profile_linux`, selected
+# Kernel capacity for the Linux host (arenas, module slots, heap segments,
+# the log ring) lives in `src/kernel/config.rs::profile_linux`, selected
 # by the `host-linux` feature. It is kernel capacity, not ABI: changing it
 # rebuilds the kernel and moves no ABI epoch.
 

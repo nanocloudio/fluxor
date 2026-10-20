@@ -4,9 +4,10 @@
 //! declared on a board) and one physical bench (which TTY, which smart
 //! plug, which TFTP root). Never checked in.
 //!
-//! The loader eagerly resolves every string field through [`secret::resolve`]
-//! so `${env:…}` and `${file:…}` indirections are bound before a plan or
-//! run is constructed. Unresolved references are fatal at load time.
+//! The loader eagerly resolves every string field of a binding through
+//! [`secret::resolve`] so `${env:…}` and `${file:…}` indirections are bound
+//! before a plan or run is constructed. Unresolved references are fatal at
+//! load time. `[host]` takes no indirections: it is written to a file.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -33,11 +34,9 @@ pub struct RigProfile {
     ///
     /// Some boards cannot be built for without a fact that belongs to the
     /// bench rather than to the repo — a Pico 2 W needs the SSID of the
-    /// network in this room, which no checked-in graph can name. Before
-    /// this, the only channel was whatever the operator happened to have
-    /// exported, so a rig run reproduced only in the shell that set it
-    /// up, and elsewhere produced an image that booted and could never
-    /// reach a network.
+    /// network in this room, which no checked-in graph can name. Carried
+    /// here, it reproduces with the profile rather than with whatever the
+    /// operator's shell happened to export.
     ///
     /// Keys are environment variable names, used verbatim. Values go
     /// through the same indirection as every other profile field, so a
@@ -231,10 +230,10 @@ impl RigProfile {
 
 // ── TOML deserialization ────────────────────────────────────────────────────
 //
-// The profile has a mostly-fixed top-level shape (rig/secrets) plus four
-// surface maps whose keys are capability names. We deserialise into
-// `toml::Value` at the section level, then walk it to resolve secrets and
-// enforce the capability vocabulary.
+// The profile has a fixed top-level shape (`[rig]`, `[power]`, `[secrets]`,
+// `[build_env]`, `[relay.*]`, `[host]`) plus four surface maps whose keys
+// are capability names. Each section deserialises as a TOML table, then is
+// walked to resolve secrets and enforce the capability vocabulary.
 
 #[derive(Deserialize)]
 struct ProfileFile {
@@ -636,7 +635,7 @@ mod tests {
                 id = "x"
                 board = "pi5"
                 [power]
-                backend = "kasa_local"
+                backend = "plug"
                 password = "hunter2"
                 "#,
                 "password",
@@ -647,9 +646,9 @@ mod tests {
                 id = "x"
                 board = "pi5"
                 [secrets]
-                kasa_alias = "lamp-1"
+                outlet_alias = "lamp-1"
                 "#,
-                "kasa_alias",
+                "outlet_alias",
             ),
         ] {
             let err = parse_profile_str(src, Path::new("/tmp/x.toml")).unwrap_err();
@@ -849,7 +848,7 @@ mod tests {
             board = "pi5"
 
             [power]
-            backend = "kasa_local"
+            backend = "plug"
             password = "${env:FLUXOR_PROFILE_TEST}"
         "#;
         let p = parse_profile_str(src, Path::new("/tmp/x.toml")).unwrap();

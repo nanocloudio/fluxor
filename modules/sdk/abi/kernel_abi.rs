@@ -24,14 +24,15 @@
 pub const ABI_VERSION: u32 = super::wire::ABI_VERSION as u32;
 
 /// Default channel buffer size in bytes.
-/// Referenced by kernel (buffer_pool, scheduler fan buffer) and modules
-/// (I2S input buffer, mixer sample buffer) to stay in sync. Sized to
-/// hold one ZX Spectrum ZVFF packet (6924 B) plus framing in a single
-/// channel write — byte-stream parsers see message boundaries at fixed
-/// offsets rather than scrambling across fragments. Embedded targets
-/// (rp2040 16 KiB arena, rp2350 32 KiB) constrain the upper bound;
-/// ports needing more declare `buffer_size` in the module manifest
-/// rather than raising this default.
+/// The ring an edge gets when neither its ports nor its wiring size it
+/// (the kernel's ring rule, `src/kernel/ipc/ring_size.rs`); modules that
+/// size their own buffers to one ring's worth (the I2S input buffer)
+/// read it too. Sized to hold one ZX Spectrum ZVFF packet (6924 B) plus
+/// framing in a single channel write — byte-stream parsers see message
+/// boundaries at fixed offsets rather than scrambling across fragments.
+/// The RP buffer arenas (16 KiB on rp2040, 64 KiB on rp2350) bound the
+/// upper end; ports needing more declare `buffer_size` in the module
+/// manifest rather than raising this default.
 pub const CHANNEL_BUFFER_SIZE: usize = 8192;
 
 /// Generic stream timing information (domain-neutral).

@@ -1,11 +1,12 @@
 //! Run record.
 //!
 //! Every rig run produces a reproducibility-grade identity manifest: hashes of
-//! the artifact bundle, scenario file, and rig profile (with secrets
-//! redacted), plus verdict and timing.
+//! the artifact, scenario file, and rig profile (with secrets redacted), the
+//! revisions of the tool and of the built tree, what each actuator reported,
+//! the verdict and its reason, timing, and how the teardown left the rig.
 //!
 //! Records are written under
-//! `~/.local/state/fluxor/labs/<lab>/rigs/<rig>/runs/<timestamp>/manifest.json`.
+//! `~/.local/state/fluxor/labs/<lab>/rigs/<rig>/runs/<run_id>/manifest.json`.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -80,8 +81,9 @@ pub struct Reports {
     pub power: Vec<ActuatorRecord>,
 }
 
-/// The teardown's three steps and whether the rig came out clean (every
-/// step `ok` or `unsupported`, no residue).
+/// The teardown's three steps and whether the rig came out clean: power
+/// off and unstage each `ok` or `unsupported`, with no residue. A failed
+/// `diagnose` is recorded but does not make the rig any less down.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TeardownRecord {
     pub diagnose: ActuatorRecord,
@@ -138,12 +140,12 @@ impl GitIdentity {
 pub enum Verdict {
     /// Planning only, no side effects taken.
     Planned,
-    Pending,
     Passed,
     Failed,
     /// Terminated without reaching a pass or fail rule.
     TimedOut,
-    /// Aborted before completion (Ctrl-C, internal error, etc.).
+    /// Ended before a verdict: a signal, a failed stage or power step, an
+    /// error inside the orchestrator.
     Aborted,
 }
 
@@ -183,7 +185,7 @@ impl RunRecord {
     }
 }
 
-/// Artifact digest for a single-file artifact. A trivial SHA-256 of the bytes.
+/// Artifact digest for a single-file artifact: SHA-256 of its bytes.
 pub fn hash_artifact_file(path: &Path) -> Result<String> {
     let mut f = std::fs::File::open(path).map_err(|e| {
         Error::Config(format!(
@@ -217,8 +219,8 @@ pub fn hash_artifact_file(path: &Path) -> Result<String> {
 /// moving a byte from the end of a path to the start of its content would
 /// hash identically.
 ///
-/// Only regular files are included; symlinks, directories, and sockets are
-/// ignored. Directory traversal is depth-first.
+/// Only regular files are included; symlinks and special files are
+/// ignored, and directories are walked.
 pub fn hash_artifact_bundle(root: &Path) -> Result<String> {
     if !root.is_dir() {
         return Err(Error::Config(format!(
@@ -278,8 +280,8 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<(PathBuf, PathBuf)>) -> 
 }
 
 fn hash_scenario_file(scenario: &Scenario) -> Result<String> {
-    // Hash the scenario file exactly as loaded, so filename changes are
-    // reflected in the manifest.
+    // The file's bytes as loaded: the same scenario under another name
+    // hashes the same, and any edit changes the hash.
     if let Some(path) = &scenario.source_path {
         if path.is_file() {
             return hash_file_bytes(path);

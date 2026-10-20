@@ -621,64 +621,27 @@ Source: `tools/src/stack_expand.rs`, `stacks/*.toml`,
 `tools/src/target.rs`.
 
 Stack expansion is how a board-independent application config acquires its
-hardware substrate. A graph YAML declares a `platform:` section naming the
-stacks it wants (`net`, `audio`, `display`, `storage`, `pointer`,
-`keyboard`, `gamepad`, `midi`, `debug`, `cli`); each stack is a profile
-file under `stacks/` containing two kinds of injection block:
-
-- `[[variant]]` — exclusive. Exactly one is selected by a
-  specificity-scored match against board and target metadata (board name,
-  phy, NIC). This answers "which driver / phy shape does this board use?".
-- `[[overlay]]` — additive. Every overlay whose match predicate holds is
-  applied on top of the variant (debug netconsole, pcap sink, and similar
-  optional layers).
-
-A selected variant injects concrete modules, wiring, params, and services
-into the config before the ordinary generation pipeline runs. The `net`
-stack, for example, injects `virtio_net + ip` on qemu-virt,
-`cyw43 + wifi + ip` on pico2w, and `rp1_gem + conn_guard + ip` on pi5 —
-three different substrate stacks under one unchanged application graph.
-Board defaults (e.g. `net → {phy: wifi, nic: cyw43}`) come from the target
-descriptor, so most configs need only name the stack.
-
-Module params inside a stack resolve through chained sources: `env:VAR`
-(environment), `user:KEY` (merged user platform fields), `host:PATH`
-(`~/.config/fluxor/host.toml`), or a literal. The first source that
-resolves wins; a trailing `|required` turns "nothing resolved" into a
-build-time error so safety-critical params cannot fall back silently.
+hardware substrate. A graph YAML's `platform:` section names the stacks it
+wants (`net`, `audio`, `display`, …); each is a profile under `stacks/`
+whose `[[variant]]` is selected by matching the board and target, and whose
+matching `[[overlay]]` blocks are applied on top. The selected variant
+injects concrete modules, wiring, params and services before the ordinary
+generation pipeline runs, so one application graph runs unchanged over
+`virtio_net + ip` on qemu-virt and `rp1_gem + conn_guard + ip` on a Pi 5.
+[stacks.md](stacks.md) describes platform stacks in full, beside the
+published stacks a graph includes by name.
 
 Separately, a config's `hardware:` section declares pin-level board wiring
 (`hardware.spi`, `hardware.i2c`, `hardware.gpio` entries), which
 `tools/src/board.rs` validates against the target: bus existence, pin
 ranges, reserved pins, and pin conflicts.
 
-## Design Target: Capability Resolution
+## Resolution
 
-Status: design target, not wired.
-
-The declared vocabulary is intended to eventually drive a generic
-requires→provides resolver in the config tool, analogous to a package
-manager resolving dependencies:
-
-- A requirement names a capability; the resolver finds a provider chain
-  through service modules down to the hardware substrate, auto-adding
-  intermediate modules.
-- Matching is by exact name or by prefix: a requirement of `net.frame`
-  would match any `net.frame.*` provider, while the reverse would not hold
-  (a `net.frame.wifi`-specific module cannot run on a generic frame
-  provider).
-- Unambiguous content-type matches (exactly one unconnected producer and
-  one unconnected consumer of a type) would be auto-wired; ambiguity would
-  be an error naming the candidates; explicit wiring would always win.
-- Quantitative constraints would be expressed as capability facts (for
-  example a `max_refresh_hz` fact on `display.scanout`, letting a motion
-  consumer reject an e-paper panel at build time) rather than as name
-  forks.
-
-None of this resolver exists. Today, substrate stacks are injected by
-platform stack expansion, application wiring is explicit, and the
-vocabulary is enforced as validated names on manifests plus the
-service / continuity / single-provider checks described above.
+The vocabulary is enforced as validated names on manifests, plus the
+service, continuity and single-provider checks described above. Nothing
+resolves a requirement to a provider chain: substrate modules are injected
+by platform stack expansion, and application wiring is explicit.
 
 ## Relationship to Other Documents
 

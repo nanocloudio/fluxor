@@ -506,9 +506,8 @@ pub fn is_builtin_module(module_type: &str) -> bool {
     )
 }
 
-/// Resolve a module .fmod file by searching primary dir, then extra dirs in order.
 /// Outcome of consulting the `fluxor.lock` `[[artifact]]` module pins for a
-/// module name (registry plan P2).
+/// module name.
 pub enum StorePin {
     /// No pin for this name — resolve from the on-disk dirs as usual.
     NotPinned,
@@ -716,7 +715,7 @@ pub fn parse_modules_from_config_multi(
                         .map(|d| d.display().to_string())
                         .collect();
                     return Err(Error::Module(format!(
-                        "Module '{}' (type '{}', artifact '{}.fmod') not found in: {} (nor pinned in fluxor.lock [[artifact]])\nRun 'fluxor modules build' to build modules, or pin it with 'fluxor store pin'.{}",
+                        "Module '{}' (type '{}', artifact '{}.fmod') not found in: {} (nor pinned in fluxor.lock [[artifact]])\nRun 'fluxor modules build' to build modules, or pin it from a dependency with 'fluxor update'.{}",
                         module_name,
                         module_type,
                         artifact,
@@ -766,7 +765,7 @@ pub fn parse_modules_from_config_multi(
                         .map(|d| d.display().to_string())
                         .collect();
                     return Err(Error::Module(format!(
-                        "Module '{}' (type '{}', artifact '{}.fmod') not found in: {} (nor pinned in fluxor.lock [[artifact]])\nRun 'fluxor modules build' to build modules, or pin it with 'fluxor store pin'.{}",
+                        "Module '{}' (type '{}', artifact '{}.fmod') not found in: {} (nor pinned in fluxor.lock [[artifact]])\nRun 'fluxor modules build' to build modules, or pin it from a dependency with 'fluxor update'.{}",
                         instance_name,
                         module_type,
                         artifact,
@@ -866,7 +865,7 @@ pub fn parse_modules_from_config_multi(
                             .map(|d| d.display().to_string())
                             .collect();
                         Error::Module(format!(
-                            "module type '{}' (staged by a workload or workload_modules; artifact '{}.fmod') not found in: {} (nor pinned in fluxor.lock [[artifact]])\nRun 'fluxor modules build' to build modules, or pin it with 'fluxor store pin'.{}",
+                            "module type '{}' (staged by a workload or workload_modules; artifact '{}.fmod') not found in: {} (nor pinned in fluxor.lock [[artifact]])\nRun 'fluxor modules build' to build modules, or pin it from a dependency with 'fluxor update'.{}",
                             module_type,
                             artifact,
                             searched.join(", "),

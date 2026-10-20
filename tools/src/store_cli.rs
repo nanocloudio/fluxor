@@ -1,11 +1,13 @@
-//! CLI glue for the local OCI artifact store: `fluxor publish bundle`
-//! and `fluxor store ls|rm|snapshot|pin`. (Project artifacts publish
-//! through `fluxor publish` — `fluxor_tools::store_publish`; read-only
-//! artifact display is `fluxor inspect <ref>` — Decision 5.)
+//! CLI glue for the local OCI artifact store: `fluxor publish
+//! bundle|stack|image|firmware|workload` and `fluxor store
+//! ls|rm|snapshot|push|pull|adopt|fsck|gc`. Project artifacts
+//! publish through `fluxor publish` (`fluxor_tools::store_publish`), and
+//! read-only artifact display is `fluxor inspect <ref>`.
 //!
-//! The store engine lives in the lib (`fluxor_tools::oci_store`); this module
-//! only walks the project tree (bundle dirs) and formats output.
-//! Offline-first: none of these verbs touch the network.
+//! The store engine lives in the lib (`fluxor_tools::oci_store`, and
+//! `fluxor_tools::store_remote` for the registry side); this module walks
+//! the project tree and formats output. Offline-first: `store push` and
+//! `store pull` are the only verbs that touch the network.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -17,7 +19,8 @@ use crate::error::{Error, Result};
 use crate::resolve_project_root;
 use fluxor_tools::oci_store::{
     self, git_source_rev, sha256_hex_prefixed, ArtifactMeta, BundleArtifact, ImageManifest,
-    OciStore, ANN_KIND, ANN_REF_NAME, ANN_TARGET, PROVENANCE_LOCAL, PROVENANCE_PUBLISHED,
+    OciStore, StackArtifact, ANN_KIND, ANN_REF_NAME, ANN_TARGET, PROVENANCE_LOCAL,
+    PROVENANCE_PUBLISHED,
 };
 use fluxor_tools::store_remote;
 use fluxor_tools::store_resolve;
@@ -142,19 +145,6 @@ pub enum StoreCommand {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Pin an artifact into `fluxor.lock` (`[[artifact]]`) so
-    /// combine/packaging resolve its `.fmod` by digest from the store
-    /// when it's absent from `target/fluxor/<target>/modules/`.
-    Pin {
-        /// Tag (`target/name:ver`), digest, or unambiguous digest prefix
-        /// of a store artifact.
-        reference: String,
-        #[arg(long)]
-        store: Option<PathBuf>,
-        /// Project root whose fluxor.lock records the pin.
-        #[arg(long)]
-        project_root: Option<PathBuf>,
-    },
 }
 
 fn open_store(dir: Option<&Path>) -> Result<OciStore> {
@@ -177,7 +167,9 @@ fn provenance_flag(published: bool) -> &'static str {
 
 /// `fluxor publish bundle <dir | workload.toml>`.
 ///
-/// A source manifest is emitted first. The bundle directory may be an
+/// A source manifest is checked where the sweep finds it
+/// (`packaging/<service|applet>/<name>/workload.toml`) and emitted first.
+/// The bundle directory may be an
 /// emitted root (`target/fluxor/<name>/`, documents under its target
 /// subdir), a flat target dir, or a materialised bundle (documents plus
 /// `modules/`). The module bytes come from the bundle's own `modules/` when
@@ -193,6 +185,8 @@ pub fn cmd_bundle_publish(
     verbose: bool,
 ) -> Result<()> {
     let dir = if crate::workload_src::is_source_manifest(bundle) {
+        let project_root = crate::project::root_for_config(bundle);
+        fluxor_tools::packaging::check_bundle(bundle, &project_root).map_err(Error::Config)?;
         crate::workload_src::emit_bundle(bundle, None, verbose)?
     } else {
         bundle.to_path_buf()
@@ -328,6 +322,117 @@ pub fn cmd_bundle_publish(
         .unwrap_or_default();
     println!(
         "{ref_name} -> {digest} ({} module(s), project {})",
+        modules.len(),
+        identity.name
+    );
+    Ok(())
+}
+
+// ── fluxor publish stack ───────────────────────────────────────────
+
+/// A lib error as the bin's, without a second `Config error:` prefix.
+fn lift_error(e: fluxor_tools::error::Error) -> Error {
+    match e {
+        fluxor_tools::error::Error::Config(m) => Error::Config(m),
+        other => Error::Config(other.to_string()),
+    }
+}
+
+/// `fluxor publish stack <file>`.
+///
+/// The document is checked first: it is the project's
+/// `packaging/stack/<name>.yaml`, parses, names a version, and renders with
+/// its defaults and examples. Its module references are resolved
+/// through the publishing project — its own published modules, then its
+/// `fluxor.lock` module pins — and published beside it, so a consumer that
+/// references the stack pins exactly the modules it was composed against. The
+/// stack joins the project's index in one transaction.
+pub fn cmd_stack_publish(
+    path: &Path,
+    store_dir: Option<&Path>,
+    tag: Option<&str>,
+    published: bool,
+) -> Result<()> {
+    use fluxor_tools::stack;
+    let project_root = crate::project::root_for_config(path);
+    stack::check_publishable(path, &project_root).map_err(lift_error)?;
+    let (doc, bytes) = stack::read_for_publish(path).map_err(lift_error)?;
+    let identity = crate::project::project_identity(&project_root)
+        .map_err(Error::Config)?
+        .ok_or_else(|| {
+            Error::Config(format!(
+                "no [project] table in {}/fluxor.toml — a stack is published under its \
+                 project",
+                project_root.display()
+            ))
+        })?;
+    let store = open_store(store_dir)?;
+    let modules = stack::module_references(&doc, &project_root, &identity.name, &store)
+        .map_err(lift_error)?;
+    let modules_json = serde_json::to_vec_pretty(&modules)
+        .map_err(|e| Error::Config(format!("modules.json: {e}")))?;
+    let ref_name = stack::publish_ref(&doc, tag).map_err(lift_error)?;
+    let epoch_hex: String = crate::hash::abi_surface_digest()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let source_rev = git_source_rev(&project_root);
+    let meta = ArtifactMeta {
+        project: &identity.name,
+        provenance: provenance_flag(published),
+        source_rev: source_rev.as_deref(),
+        abi_surface_hex: &epoch_hex,
+        input_digest_hex: None,
+        ci_digest_hex: None,
+    };
+    let deps = crate::project::dependencies(&project_root)
+        .unwrap_or_default()
+        .iter()
+        .map(|d| d.name.clone())
+        .collect::<Vec<_>>()
+        .join(",");
+    let deps = (!deps.is_empty()).then_some(deps);
+    let txn = store
+        .begin_publish()
+        .map_err(|e| Error::Config(e.to_string()))?;
+    let prepared = store
+        .prepare_stack(
+            &StackArtifact {
+                stack_yaml: &bytes,
+                modules_json: &modules_json,
+                ref_name: &ref_name,
+            },
+            &meta,
+        )
+        .map_err(|e| Error::Config(e.to_string()))?;
+    let prepared = vec![prepared];
+    let (committed, report) = store
+        .read_index()
+        .and_then(|index| {
+            store.plan_publish(
+                &index,
+                &identity.name,
+                &identity.version,
+                &prepared,
+                deps.as_deref(),
+                &[],
+            )
+        })
+        .and_then(|plan| store.commit_plan(&txn, plan, prepared, Some(&project_root)))
+        .map_err(|e| Error::Config(e.to_string()))?;
+    if !report.is_empty() {
+        eprint!(
+            "\npublish stack {ref_name} — displacement report{}",
+            oci_store::render_displacement(&report)
+        );
+    }
+    let digest = committed
+        .iter()
+        .find(|d| d.annotations.get(ANN_REF_NAME) == Some(&ref_name))
+        .map(|d| d.digest.clone())
+        .unwrap_or_default();
+    println!(
+        "{ref_name} -> {digest} ({} module reference(s), project {})",
         modules.len(),
         identity.name
     );
@@ -529,11 +634,6 @@ pub fn dispatch_store(args: StoreArgs) -> Result<()> {
             store.as_deref(),
             ca.as_deref(),
         ),
-        StoreCommand::Pin {
-            reference,
-            store,
-            project_root,
-        } => cmd_store_pin(&reference, store.as_deref(), project_root.as_deref()),
         StoreCommand::Adopt { checkouts, store } => cmd_store_adopt(&checkouts, store.as_deref()),
         StoreCommand::Fsck { store, repair } => cmd_store_fsck(store.as_deref(), repair),
         StoreCommand::Gc {
@@ -781,56 +881,6 @@ fn read_module_pins(project_root: &Path) -> Result<Option<Vec<ModulePin>>> {
     Ok(Some(pins))
 }
 
-fn cmd_store_pin(
-    reference: &str,
-    store_dir: Option<&Path>,
-    project_root: Option<&Path>,
-) -> Result<()> {
-    let pr = resolve_project_root(project_root);
-    let store = open_store(store_dir)?;
-    let desc = store
-        .resolve(reference)
-        .map_err(|e| Error::Config(e.to_string()))?;
-    let artifact = store_resolve::artifact_from_descriptor(&desc)
-        .map_err(|e| Error::Config(e.to_string()))?
-        .ok_or_else(|| {
-            Error::Config(format!(
-                "'{reference}' is not a pinnable artifact (it carries no \
-                 `io.fluxor.kind` annotation)"
-            ))
-        })?;
-    if artifact.kind == "module" {
-        // Fail now, not at consume time, if the .fmod layer is unreadable.
-        let manifest = store
-            .read_manifest(&desc)
-            .map_err(|e| Error::Config(e.to_string()))?;
-        store
-            .module_fmod_blob(&manifest)
-            .map_err(|e| Error::Config(e.to_string()))?;
-    }
-    if artifact.kind == "bundle" {
-        // Fail now, not at sync time, if any layer is unreadable: a pinned
-        // bundle is consumed whole.
-        let manifest = store
-            .read_manifest(&desc)
-            .map_err(|e| Error::Config(e.to_string()))?;
-        for layer in &manifest.layers {
-            store
-                .read_blob(&layer.digest)
-                .map_err(|e| Error::Config(format!("bundle '{}': {e}", artifact.name)))?;
-        }
-    }
-    store_resolve::pin_artifact(&pr, &artifact).map_err(|e| Error::Config(e.to_string()))?;
-    println!(
-        "pinned {} ({}) -> {} in {}",
-        artifact.name,
-        artifact.reference,
-        artifact.digest,
-        store_resolve::lockfile_path(&pr).display()
-    );
-    Ok(())
-}
-
 /// Build the `fluxor.lock`-pinned OCI-store fallback used by module
 /// resolution. `None` when the project has no lockfile,
 /// no pins for this target, or the store can't be opened — resolution then
@@ -938,8 +988,7 @@ pub fn lock_store_resolver(
 /// An artifact carrying no `manifest.toml` layer yields `NotPinned`, so an
 /// on-disk source manifest fills in. A pinned module with neither a
 /// manifest layer nor an on-disk source therefore drops out of wiring
-/// validation — the standing semantics for a manifest-less module, now
-/// reachable through a pin as well.
+/// validation, as any manifest-less module does.
 pub fn lock_store_manifest_resolver(
     project_root: &Path,
     abi: Option<&str>,
@@ -1055,7 +1104,7 @@ mod tests {
     /// Keep every unit test in this binary out of the developer's real
     /// store.
     ///
-    /// `pin_artifact` registers the checkout it just pinned into the
+    /// Writing a lock registers the checkout it just pinned into the
     /// store's pin ledger, and it resolves the store from
     /// `$FLUXOR_STORE` — not from the `--store` flag these tests pass.
     /// Unset, that is `~/.local/share/fluxor/store`, so a test pinning
@@ -1092,25 +1141,27 @@ mod tests {
         }
     }
 
-    /// Upsert one `[[artifact]]` module pin the way `store pin` does.
+    /// Upsert one `[[artifact]]` module pin, as `fluxor update` writes one.
     fn pin_module(proj: &Path, name: &str, target: &str, digest: &str, reference: &str) {
         let _env = crate::project::tests::ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _scope = StoreScope::point_at(&scratch_store());
-        store_resolve::pin_artifact(
-            proj,
-            &store_resolve::Artifact {
-                kind: "module".into(),
-                name: name.into(),
-                project: "testproj".into(),
-                target: Some(target.into()),
-                digest: digest.into(),
-                reference: reference.into(),
-                content: None,
-            },
-        )
-        .expect("pin");
+        let mut entries = store_resolve::read_store_lock(proj)
+            .expect("lock")
+            .map(|l| l.artifacts)
+            .unwrap_or_default();
+        entries.retain(|e| !(e.name == name && e.target.as_deref() == Some(target)));
+        entries.push(store_resolve::Artifact {
+            kind: "module".into(),
+            name: name.into(),
+            project: "testproj".into(),
+            target: Some(target.into()),
+            digest: digest.into(),
+            reference: reference.into(),
+            content: None,
+        });
+        store_resolve::write_store_lock(proj, &entries).expect("pin");
     }
 
     fn store_with_module(dir: &Path) -> (OciStore, String) {

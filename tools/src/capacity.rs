@@ -53,8 +53,8 @@ pub fn kernel_max_edges(target: &str) -> usize {
 }
 
 /// profile_linux and profile_bcm2712 `STATE_ARENA_SIZE`
-/// (`src/kernel/config.rs`); the two profiles agree today, and the mirror
-/// test pins each separately.
+/// (`src/kernel/config.rs`): the two profiles state the same value, and the
+/// mirror test pins each profile separately, so a divergence fails it.
 pub const HOST_STATE_ARENA: u64 = 1024 * 1024 * 1024;
 /// profile_linux and profile_bcm2712 `BUFFER_ARENA_SIZE`.
 pub const HOST_BUFFER_ARENA: u64 = 16 * 1024 * 1024;
@@ -69,8 +69,20 @@ pub const WASM_ELASTIC_REGION: u64 = 2 * 1024 * 1024;
 /// profile_rp `ELASTIC_REGION_SIZE`: Tier B compiles out on the RP parts.
 pub const RP_ELASTIC_REGION: u64 = 0;
 
+/// The channel buffer arena (`BUFFER_ARENA_SIZE`) of the kernel profile
+/// `runtime` compiles, where `src/kernel/config.rs` states it. The RP kernels
+/// take theirs from the silicon TOML (`[kernel] buffer_arena_kb`), which the
+/// target descriptor carries.
+pub fn kernel_buffer_arena(runtime: &str) -> Option<u64> {
+    match runtime {
+        "linux" | "bcm2712" => Some(HOST_BUFFER_ARENA),
+        "wasm" => Some(WASM_BUFFER_ARENA),
+        _ => None,
+    }
+}
+
 /// Graph-section byte 3 for a target: the edge-slot count in units of 128,
-/// with 0 meaning 128 (see `kernel::config::GRAPH_SLOTS_CODE`).
+/// with 0 meaning 128 (see `kernel::boot::config::GRAPH_SLOTS_CODE`).
 pub fn graph_slots_code(max_edges: usize) -> u8 {
     if max_edges == 128 {
         0
@@ -91,8 +103,8 @@ pub fn edges_for_slots_code(code: u8) -> usize {
 
 /// Kernel resource-pool registry mirror: `(yaml name, pool id)` — the
 /// composer-facing names for `modules/sdk/contracts/resource.rs` ids.
-/// Pinned against the contract source by `tools/tests/limit_register.rs`'s
-/// sibling `capacity_pool_ids_match_contract` gate.
+/// Pinned against the contract source by `capacity_pool_ids_match_contract`
+/// in `tools/tests/limit_register.rs`.
 pub const POOL_IDS: &[(&str, u16)] = &[
     ("state_arena", 0x0001),
     ("buffer_arena", 0x0002),

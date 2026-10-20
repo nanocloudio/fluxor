@@ -4,22 +4,26 @@
 //!
 //!   1. claim the rig: the lock, and a teardown of whatever an earlier run
 //!      left behind if its marker is still there
-//!   2. build or resolve artifacts (nothing has touched the rig yet, so a
-//!      failure here records `Aborted` and tears nothing down)
+//!   2. build or resolve artifacts (the rig is untouched, so a failure
+//!      here records `Aborted` and tears nothing down)
 //!   3. install the guard: write the teardown marker, set the lock's
-//!      expected end, start listening for signals
-//!   4. attach observers
+//!      expected end
+//!   4. attach transports and wait for each to report `ready`
 //!   5. deploy artifacts
 //!   6. apply power/reboot action
 //!   7. wait for pass/fail/expectation/timeout
 //!   8. tear down: diagnose on a failure, power off always, unstage, drain
-//!      the last bytes, detach transports, clear the marker if every step
-//!      came out clean
-//!   9. write the manifest — on every path, including an error or a
-//!      signal — and release the lock
+//!      the last bytes, detach transports, clear the marker if the rig came
+//!      out down
+//!   9. write the manifest and release the lock
 //!
-//! The orchestrator knows nothing about specific backends (kasa plugs,
-//! journalctl, termios, ...). It resolves capability → backend executable
+//! Once the guard is installed every path — a verdict, an error, a signal
+//! (SIGINT, SIGTERM, SIGHUP set a flag the steps poll) — goes through the
+//! teardown. The manifest is written on every path once the run's
+//! directory exists.
+//!
+//! The orchestrator knows nothing about specific backends (plugs, TFTP
+//! servers, ttys, clouds). It resolves capability → backend executable
 //! via `rig::backend` and speaks only the subprocess protocol.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -32,9 +36,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::error::{Error, Result};
 use crate::rig::backend::{
-    attach_with_grace, context_from_plan, invoke_with, resolve as resolve_backend, resolve_relay,
-    wire_artifact, wire_binding, ActuatorOutcome, BackendContext, BackendInvocation, BackendRef,
-    InvokeOptions, RelayRef, TransportHandle, PHASE_ADHOC, PHASE_RUN, PHASE_TEARDOWN,
+    attach_with, context_from_plan, invoke_with, resolve as resolve_backend, resolve_relay,
+    stderr_log_path, wire_artifact, wire_binding, ActuatorOutcome, AttachOptions, BackendContext,
+    BackendInvocation, BackendRef, InvokeOptions, RelayRef, TransportHandle,
+    DEFAULT_SHUTDOWN_GRACE, PHASE_ADHOC, PHASE_RUN, PHASE_TEARDOWN,
 };
 use crate::rig::events::{DeployEvent, RunEvent};
 use crate::rig::lock::{
@@ -66,7 +71,8 @@ pub struct RunOptions {
     /// `actuator_timeout_s`. Doesn't apply to transports.
     pub actuator_timeout: Duration,
     /// On a verdict other than `Passed`, keep the rig as the run left it
-    /// for this long (or until Enter / Ctrl-C) before tearing down.
+    /// for this long (or until Enter / Ctrl-C) before tearing down. A run
+    /// a signal ended is not held.
     pub hold: Option<Duration>,
     /// Run `power diagnose` even when the run was aborted by a signal.
     pub diagnose_on_abort: bool,
@@ -130,7 +136,7 @@ fn clear_abort() {
 pub fn execute_plan(plan: &Plan, profile: &RigProfile, options: &RunOptions) -> Result<RunOutcome> {
     clear_abort();
 
-    // Step 1 — claim the rig.
+    // 1 — claim the rig.
     let lock_path = plan
         .lock_path
         .clone()
@@ -143,8 +149,9 @@ pub fn execute_plan(plan: &Plan, profile: &RigProfile, options: &RunOptions) -> 
     let lock_guard = claim(&lock_path, &owner, options.force_lock, profile, options)?;
     let state_dir = ensure_state_dir(&lock_path)?;
 
-    // Run dir (used by the backend context AND by the console log writer).
-    let run_dir = run_dir_for(plan);
+    // The run's own directory: the backends' context, the capture logs,
+    // the manifest.
+    let run_dir = run_dir_in(&lock_path, &plan.run_record.run_id);
     std::fs::create_dir_all(&run_dir).map_err(|e| {
         Error::Config(format!(
             "rig run: creating run dir {}: {e}",
@@ -161,7 +168,7 @@ pub fn execute_plan(plan: &Plan, profile: &RigProfile, options: &RunOptions) -> 
         Err(e) => return finish_aborted(record, &run_dir, lock_guard, e),
     };
 
-    // Step 2 — build / resolve artifacts. No guard yet: a failed build has
+    // 2 — build / resolve artifacts. No guard yet: a failed build has
     // touched nothing, so there is nothing to tear down.
     if matches!(plan.artifact, ArtifactPlan::Unresolved { .. }) {
         return finish_aborted(
@@ -186,11 +193,17 @@ pub fn execute_plan(plan: &Plan, profile: &RigProfile, options: &RunOptions) -> 
         None => plan.run_record.artifact_sha256.clone(),
     };
 
-    // Step 3 — the guard. From here on every exit path tears down and
-    // writes the manifest.
+    // 3 — the guard. From here on every exit path tears down and writes
+    // the manifest.
     let marker_path = marker_path_for(&lock_path);
-    TeardownMarker::new(&plan.rig, &record.run_id, &run_dir).write(&marker_path)?;
-    lock_guard.set_expected_end(now_unix_secs() + plan.lifecycle_budget_s)?;
+    if let Err(e) = TeardownMarker::new(&plan.rig, &record.run_id, &run_dir).write(&marker_path) {
+        return finish_aborted(record, &run_dir, lock_guard, e);
+    }
+    if let Err(e) = lock_guard.set_expected_end(now_unix_secs() + plan.lifecycle_budget_s) {
+        // Nothing has touched the rig yet, so the marker comes off again.
+        let _ = TeardownMarker::clear(&marker_path);
+        return finish_aborted(record, &run_dir, lock_guard, e);
+    }
 
     let mut session = Session::new(plan, &backends, &run_dir, &state_dir, options);
     let outcome = session.run();
@@ -198,30 +211,31 @@ pub fn execute_plan(plan: &Plan, profile: &RigProfile, options: &RunOptions) -> 
     record.primary_observation_source = outcome.primary_source;
     record.reason = outcome.reason;
 
-    if record.verdict != Verdict::Passed {
+    // A run a signal ended is not held: whoever sent it wants the rig back.
+    if record.verdict != Verdict::Passed && !abort_requested() {
         if let Some(hold) = options.hold {
             session.hold(hold, &lock_guard);
         }
     }
     record.reports = std::mem::take(&mut session.reports);
 
-    // Step 8 — teardown, on every path.
+    // 8 — teardown, on every path.
     let diagnose = matches!(record.verdict, Verdict::Failed | Verdict::TimedOut)
         || (record.verdict == Verdict::Aborted && options.diagnose_on_abort);
     let teardown = session.teardown(diagnose);
-    if teardown.clean {
-        TeardownMarker::clear(&marker_path)?;
+    let clean = teardown.clean;
+    let marked = if clean {
+        TeardownMarker::clear(&marker_path)
     } else {
         let mut marker = TeardownMarker::new(&plan.rig, &record.run_id, &run_dir);
         marker.last_error = Some(teardown_failure_summary(&teardown));
-        marker.write(&marker_path)?;
-    }
-    let clean = teardown.clean;
+        marker.write(&marker_path)
+    };
     record.teardown = Some(teardown);
 
-    // Step 9 — the manifest, then the lock.
+    // 9 — the manifest, then the lock.
     record.finished_at = Some(now_unix_secs());
-    write_manifest(&record, &run_dir)?;
+    let written = write_manifest(&record, &run_dir);
     eprintln!(
         "[rig] verdict: {:?}{}  run={}",
         record.verdict,
@@ -233,6 +247,8 @@ pub fn execute_plan(plan: &Plan, profile: &RigProfile, options: &RunOptions) -> 
         run_dir.display(),
     );
     drop(lock_guard);
+    marked?;
+    written?;
     if !clean {
         return Err(Error::Config(format!(
             "rig run: teardown did not complete; the rig stays marked until \
@@ -271,7 +287,7 @@ fn claim(
                 marker.run_id,
                 marker.last_error.as_deref().unwrap_or("interrupted")
             );
-            let record = teardown_rig(profile, lock_path, Some(&marker), options)?;
+            let record = teardown_rig(profile, lock_path, &guard, Some(&marker), options)?;
             if !record.clean {
                 return Err(Error::Config(format!(
                     "rig run: the earlier run's teardown still fails ({}); fix that first, \
@@ -451,23 +467,20 @@ pub(crate) fn resolve_bound(
     }))
 }
 
-fn invoke_options(
+/// How to run one actuator verb of `backend`: the binding's own timeout
+/// and grace, else the defaults, with its stderr kept in `run_dir`.
+pub(crate) fn invoke_options(
+    backend: &BackendRef,
     binding: &BindingTable,
     fallback: Duration,
     run_dir: &Path,
-    surface: &str,
     verb: &str,
     phase: &str,
 ) -> InvokeOptions {
-    let suffix = if phase == PHASE_TEARDOWN {
-        ".teardown"
-    } else {
-        ""
-    };
     InvokeOptions {
         timeout: binding.actuator_timeout().unwrap_or(fallback),
-        grace: binding.shutdown_grace().unwrap_or(Duration::from_secs(2)),
-        stderr_log: Some(run_dir.join(format!("{surface}-{verb}{suffix}.stderr.log"))),
+        grace: binding.shutdown_grace().unwrap_or(DEFAULT_SHUTDOWN_GRACE),
+        stderr_log: Some(stderr_log_path(run_dir, backend, verb, phase)),
     }
 }
 
@@ -626,6 +639,18 @@ impl<'a> Session<'a> {
         context_from_plan(self.plan, self.run_dir, self.state_dir, phase)
     }
 
+    fn attach_options(
+        &self,
+        backend: &BackendRef,
+        binding: &BindingTable,
+        verb: &str,
+    ) -> AttachOptions {
+        AttachOptions {
+            grace: binding.shutdown_grace().unwrap_or(DEFAULT_SHUTDOWN_GRACE),
+            stderr_log: Some(stderr_log_path(self.run_dir, backend, verb, PHASE_RUN)),
+        }
+    }
+
     fn invocation(&self, binding: &BindingTable, phase: &str) -> BackendInvocation {
         BackendInvocation {
             binding: wire_binding(binding),
@@ -644,7 +669,7 @@ impl<'a> Session<'a> {
             Err(e) => return aborted(format!("attaching transports: {e}")),
         }
 
-        // Step 5 — deploy artifact (actuator).
+        // 5 — deploy artifact (actuator).
         let stage_invocation = BackendInvocation {
             binding: wire_binding(self.backends.deploy.1),
             context: self.context(PHASE_RUN),
@@ -653,10 +678,10 @@ impl<'a> Session<'a> {
             relay: None,
         };
         let opts = invoke_options(
+            &self.backends.deploy.0,
             self.backends.deploy.1,
             self.options.actuator_timeout,
             self.run_dir,
-            "deploy",
             "stage",
             PHASE_RUN,
         );
@@ -671,7 +696,7 @@ impl<'a> Session<'a> {
             return aborted("interrupted by signal".into());
         }
 
-        // Step 6 — power actions. The verbs come from the plan, which
+        // 6 — power actions. The verbs come from the plan, which
         // maps them from `scenario.requires`: `power.cycle` → `["cycle"]`,
         // otherwise each named verb in list order; `["cycle"]` is the
         // default when a backend is configured but the scenario names no
@@ -684,10 +709,10 @@ impl<'a> Session<'a> {
                 let invocation = self.invocation(binding, PHASE_RUN);
                 for verb in &self.plan.power_actions {
                     let opts = invoke_options(
+                        backend,
                         binding,
                         self.options.actuator_timeout,
                         self.run_dir,
-                        "power",
                         verb,
                         PHASE_RUN,
                     );
@@ -713,7 +738,7 @@ impl<'a> Session<'a> {
             );
         }
 
-        // Step 7 — wait for pass/fail/expectation/timeout.
+        // 7 — wait for pass/fail/expectation/timeout.
         self.match_loop()
     }
 
@@ -741,17 +766,14 @@ impl<'a> Session<'a> {
             self.byte_logs.insert(cap, f);
         }
 
-        // Step 4 — attach transports.
+        // 4 — attach transports.
         let (deploy_backend, deploy_binding) = &self.backends.deploy;
-        let grace = deploy_binding
-            .shutdown_grace()
-            .unwrap_or(Duration::from_secs(2));
-        self.deploy_watch = Some(attach_with_grace(
+        self.deploy_watch = Some(attach_with(
             deploy_backend.clone(),
             "watch",
             &self.invocation(deploy_binding, PHASE_RUN),
             self.tx.clone(),
-            grace,
+            &self.attach_options(deploy_backend, deploy_binding, "watch"),
         )?);
 
         // Attach every console transport named by a scenario rule (plus the
@@ -771,13 +793,12 @@ impl<'a> Session<'a> {
             attachments.push(("observer", *cap, backend, binding));
         }
         for (label, _cap, backend, binding) in attachments {
-            let grace = binding.shutdown_grace().unwrap_or(Duration::from_secs(2));
-            let handle = attach_with_grace(
+            let handle = attach_with(
                 backend.clone(),
                 "attach",
                 &self.invocation(binding, PHASE_RUN),
                 self.tx.clone(),
-                grace,
+                &self.attach_options(backend, binding, "attach"),
             )?;
             eprintln!("[rig] {label} attached: {}", handle.backend().slug());
             self.transports.push(handle);
@@ -877,6 +898,9 @@ impl<'a> Session<'a> {
     }
 
     fn match_loop(&mut self) -> MatchOutcome {
+        // Deadlines are anchored at the start of matching. With a power
+        // step, its `PowerDone` is already queued, and the matcher moves
+        // the anchor to the moment it reads it.
         let now = Instant::now();
         let mut m = match matcher::Matcher::with_expectations(
             &self.plan.pass_rules,
@@ -887,9 +911,6 @@ impl<'a> Session<'a> {
             Ok(m) => m,
             Err(e) => return aborted(format!("compiling rules: {e}")),
         };
-        // Matching starts now; a `PowerDone` already in the queue moves the
-        // anchor to the moment the power step actually finished.
-        m.set_anchor(now);
         let deadline = now + Duration::from_secs(self.plan.effective_timeout_s as u64);
 
         // The matcher reports which rule *actually* fired; we save its source
@@ -949,10 +970,10 @@ impl<'a> Session<'a> {
             let mut invocation = self.invocation(binding, PHASE_RUN);
             invocation.args = Some(serde_json::json!({ "minutes": minutes }));
             let opts = invoke_options(
+                backend,
                 binding,
                 self.options.actuator_timeout,
                 self.run_dir,
-                "power",
                 "hold",
                 PHASE_RUN,
             );
@@ -1027,8 +1048,8 @@ impl<'a> Session<'a> {
 }
 
 /// The teardown's three steps, shared by a run's teardown and by
-/// `fluxor rig teardown` (which has no transports to drain). `between`
-/// runs after each step.
+/// `fluxor rig teardown` (which has no transports to drain). Every step
+/// runs whatever the earlier ones did. `between` runs after each step.
 fn run_teardown_steps(
     context: &BackendContext,
     power: Option<(&BackendRef, &BindingTable)>,
@@ -1057,10 +1078,10 @@ fn run_teardown_steps(
                 relay: None,
             };
             let opts = invoke_options(
+                backend,
                 binding,
                 fallback_timeout,
                 run_dir,
-                "power",
                 "diagnose",
                 PHASE_TEARDOWN,
             );
@@ -1088,10 +1109,10 @@ fn run_teardown_steps(
                 relay: None,
             };
             let opts = invoke_options(
+                backend,
                 binding,
                 fallback_timeout,
                 run_dir,
-                "power",
                 "off",
                 PHASE_TEARDOWN,
             );
@@ -1100,6 +1121,15 @@ fn run_teardown_steps(
                 if let Some(left) = residue_summary(&rec) {
                     rec.outcome = format!("failed: residue {left}");
                 }
+            } else if rec.outcome == "unsupported" {
+                // A backend that cannot switch anything says so with a
+                // no-op; one without `off` leaves the machine's state
+                // unknown.
+                rec.outcome = format!(
+                    "failed: {} does not implement `off` (a backend with nothing to \
+                     switch reports a `no-op:`)",
+                    backend.slug()
+                );
             }
             rec
         }
@@ -1118,10 +1148,10 @@ fn run_teardown_steps(
             relay: None,
         };
         let opts = invoke_options(
+            backend,
             binding,
             fallback_timeout,
             run_dir,
-            "deploy",
             "unstage",
             PHASE_TEARDOWN,
         );
@@ -1135,37 +1165,28 @@ fn run_teardown_steps(
     record.unstage = unstage.unwrap_or_else(|| unsupported("unstage"));
     between();
 
-    record.clean = (record.diagnose.is_clean() || record.diagnose.outcome == "skipped")
-        && record.power.is_clean()
-        && record.unstage.is_clean();
+    // Clean means the rig is down: off and unstage each ok or unsupported.
+    // A failed diagnose is in the record but leaves the rig no less down.
+    record.clean = record.power.is_clean() && record.unstage.is_clean();
     record
 }
 
 /// Tear a rig down outside a run: after a crash left the marker, or on
 /// `fluxor rig teardown`. Uses every deploy backend the profile binds, and
 /// the marker's run dir (so that run's manifest records the teardown) or
-/// a fresh ad-hoc run dir.
+/// a fresh one. The caller holds the rig's lock; its expected end is set
+/// to the teardown's own bound.
 pub fn teardown_rig(
     profile: &RigProfile,
     lock_path: &Path,
+    lock_guard: &LockGuard,
     marker: Option<&TeardownMarker>,
     options: &RunOptions,
 ) -> Result<TeardownRecord> {
     let lab = lab_of(lock_path);
     let (run_id, run_dir) = match marker {
         Some(m) => (m.run_id.clone(), PathBuf::from(&m.run_dir)),
-        None => {
-            let (secs, nanos) = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| (d.as_secs(), d.subsec_nanos()))
-                .unwrap_or((0, 0));
-            let id = format!("{secs:010}-{nanos:09}-{}-teardown", profile.rig.id);
-            let dir = lock_path
-                .parent()
-                .map(|p| p.join("runs").join(&id))
-                .unwrap_or_else(|| PathBuf::from(&id));
-            (id, dir)
-        }
+        None => adhoc_run(lock_path, &profile.rig.id, "teardown")?,
     };
     std::fs::create_dir_all(&run_dir)
         .map_err(|e| Error::Config(format!("rig teardown: creating {}: {e}", run_dir.display())))?;
@@ -1198,6 +1219,16 @@ pub fn teardown_rig(
             Err(e) => eprintln!("[rig] teardown: skipping {}: {e}", cap.as_str()),
         }
     }
+    let bound = |b: &BindingTable| {
+        b.actuator_timeout()
+            .unwrap_or(options.actuator_timeout)
+            .as_secs()
+    };
+    let budget_s = power_backend.as_ref().map_or(0, |(_, b)| bound(b))
+        + deploy_backends.iter().map(|(_, b)| bound(b)).sum::<u64>()
+        + TEARDOWN_SLACK_S;
+    lock_guard.set_expected_end(now_unix_secs() + budget_s)?;
+
     let unstage_targets: Vec<(&BackendRef, &BindingTable)> =
         deploy_backends.iter().map(|(b, t)| (b, *t)).collect();
     let power = power_backend.as_ref().map(|(b, t)| (b, *t));
@@ -1255,6 +1286,10 @@ pub fn teardown_rig(
     Ok(record)
 }
 
+/// Seconds beyond the actuators' own bounds a teardown or an ad-hoc verb
+/// may take before another host may read its lock as stale.
+const TEARDOWN_SLACK_S: u64 = 30;
+
 /// An ad-hoc power verb that leaves the rig running (`on`, `cycle`) on a
 /// board whose images leave the host must not be a way to leave a machine
 /// behind: it runs under the same guard as a scenario, holds for as long
@@ -1269,17 +1304,7 @@ pub fn adhoc_power_under_guard(
 ) -> Result<TeardownRecord> {
     clear_abort();
     let state_dir = ensure_state_dir(lock_path)?;
-    let (secs, nanos) = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| (d.as_secs(), d.subsec_nanos()))
-        .unwrap_or((0, 0));
-    let run_id = format!("{secs:010}-{nanos:09}-{}-power-{verb}", profile.rig.id);
-    let run_dir = lock_path
-        .parent()
-        .map(|p| p.join("runs").join(&run_id))
-        .unwrap_or_else(|| state_dir.join(&run_id));
-    std::fs::create_dir_all(&run_dir)
-        .map_err(|e| Error::Config(format!("rig power: creating {}: {e}", run_dir.display())))?;
+    let (run_id, run_dir) = adhoc_run(lock_path, &profile.rig.id, &format!("power-{verb}"))?;
     let binding = profile
         .power
         .as_ref()
@@ -1295,7 +1320,10 @@ pub fn adhoc_power_under_guard(
     let timeout = binding
         .actuator_timeout()
         .unwrap_or(options.actuator_timeout);
-    lock_guard.set_expected_end(now_unix_secs() + 3 * timeout.as_secs() + hold.as_secs() + 60)?;
+    // The verb and the hold; the teardown sets its own bound when it starts.
+    lock_guard.set_expected_end(
+        now_unix_secs() + timeout.as_secs() + hold.as_secs() + TEARDOWN_SLACK_S,
+    )?;
 
     let context = BackendContext {
         rig_id: profile.rig.id.clone(),
@@ -1310,35 +1338,61 @@ pub fn adhoc_power_under_guard(
     };
     let invocation = BackendInvocation {
         binding: wire_binding(binding),
-        context: context.clone(),
+        context,
         artifact: None,
         args: None,
         relay: None,
     };
     let opts = invoke_options(
+        &backend,
         binding,
         options.actuator_timeout,
         &run_dir,
-        "power",
         verb,
         PHASE_ADHOC,
     );
     let rec = step(&backend, verb, &invocation, &opts);
-    if rec.is_ok() {
+    if rec.is_ok() && !abort_requested() {
         let minutes = hold.as_secs().div_ceil(60);
         eprintln!("[rig] holding the rig for up to {minutes} min; Ctrl-C ends the hold");
         let deadline = Instant::now() + hold;
         while Instant::now() < deadline && !abort_requested() {
             std::thread::sleep(Duration::from_millis(200));
         }
-        clear_abort();
     }
+    clear_abort();
     teardown_rig(
         profile,
         lock_path,
+        lock_guard,
         TeardownMarker::read(&marker_path)?.as_ref(),
         options,
     )
+}
+
+/// `<rig state root>/runs/<run_id>`: beside the lock, so every record of a
+/// rig lives under one root.
+fn run_dir_in(lock_path: &Path, run_id: &str) -> PathBuf {
+    lock_path
+        .parent()
+        .map(|p| p.join("runs").join(run_id))
+        .unwrap_or_else(|| PathBuf::from(run_id))
+}
+
+/// A run id and directory for work outside a scenario run — a teardown, an
+/// ad-hoc power verb, a sweep — with the directory created, as the
+/// protocol promises every backend. The id has a run record's shape with
+/// `what` appended, so it sorts among the runs by time.
+pub(crate) fn adhoc_run(lock_path: &Path, rig_id: &str, what: &str) -> Result<(String, PathBuf)> {
+    let (secs, nanos) = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| (d.as_secs(), d.subsec_nanos()))
+        .unwrap_or((0, 0));
+    let run_id = format!("{secs:010}-{nanos:09}-{rig_id}-{what}");
+    let run_dir = run_dir_in(lock_path, &run_id);
+    std::fs::create_dir_all(&run_dir)
+        .map_err(|e| Error::Config(format!("rig: creating {}: {e}", run_dir.display())))?;
+    Ok((run_id, run_dir))
 }
 
 // ── helpers ────────────────────────────────────────────────────────────────
@@ -1441,8 +1495,8 @@ fn run_build(
     cmd.current_dir(project_root);
     // Bench facts the repo cannot carry. A Pico 2 W cannot be built for
     // without the SSID of the network in this room, and no checked-in
-    // graph can name it; without a channel for that the build silently
-    // produced an image that boots and can never reach a network.
+    // graph can name it; without it the build produces an image that
+    // boots and never reaches a network.
     //
     // Names are used verbatim so the profile says exactly what the build
     // will see. Values are NOT logged here: a profile field written
@@ -1545,22 +1599,6 @@ fn lab_of(lock_path: &Path) -> String {
         .and_then(|p| p.file_name())
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "default".to_string())
-}
-
-fn run_dir_for(plan: &Plan) -> PathBuf {
-    // ~/.local/state/fluxor/labs/<lab>/rigs/<rig>/runs/<run_id>
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
-    home.join(".local")
-        .join("state")
-        .join("fluxor")
-        .join("labs")
-        .join(&plan.lab)
-        .join("rigs")
-        .join(&plan.rig)
-        .join("runs")
-        .join(&plan.run_record.run_id)
 }
 
 fn shell_render(argv: &[String]) -> String {

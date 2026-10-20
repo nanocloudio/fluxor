@@ -38,11 +38,16 @@ Source: `tools/src/runtime_abi.rs` (the table),
 `uefi` is bare metal on a machine its firmware describes — a cloud
 instance, or QEMU with UEFI firmware. The fluxor loader
 (`crates/fluxor-uefi-loader`), a firmware application on the boot disk,
-reads the machine from UEFI and ACPI, places the kernel image and hands
-it a `BootInfo` (`contracts/src/boot.rs`); the kernel then runs with no
-firmware service and no knowledge of UEFI. Like `linux`, one target
-(`targets/host/uefi.toml`) covers every architecture, and boards stand
-on it with `[board] host = "uefi"`.
+reads the machine from UEFI and ACPI, places the kernel image at the
+address its header names and hands it a `BootInfo`
+(`contracts/src/boot.rs`) with the MMU off; the kernel then runs with no
+firmware service and no knowledge of UEFI. As with `linux`, one host
+target (`targets/host/uefi.toml`, built for aarch64) stands for the
+runtime, and boards stand on it with `[board] host = "uefi"`
+(`qemu-uefi-arm64`). `fluxor build` for a `uefi` target writes, beside
+the packed image, the disk the machine boots: GPT with one FAT32 EFI
+system partition holding the loader at `EFI/BOOT/BOOTAA64.EFI` and the
+image at `fluxor/fluxor.img` (`tools/src/uefi_disk.rs`).
 
 ## Module ABIs
 

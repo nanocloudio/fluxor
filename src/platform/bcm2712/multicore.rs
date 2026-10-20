@@ -2,7 +2,7 @@
 //!
 //! Provides:
 //! - `CrossDomainChannel`: lock-free SPSC ring buffer for cross-core data transfer
-//! - `wake_core()`: mailbox-based secondary core wake (Pi 5 / QEMU)
+//! - `wake_core()`: secondary core wake through PSCI `CPU_ON` (Pi 5 / QEMU)
 //! - DMA40 and RP1 DMA transfer functions
 //! - Non-cacheable DMA buffer arena
 //!
@@ -297,12 +297,12 @@ impl CrossDomainChannel {
         unsafe {
             core::arch::asm!("dmb ish", "sev", options(nomem, nostack));
         }
-        // NOTE: SEV does not break a WFI-parked consumer core. The §5.4 wake
-        // doorbell SGI (cross-core) is issued from the
-        // platform's `bcm_wake_scheduler` (bcm2712.rs), reached on the common
-        // path where a cross-domain producer also signals the consumer's event
-        // (`event_signal → hal::wake_scheduler`). This SPSC ring lives in the
-        // portable kernel and cannot call the board-binary GIC directly.
+        // NOTE: SEV does not break a WFI-parked consumer core. The wake
+        // doorbell SGI that does is issued from the platform's
+        // `bcm_wake_scheduler` (bcm2712.rs), reached on the common path where
+        // a cross-domain producer also signals the consumer's event
+        // (`event_signal → hal::wake_scheduler`); whether the doorbell is on
+        // is the platform binary's switch, which this ring cannot see.
 
         true
     }
@@ -517,7 +517,7 @@ static CORE_STARTED: [AtomicU32; MAX_SECONDARY_CORES] =
 
 /// Last PSCI CPU_ON return code per core — surfaced by the primary
 /// scheduler heartbeat as `[wake] core=N psci_rc=R` so a rig log
-/// records the ATF response without needing UART access.
+/// records the firmware's response without needing UART access.
 /// `i32::MAX` means the core was never woken.
 static LAST_PSCI_RET: [core::sync::atomic::AtomicI32; MAX_SECONDARY_CORES] = [
     core::sync::atomic::AtomicI32::new(i32::MAX),
@@ -560,10 +560,12 @@ pub fn wake_core(core_id: u8, entry: fn() -> !) -> bool {
     let target_cpu = crate::arch::aarch64::cpu::mpidr_for_core(core_id);
     let entry_point: u64 = secondary_core_trampoline as usize as u64;
 
-    // Publish CORE_ENTRIES before the woken core reads it.
-    // SAFETY: DSB SY is an architectural barrier; no memory effects.
+    // Complete the CORE_ENTRIES store before the woken core can read it.
+    // Not `nomem`: the barrier must also keep the compiler from moving the
+    // store past it.
+    // SAFETY: DSB SY is an architectural barrier.
     unsafe {
-        core::arch::asm!("dsb sy", options(nomem, nostack));
+        core::arch::asm!("dsb sy", options(nostack, preserves_flags));
     }
 
     // SAFETY: the trampoline is cold-core entry code and CORE_ENTRIES was
@@ -575,7 +577,7 @@ pub fn wake_core(core_id: u8, entry: fn() -> !) -> bool {
 }
 
 /// Secondary-core entry stub. PSCI drops the core here with the MMU off,
-/// at EL2 where the firmware hands cores over there. The trampoline drops
+/// at EL2 if that is where the firmware hands cores over. The trampoline drops
 /// to EL1h (`drop_to_el1`, the same drop `_start` makes), installs core 0's
 /// page tables (so the secondary participates in inner-shareable
 /// cache coherency), enables MMU/caches/NEON, sets up its per-core
@@ -590,7 +592,8 @@ pub fn wake_core(core_id: u8, entry: fn() -> !) -> bool {
 unsafe extern "C" fn secondary_core_trampoline() -> ! {
     core::arch::naked_asm!(
         // core_id in x0, from the MPIDR affinity field this machine numbers
-        // its cores by (the shift the platform configured in `cpu`).
+        // its cores by (the shift the platform configured in `cpu`, stored
+        // before the boot core's MMU came on, so this uncached read sees it).
         "mrs x0, mpidr_el1",
         "ldr x9, ={core_id_shift}",
         "ldr w9, [x9]",
@@ -627,6 +630,7 @@ unsafe extern "C" fn secondary_core_trampoline() -> ! {
         "isb",
         "mrs x1, sctlr_el1",
         "bic x1, x1, #(1 << 1)",        // A: as core 0 (see boot_mmu::enable)
+        "bic x1, x1, #(1 << 19)",       // WXN: as core 0
         "orr x1, x1, #(1 << 0)",        // M
         "orr x1, x1, #(1 << 2)",        // C
         "orr x1, x1, #(1 << 12)",       // I
@@ -669,7 +673,7 @@ unsafe extern "C" fn secondary_core_trampoline() -> ! {
 }
 
 /// Rust entry point for secondary cores. Called by the trampoline
-/// with core_id (Aff1) in x0 once MMU is up with core 0's tables.
+/// with its core number in x0 once its MMU is up with core 0's tables.
 #[no_mangle]
 unsafe extern "C" fn secondary_core_entry(core_id: u64) -> ! {
     let idx = (core_id as usize).wrapping_sub(1);

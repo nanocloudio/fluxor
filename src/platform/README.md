@@ -5,13 +5,16 @@ Platform entrypoints stay at the top level:
 - `rp.rs`
 - `bcm2712.rs`
 - `linux.rs`
+- `wasm.rs`
 - `uefi.rs`
 
-Supporting kernel-facing modules now live in per-platform subdirectories:
+Supporting kernel-facing modules live in per-platform subdirectories
+(`uefi.rs` has none: it is the whole platform):
 
 - `rp/`
 - `bcm2712/`
 - `linux/`
+- `wasm/`
 
 Within each platform subtree, prefer concern-based files such as
 `config.rs`, `flash.rs`, `io.rs`, `protection.rs`, `providers.rs`,

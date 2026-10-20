@@ -1,19 +1,22 @@
 //! The processor as a set of cores: which one is running, how a core
 //! number maps to an MPIDR, and the drop from EL2 to EL1 at entry.
 //!
-//! Firmware hands a core over at EL2 on some machines (the Pi 5's, a
-//! hypervisor's guest at EL1 on others). Each entry path — the boot core's
+//! Some firmware hands a core over at EL2 (the Pi 5's Trusted Firmware),
+//! some at EL1 (a hypervisor's guest). Each entry path — the boot core's
 //! `_start`, a secondary core arriving from PSCI — runs the same drop, so
 //! it is one piece of assembly, [`drop_to_el1`], not two copies.
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
-/// The MPIDR shift, as a symbol so entry assembly can read it too.
+/// The MPIDR shift, as a symbol so assembly can read it too. The platform
+/// sets it before the MMU is on, so the store is in memory, not a cache,
+/// and a secondary core's entry stub reads it with its own MMU still off.
 pub static CORE_ID_SHIFT: AtomicU32 = AtomicU32::new(8);
 
 /// Which MPIDR affinity level holds the core number on this machine: the
 /// shift of that field (`8` for Aff1, as on the Pi 5; `0` for Aff0, as
-/// QEMU's `virt` machine numbers its cores). Set by the platform at boot.
+/// QEMU's `virt` machine numbers its cores). Set by the platform at boot,
+/// before the MMU is enabled.
 pub fn configure_core_id(mpidr_shift: u32) {
     CORE_ID_SHIFT.store(mpidr_shift, Ordering::Relaxed);
 }
@@ -42,9 +45,11 @@ pub fn mpidr_for_core(core_id: u8) -> u64 {
 }
 
 /// The EL2 → EL1h drop as assembly text for an entry path: if the core is
-/// at EL2, disable the EL2 MMU and caches, make EL1 AArch64, let EL1 at the
-/// physical timer and counter, and `eret` to the label that follows; if it
-/// is already at EL1, fall through to the same label. The two scratch
+/// at EL2, disable the EL2 MMU and caches (`SCTLR_EL2.{M,C,I}`), make EL1
+/// AArch64 (`HCR_EL2.RW`), give EL1 the physical counter and timer
+/// (`CNTHCTL_EL2.{EL1PCTEN,EL1PCEN}`, with `CNTVOFF_EL2` zero so the
+/// virtual counter equals the physical one), and `eret` to the label with
+/// DAIF masked on SP_EL1; if it is already at EL1, branch to the same label. The two scratch
 /// registers and the label are the caller's, so the macro fits whatever
 /// the surrounding code has free. `$label` is a local-label reference such
 /// as `"2f"`; the caller places `"2:"` right after the expansion.

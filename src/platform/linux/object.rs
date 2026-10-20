@@ -35,15 +35,45 @@ struct LinuxObjectSlot {
     in_use: bool,
     key: [u8; OBJ_MAX_KEY],
     key_len: usize,
+    /// The owner that opened the handle: the node, or an owner acting with
+    /// the node's authority. The slot answers it alone and goes with it.
+    opener: fluxor::kernel::workload::owner::OwnerHandle,
 }
 
 const OBJ_EMPTY_SLOT: LinuxObjectSlot = LinuxObjectSlot {
     in_use: false,
     key: [0u8; OBJ_MAX_KEY],
     key_len: 0,
+    opener: fluxor::kernel::workload::owner::OWNER_SYSTEM,
 };
 
 static mut LINUX_OBJECTS: [LinuxObjectSlot; OBJ_MAX_OPEN] = [OBJ_EMPTY_SLOT; OBJ_MAX_OPEN];
+
+/// The open slot `handle` names, if it is the caller's: its opener alone
+/// reaches it.
+unsafe fn obj_owned_slot(handle: i32) -> Option<usize> {
+    if handle < 0 {
+        return None;
+    }
+    let idx = fluxor::kernel::ipc::fd::slot_of(handle) as usize;
+    let objs = &*core::ptr::addr_of!(LINUX_OBJECTS);
+    objs.get(idx)
+        .filter(|s| s.in_use && s.opener == fluxor::kernel::exec::scheduler::caller_owner())
+        .map(|_| idx)
+}
+
+/// Free every handle `opener` opened. Part of the platform's owner-release
+/// hook, for an owner that acted with the node's authority: what it opened
+/// goes with it.
+///
+/// # Safety
+/// Single-threaded platform dispatch only.
+unsafe fn obj_release_opener(opener: fluxor::kernel::workload::owner::OwnerHandle) {
+    let objs = &mut *core::ptr::addr_of_mut!(LINUX_OBJECTS);
+    for s in objs.iter_mut().filter(|s| s.in_use && s.opener == opener) {
+        *s = OBJ_EMPTY_SLOT;
+    }
+}
 
 /// Outcome of one blocking HTTP request.
 struct HttpResult {
@@ -82,9 +112,7 @@ unsafe fn linux_object_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
         if arg.is_null() || arg_len < obj_dev_fence::WIRE_MAX_LEN {
             return obj_errno::EINVAL;
         }
-        let slot_idx = handle as usize;
-        let objs = &*core::ptr::addr_of!(LINUX_OBJECTS);
-        if slot_idx >= OBJ_MAX_OPEN || !objs[slot_idx].in_use {
+        if obj_owned_slot(handle).is_none() {
             return obj_errno::ENOSYS;
         }
         let buf = core::slice::from_raw_parts_mut(arg, arg_len);
@@ -123,6 +151,7 @@ unsafe fn linux_obj_alloc(key: &[u8]) -> i32 {
     slot.key[..key.len()].copy_from_slice(key);
     slot.key_len = key.len();
     slot.in_use = true;
+    slot.opener = fluxor::kernel::exec::scheduler::caller_owner();
     tag_fd(FD_TAG_STORAGE_OBJECT, slot_idx as i32)
 }
 
@@ -141,11 +170,10 @@ unsafe fn linux_obj_range_get(handle: i32, arg: *mut u8, arg_len: usize) -> i32 
     if arg.is_null() || arg_len < 8 + 4 + 8 {
         return obj_errno::EINVAL;
     }
-    let slot_idx = handle as usize;
-    let objs = &*core::ptr::addr_of!(LINUX_OBJECTS);
-    if slot_idx >= OBJ_MAX_OPEN || !objs[slot_idx].in_use {
+    let Some(slot_idx) = obj_owned_slot(handle) else {
         return obj_errno::EINVAL;
-    }
+    };
+    let objs = &*core::ptr::addr_of!(LINUX_OBJECTS);
     let offset = obj_read_u64(arg, 0);
     let length = {
         let mut b = [0u8; 4];
@@ -233,13 +261,11 @@ unsafe fn linux_obj_head(arg: *mut u8, arg_len: usize) -> i32 {
 
 /// `CLOSE` — free the slot.
 unsafe fn linux_obj_close(handle: i32) -> i32 {
-    let slot_idx = handle as usize;
-    let objs = &mut *core::ptr::addr_of_mut!(LINUX_OBJECTS);
-    if slot_idx >= OBJ_MAX_OPEN || !objs[slot_idx].in_use {
+    let Some(slot_idx) = obj_owned_slot(handle) else {
         return obj_errno::EINVAL;
-    }
-    objs[slot_idx].in_use = false;
-    objs[slot_idx].key_len = 0;
+    };
+    let objs = &mut *core::ptr::addr_of_mut!(LINUX_OBJECTS);
+    objs[slot_idx] = OBJ_EMPTY_SLOT;
     obj_errno::OK
 }
 

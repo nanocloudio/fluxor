@@ -34,6 +34,7 @@ use crate::kernel::ipc::channel;
 use crate::kernel::ipc::channel::{
     channel_set_flags, channel_set_mailbox, channel_set_reader_gone, POLL_ERR, POLL_HUP,
 };
+use crate::kernel::ipc::ring_size as rings;
 use crate::kernel::module::loader::{
     reset_state_arena, DynamicModule, ModuleLoader, PortCapacities, StartNewResult,
 };
@@ -67,12 +68,10 @@ const _: () = assert!(
     "MAX_MODULES must leave NO_MODULE outside the module-index domain"
 );
 
-/// The `buffer_group` values the tables keyed by group span. Groups above
-/// the config's 5-bit range are the kernel's, one per edge around a record
-/// fan, so the span sizes how many such edges a graph holds: the whole byte
-/// on the host profile's graph, half of it on the small parts, where these
-/// tables are on the stack.
-pub(crate) const BUFFER_GROUPS: usize = if MAX_GRAPH_EDGES > 128 { 256 } else { 128 };
+/// The `buffer_group` values the tables keyed by group span
+/// (`ring_size::buffer_groups`): the whole byte on the host profile's graph,
+/// half of it on the small parts, where these tables are on the stack.
+pub(crate) const BUFFER_GROUPS: usize = rings::buffer_groups(MAX_GRAPH_EDGES);
 
 /// Maximum number of channels (edges) in a graph.
 /// Matches MAX_GRAPH_EDGES from config to support fan-in/out expansion.
@@ -337,19 +336,25 @@ impl Edge {
 
 /// Open channels for all edges in the graph.
 ///
-/// Uses per-module channel hints to right-size each channel buffer.
-/// The source module's output port hint determines the buffer size.
-/// Falls back to the default 2048 bytes if no hint is available.
+/// Each ring is sized by `kernel::ipc::ring_size`: the largest of the
+/// producer and consumer ports' declared capacities and the edge's
+/// `buffer_bytes`, rounded up to a power of two (64 bytes at least), and the
+/// default ring (`CHANNEL_BUFFER_SIZE`) where nothing sizes the edge. The
+/// composer replays graph preparation over the same file
+/// (`tools/src/ring_plan.rs`) and refuses at build a graph whose rings do not
+/// fit the target's buffer arena; the harness test `ring_demand` pins the
+/// two together.
 ///
 /// ## Mailbox (zero-copy) aliasing
 ///
 /// `buffer_group` in graph edges is the *only* way to enable mailbox mode.
 /// Any edge with a non-zero `buffer_group` enables mailbox on its channel.
-/// When two or more edges share the same group, subsequent edges reuse the
-/// channel opened for the first edge (aliasing).
+/// When two or more edges share the same group, a later edge reuses the
+/// group's ring (aliasing).
 ///
 /// The downstream module must set `mailbox_safe` (header flags bit 0) or the
-/// alias is skipped and a separate FIFO channel is created instead. Modules
+/// alias is skipped and the edge opens a ring of its own at the group's size,
+/// still a mailbox, which later members of the group then alias. Modules
 /// that only read mailbox data (e.g. I2S sink via `buffer_acquire_read`) need
 /// `mailbox_safe` but not `in_place_writer`. Modules that modify the buffer
 /// in place (e.g. effects via `buffer_acquire_inplace`) need both.
@@ -367,16 +372,17 @@ impl Edge {
 ///
 /// ## Buffer sizing for groups
 ///
-/// For grouped edges, the buffer is sized to the maximum of all port hints
-/// across all edges in the group. This ensures the channel is large enough
-/// for the most demanding consumer (e.g. I2S requiring 2048 bytes).
+/// A group's ring is its largest member's request — port capacities and
+/// `buffer_bytes` alike — so the shared ring holds the most demanding
+/// member's records (e.g. an I2S sink requiring 2048 bytes).
 ///
 /// ## FIFO→Mailbox chaining
 ///
 /// Use FIFO for any producer that writes incrementally (partial frames). A
 /// mailbox chain begins at the first module that produces whole buffers; edges
 /// in the chain share the same `buffer_group`. At most one in-place transform
-/// is supported per chain. See `docs/architecture/pipeline.md` §FIFO→Mailbox.
+/// is supported per chain; `docs/architecture/pipeline.md` (FIFO → Mailbox
+/// Boundary Rule) has the rule.
 ///
 /// Returns the number of channels opened, or -1 on error.
 pub fn open_channels(edges: &mut [Edge]) -> i32 {
@@ -387,22 +393,19 @@ pub fn open_channels(edges: &mut [Edge]) -> i32 {
         &(*p).port_caps
     };
 
-    // Resolve the per-edge buffer-size signal. Combines the
-    // producer/consumer manifest port capacities with the YAML
-    // `buffer_bytes` override via `max(...)` — module hints express
-    // a per-port-type minimum, the YAML field expresses a graph-
-    // level bandwidth requirement, so the larger always wins.
+    // The per-edge request (`ring_size::edge_request`): the largest of the
+    // producer/consumer manifest port capacities and the wiring's
+    // `buffer_bytes` — a port capacity is a per-port-type minimum, the
+    // wiring field a per-edge one, so the larger wins.
     let edge_min_size = |edge: &Edge| -> u32 {
         let (from_size, _) = port_caps[edge.from_module].lookup(1, edge.from_port_index);
         let to_port_type = if edge.is_ctrl() { 2 } else { 0 };
         let (to_size, _) = port_caps[edge.to_module].lookup(to_port_type, edge.to_port_index);
-        from_size.max(to_size).max(edge.buffer_bytes)
+        rings::edge_request(from_size, to_size, edge.buffer_bytes)
     };
 
-    // Pre-scan: compute max buffer size per group across all edges.
-    // This ensures the shared channel is large enough for the most
-    // demanding consumer (e.g. I2S requiring exactly 2048 bytes) and
-    // for any sized YAML override on a member edge.
+    // Pre-scan: each group's largest member request, the size of the ring
+    // the group shares.
     let mut group_max_size = [0u32; BUFFER_GROUPS];
     for edge in edges.iter() {
         let group = edge.buffer_group as usize;
@@ -422,8 +425,7 @@ pub fn open_channels(edges: &mut [Edge]) -> i32 {
         // Attachable-lane edge: `channel` is a pre-existing shared spare lane
         // (an attachable-lane merge cached it at boot). Never open a fresh
         // ring for it — the producer must write into the lane the merge
-        // already reads. No boot edge sets this, so the base-graph path is
-        // byte-identical.
+        // already reads. No boot edge sets this.
         if edge.shared_channel {
             continue;
         }
@@ -454,83 +456,47 @@ pub fn open_channels(edges: &mut [Edge]) -> i32 {
         };
 
         // ── Load-time capacity enforcement ──
-        // channel_write is all-or-nothing: a record larger than the
-        // ring can NEVER succeed, so a producer whose declared
-        // max_record exceeds what this ring will grant is a
-        // permanent-wedge-by-construction — refuse the graph now,
-        // with numbers, instead of freezing at runtime.
-        {
-            let (_, max_record) = port_caps[edge.from_module].lookup(1, edge.from_port_index);
-            {
-                const MAX_CHAN_BYTES: u32 = 4 * 1024 * 1024;
-                if buf_size > MAX_CHAN_BYTES {
-                    // Refuse loudly rather than clamp to the ceiling: a
-                    // clamped producer believes it has headroom it does
-                    // not, and discovers otherwise as a wedge under load
-                    // rather than as a config error at graph build.
-                    log::error!(
-                        "[graph] edge {}→{}: requested buffer {} exceeds the \
-                         channel ceiling {} — lower the request or split the stream.",
-                        edge.from_module,
-                        edge.to_module,
-                        buf_size,
-                        MAX_CHAN_BYTES,
-                    );
-                    return -1;
-                }
-            }
-            if max_record > 0 {
-                const MIN_CHAN_BYTES: u32 = 64;
-                const MAX_CHAN_BYTES: u32 = 4 * 1024 * 1024;
-                // Model the grant the open below will actually make:
-                // sized requests are normalised (clamp + pow2); an
-                // unsized edge (buf_size == 0) takes the kernel's
-                // default ring, NOT 64 bytes — modelling it as 64
-                // would fail every max_record-only port spuriously.
-                let granted = if buf_size == 0 {
-                    crate::abi::CHANNEL_BUFFER_SIZE as u32
-                } else {
-                    buf_size
-                        .clamp(MIN_CHAN_BYTES, MAX_CHAN_BYTES)
-                        .next_power_of_two()
-                };
-                if max_record > granted {
-                    log::error!(
-                        "[graph] edge {}→{}: producer port {} declares max_record={} \
-                         but the ring grants {} bytes (requested {}); an all-or-nothing \
-                         write larger than the ring can never succeed. Raise the edge's \
-                         buffer_bytes / the port's buffer_size, or lower max_record.",
-                        edge.from_module,
-                        edge.to_module,
-                        edge.from_port_index,
-                        max_record,
-                        granted,
-                        buf_size,
-                    );
-                    return -1;
-                }
-            }
+        // The ring this edge is granted (`rings::ring_for`): a request
+        // above the ceiling is refused rather than clamped — a clamped
+        // producer believes it has headroom it does not, and would find
+        // out as a wedge under load rather than as a config error at graph
+        // build. channel_write is all-or-nothing, so a producer whose
+        // declared max_record exceeds the ring is a permanent wedge by
+        // construction, refused here with its numbers.
+        let Some(granted) = rings::ring_for(buf_size) else {
+            log::error!(
+                "[graph] edge {}→{}: requested buffer {} exceeds the \
+                 channel ceiling {} — lower the request or split the stream.",
+                edge.from_module,
+                edge.to_module,
+                buf_size,
+                rings::MAX_RING_BYTES,
+            );
+            return -1;
+        };
+        let (_, max_record) = port_caps[edge.from_module].lookup(1, edge.from_port_index);
+        if max_record > granted {
+            log::error!(
+                "[graph] edge {}→{}: producer port {} declares max_record={} \
+                 but the ring grants {} bytes (requested {}); an all-or-nothing \
+                 write larger than the ring can never succeed. Raise the edge's \
+                 buffer_bytes / the port's buffer_size, or lower max_record.",
+                edge.from_module,
+                edge.to_module,
+                edge.from_port_index,
+                max_record,
+                granted,
+                buf_size,
+            );
+            return -1;
         }
 
+        // An unsized edge opens with no config and takes the kernel's
+        // default ring; a sized one passes its granted ring, which
+        // `channel_open` accepts only as a power of two in range.
         let producer_mod = edge.from_module as ModuleId;
         let chan = if buf_size > 0 {
-            // `channel_open` accepts only an exact 4-byte LE u32 that
-            // is already a power of two and in `[64, 256 KiB]`. Module
-            // hints and YAML overrides arrive as arbitrary `u32`s, so
-            // the scheduler is the place that normalises before the
-            // syscall sees them.
-            const MIN_CHAN_BYTES: u32 = 64;
-            // 256 KiB silently clamped large producers: app GPU/video frames run
-            // past 1 MiB, so they could not transit in one ring fill and the
-            // display gated/froze. The wasm buffer arena is 8 MiB, so a single
-            // 4 MiB channel is safe (only channels that REQUEST more grow, and the
-            // other channels together stay well under the remaining 4 MiB) — chunk's
-            // GPU command ring wants a chunk mesh + far-terrain LOD ring in one step.
-            const MAX_CHAN_BYTES: u32 = 4 * 1024 * 1024;
-            let normalised = buf_size
-                .clamp(MIN_CHAN_BYTES, MAX_CHAN_BYTES)
-                .next_power_of_two();
-            let config = normalised.to_le_bytes();
+            let config = granted.to_le_bytes();
             channel::channel_open_for_module(
                 channel::CHANNEL_TYPE_PIPE,
                 config.as_ptr(),

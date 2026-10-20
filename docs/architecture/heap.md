@@ -5,8 +5,9 @@ Source: `src/kernel/mem/heap.rs`, `modules/sdk/runtime/heap.rs`
 ## Overview
 
 Fluxor provides optional per-module heap allocation. Each module may request
-a bounded heap at config time, and the graph may size it per instance. Within that arena, the module can
-dynamically allocate and free memory through syscall-table entries
+a bounded heap at config time, and the graph may size it per instance. Within
+that cap, the module can dynamically allocate and free memory through
+syscall-table entries
 (`heap_alloc`, `heap_free`, `heap_realloc`). The heap is bounded, per-module,
 kernel-managed, and observable. Modules that do not request a heap are
 unaffected -- no code change, no overhead.
@@ -85,7 +86,8 @@ Elastic growth follows the bare-metal rules:
   has a buffer lent from it); a rebuild resets the arena wholesale.
 
 A module that uses its arena as raw memory (`ARENA_GET`) gets the whole cap
-committed as one segment on its first call — provided it has not grown in
+(rounded down to the allocator's 8-byte blocks) committed as one segment on its
+first call, and the same arena on every later one — provided it has not grown in
 pieces through `heap_alloc` first, since there is then no contiguous arena to
 hand out (the call answers no arena, and the kernel logs why).
 
@@ -234,7 +236,15 @@ the heaps commit has to fit, and a heap that cannot grow fails loudly.
    instance needs less (or more) says so with `heap.arena_bytes`. On an
    elastic profile an instance commits only what it allocates either way.
 
-5. **Do not cast heap pointers to state pointers or vice versa.** The heap
+5. **Take buffers that live together as one allocation.** An elastic heap's
+   segments are not contiguous and no allocation spans two, so buffers taken
+   one by one can leave a segment's tail too short for the next and run out
+   before a cap declared at their sum. Buffers a module holds for its whole
+   life are one `heap_alloc` of their sum, carved by the module; the cap is
+   that sum (plus the 4-byte canary under `canary_enabled`) rounded up to 16
+   bytes, plus the 8-byte block header.
+
+6. **Do not cast heap pointers to state pointers or vice versa.** The heap
    arena and the state block are separate allocations.
 
 ## Checklist for Heap-Using Modules
@@ -251,7 +261,8 @@ the heaps commit has to fit, and a heap that cannot grow fails loudly.
 |--------|-------------|---------------------|
 | RP2040 | 64 KiB | 1-4 KiB per module |
 | RP2350 | 240 KiB | 4-32 KiB per module |
-| BCM2712 | 1 GiB (host profile) | KiB to MiB per module |
+| BCM2712, Linux | 1 GiB | KiB to MiB per module (elastic) |
+| wasm | 96 MiB | KiB to MiB per module |
 
 The heap is opt-in and bounded. Modules that do not use it pay
 nothing.

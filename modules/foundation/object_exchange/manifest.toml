@@ -1,0 +1,62 @@
+version          = "1.0.0"
+hardware_targets = ["bcm2712", "rp2350", "linux"]
+# Reacts to channel readiness and provider answers only; nothing here
+# measures time.
+timer_class      = "agnostic"
+
+# object_exchange — the exchange front of `storage.object`: a PROVIDER of the
+# exchange contract (`modules/sdk/contracts/exchange.rs`) that answers each
+# request by reading or writing objects through whichever `storage.object`
+# provider the graph binds. A graph reaches storage through ordinary exchange
+# edges and never holds the storage resource itself.
+#
+#   request_in    <-  request records from any requester (an HTTP server's
+#                     application route, a pipeline relay)
+#   response_out  ->  the answers, the request-body credit for streamed puts
+#
+# The request target names the object: `/<rest>` is `<scope><rest>`, the
+# scope (when given) as the front's root and the rest verbatim. `GET`, `HEAD`,
+# `PUT` and `DELETE` act on it; `GET /?list&prefix=…&after=…&max=…` lists one
+# page of names below the scope. Statuses are HTTP codes. See README.md for
+# the full surface and its limits.
+#
+# Params `scope` and `capability` (its `fxcap1.` text), given together, are
+# presented to the provider once (`PRESENT`), and every call for every request
+# names the grant it answers; without them every call names no grant (`-1`).
+# The graph's wiring decides who may send requests; the provider checks the
+# grant on each call.
+#
+# rp2040 is not a target: the two exchange edges are 8 KiB mailboxes each, the
+# whole of an rp2040's channel arena.
+
+[[ports]]
+name         = "request_in"
+index        = 0
+direction    = "input"
+content_type = "ExchangeRequest"
+max_record   = 8192
+buffer_size  = 8192
+
+[[ports]]
+name         = "response_out"
+index        = 0
+direction    = "output"
+content_type = "ExchangeResponse"
+max_record   = 8192
+buffer_size  = 8192
+
+# Every object is read and written through the bound provider; `write` covers
+# both.
+[[resources]]
+requires_contract = "storage.object"
+access            = "write"
+
+[observability]
+# id 0 = requests: exchanges opened.
+# id 1 = bytes_in: request-body bytes taken for puts.
+# id 2 = bytes_out: response-body bytes sent.
+# id 3 = errors: exchanges answered with a status of 400 or more, or ended by
+#        this module's ABORT.
+# id 4 = refused: exchanges refused 503 because every exchange slot was taken.
+# id 5 = aborts: exchanges the requester aborted before their answer ended.
+metrics = ["requests", "bytes_in", "bytes_out", "errors", "refused", "aborts"]

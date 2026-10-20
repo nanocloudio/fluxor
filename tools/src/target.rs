@@ -38,6 +38,7 @@ struct TomlSiliconFile {
 #[derive(Deserialize, Default)]
 struct TomlKernelConfig {
     state_arena_kb: Option<u32>,
+    buffer_arena_kb: Option<u32>,
     module_code_kb: Option<u32>,
     ram_static_max_kb: Option<u32>,
     kernel_stack_reserve_kb: Option<u32>,
@@ -423,6 +424,11 @@ pub struct TargetDescriptor {
         std::collections::HashMap<String, std::collections::HashMap<String, String>>,
     /// State arena size in KB (from [kernel] section, default 256)
     pub state_arena_kb: u32,
+    /// Channel buffer arena in KiB (`[kernel] buffer_arena_kb`), where the
+    /// silicon states it — the RP parts, whose kernel takes the figure from
+    /// this file. The host-class kernels state theirs in
+    /// `src/kernel/config.rs` (`capacity::kernel_buffer_arena`).
+    pub buffer_arena_kb: Option<u32>,
     /// The loader's ceiling on one module's code, in KiB (`[kernel]
     /// module_code_kb`); `None` where the silicon states none.
     pub module_code_kb: Option<u32>,
@@ -679,12 +685,9 @@ pub fn load_target(name: &str, project_root: &Path) -> Result<TargetDescriptor> 
     )))
 }
 
-// Levenshtein-distance helpers moved to
-// `tools/src/text_distance.rs` so the library-side `manifest.rs`
-// can use the same lookup for "did you mean" hints on content_type
-// typos. Re-exported here for binary-tree callers (stack_expand,
-// config, this file) that adopted them via
-// `crate::target::closest_match` before the move.
+// The "did you mean" lookup lives in `tools/src/text_distance.rs`, shared
+// with the library-side `manifest.rs`; the binary-tree callers
+// (stack_expand, config, this file) reach it through this re-export.
 pub(crate) use crate::text_distance::closest_match;
 
 /// Try to resolve `name` under a single root. Returns `Ok(None)`
@@ -857,6 +860,7 @@ fn load_silicon_target(path: &Path, kind: TargetKind) -> Result<TargetDescriptor
             .as_ref()
             .and_then(|k| k.state_arena_kb)
             .unwrap_or(256),
+        buffer_arena_kb: silicon.kernel.as_ref().and_then(|k| k.buffer_arena_kb),
         module_code_kb: silicon.kernel.as_ref().and_then(|k| k.module_code_kb),
         ram_static_max_kb: silicon.kernel.as_ref().and_then(|k| k.ram_static_max_kb),
         kernel_stack_reserve_kb: silicon

@@ -188,6 +188,30 @@ fn manifest(run_dir: &Path) -> RunRecord {
     serde_json::from_str(&raw).unwrap()
 }
 
+/// SIGINT this process once the recorder has logged `entry` — the moment
+/// an actuator is in flight, however long the steps before it took.
+fn interrupt_once_logged(log: &Path, entry: &'static str) {
+    let log = log.to_path_buf();
+    std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline {
+            let seen = std::fs::read_to_string(&log)
+                .unwrap_or_default()
+                .lines()
+                .any(|l| l == entry);
+            if seen {
+                // SAFETY: raise delivers SIGINT to this process; the
+                // handler only sets an atomic flag.
+                unsafe {
+                    libc::raise(libc::SIGINT);
+                }
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    });
+}
+
 fn position(log: &[String], entry: &str) -> usize {
     log.iter()
         .position(|l| l == entry)
@@ -327,14 +351,7 @@ fn a_signal_during_an_actuator_lets_it_finish_then_tears_down() {
     // `cycle` takes 800 ms; the abort lands in the middle of it.
     let (plan, profile) = bench.plan("sleep_ms = 800", "", "");
     install_signal_handlers();
-    std::thread::spawn(|| {
-        std::thread::sleep(Duration::from_millis(250));
-        // SAFETY: raise delivers SIGINT to this process; the handler only
-        // sets an atomic flag.
-        unsafe {
-            libc::raise(libc::SIGINT);
-        }
-    });
+    interrupt_once_logged(&bench.log, "cycle run");
     let outcome = execute_plan(&plan, &profile, &RunOptions::default()).unwrap();
     assert_eq!(outcome.record.verdict, Verdict::Aborted);
     assert!(outcome.record.reason.as_deref().unwrap().contains("signal"));
@@ -472,12 +489,12 @@ fn a_missed_expectation_fails_by_absence_and_names_itself() {
     let (plan, profile) = bench.plan(
         "",
         "",
-        "[[expect]]\nsource = \"console.serial\"\nregex = \"\\\\[boot\\\\] stages=\"\nwithin_s = 1\n",
+        "[[expect]]\nsource = \"console.serial\"\nregex = \"\\\\[boot\\\\] ready modules=\"\nwithin_s = 1\n",
     );
     let outcome = execute_plan(&plan, &profile, &RunOptions::default()).unwrap();
     assert_eq!(outcome.record.verdict, Verdict::Failed);
     let reason = outcome.record.reason.unwrap();
-    assert!(reason.contains("\\[boot\\] stages="), "{reason}");
+    assert!(reason.contains("\\[boot\\] ready modules="), "{reason}");
     assert!(reason.contains("within 1s"), "{reason}");
     assert_eq!(
         outcome.record.primary_observation_source.as_deref(),
@@ -548,9 +565,19 @@ fn teardown_rig_outside_a_run_uses_every_deploy_binding_and_writes_a_record() {
     let bench = Bench::new("teardown-cmd");
     let (_plan, profile) = bench.plan("", "", "");
     let lock_path = bench.lock_path();
-    std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
-    let record = teardown_rig(&profile, &lock_path, None, &RunOptions::default()).unwrap();
+    let owner = LockOwner::now("rig-a", "test:teardown", 30);
+    let guard = match acquire_lock(&lock_path, &owner, false).unwrap() {
+        AcquireOutcome::Acquired(g) => g,
+        _ => panic!("the lock is free and there is no marker"),
+    };
+    let record = teardown_rig(&profile, &lock_path, &guard, None, &RunOptions::default()).unwrap();
     assert!(record.clean);
+    let lock: LockOwner =
+        serde_json::from_str(&std::fs::read_to_string(&lock_path).unwrap()).unwrap();
+    assert!(
+        lock.expected_end.is_some(),
+        "the teardown bounds its own lock for other hosts"
+    );
     let log = bench.recorded();
     assert_eq!(log, vec!["off teardown", "unstage teardown"]);
 }
@@ -671,4 +698,76 @@ fn profile_host_facts_override_the_operator_host_config_for_the_build() {
     assert!(super::write_host_config(&plain, &run_dir)
         .unwrap()
         .is_none());
+}
+
+/// A diagnose that fails is recorded, but the rig is down once `off` and
+/// `unstage` are: the marker comes off and the run is not an error.
+#[test]
+fn a_failed_diagnose_is_recorded_but_the_teardown_is_clean() {
+    let bench = Bench::new("diagnose-fails");
+    let (plan, profile) = bench.plan(
+        "fail_diagnose = true",
+        "",
+        "[[expect]]\nsource = \"console.serial\"\nregex = \"never\"\nwithin_s = 1\n",
+    );
+    let outcome = execute_plan(&plan, &profile, &RunOptions::default()).unwrap();
+    assert_eq!(outcome.record.verdict, Verdict::Failed);
+    let t = manifest(&outcome.run_dir).teardown.unwrap();
+    assert!(t.diagnose.outcome.starts_with("failed"), "{:?}", t.diagnose);
+    assert!(t.clean);
+    assert!(!marker_path_for(&bench.lock_path()).exists());
+    assert!(
+        outcome
+            .run_dir
+            .join("power-recorder-diagnose.teardown.stderr.log")
+            .is_file(),
+        "the failed step's stderr is kept beside the run"
+    );
+}
+
+/// `off` is how the rig comes down; a backend without it leaves the
+/// machine's state unknown, so the rig stays marked.
+#[test]
+fn an_off_the_backend_does_not_implement_leaves_the_rig_marked() {
+    let bench = Bench::new("off-64");
+    let (plan, profile) = bench.plan("off_64 = true", "", "");
+    let err = execute_plan(&plan, &profile, &RunOptions::default()).unwrap_err();
+    assert!(
+        format!("{err}").contains("teardown did not complete"),
+        "{err}"
+    );
+    let marker = TeardownMarker::read(&marker_path_for(&bench.lock_path()))
+        .unwrap()
+        .expect("marker left");
+    assert!(
+        marker
+            .last_error
+            .as_deref()
+            .unwrap()
+            .contains("does not implement `off`"),
+        "{marker:?}"
+    );
+}
+
+/// A run a signal ended is torn down at once, `--hold` or not.
+#[test]
+fn a_run_ended_by_a_signal_is_not_held() {
+    let bench = Bench::new("signal-hold");
+    let (plan, profile) = bench.plan("sleep_ms = 600", "", "");
+    install_signal_handlers();
+    interrupt_once_logged(&bench.log, "cycle run");
+    let options = RunOptions {
+        hold: Some(Duration::from_secs(30)),
+        ..RunOptions::default()
+    };
+    let start = Instant::now();
+    let outcome = execute_plan(&plan, &profile, &options).unwrap();
+    assert_eq!(outcome.record.verdict, Verdict::Aborted);
+    assert!(
+        start.elapsed() < Duration::from_secs(15),
+        "the run was held after a signal"
+    );
+    let log = bench.recorded();
+    assert!(!log.iter().any(|l| l.starts_with("hold")), "{log:?}");
+    assert!(log.iter().any(|l| l == "off teardown"), "{log:?}");
 }

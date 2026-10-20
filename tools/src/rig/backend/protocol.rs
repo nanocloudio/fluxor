@@ -5,7 +5,7 @@
 //!
 //! Two message shapes:
 //!
-//!   * **Actuator** (one-shot, e.g. `power-kasa_local cycle`): the core
+//!   * **Actuator** (one-shot, e.g. `power-<name> cycle`): the core
 //!     writes one JSON object to the backend's stdin, closes it, and reads
 //!     one JSON object from stdout on successful exit.
 //!
@@ -31,8 +31,8 @@ pub struct BackendInvocation {
     /// artifact the backend should place in its target.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact: Option<ArtifactRef>,
-    /// Arguments of the verb itself, when it takes any. `hold` receives
-    /// `{"minutes": N}`; every other verb today receives nothing.
+    /// Arguments of the verb itself, when it takes any: `hold` receives
+    /// `{"minutes": N}`. Absent for a verb that takes none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub args: Option<serde_json::Value>,
     /// The `[relay.<name>]` binding when the backend runs through a relay
@@ -42,10 +42,12 @@ pub struct BackendInvocation {
     pub relay: Option<BTreeMap<String, BindingValue>>,
 }
 
-/// The lifecycle phase an invocation belongs to. A backend that behaves
-/// differently at the end of a run from in the middle of one (a `power off`
-/// that also stops a helper machine only when the run is over) reads this
-/// rather than guessing from the verb.
+/// Why a backend is being called: the lifecycle of a scenario (`run`),
+/// the steps that put the rig back (`teardown`), or an operator's
+/// `fluxor rig power …` (`adhoc`). A backend that behaves differently at
+/// the end of a run from in the middle of one (a `power off` that also
+/// stops a helper machine only when the run is over) reads this rather
+/// than guessing from the verb.
 pub const PHASE_RUN: &str = "run";
 pub const PHASE_TEARDOWN: &str = "teardown";
 pub const PHASE_ADHOC: &str = "adhoc";
@@ -59,8 +61,8 @@ pub struct BackendContext {
     pub scenario_name: String,
     pub board: String,
     pub effective_timeout_ms: u64,
-    /// One of [`PHASE_RUN`], [`PHASE_TEARDOWN`], [`PHASE_ADHOC`]. Absent
-    /// in an invocation written by an older core means `run`.
+    /// One of [`PHASE_RUN`], [`PHASE_TEARDOWN`], [`PHASE_ADHOC`]; absent
+    /// means `run`.
     #[serde(default = "phase_run")]
     pub phase: String,
     /// The rig's own directory, `0700`, kept across runs and serialised by
@@ -75,16 +77,14 @@ fn phase_run() -> String {
 }
 
 /// JSON-friendly view of a resolved profile field. Strings have already
-/// had `${env:…}` / `${file:…}` / `${keychain:…}` indirections substituted
-/// by the time they reach the backend — backends never see the
-/// indirection syntax.
+/// had `${env:…}` / `${file:…}` indirections substituted by the time they
+/// reach the backend — backends never see the indirection syntax.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum BindingValue {
     // Order matters for `#[serde(untagged)]`: serde tries variants in
-    // declaration order, so `Bool` and `Int` must precede `Float` —
-    // otherwise a JSON literal like `5` deserializes as `Float(5.0)`
-    // instead of `Int(5)` and `true` deserializes as a non-Bool.
+    // declaration order, so `Int` must precede `Float` — otherwise a JSON
+    // literal like `5` deserializes as `Float(5.0)` instead of `Int(5)`.
     String(String),
     Bool(bool),
     Int(i64),
@@ -124,8 +124,8 @@ fn bool_true() -> bool {
 
 /// Exit status a backend uses for a verb it does not implement. The
 /// orchestrator tolerates it for the optional verbs (`diagnose`,
-/// `unstage`, `hold`, `sweep`, and the deploy `watch` transport) and
-/// treats it as a failure for every other verb.
+/// `unstage`, `hold`, `sweep`) and for any transport, and treats it as a
+/// failure for a switching verb or `stage`.
 pub const EXIT_UNSUPPORTED_VERB: i32 = 64;
 
 // ── Transport events ───────────────────────────────────────────────────────
@@ -168,6 +168,8 @@ pub enum TransportEvent {
         message: String,
     },
     /// Sent once, after setup, so the orchestrator knows the transport is
-    /// live. Optional — backends that set up synchronously may skip it.
+    /// live. The orchestrator stages and powers nothing until every
+    /// transport has sent it or exited, up to a bound; a backend that never
+    /// sends it costs the run that bound.
     Ready,
 }

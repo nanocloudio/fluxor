@@ -9,7 +9,8 @@
 //!      (default: `/usr/local/share/fluxor/backends:/usr/share/fluxor/backends`)
 //!
 //! A backend is an executable named `<surface>-<name>`, e.g.
-//! `power-kasa_local` or `deploy-netboot_tftp`.
+//! `deploy-netboot_tftp` for the `deploy.netboot_tftp` capability, or
+//! `power-<backend>` for a `[power] backend = "<backend>"` binding.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -28,7 +29,7 @@ pub struct BackendRef {
 }
 
 /// A relay: an executable that runs a backend somewhere else (a bench
-/// host reached over SSH) with stdio passed through, so the backend
+/// host beside the device) with stdio passed through, so the backend
 /// protocol is unchanged. Invoked as `relay-<name> <surface>-<backend>
 /// <verb>`, with the relay's own `[relay.<name>]` binding in the
 /// invocation.
@@ -122,13 +123,13 @@ pub fn resolve(surface: Surface, name: &str) -> Result<BackendRef> {
         .join(", ");
     Err(Error::Config(format!(
         "rig backend '{slug}' not found on any search path: [{search_list}]. \
-         Install the fluxor reference backends, provide your own, or set \
-         $FLUXOR_BACKEND_PATH to point at them."
+         Install a backend of that name, or set $FLUXOR_BACKEND_PATH to the \
+         directory that holds it."
     )))
 }
 
-/// The full ordered list of directories the resolver will consider. Callers
-/// can print this for `--plan` and diagnostic output.
+/// The full ordered list of directories the resolver considers, as a
+/// missing-backend error names them.
 pub fn search_paths() -> Vec<PathBuf> {
     let mut out = Vec::new();
 

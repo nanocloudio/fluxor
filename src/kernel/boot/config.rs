@@ -632,7 +632,7 @@ const _: () = assert!(
 /// single-writer. wasm32 and Cortex-M keep 128, so their static tables do not
 /// grow.
 ///
-/// Above 255 the count no longer fits the header's `edge_count` byte, so the
+/// Above 255 the count does not fit the header's `edge_count` byte, so the
 /// graph section's reserved byte 2 carries the HIGH byte. A blob that leaves
 /// that byte 0, as the "reserved, must be 0" convention has it, reads back as
 /// the same count — no format version moves.
@@ -657,16 +657,17 @@ pub const GRAPH_SLOTS_CODE: u8 = if MAX_GRAPH_EDGES == 128 {
     (MAX_GRAPH_EDGES / 128) as u8
 };
 
-/// There is no fixed ceiling on the config blob. The parser is handed the
-/// blob as a slice whose length is what the platform actually mapped, and
-/// that length is the only bound: a section that would run past it is refused
-/// by name. The platforms state their windows where they map the blob — the
-/// file on Linux, the payload window between the image and `.bss` on a
-/// RAM-loaded aarch64 image (`config_window`), the graph slot or the flash
-/// below the slots on RP, the gap to the module blob on QEMU virt — and the
-/// CLI refuses an image whose config would not fit the window it is packed
-/// into.
-///
+// There is no fixed ceiling on the config blob. The parser is handed the
+// blob as a slice whose length is what the platform actually mapped, and
+// that length is the only bound: a section that would run past it is refused
+// by name. The platforms state their windows where they map the blob — the
+// file on Linux, the payload window between the image and `.bss` on a
+// RAM-loaded aarch64 image (`trailer_config_window`), the graph slot or the
+// flash below the slots on RP (`decode_slot_header`, `trailer_config_window`),
+// the gap to the module blob on QEMU virt, the embedded blob's used length on
+// wasm — and the CLI refuses an image whose config would not fit the window
+// it is packed into.
+
 /// Hardware section binary format sizes
 pub const SPI_CONFIG_BIN_SIZE: usize = 8;
 pub const I2C_CONFIG_BIN_SIZE: usize = 8;
@@ -685,9 +686,9 @@ pub const PIO_CONFIG_BIN_SIZE: usize = 4;
 ///   byte 3:    bits 7:4 = from_port_index
 ///              bits 3:0 = to_port_index
 ///   bytes 4-7: buffer_bytes (u32 LE) — explicit ring-buffer size.
-///              `0` falls back to module hints / `BUFFER_SIZE`.
-///              Otherwise `max(module_hint, buffer_bytes)` is the
-///              size requested from `channel_open_for_module`.
+///              `0` falls back to the port capacities / `BUFFER_SIZE`.
+///              Otherwise the largest of it and the two port
+///              capacities is the edge's request (`ipc::ring_size`).
 ///   byte 8:    rate_class
 ///   byte 9:    bit 0 = wake_on_write; bits 1-7 reserved
 ///   byte 10:   from_id, high byte
@@ -697,16 +698,15 @@ pub const GRAPH_EDGE_SIZE: usize = 12;
 /// adaptive_flags:u8` = 4. Byte 3 carries `adaptive_flags`.
 /// `tick_min_us`/`tick_max_us` are deliberately NOT in this (checksummed) entry:
 /// they ride in the POST-BODY adaptive section past `total_size` (see
-/// `ADAPTIVE_POST_SIZE`), because growing the checksummed `body_size` hangs the
-/// bare-metal Pi 5 boot. So the entry stays 4 bytes and `body_size`/CRC are
-/// unchanged. The blob format version is NOT bumped (latest-only; kernel + tools
-/// ship together) — a stale blob is rejected by the body-size/CRC check.
+/// `ADAPTIVE_POST_SIZE`), because a larger checksummed `body_size` hangs the
+/// bare-metal Pi 5 boot. Kernel and tools ship together, so a blob of any other
+/// layout is rejected by the body-size/CRC check.
 pub const DOMAIN_META_ENTRY_SIZE: usize = 4;
 pub const DOMAIN_META_SIZE: usize = 4 * DOMAIN_META_ENTRY_SIZE;
 /// Adaptive-tick post-body section: 4 domains × `[tick_min_us:u16, tick_max_us:u16]`.
 /// Stored AFTER the checksummed body (past `total_size`), never inside
-/// `body_size` — growing `body_size` hangs the bare-metal Pi 5 boot, but trailing
-/// bytes past it are harmless (both rig-proven). See the read site in
+/// `body_size`: a larger `body_size` hangs the bare-metal Pi 5 boot, while
+/// trailing bytes past it are harmless. See the read site in
 /// `read_config_from_slice`.
 pub const ADAPTIVE_POST_SIZE: usize = 16;
 
@@ -716,7 +716,9 @@ pub const ADAPTIVE_POST_SIZE: usize = 16;
 /// (FLXA) blobs the kernel admits at boot via `scheduler::live::apply_add`.
 /// Layout: `[FXPD u32 LE][workload_count u16 LE]` then per workload `[blob_len
 /// u32 LE][FLXA blob]`. Mirrors `tools add_subgraph::WORKLOAD_SECTION_MAGIC`.
-/// Same additive discipline as the adaptive tail — no format-version bump.
+/// Like the adaptive tail it lies outside the checksummed body. The workloads'
+/// modules borrow their params from this section in place as they
+/// instantiate.
 pub const WORKLOAD_SECTION_MAGIC: u32 = 0x4658_5044;
 /// Largest resident-workload section the kernel will map, in bytes (bounds a torn or
 /// hostile tail). Sized for a handful of workloads with small param blobs.
@@ -867,13 +869,13 @@ pub struct GraphEdge {
     /// `parse_graph_edge` for the full byte layout). Pure metadata on
     /// single-core; no runtime cost.
     pub edge_class: EdgeClass,
-    /// Per-edge ring-buffer size override in bytes. `0` defers to the
-    /// producer/consumer manifest port capacities and the
-    /// global `BUFFER_SIZE` fallback. Non-zero requests at least this
-    /// many bytes; the scheduler combines it with the port capacities via
-    /// `max(port_capacity, buffer_bytes)` and `channel_open_for_module`
-    /// clamps to `MAX_CHAN_BYTES = 256 KiB` and rounds up to a power
-    /// of two. Encoded as a u32 LE in bytes 4-7 of the edge record.
+    /// Per-edge ring-buffer size in bytes. `0` defers to the
+    /// producer/consumer manifest port capacities and the default ring
+    /// (`BUFFER_SIZE`). Non-zero requests at least this many bytes: the
+    /// scheduler takes the largest of it and the two port capacities,
+    /// rounds that up to a power of two of at least 64 bytes, and refuses
+    /// the graph when it is over the 4 MiB ceiling (`ipc::ring_size`).
+    /// Encoded as a u32 LE in bytes 4-7 of the edge record.
     pub buffer_bytes: u32,
     /// Rate class of this edge: 0=control, 1=audio, 2=video,
     /// 3=bulk, 4=transaction (contracts `RateClass`). Feeds
@@ -956,9 +958,9 @@ pub struct Config {
 
 /// `graph_flags` bit 0: accept cycles in the dataflow graph. The
 /// canonical use case is bidirectional `http <-> linux_net` feedback
-/// pairs in linux http examples. Typed feedback edges are the
-/// long-term answer (see scheduler comment near `compute_exec_order`);
-/// this flag is the transitional accommodation.
+/// pairs in linux http examples. The flag is graph-wide: an edge carries
+/// no feedback marking, so every cycle's members are stepped after the
+/// ordered modules, in declaration order (`compute_exec_order`).
 pub const GRAPH_FLAG_ACCEPT_CYCLES: u8 = 0x01;
 
 impl Config {

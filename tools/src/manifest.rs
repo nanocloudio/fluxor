@@ -161,10 +161,9 @@ pub fn contract_id_from_name(s: &str) -> Result<u8> {
         // `provider::contract::STORAGE_*` constants.
         "storage.namespace" => Ok(0x13),
         "storage.object" => Ok(0x14),
-        // USB host controller binding (scaffold). Allocated so
-        // foundation modules can name the contract today; the kernel
-        // vtable is not yet implemented and `provider_open` against
-        // it returns ENOSYS until a host-controller driver lands.
+        // USB host controller binding. Allocated so foundation modules
+        // can name the contract; no platform registers a vtable for it,
+        // so `provider_open` against it returns ENOSYS.
         "usb_host" => Ok(0x15),
         // Host process executor (the impure boundary). Host-linux only; a node
         // without the `proc` grant ENOSYS-denies.
@@ -2650,25 +2649,20 @@ impl Manifest {
         // byte 14: bit 0 = has_integrity, bit 1 = has_signature,
         //          bit 2 = isr_safe (author attestation; the
         //                  **build-time** `validate_isr_tier_admission`
-        //                  in `tools/src/config.rs` is the live gate
-        //                  for this flag. Tier 1b and Tier 2 admission
-        //                  are both live (Tier 2 additionally requires
-        //                  an `irq:` field + a `module_isr_entry`
-        //                  export — see `check_module_exports_isr_entry`
-        //                  and the loader's `isr_entry_fn`). The kernel-side
-        //                  `Manifest::from_bytes` round-trips the
-        //                  bit through `LoadedModule.manifest`, but
-        //                  the loader does NOT currently re-check it
-        //                  at instantiation — the runtime gate today
-        //                  is the EACCES check on every gated
-        //                  syscall (`scheduler::deny_isr_tier_syscall`).
-        //                  A loader-side defense-in-depth check that
-        //                  mirrors the build-time one would still be
-        //                  worth adding for hand-rolled binaries.
-        //          bit 3 = pre_tick_drain (Tier 1c opt-in).
-        //                  Read by `prepare_graph` to populate
-        //                  `domain_pre_tick_order` and exclude the
-        //                  module from `domain_exec_order`.
+        //                  in `tools/src/config/builder.rs` is the gate
+        //                  for this flag, for Tier 1b and Tier 2 alike
+        //                  (Tier 2 additionally requires an `irq:` field
+        //                  + a `module_isr_entry` export — see
+        //                  `check_module_exports_isr_entry` and the
+        //                  loader's `isr_entry_fn`). The kernel does not
+        //                  read the bit: its runtime gate is the EACCES
+        //                  check on every gated syscall
+        //                  (`scheduler::deny_isr_tier_syscall`).
+        //          bit 3 = pre_tick_drain (Tier 1c opt-in). The
+        //                  build carries it into the module's config
+        //                  entry, which `prepare_graph` reads to
+        //                  populate `domain_pre_tick_order` and exclude
+        //                  the module from `domain_exec_order`.
         //          bit 4 = ABI-surface attestation block present.
         //          bit 5 = port-capacity block present.
         //          bit 6 = stack block present.
@@ -4211,7 +4205,7 @@ required = true
 
         // A manifest with no attestation round-trips as None.
         m.abi_surface = None;
-        let back = Manifest::from_bytes(&m.to_bytes()).expect("decode legacy");
+        let back = Manifest::from_bytes(&m.to_bytes()).expect("decode unattested");
         assert_eq!(back.abi_surface, None);
 
         // Truncating the attestation block is rejected.

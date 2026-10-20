@@ -97,15 +97,16 @@ run is stateless; running the command again starts fresh.
 
 ## Running a published service
 
-A service another project publishes is run by name once it is pinned,
-with its parameters on the command line or in a values file:
+A service another project publishes is run by name. The consuming
+project lists the publisher under `[dependencies]` and the bundle under
+`[uses] bundles` in its `fluxor.toml`, and `fluxor update` pins it:
 
 ```sh
-fluxor store pin dns_service:latest
+fluxor update
 fluxor run dns_service --param port=15353 --param answer=10.1.2.3
 ```
 
-[service-bundles.md](service-bundles.md) covers the parameter schema
+[service-bundles.md](service-bundles.md) covers the params a graph declares
 and how a service is published.
 
 ## Richer graphs

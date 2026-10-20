@@ -787,8 +787,13 @@ see [reconfigure.md](reconfigure.md#adding-a-subgraph-with-the-nodes-authority))
 is not a workload here. It reaches the node's provider layers as the node does,
 and the platform providers serve it unrooted: host paths on Linux, the node's
 store, nothing charged to a ledger and no root made or removed. Its own layers
-still serve it alone, unseen by the node and by its siblings, and every handle
-it opens is stamped with its own owner and closed when it is released.
+still serve it alone, unseen by the node and by its siblings. Every handle a
+platform provider hands it is stamped with its own owner, answers that owner
+alone (the node and its siblings included) and is closed when it is
+released, and a node provider holding something for it (the node's
+`fat32`, its open files) releases it on the owner-release notification, as
+for any consumer. On Linux it holds at most 32 host files open at once, as a
+workload holds through its root.
 
 What a workload reaches of the node's storage is what its admission
 granted, recorded on its owner. A `CREATE` names the grant in its header's

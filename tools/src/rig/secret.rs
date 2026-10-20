@@ -1,21 +1,19 @@
 //! Secret indirection for private rig profiles.
 //!
-//! Any string field in a profile may use one of three indirection forms
+//! Any string field in a profile may use one of two indirection forms
 //! instead of embedding the value directly:
 //!
 //! * `${env:NAME}` — resolved from the process environment.
-//! * `${file:/path}` — resolved from an absolute file (UTF-8 contents
-//!   with a single trailing newline trimmed).
-//! * `${keychain:svc/acct}` — reserved for a future OS-keychain
-//!   integration; currently returns an error so profiles using this
-//!   syntax fail loudly.
+//! * `${file:/path}` — resolved from an absolute file the caller owns and
+//!   nobody else can read (UTF-8 contents with one trailing `\n` or
+//!   `\r\n` trimmed).
 //!
 //! The resolver preserves the distinction between values that came from an
 //! indirection (treated as secrets — redacted in plan output, run logs,
 //! and profile hashes) and values that were written as plain literals.
 //!
 //! Callers pull real values out via [`Secret::expose`] when a backend needs
-//! them; anything else — `Display`, `Debug`, serialization — returns the
+//! them; anything else — `Display`, `Debug`, the profile hash — sees the
 //! `***` sentinel for resolved secrets.
 
 use std::fmt;
@@ -23,7 +21,7 @@ use std::fmt;
 use crate::error::{Error, Result};
 
 /// A profile value. Either a plain literal or the result of resolving a
-/// `${env:…}` / `${file:…}` / `${keychain:…}` indirection.
+/// `${env:…}` / `${file:…}` indirection.
 #[derive(Clone)]
 pub enum Secret {
     Plain(String),
@@ -44,9 +42,9 @@ impl Secret {
         matches!(self, Self::Resolved(_))
     }
 
-    /// Value to use in hashes and serialized records:
-    /// secrets are replaced by the sentinel so a profile with a removed
-    /// secret does not hash-equal one with a secret still present.
+    /// Value to use in hashes: a secret is replaced by the sentinel, so its
+    /// value stays out of the hash while a profile that has the field
+    /// still hashes differently from one that does not.
     pub fn for_hash(&self) -> &str {
         match self {
             Self::Plain(s) => s,
@@ -81,7 +79,7 @@ pub const REDACTED: &str = "***";
 /// syntax is resolved against the environment or filesystem.
 ///
 /// `ctx` is a human-readable location string used in error messages, e.g.
-/// `"~/.config/fluxor/labs/default/rigs/pi5-a.toml [power].kasa_password"`.
+/// `"~/.config/fluxor/labs/default/rigs/pi5-a.toml [power].password"`.
 pub fn resolve(raw: &str, ctx: &str) -> Result<Secret> {
     let Some(inner) = strip_indirection(raw) else {
         return Ok(Secret::Plain(raw.to_string()));
@@ -90,20 +88,16 @@ pub fn resolve(raw: &str, ctx: &str) -> Result<Secret> {
     let Some((scheme, arg)) = inner.split_once(':') else {
         return Err(Error::Config(format!(
             "{ctx}: secret indirection '{raw}' is missing a scheme \
-             (expected '${{env:NAME}}', '${{file:/path}}', or '${{keychain:svc/acct}}')"
+             (expected '${{env:NAME}}' or '${{file:/path}}')"
         )));
     };
 
     match scheme {
         "env" => resolve_env(arg, ctx, raw),
         "file" => resolve_file(arg, ctx, raw),
-        "keychain" => Err(Error::Config(format!(
-            "{ctx}: ${{keychain:…}} is reserved for a future platform-specific \
-             backend and is not yet supported (got '{raw}')"
-        ))),
         other => Err(Error::Config(format!(
             "{ctx}: secret indirection '{raw}' uses unknown scheme '{other}' \
-             (valid: env, file, keychain)"
+             (valid: env, file)"
         ))),
     }
 }
@@ -159,14 +153,12 @@ fn resolve_file(path: &str, ctx: &str, raw: &str) -> Result<Secret> {
     }
     let contents = std::fs::read_to_string(path)
         .map_err(|e| Error::Config(format!("{ctx}: reading '{path}' for '{raw}': {e}")))?;
-    // Trim a single trailing newline — a `.token` file typically has one.
+    // Trim one trailing line ending — a `.token` file typically has one.
     let trimmed = contents
-        .strip_suffix('\n')
-        .unwrap_or(&contents)
-        .strip_suffix('\r')
-        .unwrap_or_else(|| contents.strip_suffix('\n').unwrap_or(&contents))
-        .to_string();
-    Ok(Secret::Resolved(trimmed))
+        .strip_suffix("\r\n")
+        .or_else(|| contents.strip_suffix('\n'))
+        .unwrap_or(&contents);
+    Ok(Secret::Resolved(trimmed.to_string()))
 }
 
 #[cfg(test)]
@@ -238,9 +230,14 @@ mod tests {
     }
 
     #[test]
-    fn keychain_not_yet_supported() {
-        let err = resolve("${keychain:svc/acct}", "x").unwrap_err();
-        assert!(format!("{err}").contains("keychain"));
+    fn file_indirection_trims_one_crlf_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret.tok");
+        std::fs::write(&path, "abc123\n\r\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let s = resolve(&format!("${{file:{}}}", path.display()), "x").unwrap();
+        assert_eq!(s.expose(), "abc123\n");
     }
 
     #[test]

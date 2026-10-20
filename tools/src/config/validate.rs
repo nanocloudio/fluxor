@@ -199,8 +199,8 @@ fn cap_satisfies(declared: &str, wanted: &str) -> bool {
 }
 
 /// Validate the optional top-level `continuity` block — session
-/// continuity classes as a validated graph property
-/// §7.3; `protocol_surfaces.md` §Continuity Classes). Compile-time
+/// continuity classes as a validated graph property (see
+/// `protocol_surfaces.md`, "Continuity Classes"). Compile-time
 /// only; no binary representation in the compiled config.
 ///
 /// ```yaml
@@ -213,11 +213,11 @@ fn cap_satisfies(declared: &str, wanted: &str) -> bool {
 ///     # transport_migratable only:
 ///     mechanism: platform_replicated_state
 ///     aead: on_wire_sequence        # platform_replicated_state only
-///     failover_budget_ms: 8000      # declared worst-case sum (§12.4)
+///     failover_budget_ms: 8000      # declared worst-case sum
 ///     client_keepalive_ms: 20000    # deployed client's timeout
 /// ```
 ///
-/// The checks are *structural* (§7.3): the required roles and
+/// The checks are *structural*: the required roles and
 /// capabilities exist in the graph. What cannot be checked here —
 /// whether the failover budget actually fits under the client
 /// keepalive at runtime, or whether R1–R5 hold under fault — is a
@@ -357,7 +357,7 @@ pub fn validate_continuity_on(
 
         // Mechanism / AEAD fields only mean something on
         // transport_migratable — a declaration on a weaker class is a
-        // mis-statement, not decoration (selection policy §9.5).
+        // mis-statement, not decoration.
         let mechanism = g.get("mechanism").and_then(|v| v.as_str());
         let aead = g.get("aead").and_then(|v| v.as_str());
         if class != "transport_migratable" {
@@ -377,7 +377,7 @@ pub fn validate_continuity_on(
             // No structural obligations: flows may drop / drain.
             "reroutable" | "drain_only" => {}
 
-            // §7.3: resumption state must exist somewhere in the
+            // Resumption state must exist somewhere in the
             // declared member set.
             "resumable" => {
                 let members: Vec<&str> = anchor.iter().chain(workers.iter()).copied().collect();
@@ -395,10 +395,10 @@ pub fn validate_continuity_on(
                 }
             }
 
-            // §7.3: a transport anchor must exist; workers are the
+            // A transport anchor must exist; workers are the
             // movable half and must be declared as such. With more
             // than one worker (a swap target) the workers must also
-            // support opaque export/import handoff (§13.1).
+            // support opaque export/import handoff.
             "edge_anchored" => {
                 let a = anchor
                     .ok_or_else(|| err("class edge_anchored requires an `anchor` module".into()))?;
@@ -432,7 +432,7 @@ pub fn validate_continuity_on(
                 }
             }
 
-            // §7.3: the mechanism decides the obligations.
+            // The mechanism decides the obligations.
             "transport_migratable" => {
                 let mech = mechanism.ok_or_else(|| {
                     err(format!(
@@ -1184,60 +1184,47 @@ fn resolve_edge_classes(
 
 /// Resolve `buffer_bytes` for each wiring entry.
 ///
-/// Reads the optional `buffer_bytes` field on each `wiring[]` entry.
-/// `0` (or missing) means "use module hints / default". Non-zero
-/// values are clamped to `[64, MAX_CHAN_BYTES = 2 MiB]`; the kernel
-/// rounds up to the next power of two at channel-open time, so the
-/// encoded value is the lower bound the producer needs.
+/// Reads the optional `buffer_bytes` field on each `wiring[]` entry. `0` (or
+/// missing) means "size the ring by the port capacities, else the default".
+/// Any other value is the edge's own request, carried as written: the kernel
+/// takes the largest of it and the two port capacities and rounds that up to
+/// a power of two of at least 64 bytes (`ring_size`). A value over one
+/// channel's ceiling is refused here, as the kernel refuses it, never clamped:
+/// a producer sized for a ring it does not get wedges under load.
 ///
 /// Per-edge sizing matters when edge bandwidth depends on graph
 /// composition rather than module type — e.g. a `spectrum_video →
 /// wasm_browser_canvas` raster edge that must carry 98 KiB per
 /// frame at 50 fps doesn't share a default with a low-rate
 /// telemetry edge from the same producer.
-fn resolve_edge_buffer_bytes(config: &Value) -> Vec<u32> {
-    // Must match the kernel's channel/scheduler cap (src/kernel/ipc/channel.rs +
-    // scheduler/mod.rs = 4 MiB). This is the config-build clamp: it was stale at
-    // 256 KiB while the kernel allowed 2 MiB, so a wiring asking for 2 MiB (a
-    // GPU-offload frame channel — dense frames near 1 MiB) was silently clamped
-    // to 256 KiB, and a frame larger than the channel gated across ticks and
-    // FROZE the display. Raised to 4 MiB to match the kernel (chunk's GPU command
-    // ring carries a chunk mesh + far-terrain LOD ring in one step).
-    const MAX_CHAN_BYTES: u32 = 4 * 1024 * 1024;
-    let wiring = match config.get("wiring").and_then(|w| w.as_array()) {
-        Some(w) => w,
-        None => return Vec::new(),
+fn resolve_edge_buffer_bytes(config: &Value) -> Result<Vec<u32>> {
+    let max = crate::ring_plan::MAX_RING_BYTES;
+    let Some(wiring) = config.get("wiring").and_then(|w| w.as_array()) else {
+        return Ok(Vec::new());
     };
-    let mut out = Vec::with_capacity(wiring.len());
-    for (i, entry) in wiring.iter().enumerate() {
-        let raw = entry
-            .get("buffer_bytes")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        let clamped = if raw == 0 {
-            0
-        } else if raw < 64 {
-            eprintln!("warning: wiring[{i}] buffer_bytes={raw} below minimum 64; rounding up");
-            64
-        } else if raw > MAX_CHAN_BYTES as u64 {
-            eprintln!(
-                "warning: wiring[{i}] buffer_bytes={raw} exceeds MAX_CHAN_BYTES={MAX_CHAN_BYTES}; clamping"
-            );
-            MAX_CHAN_BYTES
-        } else {
-            raw as u32
-        };
-        out.push(clamped);
-    }
-    out
+    wiring
+        .iter()
+        .enumerate()
+        .map(|(i, entry)| {
+            let raw = entry
+                .get("buffer_bytes")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            if raw > max as u64 {
+                return Err(Error::Config(format!(
+                    "wiring[{i}]: buffer_bytes {raw} is over the {max} B ceiling of one \
+                     channel; lower the request or split the stream"
+                )));
+            }
+            Ok(raw as u32)
+        })
+        .collect()
 }
 
 /// Contracts that tolerate more than one provider in a single graph
 /// because callers fan through them via the `CHAIN_NEXT` flag rather
-/// than letting the last registration win. Nothing declares
-/// chain-awareness today — `CHAIN_NEXT` is defined but unset by every
-/// module — so this list is empty and every duplicate provider is an
-/// error. It exists so the rule has a documented escape hatch rather than
+/// than letting the last registration win. No module sets `CHAIN_NEXT`,
+/// so this list is empty and every duplicate provider is an error. It exists so the rule has a documented escape hatch rather than
 /// an invented user.
 const CHAIN_AWARE_PROVIDES: &[&str] = &[];
 
@@ -1294,7 +1281,7 @@ fn provider_volume<'a>(config: &'a Value, name: &str) -> &'a str {
 /// Multiple providers of one surface ARE allowed when each declares a
 /// distinct `volume:` selector: they register as instance-keyed layers a
 /// `mount` module binds and routes between. The escape hatch
-/// `CHAIN_AWARE_PROVIDES` (empty today) additionally exempts a contract
+/// `CHAIN_AWARE_PROVIDES` (empty) additionally exempts a contract
 /// whose callers fan through `CHAIN_NEXT`.
 pub fn validate_single_provider(
     config: &Value,
@@ -1868,10 +1855,12 @@ fn dials_in_client_mode(ty: &str, module: &Value) -> bool {
     match ty {
         "tls_probe" | "ota_registry" => true,
         "http" => matches!(mode, Some("1") | Some("client")),
-        "remote_channel" => matches!(
-            module_param(module, "role"),
-            Some(Value::String(r)) if r == "dial"
-        ) || matches!(module_param(module, "role"), Some(Value::Number(n)) if n.as_u64() == Some(1)),
+        "remote_channel" => {
+            matches!(
+                module_param(module, "role"),
+                Some(Value::String(r)) if r == "dial"
+            ) || matches!(module_param(module, "role"), Some(Value::Number(n)) if n.as_u64() == Some(1))
+        }
         _ => false,
     }
 }

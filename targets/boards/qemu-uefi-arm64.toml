@@ -1,8 +1,8 @@
 # QEMU `virt` machine with UEFI firmware (AAVMF), aarch64.
 #
-# The emulated machine a UEFI kernel is brought up on before a cloud one: the
-# same loader, the same disk, the same ACPI-described boot. It stands on the
-# `uefi` host target; QEMU and its firmware are the rig's, not the image's.
+# The UEFI path on an emulated machine: the loader, the disk and the
+# ACPI-described boot a cloud instance runs. It stands on the `uefi` host
+# target; QEMU and its firmware are the rig's, not the image's.
 #
 # Build: tools/firmware.sh qemu-uefi-arm64
 

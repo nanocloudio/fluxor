@@ -202,10 +202,12 @@ fn generate_config_impl(
         .get("workloads")
         .and_then(|p| p.as_array())
         .map(|workloads| {
-            workloads.iter()
+            workloads
+                .iter()
                 .enumerate()
                 .flat_map(|(pi, workload)| {
-                    workload.get("modules")
+                    workload
+                        .get("modules")
                         .and_then(|m| m.as_array())
                         .cloned()
                         .unwrap_or_default()
@@ -434,11 +436,9 @@ fn generate_config_impl(
             if let Some(manifest) = manifests.get(name) {
                 // Placement: the module's signed runtime mask must name this
                 // runtime.
-                if let Some(why) = crate::runtime_abi::placement_refusal(
-                    name,
-                    manifest.hardware_targets,
-                    runtime,
-                ) {
+                if let Some(why) =
+                    crate::runtime_abi::placement_refusal(name, manifest.hardware_targets, runtime)
+                {
                     return Err(Error::Config(format!("modules[{i}] ({name}): {why}")));
                 }
                 if let Err(e) =
@@ -560,6 +560,7 @@ fn generate_config_impl(
             )));
         }
     }
+    validate_exchange_placement(config, &edges, &module_names, &manifests, &remote_manifests)?;
     let mut continuity_names = module_names.clone();
     continuity_names.extend(remote_member_names(config));
     let mut continuity_manifests = manifests.clone();
@@ -648,8 +649,7 @@ fn generate_config_impl(
     // tick_us(2), graph_sample_rate(4). The high bytes ride the module
     // section header and the graph section header.
     result.push((module_entries.len() & 0xFF) as u8); // module_count
-    // edge_count LOW byte; the high byte rides graph-section byte 2.
-    result.push((edges.len() & 0xFF) as u8); // edge_count
+    result.push((edges.len() & 0xFF) as u8); // edge_count (high byte: graph-section byte 2)
     result.extend_from_slice(&tick_us.to_le_bytes()); // tick_us (u16, bytes 10-11)
     result.extend_from_slice(&graph_sample_rate.to_le_bytes()); // graph_sample_rate (u32, bytes 12-15)
 
@@ -741,9 +741,9 @@ fn generate_config_impl(
             })
             .collect()
     };
-    // Resolve per-edge `buffer_bytes` overrides from wiring entries.
-    // Parallel array; entries default to 0 ("use module hints").
-    let edge_buffer_bytes = resolve_edge_buffer_bytes(config);
+    // Per-edge `buffer_bytes` from the wiring entries, a parallel array;
+    // 0 sizes the ring by the port capacities.
+    let edge_buffer_bytes = resolve_edge_buffer_bytes(config)?;
 
     // Per-edge wake-on-write (`wake: true`):
     // channel_write on the flagged edge latches the consumer's
@@ -870,7 +870,7 @@ fn generate_config_impl(
         // Adaptive-tick per-domain config, all optional.
         // 0 ⇒ adaptive off / "use tick_us" (the kernel parser default-fills
         // tick_min/tick_max to the domain's tick), so a domain that sets none
-        // of these is byte-identical in behaviour to today's fixed tick.
+        // of these behaves exactly as a fixed tick at `tick_us`.
         let flags = dom
             .and_then(|x| x.get("adaptive_flags"))
             .and_then(|v| v.as_u64())
@@ -971,6 +971,17 @@ fn build_capacity_envelope(config: &Value, resolved_target: Option<&str>) -> Res
                 known.join(", ")
             )));
         };
+        if name == "config_arena" {
+            // Observed, never allocated: the kernel borrows module params from
+            // the config blob in place and reports them against the blob's
+            // length, so an envelope entry would bound nothing.
+            return Err(Error::Config(
+                "capacity: 'config_arena' cannot be sized: module params are borrowed from \
+                 the config blob in place, so the pool holds no allocation an envelope could \
+                 bound"
+                    .into(),
+            ));
+        }
         let n = val.as_u64().filter(|&n| n > 0).ok_or_else(|| {
             Error::Config(format!("capacity: '{name}' must be a positive integer"))
         })?;
@@ -1085,7 +1096,9 @@ pub fn build_workloads(
                 .and_then(|v| v.as_str())
                 .or_else(|| m.get("type").and_then(|v| v.as_str()))
                 .ok_or_else(|| {
-                    Error::Config(format!("workload {pi} module {li}: needs a `name` or `type`"))
+                    Error::Config(format!(
+                        "workload {pi} module {li}: needs a `name` or `type`"
+                    ))
                 })?;
             let mtype = m.get("type").and_then(|v| v.as_str()).unwrap_or(mname);
             // PIC-only: the FLXA workload codec admits modules via the loader by
@@ -1146,23 +1159,22 @@ pub fn build_workloads(
             // reads them via `params_ptr` exactly the same way.
             let param_schema = schema::load_schema_for_module(mtype, loc)?;
             refuse_workload_node_keys(m, param_schema.as_ref(), pi, mname)?;
-            let params =
-                if let Some(param_schema) = param_schema {
-                    let mut buf = vec![0u8; MAX_MODULE_PARAMS_SIZE];
-                    let plen = schema::build_params_from_schema(
-                        m,
-                        &param_schema,
-                        &mut buf,
-                        0,
-                        data_section,
-                        mtype,
-                    )
-                    .map_err(Error::Config)?;
-                    buf.truncate(plen);
-                    buf
-                } else {
-                    Vec::new()
-                };
+            let params = if let Some(param_schema) = param_schema {
+                let mut buf = vec![0u8; MAX_MODULE_PARAMS_SIZE];
+                let plen = schema::build_params_from_schema(
+                    m,
+                    &param_schema,
+                    &mut buf,
+                    0,
+                    data_section,
+                    mtype,
+                )
+                .map_err(Error::Config)?;
+                buf.truncate(plen);
+                buf
+            } else {
+                Vec::new()
+            };
             // The heap flags act on the module's own heap: a workload module
             // takes them as a base-graph module does, in its params TLV.
             let params = insert_workload_heap_tags(params, m, mname)?;
@@ -1178,11 +1190,8 @@ pub fn build_workloads(
             // TLV: the kernel takes a live-added module's deadline and fault
             // policy from the record alone, and refuses one outside what it
             // admits a workload — refused here first, with the reason.
-            let budget = workload_step_budget(
-                m,
-                config,
-                &format!("workload {pi} module '{mname}'"),
-            )?;
+            let budget =
+                workload_step_budget(m, config, &format!("workload {pi} module '{mname}'"))?;
             modules.push(crate::add_subgraph::WorkloadModule {
                 name_hash,
                 domain_id,
@@ -1246,8 +1255,8 @@ pub fn build_workloads(
                 if from_dom != to_dom {
                     return Err(Error::Config(format!(
                         "workload {pi} wiring {ei}: cross-domain edge (domain {from_dom} → {to_dom}) is \
-                         not supported — a cross-domain edge needs the SPSC bridge that workload \
-                         admission does not yet provision (notably on bcm2712). Keep workload modules \
+                         not supported — a cross-domain edge needs an SPSC bridge, and workload \
+                         admission provisions none (notably on bcm2712). Keep workload modules \
                          that are wired together in the same domain."
                     )));
                 }
@@ -1361,7 +1370,9 @@ fn insert_workload_heap_tags(params: Vec<u8>, module: &Value, mname: &str) -> Re
     }
     let len = u16::from_le_bytes([params[2], params[3]]) as usize + entries.len();
     let len = u16::try_from(len).map_err(|_| {
-        Error::Config(format!("workload module '{mname}': params exceed the TLV length"))
+        Error::Config(format!(
+            "workload module '{mname}': params exceed the TLV length"
+        ))
     })?;
     params.splice(pos..pos, entries);
     params[2..4].copy_from_slice(&len.to_le_bytes());
@@ -1386,8 +1397,10 @@ fn refuse_workload_node_keys(
             continue;
         }
         let why = match *key {
-            "voices" => "voice presets are packed under params tag 0xFD, the device-window tag, \
-                         which a node refuses in a workload",
+            "voices" => {
+                "voice presets are packed under params tag 0xFD, the device-window tag, \
+                         which a node refuses in a workload"
+            }
             "max_restarts" | "restart_backoff_ms" => {
                 "a workload module's fault policy is skip or tolerate, and neither restarts"
             }
@@ -1817,7 +1830,11 @@ mod buffer_group_tests {
             caps("sink", false),
             caps("monitor", false),
         ];
-        let edges = [(1u16, 3u16, 1u8, 1u8, 0u8), (0, 1, 0, 0, 0), (1, 2, 0, 0, 0)];
+        let edges = [
+            (1u16, 3u16, 1u8, 1u8, 0u8),
+            (0, 1, 0, 0, 0),
+            (1, 2, 0, 0, 0),
+        ];
         let groups = assign_buffer_groups(&edges, &names, &caps).unwrap();
         assert_eq!(groups, vec![0, 1, 1]);
     }
@@ -1832,7 +1849,11 @@ mod buffer_group_tests {
             caps("a", false),
             caps("b", false),
         ];
-        let edges = [(0u16, 1u16, 0u8, 0u8, 0u8), (1, 2, 0, 0, 0), (1, 3, 0, 1, 0)];
+        let edges = [
+            (0u16, 1u16, 0u8, 0u8, 0u8),
+            (1, 2, 0, 0, 0),
+            (1, 3, 0, 1, 0),
+        ];
         let groups = assign_buffer_groups(&edges, &names, &caps).unwrap();
         assert_eq!(groups, vec![0, 0, 0]);
     }

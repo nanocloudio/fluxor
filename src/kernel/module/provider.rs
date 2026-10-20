@@ -342,8 +342,7 @@ fn track_handle(handle: i32, contract: ContractId) -> Result<(), ()> {
 /// by a different, non-system owner. Self-identifying FDs (event/timer/dma)
 /// are skipped: they carry no tracking entry and the event/timer subsystems
 /// enforce their own per-module ownership. Compile-time `false` (allow) on
-/// single-tenant builds, and inert on multi-tenant builds until the node agent
-/// stamps per-workload owners (every module is the system owner until then).
+/// single-tenant builds.
 #[cfg(feature = "multitenant")]
 fn deny_cross_owner_handle(handle: i32, syscall: &str) -> bool {
     if handle < 0 {
@@ -547,13 +546,14 @@ pub fn provider_open(
     }
     // Admission gate: opening a provider handle admits new work, which is
     // refused for a Draining owner. Handles it already holds keep working (`authorize_use`
-    // semantics) so in-flight work can run dry. System-owned modules are
-    // unaffected.
+    // semantics) so in-flight work can run dry, and an owner being added
+    // opens for its modules' `module_new` (`authorize_own_admit`).
+    // System-owned modules are unaffected.
     #[cfg(feature = "multitenant")]
     {
         let owner = crate::kernel::exec::scheduler::caller_owner();
         if !owner.is_system()
-            && !crate::kernel::exec::scheduler::owners_mut().authorize_admit(owner)
+            && !crate::kernel::exec::scheduler::owners_mut().authorize_own_admit(owner)
         {
             log::warn!(
                 "[provider] open refused: owner slot {} draining/revoked",
@@ -1540,8 +1540,7 @@ fn default_layer_index(entry: &ProviderEntry) -> Option<usize> {
 #[inline]
 fn layer_visible(layer: &ProviderLayer) -> bool {
     use crate::kernel::exec::scheduler;
-    let caller = scheduler::caller_owner();
-    layer.owner == caller || layer.owner == scheduler::owners().authority_of(caller)
+    layer.owner == scheduler::caller_owner() || layer.owner == scheduler::caller_authority()
 }
 
 /// The node's own default layer of `contract`: the top-most unkeyed layer a

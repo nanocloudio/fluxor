@@ -14,7 +14,8 @@ use crate::error::{Error, Result};
 /// Rig surfaces. Three kinds:
 ///   - actuation / transport: power, deploy, console, telemetry
 ///   - evaluation:            observe
-///   - coordination:          rig (rig.claim / rig.release / rig.lock)
+///   - coordination:          rig (rig.claim / rig.release / rig.lock),
+///     which the harness provides to every board
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Surface {
     Power,
@@ -94,25 +95,24 @@ impl Surface {
                 // The protocol-agnostic load probe, beside
                 // `observe.https_load`. The backend picks the protocol
                 // (h1 / h2c / ws / grpc, plaintext or TLS) from its
-                // profile binding, so a scenario can assert on
-                // any protocol a project owns without this vocabulary growing a
-                // name per protocol. The probe itself lives with whoever owns
-                // the protocols — Wave ships `observe-proto_load` — because a
-                // backend is just an executable on the discovery path.
+                // profile binding, so a scenario can assert on any protocol
+                // a project owns without this vocabulary growing a name per
+                // protocol. The probe lives with whoever owns the
+                // protocols: a backend is an executable on the discovery
+                // path.
                 "observe.proto_load",
-                // The TRANSPORT probe, as distinct from `proto_load`'s
+                // The transport probe, as distinct from `proto_load`'s
                 // protocol probes. Every protocol arrives through a stack
                 // that includes somebody else's module, so when a protocol
                 // scenario fails its output cannot say whether the fault is
                 // in the transport or above it. This one carries no
                 // protocol at all — it drives QUIC streams against a
                 // `mux_echo` and asserts only what a transport owes its
-                // application. Fluxor ships `observe-quic_mux`, because
-                // Fluxor owns the transport.
+                // application.
                 "observe.quic_mux",
-                // The tls anchor's own probe: TLS 1.3 handshakes and an echo
-                // above them, nothing else, so an RSA identity is measured as
-                // the handshake it changes. Fluxor ships `observe-tls_load`.
+                // TLS 1.3 handshakes and an echo above them, nothing else,
+                // so a change of identity (an RSA key) is measured as the
+                // handshake it changes.
                 "observe.tls_load",
                 // A packet capture delivered into `run_dir/network/`. Who
                 // captures (a bench host, the emulator's own tap) is the
@@ -185,7 +185,7 @@ pub const ARTIFACT_CLASSES: &[&str] = &[
     "uf2",
     "kernel8_img",
     "boot_bundle",
-    // A GPT disk image with one FAT ESP: the UEFI stub and the packed
+    // A GPT disk image with one FAT ESP: the UEFI loader and the packed
     // kernel image. What a cloud or an emulator boots.
     "uefi_disk",
     // A small FAT disk image carrying a hosted runtime, its config and

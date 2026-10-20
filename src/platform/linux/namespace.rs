@@ -42,14 +42,36 @@ const NS_MAX_PATH: usize = dev_ns::PATH_MAX;
 struct LinuxNsSlot {
     in_use: bool,
     path: String,
+    /// The owner that bound the handle: the node, or an owner acting with
+    /// the node's authority. The slot answers it alone and goes with it.
+    opener: fluxor::kernel::workload::owner::OwnerHandle,
 }
 
 const NS_EMPTY: LinuxNsSlot = LinuxNsSlot {
     in_use: false,
     path: String::new(),
+    opener: fluxor::kernel::workload::owner::OWNER_SYSTEM,
 };
 
 static mut LINUX_NS_SLOTS: [LinuxNsSlot; NS_MAX_OPEN] = [NS_EMPTY; NS_MAX_OPEN];
+
+/// Whether `slot` is bound and the caller's: its opener alone reaches it.
+fn ns_owned(slot: &LinuxNsSlot) -> bool {
+    slot.in_use && slot.opener == fluxor::kernel::exec::scheduler::caller_owner()
+}
+
+/// Free every handle `opener` bound. Part of the platform's owner-release
+/// hook, for an owner that acted with the node's authority: what it opened
+/// goes with it.
+///
+/// # Safety
+/// Single-threaded platform dispatch only.
+unsafe fn ns_release_opener(opener: fluxor::kernel::workload::owner::OwnerHandle) {
+    let slots = &mut *core::ptr::addr_of_mut!(LINUX_NS_SLOTS);
+    for s in slots.iter_mut().filter(|s| s.in_use && s.opener == opener) {
+        *s = NS_EMPTY;
+    }
+}
 
 /// FNV-1a 64-bit, for synthesising a stable etag from a path. A real
 /// content hash would be sturdier, but path+size+mtime is enough for the
@@ -169,7 +191,7 @@ unsafe fn ns_list(arg: *mut u8, arg_len: usize) -> i32 {
 unsafe fn ns_stat(raw: i32, out_ptr: *mut u8, out_cap: usize) -> i32 {
     let idx = raw as usize;
     let slots = &*core::ptr::addr_of!(LINUX_NS_SLOTS);
-    if idx >= NS_MAX_OPEN || !slots[idx].in_use {
+    if idx >= NS_MAX_OPEN || !ns_owned(&slots[idx]) {
         return errno::EINVAL;
     }
     if out_ptr.is_null() || out_cap < 8 + 8 + 1 + 1 {
@@ -238,6 +260,7 @@ unsafe fn ns_lookup(path_ptr: *mut u8, path_len: usize) -> i32 {
     };
     slots[idx].path = path;
     slots[idx].in_use = true;
+    slots[idx].opener = fluxor::kernel::exec::scheduler::caller_owner();
     tag_fd(FD_TAG_STORAGE_NAMESPACE, idx as i32)
 }
 
@@ -245,11 +268,10 @@ unsafe fn ns_lookup(path_ptr: *mut u8, path_len: usize) -> i32 {
 unsafe fn ns_close(raw: i32) -> i32 {
     let idx = raw as usize;
     let slots = &mut *core::ptr::addr_of_mut!(LINUX_NS_SLOTS);
-    if idx >= NS_MAX_OPEN || !slots[idx].in_use {
+    if idx >= NS_MAX_OPEN || !ns_owned(&slots[idx]) {
         return errno::EINVAL;
     }
-    slots[idx].in_use = false;
-    slots[idx].path = String::new();
+    slots[idx] = NS_EMPTY;
     errno::OK
 }
 
@@ -285,7 +307,7 @@ unsafe fn linux_namespace_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
         }
         let idx = raw as usize;
         let slots = &*core::ptr::addr_of!(LINUX_NS_SLOTS);
-        if idx >= NS_MAX_OPEN || !slots[idx].in_use {
+        if idx >= NS_MAX_OPEN || !ns_owned(&slots[idx]) {
             return errno::ENOSYS;
         }
         let buf = core::slice::from_raw_parts_mut(arg, arg_len);

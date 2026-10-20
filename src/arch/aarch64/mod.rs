@@ -4,13 +4,14 @@
 //! identity map, and EL0 module isolation.
 //!
 //! Nothing here knows which machine it runs on. The facts that differ
-//! between a Pi 5, a QEMU `virt` machine and a UEFI instance — where the
-//! GIC is, which PPI the timer raises, physical or virtual counter, where
-//! a fault dump may be written, which MPIDR field numbers the cores — are
-//! values the platform supplies at boot through each module's `configure`
-//! and `set_*` functions, before the first interrupt can be taken. A
-//! platform that learns them from firmware tables passes what it read; one
-//! that knows them at build time passes constants.
+//! between machines — a Pi 5 and a QEMU `virt` machine, the two boards
+//! `platform/bcm2712.rs` configures it for — are where the GIC is, which
+//! PPI the timer raises, physical or virtual counter, `smc` or `hvc` to
+//! PSCI, which MPIDR field numbers the cores, what each gigabyte of the
+//! identity map holds and where a fault dump may be written. The platform
+//! supplies them at boot through each module's `configure` and `set_*`
+//! functions, before the first interrupt can be taken; `bcm2712.rs` passes
+//! per-board constants.
 
 pub mod boot_mmu;
 pub mod cpu;

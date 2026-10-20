@@ -708,21 +708,25 @@ fn edge_framed_type(
 
 /// Per-edge capacity + rate-class validation.
 ///
-/// Static mirror of the runtime `open_channels` enforcement, using
-/// the manifests' static port capacities: for every FIFO edge, model
-/// the ring the kernel will grant and check
+/// The runtime `open_channels` enforcement over each wiring entry as
+/// written, by the kernel's ring rule (`ring_plan`, which mounts
+/// `src/kernel/ipc/ring_size.rs`) and the manifests' port capacities: for
+/// every FIFO edge, take the ring the kernel grants and check
 ///   1. producer `max_record` fits it (wedge exclusion — an
 ///      all-or-nothing write larger than the ring can never succeed);
-///   2. no request exceeds the 2 MiB channel ceiling;
+///   2. no request exceeds the 4 MiB channel ceiling;
 ///   3. the edge's rate class is satisfiable on this profile at all;
 ///   4. class floor ≤ ring × nominal tick rate (a necessary-condition
 ///      screen for order-of-magnitude misprovisioning, NOT a proof of
-///      sufficiency — module step logic is P3's business).
+///      sufficiency — that is the module's step logic).
+///
+/// The rings of the graph as the kernel prepares it, with its tees, merges
+/// and mailbox groups, are summed and checked again by `ring_demand`.
 ///
 /// Edge class = per-edge `rate:` override, else the consumer port's
 /// content-type default (`CONTENT_RATE_CLASS`), else the producer's.
-/// Grouped (mailbox) edges are skipped — their capacity story is the
-/// buffer-group max, validated by the runtime group pass.
+/// Grouped (mailbox) edges are skipped here: a group's ring is its largest
+/// member's request, which `ring_demand` checks over the prepared graph.
 fn validate_wiring_capacity(
     config: &Value,
     edges: &[(u16, u16, u8, u8, u8)],
@@ -733,10 +737,6 @@ fn validate_wiring_capacity(
     embedded_profile: bool,
 ) -> Result<()> {
     use fluxor_contracts::{rate_class_floor, RateClass};
-
-    const MIN_CHAN_BYTES: u32 = 64;
-    const MAX_CHAN_BYTES: u32 = 4 * 1024 * 1024;
-    const DEFAULT_RING: u32 = 8192; // kernel default (abi CHANNEL_BUFFER_SIZE)
 
     let tick_us = config
         .get("tick_us")
@@ -758,13 +758,12 @@ fn validate_wiring_capacity(
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
         if buffer_group != 0 {
-            continue; // mailbox/group-max semantics — runtime validates
+            continue; // sized at its group's largest; `ring_demand` checks it
         }
         debug_assert!(
             edge_framed_type(&edges[i], module_names, manifests).is_none(),
             "every framed edge is grouped before capacity is checked"
         );
-
 
         let buffer_bytes = entry
             .and_then(|e| e.get("buffer_bytes"))
@@ -832,24 +831,20 @@ fn validate_wiring_capacity(
             })
         };
 
-        // Model the runtime grant (mirror of open_channels).
+        // The runtime grant, by the kernel's rule.
         let prod_size = from_port.map(|p| p.buffer_size).unwrap_or(0);
         let cons_size = to_port_spec.map(|p| p.buffer_size).unwrap_or(0);
-        let request = prod_size.max(cons_size).max(buffer_bytes);
+        let request = crate::ring_plan::edge_request(prod_size, cons_size, buffer_bytes);
         // (2) ceiling.
-        if request > MAX_CHAN_BYTES {
+        let Some(granted) = crate::ring_plan::ring_for(request) else {
             return Err(Error::Config(format!(
                 "wiring[{i}] ({} → {}): requested buffer {} exceeds the channel \
                  ceiling {} — lower the request or split the stream.",
-                from_specs[i], to_specs[i], request, MAX_CHAN_BYTES
+                from_specs[i],
+                to_specs[i],
+                request,
+                crate::ring_plan::MAX_RING_BYTES
             )));
-        }
-        let granted = if request == 0 {
-            DEFAULT_RING
-        } else {
-            request
-                .clamp(MIN_CHAN_BYTES, MAX_CHAN_BYTES)
-                .next_power_of_two()
         };
 
         // (1) wedge exclusion.
@@ -975,9 +970,9 @@ const MIGRATION_MECHANISMS: &[&str] = &["native_primitive", "platform_replicated
 const AEAD_CLASSES: &[&str] = &["on_wire_sequence", "implicit_counter", "unencrypted"];
 
 /// Capabilities every platform-replicated-state `transport_migratable`
-/// declaration must resolve somewhere in the graph (§9.2 / §13.7.6
-/// R1–R5 as structure). Presence, not fault-correctness — R-invariants
-/// are proven by test, the timing budget by measurement.
+/// declaration must resolve somewhere in the graph. Presence, not
+/// fault-correctness: the replication invariants are proven by test, the
+/// timing budget by measurement.
 const PRS_REQUIRED_CAPS: &[&str] = &[
     "session.reservation",
     "security.key_wrap",

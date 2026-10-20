@@ -118,12 +118,30 @@ const ATTR_IDX_DEVICE: u64 = 1;
 const ATTR_IDX_NORMAL_NC: u64 = 2;
 
 /// The ASID a module's translations are tagged with: its index + 1, so
-/// ASID 0 stays the kernel's. 16-bit ASIDs (`TCR_EL1.AS`) hold every
-/// index the module ceiling allows, so no two modules share one.
+/// ASID 0 stays the kernel's and no two modules share one. 16-bit ASIDs
+/// (`TCR_EL1.AS`) hold every index the module ceiling allows; on a part
+/// with 8-bit ASIDs, `build_table` refuses an index whose ASID does not fit.
 const fn module_asid(module_idx: usize) -> u64 {
     module_idx as u64 + 1
 }
 const _: () = assert!(module_asid(MAX_MODULES - 1) <= 0xFFFF);
+
+/// The largest ASID the part implements: `ID_AA64MMFR0_EL1.ASIDBits`
+/// [7:4] is `0b0010` for 16 bits, `0b0000` for 8 (where `TCR_EL1.AS` is
+/// RES0 and the upper ASID bits are ignored, so two modules whose indices
+/// differ only above bit 7 would share TLB entries).
+fn max_asid() -> u64 {
+    let mmfr0: u64;
+    // SAFETY: reading an ID register is side-effect free.
+    unsafe {
+        core::arch::asm!("mrs {}, id_aa64mmfr0_el1", out(reg) mmfr0, options(nomem, nostack))
+    };
+    if (mmfr0 >> 4) & 0xF == 0b0010 {
+        0xFFFF
+    } else {
+        0xFF
+    }
+}
 
 // ========================================================================
 // Page table storage
@@ -276,24 +294,13 @@ pub fn set_enabled(enabled: bool) {
 // EL1/EL0 transitions
 // ========================================================================
 
-/// Enter EL0 to execute module_step, return to EL1 via SVC.
-///
-/// Routes to the real EL0 walking-skeleton transition (`el0::enter`)
-/// when isolation is enabled AND the current module has a built
-/// isolated page table. Otherwise falls through to a direct EL1
-/// call for non-isolated modules.
-///
-/// The current module index is resolved from the scheduler — the
-/// caller (`DynamicModule::step`) runs inside `m.step()` where
-/// `set_current_module(idx)` has already been called.
-///
-/// # Safety
-/// The result of a protected call that could not be made: a fault, so the
-/// scheduler applies the module's policy. The module never runs at EL1.
+/// The result of a protected call that could not be made (`-EFAULT`): a
+/// fault, so the scheduler applies the module's policy. The module never
+/// runs at EL1.
 const EL0_FAIL_CLOSED: i32 = -14;
 
 // ========================================================================
-// L3 page table support for 4KB demand paging
+// Paged arenas: per-module L3 tables mapped page by page by the pager
 // ========================================================================
 
 /// L3 page table (512 entries, each maps a 4KB page).
@@ -441,37 +448,39 @@ pub fn unmap_4k_page_impl(module_idx: usize, vaddr: u64) {
 }
 
 // ========================================================================
-// EL0 module-isolation walking skeleton
+// EL0 isolation
 // ========================================================================
 //
-// This module turns the dormant page-table machinery above into a real
-// EL1→EL0→EL1 round-trip for modules declared `protection: isolated`.
-//
-// Mechanism (setjmp/longjmp-style coroutine across an exception):
-//   * `enter`   — save kernel callee-saved regs + SP + LR + live
-//                 TTBR0 + DAIF into the per-core control block, install
-//                 the module's TTBR0/ASID, set ELR_EL1=module_step,
-//                 SPSR_EL1=EL0t (DAIF masked), SP_EL0=bounded module
-//                 stack, x0=state, LR=svc trampoline, then `ERET`.
-//   * EL0       — `module_step(state)` runs unprivileged under the
-//                 module's page table. On return it branches to the
-//                 trampoline page which executes `SVC #0`.
-//   * vector    — the lower-EL AArch64 synchronous vector
-//                 (`exception.rs`) branches to `fluxor_el0_lower_sync_vec`
-//                 below, which decodes ESR_EL1.EC: `SVC #0` carries the
-//                 module's i32 StepOutcome in x0; a data/instruction
-//                 abort records ESR/FAR/ELR and yields EFAULT. Either
-//                 way it `b fluxor_el0_resume`.
-//   * `resume`  — restore the kernel TTBR0/DAIF/SP/regs and `RET` to the
-//                 saved kernel LR, so `enter` "returns" the outcome.
-//                 We do NOT `eret` back to EL0 on a fault, so an illegal
-//                 access becomes a one-shot module fault, never a
-//                 re-faulting core spin.
+// An EL1 → EL0 → EL1 round trip per call into a module declared
+// `protection: isolated`, as a setjmp/longjmp-style coroutine across an
+// exception:
+//   * `enter`   — save the kernel's callee-saved registers, SP, LR, TTBR0
+//                 and DAIF into the per-core control block, mask IRQ/FIQ
+//                 at EL1, install the module's TTBR0/ASID, set ELR_EL1 =
+//                 the entry point,
+//                 SPSR_EL1 = EL0t with IRQs unmasked (D, A, F masked),
+//                 SP_EL0 = the module's guarded stack, x0–x7 = the
+//                 arguments, LR = the trampoline's return veneer, scrub
+//                 every other register, then `eret`.
+//   * EL0       — the entry point runs unprivileged under the module's
+//                 page table and returns into the return veneer, which
+//                 executes `svc #RETURN`.
+//   * vector    — the lower-EL synchronous vector (`exception.rs`)
+//                 branches to `fluxor_el0_lower_sync_vec` below, which
+//                 decodes ESR_EL1.EC: an SVC from its own veneer is a
+//                 gateway op or the return carrying the result in x0; any
+//                 other SVC, or a data/instruction abort, records
+//                 ESR/FAR/ELR and ends the call as a fault.
+//   * `resume`  — restore the kernel's TTBR0/DAIF/SP/registers and `ret`
+//                 to the saved kernel LR, so `enter` "returns" the
+//                 outcome. A fault never `eret`s back to EL0, so an
+//                 illegal access is a one-shot module fault, never a
+//                 re-faulting core.
 //
 // Liveness: EL0 runs with IRQs unmasked. A lower-EL IRQ is served under
-// the kernel's own table and, if the module has run past its step
-// deadline, forces it out through `resume` — a runaway EL0 loop costs its
-// deadline, not its core.
+// the kernel's own table and, if the module has run past its deadline,
+// forces it out through `resume` — a runaway EL0 loop costs its deadline,
+// not its core.
 //
 // The kernel is reached only through the trampoline page's veneers: each
 // is `svc #op; ret`, and the gateway `SyscallTable` handed to the module
@@ -484,10 +493,12 @@ pub mod el0 {
         AP_EL1_RW, ATTR_IDX_DEVICE, ATTR_IDX_NORMAL, DESC_TABLE, DESC_VALID, L1_BLOCK_SIZE,
         L2_BLOCK_SIZE, MODULE_REGION_INFO, TABLE_ENTRIES,
     };
+    use crate::arch::aarch64::exception::MAX_CORES;
+    use crate::arch::aarch64::{cpu, timer};
     use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     // `DEVICE_RANGES`: the blocks a device window may be granted in,
-    // generated from `targets/silicon/bcm2712.toml` `[isolation]`.
+    // generated at build time from the silicon's `[isolation]` section.
     include!(concat!(env!("OUT_DIR"), "/isolation_generated.rs"));
 
     /// Max modules isolated at once: the static L1/L2/L3 + stack slabs.
@@ -495,8 +506,6 @@ pub mod el0 {
     /// this; a module that finds no free slot is refused at load, never
     /// run privileged instead.
     pub const MAX_ISO: usize = 2;
-    /// Cores supported (matches scheduler MAX_DOMAINS / Pi 5 quad-core).
-    const MAX_CORES: usize = 4;
     /// L3 tables per isolated module. Each maps one 2 MB window at 4 KB
     /// granularity; one per distinct 2 MB-aligned window the module's
     /// regions (code, state, heap, stack, trampoline) and the kernel
@@ -524,8 +533,7 @@ pub mod el0 {
     /// 4 KB-aligned. Page 0 is left unmapped as the guard page; the stack
     /// occupies the pages immediately above it. Mapped at 4 KB granularity
     /// (`map_4k` carves it out of the kernel base), so it needs only page
-    /// alignment; a 2 MB-aligned 2 MB slab would bloat firmware BSS by ~6 MB
-    /// (2 slabs × 2 MB + 2 MB-alignment padding) for no benefit.
+    /// alignment.
     const STACK_SLAB_BYTES: usize = 4096 + super::ISOLATED_STACK_BYTES; // guard page + stack
 
     // ---- Per-core EL0 control block ------------------------------------
@@ -573,7 +581,7 @@ pub mod el0 {
         gate_spsr: u64,      // 304   which IRQs taken during it overwrite)
         gate_x18: u64,       // 312  (the module's x18/x30 across a gateway op)
         gate_x30: u64,       // 320
-        deadline: u64,       // 328  (CNTPCT at which the entry is forced out; 0 = none)
+        deadline: u64,       // 328  (counter value at which the entry is forced out; 0 = none)
         _pad: [u8; 48],      // 336 → 384
     }
 
@@ -604,8 +612,7 @@ pub mod el0 {
         assert!(core::mem::offset_of!(El0ControlBlock, deadline) == 328);
     };
 
-    /// Bytes of each core's fault stack; the fail-stop path's
-    /// `lsl #13` in `fluxor_el1_catch` is this.
+    /// Bytes of each core's fault stack (`fluxor_el1_catch`).
     const EL1_FAULT_STACK_BYTES: usize = 8192;
 
     /// The stack the fail-stop EL1 fault path dumps on, one per core, so a
@@ -678,7 +685,7 @@ pub mod el0 {
     /// 1 GB (L1) index.
     static mut ISO_L2: [[IsoL2; KERNEL_BASE_GB_MAX]; MAX_ISO] = {
         const E: IsoL2 = IsoL2([0; TABLE_ENTRIES]);
-        const M: [IsoL2; KERNEL_BASE_GB_MAX] = [E, E, E];
+        const M: [IsoL2; KERNEL_BASE_GB_MAX] = [E; KERNEL_BASE_GB_MAX];
         [M; MAX_ISO]
     };
     /// One L2 per module for the gigabyte its device window lies in, and
@@ -698,7 +705,7 @@ pub mod el0 {
     static mut ISO_L3_USED: [usize; MAX_ISO] = [0; MAX_ISO];
     static mut ISO_L3_KEY: [[u32; MAX_L3]; MAX_ISO] = [[0; MAX_L3]; MAX_ISO];
 
-    /// EL0 stack slabs (2 MB-aligned). Page 0 = guard (unmapped).
+    /// EL0 stack slabs, page-aligned. Page 0 = guard (unmapped).
     #[repr(C, align(4096))]
     struct StackSlab([u8; STACK_SLAB_BYTES]);
     static mut ISO_STACKS: [StackSlab; MAX_ISO] = {
@@ -748,16 +755,17 @@ pub mod el0 {
     static mut ISO_BUILT: [bool; MAX_ISO] = [false; MAX_ISO];
     /// SP_EL0 top for each isolated slot (computed in `build_table`).
     static mut ISO_SP_TOP: [u64; MAX_ISO] = [0; MAX_ISO];
-    /// Per-slot clean-step counter. The first clean EL0 round-trip and then
-    /// every `EL0_OK_LOG_EVERY` steps logs a confirmation line (observable
-    /// proof of EL0 execution + clean SVC return). Recurring (not one-shot)
-    /// so the line is observable in a telemetry stream that only starts once
-    /// the module is networking, well after its first step.
+    /// Per-slot clean-call counter. The first `EL0_OK_LOG_FIRST` clean EL0
+    /// round trips, then every `EL0_OK_LOG_EVERY`th, log a confirmation
+    /// line (proof of EL0 execution and a clean SVC return). Recurring, not
+    /// one-shot, so the line also reaches a log stream that only starts once
+    /// the module is networking, well after its first call.
     static mut ISO_OK_COUNT: [u32; MAX_ISO] = [0; MAX_ISO];
-    /// Log the EL0 clean-step confirmation on step 0 and every N thereafter.
-    /// Kept small so even an infrequently-scheduled isolated module (a
-    /// pure-compute source with no I/O steps far less than once per tick)
-    /// emits one within a reasonable window.
+    /// Clean calls logged unconditionally from a slot's first.
+    const EL0_OK_LOG_FIRST: u32 = 64;
+    /// The confirmation period after the first `EL0_OK_LOG_FIRST`. Small
+    /// enough that a rarely scheduled isolated module still logs one within
+    /// a reasonable window.
     const EL0_OK_LOG_EVERY: u32 = 256;
 
     #[inline]
@@ -809,15 +817,12 @@ pub mod el0 {
             for owner in ISO_SLOT_OWNER.iter() {
                 owner.store(usize::MAX, Ordering::Relaxed);
             }
-            // Flush all stage-1 EL1&0 translations (inner-shareable) before
-            // the graph rebuilds. ASIDs are derived deterministically from
-            // the module index (`module_idx + 1`), so a reconfigure that
-            // re-uses an index would otherwise inherit the PREVIOUS graph's
-            // EL0 mappings for that ASID out of the TLB — stale, and a
-            // cross-graph information leak. The module-page descriptors are
-            // `nG` (ASID-tagged), so without this invalidate a `switch` to a
-            // recycled ASID can hit a retained entry. Cores are parked during
-            // reconfigure, so a one-shot broadcast invalidate is sufficient.
+            // Invalidate every stage-1 EL1&0 translation, inner-shareable,
+            // before the graph rebuilds. A module's ASID is its index + 1,
+            // so a graph that reuses an index would otherwise find the
+            // previous graph's EL0 entries for that ASID in the TLB — stale,
+            // and a cross-graph information leak. Cores are parked during a
+            // reconfigure, so one broadcast invalidate suffices.
             core::arch::asm!(
                 "dsb ishst",
                 "tlbi vmalle1is",
@@ -831,7 +836,8 @@ pub mod el0 {
     /// One-time publish of the trampoline page: fill in the gateway
     /// `SyscallTable` (the veneers' absolute addresses are known only at
     /// run time), then clean the D-cache and invalidate the I-cache over
-    /// the veneers so EL0 fetches the instructions written as data.
+    /// the veneers to the point of unification, so EL0 fetches the
+    /// instructions the image carried as data.
     unsafe fn ensure_trampoline() {
         if TRAMP_READY.swap(true, Ordering::AcqRel) {
             return;
@@ -902,6 +908,13 @@ pub mod el0 {
             (base + GATEWAY_TABLE_OFFSET) as *mut crate::abi::SyscallTable,
             table,
         );
+        // Step by the smallest cache line either cache has (CTR_EL0
+        // DminLine [19:16], IminLine [3:0], log2 of words).
+        let ctr: u64;
+        core::arch::asm!("mrs {}, ctr_el0", out(reg) ctr, options(nomem, nostack));
+        let dline = 4usize << ((ctr >> 16) & 0xF);
+        let iline = 4usize << (ctr & 0xF);
+        let stride = dline.min(iline);
         let mut line = base;
         while line < base + GATEWAY_TABLE_OFFSET {
             core::arch::asm!(
@@ -911,7 +924,7 @@ pub mod el0 {
                 p = in(reg) line,
                 options(nostack, preserves_flags),
             );
-            line += 64;
+            line += stride;
         }
         core::arch::asm!("dsb ish", "isb", options(nostack, preserves_flags));
     }
@@ -970,6 +983,14 @@ pub mod el0 {
                     r.code_base,
                     r.code_size,
                 );
+            }
+            if module_asid(module_idx) > super::max_asid() {
+                log::error!(
+                    "[el0] module {module_idx}: ASID {} exceeds the part's ASID width; \
+                     cannot isolate",
+                    module_asid(module_idx)
+                );
+                return false;
             }
             let Some(slot) = ISO_SLOT_OWNER.iter().position(|o| {
                 o.compare_exchange(usize::MAX, module_idx, Ordering::AcqRel, Ordering::Relaxed)
@@ -1070,10 +1091,10 @@ pub mod el0 {
                 return false;
             }
 
-            // Publish: descriptors visible to the walker, then invalidate
-            // the whole EL1&0 regime — a cached global entry for the 2 MB
-            // window these tables live in would shadow the module's nG
-            // carve in the same window.
+            // Publish: descriptors visible to the walker (`dsb ishst`),
+            // then invalidate the EL1&0 regime on every core, so no entry
+            // or walk cached under this module's ASID by an earlier holder
+            // of the index survives.
             core::arch::asm!(
                 "dsb ishst",
                 "tlbi vmalle1is",
@@ -1134,7 +1155,7 @@ pub mod el0 {
 
     /// Identity-map `[base, base+size)` into slot `slot`'s tables at
     /// 4 KB granularity with the given access perms. `phys == va`
-    /// (the Pi 5 kernel runs an identity map). Returns `false` if ANY page
+    /// (the kernel runs on an identity map). Returns `false` if ANY page
     /// failed to map — the caller must treat a partial region as a build
     /// failure (do not publish the table).
     #[must_use]
@@ -1186,7 +1207,7 @@ pub mod el0 {
     unsafe fn seed_kernel_mmio(slot: usize) {
         for &gb in super::kernel_mmio_gb().iter() {
             let phys = (gb as u64) * L1_BLOCK_SIZE;
-            // Device-nGnRnE, EL1 RW, EL0 no-access, XN at both ELs.
+            // Device-nGnRE, EL1 RW, EL0 no-access, XN at both ELs.
             ISO_L1[slot].0[gb] = make_block_desc(phys, ATTR_IDX_DEVICE, AP_EL1_RW, true, true);
         }
     }
@@ -1226,7 +1247,7 @@ pub mod el0 {
             ISO_DEV_L2[slot].0[l2i]
         };
         if l2 & DESC_TABLE == 0 {
-            return (l1, l2, 0); // L2 block — no L3 (the bug signature)
+            return (l1, l2, 0); // L2 block — no L3: the carve never took effect
         }
         // L2 is a table → follow ITS pointer to the real L3 the MMU uses
         // (not a key-search, which can disagree with the published L2). This
@@ -1438,13 +1459,11 @@ pub mod el0 {
             regs[3] = sp;
         }
         let ret = core::ptr::addr_of!(FLUXOR_EL0_TRAMP) as u64 + 8 * RETURN_OP as u64;
-        let freq: u64;
-        // SAFETY: reading the counter frequency is side-effect free.
-        core::arch::asm!("mrs {}, cntfrq_el0", out(reg) freq, options(nomem, nostack));
+        let freq = timer::timer_freq();
         let deadline = if deadline_us == 0 || freq == 0 {
             0
         } else {
-            read_cntpct() + u64::from(deadline_us) * freq / 1_000_000
+            timer::read_timer_count_64() + u64::from(deadline_us) * freq / 1_000_000
         };
         core::ptr::write_volatile(core::ptr::addr_of_mut!((*cb).deadline), deadline);
 
@@ -1470,7 +1489,7 @@ pub mod el0 {
         if fp == 0 {
             let n = ISO_OK_COUNT[slot];
             ISO_OK_COUNT[slot] = n.wrapping_add(1);
-            if n < 64 || n.is_multiple_of(EL0_OK_LOG_EVERY) {
+            if n < EL0_OK_LOG_FIRST || n.is_multiple_of(EL0_OK_LOG_EVERY) {
                 log::info!(
                     "[el0] module {module_idx} el0 step ok outcome={outcome} step={n} \
                      (lower-EL SVC return confirms EL0 execution)"
@@ -1524,14 +1543,6 @@ pub mod el0 {
         0
     }
 
-    #[inline]
-    fn read_cntpct() -> u64 {
-        let v: u64;
-        // SAFETY: reading the virtual counter is side-effect free.
-        unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) v, options(nomem, nostack)) };
-        v
-    }
-
     /// The gateway trap, called from `fluxor_el0_svc_gate` under the
     /// kernel's table with IRQs open: authorise and serve op `op` for the
     /// module the control block names.
@@ -1568,13 +1579,44 @@ pub mod el0 {
         // SAFETY: this core's control block, read on this core.
         let deadline =
             unsafe { core::ptr::read_volatile(core::ptr::addr_of!(EL0_CBS[core].deadline)) };
-        u32::from(deadline != 0 && read_cntpct() >= deadline)
+        u32::from(deadline != 0 && timer::read_timer_count_64() >= deadline)
     }
 
     // ---- Assembly: EL0 entry, longjmp-resume, lower-EL sync dispatch ---
     //
     // Offsets below are the El0ControlBlock byte offsets pinned by the
     // assert block above.
+
+    /// x10 = this core's index, from the MPIDR field the platform
+    /// configured (`cpu::CORE_ID_SHIFT`), out-of-range cores mapped to 0 as
+    /// `cur_core` maps them. Clobbers x12.
+    macro_rules! core_index {
+        () => {
+            concat!(
+                "mrs   x10, mpidr_el1\n",
+                "adrp  x12, {core_id_shift}\n",
+                "ldr   w12, [x12, #:lo12:{core_id_shift}]\n",
+                "lsr   x10, x10, x12\n",
+                "and   x10, x10, #0xff\n",
+                "cmp   x10, #{max_cores}\n",
+                "csel  x10, x10, xzr, lo\n",
+            )
+        };
+    }
+
+    /// x11 = &EL0_CBS[core], via [`core_index`]. Clobbers x10, x12.
+    macro_rules! el0_cb {
+        () => {
+            concat!(
+                core_index!(),
+                "adrp  x11, EL0_CBS\n",
+                "add   x11, x11, #:lo12:EL0_CBS\n",
+                "mov   x12, #{cb_size}\n",
+                "madd  x11, x10, x12, x11\n",
+            )
+        };
+    }
+
     core::arch::global_asm!(
         ".section .text",
         ".global fluxor_el0_enter",
@@ -1591,6 +1633,12 @@ pub mod el0 {
         "str   x9,  [x0, #16]", // kernel_ttbr0 (live boot table)
         "mrs   x9, daif",
         "str   x9,  [x0, #24]", // kernel_daif
+        // Mask IRQ and FIQ until the `eret`: an interrupt taken at EL1
+        // between the ELR_EL1/SPSR_EL1 writes below and the `eret` would
+        // overwrite them with its own return state, and the `eret` would
+        // then enter EL0 at a kernel address. The module's SPSR unmasks
+        // IRQs at EL0; `resume` restores the kernel's DAIF.
+        "msr   daifset, #3",
         "stp   x19, x20, [x0, #32]",
         "stp   x21, x22, [x0, #48]",
         "stp   x23, x24, [x0, #64]",
@@ -1713,16 +1761,11 @@ pub mod el0 {
         "ret",
         // ---- fluxor_el0_lower_sync_vec ----
         // A synchronous exception from EL0: a veneer's SVC, or an abort.
-        // x9-x16 are scratch here (caller-saved across any veneer call).
+        // x9-x16 are scratch here: a veneer is a call, so the module holds
+        // nothing in them across it, and an abort ends the call.
         "fluxor_el0_lower_sync_vec:",
         "mov   x9, x0", // the module's x0 (outcome, or a gateway arg)
-        "mrs   x10, mpidr_el1",
-        "lsr   x10, x10, #8",
-        "and   x10, x10, #3", // core id (Pi 5: MPIDR Aff1)
-        "adrp  x11, EL0_CBS",
-        "add   x11, x11, #:lo12:EL0_CBS",
-        "mov   x12, #384",          // CB_SIZE
-        "madd  x11, x10, x12, x11", // x11 = &EL0_CBS[core]
+        el0_cb!(), // x11 = &EL0_CBS[core]
         "ldr   w13, [x11, #144]",   // active
         "cbz   w13, fluxor_el0_inactive",
         "mrs   x14, esr_el1",
@@ -1794,13 +1837,7 @@ pub mod el0 {
         "bl    fluxor_el0_irq_preempt",
         "mov   x9, x0",
         "ldr   x0, [sp], #16",
-        "mrs   x10, mpidr_el1",
-        "lsr   x10, x10, #8",
-        "and   x10, x10, #3", // core id (Pi 5: MPIDR Aff1)
-        "adrp  x11, EL0_CBS",
-        "add   x11, x11, #:lo12:EL0_CBS",
-        "mov   x12, #384",          // CB_SIZE
-        "madd  x11, x10, x12, x11", // x11 = &EL0_CBS[core]
+        el0_cb!(), // x11 = &EL0_CBS[core]
         "cbnz  w9, fluxor_el0_gate_forced",
         "ldr   x13, [x11, #296]",
         "msr   elr_el1, x13",
@@ -1884,8 +1921,11 @@ pub mod el0 {
         "mov   x0, x11",
         "movn  w1, #109", // outcome = -110 (ETIMEDOUT)
         "b     fluxor_el0_resume",
+        // A lower-EL synchronous exception with no isolated call active on
+        // this core: nothing legitimate runs at EL0 then. Fail stop.
         "fluxor_el0_inactive:",
-        "b     unhandled_exception",
+        "mov   w17, #8",
+        "b     fluxor_el1_catch",
         // ---- fluxor_el0_lower_irq_vec ----
         // An IRQ taken at EL0. Save the module's whole register file on
         // the kernel stack, serve the interrupt under the kernel's table,
@@ -1925,13 +1965,7 @@ pub mod el0 {
         "stp q26, q27, [sp, #624]",
         "stp q28, q29, [sp, #656]",
         "stp q30, q31, [sp, #688]",
-        "mrs   x10, mpidr_el1",
-        "lsr   x10, x10, #8",
-        "and   x10, x10, #3", // core id (Pi 5: MPIDR Aff1)
-        "adrp  x11, EL0_CBS",
-        "add   x11, x11, #:lo12:EL0_CBS",
-        "mov   x12, #384",          // CB_SIZE
-        "madd  x11, x10, x12, x11", // x11 = &EL0_CBS[core]
+        el0_cb!(), // x11 = &EL0_CBS[core]
         "ldr   x0, [x11, #16]", // kernel_ttbr0
         "msr   ttbr0_el1, x0",
         "isb",
@@ -1978,60 +2012,49 @@ pub mod el0 {
         "2:",
         "ldr   x16, [sp, #176]", // the module's ELR
         "add   sp, sp, #720",
-        "mrs   x10, mpidr_el1",
-        "lsr   x10, x10, #8",
-        "and   x10, x10, #3", // core id (Pi 5: MPIDR Aff1)
-        "adrp  x11, EL0_CBS",
-        "add   x11, x11, #:lo12:EL0_CBS",
-        "mov   x12, #384",          // CB_SIZE
-        "madd  x11, x10, x12, x11", // x11 = &EL0_CBS[core]
+        el0_cb!(), // x11 = &EL0_CBS[core]
         "str   x16, [x11, #136]", // fault_elr
         "mov   w16, #3",
         "str   w16, [x11, #148]", // fault_pending = 3 (deadline)
         "mov   x0, x11",
         "movn  w1, #109", // outcome = -110 (ETIMEDOUT)
         "b     fluxor_el0_resume",
-        // ---- fluxor_el1_catch (reason in w17) ----
-        // Catch for the EL1 + lower-EL-async exception vectors. A genuine EL0
-        // module fault arrives at the lower-EL SYNCHRONOUS vector
-        // (`fluxor_el0_lower_sync_vec`) and is recovered by faulting the
-        // module; anything reaching HERE is a kernel-side fault (e.g. inside
-        // `el0_syscall_dispatch` while it holds the channel spinlock) or an
-        // async exception (IRQs are masked across an EL0 step, so these
-        // should not fire). Recovering from a kernel-side fault could abandon
-        // a held lock and deadlock, so we FAIL STOP: hand to
-        // `unhandled_exception`, which latches ESR/FAR/SPSR/ELR into the
-        // per-core `CORE_FAULT_*` cells (surfaced over UDP by a sibling core)
-        // and spins diagnosably.
-        // Each vector slot does `mov w17,#reason; b fluxor_el1_catch`.
-        //   reason: 3=EL1h sync, 4=EL1h SError, 5=EL1t sync, 6=EL1t IRQ,
-        //   7=EL1t FIQ, 8=EL1t SError, 9=EL1h FIQ, 10=lowerEL IRQ,
-        //   11=lowerEL FIQ, 12=lowerEL SError.
-        ".global fluxor_el1_catch",
-        ".global fluxor_el1_sync_vec",
-        "fluxor_el1_sync_vec:", // named entry for the EL1h sync slot
-        "mov   w17, #3",
-        "fluxor_el1_catch:",
-        // Regardless of whether an EL0 step is active, this is a kernel-side
-        // or async fault that must not be silently recovered. Dump + spin
-        // (latches CORE_FAULT_* for sibling-core UDP surfacing).
+        // ---- fluxor_el1_catch (vector slot in w17) ----
+        // The fail-stop path for every exception the kernel does not
+        // recover from: a fault in kernel code (taken at EL1, possibly
+        // while serving an isolated module's trap and holding a lock whose
+        // abandonment would deadlock the kernel), an FIQ or SError from
+        // any level, and anything from AArch32. A genuine EL0 module fault
+        // arrives at the lower-EL synchronous vector instead and is
+        // recovered by ending the module's call. Each vector slot does
+        // `mov w17, #slot; b fluxor_el1_catch` (slot = VBAR_EL1 offset /
+        // 0x80); `unhandled_exception` latches ESR/FAR/SPSR/ELR and the slot
+        // into the per-core `CORE_FAULT_*` cells, for another core to
+        // report, prints the dump and spins.
         //
         // The dump runs on this core's fault stack, not the interrupted
         // SP: the fault may BE a kernel stack overflow into its guard page,
         // and pushing a frame onto that stack would fault again, forever.
         // Nothing returns from here, so the switch is unconditional.
-        // SP_top = EL1_FAULT_STACKS + (Aff1 + 1) * EL1_FAULT_STACK_BYTES.
+        // SP = EL1_FAULT_STACKS + (core + 1) * EL1_FAULT_STACK_BYTES.
+        ".global fluxor_el1_catch",
+        ".global fluxor_el1_sync_vec",
+        "fluxor_el1_sync_vec:", // named entry for the EL1h synchronous slot
+        "mov   w17, #4",
+        "fluxor_el1_catch:",
         "adrp  x16, EL1_FAULT_STACKS",
         "add   x16, x16, :lo12:EL1_FAULT_STACKS",
+        core_index!(),
+        "add   x10, x10, #1",
+        "mov   x12, #{fault_stack_bytes}",
+        "madd  x16, x10, x12, x16",
         "mov   sp, x16",
-        "mrs   x16, mpidr_el1",
-        "ubfx  x16, x16, #8, #8",
-        "and   x16, x16, #3",
-        "add   x16, x16, #1",
-        "lsl   x16, x16, #13",
-        "add   sp, sp, x16",
         "b     unhandled_exception",
         ret_op = const RETURN_OP,
+        core_id_shift = sym cpu::CORE_ID_SHIFT,
+        max_cores = const MAX_CORES,
+        cb_size = const CB_SIZE,
+        fault_stack_bytes = const EL1_FAULT_STACK_BYTES,
     );
 }
 

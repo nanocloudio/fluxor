@@ -176,8 +176,8 @@ pub fn rebuild_resident_graph_index() {
 /// Finalize the domain dispatch tables over the *current* live module set, then
 /// rebuild the resident-graph index. Call ONCE after all boot-time `apply_add`
 /// admissions, before the per-domain run loops start: `live::apply_add` splices
-/// only the flat `exec_order` (the `domain_exec_order` splice is a deliberate
-/// follow-up needing a multicore quiesce), so a per-domain cooperative runner
+/// only the flat `exec_order` (splicing `domain_exec_order` would need a
+/// multicore quiesce), so a per-domain cooperative runner
 /// (BCM2712) would otherwise never see a boot-admitted module. Rebuilds
 /// `domain_module_mask`, `domain_count`, and `domain_exec_order` from the flat
 /// order, exactly as `prepare_graph` does for the base graph.
@@ -334,7 +334,7 @@ pub fn admit_resident_workloads_from_config() {
 }
 
 /// Number of distinct resident `(graph, domain)` instances the runner is
-/// multiplexing. `<= 1` selects the single-graph fast path (today's behaviour).
+/// multiplexing. `<= 1` selects the single-graph fast path.
 /// Always `0`/`1`-equivalent on non-multitenant builds (one resident graph).
 pub fn resident_graph_count() -> usize {
     #[cfg(feature = "multitenant")]
@@ -975,9 +975,9 @@ fn graph_pacer_instance_runnable(graph_slot: u16, generation: u32, domain: u8) -
 
 /// Multi-graph entry point for a FLAT single-domain cooperative runner (Linux /
 /// wasm): step all resident graphs in domain 0 and return the next pacing
-/// deadline (µs). Single-graph fast path (`resident_graph_count() <= 1`) is the
-/// existing `step_modules` + `pacer_next_deadline_us(0)` — byte-identical to
-/// today. On non-multitenant builds always the fast path.
+/// deadline (µs). The single-graph fast path (`resident_graph_count() <= 1`)
+/// is exactly `step_modules` + `pacer_next_deadline_us(0)`. On non-multitenant
+/// builds always the fast path.
 pub fn step_resident_graphs_flat(
     modules: &mut [ModuleSlot; MAX_MODULES],
     count: usize,

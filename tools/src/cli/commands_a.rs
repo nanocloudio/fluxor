@@ -295,14 +295,6 @@ fn cmd_info(file: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-/// Substitute `${VAR}` and `${VAR:-default}` with environment values on
-/// every graph read. The pass itself lives in the library
-/// ([`fluxor_tools::env_subst`]) because the service-bundle renderer runs
-/// it too, ahead of parameter substitution.
-pub(crate) fn substitute_env_vars(input: &str) -> Result<String> {
-    fluxor_tools::env_subst::substitute(input).map_err(crate::error::Error::Config)
-}
-
 /// Tiny base64 encoder for binary `body_file` payloads. Avoids
 /// pulling in a base64 crate just for this single call site.
 fn base64_encode(bytes: &[u8], out: &mut String) {
@@ -407,15 +399,8 @@ fn cmd_generate(
     module_root: Option<&std::path::Path>,
     binary: bool,
 ) -> Result<()> {
-    let content = substitute_env_vars(&std::fs::read_to_string(config_path)?)?;
-    let config: serde_json::Value = if config_path
-        .extension()
-        .is_some_and(|ext| ext == "yaml" || ext == "yml")
-    {
-        serde_yaml::from_str(&content)?
-    } else {
-        serde_json::from_str(&content)?
-    };
+    let config: serde_json::Value =
+        stack_expand::load_graph(config_path, &crate::project::root_for_config(config_path))?;
 
     let mut config = config;
     let yaml_dir = config_path
@@ -465,6 +450,18 @@ fn cmd_generate(
         target_desc.pio_count,
         Some(&target_desc.id),
         &crate::project::root_for_config(config_path),
+    )?;
+
+    // The hosted builds (Linux, wasm) compile their config here: charge its
+    // rings against the target's buffer arena, as an image build does.
+    check_ring_demand_unbuilt(
+        &config,
+        &binary_data,
+        &modules_dir,
+        &extra_dirs,
+        &target_desc,
+        &project_root,
+        false,
     )?;
 
     eprintln!("Config size: {} bytes", binary_data.len());
@@ -634,6 +631,41 @@ fn check_state_budget(
         )));
     }
     Ok(())
+}
+
+/// Charge a compiled graph's channel rings against the target's buffer arena
+/// and REFUSE an image whose rings do not fit (`ring_demand`).
+///
+/// `modules` are the `.fmod`s the image carries: the loader holds exactly
+/// their manifests, so a module the kernel runs built in sizes none of its
+/// ports. The source manifests only name the ports in the table.
+fn check_ring_demand(
+    config: &serde_json::Value,
+    config_data: &[u8],
+    modules: &[modules::ModuleInfo],
+    target: &crate::target::TargetDescriptor,
+    extra_dirs: &[&std::path::Path],
+    project_root: &std::path::Path,
+) -> Result<()> {
+    let facts: std::collections::HashMap<u32, crate::ring_demand::ModuleFacts<'_>> = modules
+        .iter()
+        .map(|m| {
+            (
+                m.name_hash,
+                crate::ring_demand::ModuleFacts {
+                    manifest: &m.manifest,
+                    mailbox_safe: m.mailbox_safe,
+                },
+            )
+        })
+        .collect();
+    let manifests = config::load_module_manifests_with_extra_for_target(
+        &config["modules"],
+        extra_dirs,
+        Some(target.id.as_str()),
+        project_root,
+    );
+    crate::ring_demand::check(config, config_data, &facts, &manifests, target)
 }
 
 /// The 16 MiB alignment `.bss` starts on in a RAM-loaded aarch64 image
@@ -838,21 +870,15 @@ fn graph_default_level(
 
 fn cmd_combine(
     firmware_path: &PathBuf,
-    config_path: &PathBuf,
+    config_path: &Path,
     output_path: &PathBuf,
     module_root: Option<&Path>,
     verbose: bool,
 ) -> Result<()> {
-    // Parse config file (substitute env vars before YAML parse)
-    let content = substitute_env_vars(&std::fs::read_to_string(config_path)?)?;
-    let config: serde_json::Value = if config_path
-        .extension()
-        .is_some_and(|ext| ext == "yaml" || ext == "yml")
-    {
-        serde_yaml::from_str(&content)?
-    } else {
-        serde_json::from_str(&content)?
-    };
+    // Read the graph as every build reads it: includes expanded, params
+    // rendered.
+    let config: serde_json::Value =
+        stack_expand::load_graph(config_path, &crate::project::root_for_config(config_path))?;
 
     let mut config = config;
     let yaml_dir = config_path
@@ -1003,6 +1029,14 @@ fn cmd_combine(
 
     check_code_ceiling(&modules, &target_desc)?;
     check_state_budget(&modules, &config, &target_desc)?;
+    check_ring_demand(
+        &config,
+        &config_data,
+        &modules,
+        &target_desc,
+        &extra_dirs,
+        &crate::project::root_for_config(config_path),
+    )?;
     check_stack_budget(&modules, &config, &target_desc)?;
     check_gated_admission(&modules, &config, &target_desc)?;
     let programs = crate::modules::collect_programs(&config)?;
@@ -1213,18 +1247,11 @@ fn cmd_combine(
 }
 
 fn load_config_with_defaults(
-    config_path: &PathBuf,
+    config_path: &Path,
     verbose: bool,
 ) -> Result<(serde_json::Value, target::TargetDescriptor)> {
-    let content = substitute_env_vars(&std::fs::read_to_string(config_path)?)?;
-    let config: serde_json::Value = if config_path
-        .extension()
-        .is_some_and(|ext| ext == "yaml" || ext == "yml")
-    {
-        serde_yaml::from_str(&content)?
-    } else {
-        serde_json::from_str(&content)?
-    };
+    let config: serde_json::Value =
+        stack_expand::load_graph(config_path, &crate::project::root_for_config(config_path))?;
 
     let mut config = config;
 
@@ -1322,6 +1349,14 @@ fn build_packaged_blobs(
 
     check_code_ceiling(&modules, target_desc)?;
     check_state_budget(&modules, config, target_desc)?;
+    check_ring_demand(
+        config,
+        &config_data,
+        &modules,
+        target_desc,
+        extra_dirs,
+        project_root,
+    )?;
     check_stack_budget(&modules, config, target_desc)?;
     check_gated_admission(&modules, config, target_desc)?;
     let programs = crate::modules::collect_programs(config)?;
@@ -1367,15 +1402,8 @@ pub fn cmd_workload_image(
     module_root: Option<&Path>,
     verbose: bool,
 ) -> error::Result<()> {
-    let content = substitute_env_vars(&std::fs::read_to_string(config_path)?)?;
-    let mut config: serde_json::Value = if config_path
-        .extension()
-        .is_some_and(|ext| ext == "yaml" || ext == "yml")
-    {
-        serde_yaml::from_str(&content)?
-    } else {
-        serde_json::from_str(&content)?
-    };
+    let mut config: serde_json::Value =
+        stack_expand::load_graph(config_path, &crate::project::root_for_config(config_path))?;
     let target_desc = resolve_target(&config, None)?;
     let project_root = crate::project::root_for_config(config_path);
     stack_expand::expand_platform_stacks(&mut config, &target_desc, &project_root)?;
@@ -1404,7 +1432,8 @@ pub fn cmd_workload_image(
         project_root: project_root.as_path(),
     };
     let workloads = crate::config::build_workloads(&only, loc, &[])?;
-    let flxa = crate::add_subgraph::encode_add_subgraph(&workloads[0]).map_err(error::Error::Config)?;
+    let flxa =
+        crate::add_subgraph::encode_add_subgraph(&workloads[0]).map_err(error::Error::Config)?;
     let store_fb = store_cli::lock_store_resolver(&project_root, abi, None);
     let modules = parse_modules_from_config_multi(
         &only,
@@ -1413,7 +1442,9 @@ pub fn cmd_workload_image(
         store_fb.as_deref().map(|f| f as _),
     )?;
     if modules.is_empty() {
-        return Err(error::Error::Config("a workload image needs at least one module".into()));
+        return Err(error::Error::Config(
+            "a workload image needs at least one module".into(),
+        ));
     }
 
     let mods_dir = output_dir.join("modules");
@@ -1438,7 +1469,12 @@ pub fn cmd_workload_image(
         .get("name")
         .and_then(|v| v.as_str())
         .map(str::to_string)
-        .or_else(|| config_path.file_stem().and_then(|s| s.to_str()).map(str::to_string))
+        .or_else(|| {
+            config_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(str::to_string)
+        })
         .unwrap_or_else(|| "workload".into());
     let doc = serde_json::json!({
         "name": name,
@@ -1453,7 +1489,11 @@ pub fn cmd_workload_image(
         serde_json::to_string_pretty(&doc)?,
     )?;
     if verbose {
-        println!("workload image {name}: {} module(s), FLXA {} bytes", modules.len(), flxa.len());
+        println!(
+            "workload image {name}: {} module(s), FLXA {} bytes",
+            modules.len(),
+            flxa.len()
+        );
     }
     println!("{}", output_dir.display());
     Ok(())
@@ -1472,7 +1512,7 @@ pub fn cmd_workload_image(
 /// before they accept the image, and the RP boot selector does too on a
 /// kernel built with a slot root.
 fn cmd_graph_image(
-    config_path: &PathBuf,
+    config_path: &Path,
     output_path: &PathBuf,
     target_override: Option<&str>,
     epoch: u64,
@@ -1493,15 +1533,8 @@ fn cmd_graph_image(
     const RAM_IMAGE_SIZE: usize = 8 * 1024 * 1024;
 
     // Parse config (reusing the same path as cmd_combine).
-    let content = substitute_env_vars(&std::fs::read_to_string(config_path)?)?;
-    let mut config: serde_json::Value = if config_path
-        .extension()
-        .is_some_and(|ext| ext == "yaml" || ext == "yml")
-    {
-        serde_yaml::from_str(&content)?
-    } else {
-        serde_json::from_str(&content)?
-    };
+    let mut config: serde_json::Value =
+        stack_expand::load_graph(config_path, &crate::project::root_for_config(config_path))?;
 
     let target_desc = resolve_target(&config, target_override)?;
     // Resolve from the CONFIG's location, not the cwd: the rig and
@@ -1559,11 +1592,13 @@ fn cmd_graph_image(
     // wire.
     let flash_slot = target_desc.graph_flash();
     let image_size = match flash_slot {
-        Some(layout) if layout.slot_size == 0 => return Err(error::Error::Config(format!(
+        Some(layout) if layout.slot_size == 0 => {
+            return Err(error::Error::Config(format!(
             "{} has no graph slots: its {} KiB of flash leave no room for two beside the kernel",
             target_desc.board_id.as_deref().unwrap_or(&target_desc.id),
             layout.flash_size / 1024
-        ))),
+        )))
+        }
         Some(layout) => layout.slot_size as usize,
         None => RAM_IMAGE_SIZE,
     };

@@ -77,13 +77,17 @@ pub(crate) use fluxor_tools::store_sync;
 // `lifecycle`), so re-export the lib's single copies.
 pub(crate) use fluxor_tools::ci_schema;
 pub(crate) use fluxor_tools::makefile_lint;
-// `ci.rs` checks service bundles through `crate::service_params`, which is
-// lib-only; the bin reaches the lib's single copy.
-pub(crate) use fluxor_tools::service_params;
+// `ci.rs` checks stacks and bundles through `crate::packaging` and
+// `crate::stack`, which are lib-only; the bin reaches the lib's single
+// copies.
+pub(crate) use fluxor_tools::packaging;
+pub(crate) use fluxor_tools::stack;
 mod project;
 pub mod reconfigure;
 mod render_template;
 pub mod rig;
+mod ring_demand;
+mod ring_plan;
 mod runtime_abi;
 mod scenario;
 mod schema;
@@ -170,6 +174,8 @@ fn main() {
             target,
             epoch,
             sign_key,
+            params,
+            params_file,
         } => cmd_build_dispatch(
             path.as_ref(),
             BuildFlags {
@@ -181,6 +187,11 @@ fn main() {
                 target,
                 epoch,
                 sign_key,
+                params: workload_src::RunParams {
+                    flags: params,
+                    file: params_file,
+                    module_root: None,
+                },
             },
             verbose,
         ),
@@ -446,12 +457,14 @@ fn main() {
         Commands::Publish {
             action,
             only,
+            store,
             project_root,
             dry_run,
             strict_pins,
         } => cmd_publish(
             action,
             &only,
+            store.as_deref(),
             project_root.as_deref(),
             verbose,
             fluxor_tools::store_publish::PublishMode {
@@ -515,13 +528,16 @@ fn lifted(r: std::result::Result<(), fluxor_tools::error::Error>) -> Result<()> 
 
 /// `fluxor publish` — the single store-write verb. The optional
 /// subcommand (`abi|sdk|common|fmod|runtime`) and the `--only` flag
-/// both narrow the artifact kinds; `publish bundle <dir>` publishes a
-/// built workload bundle; bare `publish` sweeps everything
-/// publishable (sources, built fmods, `[project].runtimes` binaries —
-/// and, in the fluxor repo, the CLI itself).
+/// both narrow the artifact kinds; `publish bundle <dir>` publishes one
+/// workload bundle, `publish stack <file>` one stack. Bare `publish`
+/// sweeps everything the project ships, in dependency order: sources;
+/// built fmods and `[project].runtimes` binaries (and, in the fluxor repo,
+/// the CLI itself); stacks, which record the module digests they compose;
+/// bundles, which may include those stacks.
 fn cmd_publish(
     action: Option<PublishAction>,
     only: &[String],
+    store: Option<&Path>,
     project_root: Option<&Path>,
     verbose: bool,
     mode: fluxor_tools::store_publish::PublishMode,
@@ -531,6 +547,13 @@ fn cmd_publish(
     if action.is_some() && !only.is_empty() {
         return Err(Error::Config(
             "`--only` conflicts with a publish subcommand (the subcommand already names the kinds)"
+                .into(),
+        ));
+    }
+    if action.is_some() && store.is_some() {
+        return Err(Error::Config(
+            "`fluxor publish --store` sets the sweep's store; a publish subcommand takes its own \
+             `--store`"
                 .into(),
         ));
     }
@@ -548,6 +571,15 @@ fn cmd_publish(
             published,
             verbose,
         );
+    }
+    if let Some(PublishAction::Stack {
+        ref stack,
+        ref store,
+        ref tag,
+        published,
+    }) = action
+    {
+        return store_cli::cmd_stack_publish(stack, store.as_deref(), tag.as_deref(), published);
     }
     if let Some(PublishAction::Image {
         ref file,
@@ -605,11 +637,12 @@ fn cmd_publish(
         // Handled by the early returns above.
         Some(
             PublishAction::Bundle { .. }
+            | PublishAction::Stack { .. }
             | PublishAction::Image { .. }
             | PublishAction::Workload { .. }
             | PublishAction::Firmware { .. },
         ) => {
-            unreachable!("publish bundle/image/workload/firmware handled above")
+            unreachable!("publish bundle/stack/image/workload/firmware handled above")
         }
         None => {
             let mut kinds = Vec::new();
@@ -618,13 +651,17 @@ fn cmd_publish(
                     "abi" | "sdk" | "common" | "source" => "source",
                     "fmod" => "fmod",
                     "runtime" => "runtime",
+                    "stack" => "stack",
+                    "bundle" => "bundle",
                     other => {
                         return Err(Error::Config(format!(
-                            "unknown --only kind '{other}' (expected source|fmod|runtime)"
+                            "unknown --only kind '{other}' (expected \
+                             source|fmod|runtime|stack|bundle)"
                         )))
                     }
                 });
             }
+            kinds.sort_unstable();
             kinds.dedup();
             (kinds, None)
         }
@@ -632,16 +669,125 @@ fn cmd_publish(
     let pr = sub_root
         .or_else(|| project_root.map(Path::to_path_buf))
         .unwrap_or_else(crate::project::root);
-    let tags = fluxor_tools::store_publish::publish_project_with_mode(&pr, &kinds, verbose, mode)
+    publish_sweep(&pr, &kinds, store, verbose, mode)
+}
+
+/// The publish sweep over `kinds` (empty = everything), in dependency
+/// order: sources, fmods and runtimes in one transaction; then each stack
+/// under `packaging/stack/`, whose module references resolve through the
+/// modules just published; then each bundle under `packaging/service/` and
+/// `packaging/applet/`, whose graph may include those stacks. What it
+/// publishes is [`fluxor_tools::packaging::discover`]'s, the list `fluxor ci`
+/// checks. Every stack and bundle is checked before anything is written, so
+/// one that cannot be published fails the sweep rather than being skipped.
+fn publish_sweep(
+    pr: &Path,
+    kinds: &[&str],
+    store: Option<&Path>,
+    verbose: bool,
+    mode: fluxor_tools::store_publish::PublishMode,
+) -> Result<()> {
+    let want = |k: &str| kinds.is_empty() || kinds.contains(&k);
+    let project_kinds: Vec<&str> = kinds
+        .iter()
+        .copied()
+        .filter(|k| !matches!(*k, "stack" | "bundle"))
+        .collect();
+    let sweep_project = kinds.is_empty() || !project_kinds.is_empty();
+    let rel = |p: &Path| p.strip_prefix(pr).unwrap_or(p).display().to_string();
+
+    // Checked up front, so a broken stack or bundle refuses the whole
+    // sweep before its modules are published.
+    let shippables = fluxor_tools::packaging::discover(pr);
+    let mut stacks: Vec<(PathBuf, String)> = Vec::new();
+    if want("stack") {
+        let mut errors = Vec::new();
+        for path in shippables.stacks {
+            match fluxor_tools::stack::check_publishable(&path, pr) {
+                Ok(reference) => stacks.push((path, reference)),
+                Err(e) => errors.push(format!("stack {}: {}", rel(&path), lib_message(e))),
+            }
+        }
+        if !errors.is_empty() {
+            return Err(Error::Config(format!(
+                "publish refused: {} stack(s) cannot be published, and nothing was written:\n  {}",
+                errors.len(),
+                errors.join("\n  ")
+            )));
+        }
+    }
+    let mut bundles: Vec<(PathBuf, String)> = Vec::new();
+    if want("bundle") {
+        let mut errors = Vec::new();
+        for (_, manifest) in shippables.bundles {
+            match fluxor_tools::packaging::check_bundle(&manifest, pr)
+                .and_then(|_| fluxor_tools::packaging::read_bundle(&manifest).map(|s| s.name))
+            {
+                Ok(name) => bundles.push((manifest, name)),
+                Err(e) => errors.push(format!("bundle {}: {e}", rel(&manifest))),
+            }
+        }
+        if !errors.is_empty() {
+            return Err(Error::Config(format!(
+                "publish refused: {} bundle(s) cannot be published, and nothing was written:\n  {}",
+                errors.len(),
+                errors.join("\n  ")
+            )));
+        }
+    }
+
+    if sweep_project {
+        let tags = fluxor_tools::store_publish::publish_project_into(
+            pr,
+            &project_kinds,
+            verbose,
+            mode,
+            store,
+        )
         .map_err(|e| Error::Config(e.to_string()))?;
+        if !mode.dry_run {
+            for tag in &tags {
+                println!("{tag}");
+            }
+            println!("published {} tag(s)", tags.len());
+        }
+    }
+
     if mode.dry_run {
+        for (path, reference) in &stacks {
+            println!("would publish stack {reference} ({})", rel(path));
+        }
+        for (manifest, name) in &bundles {
+            println!("would publish bundle {name} ({})", rel(manifest));
+        }
+        println!("\ndry run: nothing was written.");
         return Ok(());
     }
-    for tag in &tags {
-        println!("{tag}");
+    for (path, _) in &stacks {
+        store_cli::cmd_stack_publish(path, store, None, false)
+            .map_err(|e| Error::Config(format!("publish stack {}: {}", rel(path), bare(e))))?;
     }
-    println!("published {} tag(s)", tags.len());
+    for (manifest, _) in &bundles {
+        store_cli::cmd_bundle_publish(manifest, store, None, false, verbose)
+            .map_err(|e| Error::Config(format!("publish bundle {}: {}", rel(manifest), bare(e))))?;
+    }
     Ok(())
+}
+
+/// A lib error's message, without its variant's prefix.
+fn lib_message(e: fluxor_tools::error::Error) -> String {
+    match e {
+        fluxor_tools::error::Error::Config(m) => m,
+        other => other.to_string(),
+    }
+}
+
+/// A bin error's message, without its variant's prefix, for re-wrapping.
+fn bare(e: Error) -> String {
+    match e {
+        Error::Config(m) => m,
+        other => other.to_string(),
+    }
 }
 
 /// `fluxor sync` — store → tree via the uniform lockfile.

@@ -3,11 +3,10 @@
 //!
 //! A no_std kernel sizes its static arenas at compile time, and the sizes are
 //! platform-specific (rp2040's 264 KiB SRAM and a Pi 5's gigabytes cannot share
-//! one figure). This module is where they are stated, and the ONE place the
+//! one figure). This module is where they are stated, and the one place the
 //! kernel reaches into `platform::chip` for the per-silicon figures the RP
-//! build generates from `targets/silicon/*.toml` (the sanctioned
-//! D-KERNEL-PLATFORM capacity seam). Every other kernel site consumes the
-//! constants from here.
+//! build generates from `targets/silicon/*.toml`. Every other kernel site
+//! consumes the constants from here.
 //!
 //! **Kernel capacity is not ABI.** Nothing here is part of the module ABI, and
 //! nothing under `modules/sdk` restates it: the SDK is hashed into the
@@ -21,9 +20,9 @@
 //!
 //! One profile per kernel platform, selected by the platform feature:
 //! `host-linux`, `chip-bcm2712`, `host-wasm` and `rp`. Linux and bcm2712 are
-//! separate profiles even where their values agree today, so a hosted Linux
-//! kernel is not bound to what a Pi 5's linker regions can hold, nor the board
-//! to what a Linux host can map.
+//! separate profiles even where their values agree, so a hosted Linux kernel
+//! is not bound to what a Pi 5's linker regions can hold, nor the board to
+//! what a Linux host can map.
 //!
 //! The composer mirrors some of these figures (`tools/src/capacity.rs`), and
 //! `compose::capacity_mirrors_kernel_sources` pins every mirrored value against
@@ -44,8 +43,8 @@ pub use self::profile_rp::*;
 
 // ── Linux host ─────────────────────────────────────────────────────────────
 //
-// A hosted kernel on any Linux machine. Today's figures are the Pi 5's; they
-// are stated separately so they can follow the host rather than the board.
+// A hosted kernel on any Linux machine. Its figures match the bcm2712 profile's
+// and are stated separately so they follow the host rather than the board.
 
 #[cfg(feature = "host-linux")]
 mod profile_linux {
@@ -58,9 +57,10 @@ mod profile_linux {
     /// is never zeroed whole (the loader zeroes each allocation).
     pub const STATE_ARENA_SIZE: usize = 1024 * 1024 * 1024;
     /// Per-channel buffer pool. A node's own graph and the workload
-    /// subgraphs it hosts share it: a node's base graph alone holds ~8 MiB
-    /// of channels, and a stateful workload adds two 128 KiB block edges.
-    /// 16 MiB leaves room for several such workloads.
+    /// subgraphs it hosts share it, and a stateful workload adds two
+    /// 128 KiB block edges. `fluxor build` adds a graph's rings up and
+    /// refuses one that does not fit, printing its share and the slack left
+    /// for the workloads the node will admit.
     pub const BUFFER_ARENA_SIZE: usize = 16 * 1024 * 1024;
     /// Module slots: a node's own graph plus the workload subgraphs it
     /// hosts, all in one scheduler. A node's control plane and image plane

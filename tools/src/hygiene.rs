@@ -387,7 +387,7 @@ fn scan_module_structure(project_root: &Path, report: &mut Report) {
                 rel,
                 format!(
                     "{name} under modules/ — a module is a directory, never a crate; \
-                     host tests go through `fluxor modules test` ([test] harness), not a shim crate"
+                     host tests `#[path]`-mount the module core from `tests/harness/`, not a shim crate"
                 ),
                 report,
             );

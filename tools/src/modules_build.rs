@@ -79,7 +79,7 @@ const ABI_SPECS: &[AbiSpec] = &[
         // byte slice a chain of byte loads. Module code never runs that
         // way: on the Pi 5 and on QEMU virt the kernel enables the MMU, with
         // alignment checking off, before any module is loaded
-        // (`bcm2712/boot_mmu.rs`), and under `fluxor-linux` a module is
+        // (`arch/aarch64/boot_mmu.rs`), and under `fluxor-linux` a module is
         // ordinary user memory. Device memory reaches a module only through
         // BAR, device-window or peripheral addresses, which drivers touch
         // with aligned scalar volatile accesses — the compiler knows their
@@ -274,7 +274,7 @@ struct VariantRaw {
     omit_capabilities: Vec<String>,
 }
 
-/// Editions `rustc` accepts today. Kept explicit so a manifest typo
+/// Editions `rustc` accepts. Kept explicit so a manifest typo
 /// fails discovery loudly instead of surfacing as an opaque rustc error.
 const SUPPORTED_EDITIONS: &[&str] = &["2015", "2018", "2021", "2024"];
 
@@ -523,11 +523,11 @@ fn cfg_feature_args(cand: &Candidate) -> Vec<String> {
 /// Preference order:
 ///   1. Manifest `type = "Source"|"Transformer"|…|"Protocol"` —
 ///      authoritative when present.
-///   2. Name table mirroring the Makefile's `mod_type` macro,
-///      hardcoded here so the output is byte-identical to the
-///      shell loop's. A module declaring `type = "..."` in its
-///      manifest needs no row.
-///   3. Default `Transformer` (2).
+///   2. The name table below, for the drivers and sources whose
+///      manifests declare no `type`. A module declaring
+///      `type = "..."` needs no row.
+///   3. Default `Transformer` (2), which an unrecognised `type`
+///      also takes.
 fn resolve_type_id(name: &str, manifest_type: Option<&str>) -> u8 {
     if let Some(t) = manifest_type {
         return match t {
@@ -539,10 +539,11 @@ fn resolve_type_id(name: &str, manifest_type: Option<&str>) -> u8 {
             _ => 2,
         };
     }
-    legacy_type_by_name(name)
+    type_by_name(name)
 }
 
-fn legacy_type_by_name(name: &str) -> u8 {
+/// The type byte of a module whose manifest declares no `type`.
+fn type_by_name(name: &str) -> u8 {
     match name {
         // Protocol (5) — drivers exposing a wire protocol surface.
         "cyw43" | "enc28j60" | "ch9120" | "sd" | "st7701s" | "gt911" | "pwm_rp" => 5,
@@ -1013,10 +1014,11 @@ fn is_up_to_date(
         return false;
     }
     // The target is part of the compile as well, and nothing else here can
-    // see it: a silicon whose module target changes (rp2350 moving from
-    // `eabihf` to soft-float) leaves every source older than every object,
-    // and the objects would be re-packed in the old ABI. The key carries the
-    // silicon's target features too (`compile_key`), for the same reason.
+    // see it: a silicon whose module target changes (say, from `eabihf` to
+    // soft-float) leaves every source older than every object, and the
+    // objects would be re-packed for a target they were not compiled for.
+    // The key carries the silicon's target features too (`compile_key`), for
+    // the same reason.
     if stamped_target(out_path).as_deref() != Some(module_target) {
         return false;
     }
@@ -2839,10 +2841,9 @@ pub static TICKS_ATOMIC: AtomicU32 = AtomicU32::new(3);
     }
 
     #[test]
-    fn resolve_type_id_falls_back_to_legacy_name_table() {
-        // A manifest with no `type = "..."` falls back to the name
-        // table the Makefile's mod_type macro hardcodes; the two must
-        // agree byte for byte.
+    fn resolve_type_id_falls_back_to_the_name_table() {
+        // A manifest with no `type = "..."` takes its byte from the
+        // name table.
         assert_eq!(resolve_type_id("cyw43", None), 5);
         assert_eq!(resolve_type_id("enc28j60", None), 5);
         assert_eq!(resolve_type_id("i2s_pio", None), 3);

@@ -7,17 +7,19 @@
 //!      stdin/stdout/stderr piped.
 //!   2. Write the JSON [`BackendInvocation`] to stdin; close stdin.
 //!   3. Drain stdout and stderr on threads while waiting, so a backend
-//!      that says a lot on stderr (an `aws` waiter, a traceback) never
-//!      fills the pipe and stalls against its own output.
+//!      that says a lot on stderr (a cloud CLI's waiter, a traceback)
+//!      never fills the pipe and stalls against its own output.
 //!   4. Wait for exit, bounded by the caller's timeout. A backend still
 //!      running at the deadline gets SIGTERM to its whole process group,
 //!      a grace period, then SIGKILL — so a grandchild it spawned cannot
 //!      carry on after the orchestrator has reported the step failed.
+//!      After exit, the wait for the pipes to close is bounded by the
+//!      same grace period.
 //!   5. Classify: exit 0 → the [`ActuatorReport`] on stdout (empty stdout
 //!      is `{"ok": true}`; `ok: false` is a failure); exit 64 → the verb
 //!      is unsupported; anything else → failed.
 
-use std::io::{Read, Write};
+use std::io::Write;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -26,7 +28,7 @@ use std::time::{Duration, Instant};
 use crate::error::{Error, Result};
 use crate::rig::backend::discover::BackendRef;
 use crate::rig::backend::protocol::{ActuatorReport, BackendInvocation, EXIT_UNSUPPORTED_VERB};
-use crate::rig::backend::with_relay;
+use crate::rig::backend::{terminate_group, with_relay, PipeDrain, DEFAULT_SHUTDOWN_GRACE};
 
 /// How to run one actuator call.
 #[derive(Debug, Clone)]
@@ -46,7 +48,7 @@ impl Default for InvokeOptions {
     fn default() -> Self {
         Self {
             timeout: Duration::from_secs(60),
-            grace: Duration::from_secs(2),
+            grace: DEFAULT_SHUTDOWN_GRACE,
             stderr_log: None,
         }
     }
@@ -99,7 +101,6 @@ pub fn invoke_with(
                 backend.describe(verb)
             ))
         })?;
-    let pgid = child.id() as libc::pid_t;
 
     let json = serde_json::to_string(invocation)
         .map_err(|e| Error::Config(format!("rig backend: serialising invocation: {e}")))?;
@@ -116,20 +117,8 @@ pub fn invoke_with(
     // exit means a backend that writes more than the pipe holds blocks
     // forever on its own stderr, and the timeout then reports a hang that
     // was really a full pipe.
-    let stdout_thread = child.stdout.take().map(|mut out| {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = out.read_to_end(&mut buf);
-            buf
-        })
-    });
-    let stderr_thread = child.stderr.take().map(|mut err| {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = err.read_to_end(&mut buf);
-            buf
-        })
-    });
+    let stdout_drain = child.stdout.take().map(PipeDrain::spawn);
+    let stderr_drain = child.stderr.take().map(PipeDrain::spawn);
 
     let deadline = Instant::now() + options.timeout;
     let mut timed_out = false;
@@ -139,26 +128,36 @@ pub fn invoke_with(
             Ok(None) => {
                 if Instant::now() >= deadline {
                     timed_out = true;
-                    kill_group(pgid, options.grace, &mut child);
+                    terminate_group(&mut child, options.grace);
                     break None;
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
             Err(e) => {
+                terminate_group(&mut child, options.grace);
                 return Err(Error::Config(format!(
                     "rig backend: waiting on `{} {verb}`: {e}",
                     backend.slug()
-                )))
+                )));
             }
         }
     };
 
-    let stdout_buf = stdout_thread
-        .and_then(|t| t.join().ok())
-        .unwrap_or_default();
-    let stderr_buf = stderr_thread
-        .and_then(|t| t.join().ok())
-        .unwrap_or_default();
+    // The pipes close when the last process holding them exits. One the
+    // backend started outside its group (a daemon it launched without
+    // redirecting stdio) can hold them indefinitely, so the wait for EOF
+    // is bounded by the grace period: the call returns either way.
+    let pipes_deadline = Instant::now() + options.grace;
+    let collect = |d: Option<PipeDrain>| d.map(|d| d.collect(pipes_deadline));
+    let (stdout_buf, stdout_closed) = collect(stdout_drain).unwrap_or((Vec::new(), true));
+    let (stderr_buf, stderr_closed) = collect(stderr_drain).unwrap_or((Vec::new(), true));
+    if !(stdout_closed && stderr_closed) {
+        eprintln!(
+            "[rig] `{} {verb}` exited but a process it started still holds its output; \
+             not waiting for it",
+            backend.slug()
+        );
+    }
     let stderr_text = String::from_utf8_lossy(&stderr_buf).into_owned();
     if let Some(path) = &options.stderr_log {
         if !stderr_buf.is_empty() {
@@ -265,41 +264,6 @@ pub fn invoke(
                 format!(" — stderr: {stderr_tail}")
             }
         ))),
-    }
-}
-
-/// SIGTERM the group, wait `grace`, SIGKILL whatever is left, reap the
-/// child. The reader threads see EOF once every holder of the pipes is
-/// gone, which the group kill guarantees.
-fn kill_group(pgid: libc::pid_t, grace: Duration, child: &mut std::process::Child) {
-    // SAFETY: a negative pid signals the whole process group; libc::kill
-    // has no memory effects, only signal delivery.
-    unsafe {
-        libc::kill(-pgid, libc::SIGTERM);
-    }
-    let deadline = Instant::now() + grace;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            _ => {
-                // SAFETY: same group signal as above.
-                unsafe {
-                    libc::kill(-pgid, libc::SIGKILL);
-                }
-                let _ = child.wait();
-                break;
-            }
-        }
-    }
-    // Grandchildren may outlive the child by a moment after SIGTERM; make
-    // sure the group is gone before the reader threads are joined.
-    // SAFETY: as above; the group may already be empty, in which case
-    // kill reports ESRCH and nothing happens.
-    unsafe {
-        libc::kill(-pgid, libc::SIGKILL);
     }
 }
 
@@ -420,7 +384,7 @@ mod tests {
     #[test]
     fn nonzero_exit_is_error_with_stderr_surfaced() {
         let (_dir, backend, _exec_guard) =
-            fixture_backend("fail", "#!/bin/sh\necho 'kasa unreachable' >&2\nexit 7\n");
+            fixture_backend("fail", "#!/bin/sh\necho 'plug unreachable' >&2\nexit 7\n");
         let err = invoke(
             &backend,
             "cycle",
@@ -430,7 +394,7 @@ mod tests {
         .unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("exited 7"), "{msg}");
-        assert!(msg.contains("kasa unreachable"), "{msg}");
+        assert!(msg.contains("plug unreachable"), "{msg}");
     }
 
     #[test]
@@ -551,6 +515,40 @@ mod tests {
         assert!(
             !crate::rig::lock::pid_alive(pid),
             "grandchild {pid} survived the group kill"
+        );
+    }
+
+    /// A backend that exits while a process it started still holds its
+    /// stdout must not hang the call: the wait for the pipes to close is
+    /// bounded by the grace period, and the report it wrote is kept.
+    #[test]
+    fn an_exited_backend_whose_child_holds_the_pipes_returns_within_the_grace() {
+        let (dir, backend, _exec_guard) = fixture_backend(
+            "lingering",
+            "#!/bin/sh\nread input\nsleep 30 &\necho $! > \"$LINGER_PID\"\nprintf '{\"ok\":true,\"info\":\"launched\"}\\n'\nexit 0\n",
+        );
+        let pidfile = dir.join("lingering.pid");
+        std::env::set_var("LINGER_PID", &pidfile);
+        let start = Instant::now();
+        let outcome = invoke_with(&backend, "on", &sample_invocation(), &opts(5000)).unwrap();
+        let elapsed = start.elapsed();
+        std::env::remove_var("LINGER_PID");
+        let pid: i32 = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // SAFETY: signals the test's own background `sleep`; no memory effects.
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+        match outcome {
+            ActuatorOutcome::Ok(report) => assert_eq!(report.info.as_deref(), Some("launched")),
+            other => panic!("expected Ok, got {other:?}"),
+        }
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "waited on a pipe held by the backend's child: {elapsed:?}"
         );
     }
 

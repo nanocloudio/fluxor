@@ -4,8 +4,7 @@
 //! `store_resolve` (uniform `[[artifact]]` entries over the OCI
 //! store). This module owns the one primitive shared by every
 //! lockfile writer: the exclusive advisory lock serializing
-//! read-modify-write transactions (`fluxor update`, `fluxor sync`,
-//! `fluxor store pin`).
+//! read-modify-write transactions (`fluxor update`, `fluxor sync`).
 
 use std::fs;
 use std::path::Path;

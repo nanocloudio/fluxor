@@ -9,14 +9,14 @@
 //! graph's wiring or its compiled body.
 //!
 //! The `AddSubgraph` (FLXA) blob produced here is byte-compatible with the
-//! kernel decoder `kernel::scheduler::live::apply_add_encoded`: big-endian,
-//! fixed-width, PIC modules referenced by `name_hash` (FNV-1a of the type name).
-//! The workload **section** wraps one or more FLXA blobs and is appended to the config
-//! blob PAST the checksummed body (the same additive post-body discipline as the
-//! adaptive-tick `tick_min/max` tail — see `kernel::config::ADAPTIVE_POST_SIZE`),
-//! so the body/CRC stay byte-identical and no format version is bumped. The
-//! kernel reads it in `kernel::config::read_config_from_slice` and admits each
-//! workload at boot via `apply_add_encoded` + `finalize_resident_graphs`.
+//! kernel decoder `kernel::exec::scheduler::live::apply_add_encoded`:
+//! big-endian, fixed-width, PIC modules referenced by `name_hash` (FNV-1a of
+//! the type name). The workload **section** wraps one or more FLXA blobs and
+//! is appended to the config blob PAST the checksummed body, after the
+//! adaptive-tick `tick_min/max` tail (`kernel::boot::config::ADAPTIVE_POST_SIZE`),
+//! so the body and its CRC do not cover it. The kernel reads it in
+//! `kernel::boot::config::read_config_from_slice` and admits each workload at
+//! boot via `apply_add_encoded` + `finalize_resident_graphs`.
 //!
 //! Scope: workloads are self-contained subgraphs — intra-workload edges only
 //! (`New → New`), and those edges must stay inside one domain, because a
@@ -39,9 +39,10 @@
 //! ```
 //!
 //! A workload composed here is its own authority: `flags` is always 0. Its
-//! one bit, `ADD_FLAG_CREATOR_AUTHORITY`, is honoured only from a node
-//! module's `APPLY_ADD` and refused on the workload `CREATE` path this blob
-//! takes.
+//! one bit, `ADD_FLAG_CREATOR_AUTHORITY`, is honoured only from the
+//! `APPLY_ADD` of a module acting with the node's authority, and refused on
+//! both paths a blob composed here takes: a boot graph's resident workloads
+//! and a workload `CREATE`.
 //!
 //! The module record's step budget carries the module's YAML
 //! `step_deadline_us`, `step_deadline_burst_us` and `fault_policy`, as a
@@ -50,16 +51,16 @@
 //! params TLV's tag `0xF1`). A workload's fault tags never ride in its params:
 //! the kernel takes a live-added module's budget from this record alone, and
 //! admits it only within the node's ceiling and with a policy confined to the
-//! module (see `config::workload_step_budget`, which refuses at build time
-//! what the kernel would refuse at admission).
+//! module (see `config::builder::workload_step_budget`, which refuses at build
+//! time what the kernel would refuse at admission).
 
 /// Wire magic for an `AddSubgraph` blob: "FLXA". Mirrors
-/// `kernel::scheduler::live::ADD_MAGIC`.
+/// `kernel::exec::scheduler::live::ADD_MAGIC`.
 pub const ADD_MAGIC: u32 = 0x464C_5841;
-/// `AddSubgraph` wire version. Mirrors `kernel::scheduler::live::ADD_VERSION`.
+/// `AddSubgraph` wire version. Mirrors `kernel::exec::scheduler::live::ADD_VERSION`.
 pub const ADD_VERSION: u16 = 1;
 /// Bytes of a module record before its params. Mirrors
-/// `kernel::scheduler::live::ADD_MODULE_FIXED_BYTES`.
+/// `kernel::exec::scheduler::live::ADD_MODULE_FIXED_BYTES`.
 pub const ADD_MODULE_FIXED_BYTES: usize = 4 + 1 + 4 + 4 + 1 + 2;
 
 /// Fault-policy wire bytes, as the kernel's `FaultPolicy::from_wire` reads
@@ -145,19 +146,20 @@ impl StepBudget {
     }
 }
 /// Resident-workload config-section magic: "FXPD". Mirrors
-/// `kernel::config::WORKLOAD_SECTION_MAGIC`.
+/// `kernel::boot::config::WORKLOAD_SECTION_MAGIC`.
 pub const WORKLOAD_SECTION_MAGIC: u32 = 0x4658_5044;
 
 /// Largest subgraph one `apply_add` admits — mirrors
-/// `kernel::scheduler::live::MAX_ADD_MODULES`.
+/// `kernel::exec::scheduler::live::MAX_ADD_MODULES`.
 pub const MAX_ADD_MODULES: usize = 64;
 /// Largest edge count one `apply_add` admits — mirrors
-/// `kernel::scheduler::live::MAX_ADD_EDGES`.
+/// `kernel::exec::scheduler::live::MAX_ADD_EDGES`.
 pub const MAX_ADD_EDGES: usize = 128;
 /// Largest resident-workload section the kernel will map — mirrors
-/// `kernel::config::MAX_WORKLOAD_SECTION_BYTES`. The encoder rejects output beyond
-/// this so a config that builds always admits ALL its workloads (the kernel caps the
-/// mapped section at this size and would otherwise silently truncate).
+/// `kernel::boot::config::MAX_WORKLOAD_SECTION_BYTES`. The encoder rejects
+/// output beyond this so a config that builds always admits ALL its workloads
+/// (the kernel caps the mapped section at this size and would otherwise
+/// silently truncate).
 pub const MAX_WORKLOAD_SECTION_BYTES: usize = 8 * 1024;
 
 /// One PIC module in a workload. `params` is the inline TLV blob (as

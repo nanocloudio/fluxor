@@ -72,18 +72,19 @@ pub const MODULE_MAGIC: u32 = 0x444D5846;
 /// Bumping this requires re-validating the platform's mapped modules
 /// region against the new ceiling.
 pub const MAX_MODULES_BLOB_SIZE: usize = 8 * 1024 * 1024;
-/// Total arena size for module state buffers.
-/// Bump-allocated per module at runtime — each module gets exactly what
-/// module_state_size() reports. Reset on graph reconfigure.
+/// The module state arena's size (`kernel::config`; on RP the silicon TOML's
+/// `[kernel] state_arena_kb`). Every module's state buffer and heap comes
+/// from it — a state buffer of the module's declared size, a heap committed
+/// whole or carved as an elastic heap grows — first fit over a bounded free
+/// list, else a bump. Reset wholesale at a rebuild.
 ///
-/// Channel buffers are allocated from a separate arena in buffer_pool.rs,
-/// so this entire budget is available for module state.
-///
-/// Module state arena size — the silicon TOML's `[kernel] state_arena_kb`.
+/// Channel buffers come from a separate arena (`buffer_pool.rs`), so this
+/// whole budget is module state and heaps.
 const STATE_ARENA_SIZE: usize = crate::kernel::config::STATE_ARENA_SIZE;
-// Pending modules hold a pointer to their params (in the resident config
-// blob, or the platform's override-merge storage) rather than a copy, so no
-// parameter blob is truncated to a fixed bound.
+// Module params are never copied into a loader buffer: a module, pending or
+// not, holds a pointer to its params in the resident config blob (or the
+// platform's override-merge storage), so no parameter blob is truncated to a
+// fixed bound.
 // ============================================================================
 // Error types
 // ============================================================================
@@ -3293,12 +3294,10 @@ impl DynamicModule {
         // `register_module_provider` as soon as module_new() returns
         // Ready — module code never touches registration directly.
         let auto_register = ProviderAutoRegister::resolve(module);
-        // 4b. If module exports module_arena_size, allocate and init heap.
-        // Failure here is a hard load error — a module that requested
-        // an arena but didn't get one will fail every heap_alloc call,
-        // typically silently: an arena ask larger than STATE_ARENA (a
-        // 16+ MiB request against 4 MiB on pi5) would otherwise skip the
-        // allocation and leave the module never instantiated, unreported.
+        // 4b. The heap. Failing to carve a committed heap is a hard load
+        // error, logged with the arena's occupancy: a module that asked for
+        // an arena and ran without one would fail every heap_alloc, usually
+        // silently.
         // Heap arena pointer/size captured for MMU-isolation region
         // registration below (null/0 when the module has no arena).
         let mut iso_heap_ptr: *mut u8 = core::ptr::null_mut();

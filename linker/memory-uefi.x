@@ -35,13 +35,15 @@ SECTIONS {
      * trailer, and the payload follows it in the file. */
     __end_data_addr = .;
 
-    /* As on bcm2712: BSS starts on a 16 MiB boundary, so the payload the
-     * loader places right after the binary sits in a window `_start` can
-     * relocate out of before BSS is zeroed. */
+    /* BSS starts on a 16 MiB boundary. `_start` zeroes BSS, so the payload
+     * packed after the binary must end below it (the packer refuses one
+     * that does not); the boundary leaves the payload everything from the
+     * binary's end up to it. */
     .bss (NOLOAD) : ALIGN(0x1000000) {
         __bss_start = .;
         *(.bss .bss.*)
         *(COMMON)
+        . = ALIGN(8);
         __bss_end = .;
     } > RAM
 
@@ -49,7 +51,8 @@ SECTIONS {
         *(.uninit .uninit.*)
     } > RAM
 
-    /* The boot stack above an unmapped guard page. */
+    /* The boot stack, above one page nothing is linked into
+     * (`__stack_guard`). */
     . = ALIGN(4096);
     __stack_guard = .;
     . = . + 4096;
@@ -65,7 +68,7 @@ SECTIONS {
     }
 }
 
-/* The header's fields (src/platform/uefi.rs). */
+/* The header's fields (`_start` in src/platform/uefi.rs). */
 __kernel_load_base = ORIGIN(RAM);
 __kernel_ram_end = ORIGIN(RAM) + LENGTH(RAM);
 __kernel_bytes = __end_data_addr - ORIGIN(RAM);

@@ -30,7 +30,6 @@ pub mod b64;
 pub mod capacity;
 pub mod ci_schema;
 pub mod compose;
-pub mod env_subst;
 pub mod error;
 pub mod genstore;
 pub mod gpu_contract;
@@ -38,6 +37,10 @@ pub mod gpu_pack;
 pub mod hash;
 pub mod hygiene;
 pub mod identity_key;
+// Published, parameterised stacks: the stack document, its typed params
+// and exports, include expansion, and the store side of publishing and
+// pinning one.
+pub mod stack;
 // `fluxor build|test|lint|clean` — the lifecycle verbs, plus the
 // generated `make help` block (`fluxor help --make`). Lives in the lib
 // so it can reach `ci`'s own phase runners rather than re-implementing
@@ -69,6 +72,13 @@ pub mod oci_store;
 // (serde_json + error) so it dual-compiles cleanly into both the lib
 // (tests) and the bin (called from `config.rs`).
 pub mod content_render;
+// A project's shippables: what lives under `packaging/` and how each is
+// read and checked. `fluxor publish`'s sweep and `fluxor ci` share it.
+pub mod packaging;
+// The one typed parameter model: `params:` declared in a graph, stack or
+// bundle graph, `${param:<name>}` placeholders, and the values a run or a
+// check renders with.
+pub mod params;
 pub mod presentation_resolver;
 pub mod presentation_shell;
 pub mod project;
@@ -76,7 +86,6 @@ pub mod protection;
 pub mod publish;
 pub mod render_template;
 pub mod runtime_abi;
-pub mod service_params;
 // The consolidated store flow: `store_publish` (the single store-write
 // path), `store_resolve` (uniform `[[artifact]]` lockfile resolution),
 // and `store_sync` (the one-path materialiser + `workspace publish`).

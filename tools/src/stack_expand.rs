@@ -2,8 +2,8 @@
 //!
 //! Reads `platform:` from user YAML, loads stack profiles from `stacks/*.toml`,
 //! matches a variant against board/target metadata, and injects concrete
-//! modules, wiring, params, and services into the config before the existing
-//! config generation pipeline runs.
+//! modules, wiring, params, and services into the config before config
+//! generation runs.
 //!
 //! Two kinds of injection blocks coexist in a stack file:
 //!
@@ -321,14 +321,25 @@ struct StackModule {
 // Public expansion entry point
 // ============================================================================
 
+/// Read a graph file the way every build, run and check reads one
+/// ([`fluxor_tools::stack::load_graph`]): an environment reference refused,
+/// its `params:` checked, its `include:` stacks expanded — a local stack
+/// path, and a `file` param value, relative to the graph's own directory, a
+/// stack name through `project_root` — and its placeholders rendered with
+/// the values this command was given. Runs before every other pass,
+/// platform stacks and placement included, so each sees an ordinary graph.
+pub fn load_graph(config_path: &std::path::Path, project_root: &std::path::Path) -> Result<Value> {
+    fluxor_tools::stack::load_graph(config_path, project_root)
+        .map_err(|e| Error::Config(format!("{}: {e}", config_path.display())))
+}
+
 /// Expand all `platform:` stacks into concrete modules, wiring, and services.
 ///
 /// Ordering is fixed by what this pass reads and writes. It needs the
 /// resolved target's `board_id`/`family`/`silicon` for match predicates, so
 /// it runs after `resolve_target`; it matches and injects against the
-/// canonical `modules:`/`wiring:` lists, so it runs after
-/// `translate_legacy_hardware_network` has folded the shorthand
-/// `hardware:`/`network:` form into those lists; and it runs before config
+/// graph's `modules:`/`wiring:` lists, so it runs after [`load_graph`] has
+/// expanded the graph's includes into them; and it runs before config
 /// generation, which consumes the expanded lists.
 pub fn expand_platform_stacks(
     config: &mut Value,

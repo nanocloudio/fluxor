@@ -409,6 +409,18 @@ fn linux_isr_tier_start(_period_us: u32) {}
 fn linux_isr_tier_stop() {}
 fn linux_isr_tier_poll() {}
 
+/// The platform's owner-release hook: an owner's root and what it opened
+/// through it (`owner_root`), and the host namespace and HTTP object handles
+/// an owner acting with the node's authority opened.
+fn linux_owner_released(owner: fluxor::kernel::workload::owner::OwnerHandle) {
+    fluxor::platform::linux::owner_root::release(owner);
+    // SAFETY: owner release runs on the scheduler thread, as every dispatch.
+    unsafe {
+        ns_release_opener(owner);
+        obj_release_opener(owner);
+    }
+}
+
 fn linux_init_providers() {
     // Override the default stub FS provider with one backed by real
     // libc I/O. The dispatcher also answers
@@ -417,8 +429,8 @@ fn linux_init_providers() {
     use fluxor::kernel::module::provider;
     use fluxor::kernel::module::provider::contract as dev_class;
     provider::register(dev_class::FS, linux_fs_dispatch);
-    // An owner's storage root goes with the owner.
-    provider::register_owner_release_hook(fluxor::platform::linux::owner_root::release);
+    // What an owner holds of the platform goes with the owner.
+    provider::register_owner_release_hook(linux_owner_released);
     provider::register(dev_class::STREAM_CLOCK, linux_stream_time_dispatch);
     // The platform's verdict on a certificate chain. Registered only where
     // the verifier is built in; without it nothing answers class 0x1D and a

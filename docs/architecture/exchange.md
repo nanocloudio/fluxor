@@ -140,3 +140,100 @@ module that owns the port.
 A module that writes answers places them through `ExchangeOutbox`
 (`modules/sdk/runtime/exchange.rs`): a record the channel has no room for is
 held and placed on a later step, so no answer is dropped.
+
+## Contracts behind an exchange
+
+A layer's owner fronts its contract with an exchange provider, so an
+application wires only exchange edges and reaches the layer the same way
+whether it runs in the same graph or across a network: embedding or going
+remote is a placement choice, not a different client. The front holds the
+resource; its requesters do not.
+
+`foundation/object_exchange` is the front of `storage.object`, the contract
+the key stores, `fs_object` and replicated stores all serve. It is a provider
+that never collects a request whole — a body runs to whatever the store takes —
+so it streams instead of using `Collector`: a request body moves to the
+store's `PUT_STREAMED_*` sequence a record at a time, under request-body
+credit it grants one window at a time as the stream takes what it was sent,
+and an object moves to the requester through `RANGE_GET` straight into
+response records, never past the response credit granted. Every record
+leaves through one `ExchangeOutbox`.
+
+| Request | Answer |
+|---|---|
+| `GET /<name>` | `200` with the object, or `206` for a `range: bytes=…`; `404` when absent |
+| `HEAD /<name>` | `200` with `content-length`, no body |
+| `PUT /<name>` | `200`: a single-shot put when the HEAD carries the whole body, a streamed one when it continues |
+| `DELETE /<name>` | `204` |
+| `GET /?list&prefix=…&after=…&max=…` | `200`, one page of names, one per line, with `next` when there is more |
+
+The name is the target after its `/`, verbatim. Every success carries the
+store's fence as `fence: <hex of Fence::encode>`, and the statuses map the
+store's refusals precisely: absent `404`, a condition that did not hold `412`,
+a body the store will not take `413`, a busy store `503`. A store's "not yet"
+(`EAGAIN` on a read, `EINPROGRESS` on a write) is asked again with the same
+request and is never an answer.
+
+Authority is a capability the graph gives the front (`scope`, `capability`):
+the front presents it to the store once and makes every call, for every
+request, under the grant the store answers, which the store checks on each
+call — the scope, the permissions, the window. Without one, every call names
+no grant, and a store with mesh roots refuses it `403`. Who may send requests
+is the graph's wiring: every requester wired to the front acts with its
+capability. The capability belongs to the front's instance, so it goes where
+the front is placed (below) and is presented to that node's store. A public S3
+front with its own signatures can sit in front of it as a requester. The full
+surface is the module's
+[README](../../modules/foundation/object_exchange/README.md).
+
+## Placement
+
+Where a provider runs is a placement choice: the requester reaches a
+provider on another node with the same records it uses on a local edge,
+wired to a stand-in instead of the provider. `foundation/remote_channel`
+carries one exchange across its authenticated session. With
+`exchange: near` it stands in for the remote provider, with the provider's
+ports (`request_in`, `response_out`); with `exchange: far`, on the
+provider's node, it stands in for the remote requester, with the
+requester's (`request_out`, `response_in`), wired to the real provider.
+Request records cross near to far and response records far to near, each
+direction a `mailbox` channel of its own at `RECORD_MAX`, whole and under
+that channel's credit, ids verbatim — so one requester per near endpoint,
+whose id space crosses intact. A placed member (`node:`) is never named by
+a wire; the graph wires the requester to a near endpoint as it would to the
+provider.
+
+The composer checks the placement as far as one graph shows it. A wire
+naming a placed member is refused. An instance's `exchange` mode must match
+the ports its wiring uses — `near` wires `request_in` and `response_out`,
+`far` wires `request_out` and `response_in`, `none` wires none of them —
+and both halves of an endpoint's pair must reach one module, a single
+requester or a single provider. A graph that places an exchange provider
+(a member whose manifest takes `ExchangeRequest` and answers
+`ExchangeResponse`) must hold a near endpoint for each one. Which provider a
+near endpoint reaches is its `authority`, a network name, and the far side
+is in the provider node's graph, so those two are not checked from the
+requester's.
+
+A session is the requester's backend link, and LINK is how it hears of it:
+
+- Before the first session, a request waits on its edge. Nothing is written
+  to the requester: LINK reports a change, and none has happened.
+- When a session ends, the near side delivers the answers that crossed
+  whole, writes `LINK DOWN`, and discards what the requester writes until it
+  has taken the DOWN and while the session stays down; the far side ABORTs
+  every exchange it handed the provider without a terminal record yet, and
+  drops what the provider writes for them.
+- The far side opens each session's answer channel with a LINK record
+  stating the provider's link, and only once the provider has taken every
+  ABORT and its answers are drained. The near side writes `LINK UP` when
+  that record says up, and the requester issues its open exchanges again
+  under the same ids; none can meet a record of the exchange before.
+- The provider's own LINK records cross; the requester hears the state the
+  session and the provider make together, each change once.
+
+Each exchange is answered once, with the answer to the last issue under its
+id. One whose answer was lost with the session was performed and is issued
+again, as a provider's own LINK DOWN already allows. The module's
+[README](../../modules/foundation/remote_channel/README.md) has the wire,
+the bounds and the counters.

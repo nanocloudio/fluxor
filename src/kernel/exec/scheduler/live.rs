@@ -24,10 +24,12 @@
 //! gated on a new owner (their `upstream_mask` is never touched), so a buggy
 //! ephemeral owner can't stall the system.
 //!
-//! Linux-first. The bcm2712/rp `domain_exec_order` splice + multicore quiesce,
-//! async PIC load, owner-tagged allocator, and partial replacement
-//! are documented follow-ups, not built here. Gated on `multitenant`
-//! (host-linux + bcm2712 enable it; bare-metal rp compiles it out at zero cost).
+//! On bcm2712 the per-domain dispatch tables are spliced too, with every peer
+//! core parked (see the live-splice section below). A PIC module loads within
+//! the add: a load that cannot complete synchronously refuses it
+//! ([`AddError::WouldBlock`]). Replacing part of a running owner is not part
+//! of this surface. Gated on `multitenant` (host-linux + bcm2712 enable it;
+//! bare-metal rp compiles it out at zero cost).
 
 use super::{
     BuiltInModule, Edge, FanDirection, InstantiateResult, ModuleId, ModuleSlot, SchedulerState,
@@ -321,8 +323,10 @@ pub struct AddSubgraph<'a> {
     pub modules: &'a mut [AddModule],
     pub edges: &'a [AddEdge],
     /// Admitted hard caps from the resource profile; 0 = unlimited (the
-    /// REPL/ephemeral default). Stored on the owner; fine-grained byte
-    /// enforcement is deferred to the owner-tagged allocator.
+    /// REPL/ephemeral default). Stored on the owner. `state_cap` bounds the
+    /// owner's module state, charged as each module instantiates;
+    /// `buffer_cap` is recorded and reported, and channel buffers are not
+    /// charged against it.
     pub state_cap: u32,
     pub buffer_cap: u32,
     /// Whose authority the new owner acts with.
@@ -353,7 +357,7 @@ pub enum AddError {
     BadEndpoint,
     ChannelOpenFailed,
     Instantiate,
-    /// PIC instantiation returned `Pending` (async load) — out of scope here.
+    /// A PIC load returned `Pending`: it cannot complete within the add.
     WouldBlock,
     /// The owner's admitted `state_cap` would be exceeded by this subgraph's
     /// module state. Refused at admission rather than allowed to draw down the
@@ -408,6 +412,11 @@ pub enum FreeError {
     /// The handle is unknown or its generation no longer matches (already
     /// freed / reused) — the fail-closed path.
     StaleHandle,
+    /// The owner is still being added (`Reserved`): the add that staged it
+    /// publishes it or rolls it back, and nothing else frees it — freeing it
+    /// underneath the add would leave the add placing modules for an owner
+    /// that is gone.
+    Staged,
 }
 
 impl FreeError {
@@ -415,6 +424,7 @@ impl FreeError {
         match self {
             FreeError::NotWorkload => -1,
             FreeError::StaleHandle => -2,
+            FreeError::Staged => -3,
         }
     }
 }
@@ -727,8 +737,12 @@ fn begin_staged(
                 scan += 1;
                 // A torn-down module's memory is kept while a source may still
                 // write into a buffer lent from it; the slot is not free yet.
+                // Nor is an empty slot stamped with a live owner: another add,
+                // staged and still instantiating, holds it.
+                let stamp = super::module_owner(candidate);
                 if matches!(s.modules[candidate], ModuleSlot::Empty)
                     && !crate::kernel::module::block_lend::slot_quarantined(candidate)
+                    && (stamp.is_system() || s.owners.lookup(stamp).is_none())
                 {
                     break candidate;
                 }
@@ -922,6 +936,15 @@ fn begin_staged(
         }
     }
 
+    // Every slot is stamped with the owner before any of its modules
+    // instantiates: a module's `module_new` runs as its owner, so what it
+    // allocates, opens and registers (its provider layers among them) is the
+    // owner's, reached with the owner's authority, never with the node's
+    // whose empty slot it took.
+    for &slot in local_to_global.iter().take(n) {
+        super::set_module_owner(slot, handle);
+    }
+
     let _ = sub;
     Ok(StagedAdd {
         handle,
@@ -936,9 +959,9 @@ fn begin_staged(
     })
 }
 
-/// Step 6 of an add, `max` modules at a time: instantiate each module and
-/// stamp it with the owner. `Ok(true)` once every module is in. An error
-/// rolls the whole add back; the staged add is then gone.
+/// Step 6 of an add, `max` modules at a time: instantiate each module, as
+/// the owner its slot is stamped with. `Ok(true)` once every module is in.
+/// An error rolls the whole add back; the staged add is then gone.
 pub fn instantiate_batch(st: &mut StagedAdd, max: usize) -> Result<bool, AddError> {
     let n = st.n;
     let e = st.e;
@@ -965,11 +988,10 @@ pub fn instantiate_batch(st: &mut StagedAdd, max: usize) -> Result<bool, AddErro
         if let Err(err) = res {
             // Roll back: free this and any earlier instantiated slots, close
             // the new channels, drop the appended edges, revoke the owner.
-            rollback_add(handle, &local_to_global[..=local], edge_base, e);
+            rollback_add(handle, &local_to_global[..n], local + 1, edge_base, e);
             st.done = n;
             return Err(err);
         }
-        super::set_module_owner(slot, handle);
         // Charge this module's state-arena draw against the owner's admitted
         // `state_cap` (cap 0 = unlimited). The allocation has already happened
         // — the loader is the only half that knows the size — so exceeding the
@@ -986,7 +1008,7 @@ pub fn instantiate_batch(st: &mut StagedAdd, max: usize) -> Result<bool, AddErro
                 charged,
                 footprint,
             );
-            rollback_add(handle, &local_to_global[..=local], edge_base, e);
+            rollback_add(handle, &local_to_global[..n], local + 1, edge_base, e);
             st.done = n;
             return Err(AddError::StateCapExceeded);
         }
@@ -1037,7 +1059,7 @@ pub fn finish_staged(st: StagedAdd) -> Result<OwnerHandle, AddError> {
                 "[live] owner slot {} net lane {key} refused: {rc}",
                 handle.slot
             );
-            rollback_add(handle, &local_to_global[..n], edge_base, e);
+            rollback_add(handle, &local_to_global[..n], n, edge_base, e);
             return Err(AddError::NetAttachFailed);
         }
     }
@@ -1101,9 +1123,9 @@ pub fn finish_staged(st: StagedAdd) -> Result<OwnerHandle, AddError> {
     // split across the SPSC pump (different domains, or
     // `EdgeClass::CrossCore`) must bind at consumer-side pump delivery
     // instead — a producer-side binding is the guaranteed-spurious
-    // write-time wake — and the live path does no cross-domain bridging
-    // (Linux-first, see the module header), so such edges stay unbound and
-    // degrade to readable-channel-scan/backstop service. Runs after
+    // write-time wake — and the live path does no cross-domain bridging,
+    // so such edges stay unbound and are served by the readable-channel
+    // scan and the backstop. Runs after
     // instantiation (the last fallible step, and the point where the new
     // modules' `domain_id` is stamped), so a rollback never leaves a
     // binding behind.
@@ -1135,7 +1157,7 @@ pub fn finish_staged(st: StagedAdd) -> Result<OwnerHandle, AddError> {
     // 8. Activate.
     sched().owners.set_state(handle, OwnerState::Active);
     // Refresh the multi-graph runner's bounded resident-graph index so the new
-    // owner is multiplexed (and its §7 pacer instance gets primed) on the next
+    // owner is multiplexed (and its pacer instance gets primed) on the next
     // pass. Bounded one-shot, off the hot path.
     super::rebuild_resident_graph_index();
     // Publication complete — release the parked peer cores (no-op if none).
@@ -1148,7 +1170,8 @@ pub fn finish_staged(st: StagedAdd) -> Result<OwnerHandle, AddError> {
 pub fn abandon_staged(st: StagedAdd) {
     rollback_add(
         st.handle,
-        &st.local_to_global[..st.done],
+        &st.local_to_global[..st.n],
+        st.done,
         st.edge_base,
         st.e,
     );
@@ -1231,9 +1254,16 @@ fn caller_keys_valid(edges: &[AddEdge]) -> bool {
 }
 
 /// Roll back a partially-applied add. The exec-order splice has not happened
-/// yet, so only instantiated slots, opened channels, and appended edges need
-/// undoing, then the owner is revoked.
-fn rollback_add(handle: OwnerHandle, slots: &[usize], edge_base: usize, e: usize) {
+/// yet, so only the staged slots (the first `instantiated` of them holding a
+/// module), opened channels, and appended edges need undoing, then the owner
+/// is revoked. Every staged slot goes back to the node, stamp included.
+fn rollback_add(
+    handle: OwnerHandle,
+    slots: &[usize],
+    instantiated: usize,
+    edge_base: usize,
+    e: usize,
+) {
     // An add that failed part-way still ran `module_new` for the slots that did
     // instantiate, and those may already have asked a provider for resources.
     // Same edge, same ordering as `free_owner`: notify before anything is torn
@@ -1242,7 +1272,7 @@ fn rollback_add(handle: OwnerHandle, slots: &[usize], edge_base: usize, e: usize
     // SAFETY: scheduler thread, before the owner's channels close.
     unsafe { crate::kernel::workload::net_attach::detach(handle) };
     let s = sched();
-    for &slot in slots {
+    for &slot in &slots[..instantiated.min(slots.len())] {
         // What a module that instantiated registered or opened (provider
         // layer, ioctl handler, events, timers) goes before its state does.
         crate::kernel::module::syscalls::release_module_handles(slot as ModuleId);
@@ -1251,6 +1281,8 @@ fn rollback_add(handle: OwnerHandle, slots: &[usize], edge_base: usize, e: usize
         super::free_module_state(slot);
         s.type_hash[slot] = 0;
         s.slot_generation[slot] = s.slot_generation[slot].wrapping_add(1);
+    }
+    for &slot in slots {
         super::set_module_owner(slot, OWNER_SYSTEM);
     }
     if e > 0 {
@@ -1579,6 +1611,7 @@ pub fn free_owner(handle: OwnerHandle) -> Result<(), FreeError> {
         return Err(FreeError::NotWorkload);
     }
     let state = match sched().owners.lookup(handle) {
+        Some(e) if e.state == OwnerState::Reserved => return Err(FreeError::Staged),
         Some(e) => e.state,
         None => return Err(FreeError::StaleHandle),
     };
@@ -1774,8 +1807,8 @@ pub fn free_owner(handle: OwnerHandle) -> Result<(), FreeError> {
     #[cfg(feature = "multitenant")]
     crate::kernel::workload::code_pack::release_owner(handle.slot);
     // Drop the freed owner from the resident-graph index. A later slot reuse
-    // bumps the generation, so its §7 pacer instance resets (§7.1) and the
-    // re-added entry is re-primed.
+    // bumps the generation, so its pacer instance resets and the re-added
+    // entry is re-primed.
     super::rebuild_resident_graph_index();
     // Teardown complete — release the parked peer cores (no-op if none).
     release_peers(parked);
@@ -1794,12 +1827,11 @@ pub fn free_owner(handle: OwnerHandle) -> Result<(), FreeError> {
 // `module_drain`, no channel-empty requirement, no deadline. In-flight
 // steps complete naturally (pause runs on the scheduler thread between
 // steps — there is no preemption to suppress); from the next runner pass
-// the §6.5 predicate treats the owner's graphs as not-runnable regardless
-// of readable inbound data, and inbound writes simply buffer in the
-// owner's channels (deferred, not refused — divergence from §3.5's
-// refuse-or-defer choice, documented here: channel rings are lossless and
-// bounded, so buffering IS the deferral; producers see normal
-// backpressure when the ring fills).
+// the runner's runnable predicate treats the owner's graphs as not-runnable
+// regardless of readable inbound data, and inbound writes simply buffer in
+// the owner's channels: deferred, not refused, because channel rings are
+// lossless and bounded, so buffering IS the deferral; producers see normal
+// backpressure when the ring fills.
 
 /// The owner's stamped module set. Bounded scan; scheduler-thread only.
 fn owned_module_mask(handle: OwnerHandle) -> crate::kernel::workload::bitmask::ModuleMask {
@@ -1885,7 +1917,8 @@ pub fn owner_resume(handle: OwnerHandle) -> Result<(), PauseError> {
 // Bounded binary `AddSubgraph` for the on-device caller (REPL / node agent).
 // Big-endian, fixed-width — same discipline as the composed-plan codec in
 // `tools/src/compose.rs`. PIC modules only (a built-in has no serialisable
-// form); a target with asynchronous PIC load returns `WouldBlock`.
+// form); a module whose load cannot complete within the call refuses the add
+// (`WouldBlock`, `EAGAIN`).
 // Integrity/signature verification of the blob is the signing
 // layer's job and the channel is authenticated (the node agent's), so this
 // decoder validates structure and bounds, not a content digest.
@@ -1907,14 +1940,14 @@ pub fn owner_resume(handle: OwnerHandle) -> Result<(), PauseError> {
 // TLV's tag `0xF1` (0 skip, 1 restart, 2 restart_graph, 3 tolerate). A policy
 // byte outside that set fails the decode (`EINVAL`); a known policy or a
 // deadline the node does not admit a workload refuses the add
-// ([`admit_step_budget`], also `EINVAL`).
+// ([`admit_step_budget`], `ERANGE`).
 //
 // `flags` holds one bit, `ADD_FLAG_CREATOR_AUTHORITY` (0x0001): the new owner
 // acts with its creator's authority. Only the module syscall names a creator
 // ([`apply_add_encoded_by`]); every other decode refuses the bit (`EINVAL`),
 // and every decode refuses an undefined bit.
 //
-// A module's params are its own: an add refuses (`EINVAL`) params whose TLV
+// A module's params are its own: an add refuses (`EACCES`) params whose TLV
 // carries a node tag (`is_node_param_tag`: the fault tags, trust tier,
 // protection level, quarantine partner, ISR budget, IRQ, device window),
 // before anything is allocated. Only the node's own graph grants those.

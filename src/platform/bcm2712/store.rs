@@ -436,6 +436,12 @@ fn node_caller() -> bool {
     !crate::kernel::workload::storage::rooted(crate::kernel::exec::scheduler::caller_owner())
 }
 
+/// Whether a slot is open and the caller opened it: a slot answers its
+/// opener alone.
+fn opened_by_caller(in_use: bool, opener: OwnerHandle) -> bool {
+    in_use && opener == crate::kernel::exec::scheduler::caller_owner()
+}
+
 /// Close every handle `opener` holds on the store: its `GET` reads and its
 /// subscriptions. Part of the owner-release hook, for an owner that acted
 /// with the node's authority: what it opened goes with it.
@@ -725,7 +731,10 @@ pub unsafe fn dispatch_object(handle: i32, opcode: u32, arg: *mut u8, arg_len: u
             // [offset:u64][length:u32][out_ptr:u64]
             let idx = slot_of(handle) as usize;
             let reads = &*core::ptr::addr_of!(READS);
-            if idx >= MAX_READS || !reads[idx].in_use {
+            if handle < 0
+                || idx >= MAX_READS
+                || !opened_by_caller(reads[idx].in_use, reads[idx].opener)
+            {
                 return errno::ENOSYS;
             }
             let Some(offset) = get_u64(a, 0).map(|v| v as usize) else {
@@ -880,7 +889,10 @@ pub unsafe fn dispatch_object(handle: i32, opcode: u32, arg: *mut u8, arg_len: u
         obj_op::CLOSE => {
             let idx = slot_of(handle) as usize;
             let reads = &mut *core::ptr::addr_of_mut!(READS);
-            if idx < MAX_READS {
+            if handle >= 0
+                && idx < MAX_READS
+                && opened_by_caller(reads[idx].in_use, reads[idx].opener)
+            {
                 reads[idx] = READ_EMPTY;
             }
             0
@@ -1155,7 +1167,8 @@ pub unsafe fn dispatch_namespace(handle: i32, opcode: u32, arg: *mut u8, arg_len
         ns_op::CLOSE => {
             let idx = slot_of(handle) as usize;
             let subs = &mut *core::ptr::addr_of_mut!(SUBS);
-            if idx < MAX_SUBS {
+            if handle >= 0 && idx < MAX_SUBS && opened_by_caller(subs[idx].in_use, subs[idx].opener)
+            {
                 subs[idx] = SUB_EMPTY;
             }
             0

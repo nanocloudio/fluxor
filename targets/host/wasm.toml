@@ -31,8 +31,8 @@ pio_count = 0
 pio_state_machines = 0
 dma_channels = 0
 
-# Kernel capacity for the WASM target (arenas, module slots, config and
-# log-ring sizes) lives in `src/kernel/config.rs::profile_wasm`, selected
+# Kernel capacity for the WASM target (arenas, module slots, heap segments,
+# the log ring) lives in `src/kernel/config.rs::profile_wasm`, selected
 # by the `host-wasm` feature. It is kernel capacity, not ABI.
 
 [memory]

@@ -11,9 +11,9 @@
 ENTRY(_start)
 EXTERN(_start)
 
-/* RAM holds the image, .bss (the buffer arena, elastic region, fixed tables
- * and pools, ~100 MiB on the host profile) and the stack, with the relocated
- * package payload above __end_block_addr.
+/* RAM holds the image, the payload window after it (the module table and
+ * config the packer appends, read in place), .bss (the buffer arena, elastic
+ * region, OTA staging buffers, fixed tables and pools) and the stack.
  *
  * The module state arena (kernel::config STATE_ARENA_SIZE, 1 GiB) is
  * a region of its own at ARENA_ORIGIN, never zeroed at boot: the loader
@@ -97,7 +97,7 @@ SECTIONS {
     . = . + 1M;
     __stack_end = .;
 
-    /* End of runtime-reserved RAM. Relocated package payload lives above this. */
+    /* End of runtime-reserved RAM. */
     __end_block_addr = .;
 
     /* Placed last: the location counter moves into ARENA here, and every

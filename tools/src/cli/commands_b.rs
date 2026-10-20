@@ -1,17 +1,30 @@
 fn cmd_validate(
-    config_path: &PathBuf,
+    config_path: &Path,
     target_override: Option<&str>,
     module_root: Option<&Path>,
 ) -> Result<()> {
-    let content = substitute_env_vars(&std::fs::read_to_string(config_path)?)?;
-    let config: serde_json::Value = if config_path
-        .extension()
-        .is_some_and(|ext| ext == "yaml" || ext == "yml")
-    {
-        serde_yaml::from_str(&content)?
-    } else {
-        serde_json::from_str(&content)?
-    };
+    // A stack is not a graph; checked on its own it must parse and
+    // render with its defaults and examples. Its edges to the outside are
+    // checked by the graphs that include it.
+    if let Some(stack) = read_stack_document(config_path)? {
+        let dir = config_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        stack
+            .check_render(dir)
+            .map_err(|e| Error::Config(format!("{}: {e}", config_path.display())))?;
+        println!(
+            "Stack '{}' is well-formed: {} module(s), {} param(s), {} export(s).",
+            stack.name,
+            stack.module_names().len(),
+            stack.params.len(),
+            stack.exports.len()
+        );
+        return Ok(());
+    }
+    let config: serde_json::Value =
+        stack_expand::load_graph(config_path, &crate::project::root_for_config(config_path))?;
 
     let mut config = config;
     let target_desc = resolve_target(&config, target_override)?;
@@ -122,7 +135,7 @@ fn cmd_validate(
     let search_paths = crate::config::extract_module_search_paths(&config, config_path);
     let extra_dirs: Vec<&std::path::Path> = search_paths.iter().map(|p| p.as_path()).collect();
     let dry_run_builder = ConfigBuilder::new();
-    if let Err(e) = config::generate_config_ext(
+    match config::generate_config_ext(
         &config,
         &dry_run_builder,
         &[],
@@ -133,7 +146,23 @@ fn cmd_validate(
         Some(&target_desc.id),
         &crate::project::root_for_config(config_path),
     ) {
-        result.add_error(format!("{e}"));
+        Err(e) => result.add_error(format!("{e}")),
+        Ok(blob) => {
+            // The hosted builds compile the config with no module
+            // capabilities (`cmd_generate`), the packed images with them.
+            let packed_image = !matches!(target_desc.family.as_str(), "linux" | "wasm");
+            if let Err(e) = check_ring_demand_unbuilt(
+                &config,
+                &blob,
+                &modules_dir,
+                &extra_dirs,
+                &target_desc,
+                &project_root,
+                packed_image,
+            ) {
+                result.add_error(format!("{e}"));
+            }
+        }
     }
 
     // Print warnings (yellow)
@@ -166,6 +195,107 @@ fn cmd_validate(
         );
         Err(error::Error::Config("Validation failed".into()))
     }
+}
+
+/// The buffer-arena check of `fluxor build`, for a graph whose `.fmod`s may
+/// not be at hand. With them it is the build's own check: what the loader
+/// would hold for each, over `blob` — or, for a packed image
+/// (`packed_image`), the config compiled again with their capabilities, as
+/// the image build compiles it (in-place chains grouped). Without them, the
+/// source manifests stand in, every module counted as not mailbox-safe, so no
+/// ring is aliased: the sum is then an upper bound.
+fn check_ring_demand_unbuilt(
+    config: &serde_json::Value,
+    blob: &[u8],
+    modules_dir: &Path,
+    extra_dirs: &[&Path],
+    target: &crate::target::TargetDescriptor,
+    project_root: &Path,
+    packed_image: bool,
+) -> Result<()> {
+    let store_fb = store_cli::lock_store_resolver(project_root, target.module_abi(), None);
+    if let Ok(packed) = parse_modules_from_config_multi(
+        config,
+        modules_dir,
+        extra_dirs,
+        store_fb.as_deref().map(|f| f as _),
+    ) {
+        if !packed_image {
+            return check_ring_demand(config, blob, &packed, target, extra_dirs, project_root);
+        }
+        let caps: Vec<ModuleCaps> = packed
+            .iter()
+            .map(|m| ModuleCaps {
+                name: m.name.clone(),
+                mailbox_safe: m.mailbox_safe,
+                in_place_writer: m.in_place_writer,
+                manifest: m.manifest.clone(),
+            })
+            .collect();
+        let recompiled = config::generate_config_ext(
+            config,
+            &ConfigBuilder::new(),
+            &caps,
+            modules_dir,
+            extra_dirs,
+            target.max_pin + 1,
+            target.pio_count,
+            Some(&target.id),
+            project_root,
+        )?;
+        return check_ring_demand(
+            config,
+            &recompiled,
+            &packed,
+            target,
+            extra_dirs,
+            project_root,
+        );
+    }
+    let manifests = config::load_module_manifests_with_extra_for_target(
+        &config["modules"],
+        extra_dirs,
+        Some(target.id.as_str()),
+        project_root,
+    );
+    let mut facts = std::collections::HashMap::new();
+    for m in config["modules"].as_array().into_iter().flatten() {
+        let Some(name) = m.get("name").and_then(|n| n.as_str()) else {
+            continue;
+        };
+        let ty = m.get("type").and_then(|t| t.as_str()).unwrap_or(name);
+        if let Some(manifest) = manifests.get(name).filter(|mf| !mf.builtin) {
+            facts.insert(
+                crate::hash::fnv1a_hash(ty.as_bytes()),
+                crate::ring_demand::ModuleFacts {
+                    manifest,
+                    mailbox_safe: false,
+                },
+            );
+        }
+    }
+    crate::ring_demand::check(config, blob, &facts, &manifests, target)
+}
+
+/// The stack `path` holds, when it holds one (a YAML document with a
+/// `stack:` key); `None` for a graph.
+fn read_stack_document(path: &Path) -> Result<Option<fluxor_tools::stack::Stack>> {
+    if !path
+        .extension()
+        .is_some_and(|ext| ext == "yaml" || ext == "yml")
+    {
+        return Ok(None);
+    }
+    let text = std::fs::read_to_string(path)?;
+    let Ok(doc) = serde_yaml::from_str::<serde_yaml::Value>(&text) else {
+        return Ok(None);
+    };
+    if !fluxor_tools::stack::is_stack_document(&doc) {
+        return Ok(None);
+    }
+    fluxor_tools::stack::Stack::from_document(&doc)
+        .map(Some)
+        .map_err(|e| Error::Config(format!("{}:\n{e}", path.display())))
 }
 
 /// `fluxor abi-regen [--check]` — the single writer of the ABI-surface pin.
@@ -551,9 +681,7 @@ fn cmd_inspect_json(config_path: Option<&Path>) -> Result<()> {
 /// Build the JSON sub-object for the `config` block — mirrors the
 /// human-text `Config:` rendering. Read-only; never mutates state.
 fn config_inspection_json(config_path: &Path, project_root: &Path) -> serde_json::Value {
-    let raw = match std::fs::read_to_string(config_path)
-        .and_then(|s| substitute_env_vars(&s).map_err(|e| std::io::Error::other(e.to_string())))
-    {
+    let raw = match std::fs::read_to_string(config_path) {
         Ok(s) => s,
         Err(e) => {
             return serde_json::json!({
@@ -617,6 +745,9 @@ fn config_inspection_json(config_path: &Path, project_root: &Path) -> serde_json
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| std::path::PathBuf::from("."));
+    if let Ok(loaded) = stack_expand::load_graph(config_path, project_root) {
+        probe = loaded;
+    }
     let _ = inline_route_body_files(&mut probe, &probe_yaml_dir);
     let expanded_stack_modules: Vec<String> = if let Ok(desc) = resolve_target(&parsed, None) {
         stack_expand::expand_platform_stacks(&mut probe, &desc, project_root).unwrap_or_default()
@@ -1041,7 +1172,6 @@ fn inspect_config(config_path: &Path, project_root: &Path) -> Result<()> {
     let content = std::fs::read_to_string(config_path).map_err(|e| {
         error::Error::Config(format!("Cannot read config {}: {e}", config_path.display()))
     })?;
-    let content = substitute_env_vars(&content)?;
     let raw: serde_json::Value = if config_path
         .extension()
         .is_some_and(|ext| ext == "yaml" || ext == "yml")
@@ -1116,6 +1246,9 @@ fn inspect_config(config_path: &Path, project_root: &Path) -> Result<()> {
         if probe_yaml_dir.as_os_str().is_empty() {
             probe_yaml_dir = std::path::PathBuf::from(".");
         }
+        if let Ok(loaded) = stack_expand::load_graph(config_path, project_root) {
+        probe = loaded;
+    }
         let _ = inline_route_body_files(&mut probe, &probe_yaml_dir);
         match stack_expand::expand_platform_stacks(&mut probe, &desc, project_root) {
             Ok(added) if added.is_empty() => {
@@ -1160,15 +1293,8 @@ fn inspect_config(config_path: &Path, project_root: &Path) -> Result<()> {
 }
 
 fn cmd_mktable_config(config_path: &Path, module_root: Option<&Path>, output: &Path) -> Result<()> {
-    let content = substitute_env_vars(&std::fs::read_to_string(config_path)?)?;
-    let mut config: serde_json::Value = if config_path
-        .extension()
-        .is_some_and(|ext| ext == "yaml" || ext == "yml")
-    {
-        serde_yaml::from_str(&content)?
-    } else {
-        serde_json::from_str(&content)?
-    };
+    let mut config: serde_json::Value =
+        stack_expand::load_graph(config_path, &crate::project::root_for_config(config_path))?;
     let yaml_dir = config_path
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."));
@@ -1212,12 +1338,11 @@ fn cmd_mktable_config(config_path: &Path, module_root: Option<&Path>, output: &P
     Ok(())
 }
 
-fn cmd_diff(old_path: &PathBuf, new_path: &PathBuf, target_override: Option<&str>) -> Result<()> {
-    let old_content = substitute_env_vars(&std::fs::read_to_string(old_path)?)?;
-    let new_content = substitute_env_vars(&std::fs::read_to_string(new_path)?)?;
-
-    let old_config: serde_json::Value = serde_yaml::from_str(&old_content)?;
-    let new_config: serde_json::Value = serde_yaml::from_str(&new_content)?;
+fn cmd_diff(old_path: &Path, new_path: &Path, target_override: Option<&str>) -> Result<()> {
+    let old_config =
+        stack_expand::load_graph(old_path, &crate::project::root_for_config(old_path))?;
+    let new_config =
+        stack_expand::load_graph(new_path, &crate::project::root_for_config(new_path))?;
 
     let target_desc = resolve_target(&new_config, target_override)?;
     let modules_dir = target_module_root(
@@ -1271,10 +1396,6 @@ fn build_one(
     build_one_from(yaml_path, output_override, None, verbose)
 }
 
-/// [`build_one`] with an explicit `--module-root`: the directory every
-/// `.fmod` the graph names is loaded from, instead of the project's built
-/// modules (`$FLUXOR_MODULE_ROOT` applies when it is `None`). A service
-/// bundle builds from its own pinned modules this way.
 /// A bare-metal image is the firmware plus the modules: both must have been
 /// built, by the commands named here, before it can be packed.
 fn require_firmware_and_modules(
@@ -1308,6 +1429,10 @@ fn require_firmware_and_modules(
     Ok(())
 }
 
+/// [`build_one`] with an explicit `--module-root`: the directory every
+/// `.fmod` the graph names is loaded from, instead of the project's built
+/// modules (`$FLUXOR_MODULE_ROOT` applies when it is `None`). A service
+/// bundle builds from its own pinned modules this way.
 fn build_one_from(
     yaml_path: &std::path::Path,
     output_override: Option<&std::path::Path>,
@@ -1315,15 +1440,8 @@ fn build_one_from(
     verbose: bool,
 ) -> Result<BuildResult> {
     // Load and parse config
-    let content = substitute_env_vars(&std::fs::read_to_string(yaml_path)?)?;
-    let config: serde_json::Value = if yaml_path
-        .extension()
-        .is_some_and(|ext| ext == "yaml" || ext == "yml")
-    {
-        serde_yaml::from_str(&content)?
-    } else {
-        serde_json::from_str(&content)?
-    };
+    let config: serde_json::Value =
+        stack_expand::load_graph(yaml_path, &crate::project::root_for_config(yaml_path))?;
 
     let mut config = config;
     let target_desc = resolve_target(&config, None)?;
@@ -1411,7 +1529,7 @@ fn build_one_from(
             )?;
             cmd_combine(
                 &firmware_path,
-                &yaml_path.to_path_buf(),
+                yaml_path,
                 &output_path,
                 module_root,
                 verbose,
@@ -1428,7 +1546,7 @@ fn build_one_from(
             )?;
             cmd_combine(
                 &firmware_path,
-                &yaml_path.to_path_buf(),
+                yaml_path,
                 &output_path,
                 module_root,
                 verbose,
@@ -1674,8 +1792,8 @@ fn extract_asset_pairs(
 
 // ── Polymorphic `fluxor inspect` ─────────────────────────────────────
 
-/// Flag bundle for the polymorphic `fluxor inspect` (Decision 5: one
-/// read-only verb over project / config / UF2 / store subjects).
+/// Flag bundle for the polymorphic `fluxor inspect`: one read-only verb
+/// over project / config / UF2 / store subjects.
 struct InspectFlags {
     json: bool,
     emit_config: bool,

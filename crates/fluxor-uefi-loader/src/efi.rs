@@ -1,9 +1,9 @@
-//! The UEFI interfaces the stub calls, and nothing else: the system table,
+//! The UEFI interfaces the loader calls, and nothing else: the system table,
 //! the boot and runtime services it uses, the text console, the loaded-image
 //! and file-system protocols that reach the ESP, and the RNG protocol.
 //! Layouts and member order follow the UEFI 2.10 specification; a table's
-//! members the stub never calls are kept as placeholders so the ones it does
-//! call sit at the right offsets.
+//! members the loader never calls are kept as placeholders so the ones it
+//! does call sit at the right offsets.
 
 use core::ffi::c_void;
 
@@ -84,7 +84,7 @@ pub struct SimpleTextOutput {
 
 /// `EFI_ALLOCATE_TYPE`.
 pub const ALLOCATE_ADDRESS: u32 = 2;
-/// `EFI_MEMORY_TYPE` values the stub allocates as and reads back.
+/// `EFI_MEMORY_TYPE` values the loader allocates as and reads back.
 pub const LOADER_CODE: u32 = 1;
 pub const LOADER_DATA: u32 = 2;
 pub const BOOT_SERVICES_CODE: u32 = 3;

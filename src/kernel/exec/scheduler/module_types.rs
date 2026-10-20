@@ -45,13 +45,16 @@ use crate::modules::{Module, StepOutcome};
 /// domain runs on exactly one core, so indexing by `domain_id` keeps
 /// each core on its own buffer.
 ///
-///   * **aarch64** — 32 KiB. ETH rings can hit 32 KiB on Pi-class
-///     targets; one step drains a full ring.
+///   * **aarch64** (bcm2712, and Linux on aarch64) — 32 KiB. ETH rings
+///     can hit 32 KiB on Pi-class targets; one step drains a full ring.
 ///   * **chip-rp2040 / chip-rp2350b** — 2 KiB. RP chips have tight
 ///     `.bss` budgets; audio fan-out (~1 KiB chunks) and the log_net
 ///     merge stay well below this.
-///   * **wasm32 / linux host** — 8 KiB, matching the default
-///     `CHANNEL_BUFFER_SIZE`.
+///   * **everything else** (wasm32, Linux on other architectures) —
+///     8 KiB, matching the default `CHANNEL_BUFFER_SIZE`.
+///
+/// Static `.bss`, not the buffer arena: the rings on either side of a fan
+/// are ordinary channels, sized by `ring_size` like any other edge.
 #[cfg(target_arch = "aarch64")]
 const FAN_BUF_SIZE: usize = 32768;
 #[cfg(any(feature = "chip-rp2040", feature = "chip-rp2350b"))]

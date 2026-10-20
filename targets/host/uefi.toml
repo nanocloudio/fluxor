@@ -4,9 +4,9 @@
 # The firmware is the runtime the kernel starts on: a cloud instance or an
 # emulated machine boots the fluxor loader from its EFI system partition, the
 # loader hands the kernel the machine as UEFI and ACPI describe it, and from
-# then on the kernel is the only thing running. One target covers every
-# architecture UEFI runs on, as `linux` does; this file is its aarch64 build,
-# loading the same `aarch64` modules bcm2712 and hosted linux run.
+# then on the kernel is the only thing running. The `uefi` runtime names
+# every architecture UEFI runs on, as `linux` does; this file is its aarch64
+# build, on the `aarch64` module ABI bcm2712 and hosted linux share.
 #
 # Build: tools/firmware.sh uefi (or a board standing on it, `[board] host = "uefi"`)
 
@@ -46,8 +46,7 @@ dma_channels = 0
 # reserves exactly this span from the firmware's map and refuses a busy page
 # in it, naming what holds it and the free spans that would do instead. On
 # QEMU `virt` with AAVMF the firmware's boot-services data sits at 1 GiB +
-# 64 MiB, so the span starts above it; the state arena is placed from the
-# firmware's map at boot, not linked.
+# 64 MiB, so the span starts above it.
 [memory]
 ram_base = "0x48000000"
 ram_size = "0x02000000"

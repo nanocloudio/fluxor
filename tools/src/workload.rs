@@ -19,7 +19,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::compose::{ResourceProfile, WorkloadUid};
-use crate::service_params::ParamSpec;
+use crate::params::ParamSpec;
 
 fn default_role() -> String {
     "service".to_string()
@@ -168,10 +168,10 @@ pub struct WorkloadManifest {
     pub contract: Contract,
     #[serde(default)]
     pub implementations: Vec<Implementation>,
-    /// A service's run-time parameters. The shipped graph is a template
-    /// naming them as `${param:<name>}`; its digest is the template's, and a
-    /// run substitutes values checked against this schema
-    /// ([`crate::service_params`]).
+    /// A service's run-time parameters: its linux graph's `params:`. The
+    /// shipped graph names them as `${param:<name>}`; its digest is the
+    /// unrendered graph's, and a run substitutes values checked against this
+    /// schema ([`crate::params`]).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub params: BTreeMap<String, ParamSpec>,
     /// Where this workload's control-plane store lives, relative to the
@@ -324,7 +324,7 @@ pub fn validate(m: &WorkloadManifest) -> ValidationReport {
     }
     match m.role.as_str() {
         "service" => {
-            for e in crate::service_params::validate_schema(&m.params) {
+            for e in crate::params::validate_schema(&m.params) {
                 r.push(format!("params: {e}"));
             }
         }

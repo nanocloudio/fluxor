@@ -34,18 +34,20 @@ pub struct Plan {
     pub config_path: PathBuf,
     pub effective_timeout_s: u32,
     pub deploy: AdapterSelection,
-    /// One attachment per distinct console source named by a rule. Empty
-    /// when no rule references a console transport (a summary console for
-    /// the run log may still be added by the orchestrator).
+    /// One attachment per distinct console capability named in `requires`
+    /// or by a rule; when the scenario names none, the board's default
+    /// console, so the run still captures a console log.
     pub consoles: Vec<AdapterSelection>,
+    /// The telemetry capability the scenario names, else the board's
+    /// default when the profile binds one.
     pub telemetry: Option<AdapterSelection>,
     /// Transport-style observe.* adapters resolved for this run.
     /// `observe.netboot_fetch` is excluded — that capability is produced
     /// by the deploy backend's `watch` verb, not a transport of its own.
     /// All other observe.* capabilities named in scenario rules or
     /// `requires` resolve to one entry here and become a long-running
-    /// transport (e.g. `observe-https_load` driving a load probe and
-    /// emitting NDJSON bytes the matcher evaluates).
+    /// transport (a load probe reporting its results as NDJSON bytes the
+    /// matcher evaluates).
     pub observe_transports: Vec<AdapterSelection>,
     pub power: Option<PowerSelection>,
     /// Power verbs the orchestrator will invoke (in order) against the
@@ -60,7 +62,6 @@ pub struct Plan {
     /// capability. In that case the orchestrator must have a power backend
     /// — running without one violates the scenario contract.
     pub power_required: bool,
-    pub observers: Vec<ObserverSelection>,
     pub pass_rules: Vec<ObservationRule>,
     pub fail_rules: Vec<ObservationRule>,
     pub expect_rules: Vec<ExpectRule>,
@@ -86,19 +87,6 @@ pub struct AdapterSelection {
 pub struct PowerSelection {
     pub backend: String,
     pub summary: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct ObserverSelection {
-    pub rule_kind: RuleKind,
-    pub rule: ObservationRule,
-    pub bound_to: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RuleKind {
-    Pass,
-    Fail,
 }
 
 #[derive(Debug, Clone)]
@@ -140,12 +128,7 @@ pub fn build_plan(inputs: PlanInputs<'_>) -> Result<Plan> {
     let deploy = pick_deploy(scenario, board, profile)?;
     let consoles = pick_consoles(scenario, board, profile)?;
     let observe_transports = pick_observe_transports(scenario, board, profile)?;
-    let telemetry = pick_single_surface(
-        Surface::Telemetry,
-        &board.telemetry,
-        board.preferred_telemetry,
-        &profile.telemetry,
-    );
+    let telemetry = pick_telemetry(scenario, board, profile)?;
 
     let power_required = scenario
         .requires
@@ -176,7 +159,6 @@ pub fn build_plan(inputs: PlanInputs<'_>) -> Result<Plan> {
 
     let power_actions = derive_power_actions(scenario, power.is_some());
 
-    let observers = observers_from_rules(scenario, board, profile);
     let artifact = pick_artifact(scenario, board, inputs.project)?;
     let lock_path = default_lock_path(inputs.lab, &profile.rig.id);
 
@@ -220,7 +202,6 @@ pub fn build_plan(inputs: PlanInputs<'_>) -> Result<Plan> {
         power,
         power_actions,
         power_required,
-        observers,
         pass_rules: scenario.pass.clone(),
         fail_rules: scenario.fail.clone(),
         expect_rules: scenario.expect.clone(),
@@ -366,11 +347,6 @@ fn pick_deploy(
     )))
 }
 
-/// Return one adapter selection per distinct console capability the
-/// scenario references — via its `requires` list and/or its rule sources.
-/// If the scenario names nothing console-specific, fall back to the
-/// board's preferred console so the orchestrator can still capture a
-/// `console.log` for diagnostics.
 /// Resolve transport-style observe.* adapters required by the scenario.
 ///
 /// `observe.netboot_fetch` is excluded — it's emitted by the deploy
@@ -428,6 +404,10 @@ fn pick_observe_transports(
     Ok(out)
 }
 
+/// Return one adapter selection per distinct console capability the
+/// scenario references — via its `requires` list and/or its rule sources.
+/// If the scenario names nothing console-specific, fall back to the
+/// board's default console so the run still captures a console log.
 fn pick_consoles(
     scenario: &Scenario,
     board: &BoardRig,
@@ -477,18 +457,82 @@ fn pick_consoles(
     }
 
     // Scenario is console-agnostic; pick the default for log capture.
-    Ok(pick_single_surface(
-        Surface::Console,
-        &board.console,
-        board.preferred_console,
-        &profile.console,
+    Ok(
+        pick_default(&board.console, board.preferred_console, &profile.console)
+            .into_iter()
+            .collect(),
     )
-    .into_iter()
-    .collect())
 }
 
-fn pick_single_surface(
-    _surface: Surface,
+/// The telemetry transport: the one capability the scenario names (in
+/// `requires` or as a rule source), which the board must declare and the
+/// profile bind — a rule on a telemetry source that is not attached could
+/// only time out — else the board's default when the profile binds one.
+/// A run attaches at most one telemetry transport.
+fn pick_telemetry(
+    scenario: &Scenario,
+    board: &BoardRig,
+    profile: &RigProfile,
+) -> Result<Option<AdapterSelection>> {
+    let mut wanted: Vec<Capability> = Vec::new();
+    for cap in scenario
+        .requires
+        .iter()
+        .copied()
+        .chain(rule_sources(scenario))
+    {
+        if cap.surface() == Surface::Telemetry && !wanted.contains(&cap) {
+            wanted.push(cap);
+        }
+    }
+    let cap = match wanted.as_slice() {
+        [] => {
+            return Ok(pick_default(
+                &board.telemetry,
+                board.preferred_telemetry,
+                &profile.telemetry,
+            ))
+        }
+        [one] => *one,
+        many => {
+            return Err(Error::Config(format!(
+                "rig plan: scenario '{}' names several telemetry capabilities ({:?}); a run \
+                 attaches one",
+                scenario.name,
+                many.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
+            )))
+        }
+    };
+    if !board.telemetry.contains(&cap) {
+        return Err(Error::Config(format!(
+            "rig plan: scenario '{}' references {} but board '{}' does not declare it \
+             (board telemetry: {:?})",
+            scenario.name,
+            cap.as_str(),
+            scenario.target,
+            board
+                .telemetry
+                .iter()
+                .map(|c| c.as_str())
+                .collect::<Vec<_>>(),
+        )));
+    }
+    let binding = profile.telemetry.get(&cap).ok_or_else(|| {
+        Error::Config(format!(
+            "rig plan: scenario '{}' references {} but profile '{}' has no [{}] binding",
+            scenario.name,
+            cap.as_str(),
+            profile.rig.id,
+            cap.as_str(),
+        ))
+    })?;
+    Ok(Some(AdapterSelection {
+        capability: cap,
+        summary: summarise_binding(binding),
+    }))
+}
+
+fn pick_default(
     board_list: &[Capability],
     preferred: Option<Capability>,
     profile_map: &std::collections::BTreeMap<Capability, BindingTable>,
@@ -514,44 +558,6 @@ fn pick_single_surface(
         }
     }
     None
-}
-
-fn observers_from_rules(
-    scenario: &Scenario,
-    _board: &BoardRig,
-    profile: &RigProfile,
-) -> Vec<ObserverSelection> {
-    let mut out = Vec::new();
-    for r in &scenario.pass {
-        let bound_to = describe_rule_source(r.source, profile);
-        out.push(ObserverSelection {
-            rule_kind: RuleKind::Pass,
-            rule: r.clone(),
-            bound_to,
-        });
-    }
-    for r in &scenario.fail {
-        let bound_to = describe_rule_source(r.source, profile);
-        out.push(ObserverSelection {
-            rule_kind: RuleKind::Fail,
-            rule: r.clone(),
-            bound_to,
-        });
-    }
-    out
-}
-
-fn describe_rule_source(source: Capability, profile: &RigProfile) -> String {
-    let map = match source.surface() {
-        Surface::Console => &profile.console,
-        Surface::Telemetry => &profile.telemetry,
-        Surface::Observe => &profile.observe,
-        _ => return "(unbound: rule source must be a console/telemetry/observe capability)".into(),
-    };
-    match map.get(&source) {
-        Some(b) => summarise_binding(b),
-        None => "(no profile binding — adapter will use defaults)".to_string(),
-    }
 }
 
 fn pick_artifact(
@@ -926,7 +932,7 @@ mod tests {
             board = "pi5"
 
             [power]
-            backend = "kasa_local"
+            backend = "plug"
             password = "${env:FLUXOR_PLAN_TEST_PASS}"
 
             [deploy.netboot_tftp]
@@ -1300,23 +1306,20 @@ mod tests {
         );
     }
 
-    #[test]
-    fn scenario_agnostic_default_honours_preferred_telemetry() {
-        // `preferred_telemetry` is authoritative for default selection
-        // the same way `preferred_console` is. The vocabulary defines
-        // only one telemetry capability today, so this test proves the
-        // preferred field is consulted at all.
-        let board_toml = r#"
-            [rig]
-            artifact = "kernel8_img"
-            deploy = ["deploy.netboot_tftp"]
-            console = ["console.serial"]
-            telemetry = ["telemetry.monitor_udp"]
-            preferred_telemetry = "telemetry.monitor_udp"
-            observe = ["observe.netboot_fetch"]
-            power = ["power.cycle"]
-        "#;
-        let profile_toml = r#"
+    const TWO_TELEMETRY_BOARD: &str = r#"
+        [rig]
+        artifact = "kernel8_img"
+        deploy = ["deploy.netboot_tftp"]
+        console = ["console.serial"]
+        telemetry = ["telemetry.monitor_udp", "telemetry.qemu_virtio"]
+        preferred_telemetry = "telemetry.qemu_virtio"
+        observe = ["observe.netboot_fetch"]
+        power = ["power.cycle"]
+    "#;
+
+    fn telemetry_plan(profile_extra: &str, scenario_extra: &str) -> Result<Plan> {
+        let profile_toml = format!(
+            r#"
             [rig]
             id = "pi5-a"
             board = "pi5"
@@ -1327,23 +1330,27 @@ mod tests {
             [console.serial]
             device = "/dev/ttyUSB0"
 
-            [telemetry.monitor_udp]
-            bind = "0.0.0.0:6666"
-        "#;
-        let scenario_toml = r#"
-            name = "agnostic"
+            {profile_extra}
+            "#
+        );
+        let scenario_toml = format!(
+            r#"
+            name = "telemetry"
             target = "pi5"
             config = "a.yaml"
             [[pass]]
             source = "observe.netboot_fetch"
-        "#;
-        let board = parse_board_rig_str(board_toml, "pi5.toml")
+            {scenario_extra}
+            "#
+        );
+        let board = parse_board_rig_str(TWO_TELEMETRY_BOARD, "pi5.toml")
             .unwrap()
             .unwrap();
-        let profile = parse_profile_str(profile_toml, std::path::Path::new("/tmp/p.toml")).unwrap();
+        let profile =
+            parse_profile_str(&profile_toml, std::path::Path::new("/tmp/p.toml")).unwrap();
         let scenario =
-            parse_scenario_str(scenario_toml, std::path::Path::new("/repo"), "s.toml").unwrap();
-        let p = build_plan(PlanInputs {
+            parse_scenario_str(&scenario_toml, std::path::Path::new("/repo"), "s.toml").unwrap();
+        build_plan(PlanInputs {
             lab: "default",
             scenario: &scenario,
             board: &board,
@@ -1351,9 +1358,55 @@ mod tests {
             project: None,
             scenario_path: None,
         })
-        .unwrap();
+    }
+
+    const BOTH_TELEMETRY_BOUND: &str = r#"
+            [telemetry.monitor_udp]
+            bind = "0.0.0.0:6666"
+
+            [telemetry.qemu_virtio]
+            chardev = "t0"
+    "#;
+
+    #[test]
+    fn scenario_agnostic_default_honours_preferred_telemetry() {
+        // `preferred_telemetry` is authoritative for default selection
+        // the same way `preferred_console` is: the board lists
+        // `monitor_udp` first, but prefers `qemu_virtio`.
+        let p = telemetry_plan(BOTH_TELEMETRY_BOUND, "").unwrap();
         let t = p.telemetry.expect("telemetry selection");
-        assert_eq!(t.capability.as_str(), "telemetry.monitor_udp");
+        assert_eq!(t.capability.as_str(), "telemetry.qemu_virtio");
+    }
+
+    /// A rule on a telemetry source attaches that source, whatever the
+    /// board prefers: any other transport would leave the rule nothing to
+    /// read.
+    #[test]
+    fn a_telemetry_rule_source_selects_its_own_transport() {
+        let rule = "[[expect]]\nsource = \"telemetry.monitor_udp\"\nmax_silence_s = 40\n";
+        let p = telemetry_plan(BOTH_TELEMETRY_BOUND, rule).unwrap();
+        assert_eq!(
+            p.telemetry.expect("telemetry").capability.as_str(),
+            "telemetry.monitor_udp"
+        );
+    }
+
+    #[test]
+    fn a_telemetry_rule_source_the_profile_does_not_bind_is_refused() {
+        let only_virtio = "[telemetry.qemu_virtio]\nchardev = \"t0\"\n";
+        let rule = "[[pass]]\nsource = \"telemetry.monitor_udp\"\nregex = \"up\"\n";
+        let err = telemetry_plan(only_virtio, rule).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("telemetry.monitor_udp"), "{msg}");
+        assert!(msg.contains("no [telemetry.monitor_udp] binding"), "{msg}");
+    }
+
+    #[test]
+    fn two_telemetry_rule_sources_are_refused() {
+        let rules = "[[pass]]\nsource = \"telemetry.monitor_udp\"\nregex = \"a\"\n\
+                     [[pass]]\nsource = \"telemetry.qemu_virtio\"\nregex = \"b\"\n";
+        let err = telemetry_plan(BOTH_TELEMETRY_BOUND, rules).unwrap_err();
+        assert!(format!("{err}").contains("several telemetry"), "{err}");
     }
 
     // ── power-verb derivation ─────────────────────────────────────────────

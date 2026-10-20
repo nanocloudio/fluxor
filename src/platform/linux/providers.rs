@@ -1440,15 +1440,15 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
 //
 // `do <cmd>` (sector) calls this via provider_call, gated by
 // `requires_contract="proc"`. SPAWN (handle=-1) allocates a slot, spawns the
-// command through the pre-existing `ProcExecutor` (background reader thread →
-// non-blocking `poll_stdout`), and returns a `FD_TAG_PROC`-tagged handle.
+// command through `ProcExecutor` (background reader thread → non-blocking
+// `poll_stdout`), and returns a `FD_TAG_PROC`-tagged handle.
 // READ/STATUS/CLOSE carry that handle back. Completion is the real process exit
 // (STATUS=0 once exited AND drained) — never a quiescence guess.
 //
-// GRANT: a hardcoded executable allowlist. The allowlist is hygiene +
-// accident-prevention, NOT a sandbox (any dev tool is RCE-equivalent — the node
-// is the boundary). Config-driven root/env/timeout scoping and OS sandboxing
-// are not applied here.
+// GRANT: an executable allowlist, working directory, environment allowlist
+// and timeout the operator sets at launch (`proc_grant`). The allowlist is
+// hygiene + accident-prevention, NOT a sandbox (any dev tool is
+// RCE-equivalent — the node is the boundary); no OS sandbox is applied.
 //
 // OWNERS: a spawn acts with the node's authority, so only the node and an
 // owner acting with it spawn (a workload is refused EACCES). A child is its
@@ -1521,8 +1521,8 @@ pub unsafe fn release_owner_procs(owner: crate::kernel::workload::owner::OwnerHa
 /// The node's `proc` grant — WHAT `do` may run and how, sourced from the
 /// environment so the operator declares it at launch (`SECTOR_PROC_ALLOW`,
 /// `_ROOT`, `_ENV`, `_TIMEOUT_MS`), with safe defaults. The allowlist is
-/// accident-prevention + the migration-frontier surface, NOT confinement (any
-/// dev tool is RCE-equivalent — the node is the boundary);
+/// accident-prevention, NOT confinement (any dev tool is RCE-equivalent — the
+/// node is the boundary);
 /// `root`/`env`/`timeout` are hygiene + blast-radius bounds.
 struct ProcGrant {
     root: Option<std::path::PathBuf>,
@@ -1608,10 +1608,7 @@ pub unsafe fn linux_proc_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_le
             // owner acting with it spawn one, a workload never does. The
             // child is the spawning owner's, and goes with it.
             let owner = crate::kernel::exec::scheduler::caller_owner();
-            if !crate::kernel::exec::scheduler::owners()
-                .authority_of(owner)
-                .is_system()
-            {
+            if !crate::kernel::exec::scheduler::caller_authority().is_system() {
                 return errno::EACCES;
             }
             let bytes = core::slice::from_raw_parts(arg, arg_len);
@@ -3242,7 +3239,7 @@ unsafe fn linux_net_cmd_connect_to(
     lane: usize,
 ) {
     use crate::abi::contracts::net::net_proto::Target;
-    // STREAM-only surface (net_proto Stream Surface v1). Datagram traffic uses
+    // STREAM-only surface (the net_proto stream surface). Datagram traffic uses
     // the datagram surface (CMD_DG_BIND / CMD_DG_SEND_TO), so a non-stream
     // sock_type is rejected with EINVAL — matching the bare-metal IP module
     // and the public contract.

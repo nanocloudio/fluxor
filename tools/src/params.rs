@@ -1,23 +1,25 @@
-//! Service-bundle parameters.
+//! Parameters: one typed model for graphs, stacks and bundles.
 //!
-//! A `role = "service"` workload publishes a graph TEMPLATE plus a typed
-//! parameter schema (`[params.<name>]` in its source manifest, carried into
-//! `workload.json`). The graph names a parameter as `${param:<name>}`; a
-//! consumer supplies values at `fluxor run` time and never edits the graph.
+//! Any runnable graph, a published stack and a bundle's graph declare
+//! `params:` with one schema (type, default, required, min/max,
+//! description, example) and name a value as `${param:<name>}`. A bundle's
+//! params are its graph's params. A run supplies values (`--param`,
+//! `--params`); a check renders with each param's default, else its example.
 //!
 //! Substitution works on the PARSED graph, never on its text. A scalar that
 //! is exactly one placeholder becomes a typed node (integer, boolean or
 //! string); a string scalar with placeholders inside other text is
-//! interpolated, and only string and integer parameters may appear there.
-//! Text substitution is refused by construction because a value is data: a
-//! value spliced into YAML text could open a mapping, close a quote or add a
-//! module, and a parsed-tree substitution has no syntax for a value to reach.
+//! interpolated, and a boolean parameter may not appear there: it only
+//! stands alone as a whole value.
+//! A value is data: a value spliced into YAML text could open a mapping,
+//! close a quote or add a module, and a parsed-tree substitution has no
+//! syntax for a value to reach. A value is substituted once and never
+//! rescanned.
 //!
-//! The environment pass ([`crate::env_subst`]) runs first, exactly as on
-//! every graph read; it leaves `${param:...}` untouched because `param:<name>`
-//! is not a POSIX variable name. The rendered graph is then escaped so the
-//! environment pass the build runs on it again is an identity: a substituted
-//! value is never read as an environment reference either.
+//! A graph is never read against the environment, and neither is a stack.
+//! A `${VAR}` or `${VAR:-default}` in either is refused, pointing at
+//! `params:`: a value that comes from the caller is a param the caller
+//! passes.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -64,7 +66,7 @@ pub enum ParamType {
 }
 
 impl ParamType {
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             ParamType::String => "a string",
             ParamType::Integer => "an integer",
@@ -133,7 +135,7 @@ pub struct ParamSpec {
     pub example: Option<ParamValue>,
 }
 
-/// `[params.<name>]` as written in a source manifest. Values stay TOML until
+/// One `params:` entry as written. Values stay TOML until
 /// they are checked against the declared type, so a wrong type is reported
 /// as exactly that rather than as an untagged-enum mismatch.
 #[derive(Debug, Deserialize)]
@@ -172,7 +174,7 @@ fn toml_type_word(v: &toml::Value) -> &'static str {
 }
 
 /// A TOML value as the declared type, or an error naming both.
-fn typed_toml(what: &str, ty: ParamType, v: &toml::Value) -> Result<ParamValue, String> {
+pub(crate) fn typed_toml(what: &str, ty: ParamType, v: &toml::Value) -> Result<ParamValue, String> {
     match (ty, v) {
         (ParamType::String | ParamType::File, toml::Value::String(s)) => {
             Ok(ParamValue::String(s.clone()))
@@ -187,19 +189,37 @@ fn typed_toml(what: &str, ty: ParamType, v: &toml::Value) -> Result<ParamValue, 
     }
 }
 
-/// Parse a source manifest's `[params]` table. Shape errors (an unknown key,
-/// an unknown type, a value of the wrong type) are reported here; the
-/// cross-field rules are [`validate_schema`]'s.
-pub fn parse_source_params(table: &toml::Table) -> Result<BTreeMap<String, ParamSpec>, String> {
+/// The key a graph, stack or bundle graph declares its params under.
+pub const PARAMS_KEY: &str = "params";
+
+/// Parse a `params:` mapping. Shape errors (an unknown key, an unknown type,
+/// a value of the wrong type) are reported here; the cross-field rules are
+/// [`validate_schema`]'s.
+pub fn parse_params(v: &serde_yaml::Value) -> Result<BTreeMap<String, ParamSpec>, String> {
+    let table = match v {
+        serde_yaml::Value::Null => return Ok(BTreeMap::new()),
+        serde_yaml::Value::Mapping(_) => match toml::Value::try_from(v) {
+            Ok(toml::Value::Table(t)) => t,
+            Ok(_) => return Err("`params:` must be a mapping".into()),
+            Err(e) => return Err(format!("params: {e}")),
+        },
+        _ => {
+            return Err(
+                "`params:` must be a mapping of name to declaration (type, default, \
+                 required, min, max, description, example)"
+                    .into(),
+            )
+        }
+    };
     let mut out = BTreeMap::new();
-    for (name, value) in table {
+    for (name, value) in &table {
         let src: ParamSource = value
             .clone()
             .try_into()
-            .map_err(|e| format!("[params.{name}]: {e}"))?;
+            .map_err(|e| format!("params.{name}: {e}"))?;
         let typed = |field: &str, v: &Option<toml::Value>| -> Result<Option<ParamValue>, String> {
             v.as_ref()
-                .map(|v| typed_toml(&format!("[params.{name}] {field}"), src.ty, v))
+                .map(|v| typed_toml(&format!("params.{name}.{field}"), src.ty, v))
                 .transpose()
         };
         out.insert(
@@ -220,7 +240,7 @@ pub fn parse_source_params(table: &toml::Table) -> Result<BTreeMap<String, Param
 
 /// A value against its parameter's declaration: type, integer bounds,
 /// string length, and no NUL byte in a string.
-fn check_value(name: &str, spec: &ParamSpec, v: &ParamValue) -> Result<(), String> {
+pub(crate) fn check_value(name: &str, spec: &ParamSpec, v: &ParamValue) -> Result<(), String> {
     if !v.is(spec.ty) {
         return Err(format!(
             "param '{name}' is {}, got {}",
@@ -257,7 +277,7 @@ pub fn validate_schema(params: &BTreeMap<String, ParamSpec>) -> Vec<String> {
     let mut errors = Vec::new();
     if params.len() > MAX_PARAMS {
         errors.push(format!(
-            "{} params declared; a service declares at most {MAX_PARAMS} (MAX_PARAMS)",
+            "{} params declared; a graph declares at most {MAX_PARAMS} (MAX_PARAMS)",
             params.len()
         ));
     }
@@ -279,7 +299,7 @@ pub fn validate_schema(params: &BTreeMap<String, ParamSpec>) -> Vec<String> {
         }
         if spec.ty == ParamType::File && spec.default.is_some() {
             errors.push(format!(
-                "param '{name}' is a file and declares a default; the file is the consumer's — \
+                "param '{name}' is a file and declares a default; the file is the caller's — \
                  declare it required, with an example"
             ));
         }
@@ -312,8 +332,8 @@ pub fn validate_schema(params: &BTreeMap<String, ParamSpec>) -> Vec<String> {
 }
 
 /// The value every parameter takes when the graph is checked without a
-/// consumer: its default, else its example. A file example names a sample
-/// relative to `source_dir`, the source manifest's directory, and is
+/// caller: its default, else its example. A file example names a sample
+/// relative to `source_dir`, the declaring document's directory, and is
 /// refused when the sample is not there.
 pub fn check_values(
     params: &BTreeMap<String, ParamSpec>,
@@ -348,7 +368,7 @@ pub fn check_values(
 
 /// `path` as an absolute path to a file that can be read, or an error
 /// naming parameter `name`.
-fn existing_file(name: &str, path: &Path) -> Result<String, String> {
+pub(crate) fn existing_file(name: &str, path: &Path) -> Result<String, String> {
     let abs = std::path::absolute(path)
         .map_err(|e| format!("param '{name}': {}: {e}", path.display()))?;
     std::fs::File::open(&abs)
@@ -441,30 +461,33 @@ pub fn placeholders(doc: &serde_yaml::Value) -> Result<BTreeSet<String>, String>
     Ok(out)
 }
 
-/// Every placeholder declared, every declared param referenced.
+/// Every placeholder declared, every declared param referenced. `what`
+/// names the declaring document in the message: `graph` or `stack`.
 pub fn check_references(
     params: &BTreeMap<String, ParamSpec>,
     used: &BTreeSet<String>,
+    what: &str,
 ) -> Vec<String> {
     let mut errors = Vec::new();
     let declared: Vec<&str> = params.keys().map(String::as_str).collect();
+    let declared = if declared.is_empty() {
+        "none".to_string()
+    } else {
+        declared.join(", ")
+    };
     for name in used {
         if !params.contains_key(name) {
             errors.push(format!(
-                "the graph references `{PLACEHOLDER}{name}}}` but no [params.{name}] is declared \
-                 (declared: {})",
-                if declared.is_empty() {
-                    "none".to_string()
-                } else {
-                    declared.join(", ")
-                }
+                "the {what} references `{PLACEHOLDER}{name}}}` but `params:` declares no \
+                 '{name}' (declared: {declared})"
             ));
         }
     }
     for name in params.keys() {
         if !used.contains(name) {
             errors.push(format!(
-                "param '{name}' is declared but no graph references `{PLACEHOLDER}{name}}}`"
+                "param '{name}' is declared but the {what} never references \
+                 `{PLACEHOLDER}{name}}}`"
             ));
         }
     }
@@ -530,23 +553,169 @@ pub fn render(
     })
 }
 
-/// Parse graph text after its environment pass.
-pub fn parse_graph(template: &str) -> Result<serde_yaml::Value, String> {
-    let text = crate::env_subst::substitute(template)?;
-    serde_yaml::from_str(&text).map_err(|e| format!("parse graph: {e}"))
+// ============================================================================
+// Graphs
+// ============================================================================
+
+/// Is `s` an environment reference: `${NAME}` or `${NAME:-default}` with a
+/// POSIX name? `${param:<name>}` and `${file:<path>}` are not: their
+/// prefix ends in `:` and carries no `-`.
+fn environment_reference(s: &str) -> Option<&str> {
+    let mut rest = s;
+    while let Some(pos) = rest.find("${") {
+        let after = &rest[pos + 2..];
+        let end = after.find('}').unwrap_or(after.len());
+        let expr = &after[..end];
+        let name = expr.split_once(":-").map_or(expr, |(n, _)| n);
+        let mut bytes = name.bytes();
+        let posix = matches!(bytes.next(), Some(b) if b.is_ascii_alphabetic() || b == b'_')
+            && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_');
+        if posix && end < after.len() {
+            return Some(&rest[pos..pos + 2 + end + 1]);
+        }
+        rest = after;
+    }
+    None
 }
 
-/// Template text → the graph one run builds: environment pass, parse,
-/// parameter substitution, serialise, and escape so the build's own
-/// environment pass leaves the result as rendered.
+/// Refuse a graph or a stack that reads the environment: neither is
+/// substituted against it, so a `${VAR}` left in one would reach a module as
+/// text. `what` names the document, `graph` or `stack`, and how its value
+/// arrives instead.
+pub(crate) fn refuse_environment(doc: &serde_yaml::Value, what: &str) -> Result<(), String> {
+    fn first(v: &serde_yaml::Value) -> Option<&str> {
+        match v {
+            serde_yaml::Value::String(s) => environment_reference(s),
+            serde_yaml::Value::Sequence(seq) => seq.iter().find_map(first),
+            serde_yaml::Value::Mapping(map) => {
+                map.iter().find_map(|(k, v)| first(k).or_else(|| first(v)))
+            }
+            serde_yaml::Value::Tagged(t) => first(&t.value),
+            _ => None,
+        }
+    }
+    let Some(r) = first(doc) else {
+        return Ok(());
+    };
+    let supplied = if what == "stack" {
+        "the including graph binds it in its `include:` entry"
+    } else {
+        "a caller passes it with `--param <name>=<value>`"
+    };
+    Err(format!(
+        "`{r}` reads the environment, and a {what} is never substituted against it — \
+         declare the value under `params:` and name it `${{param:<name>}}`; {supplied}"
+    ))
+}
+
+/// A parsed graph: its document without `params:`, and its checked schema.
+#[derive(Clone, Debug)]
+pub struct Graph {
+    /// The document, `params:` removed, placeholders unrendered.
+    pub doc: serde_yaml::Value,
+    /// The declared params.
+    pub params: BTreeMap<String, ParamSpec>,
+}
+
+/// Parse graph text: refuse an environment reference, take the declared
+/// `params:` and check them, and check every placeholder is declared and
+/// every declared param referenced. Every violation is reported together.
+pub fn parse_graph(text: &str) -> Result<Graph, String> {
+    let mut doc: serde_yaml::Value =
+        serde_yaml::from_str(text).map_err(|e| format!("parse graph: {e}"))?;
+    refuse_environment(&doc, "graph")?;
+    let declared = doc
+        .as_mapping_mut()
+        .and_then(|m| m.remove(PARAMS_KEY))
+        .unwrap_or(serde_yaml::Value::Null);
+    let params = parse_params(&declared)?;
+    let mut errors = validate_schema(&params);
+    match placeholders(&doc) {
+        Ok(used) => errors.extend(check_references(&params, &used, "graph")),
+        Err(e) => errors.push(e),
+    }
+    if errors.is_empty() {
+        Ok(Graph { doc, params })
+    } else {
+        Err(errors.join("\n"))
+    }
+}
+
+/// Graph text → the graph one run builds: parse, check, substitute
+/// `values`, serialise without `params:`.
 pub fn render_graph_text(
     template: &str,
     values: &BTreeMap<String, ParamValue>,
 ) -> Result<String, String> {
-    let doc = parse_graph(template)?;
-    let rendered = render(&doc, values)?;
-    let text = serde_yaml::to_string(&rendered).map_err(|e| format!("serialise graph: {e}"))?;
-    Ok(crate::env_subst::escape(&text))
+    let graph = parse_graph(template)?;
+    let rendered = render(&graph.doc, values)?;
+    serde_yaml::to_string(&rendered).map_err(|e| format!("serialise graph: {e}"))
+}
+
+/// What the graphs one command reads are rendered with.
+#[derive(Clone, Debug)]
+pub enum Values {
+    /// A check: every param's default, else its example.
+    Check,
+    /// A run or a build: the values a caller gave (`--params` file, then
+    /// `--param` flags), with defaults for the rest. A `file` param's path
+    /// in the values file is relative to `file_dir`, the values file's
+    /// directory.
+    Given {
+        file: BTreeMap<String, toml::Value>,
+        file_dir: Option<PathBuf>,
+        flags: Vec<(String, String)>,
+    },
+}
+
+impl Values {
+    /// Resolve the values a graph declaring `params` renders with. A `file`
+    /// example is relative to `graph_dir`.
+    pub fn resolve(
+        &self,
+        params: &BTreeMap<String, ParamSpec>,
+        graph_dir: &Path,
+    ) -> Result<BTreeMap<String, ParamValue>, String> {
+        match self {
+            Values::Check => check_values(params, graph_dir),
+            Values::Given {
+                file,
+                file_dir,
+                flags,
+            } => {
+                let mut file = file.clone();
+                if let Some(dir) = file_dir {
+                    for (name, v) in file.iter_mut() {
+                        let is_file = params.get(name).is_some_and(|s| s.ty == ParamType::File);
+                        if let (true, toml::Value::String(p)) = (is_file, &*v) {
+                            *v = toml::Value::String(dir.join(p).to_string_lossy().into_owned());
+                        }
+                    }
+                }
+                resolve_values(params, &file, flags)
+            }
+        }
+    }
+}
+
+static VALUES: std::sync::OnceLock<Values> = std::sync::OnceLock::new();
+
+/// Set what this process renders graphs with. The command's dispatch sets
+/// it once, before any graph is read; unset is a build given no values.
+pub fn set_values(values: Values) {
+    let _ = VALUES.set(values);
+}
+
+/// The values a graph declaring `params` renders with in this process. A
+/// `file` example is relative to `graph_dir`.
+pub fn values_for(
+    params: &BTreeMap<String, ParamSpec>,
+    graph_dir: &Path,
+) -> Result<BTreeMap<String, ParamValue>, String> {
+    match VALUES.get() {
+        Some(v) => v.resolve(params, graph_dir),
+        None => resolve_values(params, &BTreeMap::new(), &[]),
+    }
 }
 
 // ============================================================================
@@ -601,7 +770,7 @@ fn typed_flag(name: &str, ty: ParamType, raw: &str) -> Result<ParamValue, String
 /// The values one run uses: the `--params` file, overridden by `--param`
 /// flags, with defaults for the rest. Every refusal — an unknown name, a
 /// missing required value, a type or range error, a file that is not there,
-/// values given to a bundle that declares no parameters — is collected and
+/// values given to a graph that declares no params — is collected and
 /// reported together. A file value becomes the file's absolute path; a
 /// relative one is taken from the working directory (the caller makes a
 /// values file's paths relative to that file first).
@@ -615,7 +784,7 @@ pub fn resolve_values(
             return Ok(BTreeMap::new());
         }
         return Err(
-            "this bundle declares no parameters; --param and --params do not apply to it".into(),
+            "this graph declares no params; --param and --params do not apply to it".into(),
         );
     }
     let declared = params
@@ -698,171 +867,14 @@ pub fn resolve_values(
     }
 }
 
-// ============================================================================
-// Source manifests (discovery + the ci check)
-// ============================================================================
-
-/// The fields of a workload source manifest the service checks read.
-pub struct ServiceSource {
-    pub name: String,
-    pub role: String,
-    /// `(target, graph path)` per `[[implementation]]`, the path resolved
-    /// against the manifest's directory.
-    pub implementations: Vec<(String, PathBuf)>,
-    pub params: BTreeMap<String, ParamSpec>,
-}
-
-/// Read the service-relevant fields of a source manifest.
-pub fn read_source(path: &Path) -> Result<ServiceSource, String> {
-    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let doc: toml::Table = toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
-    let workload = doc
-        .get("workload")
-        .and_then(toml::Value::as_table)
-        .ok_or_else(|| format!("{}: no [workload] table", path.display()))?;
-    let name = workload
-        .get("name")
-        .and_then(toml::Value::as_str)
-        .ok_or_else(|| format!("{}: [workload] needs a string `name`", path.display()))?
-        .to_string();
-    let role = match workload.get("role") {
-        None => "service".to_string(),
-        Some(toml::Value::String(r)) if r == "service" || r == "cli" => r.clone(),
-        Some(_) => {
-            return Err(format!(
-                "{}: workload.role must be 'service' or 'cli'",
-                path.display()
-            ));
-        }
-    };
-    let dir = path.parent().unwrap_or(Path::new("."));
-    let mut implementations = Vec::new();
-    match doc.get("implementation") {
-        None => {}
-        Some(toml::Value::Array(imps)) => {
-            for (i, imp) in imps.iter().enumerate() {
-                let field = |key: &str| {
-                    imp.get(key).and_then(toml::Value::as_str).ok_or_else(|| {
-                        format!(
-                            "{}: [[implementation]] #{} needs a string `{key}`",
-                            path.display(),
-                            i + 1
-                        )
-                    })
-                };
-                implementations.push((field("target")?.to_string(), dir.join(field("graph")?)));
-            }
-        }
-        Some(_) => {
-            return Err(format!(
-                "{}: `implementation` must be an array of tables",
-                path.display()
-            ));
-        }
-    }
-    let params = match doc.get("params") {
-        None => BTreeMap::new(),
-        Some(toml::Value::Table(t)) => {
-            parse_source_params(t).map_err(|e| format!("{}: {e}", path.display()))?
-        }
-        Some(_) => return Err(format!("{}: `params` must be a table", path.display())),
-    };
-    Ok(ServiceSource {
-        name,
-        role,
-        implementations,
-        params,
-    })
-}
-
-/// The project's service source manifests, by the discovery rule:
-/// `packaging/service/workload.toml`, `packaging/service/<name>/workload.toml`
-/// and `examples/<name>/workload.toml`, each counted when its role is
-/// `service` (the default). Sorted.
-pub fn service_manifests(project_root: &Path) -> Vec<PathBuf> {
-    let mut candidates = vec![project_root.join("packaging/service/workload.toml")];
-    for parent in ["packaging/service", "examples"] {
-        if let Ok(entries) = std::fs::read_dir(project_root.join(parent)) {
-            candidates.extend(
-                entries
-                    .flatten()
-                    .map(|e| e.path().join("workload.toml"))
-                    .filter(|p| p.is_file()),
-            );
-        }
-    }
-    let mut out: Vec<PathBuf> = candidates
-        .into_iter()
-        .filter(|p| p.is_file())
-        .filter(|p| read_source(p).map(|s| s.role == "service").unwrap_or(true))
-        .collect();
-    out.sort();
-    out.dedup();
-    out
-}
-
-/// A service source manifest checked: its schema well-formed, every
-/// placeholder in its linux graphs declared and every declared param
-/// referenced, and each linux graph rendered with defaults and examples.
-/// Returns `(graph path, rendered text)` per linux implementation.
-pub fn check_source(path: &Path) -> Result<Vec<(PathBuf, String)>, String> {
-    let src = read_source(path)?;
-    if src.role != "service" && !src.params.is_empty() {
-        return Err(format!(
-            "{}: role '{}' declares [params]; parameters belong to services (an applet takes argv)",
-            path.display(),
-            src.role
-        ));
-    }
-    let mut errors = validate_schema(&src.params);
-    if !crate::workload::is_workload_name(&src.name) {
-        errors.push(format!(
-            "workload name '{}' is not a workload name",
-            src.name
-        ));
-    }
-    let mut used = BTreeSet::new();
-    let mut graphs = Vec::new();
-    for (target, graph) in &src.implementations {
-        if target != "linux" {
-            continue;
-        }
-        let template = match std::fs::read_to_string(graph) {
-            Ok(t) => t,
-            Err(e) => {
-                errors.push(format!("{}: {e}", graph.display()));
-                continue;
-            }
-        };
-        match parse_graph(&template).and_then(|doc| placeholders(&doc)) {
-            Ok(names) => used.extend(names),
-            Err(e) => errors.push(format!("{}: {e}", graph.display())),
-        }
-        graphs.push((graph.clone(), template));
-    }
-    errors.extend(check_references(&src.params, &used));
-    if !errors.is_empty() {
-        return Err(format!("{}: {}", path.display(), errors.join("; ")));
-    }
-    let values = check_values(&src.params, path.parent().unwrap_or(Path::new(".")))
-        .map_err(|e| format!("{}: {e}", path.display()))?;
-    graphs
-        .into_iter()
-        .map(|(graph, template)| {
-            render_graph_text(&template, &values)
-                .map(|text| (graph.clone(), text))
-                .map_err(|e| format!("{}: {e}", graph.display()))
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn schema(toml_text: &str) -> Result<BTreeMap<String, ParamSpec>, String> {
-        let t: toml::Table = toml::from_str(toml_text).unwrap();
-        let params = parse_source_params(t["params"].as_table().unwrap())?;
+    /// A `params:` mapping, parsed and validated.
+    fn schema(yaml: &str) -> Result<BTreeMap<String, ParamSpec>, String> {
+        let v: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        let params = parse_params(&v)?;
         let errors = validate_schema(&params);
         if errors.is_empty() {
             Ok(params)
@@ -872,21 +884,19 @@ mod tests {
     }
 
     const GOOD: &str = r#"
-[params.port]
-type = "integer"
-default = 9100
-min = 1
-max = 65535
-description = "TCP port"
-
-[params.wal_dir]
-type = "string"
-required = true
-example = "/var/lib/wal"
-
-[params.verbose]
-type = "boolean"
-default = false
+port:
+  type: integer
+  default: 9100
+  min: 1
+  max: 65535
+  description: TCP port
+wal_dir:
+  type: string
+  required: true
+  example: /var/lib/wal
+verbose:
+  type: boolean
+  default: false
 "#;
 
     #[test]
@@ -901,42 +911,30 @@ default = false
     fn schema_refusals_are_precise() {
         let cases: &[(&str, &str)] = &[
             (
-                "[params.p]\ntype = \"integer\"\nrequired = true\ndefault = 1\nexample = 1\n",
+                "p: {type: integer, required: true, default: 1, example: 1}",
                 "required and also declares a default",
             ),
             (
-                "[params.p]\ntype = \"integer\"\ndefault = \"x\"\n",
+                "p: {type: integer, default: x}",
                 "default must be an integer, got a string",
             ),
             (
-                "[params.p]\ntype = \"integer\"\ndefault = 0\nmin = 1\n",
+                "p: {type: integer, default: 0, min: 1}",
                 "below its minimum 1",
             ),
             (
-                "[params.p]\ntype = \"integer\"\ndefault = 5\nmin = 9\nmax = 2\n",
+                "p: {type: integer, default: 5, min: 9, max: 2}",
                 "min 9 above max 2",
             ),
+            ("p: {type: string, default: a, min: 1}", "integers only"),
+            ("P: {type: string, default: a}", "not [a-z]"),
             (
-                "[params.p]\ntype = \"string\"\ndefault = \"a\"\nmin = 1\n",
-                "integers only",
-            ),
-            (
-                "[params.P]\ntype = \"string\"\ndefault = \"a\"\n",
-                "not [a-z]",
-            ),
-            (
-                "[params.p]\ntype = \"string\"\ndefault = \"a\"\nbogus = 1\n",
+                "p: {type: string, default: a, bogus: 1}",
                 "unknown field `bogus`",
             ),
-            (
-                "[params.p]\ntype = \"float\"\ndefault = 1.0\n",
-                "unknown variant",
-            ),
-            ("[params.p]\ntype = \"string\"\n", "declares no default"),
-            (
-                "[params.p]\ntype = \"string\"\nrequired = true\n",
-                "declares no example",
-            ),
+            ("p: {type: float, default: 1.0}", "unknown variant"),
+            ("p: {type: string}", "declares no default"),
+            ("p: {type: string, required: true}", "declares no example"),
         ];
         for (text, want) in cases {
             let e = schema(text).unwrap_err();
@@ -948,54 +946,77 @@ default = false
     fn the_param_ceiling_and_string_ceiling_refuse() {
         let mut text = String::new();
         for i in 0..=MAX_PARAMS {
-            text.push_str(&format!("[params.p{i}]\ntype = \"integer\"\ndefault = 1\n"));
+            text.push_str(&format!("p{i}: {{type: integer, default: 1}}\n"));
         }
         assert!(schema(&text).unwrap_err().contains("MAX_PARAMS"));
         let long = "x".repeat(MAX_PARAM_STRING_BYTES + 1);
-        let e = schema(&format!(
-            "[params.s]\ntype = \"string\"\ndefault = \"{long}\"\n"
-        ))
-        .unwrap_err();
+        let e = schema(&format!("s: {{type: string, default: {long}}}\n")).unwrap_err();
         assert!(e.contains("MAX_PARAM_STRING_BYTES"), "{e}");
     }
 
     #[test]
     fn exact_placeholders_become_typed_nodes_and_embedded_ones_interpolate() {
-        let doc = parse_graph(
-            "modules:\n  - name: m\n    port: ${param:port}\n    on: ${param:verbose}\n    \
-             path: \"${param:wal_dir}/seg-${param:port}\"\n    keep: ${FLUXOR_SURELY_UNSET:-7}\n",
-        )
+        let g = parse_graph(&format!(
+            "params:\n{}\nmodules:\n  - name: m\n    port: ${{param:port}}\n    on: \
+             ${{param:verbose}}\n    path: \"${{param:wal_dir}}/seg-${{param:port}}\"\n",
+            GOOD.lines()
+                .map(|l| format!("  {l}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ))
         .unwrap();
-        let names = placeholders(&doc).unwrap();
         assert_eq!(
-            names.into_iter().collect::<Vec<_>>(),
+            g.params.keys().collect::<Vec<_>>(),
             vec!["port", "verbose", "wal_dir"]
         );
+        assert!(g.doc.get(PARAMS_KEY).is_none(), "params: is taken off");
         let values: BTreeMap<String, ParamValue> = [
             ("port".to_string(), ParamValue::Integer(9200)),
             ("verbose".to_string(), ParamValue::Boolean(true)),
             ("wal_dir".to_string(), ParamValue::String("/w".into())),
         ]
         .into();
-        let out = render(&doc, &values).unwrap();
+        let out = render(&g.doc, &values).unwrap();
         let m = &out["modules"][0];
         assert_eq!(m["port"], serde_yaml::Value::Number(9200.into()));
         assert_eq!(m["on"], serde_yaml::Value::Bool(true));
         assert_eq!(m["path"], serde_yaml::Value::String("/w/seg-9200".into()));
-        assert_eq!(m["keep"], serde_yaml::Value::Number(7.into()));
     }
 
     #[test]
-    fn a_value_cannot_inject_yaml_or_an_environment_reference() {
-        let template = "modules:\n  - name: m\n    path: ${param:p}\n    label: \"x-${param:p}\"\n";
+    fn a_graph_that_reads_the_environment_is_refused() {
+        for text in [
+            "modules:\n  - name: m\n    port: ${PORT}\n",
+            "modules:\n  - name: m\n    host: \"a-${HOST:-x}\"\n",
+            "modules:\n  - name: m\n    list: [\"${_U1}\"]\n",
+        ] {
+            let e = parse_graph(text).unwrap_err();
+            assert!(
+                e.contains("reads the environment") && e.contains("params:"),
+                "{text}: {e}"
+            );
+        }
+        // Neither a param, a file source spec, nor a comment is one.
+        let g = parse_graph(
+            "# ${HOME} in a comment\nparams:\n  p: {type: string, default: a}\nmodules:\n  \
+             - name: m\n    a: ${param:p}\n    trust: \"${file:ca.pem}\"\n    b: \"$5 ${ x\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            g.doc["modules"][0]["trust"].as_str(),
+            Some("${file:ca.pem}")
+        );
+    }
+
+    #[test]
+    fn a_value_cannot_inject_yaml() {
+        let template = "params:\n  p: {type: string, default: a}\nmodules:\n  - name: m\n    \
+                        path: ${param:p}\n    label: \"x-${param:p}\"\n";
         let evil = "a\n  - name: injected\n    path: ${HOME}";
         let values: BTreeMap<String, ParamValue> =
             [("p".to_string(), ParamValue::String(evil.into()))].into();
         let text = render_graph_text(template, &values).unwrap();
-        // The build re-runs the environment pass; the value must survive it
-        // byte-for-byte and stay one scalar.
-        let reread: serde_yaml::Value =
-            serde_yaml::from_str(&crate::env_subst::substitute(&text).unwrap()).unwrap();
+        let reread: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
         let modules = reread["modules"].as_sequence().unwrap();
         assert_eq!(modules.len(), 1);
         assert_eq!(modules[0]["path"].as_str(), Some(evil));
@@ -1003,23 +1024,21 @@ default = false
             modules[0]["label"].as_str().map(str::to_string),
             Some(format!("x-{evil}"))
         );
+        assert!(reread.get(PARAMS_KEY).is_none());
     }
 
     #[test]
     fn booleans_cannot_sit_inside_text_and_keys_cannot_be_placeholders() {
-        let doc = parse_graph("a: \"x${param:b}\"\n").unwrap();
+        let doc: serde_yaml::Value = serde_yaml::from_str("a: \"x${param:b}\"\n").unwrap();
         let values: BTreeMap<String, ParamValue> =
             [("b".to_string(), ParamValue::Boolean(true))].into();
         assert!(render(&doc, &values).unwrap_err().contains("boolean"));
-        let doc = parse_graph("\"${param:k}\": 1\n").unwrap();
+        let doc: serde_yaml::Value = serde_yaml::from_str("\"${param:k}\": 1\n").unwrap();
         assert!(placeholders(&doc).unwrap_err().contains("mapping key"));
-        let doc = parse_graph("a: \"${param:Bad}\"\n").unwrap();
+        let doc: serde_yaml::Value = serde_yaml::from_str("a: \"${param:Bad}\"\n").unwrap();
         assert!(placeholders(&doc)
             .unwrap_err()
             .contains("not a parameter name"));
-        // The environment pass refuses an unclosed `${` first; the
-        // placeholder scan refuses it on its own as well.
-        assert!(parse_graph("a: \"${param:open\"\n").is_err());
         let doc: serde_yaml::Value = serde_yaml::from_str("a: \"${param:open\"\n").unwrap();
         assert!(placeholders(&doc).unwrap_err().contains("unclosed"));
     }
@@ -1031,15 +1050,18 @@ default = false
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let errors = check_references(&p, &used).join("; ");
+        let errors = check_references(&p, &used, "graph").join("; ");
         assert!(
-            errors.contains("`${param:ghost}` but no [params.ghost]"),
+            errors.contains("`${param:ghost}` but `params:` declares no 'ghost'"),
             "{errors}"
         );
         assert!(
-            errors.contains("param 'verbose' is declared but no graph"),
+            errors.contains("param 'verbose' is declared but the graph never references"),
             "{errors}"
         );
+        let e =
+            parse_graph("params:\n  n: {type: integer, default: 1}\nmodules: []\n").unwrap_err();
+        assert!(e.contains("param 'n' is declared"), "{e}");
     }
 
     #[test]
@@ -1101,8 +1123,20 @@ default = false
         assert!(e.contains("more than once"), "{e}");
 
         let e = resolve_values(&BTreeMap::new(), &BTreeMap::new(), &[flag("port=1")]).unwrap_err();
-        assert!(e.contains("declares no parameters"), "{e}");
+        assert!(e.contains("declares no params"), "{e}");
         assert!(resolve_values(&BTreeMap::new(), &BTreeMap::new(), &[]).is_ok());
+    }
+
+    #[test]
+    fn every_missing_required_param_is_named() {
+        let p = schema(
+            "a: {type: string, required: true, example: x}\n\
+             b: {type: integer, required: true, example: 1, description: the b}\n",
+        )
+        .unwrap();
+        let e = resolve_values(&p, &BTreeMap::new(), &[]).unwrap_err();
+        assert!(e.contains("missing required param 'a'"), "{e}");
+        assert!(e.contains("missing required param 'b' (the b)"), "{e}");
     }
 
     /// A scratch directory holding `ca.pem`, unique to this test.
@@ -1114,20 +1148,15 @@ default = false
         dir
     }
 
-    const FILE_SCHEMA: &str = r#"
-[params.ca]
-type = "file"
-required = true
-example = "testdata/ca.pem"
-description = "CA bundle"
-"#;
+    const FILE_SCHEMA: &str =
+        "ca: {type: file, required: true, example: testdata/ca.pem, description: CA bundle}\n";
 
     #[test]
     fn a_file_param_is_required_and_has_no_default() {
         assert!(schema(FILE_SCHEMA).is_ok());
-        let e = schema("[params.ca]\ntype = \"file\"\ndefault = \"/etc/ca.pem\"\n").unwrap_err();
+        let e = schema("ca: {type: file, default: /etc/ca.pem}").unwrap_err();
         assert!(e.contains("is a file and declares a default"), "{e}");
-        let e = schema("[params.ca]\ntype = \"file\"\nrequired = true\nexample = 3\n").unwrap_err();
+        let e = schema("ca: {type: file, required: true, example: 3}").unwrap_err();
         assert!(e.contains("must be a file path, got an integer"), "{e}");
     }
 
@@ -1162,13 +1191,12 @@ description = "CA bundle"
         assert!(e.contains("is not a file"), "{e}");
 
         // The graph names it where a module takes a path, alone or inside a
-        // `${file:..}` source spec, and the build's environment pass leaves
-        // both as rendered.
-        let template = "modules:\n  - name: tls\n    trust: \"${file:${param:ca}}\"\n    \
+        // `${file:..}` source spec.
+        let template = "params:\n  ca: {type: file, required: true, example: x}\nmodules:\n  \
+                        - name: tls\n    trust: \"${file:${param:ca}}\"\n    \
                         cert_file: ${param:ca}\n";
         let text = render_graph_text(template, &v).unwrap();
-        let reread: serde_yaml::Value =
-            serde_yaml::from_str(&crate::env_subst::substitute(&text).unwrap()).unwrap();
+        let reread: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
         let m = &reread["modules"][0];
         assert_eq!(
             m["trust"],
@@ -1182,7 +1210,7 @@ description = "CA bundle"
     }
 
     #[test]
-    fn a_file_example_is_a_sample_beside_the_source_manifest() {
+    fn a_file_example_is_a_sample_beside_the_declaring_document() {
         let dir = scratch_with_ca("check");
         let p = schema(FILE_SCHEMA).unwrap();
         let v = check_values(&p, &dir).unwrap();

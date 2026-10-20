@@ -14,13 +14,15 @@
 //!
 //! Deadlines are measured from an **anchor**: the moment the power step
 //! finished (the orchestrator says so with [`RunEvent::PowerDone`]), or
-//! the start of matching when there was no power step. A source that
-//! reports a fresh boot after the power step started moves its own
-//! expectations' anchor to that boot, so a target that takes a while to
-//! come up is not timed against the rig's clock before it exists.
+//! the start of matching (the instant the matcher is built with) when
+//! there was no power step. A source that reports a fresh boot after the
+//! power step started moves its own expectations' anchor to that boot, so
+//! a target that takes a while to come up is not timed against the rig's
+//! clock before it exists.
 //!
-//! Time is an argument, never read inside: `observe_at` and `tick` take
+//! Time is an argument: `with_expectations`, `observe_at` and `tick` take
 //! `now`, so the deadline logic is tested with a clock the test controls.
+//! `new` and `observe` are the wall-clock conveniences.
 //!
 //! Console rules match against the accumulated tail of console bytes (the
 //! buffer is bounded to 16 KiB). Netboot-fetch rules match on the fetched
@@ -37,51 +39,39 @@ use crate::rig::events::{DeployEvent, RunEvent};
 use crate::rig::scenario::{ExpectRule, ObservationRule};
 use crate::rig::vocab::{Capability, Surface};
 
-/// Rule sources the matcher can actually evaluate today. The validator
-/// surfaces this list so a scenario whose rule source is merely declared
-/// in the vocabulary — but has no matcher path — fails at plan time
-/// rather than silently timing out at run time.
+/// The observe-surface capabilities a rule may read. Each reaches the
+/// matcher as a stream of bytes on its own source — a probe reports its
+/// results as NDJSON lines — except `observe.netboot_fetch`, which is the
+/// deploy backend's `watch` reporting fetched filenames.
 ///
-/// Supported:
-///   * any `console.*` capability (matched against the per-source byte stream)
-///   * any `telemetry.*` capability (same byte-stream evaluator; the
-///     transport layer tags incoming bytes with the qualified
-///     `telemetry.<name>` source, which the matcher buckets the same
-///     way it does console bytes)
-///   * `observe.netboot_fetch` (satisfied by a DeployEvent::ArtifactFetched)
-///   * `observe.https_load` (transport-style observer that drives a
-///     load probe against the rig's IP and emits NDJSON bytes; the
-///     matcher evaluates regex rules against the same byte-stream path
-///     it uses for console/telemetry)
-///   * `observe.proto_load` (the protocol-agnostic load probe: same
-///     byte-stream path, but the backend chooses the protocol from its
-///     binding rather than being HTTPS-only)
-///   * `observe.quic_mux` (the TRANSPORT probe: drives QUIC streams
-///     against a `mux_echo` and emits the same NDJSON byte stream, so it
-///     evaluates on the identical path. Distinct from `proto_load`
-///     because it carries no protocol — a failure there could be the
-///     transport or the protocol above it, and this one cannot be the
-///     latter)
-///   * `observe.tls_load` (the tls anchor's probe: handshakes and an echo,
-///     the same NDJSON byte stream)
-///   * `observe.udp_capture` (generic UDP-datagram capture transport —
-///     binds a configured port and streams each datagram as bytes; the
-///     matcher evaluates regex rules against that per-source byte stream,
-///     same path as console/telemetry. Use it to assert on arbitrary
-///     `platform.debug.to: net` log lines, e.g. the EL0 isolation
-///     `[el0]` / `MON_FAULT` records)
+///   * `observe.netboot_fetch` — a fetch of the staged artifact
+///   * `observe.https_load` — an HTTPS load probe against the rig
+///   * `observe.proto_load` — a load probe whose protocol (h1 / h2c / ws /
+///     grpc, plaintext or TLS) its binding chooses
+///   * `observe.quic_mux` — a transport probe: QUIC streams against an
+///     echo, no protocol above them, so a failure is the transport's
+///   * `observe.tls_load` — TLS 1.3 handshakes and an echo above them
+///   * `observe.udp_capture` — every datagram to a bound port, e.g. a
+///     board's `platform.debug.to: net` log
 ///
-/// Not yet supported (need transport attachment + matcher wiring):
-///   * `observe.monitor_stream`
-///   * `observe.usb_enumeration`
+/// The other observe capabilities describe what a board offers but carry
+/// no stream a regex can read, so a rule on one is refused at plan time
+/// rather than left to time out.
+pub const OBSERVE_RULE_SOURCES: &[&str] = &[
+    "observe.netboot_fetch",
+    "observe.https_load",
+    "observe.proto_load",
+    "observe.quic_mux",
+    "observe.tls_load",
+    "observe.udp_capture",
+];
+
+/// Whether a rule may name `cap` as its source: any console or telemetry
+/// capability (regex over its byte stream), or one of
+/// [`OBSERVE_RULE_SOURCES`].
 pub fn supports_rule_source(cap: Capability) -> bool {
     matches!(cap.surface(), Surface::Console | Surface::Telemetry)
-        || cap.as_str() == "observe.netboot_fetch"
-        || cap.as_str() == "observe.https_load"
-        || cap.as_str() == "observe.proto_load"
-        || cap.as_str() == "observe.quic_mux"
-        || cap.as_str() == "observe.tls_load"
-        || cap.as_str() == "observe.udp_capture"
+        || OBSERVE_RULE_SOURCES.contains(&cap.as_str())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -202,31 +192,6 @@ impl Matcher {
             first_byte_at: BTreeMap::new(),
             last_byte_at: BTreeMap::new(),
         })
-    }
-
-    /// Distinct console capabilities named as rule sources. The
-    /// orchestrator uses this to decide which console transports to
-    /// attach — every one referenced by a rule must be listening.
-    pub fn console_sources(&self) -> Vec<Capability> {
-        let mut out: Vec<Capability> = Vec::new();
-        for src in self
-            .rules
-            .iter()
-            .map(|r| r.source)
-            .chain(self.expects.iter().map(|e| e.source))
-        {
-            if src.surface() == Surface::Console && !out.contains(&src) {
-                out.push(src);
-            }
-        }
-        out
-    }
-
-    /// Start the deadline clock here. The orchestrator calls this when
-    /// matching begins without a power step; a `PowerDone` event does the
-    /// same thing from inside the stream.
-    pub fn set_anchor(&mut self, now: Instant) {
-        self.anchor = now;
     }
 
     /// Observe one event at the wall clock's "now" and return the current
@@ -472,9 +437,10 @@ impl Matcher {
                 }
             }
             DeployEvent::Error(msg) => {
-                // A deploy-side error may flip a fail rule if the scenario
-                // asked for it (uncommon — usually runs report these as
-                // warnings, not failures).
+                // A deploy-side error fails the run only through a
+                // netboot_fetch fail rule whose regex matches its text; a
+                // rule with no regex filters fetches and never fires on an
+                // error.
                 for (idx, rule) in self.rules.iter().enumerate() {
                     if rule.kind != RuleKind::Fail {
                         continue;
@@ -482,9 +448,6 @@ impl Matcher {
                     if rule.source.as_str() != "observe.netboot_fetch" {
                         continue;
                     }
-                    // Only treat a deploy error as a fail when the rule's
-                    // regex is absent (catch-all) or explicitly matches the
-                    // error text.
                     let matched = match &rule.regex {
                         Some(re) => re.is_match(msg),
                         None => false,
@@ -759,23 +722,6 @@ mod tests {
             }
             other => panic!("expected Failed on console.serial, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn console_sources_enumerates_distinct_rule_sources() {
-        let rule_serial = ObservationRule {
-            source: Capability::parse("console.serial").unwrap(),
-            regex: Some("a".into()),
-        };
-        let rule_usb = ObservationRule {
-            source: Capability::parse("console.usb_cdc").unwrap(),
-            regex: Some("b".into()),
-        };
-        let m = Matcher::new(&[rule_serial, rule_usb], &[]).unwrap();
-        let sources = m.console_sources();
-        assert_eq!(sources.len(), 2);
-        assert!(sources.iter().any(|c| c.as_str() == "console.serial"));
-        assert!(sources.iter().any(|c| c.as_str() == "console.usb_cdc"));
     }
 
     #[test]

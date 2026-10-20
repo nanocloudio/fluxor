@@ -88,22 +88,11 @@ pub(crate) fn detect_caused_by(sched: &SchedulerState, module_idx: usize, tick: 
     best
 }
 
-/// content_type of the module's last consumed input. Currently
-/// returns `0` (unknown) for every module — implementation deferred
-/// pending a per-channel content_type cache (`channel_content_type:
-/// [u8; MAX_CHANNELS]`) populated at edge-wire time and read on each
-/// `channel::channel_read`.
-///
-/// The wire byte at `FaultRecord.byte 3` is reserved so the
-/// FaultRecord layout doesn't change when the cache lands. See the
-/// doc comment on `FaultRecord` for the consumer-side contract.
+/// content_type of the module's last consumed input, for its fault
+/// record's `last_input_ct` byte (byte 5 of `FaultRecord`): `0`
+/// (unknown) for every module, since the kernel keeps no per-channel
+/// content type to read it from.
 pub(crate) fn last_input_content_type(_module_idx: usize) -> u8 {
-    // TODO: wire to `SCHED.last_input_ct[module_idx]` once the
-    // per-channel content_type cache is in place. The cache is
-    // populated during prepare_graph (after the destination port
-    // → content_type lookup is resolved from each module's
-    // manifest) and read by `channel::channel_read` to update
-    // `SCHED.last_input_ct[current_module] = channel_content_type[handle]`.
     0
 }
 
@@ -149,8 +138,8 @@ pub(crate) fn apply_quarantine(
 
     // Reverse: any module that declared THIS module as its
     // partner AND has itself faulted within the window. Walks
-    // every fault_info slot once — up to MAX_MODULES (1024 on the
-    // host profiles, 32 on RP), a bounded walk that runs only when a
+    // every fault_info slot once — up to MAX_MODULES (1024 on linux
+    // and bcm2712, 48 on wasm, 32 on RP), a bounded walk that runs only when a
     // module faults, never per step. Indexed loop because the body
     // reads from `sched.finished` and `sched.fault_info` and writes
     // to `targets` — three parallel arrays keyed by module index.

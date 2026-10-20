@@ -85,9 +85,10 @@ Each silicon target has its own HAL implementation under `src/platform/`:
 | UEFI | `src/platform/uefi.rs` | Entered from the UEFI loader with `BootInfo`; aarch64, EL1 or EL2 |
 
 The two RP families share `rp.rs` because both run on a Cortex-M core with
-the same peripheral families. The aarch64 targets share `bcm2712.rs` because
-both run on the same SoC; pi5 is a board overlay on top of the same chip
-support.
+the same peripheral families. The two bare-metal aarch64 boards share
+`bcm2712.rs`: the Pi 5 (`board-pi5`) is the BCM2712 itself, and the QEMU
+`virt` machine, the chip's default board, is a Cortex-A76 with a GICv2, a
+PL011 and virtio-mmio devices, whose differences are board constants.
 
 What is the processor's rather than the chip's lives in `src/arch/`: on
 AArch64, the exception vectors and IRQ dispatch, the GICv2 driver, the
@@ -95,12 +96,13 @@ generic timer, core numbering and the EL2 → EL1 drop, PSCI, the boot-time
 identity map and EL0 module isolation. None of it knows which machine it
 runs on. The facts that differ between machines — where the interrupt
 controller is, which PPI the timer raises, physical or virtual counter,
-`smc` or `hvc` to the firmware, which MPIDR field numbers the cores, where
-a fault dump may be written, which gigabytes a module table must carry for
-the kernel — are values the platform hands over at boot through each
-module's `configure` and `set_*` functions, before the first interrupt. A
-platform that learns them from firmware tables passes what it read; one
-that knows them at build time, like `bcm2712.rs`, passes constants.
+`smc` or `hvc` to the firmware, which MPIDR field numbers the cores, what
+each gigabyte of the identity map holds, where a fault dump may be written,
+which gigabytes a module table must carry for the kernel — are values the
+platform hands over at boot through each module's `configure` and `set_*`
+functions, before the first interrupt; `bcm2712.rs` passes per-board
+constants for the Pi 5 and QEMU `virt`. The UEFI runtime (`uefi.rs`) uses
+none of this layer.
 
 ### RP boot and runtime
 
@@ -396,8 +398,8 @@ fn module_step(state: *mut u8) -> i32 {
 }
 ```
 
-The same module would compile and run unchanged on RP2040 (Cortex-M0+),
-RP2350 (Cortex-M33), or any future RP-family target. It would not run
+The same module compiles and runs unchanged on RP2040 (Cortex-M0+) and
+RP2350 (Cortex-M33), and on any RP part with PIO. It would not run
 on BCM2712 because BCM2712 has no PIO peripheral — and the config
 validator catches this at build time, not at runtime.
 
@@ -502,10 +504,10 @@ The kernel branches on capability, never chip identity. Chip-conditional
 behaviour is expressed as capability features that a chip feature turns on:
 `kernel-vm` (page-table VM + EL0 isolation), `kernel-mpu` (MPU isolation),
 `smp` (multi-core execution domains), `dtb` (device-tree boot).
-`chip-bcm2712` provides `kernel-vm`, `smp` and `dtb` and is today the only
-target that does; the RP chips provide `kernel-mpu`. A future
-MMU-but-single-core (or MPU-but-multi-core) target flips only the
-capabilities it has; no chip name appears in `src/kernel`.
+`chip-bcm2712` provides `kernel-vm`, `smp` and `dtb`, the only chip that
+does; the RP chips provide `kernel-mpu`. A chip with an MMU and one core
+(or an MPU and several) turns on only the capabilities it has, so no chip
+name appears in `src/kernel`.
 
 Anything a kernel file wants from a platform beyond these two seams is a
 boundary bug: add a `HalOps` op (behaviour), a `chip` constant (fact via

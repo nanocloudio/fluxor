@@ -2,8 +2,8 @@
 //! architecture's identity-map builder (`fluxor::arch::aarch64::boot_mmu`),
 //! which owns the tables, the descriptors and the switch.
 //!
-//! Distinct from `fluxor::arch::aarch64::isolation`, which programmes per-module page
-//! tables for EL0 hardware isolation at runtime.
+//! Distinct from `fluxor::arch::aarch64::isolation`, which programmes
+//! per-module page tables for EL0 hardware isolation at runtime.
 
 #![allow(
     dead_code,
@@ -12,21 +12,59 @@
 
 use fluxor::arch::aarch64::boot_mmu::{self, Kind};
 
-pub use boot_mmu::enable;
+extern "C" {
+    /// The image's first byte (`_start` is placed first, at RAM_ORIGIN).
+    static _start: u8;
+    /// The end of the RAM the image, its BSS and the boot stack occupy.
+    static __end_block_addr: u8;
+    /// The packed-payload header `_start` relocates from (magic, _, dest,
+    /// size as u32s).
+    static __package_header_start: u32;
+}
+
+/// The packed-payload header's magic, as `_start` checks it.
+const PACKAGE_MAGIC: u32 = 0x4B50_5846;
+
+/// Turn the MMU on. Everything since entry ran with the MMU off, so the
+/// image's data, BSS (the page tables), the stack — all of
+/// `_start..__end_block_addr` — and the payload `_start` relocated were
+/// written straight to memory; `boot_mmu::enable` invalidates those
+/// ranges before caching starts.
+///
+/// # Safety
+/// As [`boot_mmu::enable`].
+pub unsafe fn enable() {
+    let image = (
+        &raw const _start as usize,
+        &raw const __end_block_addr as usize,
+    );
+    let hdr = &raw const __package_header_start;
+    let payload = if core::ptr::read_volatile(hdr) == PACKAGE_MAGIC {
+        let dest = core::ptr::read_volatile(hdr.add(2)) as usize;
+        let size = core::ptr::read_volatile(hdr.add(3)) as usize;
+        (dest, dest + size)
+    } else {
+        (0, 0)
+    };
+    boot_mmu::enable(&[image, payload]);
+}
 
 /// The Pi 5's map.
 ///
-///   0x0000_0000 .. 0xBFFF_FFFF   DRAM (the first gigabyte in 2 MB blocks)
-///   0xC000_0000 .. 0xFFFF_FFFF   BCM2712 peripherals (GIC, UART, …): device;
-///                                the gigabyte of DRAM behind it is given up
-///   0x1_0000_0000 .. 0x1_3FFF_FFFF   DRAM on 8/16 GB boards (not a DMA target)
-///   0x1_4000_0000 .. 0x1_FFFF_FFFF   PCIe space
+///   0x0000_0000 .. 0xFFFF_FFFF     DRAM (the first gigabyte in 2 MB blocks;
+///                                  the firmware keeps 0x3FC0_0000..0x4000_0000)
+///   0x1_0000_0000 .. 0x1_3FFF_FFFF DRAM (8 and 16 GB boards; not a DMA target)
+///   0x1_4000_0000 .. 0x1_FFFF_FFFF Device: DRAM on 8 and 16 GB boards that
+///                                  the kernel does not use
 ///   0x10_0000_0000 .. 0x10_7FFF_FFFF  SoC peripheral aperture (GIC-400, …)
-///   0x18_0000_0000 .. 0x1B_FFFF_FFFF  PCIe1 (NVMe HAT+) outbound windows
-///   0x1C_0000_0000 .. 0x1C_FFFF_FFFF  RP1 PCIe BAR (VPU firmware window)
+///   0x18_0000_0000 .. 0x1B_FFFF_FFFF  PCIe1 (external connector) outbound windows
+///   0x1C_0000_0000 .. 0x1C_FFFF_FFFF  RP1 BAR, where the firmware leaves PCIe2's
+///                                     outbound window (RP1's UART, Ethernet, …)
 ///
-/// Both BSS-backed DMA arenas must live below 4 GB because the PCIe1
-/// inbound ATU only covers PCI bus 0..0xFFFFFFFF.
+/// The DRAM gigabytes above the first are mapped Normal whether or not a
+/// smaller board populates them. Both BSS-backed DMA arenas must live
+/// below 4 GB because the PCIe1 inbound ATU only covers PCI bus
+/// 0..0xFFFFFFFF.
 ///
 /// # Safety
 /// Called once, early in boot, with the MMU off.
@@ -56,19 +94,17 @@ pub unsafe fn init_page_tables() {
     }
     boot_mmu::unmap_stack_guards(&fluxor::platform::multicore::kernel_stack_guards());
 
-    boot_mmu::map_gb(1, Kind::Dram);
-    boot_mmu::map_gb(2, Kind::Dram);
-    boot_mmu::map_gb(3, Kind::Device);
-    boot_mmu::map_gb(4, Kind::Dram);
+    for gb in 1..5 {
+        boot_mmu::map_gb(gb, Kind::Dram);
+    }
     for gb in 5..8 {
         boot_mmu::map_gb(gb, Kind::Device);
     }
     // The SoC aperture at 0x10_0000_0000 (2 GB): L1 indices 64, 65.
     boot_mmu::map_gb(64, Kind::Device);
     boot_mmu::map_gb(65, Kind::Device);
-    // PCIe1 outbound windows at 0x18_0000_0000..0x1B_FFFF_FFFF (16 GB,
-    // verified against the Pi 5 base-board 6.12 rpt kernel's ranges for the
-    // 1000110000.pcie controller): indices 96..111.
+    // PCIe1 outbound windows at 0x18_0000_0000..0x1B_FFFF_FFFF (16 GB, the
+    // `ranges` of the devicetree's pcie@1000110000): indices 96..111.
     for gb in 96..112 {
         boot_mmu::map_gb(gb, Kind::Device);
     }

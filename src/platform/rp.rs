@@ -447,7 +447,12 @@ fn rp_boot_scan() {
 }
 
 fn rp_runtime_params(module_id: u16, compiled: &[u8]) -> fluxor::kernel::sys::hal::RuntimeParams {
-    fluxor::platform::rp_flash::store::runtime_params(module_id as u8, compiled)
+    // The flash store addresses a module by a one-byte id; a module past it
+    // has no stored override.
+    match u8::try_from(module_id) {
+        Ok(id) => fluxor::platform::rp_flash::store::runtime_params(id, compiled),
+        Err(_) => fluxor::kernel::sys::hal::RuntimeParams::Compiled,
+    }
 }
 
 // Module protection (HalOps seam): the MPU backend where it is compiled in;
@@ -626,7 +631,7 @@ fn rp_csprng_fill(buf: *mut u8, len: usize) -> i32 {
 }
 
 // ============================================================================
-// Async graph setup and main loop (moved from scheduler.rs)
+// Graph setup and main loop
 // ============================================================================
 
 /// Graph setup.

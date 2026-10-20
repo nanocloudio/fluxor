@@ -1,11 +1,13 @@
 // Platform: BCM2712 (Raspberry Pi 5) — Cortex-A76, aarch64 bare-metal
 //
 // Two board configurations (selected at compile time):
-//   - QEMU virt (default): PL011 at 0x0900_0000, GICv2 at 0x0800_0000, RAM at 0x4008_0000
-//   - Pi 5 (feature "board-pi5"): PL011 at 0xFE20_1000, GIC-400 at 0xFF84_1000, RAM at 0x8_0000
+//   - QEMU virt (default): PL011 at 0x0900_0000, GICv2 at 0x0800_0000,
+//     kernel loaded at 0x4008_0000
+//   - Pi 5 (feature "board-pi5"): RP1 PL011 (UART0) at 0x1c_0003_0000,
+//     GIC-400 distributor at 0x10_7fff_9000, kernel loaded at 0x8_0000
 //
 // Features:
-//   - Secondary core parking (Pi 5 boots all 4 cores; cores 1-3 wait in WFE)
+//   - Secondary cores brought up through PSCI CPU_ON
 //   - Early MMU init with identity-mapped page tables (cacheable DRAM, device MMIO)
 //   - RP1 peripheral access via PCIe BAR (GPIO, SPI, I2C register bridges)
 //   - Multi-domain execution with config-driven domain assignment and core wakeup
@@ -17,10 +19,10 @@ use core::arch::global_asm;
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
+use fluxor::arch::aarch64::isolation;
 use fluxor::kernel::boot::config::EdgeClass;
 use fluxor::kernel::exec::scheduler;
 use fluxor::kernel::module::loader;
-use fluxor::arch::aarch64::isolation;
 use fluxor::platform::multicore;
 
 // ── Boot-time submodules (binary-private; not exposed via fluxor::kernel) ──
@@ -52,8 +54,8 @@ mod vault_store;
 
 // Bring the UART, GIC and exception names into the binary's namespace so
 // the callsites (`uart_puts(b"…")`, `irq_bind(…)`, `IRQ_BINDING_COUNT`,
-// `NEXT_DEADLINE_TICKS`, `CORE_TICKS`, `current_core_id()`, …) read as
-// they always have.
+// `NEXT_DEADLINE_TICKS`, `CORE_TICKS`, `current_core_id()`, …) read
+// unqualified.
 use exception::*;
 use fluxor::arch::aarch64::cpu::current_core_id;
 use fluxor::arch::aarch64::{cpu, exception, gic, psci, timer};
@@ -63,10 +65,12 @@ use uart::*;
 
 // ── The board's facts for the architecture ──────────────────────────────────
 //
-// Where the interrupt controller is, which PPI the timer raises and which
-// counter it runs on differ between the Pi 5 (GIC-400, physical timer: no
-// hypervisor) and the QEMU `virt` machine (GICv2 at its own address, the
-// virtual timer, which avoids a KVM trap per access).
+// Where the interrupt controller is, which PPI the timer raises, which
+// counter it runs on, how PSCI is reached and which MPIDR field numbers the
+// cores differ between the Pi 5 (GIC-400, physical timer: no hypervisor;
+// Trusted Firmware by `smc`; cores in Aff1) and the QEMU `virt` machine
+// (GICv2 at its own address; the virtual timer, which avoids a KVM trap per
+// access; PSCI by `hvc`; cores in Aff0).
 #[cfg(feature = "board-pi5")]
 const GICD_BASE: usize = 0x10_7fff_9000; // Pi 5 GIC-400 distributor
 #[cfg(feature = "board-pi5")]
@@ -77,6 +81,8 @@ const TIMER_PPI: u32 = 30; // physical timer
 const TIMER_COUNTER: timer::Counter = timer::Counter::Physical;
 #[cfg(feature = "board-pi5")]
 const PSCI_CONDUIT: psci::Conduit = psci::Conduit::Smc; // Trusted Firmware at EL3
+#[cfg(feature = "board-pi5")]
+const MPIDR_CORE_SHIFT: u32 = 8; // Cortex-A76 MPIDR: core number in Aff1
 #[cfg(not(feature = "board-pi5"))]
 const GICD_BASE: usize = 0x0800_0000; // QEMU virt GICv2 distributor
 #[cfg(not(feature = "board-pi5"))]
@@ -87,11 +93,14 @@ const TIMER_PPI: u32 = 27; // virtual timer
 const TIMER_COUNTER: timer::Counter = timer::Counter::Virtual;
 #[cfg(not(feature = "board-pi5"))]
 const PSCI_CONDUIT: psci::Conduit = psci::Conduit::Hvc; // QEMU virt: PSCI by HVC
+#[cfg(not(feature = "board-pi5"))]
+const MPIDR_CORE_SHIFT: u32 = 0; // QEMU virt: core number in Aff0
 
 /// The 1 GB indices of MMIO the kernel reaches at EL1 while an isolated
-/// module's table is installed: the GIC-400 (timer IAR/EOIR on the IRQ
-/// path; 0x10_7fff_a000 is in gigabytes 64-65) and the RP1 PL011 (fault
-/// dump, debug drain; 0x1c_0003_0000 is gigabyte 112).
+/// module's table is installed: the PCIe controllers (gigabyte 64, from
+/// 0x10_0000_0000: the PCIe1 MSI mux the IRQ path reads), the GIC-400
+/// (gigabyte 65: IAR/EOIR at 0x10_7fff_a000 on every IRQ) and the RP1
+/// PL011 (gigabyte 112: 0x1c_0003_0000, the fault dump and debug drain).
 #[cfg(feature = "board-pi5")]
 const KERNEL_MMIO_GB: &[usize] = &[64, 65, 112];
 /// QEMU virt's GIC and UART sit in the first gigabyte, inside the kernel
@@ -104,14 +113,15 @@ const KERNEL_MMIO_GB: &[usize] = &[];
 const FAULT_STASH: usize = 0x4007_0000;
 
 /// Tell the architecture the board's facts. First thing in `main`, before
-/// the MMU, the timer or the GIC are touched: it only writes RAM.
+/// the MMU, the timer or the GIC are touched: it only writes RAM, and with
+/// the MMU still off the writes land in memory, where a secondary core's
+/// entry stub reads the core-number shift with its own MMU off.
 fn configure_arch() {
     gic::configure(GICD_BASE, GICC_BASE, TIMER_PPI);
     timer::configure(TIMER_COUNTER);
     psci::configure(PSCI_CONDUIT);
-    // The core number sits in MPIDR Aff1 here (`_start` parks on the same
-    // field, by constant).
-    cpu::configure_core_id(8);
+    // `_start` parks on the same field, by the same constant.
+    cpu::configure_core_id(MPIDR_CORE_SHIFT);
     exception::set_fault_stash(FAULT_STASH);
     exception::set_stack_guard_probe(fluxor::platform::multicore::stack_guard_core);
     // Every module table maps the low 3 GB of DRAM EL1-only (kernel image,
@@ -186,7 +196,7 @@ global_asm!(
     "__package_source_start:",
 );
 
-// PL011 UART registers + driver moved to `bcm2712/uart.rs`.
+// PL011 UART registers + driver: `bcm2712/uart.rs`.
 
 // ============================================================================
 // BCM2712 PCIe Root Complex
@@ -359,12 +369,11 @@ static INIT_COMPLETE: AtomicU32 = AtomicU32::new(0);
 // Entry point with secondary core parking
 // ============================================================================
 //
-// Pi 5 GPU firmware boots all 4 Cortex-A76 cores. The _start code checks
-// MPIDR_EL1.Aff0 to identify the core. Core 0 proceeds to main, cores 1-3
-// park in a WFE loop.
-//
-// On QEMU virt with -smp 1 (default), MPIDR_EL1.Aff0 = 0, so the check
-// is harmless. With -smp 4, secondary cores will park correctly.
+// The firmware enters `_start` on the boot core; the others stay with the
+// PSCI implementation until `wake_core` starts them at
+// `secondary_core_trampoline`. `_start` still checks the MPIDR core field
+// (`MPIDR_CORE_SHIFT`) and parks any core but core 0, for firmware that
+// releases every core into the image.
 
 // DTB pointer handed to us by the firmware. `main` records it once the
 // MMU is up; `kernel::boot::dtb::read_ethernet_mac` consults it. Placed in
@@ -384,16 +393,16 @@ global_asm!(
     // up — storing to a symbol here would use the virtual link address,
     // which does not map anywhere real with the MMU off.
     "    mov x19, x0",
-    // Core 0 proceeds; 1-3 park. Pi 5 encodes core at Aff1[15:8].
+    // Core 0 proceeds; any other core parks.
     "    mrs x0, mpidr_el1",
-    "    ubfx x0, x0, #8, #8",
+    "    ubfx x0, x0, #{core_shift}, #8",
     "    cbnz x0, .Lpark_core",
     // ---- Primary core (core 0) continues ----
-    // Pi 5 firmware hands off at EL2. Our kernel runs as EL1, so we drop
-    // down (the architecture's drop; at EL1 already it falls through).
+    // The Pi 5's firmware hands off at EL2; the kernel runs at EL1, so drop
+    // (the architecture's drop; already at EL1, it branches straight on).
     fluxor::drop_to_el1!("x0", "x1", "2f"),
     "2:",
-    // Now at EL1 (either originally or via eret).
+    // At EL1 (either originally or via eret).
     // Install exception vectors for EL1.
     "    adr x1, exception_vectors",
     "    msr vbar_el1, x1",
@@ -472,6 +481,7 @@ global_asm!(
     ".Lpark_core:",
     "    wfi",
     "    b .Lpark_core",
+    core_shift = const MPIDR_CORE_SHIFT,
 );
 
 // ============================================================================
@@ -1108,10 +1118,10 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     uart_put_u32(tick_us);
     uart_puts(b"\r\n");
 
-    // Measured-option opt-in: the SGI wake doorbell and absolute `cntp_cval`
-    // re-arm ship OFF by default and stay off in production. This build-time
-    // feature flips them on at boot so the rig can validate them on silicon
-    // without disturbing the default path.
+    // The SGI wake doorbell and the absolute `cval` re-arm are off by
+    // default and in production; this build-time feature turns them on at
+    // boot so the rig can validate them on silicon without disturbing the
+    // default path.
     #[cfg(feature = "adaptive_deferred_rig")]
     {
         set_wake_doorbell(true);
@@ -1301,11 +1311,11 @@ static mut DOMAIN_METRICS: [DomainMetrics; multicore::MAX_DOMAINS] =
 /// propagation lag, acceptable for a cadence pacer).
 ///
 /// A fixed domain (`adaptive_flags == 0`) gets the fixed `domain_tick_us` from
-/// the pacer, so the slot keeps its boot-seeded value and cadence is
-/// byte-identical to the non-adaptive kernel. Variable cadence (mechanisms
-/// (a)/(b)) becomes active only when a domain sets adaptive flags; on bcm2712
-/// multicore it also relies on the SEV/WFI wake bound described below and the
-/// per-domain wake mask.
+/// the pacer, so the slot keeps its boot-seeded value and the cadence is a
+/// plain fixed tick. Variable cadence — idle widening toward `tick_max_us`
+/// and a per-pass period — is active only when a domain sets adaptive flags;
+/// on bcm2712 multicore it also relies on the SEV/WFI wake bound described
+/// below and the per-domain wake mask.
 ///
 /// SEV-vs-WFI bound: the Tier-0 loop idles on `WFI`, broken only by an IRQ.
 /// IRQ-backed wakes (device interrupts) break it immediately, but a
@@ -1315,16 +1325,16 @@ static mut DOMAIN_METRICS: [DomainMetrics; multicore::MAX_DOMAINS] =
 /// idle/relaxed deadline so the worst-case software-wake latency is bounded (no
 /// hot-path cost, no extra hardware; an SGI doorbell that interrupts `WFI`
 /// directly is the measured alternative). The clamp only bites when the pacer
-/// relaxes past it (idle (a) → tick_max, or (b) near tick_max); busy passes
-/// return ≤ the nominal tick, far below it, so steady-state and the
-/// non-adaptive default are untouched. Rig-tunable: it trades idle wakeups
+/// relaxes past it (an idle domain widening toward `tick_max_us`, or a
+/// per-pass period near it); busy passes return ≤ the nominal tick, far
+/// below it, so steady state and fixed-tick domains are untouched. Rig-tunable: it trades idle wakeups
 /// against worst-case software-wake latency.
 const BCM_IDLE_DEADLINE_CLAMP_US: u32 = 4_000;
 
 /// Most-relaxed deadline (µs) core 0's pacer chose since the last `[therm]`
 /// emit. The `[therm]` pass itself is busy (it drains the log ring → UDP), so a
 /// point-sampled `dl0_us` reads low even when the domain relaxes BETWEEN emits.
-/// This interval-max captures whether (a)/(b) actually reached the relaxed
+/// This interval-max captures whether the pacer actually reached a relaxed
 /// cadence — a sampling-robust idle witness. Reset each emit.
 static DL0_MAX_US: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
@@ -1348,8 +1358,8 @@ fn arm_next_deadline(domain_id: usize, core_id: usize) {
     // The software-wake latency clamp applies ONLY to an adaptive relaxed
     // deadline. A fixed domain (adaptive_flags == 0) gets `domain_tick_us`
     // verbatim from the pacer and must keep it — clamping a 10 ms fixed tick to
-    // 4 ms would silently re-pace it and break the byte-identical non-adaptive
-    // cadence guarantee. Only mechanisms (a)/(b) can relax past the clamp.
+    // 4 ms would silently re-pace it and break the fixed-cadence guarantee.
+    // Only an adaptive domain can relax past the clamp.
     let next_us = if scheduler::domain_adaptive_flags(domain_id) != 0 {
         // The clamp must NOT undercut the pacer's floor: the pacer never
         // returns below `floor = max(tick_min_us, worst_step × MARGIN)`; arming
@@ -2045,10 +2055,10 @@ fn bcm_restore_interrupts(saved: u32) {
 }
 
 /// WFI wake-doorbell toggle. Default OFF: the wake path emits only `SEV`,
-/// paired with the `tick_max_us` idle clamp. When ON, the wake
-/// path also broadcasts a GIC SGI so a WFI-parked Tier-0/1a core wakes
-/// immediately rather than waiting for the backstop — at the cost of an MMIO
-/// write on the hot `event_signal` / cross-domain SPSC-push paths. Enable it
+/// paired with the idle-deadline clamp. When ON, the wake path also
+/// broadcasts a GIC SGI so a WFI-parked core wakes immediately rather than
+/// at its next timer tick — at the cost of an MMIO write on the hot
+/// `event_signal` / cross-domain SPSC-push paths. Enable it
 /// only where the clamp's first-request-after-idle latency is measured to be
 /// insufficient.
 static WAKE_DOORBELL: AtomicBool = AtomicBool::new(false);
@@ -2058,9 +2068,8 @@ pub fn set_wake_doorbell(on: bool) {
     WAKE_DOORBELL.store(on, Ordering::Relaxed);
 }
 
-/// Enable/disable the absolute (`cntp_cval`) timer re-arm at runtime
-/// (default off — the relative `cntp_tval` path is the default). See
-/// `exception::ABSOLUTE_REARM`.
+/// Enable/disable the absolute (`cval`) timer re-arm at runtime (default
+/// off: the relative `tval` re-arm). See `exception::ABSOLUTE_REARM`.
 pub fn set_absolute_rearm(on: bool) {
     exception::ABSOLUTE_REARM.store(on, Ordering::Relaxed);
 }
@@ -2082,8 +2091,9 @@ pub fn wake_doorbell() {
 fn bcm_wake_scheduler() {
     // SAFETY: SEV broadcasts an event to wake WFE-parked cores; hint-only.
     unsafe { core::arch::asm!("sev") };
-    // SEV does NOT break WFI (Tier 0/1a idle posture). When the doorbell
-    // is enabled, also send an SGI so a WFI-parked core wakes immediately.
+    // SEV does NOT break WFI, which the domain loops idle on. When the
+    // doorbell is enabled, also send an SGI so a WFI-parked core wakes
+    // immediately.
     wake_doorbell();
 }
 
@@ -2108,7 +2118,7 @@ fn bcm_sleep_until(_deadline_us: u64) -> u32 {
 /// `dev_millis` / `syscall_millis` for module-side timing such as
 /// NVMe arena probe perf measurement and TCP RTT estimation.
 fn bcm_now_millis() -> u64 {
-    let counter = bcm_read_cntpct();
+    let counter = bcm_read_counter();
     let freq = bcm_counter_freq();
     if freq == 0 {
         return 0;
@@ -2119,7 +2129,7 @@ fn bcm_now_millis() -> u64 {
 /// Monotonic microseconds since boot. Same source as
 /// `bcm_now_millis`, scaled to µs for sub-millisecond profiling.
 fn bcm_now_micros() -> u64 {
-    let counter = bcm_read_cntpct();
+    let counter = bcm_read_counter();
     let freq = bcm_counter_freq();
     if freq == 0 {
         return 0;
@@ -2127,15 +2137,12 @@ fn bcm_now_micros() -> u64 {
     counter.wrapping_mul(1_000_000) / freq
 }
 fn bcm_tick_count() -> u32 {
-    // Back the HAL `tick_count` with wall-clock milliseconds
-    // (CNTPCT-derived) instead of `DBG_TICK`. The
-    // identity "1 tick == 1 ms" holds only at the fixed 1 ms default; under
-    // mechanism (b) the period varies and under mechanism (a)/idle `DBG_TICK`
-    // stops advancing, so a `DBG_TICK`-backed `tick_count` returns wrong
-    // "ms since boot" under adaptive tick. `bcm_now_millis()` is correct under
-    // any pacing — matching rp's `Instant`-based `rp_tick_count` (rp.rs:449).
-    // The internal logical tick counter (`scheduler::tick_count()` → DBG_TICK)
-    // is unchanged; only this outward HAL op is decoupled.
+    // The HAL `tick_count` is wall-clock milliseconds from the counter, not
+    // the scheduler's logical tick (`DBG_TICK`): "1 tick == 1 ms" holds only
+    // at the fixed 1 ms default, while an adaptive domain varies its period
+    // and an idle one stops advancing the tick, so only the counter gives
+    // "ms since boot" under any pacing — as `rp_tick_count` does from its
+    // `Instant`.
     bcm_now_millis() as u32
 }
 
@@ -2194,16 +2201,16 @@ fn maybe_emit_soc_temp(core_id: usize) {
     LAST_TEMP_MS.store(now, Ordering::Relaxed);
     let ct0 = exception::CORE_TICKS[0].load(Ordering::Relaxed);
     // irq_hz = the actual timer-IRQ (wakeup) RATE over the last interval.
-    // With mechanism (a) on an idle domain this falls far below
-    // the nominal `1e6/tick_us`. This is the SAMPLING-ROBUST idle signal: unlike
+    // On an idle adaptive domain this falls far below the nominal
+    // `1e6/tick_us`. This is the SAMPLING-ROBUST idle signal: unlike
     // the instantaneous dl0_us below, it averages over the whole interval, so it
     // isn't skewed by the fact that the emit pass itself is busy.
     let dt_ms = now.wrapping_sub(last).max(1);
     let last_ct0 = LAST_CT0.swap(ct0, Ordering::Relaxed);
     let irq_hz = (ct0.wrapping_sub(last_ct0) as u64 * 1000 / dt_ms) as u32;
     // dl0_us = core 0's deadline at THIS (busy) emit instant; dl0_max_us = the
-    // most-relaxed deadline reached since the last emit (sampling-robust — proves
-    // (a)/(b) actually relaxed even though the emit pass reads busy). Reset the
+    // most-relaxed deadline reached since the last emit (sampling-robust — shows
+    // the pacer relaxed even though the emit pass reads busy). Reset the
     // interval-max after reading it.
     let freq = timer::timer_freq();
     let to_us = |ticks: u64| -> u32 {
@@ -2331,27 +2338,14 @@ fn bcm_pic_barrier() {
 static mut BCM_ARM_TIME: u64 = 0;
 static mut BCM_DEADLINE_TICKS: u64 = 0;
 
-/// Read the timer counter (physical on Pi 5, virtual on QEMU for KVM compat).
-fn bcm_read_cntpct() -> u64 {
-    let val: u64;
-    // SAFETY: reads CNTPCT_EL0 — generic timer counter, side-effect-free.
-    #[cfg(feature = "board-pi5")]
-    unsafe {
-        core::arch::asm!("mrs {}, cntpct_el0", out(reg) val)
-    };
-    // SAFETY: reads CNTVCT_EL0 — virtual counter under KVM/QEMU.
-    #[cfg(not(feature = "board-pi5"))]
-    unsafe {
-        core::arch::asm!("mrs {}, cntvct_el0", out(reg) val)
-    };
-    val
+/// The generic-timer counter the board runs on (`TIMER_COUNTER`).
+#[inline(always)]
+fn bcm_read_counter() -> u64 {
+    timer::read_timer_count_64()
 }
 
 fn bcm_counter_freq() -> u64 {
-    let freq: u64;
-    // SAFETY: reads CNTFRQ_EL0 — read-only frequency register.
-    unsafe { core::arch::asm!("mrs {}, cntfrq_el0", out(reg) freq) };
-    freq
+    timer::timer_freq()
 }
 
 fn bcm_step_guard_init() {}
@@ -2365,7 +2359,7 @@ fn bcm_step_guard_arm(deadline_us: u32) {
     // SAFETY: per-core step-guard state; written by the same core that
     // armed it. Read back in `bcm_step_guard_post_check` on the same core.
     unsafe {
-        BCM_ARM_TIME = bcm_read_cntpct();
+        BCM_ARM_TIME = bcm_read_counter();
         BCM_DEADLINE_TICKS = ticks;
     }
 }
@@ -2379,7 +2373,7 @@ fn bcm_step_guard_post_check() {
     if !step_guard::is_armed() {
         return;
     }
-    let now = bcm_read_cntpct();
+    let now = bcm_read_counter();
     // SAFETY: per-core step-guard read paired with the arming write above.
     let elapsed = now.wrapping_sub(unsafe { BCM_ARM_TIME });
     // SAFETY: as above.
@@ -2390,7 +2384,7 @@ fn bcm_step_guard_post_check() {
 }
 
 fn bcm_read_cycle_count() -> u32 {
-    bcm_read_cntpct() as u32
+    bcm_read_counter() as u32
 }
 
 fn bcm_isr_tier_init() {}
@@ -2407,7 +2401,7 @@ fn bcm_isr_tier_start(period_us: u32) {
     // module runs; sole writer on the scheduler thread.
     unsafe {
         BCM_ISR_PERIOD_TICKS = (period_us as u64 * freq) / 1_000_000;
-        BCM_ISR_LAST_TICK = bcm_read_cntpct();
+        BCM_ISR_LAST_TICK = bcm_read_counter();
     }
     isr_tier::TIER1B_ACTIVE.store(true, core::sync::atomic::Ordering::Release);
 }
@@ -2422,7 +2416,7 @@ fn bcm_isr_tier_poll() {
     if !isr_tier::TIER1B_ACTIVE.load(core::sync::atomic::Ordering::Acquire) {
         return;
     }
-    let now = bcm_read_cntpct();
+    let now = bcm_read_counter();
     // SAFETY: ISR poll runs on the scheduler thread; sole reader.
     let elapsed = now.wrapping_sub(unsafe { BCM_ISR_LAST_TICK });
     // SAFETY: as above.
@@ -2519,7 +2513,10 @@ fn bcm_release_module_handles(_module_idx: fluxor::kernel::exec::scheduler::Modu
 fn bcm_boot_scan() {}
 /// No runtime parameter store on bcm2712: every module gets its compiled
 /// params in place.
-fn bcm_runtime_params(_module_id: u16, _compiled: &[u8]) -> fluxor::kernel::sys::hal::RuntimeParams {
+fn bcm_runtime_params(
+    _module_id: u16,
+    _compiled: &[u8],
+) -> fluxor::kernel::sys::hal::RuntimeParams {
     fluxor::kernel::sys::hal::RuntimeParams::Compiled
 }
 
@@ -2770,7 +2767,7 @@ unsafe fn bcm_system_extension_dispatch(
                 return -22;
             }
             // The bound handle tells us which root complex's MSI mux
-            // to use. Only PCIe1 is wired today.
+            // to use. Only PCIe1 is wired.
             match fluxor::platform::pcie::bound_device_root(_handle) {
                 None => fluxor::kernel::sys::errno::EINVAL,
                 Some(root) => {

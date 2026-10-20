@@ -10,7 +10,7 @@
 //! * `project`  — project build descriptor (`rig.toml` under
 //!   `$XDG_CONFIG_HOME/fluxor/projects/<name>/`, or an in-tree
 //!   `.fluxor-rig.toml`)
-//! * `secret`   — `${env:…}` / `${file:…}` / `${keychain:…}` resolution
+//! * `secret`   — `${env:…}` / `${file:…}` resolution
 //! * `validate` — cross-schema validators
 //! * `plan`     — resolved, side-effect-free lifecycle description
 //! * `lock`     — rig lockfile and teardown marker
@@ -18,8 +18,9 @@
 //! * `events`   — in-process event types consumed by the matcher
 //! * `matcher`  — pass/fail/expect rule engine
 //! * `backend`  — subprocess protocol (discovery, actuator, transport);
-//!   every concrete mechanism (kasa, uhubctl, netboot, termios, …) is
-//!   an external executable, so this crate carries none of that knowledge.
+//!   every concrete mechanism (a smart plug, a USB hub, a TFTP root, a
+//!   tty, a cloud) is an external executable, so this crate carries none
+//!   of that knowledge.
 //! * `run`      — orchestrator that speaks `backend` to execute a plan,
 //!   and tears a rig down whatever happened.
 //! * `cli`      — `fluxor rig …` subcommand entry points.

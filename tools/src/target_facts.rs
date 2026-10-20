@@ -180,7 +180,7 @@ impl TargetFacts {
             // Bare metal on firmware that hands the wall clock over once, at
             // handoff, and no sealing key — a cloud guest is offered none —
             // so the vault stays software. No Fluxor driver owns a transmit
-            // ring yet.
+            // ring, so none reports one drained.
             "uefi" => Self {
                 time_wall_source: Some("network_sync"),
                 trust_system: false,

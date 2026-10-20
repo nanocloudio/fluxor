@@ -116,6 +116,14 @@ fn table() -> &'static [Override] {
     TABLE.get().map(Vec::as_slice).unwrap_or(&[])
 }
 
+/// The store's one-byte id for module `module_id`, or `None` when the id does
+/// not fit one: no stored override can address that module, so it gets its
+/// compiled params. Never a clamp — folding every high id onto 255 would hand
+/// those modules the overrides stored for module 255.
+fn stored_id(module_id: u16) -> Option<u8> {
+    u8::try_from(module_id).ok()
+}
+
 /// Where a module's compiled params and its stored overrides are merged, one
 /// instance at a time (`RuntimeParams::Merged`). Grown to the merge it holds:
 /// there is no fixed ceiling on a merged block.
@@ -127,7 +135,9 @@ static MERGED: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
 /// them, in `MERGED`, sized to what the merge needs and valid until the next
 /// call.
 pub fn merged_params(module_id: u16, compiled: &[u8]) -> Option<(*const u8, usize)> {
-    let id = u8::try_from(module_id).unwrap_or(u8::MAX);
+    // The store addresses a module by a one-byte id, so a module whose id is
+    // past it has no override (`stored_id`).
+    let id = stored_id(module_id)?;
     let extra: usize = table()
         .iter()
         .filter(|o| o.module_id == id)
@@ -171,7 +181,9 @@ pub unsafe fn merge_runtime_overrides(
     if overrides.is_empty() || max < 4 || buf.is_null() {
         return len;
     }
-    let id = u8::try_from(module_id).unwrap_or(u8::MAX);
+    let Some(id) = stored_id(module_id) else {
+        return len;
+    };
     if !overrides.iter().any(|o| o.module_id == id) {
         return len;
     }

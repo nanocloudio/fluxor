@@ -1286,8 +1286,8 @@ fn emit_bcm2712(out: &Path) {
     println!("cargo:rerun-if-changed={board_toml}");
 
     // The isolation facts the MMU backend compiles against: the blocks a
-    // device window may be granted in. `src/platform/bcm2712/mmu.rs` includes
-    // the result.
+    // device window may be granted in. `src/arch/aarch64/isolation.rs`
+    // includes the result.
     #[derive(Deserialize)]
     struct IsolationOnly {
         isolation: Option<IsolationToml>,

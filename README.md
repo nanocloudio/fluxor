@@ -124,8 +124,9 @@ the same ABI surface on that architecture.
 - Live graph reconfigure with a four-phase drain protocol
 - Demand-paged arenas for workloads larger than physical RAM (aarch64
   targets)
-- Platform stack expansion at build time: a config's `platform:`
-  section expands into the board-appropriate driver chain
+- Stacks at build time: a config's `platform:` section expands into the
+  board-appropriate driver chain, and its `include:` takes in published
+  stacks — parameterised subsystems other projects own — by name
 - Hardware-timer ISR tier for hard real-time control, admitted into the
   same scheduler as cooperative modules
 - Stream clock vs wall clock separation via `StreamTime` for
@@ -291,7 +292,7 @@ fluxor/
 ├── crates/             # Host-side crates: fluxor-abi, fluxor-sdk, fluxor-launcher
 ├── contracts/          # Capability contract definitions
 ├── tools/              # Host CLI: validate, build, run, flash, pack, sign, inspect
-├── stacks/             # Reusable stack fragments referenced by configs
+├── stacks/             # Platform stacks: board-matched substrate a config's `platform:` names
 ├── targets/            # Silicon, board, and host definitions
 ├── firmware/           # Vendored peripheral firmware blobs (CYW43)
 └── docs/               # Architecture references and guides

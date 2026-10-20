@@ -50,6 +50,37 @@
 //! `session` output says when a session opens and ends
 //! (`contracts/mesh/remote_session.rs`), so a consumer can stop sending
 //! toward a member that cannot hear it rather than wait out a deadline.
+//!
+//! ## Exchange endpoint
+//!
+//! With `exchange` set, the instance also carries one exchange
+//! (`contracts/exchange.rs`) across the session, so a requester reaches a
+//! provider on another node with the records it would use on a local edge.
+//! The `near` side stands in for the provider (`request_in`,
+//! `response_out`); the `far` side stands in for the requester
+//! (`request_out`, `response_in`) and is wired to the real provider. The
+//! endpoint is two channels appended to the table — requests near to far,
+//! answers far to near — whose records cross verbatim, ids included.
+//!
+//! What a plain channel does not have is the exchange's account of a lost
+//! session, and the endpoint supplies it:
+//!
+//! - The far side tracks every exchange it handed the provider until the
+//!   provider's terminal record. When a session ends it ABORTs each one
+//!   still open, drops what the provider writes for them, and hands the
+//!   provider nothing more until the provider has taken the last ABORT and
+//!   its answers are drained. Only then does it open the next session's
+//!   answer channel, with a LINK record stating the provider's link.
+//! - The near side holds its requester's first requests until that LINK
+//!   record arrives. After a session it carried ends, it delivers the
+//!   answers that arrived whole, writes LINK DOWN, and discards what the
+//!   requester writes until the DOWN is taken and the requester's input is
+//!   drained; it writes LINK UP when the next session's LINK record says
+//!   the provider is up. The requester issues its open exchanges again, and
+//!   none of them can meet a record of the one before.
+//! - The provider's own LINK records cross like any answer; the near side
+//!   writes the requester the state the session and the provider make
+//!   together, and only when it changes.
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
@@ -76,6 +107,7 @@ use core::ffi::c_void;
 #[path = "../../sdk/abi.rs"]
 mod abi;
 use abi::config::tls::MAX_SESSIONS as TLS_SESSIONS;
+use abi::contracts::exchange as xc;
 use abi::contracts::mesh::remote_session;
 use abi::contracts::net::{mux, net_proto, peer_identity};
 use abi::{errno, SyscallTable};
@@ -133,6 +165,26 @@ const PORT_CH_IN: u8 = 2;
 const PORT_CH_OUT: u8 = 1;
 /// Output after the eight `chN_rx`.
 const PORT_SESSION: u8 = 9;
+/// The exchange endpoint's ports, after the channels and `session`: the
+/// near side's provider-shaped pair, the far side's requester-shaped pair.
+const PORT_REQUEST_IN: u8 = 10;
+const PORT_RESPONSE_IN: u8 = 11;
+const PORT_RESPONSE_OUT: u8 = 10;
+const PORT_REQUEST_OUT: u8 = 11;
+
+/// Exchanges the far side holds open between the request HEAD it hands the
+/// provider and the provider's terminal record — the ones it must ABORT
+/// when a session ends. A HEAD past it is answered `503`, marked RAISED,
+/// and never reaches the provider.
+pub const OPEN_EXCHANGES_MAX: usize =
+    if abi::config::TARGET_CLASS == abi::config::target_class::HOST {
+        256
+    } else {
+        32
+    };
+/// The longest record the module writes of its own on an exchange edge: a
+/// refusal HEAD with no content type, headers or body.
+const OWN_RECORD_LEN: usize = xc::HDR + xc::RESP_HEAD_FIXED;
 
 const MAX_AUTHORITY_LEN: usize = 128;
 const TABLE_TEXT_MAX: usize = 512;
@@ -172,6 +224,39 @@ const PH_ATTACHING: u8 = 4;
 /// Table sent; waiting for the peer's.
 const PH_HELLO: u8 = 5;
 const PH_OPEN: u8 = 6;
+
+// Which way an exchange channel carries records, from this side.
+const DIR_BOTH: u8 = 0;
+const DIR_SEND: u8 = 1;
+const DIR_RECV: u8 = 2;
+
+// The near side's account of the requester.
+/// No session has opened its answer channel yet: requests wait in
+/// `request_in`.
+const NS_HOLD: u8 = 0;
+/// Requests cross; answers are delivered.
+const NS_FORWARD: u8 = 1;
+/// The session requests were crossing on ended: answers that arrived whole
+/// are delivered, then LINK DOWN, and the requester's records are discarded
+/// until it has taken the DOWN.
+const NS_PURGE: u8 = 2;
+/// The requester knows; its records are discarded until the next session
+/// says the provider is reachable.
+const NS_WAIT: u8 = 3;
+
+// The far side's account of the provider.
+/// Nothing the provider holds belongs to an ended session.
+const FS_CLEAN: u8 = 0;
+/// ABORTs owed or not yet taken for the exchanges an ended session left
+/// open.
+const FS_ABORTING: u8 = 1;
+
+// What an exchange endpoint makes of a record before it is delivered.
+const X_DELIVER: u8 = 0;
+/// Taken off the ring without delivery.
+const X_CONSUME: u8 = 1;
+/// Left on the ring; the channel waits.
+const X_STALL: u8 = 2;
 
 // Send states per channel.
 const TX_IDLE: u8 = 0;
@@ -214,6 +299,9 @@ struct Chan {
     has_stream: bool,
     hello_rx: bool,
     hello_owed: bool,
+    /// `DIR_SEND` / `DIR_RECV` for an exchange channel, which only ever
+    /// carries records one way; `DIR_BOTH` otherwise.
+    xdir: u8,
     pub records_sent: u32,
     pub records_delivered: u32,
     pub refused_oversize: u32,
@@ -380,6 +468,38 @@ pub struct State {
     /// The state the `session` output last carried: open, and its ordinal.
     reported_open: bool,
     reported_session: u32,
+    // Exchange endpoint (`table.side`). Its request channel is
+    // `table.exchange_at`, its response channel the next.
+    /// Near: `NS_*`.
+    near_state: u8,
+    /// Near: what the requester last heard (or is about to): up until a
+    /// DOWN, so a requester never told anything is up.
+    told_up: bool,
+    /// The provider's link as the far side last reported it.
+    prov_up: bool,
+    /// Near: this session's opening LINK record has arrived.
+    far_ready: bool,
+    /// Near: the LINK state owed to the requester, 0 for none.
+    link_owed: u8,
+    /// Far: `FS_*`.
+    far_state: u8,
+    /// Far: this session's opening LINK record is away.
+    far_announced: bool,
+    /// Far: a record of the module's own owed on the answer channel ahead
+    /// of the provider's — the opening LINK or a refusal — and its length.
+    own_len: u8,
+    own: [u8; OWN_RECORD_LEN],
+    /// Far: how many of `open` have been ABORTed since the session ended.
+    abort_at: u16,
+    n_open: u16,
+    open: [xc::ExchangeId; OPEN_EXCHANGES_MAX],
+    /// Far: requests answered 503 because `open` was full.
+    pub x_refused: u32,
+    /// Far: ABORTs written for exchanges a session left open.
+    pub x_aborted: u32,
+    /// Records an endpoint dropped: the requester's after a lost session,
+    /// the provider's for exchanges no longer open.
+    pub x_discarded: u32,
     pool: [u8; REASSEMBLY_BYTES],
 }
 
@@ -415,6 +535,7 @@ mod params_def {
         };
         6, require_peer, u8, 1 => |s, d, len| { s.require_peer = p_u8(d, len, 0, 1); };
         7, redial_ms, u32, 1000 => |s, d, len| { s.redial_ms = p_u32(d, len, 0, 1000); };
+        8, exchange, u8, 0, enum { none=0, near=1, far=2 } => |s, d, len| { s.table.side = p_u8(d, len, 0, 0); };
     }
 }
 
@@ -436,6 +557,21 @@ unsafe fn log(s: &State, level: u8, m: &[u8]) {
 
 fn n_channels(s: &State) -> usize {
     s.table.channels as usize
+}
+
+/// The exchange endpoint's request channel.
+fn x_req(s: &State) -> usize {
+    s.table.exchange_at as usize
+}
+
+/// The exchange endpoint's response channel.
+fn x_resp(s: &State) -> usize {
+    s.table.exchange_at as usize + 1
+}
+
+/// Whether channel `i` belongs to the exchange endpoint.
+fn is_x(s: &State, i: usize) -> bool {
+    s.table.side != wire::side::NONE && (i == x_req(s) || i == x_resp(s))
 }
 
 // ── Construction ────────────────────────────────────────────────────────────
@@ -475,20 +611,33 @@ fn dial_target(s: &State) -> net_proto::Target<'_> {
 
 /// Lay each channel's region out in the pool: its reassembly ring, and on
 /// a `mailbox` channel a send stage and a delivery stage of one record
-/// each. `false` when the table needs more than `REASSEMBLY_BYTES`.
+/// each. An exchange channel carries records one way, so it has only the
+/// half it uses: a send stage where this side sends, a ring and a delivery
+/// stage where it receives. `false` when the table needs more than
+/// `REASSEMBLY_BYTES`.
 fn carve_pool(s: &mut State) -> bool {
     let mut at: u64 = 0;
     for i in 0..n_channels(s) {
         let e = s.table.entries[i];
+        let dir = s.chans[i].xdir;
         let max = e.max_record as u64;
-        let ring = max + RECORD_CHARGE as u64;
+        let ring = if dir == DIR_SEND {
+            0
+        } else {
+            max + RECORD_CHARGE as u64
+        };
         s.chans[i].ring_off = at as u32;
         s.chans[i].ring_cap = ring as u32;
         at += ring;
         if e.framing == wire::framing::MAILBOX {
-            s.chans[i].tx_stage = at as u32;
-            s.chans[i].rx_stage = (at + max) as u32;
-            at += 2 * max;
+            if dir != DIR_RECV {
+                s.chans[i].tx_stage = at as u32;
+                at += max;
+            }
+            if dir != DIR_SEND {
+                s.chans[i].rx_stage = at as u32;
+                at += max;
+            }
         }
         if at > REASSEMBLY_BYTES as u64 {
             return false;
@@ -701,6 +850,7 @@ unsafe fn end_session(s: &mut State, why: &[u8]) {
             c.tx_hdr_have = 0;
         }
     }
+    x_session_ended(s);
     s.conn = NO_CONN;
     // A listener goes on listening; a dialler redials, and on `mux` the
     // transport announces the next session.
@@ -710,6 +860,51 @@ unsafe fn end_session(s: &mut State, why: &[u8]) {
         PH_IDLE
     };
     s.retry_at_ms = later(dev_millis(sys) as u32, s.redial_ms);
+}
+
+/// The exchange endpoint's share of a session ending. Nothing an exchange
+/// channel holds crosses into the next session: the requester issues every
+/// exchange still open again, so a record of the old one arriving after it
+/// would be a stale record under a live id.
+fn x_session_ended(s: &mut State) {
+    match s.table.side {
+        wire::side::NEAR => {
+            let q = x_req(s);
+            if s.chans[q].tx_state == TX_BODY {
+                // Taken from the requester and not yet begun.
+                s.chans[q].tx_state = TX_IDLE;
+                s.x_discarded = s.x_discarded.wrapping_add(1);
+            }
+            s.far_ready = false;
+            if s.near_state == NS_FORWARD {
+                s.near_state = NS_PURGE;
+            }
+        }
+        wire::side::FAR => {
+            let q = x_req(s);
+            let c = &mut s.chans[q];
+            if c.ring_used != 0 {
+                // Requests that crossed whole and were not handed over.
+                s.x_discarded = s.x_discarded.wrapping_add(1);
+            }
+            c.ring_used = 0;
+            c.ring_head = 0;
+            c.deliver_off = 0;
+            let r = x_resp(s);
+            if s.chans[r].tx_state == TX_BODY {
+                // An answer taken from the provider and not yet begun.
+                s.chans[r].tx_state = TX_IDLE;
+                s.x_discarded = s.x_discarded.wrapping_add(1);
+            }
+            s.far_announced = false;
+            s.own_len = 0;
+            if s.far_state == FS_CLEAN && s.n_open > 0 {
+                s.far_state = FS_ABORTING;
+                s.abort_at = 0;
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Refuse the session: say why, then end it.
@@ -953,6 +1148,14 @@ unsafe fn on_event(s: &mut State, ev: Event<'_>, stream_channel: Option<usize>) 
                 );
                 return false;
             };
+            if s.chans[c].xdir == DIR_SEND {
+                refuse(
+                    s,
+                    wire::refuse::PROTOCOL,
+                    b"[remote_channel] refused: a record on a channel only this side sends on",
+                );
+                return false;
+            }
             let chan = &mut s.chans[c];
             if s.phase != PH_OPEN || chan.rx_active {
                 refuse(
@@ -1147,11 +1350,28 @@ unsafe fn deliver(s: &mut State) {
                 // whole.
                 let stage = s.chans[i].rx_stage;
                 ring_flatten(&mut s.pool, off, cap, base, stage, len);
-                let r =
-                    (sys.channel_write)(output, s.pool.as_ptr().add(stage as usize), len as usize);
-                if r == len as i32 {
+                let verdict = if is_x(s, i) {
+                    x_inbound(s, stage as usize, len as usize)
+                } else {
+                    X_DELIVER
+                };
+                let r = if verdict == X_DELIVER {
+                    (sys.channel_write)(output, s.pool.as_ptr().add(stage as usize), len as usize)
+                } else {
+                    0
+                };
+                if verdict == X_STALL {
+                    false
+                } else if verdict == X_CONSUME {
+                    refused = true;
                     true
-                } else if r == errno::EAGAIN {
+                } else if r == len as i32 {
+                    if is_x(s, i) {
+                        x_delivered(s, stage as usize, len as usize);
+                    }
+                    true
+                } else if r == errno::EAGAIN || r == 0 {
+                    // Nothing placed: the consumer has not taken the last.
                     false
                 } else {
                     log(s, 1, b"[remote_channel] the mailbox cannot take a record this size; record refused");
@@ -1579,6 +1799,10 @@ unsafe fn send_control(s: &mut State) -> bool {
 /// fragment. True when a frame was written.
 unsafe fn send_channel(s: &mut State, i: usize) -> bool {
     let sys = &*s.syscalls;
+    let exchange = is_x(s, i);
+    if exchange && !x_may_send(s, i) {
+        return false;
+    }
     let c = &mut s.chans[i];
     if c.input < 0 {
         return false;
@@ -1637,7 +1861,16 @@ unsafe fn send_channel(s: &mut State, i: usize) -> bool {
             // A mailbox read takes one whole record or, when it is larger
             // than the buffer offered, nothing at all.
             let (stage, max, input) = (c.tx_stage as usize, c.entry.max_record as usize, c.input);
-            let n = (sys.channel_read)(input, s.pool.as_mut_ptr().add(stage), max);
+            let own_record = exchange && s.own_len > 0;
+            let n = if own_record {
+                // A record of the module's own goes ahead of the provider's.
+                let own = s.own_len as usize;
+                s.pool[stage..stage + own].copy_from_slice(&s.own[..own]);
+                s.own_len = 0;
+                own as i32
+            } else {
+                (sys.channel_read)(input, s.pool.as_mut_ptr().add(stage), max)
+            };
             if n == errno::EINVAL {
                 // Over the maximum: refuse it by flushing it off the edge.
                 dev_channel_ioctl(sys, input, IOCTL_FLUSH, core::ptr::null_mut(), 0);
@@ -1650,6 +1883,10 @@ unsafe fn send_channel(s: &mut State, i: usize) -> bool {
                 return false;
             }
             if n <= 0 {
+                return false;
+            }
+            if exchange && !own_record && !x_outbound(s, stage, n as usize) {
+                s.x_discarded = s.x_discarded.wrapping_add(1);
                 return false;
             }
             let c = &mut s.chans[i];
@@ -1769,6 +2006,308 @@ unsafe fn send_records(s: &mut State) {
     }
 }
 
+// ── Exchange endpoint ───────────────────────────────────────────────────────
+
+/// Whether exchange channel `i` may take a record to send now: the near
+/// side's requests once the far side has opened the session's answer
+/// channel, the far side's answers once it has.
+fn x_may_send(s: &State, i: usize) -> bool {
+    match s.table.side {
+        wire::side::NEAR => i == x_req(s) && s.near_state == NS_FORWARD,
+        wire::side::FAR => i == x_resp(s) && s.far_announced,
+        _ => false,
+    }
+}
+
+fn open_index(s: &State, id: &xc::ExchangeId) -> Option<usize> {
+    s.open[..s.n_open as usize].iter().position(|o| o == id)
+}
+
+fn close_exchange(s: &mut State, id: &xc::ExchangeId) {
+    if let Some(k) = open_index(s, id) {
+        let n = s.n_open as usize;
+        s.open.copy_within(k + 1..n, k);
+        s.n_open -= 1;
+    }
+}
+
+/// A record whole on an exchange channel's ring, before delivery: on the
+/// near side an answer, on the far side a request.
+unsafe fn x_inbound(s: &mut State, stage: usize, len: usize) -> u8 {
+    let rec = &s.pool[stage..stage + len];
+    let kind = xc::record_kind(rec);
+    let id = xc::record_id(rec);
+    if s.table.side == wire::side::NEAR {
+        // A LINK owed goes before any answer that arrived after it.
+        if s.link_owed != 0 && !near_flush_link(s) {
+            return X_STALL;
+        }
+        if kind == Some(xc::kind::LINK) {
+            if len == xc::HDR + 1 {
+                s.prov_up = s.pool[stage + xc::HDR] == xc::link::UP;
+                if !s.far_ready {
+                    // The far side's opening record: it is clean, and this
+                    // is the provider's link.
+                    s.far_ready = true;
+                } else if s.near_state == NS_FORWARD {
+                    near_retell(s);
+                }
+            }
+            return X_CONSUME;
+        }
+        return X_DELIVER;
+    }
+    if s.far_state != FS_CLEAN || !s.far_announced || s.own_len != 0 {
+        return X_STALL;
+    }
+    let (Some(kind), Some(id)) = (kind, id) else {
+        s.x_discarded = s.x_discarded.wrapping_add(1);
+        return X_CONSUME;
+    };
+    if open_index(s, &id).is_some() {
+        return X_DELIVER;
+    }
+    if kind != xc::kind::HEAD {
+        // For an exchange the provider has ended or never saw.
+        s.x_discarded = s.x_discarded.wrapping_add(1);
+        return X_CONSUME;
+    }
+    if s.n_open as usize == OPEN_EXCHANGES_MAX {
+        let n = xc::write_refusal(&id, xc::status::BUSY, &mut s.own).unwrap_or(0);
+        s.own_len = n as u8;
+        s.x_refused = s.x_refused.wrapping_add(1);
+        return X_CONSUME;
+    }
+    X_DELIVER
+}
+
+/// A request the far side handed the provider.
+fn x_delivered(s: &mut State, stage: usize, len: usize) {
+    if s.table.side != wire::side::FAR {
+        return;
+    }
+    let rec = &s.pool[stage..stage + len];
+    let (Some(kind), Some(id)) = (xc::record_kind(rec), xc::record_id(rec)) else {
+        return;
+    };
+    match kind {
+        xc::kind::HEAD => {
+            let n = s.n_open as usize;
+            if open_index(s, &id).is_none() && n < OPEN_EXCHANGES_MAX {
+                s.open[n] = id;
+                s.n_open += 1;
+            }
+        }
+        xc::kind::ABORT => close_exchange(s, &id),
+        _ => {}
+    }
+}
+
+/// A record the far side took from the provider: whether it crosses. A
+/// LINK always does; any other record only for an exchange still open.
+fn x_outbound(s: &mut State, stage: usize, len: usize) -> bool {
+    if s.table.side != wire::side::FAR {
+        return true;
+    }
+    let rec = &s.pool[stage..stage + len];
+    let (Some(kind), Some(id)) = (xc::record_kind(rec), xc::record_id(rec)) else {
+        return false;
+    };
+    if kind == xc::kind::LINK {
+        if len != xc::HDR + 1 {
+            return false;
+        }
+        far_link(s, s.pool[stage + xc::HDR]);
+        return true;
+    }
+    if open_index(s, &id).is_none() {
+        return false;
+    }
+    if xc::ends_direction(&s.pool[stage..stage + len]) {
+        close_exchange(s, &id);
+    }
+    true
+}
+
+/// The provider reported its link. Down, every exchange it held is
+/// unknowable and the requester issues each again after up: none is open.
+fn far_link(s: &mut State, state: u8) {
+    s.prov_up = state == xc::link::UP;
+    if !s.prov_up {
+        s.n_open = 0;
+    }
+}
+
+/// Read the provider's records while no session's answer channel is open:
+/// LINK is kept, everything else belongs to an exchange being aborted.
+unsafe fn far_drain(s: &mut State) {
+    let sys = &*s.syscalls;
+    let r = x_resp(s);
+    let (input, stage, max) = (
+        s.chans[r].input,
+        s.chans[r].tx_stage as usize,
+        s.chans[r].entry.max_record as usize,
+    );
+    for _ in 0..FRAMES_PER_STEP {
+        let n = (sys.channel_read)(input, s.pool.as_mut_ptr().add(stage), max);
+        if n == errno::EINVAL {
+            dev_channel_ioctl(sys, input, IOCTL_FLUSH, core::ptr::null_mut(), 0);
+            s.x_discarded = s.x_discarded.wrapping_add(1);
+            continue;
+        }
+        if n <= 0 {
+            return;
+        }
+        let rec = &s.pool[stage..stage + n as usize];
+        if xc::record_kind(rec) == Some(xc::kind::LINK) && rec.len() == xc::HDR + 1 {
+            far_link(s, rec[xc::HDR]);
+        } else {
+            s.x_discarded = s.x_discarded.wrapping_add(1);
+        }
+    }
+}
+
+/// The far side, each step: ABORT what an ended session left open, and
+/// open the answer channel of a session once the provider holds nothing of
+/// the last.
+unsafe fn far_step(s: &mut State) {
+    if s.table.side != wire::side::FAR {
+        return;
+    }
+    let sys = &*s.syscalls;
+    let out = s.chans[x_req(s)].output;
+    if s.far_state == FS_ABORTING {
+        while s.abort_at < s.n_open {
+            let id = s.open[s.abort_at as usize];
+            let mut rec = [0u8; xc::HDR + 1];
+            let n = xc::write_abort(&id, xc::abort::PEER_GONE, &mut rec).unwrap_or(0);
+            if (sys.channel_write)(out, rec.as_ptr(), n) != n as i32 {
+                break;
+            }
+            s.abort_at += 1;
+            s.x_aborted = s.x_aborted.wrapping_add(1);
+        }
+        // The provider has taken the last ABORT once its input is free, and
+        // wrote everything for those exchanges before it took it: what is
+        // left of that is on its output, drained below.
+        if s.abort_at >= s.n_open && (sys.channel_poll)(out, POLL_OUT) & POLL_OUT as i32 != 0 {
+            far_drain(s);
+            s.n_open = 0;
+            s.abort_at = 0;
+            s.far_state = FS_CLEAN;
+        }
+    }
+    if !s.far_announced {
+        far_drain(s);
+        if s.phase == PH_OPEN && s.far_state == FS_CLEAN && s.own_len == 0 {
+            let state = if s.prov_up {
+                xc::link::UP
+            } else {
+                xc::link::DOWN
+            };
+            s.own_len = xc::write_link(state, &mut s.own).unwrap_or(0) as u8;
+            s.far_announced = true;
+        }
+    }
+}
+
+/// Write the LINK state owed to the requester. True when none is owed.
+unsafe fn near_flush_link(s: &mut State) -> bool {
+    if s.link_owed == 0 {
+        return true;
+    }
+    let sys = &*s.syscalls;
+    let out = s.chans[x_resp(s)].output;
+    let mut rec = [0u8; xc::HDR + 1];
+    let n = xc::write_link(s.link_owed, &mut rec).unwrap_or(0);
+    if (sys.channel_write)(out, rec.as_ptr(), n) == n as i32 {
+        s.link_owed = 0;
+    }
+    s.link_owed == 0
+}
+
+/// Tell the requester the provider's link, when it differs from what the
+/// requester last heard. Called with nothing owed.
+unsafe fn near_retell(s: &mut State) {
+    if s.prov_up != s.told_up {
+        s.told_up = s.prov_up;
+        s.link_owed = if s.prov_up {
+            xc::link::UP
+        } else {
+            xc::link::DOWN
+        };
+        near_flush_link(s);
+    }
+}
+
+/// Discard what the requester wrote: records of exchanges a lost session
+/// made unknowable, which it issues again after LINK UP.
+unsafe fn near_discard(s: &mut State) {
+    let sys = &*s.syscalls;
+    let q = x_req(s);
+    let (input, stage, max) = (
+        s.chans[q].input,
+        s.chans[q].tx_stage as usize,
+        s.chans[q].entry.max_record as usize,
+    );
+    for _ in 0..FRAMES_PER_STEP {
+        let n = (sys.channel_read)(input, s.pool.as_mut_ptr().add(stage), max);
+        if n == errno::EINVAL {
+            dev_channel_ioctl(sys, input, IOCTL_FLUSH, core::ptr::null_mut(), 0);
+        } else if n <= 0 {
+            return;
+        }
+        s.x_discarded = s.x_discarded.wrapping_add(1);
+    }
+}
+
+/// The near side, each step after delivery: tell the requester a lost
+/// session, purge what it wrote before it knew, and resume once the far
+/// side opens the next session's answer channel.
+unsafe fn near_step(s: &mut State) {
+    if s.table.side != wire::side::NEAR {
+        return;
+    }
+    let sys = &*s.syscalls;
+    if !near_flush_link(s) {
+        return;
+    }
+    match s.near_state {
+        NS_PURGE => {
+            near_discard(s);
+            let c = &s.chans[x_resp(s)];
+            let whole = if c.rx_active {
+                c.ring_used - RECORD_CHARGE - c.rx_have
+            } else {
+                c.ring_used
+            };
+            if whole != 0 {
+                // Answers that arrived whole go to the requester first.
+                return;
+            }
+            if s.told_up {
+                s.told_up = false;
+                s.link_owed = xc::link::DOWN;
+                near_flush_link(s);
+                return;
+            }
+            // Once the requester has taken the DOWN, everything it wrote
+            // before it knew is on `request_in`.
+            let out = s.chans[x_resp(s)].output;
+            if (sys.channel_poll)(out, POLL_OUT) & POLL_OUT as i32 != 0 {
+                near_discard(s);
+                s.near_state = NS_WAIT;
+            }
+        }
+        NS_WAIT => near_discard(s),
+        _ => {}
+    }
+    if (s.near_state == NS_HOLD || s.near_state == NS_WAIT) && s.phase == PH_OPEN && s.far_ready {
+        s.near_state = NS_FORWARD;
+        near_retell(s);
+    }
+}
+
 // ── Entry points ────────────────────────────────────────────────────────────
 
 declare_module_state_bytes!(State);
@@ -1788,6 +2327,56 @@ pub extern "C" fn module_init(_syscalls: *const c_void) {}
 #[link_section = ".text.module_mailbox_safe"]
 pub extern "C" fn module_mailbox_safe() -> i32 {
     1
+}
+
+/// Bind the exchange endpoint's ports for this instance's side. The side's
+/// own pair must be wired and the other side's must not: an edge to a port
+/// the instance does not serve would carry nothing, silently.
+unsafe fn wire_exchange(s: &mut State) -> bool {
+    let sys = &*s.syscalls;
+    let req_in = dev_channel_port(sys, 0, PORT_REQUEST_IN);
+    let resp_in = dev_channel_port(sys, 0, PORT_RESPONSE_IN);
+    let resp_out = dev_channel_port(sys, 1, PORT_RESPONSE_OUT);
+    let req_out = dev_channel_port(sys, 1, PORT_REQUEST_OUT);
+    let (own, other) = match s.table.side {
+        wire::side::NEAR => ((req_in, resp_out), (resp_in, req_out)),
+        wire::side::FAR => ((resp_in, req_out), (req_in, resp_out)),
+        _ => {
+            if req_in >= 0 || resp_in >= 0 || resp_out >= 0 || req_out >= 0 {
+                log(s, 1, b"[remote_channel] refusing to construct: exchange ports are wired and `exchange` is none");
+                return false;
+            }
+            return true;
+        }
+    };
+    if own.0 < 0 || own.1 < 0 {
+        log(s, 1, b"[remote_channel] refusing to construct: the exchange side's own port pair is not wired");
+        return false;
+    }
+    if other.0 >= 0 || other.1 >= 0 {
+        log(
+            s,
+            1,
+            b"[remote_channel] refusing to construct: the other exchange side's ports are wired",
+        );
+        return false;
+    }
+    let (q, r) = (x_req(s), x_resp(s));
+    if s.table.side == wire::side::NEAR {
+        s.chans[q].input = req_in;
+        s.chans[q].output = -1;
+        s.chans[r].input = -1;
+        s.chans[r].output = resp_out;
+    } else {
+        s.chans[q].input = -1;
+        s.chans[q].output = req_out;
+        s.chans[r].input = resp_in;
+        s.chans[r].output = -1;
+    }
+    // A requester never told anything treats its provider as up.
+    s.told_up = true;
+    s.prov_up = true;
+    true
 }
 
 /// # Safety
@@ -1835,24 +2424,52 @@ pub unsafe extern "C" fn module_new(
         log(s, 1, b"[remote_channel] refusing to construct: `channels` is longer than its parameter allows");
         return -22;
     }
+    let side = s.table.side;
+    if side > wire::side::FAR {
+        log(
+            s,
+            1,
+            b"[remote_channel] refusing to construct: `exchange` is not none, near or far",
+        );
+        return -22;
+    }
     let text = s.table_text;
-    s.table = match wire::parse_table(&text[..s.table_text_len as usize], MAX_RECORD) {
-        Ok(t) => t,
-        Err(e) => {
-            log(s, 1, TABLE_ERRORS.get(e as usize));
-            return -22;
+    s.table = if s.table_text_len == 0 && side != wire::side::NONE {
+        wire::Table::EMPTY
+    } else {
+        match wire::parse_table(&text[..s.table_text_len as usize], MAX_RECORD) {
+            Ok(t) => t,
+            Err(e) => {
+                log(s, 1, TABLE_ERRORS.get(e as usize));
+                return -22;
+            }
         }
     };
+    if side != wire::side::NONE {
+        if s.table.add_exchange(side, xc::RECORD_MAX as u32).is_err() {
+            log(s, 1, b"[remote_channel] refusing to construct: `channels` leaves no room for the exchange endpoint's two channels");
+            return -22;
+        }
+        let (q, r) = (x_req(s), x_resp(s));
+        let near = side == wire::side::NEAR;
+        s.chans[q].xdir = if near { DIR_SEND } else { DIR_RECV };
+        s.chans[r].xdir = if near { DIR_RECV } else { DIR_SEND };
+    }
     if !carve_pool(s) {
         log(s, 1, b"[remote_channel] refusing to construct: the channels' records exceed REASSEMBLY_BYTES");
         return -22;
     }
     for i in 0..n_channels(s) {
         s.chans[i].entry = s.table.entries[i];
-        s.chans[i].input = dev_channel_port(sys, 0, PORT_CH_IN + i as u8);
-        s.chans[i].output = dev_channel_port(sys, 1, PORT_CH_OUT + i as u8);
+        if !is_x(s, i) {
+            s.chans[i].input = dev_channel_port(sys, 0, PORT_CH_IN + i as u8);
+            s.chans[i].output = dev_channel_port(sys, 1, PORT_CH_OUT + i as u8);
+        }
         s.slots[i].parser = Parser::new();
         s.slots[i].channel = 0xFF;
+    }
+    if !wire_exchange(s) {
+        return -22;
     }
     if s.transport == TRANSPORT_NET && s.role == ROLE_DIAL && !adopt_authority(s) {
         log(
@@ -1910,7 +2527,9 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     } else {
         mux_input(s);
     }
+    far_step(s);
     deliver(s);
+    near_step(s);
     try_hello(s);
     check_setup_deadline(s, now);
     if flush_tx(s) && send_control(s) {

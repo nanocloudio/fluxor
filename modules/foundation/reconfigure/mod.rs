@@ -2,7 +2,8 @@
 //!
 //! Drives the reconfigure state machine
 //! (RUNNING → DRAINING → MIGRATING → RUNNING) using kernel primitives
-//! exposed via the `dev_system` reconfigure opcodes (0x0C67-0x0C6F).
+//! exposed via the `dev_system` reconfigure opcodes (0x0C67-0x0C6F, and
+//! `SLOT_CAPACITY` at 0x0C23).
 //! Graphs that do not include this module carry none of the drain,
 //! transition, or timeout logic.
 //!
@@ -82,16 +83,20 @@ const DS_PENDING_TERMINATE: u8 = 3;
 // Bits returned by RECONFIGURE_MODULE_INFO.
 const INFO_DRAIN_CAPABLE: u32 = 0x01;
 
-// Drain round width: the modules one round classifies and drains, one state
-// byte each. The kernel's module-slot count is kernel capacity, not ABI, so it
-// is not compiled in: the module asks for it (`SLOT_CAPACITY`) and the graph's
-// size (`MODULE_COUNT`) at runtime, and a graph wider than one round is
-// drained over successive rounds in index order — every module is drained,
-// none is cut off. Within a round, drain completion follows the upstream
-// masks; a module waits only on upstream peers of its own round, because
-// earlier rounds have finished and later ones have not yet been asked to
-// drain. Each round has the full `drain_timeout_ms`. One round covers every
-// graph today's kernels can hold on host-class targets.
+// Drain round width: the module slots one round classifies and drains, one
+// state byte each. The kernel's module-slot count is kernel capacity, not ABI,
+// so it is not compiled in: the module asks for it (`SLOT_CAPACITY`) and
+// drains every slot below it. Slots, not the module count, because a graph's
+// modules need not be contiguous — a live add places a workload's modules in
+// whichever slots are free — and a module at a slot past the count would be
+// torn down by the rebuild without being drained. An empty slot is classified
+// like a module with no drain export and costs one query. A slot domain wider
+// than one round is drained over successive rounds in index order. Within a
+// round, drain completion follows the upstream masks; a module waits only on
+// upstream peers of its own round, because earlier rounds have finished and
+// later ones have not yet been asked to drain. Each round has the full
+// `drain_timeout_ms`. The widths match the slot counts of the kernels each
+// class runs on, so one round is the usual case.
 const DRAIN_WINDOW: usize = if abi::config::TARGET_CLASS == abi::config::target_class::HOST {
     1024
 } else {
@@ -136,7 +141,9 @@ struct State {
     /// The kernel's module-slot count (`SLOT_CAPACITY`), read on the first
     /// step; 0 until then.
     slot_capacity: u32,
-    /// Modules in the graph when the drain began (`MODULE_COUNT`).
+    /// Module slots the drain covers: the kernel's slot count, or the
+    /// graph's module count (`MODULE_COUNT`) on a kernel that does not answer
+    /// `SLOT_CAPACITY`.
     drain_count: u32,
     /// First module index of the current drain round.
     round_base: u32,
@@ -246,16 +253,29 @@ unsafe fn sys_module_upstream(
     }
 }
 
-/// Bit `j` (a module index) of a mask window that starts at word `first_word`.
-fn upstream_bit(mask: &[u64; UPSTREAM_WORDS], first_word: usize, j: usize) -> bool {
-    let w = j / 64;
-    if w < first_word {
-        return false;
+/// Whether any module of the current round other than `i` is set in the
+/// upstream mask window `mask` (which starts at mask word `first_word`) and
+/// is still Draining. Walks the window's set bits, so the cost is the
+/// module's upstream peers, not the round's width.
+unsafe fn upstream_draining(
+    s: &State,
+    mask: &[u64; UPSTREAM_WORDS],
+    first_word: usize,
+    i: usize,
+) -> bool {
+    let mut w = 0;
+    while w < UPSTREAM_WORDS {
+        let mut bits = core::ptr::read(mask.as_ptr().add(w));
+        while bits != 0 {
+            let j = (first_word + w) * 64 + bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            if j != i && ds_get(s, j) == DS_DRAINING {
+                return true;
+            }
+        }
+        w += 1;
     }
-    match mask.get(w - first_word) {
-        Some(word) => (word >> (j % 64)) & 1 != 0,
-        None => false,
-    }
+    false
 }
 
 unsafe fn sys_module_done(sys: &SyscallTable, idx: u16) -> bool {
@@ -313,7 +333,11 @@ unsafe fn begin_draining(s: &mut State, sys: &SyscallTable) {
 
     sys_set_phase(sys, PHASE_DRAINING);
     s.phase = PHASE_DRAINING;
-    s.drain_count = count as u32;
+    s.drain_count = if s.slot_capacity > 0 {
+        s.slot_capacity
+    } else {
+        count as u32
+    };
     s.round_base = 0;
     begin_round(s, sys);
 }
@@ -396,19 +420,7 @@ unsafe fn check_drain(s: &mut State, sys: &SyscallTable) -> bool {
             let idx = i as u16;
             if sys_module_done(sys, idx) {
                 sys_module_upstream(sys, idx, first_word as u16, &mut upstream);
-                let mut upstream_ok = true;
-                let mut j = base;
-                while j < end {
-                    if j != i
-                        && upstream_bit(&upstream, first_word, j)
-                        && ds_get(s, j) == DS_DRAINING
-                    {
-                        upstream_ok = false;
-                        break;
-                    }
-                    j += 1;
-                }
-                if upstream_ok {
+                if !upstream_draining(s, &upstream, first_word, i) {
                     ds_set(s, i, DS_DRAINED);
                     sys_mark_finished(sys, idx);
                     emit_status(s, sys, STATUS_MODULE_DRAINED, idx, 0);
@@ -571,8 +583,14 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             s.signaled_ready = 1;
             let cap = sys_slot_capacity(sys);
             s.slot_capacity = if cap > 0 { cap as u32 } else { 0 };
+            // The module's own slot must be known before any drain, or the
+            // drain would classify and finish the module running it. The
+            // slot count bounds it when the kernel states one.
             let rc = sys_self_index(sys);
-            if rc >= 0 && (rc as u32) < s.slot_capacity && rc < SELF_IDX_UNKNOWN as i32 {
+            if rc >= 0
+                && rc < SELF_IDX_UNKNOWN as i32
+                && (s.slot_capacity == 0 || (rc as u32) < s.slot_capacity)
+            {
                 s.self_idx = rc as u16;
             }
             // Resolve graph_slot request channel (out port 1). -1 if unwired.

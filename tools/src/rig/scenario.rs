@@ -31,18 +31,15 @@ pub struct Scenario {
     /// additional relative paths use the same anchor.
     pub scenario_dir: PathBuf,
     /// Absolute path to the scenario file itself, when the scenario was
-    /// loaded from disk. Used by the run-record hasher so renaming or
-    /// copying a scenario doesn't produce stale `scenario_sha256` values.
-    /// Populated only by [`load_scenario`]; string-based parsing leaves it
-    /// `None`.
+    /// loaded from disk: the run record's `scenario_sha256` is the hash of
+    /// its bytes. Populated only by [`load_scenario`]; string-based parsing
+    /// leaves it `None`.
     pub source_path: Option<PathBuf>,
 }
 
-/// Every rule names a transport `source` and a match condition.
-///
-/// V1 supports regex matching. The schema deliberately leaves room for other
-/// match kinds (deployment-transport confirmation, USB enumeration) without
-/// a breaking change: additional fields are just additional optional keys.
+/// Every rule names a transport `source` and a match condition: a regex
+/// over the source's byte stream, or, for `observe.netboot_fetch`, over
+/// the fetched filename (where a rule without one matches any fetch).
 #[derive(Debug, Clone)]
 pub struct ObservationRule {
     pub source: Capability,

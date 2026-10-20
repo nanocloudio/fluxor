@@ -29,6 +29,7 @@ How the system works. These are the authoritative references.
 - [architecture/events.md](architecture/events.md) — event objects, IRQ binding, scheduler wake, ISR safety contract
 - [architecture/heap.md](architecture/heap.md) — per-module heap allocation and observability
 - [architecture/reconfigure.md](architecture/reconfigure.md) — live graph reconfigure and the drain-then-reset model
+- [architecture/stacks.md](architecture/stacks.md) — stacks: platform stacks injected by target match, and published stacks included by name (params, exports, include expansion, publishing and pinning)
 - [architecture/hal_architecture.md](architecture/hal_architecture.md) — kernel/module split, syscall table, per-silicon HAL
 - [architecture/abi_layers.md](architecture/abi_layers.md) — ABI layers, contract inventory, provider dispatch, permissions
 - [architecture/runtimes_and_abis.md](architecture/runtimes_and_abis.md) — runtimes vs module ABIs: placement, shelves, store tags, CPU floors
@@ -59,6 +60,8 @@ How the system works. These are the authoritative references.
 How to build and run things with the system.
 
 - [guides/running.md](guides/running.md) — the simplest validated bring-up, config embedded
+- [guides/project-layout.md](guides/project-layout.md) — a project's shape: what it ships under `packaging/`, references as pins, one params model, the Makefile
+- [guides/service-bundles.md](guides/service-bundles.md) — service and applet bundles: identity, the graph's params, references and runs
 - [guides/publishing.md](guides/publishing.md) — publishing artefacts into the local OCI store, consuming them downstream, and keeping the store itself (pins, quarantine, collection)
 - [guides/foundation.md](guides/foundation.md) — foundation layer, driver/foundation boundary, contract patterns
 - [guides/audio.md](guides/audio.md) — audio pipeline architecture and format handling

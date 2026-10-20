@@ -5,9 +5,10 @@
 //! One shape for every project: `[[artifact]]` entries
 //! `{kind, name, project, target?, digest, reference}`. The lockfile
 //! is always the resolver; `resolve_project` walks the dependencies'
-//! project indexes (`<dep>/meta:latest`), `cmd_update` advances the
-//! pins (optionally from a snapshot), and `pin_artifact` is the single
-//! ad-hoc pin writer. Epoch validation (`check_epoch`) enforces the
+//! project indexes (`<dep>/meta:latest`), and `cmd_update` writes the
+//! pins (optionally from a snapshot): every dependency's modules, sources
+//! and runtimes, and every stack and bundle the project references by name
+//! ([`references`]). Epoch validation (`check_epoch`) enforces the
 //! two sync-time rules: set homogeneity for everyone, currency for
 //! live workspace members only.
 
@@ -30,15 +31,15 @@ const LOCKFILE_NAME: &str = "fluxor.lock";
 /// One pinned artifact — the uniform lockfile entry for every kind.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Artifact {
-    /// `module` | `source` | `runtime` | `bundle`.
+    /// `module` | `source` | `runtime` | `bundle` | `stack`.
     pub kind: String,
     /// Artifact name (module name, source-tree name, runtime binary
-    /// name, bundle name).
+    /// name, bundle name, stack name).
     pub name: String,
     /// Publishing project (`io.fluxor.project`).
     pub project: String,
     /// Module ABI for modules, host triple for runtimes; absent
-    /// for sources and bundles.
+    /// for sources, bundles and stacks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
     /// Artifact-manifest digest (`sha256:<hex>`) — the identity.
@@ -186,10 +187,10 @@ pub fn read_store_lock(project_root: &Path) -> Result<Option<StoreLock>> {
 }
 
 /// Refuse module pins whose `target` is not a module ABI
-/// (`crate::runtime_abi::ABIS`): a pin taken under another naming of the
-/// shelves resolves nothing now, and consuming the lock as though it had no
-/// pin would build from whatever happens to be on disk. `fluxor update`
-/// replaces every module pin and is the way out.
+/// (`crate::runtime_abi::ABIS`): such a pin names no shelf and resolves
+/// nothing, and consuming the lock as though it had no pin would build from
+/// whatever happens to be on disk. `fluxor update` rewrites every module pin
+/// and is the way out.
 pub fn check_module_pin_targets(artifacts: &[Artifact]) -> Result<()> {
     let stale: Vec<String> = artifacts
         .iter()
@@ -309,7 +310,7 @@ fn is_transient(checkout: &Path) -> bool {
 /// A pin whose manifest cannot be read keeps `None` — unknown is not
 /// the same claim as "no layers", and reporting must be able to tell
 /// them apart.
-fn fill_content(store: &OciStore, entries: &mut [Artifact]) {
+pub(crate) fn fill_content(store: &OciStore, entries: &mut [Artifact]) {
     for e in entries.iter_mut() {
         if let Ok(bytes) = store.read_blob(&e.digest) {
             if let Ok(m) = serde_json::from_slice::<ImageManifest>(&bytes) {
@@ -384,7 +385,7 @@ pub fn artifact_from_descriptor(d: &Descriptor) -> Result<Option<Artifact>> {
                 content: None,
             }
         }
-        "bundle" => Artifact {
+        "bundle" | "stack" => Artifact {
             kind: kind.clone(),
             name: last_segment,
             project,
@@ -438,14 +439,9 @@ fn read_image_index(store: &OciStore, digest: &str) -> Result<ImageIndex> {
         .map_err(|e| Error::Config(format!("corrupt index {digest}: {e}")))
 }
 
-/// Resolve one dependency's pinnable artifacts from its project index
-/// (`<dep>/meta:latest`): every source and runtime child, plus module
-/// children whose target is in `abis` (all of them when `None`).
-pub(crate) fn resolve_dependency(
-    store: &OciStore,
-    dep: &str,
-    abis: Option<&BTreeSet<String>>,
-) -> Result<Vec<Artifact>> {
+/// Every pinnable child of one dependency's project index
+/// (`<dep>/meta:latest`).
+fn dependency_index(store: &OciStore, dep: &str) -> Result<Vec<Artifact>> {
     let meta_ref = format!("{dep}/meta:latest");
     let desc = store.resolve(&meta_ref).map_err(|_| {
         Error::Config(format!(
@@ -456,29 +452,159 @@ pub(crate) fn resolve_dependency(
     let idx = read_image_index(store, &desc.digest)?;
     let mut out = Vec::new();
     for child in &idx.manifests {
-        let Some(a) = artifact_from_descriptor(child)? else {
-            continue;
-        };
-        match a.kind.as_str() {
-            "source" | "runtime" => out.push(a),
-            "module" => {
-                let wanted = match (abis, a.target.as_deref()) {
-                    (Some(set), Some(t)) => set.contains(t),
-                    // No target list, or an untargeted module child:
-                    // pin rather than silently drop.
-                    _ => true,
-                };
-                if wanted {
-                    out.push(a);
-                }
-            }
-            // Bundles are not dependency pins: a consumer pins the
-            // services it runs itself (`fluxor store pin`).
-            _ => {}
+        if let Some(a) = artifact_from_descriptor(child)? {
+            out.push(a);
         }
     }
+    Ok(out)
+}
+
+/// Resolve one dependency's pinnable artifacts from its project index
+/// (`<dep>/meta:latest`): every source and runtime child, plus module
+/// children whose target is in `abis` (all of them when `None`). Its
+/// stacks and bundles are pinned only when referenced ([`references`]).
+pub(crate) fn resolve_dependency(
+    store: &OciStore,
+    dep: &str,
+    abis: Option<&BTreeSet<String>>,
+) -> Result<Vec<Artifact>> {
+    let mut out: Vec<Artifact> = dependency_index(store, dep)?
+        .into_iter()
+        .filter(|a| match a.kind.as_str() {
+            "source" | "runtime" => true,
+            "module" => match (abis, a.target.as_deref()) {
+                (Some(set), Some(t)) => set.contains(t),
+                // No target list, or an untargeted module child: pin
+                // rather than silently drop.
+                _ => true,
+            },
+            _ => false,
+        })
+        .collect();
     fill_content(store, &mut out);
     Ok(out)
+}
+
+/// The stacks and bundles a project references by name.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct References {
+    /// Every `include[].stack` name in a graph the project versions, other
+    /// than the project's own `packaging/stack/<name>.yaml`.
+    pub stacks: BTreeSet<String>,
+    /// `fluxor.toml::[uses] bundles`, other than the project's own
+    /// `packaging/` bundles.
+    pub bundles: BTreeSet<String>,
+}
+
+/// What this project references by name: every stack a graph it versions
+/// includes by name (a file path is not a reference), and every bundle its
+/// `[uses] bundles` declares. Its own packaged stacks and bundles resolve
+/// to themselves and are not references. A nested project's graphs are its
+/// own.
+pub fn references(project_root: &Path) -> Result<References> {
+    let mut refs = References::default();
+    for rel in crate::project::tracked_files(project_root, &["*.yaml", "*.yml"]) {
+        let path = project_root.join(&rel);
+        if !crate::project::is_own_file(project_root, &path) {
+            continue;
+        }
+        let Some(doc) = fs::read_to_string(&path)
+            .ok()
+            .and_then(|t| serde_yaml::from_str::<serde_yaml::Value>(&t).ok())
+        else {
+            continue;
+        };
+        let Some(includes) = doc
+            .get(crate::stack::INCLUDE_KEY)
+            .and_then(serde_yaml::Value::as_sequence)
+        else {
+            continue;
+        };
+        for inc in includes {
+            if let Some(name) = inc.get("stack").and_then(serde_yaml::Value::as_str) {
+                if crate::stack::is_stack_name(name)
+                    && !crate::packaging::stack_path(project_root, name).is_file()
+                {
+                    refs.stacks.insert(name.to_string());
+                }
+            }
+        }
+    }
+    for name in crate::project::used_bundles(project_root).map_err(Error::Config)? {
+        if crate::packaging::bundle_path(project_root, &name).is_none() {
+            refs.bundles.insert(name);
+        }
+    }
+    Ok(refs)
+}
+
+/// The one artifact of `kind` named `name` among the dependencies' indexes,
+/// or a refusal: none publishes it, or more than one does. Stack and bundle
+/// names are ecosystem-unique, so two publishers is an ambiguity this
+/// project cannot settle by guessing.
+fn find_reference<'a>(
+    indexes: &'a [(String, Vec<Artifact>)],
+    kind: &str,
+    name: &str,
+) -> Result<&'a Artifact> {
+    let found: Vec<(&str, &Artifact)> = indexes
+        .iter()
+        .flat_map(|(dep, arts)| arts.iter().map(move |a| (dep.as_str(), a)))
+        .filter(|(_, a)| a.kind == kind && a.name == name)
+        .collect();
+    match found.as_slice() {
+        [(_, a)] => Ok(a),
+        [] => Err(Error::Config(format!(
+            "{kind} '{name}' is referenced, but no dependency publishes it (dependencies: {}) \
+             — declare the project that publishes it under [dependencies]",
+            if indexes.is_empty() {
+                "none".to_string()
+            } else {
+                indexes
+                    .iter()
+                    .map(|(d, _)| d.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        ))),
+        many => Err(Error::Config(format!(
+            "{kind} '{name}' is published by more than one dependency ({}); {kind} names are \
+             unique across the ecosystem — one of them must rename it",
+            many.iter().map(|(d, _)| *d).collect::<Vec<_>>().join(", ")
+        ))),
+    }
+}
+
+/// Pin every reference: each stack with the module references it carries,
+/// and each bundle, from the dependency that publishes it, into `out`.
+fn pin_references(
+    project_root: &Path,
+    store: &OciStore,
+    refs: &References,
+    out: &mut Vec<Artifact>,
+) -> Result<()> {
+    if refs.stacks.is_empty() && refs.bundles.is_empty() {
+        return Ok(());
+    }
+    let mut indexes = Vec::new();
+    for dep in crate::project::dependencies(project_root).map_err(Error::Config)? {
+        let arts = dependency_index(store, &dep.name)?;
+        indexes.push((dep.name, arts));
+    }
+    let me = crate::project::project_identity(project_root)
+        .ok()
+        .flatten()
+        .map(|i| i.name);
+    for name in &refs.stacks {
+        let stack = find_reference(&indexes, crate::stack::KIND, name)?.clone();
+        crate::stack::derived_pins(store, &stack, out, me.as_deref())?;
+    }
+    for name in &refs.bundles {
+        let mut bundle = find_reference(&indexes, "bundle", name)?.clone();
+        fill_content(store, std::slice::from_mut(&mut bundle));
+        out.push(bundle);
+    }
+    Ok(())
 }
 
 /// Resolve every declared `[dependencies]` project against the store's
@@ -497,12 +623,12 @@ pub fn resolve_project(project_root: &Path) -> Result<Vec<Artifact>> {
     Ok(out)
 }
 
-/// `fluxor update` in the consolidated flow: without `--from`, advance
-/// every pin to the deps' latest published state; with
+/// `fluxor update` in the consolidated flow: without `--from`, pin the
+/// deps' latest published state and every reference the project makes by
+/// name ([`references`]) — a reference no longer made has no pin; with
 /// `--from snapshot/<name>`, the snapshot's children replace the pins
-/// wholesale. A lockfile that does not parse is an error: its bundle
-/// pins are the consumer's own decisions, which nothing else records, so
-/// rewriting it would drop them silently.
+/// wholesale. A lockfile that does not parse is an error, so a damaged
+/// lock is corrected by hand or deleted rather than overwritten unread.
 pub fn cmd_update(project_root: &Path, from_snapshot: Option<&str>) -> Result<()> {
     let _guard = crate::lockfile::lock_lockfile(project_root)?;
     let before = read_store_lock(project_root)?
@@ -511,7 +637,9 @@ pub fn cmd_update(project_root: &Path, from_snapshot: Option<&str>) -> Result<()
     let entries = match from_snapshot {
         None => {
             let mut out = resolve_project(project_root)?;
-            out.extend(advance_bundle_pins(&before)?);
+            let refs = references(project_root)?;
+            let store = OciStore::open(crate::oci_store::store_root()?)?;
+            pin_references(project_root, &store, &refs, &mut out)?;
             sort_entries(&mut out);
             out
         }
@@ -546,48 +674,6 @@ pub fn cmd_update(project_root: &Path, from_snapshot: Option<&str>) -> Result<()
         eprintln!("{note}");
     }
     Ok(())
-}
-
-/// The bundles this project pinned (`fluxor store pin`), advanced to the
-/// latest digest their publisher tagged.
-///
-/// Dependency indexes do not name bundles — a consumer chooses which
-/// services it runs — so a bundle pin is the consumer's own decision and
-/// `update` carries it forward rather than dropping it. A pinned bundle
-/// whose `:latest` is gone, or now belongs to another project, is an error:
-/// silently losing the pin would leave `fluxor run <name>` with nothing to
-/// run.
-fn advance_bundle_pins(before: &[Artifact]) -> Result<Vec<Artifact>> {
-    let pinned: Vec<&Artifact> = before.iter().filter(|a| a.kind == "bundle").collect();
-    if pinned.is_empty() {
-        return Ok(Vec::new());
-    }
-    let store = OciStore::open(crate::oci_store::store_root()?)?;
-    let mut out = Vec::new();
-    for old in pinned {
-        let latest = format!("{}:latest", old.name);
-        let desc = store.resolve(&latest).map_err(|_| {
-            Error::Config(format!(
-                "bundle '{}' is pinned but '{latest}' is not in the store — run `fluxor publish \
-                 bundle` in {}, or drop the pin",
-                old.name, old.project
-            ))
-        })?;
-        let Some(new) = artifact_from_descriptor(&desc)?.filter(|a| a.kind == "bundle") else {
-            return Err(Error::Config(format!(
-                "'{latest}' is no longer a bundle artifact"
-            )));
-        };
-        if new.project != old.project {
-            return Err(Error::Config(format!(
-                "bundle '{}' was pinned from project '{}' but '{latest}' is now published by '{}'",
-                old.name, old.project, new.project
-            )));
-        }
-        out.push(new);
-    }
-    fill_content(&store, &mut out);
-    Ok(out)
 }
 
 /// How one pin changed across an update.
@@ -700,39 +786,11 @@ fn withdrawal_note(project_root: &Path, before: &[Artifact], after: &[Artifact])
     (!lines.is_empty()).then(|| lines.join("\n"))
 }
 
-/// The single ad-hoc pin writer (`fluxor store pin` calls this):
-/// upsert one entry under the advisory lock. Keyed by
-/// (kind, project, name, target).
-pub fn pin_artifact(project_root: &Path, artifact: &Artifact) -> Result<()> {
-    refuse_own_pins(project_root, std::slice::from_ref(artifact))?;
-    let _guard = crate::lockfile::lock_lockfile(project_root)?;
-    let mut entries = read_store_lock(project_root)?
-        .map(|l| l.artifacts)
-        .unwrap_or_default();
-    entries.retain(|e| {
-        !(e.kind == artifact.kind
-            && e.project == artifact.project
-            && e.name == artifact.name
-            && e.target == artifact.target)
-    });
-    let mut artifact = artifact.clone();
-    if artifact.content.is_none() {
-        if let Ok(store) = OciStore::open(crate::oci_store::store_root()?) {
-            fill_content(&store, std::slice::from_mut(&mut artifact));
-        }
-    }
-    entries.push(artifact);
-    write_store_lock(project_root, &entries)?;
-    Ok(())
-}
-
 /// A project never pins what it publishes itself: nothing builds against
-/// its own published artefacts (it builds them), and a bundle pin is a
-/// consumer's choice of a service to run. A pin of one's own artifact is a
+/// its own published artefacts (it builds them), and its own stacks and
+/// bundles resolve from its `packaging/`. A pin of one's own artifact is a
 /// dependency on oneself — the next build needs a publish that needs that
-/// build — so it is refused where it would be written and where it would be
-/// followed. A project runs its own bundle by path
-/// (`fluxor run <workload.toml>`).
+/// build — so it is refused where it would be followed.
 pub(crate) fn refuse_own_pins(project_root: &Path, entries: &[Artifact]) -> Result<()> {
     let Ok(Some(me)) = crate::project::project_identity(project_root) else {
         return Ok(());
@@ -740,8 +798,8 @@ pub(crate) fn refuse_own_pins(project_root: &Path, entries: &[Artifact]) -> Resu
     if let Some(own) = entries.iter().find(|e| e.project == me.name) {
         return Err(Error::Config(format!(
             "{} pins `{}` ({} `{}`), an artifact this project publishes itself — a project \
-             does not depend on its own artifacts. Remove the entry from fluxor.lock; run \
-             your own bundle by path (`fluxor run <workload.toml>`).",
+             does not depend on its own artifacts. Run `fluxor update` to rewrite the pins; \
+             the project's own stacks and bundles resolve from its packaging/.",
             project_root.join(LOCKFILE_NAME).display(),
             own.reference,
             own.kind,
@@ -1023,7 +1081,7 @@ mod tests {
     }
 
     #[test]
-    fn a_project_cannot_pin_its_own_artifact() {
+    fn a_self_pin_is_refused_where_it_would_be_followed() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("fluxor.toml"),
@@ -1031,18 +1089,8 @@ mod tests {
         )
         .unwrap();
         let own = entry("bundle", "fluxor", "dns_service", None);
-        let err = pin_artifact(dir.path(), &own).unwrap_err().to_string();
-        assert!(err.contains("publishes itself"), "{err}");
-        assert!(
-            read_store_lock(dir.path()).unwrap().is_none(),
-            "nothing written"
-        );
-        // Another project's artifact pins as before.
         let theirs = entry("bundle", "wave", "http_service", None);
-        pin_artifact(dir.path(), &theirs).unwrap();
-        // A self-pin that reached the lock anyway is refused where it would be
-        // followed, naming itself rather than a missing blob.
-        write_store_lock(dir.path(), &[theirs, own]).unwrap();
+        write_store_lock_stamped(dir.path(), &[theirs, own], None).unwrap();
         let err = crate::store_sync::ensure_synced(dir.path())
             .unwrap_err()
             .to_string();
@@ -1052,17 +1100,264 @@ mod tests {
         );
     }
 
+    // ── references are the pins ────────────────────────────────────────
+
+    /// Publish stack `name` (no module references) from project `owner`.
+    fn publish_stack(store: &OciStore, owner: &str, name: &str) {
+        let text =
+            format!("stack: {name}\nversion: 0.1.0\nmodules:\n  - name: out\n    type: cli_out\n");
+        let reference = format!("stack/{name}:0.1.0");
+        let meta = crate::oci_store::ArtifactMeta {
+            project: owner,
+            provenance: crate::oci_store::PROVENANCE_LOCAL,
+            source_rev: None,
+            abi_surface_hex: "00",
+            input_digest_hex: None,
+            ci_digest_hex: None,
+        };
+        let txn = store.begin_publish().unwrap();
+        let prepared = vec![store
+            .prepare_stack(
+                &crate::oci_store::StackArtifact {
+                    stack_yaml: text.as_bytes(),
+                    modules_json: b"[]",
+                    ref_name: &reference,
+                },
+                &meta,
+            )
+            .unwrap()];
+        let index = store.read_index().unwrap();
+        let plan = store
+            .plan_publish(&index, owner, "0.1.0", &prepared, None, &[])
+            .unwrap();
+        store.commit_plan(&txn, plan, prepared, None).unwrap();
+    }
+
+    fn git(root: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}");
+    }
+
+    /// A consumer of `deps`, in git, whose example graph includes `stack`
+    /// by name.
+    fn consumer(root: &Path, deps: &[&str], include: Option<&str>) {
+        let deps: String = deps.iter().map(|d| format!("{d} = \"0.1\"\n")).collect();
+        std::fs::write(
+            root.join("fluxor.toml"),
+            format!(
+                "[project]\nname = \"consumer\"\nversion = \"0.0.1\"\n\n[dependencies]\n{deps}"
+            ),
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("examples")).unwrap();
+        let graph = match include {
+            Some(name) => {
+                format!("target: linux\ninclude:\n  - stack: {name}\n    as: v\nmodules: []\n")
+            }
+            None => "target: linux\nmodules: []\n".to_string(),
+        };
+        std::fs::write(root.join("examples/g.yaml"), graph).unwrap();
+        if !root.join(".git").is_dir() {
+            git(root, &["init", "-q"]);
+        }
+        git(root, &["add", "-A"]);
+    }
+
     #[test]
-    fn pin_artifact_upserts_by_identity() {
+    fn update_pins_what_the_project_references_and_drops_what_it_no_longer_does() {
+        let _env = crate::oci_store::test_env_lock();
         let dir = tempfile::tempdir().unwrap();
-        let a = entry("module", "fluxor", "tls", Some("bcm2712"));
-        pin_artifact(dir.path(), &a).unwrap();
-        let mut b = a.clone();
-        b.digest = format!("sha256:{}", "cd".repeat(32));
-        pin_artifact(dir.path(), &b).unwrap();
-        let lock = read_store_lock(dir.path()).unwrap().unwrap();
-        assert_eq!(lock.artifacts.len(), 1, "upsert must replace, not append");
-        assert_eq!(lock.artifacts[0].digest, b.digest);
+        let store_dir = dir.path().join("store");
+        let no_workspace = dir.path().join("no-workspace.toml");
+        let _scope = crate::oci_store::EnvScope::set(&[
+            ("FLUXOR_STORE", &store_dir),
+            ("FLUXOR_WORKSPACE", &no_workspace),
+        ]);
+        let store = OciStore::open(&store_dir).unwrap();
+        publish_stack(&store, "storage", "vol");
+        let root = dir.path().join("consumer");
+        std::fs::create_dir_all(&root).unwrap();
+
+        // Referenced: pinned from the dependency that publishes it.
+        consumer(&root, &["storage"], Some("vol"));
+        assert_eq!(
+            references(&root).unwrap().stacks,
+            ["vol".to_string()].into()
+        );
+        cmd_update(&root, None).unwrap();
+        let lock = read_store_lock(&root).unwrap().unwrap();
+        assert!(
+            lock.artifacts
+                .iter()
+                .any(|a| a.kind == "stack" && a.name == "vol" && a.project == "storage"),
+            "{:?}",
+            lock.artifacts
+        );
+
+        // A path include is not a reference; the project's own packaged
+        // stack is not either.
+        std::fs::create_dir_all(root.join("packaging/stack")).unwrap();
+        std::fs::write(root.join("packaging/stack/mine.yaml"), "stack: mine\n").unwrap();
+        std::fs::write(
+            root.join("examples/own.yaml"),
+            "include:\n  - stack: mine\n    as: m\n  - stack: ../packaging/stack/mine.yaml\n    as: n\n",
+        )
+        .unwrap();
+        git(&root, &["add", "-A"]);
+        assert_eq!(
+            references(&root).unwrap().stacks,
+            ["vol".to_string()].into()
+        );
+
+        // No longer referenced: the next update drops the pin.
+        consumer(&root, &["storage"], None);
+        cmd_update(&root, None).unwrap();
+        let lock = read_store_lock(&root).unwrap().unwrap();
+        assert!(
+            !lock.artifacts.iter().any(|a| a.kind == "stack"),
+            "{:?}",
+            lock.artifacts
+        );
+    }
+
+    #[test]
+    fn a_reference_two_dependencies_publish_or_none_does_is_refused() {
+        let _env = crate::oci_store::test_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let store_dir = dir.path().join("store");
+        let no_workspace = dir.path().join("no-workspace.toml");
+        let _scope = crate::oci_store::EnvScope::set(&[
+            ("FLUXOR_STORE", &store_dir),
+            ("FLUXOR_WORKSPACE", &no_workspace),
+        ]);
+        let store = OciStore::open(&store_dir).unwrap();
+        publish_stack(&store, "alpha", "vol");
+        // One store refuses a second publisher of a name; dependencies read
+        // from indexes that disagree are refused all the same.
+        let index = vec![
+            (
+                "alpha".to_string(),
+                vec![entry("stack", "alpha", "vol", None)],
+            ),
+            (
+                "beta".to_string(),
+                vec![entry("stack", "beta", "vol", None)],
+            ),
+        ];
+        let e = find_reference(&index, "stack", "vol")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("stack 'vol' is published by more than one dependency (alpha, beta)"),
+            "{e}"
+        );
+
+        let root = dir.path().join("consumer");
+        std::fs::create_dir_all(&root).unwrap();
+        consumer(&root, &["alpha"], Some("ghost"));
+        let e = cmd_update(&root, None).unwrap_err().to_string();
+        assert!(
+            e.contains(
+                "stack 'ghost' is referenced, but no dependency publishes it (dependencies: alpha)"
+            ),
+            "{e}"
+        );
+        assert!(read_store_lock(&root).unwrap().is_none(), "nothing written");
+    }
+
+    #[test]
+    fn bundles_run_by_name_are_declared_under_uses() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("fluxor.toml"),
+            "[project]\nname = \"c\"\n\n[uses]\nbundles = [\"object-store\", \"tool\"]\n",
+        )
+        .unwrap();
+        // `tool` is the project's own applet: it resolves from packaging/.
+        std::fs::create_dir_all(root.join("packaging/applet/tool")).unwrap();
+        std::fs::write(
+            root.join("packaging/applet/tool/workload.toml"),
+            "[workload]\nname = \"tool\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            references(root).unwrap().bundles,
+            ["object-store".to_string()].into()
+        );
+        let index = vec![
+            (
+                "storage".to_string(),
+                vec![entry("bundle", "storage", "object-store", None)],
+            ),
+            (
+                "control".to_string(),
+                vec![entry("stack", "control", "object-store", None)],
+            ),
+        ];
+        assert_eq!(
+            find_reference(&index, "bundle", "object-store")
+                .unwrap()
+                .project,
+            "storage"
+        );
+    }
+
+    /// A project nested in another's tree, versioned by that tree's shadow
+    /// repository rather than a repository of its own, references what its
+    /// own graphs include, and nothing of its enclosing project's.
+    #[test]
+    fn a_nested_project_versioned_by_an_enclosing_shadow_repo_references_its_graphs() {
+        let dir = tempfile::tempdir().unwrap();
+        let outer = dir.path().join("outer");
+        let app = outer.join("examples/app");
+        std::fs::create_dir_all(app.join("packaging/service/svc")).unwrap();
+        std::fs::write(outer.join(".gitignore"), "/examples/app/\n").unwrap();
+        std::fs::write(
+            outer.join("outer.yaml"),
+            "target: linux\ninclude:\n  - stack: outer_stack\n    as: o\nmodules: []\n",
+        )
+        .unwrap();
+        std::fs::write(app.join(".fluxor"), "").unwrap();
+        std::fs::write(
+            app.join("fluxor.toml"),
+            "[project]\nname = \"app\"\nversion = \"0.0.1\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            app.join("packaging/service/svc/linux.yaml"),
+            "target: linux\ninclude:\n  - stack: vol\n    as: v\nmodules: []\n",
+        )
+        .unwrap();
+        git(&outer, &["init", "-q"]);
+        git(&outer, &["add", "-A"]);
+        git(
+            &outer,
+            &["--git-dir", ".git-shadow", "--work-tree", ".", "init", "-q"],
+        );
+        git(
+            &outer,
+            &[
+                "--git-dir",
+                ".git-shadow",
+                "--work-tree",
+                ".",
+                "add",
+                "-f",
+                "examples/app",
+            ],
+        );
+        assert_eq!(references(&app).unwrap().stacks, ["vol".to_string()].into());
+        assert_eq!(
+            references(&outer).unwrap().stacks,
+            ["outer_stack".to_string()].into()
+        );
     }
 
     /// The catalog stamp is its digest and nothing else: a lock is

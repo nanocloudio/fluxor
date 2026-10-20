@@ -52,8 +52,9 @@ pub const MODULE_DONE: u32 = 0x0C6F;
 /// Kernel capacity is not ABI: the figure is per kernel platform and may be
 /// raised without moving the ABI surface, so a module that keeps per-slot
 /// state sizes it from this answer at runtime and never from a compiled
-/// constant. Outside the full 0x0C67..=0x0C6F block, in the free
-/// 0x0C23..=0x0C29 run, and gated by the same `reconfigure` permission.
+/// constant. Its wire number sits in the 0x0C20..=0x0C29 run beside
+/// `OWNER_RELEASED`, because the 0x0C67..=0x0C6F block is full; it is gated by
+/// the same `reconfigure` permission as that block.
 pub const SLOT_CAPACITY: u32 = 0x0C23;
 
 // ── Live graph mutation (add owner / free owner) ────────────────────────────
@@ -66,18 +67,18 @@ pub const SLOT_CAPACITY: u32 = 0x0C23;
 // dedicated live-mutation block that is deliberately OUTSIDE both the
 // peripheral register-bridge range (0x0C70..=0x0CCF: I2C/SPI/ADC/UART/PIO)
 // and the monitor-gated 0x0C5x range. They classify as PLATFORM_RAW via the
-// permission classifier's catch-all in src/kernel/syscalls.rs.
+// permission classifier's catch-all in src/kernel/module/syscalls.rs.
 
 /// Add a new owner's subgraph to the running graph.
 /// handle=-1, arg = bounded binary `AddSubgraph` (magic `FLXA`, version,
 /// flags, body; validated for structure and bounds — the channel, not the
-/// blob, is authenticated). On success
-/// the kernel writes the 6-byte `OwnerHandle` (`slot:u16 LE, generation:u32 LE`)
-/// into the first 6 bytes of `arg`. Returns 0 on success, negative `AddError`
-/// otherwise. NOTE: the on-wire form carries PIC modules (by `name_hash` +
-/// params); a target whose PIC load is asynchronous returns `-WouldBlock` until
-/// the async-load follow-up lands. In-process callers use `scheduler::apply_add`
-/// directly (built-in or already-resident modules).
+/// blob, is authenticated). On success the kernel writes the 6-byte
+/// `OwnerHandle` (`slot:u16 LE, generation:u32 LE`) into the first 6 bytes of
+/// `arg`. Returns 0 on success, a negative errno otherwise. The on-wire form
+/// carries PIC modules (by `name_hash` + params), each loaded within the
+/// call: a module whose load cannot complete synchronously refuses the add
+/// `EAGAIN`. In-process callers use `scheduler::apply_add` directly (built-in
+/// or already-resident modules).
 pub const APPLY_ADD: u32 = 0x0C47;
 /// `AddSubgraph` header flag: the new owner acts with its creator's
 /// authority. Honoured only from the module syscall, and only when the
@@ -91,7 +92,8 @@ pub const ADD_FLAG_CREATOR_AUTHORITY: u16 = 0x0001;
 /// Free an owner: stop its modules, close its edges, reclaim its state, and
 /// revoke the handle (the generation guard rejects it thereafter).
 /// handle=-1, arg = `[slot:u16 LE, generation:u32 LE]`. Returns 0 on success,
-/// negative `FreeError` otherwise.
+/// -1 for the system owner, -2 for a handle that no longer resolves, and -3
+/// for an owner still being added (its add publishes or rolls it back).
 pub const FREE_OWNER: u32 = 0x0C48;
 
 // ── Owner pause/resume: metal PAUSE as a reversible quiesce verb ─────────────
@@ -128,8 +130,9 @@ pub const OWNER_RESUME: u32 = 0x0C4A;
 // with this opcode. The kernel ignores the return value — a provider that
 // answers `-ENOSYS` is simply one with nothing to release.
 //
-// Wire number sits in the free 0x0C22..=0x0C2E run rather than beside
-// FREE_OWNER, because the 0x0C47..=0x0C4A live-mutation block is full.
+// Wire number sits in the 0x0C20..=0x0C29 run (beside OTA_STAGE_* and
+// SLOT_CAPACITY) rather than beside FREE_OWNER, because the 0x0C47..=0x0C4A
+// live-mutation block is full.
 
 /// Notify a provider that `owner` is about to be freed. Delivered before any
 /// teardown: the owner's slot/generation still resolve, the provider module's

@@ -1,6 +1,6 @@
 //! Chip abstraction layer — BCM2712 (aarch64) target.
 //!
-//! Kernel capacity (arenas, module slots, config and log-ring sizes) is
+//! Kernel capacity (arenas, module slots, heap segments, the log ring) is
 //! stated per kernel platform in `kernel::config` (`profile_bcm2712`), not
 //! here: one source of truth, so a second copy of a size such as
 //! `STATE_ARENA_SIZE` cannot drift below what a module's arena demand needs

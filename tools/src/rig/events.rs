@@ -17,8 +17,9 @@ use crate::rig::vocab::Capability;
 /// between a clock and a queue.
 #[derive(Debug)]
 pub enum RunEvent {
-    /// Raw bytes from a console transport, tagged with the source
-    /// capability that produced them. The matcher uses `source` to route
+    /// Raw bytes from a byte-stream transport (console, telemetry, an
+    /// observe probe), tagged with the source capability that produced
+    /// them. The matcher uses `source` to route
     /// bytes to the correct per-source buffer so a rule that names
     /// `console.serial` is only evaluated against serial output — not
     /// against `console.usb_cdc` bytes that happened to arrive on the
@@ -54,7 +55,8 @@ pub enum DeployEvent {
     /// Informational — DHCP DISCOVER/REQUEST etc. Used only for run-log
     /// diagnostics, never for pass/fail evaluation.
     DhcpActivity,
-    /// A deploy-side error the transport surfaced. Observers may treat
-    /// this as a fail source when the rule's regex matches the message.
+    /// A deploy-side error the transport surfaced. An
+    /// `observe.netboot_fetch` fail rule whose regex matches the message
+    /// fails the run on it.
     Error(String),
 }

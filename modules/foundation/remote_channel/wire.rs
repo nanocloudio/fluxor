@@ -12,7 +12,7 @@
 //!
 //! | kind | body | meaning |
 //! |---|---|---|
-//! | `HELLO` | `"FXRC"[count:1]` then per channel `[ct_len:1][content_type][max_record:4 LE]` | the sender's whole channel table |
+//! | `HELLO` | `"FXRC"[count:1]` then per channel `[ct_len:1][content_type][max_record:4 LE]`, then `[side:1]` when the table carries an exchange endpoint | the sender's whole channel table |
 //! | `REFUSE` | `[reason:1]` | the sender is ending the session, and why |
 //! | `CREDIT` | `[bytes:4 LE]` | the receiver can take `bytes` more record bytes on `channel` |
 //! | `BEGIN` | `[record_len:4 LE][first bytes]` | a record starts on `channel` |
@@ -28,6 +28,13 @@
 //! of its own, every frame on it names that stream's channel, and `HELLO`
 //! opens every stream in both directions — it is how the accepting side
 //! learns which channel a stream carries.
+//!
+//! An exchange endpoint is two more table entries, `ExchangeRequest` and
+//! `ExchangeResponse`, both `mailbox` at the exchange contract's record
+//! maximum, after the `channels` entries. Requests cross on the first from
+//! the near side to the far side and answers on the second the other way;
+//! the `HELLO` trailer names the sender's side, and a peer's table matches
+//! only when its side is the other one.
 
 /// Frame header bytes.
 pub const FRAME_HDR: usize = 4;
@@ -55,8 +62,8 @@ pub const MAX_CHANNELS: usize = 8;
 /// name in the content-type registry.
 pub const CT_NAME_MAX: usize = 32;
 
-/// Largest `HELLO` body.
-pub const HELLO_MAX: usize = 4 + 1 + MAX_CHANNELS * HELLO_ENTRY_LEN;
+/// Largest `HELLO` body: every entry at its longest, and the side byte.
+pub const HELLO_MAX: usize = 4 + 1 + MAX_CHANNELS * HELLO_ENTRY_LEN + 1;
 /// One `HELLO` table entry at its longest.
 pub const HELLO_ENTRY_LEN: usize = 1 + CT_NAME_MAX + 4;
 
@@ -87,6 +94,31 @@ pub mod framing {
     /// crosses in order and lossless; `max_record` bounds one piece of it.
     pub const BYTES: u8 = 3;
 }
+
+/// Which side of an exchange endpoint an instance is.
+pub mod side {
+    /// The instance carries no exchange endpoint.
+    pub const NONE: u8 = 0;
+    /// Stands in for the remote provider: a local requester's requests in,
+    /// the provider's answers out.
+    pub const NEAR: u8 = 1;
+    /// Stands in for the remote requester: its requests out to the local
+    /// provider, the provider's answers in.
+    pub const FAR: u8 = 2;
+
+    /// The side a peer must be for the endpoint to pair.
+    pub const fn other(side: u8) -> u8 {
+        match side {
+            NEAR => FAR,
+            FAR => NEAR,
+            s => s,
+        }
+    }
+}
+
+/// The content types of an exchange endpoint's two channels.
+pub const EXCHANGE_REQUEST: &[u8] = b"ExchangeRequest";
+pub const EXCHANGE_RESPONSE: &[u8] = b"ExchangeResponse";
 
 /// One channel's table entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -133,6 +165,40 @@ impl Entry {
 pub struct Table {
     pub channels: u8,
     pub entries: [Entry; MAX_CHANNELS],
+    /// This instance's side of the exchange endpoint ([`side`]).
+    pub side: u8,
+    /// The endpoint's request channel; its response channel is the next.
+    pub exchange_at: u8,
+}
+
+impl Table {
+    pub const EMPTY: Table = Table {
+        channels: 0,
+        entries: [Entry::EMPTY; MAX_CHANNELS],
+        side: side::NONE,
+        exchange_at: 0,
+    };
+
+    /// Append an exchange endpoint's two channels, `max_record` each, as
+    /// `side`. Refused when the table has no room for both.
+    pub fn add_exchange(&mut self, side: u8, max_record: u32) -> Result<(), TableError> {
+        let at = self.channels as usize;
+        if at + 2 > MAX_CHANNELS {
+            return Err(TableError::TooManyChannels);
+        }
+        for (k, ct) in [EXCHANGE_REQUEST, EXCHANGE_RESPONSE].iter().enumerate() {
+            let e = &mut self.entries[at + k];
+            e.content_type = [0; CT_NAME_MAX];
+            e.content_type[..ct.len()].copy_from_slice(ct);
+            e.ct_len = ct.len() as u8;
+            e.framing = framing::MAILBOX;
+            e.max_record = max_record;
+        }
+        self.channels += 2;
+        self.side = side;
+        self.exchange_at = at as u8;
+        Ok(())
+    }
 }
 
 /// Why a `channels` parameter was refused.
@@ -152,10 +218,7 @@ pub enum TableError {
 /// Parse `content_type:framing:max_record;…`. Each ceiling refuses; none
 /// is clamped.
 pub fn parse_table(text: &[u8], limit: u32) -> Result<Table, TableError> {
-    let mut t = Table {
-        channels: 0,
-        entries: [Entry::EMPTY; MAX_CHANNELS],
-    };
+    let mut t = Table::EMPTY;
     let text = trim(text);
     if text.is_empty() {
         return Err(TableError::Empty);
@@ -225,15 +288,22 @@ pub fn encode_hello(t: &Table, out: &mut [u8; HELLO_MAX]) -> usize {
         out[at..at + 4].copy_from_slice(&e.max_record.to_le_bytes());
         at += 4;
     }
+    if t.side != side::NONE {
+        out[at] = t.side;
+        at += 1;
+    }
     at
 }
 
 /// Does a peer's `HELLO` body state exactly this table? Same channel count,
-/// and per index the same content type and maximum record.
+/// per index the same content type and maximum record, and an exchange
+/// endpoint on the other side of the one this table carries.
 pub fn hello_matches(t: &Table, body: &[u8]) -> bool {
-    let mut own = [0u8; HELLO_MAX];
-    let n = encode_hello(t, &mut own);
-    body == &own[..n]
+    let mut peer = *t;
+    peer.side = side::other(t.side);
+    let mut want = [0u8; HELLO_MAX];
+    let n = encode_hello(&peer, &mut want);
+    body == &want[..n]
 }
 
 /// Write a frame header.

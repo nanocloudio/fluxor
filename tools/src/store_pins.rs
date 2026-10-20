@@ -87,8 +87,8 @@ fn entry_path(store_root: &Path, checkout: &Path) -> PathBuf {
 }
 
 /// Every `sha256:<hex>` digest appearing in `text`. Shared by the
-/// ledger writer and the legacy member-lockfile scan, so both admit
-/// exactly the same digests from exactly the same file.
+/// ledger writer and the direct scan of workspace members' lockfiles, so
+/// both admit exactly the same digests from exactly the same file.
 pub fn digests_in(text: &str) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     let mut rest = text;
@@ -130,7 +130,7 @@ fn try_register(store_root: &Path, checkout: &Path, digests: &BTreeSet<String>) 
         .unwrap_or_else(|_| checkout.to_path_buf());
     let path = entry_path(store_root, checkout);
     let mut body = String::new();
-    body.push_str("# fluxor store pin ledger — generated, one file per checkout.\n");
+    body.push_str("# fluxor pin ledger — generated, one file per checkout.\n");
     body.push_str(
         "# Registered by whatever wrote the checkout's lockfile, or by `fluxor store adopt`.\n",
     );
@@ -252,9 +252,9 @@ pub struct Holders {
 }
 
 impl Holders {
-    /// Whether any WORKSPACE MEMBER holds `digest`. Retained because it
-    /// is the exact predicate the old root set used, and the reports
-    /// need to say when the answer has become "none".
+    /// Whether any WORKSPACE MEMBER holds `digest`. The displacement
+    /// report names the case where none does: the displaced manifest is
+    /// then held up by the ledger alone.
     pub fn any_member(&self, digest: &str) -> bool {
         self.by_digest
             .get(digest)
@@ -281,8 +281,8 @@ impl Holders {
 /// Build the holder map from the ledger, marking which checkouts are
 /// workspace members. Member lockfiles are read directly as well as
 /// through the ledger, so a member that has never registered is still
-/// counted — the ledger ADDS roots, it never removes one that the old
-/// root set had.
+/// counted — the ledger ADDS roots to the members' own, it never removes
+/// one.
 pub fn holders(store_root: &Path) -> Result<Holders> {
     let mut h = Holders::default();
     let mut member_paths: BTreeSet<PathBuf> = BTreeSet::new();

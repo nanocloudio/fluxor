@@ -65,7 +65,17 @@ const HP_STATE_SIGNALLED: u8 = 2;
 // Live, not terminal: frozen via PAUSE.
 const HP_STATE_PAUSED: u8 = 3;
 
-pub const MAX_SANDBOXES: usize = 16;
+/// Sandboxes held at once, a finished one included until it is destroyed: an
+/// orchestrator keeps a terminated container (its exit status, its logs) for
+/// as long as its Pod exists, so a node holds a sandbox for every container of
+/// every Pod it hosts, not only the running ones. Each is a workload with an
+/// owner of its own, so the owner table (`MAX_OWNERS`, 64 with the system slot)
+/// is what binds; this table matches it, so it never refuses first.
+pub const MAX_SANDBOXES: usize = 64;
+const _: () = assert!(
+    MAX_SANDBOXES >= crate::kernel::workload::owner::MAX_OWNERS,
+    "the sandbox table must seat every owner"
+);
 
 struct HpSlot {
     in_use: bool,
@@ -1001,9 +1011,9 @@ unsafe fn exec_with(
     libc::_exit(if found { 126 } else { 127 });
 }
 
-/// pivot_root into `new_root` (a mount point). Mirrors nanocloud
-/// runtime.rs:2913: bind rootfs onto itself, pivot, detach the old root, with
-/// an MS_MOVE fallback on EINVAL/EXDEV. Returns 0 on success, -1 on failure.
+/// pivot_root into `new_root` (a mount point): bind rootfs onto itself,
+/// pivot, detach the old root, with an MS_MOVE fallback on EINVAL/EXDEV.
+/// Returns 0 on success, -1 on failure.
 unsafe fn hp_pivot_into(new_root: *const libc::c_char) -> i32 {
     let bind_flags = libc::MS_BIND | libc::MS_REC;
     if libc::mount(
@@ -1871,10 +1881,10 @@ pub unsafe fn hp_wait(raw: i32, out: *mut u8, out_len: usize) -> i32 {
     let buf = core::slice::from_raw_parts_mut(out, out_len);
     if !slot.reaped && slot.paused {
         // Frozen and not exited → PAUSED, live, not terminal.
-        // A workload that died BEFORE the
-        // freeze latched terminal in the poll above and reports it as today;
-        // a frozen one cannot exit, so the two never race. RESUME clears
-        // `paused`, so the next poll reflects RUNNING (§3.3).
+        // A workload that died BEFORE the freeze latched terminal in the
+        // poll above and reports that; a frozen one cannot exit, so the two
+        // never race. RESUME clears `paused`, so the next poll reflects
+        // RUNNING.
         buf[0] = HP_STATE_PAUSED;
         buf[1..5].copy_from_slice(&0i32.to_le_bytes());
         return 5;
@@ -1902,7 +1912,7 @@ pub unsafe fn hp_pause(raw: i32) -> i32 {
     };
     hp_poll_reap(slot);
     if slot.reaped {
-        return errno::EINVAL; // terminal — ESTATE-class refusal (§2.2)
+        return errno::EINVAL; // terminal — ESTATE-class refusal
     }
     if !(slot.cgrouped && slot.contained) {
         return errno::ENOSYS; // this workload has no working freezer
@@ -1967,7 +1977,7 @@ pub unsafe fn hp_destroy(raw: i32) -> i32 {
     if !slot.reaped && slot.pid > 0 {
         // Signal the container init's process group (SIGKILL to PID 1 of a
         // pid ns tears the whole namespace down; the group delivery also
-        // reaches a null sandbox's children — §3.1); reap the
+        // reaches a null sandbox's children); reap the
         // intermediate/child via `pid`. A handler-less init ignores SIGTERM
         // from our ancestor ns, so the grace simply elapses and SIGKILL
         // settles it.

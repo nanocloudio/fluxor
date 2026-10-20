@@ -550,7 +550,13 @@ impl ModuleHeap {
 
     /// An elastic heap that may commit up to `cap` bytes, carving segments
     /// from the state arena as allocations need them. Nothing is carved now.
+    ///
+    /// The cap is rounded down to the 8-byte block alignment, the granularity
+    /// every segment is carved in, so a heap committed whole
+    /// ([`commit_whole`](Self::commit_whole)) is exactly its cap and is
+    /// recognised as such on every later `ARENA_GET`.
     pub fn init_elastic(cap: usize) -> Self {
+        let cap = cap & !(HEADER_SIZE - 1);
         if cap < HEADER_SIZE + MIN_ALLOC || cap > u32::MAX as usize {
             return Self::empty();
         }
@@ -935,7 +941,7 @@ impl ModuleHeap {
         if self.seg_count != 0 {
             return None;
         }
-        let size = (self.cap as usize) & !(HEADER_SIZE - 1);
+        let size = self.cap as usize;
         let base = crate::kernel::module::loader::alloc_state(size).ok()?;
         let Some(seg) = Segment::init(base, size) else {
             // SAFETY: the allocation just returned, referenced by nothing.

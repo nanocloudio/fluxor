@@ -211,9 +211,7 @@ config = "{path}"
 
     #[test]
     fn passthrough_when_recipe_uses_no_placeholders() {
-        // Captures today's behaviour for the rest of the project's
-        // recipes (rp2350 / picow / waveshare-lcd4) — they don't
-        // template anything, and substitution should be a no-op.
+        // A recipe that names no placeholder passes through unchanged.
         let scenario = fixture_scenario();
         let cmd = vec![
             "make".to_string(),

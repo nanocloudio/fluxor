@@ -1,10 +1,10 @@
 // ============================================================================
-// PR 2: real synthesiser + binding route merger + re-validation
+// Host synthesis, the binding route merger and re-validation
 // ============================================================================
 
 /// Construct the synthesised host graph as a `serde_json::Value`
-/// equivalent to what a human would write in
-/// `examples/serve_wasm/linux.yaml`. Returns `None` when the scenario
+/// equivalent to the linux serving graph a human would write for the
+/// scenario. Returns `None` when the scenario
 /// has no `host:` block (every binding has explicit `on:`).
 ///
 /// The returned Value is the same shape `tools::board::validate_config`
@@ -86,30 +86,38 @@ const CANONICAL_OVERLAY_JS_RAW: &str =
 /// Marker in runtime.html where the overlay `<script>` is injected.
 const OVERLAY_MARKER: &str = "<!--FLUXOR_OVERLAY_RUNTIME-->";
 
-/// Escape every `${` so the config-load env-var substitutor passes
-/// the content through verbatim. The shell HTML / JS contains lots
-/// of JS template literals (`${msg}`, `${n}`, `${assetUrl}`, etc.)
-/// that look like env-var refs but aren't; the substitutor's
-/// existing `$${...}` escape syntax (see `substitute_env_vars`)
-/// then collapses our `$${` back to literal `${` so the browser
-/// sees the original source.
-fn escape_for_env_substitution(s: &str) -> String {
-    s.replace("${", "$${")
-}
-
-fn canonical_runtime_html_body() -> String {
-    // Inline the overlay renderer at its marker before env-escaping, so
-    // any `${` in the JS is escaped alongside the rest of the document.
-    // If the marker is absent (older runtime.html), this is a no-op.
-    let html = CANONICAL_RUNTIME_HTML_RAW.replace(
+/// The canonical runtime shell, with the overlay renderer inlined at its
+/// marker (a no-op when the marker is absent).
+fn canonical_runtime_html() -> String {
+    CANONICAL_RUNTIME_HTML_RAW.replace(
         OVERLAY_MARKER,
         &format!("<script>\n{CANONICAL_OVERLAY_JS_RAW}\n</script>"),
-    );
-    escape_for_env_substitution(&html)
+    )
 }
 
-fn canonical_host_shims_js_body() -> String {
-    escape_for_env_substitution(CANONICAL_HOST_SHIMS_JS_RAW)
+/// Write `contents` to `name` in the scenario's work dir and return its
+/// path, for an `fs_path` route. A served page or script is a file the
+/// route reads, never a body inlined into the graph: its JS template
+/// literals are the page's own text, and the config arena stays free.
+fn work_file(
+    scenario: &Scenario,
+    scenario_path: &Path,
+    name: &str,
+    contents: &str,
+) -> Result<String> {
+    let work_dir = scenario_work_dir(scenario);
+    let path = work_dir.join(name);
+    fs::create_dir_all(&work_dir)
+        .and_then(|()| fs::write(&path, contents))
+        .map_err(|e| {
+            Error::Config(format!(
+                "scenario {}: cannot write {}: {}",
+                scenario_path.display(),
+                path.display(),
+                e
+            ))
+        })?;
+    Ok(path.display().to_string())
 }
 
 /// Walk a `list:` directory and build the `fluxor-manifest.json` entries
@@ -204,8 +212,8 @@ fn fluxor_manifest_entries(
 ///   - `/scenario.json` → inline JSON (presentation + playlist source)
 ///   - `/api/list`...   → `list:` bindings (dual-mode listing + file-serve)
 ///
-/// Five routes baseline + N `list:` bindings, well under
-/// `MAX_ROUTES = 8` (PR 10).
+/// Five routes baseline + N `list:` bindings, within the host profile's
+/// `MAX_ROUTES = 8` (`modules/sdk/abi/config.rs`).
 fn synthesise_host_routes(
     scenario: &Scenario,
     base: &Path,
@@ -216,12 +224,12 @@ fn synthesise_host_routes(
     // ── Track the active `serve:` binding so we can synthesise the
     //    `/`, `/fluxor.wasm`, and `/scenario.json` routes coherently.
     //    Multiple `serve:` bindings (one wasm + multiple host-page
-    //    overrides) are not supported on the synth host today —
+    //    overrides) are not supported on the synth host:
     //    the first one wins; subsequent ones would need explicit
     //    `on:` targets to mount elsewhere.
     //
     // The default page is the embedded canonical runtime shell
-    // (`canonical_runtime_html_body`). A `host_page:` override on
+    // (`canonical_runtime_html`), served from the work dir. A `host_page:` override on
     // the component swaps in a user-provided file via fs_path.
     let mut serve_component: Option<&str> = None;
     let mut runtime_prefix: String = "/".to_string();
@@ -280,7 +288,12 @@ fn synthesise_host_routes(
                 } else {
                     routes.push(serde_json::json!({
                         "path": runtime_prefix,
-                        "body": canonical_runtime_html_body(),
+                        "fs_path": work_file(
+                            scenario,
+                            scenario_path,
+                            "runtime.html",
+                            &canonical_runtime_html(),
+                        )?,
                         "content_type": "text/html",
                     }));
                 }
@@ -365,8 +378,6 @@ fn synthesise_host_routes(
             ))
         })?;
         let shims_path = work_dir.join("host_shims.js");
-        // Served from disk as raw bytes (fs_path route) — no config
-        // loader ever substitutes this file, so write it UNESCAPED.
         fs::write(&shims_path, CANONICAL_HOST_SHIMS_JS_RAW).map_err(|e| {
             Error::Config(format!(
                 "scenario {}: cannot write {}: {}",
@@ -567,8 +578,8 @@ fn default_presentation() -> serde_json::Value {
 }
 
 /// Resolve a path relative to `base`, then canonicalise if possible.
-/// Falls back to the joined path on canonicalise failure (target/wasm
-/// artefacts won't exist until the build runs in PR 3).
+/// Falls back to the joined path on canonicalise failure (a `target/wasm`
+/// artefact does not exist until the scenario's build runs).
 fn absolute_or_join(base: &Path, p: &Path) -> PathBuf {
     let joined = base.join(p);
     joined.canonicalize().unwrap_or(joined)
@@ -600,7 +611,7 @@ fn render_value_as_yaml(value: &serde_json::Value, banner: &str) -> Result<Strin
 }
 
 /// Emit the synthesised host graph YAML to stdout (or anywhere — the
-/// caller decides).  PR 2 builds a real `serde_json::Value` and
+/// caller decides). It builds a real `serde_json::Value` and
 /// serialises it through `serde_yaml`, so the output round-trips
 /// through `tools::board::validate_config`.
 ///
@@ -631,7 +642,7 @@ pub fn render_synthesised_host(
 /// Load a component's graph YAML and merge any bindings that target it
 /// into its http module's `routes:` array.  Returns the augmented
 /// `serde_json::Value` — exactly the config the kernel will see at
-/// spawn time (PR 3).
+/// spawn time.
 ///
 /// Conflict detection: if a binding mounts at a `path:` already
 /// declared by the component, the error names the binding, cites the
@@ -680,9 +691,8 @@ pub fn merge_bindings_for_component(
         ))
     })?;
 
-    // Apply runtime_override into the loaded config so the eventual
-    // target validator runs against the effective target (§8 — though
-    // the actual rebuild is PR 5).
+    // Apply runtime_override into the loaded config so the target
+    // validator runs against the effective target.
     let effective_target = effective_target_for(comp);
     if let Some(target) = &effective_target {
         config["target"] = serde_json::Value::String(target.clone());
@@ -837,13 +847,12 @@ fn target_supports_host_fs(target: &str) -> bool {
 }
 
 /// Per-target ceiling on a route's `fs_path:` byte length.  Must
-/// agree with `modules/sdk/config.rs::http::MAX_FS_PATH` for the
+/// agree with `modules/sdk/abi/config.rs::http::MAX_FS_PATH` for the
 /// effective target — over-length paths get silently truncated by
 /// the http module's route table, causing `linux_fs_dispatch::OPEN`
 /// to operate on the wrong filename (typically creating an empty
 /// file via `O_CREAT`) and surfacing as 200-OK-with-0-byte-body
-/// responses.  Discovered while bringing PR 6's image_viewer
-/// scenario end-to-end.
+/// responses.
 const MAX_FS_PATH_HOST: usize = 256;
 #[allow(
     dead_code,
@@ -936,21 +945,23 @@ fn serve_binding_routes(
     } else {
         format!("{prefix_no_slash}/")
     };
-    // Build the page-route value (embedded body OR override fs_path).
+    // Build the page-route value (the canonical shell or the override,
+    // each served from its file).
+    let page_path = match override_page_path {
+        Some(ref override_path) => override_path.display().to_string(),
+        None => work_file(
+            scenario,
+            scenario_path,
+            "runtime.html",
+            &canonical_runtime_html(),
+        )?,
+    };
     let make_page_route = |path: String| -> serde_json::Value {
-        if let Some(ref override_path) = override_page_path {
-            serde_json::json!({
-                "path": path,
-                "fs_path": override_path.display().to_string(),
-                "content_type": "text/html",
-            })
-        } else {
-            serde_json::json!({
-                "path": path,
-                "body": canonical_runtime_html_body(),
-                "content_type": "text/html",
-            })
-        }
+        serde_json::json!({
+            "path": path,
+            "fs_path": page_path,
+            "content_type": "text/html",
+        })
     };
     let mut routes = vec![make_page_route(if prefix_no_slash.is_empty() {
         "/".to_string()
@@ -968,7 +979,12 @@ fn serve_binding_routes(
     }));
     routes.push(serde_json::json!({
         "path": shims_url,
-        "body": canonical_host_shims_js_body(),
+        "fs_path": work_file(
+            scenario,
+            scenario_path,
+            "host_shims.js",
+            CANONICAL_HOST_SHIMS_JS_RAW,
+        )?,
         "content_type": "application/javascript",
     }));
     routes.push(serde_json::json!({
@@ -1121,8 +1137,8 @@ pub fn render_merged_component(
 }
 
 // ----------------------------------------------------------------------------
-// PR 3 helpers: spawn-side support (build artefact paths, URL,
-// synthesised-host YAML on disk)
+// Spawn-side support: build artefact paths, URL, synthesised-host YAML
+// on disk
 // ----------------------------------------------------------------------------
 
 /// Working directory for build artefacts derived from a scenario.
@@ -1200,10 +1216,9 @@ pub fn wasm_bundle_target_path(comp_name: &str, comp: &ComponentSpec) -> Result<
     Ok(PathBuf::from(format!("target/wasm/{stem}.wasm")))
 }
 
-/// True when this scenario has exactly one component. Kept for
-/// introspection / future fast-path dispatch; PR 4's spawn path
-/// handles single-component scenarios as a degenerate case of the
-/// generic multi-component flow.
+/// True when this scenario has exactly one component. The spawn path
+/// handles a single-component scenario as a degenerate case of the
+/// multi-component flow.
 #[allow(
     dead_code,
     reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
@@ -1213,8 +1228,8 @@ pub fn is_single_component(scenario: &Scenario) -> bool {
 }
 
 /// Effective target for a component: the `runtime_override:` (if set)
-/// wins, otherwise the graph's declared `target:`. Used by PR 4 to
-/// classify components as wasm (passive, build-bundle-only) vs.
+/// wins, otherwise the graph's declared `target:`. The spawn path uses
+/// it to classify components as wasm (passive, build-bundle-only) vs.
 /// linux/qemu-virt/pi5 (active, spawn-a-kernel).
 pub fn effective_target(scenario_path: &Path, comp: &ComponentSpec) -> String {
     if let Some(ovr) = &comp.runtime_override {
@@ -1231,7 +1246,7 @@ pub fn effective_target(scenario_path: &Path, comp: &ComponentSpec) -> String {
 
 /// Find the http module's `port:` in a parsed component config.
 /// Returns `None` for graphs that have no http module or no port —
-/// such components are still legal in PR 4 (e.g. headless capturers),
+/// such components are legal (e.g. headless capturers),
 /// but the readiness probe falls back to "child has exited" instead
 /// of "child bound a listener".
 pub fn extract_http_port(config: &serde_json::Value) -> Option<u16> {
@@ -1251,7 +1266,7 @@ pub fn extract_http_port(config: &serde_json::Value) -> Option<u16> {
 }
 
 /// Write a merged-config YAML to disk under
-/// `target/scenarios/<name>/<component>.yaml` so PR 4's spawn path
+/// `target/scenarios/<name>/<component>.yaml` so the spawn path
 /// can hand it straight to `build_one()`.
 pub fn write_merged_component_yaml(
     comp_name: &str,
@@ -1289,7 +1304,7 @@ pub fn write_merged_component_yaml(
 }
 
 // ----------------------------------------------------------------------------
-// PR 5: module hardware_targets validation against effective target
+// Module hardware_targets validation against the effective target
 // ----------------------------------------------------------------------------
 
 /// Per-effective-target aliases — which manifest `hardware_targets:`
@@ -1322,7 +1337,7 @@ struct ManifestTargetsOnly {
     hardware_targets: Option<Vec<String>>,
 }
 
-/// PR 5: walk every component's graph and check that each declared
+/// Walk every component's graph and check that each declared
 /// module's `manifest.toml` carries the effective target string (with
 /// the alias map). Errors cite the manifest path so the user can
 /// `grep` the line.
@@ -1366,7 +1381,7 @@ pub fn validate_module_targets(scenario: &Scenario, scenario_path: &Path) -> Res
                 .and_then(|t| t.as_str())
                 .unwrap_or(module_name);
             let Some(manifest_path) = find_manifest_for(type_name, &project_root) else {
-                // Not finding a manifest is not a PR 5 concern — the
+                // A missing manifest is not this check's concern — the
                 // build path catches it with a clearer error.  Skip.
                 continue;
             };
@@ -1440,14 +1455,13 @@ pub fn revalidate_all(scenario: &Scenario, scenario_path: &Path) -> Result<()> {
     use crate::target::load_target;
     let project_root = crate::project::root();
 
-    // PR 5: module hardware_targets ↔ effective_target consistency,
+    // Module hardware_targets ↔ effective_target consistency,
     // checked before any expensive validation downstream.
     validate_module_targets(scenario, scenario_path)?;
 
     // Synthesised host first, if present.
-    if let Some(mut host_cfg) = synthesise_host_config(scenario, scenario_path)? {
+    if let Some(host_cfg) = synthesise_host_config(scenario, scenario_path)? {
         let target_desc = load_target("linux", &project_root)?;
-        let _ = &mut host_cfg; // future: stack_expand may mutate
         let result = crate::board::validate_config(&host_cfg, &target_desc)?;
         if !result.is_ok() {
             return Err(Error::Config(format!(
@@ -1487,8 +1501,7 @@ pub fn revalidate_all(scenario: &Scenario, scenario_path: &Path) -> Result<()> {
             Ok(d) => d,
             Err(_) => {
                 // Unknown target name — skip the validate step but
-                // warn.  Can happen for board IDs the registry doesn't
-                // yet know about; PR 5 will tighten the override path.
+                // warn: the target registry describes no such board.
                 eprintln!(
                     "warning: scenario {}: no target descriptor for `{}`; skipping \
                      merged-config re-validation for component `{}`.",
@@ -1518,7 +1531,7 @@ pub fn revalidate_all(scenario: &Scenario, scenario_path: &Path) -> Result<()> {
 
 /// Enumerate every runnable scenario in a directory (non-recursive).
 /// Kind is detected from file content (`kind: scenario` line), not
-/// from filename — the legacy `*.scenario.yaml` infix is gone.
+/// from the filename.
 ///
 /// Two kinds of runnable orchestration:
 ///   1. standalone `kind: scenario` file (multi-graph harness).

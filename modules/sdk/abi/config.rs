@@ -15,16 +15,16 @@
 // coarse `TARGET_CLASS` a module sizes its own tables by.
 //
 // What does NOT live here: kernel capacity. The kernel's arenas,
-// module-slot count, bridge slots, config and log-ring sizes live in
-// `src/kernel/config.rs`, per kernel platform. Everything under
+// module-slot count, bridge slots, heap segments, log ring and RP
+// override-merge buffer live in `src/kernel/config.rs`, per kernel
+// platform. Everything under
 // `modules/sdk` is hashed into the ABI-surface digest, so a kernel
 // size stated here would make raising it an ABI epoch and a
 // workspace republish, though no module reads it. A module that
 // needs one of those figures asks the kernel at runtime (the module
 // slot count is `internal::reconfigure::SLOT_CAPACITY`) or keys on
 // `TARGET_CLASS`. `tools/tests/kernel_capacity_gate.rs` fails CI if a
-// kernel capacity constant comes back into the SDK or into module
-// source.
+// kernel capacity constant appears in the SDK or in module source.
 //
 // Module-private opcodes, RFC values, internal struct offsets and
 // per-chip register layouts stay in the module that owns them.

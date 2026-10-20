@@ -3,41 +3,67 @@
 //! Used for `console.*`, `telemetry.*`, `observe.*` and the `watch` side of
 //! `deploy.*`. Invocation:
 //!
-//!   1. Spawn `<executable> <verb>` with stdin/stdout piped.
+//!   1. Spawn `<executable> <verb>` in its own process group with stdin,
+//!      stdout and stderr piped.
 //!   2. Write the JSON [`BackendInvocation`] to stdin; close stdin.
 //!   3. Spawn a reader thread that parses one NDJSON
 //!      [`TransportEvent`](super::protocol::TransportEvent) per line from
 //!      stdout and forwards it (translated into a [`RunEvent`]) into the
-//!      matcher's channel.
-//!   4. On [`TransportHandle`] drop: send SIGTERM, wait the grace period
-//!      (2 s unless the binding set `shutdown_grace_s`), then SIGKILL.
-//!      Join the reader thread.
+//!      matcher's channel, and one that copies stderr to the operator's
+//!      terminal and, when asked, to a log beside the run.
+//!   4. On [`TransportHandle`] drop: SIGTERM to the process group, the
+//!      grace period (the binding's `shutdown_grace_s`, default 2 s), then
+//!      SIGKILL to whatever of the group is left; then join the readers,
+//!      waiting no longer than the grace period again for a pipe some
+//!      process outside the group still holds.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::process::CommandExt;
+use std::path::PathBuf;
 use std::process::{Child, ChildStdout, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::error::{Error, Result};
 use crate::rig::backend::discover::BackendRef;
 use crate::rig::backend::protocol::{BackendInvocation, TransportEvent, EXIT_UNSUPPORTED_VERB};
-use crate::rig::backend::with_relay;
+use crate::rig::backend::{terminate_group, with_relay, DEFAULT_SHUTDOWN_GRACE};
 use crate::rig::events::{DeployEvent, RunEvent};
 use crate::rig::vocab::Capability;
 
+/// How to run one transport.
+#[derive(Debug, Clone)]
+pub struct AttachOptions {
+    /// Time between SIGTERM and SIGKILL at shutdown.
+    pub grace: Duration,
+    /// Where to keep the backend's stderr beside the run, in addition to
+    /// the operator's terminal.
+    pub stderr_log: Option<PathBuf>,
+}
+
+impl Default for AttachOptions {
+    fn default() -> Self {
+        Self {
+            grace: DEFAULT_SHUTDOWN_GRACE,
+            stderr_log: None,
+        }
+    }
+}
+
 /// Handle to a running transport subprocess. Drop signals shutdown
-/// (SIGTERM → grace → SIGKILL) and joins the reader thread.
+/// (SIGTERM → grace → SIGKILL to the process group) and joins the readers.
 pub struct TransportHandle {
     backend: BackendRef,
     child: Option<Child>,
-    reader: Option<JoinHandle<()>>,
+    /// One message from each reader thread when it finishes.
+    readers_done: Receiver<()>,
+    readers: usize,
     shutdown: Arc<AtomicBool>,
     /// Set when the backend reports `ready` (its observation is live), or
-    /// when it exits — a backend that is gone is not still getting ready.
+    /// when its stdout closes — a backend that is gone is not still
+    /// getting ready.
     ready: Arc<AtomicBool>,
     grace: Duration,
 }
@@ -76,74 +102,67 @@ impl TransportHandle {
 impl Drop for TransportHandle {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Relaxed);
-
         if let Some(mut child) = self.child.take() {
-            // Backends are spawned in their own process group (see
-            // `attach`), so the pgid matches the child's pid. Signal
-            // the whole group so grandchildren (e.g. a `journalctl`
-            // spawned by the backend script) die too — otherwise they
-            // keep the stdout pipe open and wedge the reader thread.
-            let pid = child.id() as i32;
-            // SAFETY: negative pid signals the whole process group;
-            // libc::kill has no memory effects, only signal delivery.
-            unsafe {
-                libc::kill(-pid, libc::SIGTERM);
-            }
-            let deadline = Instant::now() + self.grace;
-            let exited = loop {
-                match child.try_wait() {
-                    Ok(Some(_)) => break true,
-                    Ok(None) => {
-                        if Instant::now() >= deadline {
-                            break false;
-                        }
-                        std::thread::sleep(Duration::from_millis(50));
-                    }
-                    Err(_) => break true,
-                }
-            };
-            if !exited {
-                // SAFETY: same group-signal as the SIGTERM above.
-                unsafe {
-                    libc::kill(-pid, libc::SIGKILL);
-                }
-                let _ = child.wait();
-            }
+            // The whole group, so a helper the backend spawned (a
+            // `journalctl -f`, a capture process) dies with it rather than
+            // holding the stdout pipe open.
+            terminate_group(&mut child, self.grace);
         }
-
-        if let Some(r) = self.reader.take() {
-            let _ = r.join();
+        // A reader still blocked at the deadline is on a pipe held by a
+        // process outside the group; it ends when that process does.
+        let deadline = Instant::now() + self.grace;
+        for _ in 0..self.readers {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if self.readers_done.recv_timeout(left).is_err() {
+                break;
+            }
         }
     }
 }
 
-/// Attach with the default 2 s shutdown grace.
+/// Attach with the default shutdown grace and no stderr log.
 pub fn attach(
     backend: BackendRef,
     verb: &str,
     invocation: &BackendInvocation,
     events: Sender<RunEvent>,
 ) -> Result<TransportHandle> {
-    attach_with_grace(backend, verb, invocation, events, Duration::from_secs(2))
+    attach_with(backend, verb, invocation, events, &AttachOptions::default())
 }
 
-pub fn attach_with_grace(
+pub fn attach_with(
     backend: BackendRef,
     verb: &str,
     invocation: &BackendInvocation,
     events: Sender<RunEvent>,
-    grace: Duration,
+    options: &AttachOptions,
 ) -> Result<TransportHandle> {
     let invocation = with_relay(invocation, &backend);
     let invocation = &invocation;
+
+    // Every transport speaks on behalf of one capability: the qualified
+    // `<surface>.<name>` of its backend. Byte events carry it so the
+    // matcher routes them to the correct per-source buffer, and a close
+    // names the source that went quiet. A probe on the observe surface
+    // reports its results as bytes too, so the same byte-buffer/regex
+    // pipeline evaluates scenario rules against them.
+    let qualified = format!("{}.{}", backend.surface.as_str(), backend.name);
+    let source = Capability::parse(&qualified).map_err(|e| {
+        Error::Config(format!(
+            "transport: cannot identify the capability for backend '{}': {e}",
+            backend.slug(),
+        ))
+    })?;
+    let stderr_log = options.stderr_log.clone();
+
     let mut child = backend
         .command(verb)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        // Put the backend in its own process group so shutdown can
-        // signal the whole tree (script + any subprocesses it spawned)
-        // with one `kill(-pgid, …)`.
+        .stderr(Stdio::piped())
+        // Own process group, so shutdown signals the backend and every
+        // process it spawned with one `kill(-pgid, …)`, and a terminal's
+        // Ctrl-C reaches the orchestrator rather than the backend.
         .process_group(0)
         .spawn()
         .map_err(|e| {
@@ -161,55 +180,79 @@ pub fn attach_with_grace(
         drop(stdin);
     }
 
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| Error::Config("transport: stdout missing".into()))?;
-
-    // Every transport speaks on behalf of one capability: the qualified
-    // `<surface>.<name>` of its backend. Byte events carry it so the
-    // matcher routes them to the correct per-source buffer, and a close
-    // names the source that went quiet. Observe-surface backends (e.g.
-    // `observe-https_load`) emit synthesised NDJSON bytes summarising
-    // probe results so the same byte-buffer/regex pipeline evaluates
-    // scenario rules against them; `observe.netboot_fetch` is produced by
-    // the deploy backend's `watch` verb, not a transport of its own.
-    let qualified = format!("{}.{}", backend.surface.as_str(), backend.name);
-    let source = Capability::parse(&qualified).map_err(|e| {
-        Error::Config(format!(
-            "transport: cannot identify the capability for backend '{}': {e}",
-            backend.slug(),
-        ))
-    })?;
+    let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
+        terminate_group(&mut child, options.grace);
+        return Err(Error::Config("transport: stdio pipes missing".into()));
+    };
 
     let shutdown = Arc::new(AtomicBool::new(false));
-    let shutdown_thr = shutdown.clone();
     let ready = Arc::new(AtomicBool::new(false));
-    let ready_thr = ready.clone();
-    let slug_for_thread = backend.slug();
+    let (done_tx, readers_done) = mpsc::channel();
 
-    let reader = std::thread::Builder::new()
-        .name(format!("fluxor-rig/{}", backend.slug()))
-        .spawn(move || {
-            run_reader_loop(
-                stdout,
-                events,
-                source,
-                shutdown_thr,
-                ready_thr,
-                slug_for_thread,
-            );
-        })
-        .map_err(|e| Error::Config(format!("transport: spawning reader thread: {e}")))?;
+    let spawned = spawn_reader(format!("fluxor-rig/{}", backend.slug()), done_tx.clone(), {
+        let (shutdown, ready, slug) = (shutdown.clone(), ready.clone(), backend.slug());
+        move || run_reader_loop(stdout, events, source, shutdown, ready, slug)
+    })
+    .and_then(|()| {
+        spawn_reader(
+            format!("fluxor-rig/{}/stderr", backend.slug()),
+            done_tx,
+            move || copy_stderr(stderr, stderr_log),
+        )
+    });
+    if let Err(e) = spawned {
+        terminate_group(&mut child, options.grace);
+        return Err(e);
+    }
 
     Ok(TransportHandle {
         backend,
         child: Some(child),
-        reader: Some(reader),
+        readers_done,
+        readers: 2,
         shutdown,
         ready,
-        grace,
+        grace: options.grace,
     })
+}
+
+fn spawn_reader(
+    name: String,
+    done: Sender<()>,
+    body: impl FnOnce() + Send + 'static,
+) -> Result<()> {
+    std::thread::Builder::new()
+        .name(name)
+        .spawn(move || {
+            body();
+            let _ = done.send(());
+        })
+        .map(|_| ())
+        .map_err(|e| Error::Config(format!("transport: spawning reader thread: {e}")))
+}
+
+/// The backend's stderr is its human-readable diagnostics: the operator
+/// sees it live, and the run keeps a copy, created when the backend first
+/// says something.
+fn copy_stderr(mut stderr: impl Read, log_path: Option<PathBuf>) {
+    let mut log: Option<std::fs::File> = None;
+    let mut chunk = [0u8; 4096];
+    loop {
+        match stderr.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                let _ = std::io::stderr().write_all(&chunk[..n]);
+                if log.is_none() {
+                    log = log_path
+                        .as_ref()
+                        .and_then(|p| std::fs::File::create(p).ok());
+                }
+                if let Some(f) = log.as_mut() {
+                    let _ = f.write_all(&chunk[..n]);
+                }
+            }
+        }
+    }
 }
 
 fn run_reader_loop(
@@ -482,6 +525,73 @@ wait $CHILD
         );
     }
 
+    /// A backend that exits on SIGTERM but leaves a child that ignores it
+    /// (and holds stdout) must not wedge the drop: the group gets SIGKILL
+    /// whether or not the backend itself went quietly.
+    #[test]
+    fn drop_kills_a_child_that_outlives_its_backend() {
+        let script = r#"#!/bin/sh
+read _input
+( trap '' TERM; exec sleep 30 ) &
+echo $! > "$STUBBORN_PID"
+wait
+"#;
+        let (dir, backend, _exec_guard) = fixture("stubborn", Surface::Observe, script);
+        let pidfile = dir.join("stubborn.pid");
+        std::env::set_var("STUBBORN_PID", &pidfile);
+        let backend = BackendRef {
+            name: "pcap".into(),
+            ..backend
+        };
+        let (tx, _rx) = mpsc::channel::<RunEvent>();
+        let handle = attach(backend, "attach", &sample_invocation(), tx).unwrap();
+        std::env::remove_var("STUBBORN_PID");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !pidfile.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let start = Instant::now();
+        drop(handle);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "drop waited on the stubborn child: {elapsed:?}"
+        );
+        let pid: u32 = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !crate::rig::lock::pid_alive(pid),
+            "child {pid} survived the group kill"
+        );
+    }
+
+    /// A transport's stderr is kept beside the run.
+    #[test]
+    fn stderr_is_kept_in_the_log() {
+        let script = "#!/bin/sh\nread _input\necho 'tty opened' >&2\nprintf '{\"kind\":\"ready\"}\\n'\nexit 0\n";
+        let (dir, backend, _exec_guard) = fixture("serial", Surface::Console, script);
+        let log = dir.join("console-serial-attach.stderr.log");
+        let (tx, rx) = mpsc::channel::<RunEvent>();
+        let h = attach_with(
+            backend,
+            "attach",
+            &sample_invocation(),
+            tx,
+            &AttachOptions {
+                grace: Duration::from_millis(300),
+                stderr_log: Some(log.clone()),
+            },
+        )
+        .unwrap();
+        let _closed = rx.recv_timeout(Duration::from_secs(2)).expect("closed");
+        drop(h);
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "tty opened\n");
+    }
+
     #[test]
     fn drop_kills_unresponsive_backend_after_grace_window() {
         // Backend refuses SIGTERM entirely. With a short grace, drop
@@ -494,12 +604,15 @@ sleep 30
 "#;
         let (_dir, backend, _exec_guard) = fixture("bootfs_copy", Surface::Deploy, script);
         let (tx, _rx) = mpsc::channel::<RunEvent>();
-        let handle = attach_with_grace(
+        let handle = attach_with(
             backend,
             "attach",
             &sample_invocation(),
             tx,
-            Duration::from_millis(400),
+            &AttachOptions {
+                grace: Duration::from_millis(400),
+                stderr_log: None,
+            },
         )
         .unwrap();
         std::thread::sleep(Duration::from_millis(100));

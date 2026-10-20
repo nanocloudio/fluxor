@@ -344,11 +344,26 @@ impl OwnerTable {
     /// True when `h` may ADMIT new work — new allocation, open, accept, queue
     /// grant, timer arm. Only `Active` qualifies: admission closes the moment
     /// a drain begins, which is what lets in-flight work run dry. A `Paused`
-    /// owner is likewise admission-closed — the same §3.5 gate, reopened by
+    /// owner is likewise admission-closed — the same gate, reopened by
     /// `owner_resume`.
     pub fn authorize_admit(&self, h: OwnerHandle) -> bool {
         self.lookup(h)
             .map(|e| matches!(e.state, OwnerState::Active))
+            .unwrap_or(false)
+    }
+
+    /// True when `h`'s own modules may admit new work for themselves — the
+    /// gate on a module's own allocations, opens and arms. An `Active`
+    /// owner's may, and so may a `Reserved` one's: an add is instantiating
+    /// it, and each module's `module_new` allocates, opens and arms what it
+    /// will run with, as its owner, before the add publishes. A reserved
+    /// owner's modules are not yet scheduled, so `module_new` is the only code
+    /// that runs as it, and an add rolled back releases what it admitted.
+    /// Work admitted on an owner's behalf by anyone else is gated by
+    /// [`authorize_admit`](Self::authorize_admit).
+    pub fn authorize_own_admit(&self, h: OwnerHandle) -> bool {
+        self.lookup(h)
+            .map(|e| matches!(e.state, OwnerState::Reserved | OwnerState::Active))
             .unwrap_or(false)
     }
 
@@ -618,14 +633,15 @@ impl Default for OwnerTable {
 }
 
 /// Cross-owner access predicate: a caller may touch a target resource when the
-/// target is system-owned or the same owner. Explicit cross-owner bindings are
-/// not modeled by this predicate.
+/// target is system-owned or the same owner — slot and generation both, so a
+/// resource stamped by an owner that is gone is never the next tenant of its
+/// slot's. Explicit cross-owner bindings are not modeled by this predicate.
 ///
 /// On single-tenant builds this is a compile-time `true` with no instructions.
 #[cfg(feature = "multitenant")]
 #[inline]
 pub fn same_or_system(caller: OwnerHandle, target: OwnerHandle) -> bool {
-    target.is_system() || caller.slot == target.slot
+    target.is_system() || caller == target
 }
 
 /// Single-tenant no-op (everything is the one owner).

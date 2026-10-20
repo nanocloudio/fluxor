@@ -18,7 +18,8 @@ const DOMAIN_META_ENTRY_SIZE: usize = 4;
 const DOMAIN_META_SIZE: usize = 4 * DOMAIN_META_ENTRY_SIZE;
 
 /// Module entry header size (entry_length:u32 + name_hash:u32 + id:u8 + meta:u8,
-/// where meta is domain_id in bits 0-2 and pre_tick_drain in bit 4).
+/// where id is the module id's low byte and meta carries domain_id in bits 0-2,
+/// pre_tick_drain in bit 4 and the id's bits 8-9 in bits 5-6).
 /// `entry_length` is a u32 so a single module's params can exceed
 /// 64 KiB — needed by synth host's http module when both halves of a
 /// split scenario inline the canonical wasm shell as body routes
@@ -30,16 +31,15 @@ const MODULE_ENTRY_HEADER_SIZE: usize = 10;
 /// wasm-scenario synth host's http module, which inlines the
 /// canonical browser shell (runtime.html ~83 KiB after scenario
 /// substitution + host_shims.js ~56 KiB + scenario.json) as `body:`
-/// routes per the shared-infra-in-orchestrator partition principle.
-/// A 128 KiB cap truncates the later route bodies silently (clipped
-/// JS / empty scenario.json in the browser). Kept in lockstep with the http
-/// `DEFAULT_BODY_POOL_SIZE` host cap. The kernel itself sets no per-module
+/// routes per the shared-infra-in-orchestrator partition principle;
+/// half of it would not hold the later route bodies. Kept in lockstep with
+/// the http `DEFAULT_BODY_POOL_SIZE` host cap. The kernel itself sets no per-module
 /// or whole-blob ceiling: it borrows params from the config blob in place.
 /// Generation runs host-side, so this is a sanity bound, not a memory
 /// constraint. Wavetables and large sequences fit comfortably within.
 const MAX_MODULE_PARAMS_SIZE: usize = 256 * 1024;
 
-/// Param base offset within a module entry (= header size = 8)
+/// Param base offset within a module entry: the entry header.
 const P: usize = MODULE_ENTRY_HEADER_SIZE;
 
 /// Parse a waveform string into its numeric ID.
@@ -2853,7 +2853,10 @@ fn build_module_entry(
         // Tag 0xEF: heap.arena_bytes (u32 LE) — this instance's heap cap,
         // overriding the module type's declared arena. Validated by
         // `validate_heap_subtree`.
-        if let Some(n) = heap.get("arena_bytes").and_then(|v| heap_arena_bytes(v).ok()) {
+        if let Some(n) = heap
+            .get("arena_bytes")
+            .and_then(|v| heap_arena_bytes(v).ok())
+        {
             if base + extra_len + 6 < entry.len() {
                 entry[base + extra_len] = 0xEF;
                 entry[base + extra_len + 1] = 4;

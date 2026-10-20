@@ -11,7 +11,9 @@ binding says:
                      fresh-boot marker and a line of output to it, the way a
                      real reset makes a console reopen and the new image talk.
   diagnose   (bool)  implement `diagnose` (default: exit 64, unsupported).
+  fail_diagnose (bool) `diagnose` exits 1.
   fail_off   (bool)  `off` exits 1.
+  off_64     (bool)  `off` exits 64, as a backend without the verb would.
   residue    (bool)  `off` reports a leftover instance in `detail.residue`.
   no_op_off  (bool)  `off` answers `no-op: …`.
 """
@@ -47,6 +49,8 @@ def main():
         json.dump({"ok": True, "info": f"{verb} done"}, sys.stdout)
         return 0
     if verb == "off":
+        if binding.get("off_64"):
+            return UNSUPPORTED
         if binding.get("fail_off"):
             print("recorder: off refused", file=sys.stderr)
             return 1
@@ -58,6 +62,9 @@ def main():
         json.dump(report, sys.stdout)
         return 0
     if verb == "diagnose":
+        if binding.get("fail_diagnose"):
+            print("recorder: diagnose could not reach the machine", file=sys.stderr)
+            return 1
         if not binding.get("diagnose"):
             return UNSUPPORTED
         json.dump({"ok": True, "info": "diagnosed", "detail": {"registers": "x0=0"}}, sys.stdout)

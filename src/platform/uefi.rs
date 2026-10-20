@@ -9,11 +9,13 @@
 //
 // `_start` opens with the image's `KernelHeader`, which the loader reads to
 // place the image and reserve its RAM, then sets up FP/SIMD, the boot stack
-// and BSS and calls `uefi_main`.
+// and BSS and calls `uefi_main`, which checks the handoff, reports it on the
+// console UART in one `[boot] stage=kernel_entry` line and parks the core.
 //
-// Until the MMU is on every access is Device memory, which faults on an
-// unaligned access, so the code that runs here touches memory only with
-// naturally aligned loads and stores: byte-at-a-time output, volatile reads.
+// With the MMU off every data access is Device memory, where an unaligned
+// access faults. The target (`aarch64-unknown-none`) compiles with
+// `strict-align`, and the handoff is read field by field at each field's
+// own width.
 
 use core::arch::global_asm;
 use core::panic::PanicInfo;
@@ -36,12 +38,13 @@ global_asm!(
     "    .quad __kernel_ram_end",
     "    .quad __kernel_bytes",
     "1:",
-    // Interrupts masked until the kernel has vectors of its own (the boot
-    // contract already says so; nothing here depends on the loader keeping
-    // it).
+    // Interrupts masked until the kernel has vectors of its own. The
+    // handoff contract masks them already; masking here means nothing
+    // depends on the loader having done so.
     "    msr daifset, #0xf",
     "    mov x19, x0",
-    // FP/SIMD on: CPACR_EL1.FPEN = 0b11; at EL2, CPTR_EL2.TFP clear as well.
+    // FP/SIMD on: CPACR_EL1.FPEN = 0b11; at EL2, CPTR_EL2.TFP (bit 10 with
+    // HCR_EL2.E2H clear) cleared as well.
     "    mrs x9, CurrentEL",
     "    cmp x9, #(2 << 2)",
     "    b.ne 2f",
@@ -57,7 +60,7 @@ global_asm!(
     "    ldr x0, =__bss_start",
     "    ldr x1, =__bss_end",
     "3:  cmp x0, x1",
-    "    b.ge 4f",
+    "    b.hs 4f",
     "    str xzr, [x0], #8",
     "    b 3b",
     "4:  mov x0, x19",

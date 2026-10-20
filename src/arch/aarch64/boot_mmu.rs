@@ -7,10 +7,9 @@
 //! ASIDs, built from 1 GB blocks with the first gigabyte split into 2 MB
 //! blocks (and the blocks around kernel stack guard pages into 4 KB pages).
 //!
-//! What goes where is the machine's: a Pi 5 has DRAM below 4 GB and its
-//! peripherals in two apertures far above, QEMU's `virt` machine has RAM
-//! from 1 GB and devices below it, a UEFI machine says in its memory map.
-//! So the platform describes its map in [`Kind`]s, gigabyte by gigabyte
+//! What goes where is the machine's: a Pi 5 has DRAM from address 0 and
+//! its peripherals in apertures from 64 GB up, QEMU's `virt` machine has
+//! RAM from 1 GB and devices below it. So the platform describes its map in [`Kind`]s, gigabyte by gigabyte
 //! ([`map_gb`]) and 2 MB block by block in the first gigabyte
 //! ([`map_2mb`]), then calls [`enable`].
 //!
@@ -44,28 +43,32 @@ const SH_INNER: u64 = 3 << 8;
 const AF: u64 = 1 << 10;
 /// nG (not-global): ASID-tag the entry. The kernel runs under ASID 0, but
 /// EL0-isolated modules run under their own ASID with their own page
-/// table. If the kernel identity map were GLOBAL, its cached 2 MB DRAM
-/// block TLB entries would match ANY ASID and SHADOW an isolated module's
-/// nG 4 KB EL0 carve in the same window (the EL0 stack, which co-locates
-/// with the per-module page-table BSS) — a spurious EL0 permission fault
-/// at level 2 even though the module's own tables are right. Tagged nG
-/// (ASID 0), the kernel map never matches an isolated access.
+/// table. A global kernel entry would match ANY ASID, so a cached 2 MB
+/// kernel block would SHADOW an isolated module's 4 KB EL0 pages in the
+/// same window (its stack, which sits in the kernel's BSS) and turn its
+/// accesses into EL0 permission faults although its own tables are right.
+/// Tagged nG (ASID 0), the kernel map never matches an isolated access.
 const NG: u64 = 1 << 11;
 const PXN: u64 = 1 << 53;
 const UXN: u64 = 1 << 54;
 
-/// MAIR_EL1. Attr1 is Device-nGnRE rather than nGnRnE: nGnRnE forces the
-/// CPU to wait for each write to be observable before proceeding, which
-/// stalls on PCIe posted writes that never return a completion (the RP1
-/// datasheet §3.3.1.2 recommends nGnRE for exactly that reason).
+/// MAIR_EL1. Attr0 `0xFF`: Normal, inner and outer Write-Back
+/// non-transient, read- and write-allocate. Attr1 `0x04`: Device-nGnRE —
+/// early write acknowledgement allowed, so a posted write to MMIO (behind
+/// PCIe, say) completes at the interconnect instead of waiting on the
+/// endpoint, as it would under nGnRnE. Attr2 `0x44`: Normal, inner and
+/// outer Non-cacheable.
 pub const MAIR_VALUE: u64 = 0xFF              // index 0: Normal WB-WA
     | (0x04 << 8)    // index 1: Device-nGnRE
     | (0x44 << 16); // index 2: Normal Non-cacheable
 
-/// TCR_EL1: 39-bit VA from L1 (T0SZ = 25), 4 KB granule (TG0 = 0, so the
-/// field is omitted), inner+outer WB-WA, inner shareable, TTBR1 walks off,
-/// 40-bit PA (1 TB: reaches a Pi 5's RP1 window at 0x1f_xxxx_xxxx), 16-bit
-/// ASIDs (one per module index).
+/// TCR_EL1: T0SZ = 25 (39-bit VA, walks start at L1), IRGN0 = ORGN0 = 0b01
+/// (Write-Back write-allocate walks), SH0 = 0b11 (inner shareable), TG0 =
+/// 0b00 (4 KB granule, so the field is omitted), EPD1 = 1 (no TTBR1 walks),
+/// IPS = 0b010 (40-bit PA, 1 TB; a part with less behaves as its own
+/// maximum), AS = 1 (16-bit ASIDs: one per module index; a part with 8-bit
+/// ASIDs treats the bit as RES0, and `isolation` refuses a module whose
+/// ASID does not fit).
 pub const TCR_VALUE: u64 =
     25 | (0b01 << 8) | (0b01 << 10) | (0b11 << 12) | (1 << 23) | (0b010u64 << 32) | (1u64 << 36);
 
@@ -113,10 +116,10 @@ pub const MAX_GUARD_L3: usize = 4;
 #[link_section = ".bss"]
 static mut GUARD_L3: [PageTable; MAX_GUARD_L3] = [const { PageTable([0; 512]) }; MAX_GUARD_L3];
 
-/// MAIR/TCR/TTBR0 as the boot core programmed them, published at the
-/// point of coherency for a secondary core's trampoline, which installs
-/// the same translation with the MMU still off so that its accesses join
-/// inner-shareable coherency.
+/// MAIR/TCR/TTBR0 as the boot core programmed them, cleaned to the point
+/// of coherency for a secondary core's entry stub, which reads them with
+/// its MMU off and installs the same translation, so that its accesses
+/// join inner-shareable coherency.
 #[no_mangle]
 pub static mut SECONDARY_MMU_MAIR: u64 = 0;
 #[no_mangle]
@@ -198,14 +201,54 @@ pub unsafe fn unmap_stack_guards(guards: &[u64]) {
     }
 }
 
-/// Enable the MMU over the identity map, caches on, alignment checking
-/// off (the firmware's value is not ours to assume, and modules are built
-/// to emit unaligned accesses over Normal memory), and publish the
-/// translation registers for the secondary cores.
+/// Invalidate the data cache over `[start, end)` to the point of
+/// coherency (`DC IVAC`, by the smallest data-cache line `CTR_EL0.DminLine`
+/// reports), then `DSB SY`. Invalidate, not clean: the memory holds the
+/// bytes that count, and a line written back over them would undo them.
 ///
 /// # Safety
-/// Boot core, once, after the map is built.
-pub unsafe fn enable() {
+/// MMU and data cache off, so no line in the range holds data that is not
+/// also in memory except what a predecessor (firmware) left there.
+pub unsafe fn invalidate_dcache_poc(start: usize, end: usize) {
+    if end <= start {
+        return;
+    }
+    let ctr: u64;
+    core::arch::asm!("mrs {}, ctr_el0", out(reg) ctr, options(nomem, nostack));
+    let line = 4usize << ((ctr >> 16) & 0xF);
+    let mut p = start & !(line - 1);
+    while p < end {
+        core::arch::asm!("dc ivac, {}", in(reg) p, options(nostack, preserves_flags));
+        p += line;
+    }
+    core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+}
+
+/// Enable the MMU over the identity map, caches on, alignment checking
+/// off (`SCTLR_EL1.A`: modules are built to emit unaligned accesses over
+/// Normal memory) and write-implies-execute-never off (`SCTLR_EL1.WXN`:
+/// the kernel's DRAM blocks are writable and executable) — neither is the
+/// firmware's to choose — and publish the translation registers for the
+/// secondary cores.
+///
+/// `written_uncached` names every range written since entry with the MMU
+/// off — BSS (the page tables among it), the stack, anything relocated —
+/// as `(start, end)`. Those writes went straight to memory; a line the
+/// firmware left in a cache for the same address would hide them (and the
+/// tables from the walker, which reads through the cache) once caching is
+/// on, so each range is invalidated before `SCTLR_EL1.C` is set. The
+/// architecture does not promise the caches are empty at handoff: the
+/// Linux boot protocol, which the Pi 5's firmware and QEMU follow, asks
+/// only that the loaded image be cleaned to the point of coherency.
+///
+/// # Safety
+/// Boot core, once, after the map is built, at EL1 with the MMU and data
+/// cache off: these are the EL1&0 regime's registers, so a core that
+/// arrived at EL2 must have dropped first ([`crate::drop_to_el1`]).
+pub unsafe fn enable(written_uncached: &[(usize, usize)]) {
+    for &(start, end) in written_uncached {
+        invalidate_dcache_poc(start, end);
+    }
     let ttbr = &raw const L1_TABLE as u64;
     core::arch::asm!(
         "tlbi vmalle1",
@@ -217,6 +260,7 @@ pub unsafe fn enable() {
         "isb",
         "mrs {tmp}, sctlr_el1",
         "bic {tmp}, {tmp}, #(1 << 1)",  // A: alignment checking off
+        "bic {tmp}, {tmp}, #(1 << 19)", // WXN: off
         "orr {tmp}, {tmp}, #(1 << 0)",  // M
         "orr {tmp}, {tmp}, #(1 << 2)",  // C
         "orr {tmp}, {tmp}, #(1 << 12)", // I

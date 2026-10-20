@@ -1,6 +1,6 @@
 //! Chip abstraction layer — Linux hosted target.
 //!
-//! Kernel capacity (arenas, module slots, config and log-ring sizes) is
+//! Kernel capacity (arenas, module slots, heap segments, the log ring) is
 //! stated per kernel platform in `kernel::config`, not here.
 
 /// Default step deadline: 2 ms.

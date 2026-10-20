@@ -393,6 +393,31 @@ struct FluxorTomlParse {
     project: Option<ProjectSection>,
     #[serde(default)]
     dependencies: Option<std::collections::BTreeMap<String, DepValue>>,
+    #[serde(default)]
+    uses: Option<UsesSection>,
+}
+
+/// `[uses]`: what this project runs by name that no graph it builds names.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UsesSection {
+    #[serde(default)]
+    bundles: Vec<String>,
+}
+
+/// `fluxor.toml::[uses] bundles`: the bundles this project runs by name
+/// (`fluxor run <name>`, `fluxor install <name>`) from scripts, which no
+/// graph names. Each is a reference `fluxor update` pins from the
+/// dependency that publishes it. Empty when absent.
+#[allow(
+    dead_code,
+    reason = "read by the lib-context store flow; this file dual-compiles into the bin"
+)]
+pub fn used_bundles(project_root: &Path) -> Result<Vec<String>, String> {
+    Ok(read_fluxor_toml(project_root)?
+        .and_then(|f| f.uses)
+        .map(|u| u.bundles)
+        .unwrap_or_default())
 }
 
 #[derive(serde::Deserialize)]
@@ -487,10 +512,6 @@ pub fn discover() -> ProjectRoot {
 /// Skips the env-var check — callers that want env-var semantics
 /// should use [`discover`] / [`root`]. Returns `None` when no marker
 /// is found (callers can decide whether to fall back to `start`).
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)] // exercised by inline tests; reserved for future callers.
 pub fn discover_from(start: &Path) -> Option<ProjectRoot> {
     let starting_cwd = start.to_path_buf();
     let mut cur = starting_cwd.clone();
@@ -507,6 +528,70 @@ pub fn discover_from(start: &Path) -> Option<ProjectRoot> {
             return None;
         }
     }
+}
+
+/// Whether `path`, a file under `project_root`, belongs to that project
+/// rather than to one nested inside it: no directory between the root and
+/// the file carries a `fluxor.toml` or a `.fluxor` of its own. A nested
+/// project resolves against its own pins and is checked and published by
+/// its own CI and its own `fluxor publish`. A path outside the root belongs
+/// to another project too.
+pub fn is_own_file(project_root: &Path, path: &Path) -> bool {
+    let Ok(rel) = path.strip_prefix(project_root) else {
+        return false;
+    };
+    let mut dir = project_root.to_path_buf();
+    for component in rel.parent().into_iter().flat_map(Path::components) {
+        dir.push(component);
+        if dir.join("fluxor.toml").is_file() || dir.join(".fluxor").is_file() {
+            return false;
+        }
+    }
+    true
+}
+
+/// The files matching `pathspecs` that the project versions, relative to
+/// `project_root`, from BOTH of its repositories: the main one and the
+/// shadow one (`.git-shadow`) a project may keep its examples and tests in.
+/// Enumerating one repository silently leaves out what the other tracks.
+/// The shadow repository is the project's own, else the nearest enclosing
+/// directory's: a project nested in another's tree may be versioned by that
+/// tree's shadow repository, and only its own part of it is listed.
+/// Untracked local experiments are not listed, and a tree without git lists
+/// nothing.
+pub fn tracked_files(
+    project_root: &Path,
+    pathspecs: &[&str],
+) -> std::collections::BTreeSet<String> {
+    let mut listing = std::collections::BTreeSet::new();
+    let shadow_tree = project_root
+        .ancestors()
+        .find(|dir| dir.join(".git-shadow").is_dir());
+    for work_tree in [None, shadow_tree] {
+        let mut cmd = std::process::Command::new("git");
+        if let Some(tree) = work_tree {
+            cmd.arg("--git-dir")
+                .arg(tree.join(".git-shadow"))
+                .arg("--work-tree")
+                .arg(tree);
+        }
+        cmd.arg("ls-files")
+            .arg("--")
+            .args(pathspecs)
+            .current_dir(project_root)
+            .stderr(std::process::Stdio::null());
+        if let Ok(out) = cmd.output() {
+            if out.status.success() {
+                listing.extend(
+                    String::from_utf8_lossy(&out.stdout)
+                        .lines()
+                        .filter(|l| !l.trim().is_empty())
+                        .map(str::to_string),
+                );
+            }
+        }
+    }
+    listing
 }
 
 /// Which marker (if any) identifies `path` as a fluxor project

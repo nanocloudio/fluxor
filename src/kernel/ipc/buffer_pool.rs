@@ -112,25 +112,30 @@ const _: () = assert!(
      and BufferRegistrySlot.owner_channel storage before increasing this limit"
 );
 
-/// Default buffer size for channels without hints (audio channels).
-/// Derived from the canonical constant in abi.rs.
+/// The ring a channel opened without a size gets: the module ABI's
+/// `CHANNEL_BUFFER_SIZE`, which is the default ring the composer charges an
+/// unsized edge (`ring_size::DEFAULT_RING_BYTES`).
 pub const BUFFER_SIZE: usize = crate::abi::CHANNEL_BUFFER_SIZE;
+const _: () = assert!(BUFFER_SIZE == super::ring_size::DEFAULT_RING_BYTES as usize);
 
-/// Buffer arena size — the silicon TOML's `[kernel] buffer_arena_kb`.
+/// Buffer arena size: the kernel profile's (`kernel::config`), which on the
+/// RP parts is the silicon TOML's `[kernel] buffer_arena_kb`.
 const BUFFER_ARENA_SIZE: usize = crate::kernel::config::BUFFER_ARENA_SIZE;
 
 // ============================================================================
 // Buffer Arena (separate from module state arena)
 // ============================================================================
 
-/// Alignment of every channel buffer: one cache line. Capacities are powers of
+/// Alignment of every channel buffer: one cache line (`ring_size::RING_ALIGN`,
+/// the alignment the composer charges each ring at). Capacities are powers of
 /// two of at least 64 bytes (`channel_open`), so every buffer starts and ends
 /// on a line boundary: two channels never share a line, and cache maintenance
 /// on one buffer (a DMA-owned edge) never touches its neighbour.
-const BUFFER_ALIGN: usize = 64;
+const BUFFER_ALIGN: usize = super::ring_size::RING_ALIGN as usize;
 
 #[repr(C, align(64))]
 struct AlignedBufferArena([u8; BUFFER_ARENA_SIZE]);
+const _: () = assert!(core::mem::align_of::<AlignedBufferArena>() == BUFFER_ALIGN);
 const _: () = assert!(core::mem::align_of::<AlignedBufferArena>() == BUFFER_ALIGN);
 static mut BUFFER_ARENA: AlignedBufferArena = AlignedBufferArena([0; BUFFER_ARENA_SIZE]);
 

@@ -256,6 +256,18 @@ pub fn publish_project_with_mode(
     verbose: bool,
     mode: PublishMode,
 ) -> Result<Vec<String>> {
+    publish_project_into(project_root, only, verbose, mode, None)
+}
+
+/// `publish_project_with_mode` into the store at `store_dir`, or the
+/// default store (`$FLUXOR_STORE`, else the XDG data dir) when `None`.
+pub fn publish_project_into(
+    project_root: &Path,
+    only: &[&str],
+    verbose: bool,
+    mode: PublishMode,
+    store_dir: Option<&Path>,
+) -> Result<Vec<String>> {
     let pr = project_root.to_path_buf();
     let identity = require_project_identity(&pr)?;
     let epoch_hex: String = crate::hash::abi_surface_digest()
@@ -267,7 +279,11 @@ pub fn publish_project_with_mode(
     let input_digests = project_input_digests(&pr)?;
     let want = |k: &str| only.is_empty() || only.contains(&k);
 
-    let store = OciStore::open(crate::oci_store::store_root()?)?;
+    let store_root = match store_dir {
+        Some(d) => d.to_path_buf(),
+        None => crate::oci_store::store_root()?,
+    };
+    let store = OciStore::open(store_root.clone())?;
 
     // Retire tags for modules this project no longer has, as part of the
     // publish plan.
@@ -546,7 +562,7 @@ pub fn publish_project_with_mode(
     }
 
     // Runtimes: `[project].runtimes` binaries, plus — for fluxor — the
-    // CLI itself (Decision 8: the CLI is a runtime artifact).
+    // CLI itself, which is a runtime artifact the launcher resolves.
     if want("runtime") {
         let mut names = identity.runtimes.clone();
         if identity.name == "fluxor" && !names.iter().any(|n| n == "fluxor") {
@@ -594,10 +610,8 @@ pub fn publish_project_with_mode(
     // someone types it, and nobody types it for a number they have never
     // seen. Reporting is not collecting — `gc` stays the only verb that
     // deletes, for the reason its own doc gives.
-    if let Ok(root) = crate::oci_store::store_root() {
-        if let Some(line) = crate::store_maint::usage(&root).report(5.0) {
-            println!("  {line}");
-        }
+    if let Some(line) = crate::store_maint::usage(&store_root).report(5.0) {
+        println!("  {line}");
     }
 
     // A project with no publishable artifacts still gets its project
@@ -654,7 +668,8 @@ pub fn publish_project_with_mode(
             for (reference, why) in &retire {
                 println!("would retire {reference} ({why})");
             }
-            println!("\ndry run: nothing was written.");
+            // The caller says "nothing was written" once it has listed the
+            // rest of its sweep.
             return Ok(Vec::new());
         }
     }

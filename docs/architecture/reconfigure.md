@@ -1,7 +1,8 @@
 # Live Graph Reconfigure
 
 Source: `src/kernel/exec/scheduler/live_reconfig.rs`,
-`src/kernel/exec/scheduler/setup.rs`, `tools/src/reconfigure.rs`
+`src/kernel/exec/scheduler/setup.rs`, `src/kernel/exec/scheduler/live.rs`,
+`src/kernel/workload/owner.rs`, `tools/src/reconfigure.rs`
 
 ## Overview
 
@@ -121,27 +122,42 @@ answer `-ENOSYS`.
 
 After the subscribers, the platform's own hook runs with the same handle. On
 Linux it closes every file the owner holds open, drops its store with the
-reads, writes and watches on it, and removes its storage root. The kernel
-keeps no table of storage handles: each platform provider records which owner
-opened each handle and refuses it to any other, so the hook alone is enough
-for nothing a workload opened to outlive it. On bcm2712 the store is the
-node's alone, so a workload holds nothing there to release.
+reads, writes and watches on it, and removes its storage root. On bcm2712
+it closes the handles the owner holds through its root and queues the root
+for removal. The kernel keeps no table of storage handles: each platform
+provider records which owner opened each handle and refuses it to any other,
+so the hook alone is enough for nothing a workload opened to outlive it.
 
-An owner acting with the node's authority (below) has no root. Its hook closes
-the files, host processes and node-store handles it opened (on bcm2712, the
-store handles) and removes nothing from the node's storage.
+An owner acting with the node's authority (below) has no root, and the hook
+removes nothing from the node's storage for it. It closes what the owner
+opened: on Linux its host files, host processes, host namespace and HTTP
+object handles, and its handles on the node's store; on bcm2712 its handles
+on the node's store.
 
 ## Adding a Subgraph with the Node's Authority
 
 Every live add is an owner of its own: it is freed, paused, charged and
-released as one. By default it is also a workload — walled from the node's
-provider layers, its storage rooted. A node component that places subgraphs
-to act on its own behalf (an operator shell running a user's commands) sets
+released as one. Its modules run as that owner from their first
+instruction: the add stamps each slot it takes before any module
+instantiates, so what a module's `module_new` allocates, opens and registers
+(its provider layers among them) is its owner's. While the add is
+instantiating, the owner is `Reserved`: its own modules admit work for
+themselves, nothing else admits work on its behalf until it is `Active`, and
+only the add frees it (`FREE_OWNER` answers `-3`) by rolling itself back. A
+slot a staged add holds is not free to another add, even before its module
+is in.
+
+By default an added owner is a workload: walled from the node's provider
+layers, its storage rooted. A node component that places subgraphs to act on
+its own behalf (an operator shell running a user's commands) sets
 `ADD_FLAG_CREATOR_AUTHORITY` (`0x0001`) in the `AddSubgraph` header's `flags`
-(bytes 6..8, big-endian). The owner then acts with the
-node's authority: it reaches the node's provider layers and the platform's
-storage as the node does, and spawns host processes, while everything it
-opens is still stamped with its own owner and goes with it.
+(bytes 6..8, big-endian). The owner then acts with the node's authority: it
+reaches the node's provider layers and the platform's storage as the node
+does and, on Linux, spawns host processes and binds ports as the node does,
+outside the lease plan, while everything it opens is still stamped with its
+own owner and goes with it.
+It gains nothing an add cannot carry: node param tags are refused on every
+add, this one included.
 
 The rule, enforced by the decoder and the add:
 
@@ -183,7 +199,7 @@ workload's.
 
 ## Drain-Then-Reset Model
 
-The implemented reconfigure model is drain-then-reset:
+Reconfigure drains, then resets:
 
 1. **DRAINING**: Modules with `module_drain` get a graceful shutdown period.
    In-flight requests complete. The drain has a bounded timeout.
@@ -206,15 +222,15 @@ What this model delivers:
 - **Build-time transition plan preview** via
   `fluxor inspect new.yaml --against old.yaml`
 
-Out of scope for the current reconfigure path:
+What reconfigure does not do:
 
-- State preservation for surviving modules (all state is reset)
-- Channel preservation between surviving modules
-- Arena compaction (selective module replacement without full reset)
-- Socket handoff to new module instances
+- Preserve state for surviving modules (all state is reset)
+- Preserve channels between surviving modules
+- Compact arenas (selective module replacement without a full reset)
+- Hand sockets off to new module instances
 
-None of these are needed for the supported reconfigure semantics; a
-preservation-aware reconfigure path would be a separate design.
+None of these is needed for drain-then-reset semantics; preserving state
+across a reconfigure would be a different mechanism.
 
 ## CLI: Transition Plan Preview
 

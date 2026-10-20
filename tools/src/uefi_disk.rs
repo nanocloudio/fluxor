@@ -14,13 +14,15 @@
 //! ```
 //!
 //! The file is sparse and exactly [`DISK_BYTES`], so the backup header sits
-//! at the last LBA a volume of that size has: 1 GiB, the smallest volume a
-//! cloud machine boots from, and room to spare for an image of tens of MiB. The partition table is written here; the FAT is
-//! made and filled by `mformat`/`mcopy` (mtools), the same class of host
-//! tool as `picotool` and `qemu-img`.
+//! at the last LBA a volume of that size has: 1 GiB, a whole number of GiB
+//! as cloud block volumes are sized, with room to spare for an image of
+//! tens of MiB. The partition table is written here; the FAT is made and
+//! filled by `mformat`/`mcopy` (mtools), the same class of host tool as
+//! `picotool` and `qemu-img`.
 //!
-//! The GUIDs are derived from the ESP's contents, so the same inputs make
-//! the same disk byte for byte.
+//! The same inputs make the same disk byte for byte: the GUIDs and the FAT
+//! volume serial are derived from the ESP's contents, and every FAT
+//! timestamp is the FAT epoch (`SOURCE_DATE_EPOCH`, which mtools honours).
 
 use std::fs::OpenOptions;
 use std::io::{Seek, SeekFrom, Write};
@@ -43,9 +45,15 @@ const ENTRY_LBAS: u64 = ENTRIES * ENTRY_SIZE / SECTOR;
 /// The disk's size.
 pub const DISK_BYTES: u64 = 1 << 30;
 
-/// The smallest disk the layout fits: the ESP must hold a FAT32 volume,
-/// which mtools will not make below 32 MiB of clusters.
+/// The smallest disk this builds. FAT32 is a FAT of at least 65525 clusters
+/// (a firmware reads one with fewer as FAT16) and `mformat -F` does not
+/// enforce that; at 64 MiB it makes 512-byte clusters, about 129 000 of
+/// them.
 const MIN_DISK_BYTES: u64 = 64 << 20;
+
+/// 1980-01-01T00:00:00Z, the earliest time a FAT directory entry holds: every
+/// timestamp on the ESP.
+const FAT_EPOCH: &str = "315532800";
 
 /// `C12A7328-F81F-11D2-BA4B-00A0C93EC93B`, the EFI system partition type.
 const ESP_TYPE: [u8; 16] = guid_bytes(
@@ -103,6 +111,14 @@ pub fn build(out: &Path, size: u64, files: &[EspFile]) -> Result<DiskReport> {
     let id = identity.finalize();
     let disk_guid = v4_guid(&id[..16]);
     let part_guid = v4_guid(&id[16..]);
+    let serial = Sha256::new()
+        .chain_update(id)
+        .chain_update(b"fat volume serial")
+        .finalize();
+    let serial = format!(
+        "{:08x}",
+        u32::from_le_bytes([serial[0], serial[1], serial[2], serial[3]])
+    );
 
     let total = size / SECTOR;
     let last_usable = total - 1 - ENTRY_LBAS - 1;
@@ -154,6 +170,8 @@ pub fn build(out: &Path, size: u64, files: &[EspFile]) -> Result<DiskReport> {
             "-F",
             "-T",
             &esp_sectors.to_string(),
+            "-N",
+            &serial,
             "-v",
             "FLUXOR",
             "::",
@@ -182,12 +200,16 @@ pub fn build(out: &Path, size: u64, files: &[EspFile]) -> Result<DiskReport> {
 }
 
 fn mtool(tool: &str, args: &[&str]) -> Result<()> {
-    let out = Command::new(tool).args(args).output().map_err(|e| {
-        Error::Config(format!(
-            "uefi disk: running `{tool}`: {e} — the ESP is made with mtools \
+    let out = Command::new(tool)
+        .args(args)
+        .env("SOURCE_DATE_EPOCH", FAT_EPOCH)
+        .output()
+        .map_err(|e| {
+            Error::Config(format!(
+                "uefi disk: running `{tool}`: {e} — the ESP is made with mtools \
              (`apt install mtools`)"
-        ))
-    })?;
+            ))
+        })?;
     if !out.status.success() {
         return Err(Error::Config(format!(
             "uefi disk: `{tool} {}` failed: {}",
@@ -415,8 +437,14 @@ mod tests {
             std::fs::remove_file(&back).unwrap();
         }
 
-        // Determinism: the GUIDs come from the contents, not the moment.
-        let again = build(&dir.join("again.disk"), size, &files).unwrap();
+        // Determinism: GUIDs, volume serial and timestamps come from the
+        // contents, not the moment.
+        let again_path = dir.join("again.disk");
+        let again = build(&again_path, size, &files).unwrap();
         assert_eq!(again.disk_guid, report.disk_guid);
+        assert!(
+            std::fs::read(&again_path).unwrap() == raw,
+            "the same inputs make the same disk byte for byte"
+        );
     }
 }

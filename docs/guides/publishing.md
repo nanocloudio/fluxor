@@ -50,19 +50,60 @@ project index (`fluxor/meta`) lists:
 | Runtimes | `fluxor-linux` and the `fluxor` CLI itself, one binary layer per host triple | `fluxor/run/<name>-<triple>:<ver>` |
 | Project index | standard OCI index over the artefact manifests above; annotations carry fluxor's dependency declarations | `fluxor/meta:<ver>` |
 
+Beyond those, a project's `fluxor publish` sweeps everything else it
+ships — what lives under `packaging/`, and only that
+([project-layout.md](project-layout.md)) — in dependency order, each after
+what it depends on:
+
+1. source trees;
+2. fmods and runtimes (with the sources, one transaction);
+3. stacks — `packaging/stack/<name>.yaml` — each recording the module
+   artifacts it composes, so after the modules;
+4. bundles — `packaging/service/<name>/workload.toml` and
+   `packaging/applet/<name>/workload.toml` — which may include stacks, so
+   after the stacks.
+
+One discovery finds 3 and 4; `fluxor ci`'s `packaging` phase checks exactly
+those, the way the publish reads them. A subdirectory with its own
+`fluxor.toml` or `.fluxor` is another project; its own `fluxor publish`
+publishes what it ships. Platform stacks (`stacks/*.toml`) are fluxor's
+catalog and are never swept, and example and test graphs are never
+published.
+
+Every stack and bundle is checked before anything is written. A stack that
+does not parse, declares no `version`, is not at
+`packaging/stack/<name>.yaml`, or composes a module that is neither the
+project's own, nor pinned, nor a kernel built-in, and a bundle whose source
+manifest or graph does not check, refuse the publish with the reason; none
+is skipped. `fluxor publish --dry-run` prints the displacement report and
+lists every stack and bundle the sweep would publish, and writes nothing.
+`--store <dir>` publishes the sweep into another store.
+
 `fluxor publish --only <kind>` scopes the publish to a subset of
-artefact kinds (`source`, `fmod`, `runtime`). Only the chosen kinds'
-tags move; the project index is rewritten over them plus the
+artefact kinds (`source`, `fmod`, `runtime`, `stack`, `bundle`). Only the
+chosen kinds' tags move; the project index is rewritten over them plus the
 project's other artefacts already in the store.
 
 Only fluxor publishes runtimes; the `fluxor/run/` namespace is
 reserved. A sibling "runtime" is a graph on `fluxor-linux`.
 
-A workload bundle is published on its own, not by the sweep:
-`fluxor publish bundle <workload.toml | dir>` emits it, carries the
-`.fmod` of every module it pins, and adds it to the project index in
-one transaction. Parameterised service bundles are covered in
+One bundle publishes on its own with
+`fluxor publish bundle <packaging/…/workload.toml | dir>`: it emits the
+bundle, carries the `.fmod` of every module it pins, and adds it to the
+project index in one transaction. Bundles and their params are covered in
 [service-bundles.md](service-bundles.md).
+
+One stack publishes on its own with `fluxor publish stack <file>`: it
+checks the document, records the module artifacts it composes (the
+project's own published modules, else its `fluxor.lock` pins) and adds it
+to the project index as `stack/<name>:<version>`. See
+[../architecture/stacks.md](../architecture/stacks.md).
+
+A consumer never pins a stack or a bundle by hand: a graph that includes a
+stack by name, and a bundle listed under `[uses] bundles`, are references,
+and `fluxor update` pins each from the dependency that publishes it (with a
+stack's module references); an update pins exactly the references the
+project makes.
 
 A workload that brings its own modules is published the same way, on its
 own. `fluxor build <graph> --emit=workload --output <dir>` takes the graph's
@@ -247,7 +288,8 @@ make build && make publish  # fluxor build, then fluxor publish
   lockfile diff. An artefact fluxor publishes for the first time
   arrives with `fluxor update`.
 - **Pinned checkouts** stay on their digests until they run
-  `fluxor update`.
+  `fluxor update`, which also pins every stack and bundle the project
+  references by name.
 - **SDK edits flow the same way.** Source trees are artefacts:
   editing `modules/sdk/abi.rs` and publishing repoints
   `fluxor/src/fluxor-abi:latest`; the consumer's next sync
@@ -425,9 +467,9 @@ the digest a tag pull reports.
   `fluxor store pull` fetches the pinned artefact from a registry.
   `fluxor store fsck` says which pins are dead.
 - **`fluxor.lock` does not parse** — `fluxor sync` and `fluxor
-  update` refuse it; update will not rewrite it, because its bundle
-  pins are recorded nowhere else. Correct it, or delete it (dropping
-  every pin it held) and run `fluxor update`.
+  update` refuse it; update will not rewrite a lock it cannot read.
+  Correct it, or delete it and run `fluxor update`, which writes every
+  pin again from `[dependencies]` and the project's references.
 - **The module build reports an artefact name collision** — two
   module sources (a `<module>-<variant>` and a module directory of
   that literal name) would produce the same `<name>.fmod`; the

@@ -910,8 +910,9 @@ fn grant_handle(i: usize) -> i32 {
     tag_fd(FD_TAG_STORAGE_OBJECT, (GRANT_SLOT_BASE + i) as i32)
 }
 
-/// The streaming-write slot `handle` names in `writes`, if it is a live one.
-fn write_of(writes: &[WriteSlot], handle: i32) -> Option<usize> {
+/// The streaming-write slot `handle` names in `writes`, if it is a live one
+/// `opener` opened: a slot answers its opener alone.
+fn write_of(writes: &[WriteSlot], handle: i32, opener: OwnerHandle) -> Option<usize> {
     if handle < 0 {
         return None;
     }
@@ -920,7 +921,20 @@ fn write_of(writes: &[WriteSlot], handle: i32) -> Option<usize> {
     if slot >= GRANT_SLOT_BASE || i >= writes.len() {
         return None;
     }
-    writes[i].in_use.then_some(i)
+    (writes[i].in_use && writes[i].opener == opener).then_some(i)
+}
+
+/// The `GET` read slot `handle` names in `reads`, if it is a live one
+/// `opener` opened: a slot answers its opener alone.
+fn read_of(reads: &[ReadSlot], handle: i32, opener: OwnerHandle) -> Option<usize> {
+    if handle < 0 {
+        return None;
+    }
+    let i = slot_of(handle) as usize;
+    reads
+        .get(i)
+        .is_some_and(|r| r.in_use && r.opener == opener)
+        .then_some(i)
 }
 
 /// The grant `handle` names, if it is a live one the caller owns.
@@ -1028,8 +1042,8 @@ unsafe fn admit(
     };
     if opcode == obj_op::RANGE_GET {
         // A read handle carries the grant it was opened under.
-        let idx = slot_of(handle) as usize;
-        return match reads.get(idx).and_then(|r| r.grant) {
+        let opener = crate::kernel::exec::scheduler::caller_owner();
+        return match read_of(reads, handle, opener).and_then(|i| reads[i].grant) {
             Some(g) if grant_live(g) => Ok(None),
             _ => Err(errno::EACCES),
         };
@@ -1041,7 +1055,8 @@ unsafe fn admit(
         // Likewise a write handle: the key was scoped once at OPEN, and the
         // grant is re-checked for life on every call so closing it stops a
         // stream already running.
-        return match write_of(writes, handle).and_then(|i| writes[i].grant) {
+        let opener = crate::kernel::exec::scheduler::caller_owner();
+        return match write_of(writes, handle, opener).and_then(|i| writes[i].grant) {
             Some(g) if grant_live(g) => Ok(None),
             _ => Err(errno::EACCES),
         };
@@ -1392,7 +1407,7 @@ pub unsafe fn dispatch_object_on(
     // charged, for its own modules and for an owner acting with its
     // authority.
     let opener = crate::kernel::exec::scheduler::caller_owner();
-    let owner = crate::kernel::exec::scheduler::owners().authority_of(opener);
+    let owner = crate::kernel::exec::scheduler::caller_authority();
     let stage_max = served.stage_max;
     let store = &mut served.store;
     let subs = &mut served.subs;
@@ -1404,10 +1419,9 @@ pub unsafe fn dispatch_object_on(
         if arg.is_null() || arg_len < WIRE_MAX_LEN {
             return errno::EINVAL;
         }
-        let idx = slot_of(handle) as usize;
-        if idx >= reads.len() || !reads[idx].in_use {
+        let Some(idx) = read_of(reads, handle, opener) else {
             return errno::ENOSYS;
-        }
+        };
         let buf = core::slice::from_raw_parts_mut(arg, arg_len);
         return match (Fence::ViewConsistent {
             source: STORE_SOURCE,
@@ -1589,7 +1603,7 @@ pub unsafe fn dispatch_object_on(
         }
         obj_op::PUT_STREAMED_WRITE => {
             // arg = the chunk; appended to the staged body.
-            let Some(idx) = write_of(writes, handle) else {
+            let Some(idx) = write_of(writes, handle, opener) else {
                 return errno::EINVAL;
             };
             if writes[idx].committed {
@@ -1603,7 +1617,7 @@ pub unsafe fn dispatch_object_on(
         }
         obj_op::PUT_STREAMED_COMMIT => {
             // [fence_out_ptr:u64][fence_out_cap:u16]
-            let Some(idx) = write_of(writes, handle) else {
+            let Some(idx) = write_of(writes, handle, opener) else {
                 return errno::EINVAL;
             };
             let Some((fence_ptr, fence_cap)) = fence_out(a, 0) else {
@@ -1664,7 +1678,7 @@ pub unsafe fn dispatch_object_on(
         obj_op::PUT_STREAMED_ABORT => {
             // The staged bytes are dropped and the handle released, so no
             // CLOSE follows.
-            let Some(idx) = write_of(writes, handle) else {
+            let Some(idx) = write_of(writes, handle, opener) else {
                 return errno::EINVAL;
             };
             drop_write(owner, &mut writes[idx]);
@@ -1693,10 +1707,9 @@ pub unsafe fn dispatch_object_on(
         }
         obj_op::RANGE_GET => {
             // [offset:u64][length:u32][out_ptr:u64]
-            let idx = slot_of(handle) as usize;
-            if idx >= reads.len() || !reads[idx].in_use {
+            let Some(idx) = read_of(reads, handle, opener) else {
                 return errno::ENOSYS;
-            }
+            };
             let Some(offset) = get_u64(a, 0).map(|v| v as usize) else {
                 return errno::EINVAL;
             };
@@ -1846,13 +1859,12 @@ pub unsafe fn dispatch_object_on(
             n as i32
         }
         obj_op::CLOSE => {
-            if let Some(i) = write_of(writes, handle) {
+            if let Some(i) = write_of(writes, handle, opener) {
                 drop_write(owner, &mut writes[i]);
                 return 0;
             }
-            let idx = slot_of(handle) as usize;
-            if idx < reads.len() {
-                reads[idx] = READ_EMPTY;
+            if let Some(i) = read_of(reads, handle, opener) {
+                reads[i] = READ_EMPTY;
             }
             0
         }
@@ -2127,7 +2139,7 @@ pub unsafe fn dispatch_namespace_on(
         ns_op::LOOKUP | ns_op::STAT => errno::ENOSYS,
         ns_op::CLOSE => {
             let idx = slot_of(handle) as usize;
-            if idx < subs.len() && subs[idx].in_use {
+            if handle >= 0 && idx < subs.len() && subs[idx].in_use && subs[idx].opener == opener {
                 store.unsubscribe(subs[idx].watch);
                 subs[idx] = SUB_EMPTY;
             }

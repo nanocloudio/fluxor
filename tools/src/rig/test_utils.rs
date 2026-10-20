@@ -5,23 +5,15 @@ use std::sync::{Mutex, MutexGuard};
 
 use tempfile::TempDir;
 
-/// RAII scratch directory used across rig submodule tests. Replaces
-/// the old `unique_tmp_dir(label) -> PathBuf` which leaked to
-/// `/tmp/fluxor-test-*` on every run. Backed by [`tempfile::TempDir`]
-/// so the directory is removed automatically on drop. Path-style
-/// helpers (`.path()`, `.join(...)`) match the previous call-site
-/// ergonomics, so the only required change at call sites is "bind
-/// the return value for the test's lifetime".
+/// RAII scratch directory used across rig submodule tests, backed by
+/// [`tempfile::TempDir`] so the directory is removed on drop. It derefs
+/// to [`Path`]; bind it for the test's lifetime.
 #[derive(Debug)]
 pub(crate) struct UniqueTmpDir {
     inner: TempDir,
 }
 
 impl UniqueTmpDir {
-    #[allow(
-        dead_code,
-        reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-    )] // not every consumer goes through this accessor
     pub fn path(&self) -> &Path {
         self.inner.path()
     }
@@ -37,10 +29,8 @@ impl AsRef<Path> for UniqueTmpDir {
     }
 }
 
-// Deref to Path so test sites that called methods like `.display()`,
-// `.to_str()`, or compared paths still compile unchanged. Path methods
-// return borrowed data tied to the TempDir's lifetime, so the safety
-// argument is the same as for `&Path` derived from any owning struct.
+// Deref to Path, so a test calls `.display()`, `.exists()` and the rest
+// on the guard directly.
 impl std::ops::Deref for UniqueTmpDir {
     type Target = Path;
     fn deref(&self) -> &Self::Target {
@@ -85,11 +75,11 @@ fn sanitise(label: &str) -> String {
 }
 
 /// Serialises the critical section from "write an executable to disk"
-/// through "spawn it". Linux's `execve` reports ETXTBSY if any thread
-/// in the process holds a writable fd on the executable's inode, and
-/// the check runs before CLOEXEC closure — so a concurrent writer in
-/// another test can cause an unrelated spawn to fail. Holding this
-/// mutex for the life of each fixture removes the window.
+/// through "spawn it". `execve` fails with ETXTBSY while any process
+/// holds the file open for writing, and a child another test forks while
+/// the file is open inherits that fd until its own exec closes it — so a
+/// concurrent spawn elsewhere can make this one fail. Holding this mutex
+/// for the life of each fixture removes the window.
 static EXEC_SPAWN_LOCK: Mutex<()> = Mutex::new(());
 
 /// Acquire the process-wide write-then-spawn lock. Poisoning is

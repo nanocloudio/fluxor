@@ -1,11 +1,11 @@
 //! Rig lockfile and teardown marker.
 //!
 //! A single physical rig is a serialisable resource: only one orchestrated
-//! run should touch it at once. V1 uses a local lockfile with atomic
-//! create semantics. Lock content identifies the owner (pid, hostname,
+//! run touches it at once. The lock is a file created exclusively
+//! (`O_CREAT | O_EXCL`). Its content identifies the owner (pid, hostname,
 //! rig, what it's running, when it started, when it expects to be done)
-//! so a stale lock can be inspected and forcibly released, leaving an
-//! audit breadcrumb.
+//! so a stale lock can be inspected and taken over, and the takeover names
+//! the owner it displaced.
 //!
 //! Canonical paths under `~/.local/state/fluxor/labs/<lab>/rigs/<rig>/`:
 //!
@@ -38,14 +38,15 @@ pub struct LockOwner {
     pub task: String,
     /// Seconds since Unix epoch.
     pub started_at: u64,
-    /// Effective timeout governing stale-lock detection:
-    /// scenario `timeout_s` when present, else board `default_timeout_s`,
-    /// else a sensible fallback.
+    /// The holder's match timeout (scenario `timeout_s`, else the board's
+    /// `default_timeout_s`; 60 for a command). From another host it bounds
+    /// the lock while there is no `expected_end`.
     pub effective_timeout_s: u32,
     /// Seconds since Unix epoch by which the owner expects to be finished,
     /// every actuator timeout and the teardown allowance included. Read
-    /// only from another host, where the pid cannot be probed. Absent in
-    /// a lock written by an older core.
+    /// only from another host, where the pid cannot be probed. Absent
+    /// until the owner knows its bound: between claiming the lock and
+    /// installing its guard.
     #[serde(default)]
     pub expected_end: Option<u64>,
 }
@@ -79,8 +80,8 @@ impl LockOwner {
     /// pid is never stale, however long it has run (a metal launch can
     /// outlast any scenario timeout many times over), and a dead pid is
     /// stale at once. From another host only time is available: the lock
-    /// is stale after `expected_end`, or after the old age formula when
-    /// the lock predates that field.
+    /// is stale after `expected_end`, or, before the owner has set one,
+    /// after [`stale_threshold_s`](Self::stale_threshold_s).
     pub fn is_stale(&self) -> bool {
         if self.hostname == hostname() {
             return !pid_alive(self.pid);
@@ -146,26 +147,42 @@ impl LockGuard {
 
     /// Rewrite the lock's `expected_end`, keeping every other field. Used
     /// when the guard is installed (the plan's actuator timeouts are known
-    /// by then) and again when a `--hold` extends the run.
+    /// by then), when a `--hold` extends the run, and when a teardown
+    /// starts. The new content replaces the old by rename, so a concurrent
+    /// claimant reading the lock never sees it half written.
     pub fn set_expected_end(&self, expected_end: u64) -> Result<()> {
         let mut owner = read_owner(&self.path)?;
         if !self.token.matches(&owner) {
             return Err(Error::Config(format!(
-                "rig lock: {} no longer names this process; another run took it over",
+                "rig lock: {} names another owner; a takeover displaced this run",
                 self.path.display()
             )));
         }
         owner.expected_end = Some(expected_end);
-        let f = OpenOptions::new()
+        let tmp = self
+            .path
+            .with_extension(format!("{}.tmp", std::process::id()));
+        let written = OpenOptions::new()
             .write(true)
+            .create(true)
             .truncate(true)
-            .open(&self.path)
-            .map_err(|e| {
-                Error::Config(format!("rig lock: rewriting {}: {e}", self.path.display()))
-            })?;
-        write_owner(&f, &owner)?;
-        f.sync_all().ok();
-        Ok(())
+            .mode(0o600)
+            .open(&tmp)
+            .map_err(|e| Error::Config(format!("rig lock: writing {}: {e}", tmp.display())))
+            .and_then(|f| {
+                write_owner(&f, &owner)?;
+                f.sync_all().ok();
+                Ok(())
+            })
+            .and_then(|()| {
+                std::fs::rename(&tmp, &self.path).map_err(|e| {
+                    Error::Config(format!("rig lock: replacing {}: {e}", self.path.display()))
+                })
+            });
+        if written.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        written
     }
 }
 
@@ -233,8 +250,17 @@ pub fn acquire(lock_path: &Path, owner: &LockOwner, force: bool) -> Result<Acqui
             let existing = read_owner(lock_path)?;
             let stale = existing.is_stale();
             if force || stale {
-                // Replace the file. We do not assume the previous holder
-                // is gone — the caller is taking ownership deliberately.
+                // Replace the file. The previous holder is not assumed
+                // gone — the caller is taking ownership deliberately — so
+                // the takeover names it.
+                eprintln!(
+                    "[rig] taking over {} from pid {} on {} running '{}' ({})",
+                    lock_path.display(),
+                    existing.pid,
+                    existing.hostname,
+                    existing.task,
+                    if stale { "stale" } else { "forced" }
+                );
                 std::fs::remove_file(lock_path).map_err(|e| {
                     Error::Config(format!(
                         "rig lock: removing stale/forced {}: {e}",
@@ -330,7 +356,8 @@ pub fn marker_path_for(lock_path: &Path) -> PathBuf {
 }
 
 /// `state/needs_teardown.json`: written when a run installs its guard,
-/// removed only after every teardown step succeeded or was unsupported.
+/// removed only after a teardown that left the rig down (power off and
+/// unstage each ok or unsupported, no residue).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TeardownMarker {
     pub schema: u32,
@@ -605,7 +632,7 @@ mod tests {
 
     #[test]
     fn other_host_without_expected_end_uses_age_formula() {
-        let mut remote = LockOwner::now("rig-a", "test:old-core", 1);
+        let mut remote = LockOwner::now("rig-a", "test:unbounded", 1);
         remote.hostname = "some-other-host".into();
         remote.expected_end = None;
         assert!(!remote.is_stale());
@@ -632,8 +659,8 @@ mod tests {
     }
 
     #[test]
-    fn lock_without_expected_end_field_still_parses() {
-        let (_lock_dir, path) = tmp_path("old-format.lock");
+    fn lock_without_expected_end_parses_and_uses_the_age_rule() {
+        let (_lock_dir, path) = tmp_path("unbounded.lock");
         let json = r#"{"pid":1,"hostname":"elsewhere","rig":"rig-a","task":"t","started_at":0,"effective_timeout_s":1}"#;
         std::fs::write(&path, json).unwrap();
         let owner = read_owner(&path).unwrap();
@@ -651,6 +678,15 @@ mod tests {
         assert_eq!(persisted.expected_end, Some(1_900_000_000));
         assert_eq!(persisted.task, "test:x");
         assert_eq!(persisted.started_at, owner.started_at);
+        let leftovers: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "the rewrite leaves no temp file");
+        // The guard still recognises the rewritten lock as its own.
+        drop(guard);
+        assert!(!path.exists());
     }
 
     #[test]

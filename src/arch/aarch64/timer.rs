@@ -5,13 +5,15 @@
 //!   * [`read_timer_count`] — low 32 bits of the counter; the wraparound is
 //!     handled by callers using `wrapping_sub`.
 //!   * [`timer_set`] — programme the next timer interrupt for `ticks`
-//!     counter ticks from now and enable the counter.
+//!     counter ticks from now and enable the timer.
+//!
+//! plus [`timer_set_cval`], which arms an absolute compare value instead.
 //!
 //! Which counter is the platform's choice ([`configure`]): the physical
 //! counter (`CNTPCT_EL0`) on bare metal with no hypervisor, the virtual
-//! counter (`CNTVCT_EL0`) under one, where the physical timer traps. A
-//! UEFI machine decides from its tables at boot, so the choice is a value,
-//! not a build.
+//! counter (`CNTVCT_EL0`) under one, where the physical timer traps. The
+//! choice is a value set at boot, not a build: `bcm2712.rs` passes the
+//! physical counter on the Pi 5 and the virtual one on QEMU `virt`.
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -71,10 +73,10 @@ pub fn read_timer_count_64() -> u64 {
 /// Programme the next timer interrupt at an ABSOLUTE counter value
 /// (`cntp_cval_el0` or `cntv_cval_el0`) and enable the timer.
 ///
-/// Unlike [`timer_set`] (a relative `tval` down-counter re-armed "from now"
-/// each fire, which accumulates IRQ-entry latency drift), arming an absolute
-/// compare relative to the *previous* programmed deadline keeps the tick grid
-/// drift-free. The caller MUST guard against a `cval` already in the past
+/// Unlike [`timer_set`] (a relative `tval` down-counter re-armed from the
+/// moment of the write, so each period also carries the IRQ-entry latency),
+/// arming an absolute compare relative to the *previous* programmed deadline
+/// keeps the tick grid drift-free. The caller MUST guard against a `cval` already in the past
 /// (e.g. after a long ISR) by resyncing to `now + period`, else the timer
 /// fires a catch-up burst of immediate IRQs.
 ///

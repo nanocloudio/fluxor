@@ -104,7 +104,7 @@ mod scheduler_validation_tests {
         );
     }
 
-    // ---- F2: D9/D10 must read params from top-level OR nested `params:` ----
+    // ---- Adaptive-tick checks read params from top-level OR nested `params:` ----
 
     #[test]
     fn module_param_u64_reads_top_level_and_nested() {
@@ -124,7 +124,7 @@ mod scheduler_validation_tests {
     #[test]
     fn d10_catches_top_level_voter_count_on_adaptive_raft() {
         // raft_engine on an adaptive domain with TOP-LEVEL voter_count > 1 must
-        // be rejected (D10) — the bypass the nested-only read used to miss.
+        // be rejected by the multi-node raft check, whichever form it is in.
         let cfg = json!({"execution": {"domains": [
             {"name": "main", "cores": [0], "adaptive_flags": 1,
              "tick_min_us": 100, "tick_max_us": 8000}
@@ -135,7 +135,7 @@ mod scheduler_validation_tests {
         let ticks = vec![100u16];
         let err =
             validate_adaptive_tick(&cfg, &modules, 100, &names, &ticks, &manifests, &[], None)
-                .expect_err("D10 must reject multi-node raft on an adaptive domain");
+                .expect_err("multi-node raft on an adaptive domain must be rejected");
         let msg = format!("{err:?}");
         assert!(
             msg.contains("multi-node") && msg.contains("raft_engine"),
@@ -425,7 +425,8 @@ mod scheduler_validation_tests {
         let workloads_over: Vec<_> = (0..16)
             .map(|i| json!({"modules": [{"name": format!("p{i}"), "type": "passthrough", "domain": 0}]}))
             .collect();
-        let cfg_over = json!({"execution": {"domains": [domain.clone()]}, "workloads": workloads_over});
+        let cfg_over =
+            json!({"execution": {"domains": [domain.clone()]}, "workloads": workloads_over});
         // resolved_target None ⇒ event-driven (Linux); skips the bcm wake-policy
         // gate so this isolates the pacer-table gate.
         let err = validate_adaptive_tick(
@@ -478,7 +479,8 @@ mod scheduler_validation_tests {
         let workloads_over: Vec<_> = (0..16)
             .map(|i| json!({"modules": [{"name": format!("p{i}"), "type": "passthrough", "domain": 0}]}))
             .collect();
-        let cfg_over = json!({"execution": {"domains": [domain.clone()]}, "workloads": workloads_over});
+        let cfg_over =
+            json!({"execution": {"domains": [domain.clone()]}, "workloads": workloads_over});
         let err = validate_adaptive_tick(
             &cfg_over,
             &modules,
@@ -634,7 +636,10 @@ mod scheduler_validation_tests {
             dom.clone(),
         )
         .unwrap_err();
-        assert!(err.contains("step_deadline_us = 20000 exceeds the 16000 us"), "{err}");
+        assert!(
+            err.contains("step_deadline_us = 20000 exceeds the 16000 us"),
+            "{err}"
+        );
         // No explicit burst: 3000 × 8 = 24 ms is over.
         let err = build(m(json!({"step_deadline_us": 3000})), dom.clone()).unwrap_err();
         assert!(err.contains("burst deadline 24000 us"), "{err}");
@@ -769,10 +774,19 @@ mod scheduler_validation_tests {
         assert!(at < end, "the cap rides before the TLV end marker");
 
         // Validation: a positive integer that fits a u32.
-        for bad in [json!(0), json!(16), json!("4MiB"), json!(-1), json!(1u64 << 33)] {
+        for bad in [
+            json!(0),
+            json!(16),
+            json!("4MiB"),
+            json!(-1),
+            json!(1u64 << 33),
+        ] {
             let m = json!({"heap": {"arena_bytes": bad.clone()}});
             let err = validate_heap_subtree(&m, "reader").unwrap_err();
-            assert!(format!("{err:?}").contains("heap.arena_bytes"), "{bad}: {err:?}");
+            assert!(
+                format!("{err:?}").contains("heap.arena_bytes"),
+                "{bad}: {err:?}"
+            );
         }
         validate_heap_subtree(&json!({"heap": {"arena_bytes": 4194304}}), "reader")
             .expect("4 MiB is a cap");
@@ -1746,12 +1760,8 @@ mod scheduler_validation_tests {
         let default_manifest = load_module_manifests_with_extra(&modules, &extras, dir.path());
         assert_eq!(default_manifest["sized_stream"].ports[0].buffer_size, 2048);
         for target in ["bcm2712", "linux"] {
-            let m = load_module_manifests_with_extra_for_target(
-                &modules,
-                &extras,
-                Some(target),
-                &repo,
-            );
+            let m =
+                load_module_manifests_with_extra_for_target(&modules, &extras, Some(target), &repo);
             assert_eq!(m["sized_stream"].ports[0].buffer_size, 8192, "{target}");
         }
     }
@@ -2172,8 +2182,14 @@ mod continuity_tests {
         );
         let e = validate_fault_policy(&cfg, &names(&["a"]), &m).unwrap_err();
         let msg = format!("{e:?}");
-        assert!(msg.contains("storage.block"), "names what it provides: {msg}");
-        assert!(msg.contains("restart_graph"), "offers the alternatives: {msg}");
+        assert!(
+            msg.contains("storage.block"),
+            "names what it provides: {msg}"
+        );
+        assert!(
+            msg.contains("restart_graph"),
+            "offers the alternatives: {msg}"
+        );
 
         // The other policies stay open to it.
         for policy in ["skip", "restart_graph", "tolerate"] {
@@ -3170,6 +3186,22 @@ mod capacity_envelope_tests {
         assert!(format!("{err:?}").contains("positive"));
     }
 
+    /// `config_arena` is observed, never allocated (module params are
+    /// borrowed from the config blob in place), so an envelope entry for it
+    /// would bound nothing and is refused by name on every target.
+    #[test]
+    fn config_arena_cannot_be_sized() {
+        for target in ["linux", "pi5", "wasm", "rp2350"] {
+            let cfg = json!({"capacity": {"config_arena": 4096}});
+            let err = build_capacity_envelope(&cfg, Some(target))
+                .expect_err("config_arena holds no allocation to bound");
+            assert!(
+                format!("{err:?}").contains("config_arena"),
+                "{target}: {err:?}"
+            );
+        }
+    }
+
     /// No `capacity:` block ⇒ no section ⇒ byte-identical config blobs.
     #[test]
     fn absent_capacity_block_emits_nothing() {
@@ -3682,7 +3714,11 @@ mod port_fact_tests {
         let src = per_target_fact_manifest(
             "max_payload = { aarch64 = 8192, thumbv8m = 4096, thumbv6m = 512 }",
         );
-        for (silicon, want) in [("aarch64", "8192"), ("thumbv8m", "4096"), ("thumbv6m", "512")] {
+        for (silicon, want) in [
+            ("aarch64", "8192"),
+            ("thumbv8m", "4096"),
+            ("thumbv6m", "512"),
+        ] {
             assert_eq!(
                 resolved_fact(&src, Some(silicon)).unwrap(),
                 want,
@@ -3942,7 +3978,11 @@ mod framed_edge_tests {
             {"from": "req.records", "to": "prov.records"},
             {"from": "req.bytes", "to": "prov.bytes", "buffer_group": 30},
         ]});
-        let edges = [(0u16, 1u16, 0u8, 0u8, 0u8), (0, 1, 0, 2, 2), (0, 1, 0, 1, 1)];
+        let edges = [
+            (0u16, 1u16, 0u8, 0u8, 0u8),
+            (0, 1, 0, 2, 2),
+            (0, 1, 0, 1, 1),
+        ];
         let out = group_framed_edges(&config, &edges, &names(), &manifests()).unwrap();
         assert_eq!(groups(&out), vec![Some(31), Some(29), Some(30)]);
     }
@@ -3975,8 +4015,10 @@ mod fxwr_decode_tests {
         d.extend_from_slice(&1000u16.to_le_bytes()); // tick_us
         d.extend_from_slice(&48_000u32.to_le_bytes()); // graph_sample_rate
         let mut entries = Vec::new();
-        for (id, hash, meta, params) in [(0u8, 0x1111_1111u32, 0u8, 3usize), (1, 0x2222_2222, 0x11, 0)]
-        {
+        for (id, hash, meta, params) in [
+            (0u8, 0x1111_1111u32, 0u8, 3usize),
+            (1, 0x2222_2222, 0x11, 0),
+        ] {
             entries.extend_from_slice(&((10 + params) as u32).to_le_bytes());
             entries.extend_from_slice(&hash.to_le_bytes());
             entries.push(id);
@@ -4017,11 +4059,17 @@ mod fxwr_decode_tests {
         assert_eq!(v["accept_cycles"], true);
         assert_eq!(v["edge_slots"], 128);
         let e = &v["graph"][0];
-        assert_eq!((e["from_id"].clone(), e["to_id"].clone()), (0.into(), 1.into()));
+        assert_eq!(
+            (e["from_id"].clone(), e["to_id"].clone()),
+            (0.into(), 1.into())
+        );
         assert_eq!(e["to_port"], "ctrl");
         assert_eq!(e["edge_class"], "dma_owned");
         assert_eq!(e["buffer_group"], 3);
-        assert_eq!((e["from_port_index"].clone(), e["to_port_index"].clone()), (2.into(), 1.into()));
+        assert_eq!(
+            (e["from_port_index"].clone(), e["to_port_index"].clone()),
+            (2.into(), 1.into())
+        );
         assert_eq!(e["buffer_bytes"], 1024);
         assert_eq!(e["rate"], "transaction");
         assert_eq!(e["wake"], true);
@@ -4037,7 +4085,10 @@ mod fxwr_decode_tests {
     fn every_truncation_is_an_error() {
         let full = blob();
         for len in 0..full.len() {
-            assert!(decode_config(&full[..len]).is_err(), "prefix of {len} bytes");
+            assert!(
+                decode_config(&full[..len]).is_err(),
+                "prefix of {len} bytes"
+            );
         }
     }
 
@@ -4056,6 +4107,32 @@ mod fxwr_decode_tests {
         assert!(decode_config(&d).is_err());
         let mut d = blob();
         d[22..26].copy_from_slice(&u32::MAX.to_le_bytes());
-        assert!(decode_config(&d).unwrap_err().to_string().contains("does not fit"));
+        assert!(decode_config(&d)
+            .unwrap_err()
+            .to_string()
+            .contains("does not fit"));
+    }
+}
+
+#[cfg(test)]
+mod edge_buffer_bytes_tests {
+    use super::*;
+
+    #[test]
+    fn buffer_bytes_is_carried_as_written_and_refused_over_the_ceiling() {
+        let max = crate::ring_plan::MAX_RING_BYTES as u64;
+        let cfg = json!({"wiring": [
+            {"from": "a.out", "to": "b.in"},
+            {"from": "a.out", "to": "b.in", "buffer_bytes": 10},
+            {"from": "a.out", "to": "b.in", "buffer_bytes": max},
+        ]});
+        // Below the floor too: the kernel's rule raises it, not the encoder.
+        assert_eq!(
+            resolve_edge_buffer_bytes(&cfg).unwrap(),
+            vec![0, 10, max as u32]
+        );
+        let cfg = json!({"wiring": [{"from": "a.out", "to": "b.in", "buffer_bytes": max + 1}]});
+        let e = resolve_edge_buffer_bytes(&cfg).unwrap_err().to_string();
+        assert!(e.contains("over the 4194304 B ceiling"), "{e}");
     }
 }

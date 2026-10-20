@@ -61,12 +61,9 @@ pub(crate) fn fanned_port_frame_kind(
     FRAME_KIND_NONE
 }
 
-/// The first `buffer_group` fan insertion may give an edge of its own.
-/// Groups below it are the config tool's: in-place chains numbered up from 1
-/// and framed edges numbered down from 31, all inside the config's 5-bit
-/// field. A group the kernel mints for a record fan is above every one of
-/// them, so it can never alias an edge the graph grouped.
-const RECORD_FAN_GROUP_FIRST: u8 = 32;
+/// The first `buffer_group` fan insertion may give an edge of its own
+/// (`ring_size::RECORD_FAN_GROUP_FIRST`, which the composer replays fans by).
+const RECORD_FAN_GROUP_FIRST: u8 = crate::kernel::ipc::ring_size::RECORD_FAN_GROUP_FIRST;
 
 /// A `buffer_group` no edge uses yet, for one edge around a record fan.
 ///

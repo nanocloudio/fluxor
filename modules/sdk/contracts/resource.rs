@@ -29,7 +29,9 @@ pub const CLASS_UNIT: u8 = 3;
 pub const POOL_STATE_ARENA: u16 = 0x0001;
 /// Shared channel buffer-pool arena (bytes).
 pub const POOL_BUFFER_ARENA: u16 = 0x0002;
-/// Decoded boot-configuration arena (bytes).
+/// Boot configuration (bytes): the module params the graph borrows from its
+/// config blob in place, against the blob's mapped length. Observed, never
+/// allocated from, so it is not sizable by a capacity envelope.
 pub const POOL_CONFIG_ARENA: u16 = 0x0003;
 /// Channel slot table (slots).
 pub const POOL_CHANNELS: u16 = 0x0004;
@@ -51,8 +53,8 @@ pub const KERNEL_POOL_COUNT: usize = 9;
 /// First id of the module-declared pool range.
 pub const POOL_MODULE_BASE: u16 = 0x0100;
 
-/// Class of a kernel pool id (all kernel pools are R1 today; R3 unit
-/// claims join the ledger with their own ids when instrumented).
+/// Class of a kernel pool id. Every kernel pool is a memory pool; a pool of
+/// another class takes an id of its own.
 pub const fn kernel_pool_class(_pool: u16) -> u8 {
     CLASS_MEMORY
 }

@@ -4,10 +4,10 @@ A rig is a board on a bench that `fluxor rig` can flash, reboot and read
 without anyone present. A scenario says what to run and what the console
 must show; a rig profile outside the tree says which board is attached and
 how it is reached; backends — small executables on the discovery path — do
-the reaching. A backend is invoked with a verb,
-reads its inventory as JSON on stdin, and reports as JSON on stdout, so
-adding a way to flash or power a board is a new executable rather than a
-change here.
+the reaching. A backend is invoked with a verb, reads its inventory as
+JSON on stdin, and reports as JSON on stdout, so adding a way to flash or
+power a board is a new executable rather than a change here
+([the protocol](../architecture/rig-backend-protocol.md)).
 
 ```
 fluxor rig test --scenario <scenario>.toml --rig <rig>
@@ -26,14 +26,16 @@ off as a no-op, and the record says so. A teardown that does not complete
 rig marked; the next `fluxor rig test` on it finishes the teardown before
 doing anything else, and `fluxor rig teardown --rig <rig>` does it by
 hand. `fluxor rig teardown --all` goes through every rig in the lab and
-then asks each power backend to sweep for anything of the lab's it can
+then asks each power backend — once per distinct binding, whatever the
+rigs' own teardowns came to — to sweep for anything of the lab's it can
 still see running.
 
 A failed run can be kept for inspection: `--hold <minutes>` leaves the
-rig as the run left it until the time is up or Enter is pressed, then
-tears down. A board whose images leave the host (a cloud machine) needs
-`--hold` on `fluxor rig power on` too, because an `on` with no end would
-leave a machine running somewhere.
+rig as the run left it until the time is up, Enter is pressed or Ctrl-C
+arrives, then tears down. A run that a signal ended is torn down at
+once. A board whose images leave the host (a cloud machine) needs
+`--hold` on `fluxor rig power on` and `cycle` too, because an `on` with
+no end would leave a machine running somewhere.
 
 ## Pico 2 W over USB
 
@@ -51,8 +53,11 @@ Host setup, once:
 echo 'SUBSYSTEM=="usb", ATTRS{idVendor}=="2e8a", MODE="0666", TAG+="uaccess"' \
   | sudo tee /etc/udev/rules.d/99-picotool.rules
 sudo udevadm control --reload-rules && sudo udevadm trigger
-make install     # puts the backends on the discovery path
 ```
+
+The deploy, power and console backends for the board go on the discovery
+path — `$FLUXOR_BACKEND_PATH`, or `~/.local/share/fluxor/backends/`;
+`make install` links the ones a checkout carries.
 
 Which board is attached, and how it is reached, is a rig profile — held
 outside any repository, under `~/.config/fluxor/labs/<lab>/rigs/<rig>.toml`.
@@ -74,9 +79,11 @@ tags = ["wifi", "usb"]
 [deploy.picotool]
 serial = "<chip-id>"
 
-# "Power" on a USB-powered board is a reboot through the reset interface.
+# "Power" on a USB-powered board is a reboot through the reset interface,
+# done by the `power-<name>` backend this names. The other keys are that
+# backend's own.
 [power]
-backend = "picotool"
+backend = "<name>"
 serial = "<chip-id>"
 boot_delay_ms = 3000
 
@@ -136,7 +143,7 @@ output, run records and profile hashes show it redacted.
 Omitting the SSID is legal — the wifi module then scans instead of
 associating, which is a real mode — but the build warns, naming every
 source it tried, and the module says the same thing on its own console.
-Without that, the consequence surfaced far from the cause: cyw43 never
+The consequence otherwise shows up far from the cause: cyw43 never
 reaches link up, never announces its MAC, and `ip` sits at `[ip] waiting
 for mac` for the life of the board, with every line in that chain
 individually unalarming.
@@ -179,14 +186,15 @@ kernel says when it has given up — `[fault] pc=`, `[cyw43] halt phase=`,
 A `[[pass]]` that never arrives fails only when the whole timeout runs
 out, and the verdict then says nothing about where the boot stopped.
 `[[expect]]` rules put deadlines on the way: `within_s` says a line must
-appear that soon after power, `max_silence_s` says the source must not
-go quiet for longer than that, and a missed expectation fails the run at
-once, naming the rule.
+appear that soon after the power step (or after the source reports a
+fresh boot, if that is later), `max_silence_s` says the source, once it
+has spoken, must not go quiet for longer than that, and a missed
+expectation fails the run at once, naming the rule.
 
 ```toml
 [[expect]]
-source = "console.serial"
-regex = "\\[boot\\] stages="
+source = "console.usb_cdc"
+regex = "\\[boot\\] ready modules="
 within_s = 10
 ```
 

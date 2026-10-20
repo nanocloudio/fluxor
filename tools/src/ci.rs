@@ -239,10 +239,12 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
 
     // ───── Makefile standard ─────────────────────────────────────────────
     //
-    // Holds this project's Makefile to the Makefile standard. A CLI verb that
-    // moves strands the help text and the scripts naming it across every
-    // checkout, and each one is then found by hand. This phase reads the live
-    // CLI, so the standard is enforced where it is violated.
+    // Holds the Makefile of this project, and of every project nested in
+    // it, to the Makefile standard, together with the scripts each one's
+    // recipes call. A CLI verb that moves strands the help text and the
+    // scripts naming it across every checkout, and each one is then found by
+    // hand. This phase reads the live CLI, so the standard is enforced where
+    // it is violated.
     results.push(if skip.lint {
         skipped("makefile")
     } else {
@@ -287,7 +289,8 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
 
     // ───── catalog drift ─────────────────────────────────────────────────
     //
-    // `stacks/` and `targets/` are the one build input nothing pinned.
+    // The platform catalog — `stacks/` and `targets/` in the fluxor
+    // checkout — is the one build input nothing pins.
     // They are read live from the fluxor checkout while the modules they
     // configure come from digests in `fluxor.lock`, so a stack edited in
     // a sibling checkout changes every downstream build at once, with no
@@ -421,8 +424,8 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
     // source but absent here is a bug" — a rule that is true only while
     // something checks it, which is what this phase is.
     //
-    // Omitted entirely for a project with no register: not yet having
-    // written one is not a failure of the gate over it.
+    // Omitted entirely for a project with no register: there is nothing
+    // for the gate to hold.
     {
         let register_rel = limit_register_path(project_root);
         let coverage_fails = limit_register_coverage_fails(project_root);
@@ -603,22 +606,23 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
         run_step("examples", verbose, || run_examples(project_root))
     });
 
-    // ───── service bundles ───────────────────────────────────────────────
+    // ───── packaging ─────────────────────────────────────────────────────
     //
-    // A service bundle ships a graph TEMPLATE plus a parameter schema, and
-    // a consumer runs it without reading either. So the schema and the
-    // template are checked here, by the producer, against each other and
-    // rendered with the declared defaults and examples through the same
-    // `build --check` a plain graph takes — after the module build, for the
-    // same reason as the examples phase. Omitted when the project ships no
-    // service manifest.
-    let service_manifests = crate::service_params::service_manifests(project_root);
-    if !service_manifests.is_empty() {
+    // What the project ships is exactly what `packaging::discover` finds,
+    // and `fluxor publish` publishes nothing else, so this phase checks each
+    // shippable the way the publish reads it: every stack parses, versions
+    // and renders, and composes only modules a consumer can find; every
+    // bundle's linux graphs, includes expanded and rendered with their
+    // params' defaults and examples, pass the same `build --check` a plain
+    // graph does — after the module build, for the same reason as the
+    // examples phase. Omitted when the project ships nothing.
+    let shippables = crate::packaging::discover(project_root);
+    if !shippables.stacks.is_empty() || !shippables.bundles.is_empty() {
         results.push(if skip.lint {
-            skipped("service-bundles")
+            skipped("packaging")
         } else {
-            run_step("service-bundles", verbose, || {
-                run_service_bundles(project_root, &service_manifests)
+            run_step("packaging", verbose, || {
+                run_packaging(project_root, &shippables)
             })
         });
     }
@@ -638,15 +642,13 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
     // month fails here with a number attached instead of arriving one day as
     // a link error at the cliff, or as a slot that no longer holds the graph
     // the firmware region does.
-    results.push(
-        if skip.kernel || !is_fluxor_kernel_workspace(project_root) {
-            skipped("kernel-link (rp)")
-        } else {
-            run_step("kernel-link (rp)", verbose, || {
-                run_kernel_link_budget(project_root, verbose)
-            })
-        },
-    );
+    results.push(if skip.kernel || !runs_kernel_link(project_root) {
+        skipped("kernel-link (rp)")
+    } else {
+        run_step("kernel-link (rp)", verbose, || {
+            run_kernel_link_budget(project_root, verbose)
+        })
+    });
 
     // ───── project test scripts (E2E gate) ───────────────────────────────
     //
@@ -883,7 +885,8 @@ fn clippy_downstream(project_root: &Path) -> std::result::Result<(), String> {
 /// linted in a single `cargo clippy --workspace` invocation because
 /// the kernel's default features pull embedded-only deps that don't
 /// compile on the host; each entry below is one self-consistent
-/// build configuration matching `fluxor lint`.
+/// build configuration. `fluxor lint` runs the first, the host tools,
+/// alone: the rest compile per target and belong to the gate.
 fn clippy_matrix(project_root: &Path) -> std::result::Result<(), String> {
     let matrix: &[ClippyJob<'_>] = &[
         // Host tools — all features enabled.
@@ -1301,9 +1304,9 @@ pub(crate) fn live_staleness_scope(project_root: &Path) -> crate::store_sync::St
 
 /// Resolve the host-tools cargo crate path relative to the project
 /// root. Order: explicit `[ci.cargo] host_tools_crate` in
-/// `fluxor.toml` → conventional `tools/` if present → `None`. The
-/// `cargo-test (tools)` phase reports "skipped" when this returns
-/// `None` instead of producing a spawn-failed error.
+/// `fluxor.toml` → conventional `tools/` if present → `None`. With
+/// `None` the unit-test phase runs at the workspace root, or is omitted
+/// when there is no cargo tree ([`unit_site_for`]).
 pub(crate) fn load_host_tools_crate(project_root: &Path) -> Option<String> {
     let fp = project_root.join("fluxor.toml");
     if fp.exists() {
@@ -1700,36 +1703,14 @@ fn release_cli_dir(shim_parent: &Path) {
 ///
 /// Uses `git ls-files` rather than a directory walk so untracked local
 /// experiments — which may legitimately name sibling-repo modules — are not
-/// gated on. A repo without git, or without tracked examples, passes trivially.
+/// gated on. A repo without git, or without tracked examples, passes
+/// trivially. A graph with `params:` is checked with each param's default,
+/// else its example; a stack document is checked as a stack.
 fn run_examples(project_root: &Path) -> std::result::Result<(), String> {
     // Versioned examples, from BOTH repos: a project may keep its
     // examples in the primary repo or in a separate tracking repo.
-    // Enumerating one repo silently gates a subset: the graphs tracked in
-    // the other repo are on disk and never checked.
-    let mut listing: BTreeSet<String> = BTreeSet::new();
-    for git_dir in [None, Some(project_root.join(".git-shadow"))] {
-        let mut cmd = Command::new("git");
-        if let Some(d) = &git_dir {
-            if !d.is_dir() {
-                continue;
-            }
-            cmd.arg("--git-dir")
-                .arg(d)
-                .arg("--work-tree")
-                .arg(project_root);
-        }
-        cmd.args(["ls-files", "examples/*.yaml", "examples/**/*.yaml"])
-            .current_dir(project_root);
-        if let Ok(out) = cmd.output() {
-            listing.extend(
-                String::from_utf8_lossy(&out.stdout)
-                    .lines()
-                    .filter(|l| !l.trim().is_empty())
-                    .map(str::to_string),
-            );
-        }
-    }
-    let templates = service_templates(project_root);
+    let listing =
+        crate::project::tracked_files(project_root, &["examples/*.yaml", "examples/**/*.yaml"]);
     let mut failures: Vec<String> = Vec::new();
     let mut checked = 0usize;
     for rel in &listing {
@@ -1740,10 +1721,11 @@ fn run_examples(project_root: &Path) -> std::result::Result<(), String> {
         if rel.contains("test_harness/") || rel.contains("/bundle/") {
             continue;
         }
-        // A service template names parameters only a run supplies; the
-        // service-bundles phase checks it rendered.
         let abs = project_root.join(rel);
-        if templates.contains(&abs.canonicalize().unwrap_or(abs)) {
+        // A graph inside a nested project — a directory under `examples/`
+        // with its own `fluxor.toml` or `.fluxor` — resolves against that
+        // project's pins, and that project's own CI checks it.
+        if !crate::project::is_own_file(project_root, &abs) {
             continue;
         }
         // Tracked in an index but absent from disk. Build-checking it
@@ -1751,7 +1733,7 @@ fn run_examples(project_root: &Path) -> std::result::Result<(), String> {
         // an index (commonly the shadow one) still lists a file a
         // deletion removed. Distinguishing this from a broken graph is
         // the difference between "fix your config" and "fix your index".
-        if !project_root.join(rel).exists() {
+        if !abs.exists() {
             failures.push(format!(
                 "{rel}: tracked but not on disk — a git index still lists it after \
                  the file was deleted; drop the entry (`git rm --cached`) in \
@@ -1804,58 +1786,47 @@ fn build_check_detail(o: &std::process::Output) -> String {
         .to_string()
 }
 
-/// Graphs a service manifest ships as templates. They name parameters the
-/// examples phase has no values for; the service-bundles phase checks them
-/// rendered instead.
-fn service_templates(project_root: &Path) -> BTreeSet<PathBuf> {
-    crate::service_params::service_manifests(project_root)
-        .iter()
-        .filter_map(|m| crate::service_params::read_source(m).ok())
-        .flat_map(|src| src.implementations.into_iter().map(|(_, g)| g))
-        .map(|g| g.canonicalize().unwrap_or(g))
-        .collect()
-}
-
-/// Hold every service source manifest the project ships to its contract
-/// contract: the parameter schema is well-formed,
-/// every `${param:<name>}` its graphs carry is declared and every declared
-/// parameter is referenced, and each linux graph rendered with its defaults
-/// and examples passes the same `fluxor build --check` a plain graph does.
-///
-/// Discovery: `packaging/service/workload.toml`,
-/// `packaging/service/<name>/workload.toml` and `examples/<name>/workload.toml`
-/// whose role is `service`. The rendered graph is written under the project's
-/// `target/fluxor/ci-service/` so it resolves against this project.
-fn run_service_bundles(
+/// Hold every shippable to what its publish requires
+/// ([`crate::packaging`]): each stack is checked as `fluxor publish` checks
+/// it ([`crate::stack::check_publishable`]), and each bundle's linux graphs,
+/// read with their includes expanded and rendered with their params'
+/// defaults and examples ([`crate::packaging::check_bundle`]), pass
+/// `fluxor build --check`. A rendered graph is written under the project's
+/// `target/fluxor/ci-packaging/` so it resolves against this project.
+fn run_packaging(
     project_root: &Path,
-    manifests: &[PathBuf],
+    shippables: &crate::packaging::Shippables,
 ) -> std::result::Result<(), String> {
-    let mut failures = Vec::new();
-    let mut checked = 0usize;
-    for manifest in manifests {
-        let rel = manifest
-            .strip_prefix(project_root)
-            .unwrap_or(manifest)
+    let rel = |p: &Path| {
+        p.strip_prefix(project_root)
+            .unwrap_or(p)
             .display()
-            .to_string();
-        let graphs = match crate::service_params::check_source(manifest) {
+            .to_string()
+    };
+    let mut failures = Vec::new();
+    for stack in &shippables.stacks {
+        if let Err(e) = crate::stack::check_publishable(stack, project_root) {
+            failures.push(format!("{}: {e}", rel(stack)));
+        }
+    }
+    let mut checked = 0usize;
+    for (_, manifest) in &shippables.bundles {
+        let graphs = match crate::packaging::check_bundle(manifest, project_root) {
             Ok(g) => g,
             Err(e) => {
                 failures.push(e);
                 continue;
             }
         };
-        if graphs.is_empty() {
-            failures.push(format!("{rel}: no linux implementation to check"));
-            continue;
-        }
         checked += 1;
-        let name = crate::service_params::read_source(manifest)
-            .map(|s| s.name)
+        let name = manifest
+            .parent()
+            .and_then(Path::file_name)
+            .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
         for (i, (graph, rendered)) in graphs.iter().enumerate() {
             let dir = project_root
-                .join("target/fluxor/ci-service")
+                .join("target/fluxor/ci-packaging")
                 .join(format!("{name}-{i}"));
             let out = dir.join("graph.yaml");
             if let Err(e) =
@@ -1874,31 +1845,35 @@ fn run_service_bundles(
                 Ok(o) if o.status.success() => {}
                 Ok(o) => failures.push(format!(
                     "{} rendered with defaults and examples: {}",
-                    graph.display(),
+                    rel(graph),
                     build_check_detail(&o)
                 )),
-                Err(e) => failures.push(format!("{rel}: could not run build --check: {e}")),
+                Err(e) => failures.push(format!(
+                    "{}: could not run build --check: {e}",
+                    rel(manifest)
+                )),
             }
         }
     }
     if failures.is_empty() {
         return vacuity(
-            "service-bundles",
+            "packaging",
             checked,
-            manifests.len(),
-            "service source manifest(s) were found",
+            shippables.bundles.len(),
+            "bundle source manifest(s) were found",
             "no manifest reached its graphs",
         );
     }
     Err(format!(
-        "{} of {} service manifest(s) fail:\n  {}",
+        "{} shippable(s) fail:\n  {}",
         failures.len(),
-        manifests.len(),
         failures.join("\n  ")
     ))
 }
 
-/// Enforce the Makefile standard against this project's Makefile.
+/// Enforce the Makefile standard against this project's Makefile and the
+/// Makefile of every project nested in it: every project carries one, so
+/// `make publish` is `fluxor publish` everywhere.
 ///
 /// The rules themselves — preamble, target set, canonical recipe
 /// bodies, §3 recipe complexity — live in [`crate::makefile_lint`],
@@ -1909,28 +1884,44 @@ fn run_service_bundles(
 /// sibling repo weeks later. Nothing about the check needs updating
 /// when the CLI changes — it asks the binary.
 fn run_makefile(project_root: &Path) -> std::result::Result<(), String> {
-    let path = project_root.join("Makefile");
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return Ok(()); // fmod-only projects ship no Makefile
-    };
     let verbs = cli_verbs();
-    let mut problems: Vec<String> = crate::makefile_lint::check(&text, &verbs)
-        .iter()
-        .map(|v| v.render("Makefile"))
-        .collect();
+    let mut problems: Vec<String> = Vec::new();
+    for project in projects_in(project_root) {
+        let path = project.join("Makefile");
+        let label = path
+            .strip_prefix(project_root)
+            .unwrap_or(&path)
+            .display()
+            .to_string();
+        match std::fs::read_to_string(&path) {
+            Ok(text) => problems.extend(
+                crate::makefile_lint::check(&text, &verbs)
+                    .iter()
+                    .map(|v| v.render(&label)),
+            ),
+            Err(_) => problems.push(format!(
+                "{label}: missing — every project carries the standard Makefile, whose \
+                 lifecycle targets each delegate to the `fluxor` verb of the same name"
+            )),
+        }
 
-    // The scripts §3 sends complexity into are part of the same surface:
-    // a Makefile one line long that calls a script naming a removed verb
-    // is drift the Makefile check cannot see.
-    for script in shell_scripts(project_root) {
-        let Ok(body) = std::fs::read_to_string(project_root.join(&script)) else {
-            continue;
-        };
-        problems.extend(
-            crate::makefile_lint::check_script(&body, &verbs)
-                .iter()
-                .map(|v| v.render(&script)),
-        );
+        // The scripts §3 sends complexity into are part of the same
+        // surface: a Makefile one line long that calls a script naming a
+        // removed verb is drift the Makefile check cannot see.
+        for script in shell_scripts(&project) {
+            let Ok(body) = std::fs::read_to_string(project.join(&script)) else {
+                continue;
+            };
+            let label = project
+                .join(&script)
+                .strip_prefix(project_root)
+                .map_or_else(|_| script.clone(), |p| p.display().to_string());
+            problems.extend(
+                crate::makefile_lint::check_script(&body, &verbs)
+                    .iter()
+                    .map(|v| v.render(&label)),
+            );
+        }
     }
 
     if problems.is_empty() {
@@ -1942,21 +1933,26 @@ fn run_makefile(project_root: &Path) -> std::result::Result<(), String> {
     ))
 }
 
-/// Tracked `*.sh` under `tools/` and `scripts/` — the two directories
-/// §3 sanctions for recipe complexity and `fluxor help --make` walks.
-/// Tracked only, so an untracked local experiment is not gated.
+/// This project and every project nested in it that it versions (a
+/// directory with a tracked `fluxor.toml` or `.fluxor`), sorted.
+fn projects_in(project_root: &Path) -> Vec<PathBuf> {
+    let mut out: BTreeSet<PathBuf> =
+        crate::project::tracked_files(project_root, &["**/fluxor.toml", "**/.fluxor"])
+            .into_iter()
+            .filter_map(|rel| Path::new(&rel).parent().map(|p| project_root.join(p)))
+            .collect();
+    out.insert(project_root.to_path_buf());
+    out.into_iter().collect()
+}
+
+/// The project's own tracked `*.sh` under `tools/` and `scripts/`, at any
+/// depth — the two directories §3 sanctions for recipe complexity and
+/// `fluxor help --make` walks — from both of its repositories. Tracked only,
+/// so an untracked local experiment is not gated.
 fn shell_scripts(project_root: &Path) -> Vec<String> {
-    let Ok(out) = Command::new("git")
-        .args(["ls-files", "tools/*.sh", "scripts/*.sh"])
-        .current_dir(project_root)
-        .output()
-    else {
-        return Vec::new();
-    };
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .map(str::to_string)
+    crate::project::tracked_files(project_root, &["tools/*.sh", "scripts/*.sh"])
+        .into_iter()
+        .filter(|rel| crate::project::is_own_file(project_root, &project_root.join(rel)))
         .collect()
 }
 
@@ -2717,6 +2713,15 @@ fn run_scripts(
     }
 }
 
+/// The script the kernel-link phase builds each RP board's image with.
+pub(crate) const KERNEL_LINK_SCRIPT: &str = "tools/firmware.sh";
+
+/// Whether the gate runs the kernel-link phase here: in the kernel
+/// workspace, the one tree that builds RP kernel images.
+pub(crate) fn runs_kernel_link(project_root: &Path) -> bool {
+    is_fluxor_kernel_workspace(project_root)
+}
+
 /// Build (and therefore link) each RP board's kernel image, then hold its
 /// static RAM against the ceiling its silicon declares and the image itself
 /// against the flash reserve its silicon partitions the graph slots around.
@@ -2746,7 +2751,7 @@ fn run_kernel_link_budget(project_root: &Path, verbose: bool) -> std::result::Re
     for target in &boards {
         let board = target.board_id.as_deref().unwrap_or(&target.id);
         let silicon = &target.id;
-        let mut cmd = Command::new("tools/firmware.sh");
+        let mut cmd = Command::new(KERNEL_LINK_SCRIPT);
         cmd.arg(board).current_dir(project_root);
         let out = with_running_cli(&mut cmd)
             .output()
@@ -2775,10 +2780,10 @@ fn run_kernel_link_budget(project_root: &Path, verbose: bool) -> std::result::Re
         };
         // The board-scoped copy `firmware.sh` writes, never cargo's per-triple
         // path: two boards over one triple overwrite each other there, so that
-        // ELF belongs to whichever built last. Benign for the RP boards today
-        // (pico2w and waveshare-lcd4 compile identical features), and a
-        // wrong-board measurement the moment they diverge — which is exactly
-        // what pi5 and qemu-virt already do on aarch64-unknown-none.
+        // ELF belongs to whichever built last, which measures the wrong board
+        // whenever two boards on one triple build different images — as RP
+        // boards sharing a die may, through `[build] cargo_features` or their
+        // board facts, and as pi5 and qemu-virt do on aarch64-unknown-none.
         let elf = project_root.join(format!("target/{board}/firmware.elf"));
 
         let used = static_ram_bytes(&elf)?;
@@ -3255,6 +3260,53 @@ mod tests {
         assert!(dir.path().join("marker").is_file());
     }
 
+    /// The makefile phase reaches every project the repository versions: the
+    /// root and each nested project, with each one's own tracked scripts,
+    /// and never a nested project's scripts as the root's.
+    #[test]
+    fn makefile_phase_covers_nested_projects_and_their_scripts() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let files = [
+            "fluxor.toml",
+            "tools/firmware.sh",
+            "tools/img/verify.sh",
+            "examples/app/fluxor.toml",
+            "examples/app/tools/run.sh",
+            "examples/untracked/fluxor.toml",
+        ];
+        for f in files {
+            let path = root.join(f);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "true\n").unwrap();
+        }
+        let git = |args: &[&str]| {
+            let ok = Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        git(&[
+            "add", "--", files[0], files[1], files[2], files[3], files[4],
+        ]);
+
+        assert_eq!(
+            projects_in(root),
+            [root.to_path_buf(), root.join("examples/app")],
+            "an untracked project is not versioned by this one"
+        );
+        assert_eq!(
+            shell_scripts(root),
+            ["tools/firmware.sh", "tools/img/verify.sh"]
+        );
+        assert_eq!(shell_scripts(&root.join("examples/app")), ["tools/run.sh"]);
+    }
+
     /// The `[ci] live_staleness` key: absent or unreadable → the safe
     /// default; an unrecognised value likewise (the schema phase is what
     /// reports the typo, not this reader).
@@ -3379,10 +3431,9 @@ mod tests {
 
     #[test]
     fn abi_version_constant_is_in_range() {
-        // The pinned `[required].fluxor.abi` value in every shipped
-        // fluxor.toml today is 1; if `wire::ABI_VERSION` ever bumps,
-        // the corresponding fluxor.toml files must bump in lockstep
-        // (and this assertion becomes a reminder to do so).
+        // Every shipped fluxor.toml pins `[required].fluxor.abi = 1`, the
+        // value `wire::ABI_VERSION` carries; the two move together, and this
+        // assertion is what fails when one moves alone.
         assert_eq!(u32::from(crate::wire::ABI_VERSION), 1);
     }
 
