@@ -261,7 +261,7 @@ unsafe fn linux_namespace_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
     // A workload's namespace is its own store's: never the host filesystem
     // and never the node's store.
     let owner = fluxor::kernel::exec::scheduler::caller_owner();
-    if !owner.is_system() {
+    if fluxor::platform::linux::owner_root::rooted(owner) {
         let Some(store) = fluxor::platform::linux::owner_root::store_for(owner) else {
             return errno::EACCES;
         };

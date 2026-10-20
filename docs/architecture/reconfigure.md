@@ -127,6 +127,41 @@ opened each handle and refuses it to any other, so the hook alone is enough
 for nothing a workload opened to outlive it. On bcm2712 the store is the
 node's alone, so a workload holds nothing there to release.
 
+An owner acting with the node's authority (below) has no root. Its hook closes
+the files, host processes and node-store handles it opened (on bcm2712, the
+store handles) and removes nothing from the node's storage.
+
+## Adding a Subgraph with the Node's Authority
+
+Every live add is an owner of its own: it is freed, paused, charged and
+released as one. By default it is also a workload — walled from the node's
+provider layers, its storage rooted. A node component that places subgraphs
+to act on its own behalf (an operator shell running a user's commands) sets
+`ADD_FLAG_CREATOR_AUTHORITY` (`0x0001`) in the `AddSubgraph` header's `flags`
+(bytes 6..8, big-endian). The owner then acts with the
+node's authority: it reaches the node's provider layers and the platform's
+storage as the node does, and spawns host processes, while everything it
+opens is still stamped with its own owner and goes with it.
+
+The rule, enforced by the decoder and the add:
+
+- Only `APPLY_ADD` from a module honours the flag; the calling module is the
+  add's creator. The creator must itself act with the node's authority (a
+  node module, or a module of an owner admitted this way); a workload creator
+  is refused `EACCES` before anything is allocated, so a workload can neither
+  pass on what it does not hold nor gain it through an add of its own.
+- Every other path that decodes an `AddSubgraph` names no creator and refuses
+  the flag `EINVAL`: a workload `CREATE` (whose blob comes from off the node)
+  and a boot graph's resident workloads.
+- Every undefined flag bit is refused `EINVAL` on every path.
+
+The owner holds no storage grant (no root is ever made for it), and its
+authority is recorded on the owner table entry (`Authority::Node`), read
+through `OwnerTable::authority_of` and `scheduler::caller_authority()`. What a
+call reaches is decided by the caller's authority; what it holds is stamped
+with `scheduler::caller_owner()`. `CALLER_OWNER` answers the owner, so a
+provider scoping per consumer (scratch space) still scopes per subgraph.
+
 ## Modules for Workloads Staged at Runtime
 
 A subgraph staged after boot names its modules by type, and a type resolves

@@ -598,7 +598,7 @@ use crate::abi::fence::{Fence, QUERY_OP, WIRE_MAX_LEN};
 use crate::kernel::ipc::channel::channel_write;
 use crate::kernel::ipc::fd::{slot_of, tag_fd, FD_TAG_STORAGE_NAMESPACE, FD_TAG_STORAGE_OBJECT};
 use crate::kernel::sys::errno;
-use crate::kernel::workload::owner::OwnerHandle;
+use crate::kernel::workload::owner::{OwnerHandle, OWNER_SYSTEM};
 use crate::kernel::workload::storage::store_entry_cost;
 
 /// `CONTENT_TYPES` byte for `NamespaceChange` (`contracts/src/lib.rs`). A
@@ -633,12 +633,15 @@ struct Sub {
     watch: WatchId,
     sink_chan: u32,
     sequence: u32,
+    /// The owner that subscribed, which the slot goes with.
+    opener: OwnerHandle,
 }
 const SUB_EMPTY: Sub = Sub {
     in_use: false,
     watch: WatchId(0),
     sink_chan: 0,
     sequence: 0,
+    opener: OWNER_SYSTEM,
 };
 
 /// A GET-opened read slot: a value snapshot the caller drains via RANGE_GET.
@@ -648,12 +651,15 @@ struct ReadSlot {
     revision: u64,
     /// The grant the slot was opened under, which it dies with.
     grant: Option<usize>,
+    /// The owner that opened the slot, which it goes with.
+    opener: OwnerHandle,
 }
 const READ_EMPTY: ReadSlot = ReadSlot {
     in_use: false,
     value: Vec::new(),
     revision: 0,
     grant: None,
+    opener: OWNER_SYSTEM,
 };
 
 /// A `PUT_STREAMED_OPEN`-opened write slot: the bytes staged so far, and the
@@ -676,6 +682,8 @@ struct WriteSlot {
     precondition: Precondition,
     /// The grant the slot was opened under, which it dies with.
     grant: Option<usize>,
+    /// The owner that opened the slot, which it goes with.
+    opener: OwnerHandle,
 }
 const WRITE_EMPTY: WriteSlot = WriteSlot {
     in_use: false,
@@ -684,6 +692,7 @@ const WRITE_EMPTY: WriteSlot = WriteSlot {
     staged: Vec::new(),
     precondition: Precondition::Any,
     grant: None,
+    opener: OWNER_SYSTEM,
 };
 
 /// A store and the handles its callers hold on it: the `GET` reads, streamed
@@ -1067,6 +1076,43 @@ unsafe fn store_ref() -> Option<&'static mut Served> {
     (*core::ptr::addr_of_mut!(LINUX_STORE)).as_mut()
 }
 
+/// Close every handle `opener` holds on the node's store: its `GET` reads,
+/// its streamed writes (their staged bytes dropped, nothing committed) and
+/// its subscriptions. Part of the platform's owner-release hook, for an
+/// owner that acted with the node's authority: what it opened goes with it.
+/// A workload's own store goes whole with its root.
+///
+/// # Safety
+/// Single-threaded platform dispatch only.
+pub unsafe fn release_opener(opener: OwnerHandle) {
+    let Some(served) = store_ref() else {
+        return;
+    };
+    for r in served
+        .reads
+        .iter_mut()
+        .filter(|r| r.in_use && r.opener == opener)
+    {
+        *r = READ_EMPTY;
+    }
+    for w in served
+        .writes
+        .iter_mut()
+        .filter(|w| w.in_use && w.opener == opener)
+    {
+        // The node's store charges no one: there is nothing to give back.
+        *w = WRITE_EMPTY;
+    }
+    for s in served
+        .subs
+        .iter_mut()
+        .filter(|s| s.in_use && s.opener == opener)
+    {
+        served.store.unsubscribe(s.watch);
+        *s = SUB_EMPTY;
+    }
+}
+
 /// What a `PUT` changes in its owner's charge: the cost of the new entry
 /// over the one it replaces, or the other way round.
 struct PutCharge {
@@ -1341,7 +1387,12 @@ pub unsafe fn dispatch_object_on(
     arg: *mut u8,
     arg_len: usize,
 ) -> i32 {
-    let owner = crate::kernel::exec::scheduler::caller_owner();
+    // A slot goes with the owner that opened it; what is written is charged
+    // to the authority the caller acts with — the node, which is never
+    // charged, for its own modules and for an owner acting with its
+    // authority.
+    let opener = crate::kernel::exec::scheduler::caller_owner();
+    let owner = crate::kernel::exec::scheduler::owners().authority_of(opener);
     let stage_max = served.stage_max;
     let store = &mut served.store;
     let subs = &mut served.subs;
@@ -1532,6 +1583,7 @@ pub unsafe fn dispatch_object_on(
                 staged: Vec::with_capacity(expected.min(STORE_STAGE_RESERVE_MAX) as usize),
                 precondition,
                 grant,
+                opener,
             };
             tag_fd(FD_TAG_STORAGE_OBJECT, (WRITE_SLOT_BASE + idx) as i32)
         }
@@ -1635,6 +1687,7 @@ pub unsafe fn dispatch_object_on(
                 value: val,
                 revision: rev,
                 grant,
+                opener,
             };
             tag_fd(FD_TAG_STORAGE_OBJECT, idx as i32)
         }
@@ -1840,6 +1893,7 @@ pub unsafe fn dispatch_namespace_on(
     arg: *mut u8,
     arg_len: usize,
 ) -> i32 {
+    let opener = crate::kernel::exec::scheduler::caller_owner();
     let store = &mut served.store;
     let subs = &mut served.subs;
     // Per-handle fence introspection (LOOKUP/SUBSCRIBE handle): a view fence at
@@ -1942,6 +1996,7 @@ pub unsafe fn dispatch_namespace_on(
                     watch: wid,
                     sink_chan,
                     sequence: 0,
+                    opener,
                 };
                 for (k, rev) in items {
                     let val = store.get(&k).map(|(v, _)| v.to_vec());
@@ -1976,6 +2031,7 @@ pub unsafe fn dispatch_namespace_on(
                 watch,
                 sink_chan,
                 sequence: 0,
+                opener,
             };
             tag_fd(FD_TAG_STORAGE_NAMESPACE, idx as i32)
         }

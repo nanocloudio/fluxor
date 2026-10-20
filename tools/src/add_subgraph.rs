@@ -28,7 +28,7 @@
 //! FLXA layout (big-endian):
 //!
 //! ```text
-//! header  magic u32 "FLXA" | version u16 = 1 | reserved u16 = 0
+//! header  magic u32 "FLXA" | version u16 = 1 | flags u16 = 0
 //!         owner_uid [16] | state_cap u32 | buffer_cap u32
 //!         module_count u8 | edge_count u8
 //! module  name_hash u32 | domain_id u8
@@ -37,6 +37,11 @@
 //! edge    from_kind u8 | from_idx u16 | from_port u8
 //!         to_kind u8 | to_idx u16 | to_port u8 | buffer_bytes u32
 //! ```
+//!
+//! A workload composed here is its own authority: `flags` is always 0. Its
+//! one bit, `ADD_FLAG_CREATOR_AUTHORITY`, is honoured only from a node
+//! module's `APPLY_ADD` and refused on the workload `CREATE` path this blob
+//! takes.
 //!
 //! The module record's step budget carries the module's YAML
 //! `step_deadline_us`, `step_deadline_burst_us` and `fault_policy`, as a
@@ -264,7 +269,7 @@ pub fn encode_add_subgraph(workload: &Workload) -> Result<Vec<u8>, String> {
     let mut b = Vec::new();
     b.extend_from_slice(&ADD_MAGIC.to_be_bytes());
     b.extend_from_slice(&ADD_VERSION.to_be_bytes());
-    b.extend_from_slice(&0u16.to_be_bytes()); // reserved
+    b.extend_from_slice(&0u16.to_be_bytes()); // flags: a workload's own authority
     b.extend_from_slice(&workload.workload_uid);
     b.extend_from_slice(&workload.state_cap.to_be_bytes());
     b.extend_from_slice(&workload.buffer_cap.to_be_bytes());
@@ -377,7 +382,7 @@ mod tests {
             idle_safe: false,
         };
         let b = encode_add_subgraph(&workload).unwrap();
-        // magic (BE), version (BE), reserved.
+        // magic (BE), version (BE), flags.
         assert_eq!(&b[0..4], &ADD_MAGIC.to_be_bytes());
         assert_eq!(&b[4..6], &ADD_VERSION.to_be_bytes());
         assert_eq!(&b[6..8], &[0, 0]);

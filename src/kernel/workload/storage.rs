@@ -66,6 +66,13 @@ pub const fn store_entry_cost(key_len: usize, value_len: usize) -> u64 {
 /// can take the table the node and every other workload open files from.
 pub const OWNER_MAX_OPEN_FILES: usize = 32;
 
+/// Whether `owner`'s storage is rooted: a workload's is. The node's storage
+/// is the node's own, and so is that of an owner acting with the node's
+/// authority; the platform neither roots, charges nor removes it.
+pub fn rooted(owner: OwnerHandle) -> bool {
+    !scheduler::owners().authority_of(owner).is_system()
+}
+
 /// Whether `owner` may come to hold storage: one whose grant gives it a
 /// root, being admitted or running. An owner being drained or revoked makes
 /// no root, so nothing it does on its way out can bring back a root its

@@ -1822,8 +1822,15 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
             {
                 // SAFETY: `arg`/`arg_len` describe the caller's request buffer,
                 // valid for this call; the decoder borrows module params from it
-                // in place and writes the owner handle back into it.
-                unsafe { scheduler::live::apply_add_encoded(arg, arg_len) }
+                // in place and writes the owner handle back into it. The
+                // calling module is the add's creator.
+                unsafe {
+                    scheduler::live::apply_add_encoded_by(
+                        arg,
+                        arg_len,
+                        scheduler::current_module_index(),
+                    )
+                }
             }
             #[cfg(not(feature = "multitenant"))]
             {

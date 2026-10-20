@@ -2476,6 +2476,17 @@ fn bcm_init_providers() {
     // released. Without it every workload `fs` call answers ENOSYS.
     // SAFETY: single-threaded boot, before any provider dispatch.
     unsafe { fluxor::platform::owner_root::init(fluxor::platform::owner_root::node_fs) };
+    // The board's owner-release hook: an owner's root, and the store handles
+    // an owner acting with the node's authority opened.
+    provider::register_owner_release_hook(bcm_owner_released);
+}
+
+/// Release what a released owner holds of the board's storage: its root
+/// (`owner_root`), and the store handles it opened (`store`).
+fn bcm_owner_released(owner: fluxor::kernel::workload::owner::OwnerHandle) {
+    fluxor::platform::owner_root::release(owner);
+    // SAFETY: owner release runs on the scheduler thread, as every dispatch.
+    unsafe { fluxor::platform::store::release_opener(owner) };
 }
 
 /// Metal `workload` (0x1A) provider dispatch — the thin bcm registration hook.

@@ -63,7 +63,7 @@ unsafe fn linux_object_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
     // A workload's objects are its own store's: never the HTTP origin and
     // never the node's store.
     let owner = fluxor::kernel::exec::scheduler::caller_owner();
-    if !owner.is_system() {
+    if fluxor::platform::linux::owner_root::rooted(owner) {
         let Some(store) = fluxor::platform::linux::owner_root::store_for(owner) else {
             return obj_errno::EACCES;
         };

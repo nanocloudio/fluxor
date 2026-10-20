@@ -18,6 +18,14 @@
 //! authorization helpers ([`same_or_system`]) compile to `true`. Owner fields
 //! on graph objects are themselves `#[cfg(feature = "multitenant")]`, so
 //! bare-metal targets carry no per-object ownership state.
+//!
+//! Authority: an owner is also the authority its modules act with, unless it
+//! was admitted to act with the node's ([`Authority::Node`]). The owner
+//! handle stays the lifecycle — what is stamped, charged, paused, freed and
+//! released — while [`OwnerTable::authority_of`] answers whose authority a
+//! call carries: which provider layers it reaches and whether the platform
+//! roots its storage. Only a live add that a node-authority module places
+//! with `ADD_FLAG_CREATOR_AUTHORITY` acts with the node's.
 
 use crate::kernel::workload::storage::StorageGrant;
 
@@ -119,6 +127,17 @@ impl OwnerAccounting {
     };
 }
 
+/// Whose authority an owner's modules act with.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Authority {
+    /// Its own: a workload, walled from the node's providers and rooted in
+    /// storage of its own.
+    Own,
+    /// The node's: it reaches the node's provider layers and the platform's
+    /// storage unrooted, as the node does, while its lifecycle stays its own.
+    Node,
+}
+
 /// One entry in the owner table.
 #[derive(Clone, Copy)]
 pub struct OwnerEntry {
@@ -126,6 +145,7 @@ pub struct OwnerEntry {
     pub generation: u32,
     pub state: OwnerState,
     pub acct: OwnerAccounting,
+    pub authority: Authority,
 }
 
 impl OwnerEntry {
@@ -134,6 +154,7 @@ impl OwnerEntry {
         generation: 0,
         state: OwnerState::Free,
         acct: OwnerAccounting::ZERO,
+        authority: Authority::Own,
     };
 
     const SYSTEM: OwnerEntry = OwnerEntry {
@@ -141,6 +162,7 @@ impl OwnerEntry {
         generation: 0,
         state: OwnerState::Active,
         acct: OwnerAccounting::ZERO,
+        authority: Authority::Node,
     };
 }
 
@@ -186,6 +208,7 @@ impl OwnerTable {
                     generation,
                     state: OwnerState::Reserved,
                     acct: OwnerAccounting::ZERO,
+                    authority: Authority::Own,
                 };
                 return Some(OwnerHandle {
                     slot: slot as u16,
@@ -239,6 +262,7 @@ impl OwnerTable {
             generation,
             state: OwnerState::Active,
             acct,
+            authority: Authority::Own,
         };
         Some(OwnerHandle { slot, generation })
     }
@@ -359,6 +383,7 @@ impl OwnerTable {
         e.state = OwnerState::Free;
         e.owner_uid = [0; 16];
         e.acct = OwnerAccounting::ZERO;
+        e.authority = Authority::Own;
         true
     }
 
@@ -372,6 +397,7 @@ impl OwnerTable {
             e.state = OwnerState::Free;
             e.owner_uid = [0; 16];
             e.acct = OwnerAccounting::ZERO;
+            e.authority = Authority::Own;
         }
     }
 
@@ -405,6 +431,34 @@ impl OwnerTable {
                 true
             }
             None => false,
+        }
+    }
+
+    /// Admit an owner to act with the node's authority. Its storage grant
+    /// becomes `None`: it reaches the node's storage as the node does, so the
+    /// platform never makes it a root. Returns `false` for a stale handle.
+    pub fn set_node_authority(&mut self, h: OwnerHandle) -> bool {
+        match self.lookup_mut(h) {
+            Some(e) => {
+                e.authority = Authority::Node;
+                e.acct.storage_grant = StorageGrant::None;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The authority `h` acts with: [`OWNER_SYSTEM`] for the system owner and
+    /// for an owner admitted with the node's authority, `h` itself otherwise
+    /// — including a handle that no longer resolves, which so fails closed as
+    /// the workload it was.
+    pub fn authority_of(&self, h: OwnerHandle) -> OwnerHandle {
+        if h.is_system() {
+            return OWNER_SYSTEM;
+        }
+        match self.lookup(h) {
+            Some(e) if e.authority == Authority::Node => OWNER_SYSTEM,
+            _ => h,
         }
     }
 

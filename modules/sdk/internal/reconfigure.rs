@@ -69,8 +69,9 @@ pub const SLOT_CAPACITY: u32 = 0x0C23;
 // permission classifier's catch-all in src/kernel/syscalls.rs.
 
 /// Add a new owner's subgraph to the running graph.
-/// handle=-1, arg = bounded binary `AddSubgraph` (magic `FLXA`, version, body,
-/// trailing sha256 — same discipline as the composed plan codec). On success
+/// handle=-1, arg = bounded binary `AddSubgraph` (magic `FLXA`, version,
+/// flags, body; validated for structure and bounds — the channel, not the
+/// blob, is authenticated). On success
 /// the kernel writes the 6-byte `OwnerHandle` (`slot:u16 LE, generation:u32 LE`)
 /// into the first 6 bytes of `arg`. Returns 0 on success, negative `AddError`
 /// otherwise. NOTE: the on-wire form carries PIC modules (by `name_hash` +
@@ -78,6 +79,15 @@ pub const SLOT_CAPACITY: u32 = 0x0C23;
 /// the async-load follow-up lands. In-process callers use `scheduler::apply_add`
 /// directly (built-in or already-resident modules).
 pub const APPLY_ADD: u32 = 0x0C47;
+/// `AddSubgraph` header flag: the new owner acts with its creator's
+/// authority. Honoured only from the module syscall, and only when the
+/// calling module acts with the node's authority: the owner then reaches the
+/// node's provider layers and the platform's storage as the node does, while
+/// it is still freed, paused, charged and released as an owner of its own.
+/// A workload caller is refused `EACCES`; any other path that decodes an
+/// `AddSubgraph` (a workload `CREATE`, a boot graph) refuses the flag
+/// `EINVAL`, as it refuses every undefined flag bit.
+pub const ADD_FLAG_CREATOR_AUTHORITY: u16 = 0x0001;
 /// Free an owner: stop its modules, close its edges, reclaim its state, and
 /// revoke the handle (the generation guard rejects it thereafter).
 /// handle=-1, arg = `[slot:u16 LE, generation:u32 LE]`. Returns 0 on success,

@@ -120,6 +120,15 @@ No module may register it: the loader's registration is refused
 a provider first. `file_block`'s `volume: platform` is how an image file
 on the host sits under a graph-local filesystem built on it.
 
+Every provider of `fs` hands out handles tagged `FD_TAG_FS`, and the
+kernel routes an `fs` op by that tag. An `fs` op on a handle without it — a
+descriptor field never opened (0), or a bare slot number — is refused
+`EBADF` before it reaches a provider, rather than landing on whichever file
+holds that slot now, another module's.
+On Linux a handle also carries its slot's generation, bumped each time the
+slot is claimed: a handle kept past its close (a second close, a stale copy)
+answers `EBADF` rather than reaching the file that took the slot next.
+
 A handle minted through any selector is **routed**: the kernel returns
 its own handle in the provider's place — same contract tag, a slot in
 its route table — and records which provider minted it and what that
@@ -772,6 +781,14 @@ own owner. The node's provider modules (its `fat32`, its `fs_object`, its
 `mount`) are invisible to a workload, and a workload's own provider modules
 serve that workload alone, so a workload can neither reach the node through
 the node's providers nor stand in as the node's.
+
+An owner admitted to act with the node's authority (`ADD_FLAG_CREATOR_AUTHORITY`,
+see [reconfigure.md](reconfigure.md#adding-a-subgraph-with-the-nodes-authority))
+is not a workload here. It reaches the node's provider layers as the node does,
+and the platform providers serve it unrooted: host paths on Linux, the node's
+store, nothing charged to a ledger and no root made or removed. Its own layers
+still serve it alone, unseen by the node and by its siblings, and every handle
+it opens is stamped with its own owner and closed when it is released.
 
 What a workload reaches of the node's storage is what its admission
 granted, recorded on its owner. A `CREATE` names the grant in its header's

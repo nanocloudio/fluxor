@@ -325,6 +325,21 @@ pub struct AddSubgraph<'a> {
     /// enforcement is deferred to the owner-tagged allocator.
     pub state_cap: u32,
     pub buffer_cap: u32,
+    /// Whose authority the new owner acts with.
+    pub authority: AddAuthority,
+}
+
+/// The authority an add asks for its owner.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AddAuthority {
+    /// Its own: a workload. Every add but the one below.
+    Own,
+    /// Its creator's: the module at this global index places the subgraph
+    /// to act on its behalf. Admitted only when that module acts with the
+    /// node's authority; the new owner then acts with the node's
+    /// ([`crate::kernel::workload::owner::Authority::Node`]), its lifecycle
+    /// its own.
+    Creator(usize),
 }
 
 /// Why `apply_add` failed. A failure leaves the running graph bit-identical.
@@ -357,6 +372,9 @@ pub enum AddError {
     /// ([`super::is_node_param_tag`]): a grant only the node's own graph
     /// makes. Refused before anything is allocated.
     NodeParamRefused,
+    /// The add asked for its creator's authority, and the creator does not
+    /// act with the node's. Refused before anything is allocated.
+    AuthorityRefused,
 }
 
 impl AddError {
@@ -377,7 +395,7 @@ impl AddError {
             AddError::NetAttachFailed => errno::EBUSY,
             AddError::OwnerExists => errno::EEXIST,
             AddError::BudgetRefused => errno::ERANGE,
-            AddError::NodeParamRefused => errno::EACCES,
+            AddError::NodeParamRefused | AddError::AuthorityRefused => errno::EACCES,
         }
     }
 }
@@ -563,6 +581,7 @@ pub fn begin_add(
         sub.owner_uid,
         sub.state_cap,
         sub.buffer_cap,
+        sub.authority,
         mods,
         n,
         edges,
@@ -622,6 +641,7 @@ fn begin_staged(
     owner_uid: [u8; 16],
     state_cap: u32,
     buffer_cap: u32,
+    authority: AddAuthority,
     mut mods: [AddModule; WORK_MODULES],
     n: usize,
     edges: [AddEdge; WORK_EDGES],
@@ -635,7 +655,22 @@ fn begin_staged(
         edges: &edges[..e],
         state_cap,
         buffer_cap,
+        authority,
     };
+
+    // 0. An add on its creator's behalf is admitted only from a module that
+    //    acts with the node's authority: a workload cannot pass on what it
+    //    does not hold, nor gain it through an add of its own.
+    if let AddAuthority::Creator(idx) = sub.authority {
+        if idx >= MAX_MODULES
+            || !sched()
+                .owners
+                .authority_of(super::module_owner(idx))
+                .is_system()
+        {
+            return Err(AddError::AuthorityRefused);
+        }
+    }
 
     // 1. Reserve the owner (lowest-free slot + monotonic generation — the same
     //    rule the host composer uses, so kernel-side allocation matches a plan).
@@ -658,11 +693,21 @@ fn begin_staged(
         .owners
         .set_caps(handle, sub.state_cap, sub.buffer_cap);
     // The default grant: a root of the owner's own. A workload `CREATE`
-    // states its own grant over this before any of its modules runs.
-    sched().owners.set_storage_grant(
-        handle,
-        crate::kernel::workload::storage::StorageGrant::OwnRoot,
-    );
+    // states its own grant over this before any of its modules runs. An
+    // owner acting with the node's authority holds no root: it reaches the
+    // node's storage as the node does.
+    if let AddAuthority::Creator(idx) = sub.authority {
+        sched().owners.set_node_authority(handle);
+        log::info!(
+            "[live] owner slot {} acts with the node's authority, placed by module {idx}",
+            handle.slot
+        );
+    } else {
+        sched().owners.set_storage_grant(
+            handle,
+            crate::kernel::workload::storage::StorageGrant::OwnRoot,
+        );
+    }
 
     // 2. Assign each new module the lowest-free `Empty` slot. NOT a watermark:
     //    freeing a non-last owner leaves holes, so we scan.
@@ -1847,7 +1892,7 @@ pub fn owner_resume(handle: OwnerHandle) -> Result<(), PauseError> {
 //
 // FLXA layout (all integers big-endian):
 //
-//   header   magic u32 "FLXA" | version u16 = 1 | reserved u16 = 0
+//   header   magic u32 "FLXA" | version u16 = 1 | flags u16
 //            owner_uid [16] | state_cap u32 | buffer_cap u32
 //            module_count u8 | edge_count u8
 //   module   name_hash u32 | domain_id u8
@@ -1864,6 +1909,11 @@ pub fn owner_resume(handle: OwnerHandle) -> Result<(), PauseError> {
 // deadline the node does not admit a workload refuses the add
 // ([`admit_step_budget`], also `EINVAL`).
 //
+// `flags` holds one bit, `ADD_FLAG_CREATOR_AUTHORITY` (0x0001): the new owner
+// acts with its creator's authority. Only the module syscall names a creator
+// ([`apply_add_encoded_by`]); every other decode refuses the bit (`EINVAL`),
+// and every decode refuses an undefined bit.
+//
 // A module's params are its own: an add refuses (`EINVAL`) params whose TLV
 // carries a node tag (`is_node_param_tag`: the fault tags, trust tier,
 // protection level, quarantine partner, ISR budget, IRQ, device window),
@@ -1873,6 +1923,9 @@ pub fn owner_resume(handle: OwnerHandle) -> Result<(), PauseError> {
 pub const ADD_MAGIC: u32 = 0x464C_5841;
 /// Wire version.
 pub const ADD_VERSION: u16 = 1;
+/// The header's one flag: act with the creator's authority.
+pub const ADD_FLAG_CREATOR_AUTHORITY: u16 =
+    crate::abi::internal::reconfigure::ADD_FLAG_CREATOR_AUTHORITY;
 /// Bytes of a module record before its params: name_hash, domain_id,
 /// step_deadline_us, step_deadline_burst_us, fault_policy, params_len.
 pub const ADD_MODULE_FIXED_BYTES: usize = 4 + 1 + 4 + 4 + 1 + 2;
@@ -2053,8 +2106,21 @@ pub fn module_permissions(blob: &[u8]) -> Option<u16> {
 /// duration of the call (module params are borrowed from it in place).
 pub unsafe fn apply_add_encoded(arg: *mut u8, arg_len: usize) -> i32 {
     // SAFETY: forwarded contract; `None` = no spare-lane rewrite (the sentinel,
-    // if present, falls through to `BadEndpoint`).
-    unsafe { apply_add_encoded_inner(arg, arg_len, None) }
+    // if present, falls through to `BadEndpoint`), and no creator.
+    unsafe { apply_add_encoded_inner(arg, arg_len, None, None) }
+}
+
+/// [`apply_add_encoded`] for the module syscall: `creator` is the calling
+/// module's global index, which an add flagged
+/// [`ADD_FLAG_CREATOR_AUTHORITY`] acts on behalf of
+/// ([`AddAuthority::Creator`]). An unflagged add is the same as through
+/// [`apply_add_encoded`].
+///
+/// # Safety
+/// As [`apply_add_encoded`].
+pub unsafe fn apply_add_encoded_by(arg: *mut u8, arg_len: usize, creator: usize) -> i32 {
+    // SAFETY: forwarded contract.
+    unsafe { apply_add_encoded_inner(arg, arg_len, None, Some(creator)) }
 }
 
 /// The metal `net=own` variant of [`apply_add_encoded`] — the
@@ -2078,15 +2144,21 @@ pub unsafe fn apply_add_encoded(arg: *mut u8, arg_len: usize) -> i32 {
 /// As [`apply_add_encoded`].
 pub unsafe fn apply_add_encoded_spare_lane(arg: *mut u8, arg_len: usize, spare_lane: i32) -> i32 {
     // SAFETY: forwarded contract.
-    unsafe { apply_add_encoded_inner(arg, arg_len, Some(spare_lane)) }
+    unsafe { apply_add_encoded_inner(arg, arg_len, Some(spare_lane), None) }
 }
 
-/// Shared decode+apply body for [`apply_add_encoded`] /
-/// [`apply_add_encoded_spare_lane`]: the whole add in this call.
+/// Shared decode+apply body for [`apply_add_encoded`],
+/// [`apply_add_encoded_by`] and [`apply_add_encoded_spare_lane`]: the whole
+/// add in this call.
 ///
 /// # Safety
 /// As [`apply_add_encoded`].
-unsafe fn apply_add_encoded_inner(arg: *mut u8, arg_len: usize, spare_lane: Option<i32>) -> i32 {
+unsafe fn apply_add_encoded_inner(
+    arg: *mut u8,
+    arg_len: usize,
+    spare_lane: Option<i32>,
+    creator: Option<usize>,
+) -> i32 {
     if arg.is_null() {
         return crate::kernel::sys::errno::EINVAL;
     }
@@ -2094,7 +2166,7 @@ unsafe fn apply_add_encoded_inner(arg: *mut u8, arg_len: usize, spare_lane: Opti
     let bytes = unsafe { core::slice::from_raw_parts(arg, arg_len) };
     // SAFETY: the modules' params are borrowed from `bytes`, which outlives
     // the add: it completes within this call.
-    match unsafe { decode_add(bytes, spare_lane, |sub| apply_add(sub, None)) } {
+    match unsafe { decode_add(bytes, spare_lane, creator, |sub| apply_add(sub, None)) } {
         Ok(Ok(handle)) => {
             // SAFETY: a decoded blob is longer than the handle's 6 bytes.
             unsafe { write_handle(core::slice::from_raw_parts_mut(arg, 6), handle) };
@@ -2115,7 +2187,7 @@ unsafe fn apply_add_encoded_inner(arg: *mut u8, arg_len: usize, spare_lane: Opti
 /// or abandoned: its modules' params are read from it as they instantiate.
 pub unsafe fn begin_add_encoded(bytes: &[u8], spare_lane: Option<i32>) -> Result<StagedAdd, i32> {
     // SAFETY: forwarded contract.
-    match unsafe { decode_add(bytes, spare_lane, |sub| begin_add(sub, None)) } {
+    match unsafe { decode_add(bytes, spare_lane, None, |sub| begin_add(sub, None)) } {
         Ok(Ok(st)) => Ok(st),
         Ok(Err(e)) => Err(e.code()),
         Err(e) => Err(e),
@@ -2134,6 +2206,9 @@ pub fn write_handle(out: &mut [u8], handle: OwnerHandle) {
 ///   * `Some(l)` l>=0 — rewrite a sentinel `to` to `ExistingChannel(l)`,
 ///   * `Some(l)` l<0  — a sentinel with no resolved lane → `-ENOMEM`.
 ///
+/// `creator` is the module an [`ADD_FLAG_CREATOR_AUTHORITY`] add acts on
+/// behalf of; with `None` the flag is refused.
+///
 /// `Err(EINVAL)` for a malformed blob, before `f` runs.
 ///
 /// # Safety
@@ -2142,15 +2217,21 @@ pub fn write_handle(out: &mut [u8], handle: OwnerHandle) {
 unsafe fn decode_add<R>(
     bytes: &[u8],
     spare_lane: Option<i32>,
+    creator: Option<usize>,
     f: impl FnOnce(AddSubgraph<'_>) -> R,
 ) -> Result<R, i32> {
     const EINVAL: i32 = -22;
     const ENOMEM: i32 = -12;
     let mut c = Cur::new(bytes);
 
-    if c.u32() != Some(ADD_MAGIC) || c.u16() != Some(ADD_VERSION) || c.u16().is_none() {
+    if c.u32() != Some(ADD_MAGIC) || c.u16() != Some(ADD_VERSION) {
         return Err(EINVAL);
     }
+    let authority = match (c.u16(), creator) {
+        (Some(0), _) => AddAuthority::Own,
+        (Some(ADD_FLAG_CREATOR_AUTHORITY), Some(idx)) => AddAuthority::Creator(idx),
+        _ => return Err(EINVAL),
+    };
     let owner_uid: [u8; 16] = match c.take(16) {
         Some(s) => s.try_into().unwrap(),
         None => return Err(EINVAL),
@@ -2272,6 +2353,7 @@ unsafe fn decode_add<R>(
         edges: &edges[..ec],
         state_cap,
         buffer_cap,
+        authority,
     }))
 }
 

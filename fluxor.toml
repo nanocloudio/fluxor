@@ -31,9 +31,10 @@ limit_register_coverage = "fail"
 # configuration to a declared package ceiling, so that the external dependency
 # count moves when someone decides it should rather than drifting; the
 # script's header says why it is not a limit-register family.
-# `tests/host/service_bundle_e2e.sh` publishes the example service bundle
-# into an isolated store, pins and syncs it in a scratch consumer, runs it
-# with parameters and asserts the refusals.
+# `tests/host/service_bundle_e2e.sh` has a scratch producer publish a
+# fixture service bundle into an isolated store (fluxor publishes none),
+# pins and syncs it in a scratch consumer, runs it with parameters and
+# asserts the refusals.
 # `tests/host/program_section.sh` builds a graph whose modules own programs
 # and checks each instance reads its own, through the kernel and in place.
 scripts = ["tools/ci/deps_budget.sh", "tests/host/service_bundle_e2e.sh", "tests/host/program_section.sh"]

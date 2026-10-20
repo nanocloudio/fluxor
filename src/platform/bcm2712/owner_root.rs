@@ -1191,9 +1191,10 @@ pub unsafe fn set_backend(backend: Option<Backend>) {
 /// The owner-release hook: close every handle the owner holds through its
 /// root, forget what it had undecided, and queue its root for removal — a
 /// root it never touched in this run included, as on Linux, since one a
-/// previous run left is its own all the same.
+/// previous run left is its own all the same. An owner that acted with the
+/// node's authority has no root, and none is queued for removal.
 pub fn release(owner: OwnerHandle) {
-    if owner.is_system() {
+    if owner.is_system() || !crate::kernel::workload::storage::rooted(owner) {
         return;
     }
     // SAFETY: owner release runs on the scheduler thread, as every dispatch.
@@ -1253,14 +1254,15 @@ pub fn release(owner: OwnerHandle) {
 
 /// The `fs` provider the kernel registers on bare metal. A workload's call
 /// (the only kind that reaches it while the node has an `fs` layer of its
-/// own) is served inside the workload's root; the node itself has nothing
-/// here (`ENOSYS`).
+/// own) is served inside the workload's root; the node itself, and an owner
+/// acting with its authority, has nothing here (`ENOSYS`): it reaches the
+/// node's own `fs` layer.
 ///
 /// # Safety
 /// `arg` must satisfy the `fs` contract's requirements for `opcode`.
 pub unsafe fn dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
     let owner = scheduler::caller_owner();
-    if owner.is_system() || backend().is_none() {
+    if !crate::kernel::workload::storage::rooted(owner) || backend().is_none() {
         return errno::ENOSYS;
     }
     if opcode == op::CAPS {

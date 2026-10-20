@@ -704,6 +704,7 @@ fn withdrawal_note(project_root: &Path, before: &[Artifact], after: &[Artifact])
 /// upsert one entry under the advisory lock. Keyed by
 /// (kind, project, name, target).
 pub fn pin_artifact(project_root: &Path, artifact: &Artifact) -> Result<()> {
+    refuse_own_pins(project_root, std::slice::from_ref(artifact))?;
     let _guard = crate::lockfile::lock_lockfile(project_root)?;
     let mut entries = read_store_lock(project_root)?
         .map(|l| l.artifacts)
@@ -722,6 +723,31 @@ pub fn pin_artifact(project_root: &Path, artifact: &Artifact) -> Result<()> {
     }
     entries.push(artifact);
     write_store_lock(project_root, &entries)?;
+    Ok(())
+}
+
+/// A project never pins what it publishes itself: nothing builds against
+/// its own published artefacts (it builds them), and a bundle pin is a
+/// consumer's choice of a service to run. A pin of one's own artifact is a
+/// dependency on oneself — the next build needs a publish that needs that
+/// build — so it is refused where it would be written and where it would be
+/// followed. A project runs its own bundle by path
+/// (`fluxor run <workload.toml>`).
+pub(crate) fn refuse_own_pins(project_root: &Path, entries: &[Artifact]) -> Result<()> {
+    let Ok(Some(me)) = crate::project::project_identity(project_root) else {
+        return Ok(());
+    };
+    if let Some(own) = entries.iter().find(|e| e.project == me.name) {
+        return Err(Error::Config(format!(
+            "{} pins `{}` ({} `{}`), an artifact this project publishes itself — a project \
+             does not depend on its own artifacts. Remove the entry from fluxor.lock; run \
+             your own bundle by path (`fluxor run <workload.toml>`).",
+            project_root.join(LOCKFILE_NAME).display(),
+            own.reference,
+            own.kind,
+            own.name,
+        )));
+    }
     Ok(())
 }
 
@@ -993,6 +1019,36 @@ mod tests {
             std::fs::read_to_string(&path).unwrap(),
             text,
             "lock rewritten"
+        );
+    }
+
+    #[test]
+    fn a_project_cannot_pin_its_own_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("fluxor.toml"),
+            "[project]\nname = \"fluxor\"\nversion = \"0.0.1\"\n",
+        )
+        .unwrap();
+        let own = entry("bundle", "fluxor", "dns_service", None);
+        let err = pin_artifact(dir.path(), &own).unwrap_err().to_string();
+        assert!(err.contains("publishes itself"), "{err}");
+        assert!(
+            read_store_lock(dir.path()).unwrap().is_none(),
+            "nothing written"
+        );
+        // Another project's artifact pins as before.
+        let theirs = entry("bundle", "wave", "http_service", None);
+        pin_artifact(dir.path(), &theirs).unwrap();
+        // A self-pin that reached the lock anyway is refused where it would be
+        // followed, naming itself rather than a missing blob.
+        write_store_lock(dir.path(), &[theirs, own]).unwrap();
+        let err = crate::store_sync::ensure_synced(dir.path())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("dns_service") && err.contains("publishes itself"),
+            "{err}"
         );
     }
 

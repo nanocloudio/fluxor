@@ -83,6 +83,15 @@ pub fn caller_owner() -> OwnerHandle {
     module_owner(current_module_index())
 }
 
+/// The authority the currently-executing module acts with: the system owner
+/// for the node and for an owner admitted with the node's authority, its own
+/// owner otherwise. What it reaches is decided by this; what it holds is
+/// stamped with [`caller_owner`].
+#[inline]
+pub fn caller_authority() -> OwnerHandle {
+    owners().authority_of(caller_owner())
+}
+
 /// Whether module N has returned StepOutcome::Done.
 pub fn module_is_finished(module_idx: usize) -> bool {
     if module_idx >= MAX_MODULES {

@@ -103,6 +103,8 @@ fn walk_inodes(dir: &Path, into: &mut BTreeMap<u64, u64>) {
     }
 }
 
+pub use crate::kernel::workload::storage::rooted;
+
 /// The owner's root, made on first use. `None` for the system owner (which
 /// has no root: the host is its own), an owner that no longer resolves or is
 /// on its way out, or a root that cannot be made.
@@ -190,10 +192,22 @@ pub unsafe fn store_for(owner: OwnerHandle) -> Option<&'static mut Served> {
 /// The platform's owner-release hook: close the files the owner holds open,
 /// drop its store and the handles on it, close its files directory and
 /// remove its root. A root the owner never opened in this run, one a
-/// previous run left, is removed all the same. Registered with the kernel at
-/// init; it runs before the owner is freed, so the owner still resolves.
+/// previous run left, is removed all the same. An owner that acted with the
+/// node's authority has no root: the files, host processes and node-store
+/// handles it opened are closed, and nothing on the host is removed. Registered with the
+/// kernel at init; it runs before the owner is freed, so the owner still
+/// resolves.
 pub fn release(owner: OwnerHandle) {
     if owner.is_system() {
+        return;
+    }
+    if !rooted(owner) {
+        // SAFETY: owner release runs on the scheduler thread, as every dispatch.
+        unsafe {
+            crate::platform::linux::providers::release_owner_files(owner);
+            crate::platform::linux::providers::release_owner_procs(owner);
+            crate::platform::linux::store::release_opener(owner);
+        }
         return;
     }
     // SAFETY: owner release runs on the scheduler thread, as every dispatch.

@@ -29,6 +29,7 @@ use crate::abi::fence::{Fence, WIRE_MAX_LEN};
 use crate::kernel::ipc::channel::channel_write;
 use crate::kernel::ipc::fd::{slot_of, tag_fd, FD_TAG_STORAGE_NAMESPACE, FD_TAG_STORAGE_OBJECT};
 use crate::kernel::sys::errno;
+use crate::kernel::workload::owner::{OwnerHandle, OWNER_SYSTEM};
 
 /// Objects the store can hold — one machine's worth of state, not a fleet's.
 /// Exceeding it is refused (`ENOMEM`) rather than evicting: a consumer reads a
@@ -112,6 +113,8 @@ struct Sub {
     sequence: u32,
     /// The revision this watcher has been served up to.
     cursor: u64,
+    /// The owner that subscribed, which the slot goes with.
+    opener: OwnerHandle,
 }
 
 const SUB_EMPTY: Sub = Sub {
@@ -121,6 +124,7 @@ const SUB_EMPTY: Sub = Sub {
     sink_chan: 0,
     sequence: 0,
     cursor: 0,
+    opener: OWNER_SYSTEM,
 };
 
 #[derive(Clone, Copy)]
@@ -129,6 +133,8 @@ struct ReadSlot {
     val: [u8; MAX_VALUE],
     val_len: u16,
     revision: u64,
+    /// The owner that opened the slot, which it goes with.
+    opener: OwnerHandle,
 }
 
 const READ_EMPTY: ReadSlot = ReadSlot {
@@ -136,6 +142,7 @@ const READ_EMPTY: ReadSlot = ReadSlot {
     val: [0; MAX_VALUE],
     val_len: 0,
     revision: 0,
+    opener: OWNER_SYSTEM,
 };
 
 /// The store itself. A static, because bare metal has no heap to put it on and
@@ -418,14 +425,36 @@ pub unsafe fn init() {
     provider::register(dev_class::STORAGE_NAMESPACE, dispatch_namespace);
 }
 
-/// Whether the caller is the node. The store is one fixed table with one
-/// history and one revision clock: a workload sharing it could fill the
-/// table, flood the history the node's watchers read, and read the rate of
-/// other owners' writes off the clock, so it is the node's alone. A workload
-/// on this board keeps its objects in a store provider of its own, over a
-/// volume lent to it.
+/// Whether the caller acts with the node's authority. The store is one fixed
+/// table with one history and one revision clock: a workload sharing it
+/// could fill the table, flood the history the node's watchers read, and
+/// read the rate of other owners' writes off the clock, so it is the node's
+/// alone — the node's own modules and an owner acting with its authority. A
+/// workload on this board keeps its objects in a store provider of its own,
+/// over a volume lent to it.
 fn node_caller() -> bool {
-    crate::kernel::exec::scheduler::caller_owner().is_system()
+    !crate::kernel::workload::storage::rooted(crate::kernel::exec::scheduler::caller_owner())
+}
+
+/// Close every handle `opener` holds on the store: its `GET` reads and its
+/// subscriptions. Part of the owner-release hook, for an owner that acted
+/// with the node's authority: what it opened goes with it.
+///
+/// # Safety
+/// Single-threaded platform dispatch only.
+pub unsafe fn release_opener(opener: OwnerHandle) {
+    for r in (*core::ptr::addr_of_mut!(READS))
+        .iter_mut()
+        .filter(|r| r.in_use && r.opener == opener)
+    {
+        *r = READ_EMPTY;
+    }
+    for s in (*core::ptr::addr_of_mut!(SUBS))
+        .iter_mut()
+        .filter(|s| s.in_use && s.opener == opener)
+    {
+        *s = SUB_EMPTY;
+    }
 }
 
 unsafe fn store_ref() -> Option<&'static mut Store> {
@@ -686,6 +715,7 @@ pub unsafe fn dispatch_object(handle: i32, opcode: u32, arg: *mut u8, arg_len: u
                 return errno::ENOMEM;
             };
             reads[idx].in_use = true;
+            reads[idx].opener = crate::kernel::exec::scheduler::caller_owner();
             reads[idx].val_len = vlen as u16;
             reads[idx].val[..vlen].copy_from_slice(val);
             reads[idx].revision = rev;
@@ -952,6 +982,7 @@ pub unsafe fn dispatch_namespace(handle: i32, opcode: u32, arg: *mut u8, arg_len
             };
             subs[idx] = SUB_EMPTY;
             subs[idx].in_use = true;
+            subs[idx].opener = crate::kernel::exec::scheduler::caller_owner();
             subs[idx].prefix_len = pl as u16;
             subs[idx].prefix[..pl].copy_from_slice(&a[2..2 + pl]);
             subs[idx].sink_chan = sink_chan;

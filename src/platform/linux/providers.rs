@@ -47,6 +47,54 @@ struct LinuxFileSlot {
     /// Who opened the slot. Only that owner reaches it: a handle names a
     /// slot, and a slot answers its opener alone.
     owner: crate::kernel::workload::owner::OwnerHandle,
+    /// Bumped each time the slot is claimed and carried in the handle, so a
+    /// handle kept past its close names no slot (`slot_index`), never the
+    /// file that took the slot next — another module's, as often as not.
+    generation: u32,
+}
+
+/// Bits of a handle that name the slot; the rest above them, up to the
+/// tag, carry the slot's generation.
+const SLOT_BITS: u32 = 8;
+const _: () = assert!(MAX_OPEN_FILES <= 1 << SLOT_BITS);
+const GEN_MASK: u32 = (crate::abi::kernel_abi::fd::SLOT_MASK as u32) >> SLOT_BITS;
+
+/// The handle for slot `idx` at its current generation.
+fn slot_handle(idx: usize, generation: u32) -> i32 {
+    use crate::kernel::ipc::fd::{tag_fd, FD_TAG_FS};
+    tag_fd(FD_TAG_FS, ((generation << SLOT_BITS) | idx as u32) as i32)
+}
+
+/// The slot a handle names, while it is the slot's current occupancy; an
+/// index past the table otherwise, which every arm refuses.
+fn slot_index(handle: i32) -> usize {
+    if handle < 0 {
+        return usize::MAX;
+    }
+    let inner = crate::kernel::ipc::fd::slot_of(handle) as u32;
+    let idx = (inner & ((1 << SLOT_BITS) - 1)) as usize;
+    let generation = inner >> SLOT_BITS;
+    // SAFETY: single-threaded platform dispatch; `idx` is bounds-checked.
+    let current = unsafe {
+        (*core::ptr::addr_of!(LINUX_FILES))
+            .get(idx)
+            .map(|s| s.generation)
+    };
+    if current == Some(generation) {
+        idx
+    } else {
+        usize::MAX
+    }
+}
+
+/// The next generation of slot `idx`: never 0, so no handle is ever 0.
+unsafe fn next_generation(files: &[LinuxFileSlot], idx: usize) -> u32 {
+    let g = (files[idx].generation.wrapping_add(1)) & GEN_MASK;
+    if g == 0 {
+        1
+    } else {
+        g
+    }
 }
 
 static mut LINUX_FILES: [LinuxFileSlot; MAX_OPEN_FILES] = {
@@ -56,6 +104,7 @@ static mut LINUX_FILES: [LinuxFileSlot; MAX_OPEN_FILES] = {
         in_use: false,
         last_fence: Fence::Volatile,
         owner: crate::kernel::workload::owner::OWNER_SYSTEM,
+        generation: 0,
     };
     [EMPTY; MAX_OPEN_FILES]
 };
@@ -87,21 +136,22 @@ fn free_slot_for(
 /// `ENOMEM` with `fd` closed when the table, or the owner's share of it, is
 /// full.
 unsafe fn claim_file_slot(fd: i32, owner: crate::kernel::workload::owner::OwnerHandle) -> i32 {
-    use crate::kernel::ipc::fd::{tag_fd, FD_TAG_FS};
     use crate::kernel::sys::errno;
     let files = &mut *core::ptr::addr_of_mut!(LINUX_FILES);
     let Some(slot_idx) = free_slot_for(files, owner) else {
         libc::close(fd);
         return errno::ENOMEM;
     };
+    let generation = next_generation(files, slot_idx);
     files[slot_idx] = LinuxFileSlot {
         fd,
         dir_ptr: 0,
         in_use: true,
         last_fence: Fence::Volatile,
         owner,
+        generation,
     };
-    tag_fd(FD_TAG_FS, slot_idx as i32)
+    slot_handle(slot_idx, generation)
 }
 
 /// Claim a directory slot for `dir` on behalf of `owner`.
@@ -109,21 +159,22 @@ unsafe fn claim_dir_slot(
     dir: *mut libc::DIR,
     owner: crate::kernel::workload::owner::OwnerHandle,
 ) -> i32 {
-    use crate::kernel::ipc::fd::{tag_fd, FD_TAG_FS};
     use crate::kernel::sys::errno;
     let files = &mut *core::ptr::addr_of_mut!(LINUX_FILES);
     let Some(slot_idx) = free_slot_for(files, owner) else {
         libc::closedir(dir);
         return errno::ENOMEM;
     };
+    let generation = next_generation(files, slot_idx);
     files[slot_idx] = LinuxFileSlot {
         fd: -1,
         dir_ptr: dir as usize,
         in_use: true,
         last_fence: Fence::Volatile,
         owner,
+        generation,
     };
-    tag_fd(FD_TAG_FS, slot_idx as i32)
+    slot_handle(slot_idx, generation)
 }
 
 /// The path-taking `fs` ops for a workload: each resolves beneath the
@@ -448,7 +499,7 @@ unsafe fn tenant_fs_path_op(
 /// while the slot held it open gives its charge back now.
 unsafe fn close_file_slot(slot: &mut LinuxFileSlot) {
     use crate::platform::linux::owner_root as root;
-    if !slot.owner.is_system() {
+    if root::rooted(slot.owner) {
         if let Some(st) = root::stat_fd(slot.fd) {
             if st.st_nlink == 0 {
                 root::charge_inode(slot.owner, st.st_ino, 0, false);
@@ -517,18 +568,19 @@ unsafe fn record_slot_fence(slot: usize, fence: Fence) {
 /// Read back the fence advertised for `slot`'s most recent
 /// successful op. Returns `None` for unbound slots; the kernel
 /// introspection path treats that as `E_NOSYS`.
-pub fn slot_fence(slot: i32) -> Option<Fence> {
-    if slot < 0 || (slot as usize) >= MAX_OPEN_FILES {
+pub fn slot_fence(handle: i32) -> Option<Fence> {
+    let slot = slot_index(handle);
+    if slot >= MAX_OPEN_FILES {
         return None;
     }
     // SAFETY: `slot` is bounds-checked above; `LINUX_FILES` is a static
     // array of plain-old-data `OpenFile` entries owned by this module.
     unsafe {
         let files = &*core::ptr::addr_of!(LINUX_FILES);
-        if !owned(&files[slot as usize]) {
+        if !owned(&files[slot]) {
             return None;
         }
-        Some(files[slot as usize].last_fence)
+        Some(files[slot].last_fence)
     }
 }
 
@@ -712,8 +764,11 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
     }
 
     // A workload names paths inside a root of its own; the host's paths are
-    // the system owner's.
+    // the node's, and those of an owner acting with the node's authority.
+    // Slots are stamped with the caller's own owner either way: what it
+    // opened goes with it.
     let owner = crate::kernel::exec::scheduler::caller_owner();
+    let rooted = crate::platform::linux::owner_root::rooted(owner);
 
     // FS capability bitmap (modules/sdk/contracts/storage/fs.rs::CAPS).
     // Linux implements the full read-tier, the write-tier, both
@@ -742,10 +797,10 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             | dev_fs::caps::RMDIR
             | dev_fs::caps::LINK
             | dev_fs::caps::SYMLINK;
-        let caps = if owner.is_system() {
-            caps
-        } else {
+        let caps = if rooted {
             caps & !dev_fs::caps::LINK
+        } else {
+            caps
         };
         let bytes = caps.to_le_bytes();
         core::ptr::copy_nonoverlapping(bytes.as_ptr(), arg, 4);
@@ -753,7 +808,7 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
     }
 
     // Handle ops below serve both, each slot its opener alone.
-    if !owner.is_system() {
+    if rooted {
         if let Some(rc) = tenant_fs_path_op(owner, opcode, arg, arg_len) {
             return rc;
         }
@@ -1012,7 +1067,7 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             errno::OK
         }
         dev_fs::PREALLOCATE => {
-            let slot_idx = handle as usize;
+            let slot_idx = slot_index(handle);
             let files = &*core::ptr::addr_of!(LINUX_FILES);
             if slot_idx >= MAX_OPEN_FILES || !owned(&files[slot_idx]) {
                 return errno::EINVAL;
@@ -1033,7 +1088,7 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             // its bytes.
             let size = (st.st_size as u64).max(u64::from(capacity));
             // A workload is charged for the capacity before it is reserved.
-            if !slot_owner.is_system()
+            if crate::platform::linux::owner_root::rooted(slot_owner)
                 && !crate::platform::linux::owner_root::charge_inode(
                     slot_owner,
                     st.st_ino,
@@ -1050,7 +1105,7 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             } else {
                 -*libc::__errno_location()
             };
-            if !slot_owner.is_system() {
+            if crate::platform::linux::owner_root::rooted(slot_owner) {
                 settle_inode(slot_owner, fd, st.st_ino);
             }
             if !grew {
@@ -1077,7 +1132,7 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             errno::OK
         }
         dev_fs::READ => {
-            let slot_idx = handle as usize;
+            let slot_idx = slot_index(handle);
             let files = &*core::ptr::addr_of!(LINUX_FILES);
             if slot_idx >= MAX_OPEN_FILES || !owned(&files[slot_idx]) {
                 return errno::EINVAL;
@@ -1097,7 +1152,7 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             }
         }
         dev_fs::WRITE => {
-            let slot_idx = handle as usize;
+            let slot_idx = slot_index(handle);
             let files = &mut *core::ptr::addr_of_mut!(LINUX_FILES);
             if slot_idx >= MAX_OPEN_FILES || !owned(&files[slot_idx]) {
                 return errno::EINVAL;
@@ -1111,7 +1166,7 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             // hold before it runs; a write its storage cap refuses lands
             // nothing. What the inode holds afterwards is what it keeps.
             let mut ino = None;
-            if !slot_owner.is_system() {
+            if crate::platform::linux::owner_root::rooted(slot_owner) {
                 use crate::platform::linux::owner_root as root;
                 let Some(st) = root::stat_fd(fd) else {
                     return errno::ERROR;
@@ -1141,7 +1196,7 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             }
         }
         dev_fs::SEEK => {
-            let slot_idx = handle as usize;
+            let slot_idx = slot_index(handle);
             let files = &*core::ptr::addr_of!(LINUX_FILES);
             if slot_idx >= MAX_OPEN_FILES || !owned(&files[slot_idx]) {
                 return errno::EINVAL;
@@ -1180,7 +1235,7 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             }
         }
         dev_fs::CLOSE => {
-            let slot_idx = handle as usize;
+            let slot_idx = slot_index(handle);
             let files = &mut *core::ptr::addr_of_mut!(LINUX_FILES);
             if slot_idx >= MAX_OPEN_FILES || !owned(&files[slot_idx]) {
                 // The fs contract's CLOSE answers 0 or EBADF.
@@ -1200,7 +1255,7 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             errno::OK
         }
         dev_fs::STAT => {
-            let slot_idx = handle as usize;
+            let slot_idx = slot_index(handle);
             let files = &*core::ptr::addr_of!(LINUX_FILES);
             if slot_idx >= MAX_OPEN_FILES || !owned(&files[slot_idx]) {
                 return errno::EINVAL;
@@ -1249,7 +1304,7 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             8
         }
         dev_fs::FSYNC => {
-            let slot_idx = handle as usize;
+            let slot_idx = slot_index(handle);
             let files = &*core::ptr::addr_of!(LINUX_FILES);
             if slot_idx >= MAX_OPEN_FILES || !owned(&files[slot_idx]) {
                 return errno::EINVAL;
@@ -1290,7 +1345,7 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             claim_dir_slot(dir, owner)
         }
         dev_fs::READDIR => {
-            let slot_idx = handle as usize;
+            let slot_idx = slot_index(handle);
             let files = &*core::ptr::addr_of!(LINUX_FILES);
             if slot_idx >= MAX_OPEN_FILES
                 || !owned(&files[slot_idx])
@@ -1394,6 +1449,11 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
 // accident-prevention, NOT a sandbox (any dev tool is RCE-equivalent — the node
 // is the boundary). Config-driven root/env/timeout scoping and OS sandboxing
 // are not applied here.
+//
+// OWNERS: a spawn acts with the node's authority, so only the node and an
+// owner acting with it spawn (a workload is refused EACCES). A child is its
+// spawner's: only that owner reads, polls or closes it, and the owner-release
+// hook shuts it down with the owner.
 
 use crate::abi::platform::linux::host_process::{PROC_CLOSE, PROC_READ, PROC_SPAWN, PROC_STATUS};
 
@@ -1409,6 +1469,9 @@ struct LinuxProcSlot {
     staged: [u8; crate::platform::proc_executor::READ_CHUNK],
     staged_len: usize,
     staged_off: usize,
+    /// The owner that spawned the child: the slot is its alone, and the
+    /// child goes with it.
+    owner: crate::kernel::workload::owner::OwnerHandle,
 }
 
 static mut LINUX_PROCS: [LinuxProcSlot; MAX_PROCS] = [const {
@@ -1419,8 +1482,41 @@ static mut LINUX_PROCS: [LinuxProcSlot; MAX_PROCS] = [const {
         staged: [0; crate::platform::proc_executor::READ_CHUNK],
         staged_len: 0,
         staged_off: 0,
+        owner: crate::kernel::workload::owner::OWNER_SYSTEM,
     }
 }; MAX_PROCS];
+
+/// Whether `slot` is a live child of the calling owner's: the spawner alone
+/// reaches it.
+fn proc_owned(slot: &LinuxProcSlot) -> bool {
+    slot.in_use && slot.owner == crate::kernel::exec::scheduler::caller_owner()
+}
+
+/// Close a child's slot: the child is shut down and the slot's per-run state
+/// cleared rather than left for whoever spawns into it next.
+fn close_proc_slot(slot: &mut LinuxProcSlot, grace: std::time::Duration) {
+    if let Some(mut e) = slot.exec.take() {
+        e.shutdown(grace);
+    }
+    slot.in_use = false;
+    slot.deadline = None;
+    slot.staged_len = 0;
+    slot.staged_off = 0;
+    slot.owner = crate::kernel::workload::owner::OWNER_SYSTEM;
+}
+
+/// Shut down every child `owner` spawned. Part of the platform's
+/// owner-release hook: a host process never outlives the owner that
+/// spawned it.
+///
+/// # Safety
+/// Single-threaded platform dispatch only.
+pub unsafe fn release_owner_procs(owner: crate::kernel::workload::owner::OwnerHandle) {
+    let procs = &mut *core::ptr::addr_of_mut!(LINUX_PROCS);
+    for slot in procs.iter_mut().filter(|s| s.in_use && s.owner == owner) {
+        close_proc_slot(slot, std::time::Duration::from_millis(100));
+    }
+}
 
 /// The node's `proc` grant — WHAT `do` may run and how, sourced from the
 /// environment so the operator declares it at launch (`SECTOR_PROC_ALLOW`,
@@ -1500,7 +1596,6 @@ pub unsafe fn linux_proc_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_le
     use crate::kernel::ipc::fd::{slot_of, tag_fd};
     use crate::kernel::sys::errno;
     use crate::kernel::workload::extbridge::OverloadPolicy;
-    use crate::kernel::workload::owner::OWNER_SYSTEM;
     use crate::platform::proc_executor::{ProcExecutor, SpawnPolicy};
 
     let procs = &mut *core::ptr::addr_of_mut!(LINUX_PROCS);
@@ -1508,6 +1603,16 @@ pub unsafe fn linux_proc_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_le
         PROC_SPAWN => {
             if arg.is_null() || arg_len == 0 {
                 return errno::EINVAL;
+            }
+            // A host process acts with the node's authority: the node and an
+            // owner acting with it spawn one, a workload never does. The
+            // child is the spawning owner's, and goes with it.
+            let owner = crate::kernel::exec::scheduler::caller_owner();
+            if !crate::kernel::exec::scheduler::owners()
+                .authority_of(owner)
+                .is_system()
+            {
+                return errno::EACCES;
             }
             let bytes = core::slice::from_raw_parts(arg, arg_len);
             let line = match core::str::from_utf8(bytes) {
@@ -1534,10 +1639,11 @@ pub unsafe fn linux_proc_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_le
                 cwd: grant.root.clone(),
                 env_allow: grant.env_allow.clone(),
             };
-            match ProcExecutor::spawn(OWNER_SYSTEM, cmd, &args, OverloadPolicy::Block, &policy) {
+            match ProcExecutor::spawn(owner, cmd, &args, OverloadPolicy::Block, &policy) {
                 Ok(exec) => {
                     procs[slot].exec = Some(exec);
                     procs[slot].in_use = true;
+                    procs[slot].owner = owner;
                     procs[slot].staged_len = 0;
                     procs[slot].staged_off = 0;
                     procs[slot].deadline = Some(
@@ -1551,7 +1657,7 @@ pub unsafe fn linux_proc_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_le
         }
         PROC_READ => {
             let slot = slot_of(handle) as usize;
-            if slot >= MAX_PROCS || !procs[slot].in_use || arg.is_null() || arg_len == 0 {
+            if slot >= MAX_PROCS || !proc_owned(&procs[slot]) || arg.is_null() || arg_len == 0 {
                 return errno::EINVAL;
             }
             let out = core::slice::from_raw_parts_mut(arg, arg_len);
@@ -1573,7 +1679,7 @@ pub unsafe fn linux_proc_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_le
         }
         PROC_STATUS => {
             let slot = slot_of(handle) as usize;
-            if slot >= MAX_PROCS || !procs[slot].in_use {
+            if slot >= MAX_PROCS || !proc_owned(&procs[slot]) {
                 return errno::EINVAL;
             }
             // Past the deadline, kill the child — a runaway build can't wedge
@@ -1610,17 +1716,8 @@ pub unsafe fn linux_proc_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_le
         }
         PROC_CLOSE => {
             let slot = slot_of(handle) as usize;
-            if slot < MAX_PROCS && procs[slot].in_use {
-                if let Some(mut e) = procs[slot].exec.take() {
-                    e.shutdown(std::time::Duration::from_millis(100));
-                }
-                procs[slot].in_use = false;
-                procs[slot].deadline = None;
-                // The stage holds bytes the closed child wrote. Cleared with
-                // the rest of the slot's per-run state rather than left for
-                // whoever spawns into this slot next.
-                procs[slot].staged_len = 0;
-                procs[slot].staged_off = 0;
+            if slot < MAX_PROCS && proc_owned(&procs[slot]) {
+                close_proc_slot(&mut procs[slot], std::time::Duration::from_millis(100));
             }
             0
         }
@@ -2725,8 +2822,9 @@ unsafe fn linux_net_send_dg_error(st: &mut LinuxNetState, lane: usize, errno: u8
 /// (a Draining owner binds nothing new — same-owner re-binds of held ports
 /// never reach this, they take the use-class fast path), and when the
 /// committed plan is lease-aware the (protocol, port) must be granted.
-/// System-owned commanders are ungated, as everywhere. Returns the refusal
-/// errno, or None to proceed.
+/// System-owned commanders are ungated, as everywhere; one acting with the
+/// node's authority binds as the node does once its own admission is open.
+/// Returns the refusal errno, or None to proceed.
 fn linux_net_new_bind_refusal(
     commander: crate::kernel::workload::owner::OwnerHandle,
     protocol: u8,
@@ -2741,6 +2839,12 @@ fn linux_net_new_bind_refusal(
             commander.slot
         );
         return Some(1); // EPERM
+    }
+    if crate::kernel::exec::scheduler::owners()
+        .authority_of(commander)
+        .is_system()
+    {
+        return None;
     }
     match crate::kernel::workload::owner_plan::lease_gate(
         commander.slot,

@@ -744,6 +744,7 @@ pub fn ensure_synced(project_root: &Path) -> Result<Vec<String>> {
     let entries = read_store_lock(project_root)?
         .map(|l| l.artifacts)
         .unwrap_or_default();
+    crate::store_resolve::refuse_own_pins(project_root, &entries)?;
     crate::store_resolve::check_module_pin_targets(&entries)?;
     let deps = crate::project::dependencies(project_root).map_err(Error::Config)?;
     for dep in &deps {

@@ -682,6 +682,13 @@ pub fn provider_call(handle: i32, op: u32, arg: *mut u8, arg_len: usize) -> i32 
         // SAFETY: dispatch routes to the chain-registered handler.
         return unsafe { dispatch(contract, handle, op, arg, arg_len) };
     }
+    // Every provider of `fs` hands out handles carrying `FD_TAG_FS`, which
+    // resolve above. An untagged handle on an `fs` op is not one of them:
+    // a descriptor field never opened (0) or a raw slot number, which would
+    // otherwise reach whatever file holds that slot now — another module's.
+    if class == contract::FS && handle >= 0 {
+        return EBADF;
+    }
     // SAFETY: as above; class-byte dispatch fallback.
     unsafe { dispatch(class, handle, op, arg, arg_len) }
 }
@@ -1521,15 +1528,20 @@ fn default_layer_index(entry: &ProviderEntry) -> Option<usize> {
     None
 }
 
-/// Whether the calling module may reach `layer`: only a module of the
-/// layer's own owner may. A workload's filesystem serves that workload
-/// alone, and the node's providers serve the node alone: a node provider
-/// serving a workload would act with the node's authority on the
-/// workload's behalf, so a workload reaches storage through providers of
-/// its own or through the platform, which roots it.
+/// Whether the calling module may reach `layer`: a module of the layer's own
+/// owner may, and so may one that acts with the authority of the layer's
+/// owner. A workload's filesystem serves that workload alone, and the node's
+/// providers serve the node alone: a node provider serving a workload would
+/// act with the node's authority on the workload's behalf, so a workload
+/// reaches storage through providers of its own or through the platform,
+/// which roots it. An owner admitted to act with the node's authority
+/// reaches the node's providers as the node does; its own layers stay its
+/// own, unseen by the node and by its siblings.
 #[inline]
 fn layer_visible(layer: &ProviderLayer) -> bool {
-    layer.owner == crate::kernel::exec::scheduler::caller_owner()
+    use crate::kernel::exec::scheduler;
+    let caller = scheduler::caller_owner();
+    layer.owner == caller || layer.owner == scheduler::owners().authority_of(caller)
 }
 
 /// The node's own default layer of `contract`: the top-most unkeyed layer a
