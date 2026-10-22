@@ -79,7 +79,11 @@ pub const MAX_MODULES_BLOB_SIZE: usize = 8 * 1024 * 1024;
 /// list, else a bump. Reset wholesale at a rebuild.
 ///
 /// Channel buffers come from a separate arena (`buffer_pool.rs`), so this
-/// whole budget is module state and heaps.
+/// whole budget is module state and heaps. On bcm2712 the arena is sized at
+/// boot from the device tree instead, and on RP each graph's plan gives it
+/// what the static pool holds beside the graph's tables and buffer arena
+/// ([`arena_cap`]).
+#[cfg(not(any(feature = "chip-bcm2712", feature = "rp")))]
 const STATE_ARENA_SIZE: usize = crate::kernel::config::STATE_ARENA_SIZE;
 // Module params are never copied into a loader buffer: a module, pending or
 // not, holds a pointer to its params in the resident config blob (or the
@@ -143,6 +147,14 @@ pub enum LoaderError {
     IntegrityMismatch,
     /// Ed25519 signature invalid or missing when enforce_signatures is set.
     SignatureInvalid,
+    /// The module carries no ABI-surface attestation (manifest flag bit 4).
+    /// Every module must, signed or not: the numbers it was compiled with
+    /// are only known to be this kernel's when it says which surface it was
+    /// built against.
+    Unattested,
+    /// The module attests an ABI surface other than this kernel's: its
+    /// hardcoded opcode, errno and flag numbers are another substrate's.
+    SurfaceMismatch,
     /// The module asked for `protection: isolated` on a target whose kernel
     /// does not isolate modules.
     IsolationUnavailable,
@@ -192,6 +204,13 @@ impl LoaderError {
             }
             Self::IntegrityMismatch => log::error!("[loader] {context}: integrity hash mismatch"),
             Self::SignatureInvalid => log::error!("[loader] {context}: signature invalid"),
+            Self::Unattested => log::error!(
+                "[loader] {context}: unattested module — it carries no ABI-surface attestation; \
+                 repack it with `fluxor modules build`"
+            ),
+            Self::SurfaceMismatch => log::error!(
+                "[loader] {context}: ABI-surface mismatch — module built for a different substrate"
+            ),
             Self::IsolationUnavailable => {
                 log::error!("[loader] {context}: isolation requested; this target does not isolate")
             }
@@ -611,31 +630,227 @@ pub fn pic_irq_disabled_count() -> u32 {
 /// pointers (ARM requires aligned access for struct fields like pointers
 /// and u32).
 ///
-/// The pool holds no initial value: every allocation zeroes the bytes it
-/// hands out, and nothing reads the pool before that. On the bcm2712 kernel
-/// it is a linker region of its own (`.state_arena`, above the boot image's
-/// RAM) that boot does not zero; see `linker/memory-bcm2712.x`.
+/// Zeroing is kept off the step path. On the bcm2712
+/// kernel the pool is no static at all: it is the DRAM zone the device tree
+/// describes above the boot image (`platform/bcm2712/memmap.rs`), less the
+/// kernel tables carved from its top (`kernel::mem::carve`), installed at boot
+/// by [`install_arena`]. That memory is dirty — nothing zeroes it at boot — so
+/// the arena keeps a **zeroed frontier** ahead of the memory it has handed
+/// out, advanced in the execution domains' slack ([`zero_in_slack`]), and
+/// returns freed regions to zero there too before they are reused: an
+/// allocation finds zeroed memory waiting and zeroes synchronously only when
+/// none fits. Everywhere else the pool is explicitly zero-initialised, so
+/// memory above [`CLEAN_MARK`] is known zero and an allocation from it zeroes
+/// nothing. On RP the arena is no static either: it is the part of the
+/// kernel's static pool the graph's plan leaves it (`kernel::mem::carve::
+/// place_arenas`), zero-initialised `.bss` at power-on; what a previous plan
+/// gave the tables or the buffer arena is below [`CLEAN_MARK`] from then on
+/// ([`install_planned_arena`]). On Linux a freed region is returned to zero when it is freed
+/// (`rezero`: `madvise(MADV_DONTNEED)` on its whole pages, which refault as
+/// zero, and a memset of its partial edge pages), as is everything below the
+/// mark at a reset, so no allocation ever zeroes and no step pays for it.
+/// Page-aligned on Linux, so `rezero` releases whole pages of the arena only.
+#[cfg(feature = "host-linux")]
+#[repr(C, align(4096))]
+struct AlignedArena([u8; STATE_ARENA_SIZE]);
+#[cfg(not(any(feature = "chip-bcm2712", feature = "host-linux", feature = "rp")))]
 #[repr(C, align(4))]
 struct AlignedArena([u8; STATE_ARENA_SIZE]);
-#[cfg_attr(feature = "chip-bcm2712", link_section = ".state_arena")]
-static mut STATE_ARENA: core::mem::MaybeUninit<AlignedArena> = core::mem::MaybeUninit::uninit();
+#[cfg(not(any(feature = "chip-bcm2712", feature = "rp")))]
+static mut STATE_ARENA: AlignedArena = AlignedArena([0; STATE_ARENA_SIZE]);
+/// The bcm2712 and RP arena's base and capacity: the zone [`install_arena`]
+/// (or the plan, [`install_planned_arena`]) gave it, shrunk from the top as
+/// tables are carved ([`cede_arena_above`]). Zero until installed, and an
+/// uninstalled arena refuses every allocation.
+#[cfg(any(feature = "chip-bcm2712", feature = "rp"))]
+static ARENA_BASE: portable_atomic::AtomicUsize = portable_atomic::AtomicUsize::new(0);
+#[cfg(any(feature = "chip-bcm2712", feature = "rp"))]
+static ARENA_CAP: portable_atomic::AtomicUsize = portable_atomic::AtomicUsize::new(0);
+
+/// The arena's first byte.
+#[inline]
+fn arena_ptr() -> *mut u8 {
+    #[cfg(any(feature = "chip-bcm2712", feature = "rp"))]
+    {
+        ARENA_BASE.load(portable_atomic::Ordering::Acquire) as *mut u8
+    }
+    #[cfg(not(any(feature = "chip-bcm2712", feature = "rp")))]
+    {
+        core::ptr::addr_of_mut!(STATE_ARENA).cast::<u8>()
+    }
+}
+
+/// The arena's capacity in bytes: the compiled size, on bcm2712 what the
+/// device tree's zone holds after the carves, on RP what the graph's plan
+/// left of the static pool.
+#[inline]
+pub fn arena_cap() -> usize {
+    #[cfg(any(feature = "chip-bcm2712", feature = "rp"))]
+    {
+        ARENA_CAP.load(portable_atomic::Ordering::Acquire)
+    }
+    #[cfg(not(any(feature = "chip-bcm2712", feature = "rp")))]
+    {
+        STATE_ARENA_SIZE
+    }
+}
+
 /// Bump offset — high-water mark. Memory at `[0, STATE_ARENA_OFFSET)`
 /// has been handed out at some point; free holes in that range are
 /// recorded in `FREE_LIST`.
 static mut STATE_ARENA_OFFSET: usize = 0;
-/// Free-list entry describing a reusable hole.
+/// The highest arena offset ever handed out. Monotone: unlike the bump
+/// offset it never retreats (on a top-region free) and survives
+/// `reset_state_arena`. On every profile but bcm2712 the arena above it has
+/// never been written, so it is zero. Touched under `STATE_LOCK`.
+static mut CLEAN_MARK: usize = 0;
+
+/// The arena's freed memory is returned to zero before it is reused (when it
+/// is freed on Linux, in a domain's slack on bcm2712), so nothing on the free
+/// list is dirty and no allocation from it zeroes.
+const ZERO_ON_FREE: bool = cfg!(any(feature = "host-linux", feature = "chip-bcm2712"));
+/// The arena starts zeroed, so memory above `CLEAN_MARK` needs no zeroing
+/// (every arena but bcm2712's, which keeps a zeroed frontier instead).
+#[cfg(not(feature = "chip-bcm2712"))]
+const ZEROED_ARENA: bool = true;
+
+/// The host page size, read once.
+#[cfg(feature = "host-linux")]
+fn page_size() -> usize {
+    static PAGE: portable_atomic::AtomicUsize = portable_atomic::AtomicUsize::new(0);
+    let p = PAGE.load(portable_atomic::Ordering::Relaxed);
+    if p != 0 {
+        return p;
+    }
+    // SAFETY: `sysconf` reads a constant of the running kernel.
+    let n = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    let n = if n > 0 { n as usize } else { 4096 };
+    PAGE.store(n, portable_atomic::Ordering::Relaxed);
+    n
+}
+
+/// Return `[ptr, ptr + len)` of the arena to zero: whole pages by
+/// `madvise(MADV_DONTNEED)` — the arena is private anonymous memory, whose
+/// released pages refault as zero — and the partial pages at either edge by
+/// a memset. A free costs a syscall, not a sweep.
+///
+/// # Safety
+/// The range lies inside the arena and nothing references it.
+#[cfg(feature = "host-linux")]
+unsafe fn rezero(ptr: *mut u8, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let page = page_size();
+    let start = ptr as usize;
+    let end = start + len;
+    let first = start.next_multiple_of(page);
+    let last = end & !(page - 1);
+    if first < last {
+        // SAFETY: both edges lie inside the caller's range.
+        unsafe {
+            core::ptr::write_bytes(ptr, 0, first - start);
+            core::ptr::write_bytes(last as *mut u8, 0, end - last);
+        }
+        // SAFETY: `[first, last)` is whole pages inside the caller's range of
+        // the arena, which nothing references.
+        let rc = unsafe {
+            libc::madvise(
+                first as *mut libc::c_void,
+                last - first,
+                libc::MADV_DONTNEED,
+            )
+        };
+        if rc != 0 {
+            // SAFETY: as above.
+            unsafe { core::ptr::write_bytes(first as *mut u8, 0, last - first) };
+        }
+    } else {
+        // SAFETY: the caller's range.
+        unsafe { core::ptr::write_bytes(ptr, 0, len) };
+    }
+}
+/// Free-list entry describing a reusable hole: an offset from the arena's
+/// base and a length, both `usize` — the bcm2712 arena spans the device
+/// tree's whole zone, past 4 GiB on a large board.
 #[derive(Copy, Clone)]
 struct FreeRegion {
-    offset: u32,
-    size: u32,
+    offset: usize,
+    size: usize,
 }
 /// Bounded free list. Coalescing keeps fragmentation manageable in
-/// practice. When the free list is full, a freed region is leaked until
-/// the next full `reset_state_arena`.
-const MAX_FREE_REGIONS: usize = 32;
-static mut FREE_LIST: [FreeRegion; MAX_FREE_REGIONS] =
-    [FreeRegion { offset: 0, size: 0 }; MAX_FREE_REGIONS];
+/// practice. Where the plan sizes it (Linux, bcm2712, RP) it holds the
+/// plan's `state_free_list` ceiling: a hole for every allocation the module
+/// slots can hold, so a free never finds it full. A static profile's list is
+/// its fixed size, and when it is full a freed region is leaked until the next
+/// full `reset_state_arena`.
+const MAX_FREE_REGIONS: usize =
+    crate::kernel::config::static_slots(crate::abi::contracts::resource::POOL_STATE_FREE_LIST);
+static mut FREE_LIST: crate::kernel::mem::table::Table<FreeRegion, MAX_FREE_REGIONS> = crate::boot_table!(
+    MAX_FREE_REGIONS,
+    FreeRegion { offset: 0, size: 0 },
+    crate::abi::contracts::resource::POOL_STATE_FREE_LIST
+);
 static mut FREE_COUNT: usize = 0;
+/// bcm2712: freed regions waiting to be returned to zero (the *in-zeroing*
+/// state). A region here is on neither list: no allocation
+/// can take it until a domain with slack has zeroed it ([`zero_in_slack`]),
+/// when it joins the free list. Sized with the free list.
+#[cfg(feature = "chip-bcm2712")]
+static mut ZEROING: crate::kernel::mem::table::Table<FreeRegion, MAX_FREE_REGIONS> = crate::boot_table!(
+    MAX_FREE_REGIONS,
+    FreeRegion { offset: 0, size: 0 },
+    crate::abi::contracts::resource::POOL_STATE_FREE_LIST
+);
+#[cfg(feature = "chip-bcm2712")]
+static mut ZEROING_COUNT: usize = 0;
+
+/// Size the free list (and, on bcm2712, the in-zeroing list beside it) to `n`
+/// entries, all live.
+///
+/// # Safety
+/// Graph-preparation context: the arena is being reset and no allocation is
+/// in flight, and no domain is zeroing in its slack (preparation steps no
+/// domain).
+pub unsafe fn size_free_list(n: usize) -> Result<(), crate::kernel::mem::table::TableError> {
+    // Not under `STATE_LOCK`: a table that moves carves, and the carve
+    // asks the arena for its top ([`cede_arena_above`]).
+    let list = &*core::ptr::addr_of!(FREE_LIST);
+    list.reserve(n)?;
+    list.grow(n)?;
+    #[cfg(feature = "chip-bcm2712")]
+    {
+        let z = &*core::ptr::addr_of!(ZEROING);
+        z.reserve(n)?;
+        z.grow(n)?;
+    }
+    Ok(())
+}
+
+/// The in-zeroing list, sized from the plan's defaults when no plan has sized
+/// it. Called with `STATE_LOCK` held.
+#[cfg(feature = "chip-bcm2712")]
+unsafe fn zeroing_list() -> *mut crate::kernel::mem::table::Table<FreeRegion, MAX_FREE_REGIONS> {
+    let p = core::ptr::addr_of_mut!(ZEROING);
+    (*p).size_unplanned(|| {
+        crate::kernel::sys::resource_ledger::ceiling(
+            crate::abi::contracts::resource::POOL_STATE_FREE_LIST,
+        ) as usize
+    });
+    p
+}
+
+/// The free list, sized from the plan's defaults when no plan has sized it.
+/// Called with `STATE_LOCK` held.
+unsafe fn free_list() -> *mut crate::kernel::mem::table::Table<FreeRegion, MAX_FREE_REGIONS> {
+    let p = core::ptr::addr_of_mut!(FREE_LIST);
+    (*p).size_unplanned(|| {
+        crate::kernel::sys::resource_ledger::ceiling(
+            crate::abi::contracts::resource::POOL_STATE_FREE_LIST,
+        ) as usize
+    });
+    p
+}
 
 /// Serialises the state arena's bookkeeping (`STATE_ARENA_OFFSET` and the
 /// free list). Instantiation and teardown run on core 0, but an elastic
@@ -667,6 +882,350 @@ impl StateLock {
 impl Drop for StateLock {
     fn drop(&mut self) {
         STATE_LOCK.store(false, portable_atomic::Ordering::Release);
+    }
+}
+
+impl StateLock {
+    /// The lock if it is free now; `None` rather than waiting.
+    #[cfg(feature = "chip-bcm2712")]
+    fn try_acquire() -> Option<Self> {
+        STATE_LOCK
+            .compare_exchange(
+                false,
+                true,
+                portable_atomic::Ordering::Acquire,
+                portable_atomic::Ordering::Relaxed,
+            )
+            .is_ok()
+            .then_some(StateLock)
+    }
+}
+
+// ============================================================================
+// bcm2712: the arena's zone, its zeroed frontier and slack zeroing
+// ============================================================================
+//
+// Offsets below are from `ARENA_BASE`. Invariants:
+//
+// - `[STATE_ARENA_OFFSET, FRONTIER)` is zero. A bump allocation zeroes only
+//   what it takes above `FRONTIER` and raises `FRONTIER` past it; a retreat
+//   of the bump offset happens only over a clean (zeroed) region; a reset
+//   drops `FRONTIER` to 0. So `FRONTIER >= STATE_ARENA_OFFSET` always.
+// - Every region on the free list is zero. A freed region goes to the
+//   in-zeroing list instead, and joins the free list once a domain with slack
+//   has zeroed it.
+// - One claim at a time (`CLAIM`): the frontier chunk `[FRONTIER, CLAIM_END)`
+//   or one in-zeroing chunk, owned by the domain zeroing it outside the lock.
+//   A frontier claim completes without the lock, so an allocation that needs
+//   memory under it may wait for it while holding the lock; an in-zeroing
+//   claim completes under the lock, and nothing waits for one with it held.
+// - `ARENA_HIGH` is the highest offset the arena has ever handed out or
+//   claimed. A carve lowers `ARENA_CAP` and backs off if `ARENA_HIGH` is
+//   above it; an allocation raises `ARENA_HIGH` and backs off if `ARENA_CAP`
+//   is below it. Both sequentially consistent, so one of any two racing sees
+//   the other, and neither needs `STATE_LOCK` (a carve can be asked for while
+//   it is held — a table's first use).
+
+/// No claim, a frontier claim, an in-zeroing claim.
+#[cfg(feature = "chip-bcm2712")]
+const CLAIM_NONE: u8 = 0;
+#[cfg(feature = "chip-bcm2712")]
+const CLAIM_FRONTIER: u8 = 1;
+#[cfg(feature = "chip-bcm2712")]
+const CLAIM_ZEROING: u8 = 2;
+
+#[cfg(feature = "chip-bcm2712")]
+static FRONTIER: portable_atomic::AtomicUsize = portable_atomic::AtomicUsize::new(0);
+#[cfg(feature = "chip-bcm2712")]
+static CLAIM: portable_atomic::AtomicU8 = portable_atomic::AtomicU8::new(CLAIM_NONE);
+#[cfg(any(feature = "chip-bcm2712", feature = "rp"))]
+static ARENA_HIGH: portable_atomic::AtomicUsize = portable_atomic::AtomicUsize::new(0);
+/// Bytes the domains' slack has zeroed, and slack passes run.
+#[cfg(feature = "chip-bcm2712")]
+static SLACK_ZEROED: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
+#[cfg(feature = "chip-bcm2712")]
+static SLACK_PASSES: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
+/// Bytes zeroed synchronously because nothing zeroed fitted, anywhere (on a
+/// step or not): what slack did not keep up with.
+#[cfg(feature = "chip-bcm2712")]
+static SYNC_ZEROED: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
+
+/// Install the arena over `[base, base + size)`: the device tree's zone above
+/// the boot image (`platform/bcm2712/memmap.rs`). Called once at boot before
+/// anything allocates. Nothing in it is zeroed here.
+#[cfg(feature = "chip-bcm2712")]
+pub fn install_arena(base: usize, size: usize) {
+    use portable_atomic::Ordering::SeqCst;
+    ARENA_BASE.store(base, SeqCst);
+    ARENA_CAP.store(size, SeqCst);
+    FRONTIER.store(0, SeqCst);
+    ARENA_HIGH.store(0, SeqCst);
+}
+
+/// RP: install the arena the graph's plan gives it, `[base, base + size)` of
+/// the static pool (`kernel::mem::carve::place_arenas`). `[dirty_from, size)`
+/// held the previous plan's tables or buffer arena, so it is raised under
+/// [`CLEAN_MARK`] and an allocation there zeroes what it takes; the rest is
+/// `.bss` or memory the arena itself handed out before.
+#[cfg(feature = "rp")]
+pub fn install_planned_arena(base: usize, size: usize, dirty_from: usize) {
+    use portable_atomic::Ordering::SeqCst;
+    let _lock = StateLock::acquire();
+    ARENA_BASE.store(base, SeqCst);
+    ARENA_CAP.store(size, SeqCst);
+    ARENA_HIGH.store(0, SeqCst);
+    if size > dirty_from {
+        // SAFETY: under `STATE_LOCK`.
+        unsafe { CLEAN_MARK = CLEAN_MARK.max(size) };
+    }
+}
+
+/// RP: the plan starts over (`kernel::mem::carve::begin_plan`). The arena is
+/// uninstalled — nothing in it is live at a rebuild — so the plan's carves may
+/// take any of the pool until [`install_planned_arena`] gives it its share.
+#[cfg(feature = "rp")]
+pub fn uninstall_arena() {
+    use portable_atomic::Ordering::SeqCst;
+    let _lock = StateLock::acquire();
+    ARENA_BASE.store(0, SeqCst);
+    ARENA_CAP.store(0, SeqCst);
+    ARENA_HIGH.store(0, SeqCst);
+}
+
+/// A carve asks for everything from `addr` up (`kernel::mem::carve`): shrink
+/// the arena to end there. `false` when the arena has handed out (or a domain
+/// is zeroing) memory at or above it, which the carve must not take.
+#[cfg(any(feature = "chip-bcm2712", feature = "rp"))]
+pub fn cede_arena_above(addr: usize) -> bool {
+    use portable_atomic::Ordering::SeqCst;
+    let base = ARENA_BASE.load(SeqCst);
+    if base == 0 {
+        return true;
+    }
+    let Some(new_cap) = addr.checked_sub(base) else {
+        return false;
+    };
+    let old = ARENA_CAP.load(SeqCst);
+    if new_cap >= old {
+        return true;
+    }
+    ARENA_CAP.store(new_cap, SeqCst);
+    if ARENA_HIGH.load(SeqCst) > new_cap {
+        ARENA_CAP.store(old, SeqCst);
+        return false;
+    }
+    true
+}
+
+/// Reserve `[.., end)` of the arena against carves: `false` (and nothing
+/// reserved) when a carve has taken it.
+#[cfg(any(feature = "chip-bcm2712", feature = "rp"))]
+fn hold_arena_to(end: usize) -> bool {
+    use portable_atomic::Ordering::SeqCst;
+    if end > ARENA_CAP.load(SeqCst) {
+        return false;
+    }
+    ARENA_HIGH.fetch_max(end, SeqCst);
+    end <= ARENA_CAP.load(SeqCst)
+}
+
+/// Wait for a frontier claim to complete. Its completion takes no lock, so
+/// this may be called with `STATE_LOCK` held.
+#[cfg(feature = "chip-bcm2712")]
+fn wait_frontier_claim() {
+    while CLAIM.load(portable_atomic::Ordering::Acquire) == CLAIM_FRONTIER {
+        core::hint::spin_loop();
+    }
+}
+
+/// Wait for any claim to complete, then take `STATE_LOCK` with none in
+/// flight. An in-zeroing claim completes under the lock, so the wait is
+/// outside it.
+#[cfg(feature = "chip-bcm2712")]
+fn lock_with_no_claim() -> StateLock {
+    loop {
+        while CLAIM.load(portable_atomic::Ordering::Acquire) != CLAIM_NONE {
+            core::hint::spin_loop();
+        }
+        let lock = StateLock::acquire();
+        if CLAIM.load(portable_atomic::Ordering::Acquire) == CLAIM_NONE {
+            return lock;
+        }
+    }
+}
+
+/// Smallest slack worth a pass: below it, checking the clock costs about
+/// what zeroing would save.
+#[cfg(feature = "chip-bcm2712")]
+const MIN_SLACK_US: u64 = 20;
+
+/// Claim the next chunk to zero: an in-zeroing region's head first (it holds
+/// memory back from reuse), else the frontier while it is less than
+/// `ZERO_AHEAD_BYTES` ahead of the bump offset. `None` when there is nothing
+/// to do, another domain holds the claim or the lock is busy — a domain
+/// never waits to donate its slack.
+#[cfg(feature = "chip-bcm2712")]
+fn claim_chunk() -> Option<(u8, usize, usize)> {
+    use portable_atomic::Ordering::{AcqRel, Acquire, Release};
+    let chunk = crate::kernel::config::ZERO_CHUNK_BYTES;
+    let _lock = StateLock::try_acquire()?;
+    if CLAIM.load(Acquire) != CLAIM_NONE {
+        return None;
+    }
+    // SAFETY: the arena statics and lists are touched only under the lock.
+    unsafe {
+        let list = &mut *zeroing_list();
+        if ZEROING_COUNT > 0 {
+            let i = ZEROING_COUNT - 1;
+            let r = list[i];
+            let take = r.size.min(chunk);
+            if take == r.size {
+                ZEROING_COUNT = i;
+            } else {
+                list[i] = FreeRegion {
+                    offset: r.offset + take,
+                    size: r.size - take,
+                };
+            }
+            CLAIM.store(CLAIM_ZEROING, Release);
+            return Some((CLAIM_ZEROING, r.offset, take));
+        }
+        let f = FRONTIER.load(Acquire);
+        let target = STATE_ARENA_OFFSET
+            .saturating_add(crate::kernel::config::ZERO_AHEAD_BYTES)
+            .min(arena_cap());
+        if f >= target {
+            return None;
+        }
+        let take = chunk.min(target - f);
+        if !hold_arena_to(f + take) {
+            return None;
+        }
+        if CLAIM
+            .compare_exchange(CLAIM_NONE, CLAIM_FRONTIER, AcqRel, Acquire)
+            .is_err()
+        {
+            return None;
+        }
+        Some((CLAIM_FRONTIER, f, take))
+    }
+}
+
+/// Zero the arena in this domain's slack: `slack_us` is what is left of its
+/// tick budget after its modules stepped. Bounded: at most half the slack,
+/// one `ZERO_CHUNK_BYTES` claim between clock reads. A domain with no budget
+/// (limit 0) passes 0 and donates nothing. A no-op off bcm2712, whose arenas
+/// start zeroed and are returned to zero on free.
+#[inline]
+pub fn zero_in_slack(slack_us: u64) {
+    #[cfg(feature = "chip-bcm2712")]
+    {
+        if slack_us < MIN_SLACK_US || arena_cap() == 0 {
+            return;
+        }
+        let start = crate::kernel::sys::hal::now_micros();
+        let budget = slack_us / 2;
+        let base = arena_ptr();
+        let mut zeroed = 0u64;
+        while let Some((kind, off, len)) = claim_chunk() {
+            // SAFETY: the claim makes `[off, off + len)` this domain's alone:
+            // above the bump offset (a frontier claim) or a freed region
+            // nothing references (an in-zeroing one).
+            unsafe { core::ptr::write_bytes(base.add(off), 0, len) };
+            zeroed += len as u64;
+            if kind == CLAIM_FRONTIER {
+                FRONTIER.store(off + len, portable_atomic::Ordering::Release);
+                CLAIM.store(CLAIM_NONE, portable_atomic::Ordering::Release);
+            } else {
+                let _lock = StateLock::acquire();
+                // SAFETY: under the lock; the region is zero now.
+                unsafe { insert_clean(off, len) };
+                CLAIM.store(CLAIM_NONE, portable_atomic::Ordering::Release);
+            }
+            if crate::kernel::sys::hal::now_micros().saturating_sub(start) >= budget {
+                break;
+            }
+        }
+        if zeroed > 0 {
+            SLACK_ZEROED.fetch_add(zeroed, portable_atomic::Ordering::Relaxed);
+        }
+        let n = SLACK_PASSES.fetch_add(1, portable_atomic::Ordering::Relaxed);
+        if n.is_multiple_of(8192) {
+            let (fr, off, zq) = zero_state();
+            log::info!(
+                "[heap] zstep={} zslack={} zsync={} fr={fr} off={off} cap={} zq={zq}",
+                crate::kernel::mem::heap::heap_zero_step_bytes_total(),
+                SLACK_ZEROED.load(portable_atomic::Ordering::Relaxed),
+                SYNC_ZEROED.load(portable_atomic::Ordering::Relaxed),
+                arena_cap()
+            );
+            // The memory map beside it: a one-shot boot line can miss the
+            // rig's capture.
+            crate::platform::memmap::report();
+        }
+    }
+    #[cfg(not(feature = "chip-bcm2712"))]
+    let _ = slack_us;
+}
+
+/// Run the zeroed frontier its full distance (`ZERO_AHEAD_BYTES`) ahead of
+/// the bump offset, and zero every region waiting on the in-zeroing list, now.
+/// Called when a graph has been instantiated and before it first steps — not
+/// on a step, and bounded by `ZERO_AHEAD_BYTES` plus what was freed — so the
+/// first heap growth finds zeroed memory before any domain has had slack. A
+/// no-op off bcm2712.
+pub fn prime_frontier() {
+    #[cfg(feature = "chip-bcm2712")]
+    {
+        let base = arena_ptr();
+        while let Some((kind, off, len)) = claim_chunk() {
+            // SAFETY: as in `zero_in_slack`: the claim makes the range ours.
+            unsafe { core::ptr::write_bytes(base.add(off), 0, len) };
+            if kind == CLAIM_FRONTIER {
+                FRONTIER.store(off + len, portable_atomic::Ordering::Release);
+            } else {
+                let _lock = StateLock::acquire();
+                // SAFETY: under the lock; the region is zero now.
+                unsafe { insert_clean(off, len) };
+            }
+            CLAIM.store(CLAIM_NONE, portable_atomic::Ordering::Release);
+        }
+    }
+}
+
+/// `(frontier, bump offset, regions waiting to be zeroed)`; the frontier is
+/// the bump offset off bcm2712, where no frontier is kept.
+pub fn zero_state() -> (usize, usize, usize) {
+    // SAFETY: word reads of the arena statics, for telemetry.
+    unsafe {
+        #[cfg(feature = "chip-bcm2712")]
+        {
+            (
+                FRONTIER.load(portable_atomic::Ordering::Relaxed),
+                STATE_ARENA_OFFSET,
+                ZEROING_COUNT,
+            )
+        }
+        #[cfg(not(feature = "chip-bcm2712"))]
+        {
+            (STATE_ARENA_OFFSET, STATE_ARENA_OFFSET, 0)
+        }
+    }
+}
+
+/// `(slack_zeroed, sync_zeroed)` bytes since boot: what the domains' slack
+/// zeroed, and what allocations had to zero themselves. `(0, 0)` off bcm2712.
+pub fn zero_totals() -> (u64, u64) {
+    #[cfg(feature = "chip-bcm2712")]
+    {
+        (
+            SLACK_ZEROED.load(portable_atomic::Ordering::Relaxed),
+            SYNC_ZEROED.load(portable_atomic::Ordering::Relaxed),
+        )
+    }
+    #[cfg(not(feature = "chip-bcm2712"))]
+    {
+        (0, 0)
     }
 }
 
@@ -756,19 +1315,29 @@ pub fn alloc_private(size: usize, align: usize) -> Result<*mut u8, LoaderError> 
     // envelope.
     unsafe {
         let _lock = StateLock::acquire();
-        let base = core::ptr::addr_of_mut!(STATE_ARENA).cast::<u8>() as usize;
+        let base = arena_ptr() as usize;
         let cur = base + STATE_ARENA_OFFSET;
         let start = cur.next_multiple_of(align);
         let end = start
             .checked_add(size)
             .ok_or(LoaderError::StatePoolExhausted)?;
         let used = end - base;
+        let cap = arena_cap();
         let pool = crate::abi::contracts::resource::POOL_STATE_ARENA;
         let envelope = crate::kernel::sys::resource_ledger::enforced(pool);
-        if used > STATE_ARENA_SIZE || envelope.is_some_and(|cap| used as u32 > cap) {
+        if used > cap || envelope.is_some_and(|env| used as u64 > env) {
             log::error!(
                 "[loader] STATE ARENA EXHAUSTED for a private region — need={size} align={align} \
-                 would use={used} cap={STATE_ARENA_SIZE}"
+                 would use={used} cap={cap}"
+            );
+            crate::kernel::sys::resource_ledger::deny(pool);
+            return Err(LoaderError::StatePoolExhausted);
+        }
+        #[cfg(any(feature = "chip-bcm2712", feature = "rp"))]
+        if !hold_arena_to(used) {
+            log::error!(
+                "[loader] STATE ARENA EXHAUSTED for a private region (taken by a kernel table \
+                 carve) — need={size} would use={used}"
             );
             crate::kernel::sys::resource_ledger::deny(pool);
             return Err(LoaderError::StatePoolExhausted);
@@ -776,6 +1345,7 @@ pub fn alloc_private(size: usize, align: usize) -> Result<*mut u8, LoaderError> 
         let ptr = start as *mut u8;
         core::ptr::write_bytes(ptr, 0, size);
         STATE_ARENA_OFFSET = used;
+        CLEAN_MARK = CLEAN_MARK.max(used);
         Ok(ptr)
     }
 }
@@ -928,22 +1498,37 @@ const STATE_CANARY_SIZE: usize = 4;
 /// `write_bytes(ptr, 0, size)` would then overrun by the original
 /// huge `size`.
 pub fn alloc_state(size: usize) -> Result<*mut u8, LoaderError> {
-    let ptr = reserve_state(size)?;
-    // Outside the lock: zero exactly the bytes handed out (the arena is never
-    // zeroed whole) and stamp the canary past them.
+    let (ptr, dirty) = reserve_state(size)?;
+    // Outside the lock: zero the bytes the arena cannot vouch for (see
+    // `AlignedArena`) — `dirty` is `(offset, len)` from `ptr` — and stamp the
+    // canary.
+    let start = dirty.0.min(size);
+    let len = dirty.1.min(size - start);
     // SAFETY: `reserve_state` reserved `size + STATE_CANARY_SIZE` bytes at
     // `ptr` for this caller alone.
     unsafe {
-        core::ptr::write_bytes(ptr, 0, size);
+        if len > 0 {
+            core::ptr::write_bytes(ptr.add(start), 0, len);
+        }
         core::ptr::write_unaligned(ptr.add(size) as *mut u32, STATE_CANARY);
+    }
+    if len > 0 {
+        crate::kernel::mem::heap::note_zeroed(len);
+        #[cfg(feature = "chip-bcm2712")]
+        SYNC_ZEROED.fetch_add(len as u64, portable_atomic::Ordering::Relaxed);
     }
     Ok(ptr)
 }
 
 /// The bookkeeping half of [`alloc_state`]: reserve `size` bytes plus the
 /// canary, from the free list or the bump mark, under `STATE_LOCK`. The
-/// bytes are not touched.
-fn reserve_state(size: usize) -> Result<*mut u8, LoaderError> {
+/// bytes are not touched. Returns the region and the part of it, `(offset,
+/// len)` from its start, that may be dirty: none on Linux and from the free
+/// list on bcm2712 (both return freed memory to zero), the part below
+/// `CLEAN_MARK` of a bump allocation on the other zero-initialised arenas,
+/// the part above the zeroed frontier of a bump allocation on bcm2712, and
+/// all of a reused hole elsewhere.
+fn reserve_state(size: usize) -> Result<(*mut u8, (usize, usize)), LoaderError> {
     // SAFETY: the arena statics are touched only under `STATE_LOCK`.
     unsafe {
         let need = size
@@ -952,74 +1537,74 @@ fn reserve_state(size: usize) -> Result<*mut u8, LoaderError> {
             .ok_or(LoaderError::StatePoolExhausted)?;
         let _lock = StateLock::acquire();
         // 1. Scan free list for first-fit.
-        let free_list = &raw mut FREE_LIST;
+        let free_list = free_list();
         let count = FREE_COUNT;
         let mut i = 0;
         while i < count {
-            let region = (*free_list)[i];
-            if (region.size as usize) >= need {
-                let offset = region.offset as usize;
-                let remainder = region.size as usize - need;
+            let region = (&(*free_list))[i];
+            if region.size >= need {
+                let offset = region.offset;
+                let remainder = region.size - need;
                 if remainder == 0 {
                     // Consume the whole region: compact the list.
-                    for j in i..count - 1 {
-                        (*free_list)[j] = (*free_list)[j + 1];
-                    }
+                    (&mut (*free_list)).copy_within(i + 1..count, i);
                     FREE_COUNT = count - 1;
                 } else {
                     // Shrink: advance the region past the allocation.
-                    (*free_list)[i] = FreeRegion {
-                        offset: (offset + need) as u32,
-                        size: remainder as u32,
+                    (&mut (*free_list))[i] = FreeRegion {
+                        offset: offset + need,
+                        size: remainder,
                     };
                 }
-                let ptr = core::ptr::addr_of_mut!(STATE_ARENA)
-                    .cast::<u8>()
-                    .add(offset);
-                return Ok(ptr);
+                let ptr = arena_ptr().add(offset);
+                return Ok((ptr, (0, if ZERO_ON_FREE { 0 } else { need })));
             }
             i += 1;
         }
         // Bump from the high-water mark, against three separate refusals:
-        // offset overflow, the compiled arena size, and the deployment
-        // envelope. Each is kept apart from the others because each is fixed
-        // somewhere different, and a reader acting on the wrong one wastes a
-        // rebuild.
+        // offset overflow, the arena's capacity, and the deployment envelope.
+        // Each is kept apart from the others because each is fixed somewhere
+        // different, and a reader acting on the wrong one wastes a rebuild.
         let aligned = align_up(STATE_ARENA_OFFSET);
         // TWO ceilings guard this arena and they are reported apart, because
-        // they are raised in different places by different people. The compiled
-        // `STATE_ARENA_SIZE` is a platform fact, changed in `kernel::config` and
-        // by rebuilding the kernel (no ABI epoch). The envelope capacity is a
-        // PACKAGING fact, computed by the composer from the graph that was
-        // packed and installed from the boot config's FXEV section — and it is
-        // usually the lower of the two, so it is usually the one that refuses.
-        // A single message naming the compiled constant sends the reader to
-        // raise a number that had nothing to do with the refusal, which is
-        // worse than no diagnostic: it looks like an answer.
+        // they are raised in different places by different people. The arena's
+        // capacity is a platform fact: the compiled `STATE_ARENA_SIZE`
+        // (`kernel::config`, a kernel rebuild, no ABI epoch), or on bcm2712
+        // the DRAM the device tree gives the arena, less the kernel tables
+        // carved from its top. The envelope capacity is a PACKAGING fact,
+        // computed by the composer from the graph that was packed and
+        // installed from the boot config's FXEV section — and it is usually
+        // the lower of the two, so it is usually the one that refuses. A
+        // single message naming the platform figure sends the reader to raise
+        // a number that had nothing to do with the refusal, which is worse
+        // than no diagnostic: it looks like an answer.
         let pool = crate::abi::contracts::resource::POOL_STATE_ARENA;
         let envelope = crate::kernel::sys::resource_ledger::enforced(pool);
+        let cap = arena_cap();
         let next = match aligned.checked_add(need) {
-            Some(n) if n > STATE_ARENA_SIZE => {
+            Some(n) if n > cap => {
                 log::error!(
-                    "[loader] STATE ARENA EXHAUSTED (compiled capacity) — need={need} \
-                     used={aligned} cap={STATE_ARENA_SIZE} (raise \
-                     STATE_ARENA_SIZE in kernel::config for this platform and rebuild the \
-                     kernel, or reduce module arena demand; modules without a heap arena will \
-                     silently fail every heap_alloc call)"
+                    "[loader] STATE ARENA EXHAUSTED (platform capacity) — need={need} \
+                     used={aligned} cap={cap} (the compiled STATE_ARENA_SIZE in kernel::config, \
+                     on bcm2712 the DRAM the device tree leaves above the boot image after \
+                     the kernel's tables, on RP the static pool the graph's tables and buffer \
+                     arena leave; reduce module arena demand or give the node more \
+                     memory; modules without a heap arena will silently fail every heap_alloc \
+                     call)"
                 );
                 crate::kernel::sys::resource_ledger::deny(pool);
                 return Err(LoaderError::StatePoolExhausted);
             }
-            Some(n) if envelope.is_some_and(|cap| n as u32 > cap) => {
+            Some(n) if envelope.is_some_and(|cap| n as u64 > cap) => {
                 // Unwrap-free: the guard above only fires when `envelope` is
                 // `Some`, and the value is wanted in the message.
-                let cap = envelope.unwrap_or(0);
+                let env = envelope.unwrap_or(0);
                 log::error!(
                     "[loader] STATE ARENA EXHAUSTED (deployment envelope) — need={need} \
-                     used={aligned} cap={cap} compiled={STATE_ARENA_SIZE} (the packaged \
-                     capacity envelope is the binding ceiling, not the compiled arena: repack \
-                     the graph so its `capacity:` block admits this module set, or remove a \
-                     module from the graph. Raising STATE_ARENA_SIZE changes nothing here)"
+                     used={aligned} cap={env} platform={cap} (the packaged capacity envelope \
+                     is the binding ceiling, not the platform's arena: repack the graph so its \
+                     `capacity:` block admits this module set, or remove a module from the \
+                     graph. Raising STATE_ARENA_SIZE changes nothing here)"
                 );
                 crate::kernel::sys::resource_ledger::deny(pool);
                 return Err(LoaderError::StatePoolExhausted);
@@ -1033,18 +1618,51 @@ fn reserve_state(size: usize) -> Result<*mut u8, LoaderError> {
                 // misreport the sizes involved.
                 log::error!(
                     "[loader] STATE ARENA EXHAUSTED (offset overflow) — need={need} \
-                     used={aligned} cap={STATE_ARENA_SIZE}: the request is large enough that \
+                     used={aligned} cap={cap}: the request is large enough that \
                      `used + need` wraps, so it cannot be satisfied at any capacity"
                 );
                 crate::kernel::sys::resource_ledger::deny(pool);
                 return Err(LoaderError::StatePoolExhausted);
             }
         };
-        let ptr = core::ptr::addr_of_mut!(STATE_ARENA)
-            .cast::<u8>()
-            .add(aligned);
+        // bcm2712 and RP: hold the memory against a carve racing for the
+        // arena's top; bcm2712 also waits out a frontier claim the
+        // allocation would reach into.
+        #[cfg(any(feature = "chip-bcm2712", feature = "rp"))]
+        if !hold_arena_to(next) {
+            log::error!(
+                "[loader] STATE ARENA EXHAUSTED (taken by a kernel table carve) — \
+                 need={need} used={aligned}"
+            );
+            crate::kernel::sys::resource_ledger::deny(pool);
+            return Err(LoaderError::StatePoolExhausted);
+        }
+        #[cfg(feature = "chip-bcm2712")]
+        if next > FRONTIER.load(portable_atomic::Ordering::Acquire) {
+            wait_frontier_claim();
+        }
+        let ptr = arena_ptr().add(aligned);
         STATE_ARENA_OFFSET = next;
-        Ok(ptr)
+        #[cfg(feature = "chip-bcm2712")]
+        let dirty = {
+            // `[aligned, FRONTIER)` is zero; what lies above it is not.
+            let f = FRONTIER.load(portable_atomic::Ordering::Acquire);
+            if next > f {
+                FRONTIER.store(next, portable_atomic::Ordering::Release);
+            }
+            let clean = f.saturating_sub(aligned).min(need);
+            (clean, need - clean)
+        };
+        #[cfg(not(feature = "chip-bcm2712"))]
+        let dirty = if ZERO_ON_FREE {
+            (0, 0)
+        } else if ZEROED_ARENA {
+            (0, CLEAN_MARK.saturating_sub(aligned))
+        } else {
+            (0, need)
+        };
+        CLEAN_MARK = CLEAN_MARK.max(next);
+        Ok((ptr, dirty))
     }
 }
 
@@ -1073,7 +1691,7 @@ pub fn validate_state_canary(ptr: *const u8, size: usize) -> bool {
 /// `used − Σ holes`.
 pub fn arena_usage() -> (usize, usize) {
     // SAFETY: word-sized read of static usize.
-    unsafe { (STATE_ARENA_OFFSET, STATE_ARENA_SIZE) }
+    unsafe { (STATE_ARENA_OFFSET, arena_cap()) }
 }
 /// Return a previously allocated region to the pool. `size` must match
 /// the original allocation size; it is re-aligned internally. Adjacent
@@ -1106,7 +1724,7 @@ pub unsafe fn free_state_range(ptr: *mut u8, size: usize) {
     if is_iso_ptr(ptr as *const u8) {
         return;
     }
-    let base = core::ptr::addr_of_mut!(STATE_ARENA).cast::<u8>();
+    let base = arena_ptr();
     let offset = ptr as usize - base as usize;
     // Checked arithmetic mirrors `alloc_state`. A wrapping
     // `size + STATE_CANARY_SIZE` would compute a tiny `need` and
@@ -1118,50 +1736,94 @@ pub unsafe fn free_state_range(ptr: *mut u8, size: usize) {
         log::error!("[loader] free_state_range: size={size} overflows");
         return;
     };
+    // Return the region to zero before it is on the free list, so the next
+    // allocation from it needs no zeroing (Linux; see `AlignedArena`).
+    #[cfg(feature = "host-linux")]
+    // SAFETY: the caller's region (`need` covers its canary and alignment
+    // slack), referenced by nothing any more.
+    unsafe {
+        rezero(ptr, need)
+    };
+    // bcm2712: the region waits on the in-zeroing list for a domain with
+    // slack to zero it. Only when that list is full is it zeroed here.
+    #[cfg(feature = "chip-bcm2712")]
+    {
+        {
+            let _lock = StateLock::acquire();
+            // SAFETY: the lists are touched only under the lock.
+            unsafe {
+                let list = &mut *zeroing_list();
+                if ZEROING_COUNT < list.len() {
+                    list[ZEROING_COUNT] = FreeRegion { offset, size: need };
+                    ZEROING_COUNT += 1;
+                    return;
+                }
+            }
+        }
+        // SAFETY: the caller's region, referenced by nothing any more.
+        unsafe { core::ptr::write_bytes(ptr, 0, need) };
+        crate::kernel::mem::heap::note_zeroed(need);
+        SYNC_ZEROED.fetch_add(need as u64, portable_atomic::Ordering::Relaxed);
+    }
     let _lock = StateLock::acquire();
-    let free_list = &raw mut FREE_LIST;
-    let mut new_offset = offset as u32;
-    let mut new_size = need as u32;
-    // Coalesce with adjacent regions (walk + merge + remove merged entries).
-    let mut i = 0;
-    while i < FREE_COUNT {
-        let r = (*free_list)[i];
-        if r.offset + r.size == new_offset {
-            // Previous neighbour: absorb.
-            new_offset = r.offset;
-            new_size += r.size;
-            for j in i..FREE_COUNT - 1 {
-                (*free_list)[j] = (*free_list)[j + 1];
+    // SAFETY: under the lock; the region is zero (Linux, bcm2712) or its next
+    // allocation zeroes it.
+    unsafe { insert_clean(offset, need) };
+}
+
+/// Put `[offset, offset + size)` on the free list, coalescing with its
+/// neighbours, or retract the bump offset when it ends there. Called with
+/// `STATE_LOCK` held.
+unsafe fn insert_clean(offset: usize, size: usize) {
+    // SAFETY: the caller holds the lock.
+    unsafe {
+        let free_list = free_list();
+        let mut new_offset = offset;
+        let mut new_size = size;
+        // Coalesce with adjacent regions (walk + merge + remove merged entries).
+        let mut i = 0;
+        while i < FREE_COUNT {
+            let r = (&(*free_list))[i];
+            if r.offset + r.size == new_offset {
+                // Previous neighbour: absorb.
+                new_offset = r.offset;
+                new_size += r.size;
+                (&mut (*free_list)).copy_within(i + 1..FREE_COUNT, i);
+                FREE_COUNT -= 1;
+                continue;
             }
-            FREE_COUNT -= 1;
-            continue;
-        }
-        if new_offset + new_size == r.offset {
-            // Next neighbour: absorb.
-            new_size += r.size;
-            for j in i..FREE_COUNT - 1 {
-                (*free_list)[j] = (*free_list)[j + 1];
+            if new_offset + new_size == r.offset {
+                // Next neighbour: absorb.
+                new_size += r.size;
+                (&mut (*free_list)).copy_within(i + 1..FREE_COUNT, i);
+                FREE_COUNT -= 1;
+                continue;
             }
-            FREE_COUNT -= 1;
-            continue;
+            i += 1;
         }
-        i += 1;
-    }
-    // If the region ends at the high-water mark, retract instead of storing.
-    if (new_offset + new_size) as usize == STATE_ARENA_OFFSET {
-        STATE_ARENA_OFFSET = new_offset as usize;
-        return;
-    }
-    // Otherwise record in the free list; if full, the region is leaked
-    // until the next full reset.
-    if FREE_COUNT < MAX_FREE_REGIONS {
-        (*free_list)[FREE_COUNT] = FreeRegion {
-            offset: new_offset,
-            size: new_size,
-        };
-        FREE_COUNT += 1;
-    } else {
-        log::warn!("[loader] free list full; leaking {new_size} bytes until reset");
+        // If the region ends at the high-water mark, retract instead of storing.
+        if new_offset + new_size == STATE_ARENA_OFFSET {
+            STATE_ARENA_OFFSET = new_offset;
+            return;
+        }
+        // Otherwise record in the free list; if full, the region is leaked
+        // until the next full reset.
+        if FREE_COUNT < (&(*free_list)).len() {
+            (&mut (*free_list))[FREE_COUNT] = FreeRegion {
+                offset: new_offset,
+                size: new_size,
+            };
+            FREE_COUNT += 1;
+        } else {
+            log::warn!(
+                "[loader] pool 'state_free_list' full at {} entries; leaking {new_size} bytes \
+                 until reset",
+                (&(*free_list)).len()
+            );
+            crate::kernel::sys::resource_ledger::deny(
+                crate::abi::contracts::resource::POOL_STATE_FREE_LIST,
+            );
+        }
     }
 }
 /// Reset the pool: clear the free list and drop the high-water mark to 0.
@@ -1174,16 +1836,32 @@ pub fn reset_state_arena() {
     // SAFETY: at a rebuild no module is live; the lock orders this against
     // any allocation still finishing on another core.
     unsafe {
+        #[cfg(not(feature = "chip-bcm2712"))]
         let _lock = StateLock::acquire();
+        // bcm2712: no domain may be zeroing a region the reset hands back.
+        #[cfg(feature = "chip-bcm2712")]
+        let _lock = lock_with_no_claim();
+        // Everything below the mark is returned to zero at once (Linux), so
+        // the next graph's allocations need none.
+        #[cfg(feature = "host-linux")]
+        rezero(arena_ptr(), CLEAN_MARK);
         STATE_ARENA_OFFSET = 0;
         FREE_COUNT = 0;
+        // bcm2712: everything the old graph held is dirty again; the frontier
+        // restarts at the bottom and the in-zeroing list is moot.
+        #[cfg(feature = "chip-bcm2712")]
+        {
+            FRONTIER.store(0, portable_atomic::Ordering::Release);
+            ZEROING_COUNT = 0;
+        }
         // Reclaim the isolated arena too; the next graph rebuilds its isolated
         // tables from scratch (mmu::reset_isolation runs in the same pass).
         #[cfg(feature = "kernel-vm")]
         {
             ISO_ARENA_OFFSET = 0;
         }
-        // Content is not zeroed; alloc_state zeros each allocation.
+        // Elsewhere content is not zeroed here; an allocation below the mark
+        // zeroes what it takes.
     }
 }
 /// Free-list occupancy: `(holes, hole_bytes)` — the regions below the
@@ -1196,7 +1874,7 @@ pub fn state_free_list_usage() -> (usize, usize) {
     unsafe {
         let list = &*core::ptr::addr_of!(FREE_LIST);
         let n = FREE_COUNT;
-        let bytes = list[..n].iter().map(|r| r.size as usize).sum();
+        let bytes = list[..n].iter().map(|r| r.size).sum();
         (n, bytes)
     }
 }
@@ -2329,18 +3007,19 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<Signing, Loa
     // undersized manifest.
     let manifest_size = module.header.manifest_size() as usize;
     if manifest_size < 48 {
-        // Manifest is absent or too small to carry the integrity
-        // hash (16-byte header + 32-byte SHA-256 minimum). Under
-        // signature enforcement, reject. Without enforcement, treat
-        // as "no integrity declared" and proceed (matches the
-        // unsigned-module path with `flags & 0x01 == 0`).
+        // Manifest is absent or too small to carry even the integrity hash
+        // (16-byte header + 32-byte SHA-256 minimum), so it carries no
+        // ABI-surface attestation either (17-byte head + 32). Every module
+        // must attest, signed or not.
         if cfg!(feature = "enforce_signatures") {
             log::error!(
                 "[loader] {name}: manifest size {manifest_size} below minimum (48) under enforce_signatures"
             );
             return Err(LoaderError::SignatureInvalid);
         }
-        return Ok(Signing::Unverified);
+        let e = LoaderError::Unattested;
+        e.log(name);
+        return Err(e);
     }
     {
         let code_size = module.header.code_size as usize;
@@ -2372,11 +3051,12 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<Signing, Loa
                     );
                     return Err(LoaderError::SignatureInvalid);
                 }
-                // Without enforcement, an unrecognised manifest magic
-                // is treated as "no manifest" — the integrity /
-                // signature work below is skipped because it can't
-                // trust the byte layout.
-                return Ok(Signing::Unverified);
+                // Without enforcement, an unrecognised manifest magic is
+                // "no manifest" — and a module without a manifest carries
+                // no attestation, so it is refused.
+                let e = LoaderError::Unattested;
+                e.log(name);
+                return Err(e);
             }
             {
                 // Manifest-format envelope version. The offsets below are
@@ -2392,7 +3072,11 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<Signing, Loa
                         );
                         return Err(LoaderError::SignatureInvalid);
                     }
-                    return Ok(Signing::Unverified);
+                    // A layout this loader cannot read has no attestation
+                    // it can find.
+                    let e = LoaderError::Unattested;
+                    e.log(name);
+                    return Err(e);
                 }
                 let flags = manifest_data[14];
                 let has_integrity = (flags & 0x01) != 0;
@@ -2501,6 +3185,9 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<Signing, Loa
                         // the end while parsers read a substituted value at
                         // the canonical offset. Matches `cmd_sign`, which
                         // hashes the freshly-serialized (slack-free) layout.
+                        // The attestation's value is compared to this
+                        // kernel's surface below, for every module; here it
+                        // is only covered by the signature.
                         if manifest_data[14] & 0x10 != 0 {
                             let attn_offset = hash_offset + 32 + 96;
                             if manifest_size != attn_offset + 32 {
@@ -2509,31 +3196,7 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<Signing, Loa
                                 );
                                 return Err(LoaderError::SignatureInvalid);
                             }
-                            let attn = &manifest_data[attn_offset..attn_offset + 32];
-                            eh.update(attn);
-                            // Runtime ABI-surface enforcement (not just signature
-                            // coverage): a validly-signed module built against a
-                            // DIFFERENT surface than this kernel must be refused —
-                            // its hardcoded opcode/errno/flag numbers do not
-                            // match. Compare the embedded attestation to the
-                            // kernel's OWN surface digest, from the same canonical
-                            // stream the tools hash.
-                            let mut ks = Sha256::new();
-                            crate::abi::abi_surface::write_surface(&mut |b| ks.update(b));
-                            let kd = ks.finalize();
-                            if attn != kd.as_slice() {
-                                log::error!(
-                                    "[loader] {name}: ABI-surface mismatch — module built for a different substrate"
-                                );
-                                return Err(LoaderError::SignatureInvalid);
-                            }
-                        } else if cfg!(feature = "enforce_signatures") {
-                            // Signed but unattested under enforcement: an attested
-                            // substrate is mandatory, so refuse.
-                            log::error!(
-                                "[loader] {name}: signed module carries no ABI attestation"
-                            );
-                            return Err(LoaderError::SignatureInvalid);
+                            eh.update(&manifest_data[attn_offset..attn_offset + 32]);
                         }
                         let d = eh.finalize();
                         let mut h = [0u8; 32];
@@ -2554,6 +3217,48 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<Signing, Loa
                     // Unsigned module under enforcement — reject.
                     log::error!("[loader] {name}: unsigned module rejected");
                     return Err(LoaderError::SignatureInvalid);
+                }
+                // ABI-surface attestation, for EVERY module, signed or not:
+                // a module built against a different surface than this
+                // kernel's carries another substrate's opcode, errno and
+                // flag numbers, and signing it does not make them right.
+                // The attestation sits at its CANONICAL offset — after the
+                // integrity hash and the signature block, each where
+                // present — and the manifest ends exactly there. Reading
+                // "the last 32 bytes" instead would let an inflated manifest
+                // carry a second copy at the end while parsers read a
+                // substituted value at the canonical offset. Compared to the
+                // kernel's OWN surface digest, from the same canonical stream
+                // the tools hash.
+                if flags & 0x10 == 0 {
+                    let e = LoaderError::Unattested;
+                    e.log(name);
+                    return Err(e);
+                }
+                let attn_offset =
+                    ManifestLayout::of(manifest_data[5], manifest_data[6], manifest_data[7], flags)
+                        .hash
+                        + if has_integrity || has_signature {
+                            32
+                        } else {
+                            0
+                        }
+                        + if has_signature { 96 } else { 0 };
+                if manifest_size != attn_offset + 32 {
+                    log::error!(
+                        "[loader] {name}: attestation flag with non-canonical manifest size"
+                    );
+                    return Err(LoaderError::Unattested);
+                }
+                let attn = &manifest_data[attn_offset..attn_offset + 32];
+                use crate::kernel::security::crypto::sha256::Sha256;
+                let mut ks = Sha256::new();
+                crate::abi::abi_surface::write_surface(&mut |b| ks.update(b));
+                let kd = ks.finalize();
+                if attn != kd.as_slice() {
+                    let e = LoaderError::SurfaceMismatch;
+                    e.log(name);
+                    return Err(e);
                 }
             }
         }
@@ -3315,9 +4020,25 @@ impl DynamicModule {
             let elastic = arena_size > 0 && !gated && crate::kernel::mem::heap::elastic_heaps();
             if elastic {
                 crate::kernel::mem::heap::init_module_heap_elastic(inst_idx, arena_size);
+                // A module that declares raw arena use has its whole cap
+                // committed now, at instantiation: `ARENA_GET` hands it this
+                // arena and commits nothing on a step.
+                if crate::kernel::exec::scheduler::params_raw_arena(params_slice)
+                    && crate::kernel::mem::heap::commit_whole(inst_idx).is_none()
+                {
+                    log::error!(
+                        "[loader] {}: raw heap arena commit failed need={arena_size} (state \
+                         used={}, cap={})",
+                        name,
+                        arena_usage().0,
+                        arena_usage().1
+                    );
+                    return Err(LoaderError::StatePoolExhausted);
+                }
                 // SAFETY: instantiation context. A null base with the cap as
-                // size: `arena_get` asks the heap to commit, teardown frees
-                // the heap's own segments, and the owner is charged the cap.
+                // size: `arena_get` hands out the heap's whole-cap arena,
+                // teardown frees the heap's own segments, and the owner is
+                // charged the cap.
                 unsafe {
                     crate::kernel::exec::scheduler::set_module_arena(
                         inst_idx,

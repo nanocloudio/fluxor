@@ -47,7 +47,7 @@ pub(crate) fn compute_upstream_mask(edges: &[Edge], edge_count: usize) {
         .enumerate()
     {
         let midx = m as usize;
-        if midx < MAX_MODULES {
+        if midx < module_slots() {
             pos[midx] = order_pos as u16;
         }
     }
@@ -55,7 +55,7 @@ pub(crate) fn compute_upstream_mask(edges: &[Edge], edge_count: usize) {
     for edge in edges.iter().take(edge_count) {
         let from = edge.from_module;
         let to = edge.to_module;
-        if from >= MAX_MODULES || to >= MAX_MODULES {
+        if from >= module_slots() || to >= module_slots() {
             continue;
         }
         // Completion tracks EVERY real edge — a sink downstream of a feedback
@@ -99,11 +99,11 @@ pub(crate) fn gate_contract_consumers() -> usize {
         else {
             continue;
         };
-        if provider >= MAX_MODULES || !sched.deferred_ready[provider] {
+        if provider >= module_slots() || !sched.deferred_ready[provider] {
             continue;
         }
         let mut n = 0usize;
-        for m in 0..MAX_MODULES {
+        for m in 0..module_slots() {
             if m == provider
                 || sched.deferred_ready[m]
                 || sched.required_caps[m] & (1u64 << contract) == 0
@@ -270,7 +270,7 @@ pub(crate) fn compute_domain_exec_orders_static(_module_count: usize) {
         }
 
         let count = sched.domain_module_count[domain] as usize;
-        if count < MAX_MODULES {
+        if count < module_slots() {
             sched.domain_exec_order[domain][count] = module_idx as ModuleId;
             sched.domain_module_count[domain] = (count + 1) as ModuleId;
         }
@@ -347,7 +347,7 @@ pub fn recompute_domain_orders(affected_mask: u32) {
     // Rebuild the affected domains' wake masks over ALL resident modules —
     // mirrors the `finalize_resident_graphs` mask loop exactly, restricted to
     // the affected domains.
-    for i in 0..MAX_MODULES {
+    for i in 0..module_slots() {
         if matches!(sched.modules[i], ModuleSlot::Empty) {
             continue;
         }
@@ -362,7 +362,7 @@ pub fn recompute_domain_orders(affected_mask: u32) {
     // to the affected domains.
     for order_pos in 0..sched.exec_order_count {
         let module_idx = sched.exec_order[order_pos] as usize;
-        if module_idx >= MAX_MODULES {
+        if module_idx >= module_slots() {
             continue;
         }
         let domain = (sched.domain_id[module_idx] as usize).min(MAX_DOMAINS - 1);
@@ -377,7 +377,7 @@ pub fn recompute_domain_orders(affected_mask: u32) {
             }
         } else {
             let count = sched.domain_module_count[domain] as usize;
-            if count < MAX_MODULES {
+            if count < module_slots() {
                 sched.domain_exec_order[domain][count] = module_idx as ModuleId;
                 sched.domain_module_count[domain] = (count + 1) as ModuleId;
             }
@@ -387,7 +387,7 @@ pub fn recompute_domain_orders(affected_mask: u32) {
     // Grow `domain_count` to cover any newly-occupied domain (never shrink —
     // matches `finalize_resident_graphs`).
     let mut max_domain: u8 = 0;
-    for i in 0..MAX_MODULES {
+    for i in 0..module_slots() {
         if matches!(sched.modules[i], ModuleSlot::Empty) {
             continue;
         }
@@ -504,12 +504,12 @@ pub(crate) fn validate_domains_static(module_count: usize, edge_count: usize) {
     for i in 0..edge_count {
         let e = &sched.edges[i];
         if let crate::kernel::boot::config::EdgeClass::CrossCore = e.edge_class {
-            let from_domain = if e.from_module < MAX_MODULES {
+            let from_domain = if e.from_module < module_slots() {
                 sched.domain_id[e.from_module]
             } else {
                 0
             };
-            let to_domain = if e.to_module < MAX_MODULES {
+            let to_domain = if e.to_module < module_slots() {
                 sched.domain_id[e.to_module]
             } else {
                 0
@@ -558,7 +558,7 @@ pub fn compute_downstream_latency(sched: &mut SchedulerState, module_count: usiz
 
         let mut max_downstream: u32 = 0;
         // Find all outgoing edges from m
-        for e_i in 0..MAX_CHANNELS {
+        for e_i in 0..sched.edges.len() {
             let e = &sched.edges[e_i];
             if e.channel >= 0 && e.from_module == m && e.to_module < module_count {
                 let n = e.to_module;

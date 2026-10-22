@@ -454,8 +454,7 @@ fn extend_entries(blob: &[u8], extend: &mut Extend<'_>) -> Result<(Vec<u8>, Wide
         }
         let entry = &blob[off..off + entry_len];
         let name_hash = u32::from_le_bytes([entry[4], entry[5], entry[6], entry[7]]);
-        // Module id: low byte at 8, bits 8-9 at byte 9 bits 5-6.
-        let id = u16::from(entry[8]) | (u16::from((entry[9] >> 5) & 0x03) << 8);
+        let id = entry_module_id(entry[8], entry[9]);
         let params = &entry[ENTRY_HEADER..];
         match extend(name_hash, id, params)? {
             Some(ext) => {
@@ -536,14 +535,31 @@ fn basic_param(params: &[u8], want: u8) -> Option<&[u8]> {
     None
 }
 
-/// Where the basic TLV section ends and the extended entries begin.
+/// A module entry's 12-bit module id: the low byte at entry byte 8; entry
+/// byte 9 carries id bits 8-9 in its bits 5-6, bit 10 in bit 7 and bit 11 in
+/// bit 3, beside the domain (bits 0-2) and the pre-tick-drain flag (bit 4).
+fn entry_module_id(b8: u8, b9: u8) -> u16 {
+    u16::from(b8)
+        | (u16::from((b9 >> 5) & 0x03) << 8)
+        | (u16::from(b9 >> 7) << 10)
+        | (u16::from((b9 >> 3) & 0x01) << 11)
+}
+
+/// Where the basic TLV section ends and the extended entries begin: past its
+/// `0xFF 0x00` terminator, walked from the entries (the header's u16 length
+/// is advisory and saturates past 64 KiB).
 fn basic_end(params: &[u8]) -> Option<usize> {
     if params.len() < 4 || params[0] != 0xFE || params[1] != 0x01 {
         return None;
     }
-    let payload_len = params[2] as usize | ((params[3] as usize) << 8);
-    let end = 4 + payload_len;
-    (end <= params.len()).then_some(end)
+    let mut pos = 4usize;
+    while pos + 2 <= params.len() {
+        if params[pos] == 0xFF {
+            return Some(pos + 2);
+        }
+        pos += 2 + params[pos + 1] as usize;
+    }
+    None
 }
 
 /// The payload of the first extended entry carrying `want`, scanned the
@@ -588,6 +604,21 @@ mod tests {
         }
         v.extend(std::iter::repeat_n(fill, n));
         v
+    }
+
+    /// The id reads back every bit the graph builder packs into an entry,
+    /// and none of byte 9's domain or pre-tick-drain bits.
+    #[test]
+    fn entry_module_id_reads_all_twelve_bits() {
+        for id in [0u16, 1, 0xFF, 0x100, 0x300, 0x400, 0x800, 0xABC, 0xFFF] {
+            let b8 = (id & 0xFF) as u8;
+            let b9 = 0x07
+                | 0x10
+                | (((id >> 8) as u8 & 0x03) << 5)
+                | (((id >> 10) as u8 & 0x01) << 7)
+                | (((id >> 11) as u8 & 0x01) << 3);
+            assert_eq!(entry_module_id(b8, b9), id, "id {id:#x}");
+        }
     }
 
     #[test]

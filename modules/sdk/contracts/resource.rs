@@ -45,10 +45,44 @@ pub const POOL_OWNERS: u16 = 0x0007;
 pub const POOL_MODULE_SLOTS: u16 = 0x0008;
 /// Kernel elastic region (bytes) — Tier B chunk grants (`ELASTIC_ALLOC`).
 pub const POOL_ELASTIC_REGION: u16 = 0x0009;
+/// Control-plane store subscriptions (slots): one per watched prefix per
+/// module. Derived from what the graph's store consumers declare.
+pub const POOL_STORE_SUBS: u16 = 0x000A;
+/// Control-plane store `GET` read slots open at once (slots).
+pub const POOL_STORE_READS: u16 = 0x000B;
+/// Control-plane store streamed writes open at once (slots).
+pub const POOL_STORE_WRITES: u16 = 0x000C;
+/// Capability grants presented to a guarded store at once (slots).
+pub const POOL_STORE_GRANTS: u16 = 0x000D;
+/// Host-process sandboxes held at once, finished ones included (slots).
+pub const POOL_SANDBOXES: u16 = 0x000E;
+/// Interactive terminal sessions open at once (slots).
+pub const POOL_TTY_SESSIONS: u16 = 0x000F;
+/// Provider handles the kernel tracks for teardown at once (slots).
+pub const POOL_TRACKED_HANDLES: u16 = 0x0010;
+/// State-arena free-list entries: the holes freed modules leave below the
+/// bump mark (slots).
+pub const POOL_STATE_FREE_LIST: u16 = 0x0011;
+/// `net.policy` tables held at once (slots).
+pub const POOL_NET_POLICY_TABLES: u16 = 0x0012;
+/// Rule bytes one `net.policy` table holds (bytes).
+pub const POOL_NET_POLICY_TABLE_BYTES: u16 = 0x0013;
+/// Subscriptions one workload's own store holds (slots).
+pub const POOL_OWNER_STORE_SUBS: u16 = 0x0014;
+/// `GET` read slots one workload's own store holds (slots).
+pub const POOL_OWNER_STORE_READS: u16 = 0x0015;
+/// Streamed writes one workload's own store holds (slots).
+pub const POOL_OWNER_STORE_WRITES: u16 = 0x0016;
+/// `net.route` segments held at once (slots).
+pub const POOL_NET_ROUTE_SEGMENTS: u16 = 0x0017;
+/// `net.route` peer routes held at once (slots).
+pub const POOL_NET_ROUTE_PEERS: u16 = 0x0018;
+/// `net.route` held addresses at once (slots).
+pub const POOL_NET_ROUTE_HELD: u16 = 0x0019;
 
 /// Number of kernel pools — the ledger table size and the count of `POOL`
 /// records in one PSTATUS round.
-pub const KERNEL_POOL_COUNT: usize = 9;
+pub const KERNEL_POOL_COUNT: usize = 25;
 
 /// First id of the module-declared pool range.
 pub const POOL_MODULE_BASE: u16 = 0x0100;
@@ -59,7 +93,32 @@ pub const fn kernel_pool_class(_pool: u16) -> u8 {
     CLASS_MEMORY
 }
 
-const _: () = assert!(KERNEL_POOL_COUNT == POOL_ELASTIC_REGION as usize);
+const _: () = assert!(KERNEL_POOL_COUNT == POOL_NET_ROUTE_HELD as usize);
+
+/// An arena entry with this bit set is in KiB, not bytes. Arena sizes below
+/// 2 GiB are written in exact bytes, so a byte-precise budget stays exact; a
+/// larger one (a 16 GB board's state arena) is written in KiB, rounded up,
+/// and reaches 2 TiB. Other pools' entries are plain counts.
+pub const ENTRY_KIB: u32 = 1 << 31;
+
+/// Whether `pool` is an arena, whose entries may carry [`ENTRY_KIB`].
+pub const fn is_arena(pool: u16) -> bool {
+    matches!(
+        pool,
+        POOL_STATE_ARENA | POOL_BUFFER_ARENA | POOL_ELASTIC_REGION
+    )
+}
+
+/// The figure an envelope (or declared-demand) entry `n` states for `pool`:
+/// bytes for an arena (KiB × 1024 when [`ENTRY_KIB`] is set), slots
+/// otherwise.
+pub const fn decode_entry(pool: u16, n: u32) -> u64 {
+    if is_arena(pool) && n & ENTRY_KIB != 0 {
+        ((n & !ENTRY_KIB) as u64) * 1024
+    } else {
+        n as u64
+    }
+}
 
 // ── Tier B elastic-region chunk grants ─
 //
@@ -84,20 +143,27 @@ pub const ELASTIC_ALLOC: u32 = 0x0C3F;
 // ── Capacity-envelope config section ───
 //
 // The composer's per-deployment pool envelope, carried as a post-body
-// config section (PAST the checksummed body — the rig-proven additive
-// discipline; growing `body_size` hangs the bare-metal Pi 5 boot).
+// config section (PAST the checksummed body: growing `body_size` hangs the
+// bare-metal Pi 5 boot).
 // Section layout, mirroring the resident-workload (FXPD) section's
 // self-describing header:
 //
 //   [FXEV u32][section_len u32][crc16 u16][entry_count u16]
 //   [entries: pool_id u16 LE + n u32 LE, ×entry_count]
 //
-// `crc16` covers `section[10..section_len]` (count + entries). Each entry
-// sets the named pool's ENFORCED capacity for this deployment — always ≤
-// the compiled static table/arena size; the kernel clamps and logs an
-// entry that exceeds it. Absent section ⇒ static sizes rule (byte-identical
-// boot for configs without a `capacity:` block).
-
+// `crc16` covers `section[10..section_len]` (count + entries). The kernel
+// sizes each table from the config it parses — module slots from the module
+// and edge counts, channels from the edges, owners from the resident
+// workloads, store subscriptions from what the graph's store consumers
+// declare (the FXDM section below) — and an envelope entry is the pool's
+// LIVE-ADD RESERVE on top of that: the pool's ceiling is derived + `n`. A
+// pool with no structural source (events, timers, TTY sessions, …) is sized
+// by its entry alone. `n` is decoded by `decode_entry`: exact bytes for an
+// arena below 2 GiB, KiB past it (`ENTRY_KIB`, up to 2 TiB), the pool's own
+// unit otherwise. Absent entry ⇒ the platform's default reserve. An ask the
+// platform cannot hold (past a static table, past a format ceiling, or
+// memory the host refuses) is refused at boot with the pool named; it is
+// never clamped.
 /// Envelope section magic: "FXEV".
 pub const ENVELOPE_SECTION_MAGIC: u32 = 0x4658_4556;
 /// One envelope entry: `pool_id u16 LE + n u32 LE`.
@@ -109,3 +175,18 @@ pub const MAX_ENVELOPE_ENTRIES: usize = 64;
 /// Largest envelope section the kernel will read.
 pub const MAX_ENVELOPE_SECTION_BYTES: usize =
     ENVELOPE_HEADER_SIZE + MAX_ENVELOPE_ENTRIES * ENVELOPE_ENTRY_SIZE;
+
+// ── Declared-demand config section ─
+//
+// What the graph's modules declare they will ask of a kernel pool at run
+// time, summed per pool by the composer from each module's manifest
+// (`[capacities] store_subscriptions = n`, …). The kernel adds it to the
+// pool's derived size, so a pool such as the store's subscription table is
+// sized from the graph that boots rather than from a constant. Same shape as
+// the envelope section, after it:
+//
+//   [FXDM u32][section_len u32][crc16 u16][entry_count u16]
+//   [entries: pool_id u16 LE + n u32 LE, ×entry_count]
+
+/// Declared-demand section magic: "FXDM".
+pub const DEMAND_SECTION_MAGIC: u32 = 0x4658_444D;

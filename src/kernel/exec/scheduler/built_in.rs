@@ -7,11 +7,11 @@ use super::*;
 // ============================================================================
 
 fn collect_channels(
-    edges: &[Edge; MAX_CHANNELS],
+    edges: &[Edge],
     module_idx: usize,
     direction: FanDirection,
     ctrl_only: bool,
-    out: &mut [i32; MAX_CHANNELS],
+    out: &mut [i32],
 ) -> usize {
     let mut count = 0;
     for edge in edges.iter() {
@@ -53,28 +53,16 @@ fn collect_channels(
     count
 }
 
-pub(crate) fn collect_output_channels(
-    edges: &[Edge; MAX_CHANNELS],
-    module_idx: usize,
-    out: &mut [i32; MAX_CHANNELS],
-) -> usize {
+pub(crate) fn collect_output_channels(edges: &[Edge], module_idx: usize, out: &mut [i32]) -> usize {
     collect_channels(edges, module_idx, FanDirection::Out, false, out)
 }
 
-pub(crate) fn collect_input_channels(
-    edges: &[Edge; MAX_CHANNELS],
-    module_idx: usize,
-    out: &mut [i32; MAX_CHANNELS],
-) -> usize {
+pub(crate) fn collect_input_channels(edges: &[Edge], module_idx: usize, out: &mut [i32]) -> usize {
     // Only collect non-ctrl (data) input channels
     collect_channels(edges, module_idx, FanDirection::In, false, out)
 }
 
-pub(crate) fn collect_ctrl_channels(
-    edges: &[Edge; MAX_CHANNELS],
-    module_idx: usize,
-    out: &mut [i32; MAX_CHANNELS],
-) -> usize {
+pub(crate) fn collect_ctrl_channels(edges: &[Edge], module_idx: usize, out: &mut [i32]) -> usize {
     // Only collect ctrl input channels
     collect_channels(edges, module_idx, FanDirection::In, true, out)
 }
@@ -92,7 +80,7 @@ pub type BuiltinModuleEntry = (&'static str, fn(*mut u8) -> i32);
 /// `modules`: array of (name, step_fn) pairs. Channels between them are
 /// created automatically: module[0].out → module[1].in → module[1].out → ...
 pub fn run_builtin_graph(modules: &[BuiltinModuleEntry]) -> ! {
-    let count = modules.len().min(MAX_MODULES);
+    let count = modules.len().min(module_slots());
     // SAFETY: built-in graph runs on a single core (qemu/rp) without PIC.
     let sched = unsafe {
         let p = &raw mut SCHED;

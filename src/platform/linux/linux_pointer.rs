@@ -126,7 +126,12 @@ fn linux_pointer_step(state: *mut u8) -> i32 {
         match std::ffi::CString::new(st.path.clone()) {
             Ok(c) => {
                 // SAFETY: `c` is a valid NUL-terminated path for the call.
-                let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
+                let fd = unsafe {
+                    libc::open(
+                        c.as_ptr(),
+                        libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
+                    )
+                };
                 st.fd = fd;
                 if fd < 0 {
                     log::warn!(

@@ -71,11 +71,29 @@ instance actually reads.
 Elastic growth follows the bare-metal rules:
 
 - **Bounded work.** A carve is one state-arena allocation (first fit over the
-  arena's bounded free list, else a bump) and zeroing exactly the bytes
-  carved; the segment table is fixed. No search grows with the heap.
-- **Above 1 GB on the Pi 5.** Segments come from the state arena, the linker
-  region above the first GB, and are zeroed as they are handed out — never a
-  region wholesale.
+  arena's bounded free list, else a bump); the segment table is fixed. No
+  search grows with the heap.
+- **Zeroing off the step.** The state arena hands out zeroed memory without
+  zeroing on the step that asks. On Linux a region is returned to zero when
+  it is freed (`madvise(MADV_DONTNEED)` on its whole pages, a memset of its
+  partial edge pages), and memory above the arena's `clean_mark` — the
+  highest offset ever handed out — has never been written, so no allocation
+  zeroes at all; `heap_zero_step_bytes` (bytes zeroed while a module's step
+  ran) stays 0 under growth. On the other zero-initialised arenas (wasm, RP)
+  only memory below the mark is zeroed.
+- **From the device tree's DRAM on bcm2712.** The state arena is the
+  largest reservation-free DRAM zone the device tree describes above the boot
+  image (above 1 GB on the Pi 5), less the kernel tables carved from its top
+  (`kernel::mem::carve`). Boot zeroes none of it. The arena keeps a **zeroed
+  frontier** ahead of the memory it has handed out — claimed by one domain at a
+  time, advanced in each execution domain's slack (`limit − consumed` of its
+  tick budget; a domain with no budget donates none) and run its full
+  `ZERO_AHEAD_BYTES` once before a graph first steps — and a freed region goes
+  to an *in-zeroing* list, on neither free list, until a domain with slack has
+  zeroed it and it joins the free list. A segment carved on a step therefore
+  takes zeroed memory; only when nothing zeroed fits does the allocation zero
+  synchronously, and that is what `heap_zero_step_bytes` counts. The kernel's
+  `[heap] zstep= zslack= zsync= fr= off=` heartbeat reports it.
 - **Fail loud.** Growth that cannot be satisfied (the cap reached, or the
   state arena exhausted) returns null, counts the failure (`fail_count`, and
   `grow_denied` in the kernel), logs it (rate-limited to powers of two), and
@@ -85,11 +103,14 @@ Elastic growth follows the bare-metal rules:
   with the rest of the module's memory (held back while a block source still
   has a buffer lent from it); a rebuild resets the arena wholesale.
 
-A module that uses its arena as raw memory (`ARENA_GET`) gets the whole cap
-(rounded down to the allocator's 8-byte blocks) committed as one segment on its
-first call, and the same arena on every later one — provided it has not grown in
-pieces through `heap_alloc` first, since there is then no contiguous arena to
-hand out (the call answers no arena, and the kernel logs why).
+`ARENA_GET` hands a module its heap as raw memory. A committed heap is one
+block already, and `ARENA_GET` returns it. On an elastic heap the module
+declares raw use — `heap.raw_arena: true` on the instance, or `[capacities]
+raw_arena = 1` in the module type's manifest (params tag 0xEE) — and gets the
+whole cap (rounded down to the allocator's 8-byte blocks) committed as one
+segment at instantiation; `ARENA_GET` hands out that arena and never commits,
+so no step pays for it. An elastic heap that did not declare it gets no arena
+from `ARENA_GET` (the kernel logs why).
 
 The owner of a workload module is charged its heap's **cap** against its
 `state_cap`, so admission bounds the worst case rather than a snapshot.
@@ -127,6 +148,37 @@ tools pack it as params tag `0xEF` (a u32 LE) beside the other per-module
 kernel tags, in a base graph's module entry and a workload module's params
 alike; the kernel reads it before it sizes the heap. It is not a node tag: a
 workload module may set it, and its owner is charged for it.
+
+### Derived cap: `[capacities] heap_from_params`
+
+A module whose heap holds what its params declare (inline bodies, tables)
+states the rule in its manifest, and the composer writes the cap for it:
+
+```toml
+[capacities]
+heap_from_params = { tags = [2, 11], base = { default = 65536, thumbv6m = 8192 }, included = 4096 }
+```
+
+| Field | Meaning |
+|---|---|
+| `tags` | params tags whose value bytes count; every chunk of a chunked param counts |
+| `base` | the type's default cap (`module_arena_size()`), per ABI like any capacity |
+| `included` | the counted bytes `base` already holds (default 0) |
+
+Packing an instance, the composer totals the value bytes under `tags` in the
+packed params TLV. At or below `included` it emits nothing and the type's own
+cap stands; past it, it emits tag `0xEF` = `base + (total - included)`. An
+explicit `heap.arena_bytes` wins, with a warning when it is below
+`base - included + total`. A variant whose feature set moves the rest of the
+heap overrides fields under `[variant.capacities] heap_from_params` (unset
+fields keep the module-scope rule's). Base-graph modules and workload modules
+are sized the same way.
+
+`base` is a copy of a figure the module computes, so it is checked rather
+than trusted: a module with the rule must declare its arena
+(`declare_module_arena_bytes!`), and `pack` refuses a build whose declared
+arena differs from `base` resolved for that build's ABI and variant, naming
+the figure to write.
 
 ## Syscall API
 

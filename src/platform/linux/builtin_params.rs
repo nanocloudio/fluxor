@@ -16,37 +16,11 @@
 
 use crate::kernel::exec::scheduler;
 
-const TLV_MAGIC: u8 = 0xFE;
-const TLV_VERSION: u8 = 0x01;
-const TLV_END: u8 = 0xFF;
-
 /// Iterate the TLV payload of a module entry, calling `f(tag, value)`
 /// for each entry. No-op on a blob that lacks the magic+version
 /// header (treated as "no params for this module").
-pub fn walk_tlv<F: FnMut(u8, &[u8])>(blob: &[u8], mut f: F) {
-    if blob.len() < 4 || blob[0] != TLV_MAGIC || blob[1] != TLV_VERSION {
-        return;
-    }
-    let payload_len = u16::from_le_bytes([blob[2], blob[3]]) as usize;
-    let end = (4 + payload_len).min(blob.len());
-    let mut off = 4usize;
-    while off + 2 <= end {
-        let tag = blob[off];
-        let elen = blob[off + 1] as usize;
-        off += 2;
-        if tag == TLV_END {
-            break;
-        }
-        if off + elen > end {
-            break;
-        }
-        // Skip reserved protection/policy tags so each built-in only
-        // sees the params it declared in [[params]].
-        if tag < 0xF0 {
-            f(tag, &blob[off..off + elen]);
-        }
-        off += elen;
-    }
+pub fn walk_tlv<F: FnMut(u8, &[u8])>(blob: &[u8], f: F) {
+    crate::kernel::sys::params_tlv::walk_declared(blob, f);
 }
 
 /// Read a u32 TLV value (zero-extends shorter lengths so an upstream

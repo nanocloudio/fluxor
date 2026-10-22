@@ -132,6 +132,34 @@ include!("identity.rs");
 use abi::config::tls::MAX_SESSIONS;
 use abi::contracts::key_vault as kv;
 
+/// Concurrent cleartext-passthrough connections on one instance: the backend
+/// dials a server-mode instance relays raw for its clear-side consumer. Each
+/// such dial is made on behalf of a front connection, and every front
+/// connection through this instance holds a session, so the session ceiling
+/// bounds them. The table is resident (4 bytes an entry: 2 KiB at 512 on
+/// aarch64, 256 bytes at 64 on wasm, 4 bytes at 1 embedded) and exact for
+/// every conn id the stream contract allows. A server-mode `CMD_CONNECT_TO`
+/// that finds it full is refused downstream with `MSG_ERROR` `ENOMEM` on the
+/// requester's tag and never dialled, so a completion always finds a free
+/// entry.
+const MAX_PASSTHROUGH: usize = MAX_SESSIONS;
+
+/// One cleartext-passthrough connection: its conn id and the clear-side
+/// requester tag its dial carried, which an error on the established
+/// connection is translated back to.
+#[derive(Clone, Copy)]
+struct PassthroughConn {
+    conn_id: u16,
+    downstream_tag: net_proto::RequesterTag,
+}
+
+impl PassthroughConn {
+    const EMPTY: Self = Self {
+        conn_id: 0,
+        downstream_tag: net_proto::REQUESTER_TAG_NONE,
+    };
+}
+
 // ── Tier B session storage ────────────
 //
 // Sessions grow at runtime in whole chunks: the first chunk lives inline
@@ -374,6 +402,10 @@ const NET_MSG_ACK: u8 = 0x08;
 /// Observability trace context (see contracts/net/net_proto.rs). Received from
 /// IP on cipher_in; re-emitted to HTTP on clear_out with TLS's own span id.
 const NET_MSG_TRACE_CTX: u8 = 0x09;
+/// The stream's peer (`net_proto::MSG_PEER`), re-emitted on the clear side.
+const NET_MSG_PEER: u8 = net_proto::MSG_PEER;
+/// The part of a `MSG_PEER` payload after its connection id.
+const PEER_TAIL: usize = net_proto::PEER_LEN - net_proto::CONN_ID_LEN;
 
 // Net protocol command types (upstream: HTTP -> TLS -> IP)
 const NET_CMD_BIND: u8 = 0x10;
@@ -570,6 +602,13 @@ struct TlsSession {
     /// back-pressured `clear_out` that delays the accept doesn't drop the
     /// parent trace context (the Ready loop retries both together).
     trace_ctx_pending: bool,
+    /// The stream's peer as the transport reported it (`MSG_PEER`, after its
+    /// connection id), and whether one arrived. Re-emitted on the clear side
+    /// right after the held accept, before any data: `peer_pending` holds the
+    /// session's data until it has been written.
+    peer: [u8; PEER_TAIL],
+    peer_have: bool,
+    peer_pending: bool,
     /// Original downstream requester tag for a TLS-mediated CLIENT connect — the
     /// tag the clear-side consumer put on its `CMD_CONNECT_TO` before TLS rewrote it
     /// to TLS's own tag toward IP. Echoed when TLS forwards `MSG_CONNECTED`
@@ -622,6 +661,9 @@ impl TlsSession {
             trace_ctx_parent: [0; 8],
             trace_ctx_flags: 0,
             trace_ctx_pending: false,
+            peer: [0; PEER_TAIL],
+            peer_have: false,
+            peer_pending: false,
             downstream_tag: 0,
             span_id: [0; 8],
         }
@@ -664,6 +706,9 @@ impl TlsSession {
         self.trace_ctx_parent = [0; 8];
         self.trace_ctx_flags = 0;
         self.trace_ctx_pending = false;
+        self.peer = [0; PEER_TAIL];
+        self.peer_have = false;
+        self.peer_pending = false;
         self.downstream_tag = 0;
         self.span_id = [0; 8];
         self.read_keys = TrafficKeys::empty();
@@ -928,17 +973,20 @@ struct TlsState {
     pending_expected_len: u8,
     pending_expected_is_ip: bool,
 
-    /// Cleartext-passthrough conn_id set (256-bit bitmap, conn_id → bit).
-    /// When a SERVER-mode TLS instance's clear-side consumer (an h1 proxy
-    /// relay) dials a cleartext backend, the resulting `MSG_CONNECTED` conn_id
-    /// is marked here instead of allocating a TLS session. Passthrough conns
-    /// relay
-    /// `MSG_CONNECTED` / `MSG_DATA` / `MSG_CLOSED` (cipher→clear) and clear-side
-    /// `CMD_SEND` / `CMD_CLOSE` (clear→cipher) RAW — no session, no crypto, no
-    /// ClientHello. Inbound-terminated TLS sessions never set a bit here, so the
-    /// real-session data path (`find_session_by_conn_id` → encrypt/decrypt) is
-    /// byte-identical. conn_id 0 is a legitimate id and maps to bit 0.
-    passthrough_conns: [u8; 32],
+    /// Cleartext-passthrough connections, packed: entries `[..passthrough_len]`
+    /// are live, in no particular order. When a SERVER-mode TLS instance's
+    /// clear-side consumer (an h1 proxy relay) dials a cleartext backend, the
+    /// resulting `MSG_CONNECTED` conn_id is recorded here instead of
+    /// allocating a TLS session. Passthrough conns relay `MSG_CONNECTED` /
+    /// `MSG_DATA` / `MSG_PEER` / `MSG_CLOSED` / `MSG_ERROR` (cipher→clear) and
+    /// clear-side `CMD_SEND` / `CMD_CLOSE` (clear→cipher) RAW — no session, no
+    /// crypto, no ClientHello. Inbound-terminated TLS sessions never enter
+    /// this table, so the real-session data path (`find_session_by_conn_id` →
+    /// encrypt/decrypt) is byte-identical. Every conn id the stream contract
+    /// allows, 0 included, is an ordinary key; occupancy is the length, never
+    /// a sentinel id.
+    passthrough: [PassthroughConn; MAX_PASSTHROUGH],
+    passthrough_len: u16,
 
     // Certificate and key (DER-encoded, loaded from params)
     cert: [u8; MAX_CERT_CHAIN_BYTES],
@@ -1415,7 +1463,8 @@ pub unsafe extern "C" fn module_new(
     s.pending_expected = [0; MAX_EXPECTED_DNS];
     s.pending_expected_len = 0;
     s.pending_expected_is_ip = false;
-    s.passthrough_conns = [0u8; 32];
+    s.passthrough = [PassthroughConn::EMPTY; MAX_PASSTHROUGH];
+    s.passthrough_len = 0;
     s.transport = TRANSPORT_TCP;
     s.accept_port = 0;
     s.next_generation = 1;
@@ -1719,10 +1768,17 @@ unsafe fn parse_extended_params(s: &mut TlsState, params: *const u8, params_len:
     // (e.g. payload_len = 0x000c → bytes `0c 00 ..` matches tag 12).
     let mut pos = 0;
     if params_len >= 4 && data[0] == TLV_MAGIC && data[1] == TLV_VERSION {
-        let payload_len = ((data[3] as usize) << 8) | (data[2] as usize);
-        let basic_end = 4 + payload_len;
-        if basic_end <= params_len {
-            pos = basic_end;
+        // Walked to the `0xFF` terminator, not taken from the header's u16
+        // payload length, which saturates for params past 64 KiB. The scan
+        // starts just past the terminator's tag; the `0x00` the composer
+        // writes after it matches no extended tag and is stepped over.
+        let mut p = 4usize;
+        while let (Some(&tag), Some(&n)) = (data.get(p), data.get(p + 1)) {
+            if tag == 0xFF {
+                pos = p + 1;
+                break;
+            }
+            p += 2 + n as usize;
         }
     }
     let end = params_len;
@@ -2184,6 +2240,12 @@ unsafe fn tcp_module_step(s: &mut TlsState) -> i32 {
                 } else {
                     0
                 };
+                // A new connection under an id means the id's previous holder
+                // is gone, whoever claims this one: no passthrough entry may
+                // outlive it and capture the new stream.
+                if pl >= 2 {
+                    let _ = clear_passthrough(s, conn_id);
+                }
                 // Stream-surface routing: `MSG_CONNECTED` carries a requester
                 // tag after the conn id. When `ip.net_out` is fanned to TLS plus
                 // another stream consumer (e.g. an OTLP exporter), claim an
@@ -2229,7 +2291,7 @@ unsafe fn tcp_module_step(s: &mut TlsState) -> i32 {
                 // is no client-side active-open), so this MSG_CONNECTED completes
                 // that backend dial. It must NOT become a TLS session — the
                 // backend speaks plaintext (a server instance's backend hops
-                // are cleartext). Mark the conn passthrough and relay
+                // are cleartext). Record the conn as a passthrough and relay
                 // MSG_CONNECTED down RAW; no session alloc, no ClientHello.
                 // Client-mode TLS (mode==0, real outbound TLS) falls through
                 // to the session-allocating path below.
@@ -2237,21 +2299,46 @@ unsafe fn tcp_module_step(s: &mut TlsState) -> i32 {
                     let dtag = s.pending_downstream_tag;
                     s.pending_connect_active = false;
                     s.pending_downstream_tag = 0;
-                    set_passthrough(s, conn_id);
-                    // Forward MSG_CONNECTED to the clear side with the original
-                    // downstream requester tag after the conn id, matching the
-                    // session path's `forward_held_completion` framing so the
-                    // relay routes it on a fanned clear_out.
                     let cb = conn_id.to_le_bytes();
                     let tb = dtag.to_le_bytes();
-                    let out = [cb[0], cb[1], tb[0], tb[1]];
-                    let _ = tls_write_raw_frame(
-                        sys,
-                        s.clear_out,
-                        NET_MSG_CONNECTED,
-                        out.as_ptr(),
-                        out.len() as u16,
-                    );
+                    if set_passthrough(s, conn_id, dtag) {
+                        // Forward MSG_CONNECTED to the clear side with the
+                        // original downstream requester tag after the conn id,
+                        // matching the session path's
+                        // `forward_held_completion` framing so the relay
+                        // routes it on a fanned clear_out.
+                        let out = [cb[0], cb[1], tb[0], tb[1]];
+                        let _ = tls_write_raw_frame(
+                            sys,
+                            s.clear_out,
+                            NET_MSG_CONNECTED,
+                            out.as_ptr(),
+                            out.len() as u16,
+                        );
+                    } else {
+                        // No entry to relay it under. The dial was admitted
+                        // only with an entry free and completions are
+                        // serialised, so this is the table's guard rather
+                        // than a path the dial takes: the backend is closed
+                        // and the requester told ENOMEM on its tag.
+                        let _ = tls_write_or_count(
+                            s,
+                            s.cipher_out,
+                            NET_CMD_CLOSE,
+                            conn_id,
+                            core::ptr::null(),
+                            0,
+                        );
+                        let err = [(-12i8) as u8, tb[0], tb[1]]; // ENOMEM + downstream tag
+                        let _ = tls_write_or_count(
+                            s,
+                            s.clear_out,
+                            NET_MSG_ERROR,
+                            conn_id,
+                            err.as_ptr(),
+                            err.len() as u16,
+                        );
+                    }
                 } else if claim {
                     match alloc_session_for_conn(s, conn_id) {
                         Some(idx) => {
@@ -2435,10 +2522,10 @@ unsafe fn tcp_module_step(s: &mut TlsState) -> i32 {
                 } else {
                     0
                 };
-                // Clean up session (or drop a passthrough conn's mark). A
+                // Clean up session (or drop a passthrough conn's entry). A
                 // passthrough conn has no session, so `find_session` is -1;
-                // clearing the bit lets the id be reused.
-                clear_passthrough(s, conn_id);
+                // dropping the entry frees it and lets the id be reused.
+                let _ = clear_passthrough(s, conn_id);
                 let si = find_session_by_conn_id(s, conn_id);
                 if si >= 0 {
                     s.free_peer_closed = s.free_peer_closed.wrapping_add(1);
@@ -2496,9 +2583,12 @@ unsafe fn tcp_module_step(s: &mut TlsState) -> i32 {
                 // tag). TRANSLATE it to the original downstream tag so the
                 // clear-side requester recognises the failure — otherwise it
                 // ignores the error and waits for a timeout. For an established
-                // conn the tag comes from its session; for a connect failure
-                // (no session yet) from the pending connect slot. MSG_BOUND has
-                // no tag and passes through unchanged.
+                // conn the tag comes from its session, or for a passthrough
+                // from its entry, which the failure ends; for a connect failure
+                // (no session yet) from the pending connect slot. A live
+                // connection and a dial in flight never share an id, so the
+                // established lookups come first. MSG_BOUND has no tag and
+                // passes through unchanged.
                 let mut forward = bound_is_ours;
                 const ERR_TAG_AT: usize = net_proto::ERROR_FIXED;
                 const ERR_TAGGED: usize = ERR_TAG_AT + net_proto::REQUESTER_TAG_LEN;
@@ -2509,6 +2599,11 @@ unsafe fn tcp_module_step(s: &mut TlsState) -> i32 {
                     if si >= 0 {
                         // Established-connection error → its session's tag.
                         let dt = s.sessions[si as usize].downstream_tag.to_le_bytes();
+                        s.net_scratch[ERR_TAG_AT..ERR_TAGGED].copy_from_slice(&dt);
+                    } else if let Some(ptag) = clear_passthrough(s, conn_id) {
+                        // Established passthrough failed: its entry goes, and
+                        // the error reaches the requester its dial came from.
+                        let dt = ptag.to_le_bytes();
                         s.net_scratch[ERR_TAG_AT..ERR_TAGGED].copy_from_slice(&dt);
                     } else if s.pending_connect_active && in_tag == dev_requester_tag(sys) {
                         // A CONNECT failure routed to TLS carries TLS's own
@@ -2572,6 +2667,52 @@ unsafe fn tcp_module_step(s: &mut TlsState) -> i32 {
                     let si = find_session_by_conn_id(s, conn_id);
                     if si >= 0 {
                         retx_replay(s, si as usize, from_seq);
+                    }
+                }
+            }
+            t if t == NET_MSG_PEER => {
+                // The stream's peer. A session latches it and re-emits it on
+                // the clear side right after the completion (accept or
+                // connect) it holds until its handshake completes, before
+                // any data; a cleartext passthrough relays it raw, like its
+                // data. Payload always consumed.
+                let pl = payload_len as usize;
+                let mut pbuf = [0u8; net_proto::PEER_LEN];
+                let rd = pl.min(net_proto::PEER_LEN);
+                if rd > 0 {
+                    (sys.channel_read)(s.cipher_in, pbuf.as_mut_ptr(), rd);
+                }
+                if pl > rd {
+                    tls_discard(sys, s.cipher_in, pl - rd);
+                }
+                if rd == net_proto::PEER_LEN {
+                    let conn_id = u16::from_le_bytes([pbuf[0], pbuf[1]]);
+                    if is_passthrough(s, conn_id) {
+                        let _ = tls_write_or_count(
+                            s,
+                            s.clear_out,
+                            NET_MSG_PEER,
+                            conn_id,
+                            pbuf[net_proto::CONN_ID_LEN..].as_ptr(),
+                            PEER_TAIL as u16,
+                        );
+                    } else {
+                        let si = find_session_by_conn_id(s, conn_id);
+                        if si >= 0 {
+                            let sess = &mut s.sessions[si as usize];
+                            let mut k = 0;
+                            while k < PEER_TAIL {
+                                sess.peer[k] = pbuf[net_proto::CONN_ID_LEN + k];
+                                k += 1;
+                            }
+                            sess.peer_have = true;
+                            // Arriving after the handshake completed: the
+                            // Ready loop emits it next, after the held
+                            // completion if that has not gone out yet.
+                            if sess.state == SessionState::Ready {
+                                sess.peer_pending = true;
+                            }
+                        }
                     }
                 }
             }
@@ -2704,10 +2845,10 @@ unsafe fn tcp_module_step(s: &mut TlsState) -> i32 {
                 } else {
                     0
                 };
-                // Drop any passthrough mark (no session, no close_notify — the
-                // backend hop is cleartext). The raw
-                // CMD_CLOSE forward below tears the backend TCP conn down.
-                clear_passthrough(s, conn_id);
+                // Drop any passthrough entry (no session, no close_notify —
+                // the backend hop is cleartext). The raw CMD_CLOSE forward
+                // below tears the backend TCP conn down.
+                let _ = clear_passthrough(s, conn_id);
                 // Send close_notify alert if session is ready
                 let si = find_session_by_conn_id(s, conn_id);
                 if si >= 0 {
@@ -2852,6 +2993,23 @@ unsafe fn tcp_module_step(s: &mut TlsState) -> i32 {
                                     err.len() as u16,
                                 );
                                 forward = false;
+                            } else if s.mode == 1 && !passthrough_has_room(s) {
+                                // A server-mode dial completes as a
+                                // passthrough, and none is free: refuse it
+                                // here, before a backend connection exists,
+                                // with ENOMEM on the request's tag. It is not
+                                // forwarded; the requester may retry once a
+                                // passthrough closes.
+                                let err = [(-12i8) as u8, ntb[0], ntb[1]]; // ENOMEM + downstream tag
+                                let _ = tls_write_or_count(
+                                    s,
+                                    s.clear_out,
+                                    NET_MSG_ERROR,
+                                    0,
+                                    err.as_ptr(),
+                                    err.len() as u16,
+                                );
+                                forward = false;
                             } else if !tagged
                                 && rd + net_proto::REQUESTER_TAG_LEN > NET_SCRATCH_SIZE
                             {
@@ -2917,10 +3075,14 @@ unsafe fn tcp_module_step(s: &mut TlsState) -> i32 {
             // — and its parent trace context, which is emitted only after the
             // accept lands (so a dropped trace is retried even once the accept
             // itself has gone out).
-            if s.sessions[i].held_msg_type != 0 || s.sessions[i].trace_ctx_pending {
+            if s.sessions[i].held_msg_type != 0
+                || s.sessions[i].trace_ctx_pending
+                || s.sessions[i].peer_pending
+            {
                 forward_held_completion(s, i);
             }
-            if s.sessions[i].recv_len >= 5 {
+            // No data before the stream's peer report.
+            if s.sessions[i].recv_len >= 5 && !s.sessions[i].peer_pending {
                 try_decrypt_forward(s, i);
             }
         }
@@ -3116,31 +3278,74 @@ fn find_session_by_conn_id(s: &TlsState, conn_id: u16) -> i32 {
 
 // ── Cleartext-passthrough conn tracking ────────────────
 // A passthrough conn is NOT a session: no crypto state, no slot. These helpers
-// index a 256-bit bitmap by conn_id so the relay branches (added before every
-// `find_session_by_conn_id` on the data path) are O(1) and never disturb the
-// existing session lookup for inbound-terminated TLS.
+// keep a packed table of `MAX_PASSTHROUGH` entries keyed by the full u16
+// conn id. The relay branches (ahead of every `find_session_by_conn_id` on
+// the data path) scan only the live entries, so an instance with no
+// passthrough pays nothing, and the existing session lookup for
+// inbound-terminated TLS is undisturbed. Every operation is a bounded scan;
+// none waits.
+
+/// Index of `conn_id`'s entry, if it is a passthrough.
+#[inline]
+fn passthrough_find(s: &TlsState, conn_id: u16) -> Option<usize> {
+    let n = (s.passthrough_len as usize).min(MAX_PASSTHROUGH);
+    let mut i = 0;
+    while i < n {
+        if s.passthrough[i].conn_id == conn_id {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
 
 #[inline]
 fn is_passthrough(s: &TlsState, conn_id: u16) -> bool {
-    // The bitmap covers the producer's 256-slot conn table; a (future)
-    // producer minting ids past it simply never marks passthrough.
-    conn_id < 256 && (s.passthrough_conns[(conn_id >> 3) as usize] >> (conn_id & 7)) & 1 != 0
+    passthrough_find(s, conn_id).is_some()
 }
 
+/// Whether one more passthrough fits.
 #[inline]
-fn set_passthrough(s: &mut TlsState, conn_id: u16) {
-    if conn_id >= 256 {
-        return;
-    }
-    s.passthrough_conns[(conn_id >> 3) as usize] |= 1 << (conn_id & 7);
+fn passthrough_has_room(s: &TlsState) -> bool {
+    (s.passthrough_len as usize) < MAX_PASSTHROUGH
 }
 
+/// Record `conn_id` as a passthrough dialled for `downstream_tag`. False when
+/// the table is full, and nothing is recorded; an id already present has its
+/// tag replaced.
 #[inline]
-fn clear_passthrough(s: &mut TlsState, conn_id: u16) {
-    if conn_id >= 256 {
-        return;
+fn set_passthrough(
+    s: &mut TlsState,
+    conn_id: u16,
+    downstream_tag: net_proto::RequesterTag,
+) -> bool {
+    if let Some(i) = passthrough_find(s, conn_id) {
+        s.passthrough[i].downstream_tag = downstream_tag;
+        return true;
     }
-    s.passthrough_conns[(conn_id >> 3) as usize] &= !(1 << (conn_id & 7));
+    if !passthrough_has_room(s) {
+        return false;
+    }
+    let n = s.passthrough_len as usize;
+    s.passthrough[n] = PassthroughConn {
+        conn_id,
+        downstream_tag,
+    };
+    s.passthrough_len += 1;
+    true
+}
+
+/// Drop `conn_id`'s entry, if it has one, returning the tag its dial carried.
+/// The last entry moves into the hole, keeping the table packed.
+#[inline]
+fn clear_passthrough(s: &mut TlsState, conn_id: u16) -> Option<net_proto::RequesterTag> {
+    let i = passthrough_find(s, conn_id)?;
+    let tag = s.passthrough[i].downstream_tag;
+    let last = s.passthrough_len as usize - 1;
+    s.passthrough[i] = s.passthrough[last];
+    s.passthrough[last] = PassthroughConn::EMPTY;
+    s.passthrough_len -= 1;
+    Some(tag)
 }
 
 /// Relay `data_len` bytes of a passthrough conn's stream from `from_chan` to
@@ -5600,6 +5805,24 @@ unsafe fn forward_held_completion(s: &mut TlsState, idx: usize) {
             return;
         }
     }
+    // The completion is out: the peer report next, before any of the
+    // session's data (the Ready loop holds data while it is pending).
+    // Retried until the write lands.
+    if s.sessions[idx].peer_pending {
+        let tail = s.sessions[idx].peer;
+        if tls_write_or_count(
+            s,
+            s.clear_out,
+            NET_MSG_PEER,
+            conn_id,
+            tail.as_ptr(),
+            PEER_TAIL as u16,
+        ) {
+            s.sessions[idx].peer_pending = false;
+        } else {
+            return;
+        }
+    }
     // The accept is on the wire (now or on a prior step). Emit the queued
     // parent trace context AFTER it, so HTTP's slot exists and parents
     // under this session's span. Retried until the write lands.
@@ -5644,6 +5867,11 @@ unsafe fn pump_derive_app_keys(s: &mut TlsState, idx: usize) -> bool {
         b"[tls] handshake complete".len(),
     );
     emit_peer_identity(s, idx);
+    // A peer report that arrived during the handshake goes out right after
+    // the held completion, before any data.
+    if s.sessions[idx].peer_have {
+        s.sessions[idx].peer_pending = true;
+    }
     if s.sessions[idx].held_msg_type != 0 {
         // Observability: queue IP's trace context to forward downstream,
         // to be emitted by forward_held_completion ONLY after the held

@@ -36,6 +36,11 @@ pub mod proc_executor;
 // The per-chip platform modules, selected by `#[cfg]`. The chip selection lives
 // here in the platform layer; the kernel reaches them via `crate::platform::<name>`.
 
+/// The memory map from the device tree: what the boot tables map as DRAM and
+/// the zone the kernel's tables and the state arena share (bcm2712).
+#[cfg(feature = "chip-bcm2712")]
+#[path = "bcm2712/memmap.rs"]
+pub mod memmap;
 /// Secondary-core bring-up + RP1/DMA40 (bcm2712).
 #[cfg(feature = "chip-bcm2712")]
 #[path = "bcm2712/multicore.rs"]

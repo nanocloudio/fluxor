@@ -42,11 +42,17 @@ use crate::kernel::workload::owner::OwnerHandle;
 // * `TTY_CLOSE` (0x1B06) — kill+reap+free a session. `arg` = `[sid:u32]`;
 //   return = exit code.
 
+/// The workload-index domain: one workload per sandbox. The table is sized
+/// at boot with the sandbox table ([`size_workloads`]).
 const MAX_WORKLOADS: usize = MAX_SANDBOXES;
+const _: () = assert!(
+    MAX_WORKLOADS <= GRAPH_SLOT_BASE as usize,
+    "host-process workload slots must stay below the graph backend's"
+);
 
 /// One admitted workload: its owner and the host-process backend slot it maps
-/// to. (Only the host-process backend exists on Linux; a `kind` field is added
-/// when a second Linux backend does.)
+/// to (the host-process backend's; a graph workload's handles are the graph
+/// backend's, above [`GRAPH_SLOT_BASE`]).
 #[derive(Clone, Copy)]
 struct WorkloadSlot {
     in_use: bool,
@@ -87,7 +93,24 @@ unsafe fn free_allocated_owner(owner: OwnerHandle) {
     crate::kernel::exec::scheduler::owners_mut().free(owner);
 }
 
-static mut LINUX_WORKLOADS: [WorkloadSlot; MAX_WORKLOADS] = [WORKLOAD_EMPTY; MAX_WORKLOADS];
+static mut LINUX_WORKLOADS: crate::kernel::mem::table::Table<WorkloadSlot, MAX_WORKLOADS> = crate::boot_table!(
+    MAX_WORKLOADS,
+    WORKLOAD_EMPTY,
+    crate::abi::contracts::resource::POOL_SANDBOXES
+);
+
+/// Size the workload table to the sandbox table's `n` slots, all committed.
+///
+/// # Safety
+/// Graph-preparation context: no reference into the table is live.
+pub unsafe fn size_workloads(n: usize) -> Result<(), crate::kernel::mem::table::TableError> {
+    if n > MAX_WORKLOADS {
+        return Err(crate::kernel::mem::table::TableError::Ceiling);
+    }
+    let t = &*core::ptr::addr_of!(LINUX_WORKLOADS);
+    t.reserve(n)?;
+    t.grow(n)
+}
 
 #[inline]
 fn rd_u16(b: &[u8], off: usize) -> u16 {
@@ -99,11 +122,11 @@ fn rd_u32(b: &[u8], off: usize) -> u32 {
 }
 
 /// The host-process backend's honest capability set. `host_backend.rs` provides
-/// namespace + cgroup isolation but not seccomp/caps/SELinux, so it advertises
-/// `SHARED`/`ISOLATED` only — never `HARDENED` — and zero `linux.*` option
-/// keys. A `HARDENED` request, or a required option entry, therefore fails
-/// admission rather than running silently under-hardened (the §5.2/§5.3 rule).
-/// Extending `host_backend.rs` to apply a hardening knob is what adds its key here.
+/// namespace + cgroup isolation but no syscall filter, capability bound or
+/// security-module profile, so it advertises `SHARED`/`ISOLATED` only — never
+/// `HARDENED` — and no hardening option key. A `HARDENED` request, or a
+/// required option entry it does not list, therefore fails admission
+/// (`ENOSYS`) rather than running silently under-hardened.
 fn host_backend_honors_posture(posture: u8) -> bool {
     matches!(posture, wl::POSTURE_SHARED | wl::POSTURE_ISOLATED)
 }
@@ -114,13 +137,19 @@ fn host_backend_honors_option(ns: &[u8], key: &[u8]) -> bool {
     ns == b"mount" && key == b"bind"
 }
 
-/// A `mount`/`bind` value: `<src>\0<dst>[\0<ro>]`.
+/// A `mount`/`bind` value: `<src>\0<dst>[\0<ro>]`, `ro` `1` (read-only) or
+/// `0`. Anything else — another `ro` spelling, a fourth part — is malformed,
+/// never read as writable.
 fn parse_bind(val: &[u8]) -> Option<super::host_backend::VolumeBind> {
     let mut parts = val.split(|b| *b == 0);
     let src = core::str::from_utf8(parts.next()?).ok()?;
     let dst = core::str::from_utf8(parts.next()?).ok()?;
-    let ro = matches!(parts.next(), Some(b"1"));
-    if src.is_empty() || dst.is_empty() {
+    let ro = match parts.next() {
+        None | Some(b"0") => false,
+        Some(b"1") => true,
+        Some(_) => return None,
+    };
+    if src.is_empty() || dst.is_empty() || parts.next().is_some() {
         return None;
     }
     Some(super::host_backend::VolumeBind {
@@ -130,7 +159,7 @@ fn parse_bind(val: &[u8]) -> Option<super::host_backend::VolumeBind> {
     })
 }
 /// Network fields the backend realizes (`net_identity.rs`): own netns and an
-/// IPv4 identity. IPv6 identity is not implemented yet, so it fails admission
+/// IPv4 identity. An IPv6 identity is not realized, so it fails admission
 /// (`ENOSYS`) per the same fail-closed rule — never a silently-unaddressed
 /// workload.
 fn host_backend_net_caps() -> u8 {
@@ -204,7 +233,7 @@ unsafe fn validate_options(
 /// The host-process source section (`SOURCE_HOST_PROCESS`), little-endian,
 /// every part length-prefixed and present, in this order:
 /// ```text
-///   [isolate:u8]                       1 = own namespaces (needs privilege)
+///   [flags:u8]                         SRC_ISOLATED | SRC_ROOT_READ_ONLY
 ///   [rootfs_len:u16][rootfs]           the root to pivot into; empty = none
 ///   [argv_len:u16][argv]               NUL-separated tokens, at least one
 ///   [env_len:u16][env]                 NUL-separated `NAME=VALUE` — the WHOLE
@@ -212,9 +241,13 @@ unsafe fn validate_options(
 ///   [cwd_len:u16][cwd]                 absolute; empty = `/`
 ///   [user_len:u16][user]               `uid[:gid]` | `name[:group]`; empty =
 ///                                      the runtime's own identity
+///   [groups_len:u16][groups_flags:u8][gid:u32 × n]
+///                                      groups_len = 1 + 4n; GROUPS_STRICT
 /// ```
-/// Nothing may follow the last part. The backend's rules for each are
-/// `host_backend`'s (`plan_process`).
+/// Nothing may follow the last part. A read-only root without isolation is
+/// EINVAL (there is no mount namespace of its own to make read-only), and so
+/// is any flag bit this backend does not define. The backend's rules for
+/// each part are `host_backend`'s (`plan_process`).
 pub struct HostSource<'a> {
     pub isolate: bool,
     pub rootfs: Option<&'a str>,
@@ -224,18 +257,23 @@ pub struct HostSource<'a> {
 
 /// Parse a host-process source section; EINVAL for anything malformed —
 /// a part that overruns, bytes past the last part, text that is not UTF-8,
-/// or no argv.
+/// a groups part that is not `1 + 4n` long, an undefined flag bit, or no
+/// argv.
 pub fn parse_host_source(src: &[u8]) -> Result<HostSource<'_>, i32> {
     fn text(b: &[u8]) -> Result<&str, i32> {
         core::str::from_utf8(b).map_err(|_| crate::kernel::sys::errno::EINVAL)
     }
     use crate::kernel::sys::errno;
     let mut p = 1usize;
-    let isolate = match src.first() {
-        Some(0) => false,
-        Some(1) => true,
-        _ => return Err(errno::EINVAL),
-    };
+    let flags = *src.first().ok_or(errno::EINVAL)?;
+    if flags & !(hp::SRC_ISOLATED | hp::SRC_ROOT_READ_ONLY) != 0 {
+        return Err(errno::EINVAL);
+    }
+    let isolate = flags & hp::SRC_ISOLATED != 0;
+    let root_read_only = flags & hp::SRC_ROOT_READ_ONLY != 0;
+    if root_read_only && !isolate {
+        return Err(errno::EINVAL);
+    }
     let mut part = || -> Result<&[u8], i32> {
         let n = src
             .get(p..p + 2)
@@ -250,7 +288,14 @@ pub fn parse_host_source(src: &[u8]) -> Result<HostSource<'_>, i32> {
     let env = part()?;
     let cwd = part()?;
     let user = part()?;
+    let groups = part()?;
     if p != src.len() {
+        return Err(errno::EINVAL);
+    }
+    let Some((&gflags, gids)) = groups.split_first() else {
+        return Err(errno::EINVAL);
+    };
+    if gflags & !hp::GROUPS_STRICT != 0 || gids.len() % 4 != 0 {
         return Err(errno::EINVAL);
     }
     let rootfs = Some(text(rootfs)?).filter(|r| !r.is_empty());
@@ -273,15 +318,21 @@ pub fn parse_host_source(src: &[u8]) -> Result<HostSource<'_>, i32> {
             env: vars,
             cwd: text(cwd)?.to_string(),
             user: text(user)?.to_string(),
+            groups: gids
+                .chunks_exact(4)
+                .map(|g| u32::from_le_bytes([g[0], g[1], g[2], g[3]]))
+                .collect(),
+            groups_strict: gflags & hp::GROUPS_STRICT != 0,
+            root_read_only,
         },
     })
 }
 
-/// WORKLOAD_CREATE: admit + instantiate a workload from the Tier-1 header + the
-/// variable-length source-ref / endpoint / options sections. Returns a tagged
-/// `FD_TAG_WORKLOAD` handle or a negative errno.
-/// `CREATE` on the host-process backend. An owner this call allocates is
-/// freed again when the call refuses, so a refused CREATE leaves nothing.
+/// `CREATE` on the host-process backend: admit + instantiate a workload from
+/// the Tier-1 header + the variable-length source-ref / endpoint / options
+/// sections. Returns a tagged `FD_TAG_WORKLOAD` handle or a negative errno.
+/// An owner this call allocates is freed again when the call refuses, so a
+/// refused CREATE leaves nothing.
 unsafe fn workload_create(arg: *const u8, arg_len: usize) -> i32 {
     let mut allocated: Option<OwnerHandle> = None;
     let rc = workload_create_as(arg, arg_len, &mut allocated);
@@ -335,12 +386,25 @@ unsafe fn workload_create_as(
     let net_segment = rd_u16(buf, 50);
     let mut net_addr = [0u8; 16];
     net_addr.copy_from_slice(&buf[52..68]);
-    // This backend has no segment/lane mechanism (that is metal lane
-    // addressing); a non-default segment must refuse admission, never run on
-    // the default segment as if it were the requested one.
-    if net_segment != 0 {
-        return errno::ENOSYS;
-    }
+    // A segment ≥ 1 is a `net.route` segment: it must exist (ENOENT), hold
+    // the address and not as its gateway (EINVAL), and this backend must
+    // attach workloads to segments (ENOSYS otherwise) — never run on segment
+    // 0 as if it were the requested one.
+    let attach = if net_segment != 0 {
+        let attaches =
+            (super::net_route::caps() & crate::abi::contracts::net::route::caps::SEGMENTS) != 0;
+        match crate::kernel::net_route::validate_attach(
+            net_family,
+            &net_addr,
+            net_segment,
+            attaches,
+        ) {
+            Ok(s) => Some(s),
+            Err(e) => return e,
+        }
+    } else {
+        None
+    };
 
     // Section bounds.
     let src_start = wl::CREATE_HEADER_SIZE;
@@ -357,7 +421,7 @@ unsafe fn workload_create_as(
         return errno::ENOSYS;
     }
     if !host_backend_honors_posture(posture) {
-        return errno::ENOSYS; // e.g. HARDENED before seccomp/caps land
+        return errno::ENOSYS; // HARDENED: no syscall filter or capability bound
     }
 
     // Identity → owner. A workload names who it is: the null identity names
@@ -459,10 +523,11 @@ unsafe fn workload_create_as(
             Some(super::net_identity::NetIdentity {
                 addr_v4: v4,
                 prefix_len: net_prefix_len,
+                segment: attach,
             })
         }
-        // IPv6 identity is not realized by this backend yet (net_identity.rs
-        // is ioctl/IPv4; v6 needs the netlink addr path).
+        // An IPv6 identity is not realized by this backend (`net_identity`
+        // addresses IPv4 only).
         wl::NET_FAM_IPV6 => return errno::ENOSYS,
         _ => return errno::EINVAL,
     };
@@ -515,6 +580,9 @@ unsafe fn workload_create_as(
     let widx = match slots.iter().position(|s| !s.in_use) {
         Some(i) => i,
         None => {
+            crate::kernel::sys::resource_ledger::deny(
+                crate::abi::contracts::resource::POOL_SANDBOXES,
+            );
             // No workload slot: don't leak the backend sandbox.
             hp_destroy(backend_idx);
             return errno::ENOMEM;
@@ -532,10 +600,7 @@ unsafe fn workload_create_as(
 unsafe fn workload_backend_idx(raw: i32) -> Option<i32> {
     let idx = raw as usize;
     let slots = &*core::ptr::addr_of!(LINUX_WORKLOADS);
-    if idx >= MAX_WORKLOADS || !slots[idx].in_use {
-        return None;
-    }
-    Some(slots[idx].backend_idx)
+    slots.get(idx).filter(|s| s.in_use).map(|s| s.backend_idx)
 }
 
 /// Map the portable SIGNAL subset to the host signal number.
@@ -615,7 +680,7 @@ pub unsafe fn linux_workload_dispatch(
         identity.copy_from_slice(core::slice::from_raw_parts(arg, 16));
         let slots = &*core::ptr::addr_of!(LINUX_WORKLOADS);
         let owners = crate::kernel::exec::scheduler::owners();
-        let Some(idx) = (0..MAX_WORKLOADS).find(|&i| {
+        let Some(idx) = (0..slots.len()).find(|&i| {
             slots[i].in_use
                 && owners
                     .lookup(slots[i].owner)
@@ -683,11 +748,10 @@ unsafe fn workload_caps(arg: *mut u8, arg_len: usize) -> i32 {
         } else {
             0
         };
-    // Implemented optional ops: READ + EXEC + the TTY set + real-signal SIGNAL
-    // delivery (process-group). PAUSE is
-    // advertised iff the host can freeze at all (cgroup2 present); a workload
-    // whose own cgroup setup failed still gets per-workload ENOSYS.
-    // READ/EXEC/TTY are the host-process class's ops, not this contract's.
+    // Optional ops: SIGNAL by real signal delivery (to the process group),
+    // LOOKUP, and PAUSE iff the host can freeze at all (cgroup2 present) — a
+    // workload whose own cgroup setup failed gets ENOSYS from it. READ, EXEC
+    // and the TTY set are the host-process class's ops, not this contract's.
     let mut ops = wl::caps::SIGNAL | wl::caps::LOOKUP;
     if host_backend_can_freeze() {
         ops |= wl::caps::PAUSE;
@@ -708,11 +772,11 @@ unsafe fn workload_caps(arg: *mut u8, arg_len: usize) -> i32 {
 }
 
 /// Drain/revocation hook: destroy every workload belonging to a revoked owner.
-/// Mirrors `linux_net_close_owner_conns`; called from the owner-drain path,
+/// Called from the owner-drain path (beside `linux_net_close_owner_conns`),
 /// which frees the owner itself, so the slot is only cleared here.
 pub fn linux_workload_close_owner(owner: OwnerHandle) {
     // SAFETY: platform-thread single-writer access to the workload table and the
-    // backend slots it owns; mirrors `linux_net_close_owner_conns`.
+    // backend slots it owns.
     unsafe {
         let slots = &mut *core::ptr::addr_of_mut!(LINUX_WORKLOADS);
         for slot in slots.iter_mut() {
@@ -727,7 +791,7 @@ pub fn linux_workload_close_owner(owner: OwnerHandle) {
 /// Host-process (0x1B) provider dispatch — the linux host mechanics that sit
 /// beside the stable 0x1A workload surface. Every op is a `handle = -1`
 /// call; workload-targeting ops carry the tagged workload fd in the leading
-/// 4 bytes of `arg` (LE), TTY session ops carry the session id as before.
+/// 4 bytes of `arg` (LE), TTY session ops their session id.
 ///
 /// # Safety
 /// Scheduler-thread dispatch only; `arg` null or valid for `arg_len` bytes.
@@ -740,6 +804,10 @@ pub unsafe fn host_process_dispatch(
     use crate::kernel::ipc::fd::slot_of;
     use crate::kernel::sys::errno;
 
+    // What this host realizes of the source (no argument).
+    if opcode == hp::CAPS {
+        return super::host_backend::hp_caps() as i32;
+    }
     // Session-scoped ops (no workload fd prefix).
     if opcode == hp::TTY_STEP {
         return hp_tty_step(arg, arg_len);

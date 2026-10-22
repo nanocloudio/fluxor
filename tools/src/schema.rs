@@ -573,10 +573,37 @@ pub fn build_params_from_schema(
     pos += 1;
 
     // Patch payload length
-    let payload_len = (pos - payload_start) as u16;
-    entry[len_pos..len_pos + 2].copy_from_slice(&payload_len.to_le_bytes());
+    entry[len_pos..len_pos + 2].copy_from_slice(&tlv_payload_len_field(pos - payload_start));
 
     Ok(pos - base_offset)
+}
+
+/// The params TLV header's `u16` payload length for a payload of `n` bytes,
+/// LE. The field is advisory: a params blob is bounded by its module entry's
+/// `u32` length and its section ends at the `0xFF 0x00` terminator, which is
+/// how every reader finds it. A payload past 65,535 bytes (params have no
+/// ceiling) saturates at `0xFFFF` rather than wrapping to a small, wrong
+/// figure.
+pub fn tlv_payload_len_field(n: usize) -> [u8; 2] {
+    u16::try_from(n).unwrap_or(u16::MAX).to_le_bytes()
+}
+
+/// Where a params TLV's basic section ends: the offset just past its
+/// `0xFF 0x00` terminator, found by walking the entries from offset 4 — never
+/// from the header's advisory length, which saturates past 64 KiB. `None`
+/// when `params` is not a TLV or has no terminator inside it.
+pub fn tlv_basic_end(params: &[u8]) -> Option<usize> {
+    if params.len() < 4 || params[0] != TLV_MAGIC {
+        return None;
+    }
+    let mut pos = 4usize;
+    while pos + 2 <= params.len() {
+        if params[pos] == TLV_END {
+            return Some(pos + 2);
+        }
+        pos += 2 + params[pos + 1] as usize;
+    }
+    None
 }
 
 /// Pack a single param value into the TLV buffer.
@@ -1155,7 +1182,7 @@ fn resolve_voice_params(
 
 /// Pack voice params into a complete inner TLV blob.
 ///
-/// Produces `[0xFE, 0x02, len_lo, len_hi, ...tag-len-value entries..., 0xFF, 0x00]`.
+/// Produces `[0xFE, 0x01, len_lo, len_hi, ...tag-len-value entries..., 0xFF, 0x00]`.
 /// This is stored inside the outer `0xFD` tag. When the module switches voices,
 /// it copies this blob into `params` and calls `apply_params`.
 fn pack_voice_inner(
@@ -1229,8 +1256,7 @@ fn pack_voice_inner(
     pos += 1;
 
     // Patch payload length
-    let payload_len = (pos - payload_start) as u16;
-    buf[len_pos..len_pos + 2].copy_from_slice(&payload_len.to_le_bytes());
+    buf[len_pos..len_pos + 2].copy_from_slice(&tlv_payload_len_field(pos - payload_start));
 
     Ok(pos)
 }

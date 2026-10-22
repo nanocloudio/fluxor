@@ -93,7 +93,7 @@ fn edge_port_key(edge: &Edge, direction: FanDirection) -> u8 {
 /// Whether the out-edges `group` of `module_idx` reach exactly the modules
 /// that feed its data input, each once.
 fn fan_pairs_with_inputs(
-    edges: &[Edge; MAX_CHANNELS],
+    edges: &[Edge],
     edge_count: usize,
     module_idx: usize,
     group: &[usize],
@@ -134,9 +134,9 @@ fn edge_matches_module(edge: &Edge, module_idx: usize, direction: FanDirection) 
 /// for the other consumers/producers in the fan.
 fn insert_fan(
     direction: FanDirection,
-    edges: &mut [Edge; MAX_CHANNELS],
+    edges: &mut [Edge],
     edge_count: &mut usize,
-    module_list: &mut [Option<ModuleEntry>; MAX_MODULES],
+    module_list: &mut ModuleList,
     module_count: &mut usize,
     loader: &ModuleLoader,
 ) -> bool {
@@ -146,6 +146,12 @@ fn insert_fan(
         FanDirection::In => (INTERNAL_MERGE_HASH, "merge"),
     };
 
+    // Scratch for one module's edges, sized to the edge table (the static
+    // profiles' compiled count, Linux's committed edges).
+    let edge_cap = edges.len();
+    let mut matching = crate::scratch![0usize; MAX_CHANNELS, edge_cap];
+    let mut processed = crate::scratch![false; MAX_CHANNELS, edge_cap];
+    let mut group = crate::scratch![0usize; MAX_CHANNELS, edge_cap];
     for module_idx in 0..original_count {
         let entry_id = match &module_list[module_idx] {
             Some(entry) if !is_internal_module(entry) => entry.id,
@@ -153,10 +159,9 @@ fn insert_fan(
         };
 
         // Collect all edges connecting to this module in the given direction
-        let mut matching = [0usize; MAX_CHANNELS];
         let mut match_count = 0;
         for (i, edge) in edges.iter().take(*edge_count).enumerate() {
-            if edge_matches_module(edge, module_idx, direction) && match_count < MAX_CHANNELS {
+            if edge_matches_module(edge, module_idx, direction) && match_count < matching.len() {
                 matching[match_count] = i;
                 match_count += 1;
             }
@@ -168,7 +173,7 @@ fn insert_fan(
 
         // Group edges by port key. Each unique key gets its own tee/merge.
         // Invariant: every index in matching[0..match_count] is visited exactly once.
-        let mut processed = [false; MAX_CHANNELS];
+        processed[..match_count].fill(false);
         for start in 0..match_count {
             if processed[start] {
                 continue;
@@ -177,7 +182,6 @@ fn insert_fan(
             let port_key = edge_port_key(&edges[matching[start]], direction);
 
             // Collect all edges sharing this port key
-            let mut group = [0usize; MAX_CHANNELS];
             let mut group_count = 0;
             for j in start..match_count {
                 if !processed[j] && edge_port_key(&edges[matching[j]], direction) == port_key {
@@ -220,8 +224,13 @@ fn insert_fan(
             }
 
             // Insert tee/merge module for this port group
-            if *edge_count + 1 > MAX_CHANNELS {
-                log::error!("[graph] channel limit for {name} module={entry_id}");
+            if *edge_count + 1 > edges.len() {
+                log::error!(
+                    "[graph] pool 'channels' has no edge slot left for {name} module={entry_id}"
+                );
+                crate::kernel::sys::resource_ledger::deny(
+                    crate::abi::contracts::resource::POOL_CHANNELS,
+                );
                 return false;
             }
 
@@ -383,9 +392,9 @@ fn insert_fan(
 }
 
 pub(crate) fn insert_fan_out(
-    edges: &mut [Edge; MAX_CHANNELS],
+    edges: &mut [Edge],
     edge_count: &mut usize,
-    module_list: &mut [Option<ModuleEntry>; MAX_MODULES],
+    module_list: &mut ModuleList,
     module_count: &mut usize,
     loader: &ModuleLoader,
 ) -> bool {
@@ -400,9 +409,9 @@ pub(crate) fn insert_fan_out(
 }
 
 pub(crate) fn insert_fan_in(
-    edges: &mut [Edge; MAX_CHANNELS],
+    edges: &mut [Edge],
     edge_count: &mut usize,
-    module_list: &mut [Option<ModuleEntry>; MAX_MODULES],
+    module_list: &mut ModuleList,
     module_count: &mut usize,
     loader: &ModuleLoader,
 ) -> bool {
@@ -450,7 +459,7 @@ pub(crate) fn validate_hardware_requirements(config: &RunnerConfig) -> bool {
 /// `instantiate_one_module` — e.g. hosted built-ins that aren't in the
 /// loader.
 pub fn populate_module_ports_from_edges(module_idx: usize, instantiated: usize) -> bool {
-    if module_idx >= MAX_MODULES || instantiated >= MAX_MODULES {
+    if module_idx >= module_slots() || instantiated >= module_slots() {
         return false;
     }
     // SAFETY: graph-prep context — single mutator; both indices bounded.
@@ -458,9 +467,9 @@ pub fn populate_module_ports_from_edges(module_idx: usize, instantiated: usize) 
         let p = &raw mut SCHED;
         &mut *p
     };
-    let mut in_chans = [-1i32; MAX_CHANNELS];
-    let mut out_chans = [-1i32; MAX_CHANNELS];
-    let mut ctrl_chans = [-1i32; MAX_CHANNELS];
+    let mut in_chans = [-1i32; MAX_PORTS + 1];
+    let mut out_chans = [-1i32; MAX_PORTS + 1];
+    let mut ctrl_chans = [-1i32; MAX_PORTS + 1];
     let in_count = collect_input_channels(&sched.edges, module_idx, &mut in_chans);
     let out_count = collect_output_channels(&sched.edges, module_idx, &mut out_chans);
     let ctrl_count = collect_ctrl_channels(&sched.edges, module_idx, &mut ctrl_chans);
@@ -479,11 +488,11 @@ pub fn populate_module_ports_from_edges(module_idx: usize, instantiated: usize) 
 /// Returns false if any port count exceeds MAX_PORTS (config error).
 fn populate_ports(
     ports: &mut ModulePorts,
-    in_chans: &[i32; MAX_CHANNELS],
+    in_chans: &[i32],
     in_count: usize,
-    out_chans: &[i32; MAX_CHANNELS],
+    out_chans: &[i32],
     out_count: usize,
-    ctrl_chans: &[i32; MAX_CHANNELS],
+    ctrl_chans: &[i32],
     ctrl_count: usize,
 ) -> bool {
     if in_count > MAX_PORTS {
@@ -537,14 +546,14 @@ pub fn instantiate_one_module(
     entry: &ModuleEntry,
     module_idx: usize,
     instantiated: usize,
-    edges: &mut [Edge; MAX_CHANNELS],
-    modules: &mut [ModuleSlot; MAX_MODULES],
-    module_ports: &mut [ModulePorts; MAX_MODULES],
+    edges: &mut [Edge],
+    modules: &mut [ModuleSlot],
+    module_ports: &mut [ModulePorts],
 ) -> InstantiateResult {
     // Channel collection — large arrays stay on sync stack
-    let mut in_chans = [-1i32; MAX_CHANNELS];
-    let mut out_chans = [-1i32; MAX_CHANNELS];
-    let mut ctrl_chans = [-1i32; MAX_CHANNELS];
+    let mut in_chans = [-1i32; MAX_PORTS + 1];
+    let mut out_chans = [-1i32; MAX_PORTS + 1];
+    let mut ctrl_chans = [-1i32; MAX_PORTS + 1];
     let in_count = collect_input_channels(edges, module_idx, &mut in_chans);
     let out_count = collect_output_channels(edges, module_idx, &mut out_chans);
     let ctrl_count = collect_ctrl_channels(edges, module_idx, &mut ctrl_chans);

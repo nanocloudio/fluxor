@@ -90,7 +90,7 @@ pub fn rebuild_resident_graph_index() {
         for entry in table.iter_mut() {
             *entry = ResidentGraph::EMPTY;
         }
-        for idx in 0..MAX_MODULES {
+        for idx in 0..module_slots() {
             if matches!(sched.modules[idx], ModuleSlot::Empty) {
                 continue;
             }
@@ -194,7 +194,7 @@ pub fn finalize_resident_graphs() {
             *m = ModuleMask::EMPTY;
         }
         let mut max_domain: u8 = 0;
-        for i in 0..MAX_MODULES {
+        for i in 0..module_slots() {
             if matches!(sched.modules[i], ModuleSlot::Empty) {
                 continue;
             }
@@ -377,7 +377,7 @@ fn resident_graph_count_in_domain(domain: usize) -> usize {
               bundling them into a struct would obscure the step call site"
 )]
 fn step_graph_owner(
-    modules: &mut [ModuleSlot; MAX_MODULES],
+    modules: &mut [ModuleSlot],
     sched: &mut SchedulerState,
     slot: u16,
     generation: u32,
@@ -613,7 +613,7 @@ fn graph_inbound_readable(sched: &SchedulerState, mask: &ModuleMask, out: &mut M
 /// exec-order rotation once PER resident graph so each graph's burst/budget
 /// fairness and pacer state stay independent.
 #[cfg(feature = "multitenant")]
-fn multi_graph_runner(modules: &mut [ModuleSlot; MAX_MODULES], domain: usize) -> (StepResult, u32) {
+fn multi_graph_runner(modules: &mut [ModuleSlot], domain: usize) -> (StepResult, u32) {
     // SAFETY: scheduler-thread context — sole stepper for this domain (mirrors
     // `step_domain_modules`).
     let sched = unsafe { &mut *core::ptr::addr_of_mut!(SCHED) };
@@ -978,10 +978,7 @@ fn graph_pacer_instance_runnable(graph_slot: u16, generation: u32, domain: u8) -
 /// deadline (µs). The single-graph fast path (`resident_graph_count() <= 1`)
 /// is exactly `step_modules` + `pacer_next_deadline_us(0)`. On non-multitenant
 /// builds always the fast path.
-pub fn step_resident_graphs_flat(
-    modules: &mut [ModuleSlot; MAX_MODULES],
-    count: usize,
-) -> (StepResult, u32) {
+pub fn step_resident_graphs_flat(modules: &mut [ModuleSlot], count: usize) -> (StepResult, u32) {
     #[cfg(feature = "multitenant")]
     {
         if resident_graph_count() > 1 {
@@ -996,10 +993,7 @@ pub fn step_resident_graphs_flat(
 /// loops): step all resident graphs that live in `domain` and return that
 /// domain's next pacing deadline (µs). Single-graph-in-domain fast path is the
 /// existing `step_domain_modules(domain)` + `pacer_next_deadline_us(domain)`.
-pub fn step_resident_graphs_domain(
-    modules: &mut [ModuleSlot; MAX_MODULES],
-    domain: usize,
-) -> (StepResult, u32) {
+pub fn step_resident_graphs_domain(modules: &mut [ModuleSlot], domain: usize) -> (StepResult, u32) {
     #[cfg(feature = "multitenant")]
     {
         // A domain whose ONLY resident graph belongs to a paused owner must
@@ -1104,7 +1098,7 @@ pub fn is_isr_tier_exec_mode(mode: u8) -> bool {
 /// handler, not from `step_modules`.
 #[inline]
 pub fn module_is_isr_tier(module_idx: usize) -> bool {
-    if module_idx >= MAX_MODULES {
+    if module_idx >= module_slots() {
         return false;
     }
     // SAFETY: scheduler-thread-only read; module_idx bounded.
@@ -1130,7 +1124,7 @@ pub fn module_is_isr_tier(module_idx: usize) -> bool {
 #[inline]
 pub fn deny_isr_tier_syscall(op: &'static str) -> bool {
     let module_idx = current_module_index();
-    if module_idx >= MAX_MODULES {
+    if module_idx >= module_slots() {
         return false;
     }
     if !module_is_isr_tier(module_idx) {
@@ -1152,7 +1146,7 @@ pub fn deny_isr_tier_syscall(op: &'static str) -> bool {
 /// scheduler-conformance tests can plant a module's domain without
 /// going through a full graph build.
 pub fn set_module_domain(module_idx: usize, domain: u8) {
-    if module_idx >= MAX_MODULES {
+    if module_idx >= module_slots() {
         return;
     }
     // SAFETY: scheduler-thread mutation; module_idx bounded.
@@ -1210,14 +1204,14 @@ pub fn domain_exec_order_at(domain_id: usize, i: usize) -> Option<usize> {
     if i >= count {
         return None;
     }
-    // SAFETY: `i < count <= MAX_MODULES`; domain_id bounded.
+    // SAFETY: `i < count <= module_slots()`; domain_id bounded.
     Some(unsafe { SCHED.domain_exec_order[domain_id][i] as usize })
 }
 
 /// Return the domain id assigned to a module, or `0` (the default
 /// domain) for out-of-range indices.
 pub fn module_domain_id(module_idx: usize) -> u8 {
-    if module_idx >= MAX_MODULES {
+    if module_idx >= module_slots() {
         return 0;
     }
     // SAFETY: module_idx bounded above.
@@ -1227,7 +1221,7 @@ pub fn module_domain_id(module_idx: usize) -> u8 {
 /// Report a module's processing latency in frames.
 /// Called by modules during init via the REPORT_LATENCY kernel primitive.
 pub fn report_module_latency(module_idx: usize, frames: u32) {
-    if module_idx < MAX_MODULES {
+    if module_idx < module_slots() {
         // SAFETY: scheduler-thread-only mutation; idx bounded.
         unsafe {
             SCHED.module_latency[module_idx] = frames;
@@ -1237,7 +1231,7 @@ pub fn report_module_latency(module_idx: usize, frames: u32) {
 
 /// Get the downstream latency for a module (computed after all modules init).
 pub fn downstream_latency(module_idx: usize) -> u32 {
-    if module_idx < MAX_MODULES {
+    if module_idx < module_slots() {
         // SAFETY: module_idx bounded above.
         unsafe { SCHED.downstream_latency[module_idx] }
     } else {
@@ -1283,7 +1277,7 @@ fn step_bucket(elapsed_us: u32) -> usize {
 
 /// Record a step's elapsed time into per-module and global histograms.
 pub fn record_step_time(module_idx: usize, elapsed_us: u32) {
-    if module_idx >= MAX_MODULES {
+    if module_idx >= module_slots() {
         return;
     }
     let b = step_bucket(elapsed_us);
@@ -1304,8 +1298,8 @@ pub fn record_step_time(module_idx: usize, elapsed_us: u32) {
 pub unsafe fn query_step_histogram(module_idx: usize, out_buf: *mut u8) -> i32 {
     let hist_ptr: *const [u32; 8] = if module_idx == usize::MAX {
         &raw const SCHED.step_hist_global
-    } else if module_idx < MAX_MODULES {
-        // SAFETY: module_idx < MAX_MODULES bounds the offset; `step_hist`
+    } else if module_idx < module_slots() {
+        // SAFETY: module_idx < module_slots() bounds the offset; `step_hist`
         // is `[[u32; 8]; MAX_MODULES]` so the cast + `add` is in-bounds.
         unsafe {
             (&raw const SCHED.step_hist)
@@ -1346,7 +1340,7 @@ pub unsafe fn query_module_state(module_idx: usize, out_buf: *mut u8, out_cap: u
         module_state_flags as f, MODULE_STATE_LEN, MODULE_STATE_MAX, MODULE_STATE_NAME_MAX,
     };
 
-    if module_idx >= MAX_MODULES || out_cap < MODULE_STATE_LEN {
+    if module_idx >= module_slots() || out_cap < MODULE_STATE_LEN {
         return crate::kernel::sys::errno::EINVAL;
     }
     let s = module_state_snapshot(module_idx);
@@ -1365,7 +1359,7 @@ pub unsafe fn query_module_state(module_idx: usize, out_buf: *mut u8, out_cap: u
     // SAFETY: scheduler-thread-only read; module_idx bounded above.
     buf[o::PROTECTION] = unsafe {
         let p = &raw const SCHED;
-        (*p).protection[module_idx]
+        (&(*p).protection)[module_idx]
     };
     buf[o::RESTART_COUNT..o::RESTART_COUNT + 2].copy_from_slice(&s.restart_count.to_le_bytes());
     buf[o::INACTIVE_FOR_TICKS..o::INACTIVE_FOR_TICKS + 4]
@@ -1401,7 +1395,7 @@ pub unsafe fn query_module_state(module_idx: usize, out_buf: *mut u8, out_cap: u
 
 /// Get fault statistics for a module (for `provider_query` FAULT_STATS).
 pub fn get_fault_stats(module_idx: usize) -> FaultStats {
-    if module_idx >= MAX_MODULES {
+    if module_idx >= module_slots() {
         return FaultStats::default();
     }
     // SAFETY: scheduler-thread-only read; module_idx bounded above.
@@ -1414,7 +1408,7 @@ pub fn get_fault_stats(module_idx: usize) -> FaultStats {
 /// A copy of a module's fault record: its policy, deadlines and fault
 /// state as the step guard reads them. `None` past `MAX_MODULES`.
 pub fn module_fault_info(module_idx: usize) -> Option<ModuleFaultInfo> {
-    if module_idx >= MAX_MODULES {
+    if module_idx >= module_slots() {
         return None;
     }
     // SAFETY: scheduler-thread-only read; module_idx bounded above.
@@ -1428,7 +1422,7 @@ pub fn set_module_fault_policy(
     max_restarts: u16,
     backoff_ms: u16,
 ) {
-    if module_idx >= MAX_MODULES {
+    if module_idx >= module_slots() {
         return;
     }
     // SAFETY: scheduler-thread-only mutation; module_idx bounded.
@@ -1442,7 +1436,7 @@ pub fn set_module_fault_policy(
 
 /// Set per-module step deadline (from config).
 pub fn set_module_step_deadline(module_idx: usize, deadline_us: u32) {
-    if module_idx >= MAX_MODULES {
+    if module_idx >= module_slots() {
         return;
     }
     // SAFETY: scheduler-thread-only mutation; module_idx bounded.
@@ -1457,7 +1451,7 @@ pub fn set_module_step_deadline(module_idx: usize, deadline_us: u32) {
 /// `step_one_module`. Sourced from the module manifest's
 /// `step_deadline_burst_us` setting.
 pub fn set_module_step_deadline_burst(module_idx: usize, deadline_us: u32) {
-    if module_idx >= MAX_MODULES {
+    if module_idx >= module_slots() {
         return;
     }
     // SAFETY: scheduler-thread-only mutation; module_idx bounded.
@@ -1472,7 +1466,7 @@ pub fn set_module_step_deadline_burst(module_idx: usize, deadline_us: u32) {
 /// Sourced from the module manifest's `quarantine_partner` setting;
 /// the kernel does not infer pairings from channel wiring.
 pub fn set_module_quarantine_partner(module_idx: usize, partner: ModuleId) {
-    if module_idx >= MAX_MODULES {
+    if module_idx >= module_slots() {
         return;
     }
     // SAFETY: scheduler-thread-only mutation; module_idx bounded.
@@ -1489,7 +1483,7 @@ pub fn set_module_quarantine_partner(module_idx: usize, partner: ModuleId) {
 /// tick (convoy mitigation). Mirrors what `instantiate_one_module`
 /// does from the manifest's `ModuleHeader::step_phase()` byte.
 pub fn set_module_step_phase(module_idx: usize, phase: u8) {
-    if module_idx >= MAX_MODULES {
+    if module_idx >= module_slots() {
         return;
     }
     // SAFETY: scheduler-thread-only mutation; module_idx bounded.
@@ -1503,7 +1497,7 @@ pub fn set_module_step_phase(module_idx: usize, phase: u8) {
 /// Used by the loader's manifest-driven setup and by conformance tests
 /// that exercise the period-gating path in `step_one_module`.
 pub fn set_module_step_period(module_idx: usize, period: u8) {
-    if module_idx >= MAX_MODULES {
+    if module_idx >= module_slots() {
         return;
     }
     // SAFETY: scheduler-thread-only mutation; module_idx bounded.
@@ -1519,7 +1513,7 @@ pub fn set_module_step_period(module_idx: usize, period: u8) {
 /// scheduler conformance tests can assert fault transitions without
 /// reaching into `SCHED` directly.
 pub fn module_fault_state(module_idx: usize) -> FaultState {
-    if module_idx >= MAX_MODULES {
+    if module_idx >= module_slots() {
         return FaultState::Running;
     }
     // SAFETY: scheduler-thread-only read; module_idx bounded.
@@ -1529,7 +1523,7 @@ pub fn module_fault_state(module_idx: usize) -> FaultState {
 /// Read `finished[module_idx]`. Test-facing query for terminate /
 /// done assertions.
 pub fn module_finished(module_idx: usize) -> bool {
-    if module_idx >= MAX_MODULES {
+    if module_idx >= module_slots() {
         return false;
     }
     // SAFETY: scheduler-thread-only read; module_idx bounded.
@@ -1542,7 +1536,7 @@ pub fn module_finished(module_idx: usize) -> bool {
 /// infrastructure like `linux_net` that sets `Ready` only after the
 /// network is up).
 pub fn set_module_deferred_ready(module_idx: usize, deferred: bool) {
-    if module_idx >= MAX_MODULES {
+    if module_idx >= module_slots() {
         return;
     }
     // SAFETY: scheduler-thread-only mutation; module_idx bounded.
@@ -1556,7 +1550,7 @@ pub fn set_module_deferred_ready(module_idx: usize, deferred: bool) {
 /// step". Used by loader manifest plumbing and by conformance tests
 /// that exercise ready-signal gating without a real graph.
 pub fn set_module_upstream_mask(module_idx: usize, mask: u64) {
-    if module_idx >= MAX_MODULES {
+    if module_idx >= module_slots() {
         return;
     }
     // SAFETY: scheduler-thread-only mutation; module_idx bounded.
@@ -1572,12 +1566,12 @@ pub fn set_module_upstream_mask(module_idx: usize, mask: u64) {
 /// `clear_module_ready`) — production masks come from
 /// `compute_upstream_mask`.
 pub fn set_module_upstream_bits(module_idx: usize, bits: &[usize]) {
-    if module_idx >= MAX_MODULES {
+    if module_idx >= module_slots() {
         return;
     }
     let mut mask = ModuleMask::new();
     for &b in bits {
-        if b < MAX_MODULES {
+        if b < module_slots() {
             mask.set(b);
         }
     }
@@ -1591,7 +1585,7 @@ pub fn set_module_upstream_bits(module_idx: usize, bits: &[usize]) {
 /// graph can be wired into a state where downstream modules are
 /// gated waiting on a not-yet-Ready upstream.
 pub fn clear_module_ready(module_idx: usize) {
-    if module_idx >= MAX_MODULES {
+    if module_idx >= module_slots() {
         return;
     }
     // SAFETY: scheduler-thread-only mutation; module_idx bounded.
@@ -1602,7 +1596,7 @@ pub fn clear_module_ready(module_idx: usize) {
 
 /// Read the per-module ready bit.
 pub fn module_is_ready(module_idx: usize) -> bool {
-    if module_idx >= MAX_MODULES {
+    if module_idx >= module_slots() {
         return false;
     }
     // SAFETY: scheduler-thread-only read; module_idx bounded.
@@ -1649,9 +1643,9 @@ pub struct ModuleStateSnapshot {
 
 /// Build a `ModuleStateSnapshot` for `module_idx`. Returns a
 /// `present: false` placeholder if the slot is empty or out of range
-/// so callers can iterate `0..MAX_MODULES` uniformly.
+/// so callers can iterate `0..module_slots()` uniformly.
 pub fn module_state_snapshot(module_idx: usize) -> ModuleStateSnapshot {
-    if module_idx >= MAX_MODULES {
+    if module_idx >= module_slots() {
         return ModuleStateSnapshot {
             idx: 0,
             present: false,
@@ -1697,7 +1691,7 @@ pub fn channel_port_lookup(port_type: u8, index: u8) -> i32 {
     // Guard the "no module" sentinel (== MAX_MODULES): a live-added module can reach
     // a port lookup before CURRENT_MODULE_PER_CORE is set to its slot. Return -1
     // (port not resolvable yet) rather than index a fixed [_; MAX_MODULES] array OOB.
-    if cm >= MAX_MODULES {
+    if cm >= module_slots() {
         return -1;
     }
     // SAFETY: cm bounded above; scheduler-thread-only read.
@@ -1740,13 +1734,23 @@ pub fn channel_port_lookup(port_type: u8, index: u8) -> i32 {
 /// module teardown.
 pub unsafe extern "C" fn syscall_arena_get(size_out: *mut u32) -> *mut u8 {
     let cm = current_module_index();
-    let arena = &SCHED.arenas[cm];
-    // An elastic heap has no arena until asked: commit its whole cap now, as
-    // one contiguous region, for a module that uses its arena raw.
+    let Some(arena) = (&*core::ptr::addr_of!(SCHED)).arenas.get(cm).copied() else {
+        return core::ptr::null_mut();
+    };
+    // An elastic heap's arena is its whole cap, committed at instantiation
+    // for a module that declares raw arena use (`params_raw_arena`). One that
+    // did not declare it gets none: committing here would zero memory on
+    // whatever step asked.
     let (ptr, size) = if arena.ptr.is_null() && arena.size > 0 {
-        match crate::kernel::mem::heap::commit_whole(cm) {
+        match crate::kernel::mem::heap::committed_whole(cm) {
             Some((p, n)) => (p, n as u32),
-            None => (core::ptr::null_mut(), 0),
+            None => {
+                log::warn!(
+                    "[heap] module {cm}: ARENA_GET on a heap that declared no raw arena use \
+                     (`heap.raw_arena` / `[capacities] raw_arena`); no arena"
+                );
+                (core::ptr::null_mut(), 0)
+            }
         }
     } else {
         (arena.ptr, arena.size)

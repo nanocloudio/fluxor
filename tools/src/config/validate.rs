@@ -1983,3 +1983,62 @@ pub fn check_connector_addressing(config: &Value) -> Result<()> {
     }
     Ok(())
 }
+
+/// Coordinator exclusivity for the node's network identities.
+///
+/// A graph is a *workload node* when it holds a workload creator — a module
+/// declaring `requires_contract = "workload"` together with `platform_raw`
+/// (one that may `CREATE`; the network stack declares the contract for its
+/// lane ops, without `platform_raw`) — or says so (`workload_node: true`).
+/// On a workload node the kernel installs workload identities into the
+/// network stack's `addr_ctl` and held addresses come from `net.route` HOLD,
+/// so `addr_ctl` must have no other writer: a coordinator wired into it
+/// would race the kernel on one ring. Other graphs keep the direct
+/// `addr_ctl`/`addr_evt` path (a fence coordinator, a capture harness).
+/// The kernel enforces the same at bind: `NET_PROVIDE` and a module-realized
+/// HOLD refuse while a module writes `addr_ctl`.
+pub fn validate_net_identity_writers(
+    config: &Value,
+    module_names: &[String],
+    manifests: &HashMap<String, Manifest>,
+) -> Result<()> {
+    const WORKLOAD: u8 = 0x1A;
+    let declared = config
+        .get("workload_node")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let creator = module_names.iter().find(|n| {
+        manifests.get(n.as_str()).is_some_and(|m| {
+            m.permissions.bits & manifest::permission::PLATFORM_RAW != 0
+                && m.resources.iter().any(|r| r.device_class == WORKLOAD)
+        })
+    });
+    if !declared && creator.is_none() {
+        return Ok(());
+    }
+    let why = match creator {
+        Some(c) => format!("`{c}` creates workloads (workload contract + platform_raw)"),
+        None => "the graph declares `workload_node: true`".to_string(),
+    };
+    let Some(wiring) = config.get("wiring").and_then(|w| w.as_array()) else {
+        return Ok(());
+    };
+    for entry in wiring {
+        let (Some(from), Some(to)) = (
+            entry.get("from").and_then(|v| v.as_str()),
+            entry.get("to").and_then(|v| v.as_str()),
+        ) else {
+            continue;
+        };
+        if to.split_once('.').map(|(_, p)| p) == Some("addr_ctl") {
+            return Err(Error::Config(format!(
+                "`{from}` is wired into `{to}` on a workload node ({why}). There the kernel \
+                 installs workload identities into `addr_ctl` and held addresses come from \
+                 net.route HOLD, so `addr_ctl` has one writer; a coordinator on it would race \
+                 the kernel. Write held addresses with net.route HOLD, or run the coordinator \
+                 in a graph that creates no workloads."
+            )));
+        }
+    }
+    Ok(())
+}

@@ -19,8 +19,12 @@ use crate::kernel::sys::errno;
 use crate::kernel::sys::hal;
 use crate::kernel::workload::bitmask::{ModuleMask, MODULE_MASK_WORDS};
 
-/// Maximum concurrent events across all modules.
-pub const MAX_EVENTS: usize = 32;
+/// Events held at once across all modules: the profile's static table, or
+/// where the plan sizes it (Linux, bcm2712, RP) the plan's `events` pool
+/// (`size`), which has no structural source and is its envelope entry or
+/// default.
+pub const MAX_EVENTS: usize =
+    crate::kernel::config::static_slots(crate::abi::contracts::resource::POOL_EVENTS);
 
 // ============================================================================
 // Event slot
@@ -31,7 +35,8 @@ struct EventSlot {
     allocated: AtomicBool,
     /// The signaled flag — set by signal(), cleared by poll().
     signaled: AtomicBool,
-    /// Owning module index (0..MAX_MODULES-1), or `NO_MODULE` if unowned.
+    /// Owning module index (below `scheduler::module_slots()`), or
+    /// `NO_MODULE` if unowned.
     owner: AtomicU16,
 }
 
@@ -49,7 +54,30 @@ impl EventSlot {
 // Static state
 // ============================================================================
 
-static EVENT_SLOTS: [EventSlot; MAX_EVENTS] = [const { EventSlot::new() }; MAX_EVENTS];
+static EVENT_SLOTS: crate::kernel::mem::table::Table<EventSlot, MAX_EVENTS> = crate::boot_table!(
+    MAX_EVENTS,
+    EventSlot::new(),
+    crate::abi::contracts::resource::POOL_EVENTS
+);
+
+/// Size the event table to `n` slots, all live: events have no structural
+/// source, so the plan's ceiling is the table.
+///
+/// # Safety
+/// Boot or graph-preparation context: no reference into the table is live.
+pub unsafe fn size(n: usize) -> Result<(), crate::kernel::mem::table::TableError> {
+    EVENT_SLOTS.reserve(n)?;
+    EVENT_SLOTS.grow(n)
+}
+
+/// The event table, sized from the plan's defaults when no plan has sized it.
+fn slots() -> &'static [EventSlot] {
+    EVENT_SLOTS.size_unplanned(|| {
+        crate::kernel::sys::resource_ledger::ceiling(crate::abi::contracts::resource::POOL_EVENTS)
+            as usize
+    });
+    &EVENT_SLOTS
+}
 
 /// One bit per module. Set when any owned event is signaled. Backed by
 /// `MODULE_MASK_WORDS` atomics so it scales with `MAX_MODULES` beyond 64.
@@ -112,7 +140,7 @@ pub fn paused_owners_present() -> bool {
 pub fn module_wake_masked(module_idx: usize) -> bool {
     #[cfg(feature = "multitenant")]
     {
-        module_idx < crate::kernel::boot::config::MAX_MODULES
+        module_idx < crate::kernel::exec::scheduler::module_slots()
             && (PAUSED_MODULES[module_idx / 64].load(Ordering::Acquire) >> (module_idx % 64)) & 1
                 != 0
     }
@@ -127,7 +155,7 @@ pub fn module_wake_masked(module_idx: usize) -> bool {
 #[inline]
 pub fn defer_masked_wake(module_idx: usize) {
     #[cfg(feature = "multitenant")]
-    if module_idx < crate::kernel::boot::config::MAX_MODULES {
+    if module_idx < crate::kernel::exec::scheduler::module_slots() {
         PAUSED_DEFERRED_WAKES[module_idx / 64]
             .fetch_or(1u64 << (module_idx % 64), Ordering::Release);
     }
@@ -148,7 +176,7 @@ pub fn defer_masked_wakes(mask: &ModuleMask) {
     }
 }
 
-/// `owner_pause` half of §3.6 masking: mark `mask`'s modules wake-masked and
+/// `owner_pause` half of wake masking: mark `mask`'s modules wake-masked and
 /// bump the paused-owner count. Mask-then-check: callers sweep
 /// already-latched bits AFTER this returns.
 #[cfg(feature = "multitenant")]
@@ -194,10 +222,10 @@ pub fn unpause_mask_modules(mask: &ModuleMask) -> ModuleMask {
 /// Check that the event handle is valid, allocated, and owned by the calling module.
 /// Returns Ok(&EventSlot) on success, Err(errno) on failure.
 fn check_event_access(handle: i32) -> Result<&'static EventSlot, i32> {
-    if handle < 0 || handle as usize >= MAX_EVENTS {
+    if handle < 0 || handle as usize >= slots().len() {
         return Err(errno::EINVAL);
     }
-    let slot = &EVENT_SLOTS[handle as usize];
+    let slot = &slots()[handle as usize];
     if !slot.allocated.load(Ordering::Acquire) {
         return Err(errno::EINVAL);
     }
@@ -223,7 +251,7 @@ pub fn event_create() -> i32 {
         return errno::ENOSPC;
     }
     let owner = crate::kernel::exec::scheduler::current_module_id();
-    for (i, slot) in EVENT_SLOTS.iter().enumerate() {
+    for (i, slot) in slots().iter().enumerate() {
         if slot
             .allocated
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -240,7 +268,7 @@ pub fn event_create() -> i32 {
 
 /// Allocated slots — resource-ledger sample for `POOL_EVENTS`.
 pub fn in_use_count() -> usize {
-    EVENT_SLOTS
+    slots()
         .iter()
         .filter(|s| s.allocated.load(Ordering::Relaxed))
         .count()
@@ -251,19 +279,19 @@ pub fn in_use_count() -> usize {
 /// Sets the signaled flag, marks the owning module for wake, and pokes
 /// the scheduler signal so it can break out of its timer sleep.
 pub fn event_signal(handle: i32) -> i32 {
-    if handle < 0 || handle as usize >= MAX_EVENTS {
+    if handle < 0 || handle as usize >= slots().len() {
         return errno::EINVAL;
     }
-    let slot = &EVENT_SLOTS[handle as usize];
+    let slot = &slots()[handle as usize];
     if !slot.allocated.load(Ordering::Acquire) {
         return errno::EINVAL;
     }
     slot.signaled.store(true, Ordering::Release);
     let owner = slot.owner.load(Ordering::Relaxed);
-    if (owner as usize) < crate::kernel::boot::config::MAX_MODULES
+    if (owner as usize) < crate::kernel::exec::scheduler::module_slots()
         && !latch_module_wake(owner as usize)
     {
-        // Owner paused: wake deferred, doorbell suppressed (§3.6 masking).
+        // Owner paused: wake deferred, doorbell suppressed.
         return 0;
     }
     hal::wake_scheduler();
@@ -276,16 +304,16 @@ pub fn event_signal(handle: i32) -> i32 {
 /// # Safety
 /// Caller must ensure handle is a valid, allocated event slot.
 pub fn event_signal_from_isr(handle: i32) {
-    if handle < 0 || handle as usize >= MAX_EVENTS {
+    if handle < 0 || handle as usize >= slots().len() {
         return;
     }
-    let slot = &EVENT_SLOTS[handle as usize];
+    let slot = &slots()[handle as usize];
     slot.signaled.store(true, Ordering::Release);
     let owner = slot.owner.load(Ordering::Relaxed);
-    if (owner as usize) < crate::kernel::boot::config::MAX_MODULES
+    if (owner as usize) < crate::kernel::exec::scheduler::module_slots()
         && !latch_module_wake(owner as usize)
     {
-        // Owner paused: wake deferred, doorbell suppressed (§3.6 masking).
+        // Owner paused: wake deferred, doorbell suppressed.
         return;
     }
     hal::wake_scheduler();
@@ -309,10 +337,10 @@ pub fn event_poll(handle: i32) -> i32 {
 /// Non-destructive peek: check if an event is signaled without clearing it.
 /// Used by `fd_poll` for unified readiness checks.
 pub fn event_is_signaled(handle: i32) -> bool {
-    if handle < 0 || handle as usize >= MAX_EVENTS {
+    if handle < 0 || handle as usize >= slots().len() {
         return false;
     }
-    let slot = &EVENT_SLOTS[handle as usize];
+    let slot = &slots()[handle as usize];
     if !slot.allocated.load(Ordering::Acquire) {
         return false;
     }
@@ -395,12 +423,13 @@ pub fn relatch_module_wake(module_idx: usize) {
 /// module's wake is diverted to the deferred store instead. Returns `true`
 /// when the bit latched into `EVENT_WAKE_PENDING` (the caller may ring the
 /// doorbell), `false` when it was diverted (the caller MUST NOT ring — the
-/// suppressed doorbell is the §3.6 "no cross-domain leak" guarantee).
+/// suppressed doorbell is what keeps a paused owner's wakes from leaking
+/// across domains).
 /// When no owner is paused the masking adds one relaxed-load guard before
 /// the same `fetch_or`.
 #[inline]
 pub fn latch_module_wake(module_idx: usize) -> bool {
-    if module_idx >= crate::kernel::boot::config::MAX_MODULES {
+    if module_idx >= crate::kernel::exec::scheduler::module_slots() {
         return false;
     }
     if paused_owners_present() && module_wake_masked(module_idx) {
@@ -412,8 +441,8 @@ pub fn latch_module_wake(module_idx: usize) -> bool {
 }
 
 /// Test-only: latch a module's wake bit directly, as if an event owned by it
-/// fired. Lets the multi-graph runner tests exercise the §6.5 "woken idle
-/// graph" resumption path without registering a real event. Mirrors the
+/// fired. Lets the multi-graph runner tests exercise the woken-idle-graph
+/// resumption path without registering a real event. Mirrors the
 /// wake-latch `event_signal` performs; a later `take_wake_pending` consumes it
 /// identically.
 pub fn signal_module_wake_for_test(module_idx: usize) {
@@ -447,7 +476,7 @@ pub fn take_wake_in_mask(mask: &ModuleMask) -> ModuleMask {
 /// Note: Device providers (GPIO etc.) clean up their own bindings via
 /// their own release_owned_by — this only frees event slots.
 pub fn release_owned_by(module_idx: ModuleId) {
-    for slot in EVENT_SLOTS.iter() {
+    for slot in slots().iter() {
         if !slot.allocated.load(Ordering::Acquire) {
             continue;
         }
@@ -480,7 +509,7 @@ pub fn reset_pause_masking() {
 /// Clear all event slots. Called on graph teardown / reload.
 /// Device providers must clear their own bindings before calling this.
 pub fn reset_all() {
-    for slot in EVENT_SLOTS.iter() {
+    for slot in slots().iter() {
         if slot.allocated.load(Ordering::Acquire) {
             slot.signaled.store(false, Ordering::Release);
             slot.owner.store(NO_MODULE, Ordering::Release);

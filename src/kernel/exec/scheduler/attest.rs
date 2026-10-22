@@ -66,8 +66,12 @@ pub fn write_record(challenge: &[u8; 32], tier: u8, out: &mut [u8]) -> Option<us
     if !put(out, &mut pos, &incarnation) || !put(out, &mut pos, challenge) {
         return None;
     }
-    // The kernel's own ABI-surface digest, over the canonical stream the
-    // loader checks every module against.
+    // The kernel's own ABI-surface digest, over the canonical stream. Every
+    // module the loader instantiates attests this same digest, signed or not
+    // (`loader::validate_module` refuses one that is unattested or attests
+    // another), so each instance listed below runs a blob built for it. A
+    // blob the table holds that no instance runs is listed by its bytes and
+    // has not been checked.
     let abi = {
         let mut h = Sha256::new();
         crate::abi::abi_surface::write_surface(&mut |bytes| h.update(bytes));
@@ -82,8 +86,8 @@ pub fn write_record(challenge: &[u8; 32], tier: u8, out: &mut [u8]) -> Option<us
     // and reconfigure-time only.
     let (loader, config) = unsafe { (static_loader(), static_config()) };
 
-    // Every blob the loader holds, hashed in place. The blob is what was
-    // admitted: header, code, data, exports, manifest.
+    // Every blob the loader holds, hashed in place: the table entry's bytes,
+    // header, code, data, exports and manifest.
     let blob_count = loader.module_count();
     if !put(out, &mut pos, &(blob_count as u16).to_le_bytes()) {
         return None;

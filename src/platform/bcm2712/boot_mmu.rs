@@ -49,28 +49,43 @@ pub unsafe fn enable() {
     boot_mmu::enable(&[image, payload]);
 }
 
-/// The Pi 5's map.
+/// The Pi 5's map, built from the device tree (`fluxor::platform::memmap`,
+/// read before this runs; the fixed map below when it cannot be read).
 ///
-///   0x0000_0000 .. 0xFFFF_FFFF     DRAM (the first gigabyte in 2 MB blocks;
-///                                  the firmware keeps 0x3FC0_0000..0x4000_0000)
-///   0x1_0000_0000 .. 0x1_3FFF_FFFF DRAM (8 and 16 GB boards; not a DMA target)
-///   0x1_4000_0000 .. 0x1_FFFF_FFFF Device: DRAM on 8 and 16 GB boards that
-///                                  the kernel does not use
+///   0x0000_0000 .. 0x3FFF_FFFF     the first gigabyte in 2 MB blocks: DRAM
+///                                  where `/memory` says so (the firmware
+///                                  keeps 0x3FC0_0000..0x4000_0000, which the
+///                                  tree leaves out, so those blocks are
+///                                  Device), Device elsewhere
+///   0x4000_0000 .. 0x3_FFFF_FFFF   DRAM, a gigabyte at a time, where
+///                                  `/memory` states any (a 2 GB board's
+///                                  second gigabyte; 4, 8 and 16 GB boards'
+///                                  more), Device elsewhere
 ///   0x10_0000_0000 .. 0x10_7FFF_FFFF  SoC peripheral aperture (GIC-400, …)
 ///   0x18_0000_0000 .. 0x1B_FFFF_FFFF  PCIe1 (external connector) outbound windows
 ///   0x1C_0000_0000 .. 0x1C_FFFF_FFFF  RP1 BAR, where the firmware leaves PCIe2's
 ///                                     outbound window (RP1's UART, Ethernet, …)
 ///
-/// The DRAM gigabytes above the first are mapped Normal whether or not a
-/// smaller board populates them. Both BSS-backed DMA arenas must live
-/// below 4 GB because the PCIe1 inbound ATU only covers PCI bus
-/// 0..0xFFFFFFFF.
+/// The fixed map (no readable tree) is the first gigabyte whole, gigabytes
+/// 1..5 DRAM and 5..16 Device. Both BSS-backed
+/// DMA arenas must live below 4 GB because the PCIe1 inbound ATU only covers
+/// PCI bus 0..0xFFFFFFFF.
 ///
 /// # Safety
-/// Called once, early in boot, with the MMU off.
+/// Called once, early in boot, with the MMU off, after
+/// `fluxor::platform::memmap::build`.
 #[cfg(feature = "board-pi5")]
 pub unsafe fn init_page_tables() {
+    use fluxor::platform::memmap;
     boot_mmu::split_first_gb(Kind::Dram);
+    // A block of the first gigabyte the tree states no memory in is Device:
+    // the firmware's reservation at its top is not memory the kernel may
+    // cache.
+    for idx in 0..512 {
+        if !memmap::dram_2mb(idx) {
+            boot_mmu::map_2mb(idx, Kind::Device);
+        }
+    }
     // Each BSS DMA arena's enclosing 2 MB blocks become Normal
     // Non-Cacheable: hardware DMA and CPU see coherent memory by
     // construction, with no DC CVAC / IVAC on the fast path.
@@ -94,11 +109,15 @@ pub unsafe fn init_page_tables() {
     }
     boot_mmu::unmap_stack_guards(&fluxor::platform::multicore::kernel_stack_guards());
 
-    for gb in 1..5 {
-        boot_mmu::map_gb(gb, Kind::Dram);
-    }
-    for gb in 5..8 {
-        boot_mmu::map_gb(gb, Kind::Device);
+    // DRAM: the tree's gigabytes up to 16 GB, the largest Pi 5's
+    // (`memmap::DRAM_TOP`); a smaller board's missing ones map Device.
+    for gb in 1..16 {
+        let kind = if memmap::dram_gb(gb) {
+            Kind::Dram
+        } else {
+            Kind::Device
+        };
+        boot_mmu::map_gb(gb, kind);
     }
     // The SoC aperture at 0x10_0000_0000 (2 GB): L1 indices 64, 65.
     boot_mmu::map_gb(64, Kind::Device);
@@ -114,27 +133,27 @@ pub unsafe fn init_page_tables() {
     }
 }
 
-/// QEMU virt: RAM starts at 1 GB and `fluxor run` gives the machine 2 GB of
-/// it (`-m 2G`, `targets/boards/qemu-virt.toml`), which holds the kernel's
-/// 1 GiB state arena. Only that is mapped Normal: address space with no
-/// memory behind it is never mapped as memory, where a speculative fetch
-/// could reach it. Every other gigabyte below 512 GB is Device — the first
-/// holds the flash, GIC, UART, virtio-mmio and low PCIe windows, the one at
-/// 256 GB the PCIe ECAM. The 64-bit PCIe window, at 512 GB, is outside a
-/// 39-bit address space and is not mapped; nothing here places a BAR
-/// there. Without the map the MMU stays off, every access is
-/// Device-nGnRnE, and module code — built for a part that runs with the
-/// MMU on, so free to emit unaligned loads and stores — would
-/// alignment-fault on its first unaligned access.
+/// QEMU virt: RAM starts at 1 GB and is as large as the machine was given
+/// (`-m`; `fluxor run` gives 2 GB, `targets/boards/qemu-virt.toml`), as the
+/// device tree QEMU leaves at the base of RAM says (`fluxor::platform::memmap`;
+/// the fixed 2 GB map when it cannot be read). Only that is mapped Normal:
+/// address space with no memory behind it is never mapped as memory, where a
+/// speculative fetch could reach it. Every other gigabyte below 512 GB is
+/// Device — the first holds the flash, GIC, UART, virtio-mmio and low PCIe
+/// windows, the one at 256 GB the PCIe ECAM. The 64-bit PCIe window, at
+/// 512 GB, is outside a 39-bit address space and is not mapped; nothing here
+/// places a BAR there. Without the map the MMU stays off, every access is
+/// Device-nGnRnE, and module code — built for a part that runs with the MMU
+/// on, so free to emit unaligned loads and stores — would alignment-fault on
+/// its first unaligned access.
 ///
 /// # Safety
-/// Called once, early in boot, with the MMU off.
+/// Called once, early in boot, with the MMU off, after
+/// `fluxor::platform::memmap::build`.
 #[cfg(not(feature = "board-pi5"))]
 pub unsafe fn init_page_tables() {
-    const RAM_FIRST_GB: usize = 1;
-    const RAM_GBS: usize = 2;
     for gb in 0..512 {
-        let kind = if (RAM_FIRST_GB..RAM_FIRST_GB + RAM_GBS).contains(&gb) {
+        let kind = if fluxor::platform::memmap::dram_gb(gb) {
             Kind::Dram
         } else {
             Kind::Device

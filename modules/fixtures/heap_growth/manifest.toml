@@ -1,0 +1,15 @@
+version = "1.0.0"
+hardware_targets = ["bcm2712", "linux"]
+
+# Fixture for heap zeroing off the step path: grows its elastic heap on its
+# steps, 16 KiB a step, holding every chunk, until the heap's cap refuses;
+# then frees them all and grows again. Each growth past what the heap has
+# committed carves a new segment from the state arena on the step, which is
+# what `heap_zero_step_bytes` counts when the arena has to zero it; the heap
+# keeps its segments, so only the first cycle carves. Logs its progress on a slow cadence:
+#
+#   [heap_growth] cycle=<n> held=<bytes> peak=<bytes> fails=<n>
+timer_class = "agnostic"
+
+[observability]
+exempt = "fixture whose evidence is its progress line and the kernel's heap heartbeat"

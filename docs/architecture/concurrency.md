@@ -96,6 +96,19 @@ must be an atomic or guarded by a lock:
   compare-exchange) keeps a reader from pairing two anchors' fields.
 - Event queues (`src/kernel/ipc/event.rs`) — atomic ring per event
   handle.
+- The bcm2712 state arena's zeroed frontier (`src/kernel/module/loader.rs`)
+  — every domain zeroes the arena in its slack. One claim at a time
+  (`CLAIM`, taken under `STATE_LOCK` with a try-lock, so a domain never
+  waits to donate slack): the frontier chunk above the bump offset, or the
+  head of a freed region on the in-zeroing list. The zeroing runs outside
+  the lock. A frontier claim completes with two release stores and no lock,
+  so an allocation that needs memory under it may wait for it while holding
+  `STATE_LOCK`; an in-zeroing claim completes under the lock, and a reset
+  waits for it outside the lock. The arena's top is shared with the kernel's
+  table carves (`src/kernel/mem/carve.rs`) without a common lock: a carve
+  lowers `ARENA_CAP` then reads `ARENA_HIGH`, an allocation raises
+  `ARENA_HIGH` then reads `ARENA_CAP`, both sequentially consistent, so of
+  any two racing at least one sees the other and backs off.
 
 Rule of thumb for new code: any state visible to PIC modules via
 syscall traffic is cross-core-shared by default; any state populated by

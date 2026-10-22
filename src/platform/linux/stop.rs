@@ -27,8 +27,13 @@ const DEFAULT_DRAIN_MS: u64 = 10_000;
 
 extern "C" fn stop_signal_handler(sig: i32, info: *mut libc::siginfo_t, _ctx: *mut libc::c_void) {
     use core::sync::atomic::Ordering;
-    // SAFETY: the kernel passes a valid siginfo to an SA_SIGINFO handler.
-    let sender = if info.is_null() { 0 } else { unsafe { (*info).si_pid() } };
+    let sender = if info.is_null() {
+        0
+    } else {
+        // SAFETY: the kernel passes a valid siginfo to an SA_SIGINFO
+        // handler, and it is non-null here.
+        unsafe { (*info).si_pid() }
+    };
     if !STOP_REQUESTED.load(Ordering::Acquire) {
         STOP_SIGNAL.store(sig, Ordering::Release);
         STOP_SENDER.store(sender, Ordering::Release);
@@ -75,6 +80,8 @@ fn stop_requested() -> bool {
 fn exit_by_stop_signal() -> ! {
     let sig = STOP_SIGNAL.load(core::sync::atomic::Ordering::Acquire);
     restore_terminal();
+    // Dying by the signal skips `atexit`: leave the host registry first.
+    fluxor::platform::linux::instance::shutdown();
     // SAFETY: plain libc calls with a signal number the handler recorded.
     unsafe {
         libc::signal(sig, libc::SIG_DFL);

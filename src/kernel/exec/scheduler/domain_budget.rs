@@ -28,7 +28,7 @@ pub fn clear_domain_pacer_work_for_test(domain_id: usize) {
 /// the pass. Poll-mode callers use that bit to decide whether to spin
 /// (more work pending) or WFE (idle).
 pub fn step_domain_modules_poll(
-    modules: &mut [ModuleSlot; MAX_MODULES],
+    modules: &mut [ModuleSlot],
     domain_id: usize,
 ) -> (StepResult, bool) {
     if domain_id >= MAX_DOMAINS {
@@ -142,7 +142,7 @@ pub(crate) fn record_domain_budget_overrun(
         // pass, as `index:µs/steps`.
         const TOP: usize = 3;
         let mut top = [(u32::MAX, 0u32, 0u16); TOP];
-        for i in 0..MAX_MODULES {
+        for i in 0..module_slots() {
             let us = sched.pass_module_us[i];
             if us == 0 || sched.domain_id[i] as usize != domain_id {
                 continue;
@@ -265,10 +265,7 @@ pub fn set_domain_budget_us_limit(domain_id: usize, limit_us: u32) {
     }
 }
 
-pub fn step_domain_modules(
-    modules: &mut [ModuleSlot; MAX_MODULES],
-    domain_id: usize,
-) -> StepResult {
+pub fn step_domain_modules(modules: &mut [ModuleSlot], domain_id: usize) -> StepResult {
     if domain_id >= MAX_DOMAINS {
         return StepResult::Done;
     }
@@ -440,6 +437,15 @@ pub fn step_domain_modules(
     // Reap the completions of torn-down modules' lent buffers.
     crate::kernel::module::block_lend::pump();
 
+    // Donate what is left of the tick budget to the state arena's zeroing: a
+    // domain with no budget donates nothing.
+    let limit = sched.domain_budget_us_limit[domain_id] as u64;
+    if limit > 0 {
+        crate::kernel::module::loader::zero_in_slack(
+            limit.saturating_sub(sched.domain_budget_us_consumed[domain_id]),
+        );
+    }
+
     if active_count == 0 {
         StepResult::Done
     } else {
@@ -462,7 +468,7 @@ pub fn step_domain_modules(
 /// fresh budget.
 #[inline]
 pub(crate) fn step_domain_pre_tick(
-    modules: &mut [ModuleSlot; MAX_MODULES],
+    modules: &mut [ModuleSlot],
     sched: &mut SchedulerState,
     domain_id: usize,
     not_ready: &ModuleMask,
@@ -519,7 +525,7 @@ pub(crate) fn step_domain_pre_tick(
 /// repeat link maintenance, TX, timers, or other pre-tick side effects.
 #[inline]
 pub(crate) fn step_domain_pipeline_refill(
-    modules: &mut [ModuleSlot; MAX_MODULES],
+    modules: &mut [ModuleSlot],
     sched: &mut SchedulerState,
     domain_id: usize,
     active_count: &mut usize,
@@ -599,7 +605,7 @@ pub(crate) fn step_domain_pipeline_refill(
 /// visible in the same outer tick.
 #[inline]
 pub(crate) fn step_domain_post_tick_flush(
-    modules: &mut [ModuleSlot; MAX_MODULES],
+    modules: &mut [ModuleSlot],
     sched: &mut SchedulerState,
     domain_id: usize,
     active_count: &mut usize,
@@ -683,7 +689,7 @@ pub(crate) fn step_domain_post_tick_flush(
 /// it when a module finalises (Done / terminate / fault-without-restart).
 #[inline]
 pub(crate) fn step_one_module(
-    modules: &mut [ModuleSlot; MAX_MODULES],
+    modules: &mut [ModuleSlot],
     sched: &mut SchedulerState,
     module_idx: usize,
     not_ready: &ModuleMask,
@@ -896,7 +902,7 @@ pub(crate) fn step_one_module(
         // none — and telling those two apart is the reading this
         // histogram exists to support.
         crate::kernel::sys::hal::stack_fence_arm(m.stack_bytes());
-        let outcome = m.step();
+        let outcome = as_module_step(|| m.step());
         note_stack_fence(module_idx);
         record_step_time(
             module_idx,
@@ -1027,7 +1033,7 @@ pub(crate) fn step_one_module(
                         // recorded as one — the histogram counts steps
                         // the scheduler performed, not passes it made.
                         let burst_t0 = crate::kernel::sys::hal::now_micros();
-                        let burst_outcome = m.step();
+                        let burst_outcome = as_module_step(|| m.step());
                         note_stack_fence(module_idx);
                         record_step_time(
                             module_idx,
@@ -1168,11 +1174,7 @@ const MOD_STEP_HEAVY_US: u64 = 50;
 /// scheduler invariant — upstream-ready gating, fault state machine,
 /// step-time recording, step-guard arm/disarm, stack-canary check,
 /// burst MPU-fault handling — from the shared body.
-pub fn step_woken_modules(
-    modules: &mut [ModuleSlot; MAX_MODULES],
-    count: usize,
-    wake_bits: &ModuleMask,
-) {
+pub fn step_woken_modules(modules: &mut [ModuleSlot], count: usize, wake_bits: &ModuleMask) {
     // SAFETY: scheduler thread is the sole stepper.
     let sched = unsafe {
         let p = &raw mut SCHED;

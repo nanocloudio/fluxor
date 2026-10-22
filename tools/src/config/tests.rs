@@ -718,20 +718,20 @@ mod scheduler_validation_tests {
         let m = json!({"heap": {"zero_on_free": true, "alloc_failure_policy": "fault",
                                 "canary_enabled": true}});
         // No schema params: a TLV of their own.
-        let p = insert_workload_heap_tags(Vec::new(), &m, "kv").unwrap();
+        let p = insert_workload_heap_tags(Vec::new(), &m, "kv", None).unwrap();
         assert_eq!(
             p,
             vec![0xFE, 0x01, 11, 0, 0xF8, 1, 1, 0xF9, 1, 1, 0xFA, 1, 1, 0xFF, 0x00]
         );
         // Schema params: the flags go before the end marker, the length grows.
         let schema_tlv = vec![0xFE, 0x01, 5, 0, 1, 1, 7, 0xFF, 0x00];
-        let p = insert_workload_heap_tags(schema_tlv, &m, "kv").unwrap();
+        let p = insert_workload_heap_tags(schema_tlv, &m, "kv", None).unwrap();
         assert_eq!(&p[..7], &[0xFE, 0x01, 14, 0, 1, 1, 7]);
         assert_eq!(&p[7..16], &[0xF8, 1, 1, 0xF9, 1, 1, 0xFA, 1, 1]);
         assert_eq!(&p[16..], &[0xFF, 0x00]);
         assert_eq!(crate::add_subgraph::params_node_tag(&p), None);
         // No heap key: untouched.
-        let p = insert_workload_heap_tags(vec![1, 2, 3], &json!({}), "kv").unwrap();
+        let p = insert_workload_heap_tags(vec![1, 2, 3], &json!({}), "kv", None).unwrap();
         assert_eq!(p, vec![1, 2, 3]);
     }
 
@@ -741,7 +741,7 @@ mod scheduler_validation_tests {
     fn heap_arena_bytes_packs_as_tag_0xef() {
         // Workload path.
         let m = json!({"heap": {"arena_bytes": 2 * 1024 * 1024}});
-        let p = insert_workload_heap_tags(Vec::new(), &m, "kv").unwrap();
+        let p = insert_workload_heap_tags(Vec::new(), &m, "kv", None).unwrap();
         assert_eq!(
             p,
             vec![0xFE, 0x01, 8, 0, 0xEF, 4, 0x00, 0x00, 0x20, 0x00, 0xFF, 0x00]
@@ -2216,6 +2216,52 @@ mod continuity_tests {
         validate_fault_policy(&cfg, &n, &HashMap::new()).unwrap();
     }
 
+    /// A workload node's network stack has one `addr_ctl` writer, the
+    /// kernel: a coordinator wired into it is refused there, and allowed in a
+    /// graph that creates no workloads.
+    #[test]
+    fn a_workload_node_refuses_a_second_addr_ctl_writer() {
+        use crate::manifest::{permission, ResourceClaim};
+        let creator = Manifest {
+            resources: vec![ResourceClaim {
+                device_class: 0x1A,
+                access_mode: 1,
+                instance: 0xFF,
+            }],
+            permissions: crate::manifest::ManifestPermissions {
+                bits: permission::PLATFORM_RAW,
+            },
+            ..Manifest::default()
+        };
+        // The network stack declares the contract for its lane ops, without
+        // platform_raw: not a creator.
+        let stack = Manifest {
+            resources: vec![ResourceClaim {
+                device_class: 0x1A,
+                access_mode: 1,
+                instance: 0xFF,
+            }],
+            ..Manifest::default()
+        };
+        let wired = json!({"wiring": [{"from": "fence.ctl", "to": "net.addr_ctl"}]});
+        let mut m = HashMap::new();
+        m.insert("net".to_string(), stack.clone());
+        m.insert("fence".to_string(), Manifest::default());
+        validate_net_identity_writers(&wired, &names(&["net", "fence"]), &m)
+            .expect("no creator: the direct path stands");
+        m.insert("effect".to_string(), creator);
+        let e = validate_net_identity_writers(&wired, &names(&["net", "fence", "effect"]), &m)
+            .unwrap_err();
+        assert!(e.to_string().contains("workload node"), "{e}");
+        let mut declared = wired.clone();
+        declared["workload_node"] = json!(true);
+        let mut m2 = HashMap::new();
+        m2.insert("net".to_string(), stack);
+        assert!(validate_net_identity_writers(&declared, &names(&["net"]), &m2).is_err());
+        validate_net_identity_writers(&json!({"workload_node": true}), &names(&["net"]), &m2)
+            .expect("nothing wired into addr_ctl");
+    }
+
     #[test]
     fn single_provider_allows_distinct_and_absent_providers() {
         // A graph with no `provides` anywhere is unaffected.
@@ -3171,19 +3217,51 @@ mod capacity_envelope_tests {
         assert_eq!(u32::from_le_bytes(sec[20..24].try_into().unwrap()), 2);
     }
 
-    /// Over-asking a pool whose compiled capacity is known host-side is a
-    /// compose-time error (the envelope only sizes DOWN), and zero is
-    /// rejected (0 is the kernel's "unset" sentinel).
+    /// An entry is a reserve (a size, for a pool the config cannot derive),
+    /// and a table pool's reserve may be zero where an arena's size may not.
+    /// Whether the kernel can hold it is the boot plan's question
+    /// (`boot_plan_tests`), not the envelope's.
     #[test]
-    fn over_ask_and_zero_are_config_errors() {
-        let cfg = json!({"capacity": {"events": 33}});
-        let err = build_capacity_envelope(&cfg, Some("linux"))
-            .expect_err("events=33 exceeds the compiled 32");
-        assert!(format!("{err:?}").contains("exceeds"));
+    fn an_entry_is_a_reserve_or_an_arena_size() {
+        for target in ["wasm", "rp2350", "linux", "pi5"] {
+            let cfg = json!({"capacity": {"events": 33}});
+            build_capacity_envelope(&cfg, Some(target)).expect("every kernel has an event table");
+        }
+        let cfg = json!({"capacity": {"module_slots": 3000}});
+        build_capacity_envelope(&cfg, Some("linux")).expect("a reserve, not a ceiling");
 
         let cfg = json!({"capacity": {"events": 0}});
-        let err = build_capacity_envelope(&cfg, Some("linux")).expect_err("zero is not a capacity");
+        build_capacity_envelope(&cfg, Some("linux")).expect("a zero reserve is a choice");
+        let cfg = json!({"capacity": {"buffer_arena": 0}});
+        let err = build_capacity_envelope(&cfg, Some("linux")).expect_err("an empty arena");
         assert!(format!("{err:?}").contains("positive"));
+    }
+
+    /// A pool the target's kernel has no table for — the control-plane
+    /// store's on RP and wasm, host-process sandboxes off Linux — is refused
+    /// by name: the entry would bound nothing.
+    #[test]
+    fn an_entry_for_a_pool_the_kernel_lacks_is_refused() {
+        for (target, pool) in [
+            ("rp2350", "store_subs"),
+            ("wasm", "store_reads"),
+            ("pi5", "sandboxes"),
+            ("pi5", "tty_sessions"),
+            ("pi5", "store_writes"),
+        ] {
+            let cfg = json!({"capacity": {pool: 4}});
+            let err = build_capacity_envelope(&cfg, Some(target))
+                .expect_err("no such table")
+                .to_string();
+            assert!(
+                err.contains(&format!("has no '{pool}' table")),
+                "{target}: {err}"
+            );
+        }
+        for (target, pool) in [("linux", "sandboxes"), ("pi5", "store_subs")] {
+            let cfg = json!({"capacity": {pool: 4}});
+            build_capacity_envelope(&cfg, Some(target)).expect("the kernel has this table");
+        }
     }
 
     /// `config_arena` is observed, never allocated (module params are
@@ -3210,13 +3288,238 @@ mod capacity_envelope_tests {
     }
 
     /// RP arena asks aren't validated host-side (silicon-TOML-owned); the
-    /// section still encodes them — the kernel clamps at boot.
+    /// section still encodes them — the kernel refuses an over-ask at boot.
     #[test]
-    fn rp_arena_ask_passes_through_for_kernel_clamp() {
+    fn rp_arena_ask_passes_through_for_the_kernel_to_check() {
         let cfg = json!({"capacity": {"state_arena": 65536}});
         let sec = build_capacity_envelope(&cfg, Some("rp2350")).expect("encodes");
         assert_eq!(u16::from_le_bytes(sec[12..14].try_into().unwrap()), 0x0001);
-        assert_eq!(u32::from_le_bytes(sec[14..18].try_into().unwrap()), 65536);
+        assert_eq!(
+            u32::from_le_bytes(sec[14..18].try_into().unwrap()),
+            65536,
+            "an arena's entry below 2 GiB is exact bytes"
+        );
+    }
+
+    /// An arena entry is exact bytes below 2 GiB — a byte-precise budget stays
+    /// exact — and KiB (rounded up, with the KiB bit) past it, so an arena past
+    /// 4 GiB (a large board's state arena) still fits; a table's is in its own
+    /// unit.
+    #[test]
+    fn arena_entries_are_exact_bytes_and_reach_past_4_gib() {
+        let cfg = json!({"capacity": {"state_arena": 6u64 << 30, "buffer_arena": 1025}});
+        let sec = build_capacity_envelope(&cfg, Some("pi5")).expect("encodes");
+        let entry = |at: usize| {
+            (
+                u16::from_le_bytes(sec[at..at + 2].try_into().unwrap()),
+                u32::from_le_bytes(sec[at + 2..at + 6].try_into().unwrap()),
+            )
+        };
+        let entries = [entry(12), entry(18)];
+        let kib = crate::capacity::ENTRY_KIB;
+        assert!(entries.contains(&(0x0001, (6 << 20) | kib)), "{entries:?}");
+        assert!(
+            entries.contains(&(0x0002, 1025)),
+            "1025 B stays exact: {entries:?}"
+        );
+        let cfg = json!({"capacity": {"events": 40}});
+        let sec = build_capacity_envelope(&cfg, Some("pi5")).expect("encodes");
+        assert_eq!(u32::from_le_bytes(sec[14..18].try_into().unwrap()), 40);
+    }
+}
+
+/// Graph-sized capacity: module params have no ceiling, the composer reads
+/// the kernel's pool sizes as profile data and runs its boot plan, the Linux
+/// and bcm2712 graph sections are laid out for the graph, and the graph's
+/// declared demand rides the FXDM section.
+#[cfg(test)]
+mod dynamic_capacity_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// A schema with one blob param, `payload` (tag 1).
+    fn blob_schema() -> schema::ParamSchema {
+        let mut b = vec![0x53, 0x50, 1, 1, 1, 5, 0, 0, 0, 0, 7];
+        b.extend_from_slice(b"payload");
+        b.push(0);
+        schema::ParamSchema::from_bytes(&b).expect("schema")
+    }
+
+    /// 600 KiB of params pack into one entry — the buffer grows to fit
+    /// — and every byte is there, in order.
+    #[test]
+    fn six_hundred_kib_of_params_pack_whole() {
+        const BLOB: usize = 61440;
+        let blobs: Vec<Vec<u8>> = (0..10u8)
+            .map(|i| (0..BLOB).map(|j| (j as u8).wrapping_mul(31) ^ i).collect())
+            .collect();
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let module =
+            json!({"payload": blobs.iter().map(|b| json!({"hex": hex(b)})).collect::<Vec<_>>()});
+        let params = pack_params_growing(&module, &blob_schema(), None, "probe").expect("packs");
+        assert!(params.len() > 600 * 1024, "{} bytes", params.len());
+        // Walk the TLV and reassemble the blobs.
+        let mut got: Vec<Vec<u8>> = Vec::new();
+        let mut off = 4;
+        let mut want = 0usize;
+        while off + 2 <= params.len() && params[off] != 0xFF {
+            let (tag, len) = (params[off], params[off + 1] as usize);
+            assert_eq!(tag, 1);
+            let mut d = &params[off + 2..off + 2 + len];
+            if want == 0 {
+                want = u16::from_le_bytes([d[0], d[1]]) as usize;
+                d = &d[2..];
+                got.push(Vec::new());
+            }
+            got.last_mut().unwrap().extend_from_slice(d);
+            want -= d.len();
+            off += 2 + len;
+        }
+        assert_eq!(got, blobs, "every blob arrives whole and in order");
+    }
+
+    #[test]
+    fn pool_sizes_are_the_kernel_profiles_data() {
+        use crate::capacity::{
+            kernel_has_pool, kernel_max_edges, kernel_max_modules, kernel_max_owners,
+            kernel_pool_default_reserve, kernel_pool_static_size,
+        };
+        assert!(!crate::capacity::graph_section_per_graph("rp2350"));
+        assert_eq!(kernel_pool_static_size("pi5", "events"), None);
+        assert_eq!(kernel_pool_static_size("pi5", "channels"), None);
+        assert_eq!(kernel_pool_static_size("rp2350", "events"), None);
+        assert_eq!(kernel_pool_static_size("rp2350", "owners"), None);
+        assert_eq!(kernel_pool_static_size("wasm", "events"), Some(32));
+        assert_eq!(kernel_pool_default_reserve("rp2350", "events"), Some(32));
+        assert_eq!(
+            kernel_max_edges("rp2350"),
+            128,
+            "RP's channel table is sized from the graph within the 128-slot graph section"
+        );
+        assert_eq!(kernel_pool_static_size("linux", "events"), None);
+        assert_eq!(kernel_pool_default_reserve("linux", "events"), Some(32));
+        assert_eq!(kernel_pool_default_reserve("linux", "store_subs"), Some(64));
+        assert_eq!(kernel_pool_default_reserve("pi5", "events"), Some(32));
+        assert_eq!(
+            kernel_pool_default_reserve("pi5", "module_slots"),
+            Some(256)
+        );
+        assert_eq!(kernel_max_modules("linux"), 4096);
+        assert_eq!(kernel_max_modules("pi5"), 1024);
+        assert_eq!(kernel_max_owners("linux"), 4096);
+        assert_eq!(kernel_max_owners("pi5"), 64);
+        assert_eq!(kernel_max_owners("rp2350"), 1);
+        assert_eq!(kernel_max_owners("wasm"), 1);
+        assert!(kernel_has_pool("linux", "tty_sessions"));
+        assert!(kernel_has_pool("pi5", "store_reads"));
+        assert!(!kernel_has_pool("pi5", "store_writes"));
+        assert!(kernel_has_pool("rp2350", "state_arena"));
+        assert!(!kernel_has_pool("rp2350", "store_subs"));
+    }
+
+    #[test]
+    fn a_linux_graph_section_is_laid_out_for_its_edges() {
+        use crate::capacity::graph_slots;
+        assert_eq!(graph_slots("linux", 0), 128);
+        assert_eq!(graph_slots("linux", 128), 128);
+        assert_eq!(graph_slots("linux", 1999), 2048);
+        assert_eq!(
+            graph_slots("pi5", 1999),
+            2048,
+            "bcm2712 lays its section out for the graph, as Linux does"
+        );
+        assert_eq!(
+            graph_slots("rp2350", 3),
+            128,
+            "a static profile keeps its layout"
+        );
+    }
+
+    /// The graph's store consumers declare their subscriptions; the
+    /// composer sums them into one FXDM entry for the kernel.
+    #[test]
+    fn declared_subscriptions_ride_the_fxdm_section() {
+        let mut manifests = HashMap::new();
+        for (name, n) in [("watch_a", 7u32), ("watch_b", 5), ("plain", 0)] {
+            let mut m = Manifest::default();
+            if n > 0 {
+                m.capacities.insert("store_subscriptions".into(), n);
+            }
+            manifests.insert(name.to_string(), m);
+        }
+        let names: Vec<String> = ["watch_a", "watch_b", "plain"].map(String::from).to_vec();
+        let declared = declared_demand(&names, &manifests).expect("declared");
+        assert_eq!(declared, vec![("store_subs", 0x000A, 12)]);
+        assert!(declared_demand(&names[2..], &manifests).unwrap().is_empty());
+    }
+
+    /// A module id carries 12 bits: id 3000 round-trips through byte 9.
+    #[test]
+    fn a_module_id_past_ten_bits_is_packed() {
+        let module = json!({"name": "m", "type": "m"});
+        let entry = build_module_entry(
+            "m",
+            &module,
+            3000,
+            None,
+            &json!({}),
+            test_loc(std::path::Path::new("/nonexistent/modules")),
+            &HashMap::new(),
+            crate::capacity::kernel_max_modules("linux"),
+            &crate::target::IsolationFacts::default(),
+        )
+        .expect("entry");
+        let b9 = entry[9];
+        let id = u16::from(entry[8])
+            | (u16::from((b9 >> 5) & 3) << 8)
+            | (u16::from(b9 >> 7) << 10)
+            | (u16::from((b9 >> 3) & 1) << 11);
+        assert_eq!(id, 3000);
+        assert_eq!(b9 & 0x07, 0, "the id does not leak into the domain");
+    }
+
+    /// `heap.raw_arena` (or the type's `[capacities] raw_arena`) is params
+    /// tag 0xEE, which the kernel reads to commit the arena at instantiation.
+    #[test]
+    fn raw_arena_use_is_tag_0xee() {
+        let module = json!({"name": "kv", "type": "kv", "heap": {"raw_arena": true}});
+        let entry = build_module_entry(
+            "kv",
+            &module,
+            0,
+            None,
+            &json!({}),
+            test_loc(std::path::Path::new("/nonexistent/modules")),
+            &HashMap::new(),
+            crate::capacity::kernel_max_modules("linux"),
+            &crate::target::IsolationFacts::default(),
+        )
+        .expect("entry");
+        assert!(
+            entry.windows(3).any(|w| w == [0xEE, 1, 1]),
+            "tag 0xEE emitted"
+        );
+        let mut manifests = HashMap::new();
+        let mut m = Manifest::default();
+        m.capacities.insert("raw_arena".into(), 1);
+        manifests.insert("kv".to_string(), m);
+        let module = json!({"name": "kv", "type": "kv"});
+        let entry = build_module_entry(
+            "kv",
+            &module,
+            0,
+            None,
+            &json!({}),
+            test_loc(std::path::Path::new("/nonexistent/modules")),
+            &manifests,
+            crate::capacity::kernel_max_modules("linux"),
+            &crate::target::IsolationFacts::default(),
+        )
+        .expect("entry");
+        assert!(
+            entry.windows(3).any(|w| w == [0xEE, 1, 1]),
+            "declared by the type"
+        );
     }
 }
 
@@ -4134,5 +4437,364 @@ mod edge_buffer_bytes_tests {
         let cfg = json!({"wiring": [{"from": "a.out", "to": "b.in", "buffer_bytes": max + 1}]});
         let e = resolve_edge_buffer_bytes(&cfg).unwrap_err().to_string();
         assert!(e.contains("over the 4194304 B ceiling"), "{e}");
+    }
+}
+
+/// A module type's `[capacities] heap_from_params` sizes an instance's heap
+/// cap (params tag 0xEF) from the bytes its params declare, unless the graph
+/// sets `heap.arena_bytes`, which wins.
+#[cfg(test)]
+mod heap_from_params_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// A schema with one chunked string param, `body` (tag 2).
+    fn body_schema() -> schema::ParamSchema {
+        let mut b = vec![0x53, 0x50, 1, 1, 2, 6, 0, 0, 0, 0, 4];
+        b.extend_from_slice(b"body");
+        b.push(0);
+        schema::ParamSchema::from_bytes(&b).expect("schema")
+    }
+
+    /// A rule of http's shape: tags 2 and 11, a type default of `BASE`
+    /// holding `INCLUDED` body bytes.
+    const BASE: u32 = 23_063_552;
+    const INCLUDED: u32 = 262_144;
+
+    fn manifest() -> Manifest {
+        let toml = format!(
+            "version = \"1.0.0\"\n[capacities]\nheap_from_params = \
+             {{ tags = [2, 11], base = {BASE}, included = {INCLUDED} }}\n"
+        );
+        Manifest::from_toml_str_for_target(&toml, Some("aarch64")).expect("manifest")
+    }
+
+    /// The 0xEF value a params TLV carries, if any.
+    fn tag_0xef(tlv: &[u8]) -> Option<u32> {
+        let mut off = 4;
+        while off + 2 <= tlv.len() && tlv[off] != 0xFF {
+            let len = tlv[off + 1] as usize;
+            if tlv[off] == 0xEF && len == 4 {
+                return Some(u32::from_le_bytes(
+                    tlv[off + 2..off + 6].try_into().unwrap(),
+                ));
+            }
+            off += 2 + len;
+        }
+        None
+    }
+
+    /// 600 KiB of body bytes: the cap is the type's default grown by exactly
+    /// the bytes past what it holds, with no `heap:` key in the graph.
+    #[test]
+    fn six_hundred_kib_of_body_derives_the_heap_cap() {
+        let len = 600 * 1024;
+        let module = json!({"body": "x".repeat(len)});
+        let params = pack_params_growing(&module, &body_schema(), None, "http").expect("packs");
+        let m = manifest();
+        let rule = m.heap_from_params.as_ref().unwrap();
+        assert_eq!(rule.declared_bytes(&params), len as u64);
+
+        let p = insert_workload_heap_tags(params.clone(), &module, "http", Some(&m)).unwrap();
+        let want = BASE + (len as u32 - INCLUDED);
+        assert_eq!(tag_0xef(&p), Some(want));
+        assert_eq!(
+            instance_heap_cap("http", &module, Some(&m), &params).unwrap(),
+            Some(want)
+        );
+        // Without the rule, nothing is derived.
+        let p = insert_workload_heap_tags(params, &module, "http", None).unwrap();
+        assert_eq!(tag_0xef(&p), None);
+    }
+
+    /// Bodies the type's default cap already holds emit no tag: the module
+    /// keeps its own figure, byte for byte as before.
+    #[test]
+    fn bodies_within_the_default_emit_no_tag() {
+        let m = manifest();
+        for len in [0usize, 1, INCLUDED as usize] {
+            let module = if len == 0 {
+                json!({})
+            } else {
+                json!({"body": "x".repeat(len)})
+            };
+            let params = pack_params_growing(&module, &body_schema(), None, "http").expect("packs");
+            let p = insert_workload_heap_tags(params.clone(), &module, "http", Some(&m)).unwrap();
+            assert_eq!(p, params, "{len} B: params untouched");
+        }
+    }
+
+    /// An explicit `heap.arena_bytes` wins over the derived cap, whether it
+    /// is larger or smaller (a smaller one is warned, not overridden).
+    #[test]
+    fn explicit_arena_bytes_wins() {
+        let m = manifest();
+        let body = "x".repeat(600 * 1024);
+        for explicit in [64u32 << 20, 1 << 20] {
+            let module = json!({"body": body, "heap": {"arena_bytes": explicit}});
+            let params = pack_params_growing(&module, &body_schema(), None, "http").expect("packs");
+            let p = insert_workload_heap_tags(params.clone(), &module, "http", Some(&m)).unwrap();
+            assert_eq!(tag_0xef(&p), Some(explicit));
+            assert_eq!(
+                instance_heap_cap("http", &module, Some(&m), &params).unwrap(),
+                Some(explicit)
+            );
+        }
+    }
+
+    /// Params past 64 KiB: the header's u16 payload length saturates instead
+    /// of wrapping to a small, wrong figure, and the basic section's end is
+    /// found by walking to the terminator — through the schema packer and the
+    /// workload heap-tag insert alike.
+    #[test]
+    fn params_past_64_kib_never_carry_a_wrapped_length() {
+        let len = 600 * 1024;
+        let module = json!({"body": "x".repeat(len)});
+        let params = pack_params_growing(&module, &body_schema(), None, "http").expect("packs");
+        assert!(params.len() > 65_540);
+        assert_eq!(&params[2..4], &[0xFF, 0xFF], "saturated, not wrapped");
+        assert_eq!(schema::tlv_basic_end(&params), Some(params.len()));
+
+        let m = manifest();
+        let p = insert_workload_heap_tags(params.clone(), &module, "http", Some(&m)).unwrap();
+        assert_eq!(&p[2..4], &[0xFF, 0xFF]);
+        assert_eq!(schema::tlv_basic_end(&p), Some(p.len()));
+        assert_eq!(
+            p.len(),
+            params.len() + 6,
+            "the 0xEF entry joined before the end"
+        );
+
+        // Under 64 KiB the field stays exact.
+        let small = json!({"body": "x".repeat(1000)});
+        let params = pack_params_growing(&small, &body_schema(), None, "http").expect("packs");
+        let exact = u16::from_le_bytes([params[2], params[3]]) as usize;
+        assert_eq!(exact + 4, params.len());
+    }
+
+    /// A cap past a heap's u32 size is refused, naming the module.
+    #[test]
+    fn a_cap_past_u32_is_refused() {
+        let toml = "version = \"1.0.0\"\n[capacities]\nheap_from_params = \
+                    { tags = [2], base = 4294967000, included = 0 }\n";
+        let m = Manifest::from_toml_str_for_target(toml, None).unwrap();
+        let module = json!({"body": "x".repeat(1000)});
+        let params = pack_params_growing(&module, &body_schema(), None, "http").expect("packs");
+        let err = instance_heap_cap("big", &module, Some(&m), &params)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("module 'big'") && err.contains("u32"), "{err}");
+    }
+}
+
+/// The kernel's boot plan, run at build: each pool's ceiling is what the
+/// config derives plus its reserve, and a ceiling the target's kernel cannot
+/// hold is refused here, naming the pool and by how much, as the kernel
+/// refuses it at boot (`size_kernel_tables`).
+#[cfg(test)]
+mod boot_plan_tests {
+    use crate::capacity::{
+        check_boot_plan, fan_count, plan_pool, resident_demand, GraphShape, PoolFigures,
+    };
+
+    fn shape(modules: u64, edges: u64) -> GraphShape {
+        GraphShape {
+            modules,
+            edges,
+            ..Default::default()
+        }
+    }
+
+    fn figures(list: &[(&str, u64)]) -> Vec<(String, u64)> {
+        list.iter().map(|&(n, v)| (n.to_string(), v)).collect()
+    }
+
+    const NONE: &PoolFigures = &[];
+
+    /// A graph without `capacity:` takes each pool's derived size plus the
+    /// profile's default reserve, clamped to what the pool's index domain
+    /// leaves: a Linux graph of 3900 modules boots on 196 of the 256 default
+    /// module slots. An explicit entry is never clamped, so one past the
+    /// domain is refused, by how much and with the figure that fits.
+    #[test]
+    fn a_default_reserve_takes_what_the_domain_leaves() {
+        let plan = plan_pool("linux", "module_slots", &shape(3800, 0), NONE, NONE);
+        assert_eq!((plan.derived, plan.reserve), (3800, 256));
+        let plan = plan_pool("linux", "module_slots", &shape(3900, 0), NONE, NONE);
+        assert_eq!((plan.derived, plan.reserve), (3900, 196));
+        check_boot_plan("linux", &shape(3900, 0), NONE, NONE).expect("the default is clamped");
+        let ask = figures(&[("module_slots", 256)]);
+        let e = check_boot_plan("linux", &shape(3900, 0), &ask, NONE).unwrap_err();
+        assert!(
+            e.contains("pool 'module_slots' to 4156 (derived 3900 + reserve 256 from `capacity:`)")
+                && e.contains("module-index domain (MAX_MODULES) of 4096")
+                && e.contains("over by 60")
+                && e.contains("`capacity: { module_slots: 196 }`"),
+            "{e}"
+        );
+        let fit = figures(&[("module_slots", 196)]);
+        check_boot_plan("linux", &shape(3900, 0), &fit, NONE).expect("a reserve that fits");
+        // A graph past the domain on its own is refused whatever the reserve.
+        let e = check_boot_plan("linux", &shape(4200, 0), NONE, NONE).unwrap_err();
+        assert!(
+            e.contains("derived 4200 + default reserve 0") && e.contains("shrink the graph"),
+            "{e}"
+        );
+    }
+
+    /// bcm2712's owner-slot domain is 64 and its default owner reserve 63: a
+    /// resident workload's slot comes out of the default, while an explicit
+    /// reserve of 63 is refused.
+    #[test]
+    fn a_resident_workload_takes_an_owner_slot() {
+        let mut s = shape(10, 10);
+        s.workloads = 1;
+        let plan = plan_pool("pi5", "owners", &s, NONE, NONE);
+        assert_eq!((plan.derived, plan.reserve), (2, 62));
+        check_boot_plan("pi5", &s, NONE, NONE).expect("the default leaves room");
+        let e = check_boot_plan("pi5", &s, &figures(&[("owners", 63)]), NONE).unwrap_err();
+        assert!(
+            e.contains("pool 'owners' to 65 (derived 2 + reserve 63 from `capacity:`)")
+                && e.contains("owner-slot domain (MAX_OWNERS) of 64")
+                && e.contains("over by 1"),
+            "{e}"
+        );
+        check_boot_plan("pi5", &s, &figures(&[("owners", 62)]), NONE).expect("62 fits");
+        check_boot_plan("linux", &s, NONE, NONE).expect("linux owners");
+    }
+
+    /// Events and timers name their slot in a tagged fd's slot field, which
+    /// is their domain.
+    #[test]
+    fn events_are_held_to_the_fd_slot_domain() {
+        let ask = figures(&[("events", 1 << 26)]);
+        check_boot_plan("linux", &shape(1, 0), &ask, NONE).expect("every slot the field names");
+        let ask = figures(&[("timers", (1 << 26) + 1)]);
+        let e = check_boot_plan("linux", &shape(1, 0), &ask, NONE).unwrap_err();
+        assert!(
+            e.contains("pool 'timers'") && e.contains("tagged-fd slot domain"),
+            "{e}"
+        );
+    }
+
+    /// A static table (wasm) holds what an envelope asks of it, derived part
+    /// included; without an entry the table keeps every slot it has.
+    #[test]
+    fn a_static_table_binds_an_envelope() {
+        let e =
+            check_boot_plan("wasm", &shape(2, 1), &figures(&[("events", 33)]), NONE).unwrap_err();
+        assert!(
+            e.contains("pool 'events' to 33") && e.contains("static table of 32"),
+            "{e}"
+        );
+        check_boot_plan("wasm", &shape(40, 0), NONE, NONE).expect("40 of 48 module slots");
+        let e = check_boot_plan(
+            "wasm",
+            &shape(40, 0),
+            &figures(&[("module_slots", 10)]),
+            NONE,
+        )
+        .unwrap_err();
+        assert!(
+            e.contains("to 50 (derived 40 + reserve 10 from `capacity:`)")
+                && e.contains("over by 2"),
+            "{e}"
+        );
+    }
+
+    /// A Linux sandbox is a workload with an owner: the pool's derived part
+    /// is the owner table's workload slots. Near the sandbox domain the
+    /// default reserve shrinks to what is left; an explicit one does not.
+    #[test]
+    fn sandboxes_derive_from_the_owner_table() {
+        let owners = figures(&[("owners", 4000)]);
+        let plan = plan_pool("linux", "sandboxes", &shape(1, 0), NONE, &owners);
+        assert_eq!((plan.derived, plan.reserve), (4000, 64));
+        let wide = figures(&[("owners", 4095)]);
+        let plan = plan_pool("linux", "sandboxes", &shape(1, 0), NONE, &wide);
+        assert_eq!((plan.derived, plan.reserve), (4095, 1));
+        check_boot_plan("linux", &shape(1, 0), &wide, NONE).expect("the default is clamped");
+        let ask = figures(&[("owners", 4095), ("sandboxes", 64)]);
+        let e = check_boot_plan("linux", &shape(1, 0), &ask, NONE).unwrap_err();
+        assert!(
+            e.contains("pool 'sandboxes' to 4159 (derived 4095 + reserve 64 from `capacity:`)")
+                && e.contains("sandbox-index domain (MAX_SANDBOXES) of 4096"),
+            "{e}"
+        );
+    }
+
+    /// Declared demand adds to the derived part, as FXDM does in the kernel.
+    #[test]
+    fn declared_demand_is_derived() {
+        let declared = figures(&[("store_subs", 400)]);
+        let plan = plan_pool("linux", "store_subs", &shape(1, 0), &declared, NONE);
+        assert_eq!((plan.derived, plan.reserve), (400, 64));
+    }
+
+    /// Fans are counted as the kernel counts them: one per port carrying two
+    /// or more edges in the same direction.
+    #[test]
+    fn fans_count_ports_with_two_edges_one_way() {
+        // (from_id, to_id, to_port, from_port_index, to_port_index)
+        let tee = [(0, 1, 0, 0, 0), (0, 2, 0, 0, 0)];
+        assert_eq!(fan_count(&tee), 1);
+        let merge = [(1, 0, 0, 0, 0), (2, 0, 0, 0, 0)];
+        assert_eq!(fan_count(&merge), 1);
+        let ports = [(0, 1, 0, 0, 0), (0, 2, 0, 1, 0), (3, 1, 1, 0, 0)];
+        assert_eq!(fan_count(&ports), 0, "distinct ports, data and control");
+        let s = GraphShape {
+            modules: 3,
+            edges: 2,
+            fans: fan_count(&tee),
+            ..Default::default()
+        };
+        assert_eq!(
+            plan_pool("linux", "module_slots", &s, NONE, NONE).derived,
+            4
+        );
+        assert_eq!(plan_pool("linux", "channels", &s, NONE, NONE).derived, 3);
+    }
+
+    /// The resident-workload section is read as the kernel reads it: its
+    /// workloads, their modules and their edges.
+    #[test]
+    fn resident_demand_reads_the_encoded_section() {
+        use crate::add_subgraph::{encode_workload_section, Workload, WorkloadModule};
+        let module = || WorkloadModule {
+            name_hash: 1,
+            domain_id: 0,
+            budget: Default::default(),
+            params: vec![],
+        };
+        let workload = |n: usize| Workload {
+            workload_uid: [n as u8; 16],
+            state_cap: 0,
+            buffer_cap: 0,
+            modules: (0..n).map(|_| module()).collect(),
+            edges: vec![],
+            idle_safe: false,
+        };
+        let section = encode_workload_section(&[workload(2), workload(3)]).expect("section");
+        assert_eq!(resident_demand(&section), (2, 5, 0));
+        assert_eq!(resident_demand(&[]), (0, 0, 0));
+        let mut s = shape(4, 0);
+        (s.workloads, s.workload_modules, s.workload_edges) = resident_demand(&section);
+        assert_eq!(plan_pool("linux", "owners", &s, NONE, NONE).derived, 3);
+        assert_eq!(plan_pool("rp2350", "owners", &s, NONE, NONE).derived, 1);
+        assert_eq!(
+            plan_pool("linux", "module_slots", &s, NONE, NONE).derived,
+            9
+        );
+    }
+
+    /// The state-arena free list is derived from the module-slot ceiling where
+    /// it is sized at boot, and is the static list on wasm.
+    #[test]
+    fn the_free_list_follows_the_module_slots() {
+        let plan = plan_pool("linux", "state_free_list", &shape(10, 0), NONE, NONE);
+        // (10 + 256 module slots) × (state + arena + 8 heap segments) + 1.
+        assert_eq!(plan.derived, 266 * 10 + 1);
+        let wasm = plan_pool("wasm", "state_free_list", &shape(10, 0), NONE, NONE);
+        assert_eq!((wasm.derived, wasm.ceiling()), (0, 32));
     }
 }

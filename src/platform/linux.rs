@@ -146,10 +146,63 @@ fn vault_import(args: &[String]) -> ! {
     process::exit(0);
 }
 
+/// `fluxor-linux reclaim`: collect every dead instance's host objects (links,
+/// routes, policy tables, tunables, claims) from the host registry, without
+/// starting a runtime — a service manager's post-stop hook
+/// (`ExecStopPost=`). With `FLUXOR_INSTANCE` (or `FLUXOR_STATE_DIR`) naming
+/// the instance, reports whether that tag was reclaimed. Exit 0 when it was
+/// (or there was nothing to reclaim), 2 when the named instance is still
+/// live in another runtime, 1 on an error or a reclaim left pending.
+fn reclaim(args: &[String]) -> ! {
+    use fluxor::platform::linux::instance::{reclaim_from_env, Reclaimed};
+    if let Some(other) = args.first() {
+        eprintln!("error: reclaim: unknown argument: {other}");
+        process::exit(1);
+    }
+    let list = |v: &[String]| {
+        if v.is_empty() {
+            "none".to_string()
+        } else {
+            v.join(" ")
+        }
+    };
+    match reclaim_from_env() {
+        Ok(Reclaimed::All(done)) => {
+            println!("reclaim: collected {}", list(&done));
+            process::exit(0);
+        }
+        Ok(Reclaimed::Tag(tag, done)) => {
+            println!(
+                "reclaim: instance {tag} reclaimed; collected {}",
+                list(&done)
+            );
+            process::exit(0);
+        }
+        Ok(Reclaimed::Live(tag, done)) => {
+            println!("reclaim: instance {tag} is live; collected {}", list(&done));
+            process::exit(2);
+        }
+        Ok(Reclaimed::Pending(tag, done)) => {
+            println!(
+                "reclaim: instance {tag} left pending (see the log); collected {}",
+                list(&done)
+            );
+            process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("error: reclaim: host registry unavailable (errno {e})");
+            process::exit(1);
+        }
+    }
+}
+
 fn parse_args() -> CliArgs {
     let args: Vec<String> = env::args().collect();
     if args.get(1).map(String::as_str) == Some("vault-import") {
         vault_import(&args[2..]);
+    }
+    if args.get(1).map(String::as_str) == Some("reclaim") {
+        reclaim(&args[2..]);
     }
     let mut config_path = String::new();
     let mut modules_path = String::new();
@@ -178,6 +231,7 @@ fn parse_args() -> CliArgs {
             "--help" | "-h" => {
                 eprintln!("Usage: fluxor-linux --config <config.bin> --modules <modules.bin>");
                 eprintln!("       fluxor-linux vault-import --module <type> --label <label> --suite <hmac-sha256|aead-key> --key-hex <64 hex>");
+                eprintln!("       fluxor-linux reclaim   (collect dead instances' host objects; FLUXOR_INSTANCE names one)");
                 eprintln!();
                 eprintln!("Options:");
                 eprintln!("  -c, --config <path>   Path to config.bin");
@@ -278,6 +332,9 @@ include!("linux/owner_log_tee.rs");
 /// Runtime parameter overrides, file-backed. Its own module so its parse and
 /// merge can be unit-tested without a graph.
 pub mod param_store {
+    // The merge itself; `tools/tests/param_store.rs` provides the same name by
+    // a path include, so the source below builds in both places.
+    use fluxor::kernel::sys::params_tlv;
     include!("linux/param_store.rs");
 }
 
@@ -418,7 +475,7 @@ fn build_graph_linux() -> (usize, usize) {
                 _ => {}
             });
             let mut m = scheduler::BuiltInModule::new("linux_net", linux_net_step);
-            let state = LinuxNetState::new(
+            let state = match LinuxNetState::new(
                 net_ins,
                 lane_owners,
                 net_outs,
@@ -426,7 +483,15 @@ fn build_graph_linux() -> (usize, usize) {
                 max_conns as usize,
                 write_buf_kib as usize * 1024,
                 listen_backlog.min(i32::MAX as u32) as i32,
-            );
+            ) {
+                Ok(state) => state,
+                Err(why) => {
+                    // A graph whose table cannot be what it states is refused,
+                    // not run at a size it did not ask for.
+                    log::error!("[inst] module {module_idx} = linux_net refused: {why}");
+                    continue;
+                }
+            };
             // Register for the platform-side endpoint report, the owner
             // teardown hook, and the rebuild fd close-out.
             linux_net_register_state(&*state as *const LinuxNetState as *mut LinuxNetState);
@@ -929,7 +994,7 @@ fn main() {
                     // else) applies as a live delta: the departing owner flips
                     // to Draining and the drain driver takes over — no
                     // rebuild, co-resident owners untouched. Anything
-                    // structural falls through to the rebuild as before.
+                    // structural falls through to the rebuild.
                     match fluxor::kernel::workload::owner_plan::try_apply_drain_delta() {
                         Some(delta) => arm_drains(&delta),
                         None => {

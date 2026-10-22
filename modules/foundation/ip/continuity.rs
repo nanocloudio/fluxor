@@ -1165,8 +1165,9 @@ pub(super) fn quiescing(s: &IpState, idx: usize) -> bool {
 unsafe fn mirror_drained(s: &IpState, mi: usize) -> bool {
     let m = &s.cont.mirrors[mi];
     let idx = m.conn_idx as usize;
-    let stashed = s.pending_cmd_valid != 0 && s.pending_cmd_conn as usize == idx;
-    let closing = s.pending_close_valid != 0 && s.pending_close_conn as usize == idx;
+    let st = lane_state(s, conn_lane(s, idx));
+    let stashed = st.valid != 0 && st.conn as usize == idx;
+    let closing = st.close_valid != 0 && st.close_conn as usize == idx;
     !stashed && !closing && s.pending_tx_len == 0 && m.gate_kind == GATE_NONE && m.recv_pending == 0
 }
 
@@ -2044,8 +2045,9 @@ unsafe fn quiesce_reply(s: &mut IpState, mi: usize) {
     let idx = s.cont.mirrors[mi].conn_idx as usize;
     let c = &*s.tcp_conns.ptr(idx);
     let pending_out = c.snd_nxt.wrapping_sub(c.snd_una);
-    let pending_in = if s.pending_cmd_valid != 0 && s.pending_cmd_conn as usize == idx {
-        u32::from(s.pending_cmd_len)
+    let st = lane_state(s, conn_lane(s, idx));
+    let pending_in = if st.valid != 0 && st.conn as usize == idx {
+        u32::from(st.len)
     } else {
         0
     };
@@ -2340,7 +2342,7 @@ unsafe fn cmd_activate(s: &mut IpState, flow: &[u8; 16], epoch_new: u32, p: &[u8
     *s.tcp_conns.ptr_mut(idx) = conn;
     conn_index_insert(s, idx);
     let remote_ip = (*s.tcp_conns.ptr(idx)).remote_ip;
-    arp::pin(&mut s.arp_table, remote_ip);
+    arp::pin(arp_tab(s), remote_ip);
     // The window the primary advertised at its cut was closed for the
     // quiesce; this side's consumer decides the window from here.
     update_rcv_wnd(s, idx);
@@ -2369,16 +2371,17 @@ unsafe fn cmd_retire(s: &mut IpState, flow: &[u8; 16], epoch: u32) {
     let idx = s.cont.mirrors[mi].conn_idx as usize;
     // The connection leaves silently: no FIN, no RST, no consumer event —
     // the peer is talking to the new anchor now.
-    if s.pending_cmd_valid != 0 && s.pending_cmd_conn as usize == idx {
-        s.pending_cmd_valid = 0;
+    let st = lane_state(s, conn_lane(s, idx));
+    if st.valid != 0 && st.conn as usize == idx {
+        st.valid = 0;
     }
-    if s.pending_close_valid != 0 && s.pending_close_conn as usize == idx {
-        s.pending_close_valid = 0;
+    if st.close_valid != 0 && st.close_conn as usize == idx {
+        st.close_valid = 0;
     }
     if idx < s.tcp_conns.len() {
         let remote_ip = (*s.tcp_conns.ptr(idx)).remote_ip;
         if remote_ip != 0 {
-            arp::unpin(&mut s.arp_table, remote_ip);
+            arp::unpin(arp_tab(s), remote_ip);
         }
         conn_reset(s, idx);
     }

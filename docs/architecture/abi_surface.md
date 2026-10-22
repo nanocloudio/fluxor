@@ -51,8 +51,8 @@ and an output:
 
 | Constant | Role | Why it must be a constant |
 |---|---|---|
-| `CONTRACTS_PLATFORM_SRC_HASH` | ingredient, read inside `write_surface` | The kernel computes its own digest at boot, on bare metal, with no filesystem to hash source files from |
-| `ABI_SURFACE_DIGEST` | result, embedded by every PIC module as `FLUXOR_ABI_SURFACE` | It is the module's attestation stamp, in `no_std` code |
+| `CONTRACTS_PLATFORM_SRC_HASH` | ingredient, read inside `write_surface` | The kernel computes its own digest at run time, on bare metal, with no filesystem to hash source files from |
+| `ABI_SURFACE_DIGEST` | result, embedded by every module the SDK compiles as `FLUXOR_ABI_SURFACE` | It is the module's attestation stamp, in `no_std` code |
 
 Neither can be derived away at build time. PIC modules compile through direct
 `rustc` invocations with no `--extern` flags, so `abi_surface.rs` may use
@@ -88,22 +88,35 @@ artefacts that attest a surface nobody has.
 ## The gates
 
 Every check asks one question — *were these two things built against the same
-surface?* — at four different moments:
+surface?* — at five different moments:
 
 | Gate | Where | Catches |
 |---|---|---|
 | **Pack / read** | `tools/src/modules.rs::verify_module_abi_surface` | an `.fmod` whose stamp differs from the CLI's digest |
+| **Load** | `src/kernel/module/loader.rs::validate_module` | a module, signed or not, that carries no attestation (manifest flag bit 4) or attests a surface other than the running kernel's — native modules, code packs and wasm envelopes alike |
 | **Boot** | `src/kernel/boot/config.rs::decode_slot_header` | a graph slot that doesn't match the running kernel |
 | **Sync** | `tools/src/store_resolve.rs::check_epoch` | a store artefact set that is mixed-epoch, unstamped, or behind the current surface |
 | **Pin freshness** | `fluxor abi-regen --check` | the checked-in constants having gone stale against the source |
 
-The first three compare two artefacts. The sync gate applies two rules over a
-resolved artefact set: every artefact must carry the same
+The pack, load and boot gates compare two artefacts. The sync gate applies
+two rules over a resolved artefact set: every artefact must carry the same
 `io.fluxor.abi-surface` annotation (an unstamped or mixed set is a hard
 error), and a live workspace member's artefacts must additionally match the
-current epoch. The fourth gate checks the cache rather than compatibility:
-`abi-regen --check` recomputes the digest from source and fails if either
-checked-in site differs.
+current epoch. The pin-freshness gate checks the cache rather than
+compatibility: `abi-regen --check` recomputes the digest from source and
+fails if either checked-in site differs.
+
+At pack time a PIC module's attestation is the digest its ELF embeds, which
+the packer copies only when it equals its own: the module was compiled
+against this surface, not merely packed by a current tool. A wasm module's
+payload must contain the current digest, and the packer stamps it. At load,
+the attestation sits at its canonical offset (after the integrity hash and
+the signature block, where present) and the manifest ends there; a signature
+covers it. The loader applies the check to every module it admits: the boot
+graph, a live subgraph add, a workload's subgraph, the modules of a code
+pack and a wasm child alike. An unsigned module's attestation is the
+builder's claim, so the check catches a stale or mismatched build rather than
+a forger; authenticity is the signature's job.
 
 ## The tripwire, and the two mounts
 
@@ -166,7 +179,7 @@ Until a sibling syncs, its `.fmod` files are rejected at load, and the sync
 gate rejects its stale store artefacts: both are the same check from opposite
 ends, the artefact's embedded epoch against the current surface. The cost of
 an epoch move is paid per sibling catch-up, not per change — four surface
-changes landed together cost each sibling the same single
+changes published together cost each sibling the same single
 `fluxor update && fluxor sync` as one would.
 
 ## When something fails
@@ -184,6 +197,10 @@ The messages you may see:
 | Message | Gate |
 |---|---|
 | `built against a different ABI surface (module attests X, current is Y)` | pack/read |
+| `compiled against a different ABI surface (module embeds X, current is Y)` | pack (from the ELF) |
+| `unattested module — it carries no ABI-surface attestation` | load |
+| `ABI-surface mismatch — module built for a different substrate` | load |
+| `attestation flag with non-canonical manifest size` | load |
 | `mixed-epoch artifact set … run 'fluxor update' to advance the whole set` | sync |
 | `carries no epoch annotation … run 'fluxor publish'` | sync |
 | `ABI_SURFACE_DIGEST const … is stale — run 'fluxor abi-regen'` | pin freshness |

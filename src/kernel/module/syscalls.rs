@@ -223,6 +223,12 @@ unsafe extern "C" fn syscall_provider_call_sel(
     if let Some(rc) = check_contract_grant(c) {
         return rc;
     }
+    // The permission half, exactly as `provider_call` applies it: a selector
+    // names which provider answers, never what the caller may ask of it, so a
+    // platform_raw op is as privileged through a selector as through a handle.
+    if let Some(rc) = check_privileged_internal_op(op) {
+        return rc;
+    }
     if admission_class_op(op) && admission_closed("provider_call_sel") {
         return crate::kernel::sys::errno::EACCES;
     }
@@ -844,6 +850,13 @@ const NET_POLICY_CONTRACT: u64 = 1u64 << 0x1E;
 /// node's mount actuator can declare it; MOUNT and UMOUNT additionally require
 /// `platform_raw`, PRIV and ROOT are reads.
 const HOST_MOUNT_CONTRACT: u64 = 1u64 << 0x1F;
+/// NET_ROUTE (0x20, bit 32) — the node's segments, peer routes and held
+/// addresses. In the service-tier ceilings so the node agent can declare it;
+/// its table ops additionally require `platform_raw` (see
+/// `privileged_op_permission`) and every op the node's authority (the
+/// provider checks it). REPORT and TAKE are the node's network-stack module's
+/// side and are admitted by the provider from that module alone.
+const NET_ROUTE_CONTRACT: u64 = 1u64 << 0x20;
 pub const CAP_CONTRACT_MASK: [u64; 4] = [
     0x0027_1FE1
         | STORAGE_FAMILY
@@ -851,21 +864,24 @@ pub const CAP_CONTRACT_MASK: [u64; 4] = [
         | WORKLOAD_CONTRACT
         | TRUST_CONTRACT
         | NET_POLICY_CONTRACT
-        | HOST_MOUNT_CONTRACT, // CAP_SERVICE: infra + FS + storage family + KEY_VAULT + PLATFORM_NIC_RING + PLATFORM_DMA + PLATFORM_DMA_FD + PCIE_DEVICE + USB_HOST + PROC + WORKLOAD + TRUST + NET_POLICY + HOST_MOUNT
+        | HOST_MOUNT_CONTRACT
+        | NET_ROUTE_CONTRACT, // CAP_SERVICE: infra + FS + storage family + KEY_VAULT + PLATFORM_NIC_RING + PLATFORM_DMA + PLATFORM_DMA_FD + PCIE_DEVICE + USB_HOST + PROC + WORKLOAD + TRUST + NET_POLICY + HOST_MOUNT + NET_ROUTE
     0x0027_1FF1
         | STORAGE_FAMILY
         | PROC_CONTRACT
         | WORKLOAD_CONTRACT
         | TRUST_CONTRACT
         | NET_POLICY_CONTRACT
-        | HOST_MOUNT_CONTRACT, // CAP_SERVICE_PIO: service + HAL_PIO
+        | HOST_MOUNT_CONTRACT
+        | NET_ROUTE_CONTRACT, // CAP_SERVICE_PIO: service + HAL_PIO
     0x0027_1FE3
         | STORAGE_FAMILY
         | PROC_CONTRACT
         | WORKLOAD_CONTRACT
         | TRUST_CONTRACT
         | NET_POLICY_CONTRACT
-        | HOST_MOUNT_CONTRACT, // CAP_SERVICE_GPIO: service + HAL_GPIO
+        | HOST_MOUNT_CONTRACT
+        | NET_ROUTE_CONTRACT, // CAP_SERVICE_GPIO: service + HAL_GPIO
     u64::MAX, // CAP_FULL: any contract
 ];
 
@@ -1020,15 +1036,19 @@ fn privileged_op_permission(op: u32) -> Option<u16> {
     // platform_raw bit as raw DMA/MMIO/PCIe.
     //
     // Except the network provider's side of a workload's net lanes
-    // (NET_PROVIDE / NET_LANE_TAKE / NET_LANE_ADMIT), which `ip` calls on
-    // bare metal — a parser of untrusted frames that must not hold
-    // platform_raw. They create nothing: the first claimant becomes the lane
-    // provider (EBUSY while another holds the role), only it may take a
-    // queued lane or ask an admission, and the caller still needs the
-    // declared workload contract grant.
+    // (NET_PROVIDE / NET_LANE_TAKE / NET_LANE_ADMIT / NET_RESOLVER), which
+    // `ip` calls on bare metal — a parser of untrusted frames that must not
+    // hold platform_raw. They create nothing: the first claimant becomes the
+    // lane provider (EBUSY while another holds the role), only it may take a
+    // queued lane, ask an admission or read an owner's name-service context,
+    // and the caller still needs the declared workload contract grant.
     {
         use crate::abi::contracts::workload as wl;
-        if op == wl::NET_PROVIDE || op == wl::NET_LANE_TAKE || op == wl::NET_LANE_ADMIT {
+        if op == wl::NET_PROVIDE
+            || op == wl::NET_LANE_TAKE
+            || op == wl::NET_LANE_ADMIT
+            || op == wl::NET_RESOLVER
+        {
             return None;
         }
     }
@@ -1055,10 +1075,23 @@ fn privileged_op_permission(op: u32) -> Option<u16> {
     if op == 0x060A {
         return Some(PLATFORM_RAW);
     }
-    // host_mount (0x1Fxx) MOUNT / UMOUNT change what the host has mounted:
+    // host_mount (0x1Fxx) MOUNT / UMOUNT / PROJECT / REMOVE_TREE /
+    // GROUP_TREE / MKDIR_MODE change the host's mounts and files:
     // platform_raw. PRIV and ROOT are reads.
-    if op == 0x1F01 || op == 0x1F02 {
+    if matches!(op, 0x1F01 | 0x1F02 | 0x1F04 | 0x1F05 | 0x1F06 | 0x1F07) {
         return Some(PLATFORM_RAW);
+    }
+    // net.route (0x20xx) SEGMENTS / ROUTES / HOLD rewrite how the node
+    // forwards and what it answers for, and READ reports it: platform_raw.
+    // PROBE and CAPS are not privileged. REPORT and TAKE are the node's
+    // network-stack module's side (a parser of untrusted frames that must not
+    // hold platform_raw): the provider admits them from the registered
+    // net-identity provider alone.
+    {
+        use crate::abi::contracts::net::route as nr;
+        if matches!(op, nr::SEGMENTS | nr::ROUTES | nr::HOLD | nr::READ) {
+            return Some(PLATFORM_RAW);
+        }
     }
     if !(0x0C00..=0x0CFF).contains(&op) {
         return None;
@@ -1151,8 +1184,8 @@ fn privileged_op_permission(op: u32) -> Option<u16> {
 }
 
 /// Enforce privileged-opcode gating by fine-grained permission category.
-/// Called from `provider_open` / `provider_call` / `provider_query` for
-/// 0x0Cxx ops. Returns `Some(E_NOSYS)` when the caller lacks the
+/// Called from `provider_open` / `provider_call` / `provider_call_sel` /
+/// `provider_query` for every op `privileged_op_permission` classifies. Returns `Some(E_NOSYS)` when the caller lacks the
 /// matching permission.
 ///
 /// Every module that reaches a privileged op must carry the permission
@@ -1928,7 +1961,7 @@ unsafe fn handle_elastic_alloc(arg: *mut u8, arg_len: usize) -> i32 {
     }
     let bytes = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]) as usize;
     let idx = crate::kernel::exec::scheduler::current_module_index();
-    if idx >= crate::kernel::exec::scheduler::MAX_MODULES {
+    if idx >= crate::kernel::exec::scheduler::module_slots() {
         return E_INVAL;
     }
     // The deployment envelope may size the region down (Tier A over the
@@ -2399,7 +2432,14 @@ unsafe fn handle_reconfigure_op(opcode: u32, arg: *mut u8, arg_len: usize) -> i3
                 0
             }
         }
-        reconfigure::SLOT_CAPACITY => crate::kernel::config::MAX_MODULES as i32,
+        // The boot plan's module-slot ceiling (derived + live-add reserve): a
+        // fixed figure for the graph's life, where the committed slot count
+        // grows under live adds.
+        reconfigure::SLOT_CAPACITY => (crate::kernel::sys::resource_ledger::ceiling(
+            crate::abi::contracts::resource::POOL_MODULE_SLOTS,
+        ) as usize)
+            .min(crate::kernel::exec::scheduler::MAX_MODULES)
+            as i32,
         _ => E_NOSYS,
     }
 }
@@ -2434,7 +2474,7 @@ unsafe fn handle_fault_monitor_op(handle: i32, opcode: u32, arg: *mut u8, arg_le
         }
         monitor::FAULT_STATS_QUERY => {
             use crate::kernel::exec::step_guard::FaultStats;
-            if handle < 0 || handle as usize >= crate::kernel::boot::config::MAX_MODULES {
+            if handle < 0 || handle as usize >= crate::kernel::exec::scheduler::module_slots() {
                 return E_INVAL;
             }
             if arg.is_null() || arg_len < core::mem::size_of::<FaultStats>() {
@@ -2719,7 +2759,7 @@ unsafe fn kernel_query_dispatch(handle: i32, key: u32, out: *mut u8, out_len: us
                 // its own work, not serving a request. Answering with an
                 // owner here would let a provider charge background work to
                 // whoever called it last, which is worse than no answer.
-                if caller >= crate::kernel::exec::scheduler::MAX_MODULES {
+                if caller >= crate::kernel::exec::scheduler::module_slots() {
                     return errno::ESRCH;
                 }
                 let owner = crate::kernel::exec::scheduler::module_owner(caller);

@@ -56,30 +56,62 @@ use crate::kernel::workload::storage::StorageGrant;
 // receiver is a valid provider; the foundation `ip` module is one.
 
 use crate::abi::contracts::net::identity as netid;
-use portable_atomic::{AtomicU32, Ordering};
+use portable_atomic::{AtomicU64, Ordering};
 
 /// Registered net-identity provider, packed as
-/// `[slot: u16][addr_ctl_port: u8][net_in_port: u8]` (little-endian view), or
-/// [`NO_PROVIDER`] when none has registered. One atomic so a reader never sees
-/// a torn slot/port pair.
-static NET_IDENT_PROVIDER_REG: AtomicU32 = AtomicU32::new(NO_PROVIDER);
-const NO_PROVIDER: u32 = u32::MAX;
+/// `[slot: u16][addr_ctl_port: u8][net_in_port: u8][slot generation: u32]`
+/// (little-endian view), or [`NO_PROVIDER`] when none has registered. One
+/// atomic so a reader never sees a torn registration. The generation names
+/// one occupancy of the slot: a registration whose slot has since been
+/// reset, restarted or given another module (a rebuild bumps every
+/// generation) is stale, resolves to no provider, and the next registrant
+/// takes it over — so a module that lands in the old slot is never taken for
+/// the provider (net.route's `REPORT`/`TAKE` admit by it).
+static NET_IDENT_PROVIDER_REG: AtomicU64 = AtomicU64::new(NO_PROVIDER);
+const NO_PROVIDER: u64 = u64::MAX;
 
-/// Register `slot` as the node's net-identity provider with its declared
-/// control (`addr_ctl_port`) and ingress (`net_in_port`) input-port indices.
-/// First-wins: a second registration returns `EBUSY`. The syscall path gates
+fn unpack_provider(packed: u64) -> (usize, u8, u8, u32) {
+    (
+        (packed & 0xFFFF) as usize,
+        ((packed >> 16) & 0xFF) as u8,
+        ((packed >> 24) & 0xFF) as u8,
+        (packed >> 32) as u32,
+    )
+}
+
+/// Whether a registration still names a live occupancy of its slot.
+fn provider_current(packed: u64) -> bool {
+    if packed == NO_PROVIDER {
+        return false;
+    }
+    let (slot, _, _, gen) = unpack_provider(packed);
+    scheduler::module_slot_generation(slot) == gen
+}
+
+/// Register `slot` (its current occupancy) as the node's net-identity
+/// provider with its declared control (`addr_ctl_port`) and ingress
+/// (`net_in_port`) input-port indices. First-wins while the registrant
+/// lives: a second registration returns `EBUSY`, unless the registered
+/// occupancy is gone (stale), when it takes over. The syscall path gates
 /// callers to base-graph (system-owned) modules; tests register directly.
 pub fn register_net_identity_provider(slot: u16, addr_ctl_port: u8, net_in_port: u8) -> i32 {
-    let packed = (slot as u32) | ((addr_ctl_port as u32) << 16) | ((net_in_port as u32) << 24);
-    match NET_IDENT_PROVIDER_REG.compare_exchange(
-        NO_PROVIDER,
-        packed,
-        Ordering::AcqRel,
-        Ordering::Acquire,
-    ) {
-        Ok(_) => 0,
+    let gen = scheduler::module_slot_generation(slot as usize);
+    let packed = (slot as u64)
+        | ((addr_ctl_port as u64) << 16)
+        | ((net_in_port as u64) << 24)
+        | ((gen as u64) << 32);
+    let cur = NET_IDENT_PROVIDER_REG.load(Ordering::Acquire);
+    if cur == packed {
         // Same registration repeated (module re-init) is a benign no-op.
-        Err(cur) if cur == packed => 0,
+        return 0;
+    }
+    if provider_current(cur) {
+        return errno::EBUSY;
+    }
+    match NET_IDENT_PROVIDER_REG.compare_exchange(cur, packed, Ordering::AcqRel, Ordering::Acquire)
+    {
+        Ok(_) => 0,
+        Err(now) if now == packed => 0,
         Err(_) => errno::EBUSY,
     }
 }
@@ -91,17 +123,175 @@ pub fn reset_net_identity_provider() {
     NET_IDENT_PROVIDER_REG.store(NO_PROVIDER, Ordering::Release);
 }
 
-/// The registered provider as `(slot, addr_ctl_port, net_in_port)`, or `None`.
+/// The registered provider as `(slot, addr_ctl_port, net_in_port)`, or `None`
+/// (none registered, or its occupancy is gone).
 fn net_identity_provider() -> Option<(usize, u8, u8)> {
     let packed = NET_IDENT_PROVIDER_REG.load(Ordering::Acquire);
-    if packed == NO_PROVIDER {
+    if !provider_current(packed) {
         return None;
     }
-    Some((
-        (packed & 0xFFFF) as usize,
-        ((packed >> 16) & 0xFF) as u8,
-        ((packed >> 24) & 0xFF) as u8,
-    ))
+    let (slot, ctl, net_in, _) = unpack_provider(packed);
+    Some((slot, ctl, net_in))
+}
+
+/// Whether `(slot, generation)` is the registered net-identity provider.
+pub fn is_net_identity_provider(slot: usize, generation: u32) -> bool {
+    let packed = NET_IDENT_PROVIDER_REG.load(Ordering::Acquire);
+    if !provider_current(packed) {
+        return false;
+    }
+    let (s, _, _, g) = unpack_provider(packed);
+    s == slot && g == generation
+}
+
+/// Whether a net-identity provider is registered in a live occupancy.
+pub fn net_identity_provider_present() -> bool {
+    provider_current(NET_IDENT_PROVIDER_REG.load(Ordering::Acquire))
+}
+
+// ── Per-owner name-service context ───────────────────────────────
+//
+// A workload's CREATE may carry the name service its queries go to and its
+// search list (`wl::resolver`, a Tier-2 option). The kernel holds it per
+// owner, keyed by the owner's (slot, generation) so a context never outlives
+// the occupancy it was given for, and the net provider (`ip`) reads it with
+// `wl::NET_RESOLVER`. It is written on the creator's core and read on the
+// provider's, so each entry is a sequence lock: a writer moves `seq` odd,
+// writes, moves it even; a reader copies and retries a bounded number of
+// times.
+
+#[derive(Clone, Copy)]
+struct ResolverCtx {
+    generation: u32,
+    len: u16,
+    data: [u8; wl::resolver::MAX],
+}
+
+impl ResolverCtx {
+    const EMPTY: ResolverCtx = ResolverCtx {
+        generation: 0,
+        len: 0,
+        data: [0; wl::resolver::MAX],
+    };
+}
+
+/// One context per owner slot, sized with the owner table.
+static mut RESOLVER_CTX: crate::kernel::mem::table::Table<ResolverCtx, MAX_OWNERS> = crate::boot_table!(
+    MAX_OWNERS,
+    ResolverCtx::EMPTY,
+    crate::abi::contracts::resource::POOL_OWNERS
+);
+/// The sequence of every context entry: writes are rare (one per CREATE),
+/// so one counter for the table keeps the reader's check one load.
+static RESOLVER_SEQ: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
+/// The context of the CREATE being staged, held from its first call to its
+/// last, when the owner it belongs to exists.
+static mut PENDING_RESOLVER: (u16, [u8; wl::resolver::MAX]) = (0, [0; wl::resolver::MAX]);
+const RESOLVER_READ_RETRIES: usize = 8;
+
+/// Check a resolver context value: a known family, a whole search list.
+fn resolver_ctx_ok(v: &[u8]) -> bool {
+    if v.len() < wl::resolver::HEAD || v.len() > wl::resolver::MAX {
+        return false;
+    }
+    if v[0] != wl::NET_FAM_IPV4 || v[1..17].iter().skip(4).any(|&b| b != 0) {
+        return false;
+    }
+    let n = v[17] as usize;
+    let mut at = wl::resolver::HEAD;
+    for _ in 0..n {
+        let Some(&len) = v.get(at) else {
+            return false;
+        };
+        let len = len as usize;
+        if len == 0 || len > crate::abi::contracts::net::net_proto::MAX_NAME_LEN {
+            return false;
+        }
+        at += 1 + len;
+    }
+    at == v.len()
+}
+
+/// Walk the CREATE's Tier-2 options: the resolver context is taken (its
+/// value, or None), every other entry is advisory unless required, and a
+/// required entry this backend does not realize fails admission (`ENOSYS`).
+fn create_options(opts: &[u8]) -> Result<Option<&[u8]>, i32> {
+    let mut at = 0;
+    let mut ctx = None;
+    while at < opts.len() {
+        let ns_len = *opts.get(at).ok_or(errno::EINVAL)? as usize;
+        let ns = opts.get(at + 1..at + 1 + ns_len).ok_or(errno::EINVAL)?;
+        let k = at + 1 + ns_len;
+        let key_len = *opts.get(k).ok_or(errno::EINVAL)? as usize;
+        let key = opts.get(k + 1..k + 1 + key_len).ok_or(errno::EINVAL)?;
+        let f = k + 1 + key_len;
+        let flags = *opts.get(f).ok_or(errno::EINVAL)?;
+        let vl = u16::from_le_bytes([
+            *opts.get(f + 1).ok_or(errno::EINVAL)?,
+            *opts.get(f + 2).ok_or(errno::EINVAL)?,
+        ]) as usize;
+        let val = opts.get(f + 3..f + 3 + vl).ok_or(errno::EINVAL)?;
+        if ns == wl::resolver::NS && key == wl::resolver::KEY {
+            if !resolver_ctx_ok(val) {
+                return Err(errno::EINVAL);
+            }
+            ctx = Some(val);
+        } else if flags & wl::opt::OPT_REQUIRED != 0 {
+            return Err(errno::ENOSYS);
+        }
+        at = f + 3 + vl;
+    }
+    Ok(ctx)
+}
+
+/// Record owner `owner`'s context (the CREATE that made it carried one).
+unsafe fn resolver_ctx_set(owner: OwnerHandle, v: &[u8]) {
+    let t = &mut *core::ptr::addr_of_mut!(RESOLVER_CTX);
+    let Some(e) = t.get_mut(owner.slot as usize) else {
+        return;
+    };
+    RESOLVER_SEQ.fetch_add(1, Ordering::AcqRel);
+    e.generation = owner.generation;
+    e.len = v.len().min(wl::resolver::MAX) as u16;
+    e.data[..e.len as usize].copy_from_slice(&v[..e.len as usize]);
+    RESOLVER_SEQ.fetch_add(1, Ordering::AcqRel);
+}
+
+/// `wl::NET_RESOLVER` for the net provider at `slot`.
+unsafe fn resolver_ctx_read(slot: usize, buf: &mut [u8]) -> i32 {
+    if !crate::kernel::workload::net_attach::is_lane_provider(slot) {
+        return errno::EACCES;
+    }
+    if buf.len() < 8 {
+        return errno::EINVAL;
+    }
+    let owner_slot = u16::from_le_bytes([buf[0], buf[1]]) as usize;
+    let owner_gen = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    let t = &*core::ptr::addr_of!(RESOLVER_CTX);
+    let Some(e) = t.get(owner_slot) else {
+        return errno::ENOENT;
+    };
+    for _ in 0..RESOLVER_READ_RETRIES {
+        let seq = RESOLVER_SEQ.load(Ordering::Acquire);
+        if seq & 1 != 0 {
+            core::hint::spin_loop();
+            continue;
+        }
+        let copy = core::ptr::read_volatile(e);
+        if RESOLVER_SEQ.load(Ordering::Acquire) != seq {
+            continue;
+        }
+        if copy.generation != owner_gen || copy.len == 0 || owner_gen == 0 {
+            return errno::ENOENT;
+        }
+        let n = copy.len as usize;
+        if buf.len() < n {
+            return errno::ERANGE;
+        }
+        buf[..n].copy_from_slice(&copy.data[..n]);
+        return n as i32;
+    }
+    errno::EAGAIN
 }
 
 /// One admitted metal workload: its owner subgraph. Mirrors the Linux
@@ -116,6 +306,10 @@ struct WorkloadSlot {
     /// took one. Retained at CREATE so DESTROY/KILL can emit the matching
     /// `ADDR_DEL`.
     net_addr: [u8; 16],
+    /// The `net.route` segment the identity joined (0: none). A segment with
+    /// a workload on it cannot leave the table (`net_route` SEGMENTS answers
+    /// `EBUSY`) while that identity is installed.
+    net_segment: u16,
     /// The creating module's lanes into the subgraph (`wl::LANES`).
     lanes: [CallerLane; wl::MAX_CALLER_LANES],
     lane_count: u8,
@@ -140,13 +334,30 @@ const WL_EMPTY: WorkloadSlot = WorkloadSlot {
     in_use: false,
     owner: OWNER_SYSTEM,
     net_addr: [0u8; 16],
+    net_segment: 0,
     lanes: [NO_LANE; wl::MAX_CALLER_LANES],
     lane_count: 0,
 };
 
+/// One workload slot per owner slot: the static profile's compiled size. On
+/// Linux the table is sized at boot to the owner table ([`size`]).
 const MAX_WORKLOADS: usize = MAX_OWNERS;
 
-static mut FMOD_WORKLOADS: [WorkloadSlot; MAX_WORKLOADS] = [WL_EMPTY; MAX_WORKLOADS];
+static mut FMOD_WORKLOADS: crate::kernel::mem::table::Table<WorkloadSlot, MAX_WORKLOADS> = crate::boot_table!(
+    MAX_WORKLOADS,
+    WL_EMPTY,
+    crate::abi::contracts::resource::POOL_OWNERS
+);
+
+/// Size the workload slots to the owner table's `owners` slots.
+///
+/// # Safety
+/// Graph-preparation context: no reference into the table is live.
+pub unsafe fn size(owners: usize) -> Result<(), crate::kernel::mem::table::TableError> {
+    let t = &*core::ptr::addr_of!(FMOD_WORKLOADS);
+    t.reserve(owners)?;
+    t.grow(owners)
+}
 
 /// A `CREATE` whose subgraph is being instantiated a batch per call. The
 /// backend owns everything the add reads between calls: its own copy of the
@@ -285,7 +496,17 @@ fn provider_net_in_spare_lane() -> i32 {
 /// graph — `channel_write` on an SPSC FIFO with a second producer violates the
 /// invariant, so we refuse rather than double-write.
 fn addr_ctl_writable(ch: i32) -> bool {
-    scheduler::channel_producer_owner(ch).is_system()
+    scheduler::channel_producer_module(ch).is_none()
+}
+
+/// Whether a module writes the registered net-identity provider's
+/// `addr_ctl`: the direct coordinator path (a fence coordinator, a capture
+/// harness). On such a graph the kernel installs no workload identity and
+/// the provider realizes no held address — one writer per ring (the build
+/// refuses the same on a graph that creates workloads).
+pub fn direct_addr_ctl_wired() -> bool {
+    let ch = addr_ctl_channel();
+    ch >= 0 && !addr_ctl_writable(ch)
 }
 
 /// Write one `net::identity`-framed `addr_ctl` control frame: `[msg_type:u8]
@@ -571,15 +792,28 @@ unsafe fn workload_create(arg: *mut u8, arg_len: usize) -> i32 {
     //   * net_iso beyond OWN is malformed,
     //   * own-iso XOR a family (one without the other) is a half-specified
     //     identity — not realized,
-    //   * IPv6 and non-default segments are not realized (ENOSYS).
+    //   * IPv6 is not realized (ENOSYS),
+    //   * a segment ≥ 1 is validated against the node's net.route segments
+    //     (absent → ENOENT, address outside it or its gateway → EINVAL); the
+    //     workload joins it when the node's network stack realizes the
+    //     tables (its address is then one of that stack's), and is refused
+    //     ENOSYS where none is registered.
     if net_iso > wl::NET_ISO_OWN {
         return errno::EINVAL;
     }
     let wants_identity = net_iso == wl::NET_ISO_OWN || net_family != wl::NET_FAM_NONE;
-    if wants_identity
-        && (net_iso != wl::NET_ISO_OWN || net_family != wl::NET_FAM_IPV4 || net_segment != 0)
-    {
+    if wants_identity && (net_iso != wl::NET_ISO_OWN || net_family != wl::NET_FAM_IPV4) {
         return errno::ENOSYS;
+    }
+    if net_segment != 0 {
+        if let Err(e) = crate::kernel::net_route::validate_attach(
+            net_family,
+            &net_addr,
+            net_segment,
+            net_identity_provider_present(),
+        ) {
+            return e;
+        }
     }
     for i in 0..endpoint_count {
         let e = ep_start + i * wl::NET_ENDPOINT_SIZE;
@@ -618,6 +852,12 @@ unsafe fn workload_create(arg: *mut u8, arg_len: usize) -> i32 {
     if flxa_len < FLXA_MIN_LEN {
         return errno::EINVAL; // not a well-formed FLXA subgraph
     }
+    // The Tier-2 options: the resolver context is this backend's; any other
+    // required entry is refused before anything is staged.
+    let resolver_ctx = match create_options(&buf[opt_start..opt_end]) {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
 
     // ── Who the workload is, and what it may hold.
     //
@@ -663,6 +903,14 @@ unsafe fn workload_create(arg: *mut u8, arg_len: usize) -> i32 {
         if rc != 0 {
             return rc;
         }
+        // Captured on the first call; the owner it belongs to exists only
+        // once the last module is in.
+        let pr = &mut *core::ptr::addr_of_mut!(PENDING_RESOLVER);
+        pr.0 = 0;
+        if let Some(v) = resolver_ctx {
+            pr.0 = v.len() as u16;
+            pr.1[..v.len()].copy_from_slice(v);
+        }
     }
 
     // ── One batch of the pending add; the rest of CREATE once its last
@@ -707,6 +955,12 @@ unsafe fn workload_create(arg: *mut u8, arg_len: usize) -> i32 {
     // every later failure's `free_owner` takes the code too.
     if let Some(s) = p.pack {
         code_pack::bind(s, owner.slot);
+    }
+    // The owner's name-service context, for its lanes' provider.
+    {
+        let pr = &*core::ptr::addr_of!(PENDING_RESOLVER);
+        let v = &pr.1[..pr.0 as usize];
+        resolver_ctx_set(owner, v);
     }
 
     // ── Lease-gate each declared endpoint against the owner's retained plan
@@ -786,6 +1040,7 @@ unsafe fn workload_create(arg: *mut u8, arg_len: usize) -> i32 {
         // Only an installed identity is remembered for the DESTROY-time
         // ADDR_DEL; a host-shared workload stores a zero address (no-op DEL).
         net_addr: if wants_identity { net_addr } else { [0u8; 16] },
+        net_segment: if wants_identity { net_segment } else { 0 },
         lanes,
         lane_count: lane_count as u8,
     };
@@ -797,10 +1052,10 @@ unsafe fn workload_create(arg: *mut u8, arg_len: usize) -> i32 {
 unsafe fn slot_owner(raw: i32) -> Option<OwnerHandle> {
     let idx = raw as usize;
     let slots = &*core::ptr::addr_of!(FMOD_WORKLOADS);
-    if idx >= MAX_WORKLOADS || !slots[idx].in_use {
-        return None;
+    match slots.get(idx) {
+        Some(s) if s.in_use => Some(s.owner),
+        _ => None,
     }
-    Some(slots[idx].owner)
 }
 
 /// Map an owner's live status to the WAIT `(state, code)` pair, defined for
@@ -844,7 +1099,11 @@ unsafe fn workload_wait(owner: Option<OwnerHandle>, arg: *mut u8, arg_len: usize
     if arg.is_null() || arg_len < 5 {
         return errno::EINVAL;
     }
-    let mut snap = [OwnerLiveStatus::EMPTY; MAX_OWNERS];
+    let mut snap = crate::scratch![
+        OwnerLiveStatus::EMPTY;
+        MAX_OWNERS,
+        scheduler::owners().slot_count()
+    ];
     let n = scheduler::owner_live_snapshot(&mut snap);
     let rec = owner.and_then(|o| {
         snap[..n]
@@ -885,13 +1144,32 @@ unsafe fn workload_caps(arg: *mut u8, arg_len: usize) -> i32 {
     // delivery this backend does not provide (TERM→drain, KILL→free).
     out[2..4].copy_from_slice(&(wl::caps::PAUSE | wl::caps::LOOKUP).to_le_bytes());
     // Net: NET_ISO_OWN | NET_IDENTITY — a `net=own` workload's own IPv4
-    // address is installed into the net-identity provider and ARP-answered.
-    // Owner-scoped *binds* to that address are not resolved here (the
-    // workload's binds run host-wildcard), but the address itself is live,
-    // so both bits are honestly set.
+    // address is installed into the net-identity provider and ARP-answered,
+    // and the workload's binds land on it: `ip` stamps a lane's bind with the
+    // lane's owner and binds it to that owner's address (`lane_bind_target`),
+    // and an owned address is served only by a listener bound to it, never by
+    // a host wildcard listener. Both bits are honestly set.
     out[4] = wl::caps::NET_ISO_OWN | wl::caps::NET_IDENTITY;
-    out[5..7].copy_from_slice(&0u16.to_le_bytes()); // ns_count
-    7
+    // One Tier-2 entry is realized: the owner's name-service context, read
+    // by the net provider for the owner's lanes.
+    let ns = wl::resolver::NS;
+    let key = wl::resolver::KEY;
+    let need = 7 + 1 + ns.len() + 2 + 1 + key.len();
+    if arg_len < need {
+        out[5..7].copy_from_slice(&0u16.to_le_bytes());
+        return 7;
+    }
+    out[5..7].copy_from_slice(&1u16.to_le_bytes()); // ns_count
+    let mut at = 7;
+    out[at] = ns.len() as u8;
+    out[at + 1..at + 1 + ns.len()].copy_from_slice(ns);
+    at += 1 + ns.len();
+    out[at..at + 2].copy_from_slice(&1u16.to_le_bytes()); // key_count
+    at += 2;
+    out[at] = key.len() as u8;
+    out[at + 1..at + 1 + key.len()].copy_from_slice(key);
+    at += 1 + key.len();
+    at as i32
 }
 
 /// The metal `workload` (0x1A) provider dispatch. CREATE/CAPS are the `handle
@@ -1020,9 +1298,32 @@ unsafe fn dispatch_op(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) ->
     // role, takes the lanes staged workloads attach, and asks whether a
     // lane's owner may bind (see `net_attach`).
     if opcode == wl::NET_PROVIDE {
-        return crate::kernel::workload::net_attach::provide_queued(
-            scheduler::current_module_index(),
-        );
+        // `[lanes:u8]`: the provider's lane capacity.
+        if arg.is_null() || arg_len < wl::net_lane::PROVIDE_LEN {
+            return errno::EINVAL;
+        }
+        let slot = scheduler::current_module_index();
+        // One registration names the node's network stack: the lane
+        // provider is the registered net-identity provider, in the same
+        // occupancy (`net_attach` keys it by slot and generation too).
+        if let Some((reg, _, _)) = net_identity_provider() {
+            if reg != slot {
+                return errno::EACCES;
+            }
+            // Coordinator exclusivity: with a module writing `addr_ctl`, the
+            // kernel could not install a lane's identity there.
+            if direct_addr_ctl_wired() {
+                return errno::EBUSY;
+            }
+        }
+        return crate::kernel::workload::net_attach::provide_queued(slot, *arg as usize);
+    }
+    if opcode == wl::NET_RESOLVER {
+        if arg.is_null() {
+            return errno::EINVAL;
+        }
+        let buf = core::slice::from_raw_parts_mut(arg, arg_len);
+        return resolver_ctx_read(scheduler::current_module_index(), buf);
     }
     if opcode == wl::NET_LANE_TAKE || opcode == wl::NET_LANE_ADMIT {
         if arg.is_null() {
@@ -1050,7 +1351,7 @@ unsafe fn dispatch_op(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) ->
         let Some(widx) = slot_by_identity(&identity) else {
             return errno::ENOENT;
         };
-        let owner = (*core::ptr::addr_of!(FMOD_WORKLOADS))[widx].owner;
+        let owner = (&*core::ptr::addr_of!(FMOD_WORKLOADS))[widx].owner;
         out[0..2].copy_from_slice(&owner.slot.to_le_bytes());
         out[2..6].copy_from_slice(&owner.generation.to_le_bytes());
         return tag_fd(FD_TAG_WORKLOAD, widx as i32);
@@ -1116,6 +1417,7 @@ unsafe fn dispatch_op(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) ->
                     let slots = &mut *core::ptr::addr_of_mut!(FMOD_WORKLOADS);
                     remove_identity(&slots[raw as usize].net_addr);
                     slots[raw as usize].net_addr = [0u8; 16];
+                    slots[raw as usize].net_segment = 0;
                     // The lanes' channels close with the owner; the ids must
                     // not outlive them, or LANES would name channels another
                     // owner may be given.
@@ -1133,7 +1435,7 @@ unsafe fn dispatch_op(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) ->
             if scheduler::owners_mut().lookup(owner).is_none() {
                 return errno::EINVAL;
             }
-            let slot = &(*core::ptr::addr_of!(FMOD_WORKLOADS))[raw as usize];
+            let slot = &(&*core::ptr::addr_of!(FMOD_WORKLOADS))[raw as usize];
             let n = slot.lane_count as usize;
             let need = 1 + n * 9;
             if arg.is_null() || arg_len < need {
@@ -1165,11 +1467,26 @@ unsafe fn destroy_slot(widx: usize) -> i32 {
     0
 }
 
+/// Whether an admitted workload's installed identity is on `net.route`
+/// segment `id` (`id` ≥ 1).
+pub fn segment_attached(id: u16) -> bool {
+    if id == 0 {
+        return false;
+    }
+    // SAFETY: a read of plain fields; a slot changes only in CREATE, signal
+    // and DESTROY, and an answer that races one is the same answer the
+    // caller would get a moment earlier or later.
+    let slots = unsafe { &*core::ptr::addr_of!(FMOD_WORKLOADS) };
+    slots
+        .iter()
+        .any(|s| s.in_use && s.net_segment == id && s.net_addr.iter().any(|&b| b != 0))
+}
+
 /// The live workload slot whose owner carries `identity`.
 unsafe fn slot_by_identity(identity: &[u8; 16]) -> Option<usize> {
     let slots = &*core::ptr::addr_of!(FMOD_WORKLOADS);
     let owners = scheduler::owners();
-    (0..MAX_WORKLOADS).find(|&i| {
+    (0..slots.len()).find(|&i| {
         slots[i].in_use
             && owners
                 .lookup(slots[i].owner)

@@ -339,7 +339,9 @@ fn cmd_run_dispatch(config_path: Option<&PathBuf>, flags: RunFlags, verbose: boo
     let pinned = if config_path.exists() {
         None
     } else {
-        Some(workload_src::bundle_by_name(&config_path.to_string_lossy())?)
+        Some(workload_src::bundle_by_name(
+            &config_path.to_string_lossy(),
+        )?)
     };
     if let Some(bundle) = pinned
         .as_deref()

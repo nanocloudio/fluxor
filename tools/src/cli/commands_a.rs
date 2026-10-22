@@ -548,7 +548,14 @@ fn check_state_budget(
     if modules.is_empty() {
         return Ok(());
     }
-    let arena = target.state_arena_kb as u64 * 1024;
+    // The arena the kernel will give this graph: the target's planning figure,
+    // or what the graph's envelope places (`capacity::planned_state_arena`).
+    let (arena, envelope) = crate::capacity::planned_state_arena(
+        target.runtime(),
+        target.state_arena_kb as u64 * 1024,
+        target.buffer_arena_kb.map(|kb| kb as u64 * 1024),
+        config.get("capacity"),
+    );
     let mut total = 0u64;
     let mut unknown: Vec<&str> = Vec::new();
     let mut rows: Vec<(String, u64)> = Vec::new();
@@ -583,7 +590,12 @@ fn check_state_budget(
     }
     rows.sort_by(|a, b| b.1.cmp(&a.1));
 
-    println!("State arena ({}): {} B", target.id, arena);
+    println!(
+        "State arena ({}{}): {} B",
+        target.id,
+        if envelope { ", capacity envelope" } else { "" },
+        arena
+    );
     for (name, bytes) in &rows {
         if *bytes == 0 {
             println!("  {name:<20} unknown");
@@ -621,10 +633,17 @@ fn check_state_budget(
         return Ok(());
     }
     if total > arena {
+        let by = if envelope {
+            " (as its capacity envelope places it)"
+        } else {
+            ""
+        };
         return Err(Error::Config(format!(
-            "graph needs {total} B of module state but {}'s arena is {arena} B — over by {} B. \
-             Drop a module, select a smaller variant, or raise state_arena_kb in \
-             targets/silicon/{}.toml (which costs the buffer arena and the stack).",
+            "graph needs {total} B of module state but {}'s arena is {arena} B{by} — over by \
+             {} B. Drop a module, select a smaller variant, or give the state arena more: \
+             `capacity: {{ state_arena }}` (on RP, taken from the kernel's static pool) or \
+             state_arena_kb in targets/silicon/{}.toml (which costs the buffer arena and the \
+             stack).",
             target.id,
             total - arena,
             target.id,
@@ -1705,6 +1724,69 @@ fn sign_graph_image_header(header: &mut [u8], seed: &[u8; 32]) -> [u8; 32] {
     header[at + 4..at + 8].copy_from_slice(&key_id[..4]);
     header[at + 8..at + fl::GRAPH_SLOT_SIGNATURE_LEN].copy_from_slice(&sig);
     pk
+}
+
+#[cfg(test)]
+mod state_budget_tests {
+    use super::check_state_budget;
+    use crate::manifest::Manifest;
+    use crate::modules::ModuleInfo;
+    use serde_json::json;
+
+    fn module(name: &str, state: u64) -> ModuleInfo {
+        let manifest = Manifest {
+            state_bytes_64: (state / 64) as _,
+            ..Default::default()
+        };
+        ModuleInfo {
+            name: name.into(),
+            name_hash: 0,
+            module_type: 0,
+            mailbox_safe: false,
+            in_place_writer: false,
+            drain_capable: false,
+            permissions_bits: 0,
+            schema: None,
+            manifest,
+            data: Vec::new(),
+        }
+    }
+
+    fn pico2w() -> crate::target::TargetDescriptor {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        crate::target::load_target("pico2w", &root).expect("pico2w target")
+    }
+
+    /// On RP the envelope places the arenas: a larger `buffer_arena` takes
+    /// its growth from the state arena, and a `state_arena` entry is the
+    /// arena's size. The verdict follows the arena the kernel will give.
+    #[test]
+    fn an_rp_envelope_moves_the_state_arena() {
+        let target = pico2w();
+        let default = target.state_arena_kb as u64 * 1024;
+        let buffer = target.buffer_arena_kb.expect("rp buffer arena") as u64 * 1024;
+        // Fits the default split with 16 KiB to spare.
+        let mods = [module("a", default - 16 * 1024)];
+        check_state_budget(&mods, &json!({}), &target).expect("fits the default arena");
+        // A buffer arena 32 KiB larger leaves the state arena 32 KiB smaller.
+        let cfg = json!({"capacity": {"buffer_arena": buffer + 32 * 1024}});
+        let e = check_state_budget(&mods, &cfg, &target)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains(&format!("arena is {} B", default - 32 * 1024))
+                && e.contains("capacity envelope")
+                && e.contains("over by 16384 B"),
+            "{e}"
+        );
+        // A state-arena entry is the size the kernel guarantees.
+        let cfg = json!({"capacity": {"state_arena": default - 32 * 1024}});
+        check_state_budget(&mods, &cfg, &target).expect_err("a smaller state arena");
+        let big = [module("a", default + 8 * 1024)];
+        check_state_budget(&big, &json!({}), &target).expect_err("past the default");
+        let cfg = json!({"capacity": {"state_arena": default + 8 * 1024}});
+        check_state_budget(&big, &cfg, &target).expect("the entry places a larger arena");
+    }
 }
 
 #[cfg(test)]

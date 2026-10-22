@@ -153,6 +153,19 @@ pub struct TcpConn {
     /// 0 = the node's own shared `net_in`/`net_out`). Its events go to that
     /// lane alone, and only that lane may command it.
     pub lane: u8,
+    /// A dial translated from a service address: the service address and
+    /// port the consumer dialled, which the stream reports as its peer
+    /// (`MSG_PEER`). 0 for an untranslated stream.
+    pub svc_vip: u32,
+    pub svc_vport: u16,
+    /// A datagram endpoint's egress port: the ephemeral port its traffic
+    /// leaves the node's own address from, held as a slot-0 binding while
+    /// the endpoint lives (0 until it first needs one).
+    pub egress_port: u16,
+    /// The next hop this connection's segments leave by, and the route-table
+    /// epoch it was looked up under; looked up again when the epoch moves.
+    pub nh_ip: u32,
+    pub nh_epoch: u32,
 
     // Send sequence variables
     pub snd_una: u32, // oldest unacknowledged
@@ -264,6 +277,11 @@ impl TcpConn {
             half_open_counted: false,
             chal_epoch: 0,
             lane: 0,
+            svc_vip: 0,
+            svc_vport: 0,
+            egress_port: 0,
+            nh_ip: 0,
+            nh_epoch: 0,
             snd_una: 0,
             snd_nxt: 0,
             snd_wnd: 0,

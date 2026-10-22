@@ -123,10 +123,16 @@ pub mod contracts {
             include!("contracts/net/ws_control.rs");
         }
         /// Packet policy and service NAT, enforced by the platform: tables of
-        /// neutral rules a provider realizes as nftables, a native filter, or
-        /// nothing (and says so in its capabilities).
+        /// neutral rules a provider realizes with the host's packet filter, a
+        /// native filter, or nothing (and says so in its capabilities).
         pub mod policy {
             include!("contracts/net/policy.rs");
+        }
+        /// How the node's workloads reach each other and the outside world:
+        /// segments, peer routes and held addresses, realized by the
+        /// platform or a module provider and reported per entry.
+        pub mod route {
+            include!("contracts/net/route.rs");
         }
     }
     /// Observability telemetry envelope (metric / span signals).

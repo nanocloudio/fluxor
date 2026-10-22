@@ -127,7 +127,8 @@ platform) implements the vtable, and consumers reach it through
 | `WORKLOAD` | `0x001A` | Kernel (platform backends) | Platform-neutral isolated-workload surface (opcode class 0x1Axx): run an isolated workload with a declared capability envelope. |
 | `STREAM_CLOCK` | `0x001C` | Kernel (platform) | Generic stream-clock capability (opcode class 0x1Cxx) answering the `STREAM_TIME` audio-clock query independently of PIO hardware. |
 | `TRUST` | `0x001D` | Kernel (platform) | Platform certificate-chain verification (opcode class 0x1Dxx): the platform answers for a chain, or refuses every chain. Registered where a system trust store exists and absent otherwise, which is why a graph names it in `[[requires_when]]`. |
-| `NET_POLICY` | `0x001E` | Kernel (platform) | Packet policy and service NAT (opcode class 0x1Exx): a consumer states what traffic is allowed and where a virtual address leads, and the platform decides how — nftables on Linux, the in-graph packet filter on bare metal. Tables are replaced whole and atomically, each REPLACE advancing the table's generation. A provider that records a table it cannot act on leaves the `ENFORCED` capability bit clear rather than implying enforcement. |
+| `NET_POLICY` | `0x001E` | Kernel (platform) | Packet policy and service NAT (opcode class 0x1Exx): a consumer states what traffic is allowed and where a virtual address leads, and the platform decides how — the host's packet filter on Linux, the in-graph packet filter on bare metal. Tables are replaced whole and atomically, each REPLACE advancing the table's generation. A provider that records a table it cannot act on leaves the `ENFORCED` capability bit clear rather than implying enforcement. |
+| `NET_ROUTE` | `0x0020` | Kernel (platform), realized by the platform or by a registered net-identity module | Node reachability (opcode class 0x20xx): the node's segments (each a local network whose gateway the node holds), peer routes (another node's segment, reached through that node) and held addresses (answered for the node with no workload owning them). Each table is replaced whole and atomically by a single bound writer and persists across that writer's exit and graph rebuilds; `READ` reports each entry as realized, pending, fenced, refused (with a reason) or unknown, so a realization the host defeats is reported rather than lost. |
 
 `FS` STAT output is 8 bytes, `[size:u32 LE, mtime:u32 LE]`. The
 contract serves random-access file I/O; streaming workloads use channel
@@ -146,8 +147,8 @@ First declared consumer: `modules/foundation/usb_midi_host`.
 
 `WORKLOAD` has two placement-resolved backends: an fmod-graph backend,
 which splices the workload's subgraph into the node's own graph under an
-owner and its leases, and a host-process backend (namespaces/cgroups,
-Linux). It is gated by `requires_contract = "workload"` and
+owner and its leases, and a host-process backend (a host process in an
+isolation domain of its own, Linux). It is gated by `requires_contract = "workload"` and
 `platform_raw`.
 
 The fmod-graph backend realizes the shared posture only. A workload is a
@@ -206,7 +207,8 @@ bare-metal RP the clock is a property of the active PIO stream, so no
 provider is registered and the query falls back to `HAL_PIO`.
 
 `HOST_PROCESS` (`0x001B`) is host-scoped, not stable: Linux
-host-process mechanics (exec, PTY, read, bundles), registered only by
+host-process mechanics (exec, PTY, read, the host-process source),
+registered only by
 the Linux platform, with semantic constants at
 `abi::platform::linux::host_process`. Unregistered platforms return
 `ENOSYS`, which doubles as discovery.
@@ -220,9 +222,13 @@ mount is `nodev,nosuid`, no symlink under the root is followed — and answers
 with the kernel's errno. Mount and unmount run off the scheduler thread and
 answer `EAGAIN` until a repeat of the same request finds the result; each
 caller holds a bounded number of jobs, uncollected results expire, and both
-operations are idempotent against the host mount table. Making or
-checking a filesystem is a userland tool and goes through the process
-executor.
+operations are idempotent against the host mount table. The same class
+projects files with modes, a group and an atomic `..data` swap (optionally
+memory-backed), removes a tree without following a link or crossing a mount
+(any mount inside but a projection's is `EBUSY`), gives a volume's tree a
+group, and makes a directory of an exact mode — the permission model the portable `fs` contract does not carry.
+Making or checking a filesystem is a userland tool and goes through the
+process executor.
 
 Plus channel-served protocols (no contract id — there's nothing to
 dispatch, just message formats):
@@ -406,6 +412,14 @@ The wire format is identical to `.fmod` modules — same TLV stream
 (`[0xFE][0x01][len_lo][len_hi][tag][len][value]…`). The tool packs
 manifest defaults explicitly so every declared param shows up in the
 TLV; built-ins don't re-encode defaults in code.
+
+The header's `len` (u16) is advisory. Params have no ceiling, so a blob
+past 65,535 payload bytes carries `0xFFFF` there (writers saturate, never
+wrap), and every reader bounds the stream by the blob's own length (the
+module entry's u32) and ends the basic section at the `0xFF 0x00`
+terminator: the SDK's `parse_tlv`, the kernel's tag scans, the built-in
+walkers, the runtime-override merges, the extended-entry scanners (tls,
+quic) and the tools.
 
 #### Runtime feature cross-check
 
@@ -768,7 +782,14 @@ vocabulary is native Fluxor (`owner`, `workload`, `lease`, `posture`,
 `endpoint`, `drain`, `grant`); an orchestrator's vocabulary lives in the
 orchestrator, which translates at its boundary. No user, group or mode bit
 crosses the portable surface: those are the host-process platform contract's
-alone, and the `tenancy-vocabulary` hygiene rule refuses them elsewhere.
+alone, and the `tenancy-vocabulary` hygiene rule refuses them elsewhere. The
+same rule holds the portable surface, `src/kernel/` and these architecture
+docs to neutral words for host mechanisms (`MECHANISM_WORDS` in
+`tools/src/hygiene.rs`): they say what is guaranteed, and only
+`src/platform/<p>/` and `modules/sdk/platform/<p>/` say how one host realizes
+it. A ruling that must name a backend sits inside a reasoned exempt block
+(`VOCABULARY_EXEMPT_BEGIN` / `VOCABULARY_EXEMPT_END` in the same file: an HTML
+comment in Markdown, a line comment in Rust).
 
 Reopens if: Fluxor grows a public API audience for whom POSIX
 vocabulary actively misleads (e.g. an `fd` that stops behaving like a
@@ -799,20 +820,23 @@ minting a new one.
 The stable 0x1A workload contract carries only the native core
 (CREATE / START / WAIT / portable SIGNAL / DESTROY / PAUSE / RESUME /
 CAPS plus the Tier-1 header). Host-process mechanics — READ / EXEC /
-TTY_* opcodes, SOURCE_BUNDLE, FD_TAG_PROC, and the process-executor
+TTY_* opcodes, SOURCE_HOST_PROCESS, FD_TAG_PROC, and the process-executor
 class — live in the host-scoped class
 `abi::platform::linux::host_process` (0x1B), registered only by the
 Linux platform; unregistered = `ENOSYS` = discovery. Workload-targeting
 ops carry the tagged fd as an in-argument, since handle-tagged calls
-route by tag→class. Retired 0x1A positions are not reused; CAPS bits
-0..2 are reserved, and the stable caps define only the bit-0 native
-source kind. The generic kernel carries no host vocabulary: the proc
+route by tag→class. The 0x1A contract leaves the host-process opcode
+positions unused and its `ops` CAPS bits 0..2 reserved; its
+`source_kinds` bits are the native artifacts (bit 0 an fmod graph, bit 2
+a graph with its own modules), bit 1 being the host-process source the
+Linux backend defines. The generic kernel carries no host vocabulary: the proc
 fd-tag routes via the platform-registered `register_fd_tag_route`
 table, and the kernel registry keeps class 0x0016 — the host-process
 executor class position — and its fd tag 25 only as reserved numerics.
 
 ### Container isolation: generic primitive in fluxor, OCI policy in nanocloud
 
+<!-- vocabulary-exempt-begin: this ruling places the Linux backend's isolation mechanism, so it names it -->
 The isolation mechanism (`src/platform/linux/host_backend.rs`:
 fork/unshare/cgroups/rootfs) needs host `std`, and nanocloud has no
 std-native code — it is entirely no_std PIC modules run by
@@ -822,7 +846,10 @@ reduced to a generic isolation primitive that knows no OCI format:
 `build_plan(argv, rootfs, isolate)` takes explicit parameters, cgroup
 limits come solely from the portable `ResourceEnvelope`, and the
 workload CREATE source section carries explicit spawn params
-(`[isolate:u8][rootfs_len:u16][rootfs][argv NUL-sep]`) rather than a
+(`[flags:u8]` isolated / read-only root, then length-prefixed rootfs,
+argv, env, cwd, user and numeric groups — the layout at
+`abi::platform::linux::host_process::SOURCE_HOST_PROCESS`) rather than a
 bundle-directory path. Nanocloud owns the OCI→params mapping — the
 policy half — mirroring how the nanocloud CLI is built: a PIC fmod
 owning logic plus fluxor host built-ins for host facts.
+<!-- vocabulary-exempt-end -->

@@ -14,9 +14,11 @@
 //! and on bcm2712 the consumer-side ring of every edge crossing domains. The
 //! config is the compiled one, so platform-injected modules and the
 //! composer's mailbox groups are in it. The limit is the kernel profile's
-//! arena, or the graph's `capacity: { buffer_arena }` envelope where that is
-//! lower, and the rings are also counted against the channel slots
-//! (`MAX_CHANNELS`, or `capacity: { channels }`). Workload subgraphs a node
+//! arena, or the graph's `capacity: { buffer_arena }` envelope — its size on
+//! RP, which places the arena per graph, and a lower figure only elsewhere,
+//! where the arena is fixed. The rings are also counted against the channel
+//! table the kernel's boot plan sizes: the graph's edges and fans plus the
+//! `channels` reserve (`capacity::plan_pool`). Workload subgraphs a node
 //! admits later, and channels modules open for themselves, draw on the same
 //! arena and are not part of the sum.
 
@@ -68,21 +70,22 @@ fn multi_channel(runtime: &str, name_hash: u32) -> bool {
 }
 
 /// The figure a pool is held to: the kernel's own, or the graph's capacity
-/// envelope where that is lower (the kernel enforces the envelope as it
-/// allocates).
+/// envelope. Where the kernel places its arenas per graph (RP) the entry is
+/// the arena's size, larger or smaller; elsewhere the arena is fixed and an
+/// entry only lowers what an allocation is admitted against.
 struct Limit {
     value: u64,
     /// Whether the envelope set it.
     envelope: bool,
 }
 
-fn limit(config: &Value, pool: &str, kernel: u64) -> Limit {
+fn limit(config: &Value, pool: &str, kernel: u64, runtime: &str) -> Limit {
     match config
         .get("capacity")
         .and_then(|c| c.get(pool))
         .and_then(|v| v.as_u64())
     {
-        Some(n) if n < kernel => Limit {
+        Some(n) if n < kernel || crate::capacity::kernel_places_arenas(runtime) => Limit {
             value: n,
             envelope: true,
         },
@@ -329,12 +332,51 @@ fn check_decoded(
         })
     })?;
     let total = plan.total();
-    let arena = limit(config, "buffer_arena", kernel_arena);
-    let slots = limit(
-        config,
-        "channels",
-        crate::capacity::kernel_max_edges(target.runtime()) as u64,
-    );
+    let arena = limit(config, "buffer_arena", kernel_arena, target.runtime());
+    // Every ring takes a slot of the channel table, which the kernel sizes to
+    // its boot plan: the graph's edges and fans (and on bcm2712 the consumer
+    // side of each cross-domain edge) plus the `channels` reserve (the
+    // envelope's entry, else the profile's default). Resident workloads add
+    // their own share to the plan and are not in this sum.
+    let compiled: Vec<(u16, u16, u8, u8, u8)> = graph
+        .edges
+        .iter()
+        .map(|e| {
+            (
+                e.from as u16,
+                e.to as u16,
+                u8::from(e.ctrl),
+                e.from_port,
+                e.to_port,
+            )
+        })
+        .collect();
+    let shape = crate::capacity::GraphShape {
+        modules: graph.modules.len() as u64,
+        edges: compiled.len() as u64,
+        fans: crate::capacity::fan_count(&compiled),
+        crossings: crate::capacity::crossing_count(graph.edges.iter().map(|e| {
+            (
+                graph.modules.get(e.from).map(|m| m.domain),
+                graph.modules.get(e.to).map(|m| m.domain),
+                e.cross_core,
+            )
+        })),
+        ..Default::default()
+    };
+    let entries: Vec<(String, u64)> = config
+        .get("capacity")
+        .and_then(|c| c.get("channels"))
+        .and_then(Value::as_u64)
+        .map(|n| ("channels".to_string(), n))
+        .into_iter()
+        .collect();
+    let channel_plan =
+        crate::capacity::plan_pool(target.runtime(), "channels", &shape, &[], &entries);
+    let slots = Limit {
+        value: channel_plan.ceiling(),
+        envelope: channel_plan.from_envelope,
+    };
     let by = |l: &Limit| {
         if l.envelope {
             " (its capacity envelope)"
@@ -366,14 +408,18 @@ fn check_decoded(
     }
     if plan.rings.len() as u64 > slots.value {
         return Err(Error::Config(format!(
-            "graph preparation opens {} channel(s) but {} has {} channel slot(s){}: every ring is a \
-             channel slot, the edges joining fanned ports to their tees and merges and the \
-             consumer side of a cross-domain edge included. Fan fewer ports, or split the \
-             graph.",
+            "graph preparation opens {} channel(s) but {}'s kernel sizes its channel table to {} \
+             (derived {} + reserve {}{}): every ring is a channel slot, the edges joining \
+             fanned ports to their tees and merges and the consumer side of a cross-domain \
+             edge included — over by {}. Raise `capacity: {{ channels }}`, fan \
+             fewer ports, or split the graph.",
             plan.rings.len(),
             target.id,
             slots.value,
-            by(&slots)
+            channel_plan.derived,
+            channel_plan.reserve,
+            by(&slots),
+            plan.rings.len() as u64 - slots.value
         )));
     }
     if total > arena.value {
@@ -558,26 +604,85 @@ mod tests {
             e.contains("buffer arena is 4194304 B (its capacity envelope) — over by 4194304 B"),
             "{e}"
         );
-        // An envelope above the kernel's arena is the kernel's to clamp.
+        // Linux's arena is a fixed array: an envelope above it raises nothing,
+        // and the arena itself binds.
         config["capacity"] = serde_json::json!({"buffer_arena": 1u64 << 40});
         run(&config, &decoded, &facts(&src, &dst), &HashMap::new()).unwrap();
     }
 
+    /// A `channels:` envelope entry is a live-add reserve on top of what the
+    /// graph derives, never a lower ceiling: Linux sizes its channel table to
+    /// the graph's edges and fans plus the reserve, so a zero reserve still
+    /// seats every ring this graph opens.
     #[test]
-    fn every_ring_takes_a_channel_slot() {
+    fn a_channels_reserve_is_not_a_ceiling() {
         let (mut config, decoded, src, dst) = graph(3, 1024);
-        config["capacity"] = serde_json::json!({"channels": 2});
-        let e = run(&config, &decoded, &facts(&src, &dst), &HashMap::new())
-            .unwrap_err()
-            .to_string();
-        assert!(
-            e.contains(
-                "opens 3 channel(s) but linux has 2 channel slot(s) (its capacity envelope)"
-            ),
-            "{e}"
-        );
-        config["capacity"] = serde_json::json!({"channels": 3});
+        config["capacity"] = serde_json::json!({"channels": 0});
         run(&config, &decoded, &facts(&src, &dst), &HashMap::new()).unwrap();
+    }
+
+    /// On bcm2712 an edge between domains opens a consumer-side channel of
+    /// its own, which the boot plan derives (`cross_domain_edges`): three
+    /// crossing edges plan six channels before any reserve, so even a zero
+    /// `channels` reserve seats every ring.
+    #[test]
+    fn cross_domain_rings_are_derived_on_bcm2712() {
+        let (mut config, mut decoded, src, dst) = graph(3, 1024);
+        for m in decoded["modules"].as_array_mut().unwrap() {
+            if m["id"].as_u64().unwrap() % 2 == 1 {
+                m["domain_id"] = serde_json::json!(1);
+            }
+        }
+        let pi5 = crate::target::load_target("pi5", &root()).expect("pi5 target");
+        let arena = buffer_arena_bytes(&pi5).unwrap();
+        let check = |config: &Value| {
+            check_decoded(
+                config,
+                &decoded,
+                &facts(&src, &dst),
+                &HashMap::new(),
+                &pi5,
+                arena,
+            )
+        };
+        check(&config).expect("the default reserve");
+        config["capacity"] = serde_json::json!({"channels": 0});
+        check(&config).expect("the crossings are derived, not reserved");
+        let shape = crate::capacity::GraphShape {
+            modules: 6,
+            edges: 3,
+            crossings: 3,
+            ..Default::default()
+        };
+        let entries = vec![("channels".to_string(), 0)];
+        let plan = crate::capacity::plan_pool("pi5", "channels", &shape, &[], &entries);
+        assert_eq!(plan.ceiling(), 6);
+        let linux = crate::capacity::plan_pool("linux", "channels", &shape, &[], &entries);
+        assert_eq!(linux.ceiling(), 3, "Linux bridges no domains");
+    }
+
+    /// RP places its buffer arena per graph at the plan's figure, so an entry
+    /// above the silicon default is the arena's size there, where on Linux it
+    /// raises nothing.
+    #[test]
+    fn an_rp_buffer_arena_entry_is_its_size() {
+        let (mut config, decoded, src, dst) = graph(1, 128 * 1024);
+        let pico2w = crate::target::load_target("pico2w", &root()).expect("pico2w target");
+        let arena = buffer_arena_bytes(&pico2w).unwrap();
+        let check = |config: &Value| {
+            check_decoded(
+                config,
+                &decoded,
+                &facts(&src, &dst),
+                &HashMap::new(),
+                &pico2w,
+                arena,
+            )
+        };
+        let e = check(&config).unwrap_err().to_string();
+        assert!(e.contains("buffer arena is 65536 B"), "{e}");
+        config["capacity"] = serde_json::json!({"buffer_arena": 256 * 1024});
+        check(&config).expect("the entry places a 256 KiB arena");
     }
 
     #[test]
@@ -619,7 +724,7 @@ mod tests {
         assert_eq!(buffer_arena_bytes(&pico2w), Some(64 * 1024));
         assert_eq!(
             buffer_arena_bytes(&linux()),
-            Some(crate::capacity::HOST_BUFFER_ARENA)
+            crate::capacity::kernel_buffer_arena("linux")
         );
     }
 }

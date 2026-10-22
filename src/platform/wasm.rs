@@ -157,25 +157,8 @@ use crate::platform::builtin_param_tags::{
 /// `scheduler::module_port`, comes from `crate::platform::builtin_param_tags`,
 /// which `build.rs` generates from the `[[params]]` and `[[ports]]` tables of
 /// the wasm built-in manifests.
-fn walk_tlv<F: FnMut(u8, &[u8])>(blob: &[u8], mut f: F) {
-    if blob.len() < 4 || blob[0] != 0xFE || blob[1] != 0x01 {
-        return;
-    }
-    let payload_len = u16::from_le_bytes([blob[2], blob[3]]) as usize;
-    let end = (4 + payload_len).min(blob.len());
-    let mut off = 4usize;
-    while off + 2 <= end {
-        let tag = blob[off];
-        let elen = blob[off + 1] as usize;
-        off += 2;
-        if tag == 0xFF || off + elen > end {
-            break;
-        }
-        if tag < 0xF0 {
-            f(tag, &blob[off..off + elen]);
-        }
-        off += elen;
-    }
+fn walk_tlv<F: FnMut(u8, &[u8])>(blob: &[u8], f: F) {
+    crate::kernel::sys::params_tlv::walk_declared(blob, f);
 }
 
 fn tlv_u32(value: &[u8]) -> u32 {

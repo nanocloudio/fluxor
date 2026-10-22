@@ -25,7 +25,7 @@
 //! exactly one core, so indexing by `domain` keeps each core on its
 //! own buffer. See `docs/architecture/concurrency.md`.
 
-use super::{MAX_CHANNELS, MAX_DOMAINS, MAX_PORTS};
+use super::{MAX_DOMAINS, MAX_PORTS};
 use crate::kernel::ipc::channel;
 use crate::kernel::module::loader::DynamicModule;
 use crate::modules::{Module, StepOutcome};
@@ -273,7 +273,7 @@ pub fn telemetry_record_len(signal: u8, kind: u8) -> usize {
     // SIGNAL_PSTATUS=4; METRIC_HISTOGRAM=3, METRIC_HISTOGRAM_16=4;
     // PSTATUS_STEP=1, PSTATUS_RES=2, PSTATUS_POOL=3. scalar=24, histogram=80,
     // histogram16=144, span=64, pstatus_step=52, pstatus_res=28,
-    // pstatus_pool=32.
+    // pstatus_pool=44.
     const SIGNAL_METRIC: u8 = 2;
     const SIGNAL_SPAN: u8 = 3;
     const SIGNAL_PSTATUS: u8 = 4;
@@ -289,7 +289,7 @@ pub fn telemetry_record_len(signal: u8, kind: u8) -> usize {
         SIGNAL_SPAN => 64,
         SIGNAL_PSTATUS if kind == PSTATUS_STEP => 52,
         SIGNAL_PSTATUS if kind == PSTATUS_RES => 28,
-        SIGNAL_PSTATUS if kind == PSTATUS_POOL => 32,
+        SIGNAL_PSTATUS if kind == PSTATUS_POOL => 44,
         _ => 0,
     }
 }
@@ -317,7 +317,7 @@ pub struct TeeModule {
 impl TeeModule {
     pub fn new(
         in_chan: i32,
-        out_chans: &[i32; MAX_CHANNELS],
+        out_chans: &[i32],
         out_count: usize,
         domain: u8,
         frame_kind: u8,
@@ -633,7 +633,7 @@ pub struct MergeModule {
 
 impl MergeModule {
     pub fn new(
-        in_chans: &[i32; MAX_CHANNELS],
+        in_chans: &[i32],
         in_count: usize,
         out_chan: i32,
         domain: u8,

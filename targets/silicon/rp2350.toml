@@ -232,16 +232,29 @@ boot2_src = "0x400e0000"
 # dominated by its 8-slot TCP table at ~2.2 KiB per connection, which is what
 # a per-silicon profile should be cutting on the small parts.
 #
-# Their sum is what the die can spare, so the two move against each other;
-# `ram_static_max_kb` below binds the sum, not either half.
+# Both are the DEFAULT split of the kernel pool below, not statics of their
+# own: a graph without a `capacity:` entry for them gets this buffer arena
+# and at least this state arena; one with an entry moves the split.
 state_arena_kb = 240
 # The loader's ceiling on one module's code. Modules execute in place from
 # flash, so this costs no RAM: it is a sanity bound, set by the 4 MiB part's
 # flash rather than by a guess at what an MCU module needs. A JavaScript
 # engine is some 440 KiB of code. Mirrors `MAX_MODULE_CODE_SIZE` in
-# modules/sdk/abi/config.rs, which the kernel's loader enforces.
+# src/kernel/config.rs, which the kernel's loader enforces.
 module_code_kb = 1024
 buffer_arena_kb = 64
+# The kernel's one static pool. Each graph's plan
+# splits it at boot: the kernel tables its plan sizes (module slots,
+# channels, events, timers, tracked handles, the state free list) off the
+# top, the buffer arena below them, the state arena the rest. It is what
+# `ram_static_max_kb` holds beside the kernel's fixed statics, less a few KiB
+# of slack the static-RAM gate measures. A graph whose plan it cannot hold is
+# refused at boot naming the pool that did not fit. A full graph's tables
+# (32 module slots, 128 channels) take some 33 KiB, so 344 leaves every graph
+# the composer admits its 240 KiB of state beside the 64 KiB buffer arena;
+# the kernel's fixed statics are ~112 KiB, so 344 leaves ~8 KiB of slack
+# under the 464 KiB ceiling.
+kernel_pool_kb = 344
 config_buffer_kb = 16
 # Early-boot log ring: sized to hold a whole boot until a reader arrives —
 # the USB console opened after enumeration replays it from the oldest line,

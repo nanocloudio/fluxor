@@ -9,10 +9,9 @@
 // Single-writer discipline: the kernel rings are written only by the
 // scheduler thread. The Linux runtime runs the scheduler single-threaded on the
 // main thread, so on-step records push directly. Records emitted off the main
-// thread (today only platform/background threads — the graph-integrated
-// `proc_executor` worker path has no in-tree callers yet) go to stderr only;
-// routing them into the owning ring would take a bounded MPSC drained on the
-// tick, which owner-scoped worker threads would need.
+// thread (platform and background threads: the process executor's pumps, the
+// host-mount jobs) go to stderr only; routing them into the owning ring would
+// take a bounded MPSC drained on the tick.
 
 // NOTE: this file is `include!`d into `linux.rs`, so it shares that module's
 // imports (`OnceLock`, `thread`, `std::io::Write`). Other paths are fully
@@ -102,14 +101,14 @@ impl log::Log for TeeLogger {
             };
         let ts_ms = now_unix_ms();
         let message = format!("{}", record.args());
-        // The committed plan generation at emit — the §17.2 join key between a
+        // The committed plan generation at emit — the join key between a
         // log record and the rollout it ran under. A plain static read on the
         // scheduler thread (we are on it: the SCHED_TID gate above), safe even
         // before HAL init; 0 until the first plan applies.
         let plan_generation = fluxor::kernel::workload::owner_plan::last_applied_generation();
         // `module` is left empty: the message text already carries the module's
         // own "[name] …" convention, and the graph module name is populated from
-        // the module-scoped logger (never by parsing), per §4.2.
+        // the module-scoped logger (never by parsing).
         fluxor::kernel::workload::owner_log::push_on_slot(
             slot as usize,
             uid,
@@ -288,24 +287,35 @@ fn flush_owner_rings(logs_dir: &std::path::Path) {
     // `install_slot` resets a slot's ring to seq 0 for a new tenant, so a bare
     // seq watermark could alias the new tenant's early records to the previous
     // tenant's flushed ones and skip the new ring file entirely (a low-volume
-    // module might never get its file). Main-thread-only, so a plain static is
-    // safe.
-    static mut LAST_FLUSHED: [([u8; 16], u32, u64); fluxor::kernel::workload::owner::MAX_OWNERS] =
-        [([0u8; 16], 0u32, 0u64); fluxor::kernel::workload::owner::MAX_OWNERS];
+    // module might never get its file). One entry per owner slot, grown with
+    // the owner table. Main-thread-only, so a plain static is safe.
+    static mut LAST_FLUSHED: Vec<([u8; 16], u32, u64)> = Vec::new();
+    // A ring whose owner was freed is written once more, then freed.
+    fluxor::kernel::workload::owner_log::set_flusher(true);
 
+    let slots = fluxor::kernel::workload::owner_log::slots();
+    // SAFETY: scheduler-thread-only access to the flush high-water table.
+    unsafe {
+        let hw = &mut *core::ptr::addr_of_mut!(LAST_FLUSHED);
+        if hw.len() < slots {
+            hw.resize(slots, ([0u8; 16], 0u32, 0u64));
+        }
+    }
     let mut created_dir = false;
-    for slot in 0..fluxor::kernel::workload::owner::MAX_OWNERS {
+    for slot in 0..slots {
         let next = fluxor::kernel::workload::owner_log::next_seq(slot);
         if next == 0 {
+            fluxor::kernel::workload::owner_log::reap_retired(slot);
             continue; // never written
         }
         let (uid, generation) = fluxor::kernel::workload::owner_log::installed_identity(slot);
         // SAFETY: scheduler-thread-only access to the flush high-water table.
         let already_flushed = unsafe {
-            let hw = &raw const LAST_FLUSHED;
-            (*hw)[slot] == (uid, generation, next)
+            let hw = &*core::ptr::addr_of!(LAST_FLUSHED);
+            hw[slot] == (uid, generation, next)
         };
         if already_flushed {
+            fluxor::kernel::workload::owner_log::reap_retired(slot);
             continue; // nothing new since last flush
         }
 
@@ -331,9 +341,10 @@ fn flush_owner_rings(logs_dir: &std::path::Path) {
             // SAFETY: scheduler-thread-only access to the flush high-water table,
             // reached through a raw pointer.
             unsafe {
-                let hw = &raw mut LAST_FLUSHED;
-                (*hw)[slot] = (uid, generation, next);
+                let hw = &mut *core::ptr::addr_of_mut!(LAST_FLUSHED);
+                hw[slot] = (uid, generation, next);
             }
+            fluxor::kernel::workload::owner_log::reap_retired(slot);
         }
     }
 }

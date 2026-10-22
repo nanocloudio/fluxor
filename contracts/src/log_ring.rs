@@ -76,7 +76,7 @@ impl RingHeader {
 
     /// Parse and CRC-verify a header. Returns `None` on bad magic, wrong
     /// version, short input, or CRC mismatch (a torn header → the reader treats
-    /// the ring as empty and scans from the first record, per §4.3).
+    /// the ring as empty and scans from the first record).
     pub fn decode(bytes: &[u8]) -> Option<RingHeader> {
         if bytes.len() < HEADER_LEN || bytes[0..4] != RING_MAGIC {
             return None;
@@ -270,8 +270,9 @@ impl GapCursor {
 /// a caller-owned byte buffer. The
 /// algorithm lives here — dependency-free, `unsafe`-free, host-tested — so the
 /// intricate wrap and eviction arithmetic is exercised without the kernel's
-/// static `[MAX_OWNERS] × LOG_RING_CAPACITY` storage. The kernel owns only the
-/// buffer bytes and the single-writer discipline; it calls [`RingState::push`]
+/// per-owner rings (one ring and its buffer allocated when an owner is
+/// created and freed with it, in a slot table sized to the owner table).
+/// The kernel owns only the buffer bytes and the single-writer discipline; it calls [`RingState::push`]
 /// (allocation-free) on the hot path and drains via [`RingState::frames`] /
 /// [`RingState::header`] on the platform tick.
 ///
@@ -297,8 +298,8 @@ pub struct RingState {
 impl RingState {
     /// A fresh empty ring of `capacity` bytes. `capacity` should exceed the
     /// largest single framed record; a record larger than `capacity` can never
-    /// be stored and [`push`](Self::push) drops it. `const` so a kernel can back
-    /// a `static [RingState; MAX_OWNERS]` with it.
+    /// be stored and [`push`](Self::push) drops it. `const`, so a ring can
+    /// also live in a static.
     pub const fn new(capacity: usize) -> Self {
         RingState {
             capacity,

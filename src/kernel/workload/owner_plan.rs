@@ -4,10 +4,12 @@
 //!
 //! This is the kernel half of the host composer's wire format
 //! (`tools/src/compose.rs::encode_plan`). The two MUST stay in lockstep: same
-//! magic, version, and fixed-width record layout. Decoding is `no_std` and
-//! allocation-free — assignments land in a fixed array bounded by the owner
-//! table — and fails closed on bad magic/version, length overrun, over-cap
-//! count, or digest mismatch.
+//! magic, version, and fixed-width record layout. Decoding is `no_std` and,
+//! on a static profile, allocation-free — assignments land in a fixed array
+//! bounded by the owner table; a hosted kernel, whose owner domain is
+//! thousands of slots, holds exactly the records the plan carries — and fails
+//! closed on bad magic/version, length overrun, over-cap count, or digest
+//! mismatch.
 //!
 //! `apply` installs each owner at its plan-assigned slot/generation and stamps
 //! the owner onto its module range, so provider enforcement and per-owner
@@ -44,11 +46,60 @@ const LEASE_REC_LEN: usize = 2 + 4 + 1 + 2;
 /// `#[doc(hidden)] pub` for the golden-format tests.
 #[doc(hidden)]
 pub const LEASE_SECTION_MARKER: u32 = 0xFFFF_FFFF;
-/// Decoder ceiling for the lease section (bounded-binary rule). Matches
-/// `tools/src/compose.rs::MAX_PLAN_LEASES`.
+/// Decoder ceiling for the lease section (bounded-binary rule): the format's
+/// own domain, one grant per `(protocol, port)` a node can lease — tcp and
+/// udp, nonzero ports — the same bound as
+/// `tools/src/compose.rs::MAX_PLAN_LEASES`. A hosted kernel holds exactly
+/// the leases a plan carries.
+#[cfg(feature = "host-linux")]
+pub const MAX_PLAN_LEASES: usize = 2 * u16::MAX as usize;
+/// Decoder ceiling for the lease section on a static profile: the fixed
+/// array a decoded plan holds.
+#[cfg(not(feature = "host-linux"))]
 pub const MAX_PLAN_LEASES: usize = 256;
-/// At most one assignment per owner slot.
+/// At most one assignment per owner slot: the owner-slot domain (4096 on a
+/// hosted kernel, the static table elsewhere). The wire count is a `u32` and
+/// the slot a `u16`; a slot past the live owner table is refused when the
+/// plan is validated.
 pub const MAX_PLAN_ASSIGNMENTS: usize = MAX_OWNERS;
+
+/// A plan's records of one kind: the fixed array a static profile holds, or
+/// on a hosted kernel exactly the records decoded. Either indexes and slices
+/// the same way.
+#[cfg(feature = "host-linux")]
+pub type Records<T> = std::vec::Vec<T>;
+/// A plan's records of one kind (see the hosted definition).
+#[cfg(not(feature = "host-linux"))]
+pub type Records<T> = [T; MAX_PLAN_ASSIGNMENTS];
+
+/// Records for `n` entries, each `empty` until written.
+#[cfg(feature = "host-linux")]
+fn records<T: Copy>(empty: T, n: usize) -> Records<T> {
+    std::vec![empty; n]
+}
+/// Records for `n` entries (`n <= MAX_PLAN_ASSIGNMENTS`), each `empty` until
+/// written.
+#[cfg(not(feature = "host-linux"))]
+fn records<T: Copy>(empty: T, _n: usize) -> Records<T> {
+    [empty; MAX_PLAN_ASSIGNMENTS]
+}
+
+/// A plan's lease grants: exactly those decoded on a hosted kernel, the
+/// fixed array elsewhere.
+#[cfg(feature = "host-linux")]
+pub type LeaseRecords = std::vec::Vec<PlanLease>;
+/// A plan's lease grants (see the hosted definition).
+#[cfg(not(feature = "host-linux"))]
+pub type LeaseRecords = [PlanLease; MAX_PLAN_LEASES];
+
+#[cfg(feature = "host-linux")]
+fn lease_records(n: usize) -> LeaseRecords {
+    std::vec![PlanLease::EMPTY; n]
+}
+#[cfg(not(feature = "host-linux"))]
+fn lease_records(_n: usize) -> LeaseRecords {
+    [PlanLease::EMPTY; MAX_PLAN_LEASES]
+}
 
 /// One decoded owner placement.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -114,15 +165,16 @@ impl PlanLease {
     };
 }
 
-/// A decoded, digest-verified plan. Allocation-free.
+/// A decoded, digest-verified plan: allocation-free on a static profile, its
+/// records exactly those decoded on a hosted kernel.
 pub struct DecodedPlan {
     pub generation: u64,
     count: usize,
-    assignments: [PlanAssignment; MAX_PLAN_ASSIGNMENTS],
+    assignments: Records<PlanAssignment>,
     rev_count: usize,
-    revocations: [PlanRevocation; MAX_PLAN_ASSIGNMENTS],
+    revocations: Records<PlanRevocation>,
     lease_count: usize,
-    leases: [PlanLease; MAX_PLAN_LEASES],
+    leases: LeaseRecords,
 }
 
 impl DecodedPlan {
@@ -268,11 +320,11 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedPlan, PlanError> {
             buffer_cap: be_u32(&r[34..38]),
         }
     }
-    let mut assignments = [PlanAssignment::EMPTY; MAX_PLAN_ASSIGNMENTS];
+    let mut assignments = records(PlanAssignment::EMPTY, count);
     for (i, a) in assignments.iter_mut().enumerate().take(count) {
         *a = read_assignment(&body[12 + i * ASSIGN_REC_LEN..12 + (i + 1) * ASSIGN_REC_LEN]);
     }
-    let mut revocations = [PlanRevocation::EMPTY; MAX_PLAN_ASSIGNMENTS];
+    let mut revocations = records(PlanRevocation::EMPTY, rev_count);
     for (i, rev) in revocations.iter_mut().enumerate().take(rev_count) {
         let base = assign_len + 4 + i * REVOKE_REC_LEN;
         let r = &body[base..base + REVOKE_REC_LEN];
@@ -302,12 +354,12 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedPlan, PlanError> {
         let a = record(i);
         // Slot 0 is the system owner (reserved); slot must be a real workload
         // slot within the owner table.
-        if a.slot == 0 || a.slot as usize >= MAX_OWNERS {
+        if a.slot == 0 || a.slot as usize >= crate::kernel::exec::scheduler::owners().slot_count() {
             return Err(PlanError::SlotOutOfRange);
         }
         // The module range must lie within the module table.
         let a_end = a.module_base as usize + a.module_count as usize;
-        if a_end > crate::kernel::exec::scheduler::MAX_MODULES {
+        if a_end > crate::kernel::exec::scheduler::module_slots() {
             return Err(PlanError::ModuleRangeOutOfRange);
         }
         for j in 0..i {
@@ -327,7 +379,7 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedPlan, PlanError> {
             }
         }
     }
-    let mut leases = [PlanLease::EMPTY; MAX_PLAN_LEASES];
+    let mut leases = lease_records(lease_count);
     let lease_base = assign_len
         + if rev_count > 0 {
             4 + rev_count * REVOKE_REC_LEN
@@ -372,16 +424,9 @@ pub fn apply(plan: &DecodedPlan) -> usize {
             table.install(a.slot, a.generation, a.owner_uid, a.state_cap, a.buffer_cap)
         {
             installed += 1;
-            // Reset the owner's log ring iff this is a genuinely new tenant on
-            // the slot; a same-triple reinstall (every routine rebuild) keeps
-            // the ring and its seq counter. The ring module is
-            // host-linux-gated (see kernel/mod.rs).
-            #[cfg(feature = "host-linux")]
-            crate::kernel::workload::owner_log::install_slot(
-                a.slot as usize,
-                a.owner_uid,
-                a.generation,
-            );
+            // `install` reset the owner's log ring iff this is a genuinely
+            // new tenant on the slot; a same-triple reinstall (every routine
+            // rebuild) keeps the ring and its seq counter.
             let base = a.module_base as usize;
             let end = base.saturating_add(a.module_count as usize);
             for idx in base..end {
@@ -389,6 +434,8 @@ pub fn apply(plan: &DecodedPlan) -> usize {
             }
         }
     }
+    // The owners the plan did not bring back are gone, and their rings.
+    table.release_free_rings();
     installed
 }
 
@@ -460,14 +507,17 @@ fn take_staged_plan() -> Option<(*const u8, usize)> {
 /// records for owners that were mid-drain when the previous process died —
 /// they are absent from the assignment section, so nothing re-instantiates
 /// them; the record is the only trace.
-pub fn retained_revocations(out: &mut [PlanRevocation; MAX_PLAN_ASSIGNMENTS]) -> usize {
+pub fn retained_revocations(out: &mut [PlanRevocation]) -> usize {
     let retained = &raw const RETAINED_PLAN;
     // SAFETY: scheduler-thread read.
     match unsafe { &*retained } {
         Some(plan) => {
-            let revs = plan.revocations();
-            out[..revs.len()].copy_from_slice(revs);
-            revs.len()
+            let mut n = 0;
+            for (o, r) in out.iter_mut().zip(plan.revocations()) {
+                *o = *r;
+                n += 1;
+            }
+            n
         }
         None => 0,
     }
@@ -542,7 +592,7 @@ impl DrainArm {
 /// Drains armed by a delta apply. Fixed-size, allocation-free.
 pub struct DrainDelta {
     pub count: usize,
-    pub arms: [DrainArm; MAX_PLAN_ASSIGNMENTS],
+    pub arms: Records<DrainArm>,
 }
 
 /// Attempt to apply the staged plan as a **pure-drain delta** — the one plan
@@ -603,7 +653,7 @@ pub fn try_apply_drain_delta() -> Option<DrainDelta> {
     }
     // …and every retained revocation whose owner is still installed must be
     // carried forward verbatim. The retained revocation is the only DURABLE
-    // trace of the pending drain terminal — restart synthesis (§3.6) reads it
+    // trace of the pending drain terminal — restart synthesis reads it
     // to report a drain forfeited by a process death — so a plan may drop it
     // only once the drain driver has freed the owner.
     {
@@ -645,7 +695,7 @@ pub fn try_apply_drain_delta() -> Option<DrainDelta> {
 fn arm_revocations(plan: &DecodedPlan) -> DrainDelta {
     let mut delta = DrainDelta {
         count: 0,
-        arms: [DrainArm::EMPTY; MAX_PLAN_ASSIGNMENTS],
+        arms: records(DrainArm::EMPTY, plan.revocations().len()),
     };
     let table = crate::kernel::exec::scheduler::owners_mut();
     for rev in plan.revocations() {
@@ -677,7 +727,7 @@ fn arm_revocations(plan: &DecodedPlan) -> DrainDelta {
 pub fn arm_staged_revocation_drains() -> DrainDelta {
     let empty = DrainDelta {
         count: 0,
-        arms: [DrainArm::EMPTY; MAX_PLAN_ASSIGNMENTS],
+        arms: records(DrainArm::EMPTY, 0),
     };
     // SAFETY: scheduler-thread single accessor; scalar read by value.
     let Some((ptr, len)) = (unsafe { STAGED_PLAN }) else {

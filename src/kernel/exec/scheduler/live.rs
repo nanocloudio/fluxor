@@ -32,8 +32,8 @@
 //! bare-metal rp compiles it out at zero cost).
 
 use super::{
-    BuiltInModule, Edge, FanDirection, InstantiateResult, ModuleId, ModuleSlot, SchedulerState,
-    MAX_CHANNELS, MAX_MODULES, SCHED,
+    module_slots, BuiltInModule, Edge, FanDirection, InstantiateResult, ModuleId, ModuleSlot,
+    SchedulerState, MAX_MODULES, SCHED,
 };
 use crate::kernel::boot::config::ModuleEntry;
 use crate::kernel::exec::step_guard::{
@@ -672,7 +672,7 @@ fn begin_staged(
     //    acts with the node's authority: a workload cannot pass on what it
     //    does not hold, nor gain it through an add of its own.
     if let AddAuthority::Creator(idx) = sub.authority {
-        if idx >= MAX_MODULES
+        if idx >= module_slots()
             || !sched()
                 .owners
                 .authority_of(super::module_owner(idx))
@@ -725,12 +725,33 @@ fn begin_staged(
     {
         let s = sched();
         let mut scan = 0usize;
+        // The plan's ceiling: derived + live-add reserve. The tables may hold
+        // more slots than that (a larger graph prepared earlier committed
+        // them); the ceiling, not the committed count, is what admits.
+        let ceiling = crate::kernel::sys::resource_ledger::ceiling(
+            crate::abi::contracts::resource::POOL_MODULE_SLOTS,
+        ) as usize;
         for (local, g) in local_to_global.iter_mut().take(n).enumerate() {
             let slot = loop {
-                if scan >= MAX_MODULES {
+                // Past the live slots: commit the next segment of the
+                // per-module tables, within the plan's ceiling. Past the
+                // ceiling the add is refused, naming the pool.
+                if scan >= ceiling
+                    || (scan >= module_slots() && s.grow_module_tables(scan + 1).is_err())
+                {
                     // No free slot: undo the owner reservation and bail.
                     s.owners.free(handle);
                     let _ = local;
+                    log::warn!(
+                        "[live] add refused: pool 'module_slots' at its ceiling of {} \
+                         (derived + live-add reserve)",
+                        crate::kernel::sys::resource_ledger::ceiling(
+                            crate::abi::contracts::resource::POOL_MODULE_SLOTS
+                        )
+                    );
+                    crate::kernel::sys::resource_ledger::deny(
+                        crate::abi::contracts::resource::POOL_MODULE_SLOTS,
+                    );
                     return Err(AddError::NoFreeSlot);
                 }
                 let candidate = scan;
@@ -757,7 +778,7 @@ fn begin_staged(
             Endpoint::New(l) => local_to_global[..n].get(l as usize).copied(),
             Endpoint::Existing(g) | Endpoint::Tap(g) => {
                 let g = g as usize;
-                if g < MAX_MODULES && !matches!(sched().modules[g], ModuleSlot::Empty) {
+                if g < module_slots() && !matches!(sched().modules[g], ModuleSlot::Empty) {
                     Some(g)
                 } else {
                     None
@@ -769,8 +790,9 @@ fn begin_staged(
             // The node's net provider; the lane is attached once the subgraph
             // has instantiated.
             Endpoint::Net(_) => crate::kernel::workload::net_attach::provider_slot(),
-            Endpoint::Caller(_) => caller()
-                .filter(|&g| g < MAX_MODULES && !matches!(sched().modules[g], ModuleSlot::Empty)),
+            Endpoint::Caller(_) => caller().filter(|&g| {
+                g < module_slots() && !matches!(sched().modules[g], ModuleSlot::Empty)
+            }),
         }
     };
 
@@ -783,8 +805,21 @@ fn begin_staged(
 
     // 3. Append the new edges to `sched.edges[edge_base..]`.
     let edge_base = sched().edge_count;
-    if edge_base + e > MAX_CHANNELS {
+    let edge_ceiling = crate::kernel::sys::resource_ledger::ceiling(
+        crate::abi::contracts::resource::POOL_CHANNELS,
+    ) as usize;
+    if edge_base + e > edge_ceiling
+        || (edge_base + e > sched().edges.len() && sched().grow_edge_tables(edge_base + e).is_err())
+    {
         sched().owners.free(handle);
+        log::warn!(
+            "[live] add refused: pool 'channels' at its ceiling of {} edges \
+             (derived + live-add reserve)",
+            crate::kernel::sys::resource_ledger::ceiling(
+                crate::abi::contracts::resource::POOL_CHANNELS
+            )
+        );
+        crate::kernel::sys::resource_ledger::deny(crate::abi::contracts::resource::POOL_CHANNELS);
         return Err(AddError::TooManyEdges);
     }
     for (i, ae) in sub.edges.iter().enumerate() {
@@ -1637,7 +1672,9 @@ pub fn free_owner(handle: OwnerHandle) -> Result<(), FreeError> {
     let mut owned_count = 0usize;
     #[cfg(feature = "smp")]
     let mut affected: u32 = 0;
-    for (i, slot_owned) in owned.iter_mut().enumerate() {
+    // The live slots only: the scratch is typed by the module-index domain,
+    // the tables hold what the boot plan committed.
+    for (i, slot_owned) in owned.iter_mut().enumerate().take(module_slots()) {
         if matches!(sched().modules[i], ModuleSlot::Empty) {
             continue;
         }
@@ -1691,7 +1728,7 @@ pub fn free_owner(handle: OwnerHandle) -> Result<(), FreeError> {
         let mut w = 0usize;
         for r in 0..s.exec_order_count {
             let idx = s.exec_order[r] as usize;
-            if idx < MAX_MODULES && owned[idx] {
+            if idx < module_slots() && owned[idx] {
                 continue;
             }
             s.exec_order[w] = s.exec_order[r];
@@ -1718,8 +1755,8 @@ pub fn free_owner(handle: OwnerHandle) -> Result<(), FreeError> {
         let mut w = 0usize;
         for r in 0..s.edge_count {
             let edge = s.edges[r];
-            let from_owned = edge.from_module < MAX_MODULES && owned[edge.from_module];
-            let to_owned = edge.to_module < MAX_MODULES && owned[edge.to_module];
+            let from_owned = edge.from_module < module_slots() && owned[edge.from_module];
+            let to_owned = edge.to_module < module_slots() && owned[edge.to_module];
             if edge.tap && edge.tap_source >= 0 && (from_owned || to_owned) {
                 // Either end going stops the mirror.
                 crate::kernel::ipc::channel::channel_set_mirror(edge.tap_source, -1);
@@ -1837,7 +1874,7 @@ pub fn free_owner(handle: OwnerHandle) -> Result<(), FreeError> {
 fn owned_module_mask(handle: OwnerHandle) -> crate::kernel::workload::bitmask::ModuleMask {
     let s = sched();
     let mut mask = crate::kernel::workload::bitmask::ModuleMask::new();
-    for i in 0..MAX_MODULES {
+    for i in 0..module_slots() {
         if !matches!(s.modules[i], ModuleSlot::Empty) && super::module_owner(i) == handle {
             mask.set(i);
         }

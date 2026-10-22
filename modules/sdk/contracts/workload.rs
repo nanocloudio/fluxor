@@ -48,6 +48,12 @@
 // guarantee; the Tier-2 envelope may only refine WITHIN the declared posture.
 // A backend that ignores the entire envelope still yields a correctly-isolated
 // workload at the requested posture.
+//
+// Handle hygiene (normative): a workload starts holding only what it was
+// granted. Nothing the node holds — no open file, socket, listener or other
+// handle of the runtime's — reaches a workload unless the spec grants it; a
+// backend that starts a workload as a host process passes it its granted
+// stdio and nothing else.
 
 /// `CREATE` — admit and instantiate a workload from a spec (below); returns a
 /// tagged `WorkloadHandle` fd, or a negative errno. The caller must hold the
@@ -123,10 +129,16 @@ pub const MAX_CALLER_LANES: usize = 8;
 // `NET_LANE_TAKE` and `NET_LANE_ADMIT`; none of the three creates anything,
 // so they need the workload contract grant but not `platform_raw`.
 
-/// `NET_PROVIDE` — claim the net-provider role for workload lanes. `handle`
-/// = -1, no argument. Returns 0, or `EBUSY` when another provider holds the
-/// role (a node has one network). Claiming it again from the same module is
-/// 0.
+/// `NET_PROVIDE` — claim the net-provider role for workload lanes, stating
+/// how many lanes the provider holds. `handle` = -1, `arg` =
+/// `[lanes:u8]` ([`net_lane::PROVIDE_LEN`] bytes): the provider's lane
+/// capacity, 1..=255 (a lane id is a `u8`). The kernel sizes its lane tables
+/// to it and refuses an attach past it (`ENOSPC`), so every lane it queues is
+/// one the provider has room for. Returns 0, `EINVAL` (no capacity, or 0),
+/// `ENOSPC` (the kernel cannot hold that many), or `EBUSY` when another
+/// provider holds the role (a node has one network). Claiming it again from
+/// the same module is 0; a larger capacity then grows the tables, and a
+/// smaller one keeps them.
 pub const NET_PROVIDE: u32 = 0x1A0E;
 /// `NET_LANE_TAKE` — the next lane change queued for the provider, as one
 /// [`net_lane`] record into `arg` (at least [`net_lane::RECORD_LEN`] bytes).
@@ -144,6 +156,32 @@ pub const NET_LANE_TAKE: u32 = 0x1A0F;
 /// committed plan grants that owner no lease on the port, or for a caller
 /// that is not the provider. The same gate a built-in provider applies.
 pub const NET_LANE_ADMIT: u32 = 0x1A10;
+
+/// `NET_RESOLVER` — the name-service context of a lane's owner, for the
+/// net provider. `arg` is `[owner slot:u16 LE][0:u16][owner generation:u32
+/// LE]` followed by room for the answer; the context the owner's CREATE
+/// carried ([`resolver`]) is written over it from offset 0. Returns its
+/// length, `ENOENT` when the owner carried none (the node's own upstream
+/// serves it), `ERANGE` when `arg` is too short, or `EACCES` for a caller
+/// that is not the provider. Like the lane ops it creates nothing and needs
+/// the workload contract grant but not `platform_raw`.
+pub const NET_RESOLVER: u32 = 0x1A13;
+
+/// The per-owner name-service context: a Tier-2 option on [`CREATE`],
+/// namespace [`resolver::NS`], key [`resolver::KEY`], whose value is
+/// `[family:u8][server:16][n_search:u8]` then `n_search × ([len:u8][name])`
+/// — the server the owner's queries go to (`NET_FAM_IPV4`, the address in
+/// the first four bytes), and the search list a short name is tried under,
+/// in order. A backend that realizes it lists it in [`CAPS`]'s namespace
+/// directory; one that does not answers a required entry `ENOSYS`.
+pub mod resolver {
+    pub const NS: &[u8] = b"net";
+    pub const KEY: &[u8] = b"resolver";
+    /// Bytes before the search list.
+    pub const HEAD: usize = 1 + 16 + 1;
+    /// Longest context value: the server and a search list of names.
+    pub const MAX: usize = 256;
+}
 
 /// The record [`NET_LANE_TAKE`] writes, little-endian:
 /// ```text
@@ -171,16 +209,14 @@ pub mod net_lane {
     pub const OFF_EVENTS: usize = 16;
     /// [`super::NET_LANE_ADMIT`]'s request length.
     pub const ADMIT_LEN: usize = 12;
-    /// Most lanes the provider holds at once; the kernel refuses an attach
-    /// past it (`ENOSPC`), so every lane it queues is one the provider has
-    /// room for.
-    pub const LANES_MAX: usize = 16;
+    /// [`super::NET_PROVIDE`]'s argument length: `[lanes:u8]`.
+    pub const PROVIDE_LEN: usize = 1;
 }
 
 /// `CAPS` (`0x1AFF`) — backend capability discovery. Writes the fixed prefix
 /// `[postures:u8][source_kinds:u8][ops:u16 LE][net:u8]` then a
 /// namespace-directory the caller consults *before* flagging a Tier-2 entry
-/// required (§5.2 rule 3):
+/// required:
 ///   `[ns_count:u16] then ns_count × ([ns_len:u8][ns bytes][key_count:u16] then
 ///    key_count × ([key_len:u8][key bytes]))`.
 /// `postures`/`source_kinds`/`ops`/`net` are bitmaps over the constants below.
@@ -260,7 +296,7 @@ pub const STATE_EXITED: u8 = 1;
 pub const STATE_SIGNALLED: u8 = 2;
 /// Frozen by [`PAUSE`]; live, not terminal. A consumer's status loop must
 /// treat it as live — only EXITED/SIGNALLED latch. After [`RESUME`], the
-/// next WAIT poll reflects RUNNING (§3.3).
+/// next WAIT poll reflects RUNNING.
 pub const STATE_PAUSED: u8 = 3;
 
 // ---- portable signal subset (SIGNAL `signo`) ----
@@ -301,12 +337,12 @@ pub const SIG_KILL: u32 = 2;
 ///                            (0 = unlimited)
 /// ```
 /// Then: `source_ref[source_ref_len]`, `endpoints[endpoint_count]` (each
-/// [`NET_ENDPOINT_SIZE`] bytes), `options[options_len]` (TLV, §5.2).
+/// [`NET_ENDPOINT_SIZE`] bytes), `options[options_len]` (the TLV envelope, [`opt`]).
 ///
 /// The network identity is a Tier-1 *input*: the orchestrator's address
 /// policy (IPAM on Linux, lane addressing on metal) computes it upstream and
-/// the backend realizes it — the field never names a mechanism (no CNI, no
-/// veth, no netns vocabulary). `NET_FAM_NONE` means no identity was assigned;
+/// the backend realizes it — the field names an address, never the host
+/// mechanism that carries it. `NET_FAM_NONE` means no identity was assigned;
 /// combined with every endpoint at [`NET_ISO_SHARED`] the workload shares the
 /// host/system network domain.
 pub const CREATE_HEADER_SIZE: usize = 76;
@@ -342,14 +378,14 @@ pub const NET_ISO_SHARED: u8 = 0;
 /// Endpoint gets its own network domain/identity (metal lane; Linux network domain).
 pub const NET_ISO_OWN: u8 = 1;
 
-/// Tier-2 TLV envelope (§5.2). fluxor validates this shape and routes a whole
+/// Tier-2 TLV envelope. fluxor validates this shape and routes a whole
 /// namespace to the matching backend **without interpreting keys**. Entry:
 /// ```text
 /// [ns_len:u8][ns bytes][key_len:u8][key bytes][flags:u8][val_len:u16 LE][val bytes]
 /// ```
 /// `flags` bit 0 = [`OPT_REQUIRED`]. A *required* entry whose (namespace, key)
 /// the target backend does not advertise via `CAPS` **fails admission**
-/// (`ENOSYS`) — never silently dropped (§5.2 rule 2). Advisory entries a
+/// (`ENOSYS`) — never silently dropped. Advisory entries a
 /// backend does not understand are ignored.
 pub mod opt {
     /// The entry is required: fail `CREATE` if the backend cannot honor it.
@@ -377,7 +413,7 @@ pub mod caps {
     // asserts real-signal delivery semantics. Bits 0..2 are reserved and MUST
     // NOT be allocated: those positions belong to the 0x1B host-process class,
     // whose opcodes this contract also leaves unused.
-    /// SIGNAL is delivered by the backend's real signal mechanism (§3.1),
+    /// SIGNAL is delivered by the backend's real signal mechanism,
     /// not merely recorded as a stop request.
     pub const SIGNAL: u16 = 1 << 3;
     /// Backend implements the [`super::PAUSE`]/[`super::RESUME`] pair. The

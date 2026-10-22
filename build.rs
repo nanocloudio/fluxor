@@ -161,6 +161,7 @@ struct KernelConfig {
     psm_wdsel: String,
     psm_wdsel_mask: String,
     boot2_src: String,
+    kernel_pool_kb: u32,
     state_arena_kb: u32,
     buffer_arena_kb: u32,
     config_buffer_kb: u32,
@@ -317,6 +318,28 @@ fn generate_chip_rs(
     emit_hex_const(&mut g, "BOOT2_SRC", &k.boot2_src);
     g.push('\n');
 
+    // The kernel's one static pool: each graph's plan splits it between the
+    // kernel tables, the buffer arena and the state arena. A pool that cannot
+    // hold the default arenas beside each other plans no graph the composer
+    // admits; one past the static-RAM ceiling could never link inside it.
+    assert!(
+        k.kernel_pool_kb >= k.state_arena_kb + k.buffer_arena_kb,
+        "kernel_pool_kb ({}) cannot hold state_arena_kb + buffer_arena_kb ({})",
+        k.kernel_pool_kb,
+        k.state_arena_kb + k.buffer_arena_kb
+    );
+    assert!(
+        k.kernel_pool_kb < k.ram_static_max_kb,
+        "kernel_pool_kb ({}) leaves the kernel no static RAM under ram_static_max_kb ({})",
+        k.kernel_pool_kb,
+        k.ram_static_max_kb
+    );
+    emit_const(
+        &mut g,
+        "KERNEL_POOL_SIZE",
+        "usize",
+        &format!("{}", k.kernel_pool_kb * 1024),
+    );
     emit_const(
         &mut g,
         "STATE_ARENA_SIZE",
@@ -1254,22 +1277,18 @@ fn emit_bcm2712(out: &Path) {
     // builder and otherwise carries non-capacity metadata.
     let is_pi5 = env::var("CARGO_FEATURE_BOARD_PI5").is_ok();
     let ram_origin = if is_pi5 { "0x80000" } else { "0x40080000" };
-    // The module state arena's own region (see linker/memory-bcm2712.x): the
-    // Pi 5's DRAM above 1 GB, clear of the firmware's top-of-first-GB
-    // reservation; QEMU virt's upper GB.
-    let arena_origin = if is_pi5 { "0x40000000" } else { "0x80000000" };
     File::create(out.join("memory-bcm2712.x"))
         .unwrap()
         .write_all(include_bytes!("linker/memory-bcm2712.x"))
         .unwrap();
     println!("cargo:rustc-link-arg=-T{}/memory-bcm2712.x", out.display());
     println!("cargo:rustc-link-arg=--defsym=RAM_ORIGIN={ram_origin}");
-    println!("cargo:rustc-link-arg=--defsym=ARENA_ORIGIN={arena_origin}");
     // Where the kernel's own RAM (image, .bss, stack) must end — asserted by
     // the linker script. On the Pi 5 the firmware places the DTB and
     // initramfs near 0x2E00_0000, and a boot that writes over them never
-    // comes up; on QEMU virt the arena's region is the bound.
-    let ram_ceiling = if is_pi5 { "0x2E000000" } else { arena_origin };
+    // comes up; on QEMU virt the DRAM zone the tables and the state arena
+    // share starts at 2 GB (`platform/bcm2712/memmap.rs`).
+    let ram_ceiling = if is_pi5 { "0x2E000000" } else { "0x80000000" };
     println!("cargo:rustc-link-arg=--defsym=RAM_CEILING={ram_ceiling}");
     println!("cargo:rerun-if-changed=linker/memory-bcm2712.x");
     println!("cargo:rerun-if-changed=targets/silicon/bcm2712.toml");

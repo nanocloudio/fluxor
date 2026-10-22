@@ -35,7 +35,7 @@ pub fn provision_spare_lane_merge(
     spare_count: usize,
     frame_kind: u8,
 ) -> i32 {
-    if consumer_slot >= MAX_MODULES || spare_count == 0 || spare_count > MAX_PORTS {
+    if consumer_slot >= module_slots() || spare_count == 0 || spare_count > MAX_PORTS {
         return -1;
     }
     // SAFETY: boot / graph-prep context — single mutator, pre-SMP.
@@ -43,17 +43,30 @@ pub fn provision_spare_lane_merge(
     if matches!(sched.modules[consumer_slot], ModuleSlot::Empty) {
         return -1;
     }
-    let mut merge_slot = MAX_MODULES;
-    for (i, slot) in sched.modules.iter().enumerate() {
-        if matches!(slot, ModuleSlot::Empty) {
-            merge_slot = i;
-            break;
+    // The first empty committed slot, else the next one, committed within
+    // the plan's ceiling as a live add commits it: a graph's tables hold
+    // only the slots it uses, so a boot merge usually takes a fresh one.
+    let committed = module_slots();
+    let merge_slot = match sched
+        .modules
+        .iter()
+        .take(committed)
+        .position(|slot| matches!(slot, ModuleSlot::Empty))
+    {
+        Some(i) => i,
+        None => {
+            let ceiling = crate::kernel::sys::resource_ledger::ceiling(MODULE_POOL) as usize;
+            if committed >= ceiling || sched.grow_module_tables(committed + 1).is_err() {
+                crate::kernel::sys::resource_ledger::deny(MODULE_POOL);
+                return -1;
+            }
+            committed
         }
-    }
-    if merge_slot >= MAX_MODULES {
-        return -1;
-    }
-    if sched.edge_count >= MAX_CHANNELS {
+    };
+    if sched.edge_count >= sched.edges.len()
+        && sched.grow_edge_tables(sched.edge_count + 1).is_err()
+    {
+        crate::kernel::sys::resource_ledger::deny(EDGE_POOL);
         return -1;
     }
     // The merge's sole output — the channel the consumer caches and reads — plus
@@ -66,7 +79,7 @@ pub fn provision_spare_lane_merge(
     if out_chan < 0 {
         return -1;
     }
-    let mut lanes = [-1i32; MAX_CHANNELS];
+    let mut lanes = [-1i32; MAX_PORTS];
     for lane in lanes.iter_mut().take(spare_count) {
         let ch = crate::kernel::ipc::channel::channel_open(
             crate::kernel::ipc::channel::CHANNEL_TYPE_PIPE,
@@ -105,7 +118,7 @@ pub fn provision_spare_lane_merge(
     // Splice the merge into the execution order (append; workload producers
     // attach at the tail later). Boot / pre-SMP, so no quiesce.
     let pos = sched.exec_order_count;
-    if pos < MAX_MODULES {
+    if pos < module_slots() {
         sched.exec_order[pos] = merge_slot as ModuleId;
         sched.exec_order_count = pos + 1;
         sched.active_module_count += 1;
@@ -155,7 +168,7 @@ pub fn find_spare_lane_merge_for_channel(merge_out: i32) -> i32 {
 /// producer is wired to write into this channel id. Returns `-1` if the slot is
 /// not a merge or every lane is taken.
 pub fn merge_next_free_lane(merge_slot: usize) -> i32 {
-    if merge_slot >= MAX_MODULES {
+    if merge_slot >= module_slots() {
         return -1;
     }
     // SAFETY: scheduler-thread read.
@@ -191,7 +204,7 @@ pub fn merge_owning_lane(ch: i32) -> Option<usize> {
 /// Whether `handle` is one of `module_idx`'s channel ports — in, out or
 /// control. The gateway's authority check for a gated module's channel ops.
 pub fn module_owns_channel(module_idx: usize, handle: i32) -> bool {
-    if module_idx >= MAX_MODULES || handle < 0 {
+    if module_idx >= module_slots() || handle < 0 {
         return false;
     }
     // SAFETY: SCHED scheduler-thread owned; ports are written at graph setup
@@ -205,7 +218,7 @@ pub fn module_owns_channel(module_idx: usize, handle: i32) -> bool {
 /// Read a port channel handle for a module. Mirror of `set_module_port`.
 /// Returns -1 if unset or out of range.
 pub fn get_module_port(module_idx: usize, port_type: u8, port_index: u8) -> i32 {
-    if module_idx >= MAX_MODULES {
+    if module_idx >= module_slots() {
         return -1;
     }
     // SAFETY: SCHED scheduler-thread owned; module_idx bounded above.
@@ -249,7 +262,7 @@ pub fn module_port(module_idx: usize, port: (u8, u8)) -> i32 {
 /// which doesn't go through the RP-side instantiate_one_module path.
 /// port_type: 0=in, 1=out, 2=ctrl
 pub fn set_module_port(module_idx: usize, port_type: u8, port_index: u8, channel: i32) {
-    if module_idx >= MAX_MODULES {
+    if module_idx >= module_slots() {
         return;
     }
     // SAFETY: SCHED scheduler-thread owned; module_idx bounded above.
@@ -300,84 +313,87 @@ impl ArenaInfo {
     }
 }
 
-/// All scheduler runtime state in a single struct.
-///
-/// Replaces 14 scattered `static mut` arrays. A single `reset()` method
-/// replaces the multi-line reset block in `prepare_graph()`.
+/// The pool the per-module tables are sized from.
+const MODULE_POOL: u16 = crate::abi::contracts::resource::POOL_MODULE_SLOTS;
+/// The pool the per-edge tables are sized from.
+const EDGE_POOL: u16 = crate::abi::contracts::resource::POOL_CHANNELS;
+
+/// All scheduler runtime state in a single struct, returned to its
+/// graph-less state by one `reset()`.
 pub struct SchedulerState {
     /// Graph edge wiring
-    pub edges: [Edge; MAX_CHANNELS],
+    pub edges: EdgeTable<Edge>,
     /// Flow-stall sampler state: last sampled ring fill +
     /// consecutive-unchanged count per classed edge.
-    pub(crate) flow_last_fill: [u32; MAX_CHANNELS],
-    pub(crate) flow_stalls: [u8; MAX_CHANNELS],
+    pub(crate) flow_last_fill: EdgeTable<u32>,
+    pub(crate) flow_stalls: EdgeTable<u8>,
     /// Number of populated entries in `edges` (post fan insertion).
     pub edge_count: usize,
     /// Instantiated module slots
-    pub modules: [ModuleSlot; MAX_MODULES],
+    pub modules: ModTable<ModuleSlot>,
     /// Per-module port assignments
-    pub ports: [ModulePorts; MAX_MODULES],
+    pub ports: ModTable<ModulePorts>,
     /// Per-module declared port capacities (buffer size requests)
-    pub(crate) port_caps: [PortCapacities; MAX_MODULES],
+    pub(crate) port_caps: ModTable<PortCapacities>,
     /// Per-module finished flags (done or errored)
-    pub(crate) finished: [bool; MAX_MODULES],
+    pub(crate) finished: ModTable<bool>,
     /// Per-module arena allocations
-    pub(crate) arenas: [ArenaInfo; MAX_MODULES],
+    pub(crate) arenas: ModTable<ArenaInfo>,
     /// Per-module capability class (checked on provider dispatch)
-    pub(crate) cap_class: [u8; MAX_MODULES],
+    pub(crate) cap_class: ModTable<u8>,
     /// Per-module type: the config entry's `name_hash`, the FNV-1a of the
     /// module's type name. Stable across boots and graph edits, so it names
     /// what a module is where the slot index names only where it sits.
-    pub(crate) type_hash: [u32; MAX_MODULES],
+    pub(crate) type_hash: ModTable<u32>,
     /// Per-module required_caps bitmask from manifest — public contract bits only
-    pub(crate) required_caps: [u64; MAX_MODULES],
+    pub(crate) required_caps: ModTable<u64>,
     /// Per-module fine-grained permissions bitmap (from manifest binary
     /// byte 15). Gates privileged 0x0Cxx opcodes by category — see the
     /// `permission` module in `syscalls.rs`. Separate from `required_caps`
     /// so non-contract permissions don't overload the contract bitmask.
-    pub(crate) permissions: [u16; MAX_MODULES],
+    pub(crate) permissions: ModTable<u16>,
     /// Per-module instance-params blob pointer + length. Populated
     /// by platform loaders that have access to the source bytes —
     /// the wasm loader uses this so modules can fetch their own
     /// params via the `MODULE_INSTANCE_PARAMS` provider_query opcode
     /// across the kernel/module memory split. Native PIC loaders pass
     /// params directly to `module_new` and leave these null.
-    pub(crate) module_params_ptr: [*const u8; MAX_MODULES],
-    pub(crate) module_params_len: [usize; MAX_MODULES],
+    pub(crate) module_params_ptr: ModTable<*const u8>,
+    pub(crate) module_params_len: ModTable<usize>,
     /// Per-module mailbox_safe flag (header flags bit 0): can consume from mailbox
-    pub(crate) mailbox_safe: [bool; MAX_MODULES],
+    pub(crate) mailbox_safe: ModTable<bool>,
     /// Per-module in_place_writer flag (header flags bit 1): uses acquire_inplace
-    pub(crate) in_place_writer: [bool; MAX_MODULES],
+    pub(crate) in_place_writer: ModTable<bool>,
     /// Per-module deferred ready flag (header flags bit 2)
-    pub(crate) deferred_ready: [bool; MAX_MODULES],
+    pub(crate) deferred_ready: ModTable<bool>,
     /// Per-module gated flag (tag 0xF5 >= contained). Gates whether the
     /// module is routed through the protected entry; `none`/`guarded`
     /// modules keep the direct privileged path.
-    pub(crate) isolated: [bool; MAX_MODULES],
+    pub(crate) isolated: ModTable<bool>,
     /// Per-module protection level as tag 0xF5 carries it.
-    pub(crate) protection: [u8; MAX_MODULES],
+    pub(crate) protection: ModTable<u8>,
     /// Per-module device window (base, size) from tag 0xFD; size 0 = none.
-    pub(crate) device_window: [(u64, u32); MAX_MODULES],
+    pub(crate) device_window: ModTable<(u64, u32)>,
     /// Per-module ready flag (true = outputs meaningful, false = still initializing)
-    pub(crate) ready: [bool; MAX_MODULES],
+    pub(crate) ready: ModTable<bool>,
     /// Per-module upstream dependency bitmask (precomputed from edges).
     /// FORWARD edges only — used for the readiness gate, where counting a
     /// cycle back-edge would deadlock the feedback pair.
-    pub(crate) upstream_mask: [ModuleMask; MAX_MODULES],
+    pub(crate) upstream_mask: ModTable<ModuleMask>,
     /// Per-module predecessor bitmask over ALL edges — forward AND cycle
     /// back-edges. Used ONLY for sink-completion (`cli_out`): a sink must not
     /// declare itself done while a producer that can still feed it — including
     /// one reached through a feedback cycle — is alive. Separate from
     /// `upstream_mask` because the readiness gate needs the forward-only set.
-    pub(crate) completion_mask: [ModuleMask; MAX_MODULES],
+    pub(crate) completion_mask: ModTable<ModuleMask>,
     /// Per-module step period in scheduler ticks (0 = every tick, N =
     /// step every N ticks). Wall-clock period is
     /// `step_period * domain_tick_us` — units are ticks, NOT
     /// milliseconds. Sourced from the module header's
     /// `step_period_ticks` byte.
-    pub(crate) step_period: [u8; MAX_MODULES],
+    pub(crate) step_period: ModTable<u8>,
     /// Per-module step counter (counts ticks toward period)
-    pub(crate) step_counter: [u8; MAX_MODULES],
+    pub(crate) step_counter: ModTable<u8>,
     /// Per-module ABSOLUTE next-due wall-clock (µs) for the multi-graph
     /// runner's graph-local periodic schedule. A module with `step_period > 1`
     /// in a resident workload graph fires when `now >= module_next_due_us[i]`,
@@ -389,7 +405,7 @@ pub struct SchedulerState {
         not(feature = "multitenant"),
         allow(dead_code, reason = "read only by the multi-graph runner")
     )]
-    pub(crate) module_next_due_us: [u64; MAX_MODULES],
+    pub(crate) module_next_due_us: ModTable<u64>,
     /// Per-module idle-safe attestation: the module owner asserts it is
     /// demand-driven (woken by events / its own periodic schedule) and may be
     /// idle-skipped. DEFAULT false = fail-closed: an unattested workload graph is
@@ -399,7 +415,7 @@ pub struct SchedulerState {
         not(feature = "multitenant"),
         allow(dead_code, reason = "read only by the multi-graph runner")
     )]
-    pub(crate) module_idle_safe: [bool; MAX_MODULES],
+    pub(crate) module_idle_safe: ModTable<bool>,
     /// Per-module count of consecutive ticks the module was considered
     /// by the scheduler but never reached `m.step()` — readiness gate
     /// vetoed every time. Reset to 0 on any actual step (Continue,
@@ -407,7 +423,7 @@ pub struct SchedulerState {
     /// here on a long-running module has either a dead edge or a
     /// permanently-unsatisfied upstream dependency. Surfaced via
     /// `ModuleStateSnapshot::inactive_for_ticks`.
-    pub(crate) inactive_for_ticks: [u32; MAX_MODULES],
+    pub(crate) inactive_for_ticks: ModTable<u32>,
     /// Per-slot generation counter. Bumped on every event that
     /// invalidates an outstanding reference into the slot's state
     /// region — graph reset, module replacement (`store_builtin_module`,
@@ -418,7 +434,7 @@ pub struct SchedulerState {
     /// discarded. Closes the use-after-free window between a fault
     /// telemetry dispatch and the read of the (possibly-replaced)
     /// module state.
-    pub(crate) slot_generation: [u32; MAX_MODULES],
+    pub(crate) slot_generation: ModTable<u32>,
     /// Wall-clock time (ms, `hal::now_millis()`) at which the current
     /// `Draining` phase started. Captured by
     /// `set_reconfigure_phase(Draining)`; consulted by `step_modules`
@@ -442,7 +458,7 @@ pub struct SchedulerState {
     /// domain's exec_order.
     pub(crate) domain_exec_order_offset: [ModuleId; MAX_DOMAINS],
     /// Topological execution order (Kahn's algorithm output)
-    pub(crate) exec_order: [ModuleId; MAX_MODULES],
+    pub(crate) exec_order: ModTable<ModuleId>,
     /// Number of entries in exec_order
     pub(crate) exec_order_count: usize,
     /// Graph-level sample rate from config (0 = not set)
@@ -450,20 +466,20 @@ pub struct SchedulerState {
     /// Tick period in microseconds (0 = default 1000us)
     pub(crate) tick_us: u32,
     /// Per-module self-reported latency in frames
-    pub(crate) module_latency: [u32; MAX_MODULES],
+    pub(crate) module_latency: ModTable<u32>,
     /// Per-module accumulated downstream latency in frames
-    pub(crate) downstream_latency: [u32; MAX_MODULES],
+    pub(crate) downstream_latency: ModTable<u32>,
     /// Per-module fault bookkeeping (state, policy, counters)
-    pub(crate) fault_info: [ModuleFaultInfo; MAX_MODULES],
+    pub(crate) fault_info: ModTable<ModuleFaultInfo>,
     /// Per-module domain assignment (0 = default domain)
-    pub(crate) domain_id: [u8; MAX_MODULES],
+    pub(crate) domain_id: ModTable<u8>,
     /// Per-module Tier 1c opt-in. Mirrors
     /// `ModuleEntry::pre_tick_drain` so `compute_domain_exec_orders_static`
     /// can partition pre-tick modules into `domain_pre_tick_order`
     /// without re-reading the config blob.
-    pub(crate) pre_tick_drain: [bool; MAX_MODULES],
+    pub(crate) pre_tick_drain: ModTable<bool>,
     /// Per-domain topological execution order
-    pub(crate) domain_exec_order: [[ModuleId; MAX_MODULES]; MAX_DOMAINS],
+    pub(crate) domain_exec_order: [ModTable<ModuleId>; MAX_DOMAINS],
     /// Number of modules in each domain's execution order
     pub(crate) domain_module_count: [ModuleId; MAX_DOMAINS],
     /// Number of domains configured (0 or 1 = single default domain)
@@ -510,8 +526,8 @@ pub struct SchedulerState {
     /// Wall-clock each module consumed in the current pass, and how many
     /// times it was stepped, so a budget overrun can name what actually
     /// spent the budget rather than whichever module finished last.
-    pub(crate) pass_module_us: [u32; MAX_MODULES],
-    pub(crate) pass_module_steps: [u16; MAX_MODULES],
+    pub(crate) pass_module_us: ModTable<u32>,
+    pub(crate) pass_module_steps: ModTable<u16>,
     /// Cumulative count of times the domain's pass was cut short
     /// because `consumed > limit`. Surfaced via `monitor` so operators
     /// see chronically over-subscribed domains without needing to
@@ -578,17 +594,17 @@ pub struct SchedulerState {
 
     // ── Per-module export table info (for resolve_export_for_module) ──
     /// Code base address per module (for resolving export offsets)
-    pub(crate) module_code_base: [usize; MAX_MODULES],
+    pub(crate) module_code_base: ModTable<usize>,
     /// Code size per module (for provider pointer validation)
-    pub(crate) module_code_size: [u32; MAX_MODULES],
+    pub(crate) module_code_size: ModTable<u32>,
     /// Export table pointer per module
-    pub(crate) module_export_table: [*const u8; MAX_MODULES],
+    pub(crate) module_export_table: ModTable<*const u8>,
     /// Export count per module
-    pub(crate) module_export_count: [u16; MAX_MODULES],
+    pub(crate) module_export_count: ModTable<u16>,
 
     // ── Step timing histogram (8 log2 buckets) ─────────────────────
     /// Per-module bucket counts: <64us, <128, <256, <512, <1024, <2048, <4096, >=4096
-    pub(crate) step_hist: [[u32; 8]; MAX_MODULES],
+    pub(crate) step_hist: ModTable<[u32; 8]>,
     /// Global bucket counts across all modules.
     pub(crate) step_hist_global: [u32; 8],
     /// Workload owner table. Slot 0 is the system owner. Size-1 (system
@@ -598,55 +614,56 @@ pub struct SchedulerState {
     /// Per-module owner handle. Present only on multi-tenant builds — bare
     /// metal carries no per-module ownership state.
     #[cfg(feature = "multitenant")]
-    pub(crate) module_owner: [OwnerHandle; MAX_MODULES],
+    pub(crate) module_owner: ModTable<OwnerHandle>,
 }
 
 impl SchedulerState {
     const fn new() -> Self {
         Self {
-            edges: [Edge::simple(0, 0); MAX_CHANNELS],
+            edges: crate::boot_table!(MAX_CHANNELS, Edge::simple(0, 0), EDGE_POOL),
             edge_count: 0,
-            flow_last_fill: [0; MAX_CHANNELS],
-            flow_stalls: [0; MAX_CHANNELS],
-            modules: [const { ModuleSlot::Empty }; MAX_MODULES],
-            ports: [ModulePorts::empty(); MAX_MODULES],
-            port_caps: [PortCapacities::NONE; MAX_MODULES],
-            finished: [false; MAX_MODULES],
-            arenas: [const { ArenaInfo::empty() }; MAX_MODULES],
-            cap_class: [0; MAX_MODULES],
-            type_hash: [0; MAX_MODULES],
-            required_caps: [0; MAX_MODULES],
-            permissions: [0; MAX_MODULES],
-            module_params_ptr: [core::ptr::null(); MAX_MODULES],
-            module_params_len: [0; MAX_MODULES],
-            mailbox_safe: [false; MAX_MODULES],
-            in_place_writer: [false; MAX_MODULES],
-            deferred_ready: [false; MAX_MODULES],
-            isolated: [false; MAX_MODULES],
-            protection: [0; MAX_MODULES],
-            device_window: [(0, 0); MAX_MODULES],
-            ready: [true; MAX_MODULES],
-            upstream_mask: [ModuleMask::EMPTY; MAX_MODULES],
-            completion_mask: [ModuleMask::EMPTY; MAX_MODULES],
-            step_period: [0; MAX_MODULES],
-            step_counter: [0; MAX_MODULES],
-            module_next_due_us: [0; MAX_MODULES],
-            module_idle_safe: [false; MAX_MODULES],
-            inactive_for_ticks: [0; MAX_MODULES],
-            slot_generation: [0; MAX_MODULES],
+            flow_last_fill: crate::boot_table!(MAX_CHANNELS, 0, EDGE_POOL),
+            flow_stalls: crate::boot_table!(MAX_CHANNELS, 0, EDGE_POOL),
+            modules: crate::boot_table!(MAX_MODULES, ModuleSlot::Empty, MODULE_POOL),
+            ports: crate::boot_table!(MAX_MODULES, ModulePorts::empty(), MODULE_POOL),
+            port_caps: crate::boot_table!(MAX_MODULES, PortCapacities::NONE, MODULE_POOL),
+            finished: crate::boot_table!(MAX_MODULES, false, MODULE_POOL),
+            arenas: crate::boot_table!(MAX_MODULES, ArenaInfo::empty(), MODULE_POOL),
+            cap_class: crate::boot_table!(MAX_MODULES, 0, MODULE_POOL),
+            type_hash: crate::boot_table!(MAX_MODULES, 0, MODULE_POOL),
+            required_caps: crate::boot_table!(MAX_MODULES, 0, MODULE_POOL),
+            permissions: crate::boot_table!(MAX_MODULES, 0, MODULE_POOL),
+            module_params_ptr: crate::boot_table!(MAX_MODULES, core::ptr::null(), MODULE_POOL),
+            module_params_len: crate::boot_table!(MAX_MODULES, 0, MODULE_POOL),
+            mailbox_safe: crate::boot_table!(MAX_MODULES, false, MODULE_POOL),
+            in_place_writer: crate::boot_table!(MAX_MODULES, false, MODULE_POOL),
+            deferred_ready: crate::boot_table!(MAX_MODULES, false, MODULE_POOL),
+            isolated: crate::boot_table!(MAX_MODULES, false, MODULE_POOL),
+            protection: crate::boot_table!(MAX_MODULES, 0, MODULE_POOL),
+            device_window: crate::boot_table!(MAX_MODULES, (0, 0), MODULE_POOL),
+            ready: crate::boot_table!(MAX_MODULES, true, MODULE_POOL),
+            upstream_mask: crate::boot_table!(MAX_MODULES, ModuleMask::EMPTY, MODULE_POOL),
+            completion_mask: crate::boot_table!(MAX_MODULES, ModuleMask::EMPTY, MODULE_POOL),
+            step_period: crate::boot_table!(MAX_MODULES, 0, MODULE_POOL),
+            step_counter: crate::boot_table!(MAX_MODULES, 0, MODULE_POOL),
+            module_next_due_us: crate::boot_table!(MAX_MODULES, 0, MODULE_POOL),
+            module_idle_safe: crate::boot_table!(MAX_MODULES, false, MODULE_POOL),
+            inactive_for_ticks: crate::boot_table!(MAX_MODULES, 0, MODULE_POOL),
+            slot_generation: crate::boot_table!(MAX_MODULES, 0, MODULE_POOL),
             drain_started_ms: u64::MAX,
             exec_order_offset: 0,
             domain_exec_order_offset: [0; MAX_DOMAINS],
-            exec_order: [0; MAX_MODULES],
+            exec_order: crate::boot_table!(MAX_MODULES, 0, MODULE_POOL),
             exec_order_count: 0,
             graph_sample_rate: 0,
             tick_us: 0,
-            module_latency: [0; MAX_MODULES],
-            downstream_latency: [0; MAX_MODULES],
-            fault_info: [ModuleFaultInfo::new(); MAX_MODULES],
-            domain_id: [0; MAX_MODULES],
-            pre_tick_drain: [false; MAX_MODULES],
-            domain_exec_order: [[0; MAX_MODULES]; MAX_DOMAINS],
+            module_latency: crate::boot_table!(MAX_MODULES, 0, MODULE_POOL),
+            downstream_latency: crate::boot_table!(MAX_MODULES, 0, MODULE_POOL),
+            fault_info: crate::boot_table!(MAX_MODULES, ModuleFaultInfo::new(), MODULE_POOL),
+            domain_id: crate::boot_table!(MAX_MODULES, 0, MODULE_POOL),
+            pre_tick_drain: crate::boot_table!(MAX_MODULES, false, MODULE_POOL),
+            domain_exec_order: [const { crate::boot_table!(MAX_MODULES, 0, MODULE_POOL) };
+                MAX_DOMAINS],
             domain_module_count: [0; MAX_DOMAINS],
             domain_count: 0,
             domain_tick_us: [0; MAX_DOMAINS],
@@ -656,8 +673,8 @@ impl SchedulerState {
             domain_tick_max_us: [0; MAX_DOMAINS],
             domain_budget_us_limit: [0; MAX_DOMAINS],
             domain_budget_us_consumed: [0; MAX_DOMAINS],
-            pass_module_us: [0; MAX_MODULES],
-            pass_module_steps: [0; MAX_MODULES],
+            pass_module_us: crate::boot_table!(MAX_MODULES, 0, MODULE_POOL),
+            pass_module_steps: crate::boot_table!(MAX_MODULES, 0, MODULE_POOL),
             domain_budget_overruns: [0; MAX_DOMAINS],
             domain_worst_step_us: [0; MAX_DOMAINS],
             domain_module_mask: [ModuleMask::EMPTY; MAX_DOMAINS],
@@ -668,26 +685,226 @@ impl SchedulerState {
             active_module_count: 0,
             rebuild_request: None,
             prepare_in_progress: false,
-            module_code_base: [0; MAX_MODULES],
-            module_code_size: [0; MAX_MODULES],
-            module_export_table: [core::ptr::null(); MAX_MODULES],
-            module_export_count: [0; MAX_MODULES],
-            step_hist: [[0; 8]; MAX_MODULES],
+            module_code_base: crate::boot_table!(MAX_MODULES, 0, MODULE_POOL),
+            module_code_size: crate::boot_table!(MAX_MODULES, 0, MODULE_POOL),
+            module_export_table: crate::boot_table!(MAX_MODULES, core::ptr::null(), MODULE_POOL),
+            module_export_count: crate::boot_table!(MAX_MODULES, 0, MODULE_POOL),
+            step_hist: crate::boot_table!(MAX_MODULES, [0; 8], MODULE_POOL),
             step_hist_global: [0; 8],
-            owners: OwnerTable::new(),
+            owners: OwnerTable::kernel(),
             #[cfg(feature = "multitenant")]
-            module_owner: [OWNER_SYSTEM; MAX_MODULES],
+            module_owner: crate::boot_table!(MAX_MODULES, OWNER_SYSTEM, MODULE_POOL),
         }
+    }
+
+    /// Reserve the per-module tables for `ceiling` slots and commit `live`
+    /// of them. Graph-preparation context: no reference into a table is held.
+    ///
+    /// # Safety
+    /// No reference into any per-module table may be live (`Table::reserve`).
+    pub(crate) unsafe fn size_module_tables(
+        &mut self,
+        ceiling: usize,
+        live: usize,
+    ) -> Result<(), crate::kernel::mem::table::TableError> {
+        self.modules.reserve(ceiling)?;
+        self.ports.reserve(ceiling)?;
+        self.port_caps.reserve(ceiling)?;
+        self.finished.reserve(ceiling)?;
+        self.arenas.reserve(ceiling)?;
+        self.cap_class.reserve(ceiling)?;
+        self.type_hash.reserve(ceiling)?;
+        self.required_caps.reserve(ceiling)?;
+        self.permissions.reserve(ceiling)?;
+        self.module_params_ptr.reserve(ceiling)?;
+        self.module_params_len.reserve(ceiling)?;
+        self.mailbox_safe.reserve(ceiling)?;
+        self.in_place_writer.reserve(ceiling)?;
+        self.deferred_ready.reserve(ceiling)?;
+        self.isolated.reserve(ceiling)?;
+        self.protection.reserve(ceiling)?;
+        self.device_window.reserve(ceiling)?;
+        self.ready.reserve(ceiling)?;
+        self.upstream_mask.reserve(ceiling)?;
+        self.completion_mask.reserve(ceiling)?;
+        self.step_period.reserve(ceiling)?;
+        self.step_counter.reserve(ceiling)?;
+        self.module_next_due_us.reserve(ceiling)?;
+        self.module_idle_safe.reserve(ceiling)?;
+        self.inactive_for_ticks.reserve(ceiling)?;
+        self.slot_generation.reserve(ceiling)?;
+        self.exec_order.reserve(ceiling)?;
+        self.module_latency.reserve(ceiling)?;
+        self.downstream_latency.reserve(ceiling)?;
+        self.fault_info.reserve(ceiling)?;
+        self.domain_id.reserve(ceiling)?;
+        self.pre_tick_drain.reserve(ceiling)?;
+        self.pass_module_us.reserve(ceiling)?;
+        self.pass_module_steps.reserve(ceiling)?;
+        self.module_code_base.reserve(ceiling)?;
+        self.module_code_size.reserve(ceiling)?;
+        self.module_export_table.reserve(ceiling)?;
+        self.module_export_count.reserve(ceiling)?;
+        self.step_hist.reserve(ceiling)?;
+        #[cfg(feature = "multitenant")]
+        self.module_owner.reserve(ceiling)?;
+        for t in self.domain_exec_order.iter() {
+            t.reserve(ceiling)?;
+        }
+        // Every per-module table is indexed by the same slot, so all of them
+        // commit the same count: what the graph needs, or what any of them
+        // already holds, whichever is more.
+        let live = live.max(self.module_tables_committed());
+        self.grow_module_tables(live)
+    }
+
+    /// The most slots any per-module table holds committed. A table touched
+    /// before its plan sized it keeps the slots its first use committed, so
+    /// the tables of one graph can arrive at sizing with different counts.
+    fn module_tables_committed(&self) -> usize {
+        let mut m = 0usize;
+        m = m.max(self.modules.len());
+        m = m.max(self.ports.len());
+        m = m.max(self.port_caps.len());
+        m = m.max(self.finished.len());
+        m = m.max(self.arenas.len());
+        m = m.max(self.cap_class.len());
+        m = m.max(self.type_hash.len());
+        m = m.max(self.required_caps.len());
+        m = m.max(self.permissions.len());
+        m = m.max(self.module_params_ptr.len());
+        m = m.max(self.module_params_len.len());
+        m = m.max(self.mailbox_safe.len());
+        m = m.max(self.in_place_writer.len());
+        m = m.max(self.deferred_ready.len());
+        m = m.max(self.isolated.len());
+        m = m.max(self.protection.len());
+        m = m.max(self.device_window.len());
+        m = m.max(self.ready.len());
+        m = m.max(self.upstream_mask.len());
+        m = m.max(self.completion_mask.len());
+        m = m.max(self.step_period.len());
+        m = m.max(self.step_counter.len());
+        m = m.max(self.module_next_due_us.len());
+        m = m.max(self.module_idle_safe.len());
+        m = m.max(self.inactive_for_ticks.len());
+        m = m.max(self.slot_generation.len());
+        m = m.max(self.exec_order.len());
+        m = m.max(self.module_latency.len());
+        m = m.max(self.downstream_latency.len());
+        m = m.max(self.fault_info.len());
+        m = m.max(self.domain_id.len());
+        m = m.max(self.pre_tick_drain.len());
+        m = m.max(self.pass_module_us.len());
+        m = m.max(self.pass_module_steps.len());
+        m = m.max(self.module_code_base.len());
+        m = m.max(self.module_code_size.len());
+        m = m.max(self.module_export_table.len());
+        m = m.max(self.module_export_count.len());
+        m = m.max(self.step_hist.len());
+        #[cfg(feature = "multitenant")]
+        {
+            m = m.max(self.module_owner.len());
+        }
+        for t in self.domain_exec_order.iter() {
+            m = m.max(t.len());
+        }
+        m
+    }
+
+    /// Commit per-module slots until `n` are live, within the reserved
+    /// ceiling: a segment at a time, at boot and when a live add needs a slot.
+    pub(crate) fn grow_module_tables(
+        &mut self,
+        n: usize,
+    ) -> Result<(), crate::kernel::mem::table::TableError> {
+        self.modules.grow(n)?;
+        self.ports.grow(n)?;
+        self.port_caps.grow(n)?;
+        self.finished.grow(n)?;
+        self.arenas.grow(n)?;
+        self.cap_class.grow(n)?;
+        self.type_hash.grow(n)?;
+        self.required_caps.grow(n)?;
+        self.permissions.grow(n)?;
+        self.module_params_ptr.grow(n)?;
+        self.module_params_len.grow(n)?;
+        self.mailbox_safe.grow(n)?;
+        self.in_place_writer.grow(n)?;
+        self.deferred_ready.grow(n)?;
+        self.isolated.grow(n)?;
+        self.protection.grow(n)?;
+        self.device_window.grow(n)?;
+        self.ready.grow(n)?;
+        self.upstream_mask.grow(n)?;
+        self.completion_mask.grow(n)?;
+        self.step_period.grow(n)?;
+        self.step_counter.grow(n)?;
+        self.module_next_due_us.grow(n)?;
+        self.module_idle_safe.grow(n)?;
+        self.inactive_for_ticks.grow(n)?;
+        self.slot_generation.grow(n)?;
+        self.exec_order.grow(n)?;
+        self.module_latency.grow(n)?;
+        self.downstream_latency.grow(n)?;
+        self.fault_info.grow(n)?;
+        self.domain_id.grow(n)?;
+        self.pre_tick_drain.grow(n)?;
+        self.pass_module_us.grow(n)?;
+        self.pass_module_steps.grow(n)?;
+        self.module_code_base.grow(n)?;
+        self.module_code_size.grow(n)?;
+        self.module_export_table.grow(n)?;
+        self.module_export_count.grow(n)?;
+        self.step_hist.grow(n)?;
+        #[cfg(feature = "multitenant")]
+        self.module_owner.grow(n)?;
+        for t in self.domain_exec_order.iter() {
+            t.grow(n)?;
+        }
+        Ok(())
+    }
+
+    /// Reserve the per-edge tables for `ceiling` edges and commit `live`.
+    ///
+    /// # Safety
+    /// As [`size_module_tables`](Self::size_module_tables).
+    pub(crate) unsafe fn size_edge_tables(
+        &mut self,
+        ceiling: usize,
+        live: usize,
+    ) -> Result<(), crate::kernel::mem::table::TableError> {
+        self.edges.reserve(ceiling)?;
+        self.flow_last_fill.reserve(ceiling)?;
+        self.flow_stalls.reserve(ceiling)?;
+        // The per-edge tables share an index, so they commit one count, as
+        // the per-module tables do.
+        let live = live
+            .max(self.edges.len())
+            .max(self.flow_last_fill.len())
+            .max(self.flow_stalls.len());
+        self.grow_edge_tables(live)
+    }
+
+    /// Commit per-edge slots until `n` are live.
+    pub(crate) fn grow_edge_tables(
+        &mut self,
+        n: usize,
+    ) -> Result<(), crate::kernel::mem::table::TableError> {
+        self.edges.grow(n)?;
+        self.flow_last_fill.grow(n)?;
+        self.flow_stalls.grow(n)?;
+        Ok(())
     }
 
     /// Reset all runtime state for a new graph setup.
     /// Does NOT reset state arena or name arena (separate concerns).
     pub(crate) fn reset(&mut self) {
-        for i in 0..MAX_CHANNELS {
+        for i in 0..self.edges.len() {
             self.edges[i] = Edge::simple(0, 0);
         }
         self.edge_count = 0;
-        for i in 0..MAX_MODULES {
+        for i in 0..self.modules.len() {
             self.modules[i] = ModuleSlot::Empty;
             self.ports[i] = ModulePorts::empty();
             self.port_caps[i] = PortCapacities::NONE;
@@ -746,8 +963,8 @@ impl SchedulerState {
             self.domain_tick_max_us[d] = 0;
             self.domain_budget_us_limit[d] = 0;
             self.domain_budget_us_consumed[d] = 0;
-            self.pass_module_us = [0; MAX_MODULES];
-            self.pass_module_steps = [0; MAX_MODULES];
+            self.pass_module_us.fill(0);
+            self.pass_module_steps.fill(0);
             self.domain_budget_overruns[d] = 0;
             self.domain_worst_step_us[d] = 0;
             self.domain_module_mask[d] = ModuleMask::EMPTY;
@@ -799,7 +1016,7 @@ pub unsafe fn sched_ref() -> &'static SchedulerState {
 /// other reference (mutable or shared) to `SCHED` for the returned
 /// reference's lifetime. Use only from the single boot/owning core
 /// during reconfigure or platform-init paths.
-pub unsafe fn sched_modules() -> &'static mut [ModuleSlot; MAX_MODULES] {
+pub unsafe fn sched_modules() -> &'static mut [ModuleSlot] {
     let p = &raw mut SCHED;
     &mut (*p).modules
 }
@@ -809,6 +1026,36 @@ pub unsafe fn sched_modules() -> &'static mut [ModuleSlot; MAX_MODULES] {
 /// when multiple cores step modules concurrently.
 static CURRENT_MODULE_PER_CORE: [portable_atomic::AtomicU32; MAX_DOMAINS] =
     [const { portable_atomic::AtomicU32::new(0) }; MAX_DOMAINS];
+
+/// Per core: a module's `step` is on the stack. Instantiation, teardown and
+/// the scheduler's own work run with it clear, so what a step costs the
+/// kernel (`heap::note_zeroed`) can be told from what the graph's lifecycle
+/// costs.
+static STEP_ACTIVE: [AtomicBool; MAX_DOMAINS] = [const { AtomicBool::new(false) }; MAX_DOMAINS];
+
+/// Whether a module's step is running on this core.
+#[inline]
+pub fn in_module_step() -> bool {
+    let core = crate::kernel::sys::hal::core_id();
+    STEP_ACTIVE
+        .get(core)
+        .is_some_and(|f| f.load(Ordering::Relaxed))
+}
+
+/// Run a module's `step` with [`in_module_step`] set on this core.
+#[inline]
+pub(crate) fn as_module_step<R>(f: impl FnOnce() -> R) -> R {
+    let core = crate::kernel::sys::hal::core_id();
+    let flag = STEP_ACTIVE.get(core);
+    if let Some(flag) = flag {
+        flag.store(true, Ordering::Relaxed);
+    }
+    let r = f();
+    if let Some(flag) = flag {
+        flag.store(false, Ordering::Relaxed);
+    }
+    r
+}
 
 /// Return the index of the module currently being stepped.
 /// Used by event::event_create() to set event ownership.
@@ -823,7 +1070,7 @@ pub fn current_module_index() -> usize {
 /// owned by no module rather than by whichever slot the parked value aliases.
 pub fn current_module_id() -> ModuleId {
     let idx = current_module_index();
-    if idx < MAX_MODULES {
+    if idx < module_slots() {
         idx as ModuleId
     } else {
         NO_MODULE
@@ -975,7 +1222,7 @@ static mut MODULE_STATE_PTR: [*mut u8; MAX_MODULES] = [core::ptr::null_mut(); MA
 /// Publish a module's state pointer for later syscall lookups. Callable
 /// from any platform after a module's state has been allocated.
 pub fn set_module_state_ptr(idx: usize, state: *mut u8) {
-    if idx >= MAX_MODULES {
+    if idx >= module_slots() {
         return;
     }
     // SAFETY: scheduler-thread-only mutation; idx bounded.
@@ -985,7 +1232,7 @@ pub fn set_module_state_ptr(idx: usize, state: *mut u8) {
 }
 
 pub fn get_module_state(idx: usize) -> *mut u8 {
-    if idx >= MAX_MODULES {
+    if idx >= module_slots() {
         return core::ptr::null_mut();
     }
     // SAFETY: scheduler-thread-only access; idx bounded; the SCHED.modules
@@ -1015,7 +1262,7 @@ pub fn current_module_cap_class() -> u8 {
     // provider_call before CURRENT_MODULE_PER_CORE is set to its slot, leaving idx
     // at the "no module" sentinel (== MAX_MODULES). Fall back to class 0 rather than
     // index a fixed [_; MAX_MODULES] array out of bounds.
-    if idx >= MAX_MODULES {
+    if idx >= module_slots() {
         return 0;
     }
     // SAFETY: idx bounded above; scheduler-thread-only read.
@@ -1030,7 +1277,7 @@ pub fn current_module_required_caps() -> u64 {
     let idx = current_module_index();
     // Same sentinel guard as current_module_cap_class (a live-added module's early
     // provider_call can read the "no module" sentinel index).
-    if idx >= MAX_MODULES {
+    if idx >= module_slots() {
         return 0;
     }
     // SAFETY: idx bounded above; scheduler-thread-only read.
@@ -1060,7 +1307,7 @@ pub fn graph_holds_permission(bit: u16) -> bool {
 /// Return the export table info for a module by index.
 /// Used by loader::resolve_export_for_module to resolve export hashes.
 pub fn get_module_exports(idx: usize) -> (usize, *const u8, u16) {
-    if idx >= MAX_MODULES {
+    if idx >= module_slots() {
         return (0, core::ptr::null(), 0);
     }
     // SAFETY: scheduler-thread-only read; idx bounded.
@@ -1080,7 +1327,7 @@ pub fn set_module_exports(
     export_table: *const u8,
     export_count: u16,
 ) {
-    if idx >= MAX_MODULES {
+    if idx >= module_slots() {
         return;
     }
     // SAFETY: scheduler-thread-only mutation; idx bounded.
@@ -1093,7 +1340,7 @@ pub fn set_module_exports(
 
 /// Get the code region (base, size) for a module, used for provider pointer validation.
 pub fn module_code_region(idx: usize) -> (usize, u32) {
-    if idx >= MAX_MODULES {
+    if idx >= module_slots() {
         return (0, 0);
     }
     // SAFETY: scheduler-thread-only read; idx bounded.
@@ -1104,7 +1351,7 @@ pub fn module_code_region(idx: usize) -> (usize, u32) {
 /// a module (used by the Linux / bcm2712 platform loaders when they
 /// stage modules from their embedded images).
 pub fn set_module_caps(idx: usize, cap_class: u8, required_caps: u64, permissions: u16) {
-    if idx >= MAX_MODULES {
+    if idx >= module_slots() {
         return;
     }
     // SAFETY: scheduler-thread-only mutation; idx bounded.
@@ -1117,7 +1364,7 @@ pub fn set_module_caps(idx: usize, cap_class: u8, required_caps: u64, permission
 
 /// Record the type of the module in slot `idx`.
 pub fn set_module_type_hash(idx: usize, type_hash: u32) {
-    if idx >= MAX_MODULES {
+    if idx >= module_slots() {
         return;
     }
     // SAFETY: scheduler-thread-only mutation; idx bounded.
@@ -1128,7 +1375,7 @@ pub fn set_module_type_hash(idx: usize, type_hash: u32) {
 
 /// The type of the module in slot `idx`, or 0 when the slot holds none.
 pub fn module_type_hash(idx: usize) -> u32 {
-    if idx >= MAX_MODULES {
+    if idx >= module_slots() {
         return 0;
     }
     // SAFETY: scheduler-thread-only read; idx bounded.
@@ -1140,7 +1387,7 @@ pub fn module_type_hash(idx: usize) -> u32 {
 /// slots, which is the order the packer counts instances in
 /// (`tools/src/modules.rs::collect_programs`). `None` for an empty slot.
 fn program_owner(idx: usize) -> Option<(u32, u8)> {
-    if idx >= MAX_MODULES {
+    if idx >= module_slots() {
         return None;
     }
     let ty = module_type_hash(idx);
@@ -1176,7 +1423,7 @@ pub fn module_program_region(idx: usize) -> Option<(*const u8, usize)> {
 /// restarted or given another module, so a pair (slot, generation) names
 /// one module occupancy.
 pub fn module_slot_generation(idx: usize) -> u32 {
-    if idx >= MAX_MODULES {
+    if idx >= module_slots() {
         return 0;
     }
     // SAFETY: scheduler-thread-only read; idx bounded.
@@ -1195,7 +1442,7 @@ pub fn module_slot_generation(idx: usize) -> u32 {
 /// `ptr` must point at `len` readable bytes that outlive the module's
 /// scheduler entry.
 pub unsafe fn set_module_params(idx: usize, ptr: *const u8, len: usize) {
-    if idx >= MAX_MODULES {
+    if idx >= module_slots() {
         return;
     }
     SCHED.module_params_ptr[idx] = ptr;
@@ -1205,7 +1452,7 @@ pub unsafe fn set_module_params(idx: usize, ptr: *const u8, len: usize) {
 /// Look up the params blob registered via `set_module_params`. Returns
 /// `(ptr, len)` — `(null, 0)` if the loader didn't register any.
 pub fn module_params(idx: usize) -> (*const u8, usize) {
-    if idx >= MAX_MODULES {
+    if idx >= module_slots() {
         return (core::ptr::null(), 0);
     }
     // SAFETY: scheduler-thread-only read; idx bounded.
@@ -1214,7 +1461,7 @@ pub fn module_params(idx: usize) -> (*const u8, usize) {
 
 /// Store a BuiltInModule in the scheduler's module table (used by Linux platform).
 pub fn store_builtin_module(idx: usize, m: BuiltInModule) {
-    if idx >= MAX_MODULES {
+    if idx >= module_slots() {
         return;
     }
     // SAFETY: scheduler-thread-only mutation; idx bounded.
@@ -1240,13 +1487,13 @@ pub fn store_builtin_module(idx: usize, m: BuiltInModule) {
 /// data). This is the wasm equivalent of that instantiation; returns
 /// `false` if the port shape is invalid.
 pub fn install_fan_module(idx: usize, is_merge: bool, domain_id: u8, frame_kind: u8) -> bool {
-    if idx >= MAX_MODULES {
+    if idx >= module_slots() {
         return false;
     }
     // SAFETY: graph-prep / bring-up context — single mutator, idx bounded.
     let sched = unsafe { &mut *core::ptr::addr_of_mut!(SCHED) };
-    let mut in_chans = [-1i32; MAX_CHANNELS];
-    let mut out_chans = [-1i32; MAX_CHANNELS];
+    let mut in_chans = [-1i32; MAX_PORTS + 1];
+    let mut out_chans = [-1i32; MAX_PORTS + 1];
     let in_count = collect_input_channels(&sched.edges, idx, &mut in_chans);
     let out_count = collect_output_channels(&sched.edges, idx, &mut out_chans);
     let domain = (domain_id as usize).min(MAX_DOMAINS - 1) as u8;
@@ -1282,7 +1529,7 @@ pub fn install_fan_module(idx: usize, is_merge: bool, domain_id: u8, frame_kind:
 
 /// Store a DynamicModule in the scheduler's module table (used by Linux platform).
 pub fn store_dynamic_module(idx: usize, dm: DynamicModule) {
-    if idx >= MAX_MODULES {
+    if idx >= module_slots() {
         return;
     }
     // SAFETY: scheduler-thread-only mutation; idx bounded.
@@ -1414,7 +1661,7 @@ fn flow_budget_for_class(class: u8, domain: usize) -> i32 {
 
 pub fn syscall_flow_budget(port_index: u8) -> i32 {
     let idx = current_module_index();
-    if idx >= MAX_MODULES {
+    if idx >= module_slots() {
         return 0;
     }
     // SAFETY: scheduler-thread read of SCHED edge/domain tables.
@@ -1440,7 +1687,7 @@ pub fn syscall_flow_budget(port_index: u8) -> i32 {
 /// and resolves runtime bridge/repacking aliases when necessary.
 pub fn syscall_input_flow_budget(port_index: u8, channel: i32) -> i32 {
     let idx = current_module_index();
-    if idx >= MAX_MODULES {
+    if idx >= module_slots() {
         return 0;
     }
     // SAFETY: scheduler-thread single accessor of SCHED, read through a raw pointer.
@@ -1580,7 +1827,7 @@ pub fn set_domain_adaptive_for_test(
 /// use it to exercise the period-gated runnable path (a multi-tick module must
 /// keep its owning graph on the cooperative cadence — never idle-skipped).
 pub fn set_step_period_for_test(slot: usize, period: u8) {
-    if slot < MAX_MODULES {
+    if slot < module_slots() {
         // SAFETY: scheduler-thread-exclusive mutation; slot bounded.
         unsafe {
             SCHED.step_period[slot] = period;
@@ -1593,7 +1840,7 @@ pub fn set_step_period_for_test(slot: usize, period: u8) {
 /// deferred-ready module that has not reached Ready must keep stepping even when
 /// the graph is otherwise idle, or it could never finish initialising.
 pub fn set_module_init_state_for_test(slot: usize, initialising: bool) {
-    if slot < MAX_MODULES {
+    if slot < module_slots() {
         // SAFETY: scheduler-thread-exclusive mutation; slot bounded.
         unsafe {
             SCHED.deferred_ready[slot] = initialising;
@@ -1606,7 +1853,7 @@ pub fn set_module_init_state_for_test(slot: usize, initialising: bool) {
 /// the workload's FXPD flag at admission). Only an all-idle-safe graph may be fully
 /// parked; an unattested workload is fail-closed to the `tick_max` backstop.
 pub fn set_module_idle_safe_for_test(slot: usize, idle_safe: bool) {
-    if slot < MAX_MODULES {
+    if slot < module_slots() {
         // SAFETY: scheduler-thread-exclusive mutation; slot bounded.
         unsafe {
             SCHED.module_idle_safe[slot] = idle_safe;
@@ -1622,7 +1869,7 @@ pub fn set_module_idle_safe_for_test(slot: usize, idle_safe: bool) {
 pub fn set_owner_idle_safe(owner: crate::kernel::workload::owner::OwnerHandle, idle_safe: bool) {
     // SAFETY: scheduler-thread-exclusive boot context.
     let sched = unsafe { &mut *core::ptr::addr_of_mut!(SCHED) };
-    for i in 0..MAX_MODULES {
+    for i in 0..module_slots() {
         if matches!(sched.modules[i], ModuleSlot::Empty) {
             continue;
         }

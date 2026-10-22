@@ -605,57 +605,72 @@ fn trailer_config_window(config_addr: u32) -> u32 {
 
 /// Maximum counts.
 ///
-/// `MAX_MODULES` is the kernel platform's module-slot count, stated in
-/// `kernel::config` (1024 on linux and bcm2712, 48 on wasm, 32 on RP). It is
-/// kernel capacity, not ABI: modules ask for it at runtime
+/// `MAX_MODULES` is the kernel platform's module-index domain, stated in
+/// `kernel::config` (4096 on Linux, 1024 on bcm2712, 48 on wasm, 32 on RP);
+/// the per-module tables are sized from the boot plan within it. It is kernel
+/// capacity, not ABI: modules read the live slot count at runtime
 /// (`internal::reconfigure::SLOT_CAPACITY`). Every per-module set — the
 /// event-wake bitmap, owner and upstream masks — is a `ModuleMask` of
 /// `MODULE_MASK_WORDS` u64 words sized from it, so a profile value needs no
 /// bitmap widened by hand; the limits that do bind are the config blob's
-/// 10-bit module id (asserted below) and the `0xFFFF` no-module sentinel.
+/// 12-bit module id (asserted below) and the `0xFFFF` no-module sentinel.
 pub use crate::kernel::config::MAX_MODULES;
 use crate::kernel::exec::scheduler::ModuleId;
 
-// A module id is 10 bits on the wire: the low byte in its own field and the
-// high bits in spare bits beside it (module entry byte 9, edge bytes 10-11,
-// module-section header byte 1). The ceiling must fit them.
+// A module id is 12 bits on the wire: the low byte in its own field and four
+// high bits in spare bits beside it (module entry byte 9; edges carry a whole
+// high byte at bytes 10-11, the module-section header the count's high byte at
+// its byte 1). The module-index domain must fit them.
 const _: () = assert!(
-    MAX_MODULES <= 1024,
-    "module ids carry 10 bits in the config blob"
+    MAX_MODULES <= 4096,
+    "module ids carry 12 bits in the config blob"
 );
 
-/// Edge ceiling, keyed on the module ceiling so the two cannot drift apart.
-/// The host profile (1024 modules) carries 1536 edges: a control plane whose
-/// controllers are PARAMS is a long chain of decision and connector nodes, one
-/// edge each, and nanocloud's all-in-one graph passes 120 edges on its own —
-/// and it cannot split across processes, because the linux store is
-/// single-writer. wasm32 and Cortex-M keep 128, so their static tables do not
-/// grow.
-///
-/// Above 255 the count does not fit the header's `edge_count` byte, so the
-/// graph section's reserved byte 2 carries the HIGH byte. A blob that leaves
-/// that byte 0, as the "reserved, must be 0" convention has it, reads back as
-/// the same count — no format version moves.
-pub const MAX_GRAPH_EDGES: usize = if MAX_MODULES > 128 {
-    HOST_GRAPH_EDGES
-} else {
-    SMALL_GRAPH_EDGES
-};
-/// Literal halves of [`MAX_GRAPH_EDGES`], named so the tools' capacity mirror
-/// can pin them against this source text.
-pub const HOST_GRAPH_EDGES: usize = 1536;
+/// Edge slots a graph section holds. On the static profiles it is the
+/// profile's compiled count (`kernel::config::GRAPH_EDGES`), the slot layout
+/// every blob for that profile is built with. On Linux and bcm2712 the section
+/// is laid out for the graph it carries — byte 3 states the slot count — and
+/// this is only the format's bound: a slot code is a byte of 128-edge units.
+#[cfg(any(feature = "host-linux", feature = "chip-bcm2712"))]
+pub const MAX_GRAPH_EDGES: usize = 255 * 128;
+#[cfg(not(any(feature = "host-linux", feature = "chip-bcm2712")))]
+pub const MAX_GRAPH_EDGES: usize = crate::kernel::config::GRAPH_EDGES;
+/// The edge slots of the small (static) profiles, named so the tools' capacity
+/// mirror can pin them against this source text.
 pub const SMALL_GRAPH_EDGES: usize = 128;
+#[cfg(not(any(feature = "host-linux", feature = "chip-bcm2712")))]
+const _: () = assert!(
+    MAX_GRAPH_EDGES == SMALL_GRAPH_EDGES,
+    "a static profile lays its graph section out for the named slot count"
+);
 /// Graph-section byte 3: how many edge SLOTS the blob was laid out for, in
 /// units of 128, with 0 meaning 128 so that a blob stating no code reads as
-/// the small profile. The section is fixed-size, so a blob laid out for another
-/// profile would put the domain metadata and hardware section at the wrong
-/// offsets; this byte is how the loader refuses it by name instead of by a
-/// CRC mismatch nobody can read.
+/// the small profile. The section is fixed-size for a static profile, so a
+/// blob laid out for another profile would put the domain metadata and
+/// hardware section at the wrong offsets; this byte is how the loader refuses
+/// it by name instead of by a CRC mismatch nobody can read. On Linux and
+/// bcm2712 the section is as large as the code says.
+#[cfg(not(any(feature = "host-linux", feature = "chip-bcm2712")))]
 pub const GRAPH_SLOTS_CODE: u8 = if MAX_GRAPH_EDGES == 128 {
     0
 } else {
     (MAX_GRAPH_EDGES / 128) as u8
 };
+
+/// Edge slots a slot code (graph-section byte 3) lays out.
+pub const fn slots_for_code(code: u8) -> usize {
+    if code == 0 {
+        128
+    } else {
+        code as usize * 128
+    }
+}
+
+/// Bytes of a graph section laid out for `slots` edges: header, edges,
+/// domain metadata.
+pub const fn graph_section_size(slots: usize) -> usize {
+    4 + slots * GRAPH_EDGE_SIZE + DOMAIN_META_SIZE
+}
 
 // There is no fixed ceiling on the config blob. The parser is handed the
 // blob as a slice whose length is what the platform actually mapped, and
@@ -714,11 +729,14 @@ pub const ADAPTIVE_POST_SIZE: usize = 16;
 /// PAST the checksummed body, right after the adaptive post-body tail (at
 /// `total_size + ADAPTIVE_POST_SIZE`), carrying one or more `AddSubgraph`
 /// (FLXA) blobs the kernel admits at boot via `scheduler::live::apply_add`.
-/// Layout: `[FXPD u32 LE][workload_count u16 LE]` then per workload `[blob_len
-/// u32 LE][FLXA blob]`. Mirrors `tools add_subgraph::WORKLOAD_SECTION_MAGIC`.
-/// Like the adaptive tail it lies outside the checksummed body. The workloads'
-/// modules borrow their params from this section in place as they
-/// instantiate.
+/// Layout: `[FXPD u32 LE][section_len u32 LE][crc16 u16 LE][workload_count
+/// u16 LE]`, then per workload `[blob_len u32 LE][flags u8][FLXA blob]` (flags
+/// bit 0: the workload is attested idle-safe). Mirrors `tools
+/// add_subgraph::WORKLOAD_SECTION_MAGIC`. Like the adaptive tail it lies
+/// outside the checksummed body. Each blob is copied into a scratch buffer
+/// and admitted from there (`multigraph::admit_resident_workloads_from_config`),
+/// so the read-only config image is never written; its modules read their
+/// params from that copy as they instantiate.
 pub const WORKLOAD_SECTION_MAGIC: u32 = 0x4658_5044;
 /// Largest resident-workload section the kernel will map, in bytes (bounds a torn or
 /// hostile tail). Sized for a handful of workloads with small param blobs.
@@ -727,7 +745,6 @@ pub const MAX_WORKLOAD_SECTION_BYTES: usize = 8 * 1024;
 /// range gate. A post-body value outside this falls back to the domain tick.
 const TICK_BOUND_MIN: u16 = 100;
 const TICK_BOUND_MAX: u16 = 50_000;
-pub const GRAPH_SECTION_SIZE: usize = 4 + MAX_GRAPH_EDGES * GRAPH_EDGE_SIZE + DOMAIN_META_SIZE; // header + edges + domain metadata
 
 // ============================================================================
 // Graph Config (Version 1: Variable-Length Module Entries)
@@ -762,7 +779,8 @@ pub fn config_params_usage() -> (usize, usize) {
 ///   bits 0-2 = domain_id (0..7, 0 = default domain),
 ///   bit  4   = pre_tick_drain (Tier 1c opt-in),
 ///   bits 5-6 = id bits 8-9,
-///   bits 3, 7 reserved.
+///   bit  7   = id bit 10,
+///   bit  3   = id bit 11.
 /// - Bytes 10+: params (entry_length - 10 bytes)
 #[derive(Debug, Clone, Copy)]
 pub struct ModuleEntry {
@@ -907,11 +925,19 @@ pub struct ConfigHeader {
     pub graph_sample_rate: u32,
 }
 
+/// Module entries indexed by module id (or, for `prepare_graph`'s staged
+/// list, by scheduler slot).
+pub type ModuleList = crate::kernel::mem::table::ParseTable<Option<ModuleEntry>, MAX_MODULES>;
+
 /// Parsed configuration
 pub struct Config {
     pub header: ConfigHeader,
-    pub modules: [Option<ModuleEntry>; MAX_MODULES],
-    pub graph_edges: [Option<GraphEdge>; MAX_GRAPH_EDGES],
+    /// Module entries by id: an array of the profile's module count on the
+    /// static profiles; on Linux and bcm2712 a list as long as the largest id
+    /// parsed.
+    pub modules: ModuleList,
+    /// Graph edges in blob order.
+    pub graph_edges: crate::kernel::mem::table::ParseTable<Option<GraphEdge>, MAX_GRAPH_EDGES>,
     /// Low byte from the header, high byte from the module section's byte 1.
     pub module_count: u16,
     /// Low byte from the header, high byte from the graph section — see
@@ -976,8 +1002,8 @@ impl Config {
                 tick_us: 0,
                 graph_sample_rate: 0,
             },
-            modules: [None; MAX_MODULES],
-            graph_edges: [None; MAX_GRAPH_EDGES],
+            modules: ModuleList::new(None),
+            graph_edges: crate::kernel::mem::table::ParseTable::new(None),
             module_count: 0,
             edge_count: 0,
             hardware: HardwareConfig::new(),
@@ -1200,10 +1226,31 @@ pub fn read_config_from_slice(blob: &[u8], config: &mut Config) -> bool {
         return false;
     }
 
+    // The graph section's slot code (its byte 3) fixes the section's size, so
+    // it is read before any later offset is derived. A static profile holds
+    // exactly one layout and refuses another by name; Linux and bcm2712 take
+    // the layout the blob states.
+    let graph_off = HEADER_SIZE + 6 + section_size;
+    if blob_len < graph_off + 4 {
+        log::error!("[config] blob too short for the graph section header");
+        return false;
+    }
+    // SAFETY: `graph_off + 4 <= blob_len` checked above.
+    let slots_code = unsafe { *flash_ptr.add(graph_off + 3) };
+    #[cfg(not(any(feature = "host-linux", feature = "chip-bcm2712")))]
+    if slots_code != GRAPH_SLOTS_CODE {
+        log::error!(
+            "[config] graph section laid out for slot code {slots_code}, this kernel expects {GRAPH_SLOTS_CODE} (MAX_GRAPH_EDGES={MAX_GRAPH_EDGES}) — rebuild the config for this target"
+        );
+        return false;
+    }
+    let graph_slots = slots_for_code(slots_code);
+    let graph_section = graph_section_size(graph_slots);
+
     // Validate CRC16-CCITT checksum over body (bytes 8 onwards).
-    // Body = header tail (8) + module section (6+section_size) + graph (64) + hw (variable).
+    // Body = header tail (8) + module section (6+section_size) + graph + hw (variable).
     // We read hw counts to compute total size.
-    let body_before_hw = 8 + (6 + section_size) + GRAPH_SECTION_SIZE;
+    let body_before_hw = 8 + (6 + section_size) + graph_section;
 
     // Hardware section header (6 bytes: spi/i2c/gpio/pio/_/uart) must fit
     // inside the blob too. `body_before_hw` is measured from `flash_ptr+8`,
@@ -1219,8 +1266,8 @@ pub fn read_config_from_slice(blob: &[u8], config: &mut Config) -> bool {
         return false;
     }
     // SAFETY: `blob_len >= hw_header_offset + 6` checked above; the hw
-    // header lies at `modules_base + 6 + section_size + GRAPH_SECTION_SIZE`.
-    let hw_header_ptr = unsafe { modules_base.add(6 + section_size + GRAPH_SECTION_SIZE) };
+    // header lies at `modules_base + 6 + section_size + graph_section`.
+    let hw_header_ptr = unsafe { modules_base.add(6 + section_size + graph_section) };
     // SAFETY: 6 bytes at hw_header_ptr verified by the bounds check above.
     let (spi_n, i2c_n, gpio_n, pio_n, uart_n) = unsafe {
         (
@@ -1312,7 +1359,7 @@ pub fn read_config_from_slice(blob: &[u8], config: &mut Config) -> bool {
 
     // Section base is after module section (6-byte header + entries)
     // SAFETY: `modules_base + 6 + section_size` lies inside the blob
-    // (`6 + section_size + GRAPH_SECTION_SIZE` already validated above).
+    // (`6 + section_size + graph_section` already validated above).
     let section_base = unsafe { modules_base.add(6 + section_size) };
 
     // Graph section header layout (4 bytes, see tools/src/config.rs):
@@ -1320,38 +1367,32 @@ pub fn read_config_from_slice(blob: &[u8], config: &mut Config) -> bool {
     //   byte 1: graph_flags — see `GRAPH_FLAG_*` constants
     //   byte 2: edge_count HIGH byte (0 in every blob of <= 255 edges, which
     //           is what every blob written before it existed also says)
-    //   byte 3: edge-slot code — see `GRAPH_SLOTS_CODE`
-    // SAFETY: graph section is `GRAPH_SECTION_SIZE` bytes from section_base;
+    //   byte 3: edge-slot code — see `GRAPH_SLOTS_CODE` (read above)
+    // SAFETY: graph section is `graph_section` bytes from section_base;
     // 4-byte header fits.
     config.graph_flags = unsafe { *section_base.add(1) };
-    // SAFETY: bytes 2 and 3 of the same 4-byte graph header.
+    // SAFETY: byte 2 of the same 4-byte graph header.
     let edge_hi = unsafe { *section_base.add(2) };
-    // SAFETY: as above.
-    let slots = unsafe { *section_base.add(3) };
-    if slots != GRAPH_SLOTS_CODE {
-        log::error!(
-            "[config] graph section laid out for slot code {slots}, this kernel expects {GRAPH_SLOTS_CODE} (MAX_GRAPH_EDGES={MAX_GRAPH_EDGES}) — rebuild the config for this target"
-        );
-        return false;
-    }
     config.edge_count |= u16::from(edge_hi) << 8;
-    // A header that promises more edges than the kernel can hold is either a
-    // tool-version mismatch or a malformed blob: refuse the load, never clamp.
-    if config.edge_count as usize > MAX_GRAPH_EDGES {
+    // A header that promises more edges than its section has slots for is
+    // either a tool-version mismatch or a malformed blob: refuse the load,
+    // never clamp.
+    if config.edge_count as usize > graph_slots.min(MAX_GRAPH_EDGES) {
         log::error!(
-            "[config] edge_count={} exceeds MAX_GRAPH_EDGES={}",
+            "[config] edge_count={} exceeds the graph section's {} edge slots",
             config.edge_count,
-            MAX_GRAPH_EDGES
+            graph_slots
         );
         return false;
     }
     let edge_count = config.edge_count as usize;
+    config.graph_edges.reserve_entries(edge_count);
 
     // Edges start at offset 4 within graph section
     // SAFETY: `section_base + 4` is the start of the edge array.
     let edges_base = unsafe { section_base.add(4) };
     for i in 0..edge_count {
-        // SAFETY: `edge_count <= MAX_GRAPH_EDGES` (checked above); each
+        // SAFETY: `edge_count <= graph_slots` (checked above); each
         // entry is `GRAPH_EDGE_SIZE` bytes, all within the graph section.
         let entry_ptr = unsafe { edges_base.add(i * GRAPH_EDGE_SIZE) };
         config.graph_edges[i] = Some(parse_graph_edge(entry_ptr));
@@ -1362,9 +1403,9 @@ pub fn read_config_from_slice(blob: &[u8], config: &mut Config) -> bool {
     //   [0..2] tick_us:u16  [2] exec_mode:u8  [3] adaptive_flags:u8
     // tick_min_us/tick_max_us are NOT in this entry — they're read below from
     // the post-body adaptive section past total_size (see ADAPTIVE_POST_SIZE).
-    // SAFETY: section_base + 4 + MAX_GRAPH_EDGES * GRAPH_EDGE_SIZE points
-    // at the domain meta section within GRAPH_SECTION_SIZE.
-    let domain_meta_base = unsafe { section_base.add(4 + MAX_GRAPH_EDGES * GRAPH_EDGE_SIZE) };
+    // SAFETY: section_base + 4 + graph_slots * GRAPH_EDGE_SIZE points
+    // at the domain meta section within the graph section.
+    let domain_meta_base = unsafe { section_base.add(4 + graph_slots * GRAPH_EDGE_SIZE) };
     let global_tick = if config.header.tick_us > 0 {
         config.header.tick_us
     } else {
@@ -1396,7 +1437,7 @@ pub fn read_config_from_slice(blob: &[u8], config: &mut Config) -> bool {
     // whole config to be rejected rather than silently truncating.
     // SAFETY: hw section follows the graph section; `hw_size` already
     // validated against `body_size <= blob_len`.
-    let hw_base = unsafe { section_base.add(GRAPH_SECTION_SIZE) };
+    let hw_base = unsafe { section_base.add(graph_section) };
     config.hardware = match parse_hardware_section(hw_base) {
         Some(hw) => hw,
         None => {
@@ -1456,22 +1497,30 @@ pub fn read_config_from_slice(blob: &[u8], config: &mut Config) -> bool {
     // `section[10..section_len]` — so the walk skips sections by length and an
     // unknown magic ends the chain. Known sections:
     //   FXPD — resident workloads: payload =
-    //          `[count u16]` then per workload `[blob_len u32][FLXA blob]`.
+    //          `[count u16]` then per workload
+    //          `[blob_len u32][flags u8][FLXA blob]`.
     //   FXEV — capacity envelope: payload =
-    //          `[entry_count u16]` then `[pool u16][n u32]` entries, installed
-    //          as the deployment's enforced pool capacities.
+    //          `[entry_count u16]` then `[pool u16][n u32]` entries, each the
+    //          pool's live-add reserve (or size, for a pool the graph cannot
+    //          derive), as `resource::decode_entry` reads it (exact bytes
+    //          for an arena below 2 GiB, KiB past it).
+    //   FXDM — declared demand: the same entries, what the graph's modules
+    //          declare they will ask of each pool, added to its derived size.
     // Each is validated whole (bounds AND CRC) before use: workloads are
     // executable configuration and the envelope gates admission, so a corrupt
     // or truncated section must contribute NOTHING, never a garbled prefix.
-    // Absent sections ⇒ byte-identical single-graph, static-capacity boot.
-    crate::kernel::sys::resource_ledger::reset_enforced();
+    // Absent sections ⇒ a single-graph boot whose pools are their derived
+    // sizes plus the profile's default reserves.
+    crate::kernel::sys::resource_ledger::reset_envelope();
     let mut section_off = post_off + ADAPTIVE_POST_SIZE;
     while section_off + 12 <= blob_len {
         // SAFETY: `section_off + 12 <= blob_len` checked; reads 4+4+2 bytes in range.
         let magic = unsafe { read_u32(flash_ptr.add(section_off)) };
         let cap = match magic {
             WORKLOAD_SECTION_MAGIC => MAX_WORKLOAD_SECTION_BYTES,
-            ENVELOPE_SECTION_MAGIC => crate::abi::contracts::resource::MAX_ENVELOPE_SECTION_BYTES,
+            ENVELOPE_SECTION_MAGIC | DEMAND_SECTION_MAGIC => {
+                crate::abi::contracts::resource::MAX_ENVELOPE_SECTION_BYTES
+            }
             _ => break,
         };
         // SAFETY: header fields within the 12 bytes checked above.
@@ -1500,7 +1549,12 @@ pub fn read_config_from_slice(blob: &[u8], config: &mut Config) -> bool {
                 config.resident_workload_section = unsafe { flash_ptr.add(section_off) };
                 config.resident_workload_section_len = section_len;
             }
-            ENVELOPE_SECTION_MAGIC => parse_envelope_payload(payload),
+            ENVELOPE_SECTION_MAGIC => {
+                parse_pool_entries(payload, crate::kernel::sys::resource_ledger::set_reserve);
+            }
+            DEMAND_SECTION_MAGIC => {
+                parse_pool_entries(payload, crate::kernel::sys::resource_ledger::set_declared);
+            }
             _ => unreachable!(),
         }
         section_off += section_len;
@@ -1513,10 +1567,14 @@ pub fn read_config_from_slice(blob: &[u8], config: &mut Config) -> bool {
 /// `abi::contracts::resource::ENVELOPE_SECTION_MAGIC`.
 const ENVELOPE_SECTION_MAGIC: u32 = crate::abi::contracts::resource::ENVELOPE_SECTION_MAGIC;
 
-/// Install a CRC-validated envelope payload (`[entry_count u16]` then
-/// `[pool u16][n u32]` per entry) into the resource ledger. A count that
+/// Declared-demand section magic ("FXDM") — mirror of
+/// `abi::contracts::resource::DEMAND_SECTION_MAGIC`.
+const DEMAND_SECTION_MAGIC: u32 = crate::abi::contracts::resource::DEMAND_SECTION_MAGIC;
+
+/// Hand each `[pool u16][n u32]` entry of a CRC-validated envelope or demand
+/// payload (`[entry_count u16]` then the entries) to `install`. A count that
 /// disagrees with the payload length installs nothing.
-fn parse_envelope_payload(payload: &[u8]) {
+fn parse_pool_entries(payload: &[u8], install: fn(u16, u32)) {
     use crate::abi::contracts::resource::ENVELOPE_ENTRY_SIZE;
     if payload.len() < 2 {
         return;
@@ -1524,7 +1582,7 @@ fn parse_envelope_payload(payload: &[u8]) {
     let count = u16::from_le_bytes([payload[0], payload[1]]) as usize;
     if 2 + count * ENVELOPE_ENTRY_SIZE != payload.len() {
         log::error!(
-            "[config] envelope count {count} disagrees with section length {}; ignored",
+            "[config] pool section count {count} disagrees with section length {}; ignored",
             payload.len()
         );
         return;
@@ -1538,7 +1596,7 @@ fn parse_envelope_payload(payload: &[u8]) {
             payload[off + 4],
             payload[off + 5],
         ]);
-        crate::kernel::sys::resource_ledger::set_enforced(pool, n);
+        install(pool, n);
     }
 }
 
@@ -1561,9 +1619,13 @@ fn parse_module_entry(ptr: *const u8, entry_len: usize) -> ModuleEntry {
     unsafe {
         let name_hash = read_u32(ptr.add(4));
         // Byte 9 is multiplexed (see ModuleEntry docs): bits 0-2 carry
-        // domain_id (0..7), bit 4 pre_tick_drain, bits 5-6 the id's bits 8-9.
+        // domain_id (0..7), bit 4 pre_tick_drain, bits 5-6 the id's bits 8-9,
+        // bit 7 its bit 10 and bit 3 its bit 11.
         let byte9 = *ptr.add(9);
-        let id = ModuleId::from(*ptr.add(8)) | (ModuleId::from((byte9 >> 5) & 0x03) << 8);
+        let id = ModuleId::from(*ptr.add(8))
+            | (ModuleId::from((byte9 >> 5) & 0x03) << 8)
+            | (ModuleId::from(byte9 >> 7) << 10)
+            | (ModuleId::from((byte9 >> 3) & 0x01) << 11);
         let domain_id = byte9 & 0x07;
         let pre_tick_drain = (byte9 & 0x10) != 0;
 

@@ -22,6 +22,7 @@
 //! last line of defence.
 
 use std::io::{Read, Write};
+use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -39,9 +40,9 @@ const BRIDGE_CAP: usize = 16 * 1024;
 /// caller's buffer size needs.
 pub(crate) const READ_CHUNK: usize = 1024;
 
-/// The host-side grant a spawn is scoped by: the process
-/// starts in `cwd` and inherits ONLY the named env vars — no ambient environment, so
-/// node secrets don't leak into `do` children. Empty `cwd` = the node's cwd.
+/// The host-side grant a spawn is scoped by: the process starts in `cwd` and
+/// inherits ONLY the named env vars — no ambient environment, so node secrets
+/// never reach it. `cwd` `None` = the runtime's own working directory.
 #[derive(Default, Clone)]
 pub struct SpawnPolicy {
     pub cwd: Option<std::path::PathBuf>,
@@ -113,13 +114,20 @@ impl ProcExecutor {
             command.current_dir(dir);
         }
         // No ambient environment — inherit ONLY the allowlisted names, so node
-        // secrets never leak into a `do` child.
+        // secrets never reach the child.
         command.env_clear();
         for name in &policy.env_allow {
             if let Ok(val) = std::env::var(name) {
                 command.env(name, val);
             }
         }
+        // Nor any of the runtime's descriptors: the child starts with its
+        // three pipes and nothing else.
+        crate::platform::linux::descriptors::sweep_on_exec(&mut command);
+        // A process group of its own: `shutdown` signals the command and
+        // whatever it started, and a stop meant for the runtime (a terminal's
+        // Ctrl-C reaches the runtime's group) is not delivered to it.
+        command.process_group(0);
         let mut child = command.spawn()?;
 
         let stdout_bridge = Arc::new(ExtBridge::<BRIDGE_CAP>::new(stdout_policy));
@@ -235,9 +243,14 @@ impl ProcExecutor {
     /// process exited within `grace` (false = it needed the kill).
     pub fn shutdown(&mut self, grace: Duration) -> bool {
         self.stop.store(true, Ordering::Release);
-        // SAFETY: signalling our own child pid with SIGTERM.
-        unsafe {
-            libc::kill(self.child.id() as i32, libc::SIGTERM);
+        // Only an unreaped child is signalled: once `try_wait` has reaped it
+        // its pid is free for the host to hand to a stranger. Unreaped, the
+        // pid (and so the group it leads) is still this child's.
+        if matches!(self.child.try_wait(), Ok(None)) {
+            // SAFETY: signalling our own unreaped child's process group.
+            unsafe {
+                libc::kill(-(self.child.id() as i32), libc::SIGTERM);
+            }
         }
         let deadline = Instant::now() + grace;
         let graceful = loop {
@@ -250,6 +263,12 @@ impl ProcExecutor {
             }
         };
         if !graceful {
+            if matches!(self.child.try_wait(), Ok(None)) {
+                // SAFETY: as above.
+                unsafe {
+                    libc::kill(-(self.child.id() as i32), libc::SIGKILL);
+                }
+            }
             let _ = self.child.kill();
             let _ = self.child.wait();
         }

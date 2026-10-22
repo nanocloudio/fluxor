@@ -8,7 +8,8 @@
 ///   high byte, section_size (u32)
 /// - Module entries (variable length each)
 /// - Graph section: edge_count low byte, flags, edge_count high byte, edge-slot
-///   code, then `max_edges` fixed-size edge slots and the per-domain metadata
+///   code, then the edge slots the code states (`capacity::graph_slots`) and
+///   the per-domain metadata
 /// - Hardware section: spi/i2c/gpio/pio/uart counts, then their configs
 ///
 /// Module capability info for buffer aliasing and manifest validation.
@@ -361,11 +362,12 @@ fn generate_config_impl(
     )?;
 
     // Module-count ceiling for the target's kernel profile
-    // (`capacity::kernel_max_modules`, drift-pinned against the kernel
-    // source). Configs with no resolved target build for the host profile.
+    // (`capacity::kernel_max_modules`, read from the kernel's profile).
+    // Configs with no resolved target build for the Linux profile.
     let max_modules = crate::capacity::kernel_max_modules(resolved_target.unwrap_or("linux"));
-    // The edge ceiling follows the same profile, and the graph section is
-    // laid out for exactly that many slots (`capacity::kernel_max_edges`).
+    // The edge ceiling follows the same profile (`capacity::kernel_max_edges`):
+    // a static profile's compiled slot count, or the format's bound where the
+    // graph section is laid out for the graph.
     let max_edges = crate::capacity::kernel_max_edges(resolved_target.unwrap_or("linux"));
     // The target's isolation facts: each module's protection tag carries the
     // level the target provides rather than what was asked, and a device
@@ -585,6 +587,9 @@ fn generate_config_impl(
     // shadow — one drive becomes unreachable with no runtime
     // warning. Reject it at build time. See storage_capability_surface.md.
     validate_single_provider(config, &module_names, &manifests)?;
+    // One writer of the network stack's `addr_ctl` on a node that creates
+    // workloads: the kernel.
+    validate_net_identity_writers(config, &module_names, &manifests)?;
 
     // Resume-style fault recovery. `fault_policy: restart` resumes the
     // module's existing state after releasing its handles and flushing
@@ -787,12 +792,12 @@ fn generate_config_impl(
     };
 
     // Graph section.
-    //   header (4 bytes): edge_count, flags, reserved[2]
-    //   edges  (max_edges * GRAPH_EDGE_SIZE bytes)
+    //   header (4 bytes): edge_count low, flags, edge_count high, slot code
+    //   edges  (slots * GRAPH_EDGE_SIZE bytes)
     //   domain metadata (DOMAIN_META_SIZE bytes)
     //
     // Edge format (GRAPH_EDGE_SIZE bytes; mirrors
-    // `kernel::config::parse_graph_edge`):
+    // `kernel::boot::config::parse_graph_edge`):
     //   byte 0:    from_id, low byte
     //   byte 1:    to_id, low byte
     //   byte 2:    bit 7    = to_port
@@ -827,12 +832,16 @@ fn generate_config_impl(
         .unwrap_or(false);
     let graph_flags: u8 = if accept_cycles { 0x01 } else { 0x00 };
 
-    let graph_section_size = 4 + max_edges * GRAPH_EDGE_SIZE + DOMAIN_META_SIZE;
+    // The slots the section is laid out for: the static profile's count, or on
+    // Linux and bcm2712 the graph's own edges rounded up to 128
+    // (`capacity::graph_slots`).
+    let slots = crate::capacity::graph_slots(resolved_target.unwrap_or("linux"), edges.len());
+    let graph_section_size = 4 + slots * GRAPH_EDGE_SIZE + DOMAIN_META_SIZE;
     let mut graph_section = Vec::with_capacity(graph_section_size);
     graph_section.push((edges.len() & 0xFF) as u8);
     graph_section.push(graph_flags);
     graph_section.push((edges.len() >> 8) as u8);
-    graph_section.push(crate::capacity::graph_slots_code(max_edges));
+    graph_section.push(crate::capacity::graph_slots_code(slots));
     for (i, (from_id, to_id, to_port, from_port_index, to_port_index)) in edges.iter().enumerate() {
         let group = buffer_groups.get(i).copied().unwrap_or(0);
         let ec = edge_classes.get(i).copied().unwrap_or(0);
@@ -849,7 +858,7 @@ fn generate_config_impl(
         graph_section.push((*to_id >> 8) as u8);
     }
     // Pad edge entries to fixed offset, then write domain metadata
-    while graph_section.len() < 4 + max_edges * GRAPH_EDGE_SIZE {
+    while graph_section.len() < 4 + slots * GRAPH_EDGE_SIZE {
         graph_section.push(0);
     }
     // Domain metadata: 4 entries × DOMAIN_META_ENTRY_SIZE (4) bytes:
@@ -906,8 +915,8 @@ fn generate_config_impl(
     // tick_max_us:u16 LE] = 16 bytes, appended AFTER the checksum so it sits
     // PAST body_size (the kernel reads it at total_size). Deliberately not in
     // body_size / not checksum-covered: growing body_size hangs the bare-metal
-    // Pi 5 boot, but trailing bytes past it are harmless (both rig-proven).
-    // Mirrors `kernel::config::ADAPTIVE_POST_SIZE`; default 0 ⇒ kernel uses the
+    // Pi 5 boot, and trailing bytes past it are harmless.
+    // Mirrors `kernel::boot::config::ADAPTIVE_POST_SIZE`; default 0 ⇒ kernel uses the
     // domain tick (adaptive is a no-op when unconfigured).
     let adaptive_domains = config
         .get("execution")
@@ -931,47 +940,132 @@ fn generate_config_impl(
     // entry becomes a self-contained `AddSubgraph` (FLXA) blob the kernel admits
     // at boot via `apply_add`. Appended right AFTER the 16-byte adaptive post-body
     // (so the kernel reads it at `total_size + ADAPTIVE_POST_SIZE`), also PAST the
-    // checksummed body — same additive discipline, no format-version bump. Absent
-    // `workloads:` ⇒ empty ⇒ byte-identical single-graph config.
+    // checksummed body. Absent `workloads:` ⇒ empty ⇒ no section.
     let workload_section = build_workload_section(config, loc, extra_module_dirs)?;
     result.extend_from_slice(&workload_section);
 
-    // Capacity-envelope section (compose-time Tier A sizing): the
-    // optional top-level `capacity:` map becomes an FXEV post-body section
-    // installing per-deployment enforced pool capacities. Same additive
-    // discipline as the sections above. Absent `capacity:` ⇒ no section ⇒
-    // compiled static sizes rule (byte-identical config).
-    let envelope = build_capacity_envelope(config, resolved_target)?;
-    result.extend_from_slice(&envelope);
+    // Capacity-envelope section (FXEV): the optional top-level `capacity:`
+    // map, each entry a pool's live-add reserve (an arena's size). Absent
+    // `capacity:` writes no section, and every pool takes the profile's
+    // default reserve.
+    let target = resolved_target.unwrap_or("linux");
+    let envelope = envelope_entries(config, target)?;
+    result.extend_from_slice(&encode_envelope(&envelope));
+    // Declared-demand section (FXDM), after the envelope: what the graph's
+    // modules declare of the kernel pools, which the kernel adds to their
+    // derived sizes. Absent when nothing declares.
+    let declared = declared_demand(&module_names, &manifests)?;
+    if !declared.is_empty() {
+        let wire: Vec<(u16, u32)> = declared.iter().map(|&(_, id, n)| (id, n)).collect();
+        result.extend_from_slice(&crate::capacity::encode_pool_section(
+            crate::capacity::DEMAND_SECTION_MAGIC,
+            &wire,
+        ));
+    }
+    // The kernel's boot plan for this config, run here: a pool whose ceiling
+    // (derived + reserve) the target's kernel cannot hold is refused at build,
+    // naming the pool, instead of at boot.
+    let (workloads, workload_modules, workload_edges) =
+        crate::capacity::resident_demand(&workload_section);
+    // Each module's domain by its config id, as the entries carry them (byte
+    // 8 and the id bits of byte 9; the domain in byte 9's bits 0-2).
+    let domains: HashMap<u16, u8> = module_entries
+        .iter()
+        .filter(|e| e.len() >= 10)
+        .map(|e| {
+            let id = u16::from(e[8])
+                | (u16::from((e[9] >> 5) & 0x03) << 8)
+                | (u16::from(e[9] >> 7) << 10)
+                | (u16::from((e[9] >> 3) & 0x01) << 11);
+            (id, e[9] & 0x07)
+        })
+        .collect();
+    let crossings = crate::capacity::crossing_count(edges.iter().enumerate().map(
+        |(i, &(from_id, to_id, ..))| {
+            (
+                domains.get(&from_id).copied(),
+                domains.get(&to_id).copied(),
+                edge_classes.get(i).copied() == Some(2),
+            )
+        },
+    ));
+    let shape = crate::capacity::GraphShape {
+        modules: module_entries.len() as u64,
+        edges: edges.len() as u64,
+        fans: crate::capacity::fan_count(&edges),
+        workloads,
+        workload_modules,
+        workload_edges,
+        crossings,
+    };
+    let entries: Vec<(String, u64)> = envelope
+        .iter()
+        .map(|&(name, _, n)| (name.to_string(), n))
+        .collect();
+    let declared: Vec<(String, u64)> = declared
+        .iter()
+        .map(|&(name, _, n)| (name.to_string(), u64::from(n)))
+        .collect();
+    let summary = crate::capacity::check_boot_plan(target, &shape, &entries, &declared)
+        .map_err(Error::Config)?;
+    println!("{summary}");
 
     Ok(result)
 }
 
 /// Build the FXEV capacity-envelope section from the top-level `capacity:`
-/// map (`pool name: n`). Every name must be a registered kernel pool; `n`
-/// must be positive and, where the pool's compiled capacity is known
-/// host-side, must fit it — over-asking is a config error here rather than
-/// a clamp-and-log at boot. Prints the envelope (ask/static/slack) so a
-/// deployment's capacity choices are visible at compose time.
+/// map: [`envelope_entries`], encoded. Empty without a `capacity:` block.
+#[cfg(test)]
 fn build_capacity_envelope(config: &Value, resolved_target: Option<&str>) -> Result<Vec<u8>> {
+    let entries = envelope_entries(config, resolved_target.unwrap_or("linux"))?;
+    Ok(encode_envelope(&entries))
+}
+
+/// The FXEV section for `entries` (`(pool, id, n)`), empty when there are
+/// none.
+fn encode_envelope(entries: &[(&'static str, u16, u64)]) -> Vec<u8> {
+    if entries.is_empty() {
+        return Vec::new();
+    }
+    let wire: Vec<(u16, u32)> = entries
+        .iter()
+        .map(|&(_, id, n)| {
+            (
+                id,
+                crate::capacity::encode_entry(id, n).expect("checked by envelope_entries"),
+            )
+        })
+        .collect();
+    crate::capacity::encode_envelope_section(&wire)
+}
+
+/// The top-level `capacity:` map (`pool name: n`) as `(pool, id, n)` envelope
+/// entries for `target`. Every name must be a pool `target`'s kernel has a
+/// table for (an entry for one it has not would bound nothing). The kernel
+/// sizes each table from what the graph derives and declares, and an entry is
+/// that pool's live-add reserve on top; an arena's entry is its size, in
+/// bytes. Whether the kernel can hold the result is the boot plan's question
+/// (`capacity::check_boot_plan`). Prints the envelope so a deployment's
+/// capacity choices are visible at compose time.
+fn envelope_entries(config: &Value, target: &str) -> Result<Vec<(&'static str, u16, u64)>> {
     let Some(cap_map) = config.get("capacity") else {
         return Ok(Vec::new());
     };
     let obj = cap_map.as_object().ok_or_else(|| {
         Error::Config("capacity: must be a map of pool name → count/bytes".into())
     })?;
-    let target = resolved_target.unwrap_or("linux");
-    let mut entries: Vec<(u16, u32)> = Vec::new();
+    let mut entries = Vec::new();
     println!("Capacity envelope ({target}):");
     for (name, val) in obj {
-        let Some((_, pool_id)) = crate::capacity::POOL_IDS.iter().find(|(n, _)| n == name) else {
+        let Some(&(pool, pool_id)) = crate::capacity::POOL_IDS.iter().find(|(n, _)| n == name)
+        else {
             let known: Vec<&str> = crate::capacity::POOL_IDS.iter().map(|(n, _)| *n).collect();
             return Err(Error::Config(format!(
                 "capacity: unknown pool '{name}' (known: {})",
                 known.join(", ")
             )));
         };
-        if name == "config_arena" {
+        if pool == "config_arena" {
             // Observed, never allocated: the kernel borrows module params from
             // the config blob in place and reports them against the blob's
             // length, so an envelope entry would bound nothing.
@@ -982,35 +1076,71 @@ fn build_capacity_envelope(config: &Value, resolved_target: Option<&str>) -> Res
                     .into(),
             ));
         }
-        let n = val.as_u64().filter(|&n| n > 0).ok_or_else(|| {
-            Error::Config(format!("capacity: '{name}' must be a positive integer"))
-        })?;
-        match crate::capacity::kernel_pool_static_cap(target, name) {
-            Some(static_cap) if n > static_cap => {
-                return Err(Error::Config(format!(
-                    "capacity: '{name}' = {n} exceeds the {target} kernel's compiled \
-                     capacity {static_cap} — the envelope can only size DOWN from the \
-                     compiled tables"
-                )));
-            }
-            Some(static_cap) => {
-                println!("  {name}: {n} of {static_cap} (slack {})", static_cap - n);
-            }
-            None => {
-                println!("  {name}: {n} (compiled capacity target-specific; kernel clamps)");
-            }
-        }
-        if n > u32::MAX as u64 {
+        if !crate::capacity::kernel_has_pool(target, pool) {
             return Err(Error::Config(format!(
-                "capacity: '{name}' = {n} overflows u32"
+                "capacity: the {target} kernel has no '{pool}' table (`{}` names no such pool), \
+                 so an entry for it would bound nothing",
+                crate::capacity::kernel_profile(target)
             )));
         }
-        entries.push((*pool_id, n as u32));
+        let sized = crate::capacity::is_arena_name(pool);
+        let n = val.as_u64().filter(|&n| n > 0 || !sized).ok_or_else(|| {
+            Error::Config(format!(
+                "capacity: '{pool}' must be a {} integer",
+                if sized { "positive" } else { "non-negative" }
+            ))
+        })?;
+        // An arena's entry is exact bytes below 2 GiB and KiB past it
+        // (`resource::decode_entry`), so a byte-precise budget stays exact and
+        // a large machine's arena still fits the entry's u32.
+        if crate::capacity::encode_entry(pool_id, n).is_none() {
+            return Err(Error::Config(format!(
+                "capacity: '{pool}' = {n} overflows the envelope entry"
+            )));
+        }
+        let what = if sized { "size" } else { "reserve" };
+        match crate::capacity::kernel_pool_static_size(target, pool) {
+            Some(table) => println!("  {pool}: {what} {n} (static table {table})"),
+            None => println!("  {pool}: {what} {n} (sized at boot)"),
+        }
+        entries.push((pool, pool_id, n));
     }
-    if entries.is_empty() {
-        return Ok(Vec::new());
+    Ok(entries)
+}
+
+/// The graph's declared demand, `(pool, id, n)`: per kernel pool, what the
+/// graph's modules declare they will ask of it at run time (`[capacities]` in
+/// each manifest, `capacity::DECLARED_DEMAND`), summed over the base graph's
+/// instances. The kernel adds it to the pool's derived size, so a pool sized
+/// by its consumers — the store's subscription table — grows with the graph
+/// that boots. The FXDM section carries it; empty when nothing declares.
+fn declared_demand(
+    module_names: &[String],
+    manifests: &HashMap<String, Manifest>,
+) -> Result<Vec<(&'static str, u16, u32)>> {
+    let mut entries = Vec::new();
+    for &(key, pool) in crate::capacity::DECLARED_DEMAND {
+        let total: u64 = module_names
+            .iter()
+            .filter_map(|n| manifests.get(n))
+            .filter_map(|m| m.capacities.get(key))
+            .map(|&v| u64::from(v))
+            .sum();
+        if total == 0 {
+            continue;
+        }
+        let Some(&(_, id)) = crate::capacity::POOL_IDS.iter().find(|(n, _)| *n == pool) else {
+            continue;
+        };
+        let n = u32::try_from(total).map_err(|_| {
+            Error::Config(format!(
+                "the graph declares {total} {pool}, which overflows u32"
+            ))
+        })?;
+        println!("Declared demand: {pool} {n}");
+        entries.push((pool, id, n));
     }
-    Ok(crate::capacity::encode_envelope_section(&entries))
+    Ok(entries)
 }
 
 /// Build the resident-workload config section from the optional top-level `workloads:`
@@ -1018,7 +1148,7 @@ fn build_capacity_envelope(config: &Value, resolved_target: Option<&str>) -> Res
 /// modules referenced by `name_hash` (FNV-1a of type) with inline-TLV params (the
 /// same `build_params_from_schema` packing base modules use), and optional
 /// intra-workload `wiring:` (`from`/`to` by workload-local module name). Cross-workload edges
-/// are not supported in v1 (strict isolation). Returns an empty Vec with no workloads.
+/// are refused (strict isolation). Returns an empty Vec with no workloads.
 fn build_workload_section(
     config: &Value,
     loc: schema::ModuleLocation<'_>,
@@ -1136,48 +1266,44 @@ pub fn build_workloads(
                      execute. Place ISR-tier modules in the base graph."
                 )));
             }
+            // Resolved for the target's module ABI and the instance's
+            // variant, as base-graph manifests are: the heap rule below
+            // reads per-ABI, per-variant figures.
+            let manifest = resolve_module_root(mtype, &manifest_search)
+                .map(|root| root.join("manifest.toml"))
+                .filter(|mpath| mpath.exists())
+                .and_then(|mpath| {
+                    let abi = (!loc.abi.is_empty()).then_some(loc.abi);
+                    let mut man = Manifest::from_toml_for_target(&mpath, abi).ok()?;
+                    match m.get("variant").and_then(Value::as_str) {
+                        Some(v) => man.apply_variant(v).ok().map(|()| man),
+                        None => Some(man),
+                    }
+                });
             // Reject `pre_tick_drain` workload modules — the codec drops the flag, so a
             // workload module would silently run as an ordinary cooperative module,
             // losing its Tier-1c pre-pass drain semantics.
-            if let Some(root) = resolve_module_root(mtype, &manifest_search) {
-                let mpath = root.join("manifest.toml");
-                if mpath.exists() {
-                    if let Ok(man) = Manifest::from_toml(&mpath) {
-                        if man.pre_tick_drain {
-                            return Err(Error::Config(format!(
-                                "workload {pi} module '{mtype}' is a pre_tick_drain (Tier 1c) module, \
-                                 which resident workloads do not support in v1: the FLXA codec carries \
-                                 no pre_tick_drain flag, so the module would silently run as an \
-                                 ordinary cooperative module. Place pre_tick_drain modules in the \
-                                 base graph."
-                            )));
-                        }
-                    }
-                }
+            if manifest.as_ref().is_some_and(|man| man.pre_tick_drain) {
+                return Err(Error::Config(format!(
+                    "workload {pi} module '{mtype}' is a pre_tick_drain (Tier 1c) module, \
+                     which resident workloads do not support: the FLXA codec carries \
+                     no pre_tick_drain flag, so the module would silently run as an \
+                     ordinary cooperative module. Place pre_tick_drain modules in the \
+                     base graph."
+                )));
             }
             // Inline-TLV params — identical packing to base modules, so the kernel
             // reads them via `params_ptr` exactly the same way.
             let param_schema = schema::load_schema_for_module(mtype, loc)?;
             refuse_workload_node_keys(m, param_schema.as_ref(), pi, mname)?;
             let params = if let Some(param_schema) = param_schema {
-                let mut buf = vec![0u8; MAX_MODULE_PARAMS_SIZE];
-                let plen = schema::build_params_from_schema(
-                    m,
-                    &param_schema,
-                    &mut buf,
-                    0,
-                    data_section,
-                    mtype,
-                )
-                .map_err(Error::Config)?;
-                buf.truncate(plen);
-                buf
+                pack_params_growing(m, &param_schema, data_section, mtype)?
             } else {
                 Vec::new()
             };
             // The heap flags act on the module's own heap: a workload module
             // takes them as a base-graph module does, in its params TLV.
-            let params = insert_workload_heap_tags(params, m, mname)?;
+            let params = insert_workload_heap_tags(params, m, mname, manifest.as_ref())?;
             // What the kernel refuses in a workload's params, refused here by
             // the bytes it would read.
             if let Some(tag) = crate::add_subgraph::params_node_tag(&params) {
@@ -1244,12 +1370,12 @@ pub fn build_workloads(
                         )))
                     }
                 };
-                // Reject cross-domain workload edges (v1). On bcm2712 a cross-domain
+                // Reject cross-domain workload edges. On bcm2712 a cross-domain
                 // edge needs the SPSC bridge provisioned at boot (base edges get
                 // it before workload admission, bcm2712.rs); `apply_add` opens an
                 // ordinary channel, so a cross-domain workload edge would silently lose
-                // the bridge. Until workload admission provisions the bridge, require
-                // intra-domain workload wiring on every target (self-contained workloads).
+                // the bridge. Workload admission provisions none, so workload wiring
+                // is intra-domain on every target (self-contained workloads).
                 let from_dom = modules[from_local as usize].domain_id;
                 let to_dom = modules[to_local as usize].domain_id;
                 if from_dom != to_dom {
@@ -1325,30 +1451,36 @@ const WORKLOAD_NODE_KEYS: &[&str] = &[
 
 /// A workload module's `heap:` keys as params TLV entries (0xF8 zero on
 /// free, 0xF9 fault on alloc failure, 0xFA canary, 0xEF the instance's heap
-/// cap), with the base graph's
+/// cap, 0xEE raw arena use), with the base graph's
 /// validation and encoding, inserted before the TLV's end marker. A module
-/// with no schema params gets a TLV of its own for them.
-fn insert_workload_heap_tags(params: Vec<u8>, module: &Value, mname: &str) -> Result<Vec<u8>> {
-    let Some(heap) = module.get("heap") else {
-        return Ok(params);
-    };
+/// with no schema params gets a TLV of its own for them. The heap cap is the
+/// base graph's too: `heap.arena_bytes`, else what the type's `[capacities]
+/// heap_from_params` derives from the packed params.
+fn insert_workload_heap_tags(
+    params: Vec<u8>,
+    module: &Value,
+    mname: &str,
+    manifest: Option<&Manifest>,
+) -> Result<Vec<u8>> {
     validate_heap_subtree(module, mname)?;
+    let heap = module.get("heap");
+    let flag = |key: &str| heap.and_then(|h| h.get(key));
     let mut entries = Vec::new();
-    if let Some(v) = heap.get("zero_on_free").and_then(|v| v.as_bool()) {
+    if let Some(v) = flag("zero_on_free").and_then(|v| v.as_bool()) {
         entries.extend_from_slice(&[0xF8, 1, u8::from(v)]);
     }
-    if heap.get("alloc_failure_policy").and_then(|v| v.as_str()) == Some("fault") {
+    if flag("alloc_failure_policy").and_then(|v| v.as_str()) == Some("fault") {
         entries.extend_from_slice(&[0xF9, 1, 1]);
     }
-    if heap.get("canary_enabled").and_then(|v| v.as_bool()) == Some(true) {
+    if flag("canary_enabled").and_then(|v| v.as_bool()) == Some(true) {
         entries.extend_from_slice(&[0xFA, 1, 1]);
     }
-    if let Some(n) = heap
-        .get("arena_bytes")
-        .and_then(|v| heap_arena_bytes(v).ok())
-    {
+    if let Some(n) = instance_heap_cap(mname, module, manifest, &params)? {
         entries.extend_from_slice(&[0xEF, 4]);
         entries.extend_from_slice(&n.to_le_bytes());
+    }
+    if flag("raw_arena").and_then(Value::as_bool) == Some(true) {
+        entries.extend_from_slice(&[0xEE, 1, 1]);
     }
     if entries.is_empty() {
         return Ok(params);
@@ -1359,23 +1491,16 @@ fn insert_workload_heap_tags(params: Vec<u8>, module: &Value, mname: &str) -> Re
         params
     };
     // The end marker: the first `0xFF` tag of the TLV walk.
-    let mut pos = 4;
-    while pos + 2 <= params.len() && params[pos] != 0xFF {
-        pos += 2 + params[pos + 1] as usize;
-    }
-    if params.first() != Some(&0xFE) || pos + 2 > params.len() {
+    let Some(pos) = schema::tlv_basic_end(&params).map(|end| end - 2) else {
         return Err(Error::Config(format!(
             "workload module '{mname}': its params are not a TLV the heap flags can join"
         )));
-    }
-    let len = u16::from_le_bytes([params[2], params[3]]) as usize + entries.len();
-    let len = u16::try_from(len).map_err(|_| {
-        Error::Config(format!(
-            "workload module '{mname}': params exceed the TLV length"
-        ))
-    })?;
+    };
+    // The header's length runs to the byte past the end marker, saturating
+    // past 64 KiB (readers walk to the terminator).
+    let len = schema::tlv_payload_len_field(pos + 2 + entries.len() - 4);
     params.splice(pos..pos, entries);
-    params[2..4].copy_from_slice(&len.to_le_bytes());
+    params[2..4].copy_from_slice(&len);
     Ok(params)
 }
 

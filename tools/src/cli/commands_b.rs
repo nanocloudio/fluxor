@@ -1247,8 +1247,8 @@ fn inspect_config(config_path: &Path, project_root: &Path) -> Result<()> {
             probe_yaml_dir = std::path::PathBuf::from(".");
         }
         if let Ok(loaded) = stack_expand::load_graph(config_path, project_root) {
-        probe = loaded;
-    }
+            probe = loaded;
+        }
         let _ = inline_route_body_files(&mut probe, &probe_yaml_dir);
         match stack_expand::expand_platform_stacks(&mut probe, &desc, project_root) {
             Ok(added) if added.is_empty() => {

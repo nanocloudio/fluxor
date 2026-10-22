@@ -191,9 +191,14 @@ psm_wdsel_mask = "0x0001fffc"
 boot2_src = "0x10000000"
 state_arena_kb = 64
 # The loader's ceiling on one module's code; see rp2350.toml. 384 KiB on the
-# 2 MiB part. Mirrors `MAX_MODULE_CODE_SIZE` in modules/sdk/abi/config.rs.
+# 2 MiB part. Mirrors `MAX_MODULE_CODE_SIZE` in src/kernel/config.rs.
 module_code_kb = 384
 buffer_arena_kb = 16
+# The kernel's one static pool, split per graph between its tables and the
+# two arenas above (their default split); see rp2350.toml. The kernel's fixed
+# statics are ~96 KiB, so 112 leaves ~8 KiB of slack under the 216 KiB
+# ceiling, and a typical graph's tables (~12 KiB) leave it ~84 KiB of state.
+kernel_pool_kb = 112
 config_buffer_kb = 8
 # Early-boot log ring: sized to hold a whole boot until a reader arrives —
 # the USB console opened after enumeration replays it from the oldest line,

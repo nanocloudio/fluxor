@@ -138,105 +138,37 @@ pub fn merged_params(module_id: u16, compiled: &[u8]) -> Option<(*const u8, usiz
     // The store addresses a module by a one-byte id, so a module whose id is
     // past it has no override (`stored_id`).
     let id = stored_id(module_id)?;
-    let extra: usize = table()
-        .iter()
-        .filter(|o| o.module_id == id)
-        .map(|o| 2 + o.value.len())
-        .sum();
-    if extra == 0 {
+    let mine = || table().iter().filter(move |o| o.module_id == id);
+    let n = mine().count();
+    if n == 0 {
         return None;
     }
-    // Room for a TLV header the compiled params may lack, every override
-    // entry, and the end marker.
-    let max = compiled.len().max(4) + extra + 1;
+    let value_bytes: usize = mine().map(|o| o.value.len()).sum();
+    // Room for every override entry, plus the header and terminator the
+    // compiled params may lack.
+    let max = compiled.len() + params_tlv::merge_room(n, value_bytes);
     let mut buf = MERGED.lock().unwrap_or_else(|e| e.into_inner());
     buf.clear();
     buf.resize(max, 0);
     buf[..compiled.len()].copy_from_slice(compiled);
-    // SAFETY: `buf` holds `max` writable bytes whose first `compiled.len()`
-    // are the compiled params.
-    let len = unsafe { merge_runtime_overrides(module_id, buf.as_mut_ptr(), compiled.len(), max) };
+    // Inserted before the basic section's terminator; the terminator and the
+    // extended entries after it (certificates, keys, trust bundles) move up
+    // whole, so a module with an override keeps its trust anchors.
+    let merged = params_tlv::merge_overrides(
+        &mut buf,
+        compiled.len(),
+        mine().map(|o| (o.tag, o.value.as_slice())),
+    );
+    if merged.dropped != 0 {
+        log::warn!(
+            "[params] {} override(s) for module {} do not fit; compiled values stand",
+            merged.dropped,
+            id
+        );
+    }
     // The Vec's heap block outlives the guard: nothing touches it until the
     // next call, which is the lifetime promised.
-    Some((buf.as_ptr(), len))
-}
-
-/// Append this module's overrides after its compiled parameters, so
-/// `parse_tlv`'s last-writer-wins gives the stored value.
-///
-/// The TLV v2 shape is the RP implementation's, entry for entry: magic
-/// 0xFE, version 0x02, a `u16` payload length, then `[tag][len][value]`
-/// entries terminated by 0xFF.
-///
-/// # Safety
-/// `buf` points to `max` writable bytes of which the first `len` are the
-/// module's compiled parameters, as the HAL hook promises.
-pub unsafe fn merge_runtime_overrides(
-    module_id: u16,
-    buf: *mut u8,
-    len: usize,
-    max: usize,
-) -> usize {
-    let overrides = table();
-    if overrides.is_empty() || max < 4 || buf.is_null() {
-        return len;
-    }
-    let Some(id) = stored_id(module_id) else {
-        return len;
-    };
-    if !overrides.iter().any(|o| o.module_id == id) {
-        return len;
-    }
-    let mut pos = len;
-    if pos < 4 {
-        // No compiled parameters: write the header this module would have
-        // had, so the overrides have somewhere to be.
-        *buf.add(0) = 0xFE;
-        *buf.add(1) = 0x02;
-        *buf.add(2) = 0;
-        *buf.add(3) = 0;
-        pos = 4;
-    }
-    // Where the compiled entries end: the declared payload length when it
-    // is sane, else a walk to the 0xFF terminator.
-    let declared = usize::from(u16::from_le_bytes([*buf.add(2), *buf.add(3)]));
-    let mut write_at = if declared > 0 && 4 + declared <= pos {
-        4 + declared
-    } else {
-        let mut p = 4usize;
-        while p + 2 <= pos {
-            if *buf.add(p) == 0xFF {
-                break;
-            }
-            let entry_len = usize::from(*buf.add(p + 1));
-            p += 2 + entry_len;
-        }
-        p
-    };
-    for o in overrides.iter().filter(|o| o.module_id == id) {
-        let needed = 2 + o.value.len();
-        // One byte is kept for the terminator; an override that does not
-        // fit is dropped rather than half-written.
-        if write_at + needed + 1 > max {
-            log::warn!(
-                "[params] override tag {} for module {} does not fit; compiled value stands",
-                o.tag,
-                id
-            );
-            break;
-        }
-        *buf.add(write_at) = o.tag;
-        *buf.add(write_at + 1) = u8::try_from(o.value.len()).unwrap_or(0);
-        if !o.value.is_empty() {
-            core::ptr::copy_nonoverlapping(o.value.as_ptr(), buf.add(write_at + 2), o.value.len());
-        }
-        write_at += needed;
-    }
-    if write_at < max {
-        *buf.add(write_at) = 0xFF;
-        write_at += 1;
-    }
-    write_at
+    Some((buf.as_ptr(), merged.len))
 }
 
 /// Write a store file. The CLI uses this to turn operator intent — an

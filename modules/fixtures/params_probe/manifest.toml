@@ -1,0 +1,16 @@
+version = "1.0.0"
+hardware_targets = ["bcm2712", "linux"]
+
+# Fixture for module params of any size: takes a list of
+# blobs under `payload` and, on its first step, logs how many params bytes
+# reached it and their FNV-1a, so a lane can compare them with the files the
+# graph named:
+#
+#   [params] bytes=<n> chunks=<n> fnv=<hex8>
+#
+# `bytes` counts every chunk's bytes as the module receives them (each blob's
+# first chunk carries its 2-byte length header).
+timer_class = "agnostic"
+
+[observability]
+exempt = "fixture whose evidence is its one log line"

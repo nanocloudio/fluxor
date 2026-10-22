@@ -718,7 +718,9 @@ fn rp_setup_graph() -> i32 {
             }
         }
 
-        fluxor::platform::rp_io::gpio::grant_pending_pins(walk.instantiated() as fluxor::kernel::exec::scheduler::ModuleId);
+        fluxor::platform::rp_io::gpio::grant_pending_pins(
+            walk.instantiated() as fluxor::kernel::exec::scheduler::ModuleId
+        );
         walk.advance_instantiated();
         rp_spin_ms(1);
     }

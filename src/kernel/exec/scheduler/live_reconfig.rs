@@ -93,7 +93,7 @@ pub fn set_active_module_count(n: usize) {
 /// Invoke `module_drain()` on module N. Returns the module's return code,
 /// or -1 if the module is not drain-capable or the index is invalid.
 pub fn call_module_drain(module_idx: usize) -> i32 {
-    if module_idx >= MAX_MODULES {
+    if module_idx >= module_slots() {
         return -1;
     }
     // SAFETY: scheduler-thread read.
@@ -150,7 +150,7 @@ pub fn begin_stop_drain(waiting: &mut ModuleMask) -> usize {
         ask(sched.exec_order[pos] as usize, waiting);
     }
     // Slots outside the execution order (another resident graph's).
-    for i in (0..MAX_MODULES).rev() {
+    for i in (0..module_slots()).rev() {
         ask(i, waiting);
     }
     asked.count_ones() as usize
@@ -171,11 +171,11 @@ pub fn stop_drain_settled(waiting: &ModuleMask) -> bool {
 
 /// Mark a module as finished so the scheduler skips it in future ticks.
 pub fn mark_module_finished(module_idx: usize) {
-    if module_idx < MAX_MODULES {
+    if module_idx < module_slots() {
         // SAFETY: scheduler-thread mutation; module_idx bounded.
         unsafe {
             let p = &raw mut SCHED;
-            (*p).finished[module_idx] = true;
+            (&mut (*p).finished)[module_idx] = true;
         }
     }
 }
@@ -205,7 +205,7 @@ pub fn mark_module_finished(module_idx: usize) {
 /// This matches the contract documented at the heap-side caller
 /// (`heap.alloc_failure_policy = "fault"` → "policy runs next tick").
 pub fn raise_module_fault(module_idx: usize, fault_kind: u8) {
-    if module_idx >= MAX_MODULES {
+    if module_idx >= module_slots() {
         return;
     }
     // SAFETY: heap-side caller runs on the scheduler thread (per the
@@ -258,7 +258,7 @@ pub fn raise_module_fault(module_idx: usize, fault_kind: u8) {
 ///   bit 2: mailbox_safe
 ///   bit 3: in_place_writer
 pub fn module_info_flags(module_idx: usize) -> u32 {
-    if module_idx >= MAX_MODULES {
+    if module_idx >= module_slots() {
         return 0;
     }
     // SAFETY: scheduler-thread read.
@@ -286,7 +286,7 @@ pub fn module_info_flags(module_idx: usize) -> u32 {
 
 /// Upstream-module bitmask for module N.
 pub fn module_upstream_words(module_idx: usize, out: &mut [u64]) -> usize {
-    if module_idx >= MAX_MODULES {
+    if module_idx >= module_slots() {
         return 0;
     }
     let words = crate::kernel::workload::bitmask::MODULE_MASK_WORDS;
@@ -306,7 +306,7 @@ pub fn module_upstream_words(module_idx: usize, out: &mut [u64]) -> usize {
 /// before the async reply is produced. `true` when no live producer remains
 /// (also `true` for a genuine source with no predecessors at all).
 pub fn module_completion_predecessors_finished(module_idx: usize) -> bool {
-    if module_idx >= MAX_MODULES {
+    if module_idx >= module_slots() {
         return true;
     }
     // SAFETY: scheduler-thread read; module_idx bounded.

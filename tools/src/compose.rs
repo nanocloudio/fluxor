@@ -93,37 +93,42 @@ pub struct NodeCapacity {
     pub max_domains: u8,
 }
 
-/// Node capacity for a named target profile. This is the single host-side
-/// mirror of the kernel's per-profile limits; `capacity_mirrors_kernel_sources`
-/// (below) textually extracts the kernel constants and fails when they drift.
+/// Node capacity for a named target profile. The host rows read the kernel's
+/// own profile data (`capacity::kernel_max_modules`, `kernel_max_edges`,
+/// `kernel_max_owners`, the profile's arenas), so the composer never holds a
+/// second copy of a kernel figure; `capacity_mirrors_kernel_sources` (below)
+/// extracts the same constants textually and fails if the two readings
+/// disagree.
 ///
-/// `linux` and `pi5`/`bcm2712` share one row because their kernel profiles
-/// (`profile_linux`, `profile_bcm2712` in `src/kernel/config.rs`) state the
-/// same values and both build the `multitenant` feature
-/// (`src/kernel/workload/owner.rs` MAX_OWNERS); the drift test pins each
-/// profile separately, so a divergence fails it rather than passing silently.
-/// `max_endpoints` is agent-level admission policy: the kernel has no endpoint
-/// table.
+/// `linux` and `pi5`/`bcm2712` share one arm but not their figures: each is
+/// read from its own kernel profile (`profile_linux`, `profile_bcm2712`). Both
+/// build the `multitenant` feature, and `max_owners` is the profile's
+/// owner-slot domain; the table a node actually holds is its boot plan's
+/// `owners` ceiling (the system slot, its resident workloads and the owner
+/// reserve), which a deployment raises within the domain with `capacity: {
+/// owners }`. `max_endpoints` is agent-level admission policy: the kernel has
+/// no endpoint table.
 pub fn capacity_for_profile(profile: &str) -> Option<NodeCapacity> {
     match profile {
         "linux" | "pi5" | "bcm2712" => Some(NodeCapacity {
-            max_owners: 64, // owner.rs MAX_OWNERS (multitenant)
+            max_owners: crate::capacity::kernel_max_owners(profile) as u16,
             // Taken from `capacity::kernel_max_modules`, not restated: two
             // copies of one kernel constant is how the composer comes to
             // admit a graph the kernel has no slots for.
             max_modules: crate::capacity::kernel_max_modules(profile) as u16,
             max_edges: crate::capacity::kernel_max_edges(profile) as u16,
-            state_bytes: crate::capacity::HOST_STATE_ARENA as u32,
-            buffer_bytes: crate::capacity::HOST_BUFFER_ARENA as u32,
+            state_bytes: crate::capacity::kernel_pool_size(profile, "state_arena").unwrap_or(0)
+                as u32,
+            buffer_bytes: crate::capacity::kernel_buffer_arena(profile).unwrap_or(0) as u32,
             max_endpoints: 64, // agent admission policy
             max_domains: 4,    // scheduler MAX_DOMAINS
         }),
         // MCU silicon. Without a capacity row here, composition has no model
         // for an RP target: a graph is admitted blind and discovers its
-        // sizing as a boot-time clamp-and-log (`capacity::kernel_pool_static_cap`
-        // says so outright for the RP arenas). On a die whose whole state
-        // arena is 64 KiB that is the difference between a build error and a
-        // board that boots with modules missing.
+        // sizing as a boot-time refusal (the RP arenas are per-silicon, so
+        // the kernel profile states no figure for them). On a die whose whole
+        // state arena is 64 KiB that is the difference between a build error
+        // and a board that boots with modules missing.
         //
         // The arena figures come from `targets/silicon/<id>.toml` and are
         // mirrored here rather than read, because this function is pure and has
@@ -131,23 +136,22 @@ pub fn capacity_for_profile(profile: &str) -> Option<NodeCapacity> {
         // textually and fails on drift — the same mitigation the host row uses
         // against the kernel constants.
         //
-        // `max_owners: 1` is the system slot alone: multitenancy is an aarch64
-        // feature, so there are no workload slots to hand out. `max_modules`
-        // comes from `kernel_max_modules`, which already answers 32 for every
-        // non-host target.
+        // `max_owners` is the system slot alone: the RP kernels are
+        // single-tenant, so there are no workload slots to hand out. The
+        // module and edge figures are the RP profile's domains.
         "rp2040" | "pico" | "picow" => Some(NodeCapacity {
-            max_owners: 1,
+            max_owners: crate::capacity::kernel_max_owners(profile) as u16,
             max_modules: crate::capacity::kernel_max_modules(profile) as u16,
-            max_edges: 128,
+            max_edges: crate::capacity::kernel_max_edges(profile) as u16,
             state_bytes: 64 * 1024,  // rp2040.toml state_arena_kb
             buffer_bytes: 16 * 1024, // rp2040.toml buffer_arena_kb
             max_endpoints: 4,
             max_domains: 4,
         }),
         "rp2350" | "pico2w" | "waveshare-lcd4" => Some(NodeCapacity {
-            max_owners: 1,
+            max_owners: crate::capacity::kernel_max_owners(profile) as u16,
             max_modules: crate::capacity::kernel_max_modules(profile) as u16,
-            max_edges: 128,
+            max_edges: crate::capacity::kernel_max_edges(profile) as u16,
             state_bytes: 240 * 1024, // rp2350.toml state_arena_kb
             buffer_bytes: 64 * 1024, // rp2350.toml buffer_arena_kb
             max_endpoints: 8,
@@ -616,8 +620,11 @@ const LEASE_REC_LEN: usize = 2 + 4 + 1 + 2;
 /// lease records collide at e.g. 148 tail bytes). Lives inside the digested
 /// body, unlike header bits, so it is integrity-protected.
 const LEASE_SECTION_MARKER: u32 = 0xFFFF_FFFF;
-/// Decoder ceiling for the lease section (bounded-binary rule).
-pub const MAX_PLAN_LEASES: usize = 256;
+/// Decoder ceiling for the lease section (bounded-binary rule): the format's
+/// own domain. Composition grants each `(protocol, port)` at most once
+/// (a second claim is a conflict), and only tcp and udp nonzero ports are
+/// leased, so no valid plan carries more. The wire count is a `u32`.
+pub const MAX_PLAN_LEASES: usize = 2 * u16::MAX as usize;
 
 fn push_assignment(buf: &mut Vec<u8>, a: &OwnerAssignment) {
     buf.extend_from_slice(&a.workload_uid);
@@ -714,9 +721,12 @@ const PLAN_MAGIC: u32 = 0x464C_5850;
 const PLAN_VERSION: u16 = 1;
 /// Fixed header: magic(4) + version(2) + reserved(2).
 const PLAN_HEADER_LEN: usize = 8;
-/// Hard ceiling on assignments in one bounded plan (matches the largest
-/// per-profile owner table; the kernel rejects anything larger).
-const MAX_PLAN_ASSIGNMENTS: usize = 256;
+/// Decoder ceiling on assignments in one bounded plan: the format's own
+/// domain, one assignment per nonzero `u16` owner slot (the wire count is a
+/// `u32`). What a node holds is profile data: composition places at most
+/// `NodeCapacity::max_owners - 1` workloads (`capacity_for_profile`), and
+/// the kernel refuses a slot past its live owner table.
+const MAX_PLAN_ASSIGNMENTS: usize = u16::MAX as usize;
 
 /// Why decoding a binary plan failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1660,6 +1670,46 @@ mod tests {
         assert_eq!(decode_plan(&extra), Err(PlanDecodeError::TrailingBytes));
     }
 
+    /// A Linux node's plan is bounded by its profile's owner domain, not a
+    /// fixed 256: 300 workloads compose against the `linux` capacity row,
+    /// each with an owner slot of its own (60 with an endpoint lease), and the
+    /// plan round-trips through the binary codec intact.
+    #[test]
+    fn three_hundred_workloads_compose_and_round_trip_on_linux() {
+        let cap = capacity_for_profile("linux").expect("linux capacity row");
+        let workloads: Vec<WorkloadDesired> = (0..300u32)
+            .map(|i| {
+                let mut p = profile(1, 0);
+                p.domains = 0;
+                // Endpoints are the node's admission policy (`max_endpoints`),
+                // not the owner domain: the first workloads lease one each.
+                p.endpoints = u16::from(i < 60);
+                let mut w = workload(0, DesiredPhase::Running, p);
+                w.workload_uid[..4].copy_from_slice(&(i + 1).to_be_bytes());
+                w.name = format!("workload-{i}");
+                if i < 60 {
+                    w.exports = vec![ExportDecl {
+                        protocol: "tcp".into(),
+                        port: 10_000 + i as u16,
+                    }];
+                }
+                w
+            })
+            .collect();
+        let ds = DeviceDesiredState {
+            generation: 1,
+            system_revision: 1,
+            workloads,
+        };
+        let snap = OwnerSnapshot::empty(cap.max_owners);
+        let plan = compose(&ds, &cap, &snap, &[], 0, &[], 0).expect("300 workloads compose");
+        assert_eq!(plan.assignments.len(), 300);
+        assert!(plan.assignments.iter().any(|a| a.slot > 256));
+        assert_eq!(plan.leases.len(), 60);
+        let bytes = encode_plan(&plan);
+        assert_eq!(decode_plan(&bytes).expect("decodes"), plan);
+    }
+
     #[test]
     fn over_cap_count_rejected() {
         // Hand-craft a header claiming more assignments than the bound, so the
@@ -1831,12 +1881,13 @@ mod tests {
         assert_eq!(cap.state_bytes as u64, kernel);
     }
 
-    /// Drift guard: `capacity.rs` and `capacity_for_profile` mirror kernel
-    /// constants they cannot import (they live behind kernel platform
-    /// features). Textual extraction is the accepted pattern for cross-cfg
-    /// drift guards in this repo. EVERY mirrored value is pinned here, per
-    /// kernel profile, so a kernel raise that forgets the mirror fails loudly
-    /// and the mirror is the single place to update.
+    /// Cross-check: `capacity.rs` reads kernel constants it cannot import
+    /// (they live behind kernel platform features) out of the kernel's source
+    /// as profile data, and `capacity_for_profile` takes them from there. An
+    /// independent textual extraction of the same constants, per kernel
+    /// profile, must agree with every figure the composer uses, so a change
+    /// to the kernel source's shape that the profile reader misreads fails
+    /// here.
     #[test]
     fn capacity_mirrors_kernel_sources() {
         let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
@@ -1861,8 +1912,10 @@ mod tests {
             kernel_const(&kernel, profile, name, silicon)
         };
 
-        use crate::capacity::kernel_pool_static_cap as pool;
-        use crate::capacity::{self as cap_mirror, kernel_max_modules};
+        use crate::capacity::kernel_max_modules;
+        // A profile's pool size as the composer reads it: the static table,
+        // else the default.
+        let pool = crate::capacity::kernel_pool_size;
 
         // Module slots, per kernel profile, for every target that names it.
         assert_eq!(
@@ -1887,7 +1940,11 @@ mod tests {
         }
 
         // Every arena the composer admits against, per profile.
-        for (target, profile) in [("linux", "profile_linux"), ("bcm2712", "profile_bcm2712")] {
+        for (target, profile) in [
+            ("linux", "profile_linux"),
+            ("bcm2712", "profile_bcm2712"),
+            ("wasm", "profile_wasm"),
+        ] {
             for (pool_name, konst) in [
                 ("state_arena", "STATE_ARENA_SIZE"),
                 ("buffer_arena", "BUFFER_ARENA_SIZE"),
@@ -1896,47 +1953,33 @@ mod tests {
                 assert_eq!(
                     pool(target, pool_name),
                     Some(k(profile, konst, target)),
-                    "{target} {pool_name} mirror disagrees with {profile}::{konst}"
+                    "{target} {pool_name} profile data disagrees with {profile}::{konst}"
                 );
             }
-        }
-        for (pool_name, konst) in [
-            ("state_arena", "STATE_ARENA_SIZE"),
-            ("buffer_arena", "BUFFER_ARENA_SIZE"),
-            ("elastic_region", "ELASTIC_REGION_SIZE"),
-        ] {
-            assert_eq!(
-                pool("wasm", pool_name),
-                Some(k("profile_wasm", konst, "wasm")),
-                "wasm {pool_name} mirror disagrees with profile_wasm::{konst}"
-            );
         }
         for t in ["rp2040", "rp2350"] {
             assert_eq!(
                 pool(t, "elastic_region"),
                 Some(k("profile_rp", "ELASTIC_REGION_SIZE", t))
             );
+            // The RP arenas are per-silicon: the profile names no figure.
+            assert_eq!(pool(t, "state_arena"), None, "{t} state_arena");
         }
-        // The named mirror constants themselves.
-        assert_eq!(
-            cap_mirror::HOST_STATE_ARENA,
-            k("profile_linux", "STATE_ARENA_SIZE", "linux")
-        );
-        assert_eq!(
-            cap_mirror::HOST_STATE_ARENA,
-            k("profile_bcm2712", "STATE_ARENA_SIZE", "bcm2712")
-        );
-        assert_eq!(
-            cap_mirror::HOST_BUFFER_ARENA,
-            k("profile_bcm2712", "BUFFER_ARENA_SIZE", "bcm2712")
-        );
         // No profile compiles a config arena: params are borrowed in place.
         for t in ["linux", "bcm2712", "wasm", "rp2040", "rp2350"] {
             assert_eq!(pool(t, "config_arena"), None, "{t} config_arena");
         }
+        // bcm2712 carves its tables at boot from the device tree's DRAM: the
+        // channel table is the graph's edges and fans plus the profile's
+        // `channels` reserve, which the composer reads as profile data.
+        assert!(
+            crate::capacity::kernel_pool_default_reserve("bcm2712", "channels")
+                .is_some_and(|n| n > 0),
+            "bcm2712 states a channel reserve in DEFAULT_RESERVES"
+        );
         assert_eq!(
-            cap_mirror::HOST_ELASTIC_REGION,
-            k("profile_bcm2712", "ELASTIC_REGION_SIZE", "bcm2712")
+            crate::capacity::kernel_pool_static_size("bcm2712", "channels"),
+            None
         );
 
         // The composer's node capacity rows.
@@ -1946,8 +1989,15 @@ mod tests {
             ("bcm2712", "profile_bcm2712"),
         ] {
             let cap = capacity_for_profile(target).expect(target);
-            // First MAX_OWNERS in owner.rs is the multitenant value.
-            assert_eq!(cap.max_owners as u64, extract(&owner, "MAX_OWNERS"));
+            // owner.rs declares the hosted multitenant MAX_OWNERS first, the
+            // bare-metal multitenant one second.
+            let owners_src = if target == "linux" {
+                owner.as_str()
+            } else {
+                let first = owner.find("pub const MAX_OWNERS").expect("MAX_OWNERS");
+                &owner[first + 1..]
+            };
+            assert_eq!(cap.max_owners as u64, extract(owners_src, "MAX_OWNERS"));
             assert_eq!(cap.max_modules as u64, k(profile, "MAX_MODULES", target));
             assert_eq!(
                 cap.state_bytes as u64,
@@ -1957,7 +2007,11 @@ mod tests {
                 cap.buffer_bytes as u64,
                 k(profile, "BUFFER_ARENA_SIZE", target)
             );
-            assert_eq!(cap.max_edges as u64, extract(&kcfg, "HOST_GRAPH_EDGES"));
+            // Both lay the graph section out for the graph: the format bound.
+            assert_eq!(
+                cap.max_edges as u64,
+                crate::capacity::GRAPH_EDGES_FORMAT_BOUND as u64
+            );
             assert_eq!(cap.max_domains as u64, extract(&sched, "MAX_DOMAINS"));
         }
         assert_eq!(
@@ -1974,13 +2028,19 @@ mod tests {
             crate::add_subgraph::MAX_ADD_EDGES as u64,
             extract(&live, "MAX_ADD_EDGES")
         );
-        // The MCU rows exist but hand out no workload owner slots:
-        // multitenancy is an aarch64 feature, so `max_owners` is the system
-        // slot alone. Their arena figures are pinned against the silicon
+        // The MCU rows exist but hand out no workload owner slots: the RP
+        // kernels are single-tenant, so `max_owners` is the system slot alone
+        // (owner.rs's last MAX_OWNERS). Their arena figures are pinned against the silicon
         // TOMLs by `capacity_mirrors_silicon_tomls`; what belongs here is the
         // half that mirrors a kernel source — profile_rp's module ceiling.
         for mcu in ["rp2040", "rp2350"] {
             let c = capacity_for_profile(mcu).unwrap_or_else(|| panic!("{mcu}: no capacity row"));
+            let single = &owner[owner.rfind("pub const MAX_OWNERS").expect("MAX_OWNERS")..];
+            assert_eq!(
+                c.max_owners as u64,
+                extract(single, "MAX_OWNERS"),
+                "{mcu} is single-tenant"
+            );
             assert_eq!(c.max_owners, 1, "{mcu} is single-tenant");
             assert_eq!(
                 c.max_modules as u64,

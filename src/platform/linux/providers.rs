@@ -714,7 +714,7 @@ unsafe fn fsync_parent_dir(path: &[u8]) -> i32 {
     let dir = parent_of(path);
     let fd = libc::open(
         dir.as_ptr() as *const libc::c_char,
-        libc::O_RDONLY | libc::O_DIRECTORY,
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
     );
     if fd < 0 {
         return -*libc::__errno_location();
@@ -838,12 +838,19 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             // persisted on disk (a typo'd `GET /api/list/nope.png` would
             // 200), so a missing file is ENOENT and the http handler
             // emits 404.
-            let fd_raw = libc::open(path_buf.as_ptr() as *const libc::c_char, libc::O_RDWR, 0);
+            let fd_raw = libc::open(
+                path_buf.as_ptr() as *const libc::c_char,
+                libc::O_RDWR | libc::O_CLOEXEC,
+                0,
+            );
             if fd_raw < 0 {
                 // Fall back to read-only (covers files we can read
                 // but not write, e.g. read-only-mounted assets).
-                let fd_raw =
-                    libc::open(path_buf.as_ptr() as *const libc::c_char, libc::O_RDONLY, 0);
+                let fd_raw = libc::open(
+                    path_buf.as_ptr() as *const libc::c_char,
+                    libc::O_RDONLY | libc::O_CLOEXEC,
+                    0,
+                );
                 if fd_raw < 0 {
                     // Preserve absence versus permission/I/O failure: storage consumers
                     // must not initialise a new world after a failed existing-file read.
@@ -874,7 +881,7 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             // policy (see comment on the OPEN arm above).
             let fd_raw = libc::open(
                 path_buf.as_ptr() as *const libc::c_char,
-                libc::O_RDWR | libc::O_CREAT,
+                libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC,
                 0o600,
             );
             if fd_raw < 0 {
@@ -1809,8 +1816,12 @@ const CONN_TYPE_UDP_BOUND: u8 = 2;
 /// as `u16 LE`. A slot holds no buffer until a send backs up, so a large
 /// table of idle connections costs only the fixed per-slot fields.
 pub const LINUX_NET_MAX_CONNS_DEFAULT: usize = 128;
-/// Hard ceiling on `max_conns`: the wire id is a `u16`.
+/// Hard ceiling on `max_conns`: the wire id is a `u16`. A configured value
+/// outside `LINUX_NET_MAX_CONNS_MIN..=LINUX_NET_MAX_CONNS_CAP` is refused at
+/// instantiation, never adjusted.
 pub const LINUX_NET_MAX_CONNS_CAP: usize = 65535;
+/// Floor on `max_conns`: one listener and one connection.
+pub const LINUX_NET_MAX_CONNS_MIN: usize = 2;
 /// Ready-event batch drained from the epoll set per step. Level
 /// triggered, so a socket left out of one batch is served next step.
 const LINUX_NET_READY_BATCH: usize = 1024;
@@ -1819,10 +1830,16 @@ pub const LINUX_NET_MAX_INBOUND: usize = 8;
 /// Lanes a workload staged at runtime may attach (`net_attach`). Attached
 /// lane `j` is lane index `LINUX_NET_MAX_INBOUND + j`, after every boot lane.
 pub const LINUX_NET_MAX_ATTACHED: usize = 32;
-/// Control frames held for one destination channel while it is full.
-/// Bounded so a wedged consumer cannot grow it without limit; past the cap
-/// the oldest frame is dropped.
-const PENDING_CTRL_CAP: usize = 256;
+/// Control frames held for one destination channel while it is full. At the
+/// cap the sources that would add to it pause: the lane's commands are left
+/// in its command channel and its listeners' pending connections in the
+/// kernel's accept queue, so a wedged consumer back-pressures its producer.
+/// No queued frame is ever evicted. What can still arrive while paused is
+/// bounded by the slots the lane already holds (each emits at most a
+/// connect result, a peer report and a close), so the queue never passes
+/// [`LinuxNetState::pending_ctrl_ceiling`]; a frame refused there is
+/// counted and logged.
+pub const PENDING_CTRL_CAP: usize = 256;
 /// Per-connection write backlog cap when the graph does not set
 /// `write_buf_kib`. 128 KiB holds a full Spectrum video frame's worth of
 /// WS fragments (~98 KB) so a slow peer can absorb one frame's
@@ -1831,8 +1848,10 @@ const PENDING_CTRL_CAP: usize = 256;
 /// time a send backs up and released with the slot, so the cap is a
 /// per-connection worst case, not a resident cost.
 pub const LINUX_NET_WRITE_BUF_DEFAULT: usize = 128 * 1024;
-/// The largest command frame payload read (the command scratch).
-const LINUX_NET_CMD_MAX: usize = 49152;
+/// The largest command frame payload read (the command scratch). A larger
+/// frame is drained to stay frame-aligned and answered `EMSGSIZE` in the
+/// shape its command's requester waits on.
+pub const LINUX_NET_CMD_MAX: usize = 49152;
 /// Listen backlog when the graph does not set `listen_backlog`. The
 /// kernel's SYN queue must absorb a whole connect burst; at 8 a
 /// 32-client burst dropped SYNs 9..=32.
@@ -1915,7 +1934,23 @@ struct LinuxNetConn {
     /// flight. The first of any of them to connect wins and the rest are
     /// closed; a consumer never learns a race happened.
     racing: Vec<i32>,
+    /// Datagram endpoints only: for each peer heard from, the local address
+    /// its last datagram arrived at, `(peer addr, peer port, local addr)`
+    /// with addresses as `s_addr`. A send to that peer leaves from that
+    /// address, so an endpoint bound to every address answers from the one
+    /// it was asked at — not from whichever source the route prefers, which
+    /// the asker (and connection tracking, for a translated service) would
+    /// not take for the answer. At most [`DG_REPLY_FROM_MAX`] peers, the
+    /// longest unheard replaced first.
+    dg_reply_from: Vec<(u32, u16, u32)>,
+    /// Datagram endpoints only: arrivals not delivered to the consumer — its
+    /// channel was full or held control frames, or the datagram was larger
+    /// than one frame carries.
+    dg_rx_dropped: u64,
 }
+
+/// Peers a datagram endpoint remembers the arrival address of.
+const DG_REPLY_FROM_MAX: usize = 64;
 
 impl LinuxNetConn {
     fn empty() -> Self {
@@ -1939,13 +1974,18 @@ impl LinuxNetConn {
             alts: Vec::new(),
             attempt_started: None,
             racing: Vec::new(),
+            dg_reply_from: Vec::new(),
+            dg_rx_dropped: 0,
         }
     }
 }
 
-/// Largest control frame a lane queue holds: a tagged `MSG_ERROR`
-/// (`[type][len: u16][conn_id: u16][errno][requester_tag: u16]`).
-const CTRL_FRAME_MAX: usize = 3 + 2 + 1 + 2;
+/// Largest control frame a lane queue holds: a stream's peer report
+/// (`MSG_PEER`, `[type][len: u16][conn_id: u16][family][addr: 16][port: u16]`),
+/// queued with the accept it follows. Every control frame fits it, which
+/// `linux_net_send_msg` checks at compile time; data (`MSG_DATA`,
+/// `DG_MSG_RX_FROM`) is never queued.
+const CTRL_FRAME_MAX: usize = 3 + crate::abi::contracts::net::net_proto::PEER_LEN;
 
 /// Control frames waiting for room on one destination channel, in order.
 type PendingCtrl = std::collections::VecDeque<([u8; CTRL_FRAME_MAX], usize)>;
@@ -2006,12 +2046,11 @@ pub struct LinuxNetState {
     /// Scratch for one `epoll_wait` batch.
     ready: Vec<libc::epoll_event>,
     ready_len: usize,
-    /// Sized to absorb a full multi-MSS `CMD_SEND` payload. The
-    /// upstream HTTP module stages up to `NET_BUF_SIZE` bytes per
-    /// call (8 KiB on aarch64); a smaller cmd_buf would silently
-    /// truncate the second `channel_read` and corrupt the next
-    /// frame's header parse. Sized at 16 KiB to leave headroom for
-    /// any future raise in `NET_BUF_SIZE` without re-sync.
+    /// One command frame's payload, `LINUX_NET_CMD_MAX` (48 KiB) bytes:
+    /// several times net_proto's `MAX_CMD_DATA` (8 KiB of `CMD_SEND` data
+    /// plus its conn id), so every conforming command fits. A frame whose
+    /// payload is larger is drained and answered `EMSGSIZE`, never read in
+    /// part.
     cmd_buf: [u8; LINUX_NET_CMD_MAX],
     msg_buf: [u8; 16384],
     recv_buf: [u8; 16384],
@@ -2039,8 +2078,15 @@ pub struct LinuxNetState {
     /// one per `net_outs` channel. The consumer channel is all-or-nothing;
     /// when it's momentarily full a tiny control frame would otherwise be
     /// DROPPED, stranding a waiter. Queue it and flush before each step.
-    /// Bounded at `PENDING_CTRL_CAP`. Attached lanes queue on their own.
+    /// At `PENDING_CTRL_CAP` the lane's sources pause; nothing queued is
+    /// evicted. Attached lanes queue on their own.
     pending_ctrl: [PendingCtrl; LINUX_NET_MAX_INBOUND],
+    /// Control frames refused at `pending_ctrl_ceiling`. The pause at
+    /// `PENDING_CTRL_CAP` keeps a queue below the ceiling, so this staying
+    /// zero is the design holding.
+    ctrl_refused: u64,
+    /// Datagrams received and not delivered, over every endpoint.
+    dg_rx_dropped: u64,
     /// Runtime-attached lanes; entry `j` is lane `LINUX_NET_MAX_INBOUND + j`.
     /// A detached entry is `None` and its index may be reused, which is safe
     /// because detaching closes every slot the lane created.
@@ -2069,7 +2115,7 @@ pub struct LinuxNetState {
 
 /// One address a name resolved to, in network order as the socket wants it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Resolved {
+pub enum Resolved {
     V4([u8; 4]),
     V6([u8; 16]),
 }
@@ -2082,11 +2128,12 @@ struct DnsCacheEntry {
     expires: std::time::Instant,
 }
 
-/// How many addresses one name may be dialled at, in the host's order. A
-/// name that resolves to more than this is not worth a longer ladder: the
-/// connect timeout bounds each rung, and a host with four dead addresses is
-/// down, not slow.
-const MAX_DIAL_CANDIDATES: usize = 4;
+/// How many addresses one name may be dialled at. A name that resolves to
+/// more than this is not worth a longer ladder: the connect timeout bounds
+/// each rung, and a host with four dead addresses is down, not slow. The cut
+/// is taken after the families are interleaved ([`dial_candidates`]), so
+/// both families are dialled whenever the host answered both.
+pub const MAX_DIAL_CANDIDATES: usize = 4;
 
 /// Cache entries per instance; one slot per distinct name the graph dials.
 const DNS_CACHE_SLOTS: usize = 32;
@@ -2151,7 +2198,8 @@ impl Resolver {
 
 /// `getaddrinfo(3)` with `AI_ADDRCONFIG`: the host's resolver, hosts file
 /// and nsswitch order, which is the order the candidates are returned in.
-/// The caller dials them in turn. Runs on the resolver thread only.
+/// Every address is returned; the caller picks the ones it dials with
+/// [`dial_candidates`]. Runs on the resolver thread only.
 fn resolve_blocking(name: &str, v4_only: bool) -> Result<Vec<Resolved>, i32> {
     let cname = match std::ffi::CString::new(name) {
         Ok(c) => c,
@@ -2177,7 +2225,7 @@ fn resolve_blocking(name: &str, v4_only: bool) -> Result<Vec<Resolved>, i32> {
         }
         let mut found: Vec<Resolved> = Vec::new();
         let mut cur = res;
-        while !cur.is_null() && found.len() < MAX_DIAL_CANDIDATES {
+        while !cur.is_null() {
             let ai = &*cur;
             if ai.ai_family == libc::AF_INET && !ai.ai_addr.is_null() {
                 let sa = &*(ai.ai_addr as *const libc::sockaddr_in);
@@ -2269,7 +2317,9 @@ impl LinuxNetState {
     /// Build the per-instance state on the heap. The connection table is
     /// a `Vec` of small slot records; write backlogs are allocated per
     /// connection on first use, so the size of this struct does not
-    /// scale with `max_conns * write_buf_max`.
+    /// scale with `max_conns * write_buf_max`. A `max_conns` outside
+    /// `LINUX_NET_MAX_CONNS_MIN..=LINUX_NET_MAX_CONNS_CAP` is refused with
+    /// the reason, never adjusted to fit.
     pub fn new(
         net_ins: [i32; LINUX_NET_MAX_INBOUND],
         lane_owners: [crate::kernel::workload::owner::OwnerHandle; LINUX_NET_MAX_INBOUND],
@@ -2278,8 +2328,14 @@ impl LinuxNetState {
         max_conns: usize,
         write_buf_max: usize,
         listen_backlog: i32,
-    ) -> Box<Self> {
-        let max_conns = max_conns.clamp(2, LINUX_NET_MAX_CONNS_CAP);
+    ) -> Result<Box<Self>, String> {
+        if !(LINUX_NET_MAX_CONNS_MIN..=LINUX_NET_MAX_CONNS_CAP).contains(&max_conns) {
+            return Err(format!(
+                "max_conns {max_conns} is outside [{LINUX_NET_MAX_CONNS_MIN}, \
+                 {LINUX_NET_MAX_CONNS_CAP}] (the conn id is a u16 and the table needs a \
+                 listener and a connection)"
+            ));
+        }
         let mut conns = Vec::with_capacity(max_conns);
         for _ in 0..max_conns {
             conns.push(LinuxNetConn::empty());
@@ -2293,7 +2349,7 @@ impl LinuxNetState {
         for _ in 0..LINUX_NET_READY_BATCH {
             ready.push(libc::epoll_event { events: 0, u64: 0 });
         }
-        Box::new(Self {
+        Ok(Box::new(Self {
             net_ins,
             lane_owners,
             net_outs,
@@ -2321,7 +2377,51 @@ impl LinuxNetState {
             warming: Vec::new(),
             resolving: 0,
             dns_cache: Vec::new(),
-        })
+            ctrl_refused: 0,
+            dg_rx_dropped: 0,
+        }))
+    }
+
+    /// Control frames refused because a destination's queue stood at
+    /// [`Self::pending_ctrl_ceiling`].
+    pub fn ctrl_refused(&self) -> u64 {
+        self.ctrl_refused
+    }
+
+    /// Datagrams received and not delivered, over every endpoint.
+    pub fn dg_rx_dropped(&self) -> u64 {
+        self.dg_rx_dropped
+    }
+
+    /// Datagrams endpoint `ep` received and did not deliver.
+    pub fn dg_endpoint_rx_dropped(&self, ep: usize) -> u64 {
+        self.conns.get(ep).map_or(0, |c| c.dg_rx_dropped)
+    }
+
+    /// Control frames waiting for `lane`'s events channel.
+    pub fn pending_ctrl_len(&self, lane: usize) -> usize {
+        if lane < LINUX_NET_MAX_INBOUND {
+            return self.pending_ctrl[self.lane_out[lane] as usize].len();
+        }
+        self.attached
+            .get(lane - LINUX_NET_MAX_INBOUND)
+            .and_then(|a| a.as_ref())
+            .map_or(0, |a| a.pending.len())
+    }
+
+    /// Whether `lane`'s control queue is at [`PENDING_CTRL_CAP`]: its
+    /// commands and accepts wait until the consumer reads.
+    fn lane_paused(&self, lane: usize) -> bool {
+        self.pending_ctrl_len(lane) >= PENDING_CTRL_CAP
+    }
+
+    /// The most frames one destination's queue can hold. A paused lane
+    /// creates no slot, so past [`PENDING_CTRL_CAP`] the queue grows only
+    /// by what the slots that exist still owe — at most three frames each
+    /// (`MSG_CONNECTED`, `MSG_PEER`, `MSG_CLOSED`) — plus the two frames one
+    /// command or accept emits before the pause is seen.
+    pub fn pending_ctrl_ceiling(&self) -> usize {
+        PENDING_CTRL_CAP + 2 + 3 * self.conns.len()
     }
 
     /// Register `fd` (held by slot `slot`) for `events` in the epoll set.
@@ -2730,47 +2830,53 @@ fn linux_net_alloc_conn(st: &mut LinuxNetState) -> i32 {
     -1
 }
 
-/// Emit one message to `lane`'s events channel: the lane a slot's events
-/// belong to, or the lane whose command a slot-less result answers.
-unsafe fn linux_net_send_msg(st: &mut LinuxNetState, lane: usize, data: &[u8]) {
+/// Emit one control frame, `[type][payload]`, to `lane`'s events channel:
+/// the lane a slot's events belong to, or the lane whose command a
+/// slot-less result answers. Every control frame fits a queue slot, checked
+/// at compile time, so none can be too large to build. Ordering is per
+/// destination: a frame that cannot be written now, or that would overtake
+/// one already queued, is queued behind it. Nothing queued is evicted; the
+/// lane's sources pause at [`PENDING_CTRL_CAP`] instead, and a frame that
+/// finds the queue at [`LinuxNetState::pending_ctrl_ceiling`] is counted and
+/// logged.
+unsafe fn linux_net_send_msg<const N: usize>(st: &mut LinuxNetState, lane: usize, data: &[u8; N]) {
+    const {
+        assert!(
+            N >= 1 && N + 2 <= CTRL_FRAME_MAX,
+            "a control frame must fit a queue slot"
+        );
+    }
     let events = lane_events(st, lane);
-    if events < 0 || data.is_empty() {
+    if events < 0 {
         return;
     }
-    let msg_type = data[0];
-    let payload = &data[1..];
-    let payload_len = payload.len() as u16;
-    // Sized to fit a max-payload UDP datagram (1500 MTU) + the
-    // datagram-surface header overhead (1 op + 2 len + 9 ep/AF/port/ip).
-    let mut frame = [0u8; 1600];
-    if 3 + payload.len() > frame.len() {
-        return;
-    }
-    frame[0] = msg_type;
+    let payload_len = (N - 1) as u16;
+    let total = N + 2;
+    let mut frame = [0u8; CTRL_FRAME_MAX];
+    frame[0] = data[0];
     frame[1] = payload_len as u8;
     frame[2] = (payload_len >> 8) as u8;
-    if !payload.is_empty() {
-        frame[3..3 + payload.len()].copy_from_slice(payload);
-    }
-    let total = 3 + payload.len();
-    // Preserve ordering: if anything is already queued, OR this write doesn't
-    // fully land, enqueue for retry rather than dropping the terminal result.
-    // Small control frames (≤ CTRL_FRAME_MAX) fit the queue slot; larger frames (datagram
-    // RX) fall back to best-effort (they're not terminal results).
-    // Ordering is per destination: only this lane's queue stands in front.
+    frame[3..total].copy_from_slice(&data[1..]);
     let queued_empty = st.flush_lane(lane);
     if queued_empty && channel::channel_write(events, frame.as_ptr(), total) == total as i32 {
         return;
     }
-    if total <= CTRL_FRAME_MAX {
-        if let Some(q) = st.lane_queue(lane) {
-            if q.len() >= PENDING_CTRL_CAP {
-                q.pop_front(); // bounded — drop oldest under sustained wedge
-            }
-            let mut slot = [0u8; CTRL_FRAME_MAX];
-            slot[..total].copy_from_slice(&frame[..total]);
-            q.push_back((slot, total));
+    let ceiling = st.pending_ctrl_ceiling();
+    let queued = match st.lane_queue(lane) {
+        Some(q) if q.len() < ceiling => {
+            q.push_back((frame, total));
+            true
         }
+        _ => false,
+    };
+    if !queued {
+        st.ctrl_refused += 1;
+        log::error!(
+            "[linux_net] lane {lane}: control frame 0x{:02x} refused, its queue is at its \
+             ceiling of {ceiling} ({} refused)",
+            data[0],
+            st.ctrl_refused
+        );
     }
 }
 
@@ -2784,6 +2890,41 @@ fn connect_error_frame(
     let c = conn_id.to_le_bytes();
     let t = tag.to_le_bytes();
     [MSG_ERROR, c[0], c[1], errno, t[0], t[1]]
+}
+
+/// Report stream `conn_id`'s peer (`MSG_PEER`), the socket's remote end,
+/// queued after the `MSG_ACCEPTED` / `MSG_CONNECTED` it follows and ahead of
+/// the stream's data.
+unsafe fn linux_net_send_peer(st: &mut LinuxNetState, lane: usize, conn_id: usize, fd: i32) {
+    use crate::abi::contracts::net::net_proto as np;
+    let mut ss: libc::sockaddr_storage = core::mem::zeroed();
+    let mut len = core::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    if libc::getpeername(fd, &mut ss as *mut _ as *mut libc::sockaddr, &mut len) != 0 {
+        return;
+    }
+    let mut addr = [0u8; 16];
+    let (family, port) = match ss.ss_family as i32 {
+        libc::AF_INET => {
+            let a = &*(&ss as *const _ as *const libc::sockaddr_in);
+            addr[..4].copy_from_slice(&a.sin_addr.s_addr.to_ne_bytes());
+            (np::AF_INET, u16::from_be(a.sin_port))
+        }
+        libc::AF_INET6 => {
+            let a = &*(&ss as *const _ as *const libc::sockaddr_in6);
+            addr = a.sin6_addr.s6_addr;
+            (np::AF_INET6, u16::from_be(a.sin6_port))
+        }
+        _ => return,
+    };
+    let mut frame = [0u8; 3 + np::PEER_LEN];
+    if np::write_peer(&mut frame, conn_id as u16, family, &addr, port).is_none() {
+        return;
+    }
+    // `linux_net_send_msg` takes `[type][payload]` and frames it.
+    let mut msg = [0u8; 1 + np::PEER_LEN];
+    msg[0] = np::MSG_PEER;
+    msg[1..].copy_from_slice(&frame[3..]);
+    linux_net_send_msg(st, lane, &msg);
 }
 
 /// `MSG_CONNECTED [conn_id: u16 LE][requester_tag: u16 LE]`.
@@ -2811,7 +2952,12 @@ unsafe fn linux_net_send_bind_refused(st: &mut LinuxNetState, lane: usize, port:
 /// allocated. Emitting both frames is additive-safe: each surface's
 /// listeners match only their own opcode.
 unsafe fn linux_net_send_dg_error(st: &mut LinuxNetState, lane: usize, errno: u8) {
-    let msg = [DG_MSG_ERROR, 0xFF, errno];
+    linux_net_send_dg_ep_error(st, lane, 0xFF, errno);
+}
+
+/// `DG_MSG_ERROR [ep_id][errno]` for endpoint `ep` (0xFF: none).
+unsafe fn linux_net_send_dg_ep_error(st: &mut LinuxNetState, lane: usize, ep: u8, errno: u8) {
+    let msg = [DG_MSG_ERROR, ep, errno];
     linux_net_send_msg(st, lane, &msg);
 }
 
@@ -2906,7 +3052,7 @@ unsafe fn linux_net_cmd_bind(st: &mut LinuxNetState, port: u16, lane: usize) {
         return;
     }
 
-    let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+    let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
     if fd < 0 {
         log::error!("[linux_net] socket() failed");
         linux_net_send_bind_refused(st, lane, port, 23); // ENFILE
@@ -3017,7 +3163,7 @@ unsafe fn linux_net_dg_cmd_bind(st: &mut LinuxNetState, port: u16, owner_tag: u1
         return;
     }
 
-    let fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
+    let fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0);
     if fd < 0 {
         log::error!("[linux_net] UDP socket() failed");
         linux_net_send_bind_refused(st, lane, port, 23); // ENFILE
@@ -3029,6 +3175,14 @@ unsafe fn linux_net_dg_cmd_bind(st: &mut LinuxNetState, port: u16, owner_tag: u1
         fd,
         libc::SOL_SOCKET,
         libc::SO_REUSEADDR,
+        &opt as *const i32 as *const libc::c_void,
+        4,
+    );
+    // Each datagram's arrival address, so its answer leaves from it.
+    libc::setsockopt(
+        fd,
+        libc::IPPROTO_IP,
+        libc::IP_PKTINFO,
         &opt as *const i32 as *const libc::c_void,
         4,
     );
@@ -3134,14 +3288,81 @@ unsafe fn linux_net_dg_cmd_send_to(
     addr.sin_family = libc::AF_INET as u16;
     addr.sin_port = port.to_be();
     addr.sin_addr.s_addr = u32::from_le_bytes([ip[0], ip[1], ip[2], ip[3]]);
-    libc::sendto(
-        fd,
-        data.as_ptr() as *const libc::c_void,
-        data.len(),
-        libc::MSG_NOSIGNAL,
-        &addr as *const libc::sockaddr_in as *const libc::sockaddr,
-        core::mem::size_of::<libc::sockaddr_in>() as u32,
-    );
+    let from = st.conns[idx]
+        .dg_reply_from
+        .iter()
+        .find(|(a, p, _)| *a == addr.sin_addr.s_addr && *p == port)
+        .map(|e| e.2);
+    dg_send_from(fd, &addr, from, data);
+}
+
+/// Send `data` to `to` on `fd`, from local address `from` (`s_addr`) when
+/// given — an answer leaves from the address its question arrived at — and
+/// from the route's preferred source otherwise.
+unsafe fn dg_send_from(fd: i32, to: &libc::sockaddr_in, from: Option<u32>, data: &[u8]) {
+    let mut iov = libc::iovec {
+        iov_base: data.as_ptr() as *mut libc::c_void,
+        iov_len: data.len(),
+    };
+    // Room for one `in_pktinfo` control message, aligned as cmsg requires.
+    let mut cbuf = [0u64; 8];
+    let mut msg: libc::msghdr = core::mem::zeroed();
+    msg.msg_name = to as *const libc::sockaddr_in as *mut libc::c_void;
+    msg.msg_namelen = core::mem::size_of::<libc::sockaddr_in>() as u32;
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    if let Some(src) = from {
+        let space = libc::CMSG_SPACE(core::mem::size_of::<libc::in_pktinfo>() as u32) as usize;
+        msg.msg_control = cbuf.as_mut_ptr() as *mut libc::c_void;
+        msg.msg_controllen = space.min(core::mem::size_of_val(&cbuf)) as _;
+        let c = libc::CMSG_FIRSTHDR(&msg);
+        if !c.is_null() {
+            (*c).cmsg_level = libc::IPPROTO_IP;
+            (*c).cmsg_type = libc::IP_PKTINFO;
+            (*c).cmsg_len = libc::CMSG_LEN(core::mem::size_of::<libc::in_pktinfo>() as u32) as _;
+            let info = libc::in_pktinfo {
+                ipi_ifindex: 0,
+                ipi_spec_dst: libc::in_addr { s_addr: src },
+                ipi_addr: libc::in_addr { s_addr: 0 },
+            };
+            core::ptr::write_unaligned(libc::CMSG_DATA(c) as *mut libc::in_pktinfo, info);
+        }
+    }
+    libc::sendmsg(fd, &msg, libc::MSG_NOSIGNAL);
+}
+
+/// The local address a datagram arrived at, from its `IP_PKTINFO`: the
+/// header's destination when it is a unicast one, else the address the host
+/// would answer a broadcast or multicast from.
+unsafe fn dg_arrival_addr(msg: &libc::msghdr) -> Option<u32> {
+    let mut c = libc::CMSG_FIRSTHDR(msg);
+    while !c.is_null() {
+        if (*c).cmsg_level == libc::IPPROTO_IP && (*c).cmsg_type == libc::IP_PKTINFO {
+            let info = core::ptr::read_unaligned(libc::CMSG_DATA(c) as *const libc::in_pktinfo);
+            let dst = info.ipi_addr.s_addr;
+            let first = dst.to_le_bytes()[0];
+            let unicast = dst != 0 && dst != u32::MAX && !(224..=239).contains(&first);
+            let a = if unicast {
+                dst
+            } else {
+                info.ipi_spec_dst.s_addr
+            };
+            return (a != 0).then_some(a);
+        }
+        c = libc::CMSG_NXTHDR(msg, c);
+    }
+    None
+}
+
+/// Remember that `peer` reached `conn` at local address `local`.
+fn dg_note_arrival(conn: &mut LinuxNetConn, peer: (u32, u16), local: u32) {
+    let v = &mut conn.dg_reply_from;
+    if let Some(at) = v.iter().position(|(a, p, _)| (*a, *p) == peer) {
+        v.remove(at);
+    } else if v.len() >= DG_REPLY_FROM_MAX {
+        v.remove(0);
+    }
+    v.push((peer.0, peer.1, local));
 }
 
 unsafe fn linux_net_dg_cmd_close(st: &mut LinuxNetState, lane: usize, ep: i16, claimed_tag: u16) {
@@ -3168,6 +3389,10 @@ unsafe fn linux_net_dg_cmd_close(st: &mut LinuxNetState, lane: usize, ep: i16, c
 }
 
 unsafe fn linux_net_dg_poll_recv(st: &mut LinuxNetState) -> bool {
+    // `DG_MSG_RX_FROM [ep_id][af = 4][src_addr: 4 BE][src_port: u16 LE][data]`,
+    // built whole in `msg_buf`: the datagram is received straight after its
+    // header, so the largest one delivered is what one frame there carries.
+    const HDR: usize = 3 + 1 + 1 + 4 + 2;
     let mut had_work = false;
     let mut k = 0;
     while k < st.ready_len {
@@ -3180,45 +3405,74 @@ unsafe fn linux_net_dg_poll_recv(st: &mut LinuxNetState) -> bool {
             && st.conns[i].fd >= 0
         {
             let mut from: libc::sockaddr_in = core::mem::zeroed();
-            let mut from_len: libc::socklen_t = core::mem::size_of::<libc::sockaddr_in>() as u32;
-            let n = libc::recvfrom(
-                st.conns[i].fd,
-                st.recv_buf.as_mut_ptr() as *mut libc::c_void,
-                st.recv_buf.len(),
-                0,
-                &mut from as *mut libc::sockaddr_in as *mut libc::sockaddr,
-                &mut from_len,
-            );
+            let mut iov = libc::iovec {
+                iov_base: st.msg_buf.as_mut_ptr().add(HDR) as *mut libc::c_void,
+                iov_len: st.msg_buf.len() - HDR,
+            };
+            let mut cbuf = [0u64; 8];
+            let mut mh: libc::msghdr = core::mem::zeroed();
+            mh.msg_name = &mut from as *mut libc::sockaddr_in as *mut libc::c_void;
+            mh.msg_namelen = core::mem::size_of::<libc::sockaddr_in>() as u32;
+            mh.msg_iov = &mut iov;
+            mh.msg_iovlen = 1;
+            mh.msg_control = cbuf.as_mut_ptr() as *mut libc::c_void;
+            mh.msg_controllen = core::mem::size_of_val(&cbuf) as _;
+            let n = libc::recvmsg(st.conns[i].fd, &mut mh, 0);
             if n > 0 {
                 let n = n as usize;
                 let port = u16::from_be(from.sin_port);
-                let ip_b = from.sin_addr.s_addr.to_le_bytes();
-                // MSG_DG_RX_FROM IPv4 payload (datagram contract):
-                //   [ep_id:1][af:1=4][src_addr:4 BE][src_port:2 LE][data...].
-                let payload_len = 1 + 1 + 4 + 2 + n;
-                if 1 + payload_len > st.msg_buf.len() {
-                    k += 1;
-                    continue;
+                if let Some(local) = dg_arrival_addr(&mh) {
+                    dg_note_arrival(&mut st.conns[i], (from.sin_addr.s_addr, port), local);
                 }
-                st.msg_buf[0] = DG_MSG_RX_FROM;
-                st.msg_buf[1] = i as u8;
-                st.msg_buf[2] = DG_AF_INET;
-                st.msg_buf[3] = ip_b[0];
-                st.msg_buf[4] = ip_b[1];
-                st.msg_buf[5] = ip_b[2];
-                st.msg_buf[6] = ip_b[3];
-                st.msg_buf[7] = (port & 0xFF) as u8;
-                st.msg_buf[8] = (port >> 8) as u8;
-                core::ptr::copy_nonoverlapping(
-                    st.recv_buf.as_ptr(),
-                    st.msg_buf.as_mut_ptr().add(9),
-                    n,
-                );
-                // Copy out so `st` is free to borrow mutably in the send (the
-                // datagram RX frame lives in `st.msg_buf`).
-                let msg = st.msg_buf[..1 + payload_len].to_vec();
                 let lane = st.conns[i].lane as usize;
-                linux_net_send_msg(st, lane, &msg);
+                let total = HDR + n;
+                let delivered = if mh.msg_flags & libc::MSG_TRUNC != 0 {
+                    // Larger than a frame carries: a cut datagram is never
+                    // delivered as if it were whole.
+                    false
+                } else {
+                    let payload_len = (total - 3) as u16;
+                    let ip_b = from.sin_addr.s_addr.to_le_bytes();
+                    let pb = port.to_le_bytes();
+                    st.msg_buf[..HDR].copy_from_slice(&[
+                        DG_MSG_RX_FROM,
+                        payload_len as u8,
+                        (payload_len >> 8) as u8,
+                        i as u8,
+                        DG_AF_INET,
+                        ip_b[0],
+                        ip_b[1],
+                        ip_b[2],
+                        ip_b[3],
+                        pb[0],
+                        pb[1],
+                    ]);
+                    let events = lane_events(st, lane);
+                    // A datagram never overtakes a queued control frame (the
+                    // endpoint's own DG_MSG_BOUND among them).
+                    events >= 0
+                        && st.flush_lane(lane)
+                        && channel::channel_write(events, st.msg_buf.as_ptr(), total)
+                            == total as i32
+                };
+                if !delivered {
+                    // UDP may drop; it is never dropped uncounted.
+                    st.conns[i].dg_rx_dropped += 1;
+                    st.dg_rx_dropped += 1;
+                    if st.dg_rx_dropped.is_power_of_two() {
+                        log::warn!(
+                            "[linux_net] datagram endpoint {i}: {} arrival(s) not delivered \
+                             ({} over every endpoint; the latest {n} B{})",
+                            st.conns[i].dg_rx_dropped,
+                            st.dg_rx_dropped,
+                            if mh.msg_flags & libc::MSG_TRUNC != 0 {
+                                ", larger than a frame"
+                            } else {
+                                ", its consumer's channel full"
+                            }
+                        );
+                    }
+                }
                 had_work = true;
             }
         }
@@ -3266,7 +3520,7 @@ unsafe fn linux_net_cmd_connect_to(
     let owner = lane_owner(st, lane);
     match addrs {
         Some(addrs) if !addrs.is_empty() => {
-            let mut addrs = interleave_families(addrs);
+            let mut addrs = dial_candidates(addrs);
             let first = addrs.remove(0);
             let dial = Dial {
                 sock_type,
@@ -3334,7 +3588,10 @@ unsafe fn linux_net_drain_resolved(st: &mut LinuxNetState) -> bool {
         if done.slot.is_none() {
             st.warming.retain(|n| *n != done.name);
         }
-        if let Ok(addrs) = &done.result {
+        // The candidates are chosen once, and the cache holds exactly them,
+        // so a name answered from cache dials as a fresh one does.
+        let result = done.result.map(dial_candidates);
+        if let Ok(addrs) = &result {
             st.dns_cache_put(done.name.clone(), addrs.clone());
         }
         let Some(idx) = done.slot else {
@@ -3349,9 +3606,9 @@ unsafe fn linux_net_drain_resolved(st: &mut LinuxNetState) -> bool {
             let c = &st.conns[idx];
             (c.conn_type, c.port, c.connect_tag, c.owner, c.lane)
         };
-        match done.result {
+        match result {
             Ok(addrs) if !addrs.is_empty() => {
-                let mut addrs = interleave_families(addrs);
+                let mut addrs = addrs;
                 let first = addrs.remove(0);
                 let dial = Dial {
                     sock_type,
@@ -3412,7 +3669,7 @@ unsafe fn linux_net_drain_resolved(st: &mut LinuxNetState) -> bool {
 ///
 /// The host's ordering WITHIN a family is preserved: that part encodes
 /// policy this provider has no better view of.
-fn interleave_families(addrs: Vec<Resolved>) -> Vec<Resolved> {
+pub fn interleave_families(addrs: Vec<Resolved>) -> Vec<Resolved> {
     let mut first: Vec<Resolved> = Vec::with_capacity(addrs.len());
     let mut second: Vec<Resolved> = Vec::new();
     // Whichever family the host put first keeps the lead: its preference
@@ -3442,6 +3699,16 @@ fn interleave_families(addrs: Vec<Resolved>) -> Vec<Resolved> {
             }
         }
     }
+    out
+}
+
+/// The addresses a name is dialled at, in dial order: every address the host
+/// answered, families interleaved, then cut to [`MAX_DIAL_CANDIDATES`]. The
+/// cut comes after the interleave, so a host that answers several addresses
+/// of one family ahead of the other is still dialled over both.
+pub fn dial_candidates(addrs: Vec<Resolved>) -> Vec<Resolved> {
+    let mut out = interleave_families(addrs);
+    out.truncate(MAX_DIAL_CANDIDATES);
     out
 }
 
@@ -3486,7 +3753,7 @@ unsafe fn start_connect(addr: Resolved, port: u16) -> Option<i32> {
         Resolved::V4(_) => libc::AF_INET,
         Resolved::V6(_) => libc::AF_INET6,
     };
-    let fd = libc::socket(family, libc::SOCK_STREAM, 0);
+    let fd = libc::socket(family, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
     if fd < 0 {
         return None;
     }
@@ -3533,7 +3800,7 @@ unsafe fn linux_net_dial(st: &mut LinuxNetState, idx: usize, addr: Resolved, dia
         Resolved::V4(_) => libc::AF_INET,
         Resolved::V6(_) => libc::AF_INET6,
     };
-    let fd = libc::socket(family, libc::SOCK_STREAM, 0);
+    let fd = libc::socket(family, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
     if fd < 0 {
         log::error!("[linux_net] socket() failed for connect");
         let errno = *libc::__errno_location();
@@ -3607,6 +3874,7 @@ unsafe fn linux_net_dial(st: &mut LinuxNetState, idx: usize, addr: Resolved, dia
         let cb = (idx as u16).to_le_bytes();
         let msg = connected_frame(cb, dial.tag);
         linux_net_send_msg(st, dial.lane as usize, &msg);
+        linux_net_send_peer(st, dial.lane as usize, idx, fd);
     }
 }
 
@@ -3929,6 +4197,13 @@ unsafe fn linux_net_poll_accept(st: &mut LinuxNetState) -> bool {
         let listener_lane = st.conns[li].lane;
         let mut accepted_on_this_listener: u32 = 0;
         while accepted_on_this_listener < PER_TICK_ACCEPT_BUDGET {
+            // A lane whose control queue is full takes no new connection:
+            // it would owe an accept the lane cannot yet be told about. The
+            // kernel's accept queue holds it until the consumer reads.
+            if st.lane_paused(listener_lane as usize) {
+                had_work = true;
+                break;
+            }
             let mut addr: libc::sockaddr_in = core::mem::zeroed();
             let mut addr_len: libc::socklen_t = core::mem::size_of::<libc::sockaddr_in>() as u32;
 
@@ -3936,7 +4211,7 @@ unsafe fn linux_net_poll_accept(st: &mut LinuxNetState) -> bool {
                 listener_fd,
                 &mut addr as *mut libc::sockaddr_in as *mut libc::sockaddr,
                 &mut addr_len,
-                libc::SOCK_NONBLOCK,
+                libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
             );
             if client_fd < 0 {
                 break; // EAGAIN / EWOULDBLOCK — queue drained
@@ -4078,6 +4353,7 @@ unsafe fn accept_one_client(
     let cb = (idx as u16).to_le_bytes();
     let msg = [MSG_ACCEPTED, cb[0], cb[1], pb[0], pb[1]];
     linux_net_send_msg(st, lane as usize, &msg);
+    linux_net_send_peer(st, lane as usize, idx, client_fd);
     log::info!("[linux_net] accepted conn_id={idx}");
 }
 
@@ -4096,6 +4372,11 @@ unsafe fn forward_chunks(
 ) -> usize {
     const MAX_DATA_FRAGMENT: usize = 1460; // mirrors net_proto::MAX_DATA_FRAGMENT
     let events = lane_events(st, lane);
+    // Data never overtakes a queued control frame (an accept and its peer
+    // report): it waits, as for a full channel.
+    if !st.flush_lane(lane) {
+        return from;
+    }
     let mut off = from;
     while off < total {
         let chunk = (total - off).min(MAX_DATA_FRAGMENT);
@@ -4219,6 +4500,7 @@ unsafe fn linux_net_poll_recv(st: &mut LinuxNetState) -> bool {
                     let msg = connected_frame(cb, tag);
                     let lane = st.conns[i].lane as usize;
                     linux_net_send_msg(st, lane, &msg);
+                    linux_net_send_peer(st, lane, i, fd);
                     had_work = true;
                 } else if !dead.is_empty() {
                     // Drop the attempts that failed. The slot only falls to
@@ -4350,6 +4632,78 @@ unsafe fn linux_net_poll_recv(st: &mut LinuxNetState) -> bool {
     had_work
 }
 
+/// Leading payload bytes kept from an oversized command: enough for the
+/// retired `CMD_CONNECT`'s tag at bytes 7..9.
+const OVERSIZED_HEAD: usize = 9;
+
+/// Answer a command frame larger than `LINUX_NET_CMD_MAX` with `EMSGSIZE`,
+/// in the shape its requester waits on: a dial's `MSG_ERROR` on its tag
+/// (`CMD_CONNECT_TO`'s last two bytes, the retired `CMD_CONNECT`'s 7..9), a
+/// bind's `MSG_BIND_REFUSED` (with `DG_MSG_ERROR` for a datagram bind), a
+/// datagram send's or close's `DG_MSG_ERROR` on its endpoint, and a stream
+/// command's `MSG_ERROR` on its connection. An oversized `CMD_SEND` has lost
+/// bytes from the middle of the stream, so the connection is closed after
+/// the error (`MSG_CLOSED`): the peer must not read a stream with a hole in
+/// it as whole. A connection or endpoint the lane may not act on is not
+/// touched and its id is not echoed. An opcode with no requester shape is
+/// logged.
+unsafe fn linux_net_refuse_oversized(
+    st: &mut LinuxNetState,
+    lane: usize,
+    msg_type: u8,
+    payload_len: usize,
+    head: &[u8; OVERSIZED_HEAD],
+    tail: [u8; 2],
+) {
+    use crate::abi::contracts::net::net_proto as np;
+    const EMSGSIZE: u8 = libc::EMSGSIZE as u8;
+    log::warn!(
+        "[linux_net] lane {lane}: command 0x{msg_type:02x} of {payload_len} B is larger than \
+         {LINUX_NET_CMD_MAX} B; refused EMSGSIZE"
+    );
+    match msg_type {
+        CMD_CONNECT_TO => {
+            let msg = connect_error_frame(0, EMSGSIZE, u16::from_le_bytes(tail));
+            linux_net_send_msg(st, lane, &msg);
+        }
+        CMD_CONNECT => {
+            let msg = connect_error_frame(0, EMSGSIZE, np::retired_connect_tag(head));
+            linux_net_send_msg(st, lane, &msg);
+        }
+        CMD_SEND | CMD_CLOSE => {
+            let conn_id = u16::from_le_bytes([head[0], head[1]]);
+            let idx = conn_id as usize;
+            let live = st.conns.get(idx).is_some_and(|c| c.state != 0);
+            if !live || !lane_may_touch(st, lane, idx) {
+                return;
+            }
+            let cb = conn_id.to_le_bytes();
+            let msg = [MSG_ERROR, cb[0], cb[1], EMSGSIZE];
+            linux_net_send_msg(st, lane, &msg);
+            if msg_type == CMD_SEND && st.conns[idx].state == 2 {
+                hold_closed_slot(st, idx);
+            }
+        }
+        CMD_BIND => {
+            linux_net_send_bind_refused(st, lane, u16::from_le_bytes([head[0], head[1]]), EMSGSIZE);
+        }
+        DG_CMD_BIND => {
+            linux_net_send_bind_refused(st, lane, u16::from_le_bytes([head[0], head[1]]), EMSGSIZE);
+            linux_net_send_dg_error(st, lane, EMSGSIZE);
+        }
+        DG_CMD_SEND_TO | DG_CMD_CLOSE => {
+            let ep = head[0];
+            let named = st
+                .conns
+                .get(ep as usize)
+                .is_some_and(|c| c.state != 0 && c.conn_type == CONN_TYPE_UDP_BOUND)
+                && lane_may_touch(st, lane, ep as usize);
+            linux_net_send_dg_ep_error(st, lane, if named { ep } else { 0xFF }, EMSGSIZE);
+        }
+        _ => {}
+    }
+}
+
 pub fn linux_net_step(state: *mut u8) -> i32 {
     // SAFETY: `state` is the kernel-owned per-instance arena sized
     // for `LinuxNetState` by the loader.
@@ -4391,6 +4745,13 @@ pub fn linux_net_step(state: *mut u8) -> i32 {
                     continue;
                 }
                 loop {
+                    // Every command may owe the lane a control frame; at
+                    // the queue's cap the rest wait in the command channel
+                    // until the consumer reads its events.
+                    if st.lane_paused(lane) {
+                        had_work = true;
+                        break;
+                    }
                     let mut hdr = [0u8; 3];
                     let n = channel::channel_read(lane_ch, hdr.as_mut_ptr(), 3);
                     if n < 3 {
@@ -4401,19 +4762,32 @@ pub fn linux_net_step(state: *mut u8) -> i32 {
                     if payload_len > st.cmd_buf.len() {
                         // Oversized command (a consumer exceeding MAX_CMD_DATA). The
                         // body would NOT fit our scratch; DRAIN it from the FIFO so
-                        // the next read starts on a real header, then skip the frame
-                        // rather than parsing stale cmd_buf bytes mid-stream.
+                        // the next read starts on a real header, keeping the bytes
+                        // its requester is named by (a conn id or endpoint at the
+                        // front, a dial's tag at the end), and answer it.
                         let mut left = payload_len;
                         let mut scratch = [0u8; 1024];
+                        let mut head = [0u8; OVERSIZED_HEAD];
+                        let mut tail = [0u8; 2];
+                        let mut at = 0usize;
                         while left > 0 {
                             let take = left.min(scratch.len());
                             let got = channel::channel_read(lane_ch, scratch.as_mut_ptr(), take);
                             if got <= 0 {
                                 break;
                             }
-                            left -= got as usize;
+                            let got = got as usize;
+                            for &b in &scratch[..got] {
+                                if at < OVERSIZED_HEAD {
+                                    head[at] = b;
+                                }
+                                tail = [tail[1], b];
+                                at += 1;
+                            }
+                            left -= got;
                         }
-                        log::warn!("[linux_net] oversized command frame ({payload_len} B) dropped");
+                        linux_net_refuse_oversized(st, lane, msg_type, payload_len, &head, tail);
+                        had_work = true;
                         continue;
                     }
                     if payload_len > 0 {

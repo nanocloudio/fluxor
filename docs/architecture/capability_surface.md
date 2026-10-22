@@ -483,7 +483,8 @@ Source: `contracts/src/vocabulary.rs`, `tools/src/config/generate.rs`,
 ```
 gpio  spi  i2c  pio  channel  timer  platform_nic_ring  platform_dma
 fs  buffer  event  uart  adc  pwm  platform_dma_fd  pcie_device
-storage.namespace  storage.object  usb_host
+storage.namespace  storage.object  usb_host  proc  workload  trust
+net_policy  host_mount  net_route
 ```
 
 Naming is lowercase `snake_case`, with the two storage contracts in their

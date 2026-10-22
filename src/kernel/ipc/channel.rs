@@ -434,7 +434,32 @@ impl ChannelSlot {
     }
 }
 
-static CHANNELS: [ChannelSlot; MAX_CHANNELS] = [const { ChannelSlot::new() }; MAX_CHANNELS];
+/// The channel slot table: reserved at boot to the plan's `channels` ceiling
+/// and committed as channels open (`size`) on Linux, bcm2712 and RP, the
+/// profile's static array on wasm.
+static CHANNELS: crate::kernel::mem::table::Table<ChannelSlot, MAX_CHANNELS> = crate::boot_table!(
+    MAX_CHANNELS,
+    ChannelSlot::new(),
+    crate::abi::contracts::resource::POOL_CHANNELS
+);
+
+/// Reserve the channel table for `ceiling` slots and commit `live` of them.
+///
+/// # Safety
+/// Graph-preparation context: no reference into the table is live.
+pub unsafe fn size(
+    ceiling: usize,
+    live: usize,
+) -> Result<(), crate::kernel::mem::table::TableError> {
+    CHANNELS.reserve(ceiling)?;
+    CHANNELS.grow(live)?;
+    crate::kernel::ipc::buffer_pool::size_registry(ceiling, live)
+}
+
+/// Channel slots live now.
+pub fn slots() -> usize {
+    CHANNELS.len()
+}
 
 /// Slots not in `Free` state — resource-ledger sample for `POOL_CHANNELS`.
 pub fn in_use_count() -> usize {
@@ -524,21 +549,38 @@ pub fn channel_open_for_module(
         crate::kernel::sys::resource_ledger::deny(crate::abi::contracts::resource::POOL_CHANNELS);
         return crate::kernel::sys::errno::ENOSPC;
     }
-    for (idx, slot) in CHANNELS.iter().enumerate() {
-        match slot.try_allocate(idx, buf_capacity, producer_module) {
-            SlotClaim::Allocated => {
-                slot.state
-                    .store(ChannelState::Connected as u8, Ordering::Release);
-                debug!("channel_open: allocated channel {idx} buf_size={buf_capacity}");
-                return idx as i32;
+    let mut from = 0;
+    loop {
+        let live = CHANNELS.len();
+        for (idx, slot) in CHANNELS.iter().enumerate().skip(from) {
+            match slot.try_allocate(idx, buf_capacity, producer_module) {
+                SlotClaim::Allocated => {
+                    slot.state
+                        .store(ChannelState::Connected as u8, Ordering::Release);
+                    debug!("channel_open: allocated channel {idx} buf_size={buf_capacity}");
+                    return idx as i32;
+                }
+                SlotClaim::Taken => {}
+                // The arena is short, not the slot table: say so once rather
+                // than retrying the same allocation against every free slot.
+                SlotClaim::NoBuffer => return errno::ENOMEM,
             }
-            SlotClaim::Taken => {}
-            // The arena is short, not the slot table: say so once rather
-            // than retrying the same allocation against every free slot.
-            SlotClaim::NoBuffer => return errno::ENOMEM,
         }
+        // Every live slot is taken: commit the next segment of the table,
+        // within the plan's ceiling, and try the new slots.
+        if CHANNELS.grow(live + 1).is_err()
+            || crate::kernel::ipc::buffer_pool::grow_registry(CHANNELS.len()).is_err()
+        {
+            break;
+        }
+        from = live;
     }
-    // Slot table exhausted — an accounted capacity denial, not a busy peer.
+    // Slot table at its ceiling — an accounted capacity denial, not a busy
+    // peer.
+    log::warn!(
+        "[channel] open refused: pool 'channels' at its ceiling of {} slots",
+        CHANNELS.len()
+    );
     crate::kernel::sys::resource_ledger::deny(crate::abi::contracts::resource::POOL_CHANNELS);
     crate::kernel::sys::errno::ENOSPC
 }
@@ -548,7 +590,7 @@ pub fn channel_close(handle: i32) {
         return;
     }
     let idx = handle as usize;
-    if idx >= MAX_CHANNELS {
+    if idx >= CHANNELS.len() {
         return;
     }
     // Closing clears the source's handler, so no lend on this channel can be
@@ -562,14 +604,16 @@ pub fn channel_close(handle: i32) {
 /// reaching into the private `CHANNELS` static.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChannelStats {
-    /// Slots in `ChannelState::Free` — available for `channel_open`.
+    /// Slots available for `channel_open`: committed slots in
+    /// `ChannelState::Free`, and the slots below the table's ceiling not yet
+    /// committed (an open commits them as it needs them).
     pub free: usize,
     /// Slots in `ChannelState::Allocated` — claimed but not yet bound
     /// to a producer/consumer pair (transient state during graph setup).
     pub allocated: usize,
     /// Slots in `ChannelState::Connected` — actively wired in the graph.
     pub connected: usize,
-    /// Total slots in the channel table.
+    /// The channel table's ceiling: the slots this graph's plan sized it for.
     pub capacity: usize,
 }
 
@@ -591,11 +635,12 @@ pub fn stats() -> ChannelStats {
             connected += 1;
         }
     }
+    let capacity = CHANNELS.ceiling();
     ChannelStats {
-        free,
+        free: free + capacity.saturating_sub(CHANNELS.len()),
         allocated,
         connected,
-        capacity: MAX_CHANNELS,
+        capacity,
     }
 }
 
@@ -669,7 +714,7 @@ pub unsafe fn channel_read(handle: i32, buf: *mut u8, len: usize) -> i32 {
         return CHAN_EINVAL;
     }
     let idx = handle as usize;
-    if idx >= MAX_CHANNELS {
+    if idx >= CHANNELS.len() {
         return CHAN_EINVAL;
     }
     let slot = &CHANNELS[idx];
@@ -748,7 +793,7 @@ pub unsafe fn channel_peek(handle: i32, buf: *mut u8, len: usize) -> i32 {
         return CHAN_EINVAL;
     }
     let idx = handle as usize;
-    if idx >= MAX_CHANNELS {
+    if idx >= CHANNELS.len() {
         return CHAN_EINVAL;
     }
     let slot = &CHANNELS[idx];
@@ -807,7 +852,7 @@ pub fn channel_discard(handle: i32, len: usize) -> i32 {
         return CHAN_EINVAL;
     }
     let idx = handle as usize;
-    if idx >= MAX_CHANNELS {
+    if idx >= CHANNELS.len() {
         return CHAN_EINVAL;
     }
     let slot = &CHANNELS[idx];
@@ -876,7 +921,7 @@ pub unsafe fn channel_write(handle: i32, data: *const u8, len: usize) -> i32 {
         return CHAN_EINVAL;
     }
     let idx = handle as usize;
-    if idx >= MAX_CHANNELS {
+    if idx >= CHANNELS.len() {
         return CHAN_EINVAL;
     }
     let slot = &CHANNELS[idx];
@@ -968,7 +1013,7 @@ fn land(slot: &ChannelSlot, fifo: &mut FifoState, storage: &mut [u8], bytes: &[u
 /// never waits on it.
 fn mirror_write(slot: &ChannelSlot, bytes: &[u8]) {
     let m = slot.mirror.load(Ordering::Acquire);
-    if m < 0 || (m as usize) >= MAX_CHANNELS || bytes.is_empty() {
+    if m < 0 || (m as usize) >= CHANNELS.len() || bytes.is_empty() {
         return;
     }
     let tap = &CHANNELS[m as usize];
@@ -988,7 +1033,7 @@ fn mirror_write(slot: &ChannelSlot, bytes: &[u8]) {
 /// Make `tap` receive a copy of every write to `source` (`tap < 0` clears).
 /// Refuses a second tap on one channel, and a tap that is not a pipe.
 pub fn channel_set_mirror(source: i32, tap: i32) -> bool {
-    if source < 0 || (source as usize) >= MAX_CHANNELS {
+    if source < 0 || (source as usize) >= CHANNELS.len() {
         return false;
     }
     let slot = &CHANNELS[source as usize];
@@ -996,7 +1041,7 @@ pub fn channel_set_mirror(source: i32, tap: i32) -> bool {
         slot.mirror.store(-1, Ordering::Release);
         return true;
     }
-    if (tap as usize) >= MAX_CHANNELS || !CHANNELS[tap as usize].is_pipe() || !slot.is_pipe() {
+    if (tap as usize) >= CHANNELS.len() || !CHANNELS[tap as usize].is_pipe() || !slot.is_pipe() {
         return false;
     }
     slot.mirror
@@ -1006,7 +1051,7 @@ pub fn channel_set_mirror(source: i32, tap: i32) -> bool {
 
 /// Mark `handle` ended (HUP), as a producer's end-of-stream does.
 pub fn channel_mark_hup(handle: i32) {
-    if handle >= 0 && (handle as usize) < MAX_CHANNELS {
+    if handle >= 0 && (handle as usize) < CHANNELS.len() {
         CHANNELS[handle as usize]
             .hup_flag
             .store(true, Ordering::Release);
@@ -1016,15 +1061,16 @@ pub fn channel_mark_hup(handle: i32) {
 /// Bind a consumer module to be event-woken by successful writes on this
 /// channel. `module_idx < 0` clears the binding.
 pub fn channel_set_wake_module(handle: i32, module_idx: i32) {
-    if handle < 0 || handle as usize >= MAX_CHANNELS {
+    if handle < 0 || handle as usize >= CHANNELS.len() {
         return;
     }
-    let clamped =
-        if module_idx < 0 || module_idx as usize >= crate::kernel::boot::config::MAX_MODULES {
-            -1
-        } else {
-            module_idx as i16
-        };
+    let clamped = if module_idx < 0
+        || module_idx as usize >= crate::kernel::exec::scheduler::module_slots()
+    {
+        -1
+    } else {
+        module_idx as i16
+    };
     CHANNELS[handle as usize]
         .wake_module
         .store(clamped, Ordering::Release);
@@ -1063,7 +1109,7 @@ pub fn channel_poll(handle: i32, events: u32) -> i32 {
         return CHAN_EINVAL;
     }
     let idx = handle as usize;
-    if idx >= MAX_CHANNELS {
+    if idx >= CHANNELS.len() {
         return CHAN_EINVAL;
     }
     let slot = &CHANNELS[idx];
@@ -1125,7 +1171,7 @@ pub fn channel_ioctl(handle: i32, cmd: u32, arg: *mut u8) -> i32 {
         return CHAN_EINVAL;
     }
     let idx = handle as usize;
-    if idx >= MAX_CHANNELS {
+    if idx >= CHANNELS.len() {
         return CHAN_EINVAL;
     }
     let slot = &CHANNELS[idx];
@@ -1263,7 +1309,7 @@ pub fn channel_register_ioctl_handler(
         return CHAN_EINVAL;
     }
     let idx = handle as usize;
-    if idx >= MAX_CHANNELS {
+    if idx >= CHANNELS.len() {
         return CHAN_EINVAL;
     }
     let slot = &CHANNELS[idx];
@@ -1306,7 +1352,7 @@ pub fn channel_set_mailbox(handle: i32) {
         return;
     }
     let idx = handle as usize;
-    if idx >= MAX_CHANNELS {
+    if idx >= CHANNELS.len() {
         return;
     }
     CHANNELS[idx].mailbox.store(true, Ordering::Release);
@@ -1323,7 +1369,7 @@ pub fn channel_has_pending(handle: i32) -> bool {
         return false;
     }
     let idx = handle as usize;
-    if idx >= MAX_CHANNELS {
+    if idx >= CHANNELS.len() {
         return false;
     }
     let slot = &CHANNELS[idx];
@@ -1343,7 +1389,7 @@ pub fn channel_readable_bytes(handle: i32) -> usize {
         return 0;
     }
     let idx = handle as usize;
-    if idx >= MAX_CHANNELS {
+    if idx >= CHANNELS.len() {
         return 0;
     }
     let slot = &CHANNELS[idx];
@@ -1363,7 +1409,7 @@ pub fn channel_writable_bytes(handle: i32) -> usize {
         return 0;
     }
     let idx = handle as usize;
-    if idx >= MAX_CHANNELS {
+    if idx >= CHANNELS.len() {
         return 0;
     }
     let slot = &CHANNELS[idx];
@@ -1389,7 +1435,7 @@ pub fn channel_is_mailbox(handle: i32) -> bool {
         return false;
     }
     let idx = handle as usize;
-    if idx >= MAX_CHANNELS {
+    if idx >= CHANNELS.len() {
         return false;
     }
     CHANNELS[idx].mailbox.load(Ordering::Acquire)
@@ -1407,7 +1453,7 @@ pub fn channel_set_flags(handle: i32, flags: u8) {
         return;
     }
     let idx = handle as usize;
-    if idx >= MAX_CHANNELS {
+    if idx >= CHANNELS.len() {
         return;
     }
     let slot = &CHANNELS[idx];
@@ -1424,7 +1470,7 @@ pub fn channel_set_reader_gone(handle: i32) {
         return;
     }
     let idx = handle as usize;
-    if idx >= MAX_CHANNELS {
+    if idx >= CHANNELS.len() {
         return;
     }
     CHANNELS[idx].reader_gone.store(true, Ordering::Release);
@@ -1544,7 +1590,7 @@ impl Acquired {
 /// mailbox mode on a FIFO channel, which would lose data: a FIFO read looks at
 /// the ring's head and tail, not at the buffer's state.
 fn mailbox_slot(chan: i32) -> Result<i32, Acquired> {
-    if chan < 0 || chan as usize >= MAX_CHANNELS {
+    if chan < 0 || chan as usize >= CHANNELS.len() {
         return Err(Acquired::refused(CHAN_EINVAL, 0));
     }
     let channel = &CHANNELS[chan as usize];
@@ -1592,7 +1638,7 @@ pub fn buffer_acquire_write(chan: i32) -> Acquired {
 /// this call returns.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn syscall_buffer_release_write(chan: i32, len: u32) -> i32 {
-    if chan < 0 || chan as usize >= MAX_CHANNELS {
+    if chan < 0 || chan as usize >= CHANNELS.len() {
         return CHAN_EINVAL;
     }
 
@@ -1639,7 +1685,7 @@ pub fn buffer_acquire_read(chan: i32) -> Acquired {
 /// accessed after this call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn syscall_buffer_release_read(chan: i32) -> i32 {
-    if chan < 0 || chan as usize >= MAX_CHANNELS {
+    if chan < 0 || chan as usize >= CHANNELS.len() {
         return CHAN_EINVAL;
     }
 

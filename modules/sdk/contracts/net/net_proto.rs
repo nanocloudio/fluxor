@@ -25,7 +25,7 @@
 pub const FRAME_HDR: usize = 3;
 
 /// Wire width of a connection id (u16 LE — see the limit register:
-/// 65,535 ids; the R1 conn tables bind long before the id space does).
+/// 65,535 ids; the connection tables bind long before the id space does).
 pub const CONN_ID_LEN: usize = 2;
 
 /// The `msg_type` of a frame, from its header.
@@ -233,7 +233,8 @@ pub const MSG_CONNECTED: u8 = 0x05;
 pub const MSG_ERROR: u8 = 0x06;
 // 0x07 / 0x08 are reserved: the IP module privately uses them for
 // `MSG_RETRANSMIT` / `MSG_ACK` (consumer-side retransmit + send-buffer release)
-// on the same channel. The next free downstream opcode is 0x09.
+// on the same channel. 0x09 is `MSG_TRACE_CTX`, 0x0A `MSG_PEER`; the next
+// free downstream opcode is 0x0B.
 
 /// Observability trace context for a connection (W3C). Emitted by the ingress
 /// (IP) right after `MSG_ACCEPTED`, and re-emitted by each forwarding stage
@@ -249,6 +250,71 @@ pub const MSG_TRACE_CTX: u8 = 0x09;
 /// `MSG_TRACE_CTX` payload length: conn_id + 16-byte trace id + 8-byte span id
 /// + 1-byte W3C trace-flags.
 pub const TRACE_CTX_LEN: usize = CONN_ID_LEN + 16 + 8 + 1;
+
+/// The stream's peer: who is at the other end of `conn_id`. Payload:
+/// `[conn_id: u16 LE][family: u8][addr: 16][port: u16 LE]` ([`PEER_LEN`]
+/// bytes) — `family` is [`AF_INET`] (the address in the first four bytes,
+/// network order, the rest zero) or [`AF_INET6`].
+///
+/// Sent once per stream, right after its `MSG_ACCEPTED` (the client that
+/// connected) or its `MSG_CONNECTED` (the address the dial reached; for a
+/// dial to a service address, that service address and port, not the backend
+/// it was translated to). It is ordered like a control frame — queued with
+/// `MSG_ACCEPTED` and delivered before the stream's first `MSG_DATA` — so a
+/// consumer that reads it has it before any byte of the stream. A stage that
+/// relabels connection ids (`tls`, a demultiplexer) re-emits it with its own
+/// id. A consumer that does not use it drops it as any unknown opcode.
+pub const MSG_PEER: u8 = 0x0A;
+
+/// `MSG_PEER` payload length.
+pub const PEER_LEN: usize = CONN_ID_LEN + 1 + 16 + 2;
+
+/// Write a whole `MSG_PEER` frame (header included) into `out`; its length,
+/// or `None` when `out` is too short.
+#[inline]
+pub fn write_peer(
+    out: &mut [u8],
+    conn_id: u16,
+    family: u8,
+    addr: &[u8; 16],
+    port: u16,
+) -> Option<usize> {
+    let total = FRAME_HDR + PEER_LEN;
+    let frame = out.get_mut(..total)?;
+    let len = (PEER_LEN as u16).to_le_bytes();
+    let id = conn_id.to_le_bytes();
+    let pt = port.to_le_bytes();
+    let head = [MSG_PEER, len[0], len[1], id[0], id[1], family];
+    for (i, b) in frame.iter_mut().enumerate() {
+        *b = if i < head.len() {
+            head[i]
+        } else if i < head.len() + 16 {
+            addr[i - head.len()]
+        } else if i == head.len() + 16 {
+            pt[0]
+        } else {
+            pt[1]
+        };
+    }
+    Some(total)
+}
+
+/// Parts of a `MSG_PEER` payload: `(conn_id, family, addr, port)`, or
+/// `None` when it is short.
+#[inline]
+pub fn peer_parts(payload: &[u8]) -> Option<(u16, u8, [u8; 16], u16)> {
+    let p = payload.get(..PEER_LEN)?;
+    let mut addr = [0u8; 16];
+    for (i, a) in addr.iter_mut().enumerate() {
+        *a = *p.get(3 + i)?;
+    }
+    Some((
+        u16::from_le_bytes([*p.first()?, *p.get(1)?]),
+        *p.get(2)?,
+        addr,
+        u16::from_le_bytes([*p.get(19)?, *p.get(20)?]),
+    ))
+}
 
 // Upstream: consumer → IP/net
 /// Bind to port and listen. Payload: [port: u16 LE]

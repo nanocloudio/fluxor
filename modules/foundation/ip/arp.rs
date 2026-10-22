@@ -53,8 +53,11 @@ impl ArpEntry {
     }
 }
 
-/// ARP table size
-pub const ARP_TABLE_SIZE: usize = 16;
+/// Neighbours the table holds beyond the declared peer nodes: the gateway
+/// and the on-link hosts the node itself talks to. The table is
+/// `max_peers + ARP_SEGMENT_ENTRIES` entries, sized at construction from the
+/// declared peer count (`ip` param `max_peers`), in the module's heap.
+pub const ARP_SEGMENT_ENTRIES: usize = 16;
 
 /// ARP pending request state
 pub const ARP_PENDING_NONE: u8 = 0;
@@ -65,13 +68,13 @@ pub const ARP_PENDING_WAITING: u8 = 1;
 ///
 /// # Safety
 /// Uses raw pointer access to avoid bounds checks in PIC.
-pub fn lookup(table: &[ArpEntry; ARP_TABLE_SIZE], ip: u32) -> Option<[u8; 6]> {
-    // SAFETY: `i < ARP_TABLE_SIZE` is the loop invariant; `table.as_ptr().add(i)`
-    // therefore points into the fixed-size array. `&*` materialises a shared
+pub fn lookup(table: &[ArpEntry], ip: u32) -> Option<[u8; 6]> {
+    // SAFETY: `i < table.len()` is the loop invariant; `table.as_ptr().add(i)`
+    // therefore points into the array. `&*` materialises a shared
     // reference that lives only for the iteration.
     unsafe {
         let mut i = 0;
-        while i < ARP_TABLE_SIZE {
+        while i < table.len() {
             let entry = &*table.as_ptr().add(i);
             if entry.valid && entry.ip == ip {
                 return Some(entry.mac);
@@ -92,13 +95,13 @@ pub fn lookup(table: &[ArpEntry; ARP_TABLE_SIZE], ip: u32) -> Option<[u8; 6]> {
 /// Returns `true` iff a matching entry was found and refreshed; `false`
 /// means the caller observed a mapping it is not permitted to create or
 /// change.
-pub fn refresh_same_mac(table: &mut [ArpEntry; ARP_TABLE_SIZE], ip: u32, mac: [u8; 6]) -> bool {
-    // SAFETY: `i < ARP_TABLE_SIZE` bounds every `add(i)` into the fixed-size
+pub fn refresh_same_mac(table: &mut [ArpEntry], ip: u32, mac: [u8; 6]) -> bool {
+    // SAFETY: `i < table.len()` bounds every `add(i)` into the
     // array; the unique re-borrow is safe because the loop holds no other
     // live reference into `table`.
     unsafe {
         let mut i = 0;
-        while i < ARP_TABLE_SIZE {
+        while i < table.len() {
             let entry = &mut *table.as_mut_ptr().add(i);
             if entry.valid && entry.ip == ip {
                 if entry.mac == mac {
@@ -115,11 +118,11 @@ pub fn refresh_same_mac(table: &mut [ArpEntry; ARP_TABLE_SIZE], ip: u32, mac: [u
 
 /// Invalidate the entry for `ip`, if any. Used to force a fresh resolution
 /// before a mapping is granted elevated status.
-pub fn invalidate(table: &mut [ArpEntry; ARP_TABLE_SIZE], ip: u32) {
+pub fn invalidate(table: &mut [ArpEntry], ip: u32) {
     // SAFETY: as for `refresh_same_mac`.
     unsafe {
         let mut i = 0;
-        while i < ARP_TABLE_SIZE {
+        while i < table.len() {
             let entry = &mut *table.as_mut_ptr().add(i);
             if entry.valid && entry.ip == ip {
                 *entry = ArpEntry::empty();
@@ -133,11 +136,11 @@ pub fn invalidate(table: &mut [ArpEntry; ARP_TABLE_SIZE], ip: u32) {
 /// Report whether a MAC change for `ip` would be refused by a pin. Lets the
 /// caller distinguish "the segment moved and we rejected it" from an
 /// ordinary cache miss in its metrics.
-pub fn pin_would_reject(table: &[ArpEntry; ARP_TABLE_SIZE], ip: u32, mac: [u8; 6]) -> bool {
+pub fn pin_would_reject(table: &[ArpEntry], ip: u32, mac: [u8; 6]) -> bool {
     // SAFETY: as for `refresh_same_mac`; shared borrow only.
     unsafe {
         let mut i = 0;
-        while i < ARP_TABLE_SIZE {
+        while i < table.len() {
             let entry = &*table.as_ptr().add(i);
             if entry.valid && entry.ip == ip {
                 return entry.pinned && entry.mac != mac;
@@ -153,15 +156,15 @@ pub fn pin_would_reject(table: &[ArpEntry; ARP_TABLE_SIZE], ip: u32, mac: [u8; 6
 ///
 /// # Safety
 /// Uses raw pointer access to avoid bounds checks in PIC.
-pub fn insert(table: &mut [ArpEntry; ARP_TABLE_SIZE], ip: u32, mac: [u8; 6], step_count: u16) {
-    // SAFETY: every `add(i)` is bounded by `i < ARP_TABLE_SIZE`. The `&mut *`
+pub fn insert(table: &mut [ArpEntry], ip: u32, mac: [u8; 6], step_count: u16) {
+    // SAFETY: every `add(i)` is bounded by `i < table.len()`. The `&mut *`
     // re-borrow is unique because the loop holds no other live reference into
-    // `table`. `oldest_idx` is sentinel-checked against `ARP_TABLE_SIZE`
+    // `table`. `oldest_idx` is sentinel-checked against `table.len()`
     // before the eviction-slot write.
     unsafe {
         // Check if already exists
         let mut i = 0;
-        while i < ARP_TABLE_SIZE {
+        while i < table.len() {
             let entry = &mut *table.as_mut_ptr().add(i);
             if entry.valid && entry.ip == ip {
                 // If MAC is unchanged, refresh age and clear any outstanding
@@ -190,7 +193,7 @@ pub fn insert(table: &mut [ArpEntry; ARP_TABLE_SIZE], ip: u32, mac: [u8; 6], ste
 
         // Find empty slot
         i = 0;
-        while i < ARP_TABLE_SIZE {
+        while i < table.len() {
             let entry = &*table.as_ptr().add(i);
             if !entry.valid {
                 *table.as_mut_ptr().add(i) = ArpEntry {
@@ -209,10 +212,10 @@ pub fn insert(table: &mut [ArpEntry; ARP_TABLE_SIZE], ip: u32, mac: [u8; 6], ste
         }
 
         // Evict oldest non-pinned entry
-        let mut oldest_idx: usize = ARP_TABLE_SIZE; // sentinel: no candidate
+        let mut oldest_idx: usize = table.len(); // sentinel: no candidate
         let mut oldest_age = 0u16;
         i = 0;
-        while i < ARP_TABLE_SIZE {
+        while i < table.len() {
             let entry = &*table.as_ptr().add(i);
             if !entry.pinned && entry.age > oldest_age {
                 oldest_age = entry.age;
@@ -220,7 +223,7 @@ pub fn insert(table: &mut [ArpEntry; ARP_TABLE_SIZE], ip: u32, mac: [u8; 6], ste
             }
             i += 1;
         }
-        if oldest_idx < ARP_TABLE_SIZE {
+        if oldest_idx < table.len() {
             *table.as_mut_ptr().add(oldest_idx) = ArpEntry {
                 ip,
                 mac,
@@ -237,13 +240,13 @@ pub fn insert(table: &mut [ArpEntry; ARP_TABLE_SIZE], ip: u32, mac: [u8; 6], ste
 }
 
 /// Pin an ARP entry for the given IP (called when TCP connection established).
-pub fn pin(table: &mut [ArpEntry; ARP_TABLE_SIZE], ip: u32) {
-    // SAFETY: `i < ARP_TABLE_SIZE` bounds every `add(i)` into the fixed-size
+pub fn pin(table: &mut [ArpEntry], ip: u32) {
+    // SAFETY: `i < table.len()` bounds every `add(i)` into the
     // array; the unique re-borrow is safe because the loop holds no other
     // live reference into `table`.
     unsafe {
         let mut i = 0;
-        while i < ARP_TABLE_SIZE {
+        while i < table.len() {
             let entry = &mut *table.as_mut_ptr().add(i);
             if entry.valid && entry.ip == ip {
                 entry.pinned = true;
@@ -256,13 +259,13 @@ pub fn pin(table: &mut [ArpEntry; ARP_TABLE_SIZE], ip: u32) {
 }
 
 /// Unpin an ARP entry (called when TCP connection closed).
-pub fn unpin(table: &mut [ArpEntry; ARP_TABLE_SIZE], ip: u32) {
-    // SAFETY: `i < ARP_TABLE_SIZE` bounds every `add(i)` into the fixed-size
+pub fn unpin(table: &mut [ArpEntry], ip: u32) {
+    // SAFETY: `i < table.len()` bounds every `add(i)` into the
     // array; the unique re-borrow is safe because the loop holds no other
     // live reference into `table`.
     unsafe {
         let mut i = 0;
-        while i < ARP_TABLE_SIZE {
+        while i < table.len() {
             let entry = &mut *table.as_mut_ptr().add(i);
             if entry.valid && entry.ip == ip && entry.pin_count > 0 && entry.pin_count < 255 {
                 entry.pin_count -= 1;
@@ -282,13 +285,13 @@ pub fn unpin(table: &mut [ArpEntry; ARP_TABLE_SIZE], ip: u32) {
 /// immune to later MAC changes, so promoting an entry that was already in
 /// the cache would make whatever installed it authoritative for the rest of
 /// the lease. Returns `true` iff an entry was found and pinned.
-pub fn pin_gateway(table: &mut [ArpEntry; ARP_TABLE_SIZE], ip: u32) -> bool {
-    // SAFETY: `i < ARP_TABLE_SIZE` bounds every `add(i)` into the fixed-size
+pub fn pin_gateway(table: &mut [ArpEntry], ip: u32) -> bool {
+    // SAFETY: `i < table.len()` bounds every `add(i)` into the
     // array; the unique re-borrow is safe because the loop holds no other
     // live reference into `table`.
     unsafe {
         let mut i = 0;
-        while i < ARP_TABLE_SIZE {
+        while i < table.len() {
             let entry = &mut *table.as_mut_ptr().add(i);
             if entry.valid && entry.ip == ip {
                 entry.pinned = true;
@@ -310,11 +313,11 @@ pub fn pin_gateway(table: &mut [ArpEntry; ARP_TABLE_SIZE], ip: u32) -> bool {
 pub const ARP_PIN_REVALIDATE_AGE: u16 = 12000;
 
 /// Address of an entry needing revalidation, or `None`.
-pub fn revalidation_due(table: &[ArpEntry; ARP_TABLE_SIZE]) -> Option<u32> {
-    // SAFETY: `i < ARP_TABLE_SIZE` bounds every `add(i)`; shared borrow only.
+pub fn revalidation_due(table: &[ArpEntry]) -> Option<u32> {
+    // SAFETY: `i < table.len()` bounds every `add(i)`; shared borrow only.
     unsafe {
         let mut i = 0;
-        while i < ARP_TABLE_SIZE {
+        while i < table.len() {
             let entry = &*table.as_ptr().add(i);
             if entry.valid && entry.revalidate {
                 return Some(entry.ip);
@@ -330,14 +333,14 @@ pub fn revalidation_due(table: &[ArpEntry; ARP_TABLE_SIZE]) -> Option<u32> {
 ///
 /// # Safety
 /// Uses raw pointer access to avoid bounds checks in PIC.
-pub fn age_entries(table: &mut [ArpEntry; ARP_TABLE_SIZE]) -> u32 {
+pub fn age_entries(table: &mut [ArpEntry]) -> u32 {
     let mut revalidations = 0u32;
-    // SAFETY: `i < ARP_TABLE_SIZE` bounds every `add(i)` into the fixed-size
+    // SAFETY: `i < table.len()` bounds every `add(i)` into the
     // array; the unique re-borrow is safe because the loop holds no other
     // live reference into `table`.
     unsafe {
         let mut i = 0;
-        while i < ARP_TABLE_SIZE {
+        while i < table.len() {
             let entry = &mut *table.as_mut_ptr().add(i);
             if entry.valid {
                 entry.age = entry.age.saturating_add(1);
@@ -363,13 +366,13 @@ pub fn age_entries(table: &mut [ArpEntry; ARP_TABLE_SIZE]) -> u32 {
 /// against comes from this table and nowhere else, so its occupancy is the
 /// one number that separates "nothing has been learned" from "the wrong
 /// thing was learned".
-pub fn live_entries(table: &[ArpEntry; ARP_TABLE_SIZE]) -> u32 {
+pub fn live_entries(table: &[ArpEntry]) -> u32 {
     let mut live = 0u32;
-    // SAFETY: `i < ARP_TABLE_SIZE` bounds every `add(i)` into the
+    // SAFETY: `i < table.len()` bounds every `add(i)` into the
     // fixed-size array.
     unsafe {
         let mut i = 0;
-        while i < ARP_TABLE_SIZE {
+        while i < table.len() {
             if (*table.as_ptr().add(i)).valid {
                 live += 1;
             }

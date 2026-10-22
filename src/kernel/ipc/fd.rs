@@ -44,7 +44,11 @@ pub use crate::abi::kernel_abi::fd::{
 // Timer-as-fd
 // ============================================================================
 
-pub const MAX_TIMERS: usize = 16;
+/// Timers held at once: the profile's static table, or where the plan sizes
+/// it (Linux, bcm2712, RP) the plan's `timers` pool (`size_timers`), its
+/// envelope entry or default.
+pub const MAX_TIMERS: usize =
+    crate::kernel::config::static_slots(crate::abi::contracts::resource::POOL_TIMERS);
 
 struct TimerSlot {
     allocated: AtomicBool,
@@ -72,7 +76,29 @@ impl TimerSlot {
     }
 }
 
-static TIMER_SLOTS: [TimerSlot; MAX_TIMERS] = [const { TimerSlot::new() }; MAX_TIMERS];
+static TIMER_SLOTS: crate::kernel::mem::table::Table<TimerSlot, MAX_TIMERS> = crate::boot_table!(
+    MAX_TIMERS,
+    TimerSlot::new(),
+    crate::abi::contracts::resource::POOL_TIMERS
+);
+
+/// Size the timer table to `n` slots, all live.
+///
+/// # Safety
+/// Boot or graph-preparation context: no reference into the table is live.
+pub unsafe fn size_timers(n: usize) -> Result<(), crate::kernel::mem::table::TableError> {
+    TIMER_SLOTS.reserve(n)?;
+    TIMER_SLOTS.grow(n)
+}
+
+/// The timer table, sized from the plan's defaults when no plan has sized it.
+fn timers() -> &'static [TimerSlot] {
+    TIMER_SLOTS.size_unplanned(|| {
+        crate::kernel::sys::resource_ledger::ceiling(crate::abi::contracts::resource::POOL_TIMERS)
+            as usize
+    });
+    &TIMER_SLOTS
+}
 
 fn now_ms() -> u32 {
     hal::now_millis() as u32
@@ -88,7 +114,7 @@ pub fn timer_create() -> i32 {
         return errno::ENOSPC;
     }
     let owner = crate::kernel::exec::scheduler::current_module_id();
-    for (i, timer) in TIMER_SLOTS.iter().enumerate() {
+    for (i, timer) in timers().iter().enumerate() {
         if timer
             .allocated
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -107,7 +133,7 @@ pub fn timer_create() -> i32 {
 
 /// Allocated timer slots — resource-ledger sample for `POOL_TIMERS`.
 pub fn timer_in_use_count() -> usize {
-    TIMER_SLOTS
+    timers()
         .iter()
         .filter(|t| t.allocated.load(Ordering::Relaxed))
         .count()
@@ -117,10 +143,10 @@ pub fn timer_in_use_count() -> usize {
 /// The fd must be a tagged timer handle.
 pub fn timer_set(fd: i32, delay_ms: u32) -> i32 {
     let slot = slot_of(fd);
-    if slot < 0 || slot as usize >= MAX_TIMERS {
+    if slot < 0 || slot as usize >= timers().len() {
         return errno::EINVAL;
     }
-    let timer = &TIMER_SLOTS[slot as usize];
+    let timer = &timers()[slot as usize];
     if !timer.allocated.load(Ordering::Acquire) {
         return errno::EINVAL;
     }
@@ -134,10 +160,10 @@ pub fn timer_set(fd: i32, delay_ms: u32) -> i32 {
 /// Cancel an active timer (stop it without destroying).
 pub fn timer_cancel(fd: i32) -> i32 {
     let slot = slot_of(fd);
-    if slot < 0 || slot as usize >= MAX_TIMERS {
+    if slot < 0 || slot as usize >= timers().len() {
         return errno::EINVAL;
     }
-    let timer = &TIMER_SLOTS[slot as usize];
+    let timer = &timers()[slot as usize];
     if !timer.allocated.load(Ordering::Acquire) {
         return errno::EINVAL;
     }
@@ -149,10 +175,10 @@ pub fn timer_cancel(fd: i32) -> i32 {
 /// Destroy a timer and free its slot.
 pub fn timer_destroy(fd: i32) -> i32 {
     let slot = slot_of(fd);
-    if slot < 0 || slot as usize >= MAX_TIMERS {
+    if slot < 0 || slot as usize >= timers().len() {
         return errno::EINVAL;
     }
-    let timer = &TIMER_SLOTS[slot as usize];
+    let timer = &timers()[slot as usize];
     if !timer.allocated.load(Ordering::Acquire) {
         return errno::EINVAL;
     }
@@ -181,7 +207,7 @@ pub fn timer_destroy(fd: i32) -> i32 {
 pub fn timer_pump(domain_id: u8) -> Option<u32> {
     let now = now_ms();
     let mut earliest: Option<u32> = None;
-    for timer in TIMER_SLOTS.iter() {
+    for timer in timers().iter() {
         if !timer.allocated.load(Ordering::Acquire) || !timer.active.load(Ordering::Acquire) {
             continue;
         }
@@ -208,10 +234,10 @@ pub fn timer_pump(domain_id: u8) -> Option<u32> {
 
 /// Non-destructive check: has this timer expired?
 fn timer_is_expired(slot: i32) -> bool {
-    if slot < 0 || slot as usize >= MAX_TIMERS {
+    if slot < 0 || slot as usize >= timers().len() {
         return false;
     }
-    let timer = &TIMER_SLOTS[slot as usize];
+    let timer = &timers()[slot as usize];
     if !timer.allocated.load(Ordering::Acquire) || !timer.active.load(Ordering::Acquire) {
         return false;
     }
@@ -223,7 +249,7 @@ fn timer_is_expired(slot: i32) -> bool {
 
 /// Release all timer slots owned by a specific module. Called on module finish.
 pub fn release_timers_owned_by(module_idx: ModuleId) {
-    for timer in TIMER_SLOTS.iter() {
+    for timer in timers().iter() {
         if !timer.allocated.load(Ordering::Acquire) {
             continue;
         }

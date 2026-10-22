@@ -25,7 +25,8 @@ use core::ptr::null;
 use portable_atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::kernel::boot::config::{
-    read_config_into, Config, ModuleEntry, MAX_GRAPH_EDGES, MAX_MODULES as CONFIG_MAX_MODULES,
+    read_config_into, Config, ModuleEntry, ModuleList, MAX_GRAPH_EDGES,
+    MAX_MODULES as CONFIG_MAX_MODULES,
 };
 use crate::kernel::exec::step_guard::{
     self, fault_type, FaultPolicy, FaultRecord, FaultState, FaultStats, ModuleFaultInfo,
@@ -73,9 +74,48 @@ const _: () = assert!(
 /// half of it on the small parts, where these tables are on the stack.
 pub(crate) const BUFFER_GROUPS: usize = rings::buffer_groups(MAX_GRAPH_EDGES);
 
-/// Maximum number of channels (edges) in a graph.
-/// Matches MAX_GRAPH_EDGES from config to support fan-in/out expansion.
+/// The edge-index domain: the config format's bound on a channel id. The
+/// edge tables are sized at boot within it (see [`edge_slots`]); on the
+/// static profiles it is the compiled channel count.
 pub const MAX_CHANNELS: usize = MAX_GRAPH_EDGES;
+
+/// A scheduler table with one slot per module: boot-sized on Linux, bcm2712
+/// and RP, the profile's static array on wasm (`kernel::mem::table`).
+pub type ModTable<T> = crate::kernel::mem::table::Table<T, MAX_MODULES>;
+/// A scheduler table with one slot per edge.
+pub type EdgeTable<T> = crate::kernel::mem::table::Table<T, MAX_CHANNELS>;
+
+/// Module slots live now: what the boot plan committed, grown by live adds.
+/// Every walk over modules runs to this, never to `MAX_MODULES`. On the
+/// static profiles it is the compiled table size.
+#[inline]
+pub fn module_slots() -> usize {
+    #[cfg(any(feature = "host-linux", feature = "chip-bcm2712", feature = "rp"))]
+    {
+        // SAFETY: a length read of the scheduler's module table; it changes
+        // only while a graph is prepared or a subgraph is added, on the
+        // scheduler thread.
+        unsafe { (&*core::ptr::addr_of!(SCHED)).modules.len() }
+    }
+    #[cfg(not(any(feature = "host-linux", feature = "chip-bcm2712", feature = "rp")))]
+    {
+        MAX_MODULES
+    }
+}
+
+/// Edge slots live now (see [`module_slots`]).
+#[inline]
+pub fn edge_slots() -> usize {
+    #[cfg(any(feature = "host-linux", feature = "chip-bcm2712", feature = "rp"))]
+    {
+        // SAFETY: as `module_slots`.
+        unsafe { (&*core::ptr::addr_of!(SCHED)).edges.len() }
+    }
+    #[cfg(not(any(feature = "host-linux", feature = "chip-bcm2712", feature = "rp")))]
+    {
+        MAX_CHANNELS
+    }
+}
 
 /// Result of stepping all modules in a graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -553,7 +593,7 @@ pub fn validate_buffer_groups(edges: &[Edge]) -> bool {
         }
 
         let to_mod = edge.to_module;
-        if to_mod < MAX_MODULES && sched.in_place_writer[to_mod] {
+        if to_mod < module_slots() && sched.in_place_writer[to_mod] {
             group_writers[group] += 1;
             if group_writers[group] > 1 {
                 log::error!(

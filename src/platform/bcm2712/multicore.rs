@@ -41,8 +41,11 @@ use core::sync::atomic::{AtomicU32, Ordering};
 /// Cache line size on Cortex-A76 (BCM2712 / Pi 5).
 pub const CACHE_LINE: usize = 64;
 
-/// Maximum number of cross-domain channels.
-pub const MAX_CROSS_CHANNELS: usize = 32;
+/// The cross-domain channel index DOMAIN, not a table size: a
+/// `CrossDomainEdge` names its ring in a `u8`. The ring and edge tables are
+/// sized from the graph when it is bridged ([`size_cross`]), one per edge
+/// that crosses domains.
+pub const MAX_CROSS_CHANNELS: usize = 256;
 
 /// Maximum number of cores we can wake.
 pub const MAX_SECONDARY_CORES: usize = 3;
@@ -404,9 +407,10 @@ fn current_core_id_inline() -> u32 {
     crate::arch::aarch64::cpu::current_core_id() as u32
 }
 
-// Static channel pool
-static CROSS_CHANNELS: [CrossDomainChannel; MAX_CROSS_CHANNELS] =
-    [const { CrossDomainChannel::new() }; MAX_CROSS_CHANNELS];
+// Channel pool: one SPSC ring per cross-domain edge of the graph, carved when
+// the graph is bridged ([`size_cross`]).
+static CROSS_CHANNELS: crate::kernel::mem::table::Table<CrossDomainChannel, 0> =
+    crate::boot_table!(0, CrossDomainChannel::new());
 
 /// Number of allocated cross-domain channels.
 static CROSS_CHANNEL_COUNT: AtomicU32 = AtomicU32::new(0);
@@ -415,7 +419,7 @@ static CROSS_CHANNEL_COUNT: AtomicU32 = AtomicU32::new(0);
 /// Returns `None` if all channels are in use.
 pub fn alloc_cross_channel() -> Option<usize> {
     let idx = CROSS_CHANNEL_COUNT.fetch_add(1, Ordering::Relaxed) as usize;
-    if idx >= MAX_CROSS_CHANNELS {
+    if idx >= CROSS_CHANNELS.len() {
         CROSS_CHANNEL_COUNT.fetch_sub(1, Ordering::Relaxed);
         return None;
     }
@@ -425,11 +429,25 @@ pub fn alloc_cross_channel() -> Option<usize> {
 
 /// Get a reference to a cross-domain channel by index.
 pub fn get_cross_channel(idx: usize) -> Option<&'static CrossDomainChannel> {
-    if idx < MAX_CROSS_CHANNELS {
-        Some(&CROSS_CHANNELS[idx])
-    } else {
-        None
+    CROSS_CHANNELS.get(idx)
+}
+
+/// Size the ring and edge tables for `n` cross-domain edges: the graph's
+/// count, at boot or a rebuild, before any is registered. A table already
+/// larger keeps its slots. `Err(Ceiling)` past the ring-index domain.
+///
+/// # Safety
+/// Graph preparation (boot) or a rebuild under full quiesce: no pump walks
+/// the tables and nothing holds a reference into them.
+pub unsafe fn size_cross(n: usize) -> Result<(), crate::kernel::mem::table::TableError> {
+    if n > MAX_CROSS_CHANNELS {
+        return Err(crate::kernel::mem::table::TableError::Ceiling);
     }
+    CROSS_CHANNELS.reserve(n)?;
+    CROSS_CHANNELS.grow(n)?;
+    let edges = &*core::ptr::addr_of!(CROSS_EDGES);
+    edges.reserve(n)?;
+    edges.grow(n)
 }
 
 // ============================================================================
@@ -1164,12 +1182,9 @@ impl CrossDomainEdge {
     }
 }
 
-/// Maximum number of cross-domain edges.
-pub const MAX_CROSS_EDGES: usize = 32;
-
-/// Global cross-domain edge table.
-static mut CROSS_EDGES: [CrossDomainEdge; MAX_CROSS_EDGES] =
-    [const { CrossDomainEdge::empty() }; MAX_CROSS_EDGES];
+/// Global cross-domain edge table, sized with the rings ([`size_cross`]).
+static mut CROSS_EDGES: crate::kernel::mem::table::Table<CrossDomainEdge, 0> =
+    crate::boot_table!(0, CrossDomainEdge::empty());
 static CROSS_EDGE_COUNT: AtomicU32 = AtomicU32::new(0);
 
 /// Register a cross-domain edge. Returns the edge index, or None if full.
@@ -1178,10 +1193,9 @@ static CROSS_EDGE_COUNT: AtomicU32 = AtomicU32::new(0);
 /// Must be called during single-threaded init.
 pub unsafe fn register_cross_edge(edge: CrossDomainEdge) -> Option<usize> {
     let idx = CROSS_EDGE_COUNT.load(Ordering::Relaxed) as usize;
-    if idx >= MAX_CROSS_EDGES {
-        return None;
-    }
-    CROSS_EDGES[idx] = edge;
+    let edges = &mut *core::ptr::addr_of_mut!(CROSS_EDGES);
+    let slot = edges.get_mut(idx)?;
+    *slot = edge;
     CROSS_EDGE_COUNT.store((idx + 1) as u32, Ordering::Relaxed);
     Some(idx)
 }
@@ -1204,7 +1218,7 @@ pub unsafe fn reset_cross_state() {
     CROSS_EDGE_COUNT.store(0, Ordering::Release);
     let n = CROSS_CHANNEL_COUNT.swap(0, Ordering::AcqRel) as usize;
     let mut i = 0usize;
-    while i < n.min(MAX_CROSS_CHANNELS) {
+    while i < n.min(CROSS_CHANNELS.len()) {
         CROSS_CHANNELS[i].reset();
         i += 1;
     }
@@ -1213,9 +1227,9 @@ pub unsafe fn reset_cross_state() {
 /// Get a reference to a cross-domain edge.
 pub fn get_cross_edge(idx: usize) -> Option<&'static CrossDomainEdge> {
     if idx < cross_edge_count() {
-        // SAFETY: `idx < cross_edge_count() <= MAX_CROSS_EDGES`; the
-        // edge was published by `register_cross_edge` at boot time.
-        unsafe { Some(&CROSS_EDGES[idx]) }
+        // SAFETY: `idx < cross_edge_count()`, within the table; the edge was
+        // published by `register_cross_edge` at boot time.
+        unsafe { (&*core::ptr::addr_of!(CROSS_EDGES)).get(idx) }
     } else {
         None
     }

@@ -29,8 +29,21 @@
 
 use crate::kernel::workload::storage::StorageGrant;
 
-/// Maximum number of concurrently resident owners, including the system slot.
-#[cfg(feature = "multitenant")]
+/// The owner-slot DOMAIN on a hosted kernel, not a table size: the owner
+/// table — and every per-owner table beside it (log rings, code-pack
+/// regions, workload slots) — is sized at boot from the plan's `owners`
+/// ceiling (the system slot, the resident workloads and the owner reserve,
+/// `resource_ledger::plan`). What this bounds is what a slot may be at all:
+/// the host-process backend's workload index, which shares an fd slot space
+/// with the graph backend's above `0x1000`
+/// (`platform::linux::workload::GRAPH_SLOT_BASE`). A plan past it is refused
+/// at boot naming `owners`. Wire fields carrying a slot are `u16`.
+#[cfg(all(feature = "multitenant", feature = "host-linux"))]
+pub const MAX_OWNERS: usize = 4096;
+/// The owner-slot domain on bcm2712, including the system slot: the table is
+/// sized at boot from the plan (and carved), and a plan past this is refused
+/// naming `owners`.
+#[cfg(all(feature = "multitenant", not(feature = "host-linux")))]
 pub const MAX_OWNERS: usize = 64;
 /// Single-tenant: only the system owner exists.
 #[cfg(not(feature = "multitenant"))]
@@ -167,16 +180,134 @@ impl OwnerEntry {
 }
 
 /// Bounded table of owner slots. Slot 0 is permanently the system owner.
+///
+/// On Linux and bcm2712 the table is sized at boot to the plan's `owners`
+/// ceiling — the system slot, the resident workloads and the owner reserve —
+/// within the owner-slot domain `MAX_OWNERS` (4096 on Linux, 64 on bcm2712);
+/// elsewhere it is the static array (1 single-tenant).
 pub struct OwnerTable {
-    entries: [OwnerEntry; MAX_OWNERS],
+    entries: crate::kernel::mem::table::Table<OwnerEntry, MAX_OWNERS>,
+    /// The kernel's table ([`OwnerTable::kernel`]): its owners' log rings
+    /// are created with them and freed with them. A free-standing table (a
+    /// test's) holds no rings.
+    #[cfg(feature = "host-linux")]
+    logs: bool,
+}
+
+/// Slot 0 is the system owner; every other slot starts free.
+#[cfg(any(feature = "host-linux", feature = "chip-bcm2712", feature = "rp"))]
+fn owner_init(slot: usize) -> OwnerEntry {
+    if slot == 0 {
+        OwnerEntry::SYSTEM
+    } else {
+        OwnerEntry::EMPTY
+    }
+}
+
+/// The owners a table no plan has sized takes on first use: the plan's
+/// defaults, within the owner-slot domain.
+#[cfg(any(feature = "host-linux", feature = "chip-bcm2712", feature = "rp"))]
+fn owner_default() -> usize {
+    (crate::kernel::sys::resource_ledger::ceiling(crate::abi::contracts::resource::POOL_OWNERS)
+        as usize)
+        .clamp(1, MAX_OWNERS)
 }
 
 impl OwnerTable {
     /// A fresh table with only the system slot active.
     pub const fn new() -> Self {
-        let mut entries = [OwnerEntry::EMPTY; MAX_OWNERS];
-        entries[0] = OwnerEntry::SYSTEM;
-        OwnerTable { entries }
+        #[cfg(any(feature = "host-linux", feature = "chip-bcm2712", feature = "rp"))]
+        {
+            OwnerTable {
+                entries: crate::kernel::mem::table::Table::new_planned(owner_init, owner_default),
+                #[cfg(feature = "host-linux")]
+                logs: false,
+            }
+        }
+        #[cfg(not(any(feature = "host-linux", feature = "chip-bcm2712", feature = "rp")))]
+        {
+            let mut entries = [OwnerEntry::EMPTY; MAX_OWNERS];
+            entries[0] = OwnerEntry::SYSTEM;
+            OwnerTable {
+                entries: crate::kernel::mem::table::Table::from_array(entries),
+            }
+        }
+    }
+
+    /// The kernel's table: as [`new`](Self::new), and on a hosted kernel each
+    /// owner's log ring (`owner_log`) lives exactly as long as the owner.
+    pub const fn kernel() -> Self {
+        #[cfg(feature = "host-linux")]
+        {
+            let mut t = Self::new();
+            t.logs = true;
+            t
+        }
+        #[cfg(not(feature = "host-linux"))]
+        {
+            Self::new()
+        }
+    }
+
+    /// Size the table to `n` slots, all live (slot 0 the system owner).
+    ///
+    /// # Safety
+    /// Graph-preparation context: no reference into the table is live.
+    pub unsafe fn size(&self, n: usize) -> Result<(), crate::kernel::mem::table::TableError> {
+        if n > MAX_OWNERS {
+            return Err(crate::kernel::mem::table::TableError::Ceiling);
+        }
+        self.entries.reserve(n)?;
+        self.entries.grow(n)
+    }
+
+    /// Slots the table holds, the system slot among them: its live length,
+    /// what a per-owner walk iterates.
+    pub fn slot_count(&self) -> usize {
+        self.slots().len()
+    }
+
+    /// A new tenant took `slot`: its log ring starts (or, for the same
+    /// triple, carries on).
+    #[inline]
+    fn ring_installed(&self, _slot: u16, _uid: [u8; 16], _generation: u32) {
+        #[cfg(feature = "host-linux")]
+        if self.logs {
+            crate::kernel::workload::owner_log::install_slot(_slot as usize, _uid, _generation);
+        }
+    }
+
+    /// `slot`'s owner is gone: its log ring goes with it.
+    #[inline]
+    fn ring_released(&self, _slot: u16) {
+        #[cfg(feature = "host-linux")]
+        if self.logs {
+            crate::kernel::workload::owner_log::release_slot(_slot as usize);
+        }
+    }
+
+    /// Release the log ring of every free slot: after a plan is applied,
+    /// the owners it did not re-install are gone, and their rings with them.
+    /// A re-installed owner kept its ring (rebuild survival).
+    pub fn release_free_rings(&self) {
+        for (slot, e) in self.slots().iter().enumerate().skip(1) {
+            if matches!(e.state, OwnerState::Free) {
+                self.ring_released(slot as u16);
+            }
+        }
+    }
+
+    /// The live slots.
+    #[inline]
+    fn slots(&self) -> &[OwnerEntry] {
+        &self.entries
+    }
+
+    /// Mutable view of the live slots.
+    #[inline]
+    fn slots_mut(&mut self) -> &mut [OwnerEntry] {
+        let _ = self.slots();
+        &mut self.entries
     }
 
     /// Allocate the lowest free slot for `owner_uid`. The reuse generation is
@@ -194,13 +325,9 @@ impl OwnerTable {
                 return None;
             }
         }
-        // `1..MAX_OWNERS` is empty on single-tenant (MAX_OWNERS == 1) builds —
-        // no workload slots exist, so alloc correctly returns None.
-        #[allow(
-            clippy::reversed_empty_ranges,
-            reason = "empty by design when MAX_OWNERS == 1 (single-tenant)"
-        )]
-        for slot in 1..MAX_OWNERS {
+        // Empty on single-tenant builds (one slot): no workload slots exist,
+        // so nothing matches.
+        for slot in 1..self.slots().len() {
             if matches!(self.entries[slot].state, OwnerState::Free) {
                 let generation = self.entries[slot].generation.wrapping_add(1);
                 self.entries[slot] = OwnerEntry {
@@ -210,6 +337,7 @@ impl OwnerTable {
                     acct: OwnerAccounting::ZERO,
                     authority: Authority::Own,
                 };
+                self.ring_installed(slot as u16, owner_uid, generation);
                 return Some(OwnerHandle {
                     slot: slot as u16,
                     generation,
@@ -244,7 +372,7 @@ impl OwnerTable {
         buffer_cap: u32,
     ) -> Option<OwnerHandle> {
         let s = slot as usize;
-        if s == 0 || s >= MAX_OWNERS {
+        if s == 0 || s >= self.slots().len() {
             return None;
         }
         // Never lower a slot's generation: that is the reuse guard's core
@@ -264,12 +392,13 @@ impl OwnerTable {
             acct,
             authority: Authority::Own,
         };
+        self.ring_installed(slot, owner_uid, generation);
         Some(OwnerHandle { slot, generation })
     }
 
     #[inline]
     fn slot_valid(&self, h: OwnerHandle) -> bool {
-        (h.slot as usize) < MAX_OWNERS
+        (h.slot as usize) < self.slots().len()
     }
 
     /// Look up a live entry for `h`. `None` if the slot is out of range, freed,
@@ -308,11 +437,9 @@ impl OwnerTable {
     /// [`authorize_admit`](Self::authorize_admit) — a `Draining`/`Revoked`
     /// owner resolves but must not admit new work.
     pub fn find_by_uid(&self, owner_uid: [u8; 16]) -> Option<OwnerHandle> {
-        #[allow(
-            clippy::reversed_empty_ranges,
-            reason = "empty by design when MAX_OWNERS == 1 (single-tenant)"
-        )]
-        for slot in 1..MAX_OWNERS {
+        // Empty on single-tenant builds (one slot): no workload slots exist,
+        // so nothing matches.
+        for slot in 1..self.slots().len() {
             let e = &self.entries[slot];
             if !matches!(e.state, OwnerState::Free) && e.owner_uid == owner_uid {
                 return Some(OwnerHandle {
@@ -399,6 +526,7 @@ impl OwnerTable {
         e.owner_uid = [0; 16];
         e.acct = OwnerAccounting::ZERO;
         e.authority = Authority::Own;
+        self.ring_released(h.slot);
         true
     }
 
@@ -406,9 +534,11 @@ impl OwnerTable {
     /// later installs still issue strictly higher generations). Used by the
     /// plan-apply path: the composed plan is authoritative for residency,
     /// so owners absent from the new plan are revoked here before the
-    /// plan's owners are installed.
+    /// plan's owners are installed. Log rings are left for the apply to
+    /// release ([`release_free_rings`](Self::release_free_rings)) once it
+    /// knows which owners came back.
     pub fn reset_workloads(&mut self) {
-        for e in self.entries.iter_mut().skip(1) {
+        for e in self.slots_mut().iter_mut().skip(1) {
             e.state = OwnerState::Free;
             e.owner_uid = [0; 16];
             e.acct = OwnerAccounting::ZERO;
@@ -420,7 +550,7 @@ impl OwnerTable {
     /// out-of-range slot. Read-only view for status/telemetry aggregation
     /// (the owner-status surface walks resident slots).
     pub fn entry_at(&self, slot: usize) -> Option<&OwnerEntry> {
-        self.entries.get(slot)
+        self.slots().get(slot)
     }
 
     /// Number of active workload owners (excludes the system slot).
@@ -565,7 +695,7 @@ impl OwnerTable {
     /// module table on each rebuild; without this it would add a rebuild's
     /// modules to the previous pass's total for any slot that survived.
     pub fn clear_state_charges(&mut self) {
-        for e in self.entries.iter_mut().skip(1) {
+        for e in self.slots_mut().iter_mut().skip(1) {
             e.acct.state_bytes = 0;
         }
     }

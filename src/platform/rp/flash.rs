@@ -84,7 +84,9 @@ pub mod store {
             if bytes == 0 {
                 0
             } else {
-                bytes + 4 + 1
+                // A v1 header and terminator the compiled params may lack
+                // (`params_tlv::merge_room`).
+                bytes + 4 + 2
             }
         }
     }
@@ -364,11 +366,12 @@ pub mod store {
     // Boot merge — called per module during instantiation
     // ============================================================================
 
-    /// Merge runtime overrides for `module_id` into `param_buf`.
-    ///
-    /// Appends override TLV entries after the compiled params. Since
-    /// `parse_tlv()` processes entries sequentially (last writer wins),
-    /// overrides naturally take precedence.
+    /// Merge runtime overrides for `module_id` into `param_buf`
+    /// (`kernel::sys::params_tlv::merge_overrides`): each override entry is
+    /// inserted before the basic section's terminator, so `parse_tlv()`'s
+    /// last-writer-wins gives it precedence, and the terminator and every
+    /// extended entry after it (certificates, keys, trust bundles) move up
+    /// whole. A module with no compiled params gets a v1 header.
     ///
     /// `param_buf` points to `MERGE_BUFFER`, `param_len` is current length.
     /// Returns the new length.
@@ -381,98 +384,30 @@ pub mod store {
         param_len: usize,
         max_len: usize,
     ) -> usize {
-        // Need at least 4 bytes for a TLV v2 header; bail if buffer is undersized.
-        if max_len < 4 {
-            return param_len.min(max_len);
+        let table = &raw const BOOT_OVERRIDES;
+        if param_buf.is_null() || !(*table).valid || (*table).count == 0 {
+            return param_len;
         }
-        {
-            let table = &raw const BOOT_OVERRIDES;
-            if !(*table).valid || (*table).count == 0 {
-                return param_len;
-            }
-
-            // Count how many overrides match this module
-            let mut match_count = 0usize;
-            let mut i = 0;
-            while i < (*table).count {
-                if (*table).entries[i].module_id == module_id {
-                    match_count += 1;
-                }
-                i += 1;
-            }
-            if match_count == 0 {
-                return param_len;
-            }
-
-            // If no compiled params, create a TLV v2 header
-            let mut pos = param_len;
-            if pos < 4 {
-                // Empty params — write TLV v2 header: magic(0xFE), version(0x02), len(0x0000)
-                *param_buf.add(0) = 0xFE;
-                *param_buf.add(1) = 0x02;
-                *param_buf.add(2) = 0;
-                *param_buf.add(3) = 0;
-                pos = 4;
-            }
-
-            // Find the end of existing TLV entries.
-            // TLV v2: bytes 2-3 = payload_length. Entries start at byte 4.
-            // Scan for 0xFF end marker or use payload_length.
-            let payload_len = u16::from_le_bytes([*param_buf.add(2), *param_buf.add(3)]) as usize;
-            let payload_end = if payload_len > 0 && 4 + payload_len < pos {
-                4 + payload_len
-            } else {
-                // Scan for 0xFF end marker
-                let mut p = 4usize;
-                while p + 2 <= pos {
-                    let tag = *param_buf.add(p);
-                    if tag == 0xFF {
-                        break;
-                    }
-                    let elen = *param_buf.add(p + 1) as usize;
-                    p += 2 + elen;
-                }
-                p
-            };
-
-            // Append overrides at payload_end
-            let mut write_pos = payload_end;
-            i = 0;
-            while i < (*table).count {
-                let e = &(*table).entries[i];
-                if e.module_id == module_id {
-                    let needed = 2 + e.value_len as usize; // tag + len + value
-                    if write_pos + needed + 1 > max_len {
-                        break; // no room
-                    }
-                    *param_buf.add(write_pos) = e.tag;
-                    *param_buf.add(write_pos + 1) = e.value_len;
-                    if e.value_len > 0 {
-                        core::ptr::copy_nonoverlapping(
-                            e.value_ptr,
-                            param_buf.add(write_pos + 2),
-                            e.value_len as usize,
-                        );
-                    }
-                    write_pos += needed;
-                }
-                i += 1;
-            }
-
-            // Write 0xFF end marker
-            if write_pos < max_len {
-                *param_buf.add(write_pos) = 0xFF;
-            }
-
-            // Update TLV v2 payload length (bytes 2-3)
-            let new_payload_len = (write_pos - 4) as u16;
-            let len_bytes = new_payload_len.to_le_bytes();
-            *param_buf.add(2) = len_bytes[0];
-            *param_buf.add(3) = len_bytes[1];
-
-            // Return new total length (including end marker)
-            write_pos + 1
+        let all = &(*table).entries;
+        let entries = &all[..(*table).count.min(MAX_OVERRIDES)];
+        let mine = entries
+            .iter()
+            .filter(|e| e.module_id == module_id)
+            .map(|e| {
+                let v: &[u8] = if e.value_len == 0 || e.value_ptr.is_null() {
+                    &[]
+                } else {
+                    // SAFETY: boot_scan copied each value into
+                    // OVERRIDE_ARENA, which lives for the program.
+                    core::slice::from_raw_parts(e.value_ptr, e.value_len as usize)
+                };
+                (e.tag, v)
+            });
+        if mine.clone().next().is_none() {
+            return param_len;
         }
+        let buf = core::slice::from_raw_parts_mut(param_buf, max_len);
+        crate::kernel::sys::params_tlv::merge_overrides(buf, param_len, mine).len
     }
 
     // ============================================================================

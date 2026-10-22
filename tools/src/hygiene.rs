@@ -17,6 +17,12 @@
 //!        `storage.namespace` RENAME/DELETE/BIND) must go straight
 //!        into `write_answer(...)`, because the write may answer
 //!        `EINPROGRESS`. There is no exemption row; classify the answer.
+//!      - Vocabulary rule: the portable surface, the kernel and the
+//!        architecture docs name no Unix credential, orchestrator noun or
+//!        host mechanism, outside a reasoned `vocabulary-exempt` block.
+//!      - Descriptor-hygiene rule: in `src/platform/linux/`, every
+//!        descriptor-creating call carries its close-on-exec flag and
+//!        every spawned `Command` sweeps inherited descriptors.
 //!   3. Whole-repo checks:
 //!      - Module-structure rules over `modules/**`.
 //!      - Shadow-guard rules over the shadow-tracked test tiers.
@@ -51,6 +57,7 @@ pub enum Rule {
     CrateRootAllow,
     PendingWrite,
     TenancyVocabulary,
+    DescriptorHygiene,
 }
 
 impl Rule {
@@ -74,8 +81,7 @@ impl Rule {
                  an `#[allow]` goes on silently covering whatever arrives under it. The \
                  exception is a suppression that is target-conditional — `#[expect]` is \
                  an error in a configuration where the lint does NOT fire, so a lint \
-                 that fires on one target and not another stays `#[allow]` with a reason \
-                 (lints.md §3, case 3).\n\
+                 that fires on one target and not another stays `#[allow]` with a reason.\n\
                  \n  \
                  The cause is source this file only MOUNTS — an `include!`d SDK whose \
                  whole surface every consumer sees and each uses a subset of: there is \
@@ -103,6 +109,7 @@ impl Rule {
             Rule::ConsumerNaming => "consumer-naming",
             Rule::PendingWrite => "pending-write",
             Rule::TenancyVocabulary => "tenancy-vocabulary",
+            Rule::DescriptorHygiene => "descriptor-hygiene",
         }
     }
 }
@@ -197,9 +204,9 @@ pub enum ConfigError {
 }
 
 impl Config {
-    /// Load `<project_root>/fluxor.toml`. Missing file yields defaults
-    /// — projects that haven't adopted the standard yet still get a
-    /// meaningful scan against the prescribed baseline.
+    /// Load `<project_root>/fluxor.toml`. A missing file yields the
+    /// defaults, so a project without one is scanned against the
+    /// prescribed baseline.
     pub fn load(project_root: &Path) -> Result<Self, ConfigError> {
         let path = project_root.join("fluxor.toml");
         if !path.exists() {
@@ -300,13 +307,27 @@ pub fn scan(project_root: &Path, config: &Config) -> Result<Report, ScanError> {
             continue;
         }
         let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) != Some("rs") {
+        let ext = path.extension().and_then(|s| s.to_str());
+        if ext != Some("rs") && ext != Some("md") {
             continue;
         }
         let rel = match path.strip_prefix(project_root) {
             Ok(r) => r.to_path_buf(),
             Err(_) => continue,
         };
+        if ext == Some("md") {
+            // Prose is held to the vocabulary rule only, and only in the
+            // repo that owns the surface it describes.
+            if sdk_owner && is_architecture_doc(&rel) {
+                if let Ok(content) = fs::read_to_string(path) {
+                    report.files_scanned += 1;
+                    report
+                        .violations
+                        .extend(scan_tenancy_vocabulary(&rel, &content));
+                }
+            }
+            continue;
+        }
         let content = match fs::read_to_string(path) {
             Ok(c) => c,
             Err(_) => continue,
@@ -333,6 +354,7 @@ pub fn scan(project_root: &Path, config: &Config) -> Result<Report, ScanError> {
             file_violations.extend(scan_sdk_mounts(&rel, &content));
         }
         file_violations.extend(scan_pending_writes(&rel, &content, &write_consts));
+        file_violations.extend(scan_descriptor_hygiene(&rel, &content));
         report.violations.extend(file_violations);
     }
 
@@ -518,7 +540,7 @@ fn push_repo_violation(report: &mut Report, rel: PathBuf, rule: Rule, message: S
     });
 }
 
-/// The tree tiers [`test-tracking.md §1`] shadow-tracks. `fuzz/` and
+/// The tree tiers the test-tracking standard shadow-tracks. `fuzz/` and
 /// `fixtures/` are listed by the standard and by the projects that use
 /// them; `tools/rig/` is the standard's named extra tree — the rig
 /// mechanism backends and bench tooling, which describe benches the way
@@ -667,11 +689,10 @@ fn ignore_file_lists_tier(contents: &str, tier: &str, negated: bool) -> bool {
 /// Files under a tier that are versioned NOWHERE — not in the primary
 /// repo, not in the shadow repo, not ignored.
 ///
-/// A tier is not all-or-nothing. `examples/` here holds fifteen tracked
-/// catalog files and a hundred-odd that were `git rm --cached`-ed and
-/// never given a home: not in the primary repo, not shadow-added, not
-/// gitignored. A tier-level predicate sees the fifteen and says nothing
-/// about the rest, which is how they stayed invisible.
+/// A tier is not all-or-nothing: tracked files can sit beside files that
+/// are in neither repo and not ignored. A tier-level predicate sees the
+/// tracked ones and says nothing about the rest, so the check is per
+/// file.
 ///
 /// `git ls-files --others --exclude-standard` is the repo's own answer
 /// for "untracked and not ignored"; subtracting what the shadow repo
@@ -1141,6 +1162,45 @@ const UNIX_CREDENTIAL_WORDS: &[&str] = &[
 /// and node agent.
 const ORCHESTRATOR_WORDS: &[&str] = &["pod", "pods", "kubelet", "kubernetes", "k8s"];
 
+/// Host mechanisms: how one platform realizes a portable concept. They belong
+/// to that platform (`src/platform/<p>/`, `modules/sdk/platform/<p>/`); a
+/// portable surface, the kernel and the architecture docs say what is
+/// guaranteed, not which host facility guarantees it. `bridge` and `uid` are
+/// deliberately absent: both are ordinary portable words here (a channel
+/// bridge, an owner uid).
+const MECHANISM_WORDS: &[&str] = &[
+    "veth",
+    "netns",
+    "cgroup",
+    "cgroups",
+    "cgroup2",
+    "unshare",
+    "chroot",
+    "iptables",
+    "ip6tables",
+    "ebtables",
+    "nftables",
+    "nft",
+    "netfilter",
+    "sysctl",
+    "ip_forward",
+    "pivot_root",
+    "cni",
+    "conntrack",
+    "masquerade",
+    "netlink",
+    "rp_filter",
+];
+
+/// Opens a block the vocabulary rule skips: a ruling that must name a backend
+/// (what the Linux realization of a contract is, say). The marker carries its
+/// reason after a colon, and the block ends at [`VOCABULARY_EXEMPT_END`]. In
+/// Rust a comment (`// vocabulary-exempt-begin: …`), in Markdown an HTML
+/// comment (`<!-- vocabulary-exempt-begin: … -->`), so neither renders.
+const VOCABULARY_EXEMPT_BEGIN: &str = "vocabulary-exempt-begin";
+/// Closes a [`VOCABULARY_EXEMPT_BEGIN`] block.
+const VOCABULARY_EXEMPT_END: &str = "vocabulary-exempt-end";
+
 /// Whether `rel` is part of the portable surface: the normative surface
 /// less a platform's own contracts, which may name that platform's
 /// mechanisms.
@@ -1149,47 +1209,346 @@ fn is_portable_surface(rel: &Path) -> bool {
     is_normative_surface(rel) && !p.starts_with("modules/sdk/platform/")
 }
 
+/// Whether `rel` is an architecture document: the prose that states the
+/// rulings the portable surface implements.
+fn is_architecture_doc(rel: &Path) -> bool {
+    rel.to_string_lossy()
+        .replace('\\', "/")
+        .starts_with("docs/architecture/")
+}
+
+/// Whether `rel` is held to the vocabulary rule: the portable surface, the
+/// portable kernel, and the architecture docs.
+fn is_vocabulary_scope(rel: &Path) -> bool {
+    let p = rel.to_string_lossy().replace('\\', "/");
+    is_portable_surface(rel) || p.starts_with("src/kernel/") || is_architecture_doc(rel)
+}
+
+/// How a vocabulary violation names the scope its file is in.
+fn vocabulary_scope_name(rel: &Path) -> &'static str {
+    if is_architecture_doc(rel) {
+        "an architecture doc"
+    } else if is_portable_surface(rel) {
+        "the portable surface"
+    } else {
+        "the portable kernel"
+    }
+}
+
 /// The portable surface speaks of owners and grants, never of Unix
-/// credentials or an orchestrator's nouns. Either is a sign of a contract
-/// taking the shape of one host or one consumer: a portable `fs` that
-/// reported a uid would invite every provider to enforce one, and none of
-/// the bare-metal ones has a user to enforce.
+/// credentials, an orchestrator's nouns or a host's mechanisms. Each is a sign
+/// of a contract taking the shape of one host or one consumer: a portable `fs`
+/// that reported a uid would invite every provider to enforce one, and none of
+/// the bare-metal ones has a user to enforce. The kernel and the architecture
+/// docs are held to the same words, so the surface is not described in a
+/// vocabulary it may not use; a ruling that must name a backend sits in a
+/// reasoned `vocabulary-exempt` block.
 fn scan_tenancy_vocabulary(rel: &Path, src: &str) -> Vec<Violation> {
-    if !is_portable_surface(rel) {
+    if !is_vocabulary_scope(rel) {
         return Vec::new();
     }
+    let violation = |line: usize, message: String| Violation {
+        path: rel.to_path_buf(),
+        line,
+        rule: Rule::TenancyVocabulary,
+        message,
+    };
+    let scope = vocabulary_scope_name(rel);
     let mut out = Vec::new();
+    let mut open_at: Option<usize> = None;
     for (i, line) in src.lines().enumerate() {
+        if line.contains(VOCABULARY_EXEMPT_END) {
+            if open_at.take().is_none() {
+                out.push(violation(
+                    i + 1,
+                    format!("`{VOCABULARY_EXEMPT_END}` closes no open exempt block"),
+                ));
+            }
+            continue;
+        }
+        if let Some(at) = line.find(VOCABULARY_EXEMPT_BEGIN) {
+            if let Some(prev) = open_at {
+                out.push(violation(
+                    i + 1,
+                    format!("exempt block opened while the one from line {prev} is still open"),
+                ));
+            }
+            let reason = line[at + VOCABULARY_EXEMPT_BEGIN.len()..]
+                .trim_start_matches(':')
+                .trim()
+                .trim_end_matches("-->")
+                .trim();
+            if reason.is_empty() {
+                out.push(violation(
+                    i + 1,
+                    format!(
+                        "`{VOCABULARY_EXEMPT_BEGIN}` carries no reason — say why this ruling \
+                         must name a backend"
+                    ),
+                ));
+            }
+            open_at = Some(i + 1);
+            continue;
+        }
+        if open_at.is_some() {
+            continue;
+        }
         let lower = line.to_ascii_lowercase();
         for word in UNIX_CREDENTIAL_WORDS {
             if word_appears(&lower, word) {
-                out.push(Violation {
-                    path: rel.to_path_buf(),
-                    line: i + 1,
-                    rule: Rule::TenancyVocabulary,
-                    message: format!(
-                        "names the Unix credential `{word}` in the portable surface — what a \
+                out.push(violation(
+                    i + 1,
+                    format!(
+                        "names the Unix credential `{word}` in {scope} — what a \
                          workload may reach is a grant on its owner, made real inside a root of \
-                         its own; a credential belongs to the host-process platform contract \
-                         (`modules/sdk/platform/linux/`)"
+                         its own; a credential belongs to the host-process platform \
+                         (`src/platform/linux/`, `modules/sdk/platform/linux/`)"
                     ),
-                });
+                ));
             }
         }
         for word in ORCHESTRATOR_WORDS {
             if word_appears(&lower, word) {
-                out.push(Violation {
-                    path: rel.to_path_buf(),
-                    line: i + 1,
-                    rule: Rule::TenancyVocabulary,
-                    message: format!(
-                        "names the orchestrator noun `{word}` in the portable surface — say \
+                out.push(violation(
+                    i + 1,
+                    format!(
+                        "names the orchestrator noun `{word}` in {scope} — say \
                          workload, owner or node agent; an orchestrator's vocabulary lives in \
                          the orchestrator"
                     ),
-                });
+                ));
             }
         }
+        for word in MECHANISM_WORDS {
+            if word_appears(&lower, word) {
+                out.push(violation(
+                    i + 1,
+                    format!(
+                        "names the host mechanism `{word}` in {scope} — say what \
+                         is guaranteed, not which host facility realizes it; mechanisms live in \
+                         `src/platform/<p>/` and `modules/sdk/platform/<p>/`, and a ruling that \
+                         must name a backend goes inside a `{VOCABULARY_EXEMPT_BEGIN}: <reason>` \
+                         … `{VOCABULARY_EXEMPT_END}` block"
+                    ),
+                ));
+            }
+        }
+    }
+    if let Some(at) = open_at {
+        out.push(violation(
+            at,
+            format!("exempt block never closed with `{VOCABULARY_EXEMPT_END}`"),
+        ));
+    }
+    out
+}
+
+/// Files under `src/platform/linux/` the descriptor-hygiene rule does not
+/// read, each with its reason. Reviewed: a row here is a file whose
+/// descriptors are made safe some other way, never a file nobody fixed.
+const DESCRIPTOR_HYGIENE_EXEMPT: &[(&str, &str)] = &[];
+
+/// Descriptor-creating libc calls and how each is made close-on-exec.
+/// `None`: the call cannot take the flag, so its flag-taking sibling is used
+/// instead.
+const DESCRIPTOR_CALLS: &[(&str, Option<&str>)] = &[
+    ("socket", Some("SOCK_CLOEXEC")),
+    ("socketpair", Some("SOCK_CLOEXEC")),
+    ("accept4", Some("SOCK_CLOEXEC")),
+    ("accept", None),
+    ("open", Some("O_CLOEXEC")),
+    ("open64", Some("O_CLOEXEC")),
+    ("openat", Some("O_CLOEXEC")),
+    ("creat", None),
+    ("pipe", None),
+    ("pipe2", Some("O_CLOEXEC")),
+    ("dup", None),
+    ("dup3", Some("O_CLOEXEC")),
+    ("posix_openpt", Some("O_CLOEXEC")),
+    ("epoll_create", None),
+    ("epoll_create1", Some("EPOLL_CLOEXEC")),
+    ("eventfd", Some("EFD_CLOEXEC")),
+    ("timerfd_create", Some("TFD_CLOEXEC")),
+    ("inotify_init", None),
+    ("inotify_init1", Some("IN_CLOEXEC")),
+    ("memfd_create", Some("MFD_CLOEXEC")),
+    ("signalfd", Some("SFD_CLOEXEC")),
+];
+
+/// Descriptor-creating system calls made raw (`libc::syscall(libc::SYS_<name>,
+/// ..)`) whose names differ from the libc wrappers above, and their flags.
+/// `openat2` is absent: it takes its flags in an `open_how`, which the call's
+/// text does not show.
+const DESCRIPTOR_SYSCALLS: &[(&str, Option<&str>)] = &[
+    ("eventfd2", Some("EFD_CLOEXEC")),
+    ("signalfd4", Some("SFD_CLOEXEC")),
+    ("open_tree", Some("OPEN_TREE_CLOEXEC")),
+    ("fsopen", Some("FSOPEN_CLOEXEC")),
+    ("fsmount", Some("FSMOUNT_CLOEXEC")),
+    ("fspick", Some("FSPICK_CLOEXEC")),
+];
+
+/// The argument text of the call whose `(` is at `open`, up to its matching
+/// `)` (or the end of the source).
+fn call_args(src: &str, open: usize) -> &str {
+    let mut depth = 0usize;
+    for (k, c) in src[open..].char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &src[open + 1..open + k];
+                }
+            }
+            _ => {}
+        }
+    }
+    &src[open + 1..]
+}
+
+/// A workload starts holding only what it was granted (`workload` contract):
+/// on Linux, every descriptor the runtime creates is close-on-exec from the
+/// call that creates it, and every child the runtime spawns sweeps what it
+/// inherited anyway. Setting the flag afterwards with `fcntl` leaves a window
+/// in which another thread's fork inherits the descriptor, so the flag must be
+/// in the creating call. `dup2` onto stdio is how a child is given its stdio,
+/// and is allowed; any other `dup2` is a descriptor without the flag.
+///
+/// Calls are recognized by their `libc::` path, through the wrapper
+/// (`libc::socket(..)`) or raw (`libc::syscall(libc::SYS_socket, ..)`); a
+/// descriptor-creating call reached any other way, and `openat2`, is not
+/// seen.
+fn scan_descriptor_hygiene(rel: &Path, src: &str) -> Vec<Violation> {
+    let p = rel.to_string_lossy().replace('\\', "/");
+    if !(p.starts_with("src/platform/linux/") || p == "src/platform/linux.rs")
+        || DESCRIPTOR_HYGIENE_EXEMPT.iter().any(|(f, _)| *f == p)
+    {
+        return Vec::new();
+    }
+    // Comments may name the calls; only code is checked.
+    let code: String = src
+        .lines()
+        .map(|l| {
+            let t = l.trim_start();
+            if t.starts_with("//") {
+                ""
+            } else {
+                l
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let line_of = |at: usize| code[..at].bytes().filter(|b| *b == b'\n').count() + 1;
+    let violation = |at: usize, message: String| Violation {
+        path: rel.to_path_buf(),
+        line: line_of(at),
+        rule: Rule::DescriptorHygiene,
+        message,
+    };
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(off) = code[from..].find("libc::") {
+        let at = from + off;
+        let name_start = at + "libc::".len();
+        let name_len = code[name_start..]
+            .bytes()
+            .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_')
+            .count();
+        let mut name = &code[name_start..name_start + name_len];
+        from = name_start + name_len;
+        if code.as_bytes().get(from) != Some(&b'(') {
+            continue;
+        }
+        let mut args = call_args(&code, from);
+        // `libc::syscall(libc::SYS_<name>, rest..)` is the call `<name>(rest..)`.
+        let mut raw = false;
+        if name == "syscall" {
+            let (number, rest) = args.split_once(',').unwrap_or((args, ""));
+            let Some(sys) = number.trim().strip_prefix("libc::SYS_") else {
+                continue;
+            };
+            name = sys;
+            args = rest;
+            raw = true;
+        }
+        let call = if raw {
+            format!("libc::syscall(libc::SYS_{name}, ..)")
+        } else {
+            format!("libc::{name}")
+        };
+        if name == "dup2" {
+            let target = args.rsplit(',').next().unwrap_or("").trim();
+            let stdio = matches!(
+                target,
+                "0" | "1"
+                    | "2"
+                    | "libc::STDIN_FILENO"
+                    | "libc::STDOUT_FILENO"
+                    | "libc::STDERR_FILENO"
+            );
+            if !stdio {
+                out.push(violation(
+                    at,
+                    format!(
+                        "`{call}` onto a descriptor other than stdio leaves it without \
+                         close-on-exec — use `libc::dup3(.., O_CLOEXEC)`"
+                    ),
+                ));
+            }
+            continue;
+        }
+        if name == "fcntl" {
+            if args.contains("F_DUPFD") && !args.contains("F_DUPFD_CLOEXEC") {
+                out.push(violation(
+                    at,
+                    "`fcntl(F_DUPFD)` makes a descriptor without close-on-exec — use \
+                     `F_DUPFD_CLOEXEC`"
+                        .to_string(),
+                ));
+            }
+            continue;
+        }
+        let found = DESCRIPTOR_CALLS
+            .iter()
+            .chain(if raw { DESCRIPTOR_SYSCALLS } else { &[] })
+            .find(|(n, _)| *n == name);
+        let Some((_, flag)) = found else {
+            continue;
+        };
+        match flag {
+            None => out.push(violation(
+                at,
+                format!(
+                    "`{call}` cannot create a close-on-exec descriptor — use its \
+                     flag-taking sibling with the close-on-exec flag, so no fork in another \
+                     thread inherits it"
+                ),
+            )),
+            Some(flag) if !args.contains(flag) => out.push(violation(
+                at,
+                format!(
+                    "`{call}` without `{flag}` — every descriptor the runtime creates is \
+                     close-on-exec at creation (a workload starts holding only what it was \
+                     granted)"
+                ),
+            )),
+            Some(_) => {}
+        }
+    }
+    // Every std `Command` the runtime spawns sweeps inherited descriptors.
+    let spawns = code.matches("Command::new(").count();
+    let sweeps = code.matches("sweep_on_exec(").count();
+    if spawns > sweeps {
+        let at = code.find("Command::new(").unwrap_or(0);
+        out.push(violation(
+            at,
+            format!(
+                "{spawns} `Command::new` but {sweeps} `descriptors::sweep_on_exec` — every \
+                 process the runtime spawns starts with stdio and none of the runtime's \
+                 descriptors"
+            ),
+        ));
     }
     out
 }
@@ -1508,9 +1867,7 @@ impl<'a> HygieneVisitor<'a> {
             path: self.rel.to_path_buf(),
             line: attr.pound_token.span.start().line,
             rule: Rule::CrateRootAllow,
-            message: "crate-root `#![allow(...)]` — unbounded in scope and in time \
-                      (lints.md §4)"
-                .to_string(),
+            message: "crate-root `#![allow(...)]` — unbounded in scope and in time".to_string(),
         });
     }
 
@@ -1775,6 +2132,97 @@ mod tests {
         );
     }
 
+    #[test]
+    fn mechanism_words_are_refused_in_the_kernel_and_docs_outside_exempt_blocks() {
+        let src = "// the provider renders nftables\n// vocabulary-exempt-begin: names the Linux backend\n// veth pairs and netns\n// vocabulary-exempt-end\n// a channel bridge, an owner uid\n";
+        let v = scan_tenancy_vocabulary(Path::new("src/kernel/net_policy.rs"), src);
+        assert_eq!(
+            v.len(),
+            1,
+            "{:?}",
+            v.iter().map(|v| &v.message).collect::<Vec<_>>()
+        );
+        assert!(v[0].line == 1 && v[0].message.contains("`nftables` in the portable kernel"));
+        let md = "A plain old data struct (POD).\n<!-- vocabulary-exempt-begin: Linux ruling -->\ncgroup v2\n<!-- vocabulary-exempt-end -->\n";
+        let v = scan_tenancy_vocabulary(Path::new("docs/architecture/x.md"), md);
+        assert_eq!(v.len(), 1);
+        assert!(v[0].line == 1 && v[0].message.contains("`pod` in an architecture doc"));
+        assert!(
+            scan_tenancy_vocabulary(Path::new("src/platform/linux/net_policy.rs"), src).is_empty(),
+            "a platform names its own mechanisms"
+        );
+        assert!(scan_tenancy_vocabulary(Path::new("docs/guides/x.md"), md).is_empty());
+    }
+
+    #[test]
+    fn vocabulary_exempt_blocks_need_a_reason_and_an_end() {
+        let v = scan_tenancy_vocabulary(
+            Path::new("src/kernel/a.rs"),
+            "// vocabulary-exempt-begin\n// veth\n",
+        );
+        assert_eq!(
+            v.len(),
+            2,
+            "{:?}",
+            v.iter().map(|v| &v.message).collect::<Vec<_>>()
+        );
+        assert!(v[0].message.contains("no reason"));
+        assert!(v[1].message.contains("never closed"));
+        let v = scan_tenancy_vocabulary(Path::new("src/kernel/a.rs"), "// vocabulary-exempt-end\n");
+        assert_eq!(v.len(), 1);
+    }
+
+    #[test]
+    fn descriptor_calls_need_close_on_exec_at_creation() {
+        let src = "fn f() {\n    let a = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);\n    let b = libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);\n    let c = libc::open(\n        p,\n        libc::O_RDONLY | libc::O_CLOEXEC,\n    );\n    libc::pipe(fds.as_mut_ptr());\n    libc::dup2(w, libc::STDOUT_FILENO);\n    libc::dup2(w, 9);\n    libc::fcntl(fd, libc::F_DUPFD, 3);\n    libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3);\n    // libc::open(p, 0) in a comment\n}\n";
+        let v = scan_descriptor_hygiene(Path::new("src/platform/linux/providers.rs"), src);
+        let lines: Vec<_> = v.iter().map(|v| v.line).collect();
+        assert_eq!(
+            lines,
+            vec![2, 8, 10, 11],
+            "{:?}",
+            v.iter().map(|v| &v.message).collect::<Vec<_>>()
+        );
+        assert!(v.iter().all(|v| v.rule == Rule::DescriptorHygiene));
+        assert!(
+            scan_descriptor_hygiene(Path::new("src/kernel/x.rs"), src).is_empty(),
+            "Linux platform only"
+        );
+    }
+
+    #[test]
+    fn raw_descriptor_syscalls_need_close_on_exec_too() {
+        let src = "fn a() {\n    libc::syscall(libc::SYS_pipe2, fds.as_mut_ptr(), 0);\n    libc::syscall(libc::SYS_pipe2, fds.as_mut_ptr(), libc::O_CLOEXEC);\n    libc::syscall(libc::SYS_open_tree, dfd, p, 0);\n    libc::syscall(libc::SYS_getrandom, buf, len, 0);\n    libc::syscall(libc::SYS_dup, fd);\n    libc::syscall(libc::SYS_socket, libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);\n}\n";
+        let v = scan_descriptor_hygiene(Path::new("src/platform/linux/host_mount.rs"), src);
+        let lines: Vec<_> = v.iter().map(|v| v.line).collect();
+        assert_eq!(
+            lines,
+            vec![2, 4, 6],
+            "{:?}",
+            v.iter().map(|v| &v.message).collect::<Vec<_>>()
+        );
+        assert!(v[0]
+            .message
+            .contains("`libc::syscall(libc::SYS_pipe2, ..)` without `O_CLOEXEC`"));
+        assert!(v[1].message.contains("OPEN_TREE_CLOEXEC"));
+        assert!(v[2]
+            .message
+            .contains("cannot create a close-on-exec descriptor"));
+    }
+
+    #[test]
+    fn every_spawned_command_sweeps_inherited_descriptors() {
+        let bare = "fn f() { let c = std::process::Command::new(\"nft\"); }\n";
+        let v = scan_descriptor_hygiene(Path::new("src/platform/linux/net_policy.rs"), bare);
+        assert_eq!(v.len(), 1);
+        let swept =
+            "fn f() { let mut c = Command::new(\"nft\"); descriptors::sweep_on_exec(&mut c); }\n";
+        assert!(
+            scan_descriptor_hygiene(Path::new("src/platform/linux/net_policy.rs"), swept)
+                .is_empty()
+        );
+    }
+
     fn strict() -> Config {
         Config {
             mode: Mode::Strict,
@@ -1918,8 +2366,8 @@ fn f() {}
     }
 
     /// A crate-root allow is permitted only where a prefix says so, and the
-    /// prefix must carry a reason — a bare list is what `rfc-process.md` §6
-    /// and `tests.md` §3 refuse.
+    /// prefix must carry a reason: a bare list says nothing about why the
+    /// suppression is sound.
     #[test]
     fn a_declared_prefix_permits_a_crate_root_allow() {
         let src = "#![allow(dead_code, reason = \"mounted SDK surface\")]\n";

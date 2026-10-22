@@ -13,12 +13,20 @@ IP Stack Service Module
 - `ipv4.rs`
 - `tcp.rs`
 - `udp.rs`
+- `route.rs` — the `net.route` tables read with TAKE (segments, peer routes,
+  held addresses), each entry's state reported with REPORT
+- `flows.rs` — the datagram flow table (egress liveness, verdicts, service pins)
+- `policy.rs` — packet policy enforced from `net.policy` tables
+- `service.rs` — service translation (`net.policy` DNAT, `scope = local`)
+- `held.rs` — held addresses realized from `net.route` HOLD
+- `conn_arena.rs`, `index.rs`, `continuity.rs` — the connection table, the
+  hashed indexes, transport continuity
 
 ## Interface (manifest)
 
 ```toml
 version = "1.0.0"
-hardware_targets = ["rp2350"]
+hardware_targets = ["rp2040", "rp2350", "bcm2712"]
 
 [[ports]]
 name = "frames_rx"
@@ -33,6 +41,11 @@ content_type = "EthernetFrame"
 required = true
 ```
 
+The optional ports — `net_in` / `net_out`, `addr_ctl` / `addr_evt`, the
+pre-transport decision seam and the continuity pair — and the contracts it
+declares (`workload`, `net_route`, `net_policy`) are described in
+`manifest.toml`.
+
 ## Parameters
 
 - `use_dhcp` — run the DHCP client (default 1).
@@ -43,9 +56,29 @@ required = true
   correlate to a selection it made.
 - `static_ip`, `static_netmask`, `static_gateway` — the address to adopt
   when `use_dhcp=0`.
-- `resolver` — the DNS server named dials are resolved at (default 0 = the
-  server the DHCP lease supplied). A static-IP deployment that dials names
-  sets it.
+- `resolver` — the DNS server the node's own named dials are resolved at
+  (default 0 = the server the DHCP lease supplied). A static-IP deployment
+  that dials names sets it. A workload's dials use the name service its
+  CREATE carried (`workload::resolver`), read with `NET_RESOLVER`.
+
+Declared capacities — each sizes a table in the module heap at construction;
+a graph declaring more than the default heap holds gives the instance
+`heap.arena_bytes`, and construction otherwise refuses, naming the table.
+Defaults are aarch64's, with the MCU-class figure after the slash:
+
+- `lanes` (16 / 0) — workload lanes, stated to the kernel with
+  `NET_PROVIDE`; `lane_endpoints` (16) — datagram endpoints per lane;
+  `lane_pairs` (16) — same-node stream halves per lane; `lane_events` (8)
+  and `node_events` (32 / 16) — each lane's own event queue and the node's.
+- `max_peers` (0) — peer nodes (ARP table and peer routes); `max_segments`
+  (4 / 0), `max_held` (0) — the `net.route` tables realized. Entries the
+  node's tables hold past these are reported `refused(table_full)`.
+- `max_dg_flows` (1024 / 4), `dg_flow_floor` (16 / 1 per lane),
+  `dg_flow_idle_s` (30) — the datagram flow table; construction requires
+  `max_dg_flows >= (lanes + 1) x dg_flow_floor`.
+- `dns_cache` (8 / 2), `dns_pending` (4 / 2) — resolver entries per owner.
+- `policy_tables` (comma-separated names), `policy_bytes` (8192 / 1024) —
+  the `net.policy` tables this instance enforces and translates.
 
 ## Connecting by name
 
@@ -53,8 +86,8 @@ A consumer opens a stream with `CMD_CONNECT_TO` (`net_proto`, 0x14), whose
 target carries an address family: `AF_INET` dials the literal at once,
 `AF_INET6` is refused `EINVAL` (there is no IPv6 stack), and `AF_NAME` is
 resolved here before the SYN goes out. The reserved `CMD_CONNECT` (0x13) is
-unsupported and answered `MSG_ERROR ENOSYS` on its tag, with one log line naming the
-replacement, so a stale emitter fails on its first dial.
+unsupported and answered `MSG_ERROR ENOSYS` on its tag, with one log line naming
+`CMD_CONNECT_TO`, so an emitter of it fails on its first dial.
 
 The stub resolver is this module's: it owns the datagram path and the DHCP
 lease's DNS server, so resolution needs no sibling module and no contract of
@@ -69,11 +102,15 @@ error code, NOERROR with no A record), or no resolver to ask fails the dial
 `ENOENT` on its requester tag. `EAGAIN` means every pending slot is taken,
 or the CSPRNG had no id to give.
 
-Answers are cached by TTL in a fixed table (`MAX_DNS_CACHE` entries per
-profile: 32 on aarch64, 4 on the embedded profile), so a repeated dial pays
-no round trip. A zero TTL is held for 60 s; others for 1..3600 s. Names are
-held lowercased and at most 64 bytes — a longer one is refused `EINVAL` at
-the dial, which is what bounds the tables on an MCU-class profile. The
+Answers are cached by TTL per owner — the node and each workload lane hold
+their own `dns_cache` entries and `dns_pending` queries, so no owner joins
+another's query or reads its answer — and a repeated dial pays no round
+trip. A zero TTL is held for 60 s; others for 1..3600 s. Names are held
+lowercased, whole up to the protocol's 253 bytes. A workload's queries go to
+its own name service (translated when it is a service address, the backend
+pinned for the lookup), from its own address when the server is inside its
+cluster, under its search list; an answer is claimed only from the server
+the query was pinned to, at the address it left from. The
 `dns` module is a server; it does not resolve for siblings, and the wire
 codec the two share is `sdk/contracts/net/dns_wire.rs`.
 
@@ -83,10 +120,39 @@ report, because a datagram sender retransmits and the next send finds the
 answer. An address family other than `AF_INET` / `AF_NAME` is refused
 `EAFNOSUPPORT`.
 
+## Workload reachability
+
+On bare metal this module is the node's network stack for its workloads,
+and realizes what the node agent writes to the kernel:
+
+- **`net.route` tables**, read with `TAKE` whenever their generation moves
+  and reported entry by entry with `REPORT` (`route.rs`). A workload's
+  address sources its traffic to its segment and the segment's cluster
+  prefixes; anything else leaves from the node's address (a datagram from
+  the endpoint's egress port, its replies admitted only on a live flow).
+  Peer routes are realized when the peer is on the primary's link (direct
+  carriage); held addresses in `deliver` mode become node addresses
+  (`held.rs`). `announce`, forwarding between segments and translated
+  egress are not offered here, and the kernel's CAPS say so.
+- **`net.policy` tables** named by `policy_tables` (`policy.rs`): this
+  module ATTACHes as their one enforcer and judges each flow's first packet
+  with the shared evaluator — streams at connect and at an inbound SYN,
+  datagrams when their flow begins (and per packet for an inbound datagram
+  on no flow), echo requests to a workload. Traffic the node itself sends
+  or terminates is not judged. A flow keeps its verdict for its lifetime.
+- **Service translation** of `scope = local` DNAT records for the node's own
+  traffic (`service.rs`): a dial, a datagram or a resolver query to a
+  service address goes to one of its backends. A stream keeps its backend;
+  a datagram flow re-picks when its backend leaves the set; a service with
+  no backends refuses (`ECONNREFUSED`, `MSG_DG_ERROR`). Inbound translation
+  for clients off the node is not offered (`DNAT_LOCAL` without `DNAT`).
+
 ## Supported profile
 
 IPv4 fragments are dropped before L4 (no reassembler); off-subnet traffic
-requires a configured gateway; ARP mappings are created only by a correlated
+leaves by the longest matching peer route whose peer is on the link, else by
+the configured gateway, and with neither is not sent; ARP mappings are
+created only by a correlated
 ARP reply; one transmit frame per datagram (`EMSGSIZE` past the ceiling).
 See the module doc comment and `docs/architecture/network.md`.
 
@@ -166,4 +232,3 @@ and the option refusal print on the `[ip] cookie` line.
 ## Notes
 
 - Keep this file aligned with `manifest.toml` and parameter definitions in source.
-- Last refreshed: 2026-09-19

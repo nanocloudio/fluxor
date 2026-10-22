@@ -49,7 +49,7 @@ pub const CAPABILITY_NAMES: &[&str] = &[
     "media.muxed",
     "media.path.protected",
     "presentation.group",
-    // Input (added as modules declare them; see input_capability_surface.md §5).
+    // Input surfaces (`docs/architecture/input_capability_surface.md`).
     "input.mapper",
     "input.gamepad",
     "input.virtual",
@@ -686,12 +686,18 @@ pub const PROVIDER_CONTRACTS: &[&str] = &[
     "storage.namespace",
     "storage.object",
     "usb_host",
+    "proc",
+    "workload",
+    "trust",
+    "net_policy",
+    "host_mount",
+    "net_route",
 ];
 
 /// Names accepted in a module manifest's `provides = [..]` field — the
 /// producer side of a resolvable dependency. A superset of the
 /// `PROVIDER_CONTRACTS` service/contract names above with the storage
-/// **surface** family (`storage_capability_surface.md` §1): `storage.block`
+/// **surface** family (`docs/architecture/storage_capability_surface.md`): `storage.block`
 /// and `file.data` are surfaces a provider advertises but are not
 /// class-byte-dispatched contracts, so they live here rather than in
 /// `PROVIDER_CONTRACTS`. Validated case-insensitively at manifest parse so a

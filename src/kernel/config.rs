@@ -24,9 +24,9 @@
 //! is not bound to what a Pi 5's linker regions can hold, nor the board to
 //! what a Linux host can map.
 //!
-//! The composer mirrors some of these figures (`tools/src/capacity.rs`), and
-//! `compose::capacity_mirrors_kernel_sources` pins every mirrored value against
-//! this file. Raising one here means editing that mirror and the limit
+//! The composer reads these profiles as data (`tools/src/capacity.rs` embeds
+//! this file) and runs the kernel's boot plan with them, so a value changed
+//! here reaches it with a tools rebuild. Raising one means editing the limit
 //! register row in the same change — and no ABI epoch.
 
 #[cfg(feature = "host-linux")]
@@ -54,7 +54,8 @@ mod profile_linux {
     /// graph, and they draw on the same pool: a node's control plane seats
     /// ~253 MiB on its own, and one key-value workload's state worker asks
     /// 15-23 MiB. 1 GiB holds the node plane and several such workloads. It
-    /// is never zeroed whole (the loader zeroes each allocation).
+    /// is never zeroed whole: it starts zero, and the loader returns each
+    /// freed region to zero as it is freed.
     pub const STATE_ARENA_SIZE: usize = 1024 * 1024 * 1024;
     /// Per-channel buffer pool. A node's own graph and the workload
     /// subgraphs it hosts share it, and a stateful workload adds two
@@ -62,16 +63,16 @@ mod profile_linux {
     /// refuses one that does not fit, printing its share and the slack left
     /// for the workloads the node will admit.
     pub const BUFFER_ARENA_SIZE: usize = 16 * 1024 * 1024;
-    /// Module slots: a node's own graph plus the workload subgraphs it
-    /// hosts, all in one scheduler. A node's control plane and image plane
-    /// seat ~250 modules before any workload, and one message-broker
-    /// workload is ~17 more. Module ids are u16 throughout the kernel and on
-    /// the wire, with 0xFFFF the no-module sentinel, so the ceiling is a
-    /// sizing choice: the scheduler's per-module tables, the `ModuleMask`
-    /// bitmaps (MODULE_MASK_WORDS == 16 here) and the edge capacity
-    /// (MAX_GRAPH_EDGES) scale with it. Modules read it at runtime through
+    /// The module-index DOMAIN, not a table size: the scheduler's per-module
+    /// tables are sized at boot from the graph (`resource_ledger::plan`), its
+    /// module count, fans and resident workloads plus the module-slot
+    /// reserve. What this bounds is what a module index may be at all: a
+    /// boot-config module id carries 12 bits (entry byte 8 plus four bits of
+    /// byte 9), and a `ModuleMask` holds one bit per index in a fixed number
+    /// of words. A plan past it is refused at boot naming `module_slots`.
+    /// Modules read the live slot count at runtime through
     /// `internal::reconfigure::SLOT_CAPACITY`.
-    pub const MAX_MODULES: usize = 1024;
+    pub const MAX_MODULES: usize = 4096;
     /// ISR-tier bridge slots: one per edge that crosses into an ISR-tier
     /// domain, each holding its ring inline (~2 KiB).
     pub const MAX_BRIDGES: usize = 16;
@@ -99,28 +100,81 @@ mod profile_linux {
     /// `cap >> 7` and each carve at least doubles what is committed, so
     /// eight carves reach any cap.
     pub const HEAP_SEGMENTS: usize = 8;
+
+    /// Each kernel pool's DEFAULT reserve: what the boot plan adds to the
+    /// pool's derived size when the boot config's capacity envelope (FXEV)
+    /// carries no entry for it. A pool the graph cannot size (events,
+    /// timers, TTY sessions, …) has no derived part, so its default is its
+    /// size; the sandbox pool's derived part is the owner table's workload
+    /// slots. A pool held within an index domain (module slots, channels,
+    /// owners, events, timers, sandboxes, TTY sessions) takes only the part
+    /// of its default the domain leaves beside the derived size
+    /// (`resource_ledger::pool_domain`); an envelope entry is never clamped. Every table is sized at boot from derived + reserve
+    /// (`resource_ledger::plan`); none of these is a ceiling, and a
+    /// deployment that needs more says so in its `capacity:` block.
+    ///
+    /// The derived pools' reserves are live-add headroom: module slots and
+    /// channels for the workload subgraphs a node admits after boot (a
+    /// message broker is ~17 modules and ~50 edges), owners for the
+    /// workloads themselves, store subscriptions for the store consumers
+    /// those workloads bring.
+    pub const DEFAULT_RESERVES: &[(u16, usize)] = &[
+        (res::POOL_MODULE_SLOTS, 256),
+        (res::POOL_CHANNELS, 512),
+        (res::POOL_OWNERS, 63),
+        (res::POOL_STORE_SUBS, 64),
+        (res::POOL_STATE_FREE_LIST, 32),
+        (res::POOL_EVENTS, 32),
+        (res::POOL_TIMERS, 16),
+        (res::POOL_STORE_READS, 32),
+        (res::POOL_STORE_WRITES, 32),
+        (res::POOL_STORE_GRANTS, 64),
+        (res::POOL_SANDBOXES, 64),
+        (res::POOL_TTY_SESSIONS, 8),
+        (res::POOL_TRACKED_HANDLES, 128),
+        (res::POOL_NET_POLICY_TABLES, 8),
+        (res::POOL_NET_POLICY_TABLE_BYTES, 8192),
+        (res::POOL_OWNER_STORE_SUBS, 16),
+        (res::POOL_OWNER_STORE_READS, 8),
+        (res::POOL_OWNER_STORE_WRITES, 4),
+        (res::POOL_NET_ROUTE_SEGMENTS, 16),
+        (res::POOL_NET_ROUTE_PEERS, 256),
+        (res::POOL_NET_ROUTE_HELD, 256),
+        (res::POOL_STATE_ARENA, STATE_ARENA_SIZE),
+        (res::POOL_BUFFER_ARENA, BUFFER_ARENA_SIZE),
+        (res::POOL_ELASTIC_REGION, ELASTIC_REGION_SIZE),
+    ];
+    /// No pool is a static table here.
+    pub const STATIC_POOLS: &[(u16, usize)] = &[];
+    use crate::abi::contracts::resource as res;
 }
 
 // ── BCM2712 bare metal (Raspberry Pi 5, QEMU virt) ─────────────────────────
 //
-// Static arrays only: there is no heap on bare metal, and every byte here is
-// either a linker region of its own (the state arena) or kernel `.bss`, which
-// must stay below the firmware's reservation (`linker/memory-bcm2712.x`
-// asserts it).
+// No heap on bare metal. The kernel's tables are sized at boot from the graph
+// (`resource_ledger::plan`), as on Linux, and carved from the DRAM zone the
+// device tree describes above the boot image (`kernel::mem::carve`,
+// `platform/bcm2712/memmap.rs`); the module state arena takes what the carves
+// leave of that zone. Kernel `.bss` holds the fixed arenas only, and must
+// stay below the firmware's reservation (`linker/memory-bcm2712.x` asserts
+// it).
 
 #[cfg(feature = "chip-bcm2712")]
 mod profile_bcm2712 {
-    /// Module state pool (see the Linux profile). The bcm2712 kernel gives it
-    /// a linker region of its own above 1 GB, clear of the firmware's
-    /// top-of-first-GB reservation, so a Pi 5 needs 2 GB of DRAM. It costs
-    /// no image bytes and is never zeroed whole. `targets/silicon/bcm2712.toml`
-    /// states the same figure (`state_arena_kb`) for the graph builder.
+    /// Module state pool the graph builder plans against: the smallest zone a
+    /// supported board leaves (a 2 GB Pi 5's DRAM above 1 GB, QEMU virt's
+    /// upper GB at `-m 2G`). The arena itself is sized at boot from the device
+    /// tree — the zone above the boot image, less the tables carved from its
+    /// top — and is never zeroed whole. `targets/silicon/bcm2712.toml` states
+    /// the same figure (`state_arena_kb`) for the graph builder.
     pub const STATE_ARENA_SIZE: usize = 1024 * 1024 * 1024;
     /// Per-channel buffer pool (see the Linux profile); zero-initialised
     /// `.bss`.
     pub const BUFFER_ARENA_SIZE: usize = 16 * 1024 * 1024;
-    /// Module slots (see the Linux profile). A bare-metal node's control
-    /// plane and image plane seat ~250 modules before any workload.
+    /// The module-index DOMAIN (see the Linux profile), not a table size: the
+    /// scheduler's per-module tables are sized at boot from the graph plus the
+    /// module-slot reserve. A bare-metal node's control plane and image plane
+    /// seat ~250 modules before any workload.
     pub const MAX_MODULES: usize = 1024;
     /// ISR-tier bridge slots (see the Linux profile).
     pub const MAX_BRIDGES: usize = 16;
@@ -137,9 +191,44 @@ mod profile_bcm2712 {
     /// Grant granularity: the 64 KiB platform quantum.
     pub const ELASTIC_QUANTUM: usize = 64 * 1024;
     /// Segments one module heap may carve (see the Linux profile): elastic
-    /// heaps. Each carve comes from the state arena above 1 GB and is zeroed
-    /// as it is handed out, never a region wholesale.
+    /// heaps. Each carve comes from the state arena and takes memory the
+    /// arena's zeroed frontier has already cleared.
     pub const HEAP_SEGMENTS: usize = 8;
+    /// How far the state arena's zeroed frontier runs ahead of the memory the
+    /// arena has handed out: the growth the domains' slack keeps cleared, so
+    /// an allocation on a module's step finds zeroed memory waiting.
+    pub const ZERO_AHEAD_BYTES: usize = 64 * 1024 * 1024;
+    /// Bytes one slack claim zeroes: the unit of bounded work a domain does
+    /// between checks of its remaining slack (~10 us on a Cortex-A76).
+    pub const ZERO_CHUNK_BYTES: usize = 64 * 1024;
+
+    /// Each kernel pool's DEFAULT reserve (see the Linux profile): what the
+    /// boot plan adds to a pool's derived size when the boot config's
+    /// capacity envelope (FXEV) carries no entry for it, or its size for a
+    /// pool the graph cannot derive. Every table is sized at boot from
+    /// derived + reserve and carved; none is a compiled ceiling.
+    pub const DEFAULT_RESERVES: &[(u16, usize)] = &[
+        (res::POOL_MODULE_SLOTS, 256),
+        (res::POOL_CHANNELS, 512),
+        (res::POOL_OWNERS, 63),
+        (res::POOL_STORE_SUBS, 64),
+        (res::POOL_STATE_FREE_LIST, 32),
+        (res::POOL_EVENTS, 32),
+        (res::POOL_TIMERS, 16),
+        (res::POOL_STORE_READS, 32),
+        (res::POOL_TRACKED_HANDLES, 128),
+        (res::POOL_NET_POLICY_TABLES, 8),
+        (res::POOL_NET_POLICY_TABLE_BYTES, 8192),
+        (res::POOL_NET_ROUTE_SEGMENTS, 16),
+        (res::POOL_NET_ROUTE_PEERS, 256),
+        (res::POOL_NET_ROUTE_HELD, 256),
+        (res::POOL_STATE_ARENA, STATE_ARENA_SIZE),
+        (res::POOL_BUFFER_ARENA, BUFFER_ARENA_SIZE),
+        (res::POOL_ELASTIC_REGION, ELASTIC_REGION_SIZE),
+    ];
+    /// No pool is a static table here.
+    pub const STATIC_POOLS: &[(u16, usize)] = &[];
+    use crate::abi::contracts::resource as res;
 }
 
 // ── wasm32 (browser, wasmtime, edge runtimes) ──────────────────────────────
@@ -182,20 +271,63 @@ mod profile_wasm {
     /// One segment per module heap: every heap is committed whole at
     /// instantiation.
     pub const HEAP_SEGMENTS: usize = 1;
+    /// Graph edge slots: the config blob's graph section holds this many, and
+    /// the channel table one per edge.
+    pub const GRAPH_EDGES: usize = 128;
+
+    /// The pools this profile holds as static tables, `(pool, size)`: the
+    /// ceiling every boot plan must fit. The composer reads this table as the
+    /// profile's data (`tools/src/capacity.rs`).
+    pub const STATIC_POOLS: &[(u16, usize)] = &[
+        (res::POOL_MODULE_SLOTS, MAX_MODULES),
+        (res::POOL_CHANNELS, GRAPH_EDGES),
+        (res::POOL_OWNERS, 1),
+        (res::POOL_EVENTS, 32),
+        (res::POOL_TIMERS, 16),
+        (res::POOL_TRACKED_HANDLES, 128),
+        (res::POOL_STATE_FREE_LIST, 32),
+        (res::POOL_NET_POLICY_TABLES, 2),
+        (res::POOL_NET_POLICY_TABLE_BYTES, 2048),
+        (res::POOL_NET_ROUTE_SEGMENTS, 0),
+        (res::POOL_NET_ROUTE_PEERS, 0),
+        (res::POOL_NET_ROUTE_HELD, 0),
+        (res::POOL_STATE_ARENA, STATE_ARENA_SIZE),
+        (res::POOL_BUFFER_ARENA, BUFFER_ARENA_SIZE),
+        (res::POOL_ELASTIC_REGION, ELASTIC_REGION_SIZE),
+    ];
+    /// Static tables have no reserve.
+    pub const DEFAULT_RESERVES: &[(u16, usize)] = &[];
+    use crate::abi::contracts::resource as res;
 }
 
 // ── RP (rp2040, rp2350) ────────────────────────────────────────────────────
 //
-// 256-512 KiB SRAM. The arenas, the config sizes and the log ring are
-// per-silicon facts that `build.rs` generates from `targets/silicon/*.toml`
-// into `platform::chip`; the rest are stated here. `fluxor_abi` tells the two
-// dies apart, as it does for the module build.
+// 256-512 KiB SRAM. The kernel's tables and its two arenas share one static
+// pool (`kernel::mem::carve::POOL`, `KERNEL_POOL_SIZE`), which each graph's
+// plan splits at boot: the tables are sized from what
+// the graph derives plus the reserves below and carved off the pool's top,
+// the channel buffer arena takes its ceiling below them, and the module state
+// arena gets the rest. The pool, the default arena figures, the config sizes
+// and the log ring are per-silicon facts that `build.rs` generates from
+// `targets/silicon/*.toml` into `platform::chip`; the rest are stated here.
+// What stays compile-time is the domains: module ids within `MAX_MODULES`,
+// channel ids within the config blob's `GRAPH_EDGES` slots.
 
 #[cfg(feature = "rp")]
 mod profile_rp {
-    /// Module state pool, from `[kernel] state_arena_kb` in the silicon TOML.
+    /// The kernel's static pool, from `[kernel] kernel_pool_kb` in the silicon
+    /// TOML: the silicon's static-RAM budget (`ram_static_max_kb`) less the
+    /// kernel's fixed statics. Every table the plan sizes, the buffer arena
+    /// and the state arena come from it.
+    pub const KERNEL_POOL_SIZE: usize = crate::platform::chip::KERNEL_POOL_SIZE;
+    /// The module state arena a graph that states no `state_arena` envelope
+    /// entry is planned against, from `[kernel] state_arena_kb`: the composer
+    /// admits a graph's module state against it. The arena itself is what the
+    /// pool holds beside the graph's tables and buffer arena, at least this
+    /// for any graph the composer admits.
     pub const STATE_ARENA_SIZE: usize = crate::platform::chip::STATE_ARENA_SIZE;
-    /// Channel buffer pool, from `[kernel] buffer_arena_kb`.
+    /// Channel buffer arena a graph gets without a `buffer_arena` envelope
+    /// entry, from `[kernel] buffer_arena_kb`.
     pub const BUFFER_ARENA_SIZE: usize = crate::platform::chip::BUFFER_ARENA_SIZE;
     /// The buffer a module's compiled params and its stored runtime
     /// overrides are merged in, from `[kernel] config_buffer_kb`. Only an
@@ -206,7 +338,8 @@ mod profile_rp {
     /// Early-boot log ring, from `[kernel] log_ring_kb`. Must be a power of
     /// two.
     pub const LOG_RING_CAPACITY: usize = crate::platform::chip::LOG_RING_CAPACITY;
-    /// Module slots.
+    /// The module-index DOMAIN, not a table size: the module tables are sized
+    /// from the plan within it. A `ModuleMask` holds one bit per index.
     pub const MAX_MODULES: usize = 32;
     /// ISR-tier bridge slots. Eight is the ISR edges a graph of this size
     /// has, at ~2 KiB of static RAM each.
@@ -228,6 +361,39 @@ mod profile_rp {
     /// One segment per module heap: every heap is committed whole at
     /// instantiation, as the silicon TOML's state-arena budget plans it.
     pub const HEAP_SEGMENTS: usize = 1;
+    /// Graph edge slots: the config blob's graph section holds this many, so
+    /// it is the channel-id domain; the channel table is sized from the plan
+    /// within it.
+    pub const GRAPH_EDGES: usize = 128;
+
+    /// Each kernel pool's DEFAULT reserve (see the Linux profile): what the
+    /// boot plan adds to a pool's derived size when the boot config's
+    /// capacity envelope (FXEV) carries no entry for it, or its size for a
+    /// pool the graph cannot derive. The derived pools' reserves are slim —
+    /// an MCU graph changes by a rebuild, which plans the pool again — and
+    /// cover the channels a module opens for itself and the fan modules the
+    /// plan's upper bound misses. The arenas' entries are the defaults the
+    /// split starts from (the state arena takes what is left).
+    pub const DEFAULT_RESERVES: &[(u16, usize)] = &[
+        (res::POOL_MODULE_SLOTS, 4),
+        (res::POOL_CHANNELS, 16),
+        (res::POOL_OWNERS, 0),
+        (res::POOL_STATE_FREE_LIST, 32),
+        (res::POOL_EVENTS, 32),
+        (res::POOL_TIMERS, 16),
+        (res::POOL_TRACKED_HANDLES, 128),
+        (res::POOL_NET_POLICY_TABLES, 0),
+        (res::POOL_NET_POLICY_TABLE_BYTES, 2048),
+        (res::POOL_NET_ROUTE_SEGMENTS, 0),
+        (res::POOL_NET_ROUTE_PEERS, 0),
+        (res::POOL_NET_ROUTE_HELD, 0),
+        (res::POOL_STATE_ARENA, STATE_ARENA_SIZE),
+        (res::POOL_BUFFER_ARENA, BUFFER_ARENA_SIZE),
+        (res::POOL_ELASTIC_REGION, ELASTIC_REGION_SIZE),
+    ];
+    /// No pool is a static table here.
+    pub const STATIC_POOLS: &[(u16, usize)] = &[];
+    use crate::abi::contracts::resource as res;
 }
 
 const _: () = assert!(
@@ -237,4 +403,47 @@ const _: () = assert!(
 const _: () = assert!(
     HEAP_SEGMENTS >= 1 && HEAP_SEGMENTS <= 32,
     "a heap's first segment is cap >> (HEAP_SEGMENTS - 1)"
+);
+
+/// `pool`'s entry in a profile table, or `None`.
+const fn lookup(table: &[(u16, usize)], pool: u16) -> Option<usize> {
+    let mut i = 0;
+    while i < table.len() {
+        if table[i].0 == pool {
+            return Some(table[i].1);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The static size of `pool` on this profile, `None` where the profile sizes
+/// the pool at boot (every pool on Linux, bcm2712 and RP).
+pub const fn static_pool(pool: u16) -> Option<usize> {
+    lookup(STATIC_POOLS, pool)
+}
+
+/// The compiled size of a static table, for its array type: the profile's
+/// static size, or `0` on a profile that sizes the pool at boot (the table's
+/// backend ignores it there).
+pub const fn static_slots(pool: u16) -> usize {
+    match static_pool(pool) {
+        Some(n) => n,
+        None => 0,
+    }
+}
+
+/// The reserve the boot plan adds to `pool`'s derived size when the boot
+/// config carries no envelope entry for it: the profile's default, `0` where
+/// the pool is a static table (whose ceiling is the table).
+pub const fn default_reserve(pool: u16) -> usize {
+    match lookup(DEFAULT_RESERVES, pool) {
+        Some(n) => n,
+        None => 0,
+    }
+}
+
+const _: () = assert!(
+    MAX_MODULES <= 4096,
+    "a boot-config module id carries 12 bits"
 );

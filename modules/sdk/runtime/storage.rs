@@ -3,7 +3,7 @@
 // ============================================================================
 
 /// Store a parameter override that persists across reboots.
-/// `tag`: TLV v2 tag number for this module's param.
+/// `tag`: params TLV tag number for this module's param.
 /// `value`: pointer to raw value bytes.
 /// `len`: value byte count (max 250).
 /// Returns 0 on success, negative errno on error.

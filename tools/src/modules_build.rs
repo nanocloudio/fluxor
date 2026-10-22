@@ -272,6 +272,10 @@ struct VariantRaw {
     #[serde(default)]
     #[allow(dead_code, reason = "validated and applied at manifest packing")]
     omit_capabilities: Vec<String>,
+    /// `[variant.capacities]`, resolved and checked by
+    /// `Manifest::from_toml_for_target`; discovery only admits the key.
+    #[serde(default, rename = "capacities")]
+    _capacities: Option<toml::Value>,
 }
 
 /// Editions `rustc` accepts. Kept explicit so a manifest typo

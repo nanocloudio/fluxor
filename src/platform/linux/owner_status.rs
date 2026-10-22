@@ -14,10 +14,9 @@
 //   - Values are drawn only from the closed vocabularies the reader enforces;
 //     emitting anything else is a bug that fails the reader's parse rather
 //     than reaching a consumer.
-//   - Reasons this runtime can currently observe are `Completed`,
-//     `GraphNodeFault` and `LivenessFailure`, plus the `ActivationBackOff`
-//     waiting reason. The rest of the vocabulary belongs to paths that do not
-//     exist here yet.
+//   - The reasons this runtime observes are `Completed`, `GraphNodeFault`
+//     and `LivenessFailure`, plus the `ActivationBackOff` waiting reason; it
+//     writes no other word of the vocabulary.
 //   - `restart_count` counts AGGREGATE re-activations only: an owner observed
 //     Terminated (or superseded by a new owner generation) that runs again. An
 //     internal module retry (step-guard `Restart` policy) surfaces as transient
@@ -92,8 +91,10 @@ impl OwnerStatusWriter {
     /// latches forward, and atomically replace the status file if the
     /// derived state changed.
     pub fn tick(&mut self) {
-        let mut recs = [crate::kernel::exec::scheduler::OwnerLiveStatus::EMPTY;
-            crate::kernel::workload::owner::MAX_OWNERS];
+        let mut recs = vec![
+            crate::kernel::exec::scheduler::OwnerLiveStatus::EMPTY;
+            crate::kernel::exec::scheduler::owners().slot_count()
+        ];
         let n = crate::kernel::exec::scheduler::owner_live_snapshot(&mut recs);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -153,13 +154,13 @@ impl OwnerStatusWriter {
     }
 }
 
-/// Map a module fault kind (`step_guard::fault_type`) to the fixed §7.2
+/// Map a module fault kind (`step_guard::fault_type`) to the fixed
 /// `state.terminated.reason`. A step-deadline `TIMEOUT` is the runtime's
 /// liveness enforcement detecting a non-responsive module → `LivenessFailure`;
 /// a step error, hard/MPU fault, or drain timeout is a graph-node fault →
 /// `GraphNodeFault`. Reasons that need signals this snapshot does not carry
 /// (`ExternalProcessExited`, `Evicted`, `FluxorReservationInvalid`) are not
-/// emitted here — the reader enforces the full §7.2 set.
+/// emitted here — the reader enforces the full set.
 fn terminated_reason_for_fault(kind: u8) -> &'static str {
     use crate::kernel::exec::step_guard::fault_type;
     match kind {
@@ -250,7 +251,7 @@ pub fn derive_workloads_json(
             track.terminated = Some(("Completed", 0, now_unix));
         }
 
-        // §7.2 shape. Reason strings are the fixed vocabulary; nothing else
+        // The record shape. Reason strings are the fixed vocabulary; nothing else
         // is ever emitted here. A partially-instantiated workload (some planned
         // modules failed to load) waits in ActivationBackOff; a workload whose
         // graph hasn't instantiated at all is plainly Activating.
@@ -295,8 +296,8 @@ pub fn derive_workloads_json(
             }
             e.push(']');
         }
-        // New additive fields (old consumers ignore them); emitted only while
-        // draining, so non-draining output is byte-identical (rfc §3.7).
+        // The drain detail, emitted only while draining: a record of an owner
+        // that is not draining carries none of it.
         if draining {
             let _ = write!(e, ",\"owner_state\":\"Draining\"");
             if rec.drain_deadline_unix > 0 {

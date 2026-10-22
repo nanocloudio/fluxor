@@ -15,7 +15,7 @@ use super::*;
 /// channels and leaks owned handles.
 pub(crate) fn enforce_drain_timeout(
     sched: &mut SchedulerState,
-    modules: &mut [ModuleSlot; MAX_MODULES],
+    modules: &mut [ModuleSlot],
     count: usize,
 ) -> bool {
     if sched.reconfigure_phase != ReconfigurePhase::Draining {
@@ -109,7 +109,7 @@ pub(crate) fn last_input_content_type(_module_idx: usize) -> u8 {
 /// outranks individual-module recovery.
 pub(crate) fn apply_quarantine(
     sched: &mut SchedulerState,
-    modules: &mut [ModuleSlot; MAX_MODULES],
+    modules: &mut [ModuleSlot],
     module_idx: usize,
     active_count: &mut usize,
 ) {
@@ -127,7 +127,7 @@ pub(crate) fn apply_quarantine(
     // Forward: this module's declared partner (if any, and that
     // partner itself has a recent fault).
     let forward = sched.fault_info[module_idx].quarantine_partner as usize;
-    if forward < MAX_MODULES
+    if forward < module_slots()
         && forward != module_idx
         && !sched.finished[forward]
         && sched.fault_info[forward].fault_count > 0
@@ -147,7 +147,7 @@ pub(crate) fn apply_quarantine(
         clippy::needless_range_loop,
         reason = "iteration over indices avoids borrow conflicts on the collection"
     )]
-    for i in 0..MAX_MODULES {
+    for i in 0..module_slots() {
         if i == module_idx || sched.finished[i] {
             continue;
         }
@@ -182,7 +182,7 @@ pub(crate) fn apply_quarantine(
     // Terminate self first, then every named target. Use a tiny
     // closure to avoid duplicating the body.
     let mut term = |idx: usize| {
-        if idx < MAX_MODULES && !sched.finished[idx] {
+        if idx < module_slots() && !sched.finished[idx] {
             sched.fault_info[idx].state = FaultState::Terminated;
             finalize_module(idx, Some(-111), modules[idx].type_name(), " (quarantined)");
             *active_count -= 1;
@@ -193,7 +193,7 @@ pub(crate) fn apply_quarantine(
         clippy::needless_range_loop,
         reason = "iteration over indices avoids borrow conflicts on the collection"
     )]
-    for i in 0..MAX_MODULES {
+    for i in 0..module_slots() {
         if targets[i] {
             term(i);
         }
@@ -203,7 +203,7 @@ pub(crate) fn apply_quarantine(
 /// Handle a step timeout: record fault, transition to Faulted or Terminated.
 pub(crate) fn handle_step_timeout(
     sched: &mut SchedulerState,
-    modules: &mut [ModuleSlot; MAX_MODULES],
+    modules: &mut [ModuleSlot],
     module_idx: usize,
     active_count: &mut usize,
 ) {
@@ -262,7 +262,7 @@ pub(crate) fn handle_step_timeout(
 /// Handle a step error: record fault, transition to Faulted or finalize.
 pub(crate) fn handle_step_error(
     sched: &mut SchedulerState,
-    modules: &mut [ModuleSlot; MAX_MODULES],
+    modules: &mut [ModuleSlot],
     module_idx: usize,
     rc: i32,
     active_count: &mut usize,
@@ -311,7 +311,7 @@ pub(crate) fn handle_step_error(
 /// Handle an MPU/MMU protection fault: record, emit event, transition state.
 pub(crate) fn handle_mpu_fault(
     sched: &mut SchedulerState,
-    modules: &mut [ModuleSlot; MAX_MODULES],
+    modules: &mut [ModuleSlot],
     module_idx: usize,
     active_count: &mut usize,
 ) {
@@ -374,7 +374,7 @@ pub(crate) fn handle_mpu_fault(
 /// drains and reloads it, or `FaultPolicy::RestartGraph`.
 pub(crate) fn handle_module_restart(
     sched: &mut SchedulerState,
-    modules: &mut [ModuleSlot; MAX_MODULES],
+    modules: &mut [ModuleSlot],
     module_idx: usize,
 ) {
     sched.fault_info[module_idx].state = FaultState::Recovering;
@@ -438,7 +438,7 @@ pub(crate) fn handle_module_restart(
     sched.finished[module_idx] = false;
 }
 
-pub fn step_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize) -> StepResult {
+pub fn step_modules(modules: &mut [ModuleSlot], count: usize) -> StepResult {
     // SAFETY: scheduler thread is the sole stepper; `modules` is passed
     // through by the caller (per-platform main loop) which owns it.
     let sched = unsafe {
@@ -522,8 +522,8 @@ pub fn step_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize) -> St
     // need every bucket cleared — resetting only domain 0 would
     // leak time into the wrong accumulator when a non-default-domain
     // module is stepped.
-    sched.pass_module_us = [0; MAX_MODULES];
-    sched.pass_module_steps = [0; MAX_MODULES];
+    sched.pass_module_us.fill(0);
+    sched.pass_module_steps.fill(0);
     for d in 0..MAX_DOMAINS {
         sched.domain_budget_us_consumed[d] = 0;
         // Decay the adaptive-tick floor's worst-step peak-hold once per pass so
@@ -812,7 +812,7 @@ pub mod step_effect {
 /// pacer hot). Called from the `REPORT_STEP_EFFECT` syscall handler with the
 /// calling module's index.
 pub fn report_step_effect(module_idx: usize, effect: u8) {
-    if module_idx >= MAX_MODULES {
+    if module_idx >= module_slots() {
         return;
     }
     if effect >= step_effect::WORK_DONE {

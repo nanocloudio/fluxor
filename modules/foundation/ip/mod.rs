@@ -67,9 +67,10 @@
 //! sends one A query per name from an ephemeral port it holds for its
 //! lifetime, to `resolver` when set and otherwise to the DHCP lease's DNS
 //! server; a reply is demuxed by that port ahead of the datagram endpoints.
-//! Answers are cached by TTL (`MAX_DNS_CACHE` entries, 64-byte names) so a
-//! repeated dial pays no round trip; a name longer than 64 bytes is refused
-//! `EINVAL`. A query unanswered after 3 s is sent once more with a fresh id,
+//! Answers are cached by TTL, per owner — the node and each workload lane
+//! keep their own `dns_cache` entries and `dns_pending` queries, so no owner
+//! joins or reads another's — and a repeated dial pays no round trip. Names
+//! are held whole up to the protocol's 253 bytes. A query unanswered after 3 s is sent once more with a fresh id,
 //! then the dial fails `ENOENT` on its requester tag, as does a negative
 //! answer or a dial with no resolver known. `CMD_DG_SEND_TO` takes the same
 //! `AF_NAME`: a cached name sends at once; a name not in hand starts the
@@ -137,6 +138,10 @@ mod dhcp;
     reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
 )]
 mod eth;
+/// The datagram flow table: egress-port liveness, verdicts, pins.
+mod flows;
+/// Held addresses realized from `net.route` HOLD.
+mod held;
 #[allow(
     dead_code,
     reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
@@ -148,6 +153,12 @@ mod index;
     reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
 )]
 mod ipv4;
+/// Packet policy enforced from `net.policy` tables.
+mod policy;
+/// The `net.route` tables read with TAKE: segments, peer routes, held.
+mod route;
+/// Service translation (`net.policy` DNAT, `scope = local`).
+mod service;
 #[allow(
     dead_code,
     reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
@@ -282,16 +293,13 @@ pub const MAX_DG_ENDPOINTS: usize = if abi::config::ip::MAX_DG_ENDPOINTS < 3 {
     3
 };
 
-/// Stub-resolver tables (`abi::config::ip`): names held with their address
-/// until the answer's TTL runs out, and dials parked on a query in flight.
-pub use abi::config::ip::{MAX_DNS_CACHE, MAX_DNS_PENDING};
-
 // ── Stub resolver ───────────────────────────────
 
-/// Longest name the resolver holds, per cache and pending entry. A dial
-/// naming something longer is refused `EINVAL`; the ceiling is what bounds
-/// the tables on an MCU-class profile.
-const DNS_NAME_CAP: usize = 64;
+/// Longest name the resolver holds, per cache and pending entry: the
+/// protocol maximum (`net_proto::MAX_NAME_LEN`, RFC 1035 presentation form),
+/// so every name a dial can carry is held whole. What bounds the tables is
+/// their declared entry counts (`dns_cache`, `dns_pending`), not the name.
+const DNS_NAME_CAP: usize = abi::contracts::net::net_proto::MAX_NAME_LEN;
 /// How long one query waits for its answer before it is sent again or
 /// given up on.
 const DNS_QUERY_TIMEOUT_MS: u32 = 3000;
@@ -324,17 +332,66 @@ struct DnsCacheEntry {
     name: [u8; DNS_NAME_CAP],
     /// 0 = empty.
     name_len: u8,
-    _pad: [u8; 3],
+    _pad: [u8; 2],
     /// Host-order IPv4, as `remote_ip` holds it.
     addr: u32,
     /// Wall clock past which the entry is stale.
     expires_ms: u32,
 }
 
+impl DnsCacheEntry {
+    const EMPTY: DnsCacheEntry = DnsCacheEntry {
+        name: [0; DNS_NAME_CAP],
+        name_len: 0,
+        _pad: [0; 2],
+        addr: 0,
+        expires_ms: 0,
+    };
+}
+
+// ── Declared capacities ─────────────────────────
+//
+// Every table that grows with the node's workloads is sized at construction
+// from a declared input (a param), in this module's heap: workload lanes and
+// what each holds, the ARP table, the resolver's cache and pending queries.
+// Nothing here is a compiled ceiling the node outgrows; a graph that declares
+// more gives the instance the heap for it (`heap.arena_bytes`), and one whose
+// heap cannot hold what it declared is refused at construction, naming it.
+
+/// Lanes held when the graph declares none: a pi5-class node's workloads, or
+/// none at all on an MCU-class target, where there is no workload backend.
+#[cfg(target_arch = "aarch64")]
+const LANES_DEFAULT: u8 = 16;
+#[cfg(not(target_arch = "aarch64"))]
+const LANES_DEFAULT: u8 = 0;
+/// Datagram endpoints one lane holds when the graph declares no quota.
+const LANE_ENDPOINTS_DEFAULT: u8 = 16;
+/// Resolver cache entries and pending queries per owner (the node and each
+/// lane) when the graph declares none: room for a search list's expansion.
+#[cfg(target_arch = "aarch64")]
+const DNS_CACHE_DEFAULT: u8 = 8;
+#[cfg(not(target_arch = "aarch64"))]
+const DNS_CACHE_DEFAULT: u8 = 2;
+#[cfg(target_arch = "aarch64")]
+const DNS_PENDING_DEFAULT: u8 = 4;
+#[cfg(not(target_arch = "aarch64"))]
+const DNS_PENDING_DEFAULT: u8 = 2;
+
+/// The heap cap this module asks for when the graph names none
+/// (`module_arena_size`). On aarch64 the heap is elastic — it commits what
+/// the tables touch, so the cap is room to declare more, not memory spent;
+/// on an MCU-class target it is committed whole, so it is what the defaults
+/// need.
+#[cfg(target_arch = "aarch64")]
+const HEAP_DEFAULT_BYTES: u32 = 16 * 1024 * 1024;
+#[cfg(not(target_arch = "aarch64"))]
+const HEAP_DEFAULT_BYTES: u32 = 5 * 1024;
+
 /// Workload network lanes this provider holds: a staged workload's own
-/// command/event channel pair, attached by the kernel. The kernel admits at
-/// most as many, so a lane it attaches is one this module has room for.
-const NET_LANES: usize = abi::contracts::workload::net_lane::LANES_MAX;
+/// command/event channel pair, attached by the kernel. The provider states
+/// its capacity (`lanes`) when it claims the role (`NET_PROVIDE`), and the
+/// kernel admits no more, so a lane it attaches is one this module has room
+/// for. A lane id is a `u8`: at most 255.
 use abi::contracts::workload::{net_lane, NET_LANE_ADMIT, NET_LANE_TAKE, NET_PROVIDE};
 
 /// One workload lane. Its index (1-based) is the `lane` stamped on every
@@ -352,6 +409,62 @@ struct NetLane {
     cmd: i32,
     /// The workload reads events here (this module writes it).
     evt: i32,
+    /// The owner's own address slot (`LOCAL_SLOT_ANY` when it has none),
+    /// cached under the address-table epoch it was looked up in.
+    src_slot: u16,
+    /// The owner's name-service context (`workload::NET_RESOLVER`), and
+    /// whether it was read: 0 not yet, 1 held, 2 none (the node's own
+    /// upstream serves the owner).
+    rctx_len: u16,
+    src_epoch: u32,
+    rctx_state: u8,
+    _rctx_pad: [u8; 3],
+    rctx: [u8; abi::contracts::workload::resolver::MAX],
+}
+
+impl NetLane {
+    const EMPTY: NetLane = NetLane {
+        active: 0,
+        key: 0,
+        owner_slot: 0,
+        owner_gen: 0,
+        cmd: -1,
+        evt: -1,
+        src_slot: LOCAL_SLOT_ANY,
+        rctx_len: 0,
+        src_epoch: 0,
+        rctx_state: 0,
+        _rctx_pad: [0; 3],
+        rctx: [0; abi::contracts::workload::resolver::MAX],
+    };
+}
+
+/// One lane's own state (lane 0 is the node's): its command stash — a
+/// CMD_SEND tail that could not be drained in one step, and a CLOSE
+/// deferred behind it — its event queue, and its fast-path count. Each lane
+/// has its own, so a workload whose peer stops reading holds up its own
+/// commands and events and nobody else's.
+#[repr(C)]
+struct LaneState {
+    valid: u8,
+    close_valid: u8,
+    conn: u16,
+    off: u16,
+    len: u16,
+    close_conn: u16,
+    /// Fast-path halves the lane holds.
+    pairs: u16,
+    /// Datagram flows the lane holds (`flows.rs`).
+    flows: u16,
+    _flows_pad: u16,
+    /// Its event queue: `ev_cap` slots of `ev_slots` from `ev_base`, `ev_count`
+    /// of them queued from `ev_head`.
+    ev_base: u32,
+    ev_head: u16,
+    ev_count: u16,
+    ev_cap: u16,
+    _pad: u16,
+    buf: [u8; PENDING_CMD_BUF_SIZE],
 }
 
 /// One dial (or cache warm) waiting on a query.
@@ -371,9 +484,22 @@ struct DnsPending {
     id: u16,
     /// Wall clock at which the leader retransmits or gives up.
     deadline_ms: u32,
-    /// The lane the dial came from (see `NetLane`).
+    /// The lane the dial came from (see `NetLane`); its partition of the
+    /// table is the lane's own.
     lane: u8,
+    /// Which name of the owner's search list the query is for
+    /// ([`SEARCH_BARE`]: the name as dialled).
+    search: u8,
+    /// Where the query went — the name-service backend, after any service
+    /// translation of the owner's server — and the local slot it left from:
+    /// an answer is claimed only from there, to there.
+    srv_port: u16,
+    srv_ip: u32,
+    src_slot: u16,
 }
+
+/// `DnsPending::search`: the name as dialled, not expanded.
+const SEARCH_BARE: u8 = u8::MAX;
 
 /// Hash index over the connection table: twice the table, so chains stay
 /// short (`index.rs`).
@@ -435,6 +561,9 @@ const ADDR_FLAG_PRIMARY: u8 = 0x01;
 /// The address emits: frames are sourced from it and ARP for it answered.
 /// Clear = fenced. The primary is always armed.
 const ADDR_FLAG_ARMED: u8 = 0x02;
+/// A held address (`net.route` HOLD, `held.rs`): installed and fenced by
+/// this module from the table, its token kept here.
+const ADDR_FLAG_HELD: u8 = 0x04;
 
 /// One configured local address. 16-byte address with IPv4 in the first four
 /// bytes (network order), matching the workload CREATE-header convention so
@@ -461,7 +590,17 @@ pub struct LocalAddr {
     pub owner_tag: u16,
     pub prefix_len: u8,
     pub flags: u8,
+    /// A held address's fence evidence: the frame count at the cutoff and
+    /// what the boundary is (`net::identity::cutoff`), or `FENCE_OPEN` while
+    /// the driver is still being asked whether the wire is quiet.
+    pub fence_cutoff: u64,
+    pub fence_kind: u8,
+    pub _fence_pad: [u8; 3],
+    pub fence_deadline_ms: u32,
 }
+
+/// `LocalAddr::fence_kind`: a fence whose boundary is not settled yet.
+const FENCE_OPEN: u8 = 0xFF;
 
 impl LocalAddr {
     pub const fn empty() -> Self {
@@ -472,6 +611,10 @@ impl LocalAddr {
             owner_tag: 0,
             prefix_len: 0,
             flags: 0,
+            fence_cutoff: 0,
+            fence_kind: 0,
+            _fence_pad: [0; 3],
+            fence_deadline_ms: 0,
         }
     }
 
@@ -528,17 +671,36 @@ const PACKET_FWD_PORT: u8 = 4;
 const PKT_DECISION_OFF: u8 = 0;
 const PKT_DECISION_PRE_TRANSPORT: u8 = 1;
 
-/// Max bytes per queued outbound control frame. Sized for the
-/// largest short frame `net_send_*` produces (MSG_RETRANSMIT /
-/// MSG_ACK at 8 bytes). MSG_DATA goes through its own per-conn
-/// backpressure path.
-/// Largest control frame the fallback queue holds: the 3-byte header, a
-/// u16 connection id and a u32 sequence number (`MSG_RETRANSMIT`,
-/// `MSG_ACK`).
-const NET_OUT_FRAME_MAX: usize = 9;
-const NET_OUT_QUEUE_SLOTS: usize = 32;
-/// Queued frames one workload lane may hold (`net_send_or_queue_to`).
-const LANE_QUEUE_SHARE: usize = 4;
+/// Largest control frame an event queue holds: the peer report
+/// (`MSG_PEER`), the 3-byte header, a u16 connection id, the family, a
+/// 16-byte address and a u16 port. Every other queued frame is shorter;
+/// MSG_DATA goes through its own per-connection backpressure path.
+const NET_OUT_FRAME_MAX: usize = NET_FRAME_HDR + abi::contracts::net::net_proto::PEER_LEN;
+
+/// One queued control frame.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct EvSlot {
+    len: u8,
+    frame: [u8; NET_OUT_FRAME_MAX],
+}
+
+/// The node's event queue when the graph declares none (`node_events`).
+#[cfg(target_arch = "aarch64")]
+const NODE_EVENTS_DEFAULT: u8 = 32;
+#[cfg(not(target_arch = "aarch64"))]
+const NODE_EVENTS_DEFAULT: u8 = 16;
+/// Each lane's event queue, its reserved floor, when the graph declares none
+/// (`lane_events`). An accept is announced only with two slots free (its
+/// `MSG_ACCEPTED` and peer report), and a command's answer takes two at most.
+const LANE_EVENTS_DEFAULT: u8 = 8;
+/// Fast-path halves one lane holds at once when the graph declares none
+/// (`lane_pairs`).
+const LANE_PAIRS_DEFAULT: u8 = 16;
+/// Free slots in a workload lane's event queue below which its command
+/// intake pauses: a command's answer is at most two frames
+/// (`MSG_CONNECTED` and its peer report).
+const LANE_EVENT_HEADROOM: usize = 2;
 
 /// `TcpConn::pending_close_notify` codes — non-zero values identify
 /// which helper `step_tcp_timers` retries once `net_out_chan` has
@@ -719,6 +881,34 @@ unsafe fn conn_leave_half_open(s: &mut IpState, idx: usize) {
 /// what the slot holds, not by its state — a slot latched `Closed` for a
 /// pending notification is still indexed until here.
 unsafe fn conn_reset(s: &mut IpState, idx: usize) {
+    // A fast-path half released on its own (its lane went, the table was
+    // reset under it) takes its partner's link with it: the partner is
+    // closed and its consumer told, by the sweep that retries close
+    // notifications, rather than left pointing at a slot the next
+    // connection will take.
+    if idx < tcp::MAX_TCP_CONNS && *s.loopback_peer.as_ptr().add(idx) >= 0 {
+        let p = *s.loopback_peer.as_ptr().add(idx) as usize;
+        loopback_unpair(s, idx);
+        if p < s.tcp_conns.len() {
+            let pc = &mut *s.tcp_conns.ptr_mut(p);
+            if pc.state != tcp::TcpState::Closed {
+                pc.state = tcp::TcpState::Closed;
+                pc.pending_close_notify = NOTIFY_CLOSED;
+            }
+        }
+    }
+    {
+        let c = &*s.tcp_conns.ptr(idx);
+        if c.is_datagram && (c.egress_port != 0 || c.lane != 0) {
+            let e = c.egress_port;
+            if e != 0 {
+                port_ref_dec(s, e);
+            }
+            if idx < MAX_DG_ENDPOINTS {
+                flows::release_endpoint(s, idx as u8);
+            }
+        }
+    }
     let (is_datagram, remote_ip, local_port, hash, half_open) = {
         let c = &*s.tcp_conns.ptr(idx);
         (
@@ -955,6 +1145,18 @@ unsafe fn find_listener_indexed(
     None
 }
 
+/// Whether the lane being served must stop reading commands: its own event
+/// queue has too little room for the answers. The node pauses at
+/// `NET_OUT_QUEUE_HEADROOM`, a workload lane at `LANE_EVENT_HEADROOM`.
+unsafe fn lane_intake_paused(s: &IpState) -> bool {
+    let room = ev_room(s, s.cur_lane);
+    if s.cur_lane == 0 {
+        room <= NET_OUT_QUEUE_HEADROOM
+    } else {
+        room < LANE_EVENT_HEADROOM
+    }
+}
+
 /// Inbound RX / command processing pauses when the outbound control
 /// queue has fewer than this many free slots. Each accepted segment
 /// or command typically synthesises one outbound control event, so
@@ -1070,6 +1272,11 @@ pub struct IpDrops {
     /// timeout after the retry, or no resolver to ask. A dial counted here
     /// was answered `ENOENT`; a named datagram send was dropped.
     pub dns_unresolved: u32,
+    /// Datagrams delivered between endpoints of this node without touching
+    /// the wire (the same-node path).
+    pub udp_local: u32,
+    /// Packets, streams and datagrams packet policy refused.
+    pub policy_denied: u32,
 }
 
 impl IpDrops {
@@ -1107,6 +1314,8 @@ impl IpDrops {
             dg_ep_unowned: 0,
             dg_ep_perm: 0,
             dns_unresolved: 0,
+            udp_local: 0,
+            policy_denied: 0,
         }
     }
 }
@@ -1213,8 +1422,11 @@ struct IpState {
     signaled_ready: bool,
     _ip_pad: [u8; 2],
 
-    // ARP table
-    arp_table: [arp::ArpEntry; arp::ARP_TABLE_SIZE],
+    // ARP table: `arp_len` entries in the module heap (`max_peers` plus the
+    // segment's own neighbours).
+    arp_ptr: *mut arp::ArpEntry,
+    arp_len: u16,
+    _arp_len_pad: [u8; 2],
     arp_pending_ip: u32,
     /// Wall clock at which the outstanding resolution stops being waited
     /// for. Meaningless unless `arp_pending_state` is `ARP_PENDING_WAITING`.
@@ -1354,56 +1566,55 @@ struct IpState {
     _aw_pad: [u8; 3],
     arp_wait_overflow: u32,
 
-    /// Stash for a CMD_SEND tail that couldn't be drained in one tick
-    /// (peer window closed mid-frame, or NIC out_chan rejected a
-    /// segment). `service_net_channels` resumes from `pending_cmd_off`
-    /// on the next tick before touching `net_in_chan`; while the
-    /// stash is occupied we never read new frames, so backpressure
-    /// propagates back to the consumer through its own
-    /// `channel_write` to `net_in_chan`.
-    pending_cmd_valid: u8,
-    pending_cmd_conn: u16,
-    pending_cmd_off: u16,
-    pending_cmd_len: u16,
-    _pcmd_pad: [u8; 2],
-    pending_cmd_buf: [u8; PENDING_CMD_BUF_SIZE],
+    /// Per-lane command stashes (`LaneState`), `lane_cap + 1` of them in
+    /// the module heap, lane 0 the node's: a CMD_SEND tail that couldn't be
+    /// drained in one tick (peer window closed mid-frame, or NIC out_chan
+    /// rejected a segment), and a CMD_CLOSE deferred behind it (RFC 793 §3.5
+    /// — CLOSE transmits all queued SENDs first). The lane's channel is not
+    /// read while its stash is occupied, so backpressure propagates back to
+    /// that lane's consumer through its own `channel_write`, and to no one
+    /// else's.
+    lane_states: *mut LaneState,
 
-    /// Deferred CMD_CLOSE slot. Set when CMD_CLOSE arrives while a
-    /// `pending_cmd_*` stash is still draining (RFC 793 §3.5 — CLOSE
-    /// transmits all queued SENDs first), or when the FIN frame
-    /// itself was rejected by the NIC. Cleared once `process_cmd_close`
-    /// confirms the FIN is queued.
-    pending_close_valid: u8,
-    pending_close_conn: u16,
-    _pcls_pad: [u8; 2],
-
-    /// Outbound control-frame queue (MSG_BOUND / MSG_ACCEPTED /
-    /// MSG_CLOSED / MSG_CONNECTED / MSG_ERROR / MSG_RETRANSMIT).
-    /// `net_out_chan` writes are atomic-FIFO and reject when full;
-    /// queueing here lets a momentarily-full consumer channel apply
-    /// backpressure without losing the control event. Drained at the
-    /// top of each `module_step`. MSG_DATA bypasses this and uses its
-    /// own per-conn path because it's variable-length and large.
-    pending_net_out_frames: [[u8; NET_OUT_FRAME_MAX]; NET_OUT_QUEUE_SLOTS],
-    pending_net_out_lens: [u8; NET_OUT_QUEUE_SLOTS],
-    /// The channel each queued frame is for (its endpoint's lane, or
-    /// `net_out_chan`).
-    pending_net_out_chans: [i32; NET_OUT_QUEUE_SLOTS],
+    /// The event queues' slots, in the module heap: the node's queue
+    /// (`node_events`) then each lane's (`lane_events`); see `LaneState`.
+    /// Event-channel writes are atomic-FIFO and reject when full; queueing
+    /// lets a momentarily-full consumer apply backpressure without losing
+    /// the control event. Drained at the top of each `module_step`.
+    ev_slots: *mut EvSlot,
+    /// Frames queued across every lane, so an idle step costs one compare.
+    ev_total: u32,
+    /// Control frames refused because their lane's queue was full.
+    ev_refused: u32,
+    /// `node_events` / `lane_events` / `lane_pairs` (params).
+    node_events: u8,
+    lane_events: u8,
+    lane_pairs: u8,
+    _ev_pad: u8,
     /// Workload network lanes (see `NetLane`), the lane whose commands are
     /// being served (1-based; 0 = `net_in_chan`), and the provider claim:
     /// 0 not asked, 1 held, 2 refused (another provider, or no kernel support).
-    lanes: [NetLane; NET_LANES],
+    lanes: *mut NetLane,
     cur_lane: u8,
     lane_provider: u8,
+    /// `lanes`: the lanes this provider holds, stated to the kernel.
+    lane_cap: u8,
+    /// `lane_endpoints`: datagram endpoints one lane may hold at once.
+    lane_endpoints: u8,
+    /// `max_peers`: peer nodes the ARP table is sized for.
+    max_peers: u16,
+    /// `max_held`: held addresses the address table keeps room for.
+    max_held: u16,
+    /// `dns_cache` / `dns_pending`: resolver entries per owner.
+    dns_cache_per: u8,
+    dns_pending_per: u8,
+    /// Lanes that were refused a datagram endpoint past their quota.
+    lane_ep_refused: u32,
     /// Lane telemetry: attached, detached, commands refused for naming an
     /// endpoint another lane opened.
     lane_attached: u32,
     lane_detached: u32,
     lane_refused: u32,
-    pending_net_out_head: u8,
-    pending_net_out_tail: u8,
-    pending_net_out_count: u8,
-    _pno_pad: u8,
 
     // Step counter for timers
     step_count: u32,
@@ -1536,7 +1747,7 @@ struct IpState {
     /// Length prefixes refused on the NIC channel, reported for the first few.
     bad_prefix_seen: u32,
     /// Steps that returned early from `service_net_channels` because
-    /// outbound headroom was low (`NET_OUT_QUEUE_SLOTS` pressure) — the
+    /// outbound headroom was low (the lane's event-queue pressure) — the
     /// module refusing new commands rather than being idle.
     pend_txq_steps: u32,
     /// MSG_DATA frames emitted to `net_out` (wire -> tls direction).
@@ -1561,11 +1772,107 @@ struct IpState {
     /// by; 0 until the first lookup allocates it. Held for the module's
     /// lifetime and reserved against `next_port`.
     resolver_port: u16,
+    // ── net.route tables (`route.rs`) ─────────────────────────────────
+    /// `max_segments` (param).
+    max_segments: u8,
+    rt_nsegs: u8,
+    /// Whether a TAKE has been adopted, and whether the provider is absent.
+    rt_have: bool,
+    rt_absent: bool,
+    rt_nroutes: u16,
+    rt_nheld: u16,
+    rt_buf: *mut u8,
+    rt_buf_len: u32,
+    rt_polled_ms: u32,
+    rt_segs: *mut abi::contracts::net::route::Segment,
+    rt_routes: *mut abi::contracts::net::route::Route,
+    rt_held: *mut abi::contracts::net::route::Held,
+    rt_gen: u64,
+    /// Entries the node's tables hold, as the last TAKE's header stated:
+    /// those past what this module holds are reported `table_full`.
+    rt_tsegs: u8,
+    rt_troutes: u16,
+    rt_theld: u16,
+    /// TAKEs whose records did not fit the declared sizes.
+    rt_overflow: u32,
+    /// The primary address the held addresses were last realized against.
+    rt_realized_ip: u32,
+    /// Moves on every adopted table: cached next hops and source choices
+    /// are looked up again.
+    route_epoch: u32,
+    /// Moves on every address install and removal: lanes' cached source
+    /// slots are looked up again.
+    addr_epoch: u32,
+    rt_report: [u8; route::REPORT_BYTES],
+
+    // ── Datagram flows (`flows.rs`) ───────────────────────────────────
+    max_dg_flows: u16,
+    dg_flow_floor: u8,
+    _flow_pad: u8,
+    dg_flow_idle_s: u16,
+    _flow_pad2: u16,
+    flows: *mut flows::DgFlow,
+    flow_free: *mut u16,
+    flow_free_top: u32,
+    flow_index: *mut u32,
+    flow_index_len: u32,
+    flow_sweep: u32,
+    /// Flows held past each lane's floor, summed: what the shared part holds.
+    flows_over_floor: u32,
+    flow_refused: u32,
+    flow_evicted: u32,
+    flow_expired: u32,
+    /// Datagrams to an egress port with no live flow, dropped.
+    egress_unsolicited: u32,
+
+    // ── Packet policy (`policy.rs`) and services (`service.rs`) ───────
+    /// `policy_tables` as given (comma-separated names), until sized.
+    pol_names: [u8; 255],
+    pol_names_len: u8,
+    pol_n: u8,
+    pol_attached: bool,
+    pol_absent: bool,
+    /// `policy_bytes` (param): bytes held per table.
+    policy_bytes: u16,
+    _pol_pad: u16,
+    pol: *mut policy::PolTable,
+    pol_buf: *mut u8,
+    pol_store_gen: u64,
+    pol_polled_ms: u32,
+    pol_oversized: u32,
+    /// Moves when a table holding filter records changes: what a datagram
+    /// flow's verdict is stamped with.
+    filter_epoch: u32,
+    svc: [service::SvcCopy; 2],
+    svc_cap: u16,
+    svc_be_cap: u16,
+    svc_index_len: u32,
+    svc_live: u8,
+    /// Rebuild phase: 0 idle, 1 clearing the spare index, 2 merging records.
+    svc_build: u8,
+    _svc_pad: u16,
+    svc_build_t: u32,
+    svc_build_at: u32,
+    /// Moves on every swap: what a datagram flow's backend pin is stamped
+    /// with. 0 until the first index is in.
+    svc_gen: u32,
+    svc_overflow: u32,
+    /// The service a dial being made was translated from, stamped on the
+    /// connection it makes (`svc_vip`).
+    dial_vip: u32,
+    dial_vport: u16,
+    /// The name being dialled ended in a dot (absolute: no search list).
+    dial_absolute: bool,
+    _dial_pad: u8,
+
     /// Entries of `dns_pending` in use, so an idle step costs one compare.
-    dns_pending_live: u8,
-    _dns_pad: u8,
-    dns_cache: [DnsCacheEntry; MAX_DNS_CACHE],
-    dns_pending: [DnsPending; MAX_DNS_PENDING],
+    dns_pending_live: u16,
+    /// The resolver's tables in the module heap, one partition per owner
+    /// (the node, then each lane): `dns_cache_per` cache entries and
+    /// `dns_pending_per` pending queries each. An owner reads, joins and
+    /// evicts only within its own partition.
+    dns_cache: *mut DnsCacheEntry,
+    dns_pending: *mut DnsPending,
 }
 
 /// Cadence for the `[ip] tlm` line — every 5000 module steps.
@@ -1628,6 +1935,71 @@ mod params_def {
                 let v = p_u16(d, len, 0, 50);
                 s.pkt_hold_ms = if v == 0 { 1 } else { v };
             };
+        // Declared capacities: each sizes a table in this module's heap at
+        // construction. A graph that declares more than the defaults gives
+        // the instance the heap for it (`heap.arena_bytes`).
+        //
+        // Workload lanes held (1..=255, a lane id is a u8; 0 = serve no
+        // workloads), stated to the kernel when the role is claimed.
+        12, lanes, u8, LANES_DEFAULT
+            => |s, d, len| { s.lane_cap = p_u8(d, len, 0, LANES_DEFAULT); };
+        // Datagram endpoints one lane may hold at once; a bind past it is
+        // refused EMFILE. The endpoint id is a u8, so all lanes together
+        // share 256.
+        13, lane_endpoints, u8, LANE_ENDPOINTS_DEFAULT
+            => |s, d, len| { s.lane_endpoints = p_u8(d, len, 0, LANE_ENDPOINTS_DEFAULT); };
+        // Peer nodes on the segment: the ARP table is this plus the
+        // segment's own neighbours.
+        14, max_peers, u16, 0
+            => |s, d, len| { s.max_peers = p_u16(d, len, 0, 0); };
+        // Resolver cache entries, and queries in flight, per owner (the node
+        // and each lane): sized for a search list's expansion.
+        20, dns_cache, u8, DNS_CACHE_DEFAULT
+            => |s, d, len| { s.dns_cache_per = p_u8(d, len, 0, DNS_CACHE_DEFAULT); };
+        21, dns_pending, u8, DNS_PENDING_DEFAULT
+            => |s, d, len| { s.dns_pending_per = p_u8(d, len, 0, DNS_PENDING_DEFAULT); };
+        // Held addresses the node answers for: the address table must keep
+        // room for them beside every lane's workload address.
+        22, max_held, u16, 0
+            => |s, d, len| { s.max_held = p_u16(d, len, 0, 0); };
+        // Datagram flows held (egress liveness, verdicts, service pins),
+        // each lane's reserved floor of them, and how long an idle flow
+        // lives. Construction requires max_dg_flows >= (lanes + 1) x floor.
+        15, max_dg_flows, u16, flows::FLOWS_DEFAULT
+            => |s, d, len| { s.max_dg_flows = p_u16(d, len, 0, flows::FLOWS_DEFAULT); };
+        16, dg_flow_floor, u8, flows::FLOOR_DEFAULT
+            => |s, d, len| { s.dg_flow_floor = p_u8(d, len, 0, flows::FLOOR_DEFAULT); };
+        23, dg_flow_idle_s, u16, flows::IDLE_DEFAULT_S
+            => |s, d, len| { s.dg_flow_idle_s = p_u16(d, len, 0, flows::IDLE_DEFAULT_S).max(1); };
+        // Segments the node's net.route table may hold.
+        24, max_segments, u8, route::SEGMENTS_DEFAULT
+            => |s, d, len| { s.max_segments = p_u8(d, len, 0, route::SEGMENTS_DEFAULT); };
+        // The net.policy tables this instance enforces, comma-separated, and
+        // the bytes held for each (twice: a read lands whole in a spare).
+        25, policy_tables, str, 0
+            => |s, d, len| {
+                let n = len.min(255);
+                let mut i = 0usize;
+                while i < n {
+                    if let Some(b) = s.pol_names.get_mut(i) {
+                        *b = *d.add(i);
+                    }
+                    i += 1;
+                }
+                s.pol_names_len = n as u8;
+            };
+        26, policy_bytes, u16, policy::BYTES_DEFAULT
+            => |s, d, len| { s.policy_bytes = p_u16(d, len, 0, policy::BYTES_DEFAULT); };
+        // Fast-path halves (same-node streams) one lane holds at once.
+        17, lane_pairs, u8, LANE_PAIRS_DEFAULT
+            => |s, d, len| { s.lane_pairs = p_u8(d, len, 0, LANE_PAIRS_DEFAULT); };
+        // Event-queue slots reserved for each lane (at least 4), and the
+        // node's own (at least 8): a lane's queue fills only with its own
+        // events.
+        18, lane_events, u8, LANE_EVENTS_DEFAULT
+            => |s, d, len| { s.lane_events = p_u8(d, len, 0, LANE_EVENTS_DEFAULT).max(4); };
+        19, node_events, u8, NODE_EVENTS_DEFAULT
+            => |s, d, len| { s.node_events = p_u8(d, len, 0, NODE_EVENTS_DEFAULT).max(8); };
     }
 }
 
@@ -1650,6 +2022,259 @@ unsafe fn log_error(s: &IpState, msg: &[u8]) {
 }
 
 // Formatting helpers (fmt_u32_raw, fmt_ip_raw) are in pic_runtime.rs
+
+// ── Heap-held tables ────────────────────────────
+
+/// The ARP table, `arp_len` entries in the module heap.
+///
+/// # Safety
+/// `s` was constructed (`module_new` sized the table, or left it empty).
+#[inline(always)]
+unsafe fn arp_tab<'a>(s: &IpState) -> &'a mut [arp::ArpEntry] {
+    if s.arp_ptr.is_null() {
+        return &mut [];
+    }
+    core::slice::from_raw_parts_mut(s.arp_ptr, s.arp_len as usize)
+}
+
+/// Lane `lane` (1-based) of the lane table, if the table holds it.
+///
+/// # Safety
+/// As [`arp_tab`].
+#[inline(always)]
+unsafe fn lane_at<'a>(s: &IpState, lane: u8) -> Option<&'a mut NetLane> {
+    if lane == 0 || lane > s.lane_cap || s.lanes.is_null() {
+        return None;
+    }
+    Some(&mut *s.lanes.add(lane as usize - 1))
+}
+
+/// Lane `lane`'s command stash (0 = the node's). A lane past the table
+/// falls back to the node's, which never happens: `cur_lane` only names a
+/// lane the table holds.
+///
+/// # Safety
+/// As [`arp_tab`]; `module_new` always allocates the node's stash.
+#[inline(always)]
+unsafe fn lane_state<'a>(s: &IpState, lane: u8) -> &'a mut LaneState {
+    let i = if lane > s.lane_cap { 0 } else { lane as usize };
+    &mut *s.lane_states.add(i)
+}
+
+/// The lane connection `idx` belongs to (0 for a slot past the table).
+///
+/// # Safety
+/// As [`arp_tab`].
+#[inline(always)]
+unsafe fn conn_lane(s: &IpState, idx: usize) -> u8 {
+    if idx < s.tcp_conns.len() {
+        (*s.tcp_conns.ptr(idx)).lane
+    } else {
+        0
+    }
+}
+
+/// The resolver cache partition of `lane`: its first entry and length.
+#[inline(always)]
+fn dns_cache_part(s: &IpState, lane: u8) -> (usize, usize) {
+    let per = s.dns_cache_per as usize;
+    let lane = if lane > s.lane_cap { 0 } else { lane as usize };
+    (lane * per, per)
+}
+
+/// The pending-query partition of `lane`.
+#[inline(always)]
+fn dns_pending_part(s: &IpState, lane: u8) -> (usize, usize) {
+    let per = s.dns_pending_per as usize;
+    let lane = if lane > s.lane_cap { 0 } else { lane as usize };
+    (lane * per, per)
+}
+
+/// Pending-query entries across every partition.
+#[inline(always)]
+fn dns_pending_total(s: &IpState) -> usize {
+    (s.lane_cap as usize + 1) * s.dns_pending_per as usize
+}
+
+/// Cache entry `i` (an index inside some owner's partition).
+///
+/// # Safety
+/// `i < (lane_cap + 1) * dns_cache_per`.
+#[inline(always)]
+unsafe fn dns_cache_at<'a>(s: &IpState, i: usize) -> &'a mut DnsCacheEntry {
+    &mut *s.dns_cache.add(i)
+}
+
+/// Pending entry `i`.
+///
+/// # Safety
+/// `i < dns_pending_total(s)`.
+#[inline(always)]
+unsafe fn dns_pending_at<'a>(s: &IpState, i: usize) -> &'a mut DnsPending {
+    &mut *s.dns_pending.add(i)
+}
+
+/// `n` slots of `T` from the module heap, each set to `init`, or null when
+/// the heap cannot hold them (or `n` is 0).
+unsafe fn heap_table<T: Copy>(s: &IpState, n: usize, init: T) -> *mut T {
+    if n == 0 {
+        return core::ptr::null_mut();
+    }
+    let Some(bytes) = n.checked_mul(core::mem::size_of::<T>()) else {
+        return core::ptr::null_mut();
+    };
+    if bytes > u32::MAX as usize {
+        return core::ptr::null_mut();
+    }
+    let p = heap_alloc(&*s.syscalls, bytes as u32) as *mut T;
+    if p.is_null() {
+        return p;
+    }
+    let mut i = 0;
+    while i < n {
+        p.add(i).write(init);
+        i += 1;
+    }
+    p
+}
+
+/// Log a construction refusal naming the declared input it could not meet.
+unsafe fn refuse_capacity(s: &IpState, what: &[u8]) {
+    let mut buf = [0u8; 96];
+    let prefix = b"[ip] refusing to construct: the heap cannot hold ";
+    let mut n = 0;
+    for b in prefix.iter().chain(what.iter()) {
+        if let Some(d) = buf.get_mut(n) {
+            *d = *b;
+            n += 1;
+        }
+    }
+    dev_log(&*s.syscalls, 1, buf.as_ptr(), n);
+}
+
+/// Size the declared tables into the module heap. `false` (logged, naming
+/// the table) when a declaration is inconsistent or the heap cannot hold it.
+unsafe fn size_declared_tables(s: &mut IpState) -> bool {
+    // The address table holds the primary, one address per lane, and the
+    // held addresses: a declaration it cannot hold is refused here rather
+    // than discovered when the next install is refused.
+    if 1 + s.lane_cap as usize + s.max_held as usize > MAX_LOCAL_ADDRS {
+        let msg = b"[ip] refusing to construct: lanes + max_held exceed the address table";
+        dev_log(&*s.syscalls, 1, msg.as_ptr(), msg.len());
+        return false;
+    }
+    let arp_n = s.max_peers as usize + arp::ARP_SEGMENT_ENTRIES;
+    s.arp_ptr = heap_table(s, arp_n, arp::ArpEntry::empty());
+    if s.arp_ptr.is_null() {
+        refuse_capacity(s, b"the ARP table (max_peers)");
+        return false;
+    }
+    s.arp_len = arp_n as u16;
+    let owners = s.lane_cap as usize + 1;
+    s.lane_states = heap_lane_states(s, owners);
+    if s.lane_states.is_null() {
+        refuse_capacity(s, b"the lane stashes (lanes)");
+        return false;
+    }
+    let ev_n = s.node_events as usize + s.lane_cap as usize * s.lane_events as usize;
+    s.ev_slots = heap_table(
+        s,
+        ev_n,
+        EvSlot {
+            len: 0,
+            frame: [0; NET_OUT_FRAME_MAX],
+        },
+    );
+    if s.ev_slots.is_null() {
+        refuse_capacity(s, b"the event queues (node_events, lane_events)");
+        return false;
+    }
+    let mut lane = 0usize;
+    let mut base = 0u32;
+    while lane < owners {
+        let st = &mut *s.lane_states.add(lane);
+        let cap = if lane == 0 {
+            s.node_events
+        } else {
+            s.lane_events
+        };
+        st.ev_base = base;
+        st.ev_cap = u16::from(cap);
+        base += u32::from(cap);
+        lane += 1;
+    }
+    if s.lane_cap > 0 {
+        s.lanes = heap_table(s, s.lane_cap as usize, NetLane::EMPTY);
+        if s.lanes.is_null() {
+            refuse_capacity(s, b"the lane table (lanes)");
+            return false;
+        }
+    }
+    s.dns_cache = heap_table(s, owners * s.dns_cache_per as usize, DnsCacheEntry::EMPTY);
+    if s.dns_cache_per > 0 && s.dns_cache.is_null() {
+        refuse_capacity(s, b"the resolver cache (dns_cache)");
+        return false;
+    }
+    s.dns_pending = heap_table(
+        s,
+        owners * s.dns_pending_per as usize,
+        DnsPending {
+            name: [0; DNS_NAME_CAP],
+            name_len: 0,
+            flags: 0,
+            tag: REQUESTER_TAG_NONE,
+            retries: 0,
+            port: 0,
+            id: 0,
+            deadline_ms: 0,
+            lane: 0,
+            search: SEARCH_BARE,
+            srv_port: 0,
+            srv_ip: 0,
+            src_slot: 0,
+        },
+    );
+    if s.dns_pending_per > 0 && s.dns_pending.is_null() {
+        refuse_capacity(s, b"the resolver queries (dns_pending)");
+        return false;
+    }
+    true
+}
+
+/// The lane stashes: too large to build on the stack as a value, so each is
+/// cleared in place.
+unsafe fn heap_lane_states(s: &IpState, n: usize) -> *mut LaneState {
+    let Some(bytes) = n.checked_mul(core::mem::size_of::<LaneState>()) else {
+        return core::ptr::null_mut();
+    };
+    if bytes == 0 || bytes > u32::MAX as usize {
+        return core::ptr::null_mut();
+    }
+    let p = heap_alloc(&*s.syscalls, bytes as u32) as *mut LaneState;
+    if p.is_null() {
+        return p;
+    }
+    let mut i = 0;
+    while i < n {
+        let e = &mut *p.add(i);
+        e.valid = 0;
+        e.close_valid = 0;
+        e.conn = 0;
+        e.off = 0;
+        e.len = 0;
+        e.close_conn = 0;
+        e.pairs = 0;
+        e.flows = 0;
+        e._flows_pad = 0;
+        e.ev_base = 0;
+        e.ev_head = 0;
+        e.ev_count = 0;
+        e.ev_cap = 0;
+        e._pad = 0;
+        i += 1;
+    }
+    p
+}
 
 // ── Local-address table helpers ─────────────────
 
@@ -2118,48 +2743,70 @@ unsafe fn lane_evt(s: &IpState, lane: u8) -> i32 {
     if lane == 0 {
         return s.net_out_chan;
     }
-    match s.lanes.get(lane as usize - 1) {
+    match lane_at(s, lane) {
         Some(l) if l.active != 0 => l.evt,
         _ => -1,
+    }
+}
+
+/// The lane endpoint `idx`'s events go to.
+#[inline(always)]
+unsafe fn out_lane_conn(s: &IpState, idx: usize) -> u8 {
+    if idx < s.tcp_conns.len() {
+        (*s.tcp_conns.ptr(idx)).lane
+    } else {
+        s.cur_lane
     }
 }
 
 /// The event channel for endpoint `idx`: its lane's.
 #[inline(always)]
 unsafe fn out_chan_conn(s: &IpState, idx: usize) -> i32 {
-    if idx < s.tcp_conns.len() {
-        lane_evt(s, (*s.tcp_conns.ptr(idx)).lane)
-    } else {
-        lane_evt(s, s.cur_lane)
-    }
+    lane_evt(s, out_lane_conn(s, idx))
 }
 
-/// The channel a ready-built endpoint frame is for: its endpoint's lane (a
-/// datagram frame names the endpoint by `ep_id`, byte 3; the rest by
-/// `conn_id`, bytes 3-4). Errors are not routed here: an error can name no
-/// endpoint (`conn_id` 0, which is also a real endpoint), so its sender
-/// says where it goes.
-unsafe fn out_chan_frame(s: &IpState, frame: &[u8]) -> i32 {
-    if frame.len() < 4 {
-        return lane_evt(s, s.cur_lane);
-    }
-    let t = frame[0];
+/// The lane a ready-built endpoint frame is for: its endpoint's (a datagram
+/// frame names the endpoint by `ep_id`, byte 3; the rest by `conn_id`, bytes
+/// 3-4). Errors are not routed here: an error can name no endpoint
+/// (`conn_id` 0, which is also a real endpoint), so its sender says where it
+/// goes.
+unsafe fn out_lane_frame(s: &IpState, frame: &[u8]) -> u8 {
+    let (Some(&t), Some(&b3)) = (frame.first(), frame.get(3)) else {
+        return s.cur_lane;
+    };
     let dg = t == DG_MSG_BOUND || t == DG_MSG_RX_FROM || t == DG_MSG_CLOSED;
     let idx = if dg {
-        frame[3] as usize
-    } else if frame.len() >= 5 {
-        u16::from_le_bytes([frame[3], frame[4]]) as usize
+        b3 as usize
+    } else if let Some(&b4) = frame.get(4) {
+        u16::from_le_bytes([b3, b4]) as usize
     } else {
-        return lane_evt(s, s.cur_lane);
+        return s.cur_lane;
     };
-    out_chan_conn(s, idx)
+    out_lane_conn(s, idx)
 }
 
+/// Send a MSG_DATA frame to endpoint `conn_id`'s event channel. Returns
+/// `true` when the bytes were accepted (atomic-FIFO, so partial writes are
+/// impossible). Callers MUST gate `rcv_nxt` / `delivered_bytes` advancement
+/// and the outbound ACK on the return: ACKing data the consumer never
+/// received makes the peer think it landed and stop retransmitting,
+/// permanently losing payload.
+///
+/// Data never overtakes a control frame: while the lane still has events
+/// queued (an `MSG_ACCEPTED` and its peer report among them) the write is
+/// refused, exactly as a full channel refuses it, and the caller retries.
 #[inline(always)]
 unsafe fn net_send_data(s: &mut IpState, conn_id: u16, data: *const u8, data_len: usize) -> bool {
-    let ch = out_chan_conn(s, conn_id as usize);
+    let lane = out_lane_conn(s, conn_id as usize);
+    let ch = lane_evt(s, lane);
     if ch < 0 || data_len == 0 {
         return true;
+    }
+    if lane_state(s, lane).ev_count != 0 {
+        ev_drain_lane(s, lane);
+        if lane_state(s, lane).ev_count != 0 {
+            return false;
+        }
     }
     let sys = &*s.syscalls;
     let scratch = s.net_scratch.as_mut_ptr();
@@ -2186,132 +2833,147 @@ unsafe fn net_send_data(s: &mut IpState, conn_id: u16, data: *const u8, data_len
     }
 }
 
-/// Send a short control frame to `net_out_chan`, queueing when the
-/// channel is full rather than dropping. Returns `true` when
-/// delivered or queued; `false` only when the local queue is itself
-/// full. Callers MUST gate any state transition the consumer needs
-/// to learn about on this return.
-unsafe fn net_send_or_queue(s: &mut IpState, frame: &[u8]) -> bool {
-    let ch = out_chan_frame(s, frame);
-    net_send_or_queue_to(s, ch, frame)
+// ── Event queues ────────────────────────────────
+//
+// A control frame (`MSG_BOUND`, `MSG_ACCEPTED` and its peer report,
+// `MSG_CLOSED`, `MSG_CONNECTED`, `MSG_ERROR`, …) that a full event channel
+// refuses is queued rather than lost. Every lane has a queue of its own in
+// the module heap — the node's `node_events` slots, each workload lane's
+// `lane_events` — so a lane's count is its queue's, kept on push and drain,
+// and nothing scans one shared queue per send. A workload that stops reading
+// fills its own queue and no one else's; the receive path pauses only on the
+// node's queue, so stalled lanes never pause receive for everyone.
+
+/// Event slot `i` of the heap array every lane's queue is a run of.
+///
+/// # Safety
+/// `i` is inside some lane's run.
+#[inline(always)]
+unsafe fn ev_slot<'a>(s: &IpState, i: usize) -> &'a mut EvSlot {
+    &mut *s.ev_slots.add(i)
 }
 
-/// [`net_send_or_queue`] to an explicit channel.
-unsafe fn net_send_or_queue_to(s: &mut IpState, ch: i32, frame: &[u8]) -> bool {
+/// Free slots in `lane`'s event queue.
+#[inline(always)]
+unsafe fn ev_room(s: &IpState, lane: u8) -> usize {
+    let l = lane_state(s, lane);
+    (l.ev_cap as usize).saturating_sub(l.ev_count as usize)
+}
+
+/// Queue `frame` for `lane`. `false` when its queue is full.
+unsafe fn ev_push(s: &mut IpState, lane: u8, frame: &[u8]) -> bool {
+    let l = lane_state(s, lane);
+    if l.ev_count >= l.ev_cap || frame.is_empty() || frame.len() > NET_OUT_FRAME_MAX {
+        return false;
+    }
+    let at = l.ev_base as usize
+        + (l.ev_head as usize + l.ev_count as usize)
+            .checked_rem(l.ev_cap as usize)
+            .unwrap_or(0);
+    let slot = ev_slot(s, at);
+    let mut i = 0;
+    while i < NET_OUT_FRAME_MAX {
+        slot.frame[i] = match frame.get(i) {
+            Some(b) => *b,
+            None => 0,
+        };
+        i += 1;
+    }
+    slot.len = frame.len() as u8;
+    l.ev_count += 1;
+    s.ev_total = s.ev_total.saturating_add(1);
+    true
+}
+
+/// Write out what `lane`'s queue holds, oldest first, until its channel
+/// refuses one; the rest keep their order. A lane that has gone drops what
+/// it had queued.
+unsafe fn ev_drain_lane(s: &mut IpState, lane: u8) {
+    let l = lane_state(s, lane);
+    if l.ev_count == 0 {
+        return;
+    }
+    let ch = lane_evt(s, lane);
+    let sys = &*s.syscalls;
+    while l.ev_count > 0 {
+        let at = l.ev_base as usize + l.ev_head as usize;
+        let slot = ev_slot(s, at);
+        if ch >= 0 {
+            let len = slot.len as usize;
+            let n = (sys.channel_write)(ch, slot.frame.as_ptr(), len);
+            if n != len as i32 {
+                return;
+            }
+        }
+        l.ev_head = (l.ev_head as usize + 1)
+            .checked_rem(l.ev_cap as usize)
+            .unwrap_or(0) as u16;
+        l.ev_count -= 1;
+        s.ev_total = s.ev_total.saturating_sub(1);
+    }
+}
+
+/// Drop everything `lane` has queued (its channel has gone).
+unsafe fn ev_discard_lane(s: &mut IpState, lane: u8) {
+    let l = lane_state(s, lane);
+    s.ev_total = s.ev_total.saturating_sub(u32::from(l.ev_count));
+    l.ev_count = 0;
+    l.ev_head = 0;
+}
+
+/// Send a short control frame to `lane`, queueing when its channel is full
+/// rather than dropping. Frames for one lane leave in the order they were
+/// made: a frame goes straight out only when nothing for the lane is still
+/// queued. Returns `true` when delivered or queued (or the lane has gone);
+/// `false` only when the lane's queue is itself full. Callers MUST gate any
+/// state transition the consumer needs to learn about on this return.
+unsafe fn net_send_or_queue_lane(s: &mut IpState, lane: u8, frame: &[u8]) -> bool {
+    let ch = lane_evt(s, lane);
     if ch < 0 {
         return true;
     }
     if frame.is_empty() || frame.len() > NET_OUT_FRAME_MAX {
         return false;
     }
-    let sys = &*s.syscalls;
-    // Drain what is already queued first, so frames for one channel leave
-    // in the order they were made; a frame goes straight out only when
-    // nothing for its channel is still waiting.
-    drain_pending_net_out_inner(s, sys);
-    let (for_ch, for_lanes) = pending_counts(s, ch);
-    if for_ch == 0 {
+    ev_drain_lane(s, lane);
+    if lane_state(s, lane).ev_count == 0 {
+        let sys = &*s.syscalls;
         let n = (sys.channel_write)(ch, frame.as_ptr(), frame.len());
         if n == frame.len() as i32 {
             return true;
         }
     }
-    // A workload lane holds at most its share of the queue, and the lanes
-    // together at most half of it: a workload that stops reading its events
-    // fills only its own share, and the node's own frames — and the receive
-    // path, which pauses when the queue has no headroom — never wait on it.
-    if ch != s.net_out_chan && (for_ch >= LANE_QUEUE_SHARE || for_lanes >= NET_OUT_QUEUE_SLOTS / 2)
-    {
-        return false;
+    if ev_push(s, lane, frame) {
+        return true;
     }
-    if s.pending_net_out_count as usize >= NET_OUT_QUEUE_SLOTS {
+    if lane == 0 {
         log_info(s, b"[ip] net out queue full");
-        return false;
     }
-    let slot = s.pending_net_out_tail as usize;
-    let dst = &mut s.pending_net_out_frames[slot];
-    let n = frame.len();
-    dst[..n].copy_from_slice(frame);
-    s.pending_net_out_lens[slot] = n as u8;
-    s.pending_net_out_chans[slot] = ch;
-    s.pending_net_out_tail = ((slot + 1) % NET_OUT_QUEUE_SLOTS) as u8;
-    s.pending_net_out_count += 1;
-    true
+    s.ev_refused = s.ev_refused.wrapping_add(1);
+    false
 }
 
-/// Frames queued for `ch`, and for workload lanes in all (any channel but the
-/// node's own `net_out_chan`).
-fn pending_counts(s: &IpState, ch: i32) -> (usize, usize) {
-    let (mut for_ch, mut for_lanes) = (0usize, 0usize);
-    let mut k = 0usize;
-    while k < s.pending_net_out_count as usize {
-        let c =
-            s.pending_net_out_chans[(s.pending_net_out_head as usize + k) % NET_OUT_QUEUE_SLOTS];
-        if c == ch {
-            for_ch += 1;
-        }
-        if c >= 0 && c != s.net_out_chan {
-            for_lanes += 1;
-        }
-        k += 1;
-    }
-    (for_ch, for_lanes)
+/// Send a short control frame to the lane of the endpoint it names.
+unsafe fn net_send_or_queue(s: &mut IpState, frame: &[u8]) -> bool {
+    let lane = out_lane_frame(s, frame);
+    net_send_or_queue_lane(s, lane, frame)
 }
 
-/// Write out what the queue holds, oldest first, per channel: a channel that
-/// is full keeps its frames, in order, and every frame behind it for another
-/// channel still goes. One workload that stops reading holds up nothing but
-/// its own events. A frame whose channel has gone (`-1`) is dropped.
-unsafe fn drain_pending_net_out_inner(s: &mut IpState, sys: &SyscallTable) {
-    let count = s.pending_net_out_count as usize;
-    if count == 0 {
-        return;
-    }
-    let head = s.pending_net_out_head as usize;
-    // Channels found full in this pass: nothing more is written to them, so
-    // their order holds.
-    let mut full = [-1i32; NET_OUT_QUEUE_SLOTS];
-    let mut nfull = 0usize;
-    let mut kept = 0usize;
-    let mut k = 0usize;
-    while k < count {
-        let from = (head + k) % NET_OUT_QUEUE_SLOTS;
-        let ch = s.pending_net_out_chans[from];
-        let len = s.pending_net_out_lens[from] as usize;
-        let mut keep = false;
-        if ch >= 0 {
-            if full[..nfull].contains(&ch) {
-                keep = true;
-            } else {
-                let n = (sys.channel_write)(ch, s.pending_net_out_frames[from].as_ptr(), len);
-                if n != len as i32 {
-                    full[nfull] = ch;
-                    nfull += 1;
-                    keep = true;
-                }
-            }
-        }
-        if keep {
-            let to = (head + kept) % NET_OUT_QUEUE_SLOTS;
-            if to != from {
-                s.pending_net_out_frames[to] = s.pending_net_out_frames[from];
-                s.pending_net_out_lens[to] = s.pending_net_out_lens[from];
-                s.pending_net_out_chans[to] = ch;
-            }
-            kept += 1;
-        }
-        k += 1;
-    }
-    s.pending_net_out_count = kept as u8;
-    s.pending_net_out_tail = ((head + kept) % NET_OUT_QUEUE_SLOTS) as u8;
-}
-
+/// Flush what every lane has queued. One compare when nothing is.
 unsafe fn drain_pending_net_out(s: &mut IpState) {
-    if s.pending_net_out_count == 0 {
+    if s.ev_total == 0 {
         return;
     }
-    let sys = &*s.syscalls;
-    drain_pending_net_out_inner(s, sys);
+    let mut lane = 0u8;
+    loop {
+        if lane_state(s, lane).ev_count != 0 {
+            ev_drain_lane(s, lane);
+        }
+        if lane >= s.lane_cap {
+            break;
+        }
+        lane += 1;
+    }
 }
 
 /// Helper: write a short net-proto frame (MSG_ACCEPTED/CLOSED/BOUND/
@@ -2481,9 +3143,82 @@ unsafe fn net_send_bound(s: &mut IpState, conn_id: u16, local_port: u16) {
     net_send_or_queue(s, &frame);
 }
 
+/// Who is at the other end of stream `idx`: `(address, port)` in host
+/// order. A dial translated from a service address reports the service
+/// address it dialled. A fast-path half has no recorded remote — the pair
+/// is identified by `remote_ip == 0` — so its peer is derived from the
+/// paired half: the address it is reached at and its port.
+unsafe fn conn_peer(s: &IpState, idx: usize) -> (u32, u16) {
+    if idx >= s.tcp_conns.len() {
+        return (0, 0);
+    }
+    let c = &*s.tcp_conns.ptr(idx);
+    if c.svc_vip != 0 {
+        return (c.svc_vip, c.svc_vport);
+    }
+    let p = *s.loopback_peer.as_ptr().add(idx);
+    if p >= 0 && (p as usize) < s.tcp_conns.len() {
+        let half = &*s.tcp_conns.ptr(p as usize);
+        return (local_ip_for_slot(s, half.local_slot), half.local_port);
+    }
+    (c.remote_ip, c.remote_port)
+}
+
+/// Report stream `conn_id`'s peer (`MSG_PEER`), queued like a control frame
+/// so it reaches the consumer before the stream's first data.
+#[must_use]
+unsafe fn net_send_peer(s: &mut IpState, conn_id: u16) -> bool {
+    let (addr, port) = conn_peer(s, conn_id as usize);
+    let mut a16 = [0u8; 16];
+    let b = addr.to_be_bytes();
+    a16[0] = b[0];
+    a16[1] = b[1];
+    a16[2] = b[2];
+    a16[3] = b[3];
+    let mut frame = [0u8; NET_OUT_FRAME_MAX];
+    match abi::contracts::net::net_proto::write_peer(
+        &mut frame,
+        conn_id,
+        abi::contracts::net::net_proto::AF_INET,
+        &a16,
+        port,
+    ) {
+        Some(n) => net_send_or_queue(s, frame.get(..n).unwrap_or(&[])),
+        None => false,
+    }
+}
+
+/// Announce a stream that just reached its consumer: `MSG_ACCEPTED` (or
+/// `MSG_CONNECTED`) and its peer report, together. Both are queued in order,
+/// so the peer report precedes the stream's first data however full the
+/// channel is; the announcement is made only when the lane's queue has room
+/// for both, and is otherwise refused whole (`false`).
+unsafe fn net_announce(s: &mut IpState, conn_id: u16, accepted: bool, local_port: u16) -> bool {
+    let lane = out_lane_conn(s, conn_id as usize);
+    if lane_evt(s, lane) >= 0 && ev_room(s, lane) < 2 {
+        ev_drain_lane(s, lane);
+        if ev_room(s, lane) < 2 {
+            return false;
+        }
+    }
+    let first = if accepted {
+        net_send_accepted(s, conn_id, local_port)
+    } else {
+        net_send_connected_only(s, conn_id)
+    };
+    first && net_send_peer(s, conn_id)
+}
+
+/// `MSG_CONNECTED` and the stream's peer report (see [`net_announce`]).
 #[inline(always)]
 #[must_use]
 unsafe fn net_send_connected(s: &mut IpState, conn_id: u16) -> bool {
+    net_announce(s, conn_id, false, 0)
+}
+
+#[inline(always)]
+#[must_use]
+unsafe fn net_send_connected_only(s: &mut IpState, conn_id: u16) -> bool {
     // Payload `[conn_id:2 LE][requester_tag:2 LE]` — the tag echoes the
     // connecting module's dial tag so a fanned net_out routes the event back
     // to it.
@@ -2510,28 +3245,27 @@ unsafe fn net_send_connected(s: &mut IpState, conn_id: u16) -> bool {
 /// accept failure use the bool to know whether the latch is needed.
 #[inline(always)]
 unsafe fn net_send_error(s: &mut IpState, conn_id: u16, errno: i8, tag: RequesterTag) -> bool {
-    let ch = out_chan_conn(s, conn_id as usize);
-    net_send_error_to(s, ch, conn_id, errno, tag)
+    let lane = out_lane_conn(s, conn_id as usize);
+    net_send_error_to(s, lane, conn_id, errno, tag)
 }
 
 /// An error answering the command being served, naming no endpoint
 /// (`conn_id` 0): a refused bind or dial. It goes to the lane that sent the
 /// command.
 unsafe fn net_send_reply_error(s: &mut IpState, errno: i8, tag: RequesterTag) -> bool {
-    let ch = lane_evt(s, s.cur_lane);
-    net_send_error_to(s, ch, 0, errno, tag)
+    let lane = s.cur_lane;
+    net_send_error_to(s, lane, 0, errno, tag)
 }
 
 /// An error about the node itself, naming no endpoint: the node's own
 /// consumer hears it, no workload lane does.
 unsafe fn net_send_node_error(s: &mut IpState, errno: i8) -> bool {
-    let ch = s.net_out_chan;
-    net_send_error_to(s, ch, 0, errno, REQUESTER_TAG_NONE)
+    net_send_error_to(s, 0, 0, errno, REQUESTER_TAG_NONE)
 }
 
 unsafe fn net_send_error_to(
     s: &mut IpState,
-    ch: i32,
+    lane: u8,
     conn_id: u16,
     errno: i8,
     tag: RequesterTag,
@@ -2551,7 +3285,7 @@ unsafe fn net_send_error_to(
     core::ptr::write_volatile(frame.as_mut_ptr().add(5), errno as u8);
     core::ptr::write_volatile(frame.as_mut_ptr().add(6), tb[0]);
     core::ptr::write_volatile(frame.as_mut_ptr().add(7), tb[1]);
-    net_send_or_queue_to(s, ch, &frame)
+    net_send_or_queue_lane(s, lane, &frame)
 }
 
 /// Emit a MSG_RETRANSMIT frame. Payload: `[conn_id:2 LE][from_seq:4 LE]`.
@@ -2674,7 +3408,7 @@ unsafe fn dg_send_closed(s: &mut IpState, ep_id: u8) {
 /// A datagram error answers the command being served — a refused bind or
 /// send — so it goes to the lane that sent it.
 unsafe fn dg_send_error(s: &mut IpState, ep_id: u8, errno: i8) {
-    let ch = lane_evt(s, s.cur_lane);
+    let lane = s.cur_lane;
     let mut frame = [0u8; 5];
     use core::ptr::write_volatile as wv;
     wv(frame.as_mut_ptr(), DG_MSG_ERROR);
@@ -2682,7 +3416,7 @@ unsafe fn dg_send_error(s: &mut IpState, ep_id: u8, errno: i8) {
     wv(frame.as_mut_ptr().add(2), 0u8);
     wv(frame.as_mut_ptr().add(3), ep_id);
     wv(frame.as_mut_ptr().add(4), errno as u8);
-    net_send_or_queue_to(s, ch, &frame);
+    net_send_or_queue_lane(s, lane, &frame);
 }
 
 /// Length of a receive-window sharing epoch (`rx_seen`).
@@ -2829,6 +3563,17 @@ unsafe fn dg_decode_owner_tag(payload: *const u8, plen: usize) -> (u16, usize) {
     }
 }
 
+/// The owner a datagram command acts as. A lane's command acts as the
+/// lane's own owner — the lane is the proof, and its endpoints were bound as
+/// that owner — whatever tag its payload names; the node's shared channel
+/// presents the tag it names.
+unsafe fn lane_claim(s: &IpState, claimed: u16) -> u16 {
+    match lane_at(s, s.cur_lane) {
+        Some(l) => l.owner_slot,
+        None => claimed,
+    }
+}
+
 /// Outcome of datagram bind admission.
 enum DgBind {
     /// No endpoint holds an overlapping identity — allocate a new one.
@@ -2869,9 +3614,49 @@ unsafe fn dg_bind_admission(s: &IpState, port: u16, slot: u16, owner_tag: u16, l
                 return DgBind::Conflict;
             }
         }
+        // An endpoint's egress port is a slot-0 binding: a node bind there
+        // would be handed the endpoint's replies.
+        if c.is_active()
+            && c.is_datagram
+            && c.egress_port == port
+            && (slot == LOCAL_SLOT_ANY || slot == 0)
+        {
+            return DgBind::Conflict;
+        }
         i += 1;
     }
     DgBind::Fresh
+}
+
+/// Datagram endpoints lane `lane` holds now.
+unsafe fn lane_endpoint_count(s: &IpState, lane: u8) -> usize {
+    let mut n = 0;
+    let mut i = 0;
+    while i < MAX_DG_ENDPOINTS && i < s.tcp_conns.len() {
+        let c = &*s.tcp_conns.ptr(i);
+        if c.is_active() && c.is_datagram && c.lane == lane {
+            n += 1;
+        }
+        i += 1;
+    }
+    n
+}
+
+/// The endpoint lane `lane` already holds on `port` (a bind retry, which
+/// takes no new id), if any.
+unsafe fn dg_bind_existing(s: &IpState, port: u16, lane: u8) -> Option<usize> {
+    if port == 0 {
+        return None;
+    }
+    let mut i = 0;
+    while i < MAX_DG_ENDPOINTS && i < s.tcp_conns.len() {
+        let c = &*s.tcp_conns.ptr(i);
+        if c.is_active() && c.is_datagram && c.lane == lane && c.local_port == port {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Pick a free connection slot for a datagram endpoint, starting the scan at
@@ -2919,7 +3704,7 @@ unsafe fn port_in_use(s: &IpState, port: u16) -> bool {
     let mut i = 0;
     while i < s.tcp_conns.len() {
         let c = &*s.tcp_conns.ptr(i);
-        if c.is_active() && c.local_port == port {
+        if c.is_active() && (c.local_port == port || (c.is_datagram && c.egress_port == port)) {
             return true;
         }
         i += 1;
@@ -3220,6 +4005,16 @@ pub extern "C" fn module_state_size() -> usize {
 // measures 59,400 bytes, which is 90% of an RP2040's whole 64 KiB state arena.
 declare_module_state_bytes!(IpState);
 
+// The heap the declared tables are sized into (see "Declared capacities"):
+// elastic on aarch64, so the cap costs only what the tables touch.
+declare_module_arena_bytes!(HEAP_DEFAULT_BYTES);
+
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
+#[link_section = ".text.module_arena_size"]
+pub extern "C" fn module_arena_size() -> u32 {
+    HEAP_DEFAULT_BYTES
+}
+
 /// PIC module ABI entry: one-time initialisation. The kernel calls this
 /// once during loader bring-up before any `module_new` invocation.
 ///
@@ -3295,13 +4090,10 @@ pub unsafe extern "C" fn module_new(
         s.arp_wait_len = 0;
         s.arp_wait_overflow = 0;
 
-        // Initialize ARP table
-        let mut i = 0;
-        while i < arp::ARP_TABLE_SIZE {
-            *s.arp_table.as_mut_ptr().add(i) = arp::ArpEntry::empty();
-            i += 1;
-        }
+        // The ARP table is sized from `max_peers` with the other declared
+        // tables, once the params are read.
         s.arp_pending_state = arp::ARP_PENDING_NONE;
+        let mut i;
 
         // Initialize DHCP
         s.dhcp = dhcp::DhcpClient::new();
@@ -3440,9 +4232,49 @@ pub unsafe extern "C" fn module_new(
         }
         s.local_addrs[0].flags = ADDR_FLAG_PRIMARY | ADDR_FLAG_ARMED;
 
-        // Parse TLV params
+        // Parse TLV params. The declared capacities take their defaults
+        // here too, for a graph that passes no params at all.
+        s.lane_cap = LANES_DEFAULT;
+        s.lane_endpoints = LANE_ENDPOINTS_DEFAULT;
+        s.dns_cache_per = DNS_CACHE_DEFAULT;
+        s.dns_pending_per = DNS_PENDING_DEFAULT;
+        s.lane_pairs = LANE_PAIRS_DEFAULT;
+        s.lane_events = LANE_EVENTS_DEFAULT;
+        s.node_events = NODE_EVENTS_DEFAULT;
+        s.max_dg_flows = flows::FLOWS_DEFAULT;
+        s.dg_flow_floor = flows::FLOOR_DEFAULT;
+        s.dg_flow_idle_s = flows::IDLE_DEFAULT_S;
+        s.max_segments = route::SEGMENTS_DEFAULT;
+        s.policy_bytes = policy::BYTES_DEFAULT;
         if !params.is_null() && params_len > 0 {
             params_def::parse_tlv(s, params, params_len);
+        }
+        if !size_declared_tables(s) {
+            return -12; // ENOMEM
+        }
+        if !route::size_tables(s) {
+            refuse_capacity(s, b"the route tables (max_segments, max_peers, max_held)");
+            return -12;
+        }
+        if !flows::size(s) {
+            return -12;
+        }
+        if !policy::size(s) || !service::size(s) {
+            return -12;
+        }
+        // Claim the lane-provider role while the graph is instantiated, so
+        // the kernel sizes its lane tables now rather than on a step. A
+        // kernel that cannot answer yet is asked again on the first step.
+        if s.lane_cap > 0 {
+            let mut cap = [s.lane_cap];
+            let rc = (sys.provider_call)(-1, NET_PROVIDE, cap.as_mut_ptr(), cap.len());
+            s.lane_provider = match rc {
+                0 => 1,
+                -16 | -22 | -28 => 2, // EBUSY, EINVAL, ENOSPC
+                _ => 0,
+            };
+        } else {
+            s.lane_provider = 2;
         }
 
         // The decision seam is either wholly present or wholly absent. A
@@ -3654,8 +4486,13 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     // hold across schedulers with different `tick_us`.
     step_tcp_timers(s);
     step_resolver(s);
+    route::step(s);
+    flows::step(s);
+    policy::step(s);
+    service::step(s);
     continuity::step(s);
     step_fence_wait(s);
+    held::step(s);
 
     // Tally idle steps and emit the periodic `[ip] tlm …` line.
     // "Idle" excludes back-pressure steps (so idle + bp + active = dt)
@@ -3755,10 +4592,7 @@ unsafe fn emit_report_line(s: &mut IpState) {
             emit(b" lp=", &mut pos);
             num(s.lane_provider as u32, &mut pos);
             emit(b" ln=", &mut pos);
-            num(
-                s.lanes.iter().filter(|l| l.active != 0).count() as u32,
-                &mut pos,
-            );
+            num(lanes_active(s), &mut pos);
             emit(b" la=", &mut pos);
             num(s.lane_attached, &mut pos);
             emit(b" ld=", &mut pos);
@@ -3791,7 +4625,7 @@ unsafe fn emit_report_line(s: &mut IpState) {
             emit(b" nores=", &mut pos);
             num(s.drops.udp_noresolve, &mut pos);
             emit(b" live=", &mut pos);
-            num(arp::live_entries(&s.arp_table), &mut pos);
+            num(arp::live_entries(arp_tab(s)), &mut pos);
             dev_log(sys, 3, buf, pos);
         }
         3 => {
@@ -3965,7 +4799,10 @@ unsafe fn process_rx_frames(s: &mut IpState) {
         // MSG_ACCEPTED, FIN → MSG_CLOSED), so re-check headroom
         // every loop rather than once up-front. The peer's TCP
         // retransmit covers segments dropped while we're paused.
-        if NET_OUT_QUEUE_SLOTS - s.pending_net_out_count as usize <= NET_OUT_QUEUE_HEADROOM {
+        // Only the node's own queue pauses receive: a workload lane whose
+        // queue is full refuses its own events (an accept is refused, data
+        // is held unacknowledged) and holds up no one else.
+        if ev_room(s, 0) <= NET_OUT_QUEUE_HEADROOM {
             break;
         }
         let poll = (sys.channel_poll)(s.in_chan, POLL_IN);
@@ -4137,18 +4974,18 @@ unsafe fn process_arp(s: &mut IpState, data: *const u8, len: usize) {
     // A MAC change refused by a pin is metered wherever it is observed:
     // an operator reading a cache miss needs to know whether the mapping is
     // simply absent or whether the segment tried to move a pinned one.
-    if arp::pin_would_reject(&s.arp_table, sender_ip, sender_mac) {
+    if arp::pin_would_reject(arp_tab(s), sender_ip, sender_mac) {
         s.drops.arp_pin_reject = s.drops.arp_pin_reject.wrapping_add(1);
     }
 
     if correlated_reply {
-        arp::insert(&mut s.arp_table, sender_ip, sender_mac, s.step_count as u16);
+        arp::insert(arp_tab(s), sender_ip, sender_mac, s.step_count as u16);
         s.arp_pending_state = arp::ARP_PENDING_NONE;
         // A gateway pin is installed only against a mapping this exchange
         // just produced, never against whatever happened to be cached.
         if s.gw_pin_pending && s.gw_pin_ip == sender_ip {
             s.gw_pin_pending = false;
-            arp::pin_gateway(&mut s.arp_table, sender_ip);
+            arp::pin_gateway(arp_tab(s), sender_ip);
         }
         // A handshake blocked on this resolution ships now rather than
         // waiting for the next timer tick — the whole stall is the ARP round
@@ -4157,7 +4994,7 @@ unsafe fn process_arp(s: &mut IpState, data: *const u8, len: usize) {
     } else {
         // Uncorrelated ARP may still refresh an unchanged mapping — that is
         // the same authority ordinary IPv4 traffic has, and no more.
-        if !arp::refresh_same_mac(&mut s.arp_table, sender_ip, sender_mac) {
+        if !arp::refresh_same_mac(arp_tab(s), sender_ip, sender_mac) {
             s.drops.arp_uncorrelated = s.drops.arp_uncorrelated.wrapping_add(1);
         }
     }
@@ -4259,19 +5096,18 @@ unsafe fn process_ipv4(s: &mut IpState, data: *const u8, len: usize) {
     if ip_hdr.src_ip != 0 && ip_hdr.src_ip != 0xFFFFFFFF {
         let src_mac = eth::src_mac(s.rx_frame.as_ptr());
         if (src_mac[0] | src_mac[1] | src_mac[2] | src_mac[3] | src_mac[4] | src_mac[5]) != 0
-            && !arp::refresh_same_mac(&mut s.arp_table, ip_hdr.src_ip, src_mac)
+            && !arp::refresh_same_mac(arp_tab(s), ip_hdr.src_ip, src_mac)
         {
             s.drops.arp_from_ipv4 = s.drops.arp_from_ipv4.wrapping_add(1);
         }
     }
 
     // Destination demux: which of our local addresses (if any) is this for?
-    // Replaces the single `dst == local_ip` compare with a table lookup.
-    // `None` = not a unicast local address; still accept the
-    // (subnet-)broadcast forms as before.
+    // `None` = not a unicast local address; the limited and the primary
+    // subnet's directed broadcast are still accepted.
     let dst_slot = local_slot_for_dst(s, ip_hdr.dst_ip);
     if s.local_ip != 0 && dst_slot.is_none() && ip_hdr.dst_ip != 0xFFFFFFFF {
-        // Not for us (also check subnet broadcast — one segment in v1).
+        // Not for us, unless it is the primary subnet's broadcast.
         if s.netmask != 0 {
             let subnet_broadcast = (s.local_ip & s.netmask) | (!s.netmask);
             if ip_hdr.dst_ip != subnet_broadcast {
@@ -4945,6 +5781,14 @@ unsafe fn process_icmp(
         return;
     }
 
+    // An echo to a workload address follows packet policy, as any packet
+    // forwarded to the workload would.
+    if local_slot_for_dst(s, ip_hdr.dst_ip).is_some_and(|slot| slot_is_owned(s, slot))
+        && !policy_allows(s, ip_hdr.src_ip, ip_hdr.dst_ip, POLICY_PROTO_ICMP, 0)
+    {
+        return;
+    }
+
     // Build reply in tx_frame (after eth + ip headers)
     let icmp_dst = s
         .tx_frame
@@ -5028,47 +5872,131 @@ unsafe fn process_udp_packet(
         return;
     }
 
-    // The stub resolver's answers arrive on the port it holds, and are
-    // claimed ahead of the endpoint walk as DHCP's are: no consumer can
-    // bind that port, so nothing behind this line could want them.
-    if s.resolver_port != 0
-        && udp_hdr.dst_port == s.resolver_port
-        && udp_hdr.src_port == dns_wire::DNS_PORT
-        && ip_hdr.src_ip == resolver_server(s)
-    {
-        resolver_rx(s, data.add(udp_hdr.payload_offset), udp_hdr.payload_len);
+    let a = DgAddr {
+        src_ip: ip_hdr.src_ip,
+        src_port: udp_hdr.src_port,
+        dst_slot: local_slot,
+        dst_port: udp_hdr.dst_port,
+        wire: true,
+    };
+    udp_demux(s, &a, data.add(udp_hdr.payload_offset), udp_hdr.payload_len);
+}
+
+/// A datagram's addressing on this node: its source, and the local slot
+/// and port it is for.
+#[derive(Clone, Copy)]
+struct DgAddr {
+    src_ip: u32,
+    src_port: u16,
+    dst_slot: u16,
+    dst_port: u16,
+    /// Arrived from the wire (not from an endpoint on this node).
+    wire: bool,
+}
+
+/// Deliver a datagram that arrived for local slot `a.dst_slot`, port
+/// `a.dst_port`: from the wire, or from an endpoint on this node (the
+/// same-node path, which never touches the wire).
+///
+/// The stub resolver's answers arrive on the port it holds and are claimed
+/// ahead of the endpoint walk: no consumer can bind that port, so nothing
+/// behind it could want them. Everything else goes to the matching datagram
+/// endpoint with its source (`MSG_DG_RX_FROM`). Bind admission: a wildcard
+/// endpoint serves slot 0 and unowned secondaries, but an OWNED secondary is
+/// served only by an endpoint bound to it; `dst_owned` is always false with
+/// no owned secondary configured, so this collapses to a plain wildcard
+/// match.
+unsafe fn udp_demux(s: &mut IpState, a: &DgAddr, payload: *const u8, payload_len: usize) {
+    let DgAddr {
+        src_ip,
+        src_port,
+        dst_slot,
+        dst_port,
+        wire: _,
+    } = *a;
+    if s.resolver_port != 0 && dst_port == s.resolver_port {
+        resolver_rx(s, a, payload, payload_len);
         return;
     }
-
-    // Deliver UDP data to the matching datagram endpoint. All UDP consumers
-    // now speak datagram (see modules/sdk/contracts/net/datagram.rs) and
-    // receive source addressing via MSG_DG_RX_FROM. Bind admission: a
-    // wildcard datagram endpoint serves slot 0 and unowned secondaries, but
-    // an OWNED secondary is served only by an endpoint bound to it (an
-    // owner-stamped DG bind). `dst_owned` is always false with no owned
-    // secondary configured, so this collapses to a plain wildcard match.
-    let dst_owned = slot_is_owned(s, local_slot);
+    // A workload endpoint's egress port, on the node's address: delivered
+    // only for a live flow the endpoint itself made, and dropped otherwise —
+    // the endpoint is not exposed on the node's address.
+    if dst_slot == 0 {
+        if let Some(ep) = egress_endpoint(s, dst_port) {
+            match flows::find(s, ep as u8, src_ip, src_port, true) {
+                Some(fi) => {
+                    flows::touch(s, fi, true);
+                    let f = *flows::get(s, fi);
+                    dg_send_rx_from_v4(s, ep as u8, f.dst_ip, f.dst_port, payload, payload_len);
+                }
+                None => {
+                    s.egress_unsolicited = s.egress_unsolicited.wrapping_add(1);
+                }
+            }
+            return;
+        }
+    }
+    let dst_owned = slot_is_owned(s, dst_slot);
     let mut i = 0;
     while i < MAX_DG_ENDPOINTS {
         let conn = &*s.tcp_conns.ptr(i);
         if conn.is_datagram
             && conn.state == tcp::TcpState::Listen
-            && conn.local_port == udp_hdr.dst_port
-            && (conn.local_slot == local_slot || (conn.local_slot == LOCAL_SLOT_ANY && !dst_owned))
+            && conn.local_port == dst_port
+            && (conn.local_slot == dst_slot || (conn.local_slot == LOCAL_SLOT_ANY && !dst_owned))
         {
-            let payload = data.add(udp_hdr.payload_offset);
-            dg_send_rx_from_v4(
-                s,
-                i as u8,
-                ip_hdr.src_ip,
-                udp_hdr.src_port,
-                payload,
-                udp_hdr.payload_len,
-            );
+            let (mut from_ip, mut from_port) = (src_ip, src_port);
+            let lane = conn.lane;
+            // A reply on one of the endpoint's own flows: shown from the
+            // address the endpoint sent to (a service address, for a
+            // translated flow), and passed as connection tracking passes an
+            // established flow's.
+            if let Some(fi) = flows::find(s, i as u8, src_ip, src_port, true) {
+                flows::touch(s, fi, true);
+                let f = *flows::get(s, fi);
+                from_ip = f.dst_ip;
+                from_port = f.dst_port;
+            } else if lane != 0 && a.wire && !dg_inbound_admitted(s, i, a) {
+                return;
+            }
+            dg_send_rx_from_v4(s, i as u8, from_ip, from_port, payload, payload_len);
             return;
         }
         i += 1;
     }
+}
+
+/// Whether a datagram that is on no flow of workload endpoint `ep` may reach
+/// it (packet policy, judged per packet; `policy.rs`).
+///
+/// A packet the policy passes, to an endpoint the tables judge at all, opens
+/// an inbound flow, so the endpoint's answer passes as the reply it is.
+unsafe fn dg_inbound_admitted(s: &mut IpState, ep: usize, a: &DgAddr) -> bool {
+    if s.pol_n == 0 {
+        return true;
+    }
+    let dst = local_ip_for_slot(s, a.dst_slot);
+    if !policy_allows(s, a.src_ip, dst, POLICY_PROTO_UDP, a.dst_port) {
+        return false;
+    }
+    if policy::active(s) {
+        let lane = (*s.tcp_conns.ptr(ep)).lane;
+        let _ = flows::make(
+            s,
+            flows::DgFlow {
+                ep: ep as u8,
+                lane,
+                flags: flows::F_ALLOW,
+                dst_ip: a.src_ip,
+                dst_port: a.src_port,
+                peer_ip: a.src_ip,
+                peer_port: a.src_port,
+                verdict_gen: s.filter_epoch,
+                ..flows::DgFlow::EMPTY
+            },
+        );
+    }
+    true
 }
 
 /// Process incoming TCP segment.
@@ -5118,6 +6046,20 @@ unsafe fn process_tcp_segment(
                 && s.local_ip != 0
             {
                 let dst_owned = slot_is_owned(s, local_slot);
+                // A stream to a workload address is judged at its SYN, as
+                // the host's forward hook judges one; established segments
+                // never reach the evaluator. Dropped silently, as it drops.
+                if dst_owned
+                    && !policy_allows(
+                        s,
+                        ip_hdr.src_ip,
+                        ip_hdr.dst_ip,
+                        POLICY_PROTO_TCP,
+                        tcp_hdr.dst_port,
+                    )
+                {
+                    return;
+                }
                 if let Some(li) = find_listener_indexed(s, tcp_hdr.dst_port, local_slot, dst_owned)
                 {
                     // A connection cannot be opened without an ISN secret:
@@ -5524,7 +6466,7 @@ unsafe fn process_tcp_segment(
                 (*s.tcp_conns.ptr_mut(conn_idx)).pending_close_notify = NOTIFY_CONNECTED;
             }
             let remote_ip = (*s.tcp_conns.ptr(conn_idx)).remote_ip;
-            arp::pin(&mut s.arp_table, remote_ip);
+            arp::pin(arp_tab(s), remote_ip);
         }
         ACTION_COMPLETE_REFUSED => {
             let tag = (*s.tcp_conns.ptr(conn_idx)).connect_tag;
@@ -5547,7 +6489,7 @@ unsafe fn process_tcp_segment(
             let conn = &mut *s.tcp_conns.ptr_mut(conn_idx);
             if delivered {
                 if remote_ip != 0 {
-                    arp::unpin(&mut s.arp_table, remote_ip);
+                    arp::unpin(arp_tab(s), remote_ip);
                 }
                 conn_reset(s, conn_idx);
             } else {
@@ -5626,20 +6568,21 @@ unsafe fn process_tcp_segment(
             }
         }
         ACTION_COMPLETE_ACCEPT => {
-            // RX is gated on NET_OUT_QUEUE_HEADROOM, so the node's own
-            // consumer always has room for MSG_ACCEPTED here. A workload
-            // lane may not: it holds only its share of the queue. A
-            // connection that cannot be announced is refused, as by a full
-            // accept backlog, rather than left established with nobody told.
+            // RX pauses on the node's own queue, so the node's consumer
+            // always has room here. A workload lane's queue is its own and
+            // may not: the accept is announced only with room for
+            // MSG_ACCEPTED and its peer report, and a connection that cannot
+            // be announced is refused, as by a full accept backlog, rather
+            // than left established with nobody told.
             let local_port = (*s.tcp_conns.ptr(conn_idx)).local_port;
-            if !net_send_accepted(s, conn_idx as u16, local_port) {
+            if !net_announce(s, conn_idx as u16, true, local_port) {
                 log_info(s, b"[ip] accept refused: lane backlog full");
                 let _ = send_tcp_control(s, conn_idx, tcp::RST | tcp::ACK, false);
                 conn_reset(s, conn_idx);
                 return;
             }
             let remote_ip = (*s.tcp_conns.ptr(conn_idx)).remote_ip;
-            arp::pin(&mut s.arp_table, remote_ip);
+            arp::pin(arp_tab(s), remote_ip);
             // Piggybacked data (e.g. HTTP GET on the third handshake
             // ACK). Same gate as the regular RX_DATA path: don't ACK
             // payload the consumer didn't receive.
@@ -6018,6 +6961,20 @@ unsafe fn try_cookie_accept(
         s.tcp_syn_cookie_bad = s.tcp_syn_cookie_bad.wrapping_add(1);
         return CookieAccept::NotACookie;
     }
+    // No state was kept for the SYN this cookie answered, so the stream is
+    // judged again now it is installed: a policy that changed in between is
+    // the one honoured. Dropped silently, as at the SYN.
+    if dst_owned
+        && !policy_allows(
+            s,
+            ip_hdr.src_ip,
+            ip_hdr.dst_ip,
+            POLICY_PROTO_TCP,
+            tcp_hdr.dst_port,
+        )
+    {
+        return CookieAccept::Absorbed;
+    }
 
     let accept_idx: i32 = match alloc_free_slot(s) {
         Some(i) => i as i32,
@@ -6162,7 +7119,7 @@ unsafe fn send_tcp_control(s: &mut IpState, conn_idx: usize, flags: u8, retransm
         conn.snd_nxt
     };
 
-    let dst_mac = resolve_mac(s, remote_ip);
+    let dst_mac = resolve_mac_conn(s, conn_idx);
     let dst_mac = match dst_mac {
         Some(m) => m,
         None => {
@@ -6260,7 +7217,7 @@ unsafe fn send_tcp_data(
     let local_slot = (*s.tcp_conns.ptr(conn_idx)).local_slot;
     let local_src = local_ip_for_slot(s, local_slot);
 
-    let dst_mac = resolve_mac(s, remote_ip);
+    let dst_mac = resolve_mac_conn(s, conn_idx);
     let dst_mac = match dst_mac {
         Some(m) => m,
         None => return false,
@@ -6341,6 +7298,148 @@ fn is_broadcast_dst(dst: u32, local_ip: u32, netmask: u32) -> bool {
     host_bits == !netmask && net_bits == (local_ip & netmask)
 }
 
+/// Where endpoint `ep`'s datagram to `(dst_ip, dst_port)` leaves from.
+///
+/// The node's own endpoints, and every datagram delivered on this node,
+/// leave as bound. A workload's endpoint keeps a flow per peer it sends to
+/// (`flows.rs`) — refused `ENOBUFS` when its lane is at its floor and the
+/// shared part is spent. Bound to the workload's own address, it is reached
+/// there by its cluster; to a destination outside the cluster prefixes it
+/// leaves from the node's address and the endpoint's egress port, and the
+/// flow is what lets the reply back in.
+unsafe fn dg_route(s: &mut IpState, ep: usize, dst_ip: u32, dst_port: u16) -> Result<UdpTo, i8> {
+    let (slot, port, lane) = {
+        let c = &*s.tcp_conns.ptr(ep);
+        (c.local_slot, c.local_port, c.lane)
+    };
+    let mut to = UdpTo {
+        src_slot: slot,
+        src_port: port,
+        dst_ip,
+        dst_port,
+    };
+    let svc = service::lookup(s, POLICY_PROTO_UDP, dst_ip, dst_port);
+    if lane == 0 && svc.is_none() {
+        return Ok(to);
+    }
+    // The flow this datagram is on, by where it is sent: made, judged and
+    // pinned when it begins.
+    let fi = match flows::find(s, ep as u8, dst_ip, dst_port, false) {
+        Some(i) => i,
+        None => {
+            // A service address resolves to a backend first: the backend is
+            // what the far end, and its policy, sees.
+            let (peer_ip, peer_port) = match svc {
+                Some(v) => match service::pick(s, v, service::salt(s)) {
+                    Some(b) => b,
+                    None => return Err(-111), // ECONNREFUSED: no backends
+                },
+                None => (dst_ip, dst_port),
+            };
+            let local = local_delivery_slot(s, peer_ip).is_some();
+            let owned = slot != LOCAL_SLOT_ANY && slot != 0;
+            let via_egress =
+                !local && owned && !route::in_cluster(s, local_ip_for_slot(s, slot), peer_ip);
+            if lane != 0 {
+                let src = local_ip_for_slot(s, slot);
+                let dst_lane = match local_delivery_slot(s, peer_ip) {
+                    Some(ds) => dg_lane_for(s, ds, peer_port),
+                    None => 1, // off the node: forwarded, so judged
+                };
+                if dst_lane != 0 && !policy_allows(s, src, peer_ip, POLICY_PROTO_UDP, peer_port) {
+                    // Dropped, as the host's filter drops it: the sender is
+                    // not told, and the next datagram is judged afresh.
+                    return Err(0);
+                }
+            }
+            flows::make(
+                s,
+                flows::DgFlow {
+                    ep: ep as u8,
+                    lane,
+                    flags: flows::F_EGRESS
+                        | flows::F_ALLOW
+                        | if via_egress { flows::F_VIA_EGRESS } else { 0 },
+                    dst_ip,
+                    dst_port,
+                    peer_ip,
+                    peer_port,
+                    pin_gen: s.svc_gen,
+                    verdict_gen: s.filter_epoch,
+                    ..flows::DgFlow::EMPTY
+                },
+            )?
+        }
+    };
+    flows::touch(s, fi, false);
+    // A pin to a backend that has left its service re-picks.
+    if let Some(v) = svc {
+        let f = *flows::get(s, fi);
+        if f.pin_gen != s.svc_gen {
+            if service::has(s, v, f.peer_ip, f.peer_port) {
+                flows::get(s, fi).pin_gen = s.svc_gen;
+            } else {
+                match service::pick(s, v, service::salt(s)) {
+                    Some((a, p)) => flows::repin(s, fi, a, p, s.svc_gen),
+                    None => return Err(-111),
+                }
+            }
+        }
+    }
+    let f = *flows::get(s, fi);
+    to.dst_ip = f.peer_ip;
+    to.dst_port = f.peer_port;
+    if f.flags & flows::F_VIA_EGRESS != 0 {
+        to.src_slot = 0;
+        to.src_port = egress_port_of(s, ep)?;
+    }
+    Ok(to)
+}
+
+/// Endpoint `ep`'s egress port: drawn from the ephemeral allocator the first
+/// time it is needed and held, as a slot-0 binding counted in `port_ref`,
+/// until the endpoint closes — so it never shadows a port a node module
+/// binds, and nothing else is handed it.
+unsafe fn egress_port_of(s: &mut IpState, ep: usize) -> Result<u16, i8> {
+    let have = (*s.tcp_conns.ptr(ep)).egress_port;
+    if have != 0 {
+        return Ok(have);
+    }
+    let Some(p) = next_port(s) else {
+        return Err(-99); // EADDRNOTAVAIL
+    };
+    port_ref_inc(s, p);
+    (*s.tcp_conns.ptr_mut(ep)).egress_port = p;
+    Ok(p)
+}
+
+/// The workload endpoint whose egress port `port` is, if any.
+unsafe fn egress_endpoint(s: &IpState, port: u16) -> Option<usize> {
+    if port == 0 {
+        return None;
+    }
+    let mut i = 0;
+    while i < MAX_DG_ENDPOINTS && i < s.tcp_conns.len() {
+        let c = &*s.tcp_conns.ptr(i);
+        if c.is_datagram && c.state == tcp::TcpState::Listen && c.egress_port == port {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Where a datagram goes, and where it leaves from: the source's local slot
+/// (`LOCAL_SLOT_ANY` = the primary) and port, the destination address (host
+/// order) and port.
+#[derive(Clone, Copy)]
+struct UdpTo {
+    src_slot: u16,
+    src_port: u16,
+    dst_ip: u32,
+    dst_port: u16,
+}
+
 /// Send a UDP datagram. Used for CMD_SEND on Listen-state (bound) conns where
 /// the consumer supplies [dst_ip:4 LE][dst_port:2 LE][payload...], and for
 /// Established (connected) conns where remote_ip/port come from the conn slot.
@@ -6355,14 +7454,13 @@ fn is_broadcast_dst(dst: u32, local_ip: u32, netmask: u32) -> bool {
 /// must report to the consumer. The size bound is enforced BEFORE any copy:
 /// the command buffer is larger than `tx_frame` on aarch64, so a late check
 /// would already have run past the end of the frame buffer.
-unsafe fn send_udp_data(
-    s: &mut IpState,
-    dst_ip: u32,
-    dst_port: u16,
-    src_port: u16,
-    payload: *const u8,
-    payload_len: usize,
-) -> i8 {
+unsafe fn send_udp_data(s: &mut IpState, to: &UdpTo, payload: *const u8, payload_len: usize) -> i8 {
+    let UdpTo {
+        src_slot,
+        src_port,
+        dst_ip,
+        dst_port,
+    } = *to;
     if payload_len > MAX_UDP_TX_PAYLOAD {
         s.drops.udp_oversize = s.drops.udp_oversize.wrapping_add(1);
         return E_MSGSIZE;
@@ -6372,6 +7470,32 @@ unsafe fn send_udp_data(
         if payload_len == 0 {
             s.drops.udp_empty = s.drops.udp_empty.wrapping_add(1);
         }
+        return 0;
+    }
+
+    // The source: the endpoint's own address when it is bound to one (a
+    // reply from a bound secondary carries that secondary), else the
+    // primary.
+    let src_ip = if src_slot == LOCAL_SLOT_ANY {
+        s.local_ip
+    } else {
+        local_ip_for_slot(s, src_slot)
+    };
+
+    // Same-node delivery: a datagram to an address this node answers for
+    // never reaches the wire. It is delivered as the wire would deliver it,
+    // with its source, after packet policy.
+    // (A workload's datagram was judged when its flow began, `dg_route`.)
+    if let Some(dst_slot) = local_delivery_slot(s, dst_ip) {
+        s.drops.udp_local = s.drops.udp_local.wrapping_add(1);
+        let a = DgAddr {
+            src_ip,
+            src_port,
+            dst_slot,
+            dst_port,
+            wire: false,
+        };
+        udp_demux(s, &a, payload, payload_len);
         return 0;
     }
 
@@ -6415,7 +7539,7 @@ unsafe fn send_udp_data(
         src_port,
         dst_port,
         payload_len,
-        s.local_ip,
+        src_ip,
         dst_ip,
         payload_dst,
     );
@@ -6423,14 +7547,7 @@ unsafe fn send_udp_data(
     let ip_total = (ipv4::IPV4_HEADER_LEN + udp::UDP_HEADER_LEN + payload_len) as u16;
     let ip_start = s.tx_frame.as_mut_ptr().add(eth::ETH_HEADER_LEN);
     s.ip_id = s.ip_id.wrapping_add(1);
-    ipv4::build_ipv4_header(
-        ip_start,
-        ip_total,
-        ipv4::PROTO_UDP,
-        s.local_ip,
-        dst_ip,
-        s.ip_id,
-    );
+    ipv4::build_ipv4_header(ip_start, ip_total, ipv4::PROTO_UDP, src_ip, dst_ip, s.ip_id);
 
     eth::build_eth_header(
         s.tx_frame.as_mut_ptr(),
@@ -6453,7 +7570,7 @@ unsafe fn send_udp_data(
 /// correlated reply lands, so an entry seeded before this point — including
 /// one an attacker raced in ahead of the lease — is never the one promoted.
 unsafe fn arm_gateway_pin(s: &mut IpState, gw: u32) {
-    arp::invalidate(&mut s.arp_table, gw);
+    arp::invalidate(arp_tab(s), gw);
     s.gw_pin_pending = true;
     s.gw_pin_ip = gw;
     s.gw_pin_armed_step = s.step_count;
@@ -6487,14 +7604,14 @@ unsafe fn step_arp_maintenance(s: &mut IpState) {
         }
     }
 
-    let revalidations = arp::age_entries(&mut s.arp_table);
+    let revalidations = arp::age_entries(arp_tab(s));
     if revalidations > 0 {
         s.drops.arp_pin_revalidate = s.drops.arp_pin_revalidate.wrapping_add(revalidations);
     }
 
     // A permanent pin that has gone unconfirmed must be re-earned by a live
     // exchange rather than trusted indefinitely.
-    if let Some(ip) = arp::revalidation_due(&s.arp_table) {
+    if let Some(ip) = arp::revalidation_due(arp_tab(s)) {
         if ip == s.gateway && s.gateway != 0 && !s.gw_pin_pending {
             arm_gateway_pin(s, s.gateway);
             return;
@@ -6506,7 +7623,7 @@ unsafe fn step_arp_maintenance(s: &mut IpState) {
     if s.gw_pin_pending
         && s.gw_pin_ip != 0
         && s.arp_pending_state == arp::ARP_PENDING_NONE
-        && arp::lookup(&s.arp_table, s.gw_pin_ip).is_none()
+        && arp::lookup(arp_tab(s), s.gw_pin_ip).is_none()
     {
         let gw = s.gw_pin_ip;
         let _ = resolve_mac(s, gw);
@@ -6518,6 +7635,10 @@ unsafe fn step_arp_maintenance(s: &mut IpState) {
 /// off-subnet destination with no gateway configured. ARPing directly for
 /// such a destination would let anything on the local segment answer for an
 /// address it does not own, so the send fails with `ENETUNREACH` instead.
+///
+/// Ahead of the gateway, the node's peer routes (`net.route` ROUTES): a
+/// destination inside a peer node's prefix goes to that node directly, the
+/// longest matching prefix first.
 fn next_hop(s: &IpState, dst: u32) -> Option<u32> {
     if dst == 0xFFFF_FFFF {
         return Some(dst);
@@ -6525,10 +7646,46 @@ fn next_hop(s: &IpState, dst: u32) -> Option<u32> {
     if s.netmask == 0 || (dst & s.netmask) == (s.local_ip & s.netmask) {
         return Some(dst);
     }
+    // SAFETY: the route table is this module's heap, sized at construction.
+    if let Some(peer) = unsafe { route::route_peer(s, dst) } {
+        return Some(peer);
+    }
     if s.gateway != 0 {
         Some(s.gateway)
     } else {
         None
+    }
+}
+
+/// The next hop of connection `idx`'s segments: cached on the connection
+/// under the route epoch, so a stream looks it up once per table change.
+unsafe fn conn_next_hop(s: &mut IpState, idx: usize) -> Option<u32> {
+    if idx >= s.tcp_conns.len() {
+        return None;
+    }
+    let epoch = s.route_epoch;
+    let (cached, at, remote) = {
+        let c = &*s.tcp_conns.ptr(idx);
+        (c.nh_ip, c.nh_epoch, c.remote_ip)
+    };
+    if cached != 0 && at == epoch {
+        return Some(cached);
+    }
+    let nh = next_hop(s, remote)?;
+    let c = &mut *s.tcp_conns.ptr_mut(idx);
+    c.nh_ip = nh;
+    c.nh_epoch = epoch;
+    Some(nh)
+}
+
+/// The MAC connection `idx`'s segments go to.
+unsafe fn resolve_mac_conn(s: &mut IpState, idx: usize) -> Option<[u8; 6]> {
+    match conn_next_hop(s, idx) {
+        Some(nh) => resolve_next_hop(s, nh),
+        None => {
+            s.drops.route_unreachable = s.drops.route_unreachable.wrapping_add(1);
+            None
+        }
     }
 }
 
@@ -6539,8 +7696,8 @@ unsafe fn resolve_mac(s: &mut IpState, ip: u32) -> Option<[u8; 6]> {
         return Some(eth::BROADCAST_MAC);
     }
 
-    // Off-subnet destinations route through the default gateway; with no
-    // gateway there is no route at all (see `next_hop`).
+    // Off-subnet destinations route through a peer route or the default
+    // gateway; with neither there is no route at all (see `next_hop`).
     let target_ip = match next_hop(s, ip) {
         Some(nh) => nh,
         None => {
@@ -6548,9 +7705,17 @@ unsafe fn resolve_mac(s: &mut IpState, ip: u32) -> Option<[u8; 6]> {
             return None;
         }
     };
+    resolve_next_hop(s, target_ip)
+}
+
+/// The MAC of next hop `target_ip`: cached, or an ARP request started.
+unsafe fn resolve_next_hop(s: &mut IpState, target_ip: u32) -> Option<[u8; 6]> {
+    if target_ip == 0xFFFF_FFFF {
+        return Some(eth::BROADCAST_MAC);
+    }
 
     // Check ARP table
-    if let Some(mac) = arp::lookup(&s.arp_table, target_ip) {
+    if let Some(mac) = arp::lookup(arp_tab(s), target_ip) {
         return Some(mac);
     }
 
@@ -6939,15 +8104,170 @@ fn state_allows_send(state: tcp::TcpState) -> bool {
 /// close); from CloseWait → LAST_ACK (peer FIN'd first). State only
 /// advances on successful FIN queue, so a backpressured FIN doesn't
 /// strand the conn in FinWait1 with no frame on the wire.
+/// The local-address slot a dial to `ip` is delivered to on this node, if
+/// it is one: 127.0.0.1 and the primary are slot 0; any other installed
+/// address that is armed is its own slot. A disarmed or fenced address is
+/// not local — the node is not answering for it.
+fn local_delivery_slot(s: &IpState, ip: u32) -> Option<u16> {
+    if ip == 0x7F00_0001 {
+        return Some(0);
+    }
+    if s.local_ip == 0 {
+        return None;
+    }
+    let slot = local_slot_for_dst(s, ip)?;
+    if slot == 0 || s.local_addrs[slot as usize].flags & ADDR_FLAG_ARMED != 0 {
+        Some(slot)
+    } else {
+        None
+    }
+}
+
+/// The local-address slot a stream or datagram from the lane being served
+/// is sourced from when it is delivered on this node: the lane owner's own
+/// address when it has one, else the primary.
+fn source_slot_for_lane(s: &IpState) -> u16 {
+    // SAFETY: `cur_lane` names a lane the table holds.
+    match unsafe { lane_owner_slot(s, s.cur_lane) } {
+        LOCAL_SLOT_ANY => 0,
+        slot => slot,
+    }
+}
+
+/// The address slot lane `lane`'s owner holds (`LOCAL_SLOT_ANY` for the
+/// node's lane, or an owner with no address of its own), cached on the lane
+/// under the address-table epoch and looked up again when an address is
+/// installed or removed.
+unsafe fn lane_owner_slot(s: &IpState, lane: u8) -> u16 {
+    let Some(l) = lane_at(s, lane) else {
+        return LOCAL_SLOT_ANY;
+    };
+    if l.src_epoch != s.addr_epoch || l.src_epoch == 0 {
+        l.src_slot = slot_for_owner(s, l.owner_slot).unwrap_or(LOCAL_SLOT_ANY);
+        l.src_epoch = s.addr_epoch.max(1);
+    }
+    l.src_slot
+}
+
+/// Where a stream or datagram from lane `lane` to `dst` leaves from: the
+/// owner's own address for a destination inside its segment's cluster
+/// prefixes (so the far end — and its packet policy — sees the workload),
+/// else the node's primary. The node's own lane always leaves from the
+/// primary.
+unsafe fn source_for(s: &IpState, lane: u8, dst: u32) -> u16 {
+    let slot = lane_owner_slot(s, lane);
+    if slot == LOCAL_SLOT_ANY || slot == 0 {
+        return 0;
+    }
+    if route::in_cluster(s, local_ip_for_slot(s, slot), dst) {
+        slot
+    } else {
+        0
+    }
+}
+
+// ── Packet policy (the evaluator is `policy.rs`) ──
+
+const POLICY_PROTO_ICMP: u8 = 1;
+const POLICY_PROTO_TCP: u8 = 6;
+const POLICY_PROTO_UDP: u8 = 17;
+
+/// Whether packet policy lets a same-node stream or datagram from `src`
+/// (sent by lane `src_lane`) reach `dst` (lane `dst_lane`) on `dport`.
+///
+/// Judged as the host's forward hook judges traffic between two of its
+/// workloads; anything the node itself sends (lane 0), or that reaches the
+/// node's own endpoints, is not forwarded and is exempt.
+unsafe fn policy_admits_local(
+    s: &mut IpState,
+    src: u32,
+    dst: u32,
+    proto: u8,
+    dport: u16,
+    src_lane: u8,
+    dst_lane: u8,
+) -> bool {
+    if src_lane == 0 || dst_lane == 0 {
+        return true;
+    }
+    policy_allows(s, src, dst, proto, dport)
+}
+
+/// Whether packet policy passes a flow's first packet.
+#[inline(always)]
+unsafe fn policy_allows(s: &mut IpState, src: u32, dst: u32, proto: u8, dport: u16) -> bool {
+    if s.pol_n == 0 {
+        return true;
+    }
+    let p = abi::contracts::net::policy::Packet {
+        src,
+        dst,
+        proto,
+        dport,
+    };
+    policy::allows(s, &p)
+}
+
+/// The lane of the datagram endpoint a same-node datagram to
+/// `(dst_slot, port)` would reach (0 when none, or the node's).
+unsafe fn dg_lane_for(s: &IpState, dst_slot: u16, port: u16) -> u8 {
+    let dst_owned = slot_is_owned(s, dst_slot);
+    let mut i = 0;
+    while i < MAX_DG_ENDPOINTS {
+        let c = &*s.tcp_conns.ptr(i);
+        if c.is_datagram
+            && c.state == tcp::TcpState::Listen
+            && c.local_port == port
+            && (c.local_slot == dst_slot || (c.local_slot == LOCAL_SLOT_ANY && !dst_owned))
+        {
+            return c.lane;
+        }
+        i += 1;
+    }
+    0
+}
+
 /// Serve a CMD_CONNECT_TO addressed to this host (see `loopback_peer`):
-/// find the local listener, bind a conn-slot PAIR as `Established`,
-/// and notify both consumers. Failure surfaces exactly like the TCP
-/// path's: ECONNREFUSED when nothing listens, ENOMEM when the table
-/// is full — a consumer cannot tell the fastpath from a real connect.
-unsafe fn connect_loopback(s: &mut IpState, port: u16, requester_tag: RequesterTag) {
+/// find the listener the SYN demux would — `(dst slot, dst_owned)`, so an
+/// owned workload address is served only by a listener bound to it — bind
+/// a conn-slot PAIR as `Established`, and notify both consumers. Failure
+/// surfaces exactly like the TCP path's: ECONNREFUSED when nothing listens,
+/// EPERM when packet policy refuses the stream, ENOMEM when the table is full,
+/// ENOBUFS when the dialling lane holds its declared fast-path pairs — a
+/// consumer cannot tell the fastpath from a real connect.
+///
+/// The halves keep `remote_ip == 0`: that is what identifies a pair to
+/// every path that must treat one specially (indexing, ARP pinning, close,
+/// continuity). Each half's peer is derived from the other.
+unsafe fn connect_loopback(s: &mut IpState, dst_slot: u16, port: u16, requester_tag: RequesterTag) {
+    let dst_owned = slot_is_owned(s, dst_slot);
     // A listener must exist BEFORE the pair is allocated.
-    if find_listener_indexed(s, port, tcp::LOCAL_SLOT_ANY, false).is_none() {
+    let Some(li) = find_listener_indexed(s, port, dst_slot, dst_owned) else {
         let _ = net_send_reply_error(s, -111, requester_tag); // ECONNREFUSED
+        return;
+    };
+    let src_slot = source_slot_for_lane(s);
+    let listener_lane = (*s.tcp_conns.ptr(li)).lane;
+    let dialler_lane = s.cur_lane;
+    // Packet policy judges the stream once, at connect, as a SYN between
+    // the two addresses would be judged on the wire.
+    let src_ip = local_ip_for_slot(s, src_slot);
+    let dst_ip = local_ip_for_slot(s, dst_slot);
+    if !policy_admits_local(
+        s,
+        src_ip,
+        dst_ip,
+        POLICY_PROTO_TCP,
+        port,
+        dialler_lane,
+        listener_lane,
+    ) {
+        let _ = net_send_reply_error(s, -1, requester_tag); // EPERM, as a dropped connect
+        return;
+    }
+    let cap = s.lane_pairs as u16;
+    if lane_state(s, dialler_lane).pairs >= cap || lane_state(s, listener_lane).pairs >= cap {
+        let _ = net_send_reply_error(s, -105, requester_tag); // ENOBUFS
         return;
     }
 
@@ -6972,6 +8292,7 @@ unsafe fn connect_loopback(s: &mut IpState, port: u16, requester_tag: RequesterT
             return;
         }
     };
+    let listener_owner = (*s.tcp_conns.ptr(li)).owner_tag;
 
     // Established immediately — there is no handshake to perform.
     // `remote_ip` stays 0 so no close path ever touches the ARP table
@@ -6982,26 +8303,26 @@ unsafe fn connect_loopback(s: &mut IpState, port: u16, requester_tag: RequesterT
         c.remote_ip = 0;
         c.remote_port = port;
         c.local_port = local_port;
-        c.local_slot = 0;
+        c.local_slot = src_slot;
         c.connect_tag = requester_tag;
         c.retransmit_timer = 0;
+        c.lane = dialler_lane;
     }
+    stamp_dial(s, ci);
     {
+        // The accepted half takes the listener's lane, owner and port, and
+        // the address the dial reached.
         let v = &mut *s.tcp_conns.ptr_mut(si);
         v.state = tcp::TcpState::Established;
         v.remote_ip = 0;
         v.remote_port = local_port;
         v.local_port = port;
-        v.local_slot = 0;
+        v.local_slot = dst_slot;
+        v.owner_tag = listener_owner;
         v.connect_tag = REQUESTER_TAG_NONE;
         v.retransmit_timer = 0;
+        v.lane = listener_lane;
     }
-    // Both slots go through the same admission `conn_reset` undoes. A
-    // loopback pair is not keyed (`remote_ip == 0`), does not listen and is
-    // not half-open, so the only thing this does is take the port
-    // references teardown gives back — and taking them anywhere else would
-    // put the two halves out of step, which reads as a listener's port
-    // falling to zero while the listener is still bound.
     // Both slots go through the same admission `conn_reset` undoes. A
     // loopback pair is not keyed (`remote_ip == 0`), does not listen and is
     // not half-open, so the only thing this does is take the port
@@ -7010,16 +8331,17 @@ unsafe fn connect_loopback(s: &mut IpState, port: u16, requester_tag: RequesterT
     // falling to zero while the listener is still bound.
     conn_index_insert(s, ci);
     conn_index_insert(s, si);
-    s.loopback_peer[ci] = si as i32;
-    s.loopback_peer[si] = ci as i32;
+    *s.loopback_peer.as_mut_ptr().add(ci) = si as i32;
+    *s.loopback_peer.as_mut_ptr().add(si) = ci as i32;
+    lane_state(s, dialler_lane).pairs += 1;
+    lane_state(s, listener_lane).pairs += 1;
 
     // Listener first (it filters MSG_ACCEPTED by `local_port`), then
-    // the connector. `net_send_or_queue` holds these across full
-    // rings; if even the queue is full, tear the pair down — half a
-    // notification would strand one side forever.
-    if !net_send_accepted(s, si as u16, port) || !net_send_connected(s, ci as u16) {
-        s.loopback_peer[ci] = -1;
-        s.loopback_peer[si] = -1;
+    // the connector, each with its peer report. If either lane cannot take
+    // its announcement, tear the pair down — half a notification would
+    // strand one side forever.
+    if !net_announce(s, si as u16, true, port) || !net_send_connected(s, ci as u16) {
+        loopback_unpair(s, ci);
         conn_reset(s, ci);
         conn_reset(s, si);
         let _ = net_send_reply_error(s, -12, requester_tag);
@@ -7028,19 +8350,37 @@ unsafe fn connect_loopback(s: &mut IpState, port: u16, requester_tag: RequesterT
     log_info(s, b"[ip] loopback pair");
 }
 
+/// Break the pair link of fast-path half `idx` and its partner, and give
+/// back both halves' count. Teardown of the slots is the caller's.
+unsafe fn loopback_unpair(s: &mut IpState, idx: usize) {
+    let p = *s.loopback_peer.as_ptr().add(idx);
+    *s.loopback_peer.as_mut_ptr().add(idx) = -1;
+    let l = conn_lane(s, idx);
+    let st = lane_state(s, l);
+    st.pairs = st.pairs.saturating_sub(1);
+    if p >= 0 && (p as usize) < s.tcp_conns.len() {
+        let pi = p as usize;
+        *s.loopback_peer.as_mut_ptr().add(pi) = -1;
+        let pl = conn_lane(s, pi);
+        let pst = lane_state(s, pl);
+        pst.pairs = pst.pairs.saturating_sub(1);
+    }
+}
+
 /// Tear down a loopback pair from either end: both consumers get
 /// MSG_CLOSED, both slots free. Mirrors a FIN'd TCP close as seen
 /// from the net-proto surface.
 unsafe fn close_loopback(s: &mut IpState, conn_id: usize) {
-    let peer = s.loopback_peer[conn_id];
-    s.loopback_peer[conn_id] = -1;
-    conn_reset(s, conn_id);
+    let peer = *s.loopback_peer.as_ptr().add(conn_id);
+    loopback_unpair(s, conn_id);
+    // MSG_CLOSED goes to each half's lane before the slot is released (a
+    // released slot has no lane to route by).
     let _ = net_send_closed(s, conn_id as u16);
-    if peer >= 0 {
+    conn_reset(s, conn_id);
+    if peer >= 0 && (peer as usize) < s.tcp_conns.len() {
         let pi = peer as usize;
-        s.loopback_peer[pi] = -1;
-        conn_reset(s, pi);
         let _ = net_send_closed(s, peer as u16);
+        conn_reset(s, pi);
     }
 }
 
@@ -7088,7 +8428,7 @@ unsafe fn process_cmd_close(s: &mut IpState, conn_id: usize) -> bool {
             // Already closing/closed — reset and notify
             let remote_ip = (*s.tcp_conns.ptr(conn_id)).remote_ip;
             if remote_ip != 0 {
-                arp::unpin(&mut s.arp_table, remote_ip);
+                arp::unpin(arp_tab(s), remote_ip);
             }
             conn_reset(s, conn_id);
             net_send_closed(s, conn_id as u16);
@@ -7219,6 +8559,7 @@ unsafe fn addr_ctl_add(
                 return;
             };
             s.addr_generation = s.addr_generation.wrapping_add(1);
+            s.addr_epoch = s.addr_epoch.wrapping_add(1).max(1);
             let generation = s.addr_generation;
             let armed = flags & netid::install::DISARMED == 0;
             let a = &mut s.local_addrs[i];
@@ -7272,6 +8613,7 @@ unsafe fn addr_ctl_del(s: &mut IpState, ipv4: u32) {
                 |i| index::mix32((*addrs.add(i)).ipv4() ^ seed),
             );
             s.local_addrs[slot as usize] = LocalAddr::empty();
+            s.addr_epoch = s.addr_epoch.wrapping_add(1).max(1);
             log_info(s, b"[ip] addr_ctl del");
         }
         _ => {}
@@ -7345,14 +8687,19 @@ unsafe fn service_net_channels(s: &mut IpState) {
     s.cur_lane = 0;
     service_net_channel(s);
     let shared_in = s.net_in_chan;
-    let mut i = 0;
-    while i < NET_LANES {
-        if s.lanes[i].active != 0 {
-            s.net_in_chan = s.lanes[i].cmd;
-            s.cur_lane = (i + 1) as u8;
-            service_net_channel(s);
+    let mut lane = 1u8;
+    while lane <= s.lane_cap {
+        if let Some(l) = lane_at(s, lane) {
+            if l.active != 0 {
+                s.net_in_chan = l.cmd;
+                s.cur_lane = lane;
+                service_net_channel(s);
+            }
         }
-        i += 1;
+        if lane == u8::MAX {
+            break;
+        }
+        lane += 1;
     }
     s.net_in_chan = shared_in;
     s.cur_lane = 0;
@@ -7380,7 +8727,9 @@ unsafe fn lane_may_command(s: &IpState, msg_type: u8, p: *const u8, plen: usize)
 /// the owner drains or is gone, and refused for a port the committed plan
 /// does not lease to it.
 unsafe fn lane_bind_target(s: &IpState, protocol: u8, port: u16) -> Result<(u16, u16), i8> {
-    let l = s.lanes[s.cur_lane as usize - 1];
+    let Some(l) = lane_at(s, s.cur_lane).map(|l| *l) else {
+        return Err(-13); // EACCES: no such lane
+    };
     let mut req = [0u8; net_lane::ADMIT_LEN];
     req[0..2].copy_from_slice(&l.owner_slot.to_le_bytes());
     req[4..8].copy_from_slice(&l.owner_gen.to_le_bytes());
@@ -7405,12 +8754,37 @@ fn listen_slots_overlap(s: &IpState, a: u16, b: u16) -> bool {
         || (b == LOCAL_SLOT_ANY && !slot_is_owned(s, a))
 }
 
+/// Lanes attached now.
+unsafe fn lanes_active(s: &IpState) -> u32 {
+    let mut n = 0u32;
+    let mut j = 1u8;
+    while j <= s.lane_cap {
+        if lane_at(s, j).is_some_and(|l| l.active != 0) {
+            n += 1;
+        }
+        if j == u8::MAX {
+            break;
+        }
+        j += 1;
+    }
+    n
+}
+
+/// A lane has just attached at index `lane`: it starts with nothing of the
+/// last workload that held the index.
+unsafe fn lane_opened(s: &mut IpState, lane: u8) {
+    let st = lane_state(s, lane);
+    st.valid = 0;
+    st.close_valid = 0;
+}
+
 /// Take the lane changes the kernel queued (`net_attach`): claim the
 /// provider role once, then attach and detach as recorded.
 unsafe fn lanes_take(s: &mut IpState) {
     let sys = &*s.syscalls;
     if s.lane_provider == 0 {
-        let rc = (sys.provider_call)(-1, NET_PROVIDE, core::ptr::null_mut(), 0);
+        let mut cap = [s.lane_cap];
+        let rc = (sys.provider_call)(-1, NET_PROVIDE, cap.as_mut_ptr(), cap.len());
         s.lane_provider = if rc == 0 { 1 } else { 2 };
         if rc == 0 {
             log_info(s, b"[ip] net lanes: provider");
@@ -7419,8 +8793,10 @@ unsafe fn lanes_take(s: &mut IpState) {
     if s.lane_provider != 1 {
         return;
     }
+    // Every change the kernel can have queued: an attach and a detach per
+    // lane at most.
     let mut n = 0;
-    while n < NET_LANES {
+    while n < 2 * s.lane_cap as usize {
         let mut r = [0u8; net_lane::RECORD_LEN];
         let rc = (sys.provider_call)(-1, NET_LANE_TAKE, r.as_mut_ptr(), net_lane::RECORD_LEN);
         if rc != net_lane::RECORD_LEN as i32 {
@@ -7434,19 +8810,24 @@ unsafe fn lanes_take(s: &mut IpState) {
             net_lane::OP_ATTACH => {
                 let cmd = i32::from_le_bytes(rd32(net_lane::OFF_COMMANDS));
                 let evt = i32::from_le_bytes(rd32(net_lane::OFF_EVENTS));
-                let mut j = 0;
-                while j < NET_LANES && s.lanes[j].active != 0 {
+                let mut j = 1u8;
+                while j <= s.lane_cap && lane_at(s, j).is_some_and(|l| l.active != 0) {
+                    if j == u8::MAX {
+                        break;
+                    }
                     j += 1;
                 }
-                if j < NET_LANES {
-                    s.lanes[j] = NetLane {
+                if let Some(l) = lane_at(s, j).filter(|l| l.active == 0) {
+                    *l = NetLane {
                         active: 1,
                         key: r[net_lane::OFF_KEY],
                         owner_slot,
                         owner_gen,
                         cmd,
                         evt,
+                        ..NetLane::EMPTY
                     };
+                    lane_opened(s, j);
                     s.lane_attached = s.lane_attached.wrapping_add(1);
                     log_info(s, b"[ip] net lane attached");
                 } else {
@@ -7455,14 +8836,21 @@ unsafe fn lanes_take(s: &mut IpState) {
                 }
             }
             net_lane::OP_DETACH => {
-                let mut j = 0;
-                while j < NET_LANES {
-                    let l = s.lanes[j];
-                    if l.active != 0 && l.owner_slot == owner_slot && l.owner_gen == owner_gen {
-                        lane_close(s, (j + 1) as u8);
-                        s.lanes[j].active = 0;
+                let mut j = 1u8;
+                while j <= s.lane_cap {
+                    let held = lane_at(s, j).is_some_and(|l| {
+                        l.active != 0 && l.owner_slot == owner_slot && l.owner_gen == owner_gen
+                    });
+                    if held {
+                        lane_close(s, j);
+                        if let Some(l) = lane_at(s, j) {
+                            *l = NetLane::EMPTY;
+                        }
                         s.lane_detached = s.lane_detached.wrapping_add(1);
                         log_info(s, b"[ip] net lane detached");
+                    }
+                    if j == u8::MAX {
+                        break;
                     }
                     j += 1;
                 }
@@ -7480,22 +8868,27 @@ unsafe fn lanes_take(s: &mut IpState) {
 /// the next lane this index, to another workload, which must receive nothing
 /// of this one's.
 unsafe fn lane_close(s: &mut IpState, lane: u8) {
-    let evt = lane_evt(s, lane);
-    let mut q = 0;
-    while q < NET_OUT_QUEUE_SLOTS {
-        if evt >= 0 && s.pending_net_out_chans[q] == evt {
-            s.pending_net_out_chans[q] = -1;
-        }
-        q += 1;
-    }
-    let mut d = 0;
-    while d < MAX_DNS_PENDING {
-        let e = &*s.dns_pending.as_ptr().add(d);
-        if e.flags & DNS_PEND_ACTIVE != 0 && e.lane == lane {
+    ev_discard_lane(s, lane);
+    // The lane's resolver partition: its queries in flight are cancelled
+    // and its answers forgotten, so the next workload on this lane index
+    // inherits none of them.
+    let (p0, pn) = dns_pending_part(s, lane);
+    let mut d = p0;
+    while d < p0 + pn {
+        if dns_pending_at(s, d).flags & DNS_PEND_ACTIVE != 0 {
             resolver_clear(s, d);
         }
         d += 1;
     }
+    let (c0, cn) = dns_cache_part(s, lane);
+    let mut c = c0;
+    while c < c0 + cn {
+        *dns_cache_at(s, c) = DnsCacheEntry::EMPTY;
+        c += 1;
+    }
+    let st = lane_state(s, lane);
+    st.valid = 0;
+    st.close_valid = 0;
     let mut idx = 0;
     while idx < s.tcp_conns.len() {
         let (mine, live, dg) = {
@@ -7531,7 +8924,7 @@ unsafe fn service_net_channel(s: &mut IpState) {
     // reading more while we can't queue the responses just risks
     // overflow. The pause propagates backpressure into the
     // consumer's write to `net_in_chan`.
-    if NET_OUT_QUEUE_SLOTS - s.pending_net_out_count as usize <= NET_OUT_QUEUE_HEADROOM {
+    if lane_intake_paused(s) {
         s.pend_txq_steps = s.pend_txq_steps.wrapping_add(1);
         return;
     }
@@ -7540,18 +8933,19 @@ unsafe fn service_net_channel(s: &mut IpState) {
     // Holding off on the read propagates backpressure to the consumer
     // (its `channel_write` into `net_in_chan` stalls when the ring
     // fills).
-    if s.pending_cmd_valid != 0 {
-        let conn_id = s.pending_cmd_conn as usize;
-        let total_len = s.pending_cmd_len as usize;
-        let off = s.pending_cmd_off as usize;
-        let new_off = try_send_cmd_payload(s, conn_id, s.pending_cmd_buf.as_ptr(), total_len, off);
+    let st = lane_state(s, s.cur_lane);
+    if st.valid != 0 {
+        let conn_id = st.conn as usize;
+        let total_len = st.len as usize;
+        let off = st.off as usize;
+        let new_off = try_send_cmd_payload(s, conn_id, st.buf.as_ptr(), total_len, off);
         if new_off >= total_len {
-            s.pending_cmd_valid = 0;
-            s.pending_cmd_off = 0;
-            s.pending_cmd_len = 0;
+            st.valid = 0;
+            st.off = 0;
+            st.len = 0;
             s.tx_cmd_items = s.tx_cmd_items.wrapping_add(1);
         } else {
-            s.pending_cmd_off = new_off as u16;
+            st.off = new_off as u16;
             s.pend_cmd_steps = s.pend_cmd_steps.wrapping_add(1);
             return;
         }
@@ -7562,10 +8956,10 @@ unsafe fn service_net_channel(s: &mut IpState) {
     // If `process_cmd_close` couldn't queue the FIN, leave the slot
     // valid and retry next tick — state stays sendable until the FIN
     // is actually on the wire.
-    if s.pending_close_valid != 0 {
-        let conn_id = s.pending_close_conn as usize;
+    if st.close_valid != 0 {
+        let conn_id = st.close_conn as usize;
         if process_cmd_close(s, conn_id) {
-            s.pending_close_valid = 0;
+            st.close_valid = 0;
         } else {
             return;
         }
@@ -7586,7 +8980,7 @@ unsafe fn service_net_channel(s: &mut IpState) {
         // Headroom check has to repeat every iteration: each command
         // synthesises a control event, and a once-per-call gate would
         // let a burst run the queue dry mid-loop.
-        if NET_OUT_QUEUE_SLOTS - s.pending_net_out_count as usize <= NET_OUT_QUEUE_HEADROOM {
+        if lane_intake_paused(s) {
             break;
         }
         let mut frame = [0u8; NET_FRAME_HDR + PENDING_CMD_BUF_SIZE];
@@ -7804,15 +9198,16 @@ unsafe fn service_net_channel(s: &mut IpState) {
                                 // the same offsets, and stop reading
                                 // — backpressure must propagate to
                                 // the consumer.
+                                let st = lane_state(s, s.cur_lane);
                                 core::ptr::copy_nonoverlapping(
                                     buf.as_ptr(),
-                                    s.pending_cmd_buf.as_mut_ptr(),
+                                    st.buf.as_mut_ptr(),
                                     total_len,
                                 );
-                                s.pending_cmd_conn = conn_id as u16;
-                                s.pending_cmd_off = new_off as u16;
-                                s.pending_cmd_len = total_len as u16;
-                                s.pending_cmd_valid = 1;
+                                st.conn = conn_id as u16;
+                                st.off = new_off as u16;
+                                st.len = total_len as u16;
+                                st.valid = 1;
                                 s.pend_cmd_steps = s.pend_cmd_steps.wrapping_add(1);
                                 return;
                             }
@@ -7833,10 +9228,11 @@ unsafe fn service_net_channel(s: &mut IpState) {
                     let conn_id =
                         u16::from_le_bytes([*buf.as_ptr(), *buf.as_ptr().add(1)]) as usize;
                     if conn_id < s.tcp_conns.len()
-                        && (s.pending_cmd_valid != 0 || !process_cmd_close(s, conn_id))
+                        && (lane_state(s, s.cur_lane).valid != 0 || !process_cmd_close(s, conn_id))
                     {
-                        s.pending_close_valid = 1;
-                        s.pending_close_conn = conn_id as u16;
+                        let st = lane_state(s, s.cur_lane);
+                        st.close_valid = 1;
+                        st.close_conn = conn_id as u16;
                         return;
                     }
                 }
@@ -7873,6 +9269,18 @@ unsafe fn service_net_channel(s: &mut IpState) {
                         None
                     };
                     let owner_tag = lane_target.map_or(payload_tag, |t| t.0);
+                    // A lane holds at most its quota of endpoints: the
+                    // endpoint id is a u8 every lane draws from, so one
+                    // workload cannot take the ids the others need.
+                    if s.cur_lane != 0
+                        && lane_endpoint_count(s, s.cur_lane) >= s.lane_endpoints as usize
+                        && dg_bind_existing(s, req_port, s.cur_lane).is_none()
+                    {
+                        s.lane_ep_refused = s.lane_ep_refused.wrapping_add(1);
+                        dg_send_error(s, 0, -24); // EMFILE
+                        count += 1;
+                        continue;
+                    }
                     // Resolve the owner's address slot before drawing a port:
                     // a bind that is going to be refused must not consume an
                     // ephemeral allocation.
@@ -7969,6 +9377,7 @@ unsafe fn service_net_channel(s: &mut IpState) {
                 // the variable-length data rather than after it.
                 let bp = buf.as_ptr();
                 let (claimed_tag, dest_off) = dg_decode_owner_tag(bp, plen);
+                let claimed_tag = lane_claim(s, claimed_tag);
                 if plen > dest_off {
                     let ep_id = *bp as usize;
                     let af = *bp.add(dest_off);
@@ -8039,7 +9448,11 @@ unsafe fn service_net_channel(s: &mut IpState) {
                     {
                         let udp_data = bp.add(data_off);
                         let udp_len = plen - data_off;
-                        let rv = send_udp_data(s, dst_ip, dst_port, local_port, udp_data, udp_len);
+                        let _ = local_port;
+                        let rv = match dg_route(s, ep_id, dst_ip, dst_port) {
+                            Ok(to) => send_udp_data(s, &to, udp_data, udp_len),
+                            Err(e) => e,
+                        };
                         if rv != 0 {
                             dg_send_error(s, ep_id as u8, rv);
                         }
@@ -8053,6 +9466,7 @@ unsafe fn service_net_channel(s: &mut IpState) {
                     let bp = buf.as_ptr();
                     let ep_id = *bp as usize;
                     let (claimed_tag, _) = dg_decode_owner_tag(bp, plen);
+                    let claimed_tag = lane_claim(s, claimed_tag);
                     let live = ep_id < MAX_DG_ENDPOINTS && {
                         let conn = &*s.tcp_conns.ptr(ep_id);
                         conn.is_datagram && conn.state == tcp::TcpState::Listen
@@ -8095,10 +9509,41 @@ type RequesterTag = abi::contracts::net::net_proto::RequesterTag;
 /// the local-delivery fastpath; anything else takes a slot, an ephemeral
 /// port and a SYN. Failure is reported as `MSG_ERROR` on `requester_tag`.
 unsafe fn connect_v4(s: &mut IpState, ip: u32, port: u16, requester_tag: RequesterTag) {
+    // A dial to a service address goes to one of its backends, chosen once
+    // for the stream's lifetime, before the same-node check: a backend on
+    // this node is reached directly. The stream reports the service address
+    // as its peer.
+    if let Some(v) = service::lookup(s, POLICY_PROTO_TCP, ip, port) {
+        let Some((addr, bport)) = service::pick(s, v, service::salt(s)) else {
+            net_send_reply_error(s, -111, requester_tag); // ECONNREFUSED: no backends
+            return;
+        };
+        s.dial_vip = ip;
+        s.dial_vport = port;
+        connect_v4_to(s, addr, bport, requester_tag);
+        s.dial_vip = 0;
+        s.dial_vport = 0;
+        return;
+    }
+    connect_v4_to(s, ip, port, requester_tag);
+}
+
+/// Stamp the connection a dial made with the service address it was
+/// translated from, if any.
+unsafe fn stamp_dial(s: &mut IpState, idx: usize) {
+    if s.dial_vip != 0 && idx < s.tcp_conns.len() {
+        let c = &mut *s.tcp_conns.ptr_mut(idx);
+        c.svc_vip = s.dial_vip;
+        c.svc_vport = s.dial_vport;
+    }
+}
+
+/// [`connect_v4`] after translation.
+unsafe fn connect_v4_to(s: &mut IpState, ip: u32, port: u16, requester_tag: RequesterTag) {
     // LOCAL-DELIVERY FASTPATH: a connect to this host's own address (or
     // 127.0.0.1) is served entirely in-module — see `loopback_peer`.
-    if ip == 0x7F00_0001 || (s.local_ip != 0 && ip == s.local_ip) {
-        connect_loopback(s, port, requester_tag);
+    if let Some(dst_slot) = local_delivery_slot(s, ip) {
+        connect_loopback(s, dst_slot, port, requester_tag);
         return;
     }
 
@@ -8117,20 +9562,38 @@ unsafe fn connect_v4(s: &mut IpState, ip: u32, port: u16, requester_tag: Request
         net_send_reply_error(s, -99, requester_tag);
         return;
     };
-    let iss = compute_iss(s, s.local_ip, local_port, ip, port);
+    // A workload's dial inside its cluster prefixes leaves from its own
+    // address; anything else (and the node's own dials) from the primary.
+    // Set concretely so the peer's replies match on the demux axis. Reset
+    // explicitly — this path reuses a slot in place.
+    let src_slot = source_for(s, s.cur_lane, ip);
+    // A workload's stream is judged at its connect, from the workload's own
+    // address (what the host's forward hook would see before any source
+    // translation). Refused as a locally dropped packet is: EPERM.
+    if s.cur_lane != 0 {
+        let src = match lane_owner_slot(s, s.cur_lane) {
+            LOCAL_SLOT_ANY => s.local_ip,
+            slot => local_ip_for_slot(s, slot),
+        };
+        if !policy_allows(s, src, ip, POLICY_PROTO_TCP, port) {
+            conn_reset(s, ci);
+            net_send_reply_error(s, -1, requester_tag); // EPERM
+            return;
+        }
+    }
+    let iss = compute_iss(s, local_ip_for_slot(s, src_slot), local_port, ip, port);
 
     let conn = &mut *s.tcp_conns.ptr_mut(ci);
     conn.state = tcp::TcpState::SynSent;
     conn.remote_ip = ip;
     conn.remote_port = port;
     conn.local_port = local_port;
-    // Outbound/host traffic sources from slot 0; set it concretely so the
-    // peer's replies (dst = local_ip → slot 0) match on the demux axis.
-    // Reset explicitly — this path reuses a slot in place.
-    conn.local_slot = 0;
+    conn.local_slot = src_slot;
     conn.connect_tag = requester_tag;
     // The lane whose command this is: the connection's events go to it.
     conn.lane = s.cur_lane;
+    conn.svc_vip = s.dial_vip;
+    conn.svc_vport = s.dial_vport;
     conn.iss = iss;
     conn.snd_nxt = iss;
     conn.snd_una = iss;
@@ -8148,14 +9611,137 @@ fn deadline_passed(now_ms: u32, deadline_ms: u32) -> bool {
     (now_ms.wrapping_sub(deadline_ms) as i32) >= 0
 }
 
-/// The server named dials are resolved at: `resolver` when set, otherwise
-/// the one the DHCP lease supplied. 0 when neither is known.
+/// The server the node's own named dials are resolved at: `resolver` when
+/// set, otherwise the one the DHCP lease supplied. 0 when neither is known.
 #[inline(always)]
 fn resolver_server(s: &IpState) -> u32 {
     if s.resolver != 0 {
         s.resolver
     } else {
         s.dns_server
+    }
+}
+
+/// Lane `lane`'s name service: the server its owner's CREATE named and its
+/// search list (`[n][(len, name) × n]`), read from the kernel the first
+/// time it is needed; the node's own upstream and no search list for the
+/// node's lane, or an owner that named none.
+unsafe fn lane_resolver<'a>(s: &IpState, lane: u8) -> (u32, &'a [u8]) {
+    let node = (resolver_server(s), &[][..]);
+    let Some(st) = lane_at(s, lane) else {
+        return node;
+    };
+    let (owner_slot, owner_gen) = (st.owner_slot, st.owner_gen);
+    if st.rctx_state != 1 {
+        // Not read yet, or none was there when it was: the CREATE that made
+        // the owner may still have been completing.
+        let mut buf = [0u8; 8 + abi::contracts::workload::resolver::MAX];
+        buf[0..2].copy_from_slice(&owner_slot.to_le_bytes());
+        buf[4..8].copy_from_slice(&owner_gen.to_le_bytes());
+        let rc = ((*s.syscalls).provider_call)(
+            -1,
+            abi::contracts::workload::NET_RESOLVER,
+            buf.as_mut_ptr(),
+            buf.len(),
+        );
+        if rc > 0 {
+            let n = (rc as usize).min(st.rctx.len());
+            let mut i = 0;
+            while i < n {
+                st.rctx[i] = buf[i];
+                i += 1;
+            }
+            st.rctx_len = n as u16;
+            st.rctx_state = 1;
+        } else {
+            st.rctx_state = 2;
+        }
+    }
+    if st.rctx_state != 1 || (st.rctx_len as usize) < abi::contracts::workload::resolver::HEAD {
+        return node;
+    }
+    let server = u32::from_be_bytes([st.rctx[1], st.rctx[2], st.rctx[3], st.rctx[4]]);
+    let search = st.rctx.get(17..st.rctx_len as usize).unwrap_or(&[]);
+    (server, search)
+}
+
+/// Name `i` of a search list (`[n][(len, name) × n]`).
+fn search_at(list: &[u8], i: usize) -> Option<&[u8]> {
+    let n = *list.first()? as usize;
+    if i >= n {
+        return None;
+    }
+    let mut at = 1;
+    let mut k = 0;
+    loop {
+        let len = *list.get(at)? as usize;
+        if k == i {
+            return list.get(at + 1..at + 1 + len);
+        }
+        at += 1 + len;
+        k += 1;
+    }
+}
+
+/// The name pending entry `e` asks for: as dialled, or expanded with the
+/// owner's search list. Its length in `out`, 0 when it does not fit.
+unsafe fn query_name(s: &IpState, e: &DnsPending, out: &mut [u8; DNS_NAME_CAP]) -> usize {
+    let name = e.name.get(..e.name_len as usize).unwrap_or(&[]);
+    let mut n = 0;
+    for b in name {
+        if let Some(d) = out.get_mut(n) {
+            *d = *b;
+        }
+        n += 1;
+    }
+    if e.search != SEARCH_BARE {
+        let (_, list) = lane_resolver(s, e.lane);
+        let Some(suffix) = search_at(list, e.search as usize) else {
+            return 0;
+        };
+        if n + 1 + suffix.len() > DNS_NAME_CAP {
+            return 0;
+        }
+        if let Some(d) = out.get_mut(n) {
+            *d = b'.';
+        }
+        n += 1;
+        for b in suffix {
+            if let Some(d) = out.get_mut(n) {
+                *d = *b;
+            }
+            n += 1;
+        }
+    }
+    n.min(DNS_NAME_CAP)
+}
+
+/// The search expansion a dial of `name` starts with: the owner's first
+/// search name for a relative name (fewer than five dots, the convention a
+/// cluster's name service is configured for), the name as dialled for an
+/// absolute one or an owner with no search list.
+unsafe fn first_search(s: &IpState, lane: u8, name: &[u8], absolute: bool) -> u8 {
+    let (_, list) = lane_resolver(s, lane);
+    let dots = name.iter().filter(|&&c| c == b'.').count();
+    if absolute || dots >= 5 || search_at(list, 0).is_none() {
+        SEARCH_BARE
+    } else {
+        0
+    }
+}
+
+/// The next expansion after `search` fails, or None when the name as
+/// dialled has been tried.
+unsafe fn next_search(s: &IpState, lane: u8, search: u8) -> Option<u8> {
+    if search == SEARCH_BARE {
+        return None;
+    }
+    let (_, list) = lane_resolver(s, lane);
+    let next = search as usize + 1;
+    if search_at(list, next).is_some() && next < SEARCH_BARE as usize {
+        Some(next as u8)
+    } else {
+        Some(SEARCH_BARE)
     }
 }
 
@@ -8177,14 +9763,30 @@ unsafe fn resolver_normalise(name: &[u8], out: &mut [u8; DNS_NAME_CAP]) -> usize
 /// Byte equality of a table entry's name with `name`.
 #[inline(always)]
 fn entry_name_is(entry_name: &[u8; DNS_NAME_CAP], entry_len: u8, name: &[u8]) -> bool {
-    usize::from(entry_len) == name.len() && &entry_name[..name.len()] == name
+    usize::from(entry_len) == name.len() && entry_name.get(..name.len()) == Some(name)
 }
 
-/// The cached address for `name`, unless the entry has expired.
-unsafe fn dns_cache_get(s: &IpState, name: &[u8], now_ms: u32) -> Option<u32> {
+/// Copy `name` into an entry's name field, zero-filled; the length.
+#[inline(always)]
+fn entry_name_set(entry_name: &mut [u8; DNS_NAME_CAP], name: &[u8]) -> u8 {
     let mut i = 0;
-    while i < MAX_DNS_CACHE {
-        let e = &*s.dns_cache.as_ptr().add(i);
+    while i < DNS_NAME_CAP {
+        entry_name[i] = match name.get(i) {
+            Some(b) => *b,
+            None => 0,
+        };
+        i += 1;
+    }
+    name.len().min(DNS_NAME_CAP) as u8
+}
+
+/// The cached address for `name` in `lane`'s partition, unless the entry
+/// has expired. An owner reads only its own answers.
+unsafe fn dns_cache_get(s: &IpState, lane: u8, name: &[u8], now_ms: u32) -> Option<u32> {
+    let (c0, cn) = dns_cache_part(s, lane);
+    let mut i = c0;
+    while i < c0 + cn {
+        let e = dns_cache_at(s, i);
         if e.name_len != 0
             && entry_name_is(&e.name, e.name_len, name)
             && !deadline_passed(now_ms, e.expires_ms)
@@ -8196,11 +9798,23 @@ unsafe fn dns_cache_get(s: &IpState, name: &[u8], now_ms: u32) -> Option<u32> {
     None
 }
 
-/// Record an answer. The name's own entry is refreshed if it has one;
-/// otherwise an empty or expired entry is taken, and failing that the
-/// entry nearest its expiry is replaced. The TTL is clamped by the policy
-/// constants: a zero TTL is still held briefly, a long one is bounded.
-unsafe fn dns_cache_put(s: &mut IpState, name: &[u8], addr: u32, ttl_s: u32, now_ms: u32) {
+/// Record an answer in `lane`'s partition. The name's own entry is
+/// refreshed if it has one; otherwise an empty or expired entry is taken,
+/// and failing that the entry nearest its expiry is replaced. The TTL is
+/// clamped by the policy constants: a zero TTL is still held briefly, a long
+/// one is bounded.
+unsafe fn dns_cache_put(
+    s: &mut IpState,
+    lane: u8,
+    name: &[u8],
+    addr: u32,
+    ttl_s: u32,
+    now_ms: u32,
+) {
+    let (c0, cn) = dns_cache_part(s, lane);
+    if cn == 0 {
+        return;
+    }
     let ttl_s = if ttl_s == 0 {
         DNS_TTL_ZERO_S
     } else {
@@ -8208,11 +9822,11 @@ unsafe fn dns_cache_put(s: &mut IpState, name: &[u8], addr: u32, ttl_s: u32, now
     };
     let expires_ms = now_ms.wrapping_add(ttl_s.saturating_mul(1000));
 
-    let mut victim = 0usize;
+    let mut victim = c0;
     let mut victim_left = u32::MAX;
-    let mut i = 0;
-    while i < MAX_DNS_CACHE {
-        let e = &*s.dns_cache.as_ptr().add(i);
+    let mut i = c0;
+    while i < c0 + cn {
+        let e = dns_cache_at(s, i);
         if e.name_len == 0 || deadline_passed(now_ms, e.expires_ms) {
             if victim_left != 0 {
                 victim = i;
@@ -8230,10 +9844,8 @@ unsafe fn dns_cache_put(s: &mut IpState, name: &[u8], addr: u32, ttl_s: u32, now
         }
         i += 1;
     }
-    let e = &mut *s.dns_cache.as_mut_ptr().add(victim);
-    e.name = [0u8; DNS_NAME_CAP];
-    e.name[..name.len()].copy_from_slice(name);
-    e.name_len = name.len() as u8;
+    let e = dns_cache_at(s, victim);
+    e.name_len = entry_name_set(&mut e.name, name);
     e.addr = addr;
     e.expires_ms = expires_ms;
 }
@@ -8242,18 +9854,19 @@ unsafe fn dns_cache_put(s: &mut IpState, name: &[u8], addr: u32, ttl_s: u32, now
 /// lookup until the answer lands. Refusals and failures are reported as
 /// `MSG_ERROR` on `requester_tag`.
 unsafe fn connect_by_name(s: &mut IpState, name: &[u8], port: u16, requester_tag: RequesterTag) {
+    s.dial_absolute = name.last() == Some(&b'.');
     let mut held = [0u8; DNS_NAME_CAP];
     let len = resolver_normalise(name, &mut held);
-    if len == 0 {
+    let Some(name) = held.get(..len).filter(|_| len != 0) else {
         net_send_reply_error(s, -22, requester_tag); // EINVAL
         return;
-    }
+    };
     let now_ms = dev_millis(&*s.syscalls) as u32;
-    if let Some(ip) = dns_cache_get(s, &held[..len], now_ms) {
+    if let Some(ip) = dns_cache_get(s, s.cur_lane, name, now_ms) {
         connect_v4(s, ip, port, requester_tag);
         return;
     }
-    if let Err(errno) = resolver_start(s, &held[..len], port, requester_tag, false, now_ms) {
+    if let Err(errno) = resolver_start(s, name, port, requester_tag, false, now_ms) {
         s.drops.dns_unresolved = s.drops.dns_unresolved.wrapping_add(1);
         net_send_reply_error(s, errno, requester_tag);
     }
@@ -8263,25 +9876,25 @@ unsafe fn connect_by_name(s: &mut IpState, name: &[u8], port: u16, requester_tag
 /// that is not starts a cache-only lookup and answers `None`: the datagram
 /// is dropped, and the sender's retransmit finds the answer in the cache.
 unsafe fn resolve_for_datagram(s: &mut IpState, name: &[u8]) -> Option<u32> {
+    s.dial_absolute = name.last() == Some(&b'.');
     let mut held = [0u8; DNS_NAME_CAP];
     let len = resolver_normalise(name, &mut held);
-    if len == 0 {
-        return None;
-    }
+    let name = held.get(..len).filter(|_| len != 0)?;
     let now_ms = dev_millis(&*s.syscalls) as u32;
-    if let Some(ip) = dns_cache_get(s, &held[..len], now_ms) {
+    if let Some(ip) = dns_cache_get(s, s.cur_lane, name, now_ms) {
         return Some(ip);
     }
-    if resolver_start(s, &held[..len], 0, REQUESTER_TAG_NONE, true, now_ms).is_err() {
+    if resolver_start(s, name, 0, REQUESTER_TAG_NONE, true, now_ms).is_err() {
         s.drops.dns_unresolved = s.drops.dns_unresolved.wrapping_add(1);
     }
     None
 }
 
-/// A query id that collides with no query in flight, from the CSPRNG. An
-/// off-path answer has to guess it as well as the port.
+/// A query id that collides with no query in flight, of any owner, from the
+/// CSPRNG. An off-path answer has to guess it as well as the port.
 unsafe fn resolver_draw_id(s: &mut IpState) -> Option<u16> {
     let sys = &*s.syscalls;
+    let total = dns_pending_total(s);
     let mut draw = 0;
     while draw < DNS_ID_DRAWS {
         let mut raw = [0u8; 2];
@@ -8292,8 +9905,8 @@ unsafe fn resolver_draw_id(s: &mut IpState) -> Option<u16> {
         let id = u16::from_le_bytes(raw);
         let mut taken = false;
         let mut i = 0;
-        while i < MAX_DNS_PENDING {
-            let e = &*s.dns_pending.as_ptr().add(i);
+        while i < total {
+            let e = dns_pending_at(s, i);
             if e.flags & DNS_PEND_ACTIVE != 0 && e.id == id {
                 taken = true;
                 break;
@@ -8308,29 +9921,38 @@ unsafe fn resolver_draw_id(s: &mut IpState) -> Option<u16> {
     None
 }
 
-/// Send the A query for pending entry `slot` to the resolver. A negative
-/// errno means the datagram could not be staged at all (no route); a
-/// neighbour still resolving drops it silently, and the retry covers that.
+/// Send the A query for pending entry `slot` to its pinned server, from the
+/// slot it was pinned to leave from. A negative errno means the datagram
+/// could not be staged at all (no route); a neighbour still resolving drops
+/// it silently, and the retry covers that.
 unsafe fn resolver_send(s: &mut IpState, slot: usize) -> i8 {
-    let (id, name, name_len) = {
-        let e = &*s.dns_pending.as_ptr().add(slot);
-        (e.id, e.name, usize::from(e.name_len))
+    let e = *dns_pending_at(s, slot);
+    let mut qname = [0u8; DNS_NAME_CAP];
+    let qlen = query_name(s, &e, &mut qname);
+    let Some(q) = qname.get(..qlen).filter(|_| qlen != 0) else {
+        return -22; // EINVAL — an expansion past the name ceiling
     };
     let mut pkt = [0u8; DNS_QUERY_BUF];
-    let n = dns_wire::build_query(id, &name[..name_len], dns_wire::QTYPE_A, &mut pkt);
+    let n = dns_wire::build_query(e.id, q, dns_wire::QTYPE_A, &mut pkt);
     if n == 0 {
         return -22; // EINVAL — the name was checked to encode at admission
     }
-    let server = resolver_server(s);
-    let src_port = s.resolver_port;
-    send_udp_data(s, server, dns_wire::DNS_PORT, src_port, pkt.as_ptr(), n)
+    let to = UdpTo {
+        src_slot: e.src_slot,
+        src_port: s.resolver_port,
+        dst_ip: e.srv_ip,
+        dst_port: e.srv_port,
+    };
+    send_udp_data(s, &to, pkt.as_ptr(), n)
 }
 
-/// Park a dial (or a cache warm) on a lookup for `name`: it joins the
-/// query already in flight for that name, or becomes the leader of a new
-/// one and sends it. `Err` carries the errno the requester is answered
-/// with: `ENOENT` when there is no resolver to ask or no port to ask from,
-/// `EAGAIN` when the table or the entropy source has nothing to give.
+/// Park a dial (or a cache warm) on a lookup for `name`, in the partition of
+/// the lane being served: it joins that owner's query already in flight for
+/// the name, or becomes the leader of a new one and sends it. Owners never
+/// join each other's queries. `Err` carries the errno the requester is
+/// answered with: `ENOENT` when there is no resolver to ask or no port to ask
+/// from, `EAGAIN` when the owner's partition or the entropy source has
+/// nothing to give.
 unsafe fn resolver_start(
     s: &mut IpState,
     name: &[u8],
@@ -8339,7 +9961,9 @@ unsafe fn resolver_start(
     cache_only: bool,
     now_ms: u32,
 ) -> Result<(), i8> {
-    if resolver_server(s) == 0 {
+    let lane = s.cur_lane;
+    let (server, _) = lane_resolver(s, lane);
+    if server == 0 {
         return Err(-2); // ENOENT
     }
     if s.resolver_port == 0 {
@@ -8349,13 +9973,15 @@ unsafe fn resolver_start(
         }
     }
 
-    let mut slot = MAX_DNS_PENDING;
-    let mut leader = MAX_DNS_PENDING;
-    let mut i = 0;
-    while i < MAX_DNS_PENDING {
-        let e = &*s.dns_pending.as_ptr().add(i);
+    let (p0, pn) = dns_pending_part(s, lane);
+    let none = usize::MAX;
+    let mut slot = none;
+    let mut leader = none;
+    let mut i = p0;
+    while i < p0 + pn {
+        let e = dns_pending_at(s, i);
         if e.flags & DNS_PEND_ACTIVE == 0 {
-            if slot == MAX_DNS_PENDING {
+            if slot == none {
                 slot = i;
             }
         } else if e.flags & DNS_PEND_LEADER != 0 && entry_name_is(&e.name, e.name_len, name) {
@@ -8363,7 +9989,7 @@ unsafe fn resolver_start(
         }
         i += 1;
     }
-    if slot == MAX_DNS_PENDING {
+    if slot == none {
         return Err(-11); // EAGAIN
     }
 
@@ -8371,28 +9997,67 @@ unsafe fn resolver_start(
     if cache_only {
         flags |= DNS_PEND_CACHE_ONLY;
     }
-    let (id, deadline_ms) = if leader < MAX_DNS_PENDING {
-        let l = &*s.dns_pending.as_ptr().add(leader);
-        (l.id, l.deadline_ms)
+    let absolute = s.dial_absolute;
+    let (id, deadline_ms, search, srv_ip, srv_port, src_slot) = if leader != none {
+        let l = dns_pending_at(s, leader);
+        (
+            l.id,
+            l.deadline_ms,
+            l.search,
+            l.srv_ip,
+            l.srv_port,
+            l.src_slot,
+        )
     } else {
         flags |= DNS_PEND_LEADER;
         let Some(id) = resolver_draw_id(s) else {
             return Err(-11); // EAGAIN
         };
-        (id, now_ms.wrapping_add(DNS_QUERY_TIMEOUT_MS))
+        // The owner's server may be a service address: the query goes to one
+        // of its backends, pinned for the life of the lookup, from the
+        // owner's own address when that backend is inside its cluster.
+        let (srv_ip, srv_port) =
+            match service::lookup(s, POLICY_PROTO_UDP, server, dns_wire::DNS_PORT) {
+                Some(v) => match service::pick(s, v, service::salt(s)) {
+                    Some(b) => b,
+                    None => return Err(-2), // ENOENT: the name service has no backends
+                },
+                None => (server, dns_wire::DNS_PORT),
+            };
+        let src_slot = source_for(s, lane, srv_ip);
+        // A workload's query is egress like any datagram of its: judged.
+        if lane != 0 {
+            let src = match lane_owner_slot(s, lane) {
+                LOCAL_SLOT_ANY => s.local_ip,
+                slot => local_ip_for_slot(s, slot),
+            };
+            if !policy_allows(s, src, srv_ip, POLICY_PROTO_UDP, srv_port) {
+                return Err(-1); // EPERM
+            }
+        }
+        (
+            id,
+            now_ms.wrapping_add(DNS_QUERY_TIMEOUT_MS),
+            first_search(s, lane, name, absolute),
+            srv_ip,
+            srv_port,
+            src_slot,
+        )
     };
     {
-        let e = &mut *s.dns_pending.as_mut_ptr().add(slot);
-        e.name = [0u8; DNS_NAME_CAP];
-        e.name[..name.len()].copy_from_slice(name);
-        e.name_len = name.len() as u8;
+        let e = dns_pending_at(s, slot);
+        e.name_len = entry_name_set(&mut e.name, name);
         e.flags = 0;
         e.tag = tag;
-        e.lane = s.cur_lane;
+        e.lane = lane;
         e.retries = 0;
         e.port = port;
         e.id = id;
         e.deadline_ms = deadline_ms;
+        e.search = search;
+        e.srv_ip = srv_ip;
+        e.srv_port = srv_port;
+        e.src_slot = src_slot;
     }
     if flags & DNS_PEND_LEADER != 0 {
         let rv = resolver_send(s, slot);
@@ -8400,28 +10065,32 @@ unsafe fn resolver_start(
             return Err(rv);
         }
     }
-    (*s.dns_pending.as_mut_ptr().add(slot)).flags = flags;
+    dns_pending_at(s, slot).flags = flags;
     s.dns_pending_live = s.dns_pending_live.saturating_add(1);
     Ok(())
 }
 
 /// Release pending entry `slot`.
 unsafe fn resolver_clear(s: &mut IpState, slot: usize) {
-    (*s.dns_pending.as_mut_ptr().add(slot)).flags = 0;
-    s.dns_pending_live = s.dns_pending_live.saturating_sub(1);
+    let e = dns_pending_at(s, slot);
+    if e.flags & DNS_PEND_ACTIVE != 0 {
+        s.dns_pending_live = s.dns_pending_live.saturating_sub(1);
+    }
+    e.flags = 0;
 }
 
 /// Complete every dial waiting on query `id` with `addr`, running the
 /// literal connect path for each so it reports exactly as a literal dial
 /// would.
 unsafe fn resolver_complete_group(s: &mut IpState, id: u16, addr: u32) {
+    let total = dns_pending_total(s);
     let mut i = 0;
-    while i < MAX_DNS_PENDING {
-        let (flags, port, tag, lane) = {
-            let e = &*s.dns_pending.as_ptr().add(i);
-            (e.flags, e.port, e.tag, e.lane)
+    while i < total {
+        let (flags, port, tag, lane, eid) = {
+            let e = dns_pending_at(s, i);
+            (e.flags, e.port, e.tag, e.lane, e.id)
         };
-        if flags & DNS_PEND_ACTIVE != 0 && (*s.dns_pending.as_ptr().add(i)).id == id {
+        if flags & DNS_PEND_ACTIVE != 0 && eid == id {
             resolver_clear(s, i);
             if flags & DNS_PEND_CACHE_ONLY == 0 {
                 // The dial's lane, not whichever is being served now.
@@ -8437,13 +10106,14 @@ unsafe fn resolver_complete_group(s: &mut IpState, id: u16, addr: u32) {
 
 /// Fail every dial waiting on query `id` with `errno` on its tag.
 unsafe fn resolver_fail_group(s: &mut IpState, id: u16, errno: i8) {
+    let total = dns_pending_total(s);
     let mut i = 0;
-    while i < MAX_DNS_PENDING {
-        let (flags, tag, lane) = {
-            let e = &*s.dns_pending.as_ptr().add(i);
-            (e.flags, e.tag, e.lane)
+    while i < total {
+        let (flags, tag, lane, eid) = {
+            let e = dns_pending_at(s, i);
+            (e.flags, e.tag, e.lane, e.id)
         };
-        if flags & DNS_PEND_ACTIVE != 0 && (*s.dns_pending.as_ptr().add(i)).id == id {
+        if flags & DNS_PEND_ACTIVE != 0 && eid == id {
             resolver_clear(s, i);
             s.drops.dns_unresolved = s.drops.dns_unresolved.wrapping_add(1);
             if flags & DNS_PEND_CACHE_ONLY == 0 {
@@ -8457,45 +10127,88 @@ unsafe fn resolver_fail_group(s: &mut IpState, id: u16, errno: i8) {
     }
 }
 
-/// An answer on the resolver's port. It is matched to the query in flight
-/// by id and by the question it repeats; anything else is ignored.
-unsafe fn resolver_rx(s: &mut IpState, data: *const u8, len: usize) {
+/// An answer on the resolver's port. It is claimed only by the query in
+/// flight with its id, from the server that query was pinned to, at the
+/// address it left from — so no owner reads another's answer — and matched
+/// by the question it repeats; anything else is ignored. The answer is
+/// cached in the asking owner's partition under the name as dialled.
+unsafe fn resolver_rx(s: &mut IpState, a: &DgAddr, data: *const u8, len: usize) {
     if len < dns_wire::DNS_HEADER_LEN {
         return;
     }
     let id = u16::from_be_bytes([*data, *data.add(1)]);
-    let mut leader = MAX_DNS_PENDING;
+    let total = dns_pending_total(s);
+    let mut leader = usize::MAX;
     let mut i = 0;
-    while i < MAX_DNS_PENDING {
-        let e = &*s.dns_pending.as_ptr().add(i);
+    while i < total {
+        let e = dns_pending_at(s, i);
         if e.flags & (DNS_PEND_ACTIVE | DNS_PEND_LEADER) == (DNS_PEND_ACTIVE | DNS_PEND_LEADER)
             && e.id == id
+            && e.srv_ip == a.src_ip
+            && e.srv_port == a.src_port
+            && (e.src_slot == a.dst_slot || (e.src_slot == 0 && a.dst_slot == LOCAL_SLOT_ANY))
         {
             leader = i;
             break;
         }
         i += 1;
     }
-    if leader == MAX_DNS_PENDING {
+    if leader == usize::MAX {
         return;
     }
-    let (name, name_len) = {
-        let e = &*s.dns_pending.as_ptr().add(leader);
-        (e.name, usize::from(e.name_len))
+    let e = *dns_pending_at(s, leader);
+    let mut qname = [0u8; DNS_NAME_CAP];
+    let qlen = query_name(s, &e, &mut qname);
+    let Some(q) = qname.get(..qlen) else {
+        return;
     };
     let answer = {
         let pkt = core::slice::from_raw_parts(data, len);
-        dns_wire::parse_answer_a(pkt, id, &name[..name_len])
+        dns_wire::parse_answer_a(pkt, id, q)
     };
     match answer {
         dns_wire::AnswerA::Address(a, ttl) => {
             let addr = u32::from_be_bytes(a);
             let now_ms = dev_millis(&*s.syscalls) as u32;
-            dns_cache_put(s, &name[..name_len], addr, ttl, now_ms);
+            let name = e.name;
+            let typed = name.get(..e.name_len as usize).unwrap_or(&[]);
+            dns_cache_put(s, e.lane, typed, addr, ttl, now_ms);
             resolver_complete_group(s, id, addr);
         }
-        dns_wire::AnswerA::Negative => resolver_fail_group(s, id, -2), // ENOENT
+        dns_wire::AnswerA::Negative => match next_search(s, e.lane, e.search) {
+            // The next name of the search list, under a fresh id.
+            Some(next) => resolver_retry(s, leader, id, Some(next)),
+            None => resolver_fail_group(s, id, -2), // ENOENT
+        },
         dns_wire::AnswerA::Unrelated => {}
+    }
+}
+
+/// Ask query `id` again (led by `leader`) under a fresh id, every entry
+/// waiting on it moving with it — for the next search name when `search`
+/// says so, else the same question.
+unsafe fn resolver_retry(s: &mut IpState, leader: usize, id: u16, search: Option<u8>) {
+    let Some(new_id) = resolver_draw_id(s) else {
+        resolver_fail_group(s, id, -11); // EAGAIN
+        return;
+    };
+    let now_ms = dev_millis(&*s.syscalls) as u32;
+    let total = dns_pending_total(s);
+    let mut j = 0;
+    while j < total {
+        let e = dns_pending_at(s, j);
+        if e.flags & DNS_PEND_ACTIVE != 0 && e.id == id {
+            e.id = new_id;
+            e.deadline_ms = now_ms.wrapping_add(DNS_QUERY_TIMEOUT_MS);
+            if let Some(n) = search {
+                e.search = n;
+                e.retries = 0;
+            }
+        }
+        j += 1;
+    }
+    if resolver_send(s, leader) < 0 {
+        resolver_fail_group(s, new_id, -2); // ENOENT
     }
 }
 
@@ -8506,34 +10219,19 @@ unsafe fn step_resolver(s: &mut IpState) {
         return;
     }
     let now_ms = dev_millis(&*s.syscalls) as u32;
+    let total = dns_pending_total(s);
     let mut i = 0;
-    while i < MAX_DNS_PENDING {
+    while i < total {
         let (flags, retries, id, deadline_ms) = {
-            let e = &*s.dns_pending.as_ptr().add(i);
+            let e = dns_pending_at(s, i);
             (e.flags, e.retries, e.id, e.deadline_ms)
         };
         if flags & (DNS_PEND_ACTIVE | DNS_PEND_LEADER) == (DNS_PEND_ACTIVE | DNS_PEND_LEADER)
             && deadline_passed(now_ms, deadline_ms)
         {
             if retries < DNS_QUERY_RETRIES {
-                let Some(new_id) = resolver_draw_id(s) else {
-                    resolver_fail_group(s, id, -11); // EAGAIN
-                    i += 1;
-                    continue;
-                };
-                let mut j = 0;
-                while j < MAX_DNS_PENDING {
-                    let e = &mut *s.dns_pending.as_mut_ptr().add(j);
-                    if e.flags & DNS_PEND_ACTIVE != 0 && e.id == id {
-                        e.id = new_id;
-                        e.deadline_ms = now_ms.wrapping_add(DNS_QUERY_TIMEOUT_MS);
-                    }
-                    j += 1;
-                }
-                (*s.dns_pending.as_mut_ptr().add(i)).retries = retries + 1;
-                if resolver_send(s, i) < 0 {
-                    resolver_fail_group(s, new_id, -2); // ENOENT
-                }
+                dns_pending_at(s, i).retries = retries + 1;
+                resolver_retry(s, i, id, None);
             } else {
                 resolver_fail_group(s, id, -2); // ENOENT
             }
@@ -8666,7 +10364,7 @@ unsafe fn sweep_range(s: &mut IpState, start: usize, end: usize) {
                     if conn.state == tcp::TcpState::Closed {
                         let remote_ip = conn.remote_ip;
                         if remote_ip != 0 {
-                            arp::unpin(&mut s.arp_table, remote_ip);
+                            arp::unpin(arp_tab(s), remote_ip);
                         }
                         conn_reset(s, i);
                     } else {
@@ -8762,7 +10460,7 @@ unsafe fn sweep_range(s: &mut IpState, start: usize, end: usize) {
                     let remote_ip = conn.remote_ip;
                     if net_send_closed(s, i as u16) {
                         if remote_ip != 0 {
-                            arp::unpin(&mut s.arp_table, remote_ip);
+                            arp::unpin(arp_tab(s), remote_ip);
                         }
                         conn_reset(s, i);
                     }
@@ -8778,7 +10476,7 @@ unsafe fn sweep_range(s: &mut IpState, start: usize, end: usize) {
                     let remote_ip = conn.remote_ip;
                     if net_send_closed(s, i as u16) {
                         if remote_ip != 0 {
-                            arp::unpin(&mut s.arp_table, remote_ip);
+                            arp::unpin(arp_tab(s), remote_ip);
                         }
                         conn_reset(s, i);
                     }
@@ -8843,7 +10541,7 @@ pub mod test_helpers {
     //! exercised directly. Using them outside of `cfg(test)` is a
     //! contract violation — the kernel should never need them.
 
-    use super::{arp, tcp, IpDrops, IpState};
+    use super::{arp, arp_tab, tcp, IpDrops, IpState};
 
     /// How many entries of the connection index are occupied.
     ///
@@ -8943,7 +10641,7 @@ pub mod test_helpers {
     /// `state` must point to an initialised `IpState`.
     pub unsafe fn pin_gateway(state: *mut u8, ip: u32) -> bool {
         let s = &mut *(state as *mut IpState);
-        arp::pin_gateway(&mut s.arp_table, ip)
+        arp::pin_gateway(arp_tab(s), ip)
     }
 
     /// Read the ingress refusal counters.
@@ -9324,13 +11022,10 @@ pub mod test_helpers {
     /// `state` must point to an initialised `IpState`.
     pub unsafe fn arp_entry(state: *const u8, ip: u32) -> Option<([u8; 6], bool, u8, bool)> {
         let s = &*(state as *const IpState);
-        let mut i = 0;
-        while i < arp::ARP_TABLE_SIZE {
-            let e = &s.arp_table[i];
+        for e in arp_tab(s).iter() {
             if e.valid && e.ip == ip {
                 return Some((e.mac, e.pinned, e.pin_count, e.revalidate));
             }
-            i += 1;
         }
         None
     }
@@ -9342,7 +11037,7 @@ pub mod test_helpers {
     /// `state` must point to an initialised `IpState`.
     pub unsafe fn seed_arp(state: *mut u8, ip: u32, mac: [u8; 6]) {
         let s = &mut *(state as *mut IpState);
-        arp::insert(&mut s.arp_table, ip, mac, 0);
+        arp::insert(arp_tab(s), ip, mac, 0);
     }
 
     /// Force ARP aging forward by `passes` maintenance ticks.
@@ -9354,7 +11049,7 @@ pub mod test_helpers {
         let mut revalidations = 0;
         let mut i = 0;
         while i < passes {
-            revalidations += arp::age_entries(&mut s.arp_table);
+            revalidations += arp::age_entries(arp_tab(s));
             i += 1;
         }
         s.drops.arp_pin_revalidate = s.drops.arp_pin_revalidate.wrapping_add(revalidations);

@@ -10,7 +10,7 @@
 // stop, unsplice, close edges, reclaim, revoke) at the earlier of:
 //
 //   * quiescence — every module the owner stamps ran to Done/terminal
-//     (`scheduler::owner_modules_quiescent`, the v1 predicate), or
+//     (`scheduler::owner_modules_quiescent`), or
 //   * the deadline — wall clock passing the stamped `deadline_unix`.
 //
 // The terminal outcome is recorded here (Completed vs drain-timeout, plus a
@@ -37,7 +37,7 @@ struct DrainTerminal {
     generation: u32,
     /// Deadline passed before quiescence (forced revoke).
     timed_out: bool,
-    /// Forfeited by a runtime restart mid-drain (§3.6).
+    /// Forfeited by a runtime restart mid-drain.
     by_restart: bool,
     finished_unix: u64,
     retain_until_unix: u64,
@@ -69,7 +69,7 @@ const TERMINAL_RETAIN_SECS: u64 = 30;
 
 /// Arm the drains a delta apply produced. Re-arming an already-armed
 /// `(slot, generation)` keeps the ORIGINAL deadline: a replayed revocation
-/// record never resets the clock (§3.4).
+/// record never resets the clock.
 pub fn arm_drains(delta: &crate::kernel::workload::owner_plan::DrainDelta) {
     let d = drain_driver();
     for arm in &delta.arms[..delta.count] {
@@ -110,7 +110,7 @@ pub fn drain_tick(now_unix: u64) {
             generation: e.generation,
         };
         // An owner that vanished under us (a structural rebuild mid-drain
-        // reset the table — v1 forfeits the remainder) gets its terminal
+        // reset the table, which forfeits the remainder) gets its terminal
         // record now; nothing is left to free.
         let gone = crate::kernel::exec::scheduler::owners_mut()
             .lookup(handle)
@@ -168,10 +168,10 @@ pub fn drain_tick(now_unix: u64) {
 
 /// At boot: any revocation the (just-applied) retained plan still lists, whose
 /// owner is NOT installed, was mid-drain when the previous process died. The
-/// drain is forfeited (§3.6) and the terminal record says so — UNLESS the
+/// drain is forfeited and the terminal record says so — UNLESS the
 /// previous process already persisted a terminal state for that workload
 /// (`seeded_terminated`, from the status writer's seed of the old file): a
-/// clean `Completed` from before the restart is never rewritten (§3.7).
+/// clean `Completed` from before the restart is never rewritten.
 #[allow(
     clippy::implicit_hasher,
     reason = "internal platform surface; callers only ever pass std's default hasher"
@@ -180,8 +180,10 @@ pub fn synthesize_restart_terminals(
     now_unix: u64,
     seeded_terminated: &std::collections::HashSet<String>,
 ) {
-    let mut revs = [crate::kernel::workload::owner_plan::PlanRevocation::EMPTY;
-        crate::kernel::workload::owner_plan::MAX_PLAN_ASSIGNMENTS];
+    let mut revs = vec![
+        crate::kernel::workload::owner_plan::PlanRevocation::EMPTY;
+        crate::kernel::workload::owner_plan::MAX_PLAN_ASSIGNMENTS
+    ];
     let n = crate::kernel::workload::owner_plan::retained_revocations(&mut revs);
     let d = drain_driver();
     for rev in &revs[..n] {
@@ -250,7 +252,7 @@ pub fn drain_overlay_for_status(
 }
 
 /// Render the retained terminal records as status-file workload entries (same shape
-/// as the live workloads array; §7.2 vocabulary + the additive `drain{}` detail).
+/// as the live workloads array, its reason vocabulary, plus a `drain{}` detail).
 /// Returns entries WITHOUT leading separators; empty when nothing is retained.
 pub fn drain_terminal_workloads_json() -> Vec<String> {
     use std::fmt::Write as _;

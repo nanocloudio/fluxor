@@ -86,14 +86,11 @@ pub(crate) fn is_multi_outbound(name_hash: u32) -> bool {
 ///
 /// The error code is the bare `i32` negative-errno that
 /// `prepare_graph` already propagates.
-type ModuleList = (
-    [Option<ModuleEntry>; MAX_MODULES],
-    usize,
-    [i16; MAX_MODULES],
-);
+type BuiltModuleList = (ModuleList, usize, [i16; MAX_MODULES]);
 
-pub(crate) fn build_module_list(config: &Config) -> Result<ModuleList, i32> {
-    let mut module_list: [Option<ModuleEntry>; MAX_MODULES] = [None; MAX_MODULES];
+pub(crate) fn build_module_list(config: &Config) -> Result<BuiltModuleList, i32> {
+    let mut module_list = ModuleList::new(None);
+    module_list.reserve_entries(config.module_count as usize);
     // i16, not i8: a slot index reaches MAX_MODULES - 1 (191 on the host
     // profile), and an i8 wraps the 129th module to a negative "unknown".
     let mut id_to_slot: [i16; MAX_MODULES] = [-1; MAX_MODULES];
@@ -136,10 +133,7 @@ pub(crate) fn build_module_list(config: &Config) -> Result<ModuleList, i32> {
 /// `parse_protection_config`; this only peeks the isolation bit. No-op off BCM2712 (EL0 isolation is BCM2712-only,
 /// but the flag itself is platform-agnostic — `module_is_isolated` callers gate
 /// on the chip feature).
-pub(crate) fn mark_isolated_from_params(
-    module_list: &[Option<ModuleEntry>; MAX_MODULES],
-    module_count: usize,
-) {
+pub(crate) fn mark_isolated_from_params(module_list: &ModuleList, module_count: usize) {
     for (module_idx, slot) in module_list.iter().enumerate().take(module_count) {
         let entry = match slot {
             Some(e) => e,
@@ -154,7 +148,7 @@ pub(crate) fn mark_isolated_from_params(
         // SAFETY: prepare_graph context — single mutator of SCHED.
         unsafe {
             let p = &raw mut SCHED;
-            (*p).isolated[module_idx] = true;
+            (&mut (*p).isolated)[module_idx] = true;
         }
         crate::kernel::sys::hal::protection_set_enabled(true);
     }
@@ -164,7 +158,7 @@ pub(crate) fn mark_isolated_from_params(
 /// buffer-group flags) before its channels are opened.
 pub(crate) fn collect_module_hints(
     loader: &ModuleLoader,
-    module_list: &[Option<ModuleEntry>; MAX_MODULES],
+    module_list: &ModuleList,
     module_count: usize,
 ) {
     for (module_idx, slot) in module_list.iter().enumerate().take(module_count) {
@@ -213,13 +207,13 @@ pub(crate) fn collect_one_module_hints(
 }
 
 pub(crate) fn push_internal_module(
-    module_list: &mut [Option<ModuleEntry>; MAX_MODULES],
+    module_list: &mut ModuleList,
     module_count: &mut usize,
     name_hash: u32,
     domain_id: u8,
     frame_kind: u8,
 ) -> Option<usize> {
-    if *module_count >= MAX_MODULES
+    if *module_count >= module_slots()
         || !crate::kernel::sys::resource_ledger::enforced_allows(
             crate::abi::contracts::resource::POOL_MODULE_SLOTS,
             *module_count as u32 + 1,
@@ -244,7 +238,7 @@ pub(crate) fn push_internal_module(
     });
     // Mirror the domain assignment into SCHED so the per-domain
     // exec-order partitioner sees the inserted slot.
-    if idx < MAX_MODULES {
+    if idx < module_slots() {
         // SAFETY: prepare_graph context — single mutator; idx bounded.
         let sched = unsafe {
             let p = &raw mut SCHED;
@@ -399,7 +393,7 @@ pub fn maybe_emit_alive(tick: u64, domain_id: Option<usize>) {
     // `30_000_000 / tick_us` tick-count threshold. The tick-count form
     // silently mis-scales the moment mechanism (b) varies the period away from
     // 1 ms, and stalls entirely when mechanism (a) idle-sleep stops advancing
-    // the tick — so the heartbeat would no longer be ~30 s. Diagnostic-cadence
+    // the tick — so the heartbeat would not be ~30 s. Diagnostic-cadence
     // class: best-effort, no correctness impact. `LAST_ALIVE_MS` is 0 at boot,
     // so the first heartbeat lands ~30 s in.
     let last = LAST_ALIVE_MS[di].load(Ordering::Relaxed);
@@ -441,7 +435,7 @@ fn down_module_summary() -> (u32, ModuleId) {
     };
     let mut down = 0u32;
     let mut first = NO_MODULE;
-    for i in 0..MAX_MODULES {
+    for i in 0..module_slots() {
         match sched.fault_info[i].state {
             FaultState::Faulted | FaultState::Terminated => {
                 down += 1;
@@ -555,7 +549,7 @@ pub fn sample_pstatus() {
     unsafe {
         let p = &raw const SCHED;
         let sched = &*p;
-        for i in 0..MAX_MODULES {
+        for i in 0..module_slots() {
             if matches!(sched.modules[i], ModuleSlot::Empty) {
                 continue;
             }
@@ -627,7 +621,7 @@ pub(crate) const CRASH_CHECK_DELAY_MS: u64 = 30_000;
 /// step routes through `mmu::protected_step`. Non-isolated modules keep
 /// the direct EL1 call path unchanged.
 pub fn module_is_isolated(idx: usize) -> bool {
-    if idx >= MAX_MODULES {
+    if idx >= module_slots() {
         return false;
     }
     // SAFETY: scheduler-thread-only read of a bool array; `idx` bounded.
@@ -671,39 +665,39 @@ pub fn params_protection_level(params: &[u8]) -> u8 {
 /// The step deadline `idx` runs under, in microseconds: its declared
 /// `step_deadline_us`, or the default.
 pub fn module_step_deadline_us(idx: usize) -> u32 {
-    if idx >= MAX_MODULES {
+    if idx >= module_slots() {
         return crate::kernel::exec::step_guard::DEFAULT_STEP_DEADLINE_US;
     }
     // SAFETY: fault_info is written on the setup path and by the scheduler
     // thread that is asking.
     unsafe {
         let p = &raw const SCHED;
-        (*p).fault_info[idx].effective_deadline_us()
+        (&(*p).fault_info)[idx].effective_deadline_us()
     }
 }
 
 /// The device window the graph granted `idx` (tag 0xFD), if any.
 pub fn module_device_window(idx: usize) -> Option<(u64, u32)> {
-    if idx >= MAX_MODULES {
+    if idx >= module_slots() {
         return None;
     }
     // SAFETY: written at instantiation on the setup path; read-only after.
     let w = unsafe {
         let p = &raw const SCHED;
-        (*p).device_window[idx]
+        (&(*p).device_window)[idx]
     };
     (w.1 != 0).then_some(w)
 }
 
 /// The protection level `idx` was instantiated at (tag 0xF5).
 pub fn module_protection_level(idx: usize) -> u8 {
-    if idx >= MAX_MODULES {
+    if idx >= module_slots() {
         return protection_level::NONE;
     }
     // SAFETY: written at instantiation on the setup path; read-only after.
     unsafe {
         let p = &raw const SCHED;
-        (*p).protection[idx]
+        (&(*p).protection)[idx]
     }
 }
 
@@ -749,6 +743,37 @@ pub fn params_heap_arena_bytes(params: &[u8]) -> Option<usize> {
     None
 }
 
+/// Params TLV tag declaring that the module uses its heap arena raw
+/// (`ARENA_GET`) rather than through `heap_alloc`: the graph's
+/// `heap.raw_arena: true`, or a module type's `[capacities] raw_arena`, one
+/// byte (nonzero = yes). The loader commits such a heap's whole cap at
+/// instantiation, so `ARENA_GET` never commits — or zeroes — on a step.
+pub const HEAP_RAW_ARENA_TAG: u8 = 0xEE;
+
+/// Whether a module's params declare raw arena use ([`HEAP_RAW_ARENA_TAG`]).
+pub fn params_raw_arena(params: &[u8]) -> bool {
+    if params.len() < 4 {
+        return false;
+    }
+    let mut pos = if params[0] == 0xFE { 4 } else { 0 };
+    while pos + 2 <= params.len() {
+        let tag = params[pos];
+        let len = params[pos + 1] as usize;
+        pos += 2;
+        if tag == 0xFF {
+            break;
+        }
+        let Some(value) = params.get(pos..pos + len) else {
+            return false;
+        };
+        if tag == HEAP_RAW_ARENA_TAG {
+            return value.first().is_some_and(|&b| b != 0);
+        }
+        pos += len;
+    }
+    false
+}
+
 /// Whether a params TLV tag is a node tag: one only the node's own graph
 /// may give a module, because what it sets is a grant of the node's or
 /// reaches past the module.
@@ -765,8 +790,8 @@ pub fn params_heap_arena_bytes(params: &[u8]) -> Option<usize> {
 /// - 0xFB, 0xFC: ISR cycle budget and hardware IRQ.
 /// - 0xFD: device window, a register block mapped into the module's domain.
 ///
-/// The heap tags 0xF8–0xFA (zero on free, fault on alloc failure, canary)
-/// and 0xEF (the instance's heap cap) are not node tags. They change how
+/// The heap tags 0xF8–0xFA (zero on free, fault on alloc failure, canary),
+/// 0xEF (the instance's heap cap) and 0xEE (raw arena use) are not node tags. They change how
 /// the module's own heap behaves and how large it may grow, and that heap is
 /// charged, at its cap, to its owner's state cap.
 pub const fn is_node_param_tag(tag: u8) -> bool {

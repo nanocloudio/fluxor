@@ -6,6 +6,142 @@ use super::*;
 // Setup Functions
 // ============================================================================
 
+/// Size every boot-sized kernel table from the plan `config` derives
+/// (`resource_ledger::plan`): the scheduler's per-module and per-edge tables,
+/// the channel slots, events, timers, owners, tracked handles, the
+/// state-arena free list, the `net.policy` store and, on Linux and bcm2712,
+/// the control-plane store's tables. On a static profile it checks that each
+/// table already holds its plan. `Err` has logged the refusal, naming the
+/// pool.
+///
+/// # Safety
+/// Graph preparation: no module runs and nothing holds a reference into any
+/// of these tables.
+pub unsafe fn size_kernel_tables(
+    config: &Config,
+) -> Result<(), crate::kernel::sys::resource_ledger::Refused> {
+    use crate::abi::contracts::resource as res;
+    use crate::kernel::mem::table::TableError;
+    use crate::kernel::sys::resource_ledger as ledger;
+    // RP: the graph plans the kernel's static pool afresh.
+    #[cfg(feature = "rp")]
+    let _window = crate::kernel::mem::carve::begin_plan();
+    ledger::plan(config);
+    let refused = |pool: u16, e: TableError| {
+        ledger::refuse(
+            pool,
+            match e {
+                TableError::Ceiling => "past this profile's table or the format's bound",
+                TableError::NoMemory => {
+                    "the platform refused the memory (the host, or a full carve zone)"
+                }
+            },
+        );
+        ledger::Refused
+    };
+    for pool in 1..=res::KERNEL_POOL_COUNT as u16 {
+        ledger::check_static(pool)?;
+    }
+    let (module_derived, _) = ledger::plan_parts(res::POOL_MODULE_SLOTS);
+    let modules = ledger::ceiling(res::POOL_MODULE_SLOTS) as usize;
+    if modules > MAX_MODULES {
+        ledger::refuse(
+            res::POOL_MODULE_SLOTS,
+            "past the module-index domain (12-bit config ids, ModuleMask width)",
+        );
+        return Err(ledger::Refused);
+    }
+    let (edge_derived, _) = ledger::plan_parts(res::POOL_CHANNELS);
+    let edges = ledger::ceiling(res::POOL_CHANNELS) as usize;
+    if edges > MAX_CHANNELS {
+        ledger::refuse(res::POOL_CHANNELS, "past the channel-id domain");
+        return Err(ledger::Refused);
+    }
+    // SAFETY: graph preparation is SCHED's single mutator.
+    let sched = unsafe { &mut *core::ptr::addr_of_mut!(SCHED) };
+    sched
+        .size_module_tables(modules, module_derived as usize)
+        .map_err(|e| refused(res::POOL_MODULE_SLOTS, e))?;
+    sched
+        .size_edge_tables(edges, edge_derived as usize)
+        .map_err(|e| refused(res::POOL_CHANNELS, e))?;
+    crate::kernel::ipc::channel::size(edges, edge_derived as usize)
+        .map_err(|e| refused(res::POOL_CHANNELS, e))?;
+    let whole = |pool: u16| ledger::ceiling(pool) as usize;
+    // Event and timer handles name their slot in a tagged fd's slot field: a
+    // table past it would hand out handles that alias.
+    let fd_slots = crate::abi::kernel_abi::fd::SLOT_MASK as usize + 1;
+    for pool in [res::POOL_EVENTS, res::POOL_TIMERS] {
+        if whole(pool) > fd_slots {
+            ledger::refuse(pool, "past the tagged-fd slot domain");
+            return Err(ledger::Refused);
+        }
+    }
+    crate::kernel::ipc::event::size(whole(res::POOL_EVENTS))
+        .map_err(|e| refused(res::POOL_EVENTS, e))?;
+    crate::kernel::ipc::fd::size_timers(whole(res::POOL_TIMERS))
+        .map_err(|e| refused(res::POOL_TIMERS, e))?;
+    let owners = whole(res::POOL_OWNERS);
+    sched
+        .owners
+        .size(owners)
+        .map_err(|e| refused(res::POOL_OWNERS, e))?;
+    // Every per-owner table is the owner table's size: one log ring, one
+    // code-pack region (and one being staged), one graph-workload slot per
+    // owner slot.
+    #[cfg(feature = "host-linux")]
+    crate::kernel::workload::owner_log::size(owners).map_err(|e| refused(res::POOL_OWNERS, e))?;
+    #[cfg(feature = "multitenant")]
+    {
+        crate::kernel::workload::code_pack::size(owners)
+            .map_err(|e| refused(res::POOL_OWNERS, e))?;
+        crate::kernel::workload::workload_graph::size(owners)
+            .map_err(|e| refused(res::POOL_OWNERS, e))?;
+    }
+    // A host-process sandbox is a workload with an owner of its own: the
+    // owner table's workload slots are the sandbox pool's derived part, so
+    // every workload owner the table seats has a sandbox slot. The reserve on
+    // top seats finished sandboxes held until destroyed; by default it takes
+    // only what the sandbox-index domain leaves, so an owner table near its
+    // own domain leaves the sandboxes little headroom, and a workload that
+    // keeps finished sandboxes past it is refused its next spawn. TTY
+    // sessions have no structural source.
+    #[cfg(feature = "host-linux")]
+    {
+        ledger::set_derived(res::POOL_SANDBOXES, owners.saturating_sub(1) as u32);
+        let sandboxes = whole(res::POOL_SANDBOXES);
+        crate::platform::linux::host_backend::size_sandboxes(sandboxes)
+            .map_err(|e| refused(res::POOL_SANDBOXES, e))?;
+        crate::platform::linux::workload::size_workloads(sandboxes)
+            .map_err(|e| refused(res::POOL_SANDBOXES, e))?;
+        crate::platform::linux::host_backend::size_tty_sessions(whole(res::POOL_TTY_SESSIONS))
+            .map_err(|e| refused(res::POOL_TTY_SESSIONS, e))?;
+    }
+    crate::kernel::module::provider::size_tracked(whole(res::POOL_TRACKED_HANDLES))
+        .map_err(|e| refused(res::POOL_TRACKED_HANDLES, e))?;
+    crate::kernel::module::loader::size_free_list(whole(res::POOL_STATE_FREE_LIST))
+        .map_err(|e| refused(res::POOL_STATE_FREE_LIST, e))?;
+    crate::kernel::net_policy::size(
+        whole(res::POOL_NET_POLICY_TABLES),
+        whole(res::POOL_NET_POLICY_TABLE_BYTES),
+    )
+    .map_err(|e| refused(res::POOL_NET_POLICY_TABLES, e))?;
+    crate::kernel::net_route::size(
+        whole(res::POOL_NET_ROUTE_SEGMENTS),
+        whole(res::POOL_NET_ROUTE_PEERS),
+        whole(res::POOL_NET_ROUTE_HELD),
+    )
+    .map_err(|e| refused(res::POOL_NET_ROUTE_SEGMENTS, e))?;
+    #[cfg(feature = "host-linux")]
+    crate::platform::linux::store::size_from_plan();
+    #[cfg(feature = "chip-bcm2712")]
+    crate::platform::store::size_from_plan().map_err(|e| refused(res::POOL_STORE_SUBS, e))?;
+    // RP: the arenas take what the tables left of the pool.
+    #[cfg(feature = "rp")]
+    crate::kernel::mem::carve::finish_plan()?;
+    Ok(())
+}
+
 /// Synchronous setup - returns true if ready to run, false on error
 ///
 /// Call this first, then call run_main_loop() if it returns true.
@@ -51,7 +187,7 @@ pub fn setup(runner_config: &RunnerConfig) -> bool {
 ///
 /// Returns (module_list, module_count) on success, or -1 on error.
 /// After this call, edges/modules/module_ports/finished/exec_order are initialized.
-pub fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i32> {
+pub fn prepare_graph() -> Result<(ModuleList, usize), i32> {
     // SAFETY: prepare_graph runs single-threaded during graph bring-up.
     let config = unsafe {
         let p = &raw const STATIC_CONFIG;
@@ -110,8 +246,17 @@ pub fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i3
     // classic teardown race that would surface as "open_channels
     // returns EACCES" inside the very call that's *populating* the
     // new graph. Reset is bounded by MAX_MODULES so the gate's
-    // `caller >= MAX_MODULES` short-circuit kicks in.
+    // `caller >= module_slots()` short-circuit kicks in.
     set_current_module(MAX_MODULES);
+
+    // Size every boot-sized table to the plan this config derives, before
+    // anything below walks one. A plan the platform cannot hold fails the
+    // graph here, naming the pool.
+    // SAFETY: graph preparation — no module runs and nothing holds a
+    // reference into a kernel table.
+    if unsafe { size_kernel_tables(config) }.is_err() {
+        return Err(-1);
+    }
 
     // Reset all scheduler state, state arena, and name arena. Channel
     // slots and buffer registry slots are wiped too, so a prior graph's
@@ -139,6 +284,8 @@ pub fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i3
     crate::kernel::backing_provider::unregister();
     crate::kernel::module::provider::reset_handle_tracking();
     crate::kernel::module::provider::reset_module_layers();
+    // The old graph's slots no longer name net.route writers; the tables stay.
+    crate::kernel::net_route::reset_bindings();
     // A module net provider and the lanes queued for it belong to the old
     // graph; a built-in one registers again as the new graph instantiates.
     crate::kernel::workload::net_attach::reset_queued();
@@ -191,7 +338,7 @@ pub fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i3
     }
     for entry in config.modules.iter().flatten() {
         let id = entry.id as usize;
-        if id < MAX_MODULES {
+        if id < module_slots() {
             sched.domain_id[id] = entry.domain_id;
             sched.pre_tick_drain[id] = entry.pre_tick_drain;
             let d = entry.domain_id as usize;
@@ -348,7 +495,7 @@ pub fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i3
         // SAFETY: scheduler-thread context during graph prep.
         let same_domain = unsafe {
             let p = core::ptr::addr_of!(SCHED);
-            (*p).domain_id[e.from_module] == (*p).domain_id[e.to_module]
+            (&(*p).domain_id)[e.from_module] == (&(*p).domain_id)[e.to_module]
         };
         if !same_domain {
             continue; // bound at platform bridging, delivery side
@@ -483,7 +630,7 @@ static mut MODULE_IRQ_NUMBER: [u16; MAX_MODULES] = [u16::MAX; MAX_MODULES];
 
 /// Read the resolved IRQ for `module_idx`, or `None` when unset.
 pub fn module_irq(module_idx: usize) -> Option<u16> {
-    if module_idx >= MAX_MODULES {
+    if module_idx >= module_slots() {
         return None;
     }
     // SAFETY: scheduler-thread read; module_idx bounded.
@@ -502,7 +649,7 @@ pub fn module_irq(module_idx: usize) -> Option<u16> {
 /// clears the override (the same sentinel `module_irq` uses to mean
 /// "unset").
 pub fn set_module_irq(module_idx: usize, irq: u16) {
-    if module_idx >= MAX_MODULES {
+    if module_idx >= module_slots() {
         return;
     }
     // SAFETY: scheduler-thread mutation; module_idx bounded.
@@ -517,7 +664,7 @@ pub fn set_module_irq(module_idx: usize, irq: u16) {
 /// `parse_protection_config`'s TLV-tag 0xFB handler at module
 /// instantiation; conformance tests call this directly.
 pub fn set_module_isr_budget_cycles(module_idx: usize, budget_cycles: u32) {
-    if module_idx >= MAX_MODULES {
+    if module_idx >= module_slots() {
         return;
     }
     // SAFETY: scheduler-thread-only mutation; module_idx bounded.
@@ -537,7 +684,7 @@ pub fn module_isr_budget_cycles(module_idx: usize) -> u32 {
 /// Read the resolved Tier 1b budget for a module: the per-module
 /// override if non-zero, otherwise `DEFAULT_ISR_BUDGET_CYCLES`.
 fn resolved_isr_budget_cycles(module_idx: usize) -> u32 {
-    if module_idx >= MAX_MODULES {
+    if module_idx >= module_slots() {
         return DEFAULT_ISR_BUDGET_CYCLES;
     }
     // SAFETY: scheduler-thread read; module_idx bounded.
@@ -792,7 +939,7 @@ unsafe extern "C" fn builtin_tier1b_trampoline(state: *mut u8) -> i32 {
     // there's no preemption against the cooperative writer; we
     // observe a coherent slot.
     let sched = unsafe { sched_ref() };
-    if module_idx >= MAX_MODULES {
+    if module_idx >= module_slots() {
         return 0;
     }
     if let crate::kernel::exec::scheduler::module_types::ModuleSlot::BuiltIn(m) =
@@ -1056,7 +1203,7 @@ fn charge_resident_owner_state() {
     // loop, before the runner starts).
     let s = unsafe { crate::kernel::exec::scheduler::sched_mut() };
     s.owners.clear_state_charges();
-    for idx in 0..crate::kernel::boot::config::MAX_MODULES {
+    for idx in 0..crate::kernel::exec::scheduler::module_slots() {
         let owner = crate::kernel::exec::scheduler::module_owner(idx);
         if owner.is_system() {
             continue;

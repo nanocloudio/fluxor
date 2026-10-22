@@ -126,7 +126,7 @@ pub const CONTRACT_ID_SPACE: usize = 64;
 /// Positions consumed in the `required_caps` space, counting the four
 /// reserved ids and excluding the kernel-internal dispatch bucket (0x0C).
 /// Registered in `docs/architecture/limit_register.md`.
-pub const CONTRACT_ID_POSITIONS_ASSIGNED: usize = 31;
+pub const CONTRACT_ID_POSITIONS_ASSIGNED: usize = 32;
 
 /// Parse a contract name from `[[resources]].requires_contract`. Only
 /// public contract names are accepted here — `"internal"` and specific
@@ -185,6 +185,9 @@ pub fn contract_id_from_name(s: &str) -> Result<u8> {
         // Host mounts of block devices under the operator's mount root.
         // Host-linux; also requires the platform_raw permission.
         "host_mount" => Ok(0x1F),
+        // The node's segments, peer routes and held addresses. Also requires
+        // the platform_raw permission for its table ops.
+        "net_route" => Ok(0x20),
         // Anything that looks like a permission name is a manifest
         // schema error — those go in `permissions = [...]`, not
         // `[[resources]]`.
@@ -195,10 +198,9 @@ pub fn contract_id_from_name(s: &str) -> Result<u8> {
                  `[[resources]]`. See docs/architecture/abi_layers.md."
         ))),
         _ => Err(Error::Module(format!(
-            "unknown contract name: {s} — expected one of: gpio, spi, i2c, pio, \
-             uart, adc, pwm, fs, storage.namespace, storage.object, usb_host, \
-             platform_nic_ring, platform_dma, platform_dma_fd, \
-             pcie_device, trust, host_mount (see docs/architecture/abi_layers.md)"
+            "unknown contract name: {s} — expected one of: {} (see \
+             docs/architecture/abi_layers.md)",
+            PROVIDER_CONTRACTS.join(", ")
         ))),
     }
 }
@@ -238,6 +240,10 @@ pub fn contract_name_to_str(class: u8) -> &'static str {
         0x15 => "usb_host",
         0x16 => "proc",
         0x1A => "workload",
+        0x1D => "trust",
+        0x1E => "net_policy",
+        0x1F => "host_mount",
+        0x20 => "net_route",
         _ => "unknown",
     }
 }
@@ -945,6 +951,77 @@ pub struct VariantDecl {
     pub omit_ports: Vec<String>,
     /// Provider capabilities absent from this artifact.
     pub omit_capabilities: Vec<String>,
+    /// `[variant.capacities]`: module-scope capacities this variant's
+    /// feature set changes, already resolved for the silicon. Applied by
+    /// `apply_variant` over the module-scope values.
+    pub capacities: std::collections::BTreeMap<String, u32>,
+    /// `[variant.capacities] heap_from_params`: the fields of the heap rule
+    /// this variant changes (a variant's feature set moves what the rest of
+    /// its heap holds, so its `base` differs). Unset fields keep the
+    /// module-scope rule's.
+    pub heap_from_params: Option<HeapFromParamsOverride>,
+}
+
+/// `[capacities] heap_from_params`: the module's heap cap scales with the
+/// bytes of some of its params. The composer totals the value bytes of every
+/// TLV entry whose tag is in `tags` (a chunked param counts each chunk) and,
+/// when that total passes `included`, gives the instance the heap cap
+/// `base + (total - included)` (params tag 0xEF), unless the graph set
+/// `heap.arena_bytes`, which wins. `base` is the module type's own default
+/// cap and `included` the param bytes that cap already holds, so a module
+/// that declares no more than that keeps its own figure and no tag is
+/// emitted. Resolved for the silicon like every other capacity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeapFromParams {
+    pub tags: Vec<u8>,
+    pub base: u32,
+    pub included: u32,
+}
+
+impl HeapFromParams {
+    /// Value bytes of the entries under this rule's tags in a params TLV
+    /// (`[magic][version][len u16]` then `[tag][len u8][value]` entries,
+    /// ending at tag 0xFF), walked as a module's `parse_tlv` walks it: an
+    /// entry counts only when it fits the blob.
+    pub fn declared_bytes(&self, tlv: &[u8]) -> u64 {
+        let mut total = 0u64;
+        let mut off = 4usize;
+        while off + 2 <= tlv.len() {
+            let tag = tlv[off];
+            let len = tlv[off + 1] as usize;
+            off += 2;
+            if tag == 0xFF {
+                break;
+            }
+            if off + len <= tlv.len() && self.tags.contains(&tag) {
+                total += len as u64;
+            }
+            off += len;
+        }
+        total
+    }
+
+    /// The smallest heap cap that holds `bytes` declared bytes: what `base`
+    /// keeps for everything else, plus the bytes. Wider than `u32` so the
+    /// caller can refuse an overflow.
+    pub fn need_for(&self, bytes: u64) -> u64 {
+        u64::from(self.base.saturating_sub(self.included)) + bytes
+    }
+
+    /// The cap to emit for `bytes`: `None` while `base` already holds them,
+    /// so the module keeps its own default and no tag is written; past
+    /// `included`, `base` grown by exactly the excess.
+    pub fn derived_cap(&self, bytes: u64) -> Option<u64> {
+        (bytes > u64::from(self.included)).then(|| self.need_for(bytes))
+    }
+}
+
+/// A variant's changes to the module-scope [`HeapFromParams`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HeapFromParamsOverride {
+    pub tags: Option<Vec<u8>>,
+    pub base: Option<u32>,
+    pub included: Option<u32>,
 }
 
 /// Fine-grained module permissions. Each category gates a specific
@@ -1031,11 +1108,11 @@ pub mod permission {
 /// parameter must not occupy them.
 pub const PARAM_TAG_MIN: u8 = 10;
 
-/// Highest tag a built-in `[[params]]` entry may claim. 0xEF..=0xFF are
-/// reserved for kernel, protection and policy metadata (0xEF the instance's
-/// heap cap, 0xFD voice-preset blobs, 0xFE TLV magic, 0xFF terminator among
-/// them).
-pub const PARAM_TAG_MAX: u8 = 0xEE;
+/// Highest tag a built-in `[[params]]` entry may claim. 0xEE..=0xFF are
+/// reserved for kernel, protection and policy metadata (0xEE raw arena use,
+/// 0xEF the instance's heap cap, 0xFD voice-preset blobs, 0xFE TLV magic,
+/// 0xFF terminator among them).
+pub const PARAM_TAG_MAX: u8 = 0xED;
 
 /// Param type categories declared in `[[params]]`. Matches the wire
 /// types used by the runtime TLV packer in `tools/src/schema.rs`.
@@ -1058,7 +1135,7 @@ pub struct ManifestParam {
     /// position, is the wire identity of the parameter, so entries may
     /// be reordered or inserted without changing any encoding.
     /// Legal range is [`PARAM_TAG_MIN`]..=[`PARAM_TAG_MAX`]; tags below
-    /// the minimum belong to the TLV framing and 0xEF..=0xFF are
+    /// the minimum belong to the TLV framing and 0xEE..=0xFF are
     /// reserved for protection/policy metadata.
     pub tag: u8,
     pub name: String,
@@ -1269,16 +1346,22 @@ pub struct Manifest {
     pub permissions: ManifestPermissions,
     pub dependencies: Vec<Dependency>,
     pub integrity_hash: Option<[u8; 32]>,
-    /// ABI wire-surface digest of the SDK/kernel tree this module was
-    /// PACKED against (`hash::abi_surface_digest`, flag bit 4 + trailing
-    /// 32-byte block in the binary). Packaging (slot-image, mktable,
-    /// combine) rejects a module whose attestation differs from the
-    /// current surface — a stale `.fmod` built before an ABI renumbering
-    /// cannot ride into a new image. `None` on a module packed without an
-    /// attestation (accepted, unverifiable).
+    /// ABI wire-surface digest of the SDK/kernel tree this module was built
+    /// against (`hash::abi_surface_digest`; flag bit 4 and the manifest's
+    /// final 32-byte block in the binary). A PIC module's is the digest its
+    /// ELF embeds (`FLUXOR_ABI_SURFACE`), which `pack` requires to equal the
+    /// packer's own; a wasm module's is stamped by the packer once the
+    /// payload is found to embed the current digest. Packaging (slot-image,
+    /// mktable, combine) rejects a module whose attestation differs from
+    /// the current surface, so an `.fmod` built against other ABI numbers
+    /// cannot ride into an image, and the kernel's loader refuses a module,
+    /// signed or not, that carries none or another surface's. `None` only
+    /// before packing stamps it.
     pub abi_surface: Option<[u8; 32]>,
-    /// Ed25519 signature over the integrity hash. Set by the `fluxor sign`
-    /// subcommand; absent on unsigned (v1) manifests.
+    /// Ed25519 signature over the module's signing envelope (header, code,
+    /// data, exports, schema, the manifest before its hash, and the
+    /// attestation). Set by the `fluxor sign` subcommand; absent on an
+    /// unsigned manifest.
     pub signature: Option<[u8; 64]>,
     /// SHA-256 fingerprint of the signer's Ed25519 public key. Loader
     /// matches this against OTP/provisioned pubkey to accept/reject.
@@ -1320,6 +1403,9 @@ pub struct Manifest {
     /// reads it instead of hard-coding a second copy. TOML-only, never
     /// serialized to the binary manifest.
     pub capacities: std::collections::BTreeMap<String, u32>,
+    /// `[capacities] heap_from_params`: the heap cap derived from declared
+    /// params bytes (see [`HeapFromParams`]). TOML-only.
+    pub heap_from_params: Option<HeapFromParams>,
     /// Module attests that its `module_step` / `module_isr_init` /
     /// `module_isr_entry` exports are safe to invoke from an ISR
     /// context: no heap allocation, no `provider_call`, no
@@ -1435,6 +1521,7 @@ impl Default for Manifest {
             builtin: false,
             variants: Vec::new(),
             capacities: std::collections::BTreeMap::new(),
+            heap_from_params: None,
             isr_safe: false,
             resume_after_fault: false,
             pre_tick_drain: false,
@@ -2027,6 +2114,20 @@ impl Manifest {
         };
         let omit = decl.omit_ports.clone();
         let omitted_caps = decl.omit_capabilities.clone();
+        for (k, v) in &decl.capacities {
+            self.capacities.insert(k.clone(), *v);
+        }
+        if let (Some(rule), Some(over)) = (self.heap_from_params.as_mut(), &decl.heap_from_params) {
+            if let Some(tags) = &over.tags {
+                rule.tags = tags.clone();
+            }
+            if let Some(base) = over.base {
+                rule.base = base;
+            }
+            if let Some(included) = over.included {
+                rule.included = included;
+            }
+        }
         self.capabilities.retain(|c| !omitted_caps.contains(c));
         self.capability_facts
             .retain(|c, _| !omitted_caps.contains(c));
@@ -2529,25 +2630,55 @@ impl Manifest {
                      the unsuffixed <module>.fmod carries"
                 )));
             }
-            variants = raw_variants
-                .into_iter()
-                .map(|v| VariantDecl {
+            for v in raw_variants {
+                let scope = format!("variant.{}.capacities", v.name);
+                let (capacities, heap_from_params) =
+                    resolve_capacities(v.capacities.unwrap_or_default(), abi, &scope)?;
+                variants.push(VariantDecl {
                     name: v.name,
                     features: v.features.unwrap_or_default(),
                     default: v.default,
                     omit_ports: v.omit_ports,
                     omit_capabilities: v.omit_capabilities,
-                })
-                .collect();
+                    capacities,
+                    heap_from_params,
+                });
+            }
         }
 
         // Module-scope capacities resolve against the same abi the port
         // capacities do, so one manifest read yields every bound the build
         // needs for this target.
-        let mut capacities = std::collections::BTreeMap::new();
-        for (name, value) in toml_val.capacities.unwrap_or_default() {
-            let resolved = value.resolve(abi, &format!("capacities.{name}"))?;
-            capacities.insert(name, resolved);
+        let (capacities, heap_rule) =
+            resolve_capacities(toml_val.capacities.unwrap_or_default(), abi, "capacities")?;
+        let heap_from_params = match heap_rule {
+            None => None,
+            Some(r) => Some(HeapFromParams {
+                tags: r.tags.filter(|t| !t.is_empty()).ok_or_else(|| {
+                    Error::Module(
+                        "capacities.heap_from_params names no `tags` — the rule scales the \
+                         heap with the bytes of those params"
+                            .into(),
+                    )
+                })?,
+                base: r.base.ok_or_else(|| {
+                    Error::Module(
+                        "capacities.heap_from_params has no `base` — the module type's \
+                         default heap cap"
+                            .into(),
+                    )
+                })?,
+                included: r.included.unwrap_or(0),
+            }),
+        };
+        if heap_from_params.is_none() {
+            if let Some(v) = variants.iter().find(|v| v.heap_from_params.is_some()) {
+                return Err(Error::Module(format!(
+                    "variant '{}' changes capacities.heap_from_params, but the module \
+                     declares no such rule at module scope",
+                    v.name
+                )));
+            }
         }
 
         let build = toml_val.build.unwrap_or_default();
@@ -2579,6 +2710,7 @@ impl Manifest {
             builtin,
             variants,
             capacities,
+            heap_from_params,
             isr_safe: toml_val.isr_safe,
             resume_after_fault: toml_val.resume_after_fault,
             pre_tick_drain: toml_val.pre_tick_drain,
@@ -2960,6 +3092,7 @@ impl Manifest {
             builtin: false,
             variants: Vec::new(), // toml-only, not serialized
             capacities: std::collections::BTreeMap::new(), // toml-only, not serialized
+            heap_from_params: None, // toml-only, not serialized
             isr_safe,
             // Author attestation, TOML-only: a binary-loaded manifest makes
             // no claim, so `fault_policy: restart` is refused (fail-closed).
@@ -3119,6 +3252,9 @@ struct TomlVariant {
     omit_ports: Vec<String>,
     #[serde(default)]
     omit_capabilities: Vec<String>,
+    /// `[variant.capacities]`: module-scope capacities this feature set
+    /// changes, in the module-scope form.
+    capacities: Option<std::collections::BTreeMap<String, TomlCapacity>>,
 }
 
 #[derive(Deserialize, Default)]
@@ -3181,7 +3317,7 @@ struct TomlManifest {
     /// flat number or a per-silicon table exactly like a port's
     /// `buffer_size`. Use it for a bound the module compiles in AND the
     /// build tooling has to respect, so the two can't drift.
-    capacities: Option<std::collections::BTreeMap<String, CapacityValue>>,
+    capacities: Option<std::collections::BTreeMap<String, TomlCapacity>>,
     /// `[capability_facts."<capability>"]` tables — the terms on which this
     /// module offers a capability it declares (`ack`, `ordering`,
     /// `max_payload`, …). Schema and admitted values live in
@@ -3575,6 +3711,87 @@ struct TomlParam {
 enum CapacityValue {
     Flat(u32),
     PerTarget(std::collections::BTreeMap<String, u32>),
+}
+
+/// One `[capacities]` entry: a capacity value, or (under the
+/// `heap_from_params` key alone) the heap rule's table. The rule is tried
+/// first: its fields are a closed set, so a per-target table never matches
+/// it.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum TomlCapacity {
+    HeapRule(TomlHeapFromParams),
+    Value(CapacityValue),
+}
+
+/// `heap_from_params = { tags = [...], base = ..., included = ... }`, each
+/// number flat or per-target. Every field is optional here so a variant
+/// can change one; module scope requires `tags` and `base`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TomlHeapFromParams {
+    tags: Option<Vec<u8>>,
+    base: Option<CapacityValue>,
+    included: Option<CapacityValue>,
+}
+
+/// The `[capacities]` key that holds the heap rule.
+const HEAP_FROM_PARAMS_KEY: &str = "heap_from_params";
+
+/// Resolve a `[capacities]` table for `abi`: the plain capacities, and the
+/// heap rule's fields when the table states it. `scope` names the table in
+/// errors (`capacities`, `variant.<name>.capacities`).
+fn resolve_capacities(
+    raw: std::collections::BTreeMap<String, TomlCapacity>,
+    abi: Option<&str>,
+    scope: &str,
+) -> Result<(
+    std::collections::BTreeMap<String, u32>,
+    Option<HeapFromParamsOverride>,
+)> {
+    let mut capacities = std::collections::BTreeMap::new();
+    let mut rule = None;
+    for (name, value) in raw {
+        let field = format!("{scope}.{name}");
+        match (name == HEAP_FROM_PARAMS_KEY, value) {
+            (false, TomlCapacity::Value(v)) => {
+                capacities.insert(name, v.resolve(abi, &field)?);
+            }
+            (true, TomlCapacity::HeapRule(r)) => {
+                if let Some(tag) = r.tags.iter().flatten().find(|&&t| t > PARAM_TAG_MAX) {
+                    return Err(Error::Module(format!(
+                        "{field}: tag {tag:#04x} is reserved for kernel metadata \
+                         ({:#04x}..=0xff); the rule counts the module's own params tags",
+                        PARAM_TAG_MAX + 1
+                    )));
+                }
+                rule = Some(HeapFromParamsOverride {
+                    tags: r.tags,
+                    base: r
+                        .base
+                        .map(|v| v.resolve(abi, &format!("{field}.base")))
+                        .transpose()?,
+                    included: r
+                        .included
+                        .map(|v| v.resolve(abi, &format!("{field}.included")))
+                        .transpose()?,
+                });
+            }
+            (true, TomlCapacity::Value(_)) => {
+                return Err(Error::Module(format!(
+                    "{field} is a table `{{ tags = [...], base = ..., included = ... }}`, \
+                     not a number"
+                )));
+            }
+            (false, TomlCapacity::HeapRule(_)) => {
+                return Err(Error::Module(format!(
+                    "{field}: a capacity is a number or a per-target table; only \
+                     `{HEAP_FROM_PARAMS_KEY}` takes a rule table"
+                )));
+            }
+        }
+    }
+    Ok((capacities, rule))
 }
 
 const CAPACITY_TARGET_KEYS: &[&str] = &[
@@ -4245,6 +4462,106 @@ scratch = 512
             err.contains("capacities.idtable"),
             "error should name the offending capacity: {err}"
         );
+    }
+
+    /// `[capacities] heap_from_params` resolves per ABI like any capacity,
+    /// and a variant's `[variant.capacities]` changes only the fields it
+    /// names.
+    #[test]
+    fn heap_from_params_resolves_per_abi_and_variant() {
+        const TOML: &str = r#"
+version = "1.0.0"
+hardware_targets = ["bcm2712", "rp2350"]
+
+[[variant]]
+name = "full"
+features = []
+default = true
+
+[[variant]]
+name = "slim"
+features = []
+[variant.capacities]
+heap_from_params = { base = { default = 500, aarch64 = 5000 } }
+store_subscriptions = 3
+
+[capacities]
+heap_from_params = { tags = [2, 11], base = { default = 900, aarch64 = 9000 }, included = { default = 40, aarch64 = 400 } }
+store_subscriptions = 1
+"#;
+        let m = Manifest::from_toml_str_for_target(TOML, Some("aarch64")).expect("aarch64");
+        let rule = m.heap_from_params.clone().expect("rule");
+        assert_eq!(
+            rule,
+            HeapFromParams {
+                tags: vec![2, 11],
+                base: 9000,
+                included: 400
+            }
+        );
+        // At or under `included` the type's own cap holds them: no tag.
+        assert_eq!(rule.derived_cap(0), None);
+        assert_eq!(rule.derived_cap(400), None);
+        // Past it, `base` grows by exactly the excess.
+        assert_eq!(rule.derived_cap(401), Some(9001));
+        assert_eq!(rule.need_for(100), 8700);
+
+        let small = Manifest::from_toml_str_for_target(TOML, Some("thumbv8m")).expect("thumb");
+        assert_eq!(small.heap_from_params.as_ref().unwrap().base, 900);
+        assert_eq!(small.heap_from_params.as_ref().unwrap().included, 40);
+
+        let mut slim = m.clone();
+        slim.apply_variant("slim").expect("slim");
+        let r = slim.heap_from_params.as_ref().unwrap();
+        assert_eq!(
+            (r.tags.clone(), r.base, r.included),
+            (vec![2, 11], 5000, 400)
+        );
+        assert_eq!(slim.capacities["store_subscriptions"], 3);
+        let mut full = m.clone();
+        full.apply_variant("full").expect("full");
+        assert_eq!(full.heap_from_params, m.heap_from_params);
+
+        // The rule counts every chunk under its tags, as the module's
+        // `parse_tlv` walk would, and stops at the end marker.
+        let tlv = [
+            0xFE, 0x01, 0, 0, 2, 3, b'a', b'b', b'c', 5, 1, 9, 11, 2, b'x', b'y', 0xFF, 0, 2, 1, 0,
+        ];
+        assert_eq!(rule.declared_bytes(&tlv), 5);
+
+        for (bad, why) in [
+            (
+                "[capacities]\nheap_from_params = { base = 1 }\n",
+                "names no `tags`",
+            ),
+            (
+                "[capacities]\nheap_from_params = { tags = [2] }\n",
+                "has no `base`",
+            ),
+            ("[capacities]\nheap_from_params = 5\n", "is a table"),
+            (
+                "[capacities]\nheap_from_params = { tags = [0xEF], base = 1 }\n",
+                "reserved for kernel metadata",
+            ),
+            (
+                "[capacities]\nheap_from_params = { tags = [0xEE], base = 1 }\n",
+                "tag 0xee is reserved for kernel metadata (0xee..=0xff)",
+            ),
+            (
+                "[capacities]\nscratch = { tags = [2], base = 1 }\n",
+                "only `heap_from_params` takes a rule table",
+            ),
+            (
+                "[capacities]\nheap_from_params = { tags = [2], base = 1, per_byte = 2 }\n",
+                "",
+            ),
+        ] {
+            let src = format!("version = \"1.0.0\"\n{bad}");
+            let err = Manifest::from_toml_str_for_target(&src, Some("aarch64"))
+                .expect_err(bad)
+                .to_string();
+            assert!(err.contains(why), "{bad}: {err}");
+        }
     }
 
     /// `hardware_targets` names runtimes; anything else is refused.

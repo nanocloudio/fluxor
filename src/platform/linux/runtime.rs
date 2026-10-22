@@ -380,7 +380,9 @@ fn linux_ota_stage_protect(base: *mut u8, len: usize, executable: bool) -> bool 
     let page = page as usize;
     let start = base as usize;
     if !start.is_multiple_of(page) {
-        log::error!("[ota] stage protect: base {start:#x} is not aligned to the host's {page}-byte page");
+        log::error!(
+            "[ota] stage protect: base {start:#x} is not aligned to the host's {page}-byte page"
+        );
         return false;
     }
     let end = (start + len + page - 1) & !(page - 1);
@@ -422,6 +424,16 @@ fn linux_owner_released(owner: fluxor::kernel::workload::owner::OwnerHandle) {
 }
 
 fn linux_init_providers() {
+    // Instance scoping first: `FLUXOR_STATE_DIR` (this instance's own state
+    // directory, locked for the runtime's life; distinct from
+    // `FLUXOR_STORE_DIR`) and `FLUXOR_INSTANCE` (the tag naming this runtime
+    // in the host registry, default a digest of the state directory). A
+    // state directory or tag another live runtime holds stops the runtime
+    // here, before it touches anything host-global.
+    if let Err(e) = fluxor::platform::linux::instance::init_from_env() {
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    }
     // Override the default stub FS provider with one backed by real
     // libc I/O. The dispatcher also answers
     // `contracts::fence::QUERY_OP`, surfacing the per-handle fence
@@ -443,6 +455,17 @@ fn linux_init_providers() {
         dev_class::NET_POLICY,
         fluxor::platform::linux::net_policy::dispatch,
     );
+    // How the node's workloads reach each other and the outside world:
+    // segments, peer routes and held addresses realized in the host's
+    // network domain under this instance's tag. Probes the host at start
+    // (privilege, tunables, the rule tool, an active forwarding probe) and
+    // again periodically; with no FLUXOR_STATE_DIR it realizes nothing and
+    // says so.
+    provider::register(
+        dev_class::NET_ROUTE,
+        fluxor::platform::linux::net_route::dispatch,
+    );
+    fluxor::platform::linux::net_route::init();
     // storage.object over HTTP `Range:` — wasm peer in
     // `src/platform/wasm/object.rs`; shared windowing in
     // `abi::contracts::storage::object::range`.
@@ -537,7 +560,10 @@ fn linux_boot_scan() {
 
 /// The params a module is handed: compiled params in place unless the
 /// parameter store holds an override for it (`param_store::runtime_params`).
-fn linux_runtime_params(module_id: u16, compiled: &[u8]) -> fluxor::kernel::sys::hal::RuntimeParams {
+fn linux_runtime_params(
+    module_id: u16,
+    compiled: &[u8],
+) -> fluxor::kernel::sys::hal::RuntimeParams {
     use fluxor::kernel::sys::hal::RuntimeParams;
     match param_store::merged_params(module_id, compiled) {
         None => RuntimeParams::Compiled,

@@ -33,7 +33,7 @@ pub fn owners_mut() -> &'static mut OwnerTable {
 pub fn module_owner(module_idx: usize) -> OwnerHandle {
     #[cfg(feature = "multitenant")]
     {
-        if module_idx >= MAX_MODULES {
+        if module_idx >= module_slots() {
             return OWNER_SYSTEM;
         }
         // SAFETY: scheduler-thread read; module_idx bounded above.
@@ -51,7 +51,7 @@ pub fn module_owner(module_idx: usize) -> OwnerHandle {
 pub fn set_module_owner(module_idx: usize, owner: OwnerHandle) {
     #[cfg(feature = "multitenant")]
     {
-        if module_idx < MAX_MODULES {
+        if module_idx < module_slots() {
             // SAFETY: scheduler-thread-exclusive mutation; module_idx bounded.
             unsafe {
                 SCHED.module_owner[module_idx] = owner;
@@ -94,7 +94,7 @@ pub fn caller_authority() -> OwnerHandle {
 
 /// Whether module N has returned StepOutcome::Done.
 pub fn module_is_finished(module_idx: usize) -> bool {
-    if module_idx >= MAX_MODULES {
+    if module_idx >= module_slots() {
         return false;
     }
     // SAFETY: scheduler-thread read; module_idx bounded.
@@ -168,27 +168,27 @@ impl OwnerLiveStatus {
 
 /// Snapshot the live per-owner runtime status: every non-free workload slot,
 /// with the fault/finish state of its stamped module range aggregated in.
-/// Writes into `out` and returns the record count. Allocation-free;
-/// scheduler-thread only (same access class as `module_fault_state`).
+/// Writes into `out` — as many records as it holds; one per owner slot
+/// (`owners().slot_count()`) holds them all — and returns the record count.
+/// Scheduler-thread only (same access class as `module_fault_state`).
 ///
 /// On single-tenant builds (`MAX_OWNERS == 1`) there are no workload slots
 /// and this always returns 0.
-pub fn owner_live_snapshot(out: &mut [OwnerLiveStatus; MAX_OWNERS]) -> usize {
+pub fn owner_live_snapshot(out: &mut [OwnerLiveStatus]) -> usize {
     // SAFETY: scheduler-thread read of the static owner table + fault state.
     let sched = unsafe {
         let p = &raw const SCHED;
         &*p
     };
     let mut count = 0usize;
-    // Empty range on single-tenant (MAX_OWNERS == 1) builds — returns 0, per the doc above.
-    #[allow(
-        clippy::reversed_empty_ranges,
-        reason = "empty by design when MAX_OWNERS == 1 (single-tenant)"
-    )]
-    for slot in 1..MAX_OWNERS {
+    // Empty range on single-tenant (one slot) builds — returns 0, per the doc above.
+    for slot in 1..sched.owners.slot_count() {
         let Some(e) = sched.owners.entry_at(slot) else {
             continue;
         };
+        if count == out.len() {
+            break;
+        }
         if matches!(e.state, crate::kernel::workload::owner::OwnerState::Free) {
             continue;
         }
@@ -209,8 +209,8 @@ pub fn owner_live_snapshot(out: &mut [OwnerLiveStatus; MAX_OWNERS]) -> usize {
     // Fold each module's state into its owning record. A stale stamp (owner
     // slot reused at a newer generation) attributes to nobody — the module
     // belongs to the previous occupant, not the current one.
-    let mut last_fault_ms = [0u64; MAX_OWNERS];
-    for idx in 0..MAX_MODULES {
+    let mut last_fault_ms = crate::scratch![0u64; MAX_OWNERS, count];
+    for idx in 0..module_slots() {
         let owner = module_owner(idx);
         if owner.is_system() {
             continue;
@@ -268,7 +268,7 @@ pub fn owner_modules_quiescent(handle: OwnerHandle) -> bool {
         &*p
     };
     let mut owned = [false; MAX_MODULES];
-    for (idx, is_owned) in owned.iter_mut().enumerate() {
+    for (idx, is_owned) in owned.iter_mut().enumerate().take(module_slots()) {
         if module_owner(idx) != handle {
             continue;
         }
@@ -284,8 +284,8 @@ pub fn owner_modules_quiescent(handle: OwnerHandle) -> bool {
     // In-flight frames: revoking now would drop a queued input; wait for the
     // pipeline to run dry (the deadline bounds a pipeline that never does).
     for edge in sched.edges.iter().take(sched.edge_count) {
-        let touches_owner = (edge.from_module < MAX_MODULES && owned[edge.from_module])
-            || (edge.to_module < MAX_MODULES && owned[edge.to_module]);
+        let touches_owner = (edge.from_module < module_slots() && owned[edge.from_module])
+            || (edge.to_module < module_slots() && owned[edge.to_module]);
         if touches_owner && crate::kernel::ipc::channel::channel_has_pending(edge.channel) {
             return false;
         }
@@ -309,7 +309,7 @@ pub fn channel_producer_owner(ch: i32) -> OwnerHandle {
         &*p
     };
     for edge in sched.edges.iter().take(sched.edge_count) {
-        if edge.channel == ch && edge.from_module < MAX_MODULES {
+        if edge.channel == ch && edge.from_module < module_slots() {
             return module_owner(edge.from_module);
         }
     }
@@ -330,7 +330,7 @@ pub fn channel_producer_module(ch: i32) -> Option<usize> {
         .edges
         .iter()
         .take(sched.edge_count)
-        .find(|e| e.channel == ch && e.from_module < MAX_MODULES)
+        .find(|e| e.channel == ch && e.from_module < module_slots())
         .map(|e| e.from_module)
 }
 
@@ -349,7 +349,7 @@ pub fn channel_consumer_module(ch: i32) -> Option<usize> {
         .edges
         .iter()
         .take(sched.edge_count)
-        .find(|e| e.channel == ch && e.to_module < MAX_MODULES)
+        .find(|e| e.channel == ch && e.to_module < module_slots())
         .map(|e| e.to_module)
 }
 
@@ -380,14 +380,14 @@ pub fn module_owner_attribution(module_idx: usize) -> Option<([u8; 16], u16, u32
 /// step-guard fault path (which requires a running step loop).
 #[doc(hidden)]
 pub fn force_module_fault_state_for_test(module_idx: usize, state: FaultState, fault_kind: u8) {
-    if module_idx >= MAX_MODULES {
+    if module_idx >= module_slots() {
         return;
     }
     // SAFETY: single-threaded test context; module_idx bounded.
     unsafe {
         let p = &raw mut SCHED;
-        (*p).fault_info[module_idx].state = state;
-        (*p).fault_info[module_idx].last_fault_type = fault_kind;
+        (&mut (*p).fault_info)[module_idx].state = state;
+        (&mut (*p).fault_info)[module_idx].last_fault_type = fault_kind;
     }
 }
 
@@ -395,13 +395,13 @@ pub fn force_module_fault_state_for_test(module_idx: usize, state: FaultState, f
 /// status-aggregation tests can stage loaded vs failed-instantiate modules.
 #[doc(hidden)]
 pub fn force_module_loaded_for_test(module_idx: usize, loaded: bool) {
-    if module_idx >= MAX_MODULES {
+    if module_idx >= module_slots() {
         return;
     }
     // SAFETY: single-threaded test context; module_idx bounded.
     unsafe {
         let p = &raw mut SCHED;
-        (*p).modules[module_idx] = if loaded {
+        (&mut (*p).modules)[module_idx] = if loaded {
             ModuleSlot::Dummy(DummyModule)
         } else {
             ModuleSlot::Empty
@@ -412,13 +412,13 @@ pub fn force_module_loaded_for_test(module_idx: usize, loaded: bool) {
 /// Test-only: force module `idx`'s `finished` flag (StepOutcome::Done).
 #[doc(hidden)]
 pub fn force_module_finished_for_test(module_idx: usize, finished: bool) {
-    if module_idx >= MAX_MODULES {
+    if module_idx >= module_slots() {
         return;
     }
     // SAFETY: single-threaded test context; module_idx bounded.
     unsafe {
         let p = &raw mut SCHED;
-        (*p).finished[module_idx] = finished;
+        (&mut (*p).finished)[module_idx] = finished;
     }
 }
 
@@ -459,7 +459,7 @@ pub fn take_rebuild_request() -> Option<(*const u8, usize)> {
 /// memory and slot are kept until the source has returned them (see
 /// `block_lend`), and everything else is torn down at once.
 pub fn free_module_state(module_idx: usize) {
-    if module_idx >= MAX_MODULES {
+    if module_idx >= module_slots() {
         return;
     }
     // SAFETY: teardown context — the scheduler thread is the sole mutator.

@@ -1201,7 +1201,7 @@ fn abi_surface_advice(elf: &Path, embedded: &[u8; 32], current: &[u8; 32]) -> &'
 
 /// Read the compile-time ABI-surface attestation embedded by the SDK
 /// (`runtime.rs` `FLUXOR_ABI_SURFACE`, a 32-byte `.rodata` static). Returns
-/// `None` when the symbol is absent (a module built by a pre-embed SDK).
+/// `None` when the symbol is absent (an ELF not linked against the SDK runtime).
 fn read_embedded_abi_surface(sections: &[ElfSection], symbols: &[ElfSymbol]) -> Option<[u8; 32]> {
     // Substring match: the symbol is mangled (per-crate) to avoid host-link
     // collisions when several modules link together (harness), so the exact
@@ -1263,6 +1263,46 @@ fn read_embedded_arena_bytes(sections: &[ElfSection], symbols: &[ElfSymbol]) -> 
     let start = (sym.value as usize).checked_sub(sec.addr)?;
     let bytes = sec.data.get(start..start + 4)?;
     Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+/// A `[capacities] heap_from_params` rule's `base` is the module type's
+/// default heap cap, which the composer grows from. It is a copy of a figure
+/// the module computes, so `pack` holds the two equal for the very build it
+/// packs — this ABI, this variant: the module must declare its arena
+/// (`declare_module_arena_bytes!`) and the manifest's `base`, resolved for
+/// both, must be that figure. A drifted `base` would size every derived cap
+/// wrong, too small (the module refuses its params) or too large (the
+/// ledger charges what is never used).
+fn check_heap_rule_base(
+    input: &Path,
+    manifest: &Manifest,
+    declared_arena: Option<u32>,
+    abi: Option<&str>,
+    variant: Option<&str>,
+) -> Result<()> {
+    let Some(rule) = manifest.heap_from_params.as_ref() else {
+        return Ok(());
+    };
+    let build = format!(
+        "{} / variant {}",
+        abi.unwrap_or("<no abi>"),
+        variant.unwrap_or("<default>")
+    );
+    match declared_arena {
+        Some(bytes) if bytes == rule.base => Ok(()),
+        Some(bytes) => Err(Error::Module(format!(
+            "{}: `[capacities] heap_from_params.base` is {} B for {build}, but this build \
+             declares a {bytes} B arena — set `base` to {bytes} for this ABI and variant",
+            input.display(),
+            rule.base
+        ))),
+        None => Err(Error::Module(format!(
+            "{}: declares `[capacities] heap_from_params` but no arena \
+             (`declare_module_arena_bytes!`), so its `base` cannot be checked against \
+             the build ({build})",
+            input.display()
+        ))),
+    }
 }
 
 /// The output sections a module image carries: code and read-only data (laid
@@ -1536,6 +1576,13 @@ pub fn pack_fmod(
     if let Some(v) = variant {
         module_manifest.apply_variant(v)?;
     }
+    check_heap_rule_base(
+        input,
+        &module_manifest,
+        read_embedded_arena_bytes(&sections, &symbols),
+        target_abi,
+        variant,
+    )?;
 
     // Compute integrity hash over code + data sections (use code_data which preserves layout)
     module_manifest.integrity_hash = Some(manifest::compute_integrity(&code_data, data_data));
@@ -1836,6 +1883,16 @@ pub fn pack_fmod_wasm(
     // embeds a different digest, so the current bytes are absent and it is
     // rejected. A window scan suffices; resolving the wasm data segment is
     // unnecessary since a specific sha256 cannot plausibly occur by chance.
+    //
+    // The attestation is PACKER-STAMPED here, unlike the PIC path above,
+    // which copies the digest out of the ELF's own symbol: the scan proves
+    // the current digest occurs in the payload, and the packer then writes
+    // its own `current_surface` into the manifest. The two are equal by the
+    // check, so the stamp is no weaker as a value; what it does not prove is
+    // which data segment carried it (a module embedding several digests
+    // passes if one of them is current). The kernel's loader checks this
+    // stamp like any module's (`validate_module`); the wasm instructions
+    // themselves are the host engine's to verify.
     let current_surface = crate::hash::abi_surface_digest();
     if !wasm_data
         .windows(32)
@@ -2118,6 +2175,37 @@ mod tests {
     }
 
     use super::*;
+
+    /// `pack` holds a heap rule's `base` to the arena the build declares,
+    /// for the ABI and variant it packs, and refuses one it cannot check.
+    #[test]
+    fn heap_rule_base_must_be_the_declared_arena() {
+        const TOML: &str = "version = \"1.0.0\"\n\
+            [[variant]]\nname = \"full\"\nfeatures = []\ndefault = true\n\
+            [[variant]]\nname = \"slim\"\nfeatures = []\n\
+            [variant.capacities.heap_from_params]\nbase = { default = 50, thumbv6m = 5 }\n\
+            [capacities]\nheap_from_params = { tags = [2], base = { default = 900, thumbv6m = 90 } }\n";
+        let at = |abi: &str, variant: &str| {
+            let mut m = Manifest::from_toml_str_for_target(TOML, Some(abi)).unwrap();
+            m.apply_variant(variant).unwrap();
+            m
+        };
+        let p = Path::new("http.elf");
+        let ok = |abi, v, arena| check_heap_rule_base(p, &at(abi, v), arena, Some(abi), Some(v));
+        ok("aarch64", "full", Some(900)).expect("matches");
+        ok("thumbv6m", "full", Some(90)).expect("per ABI");
+        ok("aarch64", "slim", Some(50)).expect("per variant");
+        ok("thumbv6m", "slim", Some(5)).expect("per ABI and variant");
+        let e = ok("aarch64", "slim", Some(900)).unwrap_err().to_string();
+        assert!(
+            e.contains("is 50 B for aarch64 / variant slim") && e.contains("set `base` to 900"),
+            "{e}"
+        );
+        let e = ok("aarch64", "full", None).unwrap_err().to_string();
+        assert!(e.contains("declare_module_arena_bytes!"), "{e}");
+        // No rule: nothing to check.
+        check_heap_rule_base(p, &Manifest::default(), None, None, None).expect("no rule");
+    }
 
     /// A wasm module whose schema has a `str_chunked` param keeps its
     /// schema: the scanner knows every type id the schema table does.

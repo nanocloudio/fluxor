@@ -993,10 +993,17 @@ unsafe fn parse_extended_params(s: &mut QuicState, params: *const u8, params_len
     // (e.g. payload_len = 0x000c → bytes `0c 00 ..`).
     let mut pos = 0;
     if params_len >= 4 && data[0] == TLV_MAGIC && data[1] == TLV_VERSION {
-        let payload_len = ((data[3] as usize) << 8) | (data[2] as usize);
-        let basic_end = 4 + payload_len;
-        if basic_end <= params_len {
-            pos = basic_end;
+        // Walked to the `0xFF` terminator, not taken from the header's u16
+        // payload length, which saturates for params past 64 KiB. The scan
+        // starts just past the terminator's tag; the `0x00` the composer
+        // writes after it matches no extended tag and is stepped over.
+        let mut p = 4usize;
+        while let (Some(&tag), Some(&n)) = (data.get(p), data.get(p + 1)) {
+            if tag == 0xFF {
+                pos = p + 1;
+                break;
+            }
+            p += 2 + n as usize;
         }
     }
     while pos + 4 <= params_len {

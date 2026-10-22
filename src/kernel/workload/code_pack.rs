@@ -22,6 +22,7 @@
 //! Scheduler-thread state, like the scheduler's own: CREATE and owner
 //! teardown both run there.
 
+use crate::kernel::mem::table::Table;
 use crate::kernel::module::loader::{self, ModuleLoader};
 use crate::kernel::sys::errno;
 use crate::kernel::sys::hal;
@@ -41,7 +42,9 @@ pub const POOL_SIZE: usize = 0;
 
 const PAGES: usize = POOL_SIZE / PAGE;
 
-/// Regions at once: one per owner, and one being staged.
+/// Regions at once: one per owner, and one being staged. The static
+/// profile's compiled size; where tables are sized at boot they are sized to
+/// the owner table plus one ([`size`]).
 const REGIONS: usize = crate::kernel::workload::owner::MAX_OWNERS + 1;
 
 #[repr(C, align(65536))]
@@ -74,14 +77,44 @@ impl Region {
 }
 
 struct State {
-    regions: [Region; REGIONS],
-    loaders: [ModuleLoader; REGIONS],
+    regions: Table<Region, REGIONS>,
+    loaders: Table<ModuleLoader, REGIONS>,
 }
 
+/// Regions a table no plan has sized takes on first use: one per owner the
+/// plan's defaults seat, and one being staged.
+#[cfg(any(feature = "host-linux", feature = "chip-bcm2712"))]
+fn default_regions() -> usize {
+    crate::kernel::sys::resource_ledger::ceiling(crate::abi::contracts::resource::POOL_OWNERS)
+        as usize
+        + 1
+}
+
+#[cfg(any(feature = "host-linux", feature = "chip-bcm2712"))]
 static mut STATE: State = State {
-    regions: [Region::EMPTY; REGIONS],
-    loaders: [const { ModuleLoader::new() }; REGIONS],
+    regions: Table::new_planned(|_| Region::EMPTY, default_regions),
+    loaders: Table::new_planned(|_| ModuleLoader::new(), default_regions),
 };
+
+#[cfg(not(any(feature = "host-linux", feature = "chip-bcm2712")))]
+static mut STATE: State = State {
+    regions: Table::from_array([Region::EMPTY; REGIONS]),
+    loaders: Table::from_array([const { ModuleLoader::new() }; REGIONS]),
+};
+
+/// Size the region tables for `owners` owner slots: one region each, and
+/// one being staged.
+///
+/// # Safety
+/// Graph-preparation context: no reference into the tables is live.
+pub unsafe fn size(owners: usize) -> Result<(), crate::kernel::mem::table::TableError> {
+    let st = &*core::ptr::addr_of!(STATE);
+    let n = owners + 1;
+    st.regions.reserve(n)?;
+    st.regions.grow(n)?;
+    st.loaders.reserve(n)?;
+    st.loaders.grow(n)
+}
 
 fn state() -> &'static mut State {
     // SAFETY: scheduler-thread state (see the module doc).
@@ -229,7 +262,7 @@ pub fn release_owner(owner_slot: u16) {
 /// they ran. The node's own image may have changed with it (an OTA swaps the
 /// table), so its digests are computed afresh.
 pub fn reset() {
-    for id in 0..REGIONS {
+    for id in 0..state().regions.len() {
         free(id);
     }
     // SAFETY: scheduler-thread state.
@@ -325,24 +358,27 @@ pub fn resolve(name_hash: u32, fallback: &ModuleLoader) -> &ModuleLoader {
     fallback
 }
 
-/// The kernel's verdict on one pack module: the module the orchestrator
-/// asked for (`pinned` holds the SHA-256 of its full bytes), or one the
-/// node's signing root signed.
+/// The kernel's verdict on one pack module: it passes `validate_module` like
+/// every module the node runs (integrity, signature where present, and an
+/// ABI-surface attestation equal to this kernel's), AND it is the module the
+/// orchestrator asked for (`pinned` holds the SHA-256 of its full bytes) or
+/// one the node's signing root signed. A pin names which bytes to run; it
+/// does not excuse them from being built for this kernel.
 pub fn admitted_with(
     bytes: &[u8],
     module: &loader::LoadedModule,
     pinned: impl Fn(&[u8; 32]) -> bool,
 ) -> bool {
+    let Ok(signing) = loader::validate_module(module, "pack") else {
+        return false;
+    };
+    if matches!(signing, loader::Signing::RootVerified) {
+        return true;
+    }
     let digest = {
         let mut h = crate::kernel::security::crypto::sha256::Sha256::new();
         h.update(bytes);
         h.finalize()
     };
-    if pinned(&digest) {
-        return true;
-    }
-    matches!(
-        loader::validate_module(module, "pack"),
-        Ok(loader::Signing::RootVerified)
-    )
+    pinned(&digest)
 }

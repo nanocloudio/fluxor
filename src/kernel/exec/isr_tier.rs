@@ -495,7 +495,7 @@ pub unsafe fn isr_tier2_trampoline(irq_number: u16) -> i32 {
 ///
 /// Returns the metrics struct, or None if invalid tier/slot.
 pub fn query_metrics(tier: u8, slot: u8) -> Option<IsrMetrics> {
-    // SAFETY: `IsrMetrics` is `Copy` POD; reading the snapshot races with
+    // SAFETY: `IsrMetrics` is `Copy` plain data; reading the snapshot races with
     // ISR increments but each field is `u32`/aligned-load atomic on the
     // supported architectures, and the metrics struct is documented as
     // best-effort introspection.
@@ -554,17 +554,17 @@ pub const MODULE_MAX_BRIDGES: usize = MAX_ISR_BRIDGES;
 /// This is the kernel side of the module-facing ISR-bridge ABI: an ISR-tier
 /// module enumerates its own bridge endpoints via the `SELF_BRIDGES` opcode,
 /// then reads/writes them with the bridge `WRITE`/`READ`/`POLL`/`INFO` opcodes
-/// (which are exempt from the §D7 ISR-context syscall deny because the
+/// (which are exempt from the ISR-context syscall deny because the
 /// underlying `RingBridge` ops are lock-free and allocation-free). This is how a
 /// PIC module reaches its bridges from `module_step` / `module_isr_entry`
-/// without routing through `provider_call`, which the §D7 gate denies for
+/// without routing through `provider_call`, which that gate denies for
 /// ISR-tier callers.
 pub fn module_bridge_slots(
     module_index: ModuleId,
 ) -> Option<([i8; MAX_ISR_BRIDGES], [i8; MAX_ISR_BRIDGES])> {
     // SAFETY: the ISR slot arrays are populated only at graph bring-up
     // (single-threaded) and are read-only thereafter; this is a shared read of
-    // POD `i8` arrays / `bool` / `u8` fields.
+    // plain-data `i8` arrays / `bool` / `u8` fields.
     unsafe {
         let t2 = &raw const ISR_T2_SLOTS;
         for slot in (*t2).iter().take(ISR_T2_COUNT as usize) {
@@ -676,7 +676,7 @@ pub fn isr_metrics_dispatch(arg: *mut u8, arg_len: usize) -> i32 {
                 return crate::kernel::sys::errno::EINVAL;
             }
             // SAFETY: `arg_len >= out_size` checked above; `IsrMetrics` is
-            // `Copy` POD so byte-copy preserves representation.
+            // `Copy` plain data, so byte-copy preserves representation.
             unsafe {
                 let src = &metrics as *const IsrMetrics as *const u8;
                 core::ptr::copy_nonoverlapping(src, arg, out_size);

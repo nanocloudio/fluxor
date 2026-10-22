@@ -180,7 +180,12 @@ pub fn decode_config(data: &[u8]) -> Result<Value> {
         let mut m = Map::new();
         m.insert(
             "id".into(),
-            json!(u16::from(head[8]) | (u16::from((meta >> 5) & 0x03) << 8)),
+            json!(
+                u16::from(head[8])
+                    | (u16::from((meta >> 5) & 0x03) << 8)
+                    | (u16::from(meta >> 7) << 10)
+                    | (u16::from((meta >> 3) & 0x01) << 11)
+            ),
         );
         m.insert(
             "name_hash".into(),

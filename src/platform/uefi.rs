@@ -21,8 +21,8 @@ use core::arch::global_asm;
 use core::panic::PanicInfo;
 
 use fluxor_contracts::boot::{
-    BootInfo, MemKind, MemRegion, BOOT_INFO_MAGIC, CONSOLE_16550, CONSOLE_16550_GAS,
-    CONSOLE_PL011, CONSOLE_SBSA,
+    BootInfo, MemKind, MemRegion, BOOT_INFO_MAGIC, CONSOLE_16550, CONSOLE_16550_GAS, CONSOLE_PL011,
+    CONSOLE_SBSA,
 };
 
 global_asm!(
@@ -105,7 +105,9 @@ impl Console {
             match self.kind {
                 CONSOLE_PL011 | CONSOLE_SBSA => {
                     // FR.TXFF (bit 5) set while the transmit FIFO is full.
-                    while core::ptr::read_volatile((self.base + 0x18) as *const u32) & (1 << 5) != 0 {}
+                    while core::ptr::read_volatile((self.base + 0x18) as *const u32) & (1 << 5) != 0
+                    {
+                    }
                     core::ptr::write_volatile(self.base as *mut u32, u32::from(c));
                 }
                 _ => {
@@ -190,7 +192,9 @@ extern "C" fn uefi_main(info: *const BootInfo) -> ! {
     // SAFETY: the loader's handoff, cleaned to the point of coherency before
     // the jump; read only after its magic is checked.
     let info = unsafe {
-        if info.is_null() || core::ptr::read_volatile(core::ptr::addr_of!((*info).magic)) != BOOT_INFO_MAGIC {
+        if info.is_null()
+            || core::ptr::read_volatile(core::ptr::addr_of!((*info).magic)) != BOOT_INFO_MAGIC
+        {
             park();
         }
         &*info

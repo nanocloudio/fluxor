@@ -42,7 +42,6 @@ use core::cell::UnsafeCell;
 use portable_atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::abi::contracts::storage::block::{caps, cpl, ioctl, req, Req};
-use crate::kernel::boot::config::MAX_MODULES;
 use crate::kernel::exec::scheduler::ModuleId;
 use crate::kernel::module::loader::ModuleMemory;
 use crate::kernel::sys::errno;
@@ -206,7 +205,8 @@ pub unsafe fn begin(
     arg: *const u8,
     len: usize,
 ) -> Result<Pending, i32> {
-    if cmd != ioctl::SUBMIT || holder >= MAX_MODULES || len == 0 {
+    if cmd != ioctl::SUBMIT || holder >= crate::kernel::exec::scheduler::module_slots() || len == 0
+    {
         return Ok(Pending(None));
     }
     // SAFETY: the caller's contract; `len` is non-zero here.

@@ -13,21 +13,21 @@ EXTERN(_start)
 
 /* RAM holds the image, the payload window after it (the module table and
  * config the packer appends, read in place), .bss (the buffer arena, elastic
- * region, OTA staging buffers, fixed tables and pools) and the stack.
+ * region, OTA staging buffers and DMA arenas) and the stack.
  *
- * The module state arena (kernel::config STATE_ARENA_SIZE, 1 GiB) is
- * a region of its own at ARENA_ORIGIN, never zeroed at boot: the loader
- * zeroes each allocation as it hands it out. It cannot sit in RAM. On the
- * Pi 5 the firmware's memory map (the DTB's /memory node) is
- * 0..0x3FC0_0000 and 0x4000_0000 up: the top 4 MiB of the first GB is the
- * firmware's (its nvram copy sits at 0x3FD2_xxxx), and the firmware places
- * the DTB and initramfs near 0x2E00_0000. A boot that writes over either
- * never comes up, so RAM stays below them and the arena takes the DRAM above
- * 1 GB. QEMU virt (-m 2G: RAM 0x4000_0000..0xC000_0000) takes the arena in
- * its upper half. Both are mapped as DRAM by the boot page tables. */
+ * Nothing else of the kernel's is linked. The kernel's boot-sized tables and
+ * the module state arena live in the DRAM zone the device tree describes
+ * above RAM_CEILING (platform/bcm2712/memmap.rs): the tables carved from the
+ * zone's top, zeroed as each is carved, the arena taking the rest and zeroing
+ * what it hands out — never a region wholesale, and never at boot. On the
+ * Pi 5 the firmware's memory map (the DTB's /memory node) is 0..0x3FC0_0000
+ * and 0x4000_0000 up: the top 4 MiB of the first GB is the firmware's (its
+ * nvram copy sits at 0x3FD2_xxxx), and the firmware places the DTB and
+ * initramfs near 0x2E00_0000. A boot that writes over either never comes up,
+ * so RAM stays below them and the zone starts at 1 GB. QEMU virt's zone
+ * starts at 2 GB, above this region. */
 MEMORY {
     RAM : ORIGIN = RAM_ORIGIN, LENGTH = 512M
-    ARENA : ORIGIN = ARENA_ORIGIN, LENGTH = 1024M
 }
 
 SECTIONS {
@@ -100,12 +100,6 @@ SECTIONS {
     /* End of runtime-reserved RAM. */
     __end_block_addr = .;
 
-    /* Placed last: the location counter moves into ARENA here, and every
-       symbol above is a RAM address. */
-    .state_arena (NOLOAD) : ALIGN(4096) {
-        *(.state_arena)
-    } > ARENA
-
     /DISCARD/ : {
         *(.ARM.exidx .ARM.exidx.*)
         *(.eh_frame)
@@ -116,7 +110,8 @@ __start_block_addr = 0;
 
 /* Everything the kernel reserves in RAM — image, .bss, the stack — must end
  * below RAM_CEILING (build.rs: 0x2E00_0000 on the Pi 5, where the firmware
- * places the DTB and initramfs; ARENA_ORIGIN on QEMU virt). On the Pi 5 a
+ * places the DTB and initramfs; 0x8000_0000 on QEMU virt, where the zone
+ * starts). On the Pi 5 a
  * .bss grown past it does not fail: the boot writes over the firmware's
  * region and the board stays dark with nothing on any console. A kernel
  * capacity raise that would do that fails the link here instead. */

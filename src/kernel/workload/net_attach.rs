@@ -33,6 +33,9 @@ pub type DetachFn = unsafe fn(OwnerHandle);
 #[derive(Clone, Copy)]
 struct Provider {
     slot: usize,
+    /// The slot's generation when a module provider claimed the role (0 for
+    /// a built-in provider, which is not a module occupancy).
+    generation: u32,
     attach: AttachFn,
     detach: DetachFn,
 }
@@ -47,8 +50,22 @@ pub fn register(slot: usize, attach: AttachFn, detach: DetachFn) {
     unsafe {
         *core::ptr::addr_of_mut!(PROVIDER) = Some(Provider {
             slot,
+            generation: 0,
             attach,
             detach,
+        });
+    }
+}
+
+/// Register the module provider at `slot`, in occupancy `generation`.
+fn register_module(slot: usize, generation: u32) {
+    // SAFETY: as `register`.
+    unsafe {
+        *core::ptr::addr_of_mut!(PROVIDER) = Some(Provider {
+            slot,
+            generation,
+            attach: queued_attach,
+            detach: queued_detach,
         });
     }
 }
@@ -104,24 +121,41 @@ pub unsafe fn detach(owner: OwnerHandle) {
 //
 // The queue cannot lose a detach. An attach the provider has not taken yet
 // is withdrawn from the queue when its owner detaches, so a detach is queued
-// only for lanes the provider holds, and the provider holds at most
-// `LANES_MAX`. Queued attaches are at most `LANES_MAX` (one per live lane)
-// and queued detaches at most `LANES_MAX` (one per owner whose taken lanes
-// the provider still holds), so `2 * LANES_MAX` entries always suffice.
+// only for lanes the provider holds, and the provider holds at most its
+// stated capacity. Queued attaches are at most that capacity (one per live
+// lane) and queued detaches at most that capacity (one per owner whose taken
+// lanes the provider still holds), so twice the capacity always suffices.
+//
+// The capacity is the provider's to state (`wl::NET_PROVIDE [lanes:u8]`): a
+// lane id is a `u8`, so it is at most 255. The tables are boot tables
+// (`kernel::mem::table`) sized when the provider claims the role, which it
+// does while its graph is instantiated: carved on bcm2712, allocated on
+// Linux, the profile's static array elsewhere ([`STATIC_LANES`]). Across a
+// rebuild they keep `max(previous, stated)`.
 //
 // Lane attach and detach run inside a live graph change and the provider's
-// take on whichever core steps it; one lock orders them.
+// take on whichever core steps it; one lock orders them, and the tables are
+// sized under it.
 
 use crate::abi::contracts::workload::{self as wl, net_lane};
+use crate::kernel::mem::table::Table as BootTable;
 // `portable_atomic`, not `core::sync::atomic`: the lane lock's
 // compare-exchange does not exist on ARMv6-M (RP2040), which has no
 // LDREX/STREX; `portable_atomic` provides it there over a critical section
 // and compiles to the native instruction everywhere else.
 use portable_atomic::{AtomicBool, Ordering};
 
-/// The provider's lanes at most: the kernel refuses an attach past it.
-pub const LANES_MAX: usize = net_lane::LANES_MAX;
-const LANE_QUEUE: usize = 2 * LANES_MAX;
+/// The most lanes a provider can state: a lane id is a `u8` (`u8::MAX`).
+pub const LANE_CEILING: usize = 255;
+const _: () = assert!(LANE_CEILING == u8::MAX as usize);
+
+/// Lanes the static table holds where tables are not sized at boot (wasm,
+/// RP): the profile's compiled size, and the most a provider there may
+/// state.
+#[cfg(not(any(feature = "host-linux", feature = "chip-bcm2712")))]
+pub const STATIC_LANES: usize = 16;
+#[cfg(any(feature = "host-linux", feature = "chip-bcm2712"))]
+const STATIC_LANES: usize = 0;
 
 #[derive(Clone, Copy)]
 struct LaneOp {
@@ -141,52 +175,122 @@ struct LiveLane {
     taken: bool,
 }
 
+/// The FIFO's bookkeeping; its slots are [`OPS`] and the live lanes [`LIVE`].
 struct LaneQueue {
-    /// FIFO of changes; a withdrawn attach leaves a hole that take skips.
-    ops: [Option<LaneOp>; LANE_QUEUE],
     head: usize,
     len: usize,
-    live: [Option<LiveLane>; LANES_MAX],
+    /// Lanes the tables are sized for: the provider's stated capacity.
+    cap: usize,
 }
 
 static mut LANES: LaneQueue = LaneQueue {
-    ops: [None; LANE_QUEUE],
     head: 0,
     len: 0,
-    live: [None; LANES_MAX],
+    cap: 0,
 };
+/// FIFO of changes, `2 * cap` slots; a withdrawn attach leaves a hole that
+/// take skips.
+static mut OPS: BootTable<Option<LaneOp>, { 2 * STATIC_LANES }> =
+    crate::boot_table!(2 * STATIC_LANES, None);
+/// Live lanes, `cap` slots.
+static mut LIVE: BootTable<Option<LiveLane>, STATIC_LANES> = crate::boot_table!(STATIC_LANES, None);
 static LANES_LOCK: AtomicBool = AtomicBool::new(false);
 
+/// The lane tables, borrowed under `LANES_LOCK`.
+struct Lanes<'a> {
+    q: &'a mut LaneQueue,
+    ops: &'a mut [Option<LaneOp>],
+    live: &'a mut [Option<LiveLane>],
+}
+
 /// Run `f` on the lane queue with `LANES_LOCK` held.
-fn with_lanes<R>(f: impl FnOnce(&mut LaneQueue) -> R) -> R {
+fn with_lanes<R>(f: impl FnOnce(&mut Lanes<'_>) -> R) -> R {
     while LANES_LOCK
         .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
         .is_err()
     {
         core::hint::spin_loop();
     }
-    // SAFETY: `LANES_LOCK` is held, so this is the only reference.
-    let r = f(unsafe { &mut *core::ptr::addr_of_mut!(LANES) });
+    // SAFETY: `LANES_LOCK` is held, so these are the only references; the
+    // tables move only in `size_lanes`, under the same lock.
+    let r = unsafe {
+        let q = &mut *core::ptr::addr_of_mut!(LANES);
+        let cap = q.cap;
+        let ops = &mut *core::ptr::addr_of_mut!(OPS);
+        let live = &mut *core::ptr::addr_of_mut!(LIVE);
+        let n_ops = (2 * cap).min(ops.len());
+        let n_live = cap.min(live.len());
+        let mut l = Lanes {
+            q,
+            ops: &mut ops[..n_ops],
+            live: &mut live[..n_live],
+        };
+        f(&mut l)
+    };
     LANES_LOCK.store(false, Ordering::Release);
     r
 }
 
-impl LaneQueue {
+/// Size the lane tables for `lanes` lanes, keeping what they hold: the
+/// queued changes keep their order. Under `LANES_LOCK`.
+///
+/// # Safety
+/// `LANES_LOCK` is held.
+unsafe fn size_lanes(lanes: usize) -> i32 {
+    use crate::kernel::sys::errno;
+    let q = &mut *core::ptr::addr_of_mut!(LANES);
+    let ops = &mut *core::ptr::addr_of_mut!(OPS);
+    let live = &mut *core::ptr::addr_of_mut!(LIVE);
+    // RP replans its tables at a rebuild, which leaves them empty under the
+    // old `cap`: those are sized again.
+    if lanes <= q.cap && live.len() >= q.cap && ops.len() >= 2 * q.cap {
+        return 0;
+    }
+    if live.len() < q.cap {
+        q.cap = 0;
+        q.head = 0;
+        q.len = 0;
+    }
+    let sized = ops.reserve(2 * lanes).is_ok()
+        && ops.grow(2 * lanes).is_ok()
+        && live.reserve(lanes).is_ok()
+        && live.grow(lanes).is_ok();
+    if !sized || ops.len() < 2 * lanes || live.len() < lanes {
+        return errno::ENOSPC;
+    }
+    // The ring's slots are `[0, 2 * old cap)`; lay the queued changes out
+    // from slot 0 so the larger ring keeps their order.
+    let old = 2 * q.cap;
+    if old > 0 && q.head != 0 {
+        ops[..old].rotate_left(q.head);
+    }
+    q.head = 0;
+    q.cap = lanes;
+    0
+}
+
+impl Lanes<'_> {
     fn push(&mut self, op: LaneOp) -> bool {
-        if self.len >= LANE_QUEUE {
+        let n = self.ops.len();
+        if self.q.len >= n {
             return false;
         }
-        self.ops[(self.head + self.len) % LANE_QUEUE] = Some(op);
-        self.len += 1;
+        let at = (self.q.head + self.q.len) % n;
+        match self.ops.get_mut(at) {
+            Some(slot) => *slot = Some(op),
+            None => return false,
+        }
+        self.q.len += 1;
         true
     }
 
     /// The oldest queued change, skipping withdrawn attaches.
     fn pop(&mut self) -> Option<LaneOp> {
-        while self.len > 0 {
-            let op = self.ops[self.head].take();
-            self.head = (self.head + 1) % LANE_QUEUE;
-            self.len -= 1;
+        let n = self.ops.len();
+        while self.q.len > 0 && n > 0 {
+            let op = self.ops.get_mut(self.q.head).and_then(Option::take);
+            self.q.head = (self.q.head + 1) % n;
+            self.q.len -= 1;
             if op.is_some() {
                 return op;
             }
@@ -195,10 +299,10 @@ impl LaneQueue {
     }
 
     fn clear(&mut self) {
-        self.ops = [None; LANE_QUEUE];
-        self.head = 0;
-        self.len = 0;
-        self.live = [None; LANES_MAX];
+        self.ops.fill(None);
+        self.live.fill(None);
+        self.q.head = 0;
+        self.q.len = 0;
     }
 }
 
@@ -284,32 +388,72 @@ fn is_queued(p: &Provider) -> bool {
     p.attach as usize == queued_attach as usize
 }
 
-/// A module at `slot` claims the net-provider role (`wl::NET_PROVIDE`).
-/// `EBUSY` when another provider, built in or a module, holds it.
-pub fn provide_queued(slot: usize) -> i32 {
-    match provider() {
-        None => {
-            register(slot, queued_attach, queued_detach);
-            0
-        }
-        Some(p) if is_queued(&p) && p.slot == slot => 0,
-        Some(_) => crate::kernel::sys::errno::EBUSY,
-    }
+/// Whether a module provider's registration still names a live occupancy of
+/// its slot: a rebuild, restart or reuse of the slot moves its generation,
+/// and the registration then names no one.
+fn queued_current(p: &Provider) -> bool {
+    is_queued(p) && crate::kernel::exec::scheduler::module_slot_generation(p.slot) == p.generation
 }
 
-/// Whether the module at `slot` is the module provider.
+/// A module at `slot` claims the net-provider role (`wl::NET_PROVIDE`),
+/// stating its capacity of `lanes` lanes. `EBUSY` when another provider,
+/// built in or a module, holds it; `EINVAL` for no lanes or more than a lane
+/// id can name; `ENOSPC` when the kernel cannot size its tables for them. A
+/// module registration whose slot has since been re-occupied is stale, and
+/// the claim takes it over.
+pub fn provide_queued(slot: usize, lanes: usize) -> i32 {
+    use crate::kernel::sys::errno;
+    if lanes == 0 || lanes > LANE_CEILING {
+        return errno::EINVAL;
+    }
+    let generation = crate::kernel::exec::scheduler::module_slot_generation(slot);
+    match provider() {
+        Some(p) if is_queued(&p) && p.slot == slot && p.generation == generation => {}
+        Some(p) if !is_queued(&p) || queued_current(&p) => return errno::EBUSY,
+        _ => {}
+    }
+    let rc = with_lanes(|_| {
+        // SAFETY: `LANES_LOCK` is held for the closure's duration.
+        unsafe { size_lanes(lanes) }
+    });
+    if rc != 0 {
+        return rc;
+    }
+    if !provider().is_some_and(|p| is_queued(&p) && p.slot == slot && p.generation == generation) {
+        // A stale module registration's lanes went with its graph.
+        with_lanes(|l| l.clear());
+        register_module(slot, generation);
+    }
+    0
+}
+
+/// Whether the module at `slot` is the module provider, in its current
+/// occupancy.
 fn is_queued_provider(slot: usize) -> bool {
-    provider().is_some_and(|p| is_queued(&p) && p.slot == slot)
+    provider().is_some_and(|p| queued_current(&p) && p.slot == slot)
+}
+
+/// Whether the module at `slot` is the node's lane provider (in its current
+/// occupancy), for the ops only the provider may call.
+pub fn is_lane_provider(slot: usize) -> bool {
+    is_queued_provider(slot)
+}
+
+/// The lanes the kernel holds for its module provider: the capacity it
+/// stated, `max` across rebuilds.
+pub fn lane_capacity() -> usize {
+    with_lanes(|q| q.q.cap)
 }
 
 /// Forget a module provider and every lane queued for it: its graph is being
 /// rebuilt, and with it every channel a lane named. A built-in provider is
-/// left registered; it registers again as the new graph instantiates.
+/// left registered; it registers again as the new graph instantiates. The
+/// tables keep their size.
 pub fn reset_queued() {
     if provider().is_some_and(|p| is_queued(&p)) {
         unregister();
     }
-    with_lanes(LaneQueue::clear);
+    with_lanes(|l| l.clear());
 }
 
 /// The next queued lane change for the module provider at `slot`, as a

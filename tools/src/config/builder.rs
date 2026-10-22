@@ -27,17 +27,56 @@ const DOMAIN_META_SIZE: usize = 4 * DOMAIN_META_ENTRY_SIZE;
 /// `parse_module_entry`, which reads matching field widths.
 const MODULE_ENTRY_HEADER_SIZE: usize = 10;
 
-/// Maximum module params size. 256 KiB accommodates the
-/// wasm-scenario synth host's http module, which inlines the
-/// canonical browser shell (runtime.html ~83 KiB after scenario
-/// substitution + host_shims.js ~56 KiB + scenario.json) as `body:`
-/// routes per the shared-infra-in-orchestrator partition principle;
-/// half of it would not hold the later route bodies. Kept in lockstep with
-/// the http `DEFAULT_BODY_POOL_SIZE` host cap. The kernel itself sets no per-module
-/// or whole-blob ceiling: it borrows params from the config blob in place.
-/// Generation runs host-side, so this is a sanity bound, not a memory
-/// constraint. Wavetables and large sequences fit comfortably within.
-const MAX_MODULE_PARAMS_SIZE: usize = 256 * 1024;
+/// What a module entry's params buffer starts at before it grows to fit:
+/// most modules' params are a few hundred bytes, and a module's params are
+/// bounded only by what its YAML says (the kernel borrows them from the config
+/// blob in place). A buffer the entry might not have fit is doubled and the
+/// entry rebuilt (`build_module_entry`).
+const PARAMS_BUFFER_START: usize = 64 * 1024;
+/// Free room an entry must leave in its buffer to prove nothing was dropped:
+/// the packer and the reserved-tag emitters skip a TLV that does not fit
+/// rather than fail, and none of those TLVs is larger than this.
+const PARAMS_BUFFER_HEADROOM: usize = 64 * 1024;
+
+/// A starting params buffer for `module`: room for its YAML several times
+/// over (a hex or byte-array blob packs smaller than it is written), so an
+/// entry rarely needs a second pass.
+fn params_buffer_for(module: &Value, data_section: Option<&Value>) -> usize {
+    let text = |v: &Value| serde_json::to_vec(v).map(|b| b.len()).unwrap_or(0);
+    PARAMS_BUFFER_START + 2 * text(module) + data_section.map_or(0, text)
+}
+
+/// Pack `module`'s schema params into a buffer that grows to fit them.
+pub(crate) fn pack_params_growing(
+    module: &Value,
+    param_schema: &schema::ParamSchema,
+    data_section: Option<&Value>,
+    module_name: &str,
+) -> Result<Vec<u8>> {
+    let mut cap = params_buffer_for(module, data_section);
+    loop {
+        let mut buf = vec![0u8; cap];
+        match schema::build_params_from_schema(
+            module,
+            param_schema,
+            &mut buf,
+            0,
+            data_section,
+            module_name,
+        ) {
+            Ok(plen) if cap - plen >= PARAMS_BUFFER_HEADROOM => {
+                buf.truncate(plen);
+                return Ok(buf);
+            }
+            Ok(_) => {}
+            Err(e) if e.contains("does not fit") => {}
+            Err(e) => return Err(Error::Config(e)),
+        }
+        cap = cap.checked_mul(2).ok_or_else(|| {
+            Error::Config(format!("module '{module_name}': params too large to pack"))
+        })?;
+    }
+}
 
 /// Param base offset within a module entry: the entry header.
 const P: usize = MODULE_ENTRY_HEADER_SIZE;
@@ -1741,7 +1780,7 @@ const NON_PARAM_KEYS: &[&str] = &[
     "quarantine_partner",     // name form, resolved at wiring pass
     "quarantine_partner_idx", // numeric form passed straight through
     // `heap`: nested object { zero_on_free, alloc_failure_policy, canary_enabled,
-    // arena_bytes }
+    // arena_bytes, raw_arena }
     "heap",
     // Provenance recorded by stack expansion, not authored and not
     // emitted: which stack injected this module entry and which of its
@@ -1776,7 +1815,8 @@ fn validate_heap_subtree(module: &Value, module_name: &str) -> Result<()> {
     let heap_obj = value.as_object().ok_or_else(|| {
         Error::Config(format!(
             "module '{module_name}': `heap` must be an object \
-             (with `zero_on_free` / `alloc_failure_policy` / `canary_enabled` / `arena_bytes`)"
+             (with `zero_on_free` / `alloc_failure_policy` / `canary_enabled` / `arena_bytes` / \
+             `raw_arena`)"
         ))
     })?;
     const HEAP_KEYS: &[&str] = &[
@@ -1784,6 +1824,7 @@ fn validate_heap_subtree(module: &Value, module_name: &str) -> Result<()> {
         "alloc_failure_policy",
         "canary_enabled",
         "arena_bytes",
+        "raw_arena",
     ];
     for (subkey, subval) in heap_obj {
         if !HEAP_KEYS.contains(&subkey.as_str()) {
@@ -1826,6 +1867,62 @@ fn validate_heap_subtree(module: &Value, module_name: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Whether an instance uses its heap arena raw: its `heap.raw_arena`, else
+/// its module type's `[capacities] raw_arena`.
+fn declares_raw_arena(module: &Value, manifest: Option<&Manifest>) -> bool {
+    module
+        .get("heap")
+        .and_then(|h| h.get("raw_arena"))
+        .and_then(Value::as_bool)
+        .unwrap_or_else(|| {
+            manifest.is_some_and(|m| m.capacities.get("raw_arena").is_some_and(|&v| v != 0))
+        })
+}
+
+/// This instance's heap cap (params tag 0xEF), or `None` to leave the module
+/// type's own. The graph's `heap.arena_bytes` wins; failing that, the type's
+/// `[capacities] heap_from_params` derives the cap from the bytes the params
+/// TLV `tlv` declares under the rule's tags — a declared input, so a large
+/// inline value needs no hand-written cap. An explicit cap below what those
+/// bytes need is kept, and warned: the module will refuse its params.
+fn instance_heap_cap(
+    name: &str,
+    module: &Value,
+    manifest: Option<&Manifest>,
+    tlv: &[u8],
+) -> Result<Option<u32>> {
+    let explicit = module
+        .get("heap")
+        .and_then(|h| h.get("arena_bytes"))
+        .and_then(|v| heap_arena_bytes(v).ok());
+    let Some(rule) = manifest.and_then(|m| m.heap_from_params.as_ref()) else {
+        return Ok(explicit);
+    };
+    let bytes = rule.declared_bytes(tlv);
+    if let Some(n) = explicit {
+        let need = rule.need_for(bytes);
+        if bytes > 0 && u64::from(n) < need {
+            eprintln!(
+                "warning: module '{name}': heap.arena_bytes = {n} is below the {need} B its \
+                 {bytes} B of declared params need (`[capacities] heap_from_params`); the \
+                 module will refuse them. Raise it, or drop it to let the composer size it."
+            );
+        }
+        return Ok(Some(n));
+    }
+    let Some(cap) = rule.derived_cap(bytes) else {
+        return Ok(None);
+    };
+    let cap = u32::try_from(cap).map_err(|_| {
+        Error::Config(format!(
+            "module '{name}': its {bytes} B of declared params need a {cap} B heap cap, \
+             past a heap's u32 size"
+        ))
+    })?;
+    eprintln!("  heap: '{name}' cap {cap} B, sized from {bytes} B of declared params");
+    Ok(Some(cap))
 }
 
 /// The smallest heap cap the kernel can make a heap of: one block header and
@@ -2069,17 +2166,39 @@ fn validate_param_ranges(
         let Some((min, max)) = p.range else {
             continue;
         };
-        let Some(v) = obj
+        let Some(raw) = obj
             .get(&p.name)
             .or_else(|| inner.and_then(|i| i.get(&p.name)))
-            .and_then(|v| v.as_u64())
         else {
             continue;
         };
-        if (v as u32) < min || (v as u32) > max {
+        // The value as the packer will read it, never truncated to the
+        // param's width first: 4294967298 is not 2.
+        let v: Option<i128> = if let Some(n) = raw.as_u64() {
+            Some(i128::from(n))
+        } else if let Some(n) = raw.as_i64() {
+            Some(i128::from(n))
+        } else if let Some(t) = raw.as_str() {
+            if p.enum_values.iter().any(|(name, _)| name == t) {
+                continue;
+            }
+            match t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+                Some(h) => i128::from_str_radix(h, 16).ok(),
+                None => t.parse::<i128>().ok(),
+            }
+        } else {
+            None
+        };
+        let Some(v) = v else {
+            return Err(Error::Config(format!(
+                "module '{}': param '{}'={} is not an integer in [{}, {}]",
+                module_name, p.name, raw, min, max,
+            )));
+        };
+        if v < i128::from(min) || v > i128::from(max) {
             return Err(Error::Config(format!(
                 "module '{}': param '{}'={} is outside [{}, {}]",
-                module_name, p.name, v, min, max,
+                module_name, p.name, raw, min, max,
             )));
         }
     }
@@ -2406,8 +2525,71 @@ fn build_module_entry(
     max_modules: usize,
     isolation: &crate::target::IsolationFacts,
 ) -> Result<Vec<u8>> {
-    // Start with max possible size, will truncate to actual used size
-    let mut entry = vec![0u8; MODULE_ENTRY_HEADER_SIZE + MAX_MODULE_PARAMS_SIZE];
+    // The params buffer grows to fit the entry: an entry that ran out of room,
+    // or left too little to prove nothing was skipped, is rebuilt in a buffer
+    // twice the size. There is no params ceiling.
+    let mut cap = params_buffer_for(module, data_section);
+    loop {
+        let mut out_of_room = false;
+        let built = build_module_entry_in(
+            cap,
+            &mut out_of_room,
+            name,
+            module,
+            id,
+            data_section,
+            config,
+            loc,
+            manifests,
+            max_modules,
+            isolation,
+        );
+        match built {
+            Ok(entry)
+                if cap - (entry.len() - MODULE_ENTRY_HEADER_SIZE) >= PARAMS_BUFFER_HEADROOM =>
+            {
+                return Ok(entry);
+            }
+            Ok(_) => {}
+            Err(_) if out_of_room => {}
+            Err(e) => return Err(e),
+        }
+        cap = cap
+            .checked_mul(2)
+            .ok_or_else(|| Error::Config(format!("module '{name}': params too large to pack")))?;
+    }
+}
+
+/// The packer's error, noting when it was only this pass's buffer that was too
+/// small (the packer refuses a blob that does not fit with "does not fit").
+fn out_of_room_or(out_of_room: &mut bool, e: String) -> Error {
+    if e.contains("does not fit") {
+        *out_of_room = true;
+    }
+    Error::Config(e)
+}
+
+/// [`build_module_entry`] over a params buffer of `cap` bytes. Sets
+/// `out_of_room` when it failed only because `cap` was too small.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "build_module_entry's arguments plus the buffer it is building in"
+)]
+fn build_module_entry_in(
+    cap: usize,
+    out_of_room: &mut bool,
+    name: &str,
+    module: &Value,
+    id: u16,
+    data_section: Option<&Value>,
+    config: &Value,
+    loc: schema::ModuleLocation<'_>,
+    manifests: &HashMap<String, Manifest>,
+    max_modules: usize,
+    isolation: &crate::target::IsolationFacts,
+) -> Result<Vec<u8>> {
+    // Room for this pass's params; truncated to what the entry used.
+    let mut entry = vec![0u8; MODULE_ENTRY_HEADER_SIZE + cap];
 
     // Leave bytes 0-1 for entry_length (filled at end)
 
@@ -2422,14 +2604,15 @@ fn build_module_entry(
     //   bytes 4-7: name_hash (u32)
     //   byte 8:    module id, low byte
     //   byte 9:    bits 0-2 = domain_id (0..7), bit 4 = pre_tick_drain
-    //              (Tier 1c opt-in), bits 5-6 = module id bits 8-9.
+    //              (Tier 1c opt-in), bits 5-6 = module id bits 8-9,
+    //              bit 7 = id bit 10, bit 3 = id bit 11.
     //              `pre_tick_drain` is mirrored from the manifest and kept
     //              on the module entry (not the .fmod manifest) so the
     //              kernel reads it during `prepare_graph` without a second
     //              loader pass.
-    if id >= 1024 {
+    if id >= 4096 {
         return Err(Error::Config(format!(
-            "module `{name}` has id {id}; a module id carries 10 bits"
+            "module `{name}` has id {id}; a module id carries 12 bits"
         )));
     }
     entry[4..8].copy_from_slice(&name_hash.to_le_bytes());
@@ -2446,8 +2629,11 @@ fn build_module_entry(
     // admission finds — an installed driver among them — carries its
     // `pre_tick_drain` bit here too.
     let pre_tick_drain = manifests.get(name).is_some_and(|m| m.pre_tick_drain);
-    entry[9] =
-        domain_id | (if pre_tick_drain { 0x10 } else { 0 }) | (((id >> 8) as u8 & 0x03) << 5);
+    entry[9] = domain_id
+        | (if pre_tick_drain { 0x10 } else { 0 })
+        | (((id >> 8) as u8 & 0x03) << 5)
+        | (((id >> 10) as u8 & 0x01) << 7)
+        | (((id >> 11) as u8 & 0x01) << 3);
 
     // Track actual params length used
     let params_len: usize;
@@ -2501,7 +2687,7 @@ fn build_module_entry(
             data_section,
             type_name,
         )
-        .map_err(Error::Config)?;
+        .map_err(|e| out_of_room_or(out_of_room, e))?;
     } else if let Some((manifest, param_schema)) = load_builtin_param_schema(type_name) {
         validate_yaml_params(module, &param_schema, type_name)?;
         validate_param_ranges(module, &manifest, type_name)?;
@@ -2519,7 +2705,7 @@ fn build_module_entry(
             data_section,
             type_name,
         )
-        .map_err(Error::Config)?;
+        .map_err(|e| out_of_room_or(out_of_room, e))?;
     } else {
         // Module type with no schema source — typically a misnamed
         // YAML entry. Emit an empty params section; downstream
@@ -2849,21 +3035,31 @@ fn build_module_entry(
                 extra_len += 3;
             }
         }
+    }
 
-        // Tag 0xEF: heap.arena_bytes (u32 LE) — this instance's heap cap,
-        // overriding the module type's declared arena. Validated by
-        // `validate_heap_subtree`.
-        if let Some(n) = heap
-            .get("arena_bytes")
-            .and_then(|v| heap_arena_bytes(v).ok())
-        {
-            if base + extra_len + 6 < entry.len() {
-                entry[base + extra_len] = 0xEF;
-                entry[base + extra_len + 1] = 4;
-                entry[base + extra_len + 2..base + extra_len + 6].copy_from_slice(&n.to_le_bytes());
-                extra_len += 6;
-            }
+    // Tag 0xEF (u32 LE): this instance's heap cap, overriding the module
+    // type's declared arena — the graph's `heap.arena_bytes` (validated by
+    // `validate_heap_subtree`), else what the type's `[capacities]
+    // heap_from_params` derives from the params packed above.
+    if let Some(n) = instance_heap_cap(name, module, manifests.get(name), &entry[P..base])? {
+        if base + extra_len + 6 < entry.len() {
+            entry[base + extra_len] = 0xEF;
+            entry[base + extra_len + 1] = 4;
+            entry[base + extra_len + 2..base + extra_len + 6].copy_from_slice(&n.to_le_bytes());
+            extra_len += 6;
         }
+    }
+
+    // Tag 0xEE: raw arena use — the module reads its heap arena raw
+    // (`ARENA_GET`), so the kernel commits the whole cap at instantiation
+    // rather than on whichever step first asks. Declared per instance
+    // (`heap.raw_arena: true`) or by the module type (`[capacities]
+    // raw_arena = 1`).
+    if declares_raw_arena(module, manifests.get(name)) && base + extra_len + 3 < entry.len() {
+        entry[base + extra_len] = 0xEE;
+        entry[base + extra_len + 1] = 1;
+        entry[base + extra_len + 2] = 1;
+        extra_len += 3;
     }
 
     // Tag 0xFB: isr_budget_cycles (u32 LE, 4 bytes). Per-module
@@ -2961,10 +3157,9 @@ fn build_module_entry(
         extra_len += 2;
         // Also update the schema TLV header's payload_len (u16 LE at
         // bytes 2-3 of the schema TLV) so it reflects the new end-marker
-        // position. Without this update, the TLS extended scanner
-        // (which uses the header's payload_len to find `basic_end`)
-        // would start mid-protection-tag and either false-match or skip
-        // legitimate cert/key tags.
+        // position. The field is advisory — every reader, the extended
+        // scanners included, walks to the terminator — but it is kept
+        // honest, saturating rather than wrapping past 64 KiB.
         //
         // payload_len is measured from byte 4 (past the TLV header) to
         // the byte AFTER the end marker. With the schema's original
@@ -2972,12 +3167,11 @@ fn build_module_entry(
         // to byte 4 is `base + extra_len - (MODULE_ENTRY_HEADER_SIZE + 4)`.
         let header_pos = MODULE_ENTRY_HEADER_SIZE;
         if entry.len() >= header_pos + 4 && entry[header_pos] == 0xFE {
+            // Saturating past 64 KiB: readers walk to the terminator.
             let new_payload_len = (base + extra_len) - (header_pos + 4);
-            if new_payload_len <= u16::MAX as usize {
-                let bytes = (new_payload_len as u16).to_le_bytes();
-                entry[header_pos + 2] = bytes[0];
-                entry[header_pos + 3] = bytes[1];
-            }
+            let bytes = schema::tlv_payload_len_field(new_payload_len);
+            entry[header_pos + 2] = bytes[0];
+            entry[header_pos + 3] = bytes[1];
         }
     }
 
@@ -2996,7 +3190,13 @@ fn build_module_entry(
         let der = crate::trust_anchors::read_der_file(Path::new(path), labels)
             .map_err(|e| Error::Config(format!("module '{name}': {key}: {e}")))?;
         let n = der.len();
-        if n > u16::MAX as usize || base + extra_len + 4 + n >= entry.len() {
+        if n > u16::MAX as usize {
+            return Err(Error::Config(format!(
+                "module '{name}': {key} '{path}' ({n} bytes) exceeds the extended TLV's 64 KiB"
+            )));
+        }
+        if base + extra_len + 4 + n >= entry.len() {
+            *out_of_room = true;
             return Err(Error::Config(format!(
                 "module '{name}': {key} '{path}' ({n} bytes) does not fit in the module entry"
             )));
@@ -3025,6 +3225,7 @@ fn build_module_entry(
             core::slice::from_ref(&vec![1u8]),
         );
         if base + extra_len + blob.len() >= entry.len() {
+            *out_of_room = true;
             return Err(Error::Config(format!(
                 "module '{name}': trust marker does not fit in the module entry"
             )));
@@ -3042,6 +3243,7 @@ fn build_module_entry(
             .map_err(|e| Error::Config(format!("module '{name}': trust: {e}")))?;
         let blob = crate::trust_anchors::encode_ext(crate::trust_anchors::TAG_TRUST, &anchors);
         if base + extra_len + blob.len() >= entry.len() {
+            *out_of_room = true;
             return Err(Error::Config(format!(
                 "module '{name}': trust bundle '{path}' does not fit in the module entry"
             )));
@@ -3084,6 +3286,7 @@ fn build_module_entry(
         let bytes = uri.as_bytes();
         let n = bytes.len();
         if base + extra_len + 4 + n >= entry.len() {
+            *out_of_room = true;
             return Err(Error::Config(format!(
                 "module '{name}': verify_uri does not fit in the module entry"
             )));
@@ -3140,10 +3343,10 @@ fn build_module_entry(
                 extra_len += 4 + n;
                 eprintln!("  alpn: {alpn}");
             } else {
+                *out_of_room = true;
                 return Err(Error::Config(format!(
-                    "module '{name}': alpn list ({n} bytes) does not fit the module \
-                     params buffer (needs {} more bytes); enlarge the params buffer \
-                     or shorten the alpn list",
+                    "module '{name}': alpn list ({n} bytes) does not fit this pass's params \
+                     buffer (needs {} more bytes)",
                     end - entry.len()
                 )));
             }
@@ -3356,6 +3559,38 @@ fn check_verify_uri(uri: &str) -> std::result::Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A ranged built-in param is checked at the value the packer reads:
+    /// past `u32` it is not wrapped into range, a numeric string (what a
+    /// stack's `user:` source resolves to) is checked like a number, and a
+    /// negative or non-numeric value is refused.
+    #[test]
+    fn a_ranged_param_is_checked_at_its_whole_value() {
+        let (manifest, _) = load_builtin_param_schema("linux_net").expect("linux_net manifest");
+        let check =
+            |v: Value| validate_param_ranges(&json!({ "max_conns": v }), &manifest, "linux_net");
+        for ok in [json!(2), json!(65535), json!("128"), json!("0x80")] {
+            assert!(check(ok.clone()).is_ok(), "{ok}");
+        }
+        for bad in [
+            json!(1),
+            json!(65536),
+            json!(4_294_967_298u64),
+            json!(-1),
+            json!("100000"),
+            json!("4294967298"),
+            json!("lots"),
+            json!(2.5),
+        ] {
+            assert!(check(bad.clone()).is_err(), "{bad} accepted");
+        }
+        let wrapped = validate_param_ranges(
+            &json!({ "params": { "max_conns": 70000 } }),
+            &manifest,
+            "linux_net",
+        );
+        assert!(wrapped.is_err(), "the params: wrapper is checked too");
+    }
 
     /// A one-param schema as an `.fmod` embeds it: `decision`, a blob (tag 15).
     fn blob_param_schema() -> schema::ParamSchema {

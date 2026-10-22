@@ -647,6 +647,10 @@ fn instantiate_and_activate(
     if failed > 0 && fluxor::kernel::exec::bare_metal::instantiation_is_fail_closed() {
         return Err(failed);
     }
+    // Before the graph's first step: clear the state arena's zeroed frontier
+    // its full distance ahead of what instantiation took, so the first heap
+    // growth on a step finds zeroed memory before any domain has had slack.
+    loader::prime_frontier();
     Ok(total_mods)
 }
 
@@ -682,6 +686,22 @@ fn bridge_cross_domain_edges() -> Result<usize, &'static str> {
     // full quiesce (rebuild) — sole mutator of scheduler state either way.
     let sched = unsafe { scheduler::sched_mut() };
     let n_compiled_edges = sched.edge_count;
+    // Size the ring and edge tables for this graph's cross-domain edges
+    // before any is registered.
+    let crossing = (0..n_compiled_edges)
+        .filter(|&e| {
+            let edge = sched.edges[e];
+            edge.channel >= 0
+                && (scheduler::module_domain_id(edge.from_module)
+                    != scheduler::module_domain_id(edge.to_module)
+                    || edge.edge_class == EdgeClass::CrossCore)
+        })
+        .count();
+    // SAFETY: graph prep (boot) or full quiesce (rebuild): no pump walks the
+    // tables.
+    if unsafe { multicore::size_cross(crossing) }.is_err() {
+        return Err("cross-domain ring tables could not be sized for this graph");
+    }
     let mut bridged = 0usize;
     let mut e = 0usize;
     while e < n_compiled_edges {
@@ -890,6 +910,13 @@ fn poll_rebuild_bridge(domain_id: usize) {
 #[no_mangle]
 pub extern "C" fn main(dtb_phys: u64) -> ! {
     configure_arch();
+    // The memory map, from the device tree the firmware handed over (QEMU:
+    // left at the base of RAM): what the boot page tables map as DRAM, and
+    // the zone above the boot image that the kernel's tables are carved from
+    // and the state arena takes the rest of. Before the page tables, which
+    // are built from it; nothing is written to the zone here.
+    // SAFETY: once, on the boot core, before anything allocates.
+    unsafe { fluxor::platform::memmap::build(dtb_phys) };
     // Pi 5 bring-up sequence:
     //   1. MMU enable — DRAM cacheable, RP1 MMIO as Device-nGnRE at 0x1c.
     //   2. rp1_pcie_disable_aspm() — surgical ASPM disable on PCIe RC.
@@ -962,6 +989,7 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     // is the only call site and runs before any module exists.
     unsafe { log::set_logger_racy(&LOGGER).ok() };
     log::set_max_level(log::LevelFilter::Info);
+    fluxor::platform::memmap::report();
 
     // Force the active cooler to full so sustained-load rig runs aren't
     // confounded by thermal throttling. Drives the RP1 PWM channel the boot
@@ -2432,11 +2460,17 @@ fn bcm_isr_tier_poll() {
 
 unsafe fn bcm_net_policy_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
     use fluxor::abi::contracts::net::policy::caps;
-    let mut c = caps::FILTER | caps::EGRESS;
+    // `ip` judges filter rules and translates `scope = local` services for
+    // the node's own traffic; inbound translation is not realized here.
+    let mut c = caps::FILTER | caps::EGRESS | caps::DNAT_LOCAL;
     if fluxor::kernel::net_policy::enforcer_attached() {
         c |= caps::ENFORCED;
     }
     fluxor::kernel::net_policy::dispatch(c, None, handle, opcode, arg, arg_len)
+}
+
+unsafe fn bcm_net_route_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
+    fluxor::kernel::net_route::dispatch(None, handle, opcode, arg, arg_len)
 }
 
 fn bcm_init_providers() {
@@ -2453,9 +2487,14 @@ fn bcm_init_providers() {
     provider::register(dev_class::WORKLOAD, bcm_workload_dispatch);
     // net.policy (0x1E): the fluxor-native construct is the in-graph packet
     // filter, which READs the tables and ATTACHes; until one has, CAPS leaves
-    // ENFORCED clear. DNAT is not realized here — REPLACE refuses a table
-    // carrying one (ENOSYS) rather than dropping it.
+    // ENFORCED clear. Only `scope = local` DNAT is realized (`ip` translates
+    // the node's own traffic) — REPLACE refuses a `scope = any` record
+    // (ENOSYS) rather than dropping it.
     provider::register(dev_class::NET_POLICY, bcm_net_policy_dispatch);
+    // net.route (0x20): the kernel holds the tables; the node's `ip` module
+    // realizes them, reading them with TAKE and stating each entry with
+    // REPORT (`kernel::net_route`, no platform realizer).
+    provider::register(dev_class::NET_ROUTE, bcm_net_route_dispatch);
     // The versioned watchable key store: `storage.object` (0x14) +
     // `storage.namespace` (0x13) over a fixed-capacity RAM store. A
     // store-backed graph reaches its state through these two contracts, and a

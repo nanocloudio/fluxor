@@ -145,7 +145,7 @@ pub mod contract {
     // nanocloud consumes it there.
 
     // 0x0018 and 0x0019 unused (reserved — do not reassign): host isolation is
-    // expressed through WORKLOAD (0x1A). The host-process namespace/cgroup mechanism is
+    // expressed through WORKLOAD (0x1A). How a host process is isolated is
     // WORKLOAD's Linux host-process backend (`hp_spawn` in
     // `src/platform/linux/host_backend.rs`).
 
@@ -169,7 +169,7 @@ pub mod contract {
 
     /// Packet policy and service NAT enforced by the platform — opcode class
     /// 0x1Exx. Named tables of neutral rules (allow/drop/isolate/dnat) that
-    /// the linux platform realizes as nftables, bare metal as the in-graph
+    /// the linux platform realizes with the host's packet filter, bare metal as the in-graph
     /// packet filter's table, and wasm records without enforcing — the
     /// provider's CAPS say which. Semantic constants live at
     /// `abi::contracts::net::policy`.
@@ -179,7 +179,8 @@ pub mod contract {
     /// contract for "run an isolated workload with a declared capability
     /// envelope," realized by two placement-resolved backends: an fmod-graph
     /// backend (MPU/EL0 + owner/lease, bare metal) and a host-process backend
-    /// (namespaces/cgroups/veth, Linux). The consumer never names a platform.
+    /// (a host process in a domain of its own, Linux). The consumer never names
+    /// a platform.
     /// Gated by `requires_contract = "workload"` AND `platform_raw`; handles are
     /// `FD_TAG_WORKLOAD`-tagged.
     pub const WORKLOAD: u16 = 0x001A;
@@ -192,6 +193,13 @@ pub mod contract {
     /// a host-scoped class, registered only by the linux host platform;
     /// semantic constants live at `abi::platform::linux::host_mount`.
     pub const HOST_MOUNT: u16 = 0x001F;
+    /// How the node's workloads reach each other and the outside world —
+    /// opcode class 0x20xx: segments, peer routes and held addresses, held by
+    /// the kernel (`kernel::net_route`) and realized by the platform (Linux)
+    /// or by the node's network-stack module. Gated by
+    /// `requires_contract = "net_route"`, `platform_raw` and the node's
+    /// authority. Semantic constants live at `abi::contracts::net::route`.
+    pub const NET_ROUTE: u16 = 0x0020;
 
     // Short-name aliases used by kernel-side dispatchers (`GPIO`, `SPI`,
     // `PIO`, `UART`, `ADC`, `PWM`). Same numeric values as the `HAL_*`
@@ -276,7 +284,11 @@ fn vtable_for(contract: ContractId) -> Option<&'static ProviderVTable> {
 // (event / timer / DMA-fd) identify their contract via tag bits and
 // don't consume a slot.
 
-const MAX_TRACKED: usize = 128;
+/// Untagged handles tracked at once: the profile's static table, or where the
+/// plan sizes it (Linux, bcm2712, RP) the plan's `tracked_handles` pool, its
+/// envelope entry or default.
+const MAX_TRACKED: usize =
+    crate::kernel::config::static_slots(crate::abi::contracts::resource::POOL_TRACKED_HANDLES);
 
 struct HandleBinding {
     handle: i32,
@@ -287,14 +299,38 @@ struct HandleBinding {
     owner: crate::kernel::workload::owner::OwnerHandle,
 }
 
-static mut HANDLE_BINDINGS: [HandleBinding; MAX_TRACKED] = [const {
+static mut HANDLE_BINDINGS: crate::kernel::mem::table::Table<HandleBinding, MAX_TRACKED> = crate::boot_table!(
+    MAX_TRACKED,
     HandleBinding {
         handle: -1,
         contract: 0,
         #[cfg(feature = "multitenant")]
         owner: crate::kernel::workload::owner::OWNER_SYSTEM,
+    },
+    crate::abi::contracts::resource::POOL_TRACKED_HANDLES
+);
+
+/// Size the tracking table to `n` slots, all live.
+///
+/// # Safety
+/// Graph-preparation context: no reference into the table is live.
+pub unsafe fn size_tracked(n: usize) -> Result<(), crate::kernel::mem::table::TableError> {
+    let t = &*core::ptr::addr_of!(HANDLE_BINDINGS);
+    t.reserve(n)?;
+    t.grow(n)
+}
+
+/// Tracked handles held now — resource-ledger sample for
+/// `POOL_TRACKED_HANDLES`.
+pub fn tracked_in_use() -> usize {
+    // SAFETY: read-only walk on the scheduler thread.
+    unsafe {
+        (*core::ptr::addr_of!(HANDLE_BINDINGS))
+            .iter()
+            .filter(|b| b.handle != -1)
+            .count()
     }
-}; MAX_TRACKED];
+}
 
 /// Result of `track_handle`. `Ok(())` = a tracking slot was claimed (or none
 /// was needed because the handle is self-identifying via FD tag).
@@ -317,6 +353,11 @@ fn track_handle(handle: i32, contract: ContractId) -> Result<(), ()> {
     // is called from provider_open which serialises on the kernel side.
     unsafe {
         let p = &raw mut HANDLE_BINDINGS;
+        (*p).size_unplanned(|| {
+            crate::kernel::sys::resource_ledger::ceiling(
+                crate::abi::contracts::resource::POOL_TRACKED_HANDLES,
+            ) as usize
+        });
         for slot in (*p).iter_mut() {
             if slot.handle == -1 {
                 slot.handle = handle;
@@ -330,8 +371,12 @@ fn track_handle(handle: i32, contract: ContractId) -> Result<(), ()> {
             }
         }
         log::error!(
-            "[provider] HANDLE_BINDINGS exhausted (MAX_TRACKED={MAX_TRACKED}); refusing to leak \
+            "[provider] pool 'tracked_handles' at its ceiling of {} slots; refusing to leak \
              untracked handle {handle} for contract {contract:#x}",
+            (&(*p)).len()
+        );
+        crate::kernel::sys::resource_ledger::deny(
+            crate::abi::contracts::resource::POOL_TRACKED_HANDLES,
         );
         Err(())
     }
@@ -805,22 +850,13 @@ pub struct HandleTrackingStats {
 }
 
 /// Return current usage of the provider handle tracking table.
-/// Cheap: walks `MAX_TRACKED` entries once with relaxed ordering.
+/// Cheap: walks the live entries once with relaxed ordering.
 pub fn handle_tracking_stats() -> HandleTrackingStats {
-    let mut in_use = 0usize;
-    // SAFETY: read-only walk of HANDLE_BINDINGS; producer side runs on
-    // the scheduler thread.
-    unsafe {
-        let p = &raw const HANDLE_BINDINGS;
-        for slot in (*p).iter() {
-            if slot.handle != -1 {
-                in_use += 1;
-            }
-        }
-    }
+    // SAFETY: a length read of HANDLE_BINDINGS on the scheduler thread.
+    let capacity = unsafe { (&(*core::ptr::addr_of!(HANDLE_BINDINGS))).len() };
     HandleTrackingStats {
-        in_use,
-        capacity: MAX_TRACKED,
+        in_use: tracked_in_use(),
+        capacity,
     }
 }
 
@@ -1108,9 +1144,14 @@ pub fn release_module_providers(module_idx: ModuleId) {
     // A freed slot must not stay subscribed: the slot is reused, and the next
     // module to land in it would inherit a subscription it never asked for.
     clear_owner_release_observer(module_idx);
+    // A net.route writer that goes releases its tables' bindings; the tables
+    // and what they realized stay.
+    crate::kernel::net_route::release_module(module_idx as usize);
     // Before the chain is compacted, so the departing module's own routed
     // handles are closed at owners that are still registered.
     release_routes_of(module_idx);
+    // A departing net.policy enforcer stops vouching for its tables.
+    crate::kernel::net_policy::release_enforcer(module_idx);
     // SAFETY: called from scheduler module-finish path; scheduler thread.
     unsafe {
         let p = &raw mut PROVIDERS;
@@ -1177,7 +1218,7 @@ static mut OWNER_RELEASE_OBSERVERS: crate::kernel::workload::bitmask::ModuleMask
 /// registered provider has no dispatch to notify, so it is refused.
 pub fn register_owner_release_observer(module_idx: ModuleId) -> i32 {
     let idx = module_idx as usize;
-    if idx >= crate::kernel::boot::config::MAX_MODULES {
+    if idx >= crate::kernel::exec::scheduler::module_slots() {
         return errno::EINVAL;
     }
     if !module_has_provider_layer(module_idx) {
@@ -1200,7 +1241,7 @@ pub fn register_owner_release_observer(module_idx: ModuleId) -> i32 {
 /// module reusing the slot does not inherit the subscription.
 pub fn clear_owner_release_observer(module_idx: ModuleId) {
     let idx = module_idx as usize;
-    if idx >= crate::kernel::boot::config::MAX_MODULES {
+    if idx >= crate::kernel::exec::scheduler::module_slots() {
         return;
     }
     // SAFETY: scheduler-thread-only.
@@ -1280,7 +1321,8 @@ fn notify_module_observers(owner: crate::kernel::workload::owner::OwnerHandle) {
             for i in 0..entry.depth as usize {
                 if let Some(ref layer) = entry.chain[i] {
                     let midx = layer.module_idx as usize;
-                    if midx < crate::kernel::boot::config::MAX_MODULES && observers.test(midx) {
+                    if midx < crate::kernel::exec::scheduler::module_slots() && observers.test(midx)
+                    {
                         targets.set(midx);
                     }
                 }
@@ -1288,7 +1330,7 @@ fn notify_module_observers(owner: crate::kernel::workload::owner::OwnerHandle) {
         }
     }
 
-    for midx in 0..crate::kernel::boot::config::MAX_MODULES {
+    for midx in 0..crate::kernel::exec::scheduler::module_slots() {
         if !targets.test(midx) {
             continue;
         }

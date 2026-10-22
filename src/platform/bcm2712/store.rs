@@ -10,8 +10,9 @@
 //! and a bounded change history that drives SUBSCRIBE with resume-from-revision
 //! — and deliberately the same WIRE, because a consumer parses one encoding
 //! whichever platform answers it. What differs is the backing: no `alloc` here,
-//! so the store is a fixed-capacity static rather than a `BTreeMap`, and the
-//! capacities below are the honest ceiling on what a bare-metal store can
+//! so the store's tables are fixed-capacity — sized once at boot from the plan
+//! and carved from DRAM (`kernel::mem::carve`) — rather than a `BTreeMap`, and
+//! those capacities are the honest ceiling on what a bare-metal store can
 //! hold.
 //!
 //! **VOLATILE.** There is no log and no NVMe: the store lives in RAM and a
@@ -32,9 +33,11 @@ use crate::kernel::sys::errno;
 use crate::kernel::workload::owner::{OwnerHandle, OWNER_SYSTEM};
 
 /// Objects the store can hold — one machine's worth of state, not a fleet's.
-/// Exceeding it is refused (`ENOMEM`) rather than evicting: a consumer reads a
-/// missing key as a deletion, so silently evicting is how it comes to tear
-/// down what that key named.
+/// No pool names them, so this is their size; the table is carved at boot
+/// ([`size_from_plan`]) rather than linked into `.bss`. Exceeding it is
+/// refused (`ENOMEM`) rather than evicting: a consumer reads a missing key as
+/// a deletion, so silently evicting is how it comes to tear down what that
+/// key named.
 pub const MAX_OBJECTS: usize = 512;
 /// Longest value. Matches `store_effect`'s own `MAX_VALUE`, so a value that
 /// crosses the connector fits the store that holds it.
@@ -42,13 +45,47 @@ pub const MAX_VALUE: usize = 4096;
 /// Retained change history. A watcher that falls further behind than this is
 /// told to relist (the `Lost` sentinel) rather than handed a gap.
 pub const HISTORY: usize = 128;
-/// Concurrent subscriptions, and open read slots. One subscription per watched
-/// prefix per module: a control plane of ~45 reconcilers, most watching their
-/// own collection plus the ones they depend on, asks for ~95 — so the table is
-/// sized for a whole control plane with headroom (~55 KiB of statics), not for
-/// a handful of watchers. A refused subscription answers ENOMEM.
-const MAX_SUBS: usize = 256;
-const MAX_READS: usize = 32;
+
+use crate::abi::contracts::resource as res;
+
+/// The ceiling the boot plan gives `pool` (`resource_ledger::plan`): for the
+/// store's subscriptions, what the graph's store consumers declare plus the
+/// reserve (a control plane of ~45 reconcilers asks ~95); for its open read
+/// slots, the envelope entry or the profile's default. A refused subscription
+/// or read is counted against its pool and answers ENOMEM.
+fn plan_ceiling(pool: u16) -> usize {
+    crate::kernel::sys::resource_ledger::ceiling(pool) as usize
+}
+
+/// Refuse a slot past a table's ceiling: count it against `pool` and name it,
+/// since a silently refused watch is a controller that silently stops.
+fn refuse_slot(pool: u16, len: usize) -> i32 {
+    log::warn!(
+        "[store] pool '{}' at its ceiling of {len} slots; refused",
+        crate::kernel::sys::resource_ledger::pool_name(pool)
+    );
+    crate::kernel::sys::resource_ledger::deny(pool);
+    errno::ENOMEM
+}
+
+/// Slots in use in `pool`'s table: the resource ledger's sample for the
+/// store's subscription and read pools, 0 for any other.
+pub fn pool_in_use(pool: u16) -> usize {
+    // SAFETY: a read-only walk on the scheduler core.
+    unsafe {
+        match pool {
+            res::POOL_STORE_SUBS => (*core::ptr::addr_of!(SUBS))
+                .iter()
+                .filter(|s| s.in_use)
+                .count(),
+            res::POOL_STORE_READS => (*core::ptr::addr_of!(READS))
+                .iter()
+                .filter(|r| r.in_use)
+                .count(),
+            _ => 0,
+        }
+    }
+}
 
 /// `CONTENT_TYPES` byte for `NamespaceChange` (`contracts/src/lib.rs`). A
 /// watcher routes on this to tell a store change from anything else sharing
@@ -145,10 +182,11 @@ const READ_EMPTY: ReadSlot = ReadSlot {
     opener: OWNER_SYSTEM,
 };
 
-/// The store itself. A static, because bare metal has no heap to put it on and
-/// the capacity has to be a decision made once rather than a growth curve.
+/// The store itself. Its object table is sized once, at boot, and carved
+/// (bare metal has no heap): the capacity is a decision made once rather than
+/// a growth curve.
 pub struct Store {
-    entries: [Entry; MAX_OBJECTS],
+    entries: crate::kernel::mem::table::Table<Entry, MAX_OBJECTS>,
     hist: [HistEntry; HISTORY],
     /// Next history slot, and the oldest revision still retained.
     hist_head: usize,
@@ -156,15 +194,51 @@ pub struct Store {
     revision: u64,
 }
 
+fn objects_default() -> usize {
+    MAX_OBJECTS
+}
+
 static mut STORE: Store = Store {
-    entries: [ENTRY_EMPTY; MAX_OBJECTS],
+    entries: crate::kernel::mem::table::Table::new_planned(|_| ENTRY_EMPTY, objects_default),
     hist: [HIST_EMPTY; HISTORY],
     hist_head: 0,
     hist_filled: false,
     revision: 0,
 };
-static mut SUBS: [Sub; MAX_SUBS] = [SUB_EMPTY; MAX_SUBS];
-static mut READS: [ReadSlot; MAX_READS] = [READ_EMPTY; MAX_READS];
+/// Subscriptions and open read slots, sized at boot from the plan
+/// ([`size_from_plan`]; the plan's defaults on first use).
+static mut SUBS: crate::kernel::mem::table::Table<Sub, 0> =
+    crate::kernel::mem::table::Table::new_planned(|_| SUB_EMPTY, subs_default);
+static mut READS: crate::kernel::mem::table::Table<ReadSlot, 0> =
+    crate::kernel::mem::table::Table::new_planned(|_| READ_EMPTY, reads_default);
+
+fn subs_default() -> usize {
+    plan_ceiling(res::POOL_STORE_SUBS)
+}
+
+fn reads_default() -> usize {
+    plan_ceiling(res::POOL_STORE_READS)
+}
+
+/// Size the store's tables to the boot plan's ceilings: subscriptions and read
+/// slots from their pools, objects to [`MAX_OBJECTS`]. Slots in use keep their
+/// place (a handle names a slot index). Called when a graph is prepared,
+/// after the plan, as `platform::linux::store::size_from_plan` is.
+///
+/// # Safety
+/// Graph-preparation context on the scheduler core: no reference into the
+/// tables is live.
+pub unsafe fn size_from_plan() -> Result<(), crate::kernel::mem::table::TableError> {
+    let subs = &*core::ptr::addr_of!(SUBS);
+    subs.reserve(plan_ceiling(res::POOL_STORE_SUBS))?;
+    subs.grow(plan_ceiling(res::POOL_STORE_SUBS))?;
+    let reads = &*core::ptr::addr_of!(READS);
+    reads.reserve(plan_ceiling(res::POOL_STORE_READS))?;
+    reads.grow(plan_ceiling(res::POOL_STORE_READS))?;
+    let objects = &(*core::ptr::addr_of!(STORE)).entries;
+    objects.reserve(MAX_OBJECTS)?;
+    objects.grow(MAX_OBJECTS)
+}
 static mut ENABLED: bool = false;
 
 /// Provider telemetry. A store's failures are otherwise only guessable from
@@ -718,7 +792,7 @@ pub unsafe fn dispatch_object(handle: i32, opcode: u32, arg: *mut u8, arg_len: u
             let vlen = val.len();
             let reads = &mut *core::ptr::addr_of_mut!(READS);
             let Some(idx) = reads.iter().position(|r| !r.in_use) else {
-                return errno::ENOMEM;
+                return refuse_slot(res::POOL_STORE_READS, reads.len());
             };
             reads[idx].in_use = true;
             reads[idx].opener = crate::kernel::exec::scheduler::caller_owner();
@@ -732,7 +806,7 @@ pub unsafe fn dispatch_object(handle: i32, opcode: u32, arg: *mut u8, arg_len: u
             let idx = slot_of(handle) as usize;
             let reads = &*core::ptr::addr_of!(READS);
             if handle < 0
-                || idx >= MAX_READS
+                || idx >= reads.len()
                 || !opened_by_caller(reads[idx].in_use, reads[idx].opener)
             {
                 return errno::ENOSYS;
@@ -839,7 +913,7 @@ pub unsafe fn dispatch_object(handle: i32, opcode: u32, arg: *mut u8, arg_len: u
             };
             let out = core::slice::from_raw_parts_mut(req.out_ptr as *mut u8, req.out_cap as usize);
             let mut page = obj_op::list::PageWriter::new(out, req.max_keys);
-            // Bounded by `max_keys` steps of one `MAX_OBJECTS` pass each.
+            // Bounded by `max_keys` steps of one object-table pass each.
             let mut last = [0u8; STORAGE_KEY_MAX];
             let mut last_len = 0usize;
             let mut more = false;
@@ -890,7 +964,7 @@ pub unsafe fn dispatch_object(handle: i32, opcode: u32, arg: *mut u8, arg_len: u
             let idx = slot_of(handle) as usize;
             let reads = &mut *core::ptr::addr_of_mut!(READS);
             if handle >= 0
-                && idx < MAX_READS
+                && idx < reads.len()
                 && opened_by_caller(reads[idx].in_use, reads[idx].opener)
             {
                 reads[idx] = READ_EMPTY;
@@ -990,7 +1064,7 @@ pub unsafe fn dispatch_namespace(handle: i32, opcode: u32, arg: *mut u8, arg_len
 
             let subs = &mut *core::ptr::addr_of_mut!(SUBS);
             let Some(idx) = subs.iter().position(|s| !s.in_use) else {
-                return errno::ENOMEM;
+                return refuse_slot(res::POOL_STORE_SUBS, subs.len());
             };
             subs[idx] = SUB_EMPTY;
             subs[idx].in_use = true;
@@ -1167,7 +1241,9 @@ pub unsafe fn dispatch_namespace(handle: i32, opcode: u32, arg: *mut u8, arg_len
         ns_op::CLOSE => {
             let idx = slot_of(handle) as usize;
             let subs = &mut *core::ptr::addr_of_mut!(SUBS);
-            if handle >= 0 && idx < MAX_SUBS && opened_by_caller(subs[idx].in_use, subs[idx].opener)
+            if handle >= 0
+                && idx < subs.len()
+                && opened_by_caller(subs[idx].in_use, subs[idx].opener)
             {
                 subs[idx] = SUB_EMPTY;
             }

@@ -27,15 +27,23 @@
 //!
 //! With `table` (tag 3, a name) the module enforces that net.policy table
 //! instead of the static rules — the bare-metal realization of the contract.
-//! It ATTACHes once (so the provider's CAPS report ENFORCED), polls the table's
-//! generation every [`POLICY_POLL_STEPS`] steps and re-reads it on change.
-//! Evaluation, per packet: the table's ALLOW/DROP rules in order (ingress =
-//! the destination is the subject, egress = the source is), first match
-//! decides; otherwise a packet whose destination is ingress-isolated, or whose
-//! source is egress-isolated, is dropped — unless it is a TCP segment carrying
-//! ACK without SYN, i.e. part of a flow already admitted. That is the
-//! stateless approximation of a stateful filter; UDP replies to an isolated
-//! workload's own requests are NOT distinguished and are dropped.
+//! Every [`POLICY_POLL_STEPS`] steps it polls the store-wide generation (a
+//! zero-length READ) and, when it moved, re-reads the table. It ATTACHes
+//! naming the table, which binds it as the table's one enforcer, and
+//! re-issues ATTACH with the generation it applied in full — so the table's
+//! READ state reports ENFORCED only while what this module holds is what the
+//! store holds. A read lands whole in a spare buffer and is swapped in only
+//! then, so a read the store moved under never tears what is in force. A
+//! table past [`POLICY_BUF`] bytes is reported as not applied, and the
+//! previous copy stays in force.
+//! Evaluation, per packet, is the shared one (`net::policy::evaluate`, the
+//! same rules as the Linux rendering): ALLOW/DROP in order, first match;
+//! then ISOLATE; then services with no backends. A table that isolates
+//! anything first passes a TCP segment carrying ACK without SYN — part of a
+//! flow already admitted — as the rendering passes `ct state established`:
+//! the stateless approximation of a stateful filter. UDP replies to an
+//! isolated workload's own requests are NOT distinguished and are judged
+//! as new.
 
 #![no_std]
 #![allow(
@@ -72,17 +80,16 @@ include!("../../sdk/runtime.rs");
 const MAX_FRAME: usize = 1514;
 const META_SIZE: usize = 20;
 const MAX_RULES: usize = 8;
-/// net.policy mode: filter rules and isolations held from the table.
-const MAX_POLICY_RULES: usize = 64;
-const MAX_ISOLATES: usize = 32;
 /// Steps between generation polls: a table change takes effect within this.
 const POLICY_POLL_STEPS: u32 = 1024;
 const POLICY_BUF: usize = 4096;
 const NP_READ: u32 = 0x1E04;
 const NP_ATTACH: u32 = 0x1E05;
-const RULE_ALLOW: u8 = 1;
-const RULE_DROP: u8 = 2;
-const RULE_ISOLATE: u8 = 3;
+/// READ's state record: `[generation:u64][applied:u64][flags:u32][rsv:u32]`.
+const NP_STATE: usize = 24;
+const ERANGE: i32 = -34;
+const ENOENT: i32 = -2;
+use abi::contracts::net::policy as np;
 
 const ACTION_DROP: u8 = 0;
 const ACTION_ACCEPT: u8 = 1;
@@ -135,135 +142,138 @@ struct FilterState {
     attached: u8,
     poll: u32,
     generation: u64,
-    policy_count: u16,
-    isolate_count: u16,
-    policy: [PolicyRule; MAX_POLICY_RULES],
-    isolates: [Isolate; MAX_ISOLATES],
+    /// The store-wide generation last seen; the table is re-read only when
+    /// it moves.
+    store_gen: u64,
+    /// The generation last reported to ATTACH as applied.
+    reported: u64,
+    /// The table as held: two buffers, `live` the one in force, `len` its
+    /// bytes. A read goes to the other.
+    live: u8,
+    isolating: bool,
+    len: u16,
+    bufs: [[u8; POLICY_BUF]; 2],
 }
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct PolicyRule {
-    allow: u8,
-    dir: u8,
-    proto: u8,
-    subject_prefix: u8,
-    peer_prefix: u8,
-    subject: u32,
-    peer: u32,
-    port_lo: u16,
-    port_hi: u16,
+/// The table in force.
+fn held(s: &FilterState) -> &[u8] {
+    s.bufs[(s.live & 1) as usize]
+        .get(..s.len as usize)
+        .unwrap_or(&[])
 }
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct Isolate {
-    dir: u8,
-    prefix: u8,
-    subject: u32,
-}
-
-const POLICY_EMPTY: PolicyRule = PolicyRule {
-    allow: 0,
-    dir: 0,
-    proto: 0,
-    subject_prefix: 0,
-    peer_prefix: 0,
-    subject: 0,
-    peer: 0,
-    port_lo: 0,
-    port_hi: 0,
-};
-
-fn in_net(addr: u32, net: u32, prefix: u8) -> bool {
-    if prefix == 0 {
-        return true;
-    }
-    let mask = if prefix >= 32 {
-        u32::MAX
-    } else {
-        !(u32::MAX >> prefix)
-    };
-    (addr & mask) == (net & mask)
-}
-
-fn be32(b: &[u8], at: usize) -> u32 {
-    u32::from_be_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
-}
-
-/// Load a table's records into the rule arrays. Unknown kinds (DNAT, which
-/// this platform's provider refuses anyway, or advisory ones) are skipped.
-unsafe fn load_policy(s: &mut FilterState, rules: &[u8]) {
-    s.policy_count = 0;
-    s.isolate_count = 0;
-    let mut at = 0usize;
-    while at + 2 <= rules.len() {
-        let kind = rules[at];
-        let len = rules[at + 1] as usize;
-        let body_at = at + 2;
-        if body_at + len > rules.len() {
-            break;
+/// Write `v` little-endian at `arg[at..]`, panic-free.
+fn put_le(arg: &mut [u8], at: usize, v: u64, n: usize) {
+    let b = v.to_le_bytes();
+    let mut i = 0;
+    while i < n && i < 8 {
+        if let Some(d) = arg.get_mut(at + i) {
+            *d = b[i];
         }
-        let b = &rules[body_at..body_at + len];
-        if (kind == RULE_ALLOW || kind == RULE_DROP)
-            && len == 16
-            && (s.policy_count as usize) < MAX_POLICY_RULES
-        {
-            let r = &mut s.policy[s.policy_count as usize];
-            r.allow = (kind == RULE_ALLOW) as u8;
-            r.dir = b[0];
-            r.proto = b[1];
-            r.subject = be32(b, 2);
-            r.subject_prefix = b[6];
-            r.peer = be32(b, 7);
-            r.peer_prefix = b[11];
-            r.port_lo = u16::from_be_bytes([b[12], b[13]]);
-            r.port_hi = u16::from_be_bytes([b[14], b[15]]);
-            if r.port_hi == 0 {
-                r.port_hi = r.port_lo;
-            }
-            s.policy_count += 1;
-        } else if kind == RULE_ISOLATE && len == 6 && (s.isolate_count as usize) < MAX_ISOLATES {
-            let i = &mut s.isolates[s.isolate_count as usize];
-            i.dir = b[0];
-            i.subject = be32(b, 1);
-            i.prefix = b[5];
-            s.isolate_count += 1;
-        }
-        at = body_at + len;
+        i += 1;
     }
 }
 
-/// Poll the table's generation; re-read it when it moved.
-unsafe fn refresh_policy(s: &mut FilterState, sys: &SyscallTable) {
-    let mut buf = [0u8; POLICY_BUF];
-    let mut gen: u64 = 0;
+fn get_u64(b: &[u8], at: usize) -> u64 {
+    let mut v = [0u8; 8];
+    let mut i = 0;
+    while i < 8 {
+        v[i] = b.get(at + i).copied().unwrap_or(0);
+        i += 1;
+    }
+    u64::from_le_bytes(v)
+}
+
+/// READ `name_len` bytes of `s.table` (0: the store) into `out`; the state
+/// record lands in `state`.
+unsafe fn np_read(
+    s: &FilterState,
+    sys: &SyscallTable,
+    name_len: usize,
+    out: &mut [u8],
+    state: &mut [u8; NP_STATE],
+) -> i32 {
     let mut arg = [0u8; 1 + 32 + 8 + 4 + 8];
+    arg[0] = name_len as u8;
+    let mut i = 0;
+    while i < name_len && i < 32 {
+        arg[1 + i] = s.table[i];
+        i += 1;
+    }
+    let p = 1 + name_len;
+    put_le(&mut arg, p, out.as_mut_ptr() as u64, 8);
+    put_le(&mut arg, p + 8, out.len() as u64, 4);
+    put_le(&mut arg, p + 12, state.as_mut_ptr() as u64, 8);
+    (sys.provider_call)(-1, NP_READ, arg.as_mut_ptr(), p + 20)
+}
+
+/// ATTACH naming the table, reporting `applied`.
+unsafe fn np_attach(s: &FilterState, sys: &SyscallTable, applied: u64) -> i32 {
+    let mut arg = [0u8; 1 + 32 + 8];
     let nl = s.table_len as usize;
     arg[0] = nl as u8;
-    arg[1..1 + nl].copy_from_slice(&s.table[..nl]);
-    let p = 1 + nl;
-    arg[p..p + 8].copy_from_slice(&(buf.as_mut_ptr() as u64).to_le_bytes());
-    arg[p + 8..p + 12].copy_from_slice(&(POLICY_BUF as u32).to_le_bytes());
-    arg[p + 12..p + 20].copy_from_slice(&(&mut gen as *mut u64 as u64).to_le_bytes());
-    let n = (sys.provider_call)(-1, NP_READ, arg.as_mut_ptr(), p + 20);
-    if n < 0 {
-        // No such table yet (ENOENT), or no provider: nothing to enforce, so
-        // nothing is isolated — the default is to pass.
-        if s.generation != 0 {
-            s.policy_count = 0;
-            s.isolate_count = 0;
-            s.generation = 0;
+    let mut i = 0;
+    while i < nl && i < 32 {
+        arg[1 + i] = s.table[i];
+        i += 1;
+    }
+    put_le(&mut arg, 1 + nl, applied, 8);
+    (sys.provider_call)(-1, NP_ATTACH, arg.as_mut_ptr(), 1 + nl + 8)
+}
+
+/// Poll the store-wide generation; re-read the table when it moved, and
+/// report what was applied.
+unsafe fn refresh_policy(s: &mut FilterState, sys: &SyscallTable) {
+    let mut state = [0u8; NP_STATE];
+    let mut none = [0u8; 0];
+    if np_read(s, sys, 0, &mut none, &mut state) == 0 {
+        let g = get_u64(&state, 0);
+        if g == s.store_gen && s.attached != 0 {
+            return;
         }
-        return;
+        s.store_gen = g;
     }
-    if gen != s.generation {
-        load_policy(s, &buf[..n as usize]);
-        s.generation = gen;
-    }
-    if s.attached == 0 {
-        (sys.provider_call)(-1, NP_ATTACH, core::ptr::null_mut(), 0);
-        s.attached = 1;
+    let spare = ((s.live ^ 1) & 1) as usize;
+    let mut buf = s.bufs[spare];
+    let n = np_read(s, sys, s.table_len as usize, &mut buf, &mut state);
+    let gen = get_u64(&state, 0);
+    let applied = if n >= 0 {
+        if gen != s.generation {
+            // The whole table landed in the spare buffer: swap it in.
+            s.bufs[spare] = buf;
+            s.live = spare as u8;
+            s.len = n as u16;
+            s.isolating = isolates_any(held(s));
+            s.generation = gen;
+            gen
+        } else {
+            s.reported
+        }
+    } else if n == ENOENT {
+        // No such table: nothing to enforce, so nothing is isolated — the
+        // default is to pass.
+        s.len = 0;
+        s.isolating = false;
+        s.generation = 0;
+        0
+    } else if n == ERANGE {
+        // Too big to hold: the previous copy stays, and is not this
+        // generation.
+        0
+    } else {
+        // A busy store (EAGAIN) or no provider: keep what is held, and read
+        // the table again at the next poll whatever the store-wide
+        // generation says (it has already moved past this one).
+        s.store_gen = u64::MAX;
+        s.reported
+    };
+    if s.attached == 0 || applied != s.reported {
+        // EBUSY (another enforcer holds the table) leaves us unbound: our
+        // filtering still runs, but vouches for nothing.
+        if np_attach(s, sys, applied) == 0 {
+            s.attached = 1;
+            s.reported = applied;
+        }
     }
 }
 
@@ -271,43 +281,45 @@ unsafe fn refresh_policy(s: &mut FilterState, sys: &SyscallTable) {
 /// payload after the metadata is the frame from L3 onward.
 fn tcp_established(buf: &[u8], n: usize) -> bool {
     let l3 = META_SIZE;
-    if n < l3 + 20 || buf[10] != 6 {
+    let b = |i: usize| buf.get(i).copied().unwrap_or(0);
+    if n < l3 + 20 || b(10) != 6 {
         return false;
     }
-    let ihl = ((buf[l3] & 0x0F) as usize) * 4;
+    let ihl = ((b(l3) & 0x0F) as usize) * 4;
     let flags_at = l3 + ihl + 13;
     if flags_at >= n {
         return false;
     }
-    let f = buf[flags_at];
+    let f = b(flags_at);
     (f & 0x10) != 0 && (f & 0x02) == 0
 }
 
+/// Whether the table isolates anything (its rendering then passes
+/// established flows first).
+fn isolates_any(rules: &[u8]) -> bool {
+    let mut at = 0;
+    while let Some((kind, _, next)) = np::next_rule(rules, at) {
+        if kind == np::rule::ISOLATE {
+            return true;
+        }
+        at = next;
+    }
+    false
+}
+
+/// The table's verdict on the packet in `buf` (metadata, then L3 onward).
 unsafe fn evaluate_policy(s: &FilterState, buf: &[u8], n: usize) -> bool {
-    let src = be32(buf, 2);
-    let dst = be32(buf, 6);
-    let proto = buf[10];
-    let dport = u16::from_be_bytes([buf[13], buf[14]]);
-    for r in &s.policy[..s.policy_count as usize] {
-        let (subject, peer) = if r.dir == 0 { (dst, src) } else { (src, dst) };
-        if !in_net(subject, r.subject, r.subject_prefix) || !in_net(peer, r.peer, r.peer_prefix) {
-            continue;
-        }
-        if r.proto != 0 && r.proto != proto {
-            continue;
-        }
-        if r.port_lo != 0 && (dport < r.port_lo || dport > r.port_hi) {
-            continue;
-        }
-        return r.allow == 1;
+    if s.isolating && tcp_established(buf, n) {
+        return true;
     }
-    for i in &s.isolates[..s.isolate_count as usize] {
-        let who = if i.dir == 0 { dst } else { src };
-        if in_net(who, i.subject, i.prefix) {
-            return tcp_established(buf, n);
-        }
-    }
-    true
+    let b = |i: usize| buf.get(i).copied().unwrap_or(0);
+    let p = np::Packet {
+        src: u32::from_be_bytes([b(2), b(3), b(4), b(5)]),
+        dst: u32::from_be_bytes([b(6), b(7), b(8), b(9)]),
+        proto: b(10),
+        dport: u16::from_be_bytes([b(13), b(14)]),
+    };
+    np::evaluate(held(s), &p) == np::Verdict::Accept
 }
 
 // ============================================================================
@@ -454,14 +466,11 @@ pub unsafe extern "C" fn module_new(
     s.attached = 0;
     s.poll = 0;
     s.generation = 0;
-    s.policy_count = 0;
-    s.isolate_count = 0;
-    s.policy = [POLICY_EMPTY; MAX_POLICY_RULES];
-    s.isolates = [Isolate {
-        dir: 0,
-        prefix: 0,
-        subject: 0,
-    }; MAX_ISOLATES];
+    s.store_gen = 0;
+    s.reported = 0;
+    s.live = 0;
+    s.len = 0;
+    s.isolating = false;
 
     // Init rules to empty
     let mut i = 0;

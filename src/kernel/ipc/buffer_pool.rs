@@ -118,8 +118,11 @@ const _: () = assert!(
 pub const BUFFER_SIZE: usize = crate::abi::CHANNEL_BUFFER_SIZE;
 const _: () = assert!(BUFFER_SIZE == super::ring_size::DEFAULT_RING_BYTES as usize);
 
-/// Buffer arena size: the kernel profile's (`kernel::config`), which on the
-/// RP parts is the silicon TOML's `[kernel] buffer_arena_kb`.
+/// Buffer arena size: the kernel profile's (`kernel::config`). On the RP parts
+/// the arena is no static: each graph's plan carves it from the kernel's
+/// static pool at the plan's `buffer_arena` ceiling (the silicon TOML's
+/// `[kernel] buffer_arena_kb` by default), [`install_arena`].
+#[cfg(not(feature = "rp"))]
 const BUFFER_ARENA_SIZE: usize = crate::kernel::config::BUFFER_ARENA_SIZE;
 
 // ============================================================================
@@ -133,11 +136,74 @@ const BUFFER_ARENA_SIZE: usize = crate::kernel::config::BUFFER_ARENA_SIZE;
 /// on one buffer (a DMA-owned edge) never touches its neighbour.
 const BUFFER_ALIGN: usize = super::ring_size::RING_ALIGN as usize;
 
+#[cfg(not(feature = "rp"))]
 #[repr(C, align(64))]
 struct AlignedBufferArena([u8; BUFFER_ARENA_SIZE]);
+#[cfg(not(feature = "rp"))]
 const _: () = assert!(core::mem::align_of::<AlignedBufferArena>() == BUFFER_ALIGN);
-const _: () = assert!(core::mem::align_of::<AlignedBufferArena>() == BUFFER_ALIGN);
+#[cfg(not(feature = "rp"))]
 static mut BUFFER_ARENA: AlignedBufferArena = AlignedBufferArena([0; BUFFER_ARENA_SIZE]);
+
+/// RP: the arena the graph's plan carved, `[base, base + cap)`; `(0, 0)` while
+/// a plan is in progress, when no buffer can be handed out.
+#[cfg(feature = "rp")]
+static ARENA_BASE: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "rp")]
+static ARENA_CAP: AtomicUsize = AtomicUsize::new(0);
+
+/// The arena's first byte.
+#[inline]
+fn arena_base() -> *mut u8 {
+    #[cfg(feature = "rp")]
+    {
+        ARENA_BASE.load(Ordering::Acquire) as *mut u8
+    }
+    #[cfg(not(feature = "rp"))]
+    // SAFETY: an address computation on the arena static; nothing is read or
+    // written through it here.
+    unsafe {
+        core::ptr::addr_of_mut!(BUFFER_ARENA.0).cast::<u8>()
+    }
+}
+
+/// The arena's capacity in bytes.
+#[inline]
+fn arena_cap() -> usize {
+    #[cfg(feature = "rp")]
+    {
+        ARENA_CAP.load(Ordering::Acquire)
+    }
+    #[cfg(not(feature = "rp"))]
+    {
+        BUFFER_ARENA_SIZE
+    }
+}
+
+/// RP: give the arena the block the graph's plan carved for it
+/// (`kernel::mem::carve::place_arenas`), empty.
+#[cfg(feature = "rp")]
+pub fn install_arena(base: *mut u8, cap: usize) {
+    with_arena(|l| {
+        l.count = 0;
+        l.leaked = 0;
+        BUFFER_ARENA_OFFSET.store(0, Ordering::Relaxed);
+        ARENA_BASE.store(base as usize, Ordering::Release);
+        ARENA_CAP.store(cap, Ordering::Release);
+    });
+}
+
+/// RP: the plan starts over (`kernel::mem::carve::begin_plan`); nothing in
+/// the arena is live at a rebuild.
+#[cfg(feature = "rp")]
+pub fn uninstall_arena() {
+    with_arena(|l| {
+        l.count = 0;
+        l.leaked = 0;
+        BUFFER_ARENA_OFFSET.store(0, Ordering::Relaxed);
+        ARENA_BASE.store(0, Ordering::Release);
+        ARENA_CAP.store(0, Ordering::Release);
+    });
+}
 
 /// Bump high-water mark: `[0, offset)` has been handed out at some point;
 /// the returned regions inside it are on the free list. Written only under
@@ -261,10 +327,7 @@ impl FreeList {
 /// sample for `POOL_BUFFER_ARENA`. Regions on the free list are inside
 /// `used_bytes`; `buffer_free_list_usage` reports them.
 pub fn arena_usage() -> (usize, usize) {
-    (
-        BUFFER_ARENA_OFFSET.load(Ordering::Relaxed),
-        BUFFER_ARENA_SIZE,
-    )
+    (BUFFER_ARENA_OFFSET.load(Ordering::Relaxed), arena_cap())
 }
 
 /// Returned-region occupancy: `(regions, region_bytes, leaked_bytes)`.
@@ -285,10 +348,10 @@ fn alloc_buffer(size: usize) -> Option<*mut u8> {
             return Ok(off);
         }
         let off = BUFFER_ARENA_OFFSET.load(Ordering::Relaxed);
-        if off + need > BUFFER_ARENA_SIZE
+        if off + need > arena_cap()
             || !crate::kernel::sys::resource_ledger::enforced_allows(
                 crate::abi::contracts::resource::POOL_BUFFER_ARENA,
-                (off + need) as u32,
+                (off + need) as u64,
             )
         {
             return Err(off);
@@ -298,19 +361,20 @@ fn alloc_buffer(size: usize) -> Option<*mut u8> {
     });
     match got {
         Ok(off) => {
-            // SAFETY: `off + need <= BUFFER_ARENA_SIZE` (checked at the bump,
-            // and every free region lies below the mark), and the range is
-            // this caller's alone once it left the allocator.
+            // SAFETY: `off + need <= arena_cap()` (checked at the bump, and
+            // every free region lies below the mark), and the range is this
+            // caller's alone once it left the allocator.
             unsafe {
-                let ptr = core::ptr::addr_of_mut!(BUFFER_ARENA.0)
-                    .cast::<u8>()
-                    .add(off);
+                let ptr = arena_base().add(off);
                 core::ptr::write_bytes(ptr, 0, size);
                 Some(ptr)
             }
         }
         Err(used) => {
-            log::error!("[buf] arena full need={need} used={used} cap={BUFFER_ARENA_SIZE}");
+            log::error!(
+                "[buf] arena full need={need} used={used} cap={}",
+                arena_cap()
+            );
             crate::kernel::sys::resource_ledger::deny(
                 crate::abi::contracts::resource::POOL_BUFFER_ARENA,
             );
@@ -325,10 +389,10 @@ fn alloc_buffer(size: usize) -> Option<*mut u8> {
 /// `ptr` came from `alloc_buffer(size)` and nothing reaches it any more: no
 /// registry slot names it and no lend of it is outstanding.
 unsafe fn release_buffer(ptr: *mut u8, size: usize) {
-    let base = core::ptr::addr_of_mut!(BUFFER_ARENA.0).cast::<u8>() as usize;
+    let base = arena_base() as usize;
     let addr = ptr as usize;
     let Some(need) = arena_need(size) else { return };
-    if size == 0 || addr < base || addr + need > base + BUFFER_ARENA_SIZE {
+    if size == 0 || base == 0 || addr < base || addr + need > base + arena_cap() {
         return;
     }
     with_arena(|l| l.give(addr - base, need));
@@ -594,11 +658,35 @@ impl BufferRegistrySlot {
 // ============================================================================
 
 /// Registry of buffer slots — metadata only, data lives in the buffer arena.
-static BUFFER_REGISTRY: [BufferRegistrySlot; MAX_BUFFER_SLOTS] =
-    [const { BufferRegistrySlot::new() }; MAX_BUFFER_SLOTS];
+/// One registry slot per channel slot: sized with the channel table
+/// (`channel::size`) where the plan sizes it, the profile's static array on
+/// wasm.
+static BUFFER_REGISTRY: crate::kernel::mem::table::Table<BufferRegistrySlot, MAX_BUFFER_SLOTS> = crate::boot_table!(
+    MAX_BUFFER_SLOTS,
+    BufferRegistrySlot::new(),
+    crate::abi::contracts::resource::POOL_CHANNELS
+);
+
+/// Reserve the registry for `ceiling` slots (the channel table's) and commit
+/// `live`.
+///
+/// # Safety
+/// Graph-preparation context: no reference into the registry is live.
+pub unsafe fn size_registry(
+    ceiling: usize,
+    live: usize,
+) -> Result<(), crate::kernel::mem::table::TableError> {
+    BUFFER_REGISTRY.reserve(ceiling)?;
+    BUFFER_REGISTRY.grow(live)
+}
+
+/// Commit registry slots until `n` are live, beside a channel-table growth.
+pub fn grow_registry(n: usize) -> Result<(), crate::kernel::mem::table::TableError> {
+    BUFFER_REGISTRY.grow(n)
+}
 
 fn valid_slot(slot: i32) -> bool {
-    slot >= 0 && (slot as usize) < MAX_BUFFER_SLOTS
+    slot >= 0 && (slot as usize) < BUFFER_REGISTRY.len()
 }
 
 // ============================================================================
@@ -917,7 +1005,7 @@ pub fn stats() -> BufferPoolStats {
         ready: 0,
         consumer: 0,
         streaming: 0,
-        capacity: MAX_BUFFER_SLOTS,
+        capacity: BUFFER_REGISTRY.len(),
     };
 
     for slot in BUFFER_REGISTRY.iter() {

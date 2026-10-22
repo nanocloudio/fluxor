@@ -18,6 +18,23 @@ cutoff = "ring_handoff"
 requires_contract = "workload"
 access = "write"
 
+# The node's segments, peer routes and held addresses (`net_route` TAKE /
+# REPORT): ip realizes them on bare metal. Both ops are admitted from the
+# registered net-identity provider alone, without platform_raw. Where ip is
+# not that provider, or the node has no net_route provider, the poll is
+# refused and ip routes through its one gateway.
+[[resources]]
+requires_contract = "net_route"
+access = "read"
+
+# Packet policy and service translation (`net_policy` READ / ATTACH): with
+# `policy_tables` set, ip is the enforcer of those tables on bare metal and
+# translates their `scope = local` services for the node's own traffic.
+# Without the param it never calls the contract.
+[[resources]]
+requires_contract = "net_policy"
+access = "read"
+
 [[ports]]
 name = "frames_rx"
 direction = "input"

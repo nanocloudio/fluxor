@@ -11,33 +11,35 @@
 // it was built against, and boot selection accepts it only on equality —
 // digest identity instead of version windows (latest-is-all-there-is).
 //
-// Fingerprint vs attestation. The digest is a genuine ATTESTATION only on the
-// path where it is (a) embedded by the compiler (`runtime.rs`
-// FLUXOR_ABI_SURFACE, verified at pack time), (b) covered by the module's
-// Ed25519 signature, and (c) compared by the kernel loader to its own digest
-// under `enforce_signatures`. All three now hold for native signed modules.
-// On the unsigned/dev path (no signature, no OTP key) the field is only a
-// self-asserted FINGERPRINT — a build-time honest-mistake guard, not a
-// security boundary. The slot/generation pins (kernel boot selector,
-// graph_slot activation) are the image-level enforcement regardless.
+// Attestation. Every module carries the digest it was built against: a PIC
+// module's ELF embeds it (`runtime.rs` `FLUXOR_ABI_SURFACE`) and `pack`
+// requires it to equal the packer's own before copying it into the manifest;
+// a wasm module's payload must contain it, and the packer stamps it. The
+// kernel loader compares that attestation to its own digest for every module
+// it admits, signed or not, and refuses one that carries none or another. A
+// signature covers the attestation, so on a signed module it is the signer's
+// claim; on an unsigned one it is the builder's, which guards against a stale
+// or mismatched build, not against a forger. The slot and generation pins
+// (kernel boot selector, graph_slot activation) are the image-level check.
 //
 // What it does NOT cover: kernel *semantics* behind an unchanged number, and
 // compiler/toolchain/build-config behavior. The manually-bumped
 // `SEMANTIC_EPOCH` below is the escape hatch for the former — bump it to force
 // a digest change when meaning changes but the numbers do not.
 //
-// Two inputs, two sensitivities. (1) The numeric walk below: only VALUES
-// matter — renaming a constant or reformatting this function does not change
-// the digest; changing any numeric allocation DOES. Keep the walk
-// append-only so reorderings never masquerade as ABI changes. (2) The
-// SDK-wide SOURCE pin folded in via `abi_surface_srcpin.rs`: this is
-// deliberately broad — it hashes the canonicalized text of every
-// `modules/sdk/**/*.rs` file, so renames, formatting changes, block/inline
-// comments, and most refactors of ANY SDK file DO change the digest (only
-// blank lines and whole-line `//` comments are ignored). That over-sensitivity
-// is the safe direction: a false-positive rebuild self-heals; a missed change
-// is a field failure. Net: do not describe the digest as refactor-stable — it
-// tracks the SDK source, by design.
+// Two inputs, two sensitivities. (1) The numeric walk below: each entry's
+// label and value — renaming the Rust constant behind an entry or reformatting
+// this function does not change the walk's bytes; changing any numeric
+// allocation or any label does. Keep the walk append-only so reorderings never
+// pass for ABI changes. (2) The source pin folded in via
+// `abi_surface_srcpin.rs`: a token hash of every `.rs` file under
+// `modules/sdk/` and `contracts/src/`. Comments, doc comments and formatting
+// are not tokens and leave it unchanged; every identifier, literal and real
+// attribute is, so renames and most refactors of ANY SDK or contracts file DO
+// change the digest, as does renaming a file. That over-sensitivity is the
+// safe direction: a false-positive rebuild self-heals; a missed change is a
+// field failure. Do not describe the digest as refactor-stable — it tracks the
+// SDK source, by design.
 //
 // `no_std`, zero-alloc: the encoder walks fixed (name, value) pairs through
 // a caller-supplied sink. Shared by path-mount: host tools hash it with

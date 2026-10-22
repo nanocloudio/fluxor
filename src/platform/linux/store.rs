@@ -621,11 +621,15 @@ const STORE_SOURCE: [u8; 16] = *b"fluxor-cp-store\0";
 /// same store look like two independent domains.
 const STORE_DEVICE_ID: u64 = 1;
 
-/// One subscription per watched prefix per module. Sized as bare metal's
-/// (`bcm2712/store.rs` `MAX_SUBS`): a whole control plane asks for ~95, and a
-/// graph that runs here must run there.
-const STORE_MAX_SUBS: usize = 256;
-const STORE_MAX_READS: usize = 32;
+use crate::abi::contracts::resource as res;
+
+/// The ceiling the boot plan gives `pool` (`resource_ledger::plan`): for the
+/// node store's subscriptions, what the graph's store consumers declare plus
+/// the reserve; for its reads, writes and grants, and for a workload store's
+/// tables, the envelope entry or the profile's default.
+fn plan_ceiling(pool: u16) -> usize {
+    crate::kernel::sys::resource_ledger::ceiling(pool) as usize
+}
 
 #[derive(Clone, Copy)]
 struct Sub {
@@ -706,45 +710,73 @@ pub struct Served {
     writes: Vec<WriteSlot>,
     /// Bytes one streaming write may stage before `COMMIT`.
     stage_max: usize,
+    /// The pools the tables are sized from, `[subs, reads, writes]`: what a
+    /// refusal names.
+    pools: [u16; 3],
 }
 
+/// Refuse a slot past a table's ceiling: count it against `pool` and name it,
+/// since a silently refused watch is a controller that silently stops.
+fn refuse_slot(pool: u16, len: usize) -> i32 {
+    log::warn!(
+        "[store] pool '{}' at its ceiling of {len} slots; refused",
+        crate::kernel::sys::resource_ledger::pool_name(pool)
+    );
+    crate::kernel::sys::resource_ledger::deny(pool);
+    errno::ENOMEM
+}
+
+/// The node store's pools.
+const NODE_POOLS: [u16; 3] = [
+    res::POOL_STORE_SUBS,
+    res::POOL_STORE_READS,
+    res::POOL_STORE_WRITES,
+];
+/// A workload store's pools.
+const OWNER_POOLS: [u16; 3] = [
+    res::POOL_OWNER_STORE_SUBS,
+    res::POOL_OWNER_STORE_READS,
+    res::POOL_OWNER_STORE_WRITES,
+];
+
 impl Served {
-    fn with_tables(
-        store: Store,
-        subs: usize,
-        reads: usize,
-        writes: usize,
-        stage_max: usize,
-    ) -> Self {
-        Self {
+    fn with_tables(store: Store, pools: [u16; 3], stage_max: usize) -> Self {
+        let mut served = Self {
             store,
-            subs: vec![SUB_EMPTY; subs],
-            reads: (0..reads).map(|_| READ_EMPTY).collect(),
-            writes: (0..writes).map(|_| WRITE_EMPTY).collect(),
+            subs: Vec::new(),
+            reads: Vec::new(),
+            writes: Vec::new(),
             stage_max,
+            pools,
+        };
+        served.size_tables();
+        served
+    }
+
+    /// Grow the tables to the plan's ceilings. Slots in use keep their place
+    /// (a handle names a slot index); a table already past its ceiling keeps
+    /// its slots, since a slot a live handle names cannot be taken away.
+    fn size_tables(&mut self) {
+        let [subs, reads, writes] = self.pools.map(plan_ceiling);
+        if self.subs.len() < subs {
+            self.subs.resize(subs, SUB_EMPTY);
+        }
+        while self.reads.len() < reads {
+            self.reads.push(READ_EMPTY);
+        }
+        while self.writes.len() < writes {
+            self.writes.push(WRITE_EMPTY);
         }
     }
 
     /// The node's control-plane store.
     fn node(store: Store) -> Self {
-        Self::with_tables(
-            store,
-            STORE_MAX_SUBS,
-            STORE_MAX_READS,
-            STORE_MAX_WRITES,
-            STORE_STAGE_MAX,
-        )
+        Self::with_tables(store, NODE_POOLS, STORE_STAGE_MAX)
     }
 
     /// A workload's own store, with tables sized for one tenant.
     pub fn owner(store: Store) -> Self {
-        Self::with_tables(
-            store,
-            OWNER_MAX_SUBS,
-            OWNER_MAX_READS,
-            OWNER_MAX_WRITES,
-            OWNER_STAGE_MAX,
-        )
+        Self::with_tables(store, OWNER_POOLS, OWNER_STAGE_MAX)
     }
 
     /// What the store's live entries cost an owner holding them: see
@@ -757,17 +789,8 @@ impl Served {
     }
 }
 
-/// Subscriptions, `GET` reads and streamed writes one workload's store holds
-/// at once, and the bytes one of its streamed writes may stage.
-const OWNER_MAX_SUBS: usize = 16;
-const OWNER_MAX_READS: usize = 8;
-const OWNER_MAX_WRITES: usize = 4;
+/// Bytes one of a workload store's streamed writes may stage.
 const OWNER_STAGE_MAX: usize = 16 * 1024 * 1024;
-
-/// Streaming writes open at once. Matched to `STORE_MAX_READS`, and for the
-/// same reason: one slot per operation a node has in flight, and an S3 server
-/// fronting this store streams every object write.
-const STORE_MAX_WRITES: usize = 32;
 
 /// Bytes one streaming write may stage before `COMMIT`. Past it the write is
 /// refused `ENOSPC` rather than growing until the node dies.
@@ -778,10 +801,13 @@ const STORE_STAGE_MAX: usize = 64 * 1024 * 1024;
 /// this the staging buffer grows as the bytes arrive.
 const STORE_STAGE_RESERVE_MAX: u64 = 1024 * 1024;
 
-/// Grants presented to a guarded store at once. A presentation past it is
-/// refused `ENOMEM` until one is closed; none is evicted, because an evicted
-/// grant is a caller whose next operation silently starts failing.
-const STORE_MAX_GRANTS: usize = 64;
+/// Grants presented to a guarded store at once: the plan's `store_grants`
+/// ceiling. A presentation past it is refused `ENOMEM` until one is closed;
+/// none is evicted, because an evicted grant is a caller whose next operation
+/// silently starts failing.
+fn store_max_grants() -> usize {
+    plan_ceiling(res::POOL_STORE_GRANTS)
+}
 
 /// Streaming-write handles are store slots from here up to `GRANT_SLOT_BASE`.
 /// A band of its own, so a handle names exactly one kind of slot and the
@@ -869,6 +895,45 @@ pub unsafe fn store_init_from_env() -> StoreInit {
             StoreInit::Opened
         }
         Err(_) => StoreInit::Failed,
+    }
+}
+
+/// Grow the node store's tables to the boot plan's ceilings, and make room
+/// for its grants. Called when a graph is prepared, after the plan.
+///
+/// # Safety
+/// Graph-preparation context on the scheduler thread.
+pub unsafe fn size_from_plan() {
+    if let Some(served) = (*core::ptr::addr_of_mut!(LINUX_STORE)).as_mut() {
+        served.size_tables();
+    }
+    let grants = &mut *core::ptr::addr_of_mut!(GRANTS);
+    let want = store_max_grants();
+    if grants.capacity() < want {
+        grants.reserve(want - grants.len());
+    }
+}
+
+/// Slots of the node store's `pool` table in use — the resource ledger's
+/// sample for the store pools.
+pub fn pool_in_use(pool: u16) -> usize {
+    // SAFETY: a read-only walk on the scheduler thread.
+    unsafe {
+        if pool == res::POOL_STORE_GRANTS {
+            return (*core::ptr::addr_of!(GRANTS))
+                .iter()
+                .filter(|g| g.is_some())
+                .count();
+        }
+        let Some(served) = (*core::ptr::addr_of!(LINUX_STORE)).as_ref() else {
+            return 0;
+        };
+        match pool {
+            res::POOL_STORE_SUBS => served.subs.iter().filter(|s| s.in_use).count(),
+            res::POOL_STORE_READS => served.reads.iter().filter(|r| r.in_use).count(),
+            res::POOL_STORE_WRITES => served.writes.iter().filter(|w| w.in_use).count(),
+            _ => 0,
+        }
     }
 }
 
@@ -997,11 +1062,18 @@ unsafe fn present(arg: *mut u8, a: &[u8]) -> i32 {
     let grants = &mut *core::ptr::addr_of_mut!(GRANTS);
     let i = match grants.iter().position(Option::is_none) {
         Some(i) => i,
-        None if grants.len() < STORE_MAX_GRANTS => {
+        None if grants.len() < store_max_grants() => {
             grants.push(None);
             grants.len() - 1
         }
-        None => return errno::ENOMEM,
+        None => {
+            log::warn!(
+                "[store] pool 'store_grants' at its ceiling of {} grants; refused",
+                grants.len()
+            );
+            crate::kernel::sys::resource_ledger::deny(res::POOL_STORE_GRANTS);
+            return errno::ENOMEM;
+        }
     };
     let owner = crate::kernel::exec::scheduler::caller_module_index();
     grants[i] = Some(Grant {
@@ -1409,6 +1481,7 @@ pub unsafe fn dispatch_object_on(
     let opener = crate::kernel::exec::scheduler::caller_owner();
     let owner = crate::kernel::exec::scheduler::caller_authority();
     let stage_max = served.stage_max;
+    let pools = served.pools;
     let store = &mut served.store;
     let subs = &mut served.subs;
     let reads = &mut served.reads;
@@ -1588,7 +1661,7 @@ pub unsafe fn dispatch_object_on(
                 return errno::EINVAL;
             };
             let Some(idx) = writes.iter().position(|w| !w.in_use) else {
-                return errno::ENOMEM;
+                return refuse_slot(pools[2], writes.len());
             };
             writes[idx] = WriteSlot {
                 in_use: true,
@@ -1694,7 +1767,7 @@ pub unsafe fn dispatch_object_on(
             };
             let val = val.to_vec();
             let Some(idx) = reads.iter().position(|r| !r.in_use) else {
-                return errno::ENOMEM;
+                return refuse_slot(pools[1], reads.len());
             };
             reads[idx] = ReadSlot {
                 in_use: true,
@@ -1907,6 +1980,7 @@ pub unsafe fn dispatch_namespace_on(
 ) -> i32 {
     let opener = crate::kernel::exec::scheduler::caller_owner();
     let store = &mut served.store;
+    let pools = served.pools;
     let subs = &mut served.subs;
     // Per-handle fence introspection (LOOKUP/SUBSCRIBE handle): a view fence at
     // the current store revision.
@@ -2001,7 +2075,7 @@ pub unsafe fn dispatch_namespace_on(
                 // pushing them straight to the channel ahead of the live ring.
                 let Some(idx) = subs.iter().position(|s| !s.in_use) else {
                     store.unsubscribe(wid);
-                    return errno::ENOMEM;
+                    return refuse_slot(pools[0], subs.len());
                 };
                 subs[idx] = Sub {
                     in_use: true,
@@ -2036,7 +2110,7 @@ pub unsafe fn dispatch_namespace_on(
             };
             let Some(idx) = subs.iter().position(|s| !s.in_use) else {
                 store.unsubscribe(watch);
-                return errno::ENOMEM;
+                return refuse_slot(pools[0], subs.len());
             };
             subs[idx] = Sub {
                 in_use: true,

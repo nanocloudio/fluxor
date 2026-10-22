@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 /// The recomputed pin plus the content each checked-in site SHOULD have.
 pub struct PinPlan {
     pub digest_hex: String,
-    /// `(path, expected_content)` for each of the three checked-in sites.
+    /// `(path, expected_content)` for each of the two checked-in sites.
     pub edits: Vec<(PathBuf, String)>,
 }
 
@@ -82,9 +82,10 @@ pub fn compute(repo: &Path) -> Result<PinPlan> {
     let digest: [u8; 32] = h.finalize().into();
     let digest_hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
 
-    // Two sites, not three: the harness lock asserts the kernel mount against
-    // `ABI_SURFACE_DIGEST` rather than restating the digest, so the only
-    // spelled-out copy in the tree is the tools-side tripwire below.
+    // Two sites: the srcpin file's two constants, and the tools-side
+    // tripwire. The harness lock asserts the kernel mount against
+    // `ABI_SURFACE_DIGEST` rather than restating the digest, so the tripwire
+    // is the only spelled-out copy in the tree.
     let srcpin_file = repo.join("modules/sdk/abi_surface_srcpin.rs");
     let hash_file = repo.join("tools/src/hash.rs");
 

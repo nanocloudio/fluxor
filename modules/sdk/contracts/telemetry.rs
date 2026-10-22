@@ -133,10 +133,11 @@ pub const PSTATUS_STEP_SIZE: usize = HEADER_SIZE + 8 + HIST_BUCKETS * 4;
 /// PSTATUS resource body: `[arena_used u32][arena_cap u32][faults u32][flags u32]`
 /// (16 B → 28 total).
 pub const PSTATUS_RES_SIZE: usize = HEADER_SIZE + 16;
-/// PSTATUS pool body: `[pool u16][class u8][_rsvd u8][cap u32][cur u32]
-/// [peak u32][denials u32]` (20 B → 32 total). Units are the pool's own
-/// (bytes for arenas, slots for tables — see the `resource` contract).
-pub const PSTATUS_POOL_SIZE: usize = HEADER_SIZE + 20;
+/// PSTATUS pool body: `[pool u16][class u8][_rsvd u8][cap u64][cur u64]
+/// [peak u64][denials u32]` (32 B → 44 total). Units are the pool's own
+/// (bytes for arenas, slots for tables — see the `resource` contract); the
+/// figures are `u64` because an arena on a large machine is past 4 GiB.
+pub const PSTATUS_POOL_SIZE: usize = HEADER_SIZE + 32;
 /// Largest record the ring must reserve atomically — a 16-bucket histogram
 /// metric (144 B).
 pub const MAX_RECORD_SIZE: usize = METRIC_HIST16_SIZE;
@@ -233,7 +234,7 @@ const _: () = assert!(METRIC_HIST16_SIZE == 144);
 const _: () = assert!(SPAN_SIZE == 64);
 const _: () = assert!(PSTATUS_STEP_SIZE == 52);
 const _: () = assert!(PSTATUS_RES_SIZE == 28);
-const _: () = assert!(PSTATUS_POOL_SIZE == 32);
+const _: () = assert!(PSTATUS_POOL_SIZE == 44);
 const _: () = assert!(MAX_RECORD_SIZE == 144);
 const _: () = assert!(BATCH_HEADER_SIZE == 16);
 
@@ -264,8 +265,9 @@ pub const FILTER_ALL: u32 = FILTER_METRIC | FILTER_SPAN | FILTER_PSTATUS;
 /// Span sample-shift lives in bits 24..32: keep 1-in-2^shift spans.
 pub const FILTER_SPAN_SHIFT_POS: u32 = 24;
 
-/// Does a record with this `(signal, kind)` pass `filter`? Kind is unused today
-/// (the mask is per-signal) but kept in the signature for forward room.
+/// Does a record with this `(signal, kind)` pass `filter`? The mask selects
+/// per signal, so `kind` does not enter the decision; the caller passes the
+/// header's two bytes as it reads them.
 pub fn filter_admits(filter: u32, signal: u8, _kind: u8) -> bool {
     let bit = match signal {
         SIGNAL_METRIC => FILTER_METRIC,
@@ -609,9 +611,9 @@ pub fn write_pstatus_pool(
     t_micros: u64,
     pool: u16,
     class: u8,
-    cap: u32,
-    cur: u32,
-    peak: u32,
+    cap: u64,
+    cur: u64,
+    peak: u64,
     denials: u32,
 ) -> Option<usize> {
     if buf.len() < PSTATUS_POOL_SIZE {
@@ -621,10 +623,10 @@ pub fn write_pstatus_pool(
     buf[12..14].copy_from_slice(&pool.to_le_bytes());
     buf[14] = class;
     buf[15] = 0;
-    buf[16..20].copy_from_slice(&cap.to_le_bytes());
-    buf[20..24].copy_from_slice(&cur.to_le_bytes());
-    buf[24..28].copy_from_slice(&peak.to_le_bytes());
-    buf[28..32].copy_from_slice(&denials.to_le_bytes());
+    buf[16..24].copy_from_slice(&cap.to_le_bytes());
+    buf[24..32].copy_from_slice(&cur.to_le_bytes());
+    buf[32..40].copy_from_slice(&peak.to_le_bytes());
+    buf[40..44].copy_from_slice(&denials.to_le_bytes());
     Some(PSTATUS_POOL_SIZE)
 }
 
@@ -639,23 +641,23 @@ pub fn pstatus_pool_class(buf: &[u8]) -> u8 {
 }
 
 /// PSTATUS `POOL`: capacity in the pool's own units.
-pub fn pstatus_pool_cap(buf: &[u8]) -> u32 {
-    read_u32(buf, 16)
+pub fn pstatus_pool_cap(buf: &[u8]) -> u64 {
+    read_u64(buf, 16)
 }
 
 /// PSTATUS `POOL`: units currently in use.
-pub fn pstatus_pool_cur(buf: &[u8]) -> u32 {
-    read_u32(buf, 20)
+pub fn pstatus_pool_cur(buf: &[u8]) -> u64 {
+    read_u64(buf, 24)
 }
 
 /// PSTATUS `POOL`: high-water mark of `cur`.
-pub fn pstatus_pool_peak(buf: &[u8]) -> u32 {
-    read_u32(buf, 24)
+pub fn pstatus_pool_peak(buf: &[u8]) -> u64 {
+    read_u64(buf, 32)
 }
 
 /// PSTATUS `POOL`: cumulative denied requests.
 pub fn pstatus_pool_denials(buf: &[u8]) -> u32 {
-    read_u32(buf, 28)
+    read_u32(buf, 40)
 }
 
 // ── W3C Trace Context ───────────────────────────────────────────────
