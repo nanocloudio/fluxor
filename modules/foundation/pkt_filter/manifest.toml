@@ -1,14 +1,56 @@
 version = "1.0.0"
 hardware_targets = ["rp2350", "bcm2712"]
 
-# Stateless packet filter. Reads parsed metadata from `eth_parser`,
-# evaluates match rules from config params, and forwards or drops.
+# Packet filter in the frame path between the NIC driver and `ip`: the
+# bare-metal enforcer of one net.policy table (`table` param), stateful by
+# the contract's flow model, or a static port filter. Frames are
+# length-prefixed on every port, as between `ip` and the NIC drivers.
 
 # Optional: enforce a net.policy table (`table` param) instead of the static
-# rules — the bare-metal enforcer of the contract. The module READs the table,
-# re-reads when its generation moves, and ATTACHes so the provider's CAPS can
-# truthfully report ENFORCED. Without a `table` param it never calls the
+# rules. The module READs the table, re-reads when its generation moves, and
+# ATTACHes (declaring how much of it it holds) so the table's READ state
+# truthfully reports ENFORCED. Without a `table` param it never calls the
 # contract, and the declaration is inert.
 [[resources]]
 requires_contract = "net_policy"
 access = "read"
+
+[[ports]]
+name = "frames_rx"
+direction = "input"
+content_type = "EthernetFrame"
+required = true
+buffer_size = { default = 2048, aarch64 = 8192 }
+
+[[ports]]
+name = "frames_tx"
+direction = "output"
+content_type = "EthernetFrame"
+required = true
+buffer_size = { default = 2048, aarch64 = 8192 }
+max_record = 1514
+
+# The transmit path (in[1] from `ip`, out[1] to the NIC driver). Wire both
+# for the flow table to see both directions of every flow; unwired, only
+# the receive path is filtered and a reply to a flow the node opened is
+# judged as new.
+[[ports]]
+name = "egress_rx"
+direction = "input"
+index = 1
+content_type = "EthernetFrame"
+required = false
+buffer_size = { default = 2048, aarch64 = 8192 }
+
+[[ports]]
+name = "egress_tx"
+direction = "output"
+index = 1
+content_type = "EthernetFrame"
+required = false
+buffer_size = { default = 2048, aarch64 = 8192 }
+max_record = 1514
+
+# Module-scope observability — exempt (see standards/observability.md §6).
+[observability]
+exempt = "L2 filter in the frame path — frame bytes are observed at the ip module; its domain metric is pass/drop counts"

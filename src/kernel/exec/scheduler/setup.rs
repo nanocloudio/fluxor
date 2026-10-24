@@ -88,7 +88,11 @@ pub unsafe fn size_kernel_tables(
         .map_err(|e| refused(res::POOL_OWNERS, e))?;
     // Every per-owner table is the owner table's size: one log ring, one
     // code-pack region (and one being staged), one graph-workload slot per
-    // owner slot.
+    // owner slot; the graph-local pacers and the resident-graph index hold
+    // one entry per owner slot and execution domain.
+    super::merge::size_graph_pacers(owners).map_err(|e| refused(res::POOL_OWNERS, e))?;
+    #[cfg(feature = "multitenant")]
+    super::multigraph::size_resident_graphs(owners).map_err(|e| refused(res::POOL_OWNERS, e))?;
     #[cfg(feature = "host-linux")]
     crate::kernel::workload::owner_log::size(owners).map_err(|e| refused(res::POOL_OWNERS, e))?;
     #[cfg(feature = "multitenant")]
@@ -249,11 +253,18 @@ pub fn prepare_graph() -> Result<(ModuleList, usize), i32> {
     // `caller >= module_slots()` short-circuit kicks in.
     set_current_module(MAX_MODULES);
 
+    // No ISR-tier module may run while the tables move: one stepped from a
+    // Tier 1b or Tier 2 handler on another core reads the module tables in a
+    // syscall's admission check. Its registration reopens dispatch once the
+    // new graph has instantiated it.
+    crate::kernel::exec::isr_tier::close_dispatch();
+
     // Size every boot-sized table to the plan this config derives, before
     // anything below walks one. A plan the platform cannot hold fails the
     // graph here, naming the pool.
     // SAFETY: graph preparation — no module runs and nothing holds a
-    // reference into a kernel table.
+    // reference into a kernel table: the cooperative domains are parked or
+    // not yet started, and ISR-tier dispatch is closed above.
     if unsafe { size_kernel_tables(config) }.is_err() {
         return Err(-1);
     }

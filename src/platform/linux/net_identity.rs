@@ -29,11 +29,11 @@
 //   * The address allocation itself is the orchestrator's, never done here.
 //
 // Teardown: the veth pair dies with the netns, which dies with the
-// container process. A workload that outlives its runtime (the runtime was
-// killed) keeps its pair until the next instance on the host collects the
-// dead runtime's tag: `reclaim_links` deletes every link carrying it. IPv4
-// only: a `NET_FAM_IPV6` request is refused at admission (`ENOSYS`) rather
-// than half-realized.
+// container process, and the container dies with its runtime (parent
+// death, `confine.rs`). Whatever link a dead runtime still left is deleted
+// when the next instance on the host collects its tag: `reclaim_links`
+// deletes every link carrying it. IPv4 only: a `NET_FAM_IPV6` request is
+// refused at admission (`ENOSYS`) rather than half-realized.
 //
 // The container-side configuration runs in a short-lived forked helper that
 // `setns()`s into the container's netns — never on the platform thread, whose

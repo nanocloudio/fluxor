@@ -43,11 +43,17 @@
 //!
 //! Each `MODULE_HEAPS[i]` entry is owned by module `i`, which steps on
 //! a single assigned core, so an individual heap is touched by one
-//! core at a time and needs no cross-core synchronisation. Elastic growth
+//! core at a time and needs no cross-core synchronisation.
+//!
+//! ## Storage
+//!
+//! `MODULE_HEAPS` is a per-module kernel table (`kernel::mem::table`),
+//! sized at boot from the plan and committed, grown and moved together with
+//! the scheduler's other per-module tables, so it holds exactly the module
+//! slots they hold. An index past them reaches no heap: every entry point
+//! answers it as for a module without one (null, nothing, zero). Elastic growth
 //! draws on the shared state arena, which serialises its own bookkeeping
 //! (`loader::alloc_state`). See `docs/architecture/concurrency.md`.
-
-use crate::kernel::exec::scheduler::MAX_MODULES;
 
 // ============================================================================
 // Constants
@@ -500,12 +506,9 @@ pub fn note_zeroed(bytes: usize) {
     }
     ZERO_STEP_TOTAL.fetch_add(bytes as u64, portable_atomic::Ordering::Relaxed);
     let idx = crate::kernel::exec::scheduler::current_module_index();
-    if idx < crate::kernel::exec::scheduler::module_slots() {
+    if let Some(h) = heap_at(idx) {
         // SAFETY: the stepping module's own heap, on its core.
-        unsafe {
-            let h = &mut (*core::ptr::addr_of_mut!(MODULE_HEAPS))[idx];
-            h.zero_step_bytes = h.zero_step_bytes.saturating_add(bytes as u64);
-        }
+        unsafe { (*h).zero_step_bytes = (*h).zero_step_bytes.saturating_add(bytes as u64) };
     }
 }
 
@@ -513,11 +516,8 @@ pub fn note_zeroed(bytes: usize) {
 /// its step ran. Zero on Linux, where freed memory is returned to zero when it
 /// is freed and nothing is zeroed on allocation.
 pub fn heap_zero_step_bytes(module_idx: usize) -> u64 {
-    if module_idx >= crate::kernel::exec::scheduler::module_slots() {
-        return 0;
-    }
     // SAFETY: a word read of the module's heap record.
-    unsafe { (*core::ptr::addr_of!(MODULE_HEAPS))[module_idx].zero_step_bytes }
+    heap_at(module_idx).map_or(0, |h| unsafe { (*h).zero_step_bytes })
 }
 
 /// `heap_zero_step_bytes` summed over every module since boot.
@@ -1015,21 +1015,72 @@ impl ModuleHeap {
 // Global heap state (indexed by module)
 // ============================================================================
 
-/// Per-module heap metadata, stored in kernel memory.
-static mut MODULE_HEAPS: [ModuleHeap; MAX_MODULES] = [const { ModuleHeap::empty() }; MAX_MODULES];
+/// One module's heap record. Slot `i` is reached only from module `i`'s core,
+/// or from the scheduler while module `i` cannot step (instantiation,
+/// teardown, a rebuild), so the record needs no lock of its own (see the
+/// module header), and the cell lets every access borrow the table shared.
+#[repr(transparent)]
+pub struct HeapSlot(core::cell::UnsafeCell<ModuleHeap>);
+
+// SAFETY: a slot is touched by one core at a time (the type's documentation);
+// the table that holds the slots publishes its bounds atomically.
+unsafe impl Sync for HeapSlot {}
+
+impl HeapSlot {
+    const fn new() -> Self {
+        Self(core::cell::UnsafeCell::new(ModuleHeap::empty()))
+    }
+}
+
+/// Per-module heap metadata, in kernel memory: a per-module table, reserved,
+/// committed and grown with the scheduler's other per-module tables
+/// (`size_module_tables`, `grow_module_tables`), so it holds exactly the
+/// module slots they hold. Every access goes through [`heap_at`], which
+/// refuses an index past the committed slots.
+static MODULE_HEAPS: crate::kernel::exec::scheduler::ModTable<HeapSlot> = crate::boot_table!(
+    crate::kernel::exec::scheduler::MAX_MODULES,
+    HeapSlot::new(),
+    crate::abi::contracts::resource::POOL_MODULE_SLOTS
+);
+
+/// Module `idx`'s heap record, or `None` for an index past the module slots
+/// the table has committed: no heap exists for a slot that does not.
+#[inline]
+fn heap_at(idx: usize) -> Option<*mut ModuleHeap> {
+    MODULE_HEAPS.get(idx).map(|slot| slot.0.get())
+}
+
+/// Reserve the heap table for `ceiling` module slots.
+///
+/// # Safety
+/// As `Table::reserve`: graph preparation, with no heap record borrowed.
+pub(crate) unsafe fn reserve_heaps(
+    ceiling: usize,
+) -> Result<(), crate::kernel::mem::table::TableError> {
+    // SAFETY: the caller's contract.
+    unsafe { MODULE_HEAPS.reserve(ceiling) }
+}
+
+/// Commit heap records until `n` module slots have one.
+pub(crate) fn grow_heaps(n: usize) -> Result<(), crate::kernel::mem::table::TableError> {
+    MODULE_HEAPS.grow(n)
+}
+
+/// Module slots the heap table has committed.
+pub fn heap_slots() -> usize {
+    MODULE_HEAPS.len()
+}
 
 /// Initialize a module's committed heap over an arena allocation.
 /// Called by the loader during instantiation for a module whose heap is
 /// committed whole (see the module header).
 pub fn init_module_heap(module_idx: usize, arena_ptr: *mut u8, arena_size: usize) {
-    if module_idx >= crate::kernel::exec::scheduler::module_slots() {
+    let Some(h) = heap_at(module_idx) else {
         return;
-    }
+    };
     // SAFETY: per-module heap; each module steps on a single core (see file
-    // header), so concurrent access is precluded. `module_idx` bounded.
-    unsafe {
-        MODULE_HEAPS[module_idx] = ModuleHeap::init(arena_ptr, arena_size);
-    }
+    // header), so concurrent access is precluded.
+    unsafe { *h = ModuleHeap::init(arena_ptr, arena_size) };
     if arena_size > 0 {
         log::debug!("[heap] module {module_idx} heap init {arena_size} bytes");
     }
@@ -1038,13 +1089,11 @@ pub fn init_module_heap(module_idx: usize, arena_ptr: *mut u8, arena_size: usize
 /// Initialize a module's elastic heap with a cap of `cap` bytes: nothing is
 /// committed until it allocates.
 pub fn init_module_heap_elastic(module_idx: usize, cap: usize) {
-    if module_idx >= crate::kernel::exec::scheduler::module_slots() {
+    let Some(h) = heap_at(module_idx) else {
         return;
-    }
+    };
     // SAFETY: as `init_module_heap`.
-    unsafe {
-        MODULE_HEAPS[module_idx] = ModuleHeap::init_elastic(cap);
-    }
+    unsafe { *h = ModuleHeap::init_elastic(cap) };
     log::debug!("[heap] module {module_idx} elastic heap cap {cap} bytes");
 }
 
@@ -1055,12 +1104,9 @@ pub const fn elastic_heaps() -> bool {
 
 /// Reset a module's heap (called on graph reconfigure).
 pub fn reset_module_heap(module_idx: usize) {
-    if module_idx >= crate::kernel::exec::scheduler::module_slots() {
-        return;
-    }
-    // SAFETY: as above; reconfigure runs between graph rebuilds.
-    unsafe {
-        MODULE_HEAPS[module_idx] = ModuleHeap::empty();
+    if let Some(h) = heap_at(module_idx) {
+        // SAFETY: as above; reconfigure runs between graph rebuilds.
+        unsafe { *h = ModuleHeap::empty() };
     }
 }
 
@@ -1069,14 +1115,14 @@ pub fn reset_module_heap(module_idx: usize) {
 /// rest of the module's memory. A committed heap's arena is not among them;
 /// its owner frees it.
 pub fn detach_module_heap(module_idx: usize) -> HeapSegments {
-    if module_idx >= crate::kernel::exec::scheduler::module_slots() {
+    let Some(h) = heap_at(module_idx) else {
         return HeapSegments::none();
-    }
+    };
     // SAFETY: teardown context — the module is unspliced and never stepped
     // again, so nothing else touches its heap.
     unsafe {
-        let owned = MODULE_HEAPS[module_idx].owned_segments();
-        MODULE_HEAPS[module_idx] = ModuleHeap::empty();
+        let owned = (*h).owned_segments();
+        *h = ModuleHeap::empty();
         owned
     }
 }
@@ -1084,12 +1130,9 @@ pub fn detach_module_heap(module_idx: usize) -> HeapSegments {
 /// Reset all module heaps. Called when the state arena is reset wholesale,
 /// so no heap keeps segments of the previous graph.
 pub fn reset_all() {
-    // SAFETY: scheduler-side reset; no module is stepping when this runs.
-    unsafe {
-        let heaps = &raw mut MODULE_HEAPS;
-        for slot in (*heaps).iter_mut() {
-            *slot = ModuleHeap::empty();
-        }
+    for slot in MODULE_HEAPS.iter() {
+        // SAFETY: scheduler-side reset; no module is stepping when this runs.
+        unsafe { *slot.0.get() = ModuleHeap::empty() };
     }
 }
 
@@ -1098,11 +1141,8 @@ pub fn reset_all() {
 /// [`commit_whole`]). Never allocates: a step that asks for an arena it did
 /// not declare gets none.
 pub fn committed_whole(module_idx: usize) -> Option<(*mut u8, usize)> {
-    if module_idx >= crate::kernel::exec::scheduler::module_slots() {
-        return None;
-    }
     // SAFETY: a read of the module's heap record on its core.
-    let h = unsafe { &(*core::ptr::addr_of!(MODULE_HEAPS))[module_idx] };
+    let h = unsafe { &*heap_at(module_idx)? };
     (h.elastic && h.seg_count == 1 && h.segs[0].size == h.cap)
         .then(|| (h.segs[0].base, h.cap as usize))
 }
@@ -1111,11 +1151,9 @@ pub fn committed_whole(module_idx: usize) -> Option<(*mut u8, usize)> {
 /// `ARENA_GET`. `None` for a committed heap (its arena is the scheduler's
 /// record) and for an elastic heap that already grew in pieces.
 pub fn commit_whole(module_idx: usize) -> Option<(*mut u8, usize)> {
-    if module_idx >= crate::kernel::exec::scheduler::module_slots() {
-        return None;
-    }
+    let h = heap_at(module_idx)?;
     // SAFETY: per-module heap owned by the calling module's core.
-    let r = unsafe { MODULE_HEAPS[module_idx].commit_whole() };
+    let r = unsafe { (*h).commit_whole() };
     if r.is_none() && is_elastic(module_idx) {
         log::error!(
             "[heap] module {module_idx}: ARENA_GET after its heap grew in segments — there is \
@@ -1127,20 +1165,14 @@ pub fn commit_whole(module_idx: usize) -> Option<(*mut u8, usize)> {
 
 /// Whether module `module_idx` has an elastic heap.
 pub fn is_elastic(module_idx: usize) -> bool {
-    if module_idx >= crate::kernel::exec::scheduler::module_slots() {
-        return false;
-    }
     // SAFETY: per-module heap; read-only.
-    unsafe { MODULE_HEAPS[module_idx].elastic }
+    heap_at(module_idx).is_some_and(|h| unsafe { (*h).elastic })
 }
 
 /// `(committed, cap)` of module `module_idx`'s heap, in bytes.
 pub fn heap_footprint(module_idx: usize) -> (usize, usize) {
-    if module_idx >= crate::kernel::exec::scheduler::module_slots() {
-        return (0, 0);
-    }
     // SAFETY: per-module heap; a word-sized read of each field.
-    unsafe { MODULE_HEAPS[module_idx].footprint() }
+    heap_at(module_idx).map_or((0, 0), |h| unsafe { (*h).footprint() })
 }
 
 /// Across every module: `(heaps, committed bytes, cap bytes, grow denials)`.
@@ -1151,16 +1183,14 @@ pub fn heaps_usage() -> (usize, usize, usize, usize) {
     let mut committed = 0;
     let mut cap = 0;
     let mut denied = 0;
-    // SAFETY: scheduler-side read; each field is read whole.
-    unsafe {
-        let heaps = &raw const MODULE_HEAPS;
-        for h in (*heaps).iter() {
-            if h.is_active() {
-                n += 1;
-                committed += h.committed as usize;
-                cap += h.cap as usize;
-                denied += h.grow_denied as usize;
-            }
+    for slot in MODULE_HEAPS.iter() {
+        // SAFETY: scheduler-side read; each field is read whole.
+        let h = unsafe { &*slot.0.get() };
+        if h.is_active() {
+            n += 1;
+            committed += h.committed as usize;
+            cap += h.cap as usize;
+            denied += h.grow_denied as usize;
         }
     }
     (n, committed, cap, denied)
@@ -1172,14 +1202,14 @@ pub fn heaps_usage() -> (usize, usize, usize, usize) {
 /// declared `FaultPolicy` runs at the next tick; the C-style
 /// caller-checks-NULL pattern stays the default.
 pub fn heap_alloc(module_idx: usize, size: usize) -> *mut u8 {
-    if module_idx >= crate::kernel::exec::scheduler::module_slots() {
+    let Some(h) = heap_at(module_idx) else {
         return core::ptr::null_mut();
-    }
+    };
     // SAFETY: per-module heap owned by the calling module's core.
-    let ptr = unsafe { MODULE_HEAPS[module_idx].alloc(size) };
+    let ptr = unsafe { (*h).alloc(size) };
     if ptr.is_null() {
         // SAFETY: as above.
-        let fault_policy_enabled = unsafe { MODULE_HEAPS[module_idx].fault_on_alloc_failure };
+        let fault_policy_enabled = unsafe { (*h).fault_on_alloc_failure };
         if fault_policy_enabled {
             crate::kernel::exec::scheduler::raise_module_fault(
                 module_idx,
@@ -1192,11 +1222,10 @@ pub fn heap_alloc(module_idx: usize, size: usize) -> *mut u8 {
 
 /// Free memory from the current module's heap.
 pub fn heap_free(module_idx: usize, ptr: *mut u8) {
-    if module_idx >= crate::kernel::exec::scheduler::module_slots() {
-        return;
+    if let Some(h) = heap_at(module_idx) {
+        // SAFETY: per-module heap owned by the calling module's core.
+        unsafe { (*h).free(ptr) }
     }
-    // SAFETY: per-module heap; `module_idx` bounded.
-    unsafe { MODULE_HEAPS[module_idx].free(ptr) }
 }
 
 /// Reallocate from the current module's heap.
@@ -1209,14 +1238,14 @@ pub fn heap_free(module_idx: usize, ptr: *mut u8) {
 /// of-free path — a null return there is the expected no-op, not an
 /// OOM, so it doesn't raise.
 pub fn heap_realloc(module_idx: usize, ptr: *mut u8, new_size: usize) -> *mut u8 {
-    if module_idx >= crate::kernel::exec::scheduler::module_slots() {
+    let Some(h) = heap_at(module_idx) else {
         return core::ptr::null_mut();
-    }
-    // SAFETY: per-module heap.
-    let new_ptr = unsafe { MODULE_HEAPS[module_idx].realloc(ptr, new_size) };
+    };
+    // SAFETY: per-module heap owned by the calling module's core.
+    let new_ptr = unsafe { (*h).realloc(ptr, new_size) };
     if new_ptr.is_null() && new_size > 0 {
         // SAFETY: as above.
-        let fault_policy_enabled = unsafe { MODULE_HEAPS[module_idx].fault_on_alloc_failure };
+        let fault_policy_enabled = unsafe { (*h).fault_on_alloc_failure };
         if fault_policy_enabled {
             crate::kernel::exec::scheduler::raise_module_fault(
                 module_idx,
@@ -1229,20 +1258,14 @@ pub fn heap_realloc(module_idx: usize, ptr: *mut u8, new_size: usize) -> *mut u8
 
 /// Get heap statistics for a module.
 pub fn heap_stats(module_idx: usize) -> HeapStats {
-    if module_idx >= crate::kernel::exec::scheduler::module_slots() {
-        return HeapStats::default();
-    }
     // SAFETY: per-module heap.
-    unsafe { MODULE_HEAPS[module_idx].stats() }
+    heap_at(module_idx).map_or(HeapStats::default(), |h| unsafe { (*h).stats() })
 }
 
 /// Check if a module has an active heap.
 pub fn has_heap(module_idx: usize) -> bool {
-    if module_idx >= crate::kernel::exec::scheduler::module_slots() {
-        return false;
-    }
     // SAFETY: per-module heap; read-only.
-    unsafe { MODULE_HEAPS[module_idx].is_active() }
+    heap_at(module_idx).is_some_and(|h| unsafe { (*h).is_active() })
 }
 
 /// Opt the module's heap into zero-on-free. Must be called before
@@ -1251,22 +1274,16 @@ pub fn has_heap(module_idx: usize) -> bool {
 /// the cross-allocation residue channel for modules that handle
 /// secrets. Sourced from the manifest's `heap.zero_on_free` flag.
 pub fn set_zero_on_free(module_idx: usize, enabled: bool) {
-    if module_idx >= crate::kernel::exec::scheduler::module_slots() {
-        return;
-    }
-    // SAFETY: per-module heap; configured during instantiation.
-    unsafe {
-        MODULE_HEAPS[module_idx].zero_on_free = enabled;
+    if let Some(h) = heap_at(module_idx) {
+        // SAFETY: per-module heap; configured during instantiation.
+        unsafe { (*h).zero_on_free = enabled };
     }
 }
 
 /// Query whether the module's heap zeroes on free.
 pub fn zero_on_free_enabled(module_idx: usize) -> bool {
-    if module_idx >= crate::kernel::exec::scheduler::module_slots() {
-        return false;
-    }
     // SAFETY: per-module heap; read-only.
-    unsafe { MODULE_HEAPS[module_idx].zero_on_free }
+    heap_at(module_idx).is_some_and(|h| unsafe { (*h).zero_on_free })
 }
 
 /// Opt the module into kernel-managed fault on heap exhaustion.
@@ -1276,22 +1293,16 @@ pub fn zero_on_free_enabled(module_idx: usize) -> bool {
 /// keeps the caller-checks-NULL pattern. Sourced from the manifest's
 /// `heap.alloc_failure_policy = "fault"` setting.
 pub fn set_fault_on_alloc_failure(module_idx: usize, enabled: bool) {
-    if module_idx >= crate::kernel::exec::scheduler::module_slots() {
-        return;
-    }
-    // SAFETY: per-module heap; configured during instantiation.
-    unsafe {
-        MODULE_HEAPS[module_idx].fault_on_alloc_failure = enabled;
+    if let Some(h) = heap_at(module_idx) {
+        // SAFETY: per-module heap; configured during instantiation.
+        unsafe { (*h).fault_on_alloc_failure = enabled };
     }
 }
 
 /// Query whether the module's heap raises a fault on exhaustion.
 pub fn fault_on_alloc_failure_enabled(module_idx: usize) -> bool {
-    if module_idx >= crate::kernel::exec::scheduler::module_slots() {
-        return false;
-    }
     // SAFETY: per-module heap; read-only.
-    unsafe { MODULE_HEAPS[module_idx].fault_on_alloc_failure }
+    heap_at(module_idx).is_some_and(|h| unsafe { (*h).fault_on_alloc_failure })
 }
 
 /// Enable the trailing canary on this module's heap. Must be called
@@ -1300,20 +1311,14 @@ pub fn fault_on_alloc_failure_enabled(module_idx: usize) -> bool {
 /// extra bytes at the chunk tail; `free()` validates and logs on
 /// mismatch. Sourced from the manifest's `heap.canary_enabled` flag.
 pub fn set_canary_enabled(module_idx: usize, enabled: bool) {
-    if module_idx >= crate::kernel::exec::scheduler::module_slots() {
-        return;
-    }
-    // SAFETY: per-module heap; configured during instantiation.
-    unsafe {
-        MODULE_HEAPS[module_idx].canary_enabled = enabled;
+    if let Some(h) = heap_at(module_idx) {
+        // SAFETY: per-module heap; configured during instantiation.
+        unsafe { (*h).canary_enabled = enabled };
     }
 }
 
 /// Query whether the trailing canary is enabled for this module's heap.
 pub fn canary_enabled(module_idx: usize) -> bool {
-    if module_idx >= crate::kernel::exec::scheduler::module_slots() {
-        return false;
-    }
     // SAFETY: per-module heap; read-only.
-    unsafe { MODULE_HEAPS[module_idx].canary_enabled }
+    heap_at(module_idx).is_some_and(|h| unsafe { (*h).canary_enabled })
 }

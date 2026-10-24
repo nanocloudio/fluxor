@@ -15,9 +15,12 @@ use super::*;
 // independently, skips an idle owner, and arms the physical sleep as the
 // deadline-merge minimum.
 //
-// The resident-graph index is a bounded table built at admission/finalize time,
-// NOT scanned per pass. The graph→domain→pacer
-// keys are resolved into `RESIDENT_GRAPHS` once; a live pass only reads it.
+// The resident-graph index is a table built at admission/finalize time, NOT
+// scanned per pass. The graph→domain→pacer keys are resolved into
+// `RESIDENT_GRAPHS` once; a live pass only reads it. It is a per-owner table,
+// sized at boot with the owner table to a `(graph, domain)` entry per owner
+// slot and domain (`size_resident_graphs`), so every resident graph the owner
+// table seats is indexed.
 
 /// One resident `(graph, domain)` the runner multiplexes. `mask` is the cached
 /// set of module slots this graph owns *in this domain* (built at finalize so
@@ -66,11 +69,40 @@ impl ResidentGraph {
     };
 }
 
+/// The resident `(graph, domain)` entries, `RESIDENT_GRAPH_COUNT` of them
+/// live, at most one per owner slot and domain.
 #[cfg(feature = "multitenant")]
-static mut RESIDENT_GRAPHS: [ResidentGraph; MAX_GRAPH_PACERS] =
-    [ResidentGraph::EMPTY; MAX_GRAPH_PACERS];
+static mut RESIDENT_GRAPHS: crate::kernel::mem::table::Table<
+    ResidentGraph,
+    { crate::kernel::workload::owner::MAX_OWNERS * MAX_DOMAINS },
+> = crate::boot_table!(
+    crate::kernel::workload::owner::MAX_OWNERS * MAX_DOMAINS,
+    ResidentGraph::EMPTY,
+    crate::abi::contracts::resource::POOL_OWNERS,
+    MAX_DOMAINS
+);
 #[cfg(feature = "multitenant")]
 static mut RESIDENT_GRAPH_COUNT: usize = 0;
+
+/// Size the resident-graph index for an owner table of `owners` slots: an
+/// entry per slot and domain, the most distinct `(graph, domain)` pairs the
+/// modules of those owners can form. Committed as the index fills.
+///
+/// # Safety
+/// As `Table::reserve`: graph preparation, with no entry borrowed.
+#[cfg(feature = "multitenant")]
+pub(crate) unsafe fn size_resident_graphs(
+    owners: usize,
+) -> Result<(), crate::kernel::mem::table::TableError> {
+    let n = owners
+        .checked_mul(MAX_DOMAINS)
+        .ok_or(crate::kernel::mem::table::TableError::Ceiling)?;
+    // SAFETY: the caller's contract; the count is reset with the graph.
+    unsafe {
+        RESIDENT_GRAPH_COUNT = 0;
+        (*core::ptr::addr_of!(RESIDENT_GRAPHS)).reserve(n)
+    }
+}
 
 /// Rebuild the bounded resident-graph index from the live module set. Called at
 /// boot after all admission `apply_add`s and on every reconfigure / `free_owner`
@@ -107,13 +139,14 @@ pub fn rebuild_resident_graph_index() {
             let i = match found {
                 Some(i) => i,
                 None => {
-                    if count >= MAX_GRAPH_PACERS {
-                        // Build-time admission (`MAX_PACER_INSTANCES`) rejects
-                        // configs that need more; this is the fail-closed runtime
-                        // backstop — extra graphs simply aren't multiplexed.
+                    // The index commits entries as it fills. Its ceiling
+                    // is an entry per owner slot and domain, which no set of
+                    // live owners exceeds; fail closed if it ever does.
+                    if count >= table.len() && table.grow(count + 1).is_err() {
                         log::error!(
-                            "[multigraph] resident-graph index full ({MAX_GRAPH_PACERS}); \
-                             module {idx} owner slot={} not indexed",
+                            "[multigraph] resident-graph index full ({}); module {idx} owner \
+                             slot={} not indexed",
+                            table.len(),
                             owner.slot
                         );
                         continue;
@@ -148,11 +181,9 @@ pub fn rebuild_resident_graph_index() {
         }
         // Reconcile the graph-local pacer table (`GRAPH_PACERS`) against the rebuilt
         // resident keys. A pacer whose (slot, generation, domain) no longer
-        // appears belongs to a freed / reconfigured owner; left active it keeps
-        // occupying a slot, so repeated owner churn across domains would exhaust
-        // the bounded 16-slot table despite few LIVE graphs. Bounded (16×16) and
-        // rebuild-time only — never on the hot path. (A reused slot is a new
-        // generation, so a stale-generation pacer is also released here.)
+        // appears belongs to a freed / reconfigured owner and is released, so a
+        // reused slot's new graph starts from a fresh instance. Rebuild-time
+        // only — never on the hot path.
         // SAFETY: same single-mutator (scheduler-thread-exclusive) context.
         let pacers = unsafe { &mut *core::ptr::addr_of_mut!(GRAPH_PACERS) };
         for p in pacers.iter_mut() {
@@ -244,21 +275,30 @@ pub fn admit_resident_workloads_from_config() {
             return;
         }
         let count = u16::from_le_bytes([section[10], section[11]]) as usize;
-        // Bounded scratch: `apply_add_encoded` needs a writable buffer (it writes
-        // the 6-byte handle back) and borrows params in place during instantiate;
-        // copying each blob leaves the read-only config image unmutated.
-        const SCRATCH_LEN: usize = crate::kernel::boot::config::MAX_WORKLOAD_SECTION_BYTES;
-        static mut WORKLOAD_SCRATCH: [u8; SCRATCH_LEN] = [0u8; SCRATCH_LEN];
-        // Atomic admission: a partial admit (some workloads live, others rejected)
-        // would contradict the "all workloads" contract and leave the runtime in a
-        // half-built state. Record each admitted owner's handle; if ANY workload fails,
-        // roll back every handle admitted in this pass via `free_owner` and admit
-        // ZERO — the runtime stays single-graph rather than partially multiplexed.
-        let mut handles = [crate::kernel::workload::owner::OwnerHandle {
-            slot: 0,
-            generation: 0,
-        }; MAX_GRAPH_PACERS];
-        let mut idle_flags = [false; MAX_GRAPH_PACERS];
+        // Each workload's blob is applied where it lies in the config image:
+        // the add borrows the blob's params in place, as the base graph's
+        // modules borrow theirs, and the image stays mapped for the kernel's
+        // life. Nothing is copied, so no blob is too large for a buffer.
+        //
+        // Atomic admission: a partial admit (some workloads live, others
+        // rejected) would contradict the "all workloads" contract and leave the
+        // runtime half-built. Each admitted owner's handle is recorded, one
+        // slot per workload the section declares; if ANY workload fails, every
+        // handle admitted in this pass is rolled back via `free_owner` and ZERO
+        // are admitted — the runtime stays single-graph rather than partially
+        // multiplexed.
+        let mut handles = crate::scratch![
+            crate::kernel::workload::owner::OwnerHandle { slot: 0, generation: 0 };
+            crate::kernel::workload::owner::MAX_OWNERS,
+            count
+        ];
+        if handles.len() < count {
+            log::error!(
+                "[multigraph] no room to record {count} resident workload handle(s) for \
+                 rollback; none admitted (single-graph boot)"
+            );
+            return;
+        }
         let mut admitted = 0usize;
         let mut failed = false;
         let mut off = 12usize;
@@ -280,38 +320,37 @@ pub fn admit_resident_workloads_from_config() {
             let workload_flags = section[off];
             off += 1;
             let workload_idle_safe = (workload_flags & 0x01) != 0;
-            if blob_len == 0 || off + blob_len > len || blob_len > SCRATCH_LEN {
+            if blob_len == 0 || off + blob_len > len {
                 log::error!("[multigraph] workload blob len {blob_len} out of range; rolling back");
                 failed = true;
                 break;
             }
-            // SAFETY: scheduler-thread-exclusive boot context; bounded copy.
-            let scratch = unsafe { &mut *core::ptr::addr_of_mut!(WORKLOAD_SCRATCH) };
-            scratch[..blob_len].copy_from_slice(&section[off..off + blob_len]);
+            let blob = &section[off..off + blob_len];
             off += blob_len;
-            // SAFETY: `scratch` is writable and >= `blob_len`; `apply_add_encoded`
-            // validates the FLXA blob structure/bounds and writes the 6-byte handle
-            // (slot u16 LE, generation u32 LE) back into `scratch[0..6]` on success.
-            let rc = unsafe { live::apply_add_encoded(scratch.as_mut_ptr(), blob_len) };
-            if rc >= 0 {
-                if admitted < MAX_GRAPH_PACERS {
-                    handles[admitted] = crate::kernel::workload::owner::OwnerHandle {
-                        slot: u16::from_le_bytes([scratch[0], scratch[1]]),
-                        generation: u32::from_le_bytes([
-                            scratch[2], scratch[3], scratch[4], scratch[5],
-                        ]),
-                    };
-                    idle_flags[admitted] = workload_idle_safe;
+            // SAFETY: `blob` lies in the config image, which stays mapped and
+            // unchanged for the kernel's life; `apply_add_borrowed` validates
+            // the FLXA blob structure and bounds.
+            match unsafe { live::apply_add_borrowed(blob) } {
+                Ok(handle) => {
+                    handles[admitted] = handle;
+                    admitted += 1;
+                    // The workload's idle-safe attestation goes on its
+                    // modules before finalize, which rebuilds each graph's
+                    // `idle_safe` from them. Unattested workloads stay
+                    // fail-closed (backstop cadence).
+                    set_owner_idle_safe(handle, workload_idle_safe);
                 }
-                admitted += 1;
-            } else {
-                log::error!("[multigraph] resident workload admit failed rc={rc}; rolling back");
-                failed = true;
-                break;
+                Err(rc) => {
+                    log::error!(
+                        "[multigraph] resident workload admit failed rc={rc}; rolling back"
+                    );
+                    failed = true;
+                    break;
+                }
             }
         }
         if failed {
-            for h in handles.iter().take(admitted.min(MAX_GRAPH_PACERS)) {
+            for h in handles.iter().take(admitted) {
                 let _ = live::free_owner(*h);
             }
             log::error!(
@@ -321,12 +360,6 @@ pub fn admit_resident_workloads_from_config() {
             return;
         }
         if admitted > 0 {
-            // Apply each workload's idle-safe attestation to its admitted modules
-            // BEFORE finalize (which rebuilds the per-graph `idle_safe` from the
-            // module flags). Unattested workloads stay fail-closed (backstop cadence).
-            for i in 0..admitted.min(MAX_GRAPH_PACERS) {
-                set_owner_idle_safe(handles[i], idle_flags[i]);
-            }
             log::info!("[multigraph] admitted {admitted} resident workload(s) from config");
             finalize_resident_graphs();
         }
@@ -969,7 +1002,7 @@ fn graph_pacer_instance_runnable(graph_slot: u16, generation: u32, domain: u8) -
     };
     let gp = &raw const GRAPH_PACERS;
     // SAFETY: scheduler-thread-exclusive read; idx in bounds.
-    let p = unsafe { &(*gp)[idx] };
+    let p = unsafe { &(&*gp)[idx] };
     graph_pacer_runnable(p)
 }
 

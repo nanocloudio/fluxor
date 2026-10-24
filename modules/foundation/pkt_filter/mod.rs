@@ -1,51 +1,64 @@
-//! Stateless Packet Filter PIC Module
+//! Packet filter PIC module: the bare-metal enforcer of one `net.policy`
+//! table in the frame path, or a static port filter.
 //!
-//! Reads parsed packet metadata (from eth_parser), evaluates match rules
-//! from config params, and forwards or drops packets.
+//! Sits between the NIC driver and `ip`, on the receive path and, when the
+//! egress pair is wired, the transmit path:
 //!
-//! # Channels
+//!   nic.frames_rx → pkt_filter.frames_rx → [frames_tx] → ip.frames_rx
+//!   ip.frames_tx  → pkt_filter.egress_rx → [egress_tx] → nic.frames_tx
 //!
-//! - `in[0]`: Parsed packets (20-byte metadata + payload from eth_parser)
-//! - `out[0]`: Accepted packets (same format, passed through)
+//! Frames are length-prefixed `[len:u16 LE][frame…]` on every port, the
+//! convention between `ip` and the NIC drivers. A frame that is not IPv4
+//! passes unjudged, as the tables are IPv4 only; a VLAN-tagged frame is
+//! dropped in policy mode, since what it carries cannot be judged.
 //!
-//! # Config Params
+//! # net.policy mode (`table`)
 //!
-//! Rules are configured via params:
-//! - tag 1: rule_count (u8, max 8)
-//! - tags 10-17: rule_N (8 bytes each):
-//!   ```text
-//!   [0]     action: 0=drop, 1=accept
-//!   [1]     proto_match: 0=any, 6=TCP, 17=UDP, 1=ICMP
-//!   [2..3]  dst_port_lo (u16 LE, 0=any)
-//!   [4..5]  dst_port_hi (u16 LE, 0=same as lo)
-//!   [6..7]  reserved
-//!   ```
+//! The module enforces the named table. Every [`POLL_MS`] it polls the
+//! store-wide generation (a zero-length READ) and, when it moved, re-reads
+//! the table whole into a spare buffer, swapping it in only then, so a read
+//! the store moved under never tears what is in force. It ATTACHes naming
+//! the table — the binding that makes it the table's one enforcer — and
+//! declares [`POLICY_BUF`] as the most of it this module holds, so the store
+//! refuses a larger REPLACE (`E2BIG`); it re-issues ATTACH with the
+//! generation it applied in full, so the table's READ state reports
+//! ENFORCED only while what is in force here is what the store holds.
 //!
-//! Default policy: accept all (no rules = pass-through).
+//! **Fail closed.** A table larger than [`POLICY_BUF`] (stored before this
+//! module bound) is enforced closed: every new flow is dropped (counted
+//! `closed_dropped`) until a read of it fits, and nothing is reported
+//! applied. The copy held before is never left in force in its place.
 //!
-//! # net.policy mode
+//! **Stateful.** Verdicts are flows', by the contract's flow model
+//! (`net::policy::flow`, `flows.rs`): a packet that matches a recorded flow
+//! (either direction) passes on it; any other is new and is judged by the
+//! shared evaluator (`net::policy::evaluate`, the same rules as the Linux
+//! rendering) — an ACK without SYN that matches no flow is judged like any
+//! first packet, so a default-deny table drops it. A passed first packet
+//! records its flow (a TCP segment only when it may open one); a table full
+//! of live flows refuses the new one: its packet is dropped and counted
+//! (`flows_refused`). Rejected traffic is dropped: this module originates
+//! nothing. An ICMP error whose embedded packet belongs to a recorded flow,
+//! sent back to that packet's source, passes as related.
 //!
-//! With `table` (tag 3, a name) the module enforces that net.policy table
-//! instead of the static rules — the bare-metal realization of the contract.
-//! Every [`POLICY_POLL_STEPS`] steps it polls the store-wide generation (a
-//! zero-length READ) and, when it moved, re-reads the table. It ATTACHes
-//! naming the table, which binds it as the table's one enforcer, and
-//! re-issues ATTACH with the generation it applied in full — so the table's
-//! READ state reports ENFORCED only while what this module holds is what the
-//! store holds. A read lands whole in a spare buffer and is swapped in only
-//! then, so a read the store moved under never tears what is in force. A
-//! table past [`POLICY_BUF`] bytes is reported as not applied, and the
-//! previous copy stays in force.
-//! Evaluation, per packet, is the shared one (`net::policy::evaluate`, the
-//! same rules as the Linux rendering): ALLOW/DROP in order, first match;
-//! then ISOLATE; then services with no backends. A table that isolates
-//! anything first passes a TCP segment carrying ACK without SYN — part of a
-//! flow already admitted — as the rendering passes `ct state established`:
-//! the stateless approximation of a stateful filter. UDP replies to an
-//! isolated workload's own requests are NOT distinguished and are judged
-//! as new.
+//! The model needs both directions: with only the receive path wired, the
+//! reply to a flow the node opened is new here, and is judged.
+//!
+//! **Fragments.** A datagram's first fragment carries its ports and is
+//! judged as above; a later fragment passes only when the first fragment of
+//! the same datagram (`src`, `dst`, protocol, identification) passed within
+//! [`FRAG_MS`], and is otherwise dropped (counted `frag_dropped`). The most
+//! recent [`FRAG_SLOTS`] fragmented datagrams are remembered.
+//!
+//! # Static mode (no `table`)
+//!
+//! A stateless port filter: each frame is judged on its own against up to
+//! [`MAX_RULES`] rules (`rule_count`, `rule_0` … `rule_7`, each six bytes
+//! `[action][proto][port_lo:u16 LE][port_hi:u16 LE]`, action 0 drop / 1
+//! accept, proto 0 any, port 0 any, `port_hi` 0 the same as `port_lo`),
+//! first match wins, else `default_action`.
 
-#![no_std]
+#![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
     dead_code,
     reason = "the PIC build mounts the whole of modules/sdk/* via include!, so every \
@@ -72,30 +85,58 @@ mod abi;
 use abi::SyscallTable;
 
 include!("../../sdk/runtime.rs");
+include!("../../sdk/runtime/params.rs");
+
+/// The shared hash index the flow table goes through.
+mod index {
+    include!("../../sdk/runtime/hash_index.rs");
+}
+
+mod flows;
+mod params_def;
+
+use abi::contracts::net::policy as np;
+use np::flow as fm;
 
 // ============================================================================
 // Constants
 // ============================================================================
 
-const MAX_FRAME: usize = 1514;
-const META_SIZE: usize = 20;
-const MAX_RULES: usize = 8;
-/// Steps between generation polls: a table change takes effect within this.
-const POLICY_POLL_STEPS: u32 = 1024;
-const POLICY_BUF: usize = 4096;
-const NP_READ: u32 = 0x1E04;
-const NP_ATTACH: u32 = 0x1E05;
-/// READ's state record: `[generation:u64][applied:u64][flags:u32][rsv:u32]`.
-const NP_STATE: usize = 24;
+/// Largest frame carried (an Ethernet frame with a VLAN tag, rounded).
+const MAX_FRAME: usize = 1600;
+pub const MAX_RULES: usize = 8;
+/// How often the store-wide generation is polled: a table change takes
+/// effect within this.
+pub const POLL_MS: u32 = 100;
+/// Rule bytes of the table this module holds: declared to the store at
+/// ATTACH, so a larger REPLACE is refused.
+pub const POLICY_BUF: usize = 4096;
+/// Fragmented datagrams remembered at once, and how long a first fragment
+/// admits the rest (the host's reassembly timeout).
+pub const FRAG_SLOTS: usize = 8;
+pub const FRAG_MS: u32 = 30_000;
+/// The heap the flow table is sized into when the graph names none: room to
+/// declare up to the most `max_flows` allows on aarch64, where the heap
+/// commits only what is touched; the default table on MCU-class targets,
+/// where it is committed whole.
+#[cfg(target_arch = "aarch64")]
+const HEAP_DEFAULT_BYTES: u32 = 4 * 1024 * 1024;
+#[cfg(not(target_arch = "aarch64"))]
+const HEAP_DEFAULT_BYTES: u32 = 4 * 1024;
+
 const ERANGE: i32 = -34;
 const ENOENT: i32 = -2;
-use abi::contracts::net::policy as np;
 
 const ACTION_DROP: u8 = 0;
 const ACTION_ACCEPT: u8 = 1;
 
+const ETH_HLEN: usize = 14;
+const ETHERTYPE_IPV4: u16 = 0x0800;
+const ETHERTYPE_VLAN: u16 = 0x8100;
+const ETHERTYPE_QINQ: u16 = 0x88A8;
+
 // ============================================================================
-// Rule
+// State
 // ============================================================================
 
 #[repr(C)]
@@ -120,46 +161,106 @@ impl FilterRule {
     }
 }
 
-// ============================================================================
-// State
-// ============================================================================
+/// A fragmented datagram whose first fragment passed.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Frag {
+    live: u8,
+    proto: u8,
+    id: u16,
+    src: u32,
+    dst: u32,
+    last_ms: u32,
+}
+
+impl Frag {
+    const EMPTY: Frag = Frag {
+        live: 0,
+        proto: 0,
+        id: 0,
+        src: 0,
+        dst: 0,
+        last_ms: 0,
+    };
+}
 
 #[repr(C)]
-struct FilterState {
+pub struct FilterState {
     syscalls: *const SyscallTable,
-    in_chan: i32,
-    out_chan: i32,
-    _ctrl_chan: i32,
+    /// The receive path (in[0] → out[0]) and the transmit path (in[1] →
+    /// out[1], -1 when not wired).
+    rx_in: i32,
+    rx_out: i32,
+    tx_in: i32,
+    tx_out: i32,
+
+    // ---- static mode ----
     rule_count: u8,
     default_action: u8,
-    _pad: [u8; 2],
+    /// `max_flows` (param): the flow table's records.
+    max_flows: u16,
     rules: [FilterRule; MAX_RULES],
+
+    // ---- counters ----
     accepted: u32,
     dropped: u32,
+    /// New flows refused: the table held no free record.
+    flows_refused: u32,
+    flows_expired: u32,
+    /// Later fragments of a datagram whose first fragment did not pass.
+    frag_dropped: u32,
+    /// IPv4 frames whose headers do not hold together.
+    malformed: u32,
+    /// New flows dropped while the table is enforced closed.
+    closed_dropped: u32,
+    /// Frames dropped because the next stage had no room.
+    dropped_full: u32,
+    flows_live: u32,
+
     // ---- net.policy mode ----
-    table: [u8; 32],
+    table: [u8; np::MAX_TABLE_NAME],
     table_len: u8,
     attached: u8,
-    poll: u32,
+    /// Which buffer is in force; a read lands in the other.
+    live: u8,
+    /// The store holds more of the table than [`POLICY_BUF`]: enforced
+    /// closed.
+    closed: bool,
+    len: u16,
+    _pad: u16,
+    polled_ms: u32,
+    /// The table generation held (0: none).
     generation: u64,
     /// The store-wide generation last seen; the table is re-read only when
     /// it moves.
     store_gen: u64,
     /// The generation last reported to ATTACH as applied.
     reported: u64,
-    /// The table as held: two buffers, `live` the one in force, `len` its
-    /// bytes. A read goes to the other.
-    live: u8,
-    isolating: bool,
-    len: u16,
+
+    // ---- the flow table (`flows.rs`) ----
+    seed: u32,
+    flow_index_len: u32,
+    flow_free_top: u32,
+    flow_sweep: u32,
+    flows: *mut flows::Flow,
+    flow_free: *mut u16,
+    flow_index: *mut u32,
+    frags: [Frag; FRAG_SLOTS],
+
+    /// Frame staging (length prefix + frame), in state so `module_step`'s
+    /// frame stays small.
+    frame_buf: [u8; 2 + MAX_FRAME],
     bufs: [[u8; POLICY_BUF]; 2],
 }
 
+const STATE_SIZE: usize = core::mem::size_of::<FilterState>();
+
 /// The table in force.
 fn held(s: &FilterState) -> &[u8] {
-    s.bufs[(s.live & 1) as usize]
-        .get(..s.len as usize)
-        .unwrap_or(&[])
+    match s.bufs.get((s.live & 1) as usize) {
+        Some(b) => b.get(..s.len as usize).unwrap_or(&[]),
+        None => &[],
+    }
 }
 
 /// Write `v` little-endian at `arg[at..]`, panic-free.
@@ -184,239 +285,506 @@ fn get_u64(b: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(v)
 }
 
-/// READ `name_len` bytes of `s.table` (0: the store) into `out`; the state
-/// record lands in `state`.
+// ============================================================================
+// net.policy: reading and attaching
+// ============================================================================
+
+/// READ `name_len` bytes of `s.table` (0: the store) into `out` (`cap`
+/// bytes); the state record lands in `state`.
 unsafe fn np_read(
     s: &FilterState,
-    sys: &SyscallTable,
     name_len: usize,
-    out: &mut [u8],
-    state: &mut [u8; NP_STATE],
+    out: *mut u8,
+    cap: usize,
+    state: &mut [u8; np::state::BYTES],
 ) -> i32 {
-    let mut arg = [0u8; 1 + 32 + 8 + 4 + 8];
+    let mut arg = [0u8; 1 + np::MAX_TABLE_NAME + 8 + 4 + 8];
     arg[0] = name_len as u8;
     let mut i = 0;
-    while i < name_len && i < 32 {
-        arg[1 + i] = s.table[i];
+    while i < name_len && i < np::MAX_TABLE_NAME {
+        if let (Some(d), Some(c)) = (arg.get_mut(1 + i), s.table.get(i)) {
+            *d = *c;
+        }
         i += 1;
     }
     let p = 1 + name_len;
-    put_le(&mut arg, p, out.as_mut_ptr() as u64, 8);
-    put_le(&mut arg, p + 8, out.len() as u64, 4);
+    put_le(&mut arg, p, out as u64, 8);
+    put_le(&mut arg, p + 8, cap as u64, 4);
     put_le(&mut arg, p + 12, state.as_mut_ptr() as u64, 8);
-    (sys.provider_call)(-1, NP_READ, arg.as_mut_ptr(), p + 20)
+    ((*s.syscalls).provider_call)(-1, np::READ, arg.as_mut_ptr(), p + 20)
 }
 
-/// ATTACH naming the table, reporting `applied`.
-unsafe fn np_attach(s: &FilterState, sys: &SyscallTable, applied: u64) -> i32 {
-    let mut arg = [0u8; 1 + 32 + 8];
-    let nl = s.table_len as usize;
-    arg[0] = nl as u8;
+/// ATTACH naming the table, reporting `applied` and declaring
+/// [`POLICY_BUF`] as the most of it held.
+unsafe fn np_attach(s: &FilterState, applied: u64) -> i32 {
+    let mut arg = [0u8; 1 + np::MAX_TABLE_NAME + np::ATTACH_TAIL + np::ATTACH_CAPACITY_TAIL];
+    let nl = (s.table_len as usize).min(np::MAX_TABLE_NAME);
+    arg[0] = nl as u8 | np::ATTACH_CAPACITY;
     let mut i = 0;
-    while i < nl && i < 32 {
-        arg[1 + i] = s.table[i];
+    while i < nl {
+        if let (Some(d), Some(c)) = (arg.get_mut(1 + i), s.table.get(i)) {
+            *d = *c;
+        }
         i += 1;
     }
     put_le(&mut arg, 1 + nl, applied, 8);
-    (sys.provider_call)(-1, NP_ATTACH, arg.as_mut_ptr(), 1 + nl + 8)
+    put_le(&mut arg, 1 + nl + np::ATTACH_TAIL, POLICY_BUF as u64, 4);
+    let len = 1 + nl + np::ATTACH_TAIL + np::ATTACH_CAPACITY_TAIL;
+    ((*s.syscalls).provider_call)(-1, np::ATTACH, arg.as_mut_ptr(), len)
 }
 
 /// Poll the store-wide generation; re-read the table when it moved, and
 /// report what was applied.
-unsafe fn refresh_policy(s: &mut FilterState, sys: &SyscallTable) {
-    let mut state = [0u8; NP_STATE];
-    let mut none = [0u8; 0];
-    if np_read(s, sys, 0, &mut none, &mut state) == 0 {
-        let g = get_u64(&state, 0);
+unsafe fn refresh_policy(s: &mut FilterState) {
+    let mut state = [0u8; np::state::BYTES];
+    if np_read(s, 0, core::ptr::null_mut(), 0, &mut state) == 0 {
+        let g = get_u64(&state, np::state::GENERATION);
         if g == s.store_gen && s.attached != 0 {
             return;
         }
         s.store_gen = g;
     }
     let spare = ((s.live ^ 1) & 1) as usize;
-    let mut buf = s.bufs[spare];
-    let n = np_read(s, sys, s.table_len as usize, &mut buf, &mut state);
-    let gen = get_u64(&state, 0);
+    let out = match s.bufs.get_mut(spare) {
+        Some(b) => b.as_mut_ptr(),
+        None => return,
+    };
+    let n = np_read(s, s.table_len as usize, out, POLICY_BUF, &mut state);
+    let gen = get_u64(&state, np::state::GENERATION);
     let applied = if n >= 0 {
-        if gen != s.generation {
+        if gen != s.generation || s.closed {
             // The whole table landed in the spare buffer: swap it in.
-            s.bufs[spare] = buf;
             s.live = spare as u8;
             s.len = n as u16;
-            s.isolating = isolates_any(held(s));
             s.generation = gen;
+            s.closed = false;
             gen
         } else {
             s.reported
         }
     } else if n == ENOENT {
-        // No such table: nothing to enforce, so nothing is isolated — the
-        // default is to pass.
+        // No such table: nothing to enforce, so nothing is filtered.
         s.len = 0;
-        s.isolating = false;
+        s.closed = false;
         s.generation = 0;
         0
     } else if n == ERANGE {
-        // Too big to hold: the previous copy stays, and is not this
-        // generation.
+        // Too big to hold: enforced closed, never by the copy held before
+        // (a policy the store no longer has). Nothing is applied.
+        s.len = 0;
+        s.closed = true;
+        s.generation = gen;
         0
     } else {
-        // A busy store (EAGAIN) or no provider: keep what is held, and read
-        // the table again at the next poll whatever the store-wide
-        // generation says (it has already moved past this one).
+        // A busy store (EAGAIN) or no provider: keep what is held — it is
+        // not this generation, so it is not reported applied — and read the
+        // table again at the next poll whatever the store-wide generation
+        // says.
         s.store_gen = u64::MAX;
         s.reported
     };
     if s.attached == 0 || applied != s.reported {
-        // EBUSY (another enforcer holds the table) leaves us unbound: our
-        // filtering still runs, but vouches for nothing.
-        if np_attach(s, sys, applied) == 0 {
+        // EBUSY (another enforcer holds the table) leaves this module
+        // unbound: its filtering still runs, but vouches for nothing.
+        if np_attach(s, applied) == 0 {
             s.attached = 1;
             s.reported = applied;
         }
     }
 }
 
-/// Is this TCP segment part of an established flow (ACK set, SYN clear)? The
-/// payload after the metadata is the frame from L3 onward.
-fn tcp_established(buf: &[u8], n: usize) -> bool {
-    let l3 = META_SIZE;
-    let b = |i: usize| buf.get(i).copied().unwrap_or(0);
-    if n < l3 + 20 || b(10) != 6 {
-        return false;
-    }
-    let ihl = ((b(l3) & 0x0F) as usize) * 4;
-    let flags_at = l3 + ihl + 13;
-    if flags_at >= n {
-        return false;
-    }
-    let f = b(flags_at);
-    (f & 0x10) != 0 && (f & 0x02) == 0
+// ============================================================================
+// Judging a frame
+// ============================================================================
+
+#[inline(always)]
+fn b8(f: &[u8], i: usize) -> u8 {
+    f.get(i).copied().unwrap_or(0)
+}
+#[inline(always)]
+fn b16(f: &[u8], i: usize) -> u16 {
+    u16::from_be_bytes([b8(f, i), b8(f, i + 1)])
+}
+#[inline(always)]
+fn b32(f: &[u8], i: usize) -> u32 {
+    u32::from_be_bytes([b8(f, i), b8(f, i + 1), b8(f, i + 2), b8(f, i + 3)])
 }
 
-/// Whether the table isolates anything (its rendering then passes
-/// established flows first).
-fn isolates_any(rules: &[u8]) -> bool {
-    let mut at = 0;
-    while let Some((kind, _, next)) = np::next_rule(rules, at) {
-        if kind == np::rule::ISOLATE {
-            return true;
+/// An IPv4 packet's header fields, from the frame.
+#[derive(Clone, Copy)]
+struct Ip4 {
+    proto: u8,
+    src: u32,
+    dst: u32,
+    id: u16,
+    more_frags: bool,
+    frag_off: u16,
+    /// Where the L4 header starts in the frame, and its bytes.
+    l4: usize,
+    l4_len: usize,
+}
+
+/// The IPv4 header at `at`, when it holds together within `f`.
+fn ip4_at(f: &[u8], at: usize) -> Option<Ip4> {
+    let v = b8(f, at);
+    let ihl = ((v & 0x0F) as usize) * 4;
+    if v >> 4 != 4 || ihl < 20 || at + ihl > f.len() {
+        return None;
+    }
+    let total = b16(f, at + 2) as usize;
+    if total < ihl || at + total > f.len() {
+        return None;
+    }
+    let fw = b16(f, at + 6);
+    Some(Ip4 {
+        proto: b8(f, at + 9),
+        src: b32(f, at + 12),
+        dst: b32(f, at + 16),
+        id: b16(f, at + 4),
+        more_frags: fw & 0x2000 != 0,
+        frag_off: fw & 0x1FFF,
+        l4: at + ihl,
+        l4_len: total - ihl,
+    })
+}
+
+/// What one IPv4 packet is, for the flow table and the evaluator.
+struct Seen {
+    /// Its flow key, or None for a packet that opens no flow and matches
+    /// none (an ICMP message that is neither a query nor its answer).
+    tuple: Option<flows::Tuple>,
+    /// What the evaluator judges.
+    packet: np::Packet,
+    /// TCP flags (0 otherwise).
+    tcp_flags: u8,
+    /// An ICMP query (it opens a flow; its answer does not).
+    icmp_request: bool,
+    /// An ICMP error's embedded packet, as the flow it would belong to.
+    related: Option<flows::Tuple>,
+}
+
+/// Classify the IPv4 packet `ip` of frame `f`; None when its L4 header is
+/// cut short.
+fn classify(f: &[u8], ip: &Ip4) -> Option<Seen> {
+    let mut seen = Seen {
+        tuple: None,
+        packet: np::Packet {
+            src: ip.src,
+            dst: ip.dst,
+            proto: ip.proto,
+            dport: 0,
+        },
+        tcp_flags: 0,
+        icmp_request: false,
+        related: None,
+    };
+    let key = |sport: u16, dport: u16| flows::Tuple {
+        proto: ip.proto,
+        src: ip.src,
+        dst: ip.dst,
+        sport,
+        dport,
+    };
+    match ip.proto {
+        np::rule::PROTO_TCP => {
+            if ip.l4_len < 20 {
+                return None;
+            }
+            let (sp, dp) = (b16(f, ip.l4), b16(f, ip.l4 + 2));
+            seen.packet.dport = dp;
+            seen.tcp_flags = b8(f, ip.l4 + 13);
+            seen.tuple = Some(key(sp, dp));
         }
-        at = next;
+        np::rule::PROTO_UDP => {
+            if ip.l4_len < 8 {
+                return None;
+            }
+            let (sp, dp) = (b16(f, ip.l4), b16(f, ip.l4 + 2));
+            seen.packet.dport = dp;
+            seen.tuple = Some(key(sp, dp));
+        }
+        np::rule::PROTO_ICMP => {
+            if ip.l4_len < 8 {
+                return None;
+            }
+            let t = b8(f, ip.l4);
+            let id = b16(f, ip.l4 + 4);
+            if fm::icmp_request(t) {
+                seen.tuple = Some(key(id, 0));
+                seen.icmp_request = true;
+            } else if fm::icmp_reply(t) {
+                seen.tuple = Some(key(0, id));
+            } else if fm::icmp_error(t) {
+                seen.related = embedded(f, ip);
+            }
+        }
+        _ => seen.tuple = Some(key(0, 0)),
+    }
+    Some(seen)
+}
+
+/// The flow an ICMP error's embedded packet would belong to: it travelled
+/// from `inner.src` to `inner.dst`, and the error goes back to its source.
+fn embedded(f: &[u8], ip: &Ip4) -> Option<flows::Tuple> {
+    let inner = ip4_at_loose(f, ip.l4 + 8)?;
+    if inner.src != ip.dst {
+        return None;
+    }
+    let l4 = inner.l4;
+    let (sport, dport) = match inner.proto {
+        np::rule::PROTO_TCP | np::rule::PROTO_UDP => (b16(f, l4), b16(f, l4 + 2)),
+        np::rule::PROTO_ICMP => {
+            let t = b8(f, l4);
+            let id = b16(f, l4 + 4);
+            if fm::icmp_request(t) {
+                (id, 0)
+            } else if fm::icmp_reply(t) {
+                (0, id)
+            } else {
+                return None;
+            }
+        }
+        _ => (0, 0),
+    };
+    if l4 + 8 > f.len() {
+        return None;
+    }
+    Some(flows::Tuple {
+        proto: inner.proto,
+        src: inner.src,
+        dst: inner.dst,
+        sport,
+        dport,
+    })
+}
+
+/// An embedded IPv4 header: its own length must fit, but its total length
+/// is the original packet's, which the error carries only the start of.
+fn ip4_at_loose(f: &[u8], at: usize) -> Option<Ip4> {
+    let v = b8(f, at);
+    let ihl = ((v & 0x0F) as usize) * 4;
+    if v >> 4 != 4 || ihl < 20 || at + ihl > f.len() {
+        return None;
+    }
+    Some(Ip4 {
+        proto: b8(f, at + 9),
+        src: b32(f, at + 12),
+        dst: b32(f, at + 16),
+        id: b16(f, at + 4),
+        more_frags: false,
+        frag_off: 0,
+        l4: at + ihl,
+        l4_len: f.len() - (at + ihl),
+    })
+}
+
+/// Whether the first fragment of `ip`'s datagram passed (refreshing it).
+fn frag_admitted(s: &mut FilterState, ip: &Ip4, now: u32) -> bool {
+    let mut i = 0;
+    while i < FRAG_SLOTS {
+        if let Some(r) = s.frags.get_mut(i) {
+            if r.live != 0
+                && r.proto == ip.proto
+                && r.id == ip.id
+                && r.src == ip.src
+                && r.dst == ip.dst
+                && now.wrapping_sub(r.last_ms) < FRAG_MS
+            {
+                r.last_ms = now;
+                return true;
+            }
+        }
+        i += 1;
     }
     false
 }
 
-/// The table's verdict on the packet in `buf` (metadata, then L3 onward).
-unsafe fn evaluate_policy(s: &FilterState, buf: &[u8], n: usize) -> bool {
-    if s.isolating && tcp_established(buf, n) {
-        return true;
-    }
-    let b = |i: usize| buf.get(i).copied().unwrap_or(0);
-    let p = np::Packet {
-        src: u32::from_be_bytes([b(2), b(3), b(4), b(5)]),
-        dst: u32::from_be_bytes([b(6), b(7), b(8), b(9)]),
-        proto: b(10),
-        dport: u16::from_be_bytes([b(13), b(14)]),
-    };
-    np::evaluate(held(s), &p) == np::Verdict::Accept
-}
-
-// ============================================================================
-// Param parsing
-// ============================================================================
-
-unsafe fn parse_params(s: &mut FilterState, params: *const u8, params_len: usize) {
-    if params.is_null() || params_len == 0 {
-        return;
-    }
-
-    let mut off = 0usize;
-    while off + 2 <= params_len {
-        let tag = *params.add(off);
-        let len = *params.add(off + 1) as usize;
-        off += 2;
-        if off + len > params_len {
-            break;
-        }
-        let val = params.add(off);
-
-        match tag {
-            1 => {
-                // rule_count
-                if len >= 1 {
-                    s.rule_count = (*val).min(MAX_RULES as u8);
-                }
+/// Remember that `ip`'s first fragment passed: in a free or expired slot,
+/// else in the one least recently used.
+fn frag_note(s: &mut FilterState, ip: &Ip4, now: u32) {
+    let mut pick = 0usize;
+    let mut oldest = 0u32;
+    let mut i = 0;
+    while i < FRAG_SLOTS {
+        if let Some(r) = s.frags.get(i) {
+            let age = now.wrapping_sub(r.last_ms);
+            if r.live == 0 || age >= FRAG_MS {
+                pick = i;
+                break;
             }
-            2 => {
-                // default_action
-                if len >= 1 {
-                    s.default_action = *val;
-                }
+            if age >= oldest {
+                oldest = age;
+                pick = i;
             }
-            3 => {
-                // table — net.policy mode
-                let n = len.min(32);
-                let mut i = 0;
-                while i < n {
-                    s.table[i] = *val.add(i);
-                    i += 1;
-                }
-                s.table_len = n as u8;
-            }
-            10..=17 => {
-                // rule N
-                let idx = (tag - 10) as usize;
-                if idx < MAX_RULES && len >= 6 {
-                    let rp = s.rules.as_mut_ptr().add(idx);
-                    (*rp).action = *val;
-                    (*rp).proto_match = *val.add(1);
-                    (*rp).dst_port_lo = u16::from_le_bytes([*val.add(2), *val.add(3)]);
-                    (*rp).dst_port_hi = u16::from_le_bytes([*val.add(4), *val.add(5)]);
-                    (*rp)._reserved = 0;
-                    if (*rp).dst_port_hi == 0 {
-                        (*rp).dst_port_hi = (*rp).dst_port_lo;
-                    }
-                }
-            }
-            _ => {}
-        }
-        off += len;
-    }
-}
-
-// ============================================================================
-// Filter logic
-// ============================================================================
-
-unsafe fn evaluate(s: &FilterState, meta: &[u8; META_SIZE]) -> bool {
-    if s.rule_count == 0 {
-        return s.default_action != ACTION_DROP;
-    }
-
-    let mp = meta.as_ptr();
-    let ip_proto = *mp.add(10);
-    let dst_port = ((*mp.add(13) as u16) << 8) | *mp.add(14) as u16; // big-endian in meta
-
-    let mut i = 0usize;
-    while i < s.rule_count as usize {
-        let rule = &*s.rules.as_ptr().add(i);
-
-        // Protocol match
-        let proto_ok = rule.proto_match == 0 || rule.proto_match == ip_proto;
-
-        // Port match
-        let port_ok =
-            rule.dst_port_lo == 0 || (dst_port >= rule.dst_port_lo && dst_port <= rule.dst_port_hi);
-
-        if proto_ok && port_ok {
-            return rule.action == ACTION_ACCEPT;
         }
         i += 1;
     }
+    if let Some(r) = s.frags.get_mut(pick) {
+        *r = Frag {
+            live: 1,
+            proto: ip.proto,
+            id: ip.id,
+            src: ip.src,
+            dst: ip.dst,
+            last_ms: now,
+        };
+    }
+}
 
-    // No rule matched: use default
+/// The policy verdict on the frame in `f`: pass or drop. Moves the flow
+/// table.
+unsafe fn judge_policy(s: &mut FilterState, f: &[u8], now: u32) -> bool {
+    if f.len() < ETH_HLEN {
+        s.malformed = s.malformed.wrapping_add(1);
+        return false;
+    }
+    match b16(f, 12) {
+        ETHERTYPE_IPV4 => {}
+        ETHERTYPE_VLAN | ETHERTYPE_QINQ => return false,
+        _ => return true,
+    }
+    let Some(ip) = ip4_at(f, ETH_HLEN) else {
+        s.malformed = s.malformed.wrapping_add(1);
+        return false;
+    };
+    if ip.frag_off != 0 {
+        // A later fragment: no ports to judge it by.
+        if frag_admitted(s, &ip, now) {
+            return true;
+        }
+        s.frag_dropped = s.frag_dropped.wrapping_add(1);
+        return false;
+    }
+    let Some(seen) = classify(f, &ip) else {
+        s.malformed = s.malformed.wrapping_add(1);
+        return false;
+    };
+    // Part of a recorded flow: passes on it.
+    if let Some(t) = &seen.tuple {
+        if let Some((i, reply)) = flows::find(s, t, now) {
+            if flows::note(s, i, reply, seen.tcp_flags, now) {
+                return true;
+            }
+        }
+    }
+    if let Some(t) = &seen.related {
+        if flows::find(s, t, now).is_some() {
+            return true;
+        }
+    }
+    // New: judged.
+    if s.closed {
+        s.closed_dropped = s.closed_dropped.wrapping_add(1);
+        return false;
+    }
+    if np::evaluate(held(s), &seen.packet) != np::Verdict::Accept {
+        return false;
+    }
+    if let Some(t) = &seen.tuple {
+        let opens = if t.proto == np::rule::PROTO_TCP {
+            fm::tcp_opens(seen.tcp_flags)
+        } else if t.proto == np::rule::PROTO_ICMP {
+            // Only a query opens a flow; an answer with none was judged.
+            if seen.icmp_request {
+                Some(0)
+            } else {
+                None
+            }
+        } else {
+            Some(0)
+        };
+        if let Some(state) = opens {
+            if !flows::make(s, t, state, now) {
+                return false;
+            }
+        }
+    }
+    if ip.more_frags {
+        frag_note(s, &ip, now);
+    }
+    true
+}
+
+/// The static rules' verdict on the frame in `f`.
+fn judge_static(s: &FilterState, f: &[u8]) -> bool {
+    if s.rule_count == 0 {
+        return s.default_action != ACTION_DROP;
+    }
+    let (proto, dport) = match (b16(f, 12) == ETHERTYPE_IPV4)
+        .then(|| ip4_at(f, ETH_HLEN))
+        .flatten()
+    {
+        Some(ip)
+            if ip.frag_off == 0
+                && (ip.proto == np::rule::PROTO_TCP || ip.proto == np::rule::PROTO_UDP)
+                && ip.l4_len >= 4 =>
+        {
+            (ip.proto, b16(f, ip.l4 + 2))
+        }
+        Some(ip) => (ip.proto, 0),
+        None => (0, 0),
+    };
+    let mut i = 0usize;
+    while i < s.rule_count as usize && i < MAX_RULES {
+        if let Some(r) = s.rules.get(i) {
+            let proto_ok = r.proto_match == 0 || r.proto_match == proto;
+            let port_ok = r.dst_port_lo == 0 || (dport >= r.dst_port_lo && dport <= r.dst_port_hi);
+            if proto_ok && port_ok {
+                return r.action == ACTION_ACCEPT;
+            }
+        }
+        i += 1;
+    }
     s.default_action != ACTION_DROP
+}
+
+// ============================================================================
+// Frame paths
+// ============================================================================
+
+/// Move one frame from `input` to `output`, judged. Whether a frame was
+/// read.
+unsafe fn pass_one(s: &mut FilterState, input: i32, output: i32, now: u32) -> bool {
+    let sys = &*s.syscalls;
+    if input < 0 || output < 0 {
+        return false;
+    }
+    let poll = (sys.channel_poll)(input, POLL_IN);
+    if poll <= 0 || (poll as u32 & POLL_IN) == 0 {
+        return false;
+    }
+    let buf = s.frame_buf.as_mut_ptr();
+    if (sys.channel_read)(input, buf, 2) < 2 {
+        return false;
+    }
+    let len = (*buf as usize) | ((*buf.add(1) as usize) << 8);
+    if len == 0 || len > MAX_FRAME {
+        s.malformed = s.malformed.wrapping_add(1);
+        return true;
+    }
+    if (sys.channel_read)(input, buf.add(2), len) < len as i32 {
+        s.malformed = s.malformed.wrapping_add(1);
+        return true;
+    }
+    let frame = core::slice::from_raw_parts(buf.add(2) as *const u8, len);
+    let pass = if s.table_len > 0 {
+        judge_policy(s, frame, now)
+    } else {
+        judge_static(s, frame)
+    };
+    if !pass {
+        s.dropped = s.dropped.wrapping_add(1);
+        return true;
+    }
+    let p = (sys.channel_poll)(output, POLL_OUT);
+    if p > 0 && (p as u32 & POLL_OUT) != 0 {
+        (sys.channel_write)(output, buf as *const u8, 2 + len);
+        s.accepted = s.accepted.wrapping_add(1);
+    } else {
+        // The next stage is full: dropped, as the medium below drops.
+        s.dropped_full = s.dropped_full.wrapping_add(1);
+    }
+    true
 }
 
 // ============================================================================
@@ -424,66 +792,88 @@ unsafe fn evaluate(s: &FilterState, meta: &[u8; META_SIZE]) -> bool {
 // ============================================================================
 
 declare_module_state_bytes!(FilterState);
+declare_module_arena_bytes!(HEAP_DEFAULT_BYTES);
 
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_state_size"]
 pub extern "C" fn module_state_size() -> usize {
-    core::mem::size_of::<FilterState>()
+    STATE_SIZE
+}
+
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
+#[link_section = ".text.module_arena_size"]
+pub extern "C" fn module_arena_size() -> u32 {
+    HEAP_DEFAULT_BYTES
 }
 
 /// # Safety
 /// Kernel module-ABI entry point: `syscalls` is the kernel's syscall table,
 /// valid for the module's lifetime.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_init"]
 pub unsafe extern "C" fn module_init(_syscalls: *const c_void) {}
 
 /// # Safety
 /// Kernel module-ABI entry point: `state` is the loader-owned instance block
-/// of `state_size` bytes, `syscalls` the kernel's syscall table, and `params`
-/// the config TLV blob of `params_len` bytes (may be null when it is empty).
-#[unsafe(no_mangle)]
+/// of `state_size` bytes (zeroed), `syscalls` the kernel's syscall table,
+/// and `params` the config TLV blob of `params_len` bytes (may be null when
+/// it is empty).
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_new"]
 pub unsafe extern "C" fn module_new(
     in_chan: i32,
     out_chan: i32,
-    ctrl_chan: i32,
+    _ctrl_chan: i32,
     params: *const u8,
     params_len: usize,
     state: *mut u8,
+    _state_size: usize,
     syscalls: *const SyscallTable,
 ) -> i32 {
+    // SAFETY: the loader hands a live, aligned, zeroed block of at least
+    // `size_of::<FilterState>()`, exclusive to this module for the call.
     let s = unsafe { &mut *(state as *mut FilterState) };
     s.syscalls = syscalls;
-    s.in_chan = in_chan;
-    s.out_chan = out_chan;
-    s._ctrl_chan = ctrl_chan;
-    s.rule_count = 0;
-    s.default_action = ACTION_ACCEPT;
-    s.accepted = 0;
-    s.dropped = 0;
-    s.table_len = 0;
-    s.attached = 0;
-    s.poll = 0;
-    s.generation = 0;
-    s.store_gen = 0;
-    s.reported = 0;
-    s.live = 0;
-    s.len = 0;
-    s.isolating = false;
-
-    // Init rules to empty
+    s.rx_in = in_chan;
+    s.rx_out = out_chan;
     let mut i = 0;
     while i < MAX_RULES {
-        let rp = unsafe { s.rules.as_mut_ptr().add(i) };
-        unsafe {
-            *rp = FilterRule::empty();
+        if let Some(r) = s.rules.get_mut(i) {
+            *r = FilterRule::empty();
         }
         i += 1;
     }
-
-    unsafe {
-        parse_params(s, params, params_len);
+    // SAFETY: `params` is the loader-supplied blob of `params_len` bytes,
+    // and `parse_tlv` reads only within it (and applies the defaults).
+    unsafe { params_def::parse_tlv(s, params, params_len) };
+    // SAFETY: `syscalls` is the loader's live table.
+    let sys = unsafe { &*syscalls };
+    // The transmit path, when the graph wires it.
+    // SAFETY: as above.
+    s.tx_in = unsafe { dev_channel_port(sys, 0, 1) };
+    // SAFETY: as above.
+    s.tx_out = unsafe { dev_channel_port(sys, 1, 1) };
+    if s.tx_in < 0 || s.tx_out < 0 {
+        s.tx_in = -1;
+        s.tx_out = -1;
+    }
+    if s.table_len > 0 {
+        let mut seed = [0u8; 4];
+        // SAFETY: a 4-byte buffer of ours.
+        if unsafe { dev_csprng_fill(sys, seed.as_mut_ptr(), 4) } < 0 {
+            // SAFETY: as above.
+            let t = unsafe { dev_millis(sys) } as u32;
+            seed = (t ^ 0x9e37_79b9).to_le_bytes();
+        }
+        s.seed = u32::from_le_bytes(seed);
+        // SAFETY: the heap is this module's, sized by `module_arena_size`
+        // or the graph's `heap.arena_bytes`.
+        if !unsafe { flows::size(s) } {
+            let msg = b"[pkt_filter] refusing to construct: the heap cannot hold the flow table (max_flows)";
+            // SAFETY: a static message.
+            unsafe { dev_log(sys, 1, msg.as_ptr(), msg.len()) };
+            return -1;
+        }
     }
     0
 }
@@ -491,54 +881,68 @@ pub unsafe extern "C" fn module_new(
 /// # Safety
 /// Kernel module-ABI entry point: `state` is the instance block this module's
 /// `module_new` initialised, live and exclusively this module's for the call.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_step"]
 pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     let s = &mut *(state as *mut FilterState);
     let sys = &*s.syscalls;
-
+    let now = dev_millis(sys) as u32;
     if s.table_len > 0 {
-        if s.poll == 0 {
-            refresh_policy(s, sys);
-            s.poll = POLICY_POLL_STEPS;
+        if s.polled_ms == 0 || now.wrapping_sub(s.polled_ms) >= POLL_MS {
+            s.polled_ms = if now == 0 { 1 } else { now };
+            refresh_policy(s);
         }
-        s.poll -= 1;
+        flows::step(s, now);
     }
-
-    // Read parsed packet (metadata + payload)
-    let mut buf = [0u8; META_SIZE + MAX_FRAME];
-    let n = (sys.channel_read)(s.in_chan, buf.as_mut_ptr(), buf.len());
-    if n < META_SIZE as i32 {
-        return 0; // Nothing to process
-    }
-
-    // Extract metadata
-    let mut meta = [0u8; META_SIZE];
-    let mp = meta.as_mut_ptr();
-    let bp = buf.as_ptr();
-    let mut i = 0;
-    while i < META_SIZE {
-        core::ptr::write_volatile(mp.add(i), core::ptr::read_volatile(bp.add(i)));
-        i += 1;
-    }
-
-    let pass = if s.table_len > 0 {
-        evaluate_policy(s, &buf, n as usize)
+    let rx = pass_one(s, s.rx_in, s.rx_out, now);
+    let tx = pass_one(s, s.tx_in, s.tx_out, now);
+    if rx || tx {
+        2 // Burst: more frames are likely queued.
     } else {
-        evaluate(s, &meta)
-    };
-    if pass {
-        // Forward entire message (metadata + payload)
-        (sys.channel_write)(s.out_chan, buf.as_ptr(), n as usize);
-        s.accepted = s.accepted.wrapping_add(1);
-    } else {
-        s.dropped = s.dropped.wrapping_add(1);
+        0
     }
-
-    2 // Burst (may have more)
 }
 
 // Wasm entry-point wrappers — no-op on non-wasm targets. See
 // `modules/sdk/runtime/wasm_entry.rs` for the wasm32 module_init_wasm /
 // module_step_wasm definitions.
 include!("../../sdk/runtime/wasm_entry.rs");
+
+// ============================================================================
+// Host-test API: the counters, read from the instance block, so
+// `tests/harness/tests/pkt_filter.rs` drives the real entry points and checks
+// what the module decided. Never compiled into the PIC firmware.
+// ============================================================================
+
+/// The module's counters.
+#[cfg(feature = "host-test")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Counters {
+    pub accepted: u32,
+    pub dropped: u32,
+    pub flows_refused: u32,
+    pub flows_expired: u32,
+    pub frag_dropped: u32,
+    pub malformed: u32,
+    pub closed_dropped: u32,
+    pub flows_live: u32,
+    pub closed: bool,
+}
+
+/// # Safety
+/// `state` is an instance block `module_new` initialised.
+#[cfg(feature = "host-test")]
+pub unsafe fn counters(state: *const u8) -> Counters {
+    let s = &*(state as *const FilterState);
+    Counters {
+        accepted: s.accepted,
+        dropped: s.dropped,
+        flows_refused: s.flows_refused,
+        flows_expired: s.flows_expired,
+        frag_dropped: s.frag_dropped,
+        malformed: s.malformed,
+        closed_dropped: s.closed_dropped,
+        flows_live: s.flows_live,
+        closed: s.closed,
+    }
+}

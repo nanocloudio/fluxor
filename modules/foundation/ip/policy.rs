@@ -6,12 +6,18 @@
 //! generation is polled (a zero-length `READ`; a `CLEAR` consumes one too,
 //! so a deleted policy is noticed like a changed one) and only when it moved
 //! is each table read again, whole, into this module's heap (`policy_bytes`
-//! per table). `ATTACH` binds this module as each table's one enforcer and
-//! reports the generation it applied in full: a table it could not hold
-//! (oversized), a read the store kept moving under (a stale copy), or a
-//! table that is gone reports 0 — so the table's `ENFORCED` is clear
-//! whenever what is in force here is not what the store holds, and a
-//! faulted module's binding ends with its slot.
+//! per table). `ATTACH` binds this module as each table's one enforcer,
+//! declares `policy_bytes` as the most of it this module holds (so the store
+//! refuses a larger REPLACE, `E2BIG`), and reports the generation it applied
+//! in full: a table it could not hold, a read the store kept moving under (a
+//! stale copy), or a table that is gone reports 0 — so the table's
+//! `ENFORCED` is clear whenever what is in force here is not what the store
+//! holds, and a faulted module's binding ends with its slot.
+//!
+//! **Fail closed.** A table this module cannot hold (one stored before it
+//! bound, larger than `policy_bytes`) is not enforced by its previous copy:
+//! it is enforced closed — every packet it judges is dropped, and its
+//! services are withdrawn — until a read of it fits.
 //!
 //! **Evaluation** is the shared one (`net::policy::evaluate`), the same
 //! rules as the Linux rendering, so a policy means the same on every node.
@@ -40,6 +46,7 @@ pub(crate) const BYTES_DEFAULT: u16 = 1024;
 
 const ENOENT: i32 = -2;
 const ENOSYS: i32 = -38;
+const ERANGE: i32 = -34;
 
 /// One table this instance applies.
 #[repr(C)]
@@ -53,7 +60,8 @@ pub(crate) struct PolTable {
     /// the other and is swapped in only whole, so a read the store moved
     /// under never tears what is in force.
     pub live: u8,
-    pub _pad: u8,
+    /// The store holds more of it than this module can: enforced closed.
+    pub closed: bool,
     /// Bytes of rules held, in this table's part of the heap buffer.
     pub len: u32,
     /// The table generation held, and the one reported applied (0: none).
@@ -67,7 +75,7 @@ impl PolTable {
         name_len: 0,
         filters: false,
         live: 0,
-        _pad: 0,
+        closed: false,
         len: 0,
         gen: 0,
         applied: 0,
@@ -249,38 +257,51 @@ unsafe fn refresh(s: &mut IpState) {
         let gen = u64_at(&state, np::state::GENERATION);
         let entry = table(s, t);
         if rc >= 0 {
-            if gen != entry.gen || entry.applied != gen {
+            if gen != entry.gen || entry.applied != gen || entry.closed {
                 // The whole table landed in the spare half: swap it in.
+                let was_closed = entry.closed;
                 entry.live = spare;
                 entry.len = rc as u32;
                 entry.gen = gen;
                 entry.applied = gen;
+                entry.closed = false;
                 let had = entry.filters;
                 entry.filters = np::filters(rules(s, t));
-                filter_moved |= had || table(s, t).filters;
+                filter_moved |= had || was_closed || table(s, t).filters;
             }
         } else if rc == ENOENT {
             // The table is gone: nothing of it is in force any more.
-            if entry.len != 0 || entry.filters {
+            if entry.len != 0 || entry.filters || entry.closed {
                 filter_moved = true;
             }
             entry.len = 0;
             entry.filters = false;
+            entry.closed = false;
             entry.gen = 0;
             entry.applied = 0;
-        } else {
-            // Too big to hold (ERANGE), or the store kept moving (EAGAIN):
-            // the previous copy stays in force — the read went to the spare
-            // half — and is not this generation, so the table is not
-            // reported applied.
-            // It keeps reporting the generation it does hold, which the
-            // store no longer has: ENFORCED is clear.
-            if rc == -34 {
-                s.pol_oversized = s.pol_oversized.wrapping_add(1);
-            } else {
-                // Read again at the next poll, whatever the store says.
-                retry = true;
+        } else if rc == ERANGE {
+            // Too big to hold: enforced closed, not by the copy held before
+            // — that copy is a policy the store no longer has, and keeping it
+            // in force would pass what the stored table may drop. Every
+            // packet it judges is dropped and its services withdrawn until a
+            // read fits; nothing is reported applied, so ENFORCED is clear.
+            s.pol_oversized = s.pol_oversized.wrapping_add(1);
+            if !entry.closed || entry.len != 0 {
+                filter_moved = true;
             }
+            entry.closed = true;
+            entry.len = 0;
+            entry.filters = false;
+            entry.gen = gen;
+            entry.applied = 0;
+        } else {
+            // The store kept moving (EAGAIN): the previous copy stays in
+            // force — the read went to the spare half — and is not this
+            // generation, so it is not reported applied: it keeps reporting
+            // the generation it does hold, which the store no longer has,
+            // and ENFORCED is clear. Read again at the next poll, whatever
+            // the store says.
+            retry = true;
         }
         t += 1;
     }
@@ -294,9 +315,10 @@ unsafe fn refresh(s: &mut IpState) {
     attach(s);
 }
 
-/// ATTACH naming every table, with the generation applied.
+/// ATTACH naming every table, with the generation applied and the most of
+/// it this module holds (`policy_bytes`).
 unsafe fn attach(s: &mut IpState) {
-    let mut arg = [0u8; 1 + np::MAX_TABLE_NAME + np::ATTACH_TAIL];
+    let mut arg = [0u8; 1 + np::MAX_TABLE_NAME + np::ATTACH_TAIL + np::ATTACH_CAPACITY_TAIL];
     // One table per call: each binding stands or falls on its own (another
     // enforcer holding one table leaves this one bound for the rest).
     let mut all = true;
@@ -304,7 +326,7 @@ unsafe fn attach(s: &mut IpState) {
     while t < s.pol_n as usize {
         let e = *table(s, t);
         let nl = (e.name_len as usize).min(np::MAX_TABLE_NAME);
-        arg[0] = nl as u8;
+        arg[0] = nl as u8 | np::ATTACH_CAPACITY;
         let mut i = 0;
         while i < nl {
             if let (Some(d), Some(c)) = (arg.get_mut(1 + i), e.name.get(i)) {
@@ -320,7 +342,16 @@ unsafe fn attach(s: &mut IpState) {
             }
             k += 1;
         }
-        let rc = ((*s.syscalls).provider_call)(-1, np::ATTACH, arg.as_mut_ptr(), 1 + nl + 8);
+        let cap = u32::from(s.policy_bytes).to_le_bytes();
+        let mut k = 0;
+        while k < np::ATTACH_CAPACITY_TAIL {
+            if let (Some(d), Some(c)) = (arg.get_mut(1 + nl + 8 + k), cap.get(k)) {
+                *d = *c;
+            }
+            k += 1;
+        }
+        let len = 1 + nl + np::ATTACH_TAIL + np::ATTACH_CAPACITY_TAIL;
+        let rc = ((*s.syscalls).provider_call)(-1, np::ATTACH, arg.as_mut_ptr(), len);
         if rc != 0 {
             all = false;
         }
@@ -329,11 +360,12 @@ unsafe fn attach(s: &mut IpState) {
     s.pol_attached = all;
 }
 
-/// Whether every table passes `p`.
+/// Whether every table passes `p`: a table enforced closed passes nothing.
 pub(crate) unsafe fn allows(s: &mut IpState, p: &np::Packet) -> bool {
     let mut t = 0;
     while t < s.pol_n as usize {
-        if table(s, t).filters && np::evaluate(rules(s, t), p) != np::Verdict::Accept {
+        let e = table(s, t);
+        if e.closed || (e.filters && np::evaluate(rules(s, t), p) != np::Verdict::Accept) {
             s.drops.policy_denied = s.drops.policy_denied.wrapping_add(1);
             return false;
         }
@@ -342,12 +374,12 @@ pub(crate) unsafe fn allows(s: &mut IpState, p: &np::Packet) -> bool {
     true
 }
 
-/// Whether any table judges packets at all.
+/// Whether any table judges packets at all (one enforced closed does).
 #[inline(always)]
 pub(crate) unsafe fn active(s: &IpState) -> bool {
     let mut t = 0;
     while t < s.pol_n as usize {
-        if table(s, t).filters {
+        if table(s, t).filters || table(s, t).closed {
             return true;
         }
         t += 1;

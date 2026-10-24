@@ -30,8 +30,7 @@
 //! seeded per module instance so the tuples that land in one cluster
 //! cannot be chosen from outside.
 
-/// Empty index entry.
-pub const EMPTY: u32 = 0;
+include!("../../sdk/runtime/hash_index.rs");
 
 /// A keyed connection: what distinguishes one from another at the
 /// transport, including which local address it is reached at.
@@ -41,18 +40,6 @@ pub struct ConnKey {
     pub remote_port: u16,
     pub local_port: u16,
     pub local_slot: u16,
-}
-
-/// Avalanche mix of one word — the finaliser a hash needs so nearby keys
-/// (consecutive ports, adjacent addresses) land far apart.
-#[inline]
-pub fn mix32(mut x: u32) -> u32 {
-    x ^= x >> 16;
-    x = x.wrapping_mul(0x7feb_352d);
-    x ^= x >> 15;
-    x = x.wrapping_mul(0x846c_a68b);
-    x ^= x >> 16;
-    x
 }
 
 impl ConnKey {
@@ -69,137 +56,6 @@ impl ConnKey {
         let a = mix32(self.remote_ip ^ seed);
         let b = mix32(u32::from(self.remote_port) | (u32::from(self.local_port) << 16));
         mix32(a ^ b.rotate_left(13) ^ u32::from(self.local_slot).wrapping_mul(0x9e37_79b9))
-    }
-}
-
-/// Insert `slot` under `hash`, at the first empty entry on its probe path.
-/// `false` only when every entry is live, which cannot happen while the
-/// index is larger than the table it indexes.
-///
-/// # Safety
-/// `index` must be a power-of-two length.
-#[inline]
-pub unsafe fn insert(index: &mut [u32], hash: u32, slot: usize) -> bool {
-    let mask = index.len() - 1;
-    let mut i = hash as usize & mask;
-    let mut probes = 0;
-    while probes < index.len() {
-        let e = *index.as_ptr().add(i);
-        if e == EMPTY {
-            *index.as_mut_ptr().add(i) = slot as u32 + 1;
-            return true;
-        }
-        i = (i + 1) & mask;
-        probes += 1;
-    }
-    false
-}
-
-/// Remove the entry for `slot` under `hash`, closing the hole behind it.
-/// `false` when no such entry was on the probe path.
-///
-/// `home_of` gives the hash an occupied entry was inserted under, so the
-/// chain can be pulled back over the hole. It is asked only about entries
-/// this index holds, and it MUST answer what that slot was inserted with:
-/// the caller's key fields are immutable for as long as the slot is
-/// indexed, and a `home_of` that disagrees moves a live entry off its own
-/// chain, where nothing will find it again.
-///
-/// # Safety
-/// `index` must be a power-of-two length.
-#[inline]
-pub unsafe fn remove(
-    index: &mut [u32],
-    hash: u32,
-    slot: usize,
-    home_of: impl Fn(usize) -> u32,
-) -> bool {
-    let mask = index.len() - 1;
-    let mut i = hash as usize & mask;
-    let mut probes = 0;
-    let want = slot as u32 + 1;
-    while probes < index.len() {
-        let e = *index.as_ptr().add(i);
-        if e == EMPTY {
-            return false;
-        }
-        if e == want {
-            *index.as_mut_ptr().add(i) = EMPTY;
-            // Pull the rest of the cluster back over the hole, so the
-            // entries past it stay reachable from their own home
-            // (backward-shift deletion). Bounded like every other walk
-            // here: a degenerate cluster must cost a bounded step, not an
-            // open-ended one.
-            let mut j = (i + 1) & mask;
-            let mut shifted = 0;
-            while shifted < index.len() {
-                let f = *index.as_ptr().add(j);
-                if f == EMPTY {
-                    break;
-                }
-                let home = home_of((f - 1) as usize) as usize & mask;
-                // `f` may fill the hole only when the hole lies between
-                // its home and where it currently sits, on the cyclic
-                // probe path.
-                let between = if i <= j {
-                    home <= i || home > j
-                } else {
-                    home <= i && home > j
-                };
-                if between {
-                    *index.as_mut_ptr().add(i) = f;
-                    *index.as_mut_ptr().add(j) = EMPTY;
-                    i = j;
-                }
-                j = (j + 1) & mask;
-                shifted += 1;
-            }
-            return true;
-        }
-        i = (i + 1) & mask;
-        probes += 1;
-    }
-    false
-}
-
-/// The first slot on `hash`'s probe path for which `matches` holds.
-/// Entries are validated by the caller's predicate rather than trusted:
-/// two keys may share a hash, and a slot may have been reused since it
-/// was indexed under a key that has not yet been removed.
-///
-/// # Safety
-/// `index` must be a power-of-two length.
-#[inline]
-pub unsafe fn lookup<F: FnMut(usize) -> bool>(
-    index: &[u32],
-    hash: u32,
-    mut matches: F,
-) -> Option<usize> {
-    let mask = index.len() - 1;
-    let mut i = hash as usize & mask;
-    let mut probes = 0;
-    while probes < index.len() {
-        let e = *index.as_ptr().add(i);
-        if e == EMPTY {
-            return None;
-        }
-        let slot = (e - 1) as usize;
-        if matches(slot) {
-            return Some(slot);
-        }
-        i = (i + 1) & mask;
-        probes += 1;
-    }
-    None
-}
-
-/// Forget everything.
-#[inline]
-pub fn clear(index: &mut [u32]) {
-    let mut i = 0;
-    while i < index.len() {
-        index[i] = EMPTY;
-        i += 1;
     }
 }
 

@@ -22,10 +22,16 @@
 //!   not fit. A rebuild moves the carve's sized tag ([`sized_tag`]), which
 //!   forgets every table carved for the previous graph (`Raw::revalidate` in
 //!   `kernel::mem::table`).
-//! - **Permanent carves** ([`carve`]) back the boot-sized tables. They are
-//!   never returned — a table may be read from any core, so its block cannot
-//!   be proven free — and every one is zeroed as it is carved, never the
-//!   zone wholesale. On RP they last until the next plan.
+//! - **Permanent carves** ([`carve`]) back the boot-sized tables, each one
+//!   zeroed as it is carved, never the zone wholesale. On bcm2712 a table
+//!   that moves to a larger block hands its old one back ([`retire`]) at the
+//!   point its reservation proves no core can still read it (see
+//!   `Table::reserve` in `kernel::mem::table`); the block joins the zone's
+//!   free extents (`pool_plan::FreeExtents`), coalesced with its neighbours,
+//!   and a later carve or transient block takes from them before it lowers
+//!   the floor. So a rebuild to a larger graph reuses the memory the
+//!   previous graph's tables held. On RP carves last until the next plan,
+//!   which frees the whole pool.
 //! - **Transient blocks** ([`take`] / [`give`]) back the graph builder's
 //!   scratch and the boot config's parse lists on bcm2712, which live while a
 //!   graph is prepared. A block given back is kept on a short recycle list
@@ -44,6 +50,12 @@ use portable_atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 /// wiring scratches, the fan scan); a block given back when the list is full
 /// replaces the smallest, which is leaked and counted.
 pub const RECYCLE_SLOTS: usize = 16;
+/// Extents the bcm2712 zone's free list holds: the blocks tables moved out
+/// of, coalesced. One graph's tables are carved one below another, so the
+/// blocks a rebuild leaves behind merge into a few; a block handed back to a
+/// full list that joins none replaces the smallest extent when it is larger,
+/// and whichever is left out is leaked and counted.
+pub const FREE_EXTENTS: usize = 64;
 /// Granularity of a fresh transient block, so a list that grows by one slot
 /// at a time does not carve once per slot.
 #[cfg(feature = "chip-bcm2712")]
@@ -89,6 +101,11 @@ static mut RECYCLE: Recycle = Recycle {
     ptr: [0; RECYCLE_SLOTS],
     size: [0; RECYCLE_SLOTS],
 };
+
+/// The zone's free extents: blocks tables moved out of ([`retire`]), touched
+/// only under `LOCK`.
+#[cfg(feature = "chip-bcm2712")]
+static mut FREE: super::pool_plan::FreeExtents<FREE_EXTENTS> = super::pool_plan::FreeExtents::new();
 
 struct Guard;
 impl Guard {
@@ -150,7 +167,8 @@ pub fn floor() -> usize {
 }
 
 /// `(permanent, transient, leaked, refused)` bytes and refusals, for
-/// telemetry.
+/// telemetry. `permanent` counts the bytes tables hold now: a retired block
+/// leaves it and a carve that reuses one joins it again.
 pub fn stats() -> (usize, usize, usize, usize) {
     (
         PERMANENT.load(Ordering::Relaxed),
@@ -158,6 +176,56 @@ pub fn stats() -> (usize, usize, usize, usize) {
         LEAKED.load(Ordering::Relaxed),
         REFUSED.load(Ordering::Relaxed),
     )
+}
+
+/// Bytes the zone's free extents hold for reuse: blocks tables moved out of
+/// that no carve has taken again. Always 0 off bcm2712.
+pub fn reusable() -> usize {
+    #[cfg(feature = "chip-bcm2712")]
+    {
+        let _g = Guard::acquire();
+        // SAFETY: the free extents are touched only under the lock.
+        unsafe { (*core::ptr::addr_of!(FREE)).bytes() }
+    }
+    #[cfg(not(feature = "chip-bcm2712"))]
+    {
+        0
+    }
+}
+
+/// Take `bytes` at `align` from the zone's free extents, under the lock.
+#[cfg(feature = "chip-bcm2712")]
+fn take_free(bytes: usize, align: usize) -> Option<usize> {
+    // SAFETY: the free extents are touched only under the lock, which the
+    // caller holds.
+    let free = unsafe { &mut *core::ptr::addr_of_mut!(FREE) };
+    let dropped = free.dropped();
+    let at = free.take(bytes, align);
+    LEAKED.fetch_add(free.dropped() - dropped, Ordering::Relaxed);
+    at
+}
+
+/// Hand back a block [`carve`] gave a table that has moved to a larger one,
+/// so a later carve can take it. Its bytes leave the permanent count.
+///
+/// # Safety
+/// `[ptr, ptr + bytes)` is a block `carve` returned, whole or a part of it
+/// no other block covers, and no core can still read or write it: the table
+/// that held it has published its new block, and every reader that could
+/// have loaded the old pointer has finished with it (`Table::reserve`'s
+/// contract, proven where it is called).
+#[cfg(feature = "chip-bcm2712")]
+pub unsafe fn retire(ptr: *mut u8, bytes: usize) {
+    if ptr.is_null() || bytes == 0 {
+        return;
+    }
+    let _g = Guard::acquire();
+    // SAFETY: the free extents are touched only under the lock.
+    let free = unsafe { &mut *core::ptr::addr_of_mut!(FREE) };
+    let dropped = free.dropped();
+    free.give(ptr as usize, bytes);
+    LEAKED.fetch_add(free.dropped() - dropped, Ordering::Relaxed);
+    PERMANENT.fetch_sub(bytes, Ordering::Relaxed);
 }
 
 /// Move the floor down by `bytes` at `align`, under the lock. `None` when the
@@ -184,7 +252,15 @@ pub fn carve(bytes: usize, align: usize) -> Option<*mut u8> {
     }
     let at = {
         let _g = Guard::acquire();
-        lower_floor(bytes, align)?
+        // bcm2712: a block a table moved out of first, then the floor.
+        #[cfg(feature = "chip-bcm2712")]
+        let reused = take_free(bytes, align);
+        #[cfg(not(feature = "chip-bcm2712"))]
+        let reused = None;
+        match reused {
+            Some(at) => at,
+            None => lower_floor(bytes, align)?,
+        }
     };
     PERMANENT.fetch_add(bytes, Ordering::Relaxed);
     // SAFETY: `[at, at + bytes)` was just carved for this caller alone, and it
@@ -219,7 +295,10 @@ pub fn take(bytes: usize, align: usize) -> Option<(*mut u8, usize)> {
     let size = bytes.max(1).div_ceil(TRANSIENT_GRAIN) * TRANSIENT_GRAIN;
     let at = {
         let _g = Guard::acquire();
-        lower_floor(size, align)?
+        match take_free(size, align) {
+            Some(at) => at,
+            None => lower_floor(size, align)?,
+        }
     };
     TRANSIENT.fetch_add(size, Ordering::Relaxed);
     // SAFETY: as in `carve`.

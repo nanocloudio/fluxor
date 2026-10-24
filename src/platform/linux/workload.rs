@@ -61,6 +61,9 @@ struct WorkloadSlot {
     /// This backend allocated the owner at CREATE (its identity named no
     /// owner the plan holds), so its DESTROY frees it.
     allocated: bool,
+    /// The owner of the module that created it: only that owner, or a
+    /// caller acting with the node's authority, acts on it ([`may_use`]).
+    holder: OwnerHandle,
 }
 
 const WORKLOAD_EMPTY: WorkloadSlot = WorkloadSlot {
@@ -68,7 +71,16 @@ const WORKLOAD_EMPTY: WorkloadSlot = WorkloadSlot {
     owner: crate::kernel::workload::owner::OWNER_SYSTEM,
     backend_idx: -1,
     allocated: false,
+    holder: crate::kernel::workload::owner::OWNER_SYSTEM,
 };
+
+/// Whether the calling module may act on a workload `slot` holds: its
+/// owner created it, or it acts with the node's authority (the node agent).
+fn may_use(slot: &WorkloadSlot) -> bool {
+    use crate::kernel::exec::scheduler;
+    scheduler::caller_authority() == crate::kernel::workload::owner::OWNER_SYSTEM
+        || scheduler::caller_owner() == slot.holder
+}
 
 /// End the slot's workload: its sandbox goes, and an owner this backend
 /// allocated is freed with its storage root, as the graph backend frees one
@@ -121,14 +133,31 @@ fn rd_u32(b: &[u8], off: usize) -> u32 {
     u32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
 }
 
-/// The host-process backend's honest capability set. `host_backend.rs` provides
-/// namespace + cgroup isolation but no syscall filter, capability bound or
-/// security-module profile, so it advertises `SHARED`/`ISOLATED` only — never
-/// `HARDENED` — and no hardening option key. A `HARDENED` request, or a
-/// required option entry it does not list, therefore fails admission
-/// (`ENOSYS`) rather than running silently under-hardened.
+/// The postures the host-process backend realizes. `SHARED` is a null
+/// sandbox and `ISOLATED` namespaces of the workload's own with its cgroup;
+/// every workload, at either, is confined (`confine.rs`: the OCI default
+/// capabilities, `no_new_privs`, the default system-call filter) unless its
+/// source opts out. `HARDENED` is `ISOLATED` with that confinement whole —
+/// no capability added, no opt-out, the bounding set cut — and is realized
+/// only where the system-call filter is (`confine::filter_available`). A
+/// posture it does not realize, or a required option entry it does not
+/// list, fails admission (`ENOSYS`) rather than running under-hardened.
 fn host_backend_honors_posture(posture: u8) -> bool {
-    matches!(posture, wl::POSTURE_SHARED | wl::POSTURE_ISOLATED)
+    match posture {
+        wl::POSTURE_SHARED | wl::POSTURE_ISOLATED => true,
+        wl::POSTURE_HARDENED => super::confine::filter_available(),
+        _ => false,
+    }
+}
+
+/// The postures [`CAPS`](wl::CAPS) advertises: those
+/// [`host_backend_honors_posture`] realizes.
+fn host_backend_postures() -> u8 {
+    let mut p = wl::caps::POSTURE_SHARED | wl::caps::POSTURE_ISOLATED;
+    if host_backend_honors_posture(wl::POSTURE_HARDENED) {
+        p |= wl::caps::POSTURE_HARDENED;
+    }
+    p
 }
 /// Tier-2 options this backend realizes. `mount`/`bind` is a volume: the value
 /// is `<host path>\0<path in the workload>\0<ro: 1|0>`, bind-mounted into
@@ -233,7 +262,8 @@ unsafe fn validate_options(
 /// The host-process source section (`SOURCE_HOST_PROCESS`), little-endian,
 /// every part length-prefixed and present, in this order:
 /// ```text
-///   [flags:u8]                         SRC_ISOLATED | SRC_ROOT_READ_ONLY
+///   [flags:u8]                         SRC_ISOLATED | SRC_ROOT_READ_ONLY |
+///                                      SRC_CAP_ADD | SRC_NO_SYSCALL_FILTER
 ///   [rootfs_len:u16][rootfs]           the root to pivot into; empty = none
 ///   [argv_len:u16][argv]               NUL-separated tokens, at least one
 ///   [env_len:u16][env]                 NUL-separated `NAME=VALUE` — the WHOLE
@@ -243,6 +273,8 @@ unsafe fn validate_options(
 ///                                      the runtime's own identity
 ///   [groups_len:u16][groups_flags:u8][gid:u32 × n]
 ///                                      groups_len = 1 + 4n; GROUPS_STRICT
+///   [cap_add_len:u16 = 8][cap_add:u64] with SRC_CAP_ADD only: capabilities
+///                                      granted beyond the defaults
 /// ```
 /// Nothing may follow the last part. A read-only root without isolation is
 /// EINVAL (there is no mount namespace of its own to make read-only), and so
@@ -266,7 +298,10 @@ pub fn parse_host_source(src: &[u8]) -> Result<HostSource<'_>, i32> {
     use crate::kernel::sys::errno;
     let mut p = 1usize;
     let flags = *src.first().ok_or(errno::EINVAL)?;
-    if flags & !(hp::SRC_ISOLATED | hp::SRC_ROOT_READ_ONLY) != 0 {
+    if flags
+        & !(hp::SRC_ISOLATED | hp::SRC_ROOT_READ_ONLY | hp::SRC_CAP_ADD | hp::SRC_NO_SYSCALL_FILTER)
+        != 0
+    {
         return Err(errno::EINVAL);
     }
     let isolate = flags & hp::SRC_ISOLATED != 0;
@@ -289,6 +324,12 @@ pub fn parse_host_source(src: &[u8]) -> Result<HostSource<'_>, i32> {
     let cwd = part()?;
     let user = part()?;
     let groups = part()?;
+    let cap_add = if flags & hp::SRC_CAP_ADD != 0 {
+        let b: [u8; 8] = part()?.try_into().map_err(|_| errno::EINVAL)?;
+        u64::from_le_bytes(b)
+    } else {
+        0
+    };
     if p != src.len() {
         return Err(errno::EINVAL);
     }
@@ -324,6 +365,9 @@ pub fn parse_host_source(src: &[u8]) -> Result<HostSource<'_>, i32> {
                 .collect(),
             groups_strict: gflags & hp::GROUPS_STRICT != 0,
             root_read_only,
+            cap_add,
+            no_syscall_filter: flags & hp::SRC_NO_SYSCALL_FILTER != 0,
+            hardened: false,
         },
     })
 }
@@ -421,7 +465,7 @@ unsafe fn workload_create_as(
         return errno::ENOSYS;
     }
     if !host_backend_honors_posture(posture) {
-        return errno::ENOSYS; // HARDENED: no syscall filter or capability bound
+        return errno::ENOSYS; // a posture this host cannot realize
     }
 
     // Identity → owner. A workload names who it is: the null identity names
@@ -545,10 +589,22 @@ unsafe fn workload_create_as(
     // carries EXPLICIT spawn params (the orchestrator composes them from its own
     // bundle/OCI format — this backend has no bundle knowledge), see
     // `parse_host_source`.
-    let src = match parse_host_source(&buf[src_start..ep_start]) {
+    let mut src = match parse_host_source(&buf[src_start..ep_start]) {
         Ok(s) => s,
         Err(e) => return e,
     };
+    // The posture is the isolation: namespaces of its own at ISOLATED and
+    // above, none at SHARED, and the source's flag must say the same. A
+    // hardened workload takes no addition and no opt-out.
+    if src.isolate != (posture >= wl::POSTURE_ISOLATED) {
+        return errno::EINVAL;
+    }
+    if posture == wl::POSTURE_HARDENED {
+        if src.process.cap_add != 0 || src.process.no_syscall_filter {
+            return errno::EINVAL;
+        }
+        src.process.hardened = true;
+    }
     let backend_idx = hp_spawn_with_binds(
         &src.argv,
         src.rootfs,
@@ -593,14 +649,21 @@ unsafe fn workload_create_as(
         owner,
         backend_idx,
         allocated: allocated.is_some(),
+        holder: crate::kernel::exec::scheduler::caller_owner(),
     };
     tag_fd(FD_TAG_WORKLOAD, widx as i32)
 }
 
-unsafe fn workload_backend_idx(raw: i32) -> Option<i32> {
-    let idx = raw as usize;
+/// The sandbox behind workload slot `raw`, for the calling module: `EINVAL`
+/// for no such workload, `EACCES` for one it may not act on ([`may_use`]).
+unsafe fn workload_backend_idx(raw: i32) -> Result<i32, i32> {
+    use crate::kernel::sys::errno;
     let slots = &*core::ptr::addr_of!(LINUX_WORKLOADS);
-    slots.get(idx).filter(|s| s.in_use).map(|s| s.backend_idx)
+    match usize::try_from(raw).ok().and_then(|i| slots.get(i)) {
+        Some(s) if s.in_use && may_use(s) => Ok(s.backend_idx),
+        Some(s) if s.in_use => Err(errno::EACCES),
+        _ => Err(errno::EINVAL),
+    }
 }
 
 /// Map the portable SIGNAL subset to the host signal number.
@@ -688,6 +751,9 @@ pub unsafe fn linux_workload_dispatch(
         }) else {
             return errno::ENOENT;
         };
+        if !may_use(&slots[idx]) {
+            return errno::EACCES;
+        }
         if opcode == wl::LOOKUP {
             let owner = slots[idx].owner;
             let out = core::slice::from_raw_parts_mut(arg, 6);
@@ -703,8 +769,9 @@ pub unsafe fn linux_workload_dispatch(
         let inner = tag_fd(FD_TAG_WORKLOAD, raw - GRAPH_SLOT_BASE);
         return workload_graph::workload_dispatch(inner, opcode, arg, arg_len);
     }
-    let Some(bidx) = workload_backend_idx(raw) else {
-        return errno::EINVAL;
+    let bidx = match workload_backend_idx(raw) {
+        Ok(b) => b,
+        Err(e) => return e,
     };
     match opcode {
         wl::START => hp_start(bidx),
@@ -737,7 +804,7 @@ unsafe fn workload_caps(arg: *mut u8, arg_len: usize) -> i32 {
         return errno::EINVAL;
     }
     let out = core::slice::from_raw_parts_mut(arg, arg_len);
-    out[0] = wl::caps::POSTURE_SHARED | wl::caps::POSTURE_ISOLATED;
+    out[0] = host_backend_postures();
     // Both backends: a host-process bundle, and an fmod graph staged into
     // the live graph — with its own modules where the kernel has code space
     // for packs. Each refuses at CREATE what it cannot honour.
@@ -825,8 +892,9 @@ pub unsafe fn host_process_dispatch(
     }
     let a = core::slice::from_raw_parts(arg, 4);
     let wfd = i32::from_le_bytes([a[0], a[1], a[2], a[3]]);
-    let Some(bidx) = workload_backend_idx(slot_of(wfd)) else {
-        return errno::EINVAL;
+    let bidx = match workload_backend_idx(slot_of(wfd)) {
+        Ok(b) => b,
+        Err(e) => return e,
     };
     let body = arg.add(4);
     let body_len = arg_len - 4;

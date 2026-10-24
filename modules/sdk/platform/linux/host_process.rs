@@ -23,12 +23,18 @@ pub const READ: u32 = 0x1B01;
 /// One-shot command in a running workload. `arg = [workload_fd: i32 LE]
 /// [payload …]` (payload wire per the linux backend docs). The command
 /// joins the workload — its namespaces (every one, or it does not run), its
-/// cgroup, its environment, cwd and user — and holds no descriptor of the
-/// runtime's. `EINVAL` before START or while the workload is PAUSEd, `ESRCH`
-/// when its container is gone.
+/// cgroup, its environment, cwd and user, its capabilities, `no_new_privs`
+/// and system-call filter (see [`SOURCE_HOST_PROCESS`]) — and holds no
+/// descriptor of the runtime's. `EINVAL` before START or while the workload
+/// is PAUSEd, `ESRCH` when its container is gone.
 pub const EXEC: u32 = 0x1B02;
 /// Open an interactive PTY session. `arg = [workload_fd: i32 LE][params …]`.
 /// The session joins the workload as [`EXEC`] does, with the same refusals.
+/// The session belongs to whoever opened it — the calling module, under its
+/// owner: [`TTY_STEP`], [`TTY_RESIZE`] and [`TTY_CLOSE`] from any other
+/// module or owner answer `EACCES`, and an unknown session id `EINVAL`. The
+/// session is closed (its process killed and reaped) when the opener's owner
+/// is released, and when the workload it joined is destroyed.
 pub const TTY_OPEN: u32 = 0x1B03;
 /// Pump a session (stdin/out/exit). Session id in `arg` (unchanged framing).
 pub const TTY_STEP: u32 = 0x1B04;
@@ -43,10 +49,16 @@ pub const TTY_CLOSE: u32 = 0x1B06;
 /// present, nothing after the last:
 /// ```text
 ///   [flags:u8]                    SRC_ISOLATED: own namespaces (needs
-///                                 privilege); SRC_ROOT_READ_ONLY: the root
-///                                 is read-only once the process starts
-///                                 (needs SRC_ISOLATED, else EINVAL); any
-///                                 other bit is EINVAL
+///                                 privilege) — set exactly when the
+///                                 header's posture is ISOLATED or
+///                                 HARDENED, else EINVAL;
+///                                 SRC_ROOT_READ_ONLY: the root is
+///                                 read-only once the process starts
+///                                 (needs SRC_ISOLATED, else EINVAL);
+///                                 SRC_CAP_ADD: the cap_add part follows
+///                                 the groups part; SRC_NO_SYSCALL_FILTER:
+///                                 no system-call filter. Any other bit is
+///                                 EINVAL
 ///   [rootfs_len:u16][rootfs]      the root to pivot into; empty = none
 ///   [argv_len:u16][argv]          NUL-separated tokens, at least one
 ///   [env_len:u16][env]            NUL-separated `NAME=VALUE`: the WHOLE
@@ -73,7 +85,67 @@ pub const TTY_CLOSE: u32 = 0x1B06;
 ///                                 runs them only when it already holds
 ///                                 them (strict: exactly that set;
 ///                                 `EACCES` otherwise)
+///   [cap_add_len:u16]             8; present only with SRC_CAP_ADD
+///     [cap_add:u64]               capabilities granted beyond the
+///                                 defaults, bit n = capability n
+///                                 (capabilities(7) numbering). A number
+///                                 past the host's last is EINVAL; one the
+///                                 runtime does not hold in both its
+///                                 permitted and bounding sets, EACCES
 /// ```
+/// Confinement: every process of the workload — its own, an [`EXEC`], a
+/// [`TTY_OPEN`] session — execs with `no_new_privs`, with these
+/// capabilities, and under the system-call filter:
+/// - The bounding set is cut to the granted set: the OCI default
+///   capabilities (CHOWN, DAC_OVERRIDE, FSETID, FOWNER, MKNOD, NET_RAW,
+///   SETGID, SETUID, SETFCAP, SETPCAP, NET_BIND_SERVICE, SYS_CHROOT, KILL,
+///   AUDIT_WRITE) and `cap_add`. A runtime without CAP_SETPCAP cannot cut it
+///   and leaves it whole; under `no_new_privs` that grants nothing beyond
+///   the sets below.
+/// - Running as uid 0, the process holds the granted set (as far as the
+///   runtime holds it) effective and permitted, nothing inheritable or
+///   ambient. Running as any other uid it holds `cap_add` only, in every
+///   set including ambient, so the added capabilities survive its exec;
+///   with no addition it holds none.
+/// - The system-call filter is an allowlist modelled on the OCI default
+///   profile: the architecture is checked first (a foreign one kills the
+///   process); a call off the list answers `EPERM`; `clone` and `unshare`
+///   are allowed without namespace flags only, `clone3` answers `ENOSYS`,
+///   `personality` takes the plain Linux personalities only, `socket` every
+///   family but `AF_VSOCK`; calls the profile ties to a capability (mount
+///   and namespace creation to SYS_ADMIN, `ptrace` relatives to SYS_PTRACE,
+///   the clock to SYS_TIME, and the rest) are allowed when it is granted.
+///   SRC_NO_SYSCALL_FILTER runs the workload without it. Where [`CAPS`]
+///   lacks [`caps::SYSCALL_FILTER`] no filter is installed.
+/// - At posture HARDENED, SRC_CAP_ADD with a non-zero `cap_add`, and
+///   SRC_NO_SYSCALL_FILTER, are EINVAL; a runtime that cannot cut the
+///   bounding set answers EPERM.
+///
+/// Lifetime: a workload does not outlive the runtime process (a thread of
+/// it ending is not the runtime ending). Each workload has an intermediate
+/// process between the runtime and its init, which relays the init's status
+/// exactly (an exit code as itself, a terminating signal as that signal).
+/// When the runtime is gone the intermediate kills the init. With ISOLATED
+/// the init is PID 1 of the workload's pid namespace, so every process in
+/// it ends with it. With SHARED the intermediate is a child subreaper: when
+/// the init ends — by itself, by SIGNAL or DESTROY, or with the runtime —
+/// every process the workload started that is still running is killed and
+/// reaped, whatever process group or session it moved to. An EXEC and a
+/// TTY session of an ISOLATED workload run inside its pid namespace, behind
+/// an intermediate of their own that relays their status the same way; both
+/// end with the runtime's dispatch thread.
+///
+/// Handle binding: READ, EXEC and TTY_OPEN take the workload fd under the
+/// `workload` contract's rule — a fd another owner's module created answers
+/// `EACCES`, unless the caller acts with the node's authority.
+///
+/// Devices (SRC_ISOLATED with a rootfs): the root and every volume are
+/// `nodev`, and `/dev` is the workload's own memory filesystem (mode 0755,
+/// nosuid, noexec, nodev) holding the host's null, zero, full, random,
+/// urandom and tty bound in, `pts` (a new devpts instance, ptmxmode 0666),
+/// `shm` (a memory filesystem of at most 64 MiB, or the workload's memory
+/// quota when that is smaller), and the links fd, stdin, stdout, stderr and
+/// ptmx.
 /// Read-only root: the root mount alone is made read-only, last — after
 /// the volumes, the fresh `/proc` and the working directory are in place —
 /// so a volume keeps its own access and a missing working directory is
@@ -94,6 +166,10 @@ pub const SRC_ISOLATED: u8 = 1 << 0;
 /// Source `flags` bit: the workload's root is read-only (with
 /// [`SRC_ISOLATED`] only).
 pub const SRC_ROOT_READ_ONLY: u8 = 1 << 1;
+/// Source `flags` bit: a `cap_add` part follows the groups part.
+pub const SRC_CAP_ADD: u8 = 1 << 2;
+/// Source `flags` bit: the workload runs without a system-call filter.
+pub const SRC_NO_SYSCALL_FILTER: u8 = 1 << 3;
 /// Source `groups_flags` bit: the listed groups and the primary only.
 pub const GROUPS_STRICT: u8 = 1 << 0;
 
@@ -111,6 +187,13 @@ pub mod caps {
     pub const GROUPS: u32 = 1 << 1;
     /// [`super::GROUPS_STRICT`] is honoured.
     pub const GROUPS_STRICT: u32 = 1 << 2;
+    /// [`super::SRC_CAP_ADD`] is honoured: the runtime holds CAP_SETPCAP,
+    /// so it shapes a workload's sets. An added capability the runtime
+    /// itself lacks is still `EACCES`.
+    pub const CAP_ADD: u32 = 1 << 3;
+    /// A workload runs under the default system-call filter, and
+    /// [`super::SRC_NO_SYSCALL_FILTER`] runs one without it.
+    pub const SYSCALL_FILTER: u32 = 1 << 4;
 }
 
 /// Host process-executor provider class (opcode class 0x16xx): a host-side

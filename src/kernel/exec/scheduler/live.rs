@@ -2247,6 +2247,24 @@ unsafe fn apply_add_encoded_inner(
     }
 }
 
+/// [`apply_add_encoded`] over a blob it reads in place and does not write:
+/// the owner's handle is returned rather than written back, so the blob may
+/// lie in read-only memory (a resident workload in the config image).
+/// `Err` is `-EINVAL` for a malformed blob, or the negative
+/// [`AddError::code`].
+///
+/// # Safety
+/// `bytes` stays valid and unchanged for the call: the modules' params are
+/// read from it as they instantiate.
+pub unsafe fn apply_add_borrowed(bytes: &[u8]) -> Result<OwnerHandle, i32> {
+    // SAFETY: the caller's contract; the add completes within this call.
+    match unsafe { decode_add(bytes, None, None, |sub| apply_add(sub, None)) } {
+        Ok(Ok(handle)) => Ok(handle),
+        Ok(Err(e)) => Err(e.code()),
+        Err(e) => Err(e),
+    }
+}
+
 /// Decode an encoded subgraph and stage it, for an add its caller finishes
 /// over several calls (see [`StagedAdd`]). `spare_lane` as for
 /// [`apply_add_encoded_spare_lane`]. `EINVAL` for a malformed blob, or the

@@ -13,10 +13,21 @@
 //! installs a slot ([`install_slot`]) and releases it when the owner is freed
 //! ([`release_slot`]), so a node with a thousand owner slots and ten
 //! workloads holds ten 64 KiB rings, not a thousand. Slot 0 (system) has a
-//! ring from its first record. A released ring whose records the platform
-//! has not yet written to its file waits, retired, for that flush
-//! ([`reap_retired`]) when a flusher is registered ([`set_flusher`]), and is
-//! freed at once otherwise.
+//! ring from its first record.
+//!
+//! **Release.** When a flusher is registered ([`set_flusher`]), a released
+//! ring is **detached** from its slot at once: it leaves the slot table for
+//! a list of rings awaiting their last flush, keeping its records, its
+//! `(uid, generation)` and the slot it served. The slot is empty from the
+//! release on, so a new owner that takes it starts a ring of its own, and
+//! the freed owner's pending records cannot be overwritten by it. The
+//! platform's flush writes each detached ring to its file and frees it
+//! ([`flush_detached`]). A reinstall of the same `(uid, generation)` on the
+//! same slot before that flush — a rebuild that seats the owner again —
+//! reattaches the ring, so its `seq` carries on. Without a flusher a released
+//! ring is freed at once. The list is bounded by the owner table's size: a
+//! release that finds it full drops its oldest ring, counted
+//! ([`detached_dropped`]).
 //!
 //! **Single-writer discipline.** [`push_on_slot`] and [`install_slot`] run on
 //! the scheduler thread only. Off-step emitters route their records through a
@@ -50,8 +61,6 @@ struct Ring {
     state: RingState,
     buf: Box<[u8]>,
     installed: ([u8; 16], u32),
-    /// Its owner was freed; the ring waits for its last flush.
-    retired: bool,
 }
 
 impl Ring {
@@ -60,9 +69,50 @@ impl Ring {
             state: RingState::new(CAP),
             buf: alloc::vec![0u8; CAP].into_boxed_slice(),
             installed: (uid, generation),
-            retired: false,
         }
     }
+}
+
+/// A released owner's ring awaiting its last flush, with the slot it served.
+struct Detached {
+    slot: usize,
+    ring: Box<Ring>,
+}
+
+/// Released rings awaiting their last flush, oldest first. Scheduler thread
+/// only, like the slot table.
+static mut DETACHED: Vec<Detached> = Vec::new();
+
+/// Detached rings dropped unflushed because the list was full.
+static mut DETACHED_DROPPED: u64 = 0;
+
+fn detached() -> &'static mut Vec<Detached> {
+    // SAFETY: scheduler-thread single-writer state, reached through a raw
+    // pointer, never a `&mut STATIC` formed twice at once.
+    unsafe { &mut *core::ptr::addr_of_mut!(DETACHED) }
+}
+
+/// Move `ring`, released from `slot`, to the list awaiting its flush.
+fn detach(slot: usize, ring: Box<Ring>) {
+    let list = detached();
+    // One pending ring per owner slot the table holds, the system's aside:
+    // more is a flusher that has stopped writing.
+    if !list.is_empty() && list.len() >= slots().max(1) {
+        list.remove(0);
+        // SAFETY: scheduler-thread state.
+        unsafe { DETACHED_DROPPED += 1 };
+    }
+    list.push(Detached { slot, ring });
+}
+
+/// The released ring of `(slot, uid, generation)` awaiting its flush, taken
+/// back off the list.
+fn reattach(slot: usize, uid: [u8; 16], generation: u32) -> Option<Box<Ring>> {
+    let list = detached();
+    let i = list
+        .iter()
+        .position(|d| d.slot == slot && d.ring.installed == (uid, generation))?;
+    Some(list.remove(i).ring)
 }
 
 /// The ring of every owner slot, `None` while the slot has no owner.
@@ -72,7 +122,7 @@ static mut RINGS: Table<Option<Box<Ring>>, MAX_OWNERS> = crate::boot_table!(
     crate::abi::contracts::resource::POOL_OWNERS
 );
 
-/// A platform flushes retired rings to their files ([`set_flusher`]).
+/// A platform flushes released rings to their files ([`set_flusher`]).
 static FLUSHER: AtomicBool = AtomicBool::new(false);
 
 fn rings() -> &'static mut Table<Option<Box<Ring>>, MAX_OWNERS> {
@@ -101,13 +151,25 @@ pub fn slots() -> usize {
     rings().len()
 }
 
-/// Rings held: one per live owner, plus retired ones awaiting their flush.
+/// Rings held: one per live owner, plus detached ones awaiting their flush.
 pub fn rings_held() -> usize {
-    rings().iter().filter(|r| r.is_some()).count()
+    rings().iter().filter(|r| r.is_some()).count() + detached().len()
 }
 
-/// A platform will write retired rings to their files and then
-/// [`reap_retired`] them. Without one a released ring is freed at once.
+/// Released rings awaiting their last flush.
+pub fn detached_count() -> usize {
+    detached().len()
+}
+
+/// Released rings dropped unflushed because the list awaiting the flush was
+/// full.
+pub fn detached_dropped() -> u64 {
+    // SAFETY: scheduler-thread state.
+    unsafe { DETACHED_DROPPED }
+}
+
+/// A platform will write released rings to their files
+/// ([`flush_detached`]). Without one a released ring is freed at once.
 pub fn set_flusher(on: bool) {
     FLUSHER.store(on, Ordering::Relaxed);
 }
@@ -122,47 +184,76 @@ pub fn install_slot(slot: usize, uid: [u8; 16], generation: u32) {
         return;
     };
     match entry {
-        Some(r) if r.installed == (uid, generation) => r.retired = false,
+        Some(r) if r.installed == (uid, generation) => {}
+        Some(_) if FLUSHER.load(Ordering::Relaxed) => {
+            // A new tenant over a ring its predecessor never released: the
+            // predecessor's records wait for their flush, detached, and the
+            // new tenant starts its own.
+            if let Some(old) = entry.take() {
+                detach(slot, old);
+            }
+            *entry = Some(Box::new(Ring::new(uid, generation)));
+        }
         Some(r) => {
-            // A new tenant: fresh state over the same bytes. They need no
-            // zeroing: a fresh RingState reports `used` 0, so stale bytes are
-            // never read.
+            // A new tenant, no flusher to keep the old records for: fresh
+            // state over the same bytes. They need no zeroing: a fresh
+            // RingState reports `used` 0, so stale bytes are never read.
             r.state = RingState::new(CAP);
             r.installed = (uid, generation);
-            r.retired = false;
         }
-        None => *entry = Some(Box::new(Ring::new(uid, generation))),
+        None => {
+            *entry = Some(
+                reattach(slot, uid, generation)
+                    .unwrap_or_else(|| Box::new(Ring::new(uid, generation))),
+            )
+        }
     }
 }
 
-/// `slot`'s owner was freed: its ring goes — at once, or after the
-/// platform's next flush of it when a flusher is registered. Scheduler
-/// thread only.
+/// `slot`'s owner was freed: its ring leaves the slot now. With a flusher
+/// registered it is detached and waits for its last flush
+/// ([`flush_detached`]); without one it is freed. Either way the slot is
+/// empty when this returns, so a new owner seated there cannot touch the
+/// freed owner's records. Scheduler thread only.
 pub fn release_slot(slot: usize) {
     let Some(entry) = rings().get_mut(slot) else {
         return;
     };
+    let Some(r) = entry.take() else {
+        return;
+    };
     if FLUSHER.load(Ordering::Relaxed) {
-        if let Some(r) = entry.as_deref_mut() {
-            r.retired = true;
-        }
-    } else {
-        *entry = None;
+        detach(slot, r);
     }
 }
 
-/// Whether `slot`'s ring belongs to a freed owner and waits for its flush.
-pub fn is_retired(slot: usize) -> bool {
-    ring(slot).is_some_and(|r| r.retired)
+/// One released ring as the platform's flush writes it: the slot it served,
+/// its owner's identity, the `seq` its next record would have taken, and its
+/// persisted header and raw bytes.
+pub struct DetachedRing<'a> {
+    pub slot: usize,
+    pub uid: [u8; 16],
+    pub generation: u32,
+    pub next_seq: u64,
+    pub header: RingHeader,
+    pub bytes: &'a [u8],
 }
 
-/// Free `slot`'s ring if it is retired: the platform has written it.
-pub fn reap_retired(slot: usize) {
-    if let Some(entry) = rings().get_mut(slot) {
-        if entry.as_ref().is_some_and(|r| r.retired) {
-            *entry = None;
-        }
-    }
+/// Offer each released ring to `write`, oldest first; a ring `write` returns
+/// `true` for has been written and is freed, one it returns `false` for stays
+/// for the next flush. Scheduler thread only.
+pub fn flush_detached(mut write: impl FnMut(&DetachedRing<'_>) -> bool) {
+    detached().retain(|d| {
+        let view = DetachedRing {
+            slot: d.slot,
+            uid: d.ring.installed.0,
+            generation: d.ring.installed.1,
+            next_seq: d.ring.state.next_seq(),
+            header: d.ring.state.header(),
+            bytes: &d.ring.buf,
+        };
+        !write(&view)
+    });
 }
 
 /// Append one attributed record to `slot`'s ring, assigning it the ring's next

@@ -51,8 +51,16 @@ pub const CAPS: u32 = 0x2001;
 pub const SEGMENTS: u32 = 0x2002;
 
 /// Replace the peer-route table, whole and atomically. handle=-1, arg =
-/// `[count:u16][route]×count` ([`peer`]). Returns 0, `EINVAL`, `ENOSPC`
-/// (past capacity), `EBUSY` (another writer) or `EAGAIN`, as [`SEGMENTS`].
+/// `[count:u16][route]×count` ([`peer`]). Returns 0, `EINVAL` (malformed, or
+/// a default route: a prefix of length 0), `ENOSPC` (past capacity), `EBUSY`
+/// (another writer) or `EAGAIN`, as [`SEGMENTS`].
+///
+/// A peer route never takes the node's own uplink: a route whose prefix
+/// overlaps the connected prefix of an address the node holds on an uplink
+/// (contains it, or lies inside it) is not realized and reads
+/// `refused(conflict)` for as long as the overlap stands — re-evaluated when
+/// the uplink's addresses change — so a mistaken route cannot black-hole the
+/// node's own link or its neighbours on it.
 pub const ROUTES: u32 = 0x2003;
 
 /// Replace the held-address table, whole. handle=-1, arg =
@@ -205,7 +213,8 @@ pub mod reason {
     pub const HOST_FORWARD_DROP: u8 = 3;
     /// A host table it needs is full.
     pub const TABLE_FULL: u8 = 4;
-    /// Another runtime on the host holds an overlapping prefix or address.
+    /// Another runtime on the host holds an overlapping prefix or address,
+    /// or (a peer route) the prefix overlaps the node's own uplink.
     pub const CONFLICT: u8 = 5;
     /// The provider cannot realize it here.
     pub const UNSUPPORTED: u8 = 6;
@@ -233,6 +242,17 @@ impl Prefix {
         } else {
             32
         }
+    }
+
+    /// Whether the two prefixes share an address: one of the same family
+    /// contains the other's network.
+    pub fn overlaps(&self, o: &Prefix) -> bool {
+        self.family == o.family
+            && if self.len <= o.len {
+                self.contains(o.family, &o.addr)
+            } else {
+                o.contains(self.family, &self.addr)
+            }
     }
 
     /// Whether `addr` (of the same family) lies inside the prefix.

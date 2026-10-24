@@ -36,6 +36,16 @@ The allocator runs inside the kernel, called through SyscallTable function
 pointers. Each module's heap is independent. Its memory comes from
 STATE_ARENA in one of two ways.
 
+The heaps' bookkeeping — each module's segments, counters and policy flags —
+is kernel memory, one record per module slot in `MODULE_HEAPS`. That is a
+per-module kernel table (`kernel::mem::table`) like the scheduler's own:
+sized at boot from the plan's `module_slots` ceiling, and committed and grown
+together with the scheduler's per-module tables, at boot and when a live add
+needs a slot, so it always holds exactly the module slots they hold. Every
+heap entry point looks the record up through the table's committed slots: an
+index past them reaches no heap, and is answered as for a module without one
+(a null allocation, a no-op free, zeroed statistics).
+
 ### Committed and elastic heaps
 
 A heap has a **cap**: the most it may hold. How the cap is backed depends on

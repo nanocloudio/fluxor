@@ -43,10 +43,17 @@
 //! parent, so a symlink planted under the root is refused (`EINVAL`) rather
 //! than followed out of it, and a mount lands on the descriptor just opened
 //! (`/proc/self/fd`), not on a path that could be swapped after the check.
-//! An unmount verifies the same walk, then unmounts the resolved path with
-//! `UMOUNT_NOFOLLOW`; a party able to rewrite directories inside the root
-//! between that walk and the call can still race it, which is why the root
-//! must not be writable by untrusted users.
+//! An unmount holds the walked parent and identifies the mount at the leaf
+//! by its id (`statx` through the parent, no symlink followed); the mount
+//! with that id must sit at exactly that directory and be one `MOUNT` makes
+//! (a block device's filesystem, `nodev`, `nosuid`). The id is read again
+//! and the unmount names the leaf through the held parent
+//! (`/proc/self/fd/<parent>/<leaf>`, `UMOUNT_NOFOLLOW`), so no directory
+//! above it can be swapped. The kernel has no unmount by descriptor or id:
+//! a party able to rename entries inside the parent directory between the
+//! second read and the call could still put another mount of the same
+//! kind there, which is why the root must not be writable by untrusted
+//! users.
 //!
 //! # Projections, removal, group ownership and directory modes
 //!
@@ -60,7 +67,11 @@
 //! so what is made inside inherits the group).
 //! A memory-backed projection mounts a `tmpfs` there once, named
 //! [`PROJECTION_SOURCE`] in the mount table so it is known again after a
-//! restart.
+//! restart, and bounded: the size the request states, or
+//! [`PROJECTION_MEMORY_DEFAULT`] (what the entries need when that is more),
+//! at most [`PROJECTION_MEMORY_MAX`], and a file count to match. A later
+//! projection grows the bound by its own for the swap and sets it back to
+//! its own after.
 //!
 //! `MKDIR_MODE` makes a directory by the same walk and gives it an exact
 //! mode through the descriptor the walk opened, whatever the umask.
@@ -72,7 +83,10 @@
 //! is read first as well, since a bind mount from the same filesystem shares
 //! its device number: `REMOVE_TREE` refuses (`EBUSY`) any mount inside that
 //! a projection did not make, before removing anything, and `GROUP_TREE`
-//! leaves every inner mount alone.
+//! leaves every inner mount alone. `REMOVE_TREE` then unmounts each
+//! projection mount as `UMOUNT` unmounts a volume: reached from the held
+//! parent through no symlink, identified by its mount id, and removed only
+//! while that id is a projection's memory filesystem at exactly that path.
 
 use crate::abi::platform::linux::host_mount as hm;
 use crate::kernel::sys::errno;
@@ -104,6 +118,13 @@ pub const MAX_JOBS: usize = 16;
 pub const MAX_JOBS_PER_CALLER: usize = 4;
 /// How long a finished job's answer waits to be collected.
 pub const RESULT_TTL: Duration = Duration::from_secs(30);
+/// The bytes a memory-backed projection's filesystem may hold when the
+/// request states no size (`P_SIZE`), or what its entries need when that is
+/// more.
+pub const PROJECTION_MEMORY_DEFAULT: u64 = 64 << 20;
+/// The most a memory-backed projection's filesystem may hold, stated or
+/// needed: a larger one is `E2BIG`.
+pub const PROJECTION_MEMORY_MAX: u64 = 1 << 30;
 
 /// Work started off the scheduler thread; its value is the answer.
 pub type Work = Box<dyn FnOnce() -> i32 + Send>;
@@ -629,26 +650,162 @@ fn check_mount(arg: &[u8]) -> Result<Work, i32> {
     }))
 }
 
+/// What `statx` says of `name` in `dir` (of `dir` itself for `None`) —
+/// its type and the id of the mount it is on — without following a symlink
+/// or triggering an automount. `None` when there is nothing by that name;
+/// `ENOSYS` on a kernel that reports no mount id (before 5.8).
+fn statx_at(dir: &OwnedFd, name: Option<&CString>) -> Result<Option<libc::statx>, i32> {
+    let mut stx = core::mem::MaybeUninit::<libc::statx>::zeroed();
+    let (path, flags) = match name {
+        Some(n) => (
+            n.as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW | libc::AT_NO_AUTOMOUNT,
+        ),
+        None => (c"".as_ptr(), libc::AT_EMPTY_PATH | libc::AT_NO_AUTOMOUNT),
+    };
+    // SAFETY: `dir` is open, `path` NUL-terminated, `stx` written on success.
+    let rc = unsafe {
+        libc::statx(
+            dir.as_raw_fd(),
+            path,
+            flags,
+            libc::STATX_TYPE | libc::STATX_MNT_ID,
+            stx.as_mut_ptr(),
+        )
+    };
+    if rc != 0 {
+        let e = last_errno();
+        return if e == -libc::ENOENT { Ok(None) } else { Err(e) };
+    }
+    // SAFETY: written by the successful call above.
+    let stx = unsafe { stx.assume_init() };
+    if stx.stx_mask & libc::STATX_MNT_ID == 0 {
+        return Err(errno::ENOSYS);
+    }
+    Ok(Some(stx))
+}
+
+/// A mount as `/proc/self/mountinfo` lists it by its id.
+#[doc(hidden)]
+#[derive(Debug, PartialEq, Eq)]
+pub struct MountRow {
+    pub path: PathBuf,
+    /// Device number of the mounted filesystem, `(major, minor)`.
+    pub dev: (u32, u32),
+    /// The per-mount options carry both `nodev` and `nosuid`.
+    pub nodev_nosuid: bool,
+    pub fstype: String,
+    pub source: String,
+}
+
+impl MountRow {
+    /// Whether `MOUNT` makes a mount like this one: a filesystem on a block
+    /// device (a memory filesystem has major 0), `nodev` and `nosuid`.
+    pub fn is_volume(&self) -> bool {
+        self.dev.0 != 0 && self.nodev_nosuid
+    }
+
+    /// Whether `PROJECT` makes a mount like this one: its memory
+    /// filesystem, named [`PROJECTION_SOURCE`], `nodev` and `nosuid`.
+    pub fn is_projection(&self) -> bool {
+        self.fstype == "tmpfs" && self.source == PROJECTION_SOURCE && self.nodev_nosuid
+    }
+}
+
+/// The mount whose id is `id` in `info` (the text of
+/// `/proc/self/mountinfo`), the id `statx` reports as `stx_mnt_id`.
+#[doc(hidden)]
+pub fn mount_with_id(info: &str, id: u64) -> Option<MountRow> {
+    info.lines().find_map(|l| {
+        let f: Vec<&str> = l.split(' ').collect();
+        if f.len() < 7 || f[0].parse::<u64>().ok()? != id {
+            return None;
+        }
+        let (maj, min) = f[2].split_once(':')?;
+        let opts: Vec<&str> = f[5].split(',').collect();
+        let sep = f.iter().skip(6).position(|t| *t == "-")? + 6;
+        Some(MountRow {
+            path: PathBuf::from(std::ffi::OsString::from_vec(unescape(f[4]))),
+            dev: (maj.parse().ok()?, min.parse().ok()?),
+            nodev_nosuid: opts.contains(&"nodev") && opts.contains(&"nosuid"),
+            fstype: f.get(sep + 1)?.to_string(),
+            source: String::from_utf8_lossy(&unescape(f.get(sep + 2)?)).into_owned(),
+        })
+    })
+}
+
+/// Unmount the mount at `leaf` in the held directory `parent`, whose path is
+/// `target`, if `accept` says it is one this provider may remove. What is
+/// mounted there is identified, not looked up: its mount id is read through
+/// `parent` (`statx`, no symlink followed); the mount with that id must sit
+/// at exactly `target` and pass `accept`, else `EBUSY`; the id is read
+/// again; and the unmount names the leaf through the held parent
+/// (`/proc/self/fd/<parent>/<leaf>`, `UMOUNT_NOFOLLOW`). `Ok(true)` when it
+/// unmounted, `Ok(false)` when nothing is mounted there; `EINVAL` for a
+/// symlink leaf, `ENOTDIR` for one that is no directory.
+fn umount_verified(
+    parent: &OwnedFd,
+    leaf: &CString,
+    target: &Path,
+    accept: fn(&MountRow) -> bool,
+) -> Result<bool, i32> {
+    let mounted = || -> Result<Option<u64>, i32> {
+        let Some(at) = statx_at(parent, Some(leaf))? else {
+            return Ok(None);
+        };
+        match u32::from(at.stx_mode) & libc::S_IFMT {
+            libc::S_IFLNK => return Err(errno::EINVAL),
+            libc::S_IFDIR => {}
+            _ => return Err(-libc::ENOTDIR),
+        }
+        let own = statx_at(parent, None)?.ok_or(-libc::ENOENT)?;
+        Ok((at.stx_mnt_id != own.stx_mnt_id).then_some(at.stx_mnt_id))
+    };
+    let Some(id) = mounted()? else {
+        return Ok(false);
+    };
+    let info = std::fs::read_to_string("/proc/self/mountinfo").map_err(|e| os_errno(&e))?;
+    match mount_with_id(&info, id) {
+        Some(row) if row.path == target && accept(&row) => {}
+        Some(_) => return Err(-libc::EBUSY),
+        None => return Ok(false),
+    }
+    let dst = CString::new(format!(
+        "/proc/self/fd/{}/{}",
+        parent.as_raw_fd(),
+        leaf.to_string_lossy()
+    ))
+    .map_err(|_| errno::EINVAL)?;
+    match mounted()? {
+        Some(again) if again == id => {}
+        None => return Ok(false),
+        Some(_) => return Err(-libc::EBUSY),
+    }
+    // SAFETY: a NUL-terminated string owned here.
+    if unsafe { libc::umount2(dst.as_ptr(), libc::UMOUNT_NOFOLLOW) } != 0 {
+        return Err(last_errno());
+    }
+    Ok(true)
+}
+
 /// Check an `UMOUNT` request; `Ok` is the unmount itself. Nothing mounted
 /// there (or no such directory) is the answer 0.
+///
+/// The target is never looked up by its path from the root: its parent is
+/// walked and held (the parent, not the target: a descriptor on the mounted
+/// filesystem would itself make the unmount `EBUSY`), and the mount is
+/// removed by [`umount_verified`] only when it is one `MOUNT` makes (a block
+/// device's filesystem, `nodev`, `nosuid`).
 fn check_umount(arg: &[u8]) -> Result<Work, i32> {
     let mut rel = components(&resolve(arg)?);
     let leaf = rel.pop().ok_or(errno::EINVAL)?;
     let leaf = CString::new(leaf.as_bytes()).map_err(|_| errno::EINVAL)?;
     Ok(Box::new(move || {
-        // The parent is held open, not the target: an open descriptor on the
-        // mounted filesystem would itself make the unmount `EBUSY`.
         let parent = match walk(&rel, false, 0) {
             Ok(Some(fd)) => fd,
             Ok(None) => return 0,
             Err(e) => return e,
         };
-        // Refuses a symlink leaf; releases the descriptor at once.
-        match open_dir_at(parent.as_raw_fd(), &leaf) {
-            Ok(Some(_)) => {}
-            Ok(None) => return 0,
-            Err(e) => return e,
-        }
         let target = match fd_target(&parent) {
             Ok(p) => p.join(std::ffi::OsStr::from_bytes(leaf.as_bytes())),
             Err(e) => return e,
@@ -656,17 +813,10 @@ fn check_umount(arg: &[u8]) -> Result<Work, i32> {
         let Some(_claim) = TargetClaim::take(&target) else {
             return -libc::EBUSY;
         };
-        if mounted_at(&target).is_none() {
-            return 0;
-        }
-        let Ok(dst) = cstr(&target) else {
-            return errno::EINVAL;
-        };
-        // SAFETY: a NUL-terminated string owned by this closure.
-        if unsafe { libc::umount2(dst.as_ptr(), libc::UMOUNT_NOFOLLOW) } != 0 {
-            last_errno()
-        } else {
-            1
+        match umount_verified(&parent, &leaf, &target, MountRow::is_volume) {
+            Ok(true) => 1,
+            Ok(false) => 0,
+            Err(e) => e,
         }
     }))
 }
@@ -1032,6 +1182,8 @@ struct Projection {
     memory: bool,
     read_only: bool,
     entries: Vec<Entry>,
+    /// The bytes and files its memory filesystem holds ([`memory_bound`]).
+    bound: (u64, u64),
 }
 
 fn parse_project(arg: &[u8]) -> Result<Projection, i32> {
@@ -1043,7 +1195,9 @@ fn parse_project(arg: &[u8]) -> Result<Projection, i32> {
         g => Some(g),
     };
     let flags = r.u8()?;
-    if flags & !(hm::P_MEMORY | hm::P_READ_ONLY) != 0 {
+    if flags & !(hm::P_MEMORY | hm::P_READ_ONLY | hm::P_SIZE) != 0
+        || (flags & hm::P_SIZE != 0 && flags & hm::P_MEMORY == 0)
+    {
         return Err(errno::EINVAL);
     }
     let count = r.u16()? as usize;
@@ -1059,16 +1213,123 @@ fn parse_project(arg: &[u8]) -> Result<Projection, i32> {
         }
         entries.push(Entry { path, mode, data });
     }
+    let size = if flags & hm::P_SIZE != 0 {
+        let b: [u8; 8] = r.take(8)?.try_into().map_err(|_| errno::EINVAL)?;
+        Some(u64::from_le_bytes(b))
+    } else {
+        None
+    };
     if !r.done() {
         return Err(errno::EINVAL);
     }
+    let memory = flags & hm::P_MEMORY != 0;
+    let bound = if memory {
+        memory_bound(&entries, size)?
+    } else {
+        (0, 0)
+    };
     Ok(Projection {
         rel,
         group,
-        memory: flags & hm::P_MEMORY != 0,
+        memory,
         read_only: flags & hm::P_READ_ONLY != 0,
         entries,
+        bound,
     })
+}
+
+/// The page size every memory filesystem counts in.
+fn page() -> u64 {
+    // SAFETY: a query with no side effect.
+    let p = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if p > 0 {
+        p as u64
+    } else {
+        4096
+    }
+}
+
+/// What a memory-backed projection's filesystem needs to hold `entries`:
+/// `(bytes, files)` — every file's bytes in whole pages, a page for each
+/// entry and for the projection's own names (a long link takes one), and a
+/// file for each entry, each directory, each top-level link and the
+/// projection's own names.
+#[doc(hidden)]
+pub fn memory_need(entries: &[(Vec<Vec<u8>>, u64)]) -> (u64, u64) {
+    let page = page();
+    let mut bytes = page * (entries.len() as u64 + 4);
+    let mut dirs: HashSet<Vec<Vec<u8>>> = HashSet::new();
+    let mut tops: HashSet<&[u8]> = HashSet::new();
+    for (path, len) in entries {
+        bytes += len.div_ceil(page) * page;
+        for k in 1..path.len() {
+            dirs.insert(path[..k].to_vec());
+        }
+        if let Some(t) = path.first() {
+            tops.insert(t);
+        }
+    }
+    let files = entries.len() as u64 + dirs.len() as u64 + tops.len() as u64 + 4;
+    (bytes, files)
+}
+
+/// The bound of a memory-backed projection's filesystem: `(bytes, files)`.
+/// `size` when stated (`ENOSPC` when the entries need more), else
+/// [`PROJECTION_MEMORY_DEFAULT`] or what the entries need when that is more;
+/// either way at most [`PROJECTION_MEMORY_MAX`] (`E2BIG`). The files are what
+/// the entries need and one per page of room.
+fn memory_bound(entries: &[Entry], size: Option<u64>) -> Result<(u64, u64), i32> {
+    let listed: Vec<(Vec<Vec<u8>>, u64)> = entries
+        .iter()
+        .map(|e| (e.path.clone(), e.data.len() as u64))
+        .collect();
+    let (need, files) = memory_need(&listed);
+    let bytes = match size {
+        Some(s) if s > PROJECTION_MEMORY_MAX => return Err(-libc::E2BIG),
+        Some(s) if s < need => return Err(-libc::ENOSPC),
+        Some(s) => s,
+        None => need.max(PROJECTION_MEMORY_DEFAULT),
+    };
+    if bytes > PROJECTION_MEMORY_MAX {
+        return Err(-libc::E2BIG);
+    }
+    Ok((bytes, files + bytes / page()))
+}
+
+/// What the memory filesystem at `dir` holds now: `(bytes, files)`.
+fn memory_used(dir: &OwnedFd) -> Result<(u64, u64), i32> {
+    let mut st = core::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: `dir` is open; `st` is written on success.
+    if unsafe { libc::fstatvfs(dir.as_raw_fd(), st.as_mut_ptr()) } != 0 {
+        return Err(last_errno());
+    }
+    // SAFETY: written by the successful call above.
+    let st = unsafe { st.assume_init() };
+    let bytes = st.f_blocks.saturating_sub(st.f_bfree) * st.f_frsize;
+    let files = st.f_files.saturating_sub(st.f_ffree);
+    Ok((bytes, files))
+}
+
+/// Set the bound of the memory filesystem whose root is `dir`, in place.
+fn memory_resize(dir: &OwnedFd, (bytes, files): (u64, u64)) -> Result<(), i32> {
+    let at =
+        CString::new(format!("/proc/self/fd/{}", dir.as_raw_fd())).map_err(|_| errno::EINVAL)?;
+    let opts =
+        CString::new(format!("size={bytes},nr_inodes={files}")).map_err(|_| errno::EINVAL)?;
+    // SAFETY: NUL-terminated strings owned here.
+    let rc = unsafe {
+        libc::mount(
+            core::ptr::null(),
+            at.as_ptr(),
+            core::ptr::null(),
+            libc::MS_REMOUNT | libc::MS_NOSUID | libc::MS_NODEV,
+            opts.as_ptr().cast(),
+        )
+    };
+    if rc != 0 {
+        return Err(last_errno());
+    }
+    Ok(())
 }
 
 /// Check a `PROJECT` request; `Ok` is the projection itself.
@@ -1091,12 +1352,22 @@ fn project(p: &Projection) -> Result<(), i32> {
             .into_iter()
             .rfind(|m| m.path == target);
         match here {
-            Some(m) if m.is_projection() => {}
+            // Room for the one it holds and the new one while the swap
+            // runs; cut back to the new one's bound once it is done.
+            Some(m) if m.is_projection() => {
+                let (b, f) = memory_used(&dir)?;
+                memory_resize(&dir, (b + p.bound.0, f + p.bound.1))?;
+            }
             Some(_) => return Err(-libc::EBUSY),
             None => {
                 let dst = CString::new(format!("/proc/self/fd/{}", dir.as_raw_fd()))
                     .map_err(|_| errno::EINVAL)?;
                 let src = c_name(PROJECTION_SOURCE.as_bytes())?;
+                let opts = CString::new(format!(
+                    "mode=0755,size={},nr_inodes={}",
+                    p.bound.0, p.bound.1
+                ))
+                .map_err(|_| errno::EINVAL)?;
                 // SAFETY: NUL-terminated strings owned here.
                 let rc = unsafe {
                     libc::mount(
@@ -1104,7 +1375,7 @@ fn project(p: &Projection) -> Result<(), i32> {
                         dst.as_ptr(),
                         c"tmpfs".as_ptr(),
                         libc::MS_NOSUID | libc::MS_NODEV,
-                        c"mode=0755".as_ptr().cast(),
+                        opts.as_ptr().cast(),
                     )
                 };
                 if rc != 0 {
@@ -1206,6 +1477,11 @@ fn project(p: &Projection) -> Result<(), i32> {
         } else if is_dir(&st) && b.starts_with(b"..") {
             remove_dir_at(&dir, &name)?;
         }
+    }
+    // The bound is the new projection's again. What a workload wrote into a
+    // writable projection past it keeps the room the swap had.
+    if p.memory {
+        let _ = memory_resize(&dir, p.bound);
     }
     Ok(())
 }
@@ -1320,14 +1596,34 @@ fn remove_tree(rel: &[std::ffi::OsString], leaf: &CString) -> Result<(), i32> {
     if mounts.iter().any(|m| !m.is_projection()) {
         return Err(-libc::EBUSY);
     }
-    // Deepest first, the later of two stacked mounts first.
+    // Deepest first, the later of two stacked mounts first. Each is reached
+    // from the held parent through no symlink and removed by its id, as
+    // UMOUNT removes a volume, and only while it is a projection's.
     mounts.reverse();
     mounts.sort_by_key(|m| core::cmp::Reverse(m.path.components().count()));
     for m in &mounts {
-        let path = cstr(&m.path)?;
-        // SAFETY: a NUL-terminated path.
-        if unsafe { libc::umount2(path.as_ptr(), libc::UMOUNT_NOFOLLOW) } != 0 {
-            return Err(last_errno());
+        let inside = components(m.path.strip_prefix(&target).map_err(|_| errno::EINVAL)?);
+        let Some((last, between)) = inside.split_last() else {
+            umount_verified(&parent, leaf, &m.path, MountRow::is_projection)?;
+            continue;
+        };
+        let Some(mut dir) = open_dir_at(parent.as_raw_fd(), leaf)? else {
+            return Ok(());
+        };
+        let mut gone = false;
+        for c in between {
+            let name = CString::new(c.as_bytes()).map_err(|_| errno::EINVAL)?;
+            match open_dir_at(dir.as_raw_fd(), &name)? {
+                Some(next) => dir = next,
+                None => {
+                    gone = true;
+                    break;
+                }
+            }
+        }
+        if !gone {
+            let name = CString::new(last.as_bytes()).map_err(|_| errno::EINVAL)?;
+            umount_verified(&dir, &name, &m.path, MountRow::is_projection)?;
         }
     }
     let dir = match open_dir_at(parent.as_raw_fd(), leaf)? {

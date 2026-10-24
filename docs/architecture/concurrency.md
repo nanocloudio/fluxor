@@ -50,6 +50,30 @@ module heap grows (`kernel::mem::heap`). Its bookkeeping (`STATE_ARENA_OFFSET`,
 `FREE_LIST`, `FREE_COUNT`) is therefore serialised by `STATE_LOCK`, held only
 over the bounded bookkeeping and never while the carved bytes are zeroed.
 
+The boot-sized kernel tables (`src/kernel/mem/table.rs`) move to a larger
+block only while a graph is prepared, and on bcm2712 the block a table moves
+out of goes straight back to the carve zone for the next carve. Nothing can
+still read it: the move runs on core 0, at boot before the secondaries run
+or for a rebuild with every non-primary domain parked at its tick boundary
+(holding no slice of any table); the interrupts that read a table, a device
+IRQ signalling its event, are delivered to core 0 and so finish before the
+move continues; and `prepare_graph` closes ISR-tier dispatch first
+(`isr_tier::close_dispatch`), waiting out any Tier 1b or Tier 2 handler in
+flight on another core, so no ISR-tier module reaches a table through a
+syscall's admission check until the new graph registers it. A table a lock
+guards (the net-attach lane tables) moves under that lock.
+
+The hosted runtime frees a moved block to the host's allocator at once, for
+a simpler reason: it reads its tables from one thread. The scheduler, every
+module step and every call a module makes run on the main thread, which takes
+a rebuild between passes. The runtime's other threads — the process
+executor's and the CLI's pipe pumps, the `host_mount` workers, the resolver,
+GPU and display threads, the `net_route` prober and announcer, the audio
+callback — exchange with the scheduler through bridges, channels and their
+own locked state, never a kernel table; their log records reach the owner
+attribution tee, which reads the module owner table only on the scheduler
+thread. The stop-signal handler touches atomics only.
+
 ### Per-core-sliced — steady state, no byte shared
 
 Some state is touched on every step but is sliced by core or by module
@@ -58,7 +82,9 @@ so two cores never touch the same byte:
 - `MODULE_HEAPS[i]` (`src/kernel/mem/heap.rs`) — module *i*'s heap.
   Module *i* only steps on its assigned core, so each heap sees a
   single writer. Growing it carves from the shared state arena under
-  `STATE_LOCK`.
+  `STATE_LOCK`. The table itself is a per-module boot-sized table:
+  each record sits in a cell, so every access borrows the table shared,
+  and the table moves only while a graph is prepared.
 - `FAN_BUFS[d]` (`src/kernel/exec/scheduler/module_types.rs`) —
   per-domain scratch for tee / merge. Tee and merge inherit their fan
   group's `domain_id`; a domain runs on exactly one core, so

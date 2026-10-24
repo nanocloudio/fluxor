@@ -28,6 +28,35 @@
 //! What the record proves is bytes and wiring. It does not prove that the
 //! closure is correct, authorised or intended; that is a statement about
 //! policy, made above this surface.
+//!
+//! **Listed blobs.** The blob list is every blob the loader table holds, an
+//! instance running it or not, and only a blob an instance runs has passed
+//! `loader::validate_module` (integrity, signature where present, and an
+//! ABI-surface attestation equal to this kernel's). Listing an unvalidated
+//! blob exposes nothing, because no path runs a listed blob's code without
+//! that validation:
+//!
+//! - Every instantiation from the node's loader, at boot and in a live add
+//!   (`live::instantiate_pic`), goes through `instantiate_one_module`, which
+//!   validates before any export of the module runs, and `start_new`
+//!   validates again before its init.
+//! - A workload's code pack is admitted through `code_pack::admitted_with`,
+//!   which validates every pack module before its region is sealed
+//!   executable.
+//! - What else reads a listed blob reads bytes, never code: this record and
+//!   the node's module digests (`code_pack::node_digests`) hash the table
+//!   entry; the hints pass (`collect_one_module_hints`) validates before it
+//!   reads the manifest; fan framing (`fanned_port_frame_kind`) and an add's
+//!   permission pre-check (`live::module_permissions`) read manifest fields
+//!   only. Those reads stay inside the entry's footprint, which the table's
+//!   load bounded (`validate_table_layout` covers the header, code, data,
+//!   exports, schema and manifest of every entry), and what they decide is
+//!   advisory: the instantiation that follows validates the blob, so a forged
+//!   manifest can only make an add fail later, never run.
+//!
+//! So the list states what the table holds, and the instance list below it
+//! states what runs; a verifier that needs every held blob checked reads the
+//! digests against its own pins.
 
 use super::static_storage::{static_config, static_loader};
 use crate::kernel::security::crypto::sha256::Sha256;
@@ -71,7 +100,8 @@ pub fn write_record(challenge: &[u8; 32], tier: u8, out: &mut [u8]) -> Option<us
     // (`loader::validate_module` refuses one that is unattested or attests
     // another), so each instance listed below runs a blob built for it. A
     // blob the table holds that no instance runs is listed by its bytes and
-    // has not been checked.
+    // has not been checked; no path runs it unchecked (see the module
+    // documentation).
     let abi = {
         let mut h = Sha256::new();
         crate::abi::abi_surface::write_surface(&mut |bytes| h.update(bytes));

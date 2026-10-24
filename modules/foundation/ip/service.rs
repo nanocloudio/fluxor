@@ -9,7 +9,10 @@
 //!
 //! **Index.** The DNAT records of every table this instance holds, merged
 //! per `(proto, vip, vport)` — the writer emits one record per backend — into
-//! a hashed index of services, each with its backend list. Only `scope =
+//! a hashed index of services, each with its backend list. A service's
+//! `proto` 0 is any protocol and `vport` 0 any port; the store admits no two
+//! overlapping services on the node, so the one a packet matches is found
+//! under its exact key, then any protocol, then any port. Only `scope =
 //! local` records are realized here (the provider refuses the rest). The
 //! index is double-buffered: a table change rebuilds the spare copy a
 //! [`SLICE`] of records per step and swaps it in whole, so the copy in use
@@ -287,18 +290,38 @@ unsafe fn add(s: &mut IpState, c: usize, d: &np::Dnat, body: &[u8]) {
 }
 
 /// The service a packet to `(vip, vport)` over `proto` is for, in the copy
-/// in use: an exact record first, then one for any protocol.
+/// in use: the record for that protocol and port, then for any protocol at
+/// that port, then for that protocol on any port, then for any protocol on
+/// any port — the one that matches, since services never overlap.
 pub(crate) unsafe fn lookup(s: &IpState, proto: u8, vip: u32, vport: u16) -> Option<usize> {
     if s.svc_cap == 0 || s.svc_gen == 0 {
         return None;
     }
     let c = s.svc_live as usize;
-    find_in(s, c, proto, vip, vport).or_else(|| find_in(s, c, np::rule::PROTO_ANY, vip, vport))
+    let any = np::rule::PROTO_ANY;
+    find_in(s, c, proto, vip, vport)
+        .or_else(|| find_in(s, c, any, vip, vport))
+        .or_else(|| find_in(s, c, proto, vip, 0))
+        .or_else(|| find_in(s, c, any, vip, 0))
 }
 
-/// Backend `k` (mod the set) of service `i`: `None` for a service with no
-/// backends.
-pub(crate) unsafe fn pick(s: &IpState, i: usize, salt: u32) -> Option<(u32, u16)> {
+/// The port a backend of service `v` is reached at, for traffic sent to
+/// `dport`: its own, or (0) the port the traffic was sent to — the
+/// service's, or for a service on any port, the packet's.
+#[inline(always)]
+fn backend_port(v: &Svc, b: &Backend, dport: u16) -> u16 {
+    if b.port != 0 {
+        b.port
+    } else if v.vport != 0 {
+        v.vport
+    } else {
+        dport
+    }
+}
+
+/// Backend `k` (mod the set) of service `i`, for traffic sent to `dport`:
+/// `None` for a service with no backends.
+pub(crate) unsafe fn pick(s: &IpState, i: usize, salt: u32, dport: u16) -> Option<(u32, u16)> {
     let c = s.svc_live as usize;
     let v = *svc_at(s, c, i);
     if v.n == 0 {
@@ -314,18 +337,19 @@ pub(crate) unsafe fn pick(s: &IpState, i: usize, salt: u32) -> Option<(u32, u16)
         return None;
     }
     let b = *be_at(s, c, at as usize);
-    Some((b.addr, if b.port == 0 { v.vport } else { b.port }))
+    Some((b.addr, backend_port(&v, &b, dport)))
 }
 
-/// Whether service `i` still has backend `(addr, port)`.
-pub(crate) unsafe fn has(s: &IpState, i: usize, addr: u32, port: u16) -> bool {
+/// Whether service `i` still has backend `(addr, port)` for traffic sent to
+/// `dport`.
+pub(crate) unsafe fn has(s: &IpState, i: usize, addr: u32, port: u16, dport: u16) -> bool {
     let c = s.svc_live as usize;
     let v = *svc_at(s, c, i);
     let mut at = v.head;
     let mut walked = 0;
     while at != NONE && walked <= v.n {
         let b = *be_at(s, c, at as usize);
-        let bp = if b.port == 0 { v.vport } else { b.port };
+        let bp = backend_port(&v, &b, dport);
         if b.addr == addr && bp == port {
             return true;
         }

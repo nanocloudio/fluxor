@@ -376,6 +376,11 @@ pub fn segment_for(family: u8, addr: &[u8; wire::ADDR_LEN]) -> Result<Option<wir
 /// family, inside its prefix and not its gateway (`EINVAL`), and the backend
 /// attaches workloads to segments (`ENOSYS`). The segment the workload
 /// joins on success.
+///
+/// A check, not a hold: a SEGMENTS replace may still remove the segment
+/// before the workload is recorded on it. A backend whose CREATE spans
+/// calls records the attachment through [`attach_segment`], which checks
+/// again under the lock a replace takes.
 pub fn validate_attach(
     family: u8,
     addr: &[u8; wire::ADDR_LEN],
@@ -392,6 +397,41 @@ pub fn validate_attach(
         return Err(errno::ENOSYS);
     }
     Ok(s)
+}
+
+/// Record a workload's attachment to `segment_id` as one step with the
+/// check a SEGMENTS replace makes: under the segment table's apply flag (the
+/// one a replace holds from its attached-workload check to its store), the
+/// segment is checked again ([`validate_attach`]) and, when it still admits
+/// the address, `record` runs and makes the attachment visible to that
+/// check. So a replace either sees the attachment (and answers `EBUSY`) or
+/// completed first (and this answers its error, the caller rolling the
+/// workload back): a workload is never left on a segment the table no
+/// longer holds. `EAGAIN` when a replace held the flag for every wait.
+pub fn attach_segment(
+    family: u8,
+    addr: &[u8; wire::ADDR_LEN],
+    segment_id: u16,
+    backend_attaches: bool,
+    record: impl FnOnce(),
+) -> Result<wire::Segment, i32> {
+    let mut spins = 0;
+    while APPLYING[T_SEG]
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        spins += 1;
+        if spins >= STATE_SPINS {
+            return Err(errno::EAGAIN);
+        }
+        relax();
+    }
+    let r = validate_attach(family, addr, segment_id, backend_attaches);
+    if r.is_ok() {
+        record();
+    }
+    APPLYING[T_SEG].store(false, Ordering::Release);
+    r
 }
 
 // ---- dispatch -------------------------------------------------------------
@@ -642,8 +682,10 @@ unsafe fn replace_routes_locked(a: &[u8], n: usize, realizer: Option<&Realizer>)
     let mut buf = crate::scratch![wire::Route::EMPTY; MAX_PEERS, n];
     for (i, slot) in buf.iter_mut().take(n).enumerate() {
         match wire::route_at(a, 2 + i * wire::peer::SIZE) {
-            Some(r) => *slot = r,
-            None => return errno::EINVAL,
+            // A default route through a peer would take every destination
+            // the node has no better route to — its uplink's included.
+            Some(r) if r.prefix.len > 0 => *slot = r,
+            _ => return errno::EINVAL,
         }
     }
     let table = &mut *core::ptr::addr_of_mut!(ROUTES);

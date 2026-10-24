@@ -66,6 +66,15 @@ pub const MOUNT: u32 = 0x1F01;
 /// unmount whose earlier answer was dropped), or a negative errno (`EBUSY`,
 /// `EPERM`, `EINVAL` for a path through a symlink) when it could not; `EAGAIN`
 /// while the unmount runs or while the caller's jobs are all running.
+///
+/// What is unmounted is identified, not looked up: the directory's parent
+/// is opened by the same walk as `MOUNT`'s and held; the mount at `dir` is
+/// named by its mount id, read through that descriptor without following a
+/// symlink; it must be mounted at exactly `dir` and be a mount `MOUNT` makes
+/// — a block device's filesystem, `nodev` and `nosuid` — or the answer is
+/// `EBUSY` (a projection's memory filesystem is `REMOVE_TREE`'s); and the
+/// unmount names `dir` through the held parent, refusing a symlink. A
+/// kernel that reports no mount id answers `ENOSYS`.
 pub const UMOUNT: u32 = 0x1F02;
 /// The mount root, written into `arg`. Returns its length, or `ENOSPC` when
 /// `arg` is too short.
@@ -73,7 +82,8 @@ pub const ROOT: u32 = 0x1F03;
 
 /// Project files into a directory under the mount root, replacing what an
 /// earlier projection there put, atomically for a reader. `arg =
-/// [dir_len:u16][dir][group:u32][flags:u8][count:u16][entry]×count`, entry
+/// [dir_len:u16][dir][group:u32][flags:u8][count:u16][entry]×count`, then
+/// `[size:u64]` with [`P_SIZE`] only; entry
 /// `[path_len:u16][path][mode:u16][data_len:u32][data]`, little-endian.
 ///
 /// - `dir` is relative to the mount root, created when absent (mode 0755).
@@ -94,7 +104,19 @@ pub const ROOT: u32 = 0x1F03;
 ///   mode.
 /// - [`P_MEMORY`] mounts a memory filesystem (`nosuid,nodev`) at `dir` the
 ///   first time; later projections write into it. A different mount already
-///   at `dir` is `EBUSY`.
+///   at `dir` is `EBUSY`. The filesystem is bounded: it holds at most
+///   `size` bytes ([`P_SIZE`]; less than the entries need is `ENOSPC`), or
+///   without one 64 MiB or what the entries need when that is more — at
+///   most 1 GiB either way (`E2BIG`) — and as many files as the entries
+///   need plus one per page of room. While a later projection swaps in, the
+///   bound is what the filesystem holds plus the new one's, and the new
+///   one's again once the swap is done. Its pages are charged by the
+///   kernel's memory accounting to whoever writes them: what `PROJECT`
+///   writes to the runtime's cgroup, what a workload writes into a writable
+///   projection to the workload's. An orchestrator that bounds a
+///   projection by a workload's memory quota states it as `size`.
+/// - [`P_SIZE`] (with [`P_MEMORY`] only, else `EINVAL`): `[size:u64]`
+///   follows the last entry.
 ///
 /// Returns 0, or a negative errno: `EINVAL` (malformed, a path that climbs
 /// out, a symlink on the way to `dir`), `EEXIST` (a top-level name already
@@ -107,9 +129,13 @@ pub const PROJECT: u32 = 0x1F04;
 /// it names) and never crosses into another mount: a memory filesystem a
 /// `PROJECT` mounted inside (or at) `dir` is unmounted first, and any other
 /// mount point inside answers `EBUSY` with nothing removed — a mounted
-/// volume is never deleted through this op. Returns 0 once the tree is gone
-/// (also when there was none), or a negative errno (`EBUSY`, `EINVAL` for a
-/// path through a symlink, `EPERM`); `EAGAIN` while it runs, as `MOUNT`.
+/// volume is never deleted through this op. Each projection mount is
+/// unmounted as [`UMOUNT`] unmounts a volume: by its mount id, read through
+/// the held parent directory, and only while that id is a projection's
+/// memory filesystem at exactly that directory (else `EBUSY`). Returns 0
+/// once the tree is gone (also when there was none), or a negative errno
+/// (`EBUSY`, `EINVAL` for a path through a symlink, `EPERM`); `EAGAIN` while
+/// it runs, as `MOUNT`.
 pub const REMOVE_TREE: u32 = 0x1F05;
 /// Give a directory tree under the mount root to a group. `arg =
 /// [dir_len:u16][dir][group:u32][policy:u8]`: every file, directory and
@@ -147,6 +173,9 @@ pub const NO_GROUP: u32 = 0xFFFF_FFFF;
 pub const P_MEMORY: u8 = 1 << 0;
 /// `PROJECT` flag: the projection is read-only (`0o440` added to modes).
 pub const P_READ_ONLY: u8 = 1 << 1;
+/// `PROJECT` flag: a `[size:u64]` bound on the memory filesystem follows the
+/// entries (with [`P_MEMORY`] only).
+pub const P_SIZE: u8 = 1 << 2;
 /// `GROUP_TREE` policy: always walk the whole tree.
 pub const GT_ALWAYS: u8 = 0;
 /// `GROUP_TREE` policy: walk only when `dir` itself does not already match.

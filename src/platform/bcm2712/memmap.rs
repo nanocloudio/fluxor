@@ -153,9 +153,11 @@ fn find_zone(memory: &[Range], reserved: &[Range]) -> Option<(u64, u64)> {
 }
 
 /// Read the device tree at `dtb_phys` (the firmware's x0; QEMU leaves the
-/// blob at the base of RAM instead) and build the map, then give the carve
-/// allocator and the state arena the zone. Runs with the MMU off, before the
-/// boot page tables are built from it.
+/// blob at the base of RAM instead) and build the map. Runs with the MMU off,
+/// before the boot page tables are built from it, so it only reads the blob
+/// and writes the map: with the MMU off every access is Device memory, where
+/// an exclusive load/store never completes, and the carve allocator's lock
+/// would spin forever. [`install`] hands the zone over once the MMU is on.
 ///
 /// # Safety
 /// Once, at boot, on the boot core, before anything allocates. `dtb_phys` is
@@ -188,7 +190,16 @@ pub unsafe fn build(dtb_phys: u64) {
         m.blob = if blob.is_some() { dtb_phys } else { 0 };
         m.zone = zone;
     }
-    let (lo, hi) = (zone.0 as usize, zone.1 as usize);
+}
+
+/// Give the carve allocator and the state arena the zone [`build`] found.
+///
+/// # Safety
+/// Once, at boot, on the boot core, after [`build`] and after the MMU is on,
+/// before anything allocates.
+pub unsafe fn install() {
+    let (lo, hi) = map().zone;
+    let (lo, hi) = (lo as usize, hi as usize);
     crate::kernel::mem::carve::install(lo, hi);
     crate::kernel::module::loader::install_arena(lo, hi - lo);
 }
@@ -243,7 +254,7 @@ pub fn report() {
     let (permanent, transient, leaked, refused) = crate::kernel::mem::carve::stats();
     log::info!(
         "[mem] src={:?} dram={:#x} ({} MiB) ranges={} reserved={} zone={:#x}-{:#x} carved={} \
-         scratch={} leaked={} refused={} arena={:#x} dma<={:#x} dtb={:#x}",
+         scratch={} reusable={} leaked={} refused={} arena={:#x} dma<={:#x} dtb={:#x}",
         m.source,
         dram_bytes(),
         dram_bytes() >> 20,
@@ -253,6 +264,7 @@ pub fn report() {
         m.zone.1,
         permanent,
         transient,
+        crate::kernel::mem::carve::reusable(),
         leaked,
         refused,
         crate::kernel::module::loader::arena_cap(),

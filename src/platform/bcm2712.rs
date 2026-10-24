@@ -932,6 +932,7 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     unsafe {
         boot_mmu::init_page_tables();
         boot_mmu::enable();
+        fluxor::platform::memmap::install();
         rp1_pcie_disable_aspm();
     }
 
@@ -961,6 +962,7 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     unsafe {
         boot_mmu::init_page_tables();
         boot_mmu::enable();
+        fluxor::platform::memmap::install();
     }
 
     // Probe RP1 early on Pi 5 to confirm the PCIe BAR mapping is alive.

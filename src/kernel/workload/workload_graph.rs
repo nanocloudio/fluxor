@@ -110,10 +110,39 @@ pub fn register_net_identity_provider(slot: u16, addr_ctl_port: u8, net_in_port:
     }
     match NET_IDENT_PROVIDER_REG.compare_exchange(cur, packed, Ordering::AcqRel, Ordering::Acquire)
     {
-        Ok(_) => 0,
+        Ok(_) => provision_addr_ctl(slot as usize, addr_ctl_port),
         Err(now) if now == packed => 0,
         Err(_) => errno::EBUSY,
     }
+}
+
+/// `addr_ctl`'s ring, in bytes: the provider's declared buffer for it (`ip`'s
+/// manifest), low-rate control.
+const ADDR_CTL_RING_BYTES: u32 = 512;
+
+/// Give the provider's `addr_ctl` a channel when its graph left the port
+/// unwired. On a node that creates workloads the build refuses any module
+/// writer into `addr_ctl` — the kernel is its one writer — so the port is
+/// unwired there, and without a channel every identity install would answer
+/// `ENODEV`. A wired port (a coordinator's, on a node that creates no
+/// workloads) is left as it is. The provider reads the port after it
+/// registers.
+fn provision_addr_ctl(slot: usize, addr_ctl_port: u8) -> i32 {
+    if scheduler::get_module_port(slot, 0 /* PORT_IN */, addr_ctl_port) >= 0 {
+        return 0;
+    }
+    let cap = ADDR_CTL_RING_BYTES.to_le_bytes();
+    let ch = crate::kernel::ipc::channel::channel_open(
+        crate::kernel::ipc::channel::CHANNEL_TYPE_PIPE,
+        cap.as_ptr(),
+        cap.len(),
+    );
+    if ch < 0 {
+        NET_IDENT_PROVIDER_REG.store(NO_PROVIDER, Ordering::Release);
+        return ch;
+    }
+    scheduler::set_module_port(slot, 0 /* PORT_IN */, addr_ctl_port, ch);
+    0
 }
 
 /// Clear the registration (test isolation only — production providers live for
@@ -349,6 +378,12 @@ static mut FMOD_WORKLOADS: crate::kernel::mem::table::Table<WorkloadSlot, MAX_WO
     crate::abi::contracts::resource::POOL_OWNERS
 );
 
+/// Who holds each workload slot's handle: the owner of the module that
+/// created it. Only that owner, or a caller acting with the node's
+/// authority, acts on the workload ([`may_act_on`]).
+static mut FMOD_HOLDERS: crate::kernel::mem::table::Table<OwnerHandle, MAX_WORKLOADS> =
+    crate::boot_table!(MAX_WORKLOADS, OWNER_SYSTEM);
+
 /// Size the workload slots to the owner table's `owners` slots.
 ///
 /// # Safety
@@ -356,8 +391,29 @@ static mut FMOD_WORKLOADS: crate::kernel::mem::table::Table<WorkloadSlot, MAX_WO
 pub unsafe fn size(owners: usize) -> Result<(), crate::kernel::mem::table::TableError> {
     let t = &*core::ptr::addr_of!(FMOD_WORKLOADS);
     t.reserve(owners)?;
-    t.grow(owners)
+    t.grow(owners)?;
+    let h = &*core::ptr::addr_of!(FMOD_HOLDERS);
+    h.reserve(owners)?;
+    h.grow(owners)
 }
+
+/// Whether the calling module may act on the workload in slot `widx`: its
+/// owner is the one that created it, or it acts with the node's authority
+/// (the node agent). Every handle op, `LOOKUP` and `DESTROY` by identity
+/// answer anyone else `EACCES`.
+unsafe fn may_act_on(widx: usize) -> bool {
+    let holders = &*core::ptr::addr_of!(FMOD_HOLDERS);
+    may_act_as(holders.get(widx).copied().unwrap_or(OWNER_SYSTEM))
+}
+
+/// Whether the caller is `holder`, or acts with the node's authority.
+fn may_act_as(holder: OwnerHandle) -> bool {
+    scheduler::caller_authority() == OWNER_SYSTEM || scheduler::caller_owner() == holder
+}
+
+/// The owner staging the pending `CREATE`: only it (or the node) continues
+/// or abandons it.
+static mut PENDING_HOLDER: Option<OwnerHandle> = None;
 
 /// A `CREATE` whose subgraph is being instantiated a batch per call. The
 /// backend owns everything the add reads between calls: its own copy of the
@@ -531,9 +587,10 @@ unsafe fn write_addr_ctl_frame(ch: i32, msg_type: u8, payload: &[u8]) -> bool {
 /// `ADDR_ADD [addr:16][prefix_len:1][owner_tag:2 LE]` with
 /// `owner_tag = owner_slot`. The address is live before START releases the
 /// workload. Returns 0, or a negative errno:
-///   * `ENODEV` — no provider / addr_ctl in the base graph (a `net=own` CREATE
-///     on a node with no network stack fails cleanly — never silently
-///     dropped),
+///   * `ENODEV` — no provider registered, so no `addr_ctl` (a `net=own`
+///     CREATE on a node with no network stack fails cleanly — never silently
+///     dropped; a registered provider's unwired port is given its channel at
+///     registration, [`provision_addr_ctl`]),
 ///   * `EBUSY`  — the base graph wired a producer into addr_ctl (mis-wire),
 ///   * `EAGAIN` — the low-rate control ring rejected the frame.
 ///
@@ -1034,7 +1091,7 @@ unsafe fn workload_create(arg: *mut u8, arg_len: usize) -> i32 {
             lanes[at].from_caller = ch;
         }
     }
-    slots[widx] = WorkloadSlot {
+    let slot = WorkloadSlot {
         in_use: true,
         owner,
         // Only an installed identity is remembered for the DESTROY-time
@@ -1044,6 +1101,28 @@ unsafe fn workload_create(arg: *mut u8, arg_len: usize) -> i32 {
         lanes,
         lane_count: lane_count as u8,
     };
+    if slot.net_segment != 0 {
+        // The segment was checked when this CREATE began, calls ago; a
+        // SEGMENTS replace since may have removed it, having seen no
+        // workload on it. The attachment is recorded under the lock that
+        // replace's check holds, after checking again, so either the
+        // replace sees it (`EBUSY`) or this CREATE sees the replace and is
+        // rolled back with the error a CREATE naming the segment now gets.
+        let rc = crate::kernel::net_route::attach_segment(
+            net_family,
+            &net_addr,
+            net_segment,
+            net_identity_provider_present(),
+            || slots[widx] = slot,
+        );
+        if let Err(e) = rc {
+            remove_identity(&net_addr);
+            let _ = live::free_owner(owner);
+            return e;
+        }
+    } else {
+        slots[widx] = slot;
+    }
     tag_fd(FD_TAG_WORKLOAD, widx as i32)
 }
 
@@ -1282,7 +1361,28 @@ unsafe fn live_stats_record(opcode: u32, rc: i32, us: u64) {
 
 unsafe fn dispatch_op(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
     if opcode == wl::CREATE {
-        return workload_create(arg, arg_len);
+        let pending_holder = &mut *core::ptr::addr_of_mut!(PENDING_HOLDER);
+        if pending_identity().is_none() {
+            *pending_holder = None;
+        }
+        if let Some(h) = *pending_holder {
+            if !may_act_as(h) {
+                return errno::EACCES;
+            }
+        }
+        let rc = workload_create(arg, arg_len);
+        if rc == errno::EINPROGRESS {
+            pending_holder.get_or_insert(scheduler::caller_owner());
+        } else {
+            *pending_holder = None;
+        }
+        if rc >= 0 {
+            let holders = &mut *core::ptr::addr_of_mut!(FMOD_HOLDERS);
+            if let Some(h) = holders.get_mut(slot_of(rc) as usize) {
+                *h = scheduler::caller_owner();
+            }
+        }
+        return rc;
     }
     if opcode == wl::MODULE_DIGESTS {
         if arg.is_null() {
@@ -1351,6 +1451,9 @@ unsafe fn dispatch_op(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) ->
         let Some(widx) = slot_by_identity(&identity) else {
             return errno::ENOENT;
         };
+        if !may_act_on(widx) {
+            return errno::EACCES;
+        }
         let owner = (&*core::ptr::addr_of!(FMOD_WORKLOADS))[widx].owner;
         out[0..2].copy_from_slice(&owner.slot.to_le_bytes());
         out[2..6].copy_from_slice(&owner.generation.to_le_bytes());
@@ -1363,11 +1466,17 @@ unsafe fn dispatch_op(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) ->
         let mut identity = [0u8; 16];
         identity.copy_from_slice(core::slice::from_raw_parts(arg, 16));
         if pending_identity() == Some(identity) {
+            let pending_holder = &mut *core::ptr::addr_of_mut!(PENDING_HOLDER);
+            if !pending_holder.is_none_or(may_act_as) {
+                return errno::EACCES;
+            }
             // Abandon the staged CREATE: its add rolls back and its pack goes.
             abandon_pending();
+            *pending_holder = None;
             return 0;
         }
         return match slot_by_identity(&identity) {
+            Some(widx) if !may_act_on(widx) => errno::EACCES,
             Some(widx) => destroy_slot(widx),
             None => errno::ENOENT,
         };
@@ -1375,6 +1484,9 @@ unsafe fn dispatch_op(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) ->
 
     let raw = slot_of(handle);
     let owner_opt = slot_owner(raw);
+    if raw >= 0 && !may_act_on(raw as usize) {
+        return errno::EACCES;
+    }
     // WAIT tolerates a reaped slot → EXITED: a status loop keeps polling
     // after DESTROY/KILL and must see the terminal state, not an error.
     if opcode == wl::WAIT {

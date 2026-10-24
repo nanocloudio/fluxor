@@ -151,7 +151,19 @@ owner and its leases, and a host-process backend (a host process in an
 isolation domain of its own, Linux). It is gated by `requires_contract = "workload"` and
 `platform_raw`.
 
-The fmod-graph backend realizes the shared posture only. A workload is a
+The fmod-graph backend realizes the shared posture only. The host-process
+backend realizes the shared and isolated postures, and the hardened one
+where it can reduce a workload's call and privilege surface; `CAPS` says
+which. The posture is the isolation: the host-process source's own
+isolation flag must agree with it (`EINVAL` otherwise). At every posture
+each process of a host-process workload starts with only the privileges it
+was granted and no means to gain more, and ends with the runtime that
+started it; a privileged workload is granted more, or runs without the call
+filter, only when its source says so, and never at the hardened posture.
+A workload handle acts for the owner whose module created it: every op on
+it, and `LOOKUP` and `DESTROY` by identity, answer another owner's caller
+`EACCES`, while a caller acting with the node's authority acts on every
+workload. A workload is a
 tenant of the node: both backends refuse the null identity (`EINVAL`),
 since everything keyed on an owner's identity would see every such
 workload as one. The graph backend refuses a subgraph any of whose modules
@@ -211,7 +223,10 @@ host-process mechanics (exec, PTY, read, the host-process source),
 registered only by
 the Linux platform, with semantic constants at
 `abi::platform::linux::host_process`. Unregistered platforms return
-`ENOSYS`, which doubles as discovery.
+`ENOSYS`, which doubles as discovery. A terminal session belongs to the
+module that opened it, under that module's owner: any other caller is
+answered `EACCES`, and the session closes when its opener's owner is
+released or its workload destroyed.
 
 `HOST_MOUNT` (`0x001F`) is host-scoped the same way: mounting a block
 device onto a directory under the operator's mount root
@@ -219,12 +234,16 @@ device onto a directory under the operator's mount root
 `abi::platform::linux::host_mount`. The platform holds the policy — the
 source must be a block device, every mount point lies under the root, every
 mount is `nodev,nosuid`, no symlink under the root is followed — and answers
-with the kernel's errno. Mount and unmount run off the scheduler thread and
+with the kernel's errno. An unmount identifies the mount it removes by its
+id, read through the held parent directory, and removes only a mount the
+class itself makes at exactly that directory; removing a tree unmounts the
+projections inside it the same way. Mount and unmount run off the
+scheduler thread and
 answer `EAGAIN` until a repeat of the same request finds the result; each
 caller holds a bounded number of jobs, uncollected results expire, and both
 operations are idempotent against the host mount table. The same class
 projects files with modes, a group and an atomic `..data` swap (optionally
-memory-backed), removes a tree without following a link or crossing a mount
+memory-backed, the memory bounded), removes a tree without following a link or crossing a mount
 (any mount inside but a projection's is `EBUSY`), gives a volume's tree a
 group, and makes a directory of an exact mode — the permission model the portable `fs` contract does not carry.
 Making or checking a filesystem is a userland tool and goes through the
@@ -846,10 +865,25 @@ reduced to a generic isolation primitive that knows no OCI format:
 `build_plan(argv, rootfs, isolate)` takes explicit parameters, cgroup
 limits come solely from the portable `ResourceEnvelope`, and the
 workload CREATE source section carries explicit spawn params
-(`[flags:u8]` isolated / read-only root, then length-prefixed rootfs,
-argv, env, cwd, user and numeric groups — the layout at
+(`[flags:u8]` isolated / read-only root / capability addition / no
+syscall filter, then length-prefixed rootfs, argv, env, cwd, user,
+numeric groups and, when flagged, the added capabilities — the layout at
 `abi::platform::linux::host_process::SOURCE_HOST_PROCESS`) rather than a
 bundle-directory path. Nanocloud owns the OCI→params mapping — the
 policy half — mirroring how the nanocloud CLI is built: a PIC fmod
 owning logic plus fluxor host built-ins for host facts.
+
+The primitive confines every process of a workload by itself
+(`src/platform/linux/confine.rs`): `no_new_privs`, the capability
+bounding set cut to the OCI default capabilities plus the source's
+additions, the sets for the uid it runs as, and the OCI default seccomp
+allowlist (aarch64), installed last before exec. An intermediate process
+bound to the runtime with `PR_SET_PDEATHSIG` stands between the runtime and
+each workload's init and relays its status exactly; a runtime that dies
+takes every workload with it, and a shared workload's intermediate, a child
+subreaper, also ends every process the workload started. An EXEC or terminal
+session of an isolated workload runs inside its pid namespace. An isolated workload with a rootfs gets a `nodev` root and
+volumes and a minimal `/dev` of its own (the OCI default devices bound
+from the host, a new devpts instance, a sized `/dev/shm`). The hardened
+posture is that confinement whole, in an isolated workload.
 <!-- vocabulary-exempt-end -->

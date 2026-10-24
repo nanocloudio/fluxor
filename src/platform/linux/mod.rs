@@ -11,6 +11,9 @@
 
 pub mod builtin_params;
 pub mod clock;
+/// The privilege and system-call surface of a host-process workload:
+/// capability sets, `no_new_privs`, the system-call filter, parent death.
+pub mod confine;
 pub mod descriptors;
 /// Native GPU compute over wgpu/Vulkan, headless — the provider behind the
 /// `linux_gpu` built-in. In the library, not only the binary, so the host test

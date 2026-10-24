@@ -16,7 +16,7 @@
 //! | Forwarding | On each workload link, and on each uplink (the links peers and default routes leave by) through the registry. |
 //! | Forward guard | `ct state established,related accept`; `iif ∈ instance links accept`; `oif ∈ instance links, daddr ∈ cluster accept`; other traffic on instance links dropped. On an uplink whose forwarding the registry itself turned on, forwarded traffic that is neither translated nor established is dropped (the node does not become a router for its LAN); an uplink the host already forwarded on is left alone. |
 //! | Redirects | `send_redirects` off globally and on each uplink, through the registry (the per-link setting is OR'd with the global one). |
-//! | Peer routes | `prefix via peer` in the instance table. |
+//! | Peer routes | `prefix via peer` in the instance table — except a route whose prefix overlaps the connected prefix of one of the node's own uplink addresses, which is not installed and reads `refused(conflict)`; the overlap is checked again whenever the probe finds the uplink addresses changed. |
 //! | Egress translated | Source translation in the guard table: segment prefix → destinations outside the cluster prefixes. |
 //! | Held `announce` | `addr/32` to the dummy link in the instance table, a proxy neighbour entry on the uplink whose connected prefix covers the address, `proxy_delay = 0` there through the registry (a broadcast request is otherwise answered after up to 0.8 s), and an unsolicited announcement on arm from a raw link socket. The uplink forwards (through the registry, guarded as above). Fence withdraws the entry, the route and the tunable dependence. Requires `FORWARD`. |
 //! | Held `deliver` | `addr/32` on the covering uplink, no prefix route, marked with [`HELD_ADDR_PROTO`]. |
@@ -176,6 +176,8 @@ struct State {
     held_evidence: Vec<([u8; 4], u32, u64)>,
     held_installs: u32,
     held_fences: u64,
+    /// The uplink prefixes the peer routes were last checked against.
+    uplink_prefixes: Vec<([u8; 4], u8)>,
 }
 
 static STATE: Mutex<State> = Mutex::new(State {
@@ -198,6 +200,7 @@ static STATE: Mutex<State> = Mutex::new(State {
     proxy_uplinks: Vec::new(),
     held_evidence: Vec::new(),
     held_installs: 0,
+    uplink_prefixes: Vec::new(),
     held_fences: 0,
 });
 
@@ -577,6 +580,17 @@ fn start_prober() {
                 log::info!("[net_route] host changed: {p:?}");
             }
             st.probes = Some(p);
+            // The node's uplink addresses moved: the peer routes are
+            // checked against them again.
+            if !st.routes.is_empty() {
+                if let Ok(tag) = instance::live_tag() {
+                    if uplink_prefixes(&tag) != st.uplink_prefixes {
+                        let n = st.routes.len();
+                        st.route_outcome = vec![Outcome::Ok; n];
+                        realize(&mut st);
+                    }
+                }
+            }
         });
     if spawned.is_err() {
         log::warn!("[net_route] cannot start the periodic probe; probes are not re-run");
@@ -883,6 +897,19 @@ fn realize(st: &mut State) {
             *o = Outcome::Unsupported;
         }
     }
+    // A peer route never takes the node's own uplink.
+    let ups = uplink_prefixes(&tag);
+    for (o, r) in st.route_outcome.iter_mut().zip(&st.routes) {
+        if *o == Outcome::Ok && covers_uplink(&r.prefix, &ups) {
+            log::warn!(
+                "[net_route] peer route {}/{} overlaps the node's uplink: refused(conflict)",
+                dotted(v4(&r.prefix.addr)),
+                r.prefix.len
+            );
+            *o = Outcome::Conflict;
+        }
+    }
+    st.uplink_prefixes = ups;
     let segs: Vec<(instance::Claim, usize)> = st
         .segments
         .iter()
@@ -1337,6 +1364,39 @@ fn host_addrs() -> Result<Vec<HostAddr>, i32> {
     // SAFETY: closing the socket opened above.
     unsafe { libc::close(fd) };
     result.map(|()| out)
+}
+
+/// The connected prefixes of the node's own uplink addresses: every IPv4
+/// address on a host link that is not an instance link (any runtime's) or
+/// loopback, held addresses excepted (they are service addresses the node
+/// answers for, not its link).
+fn uplink_prefixes(tag: &str) -> Vec<([u8; 4], u8)> {
+    let stem = instance::stem(tag);
+    let links = nl::links().unwrap_or_default();
+    let mut out: Vec<([u8; 4], u8)> = host_addrs()
+        .unwrap_or_default()
+        .iter()
+        .filter(|a| a.proto != HELD_ADDR_PROTO)
+        .filter_map(|a| {
+            let l = links.iter().find(|l| l.index == a.index)?;
+            (l.name != "lo" && !instance_link(stem, l)).then_some((a.addr, a.len))
+        })
+        .collect();
+    out.sort_unstable();
+    out
+}
+
+/// Whether peer-route prefix `p` overlaps one of the uplink prefixes `ups`.
+pub fn covers_uplink(p: &wire::Prefix, ups: &[([u8; 4], u8)]) -> bool {
+    ups.iter().any(|(a, len)| {
+        let mut addr = [0u8; wire::ADDR_LEN];
+        addr[..4].copy_from_slice(a);
+        p.overlaps(&wire::Prefix {
+            family: wire::FAM_IPV4,
+            len: *len,
+            addr,
+        })
+    })
 }
 
 fn v4_contains(prefix: [u8; 4], len: u8, addr: [u8; 4]) -> bool {

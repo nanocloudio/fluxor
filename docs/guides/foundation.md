@@ -53,7 +53,8 @@ The foundation layer covers:
 - **Network-plane hygiene** (`conn_guard` for TCP-SYN connection-rate
   filtering, `demux` for 4-tuple hashed frame fan-out to replicated IP
   lanes, `conn_demux` for per-connection fan-out to parallel TLS
-  lanes, `pkt_filter` for stateless rule-based filtering)
+  lanes, `pkt_filter` for packet policy in the frame path — a `net.policy`
+  table enforced by flow, or static port rules)
 - **Media and session orchestration** (`format` for audio format
   conversion and resampling, control-plane bridges)
 

@@ -30,6 +30,45 @@
 // dropped: a table that silently lost its DNAT is a service that silently
 // stopped working.
 //
+// ## Services
+//
+// A DNAT record names a SERVICE: `(proto, vip, vport)`, `proto` 0 any
+// protocol and `vport` 0 any port. Two records overlap when they share the
+// `vip`, their protocols are equal or one is any, and their ports are equal
+// or one is any; then some packet matches both. A packet matches at most one
+// service on the node:
+//
+// - within a table, records for the same `(proto, vip, vport)` are one
+//   service (their backends merge); a record overlapping another without
+//   naming the same service fails REPLACE with `EINVAL`;
+// - across tables, a service is defined by one table: a REPLACE whose
+//   records overlap a service another stored table defines fails with
+//   `EEXIST`, and the stored tables are as they were.
+//
+// So no provider ever chooses between two translations of one packet, and a
+// policy means the same wherever it is enforced.
+//
+// ## Flows
+//
+// A verdict is a flow's, not a packet's ([`flow`]): an enforcer judges a
+// flow's first packet, records the flow when that packet passes, and every
+// later packet of it in either direction passes on that record — whatever
+// the tables say by then — until it expires. A packet that matches no flow
+// is new and is judged, whatever its flags: an unsolicited TCP segment
+// without SYN is judged like any other first packet, so a default-deny table
+// drops it. An ICMP error carrying the header of a recorded flow's packet is
+// part of that flow.
+//
+// ## Enforcers fail closed
+//
+// An in-graph enforcer declares, per table, the most rule bytes it holds
+// ([`ATTACH`] with [`ATTACH_CAPACITY`]). A REPLACE of a table larger than its
+// bound enforcer holds fails with `E2BIG` before anything is stored, so the
+// table a controller wrote is never one the enforcer cannot apply. A table
+// an enforcer still cannot hold (stored before it bound) is enforced closed:
+// it drops every packet the table could judge until it holds the table, and
+// reports nothing applied, so the table's ENFORCED stays clear.
+//
 // ## Authority
 //
 // The tables are the node's: REPLACE, CLEAR and ATTACH answer `EACCES` to a
@@ -58,10 +97,13 @@ pub const CAPS: u32 = 0x1E01;
 /// ```
 /// `rules` is a sequence of rule records (see [`rule`]). An empty sequence is
 /// a table with no rules — not a deletion; [`CLEAR`] deletes. Returns 0, or
-/// `EINVAL` (malformed), `ENOSPC` (too many tables/rules), `ENOSYS` (a rule
-/// kind this provider cannot realize), `EACCES` (not the node's authority),
-/// `EAGAIN` (another REPLACE or CLEAR is being applied), or the platform's
-/// error applying it — in which case the stored table is as it was.
+/// `EINVAL` (malformed, or two of its services overlap), `ENOSPC` (too many
+/// tables/rules), `ENOSYS` (a rule kind this provider cannot realize),
+/// `EEXIST` (one of its services overlaps a service another table defines),
+/// `E2BIG` (larger than the table's bound enforcer holds), `EACCES` (not the
+/// node's authority), `EAGAIN` (another REPLACE or CLEAR is being applied),
+/// or the platform's error applying it — in which case the stored table is
+/// as it was.
 pub const REPLACE: u32 = 0x1E02;
 
 /// Delete a table. handle=-1, arg = `[name_len:u8][name bytes]`. Idempotent;
@@ -97,9 +139,14 @@ pub const READ: u32 = 0x1E04;
 /// more entries, back to back,
 /// ```text
 /// [name_len:u8][name bytes][applied_gen:u64 LE]
+/// [name_len | ATTACH_CAPACITY:u8][name bytes][applied_gen:u64 LE][capacity:u32 LE]
 /// ```
 /// `applied_gen` is the generation of that table the enforcer has applied in
-/// full, or 0 for none yet. The first ATTACH naming a table binds it to the
+/// full, or 0 for none yet. An entry whose length byte carries
+/// [`ATTACH_CAPACITY`] also declares `capacity`, the most rule bytes of the
+/// table the enforcer holds: from then on a REPLACE of that table past it
+/// fails `E2BIG` (an entry without it declares no bound, and a later one
+/// without it keeps the bound declared). The first ATTACH naming a table binds it to the
 /// calling module, by its slot and that slot's generation; re-issuing ATTACH
 /// with a new `applied_gen` reports progress. A table has at most one
 /// enforcer: naming a table bound to another live enforcer is `EBUSY`, and
@@ -120,6 +167,13 @@ pub const ATTACH: u32 = 0x1E05;
 
 /// Bytes after an ATTACH entry's name: its `applied_gen`.
 pub const ATTACH_TAIL: usize = 8;
+
+/// Bit of an ATTACH entry's length byte: the entry carries a `capacity`
+/// ([`ATTACH_CAPACITY_TAIL`] bytes) after its `applied_gen`.
+pub const ATTACH_CAPACITY: u8 = 0x80;
+
+/// Bytes of an ATTACH entry's `capacity`.
+pub const ATTACH_CAPACITY_TAIL: usize = 4;
 
 /// The table state [`READ`] writes to `state_out_ptr`.
 /// ```text
@@ -199,13 +253,19 @@ pub mod rule {
     /// [`XLATE_HAIRPIN`], [`XLATE_ALWAYS`]), bit 2 [`DNAT_SCOPE_LOCAL`]; the
     /// other bits are zero.
     ///
-    /// A backend port of 0 is the service's own port (`vport`).
+    /// `proto` 0 matches any protocol, `vport` 0 any port. A backend port
+    /// of 0 is the port the traffic was sent to: the service's own (`vport`),
+    /// or, for a service on any port, the packet's. A service on any port
+    /// keeps the port (every backend port 0) or sets it (none 0), across
+    /// all its records; one that mixes the two is malformed.
     ///
     /// `n == 0` is a VIP with no backends: traffic to it is rejected, not
     /// passed through to an address nothing serves. A VIP with more backends
     /// than one record holds ([`DNAT_MAX_BACKENDS`]) is several DNAT records
     /// for the same `proto`/`vip`/`vport` in one table; the provider merges
     /// them into one balanced set, and the records must agree on `flags`.
+    /// Records that overlap without naming the same service, in one table or
+    /// across tables, are refused (see the Services section above).
     /// IPv4 only.
     pub const DNAT: u8 = 4;
     /// `translate_source` (flags bits 0–1): preserve the caller's source.
@@ -370,23 +430,116 @@ pub fn dnat(body: &[u8]) -> Option<Dnat> {
     Some(d)
 }
 
-/// Whether an earlier DNAT record in `rules[..until]` for the same
-/// `(proto, vip, vport)` as `d` carries different flags.
-fn dnat_conflicts(rules: &[u8], until: usize, d: &Dnat) -> bool {
-    let mut at = 0;
-    while at < until {
-        let Some((kind, body, next)) = next_rule(rules, at) else {
+impl Dnat {
+    /// The record names the same service as `o`: `(proto, vip, vport)`.
+    pub fn same_service(&self, o: &Dnat) -> bool {
+        self.proto == o.proto && self.vip == o.vip && self.vport == o.vport
+    }
+    /// Some packet matches both services: one address, protocols equal or
+    /// either any, ports equal or either any.
+    pub fn overlaps(&self, o: &Dnat) -> bool {
+        self.vip == o.vip
+            && (self.proto == o.proto
+                || self.proto == rule::PROTO_ANY
+                || o.proto == rule::PROTO_ANY)
+            && (self.vport == o.vport || self.vport == 0 || o.vport == 0)
+    }
+    /// The service matches traffic to `(dst, dport)` over `proto` — `dport`
+    /// 0 for a protocol without ports.
+    pub fn serves(&self, proto: u8, dst: u32, dport: u16) -> bool {
+        self.vip == dst
+            && (self.proto == rule::PROTO_ANY || self.proto == proto)
+            && (self.vport == 0 || self.vport == dport)
+    }
+}
+
+/// How a record of a service on any port maps the port: 0 no backends,
+/// 1 every backend keeps it (port 0), 2 every backend sets it, 3 mixed.
+fn port_mode(body: &[u8], d: &Dnat) -> u8 {
+    let mut mode = 0u8;
+    let mut i = 0;
+    while i < d.backends as usize {
+        if let Some((_, port)) = dnat_backend(body, i) {
+            mode |= if port == 0 { 1 } else { 2 };
+        }
+        i += 1;
+    }
+    mode
+}
+
+/// Whether DNAT record `body` (`d`) at `at` conflicts with the earlier
+/// records of `rules[..at]`: the same service with different flags, or (a
+/// service on any port) a different port mapping; or an overlapping other
+/// service.
+fn dnat_conflicts(rules: &[u8], at: usize, d: &Dnat, body: &[u8]) -> bool {
+    let mode = if d.vport == 0 { port_mode(body, d) } else { 0 };
+    if mode == 3 {
+        return true;
+    }
+    let mut p = 0;
+    while p < at {
+        let Some((kind, eb, next)) = next_rule(rules, p) else {
             return false;
         };
         if kind == rule::DNAT {
-            if let Some(e) = dnat(body) {
-                if e.proto == d.proto && e.vip == d.vip && e.vport == d.vport && e.flags != d.flags
-                {
+            if let Some(e) = dnat(eb) {
+                let same = e.same_service(d);
+                if same && e.flags != d.flags {
+                    return true;
+                }
+                if same && mode != 0 {
+                    let m = port_mode(eb, &e);
+                    if m != 0 && m != mode {
+                        return true;
+                    }
+                }
+                if !same && e.overlaps(d) {
                     return true;
                 }
             }
         }
+        p = next;
+    }
+    false
+}
+
+/// Whether `rules` carry a DNAT record.
+fn has_dnat(rules: &[u8]) -> bool {
+    let mut at = 0;
+    while let Some((kind, body, next)) = next_rule(rules, at) {
+        if kind == rule::DNAT && dnat(body).is_some() {
+            return true;
+        }
         at = next;
+    }
+    false
+}
+
+/// Whether a service of table `a` overlaps one of table `b`: two tables
+/// that may not both be stored.
+pub fn shares_service(a: &[u8], b: &[u8]) -> bool {
+    if !has_dnat(a) || !has_dnat(b) {
+        return false;
+    }
+    let mut at = 0;
+    while let Some((kind, body, next)) = next_rule(a, at) {
+        at = next;
+        if kind != rule::DNAT {
+            continue;
+        }
+        let Some(d) = dnat(body) else { continue };
+        let mut bt = 0;
+        while let Some((k, bb, bn)) = next_rule(b, bt) {
+            bt = bn;
+            if k != rule::DNAT {
+                continue;
+            }
+            if let Some(e) = dnat(bb) {
+                if e.overlaps(&d) {
+                    return true;
+                }
+            }
+        }
     }
     false
 }
@@ -580,7 +733,9 @@ pub fn filters(rules: &[u8]) -> bool {
 
 /// Check a whole table against what a provider can realize. `Err(errno)`:
 /// `EINVAL` for a malformed record (or DNAT records for one
-/// `(proto, vip, vport)` disagreeing on `translate_source` or scope),
+/// `(proto, vip, vport)` disagreeing on `translate_source` or scope, a
+/// service on any port mixing kept and set backend ports, or two
+/// overlapping services),
 /// `ENOSYS` for a mandatory kind, a direction, a scope or a source
 /// translation the provider's `caps` does not cover. An advisory kind the
 /// provider does not know is skipped.
@@ -617,7 +772,7 @@ pub fn validate(rules: &[u8], caps: u32) -> Result<(), i32> {
                 let Some(d) = dnat(body) else {
                     return Err(EINVAL);
                 };
-                if dnat_conflicts(rules, at, &d) {
+                if dnat_conflicts(rules, at, &d, body) {
                     return Err(EINVAL);
                 }
                 // `scope = any` needs DNAT; `scope = local` is met by either.
@@ -639,4 +794,175 @@ pub fn validate(rules: &[u8], caps: u32) -> Result<(), i32> {
         at = next;
     }
     Ok(())
+}
+
+/// The flow model every enforcer of these tables shares — the Linux
+/// provider's connection tracking, and the in-graph enforcers' own records
+/// (`ip`'s connections and datagram flows, `pkt_filter`'s flow table) — so a
+/// verdict lasts as long on every node.
+///
+/// - **Key.** A flow is `(proto, src, sport, dst, dport)` as its first packet
+///   carried it; a packet matches it in that direction (original) or the
+///   reverse (reply). An ICMP query is keyed by its identifier, carried as
+///   the request's source port and the reply's destination port.
+/// - **Verdict.** The first packet is judged; a flow is recorded only when it
+///   passes, and every later packet of the flow passes on that record. A
+///   packet that matches no flow is judged as new, whatever its flags.
+/// - **TCP.** A segment with no flow opens one when it passes: a SYN without
+///   ACK begins it (`SYN_SENT`); a segment with neither SYN nor RST is taken
+///   up mid-stream (`ESTABLISHED`), as the host's tracker takes up a
+///   connection it did not see open; a SYN+ACK or an RST opens nothing. On a
+///   flow, the reply's SYN+ACK makes it `SYN_RECV`, the original side's ACK
+///   `ESTABLISHED`, a FIN from one side `FIN_WAIT`, FINs from both
+///   `LAST_ACK`, the ACK after them `TIME_WAIT`, and an RST `CLOSE`; a SYN
+///   without ACK on a `TIME_WAIT` or `CLOSE` flow is a new connection on the
+///   same ports, judged afresh.
+/// - **Datagrams** (and any protocol without ports) live
+///   [`DATAGRAM_UNREPLIED_S`] until the reply direction carries a packet,
+///   then [`DATAGRAM_REPLIED_S`]; an ICMP query [`ICMP_S`].
+/// - **ICMP errors** (destination unreachable, source quench, redirect, time
+///   exceeded, parameter problem) carry the header of the packet they report;
+///   one whose embedded packet belongs to a recorded flow, travelling back to
+///   that packet's source, is part of the flow (related). Any other is judged
+///   as new, and opens nothing.
+/// - **Expiry.** A flow lives its state's timeout past its last packet.
+///
+/// The timeouts are the Linux connection tracker's defaults.
+pub mod flow {
+    /// TCP flag bits.
+    pub const TCP_FIN: u8 = 0x01;
+    pub const TCP_SYN: u8 = 0x02;
+    pub const TCP_RST: u8 = 0x04;
+    pub const TCP_ACK: u8 = 0x10;
+
+    /// TCP states.
+    pub const SYN_SENT: u8 = 1;
+    pub const SYN_RECV: u8 = 2;
+    pub const ESTABLISHED: u8 = 3;
+    pub const FIN_WAIT: u8 = 4;
+    pub const LAST_ACK: u8 = 5;
+    pub const TIME_WAIT: u8 = 6;
+    pub const CLOSE: u8 = 7;
+
+    /// Seconds a TCP flow lives idle in each state.
+    pub const TCP_SYN_SENT_S: u32 = 120;
+    pub const TCP_SYN_RECV_S: u32 = 60;
+    pub const TCP_ESTABLISHED_S: u32 = 432_000;
+    pub const TCP_FIN_WAIT_S: u32 = 120;
+    pub const TCP_LAST_ACK_S: u32 = 30;
+    pub const TCP_TIME_WAIT_S: u32 = 120;
+    pub const TCP_CLOSE_S: u32 = 10;
+    /// Seconds a datagram flow lives idle before and after its first reply.
+    pub const DATAGRAM_UNREPLIED_S: u32 = 30;
+    pub const DATAGRAM_REPLIED_S: u32 = 120;
+    /// Seconds an ICMP query flow lives idle.
+    pub const ICMP_S: u32 = 30;
+
+    /// FIN seen from the original side, and from the reply side.
+    pub const FIN_ORIG: u8 = 1 << 0;
+    pub const FIN_REPLY: u8 = 1 << 1;
+
+    /// The state a TCP segment with no flow opens, once it passes: `None`
+    /// when it opens nothing.
+    pub fn tcp_opens(flags: u8) -> Option<u8> {
+        if flags & TCP_RST != 0 {
+            return None;
+        }
+        if flags & TCP_SYN != 0 {
+            if flags & (TCP_ACK | TCP_FIN) == 0 {
+                return Some(SYN_SENT);
+            }
+            return None;
+        }
+        Some(ESTABLISHED)
+    }
+
+    /// Whether a segment with `flags` on a flow in `state` begins a new
+    /// connection on the same ports (judged afresh).
+    pub fn tcp_reopens(state: u8, flags: u8) -> bool {
+        (state == TIME_WAIT || state == CLOSE)
+            && flags & TCP_SYN != 0
+            && flags & (TCP_ACK | TCP_RST) == 0
+    }
+
+    /// The state and FIN bits after a segment with `flags` on a flow in
+    /// `state` with `fins`; `reply` when it travels the reply direction.
+    pub fn tcp_next(state: u8, fins: u8, reply: bool, flags: u8) -> (u8, u8) {
+        if flags & TCP_RST != 0 {
+            return (CLOSE, fins);
+        }
+        let side = if reply { FIN_REPLY } else { FIN_ORIG };
+        match state {
+            SYN_SENT => {
+                if reply && flags & TCP_SYN != 0 && flags & TCP_ACK != 0 {
+                    (SYN_RECV, fins)
+                } else {
+                    (SYN_SENT, fins)
+                }
+            }
+            SYN_RECV => {
+                if !reply && flags & TCP_ACK != 0 && flags & TCP_SYN == 0 {
+                    after_fin(ESTABLISHED, fins, side, flags)
+                } else {
+                    (SYN_RECV, fins)
+                }
+            }
+            ESTABLISHED | FIN_WAIT => after_fin(state, fins, side, flags),
+            LAST_ACK => {
+                if flags & TCP_FIN == 0 && flags & TCP_ACK != 0 {
+                    (TIME_WAIT, fins)
+                } else {
+                    (LAST_ACK, fins)
+                }
+            }
+            s => (s, fins),
+        }
+    }
+
+    fn after_fin(state: u8, fins: u8, side: u8, flags: u8) -> (u8, u8) {
+        if flags & TCP_FIN == 0 {
+            return (state, fins);
+        }
+        let f = fins | side;
+        if f == FIN_ORIG | FIN_REPLY {
+            (LAST_ACK, f)
+        } else {
+            (FIN_WAIT, f)
+        }
+    }
+
+    /// Seconds a TCP flow in `state` lives idle.
+    pub fn tcp_timeout_s(state: u8) -> u32 {
+        match state {
+            SYN_SENT => TCP_SYN_SENT_S,
+            SYN_RECV => TCP_SYN_RECV_S,
+            ESTABLISHED => TCP_ESTABLISHED_S,
+            FIN_WAIT => TCP_FIN_WAIT_S,
+            LAST_ACK => TCP_LAST_ACK_S,
+            TIME_WAIT => TCP_TIME_WAIT_S,
+            _ => TCP_CLOSE_S,
+        }
+    }
+
+    /// ICMP types.
+    pub const ICMP_ECHO_REPLY: u8 = 0;
+    pub const ICMP_ECHO: u8 = 8;
+    pub const ICMP_TIMESTAMP: u8 = 13;
+    pub const ICMP_TIMESTAMP_REPLY: u8 = 14;
+
+    /// Whether ICMP `t` reports an error and carries the offending packet's
+    /// header.
+    pub fn icmp_error(t: u8) -> bool {
+        matches!(t, 3 | 4 | 5 | 11 | 12)
+    }
+
+    /// Whether ICMP `t` is a query that opens a flow (its reply answers it).
+    pub fn icmp_request(t: u8) -> bool {
+        t == ICMP_ECHO || t == ICMP_TIMESTAMP
+    }
+
+    /// Whether ICMP `t` answers a query.
+    pub fn icmp_reply(t: u8) -> bool {
+        t == ICMP_ECHO_REPLY || t == ICMP_TIMESTAMP_REPLY
+    }
 }

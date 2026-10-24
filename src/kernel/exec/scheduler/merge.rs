@@ -707,6 +707,30 @@ impl SchedulerState {
         ceiling: usize,
         live: usize,
     ) -> Result<(), crate::kernel::mem::table::TableError> {
+        // SAFETY: the caller's contract.
+        unsafe { self.reserve_module_tables(ceiling)? };
+        // Every per-module table is indexed by the same slot, so all of them
+        // commit the same count: what the graph needs, or what any of them
+        // already holds, whichever is more. A table touched before its plan
+        // sized it holds its first use's slots, which may be past the plan's
+        // ceiling; the whole group is then reserved to hold them too, or the
+        // tables the plan reached first could not grow to that count.
+        let held = self.module_tables_committed();
+        if held > ceiling {
+            // SAFETY: the caller's contract.
+            unsafe { self.reserve_module_tables(held)? };
+        }
+        self.grow_module_tables(live.max(held))
+    }
+
+    /// Reserve every per-module table for `ceiling` slots.
+    ///
+    /// # Safety
+    /// As [`size_module_tables`](Self::size_module_tables).
+    unsafe fn reserve_module_tables(
+        &mut self,
+        ceiling: usize,
+    ) -> Result<(), crate::kernel::mem::table::TableError> {
         self.modules.reserve(ceiling)?;
         self.ports.reserve(ceiling)?;
         self.port_caps.reserve(ceiling)?;
@@ -751,11 +775,9 @@ impl SchedulerState {
         for t in self.domain_exec_order.iter() {
             t.reserve(ceiling)?;
         }
-        // Every per-module table is indexed by the same slot, so all of them
-        // commit the same count: what the graph needs, or what any of them
-        // already holds, whichever is more.
-        let live = live.max(self.module_tables_committed());
-        self.grow_module_tables(live)
+        // SAFETY: the caller's contract covers the heap table too: it is a
+        // per-module table, reserved with the rest.
+        unsafe { crate::kernel::mem::heap::reserve_heaps(ceiling) }
     }
 
     /// The most slots any per-module table holds committed. A table touched
@@ -809,7 +831,7 @@ impl SchedulerState {
         for t in self.domain_exec_order.iter() {
             m = m.max(t.len());
         }
-        m
+        m.max(crate::kernel::mem::heap::heap_slots())
     }
 
     /// Commit per-module slots until `n` are live, within the reserved
@@ -862,6 +884,7 @@ impl SchedulerState {
         for t in self.domain_exec_order.iter() {
             t.grow(n)?;
         }
+        crate::kernel::mem::heap::grow_heaps(n)?;
         Ok(())
     }
 
@@ -874,16 +897,23 @@ impl SchedulerState {
         ceiling: usize,
         live: usize,
     ) -> Result<(), crate::kernel::mem::table::TableError> {
-        self.edges.reserve(ceiling)?;
-        self.flow_last_fill.reserve(ceiling)?;
-        self.flow_stalls.reserve(ceiling)?;
-        // The per-edge tables share an index, so they commit one count, as
-        // the per-module tables do.
-        let live = live
-            .max(self.edges.len())
-            .max(self.flow_last_fill.len())
-            .max(self.flow_stalls.len());
-        self.grow_edge_tables(live)
+        // The per-edge tables share an index, so they commit one count, and
+        // hold what any of them already holds, as the per-module tables do.
+        let mut ceiling = ceiling;
+        loop {
+            self.edges.reserve(ceiling)?;
+            self.flow_last_fill.reserve(ceiling)?;
+            self.flow_stalls.reserve(ceiling)?;
+            let held = self
+                .edges
+                .len()
+                .max(self.flow_last_fill.len())
+                .max(self.flow_stalls.len());
+            if held <= ceiling {
+                return self.grow_edge_tables(live.max(held));
+            }
+            ceiling = held;
+        }
     }
 
     /// Commit per-edge slots until `n` are live.
@@ -2317,15 +2347,16 @@ fn pacer_next_deadline_us_unbounded(domain_id: usize) -> u32 {
 // surface: the shared-runner deadline-merge, the skip-idle runnable
 // predicate, and the generation-reset on slot reuse. A single resident graph
 // reduces to the per-domain `pacer_next_deadline_us` path above. The table is
-// statically bounded and the hot path allocates nothing.
+// sized at boot and the hot path allocates nothing.
 //
 // Each instance carries its own AIMD `PacerState` and reuses the same ladder
 // constants as `pacer_apply_cadence`.
-
-/// Bounded graph/domain pacer-instance table size. Sized for a
-/// handful of resident graphs across the domains; admission rejects configs
-/// that would need more (the tools `MAX_PACER_INSTANCES` gate).
-pub const MAX_GRAPH_PACERS: usize = 16;
+//
+// The table holds one instance per owner slot and execution domain, at
+// `slot * MAX_DOMAINS + domain`: a per-owner table, sized at boot with the
+// owner table (`size_graph_pacers`), so every resident graph the owner table
+// can seat has its instances, and a lookup is an index, never a search that
+// can come up full.
 
 #[derive(Clone, Copy)]
 pub(crate) struct GraphPacer {
@@ -2363,45 +2394,60 @@ impl GraphPacer {
     }
 }
 
-pub(crate) static mut GRAPH_PACERS: [GraphPacer; MAX_GRAPH_PACERS] =
-    [GraphPacer::new(); MAX_GRAPH_PACERS];
+/// The graph-local pacer instances, one per owner slot and domain (see the
+/// section comment). The static profiles hold the compiled owner table's
+/// slots.
+pub(crate) static mut GRAPH_PACERS: crate::kernel::mem::table::Table<
+    GraphPacer,
+    { crate::kernel::workload::owner::MAX_OWNERS * MAX_DOMAINS },
+> = crate::boot_table!(
+    crate::kernel::workload::owner::MAX_OWNERS * MAX_DOMAINS,
+    GraphPacer::new(),
+    crate::abi::contracts::resource::POOL_OWNERS,
+    MAX_DOMAINS
+);
 
-/// Resolve the bounded-table index for `(graph_slot, domain)`, allocating a
-/// free slot on first use. A generation mismatch (the owner slot was reused by
-/// a new graph) RESETS the instance so the new graph cannot inherit the old
-/// graph's heat/floor/dwell. Returns `None` if the table is full
-/// (the build-time admission gate prevents this for valid configs). Not a
-/// hot-path scan in steady state — the runner caches the index at prepare time.
+/// Size the pacer table for an owner table of `owners` slots: an instance
+/// per slot and domain, all committed.
+///
+/// # Safety
+/// As `Table::reserve`: graph preparation, with no pacer instance borrowed.
+pub(crate) unsafe fn size_graph_pacers(
+    owners: usize,
+) -> Result<(), crate::kernel::mem::table::TableError> {
+    let n = owners
+        .checked_mul(MAX_DOMAINS)
+        .ok_or(crate::kernel::mem::table::TableError::Ceiling)?;
+    // SAFETY: the caller's contract.
+    let t = unsafe { &*core::ptr::addr_of!(GRAPH_PACERS) };
+    // SAFETY: the caller's contract.
+    unsafe { t.reserve(n)? };
+    t.grow(n)
+}
+
+/// The instance of `(graph_slot, domain)`: its index in the table. The
+/// instance is claimed on first use, and a generation mismatch (the owner
+/// slot was reused by a new graph) RESETS it, so the new graph cannot inherit
+/// the old graph's heat/floor/dwell. `None` only for a key no resident graph
+/// can have: a slot past the owner table, or a domain past `MAX_DOMAINS`.
 pub(crate) fn graph_pacer_index(graph_slot: u16, generation: u32, domain: u8) -> Option<usize> {
+    if domain as usize >= MAX_DOMAINS {
+        return None;
+    }
+    let i = (graph_slot as usize)
+        .checked_mul(MAX_DOMAINS)?
+        .checked_add(domain as usize)?;
     let gp = &raw mut GRAPH_PACERS;
     // SAFETY: scheduler-thread-exclusive access to the table.
-    let t = unsafe { &mut *gp };
-    // Existing instance for this key?
-    for (i, p) in t.iter_mut().enumerate() {
-        if p.active && p.graph_slot == graph_slot && p.domain == domain {
-            if p.generation != generation {
-                // Slot reused by a new graph — reset (generation guard).
-                *p = GraphPacer::new();
-                p.active = true;
-                p.graph_slot = graph_slot;
-                p.generation = generation;
-                p.domain = domain;
-            }
-            return Some(i);
-        }
+    let p = unsafe { (&mut *gp).get_mut(i)? };
+    if !p.active || p.generation != generation {
+        *p = GraphPacer::new();
+        p.active = true;
+        p.graph_slot = graph_slot;
+        p.generation = generation;
+        p.domain = domain;
     }
-    // Allocate a free slot.
-    for (i, p) in t.iter_mut().enumerate() {
-        if !p.active {
-            *p = GraphPacer::new();
-            p.active = true;
-            p.graph_slot = graph_slot;
-            p.generation = generation;
-            p.domain = domain;
-            return Some(i);
-        }
-    }
-    None // table full — admission should have rejected this config
+    Some(i)
 }
 
 /// AIMD ladder step for a graph-local instance (mirrors `pacer_apply_cadence`'s
@@ -2468,7 +2514,7 @@ pub fn graph_pacer_set_signals(
     };
     let gp = &raw mut GRAPH_PACERS;
     // SAFETY: scheduler-thread-exclusive; idx in bounds.
-    let p = unsafe { &mut (*gp)[idx] };
+    let p = unsafe { &mut (&mut *gp)[idx] };
     p.work = work;
     p.burst = burst;
     p.wake = wake;
@@ -2494,7 +2540,7 @@ pub fn graph_pacer_deadline(
     };
     let gp = &raw mut GRAPH_PACERS;
     // SAFETY: scheduler-thread-exclusive; idx in bounds.
-    let p = unsafe { &mut (*gp)[idx] };
+    let p = unsafe { &mut (&mut *gp)[idx] };
     let floor = floor_us.max(tick_min_us).min(tick_max_us);
     // Must mirror `graph_pacer_runnable` exactly: a graph runnable only because
     // a timer/liveness deadline is due is NOT idle, or it would be relaxed to
@@ -2541,7 +2587,7 @@ pub fn graph_pacer_shared_runner_deadline(
         if let Some(idx) = graph_pacer_index(slot, gen_, domain) {
             let gp = &raw const GRAPH_PACERS;
             // SAFETY: scheduler-thread-exclusive read.
-            let p = unsafe { &(*gp)[idx] };
+            let p = unsafe { &(&*gp)[idx] };
             if graph_pacer_runnable(p) {
                 any_runnable = true;
                 min_runnable = min_runnable.min(d);

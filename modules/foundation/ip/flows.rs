@@ -25,10 +25,15 @@
 //! flow's two keys are one. The index is four times the table and never
 //! rehashed.
 //!
-//! **Expiry.** A flow is live until `dg_flow_idle_s` passes without traffic:
-//! checked lazily on lookup, and by a sweep sliced across steps.
+//! **Expiry.** The contract's flow model (`net::policy::flow`), as the host's
+//! connection tracking keeps a datagram flow: a flow nobody has answered is
+//! live until `dg_flow_idle_s` passes without traffic (by default the
+//! model's `DATAGRAM_UNREPLIED_S`), an answered one until the longer of that
+//! and `DATAGRAM_REPLIED_S`. Checked lazily on lookup, and by a sweep sliced
+//! across steps.
 
 use super::*;
+use abi::contracts::net::policy as np;
 
 /// Flows held when the graph declares none (`max_dg_flows`), and each
 /// lane's floor (`dg_flow_floor`), and the idle timeout (`dg_flow_idle_s`).
@@ -40,7 +45,7 @@ pub(crate) const FLOWS_DEFAULT: u16 = 4;
 pub(crate) const FLOOR_DEFAULT: u8 = 16;
 #[cfg(not(target_arch = "aarch64"))]
 pub(crate) const FLOOR_DEFAULT: u8 = 1;
-pub(crate) const IDLE_DEFAULT_S: u16 = 30;
+pub(crate) const IDLE_DEFAULT_S: u16 = np::flow::DATAGRAM_UNREPLIED_S as u16;
 /// Entries one step's expiry sweep visits.
 const SWEEP_SLICE: usize = 64;
 
@@ -165,7 +170,12 @@ fn idle_ms(s: &IpState) -> u32 {
 
 #[inline(always)]
 fn expired(s: &IpState, f: &DgFlow, now: u32) -> bool {
-    now.wrapping_sub(f.last_ms) >= idle_ms(s)
+    let idle = if f.flags & F_REPLIED != 0 {
+        idle_ms(s).max(np::flow::DATAGRAM_REPLIED_S * 1000)
+    } else {
+        idle_ms(s)
+    };
+    now.wrapping_sub(f.last_ms) >= idle
 }
 
 /// The live flow endpoint `ep` sends to `(ip, port)` by (its send key), or

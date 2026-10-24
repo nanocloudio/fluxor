@@ -324,6 +324,11 @@ const DNS_PEND_LEADER: u8 = 0x02;
 /// A lookup that only warms the cache (a named datagram send): nothing is
 /// dialled and nothing is reported when it completes or fails.
 const DNS_PEND_CACHE_ONLY: u8 = 0x04;
+/// The leader is asked again under its next search name on the resolver's
+/// next step (`step_resolver`), never from the receive path that took the
+/// negative answer: a name service on this node is delivered locally, and
+/// a send from inside `udp_demux` would re-enter it.
+const DNS_PEND_REASK: u8 = 0x08;
 
 /// One resolved name.
 #[repr(C)]
@@ -1797,6 +1802,8 @@ struct IpState {
     rt_overflow: u32,
     /// The primary address the held addresses were last realized against.
     rt_realized_ip: u32,
+    /// The primary's netmask the peer routes were last checked against.
+    rt_realized_mask: u32,
     /// Moves on every adopted table: cached next hops and source choices
     /// are looked up again.
     route_epoch: u32,
@@ -1964,7 +1971,9 @@ mod params_def {
             => |s, d, len| { s.max_held = p_u16(d, len, 0, 0); };
         // Datagram flows held (egress liveness, verdicts, service pins),
         // each lane's reserved floor of them, and how long an idle flow
-        // lives. Construction requires max_dg_flows >= (lanes + 1) x floor.
+        // nobody has answered lives (an answered one lives at least the
+        // flow model's DATAGRAM_REPLIED_S). Construction requires
+        // max_dg_flows >= (lanes + 1) x floor.
         15, max_dg_flows, u16, flows::FLOWS_DEFAULT
             => |s, d, len| { s.max_dg_flows = p_u16(d, len, 0, flows::FLOWS_DEFAULT); };
         16, dg_flow_floor, u8, flows::FLOOR_DEFAULT
@@ -4178,7 +4187,6 @@ pub unsafe extern "C" fn module_new(
         let sys = &*s.syscalls;
         s.net_in_chan = dev_channel_port(sys, 0, NET_IN_PORT); // in[1]: net commands from consumer
         s.net_out_chan = dev_channel_port(sys, 1, 1); // out[1]: net messages to consumer
-        s.addr_ctl_chan = dev_channel_port(sys, 0, ADDR_CTL_PORT); // in[2]: addr control (optional)
         s.addr_evt_chan = dev_channel_port(sys, 1, ADDR_EVT_PORT); // out[5]: emission events (optional)
         s.addr_generation = 0;
         s.tx_fenced = 0;
@@ -4221,6 +4229,10 @@ pub unsafe extern "C" fn module_new(
             reg.as_mut_ptr(),
             reg.len(),
         );
+        // in[2]: addr control (optional). Read after registering: on a node
+        // that creates workloads the kernel gives the unwired port its
+        // channel when it takes the registration.
+        s.addr_ctl_chan = dev_channel_port(sys, 0, ADDR_CTL_PORT);
 
         // Address table starts empty; slot 0 is the primary and is kept in
         // sync with `local_ip` (host-owned, owner_tag 0, flags.PRIMARY). Its
@@ -7330,7 +7342,7 @@ unsafe fn dg_route(s: &mut IpState, ep: usize, dst_ip: u32, dst_port: u16) -> Re
             // A service address resolves to a backend first: the backend is
             // what the far end, and its policy, sees.
             let (peer_ip, peer_port) = match svc {
-                Some(v) => match service::pick(s, v, service::salt(s)) {
+                Some(v) => match service::pick(s, v, service::salt(s), dst_port) {
                     Some(b) => b,
                     None => return Err(-111), // ECONNREFUSED: no backends
                 },
@@ -7376,10 +7388,10 @@ unsafe fn dg_route(s: &mut IpState, ep: usize, dst_ip: u32, dst_port: u16) -> Re
     if let Some(v) = svc {
         let f = *flows::get(s, fi);
         if f.pin_gen != s.svc_gen {
-            if service::has(s, v, f.peer_ip, f.peer_port) {
+            if service::has(s, v, f.peer_ip, f.peer_port, dst_port) {
                 flows::get(s, fi).pin_gen = s.svc_gen;
             } else {
-                match service::pick(s, v, service::salt(s)) {
+                match service::pick(s, v, service::salt(s), dst_port) {
                     Some((a, p)) => flows::repin(s, fi, a, p, s.svc_gen),
                     None => return Err(-111),
                 }
@@ -9514,7 +9526,7 @@ unsafe fn connect_v4(s: &mut IpState, ip: u32, port: u16, requester_tag: Request
     // this node is reached directly. The stream reports the service address
     // as its peer.
     if let Some(v) = service::lookup(s, POLICY_PROTO_TCP, ip, port) {
-        let Some((addr, bport)) = service::pick(s, v, service::salt(s)) else {
+        let Some((addr, bport)) = service::pick(s, v, service::salt(s), port) else {
             net_send_reply_error(s, -111, requester_tag); // ECONNREFUSED: no backends
             return;
         };
@@ -10018,7 +10030,7 @@ unsafe fn resolver_start(
         // owner's own address when that backend is inside its cluster.
         let (srv_ip, srv_port) =
             match service::lookup(s, POLICY_PROTO_UDP, server, dns_wire::DNS_PORT) {
-                Some(v) => match service::pick(s, v, service::salt(s)) {
+                Some(v) => match service::pick(s, v, service::salt(s), dns_wire::DNS_PORT) {
                     Some(b) => b,
                     None => return Err(-2), // ENOENT: the name service has no backends
                 },
@@ -10177,11 +10189,27 @@ unsafe fn resolver_rx(s: &mut IpState, a: &DgAddr, data: *const u8, len: usize) 
         }
         dns_wire::AnswerA::Negative => match next_search(s, e.lane, e.search) {
             // The next name of the search list, under a fresh id.
-            Some(next) => resolver_retry(s, leader, id, Some(next)),
+            Some(next) => resolver_reask(s, leader, id, next),
             None => resolver_fail_group(s, id, -2), // ENOENT
         },
         dns_wire::AnswerA::Unrelated => {}
     }
+}
+
+/// Move query `id`'s entries to search name `next` and mark its leader to be
+/// asked again on the resolver's next step.
+unsafe fn resolver_reask(s: &mut IpState, leader: usize, id: u16, next: u8) {
+    let total = dns_pending_total(s);
+    let mut j = 0;
+    while j < total {
+        let e = dns_pending_at(s, j);
+        if e.flags & DNS_PEND_ACTIVE != 0 && e.id == id {
+            e.search = next;
+            e.retries = 0;
+        }
+        j += 1;
+    }
+    dns_pending_at(s, leader).flags |= DNS_PEND_REASK;
 }
 
 /// Ask query `id` again (led by `leader`) under a fresh id, every entry
@@ -10226,9 +10254,12 @@ unsafe fn step_resolver(s: &mut IpState) {
             let e = dns_pending_at(s, i);
             (e.flags, e.retries, e.id, e.deadline_ms)
         };
-        if flags & (DNS_PEND_ACTIVE | DNS_PEND_LEADER) == (DNS_PEND_ACTIVE | DNS_PEND_LEADER)
-            && deadline_passed(now_ms, deadline_ms)
-        {
+        let leads =
+            flags & (DNS_PEND_ACTIVE | DNS_PEND_LEADER) == (DNS_PEND_ACTIVE | DNS_PEND_LEADER);
+        if leads && flags & DNS_PEND_REASK != 0 {
+            dns_pending_at(s, i).flags &= !DNS_PEND_REASK;
+            resolver_retry(s, i, id, None);
+        } else if leads && deadline_passed(now_ms, deadline_ms) {
             if retries < DNS_QUERY_RETRIES {
                 dns_pending_at(s, i).retries = retries + 1;
                 resolver_retry(s, i, id, None);

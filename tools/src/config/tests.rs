@@ -410,111 +410,31 @@ mod scheduler_validation_tests {
     }
 
     #[test]
-    fn multi_graph_workloads_exceeding_pacer_table_rejected() {
-        // Resident graphs (base + `workloads:`) × domains must fit the kernel's
-        // static GRAPH_PACERS table (16 slots). A base
-        // graph (1 domain) plus 16 single-domain workloads = 17 instances → reject.
+    fn many_resident_workloads_need_no_pacer_table_gate() {
+        // The kernel holds a pacer instance and a resident-graph entry per
+        // owner slot and execution domain, sized at boot with the owner table,
+        // so a base graph plus forty single-domain workloads — past any fixed
+        // table — passes the adaptive-tick gates, adaptive or fixed-tick. The
+        // owner pool's bound is the boot plan's (`capacity::check_boot_plan`).
         let modules = vec![json!({"name": "m", "type": "passthrough"})];
         let names = vec!["main".to_string()];
         let ticks = vec![100u16];
         let manifests = std::collections::HashMap::new();
-        let domain = json!({
+        let adaptive = json!({
             "name": "main", "cores": [0], "adaptive_flags": 1,
             "tick_min_us": 100, "tick_max_us": 8000
         });
-        let workloads_over: Vec<_> = (0..16)
+        let fixed = json!({"name": "main", "cores": [0]});
+        let workloads: Vec<_> = (0..40)
             .map(|i| json!({"modules": [{"name": format!("p{i}"), "type": "passthrough", "domain": 0}]}))
             .collect();
-        let cfg_over =
-            json!({"execution": {"domains": [domain.clone()]}, "workloads": workloads_over});
-        // resolved_target None ⇒ event-driven (Linux); skips the bcm wake-policy
-        // gate so this isolates the pacer-table gate.
-        let err = validate_adaptive_tick(
-            &cfg_over,
-            &modules,
-            100,
-            &names,
-            &ticks,
-            &manifests,
-            &[],
-            None,
-        )
-        .expect_err("17 (graph,domain) pacer instances must exceed the 16-slot table");
-        assert!(
-            format!("{err:?}").contains("pacer table")
-                && format!("{err:?}").contains("MAX_GRAPH_PACERS"),
-            "expected the pacer-table overflow diagnostic, got: {err:?}"
-        );
-
-        // 3 workloads → 1 (base) + 3 = 4 instances → fits.
-        let workloads_ok: Vec<_> = (0..3)
-            .map(|i| json!({"modules": [{"name": format!("p{i}"), "type": "passthrough", "domain": 0}]}))
-            .collect();
-        let cfg_ok = json!({"execution": {"domains": [domain]}, "workloads": workloads_ok});
-        validate_adaptive_tick(
-            &cfg_ok,
-            &modules,
-            100,
-            &names,
-            &ticks,
-            &manifests,
-            &[],
-            None,
-        )
-        .expect("4 (graph,domain) pacer instances must fit the 16-slot table");
-    }
-
-    #[test]
-    fn multi_graph_workloads_overflow_rejected_without_adaptive_flags() {
-        // The pacer-table gate must run even when NO domain sets adaptive_flags:
-        // the runtime keys/steps the resident-graph table for any multi-graph
-        // config (fixed-tick too), so an overflowing `workloads:` set with no adaptive
-        // flags must still be rejected, not silently dropped at runtime.
-        let modules = vec![json!({"name": "m", "type": "passthrough"})];
-        let names = vec!["main".to_string()];
-        let ticks = vec![100u16];
-        let manifests = std::collections::HashMap::new();
-        // domain with NO adaptive_flags (fixed-tick).
-        let domain = json!({"name": "main", "cores": [0]});
-        let workloads_over: Vec<_> = (0..16)
-            .map(|i| json!({"modules": [{"name": format!("p{i}"), "type": "passthrough", "domain": 0}]}))
-            .collect();
-        let cfg_over =
-            json!({"execution": {"domains": [domain.clone()]}, "workloads": workloads_over});
-        let err = validate_adaptive_tick(
-            &cfg_over,
-            &modules,
-            100,
-            &names,
-            &ticks,
-            &manifests,
-            &[],
-            None,
-        )
-        .expect_err("17 fixed-tick pacer instances must still exceed the 16-slot table");
-        assert!(
-            format!("{err:?}").contains("pacer table")
-                && format!("{err:?}").contains("MAX_GRAPH_PACERS"),
-            "expected the pacer-table overflow diagnostic even with no adaptive \
-             flags, got: {err:?}"
-        );
-
-        // 2 fixed-tick workloads → 1 + 2 = 3 instances → fits.
-        let workloads_ok: Vec<_> = (0..2)
-            .map(|i| json!({"modules": [{"name": format!("p{i}"), "type": "passthrough", "domain": 0}]}))
-            .collect();
-        let cfg_ok = json!({"execution": {"domains": [domain]}, "workloads": workloads_ok});
-        validate_adaptive_tick(
-            &cfg_ok,
-            &modules,
-            100,
-            &names,
-            &ticks,
-            &manifests,
-            &[],
-            None,
-        )
-        .expect("3 fixed-tick pacer instances must fit the 16-slot table");
+        for domain in [adaptive, fixed] {
+            let cfg = json!({"execution": {"domains": [domain]}, "workloads": workloads.clone()});
+            // resolved_target None ⇒ event-driven (Linux): the bcm wake-policy
+            // gate does not apply.
+            validate_adaptive_tick(&cfg, &modules, 100, &names, &ticks, &manifests, &[], None)
+                .expect("forty resident workloads need no pacer-table admission");
+        }
     }
 
     #[test]

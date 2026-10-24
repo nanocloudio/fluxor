@@ -74,8 +74,9 @@ Defaults are aarch64's, with the MCU-class figure after the slash:
   (4 / 0), `max_held` (0) — the `net.route` tables realized. Entries the
   node's tables hold past these are reported `refused(table_full)`.
 - `max_dg_flows` (1024 / 4), `dg_flow_floor` (16 / 1 per lane),
-  `dg_flow_idle_s` (30) — the datagram flow table; construction requires
-  `max_dg_flows >= (lanes + 1) x dg_flow_floor`.
+  `dg_flow_idle_s` (30) — the datagram flow table, and how long a flow
+  nobody answered lives idle (an answered one lives at least 120 s);
+  construction requires `max_dg_flows >= (lanes + 1) x dg_flow_floor`.
 - `dns_cache` (8 / 2), `dns_pending` (4 / 2) — resolver entries per owner.
 - `policy_tables` (comma-separated names), `policy_bytes` (8192 / 1024) —
   the `net.policy` tables this instance enforces and translates.
@@ -131,18 +132,33 @@ and realizes what the node agent writes to the kernel:
   prefixes; anything else leaves from the node's address (a datagram from
   the endpoint's egress port, its replies admitted only on a live flow).
   Peer routes are realized when the peer is on the primary's link (direct
-  carriage); held addresses in `deliver` mode become node addresses
+  carriage) and the route does not overlap that link: a route whose prefix
+  covers the primary's connected prefix, or lies inside it, is never used
+  and reads `refused(conflict)` — checked again when the primary's address
+  or netmask changes — so the link and its neighbours are always reached
+  directly. Held addresses in `deliver` mode become node addresses
   (`held.rs`). `announce`, forwarding between segments and translated
   egress are not offered here, and the kernel's CAPS say so.
 - **`net.policy` tables** named by `policy_tables` (`policy.rs`): this
-  module ATTACHes as their one enforcer and judges each flow's first packet
-  with the shared evaluator — streams at connect and at an inbound SYN,
-  datagrams when their flow begins (and per packet for an inbound datagram
-  on no flow), echo requests to a workload. Traffic the node itself sends
-  or terminates is not judged. A flow keeps its verdict for its lifetime.
+  module ATTACHes as their one enforcer, declaring `policy_bytes` as the
+  most of each it holds (the store refuses a larger REPLACE, `E2BIG`), and
+  judges each flow's first packet with the shared evaluator — streams at
+  connect and at an inbound SYN, datagrams when their flow begins (and per
+  packet for an inbound datagram on no flow), echo requests to a workload.
+  Traffic the node itself sends or terminates is not judged. A flow keeps
+  its verdict for its lifetime, by the contract's flow model
+  (`net::policy::flow`): a stream for as long as its connection, a datagram
+  flow `dg_flow_idle_s` idle while unanswered and at least the model's
+  `DATAGRAM_REPLIED_S` once answered. A table this module cannot hold (one
+  stored before it bound, past `policy_bytes`) is enforced closed: every
+  flow it judges is refused and its services are withdrawn until a read of
+  it fits, and it is reported not applied, so its `ENFORCED` stays clear.
 - **Service translation** of `scope = local` DNAT records for the node's own
   traffic (`service.rs`): a dial, a datagram or a resolver query to a
-  service address goes to one of its backends. A stream keeps its backend;
+  service address goes to one of its backends. A service for any protocol
+  (`proto` 0) or on any port (`vport` 0) is matched as the store admits it —
+  no two services on the node overlap — and a backend port of 0 is the port
+  dialled. A stream keeps its backend;
   a datagram flow re-picks when its backend leaves the set; a service with
   no backends refuses (`ECONNREFUSED`, `MSG_DG_ERROR`). Inbound translation
   for clients off the node is not offered (`DNAT_LOCAL` without `DNAT`).

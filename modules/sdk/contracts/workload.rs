@@ -54,6 +54,16 @@
 // handle of the runtime's — reaches a workload unless the spec grants it; a
 // backend that starts a workload as a host process passes it its granted
 // stdio and nothing else.
+//
+// Handle binding (normative): a workload acts for the owner whose module
+// created it. Every op that takes its handle — START, WAIT, SIGNAL, PAUSE,
+// RESUME, DESTROY, LANES, and a host class's ops that carry the handle —
+// and LOOKUP and DESTROY by identity answer a caller of any other owner
+// `EACCES`. A caller acting with the node's authority (the node agent, or
+// an owner admitted with it) acts on every workload. The binding is the
+// owner's, not one module's, so a module of that owner that lost its handle
+// recovers it with LOOKUP; LOOKUP never moves it. A CREATE being staged is
+// continued or abandoned only by the owner that began it.
 
 /// `CREATE` — admit and instantiate a workload from a spec (below); returns a
 /// tagged `WorkloadHandle` fd, or a negative errno. The caller must hold the
@@ -224,13 +234,23 @@ pub const CAPS: u32 = 0x1AFF;
 
 // ---- posture ladder — Tier-1 `posture` field values ----
 
+// The posture is the isolation: a backend whose source also says whether
+// the workload is isolated (a backend-defined source kind may) refuses
+// (`EINVAL`) a source that disagrees with the posture — isolation asked for
+// at `POSTURE_SHARED`, or none at `POSTURE_ISOLATED` or above — rather than
+// let either one decide alone.
+
 /// No isolation — same address space / null sandbox (PROC semantics).
 pub const POSTURE_SHARED: u8 = 0;
 /// Memory + resource isolation, realized by the platform's strongest
 /// available protection mechanism.
 pub const POSTURE_ISOLATED: u8 = 1;
 /// `isolated` + reduced attack surface (Linux: reduced syscall + privilege
-/// surface; metal: strongest protection-domain config). Backend refinements are Tier-2.
+/// surface; metal: strongest protection-domain config). Backend refinements
+/// are Tier-2. A backend advertises it in [`CAPS`] only where it realizes
+/// it; a request that widens the reduced surface back out (an opt-out a
+/// backend's source offers for a privileged workload) is `EINVAL` at this
+/// posture.
 pub const POSTURE_HARDENED: u8 = 2;
 
 // ---- source kind — Tier-1 `source_kind`; backend is placement-resolved ----

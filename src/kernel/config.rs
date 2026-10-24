@@ -417,10 +417,46 @@ const fn lookup(table: &[(u16, usize)], pool: u16) -> Option<usize> {
     None
 }
 
+/// A capacity profile's pool tables as data: its static tables
+/// (`STATIC_POOLS`) and its default reserves (`DEFAULT_RESERVES`). The boot
+/// plan (`resource_ledger`) reads them through one of these, the compiled
+/// profile's being [`PROFILE`], so a host test can run the same plan against
+/// another profile's tables — a static one's, which a hosted kernel does not
+/// compile.
+#[derive(Clone, Copy, Debug)]
+pub struct CapacityProfile {
+    /// `(pool, size)` of every pool the profile holds as a static table.
+    pub static_pools: &'static [(u16, usize)],
+    /// `(pool, reserve)`: what the plan adds to a pool's derived size when
+    /// the envelope carries no entry for it.
+    pub default_reserves: &'static [(u16, usize)],
+}
+
+impl CapacityProfile {
+    /// The static size of `pool`, `None` where the profile sizes it at boot.
+    pub const fn static_pool(&self, pool: u16) -> Option<usize> {
+        lookup(self.static_pools, pool)
+    }
+
+    /// The default reserve of `pool`, `0` where it has none.
+    pub const fn default_reserve(&self, pool: u16) -> usize {
+        match lookup(self.default_reserves, pool) {
+            Some(n) => n,
+            None => 0,
+        }
+    }
+}
+
+/// This kernel's own capacity profile.
+pub const PROFILE: CapacityProfile = CapacityProfile {
+    static_pools: STATIC_POOLS,
+    default_reserves: DEFAULT_RESERVES,
+};
+
 /// The static size of `pool` on this profile, `None` where the profile sizes
 /// the pool at boot (every pool on Linux, bcm2712 and RP).
 pub const fn static_pool(pool: u16) -> Option<usize> {
-    lookup(STATIC_POOLS, pool)
+    PROFILE.static_pool(pool)
 }
 
 /// The compiled size of a static table, for its array type: the profile's
@@ -437,10 +473,7 @@ pub const fn static_slots(pool: u16) -> usize {
 /// config carries no envelope entry for it: the profile's default, `0` where
 /// the pool is a static table (whose ceiling is the table).
 pub const fn default_reserve(pool: u16) -> usize {
-    match lookup(DEFAULT_RESERVES, pool) {
-        Some(n) => n,
-        None => 0,
-    }
+    PROFILE.default_reserve(pool)
 }
 
 const _: () = assert!(

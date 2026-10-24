@@ -12,7 +12,11 @@
 //!   anything else from the node's.
 //! - **Peer routes** are `prefix → peer node`, looked up before the single
 //!   default gateway; a connection caches its next hop under the route
-//!   epoch, so a stream pays the lookup once per table change.
+//!   epoch, so a stream pays the lookup once per table change. A route
+//!   whose prefix overlaps the primary's link (its connected prefix) is
+//!   never used and is reported `refused(conflict)`: the node's own link and
+//!   its neighbours on it are reached directly whatever the table says.
+//!   Checked again whenever the primary's address or netmask changes.
 //! - **Held addresses** (`deliver` mode) are realized as node addresses
 //!   (`held.rs`).
 //!
@@ -135,13 +139,41 @@ pub(crate) fn on_link(s: &IpState, dst: u32) -> bool {
     s.netmask == 0 || (dst & s.netmask) == (s.local_ip & s.netmask)
 }
 
+/// The length of a contiguous netmask (host order).
+#[inline(always)]
+fn mask_len(mask: u32) -> u8 {
+    let mut n = 0u8;
+    while n < 32 && mask & 0x8000_0000u32.checked_shr(u32::from(n)).unwrap_or(0) != 0 {
+        n += 1;
+    }
+    n
+}
+
+/// Whether peer route `r` overlaps the primary's link — the connected prefix
+/// of the node's own address. Such a route is never used.
+#[inline(always)]
+pub(crate) fn takes_uplink(s: &IpState, r: &nr::Route) -> bool {
+    if s.local_ip == 0 || r.prefix.family != nr::FAM_IPV4 {
+        return false;
+    }
+    let up = nr::Prefix {
+        family: nr::FAM_IPV4,
+        len: mask_len(s.netmask),
+        addr: addr16(s.local_ip & s.netmask),
+    };
+    r.prefix.overlaps(&up)
+}
+
 /// The peer node a route sends `dst` to: the longest matching peer route
 /// whose peer is on the link, if any.
 pub(crate) unsafe fn route_peer(s: &IpState, dst: u32) -> Option<u32> {
     let d = addr16(dst);
     let mut best: Option<(u8, u32)> = None;
     for r in routes(s) {
-        if r.prefix.family != nr::FAM_IPV4 || !r.prefix.contains(nr::FAM_IPV4, &d) {
+        if r.prefix.family != nr::FAM_IPV4
+            || !r.prefix.contains(nr::FAM_IPV4, &d)
+            || takes_uplink(s, r)
+        {
             continue;
         }
         let peer = ip_of(&r.peer);
@@ -203,15 +235,19 @@ pub(crate) unsafe fn step(s: &mut IpState) {
     let gen = u64::from_le_bytes(head);
     if gen == s.rt_gen && s.rt_have {
         // The tables are as they were; the node's own address may not be
-        // (a held address is realized only on the primary's link).
-        if s.rt_realized_ip != s.local_ip {
+        // (a held address is realized only on the primary's link, and a
+        // peer route never over it).
+        if s.rt_realized_ip != s.local_ip || s.rt_realized_mask != s.netmask {
             s.rt_realized_ip = s.local_ip;
+            s.rt_realized_mask = s.netmask;
+            s.route_epoch = s.route_epoch.wrapping_add(1).max(1);
             super::held::realize(s);
             report(s);
         }
         return;
     }
     s.rt_realized_ip = s.local_ip;
+    s.rt_realized_mask = s.netmask;
     take(s, gen);
 }
 
@@ -348,7 +384,8 @@ fn entry(kind: u8, index: usize, state: u8, reason: u8) -> nr::EntryState {
 
 /// Report what took effect: every segment held (its addresses are this
 /// module's to hold), every route held whose peer is on the link (one that
-/// is not cannot be reached directly, the only carriage there is), every
+/// is not cannot be reached directly, the only carriage there is) and that
+/// does not overlap the primary's link (`refused(conflict)`), every
 /// held address held (`held.rs`), and each table's entries past what this
 /// module holds as `table_full`.
 pub(crate) unsafe fn report(s: &mut IpState) {
@@ -367,6 +404,13 @@ pub(crate) unsafe fn report(s: &mut IpState) {
     while i < s.rt_troutes as usize {
         let e = if i >= s.rt_nroutes as usize {
             full(nr::entry::KIND_ROUTE, i)
+        } else if takes_uplink(s, &*s.rt_routes.add(i)) {
+            entry(
+                nr::entry::KIND_ROUTE,
+                i,
+                nr::state::REFUSED,
+                nr::reason::CONFLICT,
+            )
         } else if on_link(s, ip_of(&(*s.rt_routes.add(i)).peer)) {
             entry(nr::entry::KIND_ROUTE, i, nr::state::REALIZED, 0)
         } else {

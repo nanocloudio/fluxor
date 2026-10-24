@@ -290,7 +290,8 @@ fn flush_owner_rings(logs_dir: &std::path::Path) {
     // module might never get its file). One entry per owner slot, grown with
     // the owner table. Main-thread-only, so a plain static is safe.
     static mut LAST_FLUSHED: Vec<([u8; 16], u32, u64)> = Vec::new();
-    // A ring whose owner was freed is written once more, then freed.
+    // A ring whose owner was freed is detached from its slot at the release,
+    // written once more here, then freed.
     fluxor::kernel::workload::owner_log::set_flusher(true);
 
     let slots = fluxor::kernel::workload::owner_log::slots();
@@ -305,7 +306,6 @@ fn flush_owner_rings(logs_dir: &std::path::Path) {
     for slot in 0..slots {
         let next = fluxor::kernel::workload::owner_log::next_seq(slot);
         if next == 0 {
-            fluxor::kernel::workload::owner_log::reap_retired(slot);
             continue; // never written
         }
         let (uid, generation) = fluxor::kernel::workload::owner_log::installed_identity(slot);
@@ -315,7 +315,6 @@ fn flush_owner_rings(logs_dir: &std::path::Path) {
             hw[slot] == (uid, generation, next)
         };
         if already_flushed {
-            fluxor::kernel::workload::owner_log::reap_retired(slot);
             continue; // nothing new since last flush
         }
 
@@ -328,25 +327,64 @@ fn flush_owner_rings(logs_dir: &std::path::Path) {
             let _ = std::fs::create_dir_all(logs_dir);
             created_dir = true;
         }
-        let mut name = String::with_capacity(32);
-        for byte in &uid {
-            name.push_str(&format!("{byte:02x}"));
-        }
-        let path = logs_dir.join(format!("{name}.{slot}.{generation}.ring"));
         // The high-water only advances on a SUCCESSFUL write: a transient
         // failure (full disk, missing dir, permission blip) must leave the
         // slot dirty so the next tick retries — not wait for another record
         // to arrive.
-        if write_ring_file(&path, &header, &buffer) {
+        if write_ring_file(
+            &ring_path(logs_dir, &uid, slot, generation),
+            &header,
+            &buffer,
+        ) {
             // SAFETY: scheduler-thread-only access to the flush high-water table,
             // reached through a raw pointer.
             unsafe {
                 let hw = &mut *core::ptr::addr_of_mut!(LAST_FLUSHED);
                 hw[slot] = (uid, generation, next);
             }
-            fluxor::kernel::workload::owner_log::reap_retired(slot);
         }
     }
+
+    // Rings released since the last flush: each is written to its own file
+    // once more, unless that flush already wrote everything it holds, and
+    // then freed. A failed write keeps the ring for the next tick.
+    fluxor::kernel::workload::owner_log::flush_detached(|ring| {
+        if ring.next_seq == 0 {
+            return true; // never written
+        }
+        // SAFETY: scheduler-thread-only access to the flush high-water table.
+        let already_flushed = unsafe {
+            let hw = &*core::ptr::addr_of!(LAST_FLUSHED);
+            hw.get(ring.slot) == Some(&(ring.uid, ring.generation, ring.next_seq))
+        };
+        if already_flushed {
+            return true;
+        }
+        if !created_dir {
+            let _ = std::fs::create_dir_all(logs_dir);
+            created_dir = true;
+        }
+        write_ring_file(
+            &ring_path(logs_dir, &ring.uid, ring.slot, ring.generation),
+            &ring.header,
+            ring.bytes,
+        )
+    });
+}
+
+/// The ring file of the owner `(uid, generation)` on `slot`:
+/// `<uid>.<slot>.<generation>.ring` under `logs_dir`.
+fn ring_path(
+    logs_dir: &std::path::Path,
+    uid: &[u8; 16],
+    slot: usize,
+    generation: u32,
+) -> std::path::PathBuf {
+    let mut name = String::with_capacity(32);
+    for byte in uid {
+        name.push_str(&format!("{byte:02x}"));
+    }
+    logs_dir.join(format!("{name}.{slot}.{generation}.ring"))
 }
 
 /// Write a ring file in place: `[header][ring bytes]`. Not tmp+rename — that is

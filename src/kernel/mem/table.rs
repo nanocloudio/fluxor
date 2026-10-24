@@ -41,12 +41,21 @@
 //! sizes it to the plan's ceiling directly; one that comes after a first-use
 //! sizing keeps the slots that sizing committed.
 //!
-//! A reservation larger than the table's block moves the table to a new block
-//! and leaves the old one where it was: a table may be read from any core, so
-//! its old block cannot be proven unreferenced. Each preparation of a larger
-//! graph therefore costs the table's previous block, on Linux on the host's
-//! heap and on bcm2712 in the carve zone. A rebuild that asks no more than the
-//! table holds reuses it in place.
+//! A reservation larger than the table's block moves the table to a new block.
+//! What becomes of the old one is the platform's:
+//!
+//! - **bcm2712** hands it back to the carve zone's free extents at once
+//!   (`carve::retire`), and the next carve takes from them before it lowers
+//!   the floor, so a rebuild to a larger graph reuses what the previous
+//!   graph's tables held. That is sound because a reservation runs only
+//!   where no core can still read the table (see [`Table::reserve`]).
+//! - **Linux** frees it to the host's allocator at once. The hosted runtime
+//!   reads its tables from the scheduler thread alone, which runs the
+//!   reservation between passes (see [`Table::reserve`]).
+//! - **RP** leaves it in the pool until the next plan, which frees the whole
+//!   pool.
+//!
+//! A rebuild that asks no more than the table holds reuses it in place.
 //!
 //! [`ParseTable`] is the parse-side counterpart for the boot config's module
 //! and edge lists: it grows as the parser (or a test that builds a config by
@@ -115,6 +124,22 @@ macro_rules! boot_table {
             $crate::kernel::mem::table::Table::from_array([const { $init }; $n])
         }
     }};
+    // `$per` slots per slot of `$pool`: a table keyed by a pool's index and a
+    // second, bounded one (an owner slot and an execution domain).
+    ($n:expr, $init:expr, $pool:expr, $per:expr) => {{
+        #[cfg(any(feature = "host-linux", feature = "chip-bcm2712", feature = "rp"))]
+        {
+            $crate::kernel::mem::table::Table::new_planned(
+                |_| $init,
+                || $crate::kernel::sys::resource_ledger::ceiling($pool) as usize * $per,
+            )
+        }
+        #[cfg(not(any(feature = "host-linux", feature = "chip-bcm2712", feature = "rp")))]
+        {
+            let _ = ($pool, $per);
+            $crate::kernel::mem::table::Table::from_array([const { $init }; $n])
+        }
+    }};
 }
 
 // ── Linux, bcm2712 and RP: sized from the plan ────────────────────────────
@@ -155,6 +180,11 @@ mod imp {
         0
     }
 
+    /// Bytes of table blocks the host's allocator holds for the kernel's
+    /// tables now, every table together (Linux).
+    #[cfg(feature = "host-linux")]
+    pub(super) static HOST_BLOCK_BYTES: AtomicUsize = AtomicUsize::new(0);
+
     /// A block of `bytes` at `align` from the host's allocator on Linux.
     #[cfg(feature = "host-linux")]
     fn alloc_block(bytes: usize, align: usize) -> Result<*mut u8, TableError> {
@@ -166,7 +196,23 @@ mod imp {
         if fresh.is_null() {
             Err(TableError::NoMemory)
         } else {
+            HOST_BLOCK_BYTES.fetch_add(bytes, Ordering::Relaxed);
             Ok(fresh)
+        }
+    }
+
+    /// Return a block [`alloc_block`] gave, of `bytes` at `align`, to the
+    /// host's allocator. Its values have moved or been dropped.
+    ///
+    /// # Safety
+    /// `ptr` is that block, and nothing can still read or write it.
+    #[cfg(feature = "host-linux")]
+    unsafe fn free_block(ptr: *mut u8, bytes: usize, align: usize) {
+        if let Ok(layout) = std::alloc::Layout::from_size_align(bytes, align) {
+            // SAFETY: the caller's contract; `ptr` was allocated with this
+            // layout.
+            unsafe { std::alloc::dealloc(ptr, layout) };
+            HOST_BLOCK_BYTES.fetch_sub(bytes, Ordering::Relaxed);
         }
     }
 
@@ -345,6 +391,26 @@ mod imp {
                 }
                 self.ptr.store(fresh, Ordering::Release);
                 self.reserved.store(ceiling, Ordering::Relaxed);
+                // The old block is freed: to the carve zone on bcm2712, to the
+                // host's allocator on Linux. Its values moved to `fresh`
+                // bitwise and are not dropped there.
+                #[cfg(feature = "chip-bcm2712")]
+                if reserved > 0 {
+                    // SAFETY: `old` is the block `alloc_block` carved for
+                    // `reserved` slots, and `reserve`'s contract holds: no
+                    // core is inside a read of this table, so once `fresh`
+                    // is published nothing can reach `old` (the argument is
+                    // set out on `Table::reserve`).
+                    unsafe { crate::kernel::mem::carve::retire(old, reserved * self.size) };
+                }
+                #[cfg(feature = "host-linux")]
+                if reserved > 0 {
+                    // SAFETY: `old` is the block `alloc_block` allocated for
+                    // `reserved` slots, and `reserve`'s contract holds: no
+                    // thread is inside a read of this table (the argument is
+                    // set out on `Table::reserve`).
+                    unsafe { free_block(old, reserved * self.size, self.align) };
+                }
             }
             self.ceiling.store(ceiling, Ordering::Relaxed);
             // bcm2712 and RP: the whole ceiling is committed now, so `grow` is
@@ -457,10 +523,63 @@ mod imp {
         ///
         /// # Safety
         /// When `ceiling` exceeds what is reserved the table moves to a new
-        /// block, so no reference into the table may be live: callers reserve
-        /// while a graph is prepared (or the platform boots), never while one
-        /// runs. The old block is not freed, because a shared table's readers
-        /// cannot be proven gone (see the module documentation).
+        /// block, so no reference into the table may be live, and no core
+        /// may be inside a read of it, from the call until it returns:
+        /// callers reserve while a graph is prepared (or the platform boots),
+        /// never while one runs.
+        ///
+        /// On bcm2712 the old block is handed back to the carve zone at once,
+        /// so the contract is what keeps a reader off freed memory. Every
+        /// reservation there satisfies it:
+        ///
+        /// - The kernel's tables are reserved by `size_kernel_tables` (and
+        ///   the cross-domain bridge tables by `multicore::size_cross` after
+        ///   it) on the boot core, in `prepare_graph`. At boot that runs
+        ///   before the secondary cores are woken into their run loops. For a
+        ///   rebuild it runs inside the reconfigure quiesce
+        ///   (`poll_rebuild_bridge`): every non-primary domain has parked at
+        ///   its tick boundary — outside any step, holding no slice of any
+        ///   table, since a slice lives only within the call that reads it —
+        ///   before `prepare_graph` starts, and resumes only after it
+        ///   returns, when its next read loads the new block (the quiesce
+        ///   flag's release store orders the move before it).
+        /// - The interrupt handlers that read a table (a device IRQ bound to
+        ///   an event, signalling it) are delivered to the boot core
+        ///   (`gic::irq_bind` routes event bindings to core 0), the core the
+        ///   move runs on. A handler that preempts the move runs to
+        ///   completion before the move continues, so none holds the old
+        ///   block when it is handed back. A Tier 1b or Tier 2 handler, which
+        ///   may run on a parked core, steps no module while a graph is
+        ///   prepared: `prepare_graph` closes ISR-tier dispatch and waits out
+        ///   every handler in flight (`isr_tier::close_dispatch`) before it
+        ///   sizes a table.
+        /// - A table a lock guards (the net-attach lane tables) is reserved
+        ///   under that lock, which every reader of it holds.
+        ///
+        /// On Linux the old block is freed to the host's allocator at once,
+        /// and the contract holds because the hosted runtime reads its tables
+        /// from one thread:
+        ///
+        /// - The scheduler — every domain, every module step, every syscall
+        ///   and provider call a module makes — runs on the main thread
+        ///   (`platform/linux.rs`), and a rebuild is taken there between
+        ///   passes (`take_rebuild_request` in the main loop), when no pass
+        ///   holds a slice. Each pass borrows the tables afresh.
+        /// - Every other thread of the runtime exchanges with the scheduler
+        ///   through state of its own and never reads a kernel table: the
+        ///   process executor's pipe pumps and the CLI's stdin and stdout
+        ///   pumps move bytes through an `ExtBridge`; the `host_mount`
+        ///   workers run host filesystem calls and publish a result slot; the
+        ///   resolver, GPU and display threads take jobs and frames over
+        ///   channels or a mutex; the `net_route` prober and announcer read
+        ///   the platform's own route state under its mutex; the audio
+        ///   callback drains a sample queue. Their log records reach the
+        ///   owner-attribution tee, which reads the module owner table only
+        ///   on the scheduler thread (`SCHED_TID`) and returns before it on
+        ///   any other.
+        /// - The stop-signal handler (`stop.rs`) touches atomics only.
+        ///
+        /// RP keeps the old block (see the module documentation).
         pub unsafe fn reserve(&self, ceiling: usize) -> Result<(), TableError> {
             // SAFETY: the caller's contract.
             unsafe { self.raw.reserve(ceiling) }
@@ -534,10 +653,9 @@ mod imp {
             let len = *self.raw.len.get_mut();
             // SAFETY: `[0, len)` is initialised and owned by this table.
             unsafe { core::ptr::drop_in_place(core::ptr::slice_from_raw_parts_mut(ptr, len)) };
-            if let Ok(layout) = std::alloc::Layout::array::<T>(reserved) {
-                // SAFETY: `ptr` was allocated with exactly this layout.
-                unsafe { std::alloc::dealloc(ptr as *mut u8, layout) };
-            }
+            // SAFETY: the table's own block, allocated for `reserved` slots;
+            // the table is going away.
+            unsafe { free_block(ptr as *mut u8, reserved * self.raw.size, self.raw.align) };
         }
     }
 }
@@ -601,6 +719,13 @@ mod imp {
 }
 
 pub use imp::Table;
+
+/// Bytes the host's allocator holds for the kernel's table blocks now, every
+/// table together (Linux): what a test reads to see a moved block freed.
+#[cfg(feature = "host-linux")]
+pub fn host_block_bytes() -> usize {
+    imp::HOST_BLOCK_BYTES.load(portable_atomic::Ordering::Relaxed)
+}
 
 impl<T, const N: usize> Deref for Table<T, N> {
     type Target = [T];

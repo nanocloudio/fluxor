@@ -21,6 +21,13 @@
 //! re-issuing ATTACH. READ's per-table `ENFORCED` holds only while the
 //! binding is live and that generation equals the stored one.
 //!
+//! ## Services and capacity
+//!
+//! A REPLACE is checked against the store before anything is applied: a
+//! service overlapping one another stored table defines is `EEXIST`, and a
+//! table larger than the capacity its bound enforcer declared is `E2BIG`.
+//! Both are checked here, once, so every platform refuses the same tables.
+//!
 //! ## Authority
 //!
 //! REPLACE, CLEAR and ATTACH answer `EACCES` to a module not acting with the
@@ -104,6 +111,9 @@ struct Binding {
     slot: ModuleId,
     slot_gen: u32,
     applied: u64,
+    /// The most rule bytes the enforcer holds of the table (0: no bound
+    /// declared).
+    capacity: u32,
 }
 
 impl Binding {
@@ -115,6 +125,7 @@ impl Binding {
             slot: 0,
             slot_gen: 0,
             applied: 0,
+            capacity: 0,
         }
     }
     fn is(&self, name: &[u8]) -> bool {
@@ -360,6 +371,28 @@ pub fn release_enforcer(idx: ModuleId) {
     }
 }
 
+/// One ATTACH entry at `a[at..]`: its name, `applied_gen`, declared
+/// capacity (None: none declared) and the offset past it.
+fn attach_entry(a: &[u8], at: usize) -> Option<(&[u8], u64, Option<u32>, usize)> {
+    let len_byte = *a.get(at)?;
+    let with_cap = len_byte & wire::ATTACH_CAPACITY != 0;
+    let n = (len_byte & !wire::ATTACH_CAPACITY) as usize;
+    if n == 0 || n > wire::MAX_TABLE_NAME {
+        return None;
+    }
+    let name = a.get(at + 1..at + 1 + n)?;
+    let applied = u64_at(a, at + 1 + n)?;
+    let mut next = at + 1 + n + wire::ATTACH_TAIL;
+    let cap = if with_cap {
+        let c = u32_at(a, next)?;
+        next += wire::ATTACH_CAPACITY_TAIL;
+        Some(c)
+    } else {
+        None
+    };
+    Some((name, applied, cap, next))
+}
+
 /// ATTACH: bind (or report on) every named table, all or none.
 unsafe fn attach(a: &[u8]) -> i32 {
     if a.is_empty() {
@@ -368,13 +401,10 @@ unsafe fn attach(a: &[u8]) -> i32 {
     // Validate the whole argument before touching anything.
     let mut at = 0;
     while at < a.len() {
-        let Some((_, p)) = name_at(&a[at..]) else {
+        let Some((_, _, _, next)) = attach_entry(a, at) else {
             return errno::EINVAL;
         };
-        if u64_at(a, at + p).is_none() {
-            return errno::EINVAL;
-        }
-        at += p + wire::ATTACH_TAIL;
+        at = next;
     }
     // The module stepping is the caller (this provider is the platform's,
     // not a module's); kernel context parks at the out-of-range index, which
@@ -389,7 +419,7 @@ unsafe fn attach(a: &[u8]) -> i32 {
     // is gone; and there is room for the new ones.
     let mut needed = 0usize;
     let mut at = 0;
-    while let Some((name, p)) = a.get(at..).and_then(name_at) {
+    while let Some((name, _, _, next)) = attach_entry(a, at) {
         match (*bindings).iter().find(|b| b.is(name)) {
             Some(b) if b.current() && (b.slot != slot || b.slot_gen != slot_gen) => {
                 write_end();
@@ -398,7 +428,7 @@ unsafe fn attach(a: &[u8]) -> i32 {
             Some(b) if b.current() => {}
             _ => needed += 1,
         }
-        at += p + wire::ATTACH_TAIL;
+        at = next;
     }
     let free = (*bindings)
         .iter()
@@ -410,8 +440,7 @@ unsafe fn attach(a: &[u8]) -> i32 {
     }
     // Pass 2: bind and record.
     let mut at = 0;
-    while let Some((name, p)) = a.get(at..).and_then(name_at) {
-        let applied = u64_at(a, at + p).unwrap_or(0);
+    while let Some((name, applied, cap, next)) = attach_entry(a, at) {
         let idx = match (*bindings).iter().position(|b| b.is(name)) {
             Some(i) => i,
             None => match (*bindings).iter().position(|b| !b.live || !b.current()) {
@@ -420,6 +449,14 @@ unsafe fn attach(a: &[u8]) -> i32 {
             },
         };
         let b = &mut (&mut (*bindings))[idx];
+        // A re-report without a capacity keeps the bound the same binding
+        // declared; a new binding starts with none.
+        let ours = b.live && b.current() && b.slot == slot && b.slot_gen == slot_gen;
+        let capacity = match cap {
+            Some(c) => c,
+            None if ours => b.capacity,
+            None => 0,
+        };
         let mut n = [0u8; wire::MAX_TABLE_NAME];
         for (d, s) in n.iter_mut().zip(name) {
             *d = *s;
@@ -431,8 +468,9 @@ unsafe fn attach(a: &[u8]) -> i32 {
             slot,
             slot_gen,
             applied,
+            capacity,
         };
-        at += p + wire::ATTACH_TAIL;
+        at = next;
     }
     write_end();
     0
@@ -562,6 +600,21 @@ unsafe fn replace(
     platform_enforces: bool,
 ) -> Result<u64, i32> {
     let tables = &raw mut TABLES;
+    // A service is one table's: one that overlaps a service another stored
+    // table defines is refused, so no packet ever meets two translations.
+    // Only this flag's holder writes the tables, so they are stable here.
+    for (i, t) in (*tables).iter().enumerate() {
+        if t.live && !t.is(name) && wire::shares_service(rule_bytes, &rules(i)[..t.len]) {
+            return Err(errno::EEXIST);
+        }
+    }
+    // A table its bound enforcer cannot hold is refused before it is
+    // stored: what a controller wrote is never a table nothing applies.
+    if let Some(cap) = bound_capacity(name)? {
+        if rule_bytes.len() > cap as usize {
+            return Err(errno::E2BIG);
+        }
+    }
     let existing = (*tables).iter().position(|t| t.is(name));
     let idx = match existing {
         Some(i) => i,
@@ -598,6 +651,19 @@ unsafe fn replace(
     t.platform_applied = if platform_enforces { g } else { 0 };
     write_end();
     Ok(g)
+}
+
+/// The capacity the live enforcer bound for table `name` declared, if it
+/// declared one; `EAGAIN` when a binding change kept the bindings moving.
+unsafe fn bound_capacity(name: &[u8]) -> Result<Option<u32>, i32> {
+    let cap = read_locked(|| {
+        let b = &raw const BINDINGS;
+        (*b).iter()
+            .find(|b| b.is(name) && b.current())
+            .map(|b| b.capacity)
+    })
+    .ok_or(errno::EAGAIN)?;
+    Ok(cap.filter(|c| *c != 0))
 }
 
 /// CLEAR under the apply flag. Deleting a table consumes a generation.

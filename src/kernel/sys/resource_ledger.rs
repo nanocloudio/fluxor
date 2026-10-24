@@ -211,6 +211,13 @@ fn sat(n: u64) -> u32 {
 
 /// [`plan_parts`] in the pool's own unit, unsaturated.
 pub fn plan_parts_wide(pool: u16) -> (u64, u64) {
+    plan_parts_in(&crate::kernel::config::PROFILE, pool)
+}
+
+/// [`plan_parts_wide`] against `profile`'s pool tables rather than the
+/// compiled profile's: the same plan, over what the config derived and the
+/// envelope carries, for a profile this kernel was not built with.
+pub fn plan_parts_in(profile: &crate::kernel::config::CapacityProfile, pool: u16) -> (u64, u64) {
     let Some(i) = idx(pool) else { return (0, 0) };
     let mut derived = DERIVED[i]
         .load(Ordering::Relaxed)
@@ -224,7 +231,7 @@ pub fn plan_parts_wide(pool: u16) -> (u64, u64) {
         // domain is refused at boot naming the pool.
         ENTRY[i].load(Ordering::Relaxed)
     } else {
-        match crate::kernel::config::static_pool(pool) {
+        match profile.static_pool(pool) {
             // A static table without an envelope entry keeps every slot it
             // has: the reserve is whatever the derived part leaves.
             Some(n) => (n as u64).saturating_sub(derived),
@@ -232,7 +239,7 @@ pub fn plan_parts_wide(pool: u16) -> (u64, u64) {
             // the pool's index domain leaves beside the derived part, so a
             // graph that fits the domain boots on the defaults.
             None => {
-                let default = crate::kernel::config::default_reserve(pool) as u64;
+                let default = profile.default_reserve(pool) as u64;
                 match pool_domain(pool) {
                     Some(domain) => default.min(domain.saturating_sub(derived)),
                     None => default,
@@ -280,7 +287,12 @@ pub fn ceiling_bytes(pool: u16) -> u64 {
 /// Log a boot plan the platform cannot hold, naming the pool, and count it.
 /// The caller fails the boot.
 pub fn refuse(pool: u16, why: &str) {
-    let (derived, reserve) = plan_parts_wide(pool);
+    refuse_in(&crate::kernel::config::PROFILE, pool, why);
+}
+
+/// [`refuse`], stating the plan `profile` makes.
+fn refuse_in(profile: &crate::kernel::config::CapacityProfile, pool: u16, why: &str) {
+    let (derived, reserve) = plan_parts_in(profile, pool);
     log::error!(
         "[capacity] pool '{}' refused at boot: ceiling {} (derived {derived} + reserve {reserve}) — \
          {why}",
@@ -301,12 +313,26 @@ pub struct Refused;
 /// refusal ([`refuse`]). A profile that sizes the pool at boot has nothing to
 /// check here.
 pub fn check_static(pool: u16) -> Result<(), Refused> {
-    match crate::kernel::config::static_pool(pool) {
-        Some(n) if ceiling_bytes(pool) > n as u64 => {
-            refuse(pool, "past this profile's static table");
-            Err(Refused)
+    check_static_in(&crate::kernel::config::PROFILE, pool)
+}
+
+/// [`check_static`] against `profile`'s tables: the check a kernel compiled
+/// with that profile makes at boot, over the same plan.
+pub fn check_static_in(
+    profile: &crate::kernel::config::CapacityProfile,
+    pool: u16,
+) -> Result<(), Refused> {
+    match profile.static_pool(pool) {
+        Some(n) => {
+            let (derived, reserve) = plan_parts_in(profile, pool);
+            if derived.saturating_add(reserve) > n as u64 {
+                refuse_in(profile, pool, "past this profile's static table");
+                Err(Refused)
+            } else {
+                Ok(())
+            }
         }
-        _ => Ok(()),
+        None => Ok(()),
     }
 }
 

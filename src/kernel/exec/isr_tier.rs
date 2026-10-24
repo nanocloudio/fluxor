@@ -243,6 +243,56 @@ static TIER1B_TICK_COUNT: AtomicU32 = AtomicU32::new(0);
 /// visible (the count stalls while the loop's `tick_count` keeps climbing).
 static TIER2_DISPATCH_COUNT: AtomicU32 = AtomicU32::new(0);
 
+/// Whether the handlers may step their modules. Closed while a graph is
+/// prepared ([`close_dispatch`]), so no ISR-tier module runs — and reaches
+/// a kernel table through a syscall's admission check — while the tables
+/// are resized; opened again as the new graph registers its modules.
+static DISPATCH_OPEN: AtomicBool = AtomicBool::new(true);
+
+/// Handlers between their entry check and their return, on any core.
+static IN_FLIGHT: AtomicU32 = AtomicU32::new(0);
+
+/// A handler's entry: `false` when dispatch is closed, and then the handler
+/// steps nothing. Paired with [`leave`] when it returns `true`.
+///
+/// The count is raised before the gate is read, and [`close_dispatch`]
+/// closes the gate before it reads the count, both sequentially consistent:
+/// either the handler sees the gate closed, or the closer sees the handler
+/// in flight and waits for it.
+#[inline(always)]
+fn enter() -> bool {
+    IN_FLIGHT.fetch_add(1, Ordering::SeqCst);
+    if DISPATCH_OPEN.load(Ordering::SeqCst) {
+        true
+    } else {
+        IN_FLIGHT.fetch_sub(1, Ordering::Release);
+        false
+    }
+}
+
+#[inline(always)]
+fn leave() {
+    IN_FLIGHT.fetch_sub(1, Ordering::Release);
+}
+
+/// Stop the Tier 1b and Tier 2 handlers stepping modules, and wait until
+/// every handler already stepping one, on any core, has returned. From the
+/// return on, no ISR-tier module code runs until a module is registered
+/// again. Called from the scheduler (never from a handler), when a graph is
+/// prepared: a Tier 2 IRQ is delivered to its domain's core, which the
+/// reconfigure quiesce parks but does not mask.
+pub fn close_dispatch() {
+    DISPATCH_OPEN.store(false, Ordering::SeqCst);
+    while IN_FLIGHT.load(Ordering::SeqCst) != 0 {
+        core::hint::spin_loop();
+    }
+}
+
+/// Let the handlers step their modules again.
+fn open_dispatch() {
+    DISPATCH_OPEN.store(true, Ordering::SeqCst);
+}
+
 // ============================================================================
 // Registration API (called from scheduler during graph setup)
 // ============================================================================
@@ -295,6 +345,7 @@ pub fn register_tier1b_module(
 
         slot.active = true;
         ISR_COUNT = count as u8 + 1;
+        open_dispatch();
 
         log::info!(
             "[isr] tier1b registered slot={count} mod={module_index} budget={budget_cycles}cy"
@@ -357,6 +408,7 @@ pub fn register_tier2_module(reg: Tier2Registration<'_>) -> i32 {
 
         slot.active = true;
         ISR_T2_COUNT = count as u8 + 1;
+        open_dispatch();
 
         log::info!(
             "[isr] tier2 registered slot={} mod={} irq={} budget={}cy fpu={}",
@@ -370,11 +422,14 @@ pub fn register_tier2_module(reg: Tier2Registration<'_>) -> i32 {
     }
 }
 
-/// Reset all ISR state (called on graph reconfigure).
+/// Reset all ISR state (called on graph reconfigure). Dispatch stays
+/// closed until the next graph registers a module.
 pub fn reset_all() {
     stop_tier1b();
-    // SAFETY: `stop_tier1b()` above drops the active flag and waits;
-    // after this point ISRs are quiesced so the static slot arrays are
+    close_dispatch();
+    // SAFETY: `stop_tier1b()` above drops the active flag and
+    // `close_dispatch` waits out every handler in flight, on any core; no
+    // handler steps a slot from here, so the static slot arrays are
     // exclusively accessible.
     unsafe {
         let slots = &raw mut ISR_SLOTS;
@@ -415,6 +470,9 @@ pub fn reset_all() {
 #[inline(never)]
 pub unsafe fn isr_tier1b_handler() {
     TIER1B_TICK_COUNT.fetch_add(1, Ordering::Relaxed);
+    if !enter() {
+        return;
+    }
 
     let count = ISR_COUNT as usize;
     let slots = &raw mut ISR_SLOTS;
@@ -433,6 +491,7 @@ pub unsafe fn isr_tier1b_handler() {
         slot.metrics.record(elapsed);
     }
     crate::kernel::exec::scheduler::set_current_module(saved_module);
+    leave();
 }
 
 // ============================================================================
@@ -455,6 +514,9 @@ pub unsafe fn isr_tier1b_handler() {
 /// # Safety
 /// Called from ISR context.
 pub unsafe fn isr_tier2_trampoline(irq_number: u16) -> i32 {
+    if !enter() {
+        return -1;
+    }
     let count = ISR_T2_COUNT as usize;
     let slots = &raw mut ISR_T2_SLOTS;
     let saved_module = crate::kernel::exec::scheduler::current_module_index();
@@ -478,9 +540,11 @@ pub unsafe fn isr_tier2_trampoline(irq_number: u16) -> i32 {
         slot.metrics.record(elapsed);
         TIER2_DISPATCH_COUNT.fetch_add(1, Ordering::Relaxed);
         crate::kernel::exec::scheduler::set_current_module(saved_module);
+        leave();
         return rc;
     }
     crate::kernel::exec::scheduler::set_current_module(saved_module);
+    leave();
     -1 // No module found for this IRQ
 }
 

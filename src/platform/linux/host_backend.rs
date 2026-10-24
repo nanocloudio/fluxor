@@ -15,9 +15,33 @@
 // PID-ns double-fork so the container is PID 1. A **null sandbox** (the caller's
 // `isolate` param is false) skips unshare entirely — PROC semantics, the
 // unprivileged path; a namespaced spawn needs CAP_SYS_ADMIN, and one the host
-// refuses fails CREATE with the kernel's errno. No seccomp filter or
-// capability bound is applied, which is why the provider advertises
-// SHARED/ISOLATED but not HARDENED (fail-closed).
+// refuses fails CREATE with the kernel's errno.
+//
+// Confinement (`confine.rs`), for every process of every workload — the
+// container, an EXEC, a TTY session — just before its exec: `no_new_privs`,
+// the capability bounding set cut to the OCI defaults plus what the source
+// adds, the effective/permitted/inheritable/ambient sets for the uid it runs
+// as (with `PR_SET_KEEPCAPS` across the identity change), and last the
+// default system-call filter, built before the fork. The source may add
+// capabilities or skip the filter; the hardened posture takes neither.
+//
+// Lifetime: every sandbox has an intermediate (`hp_child`) between the
+// runtime and the container init. It binds itself to the runtime process
+// (`PR_SET_PDEATHSIG(SIGUSR1)`, caught, acted on only once `getppid` is no
+// longer the runtime's pid — so a dispatch thread ending is not the runtime
+// ending — and checked once after the bind, since a parent gone before it
+// would never send the signal) and kills the init when the runtime is gone.
+// The init binds itself to the intermediate (`SIGKILL`) through a lifeline
+// pipe only the intermediate writes (its `getppid` reads 0 inside its pid
+// namespace); the identity change clears that binding, so it binds again
+// after it. Isolated, the init is PID 1 of its pid namespace and takes every
+// process in it along. In a null sandbox the intermediate is a child
+// subreaper: once the init has ended it kills and reaps every orphan of the
+// workload until none is left (`kill_descendants`). Either way it exits with
+// the init's own status (`relay_status`). An EXEC or TTY session of an
+// isolated workload forks once more after joining its namespaces, so the
+// process that execs is inside its pid namespace (`enter_pid_namespace`),
+// and is bound to the runtime's dispatch thread.
 //
 // Network: when the workload spec asks for its own network domain
 // (`NET_ISO_OWN` on any endpoint), NEWNET joins the unshare set (orthogonal to
@@ -61,14 +85,24 @@
 //            in the child LAST — after the volumes, the fresh /proc and the
 //            working directory — non-recursively, so every volume keeps its
 //            own access
+//   cap_add, no_syscall_filter, hardened  the confinement (above): the
+//            capabilities granted beyond the defaults, the filter skipped,
+//            the hardened posture (isolated, neither of the two)
+// An isolated sandbox with a rootfs is bound onto itself and made `nodev`
+// throughout before anything is mounted into it, and gets a `/dev` of its
+// own (`make_dev`): a sized memory filesystem holding the host's null,
+// zero, full, random, urandom and tty bound in, a new devpts instance, a
+// sized `/dev/shm`, and the standard links — every mount made detached and
+// attached by descriptor.
 // Volumes ([`VolumeBind`], an isolated sandbox with a rootfs only) are bound
 // in the child before the pivot, from descriptors: the source is opened
 // without following a symlink at its last component (and below the mount
 // root, `FLUXOR_MOUNT_ROOT`, where workloads write, through no symlink at
 // all); the mount point is resolved inside the rootfs (`RESOLVE_IN_ROOT`, so
 // an image's symlink can never point it at the host), each missing
-// directory made there; the tree is cloned (`open_tree`), made read-only
-// recursively when asked (`mount_setattr`), and moved onto the mount point
+// directory made there; the tree is cloned (`open_tree`), made `nodev` and,
+// when asked, read-only recursively (`mount_setattr`), and moved onto the
+// mount point
 // (`move_mount`). Every mount lands in the sandbox's own private mount
 // namespace and goes with it.
 // Descriptors: every pipe is created close-on-exec, and each child (the
@@ -130,14 +164,13 @@ const fn digits(mut n: usize) -> usize {
 
 struct HpSlot {
     in_use: bool,
-    /// The pid to waitpid for exit. In an isolated sandbox this is the
-    /// intermediate (the PID-ns parent), whose exit relays the container init's
-    /// status; in a null sandbox it is the container process itself.
+    /// The pid to waitpid for exit: the intermediate (`hp_child`), whose
+    /// exit relays the container init's status.
     pid: i32,
-    /// The container init's host pid — what SIGNAL/DESTROY target. Equals `pid`
-    /// for a null sandbox; the grandchild (PID 1 in the new pid ns) when
-    /// isolated. Signalling `pid` (the intermediate, blocked in waitpid) would
-    /// not reach the container.
+    /// The container init's host pid — what SIGNAL/DESTROY target: the
+    /// intermediate's child (PID 1 in the new pid ns when isolated).
+    /// Signalling `pid` (the intermediate, blocked in waitpid) would not
+    /// reach the container.
     container_pid: i32,
     /// Write end of the start-barrier pipe; the init blocks reading the read
     /// end until `HP_START` writes here. -1 once started.
@@ -271,7 +304,49 @@ pub struct SpawnPlan {
     proc: ProcCtx,
     /// `proc.envp` as the NULL-terminated pointer array execve takes.
     envp_ptrs: Vec<*const libc::c_char>,
+    /// The runtime's pid, which the first child must still see as its
+    /// parent once it has bound itself to it (`confine::bind_to_parent`).
+    parent: i32,
+    /// The workload's `/dev` (an isolated sandbox with a rootfs): its
+    /// sizes as the `fsconfig` strings the child hands the kernel.
+    dev: DevPlan,
 }
+
+/// A workload's own `/dev`, sized before the fork ([`DEV_SIZE`],
+/// [`DEV_INODES`], and `/dev/shm` at [`DEV_SHM_DEFAULT`] or the memory quota
+/// when that is smaller).
+struct DevPlan {
+    size: CString,
+    inodes: CString,
+    shm_size: CString,
+}
+
+impl DevPlan {
+    fn for_memory(memory_bytes: u64) -> DevPlan {
+        let shm = if memory_bytes > 0 {
+            memory_bytes.min(DEV_SHM_DEFAULT)
+        } else {
+            DEV_SHM_DEFAULT
+        };
+        let c = |v: u64| CString::new(v.to_string()).unwrap_or_default();
+        DevPlan {
+            size: c(DEV_SIZE),
+            inodes: c(DEV_INODES),
+            shm_size: c(shm),
+        }
+    }
+}
+
+/// The bytes a workload's `/dev` memory filesystem may hold: it holds the
+/// device nodes' mount points and links, none of which takes a block, so
+/// this bounds only what a workload writes there itself.
+pub const DEV_SIZE: u64 = 64 << 10;
+/// The files and directories a workload's `/dev` may hold.
+pub const DEV_INODES: u64 = 1024;
+/// The bytes a workload's `/dev/shm` may hold, unless its memory quota is
+/// smaller (then the quota). What a workload writes there is charged to its
+/// own cgroup's memory, so it counts against that quota too.
+pub const DEV_SHM_DEFAULT: u64 = 64 << 20;
 
 /// The process of a workload, as it will be exec'd: built before the fork
 /// (the child only reads it) and kept on the slot for EXEC and TTY sessions.
@@ -288,6 +363,9 @@ pub struct ProcCtx {
     cwd_dirs: Vec<CString>,
     /// Who it runs as; None = the runtime's own identity.
     cred: Option<Cred>,
+    /// Its capabilities, `no_new_privs` and system-call filter
+    /// (`confine.rs`); a process nobody planned does not exec.
+    confine: super::confine::Confine,
 }
 
 const PROC_EMPTY: ProcCtx = ProcCtx {
@@ -296,6 +374,7 @@ const PROC_EMPTY: ProcCtx = ProcCtx {
     cwd: None,
     cwd_dirs: Vec::new(),
     cred: None,
+    confine: super::confine::Confine::UNPLANNED,
 };
 
 impl ProcCtx {
@@ -357,7 +436,8 @@ fn holds_cap(bit: u32) -> bool {
 /// host_process `CAPS`: what this runtime realizes of the source. A
 /// read-only root needs the mount privilege (it is realized only in an
 /// isolated sandbox, which needs it too); groups need the privilege to set
-/// them.
+/// them; a capability addition the privilege to shape a process's sets; the
+/// system-call filter an architecture and kernel that have one.
 pub fn hp_caps() -> u32 {
     use crate::abi::platform::linux::host_process::caps;
     let mut c = 0;
@@ -366,6 +446,12 @@ pub fn hp_caps() -> u32 {
     }
     if holds_cap(CAP_SETGID) {
         c |= caps::GROUPS | caps::GROUPS_STRICT;
+    }
+    if holds_cap(super::confine::cap::SETPCAP) {
+        c |= caps::CAP_ADD;
+    }
+    if super::confine::filter_available() {
+        c |= caps::SYSCALL_FILTER;
     }
     c
 }
@@ -387,6 +473,14 @@ pub struct ProcessParams {
     pub groups_strict: bool,
     /// The root is read-only (an isolated sandbox only).
     pub root_read_only: bool,
+    /// Capabilities granted beyond the defaults (`confine.rs`), one bit per
+    /// capability number.
+    pub cap_add: u64,
+    /// No system-call filter.
+    pub no_syscall_filter: bool,
+    /// The hardened posture: an isolated sandbox, confined with no
+    /// addition and no opt-out.
+    pub hardened: bool,
 }
 
 /// A user resolved against a root: who to run as (None = the runtime's own
@@ -647,7 +741,12 @@ pub fn resolve_user(user: &str, root: &str) -> Result<ResolvedUser, i32> {
 /// or the id 4294967295; ENOENT for a user the root does not have; E2BIG for
 /// a user database larger than [`USER_DB_MAX`]; EACCES for an identity the
 /// runtime cannot assume — another uid without CAP_SETUID, another gid or
-/// other groups without CAP_SETGID.
+/// other groups without CAP_SETGID. The confinement's own refusals
+/// (`confine::plan`): EINVAL for a capability number past the host's or a
+/// hardened process without isolation or with an opt-out, EACCES for a
+/// capability the runtime does not hold, ENOSYS for a hardened process
+/// where no filter can be built, EPERM for one the runtime cannot cut the
+/// bounding set of.
 pub fn plan_process(plan: &mut SpawnPlan, p: &ProcessParams) -> Result<(), i32> {
     use crate::kernel::sys::errno;
     let rootfs = plan
@@ -656,7 +755,7 @@ pub fn plan_process(plan: &mut SpawnPlan, p: &ProcessParams) -> Result<(), i32> 
         .map(|c| c.to_string_lossy().into_owned())
         .filter(|r| !r.is_empty());
     let root = rootfs.as_deref().unwrap_or("/");
-    if p.root_read_only && !plan.isolate {
+    if (p.root_read_only || p.hardened) && !plan.isolate {
         return Err(errno::EINVAL);
     }
     plan.root_read_only = p.root_read_only;
@@ -764,12 +863,23 @@ pub fn plan_process(plan: &mut SpawnPlan, p: &ProcessParams) -> Result<(), i32> 
         }
         (None, _) => cwd.to_string(),
     };
+    // The confinement, for the uid the process ends up with.
+    let root = cred.as_ref().map_or(euid, |c| c.uid) == 0;
+    let confine = super::confine::plan(
+        &super::confine::Request {
+            cap_add: p.cap_add,
+            no_syscall_filter: p.no_syscall_filter,
+            hardened: p.hardened,
+        },
+        root,
+    )?;
     plan.proc = ProcCtx {
         envp,
         search: Some(CString::new(search).map_err(|_| errno::EINVAL)?),
         cwd: Some(CString::new(child_cwd).map_err(|_| errno::EINVAL)?),
         cwd_dirs,
         cred,
+        confine,
     };
     plan.envp_ptrs = plan.proc.envp_ptrs();
     Ok(())
@@ -975,6 +1085,8 @@ pub fn build_plan(
         cpu_max: None,
         proc: PROC_EMPTY,
         envp_ptrs: vec![core::ptr::null()],
+        parent: 0,
+        dev: DevPlan::for_memory(0),
     })
 }
 
@@ -1134,15 +1246,25 @@ unsafe fn relay_errno_and_exit(pid_w: i32, code: i32) -> ! {
 
 /// The intermediate child — runs after the provider's fork. MUST be
 /// async-signal-safe: only libc calls against pointers prepared in the parent,
-/// no allocation. For an isolated sandbox it unshares the namespaces (NEWPID
-/// affects its children, so the grandchild it forks is PID 1 in the new pid ns),
-/// forks the container init, relays that init's host pid up `pid_w`, and relays
-/// its exit status as its own exit code. For a null sandbox it *is* the
-/// container and execs directly, closing `pid_w` once its own network domain
-/// (if any) is in place. A namespace the host refuses is relayed up `pid_w`
-/// as `-errno`, and CREATE answers it; any later failure `_exit`s a distinct
-/// code so the parent's WAIT surfaces it.
+/// no allocation. It takes the workload's namespaces (an isolated sandbox:
+/// MOUNT, UTS, IPC and PID — NEWPID affects its children, so the init it
+/// forks is PID 1 in the new pid ns; a null sandbox: the network domain
+/// alone when the spec asks for one), forks the container init, relays the
+/// init's host pid up `pid_w`, and relays the init's exit status exactly as
+/// its own (`relay_status`). A namespace the host refuses is relayed up
+/// `pid_w` as `-errno`, and CREATE answers it; any later failure `_exit`s a
+/// distinct code so the parent's WAIT surfaces it.
+///
+/// Parent death: this child is bound to the runtime process (see
+/// [`watch_runtime`]) and the init to this child, so a runtime that dies
+/// takes every workload with it. Isolated, the init is PID 1 of its pid
+/// namespace, and its death ends every process in it. In a null sandbox
+/// this child is a child subreaper: every process the workload starts that
+/// is orphaned is reparented to it, so when the init ends — by itself, by
+/// SIGNAL or DESTROY, or because the runtime died — it kills and reaps every
+/// one that is left ([`kill_descendants`]) before it exits.
 unsafe fn hp_child(plan: &SpawnPlan, start_r: i32, out_w: i32, pid_w: i32) -> ! {
+    watch_runtime(plan.parent);
     // Everything the runtime holds goes, but what this child needs: stdio
     // (replaced below), the barrier, the out pipe and the pid relay.
     close_all_but(&[
@@ -1153,57 +1275,242 @@ unsafe fn hp_child(plan: &SpawnPlan, start_r: i32, out_w: i32, pid_w: i32) -> ! 
         out_w,
         pid_w,
     ]);
-    if !plan.isolate {
-        // Null sandbox: this process is the container, and the provider
-        // already knows its pid. Own-netns is orthogonal to isolate: unshare
-        // just the network domain when the spec asks.
-        if plan.own_netns && libc::unshare(libc::CLONE_NEWNET) != 0 {
-            relay_errno_and_exit(pid_w, 121);
-        }
-        libc::close(pid_w);
-        hp_container_body(plan, start_r, out_w);
-    }
-
     // The intermediate lives exactly as long as the container init, whose
     // status it relays: a stop request meant for the runtime (a terminal's
     // Ctrl-C reaches its whole process group) is not one for it.
     for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT] {
         libc::signal(sig, libc::SIG_IGN);
     }
-    // Isolated sandbox (privileged). Unshare PID + MOUNT|UTS|IPC (+ NET when
-    // the spec asks for an own network domain). NEWPID takes effect for our
-    // children, so the grandchild we fork becomes PID 1 in the new pid
-    // namespace; MOUNT|UTS|IPC (and the netns) apply to us and are inherited
-    // by it.
-    let mut ns_mask =
-        libc::CLONE_NEWPID | libc::CLONE_NEWNS | libc::CLONE_NEWUTS | libc::CLONE_NEWIPC;
-    if plan.own_netns {
-        ns_mask |= libc::CLONE_NEWNET;
+    if plan.isolate {
+        // Isolated sandbox (privileged). Unshare PID + MOUNT|UTS|IPC (+ NET
+        // when the spec asks for an own network domain). NEWPID takes effect
+        // for our children, so the grandchild we fork becomes PID 1 in the
+        // new pid namespace; MOUNT|UTS|IPC (and the netns) apply to us and
+        // are inherited by it.
+        let mut ns_mask =
+            libc::CLONE_NEWPID | libc::CLONE_NEWNS | libc::CLONE_NEWUTS | libc::CLONE_NEWIPC;
+        if plan.own_netns {
+            ns_mask |= libc::CLONE_NEWNET;
+        }
+        if libc::unshare(ns_mask) != 0 {
+            relay_errno_and_exit(pid_w, 125);
+        }
+    } else {
+        // Null sandbox. Own-netns is orthogonal to isolate: unshare just the
+        // network domain when the spec asks. Orphans of the workload come
+        // to this process, which ends them with the init.
+        if plan.own_netns && libc::unshare(libc::CLONE_NEWNET) != 0 {
+            relay_errno_and_exit(pid_w, 121);
+        }
+        if libc::prctl(
+            libc::PR_SET_CHILD_SUBREAPER,
+            1 as libc::c_ulong,
+            0 as libc::c_ulong,
+            0 as libc::c_ulong,
+            0 as libc::c_ulong,
+        ) != 0
+        {
+            relay_errno_and_exit(pid_w, 120);
+        }
     }
-    if libc::unshare(ns_mask) != 0 {
-        relay_errno_and_exit(pid_w, 125);
+    // The init's lifeline: this process holds the only write end, so its
+    // end of file is this process gone (the init's `getppid` reads 0 from
+    // inside its pid namespace, whatever its parent).
+    let mut life = [0i32; 2];
+    if libc::pipe2(life.as_mut_ptr(), libc::O_CLOEXEC) != 0 {
+        relay_errno_and_exit(pid_w, 120);
     }
     let init = libc::fork();
     if init < 0 {
         relay_errno_and_exit(pid_w, 120);
     }
     if init == 0 {
-        // Grandchild = container init (PID 1). It does the mount surgery (so
-        // /proc reflects the new pid namespace) and execs.
+        // Grandchild = container init (PID 1 when isolated). It does the
+        // mount surgery (so /proc reflects the new pid namespace) and execs.
+        libc::close(life[1]);
+        super::confine::bind_to_parent_by(life[0]);
         libc::close(pid_w);
-        hp_container_body(plan, start_r, out_w);
+        hp_container_body(plan, start_r, out_w, life[0]);
     }
+    libc::close(life[0]);
     // Intermediate: relay the container init's host pid up to the provider, then
-    // relay its exit status as our own exit code.
+    // relay its exit status as our own.
     let pb = init.to_ne_bytes();
     libc::write(pid_w, pb.as_ptr() as *const libc::c_void, 4);
     libc::close(pid_w);
     libc::close(start_r); // the grandchild holds its own copy for the barrier
     libc::close(out_w); // only the grandchild should hold the stdout write end
+    let status = loop {
+        let mut st: libc::c_int = 0;
+        let r = libc::waitpid(-1, &mut st, 0);
+        if r == init {
+            break st;
+        }
+        if r > 0 {
+            continue; // an orphan of the workload, reaped
+        }
+        if *libc::__errno_location() == libc::EINTR {
+            if runtime_gone(plan.parent) {
+                libc::kill(init, libc::SIGKILL);
+            }
+            continue;
+        }
+        libc::_exit(119);
+    };
+    if !plan.isolate {
+        kill_descendants();
+    }
+    relay_status(status);
+}
+
+/// Set by the parent-death signal ([`watch_runtime`]).
+static RUNTIME_SIGNALLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn on_runtime_signal(_: libc::c_int) {
+    RUNTIME_SIGNALLED.store(true, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Bind the intermediate to the runtime process `parent`: its parent-death
+/// signal is `SIGUSR1`, caught (no `SA_RESTART`, so a blocked `waitpid`
+/// returns `EINTR`), and the intermediate acts on it only when its parent is
+/// no longer `parent` ([`runtime_gone`]). The signal also comes when merely
+/// the thread that forked it exits and it is handed to another thread of the
+/// runtime, so a thread's end alone ends no workload; the runtime's end
+/// does. A runtime gone before the binding was made exits this child at
+/// once. Async-signal-safe.
+unsafe fn watch_runtime(parent: i32) {
+    let mut sa: libc::sigaction = core::mem::zeroed();
+    sa.sa_sigaction = on_runtime_signal as extern "C" fn(libc::c_int) as usize;
+    libc::sigemptyset(&mut sa.sa_mask);
+    sa.sa_flags = 0;
+    libc::sigaction(libc::SIGUSR1, &sa, core::ptr::null_mut());
+    if libc::prctl(
+        libc::PR_SET_PDEATHSIG,
+        libc::SIGUSR1 as libc::c_ulong,
+        0 as libc::c_ulong,
+        0 as libc::c_ulong,
+        0 as libc::c_ulong,
+    ) != 0
+        || libc::getppid() != parent
+    {
+        libc::_exit(110);
+    }
+}
+
+/// Whether the parent-death signal came and the runtime `parent` is gone.
+fn runtime_gone(parent: i32) -> bool {
+    // SAFETY: an id getter.
+    RUNTIME_SIGNALLED.load(core::sync::atomic::Ordering::Relaxed)
+        && unsafe { libc::getppid() } != parent
+}
+
+/// Exit with `status` as the child it came from did: its exit code, or the
+/// same terminating signal (raised on this process with its default action,
+/// no core dumped), so a waiter reads one status whichever process it
+/// waits for. Async-signal-safe.
+unsafe fn relay_status(status: libc::c_int) -> ! {
+    if libc::WIFEXITED(status) {
+        libc::_exit(libc::WEXITSTATUS(status));
+    }
+    if libc::WIFSIGNALED(status) {
+        let sig = libc::WTERMSIG(status);
+        let none = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        libc::setrlimit(libc::RLIMIT_CORE, &none);
+        libc::prctl(
+            libc::PR_SET_DUMPABLE,
+            0 as libc::c_ulong,
+            0 as libc::c_ulong,
+            0 as libc::c_ulong,
+            0 as libc::c_ulong,
+        );
+        libc::signal(sig, libc::SIG_DFL);
+        let mut set: libc::sigset_t = core::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, sig);
+        libc::sigprocmask(libc::SIG_UNBLOCK, &set, core::ptr::null_mut());
+        libc::kill(libc::getpid(), sig);
+        libc::_exit(128 + sig);
+    }
+    libc::_exit(118);
+}
+
+/// Kill and reap every child of this process (a child subreaper) until it
+/// has none: each round kills every child `/proc/thread-self/children`
+/// names and reaps one, and a killed child's own children are reparented
+/// here for the next round, so the whole tree goes whatever its process
+/// groups and sessions. Allocation-free. Async-signal-safe.
+unsafe fn kill_descendants() {
+    loop {
+        let fd = libc::open(
+            c"/proc/thread-self/children".as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC,
+        );
+        if fd >= 0 {
+            let mut buf = [0u8; 512];
+            let mut pid: i32 = 0;
+            loop {
+                let n = libc::read(fd, buf.as_mut_ptr().cast(), buf.len());
+                if n <= 0 {
+                    break;
+                }
+                for &c in &buf[..n as usize] {
+                    if c.is_ascii_digit() {
+                        pid = pid.saturating_mul(10).saturating_add(i32::from(c - b'0'));
+                    } else {
+                        if pid > 0 {
+                            libc::kill(pid, libc::SIGKILL);
+                        }
+                        pid = 0;
+                    }
+                }
+            }
+            if pid > 0 {
+                libc::kill(pid, libc::SIGKILL);
+            }
+            libc::close(fd);
+        }
+        let mut st: libc::c_int = 0;
+        let r = libc::waitpid(-1, &mut st, 0);
+        if r < 0 && *libc::__errno_location() == libc::ECHILD {
+            return;
+        }
+    }
+}
+
+/// In a child that joined an isolated workload's namespaces (an EXEC, a
+/// TTY session): fork once more, so the process that execs is inside the
+/// workload's pid namespace — joining one places only a process's children
+/// there. This process keeps nothing open but the inner one's lifeline,
+/// waits for it, and exits with its status exactly ([`relay_status`]); it
+/// returns only in the inner one, with the lifeline's read end, which binds
+/// it to this one ([`super::confine::bind_to_parent_by`]). Async-signal-safe.
+unsafe fn enter_pid_namespace() -> i32 {
+    let mut life = [0i32; 2];
+    if libc::pipe2(life.as_mut_ptr(), libc::O_CLOEXEC) != 0 {
+        libc::_exit(125);
+    }
+    let inner = libc::fork();
+    if inner < 0 {
+        libc::_exit(125);
+    }
+    if inner == 0 {
+        libc::close(life[1]);
+        super::confine::bind_to_parent_by(life[0]);
+        return life[0];
+    }
+    libc::close(life[0]);
+    close_all_but(&[life[1]]);
+    for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT] {
+        libc::signal(sig, libc::SIG_IGN);
+    }
     let mut status: libc::c_int = 0;
     loop {
-        let r = libc::waitpid(init, &mut status, 0);
-        if r == init {
+        let r = libc::waitpid(inner, &mut status, 0);
+        if r == inner {
             break;
         }
         if r < 0 && *libc::__errno_location() == libc::EINTR {
@@ -1211,13 +1518,7 @@ unsafe fn hp_child(plan: &SpawnPlan, start_r: i32, out_w: i32, pid_w: i32) -> ! 
         }
         libc::_exit(119);
     }
-    if libc::WIFEXITED(status) {
-        libc::_exit(libc::WEXITSTATUS(status));
-    }
-    if libc::WIFSIGNALED(status) {
-        libc::_exit(128 + libc::WTERMSIG(status));
-    }
-    libc::_exit(118);
+    relay_status(status);
 }
 
 /// Every signal back to its default disposition and none blocked: a child
@@ -1259,11 +1560,12 @@ unsafe fn wire_stdio(out_w: i32) -> bool {
 }
 
 /// The container-process body — stdio, mounts (isolated), the create/start
-/// barrier, the working directory, the identity, then exec. Runs as the
-/// container init (grandchild) in an isolated sandbox, or as the direct child
-/// in a null sandbox; its namespaces are already unshared by the caller in
-/// the isolated case.
-unsafe fn hp_container_body(plan: &SpawnPlan, start_r: i32, out_w: i32) -> ! {
+/// barrier, the working directory, the confinement and the identity, then
+/// exec. Runs as the container init (grandchild) in an isolated sandbox, or
+/// as the direct child in a null sandbox; its namespaces are already
+/// unshared by the caller in the isolated case. `lifeline` is the init's
+/// read end of its parent's lifeline (`hp_child`).
+unsafe fn hp_container_body(plan: &SpawnPlan, start_r: i32, out_w: i32, lifeline: i32) -> ! {
     // Become a process-group leader so SIGNAL/DESTROY can deliver to the
     // whole group (`kill(-pgid)`) and children of the container init hear a
     // SIGTERM too. Fork inherits the parent's pgid, so the double-fork alone
@@ -1293,12 +1595,35 @@ unsafe fn hp_container_body(plan: &SpawnPlan, start_r: i32, out_w: i32) -> ! {
             libc::_exit(124);
         }
         if let Some(rootfs) = plan.rootfs.as_ref() {
-            // Volumes, before the pivot: the host paths are only reachable
-            // from here. The mount namespace is already private, so none of
-            // this propagates back to the host.
-            if !bind_volumes(rootfs, &plan.binds) {
+            // The host's device nodes, before the pivot leaves its `/dev`
+            // behind; then the root bound onto itself and made `nodev`
+            // throughout, so no node the workload makes in its root or a
+            // volume opens a device; then its own `/dev`, and the volumes
+            // (which may land in it). The mount namespace is already
+            // private, so none of this propagates back to the host.
+            let mut devs = [-1i32; DEV_NODES.len()];
+            if !clone_host_devices(&mut devs) {
+                libc::_exit(112);
+            }
+            if !bind_root(rootfs) {
+                libc::_exit(123);
+            }
+            let rfd = libc::open(
+                rootfs.as_ptr(),
+                libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            );
+            if rfd < 0 || !make_dev(rfd, &devs, &plan.dev) {
+                libc::_exit(112);
+            }
+            for d in devs {
+                if d >= 0 {
+                    libc::close(d);
+                }
+            }
+            if !bind_volumes(rfd, &plan.binds) {
                 libc::_exit(121);
             }
+            libc::close(rfd);
             if hp_pivot_into(rootfs.as_ptr()) != 0 {
                 libc::_exit(123);
             }
@@ -1351,12 +1676,20 @@ unsafe fn hp_container_body(plan: &SpawnPlan, start_r: i32, out_w: i32) -> ! {
     if plan.root_read_only && !remount_read_only(c"/") {
         libc::_exit(114);
     }
-    // Who it runs as, last: the mounts and the cwd above may need the
-    // runtime's privilege.
+    // Who it runs as and what it may do, last: the mounts and the cwd above
+    // may need the runtime's privilege. The identity change clears the
+    // parent-death binding, so it is made again after it.
+    if !plan.proc.confine.enter() {
+        libc::_exit(111);
+    }
     if let Some(c) = plan.proc.cred.as_ref() {
         if !apply_cred(c) {
             libc::_exit(115);
         }
+    }
+    super::confine::bind_to_parent_by(lifeline);
+    if !plan.proc.confine.settle() {
+        libc::_exit(111);
     }
     exec_with(&plan.argv_ptrs, &plan.envp_ptrs, &plan.proc);
 }
@@ -1370,22 +1703,281 @@ const IN_ROOT: u64 = libc::RESOLVE_IN_ROOT | libc::RESOLVE_NO_MAGICLINKS;
 const MOVE_MOUNT_F_EMPTY_PATH: libc::c_uint = 0x0000_0004;
 const MOVE_MOUNT_T_EMPTY_PATH: libc::c_uint = 0x0000_0040;
 
-/// Bind every planned volume into `rootfs` (see the module header). False
-/// on the first one that cannot be bound. Async-signal-safe.
-unsafe fn bind_volumes(rootfs: &core::ffi::CStr, binds: &[PlannedBind]) -> bool {
-    if binds.is_empty() {
-        return true;
+/// Bind every planned volume into the rootfs `rfd` (see the module
+/// header). False on the first one that cannot be bound. Async-signal-safe.
+unsafe fn bind_volumes(rfd: i32, binds: &[PlannedBind]) -> bool {
+    binds.iter().all(|b| bind_volume(rfd, b))
+}
+
+/// The device nodes of a workload's `/dev`, bound from the host's (the OCI
+/// default devices).
+const DEV_NODES: [&core::ffi::CStr; 6] = [c"null", c"zero", c"full", c"random", c"urandom", c"tty"];
+/// The same nodes on the host.
+const DEV_HOST: [&core::ffi::CStr; 6] = [
+    c"/dev/null",
+    c"/dev/zero",
+    c"/dev/full",
+    c"/dev/random",
+    c"/dev/urandom",
+    c"/dev/tty",
+];
+/// The links of a workload's `/dev`: name, target.
+const DEV_LINKS: [(&core::ffi::CStr, &core::ffi::CStr); 5] = [
+    (c"fd", c"/proc/self/fd"),
+    (c"stdin", c"/proc/self/fd/0"),
+    (c"stdout", c"/proc/self/fd/1"),
+    (c"stderr", c"/proc/self/fd/2"),
+    (c"ptmx", c"pts/ptmx"),
+];
+
+/// `fsconfig(2)` commands and the `fsopen`/`fsmount` close-on-exec flags
+/// (`<linux/mount.h>`).
+const FSCONFIG_SET_STRING: libc::c_uint = 1;
+const FSCONFIG_CMD_CREATE: libc::c_uint = 6;
+const FSOPEN_CLOEXEC: libc::c_uint = 1;
+const FSMOUNT_CLOEXEC: libc::c_uint = 1;
+
+/// Clone each host device node of [`DEV_HOST`] as a detached mount of that
+/// one file, into `out` (-1 for a node the host lacks). False on any other
+/// failure. Async-signal-safe.
+unsafe fn clone_host_devices(out: &mut [i32; DEV_NODES.len()]) -> bool {
+    for (i, path) in DEV_HOST.iter().enumerate() {
+        let t = libc::syscall(
+            libc::SYS_open_tree,
+            libc::AT_FDCWD,
+            path.as_ptr(),
+            libc::OPEN_TREE_CLONE | libc::OPEN_TREE_CLOEXEC,
+        ) as i32;
+        if t < 0 {
+            if *libc::__errno_location() == libc::ENOENT {
+                continue;
+            }
+            return false;
+        }
+        out[i] = t;
     }
-    let rfd = libc::open(
-        rootfs.as_ptr(),
-        libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
-    );
-    if rfd < 0 {
+    true
+}
+
+/// A new, detached mount of a fresh `fstype` filesystem configured with
+/// `opts` and the `MOUNT_ATTR_*` `attrs`: the mount's descriptor, or -1.
+/// Async-signal-safe.
+unsafe fn new_fs(
+    fstype: &core::ffi::CStr,
+    opts: &[(&core::ffi::CStr, &core::ffi::CStr)],
+    attrs: u64,
+) -> i32 {
+    let fs = libc::syscall(libc::SYS_fsopen, fstype.as_ptr(), FSOPEN_CLOEXEC) as i32;
+    if fs < 0 {
+        return -1;
+    }
+    let mut ok = true;
+    for (k, v) in opts {
+        ok = ok
+            && libc::syscall(
+                libc::SYS_fsconfig,
+                fs,
+                FSCONFIG_SET_STRING,
+                k.as_ptr(),
+                v.as_ptr(),
+                0,
+            ) == 0;
+    }
+    ok = ok
+        && libc::syscall(
+            libc::SYS_fsconfig,
+            fs,
+            FSCONFIG_CMD_CREATE,
+            core::ptr::null::<libc::c_char>(),
+            core::ptr::null::<libc::c_void>(),
+            0,
+        ) == 0;
+    let m = if ok {
+        libc::syscall(
+            libc::SYS_fsmount,
+            fs,
+            FSMOUNT_CLOEXEC,
+            attrs as libc::c_uint,
+        ) as i32
+    } else {
+        -1
+    };
+    libc::close(fs);
+    m
+}
+
+/// Attach the detached mount `m` onto the directory `name` in `dir` (made
+/// when absent), resolved without following a symlink. Closes `m`.
+/// Async-signal-safe.
+unsafe fn attach_at(m: i32, dir: i32, name: &core::ffi::CStr) -> bool {
+    if m < 0 {
         return false;
     }
-    let ok = binds.iter().all(|b| bind_volume(rfd, b));
-    libc::close(rfd);
+    libc::mkdirat(dir, name.as_ptr(), 0o755);
+    let at = libc::openat(
+        dir,
+        name.as_ptr(),
+        libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+    );
+    let ok = at >= 0
+        && libc::syscall(
+            libc::SYS_move_mount,
+            m,
+            c"".as_ptr(),
+            at,
+            c"".as_ptr(),
+            MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_EMPTY_PATH,
+        ) == 0;
+    if at >= 0 {
+        libc::close(at);
+    }
+    libc::close(m);
     ok
+}
+
+/// Give the rootfs `rfd` a `/dev` of its own, the OCI default one: a memory
+/// filesystem (`0755`, `nosuid`, `noexec`, `nodev`, sized by `dev`) at
+/// `/dev`, resolved inside the root; the host's [`DEV_NODES`] bound onto
+/// files in it (`devs`, a node the host lacks left out); `/dev/pts` a new
+/// `devpts` instance (`ptmxmode=0666`, `mode=0620`, `gid=5`); `/dev/shm` a
+/// memory filesystem (`1777`, `nosuid`, `nodev`, `noexec`) sized by `dev`;
+/// and the [`DEV_LINKS`]. Every mount is made detached and attached by
+/// descriptor, and everything inside is created through the new
+/// filesystem's own descriptor, so no path is looked up twice.
+/// Async-signal-safe.
+unsafe fn make_dev(rfd: i32, devs: &[i32; DEV_NODES.len()], dev: &DevPlan) -> bool {
+    libc::mkdirat(rfd, c"dev".as_ptr(), 0o755);
+    let at = openat2_raw(
+        rfd,
+        c"dev".as_ptr(),
+        libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        IN_ROOT,
+    );
+    if at < 0 {
+        return false;
+    }
+    let m = new_fs(
+        c"tmpfs",
+        &[
+            (c"mode", c"755"),
+            (c"size", &dev.size),
+            (c"nr_inodes", &dev.inodes),
+        ],
+        libc::MOUNT_ATTR_NOSUID | libc::MOUNT_ATTR_NOEXEC | libc::MOUNT_ATTR_NODEV,
+    );
+    let attached = m >= 0
+        && libc::syscall(
+            libc::SYS_move_mount,
+            m,
+            c"".as_ptr(),
+            at,
+            c"".as_ptr(),
+            MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_EMPTY_PATH,
+        ) == 0;
+    libc::close(at);
+    if !attached {
+        if m >= 0 {
+            libc::close(m);
+        }
+        return false;
+    }
+    // `m` is the new filesystem's root, attached: everything below is made
+    // through it.
+    let mut ok = true;
+    for (name, &src) in DEV_NODES.iter().zip(devs.iter()) {
+        if src < 0 || !ok {
+            continue;
+        }
+        let f = libc::openat(
+            m,
+            name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o666 as libc::c_uint,
+        );
+        if f < 0 {
+            ok = false;
+            continue;
+        }
+        libc::close(f);
+        let t = libc::openat(
+            m,
+            name.as_ptr(),
+            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        );
+        ok = t >= 0
+            && libc::syscall(
+                libc::SYS_move_mount,
+                src,
+                c"".as_ptr(),
+                t,
+                c"".as_ptr(),
+                MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_EMPTY_PATH,
+            ) == 0;
+        if t >= 0 {
+            libc::close(t);
+        }
+    }
+    ok = ok
+        && attach_at(
+            new_fs(
+                c"devpts",
+                &[(c"ptmxmode", c"0666"), (c"mode", c"0620"), (c"gid", c"5")],
+                libc::MOUNT_ATTR_NOSUID | libc::MOUNT_ATTR_NOEXEC,
+            ),
+            m,
+            c"pts",
+        );
+    ok = ok
+        && attach_at(
+            new_fs(
+                c"tmpfs",
+                &[(c"mode", c"1777"), (c"size", &dev.shm_size)],
+                libc::MOUNT_ATTR_NOSUID | libc::MOUNT_ATTR_NOEXEC | libc::MOUNT_ATTR_NODEV,
+            ),
+            m,
+            c"shm",
+        );
+    for (name, to) in DEV_LINKS {
+        ok = ok && libc::symlinkat(to.as_ptr(), m, name.as_ptr()) == 0;
+    }
+    libc::close(m);
+    ok
+}
+
+/// Bind the rootfs onto itself (recursively, so what the image has mounted
+/// inside comes along) and make the whole bound tree `nodev`: what the
+/// workload makes in its root, with the device-node capability or not,
+/// opens no device. A kernel without `mount_setattr` (before 5.12) makes
+/// the top mount `nodev` instead. Async-signal-safe.
+unsafe fn bind_root(rootfs: &core::ffi::CStr) -> bool {
+    if libc::mount(
+        rootfs.as_ptr(),
+        rootfs.as_ptr(),
+        core::ptr::null(),
+        libc::MS_BIND | libc::MS_REC,
+        core::ptr::null(),
+    ) != 0
+    {
+        return false;
+    }
+    let attr = libc::mount_attr {
+        attr_set: libc::MOUNT_ATTR_NODEV,
+        attr_clr: 0,
+        propagation: 0,
+        userns_fd: 0,
+    };
+    if libc::syscall(
+        libc::SYS_mount_setattr,
+        libc::AT_FDCWD,
+        rootfs.as_ptr(),
+        libc::AT_RECURSIVE as libc::c_uint,
+        &attr as *const libc::mount_attr,
+        core::mem::size_of::<libc::mount_attr>(),
+    ) == 0
+    {
+        return true;
+    }
+    *libc::__errno_location() == libc::ENOSYS && remount_adding(rootfs, libc::MS_NODEV)
 }
 
 /// Bind one volume: its source opened as planning opened it (and of the same
@@ -1477,33 +2069,32 @@ unsafe fn attach(src: i32, dst: i32, rfd: i32, b: &PlannedBind) -> bool {
     if tree < 0 {
         return false;
     }
-    // Read-only before it is reachable: every mount of the clone, so a
-    // volume with mounts inside is read-only all the way down. A kernel
-    // without `mount_setattr` (before 5.12) remounts the top mount once it
-    // is in place instead.
+    // `nodev` (and read-only when asked) before it is reachable: every
+    // mount of the clone, so a volume with mounts inside is so all the way
+    // down, and a device node made in it opens no device. A kernel without
+    // `mount_setattr` (before 5.12) remounts the top mount once it is in
+    // place instead.
     let mut remount = false;
-    if b.ro {
-        let attr = libc::mount_attr {
-            attr_set: libc::MOUNT_ATTR_RDONLY,
-            attr_clr: 0,
-            propagation: 0,
-            userns_fd: 0,
-        };
-        if libc::syscall(
-            libc::SYS_mount_setattr,
-            tree,
-            c"".as_ptr(),
-            (libc::AT_EMPTY_PATH | libc::AT_RECURSIVE) as libc::c_uint,
-            &attr as *const libc::mount_attr,
-            core::mem::size_of::<libc::mount_attr>(),
-        ) != 0
-        {
-            if *libc::__errno_location() != libc::ENOSYS {
-                libc::close(tree);
-                return false;
-            }
-            remount = true;
+    let attr = libc::mount_attr {
+        attr_set: libc::MOUNT_ATTR_NODEV | if b.ro { libc::MOUNT_ATTR_RDONLY } else { 0 },
+        attr_clr: 0,
+        propagation: 0,
+        userns_fd: 0,
+    };
+    if libc::syscall(
+        libc::SYS_mount_setattr,
+        tree,
+        c"".as_ptr(),
+        (libc::AT_EMPTY_PATH | libc::AT_RECURSIVE) as libc::c_uint,
+        &attr as *const libc::mount_attr,
+        core::mem::size_of::<libc::mount_attr>(),
+    ) != 0
+    {
+        if *libc::__errno_location() != libc::ENOSYS {
+            libc::close(tree);
+            return false;
         }
+        remount = true;
     }
     let moved = libc::syscall(
         libc::SYS_move_mount,
@@ -1531,8 +2122,9 @@ unsafe fn attach(src: i32, dst: i32, rfd: i32, b: &PlannedBind) -> bool {
         return false;
     }
     let mut path = [0u8; 32];
+    let add = libc::MS_NODEV | if b.ro { libc::MS_RDONLY } else { 0 };
     let ok = fd_path(top, &mut path)
-        && remount_read_only(core::ffi::CStr::from_ptr(path.as_ptr().cast()));
+        && remount_adding(core::ffi::CStr::from_ptr(path.as_ptr().cast()), add);
     libc::close(top);
     ok
 }
@@ -1563,16 +2155,24 @@ fn fd_path(fd: i32, buf: &mut [u8; 32]) -> bool {
 }
 
 /// Remount the mount at `path` read-only: that mount alone (a bind remount
-/// never recurses), so mounts beneath it keep their own access. A bind
-/// remount replaces the mount's per-mount flags, so the ones it already
-/// carries (`nosuid`, `nodev`, `noexec`, the atime policy) are read first
-/// and kept — the remount only ever takes access away. Async-signal-safe.
+/// never recurses), so mounts beneath it keep their own access.
+/// Async-signal-safe.
 unsafe fn remount_read_only(path: &core::ffi::CStr) -> bool {
+    remount_adding(path, libc::MS_RDONLY)
+}
+
+/// Remount the mount at `path` with the per-mount flags `add` added. A bind
+/// remount replaces the mount's per-mount flags, so the ones it already
+/// carries (`ro`, `nosuid`, `nodev`, `noexec`, the atime policy) are read
+/// first and kept — the remount only ever takes access away.
+/// Async-signal-safe.
+unsafe fn remount_adding(path: &core::ffi::CStr, add: libc::c_ulong) -> bool {
     let Some(have) = mount_flags(path) else {
         return false;
     };
     let mut keep: libc::c_ulong = 0;
     for (st_bit, ms_bit) in [
+        (libc::ST_RDONLY, libc::MS_RDONLY),
         (libc::ST_NOSUID, libc::MS_NOSUID),
         (libc::ST_NODEV, libc::MS_NODEV),
         (libc::ST_NOEXEC, libc::MS_NOEXEC),
@@ -1588,7 +2188,7 @@ unsafe fn remount_read_only(path: &core::ffi::CStr) -> bool {
         core::ptr::null(),
         path.as_ptr(),
         core::ptr::null(),
-        libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY | keep,
+        libc::MS_BIND | libc::MS_REMOUNT | add | keep,
         core::ptr::null(),
     ) == 0
 }
@@ -1697,16 +2297,29 @@ unsafe fn apply_cred(c: &Cred) -> bool {
 }
 
 /// A process joining a live workload (EXEC, TTY): into its cwd (it stays at
-/// the root it entered when that is gone), then its identity — a refused one
-/// exits 115 rather than run as the runtime.
-unsafe fn enter_as_workload(proc: &ProcCtx) {
+/// the root it entered when that is gone), then its confinement and its
+/// identity — a refused one exits (115 the identity, 111 the confinement)
+/// rather than run as the runtime — bound to `parent`, the runtime, again
+/// after the identity change.
+unsafe fn enter_as_workload(proc: &ProcCtx, parent: i32, lifeline: i32) {
     if let Some(c) = proc.cwd.as_ref() {
         libc::chdir(c.as_ptr());
+    }
+    if !proc.confine.enter() {
+        libc::_exit(111);
     }
     if let Some(c) = proc.cred.as_ref() {
         if !apply_cred(c) {
             libc::_exit(115);
         }
+    }
+    if lifeline >= 0 {
+        super::confine::bind_to_parent_by(lifeline);
+    } else {
+        super::confine::bind_to_parent(parent);
+    }
+    if !proc.confine.settle() {
+        libc::_exit(111);
     }
 }
 
@@ -1721,6 +2334,10 @@ unsafe fn exec_with(
     envp: &[*const libc::c_char],
     proc: &ProcCtx,
 ) -> ! {
+    // The system-call filter, last before the exec.
+    if !proc.confine.seal() {
+        libc::_exit(111);
+    }
     let file = argv[0];
     let flen = libc::strlen(file);
     if flen == 0 {
@@ -1787,21 +2404,10 @@ unsafe fn exec_with(
     libc::_exit(if found { 126 } else { 127 });
 }
 
-/// pivot_root into `new_root` (a mount point): bind rootfs onto itself,
+/// pivot_root into `new_root`, already bound onto itself ([`bind_root`]):
 /// pivot, detach the old root, with an MS_MOVE fallback on EINVAL/EXDEV.
 /// Returns 0 on success, -1 on failure.
 unsafe fn hp_pivot_into(new_root: *const libc::c_char) -> i32 {
-    let bind_flags = libc::MS_BIND | libc::MS_REC;
-    if libc::mount(
-        new_root,
-        new_root,
-        core::ptr::null(),
-        bind_flags,
-        core::ptr::null(),
-    ) != 0
-    {
-        return -1;
-    }
     if libc::chdir(new_root) != 0 {
         return -1;
     }
@@ -1916,6 +2522,8 @@ pub unsafe fn hp_spawn_with_binds(
     plan.mem_max = mem;
     plan.pids_max = pids;
     plan.cpu_max = cpu;
+    plan.dev = DevPlan::for_memory(env.memory_bytes);
+    plan.parent = libc::getpid();
 
     let slots = &mut *core::ptr::addr_of_mut!(LINUX_SANDBOXES);
     let idx = match free_slot(
@@ -2004,14 +2612,12 @@ pub unsafe fn hp_spawn_with_binds(
     let relayed = (got == 4).then(|| i32::from_ne_bytes(pb));
     let refused = match relayed {
         Some(v) if v <= 0 => Some(if v < 0 { v } else { errno::ERROR }),
-        Some(v) if plan.isolate => {
+        Some(v) => {
             container_pid = v;
             None
         }
-        Some(_) => Some(errno::ERROR),
         // The intermediate died before relaying the init's pid.
-        None if plan.isolate => Some(errno::ERROR),
-        None => None,
+        None => Some(errno::ERROR),
     };
     if let Some(e) = refused {
         libc::close(out_r);
@@ -2107,7 +2713,10 @@ pub unsafe fn hp_read(raw: i32, out: *mut u8, out_len: usize) -> i32 {
 // keeps a pseudo-terminal open across scheduler steps so a shell can be driven
 // bidirectionally. The master fd + child pid live in a process-global session
 // table; `hp_tty_step` pumps one step of it (write stdin, drain output, poll
-// liveness), and the caller relays those bytes.
+// liveness), and the caller relays those bytes. A session belongs to the
+// module that opened it, under that module's owner: step, resize and close
+// from any other caller answer EACCES. The opener's owner release
+// (`hp_tty_release_owner`) and the workload's DESTROY close it.
 
 /// The session-id DOMAIN, not a table size: the table is sized at boot to
 /// the plan's `tty_sessions` ceiling (`size_kernel_tables`) — interactive
@@ -2123,6 +2732,13 @@ struct TtySession {
     pid: i32,
     reaped: bool,
     exit_code: i32,
+    /// The sandbox the session joined: its DESTROY closes the session.
+    sandbox: i32,
+    /// Who opened it — the calling module and its owner. Only that module,
+    /// under that owner, steps, resizes or closes it; the owner's release
+    /// closes it.
+    owner: crate::kernel::workload::owner::OwnerHandle,
+    module: usize,
 }
 
 const TTY_EMPTY: TtySession = TtySession {
@@ -2131,7 +2747,34 @@ const TTY_EMPTY: TtySession = TtySession {
     pid: -1,
     reaped: false,
     exit_code: 0,
+    sandbox: -1,
+    owner: crate::kernel::workload::owner::OWNER_SYSTEM,
+    module: usize::MAX,
 };
+
+/// The caller a session is bound to: the calling module and its owner.
+fn tty_caller() -> (crate::kernel::workload::owner::OwnerHandle, usize) {
+    use crate::kernel::exec::scheduler;
+    (scheduler::caller_owner(), scheduler::current_module_index())
+}
+
+/// The session `sid` for the calling module: `EINVAL` for no such session,
+/// `EACCES` for one another module or owner opened.
+///
+/// # Safety
+/// Single-threaded platform dispatch only (process-global session table).
+unsafe fn tty_session(sid: usize) -> Result<&'static mut TtySession, i32> {
+    use crate::kernel::sys::errno;
+    let sessions = &mut *core::ptr::addr_of_mut!(LINUX_TTYS);
+    if sid >= sessions.len() || !sessions[sid].in_use {
+        return Err(errno::EINVAL);
+    }
+    let s = &mut sessions[sid];
+    if (s.owner, s.module) != tty_caller() {
+        return Err(errno::EACCES);
+    }
+    Ok(s)
+}
 
 static mut LINUX_TTYS: crate::kernel::mem::table::Table<TtySession, MAX_TTY_SESSIONS> = crate::boot_table!(
     MAX_TTY_SESSIONS,
@@ -2207,6 +2850,7 @@ pub unsafe fn hp_tty_open(raw: i32, arg: *const u8, arg_len: usize) -> i32 {
     };
     let proc = &slot.proc;
     let envp = proc.envp_ptrs();
+    let parent = libc::getpid();
 
     let sessions = &mut *core::ptr::addr_of_mut!(LINUX_TTYS);
     let sid = match free_slot(
@@ -2269,10 +2913,18 @@ pub unsafe fn hp_tty_open(raw: i32, arg: *const u8, arg_len: usize) -> i32 {
         // Child: join the workload, become a session leader on the PTY
         // slave, exec.
         reset_signals();
+        super::confine::bind_to_parent(parent);
         libc::close(master);
         if !join.enter() {
             libc::_exit(125);
         }
+        // Isolated: the session runs inside the workload's pid namespace,
+        // one fork further in; this process relays its status.
+        let lifeline = if join.isolated {
+            enter_pid_namespace()
+        } else {
+            -1
+        };
         libc::setsid();
         libc::ioctl(slave, libc::TIOCSCTTY, 0);
         libc::dup2(slave, libc::STDIN_FILENO);
@@ -2281,8 +2933,13 @@ pub unsafe fn hp_tty_open(raw: i32, arg: *const u8, arg_len: usize) -> i32 {
         if slave > 2 {
             libc::close(slave);
         }
-        close_all_but(&[libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO]);
-        enter_as_workload(proc);
+        close_all_but(&[
+            libc::STDIN_FILENO,
+            libc::STDOUT_FILENO,
+            libc::STDERR_FILENO,
+            lifeline,
+        ]);
+        enter_as_workload(proc, parent, lifeline);
         exec_with(&argv_ptrs, &envp, proc);
     }
     // Parent: keep the master (non-blocking), drop the slave + ns fds.
@@ -2290,12 +2947,16 @@ pub unsafe fn hp_tty_open(raw: i32, arg: *const u8, arg_len: usize) -> i32 {
     join.close();
     let fl = libc::fcntl(master, libc::F_GETFL);
     libc::fcntl(master, libc::F_SETFL, fl | libc::O_NONBLOCK);
+    let (owner, module) = tty_caller();
     sessions[sid] = TtySession {
         in_use: true,
         master,
         pid,
         reaped: false,
         exit_code: 0,
+        sandbox: raw,
+        owner,
+        module,
     };
     sid as i32
 }
@@ -2304,7 +2965,8 @@ pub unsafe fn hp_tty_open(raw: i32, arg: *const u8, arg_len: usize) -> i32 {
 /// drain its output, and poll the child's liveness. `arg` in =
 /// `[sid:u32 LE][wlen:u32 LE][stdin bytes: wlen]`; `arg` out =
 /// `[rlen:u32 LE][state:u8][code:i32 LE][output: rlen]` (state 0 = running,
-/// 1 = exited). Returns 0, or a negative errno for a bad session id.
+/// 1 = exited). Returns 0, `EINVAL` for no such session, `EACCES` for one
+/// another module or owner opened.
 ///
 /// # Safety
 /// Single-threaded platform dispatch only. `arg` valid for `arg_len` r/w.
@@ -2316,11 +2978,11 @@ pub unsafe fn hp_tty_step(arg: *mut u8, arg_len: usize) -> i32 {
     let sid = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]) as usize;
     let wlen = u32::from_le_bytes([*arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7)]) as usize;
 
-    let sessions = &mut *core::ptr::addr_of_mut!(LINUX_TTYS);
-    if sid >= sessions.len() || !sessions[sid].in_use {
-        return errno::EINVAL;
-    }
-    let master = sessions[sid].master;
+    let session = match tty_session(sid) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    let master = session.master;
     // Write the stdin bytes straight from `arg` — the output drain below only
     // touches `arg` after this. Partial writes and EINTR are retried; a full
     // PTY buffer (EAGAIN on the non-blocking master) drops the remainder: the
@@ -2354,12 +3016,12 @@ pub unsafe fn hp_tty_step(arg: *mut u8, arg_len: usize) -> i32 {
         }
     }
     // Poll liveness (non-blocking reap).
-    let (state, code) = if sessions[sid].reaped {
-        (1u8, sessions[sid].exit_code)
+    let (state, code) = if session.reaped {
+        (1u8, session.exit_code)
     } else {
         let mut st: libc::c_int = 0;
-        let r = libc::waitpid(sessions[sid].pid, &mut st, libc::WNOHANG);
-        if r == sessions[sid].pid {
+        let r = libc::waitpid(session.pid, &mut st, libc::WNOHANG);
+        if r == session.pid {
             let code = if libc::WIFEXITED(st) {
                 libc::WEXITSTATUS(st)
             } else if libc::WIFSIGNALED(st) {
@@ -2367,8 +3029,8 @@ pub unsafe fn hp_tty_step(arg: *mut u8, arg_len: usize) -> i32 {
             } else {
                 0
             };
-            sessions[sid].reaped = true;
-            sessions[sid].exit_code = code;
+            session.reaped = true;
+            session.exit_code = code;
             (1u8, code)
         } else {
             (0u8, 0)
@@ -2381,7 +3043,7 @@ pub unsafe fn hp_tty_step(arg: *mut u8, arg_len: usize) -> i32 {
 }
 
 /// HP_TTY_RESIZE: set a session's window size. `arg` =
-/// `[sid:u32 LE][rows:u16 LE][cols:u16 LE]`.
+/// `[sid:u32 LE][rows:u16 LE][cols:u16 LE]`. Refusals as [`hp_tty_step`].
 /// # Safety
 /// Single-threaded platform dispatch only. `arg` valid for `arg_len` reads.
 pub unsafe fn hp_tty_resize(arg: *const u8, arg_len: usize) -> i32 {
@@ -2392,22 +3054,23 @@ pub unsafe fn hp_tty_resize(arg: *const u8, arg_len: usize) -> i32 {
     let sid = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]) as usize;
     let rows = u16::from_le_bytes([*arg.add(4), *arg.add(5)]);
     let cols = u16::from_le_bytes([*arg.add(6), *arg.add(7)]);
-    let sessions = &*core::ptr::addr_of!(LINUX_TTYS);
-    if sid >= sessions.len() || !sessions[sid].in_use {
-        return errno::EINVAL;
-    }
+    let session = match tty_session(sid) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
     let ws = libc::winsize {
         ws_row: rows,
         ws_col: cols,
         ws_xpixel: 0,
         ws_ypixel: 0,
     };
-    libc::ioctl(sessions[sid].master, libc::TIOCSWINSZ, &ws);
+    libc::ioctl(session.master, libc::TIOCSWINSZ, &ws);
     0
 }
 
 /// HP_TTY_CLOSE: kill (if still running) + reap the session, close the master,
-/// free the slot. `arg` = `[sid:u32 LE]`. Returns the child's exit code.
+/// free the slot. `arg` = `[sid:u32 LE]`. Returns the child's exit code;
+/// refusals as [`hp_tty_step`].
 /// # Safety
 /// Single-threaded platform dispatch only. `arg` valid for `arg_len` reads.
 pub unsafe fn hp_tty_close(arg: *const u8, arg_len: usize) -> i32 {
@@ -2416,17 +3079,25 @@ pub unsafe fn hp_tty_close(arg: *const u8, arg_len: usize) -> i32 {
         return errno::EINVAL;
     }
     let sid = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]) as usize;
-    let sessions = &mut *core::ptr::addr_of_mut!(LINUX_TTYS);
-    if sid >= sessions.len() || !sessions[sid].in_use {
-        return errno::EINVAL;
+    match tty_session(sid) {
+        Ok(s) => close_session(s),
+        Err(e) => e,
     }
-    if !sessions[sid].reaped {
-        libc::kill(sessions[sid].pid, libc::SIGKILL);
+}
+
+/// Kill (if still running) and reap a session's child, close its master,
+/// free its slot. Returns the child's exit code.
+///
+/// # Safety
+/// Single-threaded platform dispatch only (process-global session table).
+unsafe fn close_session(session: &mut TtySession) -> i32 {
+    if !session.reaped {
+        libc::kill(session.pid, libc::SIGKILL);
         let mut st: libc::c_int = 0;
         let mut code = 128 + libc::SIGKILL;
         loop {
-            let r = libc::waitpid(sessions[sid].pid, &mut st, 0);
-            if r == sessions[sid].pid {
+            let r = libc::waitpid(session.pid, &mut st, 0);
+            if r == session.pid {
                 if libc::WIFEXITED(st) {
                     code = libc::WEXITSTATUS(st);
                 } else if libc::WIFSIGNALED(st) {
@@ -2439,15 +3110,42 @@ pub unsafe fn hp_tty_close(arg: *const u8, arg_len: usize) -> i32 {
             }
             break;
         }
-        sessions[sid].reaped = true;
-        sessions[sid].exit_code = code;
+        session.reaped = true;
+        session.exit_code = code;
     }
-    let code = sessions[sid].exit_code;
-    if sessions[sid].master >= 0 {
-        libc::close(sessions[sid].master);
+    let code = session.exit_code;
+    if session.master >= 0 {
+        libc::close(session.master);
     }
-    sessions[sid] = TTY_EMPTY;
+    *session = TTY_EMPTY;
     code
+}
+
+/// Close every session `owner` opened: what an owner opens goes with it.
+/// Returns how many were closed.
+///
+/// # Safety
+/// Single-threaded platform dispatch only (process-global session table).
+pub unsafe fn hp_tty_release_owner(owner: crate::kernel::workload::owner::OwnerHandle) -> usize {
+    let sessions = &mut *core::ptr::addr_of_mut!(LINUX_TTYS);
+    let mut n = 0;
+    for s in sessions.iter_mut() {
+        if s.in_use && s.owner == owner {
+            close_session(s);
+            n += 1;
+        }
+    }
+    n
+}
+
+/// Close every session joined to sandbox `raw` (its DESTROY).
+unsafe fn close_sandbox_sessions(raw: i32) {
+    let sessions = &mut *core::ptr::addr_of_mut!(LINUX_TTYS);
+    for s in sessions.iter_mut() {
+        if s.in_use && s.sandbox == raw {
+            close_session(s);
+        }
+    }
 }
 
 /// What a process joining a live workload (EXEC, a TTY session) needs,
@@ -2596,6 +3294,7 @@ pub unsafe fn hp_exec(raw: i32, arg: *mut u8, arg_len: usize) -> i32 {
     };
     let proc = &slot.proc;
     let envp = proc.envp_ptrs();
+    let parent = libc::getpid();
 
     let mut fds = [0i32; 2];
     if libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) != 0 {
@@ -2614,6 +3313,7 @@ pub unsafe fn hp_exec(raw: i32, arg: *mut u8, arg_len: usize) -> i32 {
         // Child: stdio while `/dev/null` is the host's, then into the
         // workload, then exec. No allocation past this point.
         reset_signals();
+        super::confine::bind_to_parent(parent);
         libc::close(r);
         if !wire_stdio(w) {
             libc::_exit(113);
@@ -2621,8 +3321,20 @@ pub unsafe fn hp_exec(raw: i32, arg: *mut u8, arg_len: usize) -> i32 {
         if !join.enter() {
             libc::_exit(125);
         }
-        close_all_but(&[libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO]);
-        enter_as_workload(proc);
+        // Isolated: the command runs inside the workload's pid namespace,
+        // one fork further in; this process relays its exit status.
+        let lifeline = if join.isolated {
+            enter_pid_namespace()
+        } else {
+            -1
+        };
+        close_all_but(&[
+            libc::STDIN_FILENO,
+            libc::STDOUT_FILENO,
+            libc::STDERR_FILENO,
+            lifeline,
+        ]);
+        enter_as_workload(proc, parent, lifeline);
         exec_with(&argv_ptrs, &envp, proc);
     }
 
@@ -2859,6 +3571,8 @@ pub unsafe fn hp_destroy(raw: i32) -> i32 {
     let Some(slot) = slot_for(raw) else {
         return errno::EINVAL;
     };
+    // Its sessions first: their processes hold its namespaces and cgroup.
+    close_sandbox_sessions(raw);
     if slot.start_w >= 0 {
         libc::close(slot.start_w);
         slot.start_w = -1;
