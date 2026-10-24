@@ -1401,6 +1401,13 @@ pub fn validate_single_provider(
 /// and handlers are among what the restart releases, and nothing registers
 /// them again, so it would run on as a provider no consumer can reach.
 ///
+/// A module that declares `store_subscriptions` demand cannot attest at all,
+/// whatever policy it runs under: the restart releases every provider handle
+/// it holds and bumps its slot generation, so every subscription it made is
+/// dead — and it resumes believing it is subscribed, never woken again. The
+/// `storage.namespace` contract says a subscriber does not attest
+/// `resume_after_fault`; the attestation beside the demand is refused here.
+///
 /// A module with no manifest in the map is not gated — the same
 /// convention the other validators in this file use for modules supplied
 /// from outside the resolved set.
@@ -1419,12 +1426,24 @@ pub fn validate_fault_policy(
         if !module_names.iter().any(|m| m == name) {
             continue;
         }
-        if entry.get("fault_policy").and_then(|v| v.as_str()) != Some("restart") {
-            continue;
-        }
         let Some(m) = manifests.get(name) else {
             continue;
         };
+        if m.resume_after_fault && declares_store_subscriptions(m) {
+            return Err(Error::Config(format!(
+                "module '{name}': its manifest attests `resume_after_fault = true` and declares \
+                 `store_subscriptions` demand, which cannot both hold. A fault restart releases \
+                 every provider handle the module holds and bumps its slot generation, so each \
+                 store subscription it made dies with it, and the module resumes believing it \
+                 is still subscribed — never woken by a change again. A `storage.namespace` \
+                 subscriber does not attest `resume_after_fault`: drop the attestation from \
+                 its manifest.toml and choose `fault_policy: \"skip\"` or \
+                 `fault_policy: \"restart_graph\"`, which re-instantiates it."
+            )));
+        }
+        if entry.get("fault_policy").and_then(|v| v.as_str()) != Some("restart") {
+            continue;
+        }
         if !m.provides.is_empty() {
             return Err(Error::Config(format!(
                 "module '{name}': fault_policy = \"restart\" is not available to a module that \
@@ -1456,6 +1475,110 @@ pub fn validate_fault_policy(
         )));
     }
     Ok(())
+}
+
+/// Reject a graph in which a module provider and a module whose
+/// `requires_contract` it serves sit in different execution domains, and a
+/// provider outside the primary domain (`execution.domains[0]`, where a
+/// module without `domain:` runs) on a node that admits live-added
+/// workloads.
+///
+/// A provider call runs the provider's code in the caller's frame, on the
+/// caller's core (`in_provider_frame`), while a module heap is touched from
+/// one core only — and a provider grows its heap inside those calls. A
+/// caller in another domain would run the provider on a second core, against
+/// a heap and state its own steps touch on the first. A live-added workload
+/// lands in the primary domain unless it names another, and the composer
+/// cannot see which it will name, so a provider any workload may reach
+/// stays there. The rule is general: it holds for every module-providable
+/// contract (`PROVIDER_CONTRACTS`), not only the store.
+///
+/// `modules` is every module the composer validates — the base graph and the
+/// resident workloads' modules — each with its manifest by name. The node
+/// admits live-added workloads when its kernel holds owners beside the
+/// system's and the plan leaves the owners pool a reserve (the `capacity:`
+/// entry, else the profile's default) — `target` names the kernel.
+pub fn validate_provider_domains(
+    config: &Value,
+    modules: &[Value],
+    manifests: &HashMap<String, Manifest>,
+    target: &str,
+) -> Result<()> {
+    // (name, domain id, domain name, manifest) of every module with one.
+    let mut placed = Vec::new();
+    for m in modules {
+        let Some(name) = m.get("name").and_then(|n| n.as_str()) else {
+            continue;
+        };
+        let Some(manifest) = manifests.get(name) else {
+            continue;
+        };
+        let domain = resolve_domain_id(m, config)?;
+        let domain_name = m
+            .get("domain")
+            .and_then(|d| d.as_str())
+            .unwrap_or("the primary domain")
+            .to_string();
+        placed.push((name, domain, domain_name, manifest));
+    }
+    let live_adds = crate::capacity::kernel_max_owners(target) > 1
+        && config
+            .get("capacity")
+            .and_then(|c| c.get("owners"))
+            .and_then(Value::as_u64)
+            .or_else(|| crate::capacity::kernel_pool_default_reserve(target, "owners"))
+            .unwrap_or(0)
+            > 0;
+    for &(provider, p_domain, ref p_domain_name, pm) in &placed {
+        for contract in &pm.provides {
+            if !fluxor_contracts::vocabulary::PROVIDER_CONTRACTS.contains(&contract.as_str()) {
+                continue; // a surface (`file.data`), not a dispatched contract
+            }
+            let Ok(id) = crate::manifest::contract_id_from_name(contract) else {
+                continue;
+            };
+            if live_adds && p_domain != 0 {
+                return Err(Error::Config(format!(
+                    "module '{provider}' provides `{contract}` from domain '{p_domain_name}', \
+                     but this node admits live-added workloads (its owners pool keeps a \
+                     reserve), and a workload may call it from the primary domain. A provider \
+                     call runs the provider's code on the caller's core, and a module heap is \
+                     touched from one core only. Move '{provider}' to the primary domain \
+                     (`execution.domains[0]`, or drop its `domain:`), or set \
+                     `capacity: {{ owners: 0 }}` if this node never admits a workload."
+                )));
+            }
+            for &(caller, c_domain, ref c_domain_name, cm) in &placed {
+                if caller == provider
+                    || c_domain == p_domain
+                    || !cm.resources.iter().any(|r| r.device_class == id)
+                {
+                    continue;
+                }
+                return Err(Error::Config(format!(
+                    "module '{caller}' (domain '{c_domain_name}') requires `{contract}`, which \
+                     module '{provider}' provides from domain '{p_domain_name}'. A provider \
+                     call runs the provider's code in the caller's frame, on the caller's \
+                     core, and a module heap is touched from one core only — so a module \
+                     provider and every module it serves share a domain. Place both in the \
+                     same domain."
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether `m` declares demand on the store's subscription pool: the
+/// `[capacities] store_subscriptions` constant, or a `demand_from_params`
+/// rule counting it from the instance's params.
+fn declares_store_subscriptions(m: &Manifest) -> bool {
+    m.capacities
+        .get("store_subscriptions")
+        .is_some_and(|&n| n > 0)
+        || m.demand_from_params
+            .as_ref()
+            .is_some_and(|r| r.pool == "store_subs")
 }
 
 /// Validate every `[[ports]] requires_capability` against the module actually

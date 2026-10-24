@@ -1016,6 +1016,105 @@ impl HeapFromParams {
     }
 }
 
+/// `[capacities] demand_from_params`: an instance's declared demand on a
+/// kernel pool (`capacity::DECLARED_DEMAND`) counted from its params, the
+/// way [`HeapFromParams`] sizes its heap from them. The composer joins the
+/// value of every TLV entry whose tag is in `tags` (a chunked param's chunks
+/// are one value), splits each tag's value on `split`, and counts the
+/// non-empty entries; the instance declares that many of `pool`, in place of
+/// the type's `[capacities]` constant. A graph's own figure for the instance
+/// (`demand: { <pool>: n }` on the module entry) wins. TOML-only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DemandFromParams {
+    /// A pool `capacity::DECLARED_DEMAND` lists.
+    pub pool: String,
+    pub tags: Vec<u8>,
+    /// Separator between entries in one param's value; `","` by default.
+    pub split: String,
+}
+
+impl DemandFromParams {
+    /// Entries the params TLV `tlv` declares under this rule's tags, walked
+    /// as [`HeapFromParams::declared_bytes`] walks it: each tag's entries
+    /// joined (a chunked param arrives in several), split on `split`, and
+    /// the non-blank pieces counted.
+    pub fn declared_count(&self, tlv: &[u8]) -> u64 {
+        let mut values: Vec<(u8, Vec<u8>)> = self.tags.iter().map(|&t| (t, Vec::new())).collect();
+        let mut off = 4usize;
+        while off + 2 <= tlv.len() {
+            let tag = tlv[off];
+            let len = tlv[off + 1] as usize;
+            off += 2;
+            if tag == 0xFF {
+                break;
+            }
+            if off + len <= tlv.len() {
+                if let Some((_, v)) = values.iter_mut().find(|(t, _)| *t == tag) {
+                    v.extend_from_slice(&tlv[off..off + len]);
+                }
+            }
+            off += len;
+        }
+        values
+            .iter()
+            .map(|(_, v)| {
+                String::from_utf8_lossy(v)
+                    .split(self.split.as_str())
+                    .filter(|e| !e.trim().trim_matches('\0').is_empty())
+                    .count() as u64
+            })
+            .sum()
+    }
+}
+
+/// `[capacities] heap_per_demand`: every instance of the module type takes
+/// `bytes_each` heap bytes per unit of `pool`'s full planned ceiling — what
+/// the graph derives and declares for the pool plus its reserve (the
+/// `capacity:` entry, else the profile's default) — on top of its heap
+/// figure (`heap_from_params`'s, else the type's declared arena). For a
+/// provider that serves a pool from its own heap (a module store's
+/// subscriptions), sized at pack time, when heap caps are fixed.
+/// Resolved for the silicon like every other capacity. TOML-only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeapPerDemand {
+    /// A kernel pool whose plan has no structural part (not an arena, not
+    /// one the graph's shape sizes): its ceiling is declared demand plus
+    /// reserve, known before the graph is laid out.
+    pub pool: String,
+    pub bytes_each: u32,
+    /// The module type's own heap cap, which the per-demand bytes are added
+    /// to — stated only by a type without a `heap_from_params` rule (whose
+    /// `base` it is otherwise), and held equal to the build's declared arena
+    /// by `pack`, as that rule's is.
+    pub base: Option<u32>,
+}
+
+impl HeapPerDemand {
+    /// The heap bytes this rule adds for a pool planned to `ceiling`.
+    pub fn extra_for(&self, ceiling: u64) -> u64 {
+        u64::from(self.bytes_each).saturating_mul(ceiling)
+    }
+}
+
+/// Pools a `heap_per_demand` rule may name: every kernel pool but the
+/// arenas (sized in bytes, never derived) and those whose plan the graph's
+/// shape derives (`capacity::plan_pool`'s structural part), which the
+/// composer knows only once the graph is laid out — after the heap caps
+/// are packed.
+pub fn heap_per_demand_pool_allowed(pool: &str) -> bool {
+    crate::capacity::POOL_IDS.iter().any(|&(n, _)| n == pool)
+        && !crate::capacity::is_arena_name(pool)
+        && !matches!(
+            pool,
+            "config_arena"
+                | "module_slots"
+                | "channels"
+                | "owners"
+                | "sandboxes"
+                | "state_free_list"
+        )
+}
+
 /// A variant's changes to the module-scope [`HeapFromParams`].
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct HeapFromParamsOverride {
@@ -1406,6 +1505,12 @@ pub struct Manifest {
     /// `[capacities] heap_from_params`: the heap cap derived from declared
     /// params bytes (see [`HeapFromParams`]). TOML-only.
     pub heap_from_params: Option<HeapFromParams>,
+    /// `[capacities] demand_from_params`: the instance's declared demand
+    /// counted from its params (see [`DemandFromParams`]). TOML-only.
+    pub demand_from_params: Option<DemandFromParams>,
+    /// `[capacities] heap_per_demand`: heap bytes per unit of a pool's
+    /// planned ceiling (see [`HeapPerDemand`]). TOML-only.
+    pub heap_per_demand: Option<HeapPerDemand>,
     /// Module attests that its `module_step` / `module_isr_init` /
     /// `module_isr_entry` exports are safe to invoke from an ISR
     /// context: no heap allocation, no `provider_call`, no
@@ -1522,6 +1627,8 @@ impl Default for Manifest {
             variants: Vec::new(),
             capacities: std::collections::BTreeMap::new(),
             heap_from_params: None,
+            demand_from_params: None,
+            heap_per_demand: None,
             isr_safe: false,
             resume_after_fault: false,
             pre_tick_drain: false,
@@ -2632,8 +2739,11 @@ impl Manifest {
             }
             for v in raw_variants {
                 let scope = format!("variant.{}.capacities", v.name);
-                let (capacities, heap_from_params) =
-                    resolve_capacities(v.capacities.unwrap_or_default(), abi, &scope)?;
+                let ResolvedCapacities {
+                    capacities,
+                    heap_rule: heap_from_params,
+                    ..
+                } = resolve_capacities(v.capacities.unwrap_or_default(), abi, &scope)?;
                 variants.push(VariantDecl {
                     name: v.name,
                     features: v.features.unwrap_or_default(),
@@ -2649,8 +2759,12 @@ impl Manifest {
         // Module-scope capacities resolve against the same abi the port
         // capacities do, so one manifest read yields every bound the build
         // needs for this target.
-        let (capacities, heap_rule) =
-            resolve_capacities(toml_val.capacities.unwrap_or_default(), abi, "capacities")?;
+        let ResolvedCapacities {
+            capacities,
+            heap_rule,
+            demand_rule: demand_from_params,
+            heap_demand_rule: heap_per_demand,
+        } = resolve_capacities(toml_val.capacities.unwrap_or_default(), abi, "capacities")?;
         let heap_from_params = match heap_rule {
             None => None,
             Some(r) => Some(HeapFromParams {
@@ -2671,6 +2785,29 @@ impl Manifest {
                 included: r.included.unwrap_or(0),
             }),
         };
+        // The per-demand bytes are added to the type's own cap: the heap
+        // rule's `base` when it has one, else the rule's own — exactly one.
+        if let Some(rule) = &heap_per_demand {
+            match (heap_from_params.is_some(), rule.base.is_some()) {
+                (true, true) => {
+                    return Err(Error::Module(
+                        "capacities.heap_per_demand states a `base`, but the module's \
+                         heap_from_params rule already does — the per-demand bytes are added \
+                         to that rule's figure; drop `base` here"
+                            .into(),
+                    ))
+                }
+                (false, false) => {
+                    return Err(Error::Module(
+                        "capacities.heap_per_demand has no `base` — the module type's default \
+                         heap cap, which the per-demand bytes are added to (or declare a \
+                         heap_from_params rule, whose `base` it then is)"
+                            .into(),
+                    ))
+                }
+                _ => {}
+            }
+        }
         if heap_from_params.is_none() {
             if let Some(v) = variants.iter().find(|v| v.heap_from_params.is_some()) {
                 return Err(Error::Module(format!(
@@ -2711,6 +2848,8 @@ impl Manifest {
             variants,
             capacities,
             heap_from_params,
+            demand_from_params,
+            heap_per_demand,
             isr_safe: toml_val.isr_safe,
             resume_after_fault: toml_val.resume_after_fault,
             pre_tick_drain: toml_val.pre_tick_drain,
@@ -3093,6 +3232,8 @@ impl Manifest {
             variants: Vec::new(), // toml-only, not serialized
             capacities: std::collections::BTreeMap::new(), // toml-only, not serialized
             heap_from_params: None, // toml-only, not serialized
+            demand_from_params: None,
+            heap_per_demand: None,
             isr_safe,
             // Author attestation, TOML-only: a binary-loaded manifest makes
             // no claim, so `fault_policy: restart` is refused (fail-closed).
@@ -3721,7 +3862,28 @@ enum CapacityValue {
 #[serde(untagged)]
 enum TomlCapacity {
     HeapRule(TomlHeapFromParams),
+    DemandRule(TomlDemandFromParams),
+    HeapDemandRule(TomlHeapPerDemand),
     Value(CapacityValue),
+}
+
+/// `demand_from_params = { pool = "...", tags = [...], split = "," }`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TomlDemandFromParams {
+    pool: String,
+    tags: Vec<u8>,
+    split: Option<String>,
+}
+
+/// `heap_per_demand = { pool = "...", bytes_each = ... }`, `bytes_each`
+/// flat or per-target.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TomlHeapPerDemand {
+    pool: String,
+    bytes_each: CapacityValue,
+    base: Option<CapacityValue>,
 }
 
 /// `heap_from_params = { tags = [...], base = ..., included = ... }`, each
@@ -3737,6 +3899,21 @@ struct TomlHeapFromParams {
 
 /// The `[capacities]` key that holds the heap rule.
 const HEAP_FROM_PARAMS_KEY: &str = "heap_from_params";
+/// The `[capacities]` key that holds the demand rule.
+const DEMAND_FROM_PARAMS_KEY: &str = "demand_from_params";
+/// The `[capacities]` key that holds the per-demand heap rule.
+const HEAP_PER_DEMAND_KEY: &str = "heap_per_demand";
+
+/// What one `[capacities]` table resolves to: its plain capacities and the
+/// rules it states (`demand_from_params` and `heap_per_demand` at module
+/// scope only).
+#[derive(Default)]
+struct ResolvedCapacities {
+    capacities: std::collections::BTreeMap<String, u32>,
+    heap_rule: Option<HeapFromParamsOverride>,
+    demand_rule: Option<DemandFromParams>,
+    heap_demand_rule: Option<HeapPerDemand>,
+}
 
 /// Resolve a `[capacities]` table for `abi`: the plain capacities, and the
 /// heap rule's fields when the table states it. `scope` names the table in
@@ -3745,17 +3922,93 @@ fn resolve_capacities(
     raw: std::collections::BTreeMap<String, TomlCapacity>,
     abi: Option<&str>,
     scope: &str,
-) -> Result<(
-    std::collections::BTreeMap<String, u32>,
-    Option<HeapFromParamsOverride>,
-)> {
-    let mut capacities = std::collections::BTreeMap::new();
+) -> Result<ResolvedCapacities> {
+    let mut out = ResolvedCapacities::default();
     let mut rule = None;
     for (name, value) in raw {
         let field = format!("{scope}.{name}");
+        if name == DEMAND_FROM_PARAMS_KEY || name == HEAP_PER_DEMAND_KEY {
+            if scope != "capacities" {
+                return Err(Error::Module(format!(
+                    "{field}: `{name}` is a module-scope rule; a variant cannot change it"
+                )));
+            }
+            match (name == DEMAND_FROM_PARAMS_KEY, value) {
+                (true, TomlCapacity::DemandRule(r)) => {
+                    if !crate::capacity::DECLARED_DEMAND
+                        .iter()
+                        .any(|&(_, pool)| pool == r.pool)
+                    {
+                        let pools: Vec<&str> = crate::capacity::DECLARED_DEMAND
+                            .iter()
+                            .map(|&(_, p)| p)
+                            .collect();
+                        return Err(Error::Module(format!(
+                            "{field}.pool = \"{}\" is not a pool a module declares demand on \
+                             (one of: {})",
+                            r.pool,
+                            pools.join(", ")
+                        )));
+                    }
+                    if r.tags.is_empty() {
+                        return Err(Error::Module(format!(
+                            "{field} names no `tags` — the rule counts the entries of those params"
+                        )));
+                    }
+                    if let Some(tag) = r.tags.iter().find(|&&t| t > PARAM_TAG_MAX) {
+                        return Err(Error::Module(format!(
+                            "{field}: tag {tag:#04x} is reserved for kernel metadata \
+                             ({:#04x}..=0xff); the rule counts the module's own params tags",
+                            PARAM_TAG_MAX + 1
+                        )));
+                    }
+                    let split = r.split.unwrap_or_else(|| ",".to_string());
+                    if split.is_empty() {
+                        return Err(Error::Module(format!(
+                            "{field}.split is empty — it separates one param's entries"
+                        )));
+                    }
+                    out.demand_rule = Some(DemandFromParams {
+                        pool: r.pool,
+                        tags: r.tags,
+                        split,
+                    });
+                }
+                (false, TomlCapacity::HeapDemandRule(r)) => {
+                    if !heap_per_demand_pool_allowed(&r.pool) {
+                        return Err(Error::Module(format!(
+                            "{field}.pool = \"{}\" cannot size a heap: it must be a kernel pool \
+                             whose ceiling is declared demand plus reserve — not an arena, and \
+                             not one the graph's shape derives (module_slots, channels, owners, \
+                             sandboxes, state_free_list)",
+                            r.pool
+                        )));
+                    }
+                    out.heap_demand_rule = Some(HeapPerDemand {
+                        pool: r.pool,
+                        bytes_each: r.bytes_each.resolve(abi, &format!("{field}.bytes_each"))?,
+                        base: r
+                            .base
+                            .map(|v| v.resolve(abi, &format!("{field}.base")))
+                            .transpose()?,
+                    });
+                }
+                (true, _) => {
+                    return Err(Error::Module(format!(
+                        "{field} is a table `{{ pool = \"...\", tags = [...], split = \",\" }}`"
+                    )));
+                }
+                (false, _) => {
+                    return Err(Error::Module(format!(
+                        "{field} is a table `{{ pool = \"...\", bytes_each = ..., base = ... }}`"
+                    )));
+                }
+            }
+            continue;
+        }
         match (name == HEAP_FROM_PARAMS_KEY, value) {
             (false, TomlCapacity::Value(v)) => {
-                capacities.insert(name, v.resolve(abi, &field)?);
+                out.capacities.insert(name, v.resolve(abi, &field)?);
             }
             (true, TomlCapacity::HeapRule(r)) => {
                 if let Some(tag) = r.tags.iter().flatten().find(|&&t| t > PARAM_TAG_MAX) {
@@ -3777,21 +4030,23 @@ fn resolve_capacities(
                         .transpose()?,
                 });
             }
-            (true, TomlCapacity::Value(_)) => {
+            (false, _) => {
+                return Err(Error::Module(format!(
+                    "{field}: a capacity is a number or a per-target table; only \
+                     `{HEAP_FROM_PARAMS_KEY}`, `{DEMAND_FROM_PARAMS_KEY}` and \
+                     `{HEAP_PER_DEMAND_KEY}` take a rule table"
+                )));
+            }
+            (true, _) => {
                 return Err(Error::Module(format!(
                     "{field} is a table `{{ tags = [...], base = ..., included = ... }}`, \
                      not a number"
                 )));
             }
-            (false, TomlCapacity::HeapRule(_)) => {
-                return Err(Error::Module(format!(
-                    "{field}: a capacity is a number or a per-target table; only \
-                     `{HEAP_FROM_PARAMS_KEY}` takes a rule table"
-                )));
-            }
         }
     }
-    Ok((capacities, rule))
+    out.heap_rule = rule;
+    Ok(out)
 }
 
 const CAPACITY_TARGET_KEYS: &[&str] = &[
@@ -4549,11 +4804,87 @@ store_subscriptions = 1
             ),
             (
                 "[capacities]\nscratch = { tags = [2], base = 1 }\n",
-                "only `heap_from_params` takes a rule table",
+                "take a rule table",
             ),
             (
                 "[capacities]\nheap_from_params = { tags = [2], base = 1, per_byte = 2 }\n",
                 "",
+            ),
+        ] {
+            let src = format!("version = \"1.0.0\"\n{bad}");
+            let err = Manifest::from_toml_str_for_target(&src, Some("aarch64"))
+                .expect_err(bad)
+                .to_string();
+            assert!(err.contains(why), "{bad}: {err}");
+        }
+    }
+
+    /// `demand_from_params` and `heap_per_demand` parse at module scope,
+    /// resolve per ABI, and refuse what they cannot mean.
+    #[test]
+    fn demand_rules_parse_and_refuse() {
+        const TOML: &str = "version = \"1.0.0\"\n[capacities]\n\
+            demand_from_params = { pool = \"store_subs\", tags = [2, 5] }\n\
+            heap_per_demand = { pool = \"store_subs\", bytes_each = { default = 96, thumbv6m = 48 }, base = 4096 }\n";
+        let m = Manifest::from_toml_str_for_target(TOML, Some("aarch64")).unwrap();
+        assert_eq!(
+            m.demand_from_params,
+            Some(DemandFromParams {
+                pool: "store_subs".into(),
+                tags: vec![2, 5],
+                split: ",".into(),
+            })
+        );
+        assert_eq!(
+            m.heap_per_demand,
+            Some(HeapPerDemand {
+                pool: "store_subs".into(),
+                bytes_each: 96,
+                base: Some(4096),
+            })
+        );
+        let small = Manifest::from_toml_str_for_target(TOML, Some("thumbv6m")).unwrap();
+        assert_eq!(small.heap_per_demand.unwrap().bytes_each, 48);
+
+        for (bad, why) in [
+            (
+                "[capacities]\ndemand_from_params = { pool = \"channels\", tags = [2] }\n",
+                "not a pool a module declares demand on",
+            ),
+            (
+                "[capacities]\ndemand_from_params = { pool = \"store_subs\", tags = [] }\n",
+                "names no `tags`",
+            ),
+            (
+                "[capacities]\ndemand_from_params = { pool = \"store_subs\", tags = [0xEF] }\n",
+                "reserved for kernel metadata",
+            ),
+            (
+                "[capacities]\ndemand_from_params = { pool = \"store_subs\", tags = [2], split = \"\" }\n",
+                "split is empty",
+            ),
+            (
+                "[capacities]\nheap_per_demand = { pool = \"channels\", bytes_each = 8, base = 1 }\n",
+                "cannot size a heap",
+            ),
+            (
+                "[capacities]\nheap_per_demand = { pool = \"state_arena\", bytes_each = 8, base = 1 }\n",
+                "cannot size a heap",
+            ),
+            (
+                "[capacities]\nheap_per_demand = { pool = \"store_subs\", bytes_each = 8 }\n",
+                "has no `base`",
+            ),
+            (
+                "[capacities]\nheap_from_params = { tags = [2], base = 9 }\n\
+                 heap_per_demand = { pool = \"store_subs\", bytes_each = 8, base = 9 }\n",
+                "drop `base` here",
+            ),
+            ("[capacities]\nheap_per_demand = 5\n", "is a table"),
+            (
+                "[[variant]]\nname = \"a\"\nfeatures = []\ndefault = true\n\
+                 [variant.capacities]\nheap_per_demand = { pool = \"store_subs\", bytes_each = 8, base = 1 }\n",
+                "module-scope rule",
             ),
         ] {
             let src = format!("version = \"1.0.0\"\n{bad}");

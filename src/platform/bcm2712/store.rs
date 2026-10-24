@@ -7,8 +7,10 @@
 //!
 //! Same semantics as `platform/linux/store.rs` — monotone revision clock,
 //! per-key revision as the CAS token, prefix enumeration with a paged cursor,
-//! and a bounded change history that drives SUBSCRIBE with resume-from-revision
-//! — and deliberately the same WIRE, because a consumer parses one encoding
+//! a bounded key-only change history that pages `CHANGES` from a revision, and
+//! SUBSCRIBE as a doorbell on the subscriber's own kernel event (no bytes are
+//! ever written to a consumer's channel) — and deliberately the same WIRE,
+//! because a consumer parses one encoding
 //! whichever platform answers it. What differs is the backing: no `alloc` here,
 //! so the store's tables are fixed-capacity — sized once at boot from the plan
 //! and carved from DRAM (`kernel::mem::carve`) — rather than a `BTreeMap`, and
@@ -27,8 +29,10 @@
 use crate::abi::contracts::storage::handle::STORAGE_KEY_MAX;
 use crate::abi::contracts::storage::{namespace as ns_op, object as obj_op};
 use crate::abi::fence::{Fence, WIRE_MAX_LEN};
-use crate::kernel::ipc::channel::channel_write;
-use crate::kernel::ipc::fd::{slot_of, tag_fd, FD_TAG_STORAGE_NAMESPACE, FD_TAG_STORAGE_OBJECT};
+use crate::kernel::ipc::event::{event_owner, event_signal};
+use crate::kernel::ipc::fd::{
+    slot_of, tag_fd, untag_fd, FD_TAG_EVENT, FD_TAG_STORAGE_NAMESPACE, FD_TAG_STORAGE_OBJECT,
+};
 use crate::kernel::sys::errno;
 use crate::kernel::workload::owner::{OwnerHandle, OWNER_SYSTEM};
 
@@ -42,8 +46,9 @@ pub const MAX_OBJECTS: usize = 512;
 /// Longest value. Matches `store_effect`'s own `MAX_VALUE`, so a value that
 /// crosses the connector fits the store that holds it.
 pub const MAX_VALUE: usize = 4096;
-/// Retained change history. A watcher that falls further behind than this is
-/// told to relist (the `Lost` sentinel) rather than handed a gap.
+/// Retained change history, in revisions. A `CHANGES` reader that falls
+/// further behind than this is answered LOST — relist — rather than handed a
+/// gap.
 pub const HISTORY: usize = 128;
 
 use crate::abi::contracts::resource as res;
@@ -87,21 +92,26 @@ pub fn pool_in_use(pool: u16) -> usize {
     }
 }
 
-/// `CONTENT_TYPES` byte for `NamespaceChange` (`contracts/src/lib.rs`). A
-/// watcher routes on this to tell a store change from anything else sharing
-/// its sink, so it must be the vocabulary's byte and not a private one.
-const CT_NAMESPACE_CHANGE: u8 = 0x23;
-const EVENT_HEADER_SIZE: usize = 32;
-/// The event source id. Byte-identical to Linux's: a consumer that matches on
-/// it must not have to know which platform produced the change.
+/// The fence source id. Byte-identical to Linux's: a consumer that matches on
+/// it must not have to know which platform answered.
 const STORE_SOURCE: [u8; 16] = *b"fluxor-cp-store\0";
 
+/// What a history entry did to its key — the advisory hint that labels a
+/// `CHANGES` record `Added` rather than `Modified`. A record's own kind is
+/// read from the key's current state, never from this.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
     Added,
     Modified,
     Deleted,
 }
+
+/// First byte of a relist continuation token,
+/// `[CONT_RELIST][pinned revision u64][key cursor]`. Never 8 bytes long (a
+/// key is never empty), so it cannot be mistaken for a bare revision.
+const CONT_RELIST: u8 = b'R';
+/// The longest relist continuation: the tag, the pinned revision and a key.
+const RELIST_TOKEN_MAX: usize = 1 + 8 + STORAGE_KEY_MAX;
 
 #[derive(Clone, Copy)]
 struct Entry {
@@ -122,14 +132,15 @@ const ENTRY_EMPTY: Entry = Entry {
     revision: 0,
 };
 
+/// One history entry: the key a revision changed, and how. Key-only — a
+/// `CHANGES` record carries the key's value at the store's current state,
+/// so the history never holds a value.
 #[derive(Clone, Copy)]
 struct HistEntry {
     revision: u64,
     kind: Kind,
     key: [u8; STORAGE_KEY_MAX],
     key_len: u16,
-    val: [u8; MAX_VALUE],
-    val_len: u16,
 }
 
 const HIST_EMPTY: HistEntry = HistEntry {
@@ -137,31 +148,38 @@ const HIST_EMPTY: HistEntry = HistEntry {
     kind: Kind::Added,
     key: [0; STORAGE_KEY_MAX],
     key_len: 0,
-    val: [0; MAX_VALUE],
-    val_len: 0,
 };
 
+/// One subscription: a prefix, the subscriber's kernel event, and its rung
+/// bit — a doorbell, with nothing queued behind it.
 #[derive(Clone, Copy)]
 struct Sub {
     in_use: bool,
     prefix: [u8; STORAGE_KEY_MAX],
     prefix_len: u16,
-    sink_chan: u32,
-    sequence: u32,
-    /// The revision this watcher has been served up to.
-    cursor: u64,
+    /// The subscriber's event, as a raw event slot.
+    event: i32,
+    /// Set when a change under the prefix signalled the event; cleared by
+    /// the subscriber's `TAKE_RUNG`. While set, further changes do nothing.
+    rung: bool,
     /// The owner that subscribed, which the slot goes with.
     opener: OwnerHandle,
+    /// The subscribing module occupancy — slot index and slot generation.
+    /// The subscription lives exactly as long as that occupancy does and
+    /// that module owns `event`; checked before every signal.
+    module: u16,
+    generation: u32,
 }
 
 const SUB_EMPTY: Sub = Sub {
     in_use: false,
     prefix: [0; STORAGE_KEY_MAX],
     prefix_len: 0,
-    sink_chan: 0,
-    sequence: 0,
-    cursor: 0,
+    event: -1,
+    rung: false,
     opener: OWNER_SYSTEM,
+    module: 0,
+    generation: 0,
 };
 
 #[derive(Clone, Copy)]
@@ -187,10 +205,10 @@ const READ_EMPTY: ReadSlot = ReadSlot {
 /// a growth curve.
 pub struct Store {
     entries: crate::kernel::mem::table::Table<Entry, MAX_OBJECTS>,
+    /// One entry per revision: every revision this store issues changes
+    /// exactly one key, so revision `r` lives at `hist[(r - 1) % HISTORY]`
+    /// while it is among the last [`HISTORY`].
     hist: [HistEntry; HISTORY],
-    /// Next history slot, and the oldest revision still retained.
-    hist_head: usize,
-    hist_filled: bool,
     revision: u64,
 }
 
@@ -201,8 +219,6 @@ fn objects_default() -> usize {
 static mut STORE: Store = Store {
     entries: crate::kernel::mem::table::Table::new_planned(|_| ENTRY_EMPTY, objects_default),
     hist: [HIST_EMPTY; HISTORY],
-    hist_head: 0,
-    hist_filled: false,
     revision: 0,
 };
 /// Subscriptions and open read slots, sized at boot from the plan
@@ -248,17 +264,18 @@ static mut ENABLED: bool = false;
 static mut TLM_PUTS: u32 = 0;
 static mut TLM_DELS: u32 = 0;
 static mut TLM_LISTS: u32 = 0;
-static mut TLM_PUSHED: u32 = 0;
-static mut TLM_BLOCKED: u32 = 0;
+static mut TLM_RUNG: u32 = 0;
+static mut TLM_DROPPED: u32 = 0;
 static mut TLM_LOST: u32 = 0;
 static mut TLM_TICK: u32 = 0;
 
-/// `[store] objs=.. rev=.. subs=.. put=.. del=.. list=.. push=.. blk=.. lost=..`
+/// `[store] objs=.. rev=.. subs=.. put=.. del=.. list=.. ring=.. drop=.. lost=..`
 ///
-/// `push` vs `blk` is the pair that matters: a change that was generated but
-/// could not be written to a watcher's channel is the difference between "the
-/// source never woke" and "the source was never told", and without it both look
-/// like silence.
+/// `ring` counts doorbells signalled; `drop` counts subscriptions dropped at a
+/// signal because their module occupancy ended or their event slot is no
+/// longer that module's. A watcher that saw nothing with `ring` climbing was
+/// told and did not read; with `drop` climbing it was never there to tell.
+/// `lost` counts `CHANGES` reads answered LOST (behind the history).
 unsafe fn telemetry(store: &Store) {
     TLM_TICK = TLM_TICK.wrapping_add(1);
     if TLM_TICK % 64 != 1 {
@@ -308,10 +325,10 @@ unsafe fn telemetry(store: &Store) {
     num!(TLM_DELS);
     lit!(b" list=");
     num!(TLM_LISTS);
-    lit!(b" push=");
-    num!(TLM_PUSHED);
-    lit!(b" blk=");
-    num!(TLM_BLOCKED);
+    lit!(b" ring=");
+    num!(TLM_RUNG);
+    lit!(b" drop=");
+    num!(TLM_DROPPED);
     lit!(b" lost=");
     num!(TLM_LOST);
     // Straight into the log ring, the same sink `log::info!` lands in on this
@@ -332,31 +349,46 @@ impl Store {
         Some((&e.val[..e.val_len as usize], e.revision))
     }
 
-    /// Record a change in the bounded history. The oldest is overwritten; a
-    /// watcher behind the window is told to relist rather than handed a gap,
-    /// which is why the window's floor is tracked rather than assumed.
-    fn push_hist(&mut self, revision: u64, kind: Kind, key: &[u8], val: &[u8]) {
-        let h = &mut self.hist[self.hist_head];
+    /// Record revision `revision`'s change in the bounded history, over the
+    /// revision [`HISTORY`] before it. A reader behind the window is told to
+    /// relist rather than handed a gap, which is why the window's base is
+    /// computed rather than assumed.
+    fn push_hist(&mut self, revision: u64, kind: Kind, key: &[u8]) {
+        let h = &mut self.hist[(revision - 1) as usize % HISTORY];
         h.revision = revision;
         h.kind = kind;
         h.key_len = key.len().min(STORAGE_KEY_MAX) as u16;
         h.key[..h.key_len as usize].copy_from_slice(&key[..h.key_len as usize]);
-        h.val_len = val.len().min(MAX_VALUE) as u16;
-        h.val[..h.val_len as usize].copy_from_slice(&val[..h.val_len as usize]);
-        self.hist_head += 1;
-        if self.hist_head == HISTORY {
-            self.hist_head = 0;
-            self.hist_filled = true;
-        }
     }
 
-    /// The oldest revision the history can still serve. A `since` below this
-    /// cannot be resumed.
-    fn hist_floor(&self) -> u64 {
-        if !self.hist_filled {
-            return 0;
+    /// The history's base: every revision after it, up to the current one,
+    /// is still retained. A `since` below it cannot be answered.
+    fn hist_base(&self) -> u64 {
+        self.revision.saturating_sub(HISTORY as u64)
+    }
+
+    /// The history entry for revision `rev`, while it is retained.
+    fn hist_at(&self, rev: u64) -> Option<&HistEntry> {
+        (rev > self.hist_base() && rev <= self.revision)
+            .then(|| &self.hist[(rev - 1) as usize % HISTORY])
+    }
+
+    /// The revision of `key`'s latest retained history entry in `(after,
+    /// upto]` — its last change in that span — and, when `first` is set, its
+    /// earliest one instead.
+    fn hist_find(&self, key: &[u8], after: u64, upto: u64, first: bool) -> Option<&HistEntry> {
+        let lo = after.max(self.hist_base()) + 1;
+        let mut found = None;
+        for rev in lo..=upto.min(self.revision) {
+            let h = self.hist_at(rev)?;
+            if &h.key[..h.key_len as usize] == key {
+                found = Some(h);
+                if first {
+                    break;
+                }
+            }
         }
-        self.hist[self.hist_head].revision
+        found
     }
 
     fn put(&mut self, key: &[u8], val: &[u8]) -> Result<u64, i32> {
@@ -371,13 +403,14 @@ impl Store {
                 e.val_len = val.len() as u16;
                 e.val[..val.len()].copy_from_slice(val);
                 e.revision = rev;
-                self.push_hist(rev, Kind::Modified, key, val);
+                self.push_hist(rev, Kind::Modified, key);
             }
             None => {
                 let Some(i) = self.entries.iter().position(|e| !e.in_use) else {
                     // Undo the revision bump: nothing happened, and a clock
-                    // that moved for a write that did not land makes every
-                    // watcher's cursor lie about what it has seen.
+                    // that moved for a write that did not land leaves a
+                    // revision with no history entry, and the history is
+                    // addressed by revision.
                     self.revision -= 1;
                     return Err(errno::ENOMEM);
                 };
@@ -388,7 +421,7 @@ impl Store {
                 e.val_len = val.len() as u16;
                 e.val[..val.len()].copy_from_slice(val);
                 e.revision = rev;
-                self.push_hist(rev, Kind::Added, key, val);
+                self.push_hist(rev, Kind::Added, key);
             }
         }
         Ok(rev)
@@ -399,7 +432,7 @@ impl Store {
         self.revision += 1;
         let rev = self.revision;
         self.entries[i] = ENTRY_EMPTY;
-        self.push_hist(rev, Kind::Deleted, key, &[]);
+        self.push_hist(rev, Kind::Deleted, key);
         Some(rev)
     }
 }
@@ -477,8 +510,8 @@ fn list_cursor<'a>(cursor: &'a [u8], prefix: &[u8]) -> Result<Option<&'a [u8]>, 
 }
 
 /// A key a `PUT` may create: UTF-8, as every listed name is, and not empty,
-/// which is the relist sentinel's key on the change stream and the "end of
-/// listing" cursor on `LIST`.
+/// which is the "end of listing" cursor on `LIST` — and what keeps a relist
+/// continuation token from ever being 8 bytes long.
 fn writable_key(key: &[u8]) -> bool {
     !key.is_empty() && key.len() <= STORAGE_KEY_MAX && core::str::from_utf8(key).is_ok()
 }
@@ -514,6 +547,26 @@ fn node_caller() -> bool {
 /// opener alone.
 fn opened_by_caller(in_use: bool, opener: OwnerHandle) -> bool {
     in_use && opener == crate::kernel::exec::scheduler::caller_owner()
+}
+
+/// The calling module occupancy, `(slot index, slot generation)`, or `None`
+/// in kernel context. This store is a kernel provider: its dispatch runs in
+/// no provider frame, so the module making the call is the one the scheduler
+/// is stepping — the same module [`caller_owner`] reads and `event::CREATE`
+/// stamps an event with.
+///
+/// [`caller_owner`]: crate::kernel::exec::scheduler::caller_owner
+fn caller_occupancy() -> Option<(u16, u32)> {
+    use crate::kernel::exec::scheduler as sched;
+    let idx = sched::current_module_index();
+    (idx < sched::module_slots()).then(|| (idx as u16, sched::module_slot_generation(idx)))
+}
+
+/// The raw event slot a tagged event fd names, or `None` when `fd` is not
+/// one.
+fn event_slot(fd: i32) -> Option<i32> {
+    let (tag, slot) = untag_fd(fd);
+    (fd >= 0 && tag == FD_TAG_EVENT).then_some(slot)
 }
 
 /// Close every handle `opener` holds on the store: its `GET` reads and its
@@ -580,116 +633,75 @@ unsafe fn write_fence(fence: Fence, ptr: u64, cap: u16) {
     let _ = fence.encode(out);
 }
 
-/// Encode one change as a mesh Event carrying `namespace.change`. Byte-for-byte
-/// what Linux emits — a consumer parses one encoding, not one per platform.
-fn encode_event(seq: u32, rev: u64, kind: Kind, key: &[u8], val: &[u8], out: &mut [u8]) -> usize {
-    let payload_len = 8 + 1 + 2 + 4 + key.len() + val.len();
-    let total = EVENT_HEADER_SIZE + payload_len;
-    if total > out.len() {
-        return 0;
-    }
-    out[..total].fill(0);
-    out[0..16].copy_from_slice(&STORE_SOURCE);
-    out[16..20].copy_from_slice(&seq.to_le_bytes());
-    out[28] = CT_NAMESPACE_CHANGE;
-    out[29] = 0;
-    out[30..32].copy_from_slice(&(payload_len as u16).to_le_bytes());
-    let mut p = EVENT_HEADER_SIZE;
-    out[p..p + 8].copy_from_slice(&rev.to_le_bytes());
-    p += 8;
-    out[p] = match kind {
-        Kind::Added => 0,
-        Kind::Modified => 1,
-        Kind::Deleted => 2,
-    };
-    p += 1;
-    out[p..p + 2].copy_from_slice(&(key.len() as u16).to_le_bytes());
-    p += 2;
-    out[p..p + 4].copy_from_slice(&(val.len() as u32).to_le_bytes());
-    p += 4;
-    out[p..p + key.len()].copy_from_slice(key);
-    p += key.len();
-    out[p..p + val.len()].copy_from_slice(val);
-    total
+/// Whether subscription `s` may still be signalled: its module occupancy is
+/// live — the slot holds the same generation and its module has not finished
+/// — and its event slot is still that module's. A module that was freed,
+/// restarted, reassigned or finished, or that destroyed its event (whose slot
+/// another module's `CREATE` may now hold), fails it, and a stranger is never
+/// woken for it.
+fn sub_live(s: &Sub) -> bool {
+    use crate::kernel::exec::scheduler as sched;
+    let idx = s.module as usize;
+    idx < sched::module_slots()
+        && sched::module_slot_generation(idx) == s.generation
+        && !sched::module_is_finished(idx)
+        && event_owner(s.event) == Some(s.module)
 }
 
-/// Push every change each subscription has not yet seen onto its sink channel.
-///
-/// Called after every write, which is what makes a SUBSCRIBE a PUSH rather
-/// than something the caller has to poll for.
+/// Drop subscription `s`: its subscriber is gone, so nothing will read it.
+fn drop_sub(s: &mut Sub) {
+    *s = SUB_EMPTY;
+    // SAFETY: single-threaded provider dispatch.
+    unsafe { TLM_DROPPED = TLM_DROPPED.wrapping_add(1) };
+}
+
+/// Signal `s`'s event, after checking it is still the subscriber's to
+/// signal ([`sub_live`]); a dead subscription, or one whose signal answers
+/// that the event is gone, is dropped instead. Every signal this store sends
+/// goes through here.
+fn signal(s: &mut Sub) -> bool {
+    if !sub_live(s) || event_signal(s.event) < 0 {
+        drop_sub(s);
+        return false;
+    }
+    // SAFETY: single-threaded provider dispatch.
+    unsafe { TLM_RUNG = TLM_RUNG.wrapping_add(1) };
+    true
+}
+
+/// Ring `s`: a change under its prefix. A clear rung bit is set and the event
+/// signalled; a set one means the subscriber has a `TAKE_RUNG` still to come,
+/// which will see this change's subscription anyway, so nothing more is sent.
+fn ring(s: &mut Sub) {
+    if !s.rung && signal(s) {
+        s.rung = true;
+    }
+}
+
+/// Ring every subscription whose prefix `key` falls under. Called after every
+/// write that moved the revision, which is what makes a SUBSCRIBE a doorbell
+/// rather than something the caller has to poll.
 ///
 /// # Safety
 /// Single-threaded provider dispatch.
-unsafe fn pump_subscriptions(store: &mut Store) {
-    let subs = &mut *core::ptr::addr_of_mut!(SUBS);
-    let floor = store.hist_floor();
-    for s in subs.iter_mut() {
-        if !s.in_use {
-            continue;
+unsafe fn notify(key: &[u8]) {
+    for s in (*core::ptr::addr_of_mut!(SUBS)).iter_mut() {
+        if s.in_use && has_prefix(key, &s.prefix[..s.prefix_len as usize]) {
+            ring(s);
         }
-        if s.cursor < floor {
-            // The watcher fell out of the retained window. Send the relist
-            // sentinel — a Deleted with an EMPTY key — and resume from now.
-            // Handing it the changes we still have would look like a complete
-            // stream that silently skipped the ones we dropped.
-            let mut buf = [0u8; EVENT_HEADER_SIZE + 16];
-            let n = encode_event(
-                s.sequence,
-                store.revision,
-                Kind::Deleted,
-                &[],
-                &[],
-                &mut buf,
-            );
-            if n > 0 {
-                let _ = channel_write(s.sink_chan as i32, buf.as_ptr(), n);
-                s.sequence = s.sequence.wrapping_add(1);
-            }
-            s.cursor = store.revision;
-            TLM_LOST = TLM_LOST.wrapping_add(1);
-            continue;
-        }
-        // Walk the history in revision order. The ring is small and this runs
-        // once per write, so a linear pass is cheaper than an index.
-        loop {
-            let mut pick: Option<usize> = None;
-            for (i, h) in store.hist.iter().enumerate() {
-                if h.revision <= s.cursor {
-                    continue;
-                }
-                let key = &h.key[..h.key_len as usize];
-                if !has_prefix(key, &s.prefix[..s.prefix_len as usize]) {
-                    continue;
-                }
-                match pick {
-                    Some(j) if store.hist[j].revision <= h.revision => {}
-                    _ => pick = Some(i),
-                }
-            }
-            let Some(i) = pick else { break };
-            let h = store.hist[i];
-            let mut buf = [0u8; EVENT_HEADER_SIZE + 16 + STORAGE_KEY_MAX + MAX_VALUE];
-            let n = encode_event(
-                s.sequence,
-                h.revision,
-                h.kind,
-                &h.key[..h.key_len as usize],
-                &h.val[..h.val_len as usize],
-                &mut buf,
-            );
-            if n == 0 {
-                break;
-            }
-            if channel_write(s.sink_chan as i32, buf.as_ptr(), n) <= 0 {
-                TLM_BLOCKED = TLM_BLOCKED.wrapping_add(1);
-                // The sink is full. Leave the cursor where it is and retry on
-                // the next write: dropping the event would make the stream
-                // lie, and advancing past it would lose it silently.
-                break;
-            }
-            s.sequence = s.sequence.wrapping_add(1);
-            s.cursor = h.revision;
-            TLM_PUSHED = TLM_PUSHED.wrapping_add(1);
+    }
+}
+
+/// Drop every subscription that can no longer be signalled. Run before a
+/// SUBSCRIBE is refused at capacity: a dead stamp must not hold a slot a
+/// live module is asking for.
+///
+/// # Safety
+/// Single-threaded provider dispatch.
+unsafe fn reap_dead_subs() {
+    for s in (*core::ptr::addr_of_mut!(SUBS)).iter_mut() {
+        if s.in_use && !sub_live(s) {
+            drop_sub(s);
         }
     }
 }
@@ -779,7 +791,7 @@ pub unsafe fn dispatch_object(handle: i32, opcode: u32, arg: *mut u8, arg_len: u
                         fence_ptr,
                         fence_cap,
                     );
-                    pump_subscriptions(store);
+                    notify(key);
                     0
                 }
                 Err(e) => e,
@@ -889,7 +901,8 @@ pub unsafe fn dispatch_object(handle: i32, opcode: u32, arg: *mut u8, arg_len: u
             if condition.refuses(store.get(key).map(|(_, r)| r)) {
                 return errno::EAGAIN;
             }
-            let rev = store.delete(key).unwrap_or(store.revision);
+            let deleted = store.delete(key);
+            let rev = deleted.unwrap_or(store.revision);
             TLM_DELS = TLM_DELS.wrapping_add(1);
             write_fence(
                 Fence::RevisionMonotone {
@@ -899,7 +912,11 @@ pub unsafe fn dispatch_object(handle: i32, opcode: u32, arg: *mut u8, arg_len: u
                 fptr,
                 fcap,
             );
-            pump_subscriptions(store);
+            // Deleting an absent key moved nothing, so there is nothing to
+            // ring for.
+            if deleted.is_some() {
+                notify(key);
+            }
             0
         }
         obj_op::LIST => {
@@ -973,6 +990,186 @@ pub unsafe fn dispatch_object(handle: i32, opcode: u32, arg: *mut u8, arg_len: u
         }
         _ => errno::ENOSYS,
     }
+}
+
+/// One `CHANGES` page for `prefix` from `token` into `out`: its byte count,
+/// or a negative errno. Tokens, per the contract:
+///
+///   - empty: a relist, pinned at the current revision;
+///   - 8 bytes: the changes after a revision, walked from the history;
+///   - `[CONT_RELIST][pinned revision u64][key cursor]`: a relist's next page.
+///
+/// A revision walk issues no continuation of its own. Every revision here
+/// changes exactly one key, so a page always ends on a revision boundary and
+/// the bare revision it ends at is where the next page resumes. A walk is
+/// bounded by the history — at most [`HISTORY`] revisions — and a relist page
+/// by `out`.
+///
+/// # Safety
+/// Single-threaded provider dispatch.
+unsafe fn changes_page(store: &Store, prefix: &[u8], token: &[u8], out: &mut [u8]) -> i32 {
+    use ns_op::changes::token_revision;
+    if token.is_empty() {
+        return relist_page(store, prefix, store.revision, None, out);
+    }
+    if let Some(since) = token_revision(token) {
+        return since_page(store, prefix, since, out);
+    }
+    let Some((&CONT_RELIST, rest)) = token.split_first() else {
+        return errno::EINVAL;
+    };
+    let (Some(pinned), Some(cursor)) = (get_u64(rest, 0), rest.get(8..)) else {
+        return errno::EINVAL;
+    };
+    let Ok(Some(after)) = list_cursor(cursor, prefix) else {
+        return errno::EINVAL;
+    };
+    if pinned > store.revision {
+        // Pinned past anything this store has issued: a token from before a
+        // reboot emptied it. Nothing it names can be continued.
+        return lost_page(out);
+    }
+    relist_page(store, prefix, pinned, Some(after), out)
+}
+
+/// A LOST page: the caller's point precedes what this store can answer.
+///
+/// # Safety
+/// Single-threaded provider dispatch.
+unsafe fn lost_page(out: &mut [u8]) -> i32 {
+    TLM_LOST = TLM_LOST.wrapping_add(1);
+    match ns_op::changes::write_lost(out) {
+        Some(n) => n as i32,
+        None => errno::ENOMEM,
+    }
+}
+
+/// One relist page: every object under `prefix` after `after`, in key order,
+/// `Added` with its value. `pinned` is the revision the relist's first page
+/// stood at; the final page hands it back as the token the consumer resumes
+/// `CHANGES` from.
+///
+/// An object written after `pinned` is left out: the `CHANGES` from `pinned`
+/// that follows the relist reports it, and reporting it here would hand the
+/// consumer a `mod_rev` ahead of where it resumes. No revision is delivered
+/// whole until the walk ends, so a page with `more` set says `safe_rev = 0`.
+fn relist_page(
+    store: &Store,
+    prefix: &[u8],
+    pinned: u64,
+    after: Option<&[u8]>,
+    out: &mut [u8],
+) -> i32 {
+    use ns_op::changes::{revision_token, PageWriter, KIND_ADDED};
+    let Some(mut page) = PageWriter::new(out, RELIST_TOKEN_MAX) else {
+        return errno::ENOMEM;
+    };
+    let mut last = [0u8; STORAGE_KEY_MAX];
+    let mut last_len = 0usize;
+    let mut more = false;
+    // Bounded by one object-table pass per object under the prefix.
+    while let Some(i) = store.next_after(
+        prefix,
+        if last_len > 0 {
+            Some(&last[..last_len])
+        } else {
+            after
+        },
+    ) {
+        let e = &store.entries[i];
+        let key = &e.key[..e.key_len as usize];
+        if e.revision <= pinned
+            && !page.push(e.revision, KIND_ADDED, key, &e.val[..e.val_len as usize])
+        {
+            more = true;
+            break;
+        }
+        last_len = key.len();
+        last[..last_len].copy_from_slice(key);
+    }
+    let finished = if !more {
+        page.finish(false, pinned, &revision_token(pinned))
+    } else if page.count() == 0 {
+        // A page that cannot hold the next record made no progress.
+        return errno::ENOMEM;
+    } else {
+        let mut token = [0u8; RELIST_TOKEN_MAX];
+        token[0] = CONT_RELIST;
+        token[1..9].copy_from_slice(&pinned.to_le_bytes());
+        token[9..9 + last_len].copy_from_slice(&last[..last_len]);
+        page.finish(true, 0, &token[..9 + last_len])
+    };
+    finished.map_or(errno::ENOMEM, |n| n as i32)
+}
+
+/// One page of the changes after revision `since`, walked from the history
+/// in revision order up to the current revision.
+///
+/// Each changed key under `prefix` is reported once, at its latest revision,
+/// read at the store's current state: present → `Added` (when its first
+/// change after `since` created it) or `Modified`, with its value; absent →
+/// `Deleted`, stamped with the delete's revision. Nothing is omitted — a key
+/// created and deleted inside the window is reported `Deleted`. A key changed
+/// again past where the page is cut is left to the later page that reaches
+/// its latest revision, so no `mod_rev` on a page is past the page's
+/// `safe_rev`.
+///
+/// # Safety
+/// Single-threaded provider dispatch.
+unsafe fn since_page(store: &Store, prefix: &[u8], since: u64, out: &mut [u8]) -> i32 {
+    use ns_op::changes::{revision_token, PageWriter, KIND_ADDED, KIND_DELETED, KIND_MODIFIED};
+    if since > store.revision || since < store.hist_base() {
+        // Past what this store has issued (a token from before a reboot), or
+        // behind what its history retains: either way, relist.
+        return lost_page(out);
+    }
+    let Some(mut page) = PageWriter::new(out, ns_op::changes::REVISION_TOKEN_LEN) else {
+        return errno::ENOMEM;
+    };
+    let mut cut = since;
+    let mut more = false;
+    for rev in since + 1..=store.revision {
+        let Some(h) = store.hist_at(rev) else {
+            break;
+        };
+        let key = &h.key[..h.key_len as usize];
+        if has_prefix(key, prefix) {
+            let current = store.get(key);
+            // The key's latest revision: its object's while present; while
+            // absent, its latest history entry — the delete, which is at or
+            // after this one and so still retained.
+            let latest = match current {
+                Some((_, r)) => r,
+                None => store
+                    .hist_find(key, rev - 1, store.revision, false)
+                    .map_or(rev, |l| l.revision),
+            };
+            if latest == rev {
+                let (kind, val) = match current {
+                    None => (KIND_DELETED, &[][..]),
+                    Some((val, _)) => {
+                        let created = store
+                            .hist_find(key, since, rev, true)
+                            .is_some_and(|f| f.kind == Kind::Added);
+                        (if created { KIND_ADDED } else { KIND_MODIFIED }, val)
+                    }
+                };
+                if !page.push(rev, kind, key, val) {
+                    more = true;
+                    break;
+                }
+            }
+            // Otherwise a later revision changed the key again; it is
+            // reported there.
+        }
+        cut = rev;
+    }
+    if more && page.count() == 0 {
+        // A page that cannot hold the next record made no progress.
+        return errno::ENOMEM;
+    }
+    page.finish(more, cut, &revision_token(cut))
+        .map_or(errno::ENOMEM, |n| n as i32)
 }
 
 /// `storage.namespace` dispatch.
@@ -1049,201 +1246,154 @@ pub unsafe fn dispatch_namespace(handle: i32, opcode: u32, arg: *mut u8, arg_len
             n as i32
         }
         ns_op::SUBSCRIBE => {
-            // [prefix_len:u16][prefix][sink_chan:u32][flags:u8]
-            let Some(pl) = get_u16(a, 0).map(|v| v as usize) else {
+            let Some(req) = ns_op::subscribe::parse(a) else {
                 return errno::EINVAL;
             };
-            if a.len() < 2 + pl || pl > STORAGE_KEY_MAX {
+            let pl = req.prefix.len();
+            if pl > STORAGE_KEY_MAX {
                 return errno::EINVAL;
             }
-            let Some(sink_chan) = get_u32(a, 2 + pl) else {
+            // The event must be the calling module's own: a subscription
+            // never wakes anybody but its subscriber.
+            let (Some(event), Some((module, generation))) =
+                (event_slot(req.event), caller_occupancy())
+            else {
                 return errno::EINVAL;
             };
-            let flags = *a.get(2 + pl + 4).unwrap_or(&0);
-            let include_initial = flags & 0x01 != 0;
+            if event_owner(event) != Some(module) {
+                return errno::EINVAL;
+            }
+            let opener = crate::kernel::exec::scheduler::caller_owner();
+            let ring_now = req.flags & ns_op::subscribe::FLAG_RING_NOW != 0;
 
             let subs = &mut *core::ptr::addr_of_mut!(SUBS);
-            let Some(idx) = subs.iter().position(|s| !s.in_use) else {
+            // Idempotent on (owner, occupancy, event, prefix): a module that
+            // re-runs its subscribe path gets the handle it already holds,
+            // not a second slot.
+            if let Some(idx) = subs.iter().position(|s| {
+                s.in_use
+                    && s.opener == opener
+                    && s.module == module
+                    && s.generation == generation
+                    && s.event == event
+                    && &s.prefix[..s.prefix_len as usize] == req.prefix
+            }) {
+                if ring_now {
+                    ring(&mut subs[idx]);
+                }
+                return tag_fd(FD_TAG_STORAGE_NAMESPACE, idx as i32);
+            }
+            // Every caller here acts with the node's authority
+            // (`node_caller`), so the pool's ceiling is the one quota; dead
+            // stamps are swept before it refuses.
+            let free = match subs.iter().position(|s| !s.in_use) {
+                Some(idx) => Some(idx),
+                None => {
+                    reap_dead_subs();
+                    subs.iter().position(|s| !s.in_use)
+                }
+            };
+            let Some(idx) = free else {
                 return refuse_slot(res::POOL_STORE_SUBS, subs.len());
             };
             subs[idx] = SUB_EMPTY;
             subs[idx].in_use = true;
-            subs[idx].opener = crate::kernel::exec::scheduler::caller_owner();
+            subs[idx].opener = opener;
+            subs[idx].module = module;
+            subs[idx].generation = generation;
+            subs[idx].event = event;
             subs[idx].prefix_len = pl as u16;
-            subs[idx].prefix[..pl].copy_from_slice(&a[2..2 + pl]);
-            subs[idx].sink_chan = sink_chan;
-            subs[idx].cursor = store.revision;
-
-            if include_initial {
-                // Synthesise Added for every current entry, so the stream is a
-                // complete list-then-watch with no separate GET and no window
-                // between the two where a change could be missed.
-                for e in store.entries.iter() {
-                    if !e.in_use
-                        || !has_prefix(&e.key[..e.key_len as usize], &subs[idx].prefix[..pl])
-                    {
-                        continue;
-                    }
-                    let mut buf = [0u8; EVENT_HEADER_SIZE + 16 + STORAGE_KEY_MAX + MAX_VALUE];
-                    let n = encode_event(
-                        subs[idx].sequence,
-                        e.revision,
-                        Kind::Added,
-                        &e.key[..e.key_len as usize],
-                        &e.val[..e.val_len as usize],
-                        &mut buf,
-                    );
-                    if n == 0 || channel_write(sink_chan as i32, buf.as_ptr(), n) <= 0 {
-                        // The snapshot could not be delivered whole. Release
-                        // the slot and refuse: a watcher established on a
-                        // partial list believes it has seen the full state,
-                        // and nothing later in the stream corrects it.
-                        subs[idx] = SUB_EMPTY;
-                        return errno::EAGAIN;
-                    }
-                    subs[idx].sequence = subs[idx].sequence.wrapping_add(1);
-                }
+            subs[idx].prefix[..pl].copy_from_slice(req.prefix);
+            // Bit 0 rings once now; no listing is pushed — the subscriber
+            // relists with `CHANGES` (empty token) itself.
+            if ring_now {
+                ring(&mut subs[idx]);
             }
             tag_fd(FD_TAG_STORAGE_NAMESPACE, idx as i32)
         }
+        ns_op::TAKE_RUNG => {
+            let Some(req) = ns_op::take::parse(a) else {
+                return errno::EINVAL;
+            };
+            let (Some(event), Some((module, generation))) =
+                (event_slot(req.event), caller_occupancy())
+            else {
+                return errno::EINVAL;
+            };
+            let out = core::slice::from_raw_parts_mut(req.out_ptr as *mut u8, req.out_cap as usize);
+            let Some(mut answer) = ns_op::take::Writer::new(out) else {
+                return errno::ENOMEM;
+            };
+            let opener = crate::kernel::exec::scheduler::caller_owner();
+            // The caller's subscriptions on an event slot it no longer owns
+            // are dead — the slot is somebody else's now, or free — and are
+            // dropped rather than named.
+            let owned = event_owner(event) == Some(module);
+            let subs = &mut *core::ptr::addr_of_mut!(SUBS);
+            let mut more = false;
+            for (idx, s) in subs.iter_mut().enumerate() {
+                // Only subscriptions this occupancy opened on this event are
+                // visible; anybody else's are as if not open.
+                if !s.in_use
+                    || s.event != event
+                    || s.opener != opener
+                    || s.module != module
+                    || s.generation != generation
+                {
+                    continue;
+                }
+                if !owned {
+                    drop_sub(s);
+                    continue;
+                }
+                if !s.rung {
+                    continue;
+                }
+                if !answer.push(tag_fd(FD_TAG_STORAGE_NAMESPACE, idx as i32)) {
+                    more = true;
+                    break;
+                }
+                s.rung = false;
+            }
+            if more {
+                // The remainder keep their bits; signal again so the caller
+                // takes them on its next wake. The caller owns the event
+                // (`owned`), and is the one calling, so it is live.
+                let _ = event_signal(event);
+            }
+            answer.finish(more) as i32
+        }
         ns_op::CHANGES => {
-            // [prefix_len:u16][prefix][since:u64][out_buf:u64][out_cap:u32]
-            // [fence_ptr:u64][fence_cap:u16]
-            let Some(pl) = get_u16(a, 0).map(|v| v as usize) else {
+            let Some(req) = ns_op::changes::parse_request(a) else {
                 return errno::EINVAL;
             };
-            if a.len() < 2 + pl {
-                return errno::EINVAL;
+            // `req.sub` names the subscription to re-ring after an EAGAIN;
+            // this store reads RAM inside the call and never answers one.
+            let out = core::slice::from_raw_parts_mut(req.out_ptr as *mut u8, req.out_cap as usize);
+            let rc = changes_page(store, req.prefix, req.token, out);
+            if rc >= 0 {
+                write_fence(
+                    Fence::ViewConsistent {
+                        source: STORE_SOURCE,
+                        revision: store.revision,
+                    },
+                    req.fence_out_ptr,
+                    req.fence_out_cap,
+                );
             }
-            let prefix = &a[2..2 + pl];
-            let mut p = 2 + pl;
-            let since = get_u64(a, p).unwrap_or(0);
-            p += 8;
-            let out_buf = get_u64(a, p).unwrap_or(0);
-            let out_cap = get_u32(a, p + 8).unwrap_or(0) as usize;
-            let fptr = get_u64(a, p + 12).unwrap_or(0);
-            let fcap = get_u16(a, p + 20).unwrap_or(0);
-
-            let mut body = [0u8; 8192];
-            let mut bo = 0usize;
-            let mut count: u32 = 0;
-            let mut status: u8 = 0;
-            let mut fence_rev = since;
-
-            // [rev:u64][kind:u8][key_len:u16][val_len:u32][key][val]
-            let mut push = |bo: &mut usize, rev: u64, kind: u8, key: &[u8], val: &[u8]| -> bool {
-                let need = 8 + 1 + 2 + 4 + key.len() + val.len();
-                if *bo + need > body.len() {
-                    return false;
-                }
-                body[*bo..*bo + 8].copy_from_slice(&rev.to_le_bytes());
-                body[*bo + 8] = kind;
-                body[*bo + 9..*bo + 11].copy_from_slice(&(key.len() as u16).to_le_bytes());
-                body[*bo + 11..*bo + 15].copy_from_slice(&(val.len() as u32).to_le_bytes());
-                body[*bo + 15..*bo + 15 + key.len()].copy_from_slice(key);
-                body[*bo + 15 + key.len()..*bo + need].copy_from_slice(val);
-                *bo += need;
-                true
-            };
-
-            if since == 0 {
-                fence_rev = store.revision;
-                for e in store.entries.iter() {
-                    if !e.in_use || !has_prefix(&e.key[..e.key_len as usize], prefix) {
-                        continue;
-                    }
-                    if !push(
-                        &mut bo,
-                        e.revision,
-                        0,
-                        &e.key[..e.key_len as usize],
-                        &e.val[..e.val_len as usize],
-                    ) {
-                        // The snapshot does not fit. Refused, as Linux
-                        // refuses an over-cap answer: a short list handed
-                        // back with `status = 0` reads as the complete
-                        // state, and the caller cannot tell it is not.
-                        return errno::ENOMEM;
-                    }
-                    count += 1;
-                }
-            } else if since < store.hist_floor() {
-                // Out of the retained window: say so rather than serve a
-                // partial history that reads as complete.
-                status = 1;
-                fence_rev = store.revision;
-            } else {
-                // Walk the retained history in ASCENDING revision order from
-                // `since`. The ring is small (HISTORY entries) and this is a
-                // request-time op, so a select-min pass per event is cheaper
-                // than maintaining an index — and it does not depend on the
-                // ring's physical order, which wraps.
-                let mut cursor = since;
-                loop {
-                    let mut pick: Option<usize> = None;
-                    for (i, h) in store.hist.iter().enumerate() {
-                        if h.revision <= cursor {
-                            continue;
-                        }
-                        if !has_prefix(&h.key[..h.key_len as usize], prefix) {
-                            continue;
-                        }
-                        match pick {
-                            Some(j) if store.hist[j].revision <= h.revision => {}
-                            _ => pick = Some(i),
-                        }
-                    }
-                    let Some(i) = pick else { break };
-                    let h = store.hist[i];
-                    let kind = match h.kind {
-                        Kind::Added => 0u8,
-                        Kind::Modified => 1u8,
-                        Kind::Deleted => 2u8,
-                    };
-                    if !push(
-                        &mut bo,
-                        h.revision,
-                        kind,
-                        &h.key[..h.key_len as usize],
-                        &h.val[..h.val_len as usize],
-                    ) {
-                        return errno::ENOMEM;
-                    }
-                    count += 1;
-                    if h.revision > fence_rev {
-                        fence_rev = h.revision;
-                    }
-                    cursor = h.revision;
-                }
-            }
-
-            let total = 5 + bo;
-            if out_buf != 0 {
-                if total > out_cap {
-                    return errno::ENOMEM;
-                }
-                let out = core::slice::from_raw_parts_mut(out_buf as *mut u8, total);
-                out[0] = status;
-                out[1..5].copy_from_slice(&count.to_le_bytes());
-                out[5..total].copy_from_slice(&body[..bo]);
-            }
-            write_fence(
-                Fence::ViewConsistent {
-                    source: STORE_SOURCE,
-                    revision: fence_rev,
-                },
-                fptr,
-                fcap,
-            );
-            total as i32
+            rc
         }
         ns_op::LOOKUP | ns_op::STAT => errno::ENOSYS,
         ns_op::CLOSE => {
             let idx = slot_of(handle) as usize;
             let subs = &mut *core::ptr::addr_of_mut!(SUBS);
+            // The opening module occupancy as well as its owner: the node's
+            // modules share one owner, and a stale handle number another
+            // module now holds must not close that module's subscription.
             if handle >= 0
                 && idx < subs.len()
                 && opened_by_caller(subs[idx].in_use, subs[idx].opener)
+                && caller_occupancy() == Some((subs[idx].module, subs[idx].generation))
             {
                 subs[idx] = SUB_EMPTY;
             }

@@ -1728,6 +1728,9 @@ const NON_PARAM_KEYS: &[&str] = &[
     // `heap`: nested object { zero_on_free, alloc_failure_policy, canary_enabled,
     // arena_bytes, raw_arena }
     "heap",
+    // `demand`: { <pool>: n } — the instance's own declared demand, which
+    // wins over its type's `[capacities]` figure (`instance_demand`).
+    "demand",
     // Provenance recorded by stack expansion, not authored and not
     // emitted: which stack injected this module entry and which of its
     // params that stack set. Read only to explain a catalog/module skew
@@ -1827,47 +1830,122 @@ fn declares_raw_arena(module: &Value, manifest: Option<&Manifest>) -> bool {
         })
 }
 
+/// What the composer knows of a graph's plan when it packs heap caps: the
+/// full planned ceiling (derived + declared + reserve) of each pool a
+/// `[capacities] heap_per_demand` rule names. Empty — no per-demand bytes —
+/// until the graph's declared demand has been counted, which needs every
+/// instance's params packed once first; that planning pass is `quiet`, so
+/// what it would print is printed once, by the pass that keeps its entries.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct HeapPlan {
+    pub(crate) ceilings: std::collections::BTreeMap<String, u64>,
+    pub(crate) quiet: bool,
+}
+
+impl HeapPlan {
+    /// A planning pass: ceilings not yet known, nothing printed.
+    pub(crate) fn planning() -> Self {
+        Self {
+            ceilings: std::collections::BTreeMap::new(),
+            quiet: true,
+        }
+    }
+
+    /// `(extra bytes, pool, ceiling)` a `heap_per_demand` rule adds to an
+    /// instance of `manifest`'s type under this plan; `None` without a rule
+    /// or before the pool's ceiling is known.
+    pub(crate) fn per_demand(&self, manifest: Option<&Manifest>) -> Option<(u64, String, u64)> {
+        let rule = manifest?.heap_per_demand.as_ref()?;
+        let ceiling = *self.ceilings.get(&rule.pool)?;
+        Some((rule.extra_for(ceiling), rule.pool.clone(), ceiling))
+    }
+}
+
 /// This instance's heap cap (params tag 0xEF), or `None` to leave the module
-/// type's own. The graph's `heap.arena_bytes` wins; failing that, the type's
-/// `[capacities] heap_from_params` derives the cap from the bytes the params
-/// TLV `tlv` declares under the rule's tags — a declared input, so a large
-/// inline value needs no hand-written cap. An explicit cap below what those
-/// bytes need is kept, and warned: the module will refuse its params.
+/// type's own. The graph's `heap.arena_bytes` wins; failing that, the cap is
+/// derived from the type's rules:
+///
+/// - `[capacities] heap_from_params` derives it from the bytes the params TLV
+///   `tlv` declares under the rule's tags — a declared input, so a large
+///   inline value needs no hand-written cap;
+/// - `[capacities] heap_per_demand` adds `bytes_each` × the planned ceiling
+///   of its pool (`plan`) to that figure — or to the rule's own `base`, for a
+///   type with no heap rule. The two are summed.
+///
+/// An explicit cap below what the params need is kept, and warned: the module
+/// will refuse its params. One below a figure that includes per-demand bytes
+/// is refused, naming both: the pool is planned to a ceiling the instance
+/// could not serve.
 fn instance_heap_cap(
     name: &str,
     module: &Value,
     manifest: Option<&Manifest>,
     tlv: &[u8],
+    plan: &HeapPlan,
 ) -> Result<Option<u32>> {
     let explicit = module
         .get("heap")
         .and_then(|h| h.get("arena_bytes"))
         .and_then(|v| heap_arena_bytes(v).ok());
-    let Some(rule) = manifest.and_then(|m| m.heap_from_params.as_ref()) else {
+    let rule = manifest.and_then(|m| m.heap_from_params.as_ref());
+    let per_demand = plan.per_demand(manifest).filter(|&(extra, ..)| extra > 0);
+    if rule.is_none() && per_demand.is_none() {
         return Ok(explicit);
+    }
+    let bytes = rule.map_or(0, |r| r.declared_bytes(tlv));
+    // The figure the rules derive, `None` while the type's own cap holds it.
+    let derived = match (&per_demand, rule) {
+        (None, Some(r)) => r.derived_cap(bytes),
+        (Some((extra, ..)), Some(r)) => {
+            Some(r.derived_cap(bytes).unwrap_or(u64::from(r.base)) + extra)
+        }
+        (Some((extra, ..)), None) => manifest
+            .and_then(|m| m.heap_per_demand.as_ref())
+            .and_then(|r| r.base)
+            .map(|base| u64::from(base) + extra),
+        (None, None) => None,
     };
-    let bytes = rule.declared_bytes(tlv);
     if let Some(n) = explicit {
-        let need = rule.need_for(bytes);
-        if bytes > 0 && u64::from(n) < need {
-            eprintln!(
-                "warning: module '{name}': heap.arena_bytes = {n} is below the {need} B its \
-                 {bytes} B of declared params need (`[capacities] heap_from_params`); the \
-                 module will refuse them. Raise it, or drop it to let the composer size it."
-            );
+        if let (Some((extra, pool, ceiling)), Some(need)) = (&per_demand, derived) {
+            if u64::from(n) < need {
+                return Err(Error::Config(format!(
+                    "module '{name}': heap.arena_bytes = {n} is below the {need} B its type \
+                     derives — {extra} B of it for `{pool}` planned to {ceiling} \
+                     (`[capacities] heap_per_demand`). The instance could not hold what the \
+                     pool is planned for. Raise it to at least {need}, or drop it to let the \
+                     composer size it."
+                )));
+            }
+        } else if let Some(r) = rule {
+            let need = r.need_for(bytes);
+            if bytes > 0 && u64::from(n) < need && !plan.quiet {
+                eprintln!(
+                    "warning: module '{name}': heap.arena_bytes = {n} is below the {need} B its \
+                     {bytes} B of declared params need (`[capacities] heap_from_params`); the \
+                     module will refuse them. Raise it, or drop it to let the composer size it."
+                );
+            }
         }
         return Ok(Some(n));
     }
-    let Some(cap) = rule.derived_cap(bytes) else {
+    let Some(cap) = derived else {
         return Ok(None);
     };
     let cap = u32::try_from(cap).map_err(|_| {
         Error::Config(format!(
-            "module '{name}': its {bytes} B of declared params need a {cap} B heap cap, \
-             past a heap's u32 size"
+            "module '{name}': its derived heap cap of {cap} B is past a heap's u32 size"
         ))
     })?;
-    eprintln!("  heap: '{name}' cap {cap} B, sized from {bytes} B of declared params");
+    if !plan.quiet {
+        match &per_demand {
+            Some((extra, pool, ceiling)) => eprintln!(
+                "  heap: '{name}' cap {cap} B, {extra} B of it for `{pool}` planned to {ceiling}"
+            ),
+            None => {
+                eprintln!("  heap: '{name}' cap {cap} B, sized from {bytes} B of declared params")
+            }
+        }
+    }
     Ok(Some(cap))
 }
 
@@ -2470,6 +2548,7 @@ fn build_module_entry(
     manifests: &HashMap<String, Manifest>,
     max_modules: usize,
     isolation: &crate::target::IsolationFacts,
+    plan: &HeapPlan,
 ) -> Result<Vec<u8>> {
     // The params buffer grows to fit the entry: an entry that ran out of room,
     // or left too little to prove nothing was skipped, is rebuilt in a buffer
@@ -2489,6 +2568,7 @@ fn build_module_entry(
             manifests,
             max_modules,
             isolation,
+            plan,
         );
         match built {
             Ok(entry)
@@ -2533,6 +2613,7 @@ fn build_module_entry_in(
     manifests: &HashMap<String, Manifest>,
     max_modules: usize,
     isolation: &crate::target::IsolationFacts,
+    plan: &HeapPlan,
 ) -> Result<Vec<u8>> {
     // Room for this pass's params; truncated to what the entry used.
     let mut entry = vec![0u8; MODULE_ENTRY_HEADER_SIZE + cap];
@@ -2987,7 +3068,7 @@ fn build_module_entry_in(
     // type's declared arena — the graph's `heap.arena_bytes` (validated by
     // `validate_heap_subtree`), else what the type's `[capacities]
     // heap_from_params` derives from the params packed above.
-    if let Some(n) = instance_heap_cap(name, module, manifests.get(name), &entry[P..base])? {
+    if let Some(n) = instance_heap_cap(name, module, manifests.get(name), &entry[P..base], plan)? {
         if base + extra_len + 6 < entry.len() {
             entry[base + extra_len] = 0xEF;
             entry[base + extra_len + 1] = 4;
@@ -3327,6 +3408,10 @@ fn build_module_entry_in(
     Ok(entry)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "build_module_entry's graph context, threaded through for every entry"
+)]
 pub(crate) fn parse_modules_map(
     modules: &Value,
     data_section: Option<&Value>,
@@ -3335,6 +3420,7 @@ pub(crate) fn parse_modules_map(
     manifests: &HashMap<String, Manifest>,
     max_modules: usize,
     isolation: &crate::target::IsolationFacts,
+    plan: &HeapPlan,
 ) -> Result<(Vec<Vec<u8>>, Vec<String>)> {
     let mut entries = Vec::new();
     let mut names = Vec::new();
@@ -3440,6 +3526,7 @@ pub(crate) fn parse_modules_map(
             manifests,
             max_modules,
             isolation,
+            plan,
         )?;
         entries.push(entry);
         names.push(name.to_string());

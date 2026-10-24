@@ -2,8 +2,8 @@
 //! ON THE BOARD.
 //!
 //! A provider that compiles is not a provider that works, and a store-backed
-//! graph reports neither: a source whose SUBSCRIBE fails looks exactly like a
-//! source with nothing to report. This fixture is the evidence the graph
+//! graph reports neither: a source whose subscription never rings looks
+//! exactly like a source with nothing to report. This fixture is the evidence the graph
 //! itself cannot give.
 //!
 //! It walks the whole contract surface a store consumer uses, in order, and
@@ -15,7 +15,9 @@
 //!   1 PUT      two objects under one prefix
 //!   2 GET      read one back and byte-compare it
 //!   3 LIST     enumerate the prefix, expect both
-//!   4 SUBSCRIBE + PUT, then drain the sink — the PUSH a source depends on
+//!   4 SUBSCRIBE + PUT, then wait for the ring — the wake a source depends
+//!     on: the store signals the probe's own event, TAKE_RUNG names the
+//!     subscription, and a CHANGES read finds the write
 //!   5 DELETE   remove one, LIST again, expect one
 //!
 //! A write the store has not decided (`EINPROGRESS`) is asked again next
@@ -23,16 +25,16 @@
 //! "not yet" (`EAGAIN` -- `fs_object` over FAT32 does while it walks a large
 //! directory) is asked again the same way rather than called a failure.
 //!
-//! `subscribe` (default 1) can be set 0 for a store with no change events,
+//! `subscribe` (default 1) can be set 0 for a store with no subscriptions,
 //! such as `fs_object`: step 4 then writes without subscribing, and the
-//! verdict does not ask for a push.
+//! verdict does not ask for a ring.
 //!
 //! **Acceptance:** `[stp] state=5 pass=1 put=3 got=1 listed=2 pushed=N del=1
 //! wit_a=A wit_b=B err=0`. Any `state=99` names the failure in `err`.
-//! `pushed` is the count of namespace.change events that ARRIVED. It is
-//! reported separately rather than folded into the PUT's pass/fail: a PUT
-//! that lands and a watcher that is never told are different failures, and
-//! only the second is silent.
+//! `pushed` is the count of rings that ARRIVED and whose CHANGES read found
+//! the write. It is reported separately rather than folded into the PUT's
+//! pass/fail: a PUT that lands and a watcher that is never told are
+//! different failures, and only the second is silent.
 //!
 //! WITNESS PREFIXES. `witness_a` / `witness_b` are optional graph params: each
 //! is a prefix this probe LISTs on every heartbeat and reports the count of.
@@ -91,6 +93,8 @@ const ENOENT: i32 = abi::kernel_abi::errno::ENOENT;
 const FENCE_CAP: usize = 64;
 const NS_LIST: u32 = abi::contracts::storage::namespace::LIST;
 const NS_SUBSCRIBE: u32 = abi::contracts::storage::namespace::SUBSCRIBE;
+const NS_TAKE_RUNG: u32 = abi::contracts::storage::namespace::TAKE_RUNG;
+const NS_CHANGES: u32 = abi::contracts::storage::namespace::CHANGES;
 
 const PREFIX: &[u8] = b"/probe/";
 const KEY_A: &[u8] = b"/probe/a";
@@ -99,12 +103,14 @@ const KEY_C: &[u8] = b"/probe/c";
 const VAL_A: &[u8] = b"{\"kind\":\"Probe\",\"n\":1}";
 const VAL_C: &[u8] = b"{\"kind\":\"Probe\",\"n\":3}";
 
-const EVENT_HEADER_SIZE: usize = 32;
-
 #[repr(C)]
 struct State {
     syscalls: *const SyscallTable,
-    sink: i32,
+    /// The probe's own kernel event, which the store signals when the
+    /// subscription rings. Created in state 3; -1 before.
+    event: i32,
+    /// The subscription handle SUBSCRIBE returned; -1 before.
+    sub: i32,
     out_chan: i32,
     step: u32,
     state: u32,
@@ -149,11 +155,13 @@ struct State {
     /// Empty when none is in flight.
     clear_key: [u8; MAX_WITNESS],
     clear_len: u32,
-    /// Subscribed in state 3: a write asked again does not subscribe again.
+    /// 0 until subscribed in state 3 (a write asked again does not
+    /// subscribe again), 1 subscribed, 2 rung and reading, 3 rung but the
+    /// read did not find the write.
     subscribed: u32,
     /// Whether to prove SUBSCRIBE (`subscribe`, default 1). A store with no
-    /// change events -- `fs_object` -- is walked with it 0: step 4 then
-    /// writes without subscribing, and the verdict does not ask for a push.
+    /// subscriptions -- `fs_object` -- is walked with it 0: step 4 then
+    /// writes without subscribing, and the verdict does not ask for a ring.
     want_push: u32,
     /// Where a write's fence lands. In the state, not on the stack, so a
     /// write asked again names the same buffer: the same request.
@@ -413,19 +421,110 @@ unsafe fn log_names(sys: &SyscallTable, prefix: &[u8], page: &mut [u8]) {
     dev_log(sys, 3, line.as_ptr(), pos);
 }
 
-unsafe fn subscribe(sys: &SyscallTable, prefix: &[u8], sink: i32) -> i32 {
-    // [prefix_len:u16][prefix][sink_chan:u32][flags:u8]
+unsafe fn subscribe(sys: &SyscallTable, prefix: &[u8], event: i32) -> i32 {
+    use abi::contracts::storage::namespace::subscribe;
     let mut arg = [0u8; 224];
-    let mut p = 0usize;
-    arg[0..2].copy_from_slice(&(prefix.len() as u16).to_le_bytes());
-    p += 2;
-    arg[p..p + prefix.len()].copy_from_slice(prefix);
-    p += prefix.len();
-    arg[p..p + 4].copy_from_slice(&(sink as u32).to_le_bytes());
-    p += 4;
-    arg[p] = 0; // no initial listing — we want the LIVE push, not a replay
-    p += 1;
-    (sys.provider_call)(-1, NS_SUBSCRIBE, arg.as_mut_ptr(), p)
+    // No ring at subscribe — we want the ring the WRITE causes.
+    let req = subscribe::Request {
+        prefix,
+        event,
+        flags: 0,
+    };
+    let Some(len) = subscribe::encode(&mut arg, &req) else {
+        return E_INVAL;
+    };
+    (sys.provider_call)(-1, NS_SUBSCRIBE, arg.as_mut_ptr(), len)
+}
+
+/// Whether `event` fired and TAKE_RUNG names `sub` among its rung
+/// subscriptions: 1 rang, 0 not (yet), or a negative errno.
+unsafe fn rang(sys: &SyscallTable, event: i32, sub: i32) -> i32 {
+    use abi::contracts::storage::namespace::take;
+    let fired = (sys.provider_call)(
+        event,
+        abi::kernel_abi::event::POLL,
+        core::ptr::null_mut(),
+        0,
+    );
+    if fired <= 0 {
+        return fired;
+    }
+    let mut out = [0u8; take::HEAD_LEN + 4 * 8];
+    let req = take::Request {
+        event,
+        out_ptr: out.as_mut_ptr() as u64,
+        out_cap: out.len() as u32,
+    };
+    let mut arg = [0u8; take::REQUEST_LEN];
+    let Some(len) = take::encode(&mut arg, &req) else {
+        return E_INVAL;
+    };
+    let n = (sys.provider_call)(-1, NS_TAKE_RUNG, arg.as_mut_ptr(), len);
+    if n < 0 {
+        return n;
+    }
+    let Some((_, mut handles)) = take::decode(&out[..n as usize]) else {
+        return E_INVAL;
+    };
+    let named = handles.any(|h| h == sub);
+    i32::from(named)
+}
+
+/// Relist `prefix` through CHANGES, every page, and report whether `key`
+/// came back with `val`: 1 found, 0 not, or a negative errno. A watcher
+/// reads what it was rung for; this is that read.
+unsafe fn changes_has(
+    sys: &SyscallTable,
+    prefix: &[u8],
+    sub: i32,
+    key: &[u8],
+    val: &[u8],
+    page: &mut [u8],
+) -> i32 {
+    use abi::contracts::storage::namespace::changes;
+    let mut fence = [0u8; abi::fence::WIRE_MAX_LEN];
+    let mut token = [0u8; changes::TOKEN_MAX];
+    let mut token_len = 0usize;
+    let mut found = 0;
+    let mut pages = 0;
+    while pages < 4096 {
+        pages += 1;
+        let req = changes::Request {
+            prefix,
+            sub,
+            token: &token[..token_len],
+            out_ptr: page.as_mut_ptr() as u64,
+            out_cap: page.len() as u32,
+            fence_out_ptr: fence.as_mut_ptr() as u64,
+            fence_out_cap: fence.len() as u16,
+        };
+        let mut arg = [0u8; changes::REQUEST_FIXED_LEN + 256 + changes::TOKEN_MAX];
+        let Some(len) = changes::encode_request(&mut arg, &req) else {
+            return E_INVAL;
+        };
+        let n = (sys.provider_call)(-1, NS_CHANGES, arg.as_mut_ptr(), len);
+        if n < 0 {
+            return n;
+        }
+        let Some(decoded) = changes::decode_page(&page[..n as usize]) else {
+            return E_INVAL;
+        };
+        if decoded.lost {
+            return E_INVAL; // a relist is never LOST
+        }
+        if decoded
+            .records()
+            .any(|r| r.kind != changes::KIND_DELETED && r.key == key && r.val == val)
+        {
+            found = 1;
+        }
+        if !decoded.more {
+            return found;
+        }
+        token[..decoded.token.len()].copy_from_slice(decoded.token);
+        token_len = decoded.token.len();
+    }
+    E_INVAL
 }
 
 fn write_dec(p: *mut u8, pos: &mut usize, mut v: u32) {
@@ -497,7 +596,7 @@ pub extern "C" fn module_init(_syscalls: *const c_void) {}
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[cfg_attr(not(feature = "host-test"), link_section = ".text.module_new")]
 pub unsafe extern "C" fn module_new(
-    in_chan: i32,
+    _in_chan: i32,
     out_chan: i32,
     _ctrl_chan: i32,
     params: *const u8,
@@ -515,7 +614,8 @@ pub unsafe extern "C" fn module_new(
         }
         let s = &mut *(state as *mut State);
         s.syscalls = syscalls as *const SyscallTable;
-        s.sink = in_chan;
+        s.event = -1;
+        s.sub = -1;
         s.out_chan = out_chan;
         s.step = 0;
         s.state = 0;
@@ -687,19 +787,32 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     s.state = 5;
                     return 0;
                 }
-                if s.sink < 0 {
-                    s.err = -6;
-                    s.state = 99;
-                    emit(s);
-                    return 0;
+                if s.event < 0 {
+                    s.event = (sys.provider_call)(
+                        -1,
+                        abi::kernel_abi::event::CREATE,
+                        core::ptr::null_mut(),
+                        0,
+                    );
+                    if s.event < 0 {
+                        s.err = -6;
+                        s.state = 99;
+                        emit(s);
+                        return 0;
+                    }
                 }
                 if s.subscribed == 0 {
-                    if subscribe(sys, PREFIX, s.sink) < 0 {
+                    let h = subscribe(sys, PREFIX, s.event);
+                    if h == E_AGAIN {
+                        return 0;
+                    }
+                    if h < 0 {
                         s.err = -7;
                         s.state = 99;
                         emit(s);
                         return 0;
                     }
+                    s.sub = h;
                     s.subscribed = 1;
                 }
                 match put(sys, KEY_C, VAL_C, &mut s.fence) {
@@ -716,18 +829,23 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 s.state = 4;
             }
             4 => {
-                // Drain the sink. The event must ARRIVE, not merely have been
+                // Wait for the ring. It must ARRIVE, not merely have been
                 // accepted: SUBSCRIBE returning a handle proves nothing about
-                // whether a change ever reaches the channel.
-                let poll = (sys.channel_poll)(s.sink, POLL_IN);
-                if poll > 0 && ((poll as u32) & POLL_IN) != 0 {
-                    let n = (sys.channel_read)(s.sink, s.scratch.as_mut_ptr(), s.scratch.len());
-                    if n as usize >= EVENT_HEADER_SIZE {
-                        s.pushed += 1;
+                // whether a change ever signals the event. Once it rings, the
+                // read it asks for must find the write. A read the store
+                // answers "not yet" is asked again next step.
+                if s.subscribed == 1 && rang(sys, s.event, s.sub) == 1 {
+                    s.subscribed = 2;
+                }
+                if s.subscribed == 2 {
+                    match changes_has(sys, PREFIX, s.sub, KEY_C, VAL_C, &mut s.scratch) {
+                        1 => s.pushed += 1,
+                        E_AGAIN => {}
+                        _ => s.subscribed = 3, // rang, but the read missed the write
                     }
                 }
-                // Give the push a bounded number of steps before judging it.
-                if s.pushed > 0 || s.step > 2000 {
+                // Give the ring a bounded number of steps before judging it.
+                if s.pushed > 0 || s.subscribed == 3 || s.step > 2000 {
                     s.state = 5;
                 }
             }

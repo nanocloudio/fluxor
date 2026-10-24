@@ -1103,7 +1103,10 @@ fn privileged_op_permission(op: u32) -> Option<u16> {
         // ARENA_GET / BIND_IRQ / REPORT_LATENCY family, LOG_WRITE,
         // HANDLE_POLL, RANDOM_FILL, SYS_CLOCK_HZ, paged-arena GET/PREFAULT,
         // BOOT_INCARNATION.
-        0x0C2A..=0x0C2E // FLASH_LAYOUT / PROGRAM_INFO / PROGRAM_READ / SLOT_SIGNING_ROOT / SLOT_ADMITTED
+        // LEDGER_DENY — admitted by provider identity, not a permission:
+        // only the module serving the pool may charge refusals to it.
+        0x0C24
+        | 0x0C2A..=0x0C2E // FLASH_LAYOUT / PROGRAM_INFO / PROGRAM_READ / SLOT_SIGNING_ROOT / SLOT_ADMITTED
         | 0x0C2F // BOOT_INCARNATION
         | 0x0C30
         | 0x0C31
@@ -1575,6 +1578,16 @@ unsafe fn timer_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_le
     }
 }
 
+/// A module occupancy as `CALLER_MODULE`, `MODULE_LIVE` and `EVENT_OWNER`
+/// carry it: `[module idx u16][0 u16][slot generation u32]`, laid out like
+/// the owner record so a provider stamps and compares both alike.
+fn module_record(idx: u16, gen: u32) -> [u8; 8] {
+    let mut r = [0u8; 8];
+    r[..2].copy_from_slice(&idx.to_le_bytes());
+    r[4..].copy_from_slice(&gen.to_le_bytes());
+    r
+}
+
 unsafe fn event_provider_dispatch(handle: i32, opcode: u32, _arg: *mut u8, _arg_len: usize) -> i32 {
     use crate::abi::kernel_abi::event as dev_event;
     use crate::kernel::ipc::event;
@@ -1789,6 +1802,19 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
         //    OBSERVE gate for the consumer ops is applied upstream by
         //    `check_privileged_internal_op`; TLM_EMIT is ungated. ──
         resource::ELASTIC_ALLOC => handle_elastic_alloc(arg, arg_len),
+        // A module provider's refusal of a pool it serves, counted by the
+        // ledger; `module_deny` admits the pool's server alone.
+        resource::LEDGER_DENY => {
+            if arg.is_null() || arg_len < 2 {
+                return E_INVAL;
+            }
+            // SAFETY: `arg_len >= 2` checked above.
+            let pool = u16::from_le_bytes(unsafe { [*arg, *arg.add(1)] });
+            crate::kernel::sys::resource_ledger::module_deny(
+                pool,
+                scheduler::current_module_index(),
+            )
+        }
         telemetry::TLM_EMIT
         | telemetry::TLM_SUBSCRIBE
         | telemetry::TLM_DRAIN
@@ -2766,6 +2792,55 @@ unsafe fn kernel_query_dispatch(handle: i32, key: u32, out: *mut u8, out_len: us
                 // The same encoder the `OWNER_RELEASED` notification uses, so
                 // a provider can compare the two records directly.
                 let record = crate::kernel::module::provider::encode_owner_record(owner);
+                core::ptr::copy_nonoverlapping(record.as_ptr(), out, record.len());
+                record.len() as i32
+            }
+            dev_query_key::CALLER_MODULE => {
+                if out.is_null() || out_len < 8 {
+                    return E_INVAL;
+                }
+                let caller = crate::kernel::exec::scheduler::caller_module_index();
+                // As CALLER_OWNER: nobody is calling when nothing is on the
+                // provider stack.
+                if caller >= crate::kernel::exec::scheduler::module_slots() {
+                    return errno::ESRCH;
+                }
+                let gen = crate::kernel::exec::scheduler::module_slot_generation(caller);
+                let record = module_record(caller as u16, gen);
+                core::ptr::copy_nonoverlapping(record.as_ptr(), out, record.len());
+                record.len() as i32
+            }
+            dev_query_key::MODULE_LIVE => {
+                if out.is_null() || out_len < 8 {
+                    return E_INVAL;
+                }
+                let mut rec = [0u8; 8];
+                core::ptr::copy_nonoverlapping(out as *const u8, rec.as_mut_ptr(), 8);
+                let idx = u16::from_le_bytes([rec[0], rec[1]]) as usize;
+                let gen = u32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]);
+                let live = idx < crate::kernel::exec::scheduler::module_slots()
+                    && crate::kernel::exec::scheduler::module_slot_generation(idx) == gen
+                    && !crate::kernel::exec::scheduler::module_is_finished(idx);
+                i32::from(live)
+            }
+            dev_query_key::EVENT_OWNER => {
+                if out.is_null() || out_len < 8 {
+                    return E_INVAL;
+                }
+                let (tag, _) = crate::kernel::ipc::fd::untag_fd(handle);
+                if handle < 0 || tag != crate::kernel::ipc::fd::FD_TAG_EVENT {
+                    return E_INVAL;
+                }
+                let slot = crate::kernel::ipc::fd::slot_of(handle);
+                let Some(owner) = crate::kernel::ipc::event::event_owner(slot) else {
+                    return errno::ENOENT;
+                };
+                let idx = owner as usize;
+                if idx >= crate::kernel::exec::scheduler::module_slots() {
+                    return errno::ENOENT;
+                }
+                let gen = crate::kernel::exec::scheduler::module_slot_generation(idx);
+                let record = module_record(owner, gen);
                 core::ptr::copy_nonoverlapping(record.as_ptr(), out, record.len());
                 record.len() as i32
             }

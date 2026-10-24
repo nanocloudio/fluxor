@@ -56,6 +56,7 @@ pub mod export_hashes {
     pub const MODULE_PROVIDES_CONTRACTS: u32 = 0x199e2fd8; // "module_provides_contracts"
     pub const MODULE_PROVIDER_SELECTOR: u32 = 0xfd70b311; // "module_provider_selector"
     pub const MODULE_OBSERVES_OWNER_RELEASE: u32 = 0x3dc0c8a1; // "module_observes_owner_release"
+    pub const MODULE_SAMPLES_POOL: u32 = 0x479835c4; // "module_samples_pool"
     pub const MODULE_FLASH_STORE_DISPATCH: u32 = 0x2f7172b5; // "module_flash_store_dispatch"
 }
 /// Module table magic: "FXMT"
@@ -389,6 +390,11 @@ struct ProviderAutoRegister {
     /// to reclaim them when the consumer's owner is torn down; one that holds
     /// nothing per-consumer omits the export and is never called.
     observes_owner_release: bool,
+    /// Present when the module exports `module_samples_pool`, the marker
+    /// that has the resource ledger ask it for the in-use figure of a pool it
+    /// serves (`resource::POOL_SAMPLE`). A provider serving no
+    /// module-provided pool omits it and is never asked.
+    samples_pool: bool,
 }
 impl ProviderAutoRegister {
     /// Look for the `module_provides_contract` + `module_provider_dispatch`
@@ -430,12 +436,16 @@ impl ProviderAutoRegister {
         let observes_owner_release = module
             .get_export_addr(export_hashes::MODULE_OBSERVES_OWNER_RELEASE)
             .is_ok();
+        let samples_pool = module
+            .get_export_addr(export_hashes::MODULE_SAMPLES_POOL)
+            .is_ok();
         Some(Self {
             contract_fn,
             contracts_fn,
             dispatch_fn: fn_ptr_from_addr(dispatch_addr),
             selector_fn,
             observes_owner_release,
+            samples_pool,
         })
     }
     /// Register this module as a provider. Called after module_new() Ready.
@@ -491,6 +501,12 @@ impl ProviderAutoRegister {
             let orc = crate::kernel::module::provider::register_owner_release_observer(module_idx);
             if orc != 0 {
                 log::warn!("[inst] {name} owner-release subscribe failed rc={orc}");
+            }
+        }
+        if self.samples_pool {
+            let src = crate::kernel::module::provider::register_pool_sampler(module_idx);
+            if src != 0 {
+                log::warn!("[inst] {name} pool-sampler mark failed rc={src}");
             }
         }
     }

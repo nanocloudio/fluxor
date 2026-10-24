@@ -1564,9 +1564,15 @@ pub fn store_dynamic_module(idx: usize, dm: DynamicModule) {
     }
     // SAFETY: scheduler-thread-only mutation; idx bounded.
     unsafe {
+        // No generation bump here, unlike `store_builtin_module`: this stores
+        // a module whose `module_new` has already run (the pending load path,
+        // `try_complete`), and anything it opened there was stamped with the
+        // slot's current generation — bumping now would make its own
+        // occupancy look stale (`query_key::MODULE_LIVE`). The slot's previous
+        // occupant already moved the generation when it vacated (owner free,
+        // rollback, restart, graph reset), as on the synchronous load path,
+        // which stores the module without a bump too.
         SCHED.modules[idx] = ModuleSlot::Dynamic(dm);
-        // See store_builtin_module — same rationale.
-        SCHED.slot_generation[idx] = SCHED.slot_generation[idx].wrapping_add(1);
     }
 }
 

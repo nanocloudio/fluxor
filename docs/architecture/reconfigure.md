@@ -109,6 +109,41 @@ compares an owner it stamped against the one being released without
 reformatting either. Compare BOTH fields: slots are reused, and matching on the
 slot alone closes the live resources of whoever replaced the dead owner.
 
+## Reporting a Pool the Provider Serves
+
+A pool can be served by a module provider instead of a kernel table — the
+store's subscriptions (`POOL_STORE_SUBS`) when a module provides
+`storage.namespace` (`resource::module_provided_pool_contract`). The resource
+ledger keeps no counters; it samples each pool from its owner, so for such a
+pool it asks the provider. Opt in with a second marker:
+
+```rust
+#[no_mangle]
+#[link_section = ".text.module_samples_pool"]
+pub extern "C" fn module_samples_pool() -> u32 {
+    1
+}
+```
+
+As with the owner-release marker, the loader reads it after provider
+registration succeeds, refuses it from a module that registers no contract,
+and drops it with the module's provider layers. The node's server of the pool
+is the system owner's top-most unkeyed layer of its contract.
+
+In each PSTATUS round (`resource_ledger::emit_all`) the kernel calls that
+provider's `module_provider_dispatch` with `resource::POOL_SAMPLE` (`0x0C25`),
+`handle = -1`, `arg = [pool: u16 LE]`. Answer the pool's in-use figure in its
+own unit (`>= 0`), or a negative errno when you cannot say. The handler runs on
+the scheduler thread in a provider frame and must be bounded — answer a count
+you keep. The ledger keeps the answer until the next round, so a refusal or a
+stats read between rounds never calls back into the provider.
+
+Count each refusal of the pool (a request answered `ENOMEM` for want of
+capacity) with `provider_call(-1, resource::LEDGER_DENY, [pool: u16 LE])`
+(`0x0C24`). The kernel admits it only from the pool's current server
+(`EACCES` from anyone else, `EINVAL` for a pool no module provides); it counts
+the denial and pushes the pool's `POOL` record like one of its own.
+
 The notification runs before any teardown, on the scheduler thread, inside a
 provider frame — the owner handle still resolves, the provider's state is still
 live, and a handler may make syscalls exactly as it would in a normal step. It

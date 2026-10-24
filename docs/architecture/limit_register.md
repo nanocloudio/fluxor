@@ -49,6 +49,8 @@ kernel-vm    | feature = "kernel-vm"
 no-kernel-vm | not(feature = "kernel-vm")
 rp2350-chip  | all(feature = "rp", not(feature = "chip-rp2040"))
 rsa-vault    | feature = "rsa-vault"
+rp2350-abi   | fluxor_abi = "thumbv8m"
+non-rp2350-abi | not(fluxor_abi = "thumbv8m")
 off-host     | not(target_arch = "aarch64")
 linux        | feature = "host-linux"
 non-linux    | not(feature = "host-linux")
@@ -116,6 +118,7 @@ ip::MAX_LOCAL_ADDRS <= 4096 | modules/sdk/abi/config.rs
 http::ARENA_WORKING_SET_CONNS <= http::MAX_CONCURRENT_CONNS | modules/sdk/abi/config.rs
 tcp::MSS as usize + 14 + 20 + 20 <= MAX_FRAME_SIZE | modules/foundation/ip/mod.rs
 MAX_PACKET_HOLD <= (1usize << abi::contracts::net::packet::PKT_SLOT_BITS) | modules/foundation/ip/mod.rs
+HO_SRC_ENTRIES >= tcp::SYN_COOKIE_WATERMARK as usize * 2 | modules/foundation/ip/mod.rs
 CAPACITY >= PSTATUS_ROUND | src/kernel/sys/telemetry_ring.rs
 ```
 
@@ -172,6 +175,7 @@ CAPACITY >= PSTATUS_ROUND | src/kernel/sys/telemetry_ring.rs
 | RSA public exponent width | `RSA_EXPONENT_BITS_MAX` | modules/sdk/crypto/rsa.rs | 32 | Policy: the exponent a public operation walks; 65537 needs 17 bits, and a key whose exponent is wider is refused rather than exponentiated at length |
 | fat32 open files | `MAX_OPEN_FILES` | modules/foundation/fat32/mod.rs | — | Policy, per-profile (256 aarch64 / 8 elsewhere): a multi-tenant node runs several independent consumers against one volume at once, where a microcontroller's consumer set is fixed and each handle costs a scratch buffer. An open past the table is refused ENFILE, with a log line naming the handles that hold it. The `max_open_per_owner` parameter adds a per-owner ceiling on top, refusing the owner that is over its share while the table still has room, so the failure lands on the workload at fault rather than on whoever asks next |
 | fat32 directory-walk budget | `DIR_SCAN_BUDGET_SECTORS` | modules/foundation/fat32/mod.rs | — | Policy, per-profile (32 aarch64 / 6 elsewhere, a quarter of `CACHE_SLOTS`): cached directory sectors one `provider_call` walks before returning EAGAIN with its position saved; a sector not cached parks the walk on it while its read lands. A walk pins the slots it touched for the rest of its call, so the budget leaves the rest of the cache to the commit that follows. A directory with thousands of entries is not exotic — a WAL that segments per snapshot fills one — so an unbounded walk is a latent stall of every module sharing the lane, not a slow path |
+| fat32 parked directory walks | `DIR_CURSOR_POOL` | modules/foundation/fat32/mod.rs | 4 | Policy: walks that ran out of budget kept beside the working cursor, so a lookup of another name in between does not restart them. With one cursor, two callers looking up different names in a directory larger than the budget restart each other on every call and neither finishes — a volume root holding a store's runs and a log's segments is such a directory. A walk that finds no free slot is not parked and restarts when asked again: a rescan, never a wrong answer. Evicting a parked walk instead would let more walkers than slots evict each other every round, while the parked ones here finish and free their slots |
 | fat32 long-name length | `LFN_MAX_CHARS` | modules/foundation/fat32/mod.rs | 64 | Policy: the format allows 255, but a buffer for that is carried in the directory cursor and in every wanted-name argument, on a board whose whole module state is measured against a 240 KiB arena. A longer name is refused at creation, not clipped. Names longer than this that were written elsewhere are still preserved and retired correctly — preservation walks the companion run without decoding it, so only matching and generation are bounded |
 | fat32 free-cluster scan | `FAT_SCAN_BUDGET_SECTORS` | modules/foundation/fat32/mod.rs | 32 | Policy: FAT sectors one `provider_call` reads looking for a free cluster before returning EAGAIN with its cursor saved. Matches `DIR_SCAN_BUDGET_SECTORS` for the same reason — a synchronous device read inside a dispatch is charged to the cooperative step budget, and the FAT of a large volume is far too big to walk in one |
 | fat32 walk time | `CALL_BUDGET_US` | modules/foundation/fat32/mod.rs | 400 | Policy: microseconds one `provider_call` or step spends walking a directory or the FAT before returning EAGAIN, alongside the two sector budgets. A sector count alone assumes a device speed, and one sector read costs from microseconds to milliseconds by device and power state. Every walk reads at least one sector per call, so a slow device still makes progress |
@@ -190,6 +194,8 @@ CAPACITY >= PSTATUS_ROUND | src/kernel/sys/telemetry_ring.rs
 | nvme pager bulk ring | `ASYNC_BULK_SLOTS` | modules/drivers/nvme/mod.rs | 8 | Policy: pager bulk commands in flight, each owning `MAX_BULK_PAGES` of contiguous DMA |
 | nvme held completions | `HELD_MAX` | modules/drivers/nvme/mod.rs | 8 | Policy: completions a synchronous request takes off queue 0 and holds for their owner (a stream read's) to reach its own behind them; past it the request waits for the owner to consume them |
 | nvme pager bulk transfer | `MAX_BULK_PAGES` | modules/drivers/nvme/mod.rs | 32 | Policy: 4 KiB pages one pager bulk command moves through its PRP list (128 KiB) |
+| nvme I/O queue entries | `IO_Q_ENTRIES` | modules/drivers/nvme/mod.rs | 64 | Sized, not chosen: one 4 KiB DMA page of 64-byte submission entries — each I/O submission and completion queue is a single `PAGE` allocation — programmed zero-based into Create I/O SQ/CQ and not checked against the controller's `CAP.MQES` (read at bring-up and unused). Every in-flight bound on queue 0 is held under it: its worst case (the channel pipeline, the bulk ring, a pager command, the stream read, the barrier Flush, every preflush and v1 slot) is asserted below it by the harness test `v1_queue_zero_cannot_overflow`, and the pipeline depth is clamped to one less so a full ring never reads as empty |
+| nvme admin queue entries | `ADMIN_Q_ENTRIES` | modules/drivers/nvme/mod.rs | 64 | Sized, not chosen: one 4 KiB DMA page of 64-byte entries, as the I/O queues. Bring-up issues admin commands one at a time, each waited out (or failed at `ADMIN_CMD_BUDGET_MS`) before the next, so the ring never holds more than one; its depth is the page, not a demand |
 | file_block requests in flight | `QUEUE_DEPTH` | modules/foundation/file_block/mod.rs | 8 | Policy: requests a `SUBMIT` has queued — waiting, running, or done and awaiting `REAP`; the queue depth the source reports. A `SUBMIT` past it is refused EAGAIN |
 | file_block blocks per request | `MAX_BLOCKS` | modules/foundation/file_block/mod.rs | 64 | Policy: bounds the file I/O one request's resumable job moves |
 | file_block image path | `PATH_CAP` | modules/foundation/file_block/mod.rs | 96 | Policy: the longest image path the `path` parameter holds; a longer one is truncated at parse and fails to open |
@@ -198,6 +204,7 @@ CAPACITY >= PSTATUS_ROUND | src/kernel/sys/telemetry_ring.rs
 | crypt_block lower block | `MAX_LOWER_BLOCK` | modules/foundation/crypt_block/mod.rs | 4096 | Policy: the largest lower logical block the metadata read-modify-write buffer holds; a larger lower device is refused at mount |
 | crypt_block requests awaiting reap | `QUEUE_DEPTH` | modules/foundation/crypt_block/mod.rs | 8 | Policy: completions a `SUBMIT` queues for `REAP`; the queue depth the source reports |
 | crypt_block journal records | `MAX_JOURNAL_RECORDS` | modules/foundation/crypt_block/mod.rs | 64 | Policy: journal records indexed in memory until they are home (half the largest journal). A full journal runs a flush cycle before the next write |
+| crypt_block journal ciphertext cache | `JOURNAL_CACHE` | modules/foundation/crypt_block/mod.rs | — | Policy, per ABI (`MAX_JOURNAL_RECORDS`, so 64 units — 256 KiB of `MAX_UNIT` ciphertext — everywhere but the rp2350's `thumbv8m`, which keeps 0): journal slots whose ciphertext stays in memory once written, so a journal cycle writes it home without reading it back. A slot it does not hold is read back from the lower device — over a remote volume a round trip per unit — so nothing is refused past it; the cycle is only slower |
 | crypt_block nonce reservation | `NONCE_STRIDE` | modules/foundation/crypt_block/mod.rs | 1048576 | Policy: nonce sequences reserved per superblock write. A restart abandons the unused rest of a range, so the stride trades superblock writes against wasted sequences out of 2^64 |
 | crypt_block key label | `KEY_LABEL_CAP` | modules/foundation/crypt_block/mod.rs | 64 | Mirrors the vault's `MAX_LABEL` |
 | crypt_block rotation batch | `MIGRATE_BATCH` | modules/foundation/crypt_block/mod.rs | 8 | Policy: units a data-key rotation re-seals, or metadata blocks its retirement scan reads, in one module step; bounds the rotation's share of a step while the volume stays mounted |
@@ -230,11 +237,13 @@ CAPACITY >= PSTATUS_ROUND | src/kernel/sys/telemetry_ring.rs
 | TLS retransmission window | `RETX_BUF_SIZE` | modules/foundation/tls/mod.rs | 4096 | Policy: the encrypted frames TLS has written to `cipher_out`, retained so `MSG_RETRANSMIT` replays them without re-encryption |
 | TLS inbound frames per step | `TLS_INBOUND_DRAIN_BUDGET` | modules/foundation/tls/mod.rs | 8 | Policy: deliberately below `ip`'s 32 RX budget. A larger drain lengthens every step, which costs the latency-bound paths — single-connection keepalive throughput is 1/latency and handshakes are round-trip bound — and buys nothing once the queue is cleared each tick |
 | TLS cleartext passthroughs | `MAX_PASSTHROUGH` | modules/foundation/tls/mod.rs | — | Derived, not chosen: `MAX_SESSIONS`. A server-mode instance relays each backend dial its clear-side consumer makes raw, keyed by the dial's full u16 conn id, and each such dial serves a front connection that holds a session. The table is resident at 4 bytes an entry — 2 KiB at 512 on aarch64, 4 bytes at 1 embedded — where an exact bitmap of the id space would be 8 KiB per instance. A server-mode `CMD_CONNECT_TO` that finds it full is refused `ENOMEM` on its own tag before anything goes upstream, so a completion always finds a free entry; an entry ends on `MSG_CLOSED`, `CMD_CLOSE`, an established `MSG_ERROR`, or a new connection under its id |
+| TLS session grant | `SESSION_CHUNK` | modules/foundation/tls/mod.rs | 8 | Policy, per-profile (8 aarch64 / `MAX_SESSIONS` elsewhere): sessions per grant of the chunked session pool. On aarch64 the first chunk is inline and the rest are granted from the kernel elastic region one chunk (~104 KiB, two grant quanta) at a time as accepts arrive, so an idle stack pays for one chunk; elsewhere the whole pool is the inline chunk and nothing is granted. A grant the region denies is pool-full, the same as `MAX_SESSIONS`: the accept is closed. Const-asserted to tile `MAX_SESSIONS` exactly |
 | QUIC peer authority | `MAX_AUTHORITY` | modules/foundation/quic/mod.rs | — | Policy: `MAX_PEER_NAME` plus `:65535`. The instance keeps one peer authority; a longer one is refused at construction |
 | QUIC peer name | `MAX_PEER_NAME` | modules/foundation/quic/mod.rs | 64 | Policy: the longest DNS name a QUIC peer may be dialled by, and the SNI and `dNSName` the handshake checks. The datagram surface carries up to 253 bytes; the module sizes this for the state budget and refuses rather than truncates, because a clipped name verifies against the wrong certificate |
 | QUIC peer certificate | `MAX_CERT_LEN` | modules/foundation/quic/mod.rs | 1024 | Policy: the per-certificate ceiling for the configured leaf and each trust anchor. An anchor past it, or a ninth anchor, marks the table refused and the instance declines to construct |
 | QUIC configured ALPN list | `MAX_ALPN_CFG` | modules/foundation/quic/mod.rs | 64 | Policy: the comma-separated protocol tokens a graph configures (`mqtt,h3`); 64 bytes holds several names with their separators |
 | QUIC resumption tickets | `MAX_TICKETS` | modules/foundation/quic/mod.rs | 4 | Policy: the client-side ticket cache. Each entry is bound to the authority that issued it, so the table holds a handful of recently dialled peers and the oldest is displaced rather than grown |
+| QUIC ticket replay claims | `TICKET_SEEN` | modules/foundation/quic/mod.rs | 64 | Policy: resumption tickets claimed against replay (RFC 8446 §8, RFC 9001 §9.2), each held for its ticket's whole lifetime (7200 s) and never reclaimed under pressure — that window is where a replay lands. Every resumption takes a claim, not only one carrying early data, since a ticket accepted twice also correlates two connections as one client. A full store refuses the resumption and the handshake completes in full — slower, never unprotected. It bounds resumptions per ticket lifetime: more of them means a shorter lifetime, not a wider replay window |
 | QUIC transparent stream read | `TRANSPARENT_READ_MAX` | modules/foundation/quic/mod.rs | 1200 | Policy: the most one read of the no-ALPN byte stream takes from `app_in`, one packet's worth. It is read only while the stream's send buffer has room for a whole read, so `app_in` backs up rather than losing bytes |
 | DNS pending forwarded queries | `MAX_PENDING` | modules/foundation/dns/mod.rs | 8 | Policy: with every slot live and unexpired, a new query is answered SERVFAIL rather than displacing accepted work |
 | DNS configured host entries | `MAX_HOSTS` | modules/foundation/dns/mod.rs | 16 | Policy: `host=` parameters past the table are ignored at parse |
@@ -265,8 +274,10 @@ CAPACITY >= PSTATUS_ROUND | src/kernel/sys/telemetry_ring.rs
 | OTA image layers | `MAX_LAYERS` | modules/foundation/ota_registry/mod.rs | 48 | Policy: sized to the 48-module fleet profile; a larger manifest is refused whole |
 | SMMU DMA map table | `MAX_DMA_MAPS` | modules/foundation/smmu/mod.rs | 32 | Policy: a map past the translation table is refused ENOMEM before any MMIO write |
 | QUIC continuity shadow slots | `MAX_SHADOW_SLOTS` | modules/foundation/quic/continuity.rs | 2 | Policy: connections under CT_QUIC takeover at once, one per slot. Continuity is a control-plane event, not steady state, and each shadow stages a whole connection's worth of state; a PAIR_PREPARE past the free slots is refused `STATUS_NO_CAPACITY` |
+| QUIC strict receive horizon | `CONT_RECV_HOLD` | modules/foundation/quic/connection.rs | 16 | Policy: inbound 1-RTT packet numbers a strict-continuity connection holds unacknowledged until the standby confirms the mirror, so the acknowledgement the peer sees never runs ahead of what a takeover could honour. A burst past it is not a loss: the mirror is abandoned, which the coordinator learns of, rather than the horizon silently dropping a number |
 | QUIC continuity checkpoint record | `CHECKPOINT_RECORD_MAX` | modules/foundation/quic/continuity.rs | 49152 | Sized, not chosen: holds the full serialized connection state — six bidi (4096 send + 1500 receive) and nine uni (256+256) stream buffers, the 1-RTT CRYPTO send buffer, the retained last-emitted packet, the sealed secret set, and the fixed header, with headroom. A checkpoint whose `total_len` exceeds it is refused `STATUS_NO_CAPACITY` at CHECKPOINT_BEGIN and the shadow is discarded |
 | ARP-wait handshake list | `ARP_WAIT_MAX` | modules/foundation/ip/mod.rs | 64 | Policy: handshakes remembered as waiting on neighbour resolution, so an ARP reply retries exactly those rather than walking the connection table. A full list only defers the retry to the timer sweep's next slice |
+| half-open source tracking | `HO_SRC_ENTRIES` | modules/foundation/ip/mod.rs | — | Derived, not chosen: the per-source half-open gauge, sized against the half-open ceiling at the 2:1 the connection index keeps — `tcp::MAX_TCP_CONNS` on tables of 4096 or more, 16 on smaller ones — because a SYN flood is distinct sources by definition, and a full table has no free entry to stop a probe at, so the gauge would go blind during exactly the flood it measures. Eight bytes an entry. Const-asserted a power of two and at least twice `tcp::SYN_COOKIE_WATERMARK`. A half-open connection from a source the table cannot track is still admitted, and counted in `ho_src_untracked` so the blind spot is visible |
 | GEM RX descriptors | `RX_DESC_COUNT` | modules/drivers/rp1_gem/mod.rs | 192 | Policy: the burst the Pi 5 MAC absorbs between two driver steps; a step drains the whole ring. The platform DMA arena holds 256 buffers shared with the 64 TX descriptors. The rings are walked with free-running `u16` positions under a `position % count` index, and those positions wrap at the largest multiple of the ring size a `u16` holds rather than at 65,536 (`rp1_gem/ring.rs`), so the index stays continuous across the wrap and a size that does not divide 65,536 is safe |
 | fan frames per step | `FAN_FRAMES_PER_STEP` | src/kernel/exec/scheduler/module_types.rs | 64 | Policy: whole frames a framed `_tee` or `_merge` moves in one step. A fan sits between a producer and its consumers, so this times the tick rate is the ceiling on every fanned port — `debug: to: net` fans the ip module's consumer ports, and every accept, delivery and send on that graph crosses one |
 | free-slot rebuild slice | `ALLOC_SCAN_SLICE` | modules/foundation/ip/mod.rs | 256 | Policy: slots one step examines to rebuild the free stack when it is empty — the table is full, or a slot was released by a path that did not push it. Allocation is a pop; a SYN at the ceiling costs this slice once per step and is refused, never a walk of the table per SYN |
@@ -290,8 +301,10 @@ CAPACITY >= PSTATUS_ROUND | src/kernel/sys/telemetry_ring.rs
 | Object LIST page | `LIST_PAGE_MAX` | modules/sdk/contracts/storage/object.rs | 1000 | Policy: entries one `storage.object` `LIST` call may return — S3's own `MaxKeys` ceiling, and the bound on one call's work. A request outside 1..=1000 is `EINVAL` |
 | Storage key and entry name | `STORAGE_KEY_MAX` | modules/sdk/contracts/storage/handle.rs | 255 | Wire width: the `u8` `name_len` and trailing `cursor_len` of a `storage.namespace` LIST page, so it is also the longest key a store creates, the longest cursor on both listing surfaces (the cursor is the last name returned), the longest `storage.object` LIST prefix, and what the gateway's argument copy is sized to carry. A provider meeting a longer name in a range it lists refuses the page `EOVERFLOW` rather than skip it. One bound for one concept: the Linux and `bcm2712` key stores size their keys by it directly |
 | Namespace path | `PATH_MAX` | modules/sdk/contracts/storage/namespace.rs | 1024 | Policy: the longest `storage.namespace` LIST prefix or LOOKUP path. A path is not a name: a directory-shaped provider's prefix is a host directory at any depth, while each name below it stays within `STORAGE_KEY_MAX`. Namespace ops are not walked by the gateway, so the bound costs no gated stack |
+| Namespace change-feed token | `TOKEN_MAX` | modules/sdk/contracts/storage/namespace.rs | 320 | Policy: the longest `CHANGES` continuation token — a provider's relist cursor (a kind byte, a pinned revision and a `STORAGE_KEY_MAX` key: 264 bytes) with room for one that carries more. A request carrying a longer token does not parse, and a page is written with room reserved for a trailer token up to this length, so a page can always be finished. Contract surface, under the ABI digest |
 | Private regions per gated module | `MAX_PRIVATE` | src/kernel/module/gateway.rs | 3 | Sanity bound: state, heap and stack on an MMU target; one combined region on an MPU target. A pointer a gated module passes must lie in one of them |
 | Gateway argument copy | `WALK_MAX` | src/kernel/module/gateway.rs | 544 | Derived, not chosen: the largest walked request, an object `LIST` with a prefix and a cursor of `STORAGE_KEY_MAX` bytes each (`REQUEST_FIXED_LEN + 2 * STORAGE_KEY_MAX`, rounded up to 16). Stack-resident per gated call |
+| Gated provider handles | `SLOTS` | src/kernel/module/gateway.rs | 128 | Policy: provider handles minted to gated callers, one kernel-wide table across every gated module. A gated module may name only a handle the kernel returned to it, so a handle that cannot be minted is unusable: the open is answered `ENOSPC`, with a warning naming the module |
 | Remote channels per instance | `MAX_CHANNELS` | modules/foundation/remote_channel/wire.rs | 8 | Policy: each channel is a port pair, a reassembly region, a send state and on `quic` a stream; the manifest declares eight port pairs. A longer table is refused at construction |
 | Remote-channel content-type name | `CT_NAME_MAX` | modules/foundation/remote_channel/wire.rs | 32 | Sanity bound: longer than any name in the content-type registry; a longer name in `channels` is refused |
 | Remote-channel table frame | `HELLO_MAX` | modules/foundation/remote_channel/wire.rs | 302 | Derived, not chosen: the whole channel table at `MAX_CHANNELS` entries of `CT_NAME_MAX` names, and the exchange endpoint's side byte |
@@ -307,6 +320,7 @@ CAPACITY >= PSTATUS_ROUND | src/kernel/sys/telemetry_ring.rs
 | Grants on a guarded store | `DEFAULT_RESERVES` | src/kernel/config.rs | — | Policy, sized at boot (the `store_grants` pool, its default in `DEFAULT_RESERVES`): capability grants presented to the Linux store at once, the plan's `store_grants` ceiling (`DEFAULT_RESERVES`, or the envelope's entry). A presentation past it is `ENOMEM`, counted against the pool; none is evicted, because an evicted grant is a caller whose next operation silently starts failing |
 | Staged streaming write | `STORE_STAGE_MAX` | src/platform/linux/store.rs | 67108864 | Policy: 64 MiB, the bytes one `PUT_STREAMED_*` write may stage before its commit. The store keeps objects in memory, so an open stream is the one place a caller can take the node's memory without committing anything; past it the write is `ENOSPC`. A provider for bulk objects stages to disk and carries no such bound |
 | Streaming-write size hint | `STORE_STAGE_RESERVE_MAX` | src/platform/linux/store.rs | 1048576 | Policy: 1 MiB, the most a `PUT_STREAMED_OPEN` size hint may reserve up front. The hint is the caller's, so it is advice and not an allocation request; past this the staging buffer grows as the bytes arrive |
+| Linux store change scan | `CHANGES_SCAN_BUDGET` | src/platform/linux/store.rs | 4096 | Policy: history entries one `CHANGES` call walks, and keys one relist page walks — the per-call budget the contract asks a provider to state. A call that spends it answers `more` with a continuation token and the caller asks again, so a long history or a wide prefix is many short calls, never one long one |
 
 ## Tables, arenas and budgets
 
@@ -351,6 +365,7 @@ cannot be evaluated from its own file reads `—` and says why.
 | Linux net resolver cache | `DNS_CACHE_SLOTS` | src/platform/linux/providers.rs | 32 | Policy: names one Linux `net` instance keeps a resolved answer for, each for `DNS_CACHE_TTL` (60 s). A name past it evicts the entry soonest to expire, an expired one first, and the evicted name is resolved again on its next dial: past it a dial costs a lookup, never a failure |
 | Linux net dial candidates | `MAX_DIAL_CANDIDATES` | src/platform/linux/providers.rs | 4 | Policy: addresses one name is dialled at. Every address `getaddrinfo` returns is taken, interleaved by family, then cut to four, so a host that answers several addresses of one family ahead of the other is dialled over both; the cache holds the same four. An address past them is never tried: when all four fail the dial ends in one `MSG_ERROR` carrying the last connect errno |
 | Linux net accepts per step | `PER_TICK_ACCEPT_BUDGET` | src/platform/linux/providers.rs | 32 | Policy: connections accepted from one listener in one step, so a 32-client connect burst clears in one pass while no burst owns the step. A connection past it waits in the kernel's listen backlog and is accepted on a later step, the epoll set being level triggered |
+| Linux net boot lanes | `LINUX_NET_MAX_INBOUND` | src/platform/linux/providers.rs | 8 | Policy: command lanes (`to: linux_net.net_in` edges, one per producer in wiring order) one Linux `net` instance collects at boot, each with its own events channel, pending control queue and commanding owner. Boot reads lane ports 0–7 only, so a ninth such edge is never read; lanes a workload attaches at runtime are the separate `LINUX_NET_MAX_ATTACHED` (32), numbered after these |
 | Workload open files | `OWNER_MAX_OPEN_FILES` | src/kernel/workload/storage.rs | 32 | Policy: files one workload holds open through its storage root at once, on every platform, so no workload can take the file table the node and every other workload open from; an open past it is `ENOMEM` |
 | Workload store watches | `DEFAULT_RESERVES` | src/kernel/config.rs | — | Policy, sized at boot (the `owner_store_subs` pool, its default in `DEFAULT_RESERVES`): `SUBSCRIBE` watches one workload's own store holds at once (the envelope's entry, else the default). Each owner's store has handle tables of its own, sized for one tenant rather than the node; a watch past it is `ENOMEM`, counted and named |
 | Workload store reads | `DEFAULT_RESERVES` | src/kernel/config.rs | — | Policy, sized at boot (the `owner_store_reads` pool, its default in `DEFAULT_RESERVES`): `GET` read slots one workload's own store holds open at once; a read past it is `ENOMEM` |
@@ -396,6 +411,7 @@ cannot be evaluated from its own file reads `—` and says why.
 | bcm2712 store read slots | `DEFAULT_RESERVES` | src/kernel/config.rs | — | Policy, sized at boot (the `store_reads` pool, by default 32) and carved: `GET` read slots open at once on the bcm2712 store; an open past it is `ENOMEM` |
 | bcm2712 store objects | `MAX_OBJECTS` | src/platform/bcm2712/store.rs | 512 | Policy: objects the bcm2712 control-plane store holds. No pool names them, so this is their size; the table (~2.2 MiB) is carved at boot from the device tree's DRAM zone rather than linked into `.bss`. A PUT past it is `ENOMEM`, never an eviction |
 | bcm2712 store value | `MAX_VALUE` | src/platform/bcm2712/store.rs | 4096 | Policy: the largest value one bcm2712 store object holds, matching `store_effect`'s own |
+| bcm2712 store change history | `HISTORY` | src/platform/bcm2712/store.rs | 128 | Policy: revisions the bcm2712 store retains for `CHANGES`, one entry per revision. A reader further behind than this is answered LOST and relists, rather than being handed a gap |
 | Cross-core channels | `MAX_CROSS_CHANNELS` | src/platform/bcm2712/multicore.rs | 256 | Format-bound: the ring-index DOMAIN, a `CrossDomainEdge` names its ring in a `u8`. The ring and cross-edge tables are sized from the graph when it is bridged (`size_cross`: one ring and one edge entry per edge whose endpoints are in different domains) and carved; a graph past the domain is refused at boot |
 | Device-tree blob | `MAX_BLOB` | src/kernel/boot/dtb.rs | 2097152 | Sanity bound: a header claiming a larger tree is refused and the platform keeps its fixed map. A board's tree is ~80 KiB (the Pi 5's), QEMU's 1 MiB at most |
 | Device-tree nesting | `MAX_DEPTH` | src/kernel/boot/dtb.rs | 16 | Sanity bound: node nesting the memory walk tracks (the Pi 5's tree nests 6 deep); a deeper tree is refused, not mis-read |
@@ -416,6 +432,7 @@ cannot be evaluated from its own file reads `—` and says why.
 | Pre-tick budget | `MAX_PRE_TICK_BUDGET_US` | src/kernel/exec/scheduler/mod.rs | 5 | Policy: the combined µs every pre-tick module of a domain may take before the cooperative pass |
 | Interned module names | `MAX_NAMES` | src/kernel/exec/scheduler/mod.rs | — | Derived, not chosen: one per module index (`MAX_MODULES`), since a graph cannot hold more distinct names |
 | Interned name length | `MAX_NAME_LEN` | src/kernel/exec/scheduler/mod.rs | 32 | Policy: bytes of one interned module name |
+| Buffer groups | `BUFFER_GROUPS` | src/kernel/exec/scheduler/mod.rs | — | Derived, not chosen: the `buffer_group` values the scheduler's per-group tables span (`ring_size::buffer_groups`) — the whole `u8` (256) where the edge domain exceeds 128, half of it elsewhere, where those tables are on the stack. Groups 1–31 are the config's; from `RECORD_FAN_GROUP_FIRST` (32) up each is one edge around a record fan, so it bounds those edges per graph. A record fan that finds no free group fails graph preparation (`no buffer group left`); the composer's ring plan searches the same range (`tools/src/ring_plan.rs`) |
 | Secondary cores | `MAX_SECONDARY_CORES` | src/platform/bcm2712/multicore.rs | 3 | Hardware: the BCM2712's four Cortex-A76 cores, one the boot core |
 | Cross-core ring depth | `RING_SLOTS` | src/platform/bcm2712/multicore.rs | 8 | Policy: slots in one cross-core SPSC ring |
 | Cross-core slot | `SLOT_DATA_SIZE` | src/platform/bcm2712/multicore.rs | — | Derived, not chosen: one channel buffer (`CHANNEL_BUFFER_SIZE`) per cross-core ring slot |
@@ -481,6 +498,10 @@ cannot be evaluated from its own file reads `—` and says why.
 | QUIC sent-datagram ceiling | `QUIC_MAX_DATAGRAM_SIZE` | modules/foundation/quic/connection.rs | 1200 | Policy: what this endpoint will itself send, held under the MTU ceiling above so a datagram never depends on path discovery to arrive |
 | QUIC bidirectional send buffer | `BIDI_SEND_BUF` | modules/foundation/quic/connection.rs | 4096 | Policy: each byte a bidirectional (or the transparent) stream sends is held until the peer acknowledges it, so a lost packet is sent again; the buffer bounds that stream's bytes in flight to a few packets per round trip. An application write with no room is held and the command channel backs up, never refused or truncated |
 | QUIC unidirectional send buffer | `UNI_SEND_BUF` | modules/foundation/quic/connection.rs | 256 | Policy: as the bidirectional buffer, for a locally-opened unidirectional stream — typically a small control or metadata channel |
+| QUIC sent-packet ring | `SENT_PACKET_RING` | modules/foundation/quic/connection.rs | 16 | Policy: ack-eliciting packets one packet-number space tracks until they are acknowledged or declared lost (RFC 9002 §A.1), with what each 1-RTT packet carried so loss can requeue it. A live entry is never overwritten — an ACK must find it to credit `bytes_in_flight` back — so with the ring full no ack-eliciting packet is sent (a pending ACK still goes alone) until an acknowledgement or a loss frees a slot; a handshake-space probe timeout declares the oldest lost to free one. It therefore bounds packets in flight per space |
+| QUIC advertised stream window | `LOCAL_STREAM_WINDOW` | modules/foundation/quic/connection.rs | 262144 | Policy: the per-stream receive credit this endpoint advertises (`initial_max_stream_data_*`), re-advanced by a whole window once the application has acknowledged half of it (`stream_ack_credit`) — the transport never grants credit the application has not freed. It is credit, not memory: bytes past a stream's receive buffer are not taken and their packet goes unacknowledged, so the peer sends them again |
+| QUIC advertised connection window | `LOCAL_CONN_WINDOW` | modules/foundation/quic/connection.rs | 1048576 | Policy: the connection-level receive credit (`initial_max_data`), four stream windows, advanced the same way as the application's acknowledgements come in |
+| QUIC assumed peer stream window | `DEFAULT_PEER_STREAM_WINDOW` | modules/foundation/quic/connection.rs | 262144 | Policy: the send credit a stream assumes before the peer's transport parameters arrive — equal to what this endpoint advertises, so a peer on the same defaults is never under-served — and replaced by the peer's own values when they do. A stream at its credit stops and owes the peer a STREAM_DATA_BLOCKED |
 | SMMU stream ids | `MAX_STREAM_IDS` | modules/foundation/smmu/mod.rs | 8 | Policy: stream-id table entries one SMMU module programs; a device past it is refused |
 | TLS checkpoint SNI | `CKPT_SNI_MAX` | modules/foundation/tls/continuity.rs | 64 | Policy, wire-visible in the checkpoint record: a session whose server name is longer is not checkpointable, and is refused rather than truncated |
 | TLS checkpoint ALPN | `CKPT_ALPN_MAX` | modules/foundation/tls/continuity.rs | 16 | Policy, wire-visible in the checkpoint record: as the server-name ceiling above, for the negotiated protocol name |
@@ -613,6 +634,7 @@ MAX_OPEN_FILES | modules/foundation/fat32/mod.rs | 256 | host
 MAX_OPEN_FILES | modules/foundation/fat32/mod.rs | 8 | off-host
 DIR_SCAN_BUDGET_SECTORS | modules/foundation/fat32/mod.rs | 32 | host
 DIR_SCAN_BUDGET_SECTORS | modules/foundation/fat32/mod.rs | 6 | off-host
+DIR_CURSOR_POOL | modules/foundation/fat32/mod.rs | 4 | *
 LFN_MAX_CHARS | modules/foundation/fat32/mod.rs | 64 | *
 FAT_SCAN_BUDGET_SECTORS | modules/foundation/fat32/mod.rs | 32 | *
 CALL_BUDGET_US | modules/foundation/fat32/mod.rs | 400 | *
@@ -633,6 +655,8 @@ MAX_NLB | modules/drivers/nvme/mod.rs | 8 | *
 ASYNC_BULK_SLOTS | modules/drivers/nvme/mod.rs | 8 | *
 HELD_MAX | modules/drivers/nvme/mod.rs | 8 | *
 MAX_BULK_PAGES | modules/drivers/nvme/mod.rs | 32 | *
+IO_Q_ENTRIES | modules/drivers/nvme/mod.rs | 64 | *
+ADMIN_Q_ENTRIES | modules/drivers/nvme/mod.rs | 64 | *
 QUEUE_DEPTH | modules/foundation/file_block/mod.rs | 8 | *
 MAX_BLOCKS | modules/foundation/file_block/mod.rs | 64 | *
 PATH_CAP | modules/foundation/file_block/mod.rs | 96 | *
@@ -641,6 +665,8 @@ MAX_UNIT | modules/foundation/crypt_block/mod.rs | 4096 | *
 MAX_LOWER_BLOCK | modules/foundation/crypt_block/mod.rs | 4096 | *
 QUEUE_DEPTH | modules/foundation/crypt_block/mod.rs | 8 | *
 MAX_JOURNAL_RECORDS | modules/foundation/crypt_block/mod.rs | 64 | *
+JOURNAL_CACHE | modules/foundation/crypt_block/mod.rs | MAX_JOURNAL_RECORDS | non-rp2350-abi
+JOURNAL_CACHE | modules/foundation/crypt_block/mod.rs | 0 | rp2350-abi
 NONCE_STRIDE | modules/foundation/crypt_block/mod.rs | 1 << 20 | *
 KEY_LABEL_CAP | modules/foundation/crypt_block/mod.rs | 64 | *
 MIGRATE_BATCH | modules/foundation/crypt_block/mod.rs | 8 | *
@@ -674,11 +700,14 @@ RECV_BUF_SIZE | modules/foundation/tls/mod.rs | 4096 | off-host
 RETX_BUF_SIZE | modules/foundation/tls/mod.rs | 4096 | *
 TLS_INBOUND_DRAIN_BUDGET | modules/foundation/tls/mod.rs | 8 | *
 MAX_PASSTHROUGH | modules/foundation/tls/mod.rs | MAX_SESSIONS | *
+SESSION_CHUNK | modules/foundation/tls/mod.rs | 8 | host
+SESSION_CHUNK | modules/foundation/tls/mod.rs | MAX_SESSIONS | off-host
 MAX_AUTHORITY | modules/foundation/quic/mod.rs | MAX_PEER_NAME + 6 | *
 MAX_PEER_NAME | modules/foundation/quic/mod.rs | 64 | *
 MAX_CERT_LEN | modules/foundation/quic/mod.rs | 1024 | *
 MAX_ALPN_CFG | modules/foundation/quic/mod.rs | 64 | *
 MAX_TICKETS | modules/foundation/quic/mod.rs | 4 | *
+TICKET_SEEN | modules/foundation/quic/mod.rs | 64 | *
 TRANSPARENT_READ_MAX | modules/foundation/quic/mod.rs | 1200 | *
 MAX_PENDING | modules/foundation/dns/mod.rs | 8 | *
 UPSTREAM_AUTHORITY_MAX | modules/foundation/dns/mod.rs | 64 | *
@@ -710,8 +739,10 @@ MAX_OPEN | modules/foundation/mount/mod.rs | 64 | *
 MAX_LAYERS | modules/foundation/ota_registry/mod.rs | 48 | *
 MAX_DMA_MAPS | modules/foundation/smmu/mod.rs | 32 | *
 MAX_SHADOW_SLOTS | modules/foundation/quic/continuity.rs | 2 | *
+CONT_RECV_HOLD | modules/foundation/quic/connection.rs | 16 | *
 CHECKPOINT_RECORD_MAX | modules/foundation/quic/continuity.rs | 49152 | *
 ARP_WAIT_MAX | modules/foundation/ip/mod.rs | 64 | *
+HO_SRC_ENTRIES | modules/foundation/ip/mod.rs | if tcp::MAX_TCP_CONNS >= 4096 { tcp::MAX_TCP_CONNS } else { 16 } | *
 RX_DESC_COUNT | modules/drivers/rp1_gem/mod.rs | 192 | *
 FAN_FRAMES_PER_STEP | src/kernel/exec/scheduler/module_types.rs | 64 | *
 ALLOC_SCAN_SLICE | modules/foundation/ip/mod.rs | 256 | *
@@ -757,6 +788,10 @@ QUIC_DGRAM_MAX | modules/foundation/quic/connection.rs | 1500 | *
 QUIC_MAX_DATAGRAM_SIZE | modules/foundation/quic/connection.rs | 1200 | *
 BIDI_SEND_BUF | modules/foundation/quic/connection.rs | 4096 | *
 UNI_SEND_BUF | modules/foundation/quic/connection.rs | 256 | *
+SENT_PACKET_RING | modules/foundation/quic/connection.rs | 16 | *
+LOCAL_STREAM_WINDOW | modules/foundation/quic/connection.rs | 1 << 18 | *
+LOCAL_CONN_WINDOW | modules/foundation/quic/connection.rs | 1 << 20 | *
+DEFAULT_PEER_STREAM_WINDOW | modules/foundation/quic/connection.rs | 1 << 18 | *
 MAX_STREAM_IDS | modules/foundation/smmu/mod.rs | 8 | *
 CKPT_SNI_MAX | modules/foundation/tls/continuity.rs | 64 | *
 CKPT_ALPN_MAX | modules/foundation/tls/continuity.rs | 16 | *
@@ -833,8 +868,10 @@ CTRL_FRAME_MAX | src/platform/linux/providers.rs | 3 + crate::abi::contracts::ne
 DNS_CACHE_SLOTS | src/platform/linux/providers.rs | 32 | *
 MAX_DIAL_CANDIDATES | src/platform/linux/providers.rs | 4 | *
 PER_TICK_ACCEPT_BUDGET | src/platform/linux/providers.rs | 32 | *
+LINUX_NET_MAX_INBOUND | src/platform/linux/providers.rs | 8 | *
 MAX_OBJECTS | src/platform/bcm2712/store.rs | 512 | *
 MAX_VALUE | src/platform/bcm2712/store.rs | 4096 | *
+HISTORY | src/platform/bcm2712/store.rs | 128 | *
 MAX_CROSS_CHANNELS | src/platform/bcm2712/multicore.rs | 256 | *
 MAX_DOMAINS | src/platform/bcm2712/multicore.rs | 4 | *
 MAX_DOMAINS | src/kernel/exec/scheduler/mod.rs | 4 | *
@@ -846,6 +883,7 @@ MAX_PRE_TICK_PER_DOMAIN | src/kernel/exec/scheduler/mod.rs | 4 | *
 MAX_PRE_TICK_BUDGET_US | src/kernel/exec/scheduler/mod.rs | 5 | *
 MAX_NAMES | src/kernel/exec/scheduler/mod.rs | MAX_MODULES | *
 MAX_NAME_LEN | src/kernel/exec/scheduler/mod.rs | 32 | *
+BUFFER_GROUPS | src/kernel/exec/scheduler/mod.rs | rings::buffer_groups(MAX_GRAPH_EDGES) | *
 MAX_SECONDARY_CORES | src/platform/bcm2712/multicore.rs | 3 | *
 RING_SLOTS | src/platform/bcm2712/multicore.rs | 8 | *
 SLOT_DATA_SIZE | src/platform/bcm2712/multicore.rs | crate::abi::CHANNEL_BUFFER_SIZE | *
@@ -883,8 +921,10 @@ MAX_TEXT_LEN | modules/sdk/contracts/mesh/capability.rs | 1375 | *
 LIST_PAGE_MAX | modules/sdk/contracts/storage/object.rs | 1000 | *
 STORAGE_KEY_MAX | modules/sdk/contracts/storage/handle.rs | 255 | *
 PATH_MAX | modules/sdk/contracts/storage/namespace.rs | 1024 | *
+TOKEN_MAX | modules/sdk/contracts/storage/namespace.rs | 320 | *
 MAX_PRIVATE | src/kernel/module/gateway.rs | 3 | *
 WALK_MAX | src/kernel/module/gateway.rs | 544 | *
+SLOTS | src/kernel/module/gateway.rs | 128 | *
 MAX_CHANNELS | modules/foundation/remote_channel/wire.rs | 8 | *
 CT_NAME_MAX | modules/foundation/remote_channel/wire.rs | 32 | *
 HELLO_MAX | modules/foundation/remote_channel/wire.rs | 4 + 1 + MAX_CHANNELS * HELLO_ENTRY_LEN + 1 | *
@@ -903,6 +943,7 @@ MAX_PARAM_NAME_BYTES | tools/src/params.rs | 64 | *
 SCOPE_MAX | modules/sdk/contracts/storage/object.rs | 255 | *
 STORE_STAGE_MAX | src/platform/linux/store.rs | 64 * 1024 * 1024 | *
 STORE_STAGE_RESERVE_MAX | src/platform/linux/store.rs | 1024 * 1024 | *
+CHANGES_SCAN_BUDGET | src/platform/linux/store.rs | 4096 | *
 OWNER_MAX_OPEN_FILES | src/kernel/workload/storage.rs | 32 | *
 MAX_SANDBOXES | src/platform/linux/host_backend.rs | 4096 | *
 MAX_TTY_SESSIONS | src/platform/linux/host_backend.rs | 4096 | *
@@ -916,6 +957,18 @@ PROJECTION_MEMORY_DEFAULT | src/platform/linux/host_mount.rs | 64 << 20 | *
 PROJECTION_MEMORY_MAX | src/platform/linux/host_mount.rs | 1 << 30 | *
 OWNER_STAGE_MAX | src/platform/linux/store.rs | 16 * 1024 * 1024 | *
 ```
+
+The coverage report (`fluxor ci`'s `limit-register` phase) scans every file
+named above for ceilings no row covers. A constant counts when its name is
+shaped like one — `MAX_` first, or a capacity word (`MAX`, `CAP`,
+`CAPACITY`, `LIMIT`, `BUDGET`, `SIZE`, `SLOTS`, `ENTRIES`, `WINDOW`,
+`DEPTH`) as the whole name or its last part — and, whatever it is called,
+when the file declares it and sizes a fixed array with it (`[T; NAME]`,
+`[x; NAME]`): a preallocated table named by a plain noun (`SUBSCRIPTIONS`,
+`PENDING_WRITES`) is a ceiling too. Only a `const` item counts: the keyword
+in a raw pointer (`*const T`), a raw borrow (`&raw const SLOTS`) or a
+const-generic parameter (`impl<const SLOTS: usize>`) declares nothing this
+file decides, so the scan skips it rather than asking for an exemption.
 
 Constants in these files that are shaped like ceilings but are not
 resource decisions — record layouts, scratch sized from a ceiling above,
@@ -1052,4 +1105,20 @@ PATH_MAX | modules/foundation/fs_object/mod.rs | derived: ROOT_MAX, a separator 
 NAME_MAX | modules/foundation/object_exchange/mod.rs | mirror of the contract's STORAGE_KEY_MAX, the longest object name
 CT_MAX | modules/foundation/object_exchange/mod.rs | format: the content type's u8 length prefix
 SCOPE_MAX | modules/foundation/object_exchange/mod.rs | mirror of the contract's grant::SCOPE_MAX, the longest scope a grant names
+DMA_WINDOW | modules/drivers/nvme/mod.rs | mirror of PCI_DMA_OFFSET, the bus-address offset BAR1's inbound window maps DRAM at, re-exported to the host-test controller model — an address, not a capacity
+PORT_REF_ENTRIES | modules/foundation/ip/mod.rs | derived: one bound-count per u16 port number (65536) on tables of 4096 or more, 1 elsewhere to disable the counts and keep the table scan — the port space, not a chosen size
+WINDOW | modules/foundation/object_exchange/mod.rs | derived: ex::BODY_MAX, one exchange record's body — each exchange's own buffer and the credit its streamed put holds out; their count is EXCHANGE_SLOTS
+CHUNKS_PER_PACKET | modules/foundation/quic/connection.rs | derived: one frame per stream slot (MAX_BIDI_STREAMS + MAX_UNI_STREAMS) plus the transparent stream and one CRYPTO frame, the most one packet can carry
+INITIAL_WINDOW | modules/foundation/quic/connection.rs | protocol: RFC 9002 §7.2 initial congestion window, min(10 * max_datagram_size, max(2 * max_datagram_size, 14720)) at 1500 bytes
+MINIMUM_WINDOW | modules/foundation/quic/connection.rs | protocol: RFC 9002 §7.2 kMinimumWindow, 2 * max_datagram_size — the congestion window persistent congestion collapses to
+IDENTITIES | modules/foundation/remote_channel/mod.rs | derived: tls::MAX_SESSIONS, one peer-identity record per connection the transport can seat
+EXTRA_CHUNKS | modules/foundation/tls/mod.rs | derived: the elastic chunks past the inline one, (MAX_SESSIONS - SESSION_CHUNK) / SESSION_CHUNK, const-asserted to tile MAX_SESSIONS exactly
+SIZE | modules/sdk/contracts/net/route.rs | format: the byte length of a route-contract record (peer route, held address, entry state)
+MIN_OUT_CAP | modules/sdk/contracts/storage/namespace.rs | derived: the TAKE_RUNG answer head and one handle, the smallest out_cap that makes progress
+RSA_T_LIMBS | modules/sdk/crypto/rsa.rs | derived: RSA_LIMBS_MAX plus the two limbs the CIOS Montgomery accumulator carries
+RSA_WINDOW | modules/sdk/crypto/rsa.rs | algorithm: exponent bits per step of the fixed-window CRT exponentiation, a speed/table-size trade inside one signing job — nothing is refused at it
+RSA_TABLE | modules/sdk/crypto/rsa.rs | derived: 1 << RSA_WINDOW precomputed powers of the base
+SIZE | src/kernel/module/loader.rs | format: the 80-byte fmod ModuleHeader, its layout pinned by the offset_of asserts beside it
+CONSUMERS | src/kernel/sys/telemetry_ring.rs | mirror: the kernel side of the registered RING_CONSUMERS (modules/sdk/contracts/telemetry.rs), held equal to it by a harness test
+RELIST_TOKEN_MAX | src/platform/bcm2712/store.rs | derived: a relist continuation, the tag, a pinned revision and a STORAGE_KEY_MAX key (264 bytes), within the registered changes::TOKEN_MAX
 ```

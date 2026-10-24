@@ -62,9 +62,14 @@
 //               renames are out of scope for this surface.
 //   DELETE    — remove an entry. Recursive delete on directories is
 //               opt-in via a flag.
-//   SUBSCRIBE — open an `Event<namespace.change>` stream rooted at
-//               a prefix; events flow through the mesh Event
-//               primitive (see mesh.md §5).
+//   SUBSCRIBE — watch a prefix: the provider signals the caller's own
+//               kernel event when something under it changes
+//               (level-triggered; no bytes are pushed).
+//   TAKE_RUNG — which of the caller's subscriptions on an event have
+//               changed since it last asked; the caller then reads
+//               them with CHANGES.
+//   CHANGES   — what changed under a prefix since a revision, one
+//               bounded page per call.
 //   CAPS      — capability bits: which optional/mutation ops this
 //               provider actually implements (mirrors `fs::CAPS`).
 //
@@ -76,10 +81,11 @@
 // namespace provider without colliding with FS (0x09__) or BUFFER
 // (0x0A__).
 //
-// Subscribe events ride the mesh Event primitive — this contract
-// owns the opcode that opens the subscription; the payload format
-// on the returned event stream is documented under
-// `docs/architecture/storage_capability_surface.md` §"namespace.change".
+// A subscription is a doorbell, not a stream: the provider never writes
+// a consumer's channel. It signals the consumer's own kernel event
+// (`kernel_abi::event`), and the consumer asks TAKE_RUNG which of its
+// subscriptions rang and reads each with CHANGES. See
+// `docs/architecture/storage_capability_surface.md` §"Subscriptions".
 
 /// A write's answer here is classified as `storage.object`'s is.
 pub use super::object::{write_answer, WriteAnswer};
@@ -279,62 +285,151 @@ pub const RENAME: u32 = 0x1303;
 /// into `fence_out_ptr` atomically with the op return.
 pub const DELETE: u32 = 0x1304;
 
-/// Open an `Event<namespace.change>` subscription rooted at a
-/// prefix.
+/// Watch a prefix: the provider signals the caller's kernel event whenever
+/// something under the prefix changes. Level-triggered — a doorbell, never a
+/// stream: no key, value or record is pushed anywhere.
 ///
-/// `handle = -1`; `arg` is:
+/// `handle = -1`; `arg` is ([`subscribe`] is the codec):
 ///
 /// ```text
 ///   [prefix_len: u16 LE]
 ///   [prefix: prefix_len bytes]
-///   [sink_chan: u32 LE]           — channel to deliver Events onto
-///   [flags: u8]                   — bit 0: include-initial-listing
+///   [event: i32 LE]               — a tagged event fd the CALLER owns
+///                                   (`kernel_abi::event::CREATE`)
+///   [flags: u8]                   — bit 0: ring once now
 /// ```
 ///
-/// Returns a non-negative subscription handle (passed to `CLOSE`)
-/// or a negative errno. Events delivered on `sink_chan` follow the
-/// mesh Event header (see `mesh.md`); the payload format for
-/// `namespace.change` is documented in
-/// `docs/architecture/storage_capability_surface.md`.
+/// Returns a non-negative subscription handle (passed to `CLOSE`, named by
+/// [`TAKE_RUNG`] and [`CHANGES`]) or a negative errno.
+///
+/// ## Delivery
+///
+/// The provider keeps one *rung* bit per subscription. A change under the
+/// prefix that finds the bit clear sets it and signals the event; one that
+/// finds it set does nothing. [`TAKE_RUNG`] returns and clears the bits. A
+/// consumer's step is therefore: `event::POLL`, then `TAKE_RUNG`, marking each
+/// returned subscription *pending*, then a [`CHANGES`] read of each pending
+/// one, clearing *pending* only when a read completes (a page with `more`
+/// clear). Whatever interleaving, a change is followed by a completed read
+/// that observes it: if the bit was clear the signal follows the change; if
+/// set, the take that clears it is still to come, and the read follows the
+/// take. A consumer holding several subscriptions uses one event for all.
+///
+/// ## Ownership and lifetime
+///
+///   - The event must belong to the calling module (`query_key::EVENT_OWNER`):
+///     `EINVAL` otherwise. Before every signal the provider checks the event
+///     still belongs to the subscribing module occupancy
+///     (`query_key::MODULE_LIVE`); a subscription whose module is gone, or
+///     whose event slot another module now holds, is dropped, never
+///     signalled.
+///   - Idempotent: a repeat with the same owner, module occupancy, event and
+///     prefix returns the existing handle (and rings once again when bit 0
+///     is set), so a module re-running its subscribe path cannot leak.
+///   - A handle answers its opener alone; to anyone else it is as if not
+///     open.
+///   - `ENOMEM` when the provider's subscription capacity, or the calling
+///     owner's quota, is spent — counted and named against the pool.
 pub const SUBSCRIBE: u32 = 0x1305;
+
+/// Which of the caller's subscriptions on an event have rung since it last
+/// asked; returns and clears their rung bits.
+///
+/// `handle = -1`; `arg` is ([`take`] is the codec):
+///
+/// ```text
+///   [event: i32 LE]               — the event the subscriptions name
+///   [out_buf: ptr u64 LE]
+///   [out_cap: u32 LE]
+/// ```
+///
+/// On success the provider writes into `out_buf`:
+///
+/// ```text
+///   [more: u8]                    — 1: further rung subscriptions did not
+///                                   fit; the provider has signalled the
+///                                   event again
+///   [count: u16 LE]
+///   count × [handle: i32 LE]      — subscription handles
+/// ```
+///
+/// and returns the byte count. Only subscriptions the caller opened on that
+/// event are named. `ENOMEM` when `out_cap` cannot hold the header and one
+/// handle.
+pub const TAKE_RUNG: u32 = 0x1309;
 
 /// Close a LOOKUP or SUBSCRIBE handle.
 pub const CLOSE: u32 = 0x1306;
 
-/// Synchronous windowed change-read — the request/response dual of the
-/// push-based `SUBSCRIBE`. Where `SUBSCRIBE` streams live events onto a channel,
-/// `CHANGES` answers "what changed under `prefix` since revision `since`?" in one
-/// call, into a caller buffer. This is the primitive a long-poll watch server
-/// (a watch resumed from a revision) is a direct projection of:
-/// LIST-at-a-fence then the changes since it, both synchronous.
+/// What changed under a prefix since a point — one bounded page per call. The
+/// read a [`SUBSCRIBE`] doorbell asks for, and the primitive a long-poll watch
+/// server (a watch resumed from a revision) is a direct projection of.
 ///
-/// `handle = -1`; `arg` is:
+/// `handle = -1`; `arg` is ([`changes`] is the codec):
 ///
 /// ```text
 ///   [prefix_len: u16 LE]
 ///   [prefix: prefix_len bytes]
-///   [since: u64 LE]               — 0 = full current snapshot; N = changes after rev N
+///   [sub: i32 LE]                 — the subscription this read serves, or -1
+///   [token_len: u16 LE]
+///   [token: token_len bytes]      — where to resume (below)
 ///   [out_buf: ptr u64 LE]
 ///   [out_cap: u32 LE]
 ///   [fence_out_ptr: u64 LE]       — receives Fence::encode bytes
 ///   [fence_out_cap: u16 LE]       — must be >= `fence::WIRE_MAX_LEN`
 /// ```
 ///
-/// On success the provider writes into `out_buf`:
+/// ## Tokens
+///
+///   - empty: a **relist** — every current entry under the prefix, `Added`,
+///     with its value, paged by key;
+///   - exactly 8 bytes: a bare revision `since` (u64 LE) — the changes after
+///     it. Any consumer may build one ([`changes::revision_token`]);
+///   - anything else: a provider-issued continuation, echoed back verbatim.
+///
+/// A page whose `more` is clear carries an 8-byte token: the revision the
+/// consumer keeps at rest and resumes from.
+///
+/// ## Answer
 ///
 /// ```text
-///   [status: u8]                  — 0 = events follow; 1 = LOST (window preceded
-///                                   retained history — the client must relist)
-///   [count: u32 LE]               — number of event records (0 when status=LOST)
-///   count × event:
-///     [rev: u64 LE][kind: u8][key_len: u16 LE][val_len: u32 LE][key][val]
+///   [status: u8]                  — 0 = records follow; 1 = LOST (the point
+///                                   precedes what the provider can answer —
+///                                   relist)
+///   [more: u8]                    — 1: ask again with `token` for the rest
+///   [safe_rev: u64 LE]            — the highest revision this read has
+///                                   delivered whole: a consumer that hands
+///                                   resume points to its own clients stamps
+///                                   them at most this; 0 on a relist page
+///                                   with `more` set (nothing is whole until
+///                                   the relist ends)
+///   [count: u32 LE]
+///   count × record:
+///     [mod_rev: u64 LE][kind: u8][key_len: u16 LE][val_len: u32 LE][key][val]
+///   [token_len: u16 LE]
+///   [token: token_len bytes]      — where the next read resumes
 /// ```
 ///
-/// `kind` is `0=Added`, `1=Modified`, `2=Deleted` (value absent for Deleted).
-/// `since = 0` returns every current entry as `Added` at its revision (the
-/// snapshot a client relists into). The return value is the byte count written
-/// to `out_buf`; the encoded fence (`ViewConsistent { revision }`, the highest
-/// revision covered — the client's next `since`) is written to `fence_out_ptr`.
+/// One record per changed key, read at the provider's current state: present
+/// → `Added` (absent before the window, when known) or `Modified`, with its
+/// current value and `mod_rev`; absent → `Deleted` (no value). A key is never
+/// omitted because it was created and deleted inside the window — `Deleted`
+/// is always reported, and applying by key is idempotent. Intermediate
+/// versions collapse. A record whose current `mod_rev` lies past the page's
+/// cut is left to the later page that holds it, so no `mod_rev` a consumer
+/// sees is ahead of what the read has delivered.
+///
+/// The return value is the byte count written to `out_buf`; the encoded
+/// fence (`ViewConsistent { revision }`) is written to `fence_out_ptr`.
+///
+/// ## Bounds and waits
+///
+/// A provider pages rather than refuses, within a per-call budget it states;
+/// `ENOMEM` only when `out_cap` cannot hold the header, one record and the
+/// trailer ([`changes::min_out_cap`]). `EAGAIN` means "not now" (a busy
+/// device, a spent walk budget); when `sub` names one of the caller's
+/// subscriptions the provider rings it again once the cause clears, so a
+/// consumer woken only by its event never stalls on a wait.
 pub const CHANGES: u32 = 0x1307;
 
 /// Create a binding: `path → {kind, target}` — the one op that mints
@@ -703,6 +798,458 @@ pub mod list {
             let (entry, next) = entry_at(self.buf, self.pos)?;
             self.pos = next;
             Some(entry)
+        }
+    }
+}
+
+// ── SUBSCRIBE / TAKE_RUNG / CHANGES wire codecs ──────────────────────
+//
+// One implementation of each layout for providers and consumers alike: no
+// `std`, no allocation, so kernel providers, bare-metal providers and PIC
+// modules share it.
+
+fn le_u16(b: &[u8], at: usize) -> Option<u16> {
+    let s = b.get(at..at.checked_add(2)?)?;
+    Some(u16::from_le_bytes([s[0], s[1]]))
+}
+
+fn le_u32(b: &[u8], at: usize) -> Option<u32> {
+    let s = b.get(at..at.checked_add(4)?)?;
+    Some(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+}
+
+fn le_u64(b: &[u8], at: usize) -> Option<u64> {
+    let s = b.get(at..at.checked_add(8)?)?;
+    Some(u64::from_le_bytes([
+        s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
+    ]))
+}
+
+/// Appends fields to a bounded buffer; `None` once one does not fit.
+struct Put<'a> {
+    out: &'a mut [u8],
+    at: usize,
+}
+
+impl Put<'_> {
+    fn bytes(&mut self, b: &[u8]) -> Option<()> {
+        let end = self.at.checked_add(b.len())?;
+        self.out.get_mut(self.at..end)?.copy_from_slice(b);
+        self.at = end;
+        Some(())
+    }
+}
+
+/// The [`SUBSCRIBE`] request.
+pub mod subscribe {
+    use super::{le_u16, Put, PATH_MAX};
+
+    /// `flags` bit 0: ring once now.
+    pub const FLAG_RING_NOW: u8 = 1 << 0;
+
+    /// A decoded request.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct Request<'a> {
+        pub prefix: &'a [u8],
+        /// The caller's tagged event fd.
+        pub event: i32,
+        pub flags: u8,
+    }
+
+    /// Parse exactly one request; `None` — `EINVAL` — otherwise.
+    pub fn parse(arg: &[u8]) -> Option<Request<'_>> {
+        let plen = le_u16(arg, 0)? as usize;
+        if plen > PATH_MAX || arg.len() != 2 + plen + 5 {
+            return None;
+        }
+        let prefix = arg.get(2..2 + plen)?;
+        let e = arg.get(2 + plen..2 + plen + 4)?;
+        Some(Request {
+            prefix,
+            event: i32::from_le_bytes([e[0], e[1], e[2], e[3]]),
+            flags: *arg.get(2 + plen + 4)?,
+        })
+    }
+
+    /// Encode a request into `out`: its length, or `None` when it does not fit.
+    pub fn encode(out: &mut [u8], req: &Request<'_>) -> Option<usize> {
+        if req.prefix.len() > PATH_MAX {
+            return None;
+        }
+        let mut p = Put { out, at: 0 };
+        p.bytes(&(req.prefix.len() as u16).to_le_bytes())?;
+        p.bytes(req.prefix)?;
+        p.bytes(&req.event.to_le_bytes())?;
+        p.bytes(&[req.flags])?;
+        Some(p.at)
+    }
+}
+
+/// The [`TAKE_RUNG`] request and answer.
+pub mod take {
+    use super::{le_u16, le_u32, le_u64, Put};
+
+    /// Request bytes: `[event i32][out_ptr u64][out_cap u32]`.
+    pub const REQUEST_LEN: usize = 16;
+    /// Answer bytes before the handles: `[more u8][count u16]`.
+    pub const HEAD_LEN: usize = 3;
+    /// The smallest `out_cap` that makes progress: the head and one handle.
+    pub const MIN_OUT_CAP: usize = HEAD_LEN + 4;
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct Request {
+        pub event: i32,
+        pub out_ptr: u64,
+        pub out_cap: u32,
+    }
+
+    /// Parse exactly one request; `None` — `EINVAL` — otherwise, or when the
+    /// output pointer is null.
+    pub fn parse(arg: &[u8]) -> Option<Request> {
+        if arg.len() != REQUEST_LEN {
+            return None;
+        }
+        let r = Request {
+            event: le_u32(arg, 0)? as i32,
+            out_ptr: le_u64(arg, 4)?,
+            out_cap: le_u32(arg, 12)?,
+        };
+        (r.out_ptr != 0).then_some(r)
+    }
+
+    pub fn encode(out: &mut [u8], req: &Request) -> Option<usize> {
+        let mut p = Put { out, at: 0 };
+        p.bytes(&req.event.to_le_bytes())?;
+        p.bytes(&req.out_ptr.to_le_bytes())?;
+        p.bytes(&req.out_cap.to_le_bytes())?;
+        Some(p.at)
+    }
+
+    /// Writes one answer, the head last.
+    pub struct Writer<'a> {
+        out: &'a mut [u8],
+        count: u16,
+    }
+
+    impl<'a> Writer<'a> {
+        /// `None` when `out` cannot hold [`MIN_OUT_CAP`] (`ENOMEM`).
+        pub fn new(out: &'a mut [u8]) -> Option<Self> {
+            (out.len() >= MIN_OUT_CAP).then_some(Writer { out, count: 0 })
+        }
+
+        /// Append a handle; `false` when it does not fit (nothing written).
+        pub fn push(&mut self, handle: i32) -> bool {
+            let at = HEAD_LEN + self.count as usize * 4;
+            match self.out.get_mut(at..at + 4) {
+                Some(d) if self.count < u16::MAX => {
+                    d.copy_from_slice(&handle.to_le_bytes());
+                    self.count += 1;
+                    true
+                }
+                _ => false,
+            }
+        }
+
+        /// Write the head; the answer's length.
+        pub fn finish(self, more: bool) -> usize {
+            self.out[0] = u8::from(more);
+            self.out[1..3].copy_from_slice(&self.count.to_le_bytes());
+            HEAD_LEN + self.count as usize * 4
+        }
+    }
+
+    /// A decoded answer: `(more, handles)`.
+    pub fn decode(ans: &[u8]) -> Option<(bool, impl Iterator<Item = i32> + '_)> {
+        let more = *ans.first()? != 0;
+        let count = le_u16(ans, 1)? as usize;
+        let body = ans.get(HEAD_LEN..HEAD_LEN + count * 4)?;
+        if ans.len() != HEAD_LEN + count * 4 {
+            return None;
+        }
+        Some((
+            more,
+            body.chunks_exact(4)
+                .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]])),
+        ))
+    }
+}
+
+/// The [`CHANGES`] request, page and tokens.
+pub mod changes {
+    use super::super::handle::STORAGE_KEY_MAX;
+    use super::{le_u16, le_u32, le_u64, Put, PATH_MAX};
+
+    /// The longest token: a provider's continuation (a kind byte, revisions
+    /// and a key cursor) fits in it.
+    pub const TOKEN_MAX: usize = 320;
+    /// A bare revision token's length.
+    pub const REVISION_TOKEN_LEN: usize = 8;
+
+    pub const STATUS_OK: u8 = 0;
+    pub const STATUS_LOST: u8 = 1;
+
+    pub const KIND_ADDED: u8 = 0;
+    pub const KIND_MODIFIED: u8 = 1;
+    pub const KIND_DELETED: u8 = 2;
+
+    /// Page bytes before the records: `[status][more][safe_rev u64][count u32]`.
+    pub const HEAD_LEN: usize = 14;
+    /// A record's bytes besides its key and value.
+    pub const RECORD_FIXED_LEN: usize = 15;
+    /// The trailer's bytes besides its token: `[token_len u16]`.
+    pub const TRAILER_FIXED_LEN: usize = 2;
+    /// Request bytes besides the prefix and token.
+    pub const REQUEST_FIXED_LEN: usize = 2 + 4 + 2 + 8 + 4 + 8 + 2;
+
+    /// A bare revision token: "the changes after `since`".
+    pub const fn revision_token(since: u64) -> [u8; REVISION_TOKEN_LEN] {
+        since.to_le_bytes()
+    }
+
+    /// The revision a bare revision token names; `None` for any other token.
+    pub fn token_revision(token: &[u8]) -> Option<u64> {
+        (token.len() == REVISION_TOKEN_LEN)
+            .then(|| le_u64(token, 0))
+            .flatten()
+    }
+
+    /// The smallest `out_cap` that makes progress past a record with a key
+    /// of `key_len` and a value of `val_len`, with a token of `token_len`.
+    pub const fn min_out_cap(key_len: usize, val_len: usize, token_len: usize) -> usize {
+        HEAD_LEN + RECORD_FIXED_LEN + key_len + val_len + TRAILER_FIXED_LEN + token_len
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct Request<'a> {
+        pub prefix: &'a [u8],
+        /// The subscription this read serves, or -1.
+        pub sub: i32,
+        pub token: &'a [u8],
+        pub out_ptr: u64,
+        pub out_cap: u32,
+        pub fence_out_ptr: u64,
+        pub fence_out_cap: u16,
+    }
+
+    /// Parse exactly one request; `None` — `EINVAL` — when the bytes are not
+    /// one request, a field exceeds its bound, an output pointer is null or
+    /// the fence buffer is short.
+    pub fn parse_request(arg: &[u8]) -> Option<Request<'_>> {
+        let plen = le_u16(arg, 0)? as usize;
+        if plen > PATH_MAX {
+            return None;
+        }
+        let prefix = arg.get(2..2 + plen)?;
+        let mut p = 2 + plen;
+        let sub = le_u32(arg, p)? as i32;
+        p += 4;
+        let tlen = le_u16(arg, p)? as usize;
+        if tlen > TOKEN_MAX {
+            return None;
+        }
+        let token = arg.get(p + 2..p + 2 + tlen)?;
+        p += 2 + tlen;
+        if arg.len() != p + 22 {
+            return None;
+        }
+        let req = Request {
+            prefix,
+            sub,
+            token,
+            out_ptr: le_u64(arg, p)?,
+            out_cap: le_u32(arg, p + 8)?,
+            fence_out_ptr: le_u64(arg, p + 12)?,
+            fence_out_cap: le_u16(arg, p + 20)?,
+        };
+        if req.out_ptr == 0
+            || req.fence_out_ptr == 0
+            || (req.fence_out_cap as usize) < super::super::super::super::fence::WIRE_MAX_LEN
+        {
+            return None;
+        }
+        Some(req)
+    }
+
+    pub fn encode_request(out: &mut [u8], req: &Request<'_>) -> Option<usize> {
+        if req.prefix.len() > PATH_MAX || req.token.len() > TOKEN_MAX {
+            return None;
+        }
+        let mut p = Put { out, at: 0 };
+        p.bytes(&(req.prefix.len() as u16).to_le_bytes())?;
+        p.bytes(req.prefix)?;
+        p.bytes(&req.sub.to_le_bytes())?;
+        p.bytes(&(req.token.len() as u16).to_le_bytes())?;
+        p.bytes(req.token)?;
+        p.bytes(&req.out_ptr.to_le_bytes())?;
+        p.bytes(&req.out_cap.to_le_bytes())?;
+        p.bytes(&req.fence_out_ptr.to_le_bytes())?;
+        p.bytes(&req.fence_out_cap.to_le_bytes())?;
+        Some(p.at)
+    }
+
+    /// Writes one page into a caller buffer, keeping room for the trailer
+    /// (a token of up to `token_reserve` bytes) so the page can always be
+    /// finished.
+    pub struct PageWriter<'a> {
+        out: &'a mut [u8],
+        pos: usize,
+        count: u32,
+        reserve: usize,
+    }
+
+    impl<'a> PageWriter<'a> {
+        /// `None` when `out` cannot hold the head and a trailer of
+        /// `token_reserve` bytes.
+        pub fn new(out: &'a mut [u8], token_reserve: usize) -> Option<Self> {
+            let reserve = TRAILER_FIXED_LEN + token_reserve.min(TOKEN_MAX);
+            (out.len() >= HEAD_LEN + reserve).then_some(PageWriter {
+                out,
+                pos: HEAD_LEN,
+                count: 0,
+                reserve,
+            })
+        }
+
+        pub fn count(&self) -> u32 {
+            self.count
+        }
+
+        /// Append one record; `false` when it and the trailer do not both
+        /// fit, or the key exceeds `STORAGE_KEY_MAX` (nothing written).
+        pub fn push(&mut self, mod_rev: u64, kind: u8, key: &[u8], val: &[u8]) -> bool {
+            if key.len() > STORAGE_KEY_MAX || val.len() > u32::MAX as usize {
+                return false;
+            }
+            let end = self.pos + RECORD_FIXED_LEN + key.len() + val.len();
+            if end + self.reserve > self.out.len() {
+                return false;
+            }
+            let o = &mut self.out[self.pos..end];
+            o[..8].copy_from_slice(&mod_rev.to_le_bytes());
+            o[8] = kind;
+            o[9..11].copy_from_slice(&(key.len() as u16).to_le_bytes());
+            o[11..15].copy_from_slice(&(val.len() as u32).to_le_bytes());
+            o[15..15 + key.len()].copy_from_slice(key);
+            o[15 + key.len()..].copy_from_slice(val);
+            self.pos = end;
+            self.count += 1;
+            true
+        }
+
+        /// Write the head and the trailer; the page's length, or `None` when
+        /// the token is longer than the reserve.
+        pub fn finish(self, more: bool, safe_rev: u64, token: &[u8]) -> Option<usize> {
+            if TRAILER_FIXED_LEN + token.len() > self.reserve {
+                return None;
+            }
+            let o = self.out;
+            o[0] = STATUS_OK;
+            o[1] = u8::from(more);
+            o[2..10].copy_from_slice(&safe_rev.to_le_bytes());
+            o[10..14].copy_from_slice(&self.count.to_le_bytes());
+            let mut p = Put {
+                out: o,
+                at: self.pos,
+            };
+            p.bytes(&(token.len() as u16).to_le_bytes())?;
+            p.bytes(token)?;
+            Some(p.at)
+        }
+    }
+
+    /// Write a LOST page into `out`: its length, or `None` when it does not
+    /// fit.
+    pub fn write_lost(out: &mut [u8]) -> Option<usize> {
+        let o = out.get_mut(..HEAD_LEN + TRAILER_FIXED_LEN)?;
+        o.fill(0);
+        o[0] = STATUS_LOST;
+        Some(HEAD_LEN + TRAILER_FIXED_LEN)
+    }
+
+    /// One record.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct Record<'a> {
+        pub mod_rev: u64,
+        pub kind: u8,
+        pub key: &'a [u8],
+        pub val: &'a [u8],
+    }
+
+    /// A decoded page.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct Page<'a> {
+        pub lost: bool,
+        pub more: bool,
+        pub safe_rev: u64,
+        pub count: u32,
+        records: &'a [u8],
+        pub token: &'a [u8],
+    }
+
+    fn record_at(b: &[u8], at: usize) -> Option<(Record<'_>, usize)> {
+        let mod_rev = le_u64(b, at)?;
+        let kind = *b.get(at + 8)?;
+        let kl = le_u16(b, at + 9)? as usize;
+        let vl = le_u32(b, at + 11)? as usize;
+        let key = b.get(at + 15..at + 15 + kl)?;
+        let val = b.get(at + 15 + kl..at + 15 + kl + vl)?;
+        Some((
+            Record {
+                mod_rev,
+                kind,
+                key,
+                val,
+            },
+            at + 15 + kl + vl,
+        ))
+    }
+
+    /// Decode exactly one page — the bytes a successful call reported.
+    pub fn decode_page(page: &[u8]) -> Option<Page<'_>> {
+        let status = *page.first()?;
+        let more = *page.get(1)? != 0;
+        let safe_rev = le_u64(page, 2)?;
+        let count = le_u32(page, 10)?;
+        let mut p = HEAD_LEN;
+        for _ in 0..count {
+            p = record_at(page, p)?.1;
+        }
+        let tlen = le_u16(page, p)? as usize;
+        let token = page.get(p + 2..p + 2 + tlen)?;
+        if page.len() != p + 2 + tlen || tlen > TOKEN_MAX {
+            return None;
+        }
+        Some(Page {
+            lost: status == STATUS_LOST,
+            more,
+            safe_rev,
+            count,
+            records: &page[HEAD_LEN..p],
+            token,
+        })
+    }
+
+    impl<'a> Page<'a> {
+        pub fn records(&self) -> Records<'a> {
+            Records {
+                buf: self.records,
+                pos: 0,
+            }
+        }
+    }
+
+    pub struct Records<'a> {
+        buf: &'a [u8],
+        pos: usize,
+    }
+
+    impl<'a> Iterator for Records<'a> {
+        type Item = Record<'a>;
+
+        fn next(&mut self) -> Option<Record<'a>> {
+            let (r, next) = record_at(self.buf, self.pos)?;
+            self.pos = next;
+            Some(r)
         }
     }
 }

@@ -638,20 +638,24 @@ mod scheduler_validation_tests {
         let m = json!({"heap": {"zero_on_free": true, "alloc_failure_policy": "fault",
                                 "canary_enabled": true}});
         // No schema params: a TLV of their own.
-        let p = insert_workload_heap_tags(Vec::new(), &m, "kv", None).unwrap();
+        let p =
+            insert_workload_heap_tags(Vec::new(), &m, "kv", None, &HeapPlan::default()).unwrap();
         assert_eq!(
             p,
             vec![0xFE, 0x01, 11, 0, 0xF8, 1, 1, 0xF9, 1, 1, 0xFA, 1, 1, 0xFF, 0x00]
         );
         // Schema params: the flags go before the end marker, the length grows.
         let schema_tlv = vec![0xFE, 0x01, 5, 0, 1, 1, 7, 0xFF, 0x00];
-        let p = insert_workload_heap_tags(schema_tlv, &m, "kv", None).unwrap();
+        let p =
+            insert_workload_heap_tags(schema_tlv, &m, "kv", None, &HeapPlan::default()).unwrap();
         assert_eq!(&p[..7], &[0xFE, 0x01, 14, 0, 1, 1, 7]);
         assert_eq!(&p[7..16], &[0xF8, 1, 1, 0xF9, 1, 1, 0xFA, 1, 1]);
         assert_eq!(&p[16..], &[0xFF, 0x00]);
         assert_eq!(crate::add_subgraph::params_node_tag(&p), None);
         // No heap key: untouched.
-        let p = insert_workload_heap_tags(vec![1, 2, 3], &json!({}), "kv", None).unwrap();
+        let p =
+            insert_workload_heap_tags(vec![1, 2, 3], &json!({}), "kv", None, &HeapPlan::default())
+                .unwrap();
         assert_eq!(p, vec![1, 2, 3]);
     }
 
@@ -661,7 +665,8 @@ mod scheduler_validation_tests {
     fn heap_arena_bytes_packs_as_tag_0xef() {
         // Workload path.
         let m = json!({"heap": {"arena_bytes": 2 * 1024 * 1024}});
-        let p = insert_workload_heap_tags(Vec::new(), &m, "kv", None).unwrap();
+        let p =
+            insert_workload_heap_tags(Vec::new(), &m, "kv", None, &HeapPlan::default()).unwrap();
         assert_eq!(
             p,
             vec![0xFE, 0x01, 8, 0, 0xEF, 4, 0x00, 0x00, 0x20, 0x00, 0xFF, 0x00]
@@ -683,6 +688,7 @@ mod scheduler_validation_tests {
             &manifests,
             crate::capacity::kernel_max_modules("linux"),
             &crate::target::IsolationFacts::default(),
+            &HeapPlan::default(),
         )
         .expect("emit module entry");
         let params = &entry[MODULE_ENTRY_HEADER_SIZE..];
@@ -1638,6 +1644,7 @@ mod scheduler_validation_tests {
             &manifests,
             crate::capacity::kernel_max_modules("linux"),
             &crate::target::IsolationFacts::default(),
+            &HeapPlan::default(),
         )
         .expect("emit module entry");
         // Entry layout (see `parse_module_entry`): bytes 0-3 =
@@ -2116,6 +2123,109 @@ mod continuity_tests {
             let cfg = json!({"modules": [{"name": "a", "fault_policy": policy}]});
             validate_fault_policy(&cfg, &names(&["a"]), &m).unwrap();
         }
+    }
+
+    /// A store subscriber cannot attest `resume_after_fault`: a restart kills
+    /// its subscriptions. Refused whatever the policy, from the constant or a
+    /// `demand_from_params` rule.
+    #[test]
+    fn resume_after_fault_is_refused_beside_store_subscriptions() {
+        let mut sub = Manifest {
+            resume_after_fault: true,
+            ..Manifest::default()
+        };
+        sub.capacities.insert("store_subscriptions".into(), 2);
+        for policy in [None, Some("skip"), Some("restart")] {
+            let cfg = match policy {
+                Some(p) => json!({"modules": [{"name": "a", "fault_policy": p}]}),
+                None => json!({"modules": [{"name": "a"}]}),
+            };
+            let m: HashMap<String, Manifest> = [("a".to_string(), sub.clone())].into();
+            let e = validate_fault_policy(&cfg, &names(&["a"]), &m).unwrap_err();
+            let msg = format!("{e:?}");
+            assert!(
+                msg.contains("resume_after_fault") && msg.contains("store_subscriptions"),
+                "{msg}"
+            );
+        }
+        let mut by_rule = Manifest {
+            resume_after_fault: true,
+            ..Manifest::default()
+        };
+        by_rule.demand_from_params = Some(crate::manifest::DemandFromParams {
+            pool: "store_subs".into(),
+            tags: vec![2],
+            split: ",".into(),
+        });
+        let cfg = json!({"modules": [{"name": "a"}]});
+        let m: HashMap<String, Manifest> = [("a".to_string(), by_rule)].into();
+        validate_fault_policy(&cfg, &names(&["a"]), &m).unwrap_err();
+        // Without the attestation a subscriber is fine.
+        sub.resume_after_fault = false;
+        let m: HashMap<String, Manifest> = [("a".to_string(), sub)].into();
+        validate_fault_policy(&cfg, &names(&["a"]), &m).unwrap();
+    }
+
+    /// A module provider and every module it serves share a domain; on a node
+    /// that admits live-added workloads the provider sits in the primary one.
+    #[test]
+    fn a_provider_and_its_callers_share_a_domain() {
+        use crate::manifest::ResourceClaim;
+        let caller = Manifest {
+            resources: vec![ResourceClaim {
+                device_class: 0x13, // storage.namespace
+                access_mode: 0,
+                instance: 0xFF,
+            }],
+            ..Manifest::default()
+        };
+        let store = prov(&["storage.namespace"]);
+        let m: HashMap<String, Manifest> =
+            [("store".to_string(), store), ("watch".to_string(), caller)].into();
+        let domains = json!({"domains": [{"name": "main"}, {"name": "io"}]});
+        let graph = |store_dom: Option<&str>, watch_dom: Option<&str>, capacity: Value| {
+            let entry = |n: &str, d: Option<&str>| match d {
+                Some(d) => json!({"name": n, "domain": d}),
+                None => json!({"name": n}),
+            };
+            json!({
+                "execution": domains,
+                "capacity": capacity,
+                "modules": [entry("store", store_dom), entry("watch", watch_dom)],
+            })
+        };
+        let check = |cfg: &Value, target: &str| {
+            let list = cfg["modules"].as_array().unwrap().clone();
+            validate_provider_domains(cfg, &list, &m, target)
+        };
+        // Together in the primary domain, or together elsewhere on a node that
+        // takes no workloads: fine.
+        check(&graph(None, Some("main"), json!({})), "linux").unwrap();
+        check(
+            &graph(Some("io"), Some("io"), json!({"owners": 0})),
+            "linux",
+        )
+        .unwrap();
+        // Split: refused, naming both modules and domains.
+        let e = check(&graph(None, Some("io"), json!({})), "linux")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("'watch' (domain 'io')")
+                && e.contains("'store'")
+                && e.contains("storage.namespace"),
+            "{e}"
+        );
+        // Outside the primary domain where workloads may be live-added.
+        let e = check(&graph(Some("io"), Some("io"), json!({})), "linux")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("primary domain") && e.contains("live-added"),
+            "{e}"
+        );
+        // A single-tenant kernel admits no workload.
+        check(&graph(Some("io"), Some("io"), json!({})), "rp2350").unwrap();
     }
 
     /// Every other policy, and a graph with no policy at all, is
@@ -3355,6 +3465,19 @@ mod dynamic_capacity_tests {
         );
     }
 
+    /// Each instance's demand, as the composer counts it: no params, no
+    /// `demand:` of its own.
+    fn demand_of(names: &[String], manifests: &HashMap<String, Manifest>) -> Vec<InstanceDemand> {
+        names
+            .iter()
+            .map(|n| InstanceDemand {
+                name: n.clone(),
+                figures: instance_demand(&json!({}), n, manifests.get(n), &[]).unwrap(),
+                heap_per_demand: manifests.get(n).and_then(|m| m.heap_per_demand.clone()),
+            })
+            .collect()
+    }
+
     /// The graph's store consumers declare their subscriptions; the
     /// composer sums them into one FXDM entry for the kernel.
     #[test]
@@ -3368,9 +3491,223 @@ mod dynamic_capacity_tests {
             manifests.insert(name.to_string(), m);
         }
         let names: Vec<String> = ["watch_a", "watch_b", "plain"].map(String::from).to_vec();
-        let declared = declared_demand(&names, &manifests).expect("declared");
+        let demand = demand_of(&names, &manifests);
+        let declared = declared_demand(&json!({}), &names, &manifests, &demand).expect("declared");
         assert_eq!(declared, vec![("store_subs", 0x000A, 12)]);
-        assert!(declared_demand(&names[2..], &manifests).unwrap().is_empty());
+        assert!(
+            declared_demand(&json!({}), &names[2..], &manifests, &demand[2..])
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// A subscriber's `store_subscribers` demand counts against the events
+    /// pool: each one is woken through an event it holds.
+    #[test]
+    fn store_subscribers_declare_events() {
+        let mut m = Manifest::default();
+        m.capacities.insert("store_subscribers".into(), 1);
+        m.capacities.insert("store_subscriptions".into(), 3);
+        let manifests: HashMap<String, Manifest> = [("a", m.clone()), ("b", m)]
+            .map(|(n, m)| (n.to_string(), m))
+            .into();
+        let names: Vec<String> = ["a", "b"].map(String::from).to_vec();
+        let demand = demand_of(&names, &manifests);
+        let declared = declared_demand(&json!({}), &names, &manifests, &demand).unwrap();
+        assert_eq!(
+            declared,
+            vec![("store_subs", 0x000A, 6), ("events", 0x0005, 2)]
+        );
+    }
+
+    /// A params TLV of `entries` `(tag, value)`.
+    fn tlv_of(entries: &[(u8, &[u8])]) -> Vec<u8> {
+        let mut t = vec![0xFE, 0x01, 0, 0];
+        for (tag, v) in entries {
+            t.push(*tag);
+            t.push(v.len() as u8);
+            t.extend_from_slice(v);
+        }
+        t.extend_from_slice(&[0xFF, 0]);
+        t
+    }
+
+    /// `demand_from_params` counts an instance's comma-split param entries in
+    /// place of the type's constant; the graph's own `demand:` wins.
+    #[test]
+    fn demand_from_params_counts_entries_and_an_explicit_figure_wins() {
+        let rule = crate::manifest::DemandFromParams {
+            pool: "store_subs".into(),
+            tags: vec![2, 5],
+            split: ",".into(),
+        };
+        let mut m = Manifest::default();
+        m.capacities.insert("store_subscriptions".into(), 2);
+        m.demand_from_params = Some(rule.clone());
+        // `prefix` (tag 2) names three, `watch` (tag 5) one; tag 9 is not
+        // counted, nor are blank entries.
+        let tlv = tlv_of(&[(2, b"/a/,/b/, /c/,"), (9, b"/x/,/y/"), (5, b"/w/")]);
+        assert_eq!(rule.declared_count(&tlv), 4);
+        assert_eq!(
+            instance_demand(&json!({}), "src", Some(&m), &tlv).unwrap(),
+            vec![("store_subs", 4)]
+        );
+        // A chunked param's chunks are one value.
+        let tlv = tlv_of(&[(2, b"/a/,/b"), (2, b"/,/c/")]);
+        assert_eq!(rule.declared_count(&tlv), 3);
+        // Empty params declare none (the rule replaces the constant).
+        assert!(instance_demand(&json!({}), "src", Some(&m), &tlv_of(&[]))
+            .unwrap()
+            .is_empty());
+        // The graph's figure wins.
+        let module = json!({"demand": {"store_subs": 9}});
+        assert_eq!(
+            instance_demand(&module, "src", Some(&m), &tlv).unwrap(),
+            vec![("store_subs", 9)]
+        );
+        // Without a rule the type's constant stands.
+        m.demand_from_params = None;
+        assert_eq!(
+            instance_demand(&json!({}), "src", Some(&m), &tlv).unwrap(),
+            vec![("store_subs", 2)]
+        );
+        // A pool nothing declares demand on is refused, named.
+        let e = instance_demand(&json!({"demand": {"channels": 1}}), "src", Some(&m), &tlv)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("'channels'") && e.contains("store_subs"), "{e}");
+    }
+
+    /// A store provider's manifest with a `heap_per_demand` rule.
+    fn per_demand_store(bytes_each: u32, base: Option<u32>) -> Manifest {
+        Manifest {
+            provides: vec!["storage.namespace".into()],
+            heap_per_demand: Some(crate::manifest::HeapPerDemand {
+                pool: "store_subs".into(),
+                bytes_each,
+                base,
+            }),
+            ..Manifest::default()
+        }
+    }
+
+    /// `heap_per_demand` adds `bytes_each` × the pool's planned ceiling to
+    /// the instance's heap figure — summed with `heap_from_params` — and an
+    /// explicit `arena_bytes` below the derived figure is refused, naming
+    /// both.
+    #[test]
+    fn heap_per_demand_is_summed_and_a_smaller_explicit_cap_refused() {
+        let plan = HeapPlan {
+            ceilings: [("store_subs".to_string(), 100u64)].into(),
+            quiet: true,
+        };
+        // Base-only form: base + 64 × 100.
+        let m = per_demand_store(64, Some(4096));
+        let module = json!({"name": "kv"});
+        assert_eq!(
+            instance_heap_cap("kv", &module, Some(&m), &tlv_of(&[]), &plan).unwrap(),
+            Some(4096 + 6400)
+        );
+        // Before the plan knows the ceiling, nothing is added.
+        assert_eq!(
+            instance_heap_cap("kv", &module, Some(&m), &tlv_of(&[]), &HeapPlan::default()).unwrap(),
+            None
+        );
+        // Summed with heap_from_params: its derived cap (base 1000 grown by
+        // 50 bytes past `included` 10), plus the per-demand bytes.
+        let mut m = per_demand_store(64, None);
+        m.heap_from_params = Some(crate::manifest::HeapFromParams {
+            tags: vec![2],
+            base: 1000,
+            included: 10,
+        });
+        let tlv = tlv_of(&[(2, &[b'x'; 60])]);
+        assert_eq!(
+            instance_heap_cap("kv", &module, Some(&m), &tlv, &plan).unwrap(),
+            Some(1050 + 6400)
+        );
+        // Params within `included`: the rule's base, plus the bytes.
+        assert_eq!(
+            instance_heap_cap("kv", &module, Some(&m), &tlv_of(&[]), &plan).unwrap(),
+            Some(1000 + 6400)
+        );
+        // An explicit cap at or above the figure wins.
+        let big = json!({"name": "kv", "heap": {"arena_bytes": 20000}});
+        assert_eq!(
+            instance_heap_cap("kv", &big, Some(&m), &tlv, &plan).unwrap(),
+            Some(20000)
+        );
+        // Below it: refused, naming both figures.
+        let small = json!({"name": "kv", "heap": {"arena_bytes": 2000}});
+        let e = instance_heap_cap("kv", &small, Some(&m), &tlv, &plan)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("arena_bytes = 2000") && e.contains("7450 B") && e.contains("store_subs"),
+            "{e}"
+        );
+    }
+
+    /// The plan's ceiling for a `heap_per_demand` pool is the graph's whole
+    /// declared demand plus the reserve: the `capacity:` entry, else the
+    /// profile's default.
+    #[test]
+    fn the_heap_plan_takes_the_full_planned_ceiling() {
+        let demand = vec![
+            InstanceDemand {
+                name: "store".into(),
+                figures: vec![],
+                heap_per_demand: per_demand_store(64, Some(4096)).heap_per_demand,
+            },
+            InstanceDemand {
+                name: "watch".into(),
+                figures: vec![("store_subs", 15)],
+                heap_per_demand: None,
+            },
+        ];
+        let plan = heap_plan("linux", &json!({"capacity": {"store_subs": 5}}), &demand);
+        assert_eq!(plan.ceilings.get("store_subs"), Some(&20));
+        let default = crate::capacity::kernel_pool_default_reserve("linux", "store_subs")
+            .expect("linux has a store_subs reserve");
+        let plan = heap_plan("linux", &json!({}), &demand);
+        assert_eq!(plan.ceilings.get("store_subs"), Some(&(15 + default)));
+        let line = heap_per_demand_report(&plan, &demand, &[]).expect("a figure to print");
+        assert!(
+            line.contains("store +") && line.contains("heap caps"),
+            "{line}"
+        );
+    }
+
+    /// When the graph has an unkeyed module provider of `storage.namespace`,
+    /// the subscription demand leaves the host `store_subs` table — the
+    /// provider serves it from its heap; a keyed provider leaves it there.
+    #[test]
+    fn a_module_store_takes_the_subscription_demand_off_the_host_pool() {
+        let mut watch = Manifest::default();
+        watch.capacities.insert("store_subscriptions".into(), 4);
+        watch.capacities.insert("store_subscribers".into(), 1);
+        let manifests: HashMap<String, Manifest> = [
+            ("store".to_string(), per_demand_store(64, Some(4096))),
+            ("watch".to_string(), watch),
+        ]
+        .into();
+        let names: Vec<String> = ["store", "watch"].map(String::from).to_vec();
+        let demand = demand_of(&names, &manifests);
+        let cfg = json!({"modules": [{"name": "store"}, {"name": "watch"}]});
+        let declared = declared_demand(&cfg, &names, &manifests, &demand).unwrap();
+        assert_eq!(
+            declared,
+            vec![("events", 0x0005, 1)],
+            "events stay kernel's"
+        );
+        // A keyed provider is not the layer class-byte calls reach.
+        let keyed = json!({"modules": [{"name": "store", "params": {"volume": "v"}},
+                                       {"name": "watch"}]});
+        let declared = declared_demand(&keyed, &names, &manifests, &demand).unwrap();
+        assert_eq!(
+            declared,
+            vec![("store_subs", 0x000A, 4), ("events", 0x0005, 1)]
+        );
     }
 
     /// A module id carries 12 bits: id 3000 round-trips through byte 9.
@@ -3387,6 +3724,7 @@ mod dynamic_capacity_tests {
             &HashMap::new(),
             crate::capacity::kernel_max_modules("linux"),
             &crate::target::IsolationFacts::default(),
+            &HeapPlan::default(),
         )
         .expect("entry");
         let b9 = entry[9];
@@ -3413,6 +3751,7 @@ mod dynamic_capacity_tests {
             &HashMap::new(),
             crate::capacity::kernel_max_modules("linux"),
             &crate::target::IsolationFacts::default(),
+            &HeapPlan::default(),
         )
         .expect("entry");
         assert!(
@@ -3434,6 +3773,7 @@ mod dynamic_capacity_tests {
             &manifests,
             crate::capacity::kernel_max_modules("linux"),
             &crate::target::IsolationFacts::default(),
+            &HeapPlan::default(),
         )
         .expect("entry");
         assert!(
@@ -4415,15 +4755,23 @@ mod heap_from_params_tests {
         let rule = m.heap_from_params.as_ref().unwrap();
         assert_eq!(rule.declared_bytes(&params), len as u64);
 
-        let p = insert_workload_heap_tags(params.clone(), &module, "http", Some(&m)).unwrap();
+        let p = insert_workload_heap_tags(
+            params.clone(),
+            &module,
+            "http",
+            Some(&m),
+            &HeapPlan::default(),
+        )
+        .unwrap();
         let want = BASE + (len as u32 - INCLUDED);
         assert_eq!(tag_0xef(&p), Some(want));
         assert_eq!(
-            instance_heap_cap("http", &module, Some(&m), &params).unwrap(),
+            instance_heap_cap("http", &module, Some(&m), &params, &HeapPlan::default()).unwrap(),
             Some(want)
         );
         // Without the rule, nothing is derived.
-        let p = insert_workload_heap_tags(params, &module, "http", None).unwrap();
+        let p =
+            insert_workload_heap_tags(params, &module, "http", None, &HeapPlan::default()).unwrap();
         assert_eq!(tag_0xef(&p), None);
     }
 
@@ -4439,7 +4787,14 @@ mod heap_from_params_tests {
                 json!({"body": "x".repeat(len)})
             };
             let params = pack_params_growing(&module, &body_schema(), None, "http").expect("packs");
-            let p = insert_workload_heap_tags(params.clone(), &module, "http", Some(&m)).unwrap();
+            let p = insert_workload_heap_tags(
+                params.clone(),
+                &module,
+                "http",
+                Some(&m),
+                &HeapPlan::default(),
+            )
+            .unwrap();
             assert_eq!(p, params, "{len} B: params untouched");
         }
     }
@@ -4453,10 +4808,18 @@ mod heap_from_params_tests {
         for explicit in [64u32 << 20, 1 << 20] {
             let module = json!({"body": body, "heap": {"arena_bytes": explicit}});
             let params = pack_params_growing(&module, &body_schema(), None, "http").expect("packs");
-            let p = insert_workload_heap_tags(params.clone(), &module, "http", Some(&m)).unwrap();
+            let p = insert_workload_heap_tags(
+                params.clone(),
+                &module,
+                "http",
+                Some(&m),
+                &HeapPlan::default(),
+            )
+            .unwrap();
             assert_eq!(tag_0xef(&p), Some(explicit));
             assert_eq!(
-                instance_heap_cap("http", &module, Some(&m), &params).unwrap(),
+                instance_heap_cap("http", &module, Some(&m), &params, &HeapPlan::default())
+                    .unwrap(),
                 Some(explicit)
             );
         }
@@ -4476,7 +4839,14 @@ mod heap_from_params_tests {
         assert_eq!(schema::tlv_basic_end(&params), Some(params.len()));
 
         let m = manifest();
-        let p = insert_workload_heap_tags(params.clone(), &module, "http", Some(&m)).unwrap();
+        let p = insert_workload_heap_tags(
+            params.clone(),
+            &module,
+            "http",
+            Some(&m),
+            &HeapPlan::default(),
+        )
+        .unwrap();
         assert_eq!(&p[2..4], &[0xFF, 0xFF]);
         assert_eq!(schema::tlv_basic_end(&p), Some(p.len()));
         assert_eq!(
@@ -4500,7 +4870,7 @@ mod heap_from_params_tests {
         let m = Manifest::from_toml_str_for_target(toml, None).unwrap();
         let module = json!({"body": "x".repeat(1000)});
         let params = pack_params_growing(&module, &body_schema(), None, "http").expect("packs");
-        let err = instance_heap_cap("big", &module, Some(&m), &params)
+        let err = instance_heap_cap("big", &module, Some(&m), &params, &HeapPlan::default())
             .unwrap_err()
             .to_string();
         assert!(err.contains("module 'big'") && err.contains("u32"), "{err}");

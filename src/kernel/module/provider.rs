@@ -1113,8 +1113,8 @@ pub fn register_module_provider(
     0
 }
 
-/// Drop every module-registered provider layer and owner-release
-/// subscription, keeping the kernel's own dispatchers. A full graph rebuild
+/// Drop every module-registered provider layer, owner-release subscription
+/// and pool-sampler mark, keeping the kernel's own dispatchers. A full graph rebuild
 /// (`prepare_graph`) calls this: the modules that registered those layers
 /// are gone, their state arena is reset and reused, and the rebuild never
 /// runs their finish path. A layer left in place would stay the default
@@ -1134,6 +1134,8 @@ pub fn reset_module_layers() {
         }
         let o = &raw mut OWNER_RELEASE_OBSERVERS;
         *o = crate::kernel::workload::bitmask::ModuleMask::new();
+        let s = &raw mut POOL_SAMPLERS;
+        *s = crate::kernel::workload::bitmask::ModuleMask::new();
     }
 }
 
@@ -1144,6 +1146,7 @@ pub fn release_module_providers(module_idx: ModuleId) {
     // A freed slot must not stay subscribed: the slot is reused, and the next
     // module to land in it would inherit a subscription it never asked for.
     clear_owner_release_observer(module_idx);
+    clear_pool_sampler(module_idx);
     // A net.route writer that goes releases its tables' bindings; the tables
     // and what they realized stay.
     crate::kernel::net_route::release_module(module_idx as usize);
@@ -1249,6 +1252,128 @@ pub fn clear_owner_release_observer(module_idx: ModuleId) {
         let p = &raw mut OWNER_RELEASE_OBSERVERS;
         (*p).clear(idx);
     }
+}
+
+// ============================================================================
+// Pool sampling: module-provided pools
+// ============================================================================
+//
+// A pool can be served by a module provider instead of a kernel table (the
+// store's subscriptions, under a module `storage.namespace` provider). The
+// ledger keeps no counters, so it pulls the pool's in-use figure from that
+// provider (`resource::POOL_SAMPLE`), and the provider tells it of each
+// refusal (`resource::LEDGER_DENY`). Both go to one module: the system
+// owner's top-most unkeyed layer of the pool's contract — the layer the
+// node's class-byte calls reach.
+
+/// Providers that answer `POOL_SAMPLE`, by module index. Opt-in, set by the
+/// loader when a provider exports `module_samples_pool`, for the reason
+/// `OWNER_RELEASE_OBSERVERS` is: a dispatch that never asked for the opcode
+/// is never handed it.
+static mut POOL_SAMPLERS: crate::kernel::workload::bitmask::ModuleMask =
+    crate::kernel::workload::bitmask::ModuleMask::EMPTY;
+
+/// Mark `module_idx` as a pool sampler. Called by the loader after the
+/// module's provider registration succeeds; a module holding no provider
+/// layer has no dispatch to ask, so it is refused.
+pub fn register_pool_sampler(module_idx: ModuleId) -> i32 {
+    let idx = module_idx as usize;
+    if idx >= crate::kernel::exec::scheduler::module_slots() {
+        return errno::EINVAL;
+    }
+    if !module_has_provider_layer(module_idx) {
+        log::warn!(
+            "[provider] module {module_idx} exports module_samples_pool but provides no \
+             contract; nothing to ask"
+        );
+        return errno::EINVAL;
+    }
+    // SAFETY: scheduler-thread-only, same access class as the provider table.
+    unsafe {
+        let p = &raw mut POOL_SAMPLERS;
+        (*p).set(idx);
+    }
+    0
+}
+
+/// Drop `module_idx` from the sampler set — with its provider layers, so a
+/// module reusing the slot does not inherit it.
+pub fn clear_pool_sampler(module_idx: ModuleId) {
+    let idx = module_idx as usize;
+    if idx >= crate::kernel::exec::scheduler::module_slots() {
+        return;
+    }
+    // SAFETY: scheduler-thread-only.
+    unsafe {
+        let p = &raw mut POOL_SAMPLERS;
+        (*p).clear(idx);
+    }
+}
+
+/// The module serving `pool` for the node: the system owner's top-most
+/// unkeyed layer of the pool's contract (`resource::
+/// module_provided_pool_contract`), with its dispatch. `None` for a pool no
+/// module provides, or none registered. The borrow of `PROVIDERS` ends with
+/// the call.
+fn pool_provider_layer(pool: u16) -> Option<(ModuleId, ModuleProviderDispatchFn, *mut u8)> {
+    let contract = crate::abi::contracts::resource::module_provided_pool_contract(pool)?;
+    let idx = contract as usize;
+    if idx >= MAX_PROVIDERS {
+        return None;
+    }
+    // SAFETY: scheduler-thread read; nothing here calls into module code.
+    unsafe {
+        let p = &raw const PROVIDERS;
+        let entry = &(*p)[idx];
+        for i in (0..entry.depth as usize).rev() {
+            if let Some(ref layer) = entry.chain[i] {
+                if layer.selector == 0 && layer.owner.is_system() {
+                    return Some((layer.module_idx, layer.dispatch, layer.state));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Whether `module_idx` is the module serving `pool` ([`pool_provider_layer`])
+/// — the one module `LEDGER_DENY` admits for it.
+pub fn is_pool_provider(pool: u16, module_idx: usize) -> bool {
+    pool_provider_layer(pool).is_some_and(|(m, ..)| m as usize == module_idx)
+}
+
+/// Ask the module serving `pool` how much of it is in use (`POOL_SAMPLE`):
+/// `Some(n)` from a marked provider that answered, `None` when no module
+/// serves the pool, the one that does never asked to be sampled, or it could
+/// not say. Runs the provider's dispatch in a provider frame on the calling
+/// thread; the caller must not itself be inside that provider's call (the
+/// ledger asks from its PSTATUS round alone).
+pub fn sample_module_pool(pool: u16) -> Option<u64> {
+    let (module_idx, dispatch, state) = pool_provider_layer(pool)?;
+    let midx = module_idx as usize;
+    // SAFETY: scheduler-thread read of the sampler set.
+    let marked = unsafe {
+        let p = &raw const POOL_SAMPLERS;
+        midx < crate::kernel::exec::scheduler::module_slots() && (*p).test(midx)
+    };
+    if !marked {
+        return None;
+    }
+    let mut arg = pool.to_le_bytes();
+    let rc = in_provider_frame(midx, || {
+        // SAFETY: `dispatch` and `state` are the pair the module registered;
+        // `arg` is a live 2-byte buffer owned by this frame.
+        unsafe {
+            dispatch(
+                state,
+                -1,
+                crate::abi::contracts::resource::POOL_SAMPLE,
+                arg.as_mut_ptr(),
+                crate::abi::contracts::resource::POOL_SAMPLE_ARG_LEN,
+            )
+        }
+    });
+    (rc >= 0).then_some(rc as u64)
 }
 
 /// Whether `module_idx` holds at least one registered provider layer.

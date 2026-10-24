@@ -17,6 +17,15 @@
 //! - **Cadence**: [`emit_all`] publishes one `POOL` record per kernel pool
 //!   in the scheduler's PSTATUS round (`sample_pstatus`), kernel-stamped.
 //!
+//! A pool a module provider serves (`resource::module_provided_pool_contract`:
+//! the store's subscriptions, under a module `storage.namespace` provider) is
+//! still sampled from its owner — the provider. [`emit_all`] asks it
+//! (`resource::POOL_SAMPLE`, to a provider exporting `module_samples_pool`)
+//! and keeps the answer as the pool's in-use figure until the next round, so
+//! a [`deny`] or [`stats`] between rounds reports it without calling into
+//! module code. The provider counts its refusals through
+//! `resource::LEDGER_DENY`, admitted only from it, which lands in [`deny`].
+//!
 //! It also holds the **boot plan**: each pool's ceiling is what the config
 //! derives for it (module and edge counts, resident workloads, declared
 //! demand) plus its live-add reserve (the FXEV envelope entry, else the
@@ -52,6 +61,13 @@ static DERIVED: [AtomicU64; res::KERNEL_POOL_COUNT] =
     [const { AtomicU64::new(0) }; res::KERNEL_POOL_COUNT];
 /// A plan has been made: before one, ceilings are the defaults alone.
 static PLANNED: AtomicBool = AtomicBool::new(false);
+/// The in-use figure the module serving a pool last answered (`POOL_SAMPLE`,
+/// pulled in [`emit_all`]); meaningful where `HAS_MODULE_SAMPLE` is set,
+/// which is cleared when no module answers.
+static MODULE_SAMPLE: [AtomicU64; res::KERNEL_POOL_COUNT] =
+    [const { AtomicU64::new(0) }; res::KERNEL_POOL_COUNT];
+static HAS_MODULE_SAMPLE: [AtomicBool; res::KERNEL_POOL_COUNT] =
+    [const { AtomicBool::new(false) }; res::KERNEL_POOL_COUNT];
 
 /// Kernel pool ids are 1-based and contiguous (`resource` contract).
 fn idx(pool: u16) -> Option<usize> {
@@ -94,8 +110,32 @@ pub fn pool_name(pool: u16) -> &'static str {
     }
 }
 
-/// Sample `cur` in the pool's own units from the owning subsystem.
+/// Ask the module serving `pool` for its in-use figure and keep the answer
+/// for [`sample_cur`]; a pool no module answers for falls back to its kernel
+/// owner. Called from [`emit_all`] alone: it runs the provider's dispatch,
+/// which a [`deny`] reached from inside that provider must not re-enter.
+fn pull_module_sample(pool: u16) {
+    let Some(i) = idx(pool) else { return };
+    if res::module_provided_pool_contract(pool).is_none() {
+        return;
+    }
+    match crate::kernel::module::provider::sample_module_pool(pool) {
+        Some(n) => {
+            MODULE_SAMPLE[i].store(n, Ordering::Relaxed);
+            HAS_MODULE_SAMPLE[i].store(true, Ordering::Relaxed);
+        }
+        None => HAS_MODULE_SAMPLE[i].store(false, Ordering::Relaxed),
+    }
+}
+
+/// Sample `cur` in the pool's own units from the owning subsystem: the
+/// module serving it when one answered the last pull, else the kernel.
 fn sample_cur(pool: u16) -> u64 {
+    if let Some(i) = idx(pool) {
+        if HAS_MODULE_SAMPLE[i].load(Ordering::Relaxed) {
+            return MODULE_SAMPLE[i].load(Ordering::Relaxed);
+        }
+    }
     match pool {
         res::POOL_STATE_ARENA => crate::kernel::module::loader::arena_usage().0 as u64,
         res::POOL_BUFFER_ARENA => crate::kernel::ipc::buffer_pool::arena_usage().0 as u64,
@@ -427,8 +467,25 @@ fn emit_one(pool: u16, t_micros: u64) {
 /// PSTATUS round; the caller has already checked ring subscription.
 pub fn emit_all(t_micros: u64) {
     for pool in 1..=res::KERNEL_POOL_COUNT as u16 {
+        pull_module_sample(pool);
         emit_one(pool, t_micros);
     }
+}
+
+/// A module provider's refusal of `pool` (`resource::LEDGER_DENY`), counted
+/// as the ledger's own [`deny`] when `module_idx` is the module serving the
+/// pool. `EINVAL` for a pool no module provides, `EACCES` for any other
+/// caller: only the pool's server may charge refusals to it.
+pub fn module_deny(pool: u16, module_idx: usize) -> i32 {
+    use crate::kernel::sys::errno;
+    if idx(pool).is_none() || res::module_provided_pool_contract(pool).is_none() {
+        return errno::EINVAL;
+    }
+    if !crate::kernel::module::provider::is_pool_provider(pool, module_idx) {
+        return errno::EACCES;
+    }
+    deny(pool);
+    0
 }
 
 // ── Boot plan ──────────────────────────────────────────────────────────────

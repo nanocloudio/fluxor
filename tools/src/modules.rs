@@ -1280,8 +1280,15 @@ fn check_heap_rule_base(
     abi: Option<&str>,
     variant: Option<&str>,
 ) -> Result<()> {
-    let Some(rule) = manifest.heap_from_params.as_ref() else {
-        return Ok(());
+    // `heap_per_demand` states its own `base` only when the type has no heap
+    // rule; either way one `base` is the figure the composer grows from.
+    let (key, base) = match (
+        manifest.heap_from_params.as_ref(),
+        manifest.heap_per_demand.as_ref().and_then(|r| r.base),
+    ) {
+        (Some(rule), _) => ("heap_from_params", rule.base),
+        (None, Some(base)) => ("heap_per_demand", base),
+        (None, None) => return Ok(()),
     };
     let build = format!(
         "{} / variant {}",
@@ -1289,15 +1296,14 @@ fn check_heap_rule_base(
         variant.unwrap_or("<default>")
     );
     match declared_arena {
-        Some(bytes) if bytes == rule.base => Ok(()),
+        Some(bytes) if bytes == base => Ok(()),
         Some(bytes) => Err(Error::Module(format!(
-            "{}: `[capacities] heap_from_params.base` is {} B for {build}, but this build \
+            "{}: `[capacities] {key}.base` is {base} B for {build}, but this build \
              declares a {bytes} B arena — set `base` to {bytes} for this ABI and variant",
             input.display(),
-            rule.base
         ))),
         None => Err(Error::Module(format!(
-            "{}: declares `[capacities] heap_from_params` but no arena \
+            "{}: declares `[capacities] {key}` but no arena \
              (`declare_module_arena_bytes!`), so its `base` cannot be checked against \
              the build ({build})",
             input.display()
@@ -1539,6 +1545,10 @@ pub fn pack_fmod(
         // resources is never told its consumer went away — a failure that is
         // invisible to host tests, which resolve exports directly.
         "module_observes_owner_release",
+        // Pool-sampler marker: the ledger asks a provider marked with it for
+        // the in-use figure of a pool it serves (`resource::POOL_SAMPLE`).
+        // Absent from the export table, the pool reads as the host's.
+        "module_samples_pool",
         "module_flash_store_dispatch",
         // Backing-provider dispatch (resolved by BACKING_PROVIDER_ENABLE)
         "backing_provider_dispatch",
@@ -2205,6 +2215,24 @@ mod tests {
         assert!(e.contains("declare_module_arena_bytes!"), "{e}");
         // No rule: nothing to check.
         check_heap_rule_base(p, &Manifest::default(), None, None, None).expect("no rule");
+    }
+
+    /// A `heap_per_demand` rule's own `base` (a type with no heap rule) is
+    /// held to the declared arena the same way.
+    #[test]
+    fn heap_per_demand_base_must_be_the_declared_arena() {
+        const TOML: &str = "version = \"1.0.0\"\n[capacities]\n\
+            heap_per_demand = { pool = \"store_subs\", bytes_each = 96, base = 4096 }\n";
+        let m = Manifest::from_toml_str_for_target(TOML, Some("aarch64")).unwrap();
+        let p = Path::new("store.elf");
+        check_heap_rule_base(p, &m, Some(4096), Some("aarch64"), None).expect("matches");
+        let e = check_heap_rule_base(p, &m, Some(8192), Some("aarch64"), None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("heap_per_demand.base` is 4096 B") && e.contains("set `base` to 8192"),
+            "{e}"
+        );
     }
 
     /// A wasm module whose schema has a `str_chunked` param keeps its

@@ -897,6 +897,30 @@ pub mod query_key {
     /// with the system owner there would let a provider charge its own
     /// background work to whoever last called it.
     pub const CALLER_OWNER: u32 = 9;
+
+    /// The module occupancy that invoked the provider frame currently
+    /// running: `handle = -1`; writes `[module idx: u16 LE][_pad: u16]
+    /// [slot generation: u32 LE]` (8 bytes) and returns 8. The generation
+    /// moves whenever the slot is reset, restarted or given another module,
+    /// so the pair names one occupancy: a provider stamps what it holds for
+    /// a module with it and asks [`MODULE_LIVE`] later whether that
+    /// occupancy still stands. `ESRCH` when nothing is on the provider stack.
+    pub const CALLER_MODULE: u32 = 10;
+
+    /// Whether a module occupancy still stands: the out buffer carries an
+    /// 8-byte record as [`CALLER_MODULE`] writes it, `handle = -1`. Returns 1
+    /// when that slot still holds that generation and its module has not
+    /// finished, 0 otherwise. A provider holding work for a module checks it
+    /// lazily — before acting on the module's behalf — instead of relying on
+    /// a release notification's timing.
+    pub const MODULE_LIVE: u32 = 11;
+
+    /// The module occupancy that owns event `handle` (a tagged event fd):
+    /// writes the [`CALLER_MODULE`] record of the owning module and returns
+    /// 8; `ENOENT` when the event is not allocated. A provider that signals
+    /// a subscriber's event checks it before every signal, so an event slot
+    /// freed and taken by another module never wakes the wrong one.
+    pub const EVENT_OWNER: u32 = 12;
 }
 
 // ─────────────────────────────────────────────────────────────────────

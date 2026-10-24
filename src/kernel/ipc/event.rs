@@ -266,6 +266,22 @@ pub fn event_create() -> i32 {
     errno::ENOSPC
 }
 
+/// The module that owns event `handle` (a slot index), or `None` when the
+/// slot is not allocated. Answers anyone: an event's owner is no secret, and
+/// a provider that signals an event on a subscriber's behalf checks it
+/// before every signal, so a slot freed and taken by another module is
+/// never woken for the first one.
+pub fn event_owner(handle: i32) -> Option<ModuleId> {
+    if handle < 0 || handle as usize >= slots().len() {
+        return None;
+    }
+    let slot = &slots()[handle as usize];
+    if !slot.allocated.load(Ordering::Acquire) {
+        return None;
+    }
+    Some(slot.owner.load(Ordering::Acquire))
+}
+
 /// Allocated slots — resource-ledger sample for `POOL_EVENTS`.
 pub fn in_use_count() -> usize {
     slots()

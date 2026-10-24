@@ -667,8 +667,29 @@ pub fn encode_entry(id: u16, n: u64) -> Option<u32> {
 /// What a module's manifest may declare it will ask of a kernel pool at run
 /// time, `([capacities] key, pool name)`. The composer sums the graph's
 /// declarations per pool into the FXDM section, and the kernel adds them to
-/// the pool's derived size.
-pub const DECLARED_DEMAND: &[(&str, &str)] = &[("store_subscriptions", "store_subs")];
+/// the pool's derived size. A key is a per-type constant; a type's
+/// `[capacities] demand_from_params` rule counts its pool per instance
+/// instead, and a graph's `demand: { <pool>: n }` on a module entry wins over
+/// both.
+///
+/// - `store_subscriptions` — store subscriptions (one per watched prefix);
+/// - `store_subscribers` — kernel events: a subscriber is woken through an
+///   event it creates (`storage.namespace` SUBSCRIBE takes one), so each
+///   subscribing instance declares the events it holds for that.
+pub const DECLARED_DEMAND: &[(&str, &str)] = &[
+    ("store_subscriptions", "store_subs"),
+    ("store_subscribers", "events"),
+];
+
+/// Pools a module provider can serve from its own heap in place of the
+/// kernel's host table, `(pool, contract)`. When a graph has an unkeyed module
+/// provider of the contract, its consumers call that module, so the composer
+/// leaves the pool's declared demand off the host table (which the Linux
+/// store sizes from `plan_ceiling(POOL_STORE_SUBS)`) and the provider carries
+/// it in its `heap_per_demand` figure — the demand is spent once. The kernel
+/// pulls the pool's in-use figure from that provider (`resource::POOL_SAMPLE`)
+/// and it counts its refusals there (`resource::LEDGER_DENY`).
+pub const MODULE_PROVIDED_POOLS: &[(&str, &str)] = &[("store_subs", "storage.namespace")];
 
 /// Envelope section magic "FXEV" — mirror of
 /// `resource::ENVELOPE_SECTION_MAGIC`.

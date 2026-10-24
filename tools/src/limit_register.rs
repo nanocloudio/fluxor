@@ -376,29 +376,52 @@ fn declared_rhs_by_scan(text: &str, name: &str) -> Vec<String> {
 
 /// Ceiling-shaped constant names declared in `text`.
 ///
-/// Deliberately a NAMING convention rather than a type or value test: a
-/// ceiling is recognisable by what it is called, and a convention a reader
-/// can apply by eye is one they can also satisfy on purpose.
+/// Mostly a NAMING convention rather than a type or value test: a ceiling is
+/// recognisable by what it is called, and a convention a reader can apply by
+/// eye is one they can also satisfy on purpose. A capacity word counts as the
+/// whole name or its last `_`-separated part (`SLOTS`, `READ_SLOTS`,
+/// `CHUNK_WINDOW`), and `MAX_` as a prefix.
+///
+/// Names alone miss a table sized by a plain noun (`SUBSCRIPTIONS`,
+/// `PENDING_WRITES`), so the scan also counts every constant this file
+/// declares that sizes a FIXED ARRAY OF RECORDS here — `[T; NAME]` in a type
+/// or `[x; NAME]` in an initialiser, the element not a byte or integer:
+/// whatever it is called, a preallocated table is a ceiling.
+///
+/// Only a `const` ITEM declares anything. The keyword also spells a raw
+/// pointer (`*const T`), a raw borrow (`&raw const SLOTS`, of a `static`) and a
+/// const-generic parameter (`impl<const SLOTS: usize>`, or `const SLOTS: usize,`
+/// on a line of its own in a long parameter list); none of those is a
+/// capacity this file decides, so the scan skips them rather than asking the
+/// register to exempt a keyword.
 fn ceiling_consts(text: &str) -> BTreeSet<String> {
-    const SUFFIXES: [&str; 7] = [
-        "_MAX",
-        "_CAP",
-        "_CAPACITY",
-        "_LIMIT",
-        "_BUDGET",
-        "_SIZE",
-        "_SLOTS",
+    const WORDS: [&str; 10] = [
+        "MAX", "CAP", "CAPACITY", "LIMIT", "BUDGET", "SIZE", "SLOTS", "ENTRIES", "WINDOW", "DEPTH",
     ];
+    let mut declared = BTreeSet::new();
     let mut out = BTreeSet::new();
     for (_, line) in line_offsets(text) {
         let Some(rel) = line.find("const ") else {
             continue;
         };
+        let before = line[..rel].trim_end();
+        if before.ends_with('*')
+            || before.ends_with("&raw")
+            || before.ends_with('<')
+            || before.ends_with(',')
+        {
+            continue;
+        }
         let rest = &line[rel + "const ".len()..];
         let name: String = rest
             .chars()
             .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
             .collect();
+        // A parameter alone on its line: no initialiser, closed by `,` or `>`.
+        let tail = rest[name.len()..].trim_end();
+        if !tail.contains('=') && (tail.ends_with(',') || tail.ends_with('>')) {
+            continue;
+        }
         if name.len() < 2
             || !name
                 .chars()
@@ -406,8 +429,82 @@ fn ceiling_consts(text: &str) -> BTreeSet<String> {
         {
             continue;
         }
-        if name.starts_with("MAX_") || SUFFIXES.iter().any(|s| name.ends_with(s)) {
-            out.insert(name);
+        let last = name.rsplit('_').next().unwrap_or(&name);
+        if name.starts_with("MAX_") || WORDS.contains(&last) {
+            out.insert(name.clone());
+        }
+        declared.insert(name);
+    }
+    for len in array_lengths(text) {
+        if declared.contains(&len) {
+            out.insert(len);
+        }
+    }
+    out
+}
+
+/// Whether an array's element is a plain scalar — an integer or byte type,
+/// or a literal of one (`u8`, `0u8`, `0`, `0xFF`, `b' '`, `false`). Such an
+/// array is a buffer, sized by a wire or record bound the register exempts
+/// as a format; an array of records (`[Sub; N]`, `[NO_SUB; N]`,
+/// `[[u8; K]; N]`) is a table, which is what the scan is for.
+fn is_scalar_element(elem: &str) -> bool {
+    const SCALARS: [&str; 13] = [
+        "u8", "u16", "u32", "u64", "u128", "usize", "i8", "i16", "i32", "i64", "i128", "isize",
+        "bool",
+    ];
+    SCALARS.contains(&elem)
+        || elem == "false"
+        || elem == "true"
+        || elem.starts_with("b'")
+        || elem.starts_with(|c: char| c.is_ascii_digit())
+}
+
+/// Names that stand as the whole length of an array type or repeat
+/// expression in `text` whose element is not a scalar: the `NAME` of
+/// `[T; NAME]` / `[x; NAME]`. A length computed from several names
+/// (`[T; A + B]`) names no one table size and is skipped.
+fn array_lengths(text: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let b = text.as_bytes();
+    let mut i = 0;
+    while let Some(rel) = text[i..].find(';') {
+        let semi = i + rel;
+        i = semi + 1;
+        // `; NAME]`, the name all caps.
+        let after = text[semi + 1..].trim_start();
+        let name: String = after
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        if name.len() < 2
+            || !name.starts_with(|c: char| c.is_ascii_uppercase())
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+            || !after[name.len()..].trim_start().starts_with(']')
+        {
+            continue;
+        }
+        // Inside an open `[` on this line: the element part before `;`.
+        let line_start = text[..semi].rfind('\n').map_or(0, |n| n + 1);
+        let mut depth = 0i32;
+        let mut open = None;
+        for (k, &c) in b[line_start..semi].iter().enumerate().rev() {
+            match c {
+                b']' => depth += 1,
+                b'[' if depth == 0 => {
+                    open = Some(line_start + k + 1);
+                    break;
+                }
+                b'[' => depth -= 1,
+                _ => {}
+            }
+        }
+        if let Some(start) = open {
+            if !is_scalar_element(text[start..semi].trim()) {
+                out.insert(name);
+            }
         }
     }
     out
@@ -1276,6 +1373,65 @@ mod tests {
             &[(SRC, src)],
         );
         assert!(run(&e).uncovered.is_empty());
+    }
+
+    /// The reverse scan finds a table however it is named: a constant this
+    /// file declares and sizes a fixed array of records with, and a capacity
+    /// word as the whole name or its last part. A byte buffer's length, a
+    /// length from another file, a computed length and a plain constant are
+    /// not counted.
+    #[test]
+    fn coverage_finds_fixed_arrays_and_capacity_words() {
+        let src = "pub const SLOTS: usize = 32;\n\
+                   pub const SUBSCRIPTIONS: usize = 256;\n\
+                   const PENDING_WRITES: usize = 32;\n\
+                   pub const CHUNK_WINDOW: usize = 4;\n\
+                   pub const ROUTE_ENTRIES: usize = 8;\n\
+                   pub const HEAD_LEN: usize = 50;\n\
+                   pub const KEY_LEN: usize = 16;\n\
+                   const ROWS: usize = 4;\n\
+                   struct S {\n    subs: [Sub; SUBSCRIPTIONS],\n    \
+                   keys: [[u8; KEY_LEN]; ROWS],\n    pad: [u8; HEAD_LEN + 2],\n    \
+                   other: [u8; ELSEWHERE_MAX],\n}\n\
+                   static W: [Write; PENDING_WRITES] = [NO_WRITE; PENDING_WRITES];\n";
+        let d = project(
+            "prose\n\n```limit-register\nSLOTS | src/a.rs | 32\n```\n",
+            &[(SRC, src)],
+        );
+        let r = run(&d);
+        assert_eq!(
+            r.uncovered,
+            [
+                "CHUNK_WINDOW",
+                "PENDING_WRITES",
+                "ROUTE_ENTRIES",
+                "ROWS",
+                "SUBSCRIPTIONS"
+            ]
+            .map(|n| format!("src/a.rs::{n}"))
+            .to_vec(),
+            "KEY_LEN sizes a byte buffer, HEAD_LEN only a computed length; ELSEWHERE_MAX is \
+             not declared here"
+        );
+    }
+
+    /// `const` as a pointer qualifier, a raw borrow or a const-generic
+    /// parameter declares nothing, so it is not a ceiling even when the name
+    /// after it is shaped like one or sizes an array — the real `const` item
+    /// beside them still is.
+    #[test]
+    fn coverage_skips_generic_params_and_raw_pointers() {
+        let src = "pub struct C<\n    const SLOTS: usize,\n    const BODY_SIZE: usize,\n> {\n    \
+                   slots: [Slot<BODY_SIZE>; SLOTS],\n}\n\
+                   impl<const SLOTS: usize, const BODY_SIZE: usize> C<SLOTS, BODY_SIZE> {}\n\
+                   static mut TABLE: [Entry; 4] = [Entry::EMPTY; 4];\n\
+                   fn f() { let t = &raw const TABLE; let p: *const MAX_T = core::ptr::null(); }\n\
+                   const REAL_SLOTS: usize = 8;\n";
+        let d = project(
+            "prose\n\n```limit-register\nOTHER_MAX | src/a.rs | 1\n```\n",
+            &[(SRC, &format!("{src}const OTHER_MAX: usize = 1;\n"))],
+        );
+        assert_eq!(run(&d).uncovered, vec!["src/a.rs::REAL_SLOTS".to_string()]);
     }
 
     /// A register with no machine-checked block states a rule about the

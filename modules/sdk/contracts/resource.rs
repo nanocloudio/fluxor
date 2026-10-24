@@ -140,6 +140,60 @@ pub const fn decode_entry(pool: u16, n: u32) -> u64 {
 /// channels only, and a grant lies outside all three.
 pub const ELASTIC_ALLOC: u32 = 0x0C3F;
 
+// ── Module-provided pools ─
+//
+// A pool can be served by a module provider rather than a kernel table: the
+// store's subscriptions, when a module provides `storage.namespace` (the
+// composer then plans the demand into that provider's heap, not the host
+// table). The ledger still keeps no counters of its own: it PULLS the pool's
+// in-use figure from that provider, and the provider tells it of each
+// refusal, so the pool's `POOL` record reads the same whoever serves it.
+//
+// A provider opts in by exporting the marker
+//
+//   #[no_mangle] #[link_section = ".text.module_samples_pool"]
+//   pub extern "C" fn module_samples_pool() -> u32 { 1 }
+//
+// beside `module_provider_dispatch`. The loader reads it after the
+// provider's registration succeeds; a module that registers no contract is
+// refused, and one without the marker is never called with `POOL_SAMPLE`.
+
+/// The kernel's question TO a provider: how much of `pool` is in use. The
+/// ledger calls the marked provider's `module_provider_dispatch` with this
+/// opcode once per pool it serves in each PSTATUS round (never from inside
+/// a provider call, so the provider is not re-entered), on the scheduler
+/// thread, in a provider frame.
+///
+/// `handle = -1`; `arg = [pool: u16 LE]`, `arg_len = 2`. The provider
+/// answers the pool's in-use figure in the pool's own unit (`>= 0`), or a
+/// negative errno when it cannot say — the ledger then keeps the last
+/// figure it was given. The handler must be bounded: a count it keeps, not
+/// a walk.
+pub const POOL_SAMPLE: u32 = 0x0C25;
+
+/// Byte length of the `POOL_SAMPLE` argument.
+pub const POOL_SAMPLE_ARG_LEN: usize = 2;
+
+/// Count a refusal against `pool`: the provider of a module-provided pool
+/// refused a request for want of capacity (it answered the request `ENOMEM`,
+/// as the store family does). `handle = -1`; `arg = [pool: u16 LE]`.
+/// The ledger counts the denial and pushes the pool's `POOL` record, as for
+/// its own refusals. Admitted only from the module currently registered as
+/// the default (unkeyed) provider of the pool's contract
+/// ([`module_provided_pool_contract`]): `EACCES` from any other caller,
+/// `EINVAL` for a pool no module provides. Answers 0.
+pub const LEDGER_DENY: u32 = 0x0C24;
+
+/// The contract whose module provider serves `pool`, as a contract id
+/// (`requires_contract` class byte), or `None` for a pool only the kernel
+/// serves. `POOL_STORE_SUBS` → `storage.namespace` (0x13).
+pub const fn module_provided_pool_contract(pool: u16) -> Option<u16> {
+    match pool {
+        POOL_STORE_SUBS => Some(0x0013),
+        _ => None,
+    }
+}
+
 // ── Capacity-envelope config section ───
 //
 // The composer's per-deployment pool envelope, carried as a post-body

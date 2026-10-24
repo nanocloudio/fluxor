@@ -41,10 +41,9 @@ use crate::platform::linux::store::{Served, Store};
 
 /// Where owner roots live when `FLUXOR_OWNER_ROOT` is unset.
 const DEFAULT_BASE: &str = "/var/lib/fluxor/owners";
-/// Change history an owner's store retains for its watchers.
+/// Change history an owner's store retains: how far back its watchers'
+/// `CHANGES` reads reach before they relist.
 const OWNER_STORE_HISTORY: usize = 4096;
-/// Changes one of an owner's watchers may fall behind by.
-const OWNER_STORE_RING: usize = 1024;
 /// Longest path an owner names, matching the `fs` provider's own bound.
 const PATH_MAX: usize = 255;
 
@@ -167,11 +166,7 @@ unsafe fn root_for(owner: OwnerHandle) -> Option<&'static mut Root> {
 pub unsafe fn store_for(owner: OwnerHandle) -> Option<&'static mut Served> {
     let root = root_for(owner)?;
     if root.store.is_none() {
-        match Store::open(
-            &root.dir.join("store"),
-            OWNER_STORE_HISTORY,
-            OWNER_STORE_RING,
-        ) {
+        match Store::open(&root.dir.join("store"), OWNER_STORE_HISTORY) {
             Ok(s) => {
                 let served = Served::owner(s);
                 scheduler::owners_mut().charge_storage_held(owner, served.held_bytes());

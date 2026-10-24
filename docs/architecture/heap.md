@@ -190,6 +190,66 @@ than trusted: a module with the rule must declare its arena
 arena differs from `base` resolved for that build's ABI and variant, naming
 the figure to write.
 
+### Per-demand cap: `[capacities] heap_per_demand`
+
+A provider that serves a kernel pool's demand from its own heap — a module
+`storage.namespace` provider holding the graph's store subscriptions — is
+sized at pack time, when heap caps are fixed, from the pool's plan:
+
+```toml
+[capacities]
+heap_per_demand = { pool = "store_subs", bytes_each = 96 }
+# a type with no heap_from_params rule states its own cap:
+# heap_per_demand = { pool = "store_subs", bytes_each = 96, base = 65536 }
+```
+
+| Field | Meaning |
+|---|---|
+| `pool` | a kernel pool whose ceiling is declared demand plus reserve: not an arena, and not one the graph's shape derives (`module_slots`, `channels`, `owners`, `sandboxes`, `state_free_list`) |
+| `bytes_each` | heap bytes per unit of the pool, per ABI like any capacity |
+| `base` | the type's default cap, only without a `heap_from_params` rule (whose `base` it otherwise is); `pack` holds it to the declared arena as it does that rule's |
+
+Every instance of the type gets `bytes_each` × the pool's **full planned
+ceiling**: what the graph's instances declare for it (base graph and resident
+workloads, a module-provided pool's demand included — the provider serves
+it), plus the pool's `capacity:` entry, else the profile's default reserve.
+That is summed with `heap_from_params`: the cap is that rule's figure (its
+`base` while the params fit `included`), or the rule's own `base`, plus the
+per-demand bytes. An explicit `heap.arena_bytes` still wins, but one below the
+derived figure is refused at compose, naming both — the pool is planned to a
+ceiling that instance could not serve. The composer prints the per-demand
+bytes beside the total of the heap caps it set (`Heap per demand: …`).
+
+Counting the demand needs every instance's params packed, so a graph with a
+`heap_per_demand` instance is packed once quietly to count it, then again
+under the plan. On an elastic heap the extra cap costs about `cap >> 7` at
+the first allocation and grows with use; a committed-heap profile pays it
+whole, once per instance that may provide.
+
+### Declared demand per instance: `[capacities] demand_from_params`
+
+What a module will ask of a kernel pool at run time is declared demand
+(`capacity::DECLARED_DEMAND`: `store_subscriptions` → `store_subs`,
+`store_subscribers` → `events`), summed by the composer into the FXDM section
+and added to the pool's derived size. A per-type constant
+(`store_subscriptions = 2`) overstates or understates a module whose
+instances watch what their params name, so the type can count it instead:
+
+```toml
+[capacities]
+demand_from_params = { pool = "store_subs", tags = [2, 5], split = "," }
+```
+
+For each instance the composer joins each tag's TLV value (a chunked param's
+chunks are one value), splits it on `split` (default `,`) and counts the
+non-blank entries; the sum is the instance's demand on `pool`, in place of the
+type's constant. A graph's own figure for an instance —
+`demand: { store_subs: 12 }` on its module entry — wins over both. Resident
+workloads are counted like base modules. When the base graph has an unkeyed
+module provider of `storage.namespace`, the `store_subs` demand is left off
+the host table (its consumers call the module) and carried by that
+provider's `heap_per_demand` figure instead, so it is spent once.
+
 ## Syscall API
 
 Three entries in the SyscallTable:

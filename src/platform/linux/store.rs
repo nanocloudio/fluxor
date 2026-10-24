@@ -3,11 +3,18 @@
 //!
 //! A versioned watchable KV is not a bespoke contract: it decomposes into the
 //! standard storage surfaces (`storage.object` CAS and LIST,
-//! `storage.namespace` LIST/SUBSCRIBE, and a `RevisionMonotone` fence). This
-//! module implements that decomposition: a keyed byte store with a monotone
-//! revision clock, per-key revision (the CAS token / etag), prefix
-//! enumeration, and a bounded change history that drives SUBSCRIBE with
-//! resume-from-revision.
+//! `storage.namespace` LIST/SUBSCRIBE/TAKE_RUNG/CHANGES, and a
+//! `RevisionMonotone` fence). This module implements that decomposition: a
+//! keyed byte store with a monotone revision clock, per-key revision (the CAS
+//! token / etag), prefix enumeration, and a bounded key-only change history
+//! that `CHANGES` pages from and the subscription pump rings from.
+//!
+//! A subscription is a doorbell: the store never writes a subscriber's
+//! channel. It keeps one *rung* bit per subscription and signals the
+//! subscriber's own kernel event when a change under the prefix finds the bit
+//! clear; the subscriber asks `TAKE_RUNG` which of its subscriptions rang and
+//! reads each with `CHANGES`, which answers from the history at the store's
+//! current state, one bounded page per call.
 //!
 //! The store is single-writer: the runtime hosts the control plane's modules
 //! in one process and the provider serialises calls, so there is no
@@ -25,14 +32,17 @@ use std::path::Path;
 const OP_PUT: u8 = 1;
 const OP_DELETE: u8 = 2;
 
-/// One change delivered to a watcher / retained in history.
+/// One entry of the change history: which key a revision touched, and how.
+/// Key-only — a `CHANGES` read takes the key's value at the store's current
+/// state, never a copy kept here.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Change {
     pub revision: u64,
     pub key: String,
+    /// What the write did to the key. A hint for the record's
+    /// Added-versus-Modified label; whether the key is present is read from
+    /// the store, never from here.
     pub kind: ChangeKind,
-    /// Present for Added/Modified; absent for Deleted.
-    pub value: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,29 +74,9 @@ impl WriteError {
     }
 }
 
-/// A subscriber's drain outcome: buffered changes, or `Lost` when the ring
-/// overflowed / the resume point preceded retained history — the consumer must
-/// relist and re-subscribe from `resume_revision`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Drain {
-    Events(Vec<Change>),
-    Lost { resume_revision: u64 },
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct WatchId(pub u64);
-
 struct Entry {
     value: Vec<u8>,
     revision: u64,
-}
-
-struct Watch {
-    prefix: String,
-    ring: VecDeque<Change>,
-    lost: bool,
-    lost_resume: u64,
-    cap: usize,
 }
 
 /// A single-writer append log — the store's durability and seed seam. No
@@ -211,14 +201,25 @@ fn parse_log(data: &[u8]) -> std::io::Result<(Vec<LogRecord>, usize)> {
 /// An in-memory versioned keyspace with an optional durable append log.
 /// Single-writer per instance (the provider serialises calls) — no interior
 /// mutability, no locks.
+///
+/// Every write takes exactly one revision and touches exactly one key, so the
+/// history holds one entry per revision, in revision order. That is what lets
+/// a `CHANGES` page always cut at a revision boundary and resume from a bare
+/// revision.
 pub struct Store {
     entries: BTreeMap<String, Entry>,
     revision: u64,
+    /// The changes after `history_base`, oldest first, at most `history_cap`.
     history: VecDeque<Change>,
     history_cap: usize,
-    watches: BTreeMap<WatchId, Watch>,
-    next_watch: u64,
-    default_ring_cap: usize,
+    /// The history covers every revision after this one: the revision of the
+    /// newest entry dropped off its front, 0 while none has been. A `since`
+    /// below it is a point the history can no longer answer.
+    history_base: u64,
+    /// The revision each absent key was deleted at, for keys whose delete the
+    /// history still holds: what a `CHANGES` read reports a `Deleted` record
+    /// at, and how it tells a delete it is looking at from a later one.
+    tombstones: BTreeMap<String, u64>,
     log: Option<Log>,
 }
 
@@ -258,32 +259,43 @@ impl Precondition {
     }
 }
 
+/// History entries one `CHANGES` call walks at most, and keys one relist page
+/// walks at most: the per-call budget the contract says a provider states. A
+/// page that spends it answers `more` and the caller asks again.
+pub const CHANGES_SCAN_BUDGET: usize = 4096;
+
+/// The kind byte a relist continuation opens with:
+/// `[TOKEN_RELIST][pinned revision u64 LE][cursor key]`. Never 8 bytes long
+/// (the cursor is a non-empty key), so it never reads as a bare revision.
+const TOKEN_RELIST: u8 = 1;
+/// A relist continuation's bytes before its cursor.
+const RELIST_TOKEN_HEAD: usize = 1 + 8;
+
 impl Store {
     pub fn new() -> Self {
-        Self::with_limits(4096, 1024)
+        Self::with_limits(4096)
     }
 
-    /// `history_cap` bounds watch-replay reach; `ring_cap` bounds a single
-    /// subscriber's in-flight backlog before it is declared `Lost`.
-    pub fn with_limits(history_cap: usize, ring_cap: usize) -> Self {
+    /// `history_cap` bounds how far back a `CHANGES since` read reaches: past
+    /// it the read answers LOST and the reader relists.
+    pub fn with_limits(history_cap: usize) -> Self {
         Store {
             entries: BTreeMap::new(),
             revision: 0,
             history: VecDeque::new(),
             history_cap: history_cap.max(1),
-            watches: BTreeMap::new(),
-            next_watch: 1,
-            default_ring_cap: ring_cap.max(1),
+            history_base: 0,
+            tombstones: BTreeMap::new(),
             log: None,
         }
     }
 
     /// Open a durable store, replaying its append log at `dir/store.log` to
     /// rebuild the map, the revision clock, and the tail of the change history.
-    pub fn open(dir: &Path, history_cap: usize, ring_cap: usize) -> std::io::Result<Self> {
+    pub fn open(dir: &Path, history_cap: usize) -> std::io::Result<Self> {
         let created = !dir.exists();
         std::fs::create_dir_all(dir)?;
-        let mut store = Self::with_limits(history_cap, ring_cap);
+        let mut store = Self::with_limits(history_cap);
         let (log, records) = Log::open(&dir.join("store.log"))?;
         // A write is acknowledged `LocalDurable` once its record is synced,
         // which holds across a power cut only if the log's directory entry
@@ -304,38 +316,10 @@ impl Store {
 
     /// Apply a record already durable in the log (replay at open). Sets the
     /// revision clock to max (the revision came off the log) and routes through
-    /// `record`, so history retains it for future-subscriber replay.
+    /// `apply`, so history retains it for a reader resuming from before it.
     fn replay(&mut self, rev: u64, op: u8, key: String, value: Vec<u8>) {
         self.revision = self.revision.max(rev);
-        let change = if op == OP_DELETE {
-            self.entries.remove(&key);
-            Change {
-                revision: rev,
-                key,
-                kind: ChangeKind::Deleted,
-                value: None,
-            }
-        } else {
-            let existed = self.entries.contains_key(&key);
-            self.entries.insert(
-                key.clone(),
-                Entry {
-                    value: value.clone(),
-                    revision: rev,
-                },
-            );
-            Change {
-                revision: rev,
-                key,
-                kind: if existed {
-                    ChangeKind::Modified
-                } else {
-                    ChangeKind::Added
-                },
-                value: Some(value),
-            }
-        };
-        self.record(change);
+        self.apply(rev, op, &key, value);
     }
 
     /// Whether writes to this store reach a durable log before they are
@@ -363,35 +347,38 @@ impl Store {
 
     fn apply_local(&mut self, rev: u64, op: u8, key: &str, value: Vec<u8>) {
         self.revision = rev;
-        let change = if op == OP_DELETE {
+        self.apply(rev, op, key, value);
+    }
+
+    /// Apply one write to the map and record it in the history.
+    fn apply(&mut self, rev: u64, op: u8, key: &str, value: Vec<u8>) {
+        let kind = if op == OP_DELETE {
             self.entries.remove(key);
-            Change {
-                revision: rev,
-                key: key.to_string(),
-                kind: ChangeKind::Deleted,
-                value: None,
-            }
+            self.tombstones.insert(key.to_string(), rev);
+            ChangeKind::Deleted
         } else {
-            let existed = self.entries.contains_key(key);
-            self.entries.insert(
-                key.to_string(),
-                Entry {
-                    value: value.clone(),
-                    revision: rev,
-                },
-            );
-            Change {
-                revision: rev,
-                key: key.to_string(),
-                kind: if existed {
-                    ChangeKind::Modified
-                } else {
-                    ChangeKind::Added
-                },
-                value: Some(value),
+            self.tombstones.remove(key);
+            let existed = self
+                .entries
+                .insert(
+                    key.to_string(),
+                    Entry {
+                        value,
+                        revision: rev,
+                    },
+                )
+                .is_some();
+            if existed {
+                ChangeKind::Modified
+            } else {
+                ChangeKind::Added
             }
         };
-        self.record(change);
+        self.record(Change {
+            revision: rev,
+            key: key.to_string(),
+            kind,
+        });
     }
 
     /// Insert or update under `precondition`. Returns the new store revision.
@@ -440,7 +427,7 @@ impl Store {
 
     /// Key-ordered `(key, revision)` snapshot under `prefix`, plus the store
     /// revision the snapshot is consistent at — the list→watch watermark a
-    /// subsequent `subscribe(prefix, watermark)` resumes from with no gap.
+    /// subsequent `CHANGES since` resumes from with no gap.
     pub fn list(&self, prefix: &str) -> (Vec<(String, u64)>, u64) {
         let items = self
             .entries
@@ -459,6 +446,17 @@ impl Store {
         prefix: &'a [u8],
         after: Option<&'a str>,
     ) -> impl Iterator<Item = (&'a str, u64, u64)> + 'a {
+        self.walk(prefix, after)
+            .map(|(k, e)| (k, e.value.len() as u64, e.revision))
+    }
+
+    /// The entries under the byte `prefix` in key order, strictly after
+    /// `after` when given.
+    fn walk<'a>(
+        &'a self,
+        prefix: &'a [u8],
+        after: Option<&'a str>,
+    ) -> impl Iterator<Item = (&'a str, &'a Entry)> + 'a {
         use std::ops::Bound;
         // The longest UTF-8 head of the prefix is a lower bound on every key
         // that starts with the prefix; a prefix that ends inside a code point
@@ -475,103 +473,214 @@ impl Store {
             .range::<str, _>((lower, Bound::Unbounded))
             .skip_while(move |(k, _)| k.as_bytes() < prefix)
             .take_while(move |(k, _)| k.as_bytes().starts_with(prefix))
-            .map(|(k, e)| (k.as_str(), e.value.len() as u64, e.revision))
+            .map(|(k, e)| (k.as_str(), e))
     }
 
-    /// Open a watch over `prefix`, delivering every retained change with
-    /// `revision > since_revision`, then live changes. If `since_revision`
-    /// precedes retained history, the watch opens already `Lost`.
-    pub fn subscribe(&mut self, prefix: &str, since_revision: u64) -> WatchId {
-        let id = WatchId(self.next_watch);
-        self.next_watch += 1;
-        let mut watch = Watch {
-            prefix: prefix.to_string(),
-            ring: VecDeque::new(),
-            lost: false,
-            lost_resume: 0,
-            cap: self.default_ring_cap,
+    /// The history entries after `since`, oldest first.
+    fn history_after(&self, since: u64) -> impl Iterator<Item = &Change> {
+        let start = self.history.partition_point(|c| c.revision <= since);
+        self.history.range(start..)
+    }
+
+    /// The lowest `since` the history still answers: a `CHANGES since` below
+    /// it is LOST.
+    pub fn history_base(&self) -> u64 {
+        self.history_base
+    }
+
+    /// One `CHANGES` page under the byte `prefix`, resumed from `token`, into
+    /// `out` — the [`namespace::CHANGES`](ns_op::CHANGES) answer, its length
+    /// or a negative errno. `budget` bounds the history entries (or, for a
+    /// relist, the keys) the call walks.
+    ///
+    /// Tokens: empty is a relist; 8 bytes a bare revision `since`; anything
+    /// else must be a relist continuation this store issued (`EINVAL`
+    /// otherwise). A history page always cuts at a revision boundary (one
+    /// entry per revision), so its continuation is itself a bare revision.
+    pub fn changes(&self, prefix: &[u8], token: &[u8], out: &mut [u8], budget: usize) -> i32 {
+        let budget = budget.max(1);
+        if token.is_empty() {
+            return self.relist(prefix, self.revision, None, out, budget);
+        }
+        if let Some(since) = ns_op::changes::token_revision(token) {
+            return self.changes_since(prefix, since, out, budget);
+        }
+        if token.len() <= RELIST_TOKEN_HEAD || token[0] != TOKEN_RELIST {
+            return errno::EINVAL;
+        }
+        let pinned = u64::from_le_bytes(token[1..RELIST_TOKEN_HEAD].try_into().unwrap());
+        let after = match list_cursor(&token[RELIST_TOKEN_HEAD..], prefix) {
+            Ok(Some(after)) => after,
+            _ => return errno::EINVAL,
         };
-        let oldest = self.history.front().map(|c| c.revision);
-        let reachable = match oldest {
-            None => since_revision <= self.revision,
-            Some(o) => since_revision.saturating_add(1) >= o,
+        if pinned > self.revision {
+            return errno::EINVAL;
+        }
+        // The relist ends by handing the reader `pinned` to resume from; a
+        // history that no longer reaches back to it would answer that resume
+        // LOST, so the relist is LOST now rather than finished for nothing.
+        if pinned < self.history_base {
+            return lost(out);
+        }
+        self.relist(prefix, pinned, Some(after), out, budget)
+    }
+
+    /// A history page: one record per key under `prefix` with an entry after
+    /// `since`, read at the current state.
+    ///
+    /// A key is reported at its LAST entry in the history — its current
+    /// `mod_rev`, or the revision of the delete that left it absent — and
+    /// passed over at every earlier one. So intermediate versions collapse,
+    /// no record's `mod_rev` lies past the page's cut (the entry that holds
+    /// it is on this page or a later one), and a key created and deleted
+    /// inside the window is reported `Deleted`, never omitted.
+    fn changes_since(&self, prefix: &[u8], since: u64, out: &mut [u8], budget: usize) -> i32 {
+        use ns_op::changes as ch;
+        // A point the history cannot answer — dropped off its front, or never
+        // reached — is LOST, never an empty "nothing changed".
+        if since < self.history_base || since > self.revision {
+            return lost(out);
+        }
+        let Some(mut page) = ch::PageWriter::new(out, ch::REVISION_TOKEN_LEN) else {
+            return errno::ENOMEM;
         };
-        if !reachable {
-            watch.lost = true;
-            watch.lost_resume = self.revision;
-        } else {
-            for change in self.history.iter() {
-                if change.revision > since_revision && change.key.starts_with(prefix) {
-                    Self::push(&mut watch, change.clone(), self.revision);
+        // The hint of the first entry this page saw for a key it passed over:
+        // a key created earlier in the window is labelled Added.
+        let mut first_hint: BTreeMap<&str, ChangeKind> = BTreeMap::new();
+        let mut cut = since;
+        let mut more = false;
+        for (scanned, c) in self.history_after(since).enumerate() {
+            if scanned == budget {
+                more = true;
+                break;
+            }
+            if c.key.as_bytes().starts_with(prefix) {
+                if c.key.len() > STORAGE_KEY_MAX {
+                    return errno::EOVERFLOW;
+                }
+                let present = self.entries.get(&c.key);
+                let last = match present {
+                    Some(e) => e.revision,
+                    None => self.tombstones.get(&c.key).copied().unwrap_or(c.revision),
+                };
+                if last > c.revision {
+                    first_hint.entry(c.key.as_str()).or_insert(c.kind);
+                } else {
+                    let (kind, val) = match present {
+                        None => (ch::KIND_DELETED, &[][..]),
+                        Some(e) => {
+                            let hint = first_hint.get(c.key.as_str()).copied().unwrap_or(c.kind);
+                            let kind = if hint == ChangeKind::Added {
+                                ch::KIND_ADDED
+                            } else {
+                                ch::KIND_MODIFIED
+                            };
+                            (kind, e.value.as_slice())
+                        }
+                    };
+                    if !page.push(c.revision, kind, c.key.as_bytes(), val) {
+                        more = true;
+                        break;
+                    }
                 }
             }
+            cut = c.revision;
         }
-        self.watches.insert(id, watch);
-        id
+        if more && cut == since {
+            // Not even the first record fits: no progress.
+            return errno::ENOMEM;
+        }
+        if !more {
+            // The walk reached the newest entry: every revision through now
+            // is covered.
+            cut = self.revision;
+        }
+        match page.finish(more, cut, &ch::revision_token(cut)) {
+            Some(n) => n as i32,
+            None => errno::ENOMEM,
+        }
     }
 
-    /// Drain up to `max` buffered changes (0 = all). `Lost` is sticky until
-    /// drained once, then the watch resumes buffering from `resume_revision`.
-    pub fn drain(&mut self, id: WatchId, max: usize) -> Option<Drain> {
-        let watch = self.watches.get_mut(&id)?;
-        if watch.lost {
-            watch.lost = false;
-            let resume = watch.lost_resume;
-            watch.ring.clear();
-            return Some(Drain::Lost {
-                resume_revision: resume,
-            });
-        }
-        let take = if max == 0 {
-            watch.ring.len()
-        } else {
-            max.min(watch.ring.len())
+    /// A relist page: the keys under `prefix` after `after`, in key order,
+    /// `Added` with their values, the walk pinned at revision `pinned`.
+    ///
+    /// A key changed after `pinned` is passed over: it has a history entry
+    /// after `pinned`, so the `CHANGES since pinned` that follows the relist
+    /// reports it, and no relist record carries a `mod_rev` past the point
+    /// the reader resumes from. Nothing is delivered whole until the walk
+    /// ends, so a page with `more` set carries `safe_rev` 0; the last carries
+    /// `pinned`, as its bare revision token.
+    fn relist(
+        &self,
+        prefix: &[u8],
+        pinned: u64,
+        after: Option<&str>,
+        out: &mut [u8],
+        budget: usize,
+    ) -> i32 {
+        use ns_op::changes as ch;
+        let Some(mut page) = ch::PageWriter::new(out, RELIST_TOKEN_HEAD + STORAGE_KEY_MAX) else {
+            return errno::ENOMEM;
         };
-        let events = watch.ring.drain(..take).collect();
-        Some(Drain::Events(events))
-    }
-
-    /// Redeliver events a `drain` took but the caller could not fit, in order.
-    pub fn requeue_front(&mut self, id: WatchId, events: Vec<Change>) {
-        if let Some(watch) = self.watches.get_mut(&id) {
-            for ev in events.into_iter().rev() {
-                watch.ring.push_front(ev);
+        let mut last: Option<&str> = None;
+        let mut more = false;
+        for (scanned, (key, e)) in self.walk(prefix, after).enumerate() {
+            if scanned == budget {
+                more = true;
+                break;
             }
+            if key.len() > STORAGE_KEY_MAX {
+                return errno::EOVERFLOW;
+            }
+            if e.revision <= pinned
+                && !page.push(e.revision, ch::KIND_ADDED, key.as_bytes(), &e.value)
+            {
+                more = true;
+                break;
+            }
+            last = Some(key);
         }
-    }
-
-    pub fn unsubscribe(&mut self, id: WatchId) -> bool {
-        self.watches.remove(&id).is_some()
-    }
-
-    pub fn watch_count(&self) -> usize {
-        self.watches.len()
+        let n = match (more, last) {
+            (false, _) => page.finish(false, pinned, &ch::revision_token(pinned)),
+            // Not even the first record fits: no progress.
+            (true, None) => return errno::ENOMEM,
+            (true, Some(key)) => {
+                let mut token = [0u8; RELIST_TOKEN_HEAD + STORAGE_KEY_MAX];
+                token[0] = TOKEN_RELIST;
+                token[1..RELIST_TOKEN_HEAD].copy_from_slice(&pinned.to_le_bytes());
+                token[RELIST_TOKEN_HEAD..RELIST_TOKEN_HEAD + key.len()]
+                    .copy_from_slice(key.as_bytes());
+                page.finish(true, 0, &token[..RELIST_TOKEN_HEAD + key.len()])
+            }
+        };
+        match n {
+            Some(n) => n as i32,
+            None => errno::ENOMEM,
+        }
     }
 
     fn record(&mut self, change: Change) {
-        let rev = self.revision;
-        for watch in self.watches.values_mut() {
-            if change.key.starts_with(&watch.prefix) {
-                Self::push(watch, change.clone(), rev);
-            }
-        }
         self.history.push_back(change);
         while self.history.len() > self.history_cap {
-            self.history.pop_front();
+            let Some(old) = self.history.pop_front() else {
+                break;
+            };
+            self.history_base = old.revision;
+            // A delete the history no longer holds is no longer asked about.
+            if old.kind == ChangeKind::Deleted
+                && self.tombstones.get(&old.key) == Some(&old.revision)
+            {
+                self.tombstones.remove(&old.key);
+            }
         }
     }
+}
 
-    fn push(watch: &mut Watch, change: Change, store_revision: u64) {
-        if watch.lost {
-            return;
-        }
-        if watch.ring.len() >= watch.cap {
-            watch.lost = true;
-            watch.lost_resume = store_revision;
-            watch.ring.clear();
-            return;
-        }
-        watch.ring.push_back(change);
+/// Write a LOST page — the reader relists — into `out`.
+fn lost(out: &mut [u8]) -> i32 {
+    match ns_op::changes::write_lost(out) {
+        Some(n) => n as i32,
+        None => errno::ENOMEM,
     }
 }
 
@@ -595,20 +704,14 @@ use crate::abi::contracts::storage::handle::STORAGE_KEY_MAX;
 use crate::abi::contracts::storage::object::precondition as obj_precondition;
 use crate::abi::contracts::storage::{namespace as ns_op, object as obj_op};
 use crate::abi::fence::{Fence, QUERY_OP, WIRE_MAX_LEN};
-use crate::kernel::ipc::channel::channel_write;
-use crate::kernel::ipc::fd::{slot_of, tag_fd, FD_TAG_STORAGE_NAMESPACE, FD_TAG_STORAGE_OBJECT};
+use crate::kernel::ipc::fd::{
+    slot_of, tag_fd, untag_fd, FD_TAG_EVENT, FD_TAG_STORAGE_NAMESPACE, FD_TAG_STORAGE_OBJECT,
+};
 use crate::kernel::sys::errno;
 use crate::kernel::workload::owner::{OwnerHandle, OWNER_SYSTEM};
 use crate::kernel::workload::storage::store_entry_cost;
 
-/// `CONTENT_TYPES` byte for `NamespaceChange` (`contracts/src/lib.rs`). A
-/// watcher routes on this to tell a store change from anything else sharing
-/// its sink, so it must be the vocabulary's byte and not a private one.
-const CT_NAMESPACE_CHANGE: u8 = 0x23;
-/// mesh Event header size (see `modules/foundation/mesh/mesh_types.rs`).
-const EVENT_HEADER_SIZE: usize = 32;
-
-/// A fixed 16-byte source id for this store's fences/events (ObjectId).
+/// A fixed 16-byte source id for this store's fences (ObjectId).
 const STORE_SOURCE: [u8; 16] = *b"fluxor-cp-store\0";
 
 /// Device id reported in a `LocalDurable` fence.
@@ -631,22 +734,110 @@ fn plan_ceiling(pool: u16) -> usize {
     crate::kernel::sys::resource_ledger::ceiling(pool) as usize
 }
 
-#[derive(Clone, Copy)]
+/// A subscription: a prefix, the event that is its doorbell, and the rung
+/// bit that coalesces its rings until the subscriber takes them.
+#[derive(Clone)]
 struct Sub {
     in_use: bool,
-    watch: WatchId,
-    sink_chan: u32,
-    sequence: u32,
+    prefix: String,
+    /// The subscriber's event, as a raw event slot.
+    event: i32,
+    /// Set when a change rang the subscription; cleared by `TAKE_RUNG`. A
+    /// change that finds it set signals nothing: the take still to come
+    /// follows the change.
+    rung: bool,
     /// The owner that subscribed, which the slot goes with.
     opener: OwnerHandle,
+    /// The module occupancy that subscribed: it must still stand, and still
+    /// own `event`, for the subscription to be signalled.
+    module: Occupancy,
 }
 const SUB_EMPTY: Sub = Sub {
     in_use: false,
-    watch: WatchId(0),
-    sink_chan: 0,
-    sequence: 0,
+    prefix: String::new(),
+    event: -1,
+    rung: false,
     opener: OWNER_SYSTEM,
+    module: Occupancy {
+        idx: usize::MAX,
+        generation: 0,
+    },
 };
+
+/// One module occupancy: a slot and the generation it held. The slot's
+/// generation moves whenever the slot is reset, restarted or reassigned, so
+/// a stale stamp is detectable without being told.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Occupancy {
+    idx: usize,
+    generation: u32,
+}
+
+impl Occupancy {
+    /// The module whose call this is — the host store runs in its caller's
+    /// own context, so the current module, the one `event::CREATE` stamps an
+    /// event with — or `None` outside any module.
+    fn caller() -> Option<Self> {
+        use crate::kernel::exec::scheduler;
+        let idx = scheduler::current_module_index();
+        (idx < scheduler::module_slots()).then(|| Occupancy {
+            idx,
+            generation: scheduler::module_slot_generation(idx),
+        })
+    }
+
+    /// The slot still holds this generation and its module has not finished.
+    fn live(self) -> bool {
+        use crate::kernel::exec::scheduler;
+        self.idx < scheduler::module_slots()
+            && scheduler::module_slot_generation(self.idx) == self.generation
+            && !scheduler::module_is_finished(self.idx)
+    }
+
+    /// This occupancy's module owns event slot `event`.
+    fn owns_event(self, event: i32) -> bool {
+        crate::kernel::ipc::event::event_owner(event).map(usize::from) == Some(self.idx)
+    }
+}
+
+/// The raw event slot a tagged event fd names, or `None` when `fd` is not one.
+fn event_slot(fd: i32) -> Option<i32> {
+    let (tag, slot) = untag_fd(fd);
+    (fd >= 0 && tag == FD_TAG_EVENT).then_some(slot)
+}
+
+/// Whether `s` may still be signalled: its module occupancy stands and its
+/// event still belongs to that module. A subscription that fails this is
+/// dead — its module is gone, or its event slot now another module's — and
+/// is dropped rather than signalled.
+fn sub_alive(s: &Sub) -> bool {
+    s.in_use && s.module.live() && s.module.owns_event(s.event)
+}
+
+/// Ring `s`: set its rung bit and signal its event, unless the bit is
+/// already set. A dead subscription is dropped instead, before any signal,
+/// and so is one whose event the kernel no longer has.
+fn ring(s: &mut Sub) {
+    if !s.in_use || s.rung {
+        return;
+    }
+    if !sub_alive(s) {
+        *s = SUB_EMPTY;
+        return;
+    }
+    s.rung = true;
+    if crate::kernel::ipc::event::event_signal(s.event) == errno::EINVAL {
+        *s = SUB_EMPTY;
+    }
+}
+
+/// Drop every dead subscription in `subs`: what a refusal at capacity sweeps
+/// first, so a table full of subscribers that are gone refuses no one.
+fn reap_dead(subs: &mut [Sub]) {
+    for s in subs.iter_mut().filter(|s| s.in_use && !sub_alive(s)) {
+        *s = SUB_EMPTY;
+    }
+}
 
 /// A GET-opened read slot: a value snapshot the caller drains via RANGE_GET.
 struct ReadSlot {
@@ -713,6 +904,9 @@ pub struct Served {
     /// The pools the tables are sized from, `[subs, reads, writes]`: what a
     /// refusal names.
     pools: [u16; 3],
+    /// The revision the subscription pump has rung through: the history
+    /// after it is what the next pump matches against the subscriptions.
+    pumped: u64,
 }
 
 /// Refuse a slot past a table's ceiling: count it against `pool` and name it,
@@ -742,6 +936,7 @@ const OWNER_POOLS: [u16; 3] = [
 impl Served {
     fn with_tables(store: Store, pools: [u16; 3], stage_max: usize) -> Self {
         let mut served = Self {
+            pumped: store.revision(),
             store,
             subs: Vec::new(),
             reads: Vec::new(),
@@ -889,7 +1084,7 @@ pub unsafe fn store_init_from_env() -> StoreInit {
         Some(roots) => MESH_ROOTS = roots,
         None => return StoreInit::Failed,
     }
-    match Store::open(std::path::Path::new(&dir), 65536, 4096) {
+    match Store::open(std::path::Path::new(&dir), 65536) {
         Ok(s) => {
             LINUX_STORE = Some(Served::node(s));
             StoreInit::Opened
@@ -1010,7 +1205,7 @@ unsafe fn grant_of(handle: i32) -> Option<usize> {
     let slot = slot_of(handle) as usize;
     let i = slot.checked_sub(GRANT_SLOT_BASE)?;
     let g = (&*core::ptr::addr_of!(GRANTS)).get(i)?.as_ref()?;
-    let owner = crate::kernel::exec::scheduler::caller_module_index();
+    let owner = crate::kernel::exec::scheduler::current_module_index();
     let generation = crate::kernel::exec::scheduler::module_slot_generation(owner);
     (g.owner == owner && g.owner_generation == generation).then_some(i)
 }
@@ -1075,7 +1270,7 @@ unsafe fn present(arg: *mut u8, a: &[u8]) -> i32 {
             return errno::ENOMEM;
         }
     };
-    let owner = crate::kernel::exec::scheduler::caller_module_index();
+    let owner = crate::kernel::exec::scheduler::current_module_index();
     grants[i] = Some(Grant {
         scope: req.scope.to_vec(),
         permissions: g.permissions,
@@ -1195,7 +1390,6 @@ pub unsafe fn release_opener(opener: OwnerHandle) {
         .iter_mut()
         .filter(|s| s.in_use && s.opener == opener)
     {
-        served.store.unsubscribe(s.watch);
         *s = SUB_EMPTY;
     }
 }
@@ -1299,9 +1493,9 @@ fn str_field(a: &[u8]) -> Option<(&str, usize)> {
     Some((core::str::from_utf8(bytes).ok()?, 2 + len))
 }
 
-/// A key a `PUT` may create. Empty is the relist sentinel's key on the change
-/// stream and the "end of listing" cursor on `LIST`; longer than `STORAGE_KEY_MAX`
-/// cannot be carried by either listing.
+/// A key a `PUT` may create. Empty is the "end of listing" cursor on `LIST`
+/// and a relist's token on `CHANGES`; longer than `STORAGE_KEY_MAX` cannot be
+/// carried by a listing or a change record.
 fn writable_key(key: &str) -> bool {
     !key.is_empty() && key.len() <= STORAGE_KEY_MAX
 }
@@ -1351,97 +1545,31 @@ unsafe fn write_fence(fence: Fence, ptr: u64, cap: u16) {
     let _ = fence.encode(buf);
 }
 
-// ---- namespace.change event push ----
+// ---- subscription pump ----
 
-/// Encode a `Change` as `[EventHeader(32)][rev:u64][kind:u8][key_len:u16][val_len:u32][key][val]`.
-fn encode_event(seq: u32, ch: &Change) -> Vec<u8> {
-    let key = ch.key.as_bytes();
-    let val = ch.value.as_deref().unwrap_or(&[]);
-    let payload_len = 8 + 1 + 2 + 4 + key.len() + val.len();
-    let mut buf = vec![0u8; EVENT_HEADER_SIZE + payload_len];
-    // mesh Event header (all LE): source[16], sequence[4], timestamp[8], ct[1], flags[1], length[2]
-    buf[0..16].copy_from_slice(&STORE_SOURCE);
-    buf[16..20].copy_from_slice(&seq.to_le_bytes());
-    // timestamp left 0 (advisory)
-    buf[28] = CT_NAMESPACE_CHANGE;
-    buf[29] = 0;
-    buf[30..32].copy_from_slice(&(payload_len as u16).to_le_bytes());
-    let mut p = EVENT_HEADER_SIZE;
-    buf[p..p + 8].copy_from_slice(&ch.revision.to_le_bytes());
-    p += 8;
-    buf[p] = match ch.kind {
-        ChangeKind::Added => 0,
-        ChangeKind::Modified => 1,
-        ChangeKind::Deleted => 2,
-    };
-    p += 1;
-    buf[p..p + 2].copy_from_slice(&(key.len() as u16).to_le_bytes());
-    p += 2;
-    buf[p..p + 4].copy_from_slice(&(val.len() as u32).to_le_bytes());
-    p += 4;
-    buf[p..p + key.len()].copy_from_slice(key);
-    p += key.len();
-    buf[p..p + val.len()].copy_from_slice(val);
-    buf
-}
-
-/// Drain every active subscription and push its changes onto its sink channel.
-/// Synchronous — the pump point (there is no async provider callback). On a
-/// full channel (`EAGAIN`) the undelivered tail is requeued for the next pump.
-/// Takes the store by `&mut` (never re-acquires the singleton) so it never
-/// aliases the caller's borrow.
-unsafe fn pump_subscriptions(store: &mut Store, subs: &mut [Sub]) {
-    for s in subs.iter_mut() {
-        if !s.in_use {
-            continue;
-        }
-        loop {
-            match store.drain(s.watch, 32) {
-                Some(Drain::Events(evs)) => {
-                    if evs.is_empty() {
-                        break;
-                    }
-                    let mut requeue: Vec<Change> = Vec::new();
-                    let mut blocked = false;
-                    for (i, ch) in evs.iter().enumerate() {
-                        if blocked {
-                            requeue.push(ch.clone());
-                            continue;
-                        }
-                        let bytes = encode_event(s.sequence, ch);
-                        let rc = channel_write(s.sink_chan as i32, bytes.as_ptr(), bytes.len());
-                        if rc == errno::EAGAIN {
-                            blocked = true;
-                            requeue.push(ch.clone());
-                            // remaining handled by the `blocked` branch above
-                            let _ = i;
-                        } else {
-                            s.sequence = s.sequence.wrapping_add(1);
-                        }
-                    }
-                    if !requeue.is_empty() {
-                        store.requeue_front(s.watch, requeue);
-                        break; // channel full — try again on the next pump
-                    }
-                }
-                Some(Drain::Lost { .. }) => {
-                    // A LOST is delivered as a distinguished namespace.change with
-                    // kind=Deleted and an empty key (the "relist" sentinel).
-                    let sentinel = Change {
-                        revision: store.revision(),
-                        key: String::new(),
-                        kind: ChangeKind::Deleted,
-                        value: None,
-                    };
-                    let bytes = encode_event(s.sequence, &sentinel);
-                    let _ = channel_write(s.sink_chan as i32, bytes.as_ptr(), bytes.len());
-                    s.sequence = s.sequence.wrapping_add(1);
-                    break;
-                }
-                None => break,
+/// Ring every subscription whose prefix holds a key the history recorded
+/// since the last pump, then mark the history pumped through now. A pump that
+/// finds the history has dropped revisions it never matched rings every
+/// subscription: it cannot tell which prefixes they touched, and a spurious
+/// ring costs one empty read where a missed one is a change never seen.
+///
+/// Synchronous — the pump point is the write itself (there is no async
+/// provider callback). Writes no channel: a ring is a rung bit and an event
+/// signal.
+fn pump(store: &Store, subs: &mut [Sub], pumped: &mut u64) {
+    if *pumped < store.history_base() {
+        subs.iter_mut().for_each(ring);
+    } else {
+        for c in store.history_after(*pumped) {
+            for s in subs
+                .iter_mut()
+                .filter(|s| s.in_use && c.key.starts_with(s.prefix.as_str()))
+            {
+                ring(s);
             }
         }
     }
+    *pumped = store.revision();
 }
 
 // ---- storage.object dispatch (routed here when the store is active) ----
@@ -1484,6 +1612,7 @@ pub unsafe fn dispatch_object_on(
     let pools = served.pools;
     let store = &mut served.store;
     let subs = &mut served.subs;
+    let pumped = &mut served.pumped;
     let reads = &mut served.reads;
     let writes = &mut served.writes;
 
@@ -1619,7 +1748,7 @@ pub unsafe fn dispatch_object_on(
                         }
                     };
                     write_fence(achieved, fence_ptr, fence_cap);
-                    pump_subscriptions(store, subs);
+                    pump(store, subs, pumped);
                     0
                 }
                 // Two answers, because they ask the caller to do two
@@ -1730,7 +1859,7 @@ pub unsafe fn dispatch_object_on(
                         }
                     };
                     write_fence(achieved, fence_ptr, fence_cap);
-                    pump_subscriptions(store, subs);
+                    pump(store, subs, pumped);
                     writes[idx].committed = true;
                     0
                 }
@@ -1878,7 +2007,7 @@ pub unsafe fn dispatch_object_on(
                         }
                     };
                     write_fence(achieved, fptr, fcap);
-                    pump_subscriptions(store, subs);
+                    pump(store, subs, pumped);
                     0
                 }
                 Err(WriteError::Conflict(_)) => errno::EAGAIN,
@@ -2007,8 +2136,8 @@ pub unsafe fn dispatch_namespace_on(
     };
 
     match opcode {
-        // Versioned store: live subscriptions and windowed change reads
-        // are implemented; mutation (BIND/RENAME/DELETE) flows through the
+        // Versioned store: subscriptions (SUBSCRIBE + TAKE_RUNG) and paged
+        // change reads are implemented; mutation (BIND/RENAME/DELETE) flows through the
         // object surface, not this one (namespace.rs::caps).
         ns_op::CAPS => (ns_op::caps::SUBSCRIBE | ns_op::caps::CHANGES) as i32,
         ns_op::LIST => {
@@ -2053,168 +2182,133 @@ pub unsafe fn dispatch_namespace_on(
             n as i32
         }
         ns_op::SUBSCRIBE => {
-            // [prefix_len:u16][prefix][sink_chan:u32][flags:u8]
-            let Some((prefix, p)) = str_field(a) else {
+            let Some(req) = ns_op::subscribe::parse(a) else {
                 return errno::EINVAL;
             };
-            let prefix = prefix.to_string();
-            let Some(sink_chan) = get_u32(a, p) else {
+            // Keys are UTF-8, so a prefix that is not could match nothing.
+            let Ok(prefix) = core::str::from_utf8(req.prefix) else {
                 return errno::EINVAL;
             };
-            let flags = *a.get(p + 4).unwrap_or(&0);
-            let include_initial = flags & 0x01 != 0;
-
-            // Live subscription from the current watermark; if the caller wants the
-            // initial listing, synthesise Added events for every current entry so
-            // the stream is a complete list→watch with no separate GET.
-            let watermark = store.revision();
-            let watch = if include_initial {
-                let (items, _) = store.list(&prefix);
-                let wid = store.subscribe(&prefix, watermark);
-                // Feed the current state as history-shaped Added events by
-                // pushing them straight to the channel ahead of the live ring.
-                let Some(idx) = subs.iter().position(|s| !s.in_use) else {
-                    store.unsubscribe(wid);
-                    return refuse_slot(pools[0], subs.len());
-                };
-                subs[idx] = Sub {
-                    in_use: true,
-                    watch: wid,
-                    sink_chan,
-                    sequence: 0,
-                    opener,
-                };
-                for (k, rev) in items {
-                    let val = store.get(&k).map(|(v, _)| v.to_vec());
-                    let ch = Change {
-                        revision: rev,
-                        key: k,
-                        kind: ChangeKind::Added,
-                        value: val,
-                    };
-                    let bytes = encode_event(subs[idx].sequence, &ch);
-                    if channel_write(sink_chan as i32, bytes.as_ptr(), bytes.len()) <= 0 {
-                        // The snapshot could not be delivered whole. Release
-                        // the slot and refuse: a watcher established on a
-                        // partial list believes it has seen the full state,
-                        // and nothing later in the stream corrects it.
-                        subs[idx].in_use = false;
-                        store.unsubscribe(wid);
-                        return errno::EAGAIN;
-                    }
-                    subs[idx].sequence = subs[idx].sequence.wrapping_add(1);
+            // The doorbell must be the calling module's own event: a
+            // subscription on another module's event would wake a stranger.
+            let (Some(event), Some(module)) = (event_slot(req.event), Occupancy::caller()) else {
+                return errno::EINVAL;
+            };
+            if !module.owns_event(event) {
+                return errno::EINVAL;
+            }
+            let ring_now = req.flags & ns_op::subscribe::FLAG_RING_NOW != 0;
+            // Idempotent: a module re-running its subscribe path gets the
+            // subscription it already has, never a second one.
+            let same = |s: &Sub| {
+                s.in_use
+                    && s.opener == opener
+                    && s.module == module
+                    && s.event == event
+                    && s.prefix == prefix
+            };
+            if let Some(idx) = subs.iter().position(same) {
+                if ring_now {
+                    ring(&mut subs[idx]);
                 }
                 return tag_fd(FD_TAG_STORAGE_NAMESPACE, idx as i32);
-            } else {
-                store.subscribe(&prefix, watermark)
-            };
-            let Some(idx) = subs.iter().position(|s| !s.in_use) else {
-                store.unsubscribe(watch);
-                return refuse_slot(pools[0], subs.len());
+            }
+            let idx = match subs.iter().position(|s| !s.in_use) {
+                Some(idx) => idx,
+                None => {
+                    reap_dead(subs);
+                    match subs.iter().position(|s| !s.in_use) {
+                        Some(idx) => idx,
+                        None => return refuse_slot(pools[0], subs.len()),
+                    }
+                }
             };
             subs[idx] = Sub {
                 in_use: true,
-                watch,
-                sink_chan,
-                sequence: 0,
+                prefix: prefix.to_string(),
+                event,
+                rung: false,
                 opener,
+                module,
             };
+            if ring_now {
+                ring(&mut subs[idx]);
+            }
             tag_fd(FD_TAG_STORAGE_NAMESPACE, idx as i32)
         }
-        ns_op::CHANGES => {
-            // [prefix_len:u16][prefix][since:u64][out_buf:u64][out_cap:u32]
-            // [fence_out_ptr:u64][fence_out_cap:u16]
-            let Some((prefix, mut p)) = str_field(a) else {
+        ns_op::TAKE_RUNG => {
+            let Some(req) = ns_op::take::parse(a) else {
                 return errno::EINVAL;
             };
-            let prefix = prefix.to_string();
-            let since = get_u64(a, p).unwrap_or(0);
-            p += 8;
-            let out_buf = get_u64(a, p).unwrap_or(0);
-            let out_cap = get_u32(a, p + 8).unwrap_or(0) as usize;
-            let fptr = get_u64(a, p + 12).unwrap_or(0);
-            let fcap = get_u16(a, p + 20).unwrap_or(0);
-
-            // Event record: [rev:u64][kind:u8][key_len:u16][val_len:u32][key][val].
-            fn push_event(body: &mut Vec<u8>, rev: u64, kind: u8, key: &str, val: &[u8]) {
-                body.extend_from_slice(&rev.to_le_bytes());
-                body.push(kind);
-                body.extend_from_slice(&(key.len() as u16).to_le_bytes());
-                body.extend_from_slice(&(val.len() as u32).to_le_bytes());
-                body.extend_from_slice(key.as_bytes());
-                body.extend_from_slice(val);
-            }
-
-            let mut body = Vec::new();
-            let mut count: u32 = 0;
-            let mut status: u8 = 0;
-            let mut fence_rev = since;
-
-            if since == 0 {
-                // Full snapshot: every current entry as Added at its revision.
-                let (items, wm) = store.list(&prefix);
-                fence_rev = wm;
-                for (k, rev) in items {
-                    let val = store.get(&k).map(|(v, _)| v.to_vec()).unwrap_or_default();
-                    push_event(&mut body, rev, 0, &k, &val);
-                    count += 1;
-                    if rev > fence_rev {
-                        fence_rev = rev;
-                    }
-                }
-            } else {
-                // Incremental: resume the change history from `since`.
-                let wid = store.subscribe(&prefix, since);
-                match store.drain(wid, 0) {
-                    Some(Drain::Events(evs)) => {
-                        for ch in evs {
-                            let kind = match ch.kind {
-                                ChangeKind::Added => 0u8,
-                                ChangeKind::Modified => 1u8,
-                                ChangeKind::Deleted => 2u8,
-                            };
-                            let val = ch.value.unwrap_or_default();
-                            push_event(&mut body, ch.revision, kind, &ch.key, &val);
-                            count += 1;
-                            if ch.revision > fence_rev {
-                                fence_rev = ch.revision;
-                            }
-                        }
-                    }
-                    Some(Drain::Lost { resume_revision }) => {
-                        status = 1;
-                        fence_rev = resume_revision;
-                    }
-                    None => {}
-                }
-                store.unsubscribe(wid);
-            }
-
-            let mut buf = Vec::with_capacity(5 + body.len());
-            buf.push(status);
-            buf.extend_from_slice(&count.to_le_bytes());
-            buf.extend_from_slice(&body);
-            if out_buf != 0 && buf.len() <= out_cap {
-                core::ptr::copy_nonoverlapping(buf.as_ptr(), out_buf as *mut u8, buf.len());
-            } else if out_buf != 0 {
+            let out = core::slice::from_raw_parts_mut(req.out_ptr as *mut u8, req.out_cap as usize);
+            let Some(mut answer) = ns_op::take::Writer::new(out) else {
                 return errno::ENOMEM;
+            };
+            // Only the caller's own subscriptions on that event are named: its
+            // owner and its occupancy both.
+            let (Some(event), Some(module)) = (event_slot(req.event), Occupancy::caller()) else {
+                return answer.finish(false) as i32;
+            };
+            let mut more = false;
+            for (idx, s) in subs.iter_mut().enumerate() {
+                if !(s.in_use
+                    && s.rung
+                    && s.opener == opener
+                    && s.module == module
+                    && s.event == event)
+                {
+                    continue;
+                }
+                if !answer.push(tag_fd(FD_TAG_STORAGE_NAMESPACE, idx as i32)) {
+                    // Its bit stays set, and the event rings again so the
+                    // rest is taken on the next wake.
+                    more = true;
+                    break;
+                }
+                s.rung = false;
             }
-            write_fence(
-                Fence::ViewConsistent {
-                    source: STORE_SOURCE,
-                    revision: fence_rev,
-                },
-                fptr,
-                fcap,
-            );
-            buf.len() as i32
+            if more && module.owns_event(event) {
+                crate::kernel::ipc::event::event_signal(event);
+            }
+            answer.finish(more) as i32
+        }
+        ns_op::CHANGES => {
+            let Some(req) = ns_op::changes::parse_request(a) else {
+                return errno::EINVAL;
+            };
+            // `req.sub` names the subscription the read serves, for a
+            // provider that may answer EAGAIN and re-ring it later. This one
+            // answers from memory inside the call and never waits, so it has
+            // nothing to re-ring.
+            let out = core::slice::from_raw_parts_mut(req.out_ptr as *mut u8, req.out_cap as usize);
+            let n = store.changes(req.prefix, req.token, out, CHANGES_SCAN_BUDGET);
+            if n >= 0 {
+                // The records were read at the current state.
+                write_fence(
+                    Fence::ViewConsistent {
+                        source: STORE_SOURCE,
+                        revision: store.revision(),
+                    },
+                    req.fence_out_ptr,
+                    req.fence_out_cap,
+                );
+            }
+            n
         }
         // The store enumerates and watches; it has no per-path handle.
         ns_op::LOOKUP | ns_op::STAT => errno::ENOSYS,
         ns_op::CLOSE => {
+            // A subscription answers its opener alone: its owner AND its
+            // module occupancy, since every node module shares the system
+            // owner. To anyone else CLOSE is a no-op, as if it were not open.
             let idx = slot_of(handle) as usize;
-            if handle >= 0 && idx < subs.len() && subs[idx].in_use && subs[idx].opener == opener {
-                store.unsubscribe(subs[idx].watch);
+            let module = Occupancy::caller();
+            if handle >= 0
+                && idx < subs.len()
+                && subs[idx].in_use
+                && subs[idx].opener == opener
+                && Some(subs[idx].module) == module
+            {
                 subs[idx] = SUB_EMPTY;
             }
             0
