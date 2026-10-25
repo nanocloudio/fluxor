@@ -48,7 +48,8 @@
 //!   (`carve::retire`), and the next carve takes from them before it lowers
 //!   the floor, so a rebuild to a larger graph reuses what the previous
 //!   graph's tables held. That is sound because a reservation runs only
-//!   where no core can still read the table (see [`Table::reserve`]).
+//!   where no other core can still read the table, and the move masks its
+//!   own core's interrupts (see [`Table::reserve`]).
 //! - **Linux** frees it to the host's allocator at once. The hosted runtime
 //!   reads its tables from the scheduler thread alone, which runs the
 //!   reservation between passes (see [`Table::reserve`]).
@@ -65,8 +66,10 @@
 //! the format's array: the config blob's graph section is laid out for its
 //! compiled slot count there.
 //!
-//! None of this runs on a step: a table is reserved and committed while a
-//! graph is prepared or a subgraph is added.
+//! A table is reserved while a graph is prepared and committed then or when
+//! a subgraph is added, never on a step. The one exception is a table its
+//! own lock guards (the net-attach lane tables), which a provider's claim
+//! reserves on its step, under that lock.
 
 use core::ops::{Deref, DerefMut, Index, IndexMut};
 
@@ -221,6 +224,27 @@ mod imp {
     #[cfg(any(feature = "chip-bcm2712", feature = "rp"))]
     fn alloc_block(bytes: usize, align: usize) -> Result<*mut u8, TableError> {
         crate::kernel::mem::carve::carve(bytes, align).ok_or(TableError::NoMemory)
+    }
+
+    /// Mask this core's interrupts for a table move (bcm2712); the state to
+    /// restore. A compiler fence on each side keeps the move's accesses
+    /// inside the masked window. `None` before the platform has installed
+    /// its HAL, when no handler is bound yet.
+    #[cfg(feature = "chip-bcm2712")]
+    fn mask_interrupts() -> Option<u32> {
+        if !crate::kernel::sys::hal::is_initialised() {
+            return None;
+        }
+        let state = crate::kernel::sys::hal::disable_interrupts();
+        core::sync::atomic::compiler_fence(Ordering::SeqCst);
+        Some(state)
+    }
+
+    /// Restore what [`mask_interrupts`] saved.
+    #[cfg(feature = "chip-bcm2712")]
+    fn restore_interrupts(state: u32) {
+        core::sync::atomic::compiler_fence(Ordering::SeqCst);
+        crate::kernel::sys::hal::restore_interrupts(state);
     }
 
     /// The type-erased table: its block, bounds and state.
@@ -381,6 +405,17 @@ mod imp {
             } else if ceiling > reserved {
                 let bytes = ceiling.checked_mul(self.size).ok_or(TableError::NoMemory)?;
                 let fresh = alloc_block(bytes, self.align)?;
+                // bcm2712: the copy, the publish and the retire run with this
+                // core's interrupts masked, so a handler on the core the move
+                // runs on (an event signal) can neither write a slot of the
+                // old block after it is copied, a write the move would lose,
+                // nor observe the old block once it is retired.
+                #[cfg(feature = "chip-bcm2712")]
+                let masked = if reserved > 0 {
+                    mask_interrupts()
+                } else {
+                    None
+                };
                 let old = self.ptr.load(Ordering::Acquire);
                 if len > 0 {
                     // SAFETY: `[0, len)` of `old` is initialised and `fresh`
@@ -398,10 +433,16 @@ mod imp {
                 if reserved > 0 {
                     // SAFETY: `old` is the block `alloc_block` carved for
                     // `reserved` slots, and `reserve`'s contract holds: no
-                    // core is inside a read of this table, so once `fresh`
-                    // is published nothing can reach `old` (the argument is
-                    // set out on `Table::reserve`).
+                    // other core is inside a read of this table and none
+                    // starts one before the move returns, and this core's
+                    // handlers are masked, so once `fresh` is published
+                    // nothing can reach `old` (the argument is set out on
+                    // `Table::reserve`).
                     unsafe { crate::kernel::mem::carve::retire(old, reserved * self.size) };
+                }
+                #[cfg(feature = "chip-bcm2712")]
+                if let Some(state) = masked {
+                    restore_interrupts(state);
                 }
                 #[cfg(feature = "host-linux")]
                 if reserved > 0 {
@@ -532,27 +573,33 @@ mod imp {
         /// so the contract is what keeps a reader off freed memory. Every
         /// reservation there satisfies it:
         ///
-        /// - The kernel's tables are reserved by `size_kernel_tables` (and
-        ///   the cross-domain bridge tables by `multicore::size_cross` after
-        ///   it) on the boot core, in `prepare_graph`. At boot that runs
-        ///   before the secondary cores are woken into their run loops. For a
-        ///   rebuild it runs inside the reconfigure quiesce
-        ///   (`poll_rebuild_bridge`): every non-primary domain has parked at
-        ///   its tick boundary — outside any step, holding no slice of any
-        ///   table, since a slice lives only within the call that reads it —
-        ///   before `prepare_graph` starts, and resumes only after it
-        ///   returns, when its next read loads the new block (the quiesce
-        ///   flag's release store orders the move before it).
-        /// - The interrupt handlers that read a table (a device IRQ bound to
-        ///   an event, signalling it) are delivered to the boot core
-        ///   (`gic::irq_bind` routes event bindings to core 0), the core the
-        ///   move runs on. A handler that preempts the move runs to
-        ///   completion before the move continues, so none holds the old
-        ///   block when it is handed back. A Tier 1b or Tier 2 handler, which
-        ///   may run on a parked core, steps no module while a graph is
+        /// - The kernel's tables are reserved on core 0 by
+        ///   `size_kernel_tables` in `prepare_graph`, and the cross-domain
+        ///   bridge tables by `multicore::size_cross` after it. Core 0 enters
+        ///   `prepare_graph` from its pump loop between steps, holding no
+        ///   slice of any table: a slice lives only within the call that
+        ///   reads it. At boot no other core has left its wait for
+        ///   `INIT_COMPLETE`. For a rebuild `poll_rebuild_bridge` quiesces
+        ///   the other domains first: each parks at its tick boundary,
+        ///   outside any step, and resumes only after the rebuild, when its
+        ///   next read loads the new block (its acquire load of the quiesce
+        ///   flag pairs with the release store that ends the quiesce).
+        /// - Core 0's own handlers are masked for the move, from the copy
+        ///   to the retire. Those are the handlers that reach a table from
+        ///   interrupt context: every event binding and the PCIe MSI
+        ///   multiplexer are bound to core 0 (`gic::irq_bind` routes an
+        ///   event binding there and refuses one on an SGI or PPI, which
+        ///   would be taken on whichever core raised it), and an event
+        ///   signal writes its slot. A handler that runs before the copy or
+        ///   after the restore finds the table whole.
+        /// - A Tier 1b or Tier 2 handler, which may run on another core (a
+        ///   Tier 2 IRQ is delivered to its domain's core, which the quiesce
+        ///   parks but does not mask), steps no module while a graph is
         ///   prepared: `prepare_graph` closes ISR-tier dispatch and waits out
-        ///   every handler in flight (`isr_tier::close_dispatch`) before it
-        ///   sizes a table.
+        ///   every handler in flight on any core (`isr_tier::close_dispatch`)
+        ///   before it sizes a table, and dispatch reopens only when the new
+        ///   graph registers an ISR-tier module, after every table is sized.
+        ///   The timer tick handler on each core touches atomics only.
         /// - A table a lock guards (the net-attach lane tables) is reserved
         ///   under that lock, which every reader of it holds.
         ///
@@ -560,8 +607,8 @@ mod imp {
         /// and the contract holds because the hosted runtime reads its tables
         /// from one thread:
         ///
-        /// - The scheduler — every domain, every module step, every syscall
-        ///   and provider call a module makes — runs on the main thread
+        /// - The scheduler (every module step, and every syscall and
+        ///   provider call a module makes) runs on the main thread
         ///   (`platform/linux.rs`), and a rebuild is taken there between
         ///   passes (`take_rebuild_request` in the main loop), when no pass
         ///   holds a slice. Each pass borrows the tables afresh.
@@ -577,7 +624,8 @@ mod imp {
         ///   owner-attribution tee, which reads the module owner table only
         ///   on the scheduler thread (`SCHED_TID`) and returns before it on
         ///   any other.
-        /// - The stop-signal handler (`stop.rs`) touches atomics only.
+        /// - The stop-signal handler (`stop.rs`) stores atomics, or restores
+        ///   the terminal and re-raises; it reads no kernel table.
         ///
         /// RP keeps the old block (see the module documentation).
         pub unsafe fn reserve(&self, ceiling: usize) -> Result<(), TableError> {

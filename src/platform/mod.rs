@@ -55,7 +55,7 @@ pub mod nic_ring;
 #[cfg(feature = "chip-bcm2712")]
 #[path = "bcm2712/owner_root.rs"]
 pub mod owner_root;
-/// PCIe root-complex bring-up (bcm2712 → RP1 over PCIe).
+/// PCIe1 root-complex bring-up, enumeration and device access (bcm2712).
 #[cfg(feature = "chip-bcm2712")]
 #[path = "bcm2712/pcie.rs"]
 pub mod pcie;

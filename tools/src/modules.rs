@@ -1265,8 +1265,9 @@ fn read_embedded_arena_bytes(sections: &[ElfSection], symbols: &[ElfSymbol]) -> 
     Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
 }
 
-/// A `[capacities] heap_from_params` rule's `base` is the module type's
-/// default heap cap, which the composer grows from. It is a copy of a figure
+/// A `[capacities] heap_from_params` rule's `base` — or a `heap_per_demand`
+/// rule's, for a type with no heap rule — is the module type's default heap
+/// cap, which the composer grows from. It is a copy of a figure
 /// the module computes, so `pack` holds the two equal for the very build it
 /// packs — this ABI, this variant: the module must declare its arena
 /// (`declare_module_arena_bytes!`) and the manifest's `base`, resolved for
@@ -1309,6 +1310,94 @@ fn check_heap_rule_base(
             input.display()
         ))),
     }
+}
+
+/// `(tag, type id, name)` of each param a `define_params!` schema declares
+/// (`[S][P][version][count]`, then per param its tag, type id, u32 default,
+/// length-prefixed name and enum table).
+fn schema_params(schema: &[u8]) -> Vec<(u8, u8, String)> {
+    let mut out = Vec::new();
+    if schema.len() < 4 || schema[..2] != [0x53, 0x50] {
+        return out;
+    }
+    let mut pos = 4usize;
+    for _ in 0..schema[3] {
+        let Some(&[tag, ty]) = schema.get(pos..pos + 2) else {
+            break;
+        };
+        pos += 6; // tag, type, default
+        let Some(&name_len) = schema.get(pos) else {
+            break;
+        };
+        let Some(name) = schema.get(pos + 1..pos + 1 + name_len as usize) else {
+            break;
+        };
+        out.push((tag, ty, String::from_utf8_lossy(name).into_owned()));
+        pos += 1 + name_len as usize;
+        let Some(&enums) = schema.get(pos) else {
+            break;
+        };
+        pos += 1;
+        for _ in 0..enums {
+            let Some(&elen) = schema.get(pos + 1) else {
+                break;
+            };
+            pos += 2 + elen as usize;
+        }
+    }
+    out
+}
+
+/// The `[capacities]` rules that read an instance's params TLV name params
+/// by tag, and a tag no param carries counts as nothing: a heap sized as if
+/// the params were empty, a demand of zero. So `pack` holds each rule's tags
+/// to the module's own param schema (`define_params!`): every
+/// `heap_from_params` tag is a param, and every `demand_from_params` tag a
+/// string param (`str` or `str_chunked`), whose value the rule splits into
+/// entries, or an integer param (`u8`, `u16`, `u32`), whose value it counts.
+fn check_param_rule_tags(input: &Path, manifest: &Manifest, schema: &[u8]) -> Result<()> {
+    let rules: Vec<(&str, &[u8], bool)> = manifest
+        .heap_from_params
+        .as_ref()
+        .map(|r| ("heap_from_params", r.tags.as_slice(), false))
+        .into_iter()
+        .chain(
+            manifest
+                .demand_from_params
+                .iter()
+                .map(|r| ("demand_from_params", r.tags.as_slice(), true)),
+        )
+        .collect();
+    if rules.is_empty() {
+        return Ok(());
+    }
+    let params = schema_params(schema);
+    for (key, tags, strings) in rules {
+        for &tag in tags {
+            let param = params.iter().find(|p| p.0 == tag);
+            // `schema::ParamType` ids: 0 `u8`, 1 `u16`, 2 `u32`, 3 `str`,
+            // 6 `str_chunked`.
+            if param.is_some_and(|p| !strings || matches!(p.1, 0..=3 | 6)) {
+                continue;
+            }
+            let found = match param {
+                Some((_, _, name)) => format!("param '{name}', neither a string nor an integer"),
+                None => "no param in the module's `define_params!` schema".to_string(),
+            };
+            let want = if strings {
+                "a `str` or `str_chunked` param, whose entries it counts, or a `u8`, `u16` or \
+                 `u32` param, whose value it counts"
+            } else {
+                "a param the module declares"
+            };
+            return Err(Error::Module(format!(
+                "{}: `[capacities] {key}` counts params tag {tag}, which is {found}; each tag \
+                 must name {want} — correct `tags` to the module's own",
+                input.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// The output sections a module image carries: code and read-only data (laid
@@ -1593,6 +1682,7 @@ pub fn pack_fmod(
         target_abi,
         variant,
     )?;
+    check_param_rule_tags(input, &module_manifest, schema_data)?;
 
     // Compute integrity hash over code + data sections (use code_data which preserves layout)
     module_manifest.integrity_hash = Some(manifest::compute_integrity(&code_data, data_data));
@@ -1883,6 +1973,7 @@ pub fn pack_fmod_wasm(
     if let Some(v) = variant {
         module_manifest.apply_variant(v)?;
     }
+    check_param_rule_tags(input, &module_manifest, schema_data)?;
 
     // Integrity hash over the wasm code payload. Empty data section.
     module_manifest.integrity_hash = Some(manifest::compute_integrity(&wasm_data, &[]));
@@ -2233,6 +2324,59 @@ mod tests {
             e.contains("heap_per_demand.base` is 4096 B") && e.contains("set `base` to 8192"),
             "{e}"
         );
+    }
+
+    /// A `[capacities]` rule's tags name the module's own params: every
+    /// `heap_from_params` tag a param, every `demand_from_params` tag a
+    /// string or integer param; anything else is refused at pack, naming the
+    /// tag.
+    #[test]
+    fn param_rule_tags_must_name_the_module_params() {
+        // `define_params!` schema: tag 1 `prefix` (str), 2 `paths`
+        // (str_chunked), 3 `depth` (u32), 4 `notes` (u16 array).
+        let mut schema = vec![0x53, 0x50, 1, 4];
+        for (tag, ty, name) in [
+            (1u8, 3u8, "prefix"),
+            (2, 6, "paths"),
+            (3, 2, "depth"),
+            (4, 4, "notes"),
+        ] {
+            schema.extend_from_slice(&[tag, ty, 0, 0, 0, 0, name.len() as u8]);
+            schema.extend_from_slice(name.as_bytes());
+            schema.push(0);
+        }
+        let p = Path::new("watch.elf");
+        let parse = |caps: &str| {
+            Manifest::from_toml_str_for_target(
+                &format!("version = \"1.0.0\"\n[capacities]\n{caps}"),
+                Some("aarch64"),
+            )
+            .unwrap()
+        };
+        let demand = |tags: &str| {
+            parse(&format!(
+                "demand_from_params = {{ pool = \"store_subs\", tags = {tags} }}\n"
+            ))
+        };
+        check_param_rule_tags(p, &demand("[1, 2, 3]"), &schema).expect("string and integer");
+        let e = check_param_rule_tags(p, &demand("[1, 4]"), &schema)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("tag 4") && e.contains("'notes'") && e.contains("integer"),
+            "{e}"
+        );
+        let e = check_param_rule_tags(p, &demand("[9]"), &schema)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("tag 9") && e.contains("no param"), "{e}");
+        let heap = parse("heap_from_params = { tags = [3], base = 64 }\n");
+        check_param_rule_tags(p, &heap, &schema).expect("any param's bytes count");
+        let heap = parse("heap_from_params = { tags = [9], base = 64 }\n");
+        assert!(check_param_rule_tags(p, &heap, &schema).is_err());
+        // A module with no schema has no params for a rule to count.
+        assert!(check_param_rule_tags(p, &demand("[1]"), &[]).is_err());
+        check_param_rule_tags(p, &Manifest::default(), &[]).expect("no rule");
     }
 
     /// A wasm module whose schema has a `str_chunked` param keeps its

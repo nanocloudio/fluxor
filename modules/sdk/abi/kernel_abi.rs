@@ -917,9 +917,12 @@ pub mod query_key {
 
     /// The module occupancy that owns event `handle` (a tagged event fd):
     /// writes the [`CALLER_MODULE`] record of the owning module and returns
-    /// 8; `ENOENT` when the event is not allocated. A provider that signals
-    /// a subscriber's event checks it before every signal, so an event slot
-    /// freed and taken by another module never wakes the wrong one.
+    /// 8; `ENOENT` when the event is not allocated or no module owns it,
+    /// `EINVAL` when `handle` is not an event fd. A module's events are freed
+    /// when its occupancy ends, so the record names the occupancy that
+    /// created the event. A provider that signals a subscriber's event
+    /// checks it before every signal, so an event slot freed and taken by
+    /// another module never wakes the wrong one.
     pub const EVENT_OWNER: u32 = 12;
 }
 

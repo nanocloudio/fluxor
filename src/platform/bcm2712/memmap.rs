@@ -28,6 +28,18 @@
 //!
 //! `.bss`, the stack and the payload window stay below `RAM_CEILING`
 //! (`linker/memory-bcm2712.x`), which the zone's floor is never below.
+//!
+//! The Pi 5's fourth gigabyte, 0xC000_0000..0x1_0000_0000, is DRAM like any
+//! other on a 4 GB or larger board, and the zone may hold it. The BCM2712
+//! has no peripheral window there: its SoC peripherals sit at
+//! 0x10_0000_0000 (the soc node's `ranges = <0x0 0x10 0x0 0x80000000>`),
+//! its PCIe controllers PCIe1 and PCIe2 at 0x10_0011_0000 and
+//! 0x10_0012_0000, and the firmware's `/memory` states the gigabyte as DRAM
+//! (`<0x0 0x4000_0000 0x0 0xC000_0000>`, as the firmware's live tree on a
+//! 16 GB Pi 5 reads). The "low peripheral" block at 0xFC00_0000..0xFF80_0000,
+//! with a PCIe root complex at 0xFD50_0000, is the BCM2711's (Pi 4); on the
+//! BCM2712 those addresses are DRAM, or nothing at all on a 2 GB board,
+//! whatever the page tables call them, so nothing may treat them as a device.
 
 use crate::kernel::boot::dtb::{self, MemoryFacts, Range};
 
@@ -155,9 +167,16 @@ fn find_zone(memory: &[Range], reserved: &[Range]) -> Option<(u64, u64)> {
 /// Read the device tree at `dtb_phys` (the firmware's x0; QEMU leaves the
 /// blob at the base of RAM instead) and build the map. Runs with the MMU off,
 /// before the boot page tables are built from it, so it only reads the blob
-/// and writes the map: with the MMU off every access is Device memory, where
-/// an exclusive load/store never completes, and the carve allocator's lock
-/// would spin forever. [`install`] hands the zone over once the MMU is on.
+/// and writes the map. [`install`] hands the zone over once the MMU is on.
+///
+/// Before the MMU is on, no lock and no atomic read-modify-write — here, in
+/// anything this calls, or anywhere else on the boot core's path to
+/// `boot_mmu::enable`. With the MMU off every data access is
+/// Device-nGnRnE, and there the Cortex-A76's store-exclusive never
+/// succeeds: a lock taken here (the carve allocator's, say) spins for ever
+/// before the UART is up, and the board boots dark. QEMU lets those atomics
+/// succeed, so only a check of the pi5 image itself catches one:
+/// `tools/ci/premmu_atomics.sh`.
 ///
 /// # Safety
 /// Once, at boot, on the boot core, before anything allocates. `dtb_phys` is

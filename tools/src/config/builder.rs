@@ -141,13 +141,6 @@ const DEFAULT_STEP_DEADLINE_US: u32 = 2000;
 /// together.
 const MAX_DOMAINS: usize = 4;
 
-/// Bounded graph/domain pacer-instance table size. One pacer per
-/// (graph_instance, domain); with a single resident graph this equals
-/// `MAX_DOMAINS`. The build rejects adaptive configs that would
-/// need more resident pacer instances than this — the scheduler never allocates
-/// pacer state on a hot path.
-const MAX_PACER_INSTANCES: usize = MAX_DOMAINS;
-
 /// Burst-mode deadline multiplier — mirrors
 /// `kernel::step_guard::BURST_MULTIPLIER`.
 const BURST_DEADLINE_MULTIPLIER: u32 = 8;
@@ -519,10 +512,11 @@ fn validate_adaptive_tick(
             }
         }
     }
-    // Resident graphs need no pacer-table gate: the kernel holds a pacer
-    // instance and a resident-graph entry per owner slot and execution
+    // Pacers need no admission gate. The base graph has one per execution
+    // domain, and `execution.domains` past `MAX_DOMAINS` is refused before
+    // this runs. Resident graphs have one per owner slot and execution
     // domain, sized at boot with the owner table, so every workload the owner
-    // pool seats is paced. The owner pool's own bound is the boot plan's
+    // pool seats is paced; the owner pool's own bound is the boot plan's
     // (`capacity::check_boot_plan`).
 
     // Unconfigured ⇒ nothing more to check (byte-identical path).
@@ -618,23 +612,6 @@ fn validate_adaptive_tick(
             flags[0],
             domain_count,
             silicon.unwrap_or("unknown"),
-        )));
-    }
-
-    // Bounded pacer-table admission. Each (graph_instance, domain) owns one
-    // pacer instance; the target declares a
-    // static maximum and the build rejects configs that exceed it (no scheduler
-    // hot path may allocate or resize pacer state). With a single resident
-    // graph the instance count is the number of adaptive execution domains and
-    // the bound is `MAX_DOMAINS` (one pacer per domain); with multiple resident
-    // graphs it is `graphs × domains` against the declared table size.
-    if domain_count > MAX_PACER_INSTANCES {
-        return Err(Error::Config(format!(
-            "adaptive tick: configuration declares {domain_count} execution domains, \
-             exceeding the target's bounded pacer table ({MAX_PACER_INSTANCES} \
-             graph/domain pacer instances). The scheduler never allocates pacer \
-             state on a hot path, so the resident pacer count is statically capped. \
-             Reduce the domain count or raise the target's pacer-table bound."
         )));
     }
 
@@ -1830,30 +1807,34 @@ fn declares_raw_arena(module: &Value, manifest: Option<&Manifest>) -> bool {
         })
 }
 
-/// What the composer knows of a graph's plan when it packs heap caps: the
+/// What the composer knows of a graph's plan when it sizes heap caps: the
 /// full planned ceiling (derived + declared + reserve) of each pool a
-/// `[capacities] heap_per_demand` rule names. Empty — no per-demand bytes —
-/// until the graph's declared demand has been counted, which needs every
-/// instance's params packed once first; that planning pass is `quiet`, so
-/// what it would print is printed once, by the pass that keeps its entries.
+/// `[capacities] heap_per_demand` rule names.
+///
+/// The ceilings follow from the graph's declared demand, which is counted
+/// from every instance's packed params, so the graph is packed once under a
+/// `counting` plan: an instance of a `heap_per_demand` type then carries a
+/// placeholder cap tag — its type's figure without the per-demand bytes —
+/// and prints nothing, and [`patch_heap_cap`] writes the planned figure
+/// over it once the demand is counted. Nothing is packed twice.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct HeapPlan {
     pub(crate) ceilings: std::collections::BTreeMap<String, u64>,
-    pub(crate) quiet: bool,
+    pub(crate) counting: bool,
 }
 
 impl HeapPlan {
-    /// A planning pass: ceilings not yet known, nothing printed.
-    pub(crate) fn planning() -> Self {
+    /// The plan while the graph is packed and its demand counted.
+    pub(crate) fn counting() -> Self {
         Self {
             ceilings: std::collections::BTreeMap::new(),
-            quiet: true,
+            counting: true,
         }
     }
 
     /// `(extra bytes, pool, ceiling)` a `heap_per_demand` rule adds to an
     /// instance of `manifest`'s type under this plan; `None` without a rule
-    /// or before the pool's ceiling is known.
+    /// or without a ceiling for its pool.
     pub(crate) fn per_demand(&self, manifest: Option<&Manifest>) -> Option<(u64, String, u64)> {
         let rule = manifest?.heap_per_demand.as_ref()?;
         let ceiling = *self.ceilings.get(&rule.pool)?;
@@ -1875,7 +1856,9 @@ impl HeapPlan {
 /// An explicit cap below what the params need is kept, and warned: the module
 /// will refuse its params. One below a figure that includes per-demand bytes
 /// is refused, naming both: the pool is planned to a ceiling the instance
-/// could not serve.
+/// could not serve. Under a `counting` plan a `heap_per_demand` type always
+/// answers a cap — the placeholder [`patch_heap_cap`] replaces — and is
+/// silent.
 fn instance_heap_cap(
     name: &str,
     module: &Value,
@@ -1888,22 +1871,39 @@ fn instance_heap_cap(
         .and_then(|h| h.get("arena_bytes"))
         .and_then(|v| heap_arena_bytes(v).ok());
     let rule = manifest.and_then(|m| m.heap_from_params.as_ref());
+    let bytes = rule.map_or(0, |r| r.declared_bytes(tlv));
+    // The type's figure before any per-demand bytes: the heap rule's (its
+    // `base` while the params fit `included`), else `heap_per_demand.base`.
+    let type_figure = || {
+        rule.map(|r| r.derived_cap(bytes).unwrap_or(u64::from(r.base)))
+            .or_else(|| {
+                manifest
+                    .and_then(|m| m.heap_per_demand.as_ref())
+                    .and_then(|r| r.base)
+                    .map(u64::from)
+            })
+    };
+    let to_cap = |cap: u64| {
+        u32::try_from(cap).map_err(|_| {
+            Error::Config(format!(
+                "module '{name}': its derived heap cap of {cap} B is past a heap's u32 size"
+            ))
+        })
+    };
+    if plan.counting && manifest.is_some_and(|m| m.heap_per_demand.is_some()) {
+        return match explicit {
+            Some(n) => Ok(Some(n)),
+            None => type_figure().map(to_cap).transpose(),
+        };
+    }
     let per_demand = plan.per_demand(manifest).filter(|&(extra, ..)| extra > 0);
     if rule.is_none() && per_demand.is_none() {
         return Ok(explicit);
     }
-    let bytes = rule.map_or(0, |r| r.declared_bytes(tlv));
     // The figure the rules derive, `None` while the type's own cap holds it.
-    let derived = match (&per_demand, rule) {
-        (None, Some(r)) => r.derived_cap(bytes),
-        (Some((extra, ..)), Some(r)) => {
-            Some(r.derived_cap(bytes).unwrap_or(u64::from(r.base)) + extra)
-        }
-        (Some((extra, ..)), None) => manifest
-            .and_then(|m| m.heap_per_demand.as_ref())
-            .and_then(|r| r.base)
-            .map(|base| u64::from(base) + extra),
-        (None, None) => None,
+    let derived = match &per_demand {
+        None => rule.and_then(|r| r.derived_cap(bytes)),
+        Some((extra, ..)) => type_figure().map(|f| f + extra),
     };
     if let Some(n) = explicit {
         if let (Some((extra, pool, ceiling)), Some(need)) = (&per_demand, derived) {
@@ -1918,7 +1918,7 @@ fn instance_heap_cap(
             }
         } else if let Some(r) = rule {
             let need = r.need_for(bytes);
-            if bytes > 0 && u64::from(n) < need && !plan.quiet {
+            if bytes > 0 && u64::from(n) < need {
                 eprintln!(
                     "warning: module '{name}': heap.arena_bytes = {n} is below the {need} B its \
                      {bytes} B of declared params need (`[capacities] heap_from_params`); the \
@@ -1931,22 +1931,56 @@ fn instance_heap_cap(
     let Some(cap) = derived else {
         return Ok(None);
     };
-    let cap = u32::try_from(cap).map_err(|_| {
-        Error::Config(format!(
-            "module '{name}': its derived heap cap of {cap} B is past a heap's u32 size"
-        ))
-    })?;
-    if !plan.quiet {
-        match &per_demand {
-            Some((extra, pool, ceiling)) => eprintln!(
-                "  heap: '{name}' cap {cap} B, {extra} B of it for `{pool}` planned to {ceiling}"
-            ),
-            None => {
-                eprintln!("  heap: '{name}' cap {cap} B, sized from {bytes} B of declared params")
-            }
-        }
+    let cap = to_cap(cap)?;
+    match &per_demand {
+        Some((extra, pool, ceiling)) => eprintln!(
+            "  heap: '{name}' cap {cap} B, {extra} B of it for `{pool}` planned to {ceiling}"
+        ),
+        None => eprintln!("  heap: '{name}' cap {cap} B, sized from {bytes} B of declared params"),
     }
     Ok(Some(cap))
+}
+
+/// The offset of the heap cap's value (params tag 0xEF, u32 LE) in a params
+/// TLV, walked as the kernel walks it: entries from byte 4 to the first
+/// 0xFF tag.
+fn heap_cap_offset(tlv: &[u8]) -> Option<usize> {
+    let mut off = 4usize;
+    while off + 2 <= tlv.len() {
+        let (tag, len) = (tlv[off], tlv[off + 1] as usize);
+        off += 2;
+        if tag == 0xFF {
+            break;
+        }
+        if tag == 0xEF && len == 4 && off + 4 <= tlv.len() {
+            return Some(off);
+        }
+        off += len;
+    }
+    None
+}
+
+/// Write `name`'s planned heap cap over the placeholder a `counting` plan
+/// left in its params TLV `tlv` ([`instance_heap_cap`] under `plan`). A cap
+/// the plan leaves at the type's own figure keeps the placeholder, which is
+/// that figure.
+fn patch_heap_cap(
+    name: &str,
+    module: &Value,
+    manifest: Option<&Manifest>,
+    tlv: &mut [u8],
+    plan: &HeapPlan,
+) -> Result<()> {
+    let Some(cap) = instance_heap_cap(name, module, manifest, tlv, plan)? else {
+        return Ok(());
+    };
+    let off = heap_cap_offset(tlv).ok_or_else(|| {
+        Error::Config(format!(
+            "module '{name}': its params carry no heap cap for the plan's figure to replace"
+        ))
+    })?;
+    tlv[off..off + 4].copy_from_slice(&cap.to_le_bytes());
+    Ok(())
 }
 
 /// The smallest heap cap the kernel can make a heap of: one block header and
@@ -2837,7 +2871,7 @@ fn build_module_entry_in(
     // prev/play/next transport.
     if type_name == "content_controls" {
         // content_controls only actuates tappable transport controls; reject a
-        // shell control it would render as a dead/wrong button (H2).
+        // shell control it would render as a dead or wrong button.
         if let Some((id, why)) = crate::presentation_resolver::content_controls_unrenderable(config)
         {
             return Err(Error::Config(format!(
@@ -3067,7 +3101,7 @@ fn build_module_entry_in(
     // Tag 0xEF (u32 LE): this instance's heap cap, overriding the module
     // type's declared arena — the graph's `heap.arena_bytes` (validated by
     // `validate_heap_subtree`), else what the type's `[capacities]
-    // heap_from_params` derives from the params packed above.
+    // heap_from_params` and `heap_per_demand` rules derive (`instance_heap_cap`).
     if let Some(n) = instance_heap_cap(name, module, manifests.get(name), &entry[P..base], plan)? {
         if base + extra_len + 6 < entry.len() {
             entry[base + extra_len] = 0xEF;

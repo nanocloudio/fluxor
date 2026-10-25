@@ -8,16 +8,18 @@
 //! table, so its clusters stay short; it is never rehashed.
 //!
 //! **Full.** A new flow is recorded only into a free record. When none is
-//! free, expired records are reclaimed first (a whole-table sweep); when
-//! none of those is left either, the new flow is refused — its packet is
-//! dropped and counted (`flows_refused`) — and no recorded flow is ever
-//! evicted to make room.
+//! free, expired records are reclaimed first — a whole-table sweep, at most
+//! once a millisecond, so a flood of new flows against a full table costs
+//! one sweep per tick rather than one per packet; when none is left, the
+//! new flow is refused — its packet is dropped and counted
+//! (`flows_refused`) — and no recorded flow is ever evicted to make room.
 //!
 //! **Expiry.** A flow lives its state's timeout past its last packet:
 //! checked on lookup, and by a sweep of [`SWEEP_SLICE`] records per step.
 
 use super::*;
-use abi::contracts::net::policy::flow as fm;
+use abi::contracts::net::policy as np;
+use np::flow as fm;
 
 /// Flows held when the graph declares none (`max_flows`).
 #[cfg(target_arch = "aarch64")]
@@ -158,10 +160,11 @@ unsafe fn home(s: &FilterState, slot: usize) -> u32 {
 #[inline(always)]
 fn timeout_s(f: &Flow) -> u32 {
     match f.proto {
-        6 => fm::tcp_timeout_s(f.state),
-        1 => fm::ICMP_S,
-        _ if f.flags & F_REPLIED != 0 => fm::DATAGRAM_REPLIED_S,
-        _ => fm::DATAGRAM_UNREPLIED_S,
+        np::rule::PROTO_TCP => fm::tcp_timeout_s(f.state),
+        np::rule::PROTO_ICMP => fm::ICMP_S,
+        np::rule::PROTO_UDP if f.flags & F_REPLIED != 0 => fm::DATAGRAM_REPLIED_S,
+        np::rule::PROTO_UDP => fm::DATAGRAM_UNREPLIED_S,
+        _ => fm::GENERIC_S,
     }
 }
 
@@ -227,12 +230,14 @@ pub(crate) unsafe fn make(s: &mut FilterState, t: &Tuple, state: u8, now: u32) -
         s.flows_refused = s.flows_refused.wrapping_add(1);
         return false;
     }
-    if s.flow_free_top == 0 {
+    if s.flow_free_top == 0 && (s.reclaim_swept == 0 || s.reclaim_ms != now) {
+        s.reclaim_swept = 1;
+        s.reclaim_ms = now;
         sweep(s, s.max_flows as usize, now);
-        if s.flow_free_top == 0 {
-            s.flows_refused = s.flows_refused.wrapping_add(1);
-            return false;
-        }
+    }
+    if s.flow_free_top == 0 {
+        s.flows_refused = s.flows_refused.wrapping_add(1);
+        return false;
     }
     s.flow_free_top -= 1;
     let i = *s.flow_free.add(s.flow_free_top as usize) as usize;

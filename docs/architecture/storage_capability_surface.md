@@ -402,8 +402,7 @@ Two retrieval paths, one per op shape:
 
 **1. Handle-bound and open-returning ops** (e.g. `fs::READ`, `fs::FSYNC`,
 `object::GET`, `object::RANGE_GET`, `namespace::LOOKUP`,
-`namespace::SUBSCRIBE`, `object::PUT_STREAMED_OPEN`) advertise the
-per-handle fence via:
+`object::PUT_STREAMED_OPEN`) advertise the per-handle fence via:
 
 ```
 let mut buf = [0u8; abi::fence::WIRE_MAX_LEN];
@@ -944,16 +943,24 @@ under its prefix changed, and reads what it needs, in bounded pages.
   subscription with the caller's owner record and module occupancy
   (`CALLER_MODULE`: slot index and generation). A repeat with the same
   owner, occupancy, event and prefix returns the same handle, so a module
-  re-running its subscribe path cannot leak. Past the store's capacity or the
-  owner's quota, `ENOMEM`, after the dead are swept.
+  re-running its subscribe path cannot leak, and two consumers of one prefix
+  share one subscription. A full table is swept of dead subscriptions before
+  it refuses; a refusal is `ENOMEM`, and the platform stores count it against
+  their `store_subs` (`owner_store_subs` for a workload's own store) pool and
+  name it in the log. `mem_ns` also holds each owner to a quota of its table.
 - **One rung bit per subscription.** A change under the prefix that finds
   the bit clear sets it and signals the event; one that finds it set does
   nothing, so a burst of writes costs one wake. Before every signal the store
   checks that the occupancy still stands (`MODULE_LIVE`) and still owns the
-  event; a subscription whose module has finished or whose slot holds another
-  occupancy now, or whose event slot another module holds, is dropped and
-  never signalled. A handle
-  answers its opener alone: to any other owner it is as if not open.
+  event; a subscription whose module has finished, restarted or lost its
+  slot, or whose event slot is free or another module's, is dropped and never
+  signalled (a module destroying its event closes the subscriptions that name
+  it first). A handle answers its opener alone: to any other owner
+  or module it is as if not open, and its `LAST_FENCE` is `ENOSYS` — a
+  subscription is a doorbell, not a view, and each read carries its own
+  fence. A subscription ends with its subscriber: releasing an owner closes
+  every subscription it holds on the platform stores, and a subscription
+  whose occupancy ended is freed at its next change or by a sweep.
 - **The consumer's step**: `event::POLL` (test-and-clear), then `TAKE_RUNG`
   on the event, which names the caller's rung subscriptions and clears their
   bits (more than fit: `more` is set and the event signalled again), marking
@@ -962,16 +969,25 @@ under its prefix changed, and reads what it needs, in bounded pages.
   change is followed by a completed read that observes it: if the bit was
   clear the signal follows the change; if set, the take that clears it is
   still to come, and the read follows the take.
+- **What the consumer owes.** `POLL` consumes the signal, and a set bit sends
+  no other, so a take that fails clears nothing and is asked again on the
+  next step whether or not the event fires; so is one that answered `more`.
+  A read that fails leaves the consumer pending, with its token where it
+  was, so it reads again rather than waiting for a change that may never
+  come.
 
 `CHANGES` answers one bounded page per call. Where it resumes is a token:
 
 - **empty** — a relist: every current entry under the prefix, `Added`, with
   its value, paged by key. The first page pins the revision the walk
-  answers for, and the last page hands it back.
+  answers for, an entry changed after it is left to the read that resumes
+  from it, and the last page hands that revision back.
 - **8 bytes** — a bare revision `since` (`changes::revision_token`): the
   changes after it.
 - **anything else** — the provider's continuation (up to
-  `changes::TOKEN_MAX` bytes), echoed back verbatim.
+  `changes::TOKEN_MAX` bytes, never exactly 8), echoed back verbatim. One the
+  provider did not issue or no longer recognises is `EINVAL` or `LOST`, and
+  the consumer relists.
 
 A page whose `more` is clear always carries an 8-byte revision token; that is
 what a consumer keeps at rest and resumes from. Records are read at the
@@ -980,26 +996,36 @@ with its current value and `mod_rev`, absent → `Deleted`. A key created and
 deleted inside the window is reported `Deleted`, never omitted, and applying
 by key is idempotent, so intermediate versions collapse and a consumer
 converges on what the store holds. A page may cut inside a revision (one
-command can touch many keys); a key whose last change lies past the page's
-cut is left to the page that holds it, so no `mod_rev` a consumer sees runs
-ahead of the read. `safe_rev` is the highest revision the read has delivered
-whole: a consumer that hands resume points to its own clients stamps them at
-most this.
+write can touch several keys: a `mem_ns` `RENAME` touches two); a key whose
+last change lies past the page's cut is left to the page that holds it, so no
+`mod_rev` a consumer sees runs ahead of the read. `safe_rev` is the highest
+revision the read has delivered whole: a consumer that hands resume points to
+its own clients stamps them at most this. The page's fence is
+`ViewConsistent` at the store's revision from the key stores, `Volatile`
+from `mem_ns`.
 
 A `since` older than the store can answer is `LOST` — the 410 of a watch —
-and the consumer relists. `EAGAIN` means "not now" (a busy device, a spent
-walk budget); a read that names its subscription (`sub`) is rung again when
-the store can answer, so a consumer woken only by its event never stalls on a
-wait. A failed read of any kind leaves the consumer pending and its token
-where it was, so it retries rather than waiting for a change that may never
-come.
+and the consumer relists; so is a `since` past anything the store has issued
+(a store that restarted empty). `EAGAIN` means "not now" (a busy device, a
+spent walk budget); a read that names its subscription (`sub`) is rung again
+when the store can answer, so a consumer woken only by its event never stalls
+on a wait. The key stores and `mem_ns` answer every read inside the call and
+never answer `EAGAIN`.
+
+| Provider | Change history | Walk per call |
+| --- | --- | --- |
+| Linux node store | 65536 revisions (`NODE_STORE_HISTORY`) | 4096 entries or keys (`CHANGES_SCAN_BUDGET`) |
+| Linux workload store | 4096 revisions (`OWNER_STORE_HISTORY`) | as the node store |
+| bcm2712 store | 128 revisions (`HISTORY`) | the retained history; a relist page, one pass of the object table per record |
+| `mem_ns` | 32 entries (`LOG_CAP`) | 16 entries or bindings (`SCAN_BUDGET`) |
 
 `table_consumer` is that protocol for a table: subscribe, take, read pages
 from the token and apply them by key, and on a cold start or `LOST` relist
 into a shadow table that is swapped in only when the last page lands — a
 table swapped in place is a torn table for any reader mid-scan. A module with
 several tables takes once per step for all of them on its one event and then
-advances each.
+advances each. A refused `SUBSCRIBE` other than `EAGAIN` is asked again after
+a backoff, so a full table is not asked, and refused, on every step.
 
 ### Listing names
 

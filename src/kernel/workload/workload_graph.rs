@@ -398,9 +398,9 @@ pub unsafe fn size(owners: usize) -> Result<(), crate::kernel::mem::table::Table
 }
 
 /// Whether the calling module may act on the workload in slot `widx`: its
-/// owner is the one that created it, or it acts with the node's authority
-/// (the node agent). Every handle op, `LOOKUP` and `DESTROY` by identity
-/// answer anyone else `EACCES`.
+/// owner is the one that created it (began its `CREATE`), or it acts with
+/// the node's authority (the node agent). Every handle op, `LOOKUP` and
+/// `DESTROY` by identity answer anyone else `EACCES`.
 unsafe fn may_act_on(widx: usize) -> bool {
     let holders = &*core::ptr::addr_of!(FMOD_HOLDERS);
     may_act_as(holders.get(widx).copied().unwrap_or(OWNER_SYSTEM))
@@ -411,8 +411,8 @@ fn may_act_as(holder: OwnerHandle) -> bool {
     scheduler::caller_authority() == OWNER_SYSTEM || scheduler::caller_owner() == holder
 }
 
-/// The owner staging the pending `CREATE`: only it (or the node) continues
-/// or abandons it.
+/// The owner staging the pending `CREATE`: only it (or a caller with the
+/// node's authority) continues it, finds it with `LOOKUP` or abandons it.
 static mut PENDING_HOLDER: Option<OwnerHandle> = None;
 
 /// A `CREATE` whose subgraph is being instantiated a batch per call. The
@@ -1113,7 +1113,7 @@ unsafe fn workload_create(arg: *mut u8, arg_len: usize) -> i32 {
             &net_addr,
             net_segment,
             net_identity_provider_present(),
-            || slots[widx] = slot,
+            |_| slots[widx] = slot,
         );
         if let Err(e) = rc {
             remove_identity(&net_addr);
@@ -1362,24 +1362,37 @@ unsafe fn live_stats_record(opcode: u32, rc: i32, us: u64) {
 unsafe fn dispatch_op(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
     if opcode == wl::CREATE {
         let pending_holder = &mut *core::ptr::addr_of_mut!(PENDING_HOLDER);
-        if pending_identity().is_none() {
+        let pending = pending_identity();
+        if pending.is_none() {
             *pending_holder = None;
         }
         if let Some(h) = *pending_holder {
             if !may_act_as(h) {
-                return errno::EACCES;
+                // Another owner's staged CREATE: continuing it is refused;
+                // any other spec waits for it, as the holder's own would.
+                let names_it = !arg.is_null()
+                    && arg_len >= 16
+                    && pending.is_some_and(|id| core::slice::from_raw_parts(arg, 16) == id);
+                return if names_it {
+                    errno::EACCES
+                } else {
+                    errno::EBUSY
+                };
             }
         }
+        // The owner that began a staged CREATE holds the workload it ends
+        // in, whoever sends the call that finishes it.
+        let holder = pending_holder.unwrap_or_else(scheduler::caller_owner);
         let rc = workload_create(arg, arg_len);
         if rc == errno::EINPROGRESS {
-            pending_holder.get_or_insert(scheduler::caller_owner());
+            *pending_holder = Some(holder);
         } else {
             *pending_holder = None;
         }
         if rc >= 0 {
             let holders = &mut *core::ptr::addr_of_mut!(FMOD_HOLDERS);
             if let Some(h) = holders.get_mut(slot_of(rc) as usize) {
-                *h = scheduler::caller_owner();
+                *h = holder;
             }
         }
         return rc;
@@ -1446,7 +1459,12 @@ unsafe fn dispatch_op(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) ->
         let mut identity = [0u8; 16];
         identity.copy_from_slice(&out[..16]);
         if pending_identity() == Some(identity) {
-            return errno::EINPROGRESS;
+            let pending_holder = *core::ptr::addr_of!(PENDING_HOLDER);
+            return if pending_holder.is_none_or(may_act_as) {
+                errno::EINPROGRESS
+            } else {
+                errno::EACCES
+            };
         }
         let Some(widx) = slot_by_identity(&identity) else {
             return errno::ENOENT;
@@ -1585,9 +1603,11 @@ pub fn segment_attached(id: u16) -> bool {
     if id == 0 {
         return false;
     }
-    // SAFETY: a read of plain fields; a slot changes only in CREATE, signal
-    // and DESTROY, and an answer that races one is the same answer the
-    // caller would get a moment earlier or later.
+    // SAFETY: a read of plain fields. A SEGMENTS replace asks under the
+    // segment table's apply flag, the flag CREATE records an attachment
+    // under (`net_route::attach_segment`), so it sees every attachment a
+    // CREATE completed; a DESTROY racing it is the answer a moment earlier
+    // or later.
     let slots = unsafe { &*core::ptr::addr_of!(FMOD_WORKLOADS) };
     slots
         .iter()

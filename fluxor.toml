@@ -37,7 +37,17 @@ limit_register_coverage = "fail"
 # asserts the refusals.
 # `tests/host/program_section.sh` builds a graph whose modules own programs
 # and checks each instance reads its own, through the kernel and in place.
-scripts = ["tools/ci/deps_budget.sh", "tests/host/service_bundle_e2e.sh", "tests/host/program_section.sh"]
+# `tools/ci/premmu_atomics.sh` builds the pi5 kernel and refuses any atomic
+# read-modify-write on the boot core's path before its MMU is on: with the
+# MMU off a store-exclusive never succeeds and the board boots dark, and
+# QEMU, which lets it succeed, cannot catch that.
+# `tests/host/qemu_net_ready_gate.sh` boots QEMU virt with a non-deferred
+# module between `virtio_net` and `ip` and needs a DHCP lease: a NIC that
+# never reports Ready holds everything after it unstepped.
+# `tests/host/qemu_access_bounds.sh` boots the `access_probe` fixture: the raw
+# register and cache-maintenance opcodes must refuse DRAM, holes and module
+# memory and serve device registers and DMA buffers.
+scripts = ["tools/ci/deps_budget.sh", "tests/host/service_bundle_e2e.sh", "tests/host/program_section.sh", "tools/ci/premmu_atomics.sh", "tests/host/qemu_net_ready_gate.sh", "tests/host/qemu_access_bounds.sh"]
 
 [ci.cargo]
 # Where the cargo phase runs. fluxor's workspace root is the bare-metal

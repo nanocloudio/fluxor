@@ -9,7 +9,7 @@
 //   1. `no_new_privs` (`PR_SET_NO_NEW_PRIVS`): no exec ever grants a
 //      privilege the process does not already hold — a setuid or setgid
 //      binary runs with the caller's ids, file capabilities are not raised,
-//      and a uid-0 exec's permitted set never grows past what it was.
+//      and an exec's permitted set never grows past the one before it.
 //   2. The capability bounding set is cut to the granted set: the OCI
 //      runtime defaults ([`DEFAULT_CAPS`]: CHOWN, DAC_OVERRIDE, FSETID,
 //      FOWNER, MKNOD, NET_RAW, SETGID, SETUID, SETFCAP, SETPCAP,
@@ -17,29 +17,34 @@
 //      orchestrator added. Cutting it needs `CAP_SETPCAP`; a runtime without
 //      it leaves the bounding set as it is, which under `no_new_privs`
 //      grants nothing (an exec's permitted set is bounded by the one before
-//      it, and that one is cut in step 4).
+//      it, and that one is cut in step 4). The hardened posture is refused
+//      by such a runtime rather than run with the bounding set whole.
 //   3. `PR_SET_KEEPCAPS`, so the identity change keeps the permitted set
 //      for step 4 to cut rather than clear; then the identity itself.
 //   4. The sets the workload runs with (`capset`, ambient): uid 0 holds the
 //      granted set as effective and permitted, inheritable and ambient
 //      empty; any other uid holds only the added capabilities, in every set
-//      including ambient, so they survive its exec. The defaults are not
-//      given to a non-root user: it holds none unless the orchestrator
-//      added them — the semantics of the OCI default for a non-root user.
-//      Only capabilities the runtime itself holds can be granted.
+//      including ambient, so they survive its exec. The defaults are given
+//      to uid 0 only: a non-root uid's exec keeps nothing but its ambient
+//      set (`capabilities(7)`), so it holds none unless the orchestrator
+//      added them. Only capabilities the runtime itself holds can be
+//      granted.
 //   5. The system-call filter (seccomp, `SECCOMP_SET_MODE_FILTER`), last,
-//      immediately before the exec: an allowlist modelled on the OCI default
-//      profile. The architecture is checked first (a foreign one — a
-//      32-bit compat entry — kills the process, since its numbers name
-//      other calls); a call off the list answers `EPERM`. `clone` and
-//      `unshare` are allowed only without namespace flags, `clone3`
-//      answers `ENOSYS` (so a C library falls back to `clone`, whose flags
-//      the filter can read), `personality` only for the plain Linux
-//      personalities, `socket` for every family but `AF_VSOCK`; the calls
-//      the default profile ties to a capability (mount and namespace
-//      creation to `CAP_SYS_ADMIN`, `ptrace` relatives to
-//      `CAP_SYS_PTRACE`, the clock to `CAP_SYS_TIME`, and so on) are allowed
-//      when that capability is granted.
+//      immediately before the exec: an allowlist modelled on the Docker
+//      default seccomp profile. The architecture is checked first: anything
+//      but aarch64 — a 32-bit compat entry, whose numbers name other calls —
+//      kills the process, where the profile admits the 32-bit ARM table too.
+//      A call off the list answers `EPERM`. `clone` and `unshare` are
+//      allowed only without namespace flags, `clone3` answers `ENOSYS` (so a
+//      C library falls back to `clone`, whose flags the filter can read),
+//      `personality` only for the plain Linux personalities, `socket` for
+//      every family but `AF_VSOCK`; the calls the profile ties to a
+//      capability (mount and namespace creation to `CAP_SYS_ADMIN`, `ptrace`
+//      relatives to `CAP_SYS_PTRACE`, the clock to `CAP_SYS_TIME`, and so on)
+//      are allowed when that capability is granted. `io_uring`, `keyctl`,
+//      `add_key`, `request_key`, `userfaultfd`, `kexec_*`, `swapon`,
+//      `pivot_root` and every call the profile does not name are never
+//      allowed.
 //
 // The filter is built in the parent, before the fork; the child only hands
 // the finished program to the kernel. Everything the child runs here is a
@@ -232,7 +237,8 @@ impl Confine {
         filter: Vec::new(),
     };
 
-    /// The sets the workload runs with.
+    /// The sets the workload runs with, its bounding set included (the
+    /// runtime's own when it cannot cut it).
     pub fn sets(&self) -> CapSets {
         self.sets
     }
@@ -384,7 +390,11 @@ pub fn plan(req: &Request, root: bool) -> Result<Confine, i32> {
             return Err(-libc::EPERM);
         }
     }
-    let sets = plan_sets(req.cap_add, held, last, root)?;
+    let mut sets = plan_sets(req.cap_add, held, last, root)?;
+    if !drop_bounding {
+        // The bounding set stays the runtime's own.
+        sets.bounding = held.bounding;
+    }
     let filter = if req.no_syscall_filter || !filter_available() {
         Vec::new()
     } else {
@@ -576,6 +586,7 @@ mod table {
         35,  // unlinkat
         36,  // symlinkat
         37,  // linkat
+        38,  // renameat
         43,  // statfs
         44,  // fstatfs
         45,  // truncate
@@ -791,8 +802,8 @@ mod table {
         454, // futex_wake
         455, // futex_wait
         456, // futex_requeue
-        // `ptrace` and its relatives: the default profile allows these on
-        // every kernel the backend runs on.
+        // `ptrace` and its relatives: the profile allows these from Linux
+        // 4.8, which runs the filter again on a call a tracer changed.
         117, // ptrace
         270, // process_vm_readv
         271, // process_vm_writev
@@ -882,9 +893,10 @@ pub fn allowed_calls(caps: u64) -> Vec<u32> {
 /// Bind the calling child to its parent: `SIGKILL` when the thread that
 /// forked it exits, then a check that it has not already — a parent gone
 /// before the bind was made would never send it. `parent` is the pid the
-/// child must still see as its parent. The identity change clears the
-/// binding, so a child binds again after it. Exits (code 110) when the
-/// parent is gone. Async-signal-safe.
+/// child must still see as its parent. A change of the effective or
+/// filesystem uid or gid clears the binding (`prctl(2)`), so a child binds
+/// again after its identity change. Exits (code 110) when the parent is
+/// gone. Async-signal-safe.
 ///
 /// # Safety
 /// A forked child.

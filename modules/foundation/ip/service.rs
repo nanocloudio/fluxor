@@ -176,7 +176,7 @@ pub(crate) unsafe fn step(s: &mut IpState) {
     }
     let spare = (s.svc_live ^ 1) as usize;
     if s.svc_build == 1 {
-        // Phase 1: clear the spare index, a slice at a time.
+        // First the spare index is cleared, a slice at a time.
         let idx = index_of(s, spare);
         let mut k = 0;
         while k < CLEAR_SLICE && (s.svc_build_at as usize) < idx.len() {
@@ -192,7 +192,7 @@ pub(crate) unsafe fn step(s: &mut IpState) {
         }
         return;
     }
-    // Phase 2: the tables' DNAT records, a slice at a time.
+    // Then the tables' DNAT records are merged into it, a slice at a time.
     let mut k = 0;
     while k < SLICE {
         if s.svc_build_t as usize >= s.pol_n as usize {

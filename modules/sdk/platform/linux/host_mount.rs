@@ -73,8 +73,11 @@ pub const MOUNT: u32 = 0x1F01;
 /// symlink; it must be mounted at exactly `dir` and be a mount `MOUNT` makes
 /// — a block device's filesystem, `nodev` and `nosuid` — or the answer is
 /// `EBUSY` (a projection's memory filesystem is `REMOVE_TREE`'s); and the
-/// unmount names `dir` through the held parent, refusing a symlink. A
-/// kernel that reports no mount id answers `ENOSYS`.
+/// unmount names `dir` through the held parent, refusing a symlink. The
+/// unmount is strict: a volume still in use answers `EBUSY`. A kernel that
+/// reports no mount id answers `ENOSYS`. The directory holding `dir` must
+/// not be one a workload can write: an entry renamed there between the
+/// identification and the unmount is not seen.
 pub const UMOUNT: u32 = 0x1F02;
 /// The mount root, written into `arg`. Returns its length, or `ENOSPC` when
 /// `arg` is too short.
@@ -108,7 +111,7 @@ pub const ROOT: u32 = 0x1F03;
 ///   `size` bytes ([`P_SIZE`]; less than the entries need is `ENOSPC`), or
 ///   without one 64 MiB or what the entries need when that is more — at
 ///   most 1 GiB either way (`E2BIG`) — and as many files as the entries
-///   need plus one per page of room. While a later projection swaps in, the
+///   need plus one per page of that size. While a later projection swaps in, the
 ///   bound is what the filesystem holds plus the new one's, and the new
 ///   one's again once the swap is done. Its pages are charged by the
 ///   kernel's memory accounting to whoever writes them: what `PROJECT`
@@ -127,15 +130,17 @@ pub const PROJECT: u32 = 0x1F04;
 /// Remove a directory tree under the mount root. `arg = [dir]`, relative to
 /// the root. The walk never follows a symlink (a link is removed, not what
 /// it names) and never crosses into another mount: a memory filesystem a
-/// `PROJECT` mounted inside (or at) `dir` is unmounted first, and any other
+/// `PROJECT` mounted inside (or at) `dir` is detached first, and any other
 /// mount point inside answers `EBUSY` with nothing removed — a mounted
-/// volume is never deleted through this op. Each projection mount is
-/// unmounted as [`UMOUNT`] unmounts a volume: by its mount id, read through
-/// the held parent directory, and only while that id is a projection's
-/// memory filesystem at exactly that directory (else `EBUSY`). Returns 0
-/// once the tree is gone (also when there was none), or a negative errno
-/// (`EBUSY`, `EINVAL` for a path through a symlink, `EPERM`); `EAGAIN` while
-/// it runs, as `MOUNT`.
+/// volume is never deleted through this op. Each projection mount is opened
+/// from the held parent directory without following a symlink, identified
+/// by the mount id of that descriptor, and detached through the descriptor
+/// itself only while that id is a projection's memory filesystem at exactly
+/// that directory (else `EBUSY`); what a process still holds open in it
+/// stays readable to that process until it closes it. Returns 0 once the
+/// tree is gone (also when there was none), or a negative errno (`EBUSY`,
+/// `EINVAL` for a path through a symlink, `EPERM`); `EAGAIN` while it runs,
+/// as `MOUNT`.
 pub const REMOVE_TREE: u32 = 0x1F05;
 /// Give a directory tree under the mount root to a group. `arg =
 /// [dir_len:u16][dir][group:u32][policy:u8]`: every file, directory and

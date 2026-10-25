@@ -1,0 +1,17 @@
+version = "1.0.0"
+hardware_targets = ["bcm2712"]
+permissions = ["platform_raw", "dma"]
+
+# Fixture for the bounds on the raw register and cache-maintenance opcodes,
+# on QEMU virt. On its first step it asks for what must be refused — a
+# register read in DRAM, an unaligned one, one in a gigabyte with nothing
+# behind it, a cache flush of its own state, a flush that wraps — and for
+# what must be served — a device register, a flush of a streaming DMA
+# buffer — and logs one line:
+#
+#   [access_probe] ok
+#   [access_probe] FAIL case=<n>
+timer_class = "agnostic"
+
+[observability]
+exempt = "fixture whose evidence is its one verdict line"

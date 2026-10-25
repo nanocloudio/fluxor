@@ -26,37 +26,37 @@
 //
 // ## Fence advertisement per op shape
 //
-//   - Open-returning ops (`LOOKUP`, `SUBSCRIBE`) advertise per-handle
-//     fence via `provider_query(handle, query_key::LAST_FENCE, …)`.
-//   - Handle-bound ops (`STAT`) advertise per-handle via the same path.
-//   - Handle=-1 one-shot ops (`LIST`, `RENAME`, `DELETE`) carry a
-//     `[fence_out_ptr: u64 LE, fence_out_cap: u16 LE]` pair in their
-//     arg layout. The provider writes the encoded `Fence` (up to
-//     `fence::WIRE_MAX_LEN` bytes) into that buffer atomically with
-//     the op return; callers decode via `Fence::decode`. A null
+//   - `LOOKUP` advertises its handle's fence via
+//     `provider_query(handle, query_key::LAST_FENCE, …)`, and `STAT`
+//     answers against that same handle and view.
+//   - A `SUBSCRIBE` handle names a doorbell, not a view, and carries no
+//     fence: `LAST_FENCE` on it is `ENOSYS`. The `CHANGES` read it asks
+//     for carries its own.
+//   - Handle=-1 one-shot ops (`LIST`, `RENAME`, `DELETE`, `BIND`,
+//     `CHANGES`) carry a `[fence_out_ptr: u64 LE, fence_out_cap: u16 LE]`
+//     pair in their arg layout. The provider writes the encoded `Fence`
+//     (up to `fence::WIRE_MAX_LEN` bytes) into that buffer atomically
+//     with the op return; callers decode via `Fence::decode`. A null
 //     `fence_out_ptr`, or a `fence_out_cap` below `fence::WIRE_MAX_LEN`,
 //     is `EINVAL`, refused before the op acts.
 //
 // Typical advertisements: `ViewConsistent { source, revision }` for
 // snapshot reads, `LocalDurable { device_id }` for committed
 // renames/deletes, `ReplicatedDurable { source, .. }` when a
-// quorum-replicated provider acks. See `contracts::fence` for the
-// dominance rules.
+// quorum-replicated provider acks, `Volatile` from a provider that keeps
+// nothing across a reset. See `contracts::fence` for the dominance rules.
 //
 // ## Operations
 //
 //   LOOKUP    — resolve a path under this namespace to its entry
 //               kind and storage handle.
-//   STAT      — read entry metadata (size, mtime, kind, etag)
-//               without opening a handle.
+//   STAT      — read a resolved entry's metadata (size, mtime, kind,
+//               etag) through its LOOKUP handle.
 //   LIST      — enumerate entries under a prefix; results paged via
 //               an opaque cursor so partial scans compose.
-//   BIND      — create a binding `name → {kind, target}`. The one
-//               op that MINTS a name; without it the surface is
-//               read-mostly by construction and every provider
-//               invents a private creation vocabulary (fat32's
-//               naming ops welded into `fs` 0x09__, a log-structured
-//               store's project-local bind op).
+//   BIND      — create a binding `name → {kind, target}`: the one op
+//               that mints a name, so a provider needs no private
+//               creation vocabulary of its own.
 //   RENAME    — rename or move an entry within the namespace.
 //               Atomic within a single provider; cross-provider
 //               renames are out of scope for this surface.
@@ -64,14 +64,15 @@
 //               opt-in via a flag.
 //   SUBSCRIBE — watch a prefix: the provider signals the caller's own
 //               kernel event when something under it changes
-//               (level-triggered; no bytes are pushed).
+//               (level-triggered; no bytes are delivered).
 //   TAKE_RUNG — which of the caller's subscriptions on an event have
 //               changed since it last asked; the caller then reads
 //               them with CHANGES.
 //   CHANGES   — what changed under a prefix since a revision, one
 //               bounded page per call.
+//   CLOSE     — release a LOOKUP or SUBSCRIBE handle.
 //   CAPS      — capability bits: which optional/mutation ops this
-//               provider actually implements (mirrors `fs::CAPS`).
+//               provider implements (mirrors `fs::CAPS`).
 //
 // ## Opcode class
 //
@@ -84,8 +85,9 @@
 // A subscription is a doorbell, not a stream: the provider never writes
 // a consumer's channel. It signals the consumer's own kernel event
 // (`kernel_abi::event`), and the consumer asks TAKE_RUNG which of its
-// subscriptions rang and reads each with CHANGES. See
-// `docs/architecture/storage_capability_surface.md` §"Subscriptions".
+// subscriptions rang and reads each with CHANGES. The section
+// "Subscriptions" of `docs/architecture/storage_capability_surface.md`
+// describes the protocol end to end.
 
 /// A write's answer here is classified as `storage.object`'s is.
 pub use super::object::{write_answer, WriteAnswer};
@@ -95,7 +97,7 @@ pub use super::object::{write_answer, WriteAnswer};
 /// `handle = -1`; `arg` points at the UTF-8 path (no null
 /// terminator), `arg_len` is its length. On success returns a
 /// non-negative handle into the namespace's resolved-entry table
-/// (passed to `STAT` or `SUBSCRIBE`); on failure returns a negative
+/// (passed to `STAT` and `CLOSE`); on failure returns a negative
 /// errno (`-2 ENOENT`, `-22 EINVAL`, …).
 ///
 /// Resolution is snapshot-relative: the provider records the
@@ -193,13 +195,16 @@ pub const STAT: u32 = 0x1301;
 /// The empty cursor means "first page" in a request and "end of listing"
 /// in a page, so the empty name is never an entry.
 ///
-/// A name is at most [`STORAGE_KEY_MAX`](super::handle::STORAGE_KEY_MAX) bytes, which is
-/// also the longest cursor. The prefix is a path, bounded by [`PATH_MAX`]: a
-/// directory-shaped provider's prefix names a directory however deep it sits,
-/// and a key-shaped provider holds no key under a prefix longer than a key; `cursor_len` in the trailing record is **u8**,
-/// narrower than the `u16` the request carries, and stated here because a
-/// consumer parses one shape and a provider that guesses the other width
-/// corrupts every page but the last.
+/// A name is at most [`STORAGE_KEY_MAX`](super::handle::STORAGE_KEY_MAX)
+/// bytes, which is also the longest cursor. The prefix is a path, bounded by
+/// [`PATH_MAX`]: a directory-shaped provider's prefix names a directory
+/// however deep it sits, and a key-shaped provider holds no key under a
+/// prefix longer than a key.
+///
+/// `cursor_len` in the trailing record is **u8**, narrower than the `u16` the
+/// request carries. It is stated here because a consumer parses one shape,
+/// and a provider that guesses the other width corrupts every page but the
+/// last.
 ///
 /// ## Why the trailer is two bytes
 ///
@@ -300,36 +305,61 @@ pub const DELETE: u32 = 0x1304;
 /// ```
 ///
 /// Returns a non-negative subscription handle (passed to `CLOSE`, named by
-/// [`TAKE_RUNG`] and [`CHANGES`]) or a negative errno.
+/// [`TAKE_RUNG`] and [`CHANGES`]) or a negative errno. The handle carries no
+/// fence.
 ///
 /// ## Delivery
 ///
 /// The provider keeps one *rung* bit per subscription. A change under the
 /// prefix that finds the bit clear sets it and signals the event; one that
 /// finds it set does nothing. [`TAKE_RUNG`] returns and clears the bits. A
-/// consumer's step is therefore: `event::POLL`, then `TAKE_RUNG`, marking each
-/// returned subscription *pending*, then a [`CHANGES`] read of each pending
-/// one, clearing *pending* only when a read completes (a page with `more`
-/// clear). Whatever interleaving, a change is followed by a completed read
-/// that observes it: if the bit was clear the signal follows the change; if
-/// set, the take that clears it is still to come, and the read follows the
-/// take. A consumer holding several subscriptions uses one event for all.
+/// consumer's step is therefore: `event::POLL`, then `TAKE_RUNG` when the
+/// event fired, marking each returned subscription *pending*, then a
+/// [`CHANGES`] read of each pending one, clearing *pending* only when a read
+/// completes (a page with `more` clear). Whatever the interleaving, a change
+/// is followed by a completed read that observes it: if the bit was clear
+/// the signal follows the change; if set, the take that clears it is still
+/// to come, and the read follows the take.
+///
+/// Two obligations make that hold. `POLL` consumes the signal while a set
+/// bit sends no other, so a `TAKE_RUNG` that fails, or answers `more`, is
+/// owed and asked again on the next step whether or not the event fires
+/// again. And a read that fails leaves the subscription *pending*: its next
+/// step reads again, since no further signal may come. A consumer holding
+/// several subscriptions uses one event for all of them and takes once per
+/// step for the whole set.
 ///
 /// ## Ownership and lifetime
 ///
-///   - The event must belong to the calling module (`query_key::EVENT_OWNER`):
-///     `EINVAL` otherwise. Before every signal the provider checks the event
-///     still belongs to the subscribing module occupancy
-///     (`query_key::MODULE_LIVE`); a subscription whose module is gone, or
-///     whose event slot another module now holds, is dropped, never
-///     signalled.
+///   - The event must belong to the calling module (`query_key::EVENT_OWNER`).
+///     Before every signal the provider checks that the subscribing module
+///     occupancy still stands (`query_key::MODULE_LIVE`) and still owns the
+///     event; a subscription whose module is gone, or whose event slot
+///     another module now holds, is dropped, never signalled. A module that
+///     destroys its event closes the subscriptions naming it first: until a
+///     change finds the slot free or another module's they stay open, and
+///     they ring the slot if the module's own next `CREATE` takes it.
 ///   - Idempotent: a repeat with the same owner, module occupancy, event and
 ///     prefix returns the existing handle (and rings once again when bit 0
 ///     is set), so a module re-running its subscribe path cannot leak.
-///   - A handle answers its opener alone; to anyone else it is as if not
-///     open.
-///   - `ENOMEM` when the provider's subscription capacity, or the calling
-///     owner's quota, is spent — counted and named against the pool.
+///   - A handle answers its opener alone — its owner and its module
+///     occupancy; to anyone else it is as if not open.
+///   - A subscription ends with its subscriber. Once the owner that opened
+///     it is released, or the module occupancy that opened it ends
+///     (finished, restarted, its slot reassigned), it is never signalled
+///     again, and the provider frees it: at once on the owner-release
+///     notification, or at its next change or the sweep a refusal at
+///     capacity makes first.
+///
+/// ## Errors
+///
+///   - `EINVAL` — malformed request, a prefix longer than this provider can
+///     hold, an `event` that is not a tagged event fd the calling module
+///     owns, or a call from outside any module.
+///   - `ENOMEM` — the provider's subscription table is full after its dead
+///     subscriptions are swept, or the calling owner holds the provider's
+///     per-owner quota where it keeps one. A provider whose table is a
+///     resource-ledger pool counts the refusal against that pool.
 pub const SUBSCRIBE: u32 = 0x1305;
 
 /// Which of the caller's subscriptions on an event have rung since it last
@@ -354,11 +384,14 @@ pub const SUBSCRIBE: u32 = 0x1305;
 /// ```
 ///
 /// and returns the byte count. Only subscriptions the caller opened on that
-/// event are named. `ENOMEM` when `out_cap` cannot hold the header and one
-/// handle.
+/// event are named; a handle that is not the caller's is never named or
+/// cleared. A failed take (`EINVAL` for a malformed request, `ENOMEM` when
+/// `out_cap` cannot hold the header and one handle) clears no bit, so the
+/// subscriptions it would have named stay rung for the take that follows.
 pub const TAKE_RUNG: u32 = 0x1309;
 
-/// Close a LOOKUP or SUBSCRIBE handle.
+/// Close a LOOKUP or SUBSCRIBE handle. A subscription closed by its opener
+/// is gone with its rung bit; its handle may name a later subscription.
 pub const CLOSE: u32 = 0x1306;
 
 /// What changed under a prefix since a point — one bounded page per call. The
@@ -386,9 +419,15 @@ pub const CLOSE: u32 = 0x1306;
 ///   - exactly 8 bytes: a bare revision `since` (u64 LE) — the changes after
 ///     it. Any consumer may build one ([`changes::revision_token`]);
 ///   - anything else: a provider-issued continuation, echoed back verbatim.
+///     A provider never issues one of exactly 8 bytes. A continuation it did
+///     not issue, or no longer recognises (it restarted), is `EINVAL` or
+///     `LOST`, and the consumer relists on either.
 ///
 /// A page whose `more` is clear carries an 8-byte token: the revision the
-/// consumer keeps at rest and resumes from.
+/// consumer keeps at rest and resumes from. A relist pins the revision its
+/// first page reads at and its last page hands that revision back; an entry
+/// changed after it is left out of the relist and reported by the read that
+/// resumes from it.
 ///
 /// ## Answer
 ///
@@ -420,13 +459,15 @@ pub const CLOSE: u32 = 0x1306;
 /// sees is ahead of what the read has delivered.
 ///
 /// The return value is the byte count written to `out_buf`; the encoded
-/// fence (`ViewConsistent { revision }`) is written to `fence_out_ptr`.
+/// fence of the state the records were read at is written to
+/// `fence_out_ptr` — `ViewConsistent { source, revision }` from a versioned
+/// store, `Volatile` from one that keeps nothing across a reset.
 ///
 /// ## Bounds and waits
 ///
 /// A provider pages rather than refuses, within a per-call budget it states;
-/// `ENOMEM` only when `out_cap` cannot hold the header, one record and the
-/// trailer ([`changes::min_out_cap`]). `EAGAIN` means "not now" (a busy
+/// `ENOMEM` only when `out_cap` cannot hold the header, the next record and
+/// the trailer ([`changes::min_out_cap`]). `EAGAIN` means "not now" (a busy
 /// device, a spent walk budget); when `sub` names one of the caller's
 /// subscriptions the provider rings it again once the cause clears, so a
 /// consumer woken only by its event never stalls on a wait.
@@ -465,8 +506,7 @@ pub const CHANGES: u32 = 0x1307;
 /// a filesystem provider whose directory entries live inside the byte
 /// tier keeps the fused forms, a split provider (index without bytes)
 /// implements BIND alone. The fused and split paths are the same
-/// operation — a future dedup of the `fs` naming opcodes against this
-/// range must preserve that equivalence.
+/// operation, with the same outcome and the same fence.
 pub const BIND: u32 = 0x1308;
 
 /// Capability bits: which optional ops this provider implements.
@@ -480,10 +520,9 @@ pub const CAPS: u32 = 0x13FF;
 
 /// Capability bits returned by [`CAPS`]. A provider sets bit B iff
 /// calling the corresponding opcode would succeed for valid input
-/// (rather than returning `ENOSYS`). Mirrors `fs::caps`: adding an
-/// opcode is a two-step ABI change — reserve the bit here (providers
-/// MUST return 0 for it until they implement), then flip it on per
-/// backend. Bit positions are stable forever — never renumber.
+/// (rather than returning `ENOSYS`). Mirrors `fs::caps`: a bit names an
+/// opcode, a provider that does not implement the opcode reads it 0, and
+/// bit positions are stable — never renumbered.
 /// [`caps::CHILD_NAMES`] is the one bit that names no opcode: it states the
 /// shape of the provider's `LIST` names.
 pub mod caps {
@@ -493,7 +532,8 @@ pub mod caps {
     pub const RENAME: u32 = 1 << 1;
     /// [`super::DELETE`] (0x1304).
     pub const DELETE: u32 = 1 << 2;
-    /// [`super::SUBSCRIBE`] (0x1305) — live change events.
+    /// [`super::SUBSCRIBE`] (0x1305) and [`super::TAKE_RUNG`] (0x1309) —
+    /// change doorbells.
     pub const SUBSCRIBE: u32 = 1 << 3;
     /// [`super::CHANGES`] (0x1307) — windowed change reads.
     pub const CHANGES: u32 = 1 << 4;

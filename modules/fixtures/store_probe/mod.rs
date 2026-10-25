@@ -29,9 +29,9 @@
 //! such as `fs_object`: step 4 then writes without subscribing, and the
 //! verdict does not ask for a ring.
 //!
-//! **Acceptance:** `[stp] state=5 pass=1 put=3 got=1 listed=2 pushed=N del=1
+//! **Acceptance:** `[stp] state=5 pass=1 put=3 got=1 listed=2 rung=N del=1
 //! wit_a=A wit_b=B err=0`. Any `state=99` names the failure in `err`.
-//! `pushed` is the count of rings that ARRIVED and whose CHANGES read found
+//! `rung` is the count of rings that ARRIVED and whose CHANGES read found
 //! the write. It is reported separately rather than folded into the PUT's
 //! pass/fail: a PUT that lands and a watcher that is never told are
 //! different failures, and only the second is silent.
@@ -118,7 +118,8 @@ struct State {
     put: u32,
     got: u32,
     listed: u32,
-    pushed: u32,
+    /// Rings that arrived and whose CHANGES read found the write.
+    rung: u32,
     del: u32,
     /// Objects under `witness_a` — evidence about a DIFFERENT module,
     /// reported by one that provably logs from this board. "Did it run" and
@@ -159,10 +160,12 @@ struct State {
     /// subscribe again), 1 subscribed, 2 rung and reading, 3 rung but the
     /// read did not find the write.
     subscribed: u32,
+    /// A TAKE_RUNG is owed: the last failed or answered `more`.
+    take_owed: u32,
     /// Whether to prove SUBSCRIBE (`subscribe`, default 1). A store with no
     /// subscriptions -- `fs_object` -- is walked with it 0: step 4 then
     /// writes without subscribing, and the verdict does not ask for a ring.
-    want_push: u32,
+    want_ring: u32,
     /// Where a write's fence lands. In the state, not on the stack, so a
     /// write asked again names the same buffer: the same request.
     fence: [u8; FENCE_CAP],
@@ -202,7 +205,7 @@ mod params_def {
             => |s, d, len| { s.op_gap_ms = super::p_u32(d, len, 0, 0); };
 
         5, subscribe, u8, 1
-            => |s, d, len| { s.want_push = u32::from(super::p_u8(d, len, 0, 1)); };
+            => |s, d, len| { s.want_ring = u32::from(super::p_u8(d, len, 0, 1)); };
     }
 }
 
@@ -437,8 +440,11 @@ unsafe fn subscribe(sys: &SyscallTable, prefix: &[u8], event: i32) -> i32 {
 }
 
 /// Whether `event` fired and TAKE_RUNG names `sub` among its rung
-/// subscriptions: 1 rang, 0 not (yet), or a negative errno.
-unsafe fn rang(sys: &SyscallTable, event: i32, sub: i32) -> i32 {
+/// subscriptions: 1 rang, 0 not (yet), or a negative errno. `owed` carries a
+/// take that failed or answered `more` to the next call, which takes again
+/// whether or not the event fired: POLL consumed the signal, and a rung bit
+/// left set sends no other.
+unsafe fn rang(sys: &SyscallTable, event: i32, sub: i32, owed: &mut u32) -> i32 {
     use abi::contracts::storage::namespace::take;
     let fired = (sys.provider_call)(
         event,
@@ -446,9 +452,10 @@ unsafe fn rang(sys: &SyscallTable, event: i32, sub: i32) -> i32 {
         core::ptr::null_mut(),
         0,
     );
-    if fired <= 0 {
+    if fired <= 0 && *owed == 0 {
         return fired;
     }
+    *owed = 1;
     let mut out = [0u8; take::HEAD_LEN + 4 * 8];
     let req = take::Request {
         event,
@@ -463,9 +470,10 @@ unsafe fn rang(sys: &SyscallTable, event: i32, sub: i32) -> i32 {
     if n < 0 {
         return n;
     }
-    let Some((_, mut handles)) = take::decode(&out[..n as usize]) else {
+    let Some((more, mut handles)) = take::decode(&out[..n as usize]) else {
         return E_INVAL;
     };
+    *owed = u32::from(more);
     let named = handles.any(|h| h == sub);
     i32::from(named)
 }
@@ -510,7 +518,11 @@ unsafe fn changes_has(
             return E_INVAL;
         };
         if decoded.lost {
-            return E_INVAL; // a relist is never LOST
+            // The history moved past the revision the relist pinned: the
+            // walk starts over.
+            token_len = 0;
+            found = 0;
+            continue;
         }
         if decoded
             .records()
@@ -568,8 +580,8 @@ unsafe fn emit(s: &State) {
     write_dec(p, &mut pos, s.got);
     lit!(b" listed=");
     write_dec(p, &mut pos, s.listed);
-    lit!(b" pushed=");
-    write_dec(p, &mut pos, s.pushed);
+    lit!(b" rung=");
+    write_dec(p, &mut pos, s.rung);
     lit!(b" del=");
     write_dec(p, &mut pos, s.del);
     lit!(b" wit_a=");
@@ -623,7 +635,7 @@ pub unsafe extern "C" fn module_new(
         s.put = 0;
         s.got = 0;
         s.listed = 0;
-        s.pushed = 0;
+        s.rung = 0;
         s.del = 0;
         s.err = 0;
         s.wit_a = 0;
@@ -637,6 +649,7 @@ pub unsafe extern "C" fn module_new(
         s.cleared = 0;
         s.clear_len = 0;
         s.subscribed = 0;
+        s.take_owed = 0;
         params_def::set_defaults(s);
         params_def::parse_tlv(s, params, params_len);
         0
@@ -770,9 +783,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 s.state = 3;
             }
             3 => {
-                // 4. SUBSCRIBE, then write — the PUSH every source depends on.
-                // A store with no change events writes and moves on.
-                if s.want_push == 0 {
+                // 4. SUBSCRIBE, then write — the wake every source depends on.
+                // A store with no subscriptions writes and moves on.
+                if s.want_ring == 0 {
                     match put(sys, KEY_C, VAL_C, &mut s.fence) {
                         WriteAnswer::Pending => return 0,
                         WriteAnswer::Decided(0) => {}
@@ -834,18 +847,18 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 // whether a change ever signals the event. Once it rings, the
                 // read it asks for must find the write. A read the store
                 // answers "not yet" is asked again next step.
-                if s.subscribed == 1 && rang(sys, s.event, s.sub) == 1 {
+                if s.subscribed == 1 && rang(sys, s.event, s.sub, &mut s.take_owed) == 1 {
                     s.subscribed = 2;
                 }
                 if s.subscribed == 2 {
                     match changes_has(sys, PREFIX, s.sub, KEY_C, VAL_C, &mut s.scratch) {
-                        1 => s.pushed += 1,
+                        1 => s.rung += 1,
                         E_AGAIN => {}
                         _ => s.subscribed = 3, // rang, but the read missed the write
                     }
                 }
                 // Give the ring a bounded number of steps before judging it.
-                if s.pushed > 0 || s.subscribed == 3 || s.step > 2000 {
+                if s.rung > 0 || s.subscribed == 3 || s.step > 2000 {
                     s.state = 5;
                 }
             }
@@ -878,7 +891,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 }
                 s.listed = n as u32;
                 witness_counts(sys, s);
-                s.pass = u32::from(s.pushed > 0 || s.want_push == 0);
+                s.pass = u32::from(s.rung > 0 || s.want_ring == 0);
                 s.state = 5;
                 emit(s);
                 s.done = 1;

@@ -110,9 +110,10 @@ pub const fn place_arenas(
 /// them before it lowers the floor.
 ///
 /// Bytes the list cannot hold — a block that coalesces with nothing while
-/// every extent is in use and is smaller than all of them, or the sliver an
-/// aligned take leaves above itself with no extent free for it — are counted
-/// in [`dropped`](Self::dropped) and not reused.
+/// every extent is in use and is smaller than all of them, the sliver an
+/// aligned take leaves above itself with no extent free for it, or a block
+/// that overlaps one the list holds — are counted in
+/// [`dropped`](Self::dropped) and not reused.
 pub struct FreeExtents<const N: usize> {
     lo: [usize; N],
     hi: [usize; N],
@@ -187,18 +188,30 @@ impl<const N: usize> FreeExtents<N> {
         self.len += 1;
     }
 
-    /// Hand back `[at, at + bytes)`, a block no extent overlaps. It joins the
-    /// extent that ends where it starts and the one that starts where it
-    /// ends. One that joins neither while the list is full replaces the
-    /// smallest extent when it is larger, and is dropped otherwise.
+    /// Hand back `[at, at + bytes)`. It joins the extent that ends where it
+    /// starts and the one that starts where it ends. One that joins neither
+    /// while the list is full replaces the smallest extent when it is larger,
+    /// and is dropped otherwise. A block that overlaps an extent the list
+    /// holds, or runs past the top of the address space, is a block handed
+    /// back twice or never carved: it is dropped, so the list never holds a
+    /// byte twice and never hands one out twice.
     pub fn give(&mut self, at: usize, bytes: usize) {
         if bytes == 0 {
             return;
         }
-        let end = at.saturating_add(bytes);
+        let Some(end) = at.checked_add(bytes) else {
+            self.dropped += bytes;
+            return;
+        };
         let mut i = 0;
         while i < self.len && self.lo[i] < at {
             i += 1;
+        }
+        let overlaps_prev = i > 0 && self.hi[i - 1] > at;
+        let overlaps_next = i < self.len && self.lo[i] < end;
+        if overlaps_prev || overlaps_next {
+            self.dropped += bytes;
+            return;
         }
         let joins_prev = i > 0 && self.hi[i - 1] == at;
         let joins_next = i < self.len && self.lo[i] == end;

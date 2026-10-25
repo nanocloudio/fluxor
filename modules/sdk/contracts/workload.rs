@@ -63,7 +63,10 @@
 // an owner admitted with it) acts on every workload. The binding is the
 // owner's, not one module's, so a module of that owner that lost its handle
 // recovers it with LOOKUP; LOOKUP never moves it. A CREATE being staged is
-// continued or abandoned only by the owner that began it.
+// the owner's that began it: only that owner (or the node's authority)
+// continues it, finds it with LOOKUP or abandons it with DESTROY by
+// identity — another owner is answered `EACCES` — and the workload it ends
+// in is that owner's, whichever caller sends the call that finishes it.
 
 /// `CREATE` — admit and instantiate a workload from a spec (below); returns a
 /// tagged `WorkloadHandle` fd, or a negative errno. The caller must hold the
@@ -78,7 +81,8 @@
 /// again each step with the same spec, byte for byte, until it gets the
 /// handle. The backend works from its own copy of the subgraph and never
 /// writes into the spec. While one `CREATE` is being staged, any other
-/// spec, for its identity or another, answers `EBUSY`; [`LOOKUP`] finds the
+/// spec, for its identity or another, answers `EBUSY` — another owner's
+/// `CREATE` for the staged identity answers `EACCES`; [`LOOKUP`] finds the
 /// staged identity and [`DESTROY`] by identity abandons it.
 pub const CREATE: u32 = 0x1A00;
 

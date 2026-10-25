@@ -49,8 +49,9 @@ pub struct NetIdentity {
     pub addr_v4: [u8; 4],
     /// Prefix length in bits (1..=32).
     pub prefix_len: u8,
-    /// The `net.route` segment the workload attaches to (validated at
-    /// CREATE), or `None` for segment 0.
+    /// The `net.route` segment the workload attaches to (checked at CREATE,
+    /// and again as the attachment is made, `net_route::attach`), or `None`
+    /// for segment 0.
     pub segment: Option<crate::abi::contracts::net::route::Segment>,
 }
 

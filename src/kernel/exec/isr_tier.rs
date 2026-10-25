@@ -21,7 +21,20 @@
 //! ## Platform backends
 //!
 //! Platform-specific timer setup and ISR vectors are in the HAL layer.
-//! The HAL calls `isr_tier1b_handler()` from the timer ISR.
+//! `isr_tier1b_handler()` runs from the Tier 1b alarm interrupt on RP and
+//! from the domain pump's poll (`poll_tier1b`) on bcm2712;
+//! `isr_tier2_trampoline()` runs from the IRQ handler for a Tier 2 binding.
+//!
+//! ## Dispatch gate
+//!
+//! Both handlers step modules only while dispatch is open. Graph preparation
+//! closes it ([`close_dispatch`]) before it resizes the kernel tables, and
+//! waits out every handler already past the gate, on any core; dispatch
+//! opens again when the new graph registers an ISR-tier module. A handler
+//! raises an in-flight count and then reads the gate, and the close stores
+//! the gate and then reads the count, all four accesses sequentially
+//! consistent: of a handler and a close that race, either the handler sees
+//! the gate closed or the close sees the handler in flight.
 //!
 //! ## Cycle budgeting
 //!

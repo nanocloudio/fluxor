@@ -697,6 +697,9 @@ fn multi_graph_runner(modules: &mut [ModuleSlot], domain: usize) -> (StepResult,
             must_tick_mask.set(i);
         }
     }
+    if domain == 0 {
+        super::domain_budget::readiness_starvation_sweep(sched, modules, count, &not_ready);
+    }
     // Once-per-tick budget reset + adaptive-tick worst-step decay for this domain.
     sched.domain_budget_us_consumed[domain] = 0;
     let w = sched.domain_worst_step_us[domain];
@@ -732,24 +735,27 @@ fn multi_graph_runner(modules: &mut [ModuleSlot], domain: usize) -> (StepResult,
 
     let nominal = domain_tick_us(domain);
     for gi in 0..rc {
-        // Snapshot the entry's static fields before borrowing `sched` mutably in
-        // the step pass (the table is not mutated by stepping).
-        let (slot, generation, gdomain, mask, primed, periodic_mask, idle_safe, snap_backstop);
+        // Snapshot the entry's fields before borrowing `sched` mutably in the
+        // step pass. An entry's domain is written only when the index is
+        // rebuilt; its pass state (`primed`, the backstop, the last logged
+        // runnability) only by the runner of that domain. So the domain is
+        // read first and another domain's entry is left alone: on bcm2712
+        // its runner, on another core, may be writing it.
+        let (slot, generation, mask, primed, periodic_mask, idle_safe, snap_backstop);
         {
-            // SAFETY: scheduler-thread read; the table is not mutated by stepping.
+            // SAFETY: a read of this domain's own entry (see above).
             let table = unsafe { &*core::ptr::addr_of!(RESIDENT_GRAPHS) };
             let e = &table[gi];
+            if e.domain as usize != domain {
+                continue;
+            }
             slot = e.slot;
             generation = e.generation;
-            gdomain = e.domain as usize;
             mask = e.mask;
             primed = e.primed;
             periodic_mask = e.periodic_mask;
             idle_safe = e.idle_safe;
             snap_backstop = e.backstop_next_due_us;
-        }
-        if gdomain != domain {
-            continue;
         }
         // Pause skip: a paused owner's
         // graph is not-runnable REGARDLESS of wakes, due periodic modules,
@@ -1666,6 +1672,10 @@ pub struct ModuleStateSnapshot {
     /// module from stepping. `0` after every successful step; non-zero
     /// indicates a dead upstream edge.
     pub inactive_for_ticks: u32,
+    /// Whether the readiness gate has held this module for a whole report
+    /// window and the kernel has logged it (`[ready] ... not stepped`).
+    /// Clears when the hold ends.
+    pub readiness_starved: bool,
     /// Per-slot generation. Bumped on graph reset, restart, and
     /// module replacement. Async consumers that snapshot telemetry
     /// must pair this with a later read of the same module — a
@@ -1691,6 +1701,7 @@ pub fn module_state_snapshot(module_idx: usize) -> ModuleStateSnapshot {
             restart_count: 0,
             domain_id: 0,
             inactive_for_ticks: 0,
+            readiness_starved: false,
             slot_generation: 0,
         };
     }
@@ -1712,6 +1723,7 @@ pub fn module_state_snapshot(module_idx: usize) -> ModuleStateSnapshot {
         restart_count: sched.fault_info[module_idx].restart_count,
         domain_id: sched.domain_id[module_idx],
         inactive_for_ticks: sched.inactive_for_ticks[module_idx],
+        readiness_starved: sched.starvation_reported.test(module_idx),
         slot_generation: sched.slot_generation[module_idx],
     }
 }

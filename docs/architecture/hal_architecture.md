@@ -527,8 +527,8 @@ Applied:
 - **PCIe** — device access is generic vocabulary: the `pcie_device` contract
   (handles, config space, BARs, interrupts, device info) lives at
   `abi::contracts::hal::pcie_device` (id 0x0012). BCM2712 root-complex control
-  (outbound windows, MSI controller, SMMU mechanics) stays platform, split by
-  concern into `pcie_config`/`nic_ring`/`smmu`/`msi`. Board PCIe topology and
+  (outbound windows, MSI controller) stays platform, split by concern into
+  `pcie_config`/`nic_ring`/`msi`. Board PCIe topology and
   aliases (`m2_primary`, `rp1`) are board facts, generated from the board TOML
   `[platform.pcie]`. Promoting the platform config/BAR ops into the generic
   `contracts/hal/pcie` opcode *class* would be a deliberate wire renumber and

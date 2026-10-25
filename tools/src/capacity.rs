@@ -684,11 +684,12 @@ pub const DECLARED_DEMAND: &[(&str, &str)] = &[
 /// Pools a module provider can serve from its own heap in place of the
 /// kernel's host table, `(pool, contract)`. When a graph has an unkeyed module
 /// provider of the contract, its consumers call that module, so the composer
-/// leaves the pool's declared demand off the host table (which the Linux
-/// store sizes from `plan_ceiling(POOL_STORE_SUBS)`) and the provider carries
-/// it in its `heap_per_demand` figure — the demand is spent once. The kernel
-/// pulls the pool's in-use figure from that provider (`resource::POOL_SAMPLE`)
-/// and it counts its refusals there (`resource::LEDGER_DENY`).
+/// leaves the pool's declared demand off the host table (which the Linux and
+/// bcm2712 stores size from `plan_ceiling(POOL_STORE_SUBS)`) and the provider
+/// carries it in its `heap_per_demand` figure — the demand is spent once. The
+/// kernel pulls the pool's in-use figure from that provider
+/// (`resource::POOL_SAMPLE`) and it counts its refusals there
+/// (`resource::LEDGER_DENY`).
 pub const MODULE_PROVIDED_POOLS: &[(&str, &str)] = &[("store_subs", "storage.namespace")];
 
 /// Envelope section magic "FXEV" — mirror of

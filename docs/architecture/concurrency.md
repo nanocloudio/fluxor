@@ -51,28 +51,53 @@ module heap grows (`kernel::mem::heap`). Its bookkeeping (`STATE_ARENA_OFFSET`,
 over the bounded bookkeeping and never while the carved bytes are zeroed.
 
 The boot-sized kernel tables (`src/kernel/mem/table.rs`) move to a larger
-block only while a graph is prepared, and on bcm2712 the block a table moves
-out of goes straight back to the carve zone for the next carve. Nothing can
-still read it: the move runs on core 0, at boot before the secondaries run
-or for a rebuild with every non-primary domain parked at its tick boundary
-(holding no slice of any table); the interrupts that read a table, a device
-IRQ signalling its event, are delivered to core 0 and so finish before the
-move continues; and `prepare_graph` closes ISR-tier dispatch first
-(`isr_tier::close_dispatch`), waiting out any Tier 1b or Tier 2 handler in
-flight on another core, so no ISR-tier module reaches a table through a
-syscall's admission check until the new graph registers it. A table a lock
-guards (the net-attach lane tables) moves under that lock.
+block only while a graph is prepared, and the block a table moves out of is
+freed at once: on bcm2712 to the carve zone, for the next carve, and on Linux
+to the host's allocator. The move copies the table, publishes the new block
+with a release store, and then frees the old one, so the argument that no
+reader can still hold the old block is made per platform.
 
-The hosted runtime frees a moved block to the host's allocator at once, for
-a simpler reason: it reads its tables from one thread. The scheduler, every
-module step and every call a module makes run on the main thread, which takes
-a rebuild between passes. The runtime's other threads — the process
-executor's and the CLI's pipe pumps, the `host_mount` workers, the resolver,
-GPU and display threads, the `net_route` prober and announcer, the audio
-callback — exchange with the scheduler through bridges, channels and their
-own locked state, never a kernel table; their log records reach the owner
-attribution tee, which reads the module owner table only on the scheduler
-thread. The stop-signal handler touches atomics only.
+On bcm2712 every move runs on core 0, in `prepare_graph`, which core 0 enters
+from its pump loop between steps, holding no slice of any table (a slice
+lives only within the call that reads it). At boot no other core has left
+its wait for `INIT_COMPLETE`. For a rebuild the other domains are quiesced
+first: each parks at its tick boundary, outside any step, and resumes only
+after the rebuild, when its acquire load of the quiesce flag, paired with the
+release store that ends the quiesce, makes the new block visible to its next
+read. Interrupts are covered by three facts:
+
+- Core 0 masks its own interrupts from the copy to the free. Every interrupt
+  that reaches a table from handler context is delivered there: an event
+  binding (which signals its event slot) and the PCIe MSI multiplexer are
+  bound to core 0, and `gic::irq_bind` refuses to bind an SGI or PPI, which
+  is taken on whichever core raises it, to an event.
+- A Tier 1b or Tier 2 handler may run on another core: a Tier 2 IRQ is
+  delivered to its domain's core, which the quiesce parks but does not mask.
+  `prepare_graph` closes ISR-tier dispatch before it sizes a table
+  (`isr_tier::close_dispatch`). A handler raises an in-flight count and then
+  reads the gate; the close stores the gate and then waits for the count to
+  reach zero; all four accesses are sequentially consistent, so either the
+  handler sees the gate closed and steps nothing, or the close sees the
+  handler and waits for it to return. Dispatch reopens only when the new
+  graph registers an ISR-tier module, after every table is sized.
+- The timer tick handler on each core touches atomics only.
+
+A table its own lock guards (the net-attach lane tables) may move on a step,
+on any core, under that lock, which every reader of it holds.
+
+On Linux the hosted runtime reads its tables from one thread. The scheduler,
+every module step and every call a module makes run on the main thread,
+which takes a rebuild between passes, when no pass holds a slice. The
+runtime's other threads (the process executor's and the CLI's pipe pumps, the
+`host_mount` workers, the resolver, GPU and display threads, the `net_route`
+prober and announcer, the audio callback) exchange with the scheduler through
+bridges, channels and their own locked state, never a kernel table. Their log
+records reach the owner-attribution tee, which reads the module owner table
+only on the scheduler thread. The stop-signal handler stores atomics, or
+restores the terminal and re-raises.
+
+RP keeps a moved block until the next plan, which replans the whole pool with
+interrupts masked (`carve::begin_plan`).
 
 ### Per-core-sliced — steady state, no byte shared
 
@@ -85,6 +110,13 @@ so two cores never touch the same byte:
   `STATE_LOCK`. The table itself is a per-module boot-sized table:
   each record sits in a cell, so every access borrows the table shared,
   and the table moves only while a graph is prepared.
+- `GRAPH_PACERS` and `RESIDENT_GRAPHS`
+  (`src/kernel/exec/scheduler/merge.rs`, `multigraph.rs`) — the multi-graph
+  runner's per-owner tables, one entry per owner slot and execution domain.
+  An entry's pass state is read and written only by the runner of its own
+  domain; of another domain's resident-graph entry a runner reads only the
+  domain it names, which changes only when the index is rebuilt, with the
+  other domains parked.
 - `FAN_BUFS[d]` (`src/kernel/exec/scheduler/module_types.rs`) —
   per-domain scratch for tee / merge. Tee and merge inherit their fan
   group's `domain_id`; a domain runs on exactly one core, so
@@ -120,8 +152,9 @@ must be an atomic or guarded by a lock:
   any core reads the anchor; any core's module may install one through
   `timer::DISCIPLINE`. A sequence lock (writers claim it even-to-odd by
   compare-exchange) keeps a reader from pairing two anchors' fields.
-- Event queues (`src/kernel/ipc/event.rs`) — atomic ring per event
-  handle.
+- Event slots (`src/kernel/ipc/event.rs`) — each `EventSlot` is atomic
+  (allocated, signalled, owner), and the wake-pending mask a module's
+  signal latches is an array of atomic words.
 - The bcm2712 state arena's zeroed frontier (`src/kernel/module/loader.rs`)
   — every domain zeroes the arena in its slack. One claim at a time
   (`CLAIM`, taken under `STATE_LOCK` with a try-lock, so a domain never

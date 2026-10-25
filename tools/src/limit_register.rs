@@ -43,7 +43,8 @@
 //! - every name in the block must also appear in the document's prose, so
 //!   the machine-checked list and the human-readable table cannot diverge
 //!   into two registers;
-//! - every ceiling-shaped `const` in a file the register already names is
+//! - every ceiling-shaped `const` in a file the register already names —
+//!   named as a ceiling, or sizing a fixed array of records there — is
 //!   counted, and those in neither the block nor the exemption block are
 //!   REPORTED. A register-named file is one the register vouches for, so a
 //!   ceiling appearing there uncovered is exactly the case the stated rule
@@ -443,21 +444,24 @@ fn ceiling_consts(text: &str) -> BTreeSet<String> {
     out
 }
 
-/// Whether an array's element is a plain scalar — an integer or byte type,
-/// or a literal of one (`u8`, `0u8`, `0`, `0xFF`, `b' '`, `false`). Such an
+/// Whether an array's element is a plain scalar — an integer, byte, bool or
+/// char type, or a literal of one (`u8`, `0u8`, `0`, `-1`, `0xFF`, `b' '`,
+/// `' '`, `false`). Such an
 /// array is a buffer, sized by a wire or record bound the register exempts
 /// as a format; an array of records (`[Sub; N]`, `[NO_SUB; N]`,
 /// `[[u8; K]; N]`) is a table, which is what the scan is for.
 fn is_scalar_element(elem: &str) -> bool {
-    const SCALARS: [&str; 13] = [
+    const SCALARS: [&str; 14] = [
         "u8", "u16", "u32", "u64", "u128", "usize", "i8", "i16", "i32", "i64", "i128", "isize",
-        "bool",
+        "bool", "char",
     ];
+    let unsigned = elem.strip_prefix('-').unwrap_or(elem);
     SCALARS.contains(&elem)
         || elem == "false"
         || elem == "true"
         || elem.starts_with("b'")
-        || elem.starts_with(|c: char| c.is_ascii_digit())
+        || elem.starts_with('\'')
+        || unsigned.starts_with(|c: char| c.is_ascii_digit())
 }
 
 /// Names that stand as the whole length of an array type or repeat
@@ -1393,7 +1397,11 @@ mod tests {
                    struct S {\n    subs: [Sub; SUBSCRIPTIONS],\n    \
                    keys: [[u8; KEY_LEN]; ROWS],\n    pad: [u8; HEAD_LEN + 2],\n    \
                    other: [u8; ELSEWHERE_MAX],\n}\n\
-                   static W: [Write; PENDING_WRITES] = [NO_WRITE; PENDING_WRITES];\n";
+                   static W: [Write; PENDING_WRITES] = [NO_WRITE; PENDING_WRITES];\n\
+                   const NEG_ROWS: usize = 2;\n\
+                   const GLYPHS: usize = 3;\n\
+                   static N: [i32; NEG_ROWS] = [-1; NEG_ROWS];\n\
+                   static G: [char; GLYPHS] = [' '; GLYPHS];\n";
         let d = project(
             "prose\n\n```limit-register\nSLOTS | src/a.rs | 32\n```\n",
             &[(SRC, src)],
@@ -1410,8 +1418,8 @@ mod tests {
             ]
             .map(|n| format!("src/a.rs::{n}"))
             .to_vec(),
-            "KEY_LEN sizes a byte buffer, HEAD_LEN only a computed length; ELSEWHERE_MAX is \
-             not declared here"
+            "KEY_LEN, NEG_ROWS and GLYPHS size scalar buffers, HEAD_LEN only a computed \
+             length; ELSEWHERE_MAX is not declared here"
         );
     }
 

@@ -1450,7 +1450,7 @@ pub fn cmd_workload_image(
         abi,
         project_root: project_root.as_path(),
     };
-    let workloads = crate::config::build_workloads(&only, loc, &[])?;
+    let workloads = crate::config::build_workloads(&only, loc, &[], &target_desc.id)?;
     let flxa =
         crate::add_subgraph::encode_add_subgraph(&workloads[0]).map_err(error::Error::Config)?;
     let store_fb = store_cli::lock_store_resolver(&project_root, abi, None);

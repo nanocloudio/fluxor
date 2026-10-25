@@ -107,9 +107,10 @@ pub const TTY_CLOSE: u32 = 0x1B06;
 ///   ambient. Running as any other uid it holds `cap_add` only, in every
 ///   set including ambient, so the added capabilities survive its exec;
 ///   with no addition it holds none.
-/// - The system-call filter is an allowlist modelled on the OCI default
-///   profile: the architecture is checked first (a foreign one kills the
-///   process); a call off the list answers `EPERM`; `clone` and `unshare`
+/// - The system-call filter is an allowlist modelled on the Docker default
+///   seccomp profile: the architecture is checked first (a foreign one,
+///   32-bit compat included, kills the process); a call off the list
+///   answers `EPERM`; `clone` and `unshare`
 ///   are allowed without namespace flags only, `clone3` answers `ENOSYS`,
 ///   `personality` takes the plain Linux personalities only, `socket` every
 ///   family but `AF_VSOCK`; calls the profile ties to a capability (mount
@@ -125,7 +126,10 @@ pub const TTY_CLOSE: u32 = 0x1B06;
 /// it ending is not the runtime ending). Each workload has an intermediate
 /// process between the runtime and its init, which relays the init's status
 /// exactly (an exit code as itself, a terminating signal as that signal).
-/// When the runtime is gone the intermediate kills the init. With ISOLATED
+/// When the runtime is gone the intermediate kills the init. SIGNAL and
+/// DESTROY reach the init's process group through the intermediate, the one
+/// process that reaps the init, so a signal never reaches a process that
+/// took the init's pid after it ended. With ISOLATED
 /// the init is PID 1 of the workload's pid namespace, so every process in
 /// it ends with it. With SHARED the intermediate is a child subreaper: when
 /// the init ends — by itself, by SIGNAL or DESTROY, or with the runtime —
@@ -145,7 +149,18 @@ pub const TTY_CLOSE: u32 = 0x1B06;
 /// urandom and tty bound in, `pts` (a new devpts instance, ptmxmode 0666),
 /// `shm` (a memory filesystem of at most 64 MiB, or the workload's memory
 /// quota when that is smaller), and the links fd, stdin, stdout, stderr and
-/// ptmx.
+/// ptmx. `/proc` is a new instance (nosuid, noexec, nodev) showing the
+/// workload's pid namespace, with `sys`, `sysrq-trigger`, `irq`, `bus` and
+/// `fs` read-only and `acpi`, `asound`, `kcore`, `keys`, `latency_stats`,
+/// `sched_debug`, `scsi`, `timer_list` and `timer_stats` masked (the Docker
+/// defaults). An EXEC or a TTY session joins the namespaces of the init
+/// itself, through a pid descriptor: once the init has ended it is `ESRCH`.
+/// The root is entered with `pivot_root(2)`: a host whose own root is the
+/// initial ramfs, where that is refused, runs no isolated workload with a
+/// rootfs (the init exits 123). An isolated workload needs Linux 5.12
+/// (`mount_setattr`) and pid-descriptor `setns` (5.8); a kernel without them
+/// fails it rather than isolate it less. An isolated workload without a
+/// rootfs shares the host's filesystem and `/proc`.
 /// Read-only root: the root mount alone is made read-only, last — after
 /// the volumes, the fresh `/proc` and the working directory are in place —
 /// so a volume keeps its own access and a missing working directory is
@@ -188,8 +203,8 @@ pub mod caps {
     /// [`super::GROUPS_STRICT`] is honoured.
     pub const GROUPS_STRICT: u32 = 1 << 2;
     /// [`super::SRC_CAP_ADD`] is honoured: the runtime holds CAP_SETPCAP,
-    /// so it shapes a workload's sets. An added capability the runtime
-    /// itself lacks is still `EACCES`.
+    /// so it also cuts a workload's bounding set to the granted set. An
+    /// added capability the runtime itself lacks is still `EACCES`.
     pub const CAP_ADD: u32 = 1 << 3;
     /// A workload runs under the default system-call filter, and
     /// [`super::SRC_NO_SYSCALL_FILTER`] runs one without it.

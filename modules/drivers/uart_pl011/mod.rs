@@ -80,7 +80,8 @@ struct UartState {
     transfers: [UartTransfer; MAX_HANDLES],
     step_count: u32,
     next_handle: u8,
-    _pad: [u8; 3],
+    ready_reported: u8,
+    _pad: [u8; 2],
 }
 
 use abi::platform::rp::uart_raw::{REG_READ as UART_REG_READ, REG_WRITE as UART_REG_WRITE};
@@ -367,6 +368,13 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
             poll_uart_transfer(s, i);
         }
         i += 1;
+    }
+    // Ready on the first step: nothing is brought up before a consumer's
+    // first open, and the scheduler holds this provider's consumers until
+    // it reports Ready.
+    if s.ready_reported == 0 {
+        s.ready_reported = 1;
+        return 3;
     }
     0
 }

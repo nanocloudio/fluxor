@@ -213,15 +213,25 @@ pub(crate) fn irq_mux() -> Option<fn()> {
 /// (`GICD_ITARGETSR`) — for a Tier-2 IRQ the core its owning domain runs
 /// on, otherwise core 0. For an SGI or PPI (INTID < 32) the enable and
 /// priority registers are banked per core, so this programs the calling
-/// core's copy, and `ITARGETSR` is read-only.
+/// core's copy, and `ITARGETSR` is read-only. An event binding
+/// (`event_handle >= 0`) must name a shared peripheral interrupt: it is
+/// serviced on core 0, which only an SPI can be routed to.
 ///
-/// Returns 0 on success, negative errno on failure.
+/// Returns 0 on success, negative errno on failure: `EINVAL` for an INTID
+/// past the GIC's, or an SGI or PPI bound to an event.
 pub fn irq_bind(irq: u32, event_handle: i32, mmio_base: usize, target_core: u8) -> i32 {
     // 1020..=1023 are special IDs and must never be programmed into the
     // distributor (the validator rejects them at build time; this is the
     // runtime backstop). A larger value would also index ISENABLER,
     // IPRIORITYR and ITARGETSR past their banks.
     if irq > MAX_INTID {
+        return crate::kernel::sys::errno::EINVAL;
+    }
+    // An event binding is serviced on core 0, where a table move masks it
+    // (`kernel::mem::table`). Only a shared peripheral interrupt can be
+    // routed there; an SGI or PPI is taken on whichever core it is raised
+    // on, so one is never bound to an event.
+    if irq < 32 && event_handle >= 0 {
         return crate::kernel::sys::errno::EINVAL;
     }
     let gicd = gicd_base();
@@ -247,12 +257,12 @@ pub fn irq_bind(irq: u32, event_handle: i32, mmio_base: usize, target_core: u8) 
         // IPRIORITYR: a byte per INTID; 0 is the highest priority.
         core::ptr::write_volatile((gicd + GICD_IPRIORITYR + irq as usize) as *mut u8, 0);
         // ITARGETSR: a byte per INTID, one bit per CPU interface.
-        let target = cpu_interface_mask(target_core as usize);
+        // An event binding goes to core 0 whatever the caller named.
+        let core = if event_handle >= 0 { 0 } else { target_core };
+        let target = cpu_interface_mask(core as usize);
         core::ptr::write_volatile((gicd + GICD_ITARGETSR + irq as usize) as *mut u8, target);
 
-        log::info!(
-            "[irq] bind irq={irq} event={event_handle} mmio={mmio_base:#x} core={target_core}"
-        );
+        log::info!("[irq] bind irq={irq} event={event_handle} mmio={mmio_base:#x} core={core}");
     }
     0
 }

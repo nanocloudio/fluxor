@@ -3,8 +3,8 @@
 // Layer: contracts/hal (portable, stable). The operations here are generic
 // PCIe concepts — bind/discover a device, read/write configuration space, map
 // a BAR, allocate an interrupt, obtain device info — so a driver (NVMe, RP1,
-// a future NIC) depends on PCIe CAPABILITY, never on a silicon family.
-// Root-complex mechanics (outbound windows, MSI controller programming, SMMU)
+// a NIC) depends on PCIe CAPABILITY, never on a silicon family.
+// Root-complex mechanics (outbound windows, MSI controller programming)
 // are platform implementation; PCIe topology/aliases (`m2_primary`, `rp1`)
 // are board facts (see docs/architecture/hal_architecture.md
 // D-HW-TAXONOMY).

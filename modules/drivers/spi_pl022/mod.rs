@@ -134,7 +134,8 @@ struct SpiState {
     buses: [BusInfo; MAX_BUSES],
     step_count: u32,
     next_handle: u8,
-    _pad: [u8; 3],
+    ready_reported: u8,
+    _pad: [u8; 2],
 }
 
 // ============================================================================
@@ -813,6 +814,13 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
         i += 1;
     }
 
+    // Ready on the first step: nothing is brought up before a consumer's
+    // first open, and the scheduler holds this provider's consumers until
+    // it reports Ready.
+    if s.ready_reported == 0 {
+        s.ready_reported = 1;
+        return 3;
+    }
     0 // Continue
 }
 

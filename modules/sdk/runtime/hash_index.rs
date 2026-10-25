@@ -1,9 +1,13 @@
 // Open-addressed hash index over a caller's table: the bounded lookup
-// structure every keyed table in a module goes through instead of a scan.
+// structure a module's keyed tables go through instead of a scan.
 //
-// Mounted with `include!` into the module that keys a table (`ip`'s
-// connection and flow indices, `pkt_filter`'s flow table), so it is one
-// implementation wherever a module hashes its records.
+// Mounted with `include!` by each module that keys a table (`ip`'s
+// connection, address, flow and service indices; `pkt_filter`'s flow
+// table), so every one of them probes, inserts and removes the same way.
+//
+// Linear probing over a power-of-two index of `u32` entries, each the
+// caller's `slot + 1`. Every walk is bounded by the index length, so a full
+// or degenerate index costs a bounded step, never an endless one.
 //
 // Entries are `slot + 1` and 0 is empty — there is no third state. A
 // removal pulls the rest of its chain back over the hole rather than
@@ -38,10 +42,10 @@ pub fn mix32(mut x: u32) -> u32 {
 /// index is larger than the table it indexes.
 ///
 /// # Safety
-/// `index` must be a power-of-two length.
+/// `index` must be a power-of-two length, or empty (it then holds nothing).
 #[inline]
 pub unsafe fn insert(index: &mut [u32], hash: u32, slot: usize) -> bool {
-    let mask = index.len() - 1;
+    let mask = index.len().wrapping_sub(1);
     let mut i = hash as usize & mask;
     let mut probes = 0;
     while probes < index.len() {
@@ -67,7 +71,7 @@ pub unsafe fn insert(index: &mut [u32], hash: u32, slot: usize) -> bool {
 /// chain, where nothing will find it again.
 ///
 /// # Safety
-/// `index` must be a power-of-two length.
+/// `index` must be a power-of-two length, or empty (it then holds nothing).
 #[inline]
 pub unsafe fn remove(
     index: &mut [u32],
@@ -75,7 +79,7 @@ pub unsafe fn remove(
     slot: usize,
     home_of: impl Fn(usize) -> u32,
 ) -> bool {
-    let mask = index.len() - 1;
+    let mask = index.len().wrapping_sub(1);
     let mut i = hash as usize & mask;
     let mut probes = 0;
     let want = slot as u32 + 1;
@@ -129,14 +133,14 @@ pub unsafe fn remove(
 /// was indexed under a key that has not yet been removed.
 ///
 /// # Safety
-/// `index` must be a power-of-two length.
+/// `index` must be a power-of-two length, or empty (it then holds nothing).
 #[inline]
 pub unsafe fn lookup<F: FnMut(usize) -> bool>(
     index: &[u32],
     hash: u32,
     mut matches: F,
 ) -> Option<usize> {
-    let mask = index.len() - 1;
+    let mask = index.len().wrapping_sub(1);
     let mut i = hash as usize & mask;
     let mut probes = 0;
     while probes < index.len() {
@@ -157,9 +161,7 @@ pub unsafe fn lookup<F: FnMut(usize) -> bool>(
 /// Forget everything.
 #[inline]
 pub fn clear(index: &mut [u32]) {
-    let mut i = 0;
-    while i < index.len() {
-        index[i] = EMPTY;
-        i += 1;
+    for e in index.iter_mut() {
+        *e = EMPTY;
     }
 }

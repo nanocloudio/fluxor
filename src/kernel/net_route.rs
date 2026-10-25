@@ -403,17 +403,18 @@ pub fn validate_attach(
 /// check a SEGMENTS replace makes: under the segment table's apply flag (the
 /// one a replace holds from its attached-workload check to its store), the
 /// segment is checked again ([`validate_attach`]) and, when it still admits
-/// the address, `record` runs and makes the attachment visible to that
-/// check. So a replace either sees the attachment (and answers `EBUSY`) or
-/// completed first (and this answers its error, the caller rolling the
-/// workload back): a workload is never left on a segment the table no
-/// longer holds. `EAGAIN` when a replace held the flag for every wait.
+/// the address, `record` runs with the segment as the table holds it now and
+/// makes the attachment visible to that check. So a replace either sees the
+/// attachment (and answers `EBUSY`) or completed first (and this answers its
+/// error, the caller rolling the workload back): a workload is never left on
+/// a segment the table no longer holds. `EAGAIN` when a replace held the
+/// flag for every wait.
 pub fn attach_segment(
     family: u8,
     addr: &[u8; wire::ADDR_LEN],
     segment_id: u16,
     backend_attaches: bool,
-    record: impl FnOnce(),
+    record: impl FnOnce(&wire::Segment),
 ) -> Result<wire::Segment, i32> {
     let mut spins = 0;
     while APPLYING[T_SEG]
@@ -427,8 +428,8 @@ pub fn attach_segment(
         relax();
     }
     let r = validate_attach(family, addr, segment_id, backend_attaches);
-    if r.is_ok() {
-        record();
+    if let Ok(seg) = r.as_ref() {
+        record(seg);
     }
     APPLYING[T_SEG].store(false, Ordering::Release);
     r

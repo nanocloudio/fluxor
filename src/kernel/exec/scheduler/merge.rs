@@ -426,8 +426,9 @@ pub struct SchedulerState {
     pub(crate) inactive_for_ticks: ModTable<u32>,
     /// Per-slot generation counter. Bumped on every event that
     /// invalidates an outstanding reference into the slot's state
-    /// region — graph reset, module replacement (`store_builtin_module`,
-    /// `store_dynamic_module`), partial restart. Callers that snapshot
+    /// region — graph reset, a slot vacated (owner free, rollback),
+    /// built-in module replacement (`store_builtin_module`), partial
+    /// restart — so one generation names one occupancy. Callers that snapshot
     /// telemetry asynchronously can pair the snapshot's
     /// `slot_generation` with a later read; a generation mismatch means
     /// the slot was reused under them and the stale read must be
@@ -554,6 +555,14 @@ pub struct SchedulerState {
     /// intersection degenerates exactly to the global
     /// `wake_pending_nonzero()`.
     pub(crate) domain_module_mask: [ModuleMask; MAX_DOMAINS],
+    /// Readiness-gate starvation sweep (`readiness_starvation_sweep`), in
+    /// order: the modules held when the current window opened and at every
+    /// sweep since, the held modules already reported for their current
+    /// hold, when the sweep last ran, and when the current window opened.
+    pub(crate) starvation_suspect: ModuleMask,
+    pub(crate) starvation_reported: ModuleMask,
+    pub(crate) starvation_sweep_ms: u64,
+    pub(crate) starvation_window_ms: u64,
 
     // ── Tier 1c pre-pass drain slot ─────────────────────────────────
     /// Per-domain module indices that opt into the Tier 1c pre-tick
@@ -678,6 +687,10 @@ impl SchedulerState {
             domain_budget_overruns: [0; MAX_DOMAINS],
             domain_worst_step_us: [0; MAX_DOMAINS],
             domain_module_mask: [ModuleMask::EMPTY; MAX_DOMAINS],
+            starvation_suspect: ModuleMask::EMPTY,
+            starvation_reported: ModuleMask::EMPTY,
+            starvation_sweep_ms: 0,
+            starvation_window_ms: 0,
             domain_pre_tick_order: [[0; MAX_PRE_TICK_PER_DOMAIN]; MAX_DOMAINS],
             domain_pre_tick_count: [0; MAX_DOMAINS],
             domain_pre_tick_overruns: [0; MAX_DOMAINS],
@@ -723,7 +736,10 @@ impl SchedulerState {
         self.grow_module_tables(live.max(held))
     }
 
-    /// Reserve every per-module table for `ceiling` slots.
+    /// Reserve every per-module table for `ceiling` slots. The module table
+    /// goes last: its committed count is `module_slots()`, the bound most
+    /// readers index the others by, so a reservation refused part-way (a
+    /// carve zone that runs out) leaves it no longer than any other.
     ///
     /// # Safety
     /// As [`size_module_tables`](Self::size_module_tables).
@@ -731,7 +747,6 @@ impl SchedulerState {
         &mut self,
         ceiling: usize,
     ) -> Result<(), crate::kernel::mem::table::TableError> {
-        self.modules.reserve(ceiling)?;
         self.ports.reserve(ceiling)?;
         self.port_caps.reserve(ceiling)?;
         self.finished.reserve(ceiling)?;
@@ -777,7 +792,8 @@ impl SchedulerState {
         }
         // SAFETY: the caller's contract covers the heap table too: it is a
         // per-module table, reserved with the rest.
-        unsafe { crate::kernel::mem::heap::reserve_heaps(ceiling) }
+        unsafe { crate::kernel::mem::heap::reserve_heaps(ceiling)? };
+        self.modules.reserve(ceiling)
     }
 
     /// The most slots any per-module table holds committed. A table touched
@@ -836,11 +852,11 @@ impl SchedulerState {
 
     /// Commit per-module slots until `n` are live, within the reserved
     /// ceiling: a segment at a time, at boot and when a live add needs a slot.
+    /// The module table commits last, as it reserves last.
     pub(crate) fn grow_module_tables(
         &mut self,
         n: usize,
     ) -> Result<(), crate::kernel::mem::table::TableError> {
-        self.modules.grow(n)?;
         self.ports.grow(n)?;
         self.port_caps.grow(n)?;
         self.finished.grow(n)?;
@@ -885,7 +901,7 @@ impl SchedulerState {
             t.grow(n)?;
         }
         crate::kernel::mem::heap::grow_heaps(n)?;
-        Ok(())
+        self.modules.grow(n)
     }
 
     /// Reserve the per-edge tables for `ceiling` edges and commit `live`.
@@ -899,11 +915,13 @@ impl SchedulerState {
     ) -> Result<(), crate::kernel::mem::table::TableError> {
         // The per-edge tables share an index, so they commit one count, and
         // hold what any of them already holds, as the per-module tables do.
+        // The edge table goes last, as the module table does among the
+        // per-module tables.
         let mut ceiling = ceiling;
         loop {
-            self.edges.reserve(ceiling)?;
             self.flow_last_fill.reserve(ceiling)?;
             self.flow_stalls.reserve(ceiling)?;
+            self.edges.reserve(ceiling)?;
             let held = self
                 .edges
                 .len()
@@ -921,10 +939,9 @@ impl SchedulerState {
         &mut self,
         n: usize,
     ) -> Result<(), crate::kernel::mem::table::TableError> {
-        self.edges.grow(n)?;
         self.flow_last_fill.grow(n)?;
         self.flow_stalls.grow(n)?;
-        Ok(())
+        self.edges.grow(n)
     }
 
     /// Reset all runtime state for a new graph setup.
@@ -1005,6 +1022,9 @@ impl SchedulerState {
                 self.domain_pre_tick_order[d][i] = 0;
             }
         }
+        self.starvation_suspect = ModuleMask::EMPTY;
+        self.starvation_reported = ModuleMask::EMPTY;
+        self.starvation_window_ms = 0;
         self.reconfigure_phase = ReconfigurePhase::Running;
         self.active_module_count = 0;
         self.rebuild_request = None;
@@ -2362,7 +2382,10 @@ fn pacer_next_deadline_us_unbounded(domain_id: usize) -> u32 {
 // `slot * MAX_DOMAINS + domain`: a per-owner table, sized at boot with the
 // owner table (`size_graph_pacers`), so every resident graph the owner table
 // can seat has its instances, and a lookup is an index, never a search that
-// can come up full.
+// can come up full. The domain in the index is what keeps the cores apart on
+// bcm2712: an instance is touched only by the runner of its own domain, on
+// that domain's core, and by the resident-graph index rebuild, which runs with
+// the other domains parked.
 
 #[derive(Clone, Copy)]
 pub(crate) struct GraphPacer {
@@ -2444,7 +2467,8 @@ pub(crate) fn graph_pacer_index(graph_slot: u16, generation: u32, domain: u8) ->
         .checked_mul(MAX_DOMAINS)?
         .checked_add(domain as usize)?;
     let gp = &raw mut GRAPH_PACERS;
-    // SAFETY: scheduler-thread-exclusive access to the table.
+    // SAFETY: instance `i` belongs to `domain`, whose runner is the caller;
+    // no other core touches it (see the section comment).
     let p = unsafe { (&mut *gp).get_mut(i)? };
     if !p.active || p.generation != generation {
         *p = GraphPacer::new();

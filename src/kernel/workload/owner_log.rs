@@ -29,11 +29,12 @@
 //! release that finds it full drops its oldest ring, counted
 //! ([`detached_dropped`]).
 //!
-//! **Single-writer discipline.** [`push_on_slot`] and [`install_slot`] run on
-//! the scheduler thread only. Off-step emitters route their records through a
-//! platform MPSC queue that the scheduler drains, so each ring sees exactly one
-//! writer — which is what makes the drop-oldest overwrite safe (the concern
-//! that made [`crate::kernel::sys::log_ring`] choose drop-new).
+//! **Single-writer discipline.** Every entry point runs on the scheduler
+//! thread only. The platform's logger rings a record only when it is emitted
+//! on that thread; a record from any other thread reaches stderr and no ring.
+//! So each ring sees exactly one writer, which is what makes the drop-oldest
+//! overwrite safe ([`crate::kernel::sys::log_ring`], written from any core,
+//! drops the newest instead).
 //!
 //! Hosted only (`kernel/workload/mod.rs` gates it on `host-linux`): the rings
 //! are written by the Linux logger tee.
@@ -47,12 +48,9 @@ use crate::kernel::workload::owner::MAX_OWNERS;
 use core::sync::atomic::{AtomicBool, Ordering};
 use fluxor_contracts::log_ring::{LogRecord, RingHeader, RingState};
 
-/// Per-owner ring byte capacity. Matches `log_ring`'s per-chip sizing; a
-/// per-profile knob is deferred.
-#[cfg(feature = "chip-rp2040")]
-pub const CAP: usize = 4096;
-#[cfg(not(feature = "chip-rp2040"))]
-pub const CAP: usize = 65536;
+/// Per-owner ring byte capacity: the hosted profile's kernel log ring
+/// (`config::LOG_RING_CAPACITY`).
+pub const CAP: usize = crate::kernel::config::LOG_RING_CAPACITY;
 
 /// One owner's ring: its state, its bytes, and the `(uid, generation)` it was
 /// installed for, so a reinstall of the *same* triple keeps the ring (rebuild
@@ -92,12 +90,14 @@ fn detached() -> &'static mut Vec<Detached> {
     unsafe { &mut *core::ptr::addr_of_mut!(DETACHED) }
 }
 
-/// Move `ring`, released from `slot`, to the list awaiting its flush.
+/// Move `ring`, released from `slot`, to the list awaiting its flush. The
+/// list holds at most one ring per owner slot the table holds: a flusher
+/// that keeps up writes each one by its next tick, so a full list is one
+/// whose writes keep failing, and its oldest ring is dropped and counted.
 fn detach(slot: usize, ring: Box<Ring>) {
     let list = detached();
-    // One pending ring per owner slot the table holds, the system's aside:
-    // more is a flusher that has stopped writing.
-    if !list.is_empty() && list.len() >= slots().max(1) {
+    let bound = slots().max(1);
+    while list.len() >= bound {
         list.remove(0);
         // SAFETY: scheduler-thread state.
         unsafe { DETACHED_DROPPED += 1 };

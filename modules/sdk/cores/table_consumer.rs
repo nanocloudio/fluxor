@@ -1,5 +1,5 @@
-// Core: table_consumer — the normative "subscribe, don't invent a
-// push contract" state machine.
+// Core: table_consumer — the consumer side of a `storage.namespace`
+// subscription: a table kept equal to what a store holds under a prefix.
 //
 // Layer: cores (reusable SDK implementation, `include!`d by consumers —
 // NOT a wire contract, so it lives under `cores/` with `session_handoff`
@@ -27,13 +27,17 @@
 //      a byte into any channel of the module, so no self-wired port and
 //      no sink exist.
 //   2. Subscribe — `SUBSCRIBE (0x1305)` on the prefix with that event.
-//      `EAGAIN`/`ENOMEM` is asked again next step; the subscription is
-//      opened *before* the first read, so every change after it rings.
-//      Cold start marks the consumer *pending* with an empty token: its
-//      first read is the relist (§5: cold start == recovery).
+//      `EAGAIN` is asked again next step, any other refusal after a
+//      backoff; the subscription is opened *before* the first read, so
+//      every change after it rings. A new subscription is *pending* with
+//      the token it holds — empty on a cold start, so its first read is
+//      the relist: a cold start is a recovery.
 //   3. Take — each step `event::POLL`s, and when the event fired asks
 //      `TAKE_RUNG (0x1309)` which subscriptions rang, marking each one
-//      named *pending* ([`take_rung`]).
+//      named *pending* ([`take_rung`]). A take that fails, or answers
+//      `more`, is owed: the next step takes again whether or not the event
+//      fired, since `POLL` consumed the signal and a set rung bit sends no
+//      other.
 //   4. Read — a pending consumer reads `CHANGES (0x1307)` from its token,
 //      one bounded page per call, applying each page by key as it lands.
 //      *Pending* is cleared only by a page whose `more` is clear; that
@@ -43,13 +47,14 @@
 //      re-rings the subscription, named in the read, once the store can
 //      answer.
 //   5. Loss recovery with shadow swap — a LOST answer (the token is older
-//      than the store can answer) or a cold start relists: `CHANGES` with
-//      the empty token, paged by key, into a SHADOW table, swapped in only
-//      when the last page lands — never in place, because a table swapped
-//      in place is a torn table for any reader mid-scan. The relist's last
-//      page carries the token the consumer resumes from.
+//      than the store can answer), a continuation the store no longer
+//      recognises, or a cold start relists: `CHANGES` with the empty token,
+//      paged by key, into a SHADOW table, swapped in only when the last
+//      page lands — never in place, because a table swapped in place is a
+//      torn table for any reader mid-scan. The relist's last page carries
+//      the token the consumer resumes from.
 //   6. Bounded admission — the arena is the caller's; overflow is the
-//      caller's to surface (a reader holds no write grant, §6).
+//      caller's to surface (a reader holds no write grant).
 //   7. Single-writer prefix discipline — a compiler owns the prefix;
 //      the consumer treats it as read-only.
 //
@@ -60,6 +65,8 @@
 // the event, so the module takes once per step for all of them —
 // [`take_rung`] over the whole set — and then [`TableConsumer::advance`]s
 // each. [`TableConsumer::step`] is the one-table shorthand that does both.
+// Two consumers of one prefix share one subscription (SUBSCRIBE is
+// idempotent), and a take that names it marks both.
 
 // `SyscallTable` and `abi` are provided by the `include!` site (see the
 // header).
@@ -68,8 +75,10 @@ use abi::contracts::storage::namespace::{self as ns, changes, subscribe, take};
 
 /// Steps until a `SUBSCRIBE` refused for a reason other than "not now"
 /// is asked again. Rare by construction (a malformed prefix, a store
-/// that offers no subscriptions), and cheap to repeat, but not worth a
-/// provider call on every step.
+/// that offers no subscriptions, a subscription table at its ceiling),
+/// and not worth a provider call on every step: a store counts and logs
+/// every refusal at capacity, so asking each step would turn one full
+/// table into a refusal per step.
 const RESUBSCRIBE_BACKOFF_STEPS: u32 = 1024;
 
 /// `CHANGES` pages read in one step at most. A relist of a large prefix
@@ -82,7 +91,6 @@ const TAKE_MAX: usize = 16;
 
 /// Errnos the consumer tells apart.
 const ERR_AGAIN: i32 = -11;
-const ERR_NOMEM: i32 = -12;
 const ERR_INVAL: i32 = -22;
 
 /// The caller's table, driven by the consumer. Implementors keep a live
@@ -102,7 +110,7 @@ pub trait TableSink {
     /// Remove `key`'s row from the shadow or live table; a key the
     /// table does not hold is a no-op.
     fn remove(&mut self, key: &[u8], shadow: bool);
-    /// Empty the shadow table at the start of a relist (§2 rule 4).
+    /// Empty the shadow table at the start of a relist.
     fn clear_shadow(&mut self);
     /// Atomically promote the shadow table to live.
     fn swap_shadow(&mut self);
@@ -133,7 +141,9 @@ pub struct TableConsumer {
     /// A relist is in flight: pages land in the shadow table, which is
     /// swapped in when the last one does.
     pub relisting: u8,
-    _pad: u8,
+    /// A `TAKE_RUNG` is owed: the last one failed or answered `more`, so
+    /// the next [`take_rung`] asks whether or not the event fired.
+    pub take_owed: u8,
     /// Steps left before a refused `SUBSCRIBE` is asked again.
     pub backoff: u32,
     /// Length of `token`. 0: nothing listed yet — the next read relists.
@@ -151,7 +161,7 @@ impl TableConsumer {
             sub: SUB_NONE,
             pending: 0,
             relisting: 0,
-            _pad: 0,
+            take_owed: 0,
             backoff: 0,
             token_len: 0,
             _pad2: [0; 6],
@@ -169,7 +179,8 @@ impl TableConsumer {
         changes::token_revision(&self.token[..self.token_len as usize])
     }
 
-    /// Mark this consumer pending when `handle` is its subscription.
+    /// Mark this consumer pending when `handle` is its subscription;
+    /// `true` when it is.
     pub fn ring(&mut self, handle: i32) -> bool {
         if self.sub == SUB_OPEN && self.handle == handle {
             self.pending = 1;
@@ -230,7 +241,7 @@ impl TableConsumer {
         while self.pending != 0 && pages < PAGES_PER_STEP {
             pages += 1;
             if self.token_len == 0 && self.relisting == 0 {
-                // A relist starts from an empty shadow (§2 rule 4).
+                // A relist starts from an empty shadow.
                 table.clear_shadow();
                 self.relisting = 1;
             }
@@ -245,7 +256,7 @@ impl TableConsumer {
             );
             if n < 0 {
                 if n == ERR_INVAL && token_len != 0 && token_len != changes::REVISION_TOKEN_LEN {
-                    // A continuation the store no longer recognises (it
+                    // A continuation the store does not recognise (it
                     // restarted mid-read): start the read over as a relist.
                     self.restart_relist();
                     continue;
@@ -288,7 +299,8 @@ impl TableConsumer {
         }
     }
 
-    /// Open the subscription. `true` once open (and the first read owed).
+    /// Open the subscription. `true` once open (and a read owed from the
+    /// token held: the relist when there is none).
     unsafe fn subscribe(&mut self, sys: &SyscallTable, event: i32, prefix: &[u8]) -> bool {
         if self.sub == SUB_REFUSED {
             if self.backoff > 0 {
@@ -301,12 +313,12 @@ impl TableConsumer {
         if rc >= 0 {
             self.handle = rc;
             self.sub = SUB_OPEN;
-            // Cold start == recovery: the first read is the relist, from
-            // an empty token, unless a token is already held.
+            // Whatever changed before the subscription existed rang no one:
+            // read from the token held, which is the relist on a cold start.
             self.pending = 1;
             return true;
         }
-        if rc != ERR_AGAIN && rc != ERR_NOMEM {
+        if rc != ERR_AGAIN {
             self.sub = SUB_REFUSED;
             self.backoff = RESUBSCRIBE_BACKOFF_STEPS;
         }
@@ -335,11 +347,15 @@ pub unsafe fn create_event(sys: &SyscallTable) -> i32 {
     (sys.provider_call)(-1, abi::kernel_abi::event::CREATE, core::ptr::null_mut(), 0)
 }
 
-/// `event::POLL` the module's event and, when it fired, `TAKE_RUNG` once,
-/// marking every consumer whose subscription is named pending. A take
-/// whose handles did not all fit has the store signal the event again,
-/// so the rest are taken on the next step. Returns how many handles the
-/// take named.
+/// `event::POLL` the module's event and, when it fired or a take is owed,
+/// `TAKE_RUNG` once, marking every consumer whose subscription is named
+/// pending. `consumers` is every consumer on `event`: a take clears the
+/// bits of all the caller's subscriptions on it.
+///
+/// A take that fails is owed by every consumer, and so is one whose
+/// handles did not all fit (`more`): `POLL` consumed the signal, and a rung
+/// bit left set sends no other, so the next step takes again whether or
+/// not the event fires. Returns how many handles the take named.
 ///
 /// # Safety
 /// `sys` must be a live syscall table; `event` an event the calling
@@ -358,36 +374,54 @@ pub unsafe fn take_rung(
         core::ptr::null_mut(),
         0,
     );
-    if fired <= 0 {
+    let owed = consumers.iter().any(|c| c.take_owed != 0);
+    if fired <= 0 && !owed {
         return 0;
     }
     let mut out = [0u8; take::HEAD_LEN + 4 * TAKE_MAX];
+    let answer = take_into(sys, event, &mut out);
+    let Some((more, handles)) = answer else {
+        for c in consumers.iter_mut() {
+            c.take_owed = 1;
+        }
+        return 0;
+    };
+    for c in consumers.iter_mut() {
+        c.take_owed = u8::from(more);
+    }
+    let mut named = 0;
+    for h in handles {
+        named += 1;
+        // Not `find`: consumers of one prefix share one subscription.
+        for c in consumers.iter_mut() {
+            c.ring(h);
+        }
+    }
+    named
+}
+
+/// Issue one `TAKE_RUNG` on `event` into `out`: `(more, handles)`, or
+/// `None` when the take failed or its answer does not decode.
+///
+/// # Safety
+/// `sys` must be a live syscall table.
+unsafe fn take_into<'a>(
+    sys: &SyscallTable,
+    event: i32,
+    out: &'a mut [u8],
+) -> Option<(bool, impl Iterator<Item = i32> + 'a)> {
     let req = take::Request {
         event,
         out_ptr: out.as_mut_ptr() as u64,
         out_cap: out.len() as u32,
     };
     let mut arg = [0u8; take::REQUEST_LEN];
-    let Some(len) = take::encode(&mut arg, &req) else {
-        return 0;
-    };
+    let len = take::encode(&mut arg, &req)?;
     let n = (sys.provider_call)(-1, ns::TAKE_RUNG, arg.as_mut_ptr(), len);
     if n < 0 {
-        return 0;
+        return None;
     }
-    let Some((_more, handles)) = take::decode(&out[..(n as usize).min(out.len())]) else {
-        return 0;
-    };
-    let mut named = 0;
-    for h in handles {
-        named += 1;
-        for c in consumers.iter_mut() {
-            if c.ring(h) {
-                break;
-            }
-        }
-    }
-    named
+    take::decode(out.get(..n as usize)?)
 }
 
 /// Encode + issue `SUBSCRIBE (0x1305)` on `prefix` with the caller's

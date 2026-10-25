@@ -55,12 +55,14 @@ pub const SEGMENTS: u32 = 0x2002;
 /// a default route: a prefix of length 0), `ENOSPC` (past capacity), `EBUSY`
 /// (another writer) or `EAGAIN`, as [`SEGMENTS`].
 ///
-/// A peer route never takes the node's own uplink: a route whose prefix
-/// overlaps the connected prefix of an address the node holds on an uplink
-/// (contains it, or lies inside it) is not realized and reads
-/// `refused(conflict)` for as long as the overlap stands — re-evaluated when
-/// the uplink's addresses change — so a mistaken route cannot black-hole the
-/// node's own link or its neighbours on it.
+/// A peer route never takes the node's own links: a route whose prefix
+/// overlaps the connected prefix of one of the node's addresses (contains
+/// it, or lies inside it) is not realized and reads `refused(conflict)` for
+/// as long as the overlap stands — re-evaluated when those addresses change
+/// — so a mistaken route cannot black-hole a link of the node's or its
+/// neighbours on it. The addresses are those on the node's host links;
+/// loopback, the links workloads attach by, and held addresses (which the
+/// node answers for, not a link it is on) are not among them.
 pub const ROUTES: u32 = 0x2003;
 
 /// Replace the held-address table, whole. handle=-1, arg =
@@ -214,7 +216,7 @@ pub mod reason {
     /// A host table it needs is full.
     pub const TABLE_FULL: u8 = 4;
     /// Another runtime on the host holds an overlapping prefix or address,
-    /// or (a peer route) the prefix overlaps the node's own uplink.
+    /// or (a peer route) the prefix overlaps one of the node's own links.
     pub const CONFLICT: u8 = 5;
     /// The provider cannot realize it here.
     pub const UNSUPPORTED: u8 = 6;

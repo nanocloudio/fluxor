@@ -245,6 +245,11 @@ pub unsafe fn invalidate_dcache_poc(start: usize, end: usize) {
 /// Boot core, once, after the map is built, at EL1 with the MMU and data
 /// cache off: these are the EL1&0 regime's registers, so a core that
 /// arrived at EL2 must have dropped first ([`crate::drop_to_el1`]).
+///
+/// Kept out of line: the pi5 image check that nothing before the MMU is on
+/// uses an atomic read-modify-write (`tools/ci/premmu_atomics.sh`) finds
+/// the boundary by this symbol.
+#[inline(never)]
 pub unsafe fn enable(written_uncached: &[(usize, usize)]) {
     for &(start, end) in written_uncached {
         invalidate_dcache_poc(start, end);

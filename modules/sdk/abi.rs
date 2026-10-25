@@ -357,9 +357,6 @@ pub mod platform {
         pub mod nic_ring {
             include!("platform/bcm2712/nic_ring.rs");
         }
-        pub mod smmu {
-            include!("platform/bcm2712/smmu.rs");
-        }
         pub mod msi {
             include!("platform/bcm2712/msi.rs");
         }

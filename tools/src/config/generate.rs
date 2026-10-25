@@ -377,20 +377,10 @@ fn generate_config_impl(
         .map(|t| t.isolation)
         .unwrap_or_default();
     // Heap caps a `heap_per_demand` rule sizes need the graph's declared
-    // demand, which needs every instance's params packed: a graph with such
-    // a rule is packed once quietly to count it, then again under the plan.
-    let plan_target = resolved_target.unwrap_or("linux");
-    let needs_plan = validation_list.iter().any(|m| {
-        m.get("name")
-            .and_then(Value::as_str)
-            .and_then(|n| manifests.get(n))
-            .is_some_and(|m| m.heap_per_demand.is_some())
-    });
-    let first_plan = if needs_plan {
-        HeapPlan::planning()
-    } else {
-        HeapPlan::default()
-    };
+    // demand, which is counted from every instance's packed params: the graph
+    // is packed once under a counting plan, and the planned caps are written
+    // over the placeholders it leaves (`apply_heap_plan`).
+    let counting = HeapPlan::counting();
     let (mut module_entries, module_names) = parse_modules_map(
         modules_ref,
         data_section,
@@ -399,30 +389,17 @@ fn generate_config_impl(
         &manifests,
         max_modules,
         &isolation,
-        &first_plan,
+        &counting,
     )?;
-    let (mut workloads, workload_demand) =
-        build_workloads_planned(config, loc, extra_module_dirs, &first_plan)?;
-    let mut demand = base_demand(modules_ref, &module_entries, &module_names, &manifests)?;
+    let (mut workloads, workload_demand, workload_heaps) =
+        build_workloads_counted(config, loc, extra_module_dirs)?;
+    let mut demand = base_demand(modules_ref, &module_entries, &module_names, &manifests, loc)?;
+    refuse_restart_of_subscribers(modules_ref, &demand)?;
     demand.extend(workload_demand);
-    let plan = if needs_plan {
-        let plan = heap_plan(plan_target, config, &demand);
-        module_entries = parse_modules_map(
-            modules_ref,
-            data_section,
-            config,
-            loc,
-            &manifests,
-            max_modules,
-            &isolation,
-            &plan,
-        )?
-        .0;
-        workloads = build_workloads_planned(config, loc, extra_module_dirs, &plan)?.0;
-        plan
-    } else {
-        first_plan
-    };
+    let mut heaps = base_planned_heaps(modules_ref, &module_names, &manifests);
+    heaps.extend(workload_heaps);
+    let plan = heap_plan(resolved_target.unwrap_or("linux"), config, &demand);
+    apply_heap_plan(&plan, &heaps, &mut module_entries, &mut workloads)?;
     let module_entries = module_entries;
 
     // Hardware-capability validation. Each module's `[requires]`
@@ -1167,10 +1144,79 @@ fn envelope_entries(config: &Value, target: &str) -> Result<Vec<(&'static str, u
 /// type's `heap_per_demand` rule, for the plan.
 #[derive(Debug, Clone)]
 pub(crate) struct InstanceDemand {
-    /// How errors and the plan's report name the instance.
+    /// How the plan's report names the instance.
     pub(crate) name: String,
     pub(crate) figures: Vec<(&'static str, u64)>,
     pub(crate) heap_per_demand: Option<crate::manifest::HeapPerDemand>,
+}
+
+/// Where an instance's params TLV sits: a base-graph module entry (from its
+/// header on), or a workload module's params.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ParamsAt {
+    Base(usize),
+    Workload(usize, usize),
+}
+
+/// An instance of a `heap_per_demand` type, packed under a counting plan:
+/// what [`patch_heap_cap`] needs to write its planned cap.
+#[derive(Debug, Clone)]
+pub(crate) struct PlannedHeap {
+    pub(crate) at: ParamsAt,
+    /// The instance's name in its graph (a workload module's local name).
+    pub(crate) name: String,
+    pub(crate) module: Value,
+    pub(crate) manifest: Manifest,
+}
+
+/// The base graph's `heap_per_demand` instances, by entry index.
+fn base_planned_heaps(
+    modules: &Value,
+    names: &[String],
+    manifests: &HashMap<String, Manifest>,
+) -> Vec<PlannedHeap> {
+    let list = modules.as_array().map(Vec::as_slice).unwrap_or(&[]);
+    list.iter()
+        .zip(names)
+        .enumerate()
+        .filter_map(|(i, (module, name))| {
+            let manifest = manifests
+                .get(name)
+                .filter(|m| m.heap_per_demand.is_some())?;
+            Some(PlannedHeap {
+                at: ParamsAt::Base(i),
+                name: name.clone(),
+                module: module.clone(),
+                manifest: manifest.clone(),
+            })
+        })
+        .collect()
+}
+
+/// Write each `heap_per_demand` instance's cap under `plan` over the
+/// placeholder its counting pass packed (`patch_heap_cap`).
+fn apply_heap_plan(
+    plan: &HeapPlan,
+    heaps: &[PlannedHeap],
+    entries: &mut [Vec<u8>],
+    workloads: &mut [crate::add_subgraph::Workload],
+) -> Result<()> {
+    for h in heaps {
+        let tlv = match h.at {
+            ParamsAt::Base(i) => entries
+                .get_mut(i)
+                .and_then(|e| e.get_mut(MODULE_ENTRY_HEADER_SIZE..)),
+            ParamsAt::Workload(w, m) => workloads
+                .get_mut(w)
+                .and_then(|w| w.modules.get_mut(m))
+                .map(|m| m.params.as_mut_slice()),
+        };
+        let tlv = tlv.ok_or_else(|| {
+            Error::Config(format!("module '{}': no packed params to size", h.name))
+        })?;
+        patch_heap_cap(&h.name, &h.module, Some(&h.manifest), tlv, plan)?;
+    }
+    Ok(())
 }
 
 /// What one instance declares it will ask of each kernel pool at run time
@@ -1179,13 +1225,15 @@ pub(crate) struct InstanceDemand {
 /// - the graph's own figure for the instance, `demand: { <pool>: n }` on its
 ///   module entry, wins;
 /// - else the type's `[capacities] demand_from_params` rule for that pool,
-///   counted from the instance's params TLV `tlv`;
+///   counted from the instance's params TLV `tlv`, with `integers` the
+///   type's integer params and their schema defaults ([`integer_params`]);
 /// - else the type's `[capacities]` constant under the pool's key.
 pub(crate) fn instance_demand(
     module: &Value,
     name: &str,
     manifest: Option<&Manifest>,
     tlv: &[u8],
+    integers: &[(u8, u32)],
 ) -> Result<Vec<(&'static str, u64)>> {
     let explicit = module.get("demand");
     if let Some(e) = explicit {
@@ -1221,11 +1269,10 @@ pub(crate) fn instance_demand(
     for &(key, pool) in crate::capacity::DECLARED_DEMAND {
         let n = if let Some(n) = explicit.and_then(|e| e.get(pool)).and_then(Value::as_u64) {
             n
-        } else if let Some(rule) = manifest
-            .and_then(|m| m.demand_from_params.as_ref())
-            .filter(|r| r.pool == pool)
+        } else if let Some(rule) =
+            manifest.and_then(|m| m.demand_from_params.iter().find(|r| r.pool == pool))
         {
-            rule.declared_count(tlv)
+            rule.declared_count(tlv, integers)
         } else if let Some(&n) = manifest.and_then(|m| m.capacities.get(key)) {
             u64::from(n)
         } else {
@@ -1238,26 +1285,86 @@ pub(crate) fn instance_demand(
     Ok(out)
 }
 
+/// `(tag, schema default)` of each integer param (`u8`, `u16`, `u32`) in a
+/// module's schema: what a `demand_from_params` rule counts by value.
+fn integer_params(schema: Option<&schema::ParamSchema>) -> Vec<(u8, u32)> {
+    schema
+        .map(|s| {
+            s.params
+                .iter()
+                .filter(|p| {
+                    matches!(
+                        p.ptype,
+                        schema::ParamType::U8 | schema::ParamType::U16 | schema::ParamType::U32
+                    )
+                })
+                .map(|p| (p.tag, p.default))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// The base graph's per-instance demand: each module entry's params (its TLV
-/// from the entry header on) read with its YAML entry and manifest.
+/// from the entry header on) read with its YAML entry, its manifest and, for
+/// a type with a `demand_from_params` rule, its param schema from `loc`.
 fn base_demand(
     modules: &Value,
     entries: &[Vec<u8>],
     names: &[String],
     manifests: &HashMap<String, Manifest>,
+    loc: schema::ModuleLocation<'_>,
 ) -> Result<Vec<InstanceDemand>> {
     let list = modules.as_array().map(Vec::as_slice).unwrap_or(&[]);
     let mut out = Vec::new();
     for ((module, entry), name) in list.iter().zip(entries).zip(names) {
         let manifest = manifests.get(name);
         let tlv = entry.get(MODULE_ENTRY_HEADER_SIZE..).unwrap_or(&[]);
+        let integers = if manifest.is_some_and(|m| !m.demand_from_params.is_empty()) {
+            let ty = module.get("type").and_then(Value::as_str).unwrap_or(name);
+            integer_params(schema::load_schema_for_module(ty, loc)?.as_ref())
+        } else {
+            Vec::new()
+        };
         out.push(InstanceDemand {
             name: format!("module '{name}'"),
-            figures: instance_demand(module, name, manifest, tlv)?,
+            figures: instance_demand(module, name, manifest, tlv, &integers)?,
             heap_per_demand: manifest.and_then(|m| m.heap_per_demand.clone()),
         });
     }
     Ok(out)
+}
+
+/// Refuse `fault_policy: restart` to a base-graph instance that declares
+/// store subscriptions or the events they ring (`store_subs`, `events`), by
+/// its type's rule, constant or its own `demand:`. The restart releases the
+/// module's kernel events and moves its slot generation, so the store drops
+/// every subscription it made, and the module resumes believing it is
+/// subscribed — never woken by a change again. `demand` is the base graph's,
+/// one per entry of `modules` in order ([`base_demand`]).
+fn refuse_restart_of_subscribers(modules: &Value, demand: &[InstanceDemand]) -> Result<()> {
+    let list = modules.as_array().map(Vec::as_slice).unwrap_or(&[]);
+    for (module, d) in list.iter().zip(demand) {
+        if module.get("fault_policy").and_then(Value::as_str) != Some("restart") {
+            continue;
+        }
+        if let Some(&(pool, n)) = d
+            .figures
+            .iter()
+            .find(|&&(p, n)| n > 0 && (p == "store_subs" || p == "events"))
+        {
+            return Err(Error::Config(format!(
+                "{}: fault_policy = \"restart\" is not available to an instance that \
+                 declares {n} `{pool}` — a store subscriber. The restart releases the kernel \
+                 events its subscriptions ring and moves its slot generation, so the store \
+                 drops every subscription it made, and the module resumes believing it is \
+                 subscribed — never woken by a change again. Configure it to subscribe to \
+                 nothing, or choose `fault_policy: \"skip\"` or \
+                 `fault_policy: \"restart_graph\"`, which re-instantiates it.",
+                d.name
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// `pool`'s total over `demand`.
@@ -1393,25 +1500,6 @@ fn declared_demand(
     Ok(entries)
 }
 
-/// The heap cap (params tag 0xEF, u32 LE) a params TLV carries, walked as
-/// the kernel walks it.
-fn tlv_heap_cap(tlv: &[u8]) -> Option<u32> {
-    let mut off = 4usize;
-    while off + 2 <= tlv.len() {
-        let (tag, len) = (tlv[off], tlv[off + 1] as usize);
-        off += 2;
-        if tag == 0xFF {
-            break;
-        }
-        if tag == 0xEF && len == 4 {
-            let b = tlv.get(off..off + 4)?;
-            return Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
-        }
-        off += len;
-    }
-    None
-}
-
 /// One line for the composer's report: the heap bytes `heap_per_demand`
 /// rules add (each instance's, under `plan`) beside the total of the heap
 /// caps the composer set in the graph's module entries (params tag 0xEF).
@@ -1445,8 +1533,13 @@ fn heap_per_demand_report(
     }
     let caps: u64 = entries
         .iter()
-        .filter_map(|e| tlv_heap_cap(e.get(MODULE_ENTRY_HEADER_SIZE..)?))
-        .map(u64::from)
+        .filter_map(|e| {
+            let tlv = e.get(MODULE_ENTRY_HEADER_SIZE..)?;
+            let off = heap_cap_offset(tlv)?;
+            Some(u64::from(u32::from_le_bytes(
+                tlv[off..off + 4].try_into().ok()?,
+            )))
+        })
         .sum();
     Some(format!(
         "Heap per demand: {per_demand} B ({}); heap caps the composer set total {caps} B",
@@ -1466,7 +1559,7 @@ fn build_workload_section(
     loc: schema::ModuleLocation<'_>,
     extra_module_dirs: &[&Path],
 ) -> Result<Vec<u8>> {
-    let workloads = build_workloads(config, loc, extra_module_dirs)?;
+    let workloads = build_workloads(config, loc, extra_module_dirs, "linux")?;
     if workloads.is_empty() {
         return Ok(Vec::new());
     }
@@ -1479,31 +1572,42 @@ use crate::add_subgraph::WorkloadEnd;
 /// (`add_subgraph::Workload`): modules by name_hash with their params, and
 /// the edges between them. Empty when the graph declares none. The resident
 /// workload section and a workload image (`--emit=workload`) encode these.
+///
+/// A `heap_per_demand` module's cap is planned from these workloads' own
+/// declared demand and `target`'s reserve, as a graph plans its own.
 pub fn build_workloads(
     config: &Value,
     loc: schema::ModuleLocation<'_>,
     extra_module_dirs: &[&Path],
+    target: &str,
 ) -> Result<Vec<crate::add_subgraph::Workload>> {
-    build_workloads_planned(config, loc, extra_module_dirs, &HeapPlan::default())
-        .map(|(workloads, _)| workloads)
+    let (mut workloads, demand, heaps) = build_workloads_counted(config, loc, extra_module_dirs)?;
+    let plan = heap_plan(target, config, &demand);
+    apply_heap_plan(&plan, &heaps, &mut [], &mut workloads)?;
+    Ok(workloads)
 }
 
-/// [`build_workloads`] with the graph's [`HeapPlan`] for the heap caps, also
-/// answering each workload module's declared demand ([`instance_demand`]):
-/// resident workloads are counted in the graph's plan as its base modules
-/// are.
-fn build_workloads_planned(
+/// The workloads [`build_workloads`] builds, packed under a counting
+/// [`HeapPlan`], with each workload module's declared demand
+/// ([`instance_demand`]) and its `heap_per_demand` instances: resident
+/// workloads are counted in the graph's plan as its base modules are.
+fn build_workloads_counted(
     config: &Value,
     loc: schema::ModuleLocation<'_>,
     extra_module_dirs: &[&Path],
-    plan: &HeapPlan,
-) -> Result<(Vec<crate::add_subgraph::Workload>, Vec<InstanceDemand>)> {
+) -> Result<(
+    Vec<crate::add_subgraph::Workload>,
+    Vec<InstanceDemand>,
+    Vec<PlannedHeap>,
+)> {
+    let plan = HeapPlan::counting();
     let mut demand = Vec::new();
+    let mut heaps = Vec::new();
     let Some(workloads_yaml) = config.get("workloads").and_then(|p| p.as_array()) else {
-        return Ok((Vec::new(), demand));
+        return Ok((Vec::new(), demand, heaps));
     };
     if workloads_yaml.is_empty() {
-        return Ok((Vec::new(), demand));
+        return Ok((Vec::new(), demand, heaps));
     }
     let data_section = config.get("data");
     // Manifest search path for the pre_tick_drain check: mirror the validators'
@@ -1520,8 +1624,7 @@ fn build_workloads_planned(
     // metadata, and workload admission runs AFTER the platform registers ISR handlers
     // (bcm2712.rs) — so an ISR-tier workload would be admitted yet never dispatched
     // (the cooperative runner skips ISR domains) and a `pre_tick_drain` workload would
-    // silently lose its pre-pass semantics. Reject both until the codec and
-    // post-admission registration support them.
+    // silently lose its pre-pass semantics. Both are refused.
     let mut domain_exec_mode: [u8; 4] = [0; 4];
     if let Some(domains) = config
         .get("execution")
@@ -1623,6 +1726,7 @@ fn build_workloads_planned(
             // reads them via `params_ptr` exactly the same way.
             let param_schema = schema::load_schema_for_module(mtype, loc)?;
             refuse_workload_node_keys(m, param_schema.as_ref(), pi, mname)?;
+            let integers = integer_params(param_schema.as_ref());
             let params = if let Some(param_schema) = param_schema {
                 pack_params_growing(m, &param_schema, data_section, mtype)?
             } else {
@@ -1632,10 +1736,18 @@ fn build_workloads_planned(
             // takes them as a base-graph module does, in its params TLV.
             demand.push(InstanceDemand {
                 name: format!("workload {pi} module '{mname}'"),
-                figures: instance_demand(m, mname, manifest.as_ref(), &params)?,
+                figures: instance_demand(m, mname, manifest.as_ref(), &params, &integers)?,
                 heap_per_demand: manifest.as_ref().and_then(|m| m.heap_per_demand.clone()),
             });
-            let params = insert_workload_heap_tags(params, m, mname, manifest.as_ref(), plan)?;
+            if let Some(man) = manifest.as_ref().filter(|m| m.heap_per_demand.is_some()) {
+                heaps.push(PlannedHeap {
+                    at: ParamsAt::Workload(workloads.len(), modules.len()),
+                    name: mname.to_string(),
+                    module: m.clone(),
+                    manifest: man.clone(),
+                });
+            }
+            let params = insert_workload_heap_tags(params, m, mname, manifest.as_ref(), &plan)?;
             // What the kernel refuses in a workload's params, refused here by
             // the bytes it would read.
             if let Some(tag) = crate::add_subgraph::params_node_tag(&params) {
@@ -1758,7 +1870,7 @@ fn build_workloads_planned(
             idle_safe,
         });
     }
-    Ok((workloads, demand))
+    Ok((workloads, demand, heaps))
 }
 
 /// YAML keys a base-graph module turns into node tags (the params TLV's
@@ -1787,7 +1899,7 @@ const WORKLOAD_NODE_KEYS: &[&str] = &[
 /// validation and encoding, inserted before the TLV's end marker. A module
 /// with no schema params gets a TLV of its own for them. The heap cap is the
 /// base graph's too: `heap.arena_bytes`, else what the type's `[capacities]
-/// heap_from_params` derives from the packed params.
+/// heap_from_params` and `heap_per_demand` rules derive (`instance_heap_cap`).
 fn insert_workload_heap_tags(
     params: Vec<u8>,
     module: &Value,

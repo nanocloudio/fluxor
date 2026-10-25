@@ -37,6 +37,7 @@ use crate::kernel::exec::scheduler;
 use crate::kernel::sys::errno;
 use crate::kernel::workload::owner::OwnerHandle;
 use crate::kernel::workload::storage::{file_cost, may_hold_storage, ENTRY_COST};
+use crate::platform::linux::providers::LINUX_FS_PATH_MAX;
 use crate::platform::linux::store::{Served, Store};
 
 /// Where owner roots live when `FLUXOR_OWNER_ROOT` is unset.
@@ -44,8 +45,6 @@ const DEFAULT_BASE: &str = "/var/lib/fluxor/owners";
 /// Change history an owner's store retains: how far back its watchers'
 /// `CHANGES` reads reach before they relist.
 const OWNER_STORE_HISTORY: usize = 4096;
-/// Longest path an owner names, matching the `fs` provider's own bound.
-const PATH_MAX: usize = 255;
 
 /// One owner's root: its files directory, held open, its store with the
 /// handles on it, opened on first use, and what each inode is charged.
@@ -287,9 +286,10 @@ pub fn unreserve(owner: OwnerHandle, bytes: u64) {
 }
 
 /// A path as the owner names it, relative to its root: a leading `/` is the
-/// root, and an empty path is the root itself. NUL-terminated for libc.
+/// root, and an empty path is the root itself. At most the `fs` provider's
+/// `LINUX_FS_PATH_MAX`, so it is NUL-terminated for libc within 256 bytes.
 fn relative(path: &[u8]) -> Result<[u8; 256], i32> {
-    if path.len() > PATH_MAX || path.contains(&0) {
+    if path.len() > LINUX_FS_PATH_MAX || path.contains(&0) {
         return Err(errno::EINVAL);
     }
     let mut p = path;

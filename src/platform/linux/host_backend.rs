@@ -5,17 +5,21 @@
 // The namespace/cgroup isolation MECHANISM behind the `workload` host-process
 // backend — not a consumer-facing surface. The `workload` provider
 // (`workload.rs`) admits and owner/lease-binds a workload, then drives the
-// primitives here: `hp_spawn` (fork + staged unshare, `/` made private, rootfs
-// bind-onto-self, pivot_root with MS_MOVE fallback, a create/start barrier, and
-// a non-blocking stdout/stderr drain), and `hp_start` / `hp_read` /
+// primitives here: `hp_spawn` (fork, unshare, `/` made private, the rootfs
+// bound onto itself, `pivot_root`, a create/start barrier, and a
+// non-blocking stdout/stderr drain), and `hp_start` / `hp_read` /
 // `hp_signal` / `hp_wait` / `hp_destroy`. This backend is owner-agnostic; the
 // owner↔handle↔slot mapping lives in the provider.
 //
-// Namespaces: MOUNT+UTS+IPC via a single unshare in the forked child, plus a
-// PID-ns double-fork so the container is PID 1. A **null sandbox** (the caller's
-// `isolate` param is false) skips unshare entirely — PROC semantics, the
-// unprivileged path; a namespaced spawn needs CAP_SYS_ADMIN, and one the host
-// refuses fails CREATE with the kernel's errno.
+// Namespaces: an isolated sandbox unshares MOUNT, UTS, IPC and PID (and NET
+// when asked) in the forked intermediate, whose own child — the container
+// init — is PID 1 of the new pid namespace. A **null sandbox** (the caller's
+// `isolate` param is false) unshares nothing but, when asked, the network
+// domain — the unprivileged path; a namespaced spawn needs CAP_SYS_ADMIN, and
+// one the host refuses fails CREATE with the kernel's errno. The mount work
+// needs `open_tree`, `move_mount`, `fsopen`/`fsmount` and `mount_setattr`
+// (Linux 5.12), a join needs `setns` on a pid descriptor (5.8): a kernel
+// without them fails an isolated spawn rather than run it weaker.
 //
 // Confinement (`confine.rs`), for every process of every workload — the
 // container, an EXEC, a TTY session — just before its exec: `no_new_privs`,
@@ -26,20 +30,26 @@
 // capabilities or skip the filter; the hardened posture takes neither.
 //
 // Lifetime: every sandbox has an intermediate (`hp_child`) between the
-// runtime and the container init. It binds itself to the runtime process
-// (`PR_SET_PDEATHSIG(SIGUSR1)`, caught, acted on only once `getppid` is no
-// longer the runtime's pid — so a dispatch thread ending is not the runtime
-// ending — and checked once after the bind, since a parent gone before it
-// would never send the signal) and kills the init when the runtime is gone.
-// The init binds itself to the intermediate (`SIGKILL`) through a lifeline
-// pipe only the intermediate writes (its `getppid` reads 0 inside its pid
-// namespace); the identity change clears that binding, so it binds again
-// after it. Isolated, the init is PID 1 of its pid namespace and takes every
-// process in it along. In a null sandbox the intermediate is a child
-// subreaper: once the init has ended it kills and reaps every orphan of the
-// workload until none is left (`kill_descendants`). Either way it exits with
-// the init's own status (`relay_status`). An EXEC or TTY session of an
-// isolated workload forks once more after joining its namespaces, so the
+// runtime and the container init. It blocks the signals it waits on and
+// takes them one at a time (`supervise`), so none is lost between two
+// waits: its parent-death signal (`PR_SET_PDEATHSIG(SIGUSR1)`, acted on only
+// once `getppid` is no longer the runtime's pid — so a dispatch thread
+// ending is not the runtime ending — and checked once after the bind, since
+// a parent gone before it would never send the signal) kills the init; a
+// child ending is reaped; and a request from the runtime (`relay`, a queued
+// real-time signal carrying the signal number) is delivered to the init's
+// process group. SIGNAL and DESTROY go through it because it alone may reap
+// the init: the pid it signals is always still the init's, alive or a
+// zombie, never a process that took the pid since. The init binds itself to
+// the intermediate (`SIGKILL`) through a lifeline pipe only the intermediate
+// writes (its `getppid` reads 0 inside its pid namespace); its identity
+// change clears that binding, so it binds again after it. Isolated, the
+// init is PID 1 of its pid namespace and takes every process in it along.
+// In a null sandbox the intermediate is a child subreaper: once the init
+// has ended it kills and reaps every orphan of the workload until none is
+// left (`kill_descendants`). Either way it exits with the init's own status
+// (`relay_status`). An EXEC or TTY session of an isolated workload joins its
+// namespaces through the init's pid descriptor and forks once more, so the
 // process that execs is inside its pid namespace (`enter_pid_namespace`),
 // and is bound to the runtime's dispatch thread.
 //
@@ -81,9 +91,9 @@
 //            keeps only the primary and these (no /etc/group membership).
 //            Without CAP_SETGID they run only when the runtime already holds
 //            them (strict: exactly that set) — refused (EACCES) otherwise
-//   root_read_only  with `isolate`: the root mount is remounted read-only
-//            in the child LAST — after the volumes, the fresh /proc and the
-//            working directory — non-recursively, so every volume keeps its
+//   root_read_only  with `isolate`: the root mount is made read-only in
+//            the child LAST — after the volumes, the fresh /proc and the
+//            working directory — that mount alone, so every volume keeps its
 //            own access
 //   cap_add, no_syscall_filter, hardened  the confinement (above): the
 //            capabilities granted beyond the defaults, the filter skipped,
@@ -92,19 +102,28 @@
 // throughout before anything is mounted into it, and gets a `/dev` of its
 // own (`make_dev`): a sized memory filesystem holding the host's null,
 // zero, full, random, urandom and tty bound in, a new devpts instance, a
-// sized `/dev/shm`, and the standard links — every mount made detached and
-// attached by descriptor.
+// sized `/dev/shm`, and the standard links; then the volumes, and a
+// `/proc` of its own (`mount_proc`) with the host's controls — sysctls, the
+// SysRq trigger, irq, bus and fs settings — read-only and the host's memory,
+// keyrings and timer internals masked, so a uid 0 in it changes nothing of
+// the host's through `/proc`. Every mount is made detached and attached by
+// descriptor; no host path is written to. Every place such a workload can
+// write is `nodev` (its root, volumes, `/dev`, `/dev/shm`; `devpts` makes
+// no node), so the default MKNOD capability makes no node that opens a
+// device. An isolated sandbox without a rootfs shares the host's
+// filesystem and `/proc`: it is isolated in its namespaces and cgroup only.
 // Volumes ([`VolumeBind`], an isolated sandbox with a rootfs only) are bound
 // in the child before the pivot, from descriptors: the source is opened
 // without following a symlink at its last component (and below the mount
 // root, `FLUXOR_MOUNT_ROOT`, where workloads write, through no symlink at
 // all); the mount point is resolved inside the rootfs (`RESOLVE_IN_ROOT`, so
 // an image's symlink can never point it at the host), each missing
-// directory made there; the tree is cloned (`open_tree`), made `nodev` and,
+// directory on its path made there — an image's symlink on the way is
+// followed inside the root, and one naming a directory the root lacks
+// fails the spawn; the tree is cloned (`open_tree`), made `nodev` and,
 // when asked, read-only recursively (`mount_setattr`), and moved onto the
-// mount point
-// (`move_mount`). Every mount lands in the sandbox's own private mount
-// namespace and goes with it.
+// mount point (`move_mount`). Every mount lands in the sandbox's own private
+// mount namespace and goes with it.
 // Descriptors: every pipe is created close-on-exec, and each child (the
 // workload, an EXEC, a TTY session) closes everything but the handful it
 // needs (stdio, the start barrier, the pid relay) before exec, so a workload
@@ -167,11 +186,16 @@ struct HpSlot {
     /// The pid to waitpid for exit: the intermediate (`hp_child`), whose
     /// exit relays the container init's status.
     pid: i32,
-    /// The container init's host pid — what SIGNAL/DESTROY target: the
-    /// intermediate's child (PID 1 in the new pid ns when isolated).
-    /// Signalling `pid` (the intermediate, blocked in waitpid) would not
-    /// reach the container.
+    /// The container init's host pid: the intermediate's child (PID 1 in
+    /// the new pid ns when isolated). Used while the init is known to be
+    /// alive (its cgroup and network domain, before START); a signal goes
+    /// through the intermediate (`relay`), which alone may reap the init and
+    /// so alone knows the pid is still its.
     container_pid: i32,
+    /// A pid descriptor of the init (isolated only, else -1): what an EXEC
+    /// or a TTY session joins the namespaces of, so a join can never reach
+    /// a process that took the init's pid after it ended.
+    pidfd: i32,
     /// Write end of the start-barrier pipe; the init blocks reading the read
     /// end until `HP_START` writes here. -1 once started.
     start_w: i32,
@@ -205,6 +229,7 @@ const HP_EMPTY: HpSlot = HpSlot {
     in_use: false,
     pid: -1,
     container_pid: -1,
+    pidfd: -1,
     start_w: -1,
     out_r: -1,
     started: false,
@@ -281,7 +306,7 @@ pub struct SpawnPlan {
     argv_ptrs: Vec<*const libc::c_char>,
     rootfs: Option<CString>,
     isolate: bool,
-    /// Remount the root read-only, last, before the identity change.
+    /// Make the root read-only, last, before the identity change.
     root_read_only: bool,
     /// Unshare NEWNET so the workload gets its own network domain
     /// (`workload` Tier-1 `NET_ISO_OWN`). Set by the caller from the spec;
@@ -1250,10 +1275,11 @@ unsafe fn relay_errno_and_exit(pid_w: i32, code: i32) -> ! {
 /// MOUNT, UTS, IPC and PID — NEWPID affects its children, so the init it
 /// forks is PID 1 in the new pid ns; a null sandbox: the network domain
 /// alone when the spec asks for one), forks the container init, relays the
-/// init's host pid up `pid_w`, and relays the init's exit status exactly as
-/// its own (`relay_status`). A namespace the host refuses is relayed up
-/// `pid_w` as `-errno`, and CREATE answers it; any later failure `_exit`s a
-/// distinct code so the parent's WAIT surfaces it.
+/// init's host pid up `pid_w`, delivers the signals the runtime asks it to
+/// ([`relay`]), and exits with the init's status exactly as its own
+/// ([`relay_status`]). A namespace the host refuses is relayed up `pid_w` as
+/// `-errno`, and CREATE answers it; any later failure `_exit`s a distinct
+/// code so the parent's WAIT surfaces it.
 ///
 /// Parent death: this child is bound to the runtime process (see
 /// [`watch_runtime`]) and the init to this child, so a runtime that dies
@@ -1340,51 +1366,47 @@ unsafe fn hp_child(plan: &SpawnPlan, start_r: i32, out_w: i32, pid_w: i32) -> ! 
     libc::close(pid_w);
     libc::close(start_r); // the grandchild holds its own copy for the barrier
     libc::close(out_w); // only the grandchild should hold the stdout write end
-    let status = loop {
-        let mut st: libc::c_int = 0;
-        let r = libc::waitpid(-1, &mut st, 0);
-        if r == init {
-            break st;
-        }
-        if r > 0 {
-            continue; // an orphan of the workload, reaped
-        }
-        if *libc::__errno_location() == libc::EINTR {
-            if runtime_gone(plan.parent) {
-                libc::kill(init, libc::SIGKILL);
-            }
-            continue;
-        }
-        libc::_exit(119);
-    };
+    let status = supervise(plan.parent, init);
     if !plan.isolate {
         kill_descendants();
     }
     relay_status(status);
 }
 
-/// Set by the parent-death signal ([`watch_runtime`]).
-static RUNTIME_SIGNALLED: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
-
-extern "C" fn on_runtime_signal(_: libc::c_int) {
-    RUNTIME_SIGNALLED.store(true, core::sync::atomic::Ordering::Relaxed);
+/// The signals an intermediate takes synchronously ([`supervise`]): a child
+/// ended, the runtime's parent-death signal, and the runtime's request to
+/// signal the init ([`relay`]). Async-signal-safe.
+unsafe fn intermediate_signals() -> libc::sigset_t {
+    let mut set: libc::sigset_t = core::mem::zeroed();
+    libc::sigemptyset(&mut set);
+    libc::sigaddset(&mut set, libc::SIGCHLD);
+    libc::sigaddset(&mut set, libc::SIGUSR1);
+    libc::sigaddset(&mut set, relay_signal());
+    set
 }
 
-/// Bind the intermediate to the runtime process `parent`: its parent-death
-/// signal is `SIGUSR1`, caught (no `SA_RESTART`, so a blocked `waitpid`
-/// returns `EINTR`), and the intermediate acts on it only when its parent is
-/// no longer `parent` ([`runtime_gone`]). The signal also comes when merely
-/// the thread that forked it exits and it is handed to another thread of the
-/// runtime, so a thread's end alone ends no workload; the runtime's end
-/// does. A runtime gone before the binding was made exits this child at
-/// once. Async-signal-safe.
+/// The signal that carries the runtime's request to an intermediate: the
+/// first real-time signal, queued, so no request is merged with another.
+fn relay_signal() -> libc::c_int {
+    libc::SIGRTMIN()
+}
+
+/// Bind the intermediate to the runtime process `parent`. The signals of
+/// [`intermediate_signals`] are blocked first, so each one stays pending
+/// until [`supervise`] takes it, whenever it comes; then the parent-death
+/// signal is `SIGUSR1`, and the parent is checked once, since a runtime gone
+/// before the binding was made would never send it (this child then exits at
+/// once). The signal also comes when merely the thread that forked this
+/// child exits and it is handed to another thread of the runtime, so
+/// [`supervise`] acts on it only when the parent is no longer `parent`: a
+/// thread's end alone ends no workload; the runtime's end does.
+/// Async-signal-safe.
 unsafe fn watch_runtime(parent: i32) {
-    let mut sa: libc::sigaction = core::mem::zeroed();
-    sa.sa_sigaction = on_runtime_signal as extern "C" fn(libc::c_int) as usize;
-    libc::sigemptyset(&mut sa.sa_mask);
-    sa.sa_flags = 0;
-    libc::sigaction(libc::SIGUSR1, &sa, core::ptr::null_mut());
+    let set = intermediate_signals();
+    libc::sigprocmask(libc::SIG_BLOCK, &set, core::ptr::null_mut());
+    // A child that ends must stay waitable whatever the runtime's own
+    // disposition: an ignored SIGCHLD reaps children unseen.
+    libc::signal(libc::SIGCHLD, libc::SIG_DFL);
     if libc::prctl(
         libc::PR_SET_PDEATHSIG,
         libc::SIGUSR1 as libc::c_ulong,
@@ -1398,11 +1420,64 @@ unsafe fn watch_runtime(parent: i32) {
     }
 }
 
-/// Whether the parent-death signal came and the runtime `parent` is gone.
-fn runtime_gone(parent: i32) -> bool {
-    // SAFETY: an id getter.
-    RUNTIME_SIGNALLED.load(core::sync::atomic::Ordering::Relaxed)
-        && unsafe { libc::getppid() } != parent
+/// Wait for the init to end, taking the intermediate's signals one at a
+/// time: every child that has ended is reaped (in a null sandbox, orphans of
+/// the workload); the runtime's end kills the init; a request from the
+/// runtime is delivered to the init's process group ([`signal_init`]).
+/// Returns the init's wait status. Every request is handled before the init
+/// is reaped, so the pid it is delivered to is still the init's — alive, or
+/// a zombie only this process can reap. Async-signal-safe.
+unsafe fn supervise(parent: i32, init: i32) -> libc::c_int {
+    let set = intermediate_signals();
+    let relay = relay_signal();
+    loop {
+        let mut st: libc::c_int = 0;
+        let r = libc::waitpid(-1, &mut st, libc::WNOHANG);
+        if r == init {
+            return st;
+        }
+        if r > 0 {
+            continue; // an orphan of the workload, reaped
+        }
+        if r < 0 && *libc::__errno_location() != libc::EINTR {
+            libc::_exit(119);
+        }
+        // Nothing has ended: wait for the next signal.
+        let mut info: libc::siginfo_t = core::mem::zeroed();
+        let sig = libc::sigwaitinfo(&set, &mut info);
+        if sig == libc::SIGUSR1 && libc::getppid() != parent {
+            libc::kill(init, libc::SIGKILL);
+        } else if sig == relay && info.si_pid() == parent {
+            signal_init(init, info.si_value().sival_ptr as usize as libc::c_int);
+        }
+    }
+}
+
+/// Deliver `signo` to the init's process group — the container body makes
+/// the init a group leader (`setpgid(0, 0)`) before it execs, so its
+/// children hear the signal too — or to the init alone while that group
+/// does not exist yet. A number that is no signal is ignored.
+/// Async-signal-safe.
+unsafe fn signal_init(init: i32, signo: libc::c_int) {
+    if !(1..=64).contains(&signo) {
+        return;
+    }
+    if libc::kill(-init, signo) != 0 && *libc::__errno_location() == libc::ESRCH {
+        libc::kill(init, signo);
+    }
+}
+
+/// Ask the intermediate `pid` — a child of this process not yet reaped, so
+/// the pid is still its — to deliver `signo` to its workload's init
+/// ([`supervise`]). False when the request could not be queued.
+///
+/// # Safety
+/// `pid` is an unreaped child of this process.
+unsafe fn relay(pid: i32, signo: i32) -> bool {
+    let value = libc::sigval {
+        sival_ptr: signo as usize as *mut libc::c_void,
+    };
+    libc::sigqueue(pid, relay_signal(), value) == 0
 }
 
 /// Exit with `status` as the child it came from did: its exit code, or the
@@ -1439,46 +1514,138 @@ unsafe fn relay_status(status: libc::c_int) -> ! {
 }
 
 /// Kill and reap every child of this process (a child subreaper) until it
-/// has none: each round kills every child `/proc/thread-self/children`
-/// names and reaps one, and a killed child's own children are reparented
-/// here for the next round, so the whole tree goes whatever its process
-/// groups and sessions. Allocation-free. Async-signal-safe.
+/// has none: each round kills every child it has now ([`kill_children`]) and
+/// reaps one, and a killed child's own children are reparented here for the
+/// next round, so the whole tree goes whatever its process groups and
+/// sessions. A pid killed is always one this process has not reaped, so it
+/// is never a stranger's. Allocation-free. Async-signal-safe.
 unsafe fn kill_descendants() {
     loop {
-        let fd = libc::open(
-            c"/proc/thread-self/children".as_ptr(),
-            libc::O_RDONLY | libc::O_CLOEXEC,
-        );
-        if fd >= 0 {
-            let mut buf = [0u8; 512];
-            let mut pid: i32 = 0;
-            loop {
-                let n = libc::read(fd, buf.as_mut_ptr().cast(), buf.len());
-                if n <= 0 {
-                    break;
-                }
-                for &c in &buf[..n as usize] {
-                    if c.is_ascii_digit() {
-                        pid = pid.saturating_mul(10).saturating_add(i32::from(c - b'0'));
-                    } else {
-                        if pid > 0 {
-                            libc::kill(pid, libc::SIGKILL);
-                        }
-                        pid = 0;
-                    }
-                }
-            }
-            if pid > 0 {
-                libc::kill(pid, libc::SIGKILL);
-            }
-            libc::close(fd);
-        }
+        kill_children();
         let mut st: libc::c_int = 0;
         let r = libc::waitpid(-1, &mut st, 0);
         if r < 0 && *libc::__errno_location() == libc::ECHILD {
             return;
         }
     }
+}
+
+/// `SIGKILL` every child of this process: those
+/// `/proc/thread-self/children` names, or, on a kernel without that file
+/// (`CONFIG_PROC_CHILDREN`), every process whose `/proc/<pid>/stat` names
+/// this one its parent. Allocation-free. Async-signal-safe.
+unsafe fn kill_children() {
+    let fd = libc::open(
+        c"/proc/thread-self/children".as_ptr(),
+        libc::O_RDONLY | libc::O_CLOEXEC,
+    );
+    if fd < 0 {
+        kill_children_by_scan();
+        return;
+    }
+    let mut buf = [0u8; 512];
+    let mut pid: i32 = 0;
+    loop {
+        let n = libc::read(fd, buf.as_mut_ptr().cast(), buf.len());
+        if n <= 0 {
+            break;
+        }
+        for &c in &buf[..n as usize] {
+            if c.is_ascii_digit() {
+                pid = pid.saturating_mul(10).saturating_add(i32::from(c - b'0'));
+            } else {
+                if pid > 0 {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+                pid = 0;
+            }
+        }
+    }
+    if pid > 0 {
+        libc::kill(pid, libc::SIGKILL);
+    }
+    libc::close(fd);
+}
+
+/// [`kill_children`] by a walk of `/proc`: each numeric entry's `stat`
+/// read, its parent (the field after the parenthesised command) compared
+/// with this process. Allocation-free. Async-signal-safe.
+unsafe fn kill_children_by_scan() {
+    let me = libc::getpid();
+    let dir = libc::open(
+        c"/proc".as_ptr(),
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+    );
+    if dir < 0 {
+        return;
+    }
+    let mut ents = [0u8; 4096];
+    loop {
+        let n = libc::syscall(libc::SYS_getdents64, dir, ents.as_mut_ptr(), ents.len());
+        if n <= 0 {
+            break;
+        }
+        let mut off = 0usize;
+        while off + 19 < n as usize {
+            // `linux_dirent64`: ino:u64, off:i64, reclen:u16, type:u8, name.
+            let reclen = u16::from_ne_bytes([ents[off + 16], ents[off + 17]]) as usize;
+            if reclen == 0 {
+                break;
+            }
+            let name = &ents[off + 19..off + reclen];
+            let len = name.iter().position(|&b| b == 0).unwrap_or(name.len());
+            let pid = decimal(&name[..len]);
+            if pid > 0 && parent_in_stat(dir, &name[..len]) == me {
+                libc::kill(pid, libc::SIGKILL);
+            }
+            off += reclen;
+        }
+    }
+    libc::close(dir);
+}
+
+/// The parent pid in `/proc/<name>/stat`, read through the `/proc`
+/// directory `proc`; 0 when it cannot be read. Async-signal-safe.
+unsafe fn parent_in_stat(proc: i32, name: &[u8]) -> i32 {
+    let mut path = [0u8; 32];
+    if name.len() + 6 > path.len() {
+        return 0;
+    }
+    path[..name.len()].copy_from_slice(name);
+    path[name.len()..name.len() + 5].copy_from_slice(b"/stat");
+    let fd = libc::openat(proc, path.as_ptr().cast(), libc::O_RDONLY | libc::O_CLOEXEC);
+    if fd < 0 {
+        return 0;
+    }
+    let mut buf = [0u8; 512];
+    let n = libc::read(fd, buf.as_mut_ptr().cast(), buf.len());
+    libc::close(fd);
+    if n <= 0 {
+        return 0;
+    }
+    let text = &buf[..n as usize];
+    // `pid (comm) state ppid …`: the command may itself hold `)`.
+    let Some(close) = text.iter().rposition(|&b| b == b')') else {
+        return 0;
+    };
+    let mut fields = text[close + 1..]
+        .split(|&b| b == b' ')
+        .filter(|f| !f.is_empty());
+    let _state = fields.next();
+    decimal(fields.next().unwrap_or(&[]))
+}
+
+/// `b` as a decimal pid; 0 when it is empty or holds anything but digits.
+/// Async-signal-safe.
+fn decimal(b: &[u8]) -> i32 {
+    let mut n: i32 = 0;
+    for &c in b {
+        if !c.is_ascii_digit() {
+            return 0;
+        }
+        n = n.saturating_mul(10).saturating_add(i32::from(c - b'0'));
+    }
+    n
 }
 
 /// In a child that joined an isolated workload's namespaces (an EXEC, a
@@ -1623,22 +1790,16 @@ unsafe fn hp_container_body(plan: &SpawnPlan, start_r: i32, out_w: i32, lifeline
             if !bind_volumes(rfd, &plan.binds) {
                 libc::_exit(121);
             }
+            // A fresh /proc — mounted by the init, so it shows the new pid
+            // namespace with the init as PID 1 — with the host's controls in
+            // it read-only or masked.
+            if !mount_proc(rfd) {
+                libc::_exit(117);
+            }
             libc::close(rfd);
             if hp_pivot_into(rootfs.as_ptr()) != 0 {
                 libc::_exit(123);
             }
-            // A fresh /proc — mounted here (in the new pid namespace) so it
-            // reflects the container's pid view, with the init as PID 1.
-            let proc_src = c"proc".as_ptr();
-            let proc_dst = c"/proc".as_ptr();
-            let proc_ty = c"proc".as_ptr();
-            libc::mount(
-                proc_src,
-                proc_dst,
-                proc_ty,
-                libc::MS_NOSUID | libc::MS_NOEXEC | libc::MS_NODEV,
-                core::ptr::null(),
-            );
         }
     }
     // A null sandbox with a rootfs is not rooted in it (no mount namespace to
@@ -1673,7 +1834,7 @@ unsafe fn hp_container_body(plan: &SpawnPlan, start_r: i32, out_w: i32, lifeline
     // The root read-only, after everything that writes to it (the volume
     // mount points, /proc, the working directory) and before the identity
     // change takes the privilege.
-    if plan.root_read_only && !remount_read_only(c"/") {
+    if plan.root_read_only && !set_mount_attr(c"/", libc::MOUNT_ATTR_RDONLY, false) {
         libc::_exit(114);
     }
     // Who it runs as and what it may do, last: the mounts and the cwd above
@@ -1819,15 +1980,7 @@ unsafe fn attach_at(m: i32, dir: i32, name: &core::ffi::CStr) -> bool {
         name.as_ptr(),
         libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
     );
-    let ok = at >= 0
-        && libc::syscall(
-            libc::SYS_move_mount,
-            m,
-            c"".as_ptr(),
-            at,
-            c"".as_ptr(),
-            MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_EMPTY_PATH,
-        ) == 0;
+    let ok = at >= 0 && move_mount_to(m, at);
     if at >= 0 {
         libc::close(at);
     }
@@ -1865,15 +2018,7 @@ unsafe fn make_dev(rfd: i32, devs: &[i32; DEV_NODES.len()], dev: &DevPlan) -> bo
         ],
         libc::MOUNT_ATTR_NOSUID | libc::MOUNT_ATTR_NOEXEC | libc::MOUNT_ATTR_NODEV,
     );
-    let attached = m >= 0
-        && libc::syscall(
-            libc::SYS_move_mount,
-            m,
-            c"".as_ptr(),
-            at,
-            c"".as_ptr(),
-            MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_EMPTY_PATH,
-        ) == 0;
+    let attached = m >= 0 && move_mount_to(m, at);
     libc::close(at);
     if !attached {
         if m >= 0 {
@@ -1904,15 +2049,7 @@ unsafe fn make_dev(rfd: i32, devs: &[i32; DEV_NODES.len()], dev: &DevPlan) -> bo
             name.as_ptr(),
             libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
         );
-        ok = t >= 0
-            && libc::syscall(
-                libc::SYS_move_mount,
-                src,
-                c"".as_ptr(),
-                t,
-                c"".as_ptr(),
-                MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_EMPTY_PATH,
-            ) == 0;
+        ok = t >= 0 && move_mount_to(src, t);
         if t >= 0 {
             libc::close(t);
         }
@@ -1947,37 +2084,65 @@ unsafe fn make_dev(rfd: i32, devs: &[i32; DEV_NODES.len()], dev: &DevPlan) -> bo
 /// Bind the rootfs onto itself (recursively, so what the image has mounted
 /// inside comes along) and make the whole bound tree `nodev`: what the
 /// workload makes in its root, with the device-node capability or not,
-/// opens no device. A kernel without `mount_setattr` (before 5.12) makes
-/// the top mount `nodev` instead. Async-signal-safe.
+/// opens no device. Async-signal-safe.
 unsafe fn bind_root(rootfs: &core::ffi::CStr) -> bool {
-    if libc::mount(
+    libc::mount(
         rootfs.as_ptr(),
         rootfs.as_ptr(),
         core::ptr::null(),
         libc::MS_BIND | libc::MS_REC,
         core::ptr::null(),
-    ) != 0
-    {
-        return false;
-    }
-    let attr = libc::mount_attr {
-        attr_set: libc::MOUNT_ATTR_NODEV,
+    ) == 0
+        && set_mount_attr(rootfs, libc::MOUNT_ATTR_NODEV, true)
+}
+
+/// `mount_setattr(2)`: add the `MOUNT_ATTR_*` `attr` to the mount at `path`
+/// — it alone, or with `recursive` every mount beneath it too — keeping
+/// every other attribute it has. Async-signal-safe.
+unsafe fn set_mount_attr(path: &core::ffi::CStr, attr: u64, recursive: bool) -> bool {
+    mount_setattr(
+        libc::AT_FDCWD,
+        path.as_ptr(),
+        if recursive { libc::AT_RECURSIVE } else { 0 },
+        attr,
+    )
+}
+
+/// `mount_setattr(2)` on `dirfd`/`path` with `flags`, adding `attr`.
+/// Async-signal-safe.
+unsafe fn mount_setattr(
+    dirfd: i32,
+    path: *const libc::c_char,
+    flags: libc::c_int,
+    attr: u64,
+) -> bool {
+    let a = libc::mount_attr {
+        attr_set: attr,
         attr_clr: 0,
         propagation: 0,
         userns_fd: 0,
     };
-    if libc::syscall(
+    libc::syscall(
         libc::SYS_mount_setattr,
-        libc::AT_FDCWD,
-        rootfs.as_ptr(),
-        libc::AT_RECURSIVE as libc::c_uint,
-        &attr as *const libc::mount_attr,
+        dirfd,
+        path,
+        flags as libc::c_uint,
+        &a as *const libc::mount_attr,
         core::mem::size_of::<libc::mount_attr>(),
     ) == 0
-    {
-        return true;
-    }
-    *libc::__errno_location() == libc::ENOSYS && remount_adding(rootfs, libc::MS_NODEV)
+}
+
+/// Move the detached mount `m` onto the mount point `dst`, both
+/// descriptors. Async-signal-safe.
+unsafe fn move_mount_to(m: i32, dst: i32) -> bool {
+    libc::syscall(
+        libc::SYS_move_mount,
+        m,
+        c"".as_ptr(),
+        dst,
+        c"".as_ptr(),
+        MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_EMPTY_PATH,
+    ) == 0
 }
 
 /// Bind one volume: its source opened as planning opened it (and of the same
@@ -1993,7 +2158,7 @@ unsafe fn bind_volume(rfd: i32, b: &PlannedBind) -> bool {
     let same_kind =
         libc::fstat(src, &mut st) == 0 && (st.st_mode & libc::S_IFMT == libc::S_IFDIR) != b.file;
     let dst = if same_kind { mount_point(rfd, b) } else { -1 };
-    let ok = dst >= 0 && attach(src, dst, rfd, b);
+    let ok = dst >= 0 && attach(src, dst, b);
     if dst >= 0 {
         libc::close(dst);
     }
@@ -2053,10 +2218,12 @@ unsafe fn mount_point(rfd: i32, b: &PlannedBind) -> i32 {
     dfd
 }
 
-/// Clone the tree at `src` (recursively, as a bind does), make it read-only
-/// throughout when `b.ro`, and move it onto the mount point `dst`.
-/// Async-signal-safe.
-unsafe fn attach(src: i32, dst: i32, rfd: i32, b: &PlannedBind) -> bool {
+/// Clone the tree at `src` (recursively, as a bind does), make it `nodev`
+/// throughout — and read-only throughout when `b.ro` — before it is
+/// reachable, so a volume with mounts inside is so all the way down and a
+/// device node made in it opens no device, and move it onto the mount point
+/// `dst`. Async-signal-safe.
+unsafe fn attach(src: i32, dst: i32, b: &PlannedBind) -> bool {
     let tree = libc::syscall(
         libc::SYS_open_tree,
         src,
@@ -2069,153 +2236,15 @@ unsafe fn attach(src: i32, dst: i32, rfd: i32, b: &PlannedBind) -> bool {
     if tree < 0 {
         return false;
     }
-    // `nodev` (and read-only when asked) before it is reachable: every
-    // mount of the clone, so a volume with mounts inside is so all the way
-    // down, and a device node made in it opens no device. A kernel without
-    // `mount_setattr` (before 5.12) remounts the top mount once it is in
-    // place instead.
-    let mut remount = false;
-    let attr = libc::mount_attr {
-        attr_set: libc::MOUNT_ATTR_NODEV | if b.ro { libc::MOUNT_ATTR_RDONLY } else { 0 },
-        attr_clr: 0,
-        propagation: 0,
-        userns_fd: 0,
-    };
-    if libc::syscall(
-        libc::SYS_mount_setattr,
+    let attr = libc::MOUNT_ATTR_NODEV | if b.ro { libc::MOUNT_ATTR_RDONLY } else { 0 };
+    let ok = mount_setattr(
         tree,
         c"".as_ptr(),
-        (libc::AT_EMPTY_PATH | libc::AT_RECURSIVE) as libc::c_uint,
-        &attr as *const libc::mount_attr,
-        core::mem::size_of::<libc::mount_attr>(),
-    ) != 0
-    {
-        if *libc::__errno_location() != libc::ENOSYS {
-            libc::close(tree);
-            return false;
-        }
-        remount = true;
-    }
-    let moved = libc::syscall(
-        libc::SYS_move_mount,
-        tree,
-        c"".as_ptr(),
-        dst,
-        c"".as_ptr(),
-        MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_EMPTY_PATH,
-    ) == 0;
+        libc::AT_EMPTY_PATH | libc::AT_RECURSIVE,
+        attr,
+    ) && move_mount_to(tree, dst);
     libc::close(tree);
-    if !moved {
-        return false;
-    }
-    if !remount {
-        return true;
-    }
-    // The mount point resolved again is the bound tree's top mount.
-    let top = openat2_raw(
-        rfd,
-        b.target.as_ptr(),
-        libc::O_PATH | libc::O_CLOEXEC,
-        IN_ROOT,
-    );
-    if top < 0 {
-        return false;
-    }
-    let mut path = [0u8; 32];
-    let add = libc::MS_NODEV | if b.ro { libc::MS_RDONLY } else { 0 };
-    let ok = fd_path(top, &mut path)
-        && remount_adding(core::ffi::CStr::from_ptr(path.as_ptr().cast()), add);
-    libc::close(top);
     ok
-}
-
-/// `/proc/self/fd/<fd>` into `buf`, NUL-terminated. Async-signal-safe.
-fn fd_path(fd: i32, buf: &mut [u8; 32]) -> bool {
-    const PREFIX: &[u8] = b"/proc/self/fd/";
-    if fd < 0 {
-        return false;
-    }
-    buf[..PREFIX.len()].copy_from_slice(PREFIX);
-    let mut digits = [0u8; 10];
-    let mut n = fd as u32;
-    let mut len = 0;
-    loop {
-        digits[len] = b'0' + (n % 10) as u8;
-        len += 1;
-        n /= 10;
-        if n == 0 {
-            break;
-        }
-    }
-    for i in 0..len {
-        buf[PREFIX.len() + i] = digits[len - 1 - i];
-    }
-    buf[PREFIX.len() + len] = 0;
-    true
-}
-
-/// Remount the mount at `path` read-only: that mount alone (a bind remount
-/// never recurses), so mounts beneath it keep their own access.
-/// Async-signal-safe.
-unsafe fn remount_read_only(path: &core::ffi::CStr) -> bool {
-    remount_adding(path, libc::MS_RDONLY)
-}
-
-/// Remount the mount at `path` with the per-mount flags `add` added. A bind
-/// remount replaces the mount's per-mount flags, so the ones it already
-/// carries (`ro`, `nosuid`, `nodev`, `noexec`, the atime policy) are read
-/// first and kept — the remount only ever takes access away.
-/// Async-signal-safe.
-unsafe fn remount_adding(path: &core::ffi::CStr, add: libc::c_ulong) -> bool {
-    let Some(have) = mount_flags(path) else {
-        return false;
-    };
-    let mut keep: libc::c_ulong = 0;
-    for (st_bit, ms_bit) in [
-        (libc::ST_RDONLY, libc::MS_RDONLY),
-        (libc::ST_NOSUID, libc::MS_NOSUID),
-        (libc::ST_NODEV, libc::MS_NODEV),
-        (libc::ST_NOEXEC, libc::MS_NOEXEC),
-        (libc::ST_NOATIME, libc::MS_NOATIME),
-        (libc::ST_NODIRATIME, libc::MS_NODIRATIME),
-        (libc::ST_RELATIME, libc::MS_RELATIME),
-    ] {
-        if have & st_bit != 0 {
-            keep |= ms_bit;
-        }
-    }
-    libc::mount(
-        core::ptr::null(),
-        path.as_ptr(),
-        core::ptr::null(),
-        libc::MS_BIND | libc::MS_REMOUNT | add | keep,
-        core::ptr::null(),
-    ) == 0
-}
-
-/// The `ST_*` flags of the mount at `path`, by the raw `statfs` syscall (the
-/// libc wrappers either hide the field or may fall back to reading the mount
-/// table). On 64-bit Linux the kernel's `struct statfs` is fifteen 8-byte
-/// words — type, bsize, blocks, bfree, bavail, files, ffree, fsid, namelen,
-/// frsize, flags, four spare — so `flags` is word 10. Async-signal-safe.
-#[cfg(target_pointer_width = "64")]
-unsafe fn mount_flags(path: &core::ffi::CStr) -> Option<libc::c_ulong> {
-    let mut w = [0u64; 15];
-    if libc::syscall(libc::SYS_statfs, path.as_ptr(), w.as_mut_ptr()) != 0 {
-        return None;
-    }
-    Some(w[10] as libc::c_ulong)
-}
-
-/// As above on a 32-bit host, through `statvfs` (a kernel that reports the
-/// flags itself — every one since 2.6.36 — spares glibc reading any file).
-#[cfg(not(target_pointer_width = "64"))]
-unsafe fn mount_flags(path: &core::ffi::CStr) -> Option<libc::c_ulong> {
-    let mut st: libc::statvfs = core::mem::zeroed();
-    if libc::statvfs(path.as_ptr(), &mut st) != 0 {
-        return None;
-    }
-    Some(st.f_flag as libc::c_ulong)
 }
 
 /// Close every descriptor of this process except `keep` (at most eight;
@@ -2404,42 +2433,164 @@ unsafe fn exec_with(
     libc::_exit(if found { 126 } else { 127 });
 }
 
-/// pivot_root into `new_root`, already bound onto itself ([`bind_root`]):
-/// pivot, detach the old root, with an MS_MOVE fallback on EINVAL/EXDEV.
-/// Returns 0 on success, -1 on failure.
+/// pivot_root into `new_root`, already bound onto itself ([`bind_root`]),
+/// and detach the old root, so nothing of the host's tree is left reachable.
+/// A root `pivot_root(2)` refuses (the initial ramfs) refuses the workload:
+/// moving the new root over it and `chroot`ing would leave the old root
+/// reachable to a process holding `CAP_SYS_CHROOT`, a default capability.
+/// Returns 0 on success, -1 on failure. Async-signal-safe.
 unsafe fn hp_pivot_into(new_root: *const libc::c_char) -> i32 {
     if libc::chdir(new_root) != 0 {
         return -1;
     }
-    // put_old = "." (the new root's cwd); pivot_root(".", ".") then detach.
+    // put_old = "." (the new root's cwd); pivot_root(".", ".") stacks the
+    // old root on "/", where it is detached.
     let dot = c".".as_ptr();
-    let pivot_rc = libc::syscall(libc::SYS_pivot_root, dot, dot);
-    if pivot_rc == 0 {
-        // Detach the old root now stacked at "/".
-        let slash = c"/".as_ptr();
-        libc::umount2(slash, libc::MNT_DETACH);
-        return 0;
-    }
-    // Fallback, for a root pivot_root refuses (one on the initial ramfs):
-    // MS_MOVE the new root onto "/" then chroot into it.
-    let slash = c"/".as_ptr();
-    if libc::mount(
-        dot,
-        slash,
-        core::ptr::null(),
-        libc::MS_MOVE,
-        core::ptr::null(),
-    ) != 0
-    {
+    if libc::syscall(libc::SYS_pivot_root, dot, dot) != 0 {
         return -1;
     }
-    if libc::chroot(dot) != 0 {
-        return -1;
-    }
-    if libc::chdir(slash) != 0 {
+    if libc::umount2(c"/".as_ptr(), libc::MNT_DETACH) != 0 {
         return -1;
     }
     0
+}
+
+/// The entries of a workload's `/proc` made read-only: the host's controls
+/// a uid 0 could otherwise write — sysctls, the magic SysRq key, interrupt
+/// affinity, bus and filesystem settings (the Docker defaults).
+const PROC_READ_ONLY: [&core::ffi::CStr; 5] = [c"bus", c"fs", c"irq", c"sys", c"sysrq-trigger"];
+/// The entries of a workload's `/proc` masked — the host's `/dev/null` over
+/// a file, an empty read-only memory filesystem over a directory: the host's memory,
+/// keyrings and kernel timing internals (the Docker defaults).
+const PROC_MASKED: [&core::ffi::CStr; 9] = [
+    c"acpi",
+    c"asound",
+    c"kcore",
+    c"keys",
+    c"latency_stats",
+    c"sched_debug",
+    c"scsi",
+    c"timer_list",
+    c"timer_stats",
+];
+
+/// Mount the workload's own `/proc` (a new instance, `nosuid,nodev,noexec`,
+/// showing the calling process's pid namespace) at `/proc` of the rootfs
+/// `rfd`, resolved inside it and made when absent, then make each of
+/// [`PROC_READ_ONLY`] read-only and mask each of [`PROC_MASKED`]; an entry
+/// this kernel lacks is skipped. Made before the pivot, while the host's own
+/// `/proc` is in view: a kernel admits a new proc instance in a user
+/// namespace only beside a fully visible one. Every mount is made detached
+/// and attached by descriptor. False on any other failure.
+/// Async-signal-safe.
+unsafe fn mount_proc(rfd: i32) -> bool {
+    libc::mkdirat(rfd, c"proc".as_ptr(), 0o555);
+    let at = openat2_raw(
+        rfd,
+        c"proc".as_ptr(),
+        libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        IN_ROOT,
+    );
+    if at < 0 {
+        return false;
+    }
+    let m = new_fs(
+        c"proc",
+        &[],
+        libc::MOUNT_ATTR_NOSUID | libc::MOUNT_ATTR_NOEXEC | libc::MOUNT_ATTR_NODEV,
+    );
+    let attached = m >= 0 && move_mount_to(m, at);
+    libc::close(at);
+    if !attached {
+        if m >= 0 {
+            libc::close(m);
+        }
+        return false;
+    }
+    let ok = PROC_READ_ONLY.iter().all(|name| proc_read_only(m, name))
+        && PROC_MASKED.iter().all(|name| proc_mask(m, name));
+    libc::close(m);
+    ok
+}
+
+/// Bind `name` of the attached `/proc` `m` onto itself read-only (and
+/// `nosuid,nodev,noexec`), everything beneath it included. True as well
+/// when the kernel has no such entry. Async-signal-safe.
+unsafe fn proc_read_only(m: i32, name: &core::ffi::CStr) -> bool {
+    let tree = libc::syscall(
+        libc::SYS_open_tree,
+        m,
+        name.as_ptr(),
+        libc::OPEN_TREE_CLONE
+            | libc::OPEN_TREE_CLOEXEC
+            | libc::AT_RECURSIVE as libc::c_uint
+            | libc::AT_SYMLINK_NOFOLLOW as libc::c_uint,
+    ) as i32;
+    if tree < 0 {
+        return *libc::__errno_location() == libc::ENOENT;
+    }
+    let dst = libc::openat(
+        m,
+        name.as_ptr(),
+        libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+    );
+    let ok = dst >= 0
+        && mount_setattr(
+            tree,
+            c"".as_ptr(),
+            libc::AT_EMPTY_PATH | libc::AT_RECURSIVE,
+            libc::MOUNT_ATTR_RDONLY
+                | libc::MOUNT_ATTR_NOSUID
+                | libc::MOUNT_ATTR_NODEV
+                | libc::MOUNT_ATTR_NOEXEC,
+        )
+        && move_mount_to(tree, dst);
+    if dst >= 0 {
+        libc::close(dst);
+    }
+    libc::close(tree);
+    ok
+}
+
+/// Mask `name` of the attached `/proc` `m`: the host's `/dev/null` bound
+/// over a file, an empty read-only memory filesystem over a directory. True
+/// as well when the kernel has no such entry. Async-signal-safe.
+unsafe fn proc_mask(m: i32, name: &core::ffi::CStr) -> bool {
+    let mut st: libc::stat = core::mem::zeroed();
+    if libc::fstatat(m, name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) != 0 {
+        return *libc::__errno_location() == libc::ENOENT;
+    }
+    let over = if st.st_mode & libc::S_IFMT == libc::S_IFDIR {
+        new_fs(
+            c"tmpfs",
+            &[(c"mode", c"555"), (c"size", c"4096"), (c"nr_inodes", c"1")],
+            libc::MOUNT_ATTR_RDONLY
+                | libc::MOUNT_ATTR_NOSUID
+                | libc::MOUNT_ATTR_NODEV
+                | libc::MOUNT_ATTR_NOEXEC,
+        )
+    } else {
+        libc::syscall(
+            libc::SYS_open_tree,
+            libc::AT_FDCWD,
+            c"/dev/null".as_ptr(),
+            libc::OPEN_TREE_CLONE | libc::OPEN_TREE_CLOEXEC,
+        ) as i32
+    };
+    if over < 0 {
+        return false;
+    }
+    let dst = libc::openat(
+        m,
+        name.as_ptr(),
+        libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+    );
+    let ok = dst >= 0 && move_mount_to(over, dst);
+    if dst >= 0 {
+        libc::close(dst);
+    }
+    libc::close(over);
+    ok
 }
 
 /// Spawn a sandbox from explicit params (`argv`, optional `rootfs`, `isolate`):
@@ -2619,7 +2770,18 @@ pub unsafe fn hp_spawn_with_binds(
         // The intermediate died before relaying the init's pid.
         None => Some(errno::ERROR),
     };
+    // What a later EXEC or TTY session of an isolated workload joins: a pid
+    // descriptor of the init, taken while it waits at the barrier.
+    let (refused, pidfd) = match refused {
+        None if plan.isolate => match init_pidfd(container_pid, pid) {
+            Ok(fd) => (None, fd),
+            Err(e) => (Some(e), -1),
+        },
+        r => (r, -1),
+    };
     if let Some(e) = refused {
+        // The barrier closed unreleased ends the init; the intermediate
+        // follows with its status.
         libc::close(out_r);
         libc::close(start_w);
         let mut status = 0;
@@ -2631,6 +2793,7 @@ pub unsafe fn hp_spawn_with_binds(
     slot.in_use = true;
     slot.pid = pid;
     slot.container_pid = container_pid;
+    slot.pidfd = pidfd;
     slot.start_w = start_w;
     slot.out_r = out_r;
     slot.started = false;
@@ -2656,6 +2819,48 @@ pub unsafe fn hp_spawn_with_binds(
         }
     }
     idx as i32
+}
+
+/// A pid descriptor of the init `init`, the child of the intermediate
+/// `intermediate` (a child of this process, not yet reaped, so its pid is
+/// its own). The pid names the init only while it is the intermediate's
+/// child: the descriptor is taken, the pid's parent read, and the
+/// descriptor's process checked still running — a process alive at the end
+/// held the pid throughout, so the parent read was its own. `ESRCH` when it
+/// is not the init (it ended before the descriptor was taken), else the
+/// errno of `pidfd_open(2)`.
+unsafe fn init_pidfd(init: i32, intermediate: i32) -> Result<i32, i32> {
+    use crate::kernel::sys::errno;
+    let fd = libc::syscall(libc::SYS_pidfd_open, init, 0) as i32;
+    if fd < 0 {
+        return Err(-*libc::__errno_location());
+    }
+    let parent = std::fs::read(format!("/proc/{init}/stat"))
+        .ok()
+        .and_then(|b| {
+            let close = b.iter().rposition(|&c| c == b')')?;
+            let mut f = b[close + 1..]
+                .split(|&c| c == b' ')
+                .filter(|f| !f.is_empty());
+            f.next()?;
+            Some(decimal(f.next()?))
+        });
+    if parent != Some(intermediate) || pidfd_exited(fd) {
+        libc::close(fd);
+        return Err(errno::ESRCH);
+    }
+    Ok(fd)
+}
+
+/// Whether the process of the pid descriptor `fd` has ended (the descriptor
+/// reads as ready once it has).
+unsafe fn pidfd_exited(fd: i32) -> bool {
+    let mut p = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    libc::poll(&mut p, 1, 0) != 0
 }
 
 unsafe fn slot_for(raw: i32) -> Option<&'static mut HpSlot> {
@@ -2860,7 +3065,6 @@ pub unsafe fn hp_tty_open(raw: i32, arg: *const u8, arg_len: usize) -> i32 {
     ) {
         Some(i) => i,
         None => {
-            join.close();
             return errno::ENOMEM;
         }
     };
@@ -2871,18 +3075,15 @@ pub unsafe fn hp_tty_open(raw: i32, arg: *const u8, arg_len: usize) -> i32 {
     // spawns) never inherit a copy that would keep this PTY from hanging up.
     let master = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC);
     if master < 0 {
-        join.close();
         return errno::ERROR;
     }
     if libc::grantpt(master) != 0 || libc::unlockpt(master) != 0 {
         libc::close(master);
-        join.close();
         return errno::ERROR;
     }
     let mut pts = [0 as libc::c_char; 128];
     if libc::ptsname_r(master, pts.as_mut_ptr(), pts.len()) != 0 {
         libc::close(master);
-        join.close();
         return errno::ERROR;
     }
     let slave = libc::open(
@@ -2891,7 +3092,6 @@ pub unsafe fn hp_tty_open(raw: i32, arg: *const u8, arg_len: usize) -> i32 {
     );
     if slave < 0 {
         libc::close(master);
-        join.close();
         return errno::ERROR;
     }
     let ws = libc::winsize {
@@ -2906,7 +3106,6 @@ pub unsafe fn hp_tty_open(raw: i32, arg: *const u8, arg_len: usize) -> i32 {
     if pid < 0 {
         libc::close(master);
         libc::close(slave);
-        join.close();
         return errno::ERROR;
     }
     if pid == 0 {
@@ -2942,9 +3141,8 @@ pub unsafe fn hp_tty_open(raw: i32, arg: *const u8, arg_len: usize) -> i32 {
         enter_as_workload(proc, parent, lifeline);
         exec_with(&argv_ptrs, &envp, proc);
     }
-    // Parent: keep the master (non-blocking), drop the slave + ns fds.
+    // Parent: keep the master (non-blocking), drop the slave.
     libc::close(slave);
-    join.close();
     let fl = libc::fcntl(master, libc::F_GETFL);
     libc::fcntl(master, libc::F_SETFL, fl | libc::O_NONBLOCK);
     let (owner, module) = tty_caller();
@@ -3150,28 +3348,37 @@ unsafe fn close_sandbox_sessions(raw: i32) {
 
 /// What a process joining a live workload (EXEC, a TTY session) needs,
 /// prepared in the parent so the child only issues system calls: the
-/// container's namespaces (isolated only, in `setns` order — ipc, uts, net,
-/// pid, mnt; mnt last, as it changes what `/proc/<pid>/ns` resolves to), the
+/// init's pid descriptor (isolated only), whose namespaces it joins, the
 /// `cgroup.procs` of the workload's cgroup when the workload is contained in
 /// one, and whether it pivoted.
 struct Join {
-    ns: [i32; 5],
+    /// The slot's own descriptor, borrowed: never closed by the join.
+    pidfd: i32,
     procs: Option<CString>,
     isolated: bool,
 }
 
+/// The namespaces a process joining an isolated workload enters.
+const JOIN_NAMESPACES: libc::c_int = libc::CLONE_NEWIPC
+    | libc::CLONE_NEWUTS
+    | libc::CLONE_NEWNET
+    | libc::CLONE_NEWPID
+    | libc::CLONE_NEWNS;
+
 /// Prepare to join `slot` (sandbox `raw`): EINVAL before START or while
 /// PAUSEd (a process joining a frozen cgroup would freeze with it), ESRCH
-/// when an isolated container's namespaces are gone. A join is all or
-/// nothing: a process that could not enter every namespace would run on the
-/// host.
+/// when an isolated workload's init has ended. A join is all or nothing: a
+/// process that could not enter every namespace would run on the host.
 unsafe fn prepare_join(raw: i32, slot: &HpSlot) -> Result<Join, i32> {
     use crate::kernel::sys::errno;
     if !slot.started || slot.paused {
         return Err(errno::EINVAL);
     }
+    if slot.isolated && (slot.pidfd < 0 || pidfd_exited(slot.pidfd)) {
+        return Err(errno::ESRCH);
+    }
     let mut join = Join {
-        ns: [-1; 5],
+        pidfd: slot.pidfd,
         procs: None,
         isolated: slot.isolated,
     };
@@ -3186,26 +3393,16 @@ unsafe fn prepare_join(raw: i32, slot: &HpSlot) -> Result<Join, i32> {
             return Err(errno::ERROR);
         }
     }
-    if slot.isolated {
-        for (i, ns) in ["ipc", "uts", "net", "pid", "mnt"].iter().enumerate() {
-            let fd = CString::new(format!("/proc/{}/ns/{ns}", slot.container_pid))
-                .map_or(-1, |p| {
-                    libc::open(p.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC)
-                });
-            if fd < 0 {
-                join.close();
-                return Err(errno::ESRCH);
-            }
-            join.ns[i] = fd;
-        }
-    }
     Ok(join)
 }
 
 impl Join {
     /// In the forked child: into the workload's cgroup (while its path is
-    /// still the host's), then its namespaces, then its root. False on any
-    /// refusal; the child must then exit. Async-signal-safe.
+    /// still the host's), then — isolated — every namespace of the init's at
+    /// once, through its pid descriptor (`setns(2)`), so the join reaches
+    /// the init or fails (`ESRCH` once it has ended), never a process that
+    /// took its pid since; then its root. False on any refusal; the child
+    /// must then exit. Async-signal-safe.
     unsafe fn enter(&self) -> bool {
         if let Some(p) = self.procs.as_ref() {
             // "0" moves the writer itself (cgroup-v2 `cgroup.procs`).
@@ -3218,24 +3415,10 @@ impl Join {
                 return false;
             }
         }
-        for &fd in &self.ns {
-            if fd >= 0 {
-                if libc::setns(fd, 0) != 0 {
-                    return false;
-                }
-                libc::close(fd);
-            }
+        if !self.isolated {
+            return true;
         }
-        !self.isolated || libc::chdir(c"/".as_ptr()) == 0
-    }
-
-    /// The parent's copies, once the child has its own.
-    unsafe fn close(&self) {
-        for &fd in &self.ns {
-            if fd >= 0 {
-                libc::close(fd);
-            }
-        }
+        libc::setns(self.pidfd, JOIN_NAMESPACES) == 0 && libc::chdir(c"/".as_ptr()) == 0
     }
 }
 
@@ -3298,7 +3481,6 @@ pub unsafe fn hp_exec(raw: i32, arg: *mut u8, arg_len: usize) -> i32 {
 
     let mut fds = [0i32; 2];
     if libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) != 0 {
-        join.close();
         return errno::ERROR;
     }
     let (r, w) = (fds[0], fds[1]);
@@ -3306,7 +3488,6 @@ pub unsafe fn hp_exec(raw: i32, arg: *mut u8, arg_len: usize) -> i32 {
     if pid < 0 {
         libc::close(r);
         libc::close(w);
-        join.close();
         return errno::ERROR;
     }
     if pid == 0 {
@@ -3338,11 +3519,10 @@ pub unsafe fn hp_exec(raw: i32, arg: *mut u8, arg_len: usize) -> i32 {
         exec_with(&argv_ptrs, &envp, proc);
     }
 
-    // Parent: close the write end + the ns fds, drain the pipe into arg[4..]
+    // Parent: close the write end, drain the pipe into arg[4..]
     // (truncating on overflow but still draining so the child never blocks)
     // until the child has exited and nothing is ready, then reap.
     libc::close(w);
-    join.close();
     let cap = arg_len - 4;
     let mut written = 0usize;
     let mut scratch = [0u8; 4096];
@@ -3399,7 +3579,10 @@ pub unsafe fn hp_exec(raw: i32, arg: *mut u8, arg_len: usize) -> i32 {
     }
 }
 
-/// HP_SIGNAL: deliver a signal to the container process.
+/// HP_SIGNAL: deliver a signal to the container init's process group,
+/// through its intermediate ([`relay`]) — the one process that may reap the
+/// init, and so the one that knows its pid is still the init's when it
+/// signals it. A workload already ended answers 0.
 /// # Safety
 /// Single-threaded platform dispatch only (process-global slot table).
 /// `arg` must be valid for reads of `arg_len` bytes.
@@ -3412,9 +3595,8 @@ pub unsafe fn hp_signal(raw: i32, arg: *const u8, arg_len: usize) -> i32 {
     let Some(slot) = slot_for(raw) else {
         return errno::EINVAL;
     };
-    // Reap first: once the process this slot waits for has exited, the
-    // container's pid is free for the host to reuse, and a signal sent to it
-    // could reach a stranger.
+    // An intermediate reaped here is gone with its init; one not yet reaped
+    // keeps its pid, so the request below reaches it and no stranger.
     hp_poll_reap(raw, slot);
     if slot.reaped {
         return errno::OK; // already gone
@@ -3426,29 +3608,10 @@ pub unsafe fn hp_signal(raw: i32, arg: *const u8, arg_len: usize) -> i32 {
         hp_freeze_write(raw as usize, false);
         slot.paused = false;
     }
-    // Target the container init's process group, not the intermediate (which
-    // is blocked in waitpid and would not forward the signal).
-    if kill_container_group(slot.container_pid, signo) != 0 {
+    if !relay(slot.pid, signo) {
         return errno::ERROR;
     }
     errno::OK
-}
-
-/// Deliver `signo` to the container's process group — the container body
-/// makes itself a group leader (`setpgid(0,0)`) before exec, so `-pgid` is
-/// `-container_pid` (children of the init must
-/// hear the signal too, or grace semantics are meaningless). Falls back to
-/// single-pid delivery when the group kill fails with ESRCH — the one
-/// legitimate gap is a container signalled before its body reached setpgid.
-/// Returns 0 on success, -1 on failure (kill semantics).
-unsafe fn kill_container_group(container_pid: i32, signo: i32) -> i32 {
-    if libc::kill(-container_pid, signo) == 0 {
-        return 0;
-    }
-    if *libc::__errno_location() == libc::ESRCH {
-        return libc::kill(container_pid, signo);
-    }
-    -1
 }
 
 /// Non-blocking reap poll: latch the terminal state once the child is gone.
@@ -3585,29 +3748,39 @@ pub unsafe fn hp_destroy(raw: i32) -> i32 {
         hp_freeze_write(raw as usize, false);
         slot.paused = false;
     }
-    // As for SIGNAL: a container whose relay already exited is not signalled.
+    // As for SIGNAL: a container whose intermediate already exited is not
+    // signalled.
     hp_poll_reap(raw, slot);
     if !slot.reaped && slot.pid > 0 {
-        // Signal the container init's process group (SIGKILL to PID 1 of a
-        // pid ns tears the whole namespace down; the group delivery also
-        // reaches a null sandbox's children); reap the
-        // intermediate/child via `pid`. A handler-less init ignores SIGTERM
-        // from our ancestor ns, so the grace simply elapses and SIGKILL
-        // settles it.
-        kill_container_group(slot.container_pid, libc::SIGTERM);
+        // Through the intermediate, to the init's process group: SIGKILL to
+        // PID 1 of a pid ns tears the whole namespace down, and a null
+        // sandbox's intermediate kills every process left once its init has
+        // ended. A handler-less init ignores SIGTERM from an ancestor pid
+        // namespace, so the grace simply elapses and SIGKILL settles it.
         let mut status: libc::c_int = 0;
         let mut gone = false;
-        for _ in 0..50 {
-            if libc::waitpid(slot.pid, &mut status, libc::WNOHANG) == slot.pid {
-                gone = true;
-                break;
+        if relay(slot.pid, libc::SIGTERM) {
+            for _ in 0..50 {
+                if libc::waitpid(slot.pid, &mut status, libc::WNOHANG) == slot.pid {
+                    gone = true;
+                    break;
+                }
+                libc::usleep(2000); // 2ms × 50 = 100ms grace
             }
-            libc::usleep(2000); // 2ms × 50 = 100ms grace
         }
         if !gone {
-            kill_container_group(slot.container_pid, libc::SIGKILL);
-            libc::waitpid(slot.pid, &mut status, 0);
+            // An intermediate that cannot take the request is killed
+            // itself: its init follows by its lifeline.
+            if !relay(slot.pid, libc::SIGKILL) {
+                libc::kill(slot.pid, libc::SIGKILL);
+            }
+            while libc::waitpid(slot.pid, &mut status, 0) < 0
+                && *libc::__errno_location() == libc::EINTR
+            {}
         }
+    }
+    if slot.pidfd >= 0 {
+        libc::close(slot.pidfd);
     }
     // Its address leaves the node: flows discarded, attachment unguarded.
     super::net_identity::released(raw as usize);

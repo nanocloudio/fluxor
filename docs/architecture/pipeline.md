@@ -161,6 +161,13 @@ for a refusal. Deferred-ready consumers are left ungated, so providers
 that require each other's contracts still step to readiness. The gate is
 set once instantiation is complete, at boot and after a rebuild alike.
 
+The gate holds a module silently, so the kernel watches it: once a second it
+looks for modules the gate is holding, and one held for a whole 30-second
+window is logged once, naming a deferred module upstream that has not
+reported Ready (`[ready] <module> not stepped for at least 30s: waiting on
+<upstream> ...`), and flagged `readiness_starved` in its `ModuleStateSnapshot`.
+When the hold ends the record clears, and a later hold is reported afresh.
+
 ### Async I/O Pattern
 
 Hardware-facing operations use start/poll sequencing:

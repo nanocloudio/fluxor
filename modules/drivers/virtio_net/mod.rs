@@ -15,8 +15,13 @@
 //! 2. Virtio handshake: reset → ack → driver → features → driver_ok
 //! 3. Setup RX + TX virtqueues (legacy v1)
 //! 4. Pre-fill RX descriptors
-//! 5. Send MAC announcement (ethertype 0x0000) on out_chan
+//! 5. Send MAC announcement (ethertype 0x0000) on out_chan, and report
+//!    Ready on that step
 //! 6. Poll: RX used ring → out_chan, in_chan → TX available ring
+//!
+//! Exports `module_deferred_ready`: the non-deferred modules downstream of
+//! it are not stepped until it reports Ready, so it reports Ready once the
+//! device is up and its MAC is announced.
 
 #![no_std]
 #![allow(
@@ -642,7 +647,8 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
         }
     }
 
-    // Send MAC announcement once after init
+    // Send MAC announcement once after init; that step reports Ready.
+    let mut ready = false;
     if s.initialized != 0 && s.mac_announced == 0 && s.out_chan >= 0 {
         let mac = s.mac_addr.as_ptr();
         if *mac != 0 || *mac.add(1) != 0 {
@@ -663,6 +669,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
             if poll > 0 && (poll as u32 & POLL_OUT) != 0 {
                 (sys.channel_write)(s.out_chan, record.as_ptr(), 16);
                 s.mac_announced = 1;
+                ready = true;
                 dev_log(sys, 3, b"[virtio_net] mac announced".as_ptr(), 26);
             }
         }
@@ -674,7 +681,11 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     // TX: one frame record from `ip`, if one is waiting.
     poll_tx(s);
 
-    0 // Continue
+    if ready {
+        3 // Ready
+    } else {
+        0 // Continue
+    }
 }
 
 // Wasm entry-point wrappers — no-op on non-wasm targets. See

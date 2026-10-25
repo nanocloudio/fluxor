@@ -523,6 +523,8 @@ pub fn free_module_state(module_idx: usize) {
     sched.mailbox_safe[module_idx] = false;
     sched.in_place_writer[module_idx] = false;
     sched.upstream_mask[module_idx] = ModuleMask::EMPTY;
+    sched.starvation_suspect.clear(module_idx);
+    sched.starvation_reported.clear(module_idx);
     sched.step_period[module_idx] = 0;
     sched.step_counter[module_idx] = 0;
     sched.module_code_base[module_idx] = 0;

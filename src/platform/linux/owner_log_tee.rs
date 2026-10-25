@@ -10,8 +10,9 @@
 // scheduler thread. The Linux runtime runs the scheduler single-threaded on the
 // main thread, so on-step records push directly. Records emitted off the main
 // thread (platform and background threads: the process executor's pumps, the
-// host-mount jobs) go to stderr only; routing them into the owning ring would
-// take a bounded MPSC drained on the tick.
+// host-mount jobs) go to stderr only, and the tee reads no kernel state for
+// them: owner attribution reads the module owner table, which only the
+// scheduler thread may read.
 
 // NOTE: this file is `include!`d into `linux.rs`, so it shares that module's
 // imports (`OnceLock`, `thread`, `std::io::Write`). Other paths are fully

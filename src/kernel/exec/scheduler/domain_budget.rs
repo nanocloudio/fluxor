@@ -325,6 +325,9 @@ pub fn step_domain_modules(modules: &mut [ModuleSlot], domain_id: usize) -> Step
             not_ready.set(i);
         }
     }
+    if domain_id == 0 {
+        readiness_starvation_sweep(sched, modules, count, &not_ready);
+    }
 
     // Reset the per-pass budget accumulator before stepping any
     // modules. `step_one_module` adds elapsed wall-clock here; the
@@ -669,6 +672,81 @@ pub(crate) fn step_domain_post_tick_flush(
             );
             break;
         }
+    }
+}
+
+/// How long the readiness gate may hold a module before it is reported:
+/// longer than a network's normal bring-up (a Wi-Fi association and a DHCP
+/// lease hold everything after `ip`), so what is reported is a hold worth
+/// looking at.
+const STARVATION_REPORT_MS: u64 = 30_000;
+/// How often [`readiness_starvation_sweep`] looks.
+const STARVATION_SWEEP_MS: u64 = 1_000;
+
+/// Report, once per hold, a module the readiness gate has held for a whole
+/// [`STARVATION_REPORT_MS`] window, naming an upstream module it waits on.
+///
+/// The gate skips a non-deferred module while any module upstream of it (on
+/// a channel edge, or the deferred provider of a contract it requires) has
+/// not reported Ready, and it does so silently: a deferred module that never
+/// reports Ready, or whose initialisation failed, holds everything after it
+/// for ever with nothing said. Held is a fact of the scheduler's state, so
+/// the sweep reads it directly, once a second. The modules held when a
+/// window opens are its suspects; a suspect seen unheld at any sweep leaves
+/// them, and one still held when the window closes is reported, so a report
+/// means a hold of between one and two windows. A module that stops being
+/// held is forgotten, and a later hold (its upstream restarted after a fault,
+/// say) is reported afresh. Only modules that are not Ready hold others, and
+/// only deferred modules are ever not Ready, so the module named is the one
+/// to look at, never another held module. Runs from one place per stepping
+/// path, outside [`step_one_module`], and is observable as
+/// `ModuleStateSnapshot::readiness_starved`.
+pub(crate) fn readiness_starvation_sweep(
+    sched: &mut SchedulerState,
+    modules: &[ModuleSlot],
+    count: usize,
+    not_ready: &ModuleMask,
+) {
+    let now = crate::kernel::sys::hal::now_millis();
+    if now.wrapping_sub(sched.starvation_sweep_ms) < STARVATION_SWEEP_MS {
+        return;
+    }
+    sched.starvation_sweep_ms = now;
+    let window_over = now.wrapping_sub(sched.starvation_window_ms) >= STARVATION_REPORT_MS;
+    let mut held_now = ModuleMask::new();
+    for m in 0..count {
+        // The gate's own predicate (`step_one_module`).
+        let held = !not_ready.is_empty()
+            && !sched.finished[m]
+            && !sched.deferred_ready[m]
+            && sched.upstream_mask[m].intersects(not_ready);
+        if !held {
+            sched.starvation_suspect.clear(m);
+            sched.starvation_reported.clear(m);
+            continue;
+        }
+        held_now.set(m);
+        if !window_over || !sched.starvation_suspect.test(m) || sched.starvation_reported.test(m) {
+            continue;
+        }
+        sched.starvation_reported.set(m);
+        let mut waits = sched.upstream_mask[m];
+        waits.and_assign(not_ready);
+        let held_name = modules.get(m).map_or("?", |s| s.type_name());
+        let wait_name = waits
+            .iter_set()
+            .next()
+            .and_then(|u| modules.get(u))
+            .map_or("?", |s| s.type_name());
+        log::warn!(
+            "[ready] {held_name} not stepped for at least {}s: waiting on {wait_name}, which \
+             has not reported Ready",
+            STARVATION_REPORT_MS / 1000
+        );
+    }
+    if window_over {
+        sched.starvation_suspect = held_now;
+        sched.starvation_window_ms = now;
     }
 }
 

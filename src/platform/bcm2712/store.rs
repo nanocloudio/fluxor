@@ -1304,8 +1304,8 @@ pub unsafe fn dispatch_namespace(handle: i32, opcode: u32, arg: *mut u8, arg_len
             subs[idx].event = event;
             subs[idx].prefix_len = pl as u16;
             subs[idx].prefix[..pl].copy_from_slice(req.prefix);
-            // Bit 0 rings once now; no listing is pushed — the subscriber
-            // relists with `CHANGES` (empty token) itself.
+            // Bit 0 rings once now. The subscriber reads what the prefix
+            // holds itself, with `CHANGES` from the empty token.
             if ring_now {
                 ring(&mut subs[idx]);
             }

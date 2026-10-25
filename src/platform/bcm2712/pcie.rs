@@ -1,15 +1,22 @@
-//! PCIe enumeration and BAR mapping for BCM2712 (Pi 5) — thin kernel bridge.
+//! PCIe bring-up, enumeration and BAR mapping for BCM2712 (Pi 5).
 //!
-//! The public enumeration path is the `pcie_scan` PIC module, which uses
-//! MMIO_READ32/WRITE32 bridges. This file keeps a built-in fallback
-//! implementation for boot-time flows that run before the module loads,
-//! plus the syscall handler wrappers that delegate to whichever is
-//! available.
+//! The kernel owns the PCIe1 root complex: it resets and trains the link,
+//! programs the outbound window and the bridge, scans bus 1 into a device
+//! table, and serves every config access from it — `PCIE_DEVICE` handles
+//! for drivers, the table-index ops (`PCIE_CFG_READ32`/`WRITE32`,
+//! `PCIE_RESCAN`) for bring-up and the diagnostic `pcie_scan` module. Config
+//! cycles go through the root complex's index/data register pair, so every
+//! access and every rescan holds [`CFG_LOCK`]: two cores interleaving an
+//! index write with another's data access would reach the wrong register.
+//! QEMU virt has no root complex here: its table holds a stand-in RP1 and
+//! answers no config access.
 
 #![allow(
     dead_code,
     reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
 )]
+
+use core::sync::atomic::{AtomicBool, Ordering};
 
 // ============================================================================
 // Constants
@@ -19,63 +26,48 @@
 // PCIe controller addresses (BCM2712, Pi 5)
 // ----------------------------------------------------------------------------
 //
-// Source: mainline Linux `arch/arm64/boot/dts/broadcom/bcm2712.dtsi`
-// (nodes `pcie1` at `pcie@114000` and `pcie2` at `pcie@120000`) plus the
-// Pi 5 bare-metal notes in `docs/guides/pi5-bare-metal.md` (PCIe RC for
-// RP1 at `0x10_0012_0000`).
+// Source: the BCM2712 device tree (`bcm2712.dtsi`; nodes
+// `pcie@1000110000` and `pcie@1000120000`, under the soc's
+// `ranges = <0x0 0x10 0x0 0x80000000>`).
 //
 // There are two usable PCIe controllers on BCM2712:
-//   - PCIe2: the internal x4 link to RP1 (default in this codebase).
-//   - PCIe1: the external x1 slot used by the Pi 5 NVMe HAT+ and friends.
-//     Requires `pciex1` enabled in `config.txt` so VPU trains the link
-//     and programs the outbound window before kernel handoff.
+//   - PCIe2: the internal x4 link to RP1. The firmware brings it up and
+//     leaves RP1's BAR at `BCM2712_PCIE2_MMIO_BASE`; the kernel does not
+//     enumerate it.
+//   - PCIe1: the external x1 connector used by the Pi 5 NVMe HAT+ and other
+//     peripherals. Requires `dtparam=pciex1` in `config.txt`; the firmware
+//     then sets MEM_WIN0_LO before handoff and the kernel does the rest
+//     (`enumerate`).
 //
-// The built-in fallback enumerator uses `ECAM_BASE = 0xFD50_0000` (a
-// legacy routing the VPU still exposes). The PIC `pcie_scan` module
-// uses the `BCM2712_PCIE2_*` values at `0x10_00**_0000`, which is
-// where the Pi 5 SoC maps its PCIe controllers post-handoff.
+// Neither controller has a flat ECAM window: config cycles go through each
+// root complex's registers (below). 0xFD50_0000, the BCM2711's root complex,
+// is not a device on the BCM2712 (`platform::memmap`).
 
-/// BCM2712 PCIe2 (RP1) configuration-space base for the built-in
-/// fallback enumerator.
-#[cfg(feature = "board-pi5")]
-const ECAM_BASE: usize = 0xFD50_0000;
-
-#[cfg(not(feature = "board-pi5"))]
-const ECAM_BASE: usize = 0;
-
-/// BCM2712 PCIe2 (RP1) outbound MMIO window base.
-#[cfg(feature = "board-pi5")]
-const PCIE_MMIO_BASE: usize = 0x1F_0000_0000;
-
+/// QEMU virt: where the stand-in RP1's BAR0 is reported.
 #[cfg(not(feature = "board-pi5"))]
 const PCIE_MMIO_BASE: usize = 0x4000_0000;
 
-/// BCM2712 PCIe2 (RP1, x4) controller base — matches mainline DTS node
-/// `pcie@120000` under the soc `ranges = <0 0x10 0 0x80000000>` mapping,
-/// and matches `PCIE_RC_BASE` in `bcm2712.rs`.
+/// BCM2712 PCIe2 (RP1, x4) controller base — the device tree's
+/// `pcie@1000120000`.
 pub const BCM2712_PCIE2_RC_BASE: u64 = 0x10_0012_0000;
 
-/// BCM2712 PCIe2 outbound MMIO window (RP1 BAR region after VPU
-/// configuration; Linux remaps to `0x1f_0000_0000` post-handoff — the
-/// bare-metal kernel inherits whichever mapping is live at entry).
+/// BCM2712 PCIe2 outbound MMIO window, where the firmware leaves RP1's BAR
+/// for a bare-metal kernel. Linux's own PCIe2 window is at
+/// `0x1F_0000_0000`; this kernel uses the mapping live at entry.
 pub const BCM2712_PCIE2_MMIO_BASE: u64 = 0x1C_0000_0000;
 
-/// BCM2712 PCIe1 (external x1, NVMe HAT+) controller base — mainline DTS
-/// node `pcie@114000`.
+/// BCM2712 PCIe1 (external x1, NVMe HAT+) controller base — the device
+/// tree's `pcie@1000110000`.
 pub const BCM2712_PCIE1_RC_BASE: u64 = 0x10_0011_0000;
 
-/// BCM2712 PCIe1 outbound MMIO window base. Verified on Pi 5 base
-/// board (6.12 rpt kernel, 2026-04-16) via `dmesg | grep 1000110000`:
-///   MEM 0x1b80000000..0x1bffffffff -> 0x0080000000   (mem0, ~2 GB)
+/// BCM2712 PCIe1 outbound MMIO window base. Linux's brcm-pcie driver on a
+/// Pi 5 reports the windows of `pcie@1000110000` as
+///   MEM 0x1b80000000..0x1bffffffff -> 0x0080000000   (mem0, 2 GB)
 ///   MEM 0x1800000000..0x1b7fffffff -> 0x0400000000   (mem1, prefetch)
 ///
-/// Effective range: `0x18_0000_0000..0x1B_FFFF_FFFF` (16 GB).
-/// Must be covered by the MMU as device memory — see `bcm2712.rs`
-/// `init_page_tables()` (L1 entries 96..111).
-///
-/// NOTE: this is NOT `0x1F`. `0x1F_0000_0000` is PCIe2/RP1's Linux
-/// post-enumeration remapped window (see `docs/guides/pi5-bare-metal.md`
-/// section on RP1 BAR remapping).
+/// Effective range: `0x18_0000_0000..0x1B_FFFF_FFFF` (16 GB), mapped Device
+/// by the boot tables (`boot_mmu::DEVICE_APERTURE_GBS`). Not to be confused
+/// with `0x1F_0000_0000`, Linux's PCIe2 window.
 pub const BCM2712_PCIE1_MMIO_BASE: u64 = 0x18_0000_0000;
 
 const MAX_SCAN_DEVS: usize = 32;
@@ -170,33 +162,31 @@ static mut DEVICES: [PcieDevice; MAX_SCAN_DEVS] = [const { PcieDevice::empty() }
 static mut DEVICE_COUNT: usize = 0;
 static mut BAR_MAPS: [BarMap; MAX_BAR_MAPS] = [const { BarMap::empty() }; MAX_BAR_MAPS];
 
-// ============================================================================
-// ECAM config space access
-// ============================================================================
+/// Serialises the root complex's config window — the EXT_CFG index/data
+/// pair, and BAR sizing, which leaves a BAR all-ones until it is restored —
+/// and the device and BAR-map tables a rescan rebuilds. Config accesses,
+/// binds, BAR maps and rescans arrive from whichever core's module asks.
+/// Held only after the MMU is on: an exclusive access before it never
+/// completes (`platform::memmap::build`).
+static CFG_LOCK: AtomicBool = AtomicBool::new(false);
 
-#[cfg(feature = "board-pi5")]
-unsafe fn ecam_read32(bus: u8, dev: u8, func: u8, offset: u16) -> u32 {
-    let addr = ECAM_BASE
-        + ((bus as usize) << 20)
-        + ((dev as usize) << 15)
-        + ((func as usize) << 12)
-        + (offset as usize & 0xFFC);
-    core::ptr::read_volatile(addr as *const u32)
+struct CfgGuard;
+
+impl Drop for CfgGuard {
+    fn drop(&mut self) {
+        CFG_LOCK.store(false, Ordering::Release);
+    }
 }
 
-#[cfg(feature = "board-pi5")]
-unsafe fn ecam_write32(bus: u8, dev: u8, func: u8, offset: u16, val: u32) {
-    let addr = ECAM_BASE
-        + ((bus as usize) << 20)
-        + ((dev as usize) << 15)
-        + ((func as usize) << 12)
-        + (offset as usize & 0xFFC);
-    core::ptr::write_volatile(addr as *mut u32, val);
+fn lock_cfg() -> CfgGuard {
+    while CFG_LOCK
+        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        core::hint::spin_loop();
+    }
+    CfgGuard
 }
-
-// ============================================================================
-// Enumerate
-// ============================================================================
 
 // ============================================================================
 // Broadcom 2712 PCIe1 bring-up — indirect config access + outbound window
@@ -204,17 +194,16 @@ unsafe fn ecam_write32(bus: u8, dev: u8, func: u8, offset: u16, val: u32) {
 //
 // BCM2712's PCIe root complex does NOT expose a flat ECAM. Config cycles for
 // bus > 0 go through an INDEX/DATA pair in the RC register space (offsets
-// 0x9000 / 0x8000, per Linux `drivers/pci/controller/pcie-brcmstb.c` and
-// verified against the running rig under Linux, 2026-04-16).
+// 0x9000 / 0x8000, per Linux `drivers/pci/controller/pcie-brcmstb.c`).
 //
 // Bus 0 config (the RC root bridge itself) is accessible directly at the RC
 // base. For bus 1+, write `(bus << 20) | (devfn << 12)` to EXT_CFG_INDEX,
 // then read/write at EXT_CFG_DATA + (reg & 0xFFC).
 //
-// VPU (with `dtparam=pciex1` in config.txt) trains the link and sets
-// MEM_WIN0_LO, but leaves the other outbound-window registers at 0. Our
-// kernel finishes the job so CPU reads in the outbound range reach the
-// downstream device BARs.
+// The firmware (with `dtparam=pciex1` in config.txt) sets MEM_WIN0_LO but
+// leaves the other outbound-window registers at 0; the kernel programs the
+// whole window so CPU reads in the outbound range reach the downstream
+// device BARs.
 
 // ----------------------------------------------------------------------------
 // BCM2712 reset-controller addresses (bare-metal CPU-visible).
@@ -290,7 +279,7 @@ mod brcm {
     pub const PCIE1_OUTBOUND_CPU_LIMIT: u64 = 0x1B_FFFF_FFFF;
     pub const PCIE1_OUTBOUND_PCI_BASE: u64 = 0x0000_0000_8000_0000;
 
-    // Stage-4 (brcm_pcie_setup / post_setup / start_link) registers.
+    // Link bring-up registers (brcm_pcie_setup / post_setup / start_link).
     pub const HARD_DEBUG: u64 = 0x4304;
     pub const HARD_DEBUG_SERDES_IDDQ: u32 = 1 << 21;
     pub const HARD_DEBUG_CLKREQ_MASK: u32 = (1 << 1) | (1 << 16) | (1 << 20) | (1 << 21);
@@ -360,9 +349,10 @@ mod brcm {
     pub const HW_REV_33: u32 = 0x0303;
 }
 
-/// Post-probe target values captured on the rig under Linux
-/// (nvme_trace/baseline/pcie1_rc_post_probe.txt). Stage-4 writes
-/// these verbatim so the Fluxor state converges on `brcm_pcie_probe`.
+/// The PCIe1 root complex's register values after Linux's
+/// `brcm_pcie_probe` on a Pi 5, read back from the running controller.
+/// Bring-up writes them verbatim so the controller ends in the state Linux
+/// leaves it in.
 #[cfg(feature = "board-pi5")]
 mod post_probe {
     pub const MISC_CTRL: u32 = 0x00263480;
@@ -785,18 +775,20 @@ unsafe fn pcie1_populate_devices() {
     pcie1_enumerate_bus1();
 }
 
+/// Bring PCIe1 up (the first call) or re-scan bus 1 (every later one),
+/// and return the device count. Called at boot and by `PCIE_RESCAN`.
 #[cfg(feature = "board-pi5")]
 pub fn enumerate() -> usize {
+    let _cfg = lock_cfg();
     // SAFETY: PCIe RC + outbound aperture MMIO accesses target fixed
     // BCM2712 register addresses mapped by boot_mmu::init_page_tables.
-    // PCIE1_BRINGUP_DONE / DEVICE_COUNT are scheduler-thread-only globals
-    // mutated from boot and the NVMe fault-retry loop, never re-entrant.
+    // PCIE1_BRINGUP_DONE, DEVICES and DEVICE_COUNT are written only here,
+    // under CFG_LOCK.
     unsafe {
-        // On a rescan after link finally came up, skip the one-shot
-        // bring-up and just re-enumerate. enumerate() is called at boot
-        // and from the nvme module's fault-retry loop; re-running
-        // reset/MDIO/PERST# after the link is live would put the
-        // controller back into training.
+        // Once bring-up has run, a rescan only re-enumerates. It runs at
+        // boot and again from `PCIE_RESCAN` (the nvme module's fault-retry
+        // loop, `pcie_scan`); re-running reset/MDIO/PERST# after the link
+        // is live would put the controller back into training.
         if PCIE1_BRINGUP_DONE {
             pcie1_populate_devices();
             return DEVICE_COUNT;
@@ -804,14 +796,15 @@ pub fn enumerate() -> usize {
 
         DEVICE_COUNT = 0;
 
-        // Stage 1: clock + reset — makes PCIe1 RC registers safe to touch.
+        // Bridge reset and RESCAL calibration: until both, the PCIe1 RC
+        // registers do not decode.
         let rescal_ok = pcie1_pre_init();
         if !rescal_ok {
             log::warn!("[pcie] RESCAL calibration timed out; aborting PCIe1");
             return 0;
         }
 
-        // Stage 2a: MISC_CTRL first (enables SCB_ACCESS_EN required by
+        // MISC_CTRL first (enables SCB_ACCESS_EN required by
         // the UBUS path we program later). Linux does this right after
         // bridge reset + rescal.
         let rc = BCM2712_PCIE1_RC_BASE;
@@ -824,7 +817,7 @@ pub fn enumerate() -> usize {
 
         // Inbound setup — match Linux brcm_pcie_setup ordering for
         // BCM2712, writing after MISC_CTRL and before MDIO / PERST#.
-        // Values from nvme_trace/baseline/pcie1_rc_post_probe_v3.txt.
+        // Values as `post_probe`.
         //
         // Writing UBUS_CTRL / UBUS_TIMEOUT / AXI_INTF_CTRL /
         // AXI_READ_ERR_DATA after the link has trained (e.g. on a
@@ -863,7 +856,7 @@ pub fn enumerate() -> usize {
         rc_w32(rc, brcm::UBUS_BAR2_REMAP_LO, post_probe::UBUS_BAR2_REMAP_LO);
         rc_w32(rc, brcm::UBUS_BAR2_REMAP_HI, post_probe::UBUS_BAR2_REMAP_HI);
 
-        // Stage 2b: MDIO tuning (brcm_pcie_post_setup_bcm2712).
+        // MDIO tuning (brcm_pcie_post_setup_bcm2712).
         // First set the MDIO base address to 0x1600, then write 7
         // registers. Each write is a short indirect bus op through
         // the RC's internal MDIO controller.
@@ -891,7 +884,7 @@ pub fn enumerate() -> usize {
         phy15 = (phy15 & !0xFF) | 0x12;
         rc_w32(rc, brcm::PL_PHY_CTL_15, phy15);
 
-        // Stage 2c: brcm_pcie_start_link — SerDes up, CLKREQ mask
+        // brcm_pcie_start_link — SerDes up, CLKREQ mask
         // clear, then PERST# deassert.
         let mut hd = rc_r32(rc, brcm::HARD_DEBUG);
         hd &= !brcm::HARD_DEBUG_SERDES_IDDQ;
@@ -918,10 +911,11 @@ pub fn enumerate() -> usize {
     }
 }
 
+/// QEMU virt: publish the stand-in RP1 and return the device count.
 #[cfg(not(feature = "board-pi5"))]
 pub fn enumerate() -> usize {
-    // SAFETY: QEMU virt enumeration runs once at boot; DEVICES /
-    // DEVICE_COUNT statics have no concurrent reader yet.
+    let _cfg = lock_cfg();
+    // SAFETY: DEVICES / DEVICE_COUNT are written only here, under CFG_LOCK.
     unsafe {
         DEVICE_COUNT = 0;
         let mut rp1 = PcieDevice::empty();
@@ -978,9 +972,10 @@ pub fn device_count() -> usize {
 /// PCIe controller returns for a missing responder).
 #[cfg(feature = "board-pi5")]
 pub fn device_cfg_read32(dev_idx: usize, offset: u16) -> u32 {
+    let _cfg = lock_cfg();
     // SAFETY: DEVICE_COUNT bounds the `DEVICES` slot we read; `dev_idx`
     // bounds-checked. `cfg_r32` does MMIO at the RC config aperture
-    // mapped by boot_mmu::init_page_tables.
+    // mapped by boot_mmu::init_page_tables, under CFG_LOCK.
     unsafe {
         let count = *core::ptr::addr_of!(DEVICE_COUNT);
         if dev_idx >= count {
@@ -1002,8 +997,10 @@ pub fn device_cfg_read32(_dev_idx: usize, _offset: u16) -> u32 {
 /// `dev_idx`.
 #[cfg(feature = "board-pi5")]
 pub fn device_cfg_write32(dev_idx: usize, offset: u16, val: u32) -> i32 {
+    let _cfg = lock_cfg();
     // SAFETY: DEVICE_COUNT bounds the `DEVICES` slot we read; `dev_idx`
-    // bounds-checked. `cfg_w32` does MMIO at the RC config aperture.
+    // bounds-checked. `cfg_w32` does MMIO at the RC config aperture, under
+    // CFG_LOCK.
     unsafe {
         let count = *core::ptr::addr_of!(DEVICE_COUNT);
         if dev_idx >= count {
@@ -1068,8 +1065,9 @@ pub unsafe fn syscall_cfg_write32(arg: *mut u8, arg_len: usize) -> i32 {
 // ============================================================================
 
 pub fn bar_map(dev_idx: usize, bar_idx: usize) -> usize {
-    // SAFETY: bar_map runs on the scheduler thread; DEVICES/BAR_MAPS
-    // are set during enumeration and mutated only here.
+    let _cfg = lock_cfg();
+    // SAFETY: DEVICES is written only by `enumerate` and BAR_MAPS only here
+    // and in `bar_unmap`, all under CFG_LOCK.
     unsafe {
         // Use addr_of! so the log macro doesn't expand into an
         // &static-mut reference (Rust 2024 static_mut_refs).
@@ -1118,7 +1116,8 @@ pub fn bar_map(dev_idx: usize, bar_idx: usize) -> usize {
 }
 
 pub fn bar_unmap(virt_addr: usize) -> i32 {
-    // SAFETY: scheduler-thread mutation of BAR_MAPS.
+    let _cfg = lock_cfg();
+    // SAFETY: BAR_MAPS is written only here and in `bar_map`, under CFG_LOCK.
     unsafe {
         let bar_maps_p = &raw mut BAR_MAPS;
         for m in (*bar_maps_p).iter_mut() {
@@ -1244,6 +1243,8 @@ pub unsafe fn bind_selector(sel: &[u8]) -> i32 {
     if s.is_empty() {
         return crate::kernel::sys::errno::EINVAL;
     }
+    // The table a rescan rebuilds.
+    let _cfg = lock_cfg();
 
     // "@class=<name>" — PCI-class match, must resolve uniquely.
     if let Some(rest) = s.strip_prefix("@class=") {
@@ -1676,7 +1677,7 @@ pub unsafe fn pcie1_msi_init() -> bool {
 /// # Safety
 /// `event_handle` must reference a kernel event handle that outlives
 /// the allocated MSI vector (released only on reboot — there is no
-/// per-vector free path today). Mutates `PCIE1_MSI_VECTORS_TAB`;
+/// per-vector free path). Mutates `PCIE1_MSI_VECTORS_TAB`;
 /// caller must serialize with other allocators on the same root.
 #[cfg(feature = "board-pi5")]
 pub unsafe fn pcie1_msi_alloc_vector(event_handle: i32) -> Option<(u8, u64, u32)> {

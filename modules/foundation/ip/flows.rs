@@ -15,9 +15,10 @@
 //! (the node's included) is guaranteed `dg_flow_floor` entries, and
 //! construction requires `max_dg_flows ≥ (lanes + 1) × floor`, so a lane
 //! under its floor always finds room; past it a lane draws on the shared
-//! part, and when that is spent the send is refused `ENOBUFS`. An
-//! inbound-only flow nobody answered is given up first; an egress flow is
-//! never evicted while it is live.
+//! part, and when that is spent the send is refused `ENOBUFS`. Before a
+//! refusal, expired flows are reclaimed and then an inbound-only flow of
+//! the lane nobody answered is given up; an egress flow is never evicted
+//! while it is live.
 //!
 //! **Index.** One open-addressed hash (`index.rs`) over two keys per flow:
 //! the address the endpoint sent to (the service address, for a translated
@@ -265,17 +266,21 @@ pub(crate) unsafe fn make(s: &mut IpState, mut f: DgFlow) -> Result<usize, i8> {
     if s.flows.is_null() {
         return Err(-105);
     }
-    if !may_take(s, f.lane) && !evict_inbound(s, f.lane) {
-        s.flow_refused = s.flow_refused.wrapping_add(1);
-        return Err(-105); // ENOBUFS
+    if !may_take(s, f.lane) {
+        // Expired flows the sweep has not reached yet still count against
+        // their lanes: reclaim them before refusing anyone.
+        sweep(s, s.max_dg_flows as usize);
+        if !may_take(s, f.lane) && !evict_inbound(s, f.lane) {
+            s.flow_refused = s.flow_refused.wrapping_add(1);
+            return Err(-105); // ENOBUFS
+        }
     }
     if s.flow_free_top == 0 {
-        // Only expired entries are left: reclaim one, as the sweep would.
-        sweep(s, s.max_dg_flows as usize);
-        if s.flow_free_top == 0 {
-            s.flow_refused = s.flow_refused.wrapping_add(1);
-            return Err(-105);
-        }
+        // Unreachable while the lane accounting holds: every live flow is
+        // counted against its lane, and `may_take` keeps the count below
+        // the table.
+        s.flow_refused = s.flow_refused.wrapping_add(1);
+        return Err(-105);
     }
     s.flow_free_top -= 1;
     let i = *s.flow_free.add(s.flow_free_top as usize) as usize;

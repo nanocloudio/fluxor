@@ -308,6 +308,7 @@ struct PioState {
     streams: [StreamSlot; MAX_STREAM_SLOTS],
     cmds: [CmdSlot; MAX_CMD_SLOTS],
     rxs: [RxSlot; MAX_RX_SLOTS],
+    ready_reported: u8,
 }
 
 // ============================================================================
@@ -1979,6 +1980,13 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
 
     // CMD slots are polled by their owners (`CMD_POLL`), not here.
 
+    // Ready on the first step: nothing is brought up before a consumer's
+    // first open, and the scheduler holds this provider's consumers until
+    // it reports Ready.
+    if s.ready_reported == 0 {
+        s.ready_reported = 1;
+        return 3;
+    }
     if has_work {
         2
     } else {

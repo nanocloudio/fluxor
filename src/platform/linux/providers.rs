@@ -588,7 +588,7 @@ pub fn slot_fence(handle: i32) -> Option<Fence> {
 /// reserved for the trailing NUL so libc's path-arg primitives
 /// can be called directly. Callers passing a longer path get
 /// `E2BIG` rather than a silently truncated open.
-const LINUX_FS_PATH_MAX: usize = 255;
+pub(crate) const LINUX_FS_PATH_MAX: usize = 255;
 
 /// Decode the two-path argument `LINK`, `RENAME` and friends share:
 /// `[a_len: u16 LE][a][b_len: u16 LE][b]`, validating both as filesystem

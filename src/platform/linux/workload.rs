@@ -433,7 +433,9 @@ unsafe fn workload_create_as(
     // A segment ≥ 1 is a `net.route` segment: it must exist (ENOENT), hold
     // the address and not as its gateway (EINVAL), and this backend must
     // attach workloads to segments (ENOSYS otherwise) — never run on segment
-    // 0 as if it were the requested one.
+    // 0 as if it were the requested one. The attachment itself checks again,
+    // under the flag a SEGMENTS replace holds (`net_route::attach`), so a
+    // segment removed or changed since fails the CREATE, rolled back whole.
     let attach = if net_segment != 0 {
         let attaches =
             (super::net_route::caps() & crate::abi::contracts::net::route::caps::SEGMENTS) != 0;

@@ -193,8 +193,8 @@ the figure to write.
 ### Per-demand cap: `[capacities] heap_per_demand`
 
 A provider that serves a kernel pool's demand from its own heap — a module
-`storage.namespace` provider holding the graph's store subscriptions — is
-sized at pack time, when heap caps are fixed, from the pool's plan:
+`storage.namespace` provider holding the graph's store subscriptions — has its
+cap sized by the composer from the pool's plan:
 
 ```toml
 [capacities]
@@ -205,9 +205,9 @@ heap_per_demand = { pool = "store_subs", bytes_each = 96 }
 
 | Field | Meaning |
 |---|---|
-| `pool` | a kernel pool whose ceiling is declared demand plus reserve: not an arena, and not one the graph's shape derives (`module_slots`, `channels`, `owners`, `sandboxes`, `state_free_list`) |
+| `pool` | a kernel pool whose ceiling is declared demand plus reserve: not an arena, and not one the graph's shape derives (`config_arena`, `module_slots`, `channels`, `owners`, `sandboxes`, `state_free_list`) |
 | `bytes_each` | heap bytes per unit of the pool, per ABI like any capacity |
-| `base` | the type's default cap, only without a `heap_from_params` rule (whose `base` it otherwise is); `pack` holds it to the declared arena as it does that rule's |
+| `base` | the type's default cap, stated only by a type without a `heap_from_params` rule (whose `base` it otherwise is); `pack` holds it to the declared arena as it does that rule's |
 
 Every instance of the type gets `bytes_each` × the pool's **full planned
 ceiling**: what the graph's instances declare for it (base graph and resident
@@ -220,11 +220,15 @@ derived figure is refused at compose, naming both — the pool is planned to a
 ceiling that instance could not serve. The composer prints the per-demand
 bytes beside the total of the heap caps it set (`Heap per demand: …`).
 
-Counting the demand needs every instance's params packed, so a graph with a
-`heap_per_demand` instance is packed once quietly to count it, then again
-under the plan. On an elastic heap the extra cap costs about `cap >> 7` at
-the first allocation and grows with use; a committed-heap profile pays it
-whole, once per instance that may provide.
+The ceiling follows from the graph's declared demand, which is counted from
+every instance's packed params, so the graph is packed once with a
+placeholder cap on each such instance — its type's figure without the
+per-demand bytes — and the planned cap is written over it once the demand is
+counted. A workload image (`--emit=workload`) is planned the same way, from
+its own workload's demand and its target's reserve. On an elastic heap the
+larger cap costs nothing until it is used: the first segment is `cap >> 7`
+(at least the 64 KiB quantum) and the heap grows with use. A committed-heap
+profile carves the whole cap, for every instance of the type.
 
 ### Declared demand per instance: `[capacities] demand_from_params`
 
@@ -238,17 +242,36 @@ instances watch what their params name, so the type can count it instead:
 ```toml
 [capacities]
 demand_from_params = { pool = "store_subs", tags = [2, 5], split = "," }
+# one rule per pool, as an array:
+# demand_from_params = [{ pool = "store_subs", tags = [5] }, { pool = "events", tags = [5] }]
 ```
 
-For each instance the composer joins each tag's TLV value (a chunked param's
-chunks are one value), splits it on `split` (default `,`) and counts the
-non-blank entries; the sum is the instance's demand on `pool`, in place of the
-type's constant. A graph's own figure for an instance —
-`demand: { store_subs: 12 }` on its module entry — wins over both. Resident
-workloads are counted like base modules. When the base graph has an unkeyed
-module provider of `storage.namespace`, the `store_subs` demand is left off
-the host table (its consumers call the module) and carried by that
+For each instance the composer reads each tag by its param's type. A string
+param's TLV value (a chunked param's chunks are one value) is split on
+`split` (default `,`) and its non-blank entries counted; an integer param
+(`u8`, `u16`, `u32`) counts its value, its schema default when the graph
+leaves it unset. The sum is the instance's demand on `pool`. The rule takes
+the place of the type's constant for that pool, so a manifest states one or
+the other, never both (a variant's `[variant.capacities]` included), and one
+rule per pool. Each tag must name a string or integer param of the module's
+own `define_params!` schema, and every `heap_from_params` tag a param of it:
+`pack` refuses a rule that names anything else, which would count nothing.
+
+A graph's own figure for an instance — `demand: { store_subs: 12 }` on its
+module entry — wins over both. Resident workloads are counted like base
+modules. When the base graph has an unkeyed module provider of
+`storage.namespace` (no `volume` selector), the `store_subs` demand is left
+off the host table (its consumers call the module) and carried by that
 provider's `heap_per_demand` figure instead, so it is spent once.
+
+A fault restart (`fault_policy: restart`) releases a module's kernel events
+and moves its slot generation, and a store drops a subscription whose
+subscriber no longer stands, so a store subscriber cannot resume on its old
+state. A manifest whose `store_subscriptions` or `store_subscribers`
+constant is not zero — every instance subscribes — cannot also attest
+`resume_after_fault`. A type that counts the demand with a rule may attest,
+and the composer refuses `fault_policy: restart` to each instance whose
+`store_subs` or `events` figure, counted or its own `demand:`, is not zero.
 
 ## Syscall API
 

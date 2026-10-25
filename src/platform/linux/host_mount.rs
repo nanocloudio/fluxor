@@ -49,11 +49,22 @@
 //! (a block device's filesystem, `nodev`, `nosuid`). The id is read again
 //! and the unmount names the leaf through the held parent
 //! (`/proc/self/fd/<parent>/<leaf>`, `UMOUNT_NOFOLLOW`), so no directory
-//! above it can be swapped. The kernel has no unmount by descriptor or id:
-//! a party able to rename entries inside the parent directory between the
-//! second read and the call could still put another mount of the same
-//! kind there, which is why the root must not be writable by untrusted
-//! users.
+//! above it can be swapped. A volume's unmount is strict — a volume still in
+//! use answers `EBUSY` — and a strict unmount cannot name a mount by a
+//! descriptor of it (the descriptor itself keeps it busy): a party able to
+//! rename entries inside the parent directory between the second read and
+//! the call could still put another mount of the same kind there, so the
+//! directory a volume is mounted in must not be one a workload can write.
+//! A projection's memory filesystem is removed with its tree, so it is
+//! detached instead, through a descriptor of the mount itself
+//! (`/proc/self/fd/<mount>`, `MNT_DETACH`): that names exactly the mount the
+//! descriptor holds, whatever is renamed around it.
+//!
+//! A mount is told a volume or a projection by what the runtime's own mount
+//! table says of it. A workload in its own mount namespace never changes
+//! that table; a workload sharing the runtime's (a shared posture) that was
+//! granted `CAP_SYS_ADMIN` can mount anything there itself, so this
+//! provider's identification is no boundary against it.
 //!
 //! # Projections, removal, group ownership and directory modes
 //!
@@ -83,10 +94,11 @@
 //! is read first as well, since a bind mount from the same filesystem shares
 //! its device number: `REMOVE_TREE` refuses (`EBUSY`) any mount inside that
 //! a projection did not make, before removing anything, and `GROUP_TREE`
-//! leaves every inner mount alone. `REMOVE_TREE` then unmounts each
-//! projection mount as `UMOUNT` unmounts a volume: reached from the held
-//! parent through no symlink, identified by its mount id, and removed only
-//! while that id is a projection's memory filesystem at exactly that path.
+//! leaves every inner mount alone. `REMOVE_TREE` then detaches each
+//! projection mount: reached from the held parent through no symlink,
+//! opened, identified by the mount id of that descriptor, and detached
+//! through it only while that id is a projection's memory filesystem at
+//! exactly that path.
 
 use crate::abi::platform::linux::host_mount as hm;
 use crate::kernel::sys::errno;
@@ -734,21 +746,17 @@ pub fn mount_with_id(info: &str, id: u64) -> Option<MountRow> {
     })
 }
 
-/// Unmount the mount at `leaf` in the held directory `parent`, whose path is
-/// `target`, if `accept` says it is one this provider may remove. What is
-/// mounted there is identified, not looked up: its mount id is read through
-/// `parent` (`statx`, no symlink followed); the mount with that id must sit
-/// at exactly `target` and pass `accept`, else `EBUSY`; the id is read
-/// again; and the unmount names the leaf through the held parent
-/// (`/proc/self/fd/<parent>/<leaf>`, `UMOUNT_NOFOLLOW`). `Ok(true)` when it
-/// unmounted, `Ok(false)` when nothing is mounted there; `EINVAL` for a
-/// symlink leaf, `ENOTDIR` for one that is no directory.
-fn umount_verified(
-    parent: &OwnedFd,
-    leaf: &CString,
-    target: &Path,
-    accept: fn(&MountRow) -> bool,
-) -> Result<bool, i32> {
+/// Unmount the volume at `leaf` in the held directory `parent`, whose path
+/// is `target`, strictly (a volume in use is `EBUSY`). What is mounted there
+/// is identified, not looked up: its mount id is read through `parent`
+/// (`statx`, no symlink followed); the mount with that id must sit at
+/// exactly `target` and be one `MOUNT` makes ([`MountRow::is_volume`]),
+/// else `EBUSY`; the id is read again; and the unmount names the leaf
+/// through the held parent (`/proc/self/fd/<parent>/<leaf>`,
+/// `UMOUNT_NOFOLLOW`). `Ok(true)` when it unmounted, `Ok(false)` when
+/// nothing is mounted there; `EINVAL` for a symlink leaf, `ENOTDIR` for one
+/// that is no directory.
+fn umount_volume(parent: &OwnedFd, leaf: &CString, target: &Path) -> Result<bool, i32> {
     let mounted = || -> Result<Option<u64>, i32> {
         let Some(at) = statx_at(parent, Some(leaf))? else {
             return Ok(None);
@@ -766,7 +774,7 @@ fn umount_verified(
     };
     let info = std::fs::read_to_string("/proc/self/mountinfo").map_err(|e| os_errno(&e))?;
     match mount_with_id(&info, id) {
-        Some(row) if row.path == target && accept(&row) => {}
+        Some(row) if row.path == target && row.is_volume() => {}
         Some(_) => return Err(-libc::EBUSY),
         None => return Ok(false),
     }
@@ -788,13 +796,68 @@ fn umount_verified(
     Ok(true)
 }
 
+/// Detach the projection mounted at `leaf` in the held directory `parent`,
+/// whose path is `target`. The leaf is opened from `parent` through no
+/// symlink (the descriptor holds the topmost mount there); its mount id —
+/// that descriptor's, `statx` — must be another than the parent's (else
+/// nothing is mounted: `Ok(false)`) and name a projection's memory
+/// filesystem at exactly `target` ([`MountRow::is_projection`], else
+/// `EBUSY`); and the mount is detached through the descriptor itself
+/// (`/proc/self/fd/<fd>`, `MNT_DETACH`), which names exactly the mount it
+/// holds, so nothing renamed in the meantime is ever unmounted in its place.
+/// `Ok(true)` when it detached; `EINVAL` for a symlink leaf.
+fn detach_projection(parent: &OwnedFd, leaf: &CString, target: &Path) -> Result<bool, i32> {
+    // SAFETY: open_how is plain integers; all-zero is its empty value.
+    let mut how: libc::open_how = unsafe { core::mem::zeroed() };
+    how.flags = (libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) as u64;
+    how.resolve = libc::RESOLVE_BENEATH | libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_NO_MAGICLINKS;
+    // SAFETY: `how` is a live open_how of the size passed; `leaf` is
+    // NUL-terminated; `parent` is open.
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            parent.as_raw_fd(),
+            leaf.as_ptr(),
+            &how as *const libc::open_how,
+            core::mem::size_of::<libc::open_how>(),
+        )
+    };
+    if fd < 0 {
+        return match last_errno() {
+            e if e == -libc::ENOENT => Ok(false),
+            e if e == -libc::ELOOP => Err(errno::EINVAL),
+            e => Err(e),
+        };
+    }
+    // SAFETY: a descriptor just returned by openat2, owned by nobody else.
+    let mount = unsafe { OwnedFd::from_raw_fd(fd as i32) };
+    let id = statx_at(&mount, None)?.ok_or(-libc::ENOENT)?.stx_mnt_id;
+    if id == statx_at(parent, None)?.ok_or(-libc::ENOENT)?.stx_mnt_id {
+        return Ok(false);
+    }
+    let info = std::fs::read_to_string("/proc/self/mountinfo").map_err(|e| os_errno(&e))?;
+    match mount_with_id(&info, id) {
+        Some(row) if row.path == target && row.is_projection() => {}
+        Some(_) => return Err(-libc::EBUSY),
+        None => return Ok(false),
+    }
+    let at =
+        CString::new(format!("/proc/self/fd/{}", mount.as_raw_fd())).map_err(|_| errno::EINVAL)?;
+    // SAFETY: a NUL-terminated string owned here; the magic link is followed
+    // to the mount `mount` holds.
+    if unsafe { libc::umount2(at.as_ptr(), libc::MNT_DETACH) } != 0 {
+        return Err(last_errno());
+    }
+    Ok(true)
+}
+
 /// Check an `UMOUNT` request; `Ok` is the unmount itself. Nothing mounted
 /// there (or no such directory) is the answer 0.
 ///
 /// The target is never looked up by its path from the root: its parent is
 /// walked and held (the parent, not the target: a descriptor on the mounted
 /// filesystem would itself make the unmount `EBUSY`), and the mount is
-/// removed by [`umount_verified`] only when it is one `MOUNT` makes (a block
+/// removed by [`umount_volume`] only when it is one `MOUNT` makes (a block
 /// device's filesystem, `nodev`, `nosuid`).
 fn check_umount(arg: &[u8]) -> Result<Work, i32> {
     let mut rel = components(&resolve(arg)?);
@@ -813,7 +876,7 @@ fn check_umount(arg: &[u8]) -> Result<Work, i32> {
         let Some(_claim) = TargetClaim::take(&target) else {
             return -libc::EBUSY;
         };
-        match umount_verified(&parent, &leaf, &target, MountRow::is_volume) {
+        match umount_volume(&parent, &leaf, &target) {
             Ok(true) => 1,
             Ok(false) => 0,
             Err(e) => e,
@@ -1597,14 +1660,14 @@ fn remove_tree(rel: &[std::ffi::OsString], leaf: &CString) -> Result<(), i32> {
         return Err(-libc::EBUSY);
     }
     // Deepest first, the later of two stacked mounts first. Each is reached
-    // from the held parent through no symlink and removed by its id, as
-    // UMOUNT removes a volume, and only while it is a projection's.
+    // from the held parent through no symlink and detached through a
+    // descriptor of it, only while it is a projection's.
     mounts.reverse();
     mounts.sort_by_key(|m| core::cmp::Reverse(m.path.components().count()));
     for m in &mounts {
         let inside = components(m.path.strip_prefix(&target).map_err(|_| errno::EINVAL)?);
         let Some((last, between)) = inside.split_last() else {
-            umount_verified(&parent, leaf, &m.path, MountRow::is_projection)?;
+            detach_projection(&parent, leaf, &m.path)?;
             continue;
         };
         let Some(mut dir) = open_dir_at(parent.as_raw_fd(), leaf)? else {
@@ -1623,7 +1686,7 @@ fn remove_tree(rel: &[std::ffi::OsString], leaf: &CString) -> Result<(), i32> {
         }
         if !gone {
             let name = CString::new(last.as_bytes()).map_err(|_| errno::EINVAL)?;
-            umount_verified(&dir, &name, &m.path, MountRow::is_projection)?;
+            detach_projection(&dir, &name, &m.path)?;
         }
     }
     let dir = match open_dir_at(parent.as_raw_fd(), leaf)? {

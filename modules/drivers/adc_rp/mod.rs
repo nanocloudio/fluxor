@@ -70,7 +70,8 @@ struct AdcState {
     transfers: [AdcTransfer; MAX_HANDLES],
     initialized: u8,
     next_handle: u8,
-    _pad: [u8; 2],
+    ready_reported: u8,
+    _pad: [u8; 1],
     step_count: u32,
 }
 
@@ -287,9 +288,16 @@ pub extern "C" fn module_provides_contract() -> u32 {
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_step"]
 pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
-    // ADC conversions complete in ~2μs — polling in dispatch is sufficient.
-    // No work needed in step.
-    let _ = state;
+    // ADC conversions complete in ~2μs, so dispatch polls them and the step
+    // has no work of its own.
+    let s = &mut *(state as *mut AdcState);
+    // Ready on the first step: nothing is brought up before a consumer's
+    // first open, and the scheduler holds this provider's consumers until
+    // it reports Ready.
+    if s.ready_reported == 0 {
+        s.ready_reported = 1;
+        return 3;
+    }
     0
 }
 

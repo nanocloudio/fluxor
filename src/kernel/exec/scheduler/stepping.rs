@@ -514,6 +514,7 @@ pub fn step_modules(modules: &mut [ModuleSlot], count: usize) -> StepResult {
             not_ready.set(i);
         }
     }
+    super::domain_budget::readiness_starvation_sweep(sched, modules, count, &not_ready);
 
     // Reset the per-pass budget accumulator for **every** domain
     // before this pass starts. `step_one_module` charges elapsed

@@ -163,7 +163,9 @@ filter, only when its source says so, and never at the hardened posture.
 A workload handle acts for the owner whose module created it: every op on
 it, and `LOOKUP` and `DESTROY` by identity, answer another owner's caller
 `EACCES`, while a caller acting with the node's authority acts on every
-workload. A workload is a
+workload. A `CREATE` staged across calls is the owner's that began it in
+the same way: another owner can neither continue, find nor abandon it, and
+the workload it ends in is that owner's whoever finishes it. A workload is a
 tenant of the node: both backends refuse the null identity (`EINVAL`),
 since everything keyed on an owner's identity would see every such
 workload as one. The graph backend refuses a subgraph any of whose modules
@@ -236,8 +238,9 @@ source must be a block device, every mount point lies under the root, every
 mount is `nodev,nosuid`, no symlink under the root is followed — and answers
 with the kernel's errno. An unmount identifies the mount it removes by its
 id, read through the held parent directory, and removes only a mount the
-class itself makes at exactly that directory; removing a tree unmounts the
-projections inside it the same way. Mount and unmount run off the
+class itself makes at exactly that directory; removing a tree detaches the
+projections inside it through a descriptor of each mount, so a rename in
+the meantime never puts another mount in its place. Mount and unmount run off the
 scheduler thread and
 answer `EAGAIN` until a repeat of the same request finds the result; each
 caller holds a bounded number of jobs, uncollected results expire, and both
@@ -320,7 +323,7 @@ sub-surface they need via the manifest `permissions = [...]` list.
 |------------|---------|----------------|
 | `reconfigure` | Graph slot commit, boot counter, FMP routing | `reconfigure` |
 | `flash_raw` | Flash ERASE, PROGRAM (bounded to declared sectors) | `flash_rp`, `graph_slot` |
-| `backing_provider` | Paged-arena / backing-store registration, SMMU map | `flash_rp`, `nvme` |
+| `backing_provider` | Paged-arena / backing-store registration | `flash_rp`, `nvme` |
 | `platform_raw` | MMIO, NIC ring create, raw peripheral register bridges, workload spawn | `pwm_rp`, `nvme`, `e810`, `rp1_gem` |
 | `monitor` | Fault monitor BIND / WAIT / ACK / REPORT / RAISE, step histograms | `reconfigure`, `monitor` |
 | `bridge` | Cross-domain / cross-core dispatch | kernel-internal |
@@ -334,6 +337,14 @@ maps each privileged opcode to exactly one permission via
 `privileged_op_permission` and enforces per-category access. A module
 that declares only `flash_raw` cannot reach `platform_raw` opcodes —
 over-privilege is structurally prevented.
+
+A permission says which opcodes a module may call; for the raw address
+opcodes the kernel bounds the address as well. On bcm2712 a register access
+(`MMIO_READ32` / `MMIO_WRITE32`) reaches only an aligned word inside one of
+the board's device apertures, never DRAM or an empty hole, and cache
+maintenance by address (`CACHE_FLUSH_RANGE`, `DMA_FLUSH`, `DMA_INVALIDATE`)
+only a range inside the DMA arenas the allocators hand out. Anything else is
+refused `EFAULT`, and the first refusal is logged.
 
 **New modules should not land opcodes here.** If a new surface is
 genuinely needed, it goes into `kernel_abi` (as a primitive every
@@ -876,14 +887,21 @@ owning logic plus fluxor host built-ins for host facts.
 The primitive confines every process of a workload by itself
 (`src/platform/linux/confine.rs`): `no_new_privs`, the capability
 bounding set cut to the OCI default capabilities plus the source's
-additions, the sets for the uid it runs as, and the OCI default seccomp
-allowlist (aarch64), installed last before exec. An intermediate process
-bound to the runtime with `PR_SET_PDEATHSIG` stands between the runtime and
-each workload's init and relays its status exactly; a runtime that dies
-takes every workload with it, and a shared workload's intermediate, a child
-subreaper, also ends every process the workload started. An EXEC or terminal
-session of an isolated workload runs inside its pid namespace. An isolated workload with a rootfs gets a `nodev` root and
-volumes and a minimal `/dev` of its own (the OCI default devices bound
-from the host, a new devpts instance, a sized `/dev/shm`). The hardened
-posture is that confinement whole, in an isolated workload.
+additions, the sets for the uid it runs as, and a seccomp allowlist
+modelled on the Docker default profile (aarch64 only), installed last
+before exec. An intermediate process bound to the runtime with
+`PR_SET_PDEATHSIG` stands between the runtime and each workload's init,
+relays its status exactly and delivers SIGNAL and DESTROY to the init's
+process group — it alone reaps the init, so a signal never reaches a
+process that took the init's pid; a runtime that dies takes every workload
+with it, and a shared workload's intermediate, a child subreaper, also ends
+every process the workload started. An EXEC or terminal session of an
+isolated workload joins its namespaces through a pid descriptor of the
+init and runs inside its pid namespace. An isolated workload with a rootfs
+gets a `nodev` root and volumes, a minimal `/dev` of its own (the OCI
+default devices bound from the host, a new devpts instance, a sized
+`/dev/shm`) and a `/proc` of its own whose host controls are read-only and
+whose host internals are masked; it is entered with `pivot_root`, never a
+`chroot` a default capability could leave. The hardened posture is that
+confinement whole, in an isolated workload.
 <!-- vocabulary-exempt-end -->

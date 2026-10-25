@@ -1044,6 +1044,10 @@ impl cap::CapCrypto for KernelCrypto {
 /// The node's control-plane store and its handle tables.
 static mut LINUX_STORE: Option<Served> = None;
 
+/// Change history the node's store retains: how far back a `CHANGES` read
+/// reaches before it is answered LOST and its reader relists.
+const NODE_STORE_HISTORY: usize = 65536;
+
 /// What `store_init_from_env` found: three outcomes, not two, because "no
 /// store was asked for" and "a store was asked for and could not be opened"
 /// must not look alike.
@@ -1084,7 +1088,7 @@ pub unsafe fn store_init_from_env() -> StoreInit {
         Some(roots) => MESH_ROOTS = roots,
         None => return StoreInit::Failed,
     }
-    match Store::open(std::path::Path::new(&dir), 65536) {
+    match Store::open(std::path::Path::new(&dir), NODE_STORE_HISTORY) {
         Ok(s) => {
             LINUX_STORE = Some(Served::node(s));
             StoreInit::Opened
@@ -2111,22 +2115,13 @@ pub unsafe fn dispatch_namespace_on(
     let store = &mut served.store;
     let pools = served.pools;
     let subs = &mut served.subs;
-    // Per-handle fence introspection (LOOKUP/SUBSCRIBE handle): a view fence at
-    // the current store revision.
+    // No handle of this surface carries a fence: the store has no `LOOKUP`,
+    // and a subscription is a doorbell, not a view. Each read carries its own.
     if opcode == QUERY_OP {
         if arg.is_null() || arg_len < WIRE_MAX_LEN {
             return errno::EINVAL;
         }
-        let buf = core::slice::from_raw_parts_mut(arg, arg_len);
-        return match (Fence::ViewConsistent {
-            source: STORE_SOURCE,
-            revision: store.revision(),
-        })
-        .encode(buf)
-        {
-            Some(n) => n as i32,
-            None => errno::EINVAL,
-        };
+        return errno::ENOSYS;
     }
 
     let a = if arg.is_null() {
@@ -2136,9 +2131,9 @@ pub unsafe fn dispatch_namespace_on(
     };
 
     match opcode {
-        // Versioned store: subscriptions (SUBSCRIBE + TAKE_RUNG) and paged
-        // change reads are implemented; mutation (BIND/RENAME/DELETE) flows through the
-        // object surface, not this one (namespace.rs::caps).
+        // Subscriptions (SUBSCRIBE and TAKE_RUNG) and paged change reads;
+        // the store is written through `storage.object`, so this surface has
+        // no BIND, RENAME or DELETE.
         ns_op::CAPS => (ns_op::caps::SUBSCRIBE | ns_op::caps::CHANGES) as i32,
         ns_op::LIST => {
             let Some(req) = ns_op::list::parse_request(a) else {
@@ -2240,14 +2235,14 @@ pub unsafe fn dispatch_namespace_on(
             let Some(req) = ns_op::take::parse(a) else {
                 return errno::EINVAL;
             };
-            let out = core::slice::from_raw_parts_mut(req.out_ptr as *mut u8, req.out_cap as usize);
-            let Some(mut answer) = ns_op::take::Writer::new(out) else {
-                return errno::ENOMEM;
-            };
             // Only the caller's own subscriptions on that event are named: its
             // owner and its occupancy both.
             let (Some(event), Some(module)) = (event_slot(req.event), Occupancy::caller()) else {
-                return answer.finish(false) as i32;
+                return errno::EINVAL;
+            };
+            let out = core::slice::from_raw_parts_mut(req.out_ptr as *mut u8, req.out_cap as usize);
+            let Some(mut answer) = ns_op::take::Writer::new(out) else {
+                return errno::ENOMEM;
             };
             let mut more = false;
             for (idx, s) in subs.iter_mut().enumerate() {

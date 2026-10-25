@@ -220,7 +220,7 @@ fn cap_satisfies(declared: &str, wanted: &str) -> bool {
 /// The checks are *structural*: the required roles and
 /// capabilities exist in the graph. What cannot be checked here —
 /// whether the failover budget actually fits under the client
-/// keepalive at runtime, or whether R1–R5 hold under fault — is a
+/// keepalive at runtime, or whether the capabilities hold under fault — is a
 /// measured/tested gate, not a static one. The validator still rejects
 /// a declared budget that is not below the declared keepalive, since a
 /// declaration that fails on its own constants cannot pass measurement.
@@ -730,8 +730,8 @@ pub fn validate_continuity_on(
                             }
                         }
 
-                        // §12.4: the budget is declared here and PROVEN
-                        // by the failover-latency measurement.
+                        // The budget is declared here and proven by the
+                        // failover-latency measurement.
                         // A declaration that fails on its own constants
                         // can be rejected statically.
                         let budget = g
@@ -740,7 +740,7 @@ pub fn validate_continuity_on(
                             .ok_or_else(|| {
                                 err("platform_replicated_state requires \
                                          `failover_budget_ms` (declared worst-case \
-                                         detect+fence+VIP-move+resume sum, §12.4)"
+                                         detect+fence+VIP-move+resume sum)"
                                     .into())
                             })?;
                         let keepalive = g
@@ -749,7 +749,7 @@ pub fn validate_continuity_on(
                             .ok_or_else(|| {
                                 err("platform_replicated_state requires \
                                      `client_keepalive_ms` (the deployed client's \
-                                     transport timeout, §12.4)"
+                                     transport timeout)"
                                     .into())
                             })?;
                         if budget >= keepalive {
@@ -1245,7 +1245,8 @@ const NON_DISPATCH_SURFACES: &[&str] = &["storage.block"];
 const RESERVED_SELECTORS: &[&str] = &["platform"];
 
 /// The per-module `volume:` param — the instance selector that keys an
-/// FS/namespace provider. Empty string = the default (unkeyed) provider.
+/// FS/namespace provider — set on the entry or inside its `params:`, as the
+/// packer reads either. Empty string = the default (unkeyed) provider.
 /// Two providers of one surface may coexist ONLY with distinct selectors:
 /// the kernel reaches each keyed volume via `provider_call_sel` and the
 /// `mount` module routes paths to them.
@@ -1261,8 +1262,10 @@ fn provider_volume<'a>(config: &'a Value, name: &str) -> &'a str {
             arr.iter()
                 .find(|e| e.get("name").and_then(|n| n.as_str()) == Some(name))
         })
-        .and_then(|e| e.get("params"))
-        .and_then(|p| p.get("volume"))
+        .and_then(|e| {
+            e.get("volume")
+                .or_else(|| e.get("params").and_then(|p| p.get("volume")))
+        })
         .and_then(|v| v.as_str())
         .unwrap_or("")
 }
@@ -1401,12 +1404,10 @@ pub fn validate_single_provider(
 /// and handlers are among what the restart releases, and nothing registers
 /// them again, so it would run on as a provider no consumer can reach.
 ///
-/// A module that declares `store_subscriptions` demand cannot attest at all,
-/// whatever policy it runs under: the restart releases every provider handle
-/// it holds and bumps its slot generation, so every subscription it made is
-/// dead — and it resumes believing it is subscribed, never woken again. The
-/// `storage.namespace` contract says a subscriber does not attest
-/// `resume_after_fault`; the attestation beside the demand is refused here.
+/// Nor is it available to a store subscriber, which the composer refuses
+/// once it has counted each instance's declared demand
+/// (`refuse_restart_of_subscribers`); a type whose every instance subscribes
+/// cannot attest `resume_after_fault` at all (`Manifest` refuses the pair).
 ///
 /// A module with no manifest in the map is not gated — the same
 /// convention the other validators in this file use for modules supplied
@@ -1426,24 +1427,12 @@ pub fn validate_fault_policy(
         if !module_names.iter().any(|m| m == name) {
             continue;
         }
-        let Some(m) = manifests.get(name) else {
-            continue;
-        };
-        if m.resume_after_fault && declares_store_subscriptions(m) {
-            return Err(Error::Config(format!(
-                "module '{name}': its manifest attests `resume_after_fault = true` and declares \
-                 `store_subscriptions` demand, which cannot both hold. A fault restart releases \
-                 every provider handle the module holds and bumps its slot generation, so each \
-                 store subscription it made dies with it, and the module resumes believing it \
-                 is still subscribed — never woken by a change again. A `storage.namespace` \
-                 subscriber does not attest `resume_after_fault`: drop the attestation from \
-                 its manifest.toml and choose `fault_policy: \"skip\"` or \
-                 `fault_policy: \"restart_graph\"`, which re-instantiates it."
-            )));
-        }
         if entry.get("fault_policy").and_then(|v| v.as_str()) != Some("restart") {
             continue;
         }
+        let Some(m) = manifests.get(name) else {
+            continue;
+        };
         if !m.provides.is_empty() {
             return Err(Error::Config(format!(
                 "module '{name}': fault_policy = \"restart\" is not available to a module that \
@@ -1567,18 +1556,6 @@ pub fn validate_provider_domains(
         }
     }
     Ok(())
-}
-
-/// Whether `m` declares demand on the store's subscription pool: the
-/// `[capacities] store_subscriptions` constant, or a `demand_from_params`
-/// rule counting it from the instance's params.
-fn declares_store_subscriptions(m: &Manifest) -> bool {
-    m.capacities
-        .get("store_subscriptions")
-        .is_some_and(|&n| n > 0)
-        || m.demand_from_params
-            .as_ref()
-            .is_some_and(|r| r.pool == "store_subs")
 }
 
 /// Validate every `[[ports]] requires_capability` against the module actually

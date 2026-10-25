@@ -158,10 +158,10 @@ and realizes what the node agent writes to the kernel:
   service address goes to one of its backends. A service for any protocol
   (`proto` 0) or on any port (`vport` 0) is matched as the store admits it —
   no two services on the node overlap — and a backend port of 0 is the port
-  dialled. A stream keeps its backend;
-  a datagram flow re-picks when its backend leaves the set; a service with
-  no backends refuses (`ECONNREFUSED`, `MSG_DG_ERROR`). Inbound translation
-  for clients off the node is not offered (`DNAT_LOCAL` without `DNAT`).
+  dialled. A stream keeps its backend; a datagram flow re-picks when its
+  backend leaves the set; a service with no backends refuses
+  (`ECONNREFUSED`, `MSG_DG_ERROR`). Inbound translation for clients off the
+  node is not offered (`DNAT_LOCAL` without `DNAT`).
 
 ## Supported profile
 

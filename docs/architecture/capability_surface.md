@@ -507,6 +507,14 @@ Validation applied by the config tool:
   Multiple providers of one surface are allowed only with distinct
   `volume:` selectors routed by a `mount` module. See
   `storage_capability_surface.md` §1 for the full mechanism.
+- **A provider shares its callers' domain.** A provider call runs the
+  provider's code in the caller's frame, on the caller's core, and a module
+  heap is touched from one core only, so a module that `provides` a
+  contract and every module whose `requires_contract` names it sit in one
+  execution domain. On a node that admits live-added workloads (its owners
+  pool keeps a reserve) a module provider sits in the primary domain, where
+  a workload lands unless it names another; `capacity: { owners: 0 }`
+  declares a node that admits none.
 - **Exclusive-access conflicts.** Two modules claiming `exclusive` access
   to the same device class and instance is a build error.
 

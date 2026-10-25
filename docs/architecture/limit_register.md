@@ -272,7 +272,6 @@ CAPACITY >= PSTATUS_ROUND | src/kernel/sys/telemetry_ring.rs
 | DNS durable-update response echo | `PEND_Q_MAX` | modules/foundation/dns/mod.rs | — | Derived: header + the longest wire name + type and class — the zone section an UPDATE's held response repeats while its commit is undecided; a longer one (unreachable after parsing) is answered SERVFAIL at once |
 | mount open handles | `MAX_OPEN` | modules/foundation/mount/mod.rs | 64 | Policy: an open past the router table is refused ENFILE |
 | OTA image layers | `MAX_LAYERS` | modules/foundation/ota_registry/mod.rs | 48 | Policy: sized to the 48-module fleet profile; a larger manifest is refused whole |
-| SMMU DMA map table | `MAX_DMA_MAPS` | modules/foundation/smmu/mod.rs | 32 | Policy: a map past the translation table is refused ENOMEM before any MMIO write |
 | QUIC continuity shadow slots | `MAX_SHADOW_SLOTS` | modules/foundation/quic/continuity.rs | 2 | Policy: connections under CT_QUIC takeover at once, one per slot. Continuity is a control-plane event, not steady state, and each shadow stages a whole connection's worth of state; a PAIR_PREPARE past the free slots is refused `STATUS_NO_CAPACITY` |
 | QUIC strict receive horizon | `CONT_RECV_HOLD` | modules/foundation/quic/connection.rs | 16 | Policy: inbound 1-RTT packet numbers a strict-continuity connection holds unacknowledged until the standby confirms the mirror, so the acknowledgement the peer sees never runs ahead of what a takeover could honour. A burst past it is not a loss: the mirror is abandoned, which the coordinator learns of, rather than the horizon silently dropping a number |
 | QUIC continuity checkpoint record | `CHECKPOINT_RECORD_MAX` | modules/foundation/quic/continuity.rs | 49152 | Sized, not chosen: holds the full serialized connection state — six bidi (4096 send + 1500 receive) and nine uni (256+256) stream buffers, the 1-RTT CRYPTO send buffer, the retained last-emitted packet, the sealed secret set, and the fixed header, with headroom. A checkpoint whose `total_len` exceeds it is refused `STATUS_NO_CAPACITY` at CHECKPOINT_BEGIN and the shadow is discarded |
@@ -321,6 +320,9 @@ CAPACITY >= PSTATUS_ROUND | src/kernel/sys/telemetry_ring.rs
 | Staged streaming write | `STORE_STAGE_MAX` | src/platform/linux/store.rs | 67108864 | Policy: 64 MiB, the bytes one `PUT_STREAMED_*` write may stage before its commit. The store keeps objects in memory, so an open stream is the one place a caller can take the node's memory without committing anything; past it the write is `ENOSPC`. A provider for bulk objects stages to disk and carries no such bound |
 | Streaming-write size hint | `STORE_STAGE_RESERVE_MAX` | src/platform/linux/store.rs | 1048576 | Policy: 1 MiB, the most a `PUT_STREAMED_OPEN` size hint may reserve up front. The hint is the caller's, so it is advice and not an allocation request; past this the staging buffer grows as the bytes arrive |
 | Linux store change scan | `CHANGES_SCAN_BUDGET` | src/platform/linux/store.rs | 4096 | Policy: history entries one `CHANGES` call walks, and keys one relist page walks — the per-call budget the contract asks a provider to state. A call that spends it answers `more` with a continuation token and the caller asks again, so a long history or a wide prefix is many short calls, never one long one |
+| Linux node store change history | `NODE_STORE_HISTORY` | src/platform/linux/store.rs | 65536 | Policy: revisions the node's control-plane store retains for `CHANGES`, one entry per revision. A reader further behind is answered LOST and relists rather than being handed a gap, so the figure is how long a watcher may sleep, not a ceiling on what the store holds |
+| Workload store change history | `OWNER_STORE_HISTORY` | src/platform/linux/owner_root.rs | 4096 | Policy: as the node store's, for one workload's own store — sized for one tenant's watchers rather than the node's |
+| Store subscriptions | `DEFAULT_RESERVES` | src/kernel/config.rs | — | Policy, sized at boot (the `store_subs` pool: what the graph's store consumers declare plus the reserve, by default 64): `SUBSCRIBE` watches the Linux node store holds at once. A full table is swept of subscriptions whose module is gone before it refuses; a watch past it is `ENOMEM`, counted and named |
 
 ## Tables, arenas and budgets
 
@@ -458,19 +460,20 @@ cannot be evaluated from its own file reads `—` and says why.
 | `ip` default heap | `HEAP_DEFAULT_BYTES` | modules/foundation/ip/mod.rs | — | Policy: the heap cap `ip` asks for when the graph names none. Elastic on aarch64 (it commits what the declared tables touch), committed whole on MCU-class targets (4 KiB). A graph declaring more than it holds gives the instance `heap.arena_bytes`; construction otherwise refuses, naming the table |
 | Outbound net queues | `node_events`, `lane_events` (params) | modules/foundation/ip/mod.rs | — | Declared inputs, default `NODE_EVENTS_DEFAULT` / `LANE_EVENTS_DEFAULT` (32 / 8; at least 8 / 4): control frames `ip` holds for a consumer that is not draining, in a queue per lane in the module heap, each lane's count kept on push and drain. The node's queue is the receive reserve — the receive loop stops reading the NIC when fewer than its headroom remain, so back-pressure reaches the wire — and a workload lane's fills only with its own events: an accept is announced only with room for `MSG_ACCEPTED` and its peer report, and is otherwise refused. Was one 32-slot queue shared four per lane, sixteen across lanes |
 | `ip` fast-path pairs per lane | `lane_pairs` (param) | modules/foundation/ip/mod.rs | — | Declared input, default `LANE_PAIRS_DEFAULT` (16): same-node stream halves one lane holds; a dial past it is refused `ENOBUFS` |
-| `ip` datagram flows | `max_dg_flows`, `dg_flow_floor`, `dg_flow_idle_s` (params) | modules/foundation/ip/flows.rs | — | Declared inputs, default `FLOWS_DEFAULT` / `FLOOR_DEFAULT` / `IDLE_DEFAULT_S` (1024 / 16 / 30 s on aarch64, the idle timeout the flow model's `DATAGRAM_UNREPLIED_S`): the flow table and its 4× index in the module heap; a flow nobody answered lives `dg_flow_idle_s` idle, an answered one the longer of that and `DATAGRAM_REPLIED_S`; each lane (the node's included) guaranteed its floor; construction refuses unless `max_dg_flows >= (lanes + 1) x floor`. A send at the floor with the shared part spent is refused `ENOBUFS`; inbound-only unanswered flows are evicted first, a live egress flow never |
+| `ip` datagram flows | `max_dg_flows`, `dg_flow_floor`, `dg_flow_idle_s` (params) | modules/foundation/ip/flows.rs | — | Declared inputs, default `FLOWS_DEFAULT` / `FLOOR_DEFAULT` / `IDLE_DEFAULT_S` (1024 / 16 / 30 s on aarch64, the idle timeout the flow model's `DATAGRAM_UNREPLIED_S`): the flow table and its 4× index in the module heap; a flow nobody answered lives `dg_flow_idle_s` idle, an answered one the longer of that and `DATAGRAM_REPLIED_S`; each lane (the node's included) guaranteed its floor; construction refuses unless `max_dg_flows >= (lanes + 1) x floor`. A send at the floor with the shared part spent is refused `ENOBUFS`, once expired flows are reclaimed and the lane's inbound-only unanswered flows evicted; a live egress flow is never evicted |
 | `ip` route tables | `max_segments` (param), `max_peers`, `max_held` | modules/foundation/ip/route.rs | — | Declared inputs, default `SEGMENTS_DEFAULT` (4): the TAKE buffer and the segments, peer routes and held addresses `ip` realizes. A table written past them answers TAKE `ERANGE`; the previous copy stays |
-| `ip` packet-policy tables | `policy_tables`, `policy_bytes` (params) | modules/foundation/ip/policy.rs | — | Declared inputs, default `BYTES_DEFAULT` (8192 on aarch64): each named table held twice (a read lands whole in the spare) in the module heap, and the service index sized from them (`service.rs`, double-buffered). `policy_bytes` is declared to the store at ATTACH, so a REPLACE past it is refused `E2BIG`; a table past it stored before `ip` bound is enforced closed (every flow it judges refused, its services withdrawn) and reported not applied, so its `ENFORCED` is clear | Policy: frames `ip` holds for a consumer that is not draining; the receive loop stops reading the NIC when fewer than the headroom remain, so back-pressure reaches the wire instead of dropping on the floor |
-| `pkt_filter` flow table | `max_flows` (param) | modules/foundation/pkt_filter/flows.rs | — | Declared input, default `FLOWS_DEFAULT` (4096 on aarch64, 64 on MCU-class targets): the flows `pkt_filter` records in net.policy mode, in the module heap with their free stack and a hash index at least four times the table (a 20-byte record and a 2-byte free entry a flow on every target, and an index of the power of two at least four times the table, 4 bytes an entry: 152 KiB at the aarch64 default, 2.4 KiB at the MCU default). Construction is refused when the heap cannot hold it. A new flow with no free record, once expired ones are reclaimed, is refused: its packet is dropped and counted (`flows_refused`), and no recorded flow is evicted for it |
+| `ip` packet-policy tables | `policy_tables`, `policy_bytes` (params) | modules/foundation/ip/policy.rs | — | Declared inputs, default `BYTES_DEFAULT` (8192 on aarch64): each named table held twice (a read lands whole in the spare) in the module heap, and the service index sized from them (`service.rs`, double-buffered). `policy_bytes` is declared to the store at ATTACH, so a REPLACE past it is refused `E2BIG`; a table past it stored before `ip` bound is enforced closed (every flow it judges refused, its services withdrawn) and reported not applied, so its `ENFORCED` is clear |
+| `pkt_filter` flow table | `max_flows` (param) | modules/foundation/pkt_filter/flows.rs | — | Declared input, default `FLOWS_DEFAULT` (4096 on aarch64, 64 on MCU-class targets): the flows `pkt_filter` records in net.policy mode, in the module heap with their free stack and a hash index at least four times the table (a 20-byte record and a 2-byte free entry a flow on every target, and an index of the power of two at least four times the table, 4 bytes an entry: 152 KiB at the aarch64 default, 2.4 KiB at the MCU default). Construction is refused when the heap cannot hold it. A new flow with no free record, once expired ones are reclaimed (a whole-table sweep, at most once a millisecond), is refused: its packet is dropped and counted (`flows_refused`), and no recorded flow is evicted for it |
 | `pkt_filter` default heap | `HEAP_DEFAULT_BYTES` | modules/foundation/pkt_filter/mod.rs | — | Policy, per-profile: the heap cap `pkt_filter` asks for when the graph names none — 4 MiB on aarch64, where the heap commits only what the flow table touches (room for the most `max_flows` allows), 4 KiB on MCU-class targets, where it is committed whole (the default table) |
 | `pkt_filter` table held | `POLICY_BUF` | modules/foundation/pkt_filter/mod.rs | 4096 | Policy: rule bytes of its net.policy table `pkt_filter` holds (twice: a read lands whole in the spare), declared to the store at ATTACH so a REPLACE past it is refused `E2BIG`; a table past it stored before the module bound is enforced closed (every new flow dropped, `closed_dropped`) and reported not applied |
 | `pkt_filter` fragmented datagrams | `FRAG_SLOTS` | modules/foundation/pkt_filter/mod.rs | 8 | Policy: datagrams whose first fragment passed that `pkt_filter` remembers, so their later fragments (which carry no ports) follow it. Past it the least recently used is replaced, and a later fragment of a forgotten datagram is dropped and counted (`frag_dropped`) |
-| `pkt_filter` fragment admission | `FRAG_MS` | modules/foundation/pkt_filter/mod.rs | 30000 | Policy: how long a passed first fragment admits its datagram's later fragments, the host's reassembly timeout |
+| `pkt_filter` fragment admission | `FRAG_MS` | modules/foundation/pkt_filter/mod.rs | 30000 | Policy: how long a passed first fragment admits its datagram's later fragments — as long as a Linux host holds fragments for reassembly (`ipfrag_time`) |
 | `pkt_filter` static rules | `MAX_RULES` | modules/foundation/pkt_filter/mod.rs | 8 | Policy: static port rules (`rule_0` … `rule_7`) one instance holds; `rule_count` past it is held to it |
 | `pkt_filter` frame | `MAX_FRAME` | modules/foundation/pkt_filter/mod.rs | 1600 | Policy: the largest frame `pkt_filter` stages, an Ethernet frame with a VLAN tag, rounded; a longer length prefix is dropped as malformed |
 | Flow model: established TCP | `TCP_ESTABLISHED_S` | modules/sdk/contracts/net/policy.rs | 432000 | Policy, the host connection tracker's default: seconds an established TCP flow keeps its verdict with no packet, on every enforcer of the contract's flow model (`net::policy::flow`; the other TCP states' timeouts sit beside it, 10 to 120 s) |
-| Flow model: unanswered datagram flow | `DATAGRAM_UNREPLIED_S` | modules/sdk/contracts/net/policy.rs | 30 | Policy, the host connection tracker's default: seconds a datagram flow nobody answered keeps its verdict idle (`ip`'s `dg_flow_idle_s` default, `pkt_filter`'s datagram flows) |
-| Flow model: answered datagram flow | `DATAGRAM_REPLIED_S` | modules/sdk/contracts/net/policy.rs | 120 | Policy, the host connection tracker's default: seconds an answered datagram flow keeps its verdict idle |
+| Flow model: unanswered UDP flow | `DATAGRAM_UNREPLIED_S` | modules/sdk/contracts/net/policy.rs | 30 | Policy, the host connection tracker's default: seconds a UDP flow nobody answered keeps its verdict idle (`ip`'s `dg_flow_idle_s` default, `pkt_filter`'s UDP flows) |
+| Flow model: answered UDP flow | `DATAGRAM_REPLIED_S` | modules/sdk/contracts/net/policy.rs | 120 | Policy, the host connection tracker's default: seconds an answered UDP flow keeps its verdict idle |
+| Flow model: other protocols | `GENERIC_S` | modules/sdk/contracts/net/policy.rs | 600 | Policy, the host connection tracker's default: seconds a flow of a protocol other than TCP, UDP and ICMP keeps its verdict idle |
 | DNS record types per allow entry | `MAX_ALLOW_TYPES` | modules/foundation/dns/mod.rs | 8 | Policy: one `update_allow` entry lists the types a signer may update; more than eight is a policy written in the wrong place |
 | fat32 enumeration | `MAX_FILES` | modules/foundation/fat32/mod.rs | 128 | Policy: entries one LIST returns; a larger directory is paged by the caller |
 | fat32 unlink free-list | `UNLINK_FREE_SLOTS` | modules/foundation/fat32/mod.rs | 8 | Deliberate cap with a stated degradation: sized for WAL segment compaction retiring a handful of segments per snapshot; overflow degrades to orphaning clusters, which fsck reclaims |
@@ -502,7 +505,6 @@ cannot be evaluated from its own file reads `—` and says why.
 | QUIC advertised stream window | `LOCAL_STREAM_WINDOW` | modules/foundation/quic/connection.rs | 262144 | Policy: the per-stream receive credit this endpoint advertises (`initial_max_stream_data_*`), re-advanced by a whole window once the application has acknowledged half of it (`stream_ack_credit`) — the transport never grants credit the application has not freed. It is credit, not memory: bytes past a stream's receive buffer are not taken and their packet goes unacknowledged, so the peer sends them again |
 | QUIC advertised connection window | `LOCAL_CONN_WINDOW` | modules/foundation/quic/connection.rs | 1048576 | Policy: the connection-level receive credit (`initial_max_data`), four stream windows, advanced the same way as the application's acknowledgements come in |
 | QUIC assumed peer stream window | `DEFAULT_PEER_STREAM_WINDOW` | modules/foundation/quic/connection.rs | 262144 | Policy: the send credit a stream assumes before the peer's transport parameters arrive — equal to what this endpoint advertises, so a peer on the same defaults is never under-served — and replaced by the peer's own values when they do. A stream at its credit stops and owes the peer a STREAM_DATA_BLOCKED |
-| SMMU stream ids | `MAX_STREAM_IDS` | modules/foundation/smmu/mod.rs | 8 | Policy: stream-id table entries one SMMU module programs; a device past it is refused |
 | TLS checkpoint SNI | `CKPT_SNI_MAX` | modules/foundation/tls/continuity.rs | 64 | Policy, wire-visible in the checkpoint record: a session whose server name is longer is not checkpointable, and is refused rather than truncated |
 | TLS checkpoint ALPN | `CKPT_ALPN_MAX` | modules/foundation/tls/continuity.rs | 16 | Policy, wire-visible in the checkpoint record: as the server-name ceiling above, for the negotiated protocol name |
 | TLS continuity drain | `CONT_DRAIN_BUDGET` | modules/foundation/tls/continuity.rs | 8 | Policy: continuity frames drained per step, so a burst of deltas cannot take a step past the tick |
@@ -737,7 +739,6 @@ MAX_ZIO_CALLS_PER_STEP | modules/foundation/dns/mod.rs | 64 | *
 PEND_Q_MAX | modules/foundation/dns/mod.rs | DNS_HEADER_LEN + MAX_NAME_LEN + 1 + 4 | *
 MAX_OPEN | modules/foundation/mount/mod.rs | 64 | *
 MAX_LAYERS | modules/foundation/ota_registry/mod.rs | 48 | *
-MAX_DMA_MAPS | modules/foundation/smmu/mod.rs | 32 | *
 MAX_SHADOW_SLOTS | modules/foundation/quic/continuity.rs | 2 | *
 CONT_RECV_HOLD | modules/foundation/quic/connection.rs | 16 | *
 CHECKPOINT_RECORD_MAX | modules/foundation/quic/continuity.rs | 49152 | *
@@ -792,7 +793,6 @@ SENT_PACKET_RING | modules/foundation/quic/connection.rs | 16 | *
 LOCAL_STREAM_WINDOW | modules/foundation/quic/connection.rs | 1 << 18 | *
 LOCAL_CONN_WINDOW | modules/foundation/quic/connection.rs | 1 << 20 | *
 DEFAULT_PEER_STREAM_WINDOW | modules/foundation/quic/connection.rs | 1 << 18 | *
-MAX_STREAM_IDS | modules/foundation/smmu/mod.rs | 8 | *
 CKPT_SNI_MAX | modules/foundation/tls/continuity.rs | 64 | *
 CKPT_ALPN_MAX | modules/foundation/tls/continuity.rs | 16 | *
 CONT_DRAIN_BUDGET | modules/foundation/tls/continuity.rs | 8 | *
@@ -944,6 +944,8 @@ SCOPE_MAX | modules/sdk/contracts/storage/object.rs | 255 | *
 STORE_STAGE_MAX | src/platform/linux/store.rs | 64 * 1024 * 1024 | *
 STORE_STAGE_RESERVE_MAX | src/platform/linux/store.rs | 1024 * 1024 | *
 CHANGES_SCAN_BUDGET | src/platform/linux/store.rs | 4096 | *
+NODE_STORE_HISTORY | src/platform/linux/store.rs | 65536 | *
+OWNER_STORE_HISTORY | src/platform/linux/owner_root.rs | 4096 | *
 OWNER_MAX_OPEN_FILES | src/kernel/workload/storage.rs | 32 | *
 MAX_SANDBOXES | src/platform/linux/host_backend.rs | 4096 | *
 MAX_TTY_SESSIONS | src/platform/linux/host_backend.rs | 4096 | *
@@ -963,9 +965,12 @@ named above for ceilings no row covers. A constant counts when its name is
 shaped like one — `MAX_` first, or a capacity word (`MAX`, `CAP`,
 `CAPACITY`, `LIMIT`, `BUDGET`, `SIZE`, `SLOTS`, `ENTRIES`, `WINDOW`,
 `DEPTH`) as the whole name or its last part — and, whatever it is called,
-when the file declares it and sizes a fixed array with it (`[T; NAME]`,
-`[x; NAME]`): a preallocated table named by a plain noun (`SUBSCRIPTIONS`,
-`PENDING_WRITES`) is a ceiling too. Only a `const` item counts: the keyword
+when the file declares it and it alone sizes a fixed array of records on one
+line (`[Sub; NAME]`, `[NO_SUB; NAME]`, `[[u8; K]; NAME]`): a preallocated
+table named by a plain noun (`SUBSCRIPTIONS`, `PENDING_WRITES`) is a ceiling
+too. An array of scalars (`[u8; NAME]`, `[0; NAME]`) is a buffer, sized by a
+format the exemptions below name, and a computed length (`[T; A + B]`) names
+no one table, so neither is counted. Only a `const` item counts: the keyword
 in a raw pointer (`*const T`), a raw borrow (`&raw const SLOTS`) or a
 const-generic parameter (`impl<const SLOTS: usize>`) declares nothing this
 file decides, so the scan skips it rather than asking for an exemption.
@@ -1081,7 +1086,6 @@ ADAPTIVE_POST_SIZE | src/kernel/boot/config.rs | packed graph-section layout
 GRAPH_SLOTS_CODE | src/kernel/boot/config.rs | packed graph-section layout, derived from MAX_GRAPH_EDGES
 MAX_SPANS | src/platform/bcm2712/memmap.rs | derived: the zone search keeps one span per device-tree memory range plus one per reservation (dtb MAX_MEMORY_RANGES + MAX_RESERVED_RANGES)
 CHANNEL_SIZE | src/platform/bcm2712/multicore.rs | a peripheral's register-block stride, hardware layout
-EVENT_HEADER_SIZE | src/platform/bcm2712/store.rs | mesh event record layout
 HEADER_SIZE | src/kernel/boot/config.rs | config blob header layout
 BUFFER_SIZE | src/kernel/ipc/buffer_pool.rs | mirror of CHANNEL_BUFFER_SIZE
 BUFFER_ARENA_SIZE | src/kernel/ipc/buffer_pool.rs | mirror of the platform config's BUFFER_ARENA_SIZE
@@ -1096,7 +1100,6 @@ MANIFEST_HEADER_SIZE | tools/src/manifest.rs | manifest layout
 SIGNATURE_BLOCK_SIZE | tools/src/manifest.rs | signature block layout
 MAX_AUTHORITY_LEN | modules/foundation/remote_channel/mod.rs | holds the `authority` parameter as written; the provider's own name ceiling binds the dial
 TABLE_TEXT_MAX | modules/foundation/remote_channel/mod.rs | holds the `channels` parameter text; MAX_CHANNELS and CT_NAME_MAX bind the table it parses to
-EVENT_HEADER_SIZE | src/platform/linux/store.rs | protocol: the mesh event header's fixed length, not a ceiling
 MAX_DATA_FRAGMENT | src/platform/linux/providers.rs | mirror of net_proto::MAX_DATA_FRAGMENT, the normative MSG_DATA payload, a protocol constant
 KEY_MAX | modules/foundation/fs_object/mod.rs | mirror of the contract's STORAGE_KEY_MAX, the longest key a listing carries
 CT_MAX | modules/foundation/fs_object/mod.rs | format: the content type's u8 length prefix

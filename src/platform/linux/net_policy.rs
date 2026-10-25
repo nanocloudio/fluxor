@@ -181,8 +181,10 @@ fn net(a: u32, prefix: u8) -> String {
     }
 }
 
-/// `tcp dport 80-81` / `udp dport 53` / `th dport 80` for any L4 proto, or the
-/// protocol alone; empty for any proto and any port.
+/// `tcp dport 80-81` / `udp dport 53` / `meta l4proto { tcp, udp } th dport
+/// 80` for any protocol with ports, or the protocol alone; empty for any
+/// protocol and any port. Only TCP, UDP and any protocol carry ports
+/// (`wire::filter` and `wire::dnat` refuse the rest).
 fn l4(proto: u8, lo: u16, hi: u16) -> String {
     let ports = if lo == 0 && hi == 0 {
         String::new()
@@ -197,8 +199,11 @@ fn l4(proto: u8, lo: u16, hi: u16) -> String {
         (wire::rule::PROTO_TCP, true) => " meta l4proto tcp".into(),
         (wire::rule::PROTO_UDP, true) => " meta l4proto udp".into(),
         (wire::rule::PROTO_ICMP, _) => " meta l4proto icmp".into(),
-        (_, false) => format!(" meta l4proto {{ tcp, udp }} th dport {ports}"),
-        (_, true) => String::new(),
+        (wire::rule::PROTO_ANY, false) => {
+            format!(" meta l4proto {{ tcp, udp }} th dport {ports}")
+        }
+        (wire::rule::PROTO_ANY, true) => String::new(),
+        (p, _) => format!(" meta l4proto {p}"),
     }
 }
 

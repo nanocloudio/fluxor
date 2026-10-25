@@ -34,7 +34,8 @@
 //! (either direction) passes on it; any other is new and is judged by the
 //! shared evaluator (`net::policy::evaluate`, the same rules as the Linux
 //! rendering) — an ACK without SYN that matches no flow is judged like any
-//! first packet, so a default-deny table drops it. A passed first packet
+//! first packet, so a default-deny table drops it, and a TCP segment whose
+//! flags TCP never sends matches no flow at all. A passed first packet
 //! records its flow (a TCP segment only when it may open one); a table full
 //! of live flows refuses the new one: its packet is dropped and counted
 //! (`flows_refused`). Rejected traffic is dropped: this module originates
@@ -44,11 +45,21 @@
 //! The model needs both directions: with only the receive path wired, the
 //! reply to a flow the node opened is new here, and is judged.
 //!
+//! **IPv4.** A header must hold together within the frame: version 4, a
+//! header length of at least 20 bytes, and a total length that covers the
+//! header and lies within the frame (Ethernet padding past it is ignored).
+//! Options are skipped, not judged. A frame that fails is dropped (counted
+//! `malformed`), as is a TCP, UDP or ICMP packet too short for the header
+//! its verdict reads.
+//!
 //! **Fragments.** A datagram's first fragment carries its ports and is
 //! judged as above; a later fragment passes only when the first fragment of
-//! the same datagram (`src`, `dst`, protocol, identification) passed within
-//! [`FRAG_MS`], and is otherwise dropped (counted `frag_dropped`). The most
-//! recent [`FRAG_SLOTS`] fragmented datagrams are remembered.
+//! the same datagram (`src`, `dst`, protocol, identification, the RFC 791
+//! reassembly key) passed within [`FRAG_MS`], and is otherwise dropped
+//! (counted `frag_dropped`). A TCP fragment at offset 8 never passes: it
+//! could only overwrite the header its first fragment was judged by (RFC
+//! 1858). The most recent [`FRAG_SLOTS`] fragmented datagrams are
+//! remembered.
 //!
 //! # Static mode (no `table`)
 //!
@@ -112,7 +123,8 @@ pub const POLL_MS: u32 = 100;
 /// ATTACH, so a larger REPLACE is refused.
 pub const POLICY_BUF: usize = 4096;
 /// Fragmented datagrams remembered at once, and how long a first fragment
-/// admits the rest (the host's reassembly timeout).
+/// admits the rest: as long as a Linux host holds fragments for reassembly
+/// (`ipfrag_time`).
 pub const FRAG_SLOTS: usize = 8;
 pub const FRAG_MS: u32 = 30_000;
 /// The heap the flow table is sized into when the graph names none: room to
@@ -242,6 +254,9 @@ pub struct FilterState {
     flow_index_len: u32,
     flow_free_top: u32,
     flow_sweep: u32,
+    /// When the last whole-table reclaim ran (`reclaim_swept` once one has).
+    reclaim_ms: u32,
+    reclaim_swept: u8,
     flows: *mut flows::Flow,
     flow_free: *mut u16,
     flow_index: *mut u32,
@@ -531,6 +546,11 @@ fn embedded(f: &[u8], ip: &Ip4) -> Option<flows::Tuple> {
         return None;
     }
     let l4 = inner.l4;
+    // RFC 792: the error carries the header and the first 64 bits of the
+    // datagram's data, the ports or the query identifier among them.
+    if l4 + 8 > f.len() {
+        return None;
+    }
     let (sport, dport) = match inner.proto {
         np::rule::PROTO_TCP | np::rule::PROTO_UDP => (b16(f, l4), b16(f, l4 + 2)),
         np::rule::PROTO_ICMP => {
@@ -546,9 +566,6 @@ fn embedded(f: &[u8], ip: &Ip4) -> Option<flows::Tuple> {
         }
         _ => (0, 0),
     };
-    if l4 + 8 > f.len() {
-        return None;
-    }
     Some(flows::Tuple {
         proto: inner.proto,
         src: inner.src,
@@ -648,8 +665,10 @@ unsafe fn judge_policy(s: &mut FilterState, f: &[u8], now: u32) -> bool {
         return false;
     };
     if ip.frag_off != 0 {
-        // A later fragment: no ports to judge it by.
-        if frag_admitted(s, &ip, now) {
+        // A later fragment: no ports to judge it by. One at offset 8 of a
+        // TCP datagram could only rewrite the header the first fragment
+        // was judged by (RFC 1858), so it never passes.
+        if !(ip.proto == np::rule::PROTO_TCP && ip.frag_off == 1) && frag_admitted(s, &ip, now) {
             return true;
         }
         s.frag_dropped = s.frag_dropped.wrapping_add(1);
@@ -659,8 +678,20 @@ unsafe fn judge_policy(s: &mut FilterState, f: &[u8], now: u32) -> bool {
         s.malformed = s.malformed.wrapping_add(1);
         return false;
     };
+    let pass = judge_packet(s, &seen, now);
+    if pass && ip.more_frags {
+        frag_note(s, &ip, now);
+    }
+    pass
+}
+
+/// The verdict on one whole packet or first fragment, by its flow or, when
+/// it has none, by the table.
+unsafe fn judge_packet(s: &mut FilterState, seen: &Seen, now: u32) -> bool {
+    // A TCP segment with flags TCP never sends belongs to no flow.
+    let tracked = seen.packet.proto != np::rule::PROTO_TCP || fm::tcp_valid(seen.tcp_flags);
     // Part of a recorded flow: passes on it.
-    if let Some(t) = &seen.tuple {
+    if let (Some(t), true) = (&seen.tuple, tracked) {
         if let Some((i, reply)) = flows::find(s, t, now) {
             if flows::note(s, i, reply, seen.tcp_flags, now) {
                 return true;
@@ -680,29 +711,19 @@ unsafe fn judge_policy(s: &mut FilterState, f: &[u8], now: u32) -> bool {
     if np::evaluate(held(s), &seen.packet) != np::Verdict::Accept {
         return false;
     }
-    if let Some(t) = &seen.tuple {
-        let opens = if t.proto == np::rule::PROTO_TCP {
-            fm::tcp_opens(seen.tcp_flags)
-        } else if t.proto == np::rule::PROTO_ICMP {
-            // Only a query opens a flow; an answer with none was judged.
-            if seen.icmp_request {
-                Some(0)
-            } else {
-                None
-            }
-        } else {
-            Some(0)
-        };
-        if let Some(state) = opens {
-            if !flows::make(s, t, state, now) {
-                return false;
-            }
-        }
+    let Some(t) = &seen.tuple else {
+        return true;
+    };
+    let opens = match t.proto {
+        np::rule::PROTO_TCP => fm::tcp_opens(seen.tcp_flags),
+        // Only a query opens a flow; an answer with none was judged.
+        np::rule::PROTO_ICMP if !seen.icmp_request => None,
+        _ => Some(0),
+    };
+    match opens {
+        Some(state) => flows::make(s, t, state, now),
+        None => true,
     }
-    if ip.more_frags {
-        frag_note(s, &ip, now);
-    }
-    true
 }
 
 /// The static rules' verdict on the frame in `f`.

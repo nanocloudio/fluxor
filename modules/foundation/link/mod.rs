@@ -7,8 +7,9 @@
 //!   - mode 2 (bidir): both directions simultaneously.
 //!
 //! Uses two UART handles for full duplex (one TX, one RX).
-//! Exports `module_deferred_ready` — gates downstream until jitter buffer filled
-//! (only relevant in RX/bidir modes).
+//! Exports `module_deferred_ready`, so downstream modules wait for its Ready:
+//! TX reports it once its UART is configured, RX and bidir once the jitter
+//! buffer has filled.
 //!
 //! **Params (TLV v2):**
 //!   tag 1: uart_bus (u8, default 0)
@@ -587,23 +588,24 @@ unsafe fn step_init(s: &mut LinkState) -> i32 {
     let mut baud_arg = s.baud.to_le_bytes();
     (dev_call)(tx_h, DEV_UART_CONFIGURE, baud_arg.as_mut_ptr(), 4);
 
-    s.phase = if s.mode == MODE_TX {
-        Phase::Running
-    } else {
-        Phase::Filling
-    };
-
     dev_log(&*s.syscalls, 3, b"[link] uart ok".as_ptr(), 14);
-    0
+    enter_service(s)
 }
 
 unsafe fn step_wait_uart(s: &mut LinkState) -> i32 {
-    s.phase = if s.mode == MODE_TX {
-        Phase::Running
+    enter_service(s)
+}
+
+/// TX has no jitter buffer to fill, so it is Ready as it starts running;
+/// RX and bidir report Ready once [`step_filling`] has filled theirs.
+unsafe fn enter_service(s: &mut LinkState) -> i32 {
+    if s.mode == MODE_TX {
+        s.phase = Phase::Running;
+        3 // StepOutcome::Ready
     } else {
-        Phase::Filling
-    };
-    0
+        s.phase = Phase::Filling;
+        0
+    }
 }
 
 // ============================================================================

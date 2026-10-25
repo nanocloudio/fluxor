@@ -143,7 +143,7 @@ mod scheduler_validation_tests {
         );
     }
 
-    // ---- F3: malformed manifest must FAIL CLOSED on an adaptive domain ----
+    // ---- A malformed manifest fails closed on an adaptive domain ----
 
     #[test]
     fn malformed_manifest_fails_closed_on_adaptive_domain() {
@@ -503,7 +503,8 @@ mod scheduler_validation_tests {
                 {"name": "plain", "type": "workload_pic_mod2", "domain": "coop"}
             ]}]
         });
-        let w = build_workloads(&cfg, test_loc(&tmp), &[]).expect("admitted budget builds");
+        let w =
+            build_workloads(&cfg, test_loc(&tmp), &[], "linux").expect("admitted budget builds");
         let m = &w[0].modules;
         assert_eq!(
             m[0].budget,
@@ -532,7 +533,7 @@ mod scheduler_validation_tests {
                 "execution": {"domains": [domain]},
                 "workloads": [{"modules": [module]}]
             });
-            build_workloads(&cfg, test_loc(&tmp), &[])
+            build_workloads(&cfg, test_loc(&tmp), &[], "linux")
                 .map(|_| ())
                 .map_err(|e| format!("{e:?}"))
         };
@@ -603,7 +604,7 @@ mod scheduler_validation_tests {
                 "execution": {"domains": [{"name": "coop", "cores": [0]}]},
                 "workloads": [{"modules": [m]}]
             });
-            build_workloads(&cfg, test_loc(&tmp), &[])
+            build_workloads(&cfg, test_loc(&tmp), &[], "linux")
                 .map(|_| ())
                 .map_err(|e| format!("{e:?}"))
         };
@@ -2125,45 +2126,65 @@ mod continuity_tests {
         }
     }
 
-    /// A store subscriber cannot attest `resume_after_fault`: a restart kills
-    /// its subscriptions. Refused whatever the policy, from the constant or a
-    /// `demand_from_params` rule.
+    /// `fault_policy: restart` is refused to an instance that declares store
+    /// subscriptions or their events — by its own `demand:`, or by its
+    /// type's rule counted from its params — and admitted to one that
+    /// declares none.
     #[test]
-    fn resume_after_fault_is_refused_beside_store_subscriptions() {
-        let mut sub = Manifest {
+    fn restart_is_refused_to_an_instance_that_subscribes() {
+        use super::dynamic_capacity_tests::tlv_of;
+        let probe = Manifest {
             resume_after_fault: true,
+            demand_from_params: vec![crate::manifest::DemandFromParams {
+                pool: "store_subs".into(),
+                tags: vec![5],
+                split: ",".into(),
+            }],
             ..Manifest::default()
         };
-        sub.capacities.insert("store_subscriptions".into(), 2);
-        for policy in [None, Some("skip"), Some("restart")] {
-            let cfg = match policy {
-                Some(p) => json!({"modules": [{"name": "a", "fault_policy": p}]}),
-                None => json!({"modules": [{"name": "a"}]}),
-            };
-            let m: HashMap<String, Manifest> = [("a".to_string(), sub.clone())].into();
-            let e = validate_fault_policy(&cfg, &names(&["a"]), &m).unwrap_err();
-            let msg = format!("{e:?}");
-            assert!(
-                msg.contains("resume_after_fault") && msg.contains("store_subscriptions"),
-                "{msg}"
-            );
-        }
-        let mut by_rule = Manifest {
-            resume_after_fault: true,
-            ..Manifest::default()
+        let integers = [(5u8, 1u32)];
+        let demand_of = |module: &Value, tlv: &[u8]| InstanceDemand {
+            name: "module 'probe'".into(),
+            figures: instance_demand(module, "probe", Some(&probe), tlv, &integers).unwrap(),
+            heap_per_demand: None,
         };
-        by_rule.demand_from_params = Some(crate::manifest::DemandFromParams {
+        let restart = json!({"name": "probe", "fault_policy": "restart"});
+        // Unset, the param's default (1) subscribes.
+        let d = demand_of(&restart, &tlv_of(&[]));
+        let msg = refuse_restart_of_subscribers(&json!([restart.clone()]), &[d])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("`store_subs`") && msg.contains("restart_graph"),
+            "{msg}"
+        );
+        // `subscribe: 0` declares none: restart is admitted.
+        let d = demand_of(&restart, &tlv_of(&[(5, &[0])]));
+        refuse_restart_of_subscribers(&json!([restart.clone()]), &[d]).unwrap();
+        // The graph's own figure counts the same way.
+        let declared = json!({"name": "probe", "fault_policy": "restart", "demand": {"events": 1}});
+        let d = demand_of(&declared, &tlv_of(&[(5, &[0])]));
+        assert!(refuse_restart_of_subscribers(&json!([declared]), &[d]).is_err());
+        // Another policy is untouched.
+        let skip = json!({"name": "probe", "fault_policy": "skip"});
+        let d = demand_of(&skip, &tlv_of(&[]));
+        refuse_restart_of_subscribers(&json!([skip]), &[d]).unwrap();
+    }
+
+    /// An integer param counts by its value, its schema default when unset;
+    /// a string param by its entries.
+    #[test]
+    fn demand_from_params_counts_an_integer_by_value() {
+        use super::dynamic_capacity_tests::tlv_of;
+        let rule = crate::manifest::DemandFromParams {
             pool: "store_subs".into(),
-            tags: vec![2],
+            tags: vec![5, 6, 2],
             split: ",".into(),
-        });
-        let cfg = json!({"modules": [{"name": "a"}]});
-        let m: HashMap<String, Manifest> = [("a".to_string(), by_rule)].into();
-        validate_fault_policy(&cfg, &names(&["a"]), &m).unwrap_err();
-        // Without the attestation a subscriber is fine.
-        sub.resume_after_fault = false;
-        let m: HashMap<String, Manifest> = [("a".to_string(), sub)].into();
-        validate_fault_policy(&cfg, &names(&["a"]), &m).unwrap();
+        };
+        let integers = [(5u8, 1u32), (6, 0)];
+        assert_eq!(rule.declared_count(&tlv_of(&[]), &integers), 1, "defaults");
+        let tlv = tlv_of(&[(5, &[3]), (6, &[0x10, 0x01]), (2, b"/a/,/b/")]);
+        assert_eq!(rule.declared_count(&tlv, &integers), 3 + 0x110 + 2);
     }
 
     /// A module provider and every module it serves share a domain; on a node
@@ -2719,7 +2740,7 @@ mod continuity_tests {
         m
     }
 
-    /// Full platform-replicated-state graph with every R1–R5 provider:
+    /// Full platform-replicated-state graph with every required provider:
     /// the ip stack (local fence, reach decided by the target) and an
     /// out-of-band fence agent declaring the wire.
     fn prs_graph_with(anchor_cap: &str) -> (Vec<String>, HashMap<String, Manifest>) {
@@ -2973,8 +2994,8 @@ mod continuity_tests {
     }
 
     #[test]
-    fn continuity_prs_requires_every_r_capability() {
-        // Dropping the fence provider (R3) must fail with the missing
+    fn continuity_prs_requires_every_capability() {
+        // Dropping the fence provider must fail with the missing
         // capability named.
         let (n, mut m) = prs_graph();
         m.remove("pdu");
@@ -3472,7 +3493,7 @@ mod dynamic_capacity_tests {
             .iter()
             .map(|n| InstanceDemand {
                 name: n.clone(),
-                figures: instance_demand(&json!({}), n, manifests.get(n), &[]).unwrap(),
+                figures: instance_demand(&json!({}), n, manifests.get(n), &[], &[]).unwrap(),
                 heap_per_demand: manifests.get(n).and_then(|m| m.heap_per_demand.clone()),
             })
             .collect()
@@ -3521,7 +3542,7 @@ mod dynamic_capacity_tests {
     }
 
     /// A params TLV of `entries` `(tag, value)`.
-    fn tlv_of(entries: &[(u8, &[u8])]) -> Vec<u8> {
+    pub(super) fn tlv_of(entries: &[(u8, &[u8])]) -> Vec<u8> {
         let mut t = vec![0xFE, 0x01, 0, 0];
         for (tag, v) in entries {
             t.push(*tag);
@@ -3543,38 +3564,47 @@ mod dynamic_capacity_tests {
         };
         let mut m = Manifest::default();
         m.capacities.insert("store_subscriptions".into(), 2);
-        m.demand_from_params = Some(rule.clone());
+        m.demand_from_params = vec![rule.clone()];
         // `prefix` (tag 2) names three, `watch` (tag 5) one; tag 9 is not
         // counted, nor are blank entries.
         let tlv = tlv_of(&[(2, b"/a/,/b/, /c/,"), (9, b"/x/,/y/"), (5, b"/w/")]);
-        assert_eq!(rule.declared_count(&tlv), 4);
+        assert_eq!(rule.declared_count(&tlv, &[]), 4);
         assert_eq!(
-            instance_demand(&json!({}), "src", Some(&m), &tlv).unwrap(),
+            instance_demand(&json!({}), "src", Some(&m), &tlv, &[]).unwrap(),
             vec![("store_subs", 4)]
         );
         // A chunked param's chunks are one value.
         let tlv = tlv_of(&[(2, b"/a/,/b"), (2, b"/,/c/")]);
-        assert_eq!(rule.declared_count(&tlv), 3);
-        // Empty params declare none (the rule replaces the constant).
-        assert!(instance_demand(&json!({}), "src", Some(&m), &tlv_of(&[]))
-            .unwrap()
-            .is_empty());
+        assert_eq!(rule.declared_count(&tlv, &[]), 3);
+        // Empty params declare none: the rule, not the constant, counts the
+        // pool.
+        assert!(
+            instance_demand(&json!({}), "src", Some(&m), &tlv_of(&[]), &[])
+                .unwrap()
+                .is_empty()
+        );
         // The graph's figure wins.
         let module = json!({"demand": {"store_subs": 9}});
         assert_eq!(
-            instance_demand(&module, "src", Some(&m), &tlv).unwrap(),
+            instance_demand(&module, "src", Some(&m), &tlv, &[]).unwrap(),
             vec![("store_subs", 9)]
         );
         // Without a rule the type's constant stands.
-        m.demand_from_params = None;
+        m.demand_from_params.clear();
         assert_eq!(
-            instance_demand(&json!({}), "src", Some(&m), &tlv).unwrap(),
+            instance_demand(&json!({}), "src", Some(&m), &tlv, &[]).unwrap(),
             vec![("store_subs", 2)]
         );
         // A pool nothing declares demand on is refused, named.
-        let e = instance_demand(&json!({"demand": {"channels": 1}}), "src", Some(&m), &tlv)
-            .unwrap_err()
-            .to_string();
+        let e = instance_demand(
+            &json!({"demand": {"channels": 1}}),
+            "src",
+            Some(&m),
+            &tlv,
+            &[],
+        )
+        .unwrap_err()
+        .to_string();
         assert!(e.contains("'channels'") && e.contains("store_subs"), "{e}");
     }
 
@@ -3599,7 +3629,7 @@ mod dynamic_capacity_tests {
     fn heap_per_demand_is_summed_and_a_smaller_explicit_cap_refused() {
         let plan = HeapPlan {
             ceilings: [("store_subs".to_string(), 100u64)].into(),
-            quiet: true,
+            counting: false,
         };
         // Base-only form: base + 64 × 100.
         let m = per_demand_store(64, Some(4096));
@@ -3608,7 +3638,14 @@ mod dynamic_capacity_tests {
             instance_heap_cap("kv", &module, Some(&m), &tlv_of(&[]), &plan).unwrap(),
             Some(4096 + 6400)
         );
-        // Before the plan knows the ceiling, nothing is added.
+        // While the demand is counted the type's own figure is the
+        // placeholder, always emitted so the plan can replace it.
+        assert_eq!(
+            instance_heap_cap("kv", &module, Some(&m), &tlv_of(&[]), &HeapPlan::counting())
+                .unwrap(),
+            Some(4096)
+        );
+        // A plan without a ceiling for the pool adds nothing.
         assert_eq!(
             instance_heap_cap("kv", &module, Some(&m), &tlv_of(&[]), &HeapPlan::default()).unwrap(),
             None
@@ -3646,6 +3683,89 @@ mod dynamic_capacity_tests {
             e.contains("arena_bytes = 2000") && e.contains("7450 B") && e.contains("store_subs"),
             "{e}"
         );
+    }
+
+    /// The graph is packed once: a `heap_per_demand` instance carries the
+    /// counting pass's placeholder cap, and the plan's figure is written over
+    /// it in place — in a base-graph entry and in a workload module's params.
+    #[test]
+    fn the_planned_cap_is_written_over_the_counting_placeholder() {
+        let manifests: HashMap<String, Manifest> =
+            [("kv".to_string(), per_demand_store(64, Some(4096)))].into();
+        let module = json!({"name": "kv", "type": "kv"});
+        let entry = build_module_entry(
+            "kv",
+            &module,
+            0,
+            None,
+            &json!({}),
+            test_loc(std::path::Path::new("/nonexistent/modules")),
+            &manifests,
+            crate::capacity::kernel_max_modules("linux"),
+            &crate::target::IsolationFacts::default(),
+            &HeapPlan::counting(),
+        )
+        .expect("entry");
+        let cap_of = |tlv: &[u8]| {
+            let off = heap_cap_offset(tlv).expect("a heap cap tag");
+            u32::from_le_bytes(tlv[off..off + 4].try_into().unwrap())
+        };
+        assert_eq!(
+            cap_of(&entry[MODULE_ENTRY_HEADER_SIZE..]),
+            4096,
+            "placeholder"
+        );
+        let len = entry.len();
+
+        let workload_params = insert_workload_heap_tags(
+            Vec::new(),
+            &module,
+            "kv",
+            manifests.get("kv"),
+            &HeapPlan::counting(),
+        )
+        .unwrap();
+        assert_eq!(cap_of(&workload_params), 4096, "workload placeholder");
+        let mut workloads = vec![crate::add_subgraph::Workload {
+            workload_uid: [0; 16],
+            state_cap: 0,
+            buffer_cap: 0,
+            modules: vec![crate::add_subgraph::WorkloadModule {
+                name_hash: 0,
+                domain_id: 0,
+                budget: crate::add_subgraph::StepBudget::default(),
+                params: workload_params,
+            }],
+            edges: Vec::new(),
+            idle_safe: false,
+        }];
+
+        let mut entries = vec![entry];
+        let heaps: Vec<PlannedHeap> = [ParamsAt::Base(0), ParamsAt::Workload(0, 0)]
+            .map(|at| PlannedHeap {
+                at,
+                name: "kv".into(),
+                module: module.clone(),
+                manifest: manifests["kv"].clone(),
+            })
+            .to_vec();
+        let plan = HeapPlan {
+            ceilings: [("store_subs".to_string(), 100u64)].into(),
+            counting: false,
+        };
+        apply_heap_plan(&plan, &heaps, &mut entries, &mut workloads).unwrap();
+        assert_eq!(cap_of(&entries[0][MODULE_ENTRY_HEADER_SIZE..]), 4096 + 6400);
+        assert_eq!(entries[0].len(), len, "written in place");
+        assert_eq!(cap_of(&workloads[0].modules[0].params), 4096 + 6400);
+
+        // A ceiling of nothing keeps the placeholder: the type's own figure.
+        let empty = HeapPlan::default();
+        let mut entries = vec![entries.remove(0)];
+        let off = heap_cap_offset(&entries[0][MODULE_ENTRY_HEADER_SIZE..]).unwrap();
+        entries[0][MODULE_ENTRY_HEADER_SIZE + off..MODULE_ENTRY_HEADER_SIZE + off + 4]
+            .copy_from_slice(&4096u32.to_le_bytes());
+        apply_heap_plan(&empty, &heaps[..1], &mut entries, &mut []).unwrap();
+        assert_eq!(cap_of(&entries[0][MODULE_ENTRY_HEADER_SIZE..]), 4096);
     }
 
     /// The plan's ceiling for a `heap_per_demand` pool is the graph's whole
@@ -3700,14 +3820,19 @@ mod dynamic_capacity_tests {
             vec![("events", 0x0005, 1)],
             "events stay kernel's"
         );
-        // A keyed provider is not the layer class-byte calls reach.
-        let keyed = json!({"modules": [{"name": "store", "params": {"volume": "v"}},
-                                       {"name": "watch"}]});
-        let declared = declared_demand(&keyed, &names, &manifests, &demand).unwrap();
-        assert_eq!(
-            declared,
-            vec![("store_subs", 0x000A, 4), ("events", 0x0005, 1)]
-        );
+        // A keyed provider is not the layer class-byte calls reach, whether
+        // its `volume` is set on the entry or inside its `params:`.
+        for store in [
+            json!({"name": "store", "params": {"volume": "v"}}),
+            json!({"name": "store", "volume": "v"}),
+        ] {
+            let keyed = json!({"modules": [store, {"name": "watch"}]});
+            let declared = declared_demand(&keyed, &names, &manifests, &demand).unwrap();
+            assert_eq!(
+                declared,
+                vec![("store_subs", 0x000A, 4), ("events", 0x0005, 1)]
+            );
+        }
     }
 
     /// A module id carries 12 bits: id 3000 round-trips through byte 9.

@@ -1000,9 +1000,10 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     // report reaches the UDP telemetry stream.
     rp1::cooling_full_on();
 
-    // PCIe1 bring-up: stages 1 + 2a + 2b (reset/RESCAL + RC-wide regs
-    // + MDIO tuning). Stage 2c onwards (SerDes/PERST#/link) is not driven
-    // from here.
+    // PCIe1 bring-up: bridge reset and RESCAL, the root complex's registers,
+    // MDIO tuning, SerDes and PERST#. The link trains after this returns, so
+    // bus 1 is scanned by a later `PCIE_RESCAN` (the nvme driver's retry,
+    // `pcie_scan`).
     {
         let n = fluxor::platform::pcie::enumerate();
         log::info!("[pcie] bus1 devices={n}");
@@ -2561,6 +2562,57 @@ fn bcm_runtime_params(
     fluxor::kernel::sys::hal::RuntimeParams::Compiled
 }
 
+/// A raw register access (`MMIO_READ32`/`MMIO_WRITE32`) reaches device
+/// registers and nothing else: a 4-byte-aligned word inside one of the
+/// board's device apertures (`boot_mmu::is_device_aperture`). DRAM — the
+/// kernel's tables, module state, firmware memory — and address space with
+/// nothing behind it are refused, whatever `platform_raw` grants. The first
+/// refusal is logged.
+fn mmio_target_ok(addr: u64) -> bool {
+    let ok = addr & 3 == 0 && boot_mmu::is_device_aperture(addr);
+    if !ok {
+        report_refused_access("MMIO", addr, 4);
+    }
+    ok
+}
+
+/// Cache maintenance by address (`CACHE_FLUSH_RANGE`, `DMA_FLUSH`,
+/// `DMA_INVALIDATE`) acts on DMA buffers only: `[addr, addr + size)` must lie
+/// inside one of the arenas the DMA allocators hand out. Anywhere else an
+/// invalidate would discard the kernel's dirty lines, and an unmapped address
+/// would fault the kernel. The first refusal is logged.
+fn dma_range_ok(addr: u64, size: u32) -> bool {
+    use fluxor::platform::nic_ring as ring;
+    let arenas = [
+        (ring::dma_arena_base(), ring::DMA_ARENA_SIZE),
+        (ring::pcie1_dma_arena_base(), ring::pcie1_dma_arena_size()),
+        (
+            ring::pcie1_stream_arena_base(),
+            ring::PCIE1_STREAM_ARENA_SIZE,
+        ),
+    ];
+    let ok = addr.checked_add(u64::from(size)).is_some_and(|end| {
+        arenas.iter().any(|&(base, len)| {
+            let (base, len) = (base as u64, len as u64);
+            base != 0 && addr >= base && end <= base + len
+        })
+    });
+    if !ok {
+        report_refused_access("DMA cache maintenance", addr, size);
+    }
+    ok
+}
+
+fn report_refused_access(what: &str, addr: u64, size: u32) {
+    static REPORTED: AtomicBool = AtomicBool::new(false);
+    if !REPORTED.swap(true, Ordering::Relaxed) {
+        log::warn!(
+            "[platform] {what} at {addr:#x} (+{size}) refused: outside the device apertures \
+             and DMA arenas (further refusals not logged)"
+        );
+    }
+}
+
 unsafe fn bcm_system_extension_dispatch(
     _handle: i32,
     opcode: u32,
@@ -2585,6 +2637,9 @@ unsafe fn bcm_system_extension_dispatch(
                 *arg.add(6),
                 *arg.add(7),
             ]);
+            if !mmio_target_ok(addr) {
+                return fluxor::kernel::sys::errno::EFAULT;
+            }
             let val = core::ptr::read_volatile(addr as *const u32);
             let vb = val.to_le_bytes();
             *arg.add(8) = vb[0];
@@ -2608,6 +2663,9 @@ unsafe fn bcm_system_extension_dispatch(
                 *arg.add(7),
             ]);
             let val = u32::from_le_bytes([*arg.add(8), *arg.add(9), *arg.add(10), *arg.add(11)]);
+            if !mmio_target_ok(addr) {
+                return fluxor::kernel::sys::errno::EFAULT;
+            }
             core::ptr::write_volatile(addr as *mut u32, val);
             0
         }
@@ -2626,6 +2684,9 @@ unsafe fn bcm_system_extension_dispatch(
                 *arg.add(7),
             ]);
             let size = u32::from_le_bytes([*arg.add(8), *arg.add(9), *arg.add(10), *arg.add(11)]);
+            if !dma_range_ok(addr, size) {
+                return fluxor::kernel::sys::errno::EFAULT;
+            }
             // Clean + invalidate data cache by VA range
             let mut ptr = (addr as usize) & !63;
             let end = ((addr as usize) + size as usize + 63) & !63;
@@ -2642,9 +2703,10 @@ unsafe fn bcm_system_extension_dispatch(
             }
             let size = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
             let align = u32::from_le_bytes([*arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7)]);
-            // Use the PCIe1-reachable arena at AXI 0x1_0000_0000 so
-            // device DMA routed through the PCIe1 inbound window lands
-            // in real DRAM. See `bcm2712_nic_ring::pcie1_dma_alloc_contig`.
+            // From the PCIe1 DMA arena, a BSS static the boot tables map
+            // Normal Non-cacheable; a device behind PCIe1 reaches it through
+            // the inbound BAR1 window (`pcie::enumerate`). See
+            // `platform::nic_ring::pcie1_dma_alloc_contig`.
             let phys =
                 fluxor::platform::nic_ring::pcie1_dma_alloc_contig(size as usize, align as usize);
             if phys == 0 {
@@ -2689,6 +2751,9 @@ unsafe fn bcm_system_extension_dispatch(
                 *arg.add(7),
             ]);
             let size = u32::from_le_bytes([*arg.add(8), *arg.add(9), *arg.add(10), *arg.add(11)]);
+            if !dma_range_ok(addr, size) {
+                return fluxor::kernel::sys::errno::EFAULT;
+            }
             // Clean (but do not invalidate) by VA range. Caller has just
             // written to a streaming DMA buffer and is about to hand it
             // to the device. `dc cvac` pushes dirty lines to PoC so the
@@ -2717,6 +2782,9 @@ unsafe fn bcm_system_extension_dispatch(
                 *arg.add(7),
             ]);
             let size = u32::from_le_bytes([*arg.add(8), *arg.add(9), *arg.add(10), *arg.add(11)]);
+            if !dma_range_ok(addr, size) {
+                return fluxor::kernel::sys::errno::EFAULT;
+            }
             // Invalidate by VA range. Device has just DMA'd into the
             // region; drop any speculatively-loaded stale CPU lines so
             // the next CPU load returns DMA data. `dc ivac` is the

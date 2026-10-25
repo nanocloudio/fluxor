@@ -16,7 +16,7 @@
 //! | Forwarding | On each workload link, and on each uplink (the links peers and default routes leave by) through the registry. |
 //! | Forward guard | `ct state established,related accept`; `iif ∈ instance links accept`; `oif ∈ instance links, daddr ∈ cluster accept`; other traffic on instance links dropped. On an uplink whose forwarding the registry itself turned on, forwarded traffic that is neither translated nor established is dropped (the node does not become a router for its LAN); an uplink the host already forwarded on is left alone. |
 //! | Redirects | `send_redirects` off globally and on each uplink, through the registry (the per-link setting is OR'd with the global one). |
-//! | Peer routes | `prefix via peer` in the instance table — except a route whose prefix overlaps the connected prefix of one of the node's own uplink addresses, which is not installed and reads `refused(conflict)`; the overlap is checked again whenever the probe finds the uplink addresses changed. |
+//! | Peer routes | `prefix via peer` in the instance table — except a route whose prefix overlaps the connected prefix of one of the node's addresses on a host link (loopback, instance links and held addresses aside), which is not installed and reads `refused(conflict)`; the overlap is checked again whenever the periodic probe finds those addresses changed. |
 //! | Egress translated | Source translation in the guard table: segment prefix → destinations outside the cluster prefixes. |
 //! | Held `announce` | `addr/32` to the dummy link in the instance table, a proxy neighbour entry on the uplink whose connected prefix covers the address, `proxy_delay = 0` there through the registry (a broadcast request is otherwise answered after up to 0.8 s), and an unsolicited announcement on arm from a raw link socket. The uplink forwards (through the registry, guarded as above). Fence withdraws the entry, the route and the tunable dependence. Requires `FORWARD`. |
 //! | Held `deliver` | `addr/32` on the covering uplink, no prefix route, marked with [`HELD_ADDR_PROTO`]. |
@@ -176,7 +176,8 @@ struct State {
     held_evidence: Vec<([u8; 4], u32, u64)>,
     held_installs: u32,
     held_fences: u64,
-    /// The uplink prefixes the peer routes were last checked against.
+    /// The host-link prefixes the peer routes were last checked against
+    /// ([`uplink_prefixes`]).
     uplink_prefixes: Vec<([u8; 4], u8)>,
 }
 
@@ -580,7 +581,7 @@ fn start_prober() {
                 log::info!("[net_route] host changed: {p:?}");
             }
             st.probes = Some(p);
-            // The node's uplink addresses moved: the peer routes are
+            // The node's host-link addresses moved: the peer routes are
             // checked against them again.
             if !st.routes.is_empty() {
                 if let Ok(tag) = instance::live_tag() {
@@ -897,12 +898,12 @@ fn realize(st: &mut State) {
             *o = Outcome::Unsupported;
         }
     }
-    // A peer route never takes the node's own uplink.
+    // A peer route never takes one of the node's own links.
     let ups = uplink_prefixes(&tag);
     for (o, r) in st.route_outcome.iter_mut().zip(&st.routes) {
         if *o == Outcome::Ok && covers_uplink(&r.prefix, &ups) {
             log::warn!(
-                "[net_route] peer route {}/{} overlaps the node's uplink: refused(conflict)",
+                "[net_route] peer route {}/{} overlaps a link of the node's: refused(conflict)",
                 dotted(v4(&r.prefix.addr)),
                 r.prefix.len
             );
@@ -1366,10 +1367,10 @@ fn host_addrs() -> Result<Vec<HostAddr>, i32> {
     result.map(|()| out)
 }
 
-/// The connected prefixes of the node's own uplink addresses: every IPv4
-/// address on a host link that is not an instance link (any runtime's) or
-/// loopback, held addresses excepted (they are service addresses the node
-/// answers for, not its link).
+/// The connected prefixes of the node's own addresses: every IPv4 address
+/// on a host link that is not an instance link (any runtime's) or loopback,
+/// held addresses excepted (they are service addresses the node answers
+/// for, not a link it is on).
 fn uplink_prefixes(tag: &str) -> Vec<([u8; 4], u8)> {
     let stem = instance::stem(tag);
     let links = nl::links().unwrap_or_default();
@@ -1386,7 +1387,8 @@ fn uplink_prefixes(tag: &str) -> Vec<([u8; 4], u8)> {
     out
 }
 
-/// Whether peer-route prefix `p` overlaps one of the uplink prefixes `ups`.
+/// Whether peer-route prefix `p` overlaps one of the node's link prefixes
+/// `ups` ([`uplink_prefixes`]).
 pub fn covers_uplink(p: &wire::Prefix, ups: &[([u8; 4], u8)]) -> bool {
     ups.iter().any(|(a, len)| {
         let mut addr = [0u8; wire::ADDR_LEN];
@@ -1915,7 +1917,36 @@ static REALIZER: store::Realizer = store::Realizer {
 /// An address another live attachment holds, or a segment's gateway, is
 /// `EEXIST`: the route to it would be taken from the workload that has it,
 /// and the guard would let both send as it.
+///
+/// The attachment is made and recorded as one step with the check a
+/// SEGMENTS replace makes (`kernel::net_route::attach_segment`): the
+/// segment is checked again in the table, under the flag a replace holds
+/// from its attached-workload check to its store, and attached only while
+/// the table still holds it as `seg` — the segment the workload's inside
+/// was configured for. So a replace either sees the attachment (`EBUSY`) or
+/// came first, and this answers what a CREATE naming the segment now gets
+/// (`ENOENT`, `EINVAL`), or `EAGAIN` for a segment since changed, with
+/// nothing recorded.
 pub fn attach(link: &str, index: i32, addr: [u8; 4], seg: &wire::Segment) -> i32 {
+    let mut a = [0u8; wire::ADDR_LEN];
+    a[..4].copy_from_slice(&addr);
+    let mut rc = errno::ERROR;
+    let checked = store::attach_segment(wire::FAM_IPV4, &a, seg.id, true, |now| {
+        rc = if now == seg {
+            attach_checked(link, index, addr, seg)
+        } else {
+            errno::EAGAIN
+        };
+    });
+    match checked {
+        Ok(_) => rc,
+        Err(e) => e,
+    }
+}
+
+/// [`attach`] once the table holds `seg`: called under the table's apply
+/// flag, so no replace runs while the attachment is made.
+fn attach_checked(link: &str, index: i32, addr: [u8; 4], seg: &wire::Segment) -> i32 {
     let mut st = state();
     let p = probes(&mut st);
     if !p.admin || !p.nft || !p.tunables {

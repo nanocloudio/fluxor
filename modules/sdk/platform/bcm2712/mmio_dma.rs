@@ -9,10 +9,15 @@
 
 /// Read a 32-bit value from a physical MMIO address (aarch64 only).
 /// handle=-1, arg=[addr:u64 LE] (8 bytes input).
-/// On success, writes u32 LE result to arg[8..12]. Returns 0 or negative errno.
+/// On success, writes u32 LE result to arg[8..12]. Returns 0, or `EFAULT` for
+/// an address that is not a 4-byte-aligned word inside one of the board's
+/// device apertures (DRAM and address space with nothing behind it are never
+/// reachable this way), or another negative errno.
 pub const MMIO_READ32: u32 = 0x0CE4;
 /// Write a 32-bit value to a physical MMIO address (aarch64 only).
-/// handle=-1, arg=[addr:u64 LE, value:u32 LE] (12 bytes input). Returns 0 or negative errno.
+/// handle=-1, arg=[addr:u64 LE, value:u32 LE] (12 bytes input). Returns 0, or
+/// `EFAULT` under the same address rule as [`MMIO_READ32`], or another
+/// negative errno.
 pub const MMIO_WRITE32: u32 = 0x0CE5;
 /// Allocate physically contiguous DMA memory (aarch64 only).
 /// handle=-1, arg=[size:u32 LE, align:u32 LE] (8 bytes input).
@@ -21,19 +26,25 @@ pub const DMA_ALLOC_CONTIG: u32 = 0x0CE6;
 
 /// Flush (clean + invalidate) a virtual address range from data cache.
 /// Required for DMA coherency on aarch64 where DMA arena is cacheable.
-/// handle=-1, arg=[addr:u64 LE, size:u32 LE] (12 bytes). Returns 0.
+/// handle=-1, arg=[addr:u64 LE, size:u32 LE] (12 bytes). Returns 0, or
+/// `EFAULT` unless `[addr, addr + size)` lies inside one DMA arena the
+/// allocators below hand out (a range that wraps included).
 pub const CACHE_FLUSH_RANGE: u32 = 0x0CE7;
 
 /// Clean (but do not invalidate) a VA range from data cache (`dc cvac`).
 /// Use before handing a cacheable buffer to a device that will READ it
 /// — ensures the device sees the CPU's writes.
-/// handle=-1, arg=[addr:u64 LE, size:u32 LE] (12 bytes). Returns 0.
+/// handle=-1, arg=[addr:u64 LE, size:u32 LE] (12 bytes). Returns 0, or
+/// `EFAULT` unless `[addr, addr + size)` lies inside one DMA arena the
+/// allocators below hand out (a range that wraps included).
 pub const DMA_FLUSH: u32 = 0x0CEA;
 
 /// Invalidate a VA range from data cache (`dc ivac`) without cleaning.
 /// Use before reading a cacheable buffer that a device has just WRITTEN
 /// — drops any stale CPU cache lines so the next load returns DMA data.
-/// handle=-1, arg=[addr:u64 LE, size:u32 LE] (12 bytes). Returns 0.
+/// handle=-1, arg=[addr:u64 LE, size:u32 LE] (12 bytes). Returns 0, or
+/// `EFAULT` unless `[addr, addr + size)` lies inside one DMA arena the
+/// allocators below hand out (a range that wraps included).
 pub const DMA_INVALIDATE: u32 = 0x0CEB;
 
 /// Allocate physically contiguous DMA memory from a STREAMING (cacheable)

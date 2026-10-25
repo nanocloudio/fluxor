@@ -1,11 +1,11 @@
 //! mem_ns — RAM-backed `storage.namespace` fixture provider.
 //!
 //! The contract-proving provider for the namespace surface
-//! (`modules/sdk/contracts/storage/namespace.rs`), and the first
-//! implementor of `BIND` (0x1308). Exists so the surface — and the
+//! (`modules/sdk/contracts/storage/namespace.rs`), and the implementor of
+//! `BIND` (0x1308) that proves it. Exists so the surface — and the
 //! `mount` routing tier above it — is testable with **no on-disk
-//! format in the loop** (a repo
-//! that owns a contract holds an in-repo provider that proves it).
+//! format in the loop**: a repo that owns a contract holds an in-repo
+//! provider that proves it.
 //!
 //! Every binding lives in the module's state arena: a fixed table of
 //! `path → {kind, target}` entries plus a LOOKUP handle table. All
@@ -738,13 +738,12 @@ unsafe fn ns_subscribe(s: &mut MemNsState, a: &[u8]) -> i32 {
         return E_INVAL;
     }
     let sys = &*s.syscalls;
-    let occ = match query_record(sys, -1, query_key::CALLER_MODULE) {
-        Ok(r) => r,
-        Err(e) => return e,
-    };
-    let owner = match query_record(sys, -1, query_key::CALLER_OWNER) {
-        Ok(r) => r,
-        Err(e) => return e,
+    // A call from outside any module has no occupancy to stamp.
+    let (Ok(occ), Ok(owner)) = (
+        query_record(sys, -1, query_key::CALLER_MODULE),
+        query_record(sys, -1, query_key::CALLER_OWNER),
+    ) else {
+        return E_INVAL;
     };
     // The event must be the caller's own: a subscription never wakes a
     // module that did not ask for it.
@@ -826,13 +825,12 @@ unsafe fn ns_take_rung(s: &mut MemNsState, a: &[u8]) -> i32 {
         return E_INVAL;
     };
     let out = core::slice::from_raw_parts_mut(req.out_ptr as *mut u8, req.out_cap as usize);
+    let sys = &*s.syscalls;
+    let Ok(occ) = query_record(sys, -1, query_key::CALLER_MODULE) else {
+        return E_INVAL;
+    };
     let Some(mut w) = take::Writer::new(out) else {
         return E_NOMEM;
-    };
-    let sys = &*s.syscalls;
-    let occ = match query_record(sys, -1, query_key::CALLER_MODULE) {
-        Ok(r) => r,
-        Err(e) => return e,
     };
     let mut more = false;
     let mut i = 0;

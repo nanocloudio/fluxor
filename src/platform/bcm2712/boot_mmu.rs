@@ -67,9 +67,9 @@ pub unsafe fn enable() {
 ///                                     outbound window (RP1's UART, Ethernet, …)
 ///
 /// The fixed map (no readable tree) is the first gigabyte whole, gigabytes
-/// 1..5 DRAM and 5..16 Device. Both BSS-backed
-/// DMA arenas must live below 4 GB because the PCIe1 inbound ATU only covers
-/// PCI bus 0..0xFFFFFFFF.
+/// 1..5 DRAM and 5..16 Device. Both BSS-backed DMA arenas lie in the image's
+/// RAM in the first gigabyte (below `RAM_CEILING`), the only gigabyte mapped
+/// in 2 MB blocks, so their blocks can be mapped Normal Non-cacheable.
 ///
 /// # Safety
 /// Called once, early in boot, with the MMU off, after
@@ -119,18 +119,43 @@ pub unsafe fn init_page_tables() {
         };
         boot_mmu::map_gb(gb, kind);
     }
-    // The SoC aperture at 0x10_0000_0000 (2 GB): L1 indices 64, 65.
-    boot_mmu::map_gb(64, Kind::Device);
-    boot_mmu::map_gb(65, Kind::Device);
-    // PCIe1 outbound windows at 0x18_0000_0000..0x1B_FFFF_FFFF (16 GB, the
-    // `ranges` of the devicetree's pcie@1000110000): indices 96..111.
-    for gb in 96..112 {
-        boot_mmu::map_gb(gb, Kind::Device);
+    for &(first, end) in DEVICE_APERTURE_GBS.iter() {
+        for gb in first..end {
+            boot_mmu::map_gb(gb, Kind::Device);
+        }
     }
-    // The RP1 BAR at 0x1C_0000_0000: 4 GB, indices 112..115.
-    for gb in 112..116 {
-        boot_mmu::map_gb(gb, Kind::Device);
-    }
+}
+
+/// The device apertures, as `[first, end)` gigabytes: where the boot tables
+/// map registers, and the only addresses the raw MMIO opcodes reach
+/// ([`is_device_aperture`]). A gigabyte mapped Device only because it holds
+/// no memory is not one: nothing answers there, and an access is an
+/// asynchronous external abort.
+///
+/// - the SoC aperture at 0x10_0000_0000 (2 GB): GIC, UARTs, the PCIe root
+///   complexes, the IOMMUs;
+/// - the PCIe1 outbound windows at 0x18_0000_0000..0x1B_FFFF_FFFF (16 GB,
+///   the `ranges` of the devicetree's pcie@1000110000);
+/// - the RP1 BAR at 0x1C_0000_0000 (4 GB), where the firmware leaves
+///   PCIe2's outbound window.
+#[cfg(feature = "board-pi5")]
+const DEVICE_APERTURE_GBS: [(usize, usize); 3] = [(64, 66), (96, 112), (112, 116)];
+
+/// QEMU virt's device apertures: the first gigabyte (flash, GIC, UART,
+/// virtio-mmio, the low PCIe windows and ECAM) and the gigabyte at 256 GB
+/// (the second GIC redistributor region and the high PCIe ECAM). The rest of
+/// the address space below 512 GB is mapped Device only because it holds no
+/// memory.
+#[cfg(not(feature = "board-pi5"))]
+const DEVICE_APERTURE_GBS: [(usize, usize); 2] = [(0, 1), (256, 257)];
+
+/// Whether `addr` lies in one of the board's device apertures — never DRAM,
+/// never firmware memory, never a hole with nothing behind it.
+pub fn is_device_aperture(addr: u64) -> bool {
+    let gb = (addr >> 30) as usize;
+    DEVICE_APERTURE_GBS
+        .iter()
+        .any(|&(first, end)| gb >= first && gb < end)
 }
 
 /// QEMU virt: RAM starts at 1 GB and is as large as the machine was given
@@ -140,7 +165,7 @@ pub unsafe fn init_page_tables() {
 /// address space with no memory behind it is never mapped as memory, where a
 /// speculative fetch could reach it. Every other gigabyte below 512 GB is
 /// Device — the first holds the flash, GIC, UART, virtio-mmio and low PCIe
-/// windows, the one at 256 GB the PCIe ECAM. The 64-bit PCIe window, at
+/// windows, the one at 256 GB the high PCIe ECAM. The 64-bit PCIe window, at
 /// 512 GB, is outside a 39-bit address space and is not mapped; nothing here
 /// places a BAR there. Without the map the MMU stays off, every access is
 /// Device-nGnRnE, and module code — built for a part that runs with the MMU

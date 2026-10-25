@@ -1170,9 +1170,9 @@ fn privileged_op_permission(op: u32) -> Option<u16> {
         //    this is a narrower grant than raw MMIO/DMA (`platform_raw`). ──
         0x0CA0..=0x0CA6 => Some(PCIE_DEVICE),
 
-        // ── backing_provider: BACKING_PROVIDER_ENABLE, ARENA_REGISTER, ─
-        //     ARENA_READ, SMMU map/unmap/fault-check, ARENA_BULK. ───────
-        0x0CE9 | 0x0CED | 0x0CEE | 0x0CEF | 0x0CFB..=0x0CFF => Some(BACKING_PROVIDER),
+        // ── backing_provider: ARENA_BULK, BACKING_PROVIDER_ENABLE, ─────
+        //     ARENA_REGISTER, ARENA_READ, ARENA_WRITE, ARENA_FLUSH. ─────
+        0x0CE9 | 0x0CED | 0x0CEE | 0x0CEF | 0x0CFE | 0x0CFF => Some(BACKING_PROVIDER),
 
         // ── platform_raw: everything else in 0x0Cxx ────────────────────
         // Explicit coverage for clarity:

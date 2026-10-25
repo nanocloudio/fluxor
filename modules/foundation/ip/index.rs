@@ -17,18 +17,14 @@
 //! Each is explicit about what it holds and is maintained at the exact
 //! points a connection is keyed or released (`conn_index_insert` /
 //! `conn_reset` in `mod.rs`), so nothing here is ever rebuilt on the hot
-//! path. Entries are `slot + 1` and 0 is empty — there is no third state.
-//! A removal pulls the rest of its chain back over the hole rather than
-//! marking it, so every entry is either live or free and a lookup always
-//! meets an empty entry at the end of its cluster. Marking instead would
-//! be cheaper per removal and unsound over time: a mark is only skipped,
-//! never reclaimed, so under sustained churn the empties disappear and
-//! every MISS walks the whole table — the one case an index exists to make
-//! cheap, turned into the most expensive thing the module does.
+//! path. The hash indices are the shared open-addressed index
+//! (`modules/sdk/runtime/hash_index.rs`, mounted below): entries are
+//! `slot + 1`, removal is backward-shift deletion, so a lookup always ends
+//! at an empty entry. The per-source table deletes the same way.
 //!
-//! The index is twice the table, so clusters stay short, and the hash is
-//! seeded per module instance so the tuples that land in one cluster
-//! cannot be chosen from outside.
+//! The connection index is twice the table, so clusters stay short, and
+//! the hash is seeded per module instance so the tuples that land in one
+//! cluster cannot be chosen from outside.
 
 include!("../../sdk/runtime/hash_index.rs");
 
@@ -79,10 +75,10 @@ impl SourceCount {
 /// visible.
 ///
 /// # Safety
-/// `table` must be a power-of-two length.
+/// `table` must be a power-of-two length, or empty.
 #[inline]
 pub unsafe fn source_enter(table: &mut [SourceCount], ip: u32) -> Option<u32> {
-    let mask = table.len() - 1;
+    let mask = table.len().wrapping_sub(1);
     let mut i = mix32(ip) as usize & mask;
     let mut probes = 0;
     while probes < table.len() {
@@ -109,10 +105,10 @@ pub unsafe fn source_enter(table: &mut [SourceCount], ip: u32) -> Option<u32> {
 /// the table never fills with them under churn.
 ///
 /// # Safety
-/// `table` must be a power-of-two length.
+/// `table` must be a power-of-two length, or empty.
 #[inline]
 pub unsafe fn source_leave(table: &mut [SourceCount], ip: u32) {
-    let mask = table.len() - 1;
+    let mask = table.len().wrapping_sub(1);
     let mut i = mix32(ip) as usize & mask;
     let mut probes = 0;
     while probes < table.len() {
@@ -161,13 +157,13 @@ pub unsafe fn source_leave(table: &mut [SourceCount], ip: u32) {
 /// than take it on trust.
 ///
 /// # Safety
-/// `index` must be a power-of-two length.
+/// `index` must be a power-of-two length, or empty.
 pub unsafe fn lookup_counted<F: FnMut(usize) -> bool>(
     index: &[u32],
     hash: u32,
     mut matches: F,
 ) -> (Option<usize>, usize) {
-    let mask = index.len() - 1;
+    let mask = index.len().wrapping_sub(1);
     let mut i = hash as usize & mask;
     let mut probes = 0;
     while probes < index.len() {

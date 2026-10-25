@@ -233,13 +233,12 @@ pub fn prepare_graph() -> Result<(ModuleList, usize), i32> {
         &mut *p
     };
 
-    // Transaction marker: latch BEFORE any destructive reset so a
-    // racing `step_modules` on another core observes a half-prepared
-    // graph as `StepResult::Done` (cleanly idle) rather than iterating
-    // stale pointers. Cleared at the successful return path below; on
-    // an early-return failure the marker is intentionally left set so
-    // the SCHED is fail-safe until the next `prepare_graph` re-latches
-    // it.
+    // Transaction marker, latched before any destructive reset: while it
+    // is set, `step_modules` reports the graph `StepResult::Done` (cleanly
+    // idle) instead of stepping a half-prepared one. Cleared on the
+    // successful return below. A failed preparation leaves it set, so a
+    // domain that resumes after the quiesce steps nothing until the next
+    // `prepare_graph` succeeds.
     sched.prepare_in_progress = true;
 
     // Clear `current_module` so the runtime EACCES gate

@@ -145,7 +145,7 @@ pub const ELASTIC_ALLOC: u32 = 0x0C3F;
 // A pool can be served by a module provider rather than a kernel table: the
 // store's subscriptions, when a module provides `storage.namespace` (the
 // composer then plans the demand into that provider's heap, not the host
-// table). The ledger still keeps no counters of its own: it PULLS the pool's
+// table). The ledger keeps no counters of its own: it PULLS the pool's
 // in-use figure from that provider, and the provider tells it of each
 // refusal, so the pool's `POOL` record reads the same whoever serves it.
 //
@@ -166,9 +166,9 @@ pub const ELASTIC_ALLOC: u32 = 0x0C3F;
 ///
 /// `handle = -1`; `arg = [pool: u16 LE]`, `arg_len = 2`. The provider
 /// answers the pool's in-use figure in the pool's own unit (`>= 0`), or a
-/// negative errno when it cannot say — the ledger then keeps the last
-/// figure it was given. The handler must be bounded: a count it keeps, not
-/// a walk.
+/// negative errno when it cannot say — the ledger then reads the pool from
+/// its kernel owner until a later round's answer. The handler must be
+/// bounded: a count it keeps, not a walk.
 pub const POOL_SAMPLE: u32 = 0x0C25;
 
 /// Byte length of the `POOL_SAMPLE` argument.

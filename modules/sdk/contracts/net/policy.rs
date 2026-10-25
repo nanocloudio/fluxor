@@ -145,9 +145,9 @@ pub const READ: u32 = 0x1E04;
 /// full, or 0 for none yet. An entry whose length byte carries
 /// [`ATTACH_CAPACITY`] also declares `capacity`, the most rule bytes of the
 /// table the enforcer holds: from then on a REPLACE of that table past it
-/// fails `E2BIG` (an entry without it declares no bound, and a later one
-/// without it keeps the bound declared). The first ATTACH naming a table binds it to the
-/// calling module, by its slot and that slot's generation; re-issuing ATTACH
+/// fails `E2BIG`. A `capacity` of 0, or an entry without one, declares no
+/// bound; a later entry without one keeps the bound its binding declared.
+/// The first ATTACH naming a table binds it to the calling module, by its slot and that slot's generation; re-issuing ATTACH
 /// with a new `applied_gen` reports progress. A table has at most one
 /// enforcer: naming a table bound to another live enforcer is `EBUSY`, and
 /// the call changes nothing (all entries or none). A binding ends when its
@@ -236,6 +236,13 @@ pub mod rule {
     /// The port is always the destination's: the subject's own port for
     /// ingress, the peer's for egress, in both directions alike, as
     /// orchestrator network policies define a rule's ports.
+    ///
+    /// `proto` 0 is any protocol: with ports, TCP or UDP to those ports;
+    /// without, every packet. TCP or UDP match that protocol, to the ports
+    /// when there are any. Any other protocol matches itself and carries no
+    /// ports. A range is `port_lo..=port_hi`, `port_hi` 0 the single port
+    /// `port_lo`; a record with ports on a protocol that has none, or with
+    /// `port_hi` below `port_lo`, is malformed.
     pub const ALLOW: u8 = 1;
     /// Drop matching traffic. Same body as [`ALLOW`].
     pub const DROP: u8 = 2;
@@ -253,11 +260,16 @@ pub mod rule {
     /// [`XLATE_HAIRPIN`], [`XLATE_ALWAYS`]), bit 2 [`DNAT_SCOPE_LOCAL`]; the
     /// other bits are zero.
     ///
-    /// `proto` 0 matches any protocol, `vport` 0 any port. A backend port
-    /// of 0 is the port the traffic was sent to: the service's own (`vport`),
-    /// or, for a service on any port, the packet's. A service on any port
-    /// keeps the port (every backend port 0) or sets it (none 0), across
-    /// all its records; one that mixes the two is malformed.
+    /// `proto` 0 matches any protocol, `vport` 0 any port. Ports are TCP's
+    /// and UDP's: a service for any protocol on a `vport` is for TCP and UDP
+    /// to it, and a `vport` on another protocol is malformed. A backend
+    /// port of 0 is the port the traffic was sent to: the service's own
+    /// (`vport`), or, for a service on any port, the packet's. Any other
+    /// backend port is set only on TCP or UDP traffic (`proto` 6 or 17, or
+    /// 0 with a `vport`); a record setting one on traffic that may carry no
+    /// port is malformed. A service on any port keeps the port (every
+    /// backend port 0) or sets it (none 0), across all its records; one
+    /// that mixes the two is malformed.
     ///
     /// `n == 0` is a VIP with no backends: traffic to it is rejected, not
     /// passed through to an address nothing serves. A VIP with more backends
@@ -392,10 +404,21 @@ pub fn filter(body: &[u8]) -> Option<Filter> {
         port_lo: be16(body, 12),
         port_hi: be16(body, 14),
     };
-    if f.subject_prefix > 32 || f.peer_prefix > 32 {
+    let ports = f.port_lo != 0 || f.port_hi != 0;
+    if f.subject_prefix > 32
+        || f.peer_prefix > 32
+        || (ports && !has_ports(f.proto))
+        || (f.port_hi != 0 && f.port_hi < f.port_lo)
+    {
         return None;
     }
     Some(f)
+}
+
+/// Whether a rule for `proto` may name ports: TCP, UDP, or any protocol
+/// (which with ports means TCP or UDP).
+fn has_ports(proto: u8) -> bool {
+    matches!(proto, rule::PROTO_ANY | rule::PROTO_TCP | rule::PROTO_UDP)
 }
 
 /// Decode an ISOLATE body: `(dir, subject, prefix)`.
@@ -424,8 +447,20 @@ pub fn dnat(body: &[u8]) -> Option<Dnat> {
     }
     if d.flags & !rule::DNAT_FLAGS_KNOWN != 0
         || d.flags & rule::DNAT_XLATE_MASK > rule::XLATE_ALWAYS
+        || (d.vport != 0 && !has_ports(d.proto))
     {
         return None;
+    }
+    // A backend port is set only on traffic that has one: TCP or UDP.
+    let sets_port = matches!(d.proto, rule::PROTO_TCP | rule::PROTO_UDP)
+        || (d.proto == rule::PROTO_ANY && d.vport != 0);
+    let mut i = 0;
+    while i < d.backends as usize {
+        match dnat_backend(body, i) {
+            Some((_, port)) if port != 0 && !sets_port => return None,
+            _ => {}
+        }
+        i += 1;
     }
     Some(d)
 }
@@ -435,14 +470,17 @@ impl Dnat {
     pub fn same_service(&self, o: &Dnat) -> bool {
         self.proto == o.proto && self.vip == o.vip && self.vport == o.vport
     }
-    /// Some packet matches both services: one address, protocols equal or
-    /// either any, ports equal or either any.
+    /// Some packet matches both services: one address, a protocol both
+    /// match, and a port both match. A service for any protocol on a port
+    /// is for TCP and UDP to it, so it meets no other protocol's.
     pub fn overlaps(&self, o: &Dnat) -> bool {
-        self.vip == o.vip
-            && (self.proto == o.proto
-                || self.proto == rule::PROTO_ANY
-                || o.proto == rule::PROTO_ANY)
-            && (self.vport == o.vport || self.vport == 0 || o.vport == 0)
+        let protos = match (self.proto, o.proto) {
+            (a, b) if a == b => true,
+            (rule::PROTO_ANY, p) => self.vport == 0 || has_ports(p),
+            (p, rule::PROTO_ANY) => o.vport == 0 || has_ports(p),
+            _ => false,
+        };
+        self.vip == o.vip && protos && (self.vport == o.vport || self.vport == 0 || o.vport == 0)
     }
     /// The service matches traffic to `(dst, dport)` over `proto` — `dport`
     /// 0 for a protocol without ports.
@@ -605,9 +643,10 @@ pub fn in_net(addr: u32, net: u32, prefix: u8) -> bool {
 
 /// The layer-4 part of a rule — `(proto, lo, hi)`, ports the destination's,
 /// `0/0` none — matches the packet, as the Linux rendering spells it: TCP or
-/// UDP with ports match that protocol and port range; TCP or UDP alone, that
-/// protocol; ICMP matches ICMP whatever the ports; any other protocol with
-/// ports matches TCP or UDP to those ports, and with none, every packet.
+/// UDP match that protocol, in the port range when there is one; any
+/// protocol with ports matches TCP or UDP to those ports, and with none,
+/// every packet; any other protocol matches itself (a decoded rule gives it
+/// no ports).
 #[inline]
 pub fn l4_matches(proto: u8, lo: u16, hi: u16, p: &Packet) -> bool {
     let ports = lo != 0 || hi != 0;
@@ -619,9 +658,9 @@ pub fn l4_matches(proto: u8, lo: u16, hi: u16, p: &Packet) -> bool {
     let tcp_udp = p.proto == rule::PROTO_TCP || p.proto == rule::PROTO_UDP;
     match proto {
         rule::PROTO_TCP | rule::PROTO_UDP => p.proto == proto && (!ports || port_ok),
-        rule::PROTO_ICMP => p.proto == rule::PROTO_ICMP,
-        _ if ports => tcp_udp && port_ok,
-        _ => true,
+        rule::PROTO_ANY if ports => tcp_udp && port_ok,
+        rule::PROTO_ANY => true,
+        other => p.proto == other,
     }
 }
 
@@ -804,36 +843,45 @@ pub fn validate(rules: &[u8], caps: u32) -> Result<(), i32> {
 /// - **Key.** A flow is `(proto, src, sport, dst, dport)` as its first packet
 ///   carried it; a packet matches it in that direction (original) or the
 ///   reverse (reply). An ICMP query is keyed by its identifier, carried as
-///   the request's source port and the reply's destination port.
+///   the request's source port and the reply's destination port. A protocol
+///   other than TCP, UDP and ICMP is keyed by its addresses alone.
 /// - **Verdict.** The first packet is judged; a flow is recorded only when it
 ///   passes, and every later packet of the flow passes on that record. A
-///   packet that matches no flow is judged as new, whatever its flags.
-/// - **TCP.** A segment with no flow opens one when it passes: a SYN without
-///   ACK begins it (`SYN_SENT`); a segment with neither SYN nor RST is taken
-///   up mid-stream (`ESTABLISHED`), as the host's tracker takes up a
-///   connection it did not see open; a SYN+ACK or an RST opens nothing. On a
-///   flow, the reply's SYN+ACK makes it `SYN_RECV`, the original side's ACK
-///   `ESTABLISHED`, a FIN from one side `FIN_WAIT`, FINs from both
-///   `LAST_ACK`, the ACK after them `TIME_WAIT`, and an RST `CLOSE`; a SYN
-///   without ACK on a `TIME_WAIT` or `CLOSE` flow is a new connection on the
-///   same ports, judged afresh.
-/// - **Datagrams** (and any protocol without ports) live
-///   [`DATAGRAM_UNREPLIED_S`] until the reply direction carries a packet,
-///   then [`DATAGRAM_REPLIED_S`]; an ICMP query [`ICMP_S`].
+///   packet that matches no flow is new and is judged, whatever its flags.
+/// - **TCP.** A segment whose flags are not a combination TCP sends
+///   ([`tcp_valid`]) belongs to no flow: it is judged as new and opens
+///   nothing. A segment with no flow opens one when it passes: a SYN
+///   without ACK begins it (`SYN_SENT`); an ACK without SYN, FIN or RST is
+///   taken up mid-stream (`ESTABLISHED`), as the host's tracker takes up a
+///   connection it did not see open; anything else (a SYN+ACK, a FIN, an
+///   RST) opens nothing. On a flow, the reply's SYN+ACK makes it
+///   `SYN_RECV` and the original side's ACK `ESTABLISHED`; a FIN from one
+///   side makes it `FIN_WAIT`, the other side's ACK of it `CLOSE_WAIT`, the
+///   other side's FIN `LAST_ACK`, and the ACK after both FINs `TIME_WAIT`;
+///   an RST makes it `CLOSE`. A SYN without ACK on a `TIME_WAIT` or `CLOSE`
+///   flow is a new connection on the same ports, judged afresh. Sequence
+///   numbers are not tracked.
+/// - **UDP** lives [`DATAGRAM_UNREPLIED_S`] until the reply direction
+///   carries a packet, then [`DATAGRAM_REPLIED_S`]; an ICMP query
+///   [`ICMP_S`]; any other protocol [`GENERIC_S`].
 /// - **ICMP errors** (destination unreachable, source quench, redirect, time
 ///   exceeded, parameter problem) carry the header of the packet they report;
 ///   one whose embedded packet belongs to a recorded flow, travelling back to
 ///   that packet's source, is part of the flow (related). Any other is judged
-///   as new, and opens nothing.
+///   as new, and opens nothing; so is an ICMP message that is neither a
+///   query nor an error.
 /// - **Expiry.** A flow lives its state's timeout past its last packet.
 ///
-/// The timeouts are the Linux connection tracker's defaults.
+/// The timeouts are the defaults of Linux's connection tracking, so a flow
+/// expires here when it would on a Linux host.
 pub mod flow {
     /// TCP flag bits.
     pub const TCP_FIN: u8 = 0x01;
     pub const TCP_SYN: u8 = 0x02;
     pub const TCP_RST: u8 = 0x04;
+    pub const TCP_PSH: u8 = 0x08;
     pub const TCP_ACK: u8 = 0x10;
+    pub const TCP_URG: u8 = 0x20;
 
     /// TCP states.
     pub const SYN_SENT: u8 = 1;
@@ -843,38 +891,62 @@ pub mod flow {
     pub const LAST_ACK: u8 = 5;
     pub const TIME_WAIT: u8 = 6;
     pub const CLOSE: u8 = 7;
+    pub const CLOSE_WAIT: u8 = 8;
 
     /// Seconds a TCP flow lives idle in each state.
     pub const TCP_SYN_SENT_S: u32 = 120;
     pub const TCP_SYN_RECV_S: u32 = 60;
     pub const TCP_ESTABLISHED_S: u32 = 432_000;
     pub const TCP_FIN_WAIT_S: u32 = 120;
+    pub const TCP_CLOSE_WAIT_S: u32 = 60;
     pub const TCP_LAST_ACK_S: u32 = 30;
     pub const TCP_TIME_WAIT_S: u32 = 120;
     pub const TCP_CLOSE_S: u32 = 10;
-    /// Seconds a datagram flow lives idle before and after its first reply.
+    /// Seconds a UDP flow lives idle before and after its first reply.
     pub const DATAGRAM_UNREPLIED_S: u32 = 30;
     pub const DATAGRAM_REPLIED_S: u32 = 120;
     /// Seconds an ICMP query flow lives idle.
     pub const ICMP_S: u32 = 30;
+    /// Seconds a flow of any other protocol lives idle.
+    pub const GENERIC_S: u32 = 600;
 
     /// FIN seen from the original side, and from the reply side.
     pub const FIN_ORIG: u8 = 1 << 0;
     pub const FIN_REPLY: u8 = 1 << 1;
 
-    /// The state a TCP segment with no flow opens, once it passes: `None`
-    /// when it opens nothing.
+    /// Whether `flags` are a combination TCP sends: SYN, SYN+ACK, RST,
+    /// RST+ACK, FIN+ACK or ACK — SYN, FIN+ACK and ACK also with URG —
+    /// whatever PSH, ECE and CWR say. The host tracker's table: anything
+    /// else it marks invalid.
+    pub fn tcp_valid(flags: u8) -> bool {
+        const S: u8 = TCP_SYN;
+        const A: u8 = TCP_ACK;
+        const R: u8 = TCP_RST;
+        const F: u8 = TCP_FIN;
+        const U: u8 = TCP_URG;
+        let f = flags & (F | S | R | A | U);
+        f == S
+            || f == S | U
+            || f == S | A
+            || f == R
+            || f == R | A
+            || f == F | A
+            || f == F | A | U
+            || f == A
+            || f == A | U
+    }
+
+    /// The state a valid TCP segment with no flow opens, once it passes:
+    /// `None` when it opens nothing.
     pub fn tcp_opens(flags: u8) -> Option<u8> {
-        if flags & TCP_RST != 0 {
+        if !tcp_valid(flags) || flags & (TCP_RST | TCP_FIN) != 0 {
             return None;
         }
-        if flags & TCP_SYN != 0 {
-            if flags & (TCP_ACK | TCP_FIN) == 0 {
-                return Some(SYN_SENT);
-            }
-            return None;
+        match flags & (TCP_SYN | TCP_ACK) {
+            TCP_SYN => Some(SYN_SENT),
+            TCP_ACK => Some(ESTABLISHED),
+            _ => None,
         }
-        Some(ESTABLISHED)
     }
 
     /// Whether a segment with `flags` on a flow in `state` begins a new
@@ -885,8 +957,8 @@ pub mod flow {
             && flags & (TCP_ACK | TCP_RST) == 0
     }
 
-    /// The state and FIN bits after a segment with `flags` on a flow in
-    /// `state` with `fins`; `reply` when it travels the reply direction.
+    /// The state and FIN bits after a valid segment with `flags` on a flow
+    /// in `state` with `fins`; `reply` when it travels the reply direction.
     pub fn tcp_next(state: u8, fins: u8, reply: bool, flags: u8) -> (u8, u8) {
         if flags & TCP_RST != 0 {
             return (CLOSE, fins);
@@ -902,12 +974,12 @@ pub mod flow {
             }
             SYN_RECV => {
                 if !reply && flags & TCP_ACK != 0 && flags & TCP_SYN == 0 {
-                    after_fin(ESTABLISHED, fins, side, flags)
+                    closing(ESTABLISHED, fins, side, flags)
                 } else {
                     (SYN_RECV, fins)
                 }
             }
-            ESTABLISHED | FIN_WAIT => after_fin(state, fins, side, flags),
+            ESTABLISHED | FIN_WAIT | CLOSE_WAIT => closing(state, fins, side, flags),
             LAST_ACK => {
                 if flags & TCP_FIN == 0 && flags & TCP_ACK != 0 {
                     (TIME_WAIT, fins)
@@ -919,16 +991,23 @@ pub mod flow {
         }
     }
 
-    fn after_fin(state: u8, fins: u8, side: u8, flags: u8) -> (u8, u8) {
-        if flags & TCP_FIN == 0 {
-            return (state, fins);
+    /// A segment from `side` on a flow that is open or closing.
+    fn closing(state: u8, fins: u8, side: u8, flags: u8) -> (u8, u8) {
+        if flags & TCP_FIN != 0 {
+            let f = fins | side;
+            if f == FIN_ORIG | FIN_REPLY {
+                return (LAST_ACK, f);
+            }
+            if state == ESTABLISHED {
+                return (FIN_WAIT, f);
+            }
+            return (state, f);
         }
-        let f = fins | side;
-        if f == FIN_ORIG | FIN_REPLY {
-            (LAST_ACK, f)
-        } else {
-            (FIN_WAIT, f)
+        if state == FIN_WAIT && flags & TCP_ACK != 0 && fins & side == 0 {
+            // The side that has not closed acknowledges the one that has.
+            return (CLOSE_WAIT, fins);
         }
+        (state, fins)
     }
 
     /// Seconds a TCP flow in `state` lives idle.
@@ -938,6 +1017,7 @@ pub mod flow {
             SYN_RECV => TCP_SYN_RECV_S,
             ESTABLISHED => TCP_ESTABLISHED_S,
             FIN_WAIT => TCP_FIN_WAIT_S,
+            CLOSE_WAIT => TCP_CLOSE_WAIT_S,
             LAST_ACK => TCP_LAST_ACK_S,
             TIME_WAIT => TCP_TIME_WAIT_S,
             _ => TCP_CLOSE_S,
@@ -951,7 +1031,7 @@ pub mod flow {
     pub const ICMP_TIMESTAMP_REPLY: u8 = 14;
 
     /// Whether ICMP `t` reports an error and carries the offending packet's
-    /// header.
+    /// header (RFC 792).
     pub fn icmp_error(t: u8) -> bool {
         matches!(t, 3 | 4 | 5 | 11 | 12)
     }
