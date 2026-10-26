@@ -391,8 +391,18 @@ fn generate_config_impl(
         &isolation,
         &counting,
     )?;
+    // YAML `target:` carries a board, silicon or host token; capabilities,
+    // facts and placement are all properties of the RUNTIME it resolves to
+    // (`crate::runtime_abi`). Falls back to the raw token (which then fails
+    // closed in `for_runtime`) when the registry doesn't know the name.
+    let target_opt = resolved_target.or_else(|| config.get("target").and_then(|t| t.as_str()));
+    let runtime_owned = target_opt.map(|t| {
+        crate::target::load_target(t, &crate::project::root())
+            .map(|d| d.runtime().to_string())
+            .unwrap_or_else(|_| t.to_string())
+    });
     let (mut workloads, workload_demand, workload_heaps) =
-        build_workloads_counted(config, loc, extra_module_dirs)?;
+        build_workloads_counted(config, loc, extra_module_dirs, runtime_owned.as_deref())?;
     let mut demand = base_demand(modules_ref, &module_entries, &module_names, &manifests, loc)?;
     refuse_restart_of_subscribers(modules_ref, &demand)?;
     demand.extend(workload_demand);
@@ -413,16 +423,6 @@ fn generate_config_impl(
     // checked-in default. A config with neither omits the check
     // entirely; that's by design, since the default `requires`
     // is all-false and satisfies every runtime.
-    // YAML `target:` carries a board, silicon or host token; capabilities,
-    // facts and placement are all properties of the RUNTIME it resolves to
-    // (`crate::runtime_abi`). Falls back to the raw token (which then fails
-    // closed in `for_runtime`) when the registry doesn't know the name.
-    let target_opt = resolved_target.or_else(|| config.get("target").and_then(|t| t.as_str()));
-    let runtime_owned = target_opt.map(|t| {
-        crate::target::load_target(t, &crate::project::root())
-            .map(|d| d.runtime().to_string())
-            .unwrap_or_else(|_| t.to_string())
-    });
     if let Some(runtime) = runtime_owned.as_deref() {
         // Cover base AND workload modules — a workload module runs on the same runtime and
         // must satisfy the same placement and `[requires]` (FPU/NEON/MMU).
@@ -547,12 +547,11 @@ fn generate_config_impl(
     // validate-time failure.
     validate_required_inputs_wired(&edges, &module_names, &manifests)?;
 
-    // (Considered: warn on declared-but-never-wired modules. Real
-    // bug class — refactor leftovers, typo'd wire references —
-    // but the false-positive rate on legitimate standalone modules
-    // (`debug`, monitor, alive heartbeat) is too high to justify
-    // a default warning. Filed for revisit if a manifest-side
-    // `standalone: true` opt-in lands so the check can be precise.)
+    // A module no wire touches is not reported: standalone modules
+    // (`debug`, a monitor, an alive heartbeat) are legitimate, and nothing
+    // in a manifest tells them apart from a module left unwired by mistake.
+    // An unwired REQUIRED input is the case that stalls, and is refused
+    // above.
 
     validate_presentation_groups(config, &module_names, &manifests)?;
 
@@ -596,13 +595,17 @@ fn generate_config_impl(
     validate_port_facts(config, &manifests)?;
     validate_connector_addressing(config)?;
 
-    // Single-provider-per-contract. Providers auto-register in
-    // module-index order onto a bounded dispatch stack that returns the
-    // last registration unconditionally, so two modules providing the
-    // same dispatched surface (two unkeyed `fat32` volumes) silently
-    // shadow — one drive becomes unreachable with no runtime
-    // warning. Reject it at build time. See storage_capability_surface.md.
-    validate_single_provider(config, &module_names, &manifests)?;
+    // One provider per (surface, selector), and every claim reaching a
+    // provider that answers it. See storage_capability_surface.md.
+    validate_single_provider(
+        config,
+        &module_names,
+        &manifests,
+        ProviderReach {
+            runtime: runtime_owned.as_deref(),
+            caller: ProviderCaller::Node,
+        },
+    )?;
     // One writer of the network stack's `addr_ctl` on a node that creates
     // workloads: the kernel.
     validate_net_identity_writers(config, &module_names, &manifests)?;
@@ -1581,7 +1584,11 @@ pub fn build_workloads(
     extra_module_dirs: &[&Path],
     target: &str,
 ) -> Result<Vec<crate::add_subgraph::Workload>> {
-    let (mut workloads, demand, heaps) = build_workloads_counted(config, loc, extra_module_dirs)?;
+    let runtime = crate::target::load_target(target, loc.project_root)
+        .map(|d| d.runtime().to_string())
+        .ok();
+    let (mut workloads, demand, heaps) =
+        build_workloads_counted(config, loc, extra_module_dirs, runtime.as_deref())?;
     let plan = heap_plan(target, config, &demand);
     apply_heap_plan(&plan, &heaps, &mut [], &mut workloads)?;
     Ok(workloads)
@@ -1595,6 +1602,7 @@ fn build_workloads_counted(
     config: &Value,
     loc: schema::ModuleLocation<'_>,
     extra_module_dirs: &[&Path],
+    runtime: Option<&str>,
 ) -> Result<(
     Vec<crate::add_subgraph::Workload>,
     Vec<InstanceDemand>,
@@ -1650,6 +1658,12 @@ fn build_workloads_counted(
         workload_uid[1] = pi as u8;
         let mut name_to_local: HashMap<String, u8> = HashMap::new();
         let mut modules = Vec::new();
+        // The workload's own instances (each under its local name) and
+        // manifests, for the provider checks: a workload reaches only
+        // providers of its own and the platform.
+        let mut local_entries: Vec<Value> = Vec::new();
+        let mut local_names: Vec<String> = Vec::new();
+        let mut local_manifests: HashMap<String, Manifest> = HashMap::new();
         for (li, m) in mods_yaml.iter().enumerate() {
             let mname = m
                 .get("name")
@@ -1710,6 +1724,15 @@ fn build_workloads_counted(
                         None => Some(man),
                     }
                 });
+            let mut local = m.clone();
+            if let Some(obj) = local.as_object_mut() {
+                obj.insert("name".to_string(), Value::String(mname.to_string()));
+            }
+            local_entries.push(local);
+            local_names.push(mname.to_string());
+            if let Some(man) = manifest.as_ref() {
+                local_manifests.insert(mname.to_string(), man.clone());
+            }
             // Reject `pre_tick_drain` workload modules — the codec drops the flag, so a
             // workload module would silently run as an ordinary cooperative module,
             // losing its Tier-1c pre-pass drain semantics.
@@ -1769,6 +1792,23 @@ fn build_workloads_counted(
                 params,
             });
         }
+        validate_single_provider(
+            &json!({
+                "modules": local_entries,
+                "wiring": workload_yaml.get("wiring").cloned().unwrap_or(Value::Null),
+                "data": data_section.cloned().unwrap_or(Value::Null),
+            }),
+            &local_names,
+            &local_manifests,
+            ProviderReach {
+                runtime,
+                caller: ProviderCaller::Workload,
+            },
+        )
+        .map_err(|e| match e {
+            Error::Config(why) => Error::Config(format!("workload {pi}: {why}")),
+            other => other,
+        })?;
         let mut edges = Vec::new();
         if let Some(wiring) = workload_yaml.get("wiring").and_then(|w| w.as_array()) {
             for (ei, e) in wiring.iter().enumerate() {

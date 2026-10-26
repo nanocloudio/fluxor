@@ -1867,9 +1867,171 @@ pub unsafe fn provider_call_sel(
     let Some(target) = target_of(contract, want) else {
         return errno::ENODEV;
     };
+    // A subscription handle carried in a `CHANGES` request is the caller's
+    // routed one: the provider is handed its own for the call.
+    // SAFETY: the caller's `arg[..arg_len]`, as every op here.
+    let restore = match unsafe { unroute_changes_sub(contract, want, target, opcode, arg, arg_len) }
+    {
+        Ok(r) => r,
+        Err(rc) => return rc,
+    };
     // SAFETY: forwarded caller contract.
     let rc = unsafe { call_target(contract, target, -1, opcode, arg, arg_len) };
+    if let Some((at, routed)) = restore {
+        // SAFETY: `at + 4 <= arg_len`, checked when it was rewritten.
+        unsafe { put_i32(arg, at, routed) };
+    }
+    // SAFETY: the answer the provider just wrote, in the caller's buffer.
+    unsafe { route_take_answer(contract, want, target, opcode, arg, arg_len, rc) };
     mint_route(contract, want, target, rc)
+}
+
+// ── Subscription handles inside a namespace op ───────────────────────────────
+//
+// A `storage.namespace` subscription opened through a selector is routed like
+// any other handle (`mint_route`), so its CLOSE reaches the provider that
+// opened it. Two of the contract's ops carry subscription handles in their
+// argument bytes rather than as `op_handle`, where the routing above never
+// looks: `CHANGES` names the subscription a read serves
+// (`[prefix_len u16][prefix][sub i32]…`), and `TAKE_RUNG` answers with the
+// handles that rang (`[more u8][count u16]` then `count × [handle i32]`).
+// Each is translated at this boundary — the provider sees and names its own
+// handles, the caller its routed ones — so a subscription to a keyed store, or
+// to the platform's own beneath a graph-local default, rings and is read as
+// one to the default store is. A handle the provider names that no route of
+// this caller's selector holds is passed through: one the caller opened on
+// the default path is already its own.
+
+/// The `CHANGES` request's `sub` field offset, when the request holds one.
+fn changes_sub_at(arg: &[u8]) -> Option<usize> {
+    let plen = usize::from(u16::from_le_bytes([*arg.first()?, *arg.get(1)?]));
+    let at = 2 + plen;
+    (arg.len() >= at + 4).then_some(at)
+}
+
+/// Write `v` at `arg[at..at + 4]`.
+///
+/// # Safety
+/// `arg` must be writable for `at + 4` bytes.
+unsafe fn put_i32(arg: *mut u8, at: usize, v: i32) {
+    // SAFETY: caller's bound.
+    let dst = unsafe { core::slice::from_raw_parts_mut(arg.add(at), 4) };
+    dst.copy_from_slice(&v.to_le_bytes());
+}
+
+/// The routed handle naming route `idx` at `generation`.
+fn routed_handle(tag: i32, idx: usize, generation: u16) -> i32 {
+    fd::tag_fd(
+        tag,
+        ROUTED_SLOT_BIT | (i32::from(generation) << ROUTE_IDX_BITS) | idx as i32,
+    )
+}
+
+/// For a `CHANGES` sent through `selector`: replace a routed `sub` in the
+/// caller's request with the handle the provider minted, returning where it
+/// was and what to put back once the provider has answered. `Ok(None)`: no
+/// rewrite (another op, no subscription named, or a handle the caller holds
+/// unrouted). `Err(EBADF)`: a routed handle this selector's provider did not
+/// mint — closed, or another provider's.
+///
+/// # Safety
+/// `arg` must be readable and writable for `arg_len` bytes.
+unsafe fn unroute_changes_sub(
+    contract: ContractId,
+    selector: u32,
+    target: Target,
+    opcode: u32,
+    arg: *mut u8,
+    arg_len: usize,
+) -> Result<Option<(usize, i32)>, i32> {
+    if contract != contract::STORAGE_NAMESPACE
+        || opcode != crate::abi::contracts::storage::namespace::CHANGES
+        || arg.is_null()
+    {
+        return Ok(None);
+    }
+    // SAFETY: caller's bound.
+    let bytes = unsafe { core::slice::from_raw_parts(arg, arg_len) };
+    let Some(at) = changes_sub_at(bytes) else {
+        return Ok(None);
+    };
+    let sub = i32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]);
+    if sub < 0 {
+        return Ok(None);
+    }
+    match route_lookup(sub) {
+        RouteLookup::NotRouted => Ok(None),
+        RouteLookup::Stale => Err(EBADF),
+        RouteLookup::Live(idx) => {
+            let r = route_at(idx);
+            if r.selector != selector || r.contract != contract || r.target() != target {
+                return Err(EBADF);
+            }
+            // SAFETY: `at + 4 <= arg_len` (`changes_sub_at`).
+            unsafe { put_i32(arg, at, r.inner) };
+            Ok(Some((at, sub)))
+        }
+    }
+}
+
+/// For a `TAKE_RUNG` sent through `selector` that answered `rc` bytes: name
+/// each subscription in the answer by the caller's routed handle for it.
+///
+/// # Safety
+/// `arg` must be readable for `arg_len` bytes; the answer buffer it names
+/// must be writable for `rc` bytes (the provider just wrote them).
+unsafe fn route_take_answer(
+    contract: ContractId,
+    selector: u32,
+    target: Target,
+    opcode: u32,
+    arg: *mut u8,
+    arg_len: usize,
+    rc: i32,
+) {
+    use crate::abi::contracts::storage::namespace::{take, TAKE_RUNG};
+    if contract != contract::STORAGE_NAMESPACE || opcode != TAKE_RUNG || rc <= 0 || arg.is_null() {
+        return;
+    }
+    let Some(tag) = contract_to_tag(contract) else {
+        return;
+    };
+    // SAFETY: caller's bound.
+    let req = unsafe { core::slice::from_raw_parts(arg, arg_len) };
+    let Some(req) = take::parse(req) else {
+        return;
+    };
+    let len = (rc as usize).min(req.out_cap as usize);
+    // SAFETY: the provider wrote `rc` bytes of answer at `out_ptr`.
+    let ans = unsafe { core::slice::from_raw_parts_mut(req.out_ptr as usize as *mut u8, len) };
+    let (Some(&lo), Some(&hi)) = (ans.get(1), ans.get(2)) else {
+        return;
+    };
+    let count = usize::from(u16::from_le_bytes([lo, hi]));
+    for i in 0..count {
+        let at = take::HEAD_LEN + i * 4;
+        let Some(field) = ans.get_mut(at..at + 4) else {
+            return;
+        };
+        let h = i32::from_le_bytes([field[0], field[1], field[2], field[3]]);
+        // SAFETY: scheduler-thread read.
+        let found = unsafe {
+            let p = &raw const ROUTES;
+            (*p).iter()
+                .enumerate()
+                .find(|(_, r)| {
+                    r.in_use
+                        && r.contract == contract
+                        && r.selector == selector
+                        && r.target() == target
+                        && r.inner == h
+                })
+                .map(|(idx, r)| (idx, r.generation))
+        };
+        if let Some((idx, generation)) = found {
+            field.copy_from_slice(&routed_handle(tag, idx, generation).to_le_bytes());
+        }
+    }
 }
 
 // ── Routed handles ───────────────────────────────────────────────────────────
@@ -2131,10 +2293,7 @@ fn mint_route(contract: ContractId, selector: u32, target: Target, rc: i32) -> i
         claimed
     };
     match claimed {
-        Some((idx, generation)) => {
-            let slot = ROUTED_SLOT_BIT | (i32::from(generation) << ROUTE_IDX_BITS) | idx as i32;
-            fd::tag_fd(tag, slot)
-        }
+        Some((idx, generation)) => routed_handle(tag, idx, generation),
         None => {
             log::error!(
                 "[provider] routed-handle table exhausted (MAX_ROUTES={MAX_ROUTES}); closing \

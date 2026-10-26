@@ -222,6 +222,18 @@ impl ParamSchema {
         Some(ParamSchema { params, name_map })
     }
 
+    /// Two params on one tag: `(tag, first name, second name)`. The packer
+    /// would put both under the tag and the module would read every entry
+    /// as the first, so a schema with one is refused wherever it is read.
+    pub fn duplicate_tag(&self) -> Option<(u8, &str, &str)> {
+        self.params.iter().enumerate().find_map(|(i, a)| {
+            self.params[..i]
+                .iter()
+                .find(|b| b.tag == a.tag)
+                .map(|b| (a.tag, b.name.as_str(), a.name.as_str()))
+        })
+    }
+
     /// Look up a param by name.
     /// Supports dotted YAML names matching underscored schema names:
     /// e.g., "eq.low_freq" matches schema param "eq_low_freq".
@@ -349,6 +361,12 @@ pub fn build_params_from_schema(
     data_section: Option<&Value>,
     module_name: &str,
 ) -> Result<usize, String> {
+    if let Some((tag, first, second)) = schema.duplicate_tag() {
+        return Err(format!(
+            "{module_name}: params `{first}` and `{second}` share tag {tag}, so a value for \
+             either would be read as `{first}` — give each param its own tag"
+        ));
+    }
     let mut kv: HashMap<String, Value> = HashMap::new();
     let mut presets: Option<Vec<Value>> = None;
     let mut voices: Option<Vec<Value>> = None;
@@ -1638,6 +1656,37 @@ fn expand_routes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A schema with two params on one tag names both, and the packer
+    /// refuses to pack an instance of it.
+    #[test]
+    fn two_params_on_one_tag_are_refused() {
+        let mut bytes = vec![0x53, 0x50, 1, 2];
+        for name in ["capacity", "step_budget_us"] {
+            bytes.extend_from_slice(&[54, 2, 0, 0, 0, 0, name.len() as u8]);
+            bytes.extend_from_slice(name.as_bytes());
+            bytes.push(0);
+        }
+        let schema = ParamSchema::from_bytes(&bytes).expect("schema");
+        assert_eq!(
+            schema.duplicate_tag(),
+            Some((54, "capacity", "step_budget_us"))
+        );
+        let mut entry = vec![0u8; 256];
+        let e = build_params_from_schema(
+            &serde_json::json!({ "step_budget_us": 5 }),
+            &schema,
+            &mut entry,
+            0,
+            None,
+            "store_source",
+        )
+        .unwrap_err();
+        assert!(
+            e.contains("share tag 54") && e.contains("step_budget_us"),
+            "{e}"
+        );
+    }
 
     fn blob_schema() -> ParamSchema {
         let params = vec![SchemaParam {

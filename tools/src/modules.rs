@@ -1356,6 +1356,22 @@ fn schema_params(schema: &[u8]) -> Vec<(u8, u8, String)> {
 /// string param (`str` or `str_chunked`), whose value the rule splits into
 /// entries, or an integer param (`u8`, `u16`, `u32`), whose value it counts.
 fn check_param_rule_tags(input: &Path, manifest: &Manifest, schema: &[u8]) -> Result<()> {
+    // One tag, one param, before any rule reads the schema: both params
+    // would be packed under the tag and read as the first. The SDK macro
+    // refuses this at compile time; a hand-built schema is refused here.
+    let params = schema_params(schema);
+    if let Some((tag, first, second)) = params.iter().enumerate().find_map(|(i, a)| {
+        params[..i]
+            .iter()
+            .find(|b| b.0 == a.0)
+            .map(|b| (a.0, b.2.as_str(), a.2.as_str()))
+    }) {
+        return Err(Error::Module(format!(
+            "{}: params `{first}` and `{second}` share tag {tag} in the module's \
+             `define_params!` schema — give each param its own tag",
+            input.display()
+        )));
+    }
     let rules: Vec<(&str, &[u8], bool)> = manifest
         .heap_from_params
         .as_ref()
@@ -1371,7 +1387,6 @@ fn check_param_rule_tags(input: &Path, manifest: &Manifest, schema: &[u8]) -> Re
     if rules.is_empty() {
         return Ok(());
     }
-    let params = schema_params(schema);
     for (key, tags, strings) in rules {
         for &tag in tags {
             let param = params.iter().find(|p| p.0 == tag);
@@ -1396,6 +1411,49 @@ fn check_param_rule_tags(input: &Path, manifest: &Manifest, schema: &[u8]) -> Re
                 input.display()
             )));
         }
+    }
+    Ok(())
+}
+
+/// A `[[resources]]` claim's `selector_param` or `selector_table` names the
+/// param whose value the composer reads as the volume, or the table of
+/// volumes, the claim reaches. A name the module's schema (`define_params!`)
+/// does not declare as a `str` param reads as absent in every graph — the
+/// default provider, or no volume at all, whatever the module does at
+/// runtime — so `pack` refuses it, naming the claim and the params the
+/// schema does declare.
+fn check_claim_selector_params(input: &Path, manifest: &Manifest, schema: &[u8]) -> Result<()> {
+    let params = schema_params(schema);
+    for claim in &manifest.resources {
+        let (key, name) = match &claim.selector {
+            manifest::ClaimSelector::Param(name) => ("selector_param", name),
+            manifest::ClaimSelector::Table(name) => ("selector_table", name),
+            _ => continue,
+        };
+        // `schema::ParamType` id 3: `str`, whose default is the empty string.
+        if params.iter().any(|p| p.2 == *name && p.1 == 3) {
+            continue;
+        }
+        let strs = params
+            .iter()
+            .filter(|p| p.1 == 3)
+            .map(|p| format!("`{}`", p.2))
+            .collect::<Vec<_>>();
+        let found = match params.iter().find(|p| p.2 == *name) {
+            Some(_) => format!("`{name}` is not a `str` param"),
+            None => format!("the module's `define_params!` schema has no param `{name}`"),
+        };
+        return Err(Error::Module(format!(
+            "{}: the `{}` claim's `{key} = \"{name}\"` names the param that says which volume \
+             the claim reaches, but {found}; name one of the module's `str` params ({})",
+            input.display(),
+            manifest::contract_name_to_str(claim.device_class),
+            if strs.is_empty() {
+                "it has none".to_string()
+            } else {
+                strs.join(", ")
+            }
+        )));
     }
     Ok(())
 }
@@ -1683,6 +1741,7 @@ pub fn pack_fmod(
         variant,
     )?;
     check_param_rule_tags(input, &module_manifest, schema_data)?;
+    check_claim_selector_params(input, &module_manifest, schema_data)?;
 
     // Compute integrity hash over code + data sections (use code_data which preserves layout)
     module_manifest.integrity_hash = Some(manifest::compute_integrity(&code_data, data_data));
@@ -1974,6 +2033,7 @@ pub fn pack_fmod_wasm(
         module_manifest.apply_variant(v)?;
     }
     check_param_rule_tags(input, &module_manifest, schema_data)?;
+    check_claim_selector_params(input, &module_manifest, schema_data)?;
 
     // Integrity hash over the wasm code payload. Empty data section.
     module_manifest.integrity_hash = Some(manifest::compute_integrity(&wasm_data, &[]));
@@ -2324,6 +2384,65 @@ mod tests {
             e.contains("heap_per_demand.base` is 4096 B") && e.contains("set `base` to 8192"),
             "{e}"
         );
+    }
+
+    /// Two params on one tag are refused at pack, rule or no rule, naming
+    /// both: the packer would put either value under the tag and the module
+    /// would read it as the first.
+    #[test]
+    fn two_params_on_one_tag_are_refused_at_pack() {
+        let mut schema = vec![0x53, 0x50, 1, 2];
+        for name in ["capacity", "step_budget_us"] {
+            schema.extend_from_slice(&[54, 2, 0, 0, 0, 0, name.len() as u8]);
+            schema.extend_from_slice(name.as_bytes());
+            schema.push(0);
+        }
+        let p = Path::new("store_source.elf");
+        let e = check_param_rule_tags(p, &Manifest::default(), &schema)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("`capacity` and `step_budget_us` share tag 54"),
+            "{e}"
+        );
+    }
+
+    /// A claim's `selector_param` names one of the module's own `str`
+    /// params; any other name is refused at pack.
+    #[test]
+    fn a_selector_param_names_a_str_param_of_the_module() {
+        let mut schema = vec![0x53, 0x50, 1, 2];
+        for (tag, ty, name) in [(1u8, 3u8, "path"), (4, 3, "volume")] {
+            schema.extend_from_slice(&[tag, ty, 0, 0, 0, 0, name.len() as u8]);
+            schema.extend_from_slice(name.as_bytes());
+            schema.push(0);
+        }
+        let claim = |param: &str| {
+            Manifest::from_toml_str_for_target(
+                &format!(
+                    "version = \"0.1.0\"\n\n[[resources]]\nrequires_contract = \"fs\"\n\
+                     access = \"write\"\nselector_param = \"{param}\"\n"
+                ),
+                None,
+            )
+            .expect("manifest")
+        };
+        let p = Path::new("file_block.elf");
+        check_claim_selector_params(p, &claim("volume"), &schema).expect("a str param");
+        let e = check_claim_selector_params(p, &claim("volum"), &schema)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("`fs` claim's `selector_param = \"volum\"`")
+                && e.contains("has no param `volum`")
+                && e.contains("`path`, `volume`"),
+            "{e}"
+        );
+        schema[5] = 2; // `path` becomes a `u32`
+        let e = check_claim_selector_params(p, &claim("path"), &schema)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("`path` is not a `str` param"), "{e}");
     }
 
     /// A `[capacities]` rule's tags name the module's own params: every

@@ -4,12 +4,23 @@ hardware_targets = ["rp2350", "bcm2712"]
 timer_class = "wall_clock"
 
 # Mount / VFS policy module. Registers as the DEFAULT (unkeyed) FS provider
-# and routes each path to a volume backend (a keyed `fat32`) by
-# longest-prefix match, binding backends via `provider_bind`. Dissolves the
-# by-name graph wiring: consumers keep `requires_contract = "fs"` and only
-# this module's `mounts:` config knows the volume set.
+# and routes each path to a volume backend (a keyed `fat32`, or `platform`)
+# by longest-prefix match. Consumers keep `requires_contract = "fs"` and
+# only this module's `mounts:` config knows the volume set.
 # See docs/architecture/storage_capability_surface.md.
 provides = ["file.data"]
+
+# Every op it routes goes to a volume through `provider_call_sel`, under
+# this module's own `fs` grant: the kernel checks the module that makes the
+# selector call, which is this one (a provider's dispatch runs as the
+# provider), not the consumer whose op it forwards. The volume is the one
+# its `mounts:` table names for the path, so the composer checks that every
+# volume the table names is provided; one the hotplug channel adds as it
+# runs is not checked.
+[[resources]]
+requires_contract = "fs"
+access = "write"
+selector_table = "mounts"
 
 # Optional hotplug control channel (in[0]). The platform backend that
 # detects media insert/remove writes one command per record

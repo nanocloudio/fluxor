@@ -140,6 +140,17 @@ handle no selector minted; a route dies with its owner's layer, a
 departing consumer's routes are closed at their owners, and a graph
 reset forgets them all.
 
+Two `storage.namespace` ops carry subscription handles in their argument
+bytes rather than as `op_handle`: `CHANGES` names the subscription a read
+serves, and `TAKE_RUNG` answers with the handles that rang. Through a
+selector the kernel translates both at the boundary: a routed subscription
+in a `CHANGES` request reaches the provider as the handle it minted (one
+this selector's provider did not mint is `EBADF`, before the provider is
+called), and each handle a `TAKE_RUNG` answer names is rewritten to the
+caller's routed handle for it. A subscription to a keyed store, or to the
+platform's own beneath a graph-local default, therefore rings and reads
+exactly as one to the default store does.
+
 The **`mount` module** (`modules/foundation/mount/`) is the policy layer.
 It registers as the default (unkeyed) FS provider and carries a
 `mounts: "/boot=sd0;/data=nvme0"` table. On `FS_OPEN(path)` it
@@ -150,10 +161,72 @@ handle-bound ops (`FS_READ` / `FS_CLOSE` / …) come back to it (which is
 what lets an unmount revoke them) and are forwarded to the owning
 volume. A mount may name `platform` as its volume. Path policy stays in
 the module; the kernel never parses paths. `validate_single_provider` therefore allows several
-providers of one surface as long as each `volume:` selector is distinct
-(two same-volume or two unkeyed providers still error), and separately
-rejects a graph in which every provider of a surface is keyed with no
-default router to reach them.
+providers of one surface as long as each `volume:` selector is distinct;
+two providers with one `volume:`, or two unkeyed providers, are refused.
+
+**Which volume a consumer reaches.** A consumer declares it on its
+claim, the `[[resources]]` row in its `manifest.toml`, with at most one of
+four keys. They are read from `manifest.toml` by `pack` and the composer
+and are not written to the module's binary manifest.
+
+- `selector = "<name>"`: the claim reaches that one volume.
+- `selector_param = "<param>"`: the instance's value of that param names
+  the volume, read as the packer reads it (a bare key on the entry over one
+  under `params:`). Empty or absent, the claim reaches the default
+  provider. `file_block` declares `selector_param = "volume"`.
+- `selector_table = "<param>"`: the param holds `;`-separated
+  `prefix=volume` entries, and the claim reaches every volume they name.
+  `mount` declares `selector_table = "mounts"` on its own `fs` claim: the
+  kernel checks the grant of the module that calls `provider_call_sel`, and
+  a provider's dispatch runs as the provider, so the check is on `mount`'s
+  claim, not on the consumer whose op it forwards. A volume `mount`'s
+  hotplug channel adds as it runs is not checked.
+- `selector_runtime = true`: the module chooses the name as it runs, so
+  the composer cannot check it.
+
+`pack` refuses a `selector_param` or `selector_table` that is not one of
+the module's own `str` params. With none of the keys, the claim reaches
+the contract's default: the top-most
+unkeyed module provider, else the platform's own provider, else `ENOSYS`.
+The platform's own `fs` provider is the host's filesystem on Linux and
+wasm; on bcm2712 it serves workloads only, each inside a root of its own
+on the node's volume, and answers the node's own modules `ENOSYS`; the RP
+targets have none.
+
+The composer checks every claim against the providers of the graph the
+module runs in (a workload's against the workload's own: a workload
+reaches only providers of its own and the platform), and refuses, naming
+the module, its claim and the fix:
+
+- a claim that names no volume in a graph whose module providers of the
+  contract are all keyed: none of them would answer it;
+- a claim that names no volume and reaches the graph's default provider
+  while feeding it through the wiring (a `file_block` under the `fat32`
+  that is the graph's filesystem): the provider cannot answer the module
+  until the module has served it, so neither comes up;
+- a claim that names a volume no provider in the graph declares: at
+  runtime it would answer `ENODEV`;
+- a claim that names `platform` where the target's platform does not
+  answer the contract for that graph's modules;
+- a `selector_table` entry that is not `prefix=volume`, which the module
+  would skip;
+- a provider that names the volume it reaches with its own `volume`
+  param, which names the volume it provides.
+
+A graph with keyed providers and no consumer, or only `selector_runtime`
+consumers, passes. A provider's claim on its own contract that names no
+volume is its use of the layers below it and is not checked.
+
+The kernel's readiness gate (`gate_contract_consumers`) holds a module
+that claims a contract until the contract's default module provider is
+Ready, when that provider is deferred-ready; a module that is
+deferred-ready itself is not held. A keyed provider is never waited for.
+The loader registers a provider when its `module_new` returns, so a keyed
+`fat32` is reachable before its volume is mounted and answers `EAGAIN`
+until it is; `provider_call_sel` answers `ENODEV` for a name no layer
+carries, and the caller retries. `file_block` is deferred-ready and
+reports Ready only once its open has succeeded, which is how a
+filesystem built on it waits.
 
 A contract may additionally opt out of single-provider validation via
 the chain-aware allowlist (`CHAIN_AWARE_PROVIDES` in
@@ -175,7 +248,8 @@ record (`[cmd][prefix_len][prefix][volume_len][volume]`), and
 on that volume: the next op fails `ENODEV` and frees the slot, the
 storage handle lease / revocation contract enforced at the handle
 authority (this module, which owns every consumer-facing FS handle). An
-add installs a mount whose backend binds lazily on first use. Media
+add installs a mount; like every mount, its volume is reached by name on
+each call, so nothing is bound until an op arrives. Media
 detection is platform-specific and outside the module's scope; the module
 only consumes the control messages.
 
@@ -1025,7 +1099,11 @@ into a shadow table that is swapped in only when the last page lands — a
 table swapped in place is a torn table for any reader mid-scan. A module with
 several tables takes once per step for all of them on its one event and then
 advances each. A refused `SUBSCRIBE` other than `EAGAIN` is asked again after
-a backoff, so a full table is not asked, and refused, on every step.
+a backoff, so a full table is not asked, and refused, on every step. Every
+store op goes to the store the consumer is given: the contract's default, or
+by selector a keyed volume or `platform`; a module names it by a `str` param
+it declares as its `storage.namespace` claim's `selector_param`, and tables
+following different stores are taken once per store.
 
 ### Listing names
 

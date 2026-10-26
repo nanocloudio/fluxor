@@ -1020,12 +1020,12 @@ pub mod fd {
 }
 
 /// Provider instance selectors — the shared hash the kernel and modules
-/// both compute so a module's declared selector string and a
-/// `provider_bind(contract, "name")` query resolve to the same u32 key.
+/// both compute so a provider's declared selector string and the name a
+/// `provider_call_sel("name", …)` carries resolve to the same u32 key.
 pub mod provider_selector {
     /// FNV-1a hash of a short selector string (a volume / instance name
     /// such as `"nvme0"` or `"boot"`). Single source of truth for both
-    /// sides of `provider_bind`; keep it a `const fn` so a module can fold
+    /// sides of `provider_call_sel`; keep it a `const fn` so a module can fold
     /// its selector at compile time. Hash `0` is reserved to mean "unkeyed
     /// / default provider" — an input that happens to hash to `0` is
     /// nudged to `1` so it never aliases the default.

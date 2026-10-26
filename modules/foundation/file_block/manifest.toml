@@ -8,6 +8,9 @@ provides = ["storage.block"]
 
 [[resources]]
 requires_contract = "fs"
+# The `volume` param names the provider the image is reached through; empty or
+# absent, the default provider.
+selector_param = "volume"
 access = "write"
 
 [[ports]]

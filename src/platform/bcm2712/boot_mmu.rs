@@ -110,14 +110,14 @@ pub unsafe fn init_page_tables() {
     boot_mmu::unmap_stack_guards(&fluxor::platform::multicore::kernel_stack_guards());
 
     // DRAM: the tree's gigabytes up to 16 GB, the largest Pi 5's
-    // (`memmap::DRAM_TOP`); a smaller board's missing ones map Device.
+    // (`memmap::DRAM_TOP`). A smaller board's missing ones stay unmapped:
+    // nothing answers there, so a stray access is a precise translation
+    // fault at the faulting instruction, not an asynchronous external abort
+    // reported later and elsewhere.
     for gb in 1..16 {
-        let kind = if memmap::dram_gb(gb) {
-            Kind::Dram
-        } else {
-            Kind::Device
-        };
-        boot_mmu::map_gb(gb, kind);
+        if memmap::dram_gb(gb) {
+            boot_mmu::map_gb(gb, Kind::Dram);
+        }
     }
     for &(first, end) in DEVICE_APERTURE_GBS.iter() {
         for gb in first..end {
@@ -163,11 +163,12 @@ pub fn is_device_aperture(addr: u64) -> bool {
 /// device tree QEMU leaves at the base of RAM says (`fluxor::platform::memmap`;
 /// the fixed 2 GB map when it cannot be read). Only that is mapped Normal:
 /// address space with no memory behind it is never mapped as memory, where a
-/// speculative fetch could reach it. Every other gigabyte below 512 GB is
-/// Device — the first holds the flash, GIC, UART, virtio-mmio and low PCIe
-/// windows, the one at 256 GB the high PCIe ECAM. The 64-bit PCIe window, at
-/// 512 GB, is outside a 39-bit address space and is not mapped; nothing here
-/// places a BAR there. Without the map the MMU stays off, every access is
+/// speculative fetch could reach it. The device apertures map Device — the
+/// first gigabyte holds the flash, GIC, UART, virtio-mmio and low PCIe
+/// windows, the one at 256 GB the high PCIe ECAM — and every other gigabyte
+/// stays unmapped, so a stray access is a precise translation fault. The
+/// 64-bit PCIe window, at 512 GB, is outside a 39-bit address space; nothing
+/// here places a BAR there. Without the map the MMU stays off, every access is
 /// Device-nGnRnE, and module code — built for a part that runs with the MMU
 /// on, so free to emit unaligned loads and stores — would alignment-fault on
 /// its first unaligned access.
@@ -178,12 +179,14 @@ pub fn is_device_aperture(addr: u64) -> bool {
 #[cfg(not(feature = "board-pi5"))]
 pub unsafe fn init_page_tables() {
     for gb in 0..512 {
-        let kind = if fluxor::platform::memmap::dram_gb(gb) {
-            Kind::Dram
-        } else {
-            Kind::Device
-        };
-        boot_mmu::map_gb(gb, kind);
+        if fluxor::platform::memmap::dram_gb(gb) {
+            boot_mmu::map_gb(gb, Kind::Dram);
+        }
+    }
+    for &(first, end) in DEVICE_APERTURE_GBS.iter() {
+        for gb in first..end {
+            boot_mmu::map_gb(gb, Kind::Device);
+        }
     }
     core::arch::asm!("dsb ish", "isb", options(nostack));
 }

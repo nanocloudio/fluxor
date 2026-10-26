@@ -35,9 +35,9 @@ struct ResidentGraph {
     domain: u8,
     mask: ModuleMask,
     primed: bool,
-    /// Last logged runnable state — drives the transition-only `MON_GRAPH_PACER`
-    /// line — per-pass logs must be rate-limited or transition-only.
-    last_runnable: bool,
+    /// The graph's `MON_GRAPH_PACER` line: its last idle/busy state and the
+    /// rate limit on reporting it.
+    pacer_line: PacerLine,
     /// Modules with `step_period > 1`. Each carries its OWN absolute next-due in
     /// `SchedulerState::module_next_due_us` and its own period
     /// (`step_period × NOMINAL tick`), so distinct periods AND phase offsets are
@@ -62,7 +62,7 @@ impl ResidentGraph {
         domain: 0,
         mask: ModuleMask::EMPTY,
         primed: false,
-        last_runnable: true,
+        pacer_line: PacerLine::NEW,
         periodic_mask: ModuleMask::EMPTY,
         idle_safe: false,
         backstop_next_due_us: 0,
@@ -737,8 +737,8 @@ fn multi_graph_runner(modules: &mut [ModuleSlot], domain: usize) -> (StepResult,
     for gi in 0..rc {
         // Snapshot the entry's fields before borrowing `sched` mutably in the
         // step pass. An entry's domain is written only when the index is
-        // rebuilt; its pass state (`primed`, the backstop, the last logged
-        // runnability) only by the runner of that domain. So the domain is
+        // rebuilt; its pass state (`primed`, the backstop, the pacer line)
+        // only by the runner of that domain. So the domain is
         // read first and another domain's entry is left alone: on bcm2712
         // its runner, on another core, may be writing it.
         let (slot, generation, mask, primed, periodic_mask, idle_safe, snap_backstop);
@@ -907,21 +907,11 @@ fn multi_graph_runner(modules: &mut [ModuleSlot], domain: usize) -> (StepResult,
         // the deadline-merge below.
         graph_pacer_set_signals(slot, generation, domain as u8, work, burst, wake, timer_due);
 
-        // Observability: transition-only `MON_GRAPH_PACER` so a per-graph
-        // idle↔busy change is visible (per-pass logging would defeat the
-        // efficiency gain). `busy` here is the post-step pacer signal.
+        // Observability: `MON_GRAPH_PACER` reports the graph's idle↔busy
+        // transitions, at most one line per `PACER_LOG_INTERVAL_US`. `busy`
+        // here is the post-step pacer signal.
         let busy = work || burst || wake || timer_due;
-        if busy != primed_was_runnable(gi) {
-            // SAFETY: DBG_TICK aligned u32 read.
-            let tick = unsafe { DBG_TICK };
-            log::info!(
-                "MON_GRAPH_PACER slot={slot} gen={generation} domain={domain} \
-                 state={} stepped={} tick={tick}",
-                if busy { "busy" } else { "idle" },
-                runnable as u8
-            );
-            set_last_runnable(gi, busy);
-        }
+        log_pacer_line(gi, now, busy, runnable, slot, generation, domain);
 
         // Deadline merge, inline: an idle instance still bounds the wait via its
         // relaxed deadline if nothing is runnable, but only runnable instances
@@ -981,21 +971,85 @@ fn multi_graph_runner(modules: &mut [ModuleSlot], domain: usize) -> (StepResult,
     (result, deadline)
 }
 
-/// Last logged runnable state for resident-graph entry `gi` (for the
-/// transition-only `MON_GRAPH_PACER` line).
-#[cfg(feature = "multitenant")]
-fn primed_was_runnable(gi: usize) -> bool {
-    // SAFETY: scheduler-thread read of a bounded entry.
-    let table = unsafe { &*core::ptr::addr_of!(RESIDENT_GRAPHS) };
-    table[gi].last_runnable
+/// The least time between two `MON_GRAPH_PACER` lines of one graph (µs).
+pub const PACER_LOG_INTERVAL_US: u64 = 1_000_000;
+
+/// The rate limit on one resident graph's `MON_GRAPH_PACER` line.
+///
+/// Each pass reports the graph's idle/busy state with [`PacerLine::observe`].
+/// A change of state is a transition; transitions are reported on a line
+/// carrying how many there were, at most one line per
+/// [`PACER_LOG_INTERVAL_US`]. The first transition is reported at once; one
+/// that falls inside the interval is held and reported, with any that follow
+/// it, on the first pass after the interval ends, so the last line always
+/// names the state the graph settled in. A graph that flips state every few
+/// ticks costs one line a second, not one a flip.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PacerLine {
+    busy: bool,
+    pending: u32,
+    logged_at_us: Option<u64>,
 }
 
-/// Record the last logged runnable state for resident-graph entry `gi`.
+impl PacerLine {
+    /// A graph not yet observed: taken as busy, as its first pass steps it,
+    /// with nothing reported.
+    pub const NEW: PacerLine = PacerLine {
+        busy: true,
+        pending: 0,
+        logged_at_us: None,
+    };
+
+    /// Record the graph's state at `now_us` (a monotonic clock). Returns the
+    /// transitions a line logged now reports, or `None` when no line is due:
+    /// nothing has changed since the last line, or the last line is under
+    /// [`PACER_LOG_INTERVAL_US`] old. The count saturates at `u32::MAX`.
+    pub fn observe(&mut self, busy: bool, now_us: u64) -> Option<u32> {
+        if busy != self.busy {
+            self.busy = busy;
+            self.pending = self.pending.saturating_add(1);
+        }
+        if self.pending == 0 {
+            return None;
+        }
+        if let Some(at) = self.logged_at_us {
+            if now_us.saturating_sub(at) < PACER_LOG_INTERVAL_US {
+                return None;
+            }
+        }
+        let n = self.pending;
+        self.pending = 0;
+        self.logged_at_us = Some(now_us);
+        Some(n)
+    }
+}
+
+/// Feed resident-graph entry `gi`'s state at `now` to its [`PacerLine`] and
+/// log the `MON_GRAPH_PACER` line when one is due. `stepped` is whether this
+/// pass stepped the graph.
 #[cfg(feature = "multitenant")]
-fn set_last_runnable(gi: usize, v: bool) {
-    // SAFETY: scheduler-thread-exclusive write of a bounded entry.
+fn log_pacer_line(
+    gi: usize,
+    now: u64,
+    busy: bool,
+    stepped: bool,
+    slot: u16,
+    generation: u32,
+    domain: usize,
+) {
+    // SAFETY: scheduler-thread-exclusive write of this domain's own entry.
     let table = unsafe { &mut *core::ptr::addr_of_mut!(RESIDENT_GRAPHS) };
-    table[gi].last_runnable = v;
+    let Some(transitions) = table[gi].pacer_line.observe(busy, now) else {
+        return;
+    };
+    // SAFETY: DBG_TICK aligned u32 read.
+    let tick = unsafe { DBG_TICK };
+    log::info!(
+        "MON_GRAPH_PACER slot={slot} gen={generation} domain={domain} state={} stepped={} \
+         tick={tick} transitions={transitions}",
+        if busy { "busy" } else { "idle" },
+        stepped as u8,
+    );
 }
 
 /// Read a graph-local pacer instance's stored runnability without mutating it (the

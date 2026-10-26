@@ -289,7 +289,7 @@ mod tests {
         );
         let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
-            hex, "bed7b6b8f95110c272fc8feec0b1d843dd194e167ad09efc304eb14daeb767a2",
+            hex, "67b728f42befc778a7a8efbc5a9d5ec976863fc0d481b938525c4895b3896652",
             "ABI wire-surface changed — this is a deliberate wire break or it is \
              a mistake; see docs/architecture/abi_surface.md before updating"
         );

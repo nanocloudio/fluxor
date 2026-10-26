@@ -19,16 +19,27 @@ device is wanted, and the host test source for block transforms.
 Without `volume`, the image is opened through the default `fs` provider, the
 one `provider_call(-1, OPEN_CREATE, …)` reaches. A graph that also carries a
 filesystem of its own — a `fat32` over an encrypted device built on this very
-source — makes that filesystem the default, and the image would be looked for
-inside the volume it backs. `volume` names the provider explicitly, through
-`provider_call_sel`:
+source — makes that filesystem the default, and the image's open would go to
+the filesystem it backs, which cannot answer until the image serves it.
+`volume` names the provider explicitly, through `provider_call_sel`:
 
-- `platform` — the platform's own provider: the host filesystem on Linux.
+- `platform` — the platform's own provider: the host filesystem on Linux
+  and wasm. On bcm2712 it serves workloads only, and the RP targets have
+  none.
   Reserved; no module can register under it.
 - any other name — a keyed volume (a `fat32` with that `volume:`).
 
 The open and every op on the handle it returns go to that provider. A name
 longer than 16 bytes is refused at open (`EINVAL`), never clipped.
+
+The `fs` claim in the manifest names this param (`selector_param =
+"volume"`), so the composer checks the provider each instance reaches and
+refuses a graph where it reaches none: a `volume` no `fat32` in the graph
+declares, `platform` on a target whose platform does not answer the graph's
+`fs` calls, or no `volume` in a graph whose `fs` providers are all keyed.
+It also refuses an image with no `volume` under a graph whose filesystem is
+built on it: that filesystem is the default provider, and it cannot open
+the image it mounts.
 
 ```yaml
 - name: file_block

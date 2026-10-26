@@ -522,6 +522,61 @@ mod scheduler_validation_tests {
         assert_eq!(blob[47], crate::add_subgraph::FAULT_POLICY_SKIP);
     }
 
+    /// A workload's modules reach only providers of their own and the
+    /// platform, so a workload's claims are checked against its own
+    /// providers, as a graph's are against its own.
+    #[test]
+    fn workload_claims_are_checked_against_the_workloads_providers() {
+        let tmp = std::env::temp_dir();
+        let build = |volume: Value| {
+            let cfg = json!({"workloads": [{
+                "modules": [
+                    {"name": "disk", "type": "file_block", "path": "d.img", "volume": volume},
+                    {"name": "fs", "type": "fat32"},
+                ],
+                "wiring": [{"from": "disk", "to": "fs"}],
+            }]});
+            build_workloads(&cfg, test_loc(&tmp), &[], "linux")
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        };
+        let e = build(Value::Null).unwrap_err();
+        assert!(
+            e.contains("workload 0: `disk`'s `fs` claim leaves its `volume` param")
+                && e.contains("which it feeds (`disk` → `fs`)"),
+            "{e}"
+        );
+        let e = build(json!("nvme0")).unwrap_err();
+        assert!(
+            e.contains("names volume `nvme0`") && e.contains("declared: none"),
+            "{e}"
+        );
+        build(json!("platform")).expect("the workload's root on the host");
+    }
+
+    /// A workload's `mount` table names volumes of the workload's own.
+    #[test]
+    fn a_workload_mount_table_names_the_workloads_volumes() {
+        let tmp = std::env::temp_dir();
+        let build = |mounts: &str| {
+            let cfg = json!({"workloads": [{
+                "modules": [
+                    {"name": "data", "type": "fat32", "volume": "nvme0"},
+                    {"name": "mount", "type": "mount", "mounts": mounts},
+                ],
+            }]});
+            build_workloads(&cfg, test_loc(&tmp), &[], "linux")
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        };
+        build("/data=nvme0").expect("the workload's own volume");
+        let e = build("/data=sd0").unwrap_err();
+        assert!(
+            e.contains("workload 0: `mount`'s `fs` claim mounts `/data` on volume `sd0`"),
+            "{e}"
+        );
+    }
+
     /// What the kernel refuses a workload, the build refuses first: a
     /// policy that reaches past the module, and a deadline over 16 × the
     /// domain's shortest tick.
@@ -2015,6 +2070,13 @@ mod continuity_tests {
     //! a validated graph property.
 
     use super::*;
+    use crate::manifest::{ClaimSelector, ResourceClaim};
+
+    /// The node's own modules on a Linux host, whose platform answers `fs`.
+    const LINUX: ProviderReach<'static> = ProviderReach {
+        runtime: Some("linux"),
+        caller: ProviderCaller::Node,
+    };
 
     fn man(caps: &[&str]) -> Manifest {
         Manifest {
@@ -2197,6 +2259,7 @@ mod continuity_tests {
                 device_class: 0x13, // storage.namespace
                 access_mode: 0,
                 instance: 0xFF,
+                selector: crate::manifest::ClaimSelector::Default,
             }],
             ..Manifest::default()
         };
@@ -2278,6 +2341,7 @@ mod continuity_tests {
                 device_class: 0x1A,
                 access_mode: 1,
                 instance: 0xFF,
+                selector: crate::manifest::ClaimSelector::Default,
             }],
             permissions: crate::manifest::ManifestPermissions {
                 bits: permission::PLATFORM_RAW,
@@ -2291,6 +2355,7 @@ mod continuity_tests {
                 device_class: 0x1A,
                 access_mode: 1,
                 instance: 0xFF,
+                selector: crate::manifest::ClaimSelector::Default,
             }],
             ..Manifest::default()
         };
@@ -2318,7 +2383,7 @@ mod continuity_tests {
         // A graph with no `provides` anywhere is unaffected.
         let mut m = HashMap::new();
         m.insert("a".to_string(), man(&[]));
-        validate_single_provider(&json!({}), &names(&["a"]), &m).unwrap();
+        validate_single_provider(&json!({}), &names(&["a"]), &m, LINUX).unwrap();
 
         // Two modules providing DIFFERENT surfaces coexist: a block
         // driver under a filesystem is the normal storage stack.
@@ -2328,7 +2393,7 @@ mod continuity_tests {
             "fat32".to_string(),
             prov(&["file.data", "storage.namespace"]),
         );
-        validate_single_provider(&json!({}), &names(&["nvme", "fat32"]), &m).unwrap();
+        validate_single_provider(&json!({}), &names(&["nvme", "fat32"]), &m, LINUX).unwrap();
     }
 
     #[test]
@@ -2345,8 +2410,8 @@ mod continuity_tests {
             "fat32_b".to_string(),
             prov(&["file.data", "storage.namespace"]),
         );
-        let e =
-            validate_single_provider(&json!({}), &names(&["fat32_a", "fat32_b"]), &m).unwrap_err();
+        let e = validate_single_provider(&json!({}), &names(&["fat32_a", "fat32_b"]), &m, LINUX)
+            .unwrap_err();
         let s = format!("{e:?}");
         assert!(
             s.contains("fat32_a") && s.contains("fat32_b"),
@@ -2366,7 +2431,7 @@ mod continuity_tests {
         let mut m = HashMap::new();
         m.insert("sd".to_string(), prov(&["storage.block"]));
         m.insert("nvme".to_string(), prov(&["storage.block"]));
-        validate_single_provider(&json!({}), &names(&["sd", "nvme"]), &m).unwrap();
+        validate_single_provider(&json!({}), &names(&["sd", "nvme"]), &m, LINUX).unwrap();
     }
 
     #[test]
@@ -2375,7 +2440,7 @@ mod continuity_tests {
         // duplicate against itself.
         let mut m = HashMap::new();
         m.insert("fat32".to_string(), prov(&["file.data", "file.data"]));
-        validate_single_provider(&json!({}), &names(&["fat32"]), &m).unwrap();
+        validate_single_provider(&json!({}), &names(&["fat32"]), &m, LINUX).unwrap();
     }
 
     #[test]
@@ -2400,7 +2465,13 @@ mod continuity_tests {
             {"name": "fat32_boot", "type": "fat32", "params": {"volume": "sd0"}},
             {"name": "fat32_data", "type": "fat32", "params": {"volume": "nvme0"}},
         ]});
-        validate_single_provider(&cfg, &names(&["mount", "fat32_boot", "fat32_data"]), &m).unwrap();
+        validate_single_provider(
+            &cfg,
+            &names(&["mount", "fat32_boot", "fat32_data"]),
+            &m,
+            LINUX,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -2413,16 +2484,72 @@ mod continuity_tests {
             {"name": "a", "type": "fat32", "params": {"volume": "nvme0"}},
             {"name": "b", "type": "fat32", "params": {"volume": "nvme0"}},
         ]});
-        let e = validate_single_provider(&cfg, &names(&["a", "b"]), &m).unwrap_err();
+        let e = validate_single_provider(&cfg, &names(&["a", "b"]), &m, LINUX).unwrap_err();
         let s = format!("{e:?}");
         assert!(s.contains("nvme0") && s.contains("collide"), "got: {s}");
     }
 
+    /// A manifest claiming `fs` the given way.
+    fn fs_consumer(selector: ClaimSelector) -> Manifest {
+        Manifest {
+            resources: vec![ResourceClaim {
+                device_class: 0x09,
+                access_mode: 1,
+                instance: 0xFF,
+                selector,
+            }],
+            ..Manifest::default()
+        }
+    }
+
     #[test]
     fn single_provider_rejects_keyed_backends_with_no_router() {
-        // Distinct selectors, but nothing provides the surface unkeyed. The
-        // class-byte path every `requires_contract` consumer uses would
-        // resolve to nothing and the kernel would answer ENOSYS.
+        // Distinct selectors, but nothing provides the surface unkeyed, and
+        // a consumer that names no volume takes the class-byte path: the
+        // kernel answers it from the target's own provider or with ENOSYS,
+        // never from these volumes.
+        let mut m = HashMap::new();
+        m.insert("boot".to_string(), prov(&["file.data"]));
+        m.insert("data".to_string(), prov(&["file.data"]));
+        m.insert("app".to_string(), fs_consumer(ClaimSelector::Default));
+        let cfg = json!({"modules": [
+            {"name": "boot", "type": "fat32", "params": {"volume": "sd0"}},
+            {"name": "data", "type": "fat32", "params": {"volume": "nvme0"}},
+            {"name": "app", "type": "fs_tap"},
+        ]});
+        let e = validate_single_provider(&cfg, &names(&["boot", "data", "app"]), &m, LINUX)
+            .unwrap_err();
+        let s = format!("{e:?}");
+        assert!(
+            s.contains("`app`'s `fs` claim names no volume")
+                && s.contains("`boot` (volume `sd0`)")
+                && s.contains("`data` (volume `nvme0`)"),
+            "got: {s}"
+        );
+    }
+
+    #[test]
+    fn single_provider_refuses_one_keyed_backend_without_a_router() {
+        // A single keyed backend needs a router too, for a consumer that
+        // names no volume: `volume:` moves it off the class-byte path
+        // whether or not it has siblings.
+        let mut m = HashMap::new();
+        m.insert("only".to_string(), prov(&["file.data"]));
+        m.insert("app".to_string(), fs_consumer(ClaimSelector::Default));
+        let cfg = json!({"modules": [
+            {"name": "only", "type": "fat32", "params": {"volume": "nvme0"}},
+            {"name": "app", "type": "fs_tap"},
+        ]});
+        let e = validate_single_provider(&cfg, &names(&["only", "app"]), &m, LINUX).unwrap_err();
+        assert!(
+            format!("{e:?}").contains("every provider of `fs` in the graph is instance-keyed"),
+            "got: {e:?}"
+        );
+    }
+
+    #[test]
+    fn keyed_only_providers_pass_with_no_consumer() {
+        // Nothing takes the class-byte path, so nothing is misrouted.
         let mut m = HashMap::new();
         m.insert("boot".to_string(), prov(&["file.data"]));
         m.insert("data".to_string(), prov(&["file.data"]));
@@ -2430,27 +2557,341 @@ mod continuity_tests {
             {"name": "boot", "type": "fat32", "params": {"volume": "sd0"}},
             {"name": "data", "type": "fat32", "params": {"volume": "nvme0"}},
         ]});
-        let e = validate_single_provider(&cfg, &names(&["boot", "data"]), &m).unwrap_err();
+        validate_single_provider(&cfg, &names(&["boot", "data"]), &m, LINUX).expect("no consumer");
+    }
+
+    #[test]
+    fn keyed_only_providers_pass_with_a_runtime_selector_consumer() {
+        // The consumer names its volume at runtime (`provider_call_sel`),
+        // which the composer cannot check and does not refuse.
+        let mut m = HashMap::new();
+        m.insert("data".to_string(), prov(&["file.data"]));
+        m.insert("relop".to_string(), fs_consumer(ClaimSelector::Runtime));
+        let cfg = json!({"modules": [
+            {"name": "data", "type": "fat32", "params": {"volume": "nvme0"}},
+            {"name": "relop", "type": "relop"},
+        ]});
+        validate_single_provider(&cfg, &names(&["data", "relop"]), &m, LINUX).expect("runtime");
+    }
+
+    #[test]
+    fn a_fixed_selector_needs_a_provider_of_that_volume() {
+        let mut m = HashMap::new();
+        m.insert("data".to_string(), prov(&["file.data"]));
+        m.insert(
+            "app".to_string(),
+            fs_consumer(ClaimSelector::Fixed("nvme0".into())),
+        );
+        let cfg = json!({"modules": [
+            {"name": "data", "type": "fat32", "params": {"volume": "nvme0"}},
+            {"name": "app", "type": "fs_tap"},
+        ]});
+        validate_single_provider(&cfg, &names(&["data", "app"]), &m, LINUX).expect("declared");
+
+        m.insert(
+            "app".to_string(),
+            fs_consumer(ClaimSelector::Fixed("sd0".into())),
+        );
+        let e = validate_single_provider(&cfg, &names(&["data", "app"]), &m, LINUX).unwrap_err();
         let s = format!("{e:?}");
         assert!(
-            s.contains("none is the default") && s.contains("boot") && s.contains("data"),
+            s.contains("`app`'s `fs` claim names volume `sd0` (`selector`), which no provider")
+                && s.contains("declared: `nvme0`"),
             "got: {s}"
         );
     }
 
     #[test]
-    fn single_provider_allows_one_keyed_backend_with_a_router() {
-        // A single keyed backend still needs the router: `volume:` moves it
-        // off the class-byte path whether or not it has siblings.
+    fn a_selector_param_names_the_volume_or_the_default() {
+        // Empty or absent: the default provider, refused against keyed-only
+        // providers. Set: that volume.
         let mut m = HashMap::new();
-        m.insert("only".to_string(), prov(&["file.data"]));
-        let cfg = json!({"modules": [
-            {"name": "only", "type": "fat32", "params": {"volume": "nvme0"}},
-        ]});
-        let e = validate_single_provider(&cfg, &names(&["only"]), &m).unwrap_err();
+        m.insert("data".to_string(), prov(&["file.data"]));
+        m.insert(
+            "img".to_string(),
+            fs_consumer(ClaimSelector::Param("volume".into())),
+        );
+        let keyed_only = |img: serde_json::Value| {
+            json!({"modules": [
+                {"name": "data", "type": "fat32", "params": {"volume": "nvme0"}},
+                img,
+            ]})
+        };
+        let e = validate_single_provider(
+            &keyed_only(json!({"name": "img", "type": "file_block", "params": {"volume": ""}})),
+            &names(&["data", "img"]),
+            &m,
+            LINUX,
+        )
+        .unwrap_err();
+        assert!(format!("{e:?}").contains("`img`'s `fs` claim leaves its `volume` param"));
+        let e = validate_single_provider(
+            &keyed_only(json!({"name": "img", "type": "file_block"})),
+            &names(&["data", "img"]),
+            &m,
+            LINUX,
+        )
+        .unwrap_err();
+        assert!(format!("{e:?}").contains("`img`'s `fs` claim leaves its `volume` param"));
+        validate_single_provider(
+            &keyed_only(
+                json!({"name": "img", "type": "file_block", "params": {"volume": "nvme0"}}),
+            ),
+            &names(&["data", "img"]),
+            &m,
+            LINUX,
+        )
+        .expect("a set volume");
+        validate_single_provider(
+            &keyed_only(json!({"name": "img", "type": "file_block", "volume": "platform"})),
+            &names(&["data", "img"]),
+            &m,
+            LINUX,
+        )
+        .expect("platform is the target's own provider");
+    }
+
+    #[test]
+    fn a_provider_cannot_reach_through_its_own_volume_param() {
+        // `volume` names the volume the provider registers as; it cannot
+        // also name the volume the provider reaches.
+        let mut m = HashMap::new();
+        let mut router = prov(&["file.data"]);
+        router.resources = fs_consumer(ClaimSelector::Param("volume".into())).resources;
+        m.insert("router".to_string(), router);
+        let cfg = json!({"modules": [{"name": "router", "type": "mount"}]});
+        let e = validate_single_provider(&cfg, &names(&["router"]), &m, LINUX).unwrap_err();
         assert!(
-            format!("{e:?}").contains("none is the default"),
+            e.to_string()
+                .contains("names the volume it reaches with `selector_param = \"volume\"`"),
             "got: {e:?}"
+        );
+
+        // A param of its own is checked as a consumer's is.
+        let mut cache = prov(&["file.data"]);
+        cache.resources = fs_consumer(ClaimSelector::Param("backend".into())).resources;
+        m.insert("cache".to_string(), cache);
+        m.insert("data".to_string(), prov(&["file.data"]));
+        let graph = |backend: &str| {
+            json!({"modules": [
+                {"name": "cache", "type": "fs_cache", "params": {"volume": "fast", "backend": backend}},
+                {"name": "data", "type": "fat32", "params": {"volume": "nvme0"}},
+            ]})
+        };
+        validate_single_provider(&graph("nvme0"), &names(&["cache", "data"]), &m, LINUX)
+            .expect("a declared backend");
+        let e = validate_single_provider(&graph("sd0"), &names(&["cache", "data"]), &m, LINUX)
+            .unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("names volume `sd0` through its `backend` param"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn every_volume_a_mount_table_names_is_provided() {
+        let mut m = HashMap::new();
+        let mut router = prov(&["file.data"]);
+        router.resources = fs_consumer(ClaimSelector::Table("mounts".into())).resources;
+        m.insert("mount".to_string(), router);
+        m.insert("data".to_string(), prov(&["file.data"]));
+        let names = names(&["mount", "data"]);
+        let graph = |mounts: &str| {
+            json!({"modules": [
+                {"name": "mount", "type": "mount", "params": {"mounts": mounts}},
+                {"name": "data", "type": "fat32", "params": {"volume": "nvme0"}},
+            ]})
+        };
+        let check =
+            |mounts: &str, reach| validate_single_provider(&graph(mounts), &names, &m, reach);
+        check("/data=nvme0;/host=platform;", LINUX).expect("both provided on Linux");
+        let e = check("/data=nvme0;/logs=nvme1", LINUX)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("`mount`'s `fs` claim mounts `/logs` on volume `nvme1`")
+                && e.contains("declared: `nvme0`"),
+            "{e}"
+        );
+        let pi5 = ProviderReach {
+            runtime: Some("bcm2712"),
+            caller: ProviderCaller::Node,
+        };
+        let e = check("/host=platform", pi5).unwrap_err().to_string();
+        assert!(e.contains("mounts `/host` on volume `platform`"), "{e}");
+        let e = check("/data=nvme0;/boot", LINUX).unwrap_err().to_string();
+        assert!(
+            e.contains("`mount`'s `mounts` entry `/boot` is not `prefix=volume`"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn a_selector_param_is_read_as_the_packer_reads_it() {
+        // A bare key on the entry wins over `params:`, and a value naming a
+        // `data:` entry stands for its content.
+        let mut m = HashMap::new();
+        m.insert("data".to_string(), prov(&["file.data"]));
+        m.insert(
+            "img".to_string(),
+            fs_consumer(ClaimSelector::Param("volume".into())),
+        );
+        let names = names(&["data", "img"]);
+        let cfg = json!({"modules": [
+            {"name": "data", "type": "fat32", "params": {"volume": "nvme0"}},
+            {"name": "img", "type": "file_block", "volume": "nvme0", "params": {"volume": "sd0"}},
+        ]});
+        validate_single_provider(&cfg, &names, &m, LINUX).expect("the bare key wins");
+        let cfg = json!({
+            "data": {"disk": {"content": "nvme0"}},
+            "modules": [
+                {"name": "data", "type": "fat32", "volume": "disk"},
+                {"name": "img", "type": "file_block", "volume": "disk"},
+            ]
+        });
+        validate_single_provider(&cfg, &names, &m, LINUX).expect("both resolve through data:");
+    }
+
+    #[test]
+    fn platform_is_reached_only_where_the_target_answers_it() {
+        let mut m = HashMap::new();
+        m.insert(
+            "img".to_string(),
+            fs_consumer(ClaimSelector::Param("volume".into())),
+        );
+        let cfg = json!({"modules": [
+            {"name": "img", "type": "file_block", "params": {"volume": "platform"}},
+        ]});
+        let reach = |runtime, caller| ProviderReach {
+            runtime: Some(runtime),
+            caller,
+        };
+        let check = |r| validate_single_provider(&cfg, &names(&["img"]), &m, r);
+        check(LINUX).expect("Linux answers fs from the host");
+        check(reach("bcm2712", ProviderCaller::Workload)).expect("bcm2712 roots a workload");
+        let e = check(reach("bcm2712", ProviderCaller::Node)).unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("on bcm2712 answers no `fs` call of the node's own modules"),
+            "{e}"
+        );
+        assert!(check(reach("rp2350", ProviderCaller::Node)).is_err());
+        check(ProviderReach {
+            runtime: None,
+            caller: ProviderCaller::Node,
+        })
+        .expect("an unknown target is not checked");
+    }
+
+    #[test]
+    fn a_consumer_cannot_reach_the_default_provider_it_feeds() {
+        // A file-backed device under the graph's own filesystem: the image's
+        // open reaches that filesystem, which mounts only once the image
+        // serves it.
+        let mut m = HashMap::new();
+        m.insert("fs".to_string(), prov(&["file.data"]));
+        let mut disk = prov(&["storage.block"]);
+        disk.resources = fs_consumer(ClaimSelector::Param("volume".into())).resources;
+        m.insert("disk".to_string(), disk);
+        m.insert("seal".to_string(), prov(&["storage.block"]));
+        let graph = |volume: Value| {
+            json!({
+                "modules": [
+                    {"name": "disk", "type": "file_block", "path": "data.img", "volume": volume},
+                    {"name": "seal", "type": "crypt_block"},
+                    {"name": "fs", "type": "fat32"},
+                ],
+                "wiring": [
+                    {"from": "disk.blocks", "to": "seal.lower"},
+                    {"from": "seal.blocks", "to": "fs.blocks"},
+                ]
+            })
+        };
+        let names = names(&["disk", "seal", "fs"]);
+        let e = validate_single_provider(&graph(Value::Null), &names, &m, LINUX).unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("which it feeds (`disk` → `seal` → `fs`)"),
+            "{e}"
+        );
+        validate_single_provider(&graph(json!("platform")), &names, &m, LINUX)
+            .expect("the image on the host's filesystem");
+    }
+
+    /// A port of `module`'s manifest, by name and content type.
+    fn named_port(name: &str, direction: u8, content_type: &str) -> crate::manifest::PortSpec {
+        crate::manifest::PortSpec {
+            direction,
+            content_type: fluxor_contracts::CONTENT_TYPES
+                .iter()
+                .position(|s| *s == content_type)
+                .unwrap_or_else(|| panic!("unknown content type '{content_type}'"))
+                as u8,
+            flags: 0,
+            name: Some(name.to_string()),
+            index: 0,
+            buffer_size: 0,
+            max_record: 0,
+            rate_class_max: None,
+            rate_class_default: None,
+            requires_capability: None,
+            facts: std::collections::BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn a_shared_net_provider_does_not_join_its_connections() {
+        // An S3 front and an outbound TLS link to a remote node share the
+        // host's net provider. The front's socket and the link's socket
+        // are different connections, so the front does not feed what sits
+        // behind the link — even when that is the provider the front's
+        // claim reaches. `net` is the platform's own net module: it has no
+        // manifest here, so only its peers' ports say the edges are
+        // `NetProto`.
+        let mut m = HashMap::new();
+        let mut front = fs_consumer(ClaimSelector::Default);
+        front.ports = vec![
+            named_port("net_out", 1, "NetProto"),
+            named_port("net_in", 0, "NetProto"),
+        ];
+        m.insert("front".to_string(), front);
+        let mut link = prov(&[]);
+        link.ports = vec![
+            named_port("cipher_in", 0, "NetProto"),
+            named_port("cipher_out", 1, "NetProto"),
+            named_port("clear_out", 1, "OctetStream"),
+        ];
+        m.insert("link".to_string(), link);
+        m.insert("fs".to_string(), prov(&["file.data"]));
+        let graph = json!({
+            "modules": [
+                {"name": "front", "type": "front"},
+                {"name": "link", "type": "tls"},
+                {"name": "fs", "type": "fat32"},
+            ],
+            "wiring": [
+                {"from": "front.net_out", "to": "net.net_in"},
+                {"from": "net.net_out", "to": "front.net_in"},
+                {"from": "link.cipher_out", "to": "net.net_in"},
+                {"from": "net.net_out", "to": "link.cipher_in"},
+                {"from": "link.clear_out", "to": "fs.blocks"},
+            ]
+        });
+        let names = names(&["front", "link", "fs"]);
+        validate_single_provider(&graph, &names, &m, LINUX)
+            .expect("two connections through one net provider are not a data path");
+
+        // The same front wired to the provider directly does feed it.
+        let mut direct = graph.clone();
+        direct["wiring"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"from": "front.net_out", "to": "fs.blocks"}));
+        let e = validate_single_provider(&direct, &names, &m, LINUX).unwrap_err();
+        assert!(
+            e.to_string().contains("which it feeds (`front` → `fs`)"),
+            "{e}"
         );
     }
 
@@ -2466,7 +2907,7 @@ mod continuity_tests {
             {"name": "mount", "type": "mount"},
             {"name": "vol", "type": "fat32", "params": {"volume": "platform"}},
         ]});
-        let e = validate_single_provider(&cfg, &names(&["mount", "vol"]), &m).unwrap_err();
+        let e = validate_single_provider(&cfg, &names(&["mount", "vol"]), &m, LINUX).unwrap_err();
         let s = format!("{e:?}");
         assert!(s.contains("`vol`") && s.contains("reserved"), "got: {s}");
 
@@ -2479,7 +2920,7 @@ mod continuity_tests {
             {"name": "file_block", "params": {"volume": "platform"}},
             {"name": "fat32"},
         ]});
-        validate_single_provider(&cfg, &names(&["file_block", "fat32"]), &m).unwrap();
+        validate_single_provider(&cfg, &names(&["file_block", "fat32"]), &m, LINUX).unwrap();
     }
 
     #[test]

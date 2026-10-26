@@ -60,7 +60,16 @@ A module's `manifest.toml` separates four concerns into four fields:
 - `[[resources]].requires_contract = "..."` — kernel or provider contracts
   the module needs at runtime (GPIO, SPI, PIO, channel, FS, timer,
   platform DMA, and the rest of `PROVIDER_CONTRACTS`), with an `access`
-  mode of `read`, `write`, `exclusive`, or `chain`.
+  mode of `read`, `write`, `exclusive`, or `chain`. A claim on a contract
+  with instance-keyed providers may name the provider it reaches, with at
+  most one of `selector = "<volume>"` (one fixed volume),
+  `selector_param = "<param>"` (the module's `str` param whose value names
+  it; empty or absent, the default provider), `selector_table = "<param>"`
+  (a `str` param of `prefix=volume` entries, each volume reached) or
+  `selector_runtime = true` (chosen as the module runs, so not checked).
+  With none of them the claim reaches the default provider. `pack` and the
+  composer read these keys; they are not written to the binary manifest.
+  See `storage_capability_surface.md`, "Which volume a consumer reaches".
 - `[requires]` — target CPU features. A module that declares
   `requires.fpu = true` is rejected at build time from a target without
   hardware floating point.
@@ -142,7 +151,7 @@ Source: `contracts/src/lib.rs`.
 | 8 | `MeshCommand` | Mesh command payloads |
 | 9 | `MeshState` | Mesh state payloads |
 | 10 | `MeshHandle` | Mesh handle payloads |
-| 11 | `InputEvent` | Generic input event record; new graphs wire the per-class input types below |
+| 11 | `InputEvent` | A driver's own input record, for a device whose events fit none of the per-class input types below; a graph wires a per-class type wherever one applies |
 | 12 | `GestureMatch` | Matched gesture identifiers |
 | 13 | `FmpMessage` | FMP control messages (next / prev / toggle) |
 | 14 | `EthernetFrame` | Raw Ethernet frames |

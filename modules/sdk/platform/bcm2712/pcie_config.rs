@@ -13,7 +13,10 @@
 
 /// Re-run PCIe bus enumeration. Intended for cold-boot recovery on
 /// platforms where the link trains slowly (Pi 5 NVMe HAT+ PCIe1).
-/// handle=-1, arg=[] (unused). Returns new device count.
+/// handle=-1, arg=[] (unused). Returns the device count the rescan
+/// found. The kernel brings PCIe1 up at boot and its link trains after
+/// that, so a call before the link is up returns 0; the device appears
+/// on a later call.
 pub const PCIE_RESCAN: u32 = 0x0CF5;
 /// Read 32-bit word from a discovered device's PCI configuration
 /// space. handle=-1, arg=[dev_idx:u8, _pad:u8, offset:u16 LE] (4 bytes

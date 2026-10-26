@@ -75,6 +75,26 @@ macro_rules! define_params {
         );* $(;)?
     ) => {
         // ================================================================
+        // One tag, one param. A value for either of two params on one tag
+        // is packed under that tag, and `dispatch_param` hands every entry
+        // to the first. The duplicate match arm only warns
+        // (`unreachable_patterns`, which a module crate may allow), so the
+        // macro refuses it here, at compile time.
+        // ================================================================
+        const _: () = {
+            let tags: &[u8] = &[$($tag),*];
+            let mut i = 0;
+            while i < tags.len() {
+                let mut j = i + 1;
+                while j < tags.len() {
+                    assert!(tags[i] != tags[j], "define_params!: two params declare the same tag");
+                    j += 1;
+                }
+                i += 1;
+            }
+        };
+
+        // ================================================================
         // Dispatch: match on TLV tag, execute apply closure
         // ================================================================
         // `#[allow(unused_variables)]` is needed for modules that

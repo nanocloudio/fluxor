@@ -1238,74 +1238,268 @@ const CHAIN_AWARE_PROVIDES: &[&str] = &[];
 /// storage.object), so these are exempt.
 const NON_DISPATCH_SURFACES: &[&str] = &["storage.block"];
 
-/// Selector names no module may register: `platform` names the platform's
-/// own provider of a contract, beneath every module layer. The kernel's
-/// `provider::PLATFORM_SELECTOR_NAME` is the other half, and refuses the
-/// registration at load; this turns that into a build error.
-const RESERVED_SELECTORS: &[&str] = &["platform"];
+/// The selector that names the platform's own provider of a contract,
+/// beneath every module layer. No module may register under it: the
+/// kernel's `provider::PLATFORM_SELECTOR_NAME` is the other half and refuses
+/// the registration at load; the composer refuses it at build.
+const PLATFORM_SELECTOR: &str = "platform";
+
+/// Whose modules a graph's are: the node's own, or a resident workload's.
+/// The platform answers each differently, and a workload reaches only
+/// providers of its own (`provider::layer_visible`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProviderCaller {
+    Node,
+    Workload,
+}
+
+/// Where a graph's modules call their providers from: the target's runtime
+/// (`None` when it is not known) and whose modules they are.
+#[derive(Clone, Copy, Debug)]
+pub struct ProviderReach<'a> {
+    pub runtime: Option<&'a str>,
+    pub caller: ProviderCaller,
+}
+
+/// The contracts the platform's own provider answers for `caller`'s modules
+/// on `runtime`: what a `platform` selector reaches, and what a call that
+/// names no volume reaches when no module provides the contract unkeyed.
+/// `None` for a runtime not listed, whose platform is then not checked.
+///
+/// Mirrors the kernel's `provider::register` calls under `src/platform/`:
+/// - Linux and wasm answer `fs`, `storage.object` and `storage.namespace`
+///   from the host (Linux answers a workload inside a root of its own);
+/// - bcm2712's `storage.object` / `storage.namespace` store serves the node
+///   alone (`EACCES` to a workload), and its `fs` provider serves workloads
+///   alone, each inside a root on the node's volume (`ENOSYS` to the node's
+///   own modules, which reach that volume through its module provider);
+/// - the RP, ESP32 and UEFI runtimes register none of them.
+fn platform_contracts(runtime: &str, caller: ProviderCaller) -> Option<&'static [&'static str]> {
+    const HOST: &[&str] = &["fs", "storage.object", "storage.namespace"];
+    match (runtime, caller) {
+        ("linux" | "wasm", _) => Some(HOST),
+        ("bcm2712", ProviderCaller::Node) => Some(&["storage.object", "storage.namespace"]),
+        ("bcm2712", ProviderCaller::Workload) => Some(&["fs"]),
+        ("rp2040" | "rp2350" | "esp32" | "uefi", _) => Some(&[]),
+        _ => None,
+    }
+}
+
+/// The value a string param of module instance `name` packs to, as the
+/// packer reads it: a bare `<key>` on the entry wins over `params.<key>`,
+/// and a value naming a `data:` entry stands for that entry's `content`.
+/// `None` when the instance sets no string under `key`, which packs nothing
+/// and leaves the module's default: for a `str` param, the empty string.
+fn instance_str_param(config: &Value, name: &str, key: &str) -> Option<String> {
+    let entry = config
+        .get("modules")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|e| e.get("name").and_then(Value::as_str) == Some(name))?;
+    let raw = entry
+        .get(key)
+        .or_else(|| entry.get("params").and_then(|p| p.get(key)))?
+        .as_str()?;
+    let resolved = config
+        .get("data")
+        .and_then(|d| d.get(raw))
+        .and_then(|d| d.get("content"))
+        .and_then(Value::as_str)
+        .unwrap_or(raw);
+    Some(resolved.to_string())
+}
 
 /// The per-module `volume:` param — the instance selector that keys an
-/// FS/namespace provider — set on the entry or inside its `params:`, as the
-/// packer reads either. Empty string = the default (unkeyed) provider.
-/// Two providers of one surface may coexist ONLY with distinct selectors:
-/// the kernel reaches each keyed volume via `provider_call_sel` and the
-/// `mount` module routes paths to them.
+/// FS/namespace provider — as the packer reads it ([`instance_str_param`]).
+/// Empty = the default (unkeyed) provider. Two providers of one surface may
+/// coexist ONLY with distinct selectors: the kernel reaches each keyed
+/// volume via `provider_call_sel` and the `mount` module routes paths to
+/// them.
 ///
 /// The literal key `"volume"` mirrors the provider module's own selector
 /// param (`fat32`'s `define_params!` tag `volume`, which feeds
 /// `module_provider_selector`) — a rename must touch both sides.
-fn provider_volume<'a>(config: &'a Value, name: &str) -> &'a str {
-    config
-        .get("modules")
-        .and_then(|m| m.as_array())
-        .and_then(|arr| {
-            arr.iter()
-                .find(|e| e.get("name").and_then(|n| n.as_str()) == Some(name))
-        })
-        .and_then(|e| {
-            e.get("volume")
-                .or_else(|| e.get("params").and_then(|p| p.get("volume")))
-        })
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
+fn provider_volume(config: &Value, name: &str) -> String {
+    instance_str_param(config, name, "volume").unwrap_or_default()
 }
 
-/// Reject a graph in which two modules provide the same contract surface
-/// (a `provides = [..]` entry) with the SAME instance selector.
+/// The contract a provided surface serves: `file.data` is the `fs`
+/// contract; the storage surfaces are contracts of their own.
+fn surface_contract(surface: &str) -> &str {
+    match surface {
+        "file.data" => "fs",
+        s => s,
+    }
+}
+
+/// The module a wiring endpoint (`module.port`, `module.port[i]`) names.
+fn endpoint_module(spec: &str) -> &str {
+    spec.split(['.', '[']).next().unwrap_or(spec)
+}
+
+/// The port a wiring endpoint (`module.port`, `module.port[i]`) names.
+fn endpoint_port(spec: &str) -> Option<&str> {
+    let (_, rest) = spec.split_once('.')?;
+    rest.split('[').next()
+}
+
+/// Whether a wiring endpoint's port carries `NetProto`, by its module's
+/// manifest. `None` when the manifest or the port is not known — the
+/// platform's own net module has no manifest of its own here.
+fn endpoint_is_net_proto(spec: &str, manifests: &HashMap<String, Manifest>) -> Option<bool> {
+    let m = manifests.get(endpoint_module(spec))?;
+    let port = endpoint_port(spec)?;
+    let p = m.ports.iter().find(|p| p.name.as_deref() == Some(port))?;
+    Some(crate::manifest::CONTENT_TYPES.get(p.content_type as usize) == Some(&"NetProto"))
+}
+
+/// A wiring path from module `from` to module `to` (both included), if the
+/// graph's `wiring:` has one that carries data from one to the other.
 ///
-/// Contract providers are auto-registered by the loader after each module
-/// reaches Ready, in module-index order. The class-byte dispatch path
-/// takes the top-most unkeyed (selector 0) layer, and a second unkeyed
-/// provider of the same surface silently shadows the first: two `fat32`
-/// volumes without distinct `volume:` selectors do not resolve by path —
-/// every `FS_OPEN` reaches the same one and the other drive is
-/// unreachable. This turns that into a build error, naming both modules.
+/// A path does not pass THROUGH a net provider. `NetProto` multiplexes
+/// connections — every frame names its connection, and the provider
+/// (`linux_net`, `ip`) delivers each to that connection's owner — so a
+/// module that arrives on a `NetProto` edge and leaves on another has
+/// crossed from one connection to another, not followed data. Without
+/// this rule every module with a socket would appear to feed every
+/// other, through the one net provider they share. A `NetProto` edge is
+/// still followed into and out of the endpoints it joins; only the hop
+/// across the provider is not.
+fn wiring_path(
+    config: &Value,
+    manifests: &HashMap<String, Manifest>,
+    from: &str,
+    to: &str,
+) -> Option<Vec<String>> {
+    // (from module, to module, carries NetProto). An edge is NetProto when
+    // either end's port declares it.
+    let edges: Vec<(&str, &str, bool)> = config
+        .get("wiring")
+        .and_then(Value::as_array)
+        .map(|w| {
+            w.iter()
+                .filter_map(|e| {
+                    let f = e.get("from").and_then(Value::as_str)?;
+                    let t = e.get("to").and_then(Value::as_str)?;
+                    let net = endpoint_is_net_proto(f, manifests) == Some(true)
+                        || endpoint_is_net_proto(t, manifests) == Some(true);
+                    Some((endpoint_module(f), endpoint_module(t), net))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    // Search state: a module, and whether it was reached over NetProto.
+    type At<'a> = (&'a str, bool);
+    let start: At<'_> = (from, false);
+    let mut came_from: HashMap<At<'_>, At<'_>> = HashMap::new();
+    let mut queue = std::collections::VecDeque::from([start]);
+    while let Some(at) = queue.pop_front() {
+        if at.0 == to {
+            let mut path = vec![to.to_string()];
+            let mut cur = at;
+            while cur != start {
+                cur = came_from[&cur];
+                path.push(cur.0.to_string());
+            }
+            path.reverse();
+            return Some(path);
+        }
+        for &(f, t, net) in &edges {
+            if f != at.0 || (net && at.1) {
+                continue;
+            }
+            let next = (t, net);
+            if t != from && !came_from.contains_key(&next) {
+                came_from.insert(next, at);
+                queue.push_back(next);
+            }
+        }
+    }
+    None
+}
+
+/// How a claim names its provider, for a diagnostic: its selector and the
+/// volume it resolved to.
+fn claim_names(selector: &crate::manifest::ClaimSelector, volume: Option<&str>) -> String {
+    use crate::manifest::ClaimSelector;
+    match (selector, volume) {
+        (ClaimSelector::Fixed(_), Some(v)) => format!("names volume `{v}` (`selector`)"),
+        (ClaimSelector::Param(p), Some(v)) => {
+            format!("names volume `{v}` through its `{p}` param (`selector_param`)")
+        }
+        (ClaimSelector::Param(p), None) => {
+            format!("leaves its `{p}` param, the claim's `selector_param`, empty")
+        }
+        (ClaimSelector::Runtime, _) => "names its volume at runtime".to_string(),
+        _ => "names no volume".to_string(),
+    }
+}
+
+/// Check how a graph's modules reach their contract providers.
 ///
-/// Multiple providers of one surface ARE allowed when each declares a
-/// distinct `volume:` selector: they register as instance-keyed layers a
-/// `mount` module binds and routes between. The escape hatch
-/// `CHAIN_AWARE_PROVIDES` (empty) additionally exempts a contract
-/// whose callers fan through `CHAIN_NEXT`.
+/// **One provider per selector.** The loader registers a module as the
+/// provider of what it provides when its `module_new` returns Ready, in
+/// module-index order. The
+/// class-byte dispatch path takes the top-most unkeyed (selector 0) layer,
+/// and a second unkeyed provider of the same surface silently shadows the
+/// first: two `fat32` volumes without distinct `volume:` selectors do not
+/// resolve by path — every `FS_OPEN` reaches the same one and the other drive
+/// is unreachable. Two providers of a surface with one `volume:` collide the
+/// same way. Both are refused, naming the two modules. Several providers of
+/// one surface are allowed when each declares a distinct `volume:`: they
+/// register as instance-keyed layers a `mount` module routes between. The
+/// escape hatch `CHAIN_AWARE_PROVIDES` (empty) exempts a contract whose
+/// callers fan through `CHAIN_NEXT`.
+///
+/// **Each claim reaches a provider.** A `[[resources]]` claim reaches the
+/// provider its selector names (`selector`, `selector_param`, each volume a
+/// `selector_table` names; `ClaimSelector`),
+/// or, naming none, the contract's default — the top-most unkeyed module
+/// layer, else the platform's own provider ([`platform_contracts`]), else
+/// `ENOSYS`. Refused, naming the module, its claim and the fix:
+/// - a claim that names no volume in a graph whose module providers of the
+///   contract are all keyed: nothing in the graph answers it;
+/// - a claim that names a volume no provider in the graph declares
+///   (`ENODEV` at runtime), or `platform` where the target's platform does
+///   not answer the contract for these modules;
+/// - a `selector_table` entry that is not `prefix=volume`, which the module
+///   skips;
+/// - a claim that names no volume and reaches the graph's default provider
+///   while feeding it through the wiring: the provider cannot answer the
+///   module until the module has served it;
+/// - a provider naming the volume it reaches with its own `volume` param,
+///   the key that names the volume it provides.
+///
+/// A `selector_runtime` claim is chosen by the module as it runs and is not
+/// checked; a provider's claim on its own contract that names no volume is
+/// its use of the layers below it, and is not checked either.
 pub fn validate_single_provider(
     config: &Value,
     module_names: &[String],
     manifests: &HashMap<String, Manifest>,
+    reach: ProviderReach<'_>,
 ) -> Result<()> {
+    use crate::manifest::ClaimSelector;
+
     // (surface, selector) -> first module declaring it. A later module
     // with the SAME (surface, selector) would shadow it at runtime.
+    let volumes: HashMap<&str, String> = module_names
+        .iter()
+        .map(|n| (n.as_str(), provider_volume(config, n)))
+        .collect();
     let mut seen: HashMap<(&str, &str), &str> = HashMap::new();
     for name in module_names {
         let Some(m) = manifests.get(name) else {
             continue;
         };
-        let sel = provider_volume(config, name);
+        let sel = volumes[name.as_str()].as_str();
         for surface in &m.provides {
             if CHAIN_AWARE_PROVIDES.contains(&surface.as_str())
                 || NON_DISPATCH_SURFACES.contains(&surface.as_str())
             {
                 continue;
             }
-            if RESERVED_SELECTORS.contains(&sel) {
+            if sel == PLATFORM_SELECTOR {
                 return Err(Error::Config(format!(
                     "`{name}` provides `{surface}` with `volume = \"{sel}\"`, a name reserved for \
                      the platform's own provider of the contract (a consumer reaches the host \
@@ -1342,45 +1536,172 @@ pub fn validate_single_provider(
         }
     }
 
-    // A surface whose providers are ALL instance-keyed has no router: the
-    // class-byte (`handle == -1`) path that every `requires_contract` consumer
-    // uses resolves to nothing, and the kernel answers ENOSYS. Catch it here,
-    // where both the module names and the fix are in hand.
-    let mut keyed: HashMap<&str, Vec<&str>> = HashMap::new();
-    let mut has_default: HashMap<&str, bool> = HashMap::new();
+    // Each contract's default (unkeyed) module provider and keyed providers.
+    let mut keyed: std::collections::BTreeMap<&str, Vec<(&str, &str)>> =
+        std::collections::BTreeMap::new();
+    let mut default_of: HashMap<&str, &str> = HashMap::new();
+    for (&(surface, sel), &provider) in &seen {
+        let contract = surface_contract(surface);
+        if sel.is_empty() {
+            default_of.insert(contract, provider);
+        } else {
+            keyed.entry(contract).or_default().push((provider, sel));
+        }
+    }
+    for providers in keyed.values_mut() {
+        providers.sort_unstable();
+    }
+    let platform = reach
+        .runtime
+        .and_then(|r| platform_contracts(r, reach.caller).map(|c| (r, c)));
+    let whose = match reach.caller {
+        ProviderCaller::Node => "the node's own modules",
+        ProviderCaller::Workload => "a workload's modules",
+    };
+
     for name in module_names {
         let Some(m) = manifests.get(name) else {
             continue;
         };
-        let sel = provider_volume(config, name);
-        for surface in &m.provides {
-            if CHAIN_AWARE_PROVIDES.contains(&surface.as_str())
-                || NON_DISPATCH_SURFACES.contains(&surface.as_str())
-            {
-                continue;
+        for claim in &m.resources {
+            let contract = crate::manifest::contract_name_to_str(claim.device_class);
+            let provides_it = m.provides.iter().any(|s| surface_contract(s) == contract);
+            if provides_it {
+                if let ClaimSelector::Param(param) = &claim.selector {
+                    if param == "volume" {
+                        return Err(Error::Config(format!(
+                            "`{name}` provides `{contract}` and its `{contract}` claim names the \
+                             volume it reaches with `selector_param = \"volume\"`, the param that \
+                             names the volume it provides: one value cannot be both. Name the \
+                             volume it reaches with a param of its own, or choose it at runtime \
+                             (`selector_runtime = true`)."
+                        )));
+                    }
+                }
             }
-            if sel.is_empty() {
-                has_default.insert(surface.as_str(), true);
-            } else {
-                keyed
-                    .entry(surface.as_str())
-                    .or_default()
-                    .push(name.as_str());
+            // Each volume the claim reaches, with how the claim names it.
+            let targets: Vec<(String, Option<String>)> = match &claim.selector {
+                ClaimSelector::Runtime => continue,
+                ClaimSelector::Default => vec![(claim_names(&claim.selector, None), None)],
+                ClaimSelector::Fixed(v) => {
+                    vec![(claim_names(&claim.selector, Some(v)), Some(v.clone()))]
+                }
+                ClaimSelector::Param(param) => {
+                    let v = instance_str_param(config, name, param).filter(|v| !v.is_empty());
+                    vec![(claim_names(&claim.selector, v.as_deref()), v)]
+                }
+                ClaimSelector::Table(param) => {
+                    let table = instance_str_param(config, name, param).unwrap_or_default();
+                    let mut targets = Vec::new();
+                    for entry in table.split(';').filter(|e| !e.trim().is_empty()) {
+                        let Some((prefix, volume)) = entry
+                            .split_once('=')
+                            .filter(|(p, v)| !p.is_empty() && !v.is_empty())
+                        else {
+                            return Err(Error::Config(format!(
+                                "`{name}`'s `{param}` entry `{entry}` is not `prefix=volume`, so \
+                                 `{name}` skips it and nothing is mounted there. Write it as \
+                                 `<path prefix>=<volume>`, entries separated by `;`."
+                            )));
+                        };
+                        targets.push((
+                            format!(
+                                "mounts `{prefix}` on volume `{volume}` (its `{param}` param, \
+                                 the claim's `selector_table`)"
+                            ),
+                            Some(volume.to_string()),
+                        ));
+                    }
+                    targets
+                }
+            };
+            for (how, volume) in targets {
+                match volume {
+                    None if provides_it => {}
+                    None => {
+                        if let Some(&provider) = default_of.get(contract) {
+                            if let Some(path) = wiring_path(config, manifests, name, provider) {
+                                return Err(Error::Config(format!(
+                                    "`{name}`'s `{contract}` claim {how}, so it reaches the graph's \
+                                     default `{contract}` provider, `{provider}`, which it feeds \
+                                     (`{}`). `{provider}` cannot answer `{name}` until `{name}` has \
+                                     served it (a `fat32` answers EAGAIN until its volume is \
+                                     mounted), so neither comes up. Name the provider `{name}` \
+                                     reaches: `{PLATFORM_SELECTOR}` for the target's own, or a keyed \
+                                     volume (`selector` or `selector_param` on the claim).",
+                                    path.join("` → `")
+                                )));
+                            }
+                            continue;
+                        }
+                        let Some(backends) = keyed.get(contract) else {
+                            continue;
+                        };
+                        let list = backends
+                            .iter()
+                            .map(|(b, v)| format!("`{b}` (volume `{v}`)"))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let fate = match platform {
+                            Some((runtime, served)) if served.contains(&contract) => format!(
+                                "on {runtime} the call reaches the platform's own `{contract}` \
+                                 provider, not these volumes"
+                            ),
+                            Some((runtime, _)) => format!(
+                                "on {runtime} the platform answers no `{contract}` call of \
+                                 {whose}, so the kernel returns ENOSYS"
+                            ),
+                            None => format!(
+                                "the call reaches the platform's own `{contract}` provider where the \
+                                 target has one, and answers ENOSYS where it has none"
+                            ),
+                        };
+                        return Err(Error::Config(format!(
+                            "`{name}`'s `{contract}` claim {how}, and every provider of `{contract}` \
+                             in the graph is instance-keyed: {list}; {fate}. Name the volume \
+                             (`selector` or `selector_param` on the claim), add a router that \
+                             provides `{contract}` with no `volume:` (the `mount` module), or drop \
+                             `volume:` from the single backend that should serve it."
+                        )));
+                    }
+                    Some(v) if v == PLATFORM_SELECTOR => {
+                        let Some((runtime, served)) = platform else {
+                            continue;
+                        };
+                        if !served.contains(&contract) {
+                            return Err(Error::Config(format!(
+                                "`{name}`'s `{contract}` claim {how}, the platform's own provider, \
+                                 which on {runtime} answers no `{contract}` call of {whose}. Name a \
+                                 volume a provider in the graph declares."
+                            )));
+                        }
+                    }
+                    Some(v) => {
+                        let declared = keyed
+                            .get(contract)
+                            .is_some_and(|b| b.iter().any(|(_, vol)| *vol == v));
+                        if !declared {
+                            let known = keyed
+                                .get(contract)
+                                .map(|b| {
+                                    b.iter()
+                                        .map(|(_, vol)| format!("`{vol}`"))
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                })
+                                .unwrap_or_else(|| "none".to_string());
+                            return Err(Error::Config(format!(
+                                "`{name}`'s `{contract}` claim {how}, which no provider in the graph \
+                                 declares (`volume:` on a `{contract}` provider; declared: \
+                                 {known}), so the call would answer ENODEV at runtime. Name a \
+                                 declared volume, `{PLATFORM_SELECTOR}` for the target's own \
+                                 provider, or add the backend."
+                            )));
+                        }
+                    }
+                }
             }
         }
-    }
-    for (surface, backends) in keyed {
-        if has_default.get(surface).copied().unwrap_or(false) {
-            continue;
-        }
-        let list = backends.join("`, `");
-        return Err(Error::Config(format!(
-            "every provider of `{surface}` is instance-keyed (`{list}`) and none is the \
-             default — a consumer calling this contract without naming a volume has \
-             nothing to route it, and the kernel returns ENOSYS. Add a router that \
-             provides `{surface}` with no `volume:` (the `mount` module), or drop \
-             `volume:` from the single backend that should serve it."
-        )));
     }
     Ok(())
 }

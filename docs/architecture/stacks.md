@@ -125,6 +125,7 @@ modules:
   - name: disk
     type: file_block
     path: ${param:image}
+    volume: platform             # the host's filesystem, not the one built on it
     block_size: ${param:block_size}
   - name: seal
     type: crypt_block

@@ -910,6 +910,35 @@ pub struct ResourceClaim {
     /// Hardware instance index (0xFF = any/unspecified).
     /// Used to distinguish e.g. PIO0 vs PIO1 for conflict checks.
     pub instance: u8,
+    /// Which provider of the contract the claim reaches. Tools-side only,
+    /// never serialised: `pack` holds a `selector_param` to the module's own
+    /// params, and the composer checks each claim against the graph's
+    /// providers (`config::validate_single_provider`).
+    pub selector: ClaimSelector,
+}
+
+/// How a `[[resources]]` claim names the provider it reaches, from at most
+/// one of `selector`, `selector_param`, `selector_table` and
+/// `selector_runtime`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ClaimSelector {
+    /// The contract's default: its unkeyed module provider, else the
+    /// platform's own.
+    #[default]
+    Default,
+    /// One fixed volume, by name.
+    Fixed(String),
+    /// The volume an instance param names; an empty or absent value is the
+    /// default provider.
+    Param(String),
+    /// The volumes a table param names: `;`-separated `prefix=volume`
+    /// entries (the `mount` module's `mounts:`), each a volume the module
+    /// reaches. A volume the module adds as it runs (`mount`'s hotplug
+    /// channel) is not checked.
+    Table(String),
+    /// Chosen at runtime (`provider_call_sel` with a name the module
+    /// computes), so the composer cannot check it.
+    Runtime,
 }
 
 #[derive(Debug, Clone)]
@@ -2389,10 +2418,12 @@ impl Manifest {
             let cid = contract_id_from_name(&r.device_class)?;
             let access_mode = access_mode_from_str(&r.access)?;
             let instance = r.instance.unwrap_or(0xFF);
+            let selector = claim_selector(&r)?;
             resources.push(ResourceClaim {
                 device_class: cid,
                 access_mode,
                 instance,
+                selector,
             });
         }
 
@@ -3181,6 +3212,8 @@ impl Manifest {
                 device_class: data[offset],
                 access_mode: data[offset + 1],
                 instance: data[offset + 2],
+                // The binary manifest does not carry the selector.
+                selector: ClaimSelector::Default,
             });
             offset += 4;
         }
@@ -4203,13 +4236,73 @@ struct TomlPort {
 
 #[derive(Deserialize)]
 struct TomlResource {
-    /// Public contract this module needs access to. Values: one of
-    /// gpio, spi, i2c, pio, uart, adc, pwm, fs. Non-contract
-    /// permissions go in the top-level `permissions = [...]` list.
+    /// Public contract this module needs access to: a name
+    /// [`contract_id_from_name`] accepts. Non-contract permissions go in
+    /// the top-level `permissions = [...]` list.
     #[serde(rename = "requires_contract")]
     device_class: String,
     access: String,
     instance: Option<u8>,
+    /// Which provider the claim reaches: at most one of the three keys. See
+    /// [`ClaimSelector`].
+    selector: Option<String>,
+    selector_param: Option<String>,
+    selector_table: Option<String>,
+    selector_runtime: Option<bool>,
+}
+
+/// The [`ClaimSelector`] a `[[resources]]` row declares: at most one of
+/// `selector`, `selector_param`, `selector_table` and `selector_runtime`, no
+/// name empty.
+/// `selector_runtime = false` declares the default provider, as no key does.
+fn claim_selector(r: &TomlResource) -> Result<ClaimSelector> {
+    let set = usize::from(r.selector.is_some())
+        + usize::from(r.selector_param.is_some())
+        + usize::from(r.selector_table.is_some())
+        + usize::from(r.selector_runtime.is_some());
+    if set > 1 {
+        return Err(Error::Module(format!(
+            "[[resources]] requires_contract = \"{}\" sets more than one of `selector`, \
+             `selector_param`, `selector_table` and `selector_runtime`; a claim reaches its \
+             provider one way, so keep the one that names it",
+            r.device_class
+        )));
+    }
+    if let Some(name) = &r.selector {
+        if name.is_empty() {
+            return Err(Error::Module(format!(
+                "[[resources]] requires_contract = \"{}\": `selector = \"\"` names no volume; \
+                 omit it to reach the default provider",
+                r.device_class
+            )));
+        }
+        return Ok(ClaimSelector::Fixed(name.clone()));
+    }
+    if let Some(param) = &r.selector_param {
+        if param.is_empty() {
+            return Err(Error::Module(format!(
+                "[[resources]] requires_contract = \"{}\": `selector_param = \"\"` names no \
+                 param; name the module's param that holds the volume, or omit it to reach the \
+                 default provider",
+                r.device_class
+            )));
+        }
+        return Ok(ClaimSelector::Param(param.clone()));
+    }
+    if let Some(param) = &r.selector_table {
+        if param.is_empty() {
+            return Err(Error::Module(format!(
+                "[[resources]] requires_contract = \"{}\": `selector_table = \"\"` names no \
+                 param; name the module's param that holds the `prefix=volume` table",
+                r.device_class
+            )));
+        }
+        return Ok(ClaimSelector::Table(param.clone()));
+    }
+    if r.selector_runtime == Some(true) {
+        return Ok(ClaimSelector::Runtime);
+    }
+    Ok(ClaimSelector::Default)
 }
 
 #[derive(Deserialize)]
@@ -4227,6 +4320,62 @@ struct TomlCommands {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `[[resources]]` claim names its provider one way: `selector`,
+    /// `selector_param` or `selector_runtime`, none of them empty.
+    #[test]
+    fn a_claim_selector_is_one_of_three_keys() {
+        let head = "version = \"0.1.0\"\n\n[[resources]]\nrequires_contract = \"fs\"\naccess = \"write\"\n";
+        let one = |tail: &str| Manifest::from_toml_str_for_target(&format!("{head}{tail}"), None);
+
+        assert_eq!(
+            one("").expect("default").resources[0].selector,
+            ClaimSelector::Default
+        );
+        assert_eq!(
+            one("selector = \"nvme0\"\n").expect("fixed").resources[0].selector,
+            ClaimSelector::Fixed("nvme0".into())
+        );
+        assert_eq!(
+            one("selector_param = \"volume\"\n")
+                .expect("param")
+                .resources[0]
+                .selector,
+            ClaimSelector::Param("volume".into())
+        );
+        assert_eq!(
+            one("selector_runtime = true\n").expect("runtime").resources[0].selector,
+            ClaimSelector::Runtime
+        );
+        assert_eq!(
+            one("selector_table = \"mounts\"\n")
+                .expect("table")
+                .resources[0]
+                .selector,
+            ClaimSelector::Table("mounts".into())
+        );
+        assert!(one("selector_table = \"\"\n").is_err());
+        assert_eq!(
+            one("selector_runtime = false\n")
+                .expect("default")
+                .resources[0]
+                .selector,
+            ClaimSelector::Default
+        );
+        for two in [
+            "selector = \"nvme0\"\nselector_runtime = true\n",
+            "selector = \"nvme0\"\nselector_runtime = false\n",
+            "selector = \"nvme0\"\nselector_param = \"volume\"\n",
+            "selector_table = \"mounts\"\nselector_runtime = true\n",
+        ] {
+            let e = one(two).unwrap_err().to_string();
+            assert!(e.contains("more than one of `selector`"), "{e}");
+        }
+        let e = one("selector = \"\"\n").unwrap_err().to_string();
+        assert!(e.contains("`selector = \"\"` names no volume"), "{e}");
+        let e = one("selector_param = \"\"\n").unwrap_err().to_string();
+        assert!(e.contains("names no param"), "{e}");
+    }
 
     /// `[build] wasm_opt_level` parses into the manifest, absent means
     /// `None` (build default), and a value outside rustc's `opt-level`
@@ -4440,6 +4589,7 @@ mod tests {
             device_class: 0x04,
             access_mode: 2,
             instance: 0xFF,
+            selector: ClaimSelector::Default,
         });
         m.dependencies.push(Dependency {
             name_hash: 0x12345678,
@@ -4465,16 +4615,19 @@ mod tests {
             device_class: 0x01,
             access_mode: 0,
             instance: 0xFF,
+            selector: ClaimSelector::Default,
         }); // GPIO
         m.resources.push(ResourceClaim {
             device_class: 0x04,
             access_mode: 2,
             instance: 0xFF,
+            selector: ClaimSelector::Default,
         }); // PIO
         m.resources.push(ResourceClaim {
             device_class: 0x3F,
             access_mode: 0,
             instance: 0xFF,
+            selector: ClaimSelector::Default,
         }); // highest representable position
         assert_eq!(
             m.required_caps_mask().unwrap(),
@@ -4489,6 +4642,7 @@ mod tests {
             device_class: CONTRACT_ID_SPACE as u8,
             access_mode: 0,
             instance: 0xFF,
+            selector: ClaimSelector::Default,
         });
         assert!(m.required_caps_mask().is_err());
     }
