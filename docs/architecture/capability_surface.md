@@ -67,9 +67,18 @@ A module's `manifest.toml` separates four concerns into four fields:
   it; empty or absent, the default provider), `selector_table = "<param>"`
   (a `str` param of `prefix=volume` entries, each volume reached) or
   `selector_runtime = true` (chosen as the module runs, so not checked).
-  With none of them the claim reaches the default provider. `pack` and the
-  composer read these keys; they are not written to the binary manifest.
+  With none of them the claim reaches the default provider.
+  `active_when_params = ["<param>", …]` (the module's `str` params) makes
+  the claim count for the composer's provider and domain checks only for an
+  instance that sets one of them non-empty: a claim the configuration never
+  exercises makes no call. `pack` and the composer read these keys; they
+  are not written to the binary manifest.
   See `storage_capability_surface.md`, "Which volume a consumer reaches".
+- `[[ports]].gates_readiness = <bool>` (input ports; default `true`) —
+  whether the module, as a contract provider, cannot answer its contract
+  until it has heard on that input. The composer counts a claimant that
+  feeds the default provider it reaches as a deadlock only through a
+  gating input. Tools-side only, never serialised.
 - `[requires]` — target CPU features. A module that declares
   `requires.fpu = true` is rejected at build time from a target without
   hardware floating point.

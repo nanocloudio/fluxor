@@ -901,6 +901,17 @@ pub struct PortSpec {
     /// Tools-side only (not serialized); compared across each edge by
     /// `config::validate::validate_port_facts`.
     pub facts: std::collections::BTreeMap<String, Vec<String>>,
+    /// Whether this module, as a contract provider, cannot answer its
+    /// contract until it has heard on this input (`gates_readiness`,
+    /// default `true`): a `fat32` answers `EAGAIN` until its `blocks` input
+    /// has served the volume it mounts. A provider whose calls are answered
+    /// whatever has or has not arrived on the input — a store fed commands
+    /// by a request pipeline — declares `false`, and the composer's
+    /// "a claimant reaches the default provider it feeds" check does not
+    /// count a wiring path whose last edge enters it there
+    /// (`config::validate::wiring_path`). Input ports only; tools-side
+    /// only, never serialised.
+    pub gates_readiness: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -915,6 +926,27 @@ pub struct ResourceClaim {
     /// params, and the composer checks each claim against the graph's
     /// providers (`config::validate_single_provider`).
     pub selector: ClaimSelector,
+    /// The instance params whose configuration exercises the claim
+    /// (`active_when_params`): empty, the claim is always exercised;
+    /// otherwise only when at least one of them is set non-empty, and an
+    /// instance that sets none never makes the call, so the composer's
+    /// provider checks pass over it. Tools-side only, never serialised —
+    /// like `selector`, it is checked at `pack` against the module's own
+    /// `str` params.
+    pub active_when_params: Vec<String>,
+}
+
+impl ResourceClaim {
+    /// Whether an instance whose params read through `param` exercises the
+    /// claim: always, unless the claim names `active_when_params`, in which
+    /// case only when one of them is non-empty.
+    pub fn exercised_by(&self, param: impl Fn(&str) -> Option<String>) -> bool {
+        self.active_when_params.is_empty()
+            || self
+                .active_when_params
+                .iter()
+                .any(|p| param(p).is_some_and(|v| !v.is_empty()))
+    }
 }
 
 /// How a `[[resources]]` claim names the provider it reaches, from at most
@@ -2330,6 +2362,14 @@ impl Manifest {
         for p in toml_val.ports.unwrap_or_default() {
             let direction = direction_from_str(&p.direction)?;
             let content_type = content_type_from_str(&p.content_type)?;
+            if p.gates_readiness.is_some() && direction != 0 && direction != 2 {
+                return Err(Error::Module(format!(
+                    "port '{}' declares `gates_readiness`, but it is an output: whether a \
+                     provider waits on what it hears is a property of an input port",
+                    p.name.as_deref().unwrap_or("?")
+                )));
+            }
+            let gates_readiness = p.gates_readiness.unwrap_or(true);
             let mut flags = 0u8;
             if p.required.unwrap_or(false) {
                 flags |= 0x01;
@@ -2410,6 +2450,7 @@ impl Manifest {
                     None => None,
                 },
                 facts,
+                gates_readiness,
             });
         }
 
@@ -2419,11 +2460,13 @@ impl Manifest {
             let access_mode = access_mode_from_str(&r.access)?;
             let instance = r.instance.unwrap_or(0xFF);
             let selector = claim_selector(&r)?;
+            let active_when_params = claim_active_when(&r)?;
             resources.push(ResourceClaim {
                 device_class: cid,
                 access_mode,
                 instance,
                 selector,
+                active_when_params,
             });
         }
 
@@ -3202,6 +3245,7 @@ impl Manifest {
                 rate_class_default: None,
                 requires_capability: None,
                 facts: std::collections::BTreeMap::new(),
+                gates_readiness: true,
             });
             offset += 4;
         }
@@ -3214,6 +3258,7 @@ impl Manifest {
                 instance: data[offset + 2],
                 // The binary manifest does not carry the selector.
                 selector: ClaimSelector::Default,
+                active_when_params: Vec::new(),
             });
             offset += 4;
         }
@@ -4232,6 +4277,8 @@ struct TomlPort {
     /// `[ports.facts]` — see [`PortSpec::facts`]. Read as raw TOML so a set
     /// may be written as one string or an array, and a number unquoted.
     facts: Option<std::collections::BTreeMap<String, toml::Value>>,
+    /// See [`PortSpec::gates_readiness`]. Input ports only.
+    gates_readiness: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -4249,6 +4296,43 @@ struct TomlResource {
     selector_param: Option<String>,
     selector_table: Option<String>,
     selector_runtime: Option<bool>,
+    /// The params whose configuration exercises the claim. See
+    /// [`ResourceClaim::active_when_params`].
+    active_when_params: Option<Vec<String>>,
+}
+
+/// The `active_when_params` a `[[resources]]` row declares: absent, none
+/// (always exercised); present, a non-empty list of distinct, non-empty
+/// param names.
+fn claim_active_when(r: &TomlResource) -> Result<Vec<String>> {
+    let Some(names) = &r.active_when_params else {
+        return Ok(Vec::new());
+    };
+    if names.is_empty() {
+        return Err(Error::Module(format!(
+            "[[resources]] requires_contract = \"{}\": `active_when_params = []` names no \
+             param, so no configuration would ever exercise the claim; name the params whose \
+             value makes the module use it, or omit the key for a claim it always uses",
+            r.device_class
+        )));
+    }
+    for (i, n) in names.iter().enumerate() {
+        if n.is_empty() {
+            return Err(Error::Module(format!(
+                "[[resources]] requires_contract = \"{}\": `active_when_params` holds an empty \
+                 name; each entry names one of the module's `str` params",
+                r.device_class
+            )));
+        }
+        if names[..i].contains(n) {
+            return Err(Error::Module(format!(
+                "[[resources]] requires_contract = \"{}\": `active_when_params` names `{n}` \
+                 twice",
+                r.device_class
+            )));
+        }
+    }
+    Ok(names.clone())
 }
 
 /// The [`ClaimSelector`] a `[[resources]]` row declares: at most one of
@@ -4377,6 +4461,66 @@ mod tests {
         assert!(e.contains("names no param"), "{e}");
     }
 
+    /// `gates_readiness` is an input port's: absent, the port gates (the
+    /// conservative default); `false` declares a provider that answers its
+    /// contract whatever has arrived there; on an output it is refused.
+    #[test]
+    fn an_input_port_says_whether_it_gates_readiness() {
+        let one = |port: &str| {
+            Manifest::from_toml_str_for_target(
+                &format!("version = \"0.1.0\"\n\n[[ports]]\nname = \"p\"\ncontent_type = \"OctetStream\"\n{port}"),
+                None,
+            )
+        };
+        assert!(one("direction = \"input\"\n").expect("default").ports[0].gates_readiness);
+        assert!(
+            one("direction = \"input\"\ngates_readiness = true\n")
+                .expect("true")
+                .ports[0]
+                .gates_readiness
+        );
+        assert!(
+            !one("direction = \"input\"\ngates_readiness = false\n")
+                .expect("false")
+                .ports[0]
+                .gates_readiness
+        );
+        let e = one("direction = \"output\"\ngates_readiness = false\n")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("it is an output"), "{e}");
+    }
+
+    /// `active_when_params` lists the params whose value exercises a claim:
+    /// absent, the claim is always exercised; present, a non-empty list of
+    /// distinct names, composed with any selector.
+    #[test]
+    fn a_claim_names_the_params_that_exercise_it() {
+        let head = "version = \"0.1.0\"\n\n[[resources]]\nrequires_contract = \"storage.namespace\"\naccess = \"read\"\n";
+        let one = |tail: &str| Manifest::from_toml_str_for_target(&format!("{head}{tail}"), None);
+        let c = one("").expect("none").resources.remove(0);
+        assert!(c.active_when_params.is_empty());
+        assert!(c.exercised_by(|_| None), "no condition: always exercised");
+        let c = one("selector_param = \"table_volume\"\nactive_when_params = [\"routes_prefix\", \"sessions_prefix\"]\n")
+            .expect("listed")
+            .resources
+            .remove(0);
+        assert_eq!(c.selector, ClaimSelector::Param("table_volume".into()));
+        assert_eq!(c.active_when_params, ["routes_prefix", "sessions_prefix"]);
+        assert!(!c.exercised_by(|_| None));
+        assert!(!c.exercised_by(|_| Some(String::new())));
+        assert!(c.exercised_by(|p| (p == "sessions_prefix").then(|| "/s/".to_string())));
+        assert!(!c.exercised_by(|p| (p == "listeners_prefix").then(|| "/l/".to_string())));
+        for (bad, why) in [
+            ("active_when_params = []\n", "names no param"),
+            ("active_when_params = [\"\"]\n", "holds an empty name"),
+            ("active_when_params = [\"a\", \"a\"]\n", "names `a` twice"),
+        ] {
+            let e = one(bad).unwrap_err().to_string();
+            assert!(e.contains(why), "{bad}: {e}");
+        }
+    }
+
     /// `[build] wasm_opt_level` parses into the manifest, absent means
     /// `None` (build default), and a value outside rustc's `opt-level`
     /// set is rejected at parse time.
@@ -4425,6 +4569,7 @@ mod tests {
             rate_class_default: None,
             requires_capability: None,
             facts: std::collections::BTreeMap::new(),
+            gates_readiness: true,
         });
         m.ports.push(PortSpec {
             direction: 1,
@@ -4438,6 +4583,7 @@ mod tests {
             rate_class_default: None,
             requires_capability: None,
             facts: std::collections::BTreeMap::new(),
+            gates_readiness: true,
         });
         let bytes = m.to_bytes();
         assert_eq!(bytes[14] & 0x20, 0x20, "capacity flag set");
@@ -4466,6 +4612,7 @@ mod tests {
             rate_class_default: None,
             requires_capability: None,
             facts: std::collections::BTreeMap::new(),
+            gates_readiness: true,
         });
         let pb = plain.to_bytes();
         assert_eq!(pb[14] & 0x20, 0);
@@ -4584,12 +4731,14 @@ mod tests {
             rate_class_default: None,
             requires_capability: None,
             facts: std::collections::BTreeMap::new(),
+            gates_readiness: true,
         });
         m.resources.push(ResourceClaim {
             device_class: 0x04,
             access_mode: 2,
             instance: 0xFF,
             selector: ClaimSelector::Default,
+            active_when_params: Vec::new(),
         });
         m.dependencies.push(Dependency {
             name_hash: 0x12345678,
@@ -4616,18 +4765,21 @@ mod tests {
             access_mode: 0,
             instance: 0xFF,
             selector: ClaimSelector::Default,
+            active_when_params: Vec::new(),
         }); // GPIO
         m.resources.push(ResourceClaim {
             device_class: 0x04,
             access_mode: 2,
             instance: 0xFF,
             selector: ClaimSelector::Default,
+            active_when_params: Vec::new(),
         }); // PIO
         m.resources.push(ResourceClaim {
             device_class: 0x3F,
             access_mode: 0,
             instance: 0xFF,
             selector: ClaimSelector::Default,
+            active_when_params: Vec::new(),
         }); // highest representable position
         assert_eq!(
             m.required_caps_mask().unwrap(),
@@ -4643,6 +4795,7 @@ mod tests {
             access_mode: 0,
             instance: 0xFF,
             selector: ClaimSelector::Default,
+            active_when_params: Vec::new(),
         });
         assert!(m.required_caps_mask().is_err());
     }

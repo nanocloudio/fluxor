@@ -1422,40 +1422,69 @@ fn check_param_rule_tags(input: &Path, manifest: &Manifest, schema: &[u8]) -> Re
 /// default provider, or no volume at all, whatever the module does at
 /// runtime — so `pack` refuses it, naming the claim and the params the
 /// schema does declare.
+///
+/// Each `active_when_params` name is held to the same rule: a name the schema
+/// does not declare as a `str` param is never set in any graph, so the claim
+/// would read as unexercised everywhere and pass every provider check
+/// unexamined.
 fn check_claim_selector_params(input: &Path, manifest: &Manifest, schema: &[u8]) -> Result<()> {
     let params = schema_params(schema);
     for claim in &manifest.resources {
-        let (key, name) = match &claim.selector {
-            manifest::ClaimSelector::Param(name) => ("selector_param", name),
-            manifest::ClaimSelector::Table(name) => ("selector_table", name),
-            _ => continue,
+        let selector = match &claim.selector {
+            manifest::ClaimSelector::Param(name) => Some(("selector_param", name)),
+            manifest::ClaimSelector::Table(name) => Some(("selector_table", name)),
+            _ => None,
         };
-        // `schema::ParamType` id 3: `str`, whose default is the empty string.
-        if params.iter().any(|p| p.2 == *name && p.1 == 3) {
-            continue;
+        let named = selector.into_iter().chain(
+            claim
+                .active_when_params
+                .iter()
+                .map(|n| ("active_when_params", n)),
+        );
+        for (key, name) in named {
+            check_claim_param(input, claim, &params, key, name)?;
         }
-        let strs = params
-            .iter()
-            .filter(|p| p.1 == 3)
-            .map(|p| format!("`{}`", p.2))
-            .collect::<Vec<_>>();
-        let found = match params.iter().find(|p| p.2 == *name) {
-            Some(_) => format!("`{name}` is not a `str` param"),
-            None => format!("the module's `define_params!` schema has no param `{name}`"),
-        };
-        return Err(Error::Module(format!(
-            "{}: the `{}` claim's `{key} = \"{name}\"` names the param that says which volume \
-             the claim reaches, but {found}; name one of the module's `str` params ({})",
-            input.display(),
-            manifest::contract_name_to_str(claim.device_class),
-            if strs.is_empty() {
-                "it has none".to_string()
-            } else {
-                strs.join(", ")
-            }
-        )));
     }
     Ok(())
+}
+
+/// One claim key naming one param: it must be a `str` param of the schema.
+fn check_claim_param(
+    input: &Path,
+    claim: &manifest::ResourceClaim,
+    params: &[(u8, u8, String)],
+    key: &str,
+    name: &str,
+) -> Result<()> {
+    // `schema::ParamType` id 3: `str`, whose default is the empty string.
+    if params.iter().any(|p| p.2 == name && p.1 == 3) {
+        return Ok(());
+    }
+    let strs = params
+        .iter()
+        .filter(|p| p.1 == 3)
+        .map(|p| format!("`{}`", p.2))
+        .collect::<Vec<_>>();
+    let found = match params.iter().find(|p| p.2 == name) {
+        Some(_) => format!("`{name}` is not a `str` param"),
+        None => format!("the module's `define_params!` schema has no param `{name}`"),
+    };
+    let what = if key == "active_when_params" {
+        "names a param whose value exercises the claim"
+    } else {
+        "names the param that says which volume the claim reaches"
+    };
+    Err(Error::Module(format!(
+        "{}: the `{}` claim's `{key} = \"{name}\"` {what}, but {found}; name one of the \
+         module's `str` params ({})",
+        input.display(),
+        manifest::contract_name_to_str(claim.device_class),
+        if strs.is_empty() {
+            "it has none".to_string()
+        } else {
+            strs.join(", ")
+        }
+    )))
 }
 
 /// The output sections a module image carries: code and read-only data (laid
@@ -2443,6 +2472,50 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(e.contains("`path` is not a `str` param"), "{e}");
+    }
+
+    /// Every `active_when_params` name is one of the module's own `str`
+    /// params: a name the schema lacks is never set, so the claim would
+    /// read as unexercised in every graph.
+    #[test]
+    fn active_when_params_name_str_params_of_the_module() {
+        let mut schema = vec![0x53, 0x50, 1, 3];
+        for (tag, ty, name) in [
+            (1u8, 3u8, "routes_prefix"),
+            (2, 3, "table_volume"),
+            (3, 2, "depth"),
+        ] {
+            schema.extend_from_slice(&[tag, ty, 0, 0, 0, 0, name.len() as u8]);
+            schema.extend_from_slice(name.as_bytes());
+            schema.push(0);
+        }
+        let claim = |active: &str| {
+            Manifest::from_toml_str_for_target(
+                &format!(
+                    "version = \"0.1.0\"\n\n[[resources]]\nrequires_contract = \"storage.namespace\"\n\
+                     access = \"read\"\nselector_param = \"table_volume\"\n\
+                     active_when_params = [{active}]\n"
+                ),
+                None,
+            )
+            .expect("manifest")
+        };
+        let p = Path::new("http.elf");
+        check_claim_selector_params(p, &claim("\"routes_prefix\""), &schema).expect("a str param");
+        let e =
+            check_claim_selector_params(p, &claim("\"routes_prefix\", \"route_prefix\""), &schema)
+                .unwrap_err()
+                .to_string();
+        assert!(
+            e.contains("`active_when_params = \"route_prefix\"` names a param whose value exercises the claim")
+                && e.contains("has no param `route_prefix`")
+                && e.contains("`routes_prefix`, `table_volume`"),
+            "{e}"
+        );
+        let e = check_claim_selector_params(p, &claim("\"depth\""), &schema)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("`depth` is not a `str` param"), "{e}");
     }
 
     /// A `[capacities]` rule's tags name the module's own params: every

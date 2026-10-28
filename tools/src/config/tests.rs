@@ -2260,6 +2260,7 @@ mod continuity_tests {
                 access_mode: 0,
                 instance: 0xFF,
                 selector: crate::manifest::ClaimSelector::Default,
+                active_when_params: Vec::new(),
             }],
             ..Manifest::default()
         };
@@ -2342,6 +2343,7 @@ mod continuity_tests {
                 access_mode: 1,
                 instance: 0xFF,
                 selector: crate::manifest::ClaimSelector::Default,
+                active_when_params: Vec::new(),
             }],
             permissions: crate::manifest::ManifestPermissions {
                 bits: permission::PLATFORM_RAW,
@@ -2356,6 +2358,7 @@ mod continuity_tests {
                 access_mode: 1,
                 instance: 0xFF,
                 selector: crate::manifest::ClaimSelector::Default,
+                active_when_params: Vec::new(),
             }],
             ..Manifest::default()
         };
@@ -2497,6 +2500,7 @@ mod continuity_tests {
                 access_mode: 1,
                 instance: 0xFF,
                 selector,
+                active_when_params: Vec::new(),
             }],
             ..Manifest::default()
         }
@@ -2819,6 +2823,180 @@ mod continuity_tests {
             .expect("the image on the host's filesystem");
     }
 
+    /// A store fed commands by a request pipeline answers its calls whatever
+    /// has arrived on its command input (`gates_readiness = false`), so a
+    /// claimant upstream of that input is admitted; the same wiring into a
+    /// port the store waits on is still refused, and so is a path through
+    /// another provider of the contract that waits on its own input.
+    #[test]
+    fn only_a_gating_input_makes_a_feed_a_deadlock() {
+        let obj = crate::manifest::contract_id_from_name("storage.object").unwrap();
+        let claimant = |name: &str| {
+            let mut m = prov(&[]);
+            m.ports = vec![named_port("record_out", 1, "OctetStream")];
+            m.resources = vec![ResourceClaim {
+                device_class: obj,
+                access_mode: 2,
+                instance: 0xFF,
+                selector: ClaimSelector::Default,
+                active_when_params: Vec::new(),
+            }];
+            (name.to_string(), m)
+        };
+        let store = |commands_gate: bool| {
+            let mut m = prov(&["storage.object"]);
+            let mut commands = named_port("commands", 0, "OctetStream");
+            commands.gates_readiness = commands_gate;
+            m.ports = vec![commands, named_port("snapshot_import", 0, "OctetStream")];
+            m
+        };
+        let mut router = prov(&[]);
+        router.ports = vec![
+            named_port("request_in", 0, "OctetStream"),
+            named_port("kv_out", 1, "OctetStream"),
+        ];
+        let manifests = |store: Manifest, mid: Option<Manifest>| {
+            let mut m: HashMap<String, Manifest> = HashMap::from([
+                claimant("http_chain"),
+                ("router".to_string(), router.clone()),
+                ("store".to_string(), store),
+            ]);
+            if let Some(mid) = mid {
+                m.insert("mid".to_string(), mid);
+            }
+            m
+        };
+        let graph = |into: &str| {
+            json!({
+                "modules": [
+                    {"name": "http_chain", "type": "http_chain"},
+                    {"name": "router", "type": "kv_request_router"},
+                    {"name": "store", "type": "kv_state_worker_store"},
+                ],
+                "wiring": [
+                    {"from": "http_chain.record_out", "to": "router.request_in"},
+                    {"from": "router.kv_out", "to": into},
+                ]
+            })
+        };
+        let mods = names(&["http_chain", "router", "store"]);
+        validate_single_provider(&graph("store.commands"), &mods, &manifests(store(false), None), LINUX)
+            .expect("the store answers whatever its command input has carried");
+        let e = validate_single_provider(&graph("store.commands"), &mods, &manifests(store(true), None), LINUX)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("which it feeds (`http_chain` → `router` → `store`)"), "{e}");
+        // Defaults stay conservative: an undeclared port, or an endpoint
+        // naming no port, gates.
+        for into in ["store.snapshot_import", "store"] {
+            let e = validate_single_provider(&graph(into), &mods, &manifests(store(false), None), LINUX)
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("which it feeds"), "{into}: {e}");
+        }
+
+        // Through another provider of the contract that waits on its
+        // input: refused, whichever port of the store the path then enters.
+        let mut mid = prov(&["storage.object"]);
+        mid.ports = vec![
+            named_port("in", 0, "OctetStream"),
+            named_port("out", 1, "OctetStream"),
+        ];
+        let mut through = graph("mid.in");
+        through["modules"].as_array_mut().unwrap().push(json!({"name": "mid", "type": "cache", "volume": "c"}));
+        through["wiring"].as_array_mut().unwrap().push(json!({"from": "mid.out", "to": "store.commands"}));
+        let names3 = names(&["http_chain", "router", "mid", "store"]);
+        let e = validate_single_provider(&through, &names3, &manifests(store(false), Some(mid.clone())), LINUX)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("which it feeds (`http_chain` → `router` → `mid` → `store`)"), "{e}");
+        // The same intermediate entered through a port it does not wait on
+        // is just another hop.
+        mid.ports[0].gates_readiness = false;
+        validate_single_provider(&through, &names3, &manifests(store(false), Some(mid)), LINUX)
+            .expect("no provider on the path waits on what it hears");
+    }
+
+    /// A claim with `active_when_params` counts only for an instance that
+    /// sets one of them: a consumer whose table params are all unset makes
+    /// no call, so it reaches no provider and feeds none it could deadlock
+    /// on; set one, and the same graph is refused as before.
+    #[test]
+    fn an_unexercised_claim_reaches_no_provider() {
+        let mut m = HashMap::new();
+        m.insert("fs".to_string(), prov(&["file.data"]));
+        let mut disk = prov(&["storage.block"]);
+        let mut claims = fs_consumer(ClaimSelector::Param("volume".into())).resources;
+        claims[0].active_when_params = names(&["routes_prefix", "sessions_prefix"]);
+        disk.resources = claims;
+        m.insert("disk".to_string(), disk);
+        let graph = |params: Value| {
+            let mut disk = json!({"name": "disk", "type": "file_block"});
+            for (k, v) in params.as_object().unwrap() {
+                disk[k] = v.clone();
+            }
+            json!({
+                "modules": [disk, {"name": "fs", "type": "fat32"}],
+                "wiring": [{"from": "disk.blocks", "to": "fs.blocks"}],
+            })
+        };
+        let names = names(&["disk", "fs"]);
+        validate_single_provider(&graph(json!({})), &names, &m, LINUX)
+            .expect("no table param set: the claim is never exercised");
+        validate_single_provider(&graph(json!({"routes_prefix": ""})), &names, &m, LINUX)
+            .expect("an empty value sets nothing");
+        for set in [
+            json!({"routes_prefix": "/dataplane/edge/"}),
+            json!({"params": {"sessions_prefix": "/s/"}}),
+        ] {
+            let e = validate_single_provider(&graph(set.clone()), &names, &m, LINUX)
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("which it feeds (`disk` → `fs`)"), "{set}: {e}");
+        }
+        // A param resolved through `data:` counts by its content.
+        let mut g = graph(json!({"routes_prefix": "routes"}));
+        g["data"] = json!({"routes": {"content": ""}});
+        validate_single_provider(&g, &names, &m, LINUX).expect("data entry with empty content");
+        g["data"] = json!({"routes": {"content": "/r/"}});
+        assert!(validate_single_provider(&g, &names, &m, LINUX).is_err());
+    }
+
+    /// The domain rule follows the same claims: a caller in another domain
+    /// that never exercises its claim on a module provider makes no call
+    /// into it.
+    #[test]
+    fn an_unexercised_claim_places_no_caller_beside_its_provider() {
+        let mut m = HashMap::new();
+        m.insert("store".to_string(), prov(&["storage.namespace"]));
+        let mut http = prov(&[]);
+        http.resources = vec![ResourceClaim {
+            device_class: crate::manifest::contract_id_from_name("storage.namespace").unwrap(),
+            access_mode: 1,
+            instance: 0xFF,
+            selector: ClaimSelector::Default,
+            active_when_params: names(&["routes_prefix"]),
+        }];
+        m.insert("http".to_string(), http);
+        let config = |routes: Value| {
+            json!({
+                "execution": {"domains": [{"name": "main"}, {"name": "net"}]},
+                "capacity": {"owners": 0},
+                "modules": [
+                    {"name": "store", "type": "kv"},
+                    {"name": "http", "type": "http", "domain": "net", "routes_prefix": routes},
+                ],
+            })
+        };
+        let check = |c: &Value| {
+            let modules = c["modules"].as_array().unwrap().clone();
+            validate_provider_domains(c, &modules, &m, "linux")
+        };
+        check(&config(Value::Null)).expect("http never calls the store");
+        let e = check(&config(json!("/dataplane/edge/"))).unwrap_err().to_string();
+        assert!(e.contains("module 'http' (domain 'net') requires `storage.namespace`"), "{e}");
+    }
+
     /// A port of `module`'s manifest, by name and content type.
     fn named_port(name: &str, direction: u8, content_type: &str) -> crate::manifest::PortSpec {
         crate::manifest::PortSpec {
@@ -2837,6 +3015,7 @@ mod continuity_tests {
             rate_class_default: None,
             requires_capability: None,
             facts: std::collections::BTreeMap::new(),
+            gates_readiness: true,
         }
     }
 
@@ -3512,6 +3691,7 @@ mod rate_class_resolution_tests {
             rate_class_default: None,
             requires_capability: None,
             facts: std::collections::BTreeMap::new(),
+            gates_readiness: true,
         }
     }
 
@@ -4409,6 +4589,7 @@ mod port_capability_tests {
             rate_class_default: None,
             requires_capability: None,
             facts: std::collections::BTreeMap::new(),
+            gates_readiness: true,
         }
     }
 
@@ -5040,6 +5221,7 @@ mod framed_edge_tests {
             rate_class_default: None,
             requires_capability: None,
             facts: std::collections::BTreeMap::new(),
+            gates_readiness: true,
         }
     }
 

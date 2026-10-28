@@ -22,6 +22,10 @@ name = "blocks"
 direction = "input"
 content_type = "OctetStream"
 required = true
+# The volume is mounted from what arrives here: until then every FS call
+# answers EAGAIN, so a module that feeds this port cannot also be one of
+# this filesystem's callers (the composer refuses it).
+gates_readiness = true
 
 # Module-scope observability (out[1], optional); wired to observe.telemetry.
 [observability]

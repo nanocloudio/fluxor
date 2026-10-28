@@ -467,6 +467,7 @@ mod tests {
             rate_class_default: None,
             requires_capability: None,
             facts: Default::default(),
+            gates_readiness: true,
         }
     }
 

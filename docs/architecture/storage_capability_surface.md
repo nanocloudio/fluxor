@@ -184,8 +184,23 @@ and are not written to the module's binary manifest.
 - `selector_runtime = true`: the module chooses the name as it runs, so
   the composer cannot check it.
 
-`pack` refuses a `selector_param` or `selector_table` that is not one of
-the module's own `str` params. With none of the keys, the claim reaches
+A claim the module uses only under some configuration says so with
+`active_when_params = ["<param>", …]`, beside any of the keys above: the
+claim counts for the composer's checks only for an instance that sets at
+least one of those params non-empty (read as `selector_param` is), and an
+instance that sets none of them never makes the call, so the claim reaches
+no provider and feeds none. `http` declares
+`active_when_params = ["routes_prefix", "listeners_prefix",
+"sessions_prefix"]` on its `storage.namespace` claim: without a table
+configured it never touches the store, so an `http` that feeds the graph's
+default store (an api plane's) is not refused for a call it never makes.
+Like the selector keys it is read from `manifest.toml` and never written to
+the binary manifest; a binary manifest's claims are always counted.
+
+`pack` refuses a `selector_param`, `selector_table` or
+`active_when_params` entry that is not one of the module's own `str`
+params, and `active_when_params = []`, an empty name or a repeated one.
+With none of the selector keys, the claim reaches
 the contract's default: the top-most
 unkeyed module provider, else the platform's own provider, else `ENOSYS`.
 The platform's own `fs` provider is the host's filesystem on Linux and
@@ -193,8 +208,8 @@ wasm; on bcm2712 it serves workloads only, each inside a root of its own
 on the node's volume, and answers the node's own modules `ENOSYS`; the RP
 targets have none.
 
-The composer checks every claim against the providers of the graph the
-module runs in (a workload's against the workload's own: a workload
+The composer checks every claim the instance exercises against the
+providers of the graph the module runs in (a workload's against the workload's own: a workload
 reaches only providers of its own and the platform), and refuses, naming
 the module, its claim and the fix:
 
@@ -203,7 +218,20 @@ the module, its claim and the fix:
 - a claim that names no volume and reaches the graph's default provider
   while feeding it through the wiring (a `file_block` under the `fat32`
   that is the graph's filesystem): the provider cannot answer the module
-  until the module has served it, so neither comes up;
+  until the module has served it, so neither comes up. A path counts only
+  when its last edge enters an input of the provider that gates its
+  readiness — `gates_readiness` on the `[[ports]]` entry, `true` unless
+  declared `false`, and assumed for an endpoint that names no port or a
+  port the manifest lacks. `fat32`'s `blocks` gates (it mounts from what
+  arrives there); a store fed commands by a request pipeline (lattice's
+  `kv_state_worker_store`, whose `commands` input carries routed commands
+  it applies, not what it needs before it answers) declares `false`, so a
+  claimant upstream of that pipeline is admitted. A path that passes
+  through another provider of the same contract, entering it through one
+  of its gating inputs, counts whichever input of the default provider it
+  then enters: what the composer cannot see through it treats as a
+  dependency. `gates_readiness` is tools-side only, never serialised, and
+  refused on an output port;
 - a claim that names a volume no provider in the graph declares: at
   runtime it would answer `ENODEV`;
 - a claim that names `platform` where the target's platform does not

@@ -1296,6 +1296,11 @@ fn instance_str_param(config: &Value, name: &str, key: &str) -> Option<String> {
         .and_then(Value::as_array)?
         .iter()
         .find(|e| e.get("name").and_then(Value::as_str) == Some(name))?;
+    entry_str_param(config, entry, key)
+}
+
+/// [`instance_str_param`] for a module entry already in hand.
+fn entry_str_param(config: &Value, entry: &Value, key: &str) -> Option<String> {
     let raw = entry
         .get(key)
         .or_else(|| entry.get("params").and_then(|p| p.get(key)))?
@@ -1353,27 +1358,61 @@ fn endpoint_is_net_proto(spec: &str, manifests: &HashMap<String, Manifest>) -> O
     Some(crate::manifest::CONTENT_TYPES.get(p.content_type as usize) == Some(&"NetProto"))
 }
 
-/// A wiring path from module `from` to module `to` (both included), if the
-/// graph's `wiring:` has one that carries data from one to the other.
+/// Whether a wiring endpoint enters a port its module waits on before it
+/// answers its contract ([`PortSpec::gates_readiness`]). Conservative: an
+/// endpoint that names no port, or a module or port with no manifest here,
+/// gates.
 ///
-/// A path does not pass THROUGH a net provider. `NetProto` multiplexes
-/// connections — every frame names its connection, and the provider
-/// (`linux_net`, `ip`) delivers each to that connection's owner — so a
-/// module that arrives on a `NetProto` edge and leaves on another has
-/// crossed from one connection to another, not followed data. Without
-/// this rule every module with a socket would appear to feed every
-/// other, through the one net provider they share. A `NetProto` edge is
-/// still followed into and out of the endpoints it joins; only the hop
-/// across the provider is not.
+/// [`PortSpec::gates_readiness`]: crate::manifest::PortSpec::gates_readiness
+fn endpoint_gates_readiness(spec: &str, manifests: &HashMap<String, Manifest>) -> bool {
+    let Some(m) = manifests.get(endpoint_module(spec)) else {
+        return true;
+    };
+    let Some(port) = endpoint_port(spec) else {
+        return true;
+    };
+    m.ports
+        .iter()
+        .find(|p| p.name.as_deref() == Some(port) && (p.direction == 0 || p.direction == 2))
+        .is_none_or(|p| p.gates_readiness)
+}
+
+/// A wiring path along which module `from` feeds provider `to` (both
+/// included) in a way `to` waits on, if the graph's `wiring:` has one:
+/// what makes a claim of `from` on `to`'s `contract` a deadlock.
+///
+/// **The last edge must gate.** A path counts only when its final edge
+/// enters a port of `to` that gates its readiness
+/// ([`endpoint_gates_readiness`]): `to` cannot answer the contract until
+/// it has heard there. A store fed commands by a request pipeline answers
+/// its calls whatever has arrived on its command input, so a claimant
+/// upstream of that input does not deadlock it.
+///
+/// **Through another provider, conservatively.** A path that enters an
+/// intermediate module providing the same `contract` through one of that
+/// module's gating ports counts whichever port of `to` it then enters:
+/// the intermediate provider cannot answer until it has heard, and what
+/// it answers may be what `to` is waiting on, which the composer cannot
+/// see through.
+///
+/// **Not through a net provider.** `NetProto` multiplexes connections —
+/// every frame names its connection, and the provider (`linux_net`, `ip`)
+/// delivers each to that connection's owner — so a module that arrives on
+/// a `NetProto` edge and leaves on another has crossed from one
+/// connection to another, not followed data. Without this rule every
+/// module with a socket would appear to feed every other, through the one
+/// net provider they share. A `NetProto` edge is still followed into and
+/// out of the endpoints it joins; only the hop across the provider is not.
 fn wiring_path(
     config: &Value,
     manifests: &HashMap<String, Manifest>,
     from: &str,
     to: &str,
+    contract: &str,
 ) -> Option<Vec<String>> {
-    // (from module, to module, carries NetProto). An edge is NetProto when
-    // either end's port declares it.
-    let edges: Vec<(&str, &str, bool)> = config
+    // (from module, to module, carries NetProto, enters a gating port). An
+    // edge is NetProto when either end's port declares it.
+    let edges: Vec<(&str, &str, bool, bool)> = config
         .get("wiring")
         .and_then(Value::as_array)
         .map(|w| {
@@ -1383,14 +1422,22 @@ fn wiring_path(
                     let t = e.get("to").and_then(Value::as_str)?;
                     let net = endpoint_is_net_proto(f, manifests) == Some(true)
                         || endpoint_is_net_proto(t, manifests) == Some(true);
-                    Some((endpoint_module(f), endpoint_module(t), net))
+                    let gates = endpoint_gates_readiness(t, manifests);
+                    Some((endpoint_module(f), endpoint_module(t), net, gates))
                 })
                 .collect()
         })
         .unwrap_or_default();
-    // Search state: a module, and whether it was reached over NetProto.
-    type At<'a> = (&'a str, bool);
-    let start: At<'_> = (from, false);
+    let provides_contract = |module: &str| {
+        manifests
+            .get(module)
+            .is_some_and(|m| m.provides.iter().any(|s| surface_contract(s) == contract))
+    };
+    // Search state: a module, whether it was reached over NetProto, and
+    // whether the path has passed a gating input of another provider of
+    // the contract.
+    type At<'a> = (&'a str, bool, bool);
+    let start: At<'_> = (from, false, false);
     let mut came_from: HashMap<At<'_>, At<'_>> = HashMap::new();
     let mut queue = std::collections::VecDeque::from([start]);
     while let Some(at) = queue.pop_front() {
@@ -1404,13 +1451,19 @@ fn wiring_path(
             path.reverse();
             return Some(path);
         }
-        for &(f, t, net) in &edges {
-            if f != at.0 || (net && at.1) {
+        for &(f, t, net, gates) in &edges {
+            if f != at.0 || (net && at.1) || t == from {
                 continue;
             }
-            let next = (t, net);
-            if t != from && !came_from.contains_key(&next) {
-                came_from.insert(next, at);
+            // An edge into `to` counts only if `to` waits on it, or the
+            // path already passed through a provider that does.
+            if t == to && !gates && !at.2 {
+                continue;
+            }
+            let through = at.2 || (t != to && gates && provides_contract(t));
+            let next = (t, net, through);
+            if let std::collections::hash_map::Entry::Vacant(e) = came_from.entry(next) {
+                e.insert(at);
                 queue.push_back(next);
             }
         }
@@ -1564,6 +1617,12 @@ pub fn validate_single_provider(
             continue;
         };
         for claim in &m.resources {
+            // A claim the instance's configuration never exercises
+            // (`active_when_params`, none of them set) makes no call, so it
+            // reaches no provider.
+            if !claim.exercised_by(|p| instance_str_param(config, name, p)) {
+                continue;
+            }
             let contract = crate::manifest::contract_name_to_str(claim.device_class);
             let provides_it = m.provides.iter().any(|s| surface_contract(s) == contract);
             if provides_it {
@@ -1620,7 +1679,7 @@ pub fn validate_single_provider(
                     None if provides_it => {}
                     None => {
                         if let Some(&provider) = default_of.get(contract) {
-                            if let Some(path) = wiring_path(config, manifests, name, provider) {
+                            if let Some(path) = wiring_path(config, manifests, name, provider, contract) {
                                 return Err(Error::Config(format!(
                                     "`{name}`'s `{contract}` claim {how}, so it reaches the graph's \
                                      default `{contract}` provider, `{provider}`, which it feeds \
@@ -1829,7 +1888,7 @@ pub fn validate_provider_domains(
             .and_then(|d| d.as_str())
             .unwrap_or("the primary domain")
             .to_string();
-        placed.push((name, domain, domain_name, manifest));
+        placed.push((name, domain, domain_name, manifest, m));
     }
     let live_adds = crate::capacity::kernel_max_owners(target) > 1
         && config
@@ -1839,7 +1898,7 @@ pub fn validate_provider_domains(
             .or_else(|| crate::capacity::kernel_pool_default_reserve(target, "owners"))
             .unwrap_or(0)
             > 0;
-    for &(provider, p_domain, ref p_domain_name, pm) in &placed {
+    for &(provider, p_domain, ref p_domain_name, pm, _) in &placed {
         for contract in &pm.provides {
             if !fluxor_contracts::vocabulary::PROVIDER_CONTRACTS.contains(&contract.as_str()) {
                 continue; // a surface (`file.data`), not a dispatched contract
@@ -1858,11 +1917,13 @@ pub fn validate_provider_domains(
                      `capacity: {{ owners: 0 }}` if this node never admits a workload."
                 )));
             }
-            for &(caller, c_domain, ref c_domain_name, cm) in &placed {
-                if caller == provider
-                    || c_domain == p_domain
-                    || !cm.resources.iter().any(|r| r.device_class == id)
-                {
+            for &(caller, c_domain, ref c_domain_name, cm, entry) in &placed {
+                // Only a claim the caller's configuration exercises makes
+                // the call (`active_when_params`).
+                let calls = cm.resources.iter().any(|r| {
+                    r.device_class == id && r.exercised_by(|p| entry_str_param(config, entry, p))
+                });
+                if caller == provider || c_domain == p_domain || !calls {
                     continue;
                 }
                 return Err(Error::Config(format!(
