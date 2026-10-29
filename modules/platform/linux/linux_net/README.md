@@ -1,6 +1,6 @@
 # linux_net
 
-Linux-only built-in network surface. Bridges the Stream Surface v1
+Linux-only built-in network surface. Bridges the stream surface
 contract (`net_proto`) to host TCP/UDP sockets via `libc`.
 
 Implements the kernel-side dispatch for `CMD_BIND` / `CMD_CONNECT_TO` /

@@ -17,6 +17,8 @@
 //! | `CREDIT` | `[bytes:4 LE]` | the receiver can take `bytes` more record bytes on `channel` |
 //! | `BEGIN` | `[record_len:4 LE][first bytes]` | a record starts on `channel` |
 //! | `MORE` | `[bytes]` | the record in progress on `channel` continues |
+//! | `ACK` | `[seq:8 LE]` | (resume) every record on `channel` through `seq` has arrived whole |
+//! | `RBEGIN` | `[record_len:4 LE][seq:8 LE][first bytes]` | (resume) record `seq` starts on `channel` |
 //!
 //! A record's bytes, and a fixed charge of four bytes per record (the length
 //! the receiver files it under), are counted against the credit the receiver
@@ -29,6 +31,30 @@
 //! opens every stream in both directions — it is how the accepting side
 //! learns which channel a stream carries.
 //!
+//! ## Resume
+//!
+//! A table with `resume` set numbers every record on every channel from 1,
+//! per direction, within the sender's incarnation (16 random bytes drawn at
+//! construction). The sender keeps each record in a retained window until
+//! the receiver acknowledges it (`ACK`), so a session that ends takes
+//! nothing with it: the `HELLO` trailer
+//!
+//! ```text
+//! ['R'][incarnation:16][held:16][next:8 LE × channels]
+//! ```
+//!
+//! names the sender's incarnation, the peer incarnation whose streams the
+//! sender holds (`held`, zero for none) and, per channel, the next record
+//! it expects of that stream. A peer whose `held` is this side's
+//! incarnation is resumed exactly: every record before `next` is released
+//! and the rest are sent again from `next`. A peer that names another
+//! incarnation never saw this stream (its first session, or it restarted
+//! and lost it): the retained records are renumbered from 1 and sent to
+//! it. Within a session every `RBEGIN` must carry exactly the next number
+//! the receiver expects — a record it already has (a replay) or one past
+//! it (a gap) is refused with `SEQUENCE` — and an `ACK` may not name a
+//! record that was never sent, nor go behind one already released.
+//!
 //! An exchange endpoint is two more table entries, `ExchangeRequest` and
 //! `ExchangeResponse`, both `mailbox` at the exchange contract's record
 //! maximum, after the `channels` entries. Requests cross on the first from
@@ -40,12 +66,18 @@
 pub const FRAME_HDR: usize = 4;
 /// `BEGIN`'s record-length prefix.
 pub const BEGIN_PREFIX: usize = 4;
+/// `RBEGIN`'s record-length and sequence prefix.
+pub const RBEGIN_PREFIX: usize = 12;
 
 pub const KIND_HELLO: u8 = 1;
 pub const KIND_REFUSE: u8 = 2;
 pub const KIND_CREDIT: u8 = 3;
 pub const KIND_BEGIN: u8 = 4;
 pub const KIND_MORE: u8 = 5;
+/// Resume sessions only: an acknowledgement of whole records.
+pub const KIND_ACK: u8 = 6;
+/// Resume sessions only: a numbered record starts.
+pub const KIND_RBEGIN: u8 = 7;
 
 /// The channel byte of a `net` carrier's `HELLO` and `REFUSE`.
 pub const CONTROL: u8 = 0xFF;
@@ -62,8 +94,16 @@ pub const MAX_CHANNELS: usize = 8;
 /// name in the content-type registry.
 pub const CT_NAME_MAX: usize = 32;
 
-/// Largest `HELLO` body: every entry at its longest, and the side byte.
-pub const HELLO_MAX: usize = 4 + 1 + MAX_CHANNELS * HELLO_ENTRY_LEN + 1;
+/// Largest `HELLO` body: every entry at its longest, the side byte, and a
+/// resume trailer.
+pub const HELLO_MAX: usize = 4 + 1 + MAX_CHANNELS * HELLO_ENTRY_LEN + 1 + RESUME_TRAILER_MAX;
+/// The resume trailer's marker byte.
+pub const RESUME_MARK: u8 = b'R';
+/// An incarnation: 16 random bytes an instance draws at construction.
+pub const INCARNATION_LEN: usize = 16;
+/// The longest resume trailer: the marker, two incarnations, a `next` per
+/// channel.
+pub const RESUME_TRAILER_MAX: usize = 1 + 2 * INCARNATION_LEN + 8 * MAX_CHANNELS;
 /// One `HELLO` table entry at its longest.
 pub const HELLO_ENTRY_LEN: usize = 1 + CT_NAME_MAX + 4;
 
@@ -77,6 +117,10 @@ pub mod refuse {
     pub const CREDIT: u8 = 3;
     /// A record longer than its channel's maximum.
     pub const OVERSIZE: u8 = 4;
+    /// Resume: a record out of sequence — one the receiver already has (a
+    /// replay) or one past the next it expects (a gap) — or an
+    /// acknowledgement or resume point the sender cannot honour.
+    pub const SEQUENCE: u8 = 5;
 }
 
 /// How records are delimited on a channel's local ports. Local only: the
@@ -169,6 +213,9 @@ pub struct Table {
     pub side: u8,
     /// The endpoint's request channel; its response channel is the next.
     pub exchange_at: u8,
+    /// Records are numbered and retained until acknowledged, and a session
+    /// resumes where the last left off (see the module docs, Resume).
+    pub resume: bool,
 }
 
 impl Table {
@@ -177,6 +224,7 @@ impl Table {
         entries: [Entry::EMPTY; MAX_CHANNELS],
         side: side::NONE,
         exchange_at: 0,
+        resume: false,
     };
 
     /// Append an exchange endpoint's two channels, `max_record` each, as
@@ -295,15 +343,100 @@ pub fn encode_hello(t: &Table, out: &mut [u8; HELLO_MAX]) -> usize {
     at
 }
 
+/// The resume trailer's length for this table (0 without `resume`).
+pub fn resume_trailer_len(t: &Table) -> usize {
+    if t.resume {
+        1 + 2 * INCARNATION_LEN + 8 * t.channels as usize
+    } else {
+        0
+    }
+}
+
+/// Append the resume trailer to a `HELLO` body of `at` bytes: this side's
+/// incarnation, the peer incarnation whose streams it holds, and the next
+/// record it expects on each channel. Returns the new length.
+pub fn encode_resume(
+    t: &Table,
+    incarnation: &[u8; INCARNATION_LEN],
+    held: &[u8; INCARNATION_LEN],
+    next: &[u64; MAX_CHANNELS],
+    out: &mut [u8; HELLO_MAX],
+    at: usize,
+) -> usize {
+    if !t.resume {
+        return at;
+    }
+    let mut at = at;
+    out[at] = RESUME_MARK;
+    at += 1;
+    out[at..at + INCARNATION_LEN].copy_from_slice(incarnation);
+    at += INCARNATION_LEN;
+    out[at..at + INCARNATION_LEN].copy_from_slice(held);
+    at += INCARNATION_LEN;
+    for n in &next[..t.channels as usize] {
+        out[at..at + 8].copy_from_slice(&n.to_le_bytes());
+        at += 8;
+    }
+    at
+}
+
+/// A peer's resume trailer: its incarnation, the incarnation whose streams
+/// it holds, and the next record it expects per channel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Resume {
+    pub incarnation: [u8; INCARNATION_LEN],
+    pub held: [u8; INCARNATION_LEN],
+    pub next: [u64; MAX_CHANNELS],
+}
+
 /// Does a peer's `HELLO` body state exactly this table? Same channel count,
-/// per index the same content type and maximum record, and an exchange
-/// endpoint on the other side of the one this table carries.
+/// per index the same content type and maximum record, an exchange
+/// endpoint on the other side of the one this table carries, and a resume
+/// trailer exactly when this table resumes.
 pub fn hello_matches(t: &Table, body: &[u8]) -> bool {
+    hello_parse(t, body).is_some()
+}
+
+/// [`hello_matches`], returning the peer's resume trailer (`None` inside
+/// when the table does not resume).
+pub fn hello_parse(t: &Table, body: &[u8]) -> Option<Option<Resume>> {
     let mut peer = *t;
     peer.side = side::other(t.side);
     let mut want = [0u8; HELLO_MAX];
     let n = encode_hello(&peer, &mut want);
-    body == &want[..n]
+    let tl = resume_trailer_len(t);
+    if body.len() != n + tl || body[..n] != want[..n] {
+        return None;
+    }
+    if !t.resume {
+        return Some(None);
+    }
+    let r = &body[n..];
+    if r[0] != RESUME_MARK {
+        return None;
+    }
+    let mut out = Resume {
+        incarnation: [0; INCARNATION_LEN],
+        held: [0; INCARNATION_LEN],
+        next: [0; MAX_CHANNELS],
+    };
+    out.incarnation.copy_from_slice(&r[1..1 + INCARNATION_LEN]);
+    out.held
+        .copy_from_slice(&r[1 + INCARNATION_LEN..1 + 2 * INCARNATION_LEN]);
+    let mut at = 1 + 2 * INCARNATION_LEN;
+    for k in 0..t.channels as usize {
+        let mut b = [0u8; 8];
+        b.copy_from_slice(&r[at..at + 8]);
+        out.next[k] = u64::from_le_bytes(b);
+        if out.next[k] == 0 {
+            return None;
+        }
+        at += 8;
+    }
+    if out.incarnation == [0; INCARNATION_LEN] {
+        return None;
+    }
+    Some(Some(out))
 }
 
 /// Write a frame header.
@@ -324,6 +457,10 @@ pub enum Event<'a> {
     Credit(u8, u32),
     /// A record of `len` bytes starts on the channel.
     Begin(u8, u32),
+    /// Resume: record `seq`, of `len` bytes, starts on the channel.
+    RBegin(u8, u32, u64),
+    /// Resume: every record through `seq` arrived whole.
+    Ack(u8, u64),
     /// Record bytes on the channel.
     Data(u8, &'a [u8]),
     /// Not a frame this protocol has; the stream cannot be resynchronised.
@@ -334,7 +471,7 @@ pub enum Event<'a> {
 /// ordered and authenticated beneath this protocol, so there is no resync:
 /// a frame that does not parse ends the session.
 pub struct Parser {
-    hdr: [u8; FRAME_HDR + BEGIN_PREFIX],
+    hdr: [u8; FRAME_HDR + RBEGIN_PREFIX],
     have: u8,
     in_body: bool,
     kind: u8,
@@ -348,7 +485,7 @@ pub struct Parser {
 impl Parser {
     pub const fn new() -> Self {
         Self {
-            hdr: [0; FRAME_HDR + BEGIN_PREFIX],
+            hdr: [0; FRAME_HDR + RBEGIN_PREFIX],
             have: 0,
             in_body: false,
             kind: 0,
@@ -367,10 +504,10 @@ impl Parser {
     }
 
     fn header_len(kind: u8) -> usize {
-        if kind == KIND_BEGIN {
-            FRAME_HDR + BEGIN_PREFIX
-        } else {
-            FRAME_HDR
+        match kind {
+            KIND_BEGIN => FRAME_HDR + BEGIN_PREFIX,
+            KIND_RBEGIN => FRAME_HDR + RBEGIN_PREFIX,
+            _ => FRAME_HDR,
         }
     }
 
@@ -404,7 +541,17 @@ impl Parser {
                 KIND_HELLO if (1..=HELLO_MAX).contains(&len) => {}
                 KIND_REFUSE if len == 1 => {}
                 KIND_CREDIT if len == 4 => {}
+                KIND_ACK if len == 8 => {}
                 KIND_MORE if len > 0 => {}
+                KIND_RBEGIN if len >= RBEGIN_PREFIX => {
+                    let h = &self.hdr;
+                    let rl = u32::from_le_bytes([h[4], h[5], h[6], h[7]]);
+                    let seq =
+                        u64::from_le_bytes([h[8], h[9], h[10], h[11], h[12], h[13], h[14], h[15]]);
+                    self.remaining = (len - RBEGIN_PREFIX) as u16;
+                    self.in_body = self.remaining > 0;
+                    return (used, Event::RBegin(self.channel, rl, seq));
+                }
                 KIND_BEGIN if len >= BEGIN_PREFIX => {
                     let rl =
                         u32::from_le_bytes([self.hdr[4], self.hdr[5], self.hdr[6], self.hdr[7]]);
@@ -424,7 +571,7 @@ impl Parser {
         if self.remaining == 0 {
             self.in_body = false;
         }
-        if self.kind == KIND_BEGIN || self.kind == KIND_MORE {
+        if matches!(self.kind, KIND_BEGIN | KIND_RBEGIN | KIND_MORE) {
             return if take == 0 {
                 (used, Event::None)
             } else {
@@ -441,6 +588,11 @@ impl Parser {
         let ev = match self.kind {
             KIND_HELLO => Event::Hello(self.channel, body),
             KIND_REFUSE => Event::Refuse(body[0]),
+            KIND_ACK => {
+                let mut b = [0u8; 8];
+                b.copy_from_slice(&body[..8]);
+                Event::Ack(self.channel, u64::from_le_bytes(b))
+            }
             _ => Event::Credit(
                 self.channel,
                 u32::from_le_bytes([body[0], body[1], body[2], body[3]]),

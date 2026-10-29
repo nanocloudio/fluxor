@@ -3,8 +3,8 @@
 //! Pairs with `echo_worker` to demonstrate the anchor / worker split
 //! described in `docs/architecture/protocol_surfaces.md`. This module
 //! plays the **transport anchor** role: it owns the client-visible TCP
-//! attachment (bound listener + accepted client conn via net_proto /
-//! Stream Surface v1 against the IP module or linux_net), and forwards
+//! attachment (bound listener + accepted client conn over the stream
+//! surface, net_proto, against the IP module or linux_net), and forwards
 //! cleartext bytes over a channel to a session worker.
 //!
 //! The worker in turn owns the session state (trivial here: uppercase
@@ -15,8 +15,8 @@
 //!
 //!   linux_net.net_out  →  anchor.net_in    (net_proto events)
 //!   anchor.net_out      →  linux_net.net_in (net_proto commands)
-//!   anchor.ctrl_out    →  worker.ctrl_in    (SessionCtrlV1)
-//!   worker.ctrl_out    →  anchor.ctrl_in    (SessionCtrlV1 replies)
+//!   anchor.ctrl_out    →  worker.ctrl_in    (session-control)
+//!   worker.ctrl_out    →  anchor.ctrl_in    (session-control replies)
 //!   anchor.data_out    →  worker.data_in    (client bytes → worker)
 //!   worker.data_out    →  anchor.data_in    (worker bytes → client)
 //!
@@ -62,7 +62,7 @@
 //! deadline and nothing else. Refusing costs a maintenance window;
 //! proceeding would cost the client bytes nobody would learn were lost.
 //!
-//! # Parameters (TLV v2)
+//! # Parameters (TLV)
 //!
 //! | Tag | Name                | Type | Default | Description                          |
 //! |-----|---------------------|------|---------|--------------------------------------|
@@ -71,8 +71,8 @@
 //!
 //! # Wire format
 //!
-//! See `modules/sdk/contracts/net/session_ctrl.rs` for SessionCtrlV1
-//! and `modules/sdk/contracts/net/net_proto.rs` for Stream Surface v1.
+//! See `modules/sdk/contracts/net/session_ctrl.rs` for session control
+//! and `modules/sdk/contracts/net/net_proto.rs` for the stream surface.
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
@@ -108,7 +108,7 @@ include!("../../sdk/runtime.rs");
 include!("../../sdk/runtime/params.rs");
 
 // ============================================================================
-// Stream Surface v1 opcodes (subset we use — see net_proto.rs)
+// Stream-surface (net_proto) opcodes (subset we use — see net_proto.rs)
 // ============================================================================
 
 const NET_MSG_ACCEPTED: u8 = 0x01;
@@ -122,7 +122,7 @@ const NET_CMD_SEND: u8 = 0x11;
 const NET_CMD_CLOSE: u8 = 0x12;
 
 // ============================================================================
-// SessionCtrlV1 opcodes (subset we use — see session_ctrl.rs)
+// session-control opcodes (subset we use — see session_ctrl.rs)
 // ============================================================================
 
 const SC_CMD_ATTACH: u8 = 0x71;
@@ -177,7 +177,7 @@ unsafe fn conn_id_at(p: *const u8) -> u16 {
     (*p as u16) | ((*p.add(1) as u16) << 8)
 }
 
-/// Max SessionCtrlV1 frame (identity + a few fields).
+/// Max session-control frame (identity + a few fields).
 const CTRL_BUF_SIZE: usize = 128;
 
 /// Raw-data chunk buffer (one tick's worth of forwarded bytes).
@@ -485,7 +485,7 @@ unsafe fn net_send_close(s: &mut AnchorState, conn_id: u16) {
 }
 
 // ============================================================================
-// SessionCtrlV1 emitters
+// session-control emitters
 // ============================================================================
 
 /// Mint a fresh session_id = anchor_id (8 bytes) || counter (8 bytes BE).
@@ -650,23 +650,16 @@ unsafe fn poll_net_in(s: &mut AnchorState) {
 
     match msg_type {
         NET_MSG_BOUND => {
-            // net_proto MSG_BOUND: `[conn_id:2 LE][local_port:2 LE]`. The
-            // `local_port` echoes our CMD_BIND port (the IP module and the
-            // Linux host adapter both carry it now). On a fanned `net_out`
-            // we claim ONLY the bound for our own `listen_port`, so a
-            // neighbour anchor's listen completing first can't flip us to
-            // Listening. A port-less (legacy) frame is accepted as
-            // sole-consumer.
-            if s.phase == AnchorPhase::WaitBoundNet {
-                let ours = payload_len < 4 || {
-                    let lo = *buf.add(NET_FRAME_HDR + 2);
-                    let hi = *buf.add(NET_FRAME_HDR + 3);
-                    ((lo as u16) | ((hi as u16) << 8)) == s.listen_port
-                };
-                if ours {
-                    if payload_len >= 2 {
-                        s.server_conn_id = conn_id_at(buf.add(NET_FRAME_HDR));
-                    }
+            // net_proto MSG_BOUND: `[conn_id:2 LE][local_port:2 LE]`, the
+            // port echoing our CMD_BIND. On a fanned `net_out` we claim ONLY
+            // the bound for our own `listen_port`, so a neighbour anchor's
+            // listen completing first can't flip us to Listening. A frame
+            // without its port is malformed and ignored.
+            if s.phase == AnchorPhase::WaitBoundNet && payload_len >= 4 {
+                let lo = *buf.add(NET_FRAME_HDR + 2);
+                let hi = *buf.add(NET_FRAME_HDR + 3);
+                if ((lo as u16) | ((hi as u16) << 8)) == s.listen_port {
+                    s.server_conn_id = conn_id_at(buf.add(NET_FRAME_HDR));
                     s.phase = AnchorPhase::Listening;
                     dev_log(&*sys_ptr, 3, b"[echo_anc] bound".as_ptr(), 16);
                 }
@@ -674,12 +667,12 @@ unsafe fn poll_net_in(s: &mut AnchorState) {
         }
         NET_MSG_ACCEPTED => {
             // `[conn_id:2 LE][local_port:2 LE]`. Multi-anchor demux: claim
-            // only accepts on our `listen_port` (a port-less frame is
-            // accepted). An accept on another anchor's port belongs to
-            // that anchor — ignore it (do NOT close it).
-            if payload_len >= 2 {
+            // only accepts on our `listen_port`; a frame without its port is
+            // malformed and ignored. An accept on another anchor's port
+            // belongs to that anchor — ignore it (do NOT close it).
+            if payload_len >= 4 {
                 let new_id = conn_id_at(buf.add(NET_FRAME_HDR));
-                let ours = payload_len < 4 || {
+                let ours = {
                     let lo = *buf.add(NET_FRAME_HDR + 2);
                     let hi = *buf.add(NET_FRAME_HDR + 3);
                     ((lo as u16) | ((hi as u16) << 8)) == s.listen_port
@@ -839,7 +832,7 @@ unsafe fn handoff_refuse(s: &mut AnchorState, status: &[u8]) {
     }
 }
 
-/// Drain one SessionCtrlV1 frame from worker slot `w`.
+/// Drain one session-control frame from worker slot `w`.
 unsafe fn poll_ctrl_in(s: &mut AnchorState, w: usize) {
     let chan = s.ctrl_in[w];
     if chan < 0 {
@@ -1051,7 +1044,7 @@ unsafe fn poll_ctrl_in(s: &mut AnchorState, w: usize) {
     }
 }
 
-/// Drain SessionCtrlV1 frames from both worker slots.
+/// Drain session-control frames from both worker slots.
 unsafe fn poll_ctrl_all(s: &mut AnchorState) {
     poll_ctrl_in(s, 0);
     poll_ctrl_in(s, 1);

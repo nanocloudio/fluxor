@@ -550,15 +550,21 @@ The IP module does not retain TCP segments for retransmission — that
 would duplicate state between IP and TLS. Instead it signals the
 consumer:
 
-- `MSG_ACK(conn_id, acked_seq)` — advance your ACK watermark.
+- `MSG_ACK(conn_id, acked_seq, isn)` — the peer acknowledged up to
+  `acked_seq`; `isn` is the sequence number of the stream's first byte.
 - `MSG_RETRANSMIT(conn_id, from_seq)` — replay data from this sequence.
 
 The TLS module holds each emitted ciphertext record in a per-session
-`retx_buf` (default 4 KB). On `MSG_ACK` the buffer is truncated up to
-the absolute TCP sequence number (the first ACK anchors `retx_base_seq`
-so subsequent deltas are unambiguous). On `MSG_RETRANSMIT` the tail is
-re-emitted as a new `CMD_SEND` frame — no re-encryption, just re-delivery
-of the ciphertext the peer is expecting.
+`retx_buf` (default 4 KB). Until the first `MSG_ACK` its base counts stream
+bytes; the first one anchors `retx_base_seq` at `isn` plus that offset, so
+the window is placed exactly whatever was sent before it arrived, and each
+`MSG_ACK` truncates it up to the absolute TCP sequence number. On
+`MSG_RETRANSMIT` up to one segment of it from `from_seq` goes back down as
+`CMD_RESEND` (`[conn_id][seq][bytes]`), which `ip` sends at those sequence
+numbers rather than as new data — no re-encryption, just re-delivery of the
+ciphertext the peer is expecting. Because the window is the only copy, an
+anchored window that cannot take the next record holds the record back
+(`cipher_out` backpressure) rather than dropping bytes it retains.
 
 ## Horizontal Scaling and Trust Domains
 
@@ -676,8 +682,11 @@ sealing primitive: a fresh CSPRNG nonce per call, the key never leaving.
 The quic module's resumption tickets are what use it — the ticket
 is the session state sealed under a labelled vault key, two generations
 alternating by parity so rotation never strands a live ticket. The AAD
-binds a ticket to the generation that sealed it and to this boot's
-incarnation, so it opens only on the host and the boot that minted it.
+binds a ticket to the generation that sealed it and to the instance's
+replay domain — 16 CSPRNG bytes drawn once and living exactly as long as
+the RAM store that enforces single use — so it opens only in the instance
+that minted it: not after a restart, and not in a re-instantiation in the
+same boot, either of which starts with an empty store.
 Acceptance is single-use: a claim is retained for the ticket's whole
 acceptance window, and a store with no free slot refuses the resumption
 rather than evicting a live claim, since evicting one would make a

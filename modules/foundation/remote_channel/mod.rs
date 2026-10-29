@@ -46,7 +46,12 @@
 //!
 //! One session at a time. A record whose sending had begun when its session
 //! ended is lost and counted; a record not yet begun waits for the next
-//! session, and every record delivered was delivered whole. The optional
+//! session, and every record delivered was delivered whole. With `resume`
+//! nothing is lost with a session: every record is numbered and kept until
+//! the peer acknowledges it, and the next session resumes exactly where the
+//! last left off — each record delivered once, in order, across any number
+//! of reconnects — while a record the peer already has is refused as a
+//! replay (`wire.rs`, Resume). The optional
 //! `session` output says when a session opens and ends
 //! (`contracts/mesh/remote_session.rs`), so a consumer can stop sending
 //! toward a member that cannot hear it rather than wait out a deadline.
@@ -116,7 +121,10 @@ include!("../../sdk/runtime.rs");
 include!("../../sdk/runtime/params.rs");
 
 pub mod wire;
-use wire::{Entry, Event, Parser, Table, BEGIN_PREFIX, FRAME_HDR, MAX_CHANNELS};
+use wire::{
+    Entry, Event, Parser, Table, BEGIN_PREFIX, FRAME_HDR, INCARNATION_LEN, MAX_CHANNELS,
+    RBEGIN_PREFIX,
+};
 
 // ── Ceilings ────────────────────────────────────────────────────────────────
 
@@ -211,7 +219,12 @@ const IDENTITIES: usize = TLS_SESSIONS;
 
 const RX_SCRATCH: usize = 3 + mux::MUX_QUIC_STREAM_RX_FRAME_MAX + 64;
 const TX_PREFIX: usize = 3 + mux::STREAM_DATA_PREFIX;
-const TX_BUF: usize = TX_PREFIX + FRAME_HDR + BEGIN_PREFIX + FRAGMENT_MAX;
+const TX_BUF: usize = TX_PREFIX + FRAME_HDR + RBEGIN_PREFIX + FRAGMENT_MAX;
+/// `resume`: a channel's retained window when `window` names none, in
+/// records at the channel's maximum.
+const WINDOW_RECORDS: u32 = 4;
+/// `resume`: records one step takes from a channel's input into its window.
+const INGEST_PER_STEP: usize = 32;
 
 // Session phases.
 const PH_IDLE: u8 = 0;
@@ -302,10 +315,39 @@ struct Chan {
     /// `DIR_SEND` / `DIR_RECV` for an exchange channel, which only ever
     /// carries records one way; `DIR_BOTH` otherwise.
     xdir: u8,
+    // `resume`. The retained window — `[len:4 LE][record]` per record, the
+    // oldest at `rt_head` — holds every record taken off the input that the
+    // peer has not acknowledged; the oldest is number `rt_base`.
+    rt_off: u32,
+    rt_cap: u32,
+    rt_head: u32,
+    rt_used: u32,
+    rt_count: u32,
+    rt_base: u64,
+    /// The record being sent: its offset from `rt_head`, number, and bytes
+    /// already sent this session.
+    cur_at: u32,
+    cur_seq: u64,
+    cur_sent: u32,
+    /// The highest record sent whole this session, and ever (a lower one
+    /// sent again is a resend).
+    sent_through: u64,
+    sent_high: u64,
+    /// A delimited record being taken off the input: its length and bytes
+    /// so far (its region is reserved when it completes).
+    in_active: bool,
+    in_len: u32,
+    in_have: u32,
+    /// The next record expected from the peer's stream, and whether its
+    /// acknowledgement is owed.
+    rx_next: u64,
+    ack_owed: bool,
     pub records_sent: u32,
     pub records_delivered: u32,
     pub refused_oversize: u32,
     pub lost: u32,
+    /// `resume`: records sent again after a session ended.
+    pub resent: u32,
 }
 
 /// A `mux` stream not yet known to carry a channel, with its parser.
@@ -463,6 +505,30 @@ pub struct State {
     n_closes: u8,
     rx: [u8; RX_SCRATCH],
     pub sessions: u32,
+    // `resume`.
+    resume: u8,
+    /// `window`: retained bytes per channel (0: `WINDOW_RECORDS` records).
+    window: u32,
+    /// This instance's incarnation, and the peer's whose streams it holds.
+    pub incarnation: [u8; INCARNATION_LEN],
+    peer_inc: [u8; INCARNATION_LEN],
+    /// What this side tells the peer in its `HELLO`, fixed when the session
+    /// attaches — before the peer's `HELLO` can change it.
+    hello_held: [u8; INCARNATION_LEN],
+    hello_next: [u64; MAX_CHANNELS],
+    /// `keepalive_ms`: an open resume session that has sent nothing this
+    /// long sends an acknowledgement, and one that has heard nothing for
+    /// three of these is given up — a link that died without a close
+    /// (a cut that reset only one end, a black hole) ends its session and
+    /// the next one resumes, rather than holding the one session for ever.
+    keepalive_ms: u32,
+    last_rx_ms: u32,
+    last_tx_ms: u32,
+    /// Records refused as replays (a number the receiver already had).
+    pub replays_refused: u32,
+    /// Sessions whose peer named another incarnation than the one held: its
+    /// first, or one after it restarted.
+    pub peer_restarts: u32,
     /// `session` output; see `report_session`.
     session_out: i32,
     /// The state the `session` output last carried: open, and its ordinal.
@@ -503,6 +569,13 @@ pub struct State {
     pool: [u8; REASSEMBLY_BYTES],
 }
 
+impl State {
+    /// `resume`: records channel `i` sent again after a session ended.
+    pub fn chans_resent(&self, i: usize) -> u32 {
+        self.chans[i].resent
+    }
+}
+
 mod params_def {
     use super::*;
     define_params! {
@@ -536,6 +609,9 @@ mod params_def {
         6, require_peer, u8, 1 => |s, d, len| { s.require_peer = p_u8(d, len, 0, 1); };
         7, redial_ms, u32, 1000 => |s, d, len| { s.redial_ms = p_u32(d, len, 0, 1000); };
         8, exchange, u8, 0, enum { none=0, near=1, far=2 } => |s, d, len| { s.table.side = p_u8(d, len, 0, 0); };
+        9, resume, u8, 0 => |s, d, len| { s.resume = p_u8(d, len, 0, 0); };
+        10, window, u32, 0 => |s, d, len| { s.window = p_u32(d, len, 0, 0); };
+        11, keepalive_ms, u32, 1000 => |s, d, len| { s.keepalive_ms = p_u32(d, len, 0, 1000); };
     }
 }
 
@@ -639,6 +715,17 @@ fn carve_pool(s: &mut State) -> bool {
                 at += max;
             }
         }
+        if s.table.resume {
+            let floor = max + RECORD_CHARGE as u64;
+            let win = if s.window == 0 {
+                floor * WINDOW_RECORDS as u64
+            } else {
+                (s.window as u64).max(floor)
+            };
+            s.chans[i].rt_off = at as u32;
+            s.chans[i].rt_cap = win as u32;
+            at += win;
+        }
         if at > REASSEMBLY_BYTES as u64 {
             return false;
         }
@@ -700,6 +787,7 @@ unsafe fn send_staged(s: &mut State, chan: Option<usize>, body_len: usize) {
         s.tx.copy_within(start..start + 3 + plen, 0);
     }
     s.tx_len = (3 + plen) as u16;
+    s.last_tx_ms = dev_millis(&*s.syscalls) as u32;
     flush_tx(s);
 }
 
@@ -790,11 +878,19 @@ unsafe fn start_attach(s: &mut State) {
     s.phase = PH_ATTACHING;
     s.setup_deadline_ms = later(dev_millis(&*s.syscalls) as u32, SETUP_TIMEOUT_MS);
     s.peer_bound = s.require_peer == 0;
+    let now = dev_millis(&*s.syscalls) as u32;
+    s.last_rx_ms = now;
+    s.last_tx_ms = now;
     s.hello_owed = false;
     s.refuse_owed = 0;
     s.opening = 0;
     s.open_pending = false;
     s.net_parser.reset();
+    // What this side's HELLO says, as things stand before the peer's.
+    s.hello_held = s.peer_inc;
+    for i in 0..MAX_CHANNELS {
+        s.hello_next[i] = s.chans[i].rx_next.max(1);
+    }
     for i in 0..MAX_CHANNELS {
         let c = &mut s.chans[i];
         c.has_stream = false;
@@ -833,12 +929,23 @@ unsafe fn end_session(s: &mut State, why: &[u8]) {
     for i in 0..n_channels(s) {
         let c = &mut s.chans[i];
         if c.rx_active {
-            // The partial record's bytes leave the ring.
+            // The partial record's bytes leave the ring. With `resume` the
+            // sender still holds it and sends it again; without, it is lost.
             c.ring_used -= RECORD_CHARGE + c.rx_have;
             c.rx_active = false;
-            c.lost = c.lost.wrapping_add(1);
+            if !s.table.resume {
+                c.lost = c.lost.wrapping_add(1);
+            }
         }
-        if c.tx_state == TX_BODY && c.tx_sent > 0 {
+        if s.table.resume {
+            // Nothing sent is lost: the next session starts from the
+            // oldest record the peer has not acknowledged.
+            c.cur_at = 0;
+            c.cur_seq = c.rt_base;
+            c.cur_sent = 0;
+            c.sent_through = c.rt_base - 1;
+            c.ack_owed = false;
+        } else if c.tx_state == TX_BODY && c.tx_sent > 0 {
             c.lost = c.lost.wrapping_add(1);
             // A mailbox record is already off its input; a delimited one
             // still has bytes there to skip.
@@ -976,15 +1083,105 @@ unsafe fn maybe_open(s: &mut State) {
 
 /// A peer's table arrived for `chan` (`net`: the whole session).
 unsafe fn on_hello(s: &mut State, body: &[u8]) -> bool {
-    if !wire::hello_matches(&s.table, body) {
+    let Some(resume) = wire::hello_parse(&s.table, body) else {
         refuse(
             s,
             wire::refuse::TABLE_MISMATCH,
             b"[remote_channel] refused: the peer's channel table differs",
         );
         return false;
+    };
+    match resume {
+        Some(r) => on_resume(s, &r),
+        None => true,
+    }
+}
+
+/// The peer's resume trailer: where each of its streams to us stands, and
+/// where it holds ours.
+unsafe fn on_resume(s: &mut State, r: &wire::Resume) -> bool {
+    let nch = n_channels(s);
+    // Its streams. A sender this side has not heard from under that
+    // incarnation starts its numbering afresh.
+    if r.incarnation != s.peer_inc {
+        if s.peer_inc != [0; INCARNATION_LEN] {
+            s.peer_restarts = s.peer_restarts.wrapping_add(1);
+            log(
+                s,
+                2,
+                b"[remote_channel] the peer is a new incarnation; its streams start afresh",
+            );
+        }
+        s.peer_inc = r.incarnation;
+        for i in 0..nch {
+            s.chans[i].rx_next = 1;
+        }
+    }
+    // Ours.
+    if r.held == s.incarnation {
+        let mut again = 0u32;
+        for i in 0..nch {
+            let c = &s.chans[i];
+            let next = r.next[i];
+            // The peer can neither expect a record we never took (it would
+            // be acknowledging one that does not exist) nor one we already
+            // released (only an acknowledgement releases, so it had it).
+            if next < c.rt_base || next > c.rt_base + c.rt_count as u64 {
+                refuse(
+                    s,
+                    wire::refuse::SEQUENCE,
+                    b"[remote_channel] refused: the peer's resume point is outside the retained window",
+                );
+                return false;
+            }
+            release(s, i, next - 1);
+            again += s.chans[i].rt_count;
+        }
+        // What the peer never had whole goes again; say how much, so a
+        // reconnect that recovered records is visible as one.
+        let mut line = [0u8; 80];
+        let head = b"[remote_channel] resumed: records going again=";
+        line[..head.len()].copy_from_slice(head);
+        let n = fmt_u32_raw(line.as_mut_ptr().add(head.len()), again);
+        log(s, 3, &line[..head.len() + n]);
+    } else {
+        // It never saw our streams under this incarnation: everything we
+        // retain is new to it, numbered from 1.
+        for i in 0..nch {
+            let c = &mut s.chans[i];
+            c.rt_base = 1;
+            c.sent_high = 0;
+        }
+    }
+    for i in 0..nch {
+        let c = &mut s.chans[i];
+        c.cur_at = 0;
+        c.cur_seq = c.rt_base;
+        c.cur_sent = 0;
+        c.sent_through = c.rt_base - 1;
     }
     true
+}
+
+/// Release channel `i`'s retained records through `seq`: the peer has them.
+fn release(s: &mut State, i: usize, seq: u64) {
+    let c = &mut s.chans[i];
+    while c.rt_count > 0 && c.rt_base <= seq {
+        let mut lb = [0u8; 4];
+        ring_get(&s.pool, c.rt_off, c.rt_cap, c.rt_head, &mut lb);
+        let step = RECORD_CHARGE + u32::from_le_bytes(lb);
+        c.rt_head = wrap(c.rt_head + step, c.rt_cap);
+        c.rt_used -= step;
+        c.rt_count -= 1;
+        c.rt_base += 1;
+        if c.cur_seq < c.rt_base {
+            c.cur_at = 0;
+            c.cur_seq = c.rt_base;
+            c.cur_sent = 0;
+        } else {
+            c.cur_at -= step;
+        }
+    }
 }
 
 // ── Receiving ───────────────────────────────────────────────────────────────
@@ -1139,7 +1336,44 @@ unsafe fn on_event(s: &mut State, ev: Event<'_>, stream_channel: Option<usize>) 
             s.chans[c].tx_credit = next as u32;
             true
         }
-        Event::Begin(ch, len) => {
+        Event::Ack(ch, seq) => {
+            let Some(c) = channel_of(ch) else {
+                refuse(
+                    s,
+                    wire::refuse::PROTOCOL,
+                    b"[remote_channel] refused: acknowledgement for no channel",
+                );
+                return false;
+            };
+            if !s.table.resume || s.phase != PH_OPEN {
+                refuse(
+                    s,
+                    wire::refuse::PROTOCOL,
+                    b"[remote_channel] refused: acknowledgement outside a resume session",
+                );
+                return false;
+            }
+            let chan = &s.chans[c];
+            if seq > chan.sent_through || seq + 1 < chan.rt_base {
+                refuse(
+                    s,
+                    wire::refuse::SEQUENCE,
+                    b"[remote_channel] refused: an acknowledgement of a record not sent, or behind one released",
+                );
+                return false;
+            }
+            release(s, c, seq);
+            true
+        }
+        Event::RBegin(ch, len, seq) => {
+            if !s.table.resume {
+                refuse(
+                    s,
+                    wire::refuse::PROTOCOL,
+                    b"[remote_channel] refused: a numbered record outside a resume session",
+                );
+                return false;
+            }
             let Some(c) = channel_of(ch) else {
                 refuse(
                     s,
@@ -1148,60 +1382,35 @@ unsafe fn on_event(s: &mut State, ev: Event<'_>, stream_channel: Option<usize>) 
                 );
                 return false;
             };
-            if s.chans[c].xdir == DIR_SEND {
-                refuse(
-                    s,
-                    wire::refuse::PROTOCOL,
-                    b"[remote_channel] refused: a record on a channel only this side sends on",
-                );
+            let next = s.chans[c].rx_next;
+            if seq != next {
+                if seq < next {
+                    s.replays_refused = s.replays_refused.wrapping_add(1);
+                    refuse(
+                        s,
+                        wire::refuse::SEQUENCE,
+                        b"[remote_channel] refused: a replay of a record already received",
+                    );
+                } else {
+                    refuse(
+                        s,
+                        wire::refuse::SEQUENCE,
+                        b"[remote_channel] refused: a record past the next one expected",
+                    );
+                }
                 return false;
             }
-            let chan = &mut s.chans[c];
-            if s.phase != PH_OPEN || chan.rx_active {
-                refuse(
-                    s,
-                    wire::refuse::PROTOCOL,
-                    b"[remote_channel] refused: record out of sequence",
-                );
-                return false;
-            }
-            if (len as usize) < chan.entry.header_len() {
-                refuse(
-                    s,
-                    wire::refuse::PROTOCOL,
-                    b"[remote_channel] refused: a record shorter than its own header",
-                );
-                return false;
-            }
-            if len == 0 || len > chan.entry.max_record {
-                refuse(
-                    s,
-                    wire::refuse::OVERSIZE,
-                    b"[remote_channel] refused: record over the channel maximum",
-                );
-                return false;
-            }
-            if chan.ring_used + RECORD_CHARGE > chan.ring_cap {
-                refuse(
-                    s,
-                    wire::refuse::CREDIT,
-                    b"[remote_channel] refused: record beyond granted credit",
-                );
-                return false;
-            }
-            let (at, off, cap) = (
-                chan.ring_head + chan.ring_used,
-                chan.ring_off,
-                chan.ring_cap,
-            );
-            ring_put(&mut s.pool, off, cap, at, &len.to_le_bytes());
-            let chan = &mut s.chans[c];
-            chan.ring_used += RECORD_CHARGE;
-            chan.rx_len = len;
-            chan.rx_have = 0;
-            chan.rx_active = true;
-            true
+            on_begin(s, ch, len, stream_channel)
         }
+        Event::Begin(_, _) if s.table.resume && s.phase == PH_OPEN => {
+            refuse(
+                s,
+                wire::refuse::PROTOCOL,
+                b"[remote_channel] refused: an unnumbered record in a resume session",
+            );
+            false
+        }
+        Event::Begin(ch, len) => on_begin(s, ch, len, stream_channel),
         Event::Data(ch, bytes) => {
             let Some(c) = channel_of(ch) else {
                 refuse(
@@ -1263,10 +1472,92 @@ unsafe fn on_event(s: &mut State, ev: Event<'_>, stream_channel: Option<usize>) 
             chan.rx_have = have;
             if have == chan.rx_len {
                 chan.rx_active = false;
+                if s.table.resume {
+                    let chan = &mut s.chans[c];
+                    chan.rx_next += 1;
+                    chan.ack_owed = true;
+                }
             }
             true
         }
     }
+}
+
+/// A record of `len` bytes starts on channel byte `ch` (numbered or not:
+/// a resume session's number is checked before this).
+unsafe fn on_begin(s: &mut State, ch: u8, len: u32, stream_channel: Option<usize>) -> bool {
+    let nch = n_channels(s);
+    let channel_of = |ch: u8| -> Option<usize> {
+        let c = ch as usize;
+        if c >= nch {
+            return None;
+        }
+        match stream_channel {
+            Some(sc) if sc != c => None,
+            _ => Some(c),
+        }
+    };
+    let Some(c) = channel_of(ch) else {
+        refuse(
+            s,
+            wire::refuse::PROTOCOL,
+            b"[remote_channel] refused: record for no channel",
+        );
+        return false;
+    };
+    if s.chans[c].xdir == DIR_SEND {
+        refuse(
+            s,
+            wire::refuse::PROTOCOL,
+            b"[remote_channel] refused: a record on a channel only this side sends on",
+        );
+        return false;
+    }
+    let chan = &mut s.chans[c];
+    if s.phase != PH_OPEN || chan.rx_active {
+        refuse(
+            s,
+            wire::refuse::PROTOCOL,
+            b"[remote_channel] refused: record out of sequence",
+        );
+        return false;
+    }
+    if (len as usize) < chan.entry.header_len() {
+        refuse(
+            s,
+            wire::refuse::PROTOCOL,
+            b"[remote_channel] refused: a record shorter than its own header",
+        );
+        return false;
+    }
+    if len == 0 || len > chan.entry.max_record {
+        refuse(
+            s,
+            wire::refuse::OVERSIZE,
+            b"[remote_channel] refused: record over the channel maximum",
+        );
+        return false;
+    }
+    if chan.ring_used + RECORD_CHARGE > chan.ring_cap {
+        refuse(
+            s,
+            wire::refuse::CREDIT,
+            b"[remote_channel] refused: record beyond granted credit",
+        );
+        return false;
+    }
+    let (at, off, cap) = (
+        chan.ring_head + chan.ring_used,
+        chan.ring_off,
+        chan.ring_cap,
+    );
+    ring_put(&mut s.pool, off, cap, at, &len.to_le_bytes());
+    let chan = &mut s.chans[c];
+    chan.ring_used += RECORD_CHARGE;
+    chan.rx_len = len;
+    chan.rx_have = 0;
+    chan.rx_active = true;
+    true
 }
 
 /// Feed carrier bytes through a carrier's parser (`slot` for a `mux`
@@ -1566,6 +1857,7 @@ unsafe fn net_input(s: &mut State) {
                 }
             }
             net_proto::MSG_DATA if plen > 2 && id == s.conn && s.phase >= PH_ATTACHING => {
+                s.last_rx_ms = dev_millis(sys) as u32;
                 let mut data = [0u8; RX_SCRATCH];
                 data[..plen - 2].copy_from_slice(&p[2..]);
                 feed(s, None, &data[..plen - 2]);
@@ -1706,6 +1998,11 @@ unsafe fn mux_input(s: &mut State) {
                 else {
                     continue;
                 };
+                // What arrives on a stream proves the link as a `net`
+                // segment does: without this, a resumable mux session with
+                // a keepalive is given up 3 × keepalive_ms after it opened,
+                // however busy it is.
+                s.last_rx_ms = dev_millis(sys) as u32;
                 let data = &p[mux::STREAM_DATA_PREFIX..];
                 // Every byte taken is acknowledged at once: what bounds the
                 // peer is the credit this protocol grants, never the
@@ -1765,6 +2062,14 @@ unsafe fn send_control(s: &mut State) -> bool {
     }
     let mut hello = [0u8; wire::HELLO_MAX];
     let hn = wire::encode_hello(&s.table, &mut hello);
+    let hn = wire::encode_resume(
+        &s.table,
+        &s.incarnation,
+        &s.hello_held,
+        &s.hello_next,
+        &mut hello,
+        hn,
+    );
     if s.hello_owed {
         if !frame(s, None, wire::KIND_HELLO, wire::CONTROL, &hello[..hn]) {
             return false;
@@ -1790,6 +2095,13 @@ unsafe fn send_control(s: &mut State) -> bool {
                 }
                 s.chans[i].credit_owed = 0;
             }
+            if s.chans[i].ack_owed {
+                let through = s.chans[i].rx_next - 1;
+                if !frame(s, Some(i), wire::KIND_ACK, i as u8, &through.to_le_bytes()) {
+                    return false;
+                }
+                s.chans[i].ack_owed = false;
+            }
         }
     }
     true
@@ -1798,6 +2110,10 @@ unsafe fn send_control(s: &mut State) -> bool {
 /// Advance channel `i`'s send: start a record, or put out its next
 /// fragment. True when a frame was written.
 unsafe fn send_channel(s: &mut State, i: usize) -> bool {
+    if s.table.resume {
+        ingest(s, i);
+        return send_retained(s, i);
+    }
     let sys = &*s.syscalls;
     let exchange = is_x(s, i);
     if exchange && !x_may_send(s, i) {
@@ -1977,6 +2293,211 @@ unsafe fn send_channel(s: &mut State, i: usize) -> bool {
     // The bytes are off the local input now; a refused write stays staged
     // and goes first next step.
     send_staged(s, Some(i), FRAME_HDR + prefix + got);
+    true
+}
+
+/// `resume`: take records off channel `i`'s input into its retained window
+/// while they fit. A record is numbered when it is whole in the window; it
+/// leaves only when the peer acknowledges it.
+unsafe fn ingest(s: &mut State, i: usize) {
+    let sys = &*s.syscalls;
+    let c = &mut s.chans[i];
+    if c.input < 0 {
+        return;
+    }
+    // Finish discarding a record refused for its size.
+    if c.tx_state == TX_DISCARD {
+        let mut sink = [0u8; 512];
+        while c.tx_sent < c.tx_len {
+            let want = ((c.tx_len - c.tx_sent) as usize).min(sink.len());
+            let n = (sys.channel_read)(c.input, sink.as_mut_ptr(), want);
+            if n <= 0 {
+                return;
+            }
+            c.tx_sent += n as u64;
+        }
+        c.tx_state = TX_IDLE;
+        c.tx_hdr_have = 0;
+    }
+    let mut scratch = [0u8; 1024];
+    for _ in 0..INGEST_PER_STEP {
+        let c = &mut s.chans[i];
+        let (off, cap, max) = (c.rt_off, c.rt_cap, c.entry.max_record);
+        let free = cap - c.rt_used;
+        let tail = c.rt_head + c.rt_used;
+        let input = c.input;
+        match c.entry.framing {
+            wire::framing::BYTES => {
+                if free <= RECORD_CHARGE {
+                    return;
+                }
+                let room = ((free - RECORD_CHARGE) as usize)
+                    .min(max as usize)
+                    .min(scratch.len());
+                let n = (sys.channel_read)(input, scratch.as_mut_ptr(), room);
+                if n <= 0 {
+                    return;
+                }
+                let n = n as u32;
+                ring_put(&mut s.pool, off, cap, tail, &n.to_le_bytes());
+                ring_put(
+                    &mut s.pool,
+                    off,
+                    cap,
+                    tail + RECORD_CHARGE,
+                    &scratch[..n as usize],
+                );
+                let c = &mut s.chans[i];
+                c.rt_used += RECORD_CHARGE + n;
+                c.rt_count += 1;
+            }
+            wire::framing::MAILBOX => {
+                if free < RECORD_CHARGE + max {
+                    return;
+                }
+                let stage = c.tx_stage as usize;
+                let n = (sys.channel_read)(input, s.pool.as_mut_ptr().add(stage), max as usize);
+                if n == errno::EINVAL {
+                    dev_channel_ioctl(sys, input, IOCTL_FLUSH, core::ptr::null_mut(), 0);
+                    s.chans[i].refused_oversize = s.chans[i].refused_oversize.wrapping_add(1);
+                    log(
+                        s,
+                        1,
+                        b"[remote_channel] record over the channel maximum refused",
+                    );
+                    return;
+                }
+                if n <= 0 {
+                    return;
+                }
+                let n = n as u32;
+                ring_put(&mut s.pool, off, cap, tail, &n.to_le_bytes());
+                for k in 0..n {
+                    let b = s.pool[stage + k as usize];
+                    ring_put(&mut s.pool, off, cap, tail + RECORD_CHARGE + k, &[b]);
+                }
+                let c = &mut s.chans[i];
+                c.rt_used += RECORD_CHARGE + n;
+                c.rt_count += 1;
+            }
+            _ => {
+                let hl = c.entry.header_len();
+                if !c.in_active {
+                    while (c.tx_hdr_have as usize) < hl {
+                        let n = (sys.channel_read)(
+                            input,
+                            c.tx_hdr.as_mut_ptr().add(c.tx_hdr_have as usize),
+                            hl - c.tx_hdr_have as usize,
+                        );
+                        if n <= 0 {
+                            return;
+                        }
+                        c.tx_hdr_have += n as u8;
+                    }
+                    let len = c.entry.record_len(&c.tx_hdr[..hl]);
+                    if len > max as u64 {
+                        c.tx_state = TX_DISCARD;
+                        c.tx_len = len;
+                        c.tx_sent = hl as u64;
+                        c.refused_oversize = c.refused_oversize.wrapping_add(1);
+                        log(
+                            s,
+                            1,
+                            b"[remote_channel] record over the channel maximum refused",
+                        );
+                        return;
+                    }
+                    if (free as u64) < RECORD_CHARGE as u64 + len {
+                        // Held, header and all, until the peer releases room.
+                        return;
+                    }
+                    let len = len as u32;
+                    let hdr = c.tx_hdr;
+                    ring_put(&mut s.pool, off, cap, tail, &len.to_le_bytes());
+                    ring_put(&mut s.pool, off, cap, tail + RECORD_CHARGE, &hdr[..hl]);
+                    let c = &mut s.chans[i];
+                    c.in_active = true;
+                    c.in_len = len;
+                    c.in_have = hl as u32;
+                }
+                while s.chans[i].in_have < s.chans[i].in_len {
+                    let (have, len) = (s.chans[i].in_have, s.chans[i].in_len);
+                    let want = ((len - have) as usize).min(scratch.len());
+                    let n = (sys.channel_read)(input, scratch.as_mut_ptr(), want);
+                    if n <= 0 {
+                        return;
+                    }
+                    let at = tail + RECORD_CHARGE + have;
+                    ring_put(&mut s.pool, off, cap, at, &scratch[..n as usize]);
+                    s.chans[i].in_have += n as u32;
+                }
+                let c = &mut s.chans[i];
+                c.rt_used += RECORD_CHARGE + c.in_len;
+                c.rt_count += 1;
+                c.in_active = false;
+                c.tx_hdr_have = 0;
+            }
+        }
+    }
+}
+
+/// `resume`: put out the next fragment of channel `i`'s retained records,
+/// from the one the session has reached. True when a frame was written.
+unsafe fn send_retained(s: &mut State, i: usize) -> bool {
+    let c = &s.chans[i];
+    if c.cur_seq >= c.rt_base + c.rt_count as u64 {
+        return false;
+    }
+    let pos = c.rt_head + c.cur_at;
+    let mut lb = [0u8; 4];
+    ring_get(&s.pool, c.rt_off, c.rt_cap, pos, &mut lb);
+    let len = u32::from_le_bytes(lb);
+    let begin = c.cur_sent == 0;
+    let charge = if begin { RECORD_CHARGE } else { 0 };
+    if c.tx_credit <= charge {
+        return false;
+    }
+    let room = c.tx_credit - charge;
+    let (prefix, kind) = if begin {
+        (RBEGIN_PREFIX, wire::KIND_RBEGIN)
+    } else {
+        (0, wire::KIND_MORE)
+    };
+    // On `mux` the whole frame is one `CMD_MUX_STREAM_SEND`, so the record
+    // bytes are what is left of it beside the header and this frame's prefix
+    // (`RBEGIN`'s is longer than `BEGIN`'s).
+    let frag_max = if s.transport == TRANSPORT_NET {
+        FRAGMENT_MAX
+    } else {
+        MUX_FRAGMENT_MAX + BEGIN_PREFIX - prefix
+    };
+    let want = (len - c.cur_sent).min(room).min(frag_max as u32) as usize;
+    let body_at = TX_PREFIX + FRAME_HDR + prefix;
+    let (off, cap) = (c.rt_off, c.rt_cap);
+    let from = pos + RECORD_CHARGE + c.cur_sent;
+    ring_get(&s.pool, off, cap, from, &mut s.tx[body_at..body_at + want]);
+    if begin {
+        let at = TX_PREFIX + FRAME_HDR;
+        s.tx[at..at + 4].copy_from_slice(&len.to_le_bytes());
+        s.tx[at + 4..at + 12].copy_from_slice(&s.chans[i].cur_seq.to_le_bytes());
+    }
+    wire::header(kind, i as u8, prefix + want, &mut s.tx[TX_PREFIX..]);
+    let c = &mut s.chans[i];
+    c.tx_credit -= charge + want as u32;
+    c.cur_sent += want as u32;
+    if c.cur_sent == len {
+        if c.cur_seq <= c.sent_high {
+            c.resent = c.resent.wrapping_add(1);
+        } else {
+            c.sent_high = c.cur_seq;
+            c.records_sent = c.records_sent.wrapping_add(1);
+        }
+        c.sent_through = c.cur_seq;
+        c.cur_seq += 1;
+        c.cur_at += RECORD_CHARGE + len;
+        c.cur_sent = 0;
+    }
+    send_staged(s, Some(i), FRAME_HDR + prefix + want);
     true
 }
 
@@ -2414,6 +2935,7 @@ pub unsafe extern "C" fn module_new(
     s.peer_port = DEFAULT_PORT;
     s.require_peer = 1;
     s.redial_ms = 1000;
+    s.keepalive_ms = 1000;
     s.conn = NO_CONN;
     s.my_tag = dev_requester_tag(sys);
     s.net_parser = Parser::new();
@@ -2454,6 +2976,33 @@ pub unsafe extern "C" fn module_new(
         let near = side == wire::side::NEAR;
         s.chans[q].xdir = if near { DIR_SEND } else { DIR_RECV };
         s.chans[r].xdir = if near { DIR_RECV } else { DIR_SEND };
+    }
+    if s.resume != 0 {
+        // On `mux` each channel's HELLO carries the same trailer, fixed when
+        // the session attached: applying it once per stream is applying it
+        // once, before any record of the session is sent.
+        if side != wire::side::NONE {
+            log(s, 1, b"[remote_channel] refusing to construct: `resume` is for channels without an exchange endpoint");
+            return -22;
+        }
+        s.table.resume = true;
+        // An incarnation no other instance, and no earlier life of this
+        // one, can be holding streams under.
+        if dev_csprng_fill(sys, s.incarnation.as_mut_ptr(), INCARNATION_LEN) < 0
+            || s.incarnation == [0; INCARNATION_LEN]
+        {
+            log(
+                s,
+                1,
+                b"[remote_channel] refusing to construct: no randomness for the incarnation",
+            );
+            return -22;
+        }
+        for c in s.chans.iter_mut() {
+            c.rt_base = 1;
+            c.cur_seq = 1;
+            c.rx_next = 1;
+        }
     }
     if !carve_pool(s) {
         log(s, 1, b"[remote_channel] refusing to construct: the channels' records exceed REASSEMBLY_BYTES");
@@ -2532,11 +3081,34 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     near_step(s);
     try_hello(s);
     check_setup_deadline(s, now);
+    keepalive(s, now);
     if flush_tx(s) && send_control(s) {
         send_records(s);
     }
     report_session(s);
     0
+}
+
+/// `resume`: keep an idle session's link proven, and give up on one that
+/// has gone silent.
+unsafe fn keepalive(s: &mut State, now: u32) {
+    if !s.table.resume || s.keepalive_ms == 0 || s.phase != PH_OPEN {
+        return;
+    }
+    let k = s.keepalive_ms.min(i32::MAX as u32 / 4);
+    if now.wrapping_sub(s.last_rx_ms) >= 3 * k && now.wrapping_sub(s.last_rx_ms) < 0x8000_0000 {
+        end_session(
+            s,
+            b"[remote_channel] the peer went silent; the session is given up",
+        );
+        return;
+    }
+    if now.wrapping_sub(s.last_tx_ms) >= k && now.wrapping_sub(s.last_tx_ms) < 0x8000_0000 {
+        // An acknowledgement of what has arrived — true whenever it is sent,
+        // so it is also the cheapest frame that proves the link.
+        let through = s.chans[0].rx_next - 1;
+        frame(s, Some(0), wire::KIND_ACK, 0, &through.to_le_bytes());
+    }
 }
 
 /// Tell the `session` output whether a session is open, when that differs

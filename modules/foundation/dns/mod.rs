@@ -6,9 +6,14 @@
 //! path (`dns64_prefix`) and an authenticated single-zone dynamic-update
 //! authority (`update_zone`).
 //!
-//! # DNS64 (RFC 6147, non-validating /96 profile)
+//! # DNS64 (RFC 6147, non-validating profile, every RFC 6052 prefix length)
 //!
-//! A native AAAA answer is always preserved. A locally configured A is
+//! A native AAAA answer is always preserved, except that an AAAA in the
+//! IPv4-mapped range `::ffff:0:0/96` is treated as absent (RFC 6147
+//! §5.1.4, the mandatory exclusion), so the A phase synthesizes in its
+//! place. The prefix may be any RFC 6052 §2.2 length (/32, /40, /48, /56,
+//! /64, /96); the IPv4 address is embedded around the `u` octet exactly as
+//! the NAT64 translator embeds it (`cores/nat.rs`, `nat64_embed`). A locally configured A is
 //! synthesized into an AAAA at the configured TTL. A forwarded AAAA whose
 //! answer is a complete, correlated NOERROR/NODATA — not NXDOMAIN, not an
 //! error, not truncated, not a referral, not malformed — starts ONE follow-up
@@ -140,7 +145,7 @@
 //! | 4   | port     | u16  | 53         | Listen port                    |
 //! | 5   | trace_sample_permille | u16 | tier | `dns.query` head-sampling rate |
 //! | 6   | upstream_port | u16 | 53    | Upstream destination port      |
-//! | 7   | dns64_prefix | str | (none) | DNS64 prefix, `"<ipv6>/96"` text or 16 prefix bytes + length byte; only /96 is admitted, anything else refuses construction |
+//! | 7   | dns64_prefix | str | (none) | DNS64 prefix, `"<ipv6>/<len>"` text or 16 prefix bytes + length byte; only RFC 6052 lengths (32, 40, 48, 56, 64, 96) with no bits past the length and a zero `u` octet are admitted, anything else refuses construction |
 //! | 8   | dns64_exclude | str | non-global | IPv4 range never translated, `"a.b.c.d/n"` (repeatable, `MAX_DNS64_EXCLUDES`); when absent every non-global range is excluded |
 //! | 9   | update_zone | str | (none)   | Zone apex served authoritatively and open to TSIG-signed UPDATE |
 //! | 10  | update_durability | u8 enum | (unset) | `volatile` or `durable`; required with `update_zone` |
@@ -184,6 +189,16 @@ include!("../../sdk/runtime/params.rs");
 // transport_buffer / quic / dtls. dns composes two: server (port 53) + upstream
 // (ephemeral), demuxed by ep_id on one channel.
 include!("../../sdk/cores/datagram_endpoint.rs");
+
+// RFC 6052 address embedding, shared with the NAT64 translator so the two
+// synthesise one address for one IPv4 address under one prefix.
+#[allow(
+    dead_code,
+    reason = "the core is mounted whole; DNS64 uses its RFC 6052 half"
+)]
+mod nat_core {
+    include!("../../sdk/cores/nat.rs");
+}
 // The DNS message codec — header, names, question, resource records —
 // shared with the `ip` stub resolver.
 #[path = "../../sdk/contracts/net/dns_wire.rs"]
@@ -288,10 +303,10 @@ const UPSTREAM_ID_DRAWS: usize = 8;
 
 // ── DNS64 ────────────────────────────────────────────────────────────────
 
-/// Only /96 prefixes are admitted (RFC 6052 §2.2 with the IPv4 address in
-/// the low 32 bits); the prefix occupies the first `DNS64_PREFIX_BYTES`.
-const DNS64_PREFIX_BITS: u8 = 96;
-const DNS64_PREFIX_BYTES: usize = 12;
+/// Every RFC 6052 §2.2 prefix length is admitted (32, 40, 48, 56, 64, 96),
+/// the IPv4 address embedded around the `u` octet as the translator embeds
+/// it (`cores/nat.rs`); the whole 16-byte prefix is kept with its length.
+const DNS64_PREFIX_BYTES: usize = 16;
 
 /// Configured address exclusions (`dns64_exclude`).
 const MAX_DNS64_EXCLUDES: usize = 16;
@@ -312,22 +327,7 @@ const MAX_SYNTH_ADDRS: usize = 8;
 
 /// The well-known prefix (RFC 6052 §2.1), which must never translate a
 /// non-global IPv4 address.
-const DNS64_WELL_KNOWN_PREFIX: [u8; DNS64_PREFIX_BYTES] =
-    [0x00, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0];
-
-/// The non-global IPv4 ranges excluded by default and always excluded under
-/// the well-known prefix: `(network, mask)` in host order.
-const DNS64_NON_GLOBAL: [(u32, u32); 9] = [
-    (0x0000_0000, 0xFF00_0000), // 0.0.0.0/8
-    (0x0A00_0000, 0xFF00_0000), // 10.0.0.0/8
-    (0x6440_0000, 0xFFC0_0000), // 100.64.0.0/10
-    (0x7F00_0000, 0xFF00_0000), // 127.0.0.0/8
-    (0xA9FE_0000, 0xFFFF_0000), // 169.254.0.0/16
-    (0xAC10_0000, 0xFFF0_0000), // 172.16.0.0/12
-    (0xC0A8_0000, 0xFFFF_0000), // 192.168.0.0/16
-    (0xE000_0000, 0xF000_0000), // 224.0.0.0/4
-    (0xF000_0000, 0xF000_0000), // 240.0.0.0/4
-];
+const DNS64_WELL_KNOWN_PREFIX: [u8; DNS64_PREFIX_BYTES] = nat_core::NAT64_WKP;
 
 /// Pending-slot phases.
 const PHASE_RELAY: u8 = 0;
@@ -926,6 +926,8 @@ struct DnsState {
     dns64_wkp: u8,
     dns64_exclude_count: u8,
     dns64_prefix: [u8; DNS64_PREFIX_BYTES],
+    /// The prefix's length in bits (RFC 6052 §2.2).
+    dns64_prefix_len: u8,
     /// Published generation of the prefix/exclusion configuration.
     dns64_generation: u32,
     /// `(network, mask)` in host order.
@@ -1048,6 +1050,7 @@ impl DnsState {
         self.dns64_wkp = 0;
         self.dns64_exclude_count = 0;
         self.dns64_prefix = [0; DNS64_PREFIX_BYTES];
+        self.dns64_prefix_len = 0;
         self.dns64_generation = 1;
         self.dns64_exclude = [(0, 0); MAX_DNS64_EXCLUDES];
         self.update_enabled = 0;
@@ -3282,61 +3285,76 @@ unsafe fn find_byte(data: *const u8, len: usize, needle: u8) -> usize {
 // DNS64: configuration
 // ============================================================================
 
-/// Parse `dns64_prefix`: either `"<ipv6>/96"` text or 16 prefix bytes
-/// followed by one length byte. Anything but a /96 marks the configuration
-/// bad and construction is refused.
+/// Parse `dns64_prefix`: either `"<ipv6>/<len>"` text or 16 prefix bytes
+/// followed by one length byte. A length RFC 6052 does not define, a bit set
+/// past it, or a set `u` octet marks the configuration bad and construction
+/// is refused.
 unsafe fn parse_dns64_prefix(s: &mut DnsState, data: *const u8, len: usize) {
     if len == 0 {
         return;
     }
     let mut prefix = [0u8; 16];
-    let ok = if len == 17 && !(*data).is_ascii_graphic() {
+    // Text is hex digits, colons and one slash. Seventeen bytes that are
+    // not all of those are the binary form: its prefix bytes past any
+    // admitted length are zero, which no text holds, so the two never
+    // collide whatever byte the prefix starts with.
+    let mut text = true;
+    let mut k = 0;
+    while k < len {
+        text &= matches!(*data.add(k), b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F' | b':' | b'/');
+        k += 1;
+    }
+    let bits = if len == 17 && !text {
         copy_bytes(prefix.as_mut_ptr(), data, 16);
-        *data.add(16) == DNS64_PREFIX_BITS
+        Some(*data.add(16))
     } else {
         parse_ipv6_prefix_text(data, len, &mut prefix)
     };
-    // The low 32 bits of a /96 prefix are the address; a configured prefix
-    // carrying bits there is not a /96.
-    if !ok || prefix[12] != 0 || prefix[13] != 0 || prefix[14] != 0 || prefix[15] != 0 {
+    let Some(bits) = bits else {
+        s.dns64_bad = 1;
+        return;
+    };
+    if !nat_core::nat64_prefix_valid(&prefix, bits) {
         s.dns64_bad = 1;
         return;
     }
-    copy_bytes(
-        s.dns64_prefix.as_mut_ptr(),
-        prefix.as_ptr(),
-        DNS64_PREFIX_BYTES,
-    );
+    s.dns64_prefix = prefix;
+    s.dns64_prefix_len = bits;
     s.dns64_enabled = 1;
-    s.dns64_wkp = u8::from(s.dns64_prefix == DNS64_WELL_KNOWN_PREFIX);
+    s.dns64_wkp = u8::from(bits == 96 && s.dns64_prefix == DNS64_WELL_KNOWN_PREFIX);
 }
 
-/// Parse `"<ipv6>/96"` into `out`. RFC 4291 text form with one optional
-/// `::`, no embedded IPv4 form; the length suffix must be exactly 96.
-unsafe fn parse_ipv6_prefix_text(data: *const u8, len: usize, out: &mut [u8; 16]) -> bool {
+/// The synthesized address for `ip` (host order) under the configured
+/// prefix: the translator's own RFC 6052 embedding (`nat64_embed`), so the
+/// two name one address for one IPv4 address. `None` for an address the
+/// embedding refuses — which `dns64_excluded` has already excluded.
+fn dns64_address(s: &DnsState, ip: u32) -> Option<[u8; 16]> {
+    nat_core::nat64_embed(&s.dns64_prefix, s.dns64_prefix_len, ip.to_be_bytes()).ok()
+}
+
+/// Parse `"<ipv6>/<len>"` into `out`, returning the length. RFC 4291 text
+/// form with one optional `::`, no embedded IPv4 form.
+unsafe fn parse_ipv6_prefix_text(data: *const u8, len: usize, out: &mut [u8; 16]) -> Option<u8> {
     let slash = find_byte(data, len, b'/');
     if slash == len {
-        return false;
+        return None;
     }
     // Length suffix.
     let mut bits: u32 = 0;
     let mut i = slash + 1;
     if i >= len {
-        return false;
+        return None;
     }
     while i < len {
         let c = *data.add(i);
         if !c.is_ascii_digit() {
-            return false;
+            return None;
         }
         bits = bits * 10 + (c - b'0') as u32;
         if bits > 128 {
-            return false;
+            return None;
         }
         i += 1;
-    }
-    if bits != DNS64_PREFIX_BITS as u32 {
-        return false;
     }
     // Address groups, with at most one `::` gap.
     let mut groups = [0u16; 8];
@@ -3356,17 +3374,17 @@ unsafe fn parse_ipv6_prefix_text(data: *const u8, len: usize, out: &mut [u8; 16]
                 b'0'..=b'9' => c - b'0',
                 b'a'..=b'f' => c - b'a' + 10,
                 b'A'..=b'F' => c - b'A' + 10,
-                _ => return false,
+                _ => return None,
             };
             val = (val << 4) | d as u32;
             digits += 1;
             if digits > 4 {
-                return false;
+                return None;
             }
             pos += 1;
         }
         if digits == 0 || count >= 8 {
-            return false;
+            return None;
         }
         groups[count] = val as u16;
         count += 1;
@@ -3375,12 +3393,12 @@ unsafe fn parse_ipv6_prefix_text(data: *const u8, len: usize, out: &mut [u8; 16]
             pos += 1;
             if pos < slash && *data.add(pos) == b':' {
                 if gap.is_some() {
-                    return false;
+                    return None;
                 }
                 gap = Some(count);
                 pos += 1;
             } else if pos >= slash {
-                return false;
+                return None;
             }
         }
     }
@@ -3388,7 +3406,7 @@ unsafe fn parse_ipv6_prefix_text(data: *const u8, len: usize, out: &mut [u8; 16]
     match gap {
         Some(g) => {
             if count >= 8 {
-                return false;
+                return None;
             }
             let mut k = 0;
             while k < g {
@@ -3404,7 +3422,7 @@ unsafe fn parse_ipv6_prefix_text(data: *const u8, len: usize, out: &mut [u8; 16]
         }
         None => {
             if count != 8 {
-                return false;
+                return None;
             }
             full = groups;
         }
@@ -3416,7 +3434,7 @@ unsafe fn parse_ipv6_prefix_text(data: *const u8, len: usize, out: &mut [u8; 16]
         out[2 * k + 1] = b[1];
         k += 1;
     }
-    true
+    Some(bits as u8)
 }
 
 /// Parse one `dns64_exclude` entry `"a.b.c.d/n"` (or `"a.b.c.d"` for /32).
@@ -3470,28 +3488,22 @@ fn dns64_excluded(s: &DnsState, ip: u32) -> bool {
         }
         i += 1;
     }
-    if s.dns64_exclude_count == 0 || s.dns64_wkp != 0 {
-        let mut k = 0;
-        while k < DNS64_NON_GLOBAL.len() {
-            let (net, mask) = DNS64_NON_GLOBAL[k];
-            if ip & mask == net {
-                return true;
-            }
-            k += 1;
-        }
-    }
-    false
+    // The non-global ranges, excluded by default and always under the
+    // well-known prefix: the translator's own test (`nat_v4_is_global`),
+    // so synthesis never names an address it refuses to translate.
+    (s.dns64_exclude_count == 0 || s.dns64_wkp != 0)
+        && !nat_core::nat_v4_is_global(ip.to_be_bytes())
 }
 
 /// Publish a new prefix generation. Pending work keeps the generation it
 /// was accepted under and completes without synthesis.
-unsafe fn dns64_set_prefix(s: &mut DnsState, prefix: &[u8; DNS64_PREFIX_BYTES]) {
-    copy_bytes(
-        s.dns64_prefix.as_mut_ptr(),
-        prefix.as_ptr(),
-        DNS64_PREFIX_BYTES,
-    );
-    s.dns64_wkp = u8::from(s.dns64_prefix == DNS64_WELL_KNOWN_PREFIX);
+unsafe fn dns64_set_prefix(s: &mut DnsState, prefix: &[u8; DNS64_PREFIX_BYTES], bits: u8) {
+    if !nat_core::nat64_prefix_valid(prefix, bits) {
+        return;
+    }
+    s.dns64_prefix = *prefix;
+    s.dns64_prefix_len = bits;
+    s.dns64_wkp = u8::from(bits == 96 && s.dns64_prefix == DNS64_WELL_KNOWN_PREFIX);
     s.dns64_enabled = 1;
     s.dns64_generation = s.dns64_generation.wrapping_add(1);
 }
@@ -3499,10 +3511,10 @@ unsafe fn dns64_set_prefix(s: &mut DnsState, prefix: &[u8; DNS64_PREFIX_BYTES]) 
 /// Host-test entry to the prefix publication path, so a gate can move the
 /// generation beneath a query in flight.
 #[cfg(feature = "host-test")]
-pub fn dns64_publish_prefix(state: *mut u8, prefix: &[u8; DNS64_PREFIX_BYTES]) {
+pub fn dns64_publish_prefix(state: *mut u8, prefix: &[u8; DNS64_PREFIX_BYTES], bits: u8) {
     unsafe {
         let s = &mut *(state as *mut DnsState);
-        dns64_set_prefix(s, prefix);
+        dns64_set_prefix(s, prefix, bits);
     }
 }
 
@@ -3557,6 +3569,9 @@ unsafe fn build_aaaa_local_response(
     ip: u32,
     tx: *mut u8,
 ) -> usize {
+    let Some(a) = dns64_address(s, ip) else {
+        return 0;
+    };
     let mut pos = begin_local_response(query_pkt, question_end, 0, 1, AAAA_RECORD_LEN, tx);
     if pos == 0 {
         return 0;
@@ -3569,8 +3584,7 @@ unsafe fn build_aaaa_local_response(
     put_u32(tx.add(pos + 4), s.ttl);
     put_u16(tx.add(pos + 8), 16);
     pos += 10;
-    copy_bytes(tx.add(pos), s.dns64_prefix.as_ptr(), DNS64_PREFIX_BYTES);
-    put_u32(tx.add(pos + DNS64_PREFIX_BYTES), ip);
+    copy_bytes(tx.add(pos), a.as_ptr(), 16);
     pos += 16;
     pos
 }
@@ -3638,7 +3652,12 @@ unsafe fn classify_aaaa_answer(
             }
             if names_equal(owner.as_ptr(), rr.owner_len, cur, cur_len) {
                 if rr.rtype == QTYPE_AAAA {
-                    found_aaaa = true;
+                    // RFC 6147 §5.1.4: an AAAA in the excluded set — always
+                    // the IPv4-mapped `::ffff:0:0/96` — is treated as
+                    // absent, so the A phase synthesizes in its place.
+                    if !aaaa_excluded(pkt, rr.rdata_off, rr.next) {
+                        found_aaaa = true;
+                    }
                 } else if rr.rtype == QTYPE_CNAME && cname.is_none() {
                     let (t_len, end) =
                         match read_name(pkt, pkt_len, rr.rdata_off, target.as_mut_ptr()) {
@@ -3754,6 +3773,22 @@ unsafe fn classify_aaaa_answer(
     AaaaOutcome::Nodata
 }
 
+/// Whether the AAAA record data at `[at, end)` is in DNS64's excluded set:
+/// the IPv4-mapped prefix `::ffff:0:0/96` (RFC 6147 §5.1.4, mandatory).
+unsafe fn aaaa_excluded(pkt: *const u8, at: usize, end: usize) -> bool {
+    if end - at != 16 {
+        return false;
+    }
+    let mut i = 0;
+    while i < 10 {
+        if *pkt.add(at + i) != 0 {
+            return false;
+        }
+        i += 1;
+    }
+    *pkt.add(at + 10) == 0xFF && *pkt.add(at + 11) == 0xFF
+}
+
 /// Header and question for an answer to the slot's original AAAA question.
 /// Returns the write position, or 0 when it cannot fit.
 unsafe fn begin_dns64_answer(slot: &PendingQuery, ancount: u16, tx: *mut u8) -> usize {
@@ -3807,6 +3842,10 @@ unsafe fn build_dns64_answer(
     let mut written: u16 = 0;
     let mut i = 0;
     while i < count {
+        let Some(a) = dns64_address(s, addrs[i]) else {
+            i += 1;
+            continue;
+        };
         // Owner: the terminal name, as a pointer to the question when it is
         // the question.
         let owner_len = if term_len == slot.qname_len as usize {
@@ -3836,8 +3875,7 @@ unsafe fn build_dns64_answer(
         put_u32(tx.add(pos + 4), ttl);
         put_u16(tx.add(pos + 8), 16);
         pos += 10;
-        copy_bytes(tx.add(pos), s.dns64_prefix.as_ptr(), DNS64_PREFIX_BYTES);
-        put_u32(tx.add(pos + DNS64_PREFIX_BYTES), addrs[i]);
+        copy_bytes(tx.add(pos), a.as_ptr(), 16);
         pos += 16;
         written += 1;
         i += 1;
@@ -5782,12 +5820,12 @@ pub unsafe extern "C" fn module_new(
         if s.dns64_bad != 0 {
             log_info(
                 s,
-                b"[dns] refusing to construct: dns64_prefix is not a /96 prefix",
+                b"[dns] refusing to construct: dns64_prefix is not an RFC 6052 prefix (/32, /40, /48, /56, /64 or /96, no bits past its length, u octet zero)",
             );
             return -1;
         }
         if s.dns64_enabled != 0 {
-            log_info(s, b"[dns] dns64: /96 synthesis on, non-validating profile (DO/CD forwarded unchanged)");
+            log_info(s, b"[dns] dns64: RFC 6052 synthesis on, non-validating profile (DO/CD forwarded unchanged)");
         }
         if s.update_enabled != 0 {
             match s.update_durability {

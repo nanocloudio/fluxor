@@ -80,6 +80,8 @@ include!("../../sdk/crypto/sha256.rs");
 include!("../../sdk/crypto/sha384.rs");
 include!("../../sdk/crypto/hmac.rs");
 include!("../../sdk/crypto/aes_gcm.rs");
+// Routable connection IDs (`cores/cid_route.rs`).
+include!("../../sdk/cores/cid_route.rs");
 include!("../../sdk/crypto/chacha20.rs");
 include!("../../sdk/crypto/p256.rs");
 include!("../../sdk/crypto/p384.rs");
@@ -112,6 +114,8 @@ include!("pump.rs");
 // Transport continuity (CT_QUIC): checkpoint/delta codec + shadow takeover
 // state machine on the cont_in / cont_out ports.
 include!("continuity.rs");
+// Vault-to-vault custody of a flow's continuity key.
+include!("custody.rs");
 
 // Concurrent connections this endpoint will hold. Per-connection state is
 // ~20 KB — dominated by the datagram/stream buffers and the TLS handshake
@@ -216,7 +220,7 @@ const MAX_TICKETS: usize = 4;
 /// lived than the store would not do: a value scoped to the boot, say,
 /// survives a re-instantiation and would let the replacement re-open every
 /// ticket its predecessor had already spent (RFC 8446 §8, RFC 9001 §9.2).
-const TICKET_AAD: &[u8] = b"quic-ticket-v1";
+const TICKET_AAD: &[u8] = b"quic-ticket";
 name_table!(TICKET_LABEL = [b"quic-resume-0", b"quic-resume-1"]);
 /// `TICKET_AAD` + parity + this instance's replay domain. Derived from the
 /// label rather than written out, so changing the label cannot leave a
@@ -277,6 +281,12 @@ pub(crate) struct QuicState {
     /// the attempt bound. Reported as `cidfail=` in the heartbeat; non-zero
     /// means a CID was declined rather than emitted zero.
     rng_cid_fail: u32,
+    /// Routable connection IDs (`cid_route_key`, `cid_route`,
+    /// `cid_route_rot`).
+    cid_route_on: bool,
+    cid_route_key: [u8; 16],
+    cid_route_token: [u8; CID_ROUTE_TOKEN],
+    cid_route_rot: u8,
     /// Times a 1-RTT emit stalled because the send packet-number
     /// reservation had no granted value left. Non-zero means
     /// the directory's grants ran dry and emission held rather than
@@ -340,6 +350,15 @@ pub(crate) struct QuicState {
     /// refuses construction.
     authority_refused: u8,
     client_started: bool,
+    /// Client mode: dial the authority again this long after the client's
+    /// connection is gone (0 never) — a mux consumer that resumes, such as
+    /// `remote_channel`, is told of the next session by MSG_MUX_SESSION_OPENED.
+    redial_ms: u32,
+    /// When the redial is due (dev_millis), 0 while none is scheduled.
+    redial_at: u64,
+    /// The idle timeout this end advertises (`max_idle_timeout`), in
+    /// milliseconds; 0 none.
+    idle_timeout_ms: u32,
     cert: [u8; MAX_CERT_LEN],
     cert_len: usize,
     key: [u8; MAX_KEY_LEN],
@@ -546,6 +565,94 @@ define_params! {
     // under. Unset means `127.0.0.1:4443`.
     20, authority, str, 0
         => |s, d, len| { parse_authority(s, d, len); };
+    // Server mode: routable connection IDs (`cores/cid_route.rs`). With a
+    // 32-hex route key every connection ID this server issues is a 19-byte
+    // ID sealing `cid_route` (12 hex, the deployment's routing token) under
+    // it, rotation `cid_route_rot`, so any ingress holding the key maps a
+    // packet to its anchor generation without a lookup. Unset: random
+    // 8-byte IDs.
+    21, cid_route_key, str, 0
+        => |s, d, len| {
+            if parse_hex_into(core::slice::from_raw_parts(d, len), &mut s.cid_route_key) {
+                s.cid_route_on = true;
+            }
+        };
+    22, cid_route, str, 0
+        => |s, d, len| {
+            let _ = parse_hex_into(core::slice::from_raw_parts(d, len), &mut s.cid_route_token);
+        };
+    23, cid_route_rot, u8, 0
+        => |s, d, len| { s.cid_route_rot = p_u8(d, len, 0, 0) & 3; };
+    // Client mode: once the connection to the authority is gone (closed by
+    // either end, lost to silence, or never established), dial it again
+    // after this many milliseconds. 0 (the default) dials once.
+    24, redial_ms, u32, 0
+        => |s, d, len| { s.redial_ms = p_u32(d, len, 0, 0); };
+    // The idle timeout advertised (`max_idle_timeout`, RFC 9000 §10.1); a
+    // connection keeps the smaller of it and the peer's, raised to at least
+    // three times its current PTO, and one that hears nothing that long
+    // ends silently. 0 advertises none (the peer's, if any, applies). A link with an application keepalive can ask for a
+    // short one, so a connection whose peer is gone ends in seconds and a
+    // client with `redial_ms` dials a fresh one.
+    25, idle_timeout_ms, u32, 30000
+        => |s, d, len| { s.idle_timeout_ms = p_u32(d, len, 0, 30000); };
+}
+
+/// Exactly `out.len()` bytes of hex (a NUL ends the text).
+fn parse_hex_into(t: &[u8], out: &mut [u8]) -> bool {
+    let t = t.split(|&b| b == 0).next().unwrap_or(&[]);
+    if t.len() != out.len() * 2 {
+        return false;
+    }
+    let hv = |b: u8| match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    };
+    for i in 0..out.len() {
+        match (hv(t[2 * i]), hv(t[2 * i + 1])) {
+            (Some(a), Some(b)) => out[i] = (a << 4) | b,
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Read and drop `n` bytes of `ch`.
+unsafe fn dg_skip(sys: &SyscallTable, ch: i32, mut n: usize) {
+    let mut b = [0u8; 64];
+    while n > 0 {
+        let r = (sys.channel_read)(ch, b.as_mut_ptr(), n.min(64));
+        if r <= 0 {
+            return;
+        }
+        n -= r as usize;
+    }
+}
+
+/// Mint one of this server's connection IDs into `cid`: a routable one
+/// under `cid_route_key`, else random. Its length, or 0 with no entropy.
+unsafe fn mint_server_cid(s: &mut QuicState, cid: &mut [u8; MAX_CID_LEN]) -> u8 {
+    let sys = &*s.syscalls;
+    if s.cid_route_on {
+        let mut nonce = [0u8; 4];
+        if !csprng_fill_nonzero(sys, nonce.as_mut_ptr(), 4) {
+            return 0;
+        }
+        let id = cid_route_mint(
+            &s.cid_route_key,
+            s.cid_route_rot,
+            &nonce,
+            &s.cid_route_token,
+        );
+        cid[..CID_ROUTE_LEN].copy_from_slice(&id);
+        return CID_ROUTE_LEN as u8;
+    }
+    if !csprng_fill_nonzero(sys, cid.as_mut_ptr(), 8) {
+        return 0;
+    }
+    8
 }
 
 /// Longest `authority` accepted: a host of up to [`MAX_PEER_NAME`] bytes
@@ -658,6 +765,9 @@ pub unsafe extern "C" fn module_new(
     s.port = 4443;
     s.mode = 1;
     s.client_started = false;
+    s.redial_ms = 0;
+    s.redial_at = 0;
+    s.idle_timeout_ms = 30_000;
     s.require_retry = 0;
     s.enable_0rtt = 0;
     s.ecdh_bits_per_step = 256;
@@ -826,19 +936,20 @@ pub unsafe extern "C" fn module_new(
 // Format:
 //   expiry_ms_le[8] || peer_ip[4] || peer_port_le[2] || odcid_len[1]
 //                  || odcid[N (0..20)] || hmac_sha256(retry_secret, all_above)[..16]
-// Total: 8 + 4 + 2 + 1 + N + 16 ≤ 51 bytes for N ≤ 20.
+// Total: 8 + 16 + 2 + 1 + N + 16 ≤ 63 bytes for N ≤ 20 (the address in
+// its sixteen-byte form, IPv4-mapped for IPv4).
 // ---------------------------------------------------------------------
 
 const RETRY_TOKEN_LIFETIME_MS: u64 = 5_000;
 
 unsafe fn build_retry_token(
     s: &QuicState,
-    peer_ip: &[u8; 4],
+    peer_ip: &[u8; 16],
     peer_port: u16,
     odcid: &[u8],
     out: &mut [u8],
 ) -> usize {
-    if odcid.len() > MAX_CID_LEN || out.len() < 8 + 4 + 2 + 1 + odcid.len() + 16 {
+    if odcid.len() > MAX_CID_LEN || out.len() < 8 + 16 + 2 + 1 + odcid.len() + 16 {
         return 0;
     }
     let now = dev_millis(&*s.syscalls);
@@ -847,8 +958,8 @@ unsafe fn build_retry_token(
     let exp_bytes = expiry.to_le_bytes();
     out[p..p + 8].copy_from_slice(&exp_bytes);
     p += 8;
-    out[p..p + 4].copy_from_slice(peer_ip);
-    p += 4;
+    out[p..p + 16].copy_from_slice(peer_ip);
+    p += 16;
     out[p..p + 2].copy_from_slice(&peer_port.to_le_bytes());
     p += 2;
     out[p] = odcid.len() as u8;
@@ -869,19 +980,19 @@ unsafe fn build_retry_token(
 unsafe fn validate_retry_token(
     s: &QuicState,
     token: &[u8],
-    peer_ip: &[u8; 4],
+    peer_ip: &[u8; 16],
     peer_port: u16,
     odcid_out: &mut [u8; MAX_CID_LEN],
 ) -> Option<usize> {
-    if token.len() < 8 + 4 + 2 + 1 + 16 {
+    if token.len() < 8 + 16 + 2 + 1 + 16 {
         return None;
     }
-    let odcid_len_off = 8 + 4 + 2;
+    let odcid_len_off = 8 + 16 + 2;
     let odcid_len = token[odcid_len_off] as usize;
     if odcid_len > MAX_CID_LEN {
         return None;
     }
-    let body_len = 8 + 4 + 2 + 1 + odcid_len;
+    let body_len = 8 + 16 + 2 + 1 + odcid_len;
     if token.len() < body_len + 16 {
         return None;
     }
@@ -911,10 +1022,10 @@ unsafe fn validate_retry_token(
         return None;
     }
     // Check peer match.
-    if &token[8..12] != peer_ip {
+    if &token[8..24] != peer_ip {
         return None;
     }
-    let port_bytes: [u8; 2] = [token[12], token[13]];
+    let port_bytes: [u8; 2] = [token[24], token[25]];
     let token_port = u16::from_le_bytes(port_bytes);
     if token_port != peer_port {
         return None;
@@ -1306,11 +1417,31 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
         NET_BUF_SIZE,
     );
 
+    // Client mode with `redial_ms`: no connection live any more, so dial
+    // the authority again once the interval has passed.
+    if s.mode == 0 && s.redial_ms != 0 && s.client_started {
+        let live = s
+            .conns
+            .iter()
+            .any(|c| matches!(c.phase, ConnPhase::Handshaking | ConnPhase::Established));
+        let now = dev_millis(sys).max(1);
+        if live {
+            s.redial_at = 0;
+        } else if s.redial_at == 0 {
+            s.redial_at = now + u64::from(s.redial_ms);
+        } else if now >= s.redial_at {
+            s.redial_at = 0;
+            s.client_started = false;
+            let m = b"[quic] redialling the authority";
+            dev_log(sys, 3, m.as_ptr(), m.len());
+        }
+    }
+
     // Client mode: kick off the handshake by allocating a connection,
     // queueing a ClientHello in driver.out_buf, and emitting the
     // first Initial packet.
     if s.mode == 0 && !s.client_started && s.endpoint.is_ready() {
-        let ip = s.peer_v4;
+        let ip = ip_mapped(s.peer_v4);
         if let Some(idx) = alloc_client_connection(s, &ip, s.peer_port) {
             // Drive far enough to get the ClientHello queued.
             let mut steps = 0;
@@ -1389,14 +1520,36 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     }
                 }
                 x if x == DG_MSG_RX_FROM => {
-                    // MSG_DG_RX_FROM IPv4 payload (datagram contract):
-                    //   [ep_id:1][af:1=4][src_addr:4 BE][src_port:2 LE][data].
-                    if payload_len >= 8 {
-                        let mut hb = [0u8; 8];
-                        (sys.channel_read)(s.net_in, hb.as_mut_ptr(), 8);
-                        let ip = [hb[2], hb[3], hb[4], hb[5]];
-                        let port = (hb[6] as u16) | ((hb[7] as u16) << 8);
-                        let dlen = payload_len - 8;
+                    // MSG_DG_RX_FROM payload (datagram contract):
+                    //   [ep_id:1][af:1=4][src_addr:4 BE][src_port:2 LE][data]
+                    //   [ep_id:1][af:1=6][src_addr:16][src_port:2 LE][data]
+                    // The address is held sixteen bytes wide, IPv4 mapped.
+                    let mut hb = [0u8; 20];
+                    let mut hlen = 0usize;
+                    if payload_len >= 2 {
+                        (sys.channel_read)(s.net_in, hb.as_mut_ptr(), 2);
+                        hlen = if hb[1] == 6 { 20 } else { 8 };
+                        if payload_len >= hlen {
+                            (sys.channel_read)(s.net_in, hb.as_mut_ptr().add(2), hlen - 2);
+                        } else {
+                            dg_skip(sys, s.net_in, payload_len - 2);
+                            hlen = 0;
+                        }
+                    } else if payload_len > 0 {
+                        dg_skip(sys, s.net_in, payload_len);
+                    }
+                    if hlen > 0 {
+                        let (ip, port) = if hlen == 20 {
+                            let mut a = [0u8; 16];
+                            a.copy_from_slice(&hb[2..18]);
+                            (a, (hb[18] as u16) | ((hb[19] as u16) << 8))
+                        } else {
+                            (
+                                ip_mapped([hb[2], hb[3], hb[4], hb[5]]),
+                                (hb[6] as u16) | ((hb[7] as u16) << 8),
+                            )
+                        };
+                        let dlen = payload_len - hlen;
                         if dlen <= QUIC_DGRAM_MAX {
                             // Peek the first 32 bytes to extract DCID
                             // for connection demux.
@@ -1415,8 +1568,12 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                         dcid_buf[..dl].copy_from_slice(&peek[6..6 + dl]);
                                     }
                                 } else if 8 < peek_len {
-                                    dcid_len = 8;
-                                    dcid_buf[..8].copy_from_slice(&peek[1..9]);
+                                    // A short header's ID is as long as the
+                                    // one this endpoint issued (8, or a
+                                    // routable 19): match on the longest
+                                    // prefix that can be.
+                                    dcid_len = (peek_len - 1).min(MAX_CID_LEN);
+                                    dcid_buf[..dcid_len].copy_from_slice(&peek[1..1 + dcid_len]);
                                 }
                             }
                             let mut idx = if dcid_len > 0 {
@@ -1567,6 +1724,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
             let reason: &[u8] = match code {
                 ERR_STREAM_LIMIT => b"stream limit",
                 ERR_CONNECTION_ID_LIMIT => b"connection id limit",
+                ERR_TRANSPORT_PARAMETER => b"transport parameter",
                 _ => b"protocol violation",
             };
             emit_connection_close(s, i, code, 0, reason);
@@ -1582,11 +1740,20 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
         if s.conns[i].phase == ConnPhase::Handshaking || s.conns[i].phase == ConnPhase::Established
         {
             quic_pto_check(s, i);
-            // Silently close on `idle_timeout_ms` of no activity
-            // (RFC 9000 §10.1 allows closing without notification).
+            // Silently close after the idle timeout in force — the
+            // negotiated one, at least three PTOs — with no activity
+            // (RFC 9000 §10.1 allows closing without notification). A
+            // taken-over connection that has not yet heard its peer ends at
+            // the deadline the primary's timer left it instead.
             let last = s.conns[i].last_activity_ms;
-            let limit = s.conns[i].idle_timeout_ms;
-            if last > 0 && limit > 0 && now_ms_top.saturating_sub(last) > limit {
+            let limit = s.conns[i].idle_timeout_in_force();
+            let first = s.conns[i].idle_first_deadline_ms;
+            let idle = if first != 0 {
+                now_ms_top >= first
+            } else {
+                last > 0 && limit > 0 && now_ms_top.saturating_sub(last) > limit
+            };
+            if idle {
                 s.conns[i].phase = ConnPhase::Closed;
                 let msg = b"[quic] idle timeout";
                 dev_log(sys, 3, msg.as_ptr(), msg.len());
@@ -1804,7 +1971,6 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 && s.conns[i].handshake_confirmed
                 && !s.conns[i].alt_cid_issued
             {
-                let conn = &mut s.conns[i];
                 // The spare CID and its stateless-reset token are minted from
                 // the CSPRNG, and BOTH fills must succeed before the frame is
                 // queued. An unchecked fill on a platform whose entropy source
@@ -1824,11 +1990,16 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 // spare CID is an offer the peer's active_connection_id_limit
                 // invites but does not require, so declining it for the
                 // connection's lifetime is correct.
-                let cid_ok = csprng_fill_nonzero(sys, conn.alt_cid.as_mut_ptr(), 8);
+                let mut cid = [0u8; MAX_CID_LEN];
+                let clen = mint_server_cid(s, &mut cid);
+                let conn = &mut s.conns[i];
+                let sys = &*s.syscalls;
+                let cid_ok = clen != 0;
+                conn.alt_cid = cid;
                 let tok_ok = csprng_fill_nonzero(sys, conn.alt_cid_reset_token.as_mut_ptr(), 16);
                 conn.alt_cid_issued = true;
                 if cid_ok && tok_ok {
-                    conn.alt_cid_len = 8;
+                    conn.alt_cid_len = clen;
                     conn.alt_cid_seq = conn.next_cid_seq;
                     conn.next_cid_seq += 1;
                     conn.new_cid_tx_pending = true;
@@ -2885,6 +3056,15 @@ unsafe fn mux_apply_command(s: &mut QuicState, mt: u8, payload: &[u8]) -> bool {
             if payload.len() < mux::STREAM_DATA_PREFIX {
                 return true;
             }
+            // A write for a connection that has ended goes nowhere: the
+            // application was told (MSG_MUX_SESSION_CLOSED), and holding
+            // it would keep every command behind it waiting for good.
+            if !matches!(
+                s.conns[cid].phase,
+                ConnPhase::Handshaking | ConnPhase::Established
+            ) {
+                return true;
+            }
             let data = &payload[mux::STREAM_DATA_PREFIX..];
             if stream_send_closed(s, cid, handle) {
                 // The send half is closed, so its final size is fixed
@@ -2960,8 +3140,13 @@ unsafe fn mux_apply_command(s: &mut QuicState, mt: u8, payload: &[u8]) -> bool {
             // The application is done with the session. Move it to
             // Closed; the idle sweep emits the close frame and frees the
             // slot, and `mux_emit_session_closed` tells the application
-            // it happened.
-            s.conns[cid].phase = ConnPhase::Closed;
+            // it happened. A session already over is left as it is.
+            if matches!(
+                s.conns[cid].phase,
+                ConnPhase::Handshaking | ConnPhase::Established
+            ) {
+                s.conns[cid].phase = ConnPhase::Closed;
+            }
         }
         _ => {}
     }
@@ -3184,7 +3369,7 @@ unsafe fn emit_conn_span(s: &mut QuicState, idx: usize) {
 /// is what makes the connection ceiling a bounded envelope rather than a
 /// hang (RFC 9000 §5.2.2 permits a stateless close for an unwanted
 /// connection attempt).
-unsafe fn emit_stateless_refusal(s: &mut QuicState, ip: &[u8; 4], port: u16, dgram: &[u8]) {
+unsafe fn emit_stateless_refusal(s: &mut QuicState, ip: &[u8; 16], port: u16, dgram: &[u8]) {
     // Only a long-header v1 Initial earns a reply; anything else is stray
     // traffic and stays dropped.
     if dgram.len() < 7 || dgram[0] & 0xF0 != 0xC0 {
@@ -3276,8 +3461,21 @@ unsafe fn send_datagram(
             NET_BUF_SIZE,
         ) != 0;
     }
-    // `peer.ip` is wire-order octets; `send_to` re-serialises via `to_be_bytes`.
-    let dst_ip = u32::from_be_bytes(peer.ip);
+    // An IPv6 peer goes out as `af = 6`; an IPv4 one (held IPv4-mapped) as
+    // `af = 4`, its octets wire order.
+    let Some(v4) = ip_v4_of(&peer.ip) else {
+        return ep.send_to6(
+            sys,
+            net_out,
+            &peer.ip,
+            peer.port,
+            bytes.as_ptr(),
+            bytes.len(),
+            scratch.as_mut_ptr(),
+            NET_BUF_SIZE,
+        ) != 0;
+    };
+    let dst_ip = u32::from_be_bytes(v4);
     ep.send_to(
         sys,
         net_out,
@@ -3294,7 +3492,7 @@ unsafe fn send_datagram(
 // Connection allocation / lookup
 // ---------------------------------------------------------------------
 
-fn find_conn(s: &QuicState, ip: &[u8; 4], port: u16) -> i32 {
+fn find_conn(s: &QuicState, ip: &[u8; 16], port: u16) -> i32 {
     let mut i = 0;
     while i < MAX_CONNS {
         if s.conns[i].phase != ConnPhase::Idle && s.conns[i].peer.matches(ip, port) {
@@ -3381,7 +3579,26 @@ unsafe fn csprng_fill_nonzero(sys: &SyscallTable, buf: *mut u8, len: usize) -> b
     false
 }
 
-unsafe fn alloc_server_connection(s: &mut QuicState, ip: &[u8; 4], port: u16) -> Option<usize> {
+/// A client connection's opening connection IDs, both random: `our_cid`
+/// (the SCID it sends) and `peer_cid` (the DCID it sends until the server
+/// picks its own), which is also the original DCID both sides derive the
+/// Initial keys from. False when the CSPRNG cannot supply either — a
+/// predictable original DCID would make the Initial keys predictable, so
+/// the caller makes no connection rather than start a handshake with one.
+unsafe fn client_cids(sys: &SyscallTable, conn: &mut QuicConnection) -> bool {
+    if !csprng_fill_nonzero(sys, conn.our_cid.as_mut_ptr(), 8)
+        || !csprng_fill_nonzero(sys, conn.peer_cid.as_mut_ptr(), 8)
+    {
+        return false;
+    }
+    conn.our_cid_len = 8;
+    conn.peer_cid_len = 8;
+    conn.original_dcid[..8].copy_from_slice(&conn.peer_cid[..8]);
+    conn.original_dcid_len = 8;
+    true
+}
+
+unsafe fn alloc_server_connection(s: &mut QuicState, ip: &[u8; 16], port: u16) -> Option<usize> {
     let framed = s.alpn_cfg_len > 0;
     // Snapshot the sampling rate before borrowing a connection slot mutably.
     let permille = s.sample_permille;
@@ -3422,12 +3639,19 @@ unsafe fn alloc_server_connection(s: &mut QuicState, ip: &[u8; 4], port: u16) ->
             conn.driver.hs_state = HandshakeState::RecvClientHello;
             conn.driver.suite = CipherSuite::ChaCha20Poly1305;
 
-            // Pick our SCID (random 8 bytes).
-            let sys = &*s.syscalls;
-            if !csprng_fill_nonzero(sys, conn.our_cid.as_mut_ptr(), 8) {
+            // Pick our SCID: routable under `cid_route_key`, else random;
+            // with no entropy for either, no connection is made.
+            let mut cid = [0u8; MAX_CID_LEN];
+            let n = mint_server_cid(s, &mut cid);
+            let conn = &mut s.conns[i];
+            if n == 0 {
                 s.rng_cid_fail = s.rng_cid_fail.wrapping_add(1);
+                conn.reset();
+                return None;
             }
-            conn.our_cid_len = 8;
+            conn.our_cid = cid;
+            conn.our_cid_len = n;
+            let sys = &*s.syscalls;
 
             // Observability: mint the `quic.connection` root trace context and
             // start the span clock when telemetry is wired. Head-sampling is
@@ -3465,7 +3689,7 @@ fn ticket_is_for(entry: &ClientTicketEntry, authority: &[u8]) -> bool {
 /// emission as soon as the early-traffic keys are installed.
 unsafe fn alloc_resumption_connection(s: &mut QuicState) -> Option<usize> {
     let framed = s.alpn_cfg_len > 0;
-    let ip = s.peer_v4;
+    let ip = ip_mapped(s.peer_v4);
     let port = s.peer_port;
     // Find the matching client_ticket entry.
     let mut tix = MAX_TICKETS;
@@ -3500,16 +3724,15 @@ unsafe fn alloc_resumption_connection(s: &mut QuicState) -> Option<usize> {
             conn.framed_app_surface = framed;
             conn.driver.hs_state = HandshakeState::SendClientHello;
             conn.driver.suite = CipherSuite::ChaCha20Poly1305;
-            // Pick fresh CIDs.
+            // Pick fresh CIDs. Without entropy for both, no connection is
+            // made: the slot goes back to idle and the resumption is tried
+            // again on a later tick.
             let sys = &*s.syscalls;
-            if !csprng_fill_nonzero(sys, conn.our_cid.as_mut_ptr(), 8) {
+            if !client_cids(sys, conn) {
+                conn.reset();
                 s.rng_cid_fail = s.rng_cid_fail.wrapping_add(1);
+                return None;
             }
-            conn.our_cid_len = 8;
-            dev_csprng_fill(sys, conn.peer_cid.as_mut_ptr(), 8);
-            conn.peer_cid_len = 8;
-            conn.original_dcid[..8].copy_from_slice(&conn.peer_cid[..8]);
-            conn.original_dcid_len = 8;
             // Install Initial keys from the original DCID.
             let mut dcid_copy = [0u8; MAX_CID_LEN];
             core::ptr::copy_nonoverlapping(conn.peer_cid.as_ptr(), dcid_copy.as_mut_ptr(), 8);
@@ -3537,7 +3760,7 @@ unsafe fn alloc_resumption_connection(s: &mut QuicState) -> Option<usize> {
     None
 }
 
-unsafe fn alloc_client_connection(s: &mut QuicState, ip: &[u8; 4], port: u16) -> Option<usize> {
+unsafe fn alloc_client_connection(s: &mut QuicState, ip: &[u8; 16], port: u16) -> Option<usize> {
     let framed = s.alpn_cfg_len > 0;
     let mut i = 0;
     while i < MAX_CONNS {
@@ -3563,15 +3786,14 @@ unsafe fn alloc_client_connection(s: &mut QuicState, ip: &[u8; 4], port: u16) ->
             //   peer_cid placeholder (DCID we send) — also random; this
             //     becomes the server-side "original DCID" used to derive
             //     Initial keys on both sides.
+            // Without entropy for both, no connection is made: the slot goes
+            // back to idle and the dial is tried again on a later tick.
             let sys = &*s.syscalls;
-            if !csprng_fill_nonzero(sys, conn.our_cid.as_mut_ptr(), 8) {
+            if !client_cids(sys, conn) {
+                conn.reset();
                 s.rng_cid_fail = s.rng_cid_fail.wrapping_add(1);
+                return None;
             }
-            conn.our_cid_len = 8;
-            dev_csprng_fill(sys, conn.peer_cid.as_mut_ptr(), 8);
-            conn.peer_cid_len = 8;
-            conn.original_dcid[..8].copy_from_slice(&conn.peer_cid[..8]);
-            conn.original_dcid_len = 8;
 
             // Install Initial keys from the original DCID. Snapshot
             // into a stack array so we don't borrow conn while passing
@@ -3624,7 +3846,8 @@ pub mod test_helpers {
     ///
     /// # Safety
     /// `state` must point to a fully-initialised `QuicState`.
-    pub unsafe fn admit_from(state: *mut u8, ip: [u8; 4], port: u16, dgram: &[u8]) -> i32 {
+    pub unsafe fn admit_from(state: *mut u8, ip4: [u8; 4], port: u16, dgram: &[u8]) -> i32 {
+        let ip = super::ip_mapped(ip4);
         let s = &mut *(state as *mut QuicState);
         let mut dcid_buf = [0u8; super::MAX_CID_LEN];
         let mut dcid_len = 0usize;
@@ -3779,7 +4002,7 @@ pub mod test_helpers {
         if idx >= MAX_CONNS {
             return [0; 4];
         }
-        s.conns[idx].peer.ip
+        super::ip_v4_of(&s.conns[idx].peer.ip).unwrap_or([0; 4])
     }
 
     /// Mark the datagram endpoint bound (endpoint id 0) without a
@@ -3829,6 +4052,20 @@ pub mod test_helpers {
     pub unsafe fn path_validating(state: *const u8, idx: usize) -> bool {
         let s = &*(state as *const QuicState);
         idx < MAX_CONNS && s.conns[idx].path_validating
+    }
+
+    /// Whether client mode has dialled (or is due no redial yet), and set it
+    /// — a test that stands a connection up by `setup_established` marks
+    /// the dial made, as the start path would have.
+    ///
+    /// # Safety
+    /// `state` points to an initialised `QuicState`.
+    pub unsafe fn client_started(state: *mut u8, set: Option<bool>) -> bool {
+        let s = &mut *(state as *mut QuicState);
+        if let Some(v) = set {
+            s.client_started = v;
+        }
+        s.client_started
     }
 
     /// Debug snapshot of connection `idx`: `(phase_code, handshake_confirmed)`.
@@ -3904,7 +4141,7 @@ pub mod test_helpers {
         conn.is_server = is_server;
         conn.handshake_confirmed = true;
         conn.peer = PeerAddr {
-            ip: peer_ip,
+            ip: super::ip_mapped(peer_ip),
             port: peer_port,
         };
         conn.our_cid_len = 8;
@@ -3953,7 +4190,7 @@ pub mod test_helpers {
         payload: &[u8],
     ) {
         let s = &mut *(state as *mut QuicState);
-        s.conns[idx].recv_ip = src_ip;
+        s.conns[idx].recv_ip = super::ip_mapped(src_ip);
         s.conns[idx].recv_port = src_port;
         let mut np = false;
         super::process_frames(&mut s.conns[idx], EncLevel::OneRtt, payload, 1, &mut np);
@@ -3991,7 +4228,7 @@ pub mod test_helpers {
     ) -> bool {
         let s = &mut *(state as *mut QuicState);
         let migration_enabled = s.disable_migration == 0;
-        s.conns[idx].recv_ip = src_ip;
+        s.conns[idx].recv_ip = super::ip_mapped(src_ip);
         s.conns[idx].recv_port = src_port;
         // The datagram a short-header packet carrying `payload` makes: first
         // byte, 8-byte connection ID, 4-byte packet number, AEAD tag.
@@ -4037,6 +4274,155 @@ pub mod test_helpers {
         t.ranges[..t.count as usize]
             .iter()
             .any(|r| r.low <= pn && pn <= r.high)
+    }
+
+    /// Set connection `idx`'s idle timeout (`setup_established` turns it
+    /// off), for a test about one.
+    ///
+    /// # Safety
+    /// `state` points to an initialised `QuicState`; `idx < MAX_CONNS`.
+    pub unsafe fn set_idle_timeout(state: *mut u8, idx: usize, ms: u64) {
+        let s = &mut *(state as *mut QuicState);
+        s.conns[idx].idle_timeout_ms = ms;
+    }
+
+    /// Feed connection `idx`'s RTT estimator one sample of `rtt_ms`, as
+    /// the first acknowledgement on a path of that round trip does, for a
+    /// test whose timing follows the PTO.
+    ///
+    /// # Safety
+    /// `state` points to an initialised `QuicState`; `idx < MAX_CONNS`.
+    pub unsafe fn seed_rtt(state: *mut u8, idx: usize, rtt_ms: u32) {
+        let s = &mut *(state as *mut QuicState);
+        s.conns[idx].rtt.update(rtt_ms, 0);
+    }
+
+    /// The 1-RTT floor connection `idx`'s checkpoint carries: its
+    /// reservation high-water, or the send counter when that is ahead.
+    ///
+    /// # Safety
+    /// `state` points to an initialised `QuicState`; `idx < MAX_CONNS`.
+    pub unsafe fn cont_floor(state: *const u8, idx: usize) -> u64 {
+        let c = &(*(state as *const QuicState)).conns[idx];
+        c.send_pn_res.high_water().max(c.one_rtt.next_send_pn)
+    }
+
+    /// Connection `idx`'s RTT estimate: `(latest_rtt, smoothed_rtt, rttvar,
+    /// min_rtt)` in milliseconds.
+    ///
+    /// # Safety
+    /// `state` points to an initialised `QuicState`; `idx < MAX_CONNS`.
+    pub unsafe fn rtt_view(state: *const u8, idx: usize) -> (u32, u32, u32, u32) {
+        let r = &(*(state as *const QuicState)).conns[idx].rtt;
+        (r.latest_rtt, r.smoothed_rtt, r.rttvar, r.min_rtt)
+    }
+
+    /// Record an ack-eliciting packet `pn` as sent now in connection
+    /// `idx`'s space `level` (0 Initial, 1 Handshake, 2 1-RTT), for a test
+    /// that acknowledges it.
+    ///
+    /// # Safety
+    /// `state` points to an initialised `QuicState`, inside the module's
+    /// syscall scope; `idx < MAX_CONNS`.
+    pub unsafe fn track_sent(state: *mut u8, idx: usize, level: u8, pn: u64) {
+        let s = &mut *(state as *mut QuicState);
+        let now = super::dev_millis(&*s.syscalls);
+        let c = &mut s.conns[idx];
+        let space = match level {
+            0 => &mut c.initial,
+            1 => &mut c.handshake,
+            _ => &mut c.one_rtt,
+        };
+        let _ = space.record_sent(super::SentPacket {
+            pn,
+            bytes: 100,
+            sent_ms: now,
+            ack_eliciting: true,
+            in_flight: true,
+            live: true,
+        });
+        c.bytes_in_flight += 100;
+    }
+
+    /// Feed `payload`'s frames to connection `idx` at space `level` (0
+    /// Initial, 1 Handshake, 2 1-RTT), through the production dispatcher.
+    ///
+    /// # Safety
+    /// `state` points to an initialised `QuicState`, inside the module's
+    /// syscall scope; `idx < MAX_CONNS`.
+    pub unsafe fn feed_frames_at(state: *mut u8, idx: usize, level: u8, payload: &[u8]) {
+        let s = &mut *(state as *mut QuicState);
+        let now = super::dev_millis(&*s.syscalls);
+        let level = match level {
+            0 => super::EncLevel::Initial,
+            1 => super::EncLevel::Handshake,
+            _ => super::EncLevel::OneRtt,
+        };
+        let mut np = false;
+        super::process_frames(&mut s.conns[idx], level, payload, now, &mut np);
+    }
+
+    /// Set whether connection `idx`'s handshake is confirmed.
+    ///
+    /// # Safety
+    /// `state` points to an initialised `QuicState`; `idx < MAX_CONNS`.
+    pub unsafe fn set_handshake_confirmed(state: *mut u8, idx: usize, confirmed: bool) {
+        (*(state as *mut QuicState)).conns[idx].handshake_confirmed = confirmed;
+    }
+
+    /// The ACK Delay field a 1-RTT ACK frame from connection `idx` would
+    /// carry now.
+    ///
+    /// # Safety
+    /// `state` points to an initialised `QuicState`, inside the module's
+    /// syscall scope; `idx < MAX_CONNS`.
+    pub unsafe fn one_rtt_ack_delay_field(state: *const u8, idx: usize) -> u64 {
+        let s = &*(state as *const QuicState);
+        s.conns[idx]
+            .one_rtt
+            .ack_tracker
+            .ack_delay_field(super::dev_millis(&*s.syscalls))
+    }
+
+    /// Take `tp` as the peer's transport parameters on connection `idx`,
+    /// as a handshake does once they are validated.
+    ///
+    /// # Safety
+    /// `state` points to an initialised `QuicState`; `idx < MAX_CONNS`.
+    pub unsafe fn apply_peer_transport_params(state: *mut u8, idx: usize, tp: &[u8]) {
+        let s = &mut *(state as *mut QuicState);
+        let lim = super::parse_peer_transport_limits(tp);
+        super::apply_peer_transport_limits(&mut s.conns[idx], &lim);
+    }
+
+    /// Connection `idx`'s current application-data Probe Timeout in
+    /// milliseconds (RFC 9002 §6.2.1, without backoff; the peer's
+    /// `max_ack_delay` included).
+    ///
+    /// # Safety
+    /// `state` points to an initialised `QuicState`; `idx < MAX_CONNS`.
+    pub unsafe fn pto_ms(state: *const u8, idx: usize) -> u64 {
+        let s = &*(state as *const QuicState);
+        u64::from(s.conns[idx].pto_app())
+    }
+
+    /// Connection `idx`'s idle timeout in force (the negotiated one, at
+    /// least three PTOs; 0 none).
+    ///
+    /// # Safety
+    /// `state` points to an initialised `QuicState`; `idx < MAX_CONNS`.
+    pub unsafe fn idle_timeout_in_force(state: *const u8, idx: usize) -> u64 {
+        let s = &*(state as *const QuicState);
+        s.conns[idx].idle_timeout_in_force()
+    }
+
+    /// Whether connection `idx` owes the peer a 1-RTT acknowledgement now.
+    ///
+    /// # Safety
+    /// `state` points to an initialised `QuicState`; `idx < MAX_CONNS`.
+    pub unsafe fn one_rtt_ack_owed(state: *const u8, idx: usize) -> bool {
+        let s = &*(state as *const QuicState);
+        s.conns[idx].one_rtt.ack_pending
     }
 
     /// What a test observes of connection `idx`: its paths, connection IDs,
@@ -4281,10 +4667,10 @@ pub mod test_helpers {
         c.handshake_confirmed = true;
         c.framed_app_surface = true;
         c.peer = PeerAddr {
-            ip: peer_ip,
+            ip: super::ip_mapped(peer_ip),
             port: peer_port,
         };
-        c.recv_ip = peer_ip;
+        c.recv_ip = super::ip_mapped(peer_ip);
         c.recv_port = peer_port;
         let on = our_cid.len().min(super::MAX_CID_LEN);
         c.our_cid[..on].copy_from_slice(&our_cid[..on]);
@@ -4467,7 +4853,7 @@ pub mod test_helpers {
         record: &[u8],
     ) -> u8 {
         let s = &mut *(state as *mut QuicState);
-        let handle = super::cont_vault_key(s);
+        let handle = super::cont_vault_key(s, flow, epoch);
         let sys = &*s.syscalls;
         let st = import_checkpoint(sys, handle, &mut s.conns[idx], flow, epoch, record);
         if st == 0 {
@@ -4600,6 +4986,29 @@ pub mod test_helpers {
     pub unsafe fn cont_cids(state: *const u8, idx: usize) -> ([u8; 20], [u8; 20], [u8; 20]) {
         let c = &(*(state as *const QuicState)).conns[idx];
         (c.our_cid, c.peer_cid, c.original_dcid)
+    }
+
+    /// Connection `idx`'s path: `(validating, validated, allowance)`, the
+    /// allowance the anti-amplification bound gives toward its peer.
+    ///
+    /// # Safety
+    /// `state` points to an initialised `QuicState`; `idx < MAX_CONNS`.
+    pub unsafe fn cont_path(state: *const u8, idx: usize) -> (bool, bool, u64) {
+        let c = &(*(state as *const QuicState)).conns[idx];
+        (
+            c.path_validating,
+            c.peer_validated,
+            c.amp_allowance(&c.peer),
+        )
+    }
+
+    /// The flow identity the anchor surface names connection `idx` by.
+    ///
+    /// # Safety
+    /// `state` points to an initialised `QuicState`; `idx < MAX_CONNS`.
+    pub unsafe fn cont_flow_id_of(state: *const u8, idx: usize) -> [u8; 16] {
+        let c = &(*(state as *const QuicState)).conns[idx];
+        super::quic_flow_id(&c.our_cid[..c.our_cid_len as usize])
     }
 
     /// RETIRE connection `idx`, zeroizing its secrets.

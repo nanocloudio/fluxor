@@ -1,0 +1,71 @@
+version = "1.0.0"
+hardware_targets = ["bcm2712", "linux"]
+# Moves records as they come; nothing here is timed.
+timer_class = "agnostic"
+
+# The decision seam's forward port shared by up to four frame-level modules
+# beside `ip` on one NIC (a chain hop, an attachment tunnel end, a rescue
+# tunnel): `ip.packet_fwd -> fwd_split.frames_in`, each output to one
+# module's forward input. A `MSG_PKT_FORWARD` record goes to every output
+# whose list names its disposition (`contracts/net/packet.rs`
+# `disposition`, COPY flag cleared: 3 TUNNEL, 4 DSR, 5 MIRROR, 6 CHAIN),
+# whole; anything else is dropped and counted. Records leave in the order
+# they came: one an output cannot take yet holds the stream, so back
+# pressure reaches `ip` and nothing is reordered or lost. A record longer
+# than an output's buffer (16384 bytes), which no output could take whole,
+# is dropped and counted. The modules' frames
+# go out through the NIC's `frames_tx` merge beside `ip.frames_tx`
+# (`network.md` §A frame-level module beside `ip` on one NIC).
+#
+# The heartbeat line `[fwd_split] frames=<n> dropped=<n> oversize=<n>` is
+# logged when a count changes, at most once every 4096 steps.
+#
+# ─── Parameters (TLV) ──────────────────────────────────────────────────
+# | Tag | Name | Type | Default | Description |
+# |-----|------|------|---------|-------------|
+# | 1   | out0 | str  | —       | The dispositions `out0` takes: hex bytes, comma-separated (`3,6`). |
+# | 2   | out1 | str  | —       | Likewise for `out1`. |
+# | 3   | out2 | str  | —       | Likewise for `out2`. |
+# | 4   | out3 | str  | —       | Likewise for `out3`. |
+# | 5   | raw  | u8   | 0       | Bit N: `outN` is handed each record's payload without its header. |
+
+[[ports]]
+name = "frames_in"
+direction = "input"
+content_type = "OctetStream"
+required = true
+buffer_size = 32768
+
+[[ports]]
+name = "out0"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 16384
+
+[[ports]]
+name = "out1"
+index = 1
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 16384
+
+[[ports]]
+name = "out2"
+index = 2
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 16384
+
+[[ports]]
+name = "out3"
+index = 3
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 16384
+
+[[resources]]
+requires_contract = "channel"
+access = "read"
+
+[observability]
+exempt = "a splitter of the seam's forward stream — the frames it moves are observed by ip, which forwarded them, and by the module each reaches"

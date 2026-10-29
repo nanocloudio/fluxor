@@ -403,7 +403,8 @@ pub const ATTEST_COMPOSITION: u32 = 0x100F;
 /// record. Output: `["FXKW"][eph_pub:65][attest_digest:32][nonce:12][sealed][tag:16]`,
 /// `sealed` being `[suite:u16][usage:u32][key_len:u8][key]` under a key
 /// derived from an ephemeral ECDH with `dest_pub`, salted by
-/// `attest_digest`. Returns 0, or `-ERANGE`.
+/// `attest_digest`, and authenticated with every header byte before it
+/// (magic to nonce) as AAD. Returns 0, or `-ERANGE`.
 ///
 /// The key never appears in the clear on any surface: only the vault
 /// holding `dest_pub`'s private half can open it, and only while its

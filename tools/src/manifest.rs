@@ -5396,6 +5396,9 @@ store_subscriptions = 1
         ("linux_display", "height", "u32", 13),
         ("linux_display", "scale", "u32", 14),
         ("linux_display", "header", "u32", 15),
+        ("linux_eth", "ifname", "str", 10),
+        ("linux_eth", "mac", "str", 11),
+        ("linux_eth", "mode", "enum", 12),
         // Memory budgets are a deployment decision, not an adapter fact: an
         // adapter will let a graph allocate until the host dies, so the
         // ceiling admission enforces is configured rather than discovered.

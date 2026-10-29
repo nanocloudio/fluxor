@@ -20,6 +20,9 @@ timer_class = "wall_clock"
 # | 6   | require_peer | u8   | 1       | 1: a session is used only once the transport's peer identity binds (tls `peer_identity` wired to `peer_identity`, a record naming the session by connection id and generation; quic's in-band record). A `net` transport that numbers no sessions cannot bind one. 0: the transport is trusted as wired. |
 # | 7   | redial_ms    | u32  | 1000    | `dial`: wait after a close or a failed dial. |
 # | 8   | exchange     | u8   | none    | `near`: stand in for a provider on the peer — a requester wires `request_out -> request_in` and `response_out -> response_in` as it would to the provider. `far`: stand in for the peer's requester — wire `request_out` and `response_in` to the real provider. `none`: no exchange endpoint. One side's pair must be wired and the other's must not. The endpoint appends two channels (`ExchangeRequest`, `ExchangeResponse`, `mailbox`, 8192) after `channels`, which may then hold at most six. The peer must state the same `channels` and the other side. |
+# | 9   | resume       | u8   | 0       | 1: every record is numbered and kept until the peer acknowledges it, and a session resumes where the last left off — each record delivered once and in order across reconnects, and a record the peer already has refused as a replay (`wire.rs`, Resume). `net` or `mux`, not beside `exchange`. |
+# | 10  | window       | u32  | 0       | `resume`: retained bytes per channel — records taken off the input and not yet acknowledged, each with its four-byte length. At least one record at the channel's maximum; 0 is four. A full window stops reading the channel's input, so backpressure reaches the producer. |
+# | 11  | keepalive_ms | u32  | 1000    | `resume`: an open session that has sent nothing for this long sends an acknowledgement, and one that has heard nothing for three of these is ended (and resumed by the next). A link that died without a close on this end — the reset reached only the other one, or nothing came back at all — is noticed instead of holding the one session for ever. 0: never. |
 #
 # Each channel's reassembly ring takes `max_record + 4` bytes, and a `mailbox`
 # channel a further `2 * max_record` for its send and delivery stages. The sum
@@ -27,6 +30,13 @@ timer_class = "wall_clock"
 # refused at construction rather than shrunk. On `mux` the channel count is
 # also bounded by the streams `quic` lets one connection open (three at a
 # time), and a session that cannot open a stream per channel is closed.
+#
+# With `resume`, each channel's retained window is carved from the same
+# `REASSEMBLY_BYTES` beside its ring. An instance draws an incarnation
+# (16 random bytes) at construction; a peer naming another one than it held
+# has restarted and lost its streams, so its streams start afresh and the
+# records retained for it go again from number 1 — exactly once across
+# reconnects, at least once across a peer's restart.
 #
 # A session that has not bound its peer and exchanged tables ten seconds
 # after the transport session came up is closed. A connection or session

@@ -29,10 +29,10 @@
 // shared SDK helpers (net_read_frame, net_write_frame) work unchanged.
 // Opcode ranges are disjoint from the other four contracts:
 //
-//     net_proto     0x01..0x14   (Stream Surface v1)
-//     datagram      0x20..0x43   (Datagram Surface v1)
-//     packet        0x50..0x63   (Packet Surface v1)
-//     session_ctrl  0x70..0x9F   (SessionCtrlV1 control sideband)
+//     net_proto     0x01..0x19   (stream surface)
+//     datagram      0x20..0x43   (datagram surface)
+//     packet        0x50..0x69   (packet surface)
+//     session_ctrl  0x70..0x9F   (session control sideband)
 //     mux           0xB0..0xCF   (this file — Multiplexed Session Surface)
 //
 // so a single channel pair may carry multiple contracts unambiguously.
@@ -69,7 +69,7 @@
 //
 // Continuity integration: a QUIC `session_id` is the natural unit of
 // `transport_migratable` continuity. A migrated QUIC connection
-// retains its session_id; SessionCtrlV1 EPOCH_BUMP / RELOCATE
+// retains its session_id; session control EPOCH_BUMP / RELOCATE
 // coordinate the migration with anchors / workers above.
 
 /// Frame header size (msg_type + len).
@@ -358,7 +358,7 @@ pub const MSG_MUX_DATAGRAM_RX: u8 = 0xC7;
 ///
 /// This is a first-class mux downstream event — it must NOT be smuggled as
 /// an out-of-contract opcode. `0x5A` is the tempting one and the wrong one:
-/// it sits inside the reserved `packet` range `0x50..0x63`.
+/// it sits inside the `packet` range `0x50..0x69`.
 ///
 /// Emitted for every mux session, whatever protocol it negotiated. A
 /// session whose peer presented no credential still gets one, with

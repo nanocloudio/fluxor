@@ -394,11 +394,12 @@ const CONN_ID_LEN: usize = 2;
 const NET_MSG_ACCEPTED: u8 = 0x01;
 const NET_MSG_DATA: u8 = 0x02;
 const NET_MSG_CLOSED: u8 = 0x03;
+use net_proto::{CLOSED_GONE, CLOSED_PEER_FIN};
 const NET_MSG_BOUND: u8 = 0x04;
 const NET_MSG_CONNECTED: u8 = 0x05;
 const NET_MSG_ERROR: u8 = 0x06;
-const NET_MSG_RETRANSMIT: u8 = 0x07;
-const NET_MSG_ACK: u8 = 0x08;
+const NET_MSG_RETRANSMIT: u8 = net_proto::MSG_RETRANSMIT;
+const NET_MSG_ACK: u8 = net_proto::MSG_ACK;
 /// Observability trace context (see contracts/net/net_proto.rs). Received from
 /// IP on cipher_in; re-emitted to HTTP on clear_out with TLS's own span id.
 const NET_MSG_TRACE_CTX: u8 = 0x09;
@@ -410,6 +411,14 @@ const PEER_TAIL: usize = net_proto::PEER_LEN - net_proto::CONN_ID_LEN;
 // Net protocol command types (upstream: HTTP -> TLS -> IP)
 const NET_CMD_BIND: u8 = 0x10;
 const NET_CMD_SEND: u8 = 0x11;
+/// The answer to `MSG_RETRANSMIT` (`net_proto::CMD_RESEND`): `[conn_id][seq: u32 LE][bytes]`,
+/// retained bytes sent again at their own sequence numbers.
+const NET_CMD_RESEND: u8 = net_proto::CMD_RESEND;
+/// On the clear side, from the consumer (`net_proto::CMD_DELIVERED`): `[conn_id]` — everything
+/// handed up on the connection so far is consumed (`delivery_ack`).
+const NET_CMD_DELIVERED: u8 = net_proto::CMD_DELIVERED;
+/// The most one resend carries: one `ip` segment.
+const RESEND_MAX: usize = 1460;
 const NET_CMD_CLOSE: u8 = 0x12;
 /// The reserved pre-`CMD_CONNECT_TO` dial; answered `ENOSYS` on its tag,
 /// never forwarded.
@@ -504,6 +513,18 @@ struct TlsSession {
     state: SessionState,
     conn_id: u16,      // net_proto connection ID
     held_msg_type: u8, // held ACCEPTED/CONNECTED msg type to forward after handshake
+    /// Half-close (`half_close`): `PEER_CLOSE_NOTIFY` the peer's
+    /// close_notify arrived, `PEER_FIN` the transport reported the peer done
+    /// (`ip`'s MSG_CLOSED), `PEER_CLOSED_TOLD` the consumer has been sent
+    /// MSG_CLOSED, `PEER_CLOSED_OWED` it is still to be (an activated
+    /// standby's, after the accept).
+    peer_closed: u8,
+    /// Our own close (with continuity wired): `LOCAL_CLOSE_SENT` the
+    /// consumer closed and our close_notify is sealed — the session stays,
+    /// `Closing`, holding its retransmit window so the alert can be resent
+    /// and the closing connection can move; `LOCAL_CLOSE_FWD` the transport
+    /// close has gone to `ip` (after every record held before it).
+    local_close: u8,
     /// This session's generation: carried on the ACCEPTED/CONNECTED it
     /// releases and in its `peer_identity` record's session id, so a
     /// consumer takes only this session's identity for the connection.
@@ -581,7 +602,7 @@ struct TlsSession {
 
     /// Observability: monotonic-micros start of this session's `tls.handshake`
     /// span, latched when the handshake begins and the telemetry port is wired
-    /// (`0` = no span). See `standards/observability.md`.
+    /// (`0` = no span).
     span_start_us: u64,
     /// Steps this handshake has made no progress; see `hs_stall_note`.
     hs_idle_steps: u16,
@@ -633,6 +654,8 @@ impl TlsSession {
             state: SessionState::Idle,
             conn_id: 0,
             held_msg_type: 0,
+            peer_closed: 0,
+            local_close: 0,
             generation: 0,
             driver: HandshakeDriver::empty(),
             read_keys: TrafficKeys::empty(),
@@ -686,6 +709,8 @@ impl TlsSession {
         self.state = SessionState::Idle;
         self.conn_id = 0;
         self.held_msg_type = 0;
+        self.peer_closed = 0;
+        self.local_close = 0;
         self.recv_len = 0;
         self.recv_expected = 0;
         self.retx_len = 0;
@@ -894,8 +919,16 @@ struct TlsState {
     /// unwired, which makes the whole surface a no-op.
     cont_in: i32,
     cont_out: i32,
-    /// Vault handle of the `tls-continuity` sealing key; -1 until opened.
+    /// Vault handle of the `tls-continuity-master` key each flow's sealing
+    /// key is derived from; -1 until opened.
     cont_vault_handle: i32,
+    /// Flows' sealing keys and custody recipients (continuity.rs).
+    cont_keys: [ContKey; CONT_KEYS],
+    cont_key_stamp: u32,
+    /// This host's custody identity (`tls-custody`) and its public key.
+    custody_signer: i32,
+    custody_signer_open: bool,
+    custody_signer_pub: [u8; 65],
     /// Standby shadows a checkpoint imports into (continuity.rs).
     shadows: [TlsShadow; MAX_TLS_SHADOWS],
     /// Frame assembly for everything the continuity surface emits.
@@ -905,6 +938,14 @@ struct TlsState {
     cont_inbox: [u8; CONT_SCRATCH_SIZE],
     /// One checkpoint record under construction at CUT_EXPORT.
     cont_record: [u8; TLS_CKPT_RECORD_MAX],
+    /// Deliveries an activated standby hands its worker again before
+    /// anything newly opened (`[len:2][plaintext]` each), for one session
+    /// at a time, and how far they have gone.
+    redeliver: [u8; CONT_REDELIVER_MAX],
+    redeliver_len: u32,
+    redeliver_off: u32,
+    redeliver_idx: u8,
+    redeliver_conn: u16,
 
     // Pre-computed ephemeral ECDH key pairs (one per session, computed in module_new)
     eph_private: [[u8; 32]; MAX_SESSIONS],
@@ -921,6 +962,18 @@ struct TlsState {
     /// resumed on a later step, so a count there is pressure and not lost
     /// bytes. Emitted on the `[tls] hb` line.
     frame_write_dropped: u32,
+    /// `delivery_ack`: the clear-side consumer acknowledges what it has
+    /// consumed (`CMD_DELIVERED`); otherwise a delivery handed up is
+    /// consumed.
+    delivery_ack: u8,
+    /// `half_close`: the peer's close_notify and its transport FIN end only
+    /// the peer's direction — the consumer is told (MSG_CLOSED) and may
+    /// still write until it closes.
+    half_close: u8,
+    /// Records held back because the retransmit window had no room for
+    /// them (retried on a later step), and segments resent from it.
+    retx_full: u32,
+    retx_resent: u32,
     /// Inbound handshake records held back because the handshake queue
     /// could not take their plaintext. The record stays at the head of
     /// `recv_buf` and no key state moves, so the next tick retries it
@@ -1162,7 +1215,7 @@ struct TlsState {
     /// `dev_get_ticks` and the host syscall surface is the same.
     step_count: u32,
 
-    // ── Hot-path telemetry (standards/observability.md §6) ─────────────
+    // ── Hot-path telemetry ─────────────────────────────────────────────
     //
     // TLS is the most expensive layer in the stack — the bulk of the cost
     // of a fresh connection — and it sits between two instrumented
@@ -1400,7 +1453,33 @@ define_params! {
     // not name it. Re-adopted on every renewal. Requires a CA profile.
     20, trust_issuer, u8, 0
         => |s, d, len| { s.label_id.trust_issuer = p_u8(d, len, 0, 0); };
+
+    // The clear-side consumer acknowledges its deliveries with
+    // `CMD_DELIVERED` `[conn_id]` (everything handed up so far is
+    // consumed). A strict continuity pair mirrors the consumption, so a
+    // standby knows which deliveries a takeover still owes the consumer.
+    // 0: a delivery handed up counts as consumed.
+    21, delivery_ack, u8, 0
+        => |s, d, len| { s.delivery_ack = p_u8(d, len, 0, 0); };
+
+    // Half-close (RFC 8446 §6.1 lets each side close its own direction):
+    // the peer's close_notify, and the transport's report that the peer is
+    // done (MSG_CLOSED from `ip`), end the peer's direction only. The
+    // consumer is told with MSG_CLOSED and may still send until it closes
+    // (its CMD_CLOSE sends our close_notify); records after the peer's
+    // close_notify are ignored. 0: either ends the session.
+    22, half_close, u8, 0
+        => |s, d, len| { s.half_close = p_u8(d, len, 0, 0); };
 }
+
+/// `TlsSession::peer_closed` bits.
+const PEER_CLOSE_NOTIFY: u8 = 1;
+const PEER_FIN: u8 = 2;
+const PEER_CLOSED_TOLD: u8 = 4;
+const PEER_CLOSED_OWED: u8 = 8;
+/// `TlsSession::local_close` bits.
+const LOCAL_CLOSE_SENT: u8 = 1;
+const LOCAL_CLOSE_FWD: u8 = 2;
 
 // ============================================================================
 // Module ABI exports
@@ -1456,6 +1535,8 @@ pub unsafe extern "C" fn module_new(
     s.ecdh_pool_hit = 0;
     s.ecdh_fallback_keygen = 0;
     s.frame_write_dropped = 0;
+    s.retx_full = 0;
+    s.retx_resent = 0;
     s.hs_intake_deferred = 0;
     s.aes_variable_time_selected = 0;
     s.pending_downstream_tag = 0;
@@ -1511,9 +1592,17 @@ pub unsafe extern "C" fn module_new(
     s.identity_cert_in = dev_channel_port(sys, 0, 3);
     s.identity_req_out = dev_channel_port(sys, 1, 4);
     s.cont_vault_handle = -1;
+    s.cont_keys = [EMPTY_CONT_KEY; CONT_KEYS];
+    s.cont_key_stamp = 0;
+    s.custody_signer = -1;
+    s.custody_signer_open = false;
+    s.redeliver_len = 0;
+    s.redeliver_off = 0;
+    s.redeliver_idx = 0;
+    s.redeliver_conn = 0;
     let mut i = 0;
     while i < MAX_TLS_SHADOWS {
-        core::ptr::copy_nonoverlapping(&EMPTY_SHADOW, &mut s.shadows[i], 1);
+        shadow_init_in_place(&mut s.shadows[i]);
         i += 1;
     }
 
@@ -2139,6 +2228,7 @@ unsafe fn tcp_module_step(s: &mut TlsState) -> i32 {
             }
         } else if s.sessions[i].state == SessionState::Closed {
             s.free_closed = s.free_closed.wrapping_add(1);
+            continuity_session_ending(s, i);
             s.sessions[i].reset();
         } else if s.sessions[i].state == SessionState::Error {
             // Best-effort close notifications; if the channel is
@@ -2146,8 +2236,9 @@ unsafe fn tcp_module_step(s: &mut TlsState) -> i32 {
             // and the peer / HTTP consumer eventually times out.
             let cid = s.sessions[i].conn_id;
             let _ = tls_write_or_count(s, s.cipher_out, NET_CMD_CLOSE, cid, core::ptr::null(), 0);
-            let _ = tls_write_or_count(s, s.clear_out, NET_MSG_CLOSED, cid, core::ptr::null(), 0);
+            let _ = tls_send_closed(s, cid, CLOSED_GONE);
             s.free_error = s.free_error.wrapping_add(1);
+            continuity_session_ending(s, i);
             s.sessions[i].reset();
         }
         i += 1;
@@ -2166,14 +2257,17 @@ unsafe fn tcp_module_step(s: &mut TlsState) -> i32 {
         // has reached Ready resumes this record under `clear_pending_conn`,
         // the id of the connection it was decrypted for.
         let idx = s.clear_pending_idx as usize;
-        if idx < s.sessions.len() && s.sessions[idx].state == SessionState::Ready {
+        if idx < s.sessions.len() && s.sessions[idx].cont.rx_held() {
+            // Decrypted under the strict profile, and held until its
+            // RECORD_IN is acknowledged.
+        } else if idx < s.sessions.len() && s.sessions[idx].state == SessionState::Ready {
             let mut off = s.clear_pending_off;
             let pt_len = s.clear_pending_len;
             let conn_id = s.clear_pending_conn;
             if drain_clear_record(s, idx, conn_id, &mut off, pt_len) {
                 s.clear_pending_len = 0;
                 s.clear_pending_off = 0;
-                note_delivered(&mut s.sessions[idx]);
+                note_delivered(s, idx);
                 did_work = true;
             } else {
                 s.clear_pending_off = off;
@@ -2196,7 +2290,10 @@ unsafe fn tcp_module_step(s: &mut TlsState) -> i32 {
     // the wait (continuity.rs).
     let cipher_in_frozen = continuity_gate_cipher_in(s);
     let mut ci_drained = 0u32;
-    while !cipher_in_frozen && ci_drained < TLS_INBOUND_DRAIN_BUDGET {
+    while !cipher_in_frozen
+        && ci_drained < TLS_INBOUND_DRAIN_BUDGET
+        && (ci_drained == 0 || !continuity_cont_out_full(s))
+    {
         let poll_ci = (sys.channel_poll)(s.cipher_in, POLL_IN);
         if poll_ci <= 0 || (poll_ci as u32 & POLL_IN) == 0 {
             break;
@@ -2507,39 +2604,61 @@ unsafe fn tcp_module_step(s: &mut TlsState) -> i32 {
                 }
             }
             t if t == NET_MSG_CLOSED => {
-                // Read conn_id and forward to clear_out
+                // `[conn_id][kind]`: the peer finished sending, or the
+                // connection is gone. Any other shape is not a MSG_CLOSED.
                 let pl = payload_len as usize;
-                let mut payload = [0u8; 16];
-                let rd = if pl < 16 { pl } else { 16 };
+                let mut payload = [0u8; net_proto::CLOSED_LEN];
+                let rd = pl.min(net_proto::CLOSED_LEN);
                 if rd > 0 {
                     (sys.channel_read)(s.cipher_in, payload.as_mut_ptr(), rd);
                 }
-                if pl > 16 {
-                    tls_discard(sys, s.cipher_in, pl - 16);
+                if pl > rd {
+                    tls_discard(sys, s.cipher_in, pl - rd);
                 }
-                let conn_id = if pl >= 2 {
-                    u16::from_le_bytes([payload[0], payload[1]])
-                } else {
-                    0
+                let Some((conn_id, kind)) =
+                    net_proto::closed_parts(&payload[..rd]).filter(|_| pl == rd)
+                else {
+                    continue;
                 };
                 // Clean up session (or drop a passthrough conn's entry). A
                 // passthrough conn has no session, so `find_session` is -1;
                 // dropping the entry frees it and lets the id be reused.
                 let _ = clear_passthrough(s, conn_id);
                 let si = find_session_by_conn_id(s, conn_id);
+                if si >= 0
+                    && s.half_close != 0
+                    && kind == CLOSED_PEER_FIN
+                    && s.sessions[si as usize].state == SessionState::Ready
+                    && s.sessions[si as usize].peer_closed & PEER_FIN == 0
+                {
+                    // The peer is done sending; we are not. The consumer is
+                    // told once (here, or already at the close_notify). A
+                    // connection that is gone ends the session below,
+                    // half-closed or not.
+                    let sess = &mut s.sessions[si as usize];
+                    sess.peer_closed |= PEER_FIN;
+                    if sess.peer_closed & (PEER_CLOSED_TOLD | PEER_CLOSED_OWED) == 0 {
+                        sess.peer_closed |= PEER_CLOSED_OWED;
+                    }
+                    continue;
+                }
+                // A session closed by its own consumer (or moved closing)
+                // ends here; that consumer is not told again.
+                let own_close = si >= 0 && s.sessions[si as usize].local_close != 0;
                 if si >= 0 {
                     s.free_peer_closed = s.free_peer_closed.wrapping_add(1);
+                    continuity_session_ending(s, si as usize);
                     s.sessions[si as usize].reset();
                 }
-                // Forward to HTTP — best-effort close notification.
-                let _ = tls_write_or_count(
-                    s,
-                    s.clear_out,
-                    NET_MSG_CLOSED,
-                    conn_id,
-                    core::ptr::null(),
-                    0,
-                );
+                if own_close {
+                    continue;
+                }
+                // Forward to the consumer — best-effort. A session that
+                // ended here is gone whatever the transport said; a
+                // connection with none (a cleartext passthrough) keeps the
+                // transport's kind.
+                let fwd = if si >= 0 { CLOSED_GONE } else { kind };
+                let _ = tls_send_closed(s, conn_id, fwd);
             }
             t if t == NET_MSG_BOUND || t == NET_MSG_ERROR => {
                 let pl = payload_len as usize;
@@ -2628,24 +2747,25 @@ unsafe fn tcp_module_step(s: &mut TlsState) -> i32 {
                 }
             }
             t if t == NET_MSG_ACK => {
-                // Payload: `[conn_id:2 LE][acked_seq:4 LE]`.
+                // Payload: `[conn_id:2 LE][acked_seq:4 LE][isn:4 LE]` — `isn`,
+                // the sequence of the stream's first byte, places what the
+                // window holds. Any other length is not a MSG_ACK.
                 let pl = payload_len as usize;
-                let mut payload = [0u8; 6];
-                let rd = if pl < 6 { pl } else { 6 };
+                let mut payload = [0u8; net_proto::ACK_LEN];
+                let rd = pl.min(net_proto::ACK_LEN);
                 if rd > 0 {
                     (sys.channel_read)(s.cipher_in, payload.as_mut_ptr(), rd);
                 }
                 if pl > rd {
                     tls_discard(sys, s.cipher_in, pl - rd);
                 }
-                if rd == 6 {
-                    let conn_id = u16::from_le_bytes([payload[0], payload[1]]);
-                    let acked_seq =
-                        u32::from_le_bytes([payload[2], payload[3], payload[4], payload[5]]);
+                if let Some((conn_id, acked_seq, isn)) =
+                    net_proto::ack_parts(&payload).filter(|_| pl == net_proto::ACK_LEN)
+                {
                     let si = find_session_by_conn_id(s, conn_id);
                     if si >= 0 {
-                        retx_ack(&mut s.sessions[si as usize], acked_seq);
-                        continuity_after_retx_ack(s, si as usize, acked_seq);
+                        retx_ack(&mut s.sessions[si as usize], acked_seq, isn);
+                        continuity_after_retx_ack(s, si as usize, acked_seq, isn);
                     }
                 }
             }
@@ -2791,6 +2911,24 @@ unsafe fn tcp_module_step(s: &mut TlsState) -> i32 {
         // the cipher_in counter above. Comparable with `[http] tlm tx`.
         s.clear_in_bytes = s.clear_in_bytes.wrapping_add(3 + payload_len as u32);
         match msg_type {
+            t if t == NET_CMD_DELIVERED => {
+                // `[conn_id]`: the consumer has consumed what it was handed.
+                let pl = payload_len as usize;
+                let mut cb = [0u8; 2];
+                let rd = pl.min(2);
+                if rd > 0 {
+                    (sys.channel_read)(s.clear_in, cb.as_mut_ptr(), rd);
+                }
+                if pl > rd {
+                    tls_discard(sys, s.clear_in, pl - rd);
+                }
+                if pl == 2 {
+                    let si = find_session_by_conn_id(s, u16::from_le_bytes(cb));
+                    if si >= 0 {
+                        note_consumed(s, si as usize);
+                    }
+                }
+            }
             t if t == NET_CMD_SEND => {
                 // Encrypt and forward as CMD_SEND on cipher_out
                 let pl = payload_len as usize;
@@ -2853,6 +2991,26 @@ unsafe fn tcp_module_step(s: &mut TlsState) -> i32 {
                 let si = find_session_by_conn_id(s, conn_id);
                 if si >= 0 {
                     let idx = si as usize;
+                    if s.sessions[idx].state == SessionState::Ready && s.cont_in >= 0 {
+                        // With continuity wired our own close moves: the
+                        // session stays `Closing` with its retransmit window
+                        // (the alert can be resent, the closing connection
+                        // exported), its close_notify sealed through the
+                        // ordinary path — held under a strict horizon like any
+                        // record and mirrored — and the transport close goes
+                        // to `ip` only after every record before it
+                        // (`continuity::local_close_step`).
+                        send_alert(s, idx, ALERT_CLOSE_NOTIFY, true);
+                        if s.sessions[idx].state != SessionState::Ready {
+                            // The alert failed the session; the step ends it.
+                            continue;
+                        }
+                        mirror_close_sent(s, idx);
+                        s.sessions[idx].state = SessionState::Closing;
+                        s.sessions[idx].local_close = LOCAL_CLOSE_SENT;
+                        let _ = local_close_step(s, idx);
+                        continue;
+                    }
                     if s.sessions[idx].state == SessionState::Ready {
                         // A closing session ends its pair first: a strict
                         // horizon would otherwise hold the alert, and the
@@ -2865,7 +3023,7 @@ unsafe fn tcp_module_step(s: &mut TlsState) -> i32 {
                         if s.sessions[idx].cont.mirror {
                             mirror_abandon(s, idx);
                         }
-                        send_alert(s, idx, ALERT_CLOSE_NOTIFY);
+                        send_alert(s, idx, ALERT_CLOSE_NOTIFY, false);
                     }
                     s.free_cmd_close = s.free_cmd_close.wrapping_add(1);
                     s.sessions[idx].reset();
@@ -3084,6 +3242,10 @@ unsafe fn tcp_module_step(s: &mut TlsState) -> i32 {
             // No data before the stream's peer report.
             if s.sessions[i].recv_len >= 5 && !s.sessions[i].peer_pending {
                 try_decrypt_forward(s, i);
+            }
+            // The peer's direction ended: told after everything it sent.
+            if s.sessions[i].peer_closed & PEER_CLOSED_OWED != 0 {
+                tell_peer_closed(s, i);
             }
         }
         i += 1;
@@ -3898,7 +4060,7 @@ unsafe fn session_verify_peer_cert(s: &mut TlsState, idx: usize, hs_body: &[u8])
     if rc != CERT_OK {
         let conn_id = s.sessions[idx].conn_id;
         log_peer_auth_failure(s, conn_id, rc);
-        send_alert(s, idx, cert_error_alert(rc));
+        send_alert(s, idx, cert_error_alert(rc), false);
         return false;
     }
     s.last_peer_auth_error = CERT_OK;
@@ -4033,7 +4195,7 @@ unsafe fn pump_rsa_verify(s: &mut TlsState, idx: usize) -> bool {
             };
             dev_log(sys, 1, msg.as_ptr(), msg.len());
             log_peer_auth_failure(s, conn_id, CERT_ERR_SIGNATURE);
-            send_alert(s, idx, cert_error_alert(CERT_ERR_SIGNATURE));
+            send_alert(s, idx, cert_error_alert(CERT_ERR_SIGNATURE), false);
             s.sessions[idx].driver.hs_state = HandshakeState::Error;
             true
         }
@@ -5761,6 +5923,32 @@ unsafe fn pump_recv_client_finished(s: &mut TlsState, idx: usize) -> bool {
     pump_recv_client_finished_core(&mut s.sessions[idx].driver)
 }
 
+/// Tell the consumer the peer's direction has ended (half-close): once,
+/// after the accept and every delivery owed before it, and not while a
+/// record of this session is still going up.
+unsafe fn tell_peer_closed(s: &mut TlsState, idx: usize) {
+    let sess = &s.sessions[idx];
+    if sess.held_msg_type != 0
+        || sess.cont.rx_held()
+        || (s.clear_pending_len > 0 && s.clear_pending_idx as usize == idx)
+        || redelivery_pending(s, idx)
+    {
+        return;
+    }
+    let conn_id = sess.conn_id;
+    if tls_send_closed(s, conn_id, CLOSED_PEER_FIN) {
+        let sess = &mut s.sessions[idx];
+        sess.peer_closed = (sess.peer_closed & !PEER_CLOSED_OWED) | PEER_CLOSED_TOLD;
+    }
+}
+
+/// `MSG_CLOSED` `[conn_id][kind]` to the clear side: `CLOSED_PEER_FIN` when
+/// the peer's direction ended and the session is still ours to write on,
+/// `CLOSED_GONE` when the session ended. Counted when dropped.
+unsafe fn tls_send_closed(s: &mut TlsState, conn_id: u16, kind: u8) -> bool {
+    tls_write_or_count(s, s.clear_out, NET_MSG_CLOSED, conn_id, &kind, 1)
+}
+
 /// Forward a session's held `MSG_ACCEPTED` / `MSG_CONNECTED` to clear_out,
 /// clearing the latch ONLY if the write lands. A dropped completion stays
 /// latched and is retried per-step (the Ready-session loop) so the clear-side
@@ -6092,6 +6280,91 @@ pub fn parse_peer_identity(payload: &[u8]) -> Option<PeerIdentity<'_>> {
     })
 }
 
+/// What a session's handshake established about its peer: the facts of
+/// its `peer_identity` record, less the session id and profile. A moved
+/// session carries them (CT_TLS); one this module opened derives them.
+#[derive(Clone, Copy)]
+struct PeerIdFacts {
+    result: u8,
+    kind: u8,
+    flags: u32,
+    not_before: u64,
+    not_after: u64,
+    fp_len: u8,
+    fp: [u8; PEER_IDENTITY_MAX_FINGERPRINT],
+    principal_len: u8,
+    principal: [u8; PEER_IDENTITY_MAX_PRINCIPAL],
+}
+
+impl PeerIdFacts {
+    const fn empty() -> Self {
+        Self {
+            result: peer_result::NO_CREDENTIAL,
+            kind: peer_credential::NONE,
+            flags: 0,
+            not_before: 0,
+            not_after: 0,
+            fp_len: 0,
+            fp: [0; PEER_IDENTITY_MAX_FINGERPRINT],
+            principal_len: 0,
+            principal: [0; PEER_IDENTITY_MAX_PRINCIPAL],
+        }
+    }
+}
+
+/// Session `idx`'s peer facts: the ones it moved with, else what its own
+/// handshake established.
+unsafe fn peer_id_facts(s: &TlsState, idx: usize) -> PeerIdFacts {
+    let sess = &s.sessions[idx];
+    if sess.cont.peer_moved {
+        return sess.cont.moved_id;
+    }
+    let mut f = PeerIdFacts::empty();
+    // The peer's key fingerprint: SHA-256 over its raw subjectPublicKey.
+    // A plaintext peer presents no certificate and yields none.
+    let pk_len = sess.driver.peer_cert_pubkey_len as usize;
+    if pk_len == 0 {
+        return f;
+    }
+    f.fp = sha256(&sess.driver.peer_cert_pubkey[..pk_len]);
+    f.fp_len = PEER_IDENTITY_MAX_FINGERPRINT as u8;
+    // What this handshake actually established.
+    //
+    // The flags say which checks RAN, and they are derived from the
+    // configured profile rather than assumed: `verify_chain` was reached
+    // only if a certificate was presented, and the validity window was
+    // enforced only when `clock_policy` demanded it under a CA profile —
+    // `validity_enforced`, which is what `chain_policy` uses.
+    // A consumer can therefore tell "trusted chain, lifetime unchecked"
+    // from "fully verified" — the distinction a single boolean erases.
+    f.result = peer_result::OK;
+    f.kind = peer_credential::X509_MTLS;
+    f.flags = peer_check::CHAIN | peer_check::KEY_POSSESSION;
+    if validity_enforced(s) {
+        f.flags |= peer_check::VALIDITY;
+    }
+    // The EKU is required by `chain_policy` for every profile that
+    // validates a chain at all, so reaching here means it was checked.
+    f.flags |= peer_check::EKU;
+    f.not_before = sess.driver.peer_cert_not_before;
+    f.not_after = sess.driver.peer_cert_not_after;
+    // The principal is a name this handshake matched against the profile:
+    // under `ca_uri`, the leaf's URI SAN that satisfied `verify_uri`, with
+    // the SAN flag saying that check ran. Every other profile reports none:
+    // `ca_dns` matches the dialled host, which the consumer already knows,
+    // and a client is identified by its issuer, not by a hostname it does
+    // not serve. `build_peer_identity_envelope` drops a principal unless
+    // SAN was checked, so this is the honest input rather than a value the
+    // formatter would discard.
+    let pl = (sess.driver.peer_principal_len as usize).min(PEER_IDENTITY_MAX_PRINCIPAL);
+    if pl > 0 {
+        f.principal[..pl].copy_from_slice(&sess.driver.peer_principal[..pl]);
+        f.principal_len = pl as u8;
+        f.flags |= peer_check::SAN;
+    }
+    f
+}
+
 /// Build a `MSG_PEER_IDENTITY` envelope for the session and try to
 /// write it on the optional `peer_identity` output port. If the
 /// channel is full at handshake completion, latch the envelope in
@@ -6103,72 +6376,19 @@ unsafe fn emit_peer_identity(s: &mut TlsState, idx: usize) {
     if s.peer_identity < 0 {
         return;
     }
-    // The peer's key fingerprint: SHA-256 over its raw subjectPublicKey.
-    // A plaintext peer presents no certificate and yields an empty slice.
-    let pk_len = s.sessions[idx].driver.peer_cert_pubkey_len as usize;
-    let mut fp_buf = [0u8; PEER_IDENTITY_MAX_FINGERPRINT];
-    let fingerprint: &[u8] = if pk_len > 0 {
-        let digest = sha256(&s.sessions[idx].driver.peer_cert_pubkey[..pk_len]);
-        fp_buf.copy_from_slice(&digest);
-        &fp_buf[..]
-    } else {
-        &fp_buf[..0]
-    };
-
-    // What this handshake actually established.
-    //
-    // The flags say which checks RAN, and they are derived from the
-    // configured profile rather than assumed: `verify_chain` was reached
-    // only if a certificate was presented, and the validity window was
-    // enforced only when `clock_policy` demanded it under a CA profile —
-    // `validity_enforced`, which is what `chain_policy` uses.
-    // A consumer can therefore tell "trusted chain, lifetime unchecked"
-    // from "fully verified" — the distinction a single boolean erases.
-    let (result, credential_kind, flags) = if pk_len == 0 {
-        (peer_result::NO_CREDENTIAL, peer_credential::NONE, 0u32)
-    } else {
-        let mut f = peer_check::CHAIN | peer_check::KEY_POSSESSION;
-        if validity_enforced(s) {
-            f |= peer_check::VALIDITY;
-        }
-        // The EKU is required by `chain_policy` for every profile that
-        // validates a chain at all, so reaching here means it was checked.
-        f |= peer_check::EKU;
-        (peer_result::OK, peer_credential::X509_MTLS, f)
-    };
-
-    // The principal is a name this handshake matched against the profile:
-    // under `ca_uri`, the leaf's URI SAN that satisfied `verify_uri`, with
-    // the SAN flag saying that check ran. Every other profile reports none:
-    // `ca_dns` matches the dialled host, which the consumer already knows,
-    // and a client is identified by its issuer, not by a hostname it does
-    // not serve. `build_peer_identity_envelope` drops a principal unless
-    // SAN was checked, so this is the honest input rather than a value the
-    // formatter would discard.
-    let pl = s.sessions[idx].driver.peer_principal_len as usize;
-    let principal: &[u8] = if pk_len > 0 && pl > 0 {
-        &s.sessions[idx].driver.peer_principal[..pl]
-    } else {
-        &[]
-    };
-    let flags = if principal.is_empty() {
-        flags
-    } else {
-        flags | peer_check::SAN
-    };
-
+    let f = peer_id_facts(s, idx);
     let identity = PeerIdentity {
         session_id: u32::from(s.sessions[idx].conn_id)
             | u32::from(s.sessions[idx].generation) << 16,
-        verification_result: result,
-        credential_kind,
+        verification_result: f.result,
+        credential_kind: f.kind,
         profile_id: u16::from(s.peer_auth),
-        not_before: s.sessions[idx].driver.peer_cert_not_before,
-        not_after: s.sessions[idx].driver.peer_cert_not_after,
-        verification_flags: flags,
+        not_before: f.not_before,
+        not_after: f.not_after,
+        verification_flags: f.flags,
         key_fp_alg: peer_fp_alg::SHA256,
-        key_fingerprint: fingerprint,
-        principal,
+        key_fingerprint: &f.fp[..usize::from(f.fp_len)],
+        principal: &f.principal[..usize::from(f.principal_len)],
     };
     let mut envelope = [0u8; PEER_IDENTITY_MAX_TOTAL];
     let total = build_peer_identity_envelope(&identity, &mut envelope);
@@ -6457,8 +6677,11 @@ unsafe fn rotate_traffic_keys(sess: &mut TlsSession, inbound: bool) -> bool {
 
 /// Emit a KeyUpdate of our own and rotate the write keys behind it.
 /// The message must be sealed under the *current* write keys, so the
-/// rotation happens only after the record is accepted.
-unsafe fn send_key_update(s: &mut TlsState, idx: usize, request_update: u8) -> bool {
+/// rotation happens only after the record is accepted. `Sent` or `Held`
+/// once it is; `Blocked` when `cipher_out` (or the retransmit window) had
+/// no room — the record is unsealed and nothing has moved, so the caller
+/// may send it later; `Failed` when the session cannot continue.
+unsafe fn send_key_update(s: &mut TlsState, idx: usize, request_update: u8) -> EmitOutcome {
     let mut rec = [0u8; 5 + 5 + 17];
     let body_len = build_key_update(request_update, &mut rec[5..]);
     let (enc_len, conn_id) = {
@@ -6471,7 +6694,7 @@ unsafe fn send_key_update(s: &mut TlsState, idx: usize, request_update: u8) -> b
             &mut rec[5..],
         ) {
             Ok(n) => n,
-            Err(_) => return false,
+            Err(_) => return EmitOutcome::Failed,
         };
         (n, sess.conn_id)
     };
@@ -6482,20 +6705,35 @@ unsafe fn send_key_update(s: &mut TlsState, idx: usize, request_update: u8) -> b
     rec[4] = enc_len as u8;
     let total = 5 + enc_len;
     let _ = conn_id;
-    if !matches!(
-        emit_record(s, idx, rec.as_ptr(), total),
-        EmitOutcome::Sent | EmitOutcome::Held
-    ) {
-        return false;
+    let out = emit_record(s, idx, rec.as_ptr(), total);
+    match out {
+        EmitOutcome::Sent | EmitOutcome::Held => {}
+        EmitOutcome::Blocked => {
+            unseal_unsent(&mut s.sessions[idx]);
+            return out;
+        }
+        EmitOutcome::Failed => return out,
     }
     // The retired epoch's keys outlive the rotation until the barrier
     // covering their last record is acknowledged.
     retain_retired_write_keys(&mut s.sessions[idx]);
     if !rotate_traffic_keys(&mut s.sessions[idx], false) {
-        return false;
+        return EmitOutcome::Failed;
     }
+    // Any rotation of ours answers a request the peer made.
+    s.sessions[idx].cont.ku_answer_owed = false;
     continuity_after_key_rotation(s, idx, false);
-    true
+    out
+}
+
+/// Take back the write sequence of a record `emit_record` answered
+/// `Blocked`: nothing of it was written, held or mirrored, so the next
+/// record is sealed under that sequence instead — the peer expects it
+/// there, and a skipped sequence would fail every record after it. The
+/// discarded ciphertext never left this module, so the sequence is spent
+/// on the wire once.
+fn unseal_unsent(sess: &mut TlsSession) {
+    sess.write_keys.seq = sess.write_keys.seq.wrapping_sub(1);
 }
 
 /// Consume post-handshake handshake messages queued in the driver's
@@ -6540,9 +6778,16 @@ unsafe fn drive_post_handshake(s: &mut TlsState, idx: usize) {
                     s.last_err_site = 39;
                     return;
                 }
+                // Owed from here until our own goes: a mirror carries it
+                // with the inbound rotation, so a standby that takes over
+                // between the two answers it.
+                s.sessions[idx].cont.ku_answer_owed = request == KEY_UPDATE_REQUESTED;
                 continuity_after_key_rotation(s, idx, true);
+                // An answer `cipher_out` has no room for stays owed; the step
+                // sends it (`continuity_step`), and nothing of ours is sealed
+                // before it.
                 if request == KEY_UPDATE_REQUESTED
-                    && !send_key_update(s, idx, KEY_UPDATE_NOT_REQUESTED)
+                    && send_key_update(s, idx, KEY_UPDATE_NOT_REQUESTED) == EmitOutcome::Failed
                 {
                     s.sessions[idx].state = SessionState::Error;
                     s.last_err_site = 40;
@@ -6567,8 +6812,10 @@ unsafe fn drive_post_handshake(s: &mut TlsState, idx: usize) {
     }
 }
 
-/// Send an encrypted alert via cipher_out channel
-unsafe fn send_alert(s: &mut TlsState, idx: usize, description: u8) {
+/// Send an encrypted alert via cipher_out channel. With `keep`, an alert
+/// `cipher_out` has no room for stays the session's next record when the
+/// stall slot is free — the close of a session that lives on to finish it.
+unsafe fn send_alert(s: &mut TlsState, idx: usize, description: u8, keep: bool) {
     let alert_body = build_alert(description);
     let mut rec = [0u8; 69];
     core::ptr::copy_nonoverlapping(
@@ -6601,9 +6848,23 @@ unsafe fn send_alert(s: &mut TlsState, idx: usize, description: u8) {
     *rec.as_mut_ptr().add(4) = enc_len as u8;
 
     let total = 5 + enc_len;
-    // Alerts are advisory (RFC 8446 §6) — best-effort is fine.
     let _ = conn_id;
-    let _ = emit_record(s, idx, rec.as_ptr(), total);
+    match emit_record(s, idx, rec.as_ptr(), total) {
+        EmitOutcome::Blocked if keep && s.tx_stall_len == 0 => {
+            // Kept as the session's next record, written before anything
+            // else of it (`flush_tx_stall`).
+            s.tx_stall[..total].copy_from_slice(&rec[..total]);
+            s.tx_stall_len = total as u16;
+            s.tx_stall_idx = idx as u8;
+            s.clear_left = 0;
+        }
+        // Alerts are advisory (RFC 8446 §6): one with no room is dropped,
+        // its sequence taken back so the records after it still open.
+        EmitOutcome::Blocked => unseal_unsent(&mut s.sessions[idx]),
+        EmitOutcome::Sent | EmitOutcome::Held => {}
+        // The sequence has moved past a record that will never be written.
+        EmitOutcome::Failed => s.sessions[idx].state = SessionState::Error,
+    }
 }
 
 // ============================================================================
@@ -6767,8 +7028,10 @@ unsafe fn tls_write_or_count(
 }
 
 /// Retain `n` bytes of encrypted record in the session's retransmit buffer.
-/// Overflow is ignored — the record has already been emitted, so TCP's ARQ
-/// still delivers the stream; only the retransmit fast-path degrades.
+/// `ip` holds no copy of the bytes it sends: this window is the only one,
+/// so once it is anchored a record is not written until it fits
+/// (`write_record_now`). Overflow only happens before that — on a
+/// transport that reports no acknowledgements and retransmits by itself.
 unsafe fn retx_push(sess: &mut TlsSession, rec: *const u8, n: u16) {
     let rec = core::slice::from_raw_parts(rec, usize::from(n));
     retx_push_window(
@@ -6780,20 +7043,26 @@ unsafe fn retx_push(sess: &mut TlsSession, rec: *const u8, n: u16) {
 }
 
 /// Drop bytes up to `acked_seq` from the session's retransmit buffer.
-/// Anchors `retx_base_seq` to `acked_seq - retx_len` on the first ACK for
-/// this connection — IP supplies the absolute TCP sequence number.
-unsafe fn retx_ack(sess: &mut TlsSession, acked_seq: u32) {
+/// The first ACK for this connection anchors `retx_base_seq` in sequence
+/// space (`retx_slide`) — IP supplies the absolute TCP sequence number
+/// and the stream's first.
+unsafe fn retx_ack(sess: &mut TlsSession, acked_seq: u32, isn: u32) {
     retx_slide(
         &mut sess.retx_buf,
         &mut sess.retx_len,
         &mut sess.retx_base_seq,
         &mut sess.retx_seq_anchored,
         acked_seq,
+        isn,
     );
 }
 
-/// Replay retained ciphertext from `from_seq` to end of retx buffer.
-// Its kilobytes of staging stay off the step's frame until it is called.
+/// Resend retained ciphertext from `from_seq` (`MSG_RETRANSMIT`): up to one
+/// segment of it, as `NET_CMD_RESEND` `[seq][bytes]`, which `ip` sends at
+/// those sequence numbers rather than as new data. One segment is what one
+/// retransmission request sends; `ip` asks again for the next hole on each
+/// partial acknowledgement.
+// Its staging stays off the step's frame until it is called.
 #[inline(never)]
 unsafe fn retx_replay(s: &mut TlsState, idx: usize, from_seq: u32) {
     let (offset, len) = {
@@ -6807,24 +7076,27 @@ unsafe fn retx_replay(s: &mut TlsState, idx: usize, from_seq: u32) {
         }
         (off as usize, sess.retx_len as usize)
     };
-    let bytes = len - offset;
-    let mut local = [0u8; RETX_BUF_SIZE];
+    let bytes = (len - offset).min(RESEND_MAX);
+    let mut local = [0u8; 4 + RESEND_MAX];
+    local[..4].copy_from_slice(&from_seq.to_le_bytes());
     core::ptr::copy_nonoverlapping(
         s.sessions[idx].retx_buf.as_ptr().add(offset),
-        local.as_mut_ptr(),
+        local.as_mut_ptr().add(4),
         bytes,
     );
     let conn_id = s.sessions[idx].conn_id;
     // Best-effort: replaying already-encrypted ciphertext, no
     // AEAD seq to keep in sync. TCP's RTO will retry on drop.
-    let _ = tls_write_or_count(
+    if tls_write_or_count(
         s,
         s.cipher_out,
-        NET_CMD_SEND,
+        NET_CMD_RESEND,
         conn_id,
         local.as_ptr(),
-        bytes as u16,
-    );
+        (4 + bytes) as u16,
+    ) {
+        s.retx_resent = s.retx_resent.wrapping_add(1);
+    }
 }
 
 /// Write a raw net_proto frame (no conn_id prefix — used for pass-through).
@@ -7074,12 +7346,17 @@ unsafe fn drain_clear_record(
 /// Try to decrypt a complete TLS record from a Ready session's recv_buf
 /// and forward the plaintext as MSG_DATA to clear_out.
 unsafe fn try_decrypt_forward(s: &mut TlsState, idx: usize) {
+    // An activated standby's worker gets the deliveries it never consumed
+    // first: nothing newer is opened for that session until they are out.
+    if redelivery_pending(s, idx) {
+        return;
+    }
     // A record still going out owns `record_scratch`, which is module-wide.
     // Finish it before anything else is decrypted — and leave another
     // session's buffer alone entirely while it is held, so that session
     // stops decrypting too and its ciphertext accumulates instead.
     if s.clear_pending_len > 0 {
-        if s.clear_pending_idx as usize != idx {
+        if s.clear_pending_idx as usize != idx || s.sessions[idx].cont.rx_held() {
             return;
         }
         let mut off = s.clear_pending_off;
@@ -7088,7 +7365,7 @@ unsafe fn try_decrypt_forward(s: &mut TlsState, idx: usize) {
         if drain_clear_record(s, idx, conn_id, &mut off, pt_len) {
             s.clear_pending_len = 0;
             s.clear_pending_off = 0;
-            note_delivered(&mut s.sessions[idx]);
+            note_delivered(s, idx);
         } else {
             s.clear_pending_off = off;
             return;
@@ -7127,9 +7404,9 @@ unsafe fn try_decrypt_forward(s: &mut TlsState, idx: usize) {
         return;
     }
 
-    // Receive horizon: the record is consumed only once the standby
-    // holds its consumption. Until then it stays at the head of the
-    // buffer and no sequence state moves.
+    // Receive horizon: under the planned profile the consumption is
+    // mirrored here; under the strict one the record waits here only for
+    // the session's previous inbound horizon, and is mirrored once opened.
     if !continuity_rx_gate(s, idx, rec_len) {
         return;
     }
@@ -7169,6 +7446,18 @@ unsafe fn try_decrypt_forward(s: &mut TlsState, idx: usize) {
                 s.last_err_site = 44;
                 return;
             }
+            // Strict profile: the consumption is mirrored now, with what it
+            // opened to, and plaintext waits for its horizon in
+            // `record_scratch` exactly as it waits for a full clear_out.
+            if continuity_after_decrypt(s, idx, inner_type, pt_len) {
+                s.clear_pending_off = 0;
+                s.clear_pending_len = pt_len;
+                s.clear_pending_conn = s.sessions[idx].conn_id;
+                s.clear_pending_idx = idx as u16;
+                return;
+            }
+            let ct = core::slice::from_raw_parts_mut(ct_ptr, RECV_BUF_SIZE);
+            let sess = &mut s.sessions[idx];
             if inner_type == CT_HANDSHAKE {
                 // Post-handshake messages (KeyUpdate, NewSessionTicket)
                 // arrive on the same authenticated stream as
@@ -7198,30 +7487,30 @@ unsafe fn try_decrypt_forward(s: &mut TlsState, idx: usize) {
                     s.last_err_site = 46;
                     return;
                 }
+                if *ct.as_ptr().add(1) == ALERT_CLOSE_NOTIFY && s.half_close != 0 {
+                    // The peer's direction ends; ours stays open.
+                    sess.peer_closed |= PEER_CLOSE_NOTIFY;
+                    if sess.peer_closed & PEER_CLOSED_TOLD == 0 {
+                        sess.peer_closed |= PEER_CLOSED_OWED;
+                    }
+                    return;
+                }
                 if *ct.as_ptr().add(1) == ALERT_CLOSE_NOTIFY {
                     sess.state = SessionState::Closed;
                     let conn_id = sess.conn_id;
-                    // Best-effort close notification (sess borrow
-                    // prevents tls_write_or_count; count inline).
-                    let ok = tls_write_frame(
-                        sys,
-                        s.clear_out,
-                        NET_MSG_CLOSED,
-                        conn_id,
-                        core::ptr::null(),
-                        0,
-                        &mut s.net_scratch,
-                    );
-                    if !ok {
-                        s.frame_write_dropped = s.frame_write_dropped.wrapping_add(1);
-                    }
+                    // Best-effort close notification.
+                    let _ = tls_send_closed(s, conn_id, CLOSED_GONE);
                     return;
                 }
                 sess.state = SessionState::Error;
                 s.last_err_site = 47;
                 return;
             }
-            if inner_type == CT_APPLICATION_DATA && pt_len > 0 {
+            // RFC 8446 §6.1: data after the peer's close_notify is ignored.
+            if inner_type == CT_APPLICATION_DATA
+                && pt_len > 0
+                && sess.peer_closed & PEER_CLOSE_NOTIFY == 0
+            {
                 // Forward decrypted bytes as MSG_DATA, chunked to the
                 // per-write scratch (a 16 KiB record spans several frames —
                 // MSG_DATA is a byte stream to the consumer).
@@ -7238,7 +7527,7 @@ unsafe fn try_decrypt_forward(s: &mut TlsState, idx: usize) {
                 let mut off = 0usize;
                 let done = drain_clear_record(s, idx, conn_id, &mut off, pt_len);
                 if done {
-                    note_delivered(&mut s.sessions[idx]);
+                    note_delivered(s, idx);
                 } else {
                     // Held, not dropped. Nothing else may decrypt until this
                     // record has left, or `record_scratch` would be
@@ -7661,6 +7950,28 @@ pub mod test_helpers {
             .unwrap_or_default()
     }
 
+    /// The retransmit window of the session bound to `conn_id`: `(base
+    /// sequence, bytes held, anchored)`.
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `TlsState`.
+    pub unsafe fn retx_window(state: *const u8, conn_id: u16) -> Option<(u32, u16, bool)> {
+        let s = &*(state as *const TlsState);
+        s.sessions
+            .iter()
+            .find(|sess| sess.state != SessionState::Idle && sess.conn_id == conn_id)
+            .map(|sess| (sess.retx_base_seq, sess.retx_len, sess.retx_seq_anchored))
+    }
+
+    /// `(records held for want of retransmit-window room, segments resent)`.
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `TlsState`.
+    pub unsafe fn retx_counters(state: *const u8) -> (u32, u32) {
+        let s = &*(state as *const TlsState);
+        (s.retx_full, s.retx_resent)
+    }
+
     /// Ownership epoch of the session bound to `conn_id`, once bound.
     ///
     /// # Safety
@@ -7723,6 +8034,9 @@ pub mod test_helpers {
         if si < 0 || s.sessions[si as usize].state != SessionState::Ready {
             return false;
         }
-        super::send_key_update(s, si as usize, super::KEY_UPDATE_REQUESTED)
+        matches!(
+            super::send_key_update(s, si as usize, super::KEY_UPDATE_REQUESTED),
+            super::EmitOutcome::Sent | super::EmitOutcome::Held
+        )
     }
 }

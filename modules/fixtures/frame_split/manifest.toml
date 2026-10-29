@@ -1,0 +1,71 @@
+version = "1.0.0"
+hardware_targets = ["bcm2712", "linux"]
+# Moves frames as they come; nothing here is timed.
+timer_class = "agnostic"
+
+# Fixture router for rigs that drive several ports of one graph from one
+# stream (the runtime's stdin): splits a `[type:1][len:2 LE][payload]`
+# stream by frame type, so each port is handed only the frames that are its
+# own — a coordinator's records, an authority's verdicts and an identity
+# certificate arriving interleaved on one pipe.
+#
+# A frame goes to every output whose list names its type, whole; a type no
+# output names is dropped and counted. With an output's `raw` bit set it is
+# handed the payload alone (a consumer whose records carry their own
+# framing). Frames leave in the order they came: one that an output cannot
+# take yet holds the stream, so back pressure reaches the producer and
+# nothing is reordered or lost. A frame longer than an output's buffer
+# (16384 bytes), which no output could take whole, is dropped and counted.
+#
+# The heartbeat line `[frame_split] frames=<n> dropped=<n> oversize=<n>`
+# is logged when a count changes, at most once every 4096 steps.
+#
+# ─── Parameters (TLV) ──────────────────────────────────────────────────
+# | Tag | Name | Type | Default | Description |
+# |-----|------|------|---------|-------------|
+# | 1   | out0 | str  | —       | The frame types `out0` takes: hex bytes, comma-separated (`c3,c5`). |
+# | 2   | out1 | str  | —       | Likewise for `out1`. |
+# | 3   | out2 | str  | —       | Likewise for `out2`. |
+# | 4   | out3 | str  | —       | Likewise for `out3`. |
+# | 5   | raw  | u8   | 0       | Bit N: `outN` is handed each frame's payload without its header. |
+
+[[ports]]
+name = "frames_in"
+direction = "input"
+content_type = "OctetStream"
+required = true
+buffer_size = 32768
+
+[[ports]]
+name = "out0"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 16384
+
+[[ports]]
+name = "out1"
+index = 1
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 16384
+
+[[ports]]
+name = "out2"
+index = 2
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 16384
+
+[[ports]]
+name = "out3"
+index = 3
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 16384
+
+[[resources]]
+requires_contract = "channel"
+access = "read"
+
+[observability]
+exempt = "rig fixture — routes a test driver's frames to the ports they are for; the data it carries is observed where it lands"

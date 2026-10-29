@@ -778,6 +778,53 @@ pub unsafe fn import_persisted(
     }
 }
 
+/// The P-256 signing identity of module type `namespace` under `label`:
+/// its public key, generating and persisting the key first when it does not
+/// exist (uses `SIGN | EXPORT_PUBLIC | PERSIST`, as a module asks for its
+/// own). The private half is generated here and only ever sealed. For an
+/// operator enrolling a host: the public half is what a relying party is
+/// told to trust, read before any evidence the key signs is seen.
+///
+/// # Safety
+/// Kernel context, exclusive access to `SLOTS` and `PERSISTED`.
+pub unsafe fn identity_public(namespace: u32, label: &[u8]) -> Result<[u8; 65], i32> {
+    use dev_key_vault::{suite, usage};
+    let want = usage::SIGN | usage::EXPORT_PUBLIC | usage::PERSIST;
+    if label.is_empty() || label.len() > MAX_LABEL {
+        return Err(EINVAL);
+    }
+    if store_not_ready() {
+        return Err(EAGAIN);
+    }
+    let mut key = [0u8; 32];
+    match find_persisted(namespace, label)? {
+        Some(pi) => {
+            if PERSISTED[pi].suite != suite::P256 || want & !PERSISTED[pi].usage != 0 {
+                return Err(EACCES);
+            }
+            let slot = open_persisted(pi)?;
+            key.copy_from_slice(&SLOTS[slot].data[..32]);
+            zeroise_slot(slot);
+        }
+        None => {
+            if !generate_into(suite::P256, &mut key) {
+                zeroize(&mut key);
+                return Err(ERROR);
+            }
+            if !matches!(
+                persist_key(namespace, label, suite::P256, want, &key),
+                Persist::Durable
+            ) {
+                zeroize(&mut key);
+                return Err(ENOSYS);
+            }
+        }
+    }
+    let public = p256::public_key_from_scalar(&key);
+    zeroize(&mut key);
+    public.ok_or(ERROR)
+}
+
 /// Largest plaintext [`AEAD_SEAL`] / [`AEAD_OPEN`] handle in one call: a
 /// resumption ticket or a checkpoint chunk, never a bulk stream.
 const MAX_SEAL_BYTES: usize = 2048;
@@ -863,16 +910,13 @@ pub(crate) fn derive_key(master: &[u8], label: &[u8], context: &[u8], out: &mut 
     out.copy_from_slice(&okm);
 }
 
-/// The key-wrap KEK: HKDF-SHA256 (RFC 5869), one block —
-/// `salt = attest_digest`, `ikm = ECDH shared secret`,
-/// `info = "fluxor key_wrap v1" || dest_pub`. Salting with the
-/// destination's composition digest is what binds the wrap to it.
-fn wrap_kek(shared: &[u8; 32], attest: &[u8; 32], dest_pub: &[u8], out: &mut [u8; 32]) {
-    let mut prk = hmac_sha256(attest, &[shared]);
-    let okm = hmac_sha256(&prk, &[b"fluxor key_wrap v1", dest_pub, &[1u8]]);
-    zeroize(&mut prk);
-    out.copy_from_slice(&okm);
-}
+// The key-wrap KEK and the wrapped object are the SDK core's
+// (`security::custody_wrap`, `modules/sdk/cores/custody_wrap.rs`):
+// HKDF-SHA256 with `salt = attest_digest`, `ikm = ECDH shared secret`,
+// `info = KW_INFO || dest_pub || 0x01`, then ChaCha20-Poly1305 with the
+// object's header (magic, ephemeral key, digest, nonce) as AAD. Salting
+// with the destination's composition digest is what binds the wrap to it.
+use crate::kernel::security::custody_wrap as cw;
 
 /// Sign `msg` with `slot` in its suite's convention, writing `sig_len`
 /// bytes to `out`. `None` on failure.
@@ -2028,6 +2072,7 @@ pub unsafe fn provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             // Ephemeral agreement key, used once and zeroised.
             let mut eph = [0u8; 32];
             if !generate_into(dev_key_vault::suite::P256, &mut eph) {
+                zeroize(&mut eph);
                 return ERROR;
             }
             let Some(eph_pub) = p256::public_key_from_scalar(&eph) else {
@@ -2039,44 +2084,32 @@ pub unsafe fn provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             let Some(mut shared) = shared else {
                 return EINVAL;
             };
-            let mut kek = [0u8; 32];
-            wrap_kek(&shared, &attest, dest_pub, &mut kek);
-            zeroize(&mut shared);
             let mut nonce = [0u8; 12];
             if crate::kernel::sys::hal::csprng_fill(nonce.as_mut_ptr(), 12) != 0 {
-                zeroize(&mut kek);
+                zeroize(&mut shared);
                 return ERROR;
             }
-            let mut sealed = [0u8; dev_key_vault::wrap::SEALED_PREFIX + MAX_KEY_BYTES];
-            sealed[0..2].copy_from_slice(&slot.suite.to_le_bytes());
-            sealed[2..6].copy_from_slice(&slot.usage.to_le_bytes());
-            sealed[6] = slot.key_len;
-            sealed[7..7 + key_len].copy_from_slice(&slot.data[..key_len]);
-            let sealed_len = w::SEALED_PREFIX + key_len;
-            let tag = crate::kernel::security::crypto::chacha20::chacha20_poly1305_encrypt(
-                &kek,
-                &nonce,
+            let mut out = [0u8; cw::kw_wrapped_len(MAX_KEY_BYTES)];
+            let sealed = cw::kw_seal(
+                &shared,
+                &eph_pub,
+                dest_pub,
                 &attest,
-                &mut sealed[..sealed_len],
+                &nonce,
+                slot.suite,
+                slot.usage,
+                &slot.data[..key_len],
+                &mut out,
             );
-            zeroize(&mut kek);
-            if !out_ptr.is_null() {
-                core::ptr::copy_nonoverlapping(w::MAGIC.as_ptr(), out_ptr, 4);
-                core::ptr::copy_nonoverlapping(eph_pub.as_ptr(), out_ptr.add(4), w::EPH_PUB_LEN);
-                core::ptr::copy_nonoverlapping(attest.as_ptr(), out_ptr.add(w::ATTEST_OFF), 32);
-                core::ptr::copy_nonoverlapping(nonce.as_ptr(), out_ptr.add(w::NONCE_OFF), 12);
-                core::ptr::copy_nonoverlapping(
-                    sealed.as_ptr(),
-                    out_ptr.add(w::SEALED_OFF),
-                    sealed_len,
-                );
-                core::ptr::copy_nonoverlapping(
-                    tag.as_ptr(),
-                    out_ptr.add(w::SEALED_OFF + sealed_len),
-                    16,
-                );
+            zeroize(&mut shared);
+            if sealed != Some(need) {
+                zeroize(&mut out);
+                return ERROR;
             }
-            zeroize(&mut sealed);
+            if !out_ptr.is_null() {
+                core::ptr::copy_nonoverlapping(out.as_ptr(), out_ptr, need);
+            }
+            zeroize(&mut out);
             let wrote = (need as u16).to_le_bytes();
             core::ptr::copy_nonoverlapping(wrote.as_ptr(), tail.add(10), 2);
             0
@@ -2145,42 +2178,21 @@ pub unsafe fn provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
                 zeroize(&mut shared);
                 return ERROR;
             };
-            let mut kek = [0u8; 32];
-            wrap_kek(&shared, &attest, &my_pub, &mut kek);
+            let mut key = [0u8; MAX_KEY_BYTES];
+            let opened = cw::kw_open(&shared, &my_pub, &attest, blob, &mut key);
             zeroize(&mut shared);
-            let mut nonce = [0u8; 12];
-            nonce.copy_from_slice(&blob[w::NONCE_OFF..w::NONCE_OFF + 12]);
-            let sealed_len = blob_len - w::SEALED_OFF - w::TAG_LEN;
-            if sealed_len < w::SEALED_PREFIX || sealed_len > w::SEALED_PREFIX + MAX_KEY_BYTES {
-                zeroize(&mut kek);
+            let Ok(opened) = opened else {
+                zeroize(&mut key);
                 return EINVAL;
-            }
-            let mut sealed = [0u8; dev_key_vault::wrap::SEALED_PREFIX + MAX_KEY_BYTES];
-            sealed[..sealed_len].copy_from_slice(&blob[w::SEALED_OFF..w::SEALED_OFF + sealed_len]);
-            let mut tag = [0u8; 16];
-            tag.copy_from_slice(&blob[w::SEALED_OFF + sealed_len..]);
-            let ok = crate::kernel::security::crypto::chacha20::chacha20_poly1305_decrypt(
-                &kek,
-                &nonce,
-                &attest,
-                &mut sealed[..sealed_len],
-                &tag,
-            );
-            zeroize(&mut kek);
-            if !ok {
-                zeroize(&mut sealed);
-                return EINVAL;
-            }
-            let suite = u16::from_le_bytes([sealed[0], sealed[1]]);
-            let usage = u32::from_le_bytes([sealed[2], sealed[3], sealed[4], sealed[5]]);
-            let key_len = sealed[6] as usize;
+            };
+            let (suite, usage, key_len) = (opened.suite, opened.usage, opened.key_len);
             if suite_private_len(suite) != key_len || usage & !suite_usage(suite) != 0 || usage == 0
             {
-                zeroize(&mut sealed);
+                zeroize(&mut key);
                 return EINVAL;
             }
             let Some(new_slot) = alloc_slot() else {
-                zeroize(&mut sealed);
+                zeroize(&mut key);
                 return ENOMEM;
             };
             // The generation is what keeps handles to the slot's earlier keys
@@ -2192,9 +2204,9 @@ pub unsafe fn provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             dst.suite = suite;
             dst.usage = usage;
             dst.key_len = key_len as u8;
-            dst.data[..key_len].copy_from_slice(&sealed[7..7 + key_len]);
+            dst.data[..key_len].copy_from_slice(&key[..key_len]);
             dst.flags = FLAG_IN_USE;
-            zeroize(&mut sealed);
+            zeroize(&mut key);
             mint(new_slot)
         }
         dev_key_vault::AEAD_SEAL => {

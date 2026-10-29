@@ -1,0 +1,113 @@
+version = "1.0.0"
+hardware_targets = ["bcm2712", "linux"]
+# Per-layer replies that never come fail their operation after a wall-clock
+# deadline; nothing else here measures time.
+timer_class = "wall_clock"
+
+# TRANSPORT_CONTINUITY (contracts/net/transport_continuity.rs) over this
+# graph's `ip` and `tls`: an anchor's operations become the per-layer
+# continuity commands both modules answer (contracts/net/session_ctrl.rs
+# §Transport continuity), the canonical record is composed from the two
+# per-layer records a primary exports and split back into the two a standby
+# imports. Logic in `stack.rs`, frame moving in `mod.rs`, the map between the
+# records and what is and is not enforced at the head of `stack.rs`.
+#
+# Wiring: `ip.cont_out -> ip_cont`, `ip_ctl -> ip.cont_in`, and the same for
+# `tls`. Every port carries `[type:1][len:2 LE][payload]` frames.
+#
+# ─── Parameters (TLV) ──────────────────────────────────────────────────
+# | Tag | Name      | Type | Default | Description |
+# |-----|-----------|------|---------|-------------|
+# | 1   | anchor_id | str  | zero    | 16 hex digits: the anchor identity a per-flow emission token must name. |
+
+# The anchor's operations.
+[[ports]]
+name = "tc_ctl"
+index = 0
+direction = "input"
+content_type = "OctetStream"
+required = true
+buffer_size = { default = 8192, aarch64 = 32768 }
+
+# `ip.cont_out`.
+[[ports]]
+name = "ip_cont"
+index = 1
+direction = "input"
+content_type = "OctetStream"
+required = true
+buffer_size = { default = 8192, aarch64 = 16384 }
+
+# `tls.cont_out` (a whole CT_TLS checkpoint arrives in one step).
+[[ports]]
+name = "tls_cont"
+index = 2
+direction = "input"
+content_type = "OctetStream"
+required = true
+buffer_size = { default = 16384, aarch64 = 65536 }
+
+# The wrapped continuity object, from the custody path.
+[[ports]]
+name = "key_in"
+index = 3
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 4096
+
+# The authority's verdicts on ACTIVATE's token and on custody evidence.
+# Unwired: nothing activates.
+[[ports]]
+name = "auth_rsp"
+index = 4
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 2048
+
+# STATUS, CHUNK, DELTA, APPLIED, REJECTED, HORIZON, CUT and CUSTODY events to
+# the anchor.
+[[ports]]
+name = "tc_evt"
+index = 0
+direction = "output"
+content_type = "OctetStream"
+required = true
+buffer_size = { default = 16384, aarch64 = 32768 }
+
+# To `ip.cont_in`.
+[[ports]]
+name = "ip_ctl"
+index = 1
+direction = "output"
+content_type = "OctetStream"
+required = true
+buffer_size = { default = 4096, aarch64 = 8192 }
+
+# To `tls.cont_in`.
+[[ports]]
+name = "tls_ctl"
+index = 2
+direction = "output"
+content_type = "OctetStream"
+required = true
+buffer_size = { default = 16384, aarch64 = 32768 }
+
+# The wrapped continuity object a primary exports, to the custody path.
+[[ports]]
+name = "key_out"
+index = 3
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 4096
+
+# ACTIVATE's token and CUSTODY_WRAP's evidence, to the authority.
+[[ports]]
+name = "auth_req"
+index = 4
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 2048
+
+# Module-scope observability is exempt.
+[observability]
+exempt = "control-plane bridge — no data bytes cross it; the connection it moves is observed at ip and tls"

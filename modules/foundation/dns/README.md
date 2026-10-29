@@ -36,8 +36,10 @@ content_type = "NetProto"
 - `upstream`
 - `upstream_port` (destination port for forwarded queries, default 53 —
   lets a delegation listener on a non-standard port be the upstream)
-- `dns64_prefix` (absent by default; `"<ipv6>/96"` — only /96 is admitted,
-  anything else refuses construction) and `dns64_exclude` (repeatable
+- `dns64_prefix` (absent by default; `"<ipv6>/<len>"` — any RFC 6052
+  length, /32, /40, /48, /56, /64 or /96, with no bits past it and a zero
+  `u` octet; anything else refuses construction; an AAAA in `::ffff:0:0/96`
+  is treated as absent and synthesized over) and `dns64_exclude` (repeatable
   `"a.b.c.d/n"`; absent means every non-global IPv4 range is excluded, and
   the well-known prefix `64:ff9b::/96` excludes them whatever the list says)
 - `update_zone` (the one zone served authoritatively and open to TSIG-signed

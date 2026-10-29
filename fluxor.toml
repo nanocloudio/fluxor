@@ -47,7 +47,32 @@ limit_register_coverage = "fail"
 # `tests/host/qemu_access_bounds.sh` boots the `access_probe` fixture: the raw
 # register and cache-maintenance opcodes must refuse DRAM, holes and module
 # memory and serve device registers and DMA buffers.
-scripts = ["tools/ci/deps_budget.sh", "tests/host/service_bundle_e2e.sh", "tests/host/program_section.sh", "tools/ci/premmu_atomics.sh", "tests/host/qemu_net_ready_gate.sh", "tests/host/qemu_access_bounds.sh"]
+# The transport-continuity scripts run two Linux runtimes, each `ip` over
+# `linux_eth` in an unprivileged network namespace, and need the client to
+# see no reset and a byte-identical continuation:
+# `transport_continuity_move.sh` moves a live TCP+TLS connection over
+# TRANSPORT_CONTINUITY; `transport_continuity_crash.sh` kills the primary of
+# a crash-continuous pair with a whole 16 KiB record under the horizons;
+# `transport_continuity_halfclose.sh` and
+# `transport_continuity_crash_halfclose.sh` move and take over a connection
+# its client half-closed; `transport_continuity_own_close.sh` moves one with
+# our close_notify and FIN in flight, `transport_continuity_v6.sh` one over
+# IPv6, `transport_continuity_unconsumed.sh` one with a delivery the worker
+# never consumed, `transport_continuity_owed_key_update.sh` one owing the
+# answer to the client's KeyUpdate, and `transport_continuity_client.sh` a
+# session this host dialled. `quic_continuity_move.sh` moves a QUIC
+# connection (a routable server ID, its key moved vault to vault, activation
+# on the authority's verdict). `packet_seam_v6.sh` runs `ip`'s decision seam
+# on a veth against the Linux stack — IPv6 neighbour discovery and echo,
+# datagrams tunnelled and sent back at the frame level through the NIC
+# merge, forward-and-copy, an IPv6 RST, LOCAL over both families, `ip6`'s
+# own address — and `packet_seam_sharded.sh` the same behind `seam_shard`
+# with the forward port shared through `fwd_split`. `quic_v6.sh` runs an
+# independent QUIC peer over IPv6 and IPv4 against `quic` on `ip`;
+# `rescue_tunnel.sh` carries a flow from the ingress host to its anchor's
+# host, refusing forged and replayed datagrams; `remote_channel_mux.sh`
+# resumes a channel on the mux carrier over QUIC across three cuts.
+scripts = ["tools/ci/deps_budget.sh", "tests/host/service_bundle_e2e.sh", "tests/host/program_section.sh", "tools/ci/premmu_atomics.sh", "tests/host/qemu_net_ready_gate.sh", "tests/host/qemu_access_bounds.sh", "tests/host/transport_continuity_move.sh", "tests/host/transport_continuity_crash.sh", "tests/host/transport_continuity_halfclose.sh", "tests/host/transport_continuity_crash_halfclose.sh", "tests/host/packet_seam_v6.sh", "tests/host/packet_seam_sharded.sh", "tests/host/quic_v6.sh", "tests/host/transport_continuity_own_close.sh", "tests/host/transport_continuity_v6.sh", "tests/host/transport_continuity_unconsumed.sh", "tests/host/transport_continuity_owed_key_update.sh", "tests/host/transport_continuity_client.sh", "tests/host/quic_continuity_move.sh", "tests/host/rescue_tunnel.sh", "tests/host/remote_channel_mux.sh"]
 
 [ci.cargo]
 # Where the cargo phase runs. fluxor's workspace root is the bare-metal

@@ -34,6 +34,15 @@ direction = "output"
 content_type = "NetProto"
 required = true
 
-# Module-scope observability — exempt (standards/observability.md §6).
+# Module-scope observability — exempt.
 [observability]
 exempt = "seam fixture; the packets it disposes are counted by ip's seam gauges (held/expired/decided per disposition), which are the observable"
+
+# With `reflect`, a tunnelled UDP datagram goes back to its sender as a
+# whole Ethernet frame on this port, which a graph wires to the NIC's
+# transmit port beside `ip`'s: two writers, one kernel merge.
+[[ports]]
+name = "frames_out"
+direction = "output"
+index = 1
+content_type = "EthernetFrame"

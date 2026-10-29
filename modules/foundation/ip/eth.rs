@@ -10,6 +10,7 @@ pub const ETH_HEADER_LEN: usize = 14;
 /// Ethertypes
 pub const ETHERTYPE_IPV4: u16 = 0x0800;
 pub const ETHERTYPE_ARP: u16 = 0x0806;
+pub const ETHERTYPE_IPV6: u16 = 0x86DD;
 
 /// Parse ethernet header fields from raw frame.
 ///

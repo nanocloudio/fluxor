@@ -1,4 +1,4 @@
-//! echo_worker — demonstration SessionCtrlV1 session worker.
+//! echo_worker — a demonstration session worker over session control.
 //!
 //! Pairs with `echo_anchor` to demonstrate the anchor / worker split
 //! described in `docs/architecture/protocol_surfaces.md`. The anchor
@@ -6,8 +6,8 @@
 //! state (trivial here: uppercase each byte). Two channel pairs link
 //! them:
 //!
-//!   anchor.ctrl_out  →  worker.ctrl_in    (SessionCtrlV1)
-//!   worker.ctrl_out  →  anchor.ctrl_in    (SessionCtrlV1 replies)
+//!   anchor.ctrl_out  →  worker.ctrl_in    (session-control)
+//!   worker.ctrl_out  →  anchor.ctrl_in    (session-control replies)
 //!   anchor.data_out  →  worker.data_in    (client bytes → worker)
 //!   worker.data_out  →  anchor.data_in    (worker bytes → client)
 //!
@@ -28,7 +28,7 @@
 //!
 //! # Anchor-preserved handoff (export / import / resume)
 //!
-//! The worker also implements both halves of the SessionCtrlV1 opaque
+//! The worker also implements both halves of the session-control opaque
 //! state handoff (`session_handoff` core), so an anchor can swap a
 //! session between two worker instances while the client transport
 //! stays open:
@@ -97,7 +97,7 @@ include!("../../sdk/runtime.rs");
 include!("../../sdk/cores/session_handoff.rs");
 
 // ============================================================================
-// SessionCtrlV1 opcodes (see modules/sdk/contracts/net/session_ctrl.rs)
+// session-control opcodes (see modules/sdk/contracts/net/session_ctrl.rs)
 // ============================================================================
 
 const SC_CMD_HELLO: u8 = 0x70;
@@ -257,10 +257,10 @@ impl WorkerState {
 }
 
 // ============================================================================
-// SessionCtrlV1 emitters
+// session-control emitters
 // ============================================================================
 
-/// Write a SessionCtrlV1 frame: `[msg_type][len:2 LE][payload...]`.
+/// Write a session-control frame: `[msg_type][len:2 LE][payload...]`.
 /// Frame assembly reuses `ctrl_buf`; caller provides the payload slice
 /// fully formed. Uses raw syscall-pointer deref to avoid holding an
 /// immutable borrow of `s` while mutably touching `ctrl_buf`.

@@ -25,7 +25,7 @@ pub const E_NOSYS: i32 = -38;
 pub const E_CONNREFUSED: i32 = -111;
 
 // ============================================================================
-// Socket Types (net_proto / Stream Surface v1)
+// Socket Types (net_proto stream surface)
 // ============================================================================
 
 /// Stream-oriented socket (TCP). The only valid SOCK_TYPE for

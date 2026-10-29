@@ -26,8 +26,10 @@ pub struct AckTracker {
     /// (the one ACK frames lead with) is always `ranges[0]`.
     pub ranges: [AckRange; MAX_ACK_RANGES],
     pub count: u8,
-    /// Wall-clock millis when the largest acknowledged was received,
-    /// used by the peer to compute RTT (RFC 9002 §5.3).
+    /// Wall-clock millis when the largest acknowledged was received: an
+    /// ACK frame's ack_delay is the time since (RFC 9000 §13.2.5), which
+    /// the peer subtracts from its RTT sample (RFC 9002 §5.3). 0: unknown
+    /// (ranges restored from a checkpoint), sent as no delay.
     pub largest_ack_recv_ms: u64,
     /// Whether an ACK frame is owed on the next emission opportunity.
     pub ack_pending: bool,
@@ -49,7 +51,8 @@ impl AckTracker {
         }
     }
 
-    pub fn record(&mut self, pn: u64, now_ms: u64) {
+    /// Note packet `pn` received at `rx_ms` (wall-clock millis).
+    pub fn record(&mut self, pn: u64, rx_ms: u64) {
         // Either extend an existing range or insert a new one. Ranges
         // are kept sorted descending by `high`; this scan is bounded
         // by MAX_ACK_RANGES so it's effectively constant time.
@@ -63,20 +66,20 @@ impl AckTracker {
             if pn == r.high.wrapping_add(1) {
                 r.high = pn;
                 self.coalesce(i);
-                self.bump_largest(now_ms);
+                self.bump_largest(pn, rx_ms);
                 self.ack_pending = true;
                 return;
             }
             if pn.wrapping_add(1) == r.low {
                 r.low = pn;
                 self.coalesce(i);
-                self.bump_largest(now_ms);
+                self.bump_largest(pn, rx_ms);
                 self.ack_pending = true;
                 return;
             }
             if pn > r.high {
                 self.insert_at(i, AckRange { low: pn, high: pn });
-                self.bump_largest(now_ms);
+                self.bump_largest(pn, rx_ms);
                 self.ack_pending = true;
                 return;
             }
@@ -90,11 +93,14 @@ impl AckTracker {
             // Drop oldest (lowest) range; insert at end.
             self.ranges[MAX_ACK_RANGES - 1] = AckRange { low: pn, high: pn };
         }
-        self.bump_largest(now_ms);
+        self.bump_largest(pn, rx_ms);
         self.ack_pending = true;
     }
 
-    fn bump_largest(&mut self, now_ms: u64) {
+    /// Restore the descending order after an insert, and stamp the receipt
+    /// time when `pn` became the largest acknowledged — a reordered, lower
+    /// number leaves the stamp of the largest as it was.
+    fn bump_largest(&mut self, pn: u64, rx_ms: u64) {
         if self.count == 0 {
             return;
         }
@@ -111,7 +117,9 @@ impl AckTracker {
             }
             i += 1;
         }
-        self.largest_ack_recv_ms = now_ms;
+        if self.ranges[0].high == pn {
+            self.largest_ack_recv_ms = rx_ms;
+        }
     }
 
     fn coalesce(&mut self, idx: usize) {
@@ -157,6 +165,18 @@ impl AckTracker {
         if self.count > 0 {
             self.count -= 1;
         }
+    }
+
+    /// The ACK Delay field an ACK frame sent at `now_ms` carries (RFC 9000
+    /// §13.2.5, §19.3): the time since the largest acknowledged packet
+    /// arrived, in microseconds shifted right by the exponent this endpoint
+    /// advertises (none: the default 3). 0 when the arrival is unknown.
+    pub fn ack_delay_field(&self, now_ms: u64) -> u64 {
+        if self.largest_ack_recv_ms == 0 {
+            return 0;
+        }
+        let held_ms = now_ms.saturating_sub(self.largest_ack_recv_ms);
+        held_ms.saturating_mul(1000) >> DEFAULT_ACK_DELAY_EXPONENT
     }
 
     pub fn largest_ack(&self) -> Option<u64> {

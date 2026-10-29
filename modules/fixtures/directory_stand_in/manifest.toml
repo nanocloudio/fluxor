@@ -4,7 +4,7 @@ timer_class = "agnostic"
 
 # A stand-in for the session-directory side of a continuity declaration,
 # at fixture scale: one instance, in memory, on a node of its own. It
-# answers the directory's SessionCtrlV1 verbs on `ctrl_in` / `ctrl_out` —
+# answers the directory's session-control verbs on `ctrl_in` / `ctrl_out` —
 # HELLO as `ROLE_DIRECTORY`, ATTACH / DETACH / RELOCATE / EPOCH_BUMP under
 # single-writer authority per (session_id, session_epoch): a binding only
 # ever moves to a higher epoch, and a command carrying a lower one is
@@ -34,14 +34,14 @@ capabilities = [
   "durable.rpo_zero",
 ]
 
-# SessionCtrlV1 commands from an anchor or a coordinator.
+# Session-control commands from an anchor or a coordinator.
 [[ports]]
 name = "ctrl_in"
 direction = "input"
 content_type = "OctetStream"
 buffer_size = 4096
 
-# SessionCtrlV1 replies and reservation grants.
+# Session-control replies and reservation grants.
 [[ports]]
 name = "ctrl_out"
 direction = "output"
@@ -52,6 +52,6 @@ buffer_size = 4096
 requires_contract = "channel"
 access = "read"
 
-# Module-scope observability — exempt (standards/observability.md §6).
+# Module-scope observability — exempt.
 [observability]
 exempt = "directory fixture; its log lines are the observable a harness test and a rig read"

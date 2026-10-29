@@ -1,7 +1,7 @@
 // Platform: Linux hosted — runs Fluxor as an aarch64 Linux userspace process.
 //
 // Loads real PIC .fmod modules via mmap and runs the same scheduler/graph
-// model as the embedded targets. Single-domain (v1): one thread, cooperative
+// model as the embedded targets. Single-domain: one thread, cooperative
 // step loop with std::thread::sleep for tick timing.
 //
 // Usage:
@@ -44,7 +44,7 @@ struct CliArgs {
 }
 
 /// `fluxor-linux vault-import --module <type> --label <label> --suite
-/// <hmac-sha256|aead-key> --key-hex <64 hex>`: provision one symmetric key
+/// <hmac-sha256|aead-key> --key-hex <64 hex> [--wrap yes]`: provision one symmetric key
 /// into this host's durable vault for module type `<type>`, sealed exactly as
 /// the kernel vault seals a key it generated, so that module's later `OPEN` by
 /// label finds it. Labels live in their module type's namespace, so the key is
@@ -52,6 +52,14 @@ struct CliArgs {
 /// shared secret provisioned out of band — a TSIG key for the dns module — has
 /// no other path to one: `OPEN_OR_GENERATE` would mint a key nobody else
 /// holds.
+///
+/// `--wrap yes` adds `WRAP` to an `aead-key`'s uses: a key that seals other
+/// key material and may leave the vault only wrapped to an attested
+/// recipient. The vault checks an open's uses against the key's and never
+/// widens them, so a key provisioned for such an open must carry them from
+/// the start. (`tls`'s continuity keys are not provisioned this way: each
+/// flow's is derived from a master its vault makes and moves vault to vault
+/// by custody transfer.)
 ///
 /// Needs `FLUXOR_SEAL_KEY` and `FLUXOR_VAULT_DIR` (or `FLUXOR_STORE_DIR`),
 /// the same two the runtime unseals with. The key is 32 bytes; the label is
@@ -62,6 +70,7 @@ fn vault_import(args: &[String]) -> ! {
     let mut label = String::new();
     let mut suite = String::new();
     let mut key_hex = String::new();
+    let mut wrap = String::new();
     let mut i = 0;
     while i < args.len() {
         let next = args.get(i + 1).cloned().unwrap_or_default();
@@ -70,6 +79,7 @@ fn vault_import(args: &[String]) -> ! {
             "--label" => label = next,
             "--suite" => suite = next,
             "--key-hex" => key_hex = next,
+            "--wrap" => wrap = next,
             other => {
                 eprintln!("error: vault-import: unknown argument: {other}");
                 process::exit(1);
@@ -88,6 +98,14 @@ fn vault_import(args: &[String]) -> ! {
         ),
         _ => {
             eprintln!("error: vault-import: --suite must be hmac-sha256 or aead-key");
+            process::exit(1);
+        }
+    };
+    let usage = match (wrap.as_str(), suite_id) {
+        ("" | "no", _) => usage,
+        ("yes", kv::suite::AEAD_KEY) => usage | kv::usage::WRAP,
+        _ => {
+            eprintln!("error: vault-import: --wrap yes applies to an aead-key only");
             process::exit(1);
         }
     };
@@ -146,6 +164,62 @@ fn vault_import(args: &[String]) -> ! {
     process::exit(0);
 }
 
+/// `fluxor-linux vault-identity --module <type> --label <label>`: the P-256
+/// signing identity module type `<type>` opens under `<label>` in this
+/// host's durable vault — generated there if it does not exist yet — printed
+/// as its public key (`vault-identity: <label> <65-byte SEC1 hex>`). The
+/// private half is generated inside the vault and only ever sealed; what an
+/// operator takes away is the public half a relying party is told to trust,
+/// as `tls`'s custody identity (`tls-custody`) is for the authority that
+/// decides a transfer of a connection's continuity key. Needs the same
+/// `FLUXOR_SEAL_KEY` and `FLUXOR_VAULT_DIR` (or `FLUXOR_STORE_DIR`) as
+/// `vault-import`.
+fn vault_identity(args: &[String]) -> ! {
+    use fluxor::abi::contracts::key_vault as kv;
+    let mut module = String::new();
+    let mut label = String::new();
+    let mut i = 0;
+    while i < args.len() {
+        let next = args.get(i + 1).cloned().unwrap_or_default();
+        match args[i].as_str() {
+            "--module" => module = next,
+            "--label" => label = next,
+            other => {
+                eprintln!("error: vault-identity: unknown argument: {other}");
+                process::exit(1);
+            }
+        }
+        i += 2;
+    }
+    if module.is_empty() || label.is_empty() || label.len() > kv::MAX_LABEL {
+        eprintln!("error: vault-identity: --module <type> --label <1..=64 bytes>");
+        process::exit(1);
+    }
+    fluxor::kernel::boot(&LINUX_HAL_OPS);
+    let namespace = fluxor::abi::wire::fnv1a32(module.as_bytes());
+    // SAFETY: single-threaded CLI; nothing else touches the vault.
+    let rc = unsafe {
+        fluxor::kernel::security::key_vault::identity_public(namespace, label.as_bytes())
+    };
+    match rc {
+        Ok(public) => {
+            let hex: String = public.iter().map(|b| format!("{b:02x}")).collect();
+            println!("vault-identity: {label} {hex}");
+            process::exit(0);
+        }
+        Err(e) if e == fluxor::abi::errno::ENOSYS => {
+            eprintln!(
+                "error: vault-identity: this host cannot keep keys (set FLUXOR_SEAL_KEY, 64 hex, and FLUXOR_VAULT_DIR or FLUXOR_STORE_DIR)"
+            );
+            process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("error: vault-identity: the identity could not be opened or made ({e})");
+            process::exit(1);
+        }
+    }
+}
+
 /// `fluxor-linux reclaim`: collect every dead instance's host objects (links,
 /// routes, policy tables, tunables, claims) from the host registry, without
 /// starting a runtime — a service manager's post-stop hook
@@ -201,6 +275,9 @@ fn parse_args() -> CliArgs {
     if args.get(1).map(String::as_str) == Some("vault-import") {
         vault_import(&args[2..]);
     }
+    if args.get(1).map(String::as_str) == Some("vault-identity") {
+        vault_identity(&args[2..]);
+    }
     if args.get(1).map(String::as_str) == Some("reclaim") {
         reclaim(&args[2..]);
     }
@@ -230,7 +307,8 @@ fn parse_args() -> CliArgs {
             }
             "--help" | "-h" => {
                 eprintln!("Usage: fluxor-linux --config <config.bin> --modules <modules.bin>");
-                eprintln!("       fluxor-linux vault-import --module <type> --label <label> --suite <hmac-sha256|aead-key> --key-hex <64 hex>");
+                eprintln!("       fluxor-linux vault-import --module <type> --label <label> --suite <hmac-sha256|aead-key> --key-hex <64 hex> [--wrap yes]");
+                eprintln!("       fluxor-linux vault-identity --module <type> --label <label>   (print, making if absent, a P-256 identity's public key)");
                 eprintln!("       fluxor-linux reclaim   (collect dead instances' host objects; FLUXOR_INSTANCE names one)");
                 eprintln!();
                 eprintln!("Options:");
@@ -327,6 +405,7 @@ include!("linux/linux_surface_traits_scan.rs");
 include!("linux/linux_surface_traits.rs");
 include!("linux/linux_surface_traits_probe.rs");
 include!("linux/linux_pointer.rs");
+include!("linux/linux_eth.rs");
 include!("linux/owner_log_tee.rs");
 
 /// Runtime parameter overrides, file-backed. Its own module so its parse and
@@ -594,6 +673,13 @@ fn build_graph_linux() -> (usize, usize) {
 
         if entry.name_hash == LINUX_POINTER_HASH {
             let m = build_linux_pointer(module_idx, entry.params());
+            scheduler::store_builtin_module(module_idx, m);
+            loaded_count += 1;
+            continue;
+        }
+
+        if entry.name_hash == LINUX_ETH_HASH {
+            let m = build_linux_eth(module_idx, entry.params());
             scheduler::store_builtin_module(module_idx, m);
             loaded_count += 1;
             continue;

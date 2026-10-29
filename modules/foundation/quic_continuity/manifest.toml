@@ -1,0 +1,72 @@
+version = "1.0.0"
+hardware_targets = ["bcm2712", "linux"]
+# Per-layer replies that never come fail their operation after a wall-clock
+# deadline; nothing else here measures time.
+timer_class = "wall_clock"
+
+# TRANSPORT_CONTINUITY over this graph's `quic` (`TcTransport::Quic`;
+# contracts/net/transport_continuity.rs, the QUIC section): an anchor's
+# operations become the per-layer continuity commands `quic` answers
+# (`session_ctrl.rs`, CT_QUIC), and the canonical record is `WHQ1` — the
+# anchor's view (CIDs, path, packet-number high-water) and `quic`'s own
+# record whole. A crash-continuous primary's per-layer deltas are the
+# stream's `QuicDelta`s, `quic`'s strict horizons waiting on the anchor's
+# DELTA_ACK; ACTIVATE needs an armed shadow, a fence, a strictly higher
+# epoch and the authority's verdict on the per-flow token; the activated
+# `quic` then validates the client's path. Logic in `qcs.rs`.
+#
+# Wiring: `quic.cont_out -> quic_cont`, `quic_ctl -> quic.cont_in`.
+#
+# ─── Parameters (TLV) ──────────────────────────────────────────────────
+# | Tag | Name      | Type | Default | Description |
+# |-----|-----------|------|---------|-------------|
+# | 1   | anchor_id | str  | zero    | 16 hex digits: the anchor identity a per-flow emission token must name. |
+
+[[ports]]
+name = "tc_ctl"
+index = 0
+direction = "input"
+content_type = "OctetStream"
+required = true
+buffer_size = { default = 16384, aarch64 = 65536 }
+
+[[ports]]
+name = "quic_cont"
+index = 1
+direction = "input"
+content_type = "OctetStream"
+required = true
+buffer_size = { default = 16384, aarch64 = 65536 }
+
+[[ports]]
+name = "auth_rsp"
+index = 2
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 2048
+
+[[ports]]
+name = "tc_evt"
+index = 0
+direction = "output"
+content_type = "OctetStream"
+required = true
+buffer_size = { default = 16384, aarch64 = 65536 }
+
+[[ports]]
+name = "quic_ctl"
+index = 1
+direction = "output"
+content_type = "OctetStream"
+required = true
+buffer_size = { default = 16384, aarch64 = 65536 }
+
+[[ports]]
+name = "auth_req"
+index = 2
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 2048
+
+[observability]
+exempt = "control-plane bridge — no data bytes cross it; the connection it moves is observed at quic"

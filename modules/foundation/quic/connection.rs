@@ -780,6 +780,7 @@ pub const RETIRE_QUEUE: usize = 4;
 
 /// QUIC transport error codes this endpoint closes with (RFC 9000 §20.1).
 pub const ERR_STREAM_LIMIT: u64 = 0x04;
+pub const ERR_TRANSPORT_PARAMETER: u64 = 0x08;
 pub const ERR_STREAM_STATE: u64 = 0x05;
 pub const ERR_CONNECTION_ID_LIMIT: u64 = 0x09;
 pub const ERR_PROTOCOL_VIOLATION: u64 = 0x0a;
@@ -985,23 +986,34 @@ impl PnSpace {
 
 #[derive(Clone, Copy)]
 pub struct PeerAddr {
-    pub ip: [u8; 4],
+    /// Sixteen bytes: an IPv6 address, or an IPv4 one IPv4-mapped
+    /// (`::ffff:a.b.c.d`, RFC 4291 §2.5.5.2) — one form for both families,
+    /// the datagram surface's `af` chosen from it at the edge.
+    pub ip: [u8; 16],
     pub port: u16,
+}
+
+/// An IPv4 address in the IPv4-mapped form `PeerAddr` holds.
+pub const fn ip_mapped(a: [u8; 4]) -> [u8; 16] {
+    [
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, a[0], a[1], a[2], a[3],
+    ]
+}
+
+/// The IPv4 address an IPv4-mapped one names.
+pub fn ip_v4_of(a: &[u8; 16]) -> Option<[u8; 4]> {
+    (a[..10] == [0; 10] && a[10] == 0xFF && a[11] == 0xFF).then(|| [a[12], a[13], a[14], a[15]])
 }
 
 impl PeerAddr {
     pub const fn unset() -> Self {
         Self {
-            ip: [0; 4],
+            ip: [0; 16],
             port: 0,
         }
     }
-    pub fn matches(&self, ip: &[u8; 4], port: u16) -> bool {
-        self.ip[0] == ip[0]
-            && self.ip[1] == ip[1]
-            && self.ip[2] == ip[2]
-            && self.ip[3] == ip[3]
-            && self.port == port
+    pub fn matches(&self, ip: &[u8; 16], port: u16) -> bool {
+        self.ip == *ip && self.port == port
     }
     pub fn is_unset(&self) -> bool {
         self.port == 0
@@ -1009,13 +1021,13 @@ impl PeerAddr {
     /// Whether the peer's address is known. A peer dialled by name has
     /// none until it answers.
     pub fn has_address(&self) -> bool {
-        self.ip != [0; 4]
+        self.ip != [0; 16] && ip_v4_of(&self.ip) != Some([0; 4])
     }
 }
 
 /// RTT estimator state per connection (RFC 9002 §5).
-/// Smoothed RTT + variance + min RTT, all in milliseconds. The PTO
-/// computation in `quic_pto_check` reads these to size the timer.
+/// Smoothed RTT + variance + min RTT, all in milliseconds. `quic_pto_check`
+/// and the idle timeout's floor size their timers from [`RttSample::pto`].
 pub struct RttSample {
     /// Most recent RTT sample (ms). 0 = uninitialised.
     pub latest_rtt: u32,
@@ -1046,9 +1058,18 @@ impl RttSample {
         }
     }
 
-    /// Apply a fresh sample (RFC 9002 §5.3 update rule).
-    /// Caller passes the wall-clock latency in milliseconds.
-    pub fn update(&mut self, sample_ms: u32) {
+    /// Apply a fresh sample (RFC 9002 §5.3): `sample_ms` the wall-clock
+    /// latency of the largest newly acknowledged packet, `ack_delay_ms` the
+    /// delay the peer reported for it, already clamped by the caller (0 in
+    /// Initial and Handshake, at most the peer's `max_ack_delay` once the
+    /// handshake is confirmed).
+    ///
+    /// `min_rtt` takes the raw sample. The first sample sets
+    /// `smoothed_rtt` to it and `rttvar` to half of it. Later ones are
+    /// adjusted by the ack delay only when that leaves them at or above
+    /// `min_rtt`, then folded in: `rttvar = 3/4 rttvar + 1/4 |smoothed -
+    /// adjusted|`, `smoothed = 7/8 smoothed + 1/8 adjusted`.
+    pub fn update(&mut self, sample_ms: u32, ack_delay_ms: u32) {
         self.latest_rtt = sample_ms;
         if !self.seeded {
             self.min_rtt = sample_ms;
@@ -1060,24 +1081,27 @@ impl RttSample {
         if sample_ms < self.min_rtt {
             self.min_rtt = sample_ms;
         }
-        // RFC 9002 §5.3: rttvar = 3/4 * rttvar + 1/4 * |smoothed - latest|
-        // smoothed = 7/8 * smoothed + 1/8 * latest
-        let abs_diff = self.smoothed_rtt.abs_diff(sample_ms);
-        self.rttvar = (3 * self.rttvar + abs_diff) / 4;
-        self.smoothed_rtt = (7 * self.smoothed_rtt + sample_ms) / 8;
+        let adjusted = if sample_ms >= self.min_rtt.saturating_add(ack_delay_ms) {
+            sample_ms - ack_delay_ms
+        } else {
+            sample_ms
+        };
+        let abs_diff = self.smoothed_rtt.abs_diff(adjusted);
+        self.rttvar = ((3 * u64::from(self.rttvar) + u64::from(abs_diff)) / 4) as u32;
+        self.smoothed_rtt = ((7 * u64::from(self.smoothed_rtt) + u64::from(adjusted)) / 8) as u32;
     }
 
-    /// Probe Timeout (RFC 9002 §6.2.1) in milliseconds.
-    /// PTO = smoothed_rtt + max(4 * rttvar, kGranularity) + max_ack_delay
-    /// kGranularity defaults to 1ms; max_ack_delay defaults to 25ms
-    /// (RFC 9002 §6.2 + §A.2).
-    pub fn pto(&self) -> u32 {
+    /// Probe Timeout (RFC 9002 §6.2.1) in milliseconds, without backoff:
+    /// `smoothed_rtt + max(4 * rttvar, kGranularity) + max_ack_delay`, with
+    /// kGranularity 1 ms. `max_ack_delay` is the peer's for the
+    /// application-data space and 0 for Initial and Handshake, whose
+    /// acknowledgements are not delayed.
+    pub fn pto(&self, max_ack_delay: u32) -> u32 {
         const K_GRANULARITY: u32 = 1;
-        const MAX_ACK_DELAY: u32 = 25;
-        let var_term = (4u32 * self.rttvar).max(K_GRANULARITY);
+        let var_term = self.rttvar.saturating_mul(4).max(K_GRANULARITY);
         self.smoothed_rtt
             .saturating_add(var_term)
-            .saturating_add(MAX_ACK_DELAY)
+            .saturating_add(max_ack_delay)
     }
 }
 
@@ -1248,14 +1272,34 @@ pub struct QuicConnection {
     /// every other stream on the connection starves.
     pub tx_cursor_bidi: u8,
     pub tx_cursor_uni: u8,
-    /// Wall-clock millis of the most recent activity on this conn —
-    /// any inbound packet decrypt success, any outbound emit. Drives
-    /// idle-timeout closure (RFC 9000 §10.1). Zero = uninitialised
-    /// (set to first dev_millis() on connection open).
+    /// Wall-clock millis of the most recent activity on this conn — an
+    /// inbound packet authenticated, or the first ack-eliciting packet
+    /// sent since then (RFC 9000 §10.1). Drives idle-timeout closure.
+    /// Zero until the connection's first packet is received or sent.
     pub last_activity_ms: u64,
+    /// An ack-eliciting packet has gone since the last one was received:
+    /// a later send does not restart the idle timer (RFC 9000 §10.1).
+    pub eliciting_since_rx: bool,
     /// Negotiated idle timeout in ms (the smaller of our + peer
-    /// `max_idle_timeout` TPs, RFC 9000 §10.1.2). 0 = disabled.
+    /// `max_idle_timeout` TPs, a zero one being none; RFC 9000 §10.1).
+    /// 0 = disabled. The timeout a check applies is
+    /// [`QuicConnection::idle_timeout_in_force`].
     pub idle_timeout_ms: u64,
+    /// A taken-over connection's first idle deadline (dev_millis): what was
+    /// left of the primary's timer, as one deadline that ends the
+    /// connection unless the peer is heard first. 0 = none; while set, the
+    /// ordinary timer is not consulted.
+    pub idle_first_deadline_ms: u64,
+    /// On an imported connection not yet activated, the idle remainder the
+    /// checkpoint carried, in ms. Read only at activation.
+    pub idle_carried_ms: u64,
+    /// The peer's `max_ack_delay` in ms (RFC 9000 §18.2; 25 when absent),
+    /// the delay it may add before acknowledging an application-data
+    /// packet. Part of that space's PTO (RFC 9002 §6.2.1).
+    pub peer_max_ack_delay_ms: u32,
+    /// The peer's `ack_delay_exponent` (RFC 9000 §18.2; 3 when absent): its
+    /// ACK frames' ack_delay is that many bits short of microseconds.
+    pub peer_ack_delay_exponent: u8,
 
     // ── Observability: `quic.connection` span (server-accepted conns) ──
     /// 16-byte W3C trace id, minted at server-accept when telemetry is wired.
@@ -1321,7 +1365,7 @@ pub struct QuicConnection {
     pub path_validate_ms: u64,
     /// Candidate path under validation (the new 4-tuple). Becomes the
     /// active `peer` once validation succeeds.
-    pub cand_ip: [u8; 4],
+    pub cand_ip: [u8; 16],
     pub cand_port: u16,
     /// A PATH_CHALLENGE is queued for emission to the candidate path.
     pub path_challenge_tx_pending: bool,
@@ -1340,7 +1384,7 @@ pub struct QuicConnection {
     /// into the validated-path data packet.
     pub path_response_tx_pending: bool,
     pub path_response_data: [u8; 8],
-    pub path_response_to_ip: [u8; 4],
+    pub path_response_to_ip: [u8; 16],
     pub path_response_to_port: u16,
     /// Source 4-tuple of the datagram currently being dispatched. Set in
     /// `mod.rs` when bytes are staged into `inbound`, before
@@ -1349,7 +1393,7 @@ pub struct QuicConnection {
     /// (RFC 9000 §8.2.2 / §8.2.3). Without this a PATH_RESPONSE could be
     /// matched on token alone and promote a candidate that answered on
     /// the wrong path.
-    pub recv_ip: [u8; 4],
+    pub recv_ip: [u8; 16],
     pub recv_port: u16,
     /// Size of the datagram currently being dispatched, counted toward the
     /// anti-amplification allowance of an unvalidated address (RFC 9000
@@ -1363,6 +1407,13 @@ pub struct QuicConnection {
     /// packet is acknowledged only once everything in it is processed
     /// (RFC 9000 §13.1).
     pub rx_unaccepted: bool,
+    /// Whether the packet `process_frames` last read was ack-eliciting: it
+    /// held a frame other than PADDING, ACK and CONNECTION_CLOSE (RFC 9000
+    /// §13.2.1). Only such a packet makes an acknowledgement owed; an
+    /// ACK-only packet is recorded and acknowledged with the next one we
+    /// send, never on its own — two endpoints that answered each other's
+    /// acknowledgements would do nothing else.
+    pub rx_eliciting: bool,
     /// Sequence number of our connection ID the peer used on the active
     /// path. A change with the address marks an intentional migration,
     /// which moves our own sending to a fresh peer ID (RFC 9000 §9.5).
@@ -1597,19 +1648,21 @@ pub struct QuicConnection {
     /// on them — so this survives a wire that is momentarily full and the
     /// per-step service retries until it takes them.
     pub cont_held_confirmed: bool,
-    /// Steps a strict horizon has been outstanding. A horizon is a promise
-    /// the standby will answer; one that never does would otherwise hold
-    /// the connection silent for ever, so past `CONT_HORIZON_STEPS` the
-    /// mirror is abandoned and the connection carries on unmirrored.
-    pub cont_horizon_steps: u32,
+    /// When the strict horizon now outstanding began waiting (`dev_millis`,
+    /// 0 while none is). A horizon is a promise the standby will answer;
+    /// one that never does would otherwise hold the connection silent for
+    /// ever, so past `CONT_HORIZON_MS` the mirror is abandoned and the
+    /// connection carries on unmirrored.
+    pub cont_horizon_since_ms: u64,
     /// The mirror was abandoned and the abort has not yet left `cont_out`.
     pub cont_abandon_pending: bool,
     /// Inbound 1-RTT packet numbers whose receipt is mirrored but not yet
-    /// confirmed, with the delta each rides on. Under the strict profile
-    /// a number is not acknowledged to the peer until the standby has
-    /// confirmed it, so the acknowledgement shown to the peer never runs
-    /// ahead of what a takeover could honour.
-    pub cont_recv_hold: [(u64, u32); CONT_RECV_HOLD],
+    /// confirmed, with the delta each rides on and when it arrived
+    /// (`dev_millis`, so its acknowledgement reports the hold as its
+    /// delay). Under the strict profile a number is not acknowledged to the
+    /// peer until the standby has confirmed it, so the acknowledgement shown
+    /// to the peer never runs ahead of what a takeover could honour.
+    pub cont_recv_hold: [(u64, u32, u64); CONT_RECV_HOLD],
     pub cont_recv_hold_len: u8,
 }
 
@@ -1619,11 +1672,21 @@ pub struct QuicConnection {
 /// number.
 pub const CONT_RECV_HOLD: usize = 16;
 
-/// Steps a strict horizon may stay unconfirmed before the mirror is
-/// abandoned. The inputs are one channel for every connection, so a
-/// horizon is counted in steps rather than milliseconds: it is the
-/// standby's turn that is missing, not a wall-clock deadline.
-pub const CONT_HORIZON_STEPS: u32 = 2000;
+/// How long a strict horizon may stay unconfirmed before the mirror is
+/// abandoned, in wall-clock milliseconds — `tls`'s budget. A mirror link
+/// between hosts that reconnects (the remote channel resumes a session in
+/// well under this) holds the pair; a step count would make the budget a
+/// function of how fast the scheduler runs, which a reconnect does not
+/// track.
+pub const CONT_HORIZON_MS: u64 = 2000;
+
+/// The `max_ack_delay` an endpoint with a continuity channel advertises
+/// (RFC 9000 §18.2). A connection it later runs under the crash-continuous
+/// profile withholds each acknowledgement until the standby holds the
+/// packet's receipt, and past `CONT_HORIZON_MS` abandons the mirror and
+/// lets it go; the default 25 ms on top covers the steps between the hold
+/// starting, the horizon being checked and the acknowledgement being sent.
+pub const CONT_MAX_ACK_DELAY_MS: u64 = CONT_HORIZON_MS + DEFAULT_MAX_ACK_DELAY_MS as u64;
 
 impl Default for QuicConnection {
     fn default() -> Self {
@@ -1632,6 +1695,49 @@ impl Default for QuicConnection {
 }
 
 impl QuicConnection {
+    /// The idle timeout in force now, in milliseconds; 0 is none. It is the
+    /// negotiated one (`idle_timeout_ms`) raised to at least three times
+    /// the current Probe Timeout (RFC 9000 §10.1), so a peer advertising a
+    /// timeout shorter than the path's round trip cannot end the
+    /// connection before a probe has had the time to be answered. Read at
+    /// each check: the floor follows the RTT estimate.
+    pub fn idle_timeout_in_force(&self) -> u64 {
+        if self.idle_timeout_ms == 0 {
+            return 0;
+        }
+        self.idle_timeout_ms.max(3 * u64::from(self.pto_app()))
+    }
+
+    /// The ack delay a peer's ACK frame reports, in milliseconds, as an RTT
+    /// sample subtracts it (RFC 9002 §5.3): `ack_delay << ack_delay_exponent`
+    /// microseconds in the application-data space, clamped to the peer's
+    /// `max_ack_delay` once the handshake is confirmed; 0 in Initial and
+    /// Handshake.
+    pub fn peer_ack_delay_ms(&self, level: EncLevel, encoded: u64) -> u32 {
+        if !matches!(level, EncLevel::OneRtt) {
+            return 0;
+        }
+        // An exponent is at most 20, so the shift loses nothing below 2^44
+        // and saturates above it.
+        let us = if encoded >= 1 << 44 {
+            u64::MAX
+        } else {
+            encoded << self.peer_ack_delay_exponent
+        };
+        let ms = (us / 1000).min(u64::from(u32::MAX)) as u32;
+        if self.handshake_confirmed {
+            ms.min(self.peer_max_ack_delay_ms)
+        } else {
+            ms
+        }
+    }
+
+    /// The application-data space's Probe Timeout, the peer's
+    /// `max_ack_delay` included (RFC 9002 §6.2.1).
+    pub fn pto_app(&self) -> u32 {
+        self.rtt.pto(self.peer_max_ack_delay_ms)
+    }
+
     /// A tracked 1-RTT packet was declared lost: owe again every STREAM
     /// range and control frame it carried (RFC 9000 §13.3). A range whose
     /// slot now holds another stream is dropped with it.
@@ -2085,9 +2191,14 @@ impl QuicConnection {
             tx_cursor_bidi: 0,
             tx_cursor_uni: 0,
             last_activity_ms: 0,
+            eliciting_since_rx: false,
             // Default to our advertised TP value (30s); refined on
             // EncryptedExtensions parse for the smaller of the two TPs.
             idle_timeout_ms: 30_000,
+            idle_first_deadline_ms: 0,
+            idle_carried_ms: 0,
+            peer_max_ack_delay_ms: DEFAULT_MAX_ACK_DELAY_MS,
+            peer_ack_delay_exponent: DEFAULT_ACK_DELAY_EXPONENT,
             trace_id: [0; 16],
             span_id: [0; 8],
             sampled_flags: 0,
@@ -2104,19 +2215,20 @@ impl QuicConnection {
             path_validating: false,
             path_challenge_data: [0; 8],
             path_validate_ms: 0,
-            cand_ip: [0; 4],
+            cand_ip: [0; 16],
             cand_port: 0,
             path_challenge_tx_pending: false,
             path_challenge_tx_ms: 0,
             path_response_tx_pending: false,
             path_response_data: [0; 8],
-            path_response_to_ip: [0; 4],
+            path_response_to_ip: [0; 16],
             path_response_to_port: 0,
-            recv_ip: [0; 4],
+            recv_ip: [0; 16],
             recv_port: 0,
             recv_len: 0,
             recv_dcid_seq: 0,
             rx_unaccepted: false,
+            rx_eliciting: false,
             peer_dcid_seq: 0,
             peer_validated: true,
             last_valid_peer: PeerAddr::unset(),
@@ -2201,9 +2313,9 @@ impl QuicConnection {
             cont_last_digest: [0; 32],
             cont_held_delta: 0,
             cont_held_confirmed: false,
-            cont_horizon_steps: 0,
+            cont_horizon_since_ms: 0,
             cont_abandon_pending: false,
-            cont_recv_hold: [(0, 0); CONT_RECV_HOLD],
+            cont_recv_hold: [(0, 0, 0); CONT_RECV_HOLD],
             cont_recv_hold_len: 0,
             cont_delta_no: 0,
         }
@@ -2555,14 +2667,15 @@ pub fn install_one_rtt_keys(conn: &mut QuicConnection) {
 // integer parameters it's a varint; for boolean parameters (e.g.
 // `disable_active_migration`) it's empty.
 //
-// We emit the minimum set RFC 9000 §18.2 mandates plus a couple of
-// reasonable defaults so the peer doesn't immediately violate flow
-// control. We don't yet enforce the parameters we receive — that's
-// the loss-recovery / flow-control work.
+// We emit the connection IDs RFC 9000 §18.2 mandates, our idle timeout and
+// `max_ack_delay`, and the flow-control and stream limits our fixed pools
+// hold. The peer's are validated by `validate_transport_params`, and the
+// ones this transport uses latched by `apply_peer_transport_limits`.
 // ----------------------------------------------------------------------
 
 pub const TP_ORIGINAL_DESTINATION_CID: u64 = 0x00;
 pub const TP_MAX_IDLE_TIMEOUT: u64 = 0x01;
+pub const TP_STATELESS_RESET_TOKEN: u64 = 0x02;
 pub const TP_MAX_UDP_PAYLOAD_SIZE: u64 = 0x03;
 pub const TP_INITIAL_MAX_DATA: u64 = 0x04;
 pub const TP_INITIAL_MAX_STREAM_DATA_BIDI_LOCAL: u64 = 0x05;
@@ -2570,7 +2683,10 @@ pub const TP_INITIAL_MAX_STREAM_DATA_BIDI_REMOTE: u64 = 0x06;
 pub const TP_INITIAL_MAX_STREAM_DATA_UNI: u64 = 0x07;
 pub const TP_INITIAL_MAX_STREAMS_BIDI: u64 = 0x08;
 pub const TP_INITIAL_MAX_STREAMS_UNI: u64 = 0x09;
+pub const TP_ACK_DELAY_EXPONENT: u64 = 0x0a;
+pub const TP_MAX_ACK_DELAY: u64 = 0x0b;
 pub const TP_DISABLE_ACTIVE_MIGRATION: u64 = 0x0c;
+pub const TP_PREFERRED_ADDRESS: u64 = 0x0d;
 pub const TP_ACTIVE_CONNECTION_ID_LIMIT: u64 = 0x0e;
 pub const TP_INITIAL_SOURCE_CID: u64 = 0x0f;
 pub const TP_RETRY_SOURCE_CID: u64 = 0x10;
@@ -2583,6 +2699,16 @@ pub const TP_MAX_DATAGRAM_FRAME_SIZE: u64 = 0x20;
 /// Bounds the inbound staging copy; sized to a single QUIC packet's
 /// worth of payload so a datagram fits one 1-RTT packet.
 pub const QUIC_MAX_DATAGRAM_SIZE: usize = 1200;
+
+/// `max_ack_delay` when the peer does not send one (RFC 9000 §18.2).
+pub const DEFAULT_MAX_ACK_DELAY_MS: u32 = 25;
+/// `max_ack_delay` values at or above this are invalid (RFC 9000 §18.2).
+pub const MAX_ACK_DELAY_LIMIT: u64 = 1 << 14;
+/// `ack_delay_exponent` values above this are invalid (RFC 9000 §18.2).
+pub const ACK_DELAY_EXPONENT_MAX: u64 = 20;
+/// `ack_delay_exponent` when an endpoint sends none (RFC 9000 §18.2). This
+/// endpoint advertises none, so its own ACK frames use it.
+pub const DEFAULT_ACK_DELAY_EXPONENT: u8 = 3;
 
 /// Maximum encoded transport parameters length we ever emit.
 pub const TP_BUF_LEN: usize = 256;
@@ -2626,11 +2752,14 @@ unsafe fn tp_put_int(out: &mut [u8], pos: &mut usize, id: u64, value: u64) {
 pub unsafe fn build_transport_params_client(
     scid: &[u8],
     disable_migration: bool,
+    idle_ms: u64,
+    max_ack_delay_ms: u64,
     out: &mut [u8],
 ) -> usize {
     let mut pos = 0;
     tp_put_bytes(out, &mut pos, TP_INITIAL_SOURCE_CID, scid);
-    tp_put_int(out, &mut pos, TP_MAX_IDLE_TIMEOUT, 30_000);
+    tp_put_int(out, &mut pos, TP_MAX_IDLE_TIMEOUT, idle_ms);
+    tp_put_int(out, &mut pos, TP_MAX_ACK_DELAY, max_ack_delay_ms);
     tp_put_int(out, &mut pos, TP_MAX_UDP_PAYLOAD_SIZE, 1500);
     tp_put_int(out, &mut pos, TP_INITIAL_MAX_DATA, LOCAL_CONN_WINDOW);
     tp_put_int(
@@ -2700,6 +2829,8 @@ pub unsafe fn build_transport_params_server(
     original_dcid: &[u8],
     retry_source_cid: Option<&[u8]>,
     disable_migration: bool,
+    idle_ms: u64,
+    max_ack_delay_ms: u64,
     out: &mut [u8],
 ) -> usize {
     let mut pos = 0;
@@ -2708,7 +2839,8 @@ pub unsafe fn build_transport_params_server(
     if let Some(rsc) = retry_source_cid {
         tp_put_bytes(out, &mut pos, TP_RETRY_SOURCE_CID, rsc);
     }
-    tp_put_int(out, &mut pos, TP_MAX_IDLE_TIMEOUT, 30_000);
+    tp_put_int(out, &mut pos, TP_MAX_IDLE_TIMEOUT, idle_ms);
+    tp_put_int(out, &mut pos, TP_MAX_ACK_DELAY, max_ack_delay_ms);
     tp_put_int(out, &mut pos, TP_MAX_UDP_PAYLOAD_SIZE, 1500);
     tp_put_int(out, &mut pos, TP_INITIAL_MAX_DATA, LOCAL_CONN_WINDOW);
     tp_put_int(
@@ -2761,8 +2893,8 @@ pub unsafe fn build_transport_params_server(
     pos
 }
 
-/// The peer's flow-control and stream-count limits, as far as this
-/// transport uses them (RFC 9000 §18.2).
+/// The peer's flow-control, stream-count, datagram and idle-timeout
+/// parameters, as far as this transport uses them (RFC 9000 §18.2).
 ///
 /// **Fills a fixed struct; takes no callback.** A per-parameter
 /// `&mut dyn FnMut(u64, u64)` is a trait object, and a trait object is a
@@ -2779,6 +2911,12 @@ pub struct PeerTransportLimits {
     pub max_streams_bidi: u64,
     pub max_streams_uni: u64,
     pub max_datagram_frame_size: u64,
+    /// `max_idle_timeout` in milliseconds; 0 (or absent) is none.
+    pub max_idle_timeout: u64,
+    /// `max_ack_delay` in milliseconds; 25 when absent.
+    pub max_ack_delay: u64,
+    /// `ack_delay_exponent`; 3 when absent.
+    pub ack_delay_exponent: u64,
 }
 
 impl PeerTransportLimits {
@@ -2795,6 +2933,9 @@ impl PeerTransportLimits {
             max_streams_bidi: 0,
             max_streams_uni: 0,
             max_datagram_frame_size: 0,
+            max_idle_timeout: 0,
+            max_ack_delay: DEFAULT_MAX_ACK_DELAY_MS as u64,
+            ack_delay_exponent: DEFAULT_ACK_DELAY_EXPONENT as u64,
         }
     }
 }
@@ -2846,9 +2987,26 @@ pub unsafe fn parse_peer_transport_limits(payload: &[u8]) -> PeerTransportLimits
             out.max_streams_uni = v;
         } else if id == TP_MAX_DATAGRAM_FRAME_SIZE {
             out.max_datagram_frame_size = v;
+        } else if id == TP_MAX_IDLE_TIMEOUT {
+            out.max_idle_timeout = v;
+        } else if id == TP_MAX_ACK_DELAY {
+            out.max_ack_delay = v;
+        } else if id == TP_ACK_DELAY_EXPONENT {
+            out.ack_delay_exponent = v;
         }
     }
     out
+}
+
+/// The idle timeout two advertised `max_idle_timeout`s negotiate: the
+/// smaller, a zero one being none, so zero only when both are (RFC 9000
+/// §10.1).
+pub fn negotiated_idle_timeout(ours: u64, peers: u64) -> u64 {
+    match (ours, peers) {
+        (0, p) => p,
+        (o, 0) => o,
+        (o, p) => o.min(p),
+    }
 }
 
 /// Latch the peer's limits onto the connection.
@@ -2864,6 +3022,12 @@ pub fn apply_peer_transport_limits(conn: &mut QuicConnection, lim: &PeerTranspor
     conn.peer_stream_window_bidi_remote = lim.max_stream_data_bidi_remote;
     conn.peer_stream_window_uni = lim.max_stream_data_uni;
     conn.send_max_data = lim.max_data;
+    // The idle timeout is the smaller of the two advertised, a zero one
+    // being none (RFC 9000 §10.1). Ours is already in place.
+    conn.idle_timeout_ms = negotiated_idle_timeout(conn.idle_timeout_ms, lim.max_idle_timeout);
+    // Validated below 2^14 with the rest of the parameters, so it fits.
+    conn.peer_max_ack_delay_ms = lim.max_ack_delay.min(MAX_ACK_DELAY_LIMIT - 1) as u32;
+    conn.peer_ack_delay_exponent = lim.ack_delay_exponent.min(ACK_DELAY_EXPONENT_MAX) as u8;
     // Streams allocated before the peer's parameters arrived (a 0-RTT
     // write, a stream the peer opened inside its first flight) were
     // seeded with the assumed window. Rewrite them from the real values
@@ -2891,57 +3055,54 @@ pub fn apply_peer_transport_limits(conn: &mut QuicConnection, lim: &PeerTranspor
     }
 }
 
-/// Extract the peer's `max_datagram_frame_size` (RFC 9221 §3) from a
-/// transport_parameters payload. Returns 0 if absent (peer won't accept
-/// DATAGRAMs) or on any decode error. Lenient: unknown params skipped.
+/// Take the peer's transport parameters during the handshake: validate
+/// them ([`validate_transport_params`], the arguments as there) and latch
+/// what this transport uses ([`apply_peer_transport_limits`]). Parameters
+/// that fail validation fail the handshake with a TRANSPORT_PARAMETER_ERROR
+/// (RFC 9000 §7.4, §18.2) and answer false; the connection is left as it
+/// was otherwise.
 ///
 /// # Safety
-/// No obligation beyond the signature: every varint read is handed a
-/// subslice of `payload` and its length.
-pub unsafe fn parse_peer_max_datagram_frame_size(payload: &[u8]) -> u64 {
-    let mut pos = 0;
-    while pos < payload.len() {
-        let after = &payload[pos..];
-        let (id, n) = match varint_decode(after.as_ptr(), after.len()) {
-            Some(t) => t,
-            None => return 0,
-        };
-        pos += n;
-        let after = &payload[pos..];
-        let (vlen, n) = match varint_decode(after.as_ptr(), after.len()) {
-            Some(t) => t,
-            None => return 0,
-        };
-        pos += n;
-        let vlen = vlen as usize;
-        if pos + vlen > payload.len() {
-            return 0;
-        }
-        let value = &payload[pos..pos + vlen];
-        pos += vlen;
-        if id == TP_MAX_DATAGRAM_FRAME_SIZE {
-            if let Some((v, _)) = varint_decode(value.as_ptr(), value.len()) {
-                return v;
-            }
-            return 0;
-        }
+/// As [`validate_transport_params`].
+pub unsafe fn accept_peer_transport_params(
+    conn: &mut QuicConnection,
+    tp: &[u8],
+    expected_isc_cid: &[u8],
+    expected_orig_dcid: Option<&[u8]>,
+    expected_retry_source_cid: Option<&[u8]>,
+) -> bool {
+    if !validate_transport_params(
+        tp,
+        expected_isc_cid,
+        expected_orig_dcid,
+        expected_retry_source_cid,
+    ) {
+        conn.close_error = ERR_TRANSPORT_PARAMETER;
+        conn.driver.hs_state = HandshakeState::Error;
+        return false;
     }
-    0
+    let lim = parse_peer_transport_limits(tp);
+    apply_peer_transport_limits(conn, &lim);
+    true
 }
 
-/// Walk a transport_parameters payload and validate the mandatory
-/// items. Returns true iff:
+/// Walk a transport_parameters payload and validate it (RFC 9000 §7.3,
+/// §7.4, §18.2; RFC 9001 §8.2). Returns true iff the encoding is whole and:
 ///   - `initial_source_connection_id` is present and equals
 ///     `expected_isc_cid`.
-///   - For `server_view = true` (client checking server's TP):
-///     `original_destination_connection_id` is present and equals
-///     `expected_orig_dcid`.
-///   - If `expected_retry_source_cid` is `Some(...)` (client used Retry):
-///     `retry_source_connection_id` is present and equals it. RFC 9000
-///     §7.3: the server MUST include this when a Retry was issued.
+///   - A client checking the server's parameters passes
+///     `expected_orig_dcid`: `original_destination_connection_id` is
+///     present and equals it. A server checking the client's passes `None`,
+///     and the parameters only a server sends
+///     (`original_destination_connection_id`, `stateless_reset_token`,
+///     `preferred_address`, `retry_source_connection_id`) are refused.
+///   - `retry_source_connection_id` is present and equals
+///     `expected_retry_source_cid` when that is `Some` (the client used a
+///     Retry), and absent when it is `None`.
+///   - `max_ack_delay` is below 2^14 and `ack_delay_exponent` at most 20.
 ///
-/// Other parameters are accepted as-is — this is enough to conform
-/// to RFC 9000 §7.3 + RFC 9001 §8.2 minimum compliance.
+/// A false return is a TRANSPORT_PARAMETER_ERROR. Other parameters are
+/// accepted as-is; unknown ones are ignored (§7.4.2).
 ///
 /// # Safety
 /// No obligation beyond the signature: every varint read is handed a
@@ -2956,6 +3117,7 @@ pub unsafe fn validate_transport_params(
     let mut saw_isc = false;
     let mut saw_orig = expected_orig_dcid.is_none();
     let mut saw_rsc = expected_retry_source_cid.is_none();
+    let from_server = expected_orig_dcid.is_some();
     while pos < payload.len() {
         let after = &payload[pos..];
         let (id, n) = match varint_decode(after.as_ptr(), after.len()) {
@@ -2983,20 +3145,29 @@ pub unsafe fn validate_transport_params(
                 }
                 saw_isc = true;
             }
-            x if x == TP_ORIGINAL_DESTINATION_CID => {
-                if let Some(exp) = expected_orig_dcid {
-                    if value != exp {
-                        return false;
-                    }
-                    saw_orig = true;
-                }
+            x if x == TP_ORIGINAL_DESTINATION_CID => match expected_orig_dcid {
+                Some(exp) if value == exp => saw_orig = true,
+                _ => return false,
+            },
+            x if x == TP_RETRY_SOURCE_CID => match expected_retry_source_cid {
+                Some(exp) if from_server && value == exp => saw_rsc = true,
+                _ => return false,
+            },
+            x if (x == TP_STATELESS_RESET_TOKEN || x == TP_PREFERRED_ADDRESS) && !from_server => {
+                return false;
             }
-            x if x == TP_RETRY_SOURCE_CID => {
-                if let Some(exp) = expected_retry_source_cid {
-                    if value != exp {
-                        return false;
-                    }
-                    saw_rsc = true;
+            // Integer parameters with a bounded range (RFC 9000 §18.2): a
+            // value that is not exactly one varint, or is out of range, is
+            // a TRANSPORT_PARAMETER_ERROR.
+            x if x == TP_MAX_ACK_DELAY || x == TP_ACK_DELAY_EXPONENT => {
+                let limit = if x == TP_MAX_ACK_DELAY {
+                    MAX_ACK_DELAY_LIMIT - 1
+                } else {
+                    ACK_DELAY_EXPONENT_MAX
+                };
+                match varint_decode(value.as_ptr(), value.len()) {
+                    Some((v, n)) if n == value.len() && v <= limit => {}
+                    _ => return false,
                 }
             }
             _ => {

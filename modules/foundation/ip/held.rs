@@ -48,7 +48,9 @@ pub(crate) unsafe fn realize(s: &mut IpState) {
                 }
             }
             if !wanted {
-                addr_ctl_del(s, ip);
+                let mut a16 = [0u8; 16];
+                a16[..4].copy_from_slice(&ip.to_be_bytes());
+                addr_ctl_del(s, &a16);
             }
         }
         i += 1;

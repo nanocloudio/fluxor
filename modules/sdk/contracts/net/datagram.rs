@@ -1,26 +1,25 @@
-// Contract: datagram — datagram protocol surface (v1 wire format).
+// Contract: datagram — the datagram protocol surface.
 //
 // Layer: contracts/net (public, stable).
 //
 // See docs/architecture/protocol_surfaces.md §Datagram Surface.
 //
 // The datagram surface is a channel contract for message-oriented
-// transports (UDP, DTLS, RTP, DNS, STUN/TURN, discovery/telemetry). It
-// replaces the current practice of carrying UDP through net_proto with
-// SOCK_TYPE_DGRAM and a variable payload prefix whose presence depends
-// on whether the endpoint is bound or connected.
+// transports (UDP, DTLS, RTP, DNS, STUN/TURN, discovery/telemetry):
+// every datagram names its endpoint and its peer address explicitly,
+// whether the endpoint is bound or connected.
 //
 // Frames use the same [msg_type: u8] [len: u16 LE] [payload...] TLV
-// header as net_proto (Stream Surface v1) so existing SDK helpers
-// (net_read_frame, net_write_frame) work unchanged. Opcode ranges are
+// header as net_proto so the same SDK helpers (net_read_frame,
+// net_write_frame) serve both. Opcode ranges are
 // disjoint from net_proto so a misconfigured channel fails loudly
 // rather than silently misparsing.
 //
 // Endpoint identity: endpoint IDs (`ep_id: u8`) are allocated by the
-// datagram provider (IP module today, ch9120 tomorrow) in response to
+// datagram provider (`ip`, `linux_net`) in response to
 // CMD_DG_BIND and echoed in MSG_DG_BOUND. They are per-provider handles,
 // not kernel resources. 256 concurrent endpoints per provider is
-// sufficient for every near-term workload.
+// the ceiling.
 //
 // Endpoint authority: an `ep_id` is an index, not an authority. The graph
 // model permits several consumer modules to feed one provider command

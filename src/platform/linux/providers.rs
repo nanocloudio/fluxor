@@ -1740,6 +1740,11 @@ pub const LINUX_NET_HASH: u32 = 0xFBCC7DC9;
 const MSG_ACCEPTED: u8 = 0x01;
 const MSG_DATA: u8 = 0x02;
 const MSG_CLOSED: u8 = 0x03;
+/// `MSG_CLOSED` kinds (net_proto `CLOSED_PEER_FIN`, `CLOSED_GONE`): the peer
+/// finished sending and the connection is still writable, or the
+/// connection is gone.
+const CLOSED_PEER_FIN: u8 = crate::abi::contracts::net::net_proto::CLOSED_PEER_FIN;
+const CLOSED_GONE: u8 = crate::abi::contracts::net::net_proto::CLOSED_GONE;
 /// net_proto `CLOSED_ID_GRACE_MS`: how long a closed connection's id stays the
 /// consumer's after MSG_CLOSED. Mirrored by value here because this file
 /// carries its own copy of the opcode table; the contract module is the
@@ -1919,6 +1924,10 @@ struct LinuxNetConn {
     /// that took the same index, and a consumer that never closes cannot
     /// pin the slot either.
     release_at: Option<std::time::Instant>,
+    /// `state == 2`: the peer finished sending (`recv` returned 0). The
+    /// socket stays open for the consumer to send on and is no longer read;
+    /// `release_at` bounds how long it waits for the consumer's CMD_CLOSE.
+    peer_fin: bool,
     /// `state == 1` (connecting): the addresses this name resolved to that
     /// have not been tried yet, in the host's order. A refused or
     /// unreachable connect moves to the next before it is reported, so a
@@ -1967,6 +1976,7 @@ impl LinuxNetConn {
             resolve_id: 0,
             resolve_started: None,
             release_at: None,
+            peer_fin: false,
             owner: crate::kernel::workload::owner::OWNER_SYSTEM,
             lane: 0,
             dg_owner_tag: 0,
@@ -3944,7 +3954,7 @@ unsafe fn linux_net_cmd_send(st: &mut LinuxNetState, conn_id: u16, data: &[u8]) 
                 st.conns[idx] = LinuxNetConn::empty();
                 libc::close(fd);
                 let cb = conn_id.to_le_bytes();
-                let msg = [MSG_CLOSED, cb[0], cb[1]];
+                let msg = [MSG_CLOSED, cb[0], cb[1], CLOSED_GONE];
                 linux_net_send_msg(st, lane, &msg);
                 return;
             }
@@ -3979,7 +3989,7 @@ unsafe fn linux_net_cmd_send(st: &mut LinuxNetState, conn_id: u16, data: &[u8]) 
         st.conns[idx] = LinuxNetConn::empty();
         libc::close(fd);
         let cb = conn_id.to_le_bytes();
-        let msg = [MSG_CLOSED, cb[0], cb[1]];
+        let msg = [MSG_CLOSED, cb[0], cb[1], CLOSED_GONE];
         linux_net_send_msg(st, lane, &msg);
         return;
     }
@@ -4048,7 +4058,7 @@ unsafe fn linux_net_drain_writes(st: &mut LinuxNetState) -> bool {
                 let cb = (i as u16).to_le_bytes();
                 st.conns[i] = LinuxNetConn::empty();
                 libc::close(fd);
-                let msg = [MSG_CLOSED, cb[0], cb[1]];
+                let msg = [MSG_CLOSED, cb[0], cb[1], CLOSED_GONE];
                 linux_net_send_msg(st, lane, &msg);
                 continue;
             }
@@ -4072,7 +4082,7 @@ unsafe fn linux_net_drain_writes(st: &mut LinuxNetState) -> bool {
             if fd >= 0 {
                 libc::close(fd);
             }
-            let msg = [MSG_CLOSED, cb[0], cb[1]];
+            let msg = [MSG_CLOSED, cb[0], cb[1], CLOSED_GONE];
             linux_net_send_msg(st, lane, &msg);
             continue;
         }
@@ -4089,7 +4099,7 @@ unsafe fn linux_net_drain_writes(st: &mut LinuxNetState) -> bool {
                 if fd >= 0 {
                     libc::close(fd);
                 }
-                let msg = [MSG_CLOSED, cb[0], cb[1]];
+                let msg = [MSG_CLOSED, cb[0], cb[1], CLOSED_GONE];
                 linux_net_send_msg(st, lane, &msg);
                 continue;
             }
@@ -4098,8 +4108,8 @@ unsafe fn linux_net_drain_writes(st: &mut LinuxNetState) -> bool {
     heavy_pending
 }
 
-/// The socket is gone (peer FIN or a dead socket). Close the fd, report
-/// MSG_CLOSED, and HOLD the slot (`state = 4`) rather than freeing it, so the
+/// The socket is gone (reset, failed, or hung up). Close the fd, report
+/// MSG_CLOSED (`CLOSED_GONE`), and HOLD the slot (`state = 4`) rather than freeing it, so the
 /// id is not handed to the next accept until the consumer has answered with
 /// CMD_CLOSE or the contract's grace interval has passed. Freeing on the
 /// spot would let a consumer's CMD_CLOSE close a newcomer that had already
@@ -4118,16 +4128,41 @@ unsafe fn hold_closed_slot(st: &mut LinuxNetState, i: usize) {
         std::time::Instant::now() + std::time::Duration::from_millis(u64::from(CLOSED_ID_GRACE_MS)),
     );
     let cb = (i as u16).to_le_bytes();
-    let msg = [MSG_CLOSED, cb[0], cb[1]];
+    let msg = [MSG_CLOSED, cb[0], cb[1], CLOSED_GONE];
     linux_net_send_msg(st, lane as usize, &msg);
 }
 
-/// Release held ids whose grace interval has passed.
+/// The peer finished sending (`recv` returned 0): report MSG_CLOSED
+/// (`CLOSED_PEER_FIN`) and keep the socket for the consumer to send on. It
+/// is no longer read — only a hangup or an error wakes it — and a consumer
+/// that has not closed within the grace interval has it closed for it.
+unsafe fn peer_finished(st: &mut LinuxNetState, i: usize) {
+    let c = &mut st.conns[i];
+    c.peer_fin = true;
+    c.release_at = Some(
+        std::time::Instant::now() + std::time::Duration::from_millis(u64::from(CLOSED_ID_GRACE_MS)),
+    );
+    let (fd, lane) = (c.fd, c.lane as usize);
+    st.rewatch(fd, i, 0);
+    let cb = (i as u16).to_le_bytes();
+    let msg = [MSG_CLOSED, cb[0], cb[1], CLOSED_PEER_FIN];
+    linux_net_send_msg(st, lane, &msg);
+}
+
+/// Release held ids whose grace interval has passed, and close the
+/// half-closed connections whose consumer has not.
 unsafe fn sweep_held_slots(st: &mut LinuxNetState) {
     let now = std::time::Instant::now();
     for i in 0..st.conns.len() {
-        if st.conns[i].state == 4 && st.conns[i].release_at.is_some_and(|t| now >= t) {
+        let due = st.conns[i].release_at.is_some_and(|t| now >= t);
+        if st.conns[i].state == 4 && due {
             st.conns[i] = LinuxNetConn::empty();
+        } else if st.conns[i].state == 2
+            && st.conns[i].peer_fin
+            && due
+            && !st.conns[i].close_when_drained
+        {
+            hold_closed_slot(st, i);
         }
     }
 }
@@ -4162,7 +4197,7 @@ unsafe fn linux_net_cmd_close(st: &mut LinuxNetState, conn_id: u16) {
     let lane = st.conns[idx].lane as usize;
     st.conns[idx] = LinuxNetConn::empty();
     let cb = conn_id.to_le_bytes();
-    let msg = [MSG_CLOSED, cb[0], cb[1]];
+    let msg = [MSG_CLOSED, cb[0], cb[1], CLOSED_GONE];
     linux_net_send_msg(st, lane, &msg);
 }
 
@@ -4436,6 +4471,13 @@ unsafe fn linux_net_poll_recv(st: &mut LinuxNetState) -> bool {
         if st.conns[i].fd < 0 {
             continue;
         }
+        if st.conns[i].peer_fin {
+            // Watched for nothing once the peer finished: what wakes it is a
+            // hangup or an error, and the connection is gone.
+            hold_closed_slot(st, i);
+            had_work = true;
+            continue;
+        }
 
         if st.conns[i].state != 2 {
             if st.conns[i].state == 1 {
@@ -4611,13 +4653,13 @@ unsafe fn linux_net_poll_recv(st: &mut LinuxNetState) -> bool {
             }
             had_work = true;
         } else if n == 0 {
-            hold_closed_slot(st, i);
+            peer_finished(st, i);
             had_work = true;
         } else {
             // n < 0. EAGAIN / EWOULDBLOCK / EINTR is "no data right
             // now"; everything else (ECONNRESET, EPIPE, EBADF, …) is a
-            // dead socket. Treat it like a peer-FIN: free the slot and
-            // emit MSG_CLOSED. Without this, an RST'd connection
+            // dead socket: hold the id and emit MSG_CLOSED
+            // (`CLOSED_GONE`). Without this, an RST'd connection
             // (browser tab closed, force-close, route flap) leaks its
             // slot forever and the 24-slot table eventually fills up,
             // after which all new accepts queue and the server appears

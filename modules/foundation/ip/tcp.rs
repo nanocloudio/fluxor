@@ -205,15 +205,23 @@ pub struct TcpConn {
     pub ssthresh: u16,     // slow-start threshold
     pub dup_ack_count: u8, // consecutive duplicate ACKs
     pub in_recovery: bool,
-    pub recover_seq: u32, // snd_nxt at recovery entry
+    pub recover_seq: u32, // snd_nxt at recovery entry (fast retransmit or RTO)
 
-    // Jacobson/Karn RTT estimation (RFC 6298). Values are in step ticks
-    // using a 3-bit fixed-point shift (srtt = RTT * 8).
+    /// `SND.UNA` as last reported to the consumer (`MSG_ACK`), which
+    /// releases the send bytes it retains up to there. The segment that
+    /// moves `SND.UNA` reports it; one whose report found the consumer's
+    /// channel full is reported again by the timer sweep.
+    pub ack_told: u32,
+
+    // Jacobson/Karn RTT estimation (RFC 6298), in milliseconds of the
+    // module's clock: `srtt` is RTT * 8 and `rttvar` RTTVAR * 4 (fixed
+    // point), `rto` the timeout itself. The retransmit timer counts 50 ms
+    // sweep windows and fires once they cover `rto` (`rto_elapsed`).
     pub srtt: u16,
     pub rttvar: u16,
     pub rto: u16,
     pub rtt_seq: u32,
-    pub rtt_start: u16,
+    pub rtt_start: u32,
     pub rtt_active: bool,
 
     // Receive bookkeeping, carried in the continuity checkpoint.
@@ -249,7 +257,7 @@ pub struct TcpConn {
 
     /// Observability: monotonic-micros start of this connection's
     /// `tcp.connection` span, latched at accept when the telemetry port is
-    /// wired (`0` = no span). See `standards/observability.md`.
+    /// wired (`0` = no span).
     pub span_start_us: u64,
     /// Root W3C trace context for this connection: minted at accept, used for
     /// the `tcp.connection` span AND propagated downstream as `MSG_TRACE_CTX`
@@ -299,6 +307,7 @@ impl TcpConn {
             dup_ack_count: 0,
             in_recovery: false,
             recover_seq: 0,
+            ack_told: 0,
             srtt: 0,
             rttvar: 0,
             rto: RTO_INITIAL,
@@ -368,12 +377,17 @@ pub fn hold_right_edge(prev: u16, advanced: u32, share: u16) -> u16 {
     (left as u16).max(share)
 }
 
-/// Initial retransmission timeout in step ticks (≈1 s at 1 kHz).
+/// Initial retransmission timeout, ms (RFC 6298 §2.1).
 pub const RTO_INITIAL: u16 = 1000;
 
-/// Minimum and maximum RTO clamps (step ticks).
-pub const RTO_MIN: u16 = 200;
-pub const RTO_MAX: u16 = 6000;
+/// RTO clamps, ms: RFC 6298's one-second floor (§2.4) and a sixty-second
+/// ceiling (§2.5).
+pub const RTO_MIN: u16 = 1000;
+pub const RTO_MAX: u16 = 60_000;
+
+/// The retransmit timer's granularity, ms: one sweep window
+/// (`TCP_SWEEP_WINDOW_MS`). RFC 6298's G.
+pub const RTO_GRANULARITY_MS: u32 = 50;
 
 /// Maximum TCP connections (incl. LISTEN, ESTABLISHED, FIN_WAIT_*,
 /// TIME_WAIT). Each `TcpConn` is ~2.1 KiB (reorder_buf dominates).
@@ -840,14 +854,27 @@ pub fn cwnd_min() -> u16 {
     2 * MSS
 }
 
+/// Whether recovery began at a retransmission timeout rather than a fast
+/// retransmit: the window was collapsed below `ssthresh` (`on_rto`) and
+/// grows by slow start, where fast recovery holds it at `ssthresh` or above.
+#[inline]
+fn rto_recovery(conn: &TcpConn) -> bool {
+    conn.in_recovery && conn.cwnd < conn.ssthresh
+}
+
 /// Handler for a new ACK that advances snd_una. Grows cwnd in slow start
-/// or congestion avoidance per RFC 5681.
+/// or congestion avoidance per RFC 5681. The acknowledgement that ends
+/// fast recovery deflates the window to `ssthresh` (RFC 6582 §3.2 step 3);
+/// one that ends recovery after a timeout leaves slow start to go on.
 pub fn on_new_ack(conn: &mut TcpConn) {
     conn.dup_ack_count = 0;
     if conn.in_recovery && !seq_lt(conn.snd_una, conn.recover_seq) {
+        let after_rto = rto_recovery(conn);
         conn.in_recovery = false;
-        conn.cwnd = conn.ssthresh;
-        return;
+        if !after_rto {
+            conn.cwnd = conn.ssthresh;
+            return;
+        }
     }
     if conn.cwnd < conn.ssthresh {
         // Slow start — exponential.
@@ -863,11 +890,16 @@ pub fn on_new_ack(conn: &mut TcpConn) {
 /// when fast-retransmit should fire.
 pub fn on_dup_ack(conn: &mut TcpConn) -> bool {
     if conn.in_recovery {
-        conn.cwnd = conn.cwnd.saturating_add(MSS);
+        // Fast recovery inflates the window by each segment that left the
+        // network (RFC 5681 §3.2 step 4); slow start after a timeout does
+        // not, and starts no second fast retransmit (RFC 6582 §4).
+        if !rto_recovery(conn) {
+            conn.cwnd = conn.cwnd.saturating_add(MSS);
+        }
         return false;
     }
     conn.dup_ack_count = conn.dup_ack_count.saturating_add(1);
-    if conn.dup_ack_count == 3 {
+    if conn.dup_ack_count >= dup_threshold(conn) {
         conn.ssthresh = (conn.cwnd / 2).max(cwnd_min());
         conn.cwnd = conn.ssthresh.saturating_add(3 * MSS);
         conn.in_recovery = true;
@@ -877,12 +909,38 @@ pub fn on_dup_ack(conn: &mut TcpConn) -> bool {
     false
 }
 
-/// Handler for an RTO timeout — collapses cwnd to slow start.
+/// Duplicate ACKs that start fast retransmit: three, or — with two or
+/// three segments outstanding, which cannot draw three — one fewer than the
+/// segments outstanding (early retransmit, RFC 5827 §3.1). The consumer that
+/// retains the send bytes bounds what is in flight (`tls` holds one
+/// 4 KiB window), so without it a single loss would wait out the RTO. One
+/// segment outstanding draws no duplicate a loss could explain.
+pub fn dup_threshold(conn: &TcpConn) -> u8 {
+    let mss = MSS as u32;
+    match conn.snd_nxt.wrapping_sub(conn.snd_una).div_ceil(mss) {
+        2 => 1,
+        3 => 2,
+        _ => 3,
+    }
+}
+
+/// Handler for an RTO timeout — collapses cwnd to slow start and enters
+/// recovery up to everything sent so far, so each partial acknowledgement
+/// that follows asks for the next hole to be resent (RFC 6582 §3.2) rather
+/// than leaving it to another, backed-off, timeout.
 pub fn on_rto(conn: &mut TcpConn) {
     conn.ssthresh = (conn.cwnd / 2).max(cwnd_min());
     conn.cwnd = MSS;
     conn.dup_ack_count = 0;
-    conn.in_recovery = false;
+    conn.in_recovery = true;
+    conn.recover_seq = conn.snd_nxt;
+}
+
+/// Whether an acknowledgement that moved `SND.UNA` left a hole still to be
+/// resent: a partial acknowledgement in recovery (RFC 6582 §3.2 step 3).
+#[inline]
+pub fn partial_ack(conn: &TcpConn) -> bool {
+    conn.in_recovery && seq_lt(conn.snd_una, conn.recover_seq)
 }
 
 /// Effective send window — minimum of peer's advertised window and cwnd.
@@ -895,46 +953,65 @@ pub fn effective_snd_wnd(conn: &TcpConn) -> u16 {
 // RTT estimation (RFC 6298)
 // ============================================================================
 
-/// Update RTT estimator with a measured sample (step ticks). Fixed-point
-/// srtt/rttvar with 3-bit shift (srtt = R * 8).
-pub fn rtt_update(conn: &mut TcpConn, sample_ticks: u16) {
-    let r = sample_ticks as u32;
-    if conn.srtt == 0 {
-        conn.srtt = (r << 3) as u16;
-        conn.rttvar = (r << 2) as u16;
+/// Update the estimator with a measured sample, ms (RFC 6298 §2.2–2.3):
+/// `srtt` holds SRTT * 8 and `rttvar` RTTVAR * 4, so α = 1/8 and β = 1/4
+/// are shifts; RTO = SRTT + max(G, 4·RTTVAR), clamped to
+/// [`RTO_MIN`, `RTO_MAX`]. A sample too long for the fixed point saturates
+/// (an 8 s round trip is already past anything the clamps distinguish).
+pub fn rtt_update(conn: &mut TcpConn, sample_ms: u32) {
+    let r = sample_ms.min(u32::from(u16::MAX) >> 3);
+    let (srtt8, rttvar4) = if conn.srtt == 0 {
+        // First measurement: SRTT = R, RTTVAR = R / 2.
+        (r << 3, r << 1)
     } else {
-        let srtt_shifted = (conn.srtt >> 3) as u32;
-        let delta = r.abs_diff(srtt_shifted);
-        // rttvar = rttvar - (rttvar >> 2) + delta
-        conn.rttvar = (conn.rttvar as u32)
-            .wrapping_sub((conn.rttvar as u32) >> 2)
-            .wrapping_add(delta) as u16;
-        // srtt = srtt - (srtt >> 3) + R
-        conn.srtt = (conn.srtt as u32)
-            .wrapping_sub((conn.srtt as u32) >> 3)
-            .wrapping_add(r) as u16;
-    }
-    // RTO = SRTT + 4 * RTTVAR (both fixed-point)
-    let rto_raw = ((conn.srtt >> 3) as u32).saturating_add(conn.rttvar as u32);
-    let rto = rto_raw.min(RTO_MAX as u32).max(RTO_MIN as u32) as u16;
-    conn.rto = rto;
+        let srtt8 = u32::from(conn.srtt);
+        let rttvar4 = u32::from(conn.rttvar);
+        let delta = r.abs_diff(srtt8 >> 3);
+        // RTTVAR = 3/4 RTTVAR + 1/4 |SRTT - R|, in units of 1/4 ms.
+        let rttvar4 = rttvar4 - (rttvar4 >> 2) + delta;
+        // SRTT = 7/8 SRTT + 1/8 R, in units of 1/8 ms.
+        let srtt8 = srtt8 - (srtt8 >> 3) + r;
+        (srtt8, rttvar4)
+    };
+    conn.srtt = srtt8.min(u32::from(u16::MAX)) as u16;
+    conn.rttvar = rttvar4.min(u32::from(u16::MAX)) as u16;
+    conn.rto = rto_from(conn.srtt, conn.rttvar);
 }
 
-/// Called when sending a segment — start an RTT measurement if one is not
-/// already active (Karn's algorithm: never time a retransmit).
-pub fn rtt_arm(conn: &mut TcpConn, seq: u32, step_tick: u16) {
+/// RTO = SRTT + max(G, 4·RTTVAR), clamped, from the fixed-point estimator.
+pub fn rto_from(srtt8: u16, rttvar4: u16) -> u16 {
+    let rto = (u32::from(srtt8) >> 3) + u32::from(rttvar4).max(RTO_GRANULARITY_MS);
+    rto.clamp(u32::from(RTO_MIN), u32::from(RTO_MAX)) as u16
+}
+
+/// Whether the sweep windows the retransmit timer has counted cover the
+/// connection's RTO.
+#[inline]
+pub fn rto_elapsed(conn: &TcpConn) -> bool {
+    u32::from(conn.retransmit_timer) * RTO_GRANULARITY_MS >= u32::from(conn.rto)
+}
+
+/// RTO back-off (RFC 6298 §5.5): double, up to the ceiling.
+#[inline]
+pub fn rto_backoff(conn: &mut TcpConn) {
+    conn.rto = conn.rto.saturating_mul(2).min(RTO_MAX);
+}
+
+/// Called when sending a segment at `now_ms` — start an RTT measurement if
+/// one is not already active (Karn's algorithm: never time a retransmit).
+pub fn rtt_arm(conn: &mut TcpConn, seq: u32, now_ms: u32) {
     if !conn.rtt_active {
         conn.rtt_seq = seq;
-        conn.rtt_start = step_tick;
+        conn.rtt_start = now_ms;
         conn.rtt_active = true;
     }
 }
 
-/// Called when `ack` arrives. If it acknowledges the timed sequence, sample
-/// the RTT and update the estimator.
-pub fn rtt_ack(conn: &mut TcpConn, ack: u32, step_tick: u16) {
+/// Called when `ack` arrives at `now_ms`. If it acknowledges the timed
+/// sequence, sample the RTT and update the estimator.
+pub fn rtt_ack(conn: &mut TcpConn, ack: u32, now_ms: u32) {
     if conn.rtt_active && !seq_lt(ack, conn.rtt_seq.wrapping_add(1)) {
-        let sample = step_tick.wrapping_sub(conn.rtt_start);
+        let sample = now_ms.wrapping_sub(conn.rtt_start);
         rtt_update(conn, sample);
         conn.rtt_active = false;
     }

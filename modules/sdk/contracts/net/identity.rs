@@ -1,4 +1,4 @@
-// Contract: identity — Net-Identity Address-Control v1.
+// Contract: identity — Net-Identity Address-Control.
 //
 // Layer: contracts/net (public, stable).
 //
@@ -10,12 +10,10 @@
 // CREATE the backend writes one `ADDR_ADD`; on DESTROY / KILL it writes the
 // matching `ADDR_DEL`.
 //
-// This contract is the shared source of truth for that exchange. Before it
-// existed, the opcodes and payload layout were duplicated — defined privately in
-// the provider module (`ip`) and again in the kernel workload backend, kept in
-// sync only by a comment. Both sides now reference the constants here, so the
-// kernel moves contract-defined bytes to a provider it resolves by role, and
-// never embeds any one provider module's private protocol.
+// This contract is the one source of truth for that exchange: the provider
+// module (`ip`) and the kernel workload backend both reference the constants
+// here, so the kernel moves contract-defined bytes to a provider it resolves
+// by role, and never embeds any one provider module's private protocol.
 //
 // ─── Provider discovery (self-registration) ─────────────────────────
 //
@@ -149,6 +147,12 @@ pub const ADDR_FENCE: u8 = 0x63;
 pub mod install {
     /// Install fenced; `ADDR_ARM` is required before the address emits.
     pub const DISARMED: u8 = 0x01;
+    /// The address is IPv6 (all sixteen bytes); without it the first four
+    /// bytes are an IPv4 address and the rest zero. An IPv6 address is
+    /// armed, fenced and removed by the same verbs; arming announces it with
+    /// an unsolicited neighbour advertisement, and only an armed one
+    /// answers neighbour solicitation or sources a packet.
+    pub const FAMILY6: u8 = 0x02;
 }
 
 // ─── Events (provider → backend, over `addr_evt`) ───────────────────
@@ -227,7 +231,43 @@ pub mod refusal {
     /// the restore): the host's state is unknown, and a coordinator must
     /// not activate a standby on it.
     pub const ACTUATOR: u8 = 6;
+    /// The authority refused the arm's emission token, or gave no verdict
+    /// within `ARM_AUTH_WAIT_MS` (a refusal with the authority's own code
+    /// is `0x80 | code`).
+    pub const AUTHORITY: u8 = 7;
+    /// An arm under `arm_authority` carried no authority token.
+    pub const NO_AUTHORITY: u8 = 8;
+    /// Not an address the provider can install: multicast, unspecified or
+    /// loopback, or IPv6 on a provider built without IPv6.
+    pub const NOT_UNICAST: u8 = 9;
 }
+
+// ─── The VIP authority's token ──────────────────────────────────────
+//
+// A provider run with `arm_authority` sources an address only once the
+// authority that commits ownership has accepted the emission token it
+// issued for this host: installs are disarmed whatever they ask, and an
+// `ADDR_ARM` carries the token after its install token —
+// `[addr:16][token:16][auth_len:u16 LE][auth:auth_len]`. The provider does
+// not parse the token (it is the authority's opaque, generation-checked
+// capability); it asks the authority it wires, naming its own boot
+// incarnation so a token issued for another boot of this host, or for
+// another host, cannot verify, and arms only on an accepting verdict.
+// Unwired, or silent past `ARM_AUTH_WAIT_MS`, nothing arms. The token is
+// held nowhere, so a restart loses it and the host must be issued another.
+
+/// Largest authority token an `ADDR_ARM` carries.
+pub const ARM_AUTH_MAX: usize = 160;
+/// How long an arm waits for the authority's verdict (ms).
+pub const ARM_AUTH_WAIT_MS: u32 = 2000;
+/// Provider → authority (`auth_req`): `[addr:16][generation:u32 LE]
+/// [boot_incarnation:16][auth_len:u16 LE][auth]`.
+pub const MSG_ARM_AUTH_CHECK: u8 = 0x7A;
+/// Authority → provider (`auth_rsp`): `[addr:16][generation:u32 LE]
+/// [sha256(auth):32][verdict:u8]`, verdict 0 accepting, anything else the
+/// authority's refusal code.
+pub const ARM_AUTH_VERDICT: u8 = 0x7B;
+pub const ARM_AUTH_VERDICT_LEN: usize = 16 + 4 + 32 + 1;
 
 // ─── Payload layout ─────────────────────────────────────────────────
 

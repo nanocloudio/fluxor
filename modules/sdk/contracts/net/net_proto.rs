@@ -1,9 +1,9 @@
-// Contract: net_proto — Stream Surface v1.
+// Contract: net_proto — Stream Surface.
 //
 // Layer: contracts/net (public, stable).
 //
 // In the protocol-surface taxonomy (docs/architecture/protocol_surfaces.md)
-// this contract is **Stream Surface v1**: its upstream commands and
+// this contract is the **Stream Surface**: its upstream commands and
 // downstream events match the stream surface vocabulary directly and
 // are consumed unchanged by HTTP, MQTT, and TLS.
 //
@@ -184,7 +184,15 @@ pub const MSG_DATA: u8 = 0x02;
 /// multiple frames; a consumer may therefore size its frame scratch to
 /// `FRAME_HDR + CONN_ID_LEN + MAX_DATA_FRAGMENT` and be sure a whole frame always fits.
 pub const MAX_DATA_FRAGMENT: usize = 1460;
-/// Remote closed connection. Payload: `[conn_id: u16 LE]`
+/// The connection closed, or its peer finished sending. Payload:
+/// `[conn_id: u16 LE][kind: u8]` ([`CLOSED_LEN`] bytes), `kind` one of:
+///
+/// - [`CLOSED_PEER_FIN`] — the peer finished sending (its FIN). The
+///   connection is still writable and its id is held: a consumer that
+///   half-closes keeps sending and closes when it is done.
+/// - [`CLOSED_GONE`] — the connection itself is gone: reset, aborted, timed
+///   out or released. Nothing more can be sent on it, and a consumer that
+///   half-closes must not take this as a FIN.
 ///
 /// Release rule. After `MSG_CLOSED` the connection id stays RESERVED for the
 /// consumer's [`CMD_CLOSE`]: the transport does not hand it to a new accept
@@ -206,6 +214,27 @@ pub const MSG_CLOSED: u8 = 0x03;
 /// longer than any consumer takes to notice a close, while short enough that
 /// a consumer which never closes cannot pin a 16-slot table through a burst.
 pub const CLOSED_ID_GRACE_MS: u32 = 5_000;
+/// `MSG_CLOSED` payload length.
+pub const CLOSED_LEN: usize = CONN_ID_LEN + 1;
+/// `MSG_CLOSED` kind: the peer finished sending; the connection is still
+/// writable.
+pub const CLOSED_PEER_FIN: u8 = 1;
+/// `MSG_CLOSED` kind: the connection is gone.
+pub const CLOSED_GONE: u8 = 2;
+
+/// Parts of a `MSG_CLOSED` payload: `(conn_id, kind)`, or `None` unless it
+/// is exactly [`CLOSED_LEN`] bytes with a defined kind.
+#[inline]
+pub fn closed_parts(payload: &[u8]) -> Option<(u16, u8)> {
+    if payload.len() != CLOSED_LEN {
+        return None;
+    }
+    let kind = payload[CONN_ID_LEN];
+    if kind != CLOSED_PEER_FIN && kind != CLOSED_GONE {
+        return None;
+    }
+    Some((u16::from_le_bytes([payload[0], payload[1]]), kind))
+}
 /// Bind/listen completed. Payload: `[conn_id: u16 LE][local_port: u16 LE]`.
 /// `local_port` echoes the port from the consumer's `CMD_BIND`; a
 /// multi-anchor consumer records it and matches it against the
@@ -231,10 +260,50 @@ pub const MSG_CONNECTED: u8 = 0x05;
 /// `0` — so a consumer must match a connect failure on `requester_tag` ALONE,
 /// never on a conn_id it has not yet been assigned.
 pub const MSG_ERROR: u8 = 0x06;
-// 0x07 / 0x08 are reserved: the IP module privately uses them for
-// `MSG_RETRANSMIT` / `MSG_ACK` (consumer-side retransmit + send-buffer release)
-// on the same channel. 0x09 is `MSG_TRACE_CTX`, 0x0A `MSG_PEER`; the next
-// free downstream opcode is 0x0B.
+/// Ask the consumer to send its retained bytes again from `from_seq` on the
+/// named connection. Payload: `[conn_id: u16 LE][from_seq: u32 LE]`. A
+/// transport that leaves the send buffer to its consumer (the bare-metal
+/// `ip` under `tls`) emits it on three duplicate ACKs, an RTO and each
+/// partial acknowledgement in recovery; the consumer answers with
+/// [`CMD_RESEND`]. A consumer that retains nothing drops it as any unknown
+/// opcode, and the transport then has nothing to resend for it.
+pub const MSG_RETRANSMIT: u8 = 0x07;
+/// `MSG_RETRANSMIT` payload length.
+pub const RETRANSMIT_LEN: usize = CONN_ID_LEN + 4;
+/// The peer's cumulative acknowledgement moved. Payload: `[conn_id: u16 LE]
+/// [acked_seq: u32 LE][isn: u32 LE]`: everything before `acked_seq` arrived,
+/// so the consumer may release what it retained below it. The third field,
+/// `isn`, is the sequence number of the stream's first byte (ISS + 1): it
+/// places the consumer's retained bytes in sequence space however many it
+/// handed down before the first report reached it. Sent when it moves, not
+/// per segment.
+pub const MSG_ACK: u8 = 0x08;
+/// `MSG_ACK` payload length.
+pub const ACK_LEN: usize = CONN_ID_LEN + 4 + 4;
+
+/// `(conn_id, acked_seq, isn)` of a `MSG_ACK` payload, or `None` when short.
+#[inline]
+pub fn ack_parts(payload: &[u8]) -> Option<(u16, u32, u32)> {
+    let p = payload.get(..ACK_LEN)?;
+    Some((
+        u16::from_le_bytes([p[0], p[1]]),
+        u32::from_le_bytes([p[2], p[3], p[4], p[5]]),
+        u32::from_le_bytes([p[6], p[7], p[8], p[9]]),
+    ))
+}
+
+/// `(conn_id, from_seq)` of a `MSG_RETRANSMIT` payload, or `None` when short.
+#[inline]
+pub fn retransmit_parts(payload: &[u8]) -> Option<(u16, u32)> {
+    let p = payload.get(..RETRANSMIT_LEN)?;
+    Some((
+        u16::from_le_bytes([p[0], p[1]]),
+        u32::from_le_bytes([p[2], p[3], p[4], p[5]]),
+    ))
+}
+
+// 0x09 is `MSG_TRACE_CTX`, 0x0A `MSG_PEER`; the next free downstream opcode
+// is 0x0B.
 
 /// Observability trace context for a connection (W3C). Emitted by the ingress
 /// (IP) right after `MSG_ACCEPTED`, and re-emitted by each forwarding stage
@@ -244,7 +313,7 @@ pub const MSG_ERROR: u8 = 0x06;
 /// channel is full) — a stage that doesn't trace discards it like any unknown
 /// frame, so it never affects the data path. The trailing `trace_flags` byte is
 /// the W3C flags (low bit = `sampled`), so the head-sampling decision survives
-/// each hop. See `standards/observability.md`.
+/// each hop.
 pub const MSG_TRACE_CTX: u8 = 0x09;
 
 /// `MSG_TRACE_CTX` payload length: conn_id + 16-byte trace id + 8-byte span id
@@ -336,6 +405,22 @@ pub const MAX_CMD_DATA: usize = 8192;
 /// is still the consumer's — and a no-op on an id the transport has already
 /// released.
 pub const CMD_CLOSE: u8 = 0x12;
+
+/// Bytes the consumer already handed down, sent again at their own sequence
+/// numbers — its answer to [`MSG_RETRANSMIT`]. Payload: `[conn_id: u16 LE]
+/// [seq: u32 LE][data…]`, at most one segment of data. Unlike [`CMD_SEND`]
+/// it allocates nothing: of the bytes it carries, those in `[SND.UNA,
+/// SND.NXT)` go out again and the rest (acknowledged since, or never sent)
+/// are dropped.
+pub const CMD_RESEND: u8 = 0x18;
+/// `CMD_RESEND` header length before its data.
+pub const RESEND_HEAD: usize = CONN_ID_LEN + 4;
+/// Everything a stage handed up on `conn_id` so far is consumed. Payload:
+/// `[conn_id: u16 LE]`. A record layer that defers its delivery horizon to
+/// its worker (`tls`'s `delivery_ack`) waits for it before it counts a
+/// delivery as made; a stage that does not defer drops it as any unknown
+/// opcode.
+pub const CMD_DELIVERED: u8 = 0x19;
 /// Reserved and unsupported: the 7/9-byte
 /// `[sock_type][ip: u32 LE][port: u16 LE][requester_tag: u16 LE?]` dial shape.
 /// Every provider answers it with `MSG_ERROR` `ENOSYS` on the requester tag

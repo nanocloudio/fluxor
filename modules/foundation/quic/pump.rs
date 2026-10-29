@@ -317,14 +317,19 @@ unsafe fn pump_recv_client_hello(s: &mut QuicState, idx: usize) -> bool {
         peer_cid_buf.as_mut_ptr(),
         peer_cid_len,
     );
-    if !validate_transport_params(tp, &peer_cid_buf[..peer_cid_len], None, None) {
-        let driver = &mut s.conns[idx].driver;
-        driver.hs_state = HandshakeState::Error;
+    // RFC 9000 §18.2 / RFC 9221 §3: the client's flow-control, stream-count
+    // and datagram limits bind what this server sends, and its idle timeout
+    // folds into ours (the smaller is the connection's).
+    s.conns[idx].idle_timeout_ms = u64::from(s.idle_timeout_ms);
+    if !accept_peer_transport_params(
+        &mut s.conns[idx],
+        tp,
+        &peer_cid_buf[..peer_cid_len],
+        None,
+        None,
+    ) {
         return true;
     }
-    // RFC 9221 §3: capture the client's max_datagram_frame_size so the
-    // server only emits DATAGRAMs the peer will accept.
-    s.conns[idx].peer_max_datagram_frame_size = parse_peer_max_datagram_frame_size(tp);
     let driver = &mut s.conns[idx].driver;
     // QUIC packet protection here is implemented for AES-128-GCM-SHA256
     // ONLY (keys.rs::secret_to_keys derives a 16-byte key under SHA256 and
@@ -667,6 +672,8 @@ unsafe fn pump_send_encrypted_extensions(s: &mut QuicState, idx: usize) -> bool 
         &orig_buf[..orig_dcid_len],
         rsc_opt,
         s.disable_migration != 0,
+        u64::from(s.idle_timeout_ms),
+        advertised_max_ack_delay(s),
         &mut tp,
     );
     let psk_selected = s.conns[idx].psk_selected;
@@ -1049,15 +1056,18 @@ unsafe fn emit_new_session_ticket(s: &mut QuicState, idx: usize) {
     let Some(domain) = replay_domain(&mut s.replay_domain, sys) else {
         return;
     };
-    // Random ticket_age_add + 8-byte nonce.
+    // Random ticket_age_add + 8-byte nonce; with no entropy, no ticket.
     let mut age_add_buf = [0u8; 4];
-    dev_csprng_fill(sys, age_add_buf.as_mut_ptr(), 4);
+    let mut nonce = [0u8; 8];
+    if dev_csprng_fill(sys, age_add_buf.as_mut_ptr(), 4) < 0
+        || dev_csprng_fill(sys, nonce.as_mut_ptr(), 8) < 0
+    {
+        return;
+    }
     let age_add = ((age_add_buf[0] as u32) << 24)
         | ((age_add_buf[1] as u32) << 16)
         | ((age_add_buf[2] as u32) << 8)
         | (age_add_buf[3] as u32);
-    let mut nonce = [0u8; 8];
-    dev_csprng_fill(sys, nonce.as_mut_ptr(), 8);
     let now_ms = dev_millis(sys);
     let lifetime_s: u32 = 7200;
     // The ticket IS the session state, sealed: suite, RMS, age_add, issue
@@ -1125,8 +1135,14 @@ unsafe fn pump_send_client_hello(s: &mut QuicState, idx: usize) -> bool {
         scid_buf.as_mut_ptr(),
         scid_len,
     );
-    let tp_len =
-        build_transport_params_client(&scid_buf[..scid_len], s.disable_migration != 0, &mut tp);
+    s.conns[idx].idle_timeout_ms = u64::from(s.idle_timeout_ms);
+    let tp_len = build_transport_params_client(
+        &scid_buf[..scid_len],
+        s.disable_migration != 0,
+        u64::from(s.idle_timeout_ms),
+        advertised_max_ack_delay(s),
+        &mut tp,
+    );
 
     let psk_len = s.conns[idx].psk_len as usize;
     let psk_id_len = s.conns[idx].psk_identity_len as usize;
@@ -1139,9 +1155,13 @@ unsafe fn pump_send_client_hello(s: &mut QuicState, idx: usize) -> bool {
     let sni = &sni_buf[..sni_len];
 
     let mut random = [0u8; 32];
-    dev_csprng_fill(sys, random.as_mut_ptr(), 32);
     let mut session_id = [0u8; 32];
-    dev_csprng_fill(sys, session_id.as_mut_ptr(), 32);
+    if dev_csprng_fill(sys, random.as_mut_ptr(), 32) < 0
+        || dev_csprng_fill(sys, session_id.as_mut_ptr(), 32) < 0
+    {
+        s.conns[idx].driver.hs_state = HandshakeState::Error;
+        return true;
+    }
 
     if resumption {
         // Build CH carrying pre_shared_key + psk_key_exchange_modes
@@ -1404,20 +1424,18 @@ unsafe fn pump_recv_encrypted_extensions(s: &mut QuicState, idx: usize) -> bool 
     } else {
         None
     };
-    if !validate_transport_params(
+    // RFC 9000 §18.2 / RFC 9221 §3: capture the server's flow-control,
+    // stream-count and datagram limits in one pass, and apply them
+    // before any application stream can exist on this connection.
+    if !accept_peer_transport_params(
+        conn,
         tp,
         &peer_cid_buf[..peer_cid_len],
         Some(&orig_buf[..orig_dcid_len]),
         rsc_opt,
     ) {
-        conn.driver.hs_state = HandshakeState::Error;
         return true;
     }
-    // RFC 9000 §18.2 / RFC 9221 §3: capture the server's flow-control,
-    // stream-count and datagram limits in one pass, and apply them
-    // before any application stream can exist on this connection.
-    let peer_limits = parse_peer_transport_limits(tp);
-    apply_peer_transport_limits(conn, &peer_limits);
     // RFC 7301: latch the server-negotiated ALPN verbatim, as opaque
     // bytes. It reaches the application on MSG_MUX_SESSION_OPENED; this
     // module never tests its value.
@@ -1476,7 +1494,7 @@ fn expected_name(s: &QuicState, out: &mut [u8; 64]) -> usize {
 /// packet that authenticates; from then on its datagrams go to that
 /// address rather than through the resolver.
 fn learn_peer_address(conn: &mut QuicConnection) {
-    if !conn.is_server && !conn.peer.has_address() && conn.recv_ip != [0; 4] {
+    if !conn.is_server && !conn.peer.has_address() && conn.recv_ip != [0; 16] {
         conn.peer.ip = conn.recv_ip;
         conn.peer.port = conn.recv_port;
     }
@@ -1777,8 +1795,12 @@ unsafe fn drain_inbound_one(s: &mut QuicState, idx: usize) -> bool {
             // Decision: issue Retry, validate token, or proceed.
             let action = peek_initial_for_retry(s, idx, off, avail);
             match action {
-                InitialAction::IssueRetry { dcid, scid } => {
-                    emit_retry(s, idx, &dcid, &scid);
+                InitialAction::IssueRetry {
+                    dcid,
+                    scid,
+                    scid_len,
+                } => {
+                    emit_retry(s, idx, &dcid, &scid[..usize::from(scid_len)]);
                     // Drop the slot — we don't keep state.
                     s.conns[idx].phase = ConnPhase::Idle;
                     mark_inbound_consumed(&mut s.conns[idx]);
@@ -1880,6 +1902,8 @@ unsafe fn drain_inbound_one(s: &mut QuicState, idx: usize) -> bool {
         // Idle-timeout activity stamp (RFC 9000 §10.1).
         let now_ms = dev_millis(&*s.syscalls);
         conn.last_activity_ms = now_ms;
+        conn.eliciting_since_rx = false;
+        conn.idle_first_deadline_ms = 0;
         learn_peer_address(conn);
 
         if !conn.is_server && pkt_type == PKT_INITIAL && parsed.scid_len > 0 {
@@ -1905,6 +1929,7 @@ unsafe fn drain_inbound_one(s: &mut QuicState, idx: usize) -> bool {
         let mut np_ignored = false;
         conn.rx_unaccepted = false;
         process_frames(conn, level, payload, now_ms, &mut np_ignored);
+        let conn_eliciting = conn.rx_eliciting;
         // Acknowledged once processed, unless part of it could not be taken
         // (RFC 9000 §13.1).
         if !conn.rx_unaccepted {
@@ -1912,8 +1937,9 @@ unsafe fn drain_inbound_one(s: &mut QuicState, idx: usize) -> bool {
                 EncLevel::Initial => &mut conn.initial,
                 _ => &mut conn.handshake,
             };
-            space.ack_pending = true;
-            space.ack_tracker.record(parsed.pn, 0);
+            // Owed at once only for an ack-eliciting packet (§13.2.1).
+            space.ack_pending |= conn_eliciting;
+            space.ack_tracker.record(parsed.pn, now_ms);
         }
         // A Handshake packet from the client proves it holds its address
         // (RFC 9000 §8.1), and ends the server's use of Initial keys (RFC
@@ -2066,6 +2092,12 @@ unsafe fn drain_inbound_one(s: &mut QuicState, idx: usize) -> bool {
         }
         let payload = &pkt_copy[body_off..body_off + body_len];
         let now_ms = dev_millis(&*s.syscalls);
+        // Idle-timeout activity stamp, as for a long-header packet: an
+        // authenticated 1-RTT packet restarts the timer (RFC 9000 §10.1),
+        // and the next ack-eliciting send may restart it again.
+        conn.last_activity_ms = now_ms;
+        conn.eliciting_since_rx = false;
+        conn.idle_first_deadline_ms = 0;
         let mut non_probing = false;
         process_one_rtt_payload(
             &*s.syscalls,
@@ -2099,8 +2131,9 @@ pub(crate) unsafe fn process_one_rtt_payload(
     conn.rx_unaccepted = false;
     process_frames(conn, EncLevel::OneRtt, payload, now_ms, non_probing);
     if !conn.rx_unaccepted && !on_one_rtt_received(sys, cont_out, conn, pn) {
-        conn.one_rtt.ack_pending = true;
-        conn.one_rtt.ack_tracker.record(pn, 0);
+        // Owed at once only for an ack-eliciting packet (RFC 9000 §13.2.1).
+        conn.one_rtt.ack_pending |= conn.rx_eliciting;
+        conn.one_rtt.ack_tracker.record(pn, now_ms);
     }
 }
 
@@ -2146,6 +2179,17 @@ pub(crate) unsafe fn arm_migration_if_new_path(
         conn.path_challenge_tx_pending = false;
         return;
     }
+    // Both paths' challenges come from the CSPRNG before anything moves: a
+    // challenge an off-path attacker could predict would let it answer for
+    // an address it does not hold (RFC 9000 §8.2.1). With no entropy the
+    // connection stays where it is; the peer's next packet asks again.
+    let mut challenge = [0u8; 8];
+    let mut old_challenge = [0u8; 8];
+    if dev_csprng_fill(sys, challenge.as_mut_ptr(), 8) < 0
+        || dev_csprng_fill(sys, old_challenge.as_mut_ptr(), 8) < 0
+    {
+        return;
+    }
     if conn.peer_validated {
         conn.last_valid_peer = conn.peer;
     }
@@ -2158,7 +2202,7 @@ pub(crate) unsafe fn arm_migration_if_new_path(
     let now = dev_millis(sys);
     conn.cand_ip = from.ip;
     conn.cand_port = from.port;
-    dev_csprng_fill(sys, conn.path_challenge_data.as_mut_ptr(), 8);
+    conn.path_challenge_data = challenge;
     conn.path_validating = true;
     conn.path_validate_ms = now;
     conn.path_challenge_tx_ms = 0;
@@ -2169,7 +2213,7 @@ pub(crate) unsafe fn arm_migration_if_new_path(
         conn.finish_old_path();
     }
     conn.old_path = conn.last_valid_peer;
-    dev_csprng_fill(sys, conn.old_path_challenge_data.as_mut_ptr(), 8);
+    conn.old_path_challenge_data = old_challenge;
     conn.old_path_validating = true;
     conn.old_path_challenge_tx_pending = true;
 
@@ -2196,6 +2240,7 @@ enum InitialAction {
     IssueRetry {
         dcid: [u8; MAX_CID_LEN],
         scid: [u8; MAX_CID_LEN],
+        scid_len: u8,
     },
     Reject,
     Proceed {
@@ -2268,20 +2313,21 @@ unsafe fn peek_initial_for_retry(
         if token_len == 0 {
             // Issue a Retry (server picks a fresh SCID for the Retry).
             // The Retry's SCID becomes the client's new DCID; we use
-            // it as our_cid post-retry too. It is a connection ID like
-            // any other, so it is declined rather than emitted zero — a
-            // zero CID here would be rejected by a conforming peer, and
-            // it is the id the whole post-Retry connection is addressed
-            // by.
+            // it as our_cid post-retry too. It is the id the whole
+            // post-Retry connection is addressed by, so it is minted as
+            // every other server CID is — routable under
+            // `cid_route_key` — and declined rather than emitted zero
+            // without entropy.
             let mut new_scid = [0u8; MAX_CID_LEN];
-            let sys = &*s.syscalls;
-            if !csprng_fill_nonzero(sys, new_scid.as_mut_ptr(), 8) {
+            let new_len = mint_server_cid(s, &mut new_scid);
+            if new_len == 0 {
                 s.rng_cid_fail = s.rng_cid_fail.wrapping_add(1);
                 return InitialAction::Reject;
             }
             return InitialAction::IssueRetry {
                 dcid: scid_buf,
                 scid: new_scid,
+                scid_len: new_len,
             };
         }
         // Validate token.
@@ -2330,7 +2376,7 @@ unsafe fn emit_retry(
     s: &mut QuicState,
     idx: usize,
     client_first_scid: &[u8; MAX_CID_LEN],
-    new_scid: &[u8; MAX_CID_LEN],
+    new_scid: &[u8],
 ) {
     let off = s.conns[idx].inbound_off;
     let inb = &s.conns[idx].inbound;
@@ -2364,7 +2410,7 @@ unsafe fn emit_retry(
         &odcid[..dcid_len],
         // DCID of Retry = peer's SCID.
         &s.conns[idx].inbound[off + scid_len_off + 1..off + scid_len_off + 1 + scid_len],
-        &new_scid[..8],
+        new_scid,
         &token[..token_len],
         &mut pkt,
     );
@@ -2578,8 +2624,19 @@ unsafe fn process_frames(
     non_probing: &mut bool,
 ) {
     let mut pos = 0;
+    conn.rx_eliciting = false;
     while pos < payload.len() {
         let frame_type = payload[pos];
+        if !matches!(
+            frame_type,
+            FRAME_PADDING
+                | FRAME_ACK
+                | FRAME_ACK_ECN
+                | FRAME_CONNECTION_CLOSE_TRANSPORT
+                | FRAME_CONNECTION_CLOSE_APP
+        ) {
+            conn.rx_eliciting = true;
+        }
         // RFC 9000 §9.1 frame classification — anything outside the four
         // probing frame types makes this a non-probing packet. The PADDING
         // run (frame_type == 0) is handled in its arm below.
@@ -2629,11 +2686,12 @@ unsafe fn process_frames(
                 };
                 pos += n1;
                 let after = &payload[pos..];
-                let (_delay, n2) = match varint_decode(after.as_ptr(), after.len()) {
+                let (delay, n2) = match varint_decode(after.as_ptr(), after.len()) {
                     Some(t) => t,
                     None => return,
                 };
                 pos += n2;
+                let ack_delay_ms = conn.peer_ack_delay_ms(level, delay);
                 let after = &payload[pos..];
                 let (range_count, n3) = match varint_decode(after.as_ptr(), after.len()) {
                     Some(t) => t,
@@ -2750,7 +2808,7 @@ unsafe fn process_frames(
                     }
                 }
                 if let Some(sample) = new_rtt_sample {
-                    conn.rtt.update(sample);
+                    conn.rtt.update(sample, ack_delay_ms);
                 }
                 // RFC 9001 §6.1: a locally-initiated key update is
                 // confirmed once the peer acknowledges a packet sent in the
@@ -3955,7 +4013,11 @@ unsafe fn emit_crypto_packet(
             EncLevel::OneRtt => &conn.one_rtt,
         };
         if space.ack_pending && space.ack_tracker.count > 0 {
-            let n = build_ack_frame(&space.ack_tracker, 0, &mut payload[payload_len..]);
+            // The delay since the largest acknowledged packet arrived —
+            // under a strict continuity pairing, the time it was held for
+            // the standby included.
+            let ack_delay = space.ack_tracker.ack_delay_field(dev_millis(sys));
+            let n = build_ack_frame(&space.ack_tracker, ack_delay, &mut payload[payload_len..]);
             if n > 0 {
                 payload_len += n;
                 had_ack = true;
@@ -4542,8 +4604,6 @@ unsafe fn emit_crypto_packet(
     if matches!(level, EncLevel::Handshake) && !is_server {
         s.conns[idx].discard_space(EncLevel::Initial);
     }
-    // Idle-timeout activity stamp on emit too (RFC 9000 §10.1.2).
-    s.conns[idx].last_activity_ms = dev_millis(sys);
 
     // ── Apply deferred state mutations ─────────────────────────────
     // Now that the packet is on the wire we can safely advance
@@ -4742,6 +4802,15 @@ unsafe fn emit_crypto_packet(
         || had_datagram
         || had_new_cid
         || had_retire;
+    // The idle timer restarts on a send only for the first ack-eliciting
+    // packet since one was last received (RFC 9000 §10.1), so a PTO probe
+    // each interval to a peer that is gone does not keep the connection
+    // alive. A held packet is not sent yet: `release_held` applies the
+    // rule when it reaches the wire.
+    if ack_eliciting && !held && !s.conns[idx].eliciting_since_rx {
+        s.conns[idx].last_activity_ms = dev_millis(sys);
+        s.conns[idx].eliciting_since_rx = true;
+    }
     let conn = &mut s.conns[idx];
     let space = match level {
         EncLevel::Initial => &mut conn.initial,
@@ -5115,8 +5184,12 @@ pub(crate) unsafe fn emit_path_challenge(s: &mut QuicState, idx: usize) {
         return;
     }
     if s.conns[idx].challenge_refresh {
+        // A fresh challenge or none: with no entropy the refresh waits for
+        // the next attempt rather than resending a value already seen.
         let sys = &*s.syscalls;
-        dev_csprng_fill(sys, s.conns[idx].path_challenge_data.as_mut_ptr(), 8);
+        if dev_csprng_fill(sys, s.conns[idx].path_challenge_data.as_mut_ptr(), 8) < 0 {
+            return;
+        }
         s.conns[idx].challenge_refresh = false;
     }
     let conn = &s.conns[idx];
@@ -5376,6 +5449,20 @@ unsafe fn hs_timeouts(conn: &mut QuicConnection, level: EncLevel, now_ms: u64, p
     }
 }
 
+/// The `max_ack_delay` this endpoint advertises (RFC 9000 §18.2): the
+/// longest it holds back an acknowledgement. Without a continuity channel
+/// one goes out in the step that received the packet, inside the default
+/// 25 ms; with one, a connection may later run under the crash-continuous
+/// profile, which withholds acknowledgements for up to
+/// [`CONT_MAX_ACK_DELAY_MS`].
+pub(crate) fn advertised_max_ack_delay(s: &QuicState) -> u64 {
+    if s.cont_out >= 0 {
+        CONT_MAX_ACK_DELAY_MS
+    } else {
+        u64::from(DEFAULT_MAX_ACK_DELAY_MS)
+    }
+}
+
 /// Probes a 1-RTT timeout sends (RFC 9002 §6.2.4 allows up to two).
 const PTO_PROBES: u8 = 2;
 /// Doublings of the probe timeout before it stops growing.
@@ -5384,8 +5471,9 @@ const PTO_BACKOFF_MAX: u8 = 6;
 /// Probe-Timeout (RFC 9002 §6.2) check for every space whose last
 /// ack-eliciting send is older than the connection's computed PTO.
 /// PTO is `smoothed_rtt + max(4*rttvar, granularity) + max_ack_delay`
-/// (RFC 9002 §6.2.1); for a brand-new connection we fall back to
-/// `kInitialRtt = 333ms`.
+/// (RFC 9002 §6.2.1), the peer's `max_ack_delay` counting only in the
+/// application-data space and 0 in Initial and Handshake; before any RTT
+/// sample the estimate is `kInitialRtt = 333ms`.
 ///
 /// In the 1-RTT space a timeout owes probes (RFC 9002 §6.2.4): new
 /// packets, sent past the congestion window, that carry every
@@ -5397,10 +5485,11 @@ const PTO_BACKOFF_MAX: u8 = 6;
 pub(crate) unsafe fn quic_pto_check(s: &mut QuicState, idx: usize) {
     let sys = &*s.syscalls;
     let now_ms = dev_millis(sys);
-    let pto_threshold = s.conns[idx].rtt.pto() as u64;
+    let pto_threshold = u64::from(s.conns[idx].pto_app());
+    let pto_handshake = u64::from(s.conns[idx].rtt.pto(0));
     one_rtt_timeouts(&mut s.conns[idx], now_ms, pto_threshold);
     for level in [EncLevel::Initial, EncLevel::Handshake] {
-        hs_timeouts(&mut s.conns[idx], level, now_ms, pto_threshold);
+        hs_timeouts(&mut s.conns[idx], level, now_ms, pto_handshake);
     }
     // PTO retransmission of a path-validation PATH_CHALLENGE (RFC 9000
     // §8.1 / §9.3.3). These probes are dedicated packets to the candidate

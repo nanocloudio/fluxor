@@ -1,10 +1,10 @@
-// Contract: session_ctrl — SessionCtrlV1 control-plane sideband.
+// Contract: session_ctrl — the session control-plane sideband.
 //
 // Layer: contracts/net (public, stable).
 //
 // See docs/architecture/protocol_surfaces.md §Session Control Sideband.
 //
-// SessionCtrlV1 is the control-plane sideband exchanged between
+// The session control sideband is the control-plane exchange exchanged between
 // **transport anchors**, **session workers**, and **session
 // directories** to coordinate session attach, detach, drain,
 // export/import handoff, resume, epoch advancement, worker
@@ -23,16 +23,16 @@
 //
 // Frames use the same [msg_type: u8] [len: u16 LE] [payload...] TLV
 // header as net_proto, datagram, and packet so the shared SDK
-// helpers (net_read_frame, net_write_frame) work unchanged. Opcode
+// helpers (net_read_frame, net_write_frame) serve all four. Opcode
 // ranges are disjoint from the other three contracts:
 //
-//     net_proto     0x01..0x14   (Stream Surface v1)
-//     datagram   0x20..0x43   (Datagram Surface v1)
-//     packet     0x50..0x63   (Packet Surface v1)
+//     net_proto     0x01..0x19   (stream surface)
+//     datagram      0x20..0x43   (datagram surface)
+//     packet        0x50..0x69   (packet surface)
 //     session_ctrl  0x70..0x9F   (this file)
 //
 // so a single channel pair may carry multiple contracts without
-// ambiguity. In practice SessionCtrlV1 flows over its own channels
+// ambiguity. In practice session control flows over its own channels
 // between anchor/worker/directory modules — often over remote channels
 // when those three roles are on different nodes.
 //
@@ -51,7 +51,7 @@
 // wire.
 //
 // `anchor_id` identifies the anchor currently serving the session.
-// When the anchor itself moves (rare; usually only for paired-anchor
+// When the anchor itself moves (rare; usually only for anchor
 // HA or QUIC-class migration) the directory binds the new anchor_id.
 //
 // `session_epoch` advances on every authoritative rebind. Messages
@@ -410,8 +410,10 @@ pub const MSG_SC_RELOCATED: u8 = 0x99;
 // (crash-continuous) profile the primary withholds the transition —
 // the TCP ACK advance, the TLS record hand-off, the QUIC packet — until
 // the DELTA_ACK covering it has returned; that is the receive / send
-// horizon. In the planned profile deltas are asynchronous and the
-// synchronous cut at CUT_EXPORT is what makes the standby exact.
+// horizon, and the relayed CHECKPOINT_COMMITTED that starts it also ends
+// a quiesce the checkpoint was taken under. In the planned profile deltas
+// are asynchronous and the synchronous cut at CUT_EXPORT is what makes the
+// standby exact.
 
 /// Transport codes carried by PAIR_PREPARE and the checkpoint manifest.
 pub const CT_TCP: u8 = 1;
@@ -440,7 +442,11 @@ pub const DELTA_TCP_TIMERS: u8 = 4;
 /// same bytes and never re-encrypts under the same counter.
 pub const DELTA_TLS_RECORD_OUT: u8 = 5;
 /// TLS: inbound record consumed — read sequence advanced, partial
-/// record bytes retained.
+/// record bytes retained. Under the strict profile the record is opened
+/// first, and the delta also carries its inner content type and plaintext
+/// (`[type:1][plain_len:2 LE][plain]` after the partial bytes, type 0xFF
+/// with none when the plaintext is longer than `tls` carries), which is
+/// held undelivered until acknowledged.
 pub const DELTA_TLS_RECORD_IN: u8 = 6;
 /// TLS: key update barrier — new secret installed (sealed) and the
 /// counters reset; the primary does not emit in the new epoch until
@@ -456,14 +462,27 @@ pub const DELTA_QUIC_RECV: u8 = 9;
 pub const DELTA_QUIC_KEY_PHASE: u8 = 10;
 /// TLS: the peer acknowledged the primary's TCP stream up to a sequence,
 /// so the retransmit window slid. Mirrored so the standby's window is the
-/// primary's and a replay after takeover sends the right bytes.
-///   [acked_seq: 4 LE]
+/// primary's and a replay after takeover sends the right bytes. `isn` is
+/// the sequence of the stream's first byte, which anchors the window.
+///   [acked_seq: 4 LE][isn: 4 LE]
 pub const DELTA_TLS_RETX_ACK: u8 = 11;
 /// TLS, strict profile: inbound bytes received but not yet forming a whole
 /// record. Mirrored on arrival so a takeover between two records does not
 /// lose the head of the next one.
 ///   [recv_len: 4 LE][bytes: recv_len]
 pub const DELTA_TLS_RECV_BYTES: u8 = 12;
+/// TLS, strict profile: what the clear-side consumer has consumed, a
+/// cumulative count of records handed up — acknowledged by the consumer
+/// (`net_proto` 0x19 under `tls`'s `delivery_ack`) or counted as handed up.
+///   [consumed: 8 LE]
+pub const DELTA_TLS_DELIVERED: u8 = 0x81;
+/// `tls`'s own close: the consumer closed and our close_notify is sealed
+/// (no payload). The alert's ciphertext is the RECORD_OUT before it; the
+/// transport FIN that follows is `ip`'s SEND with its FIN flag. A session
+/// that sent it stays exportable (CT_TLS `close_notify` bit 0).
+pub const DELTA_TLS_CLOSE_SENT: u8 = 0x82;
+// Other kinds 0x80 and up are a provider's own, as are commands 0x8B and up
+// on `cont_in`.
 
 /// Abort reasons (`ABORT` `reason`, `CONTINUITY{ABORTED}` body).
 pub const ABORT_COORDINATOR: u8 = 1;
@@ -625,6 +644,75 @@ pub const CMD_SC_ABORT: u8 = 0x87;
 ///   [len:           8 LE]              values in the block
 pub const CMD_SC_RESERVATION_GRANT: u8 = 0x88;
 
+/// A tombstone for a flow this provider never held: until it expires a
+/// segment for the flow that finds no connection here is dropped silently,
+/// never reset (`ip`). Answered CONTINUITY{RETIRED}; `STATUS_NO_CAPACITY`
+/// with every slot holding a live tombstone, which is never evicted early.
+/// Payload:
+///   [flow_id:      16 BE]
+///   [epoch:         4 LE]
+///   [ttl_ms:        4 LE]
+pub const CMD_SC_TOMBSTONE: u8 = 0x89;
+
+/// Vault-to-vault transfer of a flow's continuity key (`custody`): the
+/// standby's vault attests a fresh recipient key, the primary's vault checks
+/// that evidence and wraps the key that seals the flow's secret set to it,
+/// and the standby's vault unwraps it. No key is ever in a frame: what
+/// crosses is the evidence (public material and a signature) and the
+/// wrapped key (`key_vault` `FXKW`, sealed to the recipient and bound to its
+/// composition). Answered CONTINUITY{CUSTODY}.
+/// Payload:
+///   [flow_id:      16 BE]              ATTEST: the name the standby's
+///                                      recipient is kept under until its
+///                                      UNWRAP; WRAP and UNWRAP: the flow
+///                                      the key seals
+///   [epoch:         4 LE]              the ownership epoch it seals under
+///   [op:            1]                 custody::ATTEST / WRAP / UNWRAP
+///   [body: ...]                        ATTEST: [challenge:32]
+///                                      WRAP:   [challenge:32][evidence]
+///                                      UNWRAP: [name:16][wrapped]
+pub const CMD_SC_CUSTODY: u8 = 0x8A;
+
+/// The custody exchange's operations and bytes (`CMD_SC_CUSTODY`).
+pub mod custody {
+    pub const ATTEST: u8 = 1;
+    pub const WRAP: u8 = 2;
+    pub const UNWRAP: u8 = 3;
+    /// Evidence: `[record][recipient_pub:65][signer_pub:65][sig_len:2 LE]
+    /// [sig]`, where `record` is `key_vault` `ATTEST_KEY`'s (`FXHA`) for the
+    /// recipient, over the caller's challenge, and `sig` the signer's P-256
+    /// signature over its SHA-256 (`r‖s`).
+    pub const RECORD_LEN: usize = 148;
+    pub const PUB_LEN: usize = 65;
+    pub const RECIPIENT: usize = RECORD_LEN;
+    pub const SIGNER: usize = RECIPIENT + PUB_LEN;
+    pub const SIG_LEN: usize = SIGNER + PUB_LEN;
+    pub const SIG: usize = SIG_LEN + 2;
+    pub const SIG_MAX: usize = 64;
+    pub const EVIDENCE_MAX: usize = SIG + SIG_MAX;
+    /// A wrapped 32-byte key: `key_vault` `wrap`'s `FXKW` blob.
+    pub const WRAPPED_LEN: usize = 4 + 65 + 32 + 12 + 7 + 32 + 16;
+    /// Why a custody operation was refused (`CR_CUSTODY` `reason`).
+    pub mod why {
+        /// The evidence does not parse, or is not a P-256 recipient's.
+        pub const EVIDENCE: u8 = 1;
+        /// The evidence answers another challenge.
+        pub const CHALLENGE: u8 = 2;
+        /// The evidence's signature does not verify under its signer.
+        pub const SIGNATURE: u8 = 3;
+        /// The recipient is not an ephemeral agreement key: persisted, or
+        /// without `AGREE`, or its thumbprint is not its public key's.
+        pub const RECIPIENT: u8 = 4;
+        /// No recipient is held under that name.
+        pub const NO_RECIPIENT: u8 = 5;
+        /// The vault refused (no key to wrap, a slot, a wrap or an unwrap:
+        /// a blob for another recipient or composition does not open).
+        pub const VAULT: u8 = 6;
+        /// No session or shadow holds that flow.
+        pub const NO_FLOW: u8 = 7;
+    }
+}
+
 /// Bytes in a reservation-grant record.
 pub const GRANT_LEN: usize = 1 + 1 + 16 + 4 + 8 + 8;
 /// Grant opcode: a block of counter values reserved for one flow.
@@ -643,7 +731,10 @@ pub const GRANT_STATUS_OK: u8 = 0;
 pub const MSG_SC_CONTINUITY: u8 = 0x9A;
 
 /// `CONTINUITY` record types and their bodies.
-/// Body: [transport:1][profile:1][shadow_slot:2 LE]
+/// Body: [transport:1][profile:1][shadow_slot:2 LE], and from a provider
+/// pairing a connection it holds live (the primary half) a trailing
+/// [conn_id:2 LE] where it numbers connections — the id a layered provider
+/// above it (tls) names the same connection by.
 pub const CR_PAIR_PREPARED: u8 = 1;
 /// Body: [ckpt_gen:4 LE][offset:4 LE] — bytes accepted so far.
 pub const CR_CHECKPOINT_ACK: u8 = 2;
@@ -669,6 +760,10 @@ pub const CR_ACTIVATED: u8 = 9;
 pub const CR_RETIRED: u8 = 10;
 /// Body: [reason:1]
 pub const CR_ABORTED: u8 = 11;
+/// Body: [op:1][reason:1][bytes]: ATTEST the evidence, WRAP the wrapped
+/// key, UNWRAP nothing; `reason` is `custody::why` when `status` is not
+/// STATUS_OK.
+pub const CR_CUSTODY: u8 = 12;
 
 /// Fixed-size continuity payload lengths.
 pub const FLOW_ID_BYTES: usize = 16;

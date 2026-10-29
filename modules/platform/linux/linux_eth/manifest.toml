@@ -1,0 +1,53 @@
+version = "1.0.0"
+hardware_targets = ["linux"]
+builtin = true
+
+# A Linux network interface as an Ethernet frame driver: the hosted runtime's
+# counterpart of `virtio_net`, so `ip` (and everything over it — `tls`, the
+# continuity surfaces) runs its own TCP/IP stack on Linux instead of
+# `linux_net`'s host sockets. Frames cross both ports as `[len:u16 LE][frame]`
+# records, the first out being the MAC announcement.
+#
+# `packet`: an AF_PACKET socket bound to an existing interface (a veth end
+# with no address, in a network namespace the runtime owns — CAP_NET_RAW
+# there); the stack takes the interface's MAC. `tap`: a persistent TAP opened
+# by name (access to /dev/net/tun); the stack's MAC is derived from the name.
+
+[[ports]]
+name = "frames_rx"
+direction = "output"
+content_type = "EthernetFrame"
+required = true
+
+[[ports]]
+name = "frames_tx"
+direction = "input"
+content_type = "EthernetFrame"
+required = true
+
+# Tag 10 — the interface to drive.
+[[params]]
+name = "ifname"
+tag = 10
+type = "str"
+required = true
+
+# Tag 11 — the stack's MAC as six hex octets; the interface's (packet) or
+# derived from `ifname` (tap) when unset.
+[[params]]
+name = "mac"
+tag = 11
+type = "str"
+default = ""
+
+# Tag 12 — how the wire is reached.
+[[params]]
+name = "mode"
+tag = 12
+type = "enum"
+values = ["packet", "tap"]
+default = "packet"
+
+# Module-scope observability — exempt.
+[observability]
+exempt = "host-side dev/test frame driver — frames are observed at the ip module, and at the interface with host tooling"

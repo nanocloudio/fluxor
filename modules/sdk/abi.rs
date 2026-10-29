@@ -134,6 +134,11 @@ pub mod contracts {
         pub mod route {
             include!("contracts/net/route.rs");
         }
+        /// A hardware flow-decision provider beside the software director:
+        /// its attested generation, its decisions and its counters.
+        pub mod offload {
+            include!("contracts/net/offload.rs");
+        }
     }
     /// Observability telemetry envelope (metric / span signals).
     pub mod telemetry {

@@ -1,4 +1,4 @@
-// Contract: packet — packet protocol surface (v1 wire format).
+// Contract: packet — packet protocol surface.
 //
 // Layer: contracts/net (public, stable).
 //
@@ -11,9 +11,10 @@
 // direct NIC fast paths, market-data and control-plane packet flows.
 //
 // Two verb families share the surface. The endpoint verbs (bind, tx, rx,
-// close) are an envelope with no consumer yet. The decision-seam verbs
-// below them are consumed by `modules/foundation/ip`: a director settles
-// every inbound packet before transport state exists for it.
+// close) are an envelope no module in this tree provides or consumes. The
+// decision-seam verbs below them are provided by `modules/foundation/ip`: a
+// director settles every inbound packet before transport state exists for
+// it.
 //
 // Frames use the same [msg_type: u8] [len: u16 LE] [payload...] TLV
 // header as net_proto and datagram so the shared SDK helpers
@@ -124,7 +125,8 @@ pub const MSG_PKT_ERROR: u8 = 0x63;
 //
 // A second use of this surface, alongside the endpoint verbs above: the
 // `ip` module, with `packet_decision = "pre_transport"`, parses and
-// validates every inbound IPv4 packet ONCE and — before any connection
+// validates every inbound IPv4 packet (and, with `seam_v6`, every IPv6
+// packet to the addresses it names) ONCE and — before any connection
 // state is created — hands a director the headers and holds the buffer
 // until exactly one disposition comes back. Ownership follows the
 // disposition: LOCAL resumes the ordinary transport path, DROP and REJECT
@@ -175,11 +177,13 @@ pub const CMD_PKT_CLONE: u8 = 0x54;
 /// transport header's offset from the frame start.
 pub const MSG_PKT_DECIDE: u8 = 0x64;
 
-/// Provider → consumer, on the forward port: a packet disposed TUNNEL or
-/// DSR, whole. Payload: `[pkt_id: u32 LE] [disposition: u8] [args: 6]
-/// [frame...]` — the disposition and its argument bytes exactly as the
-/// consumer wrote them, then the Ethernet frame. The buffer is the
-/// consumer's from here on.
+/// Provider → consumer, on the forward port: a packet disposed TUNNEL,
+/// DSR or CHAIN, or a MIRROR's copy, whole. Payload: `[pkt_id: u32 LE]
+/// [disposition: u8] [args: 6] [frame...]` — the disposition and its
+/// argument bytes exactly as the consumer wrote them (for a `COPY`
+/// disposition, one record of the base and one of `MIRROR`, each with its
+/// own block), then the Ethernet frame. The buffer is the consumer's from
+/// here on.
 pub const MSG_PKT_FORWARD: u8 = 0x65;
 
 /// Provider → consumer: answer to `CMD_PKT_CLONE`. Payload:
@@ -190,6 +194,42 @@ pub const MSG_PKT_CLONED: u8 = 0x66;
 /// Provider → consumer: a held packet reached its hold deadline with no
 /// disposition and was released. Payload: `[pkt_id: u32 LE]`.
 pub const MSG_PKT_EXPIRED: u8 = 0x67;
+
+/// Provider → consumer: the copy a `MIRROR` disposition asked for was not
+/// made — the mirror budget was spent, or the forward port was unwired or
+/// full — and the original went its way alone. Payload:
+/// `[pkt_id: u32 LE] [lost_total: u32 LE]`, the second the provider's
+/// running count of copies lost, so a consumer that misses a report still
+/// sees how many it missed. A mirror never holds or delays the original.
+pub const MSG_PKT_MIRROR_LOST: u8 = 0x68;
+
+/// `MSG_PKT_MIRROR_LOST` payload length.
+pub const MIRROR_LOST_LEN: usize = 8;
+
+/// Provider → consumer: an IPv6 packet awaits disposition. Payload
+/// (`DECIDE6_LEN` bytes), `MSG_PKT_DECIDE`'s fields with the addresses
+/// sixteen bytes wide:
+///
+/// ```text
+/// [pkt_id: u32 LE] [af: u8 = 6] [proto: u8]
+/// [src_addr: 16 BE] [dst_addr: 16 BE] [src_port: u16 LE] [dst_port: u16 LE]
+/// [iface: u8] [rx_queue: u8] [flags: u8] [frag: u8]
+/// [ts_us: u64 LE] [frame_len: u16 LE] [l4_off: u16 LE]
+/// ```
+///
+/// A separate message rather than a longer `MSG_PKT_DECIDE`, so a director
+/// that reads only IPv4 records is unaffected: a provider sends it only
+/// when IPv6 is on at its seam (`ip`'s `seam_v6`). `proto` is the IPv6 next
+/// header, which is the transport — a packet with extension headers is
+/// refused before the seam, as a fragment is. The IPv6 header starts at
+/// `l4_off - 40`. `LOCAL` and `MIRROR` deliver to the provider's local
+/// transport: `ip` delivers TCP and UDP to an IPv6 address it terminates
+/// (`seam_v6`'s are) on a build with its IPv6 transport (the aarch64
+/// profile), and releases any other such packet counted (`v6_no_local`).
+pub const MSG_PKT_DECIDE6: u8 = 0x69;
+
+/// Length of a `MSG_PKT_DECIDE6` payload.
+pub const DECIDE6_LEN: usize = 4 + 1 + 1 + 16 + 16 + 2 + 2 + 1 + 1 + 1 + 1 + 8 + 2 + 2;
 
 /// Length of a `MSG_PKT_DECIDE` payload.
 pub const DECIDE_LEN: usize = 4 + 1 + 1 + 4 + 4 + 2 + 2 + 1 + 1 + 1 + 1 + 8 + 2 + 2;
@@ -248,7 +288,42 @@ pub mod disposition {
     /// Hand the frame to the forward port for direct return.
     /// `[endpoint_id: u16 LE] [rewrite_id: u16 LE]`.
     pub const DSR: u8 = 4;
+    /// Deliver to the local transport AND hand a copy to the forward port,
+    /// within the provider's mirror budget (copies per second, its
+    /// `packet_mirror_budget`). `[mirror_id: u16 LE] [flow_epoch: u32 LE]`,
+    /// echoed in the copy's forward record. A copy the budget or the
+    /// forward port cannot take is lost, counted and reported
+    /// (`MSG_PKT_MIRROR_LOST`); the original is delivered either way.
+    pub const MIRROR: u8 = 5;
+    /// Hand the frame to the forward port for the next stage of a service
+    /// chain. `[chain_id: u16 LE] [stage: u8] [flags: u8] [instance: u16
+    /// LE]` — the chain encapsulation (`cores/chain_encap.rs`) is the
+    /// consumer's to write; the seam only settles the packet's owner.
+    pub const CHAIN: u8 = 6;
+
+    /// Forward-and-copy: OR'd into `TUNNEL`, `DSR` or `CHAIN`, the
+    /// disposition carries a second argument block, a `MIRROR`'s
+    /// `[mirror_id: u16 LE] [flow_epoch: u32 LE]` —
+    /// `[pkt_id][disposition | COPY][args: 6][mirror args: 6]`. The frame
+    /// goes to the forward port as the base disposition says (its record
+    /// names the base disposition, the flag clear), and one copy goes there
+    /// too as a record naming `MIRROR` and the mirror arguments, within the
+    /// same `packet_mirror_budget` a `MIRROR` spends. As with a `MIRROR`, a
+    /// copy the budget or the port cannot take is lost, counted and reported
+    /// (`MSG_PKT_MIRROR_LOST`), never held for and never holding the
+    /// original back — so a copy can precede an original the port could not
+    /// yet take. This is how a director mirrors a tunnelled, direct-return
+    /// or chained flow, where `MIRROR` would deliver it locally.
+    pub const COPY: u8 = 0x80;
+
+    /// The base dispositions `COPY` may be OR'd into.
+    pub const fn copy_allowed(base: u8) -> bool {
+        matches!(base, TUNNEL | DSR | CHAIN)
+    }
 }
+
+/// Length of a `CMD_PKT_DISPOSE` payload carrying `disposition::COPY`.
+pub const DISPOSE_COPY_LEN: usize = 4 + 1 + DISP_ARGS_LEN + DISP_ARGS_LEN;
 
 /// `REJECT` response kinds.
 pub mod reject {

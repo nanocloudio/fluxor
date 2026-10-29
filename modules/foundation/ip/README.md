@@ -11,6 +11,10 @@ IP Stack Service Module
 - `eth.rs`
 - `icmp.rs`
 - `ipv4.rs`
+- `ipv6.rs` — IPv6 wire primitives: the fixed header, the RFC 8200
+  checksum, address text, the address classes the receive path refuses
+- `v6t.rs` — TCP and UDP over IPv6: local IPv6 addresses held as stand-in
+  slots, peers and their neighbour state, the stateless header translation
 - `tcp.rs`
 - `udp.rs`
 - `route.rs` — the `net.route` tables read with TAKE (segments, peer routes,
@@ -26,7 +30,7 @@ IP Stack Service Module
 
 ```toml
 version = "1.0.0"
-hardware_targets = ["rp2040", "rp2350", "bcm2712"]
+hardware_targets = ["rp2040", "rp2350", "bcm2712", "linux"]
 
 [[ports]]
 name = "frames_rx"
@@ -81,11 +85,44 @@ Defaults are aarch64's, with the MCU-class figure after the slash:
 - `policy_tables` (comma-separated names), `policy_bytes` (8192 / 1024) —
   the `net.policy` tables this instance enforces and translates.
 
+Decision seam (`docs/architecture/protocol_surfaces.md` §Pre-transport
+decision seam):
+
+- `packet_decision` (`off` / `pre_transport`), `packet_hold_ms` (50) — the
+  seam, and how long a packet waits for its disposition.
+- `packet_mirror_budget` (0) — `MIRROR` and forward-and-copy (`COPY`)
+  copies a second.
+- `seam_v6` (empty) — up to four IPv6 addresses, comma-separated, whose TCP
+  and UDP packets are described as `MSG_PKT_DECIDE6`; the stack answers
+  neighbour solicitation and echo for them, and on aarch64 holds each as a
+  local address, so `LOCAL` and `MIRROR` deliver its TCP and UDP to the
+  transports (on the MCU profiles, which carry no IPv6 transport, such a
+  packet is released, counted). Needs the seam on; anything but up to four
+  unicast addresses refuses construction.
+
+IPv6 (aarch64; `v6t.rs`):
+
+- `ip6` (empty) — up to four IPv6 addresses, comma-separated, this stack
+  terminates TCP and UDP for, armed and host-owned; `ADDR_ADD` with
+  `install::FAMILY6` adds more (sixteen in all, `V6T_LOCALS`).
+- `gateway6` (empty) — the IPv6 router every IPv6 peer is reached through;
+  empty, peers are on-link. Its neighbour mapping is set only by the answer
+  to the stack's solicitation, never moved by an unsolicited advertisement.
+- Anything but unicast addresses in either, or either set on a build without
+  IPv6, refuses construction. IPv6 is served whether or not the IPv4 stack
+  has an address.
+- `arm_authority` (`off` / `required`) — every arm of a secondary address
+  waits for the VIP authority's verdict on its emission token (`auth_req` /
+  `auth_rsp`, `contracts/net/identity.rs`); installs are disarmed whatever
+  they ask.
+
 ## Connecting by name
 
 A consumer opens a stream with `CMD_CONNECT_TO` (`net_proto`, 0x14), whose
 target carries an address family: `AF_INET` dials the literal at once,
-`AF_INET6` is refused `EINVAL` (there is no IPv6 stack), and `AF_NAME` is
+`AF_INET6` dials from an IPv6 address of the dialler's own — a workload's
+own, or for the node its first armed one no workload owns (`ENETUNREACH`
+with none, or with the peer table full of live peers) — and `AF_NAME` is
 resolved here before the SYN goes out. The reserved `CMD_CONNECT` (0x13) is
 unsupported and answered `MSG_ERROR ENOSYS` on its tag, with one log line naming
 `CMD_CONNECT_TO`, so an emitter of it fails on its first dial.
@@ -106,7 +143,9 @@ or the CSPRNG had no id to give.
 Answers are cached by TTL per owner — the node and each workload lane hold
 their own `dns_cache` entries and `dns_pending` queries, so no owner joins
 another's query or reads its answer — and a repeated dial pays no round
-trip. A zero TTL is held for 60 s; others for 1..3600 s. Names are held
+trip. Other TTLs are held for 1..3600 s; a zero TTL is for the lookup in
+progress only — its dials, and at most one more use (the retransmit of the
+named datagram that asked) within the 3 s query timeout. Names are held
 lowercased, whole up to the protocol's 253 bytes. A workload's queries go to
 its own name service (translated when it is a service address, the backend
 pinned for the lookup), from its own address when the server is inside its
@@ -139,6 +178,17 @@ and realizes what the node agent writes to the kernel:
   directly. Held addresses in `deliver` mode become node addresses
   (`held.rs`). `announce`, forwarding between segments and translated
   egress are not offered here, and the kernel's CAPS say so.
+- **Address removal.** An address removed (`ADDR_DEL`, a held address
+  withdrawn) or given to another owner takes what was latched to it:
+  connections close with nothing on the wire, their consumers told
+  (`MSG_CLOSED`, or `ENETUNREACH` for a connect still opening); a listener
+  or datagram endpoint moves to another address its owner holds, or closes
+  when there is none. Nothing made for one address ever sends from whatever
+  later takes its slot.
+- **IPv6 neighbours** are solicited from the address the frame waiting on
+  them leaves from — a workload's own for its flow, the node's own
+  otherwise — and never from another owner's; with no such address armed
+  there is no solicitation.
 - **`net.policy` tables** named by `policy_tables` (`policy.rs`): this
   module ATTACHes as their one enforcer, declaring `policy_bytes` as the
   most of each it holds (the store refuses a larger REPLACE, `E2BIG`), and
@@ -163,13 +213,57 @@ and realizes what the node agent writes to the kernel:
   (`ECONNREFUSED`, `MSG_DG_ERROR`). Inbound translation for clients off the
   node is not offered (`DNAT_LOCAL` without `DNAT`).
 
+## On Linux
+
+The hosted runtime ordinarily uses `linux_net` (host sockets) and no `ip`.
+A graph that needs a stack owning its connections — the transport-continuity
+surfaces checkpoint them — runs `ip` over the `linux_eth` built-in frame
+driver instead.
+
+## Transport continuity
+
+`continuity.rs` answers the per-layer surface of `session_ctrl.rs`
+§Transport continuity for TCP (`FXTC`). A primary's `CR_PAIR_PREPARED`
+carries the live connection's id after the shadow-slot field, the id `tls`
+names the same connection by. A segment for a tuple held as a shadow, or one
+`RETIRE` dropped within the last five seconds, is dropped silently rather
+than answered with RST: the connection is arriving, or has moved. So is one
+for a flow this host never held, once an anchor installs its tombstone
+(`CMD_SC_TOMBSTONE`, 0x89 on `cont_in`, `[flow_id:16][epoch:4][ttl_ms:4]`,
+held at most 120 s). Under the strict profile the relayed
+`CHECKPOINT_COMMITTED` that turns the mirror live also ends a quiesce and
+reopens the window. A record lands only on an address of the owner it
+names (0 names none and takes the address's owner); another owner's is
+refused `STATUS_CORRUPT`. An `ABORT` at the epoch a flow was activated
+under undoes that activation — the connection it made is reset, with an
+RST to the peer — while the connection is still the one activated
+(`transport_continuity` sends it when the layer above refuses the
+session). `transport_continuity` builds `TRANSPORT_CONTINUITY` over this
+and `tls`.
+
+## Retransmission
+
+`ip` keeps no copy of the bytes it sends. The consumer that does (`tls`) is
+told what the peer acknowledged (`MSG_ACK`, with the stream's first sequence
+number, so its window is placed exactly), is asked to resend from `SND.UNA`
+on duplicate ACKs (early retransmit with two or three segments out), the RTO
+and each partial acknowledgement in recovery (`MSG_RETRANSMIT`), and answers
+with `CMD_RESEND`, sent again at its own sequence numbers rather than
+allocated anew. The RTO is RFC 6298's in milliseconds (one-second floor,
+sixty-second ceiling, doubled per expiry). See `docs/architecture/network.md`
+§Downstream messages.
+
 ## Supported profile
 
-IPv4 fragments are dropped before L4 (no reassembler); off-subnet traffic
-leaves by the longest matching peer route whose peer is on the link, else by
-the configured gateway, and with neither is not sent; ARP mappings are
-created only by a correlated
-ARP reply; one transmit frame per datagram (`EMSGSIZE` past the ceiling).
+IPv4 fragments are dropped before L4 (no reassembler), and an IPv6 packet
+carrying any extension header (a fragment header among them) is refused;
+IPv6 serves TCP, UDP, neighbour discovery and echo only, from no multicast,
+loopback or IPv4-mapped source; off-subnet traffic leaves by the longest
+matching peer route whose peer is on the link, else by the configured
+gateway, and with neither is not sent; ARP mappings are created only by a
+correlated ARP reply; one transmit frame per datagram, no packet past the
+1500-byte link MTU (`EMSGSIZE` past it). `net.policy` tables name IPv4
+addresses: while one judges packets, an IPv6 flow it would judge is dropped.
 See the module doc comment and `docs/architecture/network.md`.
 
 Inbound TCP segments pass one admissibility gate before any state branch:
@@ -188,8 +282,17 @@ refused with `ENOTSOCK` and metered.
 The bind identity is `(protocol, local_port, local_slot)` plus the owner
 stamp. A repeated bind of the same identity by the same owner resolves to the
 existing endpoint; a bind whose reachability overlaps one already held is
-refused with `EADDRINUSE`. The same port at two distinct local addresses is
-two endpoints.
+refused with `EADDRINUSE`. The same port at two workloads' addresses is two
+endpoints.
+
+An owner-stamped bind — a TCP listener or a datagram endpoint — serves every
+address its owner holds, IPv4 and IPv6 alike, so a dual-stack workload is
+reached on both families through one bind; the host wildcard serves only the
+addresses no workload owns. What it sends leaves from the owner's own address
+of the destination's family, and a family the owner holds no address of is
+refused `ENETUNREACH`: a workload's traffic never leaves from the node's or
+another workload's address, except IPv4 to a destination outside its cluster
+prefixes, which leaves from the node's address and the endpoint's egress port.
 
 `ep_id` is an index, not an authority. The graph model permits several
 consumer modules to share this module's command channel — the kernel merges

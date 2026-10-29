@@ -6,7 +6,7 @@ hardware_targets = ["rp2350", "bcm2712", "linux"]
 # Consumed by the `continuity` config block validator.
 capabilities = ["session.worker", "session.handoff", "session.resume"]
 
-# SessionCtrlV1 control channel from the anchor.
+# The session-control channel from the anchor.
 [[ports]]
 name = "ctrl_in"
 direction = "input"
@@ -19,7 +19,7 @@ index = 1
 direction = "input"
 content_type = "OctetStream"
 
-# SessionCtrlV1 replies back to the anchor.
+# Session-control replies back to the anchor.
 [[ports]]
 name = "ctrl_out"
 direction = "output"
@@ -36,6 +36,6 @@ content_type = "OctetStream"
 requires_contract = "channel"
 access = "read"
 
-# Module-scope observability — exempt (see standards/observability.md §6).
+# Module-scope observability — exempt.
 [observability]
 exempt = "application-layer demo — byte throughput is observed at the foundation transport (ip/quic/http) it rides"

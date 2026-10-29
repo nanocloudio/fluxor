@@ -10,7 +10,9 @@ const NET_FRAME_HDR: usize = 3;
 /// Returns `total` bytes only when the kernel committed the full
 /// frame; returns 0 on backpressure (channel ring full or atomic
 /// FIFO write rejected) so callers can retry rather than treat a
-/// dropped frame as committed.
+/// dropped frame as committed, and 0 for a frame that can never be
+/// written: one larger than `scratch`, or a payload longer than the
+/// `u16` length names.
 unsafe fn net_write_frame(
     sys: &SyscallTable,
     chan: i32,
@@ -21,7 +23,7 @@ unsafe fn net_write_frame(
     scratch_max: usize,
 ) -> usize {
     let total = NET_FRAME_HDR + payload_len;
-    if chan < 0 || total > scratch_max {
+    if chan < 0 || total > scratch_max || payload_len > u16::MAX as usize {
         return 0;
     }
     let len_le = (payload_len as u16).to_le_bytes();
@@ -283,7 +285,7 @@ unsafe fn dev_dg_send_to_name_owned(
     let prefix = 1 + 1 + 1 + name.len() + 2;
     let body_len = prefix + tag_len + data_len;
     let total = NET_FRAME_HDR + body_len;
-    if total > scratch_max {
+    if total > scratch_max || body_len > u16::MAX as usize {
         return 0;
     }
     *scratch = DG_CMD_SEND_TO;
@@ -307,6 +309,69 @@ unsafe fn dev_dg_send_to_name_owned(
     *scratch.add(port_at + 1) = port_bytes[1];
     if data_len > 0 && !data.is_null() {
         core::ptr::copy_nonoverlapping(data, scratch.add(port_at + 2), data_len);
+    }
+    if (sys.channel_write)(chan, scratch, total) == total as i32 {
+        total
+    } else {
+        0
+    }
+}
+
+/// `CMD_DG_SEND_TO` to an IPv6 destination: `[ep_id][tag?][af = 6]
+/// [addr 16][port u16 LE][data]`. Same contract as the IPv4 form.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "an addressed datagram send is destination plus payload plus scratch"
+)]
+unsafe fn dev_dg_send_to_v6_owned(
+    sys: &SyscallTable,
+    chan: i32,
+    ep_id: u8,
+    owner_tag: u16,
+    dst: &[u8; 16],
+    dst_port: u16,
+    data: *const u8,
+    data_len: usize,
+    scratch: *mut u8,
+    scratch_max: usize,
+) -> usize {
+    if chan < 0 || ep_id == 0xFF {
+        return 0;
+    }
+    let tag_len = if owner_tag == 0 {
+        0
+    } else {
+        DG_OWNER_TAG_FIELD
+    };
+    let prefix = 1 + 1 + 16 + 2;
+    let body_len = prefix + tag_len + data_len;
+    let total = NET_FRAME_HDR + body_len;
+    if total > scratch_max || body_len > u16::MAX as usize {
+        return 0;
+    }
+    *scratch = DG_CMD_SEND_TO;
+    let pl = (body_len as u16).to_le_bytes();
+    *scratch.add(1) = pl[0];
+    *scratch.add(2) = pl[1];
+    *scratch.add(3) = ep_id;
+    if tag_len != 0 {
+        let tb = owner_tag.to_le_bytes();
+        *scratch.add(4) = DG_OWNER_TAG_MARK;
+        *scratch.add(5) = tb[0];
+        *scratch.add(6) = tb[1];
+    }
+    let af_at = NET_FRAME_HDR + 1 + tag_len;
+    *scratch.add(af_at) = abi::contracts::net::datagram::AF_INET6;
+    core::ptr::copy_nonoverlapping(dst.as_ptr(), scratch.add(af_at + 1), 16);
+    let port_bytes = dst_port.to_le_bytes();
+    *scratch.add(af_at + 17) = port_bytes[0];
+    *scratch.add(af_at + 18) = port_bytes[1];
+    if data_len > 0 && !data.is_null() {
+        core::ptr::copy_nonoverlapping(
+            data,
+            scratch.add(NET_FRAME_HDR + prefix + tag_len),
+            data_len,
+        );
     }
     if (sys.channel_write)(chan, scratch, total) == total as i32 {
         total
@@ -353,7 +418,7 @@ unsafe fn dev_dg_send_to_v4_owned(
     };
     let body_len = DG_V4_PREFIX + tag_len + data_len;
     let total = NET_FRAME_HDR + body_len;
-    if total > scratch_max {
+    if total > scratch_max || body_len > u16::MAX as usize {
         return 0;
     }
 

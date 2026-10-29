@@ -1,0 +1,103 @@
+version = "1.0.0"
+hardware_targets = ["bcm2712", "linux"]
+# Moves records as they come; nothing here is timed.
+timer_class = "agnostic"
+
+# Software receive-side scaling for `ip`'s pre-transport decision seam: up
+# to four director shards behind one seam. Each decision record goes to the
+# shard a symmetric hash of its canonical tuple names (both directions of a
+# flow, every packet of it, one shard), its `rx_queue` byte set to that
+# shard; `ip`'s later word on a packet (`CLONED`, `EXPIRED`, `MIRROR_LOST`)
+# goes to the shard that was given it, a clone becoming that shard's packet
+# too. The shards' dispositions merge back to `ip.packet_in` whole, the
+# shards served in turn; a record for a packet the shard was not given, or
+# has already disposed of, is dropped and counted (`foreign`). A shard with
+# no room holds the decision stream behind it (order kept, back pressure
+# reaching `ip`'s hold). The shard count is the number of `decide_k`
+# outputs wired, from `decide_1`.
+#
+# Wiring: `ip.packet_out -> decide_in`, `disp_out -> ip.packet_in`,
+# `decide_k -> director_k.packet_in` (its decision input) and
+# `director_k.<disposition output> -> disp_k`.
+#
+# The heartbeat line `[seam_shard] routed=<n> merged=<n> foreign=<n>
+# unknown=<n> oversize=<n> shard1..4=<n>` is logged when a count changes, at
+# most once every 512 steps.
+
+[[ports]]
+name = "decide_in"
+direction = "input"
+content_type = "OctetStream"
+required = true
+buffer_size = 8192
+
+[[ports]]
+name = "disp_1"
+index = 1
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 4096
+
+[[ports]]
+name = "disp_2"
+index = 2
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 4096
+
+[[ports]]
+name = "disp_3"
+index = 3
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 4096
+
+[[ports]]
+name = "disp_4"
+index = 4
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 4096
+
+[[ports]]
+name = "disp_out"
+direction = "output"
+content_type = "OctetStream"
+required = true
+buffer_size = 8192
+
+[[ports]]
+name = "decide_1"
+index = 1
+direction = "output"
+content_type = "OctetStream"
+required = true
+buffer_size = 4096
+
+[[ports]]
+name = "decide_2"
+index = 2
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 4096
+
+[[ports]]
+name = "decide_3"
+index = 3
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 4096
+
+[[ports]]
+name = "decide_4"
+index = 4
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 4096
+
+[[resources]]
+requires_contract = "channel"
+access = "read"
+
+[observability]
+exempt = "a router of the seam's decision records — the packets they describe are observed by ip and by the director shard each reaches"

@@ -25,18 +25,20 @@
 //!
 //! # Canonical record (`CT_TCP`)
 //!
-//! Little-endian unless stated; timers are REMAINING durations in the
-//! module's 50 ms timer ticks, never timestamps.
+//! Little-endian unless stated; timers are REMAINING durations, never
+//! timestamps: the retransmit timer in milliseconds, the others in the
+//! module's 50 ms timer ticks. The RTT estimator is in milliseconds too
+//! (`srtt` = SRTT × 8, `rttvar` = RTTVAR × 4, `rto` itself; RFC 6298).
 //!
 //! ```text
-//! [magic "FXTC"][layout u8 = 1][state u8]
+//! [magic "FXTC"][layout u8: 1 IPv4, 2 IPv6][state u8]
 //! [local_ip u32 BE][remote_ip u32 BE][local_port u16][remote_port u16]
-//! [owner_tag u16][prefix_len u8][pad u8]
+//! [reserved u16 = 0][prefix_len u8][pad u8]
 //! [iss u32][snd_una u32][snd_nxt u32][snd_wnd u16][snd_wl1 u32][snd_wl2 u32]
 //! [rcv_nxt u32][rcv_wnd u16]
 //! [cwnd u16][ssthresh u16][dup_ack_count u8][in_recovery u8][recover_seq u32]
 //! [srtt u16][rttvar u16][rto u16]
-//! [retransmit_remaining u16][timewait_remaining u16][idle_remaining u16][closewait_remaining u16]
+//! [retransmit_remaining_ms u16][timewait_remaining u16][idle_remaining u16][closewait_remaining u16]
 //! [delivered_bytes u32][consumed_bytes u32]
 //! [trace_id 16][span_id 8][sampled_flags u8]
 //! [reorder_count u8] then per slot: [seq u32][len u16][bytes]
@@ -52,6 +54,29 @@
 //! The layout digest a pair agrees on at `PAIR_PREPARE` is the SHA-256 of
 //! `TCP_CODEC_LAYOUT`; a standby built from a different layout refuses
 //! before any byte moves.
+//!
+//! # Answering a moved flow
+//!
+//! A segment for a tuple this module holds no connection for is normally
+//! answered with RST. Two kinds of flow are not: one held as a prepared,
+//! importing or armed shadow (the connection is arriving), and one RETIRE
+//! dropped within the last `TOMB_TTL_MS` (the connection left; a late or
+//! misrouted segment must not reset it at its new anchor). Those segments
+//! are dropped silently, and the peer's retransmission finds the
+//! connection wherever it now lives (`suppresses_reset`). A third kind is
+//! installed for a flow this host never held: `CMD_TOMBSTONE`
+//! (`session_ctrl`'s `CMD_SC_TOMBSTONE` on `cont_in`,
+//! `[flow_id:16][epoch:4][ttl_ms:4]`, answered `CONTINUITY{RETIRED}`), for an anchor that may route a moved flow's
+//! stray segment here. It is never evicted before its time: with every
+//! slot holding a live one it is refused `STATUS_NO_CAPACITY`.
+//!
+//! # The strict profile and a quiesce
+//!
+//! Under `PROFILE_CRASH_CONTINUOUS` the relayed
+//! `CONTINUITY{CHECKPOINT_COMMITTED}` that turns the mirror live also ends a
+//! quiesce and reopens the receive window: from there each transition
+//! waits on the standby's acknowledgement, so the window need not stay
+//! closed for the standby to stay exact.
 
 use super::*;
 
@@ -65,6 +90,10 @@ pub use abi::config::ip::MAX_TCP_SHADOWS;
 /// Record header: magic, layout, state.
 const REC_MAGIC: [u8; 4] = *b"FXTC";
 const REC_LAYOUT: u8 = 1;
+/// An IPv6 connection's record (`v6t.rs`): the IPv4 record's bytes with
+/// zero in both IPv4 address fields, then `[local_ip6 16][remote_ip6 16]`.
+const REC_LAYOUT_V6: u8 = 2;
+const REC_V6_TAIL: usize = 32;
 /// Fixed part of the record, before the reorder slots.
 const REC_FIXED_LEN: usize = 4
     + 1
@@ -99,10 +128,10 @@ const REC_FIXED_LEN: usize = 4
     + 1;
 /// Largest record: the fixed part plus every reorder slot full.
 pub const TCP_RECORD_MAX: usize =
-    REC_FIXED_LEN + tcp::REORDER_SLOTS * (4 + 2 + tcp::REORDER_SLOT_BYTES);
+    REC_FIXED_LEN + tcp::REORDER_SLOTS * (4 + 2 + tcp::REORDER_SLOT_BYTES) + REC_V6_TAIL;
 
 /// What `PAIR_PREPARE` binds: the layout of the record above.
-const TCP_CODEC_LAYOUT: &[u8] = b"fluxor.ip.tcp-checkpoint:1:FXTC:reorder";
+const TCP_CODEC_LAYOUT: &[u8] = b"fluxor.ip.tcp-checkpoint:FXTC:reorder:ipv6";
 
 /// TIME-WAIT length in timer ticks, as the sweep enforces it.
 const TIMEWAIT_TICKS: u16 = 41;
@@ -132,6 +161,40 @@ const RECV_RING: usize = 8;
 /// Distinguishes a slot reserved for a shadow from a free one.
 pub const NOTIFY_SHADOW_RESERVED: u8 = 9;
 
+/// Flows RETIRE dropped that are remembered, and for how long a late
+/// segment for one is dropped instead of reset.
+const TOMB_SLOTS: usize = 8;
+const TOMB_TTL_MS: u32 = 5_000;
+/// The longest an anchor's tombstone is held.
+const TOMB_TTL_MAX_MS: u32 = 120_000;
+
+/// `session_ctrl`'s `CMD_SC_TOMBSTONE` on `cont_in`: install a tombstone for
+/// a flow this host never held. `[flow_id:16][epoch:4][ttl_ms:4]`.
+pub const CMD_TOMBSTONE: u8 = sc::CMD_SC_TOMBSTONE;
+const TOMBSTONE_PAYLOAD_LEN: usize = sc::FLOW_HEADER_LEN + 4;
+
+/// A flow this module retired: its tuple identity and when the memory of it
+/// lapses (`dev_millis`, wrapping).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TcpTomb {
+    pub live: u8,
+    pub _pad: [u8; 3],
+    pub until_ms: u32,
+    pub flow_id: [u8; 16],
+}
+
+impl TcpTomb {
+    pub const fn empty() -> Self {
+        Self {
+            live: 0,
+            _pad: [0; 3],
+            until_ms: 0,
+            flow_id: [0; 16],
+        }
+    }
+}
+
 use abi::contracts::net::session_ctrl as sc;
 
 /// One connection staged for import.
@@ -153,11 +216,45 @@ pub struct TcpShadow {
     pub import: HandoffImport,
     pub record: [u8; TCP_RECORD_MAX],
     pub conn: tcp::TcpConn,
+    /// The activation this slot last made, so an `ABORT` at the new epoch
+    /// can undo it (`cmd_abort`). It outlives the shadow: a slot taken
+    /// again keeps it until its own activation replaces it, and a free
+    /// slot holding none is taken first (`free_shadow`).
+    pub activated: Activation,
+}
+
+/// One activation: the flow, the epoch it went live under, the connection
+/// slot it took and that connection's initial send sequence — what tells
+/// the connection activated from a later one in the same slot.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Activation {
+    pub live: u8,
+    pub _pad: [u8; 3],
+    pub epoch: u32,
+    pub conn_idx: u32,
+    pub iss: u32,
+    pub flow_id: [u8; 16],
+}
+
+impl Activation {
+    pub const fn empty() -> Self {
+        Self {
+            live: 0,
+            _pad: [0; 3],
+            epoch: 0,
+            conn_idx: u32::MAX,
+            iss: 0,
+            flow_id: [0; 16],
+        }
+    }
 }
 
 impl TcpShadow {
     /// Zero in place; no temporary the size of the record on the stack.
+    /// The slot's last activation is kept (`activated`).
     pub fn clear(&mut self) {
+        let activated = self.activated;
         // SAFETY: every field is plain data; the all-zero image is then
         // fixed up where zero is not the empty value.
         unsafe { core::ptr::write_bytes(self as *mut Self, 0, 1) };
@@ -165,6 +262,7 @@ impl TcpShadow {
         self.import = HandoffImport::new();
         self.conn.state = tcp::TcpState::Closed;
         self.conn.local_slot = tcp::LOCAL_SLOT_ANY;
+        self.activated = activated;
     }
 
     pub const fn empty() -> Self {
@@ -185,6 +283,7 @@ impl TcpShadow {
             import: HandoffImport::new(),
             record: [0; TCP_RECORD_MAX],
             conn: tcp::TcpConn::new(),
+            activated: Activation::empty(),
         }
     }
 }
@@ -292,6 +391,7 @@ pub struct Continuity {
     pub reply: [u8; 3 + sc::CONTINUITY_HEADER_LEN + 64],
     pub shadows: [TcpShadow; MAX_TCP_SHADOWS],
     pub mirrors: [TcpMirror; MAX_TCP_SHADOWS],
+    pub tombs: [TcpTomb; TOMB_SLOTS],
     pub stats: ContStats,
 }
 
@@ -307,6 +407,10 @@ pub struct ContStats {
     pub activations: u32,
     pub refusals: u32,
     pub horizon_waits: u32,
+    /// Segments for a shadowed or retired flow dropped instead of reset.
+    pub resets_suppressed: u32,
+    /// Tombstones installed by `CMD_TOMBSTONE`.
+    pub tombstones: u32,
 }
 
 impl Continuity {
@@ -321,6 +425,7 @@ impl Continuity {
             reply: [0; 3 + sc::CONTINUITY_HEADER_LEN + 64],
             shadows: [SH; MAX_TCP_SHADOWS],
             mirrors: [MI; MAX_TCP_SHADOWS],
+            tombs: [TcpTomb::empty(); TOMB_SLOTS],
             stats: ContStats {
                 checkpoints_out: 0,
                 checkpoints_in: 0,
@@ -330,6 +435,8 @@ impl Continuity {
                 activations: 0,
                 refusals: 0,
                 horizon_waits: 0,
+                resets_suppressed: 0,
+                tombstones: 0,
             },
         }
     }
@@ -345,10 +452,112 @@ pub(super) unsafe fn init(s: &mut IpState) {
     let mut i = 0;
     while i < MAX_TCP_SHADOWS {
         s.cont.shadows[i].clear();
+        s.cont.shadows[i].activated = Activation::empty();
         s.cont.mirrors[i].clear();
         i += 1;
     }
+    s.cont.tombs = [TcpTomb::empty(); TOMB_SLOTS];
     s.cont.stats = ContStats::default();
+}
+
+/// Whether a segment for the tuple — matching no connection here — is to be
+/// dropped silently rather than reset: a shadow holds the flow, or RETIRE
+/// dropped it less than `TOMB_TTL_MS` ago.
+pub(super) unsafe fn suppresses_reset(
+    s: &mut IpState,
+    local: u32,
+    remote: u32,
+    local_port: u16,
+    remote_port: u16,
+) -> bool {
+    let mut f = [0u8; 16];
+    f[..4].copy_from_slice(&local.to_be_bytes());
+    f[4..8].copy_from_slice(&remote.to_be_bytes());
+    f[8..10].copy_from_slice(&local_port.to_be_bytes());
+    f[10..12].copy_from_slice(&remote_port.to_be_bytes());
+    // An IPv6 connection is named by its digest, not its stand-ins.
+    if v6t::is_peer(remote) {
+        if let (Some(l6), Some(r6)) = (v6t::v6_of_standin(s, local), v6t::v6_of_standin(s, remote))
+        {
+            f = v6t::flow_id_v6(&l6, &r6, local_port, remote_port);
+        }
+    }
+    let held = find_shadow(s, &f).is_some() || {
+        let now = dev_millis(&*s.syscalls) as u32;
+        let mut hit = false;
+        let mut i = 0;
+        while i < TOMB_SLOTS {
+            let t = &mut s.cont.tombs[i];
+            if t.live != 0 {
+                if t.until_ms.wrapping_sub(now) >= 0x8000_0000 {
+                    t.live = 0;
+                } else if t.flow_id == f {
+                    hit = true;
+                }
+            }
+            i += 1;
+        }
+        hit
+    };
+    if held {
+        s.cont.stats.resets_suppressed = s.cont.stats.resets_suppressed.wrapping_add(1);
+    }
+    held
+}
+
+/// Remember a retired flow; the oldest memory gives way when all are held.
+unsafe fn tomb_install(s: &mut IpState, flow: &[u8; 16]) {
+    let _ = tomb_put(s, flow, TOMB_TTL_MS, true);
+}
+
+/// Hold `flow`'s tombstone for `ttl_ms`. A slot already naming the flow,
+/// a free one or an expired one takes it; with every slot live the one
+/// closest to expiry gives way if `evict`, and otherwise nothing is
+/// installed (`false`).
+unsafe fn tomb_put(s: &mut IpState, flow: &[u8; 16], ttl_ms: u32, evict: bool) -> bool {
+    let now = dev_millis(&*s.syscalls) as u32;
+    let mut at = None;
+    let mut soonest = u32::MAX;
+    let mut oldest = 0;
+    let mut i = 0;
+    while i < TOMB_SLOTS {
+        let t = &s.cont.tombs[i];
+        let left = t.until_ms.wrapping_sub(now);
+        if t.live == 0 || t.flow_id == *flow || left >= 0x8000_0000 {
+            at = Some(i);
+            break;
+        }
+        if left < soonest {
+            soonest = left;
+            oldest = i;
+        }
+        i += 1;
+    }
+    let at = match at {
+        Some(i) => i,
+        None if evict => oldest,
+        None => return false,
+    };
+    s.cont.tombs[at] = TcpTomb {
+        live: 1,
+        _pad: [0; 3],
+        until_ms: now.wrapping_add(ttl_ms),
+        flow_id: *flow,
+    };
+    true
+}
+
+/// `CMD_TOMBSTONE`: an anchor's tombstone for a flow that may be routed
+/// here without being held here.
+unsafe fn cmd_tombstone(s: &mut IpState, flow: &[u8; 16], epoch: u32, p: &[u8]) {
+    let ttl = rd_u32(p, sc::FLOW_HEADER_LEN).clamp(1, TOMB_TTL_MAX_MS);
+    let st = if tomb_put(s, flow, ttl, false) {
+        s.cont.stats.tombstones = s.cont.stats.tombstones.wrapping_add(1);
+        sc::STATUS_OK
+    } else {
+        sc::STATUS_NO_CAPACITY
+    };
+    reply(s, flow, epoch, sc::CR_RETIRED, st, &[]);
 }
 
 /// Whether the continuity ports are wired.
@@ -408,6 +617,9 @@ pub fn codec_digest() -> [u8; 32] {
 /// The flow identity of connection `idx`.
 pub(super) unsafe fn flow_id_of(s: &IpState, idx: usize) -> [u8; 16] {
     let c = &*s.tcp_conns.ptr(idx);
+    if let Some((l6, r6)) = v6_ends(s, c) {
+        return v6t::flow_id_v6(&l6, &r6, c.local_port, c.remote_port);
+    }
     let local = local_ip_for_slot(s, c.local_slot);
     let mut f = [0u8; 16];
     f[..4].copy_from_slice(&local.to_be_bytes());
@@ -465,14 +677,19 @@ fn find_shadow(s: &IpState, flow: &[u8; 16]) -> Option<usize> {
 }
 
 fn free_shadow(s: &IpState) -> Option<usize> {
+    let mut spare = None;
     let mut i = 0;
     while i < MAX_TCP_SHADOWS {
-        if s.cont.shadows[i].in_use == 0 {
-            return Some(i);
+        let sh = &s.cont.shadows[i];
+        if sh.in_use == 0 {
+            if sh.activated.live == 0 {
+                return Some(i);
+            }
+            spare = spare.or(Some(i));
         }
         i += 1;
     }
-    None
+    spare
 }
 
 fn free_mirror(s: &IpState) -> Option<usize> {
@@ -486,9 +703,33 @@ fn free_mirror(s: &IpState) -> Option<usize> {
     None
 }
 
+/// An IPv6 connection's two addresses (`v6t.rs`), `None` for IPv4.
+fn v6_ends(s: &IpState, c: &tcp::TcpConn) -> Option<([u8; 16], [u8; 16])> {
+    if !v6t::is_peer(c.remote_ip) {
+        return None;
+    }
+    Some((
+        v6t::local_v6(s, c.local_slot)?,
+        v6t::v6_of_standin(s, c.remote_ip)?,
+    ))
+}
+
 /// The live connection a flow names on this module, if it is one this
 /// module could export.
 unsafe fn conn_of_flow(s: &IpState, flow: &[u8; 16]) -> Option<usize> {
+    if flow[0] == 0xF6 {
+        // An IPv6 flow is named by a digest: the connection whose ends
+        // give it.
+        let mut i = 0;
+        while i < s.tcp_conns.len() {
+            let c = &*s.tcp_conns.ptr(i);
+            if c.is_active() && v6t::is_peer(c.remote_ip) && flow_id_of(s, i) == *flow {
+                return Some(i);
+            }
+            i += 1;
+        }
+        return None;
+    }
     let local = rd_u32_be(flow, 0);
     let remote = rd_u32_be(flow, 4);
     let lport = u16::from_be_bytes([flow[8], flow[9]]);
@@ -616,14 +857,27 @@ pub(super) unsafe fn encode_record(
         c.local_slot as usize
     };
     let prefix_len = s.local_addrs[slot].prefix_len;
+    let v6 = v6_ends(s, c);
     let mut p = 0usize;
     put(out, &mut p, &REC_MAGIC);
-    put(out, &mut p, &[REC_LAYOUT, state_code(c.state)]);
-    put(out, &mut p, &local.to_be_bytes());
-    put(out, &mut p, &c.remote_ip.to_be_bytes());
+    let layout = if v6.is_some() {
+        REC_LAYOUT_V6
+    } else {
+        REC_LAYOUT
+    };
+    put(out, &mut p, &[layout, state_code(c.state)]);
+    // An IPv6 connection's stand-ins are this host's own; its record names
+    // the IPv6 addresses (after the reorder slots).
+    let (l4, r4) = if v6.is_some() {
+        (0, 0)
+    } else {
+        (local, c.remote_ip)
+    };
+    put(out, &mut p, &l4.to_be_bytes());
+    put(out, &mut p, &r4.to_be_bytes());
     put(out, &mut p, &c.local_port.to_le_bytes());
     put(out, &mut p, &c.remote_port.to_le_bytes());
-    put(out, &mut p, &c.owner_tag.to_le_bytes());
+    put(out, &mut p, &[0, 0]);
     put(out, &mut p, &[prefix_len, 0]);
     put(out, &mut p, &c.iss.to_le_bytes());
     put(out, &mut p, &c.snd_una.to_le_bytes());
@@ -640,8 +894,10 @@ pub(super) unsafe fn encode_record(
     put(out, &mut p, &c.srtt.to_le_bytes());
     put(out, &mut p, &c.rttvar.to_le_bytes());
     put(out, &mut p, &c.rto.to_le_bytes());
+    // The RTO's remainder in ms; the timer counts 50 ms sweep windows.
     let retx_rem = if c.snd_nxt != c.snd_una {
-        c.rto.saturating_sub(c.retransmit_timer)
+        u32::from(c.rto).saturating_sub(u32::from(c.retransmit_timer) * tcp::RTO_GRANULARITY_MS)
+            as u16
     } else {
         0
     };
@@ -678,15 +934,36 @@ pub(super) unsafe fn encode_record(
         i += 1;
     }
     out[count_pos] = n;
+    if let Some((l6, r6)) = v6 {
+        put(out, &mut p, &l6);
+        put(out, &mut p, &r6);
+    }
     p
 }
 
 /// Decode a record into a connection, or the status refusing it.
 /// `elapsed_ticks` is the transfer age charged against every timer.
-unsafe fn decode_record(s: &IpState, rec: &[u8], conn: &mut tcp::TcpConn) -> Result<(), u8> {
-    if rec.len() < REC_FIXED_LEN || rec[..4] != REC_MAGIC || rec[4] != REC_LAYOUT {
+unsafe fn decode_record(s: &mut IpState, rec: &[u8], conn: &mut tcp::TcpConn) -> Result<(), u8> {
+    if rec.len() < REC_FIXED_LEN || rec[..4] != REC_MAGIC {
         return Err(sc::STATUS_CORRUPT);
     }
+    let v6 = match rec[4] {
+        REC_LAYOUT => None,
+        REC_LAYOUT_V6 if v6t::V6T && rec.len() >= REC_FIXED_LEN + REC_V6_TAIL => {
+            let t = rec.len() - REC_V6_TAIL;
+            let mut l6 = [0u8; 16];
+            let mut r6 = [0u8; 16];
+            l6.copy_from_slice(&rec[t..t + 16]);
+            r6.copy_from_slice(&rec[t + 16..]);
+            Some((l6, r6))
+        }
+        _ => return Err(sc::STATUS_CORRUPT),
+    };
+    let rec = if v6.is_some() {
+        &rec[..rec.len() - REC_V6_TAIL]
+    } else {
+        rec
+    };
     let state = state_of_code(rec[5]).ok_or(sc::STATUS_CORRUPT)?;
     let mut p = 6usize;
     let local = rd_u32_be(rec, p);
@@ -697,21 +974,47 @@ unsafe fn decode_record(s: &IpState, rec: &[u8], conn: &mut tcp::TcpConn) -> Res
     p += 2;
     let rport = rd_u16(rec, p);
     p += 2;
-    let owner_tag = rd_u16(rec, p);
-    p += 2;
-    p += 2; // prefix_len, pad
-    if remote == 0 || lport == 0 || rport == 0 {
+    if rd_u16(rec, p) != 0 {
         return Err(sc::STATUS_CORRUPT);
     }
-    // Route identity: the address must be one this module holds.
-    let slot = local_slot_for_dst(s, local).ok_or(sc::STATUS_NOT_READY)?;
+    p += 2;
+    p += 2; // prefix_len, pad
+    if lport == 0 || rport == 0 {
+        return Err(sc::STATUS_CORRUPT);
+    }
+    let (slot, remote) = match v6 {
+        Some((l6, r6)) => {
+            if local != 0 || remote != 0 || ipv6::is_multicast(&r6) || ipv6::is_unspecified(&r6) {
+                return Err(sc::STATUS_CORRUPT);
+            }
+            // The IPv6 address must be one this module holds; the peer gets
+            // a stand-in here, its neighbour solicited at first send.
+            let slot = v6t::slot_of_v6(s, &l6).ok_or(sc::STATUS_NOT_READY)?;
+            let pi = v6t::peer_for(s, &r6, None).ok_or(sc::STATUS_NO_CAPACITY)?;
+            (slot, v6t::peer_standin(pi))
+        }
+        None => {
+            if remote == 0 || v6t::is_reserved(remote) || v6t::is_reserved(local) {
+                return Err(sc::STATUS_CORRUPT);
+            }
+            // Route identity: the address must be one this module holds.
+            (
+                local_slot_for_dst(s, local).ok_or(sc::STATUS_NOT_READY)?,
+                remote,
+            )
+        }
+    };
+    // The connection belongs to the owner of the address it lands on. The
+    // record names no owner: owners are this host's own numbering, which
+    // means nothing on the host that wrote it.
+    let here = owner_tag_for_slot(s, slot);
     *conn = tcp::TcpConn::new();
     conn.state = state;
     conn.local_port = lport;
     conn.remote_port = rport;
     conn.remote_ip = remote;
     conn.local_slot = slot;
-    conn.owner_tag = owner_tag;
+    conn.owner_tag = here;
     conn.iss = rd_u32(rec, p);
     p += 4;
     conn.snd_una = rd_u32(rec, p);
@@ -807,7 +1110,8 @@ unsafe fn decode_record(s: &IpState, rec: &[u8], conn: &mut tcp::TcpConn) -> Res
     }
     // Timers are stored as remaining durations until activation converts
     // them; the conversion needs the transfer age, known only then.
-    conn.retransmit_timer = retx_rem;
+    // Held as whole sweep windows remaining until `convert_timers`.
+    conn.retransmit_timer = retx_rem.div_ceil(tcp::RTO_GRANULARITY_MS as u16);
     conn.timewait_timer = tw_rem;
     conn.idle_timer = idle_rem;
     conn.closewait_timer = cw_rem;
@@ -825,7 +1129,8 @@ fn convert_timers(s: &IpState, conn: &mut tcp::TcpConn, age_ticks: u16) -> u8 {
         if retx_rem == 0 {
             expired += 1;
         }
-        conn.retransmit_timer = conn.rto.saturating_sub(retx_rem);
+        let rto_windows = conn.rto.div_ceil(tcp::RTO_GRANULARITY_MS as u16);
+        conn.retransmit_timer = rto_windows.saturating_sub(retx_rem);
     } else {
         conn.retransmit_timer = 0;
     }
@@ -1232,6 +1537,7 @@ pub(super) unsafe fn service(s: &mut IpState) {
             }
             sc::CMD_SC_RETIRE => cmd_retire(s, &flow, epoch),
             sc::CMD_SC_ABORT if plen >= sc::ABORT_PAYLOAD_LEN => cmd_abort(s, &flow, epoch, p),
+            CMD_TOMBSTONE if plen >= TOMBSTONE_PAYLOAD_LEN => cmd_tombstone(s, &flow, epoch, p),
             sc::MSG_SC_CONTINUITY if plen >= sc::CONTINUITY_HEADER_LEN => {
                 // A relayed standby reply: the exporter learns its
                 // checkpoint is held.
@@ -1239,6 +1545,7 @@ pub(super) unsafe fn service(s: &mut IpState) {
                     if let Some(mi) = find_mirror(s, &flow) {
                         if s.cont.mirrors[mi].epoch == epoch {
                             s.cont.mirrors[mi].live = 1;
+                            resume_after_commit(s, mi);
                         }
                     }
                 }
@@ -1246,6 +1553,23 @@ pub(super) unsafe fn service(s: &mut IpState) {
             _ => {}
         }
         count += 1;
+    }
+}
+
+/// Under the strict profile a committed checkpoint ends a quiesce: the
+/// horizons hold the standby exact from here, so the window reopens (and
+/// the peer is told at once rather than by its persist timer).
+unsafe fn resume_after_commit(s: &mut IpState, mi: usize) {
+    let m = &mut s.cont.mirrors[mi];
+    if m.profile != sc::PROFILE_CRASH_CONTINUOUS || m.quiescing == 0 {
+        return;
+    }
+    m.quiescing = 0;
+    m.quiesce_deadline_ms = 0;
+    let idx = m.conn_idx as usize;
+    if idx < s.tcp_conns.len() {
+        update_rcv_wnd(s, idx);
+        send_tcp_control(s, idx, tcp::ACK, false);
     }
 }
 
@@ -1338,13 +1662,14 @@ unsafe fn cmd_pair_prepare(s: &mut IpState, flow: &[u8; 16], epoch: u32, p: &[u8
             }
             // Idempotent re-prepare.
             let slot = (mi as u16).to_le_bytes();
+            let conn = (idx as u16).to_le_bytes();
             reply(
                 s,
                 flow,
                 epoch,
                 sc::CR_PAIR_PREPARED,
                 sc::STATUS_OK,
-                &[transport, profile, slot[0], slot[1]],
+                &[transport, profile, slot[0], slot[1], conn[0], conn[1]],
             );
             return;
         }
@@ -1381,13 +1706,14 @@ unsafe fn cmd_pair_prepare(s: &mut IpState, flow: &[u8; 16], epoch: u32, p: &[u8
         m.conn_idx = idx as u32;
         m.recv_horizon = rcv_nxt;
         let slot = (mi as u16).to_le_bytes();
+        let conn = (idx as u16).to_le_bytes();
         reply(
             s,
             flow,
             epoch,
             sc::CR_PAIR_PREPARED,
             sc::STATUS_OK,
-            &[transport, profile, slot[0], slot[1]],
+            &[transport, profile, slot[0], slot[1], conn[0], conn[1]],
         );
         return;
     }
@@ -1778,7 +2104,10 @@ unsafe fn cmd_checkpoint_commit(s: &mut IpState, flow: &[u8; 16], epoch: u32, p:
     let decoded = {
         let sh = &s.cont.shadows[si];
         let len = sh.record_len as usize;
-        decode_record(s, &sh.record[..len], &mut conn)
+        // SAFETY: the record is this shadow's, untouched while it decodes
+        // (decoding only reads the tables and may make a peer entry).
+        let rec = core::slice::from_raw_parts(sh.record.as_ptr(), len);
+        decode_record(s, rec, &mut conn)
     };
     match decoded {
         Ok(()) => {
@@ -2346,7 +2675,16 @@ unsafe fn cmd_activate(s: &mut IpState, flow: &[u8; 16], epoch_new: u32, p: &[u8
     // The window the primary advertised at its cut was closed for the
     // quiesce; this side's consumer decides the window from here.
     update_rcv_wnd(s, idx);
+    let iss = (*s.tcp_conns.ptr(idx)).iss;
     s.cont.shadows[si].clear();
+    s.cont.shadows[si].activated = Activation {
+        live: 1,
+        _pad: [0; 3],
+        epoch: epoch_new,
+        conn_idx: idx as u32,
+        iss,
+        flow_id: *flow,
+    };
     s.cont.stats.activations = s.cont.stats.activations.wrapping_add(1);
     log_info(s, b"[ip] tcp activated from checkpoint");
     let mut body = [0u8; 6];
@@ -2386,6 +2724,7 @@ unsafe fn cmd_retire(s: &mut IpState, flow: &[u8; 16], epoch: u32) {
         conn_reset(s, idx);
     }
     s.cont.mirrors[mi].clear();
+    tomb_install(s, flow);
     reply(s, flow, epoch, sc::CR_RETIRED, sc::STATUS_OK, &[]);
 }
 
@@ -2411,6 +2750,10 @@ unsafe fn cmd_abort(s: &mut IpState, flow: &[u8; 16], epoch: u32, p: &[u8]) {
             return;
         }
     }
+    if undo_activation(s, flow, epoch) {
+        reply(s, flow, epoch, sc::CR_ABORTED, sc::STATUS_OK, &[reason]);
+        return;
+    }
     reply(
         s,
         flow,
@@ -2419,4 +2762,47 @@ unsafe fn cmd_abort(s: &mut IpState, flow: &[u8; 16], epoch: u32, p: &[u8]) {
         sc::STATUS_UNKNOWN_SESSION,
         &[reason],
     );
+}
+
+/// Undo the activation of `flow` at `epoch_new`: the layer above did not
+/// take up the session this connection was to carry, so the connection is
+/// reset — an RST to the peer, then closed as an address release closes
+/// one (`close_released`): its consumer told `MSG_CLOSED`, so a `tls` that
+/// activated the session after all ends it, its neighbour unpinned, its
+/// slot freed. Only the connection that activation made: one closed since,
+/// or a later connection in the same slot, is left alone and the answer is
+/// false.
+unsafe fn undo_activation(s: &mut IpState, flow: &[u8; 16], epoch_new: u32) -> bool {
+    let mut si = 0;
+    while si < MAX_TCP_SHADOWS {
+        let a = s.cont.shadows[si].activated;
+        if a.live != 0 && a.epoch == epoch_new && a.flow_id == *flow {
+            s.cont.shadows[si].activated = Activation::empty();
+            let idx = a.conn_idx as usize;
+            if conn_of_flow(s, flow) != Some(idx) || (*s.tcp_conns.ptr(idx)).iss != a.iss {
+                return false;
+            }
+            let _ = send_tcp_control(s, idx, tcp::RST | tcp::ACK, false);
+            close_released(s, idx, NOTIFY_CLOSED);
+            return true;
+        }
+        si += 1;
+    }
+    false
+}
+
+/// Local slot `slot` lost its address (removed, or given to another
+/// owner): a shadow whose connection was decoded onto it cannot go live
+/// there, so it goes back to waiting for a checkpoint, which is decoded
+/// against the table as it is then.
+pub(super) fn on_slot_removed(s: &mut IpState, slot: u16) {
+    let mut si = 0;
+    while si < MAX_TCP_SHADOWS {
+        let sh = &s.cont.shadows[si];
+        if sh.in_use != 0 && sh.phase >= SH_COMMITTED && sh.conn.local_slot == slot {
+            discard_shadow_to_prepared(s, si);
+            s.cont.shadows[si].conn = tcp::TcpConn::new();
+        }
+        si += 1;
+    }
 }

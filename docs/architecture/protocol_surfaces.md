@@ -17,12 +17,13 @@ Source: `modules/sdk/contracts/net/`.
 
 | File | Surface | Opcodes | Status |
 |------|---------|---------|--------|
-| `net_proto.rs` | stream | `0x01..0x14` | live: `ip`, `tls`, `ota_registry`, `linux_net`, downstream `http` |
+| `net_proto.rs` | stream | `0x01..0x19` | live: `ip`, `tls`, `ota_registry`, `linux_net`, downstream `http` |
 | `datagram.rs` | datagram | `0x20..0x43` | live: `ip`, `linux_net`, `dns`, `log_net`, `quic`, `tls` (DTLS mode) |
-| `packet.rs` | packet | `0x50..0x63` | reserved: envelope defined, no consumer |
-| `identity.rs` | address control | `0x60..0x61` | live: net identity self-registration |
+| `packet.rs` | packet | `0x50..0x69` | decision seam live: `ip`, `seam_shard`, `fwd_split`, `packet_echo_director` fixture; endpoint verbs (`0x50..0x52`, `0x60..0x63`) an envelope with no provider |
+| `identity.rs` | address control | `0x60..0x63`, `0x70..0x73`, `0x7A..0x7B` | live: net identity self-registration; `ADDR_ADD`/`DEL`/`ARM`/`FENCE` in, `MSG_ADDR_ADDED`/`ARMED`/`FENCED`/`REFUSED` out, the VIP authority's check and verdict |
 | `session_ctrl.rs` | session control | `0x70..0x9F` | live: `echo_anchor` / `echo_worker` fixtures; downstream `http` as a multi-session anchor with `ws_echo_worker` behind it |
 | `mux.rs` | multiplexed session | `0xB0..0xCF` | live: `quic`, `mux_echo` fixture |
+| `offload.rs` | hardware flow-decision offload | `0x70..0x7A` | contract only: no provider |
 
 The exchange contract (`modules/sdk/contracts/exchange.rs`, see
 `exchange.md`) carries no row and holds no opcodes. It is an
@@ -44,10 +45,15 @@ to it.
 
 Opcode ranges are disjoint across the
 files that can share a channel, so a misconfigured channel fails
-loudly rather than silently misparsing. The one numeric overlap is
-`identity.rs` (`ADDR_ADD` 0x60 / `ADDR_DEL` 0x61 inside the packet
-range); those opcodes travel only on a dedicated single-writer
-`addr_ctl` port and never share a channel with packet frames.
+loudly rather than silently misparsing. The numeric overlaps are on
+dedicated ports. `identity.rs`'s commands (`ADDR_ADD` 0x60 through
+`ADDR_FENCE` 0x63) sit inside the packet range and its events
+(`MSG_ADDR_ADDED` 0x70 through `MSG_ADDR_REFUSED` 0x73) and the VIP
+authority's check and verdict (0x7A, 0x7B) inside the session-control
+range; they travel only on the single-writer `addr_ctl` port and its
+event and authority ports, never on a channel with packet or session
+frames. `offload.rs` shares `session_ctrl.rs`'s range the same way: its
+records travel only between a director and its offload provider.
 
 ## The Protocol Surfaces
 
@@ -61,8 +67,12 @@ after upgrade. Operations: bind/listen, connect, accept/connected,
 send, receive, close, error. The contract is stream-only: only
 `SOCK_TYPE_STREAM` (1) is accepted on `CMD_CONNECT_TO`, and any other
 `sock_type` fails with EINVAL. The retransmit hints (`MSG_RETRANSMIT`
-0x07 / `MSG_ACK` 0x08) are reserved in the contract and defined
-privately by the `ip` module.
+0x07 / `MSG_ACK` 0x08), the consumer's answer (`CMD_RESEND` 0x18) and the
+delivery acknowledgement (`CMD_DELIVERED` 0x19) are contract constants
+any stage that retains its own send bytes, or defers its delivery horizon
+to its consumer, speaks (`ip` and `tls`); a stage that does neither drops
+them as unknown opcodes. The peer report (`MSG_PEER` 0x0A) names the
+stream's remote end once, before its first data.
 
 Who resolves: the provider that receives the `CMD_CONNECT_TO` record.
 A target is an IPv4 or IPv6 literal, or a DNS name (`AF_NAME`), and a
@@ -71,8 +81,10 @@ name is resolved by the network, never by the module that dials —
 60 s positive cache, `ip` through its stub resolver against the DHCP
 server's nameserver or the `resolver` param, the wasm host by URL. A
 provider that cannot resolve answers an `AF_NAME` target with EINVAL,
-and one with no IPv6 stack answers an `AF_INET6` literal the same way —
-`ip` refuses both. An IPv4 literal is the only target every provider
+and one with no IPv6 stack answers an `AF_INET6` literal the same way.
+`ip` serves both: a name through its stub resolver, an `AF_INET6` literal
+from an IPv6 address of the dialler's own (`ENETUNREACH` with none, or on a
+build without IPv6). An IPv4 literal is the only target every provider
 dials.
 
 ### Datagram Surface
@@ -115,8 +127,8 @@ consumer sharing the channel.
 Contract: `modules/sdk/contracts/net/packet.rs`.
 
 Packet-preserving flows with richer metadata: packet classifiers,
-policy modules, NIC fast paths. The endpoint verbs are an envelope with
-no consumer yet; the decision-seam verbs below are consumed by `ip`.
+policy modules, NIC fast paths. The endpoint verbs are an envelope no
+module provides; the decision-seam verbs below are `ip`'s.
 
 TX (`CMD_PKT_TX` 0x51) and RX (`MSG_PKT_RX` 0x61) share the shape
 `[ep_id: u8][af: u8][addr: 4|16 BE][port: u16 LE][lane: u8][flags: u8]
@@ -159,6 +171,9 @@ The director answers with one `CMD_PKT_DISPOSE` (0x53) on `packet_in`:
 | `REJECT` | release and answer the sender: TCP RST, ICMP port-unreachable, or nothing | reason, response |
 | `TUNNEL` | hand the whole frame to `packet_fwd` as `MSG_PKT_FORWARD` (0x65) | attach id, flow epoch |
 | `DSR` | as TUNNEL | endpoint id, rewrite id |
+| `MIRROR` | resume the transport path AND forward one copy as TUNNEL does, within `packet_mirror_budget` copies a second; a copy not made is reported (`MSG_PKT_MIRROR_LOST` 0x68) | mirror id, flow epoch |
+| `CHAIN` | as TUNNEL, for a service-chain hop (`cores/chain_encap.rs` is the hop's encapsulation) | chain id, stage, flags, instance |
+| `TUNNEL`/`DSR`/`CHAIN` \| `COPY` (0x80) | forward-and-copy: the frame forwarded as the base disposition says, and one copy as a `MIRROR` record within the same `packet_mirror_budget` (a copy not made is reported as a `MIRROR`'s is) — how a tunnelled, direct-return or chained flow is mirrored | the base's six bytes, then a `MIRROR`'s six (`DISPOSE_COPY_LEN` 17) |
 
 Ownership follows the disposition: a buffer has one owner at a time and
 a second disposition for the same `pkt_id` is stale — `pkt_id` is
@@ -170,7 +185,26 @@ stale id could match a live hold. Twenty-four bits is 16.7 million
 intakes against a hold the deadline already bounds — a generation narrow
 enough for a line-rate burst to wrap would put that match back within
 reach. `CMD_PKT_CLONE` (0x54) holds a second copy under a new id
-(`MSG_PKT_CLONED` 0x66) for a director that mirrors.
+(`MSG_PKT_CLONED` 0x66) for a director that wants the copy held for a
+disposition of its own; `MIRROR` is the bounded completion of the common
+case — deliver, and copy if the budget allows, never holding the original
+for the copy, every lost copy counted and reported with the running total.
+
+IPv6: with `seam_v6` naming up to four addresses, `ip` describes every
+TCP or UDP packet to one of them as `MSG_PKT_DECIDE6` (0x69,
+`DECIDE6_LEN` 58: the same fields, the addresses sixteen bytes wide) — a
+message of its own, so a director that reads only IPv4 records is
+unaffected — after verifying its transport checksum over the RFC 8200
+pseudo-header (a zero UDP checksum is refused). A packet with extension
+headers (a fragment among them) or another protocol never reaches the
+seam. The stack answers neighbour solicitation and echo for those
+addresses itself, as it answers ICMP for IPv4. `LOCAL` and `MIRROR`
+deliver an IPv6 TCP or UDP packet to `ip`'s own IPv6 transport (`v6t.rs`,
+built on the aarch64 profile; the seam addresses are local addresses) and
+release anything else, or everything on a build without it, counted
+(`v6_no_local`);
+`REJECT` answers with an IPv6 RST or ICMPv6 port unreachable quoting what
+fits the minimum MTU; the forwarding dispositions forward the frame whole.
 
 The hold is bounded twice. `abi::config::ip::MAX_PACKET_HOLD` slots
 (one frame each; 32 on the host profile) — a packet arriving with every
@@ -268,7 +302,7 @@ session directories: attach/detach, drain, chunked opaque state
 export/import with CRC32 integrity, resume, epoch bump, relocation,
 and a hello handshake carrying role constants (`ROLE_ANCHOR` 1,
 `ROLE_WORKER` 2, `ROLE_DIRECTORY` 3). The same framing carries the
-transport-continuity commands (`0x7A..0x88`, one reply opcode `0x9A`
+transport-continuity commands (`0x7A..0x8A`, one reply opcode `0x9A`
 with a record type) a transport provider answers for the connections
 it owns — see `network.md` §Transport Continuity.
 
@@ -515,7 +549,8 @@ Events (worker → anchor/directory):
 
 Detach reasons: normal (0), drain timeout (1), stale epoch (2), error
 (3), client gone (4). Status codes: OK (0), stale epoch (1), unknown
-session (2), no capacity (3), corrupt (4), not ready (5).
+session (2), no capacity (3), corrupt (4), not ready (5), unsupported
+(6), cursor mismatch (7).
 
 Stale-epoch rejection is the contract's ordering invariant: a receiver
 rejects any message whose epoch is below the last authoritative epoch

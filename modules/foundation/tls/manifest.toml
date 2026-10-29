@@ -130,22 +130,27 @@ name = "peer_identity"
 direction = "output"
 content_type = "OctetStream"
 
-# Transport-continuity control (in[2] / out[3]), the TRANSPORT_CONTINUITY
-# surface of contracts/net/session_ctrl.rs for transport CT_TLS. Driven by
-# the failover coordinator: PAIR_PREPARE / CHECKPOINT_* / DELTA_* /
-# QUIESCE_* / CUT_* / EMISSION_ARM / ACTIVATE / RETIRE / ABORT arrive on
-# `cont_in`; checkpoint chunks, deltas, DELTA_ACKs and CONTINUITY replies
+# Transport-continuity control (in[2] / out[3]), the per-layer continuity
+# surface of contracts/net/session_ctrl.rs (§Transport continuity) for
+# transport CT_TLS. Driven by a coordinator, or by `transport_continuity`:
+# PAIR_PREPARE / CHECKPOINT_* / DELTA_* / QUIESCE_* / CUT_* / EMISSION_ARM /
+# ACTIVATE / RETIRE / ABORT arrive on `cont_in`, and CUSTODY (the vault-to-vault transfer of a flow's sealing
+# key); checkpoint chunks, deltas, DELTA_ACKs and CONTINUITY replies
 # leave on `cont_out`. Unwired means the surface does not exist at runtime
 # and the record path is byte-identical. The codec, the shadow lifecycle,
-# the vault sealing of the traffic secrets (label `tls-continuity`) and
-# the strict-profile send / receive horizons are documented at the top of
+# the vault sealing of the traffic secrets (each flow's key derived from
+# `tls-continuity-master`, or unwrapped from a custody transfer attested by
+# `tls-custody`) and the strict-profile send / receive horizons are
+# documented at the top of
 # modules/foundation/tls/continuity.rs; ACTIVATE takes an optional trailing
 # `[conn_id:2 LE]` naming the connection the imported session binds to.
 #
 # `cont_out` must take one whole checkpoint in a single step: the record
-# is at most TLS_CKPT_RECORD_MAX bytes (about 21 KiB where the receive
-# buffer is 16 KiB, about 9 KiB on the 4 KiB-buffer targets) in 1 KiB
-# chunks plus the CUT manifest, and a chunk that does not fit fails the
+# this module exports carries no deliveries, so it is at most about 21 KiB
+# where the receive buffer is 16 KiB and about 8.5 KiB on the 4 KiB-buffer
+# targets, in 1 KiB chunks plus the CUT manifest (TLS_CKPT_RECORD_MAX, the
+# most an import admits, also counts the deliveries a record composed from
+# a whole-connection mirror carries). A chunk that does not fit fails the
 # export as STATUS_NO_CAPACITY rather than leaving a partial transfer.
 [[ports]]
 name = "cont_in"
@@ -184,9 +189,8 @@ content_type = "OctetStream"
 
 # Module-scope observability (optional); wired to observe.telemetry.
 [observability]
-# `bytes_in` / `bytes_out` are the cipher-side (ip seam) byte counters that
-# standards/observability.md §6 requires of a data-moving module, and they
-# sit at the END of the list: metric ids are positional, and 0..2 are
+# `bytes_in` / `bytes_out` are the cipher-side (ip seam) byte counters every
+# data-moving module reports, and they sit at the END of the list: metric ids are positional, and 0..2 are
 # interned in every collector and id-table built against this manifest, so a
 # new counter is appended and never inserted.
 metrics = [

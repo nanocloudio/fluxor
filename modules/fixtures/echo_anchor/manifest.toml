@@ -6,13 +6,13 @@ hardware_targets = ["rp2350", "bcm2712", "linux"]
 # `continuity` config block validator (class edge_anchored).
 capabilities = ["transport.anchor.stream"]
 
-# Stream Surface v1 (net_proto) channel from the IP module / linux_net.
+# The stream surface (net_proto) channel from the IP module / linux_net.
 [[ports]]
 name = "net_in"
 direction = "input"
 content_type = "NetProto"
 
-# SessionCtrlV1 replies from the worker.
+# Session-control replies from the worker.
 [[ports]]
 name = "ctrl_in"
 index = 1
@@ -26,13 +26,13 @@ index = 2
 direction = "input"
 content_type = "OctetStream"
 
-# Stream Surface v1 commands to the IP module / linux_net.
+# The stream surface (net_proto) commands to the IP module / linux_net.
 [[ports]]
 name = "net_out"
 direction = "output"
 content_type = "NetProto"
 
-# SessionCtrlV1 commands to the worker.
+# Session-control commands to the worker.
 [[ports]]
 name = "ctrl_out"
 index = 1
@@ -48,11 +48,11 @@ content_type = "OctetStream"
 
 # ── Optional standby worker (anchor-preserved handoff) ──────────────
 # When wired, `handoff_after_bytes` swaps the live session between the
-# two workers over SessionCtrlV1 EXPORT/IMPORT/RESUME while the client
+# two workers over session-control EXPORT/IMPORT/RESUME while the client
 # TCP stream stays open (protocol_surfaces.md §Anchor-Preserved
 # Maintenance).
 
-# SessionCtrlV1 replies from the standby worker.
+# Session-control replies from the standby worker.
 [[ports]]
 name = "ctrl2_in"
 index = 3
@@ -66,7 +66,7 @@ index = 4
 direction = "input"
 content_type = "OctetStream"
 
-# SessionCtrlV1 commands to the standby worker.
+# Session-control commands to the standby worker.
 [[ports]]
 name = "ctrl2_out"
 index = 3
@@ -84,6 +84,6 @@ content_type = "OctetStream"
 requires_contract = "channel"
 access = "read"
 
-# Module-scope observability — exempt (see standards/observability.md §6).
+# Module-scope observability — exempt.
 [observability]
 exempt = "application-layer demo — byte throughput is observed at the foundation transport (ip/quic/http) it rides"

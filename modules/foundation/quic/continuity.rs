@@ -25,7 +25,7 @@
 // that may be the reason the path is in doubt.
 //
 // A standby that stops answering does not hold the connection silent for
-// ever: past `CONT_HORIZON_STEPS` the mirror is abandoned, the coordinator
+// ever: past `CONT_HORIZON_MS` of wall clock the mirror is abandoned, the coordinator
 // is told, and the packet the horizon was holding still goes to the peer,
 // a packet number having been spent on it.
 //
@@ -39,40 +39,54 @@
 // holding the same key opens it. CIDs are preserved verbatim — a takeover
 // that re-minted them would be unroutable to the peer.
 //
-//   magic          [4]  = b"QKR1"
+//   magic          [4]  = b"QKRC"
 //   flow_id        [16]
 //   epoch          u32
 //   flags          u8   bit0 = is_server
-//   our_cid        u8 len + [MAX_CID_LEN]     preserved verbatim
-//   peer_cid       u8 len + [MAX_CID_LEN]     preserved verbatim
-//   original_dcid  u8 len + [MAX_CID_LEN]     preserved verbatim (Initial keys)
-//   peer_ip        [4]  peer_port u16
-//   idle_remaining_ms u64                     REMAINING, never a timestamp
-//   negotiated transport parameters:
+//   our_cid        u8 len + len bytes          preserved verbatim
+//   peer_cid       u8 len + len bytes          preserved verbatim
+//   original_dcid  u8 len + len bytes          preserved verbatim (Initial keys)
+//   peer_ip        [16] peer_port u16  (IPv6, or IPv4 IPv4-mapped)
+//   connection IDs: our_cid_seq u64, next_cid_seq u64,
+//     alt_cid (u8 len + bytes), alt_cid_seq u64, alt_reset_token [16],
+//     alt flags u8 (bit0 issued, bit1 NEW_CONNECTION_ID owed),
+//     peer_cid_seq u64, spare_peer_cid (u8 len + bytes), spare_seq u64,
+//     spare_reset_token [16], peer_dcid_seq u64,
+//     retire_count u8, then count × seq u64
+//   stream numbering: next_bidi_idx u64, next_uni_idx u64,
+//     peer_bidi_finished base u64 + bits u64, peer_uni_finished base u64 +
+//     bits u64, next_app_handle u32 (non-zero)
+//   idle_timeout_ms u64                        negotiated; 0: none
+//   idle_remaining_ms u64                      REMAINING, never a timestamp
+//   transport parameters / flow limits:
 //     send_max_data u64, peer_max_streams_bidi u64, peer_max_streams_uni u64,
 //     peer_stream_window_bidi_local u64, _bidi_remote u64, _uni u64,
 //     peer_max_datagram_frame_size u64, max_streams_bidi_granted u64,
-//     max_streams_uni_granted u64
+//     max_streams_uni_granted u64, peer_max_ack_delay_ms u64 (< 2^14),
+//     peer_ack_delay_exponent u64 (<= 20)
 //   1-RTT PnSpace:
 //     next_send_pn u64   (reservation high-water: strictly ahead of last-sent)
-//     largest_recv_pn u64, crypto_send_off u64, crypto_recv_off u64
+//     largest_recv_pn u64
+//     key update: awaiting_ack u8, first_pn u64, pkts_since_phase u32
+//     1-RTT CRYPTO: base u64, sent u64, len u16 + bytes; crypto_recv_off u64
 //     ack_range_count u8, then count × (low u64, high u64)
 //   Initial/Handshake counters: init_next_send u64, hs_next_send u64
 //   connection flow control:
 //     send_data_used u64, recv_max_data u64, recv_data_consumed u64
-//   congestion (exported; importer restarts conservatively —
-//   cap cwnd, clear recovery): congestion_window u64, ssthresh u64,
-//     bytes_in_flight u64
+//   congestion (exported; the importer starts afresh):
+//     congestion_window u64, ssthresh u64, bytes_in_flight u64
 //   key_phase u8, secret_len u8
 //   retained last_emitted: last_emitted_pn u64, len u16, bytes
 //   streams: count u8, then each
 //     kind u8 (1=uni,2=bidi), locally_initiated u8, stream_id u64, handle u32,
-//     send_off u64, recv_off u64, send_fin u8, recv_fin u8,
+//     send_base u64, send_sent u64, recv_off u64, send_fin u8, recv_fin u8,
 //     flow_send_max u64, flow_recv_max u64, flow_recv_consumed u64,
 //     send_buf_len u16 + bytes, recv_buf_len u16 + bytes
 //   sealed secret set: sealed_len u16 + sealed bytes, whose plaintext is
 //     read_secret[secret_len] ‖ write_secret ‖ next_read_secret ‖
-//     next_write_secret ‖ psk_len u8 ‖ psk[48] ‖ psk_id_len u16 ‖ psk_id
+//     next_write_secret ‖ read_hp ‖ write_hp ‖ prev_read_valid u8 ‖
+//     prev_read key ‖ iv ‖ hp ‖ psk_len u8 ‖ psk[48] ‖ psk_id_len u16 ‖
+//     psk_id
 //
 // Import validates the magic, every length as it decodes (a short read is
 // STATUS_CORRUPT), and impossible relations (largest_recv > next_send_pn,
@@ -120,7 +134,7 @@ pub const CONT_SECRET_PT_MAX: usize = 4 * 48
     + 2
     + MAX_TICKET_LEN;
 /// Record magic.
-const CONT_MAGIC: [u8; 4] = *b"QKR1";
+const CONT_MAGIC: [u8; 4] = *b"QKRC";
 
 /// Restore a stream's send half from a checkpoint: the bytes held from its
 /// acknowledged base, of which those below `sent` went out. Which packets
@@ -187,6 +201,16 @@ pub struct ContinuityState {
     scratch: [u8; CHECKPOINT_RECORD_MAX],
     /// Fence generation the last ACTIVATE observed (zero refused).
     last_fence_gen: u32,
+    /// Activations that began validating the client's path.
+    pub path_checks: u32,
+    /// Continuity keys (`custody.rs`): per-flow derived, unwrapped and
+    /// recipient keys; the master and the custody identity.
+    keys: [ContKey; QCONT_KEYS],
+    key_stamp: u32,
+    master: i32,
+    signer: i32,
+    signer_pub: [u8; sc::custody::PUB_LEN],
+    signer_open: bool,
 }
 
 /// Initialise the continuity state in-place over the module's zeroed
@@ -213,6 +237,12 @@ unsafe fn continuity_init(s: &mut QuicState) {
         i += 1;
     }
     s.continuity.last_fence_gen = 0;
+    s.continuity.path_checks = 0;
+    s.continuity.keys = [EMPTY_CONT_KEY; QCONT_KEYS];
+    s.continuity.key_stamp = 0;
+    s.continuity.master = -1;
+    s.continuity.signer = -1;
+    s.continuity.signer_open = false;
 }
 
 // ─── Bounded writer / reader ───────────────────────────────────────────
@@ -320,13 +350,10 @@ impl<'a> Reader<'a> {
 
 /// Open (or lazily generate) the continuity sealing key. Returns -1 if the
 /// vault refuses, in which case no checkpoint can be produced or imported.
-unsafe fn cont_vault_key(s: &mut QuicState) -> i32 {
-    if s.cont_vault_key >= 0 {
-        return s.cont_vault_key;
-    }
-    let sys = &*s.syscalls;
-    s.cont_vault_key = vault_open_or_generate_aead(sys, CONT_LABEL);
-    s.cont_vault_key
+unsafe fn cont_vault_key(s: &mut QuicState, flow: &[u8; CONT_FLOW_ID_BYTES], epoch: u32) -> i32 {
+    // The flow's own sealing key (`custody.rs`): unwrapped by a custody
+    // transfer, else derived here from the continuity master.
+    cont_flow_key(s, flow, epoch)
 }
 
 /// AAD binding a sealed secret set to its flow and ownership epoch.
@@ -437,7 +464,7 @@ unsafe fn serialize_checkpoint(
             return 0;
         }
     }
-    let handle = cont_vault_key(s);
+    let handle = cont_vault_key(s, flow_id, epoch);
     if handle < 0 {
         return 0;
     }
@@ -546,9 +573,19 @@ unsafe fn serialize_checkpoint(
     w.u64(c.peer_uni_finished.base);
     w.u64(c.peer_uni_finished.bits);
     w.u32(c.next_app_handle);
-    // Idle timeout as a REMAINING duration, never a host timestamp.
-    let elapsed = now_ms.saturating_sub(c.last_activity_ms);
-    let idle_remaining = c.idle_timeout_ms.saturating_sub(elapsed);
+    // The negotiated idle timeout, and what is left of the timer as a
+    // REMAINING duration, never a host timestamp: of the timeout in force
+    // here (the three-PTO floor included), or of a first deadline this host
+    // took over and has not yet heard its peer within. 0 when there is none.
+    let idle_remaining = if c.idle_timeout_ms == 0 {
+        0
+    } else if c.idle_first_deadline_ms != 0 {
+        c.idle_first_deadline_ms.saturating_sub(now_ms)
+    } else {
+        let elapsed = now_ms.saturating_sub(c.last_activity_ms);
+        c.idle_timeout_in_force().saturating_sub(elapsed)
+    };
+    w.u64(c.idle_timeout_ms);
     w.u64(idle_remaining);
     // Negotiated transport parameters / flow limits.
     w.u64(c.send_max_data);
@@ -560,6 +597,8 @@ unsafe fn serialize_checkpoint(
     w.u64(c.peer_max_datagram_frame_size);
     w.u64(c.max_streams_bidi_granted);
     w.u64(c.max_streams_uni_granted);
+    w.u64(u64::from(c.peer_max_ack_delay_ms));
+    w.u64(u64::from(c.peer_ack_delay_exponent));
     // 1-RTT packet-number space: the floor a takeover resumes from.
     //
     // This is the reservation's high-water — the end of every block this
@@ -743,8 +782,12 @@ unsafe fn import_checkpoint(
         Some(n) => conn.original_dcid_len = n,
         None => return sc::STATUS_CORRUPT,
     }
-    let ip = match r.take(4) {
-        Some(b) => [b[0], b[1], b[2], b[3]],
+    let ip: [u8; 16] = match r.take(16) {
+        Some(b) => {
+            let mut a = [0u8; 16];
+            a.copy_from_slice(b);
+            a
+        }
         None => return sc::STATUS_CORRUPT,
     };
     let port = match r.u16() {
@@ -821,11 +864,8 @@ unsafe fn import_checkpoint(
         Some(v) if v != 0 => conn.next_app_handle = v,
         _ => return sc::STATUS_CORRUPT,
     }
-    let idle_remaining = match r.u64() {
-        Some(v) => v,
-        None => return sc::STATUS_CORRUPT,
-    };
-    conn.idle_timeout_ms = idle_remaining;
+    rd_u64!(conn.idle_timeout_ms);
+    rd_u64!(conn.idle_carried_ms);
     rd_u64!(conn.send_max_data);
     rd_u64!(conn.peer_max_streams_bidi);
     rd_u64!(conn.peer_max_streams_uni);
@@ -835,6 +875,14 @@ unsafe fn import_checkpoint(
     rd_u64!(conn.peer_max_datagram_frame_size);
     rd_u64!(conn.max_streams_bidi_granted);
     rd_u64!(conn.max_streams_uni_granted);
+    conn.peer_max_ack_delay_ms = match r.u64() {
+        Some(v) if v < MAX_ACK_DELAY_LIMIT => v as u32,
+        _ => return sc::STATUS_CORRUPT,
+    };
+    conn.peer_ack_delay_exponent = match r.u64() {
+        Some(v) if v <= ACK_DELAY_EXPONENT_MAX => v as u8,
+        _ => return sc::STATUS_CORRUPT,
+    };
     let next_send_pn = match r.u64() {
         Some(v) => v,
         None => return sc::STATUS_CORRUPT,
@@ -1223,6 +1271,14 @@ unsafe fn activate_shadow(
     if fence_gen == 0 || new_epoch <= prior_epoch {
         return -1;
     }
+    // The new path's challenge, from the CSPRNG or not at all: one an
+    // off-path attacker could predict would validate an address it does
+    // not hold. Refused like a missing slot, the connection retired.
+    let mut challenge = [0u8; 8];
+    if dev_csprng_fill(&*s.syscalls, challenge.as_mut_ptr(), 8) < 0 {
+        retire_connection(&mut *from);
+        return -1;
+    }
     let idx = match alloc_shadow_live_slot(s) {
         Some(i) => i,
         None => {
@@ -1259,9 +1315,81 @@ unsafe fn activate_shadow(
     c.recovery_start_time = 0;
     c.rtt = RttSample::new();
     c.pto_count = 0;
-    c.last_activity_ms = dev_millis(&*s.syscalls);
+    // The idle timer. The connection keeps the timeout it negotiated with
+    // its peer — this host's own advertisement never reached that peer. What
+    // was left of the primary's timer (its three-PTO floor applied there)
+    // becomes one first deadline: the connection ends at it unless the peer
+    // is heard first, and from the first packet heard the ordinary timer
+    // runs at the timeout in force here. A remainder of 0 ends it at the
+    // first sweep.
+    let now = dev_millis(&*s.syscalls).max(1);
+    c.last_activity_ms = now;
+    c.idle_first_deadline_ms = if c.idle_timeout_ms == 0 {
+        0
+    } else {
+        now.saturating_add(c.idle_carried_ms)
+    };
+    c.idle_carried_ms = 0;
+    // The path the primary validated is not one this host has (RFC 9000
+    // §8.2): until the client answers a PATH_CHALLENGE
+    // from here, this host sends it at most three times what it has
+    // received from it, and a validation that never completes ends the
+    // connection rather than assuming the path.
+    c.peer_validated = false;
+    c.last_valid_peer = PeerAddr::unset();
+    c.amp_rx = 0;
+    c.amp_tx = 0;
+    c.cand_ip = c.peer.ip;
+    c.cand_port = c.peer.port;
+    c.path_challenge_data = challenge;
+    c.path_validating = true;
+    c.path_validate_ms = now;
+    c.path_challenge_tx_ms = 0;
+    c.path_challenge_tx_pending = true;
+    c.old_path_validating = false;
     s.continuity.last_fence_gen = fence_gen;
+    s.continuity.path_checks = s.continuity.path_checks.wrapping_add(1);
     idx as i32
+}
+
+/// The flow identity of a QUIC connection the anchor surface names
+/// (`tc_flow_id_quic`, contracts/net/transport_continuity.rs): `0xF7`, then
+/// SHA-256 over `"fxqc.flow" ‖ our connection ID`, first fifteen bytes.
+pub fn quic_flow_id(cid: &[u8]) -> [u8; CONT_FLOW_ID_BYTES] {
+    let mut h = Sha256::new();
+    h.update(b"fxqc.flow");
+    h.update(cid);
+    let d = h.finalize();
+    let mut f = [0u8; CONT_FLOW_ID_BYTES];
+    f[0] = 0xF7;
+    f[1..16].copy_from_slice(&d[..15]);
+    f
+}
+
+/// An established connection not yet bound to a flow, whose identity is
+/// `flow` (`quic_flow_id` of its connection ID): bound to it at `epoch`.
+unsafe fn bind_by_cid(
+    s: &mut QuicState,
+    flow: &[u8; CONT_FLOW_ID_BYTES],
+    epoch: u32,
+) -> Option<usize> {
+    if flow[0] != 0xF7 {
+        return None;
+    }
+    let mut i = 0;
+    while i < MAX_CONNS {
+        let c = &s.conns[i];
+        if c.phase == ConnPhase::Established
+            && c.cont_flow_id == [0; CONT_FLOW_ID_BYTES]
+            && quic_flow_id(&c.our_cid[..c.our_cid_len as usize]) == *flow
+        {
+            s.conns[i].cont_flow_id = *flow;
+            s.conns[i].cont_epoch = epoch;
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Find a free live slot for an activated shadow.
@@ -1351,7 +1479,8 @@ unsafe fn cont_reply(
         return false;
     }
     let sys = &*s.syscalls;
-    let mut payload = [0u8; sc::CONTINUITY_HEADER_LEN + 64];
+    // Room for the largest body: custody evidence (`[op][reason][evidence]`).
+    let mut payload = [0u8; sc::CONTINUITY_HEADER_LEN + 2 + sc::custody::EVIDENCE_MAX];
     let mut p = 0;
     let fl = flow.len().min(CONT_FLOW_ID_BYTES);
     payload[..fl].copy_from_slice(&flow[..fl]);
@@ -1365,7 +1494,8 @@ unsafe fn cont_reply(
     let n = body.len().min(payload.len() - p);
     payload[p..p + n].copy_from_slice(&body[..n]);
     p += n;
-    let mut scratch = [0u8; NET_FRAME_HDR + sc::CONTINUITY_HEADER_LEN + 64];
+    let mut scratch =
+        [0u8; NET_FRAME_HDR + sc::CONTINUITY_HEADER_LEN + 2 + sc::custody::EVIDENCE_MAX];
     net_write_frame(
         sys,
         s.cont_out,
@@ -1397,6 +1527,7 @@ unsafe fn cont_apply(s: &mut QuicState, msg_type: u8, payload: &[u8]) {
         sc::CMD_SC_RETIRE => cont_apply_retire(s, payload),
         sc::CMD_SC_ABORT => cont_apply_abort(s, payload),
         sc::MSG_SC_CONTINUITY => cont_apply_relayed(s, payload),
+        sc::CMD_SC_CUSTODY => handle_custody(s, payload),
         _ => {}
     }
 }
@@ -1766,7 +1897,7 @@ pub unsafe fn on_one_rtt_received(
         mirror_abandon(sys, cont_out, conn);
         return false;
     }
-    conn.cont_recv_hold[n] = (pn, no);
+    conn.cont_recv_hold[n] = (pn, no, dev_millis(sys));
     conn.cont_recv_hold_len = (n + 1) as u8;
     true
 }
@@ -1782,7 +1913,7 @@ pub unsafe fn on_one_rtt_received(
 /// module owns (or negative when unwired); the abort is written through it.
 pub unsafe fn mirror_abandon(sys: &SyscallTable, cont_out: i32, conn: &mut QuicConnection) {
     conn.cont_mirror = false;
-    conn.cont_horizon_steps = 0;
+    conn.cont_horizon_since_ms = 0;
     // A held packet spent a packet number, so it is owed to the peer
     // whatever became of the mirror: nothing confirms it now, which is
     // itself the confirmation. The per-step service puts it on the wire.
@@ -1790,8 +1921,8 @@ pub unsafe fn mirror_abandon(sys: &SyscallTable, cont_out: i32, conn: &mut QuicC
     let n = conn.cont_recv_hold_len as usize;
     let mut i = 0;
     while i < n {
-        let (pn, _) = conn.cont_recv_hold[i];
-        conn.one_rtt.ack_tracker.record(pn, 0);
+        let (pn, _, rx_ms) = conn.cont_recv_hold[i];
+        conn.one_rtt.ack_tracker.record(pn, rx_ms);
         conn.one_rtt.ack_pending = true;
         i += 1;
     }
@@ -1855,14 +1986,19 @@ unsafe fn release_held(s: &mut QuicState, idx: usize) -> bool {
         let conn = &mut s.conns[idx];
         conn.cont_emission_held = false;
         conn.cont_held_confirmed = false;
-        conn.cont_horizon_steps = 0;
-        conn.last_activity_ms = now;
+        conn.cont_horizon_since_ms = 0;
         // The packet reached the wire now, not when it was built: loss and
-        // probe timers run from here.
+        // probe timers run from here, and the idle timer restarts if it is
+        // the first ack-eliciting packet sent since one was received (RFC
+        // 9000 §10.1).
         let pn = conn.one_rtt.last_emitted_pn;
         conn.one_rtt.last_emitted_ms = now;
-        if let Some((_, _, _, _, ix)) = conn.one_rtt.find_sent(pn) {
+        if let Some((_, ack_eliciting, _, _, ix)) = conn.one_rtt.find_sent(pn) {
             conn.one_rtt.sent_packets[ix].sent_ms = now;
+            if ack_eliciting && !conn.eliciting_since_rx {
+                conn.last_activity_ms = now;
+                conn.eliciting_since_rx = true;
+            }
         }
     }
     sent
@@ -1895,13 +2031,16 @@ unsafe fn cont_service(s: &mut QuicState) {
             let waiting = (s.conns[i].cont_emission_held && !s.conns[i].cont_held_confirmed)
                 || s.conns[i].cont_recv_hold_len != 0;
             if mirror_strict(&s.conns[i]) && waiting {
-                s.conns[i].cont_horizon_steps = s.conns[i].cont_horizon_steps.saturating_add(1);
-                if s.conns[i].cont_horizon_steps > CONT_HORIZON_STEPS {
+                let now = dev_millis(sys).max(1);
+                let since = s.conns[i].cont_horizon_since_ms;
+                if since == 0 {
+                    s.conns[i].cont_horizon_since_ms = now;
+                } else if now.wrapping_sub(since) > CONT_HORIZON_MS {
                     mirror_abandon(sys, cont_out, &mut s.conns[i]);
                     let _ = release_held(s, i);
                 }
             } else {
-                s.conns[i].cont_horizon_steps = 0;
+                s.conns[i].cont_horizon_since_ms = 0;
             }
         }
         i += 1;
@@ -2101,12 +2240,14 @@ unsafe fn cont_apply_delta_ack(s: &mut QuicState, payload: &[u8]) {
         let mut kept = 0;
         let mut i = 0;
         while i < n {
-            let (pn, no) = c.cont_recv_hold[i];
+            let (pn, no, rx_ms) = c.cont_recv_hold[i];
             if no <= delta_no {
-                c.one_rtt.ack_tracker.record(pn, 0);
+                // Stamped with when it arrived, so the acknowledgement's
+                // delay reports the hold.
+                c.one_rtt.ack_tracker.record(pn, rx_ms);
                 c.one_rtt.ack_pending = true;
             } else {
-                c.cont_recv_hold[kept] = (pn, no);
+                c.cont_recv_hold[kept] = (pn, no, rx_ms);
                 kept += 1;
             }
             i += 1;
@@ -2153,14 +2294,21 @@ unsafe fn cont_apply_grant(s: &mut QuicState, payload: &[u8]) {
     if op != sc::GRANT_OP_RESERVE || status != sc::GRANT_STATUS_OK {
         return;
     }
-    // Apply to a matching live connection.
+    // Apply to the live connection under this flow — bound by its
+    // connection ID first when the grant comes before the pairing (a crash
+    // pair needs the durable reservation before it can prepare).
+    let mut flow_arr = [0u8; CONT_FLOW_ID_BYTES];
+    flow_arr.copy_from_slice(flow);
     let mut i = 0;
     while i < MAX_CONNS {
         if s.conns[i].phase != ConnPhase::Idle && &s.conns[i].cont_flow_id[..] == flow {
             let _ = s.conns[i].install_pn_grant(epoch, start, len);
-            break;
+            return;
         }
         i += 1;
+    }
+    if let Some(idx) = bind_by_cid(s, &flow_arr, epoch) {
+        let _ = s.conns[idx].install_pn_grant(epoch, start, len);
     }
 }
 
@@ -2189,7 +2337,8 @@ unsafe fn cont_apply_pair_prepare(s: &mut QuicState, payload: &[u8]) {
     // a cut on a connection never prepared is refused rather than guessed.
     let mut flow_arr = [0u8; CONT_FLOW_ID_BYTES];
     flow_arr.copy_from_slice(flow);
-    if let Some(idx) = find_live_by_flow(s, &flow_arr) {
+    let live = find_live_by_flow(s, &flow_arr).or_else(|| bind_by_cid(s, &flow_arr, epoch));
+    if let Some(idx) = live {
         if profile == sc::PROFILE_CRASH_CONTINUOUS && !s.conns[idx].pn_res_durable {
             // A self-granted block can be refilled at will, so no floor
             // recorded here bounds what this host may still emit. Crash
@@ -2373,7 +2522,11 @@ unsafe fn cont_apply_ckpt_commit(s: &mut QuicState, payload: &[u8]) {
     }
     // Import the record straight into the shadow's connection, which is
     // not live: a refused import leaves nothing a caller could use.
-    let handle = cont_vault_key(s);
+    let (fl, ep) = (
+        s.continuity.shadows[slot].flow_id,
+        s.continuity.shadows[slot].epoch,
+    );
+    let handle = cont_vault_key(s, &fl, ep);
     let sys = &*s.syscalls;
     let st = {
         let sh = &mut s.continuity.shadows[slot];
@@ -2466,12 +2619,9 @@ unsafe fn cont_apply_emission_arm(s: &mut QuicState, payload: &[u8]) {
         return;
     }
     // Convert timers from remaining durations; report any already expired
-    // (idle timeout of 0 remaining fires on activation).
-    let expired = if sh.conn.idle_timeout_ms == 0 {
-        1u8
-    } else {
-        0u8
-    };
+    // (an idle timer with nothing left closes the connection at the first
+    // sweep after activation).
+    let expired = u8::from(sh.conn.idle_timeout_ms != 0 && sh.conn.idle_carried_ms == 0);
     sh.expired_timers = expired;
     sh.phase = ShadowPhase::Armed;
     cont_reply(s, &flow_arr, epoch, sc::CR_ARMED, sc::STATUS_OK, &[expired]);
@@ -2580,6 +2730,7 @@ unsafe fn cont_apply_abort(s: &mut QuicState, payload: &[u8]) {
 
 /// Drain framed commands from `cont_in` once per step. Bounded work.
 unsafe fn cont_pump(s: &mut QuicState) {
+    cont_keys_sweep(s);
     cont_service(s);
     if s.cont_in < 0 {
         return;

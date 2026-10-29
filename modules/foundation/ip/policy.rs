@@ -32,6 +32,11 @@
 //!   another node to a workload endpoint with no flow of its own, per
 //!   packet;
 //! - an ICMP echo to a workload address.
+//!
+//! **IPv6.** The tables name IPv4 addresses only; an IPv6 flow they would
+//! judge (one to or from a workload's IPv6 address, seen here under its
+//! `v6t.rs` stand-ins) is dropped while any table judges packets, and
+//! passes as an IPv4 one does when none does.
 
 use super::*;
 use abi::contracts::net::policy as np;
@@ -362,6 +367,14 @@ unsafe fn attach(s: &mut IpState) {
 
 /// Whether every table passes `p`: a table enforced closed passes nothing.
 pub(crate) unsafe fn allows(s: &mut IpState, p: &np::Packet) -> bool {
+    // The tables name IPv4 addresses. An IPv6 flow reaches here under its
+    // stand-ins (`v6t.rs`), which no rule names: judging those would pass
+    // what an ISOLATE or DROP meant to stop, so while any table judges
+    // packets such a flow is dropped instead.
+    if (v6t::is_reserved(p.src) || v6t::is_reserved(p.dst)) && active(s) {
+        s.drops.policy_denied = s.drops.policy_denied.wrapping_add(1);
+        return false;
+    }
     let mut t = 0;
     while t < s.pol_n as usize {
         let e = table(s, t);

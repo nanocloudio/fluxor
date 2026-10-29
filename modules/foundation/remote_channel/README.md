@@ -27,6 +27,43 @@ session ended is lost and counted; one not yet begun waits for the next
 session. The `session` output says when a session opens and ends
 (`contracts/mesh/remote_session.rs`).
 
+## Resume
+
+With `resume` (on `net` or `mux`, not beside `exchange`) a session ending takes
+nothing with it. Every record on every channel is numbered from 1 within
+the sender's incarnation (16 random bytes drawn at construction) and kept
+in a retained window (`window` bytes per channel, four records at the
+channel's maximum by default) until the receiver's `ACK` says it arrived
+whole; a full window stops reading the channel's input. The next session's
+`HELLO` carries, after the table, `['R'][incarnation][held][next × channels]`:
+which peer incarnation's streams this end holds and the next record it
+expects on each. A peer holding this end's incarnation is resumed exactly —
+records before its `next` released, the rest sent again from it — so each
+record is delivered once and in order across reconnects. A peer naming
+another incarnation never saw this stream (its first session, or it
+restarted): what is retained is renumbered from 1 and sent to it, and its
+own streams start afresh here (at least once across a peer's restart).
+
+Inside a session a numbered record (`RBEGIN`, `[record_len:4][seq:8]`) must
+carry exactly the next number: one the receiver already has is refused as a
+replay, one past it as a gap, an acknowledgement of a record never sent or
+behind one released ends the session, and so does a resume point outside
+the retained window (`refuse::SEQUENCE`). An idle session acknowledges
+every `keepalive_ms`; one that hears nothing for three of those is ended,
+and the next resumes it — a link that died without a close on this end
+cannot hold the one session for ever. A resume prints
+`[remote_channel] resumed: records going again=<n>`.
+
+On `mux` each channel is a stream of the QUIC session and every stream's
+`HELLO` carries the same trailer, fixed when the session attached. The
+trailer arrives on every stream but is applied once per session, before any
+record of the session goes.
+A QUIC session that ends takes its streams and what was on them; the next
+session's streams resume each channel exactly as on `net`.
+
+A typical end runs over mutual `tls` with vault-held host identities
+(`net`), or over `quic` (`mux`), one instance on each node.
+
 ## Exchange endpoint
 
 An exchange provider is a placement choice: the requester that reaches a
@@ -181,6 +218,8 @@ endpoint dropped as belonging to an ended exchange).
 
 ## Limitations
 
+- `resume` is for channels without an exchange endpoint; across a peer's
+  restart it is at least once, not exactly once.
 - One exchange endpoint per instance, and one requester per near endpoint.
 - On `mux`, the endpoint's two channels are two streams; `quic` opens three
   at a time, so an endpoint leaves room for one more channel.

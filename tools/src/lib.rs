@@ -133,3 +133,18 @@ pub mod abi_surface;
 /// higher epoch. Its tests are the executable, state-machine-level
 /// form of that non-reuse guarantee.
 pub mod continuity_cores;
+
+/// `TRANSPORT_CONTINUITY` (`contracts/net/transport_continuity.rs`) and
+/// its provider core (`cores/transport_continuity.rs`), path-mounted so the
+/// host tests drive the exact provider a module includes: checkpoint and
+/// delta round trips, the receive-ACK and emission horizon gate with its
+/// KeyUpdate barrier, import/arm/activate against the authority's token,
+/// the emission-disable hook and migrated-flow reset suppression.
+pub mod transport_continuity;
+
+/// The `transport_continuity` module's provider (`TcStack`, in the module's
+/// `stack.rs`): `TRANSPORT_CONTINUITY` over `ip`'s and `tls`'s per-layer
+/// continuity halves — the canonical record composed from FXTC and CT_TLS
+/// and decomposed back, the planned move, the authority's verdict on the
+/// rebuilt token, and what the halves cannot enforce refused by name.
+pub mod transport_continuity_stack;

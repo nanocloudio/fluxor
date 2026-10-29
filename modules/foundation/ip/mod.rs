@@ -42,8 +42,9 @@
 //!   refresh an existing same-MAC entry; it can neither install a new mapping
 //!   nor move an existing one.
 //! - **One transmit frame per datagram.** There is no transmit-side
-//!   fragmentation, so a UDP payload past the frame ceiling is refused with
-//!   `EMSGSIZE` rather than truncated.
+//!   fragmentation, so a UDP payload whose packet would pass the link MTU
+//!   (1500 bytes, either family) is refused with `EMSGSIZE` rather than
+//!   truncated or sent oversize.
 //!
 //! # Config Parameters
 //!
@@ -62,7 +63,9 @@
 //!
 //! A consumer dials with `CMD_CONNECT_TO` (`net_proto`), which carries an
 //! address family: an IPv4 literal is dialled at once, an IPv6 literal is
-//! refused `EINVAL` (there is no v6 stack here), and a name is resolved by
+//! dialled from an IPv6 address of the dialler's own (`lane_source`,
+//! `v6t.rs`; `ENETUNREACH` with none, with the peer table full of live
+//! peers, or on a build without IPv6 transports), and a name is resolved by
 //! the stub resolver this module owns before the SYN goes out. The resolver
 //! sends one A query per name from an ephemeral port it holds for its
 //! lifetime, to `resolver` when set and otherwise to the DHCP lease's DNS
@@ -153,6 +156,12 @@ mod index;
     reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
 )]
 mod ipv4;
+/// IPv6 at the decision seam: header, checksum, address text, ND answers.
+#[allow(
+    dead_code,
+    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
+)]
+mod ipv6;
 /// Packet policy enforced from `net.policy` tables.
 mod policy;
 /// The `net.route` tables read with TAKE: segments, peer routes, held.
@@ -169,6 +178,8 @@ mod tcp;
     reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
 )]
 mod udp;
+/// IPv6 TCP: the TCP machine reached over IPv6 through stand-in addresses.
+mod v6t;
 
 // ============================================================================
 // Constants
@@ -176,6 +187,8 @@ mod udp;
 
 /// Maximum ethernet frame size
 const MAX_FRAME_SIZE: usize = 1536;
+/// IPv6 addresses the decision seam can name (`seam_v6`).
+const SEAM_V6_MAX: usize = 4;
 
 /// A receive buffer smaller than the MSS this stack advertises is a stack that
 /// told its peer to send segments it cannot hold.
@@ -198,11 +211,15 @@ const _: () = assert!(tcp::MSS as usize + 14 + 20 + 20 <= MAX_FRAME_SIZE);
 /// ceiling belong to the length prefix.
 const MAX_TX_FRAME_PAYLOAD: usize = MAX_FRAME_SIZE - 2;
 
-/// Largest UDP payload that fits one transmit frame. Every frame builder
-/// writes into the fixed `tx_frame`, so a datagram past this size cannot be
-/// staged at all — it is refused before any copy, never truncated.
-const MAX_UDP_TX_PAYLOAD: usize =
-    MAX_TX_FRAME_PAYLOAD - eth::ETH_HEADER_LEN - ipv4::IPV4_HEADER_LEN - udp::UDP_HEADER_LEN;
+/// The link MTU: the largest IP packet an Ethernet frame carries. With no
+/// transmit-side fragmentation it bounds every packet the stack sends.
+const LINK_MTU: usize = 1500;
+const _: () = assert!(eth::ETH_HEADER_LEN + LINK_MTU <= MAX_TX_FRAME_PAYLOAD);
+
+/// Largest UDP payload one IPv4 packet carries on the link. A datagram past
+/// it is refused before any copy (`EMSGSIZE`), never truncated or sent
+/// oversize.
+const MAX_UDP_TX_PAYLOAD: usize = LINK_MTU - ipv4::IPV4_HEADER_LEN - udp::UDP_HEADER_LEN;
 
 /// Largest TCP payload that fits one transmit frame. The segmenter caps
 /// chunks at `tcp::MSS`, which is below this; the bound is the frame
@@ -234,20 +251,33 @@ const PENDING_CMD_BUF_SIZE: usize = 1600;
 const NET_MSG_ACCEPTED: u8 = 0x01;
 const NET_MSG_DATA: u8 = 0x02;
 const NET_MSG_CLOSED: u8 = 0x03;
+use abi::contracts::net::net_proto::{CLOSED_GONE, CLOSED_PEER_FIN};
 const NET_MSG_BOUND: u8 = 0x04;
 const NET_MSG_CONNECTED: u8 = 0x05;
 const NET_MSG_ERROR: u8 = 0x06;
 /// Request that the consumer retransmit data from `from_seq` onwards on
-/// the named connection. Fires on 3 duplicate ACKs or an RTO timeout.
-const NET_MSG_RETRANSMIT: u8 = 0x07;
+/// the named connection. Fires on 3 duplicate ACKs, an RTO timeout and each
+/// partial acknowledgement in recovery; the consumer answers with
+/// `NET_CMD_RESEND`.
+const NET_MSG_RETRANSMIT: u8 = abi::contracts::net::net_proto::MSG_RETRANSMIT;
 /// Advance the consumer-side "acknowledged bytes" watermark so the
-/// consumer may free its retained send buffer up to this offset.
-const NET_MSG_ACK: u8 = 0x08;
+/// consumer may free its retained send buffer up to this sequence.
+/// Payload: `[conn_id: u16 LE][acked_seq: u32 LE][isn: u32 LE]` — `isn` is
+/// the sequence number of the stream's first byte (ISS + 1), which places
+/// a consumer's retained bytes in sequence space however many it handed
+/// down before the first report reached it.
+const NET_MSG_ACK: u8 = abi::contracts::net::net_proto::MSG_ACK;
 
 /// Net protocol: upstream commands (consumer → IP)
 const NET_CMD_BIND: u8 = 0x10;
 const NET_CMD_SEND: u8 = 0x11;
 const NET_CMD_CLOSE: u8 = 0x12;
+/// The consumer's answer to `NET_MSG_RETRANSMIT`, bytes it already handed
+/// down sent again at their own sequence numbers. Payload: `[conn_id: u16 LE][seq: u32 LE][data…]`.
+/// Unlike `CMD_SEND` it allocates nothing: of the bytes it carries, those in
+/// `[SND.UNA, SND.NXT)` go out again, up to one segment, and the rest
+/// (acknowledged since, or not yet sent) are dropped.
+const NET_CMD_RESEND: u8 = abi::contracts::net::net_proto::CMD_RESEND;
 /// Retired: answered `MSG_ERROR ENOSYS` on its tag so a stale emitter
 /// fails loudly on its first dial.
 const NET_CMD_CONNECT: u8 = abi::contracts::net::net_proto::CMD_CONNECT;
@@ -305,9 +335,11 @@ const DNS_NAME_CAP: usize = abi::contracts::net::net_proto::MAX_NAME_LEN;
 const DNS_QUERY_TIMEOUT_MS: u32 = 3000;
 /// Queries sent again after a timeout before the dial fails.
 const DNS_QUERY_RETRIES: u8 = 1;
-/// Answer TTL policy, in seconds: a zero TTL is held for `DNS_TTL_ZERO_S`,
-/// anything else for at least `DNS_TTL_MIN_S` and at most `DNS_TTL_MAX_S`.
-const DNS_TTL_ZERO_S: u32 = 60;
+/// Answer TTL policy, in seconds: anything but zero is held for at least
+/// `DNS_TTL_MIN_S` and at most `DNS_TTL_MAX_S`. A zero TTL is for the
+/// transaction in progress only (RFC 1035 §3.2.1): the lookup's own dials
+/// take the answer, and it is held for one more use at most — the
+/// retransmit of the named datagram that asked — within one query timeout.
 const DNS_TTL_MIN_S: u32 = 1;
 const DNS_TTL_MAX_S: u32 = 3600;
 /// CSPRNG draws for a query id that collides with no query in flight.
@@ -337,7 +369,9 @@ struct DnsCacheEntry {
     name: [u8; DNS_NAME_CAP],
     /// 0 = empty.
     name_len: u8,
-    _pad: [u8; 2],
+    /// 1: a zero-TTL answer, gone at its first use.
+    once: u8,
+    _pad: u8,
     /// Host-order IPv4, as `remote_ip` holds it.
     addr: u32,
     /// Wall clock past which the entry is stale.
@@ -348,7 +382,8 @@ impl DnsCacheEntry {
     const EMPTY: DnsCacheEntry = DnsCacheEntry {
         name: [0; DNS_NAME_CAP],
         name_len: 0,
-        _pad: [0; 2],
+        once: 0,
+        _pad: 0,
         addr: 0,
         expires_ms: 0,
     };
@@ -414,8 +449,8 @@ struct NetLane {
     cmd: i32,
     /// The workload reads events here (this module writes it).
     evt: i32,
-    /// The owner's own address slot (`LOCAL_SLOT_ANY` when it has none),
-    /// cached under the address-table epoch it was looked up in.
+    /// The owner's own IPv4 address slot (`LOCAL_SLOT_ANY` when it has
+    /// none), cached under the address-table epoch it was looked up in.
     src_slot: u16,
     /// The owner's name-service context (`workload::NET_RESOLVER`), and
     /// whether it was read: 0 not yet, 1 held, 2 none (the node's own
@@ -587,11 +622,12 @@ pub struct LocalAddr {
     /// Install generation, monotonic per module instance.
     pub generation: u32,
     /// Owning workload tag (0 = host/system — a legitimate owner, not a
-    /// sentinel). Enforced on bind: an
-    /// owner-stamped bind binds only to the address whose `owner_tag` matches,
-    /// and an owned secondary (`owner_tag != 0`) is served only by a listener
-    /// explicitly bound to it — never by a host wildcard listener. Set via the
-    /// `addr_ctl` `IP_ADDR_ADD` payload by the trusted single writer.
+    /// sentinel). Enforced on bind and on source selection: an owner-stamped
+    /// bind serves exactly the addresses whose `owner_tag` matches, of both
+    /// families, an owned secondary (`owner_tag != 0`) is never served by a
+    /// host wildcard listener, and an owner's traffic leaves only from its
+    /// own addresses (`bind_serves`, `lane_source`, `endpoint_source`). Set
+    /// via the `addr_ctl` `IP_ADDR_ADD` payload by the trusted single writer.
     pub owner_tag: u16,
     pub prefix_len: u8,
     pub flags: u8,
@@ -660,6 +696,9 @@ const IP_ADDR_ARM: u8 = netid::ADDR_ARM;
 const IP_ADDR_FENCE: u8 = netid::ADDR_FENCE;
 /// Emission events to the address-control writer (out[5]).
 const ADDR_EVT_PORT: u8 = 5;
+/// The VIP authority's verdicts (in[5]) and the token checks to it (out[7]).
+const AUTH_RSP_PORT: u8 = 5;
+const AUTH_REQ_PORT: u8 = 7;
 /// THIS module's input-port indices, declared to the kernel at init via the
 /// `NET_IDENT_PROVIDER` self-registration (module-local facts, matching
 /// `manifest.toml`).
@@ -719,6 +758,13 @@ const NOTIFY_CONNECTED: u8 = 3;
 /// Connect timeout (`ETIMEDOUT`) whose `MSG_ERROR` couldn't be delivered yet —
 /// retried, then the slot frees (conn is `Closed`).
 const NOTIFY_ERROR_TIMEOUT: u8 = 4;
+/// A connect whose local address was removed before it completed
+/// (`ENETUNREACH`); retried, then the slot frees (conn is `Closed`).
+const NOTIFY_ERROR_UNREACH: u8 = 5;
+/// The peer's FIN whose `MSG_CLOSED` (`CLOSED_PEER_FIN`) couldn't be
+/// delivered yet — retried; the connection stays open for the consumer to
+/// send on. `NOTIFY_CLOSED` is the connection gone (`CLOSED_GONE`).
+const NOTIFY_PEER_FIN: u8 = 6;
 /// TCP timer ticks per second (`step_tcp_timers` advances every 50 ms).
 const TCP_TIMER_HZ: u16 = 20;
 /// CloseWait bound: the peer has closed and the consumer has not answered
@@ -900,6 +946,20 @@ unsafe fn conn_reset(s: &mut IpState, idx: usize) {
                 pc.state = tcp::TcpState::Closed;
                 pc.pending_close_notify = NOTIFY_CLOSED;
             }
+        }
+    }
+    // A send or close the lane held back for this connection is this
+    // connection's alone: the next connection in the slot — another
+    // workload's, possibly — must not receive it.
+    {
+        let st = lane_state(s, (*s.tcp_conns.ptr(idx)).lane);
+        if st.valid != 0 && st.conn as usize == idx {
+            st.valid = 0;
+            st.off = 0;
+            st.len = 0;
+        }
+        if st.close_valid != 0 && st.close_conn as usize == idx {
+            st.close_valid = 0;
         }
     }
     {
@@ -1119,18 +1179,10 @@ unsafe fn find_conn_indexed(
 ///
 /// Datagram endpoints share the connection table and also sit in `Listen`,
 /// so the match excludes `is_datagram` slots: a TCP SYN never lands on a
-/// UDP-bound endpoint. Bind admission: a listener bound to a concrete slot
-/// serves only that slot; a wildcard listener (`LOCAL_SLOT_ANY`) serves slot
-/// 0 and UNOWNED secondaries but never an OWNED one (`dst_owned`) — an owned
-/// workload address is reachable only through a listener explicitly bound to
-/// it. With no owned secondary configured, `dst_owned` is always false and
-/// the wildcard matches every slot as a port-only match would.
-unsafe fn find_listener_indexed(
-    s: &IpState,
-    local_port: u16,
-    local_slot: u16,
-    dst_owned: bool,
-) -> Option<usize> {
+/// UDP-bound endpoint. Which listener serves which address is
+/// [`bind_serves`]: the wildcard never serves an owned workload address,
+/// which is reachable only through its owner's own listener.
+unsafe fn find_listener_indexed(s: &IpState, local_port: u16, local_slot: u16) -> Option<usize> {
     let mut i = 0;
     while i < MAX_LISTENERS {
         let e = s.listeners[i];
@@ -1140,7 +1192,7 @@ unsafe fn find_listener_indexed(
             if c.state == tcp::TcpState::Listen
                 && !c.is_datagram
                 && c.local_port == local_port
-                && (c.local_slot == local_slot || (c.local_slot == LOCAL_SLOT_ANY && !dst_owned))
+                && bind_serves(s, c.local_slot, c.owner_tag, local_slot)
             {
                 return Some(idx);
             }
@@ -1331,7 +1383,8 @@ impl IpDrops {
 #[repr(C)]
 pub struct HeldPacket {
     in_use: u8,
-    _pad0: u8,
+    /// Address family of the held packet: 0 or 4 IPv4, 6 IPv6.
+    af: u8,
     /// Local-address slot the packet was demuxed to at intake.
     local_slot: u16,
     /// Generation stamped into the `pkt_id`; a disposition naming another
@@ -1366,11 +1419,28 @@ pub struct PktSeamStats {
     pub dropped: u32,
     pub rejected: u32,
     pub forwarded: u32,
-    /// TUNNEL/DSR dispositions with no forward port wired; released.
+    /// TUNNEL/DSR/CHAIN dispositions with no forward port wired; released.
     pub fwd_unwired: u32,
     pub cloned: u32,
     /// Clone requests refused for want of a slot.
     pub clone_refused: u32,
+    /// MIRROR copies handed to the forward port.
+    pub mirrored: u32,
+    /// MIRROR copies not made (budget spent, forward port unwired or full).
+    pub mirror_lost: u32,
+    /// IPv6 decision records handed to the director (also in `decided`).
+    pub v6_decided: u32,
+    /// IPv6 packets disposed LOCAL or MIRROR that no local transport takes
+    /// (not TCP or UDP to a local IPv6 address, or a build without IPv6
+    /// transports); each is released.
+    pub v6_no_local: u32,
+    /// IPv6 packets to a seam address refused before the seam: extension
+    /// headers, a protocol other than TCP/UDP/ICMPv6, a bad checksum.
+    pub v6_refused: u32,
+    /// Neighbour solicitations for a seam address answered.
+    pub v6_nd_answered: u32,
+    /// Forward-and-copy dispositions (`disposition::COPY`) taken.
+    pub fwd_copy: u32,
 }
 
 #[repr(C)]
@@ -1509,6 +1579,18 @@ struct IpState {
     _fw_pad: u8,
     fence_wait_gen: u32,
     fence_wait_deadline_ms: u32,
+    /// `arm_authority`: an arm needs the VIP authority's verdict on its
+    /// emission token (identity.rs §The VIP authority's token).
+    arm_authority: u8,
+    auth_req_chan: i32,
+    auth_rsp_chan: i32,
+    /// The one arm waiting on the authority: its slot (0xFFFF none), install
+    /// generation, address, token digest and deadline.
+    auth_wait_slot: u16,
+    auth_wait_gen: u32,
+    auth_wait_addr: [u8; 16],
+    auth_wait_digest: [u8; 32],
+    auth_wait_deadline_ms: u32,
     fence_wait_addr: [u8; 16],
     /// Fences answered at the ring hand-off because the driver could not
     /// confirm the wire in time.
@@ -1523,10 +1605,36 @@ struct IpState {
     _pkt_pad: u8,
     /// How long a packet is held awaiting disposition before release.
     pkt_hold_ms: u16,
+    /// `packet_mirror_budget`: MIRROR copies per second (0: none).
+    pkt_mirror_budget: u16,
+    /// Copies the budget still allows, refilled by elapsed time.
+    pkt_mirror_tokens: u16,
+    /// When the bucket was last refilled.
+    pkt_mirror_at_ms: u32,
     /// Generation stamped into the next hold; never 0.
     pkt_gen: u32,
     /// Hold slots in use — the seam's live gauge.
     pkt_held: u16,
+    /// `seam_v6`: the IPv6 addresses whose packets go to the director.
+    seam_v6: [[u8; 16]; SEAM_V6_MAX],
+    seam_v6_count: u8,
+    /// `seam_v6` named something that is not an address, or too many.
+    seam_v6_bad: u8,
+    /// IPv6 TCP (`v6t.rs`): the local IPv6 addresses and the local slot
+    /// each stands in as, the peers and their neighbour state, the
+    /// translated frame, the router, counters.
+    v6_local: [[u8; 16]; v6t::V6T_LOCALS],
+    v6_local_slot: [u16; v6t::V6T_LOCALS],
+    v6_peers: [v6t::V6Peer; v6t::V6T_PEERS],
+    v6t_out: [u8; v6t::V6T_OUT],
+    v6_gateway: [u8; 16],
+    v6_gateway_set: bool,
+    /// `ip6` named something that is not an address, or too many.
+    ip6_bad: u8,
+    v6t_stats: v6t::V6tStats,
+    /// `ip6` as parsed, installed once the tables are sized.
+    ip6_param: [[u8; 16]; SEAM_V6_MAX],
+    ip6_param_count: u8,
     pkt_stats: PktSeamStats,
     pkt_hold: [HeldPacket; MAX_PACKET_HOLD],
 
@@ -1703,6 +1811,9 @@ struct IpState {
     /// CloseWait connections this module finished closing because the
     /// consumer never sent CMD_CLOSE within the grace interval.
     tcp_closewait_expired: u32,
+    /// Segments sent again at their own sequence numbers on the consumer's
+    /// `NET_CMD_RESEND` (retransmissions of data).
+    tcp_resent: u32,
     /// SYN-ACKs answered from cookie mode, spending no connection slot.
     /// `> 0` is the operator's signal that the deployment crossed the
     /// watermark at all — the distinction between "sized correctly" and
@@ -1914,7 +2025,8 @@ mod params_def {
         5, tcp_idle_s, u16, 0
             => |s, d, len| { s.tcp_idle_ticks = p_u16(d, len, 0, 0).saturating_mul(TCP_TIMER_HZ); };
         // Pre-transport decision seam. `pre_transport` hands every validated
-        // inbound IPv4 packet to a director on `packet_out` and holds it
+        // inbound IPv4 packet, and TCP/UDP packets to a `seam_v6` address,
+        // to a director on `packet_out` and holds it
         // until a disposition arrives on `packet_in`; `off` (the default)
         // means the code path does not exist at runtime.
         6, packet_decision, u8, 0, enum { off=0, pre_transport=1 }
@@ -1999,6 +2111,49 @@ mod params_def {
             };
         26, policy_bytes, u16, policy::BYTES_DEFAULT
             => |s, d, len| { s.policy_bytes = p_u16(d, len, 0, policy::BYTES_DEFAULT); };
+        // Decision seam: MIRROR copies per second (a token bucket that
+        // deep). 0, the default, makes every mirror a reported loss.
+        27, packet_mirror_budget, u16, 0
+            => |s, d, len| { s.pkt_mirror_budget = p_u16(d, len, 0, 0); };
+        // Decision seam: the IPv6 addresses (comma-separated, RFC 4291
+        // text, at most four) whose packets this module describes to the
+        // director as `MSG_PKT_DECIDE6`, answering neighbour solicitation
+        // and echo for them itself. Empty, the default: IPv6 is ignored.
+        // Needs `packet_decision = pre_transport`.
+        28, seam_v6, str, 0
+            => |s, d, len| { seam_v6_param(s, d, len); };
+        // IPv6 addresses (comma-separated, at most four) this stack
+        // terminates TCP and UDP for, answering neighbour solicitation and echo for
+        // them (`v6t.rs`). Empty, the default: none beyond the seam's.
+        29, ip6, str, 0
+            => |s, d, len| { ip6_param(s, d, len); };
+        // The IPv6 router every IPv6 peer is reached through: one unicast
+        // address, else construction is refused. Empty, the default: peers
+        // are on-link.
+        30, gateway6, str, 0
+            => |s, d, len| {
+                let t = core::slice::from_raw_parts(d, len);
+                let n = t.iter().position(|&b| b == 0).unwrap_or(t.len());
+                if n != 0 {
+                    match ipv6::parse_text(&t[..n]) {
+                        Some(a) if !ipv6::is_multicast(&a)
+                            && !ipv6::is_unspecified(&a)
+                            && !ipv6::is_loopback(&a)
+                            && !ipv6::is_v4_mapped(&a) =>
+                        {
+                            s.v6_gateway = a;
+                            s.v6_gateway_set = true;
+                        }
+                        _ => s.ip6_bad = 1,
+                    }
+                }
+            };
+        // Every arm of a secondary address needs the VIP authority's
+        // verdict on the emission token it carries (identity.rs); installs
+        // are disarmed whatever they ask. 0, the default: the install token
+        // alone arms.
+        31, arm_authority, u8, 0, enum { off=0, required=1 }
+            => |s, d, len| { s.arm_authority = p_u8(d, len, 0, 1); };
         // Fast-path halves (same-node streams) one lane holds at once.
         17, lane_pairs, u8, LANE_PAIRS_DEFAULT
             => |s, d, len| { s.lane_pairs = p_u8(d, len, 0, LANE_PAIRS_DEFAULT); };
@@ -2307,6 +2462,15 @@ unsafe fn sync_primary_slot(s: &mut IpState) {
     a.flags = ADDR_FLAG_PRIMARY | ADDR_FLAG_ARMED;
 }
 
+/// Whether the stack can send to `remote` at all: it has a MAC, and an
+/// IPv4 address to source from — or `remote` is an IPv6 peer, which is
+/// sourced from a local IPv6 address (`v6t.rs`) whether or not IPv4 is
+/// configured.
+#[inline]
+fn can_reach(s: &IpState, remote: u32) -> bool {
+    s.mac_valid && (s.local_ip != 0 || v6t::is_peer(remote))
+}
+
 /// Outbound IPv4 source address for a conn's bound `slot`. Slot 0 (and the
 /// `ANY` wildcard used by unbound/host traffic) sources from `local_ip`; a
 /// concrete secondary sources from its table entry, falling back to the
@@ -2380,25 +2544,94 @@ fn slot_is_owned(s: &IpState, slot: u16) -> bool {
     owner_tag_for_slot(s, slot) != 0
 }
 
-/// Resolve a nonzero bind `owner_tag` to the active local-address slot that
-/// owner owns. `None` = the owner has no configured address on this host, so a
-/// bind stamped with it is refused (the metal analogue of the Linux
-/// lease-owner gate). Owner 0 (host) is never
-/// resolved here — it binds the wildcard slot.
+/// Resolve a nonzero bind `owner_tag` to the slot an owner-stamped bind is
+/// anchored at: the first active local-address slot that owner owns, of
+/// either family. The bind serves every address the owner holds
+/// (`bind_serves`), so the anchor only names the bind. `None` = the owner has
+/// no configured address on this host, so a bind stamped with it is refused
+/// (the metal analogue of the Linux lease-owner gate). Owner 0 (host) is
+/// never resolved here — it binds the wildcard slot.
 #[inline]
 fn slot_for_owner(s: &IpState, owner_tag: u16) -> Option<u16> {
+    owner_slot_where(s, owner_tag, |_| true)
+}
+
+/// The first active IPv4 address slot owner `owner_tag` owns (never an IPv6
+/// address's stand-in). `None` for owner 0 or an owner with no IPv4 address.
+#[inline]
+fn owner_slot_v4(s: &IpState, owner_tag: u16) -> Option<u16> {
+    owner_slot_where(s, owner_tag, |a| a.flags & v6t::ADDR_FLAG_V6 == 0)
+}
+
+#[inline]
+fn owner_slot_where(s: &IpState, owner_tag: u16, want: impl Fn(&LocalAddr) -> bool) -> Option<u16> {
     if owner_tag == 0 {
         return None;
     }
     let mut i = 0;
     while i < MAX_LOCAL_ADDRS {
         let a = &s.local_addrs[i];
-        if a.is_active() && a.owner_tag == owner_tag {
+        if a.is_active() && a.owner_tag == owner_tag && want(a) {
             return Some(i as u16);
         }
         i += 1;
     }
     None
+}
+
+/// Whether local slot `slot` is active and of the IPv6 family (`v6`) or the
+/// IPv4 one.
+#[inline]
+fn slot_is_family(s: &IpState, slot: u16, v6: bool) -> bool {
+    let i = slot as usize;
+    if slot == LOCAL_SLOT_ANY || i >= MAX_LOCAL_ADDRS {
+        return false;
+    }
+    let a = &s.local_addrs[i];
+    a.is_active() && (a.flags & v6t::ADDR_FLAG_V6 != 0) == v6
+}
+
+/// Whether a listener or datagram endpoint bound at `(slot, owner)` is
+/// offered traffic to local slot `dst`.
+///
+/// - The wildcard (`LOCAL_SLOT_ANY`) serves the addresses no workload owns:
+///   the primary, unowned secondaries and the node's IPv6 addresses — never
+///   an owned one.
+/// - An owner's bind (a concrete anchor, `owner != 0`) serves every address
+///   that owner holds, IPv4 and IPv6 alike: a dual-stack workload listens on
+///   both families with one bind, and is offered no other owner's traffic.
+/// - A concrete slot bound as owner 0 serves that slot alone.
+///
+/// With no owned secondary configured every slot is unowned, and the
+/// wildcard matches every slot as a port-only match would.
+#[inline]
+fn bind_serves(s: &IpState, slot: u16, owner: u16, dst: u16) -> bool {
+    let dst_owner = owner_tag_for_slot(s, dst);
+    if slot == LOCAL_SLOT_ANY {
+        dst_owner == 0
+    } else if owner != 0 {
+        dst_owner == owner
+    } else {
+        slot == dst
+    }
+}
+
+/// Whether binds at `(a_slot, a_owner)` and `(b_slot, b_owner)` would both
+/// be offered the same traffic under [`bind_serves`].
+fn binds_overlap(s: &IpState, a_slot: u16, a_owner: u16, b_slot: u16, b_owner: u16) -> bool {
+    let a_exact = a_slot != LOCAL_SLOT_ANY && a_owner == 0;
+    let b_exact = b_slot != LOCAL_SLOT_ANY && b_owner == 0;
+    if a_exact {
+        return bind_serves(s, b_slot, b_owner, a_slot);
+    }
+    if b_exact {
+        return bind_serves(s, a_slot, a_owner, b_slot);
+    }
+    match (a_slot == LOCAL_SLOT_ANY, b_slot == LOCAL_SLOT_ANY) {
+        (true, true) => true,
+        (false, false) => a_owner == b_owner,
+        _ => false,
+    }
 }
 
 // ── Emission control ────────────────────────────────────────────────
@@ -2437,6 +2670,25 @@ unsafe fn emission_allowed(s: &IpState, frame: *const u8, len: usize) -> bool {
         eth::ETHERTYPE_ARP if len >= eth::ETH_HEADER_LEN + 28 => {
             let p = frame.add(eth::ETH_HEADER_LEN + 14);
             u32::from_be_bytes([*p, *p.add(1), *p.add(2), *p.add(3)])
+        }
+        // IPv6 sourced from a local IPv6 address is gated by its slot; a
+        // neighbour advertisement for one (its target) is the address
+        // speaking too.
+        eth::ETHERTYPE_IPV6 if len >= eth::ETH_HEADER_LEN + ipv6::IPV6_HEADER_LEN => {
+            let p = frame.add(eth::ETH_HEADER_LEN + 8);
+            let mut a = [0u8; 16];
+            core::ptr::copy_nonoverlapping(p, a.as_mut_ptr(), 16);
+            let l4 = frame.add(eth::ETH_HEADER_LEN + ipv6::IPV6_HEADER_LEN);
+            if *frame.add(eth::ETH_HEADER_LEN + 6) == ipv6::NH_ICMPV6
+                && len >= eth::ETH_HEADER_LEN + ipv6::IPV6_HEADER_LEN + 24
+                && *l4 == ipv6::ICMPV6_NA
+            {
+                core::ptr::copy_nonoverlapping(l4.add(8), a.as_mut_ptr(), 16);
+            }
+            return match v6t::slot_of_v6(s, &a) {
+                Some(slot) => s.local_addrs[slot as usize].flags & ADDR_FLAG_ARMED != 0,
+                None => true,
+            };
         }
         _ => return true,
     };
@@ -2518,8 +2770,7 @@ unsafe fn addr_ctl_resolve(
     token: &[u8; 16],
     op: u8,
 ) -> Option<usize> {
-    let ipv4 = u32::from_be_bytes([addr16[0], addr16[1], addr16[2], addr16[3]]);
-    let Some(slot) = local_slot_for_dst(s, ipv4) else {
+    let Some(slot) = addr_ctl_slot(s, addr16) else {
         addr_evt_refused(s, addr16, op, netid::refusal::NOT_FOUND);
         return None;
     };
@@ -2542,15 +2793,113 @@ unsafe fn addr_ctl_resolve(
     Some(slot as usize)
 }
 
-unsafe fn addr_ctl_arm(s: &mut IpState, addr16: &[u8; 16], token: &[u8; 16]) {
+unsafe fn addr_ctl_arm(s: &mut IpState, addr16: &[u8; 16], token: &[u8; 16], auth: &[u8]) {
     let Some(slot) = addr_ctl_resolve(s, addr16, token, IP_ADDR_ARM) else {
         return;
     };
+    if s.arm_authority != 0 {
+        arm_ask_authority(s, slot, addr16, auth);
+        return;
+    }
+    arm_slot(s, slot, addr16);
+}
+
+/// Ask the VIP authority about an arm's emission token; the arm waits for
+/// its verdict (`service_auth_rsp`). One at a time; unwired, refused.
+unsafe fn arm_ask_authority(s: &mut IpState, slot: usize, addr16: &[u8; 16], auth: &[u8]) {
+    if auth.is_empty() || auth.len() > netid::ARM_AUTH_MAX {
+        addr_evt_refused(s, addr16, IP_ADDR_ARM, netid::refusal::NO_AUTHORITY);
+        return;
+    }
+    if s.auth_req_chan < 0 || s.auth_rsp_chan < 0 || s.auth_wait_slot != 0xFFFF {
+        addr_evt_refused(s, addr16, IP_ADDR_ARM, netid::refusal::AUTHORITY);
+        return;
+    }
+    let sys = &*s.syscalls;
+    let Some(inc) = dev_boot_incarnation(sys) else {
+        addr_evt_refused(s, addr16, IP_ADDR_ARM, netid::refusal::AUTHORITY);
+        return;
+    };
+    let generation = s.local_addrs[slot].generation;
+    let mut f = [0u8; NET_FRAME_HDR + 16 + 4 + 16 + 2 + netid::ARM_AUTH_MAX];
+    let plen = 16 + 4 + 16 + 2 + auth.len();
+    f[0] = netid::MSG_ARM_AUTH_CHECK;
+    f[1..3].copy_from_slice(&(plen as u16).to_le_bytes());
+    let b = &mut f[NET_FRAME_HDR..];
+    b[..16].copy_from_slice(addr16);
+    b[16..20].copy_from_slice(&generation.to_le_bytes());
+    b[20..36].copy_from_slice(&inc);
+    b[36..38].copy_from_slice(&(auth.len() as u16).to_le_bytes());
+    b[38..38 + auth.len()].copy_from_slice(auth);
+    let total = NET_FRAME_HDR + plen;
+    if (sys.channel_write)(s.auth_req_chan, f.as_ptr(), total) != total as i32 {
+        addr_evt_refused(s, addr16, IP_ADDR_ARM, netid::refusal::AUTHORITY);
+        return;
+    }
+    s.auth_wait_slot = slot as u16;
+    s.auth_wait_gen = generation;
+    s.auth_wait_addr = *addr16;
+    s.auth_wait_digest = sha256(auth);
+    s.auth_wait_deadline_ms = (dev_millis(sys) as u32)
+        .wrapping_add(netid::ARM_AUTH_WAIT_MS)
+        .max(1);
+}
+
+/// The authority's verdicts, and the deadline of the arm waiting on one.
+unsafe fn service_auth_rsp(s: &mut IpState) {
+    if s.auth_wait_slot == 0xFFFF {
+        if s.auth_rsp_chan >= 0 {
+            // A verdict nobody waits for is read and dropped.
+            let sys = &*s.syscalls;
+            let mut f = [0u8; NET_FRAME_HDR + netid::ARM_AUTH_VERDICT_LEN];
+            let _ = net_read_frame(sys, s.auth_rsp_chan, f.as_mut_ptr(), f.len());
+        }
+        return;
+    }
+    let sys = &*s.syscalls;
+    let mut f = [0u8; NET_FRAME_HDR + netid::ARM_AUTH_VERDICT_LEN];
+    let (mt, plen) = net_read_frame(sys, s.auth_rsp_chan, f.as_mut_ptr(), f.len());
+    let addr = s.auth_wait_addr;
+    if mt == netid::ARM_AUTH_VERDICT && plen == netid::ARM_AUTH_VERDICT_LEN {
+        let b = &f[NET_FRAME_HDR..];
+        let gen = u32::from_le_bytes([b[16], b[17], b[18], b[19]]);
+        if b[..16] == addr[..] && gen == s.auth_wait_gen && b[20..52] == s.auth_wait_digest[..] {
+            let slot = s.auth_wait_slot as usize;
+            s.auth_wait_slot = 0xFFFF;
+            let verdict = b[52];
+            // The install may have gone, or been replaced, while it waited.
+            let live = s.local_addrs[slot].is_active() && s.local_addrs[slot].generation == gen;
+            if verdict == 0 && live {
+                arm_slot(s, slot, &addr);
+            } else {
+                let why = if verdict == 0 {
+                    netid::refusal::NOT_FOUND
+                } else {
+                    0x80 | (verdict & 0x7F)
+                };
+                addr_evt_refused(s, &addr, IP_ADDR_ARM, why);
+            }
+            return;
+        }
+    }
+    let now = dev_millis(sys) as u32;
+    if now.wrapping_sub(s.auth_wait_deadline_ms) < 0x8000_0000 {
+        s.auth_wait_slot = 0xFFFF;
+        addr_evt_refused(s, &addr, IP_ADDR_ARM, netid::refusal::AUTHORITY);
+    }
+}
+
+/// Arm local slot `slot` (its install token checked, and — under
+/// `arm_authority` — its emission token accepted).
+unsafe fn arm_slot(s: &mut IpState, slot: usize, addr16: &[u8; 16]) {
     let ipv4 = s.local_addrs[slot].ipv4();
     let generation = s.local_addrs[slot].generation;
     s.local_addrs[slot].flags |= ADDR_FLAG_ARMED;
     log_info(s, b"[ip] addr armed");
-    if s.netmask != 0 && s.local_ip != 0 && (ipv4 & s.netmask) == (s.local_ip & s.netmask) {
+    if s.local_addrs[slot].flags & v6t::ADDR_FLAG_V6 != 0 {
+        // A moving IPv6 VIP's new owner says so (RFC 4861 §7.2.6).
+        v6t::announce(s, addr16);
+    } else if s.netmask != 0 && s.local_ip != 0 && (ipv4 & s.netmask) == (s.local_ip & s.netmask) {
         send_gratuitous_arp(s, ipv4);
     }
     let mut p = [0u8; 20];
@@ -3060,8 +3409,10 @@ unsafe fn net_send_accepted(s: &mut IpState, conn_id: u16, local_port: u16) -> b
     ok
 }
 
+/// `MSG_CLOSED` `[conn_id][kind]` (`net_proto::CLOSED_PEER_FIN` or
+/// `CLOSED_GONE`).
 #[inline(always)]
-unsafe fn net_send_closed(s: &mut IpState, conn_id: u16) -> bool {
+unsafe fn net_send_closed(s: &mut IpState, conn_id: u16, kind: u8) -> bool {
     // Observability: emit the `tcp.connection` span before the close frame so a
     // full out-queue can't skip it. Only fires for a span that was started
     // (server-accepted, telemetry wired); client connects never set it.
@@ -3073,7 +3424,16 @@ unsafe fn net_send_closed(s: &mut IpState, conn_id: u16) -> bool {
         emit_conn_span(s, idx);
         s.tcp_conns[idx].span_start_us = 0;
     }
-    net_send_short(s, NET_MSG_CLOSED, conn_id)
+    let cb = conn_id.to_le_bytes();
+    let frame = [
+        NET_MSG_CLOSED,
+        abi::contracts::net::net_proto::CLOSED_LEN as u8,
+        0,
+        cb[0],
+        cb[1],
+        kind,
+    ];
+    net_send_or_queue(s, &frame)
 }
 
 /// Head-sampling decision for a NEW ingress root, made ONCE at accept. Draws a
@@ -3184,14 +3544,14 @@ unsafe fn net_send_peer(s: &mut IpState, conn_id: u16) -> bool {
     a16[1] = b[1];
     a16[2] = b[2];
     a16[3] = b[3];
+    // An IPv6 peer is reported as itself, never as its stand-in.
+    let mut family = abi::contracts::net::net_proto::AF_INET;
+    if let Some(v6) = v6t::v6_of_standin(s, addr).filter(|_| v6t::is_peer(addr)) {
+        a16 = v6;
+        family = abi::contracts::net::net_proto::AF_INET6;
+    }
     let mut frame = [0u8; NET_OUT_FRAME_MAX];
-    match abi::contracts::net::net_proto::write_peer(
-        &mut frame,
-        conn_id,
-        abi::contracts::net::net_proto::AF_INET,
-        &a16,
-        port,
-    ) {
+    match abi::contracts::net::net_proto::write_peer(&mut frame, conn_id, family, &a16, port) {
         Some(n) => net_send_or_queue(s, frame.get(..n).unwrap_or(&[])),
         None => false,
     }
@@ -3298,8 +3658,12 @@ unsafe fn net_send_error_to(
 }
 
 /// Emit a MSG_RETRANSMIT frame. Payload: `[conn_id:2 LE][from_seq:4 LE]`.
+/// The acknowledgement it resends from is reported first, queued in order
+/// before it, so the consumer's retained bytes are placed in sequence space
+/// by the time it is asked for them.
 #[inline(always)]
 unsafe fn net_send_retransmit(s: &mut IpState, conn_id: u16, from_seq: u32) {
+    report_ack(s, conn_id as usize, true);
     let mut frame = [0u8; 9];
     let cb = conn_id.to_le_bytes();
     core::ptr::write_volatile(frame.as_mut_ptr(), NET_MSG_RETRANSMIT);
@@ -3315,26 +3679,79 @@ unsafe fn net_send_retransmit(s: &mut IpState, conn_id: u16, from_seq: u32) {
     net_send_or_queue(s, &frame);
 }
 
-/// Emit a MSG_ACK frame. Payload: `[conn_id:2 LE][acked_seq:4 LE]`.
+/// Emit a MSG_ACK frame. Payload: `[conn_id:2 LE][acked_seq:4 LE][isn:4 LE]`.
+///
+/// An acknowledgement is cumulative, so a later one stands for every one
+/// before it: unless `queue`, the report is written only straight onto an
+/// idle channel and never takes a place in the lane's event queue, which
+/// the frames a consumer cannot do without (accepts, closes) need. A
+/// report that does not go out leaves `ack_told` behind `SND.UNA`, and the
+/// timer sweep tries it again.
 #[inline(always)]
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
-unsafe fn net_send_ack(s: &mut IpState, conn_id: u16, acked_seq: u32) {
-    let mut frame = [0u8; 9];
+unsafe fn net_send_ack(
+    s: &mut IpState,
+    conn_id: u16,
+    acked_seq: u32,
+    isn: u32,
+    queue: bool,
+) -> bool {
+    let mut frame = [0u8; 13];
     let cb = conn_id.to_le_bytes();
     core::ptr::write_volatile(frame.as_mut_ptr(), NET_MSG_ACK);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(1), 6u8);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(1), 10u8);
     core::ptr::write_volatile(frame.as_mut_ptr().add(2), 0u8);
     core::ptr::write_volatile(frame.as_mut_ptr().add(3), cb[0]);
     core::ptr::write_volatile(frame.as_mut_ptr().add(4), cb[1]);
     let b = acked_seq.to_le_bytes();
-    core::ptr::write_volatile(frame.as_mut_ptr().add(5), b[0]);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(6), b[1]);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(7), b[2]);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(8), b[3]);
-    net_send_or_queue(s, &frame);
+    let n = isn.to_le_bytes();
+    for k in 0..4 {
+        core::ptr::write_volatile(frame.as_mut_ptr().add(5 + k), b[k]);
+        core::ptr::write_volatile(frame.as_mut_ptr().add(9 + k), n[k]);
+    }
+    if queue {
+        return net_send_or_queue(s, &frame);
+    }
+    let lane = out_lane_conn(s, conn_id as usize);
+    let ch = lane_evt(s, lane);
+    if ch < 0 {
+        return true;
+    }
+    if lane_state(s, lane).ev_count != 0 {
+        return false;
+    }
+    let sys = &*s.syscalls;
+    (sys.channel_write)(ch, frame.as_ptr(), frame.len()) == frame.len() as i32
+}
+
+/// Tell the consumer of stream `idx` how far the peer has acknowledged
+/// (`MSG_ACK`), if that moved since it was last told. The consumer — `tls`
+/// — holds the only copy of the bytes in flight, and releases them on it.
+unsafe fn report_ack(s: &mut IpState, idx: usize, queue: bool) {
+    if idx >= s.tcp_conns.len() || s.loopback_peer[idx] >= 0 {
+        return;
+    }
+    let c = &*s.tcp_conns.ptr(idx);
+    let synced = matches!(
+        c.state,
+        tcp::TcpState::Established
+            | tcp::TcpState::CloseWait
+            | tcp::TcpState::FinWait1
+            | tcp::TcpState::FinWait2
+            | tcp::TcpState::Closing
+            | tcp::TcpState::LastAck
+    );
+    if c.is_datagram || !synced || c.ack_told == c.snd_una {
+        return;
+    }
+    let (una, isn) = (c.snd_una, c.iss.wrapping_add(1));
+    if una == isn && !queue {
+        // Nothing of the stream acknowledged yet: nothing to release, and
+        // a retransmission (which queues its report) anchors the window.
+        return;
+    }
+    if net_send_ack(s, idx as u16, una, isn, queue) {
+        (*s.tcp_conns.ptr_mut(idx)).ack_told = una;
+    }
 }
 
 // ─── datagram emitters ──────────────────────────────────────────
@@ -3374,6 +3791,13 @@ unsafe fn dg_send_rx_from_v4(
     if ch < 0 || data_len == 0 {
         return;
     }
+    // An IPv6 peer is reported as itself (`af = 6`), never as its stand-in.
+    if v6t::is_peer(src_ip) {
+        if let Some(a6) = v6t::v6_of_standin(s, src_ip) {
+            dg_send_rx_from_v6(s, ch, ep_id, &a6, src_port, data, data_len);
+        }
+        return;
+    }
     let sys = &*s.syscalls;
     let scratch = s.net_scratch.as_mut_ptr();
     let payload_len = 1 + 1 + 4 + 2 + data_len; // ep_id + af + addr + port + data
@@ -3397,6 +3821,37 @@ unsafe fn dg_send_rx_from_v4(
     wv(scratch.add(9), port_bytes[0]);
     wv(scratch.add(10), port_bytes[1]);
     core::ptr::copy_nonoverlapping(data, scratch.add(11), data_len);
+    (sys.channel_write)(ch, scratch, NET_FRAME_HDR + payload_len);
+}
+
+/// MSG_DG_RX_FROM (IPv6) payload:
+/// `[ep_id:1][af:1=6][src_addr:16][src_port:2 LE][data...]`.
+unsafe fn dg_send_rx_from_v6(
+    s: &mut IpState,
+    ch: i32,
+    ep_id: u8,
+    src: &[u8; 16],
+    src_port: u16,
+    data: *const u8,
+    data_len: usize,
+) {
+    let sys = &*s.syscalls;
+    let scratch = s.net_scratch.as_mut_ptr();
+    let payload_len = 1 + 1 + 16 + 2 + data_len;
+    if payload_len > s.net_scratch.len() - NET_FRAME_HDR {
+        return;
+    }
+    *scratch = DG_MSG_RX_FROM;
+    let pl = (payload_len as u16).to_le_bytes();
+    *scratch.add(1) = pl[0];
+    *scratch.add(2) = pl[1];
+    *scratch.add(3) = ep_id;
+    *scratch.add(4) = abi::contracts::net::datagram::AF_INET6;
+    core::ptr::copy_nonoverlapping(src.as_ptr(), scratch.add(5), 16);
+    let pb = src_port.to_le_bytes();
+    *scratch.add(21) = pb[0];
+    *scratch.add(22) = pb[1];
+    core::ptr::copy_nonoverlapping(data, scratch.add(23), data_len);
     (sys.channel_write)(ch, scratch, NET_FRAME_HDR + payload_len);
 }
 
@@ -3597,11 +4052,12 @@ enum DgBind {
 
 /// Decide whether a datagram bind of `(port, slot, owner_tag)` may proceed.
 ///
-/// Reachability is what makes two binds conflict, not the numeric port. A
-/// concrete slot serves one local address; `LOCAL_SLOT_ANY` serves every
-/// unowned address, so it overlaps every concrete slot. Two concrete slots
-/// never overlap, which is why the same port bound at two local addresses is
-/// two sockets. TCP listeners are a different protocol and never conflict
+/// Reachability is what makes two binds conflict, not the numeric port. An
+/// owner's bind serves every address that owner holds, so two of the same
+/// owner's binds are one identity whichever of its slots anchors them;
+/// `LOCAL_SLOT_ANY` is held to overlap every concrete slot. Two concrete
+/// slots of different owners never overlap, which is why the same port
+/// bound at two workloads' addresses is two sockets. TCP listeners are a different protocol and never conflict
 /// here — `find_listener_indexed` already excludes datagram slots in the
 /// other direction.
 unsafe fn dg_bind_admission(s: &IpState, port: u16, slot: u16, owner_tag: u16, lane: u8) -> DgBind {
@@ -3609,7 +4065,11 @@ unsafe fn dg_bind_admission(s: &IpState, port: u16, slot: u16, owner_tag: u16, l
     while i < MAX_DG_ENDPOINTS {
         let c = &*s.tcp_conns.ptr(i);
         if c.is_active() && c.is_datagram && c.local_port == port {
-            if c.local_slot == slot {
+            let same_owner = owner_tag != 0
+                && c.owner_tag == owner_tag
+                && c.local_slot != LOCAL_SLOT_ANY
+                && slot != LOCAL_SLOT_ANY;
+            if c.local_slot == slot || same_owner {
                 // A retry by the holder: the same owner, from the same lane.
                 // Another lane of the same owner is a second claimant, and
                 // handing it this endpoint would leave it unable to command
@@ -3941,6 +4401,14 @@ unsafe fn send_frame(s: &mut IpState, frame: *const u8, len: usize) -> bool {
         s.tx_fenced = s.tx_fenced.wrapping_add(1);
         return false;
     }
+    // A frame to an IPv6 peer's stand-in leaves as IPv6 (`v6t.rs`), or not
+    // at all: one with no neighbour yet is lost as on a wire, and TCP
+    // resends it.
+    let (frame, len) = match v6t::tx_translate(s, frame, len) {
+        None => (frame, len),
+        Some(0) => return true,
+        Some(n) => (s.v6t_out.as_ptr(), n),
+    };
     let sys = &*s.syscalls;
 
     // Flush any frame pending from a previous step before writing a new one.
@@ -4188,6 +4656,9 @@ pub unsafe extern "C" fn module_new(
         s.net_in_chan = dev_channel_port(sys, 0, NET_IN_PORT); // in[1]: net commands from consumer
         s.net_out_chan = dev_channel_port(sys, 1, 1); // out[1]: net messages to consumer
         s.addr_evt_chan = dev_channel_port(sys, 1, ADDR_EVT_PORT); // out[5]: emission events (optional)
+        s.auth_rsp_chan = dev_channel_port(sys, 0, AUTH_RSP_PORT); // in[5]: authority verdicts (optional)
+        s.auth_req_chan = dev_channel_port(sys, 1, AUTH_REQ_PORT); // out[7]: token checks (optional)
+        s.auth_wait_slot = 0xFFFF;
         s.addr_generation = 0;
         s.tx_fenced = 0;
         s.fence_wait_slot = 0xFFFF;
@@ -4206,9 +4677,24 @@ pub unsafe extern "C" fn module_new(
         // names a live hold.
         s.pkt_decision = PKT_DECISION_OFF;
         s.pkt_hold_ms = 50;
+        s.pkt_mirror_budget = 0;
+        s.pkt_mirror_tokens = 0;
+        s.pkt_mirror_at_ms = 0;
         s.pkt_gen = 1;
         s.pkt_held = 0;
         s.pkt_stats = PktSeamStats::default();
+        s.seam_v6 = [[0; 16]; SEAM_V6_MAX];
+        s.seam_v6_count = 0;
+        s.seam_v6_bad = 0;
+        s.v6_local = [[0; 16]; v6t::V6T_LOCALS];
+        s.v6_local_slot = [0; v6t::V6T_LOCALS];
+        s.v6_peers = [v6t::V6Peer::empty(); v6t::V6T_PEERS];
+        s.v6_gateway = [0; 16];
+        s.v6_gateway_set = false;
+        s.ip6_bad = 0;
+        s.v6t_stats = v6t::V6tStats::default();
+        s.ip6_param = [[0; 16]; SEAM_V6_MAX];
+        s.ip6_param_count = 0;
         let mut hi = 0;
         while hi < MAX_PACKET_HOLD {
             let h = &mut *s.pkt_hold.as_mut_ptr().add(hi);
@@ -4274,6 +4760,25 @@ pub unsafe extern "C" fn module_new(
         if !policy::size(s) || !service::size(s) {
             return -12;
         }
+        // The IPv6 addresses this stack terminates: `ip6`'s, and the seam's
+        // (a director may deliver a packet for one LOCAL). Host-owned and
+        // armed, as the primary is.
+        if v6t::V6T {
+            let mut k = 0;
+            while k < s.ip6_param_count as usize {
+                let a = s.ip6_param[k];
+                if v6t::install_local(s, &a, 128, 0, ADDR_FLAG_ARMED).is_none() {
+                    s.ip6_bad = 1;
+                }
+                k += 1;
+            }
+            let mut k = 0;
+            while k < s.seam_v6_count as usize {
+                let a = s.seam_v6[k];
+                let _ = v6t::install_local(s, &a, 128, 0, ADDR_FLAG_ARMED);
+                k += 1;
+            }
+        }
         // Claim the lane-provider role while the graph is instantiated, so
         // the kernel sizes its lane tables now rather than on a step. A
         // kernel that cannot answer yet is asked again on the first step.
@@ -4302,6 +4807,21 @@ pub unsafe extern "C" fn module_new(
         }
         if s.pkt_decision == PKT_DECISION_OFF && (s.pkt_in_chan >= 0 || s.pkt_out_chan >= 0) {
             let msg = b"[ip] refusing to construct: packet ports wired but packet_decision=off";
+            dev_log(sys, 1, msg.as_ptr(), msg.len());
+            return -1;
+        }
+        if s.seam_v6_bad != 0 {
+            let msg = b"[ip] refusing to construct: seam_v6 names something other than up to four IPv6 unicast addresses";
+            dev_log(sys, 1, msg.as_ptr(), msg.len());
+            return -1;
+        }
+        if s.ip6_bad != 0 || (!v6t::V6T && (s.ip6_param_count != 0 || s.v6_gateway_set)) {
+            let msg = b"[ip] refusing to construct: ip6/gateway6 name something other than IPv6 unicast addresses (ip6 at most four, each installed), or this build carries no IPv6 transports";
+            dev_log(sys, 1, msg.as_ptr(), msg.len());
+            return -1;
+        }
+        if s.seam_v6_count != 0 && s.pkt_decision == PKT_DECISION_OFF {
+            let msg = b"[ip] refusing to construct: seam_v6 needs packet_decision=pre_transport";
             dev_log(sys, 1, msg.as_ptr(), msg.len());
             return -1;
         }
@@ -4486,6 +5006,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     // consumer command that binds/sends on it. No-op when the port is unwired.
     // channel_poll verified working from PIC on aarch64 after u8→u32 widening
     service_addr_ctl(s);
+    service_auth_rsp(s);
     continuity::service(s);
     service_net_channels(s);
 
@@ -4932,6 +5453,9 @@ unsafe fn process_frame(s: &mut IpState, len: usize) {
     match ethertype {
         eth::ETHERTYPE_ARP => process_arp(s, payload, payload_len),
         eth::ETHERTYPE_IPV4 => process_ipv4(s, payload, payload_len),
+        eth::ETHERTYPE_IPV6 if s.seam_v6_count != 0 || v6t::any_local(s) => {
+            process_ipv6(s, payload, payload_len)
+        }
         _ => {}
     }
 }
@@ -5092,6 +5616,14 @@ unsafe fn process_ipv4(s: &mut IpState, data: *const u8, len: usize) {
         Some(h) => h,
         None => return,
     };
+
+    // 240.0.0.0/7 is where this module's IPv6 stand-ins live (`v6t.rs`):
+    // reserved space, never a real IPv4 source or destination, so a packet
+    // naming it is a spoof aimed at an IPv6 connection.
+    if v6t::V6T && (v6t::is_reserved(ip_hdr.src_ip) || v6t::is_reserved(ip_hdr.dst_ip)) {
+        s.v6t_stats.martian = s.v6t_stats.martian.wrapping_add(1);
+        return;
+    }
 
     // No reassembler exists, so a fragment is refused rather than handed to
     // L4 as though it were a whole packet. MF set (0x2000) or a nonzero
@@ -5412,6 +5944,7 @@ unsafe fn seam_intake(
     let hold_ms = s.pkt_hold_ms;
     let h = &mut *s.pkt_hold.as_mut_ptr().add(slot);
     h.in_use = 1;
+    h.af = 4;
     h.local_slot = local_slot;
     h.gen = gen;
     h.len = frame_len as u16;
@@ -5437,7 +5970,24 @@ unsafe fn deliver_held(s: &mut IpState, slot: usize) {
     };
     s.rx_frame_len = len as u16;
     s.rx_l3_off = l3_off as u16;
-    let l3 = s.rx_frame.as_ptr().add(l3_off);
+    let l3 = s.rx_frame.as_mut_ptr().add(l3_off);
+    if (*s.pkt_hold.as_ptr().add(slot)).af == 6 {
+        // An IPv6 packet a director delivered: TCP to a local IPv6 address
+        // goes to the TCP machine (`v6t.rs`); anything else has no local
+        // transport over IPv6.
+        let h = ipv6::parse_ipv6(l3, len - l3_off);
+        let to = h.as_ref().and_then(|h| v6t::slot_of_v6(s, &h.dst));
+        match (h, to) {
+            (Some(h), Some(slot6)) if h.next_header == ipv6::NH_TCP => {
+                v6t::rx_tcp(s, &h, l3.add(ipv6::IPV6_HEADER_LEN), h.payload_len, slot6);
+            }
+            (Some(h), Some(slot6)) if h.next_header == ipv6::NH_UDP => {
+                v6t::rx_udp(s, &h, l3.add(ipv6::IPV6_HEADER_LEN), h.payload_len, slot6);
+            }
+            _ => s.pkt_stats.v6_no_local = s.pkt_stats.v6_no_local.wrapping_add(1),
+        }
+        return;
+    }
     let Some(ip_hdr) = ipv4::parse_ipv4(l3, len - l3_off) else {
         return;
     };
@@ -5560,6 +6110,13 @@ unsafe fn send_icmp_unreachable(
 /// the slot is released; `false` leaves the slot held with the disposition
 /// pending for the next step.
 unsafe fn forward_held(s: &mut IpState, slot: usize) -> bool {
+    let rec = (*s.pkt_hold.as_ptr().add(slot)).pending_fwd;
+    forward_record(s, slot, &rec)
+}
+
+/// Write one forward record of a held frame naming `disp` (`[disposition]
+/// [args:6]`). `true` when it went (or never could).
+unsafe fn forward_record(s: &mut IpState, slot: usize, disp: &[u8; 7]) -> bool {
     use abi::contracts::net::packet as pkt;
     let sys = &*s.syscalls;
     let h = &*s.pkt_hold.as_ptr().add(slot);
@@ -5577,7 +6134,7 @@ unsafe fn forward_held(s: &mut IpState, slot: usize) -> bool {
     let id = hold_id(slot, h.gen).to_le_bytes();
     core::ptr::copy_nonoverlapping(id.as_ptr(), scratch.add(NET_FRAME_HDR), 4);
     core::ptr::copy_nonoverlapping(
-        h.pending_fwd.as_ptr(),
+        disp.as_ptr(),
         scratch.add(NET_FRAME_HDR + 4),
         1 + pkt::DISP_ARGS_LEN,
     );
@@ -5595,8 +6152,15 @@ unsafe fn forward_held(s: &mut IpState, slot: usize) -> bool {
     }
 }
 
-/// Act on one disposition.
-unsafe fn dispose_held(s: &mut IpState, pkt_id: u32, disp: u8, args: &[u8; 6]) {
+/// Act on one disposition. `copy` is the mirror argument block of a
+/// forward-and-copy (`disposition::COPY`), `None` otherwise.
+unsafe fn dispose_held(
+    s: &mut IpState,
+    pkt_id: u32,
+    disp: u8,
+    args: &[u8; 6],
+    copy: Option<&[u8; 6]>,
+) {
     use abi::contracts::net::packet as pkt;
     let Some(slot) = hold_lookup(s, pkt_id) else {
         s.pkt_stats.stale_disposition = s.pkt_stats.stale_disposition.wrapping_add(1);
@@ -5605,6 +6169,18 @@ unsafe fn dispose_held(s: &mut IpState, pkt_id: u32, disp: u8, args: &[u8; 6]) {
     // A slot with a forward pending has been disposed already.
     if (*s.pkt_hold.as_ptr().add(slot)).pending_fwd[0] != 0xFF {
         s.pkt_stats.stale_disposition = s.pkt_stats.stale_disposition.wrapping_add(1);
+        return;
+    }
+    let v6 = (*s.pkt_hold.as_ptr().add(slot)).af == 6;
+    if v6 && !v6t::V6T && matches!(disp, pkt::disposition::LOCAL | pkt::disposition::MIRROR) {
+        // No IPv6 transport to deliver to on this build.
+        s.pkt_stats.v6_no_local = s.pkt_stats.v6_no_local.wrapping_add(1);
+        hold_free(s, slot);
+        return;
+    }
+    if copy.is_some() && !pkt::disposition::copy_allowed(disp) {
+        s.pkt_stats.dropped = s.pkt_stats.dropped.wrapping_add(1);
+        hold_free(s, slot);
         return;
     }
     match disp {
@@ -5619,10 +6195,20 @@ unsafe fn dispose_held(s: &mut IpState, pkt_id: u32, disp: u8, args: &[u8; 6]) {
         }
         pkt::disposition::REJECT => {
             s.pkt_stats.rejected = s.pkt_stats.rejected.wrapping_add(1);
-            reject_held(s, slot, args[1]);
+            if v6 {
+                reject_held6(s, slot, args[1]);
+            } else {
+                reject_held(s, slot, args[1]);
+            }
             hold_free(s, slot);
         }
-        pkt::disposition::TUNNEL | pkt::disposition::DSR => {
+        pkt::disposition::MIRROR => {
+            s.pkt_stats.local = s.pkt_stats.local.wrapping_add(1);
+            mirror_held(s, slot, pkt_id, args);
+            deliver_held(s, slot);
+            hold_free(s, slot);
+        }
+        pkt::disposition::TUNNEL | pkt::disposition::DSR | pkt::disposition::CHAIN => {
             if s.pkt_fwd_chan < 0 {
                 s.pkt_stats.fwd_unwired = s.pkt_stats.fwd_unwired.wrapping_add(1);
                 hold_free(s, slot);
@@ -5633,7 +6219,12 @@ unsafe fn dispose_held(s: &mut IpState, pkt_id: u32, disp: u8, args: &[u8; 6]) {
                 h.pending_fwd[0] = disp;
                 h.pending_fwd[1..7].copy_from_slice(args);
             }
-            if forward_held(s, slot) {
+            let went = forward_held(s, slot);
+            if let Some(margs) = copy {
+                s.pkt_stats.fwd_copy = s.pkt_stats.fwd_copy.wrapping_add(1);
+                mirror_held(s, slot, pkt_id, margs);
+            }
+            if went {
                 hold_free(s, slot);
             }
         }
@@ -5644,6 +6235,71 @@ unsafe fn dispose_held(s: &mut IpState, pkt_id: u32, disp: u8, args: &[u8; 6]) {
             hold_free(s, slot);
         }
     }
+}
+
+/// Take one copy from the mirror budget: a token bucket `packet_mirror_budget`
+/// deep, refilled at that many per second.
+unsafe fn mirror_budget_take(s: &mut IpState) -> bool {
+    let budget = s.pkt_mirror_budget;
+    if budget == 0 {
+        return false;
+    }
+    let now = (dev_millis(&*s.syscalls) as u32).max(1);
+    if s.pkt_mirror_at_ms == 0 {
+        // The first mirror finds the bucket full.
+        s.pkt_mirror_tokens = budget;
+        s.pkt_mirror_at_ms = now;
+    }
+    let elapsed = now.wrapping_sub(s.pkt_mirror_at_ms);
+    let earned = (u64::from(elapsed) * u64::from(budget) / 1000) as u32;
+    if earned > 0 {
+        let t = u32::from(s.pkt_mirror_tokens).saturating_add(earned);
+        s.pkt_mirror_tokens = t.min(u32::from(budget)) as u16;
+        // Keep the remainder: advance only by the time the tokens cost.
+        let spent_ms = (u64::from(earned) * 1000 / u64::from(budget)) as u32;
+        s.pkt_mirror_at_ms = s.pkt_mirror_at_ms.wrapping_add(spent_ms);
+        if s.pkt_mirror_tokens == budget {
+            s.pkt_mirror_at_ms = now;
+        }
+    }
+    if s.pkt_mirror_tokens == 0 {
+        return false;
+    }
+    s.pkt_mirror_tokens -= 1;
+    true
+}
+
+/// A MIRROR's copy: one forward record of the held frame, now or never —
+/// a mirror never holds the original back. A copy not made is counted and
+/// reported.
+unsafe fn mirror_held(s: &mut IpState, slot: usize, pkt_id: u32, args: &[u8; 6]) {
+    use abi::contracts::net::packet as pkt;
+    let copied = s.pkt_fwd_chan >= 0 && mirror_budget_take(s) && {
+        let mut rec = [0u8; 7];
+        rec[0] = pkt::disposition::MIRROR;
+        rec[1..7].copy_from_slice(args);
+        forward_record(s, slot, &rec)
+    };
+    if copied {
+        // `forward_held` counted it forwarded; it is a mirror.
+        s.pkt_stats.forwarded = s.pkt_stats.forwarded.wrapping_sub(1);
+        s.pkt_stats.mirrored = s.pkt_stats.mirrored.wrapping_add(1);
+        return;
+    }
+    s.pkt_stats.mirror_lost = s.pkt_stats.mirror_lost.wrapping_add(1);
+    let sys = &*s.syscalls;
+    let mut rec = [0u8; pkt::MIRROR_LOST_LEN];
+    rec[0..4].copy_from_slice(&pkt_id.to_le_bytes());
+    rec[4..8].copy_from_slice(&s.pkt_stats.mirror_lost.to_le_bytes());
+    let mut scratch = [0u8; NET_FRAME_HDR + pkt::MIRROR_LOST_LEN];
+    let _ = ip_net_write_frame(
+        sys,
+        s.pkt_out_chan,
+        pkt::MSG_PKT_MIRROR_LOST,
+        rec.as_ptr(),
+        rec.len(),
+        scratch.as_mut_ptr(),
+    );
 }
 
 /// Hold a second copy of a held packet under a new id.
@@ -5713,7 +6369,7 @@ unsafe fn service_packet_in(s: &mut IpState) {
         if poll <= 0 || (poll as u32 & POLL_IN) == 0 {
             break;
         }
-        let mut frame = [0u8; NET_FRAME_HDR + 16];
+        let mut frame = [0u8; NET_FRAME_HDR + 24];
         let (msg, plen) = net_read_frame(sys, s.pkt_in_chan, frame.as_mut_ptr(), frame.len());
         let buf = &frame[NET_FRAME_HDR..];
         match msg {
@@ -5722,7 +6378,20 @@ unsafe fn service_packet_in(s: &mut IpState) {
                 let mut args = [0u8; 6];
                 let n = (plen - 5).min(6);
                 args[..n].copy_from_slice(&buf[5..5 + n]);
-                dispose_held(s, id, buf[4], &args);
+                let d = buf[4];
+                if d & pkt::disposition::COPY != 0 {
+                    // A forward-and-copy carries both blocks whole, or is
+                    // malformed and released as an unknown disposition.
+                    let mut margs = [0u8; 6];
+                    if plen >= pkt::DISPOSE_COPY_LEN {
+                        margs.copy_from_slice(&buf[11..17]);
+                        dispose_held(s, id, d & !pkt::disposition::COPY, &args, Some(&margs));
+                    } else {
+                        dispose_held(s, id, 0xFE, &args, None);
+                    }
+                } else {
+                    dispose_held(s, id, d, &args, None);
+                }
             }
             pkt::CMD_PKT_CLONE if plen >= 4 => {
                 let id = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
@@ -5765,6 +6434,511 @@ unsafe fn expire_held(s: &mut IpState) {
             hold_free(s, i);
         }
         i += 1;
+    }
+}
+
+// ── IPv6 receive ─────────────────────────────────────────────────────────
+//
+// `seam_v6` names IPv6 addresses whose packets this module describes to
+// the director (`MSG_PKT_DECIDE6`) and holds as it holds IPv4 ones; `ip6`
+// names addresses the stack terminates itself (`v6t.rs`), as does a
+// `seam_v6` address a director delivers LOCAL. The stack answers for every
+// address it holds what makes it reachable and observable — neighbour
+// solicitation (RFC 4861 §7.2.4) and echo (RFC 4443 §4.1) — as ICMP and the
+// DHCP exchange stay the stack's own for IPv4.
+
+/// Parse a comma-separated list of RFC 4291 unicast addresses (no
+/// multicast, unspecified, loopback or IPv4-mapped), at most `SEAM_V6_MAX`, into `out`:
+/// the count, or `None` when anything in it is not one.
+unsafe fn parse_v6_list(d: *const u8, len: usize, out: &mut [[u8; 16]; SEAM_V6_MAX]) -> Option<u8> {
+    let t = core::slice::from_raw_parts(d, len);
+    let n = t.iter().position(|&b| b == 0).unwrap_or(t.len());
+    let mut count = 0usize;
+    for part in t[..n].split(|&b| b == b',') {
+        let mut a = 0;
+        let mut b = part.len();
+        while a < b && part[a] == b' ' {
+            a += 1;
+        }
+        while b > a && part[b - 1] == b' ' {
+            b -= 1;
+        }
+        if b == a {
+            continue;
+        }
+        let addr = ipv6::parse_text(&part[a..b])?;
+        if ipv6::is_multicast(&addr)
+            || ipv6::is_unspecified(&addr)
+            || ipv6::is_loopback(&addr)
+            || ipv6::is_v4_mapped(&addr)
+            || count >= SEAM_V6_MAX
+        {
+            return None;
+        }
+        out[count] = addr;
+        count += 1;
+    }
+    Some(count as u8)
+}
+
+/// Parse `seam_v6`; anything but a list of unicast addresses marks the
+/// parameter bad, which refuses construction.
+unsafe fn seam_v6_param(s: &mut IpState, d: *const u8, len: usize) {
+    match parse_v6_list(d, len, &mut s.seam_v6) {
+        Some(n) => s.seam_v6_count = n,
+        None => {
+            s.seam_v6_count = 0;
+            s.seam_v6_bad = 1;
+        }
+    }
+}
+
+/// Parse `ip6`, as `seam_v6` is parsed.
+unsafe fn ip6_param(s: &mut IpState, d: *const u8, len: usize) {
+    match parse_v6_list(d, len, &mut s.ip6_param) {
+        Some(n) => s.ip6_param_count = n,
+        None => {
+            s.ip6_param_count = 0;
+            s.ip6_bad = 1;
+        }
+    }
+}
+
+/// Whether `a` is one of the seam's IPv6 addresses.
+fn seam_v6_holds(s: &IpState, a: &[u8; 16]) -> bool {
+    let mut k = 0;
+    while k < s.seam_v6_count as usize {
+        if s.seam_v6[k] == *a {
+            return true;
+        }
+        k += 1;
+    }
+    false
+}
+
+/// Whether `a` is the solicited-node multicast of a local IPv6 address.
+fn v6_solicited_local(s: &IpState, a: &[u8; 16]) -> bool {
+    let mut k = 0;
+    while k < v6t::V6T_LOCALS {
+        if s.v6_local_slot[k] != 0 && ipv6::solicited_node(&s.v6_local[k]) == *a {
+            return true;
+        }
+        k += 1;
+    }
+    false
+}
+
+/// Whether `a` is the solicited-node multicast of a seam address.
+fn seam_v6_solicited(s: &IpState, a: &[u8; 16]) -> bool {
+    let mut k = 0;
+    while k < s.seam_v6_count as usize {
+        if ipv6::solicited_node(&s.seam_v6[k]) == *a {
+            return true;
+        }
+        k += 1;
+    }
+    false
+}
+
+/// An IPv6 packet, with `seam_v6` or a local IPv6 address held.
+unsafe fn process_ipv6(s: &mut IpState, data: *const u8, len: usize) {
+    let Some(h) = ipv6::parse_ipv6(data, len) else {
+        return;
+    };
+    // RFC 4291 §2.5.3 / §2.7: no packet comes from a multicast or loopback
+    // address, none goes to loopback, and an IPv4-mapped address is never a
+    // wire address (RFC 4291 §2.5.5.2). Nothing is answered for one — an
+    // error or reply to a multicast source is a reflection.
+    if ipv6::is_multicast(&h.src)
+        || ipv6::is_loopback(&h.src)
+        || ipv6::is_loopback(&h.dst)
+        || ipv6::is_v4_mapped(&h.src)
+        || ipv6::is_v4_mapped(&h.dst)
+    {
+        s.pkt_stats.v6_refused = s.pkt_stats.v6_refused.wrapping_add(1);
+        return;
+    }
+    // Only neighbour discovery's duplicate address detection is sent from
+    // the unspecified address.
+    if ipv6::is_unspecified(&h.src) && h.next_header != ipv6::NH_ICMPV6 {
+        s.pkt_stats.v6_refused = s.pkt_stats.v6_refused.wrapping_add(1);
+        return;
+    }
+    let seam = s.pkt_decision == PKT_DECISION_PRE_TRANSPORT && seam_v6_holds(s, &h.dst);
+    let local = v6t::slot_of_v6(s, &h.dst);
+    let for_us = seam_v6_holds(s, &h.dst) || local.is_some();
+    // Neighbour discovery to a solicited-node group, or an advertisement to
+    // us or all nodes.
+    let nd_group =
+        seam_v6_solicited(s, &h.dst) || v6_solicited_local(s, &h.dst) || h.dst[0] == 0xFF;
+    if !for_us && (!nd_group || h.next_header != ipv6::NH_ICMPV6) {
+        return;
+    }
+    let l4 = data.add(ipv6::IPV6_HEADER_LEN);
+    let l4_len = h.payload_len;
+    match h.next_header {
+        ipv6::NH_ICMPV6 => process_icmpv6(s, &h, l4, l4_len, for_us),
+        ipv6::NH_TCP | ipv6::NH_UDP if seam => seam_intake6(s, &h, l4, l4_len),
+        ipv6::NH_TCP if local.is_some() => {
+            let slot = local.unwrap_or(0);
+            // A fenced address takes nothing (it answers nothing either).
+            if s.local_addrs[slot as usize].flags & ADDR_FLAG_ARMED != 0 {
+                v6t::rx_tcp(s, &h, l4 as *mut u8, l4_len, slot);
+            }
+        }
+        ipv6::NH_UDP if local.is_some() => {
+            let slot = local.unwrap_or(0);
+            if s.local_addrs[slot as usize].flags & ADDR_FLAG_ARMED != 0 {
+                v6t::rx_udp(s, &h, l4 as *mut u8, l4_len, slot);
+            }
+        }
+        _ => {
+            // Extension headers (a fragment among them) and every other
+            // protocol: the director would have to re-parse what the seam
+            // promises it never has to, so none reaches it.
+            if for_us {
+                s.pkt_stats.v6_refused = s.pkt_stats.v6_refused.wrapping_add(1);
+            }
+        }
+    }
+}
+
+/// ICMPv6 for a seam address: a neighbour solicitation answered with an
+/// advertisement, an echo request with its reply; the rest ignored.
+unsafe fn process_icmpv6(
+    s: &mut IpState,
+    h: &ipv6::Ipv6Header,
+    l4: *const u8,
+    l4_len: usize,
+    for_us: bool,
+) {
+    if l4_len < 8 || !ipv6::verify_transport(&h.src, &h.dst, ipv6::NH_ICMPV6, l4, l4_len) {
+        return;
+    }
+    let ty = *l4;
+    if ty == ipv6::ICMPV6_NS {
+        // RFC 4861 §7.1.1: hop limit 255, code 0, at least 24 bytes, the
+        // target unicast and one of ours. A duplicate address detection
+        // probe (unspecified source) is not answered.
+        if h.hop_limit != 255 || *l4.add(1) != 0 || l4_len < 24 || ipv6::is_unspecified(&h.src) {
+            return;
+        }
+        let mut target = [0u8; 16];
+        core::ptr::copy_nonoverlapping(l4.add(8), target.as_mut_ptr(), 16);
+        if ipv6::is_multicast(&target) || !nd_options_valid(l4, l4_len, 24) {
+            return;
+        }
+        // A local address answers only while armed; a seam address not
+        // installed is the director's and always answered.
+        let answer = match v6t::slot_of_v6(s, &target) {
+            Some(slot) => s.local_addrs[slot as usize].flags & ADDR_FLAG_ARMED != 0,
+            None => seam_v6_holds(s, &target),
+        };
+        if !answer {
+            return;
+        }
+        send_neighbour_advert(s, &h.src, &target);
+        return;
+    }
+    if ty == ipv6::ICMPV6_NA {
+        // RFC 4861 §7.1.2: hop limit 255, code 0, at least 24 bytes, and a
+        // solicited advertisement is never sent to a multicast group.
+        if h.hop_limit == 255
+            && *l4.add(1) == 0
+            && l4_len >= 24
+            && !(ipv6::is_multicast(&h.dst) && *l4.add(4) & 0x40 != 0)
+        {
+            v6t::on_advert(s, l4, l4_len);
+        }
+        return;
+    }
+    if ty == ipv6::ICMPV6_ECHO_REQUEST && for_us && *l4.add(1) == 0 {
+        // An echo to a workload address follows packet policy, as the
+        // IPv4 one does.
+        if let Some(slot) = v6t::slot_of_v6(s, &h.dst) {
+            if slot_is_owned(s, slot)
+                && !policy_allows(
+                    s,
+                    v6t::V6T_PEER_NET,
+                    local_ip_for_slot(s, slot),
+                    POLICY_PROTO_ICMP,
+                    0,
+                )
+            {
+                return;
+            }
+        }
+        send_echo_reply6(s, h, l4, l4_len);
+    }
+}
+
+/// Whether the neighbour discovery options from `at` to `len` are well
+/// formed: none of length zero (RFC 4861 §7.1.1), none past the message.
+unsafe fn nd_options_valid(l4: *const u8, len: usize, at: usize) -> bool {
+    let mut off = at;
+    while off < len {
+        if off + 2 > len {
+            return false;
+        }
+        let units = *l4.add(off + 1) as usize;
+        if units == 0 || off + units * 8 > len {
+            return false;
+        }
+        off += units * 8;
+    }
+    true
+}
+
+/// Write an IPv6 packet around the `payload_len` bytes already at the L4
+/// offset of `tx_frame`, checksum its ICMPv6/TCP header and send it to the
+/// MAC of the frame being answered.
+unsafe fn send_v6_reply(
+    s: &mut IpState,
+    next_header: u8,
+    hop_limit: u8,
+    src: &[u8; 16],
+    dst: &[u8; 16],
+    payload_len: usize,
+    csum_at: usize,
+) {
+    if !s.mac_valid {
+        return;
+    }
+    let l4 = s
+        .tx_frame
+        .as_mut_ptr()
+        .add(eth::ETH_HEADER_LEN + ipv6::IPV6_HEADER_LEN);
+    *l4.add(csum_at) = 0;
+    *l4.add(csum_at + 1) = 0;
+    let c = ipv6::transport_checksum(src, dst, next_header, l4, payload_len);
+    *l4.add(csum_at) = (c >> 8) as u8;
+    *l4.add(csum_at + 1) = c as u8;
+    ipv6::build_ipv6_header(
+        s.tx_frame.as_mut_ptr().add(eth::ETH_HEADER_LEN),
+        payload_len as u16,
+        next_header,
+        hop_limit,
+        src,
+        dst,
+    );
+    let dst_mac = eth::src_mac(s.rx_frame.as_ptr());
+    let mac = s.mac_addr;
+    eth::build_eth_header(s.tx_frame.as_mut_ptr(), &dst_mac, &mac, eth::ETHERTYPE_IPV6);
+    let total = eth::ETH_HEADER_LEN + ipv6::IPV6_HEADER_LEN + payload_len;
+    send_frame(s, s.tx_frame.as_ptr(), total);
+}
+
+/// A solicited neighbour advertisement for `target`, with our link-layer
+/// address (RFC 4861 §4.4: S and O set, router clear).
+unsafe fn send_neighbour_advert(s: &mut IpState, to: &[u8; 16], target: &[u8; 16]) {
+    let l4 = s
+        .tx_frame
+        .as_mut_ptr()
+        .add(eth::ETH_HEADER_LEN + ipv6::IPV6_HEADER_LEN);
+    let mut b = [0u8; 32];
+    b[0] = ipv6::ICMPV6_NA;
+    b[4] = 0x60; // solicited, override
+    b[8..24].copy_from_slice(target);
+    b[24] = 2; // target link-layer address option
+    b[25] = 1; // eight bytes
+    b[26..32].copy_from_slice(&s.mac_addr);
+    core::ptr::copy_nonoverlapping(b.as_ptr(), l4, b.len());
+    s.pkt_stats.v6_nd_answered = s.pkt_stats.v6_nd_answered.wrapping_add(1);
+    send_v6_reply(s, ipv6::NH_ICMPV6, 255, target, to, b.len(), 2);
+}
+
+/// An echo reply carrying the request's identifier, sequence and data.
+unsafe fn send_echo_reply6(s: &mut IpState, h: &ipv6::Ipv6Header, l4: *const u8, l4_len: usize) {
+    if eth::ETH_HEADER_LEN + ipv6::IPV6_HEADER_LEN + l4_len > MAX_FRAME_SIZE {
+        return;
+    }
+    let out = s
+        .tx_frame
+        .as_mut_ptr()
+        .add(eth::ETH_HEADER_LEN + ipv6::IPV6_HEADER_LEN);
+    core::ptr::copy_nonoverlapping(l4, out, l4_len);
+    *out = ipv6::ICMPV6_ECHO_REPLY;
+    let (src, dst) = (h.dst, h.src);
+    send_v6_reply(s, ipv6::NH_ICMPV6, 64, &src, &dst, l4_len, 2);
+}
+
+/// Parse and checksum an IPv6 packet's transport header once, at the seam.
+unsafe fn seam_l4_facts6(
+    s: &mut IpState,
+    h: &ipv6::Ipv6Header,
+    l4: *const u8,
+    l4_len: usize,
+) -> L4Facts {
+    let mut f = L4Facts {
+        src_port: 0,
+        dst_port: 0,
+        csum_ok: false,
+        refused: true,
+    };
+    match h.next_header {
+        ipv6::NH_TCP => {
+            let Some(t) = tcp::parse_tcp(l4, l4_len) else {
+                return f;
+            };
+            if !ipv6::verify_transport(&h.src, &h.dst, ipv6::NH_TCP, l4, l4_len) {
+                s.drops.cksum_tcp = s.drops.cksum_tcp.wrapping_add(1);
+                return f;
+            }
+            f.src_port = t.src_port;
+            f.dst_port = t.dst_port;
+        }
+        ipv6::NH_UDP => {
+            let Some(u) = udp::parse_udp(l4, l4_len) else {
+                return f;
+            };
+            if u.length as usize != l4_len {
+                s.drops.udp_len = s.drops.udp_len.wrapping_add(1);
+                return f;
+            }
+            // RFC 8200 §8.1: a zero UDP checksum is not permitted over IPv6.
+            if udp::checksum_field(l4) == 0
+                || !ipv6::verify_transport(&h.src, &h.dst, ipv6::NH_UDP, l4, l4_len)
+            {
+                s.drops.cksum_udp = s.drops.cksum_udp.wrapping_add(1);
+                return f;
+            }
+            f.src_port = u.src_port;
+            f.dst_port = u.dst_port;
+        }
+        _ => return f,
+    }
+    f.csum_ok = true;
+    f.refused = false;
+    f
+}
+
+/// Describe the IPv6 packet in `rx_frame` to the director and hold it.
+unsafe fn seam_intake6(s: &mut IpState, h: &ipv6::Ipv6Header, l4: *const u8, l4_len: usize) {
+    use abi::contracts::net::packet as pkt;
+
+    let facts = seam_l4_facts6(s, h, l4, l4_len);
+    if facts.refused {
+        s.pkt_stats.v6_refused = s.pkt_stats.v6_refused.wrapping_add(1);
+        return;
+    }
+    let Some(slot) = hold_alloc(s) else {
+        s.pkt_stats.hold_refused = s.pkt_stats.hold_refused.wrapping_add(1);
+        return;
+    };
+    let sys = &*s.syscalls;
+    let gen = s.pkt_gen;
+    let id = hold_id(slot, gen);
+    let l3_off = s.rx_l3_off as usize;
+    // The frame ends where the IPv6 payload does: trailing link padding is
+    // not the packet's.
+    let frame_len = l3_off + ipv6::IPV6_HEADER_LEN + l4_len;
+    let l4_off = l3_off + ipv6::IPV6_HEADER_LEN;
+    let ts_us = dev_micros(sys);
+
+    let mut rec = [0u8; pkt::DECIDE6_LEN];
+    rec[0..4].copy_from_slice(&id.to_le_bytes());
+    rec[4] = pkt::AF_INET6;
+    rec[5] = h.next_header;
+    rec[6..22].copy_from_slice(&h.src);
+    rec[22..38].copy_from_slice(&h.dst);
+    rec[38..40].copy_from_slice(&facts.src_port.to_le_bytes());
+    rec[40..42].copy_from_slice(&facts.dst_port.to_le_bytes());
+    rec[42] = 0; // iface
+    rec[43] = 0; // rx_queue
+    rec[44] = pkt::RX_FLAG_HAS_TIMESTAMP | pkt::RX_FLAG_CSUM_OK;
+    rec[45] = 0; // frag: extension headers never reach the seam
+    rec[46..54].copy_from_slice(&ts_us.to_le_bytes());
+    rec[54..56].copy_from_slice(&(frame_len as u16).to_le_bytes());
+    rec[56..58].copy_from_slice(&(l4_off as u16).to_le_bytes());
+
+    let mut scratch = [0u8; NET_FRAME_HDR + pkt::DECIDE6_LEN];
+    if ip_net_write_frame(
+        sys,
+        s.pkt_out_chan,
+        pkt::MSG_PKT_DECIDE6,
+        rec.as_ptr(),
+        rec.len(),
+        scratch.as_mut_ptr(),
+    ) != 0
+    {
+        s.pkt_stats.hold_refused = s.pkt_stats.hold_refused.wrapping_add(1);
+        return;
+    }
+
+    let now_ms = dev_millis(sys);
+    let hold_ms = s.pkt_hold_ms;
+    let hp = &mut *s.pkt_hold.as_mut_ptr().add(slot);
+    hp.in_use = 1;
+    hp.af = 6;
+    hp.local_slot = 0;
+    hp.gen = gen;
+    hp.len = frame_len as u16;
+    hp.l3_off = l3_off as u16;
+    hp.deadline_ms = (now_ms as u32).wrapping_add(u32::from(hold_ms));
+    hp.pending_fwd[0] = 0xFF;
+    core::ptr::copy_nonoverlapping(s.rx_frame.as_ptr(), hp.frame.as_mut_ptr(), frame_len);
+    hold_bump_gen(s);
+    s.pkt_held += 1;
+    s.pkt_stats.decided = s.pkt_stats.decided.wrapping_add(1);
+    s.pkt_stats.v6_decided = s.pkt_stats.v6_decided.wrapping_add(1);
+}
+
+/// REJECT for a held IPv6 packet: a TCP RST (RFC 9293 §3.10.7.1, as for
+/// IPv4), or ICMPv6 port unreachable quoting as much of the packet as keeps
+/// the error within the minimum MTU (RFC 4443 §3.1).
+unsafe fn reject_held6(s: &mut IpState, slot: usize, response: u8) {
+    use abi::contracts::net::packet as pkt;
+    let (len, l3_off) = {
+        let hp = &*s.pkt_hold.as_ptr().add(slot);
+        core::ptr::copy_nonoverlapping(hp.frame.as_ptr(), s.rx_frame.as_mut_ptr(), hp.len as usize);
+        (hp.len as usize, hp.l3_off as usize)
+    };
+    let l3 = s.rx_frame.as_ptr().add(l3_off);
+    let Some(h) = ipv6::parse_ipv6(l3, len - l3_off) else {
+        return;
+    };
+    let l4 = l3.add(ipv6::IPV6_HEADER_LEN);
+    match response {
+        pkt::reject::TCP_RST if h.next_header == ipv6::NH_TCP => {
+            let Some(t) = tcp::parse_tcp(l4, h.payload_len) else {
+                return;
+            };
+            if t.flags & tcp::RST != 0 {
+                return;
+            }
+            let (seq, ack, flags) = if (t.flags & tcp::ACK) != 0 {
+                (t.ack_num, 0u32, tcp::RST)
+            } else {
+                let ack = t.seq_num.wrapping_add(tcp::seg_len(t.flags, t.payload_len));
+                (0u32, ack, tcp::RST | tcp::ACK)
+            };
+            let out = s
+                .tx_frame
+                .as_mut_ptr()
+                .add(eth::ETH_HEADER_LEN + ipv6::IPV6_HEADER_LEN);
+            tcp::build_tcp_header(out, t.dst_port, t.src_port, seq, ack, flags, 0);
+            let (src, dst) = (h.dst, h.src);
+            send_v6_reply(s, ipv6::NH_TCP, 64, &src, &dst, tcp::TCP_HEADER_LEN, 16);
+        }
+        pkt::reject::ICMP_UNREACHABLE => {
+            let whole = ipv6::IPV6_HEADER_LEN + h.payload_len;
+            let quoted = whole.min(ipv6::MIN_MTU - ipv6::IPV6_HEADER_LEN - 8);
+            let out = s
+                .tx_frame
+                .as_mut_ptr()
+                .add(eth::ETH_HEADER_LEN + ipv6::IPV6_HEADER_LEN);
+            *out = ipv6::ICMPV6_UNREACHABLE;
+            *out.add(1) = ipv6::ICMPV6_UNREACH_PORT;
+            let mut k = 2;
+            while k < 8 {
+                *out.add(k) = 0;
+                k += 1;
+            }
+            core::ptr::copy_nonoverlapping(l3, out.add(8), quoted);
+            let (src, dst) = (h.dst, h.src);
+            send_v6_reply(s, ipv6::NH_ICMPV6, 64, &src, &dst, 8 + quoted, 2);
+        }
+        _ => {}
     }
 }
 
@@ -5913,11 +7087,9 @@ struct DgAddr {
 /// The stub resolver's answers arrive on the port it holds and are claimed
 /// ahead of the endpoint walk: no consumer can bind that port, so nothing
 /// behind it could want them. Everything else goes to the matching datagram
-/// endpoint with its source (`MSG_DG_RX_FROM`). Bind admission: a wildcard
-/// endpoint serves slot 0 and unowned secondaries, but an OWNED secondary is
-/// served only by an endpoint bound to it; `dst_owned` is always false with
-/// no owned secondary configured, so this collapses to a plain wildcard
-/// match.
+/// endpoint with its source (`MSG_DG_RX_FROM`). Which endpoint serves which
+/// address is [`bind_serves`]: an owned workload address is served only by
+/// its owner's own endpoint, never by the wildcard.
 unsafe fn udp_demux(s: &mut IpState, a: &DgAddr, payload: *const u8, payload_len: usize) {
     let DgAddr {
         src_ip,
@@ -5948,14 +7120,13 @@ unsafe fn udp_demux(s: &mut IpState, a: &DgAddr, payload: *const u8, payload_len
             return;
         }
     }
-    let dst_owned = slot_is_owned(s, dst_slot);
     let mut i = 0;
     while i < MAX_DG_ENDPOINTS {
         let conn = &*s.tcp_conns.ptr(i);
         if conn.is_datagram
             && conn.state == tcp::TcpState::Listen
             && conn.local_port == dst_port
-            && (conn.local_slot == dst_slot || (conn.local_slot == LOCAL_SLOT_ANY && !dst_owned))
+            && bind_serves(s, conn.local_slot, conn.owner_tag, dst_slot)
         {
             let (mut from_ip, mut from_port) = (src_ip, src_port);
             let lane = conn.lane;
@@ -6054,8 +7225,7 @@ unsafe fn process_tcp_segment(
             // SYN-ACK.
             if (tcp_hdr.flags & tcp::SYN) != 0
                 && (tcp_hdr.flags & tcp::ACK) == 0
-                && s.mac_valid
-                && s.local_ip != 0
+                && can_reach(s, ip_hdr.src_ip)
             {
                 let dst_owned = slot_is_owned(s, local_slot);
                 // A stream to a workload address is judged at its SYN, as
@@ -6072,8 +7242,7 @@ unsafe fn process_tcp_segment(
                 {
                     return;
                 }
-                if let Some(li) = find_listener_indexed(s, tcp_hdr.dst_port, local_slot, dst_owned)
-                {
+                if let Some(li) = find_listener_indexed(s, tcp_hdr.dst_port, local_slot) {
                     // A connection cannot be opened without an ISN secret:
                     // a predictable ISS is an off-path injection surface, so
                     // the SYN is dropped and the client retransmits.
@@ -6136,12 +7305,17 @@ unsafe fn process_tcp_segment(
                         ip_hdr.src_ip,
                         tcp_hdr.src_port,
                     );
-                    let lane = (*s.tcp_conns.ptr(li)).lane;
+                    let (lane, owner) = {
+                        let l = &*s.tcp_conns.ptr(li);
+                        (l.lane, l.owner_tag)
+                    };
                     let conn = &mut *s.tcp_conns.ptr_mut(idx);
                     *conn = tcp::TcpConn::new();
                     conn.local_port = listener_port;
-                    // An accepted connection belongs to its listener's lane.
+                    // An accepted connection belongs to its listener's lane
+                    // and owner.
                     conn.lane = lane;
+                    conn.owner_tag = owner;
                     // Latch the local address this SYN arrived at so replies
                     // source from it and the demux axis distinguishes it.
                     conn.local_slot = local_slot;
@@ -6172,9 +7346,22 @@ unsafe fn process_tcp_segment(
                 CookieAccept::Absorbed => return,
                 CookieAccept::NotACookie => {
                     // No listener either — send RST if not RST, sourced from
-                    // the exact local address the segment targeted.
-                    if (tcp_hdr.flags & tcp::RST) == 0 && s.mac_valid && s.local_ip != 0 {
-                        let rst_src = local_ip_for_slot(s, local_slot);
+                    // the exact local address the segment targeted; unless
+                    // the flow is arriving here as a shadow or was retired
+                    // from here, when it is dropped silently.
+                    let rst_src = local_ip_for_slot(s, local_slot);
+                    if (tcp_hdr.flags & tcp::RST) == 0
+                        && continuity::suppresses_reset(
+                            s,
+                            rst_src,
+                            ip_hdr.src_ip,
+                            tcp_hdr.dst_port,
+                            tcp_hdr.src_port,
+                        )
+                    {
+                        return;
+                    }
+                    if (tcp_hdr.flags & tcp::RST) == 0 && can_reach(s, ip_hdr.src_ip) {
                         send_tcp_rst(
                             s,
                             ip_hdr.src_ip,
@@ -6285,7 +7472,14 @@ unsafe fn process_tcp_segment(
                             // New data acknowledged.
                             acked_new = true;
                             tcp::on_new_ack(conn);
-                            tcp::rtt_ack(conn, tcp_hdr.ack_num, s.step_count as u16);
+                            tcp::rtt_ack(conn, tcp_hdr.ack_num, dev_millis(&*s.syscalls) as u32);
+                            if tcp::partial_ack(conn) {
+                                // Recovery is not over: the next hole is
+                                // resent now rather than at another RTO.
+                                net_send_fast_retransmit = true;
+                                net_send_fast_retransmit_conn = conn_idx as u16;
+                                net_send_fast_retransmit_seq = conn.snd_una;
+                            }
                         } else if tcp_hdr.ack_num == prev_una && tcp_hdr.payload_len == 0 {
                             // Duplicate ACK (no new data, no new ACK).
                             if tcp::on_dup_ack(conn) {
@@ -6497,7 +7691,7 @@ unsafe fn process_tcp_segment(
         }
         ACTION_SET_CLOSED => {
             let remote_ip = (*s.tcp_conns.ptr(conn_idx)).remote_ip;
-            let delivered = net_send_closed(s, conn_idx as u16);
+            let delivered = net_send_closed(s, conn_idx as u16, CLOSED_GONE);
             let conn = &mut *s.tcp_conns.ptr_mut(conn_idx);
             if delivered {
                 if remote_ip != 0 {
@@ -6513,9 +7707,9 @@ unsafe fn process_tcp_segment(
         }
         ACTION_SET_CLOSING => {
             send_tcp_control(s, conn_idx, tcp::ACK, false);
-            if !net_send_closed(s, conn_idx as u16) {
+            if !net_send_closed(s, conn_idx as u16, CLOSED_PEER_FIN) {
                 let conn = &mut *s.tcp_conns.ptr_mut(conn_idx);
-                conn.pending_close_notify = NOTIFY_CLOSED;
+                conn.pending_close_notify = NOTIFY_PEER_FIN;
             }
         }
         ACTION_RX_DATA | ACTION_RX_DATA_FIN => {
@@ -6532,6 +7726,7 @@ unsafe fn process_tcp_segment(
                 conn.rcv_wnd = 0;
                 send_tcp_control(s, conn_idx, tcp::ACK, false);
                 continuity::after_segment(s, conn_idx, state_before, rcv_before, acked_new);
+                report_ack(s, conn_idx, false);
                 return;
             }
             {
@@ -6574,9 +7769,10 @@ unsafe fn process_tcp_segment(
             }
             update_rcv_wnd(s, conn_idx);
             send_tcp_control(s, conn_idx, tcp::ACK, false);
-            if action == ACTION_RX_DATA_FIN && !net_send_closed(s, conn_idx as u16) {
+            if action == ACTION_RX_DATA_FIN && !net_send_closed(s, conn_idx as u16, CLOSED_PEER_FIN)
+            {
                 let conn = &mut *s.tcp_conns.ptr_mut(conn_idx);
-                conn.pending_close_notify = NOTIFY_CLOSED;
+                conn.pending_close_notify = NOTIFY_PEER_FIN;
             }
         }
         ACTION_COMPLETE_ACCEPT => {
@@ -6635,6 +7831,9 @@ unsafe fn process_tcp_segment(
     if (*s.tcp_conns.ptr(conn_idx)).is_active() {
         continuity::after_segment(s, conn_idx, state_before, rcv_before, acked_new);
     }
+
+    // What the peer acknowledged, to the consumer that retains the bytes.
+    report_ack(s, conn_idx, false);
 
     // Fast retransmit — signal the consumer to resend from `snd_una`.
     if net_send_fast_retransmit {
@@ -6823,7 +8022,7 @@ unsafe fn send_tcp_rst(
     hdr: &tcp::TcpHeader,
     local_src: u32,
 ) {
-    if !s.mac_valid || s.local_ip == 0 {
+    if !can_reach(s, remote_ip) {
         return;
     }
 
@@ -6843,7 +8042,7 @@ unsafe fn send_tcp_rst(
     };
 
     // Resolve MAC
-    let dst_mac = resolve_mac(s, remote_ip);
+    let dst_mac = resolve_mac(s, remote_ip, local_src);
     let dst_mac = match dst_mac {
         Some(m) => m,
         None => return,
@@ -6948,14 +8147,13 @@ unsafe fn try_cookie_accept(
     if (tcp_hdr.flags & tcp::ACK) == 0
         || (tcp_hdr.flags & (tcp::SYN | tcp::RST | tcp::FIN)) != 0
         || !s.isn_secret_valid
-        || !s.mac_valid
-        || s.local_ip == 0
+        || !can_reach(s, ip_hdr.src_ip)
         || !tcp::cookie_mode_admissible(tcp_hdr)
     {
         return CookieAccept::NotACookie;
     }
     let dst_owned = slot_is_owned(s, local_slot);
-    let li = match find_listener_indexed(s, tcp_hdr.dst_port, local_slot, dst_owned) {
+    let li = match find_listener_indexed(s, tcp_hdr.dst_port, local_slot) {
         Some(i) => i,
         None => return CookieAccept::NotACookie,
     };
@@ -7001,11 +8199,15 @@ unsafe fn try_cookie_accept(
     // construction. The block is installed one step short of `Established`
     // so the shared admissibility gate and state machine complete it.
     let idx = accept_idx as usize;
-    let lane = (*s.tcp_conns.ptr(li)).lane;
+    let (lane, owner) = {
+        let l = &*s.tcp_conns.ptr(li);
+        (l.lane, l.owner_tag)
+    };
     let conn = &mut *s.tcp_conns.ptr_mut(idx);
     *conn = tcp::TcpConn::new();
     conn.local_port = listener_port;
     conn.lane = lane;
+    conn.owner_tag = owner;
     conn.local_slot = local_slot;
     conn.remote_ip = ip_hdr.src_ip;
     conn.remote_port = tcp_hdr.src_port;
@@ -7041,10 +8243,10 @@ unsafe fn send_syn_ack_cookie(
     cookie: u32,
     rcv_nxt: u32,
 ) {
-    if !s.mac_valid || s.local_ip == 0 {
+    if !can_reach(s, remote_ip) {
         return;
     }
-    let dst_mac = match resolve_mac(s, remote_ip) {
+    let dst_mac = match resolve_mac(s, remote_ip, local_src) {
         Some(m) => m,
         None => return,
     };
@@ -7108,7 +8310,7 @@ unsafe fn send_syn_ack_cookie(
 /// no effect on them. Returns `true` iff the frame was queued; the
 /// caller defers state transitions on backpressured SYN/FIN.
 unsafe fn send_tcp_control(s: &mut IpState, conn_idx: usize, flags: u8, retransmit: bool) -> bool {
-    if !s.mac_valid || s.local_ip == 0 {
+    if !can_reach(s, (*s.tcp_conns.ptr(conn_idx)).remote_ip) {
         return false;
     }
 
@@ -7206,6 +8408,26 @@ unsafe fn send_tcp_data(
     payload: *const u8,
     payload_len: usize,
 ) -> bool {
+    let seq = (*s.tcp_conns.ptr(conn_idx)).snd_nxt;
+    if !send_tcp_payload(s, conn_idx, seq, payload, payload_len) {
+        return false;
+    }
+    (*s.tcp_conns.ptr_mut(conn_idx)).snd_nxt = (*s.tcp_conns.ptr_mut(conn_idx))
+        .snd_nxt
+        .wrapping_add(payload_len as u32);
+    true
+}
+
+/// One data segment carrying `payload` at sequence `seq`, which moves
+/// nothing: `send_tcp_data` allocates new bytes with it, a resend sends
+/// allocated ones again.
+unsafe fn send_tcp_payload(
+    s: &mut IpState,
+    conn_idx: usize,
+    seq: u32,
+    payload: *const u8,
+    payload_len: usize,
+) -> bool {
     // The frame builder's own precondition: `payload` is copied into the
     // fixed `tx_frame`, and the caller's stash buffer is larger than that
     // frame on aarch64. Refuse before the copy rather than trusting the
@@ -7213,7 +8435,7 @@ unsafe fn send_tcp_data(
     if payload_len > MAX_TCP_TX_PAYLOAD {
         return false;
     }
-    if !s.mac_valid || s.local_ip == 0 || payload_len == 0 {
+    if !can_reach(s, (*s.tcp_conns.ptr(conn_idx)).remote_ip) || payload_len == 0 {
         return false;
     }
 
@@ -7221,7 +8443,6 @@ unsafe fn send_tcp_data(
     let remote_ip = (*s.tcp_conns.ptr_mut(conn_idx)).remote_ip;
     let local_port = (*s.tcp_conns.ptr_mut(conn_idx)).local_port;
     let remote_port = (*s.tcp_conns.ptr_mut(conn_idx)).remote_port;
-    let snd_nxt = (*s.tcp_conns.ptr_mut(conn_idx)).snd_nxt;
     let rcv_nxt = (*s.tcp_conns.ptr_mut(conn_idx)).rcv_nxt;
     let rcv_nxt = continuity::ack_exposed(s, conn_idx, rcv_nxt);
     let rcv_wnd = (*s.tcp_conns.ptr_mut(conn_idx)).rcv_wnd;
@@ -7242,7 +8463,7 @@ unsafe fn send_tcp_data(
         tcp_start,
         local_port,
         remote_port,
-        snd_nxt,
+        seq,
         rcv_nxt,
         tcp::ACK | tcp::PSH,
         rcv_wnd,
@@ -7279,13 +8500,7 @@ unsafe fn send_tcp_data(
     );
 
     let total = eth::ETH_HEADER_LEN + ip_total as usize;
-    if !send_frame(s, s.tx_frame.as_ptr(), total) {
-        return false;
-    }
-    (*s.tcp_conns.ptr_mut(conn_idx)).snd_nxt = (*s.tcp_conns.ptr_mut(conn_idx))
-        .snd_nxt
-        .wrapping_add(payload_len as u32);
-    true
+    send_frame(s, s.tx_frame.as_ptr(), total)
 }
 
 /// Return true if `dst` is an IPv4 broadcast address we must not emit
@@ -7312,17 +8527,23 @@ fn is_broadcast_dst(dst: u32, local_ip: u32, netmask: u32) -> bool {
 
 /// Where endpoint `ep`'s datagram to `(dst_ip, dst_port)` leaves from.
 ///
-/// The node's own endpoints, and every datagram delivered on this node,
-/// leave as bound. A workload's endpoint keeps a flow per peer it sends to
-/// (`flows.rs`) — refused `ENOBUFS` when its lane is at its floor and the
-/// shared part is spent. Bound to the workload's own address, it is reached
-/// there by its cluster; to a destination outside the cluster prefixes it
-/// leaves from the node's address and the endpoint's egress port, and the
-/// flow is what lets the reply back in.
+/// The address it leaves from is the endpoint's own of the destination's
+/// family ([`endpoint_source`]; `ENETUNREACH` for a family its owner holds no
+/// address of). The node's own endpoints, and every datagram delivered on
+/// this node, leave from there. A workload's endpoint keeps a flow per peer
+/// it sends to (`flows.rs`) — refused `ENOBUFS` when its lane is at its floor
+/// and the shared part is spent. From the workload's own IPv4 address it is
+/// reached there by its cluster; to an IPv4 destination outside the cluster
+/// prefixes it leaves from the node's address and the endpoint's egress
+/// port, and the flow is what lets the reply back in. IPv6 is never
+/// translated: it always leaves from the workload's own IPv6 address.
 unsafe fn dg_route(s: &mut IpState, ep: usize, dst_ip: u32, dst_port: u16) -> Result<UdpTo, i8> {
-    let (slot, port, lane) = {
+    let v6 = v6t::is_peer(dst_ip);
+    let via = v6t::peer_index(dst_ip).map_or(0, |i| s.v6_peers[i].via_slot);
+    let slot = endpoint_source(s, ep, v6, via)?;
+    let (port, lane) = {
         let c = &*s.tcp_conns.ptr(ep);
-        (c.local_slot, c.local_port, c.lane)
+        (c.local_port, c.lane)
     };
     let mut to = UdpTo {
         src_slot: slot,
@@ -7350,8 +8571,10 @@ unsafe fn dg_route(s: &mut IpState, ep: usize, dst_ip: u32, dst_port: u16) -> Re
             };
             let local = local_delivery_slot(s, peer_ip).is_some();
             let owned = slot != LOCAL_SLOT_ANY && slot != 0;
-            let via_egress =
-                !local && owned && !route::in_cluster(s, local_ip_for_slot(s, slot), peer_ip);
+            let via_egress = !v6
+                && !local
+                && owned
+                && !route::in_cluster(s, local_ip_for_slot(s, slot), peer_ip);
             if lane != 0 {
                 let src = local_ip_for_slot(s, slot);
                 let dst_lane = match local_delivery_slot(s, peer_ip) {
@@ -7473,12 +8696,17 @@ unsafe fn send_udp_data(s: &mut IpState, to: &UdpTo, payload: *const u8, payload
         dst_ip,
         dst_port,
     } = *to;
-    if payload_len > MAX_UDP_TX_PAYLOAD {
+    let max = if v6t::is_peer(dst_ip) {
+        v6t::V6T_UDP_MAX
+    } else {
+        MAX_UDP_TX_PAYLOAD
+    };
+    if payload_len > max {
         s.drops.udp_oversize = s.drops.udp_oversize.wrapping_add(1);
         return E_MSGSIZE;
     }
 
-    if !s.mac_valid || s.local_ip == 0 || payload_len == 0 {
+    if !can_reach(s, dst_ip) || payload_len == 0 {
         if payload_len == 0 {
             s.drops.udp_empty = s.drops.udp_empty.wrapping_add(1);
         }
@@ -7526,7 +8754,7 @@ unsafe fn send_udp_data(s: &mut IpState, to: &UdpTo, payload: *const u8, payload
         return E_NETUNREACH;
     }
 
-    let dst_mac = resolve_mac(s, dst_ip);
+    let dst_mac = resolve_mac(s, dst_ip, src_ip);
     let dst_mac = match dst_mac {
         Some(m) => m,
         None => {
@@ -7588,7 +8816,7 @@ unsafe fn arm_gateway_pin(s: &mut IpState, gw: u32) {
     s.gw_pin_armed_step = s.step_count;
     // Issues the request when no other resolution is outstanding; the
     // periodic maintenance pass retries otherwise.
-    let _ = resolve_mac(s, gw);
+    let _ = resolve_mac(s, gw, 0);
 }
 
 /// How long an address resolution is waited for before the pending slot is
@@ -7638,7 +8866,7 @@ unsafe fn step_arp_maintenance(s: &mut IpState) {
         && arp::lookup(arp_tab(s), s.gw_pin_ip).is_none()
     {
         let gw = s.gw_pin_ip;
-        let _ = resolve_mac(s, gw);
+        let _ = resolve_mac(s, gw, 0);
     }
 }
 
@@ -7652,7 +8880,7 @@ unsafe fn step_arp_maintenance(s: &mut IpState) {
 /// destination inside a peer node's prefix goes to that node directly, the
 /// longest matching prefix first.
 fn next_hop(s: &IpState, dst: u32) -> Option<u32> {
-    if dst == 0xFFFF_FFFF {
+    if dst == 0xFFFF_FFFF || v6t::is_peer(dst) {
         return Some(dst);
     }
     if s.netmask == 0 || (dst & s.netmask) == (s.local_ip & s.netmask) {
@@ -7693,7 +8921,10 @@ unsafe fn conn_next_hop(s: &mut IpState, idx: usize) -> Option<u32> {
 /// The MAC connection `idx`'s segments go to.
 unsafe fn resolve_mac_conn(s: &mut IpState, idx: usize) -> Option<[u8; 6]> {
     match conn_next_hop(s, idx) {
-        Some(nh) => resolve_next_hop(s, nh),
+        Some(nh) => {
+            let src = local_ip_for_slot(s, (*s.tcp_conns.ptr(idx)).local_slot);
+            resolve_next_hop(s, nh, src)
+        }
         None => {
             s.drops.route_unreachable = s.drops.route_unreachable.wrapping_add(1);
             None
@@ -7702,7 +8933,9 @@ unsafe fn resolve_mac_conn(s: &mut IpState, idx: usize) -> Option<[u8; 6]> {
 }
 
 /// Resolve IP to MAC (returns cached entry or triggers ARP request).
-unsafe fn resolve_mac(s: &mut IpState, ip: u32) -> Option<[u8; 6]> {
+/// `src` is the local address the frame leaves from (0 when none): an IPv6
+/// neighbour is solicited from it (`v6t::resolve`).
+unsafe fn resolve_mac(s: &mut IpState, ip: u32, src: u32) -> Option<[u8; 6]> {
     // Broadcast
     if ip == 0xFFFFFFFF {
         return Some(eth::BROADCAST_MAC);
@@ -7717,13 +8950,18 @@ unsafe fn resolve_mac(s: &mut IpState, ip: u32) -> Option<[u8; 6]> {
             return None;
         }
     };
-    resolve_next_hop(s, target_ip)
+    resolve_next_hop(s, target_ip, src)
 }
 
-/// The MAC of next hop `target_ip`: cached, or an ARP request started.
-unsafe fn resolve_next_hop(s: &mut IpState, target_ip: u32) -> Option<[u8; 6]> {
+/// The MAC of next hop `target_ip`: cached, or an ARP request (an IPv6
+/// solicitation from `src`) started.
+unsafe fn resolve_next_hop(s: &mut IpState, target_ip: u32, src: u32) -> Option<[u8; 6]> {
     if target_ip == 0xFFFF_FFFF {
         return Some(eth::BROADCAST_MAC);
+    }
+    // An IPv6 peer: its neighbour, or a solicitation.
+    if v6t::is_peer(target_ip) {
+        return v6t::resolve(s, target_ip, src);
     }
 
     // Check ARP table
@@ -8135,47 +9373,102 @@ fn local_delivery_slot(s: &IpState, ip: u32) -> Option<u16> {
     }
 }
 
-/// The local-address slot a stream or datagram from the lane being served
-/// is sourced from when it is delivered on this node: the lane owner's own
-/// address when it has one, else the primary.
-fn source_slot_for_lane(s: &IpState) -> u16 {
-    // SAFETY: `cur_lane` names a lane the table holds.
-    match unsafe { lane_owner_slot(s, s.cur_lane) } {
-        LOCAL_SLOT_ANY => 0,
-        slot => slot,
-    }
-}
-
-/// The address slot lane `lane`'s owner holds (`LOCAL_SLOT_ANY` for the
-/// node's lane, or an owner with no address of its own), cached on the lane
-/// under the address-table epoch and looked up again when an address is
-/// installed or removed.
+/// The IPv4 address slot lane `lane`'s owner holds (`LOCAL_SLOT_ANY` for the
+/// node's lane, or an owner with no IPv4 address), cached on the lane under
+/// the address-table epoch and looked up again when an address is installed
+/// or removed.
 unsafe fn lane_owner_slot(s: &IpState, lane: u8) -> u16 {
     let Some(l) = lane_at(s, lane) else {
         return LOCAL_SLOT_ANY;
     };
     if l.src_epoch != s.addr_epoch || l.src_epoch == 0 {
-        l.src_slot = slot_for_owner(s, l.owner_slot).unwrap_or(LOCAL_SLOT_ANY);
+        l.src_slot = owner_slot_v4(s, l.owner_slot).unwrap_or(LOCAL_SLOT_ANY);
         l.src_epoch = s.addr_epoch.max(1);
     }
     l.src_slot
 }
 
-/// Where a stream or datagram from lane `lane` to `dst` leaves from: the
-/// owner's own address for a destination inside its segment's cluster
-/// prefixes (so the far end — and its packet policy — sees the workload),
-/// else the node's primary. The node's own lane always leaves from the
-/// primary.
-unsafe fn source_for(s: &IpState, lane: u8, dst: u32) -> u16 {
-    let slot = lane_owner_slot(s, lane);
+/// The address slot traffic of one family (`v6`) from lane `lane` leaves
+/// from, before routing.
+///
+/// A workload that holds addresses of its own uses only those: its IPv4
+/// address for IPv4, its IPv6 address for IPv6, and a family it holds no
+/// address of is unreachable to it (`ENETUNREACH`) — never sourced from the
+/// node's or another owner's address. The node's own lane, and a workload
+/// holding no address (which shares the node's, as its wildcard binds do),
+/// leave from the node's: the primary for IPv4 (`LOCAL_SLOT_ANY`), the node's
+/// own first armed IPv6 address for IPv6.
+unsafe fn lane_source(s: &IpState, lane: u8, v6: bool) -> Result<u16, i8> {
+    let v4_slot = lane_owner_slot(s, lane);
+    let v6_slot = lane_at(s, lane).and_then(|l| v6t::owner_slot(s, l.owner_slot));
+    if v4_slot == LOCAL_SLOT_ANY && v6_slot.is_none() {
+        return if v6 {
+            v6t::node_slot(s, 0).ok_or(E_NETUNREACH)
+        } else {
+            Ok(LOCAL_SLOT_ANY)
+        };
+    }
+    if v6 {
+        v6_slot.ok_or(E_NETUNREACH)
+    } else if v4_slot != LOCAL_SLOT_ANY {
+        Ok(v4_slot)
+    } else {
+        Err(E_NETUNREACH)
+    }
+}
+
+/// Where a stream or datagram from lane `lane` to `dst` leaves from
+/// ([`lane_source`] for its family). An IPv4 workload's traffic to a
+/// destination inside its segment's cluster prefixes leaves from its own
+/// address (so the far end — and its packet policy — sees the workload);
+/// to anything else, from the node's primary, as the node's own IPv4
+/// always does.
+unsafe fn source_for(s: &IpState, lane: u8, dst: u32) -> Result<u16, i8> {
+    let v6 = v6t::is_peer(dst);
+    let slot = lane_source(s, lane, v6)?;
+    if v6 {
+        return Ok(slot);
+    }
     if slot == LOCAL_SLOT_ANY || slot == 0 {
-        return 0;
+        return Ok(0);
     }
     if route::in_cluster(s, local_ip_for_slot(s, slot), dst) {
-        slot
+        Ok(slot)
     } else {
-        0
+        Ok(0)
     }
+}
+
+/// The address slot datagram endpoint `ep`'s traffic of one family (`v6`)
+/// leaves from, before routing.
+///
+/// The bound slot itself when it is of that family. An owner's endpoint
+/// (a concrete anchor) otherwise leaves from the same owner's address of
+/// that family, and from nothing else: none is `ENETUNREACH`. The wildcard,
+/// and a concrete slot bound as the node, leave from the node's: the primary
+/// for IPv4 (`LOCAL_SLOT_ANY`), for IPv6 the node's own address the peer
+/// last reached (`via`), else its first armed one.
+unsafe fn endpoint_source(s: &IpState, ep: usize, v6: bool, via: u16) -> Result<u16, i8> {
+    let c = &*s.tcp_conns.ptr(ep);
+    let (bound, owner, lane) = (c.local_slot, c.owner_tag, c.lane);
+    if slot_is_family(s, bound, v6) && owner_tag_for_slot(s, bound) == owner {
+        return Ok(bound);
+    }
+    if bound == LOCAL_SLOT_ANY || owner == 0 {
+        return if v6 {
+            v6t::node_slot(s, via).ok_or(E_NETUNREACH)
+        } else {
+            Ok(LOCAL_SLOT_ANY)
+        };
+    }
+    let slot = if v6 {
+        v6t::owner_slot(s, owner)
+    } else if lane != 0 {
+        Some(lane_owner_slot(s, lane)).filter(|&k| k != LOCAL_SLOT_ANY)
+    } else {
+        owner_slot_v4(s, owner)
+    };
+    slot.ok_or(E_NETUNREACH)
 }
 
 // ── Packet policy (the evaluator is `policy.rs`) ──
@@ -8223,14 +9516,13 @@ unsafe fn policy_allows(s: &mut IpState, src: u32, dst: u32, proto: u8, dport: u
 /// The lane of the datagram endpoint a same-node datagram to
 /// `(dst_slot, port)` would reach (0 when none, or the node's).
 unsafe fn dg_lane_for(s: &IpState, dst_slot: u16, port: u16) -> u8 {
-    let dst_owned = slot_is_owned(s, dst_slot);
     let mut i = 0;
     while i < MAX_DG_ENDPOINTS {
         let c = &*s.tcp_conns.ptr(i);
         if c.is_datagram
             && c.state == tcp::TcpState::Listen
             && c.local_port == port
-            && (c.local_slot == dst_slot || (c.local_slot == LOCAL_SLOT_ANY && !dst_owned))
+            && bind_serves(s, c.local_slot, c.owner_tag, dst_slot)
         {
             return c.lane;
         }
@@ -8240,25 +9532,32 @@ unsafe fn dg_lane_for(s: &IpState, dst_slot: u16, port: u16) -> u8 {
 }
 
 /// Serve a CMD_CONNECT_TO addressed to this host (see `loopback_peer`):
-/// find the listener the SYN demux would — `(dst slot, dst_owned)`, so an
-/// owned workload address is served only by a listener bound to it — bind
+/// find the listener the SYN demux would ([`bind_serves`], so an owned
+/// workload address is served only by its owner's own listener), bind
 /// a conn-slot PAIR as `Established`, and notify both consumers. Failure
 /// surfaces exactly like the TCP path's: ECONNREFUSED when nothing listens,
 /// EPERM when packet policy refuses the stream, ENOMEM when the table is full,
-/// ENOBUFS when the dialling lane holds its declared fast-path pairs — a
+/// ENOBUFS when the dialling lane holds its declared fast-path pairs,
+/// ENETUNREACH when the dialling workload holds no IPv4 address — a
 /// consumer cannot tell the fastpath from a real connect.
 ///
 /// The halves keep `remote_ip == 0`: that is what identifies a pair to
 /// every path that must treat one specially (indexing, ARP pinning, close,
 /// continuity). Each half's peer is derived from the other.
 unsafe fn connect_loopback(s: &mut IpState, dst_slot: u16, port: u16, requester_tag: RequesterTag) {
-    let dst_owned = slot_is_owned(s, dst_slot);
     // A listener must exist BEFORE the pair is allocated.
-    let Some(li) = find_listener_indexed(s, port, dst_slot, dst_owned) else {
+    let Some(li) = find_listener_indexed(s, port, dst_slot) else {
         let _ = net_send_reply_error(s, -111, requester_tag); // ECONNREFUSED
         return;
     };
-    let src_slot = source_slot_for_lane(s);
+    let src_slot = match lane_source(s, s.cur_lane, false) {
+        Ok(LOCAL_SLOT_ANY) => 0,
+        Ok(slot) => slot,
+        Err(e) => {
+            let _ = net_send_reply_error(s, e, requester_tag);
+            return;
+        }
+    };
     let listener_lane = (*s.tcp_conns.ptr(li)).lane;
     let dialler_lane = s.cur_lane;
     // Packet policy judges the stream once, at connect, as a SYN between
@@ -8387,11 +9686,11 @@ unsafe fn close_loopback(s: &mut IpState, conn_id: usize) {
     loopback_unpair(s, conn_id);
     // MSG_CLOSED goes to each half's lane before the slot is released (a
     // released slot has no lane to route by).
-    let _ = net_send_closed(s, conn_id as u16);
+    let _ = net_send_closed(s, conn_id as u16, CLOSED_GONE);
     conn_reset(s, conn_id);
     if peer >= 0 && (peer as usize) < s.tcp_conns.len() {
         let pi = peer as usize;
-        let _ = net_send_closed(s, peer as u16);
+        let _ = net_send_closed(s, peer as u16, CLOSED_GONE);
         conn_reset(s, pi);
     }
 }
@@ -8433,7 +9732,7 @@ unsafe fn process_cmd_close(s: &mut IpState, conn_id: usize) -> bool {
         tcp::TcpState::Listen => {
             // Close a listening socket
             conn_reset(s, conn_id);
-            net_send_closed(s, conn_id as u16);
+            net_send_closed(s, conn_id as u16, CLOSED_GONE);
             true
         }
         _ => {
@@ -8443,7 +9742,7 @@ unsafe fn process_cmd_close(s: &mut IpState, conn_id: usize) -> bool {
                 arp::unpin(arp_tab(s), remote_ip);
             }
             conn_reset(s, conn_id);
-            net_send_closed(s, conn_id as u16);
+            net_send_closed(s, conn_id as u16, CLOSED_GONE);
             true
         }
     }
@@ -8505,13 +9804,12 @@ unsafe fn try_send_cmd_payload(
             return data_off;
         }
         let chunk = (payload_len - data_off)
-            .min(tcp::MSS as usize)
+            .min(v6t::conn_mss(s, conn_id))
             .min(avail_wnd);
         if chunk == 0 {
             return data_off;
         }
         let seq = conn.snd_nxt;
-        let tick = s.step_count as u16;
         // A strict mirror sees the allocation before the wire does.
         if !continuity::send_gate(s, conn_id, seq, chunk as u16) {
             return data_off;
@@ -8523,19 +9821,64 @@ unsafe fn try_send_cmd_payload(
             return data_off;
         }
         continuity::on_sent(s, conn_id, seq, chunk as u16, false);
+        let now_ms = dev_millis(&*s.syscalls) as u32;
         let conn2 = &mut *s.tcp_conns.ptr_mut(conn_id);
-        tcp::rtt_arm(conn2, seq, tick);
+        tcp::rtt_arm(conn2, seq, now_ms);
         data_off += chunk;
     }
     data_off
+}
+
+/// Send again, at their own sequence numbers, bytes the consumer handed
+/// down before (`NET_CMD_RESEND`, `len` of them from `seq`): the part still
+/// unacknowledged and already sent, `[max(seq, SND.UNA), SND.NXT)`, up to
+/// one segment. Nothing is allocated and nothing is gated: these numbers
+/// were taken, and mirrored, when the bytes first went out. A resend that
+/// cannot go out now (no neighbour, the NIC full) is dropped; the
+/// retransmission timer asks again.
+unsafe fn resend_cmd_payload(
+    s: &mut IpState,
+    conn_id: usize,
+    seq: u32,
+    data: *const u8,
+    len: usize,
+) {
+    if s.loopback_peer[conn_id] >= 0 {
+        return;
+    }
+    let c = &*s.tcp_conns.ptr(conn_id);
+    let sending = matches!(
+        c.state,
+        tcp::TcpState::Established
+            | tcp::TcpState::CloseWait
+            | tcp::TcpState::FinWait1
+            | tcp::TcpState::Closing
+            | tcp::TcpState::LastAck
+    );
+    if c.is_datagram || !sending {
+        return;
+    }
+    let (una, nxt) = (c.snd_una, c.snd_nxt);
+    // The bytes the peer still lacks begin at SND.UNA, or later.
+    let from = if tcp::seq_lt(seq, una) { una } else { seq };
+    let skip = from.wrapping_sub(seq) as usize;
+    if skip >= len || !tcp::seq_lt(from, nxt) {
+        return;
+    }
+    let n = (len - skip)
+        .min(nxt.wrapping_sub(from) as usize)
+        .min(v6t::conn_mss(s, conn_id));
+    if send_tcp_payload(s, conn_id, from, data.add(skip), n) {
+        s.tcp_resent = s.tcp_resent.wrapping_add(1);
+    }
 }
 
 /// Add a secondary local address (`IP_ADDR_ADD`). No-op if the IPv4 word is
 /// zero, if the address is already configured (primary or secondary — only
 /// owner/prefix are refreshed then), or if the table is full. Sends a single
 /// same-subnet gratuitous ARP on first insertion. owner_tag stamps the
-/// slot's owner and is enforced on bind (see `slot_for_owner` /
-/// `find_listener_indexed`).
+/// slot's owner and is enforced on bind and source selection (see
+/// `slot_for_owner` / `bind_serves`).
 unsafe fn addr_ctl_add(
     s: &mut IpState,
     addr16: *const u8,
@@ -8543,20 +9886,30 @@ unsafe fn addr_ctl_add(
     owner_tag: u16,
     flags: u8,
 ) {
-    let ipv4 = u32::from_be_bytes([*addr16, *addr16.add(1), *addr16.add(2), *addr16.add(3)]);
-    if ipv4 == 0 {
-        return;
-    }
     let mut a16 = [0u8; 16];
     core::ptr::copy_nonoverlapping(addr16, a16.as_mut_ptr(), 16);
+    if flags & netid::install::FAMILY6 != 0 {
+        addr_ctl_add6(s, &a16, prefix_len, owner_tag, flags);
+        return;
+    }
+    let ipv4 = u32::from_be_bytes([*addr16, *addr16.add(1), *addr16.add(2), *addr16.add(3)]);
+    if ipv4 == 0 || (v6t::V6T && v6t::is_reserved(ipv4)) {
+        return;
+    }
     if let Some(slot) = local_slot_for_dst(s, ipv4) {
         // Already present. Slot 0 (primary) is off-limits to addr_ctl; a
         // secondary just refreshes owner/prefix without re-announcing and
-        // keeps its token, generation and emission state.
+        // keeps its token, generation and emission state. A new owner
+        // inherits nothing the old one had latched to it.
         if slot != 0 {
             let a = &mut s.local_addrs[slot as usize];
             a.prefix_len = prefix_len;
+            let moved = a.owner_tag != owner_tag;
             a.owner_tag = owner_tag;
+            if moved {
+                s.addr_epoch = s.addr_epoch.wrapping_add(1).max(1);
+                release_slot_bindings(s, slot);
+            }
         }
         return;
     }
@@ -8573,7 +9926,7 @@ unsafe fn addr_ctl_add(
             s.addr_generation = s.addr_generation.wrapping_add(1);
             s.addr_epoch = s.addr_epoch.wrapping_add(1).max(1);
             let generation = s.addr_generation;
-            let armed = flags & netid::install::DISARMED == 0;
+            let armed = flags & netid::install::DISARMED == 0 && s.arm_authority == 0;
             let a = &mut s.local_addrs[i];
             a.addr = a16;
             a.token = token;
@@ -8606,16 +9959,174 @@ unsafe fn addr_ctl_add(
     addr_evt_refused(s, &a16, IP_ADDR_ADD, netid::refusal::TABLE_FULL);
 }
 
-/// Remove a secondary local address (`IP_ADDR_DEL`). The slot ages out
-/// immediately; established conns latched to it keep their concrete slot and
-/// fall back to sourcing from the primary (they close naturally). The primary
-/// (slot 0) is not removable via addr_ctl.
-unsafe fn addr_ctl_del(s: &mut IpState, ipv4: u32) {
-    if ipv4 == 0 {
+/// `IP_ADDR_ADD` of an IPv6 address (`install::FAMILY6`): a local slot
+/// standing in for it (`v6t.rs`), its token minted as an IPv4 install's is,
+/// announced by an unsolicited advertisement when installed armed.
+unsafe fn addr_ctl_add6(
+    s: &mut IpState,
+    a16: &[u8; 16],
+    prefix_len: u8,
+    owner_tag: u16,
+    flags: u8,
+) {
+    if !v6t::V6T
+        || ipv6::is_multicast(a16)
+        || ipv6::is_unspecified(a16)
+        || ipv6::is_loopback(a16)
+        || ipv6::is_v4_mapped(a16)
+    {
+        addr_evt_refused(s, a16, IP_ADDR_ADD, netid::refusal::NOT_UNICAST);
         return;
     }
-    match local_slot_for_dst(s, ipv4) {
+    if let Some(slot) = v6t::slot_of_v6(s, a16) {
+        let a = &mut s.local_addrs[slot as usize];
+        a.prefix_len = prefix_len;
+        let moved = a.owner_tag != owner_tag;
+        a.owner_tag = owner_tag;
+        if moved {
+            s.addr_epoch = s.addr_epoch.wrapping_add(1).max(1);
+            release_slot_bindings(s, slot);
+        }
+        return;
+    }
+    let Some(token) = mint_token(s) else {
+        log_info(s, b"[ip] addr_ctl add: no entropy for a token");
+        addr_evt_refused(s, a16, IP_ADDR_ADD, netid::refusal::NO_ENTROPY);
+        return;
+    };
+    let armed = flags & netid::install::DISARMED == 0 && s.arm_authority == 0;
+    let Some(slot) = v6t::install_local(
+        s,
+        a16,
+        prefix_len,
+        owner_tag,
+        if armed { ADDR_FLAG_ARMED } else { 0 },
+    ) else {
+        log_info(s, b"[ip] addr_ctl add: table full");
+        addr_evt_refused(s, a16, IP_ADDR_ADD, netid::refusal::TABLE_FULL);
+        return;
+    };
+    s.addr_generation = s.addr_generation.wrapping_add(1);
+    let generation = s.addr_generation;
+    let a = &mut s.local_addrs[slot as usize];
+    a.token = token;
+    a.generation = generation;
+    log_info(s, b"[ip] addr_ctl add (ipv6)");
+    let mut p = [0u8; 36];
+    p[..16].copy_from_slice(a16);
+    p[16..32].copy_from_slice(&token);
+    p[32..36].copy_from_slice(&generation.to_le_bytes());
+    addr_evt(s, netid::MSG_ADDR_ADDED, &p);
+    if armed {
+        v6t::announce(s, a16);
+    }
+}
+
+/// The local slot an `addr_ctl` address names: an IPv6 one held, else the
+/// IPv4 address in its first four bytes.
+fn addr_ctl_slot(s: &IpState, addr16: &[u8; 16]) -> Option<u16> {
+    if let Some(slot) = v6t::slot_of_v6(s, addr16) {
+        return Some(slot);
+    }
+    if addr16[4..].iter().any(|&b| b != 0) {
+        return None;
+    }
+    let ipv4 = u32::from_be_bytes([addr16[0], addr16[1], addr16[2], addr16[3]]);
+    if v6t::V6T && v6t::is_reserved(ipv4) {
+        return None;
+    }
+    local_slot_for_dst(s, ipv4)
+}
+
+/// Local slot `slot` no longer holds the address (or the owner) what is
+/// latched to it was made for: nothing latched to it may send again, since
+/// whatever later occupies the slot is another address, possibly another
+/// owner's.
+///
+/// - A connection — established, opening or closing — is closed with
+///   nothing on the wire (the address is no longer this node's to send
+///   from) and its consumer told: `MSG_CLOSED` (in TIME-WAIT too, which
+///   tells its consumer when it ends), or `ENETUNREACH` for a connect still
+///   opening; a handshake not yet accepted is released quietly.
+/// - A listener or datagram endpoint of an owner that still holds another
+///   address is anchored there and keeps serving it (`bind_serves`); one
+///   whose owner holds none, or bound to the slot as the node, is closed
+///   (`MSG_CLOSED`, `MSG_DG_CLOSED`).
+/// - A shadow decoded onto the slot waits for a fresh checkpoint.
+///
+/// Called with the slot's entry already cleared or re-owned. A control-plane
+/// operation, it walks the table once, as `lane_close` does.
+unsafe fn release_slot_bindings(s: &mut IpState, slot: u16) {
+    let mut i = 0;
+    while i < s.tcp_conns.len() {
+        let (latched, state, dg, owner) = {
+            let c = &*s.tcp_conns.ptr(i);
+            (
+                c.local_slot == slot && c.is_active(),
+                c.state,
+                c.is_datagram,
+                c.owner_tag,
+            )
+        };
+        if !latched {
+            i += 1;
+            continue;
+        }
+        if state == tcp::TcpState::Listen {
+            match slot_for_owner(s, owner) {
+                Some(anchor) => (*s.tcp_conns.ptr_mut(i)).local_slot = anchor,
+                None if dg => {
+                    dg_send_closed(s, i as u8);
+                    conn_reset(s, i);
+                }
+                None => close_released(s, i, NOTIFY_CLOSED),
+            }
+        } else if state == tcp::TcpState::SynReceived {
+            // Never announced: no consumer to tell, no neighbour pinned.
+            conn_reset(s, i);
+        } else if state == tcp::TcpState::SynSent {
+            close_released(s, i, NOTIFY_ERROR_UNREACH);
+        } else {
+            close_released(s, i, NOTIFY_CLOSED);
+        }
+        i += 1;
+    }
+    continuity::on_slot_removed(s, slot);
+}
+
+/// Close connection `idx` with nothing on the wire and tell its consumer
+/// (`kind`: `NOTIFY_CLOSED` or `NOTIFY_ERROR_UNREACH`): the slot frees now
+/// when the notice is delivered, else it is latched `Closed` — inert from
+/// here — until the timer sweep delivers it.
+unsafe fn close_released(s: &mut IpState, idx: usize, kind: u8) {
+    let tag = (*s.tcp_conns.ptr(idx)).connect_tag;
+    let delivered = if kind == NOTIFY_ERROR_UNREACH {
+        net_send_error(s, idx as u16, E_NETUNREACH, tag)
+    } else {
+        net_send_closed(s, idx as u16, CLOSED_GONE)
+    };
+    if delivered {
+        let remote_ip = (*s.tcp_conns.ptr(idx)).remote_ip;
+        if remote_ip != 0 && kind == NOTIFY_CLOSED {
+            arp::unpin(arp_tab(s), remote_ip);
+        }
+        conn_reset(s, idx);
+    } else {
+        let c = &mut *s.tcp_conns.ptr_mut(idx);
+        c.state = tcp::TcpState::Closed;
+        c.pending_close_notify = kind;
+    }
+}
+
+/// Remove a secondary local address (`IP_ADDR_DEL`). The slot ages out
+/// immediately, and nothing latched to it sends again
+/// (`release_slot_bindings`). The primary (slot 0) is not removable via
+/// addr_ctl.
+unsafe fn addr_ctl_del(s: &mut IpState, addr16: &[u8; 16]) {
+    match addr_ctl_slot(s, addr16) {
         Some(slot) if slot != 0 => {
+            let ipv4 = s.local_addrs[slot as usize].ipv4();
+            v6t::forget_local(s, slot);
             let addrs = s.local_addrs.as_ptr();
             let seed = s.index_seed;
             let _ = index::remove(
@@ -8626,6 +10137,7 @@ unsafe fn addr_ctl_del(s: &mut IpState, ipv4: u32) {
             );
             s.local_addrs[slot as usize] = LocalAddr::empty();
             s.addr_epoch = s.addr_epoch.wrapping_add(1).max(1);
+            release_slot_bindings(s, slot);
             log_info(s, b"[ip] addr_ctl del");
         }
         _ => {}
@@ -8644,7 +10156,7 @@ unsafe fn service_addr_ctl(s: &mut IpState) {
     // waits for the next tick (the port is low-rate control, not data).
     let mut count = 0;
     while count <= MAX_LOCAL_ADDRS {
-        let mut frame = [0u8; NET_FRAME_HDR + 32];
+        let mut frame = [0u8; NET_FRAME_HDR + 32 + 2 + netid::ARM_AUTH_MAX];
         let (msg_type, plen) =
             net_read_frame(sys, s.addr_ctl_chan, frame.as_mut_ptr(), frame.len());
         if msg_type == 0 {
@@ -8673,16 +10185,25 @@ unsafe fn service_addr_ctl(s: &mut IpState) {
                 a16.copy_from_slice(&buf[..16]);
                 token.copy_from_slice(&buf[netid::TOKEN_OFF..netid::TOKEN_OFF + 16]);
                 if msg_type == IP_ADDR_ARM {
-                    addr_ctl_arm(s, &a16, &token);
+                    // `[auth_len:u16][auth]` after the token, under
+                    // `arm_authority`.
+                    let at = netid::ADDR_TOKEN_PAYLOAD_LEN;
+                    let auth: &[u8] = if plen >= at + 2 {
+                        let n = u16::from_le_bytes([buf[at], buf[at + 1]]) as usize;
+                        buf.get(at + 2..at + 2 + n).unwrap_or(&[])
+                    } else {
+                        &[]
+                    };
+                    addr_ctl_arm(s, &a16, &token, auth);
                 } else {
                     addr_ctl_fence(s, &a16, &token);
                 }
             }
             // [addr:16]
             IP_ADDR_DEL if plen >= netid::ADDR_DEL_PAYLOAD_LEN => {
-                let bp = buf.as_ptr();
-                let ipv4 = u32::from_be_bytes([*bp, *bp.add(1), *bp.add(2), *bp.add(3)]);
-                addr_ctl_del(s, ipv4);
+                let mut a16 = [0u8; 16];
+                a16.copy_from_slice(&buf[..16]);
+                addr_ctl_del(s, &a16);
             }
             _ => {}
         }
@@ -8721,7 +10242,9 @@ unsafe fn service_net_channels(s: &mut IpState) {
 /// the lane being served.
 unsafe fn lane_may_command(s: &IpState, msg_type: u8, p: *const u8, plen: usize) -> bool {
     let idx = match msg_type {
-        NET_CMD_SEND | NET_CMD_CLOSE if plen >= 2 => u16::from_le_bytes([*p, *p.add(1)]) as usize,
+        NET_CMD_SEND | NET_CMD_CLOSE | NET_CMD_RESEND if plen >= 2 => {
+            u16::from_le_bytes([*p, *p.add(1)]) as usize
+        }
         DG_CMD_SEND_TO | DG_CMD_CLOSE if plen >= 1 => *p as usize,
         _ => return true,
     };
@@ -8732,9 +10255,11 @@ unsafe fn lane_may_command(s: &IpState, msg_type: u8, p: *const u8, plen: usize)
 /// errno that refuses it.
 ///
 /// A lane's bind is stamped with the lane's own owner, never with an owner
-/// tag its payload names: a workload cannot bind as another. It lands on the
-/// owner's own address when the owner has one, and on the wildcard (the
-/// node's shared addresses) when it does not. The kernel then admits it as
+/// tag its payload names: a workload cannot bind as another — the same owner
+/// `lane_claim` presents for its later commands. It is anchored at the
+/// owner's own address when the owner holds one, and serves every address it
+/// holds of either family (`bind_serves`); it lands on the wildcard (the
+/// node's shared addresses) when the owner holds none. The kernel then admits it as
 /// it admits a bind for a built-in provider (`NET_LANE_ADMIT`): refused while
 /// the owner drains or is gone, and refused for a port the committed plan
 /// does not lease to it.
@@ -8751,19 +10276,10 @@ unsafe fn lane_bind_target(s: &IpState, protocol: u8, port: u16) -> Result<(u16,
     if rc < 0 {
         return Err(rc as i8);
     }
-    match slot_for_owner(s, l.owner_slot) {
-        Some(slot) => Ok((l.owner_slot, slot)),
-        None => Ok((0, LOCAL_SLOT_ANY)),
-    }
-}
-
-/// Whether listeners on `a` and `b` would both be offered the same SYN: the
-/// same slot, or the wildcard against a slot no owner holds (the wildcard is
-/// never served on an owned address).
-fn listen_slots_overlap(s: &IpState, a: u16, b: u16) -> bool {
-    a == b
-        || (a == LOCAL_SLOT_ANY && !slot_is_owned(s, b))
-        || (b == LOCAL_SLOT_ANY && !slot_is_owned(s, a))
+    Ok((
+        l.owner_slot,
+        slot_for_owner(s, l.owner_slot).unwrap_or(LOCAL_SLOT_ANY),
+    ))
 }
 
 /// Lanes attached now.
@@ -8912,8 +10428,18 @@ unsafe fn lane_close(s: &mut IpState, lane: u8) {
             )
         };
         if mine && live {
-            if !dg && (*s.tcp_conns.ptr(idx)).remote_ip != 0 {
+            let (remote_ip, state) = {
+                let c = &*s.tcp_conns.ptr(idx);
+                (c.remote_ip, c.state)
+            };
+            if !dg && remote_ip != 0 {
                 let _ = send_tcp_control(s, idx, tcp::RST | tcp::ACK, false);
+                if !matches!(
+                    state,
+                    tcp::TcpState::Listen | tcp::TcpState::SynSent | tcp::TcpState::SynReceived
+                ) {
+                    arp::unpin(arp_tab(s), remote_ip);
+                }
             }
             conn_reset(s, idx);
         } else if mine {
@@ -9094,7 +10620,13 @@ unsafe fn service_net_channel(s: &mut IpState) {
                                 && conn.local_port == port
                             {
                                 if conn.lane != s.cur_lane {
-                                    if listen_slots_overlap(s, conn.local_slot, target_slot) {
+                                    if binds_overlap(
+                                        s,
+                                        conn.local_slot,
+                                        conn.owner_tag,
+                                        target_slot,
+                                        owner_tag,
+                                    ) {
                                         taken = true;
                                         break;
                                     }
@@ -9148,7 +10680,7 @@ unsafe fn service_net_channel(s: &mut IpState) {
                 net_send_reply_error(s, -38, tag); // ENOSYS
             }
             NET_CMD_CONNECT_TO => {
-                // Stream Surface v1: open a TCP outbound connection to a
+                // Stream surface: open a TCP outbound connection to a
                 // target: `[sock_type][af][port: u16 LE][addr…][tag?]`.
                 // Only TCP is accepted here; UDP uses the `datagram`
                 // surface (`CMD_DG_BIND` + `CMD_DG_SEND_TO`).
@@ -9163,11 +10695,27 @@ unsafe fn service_net_channel(s: &mut IpState) {
                                 Target::V4(a) => {
                                     connect_v4(s, u32::from_be_bytes(a), port, requester_tag);
                                 }
-                                // No IPv6 stack: a v6 literal cannot be dialled.
-                                Target::V6(_) => {
-                                    net_send_reply_error(s, -22, requester_tag);
-                                    // EINVAL
-                                }
+                                // IPv6 (`v6t.rs`): dialled from an IPv6
+                                // address of the dialler's own, through the
+                                // peer's stand-in.
+                                Target::V6(a) => match lane_source(s, s.cur_lane, true) {
+                                    Err(e) => {
+                                        let _ = net_send_reply_error(s, e, requester_tag);
+                                    }
+                                    Ok(_) => match v6t::dial(s, &a) {
+                                        Some(standin) => {
+                                            connect_v4_to(s, standin, port, requester_tag)
+                                        }
+                                        // Not a unicast address, or no peer room.
+                                        None => {
+                                            let _ = net_send_reply_error(
+                                                s,
+                                                E_NETUNREACH,
+                                                requester_tag,
+                                            );
+                                        }
+                                    },
+                                },
                                 Target::Name(name) => {
                                     connect_by_name(s, name, port, requester_tag);
                                 }
@@ -9186,7 +10734,7 @@ unsafe fn service_net_channel(s: &mut IpState) {
                 }
             }
             NET_CMD_SEND => {
-                // Stream Surface v1: send TCP payload.
+                // Stream surface: send TCP payload.
                 // Payload: `[conn_id: u16 LE][data...]`. A single CMD_SEND
                 // can carry many MSS; `try_send_cmd_payload` segments
                 // into MSS-sized writes against the peer window, and
@@ -9227,6 +10775,18 @@ unsafe fn service_net_channel(s: &mut IpState) {
                         // Conn not in a sendable state — drop. Upstream
                         // owns re-delivery (CMD_CLOSE raced CMD_SEND,
                         // or peer RST'd before delivery).
+                    }
+                }
+            }
+            NET_CMD_RESEND => {
+                // The consumer's answer to MSG_RETRANSMIT:
+                // `[conn_id: u16 LE][seq: u32 LE][data...]`.
+                if plen > 6 {
+                    let conn_id =
+                        u16::from_le_bytes([*buf.as_ptr(), *buf.as_ptr().add(1)]) as usize;
+                    let seq = u32::from_le_bytes([buf[2], buf[3], buf[4], buf[5]]);
+                    if conn_id < s.tcp_conns.len() {
+                        resend_cmd_payload(s, conn_id, seq, buf.as_ptr().add(6), plen - 6);
                     }
                 }
             }
@@ -9437,6 +10997,28 @@ unsafe fn service_net_channel(s: &mut IpState) {
                         } else {
                             None
                         }
+                    } else if af == abi::contracts::net::datagram::AF_INET6 {
+                        // To an IPv6 peer, through its stand-in (`v6t.rs`).
+                        if plen >= dest_off + 1 + 16 + 2 {
+                            let mut a6 = [0u8; 16];
+                            a6.copy_from_slice(&buf[dest_off + 1..dest_off + 17]);
+                            let dst_port =
+                                u16::from_le_bytes([buf[dest_off + 17], buf[dest_off + 18]]);
+                            // The endpoint must have an IPv6 address to
+                            // send from before a peer entry is made for it.
+                            match endpoint_source(s, ep_id, true, 0)
+                                .ok()
+                                .and_then(|_| v6t::dial(s, &a6))
+                            {
+                                Some(standin) => Some((standin, dst_port, dest_off + 19)),
+                                None => {
+                                    dg_send_error(s, ep_id as u8, E_NETUNREACH);
+                                    None
+                                }
+                            }
+                        } else {
+                            None
+                        }
                     } else if af == DG_AF_NAME {
                         let name_len = if plen > dest_off + 1 {
                             buf[dest_off + 1] as usize
@@ -9559,6 +11141,17 @@ unsafe fn connect_v4_to(s: &mut IpState, ip: u32, port: u16, requester_tag: Requ
         return;
     }
 
+    // A workload's dial inside its cluster prefixes leaves from its own
+    // address; anything else (and the node's own dials) from the primary;
+    // a dial to an IPv6 peer from an IPv6 address of the dialler's own
+    // (`lane_source`).
+    let src_slot = match source_for(s, s.cur_lane, ip) {
+        Ok(slot) => slot,
+        Err(e) => {
+            net_send_reply_error(s, e, requester_tag);
+            return;
+        }
+    };
     let Some(ci) = alloc_free_slot(s) else {
         net_send_reply_error(s, -12, requester_tag); // ENOMEM
         return;
@@ -9574,11 +11167,8 @@ unsafe fn connect_v4_to(s: &mut IpState, ip: u32, port: u16, requester_tag: Requ
         net_send_reply_error(s, -99, requester_tag);
         return;
     };
-    // A workload's dial inside its cluster prefixes leaves from its own
-    // address; anything else (and the node's own dials) from the primary.
-    // Set concretely so the peer's replies match on the demux axis. Reset
-    // explicitly — this path reuses a slot in place.
-    let src_slot = source_for(s, s.cur_lane, ip);
+    // The source slot is set concretely so the peer's replies match on the
+    // demux axis. Reset explicitly — this path reuses a slot in place.
     // A workload's stream is judged at its connect, from the workload's own
     // address (what the host's forward hook would see before any source
     // translation). Refused as a locally dropped packet is: EPERM.
@@ -9803,7 +11393,11 @@ unsafe fn dns_cache_get(s: &IpState, lane: u8, name: &[u8], now_ms: u32) -> Opti
             && entry_name_is(&e.name, e.name_len, name)
             && !deadline_passed(now_ms, e.expires_ms)
         {
-            return Some(e.addr);
+            let addr = e.addr;
+            if e.once != 0 {
+                *e = DnsCacheEntry::EMPTY;
+            }
+            return Some(addr);
         }
         i += 1;
     }
@@ -9813,8 +11407,8 @@ unsafe fn dns_cache_get(s: &IpState, lane: u8, name: &[u8], now_ms: u32) -> Opti
 /// Record an answer in `lane`'s partition. The name's own entry is
 /// refreshed if it has one; otherwise an empty or expired entry is taken,
 /// and failing that the entry nearest its expiry is replaced. The TTL is
-/// clamped by the policy constants: a zero TTL is still held briefly, a long
-/// one is bounded.
+/// clamped by the policy constants, and a zero TTL is held for one use
+/// within `DNS_QUERY_TIMEOUT_MS`.
 unsafe fn dns_cache_put(
     s: &mut IpState,
     lane: u8,
@@ -9827,12 +11421,16 @@ unsafe fn dns_cache_put(
     if cn == 0 {
         return;
     }
-    let ttl_s = if ttl_s == 0 {
-        DNS_TTL_ZERO_S
+    let once = ttl_s == 0;
+    let expires_ms = if once {
+        now_ms.wrapping_add(DNS_QUERY_TIMEOUT_MS)
     } else {
-        ttl_s.clamp(DNS_TTL_MIN_S, DNS_TTL_MAX_S)
+        now_ms.wrapping_add(
+            ttl_s
+                .clamp(DNS_TTL_MIN_S, DNS_TTL_MAX_S)
+                .saturating_mul(1000),
+        )
     };
-    let expires_ms = now_ms.wrapping_add(ttl_s.saturating_mul(1000));
 
     let mut victim = c0;
     let mut victim_left = u32::MAX;
@@ -9858,6 +11456,7 @@ unsafe fn dns_cache_put(
     }
     let e = dns_cache_at(s, victim);
     e.name_len = entry_name_set(&mut e.name, name);
+    e.once = u8::from(once);
     e.addr = addr;
     e.expires_ms = expires_ms;
 }
@@ -10036,7 +11635,7 @@ unsafe fn resolver_start(
                 },
                 None => (server, dns_wire::DNS_PORT),
             };
-        let src_slot = source_for(s, lane, srv_ip);
+        let src_slot = source_for(s, lane, srv_ip)?;
         // A workload's query is egress like any datagram of its: judged.
         if lane != 0 {
             let src = match lane_owner_slot(s, lane) {
@@ -10184,7 +11783,11 @@ unsafe fn resolver_rx(s: &mut IpState, a: &DgAddr, data: *const u8, len: usize) 
             let now_ms = dev_millis(&*s.syscalls) as u32;
             let name = e.name;
             let typed = name.get(..e.name_len as usize).unwrap_or(&[]);
-            dns_cache_put(s, e.lane, typed, addr, ttl, now_ms);
+            // A zero TTL is kept only for a named datagram's retransmit:
+            // the dials waiting here take the answer directly.
+            if ttl != 0 || e.flags & DNS_PEND_CACHE_ONLY != 0 {
+                dns_cache_put(s, e.lane, typed, addr, ttl, now_ms);
+            }
             resolver_complete_group(s, id, addr);
         }
         dns_wire::AnswerA::Negative => match next_search(s, e.lane, e.search) {
@@ -10384,17 +11987,22 @@ unsafe fn sweep_range(s: &mut IpState, start: usize, end: usize) {
             let tag = conn.connect_tag;
             if kind != NOTIFY_NONE && kind != continuity::NOTIFY_SHADOW_RESERVED {
                 let delivered = match kind {
-                    NOTIFY_CLOSED => net_send_closed(s, i as u16),
+                    NOTIFY_CLOSED => net_send_closed(s, i as u16, CLOSED_GONE),
+                    NOTIFY_PEER_FIN => net_send_closed(s, i as u16, CLOSED_PEER_FIN),
                     NOTIFY_ERROR_REFUSED => net_send_error(s, i as u16, -111i8, tag),
                     NOTIFY_ERROR_TIMEOUT => net_send_error(s, i as u16, -110i8, tag),
+                    NOTIFY_ERROR_UNREACH => net_send_error(s, i as u16, E_NETUNREACH, tag),
                     NOTIFY_CONNECTED => net_send_connected(s, i as u16),
                     _ => true, // unknown code → drop the latch
                 };
                 if delivered {
                     let conn = &mut *s.tcp_conns.ptr_mut(i);
                     if conn.state == tcp::TcpState::Closed {
+                        // Only a connection that was established pinned its
+                        // neighbour; a refused, timed-out or unreachable
+                        // connect never did.
                         let remote_ip = conn.remote_ip;
-                        if remote_ip != 0 {
+                        if remote_ip != 0 && kind == NOTIFY_CLOSED {
                             arp::unpin(arp_tab(s), remote_ip);
                         }
                         conn_reset(s, i);
@@ -10489,7 +12097,7 @@ unsafe fn sweep_range(s: &mut IpState, start: usize, end: usize) {
                 conn.retransmit_timer = conn.retransmit_timer.saturating_add(1);
                 if conn.retransmit_timer >= 300 {
                     let remote_ip = conn.remote_ip;
-                    if net_send_closed(s, i as u16) {
+                    if net_send_closed(s, i as u16, CLOSED_GONE) {
                         if remote_ip != 0 {
                             arp::unpin(arp_tab(s), remote_ip);
                         }
@@ -10505,7 +12113,7 @@ unsafe fn sweep_range(s: &mut IpState, start: usize, end: usize) {
                 // MSG_CLOSED can be delivered so consumers don't strand.
                 if conn.timewait_timer > 40 {
                     let remote_ip = conn.remote_ip;
-                    if net_send_closed(s, i as u16) {
+                    if net_send_closed(s, i as u16, CLOSED_GONE) {
                         if remote_ip != 0 {
                             arp::unpin(arp_tab(s), remote_ip);
                         }
@@ -10534,17 +12142,23 @@ unsafe fn sweep_range(s: &mut IpState, start: usize, end: usize) {
                         continue;
                     }
                 }
+                // An acknowledgement the consumer's full channel refused
+                // when the segment carrying it arrived.
+                if conn.ack_told != conn.snd_una {
+                    report_ack(s, i, false);
+                }
+                let conn = &mut *s.tcp_conns.ptr_mut(i);
                 // RTO: if there is unacknowledged data and the timer expires,
                 // collapse cwnd, signal the consumer to retransmit, and arm
                 // backoff. Karn: don't use the retransmit sample for RTT.
                 if conn.snd_nxt != conn.snd_una {
                     conn.retransmit_timer = conn.retransmit_timer.saturating_add(1);
-                    if conn.retransmit_timer >= conn.rto {
+                    if tcp::rto_elapsed(conn) {
                         tcp::on_rto(conn);
                         let seq = conn.snd_una;
                         conn.retransmit_timer = 0;
                         // Exponential backoff — double RTO for next timeout.
-                        conn.rto = core::cmp::min(conn.rto.saturating_mul(2), tcp::RTO_MAX);
+                        tcp::rto_backoff(conn);
                         conn.rtt_active = false; // Karn's algorithm
                         net_send_retransmit(s, i as u16, seq);
                     }
@@ -10947,6 +12561,27 @@ pub mod test_helpers {
         c.in_recovery = in_recovery;
     }
 
+    /// The RTT estimator after `samples` (ms) on a fresh connection, each
+    /// one timed and acknowledged (`rtt_arm` / `rtt_ack`): SRTT and RTTVAR
+    /// in ms, the RTO, and the RTO after `backoffs` back-offs. The initial
+    /// RTO when `samples` is empty.
+    pub fn rtt_estimate(samples: &[u32], backoffs: u32) -> (u32, u32, u16, u16) {
+        let mut c = tcp::TcpConn::new();
+        let mut now = 1_000u32;
+        for (i, &r) in samples.iter().enumerate() {
+            let seq = 1 + i as u32;
+            tcp::rtt_arm(&mut c, seq, now);
+            now = now.wrapping_add(r);
+            tcp::rtt_ack(&mut c, seq.wrapping_add(1), now);
+            now = now.wrapping_add(10);
+        }
+        let rto = c.rto;
+        for _ in 0..backoffs {
+            tcp::rto_backoff(&mut c);
+        }
+        (u32::from(c.srtt) >> 3, u32::from(c.rttvar) >> 2, rto, c.rto)
+    }
+
     /// Force the retransmit timer of `idx`.
     ///
     /// # Safety
@@ -10996,7 +12631,8 @@ pub mod test_helpers {
     }
 
     /// Congestion and timer fields of connection `idx`:
-    /// (cwnd, ssthresh, in_recovery, retransmit_timer, rto).
+    /// (cwnd, ssthresh, in_recovery, retransmit_timer in 50 ms sweep
+    /// windows, rto in ms).
     ///
     /// # Safety
     /// `state` must point to an initialised `IpState`.

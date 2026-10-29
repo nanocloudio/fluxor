@@ -1,0 +1,68 @@
+version = "1.0.0"
+hardware_targets = ["bcm2712", "linux"]
+# Seals and opens as packets come; nothing here is timed. IPv4 or IPv6 on
+# both sides: the fabric (the anchors' addresses) and the inner packet.
+timer_class = "agnostic"
+
+# The ingress cell's authenticated tunnel to a remote anchor, both ends
+# (`mod.rs`, `cores/rescue_tunnel.rs`). Ingress: a forward record a director
+# disposed TUNNEL (`[anchor_id:u16][flow_epoch:u32]`) is sealed whole —
+# service, route generation, flow epoch, anchor and the ingress host under
+# the cell's key — and sent over `ip`'s datagram surface to UDP 4791 on the
+# anchor's host. Anchor: a datagram opens only under the key, inside its
+# ingress host's 64-packet window, for this host's service and an anchor
+# this host serves, and its packet is handed to this host's `ip` as a
+# frame, as if it had arrived here; everything else is refused, counted.
+# The sealed datagram is the packet plus 70 bytes, and `ip` sends nothing
+# larger than one frame: the fabric's frame must exceed the service's by
+# that much, or the service's segments be kept small enough to fit (a
+# datagram `ip` refuses is counted, `send_refused`).
+#
+# Wiring: `ip.packet_fwd -> fwd_in` (or a `fwd_split` output), `dg_out ->
+# ip.net_in`, `ip.net_out -> dg_in`, `frames_out -> ip.frames_rx` (merged
+# with the NIC's).
+#
+# ─── Parameters (TLV) ──────────────────────────────────────────────────
+# | Tag | Name       | Type | Default | Description |
+# |-----|------------|------|---------|-------------|
+# | 1   | key        | str  | —       | 64 hex: the cell's rescue key (this or `key_label`). |
+# | 8   | key_label  | str  | —       | The cell's key held in this host's vault instead: an HMAC-SHA256 key imported under this label (`fluxor-linux vault-import --module rescue_tunnel --suite hmac-sha256`), the same on every host of the cell; tags are made by the vault and the key never leaves it. |
+# | 2   | host_id    | str  | zero    | 16 hex: this host's identity as an ingress, unique in the cell; required with `anchors`. |
+# | 3   | service_id | str  | zero    | 32 hex: the service tunnelled packets are for — sealed under it, and opened only for it. |
+# | 4   | route_gen  | u32  | 1       | The route generation flows are placed under. |
+# | 5   | anchors    | str  | —       | `id=a.b.c.d,…` or `id=[2001:db8::2]`: the host each anchor id is on (IPv4 or IPv6 fabric). |
+# | 6   | serve      | str  | —       | `id,…`: the anchors this host is. |
+# | 7   | mac        | str  | zero    | 12 hex: the destination MAC of injected frames. |
+
+[[ports]]
+name = "fwd_in"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 16384
+
+[[ports]]
+name = "dg_in"
+index = 1
+direction = "input"
+content_type = "NetProto"
+buffer_size = 16384
+
+[[ports]]
+name = "dg_out"
+direction = "output"
+content_type = "NetProto"
+buffer_size = 16384
+
+[[ports]]
+name = "frames_out"
+index = 1
+direction = "output"
+content_type = "EthernetFrame"
+buffer_size = 16384
+
+[[resources]]
+requires_contract = "channel"
+access = "read"
+
+[observability]
+exempt = "a tunnel end — the packets it carries are observed by ip on both hosts; its refusals are counted on its heartbeat"

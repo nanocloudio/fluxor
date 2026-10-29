@@ -1,7 +1,10 @@
 version = "1.0.0"
 # timer_class: TCP/ARP timers increment on a 50 ms wall-clock gate (dev_millis), not per tick.
 timer_class = "wall_clock"
-hardware_targets = ["rp2040", "rp2350", "bcm2712"]
+# `linux`: over the `linux_eth` built-in frame driver the module is the hosted runtime's
+# own TCP/IP stack (the transport-continuity surfaces need a stack that owns
+# its connections; `linux_net`'s host sockets cannot checkpoint one).
+hardware_targets = ["rp2040", "rp2350", "bcm2712", "linux"]
 
 # The emission fence (`ADDR_FENCE` on `addr_ctl`): a provable cutoff for a
 # local address, reported as the frame counter at the ring hand-off.
@@ -91,12 +94,13 @@ content_type = "NetProto"
 buffer_size = { default = 512, aarch64 = 1024 }
 
 # Pre-transport decision seam (in[3] / out[3] / out[4]), on only when
-# `packet_decision = pre_transport`: every validated inbound IPv4 packet is
-# described to a director on `packet_out` and held until the director's
-# disposition arrives on `packet_in`; a TUNNEL or DSR disposition hands the
-# whole frame over on `packet_fwd`. Wire contract:
-# `modules/sdk/contracts/net/packet.rs` (`MSG_PKT_DECIDE`,
-# `CMD_PKT_DISPOSE`, `MSG_PKT_FORWARD`). Unwired means the seam does not
+# `packet_decision = pre_transport`: every validated inbound IPv4 packet, and
+# every TCP or UDP packet to a `seam_v6` address, is described to a director
+# on `packet_out` (`MSG_PKT_DECIDE` / `MSG_PKT_DECIDE6`) and held until the
+# director's disposition arrives on `packet_in`; a TUNNEL, DSR or CHAIN
+# disposition, and a MIRROR's copy, hand the whole frame over on
+# `packet_fwd`. Wire contract: `modules/sdk/contracts/net/packet.rs`
+# (`CMD_PKT_DISPOSE`, `MSG_PKT_FORWARD`). Unwired means the seam does not
 # exist at runtime; wiring it with the parameter off is refused at
 # construct, as is the parameter on without the ports.
 [[ports]]
@@ -122,12 +126,14 @@ buffer_size = { default = 4096, aarch64 = 32768 }
 
 # Transport continuity (in[4] / out[6]), the `session_ctrl` §Transport
 # continuity surface for the TCP connections this module owns: a
-# coordinator's PAIR_PREPARE / CHECKPOINT / DELTA / QUIESCE / CUT / ARM /
-# ACTIVATE / RETIRE / ABORT commands arrive on `cont_in`; replies
+# coordinator's (or `transport_continuity`'s) PAIR_PREPARE / CHECKPOINT /
+# DELTA / QUIESCE / CUT / ARM / ACTIVATE / RETIRE / ABORT / TOMBSTONE
+# commands arrive on `cont_in`; replies
 # (`MSG_SC_CONTINUITY`), checkpoint chunks and deltas leave on `cont_out`.
 # Unwired means no connection here can be mirrored or imported. The flow
 # identity is the tuple: [local_ip:4][remote_ip:4][local_port:2]
-# [remote_port:2][0;4], all big-endian.
+# [remote_port:2][0;4], all big-endian; an IPv6 connection's is
+# `tc_flow_id_v6` (0xF6 then a digest of its tuple, transport_continuity.rs).
 [[ports]]
 name = "cont_in"
 direction = "input"
@@ -142,9 +148,28 @@ index = 6
 content_type = "OctetStream"
 buffer_size = { default = 4096, aarch64 = 16384 }
 
+# The VIP authority (in[5] / out[7]), with `arm_authority`: each ADDR_ARM's
+# emission token goes out as MSG_ARM_AUTH_CHECK (with this host's boot
+# incarnation) and the address arms only on an accepting ARM_AUTH_VERDICT
+# (`contracts/net/identity.rs` §The VIP authority's token). Unwired with the
+# parameter set, nothing arms.
+[[ports]]
+name = "auth_rsp"
+direction = "input"
+index = 5
+content_type = "OctetStream"
+buffer_size = 512
+
+[[ports]]
+name = "auth_req"
+direction = "output"
+index = 7
+content_type = "OctetStream"
+buffer_size = 1024
+
 # Module-scope observability. Optional 3rd output (out[2]); wired to
 # `observe.telemetry` when the debug stack's observe overlay is on. Emits
-# cumulative counters; no-op when unwired. See standards/observability.md.
+# cumulative counters; no-op when unwired.
 [observability]
 metrics = ["bytes_in", "bytes_out"]
 # Span 0: one `tcp.connection` span per accepted connection (accept -> close),
