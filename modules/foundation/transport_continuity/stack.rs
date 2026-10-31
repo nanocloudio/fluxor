@@ -140,9 +140,22 @@
 // the peer has not acknowledged. A transition this stream cannot carry —
 // KeyUpdates past what `tls` derives forward, plaintext past
 // `TS_DELIV_BYTES`, a per-layer delta that contradicts the record, a gap, a
-// full journal, a half ending its own pairing — ends the pairing (both
-// halves ABORTed, STATUS of op ABORT with `tcs_why::MIRROR | tcs_lost`);
-// the connection runs on unprotected.
+// half ending its own pairing — ends the pairing (both halves ABORTed,
+// STATUS of op ABORT with `tcs_why::MIRROR | tcs_lost`); the connection
+// runs on unprotected.
+//
+// A full table is not such a transition: it holds. Every bound of the
+// record a delta fills is one the halves keep their own within
+// (`session_ctrl`'s `STRICT_*`: `tls` holds its next record while
+// `STRICT_TX_RECORDS` stand unacknowledged by the peer, and opens the next
+// inbound record only once the consumption before it is mirrored), and the
+// provider takes a half's next frame only while the gate, the half's queue
+// and the anchor's event queue have room for what it can become, and a
+// record out only while the record's outbound table has room
+// (`TcStack::layer_room`); a frame it does not take stays on the half's
+// port, where the half's own horizons and budgets hold the connection. A
+// bound reached anyway is named (`tcs_lost::BOUNDS`, with the record's
+// tables as the STATUS value), not reported as a divergence.
 //
 // Also in: unconsumed deliveries (the CT_TLS record carries them for the
 // standby's `tls` to hand its worker again), the answer to a KeyUpdate the
@@ -206,14 +219,39 @@ pub mod tcs_lost {
     /// plaintext is past `TS_DELIV_BYTES`, a TCP state the timers delta
     /// does not name).
     pub const UNREPRESENTABLE: u8 = 2;
-    /// The horizon gate's journal, or a half's queue of unacknowledged
-    /// deltas, is full.
+    /// The horizon gate's journal, a half's queue of unacknowledged
+    /// deltas, or the anchor's event queue had no room for a delta. Not
+    /// reached on the normal path: a half's input is held while any of
+    /// them lacks room for what its next frame can produce
+    /// (`TcStack::layer_room`); kept as the invariant's own name.
     pub const FULL: u8 = 3;
     /// A half ended its own pairing (`CONTINUITY{ABORTED}`), or a frame of
     /// it overran this module.
     pub const LAYER: u8 = 4;
     /// A half's delta contradicts the state the deltas so far built.
     pub const DIVERGED: u8 = 5;
+    /// A half's delta is past a bound of the canonical record (`TsState`'s
+    /// tables and buffers: `TS_TXREC_MAX`, `TS_SEND_MAX`, `TS_DELIV_MAX`,
+    /// `TS_RECV_MAX`, the out-of-order slots). The halves hold each of their
+    /// own within the strict bounds (`session_ctrl`'s `STRICT_*`), and the
+    /// provider holds a record past a full table until the peer's
+    /// acknowledgement frees it, so this names a layer that did not. The
+    /// STATUS value is the detail (`tcs_bounds_detail`).
+    pub const BOUNDS: u8 = 6;
+}
+
+/// The STATUS value of a pairing lost to `tcs_lost::BOUNDS`: the delta kind
+/// in the low byte, then the record's tables as they stood — outbound
+/// records (bits 8..16), deliveries (16..24), out-of-order segments
+/// (24..32), the send buffer's bytes (32..48) and the receive buffer's
+/// (48..64).
+pub fn tcs_bounds_detail(kind: MdKind, st: &TsState) -> u64 {
+    u64::from(kind as u8)
+        | u64::from(st.tx_count) << 8
+        | u64::from(st.deliv_count) << 16
+        | u64::from(st.ooo_count) << 24
+        | u64::from(st.send_len) << 32
+        | u64::from(st.recv_len) << 48
 }
 
 impl TcsRefuse {
@@ -240,12 +278,29 @@ pub const TCS_CAPS: u32 = tc_cap::TCP_CODEC
 pub const TCS_GATE_J: usize = 32;
 /// A half's deltas awaiting the horizon that covers them.
 pub const TCS_PEND: usize = 48;
+/// The most deltas one frame of a half becomes: a `tls` RECV_BYTES is one
+/// `RxSegment` (its partial record fits one) and the peer's FIN deferred to
+/// it, a RECORD_IN an `RxRecord` and the peer's close_notify.
+pub const TCS_FRAME_DELTAS: usize = 2;
+/// Room the anchor's event queue must have before a half's frame is taken:
+/// its deltas at their largest, and the STATUS a lost pairing reports.
+pub const TCS_FRAME_EVT: usize =
+    TCS_FRAME_DELTAS * (TCS_HDR + TC_HANDLE_LEN + MD_FRAME_MAX) + TCS_HDR + TC_STATUS_LEN;
+// The canonical record's bounds are the strict profile's (`session_ctrl`),
+// the ones `ip` and `tls` hold their own buffers and tables to.
+const _: () = assert!(TS_TXREC_MAX == sc::STRICT_TX_RECORDS);
+const _: () = assert!(TS_SEND_MAX == sc::STRICT_SEND_BYTES);
+const _: () = assert!(TS_RECV_MAX == sc::STRICT_RECV_BYTES);
+const _: () = assert!(TS_OOO_MAX == sc::STRICT_OOO_SEGS);
+const _: () = assert!(TS_OOO_SEG == sc::STRICT_OOO_SEG);
+const _: () = assert!(TS_DELIV_BYTES == sc::STRICT_DELIVERY_BYTES);
 /// `ip`'s tombstone command on `cont_in` (`session_ctrl`'s
 /// `CMD_SC_TOMBSTONE`): `[flow_id:16][epoch:4][ttl_ms:4]`, answered
 /// `CONTINUITY{RETIRED}`.
 pub const TCS_IP_TOMBSTONE: u8 = sc::CMD_SC_TOMBSTONE;
 /// `tls`'s consumption delta (`session_ctrl`'s `DELTA_TLS_DELIVERED`):
-/// `[consumed:8]`, the deliveries its clear-side consumer has consumed.
+/// `[consumed:8][consumer_cursor:8][cursor_at:8]`, the deliveries its
+/// clear-side consumer has consumed and where its acknowledgement stood.
 pub const TCS_TLS_DELIVERED: u8 = sc::DELTA_TLS_DELIVERED;
 /// `tls`'s strict RECORD_IN content type for plaintext it did not carry.
 const TCS_NOT_CARRIED: u8 = 0xFF;
@@ -257,6 +312,9 @@ const TCS_CT_APPLICATION: u8 = 23;
 const TCS_DERIVE_MAX: u32 = 16;
 /// The most bytes one `RxSegment` carries here: a whole protected record.
 const TCS_SEG_CHUNK: usize = TS_RECV_MAX;
+// A partial record `tls` holds (at most `sc::STRICT_RECV_BYTES`) is one
+// segment: `TCS_FRAME_DELTAS` counts it so.
+const _: () = assert!(TCS_SEG_CHUNK >= sc::STRICT_RECV_BYTES);
 
 /// The per-layer layouts the codecs below read and write; their SHA-256 is
 /// what each module's PAIR_PREPARE binds, so a layout change in `ip` or
@@ -560,7 +618,7 @@ const CT_LAYOUT: u8 = 1;
 /// it to its exact shapes at import.
 pub const CT_PEER_LEN: usize = 19 + 2 + 1 + 1 + 4 + 8 + 8 + 1 + 32 + 1 + 128;
 
-const CT_FIXED: usize = 214 + CT_PEER_LEN;
+const CT_FIXED: usize = 246 + CT_PEER_LEN;
 /// The unconsumed deliveries a CT_TLS record carries for a standby's `tls`
 /// to hand its worker again (`tls`'s `CONT_REDELIVER_MAX`: four whole
 /// records' plaintext, each `[len:2][plaintext]`, at most eight).
@@ -606,6 +664,16 @@ pub struct TlsHalf {
     pub close_notify: u8,
     pub delivered_in: u64,
     pub emitted_out: u64,
+    /// The consumer's clear bytes through the last record emitted (its
+    /// output horizon, `TsState::out_bytes`).
+    pub out_bytes: u64,
+    /// The consumer's cursor its last acknowledgement carried
+    /// (`net_proto::CMD_DELIVERED`; `TsState::consumer_cursor`).
+    pub consumer_cursor: u64,
+    /// The clear byte it carried (`TsState::cursor_at`).
+    pub cursor_at: u64,
+    /// The clear bytes of the `delivered_in` records (`TsState::in_bytes`).
+    pub in_bytes: u64,
     pub recv_expected: u32,
     pub recv_len: u32,
     pub retx_base: u32,
@@ -645,6 +713,10 @@ impl TlsHalf {
             close_notify: 0,
             delivered_in: 0,
             emitted_out: 0,
+            out_bytes: 0,
+            consumer_cursor: 0,
+            cursor_at: 0,
+            in_bytes: 0,
             recv_expected: 0,
             recv_len: 0,
             retx_base: 0,
@@ -710,6 +782,10 @@ pub fn ct_tls_decode(b: &[u8]) -> Result<TlsHalf, CkptError> {
     }
     h.delivered_in = r.u64().ok_or(Truncated)?;
     h.emitted_out = r.u64().ok_or(Truncated)?;
+    h.out_bytes = r.u64().ok_or(Truncated)?;
+    h.consumer_cursor = r.u64().ok_or(Truncated)?;
+    h.cursor_at = r.u64().ok_or(Truncated)?;
+    h.in_bytes = r.u64().ok_or(Truncated)?;
     h.recv_expected = r.u32().ok_or(Truncated)?;
     h.recv_len = r.u32().ok_or(Truncated)?;
     h.retx_base = r.u32().ok_or(Truncated)?;
@@ -799,6 +875,10 @@ pub fn ct_tls_encode(st: &TcsState, wr: &TcsWrapped, out: &mut [u8]) -> Option<u
     w.bytes(&[0, 0])?;
     w.u64(st.delivery_acked)?;
     w.u64(st.next_production - 1)?;
+    w.u64(st.out_bytes)?;
+    w.u64(st.consumer_cursor)?;
+    w.u64(st.cursor_at)?;
+    w.u64(st.in_bytes)?;
     w.u32(tcs_recv_expected(&st.recv[..usize::from(st.recv_len)]))?;
     w.u32(u32::from(st.recv_len))?;
     w.u32(st.snd_una)?;
@@ -1242,6 +1322,10 @@ pub fn tcs_compose(
     st.deliv_count = n as u8;
     st.next_delivery = th.delivered_in + 1 + n as u64;
     st.next_production = th.emitted_out + 1;
+    st.out_bytes = th.out_bytes;
+    st.consumer_cursor = th.consumer_cursor;
+    st.cursor_at = th.cursor_at;
+    st.in_bytes = th.in_bytes;
     st.flow_epoch = carried.flow_epoch;
     st.session_epoch = carried.session_epoch;
     st.route_generation = carried.route_generation;
@@ -1466,6 +1550,10 @@ pub enum TcsPort {
 /// (the provider then fails the operation rather than splitting a frame).
 pub trait TcsOut {
     fn send(&mut self, port: TcsPort, frame: &[u8]) -> bool;
+    /// Bytes `port` can queue now; a port that never fills need not say.
+    fn room(&self, _port: TcsPort) -> usize {
+        usize::MAX
+    }
 }
 
 /// The per-layer exchange a flow is waiting on. `Idle` is the all-zero value.
@@ -1803,6 +1891,10 @@ pub struct TcsCounters {
     /// Deltas a crash-continuous primary emitted, and pairings it lost.
     pub deltas_out: u32,
     pub mirrors_lost: u32,
+    /// Times a half's frame was left on its port for want of room
+    /// (`layer_room`): back-pressure, where a full table once ended the
+    /// pairing.
+    pub layer_holds: u32,
 }
 
 /// Operations a busy provider holds until the flow's current one finishes.
@@ -1835,6 +1927,9 @@ pub struct TcStack {
     /// An anchor TOMBSTONE waiting on `ip`: the flow, and when it fails.
     tomb_flow: [u8; 16],
     tomb_deadline: u64,
+    /// The STATUS value the next lost pairing reports (`tcs_bounds_detail`
+    /// for `tcs_lost::BOUNDS`, else 0).
+    lost_detail: u64,
 }
 
 /// A STATUS frame.
@@ -2041,6 +2136,7 @@ impl TcStack {
                 last_send: [0; 5],
                 deltas_out: 0,
                 mirrors_lost: 0,
+                layer_holds: 0,
             },
             pending: [[0; TCS_PENDING_MAX]; TCS_PENDING],
             pending_len: [0; TCS_PENDING],
@@ -2094,6 +2190,7 @@ impl TcStack {
             md: [0; MD_FRAME_MAX],
             tomb_flow: [0; 16],
             tomb_deadline: 0,
+            lost_detail: 0,
         }
     }
 
@@ -2228,6 +2325,49 @@ impl TcStack {
     }
 
     // ── input: the modules ───────────────────────────────────────────────
+
+    /// May `frame`, whole at the head of a half's port, be taken now? A
+    /// crash-continuous flow's half is held — its frame left on the port, so
+    /// the half's own horizons and budgets back-pressure the connection —
+    /// while the horizon gate lacks credits for what one frame can become
+    /// (`TCS_FRAME_DELTAS`), the half's queue of unacknowledged deltas is
+    /// full, or the anchor's event queue lacks room for them
+    /// (`TCS_FRAME_EVT`); and a `tls` record out waits while the record's
+    /// outbound table or send buffer is full, for `ip`'s acknowledgement on
+    /// the other port to free it. Each is room the standby's or the peer's
+    /// acknowledgement makes, so a full table is a wait, never the end of
+    /// the pairing. Any other frame is taken at once.
+    pub fn layer_room<O: TcsOut>(&mut self, port: TcsPort, frame: &[u8], out: &O) -> bool {
+        if frame.len() < TCS_HDR + sc::FLOW_HEADER_LEN {
+            return true;
+        }
+        let p = &frame[TCS_HDR..];
+        let on_ip = port == TcsPort::Ip;
+        let Some(c) = self.flows.iter().find(|c| {
+            let named = if on_ip { c.flow_id() } else { c.tls_flow };
+            c.live && c.mirroring && named[..] == p[..16]
+        }) else {
+            return true;
+        };
+        let half = if on_ip { &c.ip } else { &c.tls };
+        let mut room = c.gate.credits() >= TCS_FRAME_DELTAS
+            && half.pend_n < TCS_PEND
+            && out.room(TcsPort::Evt) >= TCS_FRAME_EVT;
+        if room
+            && !on_ip
+            && frame[0] == sc::CMD_SC_DELTA_APPLY
+            && p.len() >= sc::DELTA_APPLY_HEADER_LEN + 14
+            && p[60] == sc::DELTA_TLS_RECORD_OUT
+        {
+            let ct = usize::from(le16(p, sc::DELTA_APPLY_HEADER_LEN + 12));
+            room = usize::from(c.st.tx_count) < TS_TXREC_MAX
+                && usize::from(c.st.send_len) + ct <= TS_SEND_MAX;
+        }
+        if !room {
+            self.counters.layer_holds = self.counters.layer_holds.wrapping_add(1);
+        }
+        room
+    }
 
     /// One frame from a module's `cont_out`.
     pub fn layer<O: TcsOut>(&mut self, port: TcsPort, frame: &[u8], now_ms: u64, out: &mut O) {
@@ -3321,14 +3461,26 @@ impl TcStack {
                 }
                 Ok(cond)
             }
-            // `[write_epoch 4][write_seq 8][ct_len 2][ct]`: a record about
-            // to be written, the next production.
-            sc::DELTA_TLS_RECORD_OUT if b.len() >= 14 => {
+            // `[write_epoch 4][write_seq 8][ct_len 2][ct][out_bytes 8]`: a
+            // record about to be written, the next production, and the
+            // consumer's clear bytes through it.
+            sc::DELTA_TLS_RECORD_OUT if b.len() >= 14 + 8 => {
                 let (ep, seq, n) = (le32(b, 0), le64(b, 4), usize::from(le16(b, 12)));
-                let ct = b.get(14..).filter(|x| x.len() == n).ok_or(DIVERGED)?;
+                let ct = b.get(14..14 + n).ok_or(DIVERGED)?;
+                if b.len() != 14 + n + 8 {
+                    return Err(DIVERGED);
+                }
+                let out_bytes = le64(b, 14 + n);
                 let prod = self.flows[i].st.next_production;
-                let m = md_tx_record(&mut pl, prod, ep.wrapping_add(TCS_EPOCH_BASE), seq, ct)
-                    .ok_or(UNREPRESENTABLE)?;
+                let m = md_tx_record(
+                    &mut pl,
+                    prod,
+                    ep.wrapping_add(TCS_EPOCH_BASE),
+                    seq,
+                    ct,
+                    out_bytes,
+                )
+                .ok_or(UNREPRESENTABLE)?;
                 self.md_emit(i, MdKind::TxRecord, &pl[..m], out)
             }
             // The window slid; the record's send buffer slides on `ip`'s ACKED.
@@ -3341,17 +3493,24 @@ impl TcStack {
                 let m = md_dir(&mut pl, MD_DIR_OUT).ok_or(DIVERGED)?;
                 self.md_emit(i, MdKind::CloseNotify, &pl[..m], out)
             }
-            // `[consumed 8]`: what the consumer has consumed.
-            TCS_TLS_DELIVERED if b.len() == 8 => {
-                let n = le64(b, 0);
+            // `[consumed 8][consumer_cursor 8][cursor_at 8]`: what the
+            // consumer has consumed (the records ending at or before
+            // `cursor_at`), and the cursor and clear byte its
+            // acknowledgement carried. A count behind the record's is of
+            // deliveries consumed before it; the cursor still moves.
+            TCS_TLS_DELIVERED if b.len() == 24 => {
+                let (n, cc, at) = (le64(b, 0), le64(b, 8), le64(b, 16));
                 let st = &self.flows[i].st;
-                if n <= st.delivery_acked {
+                let n = n.max(st.delivery_acked);
+                if at < st.cursor_at
+                    || (n == st.delivery_acked && cc == st.consumer_cursor && at == st.cursor_at)
+                {
                     return Ok(TcsCond::Free);
                 }
                 if n >= st.next_delivery {
                     return Err(DIVERGED);
                 }
-                let m = md_u64(&mut pl, n).ok_or(DIVERGED)?;
+                let m = md_delivery_ack(&mut pl, n, cc, at).ok_or(DIVERGED)?;
                 self.md_emit(i, MdKind::DeliveryAck, &pl[..m], out)
             }
             // `[direction 1][epoch 4][sealed_len 2][sealed]`: a direction
@@ -3424,6 +3583,7 @@ impl TcStack {
             scratch,
             md,
             counters,
+            lost_detail,
             ..
         } = self;
         let c = &mut flows[i];
@@ -3442,8 +3602,13 @@ impl TcStack {
             digest: [0; 32],
         };
         let n = md_encode(&mut h, payload, md).ok_or(tcs_lost::UNREPRESENTABLE)?;
-        if md_apply(&mut c.st, scratch, kind, payload).is_err() {
-            return Err(tcs_lost::DIVERGED);
+        match md_apply(&mut c.st, scratch, kind, payload) {
+            Ok(()) => {}
+            Err(CkptError::Bounds) => {
+                *lost_detail = tcs_bounds_detail(kind, &c.st);
+                return Err(tcs_lost::BOUNDS);
+            }
+            Err(_) => return Err(tcs_lost::DIVERGED),
         }
         c.delta_seq += 1;
         c.last_digest = h.digest;
@@ -3514,13 +3679,14 @@ impl TcStack {
         let _ = tcs_layer(out, TcsPort::Tls, sc::CMD_SC_ABORT, &tf, e, &parts);
         self.counters.mirrors_lost += 1;
         self.counters.last_refusal = tcs_why::MIRROR | why;
+        let detail = core::mem::take(&mut self.lost_detail);
         tcs_status(
             out,
             tc_op::ABORT,
             tc_st::UNSUPPORTED,
             tcs_why::MIRROR | why,
             h,
-            0,
+            if why == tcs_lost::BOUNDS { detail } else { 0 },
             flow,
         );
     }

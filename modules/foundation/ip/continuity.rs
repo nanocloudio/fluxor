@@ -130,6 +130,12 @@ const REC_FIXED_LEN: usize = 4
 pub const TCP_RECORD_MAX: usize =
     REC_FIXED_LEN + tcp::REORDER_SLOTS * (4 + 2 + tcp::REORDER_SLOT_BYTES) + REC_V6_TAIL;
 
+// A strict pair's provider holds the out-of-order segments this module's
+// reorder slots keep (`session_ctrl`'s strict bounds): the record a slot
+// becomes always fits the canonical record.
+const _: () = assert!(tcp::REORDER_SLOTS <= sc::STRICT_OOO_SEGS);
+const _: () = assert!(tcp::REORDER_SLOT_BYTES <= sc::STRICT_OOO_SEG);
+
 /// What `PAIR_PREPARE` binds: the layout of the record above.
 const TCP_CODEC_LAYOUT: &[u8] = b"fluxor.ip.tcp-checkpoint:FXTC:reorder:ipv6";
 
@@ -323,7 +329,14 @@ pub struct TcpMirror {
     pub gate_delta: u32,
     pub quiesce_deadline_ms: u32,
     pub export_active: u8,
-    pub _pad3: [u8; 3],
+    /// A peer acknowledgement (`DELTA_TCP_ACKED`) or a state/timer change
+    /// (`DELTA_TCP_TIMERS`) the channel refused: owed, and offered again
+    /// each step from the connection as it then stands (both are
+    /// cumulative), so the provider's record never stays behind what the
+    /// peer acknowledged.
+    pub acked_owed: u8,
+    pub state_owed: u8,
+    pub _pad3: [u8; 1],
     pub export_off: u32,
     pub export_len: u32,
     pub export_digest: [u8; 32],
@@ -369,7 +382,9 @@ impl TcpMirror {
             gate_delta: 0,
             quiesce_deadline_ms: 0,
             export_active: 0,
-            _pad3: [0; 3],
+            acked_owed: 0,
+            state_owed: 0,
+            _pad3: [0; 1],
             export_off: 0,
             export_len: 0,
             export_digest: [0; 32],
@@ -1415,8 +1430,12 @@ pub(super) unsafe fn on_acked(s: &mut IpState, idx: usize) {
     body[4..6].copy_from_slice(&c.snd_wnd.to_le_bytes());
     body[6..8].copy_from_slice(&c.cwnd.to_le_bytes());
     body[8..10].copy_from_slice(&c.ssthresh.to_le_bytes());
-    if !emit_delta(s, mi, sc::DELTA_TCP_ACKED, &body) {
-        s.cont.mirrors[mi].deltas_dropped = s.cont.mirrors[mi].deltas_dropped.wrapping_add(1);
+    if emit_delta(s, mi, sc::DELTA_TCP_ACKED, &body) {
+        s.cont.mirrors[mi].acked_owed = 0;
+    } else {
+        let m = &mut s.cont.mirrors[mi];
+        m.acked_owed = 1;
+        m.deltas_dropped = m.deltas_dropped.wrapping_add(1);
         s.cont.stats.deltas_dropped = s.cont.stats.deltas_dropped.wrapping_add(1);
     }
 }
@@ -1437,8 +1456,12 @@ pub(super) unsafe fn on_state(s: &mut IpState, idx: usize) {
     body[5..7].copy_from_slice(&c.rttvar.to_le_bytes());
     body[7..9].copy_from_slice(&c.cwnd.to_le_bytes());
     body[9..11].copy_from_slice(&c.ssthresh.to_le_bytes());
-    if !emit_delta(s, mi, sc::DELTA_TCP_TIMERS, &body) {
-        s.cont.mirrors[mi].deltas_dropped = s.cont.mirrors[mi].deltas_dropped.wrapping_add(1);
+    if emit_delta(s, mi, sc::DELTA_TCP_TIMERS, &body) {
+        s.cont.mirrors[mi].state_owed = 0;
+    } else {
+        let m = &mut s.cont.mirrors[mi];
+        m.state_owed = 1;
+        m.deltas_dropped = m.deltas_dropped.wrapping_add(1);
         s.cont.stats.deltas_dropped = s.cont.stats.deltas_dropped.wrapping_add(1);
     }
 }
@@ -1588,6 +1611,15 @@ pub(super) unsafe fn step(s: &mut IpState) {
             }
             if s.cont.mirrors[mi].recv_pending != 0 {
                 flush_recv_delta(s, mi);
+            }
+            let conn = s.cont.mirrors[mi].conn_idx as usize;
+            if s.cont.mirrors[mi].live != 0 && conn < s.tcp_conns.len() {
+                if s.cont.mirrors[mi].acked_owed != 0 {
+                    on_acked(s, conn);
+                }
+                if s.cont.mirrors[mi].state_owed != 0 {
+                    on_state(s, conn);
+                }
             }
             if s.cont.mirrors[mi].quiescing != 0 {
                 let now = dev_millis(&*s.syscalls) as u32;

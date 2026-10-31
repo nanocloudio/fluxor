@@ -19,8 +19,12 @@ timer_class = "wall_clock"
 # that moves under transport continuity, `linger_ms` / `farewell` (a peer
 # that half-closes is kept open that long, then sent that many bytes and
 # closed), `close_after` (our own close once that many bytes were echoed),
-# `echo_after` (received bytes held unconsumed until that many have come)
-# and `dial` (`a.b.c.d:port`: connect out and be the session's client
+# `echo_after` (received bytes held unconsumed until that many have come,
+# then exactly that many consumed, the rest held for the next), `cursor`
+# (with `ack`: each CMD_DELIVERED's cursor is the bytes consumed, as its
+# in_bytes always is, logged; a stream resumed by a takeover continues from
+# its MSG_RESUMED in_bytes) and
+# `dial` (`a.b.c.d:port`: connect out and be the session's client
 # instead of listening).
 
 [[ports]]

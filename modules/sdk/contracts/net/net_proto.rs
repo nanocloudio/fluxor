@@ -302,8 +302,8 @@ pub fn retransmit_parts(payload: &[u8]) -> Option<(u16, u32)> {
     ))
 }
 
-// 0x09 is `MSG_TRACE_CTX`, 0x0A `MSG_PEER`; the next free downstream opcode
-// is 0x0B.
+// 0x09 is `MSG_TRACE_CTX`, 0x0A `MSG_PEER`, 0x0B `MSG_HORIZON`, 0x0C
+// `MSG_RESUMED`; the next free downstream opcode is 0x0D.
 
 /// Observability trace context for a connection (W3C). Emitted by the ingress
 /// (IP) right after `MSG_ACCEPTED`, and re-emitted by each forwarding stage
@@ -337,6 +337,72 @@ pub const MSG_PEER: u8 = 0x0A;
 
 /// `MSG_PEER` payload length.
 pub const PEER_LEN: usize = CONN_ID_LEN + 1 + 16 + 2;
+
+/// The connection's output horizon moved: every clear byte this consumer
+/// handed down on `conn_id` up to `bytes_through` is in records the
+/// transport has put on the wire — under a crash-continuous continuity
+/// pairing (`TRANSPORT_CONTINUITY`), records the standby acknowledged
+/// before they left, so the primary's loss cannot take them. Payload:
+/// `[conn_id: u16 LE][bytes_through: u64 LE]` ([`HORIZON_LEN`]), sent when
+/// it moves. Counted from the first byte this consumer sent on the stream
+/// as it holds it — a connection moved to another host starts again at 0
+/// for its consumer there. Bytes, not commands, so a stage that splits or
+/// joins commands between the consumer and the record layer (a router)
+/// keeps the numbering. Emitted by a record layer that opts in (`tls`'s
+/// `write_horizon`); a consumer that does not use it drops it as any
+/// unknown opcode.
+pub const MSG_HORIZON: u8 = 0x0B;
+/// `MSG_HORIZON` payload length.
+pub const HORIZON_LEN: usize = CONN_ID_LEN + 8;
+
+/// `(conn_id, bytes_through)` of a `MSG_HORIZON` payload, or `None` when it
+/// is short.
+#[inline]
+pub fn horizon_parts(payload: &[u8]) -> Option<(u16, u64)> {
+    let p = payload.get(..HORIZON_LEN)?;
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&p[2..10]);
+    Some((u16::from_le_bytes([p[0], p[1]]), u64::from_le_bytes(b)))
+}
+
+/// The stream was resumed here by a transport-continuity takeover
+/// (`TRANSPORT_CONTINUITY` ACTIVATE): where the consumer's predecessor on
+/// the old host stood, so this consumer continues exactly. Payload:
+/// `[conn_id: u16 LE][consumer_cursor: u64 LE][in_bytes: u64 LE]
+/// [out_bytes: u64 LE]` ([`RESUMED_LEN`]). `consumer_cursor` and
+/// `in_bytes` are what the predecessor's last `CMD_DELIVERED` carried (both
+/// 0 when none was mirrored): it had consumed the stream's first `in_bytes`
+/// clear bytes and stood at `consumer_cursor` there. Redelivery of what was
+/// handed up and not acknowledged starts at exactly byte `in_bytes` — in
+/// the middle of a record when the acknowledgement was — so this consumer
+/// counts on from `in_bytes` in its own `CMD_DELIVERED`s. `out_bytes` is
+/// the output horizon in `MSG_HORIZON`'s `bytes_through` numbering: the
+/// predecessor's clear bytes through the last record the connection holds.
+/// Sent once, after the activated stream's `MSG_PEER` (after its accept
+/// when it has no peer report) and before any of its data, redelivered or
+/// new. A consumer that does not use it drops it as any unknown opcode.
+pub const MSG_RESUMED: u8 = 0x0C;
+/// `MSG_RESUMED` payload length.
+pub const RESUMED_LEN: usize = CONN_ID_LEN + 8 + 8 + 8;
+
+/// `(conn_id, consumer_cursor, in_bytes, out_bytes)` of a `MSG_RESUMED`
+/// payload, or `None` when it is short.
+#[inline]
+pub fn resumed_parts(payload: &[u8]) -> Option<(u16, u64, u64, u64)> {
+    let p = payload.get(..RESUMED_LEN)?;
+    let mut c = [0u8; 8];
+    c.copy_from_slice(&p[2..10]);
+    let mut i = [0u8; 8];
+    i.copy_from_slice(&p[10..18]);
+    let mut o = [0u8; 8];
+    o.copy_from_slice(&p[18..26]);
+    Some((
+        u16::from_le_bytes([p[0], p[1]]),
+        u64::from_le_bytes(c),
+        u64::from_le_bytes(i),
+        u64::from_le_bytes(o),
+    ))
+}
 
 /// Write a whole `MSG_PEER` frame (header included) into `out`; its length,
 /// or `None` when `out` is too short.
@@ -415,12 +481,41 @@ pub const CMD_CLOSE: u8 = 0x12;
 pub const CMD_RESEND: u8 = 0x18;
 /// `CMD_RESEND` header length before its data.
 pub const RESEND_HEAD: usize = CONN_ID_LEN + 4;
-/// Everything a stage handed up on `conn_id` so far is consumed. Payload:
-/// `[conn_id: u16 LE]`. A record layer that defers its delivery horizon to
-/// its worker (`tls`'s `delivery_ack`) waits for it before it counts a
-/// delivery as made; a stage that does not defer drops it as any unknown
-/// opcode.
+/// The consumer has consumed the first `in_bytes` clear bytes a stage
+/// handed up on `conn_id`, and stands at `consumer_cursor` there. Payload:
+/// exactly `[conn_id: u16 LE][consumer_cursor: u64 LE][in_bytes: u64 LE]`
+/// ([`DELIVERED_LEN`]). `in_bytes` counts the stream's clear bytes from its
+/// start (after a takeover, on from `MSG_RESUMED`'s `in_bytes`) and may
+/// fall inside a record; `consumer_cursor` is the consumer's own position
+/// there, opaque to the transport. A record layer that defers its delivery
+/// horizon to its worker (`tls`'s `delivery_ack`) counts as consumed only
+/// the records whose plaintext ends at or before `in_bytes`, keeps the
+/// cursor with its byte offset, mirrors both under transport continuity
+/// and hands them to the consumer that resumes the stream after a takeover
+/// (`MSG_RESUMED`), redelivering from exactly that byte. A payload of any
+/// other length is ignored; a stage that does not defer drops it as any
+/// unknown opcode.
 pub const CMD_DELIVERED: u8 = 0x19;
+/// `CMD_DELIVERED` payload length.
+pub const DELIVERED_LEN: usize = CONN_ID_LEN + 16;
+
+/// `(conn_id, consumer_cursor, in_bytes)` of a `CMD_DELIVERED` payload, or
+/// `None` unless it is exactly [`DELIVERED_LEN`] long.
+#[inline]
+pub fn delivered_parts(payload: &[u8]) -> Option<(u16, u64, u64)> {
+    if payload.len() != DELIVERED_LEN {
+        return None;
+    }
+    let mut c = [0u8; 8];
+    c.copy_from_slice(&payload[2..10]);
+    let mut i = [0u8; 8];
+    i.copy_from_slice(&payload[10..18]);
+    Some((
+        u16::from_le_bytes([payload[0], payload[1]]),
+        u64::from_le_bytes(c),
+        u64::from_le_bytes(i),
+    ))
+}
 /// Reserved and unsupported: the 7/9-byte
 /// `[sock_type][ip: u32 LE][port: u16 LE][requester_tag: u16 LE?]` dial shape.
 /// Every provider answers it with `MSG_ERROR` `ENOSYS` on the requester tag

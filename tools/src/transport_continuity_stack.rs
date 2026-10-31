@@ -110,6 +110,10 @@ mod tests {
         anchored: bool,
         write_seq: u64,
         emitted: u64,
+        out_bytes: u64,
+        consumer_cursor: u64,
+        cursor_at: u64,
+        in_bytes: u64,
         key_update: u8,
         peer_block: [u8; CT_PEER_LEN],
         sealed: [u8; TCS_SEALED_LEN],
@@ -123,6 +127,10 @@ mod tests {
             anchored: false,
             write_seq: 9,
             emitted: 9,
+            out_bytes: 77,
+            consumer_cursor: 0x5150,
+            cursor_at: 1234,
+            in_bytes: 1200,
             key_update: 0,
             peer_block: peer_block_v4(),
             sealed: [0x5E; TCS_SEALED_LEN],
@@ -155,6 +163,13 @@ mod tests {
         r.extend_from_slice(&[0, 0, 0]);
         r.extend_from_slice(&4u64.to_le_bytes());
         r.extend_from_slice(&t.emitted.to_le_bytes());
+        // The consumer's clear bytes through the last record (its horizon).
+        r.extend_from_slice(&t.out_bytes.to_le_bytes());
+        // The cursor the consumer's last acknowledgement carried.
+        r.extend_from_slice(&t.consumer_cursor.to_le_bytes());
+        // Its clear byte, and the clear bytes of the delivered records.
+        r.extend_from_slice(&t.cursor_at.to_le_bytes());
+        r.extend_from_slice(&t.in_bytes.to_le_bytes());
         let expected = if t.recv.len() >= 5 {
             u32::from(u16::from_be_bytes([t.recv[3], t.recv[4]]))
         } else {
@@ -597,6 +612,64 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The connection's output horizon (the consumer's clear bytes through
+    /// the last record, `net_proto::MSG_HORIZON`) is part of the record:
+    /// `tls`'s half carries it in, the record carries it back out to the
+    /// standby's `tls`, and a record out moves it only forward.
+    #[test]
+    fn the_output_horizon_is_one_field_of_the_record_both_ways() {
+        let tcp = tcp_half(5000, 5000);
+        let rec = ct_tls(&tls_layout());
+        let th = ct_tls_decode(&rec).expect("ct_tls");
+        assert_eq!(th.out_bytes, 77);
+        let w = wrapped(&th, &rec);
+        let mut st = Box::new(TcsState::zero());
+        tcs_compose(&tcp, &th, &rec, &w, &carried(), &mut st).expect("composes");
+        assert_eq!(st.out_bytes, 77);
+        let mut back = vec![0u8; CT_TLS_MAX];
+        let n = ct_tls_encode(&st, &w, &mut back).expect("encodes");
+        let again = ct_tls_decode(&back[..n]).expect("decodes");
+        assert_eq!(again.out_bytes, 77);
+        // So is the consumer's cursor (`net_proto::CMD_DELIVERED`), opaque.
+        assert_eq!((th.consumer_cursor, st.consumer_cursor), (0x5150, 0x5150));
+        assert_eq!(again.consumer_cursor, 0x5150);
+        // With its clear byte, and where the unconsumed deliveries start.
+        assert_eq!(
+            (th.cursor_at, st.cursor_at, again.cursor_at),
+            (1234, 1234, 1234)
+        );
+        assert_eq!(
+            (th.in_bytes, st.in_bytes, again.in_bytes),
+            (1200, 1200, 1200)
+        );
+        // A record out carries it forward, never back.
+        let ct = record(25, 9);
+        let mut p = vec![0u8; 64 + ct.len()];
+        let m = md_tx_record(
+            &mut p,
+            st.next_production,
+            st.write_epoch,
+            st.write_seq,
+            &ct,
+            70,
+        )
+        .expect("payload");
+        let mut scratch = Box::new(TcsState::zero());
+        let mut low = st.clone();
+        assert!(md_apply(&mut low, &mut scratch, MdKind::TxRecord, &p[..m]).is_err());
+        let m = md_tx_record(
+            &mut p,
+            st.next_production,
+            st.write_epoch,
+            st.write_seq,
+            &ct,
+            102,
+        )
+        .expect("payload");
+        md_apply(&mut st, &mut scratch, MdKind::TxRecord, &p[..m]).expect("applies");
+        assert_eq!(st.out_bytes, 102);
     }
 
     #[test]
@@ -1811,6 +1884,8 @@ mod tests {
         ro.extend_from_slice(&9u64.to_le_bytes());
         ro.extend_from_slice(&(rec.len() as u16).to_le_bytes());
         ro.extend_from_slice(&rec);
+        // The consumer's clear bytes through it.
+        ro.extend_from_slice(&(77u64 + 100).to_le_bytes());
         a.feed_half(
             TcsPort::Tls,
             &half_delta(&tf, 3, sc::DELTA_TLS_RECORD_OUT, &ro),
@@ -1844,9 +1919,31 @@ mod tests {
             TcsPort::Ip,
             &half_delta(&flow(), 3, sc::DELTA_TCP_ACKED, &ack),
         );
+        // The consumer stands past the fifth delivery's end, and never
+        // behind where it stood.
+        let (in_new, at) = {
+            let st = a.p.flow(&flow()).expect("a").st;
+            let in_new = st.in_bytes
+                + st.deliveries()
+                    .iter()
+                    .filter(|d| d.id <= 5)
+                    .map(|d| u64::from(d.len))
+                    .sum::<u64>();
+            (in_new, in_new.max(st.cursor_at) + 7)
+        };
         a.feed_half(
             TcsPort::Tls,
-            &half_delta(&tf, 4, TCS_TLS_DELIVERED, &5u64.to_le_bytes()),
+            &half_delta(
+                &tf,
+                4,
+                TCS_TLS_DELIVERED,
+                &[
+                    5u64.to_le_bytes(),
+                    0xC0_FFEEu64.to_le_bytes(),
+                    at.to_le_bytes(),
+                ]
+                .concat(),
+            ),
         );
         let d = a.deltas();
         assert_eq!(d.len(), 2, "PeerAck, DeliveryAck");
@@ -1864,6 +1961,12 @@ mod tests {
         let sb = b.p.flow(&flow()).expect("b").st;
         assert_eq!(tc_state_digest(&sa, &mut r1), tc_state_digest(&sb, &mut r2));
         assert_eq!((sb.snd_una, sb.send_len, sb.deliv_count), (end, 0, 0));
+        assert_eq!(
+            (sb.delivery_acked, sb.consumer_cursor, sb.cursor_at),
+            (5, 0xC0_FFEE, at),
+            "the consumer's cursor and its byte ride its acknowledgement"
+        );
+        assert_eq!(sb.in_bytes, in_new, "the five deliveries' bytes, whole");
         // A quiesce now is covered: nothing journaled.
         a.op(tc_op::QUIESCE_STATUS, &ha);
         assert_eq!(a.status(tc_op::QUIESCE_STATUS).value, 1);
@@ -1882,6 +1985,11 @@ mod tests {
             (6, 10, 0, 0)
         );
         assert_eq!((th.delivered_in, th.emitted_out), (5, 10));
+        assert_eq!(
+            (th.consumer_cursor, th.cursor_at, th.in_bytes),
+            (0xC0_FFEE, at, in_new),
+            "and reaches the standby's tls in CT_TLS"
+        );
     }
 
     /// Bring the checkpoint's partial record in whole and open it ("hello"),
@@ -2009,6 +2117,8 @@ mod tests {
         ro.extend_from_slice(&9u64.to_le_bytes());
         ro.extend_from_slice(&(rec.len() as u16).to_le_bytes());
         ro.extend_from_slice(&rec);
+        // The consumer's clear bytes through it.
+        ro.extend_from_slice(&(77u64 + 100).to_le_bytes());
         a.feed_half(
             TcsPort::Tls,
             &half_delta(&tls_flow(), 5, sc::DELTA_TLS_RECORD_OUT, &ro),
@@ -2511,5 +2621,278 @@ mod tests {
             (s.status, s.reason),
             (tc_st::INVALID, tc_custody::why::RECIPIENT)
         );
+    }
+
+    // ── full tables hold; they do not end the pairing ────────────────────
+
+    /// `tls`'s RECORD_OUT of a `ct_len`-byte record at write sequence `seq`.
+    fn record_out(seq: u64, ct_len: usize, out_bytes: u64) -> Vec<u8> {
+        let rec = record(ct_len - 5, 7);
+        let mut ro = 0u32.to_le_bytes().to_vec();
+        ro.extend_from_slice(&seq.to_le_bytes());
+        ro.extend_from_slice(&(rec.len() as u16).to_le_bytes());
+        ro.extend_from_slice(&rec);
+        ro.extend_from_slice(&out_bytes.to_le_bytes());
+        ro
+    }
+
+    /// `ip`'s ACKED: the peer acknowledged through `una`.
+    fn acked(una: u32) -> Vec<u8> {
+        let mut b = una.to_le_bytes().to_vec();
+        b.extend_from_slice(&64_000u16.to_le_bytes());
+        b.extend_from_slice(&14_600u16.to_le_bytes());
+        b.extend_from_slice(&u16::MAX.to_le_bytes());
+        b
+    }
+
+    impl Host {
+        /// Offer a half's frame as the module does: taken only when
+        /// `layer_room` says so. Whether it was.
+        fn offer(&mut self, port: TcsPort, frame: &[u8]) -> bool {
+            if !self.p.layer_room(port, frame, &self.out) {
+                return false;
+            }
+            self.feed_half(port, frame);
+            true
+        }
+
+        fn lost(&mut self) -> Option<TcStatus> {
+            let evs: Vec<_> = self.out.evt.iter().cloned().collect();
+            evs.iter().find_map(|f| {
+                (f[0] == tc_evt::STATUS && f[3] == tc_op::ABORT)
+                    .then(|| TcStatus::decode(&f[3..]).expect("status"))
+            })
+        }
+    }
+
+    /// Small records written faster than the peer acknowledges them: more
+    /// than `TS_TXREC_MAX` would stand. The provider takes the record that
+    /// would be the 33rd only once `ip`'s acknowledgement freed a slot — it
+    /// waits on `tls`'s port meanwhile — and the pairing holds throughout.
+    #[test]
+    fn a_full_outbound_table_holds_the_record_until_the_peer_acknowledges() {
+        let (mut a, _b, ha, _hb) = crash_paired();
+        let tf = tls_flow();
+        let mut seq = 9u64;
+        for no in 1..=TS_TXREC_MAX as u32 {
+            let f = half_delta(
+                &tf,
+                no,
+                sc::DELTA_TLS_RECORD_OUT,
+                &record_out(seq, 26, 77 + seq),
+            );
+            assert!(a.offer(TcsPort::Tls, &f), "record {no} taken");
+            a.op(
+                tc_op::DELTA_ACK,
+                &[&ha[..], &u64::from(no).to_le_bytes()].concat(),
+            );
+            seq += 1;
+        }
+        let st = a.p.flow(&flow()).expect("a").st;
+        assert_eq!(usize::from(st.tx_count), TS_TXREC_MAX);
+        let next = half_delta(
+            &tf,
+            TS_TXREC_MAX as u32 + 1,
+            sc::DELTA_TLS_RECORD_OUT,
+            &record_out(seq, 26, 77 + seq),
+        );
+        for _ in 0..3 {
+            assert!(!a.offer(TcsPort::Tls, &next), "the 33rd waits on its port");
+        }
+        assert!(a.p.counters.layer_holds >= 3);
+        assert!(a.lost().is_none(), "the pairing holds");
+        // The peer acknowledges the first two records: one frees a slot.
+        a.feed_half(
+            TcsPort::Ip,
+            &half_delta(&flow(), 1, sc::DELTA_TCP_ACKED, &acked(5000 + 2 * 26)),
+        );
+        assert!(a.offer(TcsPort::Tls, &next), "taken once a slot is free");
+        let st = a.p.flow(&flow()).expect("a").st;
+        assert_eq!(usize::from(st.tx_count), TS_TXREC_MAX - 1);
+        assert!(a.lost().is_none());
+        assert!(a.p.flow(&flow()).expect("a").mirroring);
+    }
+
+    /// The horizon gate's journal (`TCS_GATE_J`) fills when the standby is
+    /// slow: the halves' next frames wait until its acknowledgement returns
+    /// credits, where a full journal once ended the pairing.
+    #[test]
+    fn a_full_gate_journal_holds_both_halves_until_the_standby_acknowledges() {
+        let (mut a, _b, ha, _hb) = crash_paired();
+        let tf = tls_flow();
+        let mut seq = 9u64;
+        let mut no = 1u32;
+        let mut una = 5000u32;
+        // Record, then the peer's acknowledgement of it: two deltas each,
+        // the outbound table never full, nothing acknowledged by the standby.
+        while a.p.flow(&flow()).expect("a").gate.credits() >= TCS_FRAME_DELTAS {
+            let f = half_delta(
+                &tf,
+                no,
+                sc::DELTA_TLS_RECORD_OUT,
+                &record_out(seq, 26, 77 + seq),
+            );
+            assert!(a.offer(TcsPort::Tls, &f));
+            una += 26;
+            let g = half_delta(&flow(), no, sc::DELTA_TCP_ACKED, &acked(una));
+            if !a.offer(TcsPort::Ip, &g) {
+                break;
+            }
+            no += 1;
+            seq += 1;
+        }
+        let credits = a.p.flow(&flow()).expect("a").gate.credits();
+        assert!(
+            credits < TCS_FRAME_DELTAS,
+            "the journal is full ({credits})"
+        );
+        let f = half_delta(
+            &tf,
+            no + 1,
+            sc::DELTA_TLS_RECORD_OUT,
+            &record_out(seq + 1, 26, 99),
+        );
+        assert!(!a.p.layer_room(TcsPort::Tls, &f, &a.out), "tls waits");
+        assert!(a.lost().is_none(), "the pairing holds");
+        let top = a.p.flow(&flow()).expect("a").delta_seq;
+        a.op(tc_op::DELTA_ACK, &[&ha[..], &top.to_le_bytes()].concat());
+        assert_eq!(a.p.flow(&flow()).expect("a").gate.credits(), TCS_GATE_J);
+        assert!(
+            a.p.layer_room(TcsPort::Tls, &f, &a.out),
+            "taken once acknowledged"
+        );
+        assert!(a.p.flow(&flow()).expect("a").mirroring);
+    }
+
+    /// A half's queue of deltas waiting on their horizons (`TCS_PEND`) fills
+    /// with `ip`'s receive transitions whose bytes `tls` has not mirrored
+    /// yet: `ip`'s next frame waits, the pairing holds, and `tls`'s bytes
+    /// (on the other port) settle the queue.
+    #[test]
+    fn a_full_half_queue_holds_that_half() {
+        let (mut a, _b, _ha, _hb) = crash_paired();
+        let mut at = 80_000u32;
+        for no in 1..=TCS_PEND as u32 {
+            let mut rx = at.to_le_bytes().to_vec();
+            rx.extend_from_slice(&1u16.to_le_bytes());
+            rx.extend_from_slice(&(at + 1).to_le_bytes());
+            rx.push(0);
+            assert!(a.offer(
+                TcsPort::Ip,
+                &half_delta(&flow(), no, sc::DELTA_TCP_RECV, &rx)
+            ));
+            at += 1;
+        }
+        assert_eq!(a.p.flow(&flow()).expect("a").ip.pend_n, TCS_PEND);
+        let mut rx = at.to_le_bytes().to_vec();
+        rx.extend_from_slice(&1u16.to_le_bytes());
+        rx.extend_from_slice(&(at + 1).to_le_bytes());
+        rx.push(0);
+        let next = half_delta(&flow(), TCS_PEND as u32 + 1, sc::DELTA_TCP_RECV, &rx);
+        assert!(!a.offer(TcsPort::Ip, &next), "ip waits");
+        assert!(a.lost().is_none(), "the pairing holds");
+        // `tls` is not held by `ip`'s queue.
+        let tf = tls_flow();
+        let f = half_delta(&tf, 1, sc::DELTA_TLS_RECORD_OUT, &record_out(9, 26, 86));
+        assert!(a.p.layer_room(TcsPort::Tls, &f, &a.out));
+    }
+
+    /// Ports whose event queue has `evt_room` bytes free.
+    struct Tight {
+        inner: Ports,
+        evt_room: usize,
+    }
+
+    impl TcsOut for Tight {
+        fn send(&mut self, port: TcsPort, frame: &[u8]) -> bool {
+            self.inner.send(port, frame)
+        }
+        fn room(&self, port: TcsPort) -> usize {
+            if port == TcsPort::Evt {
+                self.evt_room
+            } else {
+                usize::MAX
+            }
+        }
+    }
+
+    /// The anchor stops draining its events: a half's frame is not taken
+    /// while the event queue lacks room for what it can become, and is the
+    /// moment there is.
+    #[test]
+    fn a_full_event_queue_holds_the_halves() {
+        let (a, _b, _ha, _hb) = crash_paired();
+        let mut p = a.p;
+        let tf = tls_flow();
+        let f = half_delta(&tf, 1, sc::DELTA_TLS_RECORD_OUT, &record_out(9, 26, 86));
+        let mut out = Tight {
+            inner: Ports::default(),
+            evt_room: TCS_FRAME_EVT - 1,
+        };
+        assert!(!p.layer_room(TcsPort::Tls, &f, &out));
+        assert!(!p.layer_room(
+            TcsPort::Ip,
+            &half_delta(&flow(), 1, sc::DELTA_TCP_ACKED, &acked(5000)),
+            &out
+        ));
+        out.evt_room = TCS_FRAME_EVT;
+        assert!(p.layer_room(TcsPort::Tls, &f, &out));
+        p.layer(TcsPort::Tls, &f, 1_000, &mut out);
+        assert_eq!(p.flow(&flow()).expect("a").delta_seq, 1);
+        assert!(p.flow(&flow()).expect("a").mirroring);
+    }
+
+    /// A layer that does not hold to the strict bounds anyway: the delta
+    /// past the record's table ends the pairing named `BOUNDS`, not
+    /// DIVERGED, with the record's tables as the STATUS value.
+    #[test]
+    fn a_delta_past_a_bound_is_reported_as_bounds_with_its_tables() {
+        let (mut a, _b, ha, _hb) = crash_paired();
+        let tf = tls_flow();
+        let mut seq = 9u64;
+        for no in 1..=TS_TXREC_MAX as u32 {
+            a.feed_half(
+                TcsPort::Tls,
+                &half_delta(
+                    &tf,
+                    no,
+                    sc::DELTA_TLS_RECORD_OUT,
+                    &record_out(seq, 26, 77 + seq),
+                ),
+            );
+            a.op(
+                tc_op::DELTA_ACK,
+                &[&ha[..], &u64::from(no).to_le_bytes()].concat(),
+            );
+            seq += 1;
+        }
+        // Past the provider's own hold, as a module that ignored it would.
+        a.feed_half(
+            TcsPort::Tls,
+            &half_delta(
+                &tf,
+                TS_TXREC_MAX as u32 + 1,
+                sc::DELTA_TLS_RECORD_OUT,
+                &record_out(seq, 26, 77 + seq),
+            ),
+        );
+        let s = a.lost().expect("the pairing ended");
+        assert_eq!(s.reason, tcs_why::MIRROR | tcs_lost::BOUNDS);
+        assert_eq!(s.value & 0xFF, MdKind::TxRecord as u64, "the delta's kind");
+        assert_eq!(
+            (s.value >> 8) & 0xFF,
+            TS_TXREC_MAX as u64,
+            "the outbound table, full"
+        );
+        assert_eq!(
+            (s.value >> 32) & 0xFFFF,
+            TS_TXREC_MAX as u64 * 26,
+            "the send buffer"
+        );
+        assert_eq!(
+            a.p.counters.last_refusal,
+            tcs_why::MIRROR | tcs_lost::BOUNDS
+        );
+        assert!(!a.p.flow(&flow()).expect("a").mirroring);
     }
 }

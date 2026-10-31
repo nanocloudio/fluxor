@@ -405,6 +405,100 @@ const NET_MSG_ACK: u8 = net_proto::MSG_ACK;
 const NET_MSG_TRACE_CTX: u8 = 0x09;
 /// The stream's peer (`net_proto::MSG_PEER`), re-emitted on the clear side.
 const NET_MSG_PEER: u8 = net_proto::MSG_PEER;
+/// The connection's output horizon (`net_proto::MSG_HORIZON`).
+const NET_MSG_HORIZON: u8 = net_proto::MSG_HORIZON;
+/// A stream resumed here by a takeover (`net_proto::MSG_RESUMED`).
+const NET_MSG_RESUMED: u8 = net_proto::MSG_RESUMED;
+
+/// Records one session may have accepted for the wire and not yet written
+/// (its strict hold, a stalled record, and slack).
+const WH_SLOTS: usize = 40;
+
+/// A session's output horizon in its consumer's clear bytes: every record
+/// accepted for the wire, in wire order, tagged with the consumer's clear
+/// byte count at its end; each record written pops its tag into `through`.
+/// A record that does not carry the consumer's bytes (a KeyUpdate, an
+/// alert) carries the count as it stood, so it moves nothing.
+#[derive(Clone, Copy)]
+struct WriteHorizon {
+    /// Clear bytes the consumer handed down on this session (as this host
+    /// holds it).
+    clear_total: u64,
+    /// The horizon: clear bytes in records written.
+    through: u64,
+    /// What the consumer was last told.
+    reported: u64,
+    /// A report is owed whatever the horizon (a connection that moved
+    /// here: its consumer learns where the old one's output reached, 0
+    /// included).
+    owed: bool,
+    fifo: [u64; WH_SLOTS],
+    head: u8,
+    count: u8,
+    /// The accounting lost a record (the queue full, a hold dropped): the
+    /// horizon stops, never claiming bytes it cannot prove.
+    lost: bool,
+}
+
+impl WriteHorizon {
+    const fn empty() -> Self {
+        Self {
+            clear_total: 0,
+            through: 0,
+            reported: 0,
+            owed: false,
+            fifo: [0; WH_SLOTS],
+            head: 0,
+            count: 0,
+            lost: false,
+        }
+    }
+
+    /// A record entered the wire order, carrying the consumer's bytes as
+    /// they stand.
+    fn push(&mut self) {
+        if usize::from(self.count) == WH_SLOTS {
+            self.lost = true;
+            return;
+        }
+        let at = (usize::from(self.head) + usize::from(self.count)) % WH_SLOTS;
+        self.fifo[at] = self.clear_total;
+        self.count += 1;
+    }
+
+    /// The record last pushed did not enter the wire order after all.
+    fn unpush(&mut self) {
+        if self.count > 0 {
+            self.count -= 1;
+        }
+    }
+
+    /// The tag of the record `after` places from the end of the queue
+    /// (1: the newest); the horizon when the queue is shorter.
+    fn tag_from_end(&self, after: u64) -> u64 {
+        let n = u64::from(self.count);
+        if after == 0 || after > n {
+            return self.through;
+        }
+        let k = (u64::from(self.head) + n - after) as usize % WH_SLOTS;
+        self.fifo[k]
+    }
+
+    /// The oldest record accepted was written.
+    fn pop(&mut self) {
+        if self.count == 0 {
+            // A record nobody accounted for: the order is no longer known.
+            self.lost = true;
+            return;
+        }
+        let tag = self.fifo[usize::from(self.head)];
+        self.head = ((usize::from(self.head) + 1) % WH_SLOTS) as u8;
+        self.count -= 1;
+        if !self.lost && tag > self.through {
+            self.through = tag;
+        }
+    }
+}
 /// The part of a `MSG_PEER` payload after its connection id.
 const PEER_TAIL: usize = net_proto::PEER_LEN - net_proto::CONN_ID_LEN;
 
@@ -414,8 +508,8 @@ const NET_CMD_SEND: u8 = 0x11;
 /// The answer to `MSG_RETRANSMIT` (`net_proto::CMD_RESEND`): `[conn_id][seq: u32 LE][bytes]`,
 /// retained bytes sent again at their own sequence numbers.
 const NET_CMD_RESEND: u8 = net_proto::CMD_RESEND;
-/// On the clear side, from the consumer (`net_proto::CMD_DELIVERED`): `[conn_id]` — everything
-/// handed up on the connection so far is consumed (`delivery_ack`).
+/// On the clear side, from the consumer (`net_proto::CMD_DELIVERED`): `[conn_id][consumer_cursor]
+/// [in_bytes]` — the connection's first `in_bytes` clear bytes are consumed (`delivery_ack`).
 const NET_CMD_DELIVERED: u8 = net_proto::CMD_DELIVERED;
 /// The most one resend carries: one `ip` segment.
 const RESEND_MAX: usize = 1460;
@@ -556,6 +650,12 @@ struct TlsSession {
     retx_len: u16,
     retx_base_seq: u32,
     retx_seq_anchored: bool,
+    /// Bytes at the window's front that end a record whose head the peer
+    /// has acknowledged (0 when the window starts on a record), so the
+    /// records it holds can be told apart (`continuity::retx_records`);
+    /// `RETX_HEAD_UNKNOWN` for a window installed from a checkpoint, until
+    /// it next empties.
+    retx_head: u16,
 
     /// Traffic epochs: key updates applied per direction since the
     /// application keys were installed.
@@ -637,6 +737,8 @@ struct TlsSession {
     /// `0` for inbound (server) sessions.
     downstream_tag: net_proto::RequesterTag,
     span_id: [u8; 8],
+    /// The output horizon (`write_horizon`).
+    wh: WriteHorizon,
 }
 
 /// Flash-resident prototypes of the empty slots. A session, a DTLS peer
@@ -667,6 +769,7 @@ impl TlsSession {
             retx_len: 0,
             retx_base_seq: 0,
             retx_seq_anchored: false,
+            retx_head: 0,
             read_epoch: 0,
             write_epoch: 0,
             cont: SessionContinuity::empty(),
@@ -689,6 +792,7 @@ impl TlsSession {
             peer_pending: false,
             downstream_tag: 0,
             span_id: [0; 8],
+            wh: WriteHorizon::empty(),
         }
     }
 
@@ -716,6 +820,7 @@ impl TlsSession {
         self.retx_len = 0;
         self.retx_base_seq = 0;
         self.retx_seq_anchored = false;
+        self.retx_head = 0;
         self.read_epoch = 0;
         self.write_epoch = 0;
         self.cont.reset();
@@ -736,6 +841,7 @@ impl TlsSession {
         self.peer_pending = false;
         self.downstream_tag = 0;
         self.span_id = [0; 8];
+        self.wh = WriteHorizon::empty();
         self.read_keys = TrafficKeys::empty();
         self.write_keys = TrafficKeys::empty();
     }
@@ -944,6 +1050,8 @@ struct TlsState {
     redeliver: [u8; CONT_REDELIVER_MAX],
     redeliver_len: u32,
     redeliver_off: u32,
+    /// Bytes of the first redelivery its consumer's predecessor consumed.
+    redeliver_trim: u16,
     redeliver_idx: u8,
     redeliver_conn: u16,
 
@@ -962,6 +1070,18 @@ struct TlsState {
     /// resumed on a later step, so a count there is pressure and not lost
     /// bytes. Emitted on the `[tls] hb` line.
     frame_write_dropped: u32,
+    /// Strict pairs abandoned because the redelivery caps held with no
+    /// consumption for `CONT_HORIZON_MS` (`continuity::redelivery_room`).
+    redeliver_cap_abandoned: u32,
+    /// Strict pairs abandoned because `sc::STRICT_TX_RECORDS` records stood
+    /// unacknowledged by the peer's transport, with no acknowledgement for
+    /// `CONT_HORIZON_MS` (`continuity::strict_tx_room`).
+    txrec_cap_abandoned: u32,
+    /// `cont_out`'s ring, measured at `module_new` (`IOCTL_WRITABLE` on the
+    /// empty channel): whether it holds what a strict mirror may leave on it
+    /// (`continuity::CONT_OUT_NEED`). A strict pairing is refused when it
+    /// does not (`continuity::cont_out_admits_strict`).
+    cont_out_strict_ok: bool,
     /// `delivery_ack`: the clear-side consumer acknowledges what it has
     /// consumed (`CMD_DELIVERED`); otherwise a delivery handed up is
     /// consumed.
@@ -970,6 +1090,9 @@ struct TlsState {
     /// the peer's direction — the consumer is told (MSG_CLOSED) and may
     /// still write until it closes.
     half_close: u8,
+    /// `write_horizon`: report each session's output horizon to its
+    /// consumer (`MSG_HORIZON`).
+    write_horizon: u8,
     /// Records held back because the retransmit window had no room for
     /// them (retried on a later step), and segments resent from it.
     retx_full: u32,
@@ -1455,9 +1578,12 @@ define_params! {
         => |s, d, len| { s.label_id.trust_issuer = p_u8(d, len, 0, 0); };
 
     // The clear-side consumer acknowledges its deliveries with
-    // `CMD_DELIVERED` `[conn_id]` (everything handed up so far is
-    // consumed). A strict continuity pair mirrors the consumption, so a
-    // standby knows which deliveries a takeover still owes the consumer.
+    // `CMD_DELIVERED` `[conn_id][consumer_cursor][in_bytes]` (the first
+    // `in_bytes` clear bytes are consumed; a record counts as consumed when
+    // its plaintext ends at or before that byte). A strict continuity pair
+    // mirrors the consumption, so a standby knows from which byte a
+    // takeover redelivers, and holds the next record back while the
+    // unconsumed ones fill what a standby can redeliver.
     // 0: a delivery handed up counts as consumed.
     21, delivery_ack, u8, 0
         => |s, d, len| { s.delivery_ack = p_u8(d, len, 0, 0); };
@@ -1470,6 +1596,15 @@ define_params! {
     // close_notify are ignored. 0: either ends the session.
     22, half_close, u8, 0
         => |s, d, len| { s.half_close = p_u8(d, len, 0, 0); };
+
+    // The output horizon (`net_proto::MSG_HORIZON` `[conn_id]
+    // [bytes_through u64]`): the clear bytes this consumer handed down on a
+    // connection that are in records on the wire — under a crash-continuous
+    // pair, records the standby acknowledged before they left, so a
+    // response counted as given there survives the primary's loss. Sent on
+    // `clear_out` when it moves. 0: never sent.
+    23, write_horizon, u8, 0
+        => |s, d, len| { s.write_horizon = p_u8(d, len, 0, 0); };
 }
 
 /// `TlsSession::peer_closed` bits.
@@ -1535,6 +1670,8 @@ pub unsafe extern "C" fn module_new(
     s.ecdh_pool_hit = 0;
     s.ecdh_fallback_keygen = 0;
     s.frame_write_dropped = 0;
+    s.redeliver_cap_abandoned = 0;
+    s.txrec_cap_abandoned = 0;
     s.retx_full = 0;
     s.retx_resent = 0;
     s.hs_intake_deferred = 0;
@@ -1589,6 +1726,7 @@ pub unsafe extern "C" fn module_new(
     s.peer_identity = dev_channel_port(sys, 1, 2);
     s.cont_in = dev_channel_port(sys, 0, 2);
     s.cont_out = dev_channel_port(sys, 1, 3);
+    s.cont_out_strict_ok = cont_out_admits_strict(sys, s.cont_out);
     s.identity_cert_in = dev_channel_port(sys, 0, 3);
     s.identity_req_out = dev_channel_port(sys, 1, 4);
     s.cont_vault_handle = -1;
@@ -1598,6 +1736,7 @@ pub unsafe extern "C" fn module_new(
     s.custody_signer_open = false;
     s.redeliver_len = 0;
     s.redeliver_off = 0;
+    s.redeliver_trim = 0;
     s.redeliver_idx = 0;
     s.redeliver_conn = 0;
     let mut i = 0;
@@ -2016,6 +2155,7 @@ unsafe fn tcp_module_step(s: &mut TlsState) -> i32 {
     if continuity_step(s) {
         did_work = true;
     }
+    report_write_horizons(s);
 
     // `[tls] hb` heartbeat. 5000 steps to genuinely match `[ip] tlm` /
     // `[http] tlm` — the comment here claimed parity while the constant was
@@ -2044,6 +2184,8 @@ unsafe fn tcp_module_step(s: &mut TlsState) -> i32 {
                 // scrape — a counter that looks wired and measures nothing.
                 dev_telemetry_metric(tsys, -1, midx, t, c, 3, s.tlm.bytes_in as u64);
                 dev_telemetry_metric(tsys, -1, midx, t, c, 4, s.tlm.bytes_out as u64);
+                dev_telemetry_metric(tsys, -1, midx, t, c, 5, s.redeliver_cap_abandoned as u64);
+                dev_telemetry_metric(tsys, -1, midx, t, c, 6, s.txrec_cap_abandoned as u64);
             }
         }
         let buf = s.net_scratch.as_mut_ptr();
@@ -2065,6 +2207,10 @@ unsafe fn tcp_module_step(s: &mut TlsState) -> i32 {
         pos += fmt_u32_dec(s.frame_write_dropped, buf.add(pos));
         emit(b" pool_refill=", &mut pos);
         pos += fmt_u32_dec(s.ecdh_pool_refill, buf.add(pos));
+        emit(b" cap_abandoned=", &mut pos);
+        pos += fmt_u32_dec(s.redeliver_cap_abandoned, buf.add(pos));
+        emit(b" txrec_abandoned=", &mut pos);
+        pos += fmt_u32_dec(s.txrec_cap_abandoned, buf.add(pos));
         // Clear-side (HTTP seam) byte deltas for this window. The cipher
         // side rides the `[tls] tlm` line at the end of the step; keeping
         // both on the same 5000-step cadence means a window's four byte
@@ -2267,7 +2413,7 @@ unsafe fn tcp_module_step(s: &mut TlsState) -> i32 {
             if drain_clear_record(s, idx, conn_id, &mut off, pt_len) {
                 s.clear_pending_len = 0;
                 s.clear_pending_off = 0;
-                note_delivered(s, idx);
+                note_delivered(s, idx, pt_len);
                 did_work = true;
             } else {
                 s.clear_pending_off = off;
@@ -2912,20 +3058,25 @@ unsafe fn tcp_module_step(s: &mut TlsState) -> i32 {
         s.clear_in_bytes = s.clear_in_bytes.wrapping_add(3 + payload_len as u32);
         match msg_type {
             t if t == NET_CMD_DELIVERED => {
-                // `[conn_id]`: the consumer has consumed what it was handed.
+                // `[conn_id][consumer_cursor u64][in_bytes u64]`: the
+                // consumer has consumed the stream's first `in_bytes` clear
+                // bytes and stands at its cursor there. Any other length is
+                // ignored.
                 let pl = payload_len as usize;
-                let mut cb = [0u8; 2];
-                let rd = pl.min(2);
+                let mut cb = [0u8; net_proto::DELIVERED_LEN];
+                let rd = pl.min(cb.len());
                 if rd > 0 {
                     (sys.channel_read)(s.clear_in, cb.as_mut_ptr(), rd);
                 }
                 if pl > rd {
                     tls_discard(sys, s.clear_in, pl - rd);
                 }
-                if pl == 2 {
-                    let si = find_session_by_conn_id(s, u16::from_le_bytes(cb));
+                if let Some((conn, cursor, in_bytes)) =
+                    net_proto::delivered_parts(&cb[..rd.min(pl)])
+                {
+                    let si = find_session_by_conn_id(s, conn);
                     if si >= 0 {
-                        note_consumed(s, si as usize);
+                        note_consumed(s, si as usize, cursor, in_bytes);
                     }
                 }
             }
@@ -3236,11 +3387,16 @@ unsafe fn tcp_module_step(s: &mut TlsState) -> i32 {
             if s.sessions[i].held_msg_type != 0
                 || s.sessions[i].trace_ctx_pending
                 || s.sessions[i].peer_pending
+                || s.sessions[i].cont.resumed_owed
             {
                 forward_held_completion(s, i);
             }
-            // No data before the stream's peer report.
-            if s.sessions[i].recv_len >= 5 && !s.sessions[i].peer_pending {
+            // No data before the stream's peer report (and, for a stream
+            // resumed here, its MSG_RESUMED).
+            if s.sessions[i].recv_len >= 5
+                && !s.sessions[i].peer_pending
+                && !s.sessions[i].cont.resumed_owed
+            {
                 try_decrypt_forward(s, i);
             }
             // The peer's direction ended: told after everything it sent.
@@ -5929,6 +6085,8 @@ unsafe fn pump_recv_client_finished(s: &mut TlsState, idx: usize) -> bool {
 unsafe fn tell_peer_closed(s: &mut TlsState, idx: usize) {
     let sess = &s.sessions[idx];
     if sess.held_msg_type != 0
+        || sess.peer_pending
+        || sess.cont.resumed_owed
         || sess.cont.rx_held()
         || (s.clear_pending_len > 0 && s.clear_pending_idx as usize == idx)
         || redelivery_pending(s, idx)
@@ -6007,6 +6165,26 @@ unsafe fn forward_held_completion(s: &mut TlsState, idx: usize) {
             PEER_TAIL as u16,
         ) {
             s.sessions[idx].peer_pending = false;
+        } else {
+            return;
+        }
+    }
+    // A stream resumed here: where its predecessor's consumer stood, after
+    // the peer report and before any data. Retried until the write lands.
+    if s.sessions[idx].cont.resumed_owed && s.sessions[idx].held_msg_type == 0 {
+        let mut tail = [0u8; net_proto::RESUMED_LEN - net_proto::CONN_ID_LEN];
+        tail[..8].copy_from_slice(&s.sessions[idx].cont.resumed_cursor.to_le_bytes());
+        tail[8..16].copy_from_slice(&s.sessions[idx].cont.resumed_in.to_le_bytes());
+        tail[16..].copy_from_slice(&s.sessions[idx].cont.resumed_out.to_le_bytes());
+        if tls_write_or_count(
+            s,
+            s.clear_out,
+            NET_MSG_RESUMED,
+            conn_id,
+            tail.as_ptr(),
+            tail.len() as u16,
+        ) {
+            s.sessions[idx].cont.resumed_owed = false;
         } else {
             return;
         }
@@ -6907,6 +7085,7 @@ unsafe fn seal_clear(s: &mut TlsState, idx: usize, mut remaining: usize) -> bool
         let mut rec = [0u8; WIRE_RECORD_MAX];
         (sys.channel_read)(s.clear_in, rec.as_mut_ptr().add(5), rd);
         let sess = &mut s.sessions[idx];
+        sess.wh.clear_total = sess.wh.clear_total.wrapping_add(rd as u64);
         let enc_payload_len = match encrypt_record_in_place(
             sess.driver.suite,
             &mut sess.write_keys,
@@ -7040,6 +7219,10 @@ unsafe fn retx_push(sess: &mut TlsSession, rec: *const u8, n: u16) {
         &mut sess.retx_base_seq,
         rec,
     );
+    // A window holding only this record (or nothing) restarted on it.
+    if sess.retx_len == 0 || sess.retx_len == n {
+        sess.retx_head = 0;
+    }
 }
 
 /// Drop bytes up to `acked_seq` from the session's retransmit buffer.
@@ -7047,6 +7230,22 @@ unsafe fn retx_push(sess: &mut TlsSession, rec: *const u8, n: u16) {
 /// space (`retx_slide`) — IP supplies the absolute TCP sequence number
 /// and the stream's first.
 unsafe fn retx_ack(sess: &mut TlsSession, acked_seq: u32, isn: u32) {
+    let base = if sess.retx_seq_anchored {
+        sess.retx_base_seq
+    } else {
+        isn.wrapping_add(sess.retx_base_seq)
+    };
+    let d = acked_seq.wrapping_sub(base);
+    if d != 0 && d <= u32::from(sess.retx_len) {
+        sess.retx_head = retx_head_after(
+            &sess.retx_buf[..usize::from(sess.retx_len)],
+            sess.retx_head,
+            d as usize,
+        );
+        // The peer's transport moved: what the record ceiling holds back
+        // may go (`continuity::strict_tx_room`).
+        sess.cont.txrec_since_ms = 0;
+    }
     retx_slide(
         &mut sess.retx_buf,
         &mut sess.retx_len,
@@ -7365,7 +7564,7 @@ unsafe fn try_decrypt_forward(s: &mut TlsState, idx: usize) {
         if drain_clear_record(s, idx, conn_id, &mut off, pt_len) {
             s.clear_pending_len = 0;
             s.clear_pending_off = 0;
-            note_delivered(s, idx);
+            note_delivered(s, idx, pt_len);
         } else {
             s.clear_pending_off = off;
             return;
@@ -7527,7 +7726,7 @@ unsafe fn try_decrypt_forward(s: &mut TlsState, idx: usize) {
                 let mut off = 0usize;
                 let done = drain_clear_record(s, idx, conn_id, &mut off, pt_len);
                 if done {
-                    note_delivered(s, idx);
+                    note_delivered(s, idx, pt_len);
                 } else {
                     // Held, not dropped. Nothing else may decrypt until this
                     // record has left, or `record_scratch` would be
@@ -7985,6 +8184,34 @@ pub mod test_helpers {
             .map(|sess| sess.cont.epoch)
     }
 
+    /// Strict pairs abandoned when the redelivery caps held with no
+    /// consumption (`redeliver_cap_abandoned`).
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `TlsState`.
+    pub unsafe fn redeliver_cap_abandoned(state: *const u8) -> u32 {
+        (*(state as *const TlsState)).redeliver_cap_abandoned
+    }
+
+    /// Strict pairs abandoned when `sc::STRICT_TX_RECORDS` records stood
+    /// unacknowledged with no acknowledgement (`txrec_cap_abandoned`).
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `TlsState`.
+    pub unsafe fn txrec_cap_abandoned(state: *const u8) -> u32 {
+        (*(state as *const TlsState)).txrec_cap_abandoned
+    }
+
+    /// Whether `conn_id`'s session is mirrored to a standby.
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `TlsState`.
+    pub unsafe fn session_mirrored(state: *const u8, conn_id: u16) -> bool {
+        let s = &*(state as *const TlsState);
+        let i = find_session_by_conn_id(s, conn_id);
+        i >= 0 && s.sessions[i as usize].cont.mirror
+    }
+
     /// Shadows holding a reservation or an import.
     ///
     /// # Safety
@@ -8038,5 +8265,48 @@ pub mod test_helpers {
             super::send_key_update(s, si as usize, super::KEY_UPDATE_REQUESTED),
             super::EmitOutcome::Sent | super::EmitOutcome::Held
         )
+    }
+}
+
+/// Tell each session's consumer its output horizon when it moved
+/// (`write_horizon`). A report `clear_out` has no room for stays owed.
+unsafe fn report_write_horizons(s: &mut TlsState) {
+    if s.write_horizon == 0 {
+        return;
+    }
+    let sys = &*s.syscalls;
+    for idx in 0..s.sessions.len() {
+        let (conn_id, through, owed) = {
+            let sess = &s.sessions[idx];
+            // After the stream's accept, peer report and (resumed here)
+            // MSG_RESUMED: a horizon names a stream the consumer knows.
+            let ready = matches!(sess.state, SessionState::Ready | SessionState::Closing)
+                && sess.held_msg_type == 0
+                && !sess.peer_pending
+                && !sess.cont.resumed_owed;
+            (
+                sess.conn_id,
+                sess.wh.through,
+                ready && (sess.wh.owed || sess.wh.through > sess.wh.reported),
+            )
+        };
+        if !owed {
+            continue;
+        }
+        let b = through.to_le_bytes();
+        if tls_write_frame(
+            sys,
+            s.clear_out,
+            NET_MSG_HORIZON,
+            conn_id,
+            b.as_ptr(),
+            8,
+            &mut s.net_scratch,
+        ) {
+            s.sessions[idx].wh.reported = through;
+            s.sessions[idx].wh.owed = false;
+        } else {
+            break;
+        }
     }
 }

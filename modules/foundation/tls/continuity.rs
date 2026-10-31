@@ -76,6 +76,20 @@
 //   [ticket:1]            0 none (no resumption state is retained)
 //   [delivered_in:8]      records whose plaintext reached clear_out
 //   [emitted_out:8]       records whose ciphertext reached cipher_out
+//   [out_bytes:8]         the consumer's clear bytes through the last
+//                         record emitted (`net_proto::MSG_HORIZON`)
+//   [consumer_cursor:8]   the cursor the consumer's last `CMD_DELIVERED`
+//                         carried (0 for none), opaque here: a standby's
+//                         consumer is handed it at activation
+//                         (`net_proto::MSG_RESUMED`)
+//   [cursor_at:8]         the clear byte that acknowledgement carried
+//                         (`in_bytes`): the consumer had consumed the
+//                         stream's first `cursor_at` bytes (0 for none)
+//   [in_bytes:8]          the clear bytes of the `delivered_in` records,
+//                         where the first unconsumed delivery below starts;
+//                         a standby redelivers from byte
+//                         max(cursor_at, in_bytes), the first delivery
+//                         trimmed by the difference
 //   [recv_expected:4][recv_len:4]         partial inbound record bytes
 //   [retx_base_seq:4][retx_anchored:1][retx_len:2]
 //                         retained outbound ciphertext (byte-identical
@@ -290,6 +304,10 @@ const CKPT_FIXED_LEN: usize = 1
     + 1
     + 8
     + 8
+    + 8
+    + 8
+    + 8
+    + 8
     + 4
     + 4
     + 4
@@ -307,6 +325,12 @@ const CONT_REDELIVER_MAX: usize = 4 * 2 + 4 * 16384;
 const CONT_REDELIVER_MAX: usize = 8 * 2 + 8 * 512;
 /// And at most this many of them.
 const CONT_REDELIVER_COUNT: u8 = 8;
+/// Records handed up and not yet consumed a primary keeps account of
+/// (`delivery_ack`): a strict pair never lets more than
+/// `CONT_REDELIVER_COUNT` stand (`continuity_rx_gate`); beyond these the
+/// oldest is counted consumed, which only an unmirrored session reaches.
+const PEND_MAX: usize = 16;
+const _: () = assert!(PEND_MAX >= CONT_REDELIVER_COUNT as usize);
 /// Largest CT_TLS record this build emits or accepts.
 const TLS_CKPT_RECORD_MAX: usize =
     CKPT_FIXED_LEN + RECV_BUF_SIZE + RETX_BUF_SIZE + CONT_REDELIVER_MAX + TLS_SEALED_LEN;
@@ -334,8 +358,10 @@ const RECORD_IN_NOT_CARRIED: u8 = 0xFF;
 /// The strict RECORD_IN trailer, at its largest.
 const DELTA_IN_TRAILER_MAX: usize = 1 + 2 + DELIV_CARRY_MAX;
 /// `session_ctrl`'s `DELTA_TLS_DELIVERED`: the deliveries the clear-side
-/// consumer has consumed, `[delivered:8 LE]`, a cumulative count of records
-/// handed up.
+/// consumer has consumed, `[delivered:8 LE][consumer_cursor:8 LE]
+/// [cursor_at:8 LE]`, a cumulative count of the records handed up whose
+/// plaintext ends at or before `cursor_at`, and the cursor and clear byte
+/// the consumer's acknowledgement carried.
 pub const DELTA_TLS_DELIVERED: u8 = sc::DELTA_TLS_DELIVERED;
 /// KEY_UPDATE: `[direction:1][epoch:4][sealed_len:2][sealed...]`.
 const DELTA_KU_LEN: usize = 1 + 4 + 2 + TLS_SEALED_LEN;
@@ -355,6 +381,32 @@ const CONT_SCRATCH_SIZE: usize = DELTA_PAYLOAD_OFF + DELTA_PAYLOAD_MAX;
 const CONT_OUT_BUDGET: usize = 48 * 1024;
 #[cfg(not(target_arch = "aarch64"))]
 const CONT_OUT_BUDGET: usize = 12 * 1024;
+/// The most a strict mirror leaves on `cont_out` unread: what the inputs
+/// are held to (`CONT_OUT_BUDGET`, asked before each frame they give up),
+/// then the RECORD_OUTs of one `CMD_SEND`'s records held for their horizon
+/// (the clear side is frozen while they are), then an owed KeyUpdate
+/// answer. A strict pairing needs a `cont_out` ring that holds it
+/// (`cont_out_admits_strict`): a delta the channel refused would end the
+/// pair.
+const CONT_OUT_NEED: usize = CONT_OUT_BUDGET
+    + abi::contracts::net::net_proto::MAX_CMD_DATA
+    + TX_HOLD_RECORDS
+        * (DELTA_PAYLOAD_OFF + DELTA_OUT_HDR + 8 + (WIRE_RECORD_MAX - CLEAR_CHUNK_MAX))
+    + DELTA_PAYLOAD_OFF
+    + DELTA_KU_LEN;
+// The ring the manifest asks for on aarch64 holds it.
+#[cfg(target_arch = "aarch64")]
+const _: () = assert!(CONT_OUT_NEED <= 64 * 1024);
+// What a strict pair's provider holds of a connection (`session_ctrl`'s
+// strict bounds) holds each buffer of this module's a delta carries: the
+// retransmit window, the partial record, a record's plaintext.
+const _: () = assert!(RETX_BUF_SIZE <= sc::STRICT_SEND_BYTES);
+const _: () = assert!(RECV_BUF_SIZE <= sc::STRICT_RECV_BYTES);
+const _: () = assert!(DELIV_CARRY_MAX <= sc::STRICT_DELIVERY_BYTES);
+/// `TlsSession::retx_head` of a window whose record boundaries are not
+/// known (installed from a checkpoint, which carries the bytes and not
+/// where its records start).
+pub(crate) const RETX_HEAD_UNKNOWN: u16 = u16::MAX;
 /// CUT manifest body.
 const CUT_BODY_LEN: usize = 4 + 4 + 32 + 1 + 2 + TLS_SEALED_LEN;
 /// The largest reply body: a CUT manifest, or custody evidence.
@@ -582,6 +634,16 @@ struct TlsCheckpoint {
     close_notify: u8,
     delivered_in: u64,
     emitted_out: u64,
+    /// The consumer's clear bytes through the last record emitted: its
+    /// output horizon, in its numbering (`net_proto::MSG_HORIZON`).
+    out_bytes: u64,
+    /// The cursor the consumer's last `CMD_DELIVERED` carried, and the
+    /// clear byte it stood at.
+    consumer_cursor: u64,
+    cursor_at: u64,
+    /// The clear bytes of the `delivered_in` records: where the first
+    /// unconsumed delivery starts.
+    in_bytes: u64,
     recv_expected: u32,
     recv_len: u32,
     recv: [u8; RECV_BUF_SIZE],
@@ -621,6 +683,10 @@ impl TlsCheckpoint {
             close_notify: 0,
             delivered_in: 0,
             emitted_out: 0,
+            out_bytes: 0,
+            consumer_cursor: 0,
+            cursor_at: 0,
+            in_bytes: 0,
             recv_expected: 0,
             recv_len: 0,
             recv: [0; RECV_BUF_SIZE],
@@ -656,6 +722,10 @@ impl TlsCheckpoint {
         self.requester_tag = 0;
         self.peer_id = PeerIdFacts::empty();
         self.emitted_out = 0;
+        self.out_bytes = 0;
+        self.consumer_cursor = 0;
+        self.cursor_at = 0;
+        self.in_bytes = 0;
         self.delivered_in = 0;
         self.read_seq = 0;
         self.write_seq = 0;
@@ -753,7 +823,8 @@ struct SessionContinuity {
     /// The mirror was abandoned and the abort has not yet left `cont_out`.
     abandon_pending: bool,
     /// `dev_millis` when a strict horizon (or an undelivered abort) began
-    /// to wait, 0 while nothing does. A horizon is a promise the standby
+    /// to wait with no answer from the standby since — each acknowledgement
+    /// restarts it (`apply_delta_ack`) — 0 while nothing does. A horizon is a promise the standby
     /// confirms within a bounded time; one it never confirms would
     /// otherwise freeze this instance's inputs for every session.
     horizon_since_ms: u64,
@@ -791,10 +862,41 @@ struct SessionContinuity {
     rx_owed: bool,
     rx_owed_type: u8,
     rx_owed_len: u16,
-    /// Deliveries the clear-side consumer has consumed, and the count last
-    /// mirrored as DELTA_TLS_DELIVERED.
+    /// Deliveries the clear-side consumer has consumed — the records
+    /// handed up whose plaintext ends at or before the clear byte its last
+    /// `CMD_DELIVERED` carried — and the count last mirrored as
+    /// DELTA_TLS_DELIVERED.
     consumed: u64,
     consumed_told: u64,
+    /// The cursor the consumer's last `CMD_DELIVERED` carried (opaque, 0
+    /// for none) and its clear byte (`in_bytes`), and the ones last
+    /// mirrored with the count.
+    consumer_cursor: u64,
+    cursor_told: u64,
+    cursor_at: u64,
+    cursor_at_told: u64,
+    /// The clear byte the last record handed up ends at, in the consumer's
+    /// numbering (from the stream's start, across takeovers).
+    handed_bytes: u64,
+    /// The records handed up and not yet consumed (`delivery_ack`): where
+    /// each ends, oldest first, and their plaintext bytes in all.
+    pend_end: [u64; PEND_MAX],
+    pend_len: [u16; PEND_MAX],
+    pend_n: u8,
+    pend_bytes: u32,
+    /// `dev_millis` when the redelivery caps began holding the next record
+    /// back with no consumption since (0 while they do not).
+    cap_since_ms: u64,
+    /// `dev_millis` when the record ceiling (`sc::STRICT_TX_RECORDS`) began
+    /// holding the next outbound record back with no acknowledgement from
+    /// the peer's transport since (0 while it does not).
+    pub(crate) txrec_since_ms: u64,
+    /// Activated here: `MSG_RESUMED` (`[cursor][in_bytes][out_bytes]`) is
+    /// owed to the consumer, after the peer report and before any data.
+    resumed_owed: bool,
+    resumed_cursor: u64,
+    resumed_in: u64,
+    resumed_out: u64,
     /// Write-side key-update barrier.
     write_barrier_pending: bool,
     write_barrier_delta: u32,
@@ -847,6 +949,21 @@ impl SessionContinuity {
             rx_owed_len: 0,
             consumed: 0,
             consumed_told: 0,
+            consumer_cursor: 0,
+            cursor_told: 0,
+            cursor_at: 0,
+            cursor_at_told: 0,
+            handed_bytes: 0,
+            pend_end: [0; PEND_MAX],
+            pend_len: [0; PEND_MAX],
+            pend_n: 0,
+            pend_bytes: 0,
+            cap_since_ms: 0,
+            txrec_since_ms: 0,
+            resumed_owed: false,
+            resumed_cursor: 0,
+            resumed_in: 0,
+            resumed_out: 0,
             write_barrier_pending: false,
             write_barrier_delta: 0,
             retired_write: TrafficKeys::empty(),
@@ -893,6 +1010,19 @@ impl SessionContinuity {
         self.rx_owed_len = 0;
         self.consumed = 0;
         self.consumed_told = 0;
+        self.consumer_cursor = 0;
+        self.cursor_told = 0;
+        self.cursor_at = 0;
+        self.cursor_at_told = 0;
+        self.handed_bytes = 0;
+        self.pend_n = 0;
+        self.pend_bytes = 0;
+        self.cap_since_ms = 0;
+        self.txrec_since_ms = 0;
+        self.resumed_owed = false;
+        self.resumed_cursor = 0;
+        self.resumed_in = 0;
+        self.resumed_out = 0;
         self.write_barrier_pending = false;
         self.write_barrier_delta = 0;
         self.retired_pending = false;
@@ -1576,6 +1706,12 @@ unsafe fn encode_checkpoint(
     e.u8(0); // ticket
     e.u64(sess.cont.delivered_in);
     e.u64(sess.cont.emitted_out);
+    e.u64(sess.wh.through);
+    e.u64(sess.cont.consumer_cursor);
+    e.u64(sess.cont.cursor_at);
+    // Everything handed up counts as delivered here: the record carries no
+    // deliveries of its own.
+    e.u64(sess.cont.handed_bytes);
     e.u32(sess.recv_expected as u32);
     e.u32(sess.recv_len as u32);
     e.u32(sess.retx_base_seq);
@@ -1789,7 +1925,12 @@ unsafe fn decode_into(
     if d.u8() != Some(0) || d.u8() != Some(0) {
         return false;
     }
-    let (delivered_in, emitted_out) = match (d.u64(), d.u64()) {
+    let (delivered_in, emitted_out, out_bytes, consumer_cursor) =
+        match (d.u64(), d.u64(), d.u64(), d.u64()) {
+            (Some(a), Some(b), Some(c), Some(k)) => (a, b, c, k),
+            _ => return false,
+        };
+    let (cursor_at, in_bytes) = match (d.u64(), d.u64()) {
         (Some(a), Some(b)) => (a, b),
         _ => return false,
     };
@@ -1918,6 +2059,10 @@ unsafe fn decode_into(
     ck.close_notify = close_notify;
     ck.delivered_in = delivered_in;
     ck.emitted_out = emitted_out;
+    ck.out_bytes = out_bytes;
+    ck.consumer_cursor = consumer_cursor;
+    ck.cursor_at = cursor_at;
+    ck.in_bytes = in_bytes;
     ck.recv_expected = recv_expected;
     ck.recv_len = recv_len;
     core::ptr::copy_nonoverlapping(recv_p, ck.recv.as_mut_ptr(), recv_len as usize);
@@ -2233,7 +2378,9 @@ unsafe fn mirror_lost(s: &mut TlsState, idx: usize) {
 /// sequence number it was sealed under.
 unsafe fn mirror_record_out(s: &mut TlsState, idx: usize, rec: *const u8, total: usize) -> u32 {
     let seq = s.sessions[idx].write_keys.seq.wrapping_sub(1);
-    mirror_record_out_at(s, idx, rec, total, seq)
+    // Written already: the horizon's tag for it is the one just popped.
+    let out_bytes = s.sessions[idx].wh.through;
+    mirror_record_out_at(s, idx, rec, total, seq, out_bytes)
 }
 
 /// `mirror_record_out` for a record sealed under write sequence `seq`: a
@@ -2244,6 +2391,7 @@ unsafe fn mirror_record_out_at(
     rec: *const u8,
     total: usize,
     seq: u64,
+    out_bytes: u64,
 ) -> u32 {
     let no = delta_begin(s, idx, sc::DELTA_TLS_RECORD_OUT);
     let epoch = s.sessions[idx].write_epoch;
@@ -2255,6 +2403,7 @@ unsafe fn mirror_record_out_at(
     e.u64(seq);
     e.u16(total as u16);
     e.raw(rec, total);
+    e.u64(out_bytes);
     if !e.ok {
         return 0;
     }
@@ -2326,6 +2475,121 @@ fn retx_slide(
     buf.copy_within(d..d + remain, 0);
     *len = remain as u16;
     *base = acked_seq;
+}
+
+/// Where the first record boundary sits after `d` bytes leave the front of
+/// `window` (records pushed whole; its first `head` bytes end a record
+/// whose head already left). `RETX_HEAD_UNKNOWN` stays unknown until the
+/// window empties, and a window whose headers do not walk becomes unknown.
+fn retx_head_after(window: &[u8], head: u16, d: usize) -> u16 {
+    if d >= window.len() {
+        return 0;
+    }
+    if head == RETX_HEAD_UNKNOWN {
+        return RETX_HEAD_UNKNOWN;
+    }
+    let head = usize::from(head);
+    if d < head {
+        return (head - d) as u16;
+    }
+    let mut at = head;
+    while at < d {
+        let rl = held_record_len(window, at, window.len());
+        if rl == 0 {
+            return RETX_HEAD_UNKNOWN;
+        }
+        at += rl;
+    }
+    (at - d) as u16
+}
+
+/// Records with a byte in the retransmit window — those the peer's
+/// transport has not wholly acknowledged — or `None` when its boundaries
+/// are not known.
+fn retx_records(window: &[u8], head: u16) -> Option<usize> {
+    if head == RETX_HEAD_UNKNOWN {
+        return None;
+    }
+    let head = usize::from(head).min(window.len());
+    let mut n = usize::from(head > 0);
+    let mut at = head;
+    while at < window.len() {
+        let rl = held_record_len(window, at, window.len());
+        if rl == 0 {
+            return None;
+        }
+        n += 1;
+        at += rl;
+    }
+    Some(n)
+}
+
+/// Outbound records of session `idx` the canonical record of a strict pair
+/// holds: those in the retransmit window and those held for their horizon
+/// (`None` when the window's boundaries are not known).
+fn strict_tx_records(s: &TlsState, idx: usize) -> Option<usize> {
+    let sess = &s.sessions[idx];
+    let mut n = retx_records(&sess.retx_buf[..usize::from(sess.retx_len)], sess.retx_head)?;
+    let len = usize::from(sess.cont.tx_hold_len);
+    let mut at = 0;
+    while at < len {
+        let rl = held_record_len(&sess.cont.tx_hold, at, len);
+        if rl == 0 {
+            return None;
+        }
+        n += 1;
+        at += rl;
+    }
+    Some(n)
+}
+
+/// Under a strict pair: may one more outbound record be written or held?
+/// Only while the records the peer's transport has not acknowledged, with
+/// this one, stay within what the canonical record holds
+/// (`sc::STRICT_TX_RECORDS`, its `TS_TXREC_MAX`); otherwise the record waits
+/// (`EmitOutcome::Blocked`) and the acknowledgement that slides the window
+/// releases it. A peer that acknowledges nothing for `CONT_HORIZON_MS` while
+/// the ceiling holds would hold the connection for ever: the pair is
+/// abandoned then and the connection goes on unmirrored
+/// (`txrec_cap_abandoned`).
+unsafe fn strict_tx_room(s: &mut TlsState, idx: usize) -> bool {
+    if matches!(strict_tx_records(s, idx), Some(n) if n < sc::STRICT_TX_RECORDS) {
+        s.sessions[idx].cont.txrec_since_ms = 0;
+        return true;
+    }
+    let now = dev_millis(&*s.syscalls).max(1);
+    let since = s.sessions[idx].cont.txrec_since_ms;
+    if since == 0 {
+        s.sessions[idx].cont.txrec_since_ms = now;
+        return false;
+    }
+    if now.wrapping_sub(since) <= CONT_HORIZON_MS {
+        return false;
+    }
+    let sys = &*s.syscalls;
+    let msg: &[u8] =
+        b"[tls] continuity record ceiling held with no acknowledgement; mirror abandoned";
+    dev_log(sys, 2, msg.as_ptr(), msg.len());
+    s.txrec_cap_abandoned = s.txrec_cap_abandoned.wrapping_add(1);
+    s.sessions[idx].cont.txrec_since_ms = 0;
+    mirror_abandon(s, idx);
+    false
+}
+
+/// Whether `cont_out` — empty: this runs at `module_new` — holds what a
+/// strict mirror may leave on it (`CONT_OUT_NEED`). A ring the kernel
+/// measures smaller (a mailbox measures 0) is refused strict pairing; an
+/// unwired port, or a channel the kernel does not measure, claims nothing
+/// and is not.
+unsafe fn cont_out_admits_strict(sys: &SyscallTable, ch: i32) -> bool {
+    if ch < 0 {
+        return true;
+    }
+    let mut free = [0u8; 4];
+    if dev_channel_ioctl(sys, ch, IOCTL_WRITABLE, free.as_mut_ptr(), 4) < 0 {
+        return true;
+    }
+    u32::from_le_bytes(free) as usize >= CONT_OUT_NEED
 }
 
 /// Mirror the retransmit window sliding on a transport acknowledgement.
@@ -2515,6 +2779,9 @@ unsafe fn emit_record(s: &mut TlsState, idx: usize, rec: *const u8, total: usize
         (c.mirror, c.strict())
     };
     if mirror && strict {
+        if !strict_tx_room(s, idx) {
+            return EmitOutcome::Blocked;
+        }
         {
             // What is held goes into the window when it is released: the
             // window must have room for it, and for this record, now.
@@ -2532,6 +2799,8 @@ unsafe fn emit_record(s: &mut TlsState, idx: usize, rec: *const u8, total: usize
             core::ptr::copy_nonoverlapping(rec, c.tx_hold.as_mut_ptr().add(len), total);
             c.tx_hold_len = (len + total) as u16;
         }
+        // In the wire order now, behind the hold.
+        s.sessions[idx].wh.push();
         mirror_tx_hold(s, idx);
         return EmitOutcome::Held;
     }
@@ -2539,7 +2808,9 @@ unsafe fn emit_record(s: &mut TlsState, idx: usize, rec: *const u8, total: usize
     if tx_stalled(s, idx) {
         return EmitOutcome::Blocked;
     }
+    s.sessions[idx].wh.push();
     if !write_record_now(s, idx, rec, total) {
+        s.sessions[idx].wh.unpush();
         return EmitOutcome::Blocked;
     }
     if mirror && mirror_record_out(s, idx, rec, total) == 0 {
@@ -2589,7 +2860,9 @@ unsafe fn flush_tx_stall(s: &mut TlsState) -> bool {
             }
         };
     }
+    s.sessions[idx].wh.push();
     if !write_record_now(s, idx, rec, n) {
+        s.sessions[idx].wh.unpush();
         return false;
     }
     s.tx_stall_len = 0;
@@ -2632,6 +2905,7 @@ unsafe fn write_record_now(s: &mut TlsState, idx: usize, rec: *const u8, total: 
     }
     s.tlm.bytes_out = s.tlm.bytes_out.wrapping_add(4 + total as u32);
     retx_push(&mut s.sessions[idx], rec, total as u16);
+    s.sessions[idx].wh.pop();
     let c = &mut s.sessions[idx].cont;
     c.emitted_out = c.emitted_out.wrapping_add(1);
     true
@@ -2678,9 +2952,13 @@ unsafe fn mirror_tx_hold(s: &mut TlsState, idx: usize) {
             at += t;
         }
         let seq = s.sessions[idx].write_keys.seq.wrapping_sub(after);
+        // Its horizon tag: the hold is the tail of the wire order, so the
+        // record `after` from the end of the hold is that far from the
+        // queue's end.
+        let out_bytes = s.sessions[idx].wh.tag_from_end(after);
         let mut local = [0u8; WIRE_RECORD_MAX];
         local[..total].copy_from_slice(&s.sessions[idx].cont.tx_hold[off..off + total]);
-        let no = mirror_record_out_at(s, idx, local.as_ptr(), total, seq);
+        let no = mirror_record_out_at(s, idx, local.as_ptr(), total, seq, out_bytes);
         cont_wipe(&mut local[..total]);
         if no == 0 {
             return;
@@ -2708,7 +2986,9 @@ unsafe fn release_tx_hold(s: &mut TlsState, idx: usize) {
         }
         let total = held_record_len(&s.sessions[idx].cont.tx_hold, 0, len);
         if total == 0 {
-            // Not a record: the hold is unusable and is dropped.
+            // Not a record: the hold is unusable and is dropped, and with
+            // it the horizon's account of what is on the wire.
+            s.sessions[idx].wh.lost = true;
             let c = &mut s.sessions[idx].cont;
             cont_wipe(&mut c.tx_hold[..len]);
             c.tx_hold_len = 0;
@@ -2740,6 +3020,14 @@ unsafe fn apply_delta_ack(s: &mut TlsState, idx: usize, delta_no: u32) {
         let c = &mut s.sessions[idx].cont;
         if delta_no > c.acked_delta {
             c.acked_delta = delta_no;
+            // The standby answered: the budget measures a standby that has
+            // stopped answering, not a connection busy for longer than it.
+            // Under sustained traffic one hold follows the next with no step
+            // between them free of a horizon, and a budget counted from the
+            // first would abandon a healthy pair.
+            if c.mirror && !c.abandon_pending && !c.cut_pending {
+                c.horizon_since_ms = 0;
+            }
         }
         if c.acked_delta.wrapping_add(1) >= c.next_delta {
             c.delta_unacked_bytes = 0;
@@ -2797,7 +3085,10 @@ unsafe fn continuity_rx_gate(s: &mut TlsState, idx: usize, rec_len: usize) -> bo
         s.sessions[idx].cont.rx_released = false;
         // One horizon in flight per session: a key-update answer to this
         // record needs the hold slot free.
-        return !pending && !tx_busy && !barrier;
+        if pending || tx_busy || barrier {
+            return false;
+        }
+        return redelivery_room(s, idx, rec_len);
     }
     if released {
         s.sessions[idx].cont.rx_released = false;
@@ -2810,6 +3101,60 @@ unsafe fn continuity_rx_gate(s: &mut TlsState, idx: usize, rec_len: usize) -> bo
         mirror_abandon(s, idx);
     }
     true
+}
+
+/// Under a strict pair whose consumer acknowledges (`delivery_ack`): may
+/// the record at the head of recv_buf (`rec_len` payload bytes) be opened
+/// and handed up? Only while what stands unconsumed with it fits what the
+/// standby holds for a takeover to redeliver — fewer than
+/// `CONT_REDELIVER_COUNT` records, and their entries with this one's within
+/// `CONT_REDELIVER_MAX` — and the consumption that made room has been
+/// mirrored ahead of it. Otherwise the record stays in recv_buf and the
+/// back-pressure reaches the TCP window. A consumer that cannot free room
+/// (a message of its own spanning more records than the caps) would hold
+/// the connection for ever: when no consumption has come for
+/// `CONT_HORIZON_MS` while the caps hold, the pair is abandoned and the
+/// connection goes on unmirrored (`redeliver_cap_abandoned`).
+unsafe fn redelivery_room(s: &mut TlsState, idx: usize, rec_len: usize) -> bool {
+    // Without `delivery_ack` a delivery is consumed when it is handed up,
+    // and its consumption is mirrored here too, before the next is opened:
+    // the standby never holds more deliveries than the caps either way.
+    mirror_consumed(s, idx);
+    let (fits, told) = {
+        let c = &s.sessions[idx].cont;
+        // The record's plaintext is at most its payload less the tag and
+        // the inner content type.
+        let pt_max = rec_len.saturating_sub(17);
+        let n = usize::from(c.pend_n) + 1;
+        let fits = n <= usize::from(CONT_REDELIVER_COUNT)
+            && 2 * n + c.pend_bytes as usize + pt_max <= CONT_REDELIVER_MAX;
+        (fits, c.consumed == c.consumed_told)
+    };
+    if fits && told {
+        s.sessions[idx].cont.cap_since_ms = 0;
+        return true;
+    }
+    if !told {
+        // The consumption is still to leave `cont_out`: the horizon budget
+        // covers a standby that stopped answering.
+        return false;
+    }
+    let now = dev_millis(&*s.syscalls).max(1);
+    let since = s.sessions[idx].cont.cap_since_ms;
+    if since == 0 {
+        s.sessions[idx].cont.cap_since_ms = now;
+        return false;
+    }
+    if now.wrapping_sub(since) <= CONT_HORIZON_MS {
+        return false;
+    }
+    let sys = &*s.syscalls;
+    let msg: &[u8] = b"[tls] continuity redelivery caps held with no consumption; mirror abandoned";
+    dev_log(sys, 2, msg.as_ptr(), msg.len());
+    s.redeliver_cap_abandoned = s.redeliver_cap_abandoned.wrapping_add(1);
+    s.sessions[idx].cont.cap_since_ms = 0;
+    mirror_abandon(s, idx);
+    false
 }
 
 /// Under the strict profile, after the record at the head of recv_buf was
@@ -2868,31 +3213,84 @@ unsafe fn continuity_rx_owed(s: &mut TlsState, idx: usize) {
     }
 }
 
-/// A record's plaintext reached clear_out. Without `delivery_ack` that is
-/// also its consumption.
-fn note_delivered(s: &mut TlsState, idx: usize) {
+/// A record's `len` bytes of plaintext reached clear_out. Without
+/// `delivery_ack` that is also its consumption; with it the record waits,
+/// by where it ends, for the consumer's acknowledgement to reach that byte.
+fn note_delivered(s: &mut TlsState, idx: usize, len: usize) {
     let worker_acks = s.delivery_ack != 0;
     let c = &mut s.sessions[idx].cont;
     c.delivered_in = c.delivered_in.wrapping_add(1);
+    c.handed_bytes = c.handed_bytes.wrapping_add(len as u64);
     if !worker_acks {
+        // Consumed as handed up: the consumer stands at its end.
         c.consumed = c.delivered_in;
+        c.cursor_at = c.handed_bytes;
+        return;
     }
+    if usize::from(c.pend_n) == PEND_MAX {
+        // Only an unmirrored session gets here (a strict pair stops at
+        // `CONT_REDELIVER_COUNT`): the oldest is counted consumed.
+        c.pend_bytes -= u32::from(c.pend_len[0]);
+        c.pend_end.copy_within(1.., 0);
+        c.pend_len.copy_within(1.., 0);
+        c.pend_n -= 1;
+        c.consumed = c.consumed.wrapping_add(1);
+    }
+    let n = usize::from(c.pend_n);
+    c.pend_end[n] = c.handed_bytes;
+    c.pend_len[n] = len as u16;
+    c.pend_n += 1;
+    c.pend_bytes += len as u32;
 }
 
-/// The clear-side consumer acknowledged everything handed up so far
-/// (`CMD_DELIVERED`, under `delivery_ack`).
-fn note_consumed(s: &mut TlsState, idx: usize) {
+/// The clear-side consumer has consumed the stream's first `in_bytes`
+/// clear bytes and stands at `cursor` there (`CMD_DELIVERED`, under
+/// `delivery_ack`). The records whose plaintext ends at or before that byte
+/// are consumed; one it falls inside is not, and a takeover redelivers it
+/// from that byte. An acknowledgement behind the last, or past what was
+/// handed up (with the part of a record still going out), is ignored.
+fn note_consumed(s: &mut TlsState, idx: usize, cursor: u64, in_bytes: u64) {
+    let partial = if s.clear_pending_len > 0 && s.clear_pending_idx as usize == idx {
+        s.clear_pending_off as u64
+    } else {
+        0
+    };
     let c = &mut s.sessions[idx].cont;
-    c.consumed = c.delivered_in;
+    if in_bytes < c.cursor_at || in_bytes > c.handed_bytes.wrapping_add(partial) {
+        return;
+    }
+    let mut k = 0usize;
+    while k < usize::from(c.pend_n) && c.pend_end[k] <= in_bytes {
+        c.pend_bytes -= u32::from(c.pend_len[k]);
+        k += 1;
+    }
+    if k > 0 {
+        c.pend_end.copy_within(k.., 0);
+        c.pend_len.copy_within(k.., 0);
+        c.pend_n -= k as u8;
+        c.consumed = c.consumed.wrapping_add(k as u64);
+        c.cap_since_ms = 0;
+    }
+    c.consumer_cursor = cursor;
+    c.cursor_at = in_bytes;
 }
 
 /// Mirror what the consumer has consumed since it was last mirrored.
 unsafe fn mirror_consumed(s: &mut TlsState, idx: usize) {
-    let (mirror, strict, consumed, told) = {
+    let (mirror, strict, consumed, told, cursor, cursor_told, at, at_told) = {
         let c = &s.sessions[idx].cont;
-        (c.mirror, c.strict(), c.consumed, c.consumed_told)
+        (
+            c.mirror,
+            c.strict(),
+            c.consumed,
+            c.consumed_told,
+            c.consumer_cursor,
+            c.cursor_told,
+            c.cursor_at,
+            c.cursor_at_told,
+        )
     };
-    if !mirror || !strict || consumed == told {
+    if !mirror || !strict || (consumed == told && cursor == cursor_told && at == at_told) {
         return;
     }
     let _ = delta_begin(s, idx, DELTA_TLS_DELIVERED);
@@ -2901,8 +3299,13 @@ unsafe fn mirror_consumed(s: &mut TlsState, idx: usize) {
         DELTA_PAYLOAD_MAX,
     );
     e.u64(consumed);
+    e.u64(cursor);
+    e.u64(at);
     if e.ok && delta_finish(s, idx, e.pos) {
-        s.sessions[idx].cont.consumed_told = consumed;
+        let c = &mut s.sessions[idx].cont;
+        c.consumed_told = consumed;
+        c.cursor_told = cursor;
+        c.cursor_at_told = at;
     }
 }
 
@@ -3079,6 +3482,23 @@ unsafe fn handle_pair_prepare(s: &mut TlsState, p: &[u8]) {
                 epoch,
                 sc::CR_PAIR_PREPARED,
                 sc::STATUS_STALE_EPOCH,
+                &body,
+            );
+            return;
+        }
+        if profile == sc::PROFILE_CRASH_CONTINUOUS && !s.cont_out_strict_ok {
+            // The graph's `cont_out` is smaller than what a strict mirror
+            // may leave on it: a delta it refused would end the pair.
+            let sys = &*s.syscalls;
+            let msg: &[u8] =
+                b"[tls] continuity: cont_out holds less than a strict mirror needs; strict pairing refused";
+            dev_log(sys, 1, msg.as_ptr(), msg.len());
+            cont_reply(
+                s,
+                flow,
+                epoch,
+                sc::CR_PAIR_PREPARED,
+                sc::STATUS_NO_CAPACITY,
                 &body,
             );
             return;
@@ -3378,6 +3798,8 @@ unsafe fn handle_continuity_reply(s: &mut TlsState, p: &[u8]) {
     c.cut_pending = false;
     c.mirror = true;
     c.consumed_told = c.consumed;
+    c.cursor_told = c.consumer_cursor;
+    c.cursor_at_told = c.cursor_at;
     if c.strict() {
         // From here every transition waits on the standby: the horizons
         // keep it exact, and the clear side may move again.
@@ -3760,7 +4182,7 @@ unsafe fn shadow_apply_delta(s: &mut TlsState, sh: usize, kind: u8, data: &[u8])
             // Nothing is sealed after our own close_notify.
             if ep != ck.write_epoch
                 || seq != ck.write_seq
-                || d.remaining() != n
+                || d.remaining() != n + 8
                 || n == 0
                 || ck.close_notify & 1 != 0
             {
@@ -3770,6 +4192,12 @@ unsafe fn shadow_apply_delta(s: &mut TlsState, sh: usize, kind: u8, data: &[u8])
                 Some(p) => p,
                 None => return sc::STATUS_CORRUPT,
             };
+            // The consumer's clear bytes through this record: never back.
+            let out_bytes = match d.u64() {
+                Some(b) if b >= ck.out_bytes => b,
+                _ => return sc::STATUS_CORRUPT,
+            };
+            ck.out_bytes = out_bytes;
             ck.write_seq = seq.wrapping_add(1);
             ck.emitted_out = ck.emitted_out.wrapping_add(1);
             let rec = core::slice::from_raw_parts(src, n);
@@ -3866,17 +4294,24 @@ unsafe fn shadow_apply_delta(s: &mut TlsState, sh: usize, kind: u8, data: &[u8])
             ck.recv_len = n as u32;
             sc::STATUS_OK
         }
-        // Strict-profile deltas only. `[consumed:8]`, cumulative: the
-        // deliveries it covers leave the shadow, oldest first. A count at or
-        // below the record's is of deliveries handed up before the
+        // Strict-profile deltas only. `[consumed:8][consumer_cursor:8]
+        // [cursor_at:8]`, cumulative: the deliveries it covers leave the
+        // shadow, oldest first, their bytes counted into `in_bytes`, and the
+        // cursor and its clear byte are the latest the consumer gave. A
+        // count below the record's is of deliveries handed up before the
         // checkpoint, which the record never held.
         DELTA_TLS_DELIVERED if strict => {
-            let Some(n) = d.u64() else {
+            let (Some(n), Some(cursor), Some(at)) = (d.u64(), d.u64(), d.u64()) else {
                 return sc::STATUS_CORRUPT;
             };
             if d.remaining() != 0 {
                 return sc::STATUS_CORRUPT;
             }
+            if at < ck.cursor_at {
+                return sc::STATUS_OK;
+            }
+            ck.consumer_cursor = cursor;
+            ck.cursor_at = at;
             if n <= ck.delivered_in {
                 return sc::STATUS_OK;
             }
@@ -3885,17 +4320,26 @@ unsafe fn shadow_apply_delta(s: &mut TlsState, sh: usize, kind: u8, data: &[u8])
             }
             let k = (n - ck.delivered_in) as u8;
             let len = ck.deliv_len as usize;
-            let mut at = 0usize;
+            let mut at_b = 0usize;
+            let mut bytes = 0u64;
             let mut i = 0u8;
             while i < k {
-                at += 2 + usize::from(u16::from_le_bytes([ck.deliv[at], ck.deliv[at + 1]]));
+                let l = usize::from(u16::from_le_bytes([ck.deliv[at_b], ck.deliv[at_b + 1]]));
+                bytes += l as u64;
+                at_b += 2 + l;
                 i += 1;
             }
-            ck.deliv.copy_within(at..len, 0);
-            cont_wipe(&mut ck.deliv[len - at..len]);
-            ck.deliv_len = (len - at) as u32;
+            ck.deliv.copy_within(at_b..len, 0);
+            cont_wipe(&mut ck.deliv[len - at_b..len]);
+            ck.deliv_len = (len - at_b) as u32;
             ck.deliv_count -= k;
             ck.delivered_in = n;
+            ck.in_bytes = ck.in_bytes.wrapping_add(bytes);
+            // Whole records only: the acknowledgement may stand inside the
+            // first one still held, never past it.
+            if ck.in_bytes > at {
+                return sc::STATUS_CORRUPT;
+            }
             sc::STATUS_OK
         }
         sc::DELTA_TLS_RETX_ACK => {
@@ -4231,6 +4675,7 @@ unsafe fn activate_shadow(s: &mut TlsState, sh: usize, new_epoch: u32, conn_id: 
     let xl = (ck.retx_len as usize).min(RETX_BUF_SIZE);
     sess.retx_buf[..xl].copy_from_slice(&ck.retx[..xl]);
     sess.retx_len = xl as u16;
+    sess.retx_head = if xl == 0 { 0 } else { RETX_HEAD_UNKNOWN };
     sess.retx_base_seq = ck.retx_base_seq;
     sess.retx_seq_anchored = ck.retx_anchored;
     sess.ccs_seen = MAX_COMPAT_CCS;
@@ -4241,6 +4686,13 @@ unsafe fn activate_shadow(s: &mut TlsState, sh: usize, new_epoch: u32, conn_id: 
     sess.cont.ckpt_gen = gen;
     sess.cont.delivered_in = ck.delivered_in;
     sess.cont.emitted_out = ck.emitted_out;
+    // The connection's output horizon moves with it: the consumer here
+    // continues the old one's numbering, and is told at once how far the
+    // old one's output reached (every record held here reaches the peer).
+    sess.wh = WriteHorizon::empty();
+    sess.wh.clear_total = ck.out_bytes;
+    sess.wh.through = ck.out_bytes;
+    sess.wh.owed = true;
     sess.cont.peer_moved = true;
     sess.cont.moved_id = ck.peer_id;
     sess.cont.activated = true;
@@ -4270,11 +4722,41 @@ unsafe fn activate_shadow(s: &mut TlsState, sh: usize, new_epoch: u32, conn_id: 
     // carries beyond that is handed to this worker again, first.
     sess.cont.consumed = ck.delivered_in;
     sess.cont.consumed_told = ck.delivered_in;
+    // The consumer here is told where its predecessor stood — the cursor
+    // and clear byte of the last acknowledgement, and the output horizon —
+    // before any data. Redelivery starts at exactly that byte: the first
+    // delivery held is trimmed by what of it was consumed. Bytes the record
+    // counts delivered past the acknowledgement (a primary's own export
+    // carries none of its deliveries) are not handed up again, and the
+    // stream resumes after them.
+    sess.cont.consumer_cursor = ck.consumer_cursor;
+    sess.cont.cursor_told = ck.consumer_cursor;
+    let first = if ck.deliv_count > 0 {
+        u64::from(u16::from_le_bytes([ck.deliv[0], ck.deliv[1]]))
+    } else {
+        0
+    };
+    let trim = if ck.cursor_at > ck.in_bytes {
+        (ck.cursor_at - ck.in_bytes).min(first.saturating_sub(1))
+    } else {
+        0
+    };
+    let resume_at = ck.in_bytes.wrapping_add(trim);
+    sess.cont.cursor_at = resume_at.min(ck.cursor_at.max(ck.in_bytes));
+    sess.cont.cursor_at_told = sess.cont.cursor_at;
+    sess.cont.handed_bytes = ck.in_bytes;
+    sess.cont.pend_n = 0;
+    sess.cont.pend_bytes = 0;
+    sess.cont.resumed_cursor = ck.consumer_cursor;
+    sess.cont.resumed_in = resume_at;
+    sess.cont.resumed_out = ck.out_bytes;
+    sess.cont.resumed_owed = ck.close_notify & 1 == 0;
     let dl = ck.deliv_len as usize;
     if dl > 0 {
         core::ptr::copy_nonoverlapping(ck.deliv.as_ptr(), s.redeliver.as_mut_ptr(), dl);
         s.redeliver_len = dl as u32;
         s.redeliver_off = 0;
+        s.redeliver_trim = trim as u16;
         s.redeliver_idx = idx as u8;
         s.redeliver_conn = s.sessions[idx].conn_id;
     }
@@ -4743,7 +5225,11 @@ unsafe fn redeliver_step(s: &mut TlsState) -> bool {
             s.redeliver_off = 0;
             return did;
         }
-        if s.sessions[idx].held_msg_type != 0 || s.clear_pending_len > 0 {
+        if s.sessions[idx].held_msg_type != 0
+            || s.sessions[idx].peer_pending
+            || s.sessions[idx].cont.resumed_owed
+            || s.clear_pending_len > 0
+        {
             return did;
         }
         let at = s.redeliver_off as usize;
@@ -4756,9 +5242,12 @@ unsafe fn redeliver_step(s: &mut TlsState) -> bool {
         s.redeliver_off = (at + 2 + l) as u32;
         did = true;
         let conn = s.redeliver_conn;
-        let mut off = 0usize;
+        // The first delivery starts at the byte the consumer's predecessor
+        // had consumed up to; the rest are whole.
+        let mut off = usize::from(s.redeliver_trim).min(l);
+        s.redeliver_trim = 0;
         if drain_clear_record(s, idx, conn, &mut off, l) {
-            note_delivered(s, idx);
+            note_delivered(s, idx, l);
         } else {
             // The rest goes out with the ordinary pending drain, which
             // counts it delivered when it has.

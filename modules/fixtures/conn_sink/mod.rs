@@ -11,9 +11,15 @@
 //! An echo the channel refuses is held and written first next step, and
 //! nothing more is read until it is: back pressure reaches the transport
 //! instead of the bytes being lost. With `ack` set, each echo is followed
-//! by `tls`'s `CMD_DELIVERED` (`[conn_id]`), which tells a `tls` running
-//! `delivery_ack` that what it handed up is consumed — the worker
-//! acknowledgement a crash-continuous pair mirrors.
+//! by `tls`'s `CMD_DELIVERED` (`[conn_id][consumer_cursor][in_bytes]`),
+//! which tells a `tls` running `delivery_ack` how many of the stream's clear
+//! bytes are consumed — the worker acknowledgement a crash-continuous pair
+//! mirrors. The sink's cursor is the bytes it has consumed (0 unless
+//! `cursor` is set); a stream resumed here by a takeover (`MSG_RESUMED`)
+//! continues from the byte it names. With `cursor` both are logged
+//! (`[sink] acked cursor=N in=I`, `[sink] resumed cursor=C in=I out=O`).
+//! With `echo_after`, exactly that many bytes are consumed at a time (an
+//! acknowledgement may stand inside a record), the rest held for the next.
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
@@ -46,6 +52,10 @@ include!("../../sdk/runtime/params.rs");
 
 const NET_MSG_ACCEPTED: u8 = 0x01;
 const NET_MSG_DATA: u8 = 0x02;
+/// The connection's output horizon (`net_proto::MSG_HORIZON`).
+const NET_MSG_HORIZON: u8 = 0x0B;
+/// A stream resumed here by a takeover (`net_proto::MSG_RESUMED`).
+const NET_MSG_RESUMED: u8 = abi::contracts::net::net_proto::MSG_RESUMED;
 const NET_MSG_CLOSED: u8 = 0x03;
 /// `MSG_CLOSED` kind: the peer finished sending (net_proto `CLOSED_PEER_FIN`).
 const CLOSED_PEER_FIN: u8 = 1;
@@ -59,6 +69,8 @@ const NET_MSG_CONNECTED: u8 = 0x05;
 const HOLD_MAX: usize = 4096;
 /// `tls`'s clear-side acknowledgement (`delivery_ack`).
 const NET_CMD_DELIVERED: u8 = abi::contracts::net::net_proto::CMD_DELIVERED;
+use abi::contracts::net::net_proto;
+use net_proto::{DELIVERED_LEN, RESUMED_LEN};
 
 const LOG_PERIOD: u32 = 5000;
 /// One bit per possible `conn_id`.
@@ -85,6 +97,11 @@ pub struct SinkState {
     /// A `CMD_DELIVERED` owed for this connection.
     ack_owed: u8,
     ack_conn: u16,
+    /// `cursor`: acknowledgements carry the consumer cursor — the bytes
+    /// consumed so far (`consumed`), as of the owed one (`ack_cursor`).
+    cursor: u8,
+    consumed: u64,
+    ack_cursor: u64,
     step_count: u32,
     pub open: u32,
     pub peak: u32,
@@ -143,6 +160,10 @@ mod params_def {
         // Dial out (`a.b.c.d:port`) instead of listening: the sink is the
         // client of the session and echoes what the server sends.
         8, dial, str, 0 => |s, d, len| { parse_dial(s, core::slice::from_raw_parts(d, len)); };
+        // With `ack`: every CMD_DELIVERED carries the consumer cursor (the
+        // bytes consumed so far), and a resumed stream continues from the
+        // cursor its MSG_RESUMED names.
+        9, cursor, u8, 0 => |s, d, len| { s.cursor = p_u8(d, len, 0, 0); };
     }
 }
 
@@ -285,6 +306,26 @@ unsafe fn log_counters(s: &mut SinkState) {
     dev_log(sys, 3, line.as_ptr(), p);
 }
 
+/// `[sink] <head><a>` and, given one, ` out=<b>`.
+unsafe fn log_value(sys: &SyscallTable, head: &[u8], a: u64, more: &[(&[u8], u64)]) {
+    let mut line = [0u8; 96];
+    let mut at = head.len().min(40);
+    line[..at].copy_from_slice(&head[..at]);
+    let mut tmp = [0u8; 12];
+    let d = fmt_u32(a.min(u64::from(u32::MAX)) as u32, &mut tmp);
+    line[at..at + d.len()].copy_from_slice(d);
+    at += d.len();
+    for &(label, v) in more {
+        let l = label.len().min(8);
+        line[at..at + l].copy_from_slice(&label[..l]);
+        at += l;
+        let d = fmt_u32(v.min(u64::from(u32::MAX)) as u32, &mut tmp);
+        line[at..at + d.len()].copy_from_slice(d);
+        at += d.len();
+    }
+    dev_log(sys, 3, line.as_ptr(), at);
+}
+
 fn fmt_u32(mut v: u32, out: &mut [u8; 12]) -> &[u8] {
     let mut i = 12;
     if v == 0 {
@@ -312,11 +353,23 @@ unsafe fn flush_owed(s: &mut SinkState) -> bool {
     }
     if s.ack_owed != 0 {
         let id = s.ack_conn.to_le_bytes();
-        let f = [NET_CMD_DELIVERED, 2, 0, id[0], id[1]];
+        let mut f = [0u8; 3 + DELIVERED_LEN];
+        f[..5].copy_from_slice(&[NET_CMD_DELIVERED, DELIVERED_LEN as u8, 0, id[0], id[1]]);
+        let cursor = if s.cursor != 0 { s.ack_cursor } else { 0 };
+        f[5..13].copy_from_slice(&cursor.to_le_bytes());
+        f[13..21].copy_from_slice(&s.ack_cursor.to_le_bytes());
         if (sys.channel_write)(s.net_out, f.as_ptr(), f.len()) != f.len() as i32 {
             return false;
         }
         s.ack_owed = 0;
+        if s.cursor != 0 {
+            log_value(
+                sys,
+                b"[sink] acked cursor=",
+                cursor,
+                &[(b" in=", s.ack_cursor)],
+            );
+        }
     }
     true
 }
@@ -421,6 +474,36 @@ unsafe fn service(s: &mut SinkState) {
                     dev_log(sys, 3, m.as_ptr(), m.len());
                 }
             }
+            // `tls`'s output horizon (`write_horizon`): logged, so a rig can
+            // hold what a takeover kept against what the client received.
+            NET_MSG_HORIZON if plen == 10 => {
+                let mut b = [0u8; 8];
+                core::ptr::copy_nonoverlapping(p.add(2), b.as_mut_ptr(), 8);
+                let through = u64::from_le_bytes(b);
+                let mut line = [0u8; 48];
+                let head = b"[sink] horizon bytes=";
+                line[..head.len()].copy_from_slice(head);
+                let mut tmp = [0u8; 12];
+                let digits = fmt_u32(through.min(u64::from(u32::MAX)) as u32, &mut tmp);
+                line[head.len()..head.len() + digits.len()].copy_from_slice(digits);
+                dev_log(sys, 3, line.as_ptr(), head.len() + digits.len());
+            }
+            // A stream resumed here: its predecessor's cursor, the byte it
+            // had consumed through and its output horizon. The count of
+            // bytes consumed continues from that byte.
+            NET_MSG_RESUMED if plen == RESUMED_LEN => {
+                let mut r = [0u8; RESUMED_LEN];
+                core::ptr::copy_nonoverlapping(p, r.as_mut_ptr(), RESUMED_LEN);
+                if let Some((_, cursor, in_bytes, out)) = net_proto::resumed_parts(&r) {
+                    s.consumed = in_bytes;
+                    log_value(
+                        sys,
+                        b"[sink] resumed cursor=",
+                        cursor,
+                        &[(b" in=", in_bytes), (b" out=", out)],
+                    );
+                }
+            }
             NET_MSG_DATA if plen > 2 && s.echo_after != 0 => {
                 let id = (*p as u16) | ((*p.add(1) as u16) << 8);
                 let data_len = plen - 2;
@@ -433,13 +516,19 @@ unsafe fn service(s: &mut SinkState) {
                     s.hold_len += k as u16;
                     s.hold_conn = id;
                     if s.hold_len >= s.echo_after {
-                        let n = usize::from(s.hold_len);
+                        // Exactly `echo_after` consumed; the rest waits for
+                        // the next.
+                        let n = usize::from(s.echo_after);
                         let held = s.hold;
-                        s.hold_len = 0;
+                        let rest = usize::from(s.hold_len) - n;
+                        s.hold.copy_within(n..n + rest, 0);
+                        s.hold_len = rest as u16;
                         send_data(s, id, &held[..n]);
                         if s.ack != 0 {
                             s.ack_owed = 1;
                             s.ack_conn = id;
+                            s.consumed = s.consumed.wrapping_add(n as u64);
+                            s.ack_cursor = s.consumed;
                         }
                         let m = b"[sink] held bytes echoed";
                         dev_log(sys, 3, m.as_ptr(), m.len());
@@ -464,6 +553,8 @@ unsafe fn service(s: &mut SinkState) {
                     if s.ack != 0 {
                         s.ack_owed = 1;
                         s.ack_conn = id;
+                        s.consumed = s.consumed.wrapping_add(data_len as u64);
+                        s.ack_cursor = s.consumed;
                     }
                     after_echo(s, id, data_len);
                 }

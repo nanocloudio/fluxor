@@ -25,6 +25,10 @@
 //! Each input is a byte stream of `[type][len u16 LE][payload]` frames and is
 //! reassembled whole; each port takes only its own frames, so an anchor
 //! cannot hand in a verdict or a key. Every output frame is written whole.
+//! A crash-continuous half's frame is taken only when what it becomes has
+//! room (`TcStack::layer_room`); otherwise it stays on `ip_cont` / `tls_cont`
+//! and that port is read no further this step — back-pressure the half's
+//! own horizons carry to the connection, never the end of the pairing.
 //!
 //! Params: `anchor_id` (16 hex digits: the 8-byte anchor identity tokens
 //! are minted for).
@@ -80,6 +84,9 @@ const Q_KEY: usize = 2 * 1024;
 const Q_AUTH: usize = 1024;
 const Q_MAX: usize = Q_EVT;
 const Q_CAP: [usize; PORTS] = [Q_EVT, Q_IP, Q_TLS, Q_KEY, Q_AUTH];
+// A half's frame is taken only with this much room on the event queue
+// (`TcStack::layer_room`); an empty queue always has it.
+const _: () = assert!(Q_EVT >= TCS_FRAME_EVT);
 
 /// One input's reassembly buffer, and the bytes of an overlong frame
 /// still to be discarded.
@@ -119,15 +126,25 @@ struct Out<'a> {
     full: &'a mut u32,
 }
 
+fn port_index(port: TcsPort) -> usize {
+    match port {
+        TcsPort::Evt => P_CTL,
+        TcsPort::Ip => P_IP,
+        TcsPort::Tls => P_TLS,
+        TcsPort::Key => P_KEY,
+        TcsPort::Auth => P_AUTH,
+    }
+}
+
 impl TcsOut for Out<'_> {
+    fn room(&self, port: TcsPort) -> usize {
+        let k = port_index(port);
+        let q = &self.q[k];
+        Q_CAP[k] - (q.end - q.start)
+    }
+
     fn send(&mut self, port: TcsPort, frame: &[u8]) -> bool {
-        let k = match port {
-            TcsPort::Evt => P_CTL,
-            TcsPort::Ip => P_IP,
-            TcsPort::Tls => P_TLS,
-            TcsPort::Key => P_KEY,
-            TcsPort::Auth => P_AUTH,
-        };
+        let k = port_index(port);
         if self.outs[k] < 0 {
             return false;
         }
@@ -228,6 +245,29 @@ unsafe fn pump(s: &mut State, k: usize, now: u64) {
         if rx.len < total {
             return;
         }
+        if k == P_IP || k == P_TLS {
+            // A crash-continuous half's frame waits on its port while what
+            // it would become has no room (`TcStack::layer_room`): the
+            // half's horizons hold the connection meanwhile.
+            let port = if k == P_IP { TcsPort::Ip } else { TcsPort::Tls };
+            let State {
+                outs,
+                q,
+                queue_full,
+                core,
+                rx,
+                ..
+            } = s;
+            let out = Out {
+                outs,
+                q,
+                full: queue_full,
+            };
+            if !core.layer_room(port, &rx[k].buf[..total], &out) {
+                return;
+            }
+        }
+        let rx = &s.rx[k];
         let mut frame = [0u8; RX_MAX];
         frame[..total].copy_from_slice(&rx.buf[..total]);
         let rest = rx.len - total;

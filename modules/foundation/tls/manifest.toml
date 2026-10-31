@@ -199,6 +199,14 @@ metrics = [
     "frame_write_dropped",
     "bytes_in",
     "bytes_out",
+    # Strict pairs abandoned when the redelivery caps held the next record
+    # back with no consumption for the horizon budget.
+    "redeliver_cap_abandoned",
+    # Strict pairs abandoned when the record ceiling (session_ctrl's
+    # STRICT_TX_RECORDS outbound records unacknowledged by the peer's
+    # transport) held the next record back with no acknowledgement for the
+    # horizon budget.
+    "txrec_cap_abandoned",
 ]
 # Span 0: one `tls.handshake` span per session (Handshaking -> Ready/Error),
 # status OK on completion, ERROR on a failed handshake. Minted only when the

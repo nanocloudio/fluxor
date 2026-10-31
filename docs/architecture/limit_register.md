@@ -120,6 +120,16 @@ tcp::MSS as usize + 14 + 20 + 20 <= MAX_FRAME_SIZE | modules/foundation/ip/mod.r
 MAX_PACKET_HOLD <= (1usize << abi::contracts::net::packet::PKT_SLOT_BITS) | modules/foundation/ip/mod.rs
 HO_SRC_ENTRIES >= tcp::SYN_COOKIE_WATERMARK as usize * 2 | modules/foundation/ip/mod.rs
 CAPACITY >= PSTATUS_ROUND | src/kernel/sys/telemetry_ring.rs
+TS_TXREC_MAX == sc::STRICT_TX_RECORDS | modules/foundation/transport_continuity/stack.rs
+TS_SEND_MAX == sc::STRICT_SEND_BYTES | modules/foundation/transport_continuity/stack.rs
+TS_RECV_MAX == sc::STRICT_RECV_BYTES | modules/foundation/transport_continuity/stack.rs
+TS_OOO_MAX == sc::STRICT_OOO_SEGS | modules/foundation/transport_continuity/stack.rs
+TS_DELIV_BYTES == sc::STRICT_DELIVERY_BYTES | modules/foundation/transport_continuity/stack.rs
+RETX_BUF_SIZE <= sc::STRICT_SEND_BYTES | modules/foundation/tls/continuity.rs
+RECV_BUF_SIZE <= sc::STRICT_RECV_BYTES | modules/foundation/tls/continuity.rs
+DELIV_CARRY_MAX <= sc::STRICT_DELIVERY_BYTES | modules/foundation/tls/continuity.rs
+tcp::REORDER_SLOTS <= sc::STRICT_OOO_SEGS | modules/foundation/ip/continuity.rs
+CONT_OUT_NEED <= 64 * 1024 | modules/foundation/tls/continuity.rs
 ```
 
 ## Identifier widths
@@ -239,6 +249,7 @@ CAPACITY >= PSTATUS_ROUND | src/kernel/sys/telemetry_ring.rs
 | TLS inbound frames per step | `TLS_INBOUND_DRAIN_BUDGET` | modules/foundation/tls/mod.rs | 8 | Policy: deliberately below `ip`'s 32 RX budget. A larger drain lengthens every step, which costs the latency-bound paths — single-connection keepalive throughput is 1/latency and handshakes are round-trip bound — and buys nothing once the queue is cleared each tick |
 | TLS cleartext passthroughs | `MAX_PASSTHROUGH` | modules/foundation/tls/mod.rs | — | Derived, not chosen: `MAX_SESSIONS`. A server-mode instance relays each backend dial its clear-side consumer makes raw, keyed by the dial's full u16 conn id, and each such dial serves a front connection that holds a session. The table is resident at 4 bytes an entry — 2 KiB at 512 on aarch64, 4 bytes at 1 embedded — where an exact bitmap of the id space would be 8 KiB per instance. A server-mode `CMD_CONNECT_TO` that finds it full is refused `ENOMEM` on its own tag before anything goes upstream, so a completion always finds a free entry; an entry ends on `MSG_CLOSED`, `CMD_CLOSE`, an established `MSG_ERROR`, or a new connection under its id |
 | TLS session grant | `SESSION_CHUNK` | modules/foundation/tls/mod.rs | 8 | Policy, per-profile (8 aarch64 / `MAX_SESSIONS` elsewhere): sessions per grant of the chunked session pool. On aarch64 the first chunk is inline and the rest are granted from the kernel elastic region one chunk (~104 KiB, two grant quanta) at a time as accepts arrive, so an idle stack pays for one chunk; elsewhere the whole pool is the inline chunk and nothing is granted. A grant the region denies is pool-full, the same as `MAX_SESSIONS`: the accept is closed. Const-asserted to tile `MAX_SESSIONS` exactly |
+| TLS output horizon queue | `WH_SLOTS` | modules/foundation/tls/mod.rs | 40 | Policy: records one session has accepted for the wire and not yet written, each tagged with the clear bytes through it so `MSG_HORIZON` reports exactly what the standby holds — a strict pair's hold, a stalled record and slack. Past it the session stops reporting a horizon (`lost`) rather than report one it cannot vouch for; the consumer's gate then gives nothing more, which is backpressure, never a false acknowledgement |
 | QUIC peer authority | `MAX_AUTHORITY` | modules/foundation/quic/mod.rs | — | Policy: `MAX_PEER_NAME` plus `:65535`. The instance keeps one peer authority; a longer one is refused at construction |
 | QUIC peer name | `MAX_PEER_NAME` | modules/foundation/quic/mod.rs | 64 | Policy: the longest DNS name a QUIC peer may be dialled by, and the SNI and `dNSName` the handshake checks. The datagram surface carries up to 253 bytes; the module sizes this for the state budget and refuses rather than truncates, because a clipped name verifies against the wrong certificate |
 | QUIC peer certificate | `MAX_CERT_LEN` | modules/foundation/quic/mod.rs | 1024 | Policy: the per-certificate ceiling for the configured leaf and each trust anchor. An anchor past it, or a ninth anchor, marks the table refused and the instance declines to construct |
@@ -289,6 +300,7 @@ CAPACITY >= PSTATUS_ROUND | src/kernel/sys/telemetry_ring.rs
 | TLS continuity shadow slots | `MAX_TLS_SHADOWS` | modules/foundation/tls/continuity.rs | 2 | Policy: sessions under CT_TLS takeover at once on one instance, one per slot (1 on wasm, 0 on the MCU-class targets, which hold no standby). A shadow is a staging record plus the decoded checkpoint — about twice `TLS_CKPT_RECORD_MAX`, resident in module state — and takeover is a control-plane event, not steady state; a PAIR_PREPARE past the free slots is refused `STATUS_NO_CAPACITY` |
 | ISR bridge slots | `MAX_BRIDGES` | src/kernel/config.rs | 16 | Policy: edges that cross into an ISR-tier domain, one bridge slot each with its ring inline (~2 KiB of kernel static RAM per slot). An edge past the ceiling loses its ISR routing and the graph fails at setup rather than corrupting. 8 on RP, where the die's stack is what the slots would take |
 | TLS continuity checkpoint record | `TLS_CKPT_RECORD_MAX` | modules/foundation/tls/continuity.rs | — | Derived, not chosen: the fixed header plus the whole partial-inbound buffer (`RECV_BUF_SIZE`), the whole retransmission window (`RETX_BUF_SIZE`), the unconsumed deliveries a record may carry (`CONT_REDELIVER_MAX`) and the sealed secret set — about 85 KiB where the receive buffer is 16 KiB, about 12.5 KiB on the 4 KiB targets. A CHECKPOINT_BEGIN whose `total_len` exceeds it is refused `STATUS_NO_CAPACITY` before any byte moves; the record is never truncated |
+| TLS unconsumed deliveries tracked | `PEND_MAX` | modules/foundation/tls/continuity.rs | 16 | Policy: records a primary has handed up under `delivery_ack` and not yet seen consumed, each kept as its end byte and length (10 bytes) so an acknowledgement inside a record consumes only the records before it. At least `CONT_REDELIVER_COUNT` (8): a strict pair never lets more than that stand — the next record waits unopened in the receive buffer — so only an unmirrored session reaches the bound, where the oldest is counted consumed |
 | TLS strict-profile send hold | `TX_HOLD_SIZE` | modules/foundation/tls/continuity.rs | — | Derived, not chosen: every record one `CMD_SEND` (`MAX_CMD_DATA` bytes) can produce, since the clear-side frame is consumed whole and each of its records must wait for its own send horizon — six records of `WIRE_RECORD_MAX`, about 9.3 KiB per session, paid in every session slot whether or not it is mirrored. A producer that exceeds the contract's frame ceiling fills the hold and the session fails rather than the record being dropped |
 | QUIC 1-RTT self-grant block | `LOCAL_PN_BLOCK` | modules/foundation/quic/connection.rs | 4096 | Policy: the send packet-number block a connection self-grants in local (non-durable) mode, refilled `LOCAL_PN_REFILL_LOW` (512) values ahead of exhaustion so the reservation never stalls a healthy sender. In durable mode the `session.reservation` provider chooses the block |
 | declared step cost (`[execution] max_step_us`) | `STEP_BUDGET_DEFAULT_TICK_US` | tools/src/target_facts.rs | 1000 | Policy: the scheduler's default pass budget (`DEFAULT_TICK_US`, one tick) on every silicon; a manifest whose step cannot fit one default pass on a target it names is refused at parse. Per-target in shape so a slower part can publish a smaller budget |
@@ -517,6 +529,13 @@ cannot be evaluated from its own file reads `—` and says why.
 | TLS strict-profile carried plaintext | `DELIV_CARRY_MAX` | modules/foundation/tls/continuity.rs | 16384 | Policy, wire-visible in the strict RECORD_IN delta: the plaintext of an opened record it carries — a whole record's (2^14) where a whole record is received, which `TRANSPORT_CONTINUITY` holds as one delivery (`TS_DELIV_BYTES`); 512 off-host. Nothing longer exists, so nothing is mirrored as not carried on the host |
 | TLS redeliveries a record carries | `CONT_REDELIVER_MAX` | modules/foundation/tls/continuity.rs | 65544 | Policy, wire-visible in the CT_TLS record: the unconsumed deliveries (`[len:2][plaintext]` each, at most eight) a record carries for a standby to hand its worker again — four whole records' plaintext on the host, eight of 512 bytes off-host. A record past it is not importable, refused by name at the bridge (`TCS_REDELIVER_MAX`), never truncated |
 | TLS strict-mirror unacknowledged deltas | `CONT_OUT_BUDGET` | modules/foundation/tls/continuity.rs | 49152 | Policy: delta bytes a strict mirror lets stand unacknowledged on `cont_out` (three quarters of the 64 KiB channel the manifest asks for on the host; 12 KiB off-host) before it stops reading `cipher_in` — a delta the channel refuses ends the pair, and each inbound segment writes one as large as the partial record |
+| TLS strict-mirror `cont_out` need | `CONT_OUT_NEED` | modules/foundation/tls/continuity.rs | — | Policy, derived (`CONT_OUT_BUDGET + MAX_CMD_DATA` + one `CMD_SEND`'s RECORD_OUT framing + a KeyUpdate delta, ≈ 56.4 KiB on the host): the most a strict mirror leaves unread on `cont_out` — `CONT_OUT_BUDGET`, then one `CMD_SEND`'s RECORD_OUTs held for their horizon, then an owed KeyUpdate answer. `tls` measures `cont_out`'s ring at `module_new` (`IOCTL_WRITABLE`) and refuses a strict PAIR_PREPARE (`STATUS_NO_CAPACITY`, logged) on a smaller one, where a delta the channel refused would end the pair; asserted within the 64 KiB the manifest asks for on the host |
+| Strict pair: outbound records unacknowledged | `STRICT_TX_RECORDS` | modules/sdk/contracts/net/session_ctrl.rs | 32 | Policy, the canonical record's `TS_TXREC_MAX` (the provider asserts them equal): outbound TLS records written or held and not wholly acknowledged by the peer's transport. A strict `tls` holds the next record while this many stand — the clear side waits, the window slides on `ip`'s acknowledgement — and abandons the pair after `CONT_HORIZON_MS` with no acknowledgement (`txrec_cap_abandoned`). A small-record producer pipelining faster than the peer acknowledges (MQTT acknowledgements) waits here instead of losing the pair |
+| Strict pair: unacknowledged outbound bytes | `STRICT_SEND_BYTES` | modules/sdk/contracts/net/session_ctrl.rs | 32768 | Policy, the canonical record's `TS_SEND_MAX`: `tls`'s retransmit window (`RETX_BUF_SIZE`, 4 KiB) is asserted within it |
+| Strict pair: partial inbound record | `STRICT_RECV_BYTES` | modules/sdk/contracts/net/session_ctrl.rs | 16704 | Policy, the canonical record's `TS_RECV_MAX` (a whole protected TLS 1.3 record): `tls`'s receive buffer is asserted within it, and the provider carries it as one `RxSegment` |
+| Strict pair: out-of-order segments | `STRICT_OOO_SEGS` | modules/sdk/contracts/net/session_ctrl.rs | 4 | Policy, the canonical record's `TS_OOO_MAX`: `ip`'s reorder slots are asserted within it |
+| Strict pair: out-of-order segment bytes | `STRICT_OOO_SEG` | modules/sdk/contracts/net/session_ctrl.rs | 512 | Policy, the canonical record's `TS_OOO_SEG`: `ip`'s reorder slot bytes are asserted within it |
+| Strict pair: one delivery's plaintext | `STRICT_DELIVERY_BYTES` | modules/sdk/contracts/net/session_ctrl.rs | 16384 | Policy, the canonical record's `TS_DELIV_BYTES`: `tls`'s carried plaintext (`DELIV_CARRY_MAX`) is asserted within it |
 
 ## Machine-checked block
 
@@ -714,6 +733,7 @@ TLS_INBOUND_DRAIN_BUDGET | modules/foundation/tls/mod.rs | 8 | *
 MAX_PASSTHROUGH | modules/foundation/tls/mod.rs | MAX_SESSIONS | *
 SESSION_CHUNK | modules/foundation/tls/mod.rs | 8 | host
 SESSION_CHUNK | modules/foundation/tls/mod.rs | MAX_SESSIONS | off-host
+WH_SLOTS | modules/foundation/tls/mod.rs | 40 | *
 MAX_AUTHORITY | modules/foundation/quic/mod.rs | MAX_PEER_NAME + 6 | *
 MAX_PEER_NAME | modules/foundation/quic/mod.rs | 64 | *
 MAX_CERT_LEN | modules/foundation/quic/mod.rs | 1024 | *
@@ -774,7 +794,15 @@ CONT_REDELIVER_MAX | modules/foundation/tls/continuity.rs | 4 * 2 + 4 * 16384 | 
 CONT_REDELIVER_MAX | modules/foundation/tls/continuity.rs | 8 * 2 + 8 * 512 | off-host
 CONT_OUT_BUDGET | modules/foundation/tls/continuity.rs | 48 * 1024 | host
 CONT_OUT_BUDGET | modules/foundation/tls/continuity.rs | 12 * 1024 | off-host
+CONT_OUT_NEED | modules/foundation/tls/continuity.rs | - | *
+STRICT_TX_RECORDS | modules/sdk/contracts/net/session_ctrl.rs | 32 | *
+STRICT_SEND_BYTES | modules/sdk/contracts/net/session_ctrl.rs | 32 * 1024 | *
+STRICT_RECV_BYTES | modules/sdk/contracts/net/session_ctrl.rs | 16_704 | *
+STRICT_OOO_SEGS | modules/sdk/contracts/net/session_ctrl.rs | 4 | *
+STRICT_OOO_SEG | modules/sdk/contracts/net/session_ctrl.rs | 512 | *
+STRICT_DELIVERY_BYTES | modules/sdk/contracts/net/session_ctrl.rs | 16 * 1024 | *
 CONT_KEYS | modules/foundation/tls/continuity.rs | 2 + 2 * MAX_TLS_SHADOWS | *
+PEND_MAX | modules/foundation/tls/continuity.rs | 16 | *
 CONT_DERIVE_MAX | modules/foundation/tls/continuity.rs | 16 | *
 TX_HOLD_SIZE | modules/foundation/tls/continuity.rs | TX_HOLD_RECORDS * WIRE_RECORD_MAX | *
 LOCAL_PN_BLOCK | modules/foundation/quic/connection.rs | 4096 | *
@@ -1002,6 +1030,10 @@ protocol constants, mirrors of a registered symbol — are excluded from
 the coverage report here, each with the reason it is not a row.
 
 ```limit-register-exempt
+STATUS_NO_CAPACITY | modules/sdk/contracts/net/session_ctrl.rs | protocol: a continuity reply's status code, not a capacity
+SIG_MAX | modules/sdk/contracts/net/session_ctrl.rs | format: the longest custody-evidence signature (a P-256 DER signature) the evidence layout holds
+EVIDENCE_MAX | modules/sdk/contracts/net/session_ctrl.rs | derived: the custody evidence's fixed part and SIG_MAX
+CHECKPOINT_CHUNK_MAX | modules/sdk/contracts/net/session_ctrl.rs | format: the per-layer checkpoint chunk on the continuity wire, sized to the frames both ends assemble
 REPLY_BODY_MAX | modules/foundation/tls/continuity.rs | derived: the larger of a CUT manifest body and a custody reply carrying the largest evidence
 DELTA_IN_TRAILER_MAX | modules/foundation/tls/continuity.rs | derived: a strict RECORD_IN's trailer at its largest, the content type and length and DELIV_CARRY_MAX bytes of plaintext
 BODY_MAX | modules/sdk/contracts/exchange.rs | derived: one RECORD_MAX record less its 16-byte prefix

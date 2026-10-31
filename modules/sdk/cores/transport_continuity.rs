@@ -1693,8 +1693,18 @@ impl<const F: usize, const T: usize> TcProvider<F, T> {
         c.handed = handed;
     }
 
-    /// The worker acknowledged deliveries through `cursor`.
-    pub fn worker_ack(&mut self, flow: &[u8; 16], cursor: u64, ev: &mut dyn FnMut(&[u8])) {
+    /// The worker acknowledged deliveries through `cursor` — each whole,
+    /// its plaintext ending at or before clear byte `cursor_at` — and
+    /// stands at its own `consumer_cursor` (opaque here; 0 for none) at
+    /// that byte (`net_proto::CMD_DELIVERED`).
+    pub fn worker_ack(
+        &mut self,
+        flow: &[u8; 16],
+        cursor: u64,
+        consumer_cursor: u64,
+        cursor_at: u64,
+        ev: &mut dyn FnMut(&[u8]),
+    ) {
         let Some(i) = self.slot_of(flow) else {
             return;
         };
@@ -1706,11 +1716,19 @@ impl<const F: usize, const T: usize> TcProvider<F, T> {
             ..
         } = self;
         let c = &mut flows[i];
-        if cursor <= c.st.delivery_acked || cursor >= c.st.next_delivery || !c.emitting {
+        let same = cursor == c.st.delivery_acked
+            && consumer_cursor == c.st.consumer_cursor
+            && cursor_at == c.st.cursor_at;
+        if cursor < c.st.delivery_acked
+            || cursor_at < c.st.cursor_at
+            || same
+            || cursor >= c.st.next_delivery
+            || !c.emitting
+        {
             return;
         }
-        let mut p = [0u8; 8];
-        if md_u64(&mut p, cursor).is_some() {
+        let mut p = [0u8; 24];
+        if md_delivery_ack(&mut p, cursor, consumer_cursor, cursor_at).is_some() {
             tc_delta(
                 c,
                 scratch,
@@ -1762,7 +1780,9 @@ impl<const F: usize, const T: usize> TcProvider<F, T> {
             return TcProduced::NotReady;
         };
         let mut p = [0u8; MD_PAYLOAD_MAX];
-        let Some(m) = md_tx_record(&mut p, pid, we, c.st.write_seq, &rec[..n]) else {
+        // The consumer's clear bytes through this record: its output horizon.
+        let out_bytes = c.st.out_bytes.wrapping_add(pt.len() as u64);
+        let Some(m) = md_tx_record(&mut p, pid, we, c.st.write_seq, &rec[..n], out_bytes) else {
             return TcProduced::NotReady;
         };
         if c.paired {
@@ -1844,7 +1864,12 @@ impl<const F: usize, const T: usize> TcProvider<F, T> {
         let mut p = [0u8; MD_PAYLOAD_MAX];
         let framed = records
             .seal(flow, we, ws, TC_RT_KEY_UPDATE, &[0], &mut rec)
-            .and_then(|n| Some((n, md_tx_record(&mut p, 0, we, ws, &rec[..n])?)));
+            .and_then(|n| {
+                Some((
+                    n,
+                    md_tx_record(&mut p, 0, we, ws, &rec[..n], c.st.out_bytes)?,
+                ))
+            });
         let last_end_before = c.st.send_end();
         let sent = match framed {
             Some((n, m)) => tc_delta(

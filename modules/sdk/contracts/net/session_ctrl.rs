@@ -426,6 +426,26 @@ pub const PROFILE_PLANNED: u8 = 1;
 /// Every externally visible transition waits for its DELTA_ACK.
 pub const PROFILE_CRASH_CONTINUOUS: u8 = 2;
 
+/// What a crash-continuous pair's provider holds of one connection: the
+/// canonical record's bounds (`TRANSPORT_CONTINUITY`'s `TS_*`, which its
+/// provider holds equal to these). A layer under the strict profile keeps
+/// each of its own within them, so a full table is back-pressure at the
+/// layer, never a delta its provider cannot apply.
+///
+/// Outbound records written or held and not yet acknowledged by the peer's
+/// transport: `tls` holds the next record while this many stand.
+pub const STRICT_TX_RECORDS: usize = 32;
+/// Unacknowledged outbound bytes (`tls`'s retransmit window).
+pub const STRICT_SEND_BYTES: usize = 32 * 1024;
+/// In-order received bytes not yet a record (`tls`'s partial record).
+pub const STRICT_RECV_BYTES: usize = 16_704;
+/// Out-of-order segments held, and the bytes of each (`ip`'s reorder
+/// slots).
+pub const STRICT_OOO_SEGS: usize = 4;
+pub const STRICT_OOO_SEG: usize = 512;
+/// The plaintext one delivery carries (`tls`'s RECORD_IN).
+pub const STRICT_DELIVERY_BYTES: usize = 16 * 1024;
+
 /// Delta kinds (`DELTA_APPLY` `kind`).
 /// TCP: a send-side transition — bytes allocated to sequence space,
 /// with the segment bytes so retransmission is byte-identical.
@@ -472,9 +492,13 @@ pub const DELTA_TLS_RETX_ACK: u8 = 11;
 ///   [recv_len: 4 LE][bytes: recv_len]
 pub const DELTA_TLS_RECV_BYTES: u8 = 12;
 /// TLS, strict profile: what the clear-side consumer has consumed, a
-/// cumulative count of records handed up — acknowledged by the consumer
-/// (`net_proto` 0x19 under `tls`'s `delivery_ack`) or counted as handed up.
-///   [consumed: 8 LE]
+/// cumulative count of records handed up — those whose plaintext ends at or
+/// before the clear byte the consumer acknowledged (`net_proto` 0x19 under
+/// `tls`'s `delivery_ack`), or counted as handed up — and the cursor and
+/// clear byte its last acknowledgement carried (0 for none), kept with the
+/// count so a takeover redelivers from that byte and hands both to the next
+/// consumer (`net_proto::MSG_RESUMED`).
+///   [consumed: 8 LE][consumer_cursor: 8 LE][cursor_at: 8 LE]
 pub const DELTA_TLS_DELIVERED: u8 = 0x81;
 /// `tls`'s own close: the consumer closed and our close_notify is sealed
 /// (no payload). The alert's ciphertext is the RECORD_OUT before it; the

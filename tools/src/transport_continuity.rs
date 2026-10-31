@@ -499,7 +499,7 @@ mod tests {
     }
 
     const TS_REFERENCE_DIGEST: &str =
-        "5c13b0f4920e4b81dff9bb91b745c0c9671967697d98904f05139adc2639c607";
+        "14c55f2bdb8b1fda5822594e03e5a8d241f7cd15063923c136fade738fb283b9";
 
     /// A digest that verifies does not make the record readable: another
     /// version, a reserved flag, an IPv4 address with bytes past its four,
@@ -643,7 +643,15 @@ mod tests {
         assert!(md_encode(&mut h, &vec![0; MD_PAYLOAD_MAX + 1], &mut f).is_none());
 
         let ct = vec![0x17; 16_645];
-        let m = md_tx_record(&mut payload, 1, shadow.write_epoch, shadow.write_seq, &ct).unwrap();
+        let m = md_tx_record(
+            &mut payload,
+            1,
+            shadow.write_epoch,
+            shadow.write_seq,
+            &ct,
+            shadow.out_bytes + 5,
+        )
+        .unwrap();
         md_apply(&mut shadow, &mut scratch, MdKind::TxRecord, &payload[..m]).unwrap();
         assert_eq!(usize::from(shadow.send_len), 16_645);
     }

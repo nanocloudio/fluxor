@@ -135,7 +135,7 @@ as a lost frame and reconnect, where the plain reader logs it.
 | `0x13` | `CMD_CONNECT` | reserved, unsupported — every provider answers `MSG_ERROR` ENOSYS on the requester tag |
 | `0x14` | `CMD_CONNECT_TO` | `[sock_type: u8][af: u8][port: u16 LE][addr…][requester_tag: u16 LE?]` |
 | `0x18` | `CMD_RESEND` | `[conn_id: u16 LE][seq: u32 LE][data…]` — retained bytes again at their own sequence numbers |
-| `0x19` | `CMD_DELIVERED` | `[conn_id: u16 LE]` — everything a record layer handed up on the connection is consumed |
+| `0x19` | `CMD_DELIVERED` | `[conn_id: u16 LE][consumer_cursor: u64 LE][in_bytes: u64 LE]` (`DELIVERED_LEN`) — the consumer has consumed the connection's first `in_bytes` clear bytes and stands at its cursor (opaque to the transport) there; kept with the byte and handed to a consumer that resumes the stream after a takeover (`MSG_RESUMED`), redelivery starting at that byte |
 
 `CMD_CONNECT_TO` carries one of three address families: `AF_INET` (4,
 `addr` is 4 bytes in network order), `AF_INET6` (6, 16 bytes), or
@@ -166,6 +166,8 @@ the provider re-segments to MSS on the wire.
 | `0x08` | `MSG_ACK` | `[conn_id: u16 LE][acked_seq: u32 LE][isn: u32 LE]` — the peer has everything before `acked_seq` |
 | `0x09` | `MSG_TRACE_CTX` | `[conn_id: u16 LE][trace_id: 16][parent_span_id: 8][trace_flags: u8]` |
 | `0x0A` | `MSG_PEER` | `[conn_id: u16 LE][family: u8][addr: 16][port: u16 LE]` — who is at the other end, sent once before the stream's first `MSG_DATA` |
+| `0x0B` | `MSG_HORIZON` | `[conn_id: u16 LE][bytes_through: u64 LE]` — the consumer's clear bytes on the wire (under a crash-continuous pair, held by the standby first); from a record layer that opts in (`tls`'s `write_horizon`) |
+| `0x0C` | `MSG_RESUMED` | `[conn_id: u16 LE][consumer_cursor: u64 LE][in_bytes: u64 LE][out_bytes: u64 LE]` (`RESUMED_LEN`) — the stream was resumed here by a continuity takeover: the predecessor consumer's last `CMD_DELIVERED` cursor and byte (both 0 when none was mirrored; redelivery starts at byte `in_bytes`) and its output horizon, after `MSG_PEER` and before any data |
 
 A stage that numbers sessions (`tls`) appends `[generation: u16 LE]` to
 `MSG_ACCEPTED` and `MSG_CONNECTED` (`put_session_generation`), and a
@@ -1163,10 +1165,35 @@ and its plaintext — a whole record's (2^14) on aarch64, up to 512 bytes on
 the small targets (`[type][len u16][plain]` after the partial record; type
 0xFF when not carried) — and the plaintext is held
 undelivered until the delta is acknowledged. What the clear-side consumer
-has consumed goes out as `DELTA_TLS_DELIVERED` (0x81, `[consumed u64]`):
-with the `tls` parameter `delivery_ack` the consumer says so with
-`CMD_DELIVERED` (0x19, `[conn_id]`: everything handed up is consumed),
-otherwise a delivery handed up counts as consumed. A strict pair's relayed
+has consumed goes out as `DELTA_TLS_DELIVERED` (0x81, `[consumed u64]
+[consumer_cursor u64][cursor_at u64]`): with the `tls` parameter
+`delivery_ack` the consumer says so with `CMD_DELIVERED` (0x19, exactly
+`[conn_id][consumer_cursor u64][in_bytes u64]`: it has consumed the
+stream's first `in_bytes` clear bytes and stands at that cursor of its own
+there), otherwise a delivery handed up counts as consumed. `tls` counts as
+consumed only the records whose plaintext ends at or before `in_bytes` —
+an acknowledgement still in flight while more records are handed up covers
+none of them — and keeps the cursor with its byte (`cursor_at`). The cursor
+is opaque to the transport: CT_TLS carries the latest with its byte and
+the clear bytes of the consumed records (`[consumer_cursor:8][cursor_at:8]
+[in_bytes:8]` after `out_bytes`), a strict shadow keeps the latest
+mirrored, and the provider core carries them as `TsState::consumer_cursor`
+/ `cursor_at` / `in_bytes` (the `DeliveryAck` delta `[cursor][consumer_cursor]
+[cursor_at]`). At ACTIVATE the standby's `tls` tells its consumer
+`MSG_RESUMED` (0x0C, `[conn_id][consumer_cursor u64][in_bytes u64]
+[out_bytes u64]`, `out_bytes` in `MSG_HORIZON`'s numbering) after the
+stream's `MSG_PEER` and before any of its data, and redelivers from exactly
+byte `in_bytes`: the first delivery it holds is trimmed by what of it was
+consumed, so an acknowledgement inside a record resumes inside it. The
+consumer continues its predecessor's cursor and byte count exactly, also
+after a crash with an acknowledgement in flight. While a strict pair's
+consumer acknowledges, the primary opens the next record only while the
+unconsumed ones with it stay fewer than the standby's eight and within its
+`TCS_REDELIVER_MAX`; otherwise the record waits in the receive buffer and
+the back-pressure reaches the TCP window. A consumer that cannot free room
+(one message of its own spanning more records) is not waited on for ever:
+after `CONT_HORIZON_MS` with no consumption the pair is abandoned and the
+connection goes on unmirrored, counted as `redeliver_cap_abandoned`. A strict pair's relayed
 `CONTINUITY{CHECKPOINT_COMMITTED}` also ends a quiesce — at `ip` the window
 reopens with a window update — since from there the horizons, not a closed
 window, keep the standby exact.
@@ -1310,8 +1337,8 @@ Under `CrashContinuous` the gate (`MdGate`, a bounded journal of
 `TC_GATE_J` unacknowledged deltas) holds the exposed ACK at the standby's
 acknowledged RCV.NXT, emission at its acknowledged send end, deliveries
 at its acknowledged delivery id and sealing at its installed write epoch
-(the KeyUpdate barrier); a full journal closes the window and refuses the
-producer. A delta is encoded before its transition is applied, so a
+(the KeyUpdate barrier); a full journal closes the window and the
+producer waits for credits. A delta is encoded before its transition is applied, so a
 transition that could not be sent never changes the primary. A flow
 `RETIRE` drops leaves a tombstone, so a late segment is dropped silently
 instead of reset.
@@ -1418,10 +1445,57 @@ standby applies the stream into its shadow and, after a crash, arms both
 halves from it alone, its `ip` counting the whole send buffer sent so its RTO
 resends what the peer never acknowledged. A transition the stream cannot
 carry (KeyUpdates past what `tls` derives forward, plaintext `tls` did not
-carry, a per-layer delta that contradicts the record, a gap, a full journal,
-a half ending its own pairing) ends the pairing — both halves ABORTed, an
-unsolicited STATUS of op `ABORT` with reason `0x80 | tcs_lost` — and the
-connection runs on unprotected.
+carry, a per-layer delta that contradicts the record, a gap, a half ending
+its own pairing) ends the pairing — both halves ABORTed, an unsolicited
+STATUS of op `ABORT` with reason `0x80 | tcs_lost` — and the connection runs
+on unprotected.
+
+A full table is not such a transition: it holds. Every fixed table or
+buffer of the record a delta fills is one the halves keep their own within —
+`session_ctrl`'s strict bounds (`STRICT_TX_RECORDS` 32 outbound records,
+`STRICT_SEND_BYTES`, `STRICT_RECV_BYTES`, `STRICT_OOO_SEGS` ×
+`STRICT_OOO_SEG`, `STRICT_DELIVERY_BYTES`), which the provider asserts equal
+to the record's `TS_*` and `tls` and `ip` assert their own buffers within:
+
+- `tls` holds its next outbound record while `STRICT_TX_RECORDS` records
+  stand written-or-held and not wholly acknowledged by the peer's transport
+  (its retransmit window since SND.UNA, and its horizon hold), the clear side
+  waiting behind it; `ip`'s acknowledgement, sliding the window, releases it.
+  A producer of many small records — MQTT acknowledgements pipelined faster
+  than the peer acknowledges them — waits there instead of losing the pair.
+  A peer that acknowledges nothing for `CONT_HORIZON_MS` while the ceiling
+  holds has the pair abandoned (`[tls] continuity record ceiling held with
+  no acknowledgement; mirror abandoned`, metric `txrec_cap_abandoned`), as
+  the redelivery caps are.
+- `tls` opens the next inbound record only once the consumption before it is
+  mirrored, with `delivery_ack` or without it (without it a delivery is
+  consumed when handed up), so the standby holds no more deliveries than the
+  caps.
+- The provider takes a half's next frame only while the gate has credits
+  for what one frame becomes (`TCS_FRAME_DELTAS`, 2), the half's queue of
+  deltas awaiting their horizon has room (`TCS_PEND`) and the anchor's event
+  queue has room for them (`TCS_FRAME_EVT`); a `tls` record out only while
+  the record's outbound table and send buffer have room — `ip`'s
+  acknowledgement, arriving on the other port, frees it. A frame not taken
+  stays on its port (`TcStack::layer_room`, counted `layer_holds`), and the
+  half's own horizons and budgets carry the wait to the connection. The full
+  journal, half queue and event queue keep their name (`tcs_lost::FULL`)
+  only as a defensive invariant.
+- `ip` offers a peer acknowledgement or a timer change its `cont_out`
+  refused again each step (both cumulative), so the record never stays
+  behind what the peer acknowledged.
+- `tls` measures its `cont_out` ring at `module_new` and refuses a strict
+  PAIR_PREPARE (`STATUS_NO_CAPACITY`, logged) when it holds less than a
+  strict mirror may leave on it (`CONT_OUT_NEED`: `CONT_OUT_BUDGET`, one
+  `CMD_SEND`'s held records and an owed KeyUpdate answer — within the 64 KiB
+  the manifest asks for).
+
+A bound reached anyway is named: `tcs_lost::BOUNDS` (reason `0x86`), its
+STATUS value the delta's kind and the record's tables as they stood
+(`tcs_bounds_detail`), not a divergence. Proven across two runtimes: 120
+tiny records pipelined with the client's acknowledgements dropped hold the
+primary at 32, the pair kept; a crash there, and the standby answers every
+request byte-exactly.
 
 Deliveries the standby owes its worker: a record's unconsumed deliveries
 — handed to the primary's worker, never acknowledged by it (`delivery_ack`)
@@ -1435,7 +1509,7 @@ keeps no plaintext it handed up), so what moves them is a mirror: a
 crash-continuous standby's record, or a `tls` standby's own shadow, which
 keeps each strict delivery from its RECORD_IN until DELTA_TLS_DELIVERED says
 it was consumed (more than a record holds is refused `STATUS_NO_CAPACITY`,
-ending the pair). More than `tls` hands again, or deliveries not following
+ending the pair; a primary whose consumer acknowledges never sends more). More than `tls` hands again, or deliveries not following
 the consumed cursor, are refused by name.
 
 What a moved session's worker is told: what a session this host opened

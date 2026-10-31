@@ -446,9 +446,28 @@ pub struct TsState {
 
     pub next_delivery: u64,
     pub delivery_acked: u64,
+    /// The consumer's cursor its acknowledgement through `delivery_acked`
+    /// carried (`net_proto::CMD_DELIVERED`, opaque here; 0 for none): what
+    /// a host that takes the connection over hands its own consumer
+    /// (`net_proto::MSG_RESUMED`).
+    pub consumer_cursor: u64,
+    /// The clear byte that acknowledgement carried (`CMD_DELIVERED`'s
+    /// `in_bytes`): the consumer had consumed the stream's first
+    /// `cursor_at` bytes, at most one delivery's part past `in_bytes`.
+    pub cursor_at: u64,
+    /// The clear bytes of the deliveries through `delivery_acked`: where
+    /// the first delivery held below starts. A takeover redelivers from byte
+    /// `cursor_at`, the first delivery trimmed by `cursor_at - in_bytes`.
+    pub in_bytes: u64,
     pub deliv_count: u8,
     pub deliv: [TsDelivery; TS_DELIV_MAX],
     pub next_production: u64,
+    /// The consumer's clear bytes the records through `next_production - 1`
+    /// carry: the output horizon (`net_proto::MSG_HORIZON`) the connection
+    /// holds, in its consumer's numbering, so a host that takes the
+    /// connection over continues that numbering and tells its consumer how
+    /// far the old one's output reached.
+    pub out_bytes: u64,
 
     pub flow_epoch: u32,
     pub session_epoch: u32,
@@ -553,6 +572,9 @@ impl TsState {
             }; TS_TXREC_MAX],
             next_delivery: 0,
             delivery_acked: 0,
+            consumer_cursor: 0,
+            cursor_at: 0,
+            in_bytes: 0,
             deliv_count: 0,
             deliv: [TsDelivery {
                 id: 0,
@@ -560,6 +582,7 @@ impl TsState {
                 bytes: [0; TS_DELIV_BYTES],
             }; TS_DELIV_MAX],
             next_production: 0,
+            out_bytes: 0,
             flow_epoch: 0,
             session_epoch: 0,
             route_generation: 0,
@@ -661,6 +684,9 @@ impl TsState {
             }; TS_TXREC_MAX],
             next_delivery: 1,
             delivery_acked: 0,
+            consumer_cursor: 0,
+            cursor_at: 0,
+            in_bytes: 0,
             deliv_count: 0,
             deliv: [TsDelivery {
                 id: 0,
@@ -668,6 +694,7 @@ impl TsState {
                 bytes: [0; TS_DELIV_BYTES],
             }; TS_DELIV_MAX],
             next_production: 1,
+            out_bytes: 0,
             flow_epoch: 1,
             session_epoch: 1,
             route_generation: 1,
@@ -828,6 +855,9 @@ fn ts_put(s: &TsState, w: &mut TcW<'_>) -> Option<()> {
 
     w.u64(s.next_delivery)?;
     w.u64(s.delivery_acked)?;
+    w.u64(s.consumer_cursor)?;
+    w.u64(s.cursor_at)?;
+    w.u64(s.in_bytes)?;
     w.u8(s.deliv_count)?;
     for d in s.deliveries() {
         w.u64(d.id)?;
@@ -835,6 +865,7 @@ fn ts_put(s: &TsState, w: &mut TcW<'_>) -> Option<()> {
         w.bytes(&d.bytes[..usize::from(d.len)])?;
     }
     w.u64(s.next_production)?;
+    w.u64(s.out_bytes)?;
 
     w.u32(s.flow_epoch)?;
     w.u32(s.session_epoch)?;
@@ -991,6 +1022,9 @@ fn ts_get(r: &mut TcR<'_>, s: &mut TsState) -> Result<(), CkptError> {
 
     s.next_delivery = r.u64().ok_or(Truncated)?;
     s.delivery_acked = r.u64().ok_or(Truncated)?;
+    s.consumer_cursor = r.u64().ok_or(Truncated)?;
+    s.cursor_at = r.u64().ok_or(Truncated)?;
+    s.in_bytes = r.u64().ok_or(Truncated)?;
     s.deliv_count = r.u8().ok_or(Truncated)?;
     if usize::from(s.deliv_count) > TS_DELIV_MAX {
         return Err(Bounds);
@@ -1007,6 +1041,7 @@ fn ts_get(r: &mut TcR<'_>, s: &mut TsState) -> Result<(), CkptError> {
         d.bytes[..usize::from(len)].copy_from_slice(r.take(usize::from(len)).ok_or(Truncated)?);
     }
     s.next_production = r.u64().ok_or(Truncated)?;
+    s.out_bytes = r.u64().ok_or(Truncated)?;
 
     s.flow_epoch = r.u32().ok_or(Truncated)?;
     s.session_epoch = r.u32().ok_or(Truncated)?;
@@ -1730,12 +1765,34 @@ pub fn md_rx_record(
     Some(w.at)
 }
 
+/// A delivery acknowledgement: `[cursor u64][consumer_cursor u64]
+/// [cursor_at u64]` — every delivery through `cursor` consumed (each
+/// whole: its plaintext ends at or before `cursor_at`), and the consumer's
+/// own cursor and the clear byte its acknowledgement carried
+/// (`net_proto::CMD_DELIVERED`; 0 for none).
+pub fn md_delivery_ack(
+    out: &mut [u8],
+    cursor: u64,
+    consumer_cursor: u64,
+    cursor_at: u64,
+) -> Option<usize> {
+    let mut w = TcW::new(out);
+    w.u64(cursor)?;
+    w.u64(consumer_cursor)?;
+    w.u64(cursor_at)?;
+    Some(w.at)
+}
+
+/// A record out: `[production_id u64][epoch u32][record_seq u64][len u16]
+/// [ciphertext][out_bytes u64]` — `out_bytes` the consumer's clear bytes
+/// through this record (`TsState::out_bytes`).
 pub fn md_tx_record(
     out: &mut [u8],
     production_id: u64,
     epoch: u32,
     record_seq: u64,
     ciphertext: &[u8],
+    out_bytes: u64,
 ) -> Option<usize> {
     let mut w = TcW::new(out);
     w.u64(production_id)?;
@@ -1743,6 +1800,7 @@ pub fn md_tx_record(
     w.u64(record_seq)?;
     w.u16(ciphertext.len() as u16)?;
     w.bytes(ciphertext)?;
+    w.u64(out_bytes)?;
     Some(w.at)
 }
 
@@ -1965,12 +2023,31 @@ fn md_apply_raw(s: &mut TsState, kind: MdKind, p: &[u8]) -> Result<(), CkptError
         }
         MdKind::DeliveryAck => {
             let cursor = r.u64().ok_or(Truncated)?;
+            let consumer_cursor = r.u64().ok_or(Truncated)?;
+            let cursor_at = r.u64().ok_or(Truncated)?;
             md_end(&r)?;
-            if cursor < s.delivery_acked || cursor >= s.next_delivery {
+            if cursor < s.delivery_acked || cursor >= s.next_delivery || cursor_at < s.cursor_at {
+                return Err(SequenceImpossible);
+            }
+            let n = usize::from(s.deliv_count);
+            let mut bytes = 0u64;
+            for d in s.deliv[..n].iter() {
+                if d.id <= cursor {
+                    bytes += u64::from(d.len);
+                }
+            }
+            // Whole deliveries only: the acknowledgement may stand inside
+            // the first one still held, never short of those it covers. (One
+            // covering none may stand behind `in_bytes`, which counts what
+            // a record delivered before any acknowledgement reached it.)
+            let in_bytes = s.in_bytes.wrapping_add(bytes);
+            if cursor > s.delivery_acked && in_bytes > cursor_at {
                 return Err(SequenceImpossible);
             }
             s.delivery_acked = cursor;
-            let n = usize::from(s.deliv_count);
+            s.consumer_cursor = consumer_cursor;
+            s.cursor_at = cursor_at;
+            s.in_bytes = in_bytes;
             let mut keep = 0;
             for i in 0..n {
                 if s.deliv[i].id > cursor {
@@ -1994,8 +2071,9 @@ fn md_apply_raw(s: &mut TsState, kind: MdKind, p: &[u8]) -> Result<(), CkptError
             let record_seq = r.u64().ok_or(Truncated)?;
             let len = r.u16().ok_or(Truncated)?;
             let ct = r.take(usize::from(len)).ok_or(Truncated)?;
+            let out_bytes = r.u64().ok_or(Truncated)?;
             md_end(&r)?;
-            if len == 0 || s.fin_queued {
+            if len == 0 || s.fin_queued || out_bytes < s.out_bytes {
                 return Err(SequenceImpossible);
             }
             if epoch != s.write_epoch || record_seq != s.write_seq {
@@ -2019,6 +2097,7 @@ fn md_apply_raw(s: &mut TsState, kind: MdKind, p: &[u8]) -> Result<(), CkptError
             s.tx_count += 1;
             s.send_len += len;
             s.write_seq += 1;
+            s.out_bytes = out_bytes;
             if production_id != 0 {
                 s.next_production += 1;
             }
