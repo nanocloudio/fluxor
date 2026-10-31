@@ -45,6 +45,6 @@ direction = "output"
 content_type = "NetProto"
 required = false
 
-# Module-scope observability — exempt (see standards/observability.md §6).
+# Module-scope observability — exempt.
 [observability]
 exempt = "connection-level fan-out — per-connection bytes are observed at the ip and tls modules; this module's domain metric is route/drop counts only"

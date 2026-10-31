@@ -27,6 +27,6 @@ max_record = 24
 # key | physical_buttons); `display_count = 0` declares a screenless audio-only
 # device (rp2350 + I2S speaker).
 
-# Module-scope observability — exempt (see standards/observability.md §6).
+# Module-scope observability — exempt.
 [observability]
 exempt = "environment-plane authority — emits a one-shot surface-state descriptor, not a sustained byte stream"

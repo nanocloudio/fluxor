@@ -327,7 +327,7 @@ pub fn load_module_manifests_with_extra_for_target(
         }
         match Manifest::from_toml_for_target(&manifest_path, target_abi) {
             Ok(mut m) => {
-                // Variant-selected node (RFC module_variants): the
+                // Variant-selected node: the
                 // manifest wiring validates against is the VARIANT's —
                 // omitted ports absent, so a YAML that wires a dropped
                 // port fails loudly at config build (`resolve_port_spec`

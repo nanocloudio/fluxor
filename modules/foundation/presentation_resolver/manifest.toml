@@ -29,6 +29,6 @@ buffer_size = 1024
 #         + MAX_CONTROLS * (1 + MAX_BTN_LEN (24)) = 472.
 max_record = 472
 
-# Module-scope observability — exempt (see standards/observability.md §6).
+# Module-scope observability — exempt.
 [observability]
 exempt = "placement resolver — emits a small layout record per surface-state change, not a sustained byte stream"

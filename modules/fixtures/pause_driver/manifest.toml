@@ -17,6 +17,6 @@ timer_class = "wall_clock"
 requires_contract = "timer"
 access = "read"
 
-# Module-scope observability — exempt (standards/observability.md §6).
+# Module-scope observability — exempt.
 [observability]
 exempt = "pause/resume driver fixture; its '[pdrv]' log lines are the observable, consumed by the rig scenario's pass rules"

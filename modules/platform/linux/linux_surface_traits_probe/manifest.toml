@@ -15,6 +15,6 @@ direction = "input"
 content_type = "SurfaceTraits"
 required = true
 
-# Module-scope observability — exempt (see standards/observability.md §6).
+# Module-scope observability — exempt.
 [observability]
 exempt = "Linux-host demo probe — logs decoded surface-state to stdout, not an on-silicon data path"

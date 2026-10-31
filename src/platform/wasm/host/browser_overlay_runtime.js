@@ -316,7 +316,7 @@
     // defaulting. Keep the two lists in lock-step (pinned by
     // tools/tests/browser_overlay_runtime_surface.rs).
     const OVERLAY_REGION = {
-      // Edge thirds (the RFC canonical safe regions — e.g. a dpad in left_third).
+      // Edge thirds, the canonical safe regions (e.g. a dpad in left_third).
       left_third: { left: '2%', top: '50%', transform: 'translateY(-50%)', width: '30%' },
       right_third: { right: '2%', top: '50%', transform: 'translateY(-50%)', width: '30%' },
       center_third: { left: '50%', top: '50%', transform: 'translate(-50%,-50%)', width: '30%' },

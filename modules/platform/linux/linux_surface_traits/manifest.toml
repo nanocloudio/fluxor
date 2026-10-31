@@ -33,6 +33,6 @@ type = "u32"
 default = 480
 range = [1, 4096]
 
-# Module-scope observability — exempt (see standards/observability.md §6).
+# Module-scope observability — exempt.
 [observability]
 exempt = "Linux-host environment shim — publishes surface-state snapshots derived from config + /proc input enumeration, not an on-silicon data path"

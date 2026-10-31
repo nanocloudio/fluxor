@@ -21,6 +21,6 @@ tag = 10
 type = "str"
 default = ""
 
-# Module-scope observability — exempt (see standards/observability.md §6).
+# Module-scope observability — exempt.
 [observability]
 exempt = "browser-API shim (wasm) — observed via browser devtools; carries input events / media samples / canvas rasters / WS frames, not a measurable on-device byte stream"

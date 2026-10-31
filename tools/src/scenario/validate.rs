@@ -2,12 +2,11 @@
 // Validation
 // ============================================================================
 
-/// Validate a parsed scenario against the §5 schema rules and the §16
-/// invariants. `scenario_path` is used for path resolution (`graph:`,
-/// `host_page:`, `list:` all resolve relative to the scenario YAML's
-/// directory) and for error messages.
+/// Validate a parsed scenario's structure. `scenario_path` is used for
+/// path resolution (`graph:`, `host_page:`, `list:` all resolve relative
+/// to the scenario YAML's directory) and for error messages.
 ///
-/// PR 1 scope:
+/// Checks:
 ///   - Component existence (`graph:` path exists and is readable).
 ///   - Mutual exclusion of `graph:` / `scenario:`.
 ///   - `kind: scenario` is set to `"scenario"`.
@@ -17,22 +16,18 @@
 ///   - Binding references resolve (`serve:` / `on:` name defined
 ///     components).
 ///   - `runtime_override:` is one of {linux, qemu-virt}; never on a wasm
-///     component (§16 Q3).
+///     component.
 ///   - `host_page:` exists on disk (when set).
 ///   - `list:` directory exists on disk (when set).
 ///   - Binding dependency graph is a DAG (cycle → hard error).
-///   - Under `sequential: true`, every component declares `duration:`
-///     OR exits on its own (heuristic: any component whose graph
-///     target is wasm exits on tab-close, not on its own — flag it).
-///     Per RFC: "every component that does not exit on its own must
-///     declare `duration:`". PR 1 conservatively warns; PR 4 enforces.
+///   - Under `sequential: true`, every component that does not exit on
+///     its own declares `duration:`. A wasm component runs until its tab
+///     closes, so one without `duration:` is an error; any other
+///     component without one draws a warning that it must exit on its
+///     own, which only running it can show.
 ///
-/// Deferred to PR 2: route-conflict detection (requires parsing each
-/// component's graph YAML and walking its http module's `routes:`
-/// table — done in the route merger).
-///
-/// Deferred to PR 5: module-mask compatibility check for
-/// `runtime_override:` (requires loading every module's manifest).
+/// Route conflicts and a binding's module name are checked by the route
+/// merger, which reads each component's graph.
 pub fn validate(scenario: &Scenario, scenario_path: &Path) -> Result<()> {
     let base = scenario_path
         .parent()
@@ -127,7 +122,7 @@ pub fn validate(scenario: &Scenario, scenario_path: &Path) -> Result<()> {
             if graph_targets.get(name).map(String::as_str) == Some("wasm") {
                 return Err(Error::Config(format!(
                     "scenario {}: component `{}` has `runtime_override:` but the underlying \
-                     graph targets wasm. Wasm bundles always build for the wasm target \
+                     graph targets wasm. Wasm bundles always build for the wasm target; \
                      remove the override.",
                     scenario_path.display(),
                     name
@@ -236,22 +231,28 @@ pub fn validate(scenario: &Scenario, scenario_path: &Path) -> Result<()> {
     // --- binding dependency DAG ---
     check_binding_dag(scenario, scenario_path)?;
 
-    // --- sequential + duration consistency (warn-only PR 1; PR 4 enforces) ---
+    // --- sequential + duration consistency ---
     if scenario.sequential {
         for (name, comp) in &scenario.components {
-            if comp.duration.is_none() {
-                let target = graph_targets.get(name).map(String::as_str).unwrap_or("");
-                if target != "wasm" {
-                    eprintln!(
-                        "warning: scenario {}: sequential mode without `duration:` on \
-                         component `{}` (target {:?}) — component must exit on its own. \
-                         Will be enforced as a hard error in PR 4.",
-                        scenario_path.display(),
-                        name,
-                        target
-                    );
-                }
+            if comp.duration.is_some() {
+                continue;
             }
+            let target = graph_targets.get(name).map(String::as_str).unwrap_or("");
+            if target == "wasm" {
+                return Err(Error::Config(format!(
+                    "scenario {}: sequential mode needs `duration:` on wasm component `{}` \
+                     — it runs until its tab closes, so it never ends on its own.",
+                    scenario_path.display(),
+                    name
+                )));
+            }
+            eprintln!(
+                "warning: scenario {}: sequential mode without `duration:` on \
+                 component `{}` (target {:?}) — component must exit on its own.",
+                scenario_path.display(),
+                name,
+                target
+            );
         }
     }
 
@@ -283,7 +284,7 @@ fn check_on_reference(
         )));
     }
     // Module existence inside the graph is verified by the route
-    // merger (PR 2); PR 1 only catches typo'd component names.
+    // merger; this only catches a misspelt component name.
     Ok(())
 }
 

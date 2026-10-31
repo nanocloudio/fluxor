@@ -28,6 +28,6 @@ buffer_size = 2048
 # BLOB_CHUNK_SIZE — blobs are emitted in 512-byte chunks.
 max_record = 512
 
-# Module-scope observability — exempt (see standards/observability.md §6).
+# Module-scope observability — exempt.
 [observability]
 exempt = "block-storage driver — block I/O is observed at the fs/bank layer above it"

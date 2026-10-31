@@ -2,9 +2,8 @@ version = "1.0.0"
 hardware_targets = ["wasm"]
 builtin = true
 
-# Truthful AV capabilities, parallel to `linux_audio` / `i2s_pio`
-# (RFC browser_overlay §5.7): a PCM sample sink with a presentation
-# clock. Lets the `audio` platform stack resolve a wasm variant and
+# Truthful AV capabilities, parallel to `linux_audio` / `i2s_pio`: a PCM
+# sample sink with a presentation clock. Lets the `audio` platform stack resolve a wasm variant and
 # lets cross-target graph-shape checks treat all PCM sinks alike.
 capabilities = ["audio.sample", "presentation.clock"]
 
@@ -48,6 +47,6 @@ tag = 12
 type = "u8"
 default = 120
 
-# Module-scope observability — exempt (see standards/observability.md §6).
+# Module-scope observability — exempt.
 [observability]
 exempt = "browser-API shim (wasm) — observed via browser devtools; carries input events / media samples / canvas rasters / WS frames, not a measurable on-device byte stream"

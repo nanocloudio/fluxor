@@ -84,7 +84,7 @@ pub fn is_scenario_file(path: &Path) -> bool {
 // result: one file per example per platform — no separate
 // standalone scenario sibling needed.
 //
-// The block fields mirror the explicit-scenario schema (§5) one-to-
+// The block fields mirror the explicit-scenario schema one-to-
 // one minus the always-implicit primary component:
 //   * `name`             — scenario name
 //   * `companions`       — map of `<name>: <path>` graphs to spawn alongside

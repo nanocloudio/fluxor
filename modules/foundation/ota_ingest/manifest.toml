@@ -29,6 +29,6 @@ direction = "output"
 content_type = "FmpMessage"
 required = true
 
-# Module-scope observability — exempt (see standards/observability.md §6).
+# Module-scope observability — exempt.
 [observability]
 exempt = "firmware-image ingest — emits its own progress status records (kind/offset/byte_count) on the status port; a generic byte counter would duplicate that domain telemetry"

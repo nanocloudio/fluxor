@@ -3,7 +3,7 @@ hardware_targets = ["bcm2712", "rp2350", "linux"]
 
 # Drives its busy/idle phase off real wall-clock time (dev_millis), so a
 # variable scheduler cadence only changes when it samples, not its behaviour —
-# safe on an adaptive-tick domain (RFC adaptive_tick D8/AC5b).
+# safe on an adaptive-tick domain.
 timer_class = "wall_clock"
 
 # Synthetic, self-driven load generator for adaptive-tick (pacer) validation.

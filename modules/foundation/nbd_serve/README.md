@@ -121,9 +121,8 @@ no `/dev/ublk-control`), while `nbd.ko` is available and io_uring is enabled.
 A ublk frontend would consume the same `storage.block` records and replace
 only the transport.
 
-Attaching a real `/dev/nbdN` needs root, so the host tests
-(`tests/harness/tests/nbd_serve.rs`) play the NBD client byte for byte over a
-modelled transport instead.
+Attaching a real `/dev/nbdN` needs root, so the host tests play the NBD
+client byte for byte over a modelled transport instead.
 
 ## Limits
 

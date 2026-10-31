@@ -11,6 +11,6 @@ hardware_targets = ["linux"]
 #   [drain_probe] draining           module_drain was called
 #   [drain_probe] drained            the drain work finished; Done follows
 
-# Module-scope observability — exempt (standards/observability.md §6).
+# Module-scope observability — exempt.
 [observability]
 exempt = "drain fixture; its '[drain_probe]' log lines are the observable, consumed by the stop-drain test"

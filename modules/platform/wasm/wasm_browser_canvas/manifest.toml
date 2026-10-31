@@ -10,8 +10,8 @@ builtin = true
 # `linux_display`). Other formats are added by extending the host
 # import.
 
-# Truthful AV capabilities, parallel to `linux_display` / `st7701s`
-# (RFC browser_overlay §5.7): a paced raster present surface. Lets the
+# Truthful AV capabilities, parallel to `linux_display` / `st7701s`: a
+# paced raster present surface. Lets the
 # `display` platform stack resolve a wasm variant and lets cross-target
 # graph-shape checks treat all three display sinks interchangeably.
 capabilities = ["video.raster", "display.scanout", "presentation.clock"]
@@ -49,6 +49,6 @@ tag = 12
 type = "u16"
 default = 0
 
-# Module-scope observability — exempt (see standards/observability.md §6).
+# Module-scope observability — exempt.
 [observability]
 exempt = "browser-API shim (wasm) — observed via browser devtools; carries input events / media samples / canvas rasters / WS frames, not a measurable on-device byte stream"

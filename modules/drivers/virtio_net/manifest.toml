@@ -18,6 +18,6 @@ buffer_size = 4096
 # MAX_FRAME_SIZE — one ethernet frame per write.
 max_record = 1514
 
-# Module-scope observability — exempt (see standards/observability.md §6).
+# Module-scope observability — exempt.
 [observability]
 exempt = "L2 frame DMA shim — wire-byte throughput is observed at the ip module that consumes/produces these frames"

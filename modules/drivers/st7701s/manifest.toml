@@ -28,6 +28,6 @@ access = "write"
 requires_contract = "platform_dma_fd"
 access = "exclusive"
 
-# Module-scope observability — exempt (see standards/observability.md §6).
+# Module-scope observability — exempt.
 [observability]
 exempt = "display scanout — frame/refresh rate is the domain metric, not byte throughput"

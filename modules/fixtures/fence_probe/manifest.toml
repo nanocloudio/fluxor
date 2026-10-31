@@ -49,6 +49,6 @@ buffer_size = 512
 requires_contract = "channel"
 access = "read"
 
-# Module-scope observability — exempt (standards/observability.md §6).
+# Module-scope observability — exempt.
 [observability]
 exempt = "fence fixture; its log lines are the observable a packet capture is aligned against"

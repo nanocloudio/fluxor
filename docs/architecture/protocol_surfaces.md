@@ -497,14 +497,12 @@ Four identifiers at three scopes:
 
 ## Content Contracts
 
-The envelope vocabulary is declared as content types alongside the
-registry in `capability_surface.md` (canonical names in
-`contracts/src/vocabulary.rs`): `NetStreamCmdV1` / `NetStreamEvtV1`
-(stream), `NetDatagramTxV1` / `NetDatagramRxV1` (datagram),
-`NetPacketV1` (packet), `NetMuxCmdV1` / `NetMuxEvtV1` (multiplexed
-session), and `NetSessionCtrlV1` (session control). These are declared
-vocabulary; current manifests type their net ports as `NetProto` or
-`OctetStream`.
+Every surface on this page travels on a port typed `NetProto`: one
+`[msg_type u8][len u16 LE][payload]` frame per channel write. The
+content type names the framing, not the surface; a frame's surface is
+fixed by its message-type range, which is why the ranges are disjoint.
+Ports that carry a format of their own rather than these frames, such
+as a continuity record stream, are typed `OctetStream`.
 
 ## SessionCtrl Envelope
 

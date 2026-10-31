@@ -37,6 +37,6 @@ access = "read"
 accepts = ["next", "prev", "toggle", "select"]
 emits = ["status"]
 
-# Module-scope observability — exempt (see standards/observability.md §6).
+# Module-scope observability — exempt.
 [observability]
 exempt = "asset store — served bytes are observed at the http module that serves them"

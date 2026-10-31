@@ -34,6 +34,6 @@ required = false
 buffer_size = { default = 2048, aarch64 = 8192 }
 max_record = 2048
 
-# Module-scope observability — exempt (see standards/observability.md §6).
+# Module-scope observability — exempt.
 [observability]
 exempt = "transport buffer — forwards framed bytes to a selected transport (udp/uart), originates no telemetry of its own (cf. log_net)"

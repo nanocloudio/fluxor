@@ -21,6 +21,6 @@ direction = "input"
 content_type = "OctetStream"
 buffer_size = 16
 
-# Module-scope observability — exempt (standards/observability.md §6).
+# Module-scope observability — exempt.
 [observability]
 exempt = "RAM fixture provider driven only by provider_call from contract tests; emits no sustained byte stream"

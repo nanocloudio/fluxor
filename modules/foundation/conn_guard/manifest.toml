@@ -13,8 +13,7 @@ timer_class = "agnostic"
 # does, and the fuse table is a rate limiter whose worst case after a partial
 # update is one admission of drift inside one `rate_window_ms`. A fault between
 # the prefix read and the body read cannot desynchronise the stream because the
-# restart path flushes the channel before the module runs again. Matrix:
-# tools/tests/conn_guard_resume.rs.
+# restart path flushes the channel before the module runs again.
 resume_after_fault = true
 
 [[ports]]
@@ -32,6 +31,6 @@ required = true
 buffer_size = { default = 2048, aarch64 = 8192 }
 max_record = 1514
 
-# Module-scope observability — exempt (see standards/observability.md §6).
+# Module-scope observability — exempt.
 [observability]
 exempt = "L2 pass-through filter/fan-out — frame bytes are observed at the ip module; its domain metric is pass/drop counts"

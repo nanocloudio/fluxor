@@ -27,6 +27,5 @@ The platform-side constants are generated from these manifests by
 `build.rs` into `fluxor::platform::builtin_param_tags`, so the tag number
 exists once rather than in two places that must agree.
 
-`tools/tests/builtin_param_layout.rs` pins the released
-`(module, name, type, tag)` set; changing a released row means updating
-that table in the same commit.
+The released `(module, name, type, tag)` set is pinned in CI: a
+released row changes only by updating the pin in the same commit.

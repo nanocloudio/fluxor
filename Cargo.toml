@@ -335,9 +335,8 @@ members = ["contracts", "crates/fluxor-abi", "crates/fluxor-launcher", "crates/f
 # via path. It is intentionally not a member here — host integration
 # tests are run from inside `tests/harness` so the rest of the tree
 # builds without them present. Module directories carry no Cargo
-# manifests at all (standards/fluxor-modules.md §1): the PIC build
-# invokes rustc directly, and the harness mounts module cores via
-# `include!`.
+# manifests at all: the PIC build invokes rustc directly, and the
+# harness mounts module cores via `include!`.
 exclude = ["tests"]
 
 [workspace.package]
@@ -367,11 +366,11 @@ pedantic = { level = "warn",  priority = -1 }
 # hygiene scanner enforces the same on module trees outside the
 # cargo workspace.
 #
-# `allow_attributes = "allow"` is the setting standards/lints.md §1 prescribes
-# for a multi-target project, and this is a multi-target project: the
-# target-conditional shim of §3.3 is unavoidable across the kernel's silicon
-# and host configurations, and `#[expect]` is not the alternative, because it
-# fails the build in the configurations where the lint does not fire.
+# `allow_attributes = "allow"` because this is a multi-target project: a
+# lint that fires under one target configuration and not another is
+# unavoidable across the kernel's silicon and host builds, and `#[expect]`
+# is not the alternative, because it fails the build in the configurations
+# where the lint does not fire.
 #
 # `allow_attributes_without_reason` below carries §3's actual requirement and
 # stays denied. Crate-root `#![allow]` is held separately, by `fluxor ci`'s

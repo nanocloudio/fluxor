@@ -44,7 +44,7 @@ modules = [
 ]
 wiring = []
 
-# ── WASM: browser WebAudio sink (RFC browser_overlay §5.7) ──────────────
+# ── WASM: browser WebAudio sink ─────────────────────────────────────────
 # Lets a wasm graph resolve `audio_out` through the same `platform.audio:`
 # stack as Linux/RP instead of instantiating `wasm_browser_audio`
 # directly. The sink declares `audio.sample` + `presentation.clock`.

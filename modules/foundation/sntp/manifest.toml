@@ -53,6 +53,6 @@ content_type = "NetProto"
 requires_contract = "timer"
 access = "write"
 
-# Module-scope observability — exempt (standards/observability.md §6).
+# Module-scope observability — exempt.
 [observability]
 exempt = "its '[sntp]' sync / no_quorum / kod / hb lines are the observable; the kernel's own '[time] anchored' line confirms each anchor"

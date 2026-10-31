@@ -16,6 +16,6 @@ required = true
 max_record = 1
 buffer_size = 64
 
-# Module-scope observability — exempt (see standards/observability.md §6).
+# Module-scope observability — exempt.
 [observability]
 exempt = "control-rate transformer — emits one level byte per brightness change, not a sustained byte stream"

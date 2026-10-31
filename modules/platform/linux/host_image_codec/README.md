@@ -11,7 +11,7 @@ without a board-side image codec module.
 modules:
   - name: asset
     type: host_asset_source
-    path: examples/image_viewer/assets/test.jpg
+    path: assets/test.jpg
   - name: codec
     type: host_image_codec
     width: 480
@@ -56,9 +56,8 @@ Configured via `[[params]]` in [manifest.toml](manifest.toml):
 | `scale_mode` | enum | `fit`                       | `fit` preserves aspect with black letterbox; `stretch` fills the target dimensions  |
 | `max_bytes`  | u32  | 4194304 (range 1024..=64M)  | hard cap on encoded input size before the codec gives up                            |
 
-Width and height should match the downstream `linux_display`. If they
-don't, the display garbles the frame — typed-payload validation will
-catch this when that RFC lands.
+Width and height must match the downstream `linux_display`. Nothing
+checks that they agree; if they don't, the display garbles the frame.
 
 ## Behaviour
 

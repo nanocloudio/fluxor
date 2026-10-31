@@ -91,6 +91,6 @@ rate_class_default = "control"
 requires_contract = "proc"
 access = "read"
 
-# Module-scope observability — exempt (standards/observability.md §6).
+# Module-scope observability — exempt.
 [observability]
 exempt = "fence fixture; its log lines and the actuator it drives are the observables a packet capture is aligned against"

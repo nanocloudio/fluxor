@@ -65,6 +65,6 @@ index = 1
 direction = "input"
 content_type = "OctetStream"
 
-# Module-scope observability — exempt (see standards/observability.md §6).
+# Module-scope observability — exempt.
 [observability]
 exempt = "control-plane puller — emits discrete progress log lines (manifest/blob/commit), not a sustained byte data path"

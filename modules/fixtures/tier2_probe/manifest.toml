@@ -23,6 +23,6 @@ direction = "output"
 content_type = "OctetStream"
 buffer_size = 16
 
-# Module-scope observability — exempt (see standards/observability.md §6).
+# Module-scope observability — exempt.
 [observability]
 exempt = "Tier-2 IRQ probe — counts module_isr_entry dispatches, emits no sustained byte stream"

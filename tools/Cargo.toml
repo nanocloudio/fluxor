@@ -84,9 +84,8 @@ toml = "1.1.2"
 walkdir = "2.5.0"
 
 # The rig load probes are a crate of their own, `tools/rig-observers/`, so the
-# async runtime they need stays out of the CLI's dependency closure. Splitting
-# the crate is what standards/dependencies.md §10a asks for in place of gating
-# a shipped binary behind a feature.
+# async runtime they need stays out of the CLI's dependency closure without
+# gating a shipped binary behind a feature.
 rustls = { version = "0.23.40", default-features = false, features = ["std", "tls12", "ring"] }
 # Web-PKI trust anchors for `fluxor store push`/`pull` against public
 # registries; a deployment CA (e.g. the nanocloud registry's) is added

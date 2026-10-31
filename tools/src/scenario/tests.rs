@@ -91,6 +91,38 @@ bindings:
     }
 
     #[test]
+    fn sequential_wasm_component_needs_a_duration() {
+        let yaml = |duration: &str| {
+            format!(
+                "\
+kind: scenario
+name: viewer
+sequential: true
+components:
+  viewer:
+    graph: viewer/graph.yaml
+    host_page: viewer/viewer.html
+{duration}host:
+  port: 9876
+bindings:
+  - serve: viewer
+"
+            )
+        };
+        let (_tmp, path) = make_temp_tree("seq_no_duration", &yaml(""));
+        let s = parse(&path).unwrap();
+        let msg = format!("{}", validate(&s, &path).unwrap_err());
+        assert!(
+            msg.contains("duration") && msg.contains("viewer"),
+            "expected a missing-duration error, got: {msg}"
+        );
+
+        let (_tmp, path) = make_temp_tree("seq_duration", &yaml("    duration: 30\n"));
+        let s = parse(&path).unwrap();
+        validate(&s, &path).unwrap();
+    }
+
+    #[test]
     fn runtime_override_wasm_is_rejected() {
         let (_tmp, path) = make_temp_tree(
             "override_wasm",
@@ -444,7 +476,7 @@ bindings:
         let merged = merge_bindings_for_component("decoder", &s, &path).unwrap();
         let routes = merged["modules"][0]["routes"].as_array().unwrap();
         // Original /api/list + 4 binding-injected routes (page,
-        // bundle, host_shims.js, scenario.json — commit 1c).
+        // bundle, host_shims.js, scenario.json).
         assert_eq!(routes.len(), 5);
         let paths: Vec<&str> = routes.iter().map(|r| r["path"].as_str().unwrap()).collect();
         assert!(paths.contains(&"/api/list"));
@@ -713,7 +745,7 @@ bindings:
         // bare-metal `["bcm2712"]` module is not placed under it.
         assert_eq!(aliases("linux"), vec!["linux".to_string()]);
         // A board resolves to its silicon's runtime; the board id itself is
-        // NOT a legal `hardware_targets` token (§2 rule 1).
+        // NOT a legal `hardware_targets` token.
         assert_eq!(aliases("pi5"), vec!["bcm2712".to_string()]);
         assert_eq!(aliases("qemu-virt"), vec!["bcm2712".to_string()]);
         assert_eq!(aliases("pico2w"), vec!["rp2350".to_string()]);

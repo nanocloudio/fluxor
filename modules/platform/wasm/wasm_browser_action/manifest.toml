@@ -27,6 +27,6 @@ required = true
 # selector verbs below are the common case (`bank` matches these).
 emits = ["next", "prev", "toggle"]
 
-# Module-scope observability — exempt (see standards/observability.md §6).
+# Module-scope observability — exempt.
 [observability]
 exempt = "browser-API shim (wasm) — observed via browser devtools; bridges user-activated overlay controls into FMP commands, not a measurable on-device byte stream"

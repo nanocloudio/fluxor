@@ -23,6 +23,6 @@ buffer_size = 256
 [commands]
 accepts = ["status", "toggle", "select", "next", "prev"]
 
-# Module-scope observability — exempt (see standards/observability.md §6).
+# Module-scope observability — exempt.
 [observability]
 exempt = "note-event source — event rate, set by the step clock, is the domain metric, not byte throughput"

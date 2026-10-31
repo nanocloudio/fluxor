@@ -203,62 +203,6 @@ kind       = "doc_only"
 mechanical = true
 
 [[entry]]
-legacy     = "net.stream.cmd.v1"
-canonical  = "NetStreamCmdV1"
-layer      = "wire_content"
-kind       = "doc_only"
-mechanical = true
-
-[[entry]]
-legacy     = "net.stream.evt.v1"
-canonical  = "NetStreamEvtV1"
-layer      = "wire_content"
-kind       = "doc_only"
-mechanical = true
-
-[[entry]]
-legacy     = "net.datagram.tx.v1"
-canonical  = "NetDatagramTxV1"
-layer      = "wire_content"
-kind       = "doc_only"
-mechanical = true
-
-[[entry]]
-legacy     = "net.datagram.rx.v1"
-canonical  = "NetDatagramRxV1"
-layer      = "wire_content"
-kind       = "doc_only"
-mechanical = true
-
-[[entry]]
-legacy     = "net.packet.v1"
-canonical  = "NetPacketV1"
-layer      = "wire_content"
-kind       = "doc_only"
-mechanical = true
-
-[[entry]]
-legacy     = "net.mux.cmd.v1"
-canonical  = "NetMuxCmdV1"
-layer      = "wire_content"
-kind       = "doc_only"
-mechanical = true
-
-[[entry]]
-legacy     = "net.mux.evt.v1"
-canonical  = "NetMuxEvtV1"
-layer      = "wire_content"
-kind       = "doc_only"
-mechanical = true
-
-[[entry]]
-legacy     = "net.session.ctrl.v1"
-canonical  = "NetSessionCtrlV1"
-layer      = "wire_content"
-kind       = "doc_only"
-mechanical = true
-
-[[entry]]
 legacy     = "storage.block.v1"
 canonical  = "storage.block"
 layer      = "surface"

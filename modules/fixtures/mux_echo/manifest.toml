@@ -26,8 +26,8 @@ buffer_size = 8192
 requires_contract = "channel"
 access = "read"
 
-# Module-scope observability — exempt (see standards/observability.md §6). This
-# is a test fixture: what it proves is asserted by the suite that drives it, and
-# byte throughput is the transport's to report.
+# Module-scope observability — exempt. This is a test fixture: what it
+# proves is asserted by the suite that drives it, and byte throughput is the
+# transport's to report.
 [observability]
 exempt = "test fixture for the mux surface — the transport underneath it reports throughput"

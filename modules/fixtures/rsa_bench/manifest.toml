@@ -14,6 +14,6 @@ timer_class = "wall_clock"
 # exponentiation on a Cortex-M33), so a graph that boots it raises the
 # module's `step_deadline_us`.
 
-# Module-scope observability — exempt (see standards/observability.md §6).
+# Module-scope observability — exempt.
 [observability]
 exempt = "measurement fixture — its findings are its log lines, not a data path"

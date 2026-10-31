@@ -25,6 +25,6 @@ version = "1.0.0"
 hardware_targets = ["linux"]
 builtin = true
 
-# Module-scope observability — exempt (see standards/observability.md §6).
+# Module-scope observability — exempt.
 [observability]
 exempt = "Boot-time KEY_VAULT contract backend, not a graph data path; observed via the contract's TIER/CAPS opcodes and host tooling"

@@ -62,6 +62,6 @@ type = "u16"
 default = 1
 range = [0, 1]
 
-# Module-scope observability — exempt (see standards/observability.md §6).
+# Module-scope observability — exempt.
 [observability]
 exempt = "browser-API shim (wasm) — observed via browser devtools; carries media samples, not a measurable on-device byte stream"

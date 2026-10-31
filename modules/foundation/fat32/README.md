@@ -300,19 +300,16 @@ mismatch reports what is on the device against what was expected.
   order would leave a size claiming bytes the chain cannot reach, so this is
   the direction to fail in.
 
-## Tests
+## Verification
 
-`tests/harness/tests/`:
-
-- `fat32_volume_integrity.rs` — the gate. Fixtures are real `mkfs.vfat`
-  images mounted through the provider's own boot-sector parser, mutations
-  are checked with `fsck.vfat` **against the platter** at every crash point,
+- **Volume integrity**, the gate. Fixtures are real `mkfs.vfat` images
+  mounted through the provider's own boot-sector parser, mutations are
+  checked with `fsck.vfat` **against the platter** at every crash point,
   and cluster usage is compared across create/unlink cycles to catch leaks,
   which are not inconsistencies and so are invisible to `fsck` alone.
-- `fat32_rename_contract.rs` — the intent record's crash-point matrix.
-- `fat32_async_fence_contract.rs` — the two-stage data-then-metadata fence.
-- `fat32_write_contract.rs`, `fat32_unlink_contract.rs`,
-  `fat32_kv_run_storage.rs`.
+- **Rename**: the intent record at every crash point.
+- **Async fence**: the two-stage data-then-metadata fence.
+- **Write, unlink and KV-run storage** contracts.
 
 Checking the platter rather than the visible image is the point: the visible
 image includes writes still in the device's volatile cache, and a provider
@@ -337,9 +334,8 @@ accident would then be the seam:
 
 What is worth reusing from here is the *lower* half — the sector cache and
 its write chokepoints, the bounded resumable-scan shape, the fence and
-ticket machinery, the errno taxonomy, and the harness in
-`tests/harness/src/fat32_volume.rs` (which is filesystem-agnostic apart from
-naming `mkfs.vfat`). What is not worth reusing is anything above that:
+ticket machinery, the errno taxonomy, and the host volume harness (which is
+filesystem-agnostic apart from naming `mkfs.vfat`). What is not worth reusing is anything above that:
 FAT's path resolution, its directory format and its allocation model have
 nothing in common with an inode-and-extent filesystem, and a shared
 abstraction over both would be shaped by whichever came first.

@@ -7,6 +7,6 @@ name = "devices"
 direction = "output"
 content_type = "OctetStream"
 
-# Module-scope observability — exempt (see standards/observability.md §6).
+# Module-scope observability — exempt.
 [observability]
 exempt = "diagnostic/one-shot probe — not a steady-state production data path"

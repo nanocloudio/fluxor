@@ -2,9 +2,9 @@ version = "1.0.0"
 hardware_targets = ["bcm2712"]
 permissions = ["platform_raw"]
 
-# Workload-churn driver (tests/hardware/pi5_workload_churn.toml): admits and
-# reaps a small workload `cycles` times through the metal `workload` backend
-# (0x1A), the way a node agent does, then stages two faulting workloads.
+# Workload-churn driver: admits and reaps a small workload `cycles` times
+# through the metal `workload` backend (0x1A), the way a node agent does, then
+# stages two faulting workloads.
 #
 # Each cycle: CREATE the FLXA workload churn_probe(source) -> churn_probe(relay) ->
 # this module's lane (edges sized `chan_bytes`), START, read the lane until a
@@ -44,6 +44,6 @@ access = "read"
 requires_contract = "workload"
 access = "write"
 
-# Module-scope observability — exempt (standards/observability.md §6).
+# Module-scope observability — exempt.
 [observability]
 exempt = "workload-churn driver fixture; its '[churn]' log lines are the observable, consumed by the rig scenario's pass rules"

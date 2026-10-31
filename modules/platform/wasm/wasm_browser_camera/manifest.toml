@@ -14,6 +14,6 @@ direction = "output"
 content_type = "OctetStream"
 required = true
 
-# Module-scope observability — exempt (see standards/observability.md §6).
+# Module-scope observability — exempt.
 [observability]
 exempt = "browser-API shim (wasm) — observed via browser devtools; carries media samples, not a measurable on-device byte stream"
