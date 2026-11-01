@@ -484,6 +484,10 @@ impl NetLane {
 /// deferred behind it — its event queue, and its fast-path count. Each lane
 /// has its own, so a workload whose peer stops reading holds up its own
 /// commands and events and nobody else's.
+/// `LaneState::close_valid` for a deferred abortive close (1: an orderly
+/// one).
+const CLOSE_STASH_ABORT: u8 = 2;
+
 #[repr(C)]
 struct LaneState {
     valid: u8,
@@ -765,6 +769,15 @@ const NOTIFY_ERROR_UNREACH: u8 = 5;
 /// delivered yet — retried; the connection stays open for the consumer to
 /// send on. `NOTIFY_CLOSED` is the connection gone (`CLOSED_GONE`).
 const NOTIFY_PEER_FIN: u8 = 6;
+/// Our RST, owed to a connection that is being reset (an abortive
+/// `CMD_CLOSE`, its lane gone) but whose standby must hold the reset first
+/// (`continuity::rst_gate`): the slot is latched `Closed` — inert, every
+/// segment absorbed — and the sweep sends the RST and frees it once the
+/// gate opens. Its consumer, if any, is told `CLOSED_GONE` then.
+const NOTIFY_RESET: u8 = 7;
+/// As `NOTIFY_RESET`, for a connection whose consumer is gone with its lane:
+/// nobody is told.
+const NOTIFY_RESET_QUIET: u8 = 8;
 /// TCP timer ticks per second (`step_tcp_timers` advances every 50 ms).
 const TCP_TIMER_HZ: u16 = 20;
 /// CloseWait bound: the peer has closed and the consumer has not answered
@@ -1004,6 +1017,7 @@ unsafe fn conn_reset(s: &mut IpState, idx: usize) {
     if half_open {
         half_open_leave(s, remote_ip);
     }
+    continuity::note_release(s, idx);
     continuity::on_conn_released(s, idx);
     *s.tcp_conns.ptr_mut(idx) = tcp::TcpConn::new();
     free_push(s, idx);
@@ -7411,6 +7425,8 @@ unsafe fn process_tcp_segment(
     const ACTION_RX_DATA_FIN: u8 = 10;
 
     let mut action: u8 = ACTION_NONE;
+    // How a connection this segment closes ended (`continuity::END_*`).
+    let mut ended = continuity::END_CLOSED;
     let mut rx_payload_offset: usize = 0;
     let mut rx_payload_len: usize = 0;
     let mut reorder_pending: bool = false;
@@ -7423,6 +7439,27 @@ unsafe fn process_tcp_segment(
 
     {
         let conn = &mut (*s.tcp_conns.ptr_mut(conn_idx));
+
+        // An RST the gate admitted (RFC 5961: at the receive position) ends
+        // the connection in every synchronised state (RFC 9293 §3.10.7.4);
+        // the handshake states keep their own rules below.
+        let rst = (tcp_hdr.flags & tcp::RST) != 0;
+        if rst
+            && matches!(
+                conn.state,
+                tcp::TcpState::Established
+                    | tcp::TcpState::CloseWait
+                    | tcp::TcpState::FinWait1
+                    | tcp::TcpState::FinWait2
+                    | tcp::TcpState::Closing
+                    | tcp::TcpState::LastAck
+                    | tcp::TcpState::TimeWait
+            )
+        {
+            conn.state = tcp::TcpState::Closed;
+            action = ACTION_SET_CLOSED;
+            ended = continuity::END_RESET_IN;
+        }
 
         match conn.state {
             tcp::TcpState::SynSent => {
@@ -7458,10 +7495,7 @@ unsafe fn process_tcp_segment(
                 }
             }
             tcp::TcpState::Established => {
-                if (tcp_hdr.flags & tcp::RST) != 0 {
-                    conn.state = tcp::TcpState::Closed;
-                    action = ACTION_SET_CLOSED;
-                } else {
+                {
                     if ack_usable {
                         let prev_una = conn.snd_una;
                         if seq_between(conn.snd_una, tcp_hdr.ack_num, conn.snd_nxt.wrapping_add(1))
@@ -7562,8 +7596,11 @@ unsafe fn process_tcp_segment(
                 let fin_at_rcv_nxt = (tcp_hdr.flags & tcp::FIN) != 0
                     && tcp_hdr.seq_num.wrapping_add(tcp_hdr.payload_len as u32) == conn.rcv_nxt;
                 if ack_usable {
-                    if seq_between(conn.snd_una, tcp_hdr.ack_num, conn.snd_nxt.wrapping_add(1)) {
+                    if seq_between(conn.snd_una, tcp_hdr.ack_num, conn.snd_nxt.wrapping_add(1))
+                        && tcp_hdr.ack_num != conn.snd_una
+                    {
                         conn.snd_una = tcp_hdr.ack_num;
+                        acked_new = true;
                     }
                     if tcp_hdr.ack_num == conn.snd_nxt {
                         // Our FIN has been acknowledged.
@@ -7591,6 +7628,8 @@ unsafe fn process_tcp_segment(
                 // Both FINs are exchanged; only the acknowledgement of ours
                 // is outstanding. Nothing else advances this state.
                 if ack_usable && tcp_hdr.ack_num == conn.snd_nxt {
+                    acked_new = conn.snd_una != tcp_hdr.ack_num;
+                    conn.snd_una = tcp_hdr.ack_num;
                     conn.state = tcp::TcpState::TimeWait;
                     conn.timewait_timer = 0;
                 }
@@ -7610,6 +7649,7 @@ unsafe fn process_tcp_segment(
                 // state: a stale ACK of earlier data must not tear the
                 // slot down while the FIN is still in flight.
                 if ack_usable && tcp_hdr.ack_num == conn.snd_nxt {
+                    conn.snd_una = tcp_hdr.ack_num;
                     conn.state = tcp::TcpState::Closed;
                     action = ACTION_SET_CLOSED;
                 }
@@ -7691,7 +7731,10 @@ unsafe fn process_tcp_segment(
         }
         ACTION_SET_CLOSED => {
             let remote_ip = (*s.tcp_conns.ptr(conn_idx)).remote_ip;
-            let delivered = net_send_closed(s, conn_idx as u16, CLOSED_GONE);
+            // A mirrored connection's provider hears the end first; until it
+            // can, the slot stays latched and the sweep asks again.
+            let delivered = continuity::end_reported(s, conn_idx, ended)
+                && net_send_closed(s, conn_idx as u16, CLOSED_GONE);
             let conn = &mut *s.tcp_conns.ptr_mut(conn_idx);
             if delivered {
                 if remote_ip != 0 {
@@ -9695,7 +9738,10 @@ unsafe fn close_loopback(s: &mut IpState, conn_id: usize) {
     }
 }
 
-unsafe fn process_cmd_close(s: &mut IpState, conn_id: usize) -> bool {
+/// `CMD_CLOSE` on `conn_id`; `abort` resets the connection instead
+/// (`net_proto::CLOSE_ABORT`). `false` when it must be asked again later
+/// (the FIN could not go yet).
+unsafe fn process_cmd_close(s: &mut IpState, conn_id: usize, abort: bool) -> bool {
     if conn_id >= s.tcp_conns.len() {
         return true;
     }
@@ -9704,6 +9750,34 @@ unsafe fn process_cmd_close(s: &mut IpState, conn_id: usize) -> bool {
         return true;
     }
     let conn_state = (*s.tcp_conns.ptr(conn_id)).state;
+    if abort
+        && matches!(
+            conn_state,
+            tcp::TcpState::Established
+                | tcp::TcpState::CloseWait
+                | tcp::TcpState::FinWait1
+                | tcp::TcpState::FinWait2
+                | tcp::TcpState::Closing
+                | tcp::TcpState::LastAck
+                | tcp::TcpState::SynReceived
+        )
+    {
+        // Our RST. Latched until the sweep sends it: at once unmirrored, and
+        // for a mirrored connection only once its standby holds the reset.
+        let c = &mut *s.tcp_conns.ptr_mut(conn_id);
+        c.state = tcp::TcpState::Closed;
+        c.pending_close_notify = NOTIFY_RESET;
+        if continuity::rst_gate(s, conn_id) {
+            let _ = send_tcp_control(s, conn_id, tcp::RST | tcp::ACK, false);
+            let remote_ip = (*s.tcp_conns.ptr(conn_id)).remote_ip;
+            if remote_ip != 0 {
+                arp::unpin(arp_tab(s), remote_ip);
+            }
+            conn_reset(s, conn_id);
+            net_send_closed(s, conn_id as u16, CLOSED_GONE);
+        }
+        return true;
+    }
     match conn_state {
         tcp::TcpState::Established => {
             let seq = (*s.tcp_conns.ptr(conn_id)).snd_nxt;
@@ -9724,7 +9798,10 @@ unsafe fn process_cmd_close(s: &mut IpState, conn_id: usize) -> bool {
             {
                 return false;
             }
-            (*s.tcp_conns.ptr_mut(conn_id)).state = tcp::TcpState::LastAck;
+            let c = &mut *s.tcp_conns.ptr_mut(conn_id);
+            c.state = tcp::TcpState::LastAck;
+            // The closing bound counts from here.
+            c.retransmit_timer = 0;
             continuity::on_sent(s, conn_id, seq, 0, true);
             continuity::on_state(s, conn_id);
             true
@@ -9735,8 +9812,18 @@ unsafe fn process_cmd_close(s: &mut IpState, conn_id: usize) -> bool {
             net_send_closed(s, conn_id as u16, CLOSED_GONE);
             true
         }
+        tcp::TcpState::TimeWait => {
+            // The close is done; TIME-WAIT is the quiet period that follows
+            // it, and runs its course (a retransmitted FIN is still
+            // answered). The consumer hears of the end when it does.
+            true
+        }
         _ => {
-            // Already closing/closed — reset and notify
+            // Already closing/closed — released, and the consumer told. A
+            // mirrored connection's provider hears of it first.
+            if !continuity::end_reported(s, conn_id, continuity::END_CLOSED) {
+                return false;
+            }
             let remote_ip = (*s.tcp_conns.ptr(conn_id)).remote_ip;
             if remote_ip != 0 {
                 arp::unpin(arp_tab(s), remote_ip);
@@ -10432,6 +10519,21 @@ unsafe fn lane_close(s: &mut IpState, lane: u8) {
                 let c = &*s.tcp_conns.ptr(idx);
                 (c.remote_ip, c.state)
             };
+            let synced = !matches!(
+                state,
+                tcp::TcpState::Listen | tcp::TcpState::SynSent | tcp::TcpState::SynReceived
+            );
+            if !dg && remote_ip != 0 && synced && !continuity::rst_gate(s, idx) {
+                // A mirrored connection's RST waits until its standby holds
+                // the reset: the slot is latched, inert, out of the lane,
+                // and the sweep sends the RST and frees it (nobody to tell).
+                let c = &mut *s.tcp_conns.ptr_mut(idx);
+                c.state = tcp::TcpState::Closed;
+                c.pending_close_notify = NOTIFY_RESET_QUIET;
+                c.lane = 0;
+                idx += 1;
+                continue;
+            }
             if !dg && remote_ip != 0 {
                 let _ = send_tcp_control(s, idx, tcp::RST | tcp::ACK, false);
                 if !matches!(
@@ -10496,7 +10598,7 @@ unsafe fn service_net_channel(s: &mut IpState) {
     // is actually on the wire.
     if st.close_valid != 0 {
         let conn_id = st.close_conn as usize;
-        if process_cmd_close(s, conn_id) {
+        if process_cmd_close(s, conn_id, st.close_valid == CLOSE_STASH_ABORT) {
             st.close_valid = 0;
         } else {
             return;
@@ -10799,11 +10901,13 @@ unsafe fn service_net_channel(s: &mut IpState) {
                 if plen >= 2 {
                     let conn_id =
                         u16::from_le_bytes([*buf.as_ptr(), *buf.as_ptr().add(1)]) as usize;
+                    let abort = plen >= 3 && buf[2] == abi::contracts::net::net_proto::CLOSE_ABORT;
                     if conn_id < s.tcp_conns.len()
-                        && (lane_state(s, s.cur_lane).valid != 0 || !process_cmd_close(s, conn_id))
+                        && (lane_state(s, s.cur_lane).valid != 0
+                            || !process_cmd_close(s, conn_id, abort))
                     {
                         let st = lane_state(s, s.cur_lane);
-                        st.close_valid = 1;
+                        st.close_valid = if abort { CLOSE_STASH_ABORT } else { 1 };
                         st.close_conn = conn_id as u16;
                         return;
                     }
@@ -11985,9 +12089,28 @@ unsafe fn sweep_range(s: &mut IpState, start: usize, end: usize) {
             let conn = &mut *s.tcp_conns.ptr_mut(i);
             let kind = conn.pending_close_notify;
             let tag = conn.connect_tag;
+            if kind == NOTIFY_RESET || kind == NOTIFY_RESET_QUIET {
+                // Our RST, once the standby holds it (or at once, unmirrored).
+                if continuity::rst_gate(s, i) {
+                    let _ = send_tcp_control(s, i, tcp::RST | tcp::ACK, false);
+                    let remote_ip = (*s.tcp_conns.ptr(i)).remote_ip;
+                    if remote_ip != 0 {
+                        arp::unpin(arp_tab(s), remote_ip);
+                    }
+                    if kind == NOTIFY_RESET {
+                        let _ = net_send_closed(s, i as u16, CLOSED_GONE);
+                    }
+                    conn_reset(s, i);
+                }
+                i += 1;
+                continue;
+            }
             if kind != NOTIFY_NONE && kind != continuity::NOTIFY_SHADOW_RESERVED {
                 let delivered = match kind {
-                    NOTIFY_CLOSED => net_send_closed(s, i as u16, CLOSED_GONE),
+                    NOTIFY_CLOSED => {
+                        continuity::end_reported(s, i, continuity::END_CLOSED)
+                            && net_send_closed(s, i as u16, CLOSED_GONE)
+                    }
                     NOTIFY_PEER_FIN => net_send_closed(s, i as u16, CLOSED_PEER_FIN),
                     NOTIFY_ERROR_REFUSED => net_send_error(s, i as u16, -111i8, tag),
                     NOTIFY_ERROR_TIMEOUT => net_send_error(s, i as u16, -110i8, tag),
@@ -12080,13 +12203,19 @@ unsafe fn sweep_range(s: &mut IpState, start: usize, end: usize) {
                 // the consumer closes — forever, for a consumer that never
                 // does.
                 conn.closewait_timer = conn.closewait_timer.saturating_add(1);
+                // A mirrored connection's FIN waits on its standby, as a
+                // consumer's close does.
+                let seq = conn.snd_nxt;
                 if conn.closewait_timer >= CLOSE_WAIT_TICKS
+                    && continuity::fin_gate(s, i)
                     && send_tcp_control(s, i, tcp::FIN | tcp::ACK, false)
                 {
                     let conn = &mut *s.tcp_conns.ptr_mut(i);
                     conn.state = tcp::TcpState::LastAck;
                     conn.retransmit_timer = 0;
                     s.tcp_closewait_expired = s.tcp_closewait_expired.wrapping_add(1);
+                    continuity::on_sent(s, i, seq, 0, true);
+                    continuity::on_state(s, i);
                 }
             }
             tcp::TcpState::Closing | tcp::TcpState::LastAck => {
@@ -12097,7 +12226,9 @@ unsafe fn sweep_range(s: &mut IpState, start: usize, end: usize) {
                 conn.retransmit_timer = conn.retransmit_timer.saturating_add(1);
                 if conn.retransmit_timer >= 300 {
                     let remote_ip = conn.remote_ip;
-                    if net_send_closed(s, i as u16, CLOSED_GONE) {
+                    if continuity::end_reported(s, i, continuity::END_CLOSED)
+                        && net_send_closed(s, i as u16, CLOSED_GONE)
+                    {
                         if remote_ip != 0 {
                             arp::unpin(arp_tab(s), remote_ip);
                         }
@@ -12113,7 +12244,9 @@ unsafe fn sweep_range(s: &mut IpState, start: usize, end: usize) {
                 // MSG_CLOSED can be delivered so consumers don't strand.
                 if conn.timewait_timer > 40 {
                     let remote_ip = conn.remote_ip;
-                    if net_send_closed(s, i as u16, CLOSED_GONE) {
+                    if continuity::end_reported(s, i, continuity::END_CLOSED)
+                        && net_send_closed(s, i as u16, CLOSED_GONE)
+                    {
                         if remote_ip != 0 {
                             arp::unpin(arp_tab(s), remote_ip);
                         }
@@ -12131,11 +12264,19 @@ unsafe fn sweep_range(s: &mut IpState, start: usize, end: usize) {
                 if s.tcp_idle_ticks != 0 {
                     conn.idle_timer = conn.idle_timer.saturating_add(1);
                     if conn.idle_timer >= s.tcp_idle_ticks {
-                        conn.idle_timer = 0;
-                        if send_tcp_control(s, i, tcp::FIN | tcp::ACK, false) {
+                        // A mirrored connection's FIN waits on its standby;
+                        // until it may go, the close is asked again each
+                        // sweep.
+                        let seq = conn.snd_nxt;
+                        if continuity::fin_gate(s, i)
+                            && send_tcp_control(s, i, tcp::FIN | tcp::ACK, false)
+                        {
                             let conn = &mut *s.tcp_conns.ptr_mut(i);
+                            conn.idle_timer = 0;
                             conn.state = tcp::TcpState::FinWait1;
                             s.tcp_idle_closed = s.tcp_idle_closed.wrapping_add(1);
+                            continuity::on_sent(s, i, seq, 0, true);
+                            continuity::on_state(s, i);
                             let _ = net_send_error(s, i as u16, -110, 0);
                         }
                         i += 1;
@@ -12538,6 +12679,11 @@ pub mod test_helpers {
     /// `TcpState` discriminants a test compares `ConnView::state` against.
     pub const STATE_ESTABLISHED: u8 = tcp::TcpState::Established as u8;
     pub const STATE_FIN_WAIT1: u8 = tcp::TcpState::FinWait1 as u8;
+    pub const STATE_FIN_WAIT2: u8 = tcp::TcpState::FinWait2 as u8;
+    pub const STATE_CLOSE_WAIT: u8 = tcp::TcpState::CloseWait as u8;
+    pub const STATE_LAST_ACK: u8 = tcp::TcpState::LastAck as u8;
+    pub const STATE_TIME_WAIT: u8 = tcp::TcpState::TimeWait as u8;
+    pub const STATE_CLOSED: u8 = tcp::TcpState::Closed as u8;
 
     /// The congestion window a takeover restarts at.
     pub fn initial_cwnd() -> u16 {

@@ -68,7 +68,17 @@ limit_register_coverage = "fail"
 # pipelined past the 32 outbound records the record holds (held at that
 # ceiling, the pair kept, a crash there byte-exact), `transport_continuity_owed_key_update.sh` one owing the
 # answer to the client's KeyUpdate, and `transport_continuity_client.sh` a
-# session this host dialled. `quic_continuity_move.sh` moves a QUIC
+# session this host dialled. A connection's end is no loss of its pair:
+# `transport_continuity_rst_in.sh` has the client reset a crash-continuous
+# connection (both hosts report it ENDED, the standby refuses to arm it and
+# answers nothing of it), `transport_continuity_rst_out.sh` has the service
+# reset one (the RST held until the standby has the reset, then sent once,
+# the flow never resumed), and `transport_continuity_timewait.sh` takes one
+# over in TIME-WAIT (the client's retransmitted FIN re-ACKed by the standby).
+# `transport_continuity_timers.sh` resumes the timers beyond the RTO — the
+# retransmission timer, CLOSE-WAIT's bound (and one expired before the
+# activation), the idle close, LAST-ACK's bound and TIME-WAIT — at the
+# standby at what remained of each, planned and after a crash. `quic_continuity_move.sh` moves a QUIC
 # connection (a routable server ID, its key moved vault to vault, activation
 # on the authority's verdict). `packet_seam_v6.sh` runs `ip`'s decision seam
 # on a veth against the Linux stack — IPv6 neighbour discovery and echo,
@@ -80,7 +90,7 @@ limit_register_coverage = "fail"
 # `rescue_tunnel.sh` carries a flow from the ingress host to its anchor's
 # host, refusing forged and replayed datagrams; `remote_channel_mux.sh`
 # resumes a channel on the mux carrier over QUIC across three cuts.
-scripts = ["tools/ci/deps_budget.sh", "tests/host/service_bundle_e2e.sh", "tests/host/program_section.sh", "tools/ci/premmu_atomics.sh", "tests/host/qemu_net_ready_gate.sh", "tests/host/qemu_access_bounds.sh", "tests/host/transport_continuity_move.sh", "tests/host/transport_continuity_crash.sh", "tests/host/transport_continuity_horizon.sh", "tests/host/transport_continuity_halfclose.sh", "tests/host/transport_continuity_crash_halfclose.sh", "tests/host/packet_seam_v6.sh", "tests/host/packet_seam_sharded.sh", "tests/host/quic_v6.sh", "tests/host/transport_continuity_own_close.sh", "tests/host/transport_continuity_v6.sh", "tests/host/transport_continuity_unconsumed.sh", "tests/host/transport_continuity_resumed.sh", "tests/host/transport_continuity_pipelined.sh", "tests/host/transport_continuity_capsfull.sh", "tests/host/transport_continuity_smallrecords.sh", "tests/host/transport_continuity_owed_key_update.sh", "tests/host/transport_continuity_client.sh", "tests/host/quic_continuity_move.sh", "tests/host/rescue_tunnel.sh", "tests/host/remote_channel_mux.sh"]
+scripts = ["tools/ci/deps_budget.sh", "tests/host/service_bundle_e2e.sh", "tests/host/program_section.sh", "tools/ci/premmu_atomics.sh", "tests/host/qemu_net_ready_gate.sh", "tests/host/qemu_access_bounds.sh", "tests/host/transport_continuity_move.sh", "tests/host/transport_continuity_crash.sh", "tests/host/transport_continuity_horizon.sh", "tests/host/transport_continuity_halfclose.sh", "tests/host/transport_continuity_crash_halfclose.sh", "tests/host/packet_seam_v6.sh", "tests/host/packet_seam_sharded.sh", "tests/host/quic_v6.sh", "tests/host/transport_continuity_own_close.sh", "tests/host/transport_continuity_v6.sh", "tests/host/transport_continuity_unconsumed.sh", "tests/host/transport_continuity_resumed.sh", "tests/host/transport_continuity_pipelined.sh", "tests/host/transport_continuity_capsfull.sh", "tests/host/transport_continuity_smallrecords.sh", "tests/host/transport_continuity_owed_key_update.sh", "tests/host/transport_continuity_client.sh", "tests/host/transport_continuity_rst_in.sh", "tests/host/transport_continuity_rst_out.sh", "tests/host/transport_continuity_timewait.sh", "tests/host/transport_continuity_timers.sh", "tests/host/quic_continuity_move.sh", "tests/host/rescue_tunnel.sh", "tests/host/remote_channel_mux.sh"]
 
 [ci.cargo]
 # Where the cargo phase runs. fluxor's workspace root is the bare-metal

@@ -2374,7 +2374,7 @@ unsafe fn tcp_module_step(s: &mut TlsState) -> i32 {
             }
         } else if s.sessions[i].state == SessionState::Closed {
             s.free_closed = s.free_closed.wrapping_add(1);
-            continuity_session_ending(s, i);
+            continuity_session_ending(s, i, abi::contracts::net::session_ctrl::END_TRANSPORT);
             s.sessions[i].reset();
         } else if s.sessions[i].state == SessionState::Error {
             // Best-effort close notifications; if the channel is
@@ -2384,7 +2384,7 @@ unsafe fn tcp_module_step(s: &mut TlsState) -> i32 {
             let _ = tls_write_or_count(s, s.cipher_out, NET_CMD_CLOSE, cid, core::ptr::null(), 0);
             let _ = tls_send_closed(s, cid, CLOSED_GONE);
             s.free_error = s.free_error.wrapping_add(1);
-            continuity_session_ending(s, i);
+            continuity_session_ending(s, i, abi::contracts::net::session_ctrl::END_TRANSPORT);
             s.sessions[i].reset();
         }
         i += 1;
@@ -2793,7 +2793,11 @@ unsafe fn tcp_module_step(s: &mut TlsState) -> i32 {
                 let own_close = si >= 0 && s.sessions[si as usize].local_close != 0;
                 if si >= 0 {
                     s.free_peer_closed = s.free_peer_closed.wrapping_add(1);
-                    continuity_session_ending(s, si as usize);
+                    continuity_session_ending(
+                        s,
+                        si as usize,
+                        abi::contracts::net::session_ctrl::END_TRANSPORT,
+                    );
                     s.sessions[si as usize].reset();
                 }
                 if own_close {
@@ -3138,8 +3142,33 @@ unsafe fn tcp_module_step(s: &mut TlsState) -> i32 {
                 // the backend hop is cleartext). The raw CMD_CLOSE forward
                 // below tears the backend TCP conn down.
                 let _ = clear_passthrough(s, conn_id);
-                // Send close_notify alert if session is ready
                 let si = find_session_by_conn_id(s, conn_id);
+                if pl >= 3 && payload[2] == net_proto::CLOSE_ABORT {
+                    // An abortive close: no close_notify, nothing held is
+                    // written; the session ends here (a paired one ended by our
+                    // reset, which the transport holds until its standby has
+                    // it) and the transport resets the connection.
+                    if si >= 0 {
+                        continuity_session_ending(
+                            s,
+                            si as usize,
+                            abi::contracts::net::session_ctrl::END_RESET,
+                        );
+                        s.free_cmd_close = s.free_cmd_close.wrapping_add(1);
+                        s.sessions[si as usize].reset();
+                    }
+                    let how = [net_proto::CLOSE_ABORT];
+                    let _ = tls_write_or_count(
+                        s,
+                        s.cipher_out,
+                        NET_CMD_CLOSE,
+                        conn_id,
+                        how.as_ptr(),
+                        how.len() as u16,
+                    );
+                    continue;
+                }
+                // Send close_notify alert if session is ready
                 if si >= 0 {
                     let idx = si as usize;
                     if s.sessions[idx].state == SessionState::Ready && s.cont_in >= 0 {

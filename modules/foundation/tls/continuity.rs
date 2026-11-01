@@ -820,8 +820,11 @@ struct SessionContinuity {
     mirror: bool,
     /// CUT emitted, CHECKPOINT_COMMITTED awaited: inputs frozen.
     cut_pending: bool,
-    /// The mirror was abandoned and the abort has not yet left `cont_out`.
+    /// The mirror was abandoned and the abort has not yet left `cont_out`,
+    /// and why (`sc::ABORT_*`): the record ceiling, the redelivery caps or
+    /// the horizon budget, each by name, else the mirror lost.
     abandon_pending: bool,
+    abandon_reason: u8,
     /// `dev_millis` when a strict horizon (or an undelivered abort) began
     /// to wait with no answer from the standby since — each acknowledgement
     /// restarts it (`apply_delta_ack`) — 0 while nothing does. A horizon is a promise the standby
@@ -927,6 +930,7 @@ impl SessionContinuity {
             mirror: false,
             cut_pending: false,
             abandon_pending: false,
+            abandon_reason: 0,
             horizon_since_ms: 0,
             quiescing: false,
             ckpt_gen: 0,
@@ -989,6 +993,7 @@ impl SessionContinuity {
         self.mirror = false;
         self.cut_pending = false;
         self.abandon_pending = false;
+        self.abandon_reason = 0;
         self.horizon_since_ms = 0;
         self.quiescing = false;
         self.ckpt_gen = 0;
@@ -2290,8 +2295,14 @@ unsafe fn delta_finish(s: &mut TlsState, idx: usize, payload_len: usize) -> bool
 /// which it could believe the shadow current. An abort that cannot leave
 /// within its own budget ends the session (`continuity_step`).
 unsafe fn mirror_abandon(s: &mut TlsState, idx: usize) {
+    mirror_abandon_for(s, idx, sc::ABORT_MIRROR_LOST);
+}
+
+/// `mirror_abandon`, naming why (`sc::ABORT_*`), which the abort carries.
+unsafe fn mirror_abandon_for(s: &mut TlsState, idx: usize, reason: u8) {
     mirror_lost(s, idx);
     s.sessions[idx].cont.abandon_pending = true;
+    s.sessions[idx].cont.abandon_reason = reason;
     // Delivering the abort is a promise of its own, and gets its own
     // budget: a horizon that has just run out must not spend the abort's
     // as well, or the records it is ordered ahead of would go at once.
@@ -2305,18 +2316,11 @@ unsafe fn flush_abandon(s: &mut TlsState, idx: usize) -> bool {
     if !s.sessions[idx].cont.abandon_pending {
         return true;
     }
-    let (flow, epoch) = {
+    let (flow, epoch, reason) = {
         let c = &s.sessions[idx].cont;
-        (c.flow_id, c.epoch)
+        (c.flow_id, c.epoch, c.abandon_reason)
     };
-    if cont_reply(
-        s,
-        &flow,
-        epoch,
-        sc::CR_ABORTED,
-        sc::STATUS_OK,
-        &[sc::ABORT_MIRROR_LOST],
-    ) {
+    if cont_reply(s, &flow, epoch, sc::CR_ABORTED, sc::STATUS_OK, &[reason]) {
         s.sessions[idx].cont.abandon_pending = false;
         release_after_abort(s, idx);
         true
@@ -2336,25 +2340,26 @@ unsafe fn release_after_abort(s: &mut TlsState, idx: usize) {
     }
 }
 
-/// A session in a pairing ends here — failed, closed by the peer, or its
-/// connection gone. A shadow of it is of a session that no longer exists,
-/// and one whose mirror was abandoned may be behind what the peer saw, so
-/// the coordinator is told the pair is over; best effort, as the slot does
-/// not outlive this step.
-unsafe fn continuity_session_ending(s: &mut TlsState, idx: usize) {
+/// A session in a pairing ends here — failed, closed by the peer, reset by
+/// its consumer, or its connection gone (`why`, `sc::END_*`). A shadow of it
+/// is of a session that no longer exists, so the coordinator is told the
+/// pair is over; best effort, as the slot does not outlive this step. A
+/// session whose mirror was abandoned may be behind what the peer saw: that
+/// is the abort it owed, by its reason. Any other ended with its connection
+/// — the flow is over, which is no loss of the pairing: `CR_ENDED`, after
+/// every delta it emitted.
+unsafe fn continuity_session_ending(s: &mut TlsState, idx: usize, why: u8) {
     let c = &s.sessions[idx].cont;
     if !c.flow_bound || !(c.mirror || c.cut_pending || c.abandon_pending) {
         return;
     }
     let (flow, epoch) = (c.flow_id, c.epoch);
-    let _ = cont_reply(
-        s,
-        &flow,
-        epoch,
-        sc::CR_ABORTED,
-        sc::STATUS_OK,
-        &[sc::ABORT_MIRROR_LOST],
-    );
+    if c.abandon_pending {
+        let reason = c.abandon_reason;
+        let _ = cont_reply(s, &flow, epoch, sc::CR_ABORTED, sc::STATUS_OK, &[reason]);
+    } else {
+        let _ = cont_reply(s, &flow, epoch, sc::CR_ENDED, sc::STATUS_OK, &[why]);
+    }
 }
 
 unsafe fn mirror_lost(s: &mut TlsState, idx: usize) {
@@ -2572,7 +2577,7 @@ unsafe fn strict_tx_room(s: &mut TlsState, idx: usize) -> bool {
     dev_log(sys, 2, msg.as_ptr(), msg.len());
     s.txrec_cap_abandoned = s.txrec_cap_abandoned.wrapping_add(1);
     s.sessions[idx].cont.txrec_since_ms = 0;
-    mirror_abandon(s, idx);
+    mirror_abandon_for(s, idx, sc::ABORT_TXREC_CAP);
     false
 }
 
@@ -3153,7 +3158,7 @@ unsafe fn redelivery_room(s: &mut TlsState, idx: usize, rec_len: usize) -> bool 
     dev_log(sys, 2, msg.as_ptr(), msg.len());
     s.redeliver_cap_abandoned = s.redeliver_cap_abandoned.wrapping_add(1);
     s.sessions[idx].cont.cap_since_ms = 0;
-    mirror_abandon(s, idx);
+    mirror_abandon_for(s, idx, sc::ABORT_REDELIVER_CAP);
     false
 }
 
@@ -3755,10 +3760,11 @@ unsafe fn handle_continuity_reply(s: &mut TlsState, p: &[u8]) {
     let record = p[20];
     let status = p[21];
     let body = &p[sc::CONTINUITY_HEADER_LEN..];
-    if record == sc::CR_ABORTED {
-        // The primary abandoned the pair. Whatever this shadow holds is
-        // stale from that moment, so it is released here rather than left
-        // armed for a coordinator to activate.
+    if record == sc::CR_ABORTED || record == sc::CR_ENDED {
+        // The primary abandoned the pair, or its session ended with its
+        // connection. Whatever this shadow holds is stale (or of a session
+        // that no longer exists) from that moment, so it is released here
+        // rather than left armed for a coordinator to activate.
         if let Some(sh) = find_shadow(s, flow) {
             if s.shadows[sh].epoch == epoch {
                 s.shadows[sh].release();
@@ -5409,7 +5415,7 @@ unsafe fn continuity_step(s: &mut TlsState) -> bool {
                 }
                 s.sessions[i].cont.horizon_since_ms = 0;
             } else {
-                mirror_abandon(s, i);
+                mirror_abandon_for(s, i, sc::ABORT_HORIZON_BUDGET);
             }
             did_work = true;
         }

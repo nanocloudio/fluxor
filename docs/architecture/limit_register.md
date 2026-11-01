@@ -1034,6 +1034,9 @@ STATUS_NO_CAPACITY | modules/sdk/contracts/net/session_ctrl.rs | protocol: a con
 SIG_MAX | modules/sdk/contracts/net/session_ctrl.rs | format: the longest custody-evidence signature (a P-256 DER signature) the evidence layout holds
 EVIDENCE_MAX | modules/sdk/contracts/net/session_ctrl.rs | derived: the custody evidence's fixed part and SIG_MAX
 CHECKPOINT_CHUNK_MAX | modules/sdk/contracts/net/session_ctrl.rs | format: the per-layer checkpoint chunk on the continuity wire, sized to the frames both ends assemble
+ABORT_TXREC_CAP | modules/sdk/contracts/net/session_ctrl.rs | protocol: a pairing-abort reason code (the outbound-record cap reached), not a capacity
+ABORT_REDELIVER_CAP | modules/sdk/contracts/net/session_ctrl.rs | protocol: a pairing-abort reason code (the redelivery cap reached), not a capacity
+ABORT_HORIZON_BUDGET | modules/sdk/contracts/net/session_ctrl.rs | protocol: a pairing-abort reason code (the horizon budget spent), not a budget
 REPLY_BODY_MAX | modules/foundation/tls/continuity.rs | derived: the larger of a CUT manifest body and a custody reply carrying the largest evidence
 DELTA_IN_TRAILER_MAX | modules/foundation/tls/continuity.rs | derived: a strict RECORD_IN's trailer at its largest, the content type and length and DELIV_CARRY_MAX bytes of plaintext
 BODY_MAX | modules/sdk/contracts/exchange.rs | derived: one RECORD_MAX record less its 16-byte prefix

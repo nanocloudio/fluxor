@@ -63,6 +63,8 @@ const NET_MSG_BOUND: u8 = 0x04;
 const NET_CMD_BIND: u8 = 0x10;
 const NET_CMD_SEND: u8 = 0x11;
 const NET_CMD_CLOSE: u8 = 0x12;
+/// `CMD_CLOSE`'s `how`: reset (net_proto `CLOSE_ABORT`).
+const CLOSE_ABORT: u8 = 1;
 const NET_CMD_CONNECT_TO: u8 = 0x14;
 const NET_MSG_CONNECTED: u8 = 0x05;
 /// What `echo_after` holds before echoing.
@@ -120,6 +122,12 @@ pub struct SinkState {
     pub farewells: u32,
     /// `close_after`: our own close once this many bytes were echoed.
     close_after: u16,
+    /// `abort_after`: an abortive close (`CMD_CLOSE` with `CLOSE_ABORT`: a
+    /// reset) once this many bytes were echoed; owed on `abort_id` until it
+    /// is written.
+    abort_after: u16,
+    abort_owed: u8,
+    abort_id: u16,
     echoed: u32,
     /// `echo_after`: received bytes held (unconsumed) until this many.
     echo_after: u16,
@@ -164,6 +172,9 @@ mod params_def {
         // bytes consumed so far), and a resumed stream continues from the
         // cursor its MSG_RESUMED names.
         9, cursor, u8, 0 => |s, d, len| { s.cursor = p_u8(d, len, 0, 0); };
+        // An abortive close (the connection reset, `CLOSE_ABORT`) once this
+        // many bytes were echoed on a connection. 0: never.
+        10, abort_after, u16, 0 => |s, d, len| { s.abort_after = p_u16(d, len, 0, 0); };
     }
 }
 
@@ -241,6 +252,12 @@ unsafe fn send_data(s: &mut SinkState, id: u16, bytes: &[u8]) {
 /// After an echo: our own close once `close_after` bytes have gone.
 unsafe fn after_echo(s: &mut SinkState, id: u16, n: usize) {
     s.echoed = s.echoed.wrapping_add(n as u32);
+    if s.abort_after != 0 && s.echoed >= u32::from(s.abort_after) {
+        s.abort_after = 0;
+        s.abort_owed = 1;
+        s.abort_id = id;
+        abort(s);
+    }
     if s.close_after != 0 && s.lingering == 0 && s.echoed >= u32::from(s.close_after) {
         s.close_after = 0;
         s.lingering = 1;
@@ -250,6 +267,37 @@ unsafe fn after_echo(s: &mut SinkState, id: u16, n: usize) {
         let m = b"[sink] closing our side";
         dev_log(&*s.syscalls, 3, m.as_ptr(), m.len());
     }
+}
+
+/// The owed abortive close, if the channel takes it.
+unsafe fn abort(s: &mut SinkState) {
+    if s.abort_owed == 0 {
+        return;
+    }
+    let sys = &*s.syscalls;
+    let id = s.abort_id.to_le_bytes();
+    let payload = [id[0], id[1], CLOSE_ABORT];
+    let mut scratch = [0u8; 8];
+    if net_write_frame(
+        sys,
+        s.net_out,
+        NET_CMD_CLOSE,
+        payload.as_ptr(),
+        3,
+        scratch.as_mut_ptr(),
+        8,
+    ) == 0
+    {
+        return;
+    }
+    s.abort_owed = 0;
+    let open = is_open(s, s.abort_id);
+    if open {
+        s.open = s.open.saturating_sub(1);
+        set_open(s, s.abort_id, false);
+    }
+    let m = b"[sink] aborted the connection";
+    dev_log(sys, 3, m.as_ptr(), m.len());
 }
 
 fn is_open(s: &SinkState, id: u16) -> bool {
@@ -575,6 +623,8 @@ unsafe fn service(s: &mut SinkState) {
                 } else if is_open(s, id) {
                     set_open(s, id, false);
                     s.open = s.open.saturating_sub(1);
+                    let m = b"[sink] connection closed";
+                    dev_log(sys, 3, m.as_ptr(), m.len());
                     // The id is ours until we close it.
                     let payload = id.to_le_bytes();
                     let mut scratch = [0u8; 8];
@@ -659,6 +709,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     }
     service(s);
     linger(s);
+    abort(s);
     if s.step_count.is_multiple_of(LOG_PERIOD) {
         log_counters(s);
     }

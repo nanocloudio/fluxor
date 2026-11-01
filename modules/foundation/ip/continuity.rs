@@ -27,11 +27,16 @@
 //!
 //! Little-endian unless stated; timers are REMAINING durations, never
 //! timestamps: the retransmit timer in milliseconds, the others in the
-//! module's 50 ms timer ticks. The RTT estimator is in milliseconds too
+//! module's 50 ms timer ticks. Each is 0 when the connection's state does
+//! not run it and at least 1 when it does (1: due) — the retransmit timer
+//! in ESTABLISHED with data in flight, the idle close in ESTABLISHED, the
+//! CLOSE-WAIT bound, the CLOSING / LAST-ACK bound, TIME-WAIT — and the idle
+//! period rides with them. The RTT estimator is in milliseconds too
 //! (`srtt` = SRTT × 8, `rttvar` = RTTVAR × 4, `rto` itself; RFC 6298).
 //!
 //! ```text
-//! [magic "FXTC"][layout u8: 1 IPv4, 2 IPv6][state u8]
+//! [magic "FXTC"][layout u8: 1 IPv4, 2 IPv6][state u8: 1 ESTABLISHED, 2 CLOSE-WAIT,
+//!   3 FIN-WAIT-1, 4 FIN-WAIT-2, 5 CLOSING, 6 LAST-ACK, 7 TIME-WAIT]
 //! [local_ip u32 BE][remote_ip u32 BE][local_port u16][remote_port u16]
 //! [reserved u16 = 0][prefix_len u8][pad u8]
 //! [iss u32][snd_una u32][snd_nxt u32][snd_wnd u16][snd_wl1 u32][snd_wl2 u32]
@@ -39,6 +44,7 @@
 //! [cwnd u16][ssthresh u16][dup_ack_count u8][in_recovery u8][recover_seq u32]
 //! [srtt u16][rttvar u16][rto u16]
 //! [retransmit_remaining_ms u16][timewait_remaining u16][idle_remaining u16][closewait_remaining u16]
+//! [closing_remaining u16][idle_period u16]
 //! [delivered_bytes u32][consumed_bytes u32]
 //! [trace_id 16][span_id 8][sampled_flags u8]
 //! [reorder_count u8] then per slot: [seq u32][len u16][bytes]
@@ -119,7 +125,7 @@ const REC_FIXED_LEN: usize = 4
     + 2
     + 2
     + 2
-    + 2 * 4
+    + 2 * 6
     + 4
     + 4
     + 16
@@ -137,15 +143,18 @@ const _: () = assert!(tcp::REORDER_SLOTS <= sc::STRICT_OOO_SEGS);
 const _: () = assert!(tcp::REORDER_SLOT_BYTES <= sc::STRICT_OOO_SEG);
 
 /// What `PAIR_PREPARE` binds: the layout of the record above.
-const TCP_CODEC_LAYOUT: &[u8] = b"fluxor.ip.tcp-checkpoint:FXTC:reorder:ipv6";
+const TCP_CODEC_LAYOUT: &[u8] = b"fluxor.ip.tcp-checkpoint:FXTC:reorder:ipv6:timers";
 
 /// TIME-WAIT length in timer ticks, as the sweep enforces it.
 const TIMEWAIT_TICKS: u16 = 41;
 /// Handshake and closing-state ceiling in timer ticks, as the sweep
 /// enforces it.
 const HANDSHAKE_TICKS: u16 = 300;
-/// A disabled idle timer exports as this and imports back as disabled.
-const IDLE_DISABLED: u16 = u16::MAX;
+/// How a mirrored connection ended (`end_reported`): the peer's reset, ours,
+/// or its close completed.
+pub(super) const END_RESET_IN: u8 = 1;
+pub(super) const END_RESET_OUT: u8 = 2;
+pub(super) const END_CLOSED: u8 = 3;
 
 /// Shadow phases.
 const SH_PREPARED: u8 = 1;
@@ -158,6 +167,8 @@ const SH_ARMED: u8 = 5;
 const GATE_NONE: u8 = 0;
 const GATE_SEND: u8 = 1;
 const GATE_FIN: u8 = 2;
+/// Our RST: emitted only once the standby holds the `DELTA_TCP_RESET`.
+const GATE_RST: u8 = 3;
 
 /// Outstanding receive deltas a strict mirror tracks; acknowledgements
 /// are cumulative, so the ring only needs to cover what one ack window
@@ -336,7 +347,12 @@ pub struct TcpMirror {
     /// peer acknowledged.
     pub acked_owed: u8,
     pub state_owed: u8,
-    pub _pad3: [u8; 1],
+    /// The connection's end (`END_*`), once known, and whether its delta
+    /// (`DELTA_TCP_RESET` / `DELTA_TCP_CLOSED`) is on `cont_out`: the
+    /// provider hears of a mirrored connection's end before its slot goes.
+    pub end_kind: u8,
+    pub end_sent: u8,
+    pub _pad4: [u8; 3],
     pub export_off: u32,
     pub export_len: u32,
     pub export_digest: [u8; 32],
@@ -384,7 +400,9 @@ impl TcpMirror {
             export_active: 0,
             acked_owed: 0,
             state_owed: 0,
-            _pad3: [0; 1],
+            end_kind: 0,
+            end_sent: 0,
+            _pad4: [0; 3],
             export_off: 0,
             export_len: 0,
             export_digest: [0; 32],
@@ -823,15 +841,7 @@ fn put(out: &mut [u8], pos: &mut usize, bytes: &[u8]) {
 /// Whether `state` is one a checkpoint admits: synchronised, and not a
 /// state whose remaining life is a quiet period this side owns.
 fn state_exportable(state: tcp::TcpState) -> bool {
-    matches!(
-        state,
-        tcp::TcpState::Established
-            | tcp::TcpState::CloseWait
-            | tcp::TcpState::FinWait1
-            | tcp::TcpState::FinWait2
-            | tcp::TcpState::Closing
-            | tcp::TcpState::LastAck
-    )
+    state_code(state) != 0
 }
 
 fn state_code(state: tcp::TcpState) -> u8 {
@@ -842,6 +852,7 @@ fn state_code(state: tcp::TcpState) -> u8 {
         tcp::TcpState::FinWait2 => 4,
         tcp::TcpState::Closing => 5,
         tcp::TcpState::LastAck => 6,
+        tcp::TcpState::TimeWait => 7,
         _ => 0,
     }
 }
@@ -854,8 +865,56 @@ fn state_of_code(code: u8) -> Option<tcp::TcpState> {
         4 => tcp::TcpState::FinWait2,
         5 => tcp::TcpState::Closing,
         6 => tcp::TcpState::LastAck,
+        7 => tcp::TcpState::TimeWait,
         _ => return None,
     })
+}
+
+/// What remains of each timer connection `c` runs, as its record carries
+/// it: the retransmit timer in ms, the others in sweep ticks, each 0 when
+/// the state does not run it and at least 1 when it does (1: due).
+#[derive(Clone, Copy)]
+struct TimerRems {
+    retx_ms: u16,
+    timewait: u16,
+    idle: u16,
+    closewait: u16,
+    closing: u16,
+    idle_period: u16,
+}
+
+fn timer_rems(s: &IpState, c: &tcp::TcpConn) -> TimerRems {
+    let est = c.state == tcp::TcpState::Established;
+    TimerRems {
+        retx_ms: if est && c.snd_nxt != c.snd_una {
+            u32::from(c.rto)
+                .saturating_sub(u32::from(c.retransmit_timer) * tcp::RTO_GRANULARITY_MS)
+                .clamp(1, u32::from(u16::MAX)) as u16
+        } else {
+            0
+        },
+        timewait: if c.state == tcp::TcpState::TimeWait {
+            TIMEWAIT_TICKS.saturating_sub(c.timewait_timer).max(1)
+        } else {
+            0
+        },
+        idle: if est && s.tcp_idle_ticks != 0 {
+            s.tcp_idle_ticks.saturating_sub(c.idle_timer).max(1)
+        } else {
+            0
+        },
+        closewait: if c.state == tcp::TcpState::CloseWait {
+            CLOSE_WAIT_TICKS.saturating_sub(c.closewait_timer).max(1)
+        } else {
+            0
+        },
+        closing: if matches!(c.state, tcp::TcpState::Closing | tcp::TcpState::LastAck) {
+            HANDSHAKE_TICKS.saturating_sub(c.retransmit_timer).max(1)
+        } else {
+            0
+        },
+        idle_period: s.tcp_idle_ticks,
+    }
 }
 
 /// Encode connection `idx` into `out`; the record length.
@@ -909,24 +968,13 @@ pub(super) unsafe fn encode_record(
     put(out, &mut p, &c.srtt.to_le_bytes());
     put(out, &mut p, &c.rttvar.to_le_bytes());
     put(out, &mut p, &c.rto.to_le_bytes());
-    // The RTO's remainder in ms; the timer counts 50 ms sweep windows.
-    let retx_rem = if c.snd_nxt != c.snd_una {
-        u32::from(c.rto).saturating_sub(u32::from(c.retransmit_timer) * tcp::RTO_GRANULARITY_MS)
-            as u16
-    } else {
-        0
-    };
-    let tw_rem = TIMEWAIT_TICKS.saturating_sub(c.timewait_timer);
-    let idle_rem = if s.tcp_idle_ticks == 0 {
-        IDLE_DISABLED
-    } else {
-        s.tcp_idle_ticks.saturating_sub(c.idle_timer)
-    };
-    let cw_rem = CLOSE_WAIT_TICKS.saturating_sub(c.closewait_timer);
-    put(out, &mut p, &retx_rem.to_le_bytes());
-    put(out, &mut p, &tw_rem.to_le_bytes());
-    put(out, &mut p, &idle_rem.to_le_bytes());
-    put(out, &mut p, &cw_rem.to_le_bytes());
+    let t = timer_rems(s, c);
+    put(out, &mut p, &t.retx_ms.to_le_bytes());
+    put(out, &mut p, &t.timewait.to_le_bytes());
+    put(out, &mut p, &t.idle.to_le_bytes());
+    put(out, &mut p, &t.closewait.to_le_bytes());
+    put(out, &mut p, &t.closing.to_le_bytes());
+    put(out, &mut p, &t.idle_period.to_le_bytes());
     put(out, &mut p, &c.delivered_bytes.to_le_bytes());
     put(out, &mut p, &c.consumed_bytes.to_le_bytes());
     put(out, &mut p, &c.trace_id);
@@ -1069,6 +1117,11 @@ unsafe fn decode_record(s: &mut IpState, rec: &[u8], conn: &mut tcp::TcpConn) ->
     p += 2;
     let cw_rem = rd_u16(rec, p);
     p += 2;
+    let closing_rem = rd_u16(rec, p);
+    p += 2;
+    // The idle period is this host's own configuration; the record's rides
+    // for the canonical record.
+    p += 2;
     conn.delivered_bytes = rd_u32(rec, p);
     p += 4;
     conn.consumed_bytes = rd_u32(rec, p);
@@ -1125,8 +1178,14 @@ unsafe fn decode_record(s: &mut IpState, rec: &[u8], conn: &mut tcp::TcpConn) ->
     }
     // Timers are stored as remaining durations until activation converts
     // them; the conversion needs the transfer age, known only then.
-    // Held as whole sweep windows remaining until `convert_timers`.
-    conn.retransmit_timer = retx_rem.div_ceil(tcp::RTO_GRANULARITY_MS as u16);
+    // Held as whole sweep windows remaining until `convert_timers` (0: the
+    // record ran none), the retransmit timer's and the closing bound's in
+    // `retransmit_timer` — the one the state runs.
+    conn.retransmit_timer = if matches!(state, tcp::TcpState::Closing | tcp::TcpState::LastAck) {
+        closing_rem
+    } else {
+        retx_rem.div_ceil(tcp::RTO_GRANULARITY_MS as u16)
+    };
     conn.timewait_timer = tw_rem;
     conn.idle_timer = idle_rem;
     conn.closewait_timer = cw_rem;
@@ -1134,40 +1193,55 @@ unsafe fn decode_record(s: &mut IpState, rec: &[u8], conn: &mut tcp::TcpConn) ->
 }
 
 /// Turn the remaining durations held in a decoded shadow into the
-/// counters the sweep drives, charging `age_ticks` of transfer time
-/// conservatively. Expired timers are set to fire on the next sweep.
-/// Returns how many had expired.
+/// counters the sweep drives, charging `age_ticks` of transfer time. Each
+/// timer the state runs resumes at what remained of it, less the age; an
+/// expired one is set to fire on the next sweep, once; one the record ran
+/// none of (remainder 0) starts whole, the conservative reading. Returns
+/// how many had expired.
 fn convert_timers(s: &IpState, conn: &mut tcp::TcpConn, age_ticks: u16) -> u8 {
     let mut expired = 0u8;
-    let retx_rem = conn.retransmit_timer.saturating_sub(age_ticks);
-    if conn.snd_nxt != conn.snd_una {
-        if retx_rem == 0 {
-            expired += 1;
+    // `(remaining, expired)` of a timer whose whole length is `full`.
+    let mut run = |raw: u16, full: u16| -> u16 {
+        if raw == 0 {
+            return full;
         }
-        let rto_windows = conn.rto.div_ceil(tcp::RTO_GRANULARITY_MS as u16);
-        conn.retransmit_timer = rto_windows.saturating_sub(retx_rem);
-    } else {
-        conn.retransmit_timer = 0;
-    }
-    let tw_rem = conn.timewait_timer.saturating_sub(age_ticks);
-    conn.timewait_timer = TIMEWAIT_TICKS.saturating_sub(tw_rem);
-    if conn.idle_timer == IDLE_DISABLED || s.tcp_idle_ticks == 0 {
-        conn.idle_timer = 0;
-    } else {
-        let rem = conn.idle_timer.saturating_sub(age_ticks);
+        let rem = raw.saturating_sub(age_ticks);
         if rem == 0 {
             expired += 1;
         }
-        conn.idle_timer = s.tcp_idle_ticks.saturating_sub(rem);
-    }
-    let cw_rem = conn.closewait_timer.saturating_sub(age_ticks);
-    if conn.state == tcp::TcpState::CloseWait && cw_rem == 0 {
-        expired += 1;
-    }
-    conn.closewait_timer = CLOSE_WAIT_TICKS.saturating_sub(cw_rem);
-    // A closing state's wait restarts from what remains of the ceiling.
-    if matches!(conn.state, tcp::TcpState::Closing | tcp::TcpState::LastAck) {
-        conn.retransmit_timer = HANDSHAKE_TICKS.saturating_sub(retx_rem.max(1));
+        rem.min(full)
+    };
+    let (retx, tw, idle, cw) = (
+        conn.retransmit_timer,
+        conn.timewait_timer,
+        conn.idle_timer,
+        conn.closewait_timer,
+    );
+    conn.retransmit_timer = 0;
+    conn.timewait_timer = 0;
+    conn.idle_timer = 0;
+    conn.closewait_timer = 0;
+    match conn.state {
+        tcp::TcpState::Established => {
+            if conn.snd_nxt != conn.snd_una {
+                let rto_windows = conn.rto.div_ceil(tcp::RTO_GRANULARITY_MS as u16);
+                conn.retransmit_timer = rto_windows - run(retx, rto_windows);
+            }
+            if s.tcp_idle_ticks != 0 {
+                conn.idle_timer = s.tcp_idle_ticks - run(idle, s.tcp_idle_ticks);
+            }
+        }
+        tcp::TcpState::CloseWait => {
+            conn.closewait_timer = CLOSE_WAIT_TICKS - run(cw, CLOSE_WAIT_TICKS);
+        }
+        // A closing state's wait for the acknowledgement of our FIN.
+        tcp::TcpState::Closing | tcp::TcpState::LastAck => {
+            conn.retransmit_timer = HANDSHAKE_TICKS - run(retx, HANDSHAKE_TICKS);
+        }
+        tcp::TcpState::TimeWait => {
+            conn.timewait_timer = TIMEWAIT_TICKS - run(tw, TIMEWAIT_TICKS);
+        }
+        _ => {}
     }
     // Conservative congestion restart: the path is not proven the same.
     conn.cwnd = conn.cwnd.min(tcp::INITIAL_CWND).max(tcp::cwnd_min());
@@ -1449,13 +1523,28 @@ pub(super) unsafe fn on_state(s: &mut IpState, idx: usize) {
         return;
     }
     let c = &*s.tcp_conns.ptr(idx);
-    let mut body = [0u8; 11];
+    let mut body = [0u8; TIMERS_DELTA_LEN];
     body[0] = state_code(c.state);
     body[1..3].copy_from_slice(&c.rto.to_le_bytes());
     body[3..5].copy_from_slice(&c.srtt.to_le_bytes());
     body[5..7].copy_from_slice(&c.rttvar.to_le_bytes());
     body[7..9].copy_from_slice(&c.cwnd.to_le_bytes());
     body[9..11].copy_from_slice(&c.ssthresh.to_le_bytes());
+    // What remains of each timer the new state runs, in ms (a tick's
+    // remainder counted whole).
+    let t = timer_rems(s, c);
+    let tick = tcp::RTO_GRANULARITY_MS;
+    let rems = [
+        u32::from(t.retx_ms),
+        u32::from(t.idle_period) * tick,
+        u32::from(t.idle) * tick,
+        u32::from(t.closewait) * tick,
+        u32::from(t.closing) * tick,
+        u32::from(t.timewait) * tick,
+    ];
+    for (k, v) in rems.iter().enumerate() {
+        body[11 + 4 * k..15 + 4 * k].copy_from_slice(&v.to_le_bytes());
+    }
     if emit_delta(s, mi, sc::DELTA_TCP_TIMERS, &body) {
         s.cont.mirrors[mi].state_owed = 0;
     } else {
@@ -1463,6 +1552,131 @@ pub(super) unsafe fn on_state(s: &mut IpState, idx: usize) {
         m.state_owed = 1;
         m.deltas_dropped = m.deltas_dropped.wrapping_add(1);
         s.cont.stats.deltas_dropped = s.cont.stats.deltas_dropped.wrapping_add(1);
+    }
+}
+
+/// `DELTA_TCP_TIMERS`' payload: the state, the RTT estimator and congestion
+/// state, and six remainders (`session_ctrl`).
+pub const TIMERS_DELTA_LEN: usize = 11 + 6 * 4;
+
+/// Connection `idx` is about to be released because it ended (`how`,
+/// `END_*`): answers whether its slot may go. A live mirror's provider hears
+/// the end first — `DELTA_TCP_RESET` for a reset, `DELTA_TCP_CLOSED` for a
+/// completed close — so a mirrored connection never just vanishes from its
+/// pairing (a standby would resume a connection the peer no longer has).
+/// When `cont_out` has no room the answer is no, and the caller keeps the
+/// slot latched and asks again. The first `how` asked about is the one
+/// reported. A connection with no live mirror goes at once.
+pub(super) unsafe fn end_reported(s: &mut IpState, idx: usize, how: u8) -> bool {
+    let Some(mi) = mirror_of_conn(s, idx) else {
+        return true;
+    };
+    if s.cont.mirrors[mi].live == 0 || s.cont.mirrors[mi].end_sent != 0 {
+        return true;
+    }
+    if s.cont.mirrors[mi].end_kind == 0 {
+        s.cont.mirrors[mi].end_kind = how;
+    }
+    let kind = s.cont.mirrors[mi].end_kind;
+    if !emit_end(s, mi, idx, kind) {
+        return false;
+    }
+    s.cont.mirrors[mi].end_sent = 1;
+    true
+}
+
+/// The end delta of `kind` for mirror `mi` (connection `idx`).
+unsafe fn emit_end(s: &mut IpState, mi: usize, idx: usize, kind: u8) -> bool {
+    if kind == END_CLOSED {
+        return emit_delta(s, mi, sc::DELTA_TCP_CLOSED, &[]);
+    }
+    let c = &*s.tcp_conns.ptr(idx);
+    // The peer's reset is at our receive position (RFC 5961: an exact
+    // match resets); ours carries our next sequence number.
+    let (dir, seq, ack) = if kind == END_RESET_IN {
+        (1u8, c.rcv_nxt, c.snd_nxt)
+    } else {
+        (2u8, c.snd_nxt, c.rcv_nxt)
+    };
+    let mut body = [0u8; 9];
+    body[0] = dir;
+    body[1..5].copy_from_slice(&seq.to_le_bytes());
+    body[5..9].copy_from_slice(&ack.to_le_bytes());
+    emit_delta(s, mi, sc::DELTA_TCP_RESET, &body)
+}
+
+/// May our RST go on the wire for `idx` now? A live mirror's standby must
+/// hold the reset first: under the strict profile the `DELTA_TCP_RESET` goes
+/// out and the RST waits for the acknowledgement covering it, exactly as a
+/// FIN does; under the planned profile the delta goes out and the RST
+/// follows at once. Without a live mirror, at once. `false` means ask again
+/// on a later step.
+pub(super) unsafe fn rst_gate(s: &mut IpState, idx: usize) -> bool {
+    let Some(mi) = mirror_of_conn(s, idx) else {
+        return true;
+    };
+    let (live, strict, kind, open, sent) = {
+        let m = &s.cont.mirrors[mi];
+        (
+            m.live != 0,
+            m.profile == sc::PROFILE_CRASH_CONTINUOUS,
+            m.gate_kind,
+            m.gate_open != 0,
+            m.end_sent != 0,
+        )
+    };
+    if !live {
+        return true;
+    }
+    if !strict {
+        return end_reported(s, idx, END_RESET_OUT);
+    }
+    if kind == GATE_RST {
+        return open;
+    }
+    if kind != GATE_NONE || sent {
+        // Another transition waits on the standby first.
+        return false;
+    }
+    s.cont.mirrors[mi].end_kind = END_RESET_OUT;
+    if !emit_end(s, mi, idx, END_RESET_OUT) {
+        return false;
+    }
+    let m = &mut s.cont.mirrors[mi];
+    m.end_sent = 1;
+    m.gate_kind = GATE_RST;
+    m.gate_seq = 0;
+    m.gate_len = 0;
+    m.gate_delta = m.delta_no;
+    m.gate_open = 0;
+    s.cont.stats.horizon_waits = s.cont.stats.horizon_waits.wrapping_add(1);
+    false
+}
+
+/// Connection slot `idx` is being released. One this module activated from
+/// a checkpoint says so, and in which state it ended — a moved connection's
+/// end is what an operator (and a rig) looks for after a takeover.
+pub(super) unsafe fn note_release(s: &mut IpState, idx: usize) {
+    let c = &*s.tcp_conns.ptr(idx);
+    let (state, iss) = (c.state, c.iss);
+    let mut si = 0;
+    while si < MAX_TCP_SHADOWS {
+        let a = s.cont.shadows[si].activated;
+        if a.live != 0 && a.conn_idx as usize == idx && a.iss == iss {
+            // Each arm logs its own literal: a `match` returning the
+            // literals would lower to a table of absolute pointers.
+            match state {
+                tcp::TcpState::TimeWait => {
+                    log_info(s, b"[ip] tcp from checkpoint released: time-wait over");
+                }
+                tcp::TcpState::Closing | tcp::TcpState::LastAck => {
+                    log_info(s, b"[ip] tcp from checkpoint released: closing bound spent");
+                }
+                _ => log_info(s, b"[ip] tcp from checkpoint released"),
+            }
+            return;
+        }
+        si += 1;
     }
 }
 
@@ -1613,7 +1827,10 @@ pub(super) unsafe fn step(s: &mut IpState) {
                 flush_recv_delta(s, mi);
             }
             let conn = s.cont.mirrors[mi].conn_idx as usize;
-            if s.cont.mirrors[mi].live != 0 && conn < s.tcp_conns.len() {
+            if s.cont.mirrors[mi].live != 0
+                && conn < s.tcp_conns.len()
+                && (*s.tcp_conns.ptr(conn)).is_active()
+            {
                 if s.cont.mirrors[mi].acked_owed != 0 {
                     on_acked(s, conn);
                 }
@@ -2247,6 +2464,28 @@ unsafe fn cmd_delta_apply(s: &mut IpState, flow: &[u8; 16], epoch: u32, p: &[u8]
             return;
         }
     }
+    if kind == sc::DELTA_TCP_RESET || kind == sc::DELTA_TCP_CLOSED {
+        // The connection ended at the primary: there is nothing left to
+        // import. The shadow goes, its slot with it, and the flow's
+        // tombstone stays, so a late segment of it is dropped here, never
+        // answered.
+        if kind == sc::DELTA_TCP_RESET && (body.len() != 9 || !matches!(body[0], 1 | 2)) {
+            reply(
+                s,
+                flow,
+                epoch,
+                sc::CR_DELTA_APPLIED,
+                sc::STATUS_CORRUPT,
+                &ack,
+            );
+            return;
+        }
+        discard_shadow(s, si);
+        tomb_install(s, flow);
+        s.cont.stats.deltas_in = s.cont.stats.deltas_in.wrapping_add(1);
+        reply(s, flow, epoch, sc::CR_DELTA_APPLIED, sc::STATUS_OK, &ack);
+        return;
+    }
     let applied = {
         let sh = &mut s.cont.shadows[si];
         apply_delta(&mut sh.conn, kind, body)
@@ -2322,7 +2561,7 @@ fn apply_delta(c: &mut tcp::TcpConn, kind: u8, body: &[u8]) -> bool {
             c.ssthresh = rd_u16(body, 8);
             true
         }
-        sc::DELTA_TCP_TIMERS if body.len() >= 11 => {
+        sc::DELTA_TCP_TIMERS if body.len() >= TIMERS_DELTA_LEN => {
             let Some(st) = state_of_code(body[0]) else {
                 return false;
             };
@@ -2332,6 +2571,19 @@ fn apply_delta(c: &mut tcp::TcpConn, kind: u8, body: &[u8]) -> bool {
             c.rttvar = rd_u16(body, 5);
             c.cwnd = rd_u16(body, 7);
             c.ssthresh = rd_u16(body, 9);
+            // The remainders, as the record holds them until activation
+            // (`decode_record`): the timer the state runs, in ticks.
+            let ms = |k: usize| rd_u32(body, 11 + 4 * k);
+            let ticks =
+                |v: u32| v.div_ceil(tcp::RTO_GRANULARITY_MS).min(u32::from(u16::MAX)) as u16;
+            c.retransmit_timer = if matches!(st, tcp::TcpState::Closing | tcp::TcpState::LastAck) {
+                ticks(ms(4))
+            } else {
+                ticks(ms(0))
+            };
+            c.idle_timer = ticks(ms(2));
+            c.closewait_timer = ticks(ms(3));
+            c.timewait_timer = ticks(ms(5));
             true
         }
         _ => false,
@@ -2371,7 +2623,7 @@ unsafe fn cmd_delta_ack(s: &mut IpState, flow: &[u8; 16], epoch: u32, p: &[u8]) 
         }
         m.recv_ring_len = kept as u8;
     }
-    if ack_moved && idx < s.tcp_conns.len() {
+    if ack_moved && idx < s.tcp_conns.len() && (*s.tcp_conns.ptr(idx)).is_active() {
         // The horizon moved: show the peer the acknowledgement it earns.
         send_tcp_control(s, idx, tcp::ACK, false);
     }

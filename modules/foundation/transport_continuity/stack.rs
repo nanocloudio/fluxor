@@ -32,10 +32,14 @@
 //   `RCV.NXT − 1 − delivered`, `ip`'s count of in-order bytes handed up.
 // - timers: FXTC holds the RTT estimator and the retransmit timer's
 //   remainder in milliseconds (RFC 6298 fixed point: SRTT × 8, RTTVAR × 4)
-//   and its other remaining durations in 50 ms ticks; the record holds
-//   milliseconds. The RTO travels as `rto_ms` (the standby waits one full
-//   RTO before retransmitting, the conservative reading), the idle timer as
-//   `keepalive_ms` (0 = disabled). SRTT/RTTVAR scale exactly.
+//   and its other remaining durations — idle close, CLOSE-WAIT, CLOSING /
+//   LAST-ACK, TIME-WAIT — in 50 ms ticks, each 0 when the state does not run
+//   it; the record holds milliseconds, field for field (`rto_ms` the
+//   interval, `idle_ms` the idle period, each remainder its own), so nothing
+//   is restarted by a move. A standby charges each remainder the time since
+//   it was current — its checkpoint's commit, or the delta that last set it
+//   (`md_timers_set`) — before it imports the record (`ts_age_timers`), and
+//   `ip` charges the rest up to its activation. SRTT/RTTVAR scale exactly.
 // - the send buffer: `ip` holds no unacknowledged bytes — `tls` retains the
 //   exact ciphertext it handed down (its retransmit window) — so
 //   `send[SND.UNA..SND.NXT)` comes from `tls`'s window, and the outbound
@@ -164,12 +168,27 @@
 // CT_TLS `close_notify` bits 1 and 2; under crash continuity the peer's FIN
 // is a `Fin` deferred until the record has the bytes before it).
 //
-// Also in: our own close (FIN-WAIT-1/2, CLOSING, LAST-ACK with our
-// close_notify), IPv6 (FXTC's IPv6 layout) and a client session
-// (`local_client`). Not in: TIME-WAIT, which is the connection over, and a
+// Also in: our own close (FIN-WAIT-1/2, CLOSING, LAST-ACK and TIME-WAIT
+// with our close_notify — a standby that takes over in TIME-WAIT answers
+// the peer's retransmitted FIN and ends when the quiet period does), IPv6
+// (FXTC's IPv6 layout) and a client session (`local_client`). Not in: a
 // KeyUpdate delta naming another object than the one the standby holds,
 // refused DERIVE. `TCS_CAPS` reports exactly the rest, and a refused export
 // or import says why (`tcs_why`).
+//
+// The flow's end. A connection that ends is no loss of its pairing: `ip`
+// tells the provider before it lets the connection go — `DELTA_TCP_RESET`
+// for a reset (the peer's, or ours, which `ip` holds at the send horizon
+// until the standby has it), `DELTA_TCP_CLOSED` for a completed close — and
+// `tls` ends its half with `CONTINUITY{ENDED}`. A reset becomes the `Reset`
+// delta; then the primary reports `tc_evt::ENDED` (ours once the standby
+// acknowledged it) and its pairing stops, without an `ABORT` STATUS. A
+// standby that applies a `Reset` discards its `ip` shadow, leaves the flow's
+// tombstone there (a late segment of it is dropped, never answered), reports
+// `ENDED` and refuses ARM / ACTIVATE / CUT_IMPORT with `tcs_why::ENDED`. A
+// layer that abandons its pairing names why (`sc::ABORT_*`); the STATUS of a
+// pairing lost to it (`tcs_lost::LAYER`) carries the layer (`sc::CT_*`) in
+// the value's second byte and its reason in the first.
 //
 // ── Ports (as the module wires them) ──────────────────────────────────────
 //
@@ -208,6 +227,9 @@ pub mod tcs_why {
     /// A crash-continuous pairing ended (STATUS of op `ABORT`, unsolicited):
     /// the primary runs on unprotected. Low bits: `tcs_lost`.
     pub const MIRROR: u8 = 0x80;
+    /// The flow ended (`tc_evt::ENDED`): there is no connection to arm,
+    /// activate, import or export (`tc_end::REFUSED`).
+    pub const ENDED: u8 = super::tc_end::REFUSED;
 }
 
 /// Why a crash-continuous pairing ended (`tcs_why::MIRROR | …`).
@@ -226,7 +248,10 @@ pub mod tcs_lost {
     /// (`TcStack::layer_room`); kept as the invariant's own name.
     pub const FULL: u8 = 3;
     /// A half ended its own pairing (`CONTINUITY{ABORTED}`), or a frame of
-    /// it overran this module.
+    /// it overran this module. The STATUS value names it: the half's
+    /// transport (`sc::CT_TCP` / `sc::CT_TLS`) in bits 8..16 and its reason
+    /// (`sc::ABORT_*`: the record ceiling, the redelivery caps, the horizon
+    /// budget, the mirror lost) in bits 0..8; 0 for an overrun.
     pub const LAYER: u8 = 4;
     /// A half's delta contradicts the state the deltas so far built.
     pub const DIVERGED: u8 = 5;
@@ -319,7 +344,7 @@ const _: () = assert!(TCS_SEG_CHUNK >= sc::STRICT_RECV_BYTES);
 /// The per-layer layouts the codecs below read and write; their SHA-256 is
 /// what each module's PAIR_PREPARE binds, so a layout change in `ip` or
 /// `tls` is refused at pairing rather than misread.
-pub const TCS_FXTC_LABEL: [u8; 42] = *b"fluxor.ip.tcp-checkpoint:FXTC:reorder:ipv6";
+pub const TCS_FXTC_LABEL: [u8; 49] = *b"fluxor.ip.tcp-checkpoint:FXTC:reorder:ipv6:timers";
 pub const TCS_CT_TLS_LABEL: [u8; 28] = *b"fluxor.tls.continuity.ct_tls";
 
 /// Module-defined frames, `[type][len u16 LE][payload]` like every other
@@ -358,10 +383,10 @@ const TCS_TICK_MS: u32 = 50;
 /// one unit is this many µs.
 const TCS_SRTT_UNIT_US: u32 = 1000 / 8;
 const TCS_RTTVAR_UNIT_US: u32 = 1000 / 4;
-/// FXTC's "idle timer disabled".
-const TCS_IDLE_OFF: u16 = u16::MAX;
-/// FXTC's TIME-WAIT length (ticks), exported full.
-const TCS_TIMEWAIT_TICKS: u16 = 41;
+/// How long a standby whose shadow ended by reset keeps the flow's
+/// tombstone at `ip` (`TCS_IP_TOMBSTONE`): the peer's stragglers are dropped,
+/// never answered.
+const TCS_ENDED_TOMB_MS: u32 = 5_000;
 /// `ip`'s RTO clamps (ms; RFC 6298's one-second floor).
 const TCS_RTO_MIN: u16 = 1000;
 const TCS_RTO_MAX: u16 = 60_000;
@@ -375,7 +400,7 @@ const TCS_QUIESCE_MS: u32 = 10_000;
 const FXTC_MAGIC: [u8; 4] = *b"FXTC";
 /// FXTC's layout byte for an IPv4 connection.
 const FXTC_LAYOUT: u8 = 1;
-const FXTC_FIXED: usize = 108;
+const FXTC_FIXED: usize = 112;
 /// Out-of-order slots and bytes (aarch64 `ip`: four of 512).
 const FXTC_REORDER: usize = TS_OOO_MAX;
 pub const FXTC_MAX: usize = FXTC_FIXED + FXTC_REORDER * (6 + TS_OOO_SEG);
@@ -390,6 +415,8 @@ const FXTC_FIN_WAIT_1: u8 = 3;
 const FXTC_FIN_WAIT_2: u8 = 4;
 const FXTC_CLOSING: u8 = 5;
 const FXTC_LAST_ACK: u8 = 6;
+/// TIME-WAIT: both FINs exchanged, ours acknowledged.
+const FXTC_TIME_WAIT: u8 = 7;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct TcpHalf {
@@ -419,6 +446,10 @@ pub struct TcpHalf {
     pub tw_rem: u16,
     pub idle_rem: u16,
     pub cw_rem: u16,
+    /// The CLOSING / LAST-ACK bound's remainder (ticks), and the idle
+    /// period (ticks; 0: none).
+    pub closing_rem: u16,
+    pub idle_period: u16,
     pub delivered: u32,
     pub consumed: u32,
     pub ooo_count: u8,
@@ -509,11 +540,13 @@ pub fn fxtc_decode(b: &[u8], h: &mut TcpHalf) -> Result<(), CkptError> {
     h.tw_rem = le16(b, 68);
     h.idle_rem = le16(b, 70);
     h.cw_rem = le16(b, 72);
-    h.delivered = le32(b, 74);
-    h.consumed = le32(b, 78);
+    h.closing_rem = le16(b, 74);
+    h.idle_period = le16(b, 76);
+    h.delivered = le32(b, 78);
+    h.consumed = le32(b, 82);
     // trace_id[16] span_id[8] sampled[1] are the old anchor's observability
     // and do not move.
-    let n = usize::from(b[107]);
+    let n = usize::from(b[111]);
     if n > FXTC_REORDER {
         return Err(CkptError::Bounds);
     }
@@ -582,6 +615,8 @@ pub fn fxtc_encode(h: &TcpHalf, out: &mut [u8]) -> Option<usize> {
     w.u16(h.tw_rem)?;
     w.u16(h.idle_rem)?;
     w.u16(h.cw_rem)?;
+    w.u16(h.closing_rem)?;
+    w.u16(h.idle_period)?;
     w.u32(h.delivered)?;
     w.u32(h.consumed)?;
     w.bytes(&[0; 16 + 8 + 1])?;
@@ -866,7 +901,7 @@ pub fn ct_tls_encode(st: &TcsState, wr: &TcsWrapped, out: &mut [u8]) -> Option<u
     // our FIN (bit 3).
     let our_fin = matches!(
         st.tcp,
-        TsTcp::FinWait1 | TsTcp::FinWait2 | TsTcp::Closing | TsTcp::LastAck
+        TsTcp::FinWait1 | TsTcp::FinWait2 | TsTcp::Closing | TsTcp::LastAck | TsTcp::TimeWait
     );
     w.u8(u8::from(st.close_notify_sent)
         | (u8::from(st.close_notify_rcvd) << 1)
@@ -1088,6 +1123,7 @@ pub fn tcs_compose(
             | FXTC_FIN_WAIT_2
             | FXTC_CLOSING
             | FXTC_LAST_ACK
+            | FXTC_TIME_WAIT
     ) || (tcp.state >= FXTC_FIN_WAIT_1 && th.close_notify & 1 == 0)
         || th.role > 1
         || th.key_update & !2 != 0
@@ -1164,13 +1200,17 @@ pub fn tcs_compose(
     st.ts_ok = false;
     // CLOSE_WAIT: the peer's FIN took a sequence number past what `ip`
     // delivered.
-    let fin = matches!(tcp.state, FXTC_CLOSE_WAIT | FXTC_CLOSING | FXTC_LAST_ACK);
+    let fin = matches!(
+        tcp.state,
+        FXTC_CLOSE_WAIT | FXTC_CLOSING | FXTC_LAST_ACK | FXTC_TIME_WAIT
+    );
     st.tcp = match tcp.state {
         FXTC_CLOSE_WAIT => TsTcp::CloseWait,
         FXTC_FIN_WAIT_1 => TsTcp::FinWait1,
         FXTC_FIN_WAIT_2 => TsTcp::FinWait2,
         FXTC_CLOSING => TsTcp::Closing,
         FXTC_LAST_ACK => TsTcp::LastAck,
+        FXTC_TIME_WAIT => TsTcp::TimeWait,
         _ => TsTcp::Established,
     };
     st.iss = tcp.iss;
@@ -1211,14 +1251,22 @@ pub fn tcs_compose(
     st.dupacks = tcp.dup_acks;
     st.in_recovery = tcp.in_recovery != 0;
     st.recovery_point = tcp.recover_seq;
+    // Each remainder FXTC carries, in the state that runs it (FXTC's 0 is
+    // not running); `ip` runs no persist timer.
+    let ms = |t: u16| (u32::from(t) * TCS_TICK_MS).min(TS_TIMER_MAX_MS);
+    let in_state = |s: u8, v: u32| if tcp.state == s { v } else { 0 };
     st.rto_ms = u32::from(tcp.rto).min(TS_TIMER_MAX_MS);
-    st.persist_ms = 0;
-    st.keepalive_ms = if tcp.idle_rem == TCS_IDLE_OFF {
-        0
+    st.retx_rem_ms = in_state(FXTC_ESTABLISHED, u32::from(tcp.retx_rem));
+    st.idle_ms = ms(tcp.idle_period);
+    st.idle_rem_ms = in_state(FXTC_ESTABLISHED, ms(tcp.idle_rem)).min(st.idle_ms);
+    st.persist_rem_ms = 0;
+    st.closewait_rem_ms = in_state(FXTC_CLOSE_WAIT, ms(tcp.cw_rem));
+    st.closing_rem_ms = if matches!(tcp.state, FXTC_CLOSING | FXTC_LAST_ACK) {
+        ms(tcp.closing_rem)
     } else {
-        (u32::from(tcp.idle_rem) * TCS_TICK_MS).clamp(1, TS_TIMER_MAX_MS)
+        0
     };
-    st.timewait_ms = 0;
+    st.timewait_rem_ms = in_state(FXTC_TIME_WAIT, ms(tcp.tw_rem));
     st.srtt_us = u32::from(tcp.srtt) * TCS_SRTT_UNIT_US;
     st.rttvar_us = u32::from(tcp.rttvar) * TCS_RTTVAR_UNIT_US;
     st.cwnd = u32::from(tcp.cwnd).max(1);
@@ -1375,6 +1423,7 @@ pub fn tcs_tcp_half(st: &TcsState, h: &mut TcpHalf) {
         TsTcp::FinWait2 => FXTC_FIN_WAIT_2,
         TsTcp::Closing => FXTC_CLOSING,
         TsTcp::LastAck => FXTC_LAST_ACK,
+        TsTcp::TimeWait => FXTC_TIME_WAIT,
         _ => FXTC_ESTABLISHED,
     };
     let sv = u32::from_be_bytes([
@@ -1438,15 +1487,16 @@ pub fn tcs_tcp_half(st: &TcsState, h: &mut TcpHalf) {
         .rto_ms
         .clamp(u32::from(TCS_RTO_MIN), u32::from(TCS_RTO_MAX));
     h.rto = rto as u16;
-    // One full RTO before the first retransmission here.
-    h.retx_rem = h.rto;
-    h.tw_rem = TCS_TIMEWAIT_TICKS;
-    h.idle_rem = if st.keepalive_ms == 0 {
-        TCS_IDLE_OFF
-    } else {
-        (st.keepalive_ms / TCS_TICK_MS).clamp(1, u32::from(u16::MAX - 1)) as u16
-    };
-    h.cw_rem = u16::MAX;
+    // What remains of each timer, field for field (a tick's part counted
+    // whole, so a due timer stays due); `ip` starts a timer the record ran
+    // none of whole.
+    let ticks = |v: u32| v.div_ceil(TCS_TICK_MS).min(u32::from(u16::MAX)) as u16;
+    h.retx_rem = st.retx_rem_ms.min(u32::from(u16::MAX)) as u16;
+    h.tw_rem = ticks(st.timewait_rem_ms);
+    h.idle_rem = ticks(st.idle_rem_ms);
+    h.idle_period = ticks(st.idle_ms);
+    h.cw_rem = ticks(st.closewait_rem_ms);
+    h.closing_rem = ticks(st.closing_rem_ms);
     let delivered = st
         .rcv_nxt
         .wrapping_sub(1)
@@ -1499,11 +1549,11 @@ pub fn tcs_importable(st: &TcsState, wr: &TcsWrapped) -> Result<(), TcsRefuse> {
     // forward, IPv6. A record of an earlier write epoch still in flight is
     // only resent, byte for byte: no key is needed for it. A KeyUpdate
     // answer owed rides CT_TLS (`key_update` bit 1).
-    // Our own close moves (FIN-WAIT-1/2, CLOSING, LAST-ACK, with our
-    // close_notify sealed); TIME-WAIT is the connection over.
+    // Our own close moves (FIN-WAIT-1/2, CLOSING, LAST-ACK and TIME-WAIT,
+    // with our close_notify sealed); a reset connection does not.
     let our_close = matches!(
         st.tcp,
-        TsTcp::FinWait1 | TsTcp::FinWait2 | TsTcp::Closing | TsTcp::LastAck
+        TsTcp::FinWait1 | TsTcp::FinWait2 | TsTcp::Closing | TsTcp::LastAck | TsTcp::TimeWait
     );
     if !matches!(st.tcp, TsTcp::Established | TsTcp::CloseWait) && !our_close
         || (our_close && !st.close_notify_sent)
@@ -1655,7 +1705,43 @@ pub struct TcsFlow {
     pub custody_ev_len: usize,
     /// The flow's continuity key reached this host's vault by CUSTODY_UNWRAP.
     pub key_unwrapped: bool,
+    /// The flow ended (`tc_evt::ENDED` reported): a later RETIRE or ABORT
+    /// lets the slot go, any other operation is refused `tcs_why::ENDED`.
+    pub ended: bool,
+    /// A primary's end not yet reported: how (`tc_end`), whose (`MD_DIR_*`,
+    /// 0 for a close), and for our reset the `ip` delta number its
+    /// acknowledgement — the standby holding the `Reset` — must reach first.
+    pub end_pending: bool,
+    pub end_why: u8,
+    pub end_dir: u8,
+    pub end_ip_no: u32,
+    /// `tls` ended its half (`CONTINUITY{ENDED}`): `ip`'s end is due by this
+    /// time, else the flow is reported closed (0: not ended).
+    pub tls_end_by: u64,
+    /// A standby's: when each remainder of its record was current
+    /// (`ts_timer_remainders` order), charged at EMISSION_ARM.
+    pub timer_at: [u64; 6],
+    /// `ip`'s timers for a state the record has not reached yet (the peer's
+    /// FIN deferred until the bytes before it are in): emitted once it has.
+    pub timers_held: bool,
+    pub held_state: TsTcp,
+    pub held_timers: MdTimers,
 }
+
+const TCS_TIMERS0: MdTimers = MdTimers {
+    rto_ms: 0,
+    retx_rem_ms: 0,
+    idle_ms: 0,
+    idle_rem_ms: 0,
+    persist_rem_ms: 0,
+    closewait_rem_ms: 0,
+    closing_rem_ms: 0,
+    timewait_rem_ms: 0,
+    srtt_us: 0,
+    rttvar_us: 0,
+    cwnd: 0,
+    ssthresh: 0,
+};
 
 /// What a half's delta waits for before it is acknowledged to that half.
 /// `Free` is the all-zero value.
@@ -1835,6 +1921,16 @@ impl TcsFlow {
             custody_ev: [0; tc_custody::EVIDENCE_MAX],
             custody_ev_len: 0,
             key_unwrapped: false,
+            ended: false,
+            end_pending: false,
+            end_why: 0,
+            end_dir: 0,
+            end_ip_no: 0,
+            tls_end_by: 0,
+            timer_at: [0; 6],
+            timers_held: false,
+            held_state: TsTcp::Established,
+            held_timers: TCS_TIMERS0,
         }
     }
 
@@ -2170,6 +2266,8 @@ impl TcStack {
                 tw_rem: 0,
                 idle_rem: 0,
                 cw_rem: 0,
+                closing_rem: 0,
+                idle_period: 0,
                 delivered: 0,
                 consumed: 0,
                 ooo_count: 0,
@@ -2407,7 +2505,20 @@ impl TcStack {
                 return self.layer_delta(i, on_ip, p, out);
             }
             if reply && p[20] == sc::CR_ABORTED && self.flows[i].step == TcsStep::Idle {
+                // Which half, and why it abandoned the pairing.
+                let layer = if on_ip { sc::CT_TCP } else { sc::CT_TLS };
+                let reason = p.get(22).copied().unwrap_or(0);
+                self.lost_detail = u64::from(layer) << 8 | u64::from(reason);
                 return self.lose_mirror(i, tcs_lost::LAYER, out);
+            }
+            if reply && p[20] == sc::CR_ENDED && !on_ip {
+                // `tls`'s session ended with its connection: `ip`'s end
+                // (its reset or close delta) names how, and is due.
+                let c = &mut self.flows[i];
+                if c.tls_end_by == 0 {
+                    c.tls_end_by = now_ms.max(1) + TCS_JOB_MS;
+                }
+                return;
             }
         }
         let Some(i) = self.flows.iter().position(|c| {
@@ -2466,6 +2577,20 @@ impl TcStack {
             let c = &self.flows[i];
             if c.live && c.mirroring && (c.ip.covered > c.ip.acked || c.tls.covered > c.tls.acked) {
                 self.settle(i, out);
+            }
+            let c = &mut self.flows[i];
+            if c.live
+                && c.mirroring
+                && !c.end_pending
+                && c.tls_end_by != 0
+                && now_ms >= c.tls_end_by
+            {
+                // `tls` ended and `ip` never said how: the connection is
+                // gone here all the same.
+                c.end_pending = true;
+                c.end_why = tc_end::CLOSED;
+                c.end_dir = 0;
+                self.try_end(i, out);
             }
         }
     }
@@ -2534,6 +2659,23 @@ impl TcStack {
         let role = self.flows[i].role;
         let e = self.flows[i].layer_epoch;
         let tls_flow = self.flows[i].tls_flow;
+        if self.flows[i].ended {
+            // The connection is over, here and at the standby: nothing is
+            // left to move. RETIRE or ABORT lets the slot go; a late
+            // acknowledgement or delta is no one's; anything else is refused
+            // by name.
+            match op {
+                tc_op::RETIRE | tc_op::ABORT => {
+                    self.flows[i].live = false;
+                    tcs_status(out, op, tc_st::OK, 0, h, 0, flow);
+                }
+                tc_op::DELTA_ACK | tc_op::DELTA_APPLY | tc_op::CHECKPOINT_NEXT => {}
+                _ => {
+                    tcs_status(out, op, tc_st::UNSUPPORTED, tcs_why::ENDED, h, 0, flow);
+                }
+            }
+            return;
+        }
         if matches!(op, tc_op::RETIRE | tc_op::ABORT | tc_op::EMISSION_DISABLE) {
             // The halves' pairing ends with the operation, and with it their
             // delta streams.
@@ -2664,8 +2806,8 @@ impl TcStack {
                     tcs_evt_h(out, tc_evt::REJECTED, h, &[tc_rej::CHUNK]);
                 }
             }
-            (tc_op::CHECKPOINT_COMMIT, TcRole::Standby) => self.commit(i, h, body, out),
-            (tc_op::DELTA_APPLY, TcRole::Standby) => self.delta(i, h, body, out),
+            (tc_op::CHECKPOINT_COMMIT, TcRole::Standby) => self.commit(i, h, body, now_ms, out),
+            (tc_op::DELTA_APPLY, TcRole::Standby) => self.delta(i, h, body, now_ms, out),
             (tc_op::CUT_IMPORT, TcRole::Standby) => {
                 let Some(cut) = TcCut::decode(body) else {
                     tcs_status(out, op, tc_st::INVALID, 0, h, 0, flow);
@@ -2973,6 +3115,11 @@ impl TcStack {
         c.mirroring = false;
         c.key_unwrapped = false;
         c.custody_ev_len = 0;
+        c.ended = false;
+        c.end_pending = false;
+        c.end_ip_no = 0;
+        c.tls_end_by = 0;
+        c.timers_held = false;
         // A crash-continuous primary pairs its halves strict: each holds
         // its transitions until the delta covering them is acknowledged.
         let profile = tcs_profile(pair.role, pair.mode);
@@ -2995,7 +3142,7 @@ impl TcStack {
         }
     }
 
-    fn commit<O: TcsOut>(&mut self, i: usize, h: TcHandle, body: &[u8], out: &mut O) {
+    fn commit<O: TcsOut>(&mut self, i: usize, h: TcHandle, body: &[u8], now_ms: u64, out: &mut O) {
         let Some(id) = body.get(0..8).map(|b| le64(b, 0)) else {
             tcs_status(
                 out,
@@ -3048,6 +3195,8 @@ impl TcStack {
         c.shadow_valid = true;
         c.has_state = true;
         c.checkpoint_id = id;
+        // Every remainder the checkpoint carries is current as of now.
+        c.timer_at = [now_ms; 6];
         c.order = MdOrder::after_checkpoint(
             c.flow_id(),
             c.st.flow_epoch,
@@ -3060,7 +3209,7 @@ impl TcStack {
         tcs_evt_h(out, tc_evt::APPLIED, h, &a);
     }
 
-    fn delta<O: TcsOut>(&mut self, i: usize, h: TcHandle, body: &[u8], out: &mut O) {
+    fn delta<O: TcsOut>(&mut self, i: usize, h: TcHandle, body: &[u8], now_ms: u64, out: &mut O) {
         let Self {
             flows,
             scratch,
@@ -3097,17 +3246,41 @@ impl TcStack {
                     tcs_evt_h(out, tc_evt::REJECTED, h, &[tc_rej::DERIVE]);
                     return;
                 }
+                let (rem, una) = (ts_timer_remainders(&c.st), c.st.snd_una);
                 if md_apply(&mut c.st, scratch, hd.kind, payload).is_err() {
                     c.shadow_valid = false;
                     counters.rejected += 1;
                     tcs_evt_h(out, tc_evt::REJECTED, h, &[tc_rej::TRANSITION]);
                     return;
                 }
+                // The remainders this delta set are current as of its receipt.
+                let set = md_timers_set(&rem, una, &c.st, hd.kind);
+                for k in 0..6 {
+                    if set & (1 << k) != 0 {
+                        c.timer_at[k] = now_ms;
+                    }
+                }
                 c.order.commit(&hd);
                 let mut a = [0u8; 16];
                 a[0..8].copy_from_slice(&c.checkpoint_id.to_le_bytes());
                 a[8..16].copy_from_slice(&hd.seq.to_le_bytes());
                 tcs_evt_h(out, tc_evt::APPLIED, h, &a);
+                if hd.kind == MdKind::Reset {
+                    // The connection ended at the primary: the shadow is of a
+                    // connection that no longer exists. `ip` lets its shadow
+                    // (and the slot it reserved) go and keeps the flow's
+                    // tombstone, so a straggler is dropped, never answered.
+                    let (flow, e) = (c.flow_id(), c.layer_epoch);
+                    let dir = payload[0];
+                    c.ended = true;
+                    let tomb = TCS_ENDED_TOMB_MS.to_le_bytes();
+                    let sent = tcs_abort(out, TcsPort::Ip, &flow, e)
+                        && tcs_layer(out, TcsPort::Ip, TCS_IP_TOMBSTONE, &flow, e, &[&tomb]);
+                    if !sent {
+                        counters.out_full += 1;
+                    }
+                    tcs_evt_h(out, tc_evt::ENDED, h, &[tc_end::RESET, dir]);
+                }
             }
             Err(MdReject::Stale) => {}
             Err(_) => {
@@ -3142,16 +3315,24 @@ impl TcStack {
             );
             return;
         }
-        // The TCP half into `ip`'s shadow (prepared at PAIR_PREPARE).
+        // The TCP half into `ip`'s shadow (prepared at PAIR_PREPARE), each
+        // timer charged the time since its remainder was current here.
         let Self {
             flows,
             tcp_half,
             tcp_rec,
+            scratch,
             ..
         } = self;
         let c = &mut flows[i];
         c.tls_flow = c.wrapped.tls_flow;
-        tcs_tcp_half(&c.st, tcp_half);
+        let mut elapsed = [0u64; 6];
+        for (k, at) in c.timer_at.iter().enumerate() {
+            elapsed[k] = now_ms.saturating_sub(*at);
+        }
+        *scratch = c.st;
+        ts_age_timers(scratch, &elapsed);
+        tcs_tcp_half(scratch, tcp_half);
         let Some(n) = fxtc_encode(tcp_half, tcp_rec) else {
             return self.fail_op(i, op, tc_st::INVALID, now_ms, out);
         };
@@ -3265,12 +3446,71 @@ impl TcStack {
             let why = cond.unwrap_err();
             return self.lose_mirror(i, why, out);
         };
+        if let Err(why) = self.release_held_timers(i, out) {
+            return self.lose_mirror(i, why, out);
+        }
         let c = &mut self.flows[i];
+        if on_ip && kind == sc::DELTA_TCP_RESET {
+            c.end_ip_no = no;
+        }
         let half = if on_ip { &mut c.ip } else { &mut c.tls };
         if !half.push(no, cond) {
             return self.lose_mirror(i, tcs_lost::FULL, out);
         }
         self.settle(i, out);
+    }
+
+    /// `ip`'s timers held for a state the record had not reached, once it
+    /// has.
+    fn release_held_timers<O: TcsOut>(&mut self, i: usize, out: &mut O) -> Result<(), u8> {
+        let c = &mut self.flows[i];
+        if c.timers_held && c.st.tcp == c.held_state {
+            c.timers_held = false;
+            let t = c.held_timers;
+            self.emit_timers(i, t, out)?;
+        }
+        Ok(())
+    }
+
+    /// A `Timers` delta of `t`, its remainders kept to what the record's
+    /// state runs (a retransmission timer with nothing unacknowledged in the
+    /// record — `ip` ahead of it by an acknowledgement still to come — is
+    /// not carried; the next acknowledgement stops it there too).
+    fn emit_timers<O: TcsOut>(
+        &mut self,
+        i: usize,
+        mut t: MdTimers,
+        out: &mut O,
+    ) -> Result<TcsCond, u8> {
+        let st = &self.flows[i].st;
+        if st.snd_una == st.send_end() {
+            t.retx_rem_ms = 0;
+        }
+        t.idle_rem_ms = t.idle_rem_ms.min(t.idle_ms);
+        let mut pl = [0u8; 4 * TS_TIMER_WORDS];
+        let n = md_timers(&mut pl, &t).ok_or(tcs_lost::DIVERGED)?;
+        self.md_emit(i, MdKind::Timers, &pl[..n], out)
+    }
+
+    /// Report a primary's end once it may be: at once for the peer's reset
+    /// and a close, ours once `ip` has the acknowledgement that releases its
+    /// RST. The pairing stops there — no `ABORT` STATUS, the flow is over.
+    fn try_end<O: TcsOut>(&mut self, i: usize, out: &mut O) {
+        let c = &mut self.flows[i];
+        if !c.end_pending || c.ended {
+            return;
+        }
+        if c.end_why == tc_end::RESET && c.end_dir == MD_DIR_OUT && c.ip.acked < c.end_ip_no {
+            return;
+        }
+        c.end_pending = false;
+        c.ended = true;
+        c.mirroring = false;
+        c.has_state = false;
+        let (h, why, dir) = (c.handle, c.end_why, c.end_dir);
+        if !tcs_evt_h(out, tc_evt::ENDED, h, &[why, dir]) {
+            self.counters.out_full += 1;
+        }
     }
 
     /// `ip`'s delta: the receive and emission horizons it waits on, or the
@@ -3312,11 +3552,11 @@ impl TcStack {
                 let end = le32(b, 0).wrapping_add(u32::from(le16(b, 4)));
                 if b[6] != 0 {
                     // Our FIN, one sequence number past the bytes before it:
-                    // a `Fin` out (once, after our close_notify), and the
+                    // a `Fin` out (once; after our close_notify, or `ip`'s
+                    // own — its idle close, its CLOSE-WAIT bound), and the
                     // segment waits for the horizon past it.
                     let st = &self.flows[i].st;
                     if st.fin_queued
-                        || !st.close_notify_sent
                         || !matches!(st.tcp, TsTcp::Established | TsTcp::CloseWait)
                         || end != st.send_end()
                     {
@@ -3333,27 +3573,32 @@ impl TcStack {
                 let n = md_peer_ack(&mut pl, le32(b, 0), u32::from(le16(b, 4))).ok_or(DIVERGED)?;
                 self.md_emit(i, MdKind::PeerAck, &pl[..n], out)
             }
-            // `[state 1][rto 2][srtt 2][rttvar 2][cwnd 2][ssthresh 2]`.
-            sc::DELTA_TCP_TIMERS if b.len() == 11 => {
-                // The state itself moves by the `Fin` delta.
-                if !matches!(
-                    b[0],
-                    FXTC_ESTABLISHED
-                        | FXTC_CLOSE_WAIT
-                        | FXTC_FIN_WAIT_1
-                        | FXTC_FIN_WAIT_2
-                        | FXTC_CLOSING
-                        | FXTC_LAST_ACK
-                ) {
-                    return Err(UNREPRESENTABLE);
-                }
-                let st = &self.flows[i].st;
+            // `[state 1][rto 2][srtt 2][rttvar 2][cwnd 2][ssthresh 2]` and
+            // six remainders `[retx][idle period][idle][close-wait][closing]
+            // [time-wait]` (ms, 4 each): the timers the new state runs.
+            sc::DELTA_TCP_TIMERS if b.len() == 11 + 6 * 4 => {
+                // The state itself moves by the `Fin` / `PeerAck` deltas.
+                let state = match b[0] {
+                    FXTC_ESTABLISHED => TsTcp::Established,
+                    FXTC_CLOSE_WAIT => TsTcp::CloseWait,
+                    FXTC_FIN_WAIT_1 => TsTcp::FinWait1,
+                    FXTC_FIN_WAIT_2 => TsTcp::FinWait2,
+                    FXTC_CLOSING => TsTcp::Closing,
+                    FXTC_LAST_ACK => TsTcp::LastAck,
+                    FXTC_TIME_WAIT => TsTcp::TimeWait,
+                    _ => return Err(UNREPRESENTABLE),
+                };
                 let ss = le16(b, 9);
+                let rem = |k: usize| le32(b, 11 + 4 * k).min(TS_TIMER_MAX_MS);
                 let t = MdTimers {
                     rto_ms: u32::from(le16(b, 1)).min(TS_TIMER_MAX_MS),
-                    persist_ms: st.persist_ms,
-                    keepalive_ms: st.keepalive_ms,
-                    timewait_ms: st.timewait_ms,
+                    retx_rem_ms: rem(0),
+                    idle_ms: rem(1),
+                    idle_rem_ms: rem(2),
+                    persist_rem_ms: 0,
+                    closewait_rem_ms: rem(3),
+                    closing_rem_ms: rem(4),
+                    timewait_rem_ms: rem(5),
                     srtt_us: u32::from(le16(b, 3)) * TCS_SRTT_UNIT_US,
                     rttvar_us: u32::from(le16(b, 5)) * TCS_RTTVAR_UNIT_US,
                     cwnd: u32::from(le16(b, 7)).max(1),
@@ -3363,8 +3608,49 @@ impl TcStack {
                         u32::from(ss)
                     },
                 };
-                let n = md_timers(&mut pl, &t).ok_or(DIVERGED)?;
-                self.md_emit(i, MdKind::Timers, &pl[..n], out)
+                let c = &mut self.flows[i];
+                if c.st.tcp != state {
+                    // The record reaches that state by a delta still to come
+                    // (the peer's FIN, deferred until the bytes before it are
+                    // in): these timers wait for it.
+                    c.timers_held = true;
+                    c.held_state = state;
+                    c.held_timers = t;
+                    return Ok(TcsCond::Free);
+                }
+                c.timers_held = false;
+                self.emit_timers(i, t, out)
+            }
+            // `[dir 1][seq 4][ack 4]`: the connection reset — the peer's,
+            // which `ip` has accepted, or ours, which `ip` holds until the
+            // standby has this.
+            sc::DELTA_TCP_RESET if b.len() == 9 => {
+                let dir = b[0];
+                if dir != MD_DIR_IN && dir != MD_DIR_OUT {
+                    return Err(DIVERGED);
+                }
+                let n = md_reset(&mut pl, dir, le32(b, 1), le32(b, 5)).ok_or(DIVERGED)?;
+                let cond = self.md_emit(i, MdKind::Reset, &pl[..n], out)?;
+                let c = &mut self.flows[i];
+                c.end_pending = true;
+                c.end_why = tc_end::RESET;
+                c.end_dir = dir;
+                c.timers_held = false;
+                c.fin_held = false;
+                Ok(if dir == MD_DIR_OUT {
+                    cond
+                } else {
+                    TcsCond::Free
+                })
+            }
+            // The connection completed its close and `ip` let it go: the
+            // flow is over (the standby's shadow is the anchor's to retire).
+            sc::DELTA_TCP_CLOSED if b.is_empty() => {
+                let c = &mut self.flows[i];
+                c.end_pending = true;
+                c.end_why = tc_end::CLOSED;
+                c.end_dir = 0;
+                Ok(TcsCond::Free)
             }
             _ => Err(UNREPRESENTABLE),
         }
@@ -3379,6 +3665,7 @@ impl TcStack {
             let m = md_dir(&mut pl, MD_DIR_IN).ok_or(tcs_lost::DIVERGED)?;
             self.md_emit(i, MdKind::Fin, &pl[..m], out)?;
             self.flows[i].fin_held = false;
+            self.release_held_timers(i, out)?;
         }
         Ok(())
     }
@@ -3660,6 +3947,7 @@ impl TcStack {
                 self.counters.out_full += 1;
             }
         }
+        self.try_end(i, out);
     }
 
     /// The crash-continuous pairing of flow `i` cannot go on: both halves
@@ -3686,7 +3974,11 @@ impl TcStack {
             tc_st::UNSUPPORTED,
             tcs_why::MIRROR | why,
             h,
-            if why == tcs_lost::BOUNDS { detail } else { 0 },
+            if matches!(why, tcs_lost::BOUNDS | tcs_lost::LAYER) {
+                detail
+            } else {
+                0
+            },
             flow,
         );
     }
@@ -3819,6 +4111,15 @@ impl TcStack {
             return self.fail(i, tc_st::UNSUPPORTED, why.why(), now_ms, out);
         }
         if op == tc_op::CUT_EXPORT {
+            // The remainders run down with the clock: the checkpoint's are
+            // the standby's (it charges the time since it took them), and
+            // nothing else may have moved.
+            scratch.retx_rem_ms = c.st.retx_rem_ms;
+            scratch.idle_rem_ms = c.st.idle_rem_ms;
+            scratch.persist_rem_ms = c.st.persist_rem_ms;
+            scratch.closewait_rem_ms = c.st.closewait_rem_ms;
+            scratch.closing_rem_ms = c.st.closing_rem_ms;
+            scratch.timewait_rem_ms = c.st.timewait_rem_ms;
             let now = tc_state_digest(scratch, rec);
             let Some(digest) = tc_state_digest(&c.st, rec) else {
                 return self.fail(i, tc_st::UNSUPPORTED, 0, now_ms, out);

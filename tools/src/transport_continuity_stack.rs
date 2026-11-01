@@ -72,9 +72,11 @@ mod tests {
             rttvar: 12,
             rto: 1000,
             retx_rem: 0,
-            tw_rem: 41,
-            idle_rem: u16::MAX,
-            cw_rem: 900,
+            tw_rem: 0,
+            idle_rem: 0,
+            cw_rem: 0,
+            closing_rem: 0,
+            idle_period: 0,
             delivered: 2999,
             consumed: 2999,
             ooo_count: 1,
@@ -562,10 +564,21 @@ mod tests {
             (4, 9, TsTcp::FinWait2, false, false),
             (5, 9 | 6, TsTcp::Closing, true, true),
             (6, 9 | 6, TsTcp::LastAck, true, true),
+            (7, 9 | 6, TsTcp::TimeWait, false, true),
         ];
         for (state, bits, tcp_state, fin_out, peer_fin) in cases {
             let mut tcp = tcp_half(5000, 5000);
             tcp.state = state;
+            // The timer the state runs, as `ip` exports it (ticks): the idle
+            // close in ESTABLISHED (a minute's period, 42 s left), the
+            // closing bound, TIME-WAIT.
+            tcp.idle_period = 1200;
+            match state {
+                1 => tcp.idle_rem = 840,
+                5 | 6 => tcp.closing_rem = 200,
+                7 => tcp.tw_rem = 30,
+                _ => {}
+            }
             if peer_fin {
                 tcp.delivered -= 1;
             }
@@ -586,6 +599,23 @@ mod tests {
                 "state {state}"
             );
             ts_validate(&st).unwrap_or_else(|e| panic!("state {state} validates: {e:?}"));
+            // Each remainder crosses field for field, in milliseconds.
+            assert_eq!(
+                (
+                    st.idle_ms,
+                    st.idle_rem_ms,
+                    st.closing_rem_ms,
+                    st.timewait_rem_ms,
+                    st.retx_rem_ms
+                ),
+                match state {
+                    1 => (60_000, 42_000, 0, 0, 0),
+                    5 | 6 => (60_000, 0, 10_000, 0, 0),
+                    7 => (60_000, 0, 0, 1_500, 0),
+                    _ => (60_000, 0, 0, 0, 0),
+                },
+                "state {state}'s timers"
+            );
             let w = wrapped(&th, &rec);
             tcs_importable(&st, &w).unwrap_or_else(|e| panic!("state {state} imports: {e:?}"));
             let mut back = tcp;
@@ -594,6 +624,16 @@ mod tests {
                 (back.state, back.snd_nxt, back.delivered, back.rcv_nxt),
                 (state, tcp.snd_nxt, tcp.delivered, tcp.rcv_nxt),
                 "state {state} decomposes"
+            );
+            assert_eq!(
+                (
+                    back.idle_period,
+                    back.idle_rem,
+                    back.closing_rem,
+                    back.tw_rem
+                ),
+                (tcp.idle_period, tcp.idle_rem, tcp.closing_rem, tcp.tw_rem),
+                "state {state}'s timers decompose"
             );
             let mut out = vec![0u8; CT_TLS_MAX];
             let n = ct_tls_encode(&st, &w, &mut out).expect("ct_tls");
@@ -737,9 +777,12 @@ mod tests {
             TcsPort::Tls,
             &half_delta(&tf, 1, sc::DELTA_TLS_RECV_BYTES, &rb),
         );
-        // `ip`'s CLOSE-WAIT timers.
+        // `ip`'s CLOSE-WAIT timers: its CLOSE-WAIT bound runs, 5 s left.
         let mut tm = vec![2u8];
         tm.extend_from_slice(&[0xE8, 0x03, 40, 0, 12, 0, 0x08, 0x39, 0xFF, 0xFF]);
+        for rem in [0u32, 0, 0, 5_000, 0, 0] {
+            tm.extend_from_slice(&rem.to_le_bytes());
+        }
         a.feed_half(
             TcsPort::Ip,
             &half_delta(&flow(), 2, sc::DELTA_TCP_TIMERS, &tm),
@@ -766,16 +809,22 @@ mod tests {
         assert_eq!(a.ip.acks.last(), Some(&2), "the ACK of the FIN released");
         let st = b.p.flow(&flow()).expect("b").st;
         assert_eq!(
-            (st.tcp, st.fin_rcvd, st.rcv_nxt),
-            (TsTcp::CloseWait, true, 80_038)
+            (st.tcp, st.fin_rcvd, st.rcv_nxt, st.closewait_rem_ms),
+            (TsTcp::CloseWait, true, 80_038, 5_000)
         );
-        // The standby arms `ip` in CLOSE-WAIT.
+        // The standby arms `ip` in CLOSE-WAIT, with what remained of its
+        // bound (at most that: the time since the delta is charged).
         drop(a);
         b.op(tc_op::EMISSION_ARM, &hb);
         assert_eq!(b.status(tc_op::EMISSION_ARM).status, tc_st::OK);
         let mut h = tcp_half(0, 0);
         fxtc_decode(&b.ip.imported.clone().expect("fxtc"), &mut h).expect("fxtc");
         assert_eq!((h.state, h.rcv_nxt), (2, 80_038));
+        assert!(
+            h.cw_rem > 0 && h.cw_rem <= 100,
+            "CLOSE-WAIT's remainder: {}",
+            h.cw_rem
+        );
         let th = ct_tls_decode(&b.tls.imported.clone().expect("ct_tls")).expect("ct_tls");
         assert_eq!(th.close_notify & 4, 4, "tls is told the peer's FIN");
     }
@@ -2894,5 +2943,298 @@ mod tests {
             tcs_why::MIRROR | tcs_lost::BOUNDS
         );
         assert!(!a.p.flow(&flow()).expect("a").mirroring);
+    }
+
+    // ── the flow's end ───────────────────────────────────────────────────
+
+    fn reset_body(dir: u8, seq: u32, ack: u32) -> Vec<u8> {
+        let mut b = vec![dir];
+        b.extend_from_slice(&seq.to_le_bytes());
+        b.extend_from_slice(&ack.to_le_bytes());
+        b
+    }
+
+    /// Relay `deltas` to the standby; everything it reported.
+    fn relay_all(b: &mut Host, hb: &[u8; 8], deltas: &[Vec<u8>]) -> Vec<(u8, Vec<u8>)> {
+        let mut evs = Vec::new();
+        for d in deltas {
+            b.op(tc_op::DELTA_APPLY, &[&hb[..], d].concat());
+            evs.extend(b.events());
+        }
+        evs
+    }
+
+    fn ended(evs: &[(u8, Vec<u8>)]) -> Option<(u8, u8)> {
+        evs.iter()
+            .find(|(t, _)| *t == tc_evt::ENDED)
+            .map(|(_, p)| (p[8], p[9]))
+    }
+
+    fn aborted(evs: &[(u8, Vec<u8>)]) -> bool {
+        evs.iter()
+            .any(|(t, p)| *t == tc_evt::STATUS && p[0] == tc_op::ABORT)
+    }
+
+    fn kinds(evs: &[(u8, Vec<u8>)]) -> Vec<MdKind> {
+        evs.iter()
+            .filter(|(t, _)| *t == tc_evt::DELTA)
+            .map(|(_, p)| md_parse(&p[8..]).expect("a delta").0.kind)
+            .collect()
+    }
+
+    /// The peer resets a crash-continuous connection: `ip`'s reset becomes the
+    /// `Reset` delta and the flow's end — not the pairing's loss — at both
+    /// ends. The standby lets its shadow go, keeps the flow's tombstone, and
+    /// refuses to arm, activate or import it, by name; RETIRE and ABORT let
+    /// the slots go.
+    #[test]
+    fn the_peers_reset_ends_the_flow_at_both_ends_not_the_pairing() {
+        let (mut a, mut b, ha, hb) = crash_paired();
+        a.feed_half(
+            TcsPort::Ip,
+            &half_delta(
+                &flow(),
+                1,
+                sc::DELTA_TCP_RESET,
+                &reset_body(MD_DIR_IN, 80_000, 5000),
+            ),
+        );
+        let evs = a.events();
+        assert_eq!(kinds(&evs), vec![MdKind::Reset]);
+        assert_eq!(ended(&evs), Some((tc_end::RESET, MD_DIR_IN)), "{evs:?}");
+        assert!(!aborted(&evs), "a reset is no loss of the pairing");
+        assert!(a.ip.aborts.is_empty() && a.tls.aborts.is_empty());
+        let fa = a.p.flow(&flow()).expect("a");
+        assert!(fa.ended && !fa.mirroring);
+        let ds: Vec<Vec<u8>> = evs
+            .iter()
+            .filter(|(t, _)| *t == tc_evt::DELTA)
+            .map(|(_, p)| p[8..].to_vec())
+            .collect();
+
+        let bev = relay_all(&mut b, &hb, &ds);
+        assert!(bev.iter().any(|(t, _)| *t == tc_evt::APPLIED), "{bev:?}");
+        assert_eq!(ended(&bev), Some((tc_end::RESET, MD_DIR_IN)));
+        assert_eq!(b.p.flow(&flow()).expect("b").st.tcp, TsTcp::Reset);
+        // ip's shadow goes, the flow's tombstone stays.
+        assert_eq!(b.ip.aborts.len(), 1);
+        assert_eq!(b.ip.tombs.len(), 1);
+        assert_eq!(&b.ip.tombs[0][..16], &flow()[..]);
+        assert_eq!(
+            u32::from_le_bytes(b.ip.tombs[0][20..24].try_into().expect("ttl")),
+            5_000
+        );
+        for (op, body) in [
+            (tc_op::EMISSION_ARM, hb.to_vec()),
+            (
+                tc_op::ACTIVATE,
+                [
+                    &hb[..],
+                    &2u32.to_le_bytes(),
+                    &1u32.to_le_bytes(),
+                    &[0xCA; 16],
+                ]
+                .concat(),
+            ),
+            (
+                tc_op::CUT_IMPORT,
+                [&hb[..], &[0u8; TC_CUT_LEN][..]].concat(),
+            ),
+        ] {
+            b.op(op, &body);
+            let s = b.status(op);
+            assert_eq!(
+                (s.status, s.reason),
+                (tc_st::UNSUPPORTED, tcs_why::ENDED),
+                "op {op} on an ended flow"
+            );
+        }
+        assert!(!b.ip.armed && b.ip.activated.is_none() && b.out.auth.is_empty());
+        b.op(tc_op::ABORT, &hb);
+        assert_eq!(b.status(tc_op::ABORT).status, tc_st::OK);
+        assert!(b.p.flow(&flow()).is_none(), "the standby's slot is free");
+        a.op(tc_op::RETIRE, &ha);
+        assert_eq!(a.status(tc_op::RETIRE).status, tc_st::OK);
+        assert!(!a.ip.retired, "nothing left at ip to retire");
+        assert!(a.p.flow(&flow()).is_none());
+    }
+
+    /// Our reset: `ip` holds the RST at the send horizon, so its delta's
+    /// acknowledgement — the standby holding the `Reset` — is what releases
+    /// it, and the flow's end is reported then.
+    #[test]
+    fn our_reset_is_released_only_once_the_standby_holds_it() {
+        let (mut a, mut b, ha, hb) = crash_paired();
+        a.feed_half(
+            TcsPort::Ip,
+            &half_delta(
+                &flow(),
+                1,
+                sc::DELTA_TCP_RESET,
+                &reset_body(MD_DIR_OUT, 5000, 80_000),
+            ),
+        );
+        let evs = a.events();
+        assert_eq!(kinds(&evs), vec![MdKind::Reset]);
+        assert_eq!(ended(&evs), None, "not before the standby holds it");
+        assert!(a.ip.acks.is_empty(), "the RST waits");
+        let ds: Vec<Vec<u8>> = evs
+            .iter()
+            .filter(|(t, _)| *t == tc_evt::DELTA)
+            .map(|(_, p)| p[8..].to_vec())
+            .collect();
+        let bev = relay_all(&mut b, &hb, &ds);
+        assert_eq!(ended(&bev), Some((tc_end::RESET, MD_DIR_OUT)));
+        let top = bev
+            .iter()
+            .filter(|(t, _)| *t == tc_evt::APPLIED)
+            .map(|(_, p)| u64::from_le_bytes(p[16..24].try_into().expect("seq")))
+            .max()
+            .expect("applied");
+        a.op(tc_op::DELTA_ACK, &[&ha[..], &top.to_le_bytes()].concat());
+        assert_eq!(a.ip.acks.last(), Some(&1), "the RST released");
+        let evs = a.events();
+        assert_eq!(ended(&evs), Some((tc_end::RESET, MD_DIR_OUT)));
+        assert!(!aborted(&evs));
+        // A late acknowledgement of an ended flow is no one's.
+        a.op(tc_op::DELTA_ACK, &[&ha[..], &top.to_le_bytes()].concat());
+        assert!(a.events().is_empty());
+    }
+
+    /// A connection that completes its close ends its flow; and a `tls` that
+    /// ends its half while `ip` never says how is reported closed once `ip`
+    /// had its time.
+    #[test]
+    fn a_completed_close_ends_the_flow() {
+        let (mut a, _b, _ha, _hb) = crash_paired();
+        a.feed_half(
+            TcsPort::Ip,
+            &half_delta(&flow(), 1, sc::DELTA_TCP_CLOSED, &[]),
+        );
+        let evs = a.events();
+        assert_eq!(ended(&evs), Some((tc_end::CLOSED, 0)));
+        assert!(kinds(&evs).is_empty() && !aborted(&evs));
+
+        let (mut a, _b, _ha, _hb) = crash_paired();
+        let mut p = tls_flow().to_vec();
+        p.extend_from_slice(&EPOCH.to_le_bytes());
+        p.extend_from_slice(&[sc::CR_ENDED, sc::STATUS_OK, sc::END_TRANSPORT]);
+        a.feed_half(TcsPort::Tls, &sc_frame(sc::MSG_SC_CONTINUITY, &p));
+        let evs = a.events();
+        assert_eq!(ended(&evs), None, "ip's end is awaited");
+        assert!(!aborted(&evs), "tls's end is no loss");
+        a.now += TCS_JOB_MS + 1;
+        a.p.poll(a.now, &mut a.out);
+        a.settle();
+        let evs = a.events();
+        assert_eq!(ended(&evs), Some((tc_end::CLOSED, 0)));
+        assert!(!aborted(&evs));
+    }
+
+    /// A layer that abandons its pairing says why, and the STATUS that ends
+    /// the pairing carries it: the layer in the value's second byte, its
+    /// reason in the first.
+    #[test]
+    fn a_layer_that_abandons_its_pairing_names_why() {
+        for reason in [
+            sc::ABORT_TXREC_CAP,
+            sc::ABORT_REDELIVER_CAP,
+            sc::ABORT_HORIZON_BUDGET,
+            sc::ABORT_MIRROR_LOST,
+        ] {
+            let (mut a, _b, _ha, _hb) = crash_paired();
+            let mut p = tls_flow().to_vec();
+            p.extend_from_slice(&EPOCH.to_le_bytes());
+            p.extend_from_slice(&[sc::CR_ABORTED, sc::STATUS_OK, reason]);
+            a.feed_half(TcsPort::Tls, &sc_frame(sc::MSG_SC_CONTINUITY, &p));
+            let s = a.status(tc_op::ABORT);
+            assert_eq!(
+                (s.status, s.reason, s.value),
+                (
+                    tc_st::UNSUPPORTED,
+                    tcs_why::MIRROR | tcs_lost::LAYER,
+                    u64::from(sc::CT_TLS) << 8 | u64::from(reason)
+                ),
+                "reason {reason}"
+            );
+        }
+    }
+
+    /// A crash-continuous standby charges each timer the time since its
+    /// remainder was current — the checkpoint's commit, or the delta that set
+    /// it — and imports what remains, not a restarted timer. `ip`'s timers
+    /// for a state the record reaches later (the peer's FIN deferred) wait
+    /// for it.
+    #[test]
+    fn a_standby_imports_each_timer_at_what_remains_of_it() {
+        let mut tcp = tcp_half(5000, 5000);
+        tcp.ooo_count = 0;
+        tcp.idle_period = 1200;
+        tcp.idle_rem = 1000;
+        let (mut a, mut b, _ha, hb) = crash_paired_tcp(&tcp);
+        let st = b.p.flow(&flow()).expect("b").st;
+        assert_eq!((st.idle_ms, st.idle_rem_ms), (60_000, 50_000));
+        // 20 s pass at the standby; nothing sets the idle close again.
+        b.now += 20_000;
+        // `ip`'s timers as the peer's FIN arrives with 37 bytes the record
+        // does not hold yet: CLOSE-WAIT's, held for the FIN.
+        let mut rx = 80_000u32.to_le_bytes().to_vec();
+        rx.extend_from_slice(&37u16.to_le_bytes());
+        rx.extend_from_slice(&80_038u32.to_le_bytes());
+        rx.push(1);
+        a.feed_half(
+            TcsPort::Ip,
+            &half_delta(&flow(), 1, sc::DELTA_TCP_RECV, &rx),
+        );
+        let mut tm = vec![2u8];
+        tm.extend_from_slice(&[0xE8, 0x03, 40, 0, 12, 0, 0x08, 0x39, 0xFF, 0xFF]);
+        for rem in [0u32, 60_000, 0, 4_000, 0, 0] {
+            tm.extend_from_slice(&rem.to_le_bytes());
+        }
+        a.feed_half(
+            TcsPort::Ip,
+            &half_delta(&flow(), 2, sc::DELTA_TCP_TIMERS, &tm),
+        );
+        assert!(
+            a.deltas().is_empty(),
+            "nothing before the bytes before the FIN"
+        );
+        let tf = tls_flow();
+        let mut whole = tls_layout().recv;
+        whole.extend(std::iter::repeat_n(0xAB, 45 - whole.len()));
+        let mut rb = (whole.len() as u32).to_le_bytes().to_vec();
+        rb.extend_from_slice(&whole);
+        a.feed_half(
+            TcsPort::Tls,
+            &half_delta(&tf, 1, sc::DELTA_TLS_RECV_BYTES, &rb),
+        );
+        let ds = a.deltas();
+        let k: Vec<MdKind> = ds
+            .iter()
+            .map(|f| md_parse(f).expect("a delta").0.kind)
+            .collect();
+        assert_eq!(k, vec![MdKind::RxSegment, MdKind::Fin, MdKind::Timers]);
+        relay(&mut b, &hb, &ds);
+        let st = b.p.flow(&flow()).expect("b").st;
+        assert_eq!(
+            (st.tcp, st.closewait_rem_ms, st.idle_rem_ms),
+            (TsTcp::CloseWait, 4_000, 0)
+        );
+        // 1.5 s more, then the standby arms: CLOSE-WAIT's bound has 2.5 s
+        // left — 50 ticks — not its whole length.
+        b.now += 1_500;
+        b.op(tc_op::EMISSION_ARM, &hb);
+        assert_eq!(b.status(tc_op::EMISSION_ARM).status, tc_st::OK);
+        let mut h = tcp_half(0, 0);
+        fxtc_decode(&b.ip.imported.clone().expect("fxtc"), &mut h).expect("fxtc");
+        assert_eq!((h.state, h.cw_rem, h.idle_period), (2, 50, 1200));
+        // A remainder that ran out is due, never disarmed.
+        let (_a, mut b, _ha, hb) = crash_paired_tcp(&tcp);
+        b.now += 100_000;
+        b.op(tc_op::EMISSION_ARM, &hb);
+        assert_eq!(b.status(tc_op::EMISSION_ARM).status, tc_st::OK);
+        let mut h = tcp_half(0, 0);
+        fxtc_decode(&b.ip.imported.clone().expect("fxtc"), &mut h).expect("fxtc");
+        assert_eq!(h.idle_rem, 1, "due at once");
     }
 }

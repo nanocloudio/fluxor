@@ -20,7 +20,9 @@ timer_class = "wall_clock"
 # that half-closes is kept open that long, then sent that many bytes and
 # closed), `close_after` (our own close once that many bytes were echoed),
 # `echo_after` (received bytes held unconsumed until that many have come,
-# then exactly that many consumed, the rest held for the next), `cursor`
+# then exactly that many consumed, the rest held for the next),
+# `abort_after` (an abortive close — the connection reset — once that many
+# bytes were echoed), `cursor`
 # (with `ack`: each CMD_DELIVERED's cursor is the bytes consumed, as its
 # in_bytes always is, logged; a stream resumed by a takeover continues from
 # its MSG_RESUMED in_bytes) and

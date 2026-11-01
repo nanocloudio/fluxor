@@ -439,6 +439,9 @@ mod tests {
             *b = (i % 251) as u8;
         }
         st.rcv_nxt = st.rcv_nxt.wrapping_add(16_645 + 2 * 16_384);
+        // An idle close that runs: a minute, 42 s of it left.
+        st.idle_ms = 60_000;
+        st.idle_rem_ms = 42_000;
         st.next_delivery = 3;
         st.delivery_acked = 0;
         st.deliv_count = 2;
@@ -499,7 +502,7 @@ mod tests {
     }
 
     const TS_REFERENCE_DIGEST: &str =
-        "14c55f2bdb8b1fda5822594e03e5a8d241f7cd15063923c136fade738fb283b9";
+        "c9258d1d493db0fca6e338d6d11ed96f8c8a7ffb63eba34f19fb5db90ebf9079";
 
     /// A digest that verifies does not make the record readable: another
     /// version, a reserved flag, an IPv4 address with bytes past its four,
@@ -1168,7 +1171,8 @@ mod tests {
             (1, 2)
         );
         assert_eq!((TsTcp::Established.wire(), TsTcp::TimeWait.wire()), (4, 10));
-        assert_eq!(MdKind::QuicDelta.wire(), 12);
+        assert_eq!(TsTcp::Reset.wire(), 11);
+        assert_eq!((MdKind::Reset.wire(), MdKind::QuicDelta.wire()), (11, 12));
         for v in 0..=u8::MAX {
             for w in [
                 TcRole::from_u8(v).map(TcRole::wire),
@@ -1231,5 +1235,251 @@ mod tests {
         );
         assert_eq!(o.verify(&hdr(n + 2, prev, [0; 32])), Err(MdReject::Gap));
         assert_eq!(o.verify(&hdr(n + 1, prev, [0; 32])), Ok(MdVerdict::Apply));
+    }
+
+    // ── a reset, and the timers ──────────────────────────────────────────
+
+    fn apply(st: &mut TsState, kind: MdKind, p: &[u8]) -> Result<(), CkptError> {
+        let mut scratch = Box::new(TsState::zero());
+        md_apply(st, &mut scratch, kind, p)
+    }
+
+    fn tx(st: &mut TsState, n: usize) {
+        let mut p = vec![0u8; 64 + n];
+        let ct = vec![0x17; n];
+        let m = md_tx_record(
+            &mut p,
+            st.next_production,
+            st.write_epoch,
+            st.write_seq,
+            &ct,
+            st.out_bytes + n as u64,
+        )
+        .unwrap();
+        apply(st, MdKind::TxRecord, &p[..m]).unwrap();
+    }
+
+    fn peer_ack(st: &mut TsState, ack: u32) {
+        let mut p = [0u8; 8];
+        let m = md_peer_ack(&mut p, ack, 65_535).unwrap();
+        apply(st, MdKind::PeerAck, &p[..m]).unwrap();
+    }
+
+    fn fin(st: &mut TsState, dir: u8) {
+        let mut p = [0u8; 1];
+        let m = md_dir(&mut p, dir).unwrap();
+        apply(st, MdKind::Fin, &p[..m]).unwrap();
+    }
+
+    fn timers(st: &mut TsState, t: &MdTimers) -> Result<(), CkptError> {
+        let mut p = [0u8; 4 * TS_TIMER_WORDS];
+        let m = md_timers(&mut p, t).unwrap();
+        apply(st, MdKind::Timers, &p[..m])
+    }
+
+    /// A reset ends the record: it validates (it is what a standby's shadow
+    /// becomes), its timers stop, it applies nothing more, and it is never
+    /// encoded — there is no connection left to export or take over.
+    #[test]
+    fn a_reset_ends_the_record_and_nothing_follows_it() {
+        let mut v = Vault {
+            backend: 1,
+            ..Vault::default()
+        };
+        for dir in [MD_DIR_IN, MD_DIR_OUT] {
+            let mut st = Box::new(initial(&mut v));
+            st.idle_ms = 30_000;
+            st.idle_rem_ms = 10_000;
+            tx(&mut st, 100);
+            assert_eq!(
+                st.retx_rem_ms, st.rto_ms,
+                "data out arms the retransmission timer"
+            );
+            let mut p = [0u8; 9];
+            let m = md_reset(&mut p, dir, st.snd_nxt, st.rcv_nxt).unwrap();
+            assert_eq!(m, 9);
+            apply(&mut st, MdKind::Reset, &p[..m]).unwrap();
+            assert_eq!(st.tcp, TsTcp::Reset);
+            assert_eq!(ts_timer_remainders(&st), [0; 6], "every timer stops");
+            assert_eq!(ts_validate(&st), Ok(()));
+            let mut out = vec![0u8; TS_CKPT_MAX];
+            assert_eq!(ts_encode(&st, &mut out), Err(CkptError::UnsupportedState));
+            assert!(
+                tc_state_digest(&st, &mut out).is_none(),
+                "no cut of an ended flow"
+            );
+            // Nothing applies after it, not another reset, not a FIN.
+            assert_eq!(
+                apply(&mut st, MdKind::Reset, &p[..m]),
+                Err(CkptError::SequenceImpossible)
+            );
+            let mut f = [0u8; 1];
+            let k = md_dir(&mut f, MD_DIR_IN).unwrap();
+            assert!(apply(&mut st, MdKind::Fin, &f[..k]).is_err());
+        }
+        // A direction that is neither, or a short payload, is refused.
+        let mut st = Box::new(initial(&mut v));
+        let mut p = [0u8; 9];
+        let m = md_reset(&mut p, 3, 1, 1).unwrap();
+        assert_eq!(
+            apply(&mut st, MdKind::Reset, &p[..m]),
+            Err(CkptError::UnknownField)
+        );
+        assert!(apply(&mut st, MdKind::Reset, &p[..8]).is_err());
+        assert_eq!(st.tcp, TsTcp::Established, "refused, nothing changed");
+        // A reset record with a timer still armed does not validate.
+        let mut bad = Box::new(initial(&mut v));
+        bad.tcp = TsTcp::Reset;
+        bad.closing_rem_ms = 5;
+        assert_eq!(ts_validate(&bad), Err(CkptError::SequenceImpossible));
+    }
+
+    /// Each timer is armed only where the state runs it, and a remainder
+    /// runs down to due — never to disarmed.
+    #[test]
+    fn a_timer_is_armed_only_in_the_states_that_run_it() {
+        let mut v = Vault {
+            backend: 1,
+            ..Vault::default()
+        };
+        let st = initial(&mut v);
+        type Arm = fn(&mut TsState);
+        let cases: [(&str, Arm); 7] = [
+            ("retransmission with nothing outstanding", |s| {
+                s.retx_rem_ms = 300
+            }),
+            ("idle with no period", |s| s.idle_rem_ms = 5),
+            ("idle past its period", |s| {
+                s.idle_ms = 10;
+                s.idle_rem_ms = 11
+            }),
+            ("persist with a window open", |s| s.persist_rem_ms = 5),
+            ("CLOSE-WAIT bound in ESTABLISHED", |s| {
+                s.closewait_rem_ms = 5
+            }),
+            ("closing bound in ESTABLISHED", |s| s.closing_rem_ms = 5),
+            ("TIME-WAIT in ESTABLISHED", |s| s.timewait_rem_ms = 5),
+        ];
+        for (what, f) in cases {
+            let mut s = Box::new(st);
+            f(&mut s);
+            assert_eq!(
+                ts_validate(&s),
+                Err(CkptError::SequenceImpossible),
+                "{what}"
+            );
+        }
+        let mut s = Box::new(st);
+        s.idle_ms = TS_TIMER_MAX_MS + 1;
+        assert_eq!(ts_validate(&s), Err(CkptError::Bounds), "past the ceiling");
+        // Aged: armed timers run down to due, disarmed ones stay so.
+        let mut s = Box::new(st);
+        s.idle_ms = 1_000;
+        s.idle_rem_ms = 400;
+        ts_age_timers(&mut s, &[0, 150, 0, 0, 0, 0]);
+        assert_eq!(s.idle_rem_ms, 250);
+        ts_age_timers(&mut s, &[9_999; 6]);
+        assert_eq!((s.idle_rem_ms, s.retx_rem_ms), (TS_TIMER_DUE, 0));
+        assert_eq!(ts_validate(&s), Ok(()));
+    }
+
+    /// The transitions keep the timers as a stack does: data out arms the
+    /// retransmission timer, an acknowledgement of new data restarts or
+    /// stops it, a payload byte restarts the idle close, a state change
+    /// stops what the new state does not run, and a `Timers` delta sets the
+    /// block — each set remainder current as of that delta.
+    #[test]
+    fn the_transitions_keep_the_timers() {
+        let mut v = Vault {
+            backend: 1,
+            ..Vault::default()
+        };
+        let mut st = Box::new(initial(&mut v));
+        st.idle_ms = 20_000;
+        st.idle_rem_ms = 3_000;
+        let (rem, una) = (ts_timer_remainders(&st), st.snd_una);
+        tx(&mut st, 200);
+        assert_eq!((st.retx_rem_ms, st.idle_rem_ms), (200, 20_000));
+        assert_eq!(md_timers_set(&rem, una, &st, MdKind::TxRecord), 0b11);
+        // A second record: the running timer is not restarted.
+        st.retx_rem_ms = 120;
+        let rem = ts_timer_remainders(&st);
+        tx(&mut st, 50);
+        assert_eq!(st.retx_rem_ms, 120);
+        assert_eq!(md_timers_set(&rem, st.snd_una, &st, MdKind::TxRecord), 0b10);
+        // Part acknowledged: restarted at the interval; all of it: stopped.
+        st.retx_rem_ms = 30;
+        let (rem, una) = (ts_timer_remainders(&st), st.snd_una);
+        let to = st.snd_una + 100;
+        peer_ack(&mut st, to);
+        assert_eq!(st.retx_rem_ms, 200);
+        assert_eq!(md_timers_set(&rem, una, &st, MdKind::PeerAck) & 1, 1);
+        let end = st.send_end();
+        peer_ack(&mut st, end);
+        assert_eq!(st.retx_rem_ms, 0);
+        // The peer's FIN: CLOSE-WAIT runs no idle close.
+        fin(&mut st, MD_DIR_IN);
+        assert_eq!((st.tcp, st.idle_rem_ms), (TsTcp::CloseWait, 0));
+        let mut t = MdTimers::of(&st);
+        t.closewait_rem_ms = 4_000;
+        timers(&mut st, &t).unwrap();
+        assert_eq!(st.closewait_rem_ms, 4_000);
+        let mut wrong = t;
+        wrong.timewait_rem_ms = 1;
+        assert_eq!(timers(&mut st, &wrong), Err(CkptError::SequenceImpossible));
+        // Our FIN: LAST-ACK runs the closing bound, not CLOSE-WAIT's.
+        st.close_notify_sent = true;
+        fin(&mut st, MD_DIR_OUT);
+        assert_eq!((st.tcp, st.closewait_rem_ms), (TsTcp::LastAck, 0));
+        let mut t = MdTimers::of(&st);
+        t.closing_rem_ms = 12_000;
+        let rem = ts_timer_remainders(&st);
+        timers(&mut st, &t).unwrap();
+        assert_eq!(md_timers_set(&rem, st.snd_una, &st, MdKind::Timers), 0x3F);
+        let mut out = vec![0u8; TS_CKPT_MAX];
+        let n = ts_encode(&st, &mut out).unwrap();
+        let mut back = Box::new(TsState::zero());
+        ts_decode(&out[..n], &mut back).unwrap();
+        assert_eq!(back.closing_rem_ms, 12_000);
+    }
+
+    /// TIME-WAIT is a state the record carries: our FIN acknowledged, the
+    /// peer's received, its quiet period's remainder set by the state's
+    /// timers — and CLOSING's bound stops when it gets there.
+    #[test]
+    fn time_wait_is_carried_with_its_remainder() {
+        let mut v = Vault {
+            backend: 1,
+            ..Vault::default()
+        };
+        // FIN-WAIT-2, then the peer's FIN.
+        let mut st = Box::new(initial(&mut v));
+        st.close_notify_sent = true;
+        fin(&mut st, MD_DIR_OUT);
+        let end = st.send_end();
+        peer_ack(&mut st, end);
+        assert_eq!(st.tcp, TsTcp::FinWait2);
+        fin(&mut st, MD_DIR_IN);
+        assert_eq!(st.tcp, TsTcp::TimeWait);
+        let mut t = MdTimers::of(&st);
+        t.timewait_rem_ms = 1_650;
+        timers(&mut st, &t).unwrap();
+        let mut out = vec![0u8; TS_CKPT_MAX];
+        let n = ts_encode(&st, &mut out).unwrap();
+        let mut back = Box::new(TsState::zero());
+        ts_decode(&out[..n], &mut back).unwrap();
+        assert_eq!((back.tcp, back.timewait_rem_ms), (TsTcp::TimeWait, 1_650));
+        // Simultaneous close: CLOSING's bound, then our FIN acknowledged.
+        let mut st = Box::new(initial(&mut v));
+        st.close_notify_sent = true;
+        fin(&mut st, MD_DIR_OUT);
+        fin(&mut st, MD_DIR_IN);
+        assert_eq!(st.tcp, TsTcp::Closing);
+        let mut t = MdTimers::of(&st);
+        t.closing_rem_ms = 9_000;
+        timers(&mut st, &t).unwrap();
+        let end = st.send_end();
+        peer_ack(&mut st, end);
+        assert_eq!((st.tcp, st.closing_rem_ms), (TsTcp::TimeWait, 0));
     }
 }

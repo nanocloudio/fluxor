@@ -333,11 +333,17 @@ pub fn tc_restart(s: &mut TsState, restart_window: u32) {
 
 /// The retransmission deadline of an imported state on this host's
 /// monotonic clock: armed whenever anything is outstanding (everything in
-/// the send buffer may already have been emitted by the old primary), and
-/// due at once when no time is left.
+/// the send buffer may already have been emitted by the old primary) — at
+/// what remains of the record's retransmission timer, a whole interval when
+/// the record ran none — and due at once when no time is left.
 pub fn tc_rto_deadline(s: &TsState, now_ms: u64) -> u64 {
     if s.send_len > 0 || s.fin_queued {
-        now_ms + u64::from(s.rto_ms)
+        let left = if s.retx_rem_ms != 0 {
+            s.retx_rem_ms
+        } else {
+            s.rto_ms
+        };
+        now_ms + u64::from(left)
     } else {
         0
     }

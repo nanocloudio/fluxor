@@ -465,12 +465,18 @@ pub const CMD_SEND: u8 = 0x11;
 /// Receivers (IP, the Linux host adapter) size their command scratch to
 /// `FRAME_HDR + CONN_ID_LEN + MAX_CMD_DATA` and drain anything larger to stay frame-aligned.
 pub const MAX_CMD_DATA: usize = 8192;
-/// Close connection. Payload: `[conn_id: u16 LE]`
+/// Close connection. Payload: `[conn_id: u16 LE]`, or
+/// `[conn_id: u16 LE][how: u8]` with `how` [`CLOSE_ABORT`]: an abortive
+/// close — the connection is reset (RST) instead of closed in order (FIN),
+/// and whatever is queued or in flight is dropped (`SO_LINGER` zero). A
+/// record layer forwards it without its own close (no close_notify).
 ///
 /// Always safe after [`MSG_CLOSED`] within [`CLOSED_ID_GRACE_MS`] — the id
 /// is still the consumer's — and a no-op on an id the transport has already
 /// released.
 pub const CMD_CLOSE: u8 = 0x12;
+/// `CMD_CLOSE`'s `how`: reset the connection.
+pub const CLOSE_ABORT: u8 = 1;
 
 /// Bytes the consumer already handed down, sent again at their own sequence
 /// numbers — its answer to [`MSG_RETRANSMIT`]. Payload: `[conn_id: u16 LE]

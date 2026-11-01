@@ -1263,10 +1263,57 @@ outbound records), beside four out-of-order segments of up to 512 bytes;
 an encoded checkpoint is at most 192 KiB (`TS_CKPT_MAX`). The header's flags
 say which end opened the connection (`TS_FLAG_CLIENT`): a client session's
 `client_*` is this host and `service_*` the remote server. An IPv4 address
-is the first four bytes of its sixteen, the other twelve zero. Timers travel
-as bounded remaining durations (`TS_TIMER_MAX_MS`), secrets only as vault
-references, and the record holds the answer a peer's KeyUpdate asked for
-(`key_update_owed`).
+is the first four bytes of its sixteen, the other twelve zero. Secrets
+travel only as vault references, and the record holds the answer a peer's
+KeyUpdate asked for (`key_update_owed`).
+
+**Timers.** Beside the retransmission interval (`rto_ms`) and the idle
+period (`idle_ms`) the record carries what remains of every timer the
+connection runs — the retransmission timer, the idle close, the persist
+timer (0 from `ip`, which leaves zero-window probing to its peer), the
+CLOSE-WAIT bound, the CLOSING / LAST-ACK bound and TIME-WAIT — each 0 when
+disarmed and at least `TS_TIMER_DUE` (1 ms: due) when armed, never past
+`TS_TIMER_MAX_MS` (an hour), and armed only in the states that run it
+(`ts_validate`). The transitions keep them as a stack does (`md_apply`):
+data out starts the retransmission timer, an acknowledgement of new data
+restarts or stops it (RFC 6298 §5), a payload byte restarts the idle close,
+a state change stops what the new state does not run, and `ip`'s TIMERS at
+each state change (`DELTA_TCP_TIMERS`, with six remainders) is a `Timers`
+delta that sets the block — held by the bridge while the record has not yet
+reached that state (the peer's FIN deferred behind the bytes before it).
+A standby records when each remainder was current — its checkpoint's commit,
+or the delta that last set it (`md_timers_set`) — and charges each the time
+since before it imports the record (`ts_age_timers`); `ip` charges the rest
+up to activation and fires an expired timer once, on its first sweep. So a
+takeover resumes an RTO, an idle close, CLOSE-WAIT's FIN, LAST-ACK's give-up
+and TIME-WAIT's end at what remained of them, late by at most the mirror's
+latency — never restarted, never a whole interval late. A planned cut
+compares the connection it re-exports with its checkpoint apart from the
+remainders, which run down with the clock.
+
+**The flow's end.** A connection that ends is no loss of its pairing.
+`ip` tells the provider before it lets a mirrored connection go:
+`DELTA_TCP_RESET` for a reset — the peer's, accepted on RFC 5961's rules in
+every synchronised state, or ours, which it holds at the send horizon until
+the standby has it, exactly as a FIN (an abortive `CMD_CLOSE`,
+`net_proto::CLOSE_ABORT`, and a lane torn down) — and `DELTA_TCP_CLOSED` for
+a completed close (LAST-ACK acknowledged, TIME-WAIT over, the closing bound
+spent); with no room on `cont_out` the slot stays latched until there is.
+`tls` ends a paired session that ends with its connection with
+`CONTINUITY{ENDED}` (`CR_ENDED`; `END_RESET` for its consumer's abortive
+close), not an abort. A reset is the `Reset` delta, after which the record
+is terminal (`TsTcp::Reset`: it applies nothing more and never encodes). The
+primary reports `tc_evt::ENDED` `[why][dir]` (`tc_end`) — ours once the
+standby acknowledged the delta — and stops its pairing without an `ABORT`
+STATUS; the standby that applies the `Reset` lets its `ip` shadow go, keeps
+the flow's tombstone there (a straggler is dropped, never answered), reports
+`ENDED` and refuses EMISSION_ARM, ACTIVATE and CUT_IMPORT with
+`tc_end::REFUSED`; RETIRE or ABORT then lets either slot go. A layer that
+abandons its pairing names why — `ABORT_TXREC_CAP` (the record ceiling),
+`ABORT_REDELIVER_CAP` (the redelivery caps), `ABORT_HORIZON_BUDGET` (an
+unanswered horizon), `ABORT_MIRROR_LOST` — and the STATUS that ends the
+pairing (`tcs_why::MIRROR | tcs_lost::LAYER`) carries the layer in its
+value's second byte and the reason in the first.
 
 **Chunks.** CHECKPOINT_BEGIN sends the encoded record as `WHCC` chunks of
 16 KiB (`CKPT_CHUNK_PAYLOAD`, at most `CKPT_MAX_CHUNKS`), each naming the
@@ -1550,8 +1597,10 @@ shows for the FIN waits on the horizon past it. The `conn_sink` fixture
 plays each of these services: `linger_ms` / `farewell` keep a half-closed
 connection open and write to it before closing, `close_after` closes our
 side once it has echoed that much, `echo_after` holds what it receives
-unconsumed until that much has come (deliveries a standby owes), and `dial`
-makes it the client of a session it opens (`tls` in client mode).
+unconsumed until that much has come (deliveries a standby owes),
+`abort_after` resets the connection once it has echoed that much (an
+abortive close), and `dial` makes it the client of a session it opens
+(`tls` in client mode).
 
 Our own close moves too. With continuity wired, a consumer's close keeps
 the `tls` session `Closing`: its close_notify sealed through the ordinary
@@ -1567,14 +1616,16 @@ session closing — its consumer never told, its alert resent from the window
 if `ip` asks, the transport close forwarded if the primary had not — and it
 ends at `ip`'s MSG_CLOSED; a session that moves with its close_notify and
 FIN in flight reaches the client whole, followed by a clean close from the
-standby. TIME-WAIT is the connection over and does not move. A KeyUpdate that does not name the object the standby holds
-is refused `DERIVE`. Quiescent means drained — nothing stashed below `ip`'s
+standby. TIME-WAIT moves too (FXTC state 7, the record's `TimeWait`): a
+standby that takes it over answers the peer's retransmitted FIN and ends the
+quiet period at what remained of it. A KeyUpdate that does not name the
+object the standby holds is refused `DERIVE`. Quiescent means drained — nothing stashed below `ip`'s
 send window, nothing held in `tls` — not nothing in flight: `tls`'s
 retransmit window, anchored by `ip`'s `MSG_ACK` (above), holds exactly
 `[SND.UNA, SND.NXT)`, so the cut carries the bytes in flight and the standby
 resends them from the window it imports. Sessions move in ESTABLISHED,
-CLOSE-WAIT and our own closing states, over IPv4 and IPv6, whichever end
-opened them.
+CLOSE-WAIT, our own closing states and TIME-WAIT, over IPv4 and IPv6,
+whichever end opened them.
 
 A record crosses whole: an `RxRecord` delta is one record — it consumes
 receive bytes and advances the read sequence by one — and carries its

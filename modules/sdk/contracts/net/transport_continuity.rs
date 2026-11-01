@@ -14,8 +14,9 @@
 //   local-address generation, which end opened the connection, negotiated
 //   TCP options, the TCP state and every sequence variable, unacknowledged
 //   send bytes at their exact range, accepted-but-undelivered receive bytes
-//   and out-of-order segments, SACK/timestamp and recovery state, timers as
-//   bounded REMAINING durations, congestion state, the TLS 1.3 record layer
+//   and out-of-order segments, SACK/timestamp and recovery state, each
+//   timer the connection runs as a bounded REMAINING duration (below),
+//   congestion state, the TLS 1.3 record layer
 //   (suite, read/write epochs and record numbers, the KeyUpdate answer owed
 //   and close-notify state), the pending outbound records with their
 //   production ids, the delivery cursor and pending deliveries with their
@@ -26,7 +27,10 @@
 // - its chunked transfer (`WHCC`) and the standby's shadow assembler, which
 //   publishes only a whole, validated record;
 // - the ordered mirror deltas (`WHMD`), the deterministic transition each
-//   applies (`md_apply`) and the standby's ordering rule (`MdOrder`);
+//   applies (`md_apply`) and the standby's ordering rule (`MdOrder`); a
+//   connection's end by reset is one of them (`MdKind::Reset`), after which
+//   the record is terminal: it applies nothing more and is never exported
+//   as a live connection;
 // - the provider frames: anchor → provider operations (`tc_op`), provider
 //   → anchor events (`tc_evt`), statuses, the handle, the planned cut and
 //   the capability bits a provider reports.
@@ -39,6 +43,24 @@
 // `TS_CKPT_MAX` crosses in chunks of 16 KiB. The record names which end
 // opened the connection (`TS_FLAG_CLIENT`): a client session's `client_*`
 // is this host and `service_*` the remote server.
+//
+// Timers. The record carries, beside the retransmission interval (`rto_ms`)
+// and the idle period (`idle_ms`), what remains of each timer the
+// connection runs: the retransmission timer, the idle close, the persist
+// timer, the CLOSE-WAIT bound (our close owed to a peer that closed), the
+// CLOSING / LAST-ACK bound (the acknowledgement of our FIN) and TIME-WAIT.
+// Each is the time left when the record was exported or the delta that set
+// it was emitted: 0 is disarmed, and `TS_TIMER_DUE` (1 ms) is due now — an
+// expired timer is never confused with one that is not running. A timer is
+// armed only in the states that run it (`ts_validate`). The transitions keep
+// them as a stack does (`md_apply`): sending data arms the retransmission
+// timer and an acknowledgement of new data restarts or stops it (RFC 6298
+// §5), a payload byte either way restarts the idle close, a state change
+// stops the timers the new state does not run, and a `Timers` delta sets
+// them all. A standby charges the time since its record was last brought
+// up to date — the checkpoint it committed, or the last delta it applied —
+// against every remainder before it imports them, so a takeover resumes
+// each timer late by at most the mirror's latency, never restarted.
 //
 // The bytes are fixed: this provider and the anchors that drive it hold the
 // same reference vector (`tools/src/transport_continuity.rs` pins the record
@@ -251,8 +273,12 @@ pub const TS_DELIV_MAX: usize = 8;
 pub const TS_DELIV_BYTES: usize = 16 * 1024;
 /// Outbound TLS records still in the send buffer.
 pub const TS_TXREC_MAX: usize = 32;
-/// Remaining-duration ceiling for any imported timer (ms).
-pub const TS_TIMER_MAX_MS: u32 = 120_000;
+/// Ceiling for any timer the record carries, interval or remainder (ms):
+/// an hour, past every idle period a stack is configured with.
+pub const TS_TIMER_MAX_MS: u32 = 3_600_000;
+/// A timer remainder that is due now: armed, and expired. A remainder is 0
+/// only when the timer is not running.
+pub const TS_TIMER_DUE: u32 = 1;
 /// Largest encoded checkpoint: every buffer above full, and the fields.
 pub const TS_CKPT_MAX: usize = 192 * 1024;
 
@@ -282,7 +308,11 @@ const _: () = assert!(
 tc_wire_enum!(
     /// The TCP states a checkpoint represents (RFC 9293 numbering).
     /// LISTEN, SYN-SENT and SYN-RECEIVED have no established transport to
-    /// migrate and are not representable.
+    /// migrate and are not representable. `Reset` is terminal: the
+    /// connection ended by a reset (`MdKind::Reset`), in either direction.
+    /// A record in it validates — it is what a standby's shadow becomes —
+    /// but applies no further delta and is never encoded: there is no
+    /// connection left to export, checkpoint or take over.
     TsTcp {
         Established = 4,
         CloseWait = 5,
@@ -291,6 +321,7 @@ tc_wire_enum!(
         Closing = 8,
         LastAck = 9,
         TimeWait = 10,
+        Reset = 11,
     }
 );
 
@@ -413,10 +444,24 @@ pub struct TsState {
     pub in_recovery: bool,
     pub recovery_point: u32,
 
+    /// The retransmission timeout (the interval, RFC 6298), and what
+    /// remains of the retransmission timer (armed only with something
+    /// unacknowledged).
     pub rto_ms: u32,
-    pub persist_ms: u32,
-    pub keepalive_ms: u32,
-    pub timewait_ms: u32,
+    pub retx_rem_ms: u32,
+    /// The idle close's period (0: the connection has none), and what
+    /// remains of it (armed only in ESTABLISHED, never past the period).
+    pub idle_ms: u32,
+    pub idle_rem_ms: u32,
+    /// The persist timer (armed only against a zero send window). A stack
+    /// that leaves zero-window probing to its peer exports 0.
+    pub persist_rem_ms: u32,
+    /// The CLOSE-WAIT bound: our close, owed to a peer that closed.
+    pub closewait_rem_ms: u32,
+    /// The CLOSING / LAST-ACK bound: the acknowledgement of our FIN.
+    pub closing_rem_ms: u32,
+    /// TIME-WAIT's quiet period.
+    pub timewait_rem_ms: u32,
     pub srtt_us: u32,
     pub rttvar_us: u32,
     pub cwnd: u32,
@@ -527,9 +572,13 @@ impl TsState {
             in_recovery: false,
             recovery_point: 0,
             rto_ms: 0,
-            persist_ms: 0,
-            keepalive_ms: 0,
-            timewait_ms: 0,
+            retx_rem_ms: 0,
+            idle_ms: 0,
+            idle_rem_ms: 0,
+            persist_rem_ms: 0,
+            closewait_rem_ms: 0,
+            closing_rem_ms: 0,
+            timewait_rem_ms: 0,
             srtt_us: 0,
             rttvar_us: 0,
             cwnd: 0,
@@ -639,9 +688,13 @@ impl TsState {
             in_recovery: false,
             recovery_point: 0,
             rto_ms: 1000,
-            persist_ms: 0,
-            keepalive_ms: 0,
-            timewait_ms: 0,
+            retx_rem_ms: 0,
+            idle_ms: 0,
+            idle_rem_ms: 0,
+            persist_rem_ms: 0,
+            closewait_rem_ms: 0,
+            closing_rem_ms: 0,
+            timewait_rem_ms: 0,
             srtt_us: 0,
             rttvar_us: 0,
             cwnd: 14600,
@@ -730,6 +783,85 @@ pub fn ts_seq_le(a: u32, b: u32) -> bool {
     a == b || ts_seq_lt(a, b)
 }
 
+/// The timer block's words, in record order: the eight durations
+/// (`TS_TIMER_SPANS`, each at most `TS_TIMER_MAX_MS`) — `rto_ms`,
+/// `retx_rem_ms`, `idle_ms`, `idle_rem_ms`, `persist_rem_ms`,
+/// `closewait_rem_ms`, `closing_rem_ms`, `timewait_rem_ms` — then the RTT
+/// estimator and congestion state (`srtt_us`, `rttvar_us`, `cwnd`,
+/// `ssthresh`). The `Timers` delta carries the same words.
+pub const TS_TIMER_WORDS: usize = 12;
+pub const TS_TIMER_SPANS: usize = 8;
+
+pub fn ts_timer_words(s: &TsState) -> [u32; TS_TIMER_WORDS] {
+    [
+        s.rto_ms,
+        s.retx_rem_ms,
+        s.idle_ms,
+        s.idle_rem_ms,
+        s.persist_rem_ms,
+        s.closewait_rem_ms,
+        s.closing_rem_ms,
+        s.timewait_rem_ms,
+        s.srtt_us,
+        s.rttvar_us,
+        s.cwnd,
+        s.ssthresh,
+    ]
+}
+
+fn ts_set_timer_words(s: &mut TsState, t: &[u32; TS_TIMER_WORDS]) {
+    s.rto_ms = t[0];
+    s.retx_rem_ms = t[1];
+    s.idle_ms = t[2];
+    s.idle_rem_ms = t[3];
+    s.persist_rem_ms = t[4];
+    s.closewait_rem_ms = t[5];
+    s.closing_rem_ms = t[6];
+    s.timewait_rem_ms = t[7];
+    s.srtt_us = t[8];
+    s.rttvar_us = t[9];
+    s.cwnd = t[10];
+    s.ssthresh = t[11];
+}
+
+/// The six remainders: retransmission, idle, persist, CLOSE-WAIT,
+/// CLOSING / LAST-ACK, TIME-WAIT.
+pub fn ts_timer_remainders(s: &TsState) -> [u32; 6] {
+    [
+        s.retx_rem_ms,
+        s.idle_rem_ms,
+        s.persist_rem_ms,
+        s.closewait_rem_ms,
+        s.closing_rem_ms,
+        s.timewait_rem_ms,
+    ]
+}
+
+/// Each remainder (`ts_timer_remainders` order) runs down by what has
+/// passed since it was current (`elapsed_ms[k]`), to `TS_TIMER_DUE` at the
+/// least: an expired timer stays armed and due, never disarmed. What a
+/// standby does before it imports its record: a remainder is current as of
+/// the checkpoint it committed or the delta that last set it
+/// (`md_timers_set`).
+pub fn ts_age_timers(s: &mut TsState, elapsed_ms: &[u64; 6]) {
+    for (t, e) in [
+        &mut s.retx_rem_ms,
+        &mut s.idle_rem_ms,
+        &mut s.persist_rem_ms,
+        &mut s.closewait_rem_ms,
+        &mut s.closing_rem_ms,
+        &mut s.timewait_rem_ms,
+    ]
+    .into_iter()
+    .zip(elapsed_ms)
+    {
+        if *t != 0 {
+            let e = (*e).min(u64::from(u32::MAX)) as u32;
+            *t = t.saturating_sub(e).max(TS_TIMER_DUE);
+        }
+    }
+}
+
 /// Why a checkpoint (or a delta applied to one) was refused.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
@@ -762,6 +894,11 @@ pub enum CkptError {
 /// its bounds or that would not validate.
 pub fn ts_encode(s: &TsState, out: &mut [u8]) -> Result<usize, CkptError> {
     ts_validate(s)?;
+    if s.tcp == TsTcp::Reset {
+        // Validates (a standby's shadow may stand in it), but there is no
+        // connection left to put in a record.
+        return Err(CkptError::UnsupportedState);
+    }
     let n = {
         let mut w = TcW::new(out);
         ts_put(s, &mut w).ok_or(CkptError::Buffer)?;
@@ -815,16 +952,7 @@ fn ts_put(s: &TsState, w: &mut TcW<'_>) -> Option<()> {
         w.bytes(&o.bytes[..usize::from(o.len)])?;
     }
 
-    for v in [
-        s.rto_ms,
-        s.persist_ms,
-        s.keepalive_ms,
-        s.timewait_ms,
-        s.srtt_us,
-        s.rttvar_us,
-        s.cwnd,
-        s.ssthresh,
-    ] {
+    for v in ts_timer_words(s) {
         w.u32(v)?;
     }
 
@@ -980,14 +1108,11 @@ fn ts_get(r: &mut TcR<'_>, s: &mut TsState) -> Result<(), CkptError> {
         o.bytes[..usize::from(len)].copy_from_slice(r.take(usize::from(len)).ok_or(Truncated)?);
     }
 
-    s.rto_ms = r.u32().ok_or(Truncated)?;
-    s.persist_ms = r.u32().ok_or(Truncated)?;
-    s.keepalive_ms = r.u32().ok_or(Truncated)?;
-    s.timewait_ms = r.u32().ok_or(Truncated)?;
-    s.srtt_us = r.u32().ok_or(Truncated)?;
-    s.rttvar_us = r.u32().ok_or(Truncated)?;
-    s.cwnd = r.u32().ok_or(Truncated)?;
-    s.ssthresh = r.u32().ok_or(Truncated)?;
+    let mut t = [0u32; TS_TIMER_WORDS];
+    for x in &mut t {
+        *x = r.u32().ok_or(Truncated)?;
+    }
+    ts_set_timer_words(s, &t);
 
     s.tls_phase = TsTlsPhase::from_u8(r.u8().ok_or(Truncated)?).ok_or(UnknownField)?;
     s.suite = r.u16().ok_or(Truncated)?;
@@ -1081,10 +1206,11 @@ pub fn ts_validate(s: &TsState) -> Result<(), CkptError> {
     {
         return Err(Bounds);
     }
-    for t in [s.rto_ms, s.persist_ms, s.keepalive_ms, s.timewait_ms] {
-        if t > TS_TIMER_MAX_MS {
-            return Err(Bounds);
-        }
+    if ts_timer_words(s)[..TS_TIMER_SPANS]
+        .iter()
+        .any(|&t| t > TS_TIMER_MAX_MS)
+    {
+        return Err(Bounds);
     }
     if s.cwnd == 0 || s.rcv_wnd > (1 << 30) || s.snd_wnd > (1 << 30) {
         return Err(Bounds);
@@ -1115,20 +1241,37 @@ pub fn ts_validate(s: &TsState) -> Result<(), CkptError> {
         }
         floor = o.seq.wrapping_add(u32::from(o.len));
     }
-    // State flags agree with the TCP state.
-    let fin_state = matches!(
-        s.tcp,
-        TsTcp::CloseWait | TsTcp::Closing | TsTcp::LastAck | TsTcp::TimeWait
-    );
-    if s.fin_rcvd != fin_state {
-        return Err(SequenceImpossible);
-    }
-    let local_fin = matches!(
-        s.tcp,
-        TsTcp::FinWait1 | TsTcp::FinWait2 | TsTcp::Closing | TsTcp::LastAck | TsTcp::TimeWait
-    );
-    if s.fin_queued && !local_fin {
-        return Err(SequenceImpossible);
+    // State flags agree with the TCP state, and each timer runs only in the
+    // states that run it. A reset may have come in any state, and stopped
+    // every timer.
+    if s.tcp == TsTcp::Reset {
+        if ts_timer_remainders(s).iter().any(|&t| t != 0) {
+            return Err(SequenceImpossible);
+        }
+    } else {
+        let fin_state = matches!(
+            s.tcp,
+            TsTcp::CloseWait | TsTcp::Closing | TsTcp::LastAck | TsTcp::TimeWait
+        );
+        if s.fin_rcvd != fin_state {
+            return Err(SequenceImpossible);
+        }
+        let local_fin = matches!(
+            s.tcp,
+            TsTcp::FinWait1 | TsTcp::FinWait2 | TsTcp::Closing | TsTcp::LastAck | TsTcp::TimeWait
+        );
+        if s.fin_queued && !local_fin {
+            return Err(SequenceImpossible);
+        }
+        let armed_wrong = (s.retx_rem_ms != 0 && s.snd_una == s.send_end())
+            || (s.idle_rem_ms != 0 && (s.tcp != TsTcp::Established || s.idle_rem_ms > s.idle_ms))
+            || (s.persist_rem_ms != 0 && s.snd_wnd != 0)
+            || (s.closewait_rem_ms != 0 && s.tcp != TsTcp::CloseWait)
+            || (s.closing_rem_ms != 0 && !matches!(s.tcp, TsTcp::Closing | TsTcp::LastAck))
+            || (s.timewait_rem_ms != 0 && s.tcp != TsTcp::TimeWait);
+        if armed_wrong {
+            return Err(SequenceImpossible);
+        }
     }
 
     // The outbound records tile the send buffer exactly: contiguous from the
@@ -1613,7 +1756,12 @@ tc_wire_enum!(
     /// transition (`TcTransport::Quic`): the provider's own per-layer
     /// delta, `[layer_no u32][kind u8][data]`, carried whole (the QUIC
     /// section below); not a TCP/TLS transition — `md_apply` refuses it,
-    /// and a relay checks its order and chain like any delta's.
+    /// and a relay checks its order and chain like any delta's. `Reset` is
+    /// the connection's end by a reset, `[dir u8][seq u32][ack u32]`: the
+    /// peer's (`MD_DIR_IN`, the RST it sent, at its sequence number) or ours
+    /// (`MD_DIR_OUT`, the RST we send, at ours; a strict primary puts it on
+    /// the wire only once its standby holds this delta). It leaves the
+    /// record terminal (`TsTcp::Reset`).
     MdKind {
         RxSegment = 1,
         RxRecord = 2,
@@ -1625,6 +1773,7 @@ tc_wire_enum!(
         Fin = 8,
         CloseNotify = 9,
         Timers = 10,
+        Reset = 11,
         QuicDelta = 12,
     }
 );
@@ -1852,33 +2001,79 @@ pub fn md_dir(out: &mut [u8], dir: u8) -> Option<usize> {
     Some(w.at)
 }
 
-/// The timer snapshot, as remaining durations at the primary.
+/// The timer block as the primary holds it when the delta is emitted: the
+/// retransmission interval and idle period, each timer's remainder (0
+/// disarmed, `TS_TIMER_DUE` due), the RTT estimator and congestion state —
+/// `TsState`'s timer fields, in `ts_timer_words` order. A `Timers` delta
+/// sets them all; each must be armed only where the record's state runs it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct MdTimers {
     pub rto_ms: u32,
-    pub persist_ms: u32,
-    pub keepalive_ms: u32,
-    pub timewait_ms: u32,
+    pub retx_rem_ms: u32,
+    pub idle_ms: u32,
+    pub idle_rem_ms: u32,
+    pub persist_rem_ms: u32,
+    pub closewait_rem_ms: u32,
+    pub closing_rem_ms: u32,
+    pub timewait_rem_ms: u32,
     pub srtt_us: u32,
     pub rttvar_us: u32,
     pub cwnd: u32,
     pub ssthresh: u32,
 }
 
+impl MdTimers {
+    fn words(&self) -> [u32; TS_TIMER_WORDS] {
+        [
+            self.rto_ms,
+            self.retx_rem_ms,
+            self.idle_ms,
+            self.idle_rem_ms,
+            self.persist_rem_ms,
+            self.closewait_rem_ms,
+            self.closing_rem_ms,
+            self.timewait_rem_ms,
+            self.srtt_us,
+            self.rttvar_us,
+            self.cwnd,
+            self.ssthresh,
+        ]
+    }
+
+    /// The block a record holds.
+    pub fn of(s: &TsState) -> Self {
+        Self {
+            rto_ms: s.rto_ms,
+            retx_rem_ms: s.retx_rem_ms,
+            idle_ms: s.idle_ms,
+            idle_rem_ms: s.idle_rem_ms,
+            persist_rem_ms: s.persist_rem_ms,
+            closewait_rem_ms: s.closewait_rem_ms,
+            closing_rem_ms: s.closing_rem_ms,
+            timewait_rem_ms: s.timewait_rem_ms,
+            srtt_us: s.srtt_us,
+            rttvar_us: s.rttvar_us,
+            cwnd: s.cwnd,
+            ssthresh: s.ssthresh,
+        }
+    }
+}
+
 pub fn md_timers(out: &mut [u8], t: &MdTimers) -> Option<usize> {
     let mut w = TcW::new(out);
-    for v in [
-        t.rto_ms,
-        t.persist_ms,
-        t.keepalive_ms,
-        t.timewait_ms,
-        t.srtt_us,
-        t.rttvar_us,
-        t.cwnd,
-        t.ssthresh,
-    ] {
+    for v in t.words() {
         w.u32(v)?;
     }
+    Some(w.at)
+}
+
+/// A reset: `dir` the peer's (`MD_DIR_IN`) or ours (`MD_DIR_OUT`), and the
+/// segment's sequence and acknowledgement numbers.
+pub fn md_reset(out: &mut [u8], dir: u8, seq: u32, ack: u32) -> Option<usize> {
+    let mut w = TcW::new(out);
+    w.u8(dir)?;
+    w.u32(seq)?;
+    w.u32(ack)?;
     Some(w.at)
 }
 
@@ -1896,6 +2091,10 @@ fn md_end(r: &TcR<'_>) -> Result<(), CkptError> {
 fn md_apply_raw(s: &mut TsState, kind: MdKind, p: &[u8]) -> Result<(), CkptError> {
     use CkptError::*;
     let mut r = TcR::new(p);
+    if s.tcp == TsTcp::Reset {
+        // The connection is over: nothing follows its reset.
+        return Err(SequenceImpossible);
+    }
     match kind {
         MdKind::RxSegment => {
             let seq = r.u32().ok_or(Truncated)?;
@@ -1941,6 +2140,7 @@ fn md_apply_raw(s: &mut TsState, kind: MdKind, p: &[u8]) -> Result<(), CkptError
                     };
                     s.ooo_count -= 1;
                 }
+                md_payload_moved(s);
                 Ok(())
             } else if ts_seq_lt(s.rcv_nxt, seq) {
                 if usize::from(len) > TS_OOO_SEG || usize::from(s.ooo_count) == TS_OOO_MAX {
@@ -1969,6 +2169,7 @@ fn md_apply_raw(s: &mut TsState, kind: MdKind, p: &[u8]) -> Result<(), CkptError
                 o.len = len;
                 o.bytes[..bytes.len()].copy_from_slice(bytes);
                 s.ooo_count += 1;
+                md_payload_moved(s);
                 Ok(())
             } else {
                 Err(SequenceImpossible)
@@ -2101,6 +2302,12 @@ fn md_apply_raw(s: &mut TsState, kind: MdKind, p: &[u8]) -> Result<(), CkptError
             if production_id != 0 {
                 s.next_production += 1;
             }
+            // Data to send arms the retransmission timer if it is not
+            // running (RFC 6298 §5.1).
+            if s.retx_rem_ms == 0 {
+                s.retx_rem_ms = s.rto_ms;
+            }
+            md_payload_moved(s);
             Ok(())
         }
         MdKind::PeerAck => {
@@ -2139,13 +2346,32 @@ fn md_apply_raw(s: &mut TsState, kind: MdKind, p: &[u8]) -> Result<(), CkptError
                 s.snd_nxt = ack;
             }
             s.snd_wnd = wnd;
+            if n != 0 {
+                // New data acknowledged: the retransmission timer restarts
+                // while anything is still outstanding, and stops when nothing
+                // is (RFC 6298 §5.2, §5.3).
+                s.retx_rem_ms = if s.snd_una == s.send_end() {
+                    0
+                } else {
+                    s.rto_ms
+                };
+            }
             if fin_acked {
                 s.fin_queued = false;
                 s.tcp = match s.tcp {
                     TsTcp::FinWait1 => TsTcp::FinWait2,
-                    TsTcp::Closing => TsTcp::TimeWait,
+                    TsTcp::Closing => {
+                        s.closing_rem_ms = 0;
+                        TsTcp::TimeWait
+                    }
                     other => other,
                 };
+                if s.snd_una == s.send_end() {
+                    s.retx_rem_ms = 0;
+                }
+            }
+            if s.snd_wnd != 0 {
+                s.persist_rem_ms = 0;
             }
             Ok(())
         }
@@ -2203,6 +2429,8 @@ fn md_apply_raw(s: &mut TsState, kind: MdKind, p: &[u8]) -> Result<(), CkptError
             let dir = r.u8().ok_or(Truncated)?;
             md_end(&r)?;
             match dir {
+                // A state change stops the timers the new state does not run;
+                // those it starts come with the `Timers` delta that follows.
                 MD_DIR_IN if !s.fin_rcvd && s.ooo_count == 0 => {
                     s.fin_rcvd = true;
                     s.rcv_nxt = s.rcv_nxt.wrapping_add(1);
@@ -2212,6 +2440,7 @@ fn md_apply_raw(s: &mut TsState, kind: MdKind, p: &[u8]) -> Result<(), CkptError
                         TsTcp::FinWait2 => TsTcp::TimeWait,
                         _ => return Err(SequenceImpossible),
                     };
+                    s.idle_rem_ms = 0;
                 }
                 MD_DIR_OUT if !s.fin_queued => {
                     s.fin_queued = true;
@@ -2220,6 +2449,8 @@ fn md_apply_raw(s: &mut TsState, kind: MdKind, p: &[u8]) -> Result<(), CkptError
                         TsTcp::CloseWait => TsTcp::LastAck,
                         _ => return Err(SequenceImpossible),
                     };
+                    s.idle_rem_ms = 0;
+                    s.closewait_rem_ms = 0;
                 }
                 _ => return Err(SequenceImpossible),
             }
@@ -2236,22 +2467,66 @@ fn md_apply_raw(s: &mut TsState, kind: MdKind, p: &[u8]) -> Result<(), CkptError
             Ok(())
         }
         MdKind::Timers => {
-            let mut v = [0u32; 8];
+            let mut v = [0u32; TS_TIMER_WORDS];
             for x in &mut v {
                 *x = r.u32().ok_or(Truncated)?;
             }
             md_end(&r)?;
-            s.rto_ms = v[0];
-            s.persist_ms = v[1];
-            s.keepalive_ms = v[2];
-            s.timewait_ms = v[3];
-            s.srtt_us = v[4];
-            s.rttvar_us = v[5];
-            s.cwnd = v[6];
-            s.ssthresh = v[7];
+            ts_set_timer_words(s, &v);
+            Ok(())
+        }
+        MdKind::Reset => {
+            let dir = r.u8().ok_or(Truncated)?;
+            let _seq = r.u32().ok_or(Truncated)?;
+            let _ack = r.u32().ok_or(Truncated)?;
+            md_end(&r)?;
+            if dir != MD_DIR_IN && dir != MD_DIR_OUT {
+                return Err(UnknownField);
+            }
+            s.tcp = TsTcp::Reset;
+            s.retx_rem_ms = 0;
+            s.idle_rem_ms = 0;
+            s.persist_rem_ms = 0;
+            s.closewait_rem_ms = 0;
+            s.closing_rem_ms = 0;
+            s.timewait_rem_ms = 0;
             Ok(())
         }
         MdKind::QuicDelta => Err(UnknownField),
+    }
+}
+
+/// Which remainders (bit `k`, `ts_timer_remainders` order) a delta of
+/// `kind` set — changed, or started again at the value they held: what
+/// each remainder is current as of. `before` is the record's remainders and
+/// `before_una` its SND.UNA before the delta, `after` the record after it.
+/// A `Timers` delta sets them all; sending starts the retransmission timer
+/// when it was not running, an acknowledgement of new data restarts it, and
+/// a payload byte restarts the idle close.
+pub fn md_timers_set(before: &[u32; 6], before_una: u32, after: &TsState, kind: MdKind) -> u8 {
+    let b = before;
+    let a = ts_timer_remainders(after);
+    let mut set = 0u8;
+    for k in 0..6 {
+        if a[k] != b[k] {
+            set |= 1 << k;
+        }
+    }
+    match kind {
+        MdKind::Timers => set = 0x3F,
+        MdKind::TxRecord => set |= 1 << 1,
+        MdKind::RxSegment => set |= 1 << 1,
+        MdKind::PeerAck if after.snd_una != before_una => set |= 1,
+        _ => {}
+    }
+    set
+}
+
+/// A payload byte moved, in either direction: the idle close restarts at its
+/// period.
+fn md_payload_moved(s: &mut TsState) {
+    if s.tcp == TsTcp::Established && s.idle_ms != 0 {
+        s.idle_rem_ms = s.idle_ms;
     }
 }
 
@@ -2485,6 +2760,29 @@ pub mod tc_evt {
     /// `[handle][kind u8][bytes]` (`tc_custody`): a standby's evidence, a
     /// primary's wrapped key.
     pub const CUSTODY: u8 = 0x88;
+    /// `[handle][why u8][dir u8]` (`tc_end`): the flow ended — not a loss.
+    /// The connection is over, so there is nothing to protect: a primary
+    /// stops its pairing without an `ABORT` / `MIRROR` STATUS (an anchor
+    /// counts no downgrade), and a standby whose shadow applied the end
+    /// holds the flow's tombstone and refuses `EMISSION_ARM`, `ACTIVATE`
+    /// and `CUT_IMPORT` with `tc_end::REFUSED`. On a reset the primary sends
+    /// it once its standby holds the `Reset` delta (ours) or at once (the
+    /// peer's); the standby sends it when it applies that delta. Either side
+    /// answers a later `RETIRE` / `ABORT` with `OK` and lets the slot go.
+    pub const ENDED: u8 = 0x89;
+}
+
+/// How a flow ended (`tc_evt::ENDED`).
+pub mod tc_end {
+    /// A reset; `dir` is whose (`MD_DIR_IN` the peer's, `MD_DIR_OUT` ours).
+    pub const RESET: u8 = 1;
+    /// The connection closed: both FINs exchanged and ours acknowledged,
+    /// TIME-WAIT over, or a closing state's bound spent; `dir` 0.
+    pub const CLOSED: u8 = 2;
+    /// STATUS `reason` (with `tc_st::UNSUPPORTED`) refusing an operation on
+    /// a flow that ended: there is no connection to arm, activate, import,
+    /// quiesce or export.
+    pub const REFUSED: u8 = 0x90;
 }
 
 /// The vault-to-vault transfer CUSTODY_* carries: opaque to an anchor, which

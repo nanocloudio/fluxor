@@ -455,7 +455,14 @@ pub const DELTA_TCP_SEND: u8 = 1;
 pub const DELTA_TCP_RECV: u8 = 2;
 /// TCP: acknowledgement from the peer reclaimed send bytes / window.
 pub const DELTA_TCP_ACKED: u8 = 3;
-/// TCP: timer or congestion-state change without bytes.
+/// TCP: a state change without bytes — its timers and congestion state as
+/// they stand after it. `ip`'s payload:
+///   [state:1][rto:2 LE][srtt:2 LE][rttvar:2 LE][cwnd:2 LE][ssthresh:2 LE]
+///   [retx_rem_ms:4 LE][idle_ms:4 LE][idle_rem_ms:4 LE]
+///   [closewait_rem_ms:4 LE][closing_rem_ms:4 LE][timewait_rem_ms:4 LE]
+/// `state` is `ip`'s record code (`FXTC`, TIME-WAIT included); each
+/// remainder is what is left of a timer the new state runs, 0 when it runs
+/// none, 1 when it is due (`TRANSPORT_CONTINUITY`'s `TS_TIMER_DUE`).
 pub const DELTA_TCP_TIMERS: u8 = 4;
 /// TLS: a record is about to be handed to the transport — its
 /// ciphertext, write epoch and sequence, so the standby retransmits the
@@ -500,6 +507,16 @@ pub const DELTA_TLS_RECV_BYTES: u8 = 12;
 /// consumer (`net_proto::MSG_RESUMED`).
 ///   [consumed: 8 LE][consumer_cursor: 8 LE][cursor_at: 8 LE]
 pub const DELTA_TLS_DELIVERED: u8 = 0x81;
+/// TCP: the connection ended by a reset — the peer's, accepted
+/// (RFC 5961 rules), or ours. The provider hears it before the connection
+/// is released; ours goes on the wire only once this delta is acknowledged
+/// (a strict pair: held at the send horizon like a FIN).
+///   [dir:1][seq:4 LE][ack:4 LE]     dir 1 the peer's, 2 ours
+pub const DELTA_TCP_RESET: u8 = 13;
+/// TCP: the connection completed its close and is released — our FIN
+/// acknowledged in LAST-ACK, TIME-WAIT over, or a closing state's bound
+/// spent. No payload. Nothing more of the connection follows.
+pub const DELTA_TCP_CLOSED: u8 = 14;
 /// `tls`'s own close: the consumer closed and our close_notify is sealed
 /// (no payload). The alert's ciphertext is the RECORD_OUT before it; the
 /// transport FIN that follows is `ip`'s SEND with its FIN flag. A session
@@ -511,8 +528,19 @@ pub const DELTA_TLS_CLOSE_SENT: u8 = 0x82;
 /// Abort reasons (`ABORT` `reason`, `CONTINUITY{ABORTED}` body).
 pub const ABORT_COORDINATOR: u8 = 1;
 pub const ABORT_IMPORT_FAILED: u8 = 2;
+/// The mirror could not carry a transition (its channel refused a delta,
+/// the standby answered out of order, a delta was past what it represents).
 pub const ABORT_MIRROR_LOST: u8 = 3;
 pub const ABORT_UNSUPPORTED_STATE: u8 = 4;
+/// A strict layer abandoned its pairing because the peer acknowledged none
+/// of the outbound records held at the record ceiling (`STRICT_TX_RECORDS`)
+/// within its horizon budget (`tls`'s `txrec_cap_abandoned`).
+pub const ABORT_TXREC_CAP: u8 = 5;
+/// ... because its consumer consumed nothing while the redelivery caps held
+/// within the horizon budget (`tls`'s `redeliver_cap_abandoned`).
+pub const ABORT_REDELIVER_CAP: u8 = 6;
+/// ... because its standby left a horizon unanswered past the budget.
+pub const ABORT_HORIZON_BUDGET: u8 = 7;
 
 /// Prepare a standby slot for `flow_id` — reserves the shadow and its
 /// buffers before the connection is promised migration. Refused
@@ -788,6 +816,16 @@ pub const CR_ABORTED: u8 = 11;
 /// key, UNWRAP nothing; `reason` is `custody::why` when `status` is not
 /// STATUS_OK.
 pub const CR_CUSTODY: u8 = 12;
+/// Unsolicited, from a layer whose paired session ended with its
+/// connection (the transport reset or closed it, `net_proto::CLOSED_GONE`)
+/// rather than being abandoned: the flow is over, which is no loss of the
+/// pairing (`CR_ABORTED`). Sent after every delta the session emitted.
+/// Body: [why:1] — `END_RESET`, `END_CLOSED`, or `END_TRANSPORT` when the
+/// layer cannot tell (the transport below names it).
+pub const CR_ENDED: u8 = 13;
+pub const END_TRANSPORT: u8 = 0;
+pub const END_RESET: u8 = 1;
+pub const END_CLOSED: u8 = 2;
 
 /// Fixed-size continuity payload lengths.
 pub const FLOW_ID_BYTES: usize = 16;
