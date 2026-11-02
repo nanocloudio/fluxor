@@ -12,6 +12,11 @@ contract opcodes onto a PKCS#11 token:
 `SIGN` → raw `CKM_ECDSA` folded to low-s, `ECDH` → `CKM_ECDH1_DERIVE`,
 `PUBLIC` → `CKA_EC_POINT`. `VERIFY` delegates to the kernel software
 implementation (touches no custodial material); `STORE` is `ENOSYS`.
+`OPEN_OR_GENERATE` / `OPEN` with `PERSIST` make and reopen token objects
+named per module type and label, so a restarted process gets the same key;
+the usage mask is sealed into `CKA_ID` and checked, never widened, on
+reopen. `DESTROY_BY_LABEL` removes them. The layout is in the source's
+top comment and in `docs/architecture/security.md`.
 
 It registers at platform boot via `try_register_from_env`, replacing the
 kernel software backend's class dispatch + vtable — the platform-

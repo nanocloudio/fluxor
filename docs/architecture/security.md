@@ -320,7 +320,9 @@ cannot be opened leaves the software backend alone.
 | --- | --- |
 | An operation on a handle | The backend that minted it; each backend resolves only its own handles |
 | `GENERATE`, `SUITE_QUERY` for a suite the token serves (P-256) | The token |
-| Labels, `STORE`, symmetric and every other suite | Software |
+| `OPEN`, `OPEN_OR_GENERATE` for a suite the token serves | Software if it holds the label, else the token if it does; a new key is made in the token when it is asked to `PERSIST` with uses the token permits, in software otherwise |
+| `DESTROY_BY_LABEL` | Both: removed wherever the label is held |
+| Other labels, `STORE`, symmetric and every other suite | Software |
 | `TIER` | The token when present: the backend that holds identity keys |
 | `SHARE_REWRAP`, `SHARE_COMBINE`, `ATTEST_KEY` | The router, reaching each key through `ECDH`, `PUBLIC`, `SIGN` and `DESCRIBE` on its own backend |
 
@@ -329,6 +331,29 @@ shares opened by a token recipient key is a software session key:
 - the agreed secrets cross only bounded kernel scratch, zeroed on every
   path;
 - `DESCRIBE` and `ATTEST_KEY` report it `SOFTWARE`, never the token's tier.
+
+The token's keys come in two lifetimes. An unlabelled `GENERATE` key is a
+PKCS#11 session object, gone with the process whatever its mask says: it has
+no name to be reopened by. A labelled key asked to `PERSIST` is a pair of
+token objects (`CKA_TOKEN=true`, the private half sensitive and never
+extractable), and a later process — a new session on the same token —
+reopens it by the same name with the same public key:
+- the name is the token's `CKA_LABEL`, `fluxor-kv/<namespace>/<label>` with
+  the caller's module type as eight hex digits and the label in hex, so
+  labels are per module type exactly as in software;
+- the usage mask is sealed at creation into `CKA_ID`
+  (`FXVK ‖ namespace:u32 ‖ suite:u16 ‖ usage:u32`, little-endian), both
+  halves created `CKA_MODIFIABLE=false`, and every reopen CHECKS it: another
+  suite or a wider mask is `EACCES`, never a widened key;
+- the contract's other answers are the software backend's: `ENOENT` for
+  `OPEN` of an absent label, `EBUSY` for a key another instance of the type
+  holds open, `ENOMEM` with no slot, `ERANGE` before anything is made;
+- lookup and creation run under the backend's one session lock, so within a
+  process "is it there?" and "make it" are one step. PKCS#11 offers nothing
+  across processes; a name the token holds two private keys under is refused
+  rather than resolved by picking one;
+- `DESCRIBE` reports it persisted; `DESTROY` frees its handle and leaves it
+  on the token, and `DESTROY_BY_LABEL` removes both objects.
 
 A share opener must permit `AGREE` and `EXPORT_PUBLIC`: the router names the
 recipient by its public key. A token key cannot be split (`ENOSYS`), and its

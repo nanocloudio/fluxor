@@ -5,8 +5,18 @@
 //! resolves only its own handles, so an operation on a handle goes to that
 //! backend and nowhere else. An operation without a handle goes where its
 //! suite is served: a hardware backend generates the suites it supports —
-//! the identity and attachment-recipient keys — and labels, imports and
-//! symmetric keys stay in software.
+//! the identity and attachment-recipient keys — and imports and symmetric
+//! keys stay in software.
+//!
+//! A label names one key across both backends. A lookup of a suite the
+//! hardware serves asks software first, then the token, so a key either
+//! already holds is the one opened — a software key persisted before the
+//! token was configured keeps its identity. Only when neither has it is one
+//! made: in the token when it is asked to persist with uses the token can
+//! give (a token object is what survives a restart there), in software
+//! otherwise, where labels that die with the process have always lived.
+//! Every step runs inside the one dispatch, so "is it there?" and "make it"
+//! stay one operation. A destroy by label goes to both.
 //!
 //! Operations that span keys — opening share envelopes, attesting a key —
 //! reach each key through the contract's own opcodes on whichever backend
@@ -16,7 +26,7 @@
 //! made is reported as the software tier it is.
 
 use crate::abi::contracts::key_vault as kv;
-use crate::abi::errno::{EACCES, EINVAL, ENOMEM, ENOSYS, ERANGE, ERROR};
+use crate::abi::errno::{EACCES, EINVAL, ENOENT, ENOMEM, ENOSYS, ERANGE, ERROR};
 use crate::kernel::ipc::fd;
 use crate::kernel::security::crypto::sha256::Sha256;
 use crate::kernel::security::key_share;
@@ -55,9 +65,15 @@ pub fn is_hardware(handle: i32) -> bool {
 
 /// Whether the hardware backend serves `suite`.
 unsafe fn hardware_serves(hw: Dispatch, suite: u16) -> bool {
+    hardware_usage(hw, suite).is_some()
+}
+
+/// The uses the hardware backend permits for `suite`, if it serves it.
+unsafe fn hardware_usage(hw: Dispatch, suite: u16) -> Option<u32> {
     let mut q = [0u8; 14];
     q[..2].copy_from_slice(&suite.to_le_bytes());
-    hw(-1, kv::SUITE_QUERY, q.as_mut_ptr(), q.len()) >= 0
+    (hw(-1, kv::SUITE_QUERY, q.as_mut_ptr(), q.len()) >= 0)
+        .then(|| u32::from_le_bytes([q[4], q[5], q[6], q[7]]))
 }
 
 /// The backend `handle` names.
@@ -88,6 +104,27 @@ pub unsafe fn dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -
                 _ => software::provider_dispatch(handle, opcode, arg, arg_len),
             }
         }
+        kv::OPEN | kv::OPEN_OR_GENERATE if handle < 0 && arg_len >= 8 && !arg.is_null() => {
+            open_by_label(handle, opcode, arg, arg_len)
+        }
+        kv::DESTROY_BY_LABEL if handle < 0 => {
+            let sw = software::provider_dispatch(handle, opcode, arg, arg_len);
+            let Some(hw) = hardware() else {
+                return sw;
+            };
+            let hw = hw(handle, opcode, arg, arg_len);
+            // A refusal from either is the answer, so a key one backend
+            // could not remove is never reported gone.
+            if sw < 0 && sw != ENOENT {
+                sw
+            } else if hw < 0 && hw != ENOENT {
+                hw
+            } else if sw == 0 || hw == 0 {
+                0
+            } else {
+                ENOENT
+            }
+        }
         // The tier of the backend that holds the identity keys a node
         // attests with; each key's own custody is its `DESCRIBE`.
         kv::TIER => match hardware() {
@@ -98,6 +135,42 @@ pub unsafe fn dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -
             Ok(b) => b(handle, opcode, arg, arg_len),
             Err(e) => e,
         },
+    }
+}
+
+/// `OPEN` / `OPEN_OR_GENERATE` across both backends: software first, then
+/// the token, then — for `OPEN_OR_GENERATE` with neither holding the key —
+/// made in the token if it is asked to persist with uses the token permits,
+/// in software otherwise. Any answer other than `ENOENT` (the key
+/// itself, or `EBUSY`, `EACCES`, `EAGAIN`, `ERANGE`, ...) is final: a key
+/// that exists somewhere is never made again somewhere else.
+///
+/// # Safety
+/// `arg` valid for `arg_len` bytes (at least 8).
+unsafe fn open_by_label(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
+    let suite = u16::from_le_bytes([*arg, *arg.add(1)]);
+    let usage = u32::from_le_bytes([*arg.add(2), *arg.add(3), *arg.add(4), *arg.add(5)]);
+    let (hw, hw_usage) = match hardware() {
+        Some(hw) => match hardware_usage(hw, suite) {
+            Some(u) => (hw, u),
+            None => return software::provider_dispatch(handle, opcode, arg, arg_len),
+        },
+        None => return software::provider_dispatch(handle, opcode, arg, arg_len),
+    };
+    let rc = software::provider_dispatch(handle, kv::OPEN, arg, arg_len);
+    if rc != ENOENT {
+        return rc;
+    }
+    let rc = hw(handle, kv::OPEN, arg, arg_len);
+    if rc != ENOENT || opcode == kv::OPEN {
+        return rc;
+    }
+    // A use the token cannot give (WRAP: its key's bytes are nowhere to
+    // wrap) keeps the key in software rather than refusing it.
+    if usage & kv::usage::PERSIST != 0 && usage & !hw_usage == 0 {
+        hw(handle, opcode, arg, arg_len)
+    } else {
+        software::provider_dispatch(handle, opcode, arg, arg_len)
     }
 }
 

@@ -46,7 +46,7 @@
 //! - What else reads a listed blob reads bytes, never code: this record and
 //!   the node's module digests (`code_pack::node_digests`) hash the table
 //!   entry; the hints pass (`collect_one_module_hints`) validates before it
-//!   reads the manifest; fan framing (`fanned_port_frame_kind`) and an add's
+//!   reads the manifest; fan framing (`declared_port_frame_kind`) and an add's
 //!   permission pre-check (`live::module_permissions`) read manifest fields
 //!   only. Those reads stay inside the entry's footprint, which the table's
 //!   load bounded (`validate_table_layout` covers the header, code, data,

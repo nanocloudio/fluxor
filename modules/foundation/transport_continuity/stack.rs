@@ -1937,6 +1937,13 @@ impl TcsFlow {
     fn flow_id(&self) -> [u8; 16] {
         self.carried.flow_id
     }
+
+    /// The flow's end is in the record — `ip`'s reset, or an end awaiting
+    /// its report (our reset until the standby holds it): a `tls` delta
+    /// read now was overtaken by it.
+    fn tls_overtaken(&self) -> bool {
+        self.end_pending || self.st.tcp == TsTcp::Reset
+    }
 }
 
 /// A per-layer record arriving from a primary's export.
@@ -2434,7 +2441,9 @@ impl TcStack {
     /// outbound table or send buffer is full, for `ip`'s acknowledgement on
     /// the other port to free it. Each is room the standby's or the peer's
     /// acknowledgement makes, so a full table is a wait, never the end of
-    /// the pairing. Any other frame is taken at once.
+    /// the pairing — except once the flow's end overtook it (`ip`'s reset:
+    /// no acknowledgement frees that table again, and the record is taken,
+    /// not applied). Any other frame is taken at once.
     pub fn layer_room<O: TcsOut>(&mut self, port: TcsPort, frame: &[u8], out: &O) -> bool {
         if frame.len() < TCS_HDR + sc::FLOW_HEADER_LEN {
             return true;
@@ -2453,6 +2462,7 @@ impl TcStack {
             && out.room(TcsPort::Evt) >= TCS_FRAME_EVT;
         if room
             && !on_ip
+            && !c.tls_overtaken()
             && frame[0] == sc::CMD_SC_DELTA_APPLY
             && p.len() >= sc::DELTA_APPLY_HEADER_LEN + 14
             && p[60] == sc::DELTA_TLS_RECORD_OUT
@@ -3439,6 +3449,20 @@ impl TcStack {
         half.last = no;
         let cond = if on_ip {
             self.ip_delta(i, kind, body, out)
+        } else if self.flows[i].tls_overtaken() {
+            // The flow's own end overtook this `tls` delta: it was sent
+            // before `ip`'s end but read after it — the halves are separate
+            // ports, `ip`'s read first, and a RECORD_OUT may wait on its own
+            // (`layer_room`). Nothing follows the end in the record, and
+            // nothing the delta describes reaches the wire (an abortive
+            // close writes nothing `tls` held), so it is taken in its
+            // number, not applied. Our reset still waits for the standby's
+            // acknowledgement (`try_end`), the pairing intact. (`ip`'s own
+            // stream is ordered: nothing of its own follows its end, and
+            // its FIN cannot pass the records before it — `tls` closes
+            // only after every record, and `ip` gates one transition at a
+            // time.)
+            Ok(TcsCond::Free)
         } else {
             self.tls_delta(i, kind, body, out)
         };

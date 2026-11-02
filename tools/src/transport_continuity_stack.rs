@@ -3101,6 +3101,159 @@ mod tests {
         assert!(a.events().is_empty());
     }
 
+    /// Our reset overtakes a `tls` delta sent before it: the halves are
+    /// separate ports (`ip`'s read first, and a RECORD_OUT may wait on its
+    /// own), so the record `tls` sealed just before its consumer's abortive
+    /// close can arrive after `ip`'s `Reset`. That record never reaches the
+    /// wire; it is taken, not applied, and the pairing holds: the RST still
+    /// waits for the standby, and the flow ENDS by our reset.
+    #[test]
+    fn a_tls_delta_overtaken_by_our_reset_does_not_lose_the_pairing() {
+        let (mut a, mut b, ha, hb) = crash_paired();
+        a.feed_half(
+            TcsPort::Ip,
+            &half_delta(
+                &flow(),
+                1,
+                sc::DELTA_TCP_RESET,
+                &reset_body(MD_DIR_OUT, 5000, 80_000),
+            ),
+        );
+        let late = half_delta(
+            &tls_flow(),
+            1,
+            sc::DELTA_TLS_RECORD_OUT,
+            &record_out(9, 26, 86),
+        );
+        assert!(a.offer(TcsPort::Tls, &late), "taken");
+        let evs = a.events();
+        assert_eq!(kinds(&evs), vec![MdKind::Reset]);
+        assert!(
+            !aborted(&evs),
+            "a delta after our reset is no loss: {evs:?}"
+        );
+        assert!(a.ip.aborts.is_empty() && a.tls.aborts.is_empty());
+        assert!(a.ip.acks.is_empty(), "the RST waits");
+        assert_eq!(a.tls.acks.last(), Some(&1), "tls's number taken");
+        let ds: Vec<Vec<u8>> = evs
+            .iter()
+            .filter(|(t, _)| *t == tc_evt::DELTA)
+            .map(|(_, p)| p[8..].to_vec())
+            .collect();
+        let bev = relay_all(&mut b, &hb, &ds);
+        let top = bev
+            .iter()
+            .filter(|(t, _)| *t == tc_evt::APPLIED)
+            .map(|(_, p)| u64::from_le_bytes(p[16..24].try_into().expect("seq")))
+            .max()
+            .expect("applied");
+        a.op(tc_op::DELTA_ACK, &[&ha[..], &top.to_le_bytes()].concat());
+        assert_eq!(a.ip.acks.last(), Some(&1), "the RST released");
+        assert_eq!(ended(&a.events()), Some((tc_end::RESET, MD_DIR_OUT)));
+    }
+
+    /// The whole class: every `tls` delta kind, overtaken by each of the
+    /// flow's ends — our reset (the pairing waits for the standby), the
+    /// peer's reset and a completed close (the flow ends at once) — is
+    /// never the pairing's loss, and the end is reported as it is.
+    #[test]
+    fn any_tls_delta_overtaken_by_the_flows_end_is_no_loss() {
+        let mut ku = vec![0u8];
+        ku.extend_from_slice(&1u32.to_le_bytes());
+        ku.extend_from_slice(&0u16.to_le_bytes());
+        let mut delivered = 1u64.to_le_bytes().to_vec();
+        delivered.extend_from_slice(&0u64.to_le_bytes());
+        delivered.extend_from_slice(&0u64.to_le_bytes());
+        let mut recv = 3u32.to_le_bytes().to_vec();
+        recv.extend_from_slice(&[0x17, 3, 3]);
+        let lates: [(u8, Vec<u8>); 5] = [
+            (sc::DELTA_TLS_RECORD_OUT, record_out(9, 26, 86)),
+            (sc::DELTA_TLS_CLOSE_SENT, Vec::new()),
+            (sc::DELTA_TLS_KEY_UPDATE, ku),
+            (TCS_TLS_DELIVERED, delivered),
+            (sc::DELTA_TLS_RECV_BYTES, recv),
+        ];
+        for (kind, body) in &lates {
+            for end in ["ours", "peers", "closed"] {
+                let (mut a, _b, _ha, _hb) = crash_paired();
+                let (k, b) = match end {
+                    "ours" => (sc::DELTA_TCP_RESET, reset_body(MD_DIR_OUT, 5000, 80_000)),
+                    "peers" => (sc::DELTA_TCP_RESET, reset_body(MD_DIR_IN, 80_000, 5000)),
+                    _ => (sc::DELTA_TCP_CLOSED, Vec::new()),
+                };
+                a.feed_half(TcsPort::Ip, &half_delta(&flow(), 1, k, &b));
+                let late = half_delta(&tls_flow(), 1, *kind, body);
+                assert!(a.offer(TcsPort::Tls, &late), "{end}/{kind:#x} taken");
+                let evs = a.events();
+                assert!(!aborted(&evs), "{end}/{kind:#x}: {evs:?}");
+                assert!(a.lost().is_none(), "{end}/{kind:#x}");
+                assert!(a.ip.aborts.is_empty() && a.tls.aborts.is_empty());
+                let want = match end {
+                    "ours" => None,
+                    "peers" => Some((tc_end::RESET, MD_DIR_IN)),
+                    _ => Some((tc_end::CLOSED, 0)),
+                };
+                if want.is_some() {
+                    assert!(!kinds(&evs).contains(&MdKind::TxRecord));
+                }
+                let fa = a.p.flow(&flow()).expect("a");
+                assert_eq!(fa.mirroring, want.is_none(), "{end}/{kind:#x}");
+            }
+        }
+    }
+
+    /// A RECORD_OUT waiting on a full outbound table when our reset comes:
+    /// no acknowledgement frees that table again, so it is taken at once
+    /// (not applied), and `tls`'s CONTINUITY{ENDED} behind it is not stuck.
+    #[test]
+    fn a_record_out_held_on_a_full_table_is_taken_once_our_reset_overtakes_it() {
+        let (mut a, _b, ha, _hb) = crash_paired();
+        let tf = tls_flow();
+        let mut seq = 9u64;
+        for no in 1..=TS_TXREC_MAX as u32 {
+            let f = half_delta(
+                &tf,
+                no,
+                sc::DELTA_TLS_RECORD_OUT,
+                &record_out(seq, 26, 77 + seq),
+            );
+            assert!(a.offer(TcsPort::Tls, &f), "record {no} taken");
+            a.op(
+                tc_op::DELTA_ACK,
+                &[&ha[..], &u64::from(no).to_le_bytes()].concat(),
+            );
+            seq += 1;
+        }
+        let next = half_delta(
+            &tf,
+            TS_TXREC_MAX as u32 + 1,
+            sc::DELTA_TLS_RECORD_OUT,
+            &record_out(seq, 26, 77 + seq),
+        );
+        assert!(!a.offer(TcsPort::Tls, &next), "waits on its port");
+        a.feed_half(
+            TcsPort::Ip,
+            &half_delta(
+                &flow(),
+                1,
+                sc::DELTA_TCP_RESET,
+                &reset_body(MD_DIR_OUT, 5000, 80_000),
+            ),
+        );
+        let _ = a.events();
+        assert!(
+            a.offer(TcsPort::Tls, &next),
+            "taken once our reset overtook it"
+        );
+        assert!(a.lost().is_none());
+        assert!(
+            a.p.flow(&flow()).expect("a").mirroring,
+            "the RST still waits"
+        );
+        let st = a.p.flow(&flow()).expect("a").st;
+        assert_eq!(usize::from(st.tx_count), TS_TXREC_MAX, "not applied");
+    }
+
     /// A connection that completes its close ends its flow; and a `tls` that
     /// ends its half while `ip` never says how is reported closed once `ip`
     /// had its time.

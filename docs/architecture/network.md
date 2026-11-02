@@ -909,7 +909,12 @@ consumer's.
   and since `EthernetFrame` edges carry `[len: u16 LE][frame]` the wiring
   gives it `FRAME_KIND_ETH`: it peeks each lane's length and moves one
   whole frame at a time, never one its output cannot hold, so sharing a
-  NIC needs no module of its own. A frame-level module receives through the seam (its frames are
+  NIC needs no module of its own. A fan into a port with no manifest of its
+  own (the NIC, stdout) takes its framing from the producers only when every
+  one that declares a framing declares the same (`agreed_frame_kind`);
+  mixed producers — a `NetProto` port and an `OctetStream` one merged into
+  stdout — make a byte fan that keeps each write whole, where a framed fan
+  would read the stream as `NetProto` headers and stall for everyone. A frame-level module receives through the seam (its frames are
   forwarded to it), not through a tee of `frames_rx`, which would hand
   `ip` and it every frame.
 - **Service chains** (`disposition::CHAIN` 6, `cores/chain_encap.rs`). The
@@ -1308,7 +1313,17 @@ standby acknowledged the delta — and stops its pairing without an `ABORT`
 STATUS; the standby that applies the `Reset` lets its `ip` shadow go, keeps
 the flow's tombstone there (a straggler is dropped, never answered), reports
 `ENDED` and refuses EMISSION_ARM, ACTIVATE and CUT_IMPORT with
-`tc_end::REFUSED`; RETIRE or ABORT then lets either slot go. A layer that
+`tc_end::REFUSED`; RETIRE or ABORT then lets either slot go. The halves
+reach the provider on two ports, `ip`'s read first, so the flow's end can
+overtake a `tls` delta sent before it — the record `tls` sealed just before
+its consumer's abortive close, held at the horizon and never written. A
+`tls` delta read once the record holds the end (our reset awaiting the
+standby, the peer's reset, a completed close) is taken in its number and
+not applied, and a RECORD_OUT waiting on a full outbound table is taken
+then too: the end is reported as it is, never as a lost pairing. (`ip`'s
+own stream is ordered, and its FIN cannot pass the records before it: `tls`
+closes only after every record, and `ip` gates one transition at a
+time.) A layer that
 abandons its pairing names why — `ABORT_TXREC_CAP` (the record ceiling),
 `ABORT_REDELIVER_CAP` (the redelivery caps), `ABORT_HORIZON_BUDGET` (an
 unanswered horizon), `ABORT_MIRROR_LOST` — and the STATUS that ends the

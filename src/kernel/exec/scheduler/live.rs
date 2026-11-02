@@ -1515,8 +1515,8 @@ fn same_endpoint(a: Endpoint, b: Endpoint) -> bool {
 }
 
 /// The frame kind of a fanned port, read from the fanned module's manifest
-/// and, when it names none, from a peer's across the fan (both ends of an
-/// edge declare compatible content), as the boot fan pass reads it.
+/// and, when it names none, from the peers across the fan when they agree
+/// (`agreed_frame_kind`), as the boot fan pass reads it.
 fn fan_frame_kind(
     node: &ModuleLoader,
     mods: &[AddModule; WORK_MODULES],
@@ -1535,27 +1535,24 @@ fn fan_frame_kind(
         }
     };
     let kind_of = |hash: u32, d: FanDirection, k: u8| {
-        super::fanned_port_frame_kind(resolving_loader(hash, node), hash, d, boot_key(k))
+        super::declared_port_frame_kind(resolving_loader(hash, node), hash, d, boot_key(k))
     };
-    let kind = kind_of(staged_hash(&mods[l]), dir, key);
-    if kind != super::module_types::FRAME_KIND_NONE {
-        return kind;
+    if let Some(kind) = kind_of(staged_hash(&mods[l]), dir, key) {
+        if kind != super::module_types::FRAME_KIND_NONE {
+            return kind;
+        }
     }
-    for &ei in group {
+    super::agreed_frame_kind(group.iter().map(|&ei| {
         let ae = &edges[ei];
         let (peer, peer_dir, peer_key) = match dir {
             FanDirection::Out => (ae.to, FanDirection::In, ae.to_port_index),
             FanDirection::In => (ae.from, FanDirection::Out, ae.from_port_index),
         };
         let Endpoint::New(p) = peer else {
-            continue;
+            return None;
         };
-        let k = kind_of(staged_hash(&mods[p as usize]), peer_dir, peer_key);
-        if k != super::module_types::FRAME_KIND_NONE {
-            return k;
-        }
-    }
-    super::module_types::FRAME_KIND_NONE
+        kind_of(staged_hash(&mods[p as usize]), peer_dir, peer_key)
+    }))
 }
 
 /// Topologically order the new modules over their subgraph-internal edges so

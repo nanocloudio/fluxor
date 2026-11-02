@@ -37,28 +37,51 @@ fn manifest_direction_byte(dir: FanDirection, port_key: u8) -> u8 {
     }
 }
 
-/// Look up a module's port content_type by its `name_hash`. Returns
-/// `FRAME_KIND_NONE` when the module isn't in the loader table (host
-/// built-in without a packed manifest) or the manifest doesn't
-/// describe a port at the requested direction+index.
-pub(crate) fn fanned_port_frame_kind(
+/// A port's frame kind as its module's manifest declares it — `None` when
+/// the module has no manifest here (a host built-in) or names no such
+/// port, which is not the same as a port that declares a stream
+/// (`Some(FRAME_KIND_NONE)`).
+pub(crate) fn declared_port_frame_kind(
     loader: &ModuleLoader,
     name_hash: u32,
     dir: FanDirection,
     port_key: u8,
-) -> u8 {
-    use module_types::FRAME_KIND_NONE;
+) -> Option<u8> {
     let direction_byte = manifest_direction_byte(dir, port_key);
     let index = port_key & 0x0F;
-    if let Ok(module) = loader.find_by_name_hash(name_hash) {
-        if let Some((ct, flags)) = module.port_spec(direction_byte, index) {
-            if module_types::port_is_framed(ct, flags) {
-                return module_types::FRAME_KIND_RECORD;
-            }
-            return port_frame_kind_from_content_type(ct);
+    let module = loader.find_by_name_hash(name_hash).ok()?;
+    let (ct, flags) = module.port_spec(direction_byte, index)?;
+    if module_types::port_is_framed(ct, flags) {
+        return Some(module_types::FRAME_KIND_RECORD);
+    }
+    Some(port_frame_kind_from_content_type(ct))
+}
+
+/// The frame kind of a fan whose fanned port declares none (a host
+/// built-in such as the stdout sink): the kind its peers across the fan
+/// declare, when every peer that declares one declares the SAME kind.
+///
+/// Peers that disagree — a `NetProto` producer and an `OctetStream` one
+/// merged into stdout — make it a byte fan (`FRAME_KIND_NONE`). A framed
+/// fan would read every peer's bytes as that one framing: an
+/// `OctetStream` producer's text parsed as `NetProto` headers names
+/// lengths no frame has, and the fan either waits forever for a frame that
+/// never completes or refuses the "malformed" one and stops — for every
+/// producer behind it, not just the odd one. The byte fan keeps each
+/// producer's writes whole (a cut-short lane is drained before another is
+/// read), which is all a sink that declares no framing can ask.
+/// Peers with no manifest here say nothing and are passed over; no peer
+/// that says anything leaves the fan a byte fan.
+pub fn agreed_frame_kind<I: IntoIterator<Item = Option<u8>>>(peers: I) -> u8 {
+    let mut agreed: Option<u8> = None;
+    for k in peers.into_iter().flatten() {
+        match agreed {
+            None => agreed = Some(k),
+            Some(a) if a == k => {}
+            Some(_) => return module_types::FRAME_KIND_NONE,
         }
     }
-    FRAME_KIND_NONE
+    agreed.unwrap_or(module_types::FRAME_KIND_NONE)
 }
 
 /// The first `buffer_group` fan insertion may give an edge of its own
@@ -242,36 +265,28 @@ fn insert_fan(
             };
             // Detect the fanned port's wire format from the module's
             // manifest content_type. If the fanned module is a host
-            // built-in (no manifest), fall back to checking any peer's
-            // manifest across the fan — both ends of an edge must
-            // declare a compatible content_type, so peer-side gives
-            // the same answer.
-            let mut fan_kind = fanned_port_frame_kind(loader, fan_name_hash, direction, port_key);
-            if fan_kind == module_types::FRAME_KIND_NONE {
-                for k in 0..group_count {
-                    let edge = &edges[group[k]];
-                    let (peer_idx, peer_dir, peer_port_key) = match direction {
-                        FanDirection::Out => (
-                            edge.to_module,
-                            FanDirection::In,
-                            if edge.is_ctrl() { 0x10 } else { 0x00 } | edge.to_port_index,
-                        ),
-                        FanDirection::In => {
-                            (edge.from_module, FanDirection::Out, edge.from_port_index)
-                        }
-                    };
-                    let peer_hash = match &module_list[peer_idx] {
-                        Some(e) => e.name_hash,
-                        None => continue,
-                    };
-                    let peer_kind =
-                        fanned_port_frame_kind(loader, peer_hash, peer_dir, peer_port_key);
-                    if peer_kind != module_types::FRAME_KIND_NONE {
-                        fan_kind = peer_kind;
-                        break;
-                    }
-                }
-            }
+            // built-in (no manifest), the peers across the fan say it —
+            // when they all say the same (`agreed_frame_kind`): a fan-in
+            // of mixed producers into an undeclared sink is a byte fan.
+            let fan_kind =
+                match declared_port_frame_kind(loader, fan_name_hash, direction, port_key) {
+                    Some(k) if k != module_types::FRAME_KIND_NONE => k,
+                    _ => agreed_frame_kind(group.iter().take(group_count).map(|&gi| {
+                        let edge = &edges[gi];
+                        let (peer_idx, peer_dir, peer_port_key) = match direction {
+                            FanDirection::Out => (
+                                edge.to_module,
+                                FanDirection::In,
+                                if edge.is_ctrl() { 0x10 } else { 0x00 } | edge.to_port_index,
+                            ),
+                            FanDirection::In => {
+                                (edge.from_module, FanDirection::Out, edge.from_port_index)
+                            }
+                        };
+                        let peer_hash = module_list[peer_idx].as_ref()?.name_hash;
+                        declared_port_frame_kind(loader, peer_hash, peer_dir, peer_port_key)
+                    })),
+                };
             // A buffer group is aliasing: every edge in one shares one channel.
             // No fan can keep that, since one producer feeding several
             // consumers, or several producers one consumer, would do in-place
