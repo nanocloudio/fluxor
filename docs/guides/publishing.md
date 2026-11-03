@@ -109,8 +109,11 @@ A workload that brings its own modules is published the same way, on its
 own. `fluxor build <graph> --emit=workload --output <dir>` takes the graph's
 one `workloads:` entry and writes `graph.flxa` (the subgraph as the kernel
 admits it), `modules/<name>.fmod` for every module it names, and
-`workload-image.json` (name, target, module ABI, ABI-surface digest, and
-each module's `name_hash` and SHA-256). Each module's `step_deadline_us`,
+`workload-image.json` (name, target, module ABI, ABI-surface digest,
+each module's `name_hash` and SHA-256, and under `env` every param bound to
+the workload's environment with `{env: NAME}` — see
+[A workload's environment](../architecture/scheduler.md#a-workloads-environment)).
+Each module's `step_deadline_us`,
 `step_deadline_burst_us` and `fault_policy` go in its FLXA record, and the
 node admits them within its own ceiling (see
 [Workload step budgets](../architecture/scheduler.md#workload-step-budgets)).

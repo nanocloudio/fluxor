@@ -29,6 +29,15 @@
 //! held, charged to its ledger again. A root for an identity the node agent
 //! will not admit again is the agent's to remove. Data that must outlive the
 //! owner itself belongs to a volume.
+//!
+//! A volume is a host directory lent to a workload at its `CREATE`
+//! (`abi::contracts::workload::volume`, [`lend`]): the workload's `fs` paths
+//! at or under the volume's path resolve beneath that directory, through
+//! the same `openat2` `RESOLVE_BENEATH`, whatever its storage grant. A
+//! read-only volume takes no change (`EACCES`). What a volume holds is the
+//! node's, not the owner's: nothing in it is charged to the owner's ledger,
+//! and the owner's release closes the volume and leaves its directory as it
+//! was.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -57,6 +66,139 @@ struct Root {
 }
 
 static mut ROOTS: Vec<Root> = Vec::new();
+
+/// A host directory lent to an owner: held open (`O_PATH`), named by `dst`
+/// — the owner's path for it, its components joined by `/`, no leading one.
+struct Volume {
+    owner: OwnerHandle,
+    dst: Vec<u8>,
+    fd: i32,
+    ro: bool,
+}
+
+static mut VOLUMES: Vec<Volume> = Vec::new();
+
+/// Lend `owner` the host directory `src` (absolute) at its path `dst`,
+/// read-only when `ro`. `EINVAL` for a `dst` that is empty, climbs (`.`/`..`)
+/// or is lent already; `E2BIG` past `workload::volume::MAX` volumes; the
+/// error opening `src` (`ENOENT`, `ENOTDIR`, ...).
+///
+/// # Safety
+/// Single-threaded platform dispatch only: touches the `static mut` table.
+pub unsafe fn lend(owner: OwnerHandle, src: &[u8], dst: &[u8], ro: bool) -> Result<(), i32> {
+    if owner.is_system() || !src.starts_with(b"/") || src.contains(&0) {
+        return Err(errno::EINVAL);
+    }
+    let mut norm = Vec::new();
+    for part in dst.split(|&b| b == b'/').filter(|p| !p.is_empty()) {
+        if part == b"." || part == b".." || part.contains(&0) {
+            return Err(errno::EINVAL);
+        }
+        if !norm.is_empty() {
+            norm.push(b'/');
+        }
+        norm.extend_from_slice(part);
+    }
+    if norm.is_empty() || norm.len() > LINUX_FS_PATH_MAX {
+        return Err(errno::EINVAL);
+    }
+    let vols = &mut *core::ptr::addr_of_mut!(VOLUMES);
+    let held = vols.iter().filter(|v| v.owner == owner);
+    if held.clone().any(|v| v.dst == norm) {
+        return Err(errno::EINVAL);
+    }
+    if held.count() >= crate::abi::contracts::workload::volume::MAX {
+        return Err(errno::E2BIG);
+    }
+    let c = std::ffi::CString::new(src).map_err(|_| errno::EINVAL)?;
+    let fd = libc::open(
+        c.as_ptr(),
+        libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+    );
+    if fd < 0 {
+        return Err(-*libc::__errno_location());
+    }
+    vols.push(Volume {
+        owner,
+        dst: norm,
+        fd,
+        ro,
+    });
+    Ok(())
+}
+
+/// Close every volume lent to `owner`. Its directories stay as they are.
+///
+/// # Safety
+/// As [`lend`].
+unsafe fn close_volumes(owner: OwnerHandle) {
+    let vols = &mut *core::ptr::addr_of_mut!(VOLUMES);
+    vols.retain(|v| {
+        if v.owner == owner {
+            libc::close(v.fd);
+            false
+        } else {
+            true
+        }
+    });
+}
+
+/// The volume a root-relative path (as [`relative`] makes it) lies in, the
+/// longest `dst` that is the path or a parent of it, and the rest of the
+/// path beneath it (`.` for the volume itself).
+///
+/// # Safety
+/// As [`lend`].
+unsafe fn volume_of(owner: OwnerHandle, rel: &[u8; 256]) -> Option<(&'static Volume, [u8; 256])> {
+    let len = rel.iter().position(|&b| b == 0).unwrap_or(rel.len());
+    let path = &rel[..len];
+    let vols = &*core::ptr::addr_of!(VOLUMES);
+    let v = vols
+        .iter()
+        .filter(|v| {
+            v.owner == owner
+                && path.starts_with(&v.dst)
+                && (path.len() == v.dst.len() || path[v.dst.len()] == b'/')
+        })
+        .max_by_key(|v| v.dst.len())?;
+    let mut rest = &path[v.dst.len()..];
+    while let Some(r) = rest.strip_prefix(b"/") {
+        rest = r;
+    }
+    let mut out = [0u8; 256];
+    if rest.is_empty() {
+        out[0] = b'.';
+    } else {
+        out[..rest.len()].copy_from_slice(rest);
+    }
+    Some((v, out))
+}
+
+/// Which volume `path` (as the owner names it) lies in: an index stable for
+/// the call, or `None` for the owner's own root. What lies in a volume is
+/// not charged to the owner.
+///
+/// # Safety
+/// As [`lend`].
+pub unsafe fn volume_index(owner: OwnerHandle, path: &[u8]) -> Option<usize> {
+    let rel = relative(path).ok()?;
+    let (v, _) = volume_of(owner, &rel)?;
+    let vols = &*core::ptr::addr_of!(VOLUMES);
+    vols.iter().position(|x| core::ptr::eq(x, v))
+}
+
+/// Whether `path` lies in a volume lent to `owner`.
+///
+/// # Safety
+/// As [`lend`].
+pub unsafe fn lent(owner: OwnerHandle, path: &[u8]) -> bool {
+    volume_index(owner, path).is_some()
+}
+
+/// Whether `open(2)` flags ask to change what they open.
+fn writes(flags: i32) -> bool {
+    flags & (libc::O_WRONLY | libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC | libc::O_APPEND) != 0
+}
 
 fn base_dir() -> PathBuf {
     std::env::var_os("FLUXOR_OWNER_ROOT")
@@ -195,6 +337,9 @@ pub fn release(owner: OwnerHandle) {
     if owner.is_system() {
         return;
     }
+    // Lent, not owned: closed, and left as they are.
+    // SAFETY: owner release runs on the scheduler thread, as every dispatch.
+    unsafe { close_volumes(owner) };
     if !rooted(owner) {
         // SAFETY: owner release runs on the scheduler thread, as every dispatch.
         unsafe {
@@ -319,12 +464,18 @@ fn confined(raw: i32) -> i32 {
 /// # Safety
 /// As [`root_for`].
 pub unsafe fn open_beneath(owner: OwnerHandle, path: &[u8], flags: i32, mode: u32) -> i32 {
-    let Some(root) = root_for(owner) else {
-        return errno::EACCES;
-    };
     let rel = match relative(path) {
         Ok(r) => r,
         Err(e) => return e,
+    };
+    if let Some((v, rest)) = volume_of(owner, &rel) {
+        if v.ro && writes(flags) {
+            return errno::EACCES;
+        }
+        return openat2_beneath(v.fd, &rest, flags, mode);
+    }
+    let Some(root) = root_for(owner) else {
+        return errno::EACCES;
     };
     openat2_beneath(root.files_fd, &rel, flags, mode)
 }
@@ -363,10 +514,18 @@ unsafe fn openat2_beneath(dirfd: i32, rel: &[u8; 256], flags: i32, mode: u32) ->
 /// # Safety
 /// As [`root_for`].
 pub unsafe fn parent_beneath(owner: OwnerHandle, path: &[u8]) -> Result<(i32, [u8; 256]), i32> {
-    let Some(root) = root_for(owner) else {
-        return Err(errno::EACCES);
-    };
     let rel = relative(path)?;
+    // In a volume, beneath its directory: a read-only one takes no change,
+    // and the volume itself is no entry the owner can change.
+    let (base_fd, rel) = match volume_of(owner, &rel) {
+        Some((v, _)) if v.ro => return Err(errno::EACCES),
+        Some((_, rest)) if rest[0] == b'.' && rest[1] == 0 => return Err(errno::EBUSY),
+        Some((v, rest)) => (v.fd, rest),
+        None => match root_for(owner) {
+            Some(root) => (root.files_fd, rel),
+            None => return Err(errno::EACCES),
+        },
+    };
     let len = rel.iter().position(|&b| b == 0).unwrap_or(0);
     let mut end = len;
     while end > 0 && rel[end - 1] == b'/' {
@@ -386,7 +545,7 @@ pub unsafe fn parent_beneath(owner: OwnerHandle, path: &[u8]) -> Result<(i32, [u
     } else {
         dir[..dir_part.len()].copy_from_slice(dir_part);
     }
-    let dirfd = openat2_beneath(root.files_fd, &dir, libc::O_RDONLY | libc::O_DIRECTORY, 0);
+    let dirfd = openat2_beneath(base_fd, &dir, libc::O_RDONLY | libc::O_DIRECTORY, 0);
     if dirfd < 0 {
         return Err(dirfd);
     }

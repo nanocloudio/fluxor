@@ -1410,8 +1410,16 @@ fn build_packaged_blobs(
 /// <dir>/graph.flxa            the subgraph (FLXA), as the kernel admits it
 /// <dir>/modules/<name>.fmod   every module it names, byte for byte
 /// <dir>/workload-image.json   name, target, module ABI, ABI-surface pin,
-///                             and each module's name_hash and sha256
+///                             each module's name_hash and sha256, and the
+///                             environment its params are bound to
 /// ```
+///
+/// A module param written `{env: NAME}` (with an optional `default:` or
+/// `required: false`) is packed as an env bind record (`schema::env_bind`):
+/// the node fills it from the CREATE's `env`/`var` entries. `env` in the
+/// json lists each binding — `name`, `module`, `param`, `required` — so the
+/// orchestrator can refuse a pod that does not give a required name before
+/// it asks the node.
 ///
 /// A module's sha256 is the pin the kernel admits it by, and the digest the
 /// module's layer has once published (`fluxor publish workload <dir>`).
@@ -1450,7 +1458,10 @@ pub fn cmd_workload_image(
         abi,
         project_root: project_root.as_path(),
     };
-    let workloads = crate::config::build_workloads(&only, loc, &[], &target_desc.id)?;
+    let (workloads, env_binds) = crate::schema::with_env_binds(|| {
+        crate::config::build_workloads(&only, loc, &[], &target_desc.id)
+    });
+    let workloads = workloads?;
     let flxa =
         crate::add_subgraph::encode_add_subgraph(&workloads[0]).map_err(error::Error::Config)?;
     let store_fb = store_cli::lock_store_resolver(&project_root, abi, None);
@@ -1502,6 +1513,15 @@ pub fn cmd_workload_image(
         "abi_surface": hex(&hash::abi_surface_digest()),
         "flxa_sha256": sha(&flxa),
         "modules": entries,
+        "env": env_binds
+            .iter()
+            .map(|b| serde_json::json!({
+                "name": b.name,
+                "module": b.module,
+                "param": b.param,
+                "required": b.required,
+            }))
+            .collect::<Vec<_>>(),
     });
     std::fs::write(
         output_dir.join("workload-image.json"),

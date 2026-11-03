@@ -2,11 +2,13 @@
 //
 // Layer: contracts/mesh (public, stable).
 //
-// A `remote_channel` instance carries local channels across one transport
-// session at a time. Its optional `session` output says when that session
-// opens and when it ends, so a consumer can stop sending toward a member
-// that cannot hear it — refusing a request at once rather than waiting out
-// a deadline for an answer that is not coming.
+// A `remote_channel` instance carries local channels across its transport
+// sessions: one for a dialer, up to its `sessions` param for a listener.
+// Its optional `session` output says when the instance has a session open
+// (UP, with a new ordinal each time one opens) and when none is left (DOWN),
+// so a consumer can stop sending toward a member that cannot hear it —
+// refusing a request at once rather than waiting out a deadline for an
+// answer that is not coming.
 //
 // Frames use the `[msg_type:1][len:2 LE][payload]` header the net contracts
 // share, in a range disjoint from them and from `mesh::capability`.

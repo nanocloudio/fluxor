@@ -174,6 +174,74 @@ The build refuses the same things first. A workload module may not declare
 `voices` presets are packed under tag `0xFD`. The build also checks the
 packed params bytes with the same walk the kernel uses.
 
+### A workload's environment
+
+Source: `modules/sdk/contracts/workload.rs` (`env`),
+`src/kernel/workload/workload_graph.rs` (`bind_env`), `tools/src/schema.rs`
+(`env_bind`, `with_env_binds`)
+
+A workload is created with an environment: the `CREATE`'s Tier-2 entries
+`env`/`var`, each `NAME=VALUE` (the name up to the first `=`), a later
+entry for a name replacing an earlier one. An orchestrator that runs a
+workload on a node passes the workload's resolved environment this way,
+literal values and values it resolved from its own configuration and secret
+stores alike.
+
+A host process takes the entries into its environment, over the source's
+own. A graph workload takes them into its modules' params, where the graph
+bound a param to a name:
+
+```yaml
+workloads:
+  - name: web
+    modules:
+      - name: http
+        type: http_server
+        port: {env: PORT, default: 8080}   # PORT, else 8080
+        site: {env: SITE_NAME}             # required: no SITE_NAME refuses the CREATE
+        banner: {env: BANNER, required: false}  # BANNER, else the module's default
+```
+
+`fluxor build --emit=workload` packs a bound param as an env bind record
+under the reserved params tag `0xED`, in the param's place:
+`[target tag][kind][flags][name_len][name][default]` — the kind is the
+param's (`u8`, `u16`, `u32`, `str`, `str_chunked`), the flags `REQUIRED` or
+`DEFAULT`, and a default is an integer's little-endian bytes or a string's
+bytes. `workload-image.json` lists every binding under `env` (`name`,
+`module`, `param`, `required`). No other build accepts a binding: nothing
+else is created with an environment. `${NAME}` stays refused everywhere
+(a graph is never read against the build host's environment); a binding
+names the workload's own, explicitly.
+
+The graph backend copies the subgraph into its own memory through
+`bind_env` before anything is staged, writing each record out as the
+param's entries: an integer (decimal, `0x` hex, `true`/`false`) in its
+width, out of range `EINVAL`; a `str` as one entry (more than 255 bytes is
+`EINVAL`); a `str_chunked` as 255-byte chunks; an empty string as no entry.
+A name no entry gives takes the default, leaves an optional param out, and
+refuses the `CREATE` with `EINVAL` when it is required. A subgraph the
+values make too large (a module's params past 64 KiB, the subgraph past
+the FLXA source's 64 KiB) is `E2BIG`. Every other add refuses params that
+still carry a record (`EINVAL`), so a module never sees one. The spec
+digest a staged `CREATE` is continued by covers the options, so every
+continuation carries the same environment.
+
+### Volumes lent to a workload
+
+Source: `modules/sdk/contracts/workload.rs` (`volume`),
+`src/platform/linux/owner_root.rs` (`lend`)
+
+A `CREATE` lends a workload a host directory with the Tier-2 entry
+`mount`/`bind`, `<src>\0<dst>\0<ro>`: a host process has it bind-mounted at
+`dst` in its root, and on Linux a graph workload's `fs` paths at or under
+`dst` resolve beneath `src` (see
+[the storage surface](storage_capability_surface.md#what-a-workload-reaches)).
+A read-only volume takes no change; nothing in a volume is charged to the
+owner; the owner's release closes it and leaves its directory as it was.
+At most 16 per workload. A node that does not lend volumes does not list
+the entry in `CAPS`, and a required entry it does not list fails the
+`CREATE` with `ENOSYS`, so an orchestrator marks every volume required.
+
 ## Where tier is declared
 
 YAML graphs declare tier on the domain:

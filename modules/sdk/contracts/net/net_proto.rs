@@ -119,6 +119,39 @@ pub fn put_session_generation(buf: &mut [u8], fixed: usize, generation: u16) -> 
     Some(end)
 }
 
+/// The application protocol a session stage negotiated for the stream (TLS
+/// ALPN, RFC 7301: `h2`, `http/1.1`, …), carried after the session
+/// generation as `[alpn_len: u8][alpn…]` (`fixed`: [`ACCEPTED_FIXED`] or
+/// [`CONNECTED_FIXED`]). Empty when the stage negotiated none, when the
+/// record stops at its generation, and when the length overruns the record.
+/// A consumer that speaks more than one protocol over the stream (an HTTP
+/// client choosing between HTTP/1.1 and HTTP/2) reads it from the
+/// `MSG_CONNECTED` / `MSG_ACCEPTED` that hands it the connection, before any
+/// of its data.
+#[inline]
+pub fn session_alpn(payload: &[u8], fixed: usize) -> &[u8] {
+    let at = fixed + SESSION_GENERATION_LEN;
+    let Some(&n) = payload.get(at) else {
+        return &[];
+    };
+    payload.get(at + 1..at + 1 + n as usize).unwrap_or(&[])
+}
+
+/// Write the negotiated protocol where [`session_alpn`] reads it — after a
+/// generation written at `fixed` — and return the length of the record
+/// through it: `None` when `buf` cannot hold it or `proto` is over 255
+/// bytes. An empty `proto` writes a zero length, which reads back empty.
+#[inline]
+pub fn put_session_alpn(buf: &mut [u8], fixed: usize, proto: &[u8]) -> Option<usize> {
+    let at = fixed.checked_add(SESSION_GENERATION_LEN)?;
+    let n = u8::try_from(proto.len()).ok()?;
+    let end = at.checked_add(1 + proto.len())?;
+    let dst = buf.get_mut(at..end)?;
+    dst[0] = n;
+    dst[1..].copy_from_slice(proto);
+    Some(end)
+}
+
 /// `MSG_ACCEPTED`'s fixed part: `[conn_id][local_port]`.
 pub const ACCEPTED_FIXED: usize = CONN_ID_LEN + 2;
 /// Bytes a requester tag occupies on the wire (`u16` LE).
@@ -170,7 +203,8 @@ pub fn accepted_parts(payload: &[u8]) -> (u16, u16) {
 /// corrupt each other's subsequent `MSG_DATA`. A single-consumer graph
 /// may ignore the trailing port bytes and read just `conn_id`. A session
 /// stage appends `[generation: u16 LE]` ([`session_generation`]) to the
-/// port-qualified form.
+/// port-qualified form, then `[alpn_len: u8][alpn…]`, the application
+/// protocol it negotiated ([`session_alpn`]; length 0 for none).
 pub const MSG_ACCEPTED: u8 = 0x01;
 /// Received data. Payload: `[conn_id: u16 LE][data…]`. The `data` portion of a
 /// single `MSG_DATA` frame MUST NOT exceed [`MAX_DATA_FRAGMENT`] — a producer
@@ -247,7 +281,9 @@ pub const MSG_BOUND: u8 = 0x04;
 /// TLS + an OTLP exporter), each claims only the connections it opened. A
 /// consumer that doesn't filter just reads `conn_id` and ignores the trailing
 /// tag; untagged connects echo tag `0` (`REQUESTER_TAG_NONE`). A session
-/// stage appends `[generation: u16 LE]` ([`session_generation`]).
+/// stage appends `[generation: u16 LE]` ([`session_generation`]), then
+/// `[alpn_len: u8][alpn…]`, the application protocol it negotiated
+/// ([`session_alpn`]; length 0 for none).
 pub const MSG_CONNECTED: u8 = 0x05;
 /// Error. Payload: `[conn_id: u16 LE][errno: i8][requester_tag: u16 LE?]`. For a
 /// connect-phase failure the trailing `requester_tag` echoes the failing

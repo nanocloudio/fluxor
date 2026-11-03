@@ -173,7 +173,23 @@ A stage that numbers sessions (`tls`) appends `[generation: u16 LE]` to
 `MSG_ACCEPTED` and `MSG_CONNECTED` (`put_session_generation`), and a
 consumer that binds work to a session (`remote_channel`) reads it back
 (`session_generation`), so it can tell a connection id's current session
-from a closed one's. `MSG_PEER`'s
+from a closed one's. After the generation comes `[alpn_len: u8][alpn…]`,
+the application protocol the stage negotiated (`put_session_alpn` /
+`session_alpn`; length 0 for none): an HTTP client reads `h2` there and
+runs HTTP/2 streams over the connection, `http/1.1` or nothing and it
+speaks HTTP/1.1. `tls` configures what it offers (client) and selects from
+in its own preference order (server) with `alpn` — a name or a list,
+`h2,http/1.1` when unset (`http/1.1` under `alpn_h1_only`). A port-less
+`MSG_ACCEPTED` (a sole consumer whose bind `tls` never saw) carries
+neither.
+
+`tls` holds a dial's `MSG_CONNECTED` until the handshake completes, so a
+dial that never completes one is answered as a failed connect — a tagged
+`MSG_ERROR` `ECONNREFUSED` — never a `MSG_CLOSED` under an id the
+requester was not told. A client whose `identity_label` is not certified
+yet (and so, under `trust_issuer`, has no anchor) does not dial: its
+`CMD_CONNECT_TO` is answered `EAGAIN` on the requester's tag, and the
+requester's backoff dials again. `MSG_PEER`'s
 `family` is `AF_INET` (the address in the first four bytes, the rest zero)
 or `AF_INET6`; for a dial to a service address it names that address, not
 the backend it was translated to, and a stage that relabels connection ids
@@ -1753,7 +1769,9 @@ deltas and their acknowledgements, the cut, the wrapped continuity object,
 custody evidence and the wrapped key — crosses between runtimes. Fluxor's
 carrier for module-to-module frames between runtimes is `remote_channel`
 (`modules/foundation/remote_channel`, `mesh.md`): local channels carried
-record for record over one authenticated transport session. With `resume`
+record for record over authenticated transport sessions (a listener serves
+up to `sessions` peers at once, one session each, named by the key
+fingerprint its transport verified). With `resume`
 it is also ordered and reliable across sessions:
 
 - every record on every channel is numbered from 1 within the sender's

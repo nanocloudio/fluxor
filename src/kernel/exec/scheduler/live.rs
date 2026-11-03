@@ -379,6 +379,11 @@ pub enum AddError {
     /// The add asked for its creator's authority, and the creator does not
     /// act with the node's. Refused before anything is allocated.
     AuthorityRefused,
+    /// A module's params still carry an env bind record
+    /// (`abi::contracts::workload::env::BIND_TAG`): a value only a workload
+    /// `CREATE` writes in, from its environment. Refused before anything is
+    /// allocated.
+    UnboundEnv,
 }
 
 impl AddError {
@@ -392,7 +397,7 @@ impl AddError {
             AddError::OwnerSlotsExhausted | AddError::NoFreeSlot | AddError::StateCapExceeded => {
                 errno::ENOSPC
             }
-            AddError::PlanMismatch | AddError::BadEndpoint => errno::EINVAL,
+            AddError::PlanMismatch | AddError::BadEndpoint | AddError::UnboundEnv => errno::EINVAL,
             AddError::ChannelOpenFailed => errno::ENOMEM,
             AddError::Instantiate => errno::ENOEXEC,
             AddError::WouldBlock => errno::EAGAIN,
@@ -570,6 +575,13 @@ pub fn begin_add(
                     "[live] module {i} of the add refused: its params carry node tag {tag:#04x}"
                 );
                 return Err(AddError::NodeParamRefused);
+            }
+            if super::params_carry_tag(
+                entry.params(),
+                crate::abi::contracts::workload::env::BIND_TAG,
+            ) {
+                log::warn!("[live] module {i} of the add refused: its params carry an env bind");
+                return Err(AddError::UnboundEnv);
             }
         }
     }

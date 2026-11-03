@@ -238,6 +238,8 @@ CONT_OUT_NEED <= 64 * 1024 | modules/foundation/tls/continuity.rs
 | TLS/DTLS identity key | `MAX_KEY_LEN` | modules/foundation/tls/mod.rs | 2400 | Policy: a PKCS#1 RSAPrivateKey of 4096 bits with its CRT fields is about 2.4 KB, and a PKCS#8 P-256 key is under 200 bytes, so this admits the largest identity the module signs with |
 | TLS expected DNS identity | `MAX_EXPECTED_DNS` | modules/foundation/tls/mod.rs | 64 | Policy: a DNS name may be 253 octets, but this profile's names are service names in a configured deployment and the buffer is per-instance module state on targets that count kilobytes |
 | TLS expected URI SAN | `MAX_EXPECTED_URI` | modules/foundation/tls/mod.rs | 256 | Policy: a SPIFFE ID is a trust domain plus a path and runs longer than a hostname, so it gets its own bound rather than borrowing the DNS one and silently truncating |
+| TLS ALPN list | `ALPN_CFG_MAX` | modules/foundation/tls/mod.rs | 64 | Policy: the `alpn` parameter's comma-joined protocol list, the builder's bound; a handful of registered protocol names fits with room, and the list is per-instance module state |
+| TLS ALPN protocol name | `ALPN_NAME_MAX` | modules/foundation/tls/mod.rs | 16 | Policy: the negotiated name is kept per session (and checkpointed) at this width, so a longer entry could be offered but never recorded; construction refuses it |
 | DTLS client authority | `DTLS_AUTHORITY_MAX` | modules/foundation/tls/mod.rs | 64 | Policy: the `host[:port]` a DTLS client dials, held as text until construction judges it. Longer is refused with the parameter named, because a truncated authority is a different peer |
 | DTLS peer sessions | `MAX_PEERS` | modules/foundation/tls/mod.rs | 4 | Policy: a peer carries its own handshake driver and reassembly buffer, ~29 KiB on a 32-bit core; 1 on embedded, where the arena holds one beside the stream session |
 | DTLS datagram payload | `DGRAM_MAX` | modules/foundation/tls/mod.rs | 1500 | Policy: one link MTU, so a DTLS record the module emits never relies on IP fragmentation to arrive |
@@ -323,9 +325,11 @@ CONT_OUT_NEED <= 64 * 1024 | modules/foundation/tls/continuity.rs
 | Remote-channel table frame | `HELLO_MAX` | modules/foundation/remote_channel/wire.rs | 399 | Derived, not chosen: the whole channel table at `MAX_CHANNELS` entries of `CT_NAME_MAX` names, the exchange endpoint's side byte, and the resume trailer (`RESUME_TRAILER_MAX`: a marker, two incarnations, a next record per channel) |
 | Remote-channel resume trailer | `RESUME_TRAILER_MAX` | modules/foundation/remote_channel/wire.rs | 97 | Derived, not chosen: the `HELLO`'s resume trailer — its marker, the sender's incarnation and the one it holds, and the next record expected on each of `MAX_CHANNELS` channels |
 | Remote-channel record | `MAX_RECORD` | modules/foundation/remote_channel/mod.rs | 262144 | Policy: the largest record any channel may declare — one record is reassembled whole before delivery, so this is the largest allocation a peer can make the module hold. Above a large body record with its frame (loam's 128 KiB frames). 128 KiB on wasm, 16 KiB on embedded. A larger declaration is refused at construction; a larger record is refused and counted |
-| Remote-channel reassembly | `REASSEMBLY_BYTES` | modules/foundation/remote_channel/mod.rs | 1048576 | Policy: every channel's reassembly ring (`max_record + 4`) and, on a `mailbox` channel, its two record stages must fit; a table that does not is refused at construction rather than shrunk. 256 KiB on wasm, 32 KiB on embedded |
+| Remote-channel reassembly | `REASSEMBLY_BYTES` | modules/foundation/remote_channel/mod.rs | 1048576 | Policy: every channel's reassembly ring (`max_record + 4`) per session, its retained window per session under `resume`, and its record stages (a `mailbox`'s two; one on every channel a listener with several sessions sends on) must fit; a table that does not is refused at construction rather than shrunk. 256 KiB on wasm, 32 KiB on embedded |
 | Remote-channel fragment (`net`) | `FRAGMENT_MAX` | modules/foundation/remote_channel/mod.rs | 4096 | Policy: record bytes in one frame on a shared stream — how long one channel holds the stream before the next channel's turn |
 | Remote-channel open exchanges | `OPEN_EXCHANGES_MAX` | modules/foundation/remote_channel/mod.rs | — | Policy, per target class (`abi::config::TARGET_CLASS`): 256 on host-class targets, 32 on MCUs. The exchanges a far endpoint has handed its provider without a terminal record yet — the ones it ABORTs when the session ends. A request HEAD past it is answered `503`, marked RAISED, and never reaches the provider |
+| Remote-channel sessions | `SESSIONS_MAX` | modules/foundation/remote_channel/mod.rs | — | Policy, per target class (`abi::config::TARGET_CLASS`): 8 on host-class targets, 4 on MCUs. The sessions one `net` listener serves at once (`sessions`), one per verified peer — each a send and receive state per channel and a reassembly ring per channel within `REASSEMBLY_BYTES`. A larger `sessions` is refused at construction; a peer arriving with every session in use is closed |
+| Remote-channel local header | `HDR_MAX` | modules/foundation/remote_channel/wire.rs | 64 | Policy: the longest local header a length framing (`len16@<off>+<add>`, `len32@<off>+<add>`) names — the length field's offset and width together. A framing past it is refused at construction |
 | Remote-channel fragment (`mux`) | `MUX_FRAGMENT_MAX` | modules/foundation/remote_channel/mod.rs | 1192 | Derived, not chosen: a whole frame fits one `CMD_MUX_STREAM_SEND` (`MUX_QUIC_STREAM_SEND_MAX` less the frame header and record length), held to that by a const assert |
 | Graph parameters | `MAX_PARAMS` | tools/src/params.rs | 64 | Policy: parameters one graph, stack or bundle may declare. A graph needing more is being configured through its internals rather than its run surface; the bound also bounds the checks every launch makes |
 | Parameter value | `MAX_PARAM_STRING_BYTES` | tools/src/params.rs | 4096 | Policy: the longest string value from `--param` or `--params`; content belongs in a file the value names |
@@ -464,7 +468,7 @@ cannot be evaluated from its own file reads `—` and says why.
 | Persisted vault keys | `MAX_PERSISTED` | src/kernel/security/key_vault.rs | — | Policy, per-profile (64 aarch64 / 8 elsewhere), like the slot table: a Pi-class node persists a master per replication group, replica and key epoch, per locally encrypted volume, and its identities. With none free, persisting is refused and the consumer refuses its operation rather than holding an unpersisted key |
 | One AEAD seal/open | `MAX_SEAL_BYTES` | src/kernel/security/key_vault.rs | 2048 | Policy: a resumption ticket or a checkpoint chunk in one call, never a bulk stream; a larger plaintext is refused EINVAL |
 | Consumed share envelopes | `MAX_CONSUMED` | src/kernel/security/key_share.rs | 32 | Policy: anti-replay ids of the last envelopes a reconstruction used, refused EACCES if presented again. An attachment envelope's recipient is a fresh key destroyed after the attach, which stops replay to any other opener; the ring covers the recipient's own lifetime, which spans one attach |
-| Parameter tag space | `PARAM_TAG_MAX` | tools/src/manifest.rs | 237 | Id width: a module parameter is addressed by a byte tag, and 0xEE–0xFF are reserved for kernel, protection and policy metadata (0xEE raw arena use, 0xEF an instance's heap cap, the voice-preset blobs, TLV magic and the terminator among them) |
+| Parameter tag space | `PARAM_TAG_MAX` | tools/src/manifest.rs | 236 | Id width: a module parameter is addressed by a byte tag, and 0xED–0xFF are reserved for kernel, protection and policy metadata (0xED a workload's env bind record, 0xEE raw arena use, 0xEF an instance's heap cap, the voice-preset blobs, TLV magic and the terminator among them) |
 | IPv6 seam and stack addresses | `SEAM_V6_MAX` | modules/foundation/ip/mod.rs | 4 | Policy: the IPv6 addresses `seam_v6` may name — the VIPs a director decides at one `ip` — and, separately, the ones `ip6` names for the stack itself; a longer list refuses construction |
 | Transmit-side ethernet frame | `MAX_FRAME_SIZE` | modules/foundation/ip/mod.rs | 1536 | Policy: the frame ceiling every NIC driver and `ip` size their staging to — MTU plus headers, rounded to a 32-byte multiple. The link MTU every packet `ip` sends keeps within (`LINK_MTU`, 1500) is held inside it by a const assert |
 | Listening TCP sockets | `MAX_LISTENERS` | modules/foundation/ip/mod.rs | — | Policy, per-profile (derived from `MAX_TCP_CONNS`): a SYN is matched against the listener list, never the whole table |
@@ -719,6 +723,8 @@ MAX_CERT_CHAIN_BYTES | modules/foundation/tls/mod.rs | 3072 | *
 MAX_KEY_LEN | modules/foundation/tls/mod.rs | 2400 | *
 MAX_EXPECTED_DNS | modules/foundation/tls/mod.rs | 64 | *
 MAX_EXPECTED_URI | modules/foundation/tls/mod.rs | 256 | *
+ALPN_CFG_MAX | modules/foundation/tls/mod.rs | 64 | *
+ALPN_NAME_MAX | modules/foundation/tls/mod.rs | 16 | *
 DTLS_AUTHORITY_MAX | modules/foundation/tls/mod.rs | 64 | *
 MAX_PEERS | modules/foundation/tls/mod.rs | 4 | host
 MAX_PEERS | modules/foundation/tls/mod.rs | 1 | off-host
@@ -959,7 +965,7 @@ MAX_PERSISTED | src/kernel/security/key_vault.rs | 64 | host
 MAX_PERSISTED | src/kernel/security/key_vault.rs | 8 | off-host
 MAX_SEAL_BYTES | src/kernel/security/key_vault.rs | 2048 | *
 MAX_CONSUMED | src/kernel/security/key_share.rs | 32 | *
-PARAM_TAG_MAX | tools/src/manifest.rs | 0xED | *
+PARAM_TAG_MAX | tools/src/manifest.rs | 0xEC | *
 MAX_CHAIN_LINKS | modules/sdk/contracts/mesh/capability.rs | 8 | *
 MAX_CHAIN_BYTES | modules/sdk/contracts/mesh/capability.rs | CHAIN_HDR + MAX_CHAIN_LINKS * LINK_LEN | *
 MAX_ROOTS | modules/sdk/contracts/mesh/capability.rs | 2 | *
@@ -986,6 +992,8 @@ REASSEMBLY_BYTES | modules/foundation/remote_channel/mod.rs | 32 * 1024 | embedd
 FRAGMENT_MAX | modules/foundation/remote_channel/mod.rs | 4096 | *
 MUX_FRAGMENT_MAX | modules/foundation/remote_channel/mod.rs | 1192 | *
 OPEN_EXCHANGES_MAX | modules/foundation/remote_channel/mod.rs | if abi::config::TARGET_CLASS == abi::config::target_class::HOST { 256 } else { 32 } | *
+SESSIONS_MAX | modules/foundation/remote_channel/mod.rs | if abi::config::TARGET_CLASS == abi::config::target_class::HOST { 8 } else { 4 } | *
+HDR_MAX | modules/foundation/remote_channel/wire.rs | 64 | *
 MAX_PARAMS | tools/src/params.rs | 64 | *
 MAX_PARAM_STRING_BYTES | tools/src/params.rs | 4096 | *
 MAX_PARAM_NAME_BYTES | tools/src/params.rs | 64 | *
@@ -1177,6 +1185,8 @@ CHUNKS_PER_PACKET | modules/foundation/quic/connection.rs | derived: one frame p
 INITIAL_WINDOW | modules/foundation/quic/connection.rs | protocol: RFC 9002 §7.2 initial congestion window, min(10 * max_datagram_size, max(2 * max_datagram_size, 14720)) at 1500 bytes
 MINIMUM_WINDOW | modules/foundation/quic/connection.rs | protocol: RFC 9002 §7.2 kMinimumWindow, 2 * max_datagram_size — the congestion window persistent congestion collapses to
 IDENTITIES | modules/foundation/remote_channel/mod.rs | derived: tls::MAX_SESSIONS, one peer-identity record per connection the transport can seat
+LINKS_MAX | modules/foundation/remote_channel/mod.rs | derived: SESSIONS_MAX plus the one transport session a listener holds while it settles a peer's newer session
+TAIL_MAX | modules/foundation/tls/mod.rs | derived: the generation and ALPN tail of MSG_CONNECTED/MSG_ACCEPTED, `2 + SESSION_GENERATION_LEN + 1 + ALPN_NAME_MAX`
 EXTRA_CHUNKS | modules/foundation/tls/mod.rs | derived: the elastic chunks past the inline one, (MAX_SESSIONS - SESSION_CHUNK) / SESSION_CHUNK, const-asserted to tile MAX_SESSIONS exactly
 SIZE | modules/sdk/contracts/net/route.rs | format: the byte length of a route-contract record (peer route, held address, entry state)
 MIN_OUT_CAP | modules/sdk/contracts/storage/namespace.rs | derived: the TAKE_RUNG answer head and one handle, the smallest out_cap that makes progress

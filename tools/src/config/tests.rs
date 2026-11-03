@@ -5836,3 +5836,63 @@ mod boot_plan_tests {
         assert_eq!((wasm.derived, wasm.ceiling()), (0, 32));
     }
 }
+
+#[cfg(test)]
+mod check_mode_file_tests {
+    use super::*;
+
+    /// A check stands a nominal size in for a deployment file that is not
+    /// there; a file that is there is decoded as a build decodes it, and
+    /// outside a check nothing is stood in for: the build reads the file
+    /// and fails on its absence.
+    #[test]
+    fn a_check_stands_in_only_for_an_absent_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let absent = dir.path().join("server_cert.der");
+        let absent = absent.to_str().unwrap();
+        assert_eq!(
+            stand_in_size(true, absent, "cert_file"),
+            Some(CHECK_NOMINAL_CERT)
+        );
+        assert_eq!(
+            stand_in_size(true, absent, "key_file"),
+            Some(CHECK_NOMINAL_KEY)
+        );
+        assert_eq!(
+            stand_in_size(true, absent, "trust"),
+            Some(CHECK_NOMINAL_CERT)
+        );
+        assert_eq!(stand_in_size(false, absent, "cert_file"), None);
+
+        let present = dir.path().join("present.der");
+        std::fs::write(&present, b"not a certificate").unwrap();
+        assert_eq!(
+            stand_in_size(true, present.to_str().unwrap(), "cert_file"),
+            None,
+            "a file that is there is decoded, and refused if it does not decode"
+        );
+    }
+
+    #[test]
+    fn alpn_is_a_name_or_a_list_held_whole() {
+        let s = |v: serde_json::Value| alpn_param("m", "tls", Some(&v));
+        assert_eq!(s(json!("h2")).unwrap().as_deref(), Some("h2"));
+        assert_eq!(
+            s(json!(["h2", "http/1.1"])).unwrap().as_deref(),
+            Some("h2,http/1.1")
+        );
+        assert_eq!(s(json!("h2,http/1.1")).unwrap().as_deref(), Some("h2,http/1.1"));
+        assert_eq!(alpn_param("m", "tls", None).unwrap(), None);
+        // A name tls cannot record whole, an empty one, a space, a comma
+        // inside a listed name, a non-string.
+        assert!(s(json!("a-protocol-name-17")).is_err());
+        assert!(s(json!("h2,,http/1.1")).is_err());
+        assert!(s(json!("h2 x")).is_err());
+        assert!(s(json!(["h2,http/1.1"])).is_err());
+        assert!(s(json!(2)).is_err());
+        // quic keeps its 24-byte names.
+        assert!(alpn_param("m", "quic", Some(&json!("a-protocol-name-17"))).is_ok());
+        assert!(alpn_param("m", "quic", Some(&json!("x".repeat(25)))).is_err());
+        assert!(s(json!(vec!["abcdefgh"; 8])).is_err(), "over 64 bytes in all");
+    }
+}

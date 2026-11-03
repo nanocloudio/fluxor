@@ -1,10 +1,11 @@
 # `remote_channel` — local channels and exchanges across nodes
 
-`remote_channel` carries up to eight local channels record for record across
-one authenticated transport session, and optionally one exchange
+`remote_channel` carries up to eight local channels record for record
+across authenticated transport sessions, and optionally one exchange
 (`modules/sdk/contracts/exchange.rs`,
 [docs/architecture/exchange.md](../../../docs/architecture/exchange.md)). Two
-instances, one on each node, are the two ends of one session. The transport
+instances, one on each node, are the two ends of a session; a listener
+serves up to `sessions` of them at once, one per verified peer. The transport
 authenticates: `net` speaks `net_proto` to the clear side of mutual `tls`,
 `mux` speaks the mux contract to `quic` with one stream per channel. The
 module authenticates and encrypts nothing itself.
@@ -16,9 +17,27 @@ Sources: `mod.rs` (behaviour), `wire.rs` (the protocol), `manifest.toml`
 
 The `channels` table, `content_type:framing:max_record;…`, names each
 channel's content type, how its records are delimited on the local ports
-(`tlv16`, `len32`, `mailbox`, `bytes`) and its largest record. Channel `N`
-is the port pair `chN` (in) and `chN_rx` (out). Both ends exchange tables
-when a session opens and refuse the session on any difference. A record is
+and its largest record. Channel `N` is the port pair `chN` (in) and
+`chN_rx` (out). Both ends exchange tables when a session opens and refuse
+the session on any difference.
+
+| Framing | Local record |
+|---|---|
+| `len16@<off>+<add>`, `len32@<off>+<add>` | a little-endian 16- or 32-bit length field at byte `off` of the record's own header; the whole record is the field's value plus `add`. The header (`off` plus the field) is at most 64 bytes |
+| `tlv16` | `len16@1+3`: `[type:1][len:2 LE][payload]`, the header the net contracts share |
+| `len32` | `len32@0+4`: `[len:4 LE][payload]` |
+| `mailbox` | one buffer of a `buffer_group` edge is one record; an empty buffer is skipped |
+| `bytes` | a stream with no records, carried in order; `max_record` bounds one piece |
+
+A length framing is what a FIFO edge needs: a record is taken as one record
+however the producer's writes split it or join it to the next, and
+delivered whole, one wire record per local record. `mailbox` is for an edge
+whose every buffer is one record — a FIFO producer behind it would have its
+records joined or split by the edge. A delimited record must carry, in its
+own header, the length the wire gave it; a peer whose record does not is
+refused. `max_record` is at least the header and `add`, and for a 16-bit
+field at most `add + 65535`; a malformed framing is refused at
+construction. A record is
 reassembled whole before any byte of it is delivered; one over its maximum
 is refused and counted, never truncated. Every channel has its own credit,
 so a stalled consumer holds up its own channel and no other, and nothing is
@@ -27,10 +46,51 @@ session ended is lost and counted; one not yet begun waits for the next
 session. The `session` output says when a session opens and ends
 (`contracts/mesh/remote_session.rs`).
 
+## Sessions
+
+A dialler holds one session. A `net` listener serves up to `sessions` (at
+most `SESSIONS_MAX`: 8 on host-class targets, 4 on MCUs), one per peer. With
+`require_peer` a session belongs to the peer its transport verified, named
+by the key fingerprint of that identity (`peer_identity::fingerprint` — the
+bytes an HTTP server stamps as a request's `peer`), and a new session from
+a peer that already has one replaces it: the older is closed and the newer
+takes its place, its retained streams included, so a half-dead connection
+never shuts its own peer out. The listener holds one transport session more
+than it serves for exactly that. A peer arriving to find every session in
+use is closed (`sessions_refused`). Without `require_peer` the sessions are
+anonymous and never replace one another.
+
+Each session has its own reassembly ring per channel and its own credit, so
+a slow session holds up only itself. What the local side sees depends on
+`peer_tag`:
+
+- `peer_tag: 0` — the sessions are interchangeable. Records arriving on any
+  of them are merged onto the channel's output record by record, each
+  session's in order. A record written to a channel goes to every session
+  open when it is taken; one whose session ended before it had it all is
+  counted lost.
+- `peer_tag: 1` — every local record carries, ahead of its own bytes, a
+  32-byte fingerprint prefix: an inbound record its session's peer, an
+  outbound record the peer it goes to. All zero sends to every session; a
+  fingerprint with no session is dropped and counted (`unrouted`). Needs
+  `require_peer`.
+
+A `bytes` channel has no records to merge, route or prefix, so it needs one
+session and no `peer_tag`; a `near` endpoint serves one requester's ids, so
+one session. The `session` output reports open while any session is.
+
 ## Resume
 
 With `resume` (on `net` or `mux`, not beside `exchange`) a session ending takes
-nothing with it. Every record on every channel is numbered from 1 within
+nothing with it. Across several sessions each peer's streams are its own —
+numbered, retained and resumed per peer, held by its verified identity (so
+`require_peer` is needed). A record written to a channel is retained for
+every peer whose streams are held (with `peer_tag`, the one its prefix
+names), and is taken off the input only once every one of them has room: a
+peer gone and not back holds the channel once its window is full. A new peer
+finding every slot held takes the slot of the peer gone longest whose
+records have all been delivered, and that peer's retained streams are given
+up (`peers_evicted`). Every record on every channel is numbered from 1 within
 the sender's incarnation (16 random bytes drawn at construction) and kept
 in a retained window (`window` bytes per channel, four records at the
 channel's maximum by default) until the receiver's `ACK` says it arrived
@@ -62,7 +122,8 @@ A QUIC session that ends takes its streams and what was on them; the next
 session's streams resume each channel exactly as on `net`.
 
 A typical end runs over mutual `tls` with vault-held host identities
-(`net`), or over `quic` (`mux`), one instance on each node.
+(`net`), or over `quic` (`mux`), one instance on each node; `mux` carries
+one session.
 
 ## Exchange endpoint
 
@@ -74,7 +135,7 @@ stand-in an instance is.
 | Side | Stands in for | Ports | Wired to |
 |---|---|---|---|
 | `near` | the remote provider | `request_in` (`ExchangeRequest`), `response_out` (`ExchangeResponse`) | the requester's `request_out` and `response_in` |
-| `far` | the remote requester | `request_out` (`ExchangeRequest`), `response_in` (`ExchangeResponse`) | the provider's `request_in` and `response_out` |
+| `far` | the remote requesters | `request_out` (`ExchangeRequest`), `response_in` (`ExchangeResponse`) | the provider's `request_in` and `response_out` |
 
 The names are the exchange vocabulary's own: the near side's pair is a
 provider's, the far side's a requester's, so each edge is content-type
@@ -139,13 +200,25 @@ one endpoint: on an MCU it is three quarters of `REASSEMBLY_BYTES`, and a
 second would not fit. A node that both fronts a remote provider and serves
 a remote requester runs two instances.
 
-### Ids
+### Ids and the peer
 
-Records cross verbatim, ids included: the provider echoes the requester's
-id and the near side hands the echo back unchanged. The id space is the
-requester's, so **one requester per near endpoint**; requesters that share
-a provider remotely share it through a local relay that owns their ids,
-exactly as they would locally.
+The near side carries its requester's records verbatim, so **one requester
+per near endpoint**; requesters that share a provider remotely share it
+through a local relay that owns their ids, exactly as they would locally.
+
+The far side hands the provider every exchange under an id of its own and
+maps it back on every answer, per session: any number of near endpoints on
+any number of sessions share one provider, each in its own id space, and a
+record of an exchange the far side has ended — the provider's late answer to
+an exchange whose session was lost — can never reach a newer exchange,
+whatever id its requester reissues it under.
+
+The far side also writes each request HEAD's `peer` itself: the session's
+verified key fingerprint under `require_peer`, empty without it. What the
+requester put there is never passed on, so a provider authorises on the
+peer the transport proved. A HEAD that no longer fits one record once its
+`peer` is written is answered `413` (RAISED) and never reaches the
+provider; a request HEAD that does not parse is answered `400`.
 
 ### Session loss
 
@@ -173,54 +246,55 @@ The exchange contract's LINK is the requester's whole account of a session.
   record says the provider is up.
 - **Far side, on loss.** The far side tracks every exchange it handed the
   provider, from its request HEAD to the provider's terminal record (or the
-  requester's ABORT). Each one still open is ABORTed (`PEER_GONE`) to the
-  provider, and whatever the provider writes for it is dropped. Requests
-  that had crossed whole and not been handed over are dropped, as is an
-  answer taken from the provider and not yet sent. Nothing more is handed
-  to the provider until it has taken the last ABORT and its answers are
-  drained; only then does the far side open the next session's answer
-  channel with its LINK record, so an exchange issued again under the same
-  id never meets a record of the one before.
+  requester's ABORT), with the session that issued it. Each one of the lost
+  session's still open is ABORTed (`PEER_GONE`) to the provider — no other
+  session's — and whatever the provider writes for it is dropped. Requests
+  that had crossed whole on that session and not been handed over are
+  dropped, as is an answer taken from the provider for it and not yet sent.
+  The ABORTs reach the provider before any request after them; the next
+  session's answer channel opens with its LINK record, and an exchange
+  issued again is a new exchange to the provider, under a new id.
 - **Exactly once.** Each exchange the requester issues is answered once: the
   terminal answer it reads is the one to the issue it last made under that
   id. An exchange whose answer was lost with the session was performed once
   by the provider and is issued again, so a provider whose operations are
   not idempotent sees it twice — the contract's "unknowable".
 - **The provider's LINK.** The provider's own LINK records cross like any
-  answer. The near side writes the requester the state the session and the
+  answer, to every session. The near side writes the requester the state the session and the
   provider make together, and only when it changes: a provider DOWN while
   the session is up is written as it came, a provider UP is written only
   while the session is up, and a session that comes back while the
   provider is down writes nothing until the provider's UP. A provider DOWN
-  ends every exchange the far side tracks, since the requester issues each
+  ends every exchange the far side tracks, since each requester issues them
   again after the UP.
-
-The far side treats a provider's records for an exchange as finished once
-the provider has taken that exchange's ABORT and its response edge is
-drained. That is the contract's own rule — nothing is written for an
-exchange after its ABORT — together with the order every provider writes
-in: what it built before reading the ABORT reaches its edge before it reads
-anything else (`ExchangeOutbox`).
 
 ### Bounds
 
 | Limit | Value | On reaching it |
 |---|---|---|
-| `OPEN_EXCHANGES_MAX` | 256 on host-class targets, 32 on MCUs | a request HEAD past it is answered `503`, marked RAISED, and never reaches the provider; records that follow for it are dropped |
+| `OPEN_EXCHANGES_MAX` | 256 on host-class targets, 32 on MCUs, across every session | a request HEAD past it is answered `503`, marked RAISED, and never reaches the provider; records that follow for it are dropped |
+| `SESSIONS_MAX` | 8 on host-class targets, 4 on MCUs | `sessions` past it is refused at construction |
 | record | the exchange contract's `RECORD_MAX` | a larger record is refused by the edge, never cut |
 | channels | six beside an endpoint | a longer table is refused at construction |
 
 ### Counters
 
-`x_refused` (requests answered `503` at the far side), `x_aborted` (ABORTs
-written for exchanges a session left open), `x_discarded` (records an
-endpoint dropped as belonging to an ended exchange).
+`x_refused` (requests the far side answered itself: `503`, `413`, `400`),
+`x_aborted` (ABORTs written for exchanges a session left open),
+`x_discarded` (records an endpoint dropped as belonging to an ended
+exchange). Per instance: `sessions` (opened, ever), `sessions_replaced`,
+`sessions_refused`, `peers_evicted`; per channel `unrouted` (`peer_tag`
+records whose prefix named no session) and `lost`.
 
 ## Limitations
 
 - `resume` is for channels without an exchange endpoint; across a peer's
   restart it is at least once, not exactly once.
 - One exchange endpoint per instance, and one requester per near endpoint.
+- Several sessions are a `net` listener's; `mux` carries one.
+- Under `resume` across several sessions a peer that never returns holds a
+  channel's input once its retained window is full, until a new peer takes
+  its slot.
 - On `mux`, the endpoint's two channels are two streams; `quic` opens three
   at a time, so an endpoint leaves room for one more channel.
 - `fluxor build` and `--check` check what one graph shows: a wire naming a

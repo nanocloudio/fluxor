@@ -293,6 +293,10 @@ pub fn scan(project_root: &Path, config: &Config) -> Result<Report, ScanError> {
     // them repo-wide.
     let write_consts = repo_write_op_consts(project_root);
 
+    // The consumer names the consumer-naming rule guards, the checkout's
+    // own among them.
+    let consumers = consumer_projects(project_root);
+
     let walker = walkdir::WalkDir::new(project_root)
         .follow_links(false)
         .into_iter()
@@ -347,7 +351,7 @@ pub fn scan(project_root: &Path, config: &Config) -> Result<Report, ScanError> {
         // Only in the repo that OWNS the SDK: a consumer's vendored copy
         // is not its to rename.
         if sdk_owner {
-            file_violations.extend(scan_consumer_naming(&rel, &content));
+            file_violations.extend(scan_consumer_naming(&rel, &content, &consumers));
             file_violations.extend(scan_tenancy_vocabulary(&rel, &content));
         }
         if !sdk_owner {
@@ -839,6 +843,12 @@ fn scan_sdk_mounts(rel: &Path, src: &str) -> Vec<Violation> {
 /// violation.
 /// Sibling projects that consume this SDK. Names, not common words: a
 /// list that included `wave` or `sector` would fire on ordinary prose.
+///
+/// Public names only. A consumer whose name is not public is guarded by
+/// the checkout that knows it ([`consumer_projects`]): one name per line
+/// in the untracked `.git/info/consumer-projects`, and/or the comma- or
+/// space-separated `$FLUXOR_CONSUMER_PROJECTS`, so the rule never
+/// publishes the names it keeps out.
 const CONSUMER_PROJECTS: &[&str] = &[
     "ceptra",
     "clustor",
@@ -848,9 +858,54 @@ const CONSUMER_PROJECTS: &[&str] = &[
     "loam",
     "spectra",
     "truffle",
-    "wormhole",
     "zedex",
 ];
+
+/// The per-checkout consumer list under the repository's git directory.
+const CONSUMER_PROJECTS_FILE: &str = "info/consumer-projects";
+/// The environment's additional consumer names.
+const CONSUMER_PROJECTS_ENV: &str = "FLUXOR_CONSUMER_PROJECTS";
+
+/// Every consumer name the consumer-naming rule guards in `project_root`:
+/// [`CONSUMER_PROJECTS`], then the checkout's own list, then the
+/// environment's, lowercased and without repeats.
+fn consumer_projects(project_root: &Path) -> Vec<String> {
+    let file = git_dir(project_root)
+        .and_then(|d| fs::read_to_string(d.join(CONSUMER_PROJECTS_FILE)).ok())
+        .unwrap_or_default();
+    let env = std::env::var(CONSUMER_PROJECTS_ENV).unwrap_or_default();
+    consumer_names(&file, &env)
+}
+
+/// [`consumer_projects`] from the file's and the environment's text. A
+/// file line is one name; `#` starts a comment. The environment separates
+/// names by commas or whitespace.
+fn consumer_names(file: &str, env: &str) -> Vec<String> {
+    let mut out: Vec<String> = CONSUMER_PROJECTS.iter().map(|s| s.to_string()).collect();
+    let from_file = file
+        .lines()
+        .map(|l| l.split('#').next().unwrap_or("").trim());
+    let from_env = env.split(|c: char| c == ',' || c.is_whitespace());
+    for name in from_file.chain(from_env) {
+        let name = name.trim().to_ascii_lowercase();
+        if !name.is_empty() && !out.contains(&name) {
+            out.push(name);
+        }
+    }
+    out
+}
+
+/// The repository's git directory: `.git`, or the directory a `.git` file
+/// names (`gitdir: <path>`, a worktree or submodule).
+fn git_dir(project_root: &Path) -> Option<PathBuf> {
+    let dot = project_root.join(".git");
+    if dot.is_dir() {
+        return Some(dot);
+    }
+    let text = fs::read_to_string(&dot).ok()?;
+    let rel = text.trim().strip_prefix("gitdir:")?.trim();
+    Some(project_root.join(rel))
+}
 
 /// Whether `rel` is part of the normative surface — the contracts and SDK
 /// a consumer compiles against.
@@ -1110,14 +1165,14 @@ fn repo_write_op_consts(project_root: &Path) -> std::collections::HashSet<String
 /// Deliberately scoped to the normative surface. A guide pointing a reader
 /// at the repository where audio codecs live is orienting them, not
 /// defining a contract, and is fine.
-fn scan_consumer_naming(rel: &Path, src: &str) -> Vec<Violation> {
+fn scan_consumer_naming(rel: &Path, src: &str, consumers: &[String]) -> Vec<Violation> {
     if !is_normative_surface(rel) {
         return Vec::new();
     }
     let mut out = Vec::new();
     for (i, line) in src.lines().enumerate() {
         let lower = line.to_ascii_lowercase();
-        for name in CONSUMER_PROJECTS {
+        for name in consumers {
             if !word_appears(&lower, name) {
                 continue;
             }
@@ -2748,6 +2803,50 @@ include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
     fn pending(src: &str) -> usize {
         let none = std::collections::HashSet::new();
         scan_pending_writes(std::path::Path::new("modules/app/x/mod.rs"), src, &none).len()
+    }
+
+    #[test]
+    fn consumer_names_come_from_the_list_the_checkout_and_the_environment() {
+        let names = consumer_names(
+            "# private consumers\nAlpha\n\n  beta # ours\nclustor\n",
+            "gamma, delta  epsilon",
+        );
+        for n in [
+            "clustor", "loam", "alpha", "beta", "gamma", "delta", "epsilon",
+        ] {
+            assert!(names.iter().any(|x| x == n), "{n} missing from {names:?}");
+        }
+        assert_eq!(
+            names.iter().filter(|x| *x == "clustor").count(),
+            1,
+            "a name listed twice is guarded once"
+        );
+        assert_eq!(consumer_names("", "").len(), CONSUMER_PROJECTS.len());
+
+        let surface = Path::new("modules/sdk/contracts/net/net_proto.rs");
+        let src = "/// the record alpha writes\nconst A: u8 = 0;\n";
+        assert_eq!(scan_consumer_naming(surface, src, &names).len(), 1);
+        assert!(
+            scan_consumer_naming(surface, src, &consumer_names("", "")).is_empty(),
+            "a name is guarded only where the checkout or the environment lists it"
+        );
+    }
+
+    #[test]
+    fn the_checkout_list_is_read_from_its_git_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".git/info")).unwrap();
+        std::fs::write(dir.path().join(".git/info/consumer-projects"), "omega\n").unwrap();
+        assert!(consumer_projects(dir.path()).iter().any(|n| n == "omega"));
+
+        // A worktree's `.git` file names its git directory.
+        let wt = tempfile::tempdir().unwrap();
+        std::fs::write(
+            wt.path().join(".git"),
+            format!("gitdir: {}\n", dir.path().join(".git").display()),
+        )
+        .unwrap();
+        assert!(consumer_projects(wt.path()).iter().any(|n| n == "omega"));
     }
 
     #[test]

@@ -3248,8 +3248,12 @@ fn build_module_entry_in(
         let Some(path) = module.get(key).and_then(|v| v.as_str()) else {
             continue;
         };
-        let der = crate::trust_anchors::read_der_file(Path::new(path), labels)
-            .map_err(|e| Error::Config(format!("module '{name}': {key}: {e}")))?;
+        let der = if let Some(n) = check_stand_in(path, key) {
+            vec![0u8; n]
+        } else {
+            crate::trust_anchors::read_der_file(Path::new(path), labels)
+                .map_err(|e| Error::Config(format!("module '{name}': {key}: {e}")))?
+        };
         let n = der.len();
         if n > u16::MAX as usize {
             return Err(Error::Config(format!(
@@ -3300,8 +3304,12 @@ fn build_module_entry_in(
                 "module '{name}': trust must be `system` or a `${{file:<path>}}` source spec, got '{spec}'"
             ))
         })?;
-        let anchors = crate::trust_anchors::load_bundle(Path::new(path))
-            .map_err(|e| Error::Config(format!("module '{name}': trust: {e}")))?;
+        let anchors = if let Some(n) = check_stand_in(path, "trust") {
+            vec![vec![0u8; n]]
+        } else {
+            crate::trust_anchors::load_bundle(Path::new(path))
+                .map_err(|e| Error::Config(format!("module '{name}': trust: {e}")))?
+        };
         let blob = crate::trust_anchors::encode_ext(crate::trust_anchors::TAG_TRUST, &anchors);
         if base + extra_len + blob.len() >= entry.len() {
             *out_of_room = true;
@@ -3361,30 +3369,15 @@ fn build_module_entry_in(
         eprintln!("  verify_uri: {uri}");
     }
 
-    // Tag 14: alpn (RFC 7301 ALPN list, comma-separated ASCII tokens
-    // like "mqtt,h3", extended TLV). Consumed by modules that negotiate
-    // ALPN (e.g. quic) to pick the offered protocol; selection is
-    // server-preference, first-configured-token-the-client-offered.
-    if let Some(alpn) = module.get("alpn").and_then(|v| v.as_str()) {
+    // Tag 14: alpn (RFC 7301 ALPN list, extended TLV): the protocol names
+    // an instance offers (client) or selects from (server) in its own
+    // preference order — "h2", "http/1.1", "mqtt,h3", or a YAML list of
+    // names — carried comma-separated. Consumed by the modules that
+    // negotiate ALPN (tls, quic); selection is server-preference, the
+    // first configured name the client offered.
+    if let Some(alpn) = alpn_param(name, type_name, module.get("alpn"))? {
         let bytes = alpn.as_bytes();
         let n = bytes.len();
-        // The module stores the ALPN list in a fixed buffer and each
-        // selected token in a fixed per-token slot. Truncating a token
-        // would negotiate a protocol the peer never offered, so reject an
-        // over-capacity list at config time rather than silently clip it.
-        // (Mirrors the quic module: MAX_ALPN_CFG = 64, MAX_ALPN = 24.)
-        const ALPN_LIST_MAX: usize = 64;
-        const ALPN_TOKEN_MAX: usize = 24;
-        if n > ALPN_LIST_MAX {
-            return Err(Error::Config(format!(
-                "module '{name}': alpn list is {n} bytes, exceeds the {ALPN_LIST_MAX}-byte limit"
-            )));
-        }
-        if let Some(tok) = alpn.split(',').find(|t| t.len() > ALPN_TOKEN_MAX) {
-            return Err(Error::Config(format!(
-                "module '{name}': alpn token '{tok}' exceeds the {ALPN_TOKEN_MAX}-byte limit"
-            )));
-        }
         if n > 0 {
             // The TLV body spans `[base + extra_len .. base + extra_len + 4 + n)`,
             // so the highest index written is `base + extra_len + 4 + n - 1`;
@@ -3569,11 +3562,104 @@ pub(crate) fn parse_modules_map(
     Ok((entries, names))
 }
 
+/// The `alpn` parameter of a module of type `type_name`, comma-joined:
+/// a string (`"h2"`, `"h2,http/1.1"`) or a list of names. `None` when the
+/// module names none. A name the module could not hold whole is refused
+/// here, not clipped: a truncated name negotiates a protocol nobody
+/// configured. The module stores the list in a fixed buffer and each
+/// selected name in a fixed slot — 64 bytes in all for both, and a name of
+/// at most 24 bytes for quic (`MAX_ALPN`) or 16 for tls (its
+/// `ALPN_NAME_MAX`, the width a session's negotiated protocol is kept and
+/// checkpointed at).
+fn alpn_param(name: &str, type_name: &str, v: Option<&Value>) -> Result<Option<String>> {
+    const ALPN_LIST_MAX: usize = 64;
+    let token_max: usize = if type_name == "tls" { 16 } else { 24 };
+    let alpn = match v {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(items)) => {
+            let mut names = Vec::with_capacity(items.len());
+            for it in items {
+                let Some(s) = it.as_str() else {
+                    return Err(Error::Config(format!(
+                        "module '{name}': alpn is a protocol name or a list of them"
+                    )));
+                };
+                if s.contains(',') {
+                    return Err(Error::Config(format!(
+                        "module '{name}': alpn name '{s}' holds a comma; list the names apart"
+                    )));
+                }
+                names.push(s);
+            }
+            names.join(",")
+        }
+        Some(_) => {
+            return Err(Error::Config(format!(
+                "module '{name}': alpn is a protocol name or a list of them"
+            )))
+        }
+    };
+    let n = alpn.len();
+    if n > ALPN_LIST_MAX {
+        return Err(Error::Config(format!(
+            "module '{name}': alpn list is {n} bytes, exceeds the {ALPN_LIST_MAX}-byte limit"
+        )));
+    }
+    if n == 0 {
+        return Ok(None);
+    }
+    for tok in alpn.split(',') {
+        if tok.is_empty() || !tok.bytes().all(|c| (0x21..0x7F).contains(&c)) {
+            return Err(Error::Config(format!(
+                "module '{name}': alpn name '{tok}' must be 1 or more printable ASCII bytes \
+                 with no space"
+            )));
+        }
+        if tok.len() > token_max {
+            return Err(Error::Config(format!(
+                "module '{name}': alpn token '{tok}' exceeds the {token_max}-byte limit"
+            )));
+        }
+    }
+    Ok(Some(alpn))
+}
+
 /// The longest `verify_uri` the tls module accepts: its `PEER_PRINCIPAL_MAX`,
 /// the longest principal a session reports. A peer is never accepted under
 /// a URI its session could not report, so a longer expectation could never
 /// be satisfied.
 const VERIFY_URI_MAX: usize = 128;
+
+/// Bytes a certificate, a private key, or one trust anchor is checked at
+/// when `fluxor build --check` finds its file absent: a P-256 or RSA-2048
+/// certificate and a PKCS#8 key fit, so a check still answers whether an
+/// instance's identity and anchors fit its module entry.
+const CHECK_NOMINAL_CERT: usize = 1024;
+const CHECK_NOMINAL_KEY: usize = 256;
+
+/// Under `fluxor build --check` (`params::checking`), the nominal size a
+/// module's `key` file (`cert_file`, `key_file`, `trust`) at `path` is
+/// checked at because it is not there; `None` when it is there, which is
+/// then decoded as a build decodes it, and always outside a check, where a
+/// missing file fails the build.
+pub(crate) fn check_stand_in(path: &str, key: &str) -> Option<usize> {
+    let n = stand_in_size(fluxor_tools::params::checking(), path, key)?;
+    eprintln!("  {key}: {path} is not here; checked at a nominal {n} bytes");
+    Some(n)
+}
+
+/// [`check_stand_in`]'s decision, with whether this is a check given.
+fn stand_in_size(checking: bool, path: &str, key: &str) -> Option<usize> {
+    if !checking || Path::new(path).exists() {
+        return None;
+    }
+    Some(if key == "key_file" {
+        CHECK_NOMINAL_KEY
+    } else {
+        CHECK_NOMINAL_CERT
+    })
+}
 
 /// The tls module's rule for a `verify_uri` (its `uri_well_formed`): at most
 /// [`VERIFY_URI_MAX`] bytes of RFC 3986 unreserved characters, sub-delims,

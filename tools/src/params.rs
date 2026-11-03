@@ -700,6 +700,17 @@ impl Values {
 
 static VALUES: std::sync::OnceLock<Values> = std::sync::OnceLock::new();
 
+/// Is this process checking graphs (`fluxor build --check`) rather than
+/// building or running them? A check validates a graph without the
+/// deployment's files: a certificate, key or trust bundle a module names
+/// by path (`cert_file`, `key_file`, `trust: "${file:…}"`) is decoded when
+/// it is there and stood in for at a nominal size when it is not, so an
+/// example does not depend on a file only its operator has. A build still
+/// reads every one of them and fails on a missing one.
+pub fn checking() -> bool {
+    matches!(VALUES.get(), Some(Values::Check))
+}
+
 /// Set what this process renders graphs with. The command's dispatch sets
 /// it once, before any graph is read; unset is a build given no values.
 pub fn set_values(values: Values) {

@@ -437,7 +437,13 @@ fn generate_config_impl(
             // one: an instance whose identity is missing is not an instance
             // that will serve, and the composer is where that is cheapest to
             // hear.
-            if let Some(key_path) = m.get("key_file").and_then(|v| v.as_str()) {
+            // A check without the key file (`params::checking`) cannot
+            // classify a key it does not have; the build that has it does.
+            if let Some(key_path) = m
+                .get("key_file")
+                .and_then(|v| v.as_str())
+                .filter(|p| check_stand_in(p, "key_file").is_none())
+            {
                 let der = crate::trust_anchors::read_der_file(
                     std::path::Path::new(key_path),
                     crate::trust_anchors::KEY_LABELS,

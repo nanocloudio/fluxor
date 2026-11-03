@@ -924,6 +924,17 @@ platform provider, which confines it as follows.
   the name inside it. `LINK` is `ENOSYS` and absent from the caps a
   workload is answered: a second name for an inode would let a file be
   charged once and held twice.
+- **Linux volumes.** A `CREATE`'s `mount`/`bind` entries
+  (`workload::volume`, `<src>\0<dst>\0<ro>`) lend the workload host
+  directories: a path at or under `dst` resolves beneath `src` with the
+  same `openat2` flags, whatever the owner's grant (a workload granted
+  `STORAGE_NONE` reaches its volumes and nothing else). A read-only volume
+  opens read-only and refuses every change with `EACCES`; the volume's own
+  name is `EBUSY` to `UNLINK`, `RMDIR` and `RENAME`; a `RENAME` between a
+  volume and anything else is `EXDEV`. Nothing a volume holds is charged to
+  the owner, and the owner's release closes the volume and removes nothing
+  in it: a workload keeps its state on a persistent volume and reads a
+  mounted secret this way.
 - **Linux `storage.object` and `storage.namespace`** reach a versioned
   store of the owner's own, under `<root>/store/`, with the node store's
   semantics and durability, handle tables of its own (16 watches, 8 open

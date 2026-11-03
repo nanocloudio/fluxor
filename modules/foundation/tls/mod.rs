@@ -292,6 +292,15 @@ const MAX_EXPECTED_DNS: usize = 64;
 /// borrowing the DNS one and silently truncating.
 const MAX_EXPECTED_URI: usize = 256;
 
+/// Longest `alpn` list (the comma-separated parameter), the builder's bound.
+const ALPN_CFG_MAX: usize = 64;
+/// Longest protocol name one `alpn` entry may hold: the negotiated name is
+/// kept per session in `HandshakeDriver::alpn_selected` (and checkpointed at
+/// that width), so a longer one could be offered but never recorded.
+const ALPN_NAME_MAX: usize = 16;
+/// What is offered and selected when no `alpn` is configured.
+const ALPN_DEFAULT: &[u8] = b"h2,http/1.1";
+
 /// Certificate validity posture.
 const CLOCK_POLICY_REQUIRE: u8 = 0;
 
@@ -1009,6 +1018,15 @@ struct TlsState {
     /// an h1-only proxy relay sets this: the relay can only route
     /// HTTP/1.1, so h2 must never be the negotiated protocol.
     alpn_h1_only: u8,
+    /// The `alpn` parameter (extended tag 14): comma-separated protocol
+    /// names, in this instance's preference order. A client offers them; a
+    /// server selects the first of them the client offered. Empty: the
+    /// default `h2,http/1.1` (`http/1.1` under `alpn_h1_only`).
+    alpn_cfg: [u8; ALPN_CFG_MAX],
+    alpn_cfg_len: u8,
+    /// The `alpn` list is unusable (too long, an empty name, a name longer
+    /// than `ALPN_NAME_MAX`); construction refuses.
+    alpn_cfg_bad: u8,
 
     // Channel ports (4-port node: cipher side facing IP, clear side facing HTTP)
     cipher_in: i32,  // from IP: ciphertext net_proto frames
@@ -1535,7 +1553,9 @@ define_params! {
 
     // Restrict the server's ALPN advertisement to `http/1.1` only. 0 keeps the
     // `h2` > `http/1.1` preference; 1 steers dual-offering clients to
-    // HTTP/1.1 so an h1-only proxy edge never negotiates h2.
+    // HTTP/1.1 so an h1-only proxy edge never negotiates h2. The general
+    // form is the `alpn` list (extended tag 14, `alpn_list`), which wins
+    // when both are given.
     10, alpn_h1_only, u8, 0
         => |s, d, len| { s.alpn_h1_only = p_u8(d, len, 0, 0); };
 
@@ -1784,6 +1804,11 @@ pub unsafe extern "C" fn module_new(
         dev_log(sys, 1, msg.as_ptr(), msg.len());
         return -1;
     }
+    if s.alpn_cfg_bad != 0 {
+        let msg = b"[tls] refusing to construct: `alpn` must be comma-separated names of 1..=16 bytes, 64 bytes in all";
+        dev_log(sys, 1, msg.as_ptr(), msg.len());
+        return -1;
+    }
     // The DTLS client's peer. A datagram session is keyed by the address
     // its records arrive from, so this one is a literal; a peer known only
     // by name has nothing to key on until it answers. A stream instance
@@ -1979,10 +2004,37 @@ fn rsa_identity_suite(der: &[u8]) -> Option<u16> {
     }
 }
 
+/// Is `list` a usable `alpn` parameter: comma-separated names, each 1..=
+/// `ALPN_NAME_MAX` printable ASCII bytes, `ALPN_CFG_MAX` bytes in all?
+fn alpn_list_ok(list: &[u8]) -> bool {
+    if list.is_empty() || list.len() > ALPN_CFG_MAX {
+        return false;
+    }
+    list.split(|&b| b == b',').all(|n| {
+        !n.is_empty() && n.len() <= ALPN_NAME_MAX && n.iter().all(|&c| (0x21..0x7F).contains(&c))
+    })
+}
+
+/// The protocols this instance offers (client) or accepts (server), in its
+/// preference order, comma-separated: the `alpn` parameter, else
+/// `http/1.1` under `alpn_h1_only`, else `h2,http/1.1`. Copied out so a
+/// caller holding a session borrow can use it.
+fn alpn_list(s: &TlsState) -> ([u8; ALPN_CFG_MAX], usize) {
+    let mut out = [0u8; ALPN_CFG_MAX];
+    let src: &[u8] = if s.alpn_cfg_len > 0 {
+        &s.alpn_cfg[..s.alpn_cfg_len as usize]
+    } else if s.alpn_h1_only != 0 {
+        b"http/1.1"
+    } else {
+        ALPN_DEFAULT
+    };
+    out[..src.len()].copy_from_slice(src);
+    (out, src.len())
+}
+
 /// Parse extended TLV entries: `cert_file` (10), `key_file` (11), the
-/// deployment's `trust` bundle (12), `verify_hostname` (13), `verify_uri`
-/// (15), and the operator's `--ca` bundle (16). Tag 14 is `alpn`, which
-/// this module does not consume.
+/// deployment's `trust` bundle (12), `verify_hostname` (13), `alpn` (14),
+/// `verify_uri` (15), and the operator's `--ca` bundle (16).
 /// Scans the entire params
 /// blob; extended entries use `tag + 0x00 + len_hi + len_lo`.
 unsafe fn parse_extended_params(s: &mut TlsState, params: *const u8, params_len: usize) {
@@ -2014,8 +2066,14 @@ unsafe fn parse_extended_params(s: &mut TlsState, params: *const u8, params_len:
     // Search for extended TLV pattern: tag + 0x00 + len_hi + len_lo
     while pos + 4 <= end {
         let tag = data[pos];
-        let ext_tags =
-            tag == 10 || tag == 11 || tag == 12 || tag == 13 || tag == 15 || tag == 16 || tag == 17;
+        let ext_tags = tag == 10
+            || tag == 11
+            || tag == 12
+            || tag == 13
+            || tag == 14
+            || tag == 15
+            || tag == 16
+            || tag == 17;
         if ext_tags && pos + 1 < end && data[pos + 1] == 0x00 && pos + 4 <= end {
             let len = ((data[pos + 2] as usize) << 8) | (data[pos + 3] as usize);
             let data_start = pos + 4;
@@ -2079,6 +2137,17 @@ unsafe fn parse_extended_params(s: &mut TlsState, params: *const u8, params_len:
                             len,
                         );
                         s.expected_dns_len = len;
+                    }
+                }
+                14 => {
+                    // `alpn`: kept whole or refused. A clipped list would
+                    // offer, or select, a protocol nobody configured.
+                    let list = core::slice::from_raw_parts(data.as_ptr().add(data_start), len);
+                    if alpn_list_ok(list) {
+                        core::ptr::copy_nonoverlapping(list.as_ptr(), s.alpn_cfg.as_mut_ptr(), len);
+                        s.alpn_cfg_len = len as u8;
+                    } else {
+                        s.alpn_cfg_bad = 1;
                     }
                 }
                 15 => {
@@ -2382,7 +2451,7 @@ unsafe fn tcp_module_step(s: &mut TlsState) -> i32 {
             // and the peer / HTTP consumer eventually times out.
             let cid = s.sessions[i].conn_id;
             let _ = tls_write_or_count(s, s.cipher_out, NET_CMD_CLOSE, cid, core::ptr::null(), 0);
-            let _ = tls_send_closed(s, cid, CLOSED_GONE);
+            let _ = tell_session_ended(s, i);
             s.free_error = s.free_error.wrapping_add(1);
             continuity_session_ending(s, i, abi::contracts::net::session_ctrl::END_TRANSPORT);
             s.sessions[i].reset();
@@ -2791,6 +2860,24 @@ unsafe fn tcp_module_step(s: &mut TlsState) -> i32 {
                 // A session closed by its own consumer (or moved closing)
                 // ends here; that consumer is not told again.
                 let own_close = si >= 0 && s.sessions[si as usize].local_close != 0;
+                // A dial whose handshake had not completed is answered as
+                // the connect failure it is (`tell_session_ended`): its
+                // consumer never learned the connection id a MSG_CLOSED
+                // would name.
+                if si >= 0
+                    && !own_close
+                    && s.sessions[si as usize].held_msg_type == NET_MSG_CONNECTED
+                {
+                    let _ = tell_session_ended(s, si as usize);
+                    s.free_peer_closed = s.free_peer_closed.wrapping_add(1);
+                    continuity_session_ending(
+                        s,
+                        si as usize,
+                        abi::contracts::net::session_ctrl::END_TRANSPORT,
+                    );
+                    s.sessions[si as usize].reset();
+                    continue;
+                }
                 if si >= 0 {
                     s.free_peer_closed = s.free_peer_closed.wrapping_add(1);
                     continuity_session_ending(
@@ -3304,6 +3391,24 @@ unsafe fn tcp_module_step(s: &mut TlsState) -> i32 {
                             let (exp, exp_len, exp_ip) = connect_expected(s, &target);
                             if !connect_admissible(s, exp_len) {
                                 let err = [(-1i8) as u8, ntb[0], ntb[1]]; // EPERM + downstream tag
+                                let _ = tls_write_or_count(
+                                    s,
+                                    s.clear_out,
+                                    NET_MSG_ERROR,
+                                    0,
+                                    err.as_ptr(),
+                                    err.len() as u16,
+                                );
+                                forward = false;
+                            } else if s.mode == MODE_CLIENT && !identity_dialable(s) {
+                                // The label identity is not certified yet
+                                // (nor, under `trust_issuer`, its anchor
+                                // adopted): a handshake now could only
+                                // fail. Not dialled; EAGAIN on the
+                                // request's tag, and the requester's
+                                // backoff dials again.
+                                identity_refuse_dial(s);
+                                let err = [abi::errno::EAGAIN as i8 as u8, ntb[0], ntb[1]];
                                 let _ = tls_write_or_count(
                                     s,
                                     s.clear_out,
@@ -5379,7 +5484,7 @@ unsafe fn pump_recv_client_hello(s: &mut TlsState, idx: usize) -> bool {
     let sys = &*s.syscalls;
     // Captured before the `sess` borrow so the ALPN selection below can consult
     // it without re-borrowing `s`.
-    let alpn_h1_only = s.alpn_h1_only != 0;
+    let (accepted, accepted_len) = alpn_list(s);
     let sess = &mut s.sessions[idx];
 
     let (msg, total, msg_type) = match driver_read_handshake_message(sess) {
@@ -5446,26 +5551,28 @@ unsafe fn pump_recv_client_hello(s: &mut TlsState, idx: usize) -> bool {
         sess.driver.transcript = Some(Transcript::new(sess.driver.suite.hash_alg()));
     }
 
-    // ALPN selection (RFC 7301 + RFC 8446 §4.6.1). The server's
-    // preference order is `h2` then `http/1.1`; if the client's ALPN
-    // extension overlaps with that list, we record the chosen
-    // protocol so the EncryptedExtensions builder can echo it back.
-    // When `alpn_h1_only` is set the server advertises only `http/1.1`,
-    // so a dual-offering client is steered to HTTP/1.1.
+    // ALPN selection (RFC 7301 + RFC 8446 §4.6.1), in the SERVER's
+    // preference order: the first protocol of this instance's list
+    // (`alpn_list`: the `alpn` parameter, else `http/1.1` under
+    // `alpn_h1_only`, else `h2,http/1.1`) that the client offered is
+    // recorded, for the EncryptedExtensions builder to echo and for the
+    // held completion to report to the clear side. No overlap, or no
+    // offer, selects nothing and the handshake proceeds without ALPN.
     sess.driver.alpn_selected_len = 0;
     if let Some(list) = ch.alpn_protos {
-        for offered in alpn_iter(list) {
-            if offered == b"http/1.1" || (!alpn_h1_only && offered == b"h2") {
-                let n = offered.len();
-                if n <= sess.driver.alpn_selected.len() {
-                    core::ptr::copy_nonoverlapping(
-                        offered.as_ptr(),
-                        sess.driver.alpn_selected.as_mut_ptr(),
-                        n,
-                    );
-                    sess.driver.alpn_selected_len = n as u8;
-                    break;
-                }
+        for mine in accepted[..accepted_len].split(|&b| b == b',') {
+            let n = mine.len();
+            if n == 0 || n > sess.driver.alpn_selected.len() {
+                continue;
+            }
+            if alpn_iter(list).any(|offered| offered == mine) {
+                core::ptr::copy_nonoverlapping(
+                    mine.as_ptr(),
+                    sess.driver.alpn_selected.as_mut_ptr(),
+                    n,
+                );
+                sess.driver.alpn_selected_len = n as u8;
+                break;
             }
         }
     }
@@ -6136,6 +6243,36 @@ unsafe fn tls_send_closed(s: &mut TlsState, conn_id: u16, kind: u8) -> bool {
     tls_write_or_count(s, s.clear_out, NET_MSG_CLOSED, conn_id, &kind, 1)
 }
 
+/// Tell the clear side that session `idx` has ended without its consumer
+/// closing it.
+///
+/// A client dial whose handshake never completed still holds its
+/// `MSG_CONNECTED`: the requester has not been told the connection id and
+/// is waiting on the completion of its `CMD_CONNECT_TO`, which only a
+/// `MSG_CONNECTED` or a TAGGED `MSG_ERROR` ends (net_proto `MSG_ERROR`). A
+/// `MSG_CLOSED` under an id it never learned names nothing it holds, so it
+/// would sit until its own connect timeout. It is answered instead as the
+/// connect failure it is: `[conn_id][ECONNREFUSED][requester tag]`, on the
+/// tag its dial carried, the shape every other refused dial here takes.
+/// Every other session — established, or an accept its consumer has not
+/// seen — is told `MSG_CLOSED` `CLOSED_GONE`.
+unsafe fn tell_session_ended(s: &mut TlsState, idx: usize) -> bool {
+    let cid = s.sessions[idx].conn_id;
+    if s.sessions[idx].held_msg_type == NET_MSG_CONNECTED {
+        let tb = s.sessions[idx].downstream_tag.to_le_bytes();
+        let err = [abi::errno::ECONNREFUSED as i8 as u8, tb[0], tb[1]];
+        return tls_write_or_count(
+            s,
+            s.clear_out,
+            NET_MSG_ERROR,
+            cid,
+            err.as_ptr(),
+            err.len() as u16,
+        );
+    }
+    tls_send_closed(s, cid, CLOSED_GONE)
+}
+
 /// Forward a session's held `MSG_ACCEPTED` / `MSG_CONNECTED` to clear_out,
 /// clearing the latch ONLY if the write lands. A dropped completion stays
 /// latched and is retried per-step (the Ready-session loop) so the clear-side
@@ -6145,13 +6282,21 @@ unsafe fn forward_held_completion(s: &mut TlsState, idx: usize) {
     let held = s.sessions[idx].held_msg_type;
     if held != 0 {
         let generation = s.sessions[idx].generation;
+        // The protocol the handshake negotiated (ALPN), reported after the
+        // generation (`net_proto::session_alpn`); a zero length for none.
+        let alpn_len = (s.sessions[idx].driver.alpn_selected_len as usize).min(ALPN_NAME_MAX);
+        let alpn_buf = s.sessions[idx].driver.alpn_selected;
+        let alpn = &alpn_buf[..alpn_len];
         // `tls_write_or_count` writes the connection id itself, so a tail
-        // starts after it: the fixed part less the id, then the generation.
+        // starts after it: the fixed part less the id, then the generation,
+        // then the protocol.
+        const TAIL_MAX: usize = 2 + net_proto::SESSION_GENERATION_LEN + 1 + ALPN_NAME_MAX;
         let ok = if held == NET_MSG_CONNECTED {
             const AT: usize = net_proto::CONNECTED_FIXED - net_proto::CONN_ID_LEN;
-            let mut tail = [0u8; AT + net_proto::SESSION_GENERATION_LEN];
+            let mut tail = [0u8; TAIL_MAX];
             tail[..AT].copy_from_slice(&s.sessions[idx].downstream_tag.to_le_bytes());
             let n = net_proto::put_session_generation(&mut tail, AT, generation).unwrap_or(AT);
+            let n = net_proto::put_session_alpn(&mut tail, AT, alpn).unwrap_or(n);
             tls_write_or_count(s, s.clear_out, held, conn_id, tail.as_ptr(), n as u16)
         } else {
             // NET_MSG_ACCEPTED: carry the listener port the connection was
@@ -6164,9 +6309,10 @@ unsafe fn forward_held_completion(s: &mut TlsState, idx: usize) {
             // (`net_proto::session_generation`).
             if s.accept_port != 0 {
                 const AT: usize = net_proto::ACCEPTED_FIXED - net_proto::CONN_ID_LEN;
-                let mut tail = [0u8; AT + net_proto::SESSION_GENERATION_LEN];
+                let mut tail = [0u8; TAIL_MAX];
                 tail[..AT].copy_from_slice(&s.accept_port.to_le_bytes());
                 let n = net_proto::put_session_generation(&mut tail, AT, generation).unwrap_or(AT);
+                let n = net_proto::put_session_alpn(&mut tail, AT, alpn).unwrap_or(n);
                 tls_write_or_count(s, s.clear_out, held, conn_id, tail.as_ptr(), n as u16)
             } else {
                 tls_write_or_count(s, s.clear_out, held, conn_id, core::ptr::null(), 0)
@@ -6666,13 +6812,13 @@ unsafe fn service_pending_peer_identity(s: &mut TlsState) {
 #[inline(never)]
 unsafe fn pump_send_client_hello(s: &mut TlsState, idx: usize) -> bool {
     let sys = &*s.syscalls;
-    // `alpn_h1_only` governs BOTH directions: the server's
-    // EncryptedExtensions selection (below, server mode) and the client
-    // offer here. An HTTP/1.1-only consumer (e.g. `ota_registry`
-    // against a Go registry whose h2 path expects a preface) must not
-    // offer `h2`, or the peer selects it and the plain-text request is
-    // read as a bogus HTTP/2 preface.
-    let alpn_h1_only = s.alpn_h1_only != 0;
+    // The offer is `alpn_list`, the list the server side selects from:
+    // `alpn`, else `http/1.1` under `alpn_h1_only`, else `h2,http/1.1`.
+    // An HTTP/1.1-only consumer (e.g. `ota_registry` against a Go registry
+    // whose h2 path expects a preface) must not offer `h2`, or the peer
+    // selects it and the plain-text request is read as a bogus HTTP/2
+    // preface.
+    let (offer, offer_len) = alpn_list(s);
     // SNI is emitted only when a DNS identity is the thing being
     // authenticated. Under `pinned` there is no authenticated name, and
     // disclosing an unauthenticated one would promise nothing; a peer
@@ -6698,7 +6844,7 @@ unsafe fn pump_send_client_hello(s: &mut TlsState, idx: usize) -> bool {
     sess.driver.peer_session_id = session_id;
     sess.driver.peer_session_id_len = 32;
 
-    let alpn: &[u8] = if alpn_h1_only { b"http/1.1" } else { &[] };
+    let alpn: &[u8] = &offer[..offer_len];
     let x25519_pub = sess.driver.x25519_public;
     let msg_len = build_client_hello_sni(
         &random,
@@ -6748,6 +6894,28 @@ unsafe fn pump_recv_encrypted(
                 s.sessions[idx].state = SessionState::Error;
                 s.last_err_site = 34;
                 return true;
+            }
+            // The server's ALPN selection (RFC 7301 §3.2): one of the
+            // protocols offered, or none. Anything else is a protocol this
+            // client's consumer never agreed to speak.
+            if expected_type == HT_ENCRYPTED_EXTENSIONS {
+                s.sessions[idx].driver.alpn_selected_len = 0;
+                if len >= 4 {
+                    if let Some(chosen) = parse_encrypted_extensions_alpn(&data[4..len]) {
+                        let (offer, offer_len) = alpn_list(s);
+                        let n = chosen.len();
+                        let offered = offer[..offer_len]
+                            .split(|&b| b == b',')
+                            .any(|o| o == chosen);
+                        if !offered || n > s.sessions[idx].driver.alpn_selected.len() {
+                            s.sessions[idx].state = SessionState::Error;
+                            s.last_err_site = 50;
+                            return true;
+                        }
+                        s.sessions[idx].driver.alpn_selected[..n].copy_from_slice(chosen);
+                        s.sessions[idx].driver.alpn_selected_len = n as u8;
+                    }
+                }
             }
             // Update transcript
             if let Some(ref mut t) = s.sessions[idx].driver.transcript {
@@ -7725,9 +7893,9 @@ unsafe fn try_decrypt_forward(s: &mut TlsState, idx: usize) {
                 }
                 if *ct.as_ptr().add(1) == ALERT_CLOSE_NOTIFY {
                     sess.state = SessionState::Closed;
-                    let conn_id = sess.conn_id;
-                    // Best-effort close notification.
-                    let _ = tls_send_closed(s, conn_id, CLOSED_GONE);
+                    // Best-effort close notification (a connect failure
+                    // while the completion is still held).
+                    let _ = tell_session_ended(s, idx);
                     return;
                 }
                 sess.state = SessionState::Error;

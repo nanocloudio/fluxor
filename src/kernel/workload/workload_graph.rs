@@ -241,36 +241,372 @@ fn resolver_ctx_ok(v: &[u8]) -> bool {
     at == v.len()
 }
 
-/// Walk the CREATE's Tier-2 options: the resolver context is taken (its
-/// value, or None), every other entry is advisory unless required, and a
-/// required entry this backend does not realize fails admission (`ENOSYS`).
-fn create_options(opts: &[u8]) -> Result<Option<&[u8]>, i32> {
-    let mut at = 0;
+/// One Tier-2 option entry: `[ns_len:u8][ns][key_len:u8][key][flags:u8]
+/// [val_len:u16 LE][val]`.
+#[derive(Clone, Copy)]
+struct CreateOption<'a> {
+    ns: &'a [u8],
+    key: &'a [u8],
+    flags: u8,
+    val: &'a [u8],
+}
+
+/// The entries of a Tier-2 options envelope, in order; `Err(EINVAL)` at the
+/// first that overruns it.
+struct CreateOptionIter<'a> {
+    opts: &'a [u8],
+    at: usize,
+}
+
+impl<'a> Iterator for CreateOptionIter<'a> {
+    type Item = Result<CreateOption<'a>, i32>;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.at >= self.opts.len() {
+            return None;
+        }
+        let opts = self.opts;
+        let at = self.at;
+        let entry = || -> Result<(CreateOption<'a>, usize), i32> {
+            let ns_len = *opts.get(at).ok_or(errno::EINVAL)? as usize;
+            let ns = opts.get(at + 1..at + 1 + ns_len).ok_or(errno::EINVAL)?;
+            let k = at + 1 + ns_len;
+            let key_len = *opts.get(k).ok_or(errno::EINVAL)? as usize;
+            let key = opts.get(k + 1..k + 1 + key_len).ok_or(errno::EINVAL)?;
+            let f = k + 1 + key_len;
+            let flags = *opts.get(f).ok_or(errno::EINVAL)?;
+            let vl = u16::from_le_bytes([
+                *opts.get(f + 1).ok_or(errno::EINVAL)?,
+                *opts.get(f + 2).ok_or(errno::EINVAL)?,
+            ]) as usize;
+            let val = opts.get(f + 3..f + 3 + vl).ok_or(errno::EINVAL)?;
+            Ok((
+                CreateOption {
+                    ns,
+                    key,
+                    flags,
+                    val,
+                },
+                f + 3 + vl,
+            ))
+        };
+        match entry() {
+            Ok((o, next)) => {
+                self.at = next;
+                Some(Ok(o))
+            }
+            Err(e) => {
+                self.at = opts.len();
+                Some(Err(e))
+            }
+        }
+    }
+}
+
+fn create_option_entries(opts: &[u8]) -> CreateOptionIter<'_> {
+    CreateOptionIter { opts, at: 0 }
+}
+
+/// An `env`/`var` entry's `(name, value)`: the name up to the first `=`,
+/// never empty, at most `wl::env::MAX_NAME`; `None` for anything else.
+fn env_entry(val: &[u8]) -> Option<(&[u8], &[u8])> {
+    let eq = val.iter().position(|&b| b == b'=')?;
+    (eq > 0 && eq <= wl::env::MAX_NAME).then(|| (&val[..eq], &val[eq + 1..]))
+}
+
+/// Whether this backend lends volumes (`wl::volume`): where the platform
+/// resolves a workload's `fs` paths through a root it can bind beneath.
+const LENDS_VOLUMES: bool = cfg!(feature = "host-linux");
+
+/// What a CREATE's Tier-2 options ask of this backend, every entry checked.
+struct CreateOptions<'a> {
+    /// The owner's name-service context, when one was given.
+    resolver: Option<&'a [u8]>,
+    /// The options envelope itself: its `env`/`var` entries feed the
+    /// subgraph's env binds ([`bind_env`]), its volumes the platform root.
+    opts: &'a [u8],
+}
+
+/// Walk the CREATE's Tier-2 options: the resolver context is taken, the
+/// environment and the volumes are checked, every other entry is advisory
+/// unless required, and a required entry this backend does not realize
+/// fails admission (`ENOSYS`).
+fn create_options(opts: &[u8]) -> Result<CreateOptions<'_>, i32> {
     let mut ctx = None;
-    while at < opts.len() {
-        let ns_len = *opts.get(at).ok_or(errno::EINVAL)? as usize;
-        let ns = opts.get(at + 1..at + 1 + ns_len).ok_or(errno::EINVAL)?;
-        let k = at + 1 + ns_len;
-        let key_len = *opts.get(k).ok_or(errno::EINVAL)? as usize;
-        let key = opts.get(k + 1..k + 1 + key_len).ok_or(errno::EINVAL)?;
-        let f = k + 1 + key_len;
-        let flags = *opts.get(f).ok_or(errno::EINVAL)?;
-        let vl = u16::from_le_bytes([
-            *opts.get(f + 1).ok_or(errno::EINVAL)?,
-            *opts.get(f + 2).ok_or(errno::EINVAL)?,
-        ]) as usize;
-        let val = opts.get(f + 3..f + 3 + vl).ok_or(errno::EINVAL)?;
-        if ns == wl::resolver::NS && key == wl::resolver::KEY {
-            if !resolver_ctx_ok(val) {
+    let mut volumes = 0usize;
+    for o in create_option_entries(opts) {
+        let o = o?;
+        if o.ns == wl::resolver::NS && o.key == wl::resolver::KEY {
+            if !resolver_ctx_ok(o.val) {
                 return Err(errno::EINVAL);
             }
-            ctx = Some(val);
-        } else if flags & wl::opt::OPT_REQUIRED != 0 {
+            ctx = Some(o.val);
+        } else if o.ns == wl::env::NS && o.key == wl::env::KEY {
+            if env_entry(o.val).is_none() {
+                return Err(errno::EINVAL);
+            }
+        } else if LENDS_VOLUMES && o.ns == wl::volume::NS && o.key == wl::volume::KEY {
+            if volume_entry(o.val).is_none() {
+                return Err(errno::EINVAL);
+            }
+            volumes += 1;
+            if volumes > wl::volume::MAX {
+                return Err(errno::E2BIG);
+            }
+        } else if o.flags & wl::opt::OPT_REQUIRED != 0 {
             return Err(errno::ENOSYS);
         }
-        at = f + 3 + vl;
     }
-    Ok(ctx)
+    Ok(CreateOptions {
+        resolver: ctx,
+        opts,
+    })
+}
+
+/// A `mount`/`bind` value: `(src, dst, read_only)`. `src` absolute, `dst`
+/// not empty, `ro` `1` or `0` (writable when left out, as the host-process
+/// backend reads it); nothing else.
+fn volume_entry(val: &[u8]) -> Option<(&[u8], &[u8], bool)> {
+    let mut parts = val.split(|&b| b == 0);
+    let src = parts.next()?;
+    let dst = parts.next()?;
+    let ro = match parts.next() {
+        None | Some(b"0") => false,
+        Some(b"1") => true,
+        Some(_) => return None,
+    };
+    if parts.next().is_some() || !src.starts_with(b"/") || dst.is_empty() {
+        return None;
+    }
+    Some((src, dst, ro))
+}
+
+/// Lend the CREATE's volumes to `owner`, before any of its modules runs.
+/// A volume that cannot be lent fails the CREATE.
+#[cfg(feature = "host-linux")]
+fn lend_volumes(owner: OwnerHandle, opts: &[u8]) -> Result<(), i32> {
+    for o in create_option_entries(opts).flatten() {
+        if o.ns == wl::volume::NS && o.key == wl::volume::KEY {
+            let (src, dst, ro) = volume_entry(o.val).ok_or(errno::EINVAL)?;
+            // SAFETY: scheduler thread, as every platform dispatch.
+            unsafe { crate::platform::linux::owner_root::lend(owner, src, dst, ro)? };
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "host-linux"))]
+fn lend_volumes(_owner: OwnerHandle, _opts: &[u8]) -> Result<(), i32> {
+    Ok(())
+}
+
+// ── Env binds ─────────────────────────────────────────────────────
+//
+// A module param the graph binds to an environment name travels as an env
+// bind record (`wl::env`, tag `wl::env::BIND_TAG`) in its params TLV. The
+// backend copies the caller's subgraph into its own memory through
+// [`bind_env`], which writes every record out as the param's entries.
+
+/// The value the last `env`/`var` entry gives `name`.
+fn env_value<'a>(opts: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
+    let mut found = None;
+    for o in create_option_entries(opts).flatten() {
+        if o.ns == wl::env::NS && o.key == wl::env::KEY {
+            if let Some((n, v)) = env_entry(o.val) {
+                if n == name {
+                    found = Some(v);
+                }
+            }
+        }
+    }
+    found
+}
+
+/// An integer as an env value writes it: decimal, `0x` hex, `true`/`false`.
+fn parse_env_int(v: &[u8]) -> Option<u64> {
+    match v {
+        b"true" => return Some(1),
+        b"false" => return Some(0),
+        _ => {}
+    }
+    let (digits, radix) = match v.strip_prefix(b"0x").or_else(|| v.strip_prefix(b"0X")) {
+        Some(h) => (h, 16u32),
+        None => (v, 10u32),
+    };
+    if digits.is_empty() {
+        return None;
+    }
+    let mut n: u64 = 0;
+    for &c in digits {
+        let d = (c as char).to_digit(radix)? as u64;
+        n = n.checked_mul(radix as u64)?.checked_add(d)?;
+    }
+    Some(n)
+}
+
+/// A bounded writer over the backend's copy of the subgraph.
+struct BlobOut<'a> {
+    buf: &'a mut [u8],
+    at: usize,
+}
+
+impl BlobOut<'_> {
+    fn put(&mut self, b: &[u8]) -> Result<(), i32> {
+        let end = self.at.checked_add(b.len()).ok_or(errno::E2BIG)?;
+        self.buf
+            .get_mut(self.at..end)
+            .ok_or(errno::E2BIG)?
+            .copy_from_slice(b);
+        self.at = end;
+        Ok(())
+    }
+
+    /// One params entry, or several 255-byte ones under `tag` for a value
+    /// longer than one entry carries.
+    fn entries(&mut self, tag: u8, v: &[u8]) -> Result<(), i32> {
+        for chunk in v.chunks(u8::MAX as usize) {
+            self.put(&[tag, chunk.len() as u8])?;
+            self.put(chunk)?;
+        }
+        Ok(())
+    }
+}
+
+/// Write one env bind record out as its param's entries.
+fn emit_bind(rec: &[u8], opts: &[u8], out: &mut BlobOut<'_>) -> Result<(), i32> {
+    use wl::env as e;
+    if rec.len() < e::HEAD {
+        return Err(errno::EINVAL);
+    }
+    let (target, kind, flags, name_len) = (rec[0], rec[1], rec[2], rec[3] as usize);
+    let both = e::FLAG_REQUIRED | e::FLAG_DEFAULT;
+    if target >= e::BIND_TAG
+        || name_len == 0
+        || name_len > e::MAX_NAME
+        || flags & !both != 0
+        || flags == both
+    {
+        return Err(errno::EINVAL);
+    }
+    let name = rec.get(e::HEAD..e::HEAD + name_len).ok_or(errno::EINVAL)?;
+    let default = &rec[e::HEAD + name_len..];
+    if flags & e::FLAG_DEFAULT == 0 && !default.is_empty() {
+        return Err(errno::EINVAL);
+    }
+    let width = match kind {
+        e::KIND_U8 => Some(1),
+        e::KIND_U16 => Some(2),
+        e::KIND_U32 => Some(4),
+        e::KIND_STR | e::KIND_STR_CHUNKED => None,
+        _ => return Err(errno::EINVAL),
+    };
+    let text = |v: &[u8], out: &mut BlobOut<'_>| -> Result<(), i32> {
+        if kind == e::KIND_STR && v.len() > u8::MAX as usize {
+            return Err(errno::EINVAL);
+        }
+        out.entries(target, v)
+    };
+    match (env_value(opts, name), width) {
+        (Some(v), Some(w)) => {
+            let n = parse_env_int(v).ok_or(errno::EINVAL)?;
+            if n >> (8 * w) != 0 {
+                return Err(errno::EINVAL);
+            }
+            out.entries(target, &n.to_le_bytes()[..w])
+        }
+        (Some(v), None) => text(v, out),
+        (None, Some(w)) if flags & e::FLAG_DEFAULT != 0 => {
+            if default.len() != w {
+                return Err(errno::EINVAL);
+            }
+            out.entries(target, default)
+        }
+        (None, None) if flags & e::FLAG_DEFAULT != 0 => text(default, out),
+        (None, _) if flags & e::FLAG_REQUIRED != 0 => Err(errno::EINVAL),
+        (None, _) => Ok(()),
+    }
+}
+
+/// TLV header byte and terminator of a module's params.
+const TLV_MAGIC: u8 = 0xFE;
+const TLV_END: u8 = 0xFF;
+
+/// Write a module's params out with every env bind record replaced by its
+/// param's entries; params with none are copied as they are.
+fn bind_params(p: &[u8], opts: &[u8], out: &mut BlobOut<'_>) -> Result<(), i32> {
+    let start = if p.len() >= 4 && p[0] == TLV_MAGIC {
+        4
+    } else {
+        0
+    };
+    // Is there a record at all? Walked as the kernel walks params.
+    let mut pos = start;
+    let mut binds = false;
+    while pos + 2 <= p.len() && p[pos] != TLV_END {
+        binds |= p[pos] == wl::env::BIND_TAG;
+        pos += 2 + p[pos + 1] as usize;
+    }
+    if !binds {
+        return out.put(p);
+    }
+    let head_at = out.at;
+    out.put(&p[..start])?;
+    let payload_at = out.at;
+    let mut pos = start;
+    loop {
+        if pos + 2 > p.len() {
+            return Err(errno::EINVAL); // a record in params with no terminator
+        }
+        let (tag, len) = (p[pos], p[pos + 1] as usize);
+        if tag == TLV_END {
+            // The terminator, and whatever follows it, as they are; the
+            // header's advisory length runs through the terminator.
+            let end_at = out.at + 2;
+            out.put(&p[pos..])?;
+            if start == 4 {
+                let n = u16::try_from(end_at - payload_at).unwrap_or(u16::MAX);
+                out.buf[head_at + 2..head_at + 4].copy_from_slice(&n.to_le_bytes());
+            }
+            return Ok(());
+        }
+        let val = p.get(pos + 2..pos + 2 + len).ok_or(errno::EINVAL)?;
+        if tag == wl::env::BIND_TAG {
+            emit_bind(val, opts, out)?;
+        } else {
+            out.put(&p[pos..pos + 2 + len])?;
+        }
+        pos += 2 + len;
+    }
+}
+
+/// Copy an FLXA subgraph into `out` with each module's env bind records
+/// written out from the CREATE's `env`/`var` entries in `opts` (the
+/// contract's `wl::env`). The length written; `EINVAL` for a malformed
+/// subgraph or record, or a required name no entry gives; `E2BIG` when a
+/// module's params pass a `u16` or the subgraph `out`.
+pub fn bind_env(flxa: &[u8], opts: &[u8], out: &mut [u8]) -> Result<usize, i32> {
+    use crate::kernel::exec::scheduler::live::ADD_MODULE_FIXED_BYTES as FIXED;
+    if flxa.len() < FLXA_MIN_LEN {
+        return Err(errno::EINVAL);
+    }
+    let mut o = BlobOut { buf: out, at: 0 };
+    o.put(&flxa[..FLXA_MIN_LEN])?;
+    let modules = flxa[FLXA_MIN_LEN - 2] as usize;
+    let mut at = FLXA_MIN_LEN;
+    for _ in 0..modules {
+        let fixed = flxa.get(at..at + FIXED).ok_or(errno::EINVAL)?;
+        let plen = u16::from_be_bytes([fixed[FIXED - 2], fixed[FIXED - 1]]) as usize;
+        let params = flxa
+            .get(at + FIXED..at + FIXED + plen)
+            .ok_or(errno::EINVAL)?;
+        let record_at = o.at;
+        o.put(fixed)?;
+        bind_params(params, opts, &mut o)?;
+        let written = u16::try_from(o.at - record_at - FIXED).map_err(|_| errno::E2BIG)?;
+        o.buf[record_at + FIXED - 2..record_at + FIXED].copy_from_slice(&written.to_be_bytes());
+        at += FIXED + plen;
+    }
+    o.put(&flxa[at..])?;
+    Ok(o.at)
 }
 
 /// Record owner `owner`'s context (the CREATE that made it carried one).
@@ -659,6 +995,7 @@ unsafe fn begin_create(
     wants_identity: bool,
     identity: [u8; 16],
     spec: [u8; 32],
+    opts: &[u8],
 ) -> i32 {
     // ── A pack: the workload's own modules, staged as its code. Each must be
     //    the module asked for — its bytes match a pin — or one the node's
@@ -728,11 +1065,19 @@ unsafe fn begin_create(
         return errno::EINVAL;
     };
 
-    // ── The backend's own copy of the subgraph, carrying the header's
+    // ── The backend's own copy of the subgraph, its modules' env binds
+    //    written out from the CREATE's environment, carrying the header's
     //    identity (what `apply_add` allocates the owner by) and the memory
     //    ceiling clamped onto the subgraph's caps.
-    let blob = &mut (&mut *core::ptr::addr_of_mut!(PENDING_BLOB))[..flxa_len];
-    blob.copy_from_slice(flxa);
+    let pending = &mut *core::ptr::addr_of_mut!(PENDING_BLOB);
+    let blob_len = match bind_env(flxa, opts, pending) {
+        Ok(n) => n,
+        Err(e) => {
+            unstage(staged);
+            return e;
+        }
+    };
+    let blob = &mut pending[..blob_len];
     blob[FLXA_OWNER_UID_OFF..FLXA_OWNER_UID_OFF + 16].copy_from_slice(&identity);
     let mem_ceil = if memory_bytes == 0 {
         None
@@ -762,10 +1107,17 @@ unsafe fn begin_create(
             return e;
         }
     };
-    // What the owner may hold in the node's storage, set before any of its
-    // modules runs.
+    // What the owner may hold in the node's storage, and the volumes it is
+    // lent, set before any of its modules runs.
     scheduler::owners_mut().set_storage_cap(staged_add.handle(), storage_bytes);
     scheduler::owners_mut().set_storage_grant(staged_add.handle(), storage_grant);
+    if let Err(e) = lend_volumes(staged_add.handle(), opts) {
+        live::abandon_staged(staged_add);
+        if let Some(s) = staged {
+            code_pack::release(s);
+        }
+        return e;
+    }
     log::info!(
         "[workload] graph workload {}.{}: storage_bytes={}",
         staged_add.handle().slot,
@@ -911,10 +1263,11 @@ unsafe fn workload_create(arg: *mut u8, arg_len: usize) -> i32 {
     }
     // The Tier-2 options: the resolver context is this backend's; any other
     // required entry is refused before anything is staged.
-    let resolver_ctx = match create_options(&buf[opt_start..opt_end]) {
+    let options = match create_options(&buf[opt_start..opt_end]) {
         Ok(c) => c,
         Err(e) => return e,
     };
+    let resolver_ctx = options.resolver;
 
     // ── Who the workload is, and what it may hold.
     //
@@ -956,6 +1309,7 @@ unsafe fn workload_create(arg: *mut u8, arg_len: usize) -> i32 {
             wants_identity,
             identity,
             spec,
+            options.opts,
         );
         if rc != 0 {
             return rc;
@@ -1198,7 +1552,8 @@ unsafe fn workload_wait(owner: Option<OwnerHandle>, arg: *mut u8, arg_len: usize
 
 /// WORKLOAD_CAPS: write the metal backend's honest capability set. Same
 /// prefix shape as the Linux backend: `[postures:u8][source_kinds:u8]
-/// [ops:u16 LE][net:u8]` then an empty namespace directory `[ns_count:u16 = 0]`.
+/// [ops:u16 LE][net:u8]` then the namespace directory of the Tier-2 entries
+/// it realizes ([`GRAPH_OPTIONS`]), empty when `arg` is too short for it.
 ///
 /// # Safety
 /// `arg` must be valid for writes of `arg_len` (>= 7) bytes.
@@ -1229,26 +1584,58 @@ unsafe fn workload_caps(arg: *mut u8, arg_len: usize) -> i32 {
     // and an owned address is served only by a listener bound to it, never by
     // a host wildcard listener. Both bits are honestly set.
     out[4] = wl::caps::NET_ISO_OWN | wl::caps::NET_IDENTITY;
-    // One Tier-2 entry is realized: the owner's name-service context, read
-    // by the net provider for the owner's lanes.
-    let ns = wl::resolver::NS;
-    let key = wl::resolver::KEY;
-    let need = 7 + 1 + ns.len() + 2 + 1 + key.len();
-    if arg_len < need {
+    // The Tier-2 entries realized: the owner's name-service context, read
+    // by the net provider for the owner's lanes; its environment, written
+    // into its modules' env binds; and, where the platform roots a
+    // workload's files, the volumes it is lent.
+    let n = write_option_directory(&mut out[5..], GRAPH_OPTIONS);
+    if n == 0 {
         out[5..7].copy_from_slice(&0u16.to_le_bytes());
         return 7;
     }
-    out[5..7].copy_from_slice(&1u16.to_le_bytes()); // ns_count
-    let mut at = 7;
-    out[at] = ns.len() as u8;
-    out[at + 1..at + 1 + ns.len()].copy_from_slice(ns);
-    at += 1 + ns.len();
-    out[at..at + 2].copy_from_slice(&1u16.to_le_bytes()); // key_count
-    at += 2;
-    out[at] = key.len() as u8;
-    out[at + 1..at + 1 + key.len()].copy_from_slice(key);
-    at += 1 + key.len();
-    at as i32
+    (5 + n) as i32
+}
+
+/// The Tier-2 `(namespace, keys)` the graph backend realizes.
+const GRAPH_OPTIONS: &[(&[u8], &[&[u8]])] = if LENDS_VOLUMES {
+    &[
+        (wl::resolver::NS, &[wl::resolver::KEY]),
+        (wl::env::NS, &[wl::env::KEY]),
+        (wl::volume::NS, &[wl::volume::KEY]),
+    ]
+} else {
+    &[
+        (wl::resolver::NS, &[wl::resolver::KEY]),
+        (wl::env::NS, &[wl::env::KEY]),
+    ]
+};
+
+/// Write a `CAPS` namespace directory `[ns_count:u16] then ns_count ×
+/// ([ns_len:u8][ns][key_count:u16] then key_count × ([key_len:u8][key]))`
+/// into `out`; its length, or 0 when `out` is too short for it.
+pub fn write_option_directory(out: &mut [u8], dir: &[(&[u8], &[&[u8]])]) -> usize {
+    let need = 2 + dir
+        .iter()
+        .map(|(ns, keys)| 1 + ns.len() + 2 + keys.iter().map(|k| 1 + k.len()).sum::<usize>())
+        .sum::<usize>();
+    if out.len() < need {
+        return 0;
+    }
+    out[0..2].copy_from_slice(&(dir.len() as u16).to_le_bytes());
+    let mut at = 2;
+    for (ns, keys) in dir {
+        out[at] = ns.len() as u8;
+        out[at + 1..at + 1 + ns.len()].copy_from_slice(ns);
+        at += 1 + ns.len();
+        out[at..at + 2].copy_from_slice(&(keys.len() as u16).to_le_bytes());
+        at += 2;
+        for k in *keys {
+            out[at] = k.len() as u8;
+            out[at + 1..at + 1 + k.len()].copy_from_slice(k);
+            at += 1 + k.len();
+        }
+    }
+    at
 }
 
 /// The metal `workload` (0x1A) provider dispatch. CREATE/CAPS are the `handle

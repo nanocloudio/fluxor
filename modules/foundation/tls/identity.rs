@@ -65,6 +65,8 @@ struct LabelIdentity {
     refused: u32,
     /// Handshakes refused because no certificate was held yet.
     early: u32,
+    /// Client dials refused (`EAGAIN`) because no certificate was held yet.
+    early_dials: u32,
     /// `trust_issuer`: the held chain's issuer is also a trust anchor.
     trust_issuer: u8,
     /// Anchors the graph configured; an adopted issuer sits after them.
@@ -97,6 +99,32 @@ impl LabelIdentity {
 /// file identity; for a label identity only once one is held.
 fn identity_presentable(s: &TlsState) -> bool {
     s.label_id.state == ID_NONE || s.label_id.state == ID_CERTIFIED
+}
+
+/// May a client dial now? A label identity that holds no certificate yet
+/// (and so, under `trust_issuer`, no adopted anchor either) could neither
+/// present itself nor verify a peer of its runtime authority: a dial now
+/// would fail its handshake and cost the peer one. Refused with `EAGAIN`
+/// on the requester's tag instead, which a consumer's backoff redials; a
+/// file identity, or none, may always dial.
+fn identity_dialable(s: &TlsState) -> bool {
+    if !s.label_id.configured() {
+        return true;
+    }
+    // Under `trust_issuer` a chain is taken only with its issuer adopted
+    // (`identity_take_chain`), so a certified identity has its anchor.
+    s.label_id.state == ID_CERTIFIED
+}
+
+/// Count, and say on the first and every 64th, a dial refused because the
+/// label identity is not certified yet.
+unsafe fn identity_refuse_dial(s: &mut TlsState) {
+    s.label_id.early_dials = s.label_id.early_dials.wrapping_add(1);
+    if s.label_id.early_dials & 63 == 1 {
+        let sys = &*s.syscalls;
+        let msg = b"[tls] identity not yet certified: dial refused EAGAIN";
+        dev_log(sys, 2, msg.as_ptr(), msg.len());
+    }
 }
 
 /// Refuse a session that reached its Certificate with nothing to present.

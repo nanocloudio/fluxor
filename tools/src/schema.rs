@@ -24,6 +24,217 @@ const TLV_MAGIC: u8 = 0xFE;
 const TLV_VERSION: u8 = 0x01;
 const TLV_END: u8 = 0xFF;
 
+// ============================================================================
+// Env binds
+// ============================================================================
+//
+// A workload module's param written `{env: NAME}` takes its value from the
+// workload's environment when the node creates it: the `env`/`var` Tier-2
+// options of the workload `CREATE` (`abi::contracts::workload::env`). The
+// param is packed as an env bind record — the param's tag, its kind, whether
+// it is required, the name and any default — under the reserved tag
+// [`env_bind::BIND_TAG`], and the node writes the record out as the param's
+// entries before any module is instantiated.
+//
+//   port: {env: PORT}                    required: no PORT fails the CREATE
+//   port: {env: PORT, default: 8080}     PORT, else 8080
+//   label: {env: LABEL, required: false} LABEL, else the module's own default
+//
+// Only a workload image (`fluxor build --emit=workload`) carries one: no
+// other graph is created with an environment, so anywhere else a binding is
+// refused (see [`with_env_binds`]). `${NAME}` stays refused everywhere
+// (`params::refuse_environment`): a graph is never read against the build
+// host's environment, and a binding names the workload's, explicitly.
+
+/// The env bind record. Mirrors `abi::contracts::workload::env`.
+pub mod env_bind {
+    pub const BIND_TAG: u8 = 0xED;
+    pub const MAX_NAME: usize = 128;
+    pub const KIND_U8: u8 = 0;
+    pub const KIND_U16: u8 = 1;
+    pub const KIND_U32: u8 = 2;
+    pub const KIND_STR: u8 = 3;
+    pub const KIND_STR_CHUNKED: u8 = 6;
+    pub const FLAG_REQUIRED: u8 = 0x01;
+    pub const FLAG_DEFAULT: u8 = 0x02;
+}
+
+/// One env bind a workload's params carry: the module, the param, the name
+/// and whether a CREATE must give it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EnvBindInfo {
+    pub module: String,
+    pub param: String,
+    pub name: String,
+    pub required: bool,
+}
+
+thread_local! {
+    /// The binds packed while [`with_env_binds`] runs; `None` outside it,
+    /// where a binding is refused.
+    static ENV_BINDS: std::cell::RefCell<Option<Vec<EnvBindInfo>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` (a workload image's packing) admitting env binds, and return
+/// what it packed with every bind it packed, in packing order.
+pub fn with_env_binds<R>(f: impl FnOnce() -> R) -> (R, Vec<EnvBindInfo>) {
+    let outer = ENV_BINDS.with(|b| b.replace(Some(Vec::new())));
+    let r = f();
+    let binds = ENV_BINDS.with(|b| b.replace(outer)).unwrap_or_default();
+    (r, binds)
+}
+
+/// A param value bound to the environment.
+struct EnvBinding {
+    name: String,
+    default: Option<Value>,
+    required: bool,
+}
+
+/// Whether `value` is an env binding (`{env: NAME, default?, required?}`).
+fn is_env_binding(value: &Value) -> bool {
+    value.as_object().is_some_and(|o| o.contains_key("env"))
+}
+
+/// Read an env binding. `Ok(None)` for any other value.
+fn env_binding(value: &Value, module_name: &str, key: &str) -> Result<Option<EnvBinding>, String> {
+    let Some(obj) = value.as_object().filter(|o| o.contains_key("env")) else {
+        return Ok(None);
+    };
+    let at = || format!("module '{module_name}': parameter '{key}'");
+    if let Some(k) = obj
+        .keys()
+        .find(|k| !matches!(k.as_str(), "env" | "default" | "required"))
+    {
+        return Err(format!(
+            "{}: an env binding takes `env`, `default` and `required`, not `{k}`",
+            at()
+        ));
+    }
+    let name = obj["env"].as_str().unwrap_or_default();
+    if name.is_empty()
+        || name.len() > env_bind::MAX_NAME
+        || name.bytes().any(|b| b == b'=' || b == 0)
+    {
+        return Err(format!(
+            "{}: `env` names a variable: 1..={} bytes, no `=`",
+            at(),
+            env_bind::MAX_NAME
+        ));
+    }
+    let default = obj.get("default").cloned();
+    let required = match obj.get("required") {
+        None => default.is_none(),
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return Err(format!("{}: `required` is true or false", at())),
+    };
+    if required && default.is_some() {
+        return Err(format!(
+            "{}: a required env binding has no default; drop one of them",
+            at()
+        ));
+    }
+    Ok(Some(EnvBinding {
+        name: name.into(),
+        default,
+        required,
+    }))
+}
+
+/// Pack `param`'s env bind record at `pos`; the position after it.
+fn pack_env_bind(
+    param: &SchemaParam,
+    b: &EnvBinding,
+    entry: &mut [u8],
+    pos: usize,
+    data_section: Option<&Value>,
+    module_name: &str,
+) -> Result<usize, String> {
+    let at = || format!("module '{module_name}': parameter '{}'", param.name);
+    if ENV_BINDS.with(|binds| binds.borrow().is_none()) {
+        return Err(format!(
+            "{}: `{{env: {}}}` binds it to the environment of a workload CREATE, and only a \
+             workload image (`fluxor build --emit=workload`) is created with one",
+            at(),
+            b.name
+        ));
+    }
+    if param.tag >= env_bind::BIND_TAG {
+        return Err(format!(
+            "{}: tag {:#04x} is reserved, so it cannot be bound to the environment",
+            at(),
+            param.tag
+        ));
+    }
+    let kind = match param.ptype {
+        ParamType::U8 => env_bind::KIND_U8,
+        ParamType::U16 => env_bind::KIND_U16,
+        ParamType::U32 => env_bind::KIND_U32,
+        ParamType::Str => env_bind::KIND_STR,
+        ParamType::StrChunked => env_bind::KIND_STR_CHUNKED,
+        ParamType::U16Array | ParamType::Blob => {
+            return Err(format!(
+                "{}: a {:?} parameter cannot be bound to the environment",
+                at(),
+                param.ptype
+            ))
+        }
+    };
+    let default: Option<Vec<u8>> = b.default.as_ref().map(|v| match param.ptype {
+        ParamType::U8 => vec![resolve_u8(v, param)],
+        ParamType::U16 => resolve_u16(v, param).to_le_bytes().to_vec(),
+        ParamType::U32 => resolve_u32(v, param).to_le_bytes().to_vec(),
+        _ => match v {
+            Value::String(s) => resolve_str_content(s, data_section).as_bytes().to_vec(),
+            other => other.to_string().into_bytes(),
+        },
+    });
+    let flags = if b.required {
+        env_bind::FLAG_REQUIRED
+    } else if default.is_some() {
+        env_bind::FLAG_DEFAULT
+    } else {
+        0
+    };
+    let mut rec = vec![param.tag, kind, flags, b.name.len() as u8];
+    rec.extend_from_slice(b.name.as_bytes());
+    rec.extend_from_slice(default.as_deref().unwrap_or_default());
+    if rec.len() > MAX_TLV_VALUE_LEN {
+        return Err(format!(
+            "{}: its env binding of `{}` is {} bytes, over the {MAX_TLV_VALUE_LEN} one entry \
+             carries — shorten the name or the default",
+            at(),
+            b.name,
+            rec.len()
+        ));
+    }
+    if pos + 2 + rec.len() >= entry.len() {
+        return Err(format!(
+            "{}: its env binding does not fit the module's config entry",
+            at()
+        ));
+    }
+    entry[pos] = env_bind::BIND_TAG;
+    entry[pos + 1] = rec.len() as u8;
+    entry[pos + 2..pos + 2 + rec.len()].copy_from_slice(&rec);
+    let info = EnvBindInfo {
+        module: module_name.into(),
+        param: param.name.clone(),
+        name: b.name.clone(),
+        required: b.required,
+    };
+    ENV_BINDS.with(|binds| {
+        if let Some(v) = binds.borrow_mut().as_mut() {
+            // A packing retried in a larger buffer packs the same bind again.
+            if !v.contains(&info) {
+                v.push(info);
+            }
+        }
+    });
+    Ok(pos + 2 + rec.len())
+}
+
 /// Parameter types (must match module-side param_macro.rs)
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ParamType {
@@ -409,7 +620,7 @@ pub fn build_params_from_schema(
                     .get(name)
                     .is_some_and(|&i| schema.params[i].ptype == ParamType::Blob)
             };
-            if value.is_object() && is_blob(key) {
+            if value.is_object() && (is_blob(key) || is_env_binding(value)) {
                 kv.insert(key.clone(), value.clone());
                 continue;
             }
@@ -490,6 +701,16 @@ pub fn build_params_from_schema(
                     }
                 }
             }
+            continue;
+        }
+
+        if let Some(b) = kv
+            .get(&param.name)
+            .map(|v| env_binding(v, module_name, &param.name))
+            .transpose()?
+            .flatten()
+        {
+            pos = pack_env_bind(param, &b, entry, pos, data_section, module_name)?;
             continue;
         }
 
@@ -1686,6 +1907,127 @@ mod tests {
             e.contains("share tag 54") && e.contains("step_budget_us"),
             "{e}"
         );
+    }
+
+    fn env_schema() -> ParamSchema {
+        let p = |tag, ptype, name: &str| SchemaParam {
+            tag,
+            ptype,
+            name: name.into(),
+            default: 0,
+            enums: HashMap::new(),
+        };
+        let params = vec![
+            p(10, ParamType::U16, "port"),
+            p(11, ParamType::Str, "label"),
+            p(12, ParamType::StrChunked, "body"),
+            p(13, ParamType::U8, "verbose"),
+        ];
+        let name_map = params
+            .iter()
+            .enumerate()
+            .map(|(i, q)| (q.name.clone(), i))
+            .collect();
+        ParamSchema { params, name_map }
+    }
+
+    /// The `(tag, value)` entries of a params TLV's basic section.
+    fn tlv_entries(entry: &[u8]) -> Vec<(u8, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut pos = 4;
+        while entry[pos] != TLV_END {
+            let len = entry[pos + 1] as usize;
+            out.push((entry[pos], entry[pos + 2..pos + 2 + len].to_vec()));
+            pos += 2 + len;
+        }
+        out
+    }
+
+    /// `{env: NAME}` packs an env bind record under the reserved tag, in the
+    /// param's place: its tag, kind, flags, name and default, as the kernel
+    /// reads them (`abi::contracts::workload::env`).
+    #[test]
+    fn an_env_binding_packs_a_bind_record_in_a_workload_image() {
+        let module = serde_json::json!({
+            "port": {"env": "PORT", "default": 8080},
+            "label": {"env": "POD_NAME"},
+            "body": {"env": "BODY", "required": false},
+            "verbose": 1,
+        });
+        let mut entry = vec![0u8; 1024];
+        let (end, binds) = with_env_binds(|| {
+            build_params_from_schema(&module, &env_schema(), &mut entry, 0, None, "svc")
+        });
+        let end = end.expect("env bindings pack in a workload image");
+        assert_eq!(entry[end - 2..end], [TLV_END, 0]);
+        let entries = tlv_entries(&entry);
+        let mut port = vec![10, env_bind::KIND_U16, env_bind::FLAG_DEFAULT, 4];
+        port.extend_from_slice(b"PORT");
+        port.extend_from_slice(&8080u16.to_le_bytes());
+        let mut label = vec![11, env_bind::KIND_STR, env_bind::FLAG_REQUIRED, 8];
+        label.extend_from_slice(b"POD_NAME");
+        let mut body = vec![12, env_bind::KIND_STR_CHUNKED, 0, 4];
+        body.extend_from_slice(b"BODY");
+        assert_eq!(
+            entries,
+            vec![
+                (env_bind::BIND_TAG, port),
+                (env_bind::BIND_TAG, label),
+                (env_bind::BIND_TAG, body),
+                (13, vec![1]),
+            ],
+            "each bound param is a record in schema order; the plain one packs as before"
+        );
+        let names: Vec<(&str, bool)> = binds
+            .iter()
+            .map(|b| (b.name.as_str(), b.required))
+            .collect();
+        assert_eq!(
+            names,
+            [("PORT", false), ("POD_NAME", true), ("BODY", false)]
+        );
+    }
+
+    /// Outside a workload image nothing is created with an environment: a
+    /// binding is refused, naming the param.
+    #[test]
+    fn an_env_binding_is_refused_outside_a_workload_image() {
+        let module = serde_json::json!({ "port": {"env": "PORT"} });
+        let mut entry = vec![0u8; 256];
+        let err = build_params_from_schema(&module, &env_schema(), &mut entry, 0, None, "svc")
+            .expect_err("no environment outside a workload image");
+        assert!(
+            err.contains("'port'") && err.contains("--emit=workload"),
+            "{err}"
+        );
+    }
+
+    /// A malformed binding is refused where it is written.
+    #[test]
+    fn a_malformed_env_binding_is_refused() {
+        for (v, why) in [
+            (
+                serde_json::json!({"env": "A", "default": 1, "required": true}),
+                "no default",
+            ),
+            (serde_json::json!({"env": "A=B"}), "no `=`"),
+            (
+                serde_json::json!({"env": "A", "fallback": 1}),
+                "not `fallback`",
+            ),
+            (
+                serde_json::json!({"env": "A", "required": "yes"}),
+                "true or false",
+            ),
+        ] {
+            let module = serde_json::json!({ "port": v });
+            let mut entry = vec![0u8; 256];
+            let (r, _) = with_env_binds(|| {
+                build_params_from_schema(&module, &env_schema(), &mut entry, 0, None, "svc")
+            });
+            let err = r.expect_err(why);
+            assert!(err.contains(why), "{err}");
+        }
     }
 
     fn blob_schema() -> ParamSchema {

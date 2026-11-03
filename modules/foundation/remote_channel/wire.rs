@@ -127,17 +127,23 @@ pub mod refuse {
 /// wire carries the record's bytes verbatim, so the two ends agree on
 /// content type and maximum, not on how each delimits locally.
 pub mod framing {
-    /// `[type:1][len:2 LE][payload]` — the header the net contracts share
-    /// (net_proto, session_ctrl, mux, peer_identity).
-    pub const TLV16: u8 = 0;
-    /// `[len:4 LE][payload]`.
-    pub const LEN32: u8 = 1;
+    /// A length field in a header of the record's own: `len16@<off>+<add>`
+    /// or `len32@<off>+<add>` — a little-endian 16- or 32-bit field at byte
+    /// `off` of the record, and the whole record is the field's value plus
+    /// `add` bytes ([`super::Entry::len_off`], `len_width`, `len_add`).
+    /// `tlv16` is `len16@1+3` (`[type:1][len:2 LE][payload]`, the header the
+    /// net contracts share) and `len32` is `len32@0+4` (`[len:4 LE][payload]`).
+    pub const LEN: u8 = 0;
     /// A mailbox edge (`buffer_group`): one buffer is one record.
     pub const MAILBOX: u8 = 2;
     /// A byte stream with no records in it — a connection's payload. It
     /// crosses in order and lossless; `max_record` bounds one piece of it.
     pub const BYTES: u8 = 3;
 }
+
+/// The longest local header a length framing names: the field's offset and
+/// width together.
+pub const HDR_MAX: usize = 64;
 
 /// Which side of an exchange endpoint an instance is.
 pub mod side {
@@ -170,6 +176,11 @@ pub struct Entry {
     pub content_type: [u8; CT_NAME_MAX],
     pub ct_len: u8,
     pub framing: u8,
+    /// [`framing::LEN`]: the length field's offset in the record, its width
+    /// in bytes (2 or 4), and what the whole record adds to its value.
+    pub len_off: u8,
+    pub len_width: u8,
+    pub len_add: u32,
     pub max_record: u32,
 }
 
@@ -177,7 +188,10 @@ impl Entry {
     pub const EMPTY: Entry = Entry {
         content_type: [0; CT_NAME_MAX],
         ct_len: 0,
-        framing: framing::TLV16,
+        framing: framing::LEN,
+        len_off: 1,
+        len_width: 2,
+        len_add: 3,
         max_record: 0,
     };
 
@@ -185,23 +199,50 @@ impl Entry {
         &self.content_type[..self.ct_len as usize]
     }
 
-    /// Bytes of local header that announce a record's length, or 0 for a
-    /// mailbox.
+    /// Bytes of local header that announce a record's length — through the
+    /// end of its length field — or 0 for a mailbox or a byte stream.
     pub fn header_len(&self) -> usize {
         match self.framing {
-            framing::TLV16 => 3,
-            framing::LEN32 => 4,
+            framing::LEN => self.len_off as usize + self.len_width as usize,
             _ => 0,
         }
     }
 
-    /// The whole record's length from its local header.
+    /// The whole record's length from its local header (`header_len` bytes).
     pub fn record_len(&self, hdr: &[u8]) -> u64 {
-        match self.framing {
-            framing::TLV16 => 3 + u16::from_le_bytes([hdr[1], hdr[2]]) as u64,
-            _ => 4 + u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as u64,
-        }
+        let at = self.len_off as usize;
+        let field = if self.len_width == 2 {
+            u16::from_le_bytes([hdr[at], hdr[at + 1]]) as u64
+        } else {
+            u32::from_le_bytes([hdr[at], hdr[at + 1], hdr[at + 2], hdr[at + 3]]) as u64
+        };
+        field + self.len_add as u64
     }
+}
+
+/// A length framing's text: `tlv16`, `len32`, or `len16@<off>+<add>` /
+/// `len32@<off>+<add>` (decimal). `(offset, width, add)`, or `None` for a
+/// spec that is malformed or whose header passes [`HDR_MAX`].
+pub fn parse_len_framing(text: &[u8]) -> Option<(u8, u8, u32)> {
+    match text {
+        b"tlv16" => return Some((1, 2, 3)),
+        b"len32" => return Some((0, 4, 4)),
+        _ => {}
+    }
+    let (width, rest) = if let Some(r) = text.strip_prefix(b"len16@") {
+        (2u8, r)
+    } else if let Some(r) = text.strip_prefix(b"len32@") {
+        (4u8, r)
+    } else {
+        return None;
+    };
+    let plus = rest.iter().position(|&b| b == b'+')?;
+    let off = parse_u32(&rest[..plus])?;
+    let add = parse_u32(&rest[plus + 1..])?;
+    if off as usize + width as usize > HDR_MAX {
+        return None;
+    }
+    Some((off as u8, width, add))
 }
 
 /// The channel table: `channels` entries, index = position.
@@ -290,22 +331,31 @@ pub fn parse_table(text: &[u8], limit: u32) -> Result<Table, TableError> {
         {
             return Err(TableError::ContentType);
         }
-        let framing = match trim(fr) {
-            b"tlv16" => framing::TLV16,
-            b"len32" => framing::LEN32,
-            b"mailbox" => framing::MAILBOX,
-            b"bytes" => framing::BYTES,
-            _ => return Err(TableError::Framing),
+        let fr = trim(fr);
+        let (framing, len) = match fr {
+            b"mailbox" => (framing::MAILBOX, None),
+            b"bytes" => (framing::BYTES, None),
+            _ => (
+                framing::LEN,
+                Some(parse_len_framing(fr).ok_or(TableError::Framing)?),
+            ),
         };
         let max = parse_u32(trim(mx)).ok_or(TableError::MaxRecord)?;
-        let ceiling = match framing {
-            framing::TLV16 => limit.min(3 + u16::MAX as u32),
-            _ => limit,
-        };
-        let floor = match framing {
-            framing::TLV16 => 3,
-            framing::LEN32 => 4,
-            _ => 1,
+        // A record holds at least its own header and at least what its
+        // length adds; a 16-bit field reaches `add + 0xFFFF` and no further.
+        let (ceiling, floor) = match len {
+            Some((off, width, add)) => {
+                let field_max = if width == 2 {
+                    u16::MAX as u64
+                } else {
+                    u32::MAX as u64
+                };
+                (
+                    (limit as u64).min(add as u64 + field_max) as u32,
+                    (off as u32 + width as u32).max(add).max(1),
+                )
+            }
+            None => (limit, 1),
         };
         if max < floor || max > ceiling {
             return Err(TableError::MaxRecord);
@@ -314,6 +364,11 @@ pub fn parse_table(text: &[u8], limit: u32) -> Result<Table, TableError> {
         e.content_type[..ct.len()].copy_from_slice(ct);
         e.ct_len = ct.len() as u8;
         e.framing = framing;
+        if let Some((off, width, add)) = len {
+            e.len_off = off;
+            e.len_width = width;
+            e.len_add = add;
+        }
         e.max_record = max;
         t.channels += 1;
     }

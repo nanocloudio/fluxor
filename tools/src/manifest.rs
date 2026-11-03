@@ -1278,11 +1278,11 @@ pub mod permission {
 /// parameter must not occupy them.
 pub const PARAM_TAG_MIN: u8 = 10;
 
-/// Highest tag a built-in `[[params]]` entry may claim. 0xEE..=0xFF are
-/// reserved for kernel, protection and policy metadata (0xEE raw arena use,
-/// 0xEF the instance's heap cap, 0xFD voice-preset blobs, 0xFE TLV magic,
-/// 0xFF terminator among them).
-pub const PARAM_TAG_MAX: u8 = 0xED;
+/// Highest tag a built-in `[[params]]` entry may claim. 0xED..=0xFF are
+/// reserved for kernel, protection and policy metadata (0xED a workload's
+/// env bind record, 0xEE raw arena use, 0xEF the instance's heap cap, 0xFD
+/// voice-preset blobs, 0xFE TLV magic, 0xFF terminator among them).
+pub const PARAM_TAG_MAX: u8 = 0xEC;
 
 /// Param type categories declared in `[[params]]`. Matches the wire
 /// types used by the runtime TLV packer in `tools/src/schema.rs`.
@@ -1305,7 +1305,7 @@ pub struct ManifestParam {
     /// position, is the wire identity of the parameter, so entries may
     /// be reordered or inserted without changing any encoding.
     /// Legal range is [`PARAM_TAG_MIN`]..=[`PARAM_TAG_MAX`]; tags below
-    /// the minimum belong to the TLV framing and 0xEE..=0xFF are
+    /// the minimum belong to the TLV framing and 0xED..=0xFF are
     /// reserved for protection/policy metadata.
     pub tag: u8,
     pub name: String,
@@ -2588,7 +2588,7 @@ impl Manifest {
                     "param '{}': tag {tag} out of range \
                      ({PARAM_TAG_MIN}..={PARAM_TAG_MAX}). Tags below \
                      {PARAM_TAG_MIN} belong to the TLV framing and \
-                     0xEF..=0xFF are reserved for kernel and protection metadata.",
+                     0xED..=0xFF are reserved for kernel and protection metadata.",
                     p.name,
                 )));
             }
@@ -5195,7 +5195,7 @@ store_subscriptions = 1
             ),
             (
                 "[capacities]\nheap_from_params = { tags = [0xEE], base = 1 }\n",
-                "tag 0xee is reserved for kernel metadata (0xee..=0xff)",
+                "tag 0xee is reserved for kernel metadata (0xed..=0xff)",
             ),
             (
                 "[capacities]\nscratch = { tags = [2], base = 1 }\n",

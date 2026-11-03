@@ -159,11 +159,56 @@ fn host_backend_postures() -> u8 {
     }
     p
 }
-/// Tier-2 options this backend realizes. `mount`/`bind` is a volume: the value
-/// is `<host path>\0<path in the workload>\0<ro: 1|0>`, bind-mounted into
-/// the rootfs before the pivot (`host_backend::hp_spawn_with_binds`).
+/// Tier-2 options this backend realizes. `mount`/`bind` is a volume
+/// (`wl::volume`): the value is `<host path>\0<path in the workload>\0<ro:
+/// 1|0>`, bind-mounted into the rootfs before the pivot
+/// (`host_backend::hp_spawn_with_binds`). `env`/`var` (`wl::env`) is one
+/// `NAME=VALUE` of the process's environment, over the source's own.
 fn host_backend_honors_option(ns: &[u8], key: &[u8]) -> bool {
-    ns == b"mount" && key == b"bind"
+    (ns == wl::volume::NS && key == wl::volume::KEY) || (ns == wl::env::NS && key == wl::env::KEY)
+}
+
+/// The Tier-2 directory [`CAPS`](wl::CAPS) lists: what both backends
+/// realize. The graph backend realizes the same two
+/// (`workload_graph::GRAPH_OPTIONS`): a volume as its modules' `fs` root,
+/// the environment as their env binds.
+const LINUX_OPTIONS: &[(&[u8], &[&[u8]])] = &[
+    (wl::volume::NS, &[wl::volume::KEY]),
+    (wl::env::NS, &[wl::env::KEY]),
+];
+
+/// Put the CREATE's `env`/`var` entries into a process's environment, in
+/// order, each replacing any entry of its name. `EINVAL` for an entry with
+/// no name or one that is not UTF-8.
+fn apply_env_options(opts: &[u8], env: &mut std::vec::Vec<std::string::String>) -> Result<(), i32> {
+    use crate::kernel::sys::errno;
+    let mut p = 0usize;
+    while p < opts.len() {
+        let ns_len = opts[p] as usize;
+        let ns = opts.get(p + 1..p + 1 + ns_len).ok_or(errno::EINVAL)?;
+        p += 1 + ns_len;
+        let key_len = *opts.get(p).ok_or(errno::EINVAL)? as usize;
+        let key = opts.get(p + 1..p + 1 + key_len).ok_or(errno::EINVAL)?;
+        p += 1 + key_len + 1;
+        if p + 2 > opts.len() {
+            return Err(errno::EINVAL);
+        }
+        let vl = rd_u16(opts, p) as usize;
+        p += 2;
+        let val = opts.get(p..p + vl).ok_or(errno::EINVAL)?;
+        p += vl;
+        if ns != wl::env::NS || key != wl::env::KEY {
+            continue;
+        }
+        let entry = core::str::from_utf8(val).map_err(|_| errno::EINVAL)?;
+        let Some(eq) = entry.find('=').filter(|&eq| eq > 0) else {
+            return Err(errno::EINVAL);
+        };
+        let prefix = &entry[..=eq];
+        env.retain(|e| !e.starts_with(prefix));
+        env.push(entry.into());
+    }
+    Ok(())
 }
 
 /// A `mount`/`bind` value: `<src>\0<dst>[\0<ro>]`, `ro` `1` (read-only) or
@@ -245,7 +290,7 @@ unsafe fn validate_options(
         }
         let val = &opts[p..p + val_len];
         p += val_len;
-        if ns == b"mount" && key == b"bind" {
+        if ns == wl::volume::NS && key == wl::volume::KEY {
             match parse_bind(val) {
                 Some(b) => binds.push(b),
                 None => return Err(errno::EINVAL),
@@ -595,6 +640,9 @@ unsafe fn workload_create_as(
         Ok(s) => s,
         Err(e) => return e,
     };
+    if let Err(e) = apply_env_options(&buf[opt_start..opt_end], &mut src.process.env) {
+        return e;
+    }
     // The posture is the isolation: namespaces of its own at ISOLATED and
     // above, none at SHARED, and the source's flag must say the same. A
     // hardened workload takes no addition and no opt-out.
@@ -798,8 +846,8 @@ pub unsafe fn linux_workload_dispatch(
 
 /// WORKLOAD_CAPS: write the backend discovery structure (see the contract's
 /// `CAPS` doc). Prefix `[postures:u8][source_kinds:u8][ops:u16 LE][net:u8]`
-/// then the namespace directory: one namespace, `mount`, with one key, `bind`
-/// (a volume).
+/// then the namespace directory ([`LINUX_OPTIONS`]): `mount`/`bind` (a
+/// volume) and `env`/`var` (the environment).
 unsafe fn workload_caps(arg: *mut u8, arg_len: usize) -> i32 {
     use crate::kernel::sys::errno;
     if arg.is_null() || arg_len < 7 {
@@ -827,17 +875,16 @@ unsafe fn workload_caps(arg: *mut u8, arg_len: usize) -> i32 {
     }
     out[2..4].copy_from_slice(&ops.to_le_bytes());
     out[4] = host_backend_net_caps();
-    // `[ns_count:u16][ns_len:u8]"mount"[key_count:u16][key_len:u8]"bind"`
-    const DIR: &[u8] = &[
-        1, 0, 5, b'm', b'o', b'u', b'n', b't', 1, 0, 4, b'b', b'i', b'n', b'd',
-    ];
-    if arg_len < 5 + DIR.len() {
+    let n = crate::kernel::workload::workload_graph::write_option_directory(
+        &mut out[5..],
+        LINUX_OPTIONS,
+    );
+    if n == 0 {
         // Too short for the directory: the prefix alone, and an empty one.
         out[5..7].copy_from_slice(&0u16.to_le_bytes());
         return 7;
     }
-    out[5..5 + DIR.len()].copy_from_slice(DIR);
-    (5 + DIR.len()) as i32
+    (5 + n) as i32
 }
 
 /// Drain/revocation hook: destroy every workload belonging to a revoked owner.

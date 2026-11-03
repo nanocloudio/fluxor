@@ -92,6 +92,26 @@ access = "read"
 # ECDSA_P384_SHA384 suite, which a P-256 key cannot sign, so such a chain
 # fails as `signature`. No public issuer does this.
 
+# Application protocol (ALPN, RFC 7301): the `alpn` graph parameter — one
+# name or a list (`alpn: "h2"`, `alpn: ["h2", "http/1.1"]`), each 1..=16
+# printable bytes, 64 in all — embedded as extended tag 14. A client offers
+# the names in that order; a server selects the first of ITS names the
+# client offered, and with none in common selects nothing and proceeds. A
+# client refuses a server selection it did not offer. Unset, both sides use
+# `h2,http/1.1` (`http/1.1` under `alpn_h1_only`). The negotiated name is
+# reported with the connection on `clear_out`: after the session generation
+# in `MSG_CONNECTED` / the port-qualified `MSG_ACCEPTED` comes
+# `[alpn_len:1][alpn]` (`net_proto::session_alpn`; length 0 for none), so
+# an HTTP client knows before its first byte whether to speak HTTP/2.
+#
+# Dial completions on `clear_out`: a `CMD_CONNECT_TO` is answered by the
+# held `MSG_CONNECTED` once the handshake completes, or by a tagged
+# `MSG_ERROR` on the requester's tag — `ECONNREFUSED` when the handshake
+# fails or the transport loses the connection before it completes, and
+# `EAGAIN` (nothing dialled) while a client's `identity_label` holds no
+# certificate yet. Never a `MSG_CLOSED` for a connection the requester was
+# not told of.
+
 [[ports]]
 name = "cipher_in"
 direction = "input"

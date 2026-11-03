@@ -191,15 +191,20 @@ surface is the module's
 Where a provider runs is a placement choice: the requester reaches a
 provider on another node with the same records it uses on a local edge,
 wired to a stand-in instead of the provider. `foundation/remote_channel`
-carries one exchange across its authenticated session. With
+carries one exchange across its authenticated sessions. With
 `exchange: near` it stands in for the remote provider, with the provider's
 ports (`request_in`, `response_out`); with `exchange: far`, on the
-provider's node, it stands in for the remote requester, with the
-requester's (`request_out`, `response_in`), wired to the real provider.
-Request records cross near to far and response records far to near, each
-direction a `mailbox` channel of its own at `RECORD_MAX`, whole and under
-that channel's credit, ids verbatim — so one requester per near endpoint,
-whose id space crosses intact. A placed member (`node:`) is never named by
+provider's node, it stands in for the remote requesters, with a
+requester's ports (`request_out`, `response_in`), wired to the real
+provider. Request records cross near to far and response records far to
+near, each direction a `mailbox` channel of its own at `RECORD_MAX`, whole
+and under that channel's credit. The near side carries its requester's ids
+verbatim — so one requester per near endpoint; the far side, which may
+serve several near endpoints at once (one session each), hands the provider
+every exchange under an id of its own and maps it back on every answer, and
+writes each request HEAD's `peer` as the session's verified key
+fingerprint (empty without `require_peer`), whatever the requester wrote —
+a HEAD that no longer fits is answered `413`. A placed member (`node:`) is never named by
 a wire; the graph wires the requester to a near endpoint as it would to the
 provider.
 
@@ -222,13 +227,13 @@ A session is the requester's backend link, and LINK is how it hears of it:
 - When a session ends, the near side delivers the answers that crossed
   whole, writes `LINK DOWN`, and discards what the requester writes until it
   has taken the DOWN and while the session stays down; the far side ABORTs
-  every exchange it handed the provider without a terminal record yet, and
-  drops what the provider writes for them.
+  every exchange that session handed the provider without a terminal record
+  yet — no other session's — and drops what the provider writes for them.
 - The far side opens each session's answer channel with a LINK record
-  stating the provider's link, and only once the provider has taken every
-  ABORT and its answers are drained. The near side writes `LINK UP` when
-  that record says up, and the requester issues its open exchanges again
-  under the same ids; none can meet a record of the exchange before.
+  stating the provider's link. The near side writes `LINK UP` when that
+  record says up, and the requester issues its open exchanges again under
+  the same ids; each is a new exchange to the provider, under a new id of
+  the far side's, so none can meet a record of the exchange before.
 - The provider's own LINK records cross; the requester hears the state the
   session and the provider make together, each change once.
 

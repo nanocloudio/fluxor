@@ -197,6 +197,85 @@ pub mod resolver {
     pub const MAX: usize = 256;
 }
 
+/// The workload's environment: a Tier-2 option on [`CREATE`], namespace
+/// [`env::NS`], key [`env::KEY`], value `NAME=VALUE` (the name up to the
+/// first `=`, never empty; the value may be empty), repeatable, a later
+/// entry for a name replacing an earlier one. A backend that realizes it
+/// lists it in [`CAPS`]'s namespace directory; one that does not answers a
+/// required entry `ENOSYS`.
+///
+/// A host process takes the entries into its environment, over the source's
+/// own. A graph workload (`SOURCE_FMOD_GRAPH`, `SOURCE_FMOD_PACK`) takes
+/// them into its modules' params: a module param the graph binds to a name
+/// is an **env bind record** in the module's params TLV, entry tag
+/// [`env::BIND_TAG`] in the basic section, which the backend replaces, in
+/// its own copy of the subgraph and before any module is instantiated, with
+/// the param's entries carrying the value. The record's value:
+/// ```text
+/// off  size  field
+///   0    1   target    the param's own TLV tag (below env::BIND_TAG)
+///   1    1   kind      KIND_U8 | KIND_U16 | KIND_U32 | KIND_STR | KIND_STR_CHUNKED
+///   2    1   flags     FLAG_REQUIRED | FLAG_DEFAULT (at most one)
+///   3    1   name_len  1..=MAX_NAME
+///   4    n   name
+///   4+n  ..  default   with FLAG_DEFAULT: an integer kind's value LE in its
+///                      width, a string kind's bytes
+/// ```
+/// The value an entry names is written as the param's packer writes it: an
+/// integer (decimal, `0x` hex, `true`/`false`) LE in the kind's width, out
+/// of range `EINVAL`; a string as one entry (`KIND_STR`, at most 255 bytes,
+/// longer `EINVAL`) or 255-byte chunks under the one tag
+/// (`KIND_STR_CHUNKED`); an empty string as no entry. A name no entry gives
+/// takes the default; with none and `FLAG_REQUIRED` the `CREATE` fails
+/// `EINVAL`, and an optional one leaves the param out (the module's own
+/// default). A subgraph the values do not fit (a module's params past a
+/// `u16`, the subgraph past an FLXA source's `u16`) fails `E2BIG`; a
+/// malformed record `EINVAL`. A bind record never reaches a module: an add
+/// that still carries one is refused `EINVAL`.
+pub mod env {
+    pub const NS: &[u8] = b"env";
+    pub const KEY: &[u8] = b"var";
+    /// The params TLV tag of an env bind record: reserved, below the kernel's
+    /// metadata tags (0xEE..=0xFF) and above every module param's.
+    pub const BIND_TAG: u8 = 0xED;
+    /// Longest name a bind record or an entry carries.
+    pub const MAX_NAME: usize = 128;
+    /// Bytes of a bind record before its name.
+    pub const HEAD: usize = 4;
+    pub const KIND_U8: u8 = 0;
+    pub const KIND_U16: u8 = 1;
+    pub const KIND_U32: u8 = 2;
+    pub const KIND_STR: u8 = 3;
+    pub const KIND_STR_CHUNKED: u8 = 6;
+    /// No entry for the name fails the `CREATE` (`EINVAL`).
+    pub const FLAG_REQUIRED: u8 = 0x01;
+    /// The record carries a default after its name.
+    pub const FLAG_DEFAULT: u8 = 0x02;
+}
+
+/// A volume lent to a workload: a Tier-2 option on [`CREATE`], namespace
+/// [`volume::NS`], key [`volume::KEY`], value `<src>\0<dst>\0<ro>` — `src`
+/// an absolute host directory, `dst` the path the workload names it by, `ro`
+/// `1` (read-only) or `0` (left out with its `\0`: writable). Repeatable, at
+/// most [`volume::MAX`] per workload.
+///
+/// A host process has `src` bind-mounted at `dst` in its root. A graph
+/// workload's `fs` paths at or under `dst` resolve beneath `src` (no path,
+/// symlink or magic link leads out of it); on a read-only volume nothing
+/// is created, written, renamed or removed (`EACCES`, and `OPEN` is
+/// read-only). A volume is lent, not owned: what it holds is never charged
+/// to the owner's storage, it is reachable whatever the owner's storage
+/// grant, and the owner's release leaves it as it was. A rename between a
+/// volume and anything else is `EXDEV`. A backend that realizes it lists it
+/// in [`CAPS`]; one that does not answers a required entry `ENOSYS`, so a
+/// consumer marks every volume required.
+pub mod volume {
+    pub const NS: &[u8] = b"mount";
+    pub const KEY: &[u8] = b"bind";
+    /// Most volumes one workload is lent.
+    pub const MAX: usize = 16;
+}
+
 /// The record [`NET_LANE_TAKE`] writes, little-endian:
 /// ```text
 /// off  size  field

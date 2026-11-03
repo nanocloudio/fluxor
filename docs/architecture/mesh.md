@@ -372,7 +372,10 @@ these limits:
 
 The mesh does not define its own fabric. Cross-node transport is carried
 by remote channels (`modules/foundation/remote_channel/`), which
-multiplex up to eight local channels over one authenticated session.
+multiplex up to eight local channels over an authenticated session — a
+listener serves up to `sessions` of them, one per verified peer, merging
+what arrives and sending to every peer (or, with `peer_tag`, stamping and
+routing each record by its peer's key fingerprint).
 
 - **Records preserved.** Each channel declares a content type, a local
   record framing and a maximum record. Both ends exchange these tables

@@ -826,6 +826,27 @@ pub fn params_node_tag(params: &[u8]) -> Option<u8> {
     None
 }
 
+/// Whether a params TLV carries an entry under `tag`, walked as
+/// [`params_node_tag`] walks it.
+pub fn params_carry_tag(params: &[u8], tag: u8) -> bool {
+    if params.len() < 4 {
+        return false;
+    }
+    let mut pos = if params[0] == 0xFE { 4 } else { 0 };
+    while pos + 2 <= params.len() {
+        let t = params[pos];
+        let len = params[pos + 1] as usize;
+        if t == 0xFF {
+            break;
+        }
+        if t == tag {
+            return true;
+        }
+        pos += 2 + len;
+    }
+    false
+}
+
 /// Parse protection configuration from module params TLV.
 ///
 /// Recognised tags in the schema-packed params blob:
