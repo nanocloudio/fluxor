@@ -109,7 +109,8 @@ pub unsafe fn dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -
         }
         kv::DESTROY_BY_LABEL if handle < 0 => {
             let sw = software::provider_dispatch(handle, opcode, arg, arg_len);
-            let Some(hw) = hardware() else {
+            // A workload's labels are its realm's, which only software keeps.
+            let Some(hw) = hardware().filter(|_| !software::caller_in_workload()) else {
                 return sw;
             };
             let hw = hw(handle, opcode, arg, arg_len);
@@ -138,7 +139,8 @@ pub unsafe fn dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -
     }
 }
 
-/// `OPEN` / `OPEN_OR_GENERATE` across both backends: software first, then
+/// `OPEN` / `OPEN_OR_GENERATE` across both backends (a workload's: software
+/// alone): software first, then
 /// the token, then — for `OPEN_OR_GENERATE` with neither holding the key —
 /// made in the token if it is asked to persist with uses the token permits,
 /// in software otherwise. Any answer other than `ENOENT` (the key
@@ -148,6 +150,13 @@ pub unsafe fn dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -
 /// # Safety
 /// `arg` valid for `arg_len` bytes (at least 8).
 unsafe fn open_by_label(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
+    // A workload's labels live in its realm (its owner uid), which only
+    // the software backend keeps: a token names a label by module type and
+    // nothing narrower, so a workload reaching it would reach the node's
+    // keys of its type, and every other workload's.
+    if software::caller_in_workload() {
+        return software::provider_dispatch(handle, opcode, arg, arg_len);
+    }
     let suite = u16::from_le_bytes([*arg, *arg.add(1)]);
     let usage = u32::from_le_bytes([*arg.add(2), *arg.add(3), *arg.add(4), *arg.add(5)]);
     let (hw, hw_usage) = match hardware() {

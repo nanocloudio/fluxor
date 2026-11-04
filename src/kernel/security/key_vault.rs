@@ -180,6 +180,70 @@ const FLAG_IN_USE: u8 = 0x01;
 /// that conflates them is the failure this whole surface is shaped to
 /// prevent.
 const FLAG_PERSISTED: u8 = 0x02;
+/// This slot's key is kept in a workload's own vault, sealed under the key
+/// the workload's owner supplied (`workload::vault`): its custody is
+/// `SOFTWARE` whatever the platform's sealing key is worth, since whoever
+/// holds the volume and that key holds the key.
+const FLAG_OWNER_SEALED: u8 = 0x04;
+
+/// The realm of a key made by node code: every module the node runs itself.
+/// A workload's realm is its owner uid ([`Scope`]).
+const NODE_REALM: [u8; 16] = [0; 16];
+
+/// Where a label lives: its owner's module type (`namespace`) within its
+/// owner's realm — the node's, or one workload's, named by the workload's
+/// durable owner uid. Labels are unique within a scope, and no module
+/// reaches another scope's: two workloads running one module type, or a
+/// workload and the node, never share a label.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Scope {
+    namespace: u32,
+    realm: [u8; 16],
+}
+
+impl Scope {
+    /// The node's own scope for module type `namespace`.
+    const fn node(namespace: u32) -> Self {
+        Scope {
+            namespace,
+            realm: NODE_REALM,
+        }
+    }
+
+    fn is_node(&self) -> bool {
+        self.realm == NODE_REALM
+    }
+}
+
+/// Who keeps a scope's persisted records, and under which sealing key.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Keeper {
+    /// The platform's store (`hal::seal_blob_*`), sealed under the
+    /// platform's key (`hal::seal`): the node's records, and a workload's
+    /// when it brings no vault of its own.
+    Platform,
+    /// The workload's own vault, on a volume it is lent, sealed under the
+    /// key its owner supplied (`workload::vault`): the records follow the
+    /// volume and that key, not the node.
+    #[cfg(feature = "host-linux")]
+    Volume(crate::kernel::workload::owner::OwnerHandle),
+}
+
+/// The keeper of `scope`'s records: the workload's own vault while the
+/// workload that holds `scope.realm` is live and brought one.
+fn keeper_of(scope: Scope) -> Keeper {
+    #[cfg(feature = "host-linux")]
+    if !scope.is_node() {
+        if let Some(h) = crate::kernel::exec::scheduler::owners().find_by_uid(scope.realm) {
+            // SAFETY: scheduler thread, as every vault call.
+            if unsafe { crate::platform::linux::owner_root::vault_present(h) } {
+                return Keeper::Volume(h);
+            }
+        }
+    }
+    let _ = scope;
+    Keeper::Platform
+}
 
 /// Longest label, mirroring the contract's `MAX_LABEL`.
 pub const MAX_LABEL: usize = 64;
@@ -208,6 +272,8 @@ struct Slot {
     /// The label namespace: the owner's module type. Labels are unique
     /// within a namespace, and no module reaches another type's labels.
     namespace: u32,
+    /// The owner's realm (see [`Scope`]).
+    realm: [u8; 16],
     /// Bumped each time this slot is freed, and carried in every handle to
     /// it, so a handle to a freed key cannot reach whatever key the slot
     /// holds next.
@@ -227,6 +293,7 @@ impl Slot {
             _pad: 0,
             owner_generation: 0,
             namespace: 0,
+            realm: NODE_REALM,
             generation: 0,
             data: [0; MAX_KEY_BYTES],
         }
@@ -234,6 +301,14 @@ impl Slot {
 
     fn label_bytes(&self) -> &[u8] {
         &self.label[..self.label_len as usize]
+    }
+
+    /// Whether this slot is filed under `label` in `scope`.
+    fn filed_as(&self, scope: Scope, label: &[u8]) -> bool {
+        (self.flags & FLAG_IN_USE) != 0
+            && self.namespace == scope.namespace
+            && self.realm == scope.realm
+            && self.label_bytes() == label
     }
 
     /// Whether this slot permits `want`.
@@ -275,6 +350,30 @@ struct Caller {
     slot: ModuleId,
     generation: u32,
     namespace: u32,
+    /// The realm of the module's owner (see [`Scope`]).
+    realm: [u8; 16],
+}
+
+impl Caller {
+    fn scope(&self) -> Scope {
+        Scope {
+            namespace: self.namespace,
+            realm: self.realm,
+        }
+    }
+}
+
+/// The realm of the module in scheduler slot `idx`: its owner's uid when a
+/// workload owns it, the node's otherwise.
+fn realm_of(idx: usize) -> [u8; 16] {
+    use crate::kernel::exec::scheduler;
+    let owner = scheduler::module_owner(idx);
+    if owner.is_system() {
+        return NODE_REALM;
+    }
+    scheduler::owners()
+        .lookup(owner)
+        .map_or(NODE_REALM, |e| e.owner_uid)
 }
 
 /// The module whose code is running — the one a key it creates belongs to.
@@ -286,12 +385,14 @@ fn caller() -> Caller {
             slot: KERNEL_OWNER,
             generation: 0,
             namespace: 0,
+            realm: NODE_REALM,
         };
     }
     Caller {
         slot: idx as ModuleId,
         generation: scheduler::module_slot_generation(idx),
         namespace: scheduler::module_type_hash(idx),
+        realm: realm_of(idx),
     }
 }
 
@@ -355,6 +456,7 @@ unsafe fn mint(i: usize) -> i32 {
     SLOTS[i].owner = c.slot;
     SLOTS[i].owner_generation = c.generation;
     SLOTS[i].namespace = c.namespace;
+    SLOTS[i].realm = c.realm;
     handle_of(i)
 }
 
@@ -434,10 +536,17 @@ const MAX_SEALED: usize = MAX_KEY_BYTES + 12 + 16;
 /// seal, so every fact a key is filed under is authenticated with the key: a
 /// header altered at rest — a widened usage, another suite, another label —
 /// makes the record not open, rather than open as something else.
+///
+/// A workload's record kept in the platform's store is `FXVW`, its header
+/// followed by the workload's realm: the realm is authenticated with the key,
+/// so no other workload's record, nor the node's, opens as it. A record in a
+/// workload's own vault is `FXVK` and names no realm: it is the volume's and
+/// its sealing key's, wherever the workload holding them runs.
 const RECORD_MAGIC: [u8; 4] = *b"FXVK";
-const MAX_HEADER: usize = 4 + 4 + 2 + 4 + 1 + MAX_LABEL;
-/// Longest durable name: `namespace:u32 (big-endian) ‖ label`.
-const MAX_BLOB_NAME: usize = 4 + MAX_LABEL;
+const REALM_RECORD_MAGIC: [u8; 4] = *b"FXVW";
+const MAX_HEADER: usize = 4 + 4 + 2 + 4 + 1 + MAX_LABEL + 16;
+/// Longest durable name: `namespace:u32 (big-endian) ‖ [realm:16] ‖ label`.
+const MAX_BLOB_NAME: usize = 4 + 16 + MAX_LABEL;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -448,6 +557,10 @@ struct Persisted {
     suite: u16,
     usage: u32,
     namespace: u32,
+    realm: [u8; 16],
+    /// Who sealed `sealed`: an entry whose scope's keeper is another now
+    /// (the workload that held the vault is gone) is not this key.
+    kept: Keeper,
     sealed: [u8; MAX_SEALED],
     sealed_len: u8,
 }
@@ -461,6 +574,8 @@ impl Persisted {
             suite: 0,
             usage: 0,
             namespace: 0,
+            realm: NODE_REALM,
+            kept: Keeper::Platform,
             sealed: [0; MAX_SEALED],
             sealed_len: 0,
         }
@@ -469,20 +584,33 @@ impl Persisted {
     fn label_bytes(&self) -> &[u8] {
         &self.label[..self.label_len as usize]
     }
+
+    fn scope(&self) -> Scope {
+        Scope {
+            namespace: self.namespace,
+            realm: self.realm,
+        }
+    }
 }
 
 static mut PERSISTED: [Persisted; MAX_PERSISTED] = [Persisted::empty(); MAX_PERSISTED];
 
 /// The record header for a key, written into `out`; returns its length.
 fn record_header(
-    namespace: u32,
+    scope: Scope,
+    kept: Keeper,
     label: &[u8],
     suite: u16,
     usage: u32,
     out: &mut [u8; MAX_HEADER],
 ) -> usize {
-    out[0..4].copy_from_slice(&RECORD_MAGIC);
-    out[4..8].copy_from_slice(&namespace.to_le_bytes());
+    let realm_bound = !scope.is_node() && kept == Keeper::Platform;
+    out[0..4].copy_from_slice(if realm_bound {
+        &REALM_RECORD_MAGIC
+    } else {
+        &RECORD_MAGIC
+    });
+    out[4..8].copy_from_slice(&scope.namespace.to_le_bytes());
     out[8..10].copy_from_slice(&suite.to_le_bytes());
     out[10..14].copy_from_slice(&usage.to_le_bytes());
     #[expect(clippy::cast_possible_truncation, reason = "bounded by MAX_LABEL")]
@@ -490,14 +618,137 @@ fn record_header(
         out[14] = label.len() as u8;
     }
     out[15..15 + label.len()].copy_from_slice(label);
+    if realm_bound {
+        out[15 + label.len()..31 + label.len()].copy_from_slice(&scope.realm);
+        return 31 + label.len();
+    }
     15 + label.len()
 }
 
-/// The durable name a key is filed under: its namespace, then its label.
-fn blob_name(namespace: u32, label: &[u8], out: &mut [u8; MAX_BLOB_NAME]) -> usize {
-    out[0..4].copy_from_slice(&namespace.to_be_bytes());
-    out[4..4 + label.len()].copy_from_slice(label);
-    4 + label.len()
+/// The durable name a key is filed under: its namespace, then (a
+/// workload's, in the platform's store) its realm, then its label.
+fn blob_name(scope: Scope, kept: Keeper, label: &[u8], out: &mut [u8; MAX_BLOB_NAME]) -> usize {
+    out[0..4].copy_from_slice(&scope.namespace.to_be_bytes());
+    let mut at = 4;
+    if !scope.is_node() && kept == Keeper::Platform {
+        out[4..20].copy_from_slice(&scope.realm);
+        at = 20;
+    }
+    out[at..at + label.len()].copy_from_slice(label);
+    at + label.len()
+}
+
+/// Seal `plain` under `aad` as `kept` seals: `[nonce:12][ciphertext][tag:16]`.
+fn keeper_seal(kept: Keeper, aad: &[u8], plain: &[u8], out: &mut [u8]) -> Option<usize> {
+    match kept {
+        Keeper::Platform => crate::kernel::sys::hal::seal(aad, plain, out),
+        #[cfg(feature = "host-linux")]
+        Keeper::Volume(h) => {
+            // SAFETY: scheduler thread, as every vault call.
+            let mut key = unsafe { crate::platform::linux::owner_root::vault_key(h) }?;
+            let total = 12 + plain.len() + 16;
+            if out.len() < total {
+                zeroize(&mut key);
+                return None;
+            }
+            let mut nonce = [0u8; 12];
+            if crate::kernel::sys::hal::csprng_fill(nonce.as_mut_ptr(), 12) < 0 {
+                zeroize(&mut key);
+                return None;
+            }
+            out[..12].copy_from_slice(&nonce);
+            out[12..12 + plain.len()].copy_from_slice(plain);
+            let tag = crate::kernel::security::crypto::chacha20::chacha20_poly1305_encrypt(
+                &key,
+                &nonce,
+                aad,
+                &mut out[12..12 + plain.len()],
+            );
+            out[12 + plain.len()..total].copy_from_slice(&tag);
+            zeroize(&mut key);
+            Some(total)
+        }
+    }
+}
+
+/// Open what [`keeper_seal`] sealed; `None` (and `out` wiped) when it does
+/// not open under `aad` and `kept`'s key.
+fn keeper_unseal(kept: Keeper, aad: &[u8], sealed: &[u8], out: &mut [u8]) -> Option<usize> {
+    match kept {
+        Keeper::Platform => crate::kernel::sys::hal::unseal(aad, sealed, out),
+        #[cfg(feature = "host-linux")]
+        Keeper::Volume(h) => {
+            // SAFETY: scheduler thread, as every vault call.
+            let mut key = unsafe { crate::platform::linux::owner_root::vault_key(h) }?;
+            if sealed.len() < 12 + 16 || out.len() < sealed.len() - 28 {
+                zeroize(&mut key);
+                return None;
+            }
+            let body = sealed.len() - 28;
+            let mut nonce = [0u8; 12];
+            nonce.copy_from_slice(&sealed[..12]);
+            let mut tag = [0u8; 16];
+            tag.copy_from_slice(&sealed[12 + body..]);
+            out[..body].copy_from_slice(&sealed[12..12 + body]);
+            let ok = crate::kernel::security::crypto::chacha20::chacha20_poly1305_decrypt(
+                &key,
+                &nonce,
+                aad,
+                &mut out[..body],
+                &tag,
+            );
+            zeroize(&mut key);
+            if ok {
+                Some(body)
+            } else {
+                zeroize(&mut out[..body]);
+                None
+            }
+        }
+    }
+}
+
+/// Read the record `kept` holds under `name`.
+fn keeper_read(kept: Keeper, name: &[u8], out: &mut [u8]) -> Option<usize> {
+    match kept {
+        Keeper::Platform => crate::kernel::sys::hal::seal_blob_read(name, out),
+        #[cfg(feature = "host-linux")]
+        // SAFETY: scheduler thread, as every vault call.
+        Keeper::Volume(h) => unsafe {
+            crate::platform::linux::owner_root::vault_read(h, name, out)
+        },
+    }
+}
+
+/// Store `blob` under `name` durably with `kept`.
+fn keeper_write(kept: Keeper, name: &[u8], blob: &[u8]) -> bool {
+    match kept {
+        Keeper::Platform => crate::kernel::sys::hal::seal_blob_write(name, blob),
+        #[cfg(feature = "host-linux")]
+        // SAFETY: scheduler thread, as every vault call.
+        Keeper::Volume(h) => unsafe {
+            crate::platform::linux::owner_root::vault_write(h, name, blob)
+        },
+    }
+}
+
+/// Remove the record `kept` holds under `name`; whether none remains.
+fn keeper_delete(kept: Keeper, name: &[u8]) -> bool {
+    match kept {
+        Keeper::Platform => crate::kernel::sys::hal::seal_blob_delete(name),
+        #[cfg(feature = "host-linux")]
+        // SAFETY: scheduler thread, as every vault call.
+        Keeper::Volume(h) => unsafe { crate::platform::linux::owner_root::vault_delete(h, name) },
+    }
+}
+
+/// Whether `kept` has a durable store: a workload's vault always does.
+fn keeper_stores(kept: Keeper) -> bool {
+    match kept {
+        Keeper::Platform => crate::kernel::sys::hal::seal_blob_store(),
+        #[cfg(feature = "host-linux")]
+        Keeper::Volume(_) => true,
+    }
 }
 
 /// The platform has a durable store and it cannot be read yet (its medium
@@ -505,8 +756,10 @@ fn blob_name(namespace: u32, label: &[u8], out: &mut [u8; MAX_BLOB_NAME]) -> usi
 /// labelled open would generate a fresh key over the one already stored,
 /// and a delete would leave the record to come back. Those paths answer
 /// `EAGAIN` until it reads.
-fn store_not_ready() -> bool {
-    crate::kernel::sys::hal::seal_blob_store() && !crate::kernel::sys::hal::seal_blob_ready()
+fn store_not_ready(scope: Scope) -> bool {
+    keeper_of(scope) == Keeper::Platform
+        && crate::kernel::sys::hal::seal_blob_store()
+        && !crate::kernel::sys::hal::seal_blob_ready()
 }
 
 /// Find a persisted entry by namespace and label: `Ok(None)` when no such
@@ -516,11 +769,19 @@ fn store_not_ready() -> bool {
 ///
 /// # Safety
 /// Kernel context, exclusive access to `PERSISTED`.
-unsafe fn find_persisted(namespace: u32, label: &[u8]) -> Result<Option<usize>, i32> {
-    let table = &raw const PERSISTED;
-    for (i, e) in (*table).iter().enumerate() {
-        if e.live && e.namespace == namespace && e.label_bytes() == label {
-            return Ok(Some(i));
+unsafe fn find_persisted(scope: Scope, label: &[u8]) -> Result<Option<usize>, i32> {
+    let kept = keeper_of(scope);
+    let table = &raw mut PERSISTED;
+    for (i, e) in (*table).iter_mut().enumerate() {
+        if e.live && e.scope() == scope && e.label_bytes() == label {
+            if e.kept == kept {
+                return Ok(Some(i));
+            }
+            // Sealed by a keeper this scope no longer has (the workload
+            // that brought the vault is gone): not this key. What the
+            // scope's keeper holds now is read afresh.
+            zeroize(&mut e.sealed);
+            *e = Persisted::empty();
         }
     }
     // Not in RAM — this may be a fresh process. Ask the platform whether it
@@ -528,7 +789,7 @@ unsafe fn find_persisted(namespace: u32, label: &[u8]) -> Result<Option<usize>, 
     // rather than only a scheduler reset. Without it an issuer would re-key
     // on every start and every credential it had signed would stop verifying,
     // silently: a verifier just sees a bad signature.
-    rehydrate_persisted(namespace, label)
+    rehydrate_persisted(scope, label)
 }
 
 /// Pull a sealed record back from the platform into the RAM table.
@@ -541,36 +802,49 @@ unsafe fn find_persisted(namespace: u32, label: &[u8]) -> Result<Option<usize>, 
 ///
 /// # Safety
 /// Kernel context, exclusive access to `PERSISTED`.
-unsafe fn rehydrate_persisted(namespace: u32, label: &[u8]) -> Result<Option<usize>, i32> {
+unsafe fn rehydrate_persisted(scope: Scope, label: &[u8]) -> Result<Option<usize>, i32> {
     if label.is_empty() || label.len() > MAX_LABEL {
         return Ok(None);
     }
+    let kept = keeper_of(scope);
     let mut name = [0u8; MAX_BLOB_NAME];
-    let name_len = blob_name(namespace, label, &mut name);
+    let name_len = blob_name(scope, kept, label, &mut name);
     let mut blob = [0u8; MAX_HEADER + MAX_SEALED];
-    let Some(n) = crate::kernel::sys::hal::seal_blob_read(&name[..name_len], &mut blob) else {
+    let Some(n) = keeper_read(kept, &name[..name_len], &mut blob) else {
         return Ok(None);
     };
-    if n < 15 || blob[0..4] != RECORD_MAGIC {
-        return Ok(None);
+    // In a workload's own vault a record that is there and is not this key
+    // (another seal key, a header altered at rest) is refused, never read as
+    // absent: answered as absent, a labelled open would generate a key and
+    // write it over the record — a misconfigured seal key would destroy the
+    // key it cannot open.
+    let unreadable = if kept == Keeper::Platform {
+        Ok(None)
+    } else {
+        Err(EACCES)
+    };
+    if n < 15 {
+        zeroize(&mut blob);
+        return unreadable;
     }
     let suite = u16::from_le_bytes([blob[8], blob[9]]);
     let usage = u32::from_le_bytes([blob[10], blob[11], blob[12], blob[13]]);
     let mut header = [0u8; MAX_HEADER];
-    let h = record_header(namespace, label, suite, usage, &mut header);
+    let h = record_header(scope, kept, label, suite, usage, &mut header);
     if n <= h || blob[..h] != header[..h] || n - h > MAX_SEALED {
-        return Ok(None);
+        zeroize(&mut blob);
+        return unreadable;
     }
     // Proven here, not at first use: a record that does not open under its
     // own header is not this key.
     let mut probe = [0u8; MAX_KEY_BYTES];
-    let opened = crate::kernel::sys::hal::unseal(&header[..h], &blob[h..n], &mut probe);
+    let opened = keeper_unseal(kept, &header[..h], &blob[h..n], &mut probe);
     zeroize(&mut probe);
     if opened.is_none() {
-        return Ok(None);
+        zeroize(&mut blob);
+        return unreadable;
     }
-    let table = &raw const PERSISTED;
-    let Some(idx) = (*table).iter().position(|e| !e.live) else {
+    let Some(idx) = free_persisted() else {
         return Err(ENOMEM);
     };
     PERSISTED[idx] = Persisted::empty();
@@ -579,7 +853,9 @@ unsafe fn rehydrate_persisted(namespace: u32, label: &[u8]) -> Result<Option<usi
     {
         PERSISTED[idx].label_len = label.len() as u8;
     }
-    PERSISTED[idx].namespace = namespace;
+    PERSISTED[idx].namespace = scope.namespace;
+    PERSISTED[idx].realm = scope.realm;
+    PERSISTED[idx].kept = kept;
     PERSISTED[idx].suite = suite;
     PERSISTED[idx].usage = usage;
     PERSISTED[idx].sealed[..n - h].copy_from_slice(&blob[h..n]);
@@ -610,14 +886,15 @@ enum Persist {
 ///
 /// # Safety
 /// Kernel context, exclusive access to `PERSISTED`.
-unsafe fn persist_key(namespace: u32, label: &[u8], suite: u16, usage: u32, key: &[u8]) -> Persist {
+unsafe fn persist_key(scope: Scope, label: &[u8], suite: u16, usage: u32, key: &[u8]) -> Persist {
     if label.is_empty() || label.len() > MAX_LABEL {
         return Persist::Failed;
     }
+    let kept = keeper_of(scope);
     let mut header = [0u8; MAX_HEADER];
-    let h = record_header(namespace, label, suite, usage, &mut header);
+    let h = record_header(scope, kept, label, suite, usage, &mut header);
     let mut sealed = [0u8; MAX_SEALED];
-    let Some(n) = crate::kernel::sys::hal::seal(&header[..h], key, &mut sealed) else {
+    let Some(n) = keeper_seal(kept, &header[..h], key, &mut sealed) else {
         // No sealing on this platform. The key still works for this boot;
         // it simply will not come back, and `DESCRIBE` reports that
         // truthfully rather than claiming a persistence that is not there.
@@ -627,10 +904,10 @@ unsafe fn persist_key(namespace: u32, label: &[u8], suite: u16, usage: u32, key:
     record[..h].copy_from_slice(&header[..h]);
     record[h..h + n].copy_from_slice(&sealed[..n]);
     let mut name = [0u8; MAX_BLOB_NAME];
-    let name_len = blob_name(namespace, label, &mut name);
-    let outcome = if crate::kernel::sys::hal::seal_blob_write(&name[..name_len], &record[..h + n]) {
+    let name_len = blob_name(scope, kept, label, &mut name);
+    let outcome = if keeper_write(kept, &name[..name_len], &record[..h + n]) {
         Persist::Durable
-    } else if crate::kernel::sys::hal::seal_blob_store() {
+    } else if keeper_stores(kept) {
         log::warn!("[vault] persist failed: sealed record not durably stored (suite={suite})");
         Persist::Failed
     } else {
@@ -643,27 +920,26 @@ unsafe fn persist_key(namespace: u32, label: &[u8], suite: u16, usage: u32, key:
     }
     // The RAM entry carries the key across a scheduler reset, whether or not
     // the platform could keep it across a restart.
-    let idx = match find_persisted(namespace, label) {
+    let idx = match find_persisted(scope, label) {
         Ok(Some(i)) => i,
-        Ok(None) | Err(_) => {
-            let table = &raw const PERSISTED;
-            match (*table).iter().position(|e| !e.live) {
-                Some(i) => i,
-                None => {
-                    zeroize(&mut sealed);
-                    return if outcome == Persist::Durable {
-                        outcome
-                    } else {
-                        Persist::Unavailable
-                    };
-                }
+        Ok(None) | Err(_) => match free_persisted() {
+            Some(i) => i,
+            None => {
+                zeroize(&mut sealed);
+                return if outcome == Persist::Durable {
+                    outcome
+                } else {
+                    Persist::Unavailable
+                };
             }
-        }
+        },
     };
     PERSISTED[idx] = Persisted::empty();
     PERSISTED[idx].label[..label.len()].copy_from_slice(label);
     PERSISTED[idx].label_len = label.len() as u8;
-    PERSISTED[idx].namespace = namespace;
+    PERSISTED[idx].namespace = scope.namespace;
+    PERSISTED[idx].realm = scope.realm;
+    PERSISTED[idx].kept = kept;
     PERSISTED[idx].suite = suite;
     PERSISTED[idx].usage = usage;
     PERSISTED[idx].sealed[..n].copy_from_slice(&sealed[..n]);
@@ -682,14 +958,16 @@ unsafe fn open_persisted(idx: usize) -> Result<usize, i32> {
     let entry = PERSISTED[idx];
     let mut header = [0u8; MAX_HEADER];
     let h = record_header(
-        entry.namespace,
+        entry.scope(),
+        entry.kept,
         entry.label_bytes(),
         entry.suite,
         entry.usage,
         &mut header,
     );
     let mut key = [0u8; MAX_KEY_BYTES];
-    let Some(n) = crate::kernel::sys::hal::unseal(
+    let Some(n) = keeper_unseal(
+        entry.kept,
         &header[..h],
         &entry.sealed[..entry.sealed_len as usize],
         &mut key,
@@ -711,13 +989,47 @@ unsafe fn open_persisted(idx: usize) -> Result<usize, i32> {
         .copy_from_slice(&entry.label[..entry.label_len as usize]);
     SLOTS[slot].label_len = entry.label_len;
     SLOTS[slot].namespace = entry.namespace;
+    SLOTS[slot].realm = entry.realm;
     for (j, b) in key.iter().take(n).enumerate() {
         core::ptr::write_volatile(&raw mut SLOTS[slot].data[j], *b);
     }
     zeroize(&mut key);
     // In-use last, so a partial fill is never observable.
-    SLOTS[slot].flags = FLAG_IN_USE | FLAG_PERSISTED;
+    SLOTS[slot].flags = FLAG_IN_USE | FLAG_PERSISTED | owner_sealed_flag(entry.kept);
     Ok(slot)
+}
+
+/// A `PERSISTED` entry free to take: one not live, or one a workload's
+/// vault sealed whose workload is gone (its keeper can never open it again,
+/// and a workload churning through vaults must not fill the table).
+///
+/// # Safety
+/// Kernel context, exclusive access to `PERSISTED`.
+unsafe fn free_persisted() -> Option<usize> {
+    let table = &raw mut PERSISTED;
+    if let Some(i) = (*table).iter().position(|e| !e.live) {
+        return Some(i);
+    }
+    #[cfg(feature = "host-linux")]
+    for (i, e) in (*table).iter_mut().enumerate() {
+        if let Keeper::Volume(h) = e.kept {
+            if !crate::platform::linux::owner_root::vault_present(h) {
+                zeroize(&mut e.sealed);
+                *e = Persisted::empty();
+                return Some(i);
+            }
+        }
+    }
+    None
+}
+
+/// [`FLAG_OWNER_SEALED`] for a key `kept` holds in a workload's own vault.
+fn owner_sealed_flag(kept: Keeper) -> u8 {
+    if kept == Keeper::Platform {
+        0
+    } else {
+        FLAG_OWNER_SEALED
+    }
 }
 
 /// Remove a persisted key: its RAM entry and its durable record. Returns
@@ -726,24 +1038,25 @@ unsafe fn open_persisted(idx: usize) -> Result<usize, i32> {
 ///
 /// # Safety
 /// Kernel context, exclusive access to `PERSISTED`.
-unsafe fn forget_persisted(namespace: u32, label: &[u8]) -> (bool, bool) {
+unsafe fn forget_persisted(scope: Scope, label: &[u8]) -> (bool, bool) {
     let mut found = false;
     let table = &raw mut PERSISTED;
     for e in (*table).iter_mut() {
-        if e.live && e.namespace == namespace && e.label_bytes() == label {
+        if e.live && e.scope() == scope && e.label_bytes() == label {
             zeroize(&mut e.sealed);
             *e = Persisted::empty();
             found = true;
         }
     }
+    let kept = keeper_of(scope);
     let mut name = [0u8; MAX_BLOB_NAME];
-    let name_len = blob_name(namespace, label, &mut name);
+    let name_len = blob_name(scope, kept, label, &mut name);
     let mut blob = [0u8; MAX_HEADER + MAX_SEALED];
-    if crate::kernel::sys::hal::seal_blob_read(&name[..name_len], &mut blob).is_some() {
+    if keeper_read(kept, &name[..name_len], &mut blob).is_some() {
         found = true;
     }
     zeroize(&mut blob);
-    let removed = crate::kernel::sys::hal::seal_blob_delete(&name[..name_len]);
+    let removed = keeper_delete(kept, &name[..name_len]);
     (found, removed)
 }
 
@@ -768,10 +1081,10 @@ pub unsafe fn import_persisted(
     {
         return Err(EINVAL);
     }
-    if store_not_ready() {
+    if store_not_ready(Scope::node(namespace)) {
         return Err(EAGAIN);
     }
-    match persist_key(namespace, label, suite, usage, key) {
+    match persist_key(Scope::node(namespace), label, suite, usage, key) {
         Persist::Durable => Ok(()),
         Persist::Unavailable => Err(ENOSYS),
         Persist::Failed => Err(ERROR),
@@ -793,11 +1106,12 @@ pub unsafe fn identity_public(namespace: u32, label: &[u8]) -> Result<[u8; 65], 
     if label.is_empty() || label.len() > MAX_LABEL {
         return Err(EINVAL);
     }
-    if store_not_ready() {
+    let scope = Scope::node(namespace);
+    if store_not_ready(scope) {
         return Err(EAGAIN);
     }
     let mut key = [0u8; 32];
-    match find_persisted(namespace, label)? {
+    match find_persisted(scope, label)? {
         Some(pi) => {
             if PERSISTED[pi].suite != suite::P256 || want & !PERSISTED[pi].usage != 0 {
                 return Err(EACCES);
@@ -812,7 +1126,7 @@ pub unsafe fn identity_public(namespace: u32, label: &[u8]) -> Result<[u8; 65], 
                 return Err(ERROR);
             }
             if !matches!(
-                persist_key(namespace, label, suite::P256, want, &key),
+                persist_key(scope, label, suite::P256, want, &key),
                 Persist::Durable
             ) {
                 zeroize(&mut key);
@@ -1407,6 +1721,7 @@ unsafe fn zeroise_slot(i: usize) {
     SLOTS[i].owner = KERNEL_OWNER;
     SLOTS[i].owner_generation = 0;
     SLOTS[i].namespace = 0;
+    SLOTS[i].realm = NODE_REALM;
     // Every handle to the key just destroyed stops resolving.
     SLOTS[i].generation = SLOTS[i].generation.wrapping_add(1) & GENERATION_MASK;
 }
@@ -2445,7 +2760,14 @@ pub unsafe fn provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             // it comes back after a restart. A key can be persisted and
             // isolated from nothing, which is the ordinary case on a host
             // with no device-unique sealing key.
-            *arg.add(6) = current_tier();
+            // A key a workload's own vault holds is sealed under a key its
+            // owner supplied: isolated from nothing the platform's key
+            // could add.
+            *arg.add(6) = if slot.flags & FLAG_OWNER_SEALED != 0 {
+                dev_key_vault::tier::SOFTWARE
+            } else {
+                current_tier()
+            };
             *arg.add(7) = u8::from((slot.flags & FLAG_PERSISTED) != 0);
             8
         }
@@ -2494,12 +2816,9 @@ pub unsafe fn provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             // first had freed. Another instance of the same module type is
             // refused: the key is in use, and it is not that instance's.
             let who = caller();
+            let scope = who.scope();
             let slots = &raw const SLOTS;
-            let existing = (*slots).iter().position(|s| {
-                (s.flags & FLAG_IN_USE) != 0
-                    && s.namespace == who.namespace
-                    && s.label_bytes() == label
-            });
+            let existing = (*slots).iter().position(|s| s.filed_as(scope, label));
             if let Some(i) = existing {
                 if !owned_by(i, who) {
                     return EBUSY;
@@ -2513,12 +2832,12 @@ pub unsafe fn provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             // reading it as empty would generate a fresh key over one
             // already stored (a node's CA, minted anew on every boot). The
             // caller asks again once the medium is up.
-            if existing.is_none() && store_not_ready() {
+            if existing.is_none() && store_not_ready(scope) {
                 return EAGAIN;
             }
             let idx = match existing {
                 Some(i) => i,
-                None => match find_persisted(who.namespace, label) {
+                None => match find_persisted(scope, label) {
                     // A key exists that this table has no room to hold:
                     // never answered by generating another over it.
                     Err(e) => return e,
@@ -2571,7 +2890,7 @@ pub unsafe fn provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
                             core::ptr::write_volatile(&raw mut SLOTS[i].data[j], *b);
                         }
                         let persisted = if usage & dev_key_vault::usage::PERSIST != 0 {
-                            persist_key(who.namespace, label, suite, usage, &key[..priv_len])
+                            persist_key(scope, label, suite, usage, &key[..priv_len])
                         } else {
                             Persist::Unavailable
                         };
@@ -2585,7 +2904,7 @@ pub unsafe fn provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
                         }
                         SLOTS[i].flags = FLAG_IN_USE
                             | if persisted == Persist::Durable {
-                                FLAG_PERSISTED
+                                FLAG_PERSISTED | owner_sealed_flag(keeper_of(scope))
                             } else {
                                 0
                             };
@@ -2627,7 +2946,9 @@ pub unsafe fn provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             let label = &label[..label_len];
             // The blob may be in a store that cannot be read yet: a delete
             // answered there would leave it to come back once it can.
-            if store_not_ready() {
+            let who = caller();
+            let scope = who.scope();
+            if store_not_ready(scope) {
                 return EAGAIN;
             }
             let mut found = false;
@@ -2636,15 +2957,11 @@ pub unsafe fn provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             // next open — so a revocation that used it would not revoke.
             // Collected first: `zeroise_slot` takes a mutable borrow, so
             // the scan and the wipe cannot share one iteration.
-            let who = caller();
             let slots = &raw const SLOTS;
             let mut victims = [usize::MAX; MAX_SLOTS];
             let mut n = 0usize;
             for (i, sl) in (*slots).iter().enumerate() {
-                if (sl.flags & FLAG_IN_USE) != 0
-                    && sl.namespace == who.namespace
-                    && sl.label_bytes() == label
-                {
+                if sl.filed_as(scope, label) {
                     victims[n] = i;
                     n += 1;
                 }
@@ -2653,7 +2970,7 @@ pub unsafe fn provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
                 zeroise_slot(i);
                 found = true;
             }
-            let (had, removed) = forget_persisted(who.namespace, label);
+            let (had, removed) = forget_persisted(scope, label);
             if !removed {
                 log::warn!("[vault] destroy: sealed record could not be removed");
                 return ERROR;
@@ -3020,6 +3337,13 @@ pub(crate) unsafe fn import_session_key(suite: u16, usage: u32, key: &[u8; 32]) 
 /// The calling module's label namespace.
 pub(crate) fn caller_namespace() -> u32 {
     caller().namespace
+}
+
+/// Whether the calling module is a workload's: its labels live in its
+/// workload's realm, which only this backend keeps (a token's labels name
+/// a module type and nothing narrower).
+pub(crate) fn caller_in_workload() -> bool {
+    caller().realm != NODE_REALM
 }
 
 /// A suite's signature length, or 0.

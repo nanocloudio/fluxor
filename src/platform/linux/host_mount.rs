@@ -341,10 +341,66 @@ fn holds_cap(bit: u32) -> bool {
         .is_some_and(|caps| caps & (1u64 << bit) != 0)
 }
 
-/// The `PRIV` answer: the privilege bits this runtime holds.
+/// Whether this process may mount in its own mount namespace: it holds
+/// `CAP_SYS_ADMIN` over the user namespace that owns that mount namespace,
+/// which is the check `mount(2)` makes. The capability in the effective set
+/// alone does not say so: a runtime in a user namespace of its own
+/// (`unshare -Urn`) holds it there, but its mount namespace is still the
+/// host's, owned by the initial user namespace, and every mount is `EPERM`.
+///
+/// Asked of the kernel with nothing mounted: `fsopen("tmpfs")` makes the
+/// same permission check (`CAP_SYS_ADMIN` over the mount namespace's owner)
+/// and opens only a filesystem context, closed at once. On a kernel without
+/// `fsopen` (before 5.2) the answer is whether the mount namespace's owner
+/// is this process's own user namespace (`NS_GET_USERNS`).
+fn can_mount() -> bool {
+    if !holds_cap(CAP_SYS_ADMIN) {
+        return false;
+    }
+    // SAFETY: a NUL-terminated name; the descriptor, if any, is closed here.
+    let fd = unsafe { libc::syscall(libc::SYS_fsopen, c"tmpfs".as_ptr(), FSOPEN_CLOEXEC) };
+    if fd >= 0 {
+        // SAFETY: the descriptor fsopen just returned, owned here.
+        unsafe { libc::close(fd as i32) };
+        return true;
+    }
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(libc::ENOSYS) => mount_ns_is_own(),
+        // `EPERM`: the mount namespace is not this process's to mount in;
+        // anything else (no tmpfs, a limit) is no mount it could make.
+        _ => false,
+    }
+}
+
+/// `fsopen(2)`'s close-on-exec flag.
+const FSOPEN_CLOEXEC: libc::c_uint = 1;
+
+/// Whether the user namespace owning this process's mount namespace is its
+/// own user namespace.
+fn mount_ns_is_own() -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(mnt) = std::fs::File::open("/proc/self/ns/mnt") else {
+        return false;
+    };
+    // SAFETY: an ioctl on a namespace descriptor this function holds.
+    let owner = unsafe { libc::ioctl(mnt.as_raw_fd(), libc::NS_GET_USERNS) };
+    if owner < 0 {
+        // `EPERM`: the owner lies outside this process's user namespace.
+        return false;
+    }
+    // SAFETY: the descriptor NS_GET_USERNS returned, owned from here.
+    let owner = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(owner) });
+    match (owner.metadata(), std::fs::metadata("/proc/self/ns/user")) {
+        (Ok(theirs), Ok(own)) => own.ino() == theirs.ino() && own.dev() == theirs.dev(),
+        _ => false,
+    }
+}
+
+/// The `PRIV` answer: the privilege bits this runtime holds. `SYS_ADMIN`
+/// only when it can mount in its own mount namespace ([`can_mount`]).
 fn privileges() -> i32 {
     let mut p = 0;
-    if holds_cap(CAP_SYS_ADMIN) {
+    if can_mount() {
         p |= hm::PRIV_SYS_ADMIN;
     }
     if holds_cap(CAP_CHOWN) {

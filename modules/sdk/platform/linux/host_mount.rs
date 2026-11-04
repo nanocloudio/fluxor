@@ -47,7 +47,14 @@ pub const CLASS: u16 = 0x001F;
 /// and `GROUP_TREE` with a group the runtime is not a member of).
 /// `handle = -1`, no argument.
 pub const PRIV: u32 = 0x1F00;
-/// [`PRIV`] bit: `CAP_SYS_ADMIN` is held.
+/// [`PRIV`] bit: the runtime can mount in its own mount namespace — it holds
+/// `CAP_SYS_ADMIN` over the user namespace that owns that mount namespace,
+/// as `mount(2)` checks, probed with nothing mounted. Holding the capability
+/// in a user namespace of its own whose mount namespace is still the
+/// host's (`unshare -Urn`) is not enough, and clears the bit. In a user
+/// namespace that owns its mount namespace (`unshare -Urm`) the bit is set:
+/// a memory-backed `PROJECT` mounts there, while `MOUNT` of a block
+/// filesystem that user namespace may not mount still answers `EPERM`.
 pub const PRIV_SYS_ADMIN: i32 = 1 << 0;
 /// [`PRIV`] bit: `CAP_CHOWN` is held.
 pub const PRIV_CHOWN: i32 = 1 << 1;

@@ -577,6 +577,229 @@ mod scheduler_validation_tests {
         );
     }
 
+    /// The FLXA edges a workload's `wiring:` resolves to, or why it is refused.
+    fn workload_wiring(
+        modules: Value,
+        wiring: Value,
+    ) -> std::result::Result<Vec<WorkloadEdge>, String> {
+        let tmp = std::env::temp_dir();
+        let cfg = json!({"workloads": [{"modules": modules, "wiring": wiring}]});
+        build_workloads(&cfg, test_loc(&tmp), &[], "linux")
+            .map(|mut w| w.remove(0).edges)
+            .map_err(|e| e.to_string())
+    }
+
+    fn port_index(module: &str, port: &str) -> u8 {
+        crate::manifest::Manifest::from_source_tree(module)
+            .unwrap()
+            .unwrap()
+            .find_port_by_name(port)
+            .unwrap_or_else(|| panic!("{module}.{port}"))
+            .1
+    }
+
+    /// A workload's wiring is a graph's: `module.port` ends resolve
+    /// against the manifests, and `linux_net` is the node's network — each
+    /// module wired to it a lane of its own, keyed in the order the wiring
+    /// first names it.
+    #[test]
+    fn a_workload_wires_named_ports_and_the_node_network_as_a_graph_does() {
+        let edges = workload_wiring(
+            json!([
+                {"name": "front", "type": "tls"},
+                {"name": "link", "type": "remote_channel"},
+                {"name": "back", "type": "tls"},
+            ]),
+            json!([
+                {"from": "front.cipher_out", "to": "linux_net.net_in", "buffer_bytes": 4096},
+                {"from": "linux_net.net_out", "to": "front.cipher_in"},
+                {"from": "front.clear_out", "to": "link.transport_in"},
+                {"from": "link.transport_out", "to": "front.clear_in"},
+                {"from": "linux_net", "to": "back.cipher_in"},
+                {"from": "back.cipher_out", "to": "linux_net"},
+            ]),
+        )
+        .unwrap();
+        let shape: Vec<_> = edges
+            .iter()
+            .map(|e| (e.from, e.from_port, e.to, e.to_port, e.buffer_bytes))
+            .collect();
+        let (l, n) = (WorkloadEnd::Local, WorkloadEnd::Net);
+        assert_eq!(
+            shape,
+            vec![
+                (l(0), port_index("tls", "cipher_out"), n(0), 0, 4096),
+                (n(0), 0, l(0), port_index("tls", "cipher_in"), 0),
+                (
+                    l(0),
+                    port_index("tls", "clear_out"),
+                    l(1),
+                    port_index("remote_channel", "transport_in"),
+                    0
+                ),
+                (
+                    l(1),
+                    port_index("remote_channel", "transport_out"),
+                    l(0),
+                    port_index("tls", "clear_in"),
+                    0
+                ),
+                (n(1), 0, l(2), port_index("tls", "cipher_in"), 0),
+                (l(2), port_index("tls", "cipher_out"), n(1), 0, 0),
+            ]
+        );
+        // Not every port is the first of its direction: the names matter.
+        assert_ne!(port_index("tls", "clear_out"), 0);
+        // A control input rides the edge's control bit.
+        let edges = workload_wiring(
+            json!([{"name": "a", "type": "link"}, {"name": "b", "type": "link"}]),
+            json!([{"from": "a.ctrl_fwd", "to": "b.control"}]),
+        )
+        .unwrap();
+        assert_eq!(edges[0].from_port, port_index("link", "ctrl_fwd"));
+        assert_eq!(edges[0].to_port, 0x80 | port_index("link", "control"));
+    }
+
+    /// What a workload's wiring cannot say is refused, naming the edge.
+    #[test]
+    fn a_workload_wiring_refuses_what_it_cannot_carry() {
+        let tls = json!([{"name": "front", "type": "tls"}]);
+        let refused =
+            |modules: &Value, wiring: Value| match workload_wiring(modules.clone(), wiring) {
+                Ok(_) => panic!("refused"),
+                Err(e) => e,
+            };
+        let lane = |extra: Value| {
+            let mut w = vec![
+                json!({"from": "front.cipher_out", "to": "linux_net.net_in"}),
+                json!({"from": "linux_net.net_out", "to": "front.cipher_in"}),
+            ];
+            w.push(extra);
+            Value::Array(w)
+        };
+        // The numeric forms are gone.
+        let e = refused(
+            &tls,
+            json!([{"from": "front", "to": "front", "from_port": 1}]),
+        );
+        assert!(
+            e.contains("wiring 0: `from_port` is not a wiring key"),
+            "{e}"
+        );
+        let e = refused(&tls, json!([{"from": "net:0", "to": "front"}]));
+        assert!(
+            e.contains("`net:0`: the node's network is the platform's `linux_net`"),
+            "{e}"
+        );
+        // An unknown port, with what the manifest has.
+        let e = refused(
+            &tls,
+            json!([{"from": "front.clear_ot", "to": "linux_net.net_in"}]),
+        );
+        assert!(
+            e.contains("wiring 0: from `front.clear_ot`")
+                && e.contains("Did you mean 'clear_out'?"),
+            "{e}"
+        );
+        // A port used the wrong way round.
+        let e = refused(
+            &tls,
+            json!([{"from": "front.cipher_in", "to": "linux_net.net_in"}]),
+        );
+        assert!(e.contains("used in 'from:'"), "{e}");
+        // An unknown module.
+        let e = refused(
+            &tls,
+            json!([{"from": "frnt.cipher_out", "to": "linux_net.net_in"}]),
+        );
+        assert!(
+            e.contains("unknown module `frnt`. Did you mean 'front'?"),
+            "{e}"
+        );
+        // The network is reached through the lane alone.
+        let e = refused(
+            &tls,
+            json!([{"from": "front.cipher_out", "to": "linux_net.net_out"}]),
+        );
+        assert!(e.contains("through its lane alone"), "{e}");
+        // A lane is one edge each way.
+        let e = refused(
+            &tls,
+            json!([{"from": "front.cipher_out", "to": "linux_net.net_in"}]),
+        );
+        assert!(
+            e.contains(
+                "`front` is wired to the node's network 1 time(s) toward it and 0 time(s) from it"
+            ),
+            "{e}"
+        );
+        let e = refused(
+            &tls,
+            lane(json!({"from": "front.clear_out", "to": "linux_net.net_in"})),
+        );
+        assert!(
+            e.contains("2 time(s) toward it and 1 time(s) from it"),
+            "{e}"
+        );
+        let e = refused(
+            &tls,
+            lane(json!({"from": "linux_net.net_out", "to": "linux_net.net_in"})),
+        );
+        assert!(e.contains("not to itself"), "{e}");
+        // The network is not a module of the workload.
+        let e = refused(
+            &json!([{"name": "linux_net"}, {"name": "front", "type": "tls"}]),
+            lane(json!({"from": "front.clear_out", "to": "front.clear_in"})),
+        );
+        assert!(
+            e.contains("`linux_net` is the node's network, not a module of the workload"),
+            "{e}"
+        );
+        workload_wiring(
+            tls.clone(),
+            lane(json!({"from": "front.clear_out", "to": "front.clear_in"})),
+        )
+        .expect("one lane, one loop");
+    }
+
+    /// A workload past a traffic-fabric integration image's 175 edges builds
+    /// and encodes up to `MAX_ADD_EDGES` (192); one edge more is refused.
+    #[test]
+    fn a_workload_builds_up_to_the_subgraph_edge_cap() {
+        use crate::add_subgraph::{encode_add_subgraph, MAX_ADD_EDGES};
+        assert_eq!(MAX_ADD_EDGES, 192);
+        let n = 50usize;
+        let modules: Vec<Value> = (0..n)
+            .map(|i| json!({"name": format!("m{i}"), "type": "churn_probe"}))
+            .collect();
+        // Each module feeds the next four, then `i -> i + 5`: 190 + 45 edges.
+        let mut pairs: Vec<(usize, usize)> = (0..n)
+            .flat_map(|i| (i + 1..(i + 5).min(n)).map(move |j| (i, j)))
+            .collect();
+        pairs.extend((0..n - 5).map(|i| (i, i + 5)));
+        let wiring = |count: usize| -> Value {
+            pairs[..count]
+                .iter()
+                .map(|(a, b)| json!({"from": format!("m{a}.data_out"), "to": format!("m{b}.data_in")}))
+                .collect()
+        };
+        let tmp = std::env::temp_dir();
+        let build = |count: usize| {
+            let cfg = json!({"workloads": [{"modules": modules.clone(), "wiring": wiring(count)}]});
+            build_workloads(&cfg, test_loc(&tmp), &[], "linux").expect("the workload resolves")
+        };
+        let at_cap = build(MAX_ADD_EDGES);
+        assert_eq!(at_cap[0].edges.len(), MAX_ADD_EDGES);
+        let blob = encode_add_subgraph(&at_cap[0]).expect("192 edges encode");
+        // The FLXA header's counts: modules then edges, in a byte each.
+        assert_eq!((blob[32], blob[33]), (n as u8, MAX_ADD_EDGES as u8));
+        let over = build(MAX_ADD_EDGES + 1);
+        let e = encode_add_subgraph(&over[0]).unwrap_err();
+        assert!(
+            e.contains("workload has 193 edges, exceeds MAX_ADD_EDGES (192)"),
+            "{e}"
+        );
+    }
     /// What the kernel refuses a workload, the build refuses first: a
     /// policy that reaches past the module, and a deadline over 16 × the
     /// domain's shortest tick.
@@ -5841,36 +6064,200 @@ mod boot_plan_tests {
 mod check_mode_file_tests {
     use super::*;
 
-    /// A check stands a nominal size in for a deployment file that is not
-    /// there; a file that is there is decoded as a build decodes it, and
-    /// outside a check nothing is stood in for: the build reads the file
-    /// and fails on its absence.
+    /// tls and quic credentials: a bare path stays a packed param (the
+    /// module reads it at runtime, and nothing is read here), an env
+    /// binding stays for the schema to pack, and only `${file:<path>}` and
+    /// `trust: system` are lifted out to be embedded.
     #[test]
-    fn a_check_stands_in_only_for_an_absent_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let absent = dir.path().join("server_cert.der");
-        let absent = absent.to_str().unwrap();
-        assert_eq!(
-            stand_in_size(true, absent, "cert_file"),
-            Some(CHECK_NOMINAL_CERT)
-        );
-        assert_eq!(
-            stand_in_size(true, absent, "key_file"),
-            Some(CHECK_NOMINAL_KEY)
-        );
-        assert_eq!(
-            stand_in_size(true, absent, "trust"),
-            Some(CHECK_NOMINAL_CERT)
-        );
-        assert_eq!(stand_in_size(false, absent, "cert_file"), None);
+    fn credentials_named_by_path_are_packed_and_never_read() {
+        let all = |_: &str| true;
+        let module = json!({
+            "cert_file": "/run/secrets/tls/tls.crt",
+            "key_file": {"env": "TLS_KEY"},
+            "trust": "/run/secrets/tls/ca.crt",
+        });
+        let (validated, packed, sources) =
+            lift_credential_sources("srv", module.clone(), all).unwrap();
+        assert_eq!(validated, module);
+        assert_eq!(packed, module, "every runtime form packs as written");
+        assert_eq!(sources, CredentialSources::default(), "nothing to embed");
 
-        let present = dir.path().join("present.der");
-        std::fs::write(&present, b"not a certificate").unwrap();
+        let module = json!({
+            "cert_file": "${file:/build/cert.pem}",
+            "key_file": "/run/key.pem",
+            "trust": "system",
+        });
+        let (_, packed, sources) = lift_credential_sources("srv", module, all).unwrap();
+        assert_eq!(packed, json!({"key_file": "/run/key.pem"}));
+        assert_eq!(sources.cert.as_deref(), Some("${file:/build/cert.pem}"));
+        assert_eq!(sources.key, None);
+        assert_eq!(sources.trust.as_deref(), Some("system"));
+
+        // An empty value (a param left at `""`) names nothing.
+        let empty = json!({"trust": ""});
+        let (_, packed, sources) = lift_credential_sources("srv", empty.clone(), all).unwrap();
+        assert_eq!((packed, sources), (empty, CredentialSources::default()));
+
+        // A module whose schema declares none of them is left alone: an
+        // ISR-tier module's `trust: platform` is a trust level.
+        let level = json!({"trust": "platform"});
+        let (_, packed, sources) =
+            lift_credential_sources("isr", level.clone(), |_| false).unwrap();
+        assert_eq!((packed, sources), (level, CredentialSources::default()));
+
+        for (bad, says) in [
+            (json!({"cert_file": "certs/server.pem"}), "absolute path"),
+            (
+                json!({"key_file": format!("/{}", "k".repeat(255))}),
+                "at most 255",
+            ),
+            (json!({"trust": "${param:ca}"}), "is not `${file:<path>}`"),
+            (json!({"trust": 7}), "an `{env: NAME}` binding"),
+        ] {
+            let err = lift_credential_sources("srv", bad, all).unwrap_err();
+            assert!(format!("{err:?}").contains(says), "{err:?}");
+        }
+    }
+
+    /// A Linux image never embeds a credential: the build-time form is
+    /// refused before any file is read, so a host build (and its check)
+    /// reads nothing. Elsewhere it embeds, and a bare path — read at
+    /// runtime — is refused where nothing serves `fs`.
+    #[test]
+    fn credential_forms_follow_the_runtime() {
+        for key in ["cert_file", "key_file", "trust"] {
+            let m = json!({"name": "srv", "type": "tls", key: "${file:/nonexistent/x.pem}"});
+            let err = refuse_credential_forms(&m, Some("linux"), true, "srv").unwrap_err();
+            let msg = format!("{err:?}");
+            assert!(msg.contains("takes its credentials at runtime"), "{msg}");
+            assert!(
+                msg.contains(&format!("`{key}: /nonexistent/x.pem`")),
+                "{msg}"
+            );
+            refuse_credential_forms(&m, Some("bcm2712"), false, "srv").expect("metal embeds");
+            refuse_credential_forms(&m, None, false, "srv").expect("no target: unjudged");
+
+            let bare = json!({"name": "srv", "type": "tls", key: "/nonexistent/x.pem"});
+            refuse_credential_forms(&bare, Some("linux"), true, "srv").expect("read at runtime");
+            let err = refuse_credential_forms(&bare, Some("rp2350"), false, "srv").unwrap_err();
+            let msg = format!("{err:?}");
+            assert!(msg.contains("nothing serves `fs`"), "{msg}");
+            assert!(msg.contains("${file:/nonexistent/x.pem}"), "{msg}");
+            refuse_credential_forms(&bare, Some("rp2350"), true, "srv")
+                .expect("a graph with an fs provider reads it");
+        }
+        let system = json!({"name": "srv", "type": "tls", "trust": "system"});
+        refuse_credential_forms(&system, Some("rp2350"), false, "srv").expect("no file");
+        assert!(fs_reachable("linux", ProviderCaller::Node));
+        assert!(fs_reachable("bcm2712", ProviderCaller::Workload));
+        assert!(!fs_reachable("bcm2712", ProviderCaller::Node));
+        assert!(!fs_reachable("rp2350", ProviderCaller::Node));
+    }
+
+    /// tls's peer names as its schema declares them (tags 24..=26).
+    fn peer_name_schema() -> crate::schema::ParamSchema {
+        use crate::schema::{ParamSchema, ParamType, SchemaParam};
+        let p = |tag, name: &str| SchemaParam {
+            tag,
+            ptype: ParamType::Str,
+            name: name.into(),
+            default: 0,
+            enums: std::collections::HashMap::new(),
+        };
+        ParamSchema::from_params(vec![
+            p(24, "verify_hostname"),
+            p(25, "verify_uri"),
+            p(26, "alpn"),
+        ])
+    }
+
+    /// The `(tag, value)` entries of a packed params TLV's basic section.
+    fn packed_entries(entry: &[u8]) -> Vec<(u8, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut pos = 4;
+        while entry[pos] != 0xFF {
+            let len = entry[pos + 1] as usize;
+            out.push((entry[pos], entry[pos + 2..pos + 2 + len].to_vec()));
+            pos += 2 + len;
+        }
+        out
+    }
+
+    /// `verify_hostname`, `verify_uri` and `alpn` are tls / quic schema
+    /// strings: checked under the module's rules, `alpn`'s list joined, and
+    /// packed as basic TLVs — nothing past the terminator — so `{env: NAME}`
+    /// binds each of them in a workload image.
+    #[test]
+    fn peer_names_pack_as_schema_strings_and_bind_from_the_environment() {
+        let all = |_: &str| true;
+        let schema = peer_name_schema();
+        let pack = |module: Value| {
+            let m = normalize_peer_names("cli", "tls", module, all).unwrap();
+            let mut entry = vec![0u8; 512];
+            let end = crate::schema::build_params_from_schema(&m, &schema, &mut entry, 0, None, "tls")
+                .unwrap();
+            assert_eq!(entry[end - 2..end], [0xFF, 0], "no extended entries");
+            packed_entries(&entry[..end])
+        };
         assert_eq!(
-            stand_in_size(true, present.to_str().unwrap(), "cert_file"),
-            None,
-            "a file that is there is decoded, and refused if it does not decode"
+            pack(json!({
+                "verify_hostname": "api.cell.example",
+                "verify_uri": "spiffe://cell.example/peers/",
+                "alpn": ["h2", "http/1.1"],
+            })),
+            vec![
+                (24, b"api.cell.example".to_vec()),
+                (25, b"spiffe://cell.example/peers/".to_vec()),
+                (26, b"h2,http/1.1".to_vec()),
+            ]
         );
+        // An empty value names nothing and packs nothing.
+        assert_eq!(pack(json!({"verify_hostname": "", "alpn": []})), vec![]);
+
+        // `{env: NAME}`: a bind record in each param's place.
+        let module = json!({
+            "verify_hostname": {"env": "PEER_HOST"},
+            "verify_uri": {"env": "PEER_URI"},
+            "alpn": {"env": "PEER_ALPN"},
+        });
+        let (entries, binds) = crate::schema::with_env_binds(|| pack(module));
+        let bind = |target: u8, name: &str| {
+            let mut v = vec![
+                target,
+                crate::schema::env_bind::KIND_STR,
+                crate::schema::env_bind::FLAG_REQUIRED,
+                name.len() as u8,
+            ];
+            v.extend_from_slice(name.as_bytes());
+            (crate::schema::env_bind::BIND_TAG, v)
+        };
+        assert_eq!(
+            entries,
+            vec![
+                bind(24, "PEER_HOST"),
+                bind(25, "PEER_URI"),
+                bind(26, "PEER_ALPN"),
+            ]
+        );
+        let names: Vec<&str> = binds.iter().map(|b| b.name.as_str()).collect();
+        assert_eq!(names, ["PEER_HOST", "PEER_URI", "PEER_ALPN"]);
+
+        // A literal the module would refuse is refused here, with the reason.
+        for (bad, says) in [
+            (json!({"verify_uri": "spiffe://"}), "must be scheme://authority/path"),
+            (
+                json!({"verify_hostname": format!("{}.example", "a".repeat(60))}),
+                "over the 64-byte limit",
+            ),
+            (json!({"verify_hostname": 7}), "a string or an `{env: NAME}` binding"),
+            (json!({"alpn": "h2,,x"}), "alpn name ''"),
+        ] {
+            let err = normalize_peer_names("cli", "tls", bad, all).unwrap_err();
+            assert!(format!("{err:?}").contains(says), "{err:?}");
+        }
+        // A module whose schema declares none of them is left alone.
+        let other = json!({"alpn": ["x"]});
+        assert_eq!(normalize_peer_names("m", "mqtt", other.clone(), |_| false).unwrap(), other);
     }
 
     #[test]

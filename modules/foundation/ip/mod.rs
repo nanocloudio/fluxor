@@ -5007,12 +5007,12 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     // The static path waits for the MAC for the reason DHCP does — the
     // stack has to be able to answer ARP for an address at the moment it
     // starts claiming it.
-    if !s.ip_configured {
-        if s.use_dhcp != 0 {
-            step_dhcp(s);
-        } else if s.static_ip != 0 && s.mac_valid {
-            apply_static_address(s);
-        }
+    // DHCP runs bound as well: a lease's renewal and its end are its
+    // timers.
+    if s.use_dhcp != 0 {
+        step_dhcp(s);
+    } else if !s.ip_configured && s.static_ip != 0 && s.mac_valid {
+        apply_static_address(s);
     }
 
     // 3. Address control (in[2]) then net protocol channels (consumer ↔ IP).
@@ -9093,13 +9093,28 @@ unsafe fn apply_static_address(s: &mut IpState) {
     log_info(s, sl);
 }
 
-/// Drive the DHCP state machine.
+/// Arm the retransmission of the message just sent: due `retx_wait_ms`
+/// from now, randomised (RFC 2131 §4.1); the next wait doubles.
+unsafe fn dhcp_arm_retx(s: &mut IpState, now: u64) {
+    let mut r = [128u8; 1];
+    // No randomness leaves the wait as it is: still on time.
+    let _ = dev_csprng_fill(&*s.syscalls, r.as_mut_ptr(), 1);
+    s.dhcp.retx_at_ms = now + dhcp::jittered(s.dhcp.retx_wait_ms, r[0]) as u64;
+    s.dhcp.retx_wait_ms = dhcp::next_wait(s.dhcp.retx_wait_ms);
+}
+
+/// Start a new message's retransmission schedule.
+fn dhcp_reset_retx(s: &mut IpState) {
+    s.dhcp.retries = 0;
+    s.dhcp.retx_wait_ms = dhcp::RETX_FIRST_MS;
+}
+
+/// Drive the DHCP state machine, by the wall clock (`TIMER::MILLIS`).
 unsafe fn step_dhcp(s: &mut IpState) {
     if !s.mac_valid {
         return;
     }
-
-    s.dhcp.timer = s.dhcp.timer.wrapping_add(1);
+    let now = dev_millis(&*s.syscalls);
 
     match s.dhcp.state {
         dhcp::DhcpState::Idle => {
@@ -9120,55 +9135,54 @@ unsafe fn step_dhcp(s: &mut IpState) {
                     }
                 }
             }
-            s.dhcp.retries = 0;
+            dhcp_reset_retx(s);
             send_dhcp_discover(s);
             s.dhcp.state = dhcp::DhcpState::Discovering;
-            s.dhcp.timer = 0;
+            dhcp_arm_retx(s, now);
         }
         dhcp::DhcpState::Discovering => {
-            // Retransmit after ~2 seconds (2000 steps at ~1ms)
-            if s.dhcp.timer > 2000 {
-                s.dhcp.retries += 1;
-                if s.dhcp.retries < 10 {
-                    send_dhcp_discover(s);
-                    s.dhcp.timer = 0;
-                } else {
-                    // Give up, retry from idle (keep same XID)
-                    s.dhcp.state = dhcp::DhcpState::Idle;
-                    s.dhcp.timer = 0;
-                    s.dhcp.retries = 0;
-                }
+            // Retransmitted for as long as no OFFER comes, the wait backing
+            // off to RETX_MAX_MS.
+            if now >= s.dhcp.retx_at_ms {
+                s.dhcp.retries = s.dhcp.retries.saturating_add(1);
+                send_dhcp_discover(s);
+                dhcp_arm_retx(s, now);
             }
         }
         dhcp::DhcpState::Requesting => {
-            // Retransmit after ~2 seconds (2000 steps at ~1ms)
-            if s.dhcp.timer > 2000 {
-                s.dhcp.retries += 1;
-                if s.dhcp.retries < 10 {
+            if now >= s.dhcp.retx_at_ms {
+                if s.dhcp.retries < dhcp::REQUEST_RETRIES {
+                    s.dhcp.retries += 1;
                     send_dhcp_request(s);
-                    s.dhcp.timer = 0;
+                    dhcp_arm_retx(s, now);
                 } else {
+                    // No ACK or NAK: start over, under a new transaction.
                     s.dhcp.state = dhcp::DhcpState::Idle;
-                    s.dhcp.timer = 0;
-                    s.dhcp.retries = 0;
+                    s.dhcp.xid = 0;
                 }
             }
         }
         dhcp::DhcpState::Bound => {
-            // Track lease expiry (RFC 2131 §4.4.5). T1 = 0.5 * lease, T2 =
-            // 0.875 * lease. On T1, send a unicast REQUEST (renewal). At
-            // expiry, drop back to Idle and start a fresh discover.
-            if s.dhcp.lease_duration > 0 {
-                let elapsed = s.step_count.wrapping_sub(s.dhcp.lease_start);
-                if elapsed >= s.dhcp.lease_duration {
+            // The lease's timers (RFC 2131 §4.4.5): from T1, half the lease,
+            // a REQUEST renews it, sent again half the time left to T2
+            // (seven eighths) and then to the lease's end, never sooner than
+            // a minute; at the end the address is dropped and a fresh
+            // DISCOVER starts.
+            let lease = s.dhcp.lease_ms;
+            if lease > 0 {
+                let elapsed = now.saturating_sub(s.dhcp.lease_start_ms);
+                if elapsed >= lease {
                     s.ip_configured = false;
                     s.dhcp.state = dhcp::DhcpState::Idle;
                     s.dhcp.xid = 0;
-                    s.dhcp.timer = 0;
                     s.dhcp.renew_sent = false;
-                } else if !s.dhcp.renew_sent && elapsed >= s.dhcp.lease_duration / 2 {
+                } else if elapsed >= lease / 2 && now >= s.dhcp.renew_at_ms {
                     s.dhcp.renew_sent = true;
                     send_dhcp_request(s);
+                    let t2 = lease / 8 * 7;
+                    let until = if elapsed < t2 { t2 } else { lease };
+                    let wait = ((until - elapsed) / 2).max(dhcp::RENEW_MIN_MS);
+                    s.dhcp.renew_at_ms = now + wait;
                 }
             }
         }
@@ -9255,9 +9269,9 @@ unsafe fn process_dhcp_reply(s: &mut IpState, data: *const u8, len: usize) {
                 s.dhcp.dns_server = dns;
                 s.dhcp.lease_time = lease_time;
                 s.dhcp.state = dhcp::DhcpState::Requesting;
-                s.dhcp.timer = 0;
-                s.dhcp.retries = 0;
+                dhcp_reset_retx(s);
                 send_dhcp_request(s);
+                dhcp_arm_retx(s, dev_millis(&*s.syscalls));
             }
         }
         dhcp::DHCP_ACK => {
@@ -9303,11 +9317,10 @@ unsafe fn process_dhcp_reply(s: &mut IpState, data: *const u8, len: usize) {
                 }
                 s.ip_configured = true;
                 s.dhcp.state = dhcp::DhcpState::Bound;
-                s.dhcp.lease_start = s.step_count;
-                // Convert lease seconds into step ticks (one step = 100 µs or 1 ms
-                // depending on config; we approximate by treating step_count as
-                // an opaque tick counter and multiplying by 1000 to get ms).
-                s.dhcp.lease_duration = lease_time.saturating_mul(1000);
+                s.dhcp.lease_start_ms = dev_millis(&*s.syscalls);
+                // The lease's seconds, in the milliseconds the clock counts.
+                s.dhcp.lease_ms = lease_time as u64 * 1000;
+                s.dhcp.renew_at_ms = 0;
                 s.dhcp.renew_sent = false;
                 // Resolve the gateway afresh, then pin the mapping that
                 // exchange produces (see `arm_gateway_pin`).
@@ -9365,8 +9378,11 @@ unsafe fn process_dhcp_reply(s: &mut IpState, data: *const u8, len: usize) {
             }
         }
         dhcp::DHCP_NAK => {
+            // A renewal refused is the lease's end: the address is dropped
+            // before the client starts over (RFC 2131 §4.4.5).
+            s.ip_configured = false;
+            s.dhcp.renew_sent = false;
             s.dhcp.state = dhcp::DhcpState::Idle;
-            s.dhcp.timer = 0;
         }
         _ => {}
     }

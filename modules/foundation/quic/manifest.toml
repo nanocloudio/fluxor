@@ -53,20 +53,31 @@ aead = "on_wire_sequence"
 # |-----|--------------------|------|---------|--------------------------------|
 # | 1   | port               | u16  | 4443    | UDP port to bind.              |
 # | 2   | mode               | u8   | 1       | 0 = client, 1 = server.        |
+# | 3   | cert_file          | str  | —       | Certificate chain (leaf first, ≤1024 B): an absolute path read at runtime, or `${file:<path>}` embedded at build (not on Linux). |
+# | 4   | key_file           | str  | —       | P-256 / P-384 private key, as `cert_file`. |
 # | 5   | require_retry      | u8   | 0       | Server: demand a Retry token.  |
 # | 6   | enable_0rtt        | u8   | 0       | 0-RTT resumption + early data. |
 # | 9   | verify_peer        | u8   | 0       | Validate the peer cert chain.  |
 # | 11  | trace_sample_permille | u16 | tier  | Span head-sampling rate (‰).   |
 # | 12  | disable_migration  | u8   | 0       | Advertise disable_active_migration. |
-# | 14  | alpn               | str  | —       | Comma-separated ALPN tokens.   |
 # | 15  | ecdh_bits_per_step | u16  | 256     | P-256 ladder chunk per step.   |
 # | 16  | ticket_rotate_s    | u32  | 3600    | Ticket-sealing key rotation.   |
 # | 17  | key_update_pkts    | u32  | 0       | RFC 9001 §6 key-update knob: initiate a 1-RTT key update after this many packets in the current phase (0 = never), once the handshake is confirmed and any prior update is acknowledged. Reservations are not reset on key update (§8.3). |
+# | 19  | trust              | str  | —       | Trust anchors (one certificate or a bundle): an absolute path read at runtime, or `${file:<path>}` embedded at build (not on Linux). |
 # | 20  | authority          | str  | 127.0.0.1:4443 | Client-mode peer as `host[:port]`: a DNS name the datagram provider resolves, or a dotted-quad v4 literal; port defaults to 4443. The one address-bearing client parameter: where datagrams go, the SNI the ClientHello carries (a name only), the identity the peer's certificate must hold (dNSName for a name, iPAddress for a literal), and the key a session ticket resumes under. A v6 literal is refused at construction (the datagram surface is v4-only). |
+# | 26  | verify_hostname    | str  | —       | The peer's expected name, overriding `authority`: the SNI and the dNSName the leaf must hold (a proxy, or a pinned host reached by address). At most 64 bytes, else refused at construction. |
+# | 27  | alpn               | str  | —       | Comma-separated ALPN tokens (1..=24 printable bytes each, 64 in all, else refused at construction); set, the framed mux surface. |
 #
-# Extended tag 13 `verify_hostname` is the override: when set it is the SNI
-# and the expected dNSName regardless of `authority` (a proxy, or a pinned
-# host reached by address).
+# A path parameter is read through the `fs` contract after construction
+# (../tls/cred_file.rs), PEM or DER: until every named file is read a server
+# drops new connections' Initials unanswered (a retransmit finds it ready)
+# and a client does not dial. Unreadable files are retried every second,
+# malformed ones refused once per content; on aarch64 targets they are
+# re-read every 10 s and a changed set is installed between handshakes.
+#
+# Every string parameter is a schema param, so a workload binds any of them
+# from its environment (`{env: NAME}`) — a per-cell peer name or path in one
+# image — and the module holds a bound value to the builder's rule.
 
 [[ports]]
 name = "net_in"
@@ -130,6 +141,13 @@ metrics = ["bytes_in", "bytes_out"]
 # consuming HTTP module emits `http.server.request`, parented by the
 # connection span above via the propagated trace context.
 spans = ["quic.connection"]
+
+# Credential files named by path (`cert_file`, `key_file`, `trust`). A
+# grant: an instance naming no path never calls it.
+[[resources]]
+requires_contract = "fs"
+access = "read"
+active_when_params = ["cert_file", "key_file", "trust"]
 
 [[resources]]
 requires_contract = "channel"

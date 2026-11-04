@@ -138,8 +138,13 @@ pub mod kind {
 pub mod flag {
     /// More BODY records follow in this direction.
     pub const MORE: u8 = 0x01;
-    /// Response: the provider holds the exchange open on purpose (a watch, an
-    /// event stream) and ends it itself; its progress deadline is the long one.
+    /// Request: the requester asks for a held exchange (a watch, an event
+    /// stream) that its provider keeps open until the origin ends it; a
+    /// provider that grants it answers HOLD|MORE on the response HEAD and,
+    /// once that head has come, applies no whole-exchange or stall deadline
+    /// to it (liveness is the transport's own, e.g. an h2 PING). Response:
+    /// the provider holds the exchange open on purpose and ends it itself;
+    /// its progress deadline is the long one.
     pub const HOLD: u8 = 0x02;
     /// Request: an extended CONNECT for a WebSocket on a route that delegates
     /// the upgrade. Response: the upgrade is accepted, and the exchange

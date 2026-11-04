@@ -218,9 +218,12 @@ modules.
   `EACCES`, including a later module in the same slot. A module's channel
   ioctl handler runs as that module, so the handles it holds work in the
   handler as in its step.
-- **Labels.** Labels live in their owner's module-type namespace: no module
-  reaches another type's labels. A reopen must name the key's suite and may
-  not widen its uses. A label open in another instance of the same type is
+- **Labels.** Labels live in their owner's module-type namespace within the
+  owner's realm: the node's, or one workload's (its durable owner uid). No
+  module reaches another type's labels, nor another realm's: two workloads
+  running one module type, and a workload and the node, hold different keys
+  under one label. A reopen must name the key's suite and may not widen its
+  uses. A label open in another instance of the same type and realm is
   refused `EBUSY`.
 
 ### Persisted keys
@@ -252,8 +255,17 @@ A labelled key asked to persist is sealed through the platform HAL.
   leave the record to come back.
 - **Destroy.** Destroying a label removes its record, so the key does not
   come back.
+- **A workload's records.** Without a vault of its own a workload's record
+  is kept in the platform's store under `FXVW`, its header followed by its
+  realm, so it is authenticated to that workload and opens for no other. A
+  workload given a vault (`workload::vault`, on a Linux graph workload) keeps
+  its records in a directory on a volume it is lent instead, under `FXVK`,
+  sealed with ChaCha20-Poly1305 under the key its owner supplied: they follow
+  the volume and that key, not the node, `DESCRIBE` reports them `SOFTWARE`,
+  and a record there that does not open is refused `EACCES` rather than
+  replaced. See [scheduler.md](scheduler.md#a-workloads-own-vault).
 - **Provisioning.** `fluxor-linux vault-import --module <type>` provisions a
-  shared secret into a module type's namespace.
+  shared secret into a module type's namespace (the node's realm).
 
 Sizes come from `SUITE_QUERY` rather than from a caller's assumption,
 because they are not uniform: an ML-DSA-87 signature is 4627 bytes where a
@@ -320,8 +332,8 @@ cannot be opened leaves the software backend alone.
 | --- | --- |
 | An operation on a handle | The backend that minted it; each backend resolves only its own handles |
 | `GENERATE`, `SUITE_QUERY` for a suite the token serves (P-256) | The token |
-| `OPEN`, `OPEN_OR_GENERATE` for a suite the token serves | Software if it holds the label, else the token if it does; a new key is made in the token when it is asked to `PERSIST` with uses the token permits, in software otherwise |
-| `DESTROY_BY_LABEL` | Both: removed wherever the label is held |
+| `OPEN`, `OPEN_OR_GENERATE` for a suite the token serves | Software if it holds the label, else the token if it does; a new key is made in the token when it is asked to `PERSIST` with uses the token permits, in software otherwise. A workload's: software alone, since the token's labels name no realm |
+| `DESTROY_BY_LABEL` | Both: removed wherever the label is held (a workload's: software) |
 | Other labels, `STORE`, symmetric and every other suite | Software |
 | `TIER` | The token when present: the backend that holds identity keys |
 | `SHARE_REWRAP`, `SHARE_COMBINE`, `ATTEST_KEY` | The router, reaching each key through `ECDH`, `PUBLIC`, `SIGN` and `DESCRIBE` on its own backend |
@@ -366,10 +378,39 @@ reads a device key but cannot seal holds every key in RAM and reports
 
 ### TLS integration
 
+A `tls` or `quic` instance takes its certificate chain, key and trust
+anchors (`cert_file`, `key_file`, `trust`) from files it reads at
+runtime, through the `fs` contract, when they are given as absolute paths
+(modules/foundation/tls/cred_file.rs): on the Linux host a node graph
+reads the host's paths and a workload reads beneath its owner root and the
+volumes lent to it, so a workload image carries no credential and takes
+its identity from a volume its node lends it. PEM or DER is accepted. Until every
+named file has been read and validated the instance is not ready: a server
+refuses each handshake before presenting anything, a client answers a dial
+`EAGAIN` on the requester's tag, and a `quic` server drops new Initials
+unanswered. A file that cannot be opened is retried every second; one that
+is malformed — no PEM block of its kind, base64 that does not decode, an
+encrypted key, a certificate that does not parse, a key of a suite the
+instance cannot sign with — is refused and reported once per content, and
+taken once fixed, with no restart. On aarch64 targets the files are re-read
+every ten seconds: a changed set is adopted only when two consecutive reads
+of every file agree (so a volume whose files are swapped all at once is never
+taken half-old, half-new), then validated whole, and
+installed between handshakes (at most two seconds' wait). A new key is
+deposited in the vault and the old handle destroyed; anchors replaced under
+a chain walk still stepping fail that walk rather than verify it against
+another key. A rotation that does not validate keeps the credentials in
+use. On Cortex-M targets the files are read once (there is no memory to
+stage a second set beside the first), and a change takes a restart. The
+build-time form, `${file:<path>}`, embeds the file instead, for targets
+with no file surface at runtime; a Linux image refuses it, and a
+credential named both ways refuses to construct.
+
 At `module_new` the TLS module issues `PROBE`. If the vault is present
 and an identity key is configured, it calls `STORE`, records the slot
 handle, and then wipes the in-module key bytes with volatile writes, so
-`CertificateVerify` signs only through the vault (`SIGN`). The in-module
+`CertificateVerify` signs only through the vault (`SIGN`). A key read
+from `key_file` at runtime is deposited the same way when it is read. The in-module
 path is retained only as the explicit not-present fallback — a module
 arena dump on a vault-enabled build does not reveal the identity key.
 

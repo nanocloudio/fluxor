@@ -1922,14 +1922,23 @@ fn cmd_inspect_store_ref(reference: &str, json: bool) -> Result<()> {
         (epoch, current_epoch.as_deref()),
         (Some(e), Some(c)) if e == c
     );
+    // A workload image's config: the env names a pod must give it.
+    let workload = fluxor_tools::oci_store::workload_image_config(&store, &manifest)
+        .map_err(|e| Error::Config(e.to_string()))?;
     if json {
-        let doc = serde_json::json!({
+        let mut doc = serde_json::json!({
             "descriptor": desc,
             "manifest": manifest,
             "tags": tags,
             "current_abi_surface": current_epoch,
             "epoch_current": epoch_current,
         });
+        if let Some(w) = &workload {
+            doc["workload"] = serde_json::json!({
+                "env": w.env,
+                "required_env": w.required_env(),
+            });
+        }
         println!("{}", serde_json::to_string_pretty(&doc)?);
         return Ok(());
     }
@@ -1973,6 +1982,21 @@ fn cmd_inspect_store_ref(reference: &str, json: bool) -> Result<()> {
     println!("layers:");
     for l in &manifest.layers {
         println!("  {:>9}  {}  {}", l.size, l.digest, l.media_type);
+    }
+    if let Some(w) = &workload {
+        if w.env.is_empty() {
+            println!("env:           (none bound)");
+        }
+        for (i, b) in w.env.iter().enumerate() {
+            let label = if i == 0 { "env:" } else { "" };
+            println!(
+                "{label:<14} {:<20} {}.{}{}",
+                b.name,
+                b.module,
+                b.param,
+                if b.required { "  required" } else { "" }
+            );
+        }
     }
     Ok(())
 }

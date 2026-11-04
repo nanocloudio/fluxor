@@ -59,8 +59,8 @@ pub const SYSTEM_SPEC: &str = "system";
 /// The path a `${file:<path>}` source spec names; `None` for any other
 /// shape — including [`SYSTEM_SPEC`], which names the platform's verifier
 /// rather than a file and is handled before this is reached. The spec form
-/// is the only file shape accepted: a bare path in a checked-in graph states
-/// no indirection.
+/// is the build-time one, embedded by the builder; a bare path is a file the
+/// module reads at runtime and never reaches here.
 pub fn file_source(spec: &str) -> Option<&str> {
     let inner = spec.strip_prefix("${file:")?.strip_suffix('}')?;
     if inner.is_empty() || inner.contains('}') {
@@ -366,6 +366,13 @@ pub const MAX_CHAIN_DER: usize = 3072;
 pub const MAX_KEY_DER: usize = 2400;
 /// tls's `identity_label` (basic tag 19): an identity the vault holds.
 const TAG_IDENTITY_LABEL: u8 = 19;
+/// tls's `cert_file` / `key_file` named by path (basic tags 6 / 7): an
+/// identity the instance reads at runtime.
+const TAG_CERT_PATH: u8 = 6;
+const TAG_KEY_PATH: u8 = 7;
+/// An env bind record (`schema::env_bind::BIND_TAG`): its first byte is the
+/// tag of the param it fills.
+const TAG_ENV_BIND: u8 = 0xED;
 
 /// Give every CLIENT-MODE `tls` instance that carries no identity of its
 /// own the operator's: `cert` (DER chain, leaf first) under [`TAG_CERT`]
@@ -406,7 +413,13 @@ pub fn append_operator_identity(
         let client = name_hash == tls_hash && basic_param_u8(params, 1).unwrap_or(0) == 0;
         let named = ext_blob(params, TAG_CERT).is_some()
             || ext_blob(params, TAG_KEY).is_some()
-            || basic_param_len(params, TAG_IDENTITY_LABEL).unwrap_or(0) > 0;
+            || basic_param_len(params, TAG_IDENTITY_LABEL).unwrap_or(0) > 0
+            || basic_param_len(params, TAG_CERT_PATH).unwrap_or(0) > 0
+            || basic_param_len(params, TAG_KEY_PATH).unwrap_or(0) > 0
+            || basic_entries(params, TAG_ENV_BIND).any(|r| {
+                r.first()
+                    .is_some_and(|t| *t == TAG_CERT_PATH || *t == TAG_KEY_PATH)
+            });
         Ok((client && !named).then(|| ext.clone()))
     })
 }
@@ -512,6 +525,30 @@ fn basic_param_u8(params: &[u8], want: u8) -> Option<u8> {
 /// The length of a basic TLV entry's value, when the entry is present.
 fn basic_param_len(params: &[u8], want: u8) -> Option<usize> {
     basic_param(params, want).map(<[u8]>::len)
+}
+
+/// Every basic TLV entry tagged `want`, in order.
+fn basic_entries(params: &[u8], want: u8) -> impl Iterator<Item = &[u8]> {
+    let end = basic_end(params).unwrap_or(0);
+    let mut pos = 4;
+    core::iter::from_fn(move || {
+        while pos + 2 <= end {
+            let tag = params[pos];
+            if tag == 0xFF {
+                return None;
+            }
+            let len = params[pos + 1] as usize;
+            if pos + 2 + len > end {
+                return None;
+            }
+            let at = pos;
+            pos += 2 + len;
+            if tag == want {
+                return Some(&params[at + 2..at + 2 + len]);
+            }
+        }
+        None
+    })
 }
 
 /// A basic TLV entry's value, when the entry is present.
@@ -827,6 +864,10 @@ mod tests {
             e
         };
         let keyed_client = entry("tls", 6, &[(1, 0)], &own_key);
+        // A certificate named by path (basic tag 6), read at runtime, and a
+        // key bound to the environment (an env bind record filling tag 7).
+        let path_client = entry("tls", 7, &[(1, 0), (TAG_CERT_PATH, b'/')], &[]);
+        let env_client = entry("tls", 8, &[(1, 0), (TAG_ENV_BIND, TAG_KEY_PATH)], &[]);
         let before = blob(&[
             bare_client,
             server.clone(),
@@ -834,6 +875,8 @@ mod tests {
             labelled,
             quic_client,
             keyed_client,
+            path_client,
+            env_client,
         ]);
 
         let (after, given) = append_operator_identity(&before, &cert, &key).unwrap();
@@ -862,6 +905,16 @@ mod tests {
             identity_of(&after, 5),
             (6, None, Some(vec![8, 8])),
             "a named key is kept, and no second key is appended"
+        );
+        assert_eq!(
+            identity_of(&after, 6),
+            (7, None, None),
+            "an identity read from a path at runtime is kept"
+        );
+        assert_eq!(
+            identity_of(&after, 7),
+            (8, None, None),
+            "an identity bound to the environment is kept"
         );
         assert!(after.ends_with(b"TAIL"));
         let body_end = after.len() - 16 - 4;

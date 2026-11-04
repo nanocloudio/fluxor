@@ -107,7 +107,10 @@ project makes.
 
 A workload that brings its own modules is published the same way, on its
 own. `fluxor build <graph> --emit=workload --output <dir>` takes the graph's
-one `workloads:` entry and writes `graph.flxa` (the subgraph as the kernel
+one `workloads:` entry — its modules and wiring written as a base graph's,
+`module.port` ends and the platform's `linux_net` for the node's network (see
+[Lanes for a workload staged at runtime](../architecture/network.md#lanes-for-a-workload-staged-at-runtime))
+— and writes `graph.flxa` (the subgraph as the kernel
 admits it), `modules/<name>.fmod` for every module it names, and
 `workload-image.json` (name, target, module ABI, ABI-surface digest,
 each module's `name_hash` and SHA-256, and under `env` every param bound to
@@ -122,7 +125,13 @@ tags it in the local store as `<name>:latest` (or `--tag`): an OCI
 artifact whose first layer is the FLXA and whose other layers are the
 modules, one each. A module layer's digest is the SHA-256 of its bytes,
 which is exactly the pin the node's kernel admits it by, so a node pins
-what the manifest names. `fluxor store push` serves it onward like any
+what the manifest names. Its config blob
+(`application/vnd.nanocloud.fluxor.workload-image.config.v1+json`) is
+`{"env": [...]}`, the `env` list of `workload-image.json` (`name`,
+`module`, `param`, `required`), so a puller reads the names a pod must give
+from the manifest and one blob and refuses a pod missing a required one
+before it asks a node; `fluxor inspect <ref>` lists them (`--json`:
+`workload.env`, `workload.required_env`). `fluxor store push` serves it onward like any
 other tag.
 
 ## Withholding a module

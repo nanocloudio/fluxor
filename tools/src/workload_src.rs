@@ -101,7 +101,7 @@ fn sum_module_state_bytes(modules_dir: &Path, module_types: &[String]) -> (u64, 
 /// kernel built-ins, which every runtime carries and no bundle pins.
 fn graph_facts(template: &str) -> Result<GraphFacts> {
     let doc = params::parse_graph(template).map_err(Error::Config)?.doc;
-    if doc.get(fluxor_tools::stack::INCLUDE_KEY).is_some() {
+    if includes_stacks(&doc) {
         return Err(Error::Config(
             "the graph still includes stacks; a bundle carries its graph with every \
              include expanded — emit the bundle again"
@@ -140,6 +140,17 @@ fn graph_facts(template: &str) -> Result<GraphFacts> {
     })
 }
 
+/// Does the graph include a stack: an `include:` of its own, or one in any
+/// of its `workloads:` entries (each expands in its own scope).
+fn includes_stacks(doc: &serde_yaml::Value) -> bool {
+    use fluxor_tools::stack::{INCLUDE_KEY, WORKLOADS_KEY};
+    doc.get(INCLUDE_KEY).is_some()
+        || doc
+            .get(WORKLOADS_KEY)
+            .and_then(serde_yaml::Value::as_sequence)
+            .is_some_and(|w| w.iter().any(|x| x.get(INCLUDE_KEY).is_some()))
+}
+
 /// The graph a bundle carries for the graph file at `graph_path`, whose text
 /// is `written`, and the graph's params: the text as written when it
 /// includes no stack, else the graph with every include expanded against
@@ -159,7 +170,7 @@ fn bundle_graph(
         fluxor_tools::stack::read_expanded(graph_path, project_root, None).map_err(at)?;
     let raw: serde_yaml::Value =
         serde_yaml::from_str(&written).map_err(|e| at(format!("parse graph: {e}")))?;
-    if raw.get(fluxor_tools::stack::INCLUDE_KEY).is_none() {
+    if !includes_stacks(&raw) {
         return Ok((written, declared));
     }
     let mut doc = doc;
@@ -1612,6 +1623,38 @@ buffer_bytes = 32768
             .unwrap()
             .to_string();
         assert!(e.contains("still includes stacks"), "{e}");
+        let e = graph_facts(
+            "target: linux\nmodules: []\nworkloads:\n  - include:\n      - stack: s.yaml\n        \
+             as: s\n",
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(
+            e.contains("still includes stacks"),
+            "a workload's include too: {e}"
+        );
+    }
+
+    #[test]
+    fn a_bundle_graph_carries_a_workloads_include_expanded() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("s.yaml"),
+            "stack: s\nexports:\n  out: a.out\nmodules:\n  - name: a\n    type: echo_worker\n",
+        )
+        .unwrap();
+        let graph = dir.path().join("g.yaml");
+        let text =
+            "target: linux\nmodules: []\nworkloads:\n  - include:\n      - stack: s.yaml\n        \
+                    as: s\n    modules: []\n";
+        std::fs::write(&graph, text).unwrap();
+        let (carried, _) = bundle_graph(&graph, text.to_string(), dir.path()).unwrap();
+        let doc: serde_yaml::Value = serde_yaml::from_str(&carried).unwrap();
+        let w = &doc["workloads"][0];
+        assert!(w.get("include").is_none(), "{carried}");
+        assert_eq!(w["modules"][0]["name"].as_str(), Some("s_a"), "{carried}");
+        assert_eq!(w["modules"][0]["type"].as_str(), Some("echo_worker"));
     }
 
     /// `fluxor run <name>` looks the name up in the project the command runs

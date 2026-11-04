@@ -303,6 +303,17 @@ pub struct ParamSchema {
 }
 
 impl ParamSchema {
+    /// A schema of `params`, as a test states one.
+    #[cfg(test)]
+    pub(crate) fn from_params(params: Vec<SchemaParam>) -> Self {
+        let name_map = params
+            .iter()
+            .enumerate()
+            .map(|(i, q)| (q.name.clone(), i))
+            .collect();
+        ParamSchema { params, name_map }
+    }
+
     /// Parse schema from raw bytes (as embedded in .fmod).
     pub fn from_bytes(data: &[u8]) -> Option<Self> {
         if data.len() < 4 {

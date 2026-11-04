@@ -98,7 +98,7 @@ impl LabelIdentity {
 /// May a handshake present this instance's certificate now? Always, for a
 /// file identity; for a label identity only once one is held.
 fn identity_presentable(s: &TlsState) -> bool {
-    s.label_id.state == ID_NONE || s.label_id.state == ID_CERTIFIED
+    s.creds.ready() && (s.label_id.state == ID_NONE || s.label_id.state == ID_CERTIFIED)
 }
 
 /// May a client dial now? A label identity that holds no certificate yet
@@ -108,6 +108,11 @@ fn identity_presentable(s: &TlsState) -> bool {
 /// on the requester's tag instead, which a consumer's backoff redials; a
 /// file identity, or none, may always dial.
 fn identity_dialable(s: &TlsState) -> bool {
+    // Credentials named by path and not yet read: nothing to present, and
+    // perhaps no anchor to verify the peer against.
+    if !s.creds.ready() {
+        return false;
+    }
     if !s.label_id.configured() {
         return true;
     }
@@ -122,7 +127,11 @@ unsafe fn identity_refuse_dial(s: &mut TlsState) {
     s.label_id.early_dials = s.label_id.early_dials.wrapping_add(1);
     if s.label_id.early_dials & 63 == 1 {
         let sys = &*s.syscalls;
-        let msg = b"[tls] identity not yet certified: dial refused EAGAIN";
+        let msg: &[u8] = if s.creds.ready() {
+            b"[tls] identity not yet certified: dial refused EAGAIN"
+        } else {
+            b"[tls] credentials not yet read from their files: dial refused EAGAIN"
+        };
         dev_log(sys, 2, msg.as_ptr(), msg.len());
     }
 }
@@ -134,7 +143,11 @@ unsafe fn identity_refuse_early(s: &mut TlsState) {
     s.label_id.early = s.label_id.early.wrapping_add(1);
     if s.label_id.early & 63 == 1 {
         let sys = &*s.syscalls;
-        let msg = b"[tls] identity not yet certified: handshake refused";
+        let msg: &[u8] = if s.creds.ready() {
+            b"[tls] identity not yet certified: handshake refused"
+        } else {
+            b"[tls] credentials not yet read from their files: handshake refused"
+        };
         dev_log(sys, 2, msg.as_ptr(), msg.len());
     }
 }
@@ -342,7 +355,10 @@ unsafe fn identity_request(s: &mut TlsState, now: u64) -> bool {
 
 /// One step of the label identity. True when it did anything.
 unsafe fn identity_step(s: &mut TlsState) -> bool {
-    if s.label_id.state == ID_NONE {
+    // Anchors named by path are installed before an issuer is adopted
+    // after them (`creds_install` places the adopted slot), so a label
+    // identity waits for its instance's files.
+    if s.label_id.state == ID_NONE || !s.creds.ready() {
         return false;
     }
     let sys = &*s.syscalls;
@@ -382,7 +398,11 @@ unsafe fn identity_admit(s: &mut TlsState) -> Option<&'static [u8]> {
         }
         return None;
     }
-    if s.cert_len > 0 || s.key_len > 0 {
+    if s.cert_len > 0
+        || s.key_len > 0
+        || s.creds.files[CRED_CERT].configured()
+        || s.creds.files[CRED_KEY].configured()
+    {
         return Some(b"[tls] refusing to construct: identity_label names the identity; cert_file / key_file would name a second one");
     }
     let sys = &*s.syscalls;
@@ -411,4 +431,240 @@ unsafe fn identity_admit(s: &mut TlsState) -> Option<&'static [u8]> {
 unsafe fn id_put(line: *mut u8, at: usize, text: &[u8]) -> usize {
     core::ptr::copy_nonoverlapping(text.as_ptr(), line.add(at), text.len());
     at + text.len()
+}
+
+// ── Credentials named by path (cred_file.rs) ─────────────────────────────
+
+/// Construction-time admission of `cert_file` / `key_file` / `trust` named
+/// by path. `None` when admitted. Each credential has one source: a path
+/// read at runtime, or a blob the builder embedded, never both.
+fn creds_admit(s: &TlsState) -> Option<&'static [u8]> {
+    if s.creds.bad_path() {
+        return Some(b"[tls] refusing to construct: cert_file / key_file / trust must be an absolute path of at most 255 bytes");
+    }
+    if s.creds.files[CRED_CERT].configured() && s.cert_len > 0 {
+        return Some(b"[tls] refusing to construct: cert_file names a file read at runtime and an embedded chain");
+    }
+    if s.creds.files[CRED_KEY].configured() && (s.key_len > 0 || s.key_refused) {
+        return Some(b"[tls] refusing to construct: key_file names a file read at runtime and an embedded key");
+    }
+    if s.creds.files[CRED_TRUST].configured()
+        && (s.anchor_count > s.anchor_operator || s.trust_system)
+    {
+        return Some(
+            b"[tls] refusing to construct: trust names a file read at runtime and another source",
+        );
+    }
+    None
+}
+
+/// Where each credential file decodes: the staging buffers on `CRED_ROTATE`
+/// targets, else straight into the live ones (read once, before the
+/// instance is ready, so nothing is using them). Trust decodes as one
+/// bundle over the anchor slots after the operator's.
+unsafe fn creds_dests(s: &mut TlsState) -> [(*mut u8, usize); CRED_SLOTS] {
+    let op = s.anchor_operator as usize;
+    if CRED_ROTATE {
+        [
+            (s.cred_stage_cert.as_mut_ptr(), CRED_STAGE_CERT),
+            (s.cred_stage_key.as_mut_ptr(), CRED_STAGE_KEY),
+            (s.cred_stage_trust.as_mut_ptr(), CRED_STAGE_TRUST),
+        ]
+    } else {
+        [
+            (s.cert.as_mut_ptr(), MAX_CERT_CHAIN_BYTES),
+            (s.key.as_mut_ptr(), MAX_KEY_LEN),
+            (
+                (s.anchors.as_mut_ptr() as *mut u8).add(op * MAX_CERT_LEN),
+                (MAX_ANCHORS - op.min(MAX_ANCHORS)) * MAX_CERT_LEN,
+            ),
+        ]
+    }
+}
+
+/// Is a handshake in flight, using the credentials a rotation would
+/// replace (a certificate presented, a signature or a chain walk taking
+/// several steps)?
+fn creds_in_use(s: &TlsState) -> bool {
+    let tcp = s.sessions.iter().any(|x| {
+        matches!(
+            x.state,
+            SessionState::Allocated
+                | SessionState::Connecting
+                | SessionState::AcceptPending
+                | SessionState::Handshaking
+        )
+    });
+    tcp || s
+        .peer_sessions
+        .iter()
+        .any(|p| p.phase == DtlsPhase::Handshaking)
+}
+
+/// The generation a deferred chain walk records for anchor slot `i`: the
+/// adopted issuer's slot counts renewals, every other slot counts the
+/// replacements of the anchors read from `trust`. The top bit keeps the
+/// two counts from ever meeting at one value.
+fn anchor_generation(s: &TlsState, i: usize) -> u32 {
+    if s.label_id.trust_issuer != 0 && i == s.label_id.static_anchors as usize {
+        s.label_id.adopted_generation | 0x8000_0000
+    } else {
+        s.trust_epoch & 0x7FFF_FFFF
+    }
+}
+
+/// One step of the credential files. True when it installed or refused a
+/// set.
+unsafe fn creds_step(s: &mut TlsState) -> bool {
+    if !s.creds.configured() {
+        return false;
+    }
+    let sys = &*s.syscalls;
+    let dest = creds_dests(s);
+    if s.creds.step(sys, b"[tls]", &dest) != CS_CANDIDATE {
+        return false;
+    }
+    if s.creds.ready && creds_in_use(s) && !s.creds.deferred_long_enough(sys) {
+        return false;
+    }
+    match creds_install(s, &dest) {
+        Ok(()) => s.creds.adopt(sys, b"[tls]"),
+        Err((slot, why)) => s.creds.refuse(sys, b"[tls]", slot, why),
+    }
+    true
+}
+
+/// Validate the files just read and install them: all of them, or none
+/// while the credentials in use stay. `Err((slot, why))` names the file.
+unsafe fn creds_install(
+    s: &mut TlsState,
+    dest: &[(*mut u8, usize); CRED_SLOTS],
+) -> Result<(), (usize, &'static [u8])> {
+    let sys = &*s.syscalls;
+    let cert_on = s.creds.files[CRED_CERT].configured();
+    let key_on = s.creds.files[CRED_KEY].configured();
+    let trust_on = s.creds.files[CRED_TRUST].configured();
+    let cert_len = s.creds.files[CRED_CERT].len;
+    let key_len = s.creds.files[CRED_KEY].len;
+    let trust_len = s.creds.files[CRED_TRUST].len;
+    let op = s.anchor_operator as usize;
+    let issuer_room = usize::from(s.label_id.trust_issuer != 0);
+
+    // ── Validate everything before anything changes.
+    if cert_on {
+        let chain = core::slice::from_raw_parts(dest[CRED_CERT].0, cert_len);
+        if cert_len > MAX_CERT_CHAIN_BYTES || !chain_parses(chain) {
+            return Err((
+                CRED_CERT,
+                b"does not hold a certificate chain this module presents (leaf first, at most 3072 bytes)",
+            ));
+        }
+    }
+    if key_on {
+        let key = core::slice::from_raw_parts(dest[CRED_KEY].0, key_len);
+        if key_len == 0 || key_len > MAX_KEY_LEN {
+            return Err((
+                CRED_KEY,
+                b"is not a key this module holds (at most 2400 bytes)",
+            ));
+        }
+        let rsa = rsa_identity_suite(key);
+        let mut scalar = [0u8; 48];
+        let ec = identity_ec_scalar(key, &mut scalar);
+        zeroize(&mut scalar);
+        if rsa.is_none() && ec != 32 && ec != 48 {
+            return Err((
+                CRED_KEY,
+                b"is not a P-256, P-384 or RSA-2048/3072/4096 private key",
+            ));
+        }
+        if rsa.is_some() && (sys.provider_call)(-1, kv::PROBE, core::ptr::null_mut(), 0) != 1 {
+            return Err((
+                CRED_KEY,
+                b"is an RSA key, and this target's vault does not hold RSA",
+            ));
+        }
+    }
+    let mut n_trust = 0;
+    if trust_on {
+        let room = MAX_ANCHORS.saturating_sub(op + issuer_room);
+        match count_certificates(dest[CRED_TRUST].0, trust_len, MAX_CERT_LEN, room) {
+            Some(n) => n_trust = n,
+            None => {
+                return Err((
+                    CRED_TRUST,
+                    b"does not hold trust anchors this module takes (certificates of at most 2048 bytes, at most 8 with the operator's and an adopted issuer)",
+                ))
+            }
+        }
+    }
+
+    // ── Install.
+    if cert_on {
+        core::ptr::copy(dest[CRED_CERT].0, s.cert.as_mut_ptr(), cert_len);
+        s.cert_len = cert_len;
+    }
+    if key_on {
+        let old = s.key_vault_handle;
+        core::ptr::copy(dest[CRED_KEY].0, s.key.as_mut_ptr(), key_len);
+        s.key_len = key_len;
+        s.key_vault_handle = -1;
+        if CRED_ROTATE {
+            // The staged copy is not needed past this point.
+            core::ptr::write_bytes(dest[CRED_KEY].0, 0, key_len);
+        }
+        let deposited = identity_key_deposit(s);
+        if old >= 0 {
+            (sys.provider_call)(old, kv::DESTROY, core::ptr::null_mut(), 0);
+        }
+        if !deposited {
+            // Validated above against the vault's presence; a vault that
+            // then refuses the key leaves no identity to serve.
+            s.creds.ready = false;
+            return Err((CRED_KEY, b"was refused by the vault"));
+        }
+    }
+    if trust_on {
+        let base = (s.anchors.as_mut_ptr() as *mut u8).add(op * MAX_CERT_LEN);
+        let old_static = s.label_id.static_anchors as usize;
+        let new_static = op + n_trust;
+        let adopted = s.label_id.trust_issuer != 0 && s.anchor_count as usize > old_static;
+        let move_issuer = |s: &mut TlsState| {
+            if adopted && old_static != new_static {
+                let (a, b) = (old_static, new_static);
+                let len = s.anchor_lens[a] as usize;
+                let src = s.anchors[a].as_ptr();
+                let dst = s.anchors[b].as_mut_ptr();
+                core::ptr::copy(src, dst, len);
+                s.anchor_lens[b] = len as u16;
+            }
+        };
+        if new_static > old_static {
+            move_issuer(s);
+        }
+        let mut written = [0u16; MAX_ANCHORS];
+        let _ = split_certificates(
+            dest[CRED_TRUST].0,
+            trust_len,
+            base,
+            MAX_CERT_LEN,
+            MAX_ANCHORS - op,
+            &mut written,
+        );
+        let mut k = 0;
+        while k < n_trust {
+            s.anchor_lens[op + k] = written[k];
+            k += 1;
+        }
+        if new_static < old_static {
+            move_issuer(s);
+        }
+        s.anchor_count = (new_static + usize::from(adopted)) as u8;
+        s.label_id.static_anchors = new_static as u8;
+        // Every walk that chose an anchor before now reads no key from
+        // the table it chose from.
+        s.trust_epoch = s.trust_epoch.wrapping_add(1);
+        s.label_id.adopted_generation = s.label_id.adopted_generation.wrapping_add(1);
+    }
+    Ok(())
 }

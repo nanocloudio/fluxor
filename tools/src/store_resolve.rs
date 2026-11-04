@@ -488,8 +488,9 @@ pub(crate) fn resolve_dependency(
 /// The stacks and bundles a project references by name.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct References {
-    /// Every `include[].stack` name in a graph the project versions, other
-    /// than the project's own `packaging/stack/<name>.yaml`.
+    /// Every `include[].stack` name in a graph the project versions — the
+    /// graph's own and its `workloads[].include` — other than the
+    /// project's own `packaging/stack/<name>.yaml`.
     pub stacks: BTreeSet<String>,
     /// `fluxor.toml::[uses] bundles`, other than the project's own
     /// `packaging/` bundles.
@@ -514,12 +515,17 @@ pub fn references(project_root: &Path) -> Result<References> {
         else {
             continue;
         };
-        let Some(includes) = doc
-            .get(crate::stack::INCLUDE_KEY)
+        // The graph's own includes, and each of its workloads'.
+        let workloads = doc
+            .get(crate::stack::WORKLOADS_KEY)
             .and_then(serde_yaml::Value::as_sequence)
-        else {
-            continue;
-        };
+            .map(|w| w.as_slice())
+            .unwrap_or_default();
+        let includes = std::iter::once(&doc)
+            .chain(workloads)
+            .filter_map(|scope| scope.get(crate::stack::INCLUDE_KEY))
+            .filter_map(serde_yaml::Value::as_sequence)
+            .flatten();
         for inc in includes {
             if let Some(name) = inc.get("stack").and_then(serde_yaml::Value::as_str) {
                 if crate::stack::is_stack_name(name)
@@ -1223,6 +1229,26 @@ mod tests {
             !lock.artifacts.iter().any(|a| a.kind == "stack"),
             "{:?}",
             lock.artifacts
+        );
+    }
+
+    #[test]
+    fn a_stack_a_workload_includes_by_name_is_a_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("consumer");
+        std::fs::create_dir_all(&root).unwrap();
+        consumer(&root, &[], None);
+        std::fs::write(
+            root.join("examples/w.yaml"),
+            "target: linux\nmodules: []\nworkloads:\n  - include:\n      - stack: wvol\n        \
+             as: v\n      - stack: ../w.yaml\n        as: p\n    modules: []\n",
+        )
+        .unwrap();
+        git(&root, &["add", "-A"]);
+        assert_eq!(
+            references(&root).unwrap().stacks,
+            ["wvol".to_string()].into(),
+            "a workload's include by name is pinned as a graph's is; a path is not a reference"
         );
     }
 

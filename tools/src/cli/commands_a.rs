@@ -1414,6 +1414,12 @@ fn build_packaged_blobs(
 ///                             environment its params are bound to
 /// ```
 ///
+/// The workload's modules and `wiring:` are written as a base graph's:
+/// `module.port` ends resolved against the manifests, and the platform's
+/// `linux_net` (undeclared) for the node's network, each module wired to it
+/// a lane of its own (`config::workload_edges`). A graph's modules and
+/// wiring move under `workloads:` as they are, but for the platform's entry.
+///
 /// A module param written `{env: NAME}` (with an optional `default:` or
 /// `required: false`) is packed as an env bind record (`schema::env_bind`):
 /// the node fills it from the CREATE's `env`/`var` entries. `env` in the

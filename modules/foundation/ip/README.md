@@ -52,7 +52,14 @@ declares (`workload`, `net_route`, `net_policy`) are described in
 
 ## Parameters
 
-- `use_dhcp` — run the DHCP client (default 1).
+- `use_dhcp` — run the DHCP client (default 1). Its timers are the wall
+  clock's (`TIMER::MILLIS`), never the step rate: a DISCOVER or REQUEST is
+  sent again 4 s after it went, each wait doubled up to 64 s and randomised
+  by ±1 s (RFC 2131 §4.1); a DISCOVER is retransmitted until an OFFER
+  comes, a REQUEST four times before the client starts over; a lease is
+  renewed from half its seconds (T1), the REQUEST sent again by halves of
+  the time left to seven eighths (T2) and then to its end, at least a
+  minute apart, and given up at its end or on a NAK.
 - `expected_dhcp_server` — accept replies only from this server (0 = any).
 - `trace_sample_permille` — ingress head-sampling rate.
 - `dhcp_compat` — admit BOOTP replies and an ACK with no preceding OFFER

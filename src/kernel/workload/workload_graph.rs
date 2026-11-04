@@ -333,6 +333,7 @@ struct CreateOptions<'a> {
 fn create_options(opts: &[u8]) -> Result<CreateOptions<'_>, i32> {
     let mut ctx = None;
     let mut volumes = 0usize;
+    let mut vaults = 0usize;
     for o in create_option_entries(opts) {
         let o = o?;
         if o.ns == wl::resolver::NS && o.key == wl::resolver::KEY {
@@ -351,6 +352,14 @@ fn create_options(opts: &[u8]) -> Result<CreateOptions<'_>, i32> {
             volumes += 1;
             if volumes > wl::volume::MAX {
                 return Err(errno::E2BIG);
+            }
+        } else if LENDS_VOLUMES && o.ns == wl::vault::NS && o.key == wl::vault::KEY {
+            if vault_entry(o.val).is_none() {
+                return Err(errno::EINVAL);
+            }
+            vaults += 1;
+            if vaults > 1 {
+                return Err(errno::EINVAL);
             }
         } else if o.flags & wl::opt::OPT_REQUIRED != 0 {
             return Err(errno::ENOSYS);
@@ -380,8 +389,30 @@ fn volume_entry(val: &[u8]) -> Option<(&[u8], &[u8], bool)> {
     Some((src, dst, ro))
 }
 
-/// Lend the CREATE's volumes to `owner`, before any of its modules runs.
-/// A volume that cannot be lent fails the CREATE.
+/// A `vault`/`store` value: `(dir, seal_key)`. `dir` not empty, the key
+/// exactly 64 hex digits; nothing else.
+fn vault_entry(val: &[u8]) -> Option<(&[u8], [u8; wl::vault::SEAL_KEY_LEN])> {
+    let cut = val.iter().position(|&b| b == 0)?;
+    let (dir, hex) = (&val[..cut], &val[cut + 1..]);
+    if dir.is_empty() || hex.len() != 2 * wl::vault::SEAL_KEY_LEN {
+        return None;
+    }
+    let nibble = |c: u8| match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    };
+    let mut key = [0u8; wl::vault::SEAL_KEY_LEN];
+    for (i, k) in key.iter_mut().enumerate() {
+        *k = (nibble(hex[2 * i])? << 4) | nibble(hex[2 * i + 1])?;
+    }
+    Some((dir, key))
+}
+
+/// Lend the CREATE's volumes to `owner`, before any of its modules runs,
+/// then give it its own vault in one of them. A volume that cannot be lent,
+/// or a vault that cannot be set up, fails the CREATE.
 #[cfg(feature = "host-linux")]
 fn lend_volumes(owner: OwnerHandle, opts: &[u8]) -> Result<(), i32> {
     for o in create_option_entries(opts).flatten() {
@@ -389,6 +420,18 @@ fn lend_volumes(owner: OwnerHandle, opts: &[u8]) -> Result<(), i32> {
             let (src, dst, ro) = volume_entry(o.val).ok_or(errno::EINVAL)?;
             // SAFETY: scheduler thread, as every platform dispatch.
             unsafe { crate::platform::linux::owner_root::lend(owner, src, dst, ro)? };
+        }
+    }
+    for o in create_option_entries(opts).flatten() {
+        if o.ns == wl::vault::NS && o.key == wl::vault::KEY {
+            let (dir, mut key) = vault_entry(o.val).ok_or(errno::EINVAL)?;
+            // SAFETY: scheduler thread, as every platform dispatch.
+            let r = unsafe { crate::platform::linux::owner_root::set_vault(owner, dir, key) };
+            for b in key.iter_mut() {
+                // SAFETY: a live, exclusively-borrowed byte.
+                unsafe { core::ptr::write_volatile(b, 0) };
+            }
+            r?;
         }
     }
     Ok(())
@@ -1602,6 +1645,7 @@ const GRAPH_OPTIONS: &[(&[u8], &[&[u8]])] = if LENDS_VOLUMES {
         (wl::resolver::NS, &[wl::resolver::KEY]),
         (wl::env::NS, &[wl::env::KEY]),
         (wl::volume::NS, &[wl::volume::KEY]),
+        (wl::vault::NS, &[wl::vault::KEY]),
     ]
 } else {
     &[

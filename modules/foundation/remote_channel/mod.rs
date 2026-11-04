@@ -63,7 +63,9 @@
 //! records arriving on any of them are merged onto the channel's output,
 //! record by record, and every record written to a channel's input goes to
 //! every open session (with `resume`, to every peer whose streams are held,
-//! and a record is taken only once each of them has room). With
+//! and a record is taken only once each of them has room — a peer with no
+//! session gives its streams up after `retain_ms`, so one gone for good
+//! holds the channel no longer than that). With
 //! `peer_tag: 1` every local record carries, ahead of its own bytes, the
 //! 32-byte fingerprint of the peer it came from or goes to: an inbound
 //! record is stamped with its session's, and an outbound record goes to the
@@ -275,6 +277,16 @@ const TX_BUF: usize = TX_PREFIX + FRAME_HDR + RBEGIN_PREFIX + FRAGMENT_MAX;
 const WINDOW_RECORDS: u32 = 4;
 /// `resume`: records one step takes from a channel's input into its window.
 const INGEST_PER_STEP: usize = 32;
+/// `retain_ms` as declared when the graph names none: derived from
+/// `keepalive_ms` and `redial_ms` at construction (`retain_default`).
+const RETAIN_DERIVED: u32 = 0xFFFF_FFFF;
+/// The least derived `retain_ms`: a peer restarting, or a link that fails
+/// and is redialled, must find its streams still held — setup alone may take
+/// `SETUP_TIMEOUT_MS`.
+const RETAIN_FLOOR_MS: u32 = 3 * SETUP_TIMEOUT_MS;
+/// A derived `retain_ms` is this many of the larger of `keepalive_ms` and
+/// `redial_ms`.
+const RETAIN_PERIODS: u32 = 30;
 
 // The instance's own phase: what its listener or dialler is doing.
 const PH_IDLE: u8 = 0;
@@ -442,6 +454,13 @@ struct Peer {
     fp_len: u8,
     /// When its last session ended, by `State::clock`.
     gone_at: u32,
+    /// When its last session ended, by the wall clock (`retain_ms`).
+    gone_ms: u32,
+    /// `resume`: the slot was claimed for this peer and no session of it has
+    /// resumed here yet — this side holds none of its streams, so a peer
+    /// that still holds this side's is rebased to where it stands
+    /// (`on_resume`).
+    fresh: bool,
     /// `resume`: the peer's incarnation whose streams this side holds, and
     /// what this side's `HELLO` tells it, fixed when the session attaches.
     peer_inc: [u8; INCARNATION_LEN],
@@ -674,6 +693,12 @@ pub struct State {
     /// `resume`: peers whose retained streams were given up to make room
     /// for a new peer.
     pub peers_evicted: u32,
+    /// `resume`, several sessions: peers whose slot and retained streams
+    /// were released after `retain_ms` without a session.
+    pub peers_expired: u32,
+    /// `retain_ms`: how long a peer with no session keeps its slot and
+    /// retained windows (several sessions, `resume`); 0 for ever.
+    retain_ms: u32,
     // `resume`.
     resume: u8,
     /// `window`: retained bytes per channel (0: `WINDOW_RECORDS` records).
@@ -748,6 +773,11 @@ impl State {
         (self.chans[i].records_sent, self.chans[i].records_delivered)
     }
 
+    /// `retain_ms` as resolved at construction (0: for ever).
+    pub fn retain_ms(&self) -> u32 {
+        self.retain_ms
+    }
+
     /// Sessions open now.
     pub fn open_sessions(&self) -> usize {
         self.links[..self.n_links as usize]
@@ -795,6 +825,7 @@ mod params_def {
         11, keepalive_ms, u32, 1000 => |s, d, len| { s.keepalive_ms = p_u32(d, len, 0, 1000); };
         12, sessions, u8, 1 => |s, d, len| { s.n_peers = p_u8(d, len, 0, 1); };
         13, peer_tag, u8, 0 => |s, d, len| { s.peer_tag = p_u8(d, len, 0, 0); };
+        14, retain_ms, u32, 0xFFFF_FFFF => |s, d, len| { s.retain_ms = p_u32(d, len, 0, RETAIN_DERIVED); };
     }
 }
 
@@ -802,7 +833,7 @@ mod params_def {
 name_table!(
     TABLE_ERRORS = [
         b"[remote_channel] refusing to construct: `channels` is empty",
-        b"[remote_channel] refusing to construct: `channels` names more than MAX_CHANNELS",
+        b"[remote_channel] refusing to construct: `channels` names more than PORT_CHANNELS",
         b"[remote_channel] refusing to construct: a `channels` entry is not content_type:framing:max_record",
         b"[remote_channel] refusing to construct: a `channels` content type is empty, too long, or not alphanumeric",
         b"[remote_channel] refusing to construct: a `channels` framing is not tlv16, len32, len16@<off>+<add>, len32@<off>+<add> (header within 64 bytes), mailbox or bytes",
@@ -831,6 +862,13 @@ fn x_resp(s: &State) -> usize {
 /// Whether channel `i` belongs to the exchange endpoint.
 fn is_x(s: &State, i: usize) -> bool {
     s.table.side != wire::side::NONE && (i == x_req(s) || i == x_resp(s))
+}
+
+/// Whether channel `i` is numbered, retained and resumed: every channel
+/// under `resume` but the exchange endpoint's two, whose exchanges a
+/// session's end ends (`x_peer_ended`) for the requester to issue again.
+fn resumes(s: &State, i: usize) -> bool {
+    s.table.resume && !is_x(s, i)
 }
 
 /// Bytes of fingerprint prefix channel `i`'s local records carry.
@@ -962,6 +1000,7 @@ fn carve_pool(s: &mut State) -> bool {
         let max = e.max_record as u64;
         let tag = tag_len(s, i) as u64;
         let mailbox = e.framing == wire::framing::MAILBOX;
+        let resumed = resumes(s, i);
         s.chans[i].staged = mailbox || peers > 1;
         if s.chans[i].staged && dir != DIR_RECV {
             s.chans[i].tx_stage = (at + tag) as u32;
@@ -978,7 +1017,7 @@ fn carve_pool(s: &mut State) -> bool {
                 pc.ring_cap = (max + RECORD_CHARGE as u64) as u32;
                 at += max + RECORD_CHARGE as u64;
             }
-            if s.table.resume {
+            if resumed {
                 let floor = max + RECORD_CHARGE as u64;
                 let win = if s.window == 0 {
                     floor * WINDOW_RECORDS as u64
@@ -1250,7 +1289,12 @@ unsafe fn bind_link(s: &mut State, l: usize) -> bool {
             );
         }
         p
-    } else if let Some(p) = (0..s.n_peers as usize).find(|&p| !s.peers[p].used) {
+    } else if let Some(p) = (0..s.n_peers as usize)
+        .find(|&p| !s.peers[p].used && rings_empty(s, p))
+        .or_else(|| (0..s.n_peers as usize).find(|&p| !s.peers[p].used))
+    {
+        // A free slot whose last holder's records have all been delivered
+        // first, so those still waiting keep its fingerprint.
         claim_peer(s, p);
         p
     } else {
@@ -1337,9 +1381,67 @@ fn claim_peer(s: &mut State, p: usize) {
     }
     let e = &mut s.peers[p];
     e.used = true;
+    e.fresh = true;
     e.peer_inc = [0; INCARNATION_LEN];
     e.far_announced = false;
     e.own_len = 0;
+}
+
+/// `resume`, several sessions: release the slot and retained windows of
+/// every peer that has had no session for `retain_ms`, so a peer gone for
+/// good stops holding every broadcast record for room it will never free.
+/// What was retained for it is lost and counted; if it comes back it is
+/// served afresh (`on_resume`).
+unsafe fn expire_peers(s: &mut State, now: u32) {
+    if !s.table.resume || s.n_peers < 2 || s.retain_ms == 0 {
+        return;
+    }
+    let wait = s.retain_ms.min(i32::MAX as u32);
+    for p in 0..s.n_peers as usize {
+        let e = &s.peers[p];
+        if !e.used || e.link != NO_LINK || now.wrapping_sub(e.gone_ms) < wait {
+            continue;
+        }
+        expire_peer(s, p);
+    }
+}
+
+/// Release peer slot `p` (no session holds it): every record retained for
+/// it, and one being taken for it, is lost to it and counted. Its
+/// fingerprint stays with the slot until it is claimed, so records of it
+/// still waiting for the local output are stamped as its own.
+unsafe fn expire_peer(s: &mut State, p: usize) {
+    let bit = 1u8 << p;
+    for i in 0..n_channels(s) {
+        let pc = &mut s.peers[p].chans[i];
+        let mut lost = pc.rt_count;
+        pc.rt_head = 0;
+        pc.rt_used = 0;
+        pc.rt_count = 0;
+        pc.rt_base = 1;
+        pc.cur_at = 0;
+        pc.cur_seq = 1;
+        pc.cur_sent = 0;
+        pc.sent_through = 0;
+        pc.sent_high = 0;
+        pc.tx_sent = 0;
+        let c = &mut s.chans[i];
+        if c.in_active && c.in_mask & bit != 0 {
+            // Being taken for it, among others or alone: the rest is still
+            // read off the input, for whoever else it goes to.
+            lost += 1;
+        }
+        c.in_mask &= !bit;
+        c.tx_mask &= !bit;
+        c.lost = c.lost.wrapping_add(lost);
+    }
+    s.peers[p].used = false;
+    s.peers_expired = s.peers_expired.wrapping_add(1);
+    log(
+        s,
+        2,
+        b"[remote_channel] a peer gone past retain_ms gives its slot and retained streams up",
+    );
 }
 
 /// Transport session `l` serves peer slot `p` from now: fix what this
@@ -1393,10 +1495,11 @@ unsafe fn end_link(s: &mut State, l: usize, close: bool, why: &[u8]) {
     lk.fp_len = 0;
     lk.early_len = 0;
     lk.peer_bound = false;
+    let sys = &*s.syscalls;
     if p != NO_PEER {
         peer_ended(s, p as usize);
+        s.peers[p as usize].gone_ms = dev_millis(sys) as u32;
     }
-    let sys = &*s.syscalls;
     // A dialler redials; a listener goes on listening, and on `mux` the
     // transport announces the next session.
     if s.transport == TRANSPORT_NET && s.role == ROLE_DIAL {
@@ -1412,19 +1515,20 @@ fn peer_ended(s: &mut State, p: usize) {
     let resume = s.table.resume;
     let several = s.n_peers > 1;
     for i in 0..n_channels(s) {
+        let resumed = resumes(s, i);
         let pc = &mut s.peers[p].chans[i];
         if pc.rx_active {
             // The partial record's bytes leave the ring. With `resume` the
             // sender still holds it and sends it again; without, it is lost.
             pc.ring_used -= RECORD_CHARGE + pc.rx_have;
             pc.rx_active = false;
-            if !resume {
+            if !resumed {
                 s.chans[i].lost = s.chans[i].lost.wrapping_add(1);
             }
         }
         pc.credit_owed = 0;
         pc.tx_credit = 0;
-        if resume {
+        if resumed {
             // Nothing sent is lost: the next session starts from the
             // oldest record the peer has not acknowledged.
             pc.cur_at = 0;
@@ -1628,7 +1732,9 @@ unsafe fn on_hello(s: &mut State, l: usize, body: &[u8]) -> bool {
 /// The peer's resume trailer: where each of its streams to us stands, and
 /// where it holds ours.
 unsafe fn on_resume(s: &mut State, l: usize, r: &wire::Resume) -> bool {
-    let nch = n_channels(s);
+    // The resumed channels, which the trailer covers: the exchange
+    // endpoint's two follow them and start every session afresh.
+    let nch = s.table.resumed();
     let p = s.links[l].peer as usize;
     // Its streams. A sender this side has not heard from under that
     // incarnation starts its numbering afresh.
@@ -1647,7 +1753,23 @@ unsafe fn on_resume(s: &mut State, l: usize, r: &wire::Resume) -> bool {
         }
     }
     // Ours.
-    if r.held == s.incarnation {
+    let fresh = core::mem::replace(&mut s.peers[p].fresh, false);
+    if r.held == s.incarnation && fresh {
+        // The peer holds this side's streams, but its slot here was given up
+        // (`retain_ms`, or to make room) and claimed again: what it missed
+        // went with the slot, counted lost then. Number on from where it
+        // stands, so it takes what comes next as the next record.
+        for i in 0..nch {
+            let pc = &mut s.peers[p].chans[i];
+            pc.rt_base = r.next[i].max(1);
+            pc.sent_high = pc.rt_base - 1;
+        }
+        log(
+            s,
+            2,
+            b"[remote_channel] a peer whose streams were given up returns; it goes on past what it lost",
+        );
+    } else if r.held == s.incarnation {
         let mut again = 0u32;
         for i in 0..nch {
             let pc = &s.peers[p].chans[i];
@@ -1920,12 +2042,12 @@ unsafe fn on_event(s: &mut State, l: usize, ev: Event<'_>, stream_channel: Optio
                 );
                 return false;
             };
-            if !s.table.resume || !open {
+            if !resumes(s, c) || !open {
                 refuse(
                     s,
                     l,
                     wire::refuse::PROTOCOL,
-                    b"[remote_channel] refused: acknowledgement outside a resume session",
+                    b"[remote_channel] refused: acknowledgement outside a resumed channel's session",
                 );
                 return false;
             }
@@ -1943,15 +2065,6 @@ unsafe fn on_event(s: &mut State, l: usize, ev: Event<'_>, stream_channel: Optio
             true
         }
         Event::RBegin(ch, len, seq) => {
-            if !s.table.resume {
-                refuse(
-                    s,
-                    l,
-                    wire::refuse::PROTOCOL,
-                    b"[remote_channel] refused: a numbered record outside a resume session",
-                );
-                return false;
-            }
             let Some(c) = channel_of(s, ch, stream_channel) else {
                 refuse(
                     s,
@@ -1961,6 +2074,15 @@ unsafe fn on_event(s: &mut State, l: usize, ev: Event<'_>, stream_channel: Optio
                 );
                 return false;
             };
+            if !resumes(s, c) {
+                refuse(
+                    s,
+                    l,
+                    wire::refuse::PROTOCOL,
+                    b"[remote_channel] refused: a numbered record on a channel that is not resumed",
+                );
+                return false;
+            }
             let next = s.peers[p].chans[c].rx_next;
             if seq != next {
                 if seq < next {
@@ -1983,12 +2105,14 @@ unsafe fn on_event(s: &mut State, l: usize, ev: Event<'_>, stream_channel: Optio
             }
             on_begin(s, l, ch, len, stream_channel)
         }
-        Event::Begin(_, _) if s.table.resume && open => {
+        Event::Begin(ch, _)
+            if open && channel_of(s, ch, stream_channel).is_some_and(|c| resumes(s, c)) =>
+        {
             refuse(
                 s,
                 l,
                 wire::refuse::PROTOCOL,
-                b"[remote_channel] refused: an unnumbered record in a resume session",
+                b"[remote_channel] refused: an unnumbered record on a resumed channel",
             );
             false
         }
@@ -2049,13 +2173,13 @@ unsafe fn on_event(s: &mut State, l: usize, ev: Event<'_>, stream_channel: Optio
                     return false;
                 }
             }
-            let resume = s.table.resume;
+            let resumed = resumes(s, c);
             let pc = &mut s.peers[p].chans[c];
             pc.ring_used += bytes.len() as u32;
             pc.rx_have = have;
             if have == pc.rx_len {
                 pc.rx_active = false;
-                if resume {
+                if resumed {
                     pc.rx_next += 1;
                     pc.ack_owed = true;
                 }
@@ -3238,7 +3362,7 @@ unsafe fn send_streamed(s: &mut State, i: usize) -> bool {
 /// Advance channel `i`'s sends: take records off its input, and put out a
 /// fragment to each session owed one. Frames written.
 unsafe fn send_channel(s: &mut State, i: usize) -> usize {
-    if s.table.resume {
+    if resumes(s, i) {
         ingest(s, i);
         return send_retained_all(s, i);
     }
@@ -3361,7 +3485,9 @@ unsafe fn ingest(s: &mut State, i: usize) {
             return;
         }
         let targets = resume_targets(s);
-        if targets == 0 {
+        // A record part-taken goes on being read for the peers it was taken
+        // for, even once none is held: it never holds the input.
+        if targets == 0 && !s.chans[i].in_active {
             return;
         }
         let c = &s.chans[i];
@@ -4219,7 +4345,7 @@ pub unsafe extern "C" fn module_new(
     }
     if side != wire::side::NONE {
         if s.table.add_exchange(side, xc::RECORD_MAX as u32).is_err() {
-            return refuse_construct(s, b"[remote_channel] refusing to construct: `channels` leaves no room for the exchange endpoint's two channels");
+            return refuse_construct(s, b"[remote_channel] refusing to construct: the table leaves no room for the exchange endpoint's two channels");
         }
         let (q, r) = (x_req(s), x_resp(s));
         let near = side == wire::side::NEAR;
@@ -4230,8 +4356,11 @@ pub unsafe extern "C" fn module_new(
         // On `mux` each channel's HELLO carries the same trailer, fixed when
         // the session attached: applying it once per stream is applying it
         // once, before any record of the session is sent.
-        if side != wire::side::NONE {
-            return refuse_construct(s, b"[remote_channel] refusing to construct: `resume` is for channels without an exchange endpoint");
+        // An exchange endpoint's own two channels are not resumed (their
+        // exchanges end with a session and are issued again), so `resume`
+        // needs a `channels` entry of its own to resume.
+        if s.table.resumed() == 0 {
+            return refuse_construct(s, b"[remote_channel] refusing to construct: `resume` resumes the `channels` entries, and there are none (an exchange endpoint's channels are not resumed)");
         }
         if s.n_peers > 1 && s.require_peer == 0 {
             return refuse_construct(s, b"[remote_channel] refusing to construct: `resume` across several sessions keeps each peer's streams by its verified identity, so it needs `require_peer`");
@@ -4254,6 +4383,9 @@ pub unsafe extern "C" fn module_new(
                 pc.rx_next = 1;
             }
         }
+    }
+    if s.retain_ms == RETAIN_DERIVED {
+        s.retain_ms = retain_default(s.keepalive_ms, s.redial_ms);
     }
     s.n_links = if s.transport == TRANSPORT_NET && s.role == ROLE_LISTEN {
         s.n_peers + 1
@@ -4287,6 +4419,17 @@ pub unsafe extern "C" fn module_new(
     }
     s.phase = PH_IDLE;
     0
+}
+
+/// `retain_ms` when the graph names none: `RETAIN_PERIODS` of the larger of
+/// `keepalive_ms` and `redial_ms`, at least `RETAIN_FLOOR_MS` — long past a
+/// silent link being noticed (three keepalives) and redialled.
+pub fn retain_default(keepalive_ms: u32, redial_ms: u32) -> u32 {
+    keepalive_ms
+        .max(redial_ms)
+        .saturating_mul(RETAIN_PERIODS)
+        .max(RETAIN_FLOOR_MS)
+        .min(i32::MAX as u32)
 }
 
 /// # Safety
@@ -4343,6 +4486,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
         check_setup_deadline(s, l, now);
         keepalive(s, l, now);
     }
+    expire_peers(s, now);
     if flush_tx(s) && send_control(s) {
         send_records(s);
     }

@@ -926,9 +926,17 @@ platform provider, which confines it as follows.
   charged once and held twice.
 - **Linux volumes.** A `CREATE`'s `mount`/`bind` entries
   (`workload::volume`, `<src>\0<dst>\0<ro>`) lend the workload host
-  directories: a path at or under `dst` resolves beneath `src` with the
-  same `openat2` flags, whatever the owner's grant (a workload granted
-  `STORAGE_NONE` reaches its volumes and nothing else). A read-only volume
+  directories: a path at or under `dst` resolves beneath `src` with
+  `RESOLVE_BENEATH` and `RESOLVE_NO_MAGICLINKS`, whatever the owner's grant
+  (a workload granted `STORAGE_NONE` reaches its volumes and nothing else).
+  Unlike the owner's root, a volume follows a symlink whose target stays
+  beneath `src`, so a projection laid out with the timestamped-directory
+  swap (`key -> ..data/key`, `..data -> ..<timestamp>`) reads, and the node
+  agent's swap of `..data` is seen by the next `OPEN`; a link leading out
+  (an absolute target, a `..` past `src`) or a magic link is `EACCES`. The
+  ops that name an entry (`UNLINK`, `RENAME`, `RMDIR`, `READLINK`) act on a
+  link itself, never on its target, and `READDIR` lists a link as an entry
+  of its own (type 0). A read-only volume
   opens read-only and refuses every change with `EACCES`; the volume's own
   name is `EBUSY` to `UNLINK`, `RMDIR` and `RENAME`; a `RENAME` between a
   volume and anything else is `EXDEV`. Nothing a volume holds is charged to

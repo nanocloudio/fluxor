@@ -276,6 +276,34 @@ pub mod volume {
     pub const MAX: usize = 16;
 }
 
+/// A workload's own vault: a Tier-2 option on [`CREATE`], namespace
+/// [`vault::NS`], key [`vault::KEY`], value `<dir>\0<seal_key>` — `dir` a
+/// path the workload names (at or beneath the `dst` of one of the CREATE's
+/// writable [`volume`]s; made when absent), `seal_key` 64 hex digits, the 32
+/// bytes the workload's owner supplies (a Secret it holds, say). At most one.
+///
+/// Every key a module of the workload persists by label (`key_vault`
+/// `PERSIST`) is sealed with ChaCha20-Poly1305 under `seal_key` and kept as
+/// one file per label in `dir`, never in the node's store: the keys follow
+/// the volume and the seal key, not the node — the same volume and key
+/// given to the workload on another node open the same keys, and nothing
+/// else opens them. Their custody is `SOFTWARE` (`DESCRIBE`), whatever the
+/// node's sealing key is worth: whoever holds the volume and `seal_key`
+/// holds the keys. Without this option a workload's labelled keys are its
+/// own still — a workload's labels live in its realm, its owner uid, and no
+/// other workload's nor the node's reach them — but are kept in the node's
+/// store under the node's sealing key, and so stay with the node.
+///
+/// A backend that realizes it lists it in [`CAPS`] (the graph backend on a
+/// Linux host); one that does not answers a required entry `ENOSYS`, so a
+/// consumer marks it required.
+pub mod vault {
+    pub const NS: &[u8] = b"vault";
+    pub const KEY: &[u8] = b"store";
+    /// Bytes of the owner's sealing key (64 hex digits in the option).
+    pub const SEAL_KEY_LEN: usize = 32;
+}
+
 /// The record [`NET_LANE_TAKE`] writes, little-endian:
 /// ```text
 /// off  size  field

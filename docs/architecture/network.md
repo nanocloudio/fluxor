@@ -623,21 +623,37 @@ A subgraph staged by a `workload` CREATE (an fmod-graph source) joins the
 network through lanes of its own rather than the fanned `net_out`. Its
 FLXA names the provider as an endpoint, `Net(key)`: one edge from a module
 into it (commands) and one edge out of it to a module (events) per key.
-Each key becomes one lane. A graph writes it in a workload's `wiring:` as
-the end `net:<key>` (decimal 0..=255), which `fluxor build` encodes as FLXA
-endpoint kind 3 and refuses unless each key has exactly one edge of each
-direction, both to modules of the workload:
+Each key becomes one lane.
+
+A workload's `wiring:` is written as a graph's: ends are `module.port`
+(resolved against the module's manifest; a bare `module` is its first
+output in `from:`, its first input in `to:`), and the node's network is
+the platform provider a base graph names — `linux_net` (or `ip`), which
+the workload does not declare among its modules. `fluxor build` gives
+every module wired to it a lane of its own (FLXA endpoint kind 3), keyed
+in the order the wiring first names the module, and refuses a module
+that is not wired to it exactly once each way — `linux_net.net_out` into
+one of its inputs, one of its outputs into `linux_net.net_in`. The
+network's other ports are not a workload's to reach. So a graph's
+modules and wiring move under `workloads:` unchanged, but for the
+platform's own entry:
 
 ```yaml
 workloads:
   - modules:
       - name: front
         type: tls
+      - name: link
+        type: remote_channel
     wiring:
-      - from: "net:0"     # the lane's events (accepts, data) into the module
-        to: front
-      - from: front       # the module's net commands out to the lane
-        to: "net:0"
+      - from: linux_net.net_out   # the lane's events (accepts, data) into tls
+        to: front.cipher_in
+      - from: front.cipher_out    # tls's net commands out to its lane
+        to: linux_net.net_in
+      - from: front.clear_out
+        to: link.transport_in
+      - from: link.transport_out
+        to: front.clear_in
 ```
 
 | Rule | Effect |

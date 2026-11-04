@@ -40,14 +40,18 @@
 //! nothing with it: the `HELLO` trailer
 //!
 //! ```text
-//! ['R'][incarnation:16][held:16][next:8 LE × channels]
+//! ['R'][incarnation:16][held:16][next:8 LE × resumed channels]
 //! ```
 //!
 //! names the sender's incarnation, the peer incarnation whose streams the
 //! sender holds (`held`, zero for none) and, per channel, the next record
 //! it expects of that stream. A peer whose `held` is this side's
 //! incarnation is resumed exactly: every record before `next` is released
-//! and the rest are sent again from `next`. A peer that names another
+//! and the rest are sent again from `next` — unless this side gave the
+//! peer's streams up (a listener releasing a peer slot after `retain_ms`,
+//! or to make room for another peer) and holds none of them: then it
+//! numbers what it sends next from `next`, so the peer takes it as the next
+//! record, and names no incarnation as `held`. A peer that names another
 //! incarnation never saw this stream (its first session, or it restarted
 //! and lost it): the retained records are renumbered from 1 and sent to
 //! it. Within a session every `RBEGIN` must carry exactly the next number
@@ -60,7 +64,12 @@
 //! maximum, after the `channels` entries. Requests cross on the first from
 //! the near side to the far side and answers on the second the other way;
 //! the `HELLO` trailer names the sender's side, and a peer's table matches
-//! only when its side is the other one.
+//! only when its side is the other one. Under `resume` the endpoint's two
+//! channels are the ones not resumed: their records are `BEGIN`, never
+//! `RBEGIN`, nothing on them is acknowledged, and the trailer's `next` list
+//! covers only the `channels` entries — an exchange a session leaves open
+//! is ended with it and issued again by its requester (the exchange
+//! contract's LINK), whatever the channels beside it resume.
 
 /// Frame header bytes.
 pub const FRAME_HDR: usize = 4;
@@ -85,10 +94,15 @@ pub const CONTROL: u8 = 0xFF;
 /// `HELLO`'s leading magic.
 pub const HELLO_MAGIC: [u8; 4] = *b"FXRC";
 
-/// Most channels one instance carries. Each is a port pair, a reassembly
-/// region and a send state, and on `quic` a stream; the manifest declares
-/// this many port pairs.
-pub const MAX_CHANNELS: usize = 8;
+/// Most `channels` entries one instance carries: one per port pair
+/// (`chN`/`chN_rx`), and the manifest declares this many.
+pub const PORT_CHANNELS: usize = 8;
+
+/// Most channels one table carries: every `channels` entry, and the
+/// exchange endpoint's two after them, which have ports of their own
+/// (`request_in` …) and so take no port pair. Each is a reassembly region
+/// and a send state, and on `quic` a stream.
+pub const MAX_CHANNELS: usize = PORT_CHANNELS + 2;
 
 /// Longest content-type name a channel table carries — longer than any
 /// name in the content-type registry.
@@ -260,6 +274,17 @@ pub struct Table {
 }
 
 impl Table {
+    /// The channels `resume` numbers, retains and resumes: the `channels`
+    /// entries, never an exchange endpoint's two, which its requester
+    /// issues again when a session ends (they are the table's last).
+    pub const fn resumed(&self) -> usize {
+        if self.side == side::NONE {
+            self.channels as usize
+        } else {
+            (self.channels as usize).saturating_sub(2)
+        }
+    }
+
     pub const EMPTY: Table = Table {
         channels: 0,
         entries: [Entry::EMPTY; MAX_CHANNELS],
@@ -317,7 +342,7 @@ pub fn parse_table(text: &[u8], limit: u32) -> Result<Table, TableError> {
         if item.is_empty() {
             continue;
         }
-        if t.channels as usize == MAX_CHANNELS {
+        if t.channels as usize == PORT_CHANNELS {
             return Err(TableError::TooManyChannels);
         }
         let mut parts = item.split(|&b| b == b':');
@@ -401,7 +426,7 @@ pub fn encode_hello(t: &Table, out: &mut [u8; HELLO_MAX]) -> usize {
 /// The resume trailer's length for this table (0 without `resume`).
 pub fn resume_trailer_len(t: &Table) -> usize {
     if t.resume {
-        1 + 2 * INCARNATION_LEN + 8 * t.channels as usize
+        1 + 2 * INCARNATION_LEN + 8 * t.resumed()
     } else {
         0
     }
@@ -409,7 +434,8 @@ pub fn resume_trailer_len(t: &Table) -> usize {
 
 /// Append the resume trailer to a `HELLO` body of `at` bytes: this side's
 /// incarnation, the peer incarnation whose streams it holds, and the next
-/// record it expects on each channel. Returns the new length.
+/// record it expects on each resumed channel ([`Table::resumed`]). Returns
+/// the new length.
 pub fn encode_resume(
     t: &Table,
     incarnation: &[u8; INCARNATION_LEN],
@@ -428,7 +454,7 @@ pub fn encode_resume(
     at += INCARNATION_LEN;
     out[at..at + INCARNATION_LEN].copy_from_slice(held);
     at += INCARNATION_LEN;
-    for n in &next[..t.channels as usize] {
+    for n in &next[..t.resumed()] {
         out[at..at + 8].copy_from_slice(&n.to_le_bytes());
         at += 8;
     }
@@ -436,7 +462,8 @@ pub fn encode_resume(
 }
 
 /// A peer's resume trailer: its incarnation, the incarnation whose streams
-/// it holds, and the next record it expects per channel.
+/// it holds, and the next record it expects per resumed channel (the
+/// exchange endpoint's two entries are not resumed and stay 0 here).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Resume {
     pub incarnation: [u8; INCARNATION_LEN],
@@ -479,7 +506,7 @@ pub fn hello_parse(t: &Table, body: &[u8]) -> Option<Option<Resume>> {
     out.held
         .copy_from_slice(&r[1 + INCARNATION_LEN..1 + 2 * INCARNATION_LEN]);
     let mut at = 1 + 2 * INCARNATION_LEN;
-    for k in 0..t.channels as usize {
+    for k in 0..t.resumed() {
         let mut b = [0u8; 8];
         b.copy_from_slice(&r[at..at + 8]);
         out.next[k] = u64::from_le_bytes(b);

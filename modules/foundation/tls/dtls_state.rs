@@ -1170,6 +1170,7 @@ unsafe fn dtls_discard_bytes(sys: &SyscallTable, ch: i32, mut count: usize) {
 // inlined the two would share one frame holding both paths' buffers.
 #[inline(never)]
 unsafe fn dtls_module_step(s: &mut TlsState) -> i32 {
+    creds_step(s);
     identity_step(s);
     let sys = &*s.syscalls;
 
@@ -1261,7 +1262,7 @@ unsafe fn dtls_module_step(s: &mut TlsState) -> i32 {
     }
 
     // Client mode: kick off the handshake on the first tick after bind.
-    if s.mode == 0 && !s.dtls_client_started && s.dtls_endpoint.is_ready() {
+    if s.mode == 0 && !s.dtls_client_started && s.dtls_endpoint.is_ready() && s.creds.ready() {
         let ip_bytes = s.dtls_peer_ip.to_le_bytes();
         let ip = [ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3]];
         if let Some(idx) = dtls_alloc_client_session(s, &ip, s.dtls_peer_port) {

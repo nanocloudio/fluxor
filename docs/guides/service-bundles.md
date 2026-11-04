@@ -90,7 +90,11 @@ certificate, a private key. It is always required and has no default: the
 file is the caller's. Its `example` names a sample relative to the graph,
 and the checks build with that sample. It renders as the file's absolute
 path and goes where a module takes a path (`cert_file: ${param:cert}`,
-`trust: "${file:${param:ca}}"`).
+`trust: ${param:ca}`; on a target that embeds credentials at build,
+`trust: "${file:${param:ca}}"`). A `file` param is checked on the host
+that renders the graph; a credential a Linux module reads where it runs —
+from a volume lent to a workload, say — is a `string` param holding its absolute path, or
+an `{env: NAME}` binding in a workload image.
 
 Param names are `[a-z][a-z0-9_]*`, at most 64 bytes. A default or example
 of the wrong type or outside `min`/`max`, bounds on a non-integer,

@@ -16,10 +16,12 @@
 //
 // Completion (the CLI-ness): cli_in returns Done once argv is emitted and
 // stdin has hit EOF fully flushed; cli_out returns Done when an exit record
-// arrives, or when every upstream producer is finished and its inputs and
-// bridges are drained, or when stdout's reader has gone (exit 141, as a
+// has arrived or every upstream producer is finished — and, either way, its
+// input channels are empty and every byte it took from them has been
+// written whole to its fd — or when stdout's reader has gone (exit 141, as a
 // shell reports for a writer whose pipe closed). The plain-run completion
-// branch then exits the process with CLI_EXIT_CODE.
+// branch then exits the process with CLI_EXIT_CODE, so nothing the applet
+// printed is still in flight when the process ends.
 
 use fluxor::kernel::workload::extbridge::{ExtBridge, OverloadPolicy, PushOutcome};
 use fluxor::platform::builtin_param_tags::cli_in as cli_in_tags;
@@ -296,19 +298,15 @@ fn build_cli_in(module_idx: usize) -> scheduler::BuiltInModule {
         let pump = Arc::clone(&b);
         let pump_eof = Arc::clone(&eof);
         std::thread::spawn(move || {
-            use std::io::Read;
-            let mut stdin = std::io::stdin().lock();
             let mut buf = [0u8; CLI_CHUNK];
-            loop {
-                match stdin.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        // Block policy: the pump (never module_step) waits out
-                        // a full ring — real backpressure to the terminal/pipe.
-                        while let PushOutcome::Rejected = pump.push_frame(&buf[..n]) {
-                            std::thread::sleep(Duration::from_millis(1));
-                        }
-                    }
+            // Raw fd reads, not `std::io::stdin()`: a stdin another process
+            // set O_NONBLOCK on answers EAGAIN while it is merely empty, and
+            // only end-of-file or a real error ends the input.
+            while let Some(n) = read_stream(libc::STDIN_FILENO, &mut buf) {
+                // Block policy: the pump (never module_step) waits out
+                // a full ring — real backpressure to the terminal/pipe.
+                while let PushOutcome::Rejected = pump.push_frame(&buf[..n]) {
+                    std::thread::sleep(Duration::from_millis(1));
                 }
             }
             pump_eof.store(true, Ordering::Release);
@@ -339,30 +337,64 @@ fn build_cli_in(module_idx: usize) -> scheduler::BuiltInModule {
     m
 }
 
+// ── host stream I/O ─────────────────────────────────────────────────────────
+//
+// The worker threads talk to fds 0/1/2 with raw read/write, so every way the
+// kernel can answer short is handled here rather than mistaken for an end:
+// a partial write is resumed, EINTR is retried, and EAGAIN — an fd shared
+// with a process that set O_NONBLOCK on it — waits for readiness instead of
+// being taken for a closed reader (stdout) or end of input (stdin).
+
+#[path = "fd_stream.rs"]
+mod fd_stream;
+use fd_stream::{read_stream, write_stream};
+
 // ── cli_out ─────────────────────────────────────────────────────────────────
+
+/// One output stream: the bridge cli_out fills and the worker that empties
+/// it onto a host fd.
+///
+/// `pushed` (cli_out's count of frames put on the bridge) against `delivered`
+/// (the worker's count of frames whose every byte the fd took) is what says
+/// the stream is settled. An empty bridge alone does not: the worker pops a
+/// frame — emptying the ring — before writing it, so "empty" is also true
+/// while the last frame is still on its way to the fd.
+struct CliSink {
+    bridge: Arc<ExtBridge<CLI_BRIDGE_CAP>>,
+    pushed: u64,
+    delivered: Arc<portable_atomic::AtomicU64>,
+}
+
+impl CliSink {
+    /// Every frame pushed has been written whole to the fd.
+    fn settled(&self) -> bool {
+        self.delivered.load(Ordering::Acquire) == self.pushed
+    }
+}
 
 struct CliOutState {
     module_idx: usize,
     bytes_in: i32,
     err_in: i32,
     exit_in: i32,
-    stdout_bridge: Option<Arc<ExtBridge<CLI_BRIDGE_CAP>>>,
-    stderr_bridge: Option<Arc<ExtBridge<CLI_BRIDGE_CAP>>>,
+    stdout_sink: Option<CliSink>,
+    stderr_sink: Option<CliSink>,
     exited: bool,
 }
 
-/// Drain one input channel into one bridge. Reads a chunk **only when the
-/// bridge provably has room for it**, so a full ring leaves the bytes in the
-/// channel — backpressure the producing app observes as channel fullness —
-/// rather than reading and then dropping them on a rejected push. Stops when
-/// the channel is empty or the bridge is full. Returns whether anything moved.
-fn drain_to_bridge(chan: i32, bridge: &ExtBridge<CLI_BRIDGE_CAP>) -> bool {
+/// Drain one input channel into one sink's bridge. Reads a chunk **only when
+/// the bridge provably has room for it**, so a full ring leaves the bytes in
+/// the channel — backpressure the producing app observes as channel fullness
+/// — rather than reading and then dropping them on a rejected push. Stops
+/// when the channel is empty or the bridge is full. Returns whether anything
+/// moved.
+fn drain_to_bridge(chan: i32, sink: &mut CliSink) -> bool {
     let mut moved = false;
     let mut buf = [0u8; CLI_CHUNK];
     loop {
         // Prove capacity for a full chunk before consuming any bytes. A read of
         // up to CLI_CHUNK bytes then always pushes losslessly.
-        if !bridge.has_room_for(CLI_CHUNK) {
+        if !sink.bridge.has_room_for(CLI_CHUNK) {
             break;
         }
         // SAFETY: stack buffer of CLI_CHUNK bytes.
@@ -370,7 +402,7 @@ fn drain_to_bridge(chan: i32, bridge: &ExtBridge<CLI_BRIDGE_CAP>) -> bool {
         if n <= 0 {
             break;
         }
-        match bridge.push_frame(&buf[..n as usize]) {
+        match sink.bridge.push_frame(&buf[..n as usize]) {
             PushOutcome::Rejected => {
                 // Unreachable: we proved room for a full CLI_CHUNK and read at
                 // most that many bytes. A rejection means the capacity
@@ -380,10 +412,22 @@ fn drain_to_bridge(chan: i32, bridge: &ExtBridge<CLI_BRIDGE_CAP>) -> bool {
                 debug_assert!(false, "cli_out bridge rejected a capacity-proven push");
                 break;
             }
-            _ => moved = true,
+            _ => {
+                sink.pushed += 1;
+                moved = true;
+            }
         }
     }
     moved
+}
+
+/// Nothing is waiting in `chan` (or there is no such channel).
+fn channel_drained(chan: i32) -> bool {
+    if chan < 0 {
+        return true;
+    }
+    let r = channel::channel_poll(chan, channel::POLL_IN);
+    r < 0 || (r as u32 & channel::POLL_IN) == 0
 }
 
 fn cli_out_step(state: *mut u8) -> i32 {
@@ -405,13 +449,13 @@ fn cli_out_step(state: *mut u8) -> i32 {
     }
 
     let mut moved = false;
-    if let (true, Some(b)) = (st.bytes_in >= 0, st.stdout_bridge.as_ref()) {
+    if let (true, Some(s)) = (st.bytes_in >= 0, st.stdout_sink.as_mut()) {
         // drain_to_bridge proves per-chunk capacity itself, so a full ring
         // leaves bytes in the channel rather than dropping them.
-        moved |= drain_to_bridge(st.bytes_in, b);
+        moved |= drain_to_bridge(st.bytes_in, s);
     }
-    if let (true, false, Some(b)) = (st.err_in >= 0, stderr_gone, st.stderr_bridge.as_ref()) {
-        moved |= drain_to_bridge(st.err_in, b);
+    if let (true, false, Some(s)) = (st.err_in >= 0, stderr_gone, st.stderr_sink.as_mut()) {
+        moved |= drain_to_bridge(st.err_in, s);
     }
 
     if st.exit_in >= 0 && !st.exited {
@@ -432,14 +476,26 @@ fn cli_out_step(state: *mut u8) -> i32 {
     }
 
     // Completion: an explicit exit, or every producer that can still feed us is
-    // finished with nothing left in flight. This uses the completion-predecessor
-    // set (ALL edges, including feedback-cycle back-edges) rather than the
-    // forward-only upstream mask — otherwise a sink downstream of the
-    // tcp_client/linux_net cycle would retire before its async reply is decoded.
-    // Bridges must be empty so the worker threads have written the tail to the fds.
+    // finished — and in both cases nothing of the output is anywhere but on
+    // the fd. This uses the completion-predecessor set (ALL edges, including
+    // feedback-cycle back-edges) rather than the forward-only upstream mask —
+    // otherwise a sink downstream of the tcp_client/linux_net cycle would
+    // retire before its async reply is decoded.
+    //
+    // "Nowhere but on the fd" is three facts, all required:
+    //   - the input channels are empty. The exit record and the bytes travel
+    //     on different channels, and a full bridge stops the drain above with
+    //     the tail still in `bytes_in`; the worker can empty the bridge in
+    //     the meantime, so an empty bridge says nothing about the channel.
+    //   - every frame pushed has been written whole (`settled`), which also
+    //     covers a frame the worker has popped but not yet written.
+    // Producers and this step share the scheduler thread, so neither fact can
+    // change between here and the retirement below; only the workers run
+    // alongside, and they only ever move `delivered` towards `pushed`.
     let upstream_done = scheduler::module_completion_predecessors_finished(st.module_idx);
-    let flushed = st.stdout_bridge.as_ref().is_none_or(|b| b.is_empty())
-        && (stderr_gone || st.stderr_bridge.as_ref().is_none_or(|b| b.is_empty()));
+    let drained = channel_drained(st.bytes_in) && (stderr_gone || channel_drained(st.err_in));
+    let settled = st.stdout_sink.as_ref().is_none_or(CliSink::settled)
+        && (stderr_gone || st.stderr_sink.as_ref().is_none_or(CliSink::settled));
     // A sink nothing feeds carries no such claim. `cli` is a platform
     // stanza, so a graph that names it for its stdin alone still gets a
     // `cli_out`, and an unwired one has no predecessors at all —
@@ -449,36 +505,41 @@ fn cli_out_step(state: *mut u8) -> i32 {
     // its connect completed. Only a fed sink falling quiet means the output
     // is over.
     let wired = st.bytes_in >= 0 || st.err_in >= 0 || st.exit_in >= 0;
-    if wired && flushed && (st.exited || upstream_done) {
+    if wired && drained && settled && (st.exited || upstream_done) {
         CLI_RUN_COMPLETE.store(true, Ordering::Release);
         return 1;
     }
     0
 }
 
-/// Spawn a worker that pops bridge frames and writes them to a host stream.
-fn spawn_sink_worker<W: std::io::Write + Send + 'static>(
-    bridge: Arc<ExtBridge<CLI_BRIDGE_CAP>>,
-    mut sink: W,
-    gone: &'static core::sync::atomic::AtomicBool,
-) {
+/// Start a sink for host fd `fd`: a bridge and the worker that writes its
+/// frames out, counting each one only once the fd has taken all of it.
+fn spawn_sink(fd: i32, gone: &'static core::sync::atomic::AtomicBool) -> CliSink {
+    let bridge: Arc<ExtBridge<CLI_BRIDGE_CAP>> = Arc::new(ExtBridge::new(OverloadPolicy::Block));
+    let delivered = Arc::new(portable_atomic::AtomicU64::new(0));
+    let (b, d) = (Arc::clone(&bridge), Arc::clone(&delivered));
     std::thread::spawn(move || {
         let mut frame = [0u8; CLI_CHUNK];
         loop {
-            match bridge.pop_frame(&mut frame) {
+            match b.pop_frame(&mut frame) {
                 Some(n) => {
-                    if sink.write_all(&frame[..n]).is_err() {
+                    if !write_stream(fd, &frame[..n]) {
                         // The reader hung up (broken pipe): say so, or the
                         // sink waits for ever on a bridge nobody empties.
                         gone.store(true, Ordering::Release);
                         return;
                     }
-                    let _ = sink.flush();
+                    d.fetch_add(1, Ordering::Release);
                 }
                 None => std::thread::sleep(Duration::from_millis(1)),
             }
         }
     });
+    CliSink {
+        bridge,
+        pushed: 0,
+        delivered,
+    }
 }
 
 /// Construct a `cli_out` built-in: own stdout/stderr and the exit-code latch.
@@ -488,16 +549,8 @@ fn build_cli_out(module_idx: usize) -> scheduler::BuiltInModule {
     let err_in = scheduler::module_port(module_idx, cli_out_tags::PORT_ERR_IN);
     let exit_in = scheduler::module_port(module_idx, cli_out_tags::PORT_EXIT_IN);
 
-    let stdout_bridge = (bytes_in >= 0).then(|| {
-        let b: Arc<ExtBridge<CLI_BRIDGE_CAP>> = Arc::new(ExtBridge::new(OverloadPolicy::Block));
-        spawn_sink_worker(Arc::clone(&b), std::io::stdout(), &STDOUT_GONE);
-        b
-    });
-    let stderr_bridge = (err_in >= 0).then(|| {
-        let b: Arc<ExtBridge<CLI_BRIDGE_CAP>> = Arc::new(ExtBridge::new(OverloadPolicy::Block));
-        spawn_sink_worker(Arc::clone(&b), std::io::stderr(), &STDERR_GONE);
-        b
-    });
+    let stdout_sink = (bytes_in >= 0).then(|| spawn_sink(libc::STDOUT_FILENO, &STDOUT_GONE));
+    let stderr_sink = (err_in >= 0).then(|| spawn_sink(libc::STDERR_FILENO, &STDERR_GONE));
 
     let mut m = scheduler::BuiltInModule::new("cli_out", cli_out_step);
     install_state(
@@ -507,8 +560,8 @@ fn build_cli_out(module_idx: usize) -> scheduler::BuiltInModule {
             bytes_in,
             err_in,
             exit_in,
-            stdout_bridge,
-            stderr_bridge,
+            stdout_sink,
+            stderr_sink,
             exited: false,
         }),
     );

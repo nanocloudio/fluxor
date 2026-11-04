@@ -34,7 +34,18 @@
 //! (`abi::contracts::workload::volume`, [`lend`]): the workload's `fs` paths
 //! at or under the volume's path resolve beneath that directory, through
 //! the same `openat2` `RESOLVE_BENEATH`, whatever its storage grant. A
-//! read-only volume takes no change (`EACCES`). What a volume holds is the
+//! symlink in a volume resolves when its target stays beneath the volume's
+//! directory, so a directory laid out by the Kubernetes AtomicWriter
+//! (`key -> ..data/key`, `..data -> ..<timestamp>`) reads, and a swap of
+//! `..data` is seen by the next open; a link that leads out of it, by an
+//! absolute target or a `..` past its top, and every magic link, is refused
+//! (`EACCES`). The owner's own root follows no symlink at all: nothing the
+//! owner can make there is one. A path op that names an entry (`UNLINK`,
+//! `RENAME`, `RMDIR`, `READLINK`, the `lstat` charging reads) acts on a link
+//! itself, never its target; only the directories leading to it are
+//! followed. A listing reports a link as an entry of its own (type 0), not
+//! as what it points at. A read-only volume takes no change (`EACCES`),
+//! whatever a link in it names. What a volume holds is the
 //! node's, not the owner's: nothing in it is charged to the owner's ledger,
 //! and the owner's release closes the volume and leaves its directory as it
 //! was.
@@ -77,6 +88,216 @@ struct Volume {
 }
 
 static mut VOLUMES: Vec<Volume> = Vec::new();
+
+/// A workload's own vault (`workload::vault`): the directory its labelled
+/// keys are kept in, held open, and the key its owner supplied that they
+/// are sealed under.
+struct Vault {
+    owner: OwnerHandle,
+    dir_fd: i32,
+    key: [u8; crate::abi::contracts::workload::vault::SEAL_KEY_LEN],
+}
+
+static mut VAULTS: Vec<Vault> = Vec::new();
+
+/// Give `owner` its own vault: the directory `dir` (a path the owner names,
+/// in one of the volumes lent to it, made when absent) and the key its
+/// records are sealed under. `EINVAL` for a `dir` in no lent volume or a
+/// second vault; `EACCES` for a read-only volume; the error making or
+/// opening the directory otherwise.
+///
+/// # Safety
+/// As [`lend`].
+pub unsafe fn set_vault(
+    owner: OwnerHandle,
+    dir: &[u8],
+    key: [u8; crate::abi::contracts::workload::vault::SEAL_KEY_LEN],
+) -> Result<(), i32> {
+    let vaults = &mut *core::ptr::addr_of_mut!(VAULTS);
+    if owner.is_system() || vaults.iter().any(|v| v.owner == owner) {
+        return Err(errno::EINVAL);
+    }
+    let rel = relative(dir)?;
+    let Some((v, _)) = volume_of(owner, &rel) else {
+        return Err(errno::EINVAL);
+    };
+    if v.ro {
+        return Err(errno::EACCES);
+    }
+    let mut fd = open_beneath(owner, dir, libc::O_RDONLY | libc::O_DIRECTORY, 0);
+    if fd == errno::ENOENT {
+        let (parent, name) = parent_beneath(owner, dir)?;
+        let made = libc::mkdirat(parent, name.as_ptr() as *const libc::c_char, 0o700);
+        let err = *libc::__errno_location();
+        libc::close(parent);
+        if made != 0 && err != libc::EEXIST {
+            return Err(-err);
+        }
+        fd = open_beneath(owner, dir, libc::O_RDONLY | libc::O_DIRECTORY, 0);
+    }
+    if fd < 0 {
+        return Err(fd);
+    }
+    vaults.push(Vault {
+        owner,
+        dir_fd: fd,
+        key,
+    });
+    Ok(())
+}
+
+/// Forget `owner`'s vault: its directory closed and left as it is, its key
+/// wiped.
+///
+/// # Safety
+/// As [`lend`].
+unsafe fn close_vault(owner: OwnerHandle) {
+    let vaults = &mut *core::ptr::addr_of_mut!(VAULTS);
+    vaults.retain_mut(|v| {
+        if v.owner != owner {
+            return true;
+        }
+        for b in v.key.iter_mut() {
+            core::ptr::write_volatile(b, 0);
+        }
+        libc::close(v.dir_fd);
+        false
+    });
+}
+
+unsafe fn vault_of(owner: OwnerHandle) -> Option<&'static Vault> {
+    let vaults = &*core::ptr::addr_of!(VAULTS);
+    vaults.iter().find(|v| v.owner == owner)
+}
+
+/// Whether `owner` brought a vault of its own.
+///
+/// # Safety
+/// As [`lend`].
+pub unsafe fn vault_present(owner: OwnerHandle) -> bool {
+    vault_of(owner).is_some()
+}
+
+/// The key `owner`'s vault records are sealed under; the caller wipes it.
+///
+/// # Safety
+/// As [`lend`].
+pub unsafe fn vault_key(
+    owner: OwnerHandle,
+) -> Option<[u8; crate::abi::contracts::workload::vault::SEAL_KEY_LEN]> {
+    vault_of(owner).map(|v| v.key)
+}
+
+/// A record's file name in a vault: its name, hex-encoded (a name is any
+/// bytes; a file name is not), NUL-terminated.
+fn vault_file(name: &[u8], tmp: bool) -> Option<std::ffi::CString> {
+    let mut s = String::with_capacity(name.len() * 2 + 4);
+    for b in name {
+        use core::fmt::Write as _;
+        let _ = write!(s, "{b:02x}");
+    }
+    if tmp {
+        s.push_str(".tmp");
+    }
+    std::ffi::CString::new(s).ok()
+}
+
+/// Read the record `name` from `owner`'s vault into `out`: its length, or
+/// `None` when there is none (or it does not fit).
+///
+/// # Safety
+/// As [`lend`].
+pub unsafe fn vault_read(owner: OwnerHandle, name: &[u8], out: &mut [u8]) -> Option<usize> {
+    let v = vault_of(owner)?;
+    let file = vault_file(name, false)?;
+    let fd = libc::openat(
+        v.dir_fd,
+        file.as_ptr(),
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+    );
+    if fd < 0 {
+        return None;
+    }
+    let mut at = 0usize;
+    let mut whole = false;
+    loop {
+        if at == out.len() {
+            // One byte more than fits says the record is not one of ours.
+            let mut extra = [0u8; 1];
+            whole = libc::read(fd, extra.as_mut_ptr().cast(), 1) == 0;
+            break;
+        }
+        let n = libc::read(fd, out[at..].as_mut_ptr().cast(), out.len() - at);
+        if n < 0 {
+            break;
+        }
+        if n == 0 {
+            whole = true;
+            break;
+        }
+        at += n as usize;
+    }
+    libc::close(fd);
+    whole.then_some(at)
+}
+
+/// Store `blob` as the record `name` in `owner`'s vault so it outlives the
+/// process: written to a temporary, flushed, renamed over the old record and
+/// the directory flushed, so `true` means it would survive a power cut and a
+/// crash at any point leaves the old record whole.
+///
+/// # Safety
+/// As [`lend`].
+pub unsafe fn vault_write(owner: OwnerHandle, name: &[u8], blob: &[u8]) -> bool {
+    let Some(v) = vault_of(owner) else {
+        return false;
+    };
+    let (Some(file), Some(tmp)) = (vault_file(name, false), vault_file(name, true)) else {
+        return false;
+    };
+    let fd = libc::openat(
+        v.dir_fd,
+        tmp.as_ptr(),
+        libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        0o600,
+    );
+    if fd < 0 {
+        return false;
+    }
+    let mut at = 0usize;
+    while at < blob.len() {
+        let n = libc::write(fd, blob[at..].as_ptr().cast(), blob.len() - at);
+        if n <= 0 {
+            break;
+        }
+        at += n as usize;
+    }
+    let ok = at == blob.len() && libc::fsync(fd) == 0;
+    libc::close(fd);
+    if !ok || libc::renameat(v.dir_fd, tmp.as_ptr(), v.dir_fd, file.as_ptr()) != 0 {
+        libc::unlinkat(v.dir_fd, tmp.as_ptr(), 0);
+        return false;
+    }
+    libc::fsync(v.dir_fd) == 0
+}
+
+/// Remove the record `name` from `owner`'s vault; whether none remains.
+///
+/// # Safety
+/// As [`lend`].
+pub unsafe fn vault_delete(owner: OwnerHandle, name: &[u8]) -> bool {
+    let Some(v) = vault_of(owner) else {
+        return false;
+    };
+    let Some(file) = vault_file(name, false) else {
+        return false;
+    };
+    if libc::unlinkat(v.dir_fd, file.as_ptr(), 0) != 0 && *libc::__errno_location() != libc::ENOENT
+    {
+        return false;
+    }
+    libc::fsync(v.dir_fd) == 0
+}
 
 /// Lend `owner` the host directory `src` (absolute) at its path `dst`,
 /// read-only when `ro`. `EINVAL` for a `dst` that is empty, climbs (`.`/`..`)
@@ -337,9 +558,12 @@ pub fn release(owner: OwnerHandle) {
     if owner.is_system() {
         return;
     }
-    // Lent, not owned: closed, and left as they are.
+    // Lent, not owned: closed, and left as they are; the vault's key wiped.
     // SAFETY: owner release runs on the scheduler thread, as every dispatch.
-    unsafe { close_volumes(owner) };
+    unsafe {
+        close_vault(owner);
+        close_volumes(owner);
+    }
     if !rooted(owner) {
         // SAFETY: owner release runs on the scheduler thread, as every dispatch.
         unsafe {
@@ -472,12 +696,12 @@ pub unsafe fn open_beneath(owner: OwnerHandle, path: &[u8], flags: i32, mode: u3
         if v.ro && writes(flags) {
             return errno::EACCES;
         }
-        return openat2_beneath(v.fd, &rest, flags, mode);
+        return openat2_beneath(v.fd, &rest, flags, mode, Links::Beneath);
     }
     let Some(root) = root_for(owner) else {
         return errno::EACCES;
     };
-    openat2_beneath(root.files_fd, &rel, flags, mode)
+    openat2_beneath(root.files_fd, &rel, flags, mode, Links::None)
 }
 
 /// `struct open_how` as `openat2(2)` reads it.
@@ -488,11 +712,28 @@ struct OpenHow {
     resolve: u64,
 }
 
-unsafe fn openat2_beneath(dirfd: i32, rel: &[u8; 256], flags: i32, mode: u32) -> i32 {
+/// Which symlinks a resolution beneath a directory follows.
+#[derive(Clone, Copy)]
+enum Links {
+    /// None: the owner's own root, where nothing the owner makes is a link.
+    None,
+    /// Those whose target stays beneath the directory: a lent volume. A
+    /// link leading out (absolute, or `..` past the top) is `EXDEV` from
+    /// `RESOLVE_BENEATH`, a magic link `ELOOP`; both answer `EACCES`.
+    Beneath,
+}
+
+unsafe fn openat2_beneath(dirfd: i32, rel: &[u8; 256], flags: i32, mode: u32, links: Links) -> i32 {
+    let resolve = match links {
+        Links::None => {
+            libc::RESOLVE_BENEATH | libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_NO_MAGICLINKS
+        }
+        Links::Beneath => libc::RESOLVE_BENEATH | libc::RESOLVE_NO_MAGICLINKS,
+    };
     let how = OpenHow {
         flags: (flags | libc::O_CLOEXEC) as u64,
         mode: mode as u64,
-        resolve: libc::RESOLVE_BENEATH | libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_NO_MAGICLINKS,
+        resolve,
     };
     let fd = libc::syscall(
         libc::SYS_openat2,
@@ -517,12 +758,12 @@ pub unsafe fn parent_beneath(owner: OwnerHandle, path: &[u8]) -> Result<(i32, [u
     let rel = relative(path)?;
     // In a volume, beneath its directory: a read-only one takes no change,
     // and the volume itself is no entry the owner can change.
-    let (base_fd, rel) = match volume_of(owner, &rel) {
+    let (base_fd, rel, links) = match volume_of(owner, &rel) {
         Some((v, _)) if v.ro => return Err(errno::EACCES),
         Some((_, rest)) if rest[0] == b'.' && rest[1] == 0 => return Err(errno::EBUSY),
-        Some((v, rest)) => (v.fd, rest),
+        Some((v, rest)) => (v.fd, rest, Links::Beneath),
         None => match root_for(owner) {
-            Some(root) => (root.files_fd, rel),
+            Some(root) => (root.files_fd, rel, Links::None),
             None => return Err(errno::EACCES),
         },
     };
@@ -545,7 +786,9 @@ pub unsafe fn parent_beneath(owner: OwnerHandle, path: &[u8]) -> Result<(i32, [u
     } else {
         dir[..dir_part.len()].copy_from_slice(dir_part);
     }
-    let dirfd = openat2_beneath(base_fd, &dir, libc::O_RDONLY | libc::O_DIRECTORY, 0);
+    // The directories leading to the name follow what `links` allows; the
+    // name itself is the caller's to act on, a link as a link.
+    let dirfd = openat2_beneath(base_fd, &dir, libc::O_RDONLY | libc::O_DIRECTORY, 0, links);
     if dirfd < 0 {
         return Err(dirfd);
     }

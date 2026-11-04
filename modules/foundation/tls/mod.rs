@@ -84,6 +84,8 @@ include!("../../sdk/crypto/sha3.rs");
 include!("../../sdk/crypto/ml_dsa.rs");
 include!("../../sdk/crypto/rsa.rs");
 include!("x509.rs");
+// `cert_file` / `key_file` / `trust` named by path and read at runtime.
+include!("cred_file.rs");
 
 // TLS protocol
 include!("alert.rs");
@@ -309,6 +311,17 @@ const MODE_CLIENT: u8 = 0;
 /// The longest identity key file: a PKCS#1 RSAPrivateKey of 4096 bits with
 /// its CRT fields is about 2.4 KB; a PKCS#8 P-256 key is under 200 bytes.
 const MAX_KEY_LEN: usize = 2400;
+
+/// Where a rotation of credentials read from files decodes before it is
+/// installed (cred_file.rs): beside the live buffers on `CRED_ROTATE`
+/// targets, absent elsewhere, where the first read decodes in place.
+const CRED_STAGE_CERT: usize = if CRED_ROTATE { MAX_CERT_CHAIN_BYTES } else { 0 };
+const CRED_STAGE_KEY: usize = if CRED_ROTATE { MAX_KEY_LEN } else { 0 };
+const CRED_STAGE_TRUST: usize = if CRED_ROTATE {
+    MAX_CERT_LEN * MAX_ANCHORS
+} else {
+    0
+};
 
 /// `transport` parameter values selecting which I/O path runs.
 const TRANSPORT_TCP: u8 = 0; // TLS records over a net_proto stream channel.
@@ -1018,7 +1031,7 @@ struct TlsState {
     /// an h1-only proxy relay sets this: the relay can only route
     /// HTTP/1.1, so h2 must never be the negotiated protocol.
     alpn_h1_only: u8,
-    /// The `alpn` parameter (extended tag 14): comma-separated protocol
+    /// The `alpn` parameter (schema tag 26): comma-separated protocol
     /// names, in this instance's preference order. A client offers them; a
     /// server selects the first of them the client offered. Empty: the
     /// default `h2,http/1.1` (`http/1.1` under `alpn_h1_only`).
@@ -1244,6 +1257,16 @@ struct TlsState {
     /// The `key_file` entry was longer than `MAX_KEY_LEN`. A truncated key
     /// is not a key, so the instance declines to construct.
     key_refused: bool,
+    /// `cert_file`, `key_file` and `trust` named by path: read at runtime,
+    /// and until read the instance serves no handshake (cred_file.rs).
+    creds: CredSet,
+    cred_stage_cert: [u8; CRED_STAGE_CERT],
+    cred_stage_key: [u8; CRED_STAGE_KEY],
+    cred_stage_trust: [u8; CRED_STAGE_TRUST],
+    /// Bumped each time anchors read from `trust` are replaced, so a link
+    /// still stepping against a replaced slot fails rather than reading
+    /// another anchor's key (`anchor_generation`).
+    trust_epoch: u32,
 
     /// `verify_hostname`: the OVERRIDE of the peer identity a client expects.
     /// A stream session takes its name from the target of the
@@ -1261,6 +1284,11 @@ struct TlsState {
     /// than reached at it.
     expected_uri: [u8; MAX_EXPECTED_URI],
     expected_uri_len: usize,
+    /// A `verify_hostname` or `verify_uri` this instance cannot hold whole,
+    /// or a `verify_uri` no peer could satisfy: construction refuses. Either
+    /// may arrive bound from the workload's environment, past the builder's
+    /// checks.
+    peer_name_refused: bool,
 
     /// Reason code of the most recent peer-certificate refusal
     /// (`x509.rs` `CERT_ERR_*`), retained for diagnostics.
@@ -1525,7 +1553,19 @@ define_params! {
     5, dtls_port, u16, 4433
         => |s, d, len| { s.dtls_port = p_u16(d, len, 0, 4433); };
 
-    // Tags 6 and 7 are unassigned; the next allocation is 18.
+    // The certificate chain this instance presents, leaf first, and its
+    // private key: absolute paths read at runtime through the `fs`
+    // contract, PEM or DER (cred_file.rs). Until both are read no
+    // handshake presents anything. The build-time form `${file:<path>}`
+    // is embedded by the builder as extended tags 10 / 11 instead, and a
+    // value naming both is refused.
+    6, cert_file, str, 0
+        => |s, d, len| { s.creds.files[CRED_CERT].set_path(core::slice::from_raw_parts(d, len)); };
+
+    7, key_file, str, 0
+        => |s, d, len| { s.creds.files[CRED_KEY].set_path(core::slice::from_raw_parts(d, len)); };
+
+    // The next allocation is 27.
     // The DTLS client's peer, `host[:port]` with port 4433 when it names
     // none. A v4 literal: a datagram session is keyed by the address its
     // records arrive from, so there is nothing to key on until a name
@@ -1554,7 +1594,7 @@ define_params! {
     // Restrict the server's ALPN advertisement to `http/1.1` only. 0 keeps the
     // `h2` > `http/1.1` preference; 1 steers dual-offering clients to
     // HTTP/1.1 so an h1-only proxy edge never negotiates h2. The general
-    // form is the `alpn` list (extended tag 14, `alpn_list`), which wins
+    // form is the `alpn` list (tag 26, `alpn_list`), which wins
     // when both are given.
     10, alpn_h1_only, u8, 0
         => |s, d, len| { s.alpn_h1_only = p_u8(d, len, 0, 0); };
@@ -1570,17 +1610,25 @@ define_params! {
     12, clock_policy, u8, 0, enum { require=0, unchecked=1 }
         => |s, d, len| { s.clock_policy = p_u8(d, len, 0, 0); };
 
-    // Trust anchors, as a `${file:<path>}` source spec naming one
-    // certificate or a bundle of up to MAX_ANCHORS (concatenated DER, or
-    // PEM). The build tool resolves the file and embeds its certificates
-    // as extended tag 12; the spec string itself never reaches the wire,
-    // so this arm reads nothing. It is declared so the parameter is in
-    // the schema, where `[[requires_when]]` can bind to it. The id is the
-    // one the extended `--ca` bundle also carries: plain and extended
-    // entries share the tag space and are told apart by the 0x00
-    // length-high byte, and this parameter emits neither.
+    // Trust anchors: an absolute path to one certificate or a bundle of up
+    // to MAX_ANCHORS (concatenated DER, or PEM), read at runtime like
+    // `cert_file`; `system`, the platform's verifier (extended tag 17);
+    // or the build-time `${file:<path>}`, which the builder embeds as
+    // extended tag 12 and never packs here. Declared in the schema so
+    // `[[requires_when]]` can bind to it. The id is the one the extended
+    // `--ca` bundle also carries: plain and extended entries share the tag
+    // space and are told apart by the 0x00 length-high byte.
     16, trust, str, 0
-        => |_s, _d, _len| {};
+        => |s, d, len| {
+            let v = core::slice::from_raw_parts(d, len);
+            if v == b"system" {
+                // Reached only through an env binding: the builder lifts
+                // a literal `system` to extended tag 17.
+                s.trust_system = true;
+            } else {
+                s.creds.files[CRED_TRUST].set_path(v);
+            }
+        };
 
     // A server identity held in the key vault under this label, certified
     // at runtime (identity.rs): the key is opened or generated there and
@@ -1625,6 +1673,53 @@ define_params! {
     // `clear_out` when it moves. 0: never sent.
     23, write_horizon, u8, 0
         => |s, d, len| { s.write_horizon = p_u8(d, len, 0, 0); };
+
+    // The peer a client expects, overriding each dial's target: the SNI and
+    // the `dNSName` the leaf must hold (a proxy, or a pinned host reached by
+    // address); a DTLS client's name for the literal in `authority`. Held
+    // whole or refused: a truncated name authenticates a different host.
+    // A schema string, so a workload binds it from its environment
+    // (`{env: NAME}`) and one image serves every cell.
+    24, verify_hostname, str, 0
+        => |s, d, len| {
+            if len <= MAX_EXPECTED_DNS {
+                core::ptr::copy_nonoverlapping(d, s.expected_dns.as_mut_ptr(), len);
+                s.expected_dns_len = len;
+            } else {
+                s.peer_name_refused = true;
+            }
+        };
+
+    // The URI SAN a peer leaf must satisfy under `peer_auth: ca_uri` (the
+    // SPIFFE case): the URI itself, or any URI strictly under it when it
+    // ends in `/`. Held whole and well formed (`uri_well_formed`) or
+    // refused at construction, under every profile — the builder holds a
+    // literal to the same rule, and an environment-bound value meets it here.
+    25, verify_uri, str, 0
+        => |s, d, len| {
+            let v = core::slice::from_raw_parts(d, len);
+            if len <= MAX_EXPECTED_URI && uri_well_formed(v) {
+                core::ptr::copy_nonoverlapping(d, s.expected_uri.as_mut_ptr(), len);
+                s.expected_uri_len = len;
+            } else if len > 0 {
+                s.peer_name_refused = true;
+            }
+        };
+
+    // ALPN (RFC 7301): comma-separated protocol names in this instance's
+    // preference order; a client offers them, a server selects the first
+    // the client offered. Kept whole or refused: a clipped list would offer,
+    // or select, a protocol nobody configured.
+    26, alpn, str, 0
+        => |s, d, len| {
+            let list = core::slice::from_raw_parts(d, len);
+            if alpn_list_ok(list) {
+                core::ptr::copy_nonoverlapping(d, s.alpn_cfg.as_mut_ptr(), len);
+                s.alpn_cfg_len = len as u8;
+            } else if len > 0 {
+                s.alpn_cfg_bad = 1;
+            }
+        };
 }
 
 /// `TlsSession::peer_closed` bits.
@@ -1679,8 +1774,13 @@ pub unsafe extern "C" fn module_new(
     s.anchor_operator = 0;
     s.anchor_refused = false;
     s.key_refused = false;
+    CredSet::init(&mut s.creds);
+    s.trust_epoch = 0;
     s.expected_dns_len = 0;
     s.expected_uri_len = 0;
+    s.peer_name_refused = false;
+    s.alpn_cfg_len = 0;
+    s.alpn_cfg_bad = 0;
     s.last_peer_auth_error = 0;
     s.key_vault_handle = -1;
     s.rsa_owner = -1;
@@ -1784,6 +1884,10 @@ pub unsafe extern "C" fn module_new(
 
     // Parse extended TLV for cert/key blobs
     parse_extended_params(s, params, params_len);
+    if let Some(msg) = creds_admit(s) {
+        dev_log(sys, 1, msg.as_ptr(), msg.len());
+        return -1;
+    }
 
     // Peer authentication is admitted here, before any channel is serviced:
     // a client with no trust policy must fail before network readiness, not
@@ -1806,6 +1910,11 @@ pub unsafe extern "C" fn module_new(
     }
     if s.alpn_cfg_bad != 0 {
         let msg = b"[tls] refusing to construct: `alpn` must be comma-separated names of 1..=16 bytes, 64 bytes in all";
+        dev_log(sys, 1, msg.as_ptr(), msg.len());
+        return -1;
+    }
+    if s.peer_name_refused {
+        let msg = b"[tls] refusing to construct: `verify_hostname` must be at most 64 bytes and `verify_uri` a scheme://authority/path URI of at most 128 bytes (RFC 3986 unreserved, sub-delims, ':', '@', '/'); a truncated or malformed name authenticates a different peer";
         dev_log(sys, 1, msg.as_ptr(), msg.len());
         return -1;
     }
@@ -1877,6 +1986,23 @@ pub unsafe extern "C" fn module_new(
         }
     }
 
+    // An identity key read from `key_file` at runtime is deposited when it
+    // is read (`creds_install`); an embedded one here.
+    if !identity_key_deposit(s) {
+        let msg = b"[tls] refusing to construct: RSA identity key, and this target's vault does not hold RSA";
+        dev_log(sys, 1, msg.as_ptr(), msg.len());
+        return -1;
+    }
+
+    0
+}
+
+/// Deposit the identity key in `s.key` into the kernel key vault, where the
+/// target's vault holds its suite, and wipe the module's copy. False for an
+/// RSA key this target's vault cannot hold: the module carries no RSA
+/// signer of its own, so such an identity cannot serve.
+unsafe fn identity_key_deposit(s: &mut TlsState) -> bool {
+    let sys = &*s.syscalls;
     // Deposit the private scalar into the kernel KEY_VAULT so
     // CertificateVerify signs via `kv::SIGN` and `s.key` can be
     // wiped. Bypassed when `ecdh_bits_per_step < 256` — kv::SIGN
@@ -1917,9 +2043,7 @@ pub unsafe extern "C" fn module_new(
             }
             s.key_len = 0;
             if handle < 0 {
-                let msg = b"[tls] refusing to construct: RSA identity key, and this target's vault does not hold RSA";
-                dev_log(sys, 1, msg.as_ptr(), msg.len());
-                return -1;
+                return false;
             }
             s.key_vault_handle = handle;
             s.identity_rsa_suite = suite;
@@ -1972,7 +2096,7 @@ pub unsafe extern "C" fn module_new(
         }
     }
 
-    0
+    true
 }
 
 /// The vault suite of a `key_file` that is a PKCS#1 RSAPrivateKey, or
@@ -2032,9 +2156,12 @@ fn alpn_list(s: &TlsState) -> ([u8; ALPN_CFG_MAX], usize) {
     (out, src.len())
 }
 
-/// Parse extended TLV entries: `cert_file` (10), `key_file` (11), the
-/// deployment's `trust` bundle (12), `verify_hostname` (13), `alpn` (14),
-/// `verify_uri` (15), and the operator's `--ca` bundle (16).
+/// Parse extended TLV entries: the chain (10) and key (11) the builder
+/// embeds for `cert_file` / `key_file: "${file:<path>}"` (a bare path is a
+/// schema param, read at runtime by cred_file.rs), the deployment's
+/// embedded `trust` bundle (12), the operator's `--ca` bundle (16) and
+/// `trust: system` (17). `verify_hostname`, `verify_uri` and `alpn` are
+/// schema params (24..=26).
 /// Scans the entire params
 /// blob; extended entries use `tag + 0x00 + len_hi + len_lo`.
 unsafe fn parse_extended_params(s: &mut TlsState, params: *const u8, params_len: usize) {
@@ -2066,14 +2193,7 @@ unsafe fn parse_extended_params(s: &mut TlsState, params: *const u8, params_len:
     // Search for extended TLV pattern: tag + 0x00 + len_hi + len_lo
     while pos + 4 <= end {
         let tag = data[pos];
-        let ext_tags = tag == 10
-            || tag == 11
-            || tag == 12
-            || tag == 13
-            || tag == 14
-            || tag == 15
-            || tag == 16
-            || tag == 17;
+        let ext_tags = tag == 10 || tag == 11 || tag == 12 || tag == 16 || tag == 17;
         if ext_tags && pos + 1 < end && data[pos + 1] == 0x00 && pos + 4 <= end {
             let len = ((data[pos + 2] as usize) << 8) | (data[pos + 3] as usize);
             let data_start = pos + 4;
@@ -2125,45 +2245,6 @@ unsafe fn parse_extended_params(s: &mut TlsState, params: *const u8, params_len:
                     // table of its own.
                     s.trust_system = len > 0 && *data.as_ptr().add(data_start) == 1;
                 }
-                13 => {
-                    // `verify_hostname`, the expected-identity override.
-                    // Truncating a name would authenticate a different one,
-                    // so an over-long value is dropped and the admission
-                    // check refuses the instance.
-                    if len > 0 && len <= MAX_EXPECTED_DNS {
-                        core::ptr::copy_nonoverlapping(
-                            data.as_ptr().add(data_start),
-                            s.expected_dns.as_mut_ptr(),
-                            len,
-                        );
-                        s.expected_dns_len = len;
-                    }
-                }
-                14 => {
-                    // `alpn`: kept whole or refused. A clipped list would
-                    // offer, or select, a protocol nobody configured.
-                    let list = core::slice::from_raw_parts(data.as_ptr().add(data_start), len);
-                    if alpn_list_ok(list) {
-                        core::ptr::copy_nonoverlapping(list.as_ptr(), s.alpn_cfg.as_mut_ptr(), len);
-                        s.alpn_cfg_len = len as u8;
-                    } else {
-                        s.alpn_cfg_bad = 1;
-                    }
-                }
-                15 => {
-                    // Expected URI SAN. Truncating it would authenticate a
-                    // different identity — and a prefix of a SPIFFE ID is
-                    // another valid SPIFFE ID — so an over-long value is
-                    // dropped and the admission check refuses the instance.
-                    if len > 0 && len <= MAX_EXPECTED_URI {
-                        core::ptr::copy_nonoverlapping(
-                            data.as_ptr().add(data_start),
-                            s.expected_uri.as_mut_ptr(),
-                            len,
-                        );
-                        s.expected_uri_len = len;
-                    }
-                }
                 _ => {}
             }
             pos = data_start + len;
@@ -2201,7 +2282,8 @@ unsafe fn tcp_module_step(s: &mut TlsState) -> i32 {
     // first so quiet steps cost a single syscall per latched
     // session.
     service_pending_peer_identity(s);
-    let id_work = identity_step(s);
+    let cred_work = creds_step(s);
+    let id_work = identity_step(s) || cred_work;
 
     // Hot-path telemetry snapshots. Taken after the DTLS early-return so
     // `tlm` describes the TCP record path only, and before any work so the
@@ -3876,18 +3958,16 @@ fn anchor_set(s: &TlsState) -> AnchorSet<'_> {
 
 /// The anchor a walked chain was accepted under, for the stepped links
 /// that read their issuer key from it. Empty for an index the table does
-/// not hold, and for the adopted issuer's slot when a renewal replaced it
-/// after the walk chose it; the step then refuses either as a signature
+/// not hold, and for a slot replaced after the walk chose it (the adopted
+/// issuer's by a renewal, any other by a rotation of the anchors read from
+/// `trust`, `anchor_generation`); the step then refuses either as a signature
 /// failure, so no link verifies against an anchor the walk did not judge.
 fn selected_anchor<'a>(s: &'a TlsState, links: &DeferredLinks) -> &'a [u8] {
     let i = links.anchor as usize;
     if i >= s.anchor_count as usize || i >= MAX_ANCHORS {
         return &[];
     }
-    if s.label_id.trust_issuer != 0
-        && i == s.label_id.static_anchors as usize
-        && links.generation != s.label_id.adopted_generation
-    {
+    if links.generation != anchor_generation(s, i) {
         return &[];
     }
     &s.anchors[i][..s.anchor_lens[i] as usize]
@@ -3914,13 +3994,17 @@ fn peer_auth_admissible(s: &TlsState) -> bool {
     // (`trust_issuer`) is trust that arrives at runtime: until it does, a
     // chain the platform cannot place verifies against nothing and the
     // handshake fails closed.
+    // Anchors named by path are trust that arrives at runtime too: until
+    // they are read the instance serves no handshake (`CredSet::ready`).
+    let file_trust = s.creds.files[CRED_TRUST].configured();
     let has_trust = s.anchor_count > 0
         || s.trust_system
+        || file_trust
         || (s.label_id.trust_issuer != 0 && s.label_id.configured());
     match s.peer_auth {
         // Pinning is a statement about a specific key, which is this
         // module's to hold and not the platform's to answer.
-        PROFILE_PINNED => s.anchor_count > 0,
+        PROFILE_PINNED => s.anchor_count > 0 || file_trust,
         // `ca_uri` demands the name on BOTH sides, unlike `ca_dns`: a
         // server under `ca_dns` legitimately has no name to expect of a
         // client, whereas under `ca_uri` the URI is the whole
@@ -4105,7 +4189,7 @@ unsafe fn peer_cert_reason(
         deferred.as_deref_mut(),
     );
     if let Some(d) = deferred {
-        d.generation = s.label_id.adopted_generation;
+        d.generation = anchor_generation(s, d.anchor as usize);
     }
     rc
 }
@@ -8108,6 +8192,32 @@ pub mod test_helpers {
     pub unsafe fn last_peer_auth_error(state: *const u8) -> u32 {
         let s = &*(state as *const TlsState);
         s.last_peer_auth_error
+    }
+
+    /// Whether the credentials named by path have been read and adopted
+    /// (true when none are), and what the instance holds now: the
+    /// certificate chain's length, whether an identity key is held (in
+    /// the vault or in module state), and the anchor count.
+    ///
+    /// # Safety
+    /// `state` points to an initialised `TlsState`.
+    pub unsafe fn credentials(state: *const u8) -> (bool, usize, bool, usize) {
+        let s = &*(state as *const TlsState);
+        (
+            s.creds.ready(),
+            s.cert_len,
+            s.key_len > 0 || s.key_vault_handle >= 0,
+            s.anchor_count as usize,
+        )
+    }
+
+    /// The certificate chain the instance presents.
+    ///
+    /// # Safety
+    /// `state` points to an initialised `TlsState`.
+    pub unsafe fn presented_chain(state: *const u8) -> Vec<u8> {
+        let s = &*(state as *const TlsState);
+        s.cert[..s.cert_len].to_vec()
     }
 
     /// The configured profile, anchor count, and expected DNS identity

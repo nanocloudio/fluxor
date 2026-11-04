@@ -1685,14 +1685,12 @@ const NON_PARAM_KEYS: &[&str] = &[
     "trust_tier",
     "protection",
     "device_window",
-    "cert_file",
-    "key_file",
-    // `trust` is NOT here: it is a schema parameter of tls and quic (a
-    // `${file:<path>}` source spec), validated like any other key and
-    // lifted out before packing by `lift_trust_source`.
-    "verify_hostname",
-    "verify_uri", // URI SAN required under peer_auth: ca_uri, extended TLV tag 15
-    "alpn",       // RFC 7301 ALPN list, emitted as extended TLV tag 14
+    // `cert_file`, `key_file` and `trust` are NOT here: they are schema
+    // parameters of tls and quic, validated like any other key, and their
+    // build-time forms are lifted out before packing by
+    // `lift_credential_sources`. Nor are `verify_hostname`, `verify_uri`
+    // and `alpn`: schema strings too, checked and put in their packed
+    // form by `normalize_peer_names`.
     "domain",
     "sample_rate", // injected by graph_sample_rate
     // Protection-control keys emitted as TLV tags by
@@ -2334,33 +2332,175 @@ fn closest_param_name<'a>(key: &str, schema: &'a schema::ParamSchema) -> Option<
     })
 }
 
-/// Separate the `trust` source spec from the keys that pack as TLVs.
-///
-/// Returns the module as validated (with `trust` present, so the schema
-/// check sees it), the module as packed (with `trust` removed, so no string
-/// TLV is emitted for a value that is resolved to a bundle instead), and
-/// the spec itself. A trust set is named one way: `trust`, holding a
-/// `${file:<path>}` source spec.
-fn lift_trust_source(name: &str, module: Value) -> Result<(Value, Value, Option<String>)> {
-    let mut validated = module;
-    let Some(obj) = validated.as_object_mut() else {
-        return Ok((validated.clone(), validated, None));
-    };
-    let trust_spec = match obj.get("trust") {
-        None => None,
-        Some(Value::String(spec)) => Some(spec.clone()),
-        Some(_) => {
-            return Err(Error::Config(format!(
-                "module '{name}': trust must be `system` or a `${{file:<path>}}` source spec string"
-            )));
-        }
-    };
-    let mut packed = validated.clone();
-    if let Some(p) = packed.as_object_mut() {
-        p.remove("trust");
-    }
-    Ok((validated, packed, trust_spec))
+/// The build-time sources of a tls / quic instance's credentials: what
+/// [`lift_credential_sources`] took out of the packed module.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct CredentialSources {
+    /// `cert_file: "${file:<path>}"`: the chain embedded as extended tag 10.
+    pub cert: Option<String>,
+    /// `key_file: "${file:<path>}"`: the key embedded as extended tag 11.
+    pub key: Option<String>,
+    /// `trust: "${file:<path>}"` (embedded as extended tag 12), or
+    /// `trust: system` (extended tag 17).
+    pub trust: Option<String>,
 }
+
+/// The credential parameters of tls and quic. Each is one of: an absolute
+/// path the module reads at runtime through the `fs` contract (packed as
+/// the schema's string param, so `{env: NAME}` binds it too); the
+/// build-time `${file:<path>}`, read here and embedded; or, for `trust`,
+/// `system`.
+pub(crate) const CREDENTIAL_KEYS: [&str; 3] = ["cert_file", "key_file", "trust"];
+
+/// Separate the build-time credential sources from the keys that pack as
+/// TLVs, for the `CREDENTIAL_KEYS` `schema` declares.
+///
+/// Returns the module as validated (every key present, so the schema check
+/// sees it), the module as packed (the build-time forms removed: they are
+/// embedded as extended TLVs instead), and those forms. A runtime path is
+/// left to pack, and must be absolute: the module resolves it on the file
+/// surface it runs on, and a relative path names nothing there.
+pub(crate) fn lift_credential_sources(
+    name: &str,
+    module: Value,
+    declares: impl Fn(&str) -> bool,
+) -> Result<(Value, Value, CredentialSources)> {
+    let validated = module;
+    let mut packed = validated.clone();
+    let mut sources = CredentialSources::default();
+    let Some(obj) = validated.as_object() else {
+        return Ok((validated, packed, sources));
+    };
+    for key in CREDENTIAL_KEYS {
+        if !declares(key) {
+            continue;
+        }
+        let spec = match obj.get(key) {
+            None => continue,
+            // `{env: NAME}`: the schema packs the binding, and the node
+            // writes the path in at CREATE.
+            Some(v) if v.as_object().is_some_and(|o| o.contains_key("env")) => continue,
+            // An empty value names nothing (a param left at `""`): the
+            // module takes no credential from it.
+            Some(Value::String(spec)) if spec.is_empty() => continue,
+            Some(Value::String(spec)) => spec.clone(),
+            Some(_) => {
+                return Err(Error::Config(format!(
+                    "module '{name}': {key} must be an absolute path read at runtime, \
+                     `${{file:<path>}}` to embed the file at build{}, or an `{{env: NAME}}` binding",
+                    if key == "trust" { ", `system`" } else { "" }
+                )));
+            }
+        };
+        let lifted = if key == "trust" && spec == crate::trust_anchors::SYSTEM_SPEC {
+            true
+        } else if spec.starts_with("${") {
+            if crate::trust_anchors::file_source(&spec).is_none() {
+                return Err(Error::Config(format!(
+                    "module '{name}': {key} '{spec}' is not `${{file:<path>}}`"
+                )));
+            }
+            true
+        } else {
+            if !spec.starts_with('/') || spec.len() > RUNTIME_CREDENTIAL_PATH_MAX {
+                return Err(Error::Config(format!(
+                    "module '{name}': {key} '{spec}' is read at runtime, so it must be an \
+                     absolute path of at most {RUNTIME_CREDENTIAL_PATH_MAX} bytes (write \
+                     `${{file:<path>}}` to embed a build-host file instead)"
+                )));
+            }
+            false
+        };
+        if lifted {
+            if let Some(p) = packed.as_object_mut() {
+                p.remove(key);
+            }
+            let slot = match key {
+                "cert_file" => &mut sources.cert,
+                "key_file" => &mut sources.key,
+                _ => &mut sources.trust,
+            };
+            *slot = Some(spec);
+        }
+    }
+    Ok((validated, packed, sources))
+}
+
+/// The peer-name keys of tls and quic: schema strings, so a workload binds
+/// any of them from its environment (`{env: NAME}`) like any other string.
+pub(crate) const PEER_NAME_KEYS: [&str; 3] = ["verify_hostname", "verify_uri", "alpn"];
+
+/// The longest `verify_hostname` tls and quic hold (`MAX_EXPECTED_DNS`,
+/// quic's field): a longer one is refused rather than truncated, since a
+/// truncated name authenticates a different host.
+const VERIFY_HOSTNAME_MAX: usize = 64;
+
+/// Check the [`PEER_NAME_KEYS`] a module's schema declares under the
+/// module's own rules, and put each in the form it packs as: `alpn`'s list
+/// joined with commas, an empty value dropped (it names nothing). An
+/// `{env: NAME}` binding is left for the node to fill at `CREATE`, where
+/// the module holds the value to the same rule and refuses to construct
+/// on one that breaks it.
+pub(crate) fn normalize_peer_names(
+    name: &str,
+    type_name: &str,
+    mut module: Value,
+    declares: impl Fn(&str) -> bool,
+) -> Result<Value> {
+    let Some(obj) = module.as_object_mut() else {
+        return Ok(module);
+    };
+    for key in PEER_NAME_KEYS {
+        if !declares(key) {
+            continue;
+        }
+        let Some(v) = obj.get(key) else {
+            continue;
+        };
+        if v.as_object().is_some_and(|o| o.contains_key("env")) {
+            continue;
+        }
+        let packed = match key {
+            "alpn" => alpn_param(name, type_name, Some(v))?,
+            _ => {
+                let Some(text) = v.as_str() else {
+                    return Err(Error::Config(format!(
+                        "module '{name}': {key} is a string or an `{{env: NAME}}` binding"
+                    )));
+                };
+                if text.is_empty() {
+                    None
+                } else if key == "verify_uri" {
+                    check_verify_uri(text)
+                        .map_err(|e| Error::Config(format!("module '{name}': {e}")))?;
+                    Some(text.to_string())
+                } else if text.len() > VERIFY_HOSTNAME_MAX {
+                    return Err(Error::Config(format!(
+                        "module '{name}': verify_hostname is {} bytes, over the \
+                         {VERIFY_HOSTNAME_MAX}-byte limit: a truncated name would \
+                         authenticate a different host",
+                        text.len()
+                    )));
+                } else {
+                    Some(text.to_string())
+                }
+            }
+        };
+        match packed {
+            Some(text) => {
+                obj.insert(key.to_string(), Value::String(text));
+            }
+            None => {
+                obj.remove(key);
+            }
+        }
+    }
+    Ok(module)
+}
+
+/// The longest runtime credential path: the module's `CRED_PATH_MAX`, one
+/// basic TLV string.
+const RUNTIME_CREDENTIAL_PATH_MAX: usize = 255;
 
 /// Expand compound YAML fields that don't map 1:1 to schema params,
 /// returning a clone with the flat fields in place. Pure YAML-level
@@ -2720,14 +2860,11 @@ fn build_module_entry_in(
     // other module `trust` keeps whatever meaning that module gives it —
     // an ISR-tier module's `trust: platform` is a trust LEVEL, read by
     // `board::validate_config`, and is left exactly as written.
-    let declares_trust = pic_schema
-        .as_ref()
-        .is_some_and(|s| s.find("trust").is_some());
-    let (normalized_module, packed_module, trust_spec) = if declares_trust {
-        lift_trust_source(name, normalized_module)?
-    } else {
-        (normalized_module.clone(), normalized_module, None)
-    };
+    let declares = |key: &str| pic_schema.as_ref().is_some_and(|s| s.find(key).is_some());
+    let normalized_module = normalize_peer_names(name, type_name, normalized_module, declares)?;
+    let (normalized_module, packed_module, sources) =
+        lift_credential_sources(name, normalized_module, declares)?;
+    let trust_spec = sources.trust.clone();
     let module = &normalized_module;
     let packed_module = &packed_module;
 
@@ -3236,16 +3373,27 @@ fn build_module_entry_in(
         }
     }
 
-    // Tags 10 and 11: the instance's own certificate and private key,
-    // `cert_file` / `key_file`, each PEM or DER, embedded as DER. A file
-    // that cannot be read, decoded or carried fails the build: an instance
-    // run without the identity it was given would fail later, further from
-    // the cause.
-    for (key, tag, labels) in [
-        ("cert_file", 10u8, crate::trust_anchors::CERT_LABELS),
-        ("key_file", 11u8, crate::trust_anchors::KEY_LABELS),
+    // Tags 10 and 11: the instance's own certificate and private key in
+    // their build-time form, `cert_file` / `key_file: "${file:<path>}"`,
+    // each PEM or DER, embedded as DER. A file that cannot be read, decoded
+    // or carried fails the build: an instance run without the identity it
+    // was given would fail later, further from the cause. A bare path is
+    // the module's to read at runtime and was packed as its string param.
+    for (key, tag, labels, spec) in [
+        (
+            "cert_file",
+            10u8,
+            crate::trust_anchors::CERT_LABELS,
+            sources.cert.as_deref(),
+        ),
+        (
+            "key_file",
+            11u8,
+            crate::trust_anchors::KEY_LABELS,
+            sources.key.as_deref(),
+        ),
     ] {
-        let Some(path) = module.get(key).and_then(|v| v.as_str()) else {
+        let Some(path) = spec.and_then(crate::trust_anchors::file_source) else {
             continue;
         };
         let der = if let Some(n) = check_stand_in(path, key) {
@@ -3275,8 +3423,9 @@ fn build_module_entry_in(
         eprintln!("  {key}: {path} ({n} bytes)");
     }
 
-    // Tag 12: the deployment's trust anchors — `trust: "${file:<path>}"`,
-    // one certificate or a bundle, embedded as concatenated DER. A file
+    // Tag 12: the deployment's trust anchors in their build-time form —
+    // `trust: "${file:<path>}"`, one certificate or a bundle, embedded as
+    // concatenated DER. A file
     // that cannot be read, holds no certificate, or holds more than the
     // module's table fails the build here, naming the file and the
     // instance: an anchor set is a decision, and an instance is not run
@@ -3324,87 +3473,6 @@ fn build_module_entry_in(
             anchors.len(),
             blob.len() - 4
         );
-    }
-
-    // Tag 13: verify_hostname (ASCII string, extended TLV).
-    if let Some(name) = module.get("verify_hostname").and_then(|v| v.as_str()) {
-        let bytes = name.as_bytes();
-        let n = bytes.len();
-        if n > 0 && n < 256 && base + extra_len + 4 + n < entry.len() {
-            entry[base + extra_len] = 13;
-            entry[base + extra_len + 1] = 0x00;
-            entry[base + extra_len + 2] = (n >> 8) as u8;
-            entry[base + extra_len + 3] = n as u8;
-            entry[base + extra_len + 4..base + extra_len + 4 + n].copy_from_slice(bytes);
-            extra_len += 4 + n;
-            eprintln!("  verify_hostname: {name}");
-        }
-    }
-
-    // Tag 15: verify_uri (ASCII URI, extended TLV). The URI a peer leaf's
-    // URI SAN must satisfy under the tls module's `ca_uri` peer-auth
-    // profile — the SPIFFE case: the URI itself, or, when it ends in `/`,
-    // any URI strictly under that path. Separate from `verify_hostname`
-    // because a URI admits none of a hostname's wildcard and label rules;
-    // one key feeding both would apply whichever rule the code reached
-    // first. Checked here under the module's own rule
-    // (`check_verify_uri`), so an expectation the module would refuse at
-    // construction is refused at build with the reason.
-    if let Some(uri) = module.get("verify_uri").and_then(|v| v.as_str()) {
-        check_verify_uri(uri).map_err(|e| Error::Config(format!("module '{name}': {e}")))?;
-        let bytes = uri.as_bytes();
-        let n = bytes.len();
-        if base + extra_len + 4 + n >= entry.len() {
-            *out_of_room = true;
-            return Err(Error::Config(format!(
-                "module '{name}': verify_uri does not fit in the module entry"
-            )));
-        }
-        entry[base + extra_len] = 15;
-        entry[base + extra_len + 1] = 0x00;
-        entry[base + extra_len + 2] = (n >> 8) as u8;
-        entry[base + extra_len + 3] = n as u8;
-        entry[base + extra_len + 4..base + extra_len + 4 + n].copy_from_slice(bytes);
-        extra_len += 4 + n;
-        eprintln!("  verify_uri: {uri}");
-    }
-
-    // Tag 14: alpn (RFC 7301 ALPN list, extended TLV): the protocol names
-    // an instance offers (client) or selects from (server) in its own
-    // preference order — "h2", "http/1.1", "mqtt,h3", or a YAML list of
-    // names — carried comma-separated. Consumed by the modules that
-    // negotiate ALPN (tls, quic); selection is server-preference, the
-    // first configured name the client offered.
-    if let Some(alpn) = alpn_param(name, type_name, module.get("alpn"))? {
-        let bytes = alpn.as_bytes();
-        let n = bytes.len();
-        if n > 0 {
-            // The TLV body spans `[base + extra_len .. base + extra_len + 4 + n)`,
-            // so the highest index written is `base + extra_len + 4 + n - 1`;
-            // the write fits iff `base + extra_len + 4 + n <= entry.len()`
-            // (note `<=`, so an exact fill is valid). An explicit `alpn` is a
-            // hard requirement — silently omitting it here would fall the
-            // module back to non-ALPN QUIC, which the operator did not ask
-            // for — so a buffer that can't hold it is a config error, not a
-            // silent drop.
-            let end = base + extra_len + 4 + n;
-            if end <= entry.len() {
-                entry[base + extra_len] = 14;
-                entry[base + extra_len + 1] = 0x00;
-                entry[base + extra_len + 2] = (n >> 8) as u8;
-                entry[base + extra_len + 3] = n as u8;
-                entry[base + extra_len + 4..end].copy_from_slice(bytes);
-                extra_len += 4 + n;
-                eprintln!("  alpn: {alpn}");
-            } else {
-                *out_of_room = true;
-                return Err(Error::Config(format!(
-                    "module '{name}': alpn list ({n} bytes) does not fit this pass's params \
-                     buffer (needs {} more bytes)",
-                    end - entry.len()
-                )));
-            }
-        }
     }
 
     // Calculate total entry length and write to header. The

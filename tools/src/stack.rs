@@ -48,6 +48,9 @@
 //!     to: fs.blocks
 //! ```
 //!
+//! A `workloads:` entry takes an `include:` of its own, expanded the same
+//! way into the workload's own `modules:` and `wiring:`.
+//!
 //! Expansion runs on the parsed graph before every other pass — ahead of
 //! platform stack expansion and placement — so everything downstream sees
 //! an ordinary graph: the stack's modules under prefixed names, its internal edges,
@@ -100,6 +103,15 @@ const DOC_KEYS: &[&str] = &[
     "modules",
     "wiring",
 ];
+
+/// The graph key whose entries are workloads, each a scope of its own that
+/// may carry an `include:` of its own.
+pub const WORKLOADS_KEY: &str = "workloads";
+
+/// The node's network as a workload's `wiring:` names it — the platform
+/// provider a base graph declares, `linux_net` on a hosted node and `ip` on
+/// metal — when the workload has no module of that name.
+pub const WORKLOAD_NET_ENDS: &[&str] = &["linux_net", "ip"];
 
 /// Every key one `include:` entry may carry.
 const INCLUDE_ENTRY_KEYS: &[&str] = &["stack", "as", "params", "node"];
@@ -774,6 +786,13 @@ fn module_entry_name(entry: &Value) -> Option<&str> {
 /// expansion is a pure function of the graph, the stacks and the pins:
 /// includes expand in list order, a stack's modules and edges keep its
 /// declaration order, and they follow the graph's own.
+///
+/// A `workloads:` entry is a graph of its own — its modules are named, and
+/// its wiring resolved, within it — so its `include:` expands into its own
+/// `modules:` and `wiring:` by the same rules, its names checked against
+/// its own modules alone. Such an include takes no `node:` (a workload's
+/// modules run together, where the workload runs) and its `as:` is never
+/// the node's network a workload wires as [`WORKLOAD_NET_ENDS`].
 pub fn expand_includes(
     config: &mut Value,
     ctx: &IncludeContext<'_>,
@@ -781,6 +800,24 @@ pub fn expand_includes(
     let Some(obj) = config.as_object_mut() else {
         return Ok(());
     };
+    expand_scope(obj, ctx, None)?;
+    if let Some(Value::Array(workloads)) = obj.get_mut(WORKLOADS_KEY) {
+        for (pi, w) in workloads.iter_mut().enumerate() {
+            if let Some(entry) = w.as_object_mut() {
+                expand_scope(entry, ctx, Some(pi)).map_err(|e| format!("workload {pi}: {e}"))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Expand the `include:` of one scope: the graph itself (`workload`
+/// `None`), or its `workloads:` entry `workload`.
+fn expand_scope(
+    obj: &mut Map<String, Value>,
+    ctx: &IncludeContext<'_>,
+    workload: Option<usize>,
+) -> std::result::Result<(), String> {
     let Some(includes) = obj.remove(INCLUDE_KEY) else {
         return Ok(());
     };
@@ -860,6 +897,21 @@ pub fn expand_includes(
                 "{at}: `as: {alias}` is also a module name; an edge to `{alias}.<port>` would \
                  be ambiguous"
             ));
+        }
+        if workload.is_some() {
+            if WORKLOAD_NET_ENDS.contains(&alias) {
+                return Err(format!(
+                    "{at}: `as: {alias}` is the node's network a workload's wiring names; \
+                     give the include another name"
+                ));
+            }
+            if entry.get("node").is_some_and(|n| !n.is_null()) {
+                return Err(format!(
+                    "{at}: `node` places an include on another node, and a workload's modules \
+                     run together where the workload runs — drop it, or include the stack in \
+                     the graph instead"
+                ));
+            }
         }
         let node = match entry.get("node") {
             None | Some(Value::Null) => None,
@@ -2140,6 +2192,152 @@ wiring:
         assert_eq!(module(&g, "data_disk")["block_size"], 1024);
     }
 
+    // ── workloads ──────────────────────────────────────────────────────
+
+    /// A graph whose one workload includes the volume stack, and whose own
+    /// graph names a module the include's would collide with there.
+    fn workload_volume(include: Value) -> Value {
+        json!({
+            "target": "linux",
+            "modules": [{"name": "data_disk", "type": "file_block"}],
+            "wiring": [],
+            "workloads": [{
+                "include": [include],
+                "modules": [{"name": "fs", "type": "fat32"}],
+                "wiring": [{"from": "data.blocks", "to": "fs.blocks"}],
+                "idle_safe": true,
+            }],
+        })
+    }
+
+    #[test]
+    fn a_workload_includes_a_stack_into_its_own_modules_and_wiring() {
+        let sb = Sandbox::new();
+        let g = sb
+            .expand(workload_volume(
+                json!({"stack": "volume.yaml", "as": "data", "params": {"image": "d.img"}}),
+            ))
+            .unwrap();
+        let w = &g["workloads"][0];
+        assert!(
+            w.get(INCLUDE_KEY).is_none(),
+            "the workload's include is consumed"
+        );
+        assert_eq!(w["idle_safe"], true, "the workload's own keys stay");
+        let names: Vec<&str> = w["modules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            ["fs", "data_disk", "data_seal"],
+            "the workload's own modules, then the stack's under its prefix: names are scoped \
+             to the workload, so the graph's own `data_disk` is no collision"
+        );
+        assert_eq!(module(w, "data_disk")["type"], "file_block");
+        assert_eq!(module(w, "data_disk")["path"], "d.img");
+        assert_eq!(
+            edges(w),
+            [
+                ("data_seal.blocks".to_string(), "fs.blocks".to_string()),
+                ("data_disk.blocks".into(), "data_seal.lower".into()),
+            ],
+            "the workload's export edge rewritten, then the stack's internal edge"
+        );
+        assert_eq!(
+            g["modules"].as_array().unwrap().len(),
+            1,
+            "the graph's own modules are untouched"
+        );
+        assert!(edges(&g).is_empty());
+    }
+
+    #[test]
+    fn a_workload_include_keeps_to_its_workload() {
+        let sb = Sandbox::new();
+        // A name taken inside the workload collides.
+        let mut g = workload_volume(json!({"stack": "volume.yaml", "as": "data",
+                                           "params": {"image": "d.img"}}));
+        g["workloads"][0]["modules"] = json!([{"name": "data_seal", "type": "fat32"}]);
+        let e = sb.expand(g).unwrap_err();
+        assert!(
+            e.starts_with("workload 0: include 'data'") && e.contains("already names"),
+            "{e}"
+        );
+        // No placement: a workload's modules run together.
+        let e = sb
+            .expand(workload_volume(
+                json!({"stack": "volume.yaml", "as": "data",
+                                           "node": "storage-1", "params": {"image": "d.img"}}),
+            ))
+            .unwrap_err();
+        assert!(
+            e.contains("`node` places an include on another node"),
+            "{e}"
+        );
+        // The node's network is not an instance name.
+        let e = sb
+            .expand(workload_volume(
+                json!({"stack": "volume.yaml", "as": "linux_net",
+                                           "params": {"image": "d.img"}}),
+            ))
+            .unwrap_err();
+        assert!(e.contains("node's network"), "{e}");
+        // An internal port is the stack's, in a workload as in a graph.
+        let mut g = workload_volume(json!({"stack": "volume.yaml", "as": "data",
+                                           "params": {"image": "d.img"}}));
+        g["workloads"][0]["wiring"] = json!([{"from": "data_disk.blocks", "to": "fs.blocks"}]);
+        let e = sb.expand(g).unwrap_err();
+        assert!(
+            e.starts_with("workload 0: wiring[0]") && e.contains("internal to include 'data'"),
+            "{e}"
+        );
+        // A graph-level include is not reachable from a workload's wiring:
+        // the workload's ends name its own modules (and the network).
+        let g = json!({
+            "include": [{"stack": "volume.yaml", "as": "data", "params": {"image": "d.img"}}],
+            "workloads": [{"modules": [{"name": "fs", "type": "fat32"}],
+                           "wiring": [{"from": "data.blocks", "to": "fs.blocks"}]}],
+        });
+        let g = sb.expand(g).unwrap();
+        assert_eq!(
+            edges(&g["workloads"][0]),
+            [("data.blocks".to_string(), "fs.blocks".to_string())],
+            "left as written, for the workload's own wiring check to refuse"
+        );
+    }
+
+    #[test]
+    fn a_workload_include_forwards_the_graphs_params_and_its_lanes_pass_through() {
+        let sb = Sandbox::new();
+        let graph = sb.path().join("w.yaml");
+        std::fs::write(
+            &graph,
+            "target: linux\nparams:\n  size: {type: integer, default: 1024, min: 512, max: \
+             2048}\nmodules: []\nworkloads:\n  - include:\n      - stack: volume.yaml\n        \
+             as: data\n        params:\n          image: d.img\n          block_size: \
+             ${param:size}\n    wiring:\n      - from: linux_net.net_out\n        to: \
+             data.lower\n",
+        )
+        .unwrap();
+        let g = load_graph(&graph, sb.path()).unwrap();
+        let w = &g["workloads"][0];
+        assert_eq!(module(w, "data_disk")["block_size"], 1024);
+        assert_eq!(
+            edges(w)[..2],
+            [
+                (
+                    "linux_net.net_out".to_string(),
+                    "data_disk.blocks".to_string()
+                ),
+                ("linux_net.net_out".into(), "data_seal.lower".into()),
+            ],
+            "an export fans out; the node's network end is left for the lane rule"
+        );
+    }
+
     // ── placement ──────────────────────────────────────────────────────
 
     #[test]
@@ -2529,6 +2727,19 @@ wiring:
         sb.expand_with_store(&mut graph, Some(&store_root)).unwrap();
         assert_eq!(module(&graph, "data_disk")["path"], "d.img");
         assert!(edges(&graph).contains(&("data_seal.blocks".into(), "fs.blocks".into())));
+
+        // A workload includes the pinned stack by name as a graph does.
+        let mut graph = json!({
+            "workloads": [{
+                "include": [{"stack": "volume", "as": "data", "params": {"image": "w.img"}}],
+                "modules": [{"name": "fs", "type": "fat32"}],
+                "wiring": [{"from": "data.blocks", "to": "fs.blocks"}],
+            }],
+        });
+        sb.expand_with_store(&mut graph, Some(&store_root)).unwrap();
+        let w = &graph["workloads"][0];
+        assert_eq!(module(w, "data_disk")["path"], "w.img");
+        assert!(edges(w).contains(&("data_seal.blocks".into(), "fs.blocks".into())));
     }
 
     #[test]

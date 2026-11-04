@@ -81,16 +81,25 @@ one session. The `session` output reports open while any session is.
 
 ## Resume
 
-With `resume` (on `net` or `mux`, not beside `exchange`) a session ending takes
-nothing with it. Across several sessions each peer's streams are its own —
+With `resume` (on `net` or `mux`) a session ending takes nothing with it. Across several sessions each peer's streams are its own —
 numbered, retained and resumed per peer, held by its verified identity (so
 `require_peer` is needed). A record written to a channel is retained for
 every peer whose streams are held (with `peer_tag`, the one its prefix
 names), and is taken off the input only once every one of them has room: a
-peer gone and not back holds the channel once its window is full. A new peer
-finding every slot held takes the slot of the peer gone longest whose
-records have all been delivered, and that peer's retained streams are given
-up (`peers_evicted`). Every record on every channel is numbered from 1 within
+peer gone holds the channel once its window is full, for at most
+`retain_ms`. A peer with no session for `retain_ms` (by default 30 × the
+larger of `keepalive_ms` and `redial_ms`, at least 30 s; 0 keeps it for
+ever) gives its slot and retained streams up (`peers_expired`): what was
+retained for it, and a record being taken for it, is counted `lost`, and the
+channel's input goes on to the peers still held — or, with none held, waits
+for the next. A new peer finding every slot held takes the slot of the peer
+gone longest whose records have all been delivered, and that peer's
+retained streams are given up (`peers_evicted`). A peer whose streams were
+given up either way and that comes back is served afresh: a slot of its
+own, this side's streams going on from the next record taken for it,
+numbered from the point it names (it never sees a record twice; the ones it
+missed were counted lost when its slot went), and its own retained records
+sent again from 1 (at least once, as across a restart). Every record on every channel is numbered from 1 within
 the sender's incarnation (16 random bytes drawn at construction) and kept
 in a retained window (`window` bytes per channel, four records at the
 channel's maximum by default) until the receiver's `ACK` says it arrived
@@ -113,6 +122,19 @@ every `keepalive_ms`; one that hears nothing for three of those is ended,
 and the next resumes it — a link that died without a close on this end
 cannot hold the one session for ever. A resume prints
 `[remote_channel] resumed: records going again=<n>`.
+
+Beside an exchange endpoint `resume` numbers, retains and resumes the
+`channels` entries — at least one — and never the endpoint's own two. An
+exchange is the requester's to issue again (the exchange contract's LINK),
+so a session that ends ends the exchanges it carried exactly as without
+`resume` ([Session loss](#session-loss)): the far side ABORTs each still
+open to the provider, the near side writes LINK DOWN and then UP once the
+next session opens, and the reissue is a new exchange to the provider. The
+channels beside it resume across the same reconnect, record for record. The
+endpoint's records are unnumbered `BEGIN`s inside the resume session, are
+never acknowledged, and its channels have no `next` in the `HELLO` trailer.
+One link therefore carries both a stream that must not lose a record and an
+exchange that must not be performed twice unknowingly.
 
 On `mux` each channel is a stream of the QUIC session and every stream's
 `HELLO` carries the same trailer, fixed when the session attached. The
@@ -191,7 +213,8 @@ channel's credit, like any mailbox record. The `HELLO` table carries the
 two entries and then the sender's side; a peer's table matches only when it
 states the same entries and the other side, so two `near` ends, or an
 endpoint against none, are refused as a table mismatch. `channels` may be
-empty when `exchange` is set, and holds at most six entries beside it.
+empty when `exchange` is set, and holds up to eight entries beside it: the
+endpoint's two have ports of their own and take no port pair.
 
 Each side keeps only the half of a mailbox channel's region its direction
 uses: the sending side a send stage (8192), the receiving side a ring and a
@@ -275,7 +298,7 @@ The exchange contract's LINK is the requester's whole account of a session.
 | `OPEN_EXCHANGES_MAX` | 256 on host-class targets, 32 on MCUs, across every session | a request HEAD past it is answered `503`, marked RAISED, and never reaches the provider; records that follow for it are dropped |
 | `SESSIONS_MAX` | 8 on host-class targets, 4 on MCUs | `sessions` past it is refused at construction |
 | record | the exchange contract's `RECORD_MAX` | a larger record is refused by the edge, never cut |
-| channels | six beside an endpoint | a longer table is refused at construction |
+| channels | `PORT_CHANNELS`, 8, beside an endpoint as without one (the table holds `MAX_CHANNELS`, 10) | a longer table is refused at construction |
 
 ### Counters
 
@@ -283,18 +306,21 @@ The exchange contract's LINK is the requester's whole account of a session.
 `x_aborted` (ABORTs written for exchanges a session left open),
 `x_discarded` (records an endpoint dropped as belonging to an ended
 exchange). Per instance: `sessions` (opened, ever), `sessions_replaced`,
-`sessions_refused`, `peers_evicted`; per channel `unrouted` (`peer_tag`
+`sessions_refused`, `peers_evicted`, `peers_expired`; per channel `unrouted` (`peer_tag`
 records whose prefix named no session) and `lost`.
 
 ## Limitations
 
-- `resume` is for channels without an exchange endpoint; across a peer's
-  restart it is at least once, not exactly once.
+- `resume` resumes the `channels` entries, never an exchange endpoint's: an
+  exchange a session leaves open ends with it and is issued again. Across a
+  peer's restart a resumed channel is at least once, not exactly once.
 - One exchange endpoint per instance, and one requester per near endpoint.
 - Several sessions are a `net` listener's; `mux` carries one.
 - Under `resume` across several sessions a peer that never returns holds a
-  channel's input once its retained window is full, until a new peer takes
-  its slot.
+  channel's input once its retained window is full, until `retain_ms`
+  passes or a new peer takes its slot; a peer back after that has lost what
+  it missed (counted), and what it had sent but not seen acknowledged
+  arrives again.
 - On `mux`, the endpoint's two channels are two streams; `quic` opens three
   at a time, so an endpoint leaves room for one more channel.
 - `fluxor build` and `--check` check what one graph shows: a wire naming a

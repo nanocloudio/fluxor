@@ -72,12 +72,36 @@ requires_contract = "trust"
 # anchor material crosses in either direction.
 access = "read"
 
+# Credentials named by path. `cert_file`, `key_file` and `trust` given as an
+# absolute path are read by the instance at runtime through the `fs`
+# contract (cred_file.rs), PEM or DER, so an image carries no credential and
+# no deployment's trust: on the Linux host a node graph reads the host's
+# paths, and a workload reads beneath its owner root and the volumes lent to
+# it — a lent credential volume. Until every named file is read the instance is not
+# ready: a server refuses handshakes before presenting anything and a client
+# answers a dial `EAGAIN`. An unreadable file is retried every second, a
+# malformed one is refused (logged once per content) and taken once fixed.
+# On aarch64 targets the files are re-read every 10 s and a changed set —
+# read the same twice running, validated whole — is installed between
+# handshakes, so rotated credentials take effect without a restart; a broken
+# rotation keeps the credentials in use. Elsewhere they are read once.
+# A grant, like `trust` below: a graph naming no path never calls it.
+[[resources]]
+requires_contract = "fs"
+access = "read"
+active_when_params = ["cert_file", "key_file", "trust"]
+
+# The build-time form, `${file:<path>}`, is for targets with no file surface
+# at runtime: the builder reads the file and embeds the chain, the key and
+# the anchors as extended tags 10, 11 and 12. A Linux image refuses it. A
+# credential has one source; a path beside an embedded blob for the same
+# credential refuses to construct.
+#
 # Trust anchors are the `trust` parameter (see `define_params!` in mod.rs):
-# a `${file:<path>}` source spec the build resolves to one certificate or
-# a bundle of up to MAX_ANCHORS (concatenated DER, or PEM) and embeds as
-# extended tag 12. A bundle is how a rotation is expressed — the outgoing
-# and incoming authorities side by side — and a chain signed by either
-# verifies. `fluxor run --ca` / `fluxor exec --ca` append an operator's
+# one certificate or a bundle of up to MAX_ANCHORS (concatenated DER, or
+# PEM), or `system`. A bundle is how an authority rotation is expressed —
+# the outgoing and incoming authorities side by side — and a chain signed by
+# either verifies. `fluxor run --ca` / `fluxor exec --ca` append an operator's
 # anchors under tag 16 to CLIENT-MODE instances only; a `verify_peer`
 # server is never widened. Both feed one table through one walk, and the
 # accepted-chain log line reports the count and the origin. `trust` is a
@@ -94,7 +118,9 @@ access = "read"
 
 # Application protocol (ALPN, RFC 7301): the `alpn` graph parameter — one
 # name or a list (`alpn: "h2"`, `alpn: ["h2", "http/1.1"]`), each 1..=16
-# printable bytes, 64 in all — embedded as extended tag 14. A client offers
+# printable bytes, 64 in all — packed comma-separated as schema param 26
+# (so `alpn: {env: NAME}` binds it too, the module holding a bound value to
+# the same rule and refusing to construct otherwise). A client offers
 # the names in that order; a server selects the first of ITS names the
 # client offered, and with none in common selects nothing and proceeds. A
 # client refuses a server selection it did not offer. Unset, both sides use

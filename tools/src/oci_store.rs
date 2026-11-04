@@ -73,6 +73,14 @@ pub const MT_FLUXOR_IMAGE: &str = "application/vnd.nanocloud.fluxor.image.v1";
 /// subgraph layer. Each module is a `MT_FLUXOR_MODULE` layer.
 pub const MT_FLUXOR_WORKLOAD_IMAGE: &str = "application/vnd.nanocloud.fluxor.workload-image.v1";
 pub const MT_FLUXOR_FLXA: &str = "application/vnd.nanocloud.fluxor.flxa.v1";
+/// A workload image's config blob: what a puller needs to know before it
+/// asks a node to run the image, as JSON — `env`, every param the image's
+/// graph binds to the workload's environment ([`WorkloadEnvBinding`]), so an
+/// orchestrator can refuse a pod that does not give a required name before
+/// the node's `CREATE` would. Content-addressed with the manifest, and read
+/// with one blob fetch after it ([`workload_image_config`]).
+pub const MT_FLUXOR_WORKLOAD_IMAGE_CONFIG: &str =
+    "application/vnd.nanocloud.fluxor.workload-image.config.v1+json";
 /// A workload-image module layer's FNV-1a name hash, as the FLXA names it.
 pub const ANN_MODULE_NAME_HASH: &str = "io.fluxor.module.name-hash";
 /// A workload image's module ABI (`aarch64`, …).
@@ -1079,6 +1087,60 @@ pub struct WorkloadModule {
     pub bytes: Vec<u8>,
 }
 
+/// One param a workload image's graph binds to the workload's environment
+/// (`{env: NAME}`), as `workload-image.json` lists it under `env` and the
+/// image's config blob carries it.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkloadEnvBinding {
+    /// The environment name (`NAME` of a `NAME=VALUE` entry).
+    pub name: String,
+    /// The module whose param it fills, as the graph names it.
+    pub module: String,
+    /// The param it fills.
+    pub param: String,
+    /// No entry for `name` refuses the `CREATE` (no default stands in).
+    pub required: bool,
+}
+
+/// A workload image's config blob ([`MT_FLUXOR_WORKLOAD_IMAGE_CONFIG`]).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkloadImageConfig {
+    /// Every env binding, in the order the image lists them.
+    #[serde(default)]
+    pub env: Vec<WorkloadEnvBinding>,
+}
+
+impl WorkloadImageConfig {
+    /// The names a pod must give, each once, in first-listed order.
+    pub fn required_env(&self) -> Vec<&str> {
+        let mut out: Vec<&str> = Vec::new();
+        for b in self.env.iter().filter(|b| b.required) {
+            if !out.contains(&b.name.as_str()) {
+                out.push(&b.name);
+            }
+        }
+        out
+    }
+}
+
+/// A workload image manifest's config ([`WorkloadImageConfig`]), read from
+/// its config blob. `None` for a manifest that is not a workload image's.
+pub fn workload_image_config(
+    store: &OciStore,
+    manifest: &ImageManifest,
+) -> Result<Option<WorkloadImageConfig>> {
+    if manifest.config.media_type != MT_FLUXOR_WORKLOAD_IMAGE_CONFIG {
+        return Ok(None);
+    }
+    let bytes = store.read_blob(&manifest.config.digest)?;
+    serde_json::from_slice(&bytes).map(Some).map_err(|e| {
+        Error::Config(format!(
+            "workload image config {}: {e}",
+            manifest.config.digest
+        ))
+    })
+}
+
 pub struct WorkloadImagePublish<'a> {
     pub name: &'a str,
     pub target: &'a str,
@@ -1086,6 +1148,8 @@ pub struct WorkloadImagePublish<'a> {
     pub abi_surface_hex: &'a str,
     pub flxa: &'a [u8],
     pub modules: &'a [WorkloadModule],
+    /// The image's env bindings, carried in its config blob.
+    pub env: &'a [WorkloadEnvBinding],
     pub provenance: &'a str,
     pub source_rev: Option<&'a str>,
     pub ref_name: &'a str,
@@ -1095,13 +1159,20 @@ pub struct WorkloadImagePublish<'a> {
 /// the order the image lists them. A module layer's digest is the sha256 of
 /// its `.fmod` bytes, which is the pin a node's kernel admits it by — so a
 /// node pins exactly what the manifest names, and a registry stores a module
-/// shared by many images once.
+/// shared by many images once. The config is a [`WorkloadImageConfig`]
+/// ([`MT_FLUXOR_WORKLOAD_IMAGE_CONFIG`]): the image's env bindings, so a
+/// puller learns the names a pod must give from the manifest and one blob,
+/// before it asks a node.
 pub fn publish_workload_image(
     store: &OciStore,
     a: &WorkloadImagePublish<'_>,
 ) -> Result<Descriptor> {
     let _index_lock = store.lock_index()?;
-    let (config_digest, config_size) = store.put_blob(EMPTY_CONFIG)?;
+    let config = serde_json::to_vec(&WorkloadImageConfig {
+        env: a.env.to_vec(),
+    })
+    .map_err(|e| Error::Config(format!("workload image config: {e}")))?;
+    let (config_digest, config_size) = store.put_blob(&config)?;
     let mut layers = Vec::with_capacity(a.modules.len() + 1);
     let (fd, fsz) = store.put_blob(a.flxa)?;
     layers.push(Descriptor {
@@ -1133,7 +1204,7 @@ pub fn publish_workload_image(
         media_type: MT_OCI_MANIFEST.into(),
         artifact_type: Some(MT_FLUXOR_WORKLOAD_IMAGE.into()),
         config: Descriptor {
-            media_type: MT_OCI_EMPTY.into(),
+            media_type: MT_FLUXOR_WORKLOAD_IMAGE_CONFIG.into(),
             digest: config_digest,
             size: config_size,
             annotations: Annotations::new(),
@@ -2916,6 +2987,76 @@ mod tests {
             d1,
             "sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
         );
+    }
+
+    /// A workload image's config blob carries its env bindings, so a puller
+    /// reads the names a pod must give from the manifest and one blob; an
+    /// image that binds none carries an empty list, and a manifest that is
+    /// not a workload image's has no workload config.
+    #[test]
+    fn a_workload_image_config_carries_its_env_bindings() {
+        let (_dir, store) = temp_store();
+        let modules = [WorkloadModule {
+            name: "probe".into(),
+            name_hash: 0x1234_5678,
+            bytes: b"FMOD-probe".to_vec(),
+        }];
+        let bind = |name: &str, param: &str, required: bool| WorkloadEnvBinding {
+            name: name.into(),
+            module: "probe".into(),
+            param: param.into(),
+            required,
+        };
+        let env = [
+            bind("TOKEN", "token", true),
+            bind("PORT", "port", false),
+            bind("TOKEN", "token_copy", true),
+        ];
+        let publish = |env: &[WorkloadEnvBinding], tag: &str| {
+            publish_workload_image(
+                &store,
+                &WorkloadImagePublish {
+                    name: "probe",
+                    target: "linux",
+                    module_abi: "aarch64",
+                    abi_surface_hex: "00",
+                    flxa: b"FLXA",
+                    modules: &modules,
+                    env,
+                    provenance: PROVENANCE_LOCAL,
+                    source_rev: None,
+                    ref_name: tag,
+                },
+            )
+            .expect("publish")
+        };
+        let desc = publish(&env, "probe:1");
+        let m = store.read_manifest(&desc).unwrap();
+        assert_eq!(m.config.media_type, MT_FLUXOR_WORKLOAD_IMAGE_CONFIG);
+        assert_eq!(m.artifact_type.as_deref(), Some(MT_FLUXOR_WORKLOAD_IMAGE));
+        let raw: serde_json::Value =
+            serde_json::from_slice(&store.read_blob(&m.config.digest).unwrap()).unwrap();
+        assert_eq!(raw["env"][0]["name"], "TOKEN");
+        assert_eq!(raw["env"][0]["required"], true);
+        assert_eq!(raw["env"][1]["param"], "port");
+        let cfg = workload_image_config(&store, &m)
+            .unwrap()
+            .expect("a workload image");
+        assert_eq!(cfg.env, env);
+        assert_eq!(cfg.required_env(), ["TOKEN"]);
+
+        let none = publish(&[], "probe:2");
+        let m = store.read_manifest(&none).unwrap();
+        let cfg = workload_image_config(&store, &m).unwrap().unwrap();
+        assert!(cfg.env.is_empty() && cfg.required_env().is_empty());
+        assert_ne!(
+            none.digest, desc.digest,
+            "the env list is part of the image"
+        );
+
+        let module = publish_test_module(&store, "blinky", b"FMOD-bytes", "blinky:1");
+        let m = store.read_manifest(&module).unwrap();
+        assert!(workload_image_config(&store, &m).unwrap().is_none());
     }
 
     fn publish_test_module(store: &OciStore, name: &str, bytes: &[u8], tag: &str) -> Descriptor {

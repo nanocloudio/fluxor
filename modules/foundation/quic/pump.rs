@@ -1501,6 +1501,7 @@ fn learn_peer_address(conn: &mut QuicConnection) {
 }
 
 unsafe fn pump_recv_certificate(s: &mut QuicState, idx: usize) -> bool {
+    let trust_epoch = s.trust_epoch;
     // Capture the verify-peer config before borrowing the connection
     // mutably.
     let verify_peer = s.verify_peer != 0;
@@ -1572,6 +1573,9 @@ unsafe fn pump_recv_certificate(s: &mut QuicState, idx: usize) -> bool {
             &expected_ip[..ip_len],
             Some(&mut deferred),
         );
+        // The anchors read from `trust` may be replaced while the links
+        // step; a link then reads no key (`selected_anchor`).
+        deferred.generation = trust_epoch;
         conn.driver.deferred_links = deferred;
         if rc != 0 {
             let mut buf = [0u8; 48];
@@ -1656,7 +1660,7 @@ unsafe fn pump_rsa_verify(s: &mut QuicState, idx: usize) -> bool {
     } else {
         s.rsa_rows_per_step as usize
     };
-    let selected = selected_anchor(s, s.conns[idx].driver.deferred_links.anchor);
+    let selected = selected_anchor(s, &s.conns[idx].driver.deferred_links);
     let anchor = core::slice::from_raw_parts(selected.as_ptr(), selected.len());
     let job: *mut RsaVerifyJob = &mut s.rsa_verify;
     let ec_bits = ladder_bits_per_step(s);

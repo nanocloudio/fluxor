@@ -154,7 +154,7 @@ pub const WORKLOAD_SECTION_MAGIC: u32 = 0x4658_5044;
 pub const MAX_ADD_MODULES: usize = 64;
 /// Largest edge count one `apply_add` admits — mirrors
 /// `kernel::exec::scheduler::live::MAX_ADD_EDGES`.
-pub const MAX_ADD_EDGES: usize = 128;
+pub const MAX_ADD_EDGES: usize = 192;
 /// Largest resident-workload section the kernel will map — mirrors
 /// `kernel::boot::config::MAX_WORKLOAD_SECTION_BYTES`. The encoder rejects
 /// output beyond this so a config that builds always admits ALL its workloads

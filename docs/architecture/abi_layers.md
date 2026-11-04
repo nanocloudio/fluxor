@@ -172,7 +172,7 @@ workload as one. The graph backend refuses a subgraph any of whose modules
 holds a permission other than `observe`, or is a `Protocol` module (which
 runs at `CAP_FULL` and so passes every permission check), with `EACCES`,
 checked before anything is allocated. One subgraph holds at most 64
-modules and 128 edges (`MAX_ADD_MODULES`, `MAX_ADD_EDGES`); the build
+modules and 192 edges (`MAX_ADD_MODULES`, `MAX_ADD_EDGES`); the build
 refuses a workload past either.
 
 A workload's `CREATE` header carries its quotas: `memory_bytes` for its

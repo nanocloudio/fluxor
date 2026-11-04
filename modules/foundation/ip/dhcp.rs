@@ -39,8 +39,15 @@ pub const DHCP_MAGIC: [u8; 4] = [99, 130, 83, 99];
 // Discovering  | timeout              | Discovering   | retransmit
 // Requesting   | recv ACK             | Bound         | apply config
 // Requesting   | recv NAK             | Discovering   | restart
-// Requesting   | timeout              | Discovering   | restart
-// Bound        | lease expires        | Discovering   | renew
+// Requesting   | timeout              | Requesting    | retransmit
+// Requesting   | REQUEST_RETRIES out  | Discovering   | restart
+// Bound        | T1, then T2         | Bound         | renew (again by halves)
+// Bound        | lease expires        | Discovering   | restart
+//
+// Every timer is wall-clock milliseconds (`TIMER::MILLIS`), never steps: a
+// module's step rate is the graph's tick and the scheduler's to vary, and a
+// lease is seconds. Retransmission is RFC 2131 §4.1's: the first after 4 s,
+// each wait doubled up to 64 s, each randomised by ±1 s.
 //
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -49,6 +56,36 @@ pub enum DhcpState {
     Discovering = 1,
     Requesting = 2,
     Bound = 3,
+}
+
+/// The wait before a message's first retransmission (RFC 2131 §4.1).
+pub const RETX_FIRST_MS: u32 = 4_000;
+/// The longest wait between retransmissions (RFC 2131 §4.1).
+pub const RETX_MAX_MS: u32 = 64_000;
+/// The randomisation of every wait, either way (RFC 2131 §4.1).
+pub const RETX_JITTER_MS: u32 = 1_000;
+/// Retransmissions of a REQUEST before the client starts over with a
+/// DISCOVER (RFC 2131 §4.4.1): 4 s, 8 s, 16 s and 32 s, a minute in all. A
+/// DISCOVER is retransmitted for as long as no OFFER comes.
+pub const REQUEST_RETRIES: u8 = 4;
+/// The shortest wait between renewal REQUESTs (RFC 2131 §4.4.5).
+pub const RENEW_MIN_MS: u64 = 60_000;
+
+/// The wait after `wait_ms` (the next one, doubled and capped).
+pub const fn next_wait(wait_ms: u32) -> u32 {
+    let d = wait_ms.saturating_mul(2);
+    if d > RETX_MAX_MS {
+        RETX_MAX_MS
+    } else {
+        d
+    }
+}
+
+/// `wait_ms` randomised by `r`, a uniform byte: `wait_ms - RETX_JITTER_MS`
+/// to `wait_ms + RETX_JITTER_MS`.
+pub const fn jittered(wait_ms: u32, r: u8) -> u32 {
+    let span = 2 * RETX_JITTER_MS;
+    (wait_ms - RETX_JITTER_MS) + (span * r as u32) / 255
 }
 
 /// DHCP client data
@@ -61,18 +98,23 @@ pub struct DhcpClient {
     pub gateway: u32,
     pub dns_server: u32,
     pub lease_time: u32,
-    /// Timer for retransmits/renewals (in step counts)
-    pub timer: u32,
-    /// Retry count
+    /// When the message last sent is sent again, by `TIMER::MILLIS`.
+    pub retx_at_ms: u64,
+    /// The wait before that retransmission, before its randomisation:
+    /// [`RETX_FIRST_MS`] doubled per retransmission up to [`RETX_MAX_MS`].
+    pub retx_wait_ms: u32,
+    /// Retransmissions of the current message.
     pub retries: u8,
     /// Expected DHCP server IP (0 = accept any)
     pub expected_server: u32,
-    /// Lease tracking: step_count when ACK received
-    pub lease_start: u32,
-    /// Lease duration in step ticks (converted from seconds)
-    pub lease_duration: u32,
+    /// When the lease was bound, by `TIMER::MILLIS`.
+    pub lease_start_ms: u64,
+    /// The lease's length in milliseconds (its seconds, from the ACK).
+    pub lease_ms: u64,
     /// Whether renewal REQUEST has been sent
     pub renew_sent: bool,
+    /// When a renewal REQUEST is next due, by `TIMER::MILLIS` (0: at T1).
+    pub renew_at_ms: u64,
 }
 
 impl DhcpClient {
@@ -86,12 +128,14 @@ impl DhcpClient {
             gateway: 0,
             dns_server: 0,
             lease_time: 0,
-            timer: 0,
+            retx_at_ms: 0,
+            retx_wait_ms: RETX_FIRST_MS,
             retries: 0,
             expected_server: 0,
-            lease_start: 0,
-            lease_duration: 0,
+            lease_start_ms: 0,
+            lease_ms: 0,
             renew_sent: false,
+            renew_at_ms: 0,
         }
     }
 }

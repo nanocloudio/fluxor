@@ -208,7 +208,11 @@ under the reserved params tag `0xED`, in the param's place:
 param's (`u8`, `u16`, `u32`, `str`, `str_chunked`), the flags `REQUIRED` or
 `DEFAULT`, and a default is an integer's little-endian bytes or a string's
 bytes. `workload-image.json` lists every binding under `env` (`name`,
-`module`, `param`, `required`). No other build accepts a binding: nothing
+`module`, `param`, `required`), and `fluxor publish workload` carries the
+list in the image's config blob (`{"env": [...]}`,
+`application/vnd.nanocloud.fluxor.workload-image.config.v1+json`), so an
+orchestrator that pulls the image refuses a workload missing a required name
+before the `CREATE` would. No other build accepts a binding: nothing
 else is created with an environment. `${NAME}` stays refused everywhere
 (a graph is never read against the build host's environment); a binding
 names the workload's own, explicitly.
@@ -226,6 +230,15 @@ still carry a record (`EINVAL`), so a module never sees one. The spec
 digest a staged `CREATE` is continued by covers the options, so every
 continuation carries the same environment.
 
+Only a schema param binds, so whatever a module should take per placement
+is one. tls's and quic's peer names are: `verify_hostname`, `verify_uri`
+(tls) and `alpn` are schema strings beside `cert_file`, `key_file` and
+`trust`, so one image serves every cell with
+`verify_uri: {env: PEER_URI}`. The builder holds a literal to the module's
+rule (a well-formed URI, a hostname of at most 64 bytes, an ALPN list of
+whole names); the module holds a bound value to the same rule and refuses
+to construct on one that breaks it, rather than truncating or dropping it.
+
 ### Volumes lent to a workload
 
 Source: `modules/sdk/contracts/workload.rs` (`volume`),
@@ -241,6 +254,37 @@ owner; the owner's release closes it and leaves its directory as it was.
 At most 16 per workload. A node that does not lend volumes does not list
 the entry in `CAPS`, and a required entry it does not list fails the
 `CREATE` with `ENOSYS`, so an orchestrator marks every volume required.
+
+### A workload's own vault
+
+Source: `modules/sdk/contracts/workload.rs` (`vault`),
+`src/platform/linux/owner_root.rs` (`set_vault`),
+`src/kernel/security/key_vault.rs` (`Scope`, `Keeper`)
+
+A workload's labelled keys are its own whatever it brings: a label lives in
+its module type's namespace within its owner's realm, the workload's
+durable owner uid, so two workloads running one module type, and a workload
+and the node, never reach each other's labels (a token's labels name a
+module type and nothing narrower, so a workload's labels are the software
+vault's alone). Kept in the node's store, under the node's sealing key and
+bound to the realm, they stay with the node.
+
+The Tier-2 entry `vault`/`store`, `<dir>\0<seal_key>`, gives the workload
+a vault of its own on Linux: `dir` lies in one of its writable volumes (made
+when absent), `seal_key` is 64 hex digits its owner supplies. Every key a
+module of the workload persists by label is sealed with ChaCha20-Poly1305
+under `seal_key` and kept as one file per label in `dir`, and nothing of it
+is in the node's store: the keys follow the volume and the seal key. The
+same volume and seal key given to a workload on another node open the same
+keys; a record that does not open under the key given is refused `EACCES`,
+never written over by a fresh key. Such a key's custody is `SOFTWARE`
+(`DESCRIBE`) whatever the node's sealing key is worth: whoever holds the
+volume and the seal key holds the key, which is the point of keeping it
+there, and the trade against a node-held key a device-unique seal or a
+token would bind to the node. One vault per workload; `dir` outside a lent
+volume, or in a read-only one, refuses the `CREATE`. The graph backend lists
+the entry in `CAPS`; a host process (which reaches no kernel vault) and a
+metal node do not, and answer a required entry `ENOSYS`.
 
 ## Where tier is declared
 

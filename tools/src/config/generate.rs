@@ -439,9 +439,26 @@ fn generate_config_impl(
             // hear.
             // A check without the key file (`params::checking`) cannot
             // classify a key it does not have; the build that has it does.
+            // Only the embedded form is read here: a key named by a bare
+            // path is the module's to read, and to refuse, at runtime.
+            // A workload's modules are judged where its workload is built
+            // (`build_workloads_counted`), against what serves a workload.
+            if i < module_list.len() {
+                let fs_served = fs_reachable(runtime, ProviderCaller::Node)
+                    || manifests
+                        .values()
+                        .any(|mm| mm.provides.iter().any(|p| surface_contract(p) == "fs"));
+                refuse_credential_forms(
+                    m,
+                    Some(runtime),
+                    fs_served,
+                    &format!("modules[{i}] ({name})"),
+                )?;
+            }
             if let Some(key_path) = m
                 .get("key_file")
                 .and_then(|v| v.as_str())
+                .and_then(crate::trust_anchors::file_source)
                 .filter(|p| check_stand_in(p, "key_file").is_none())
             {
                 let der = crate::trust_anchors::read_der_file(
@@ -1560,7 +1577,8 @@ fn heap_per_demand_report(
 /// list. Each workload is a self-contained subgraph:
 /// modules referenced by `name_hash` (FNV-1a of type) with inline-TLV params (the
 /// same `build_params_from_schema` packing base modules use), and optional
-/// intra-workload `wiring:` (`from`/`to` by workload-local module name). Cross-workload edges
+/// intra-workload `wiring:` (`module.port` ends among the workload's modules, the node's
+/// network as `linux_net`, see [`workload_edges`]). Cross-workload edges
 /// are refused (strict isolation). Returns an empty Vec with no workloads.
 #[cfg(test)]
 fn build_workload_section(
@@ -1575,7 +1593,7 @@ fn build_workload_section(
     crate::add_subgraph::encode_workload_section(&workloads).map_err(Error::Config)
 }
 
-use crate::add_subgraph::WorkloadEnd;
+use crate::add_subgraph::{WorkloadEdge, WorkloadEnd};
 
 /// The graph's `workloads:` section, each as the subgraph the kernel admits
 /// (`add_subgraph::Workload`): modules by name_hash with their params, and
@@ -1598,6 +1616,57 @@ pub fn build_workloads(
     let plan = heap_plan(target, config, &demand);
     apply_heap_plan(&plan, &heaps, &mut [], &mut workloads)?;
     Ok(workloads)
+}
+
+/// Whether the platform of `runtime` answers `caller`'s `fs` calls.
+fn fs_reachable(runtime: &str, caller: ProviderCaller) -> bool {
+    platform_contracts(runtime, caller).is_some_and(|c| c.contains(&"fs"))
+}
+
+/// Refuse a credential form the instance could not use where it runs.
+///
+/// `cert_file`, `key_file` and `trust` written `${file:<path>}` are embedded
+/// at build. An image for the Linux runtime refuses that form: there the
+/// module reads its credentials at runtime from the file surface it is
+/// given (the host's paths for a node graph, a workload's root and lent
+/// volumes), so the image carries no credential and no deployment's trust,
+/// and a build reads nothing. Elsewhere the embedded form is how a target
+/// with no file surface at runtime is given its credentials, and a bare
+/// path — read at runtime through `fs` — is refused when nothing serves
+/// `fs` to the instance (`fs_served`), since it could never be read.
+pub(crate) fn refuse_credential_forms(
+    module: &Value,
+    runtime: Option<&str>,
+    fs_served: bool,
+    label: &str,
+) -> Result<()> {
+    let Some(runtime) = runtime else {
+        return Ok(());
+    };
+    for key in CREDENTIAL_KEYS {
+        let Some(spec) = module.get(key).and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if let Some(path) = crate::trust_anchors::file_source(spec) {
+            if runtime == "linux" {
+                return Err(Error::Config(format!(
+                    "{label}: {key} \"{spec}\" embeds a build-host file, and a Linux image takes \
+                     its credentials at runtime: write the path bare (`{key}: {path}`) for the \
+                     module to read where it runs, or bind it (`{key}: {{env: NAME}}`)"
+                )));
+            }
+            continue;
+        }
+        let runtime_path = spec.starts_with('/');
+        if runtime_path && !fs_served {
+            return Err(Error::Config(format!(
+                "{label}: {key} \"{spec}\" is read at runtime through the `fs` contract, and \
+                 nothing serves `fs` to this instance on {runtime}: embed the file at build \
+                 (`{key}: \"${{file:{spec}}}\"`), or give the graph an `fs` provider"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// The workloads [`build_workloads`] builds, packed under a counting
@@ -1681,9 +1750,22 @@ fn build_workloads_counted(
                     ))
                 })?;
             let mtype = m.get("type").and_then(|v| v.as_str()).unwrap_or(mname);
+            refuse_credential_forms(
+                m,
+                runtime,
+                runtime.is_some_and(|r| fs_reachable(r, ProviderCaller::Workload)),
+                &format!("workload {pi} module '{mname}'"),
+            )?;
             // PIC-only: the FLXA workload codec admits modules via the loader by
             // name_hash; a built-in has no .fmod and apply_add cannot decode it.
             if crate::modules::is_builtin_module(mtype) {
+                if WORKLOAD_NET_ENDS.contains(&mtype) {
+                    return Err(Error::Config(format!(
+                        "workload {pi} module '{mname}': `{mtype}` is the node's network, not a \
+                         module of the workload — drop the entry; the workload's wires to \
+                         `{mtype}.net_in` and from `{mtype}.net_out` are its lanes"
+                    )));
+                }
                 return Err(Error::Config(format!(
                     "workload {pi} module '{mtype}' is a kernel built-in; resident workloads are PIC-only \
                      (no .fmod for apply_add to load). Use a PIC module, or place it in the base graph."
@@ -1757,6 +1839,10 @@ fn build_workloads_counted(
             refuse_workload_node_keys(m, param_schema.as_ref(), pi, mname)?;
             let integers = integer_params(param_schema.as_ref());
             let params = if let Some(param_schema) = param_schema {
+                // tls / quic peer names: checked and packed as a base
+                // graph's are, an `{env: NAME}` binding left for CREATE.
+                let declares = |key: &str| param_schema.find(key).is_some();
+                let m = &normalize_peer_names(mname, mtype, m.clone(), declares)?;
                 pack_params_growing(m, &param_schema, data_section, mtype)?
             } else {
                 Vec::new()
@@ -1815,80 +1901,53 @@ fn build_workloads_counted(
             Error::Config(why) => Error::Config(format!("workload {pi}: {why}")),
             other => other,
         })?;
-        let mut edges = Vec::new();
-        if let Some(wiring) = workload_yaml.get("wiring").and_then(|w| w.as_array()) {
-            for (ei, e) in wiring.iter().enumerate() {
-                // An end is one of the workload's modules, or `net:<key>` —
-                // the node's network through a lane of the workload's own.
-                let resolve = |key: &str| -> Result<WorkloadEnd> {
-                    let n = e.get(key).and_then(|v| v.as_str()).ok_or_else(|| {
-                        Error::Config(format!(
-                            "workload {pi} wiring {ei}: `{key}` must be a module name or net:<key>"
-                        ))
-                    })?;
-                    if let Some(k) = n.strip_prefix("net:") {
-                        // Decimal digits only (no sign, no hex): the kernel
-                        // decodes a key as 0..=255.
-                        let bad = || {
-                            Error::Config(format!(
-                                "workload {pi} wiring {ei}: `{n}`: a net lane key is decimal 0..=255"
-                            ))
-                        };
-                        if k.is_empty() || k.len() > 3 || !k.bytes().all(|c| c.is_ascii_digit()) {
-                            return Err(bad());
-                        }
-                        return k.parse::<u8>().map(WorkloadEnd::Net).map_err(|_| bad());
-                    }
-                    name_to_local.get(n).copied().map(WorkloadEnd::Local).ok_or_else(|| {
-                        Error::Config(format!(
-                            "workload {pi} wiring {ei}: unknown module `{n}` (cross-workload edges are not \
-                             supported — workloads are self-contained; the node's network is `net:<key>`)"
-                        ))
-                    })
-                };
-                let from = resolve("from")?;
-                let to = resolve("to")?;
-                // The domain check applies between two of the workload's
-                // modules; a lane has no domain of its own.
-                let (from_local, to_local) = match (from, to) {
-                    (WorkloadEnd::Local(f), WorkloadEnd::Local(t)) => (f, t),
-                    (WorkloadEnd::Local(l), WorkloadEnd::Net(_))
-                    | (WorkloadEnd::Net(_), WorkloadEnd::Local(l)) => (l, l),
-                    (WorkloadEnd::Net(_), WorkloadEnd::Net(_)) => {
-                        return Err(Error::Config(format!(
-                            "workload {pi} wiring {ei}: a net lane connects to a module of the workload, not to another lane"
-                        )))
-                    }
-                };
-                // Reject cross-domain workload edges. On bcm2712 a cross-domain
-                // edge needs the SPSC bridge provisioned at boot (base edges get
-                // it before workload admission, bcm2712.rs); `apply_add` opens an
-                // ordinary channel, so a cross-domain workload edge would silently lose
-                // the bridge. Workload admission provisions none, so workload wiring
-                // is intra-domain on every target (self-contained workloads).
-                let from_dom = modules[from_local as usize].domain_id;
-                let to_dom = modules[to_local as usize].domain_id;
-                if from_dom != to_dom {
-                    return Err(Error::Config(format!(
-                        "workload {pi} wiring {ei}: cross-domain edge (domain {from_dom} → {to_dom}) is \
-                         not supported — a cross-domain edge needs an SPSC bridge, and workload \
-                         admission provisions none (notably on bcm2712). Keep workload modules \
-                         that are wired together in the same domain."
-                    )));
-                }
-                edges.push(crate::add_subgraph::WorkloadEdge {
-                    from,
-                    from_port: e.get("from_port").and_then(|v| v.as_u64()).unwrap_or(0) as u8,
-                    to,
-                    to_port: e.get("to_port").and_then(|v| v.as_u64()).unwrap_or(0) as u8,
-                    buffer_bytes: e.get("buffer_bytes").and_then(|v| v.as_u64()).unwrap_or(0)
-                        as u32,
-                });
+        // `wiring:` is the graph syntax: `module.port` (a bare `module` is
+        // its first output in `from:`, its first input in `to:`), resolved
+        // against the module's manifest. The node's network is the platform
+        // provider a base graph names, `linux_net` (or `ip`), which a
+        // workload does not declare: each module wired to it gets a lane of
+        // its own, keyed in the order the wiring first names the module —
+        // its edge from `linux_net.net_out` is the lane's events, its edge
+        // to `linux_net.net_in` the lane's commands.
+        let wiring = match workload_yaml.get("wiring") {
+            None | Some(Value::Null) => Vec::new(),
+            Some(Value::Array(w)) => w.clone(),
+            Some(_) => {
+                return Err(Error::Config(format!(
+                    "workload {pi}: `wiring` must be a list"
+                )))
+            }
+        };
+        let edges = workload_edges(pi, &wiring, &name_to_local, &local_names, &local_manifests)?;
+        for e in &edges {
+            // The domain check applies between two of the workload's
+            // modules; a lane has no domain of its own.
+            let (from_local, to_local) = match (e.from, e.to) {
+                (WorkloadEnd::Local(f), WorkloadEnd::Local(t)) => (f, t),
+                (WorkloadEnd::Local(l), WorkloadEnd::Net(_))
+                | (WorkloadEnd::Net(_), WorkloadEnd::Local(l)) => (l, l),
+                // Refused by `workload_edges`.
+                (WorkloadEnd::Net(_), WorkloadEnd::Net(_)) => continue,
+            };
+            // Reject cross-domain workload edges. On bcm2712 a cross-domain
+            // edge needs the SPSC bridge provisioned at boot (base edges get
+            // it before workload admission, bcm2712.rs); `apply_add` opens an
+            // ordinary channel, so a cross-domain workload edge would silently lose
+            // the bridge. Workload admission provisions none, so workload wiring
+            // is intra-domain on every target (self-contained workloads).
+            let from_dom = modules[from_local as usize].domain_id;
+            let to_dom = modules[to_local as usize].domain_id;
+            if from_dom != to_dom {
+                return Err(Error::Config(format!(
+                    "workload {pi}: edge {} -> {}: cross-domain edge (domain {from_dom} → {to_dom}) is \
+                     not supported — a cross-domain edge needs an SPSC bridge, and workload \
+                     admission provisions none (notably on bcm2712). Keep workload modules \
+                     that are wired together in the same domain.",
+                    local_names[from_local as usize], local_names[to_local as usize],
+                )));
             }
         }
-        // Each net lane key names exactly one edge into the lane (a module's
-        // commands) and one out of it (its events) — the kernel's rule,
-        // refused here by key rather than at the node's CREATE.
+        // The kernel's lane rule, checked again on the encoded edges.
         crate::add_subgraph::check_net_lanes(&edges)
             .map_err(|why| Error::Config(format!("workload {pi}: {why}")))?;
         let state_cap = workload_yaml
@@ -1919,6 +1978,154 @@ fn build_workloads_counted(
     Ok((workloads, demand, heaps))
 }
 
+/// The node's network as a workload's `wiring:` names it
+/// ([`fluxor_tools::stack::WORKLOAD_NET_ENDS`]). A workload never declares
+/// it: its modules reach the network through lanes of their own.
+const WORKLOAD_NET_ENDS: &[&str] = fluxor_tools::stack::WORKLOAD_NET_ENDS;
+
+/// One end of a workload wire as written.
+enum WireEnd {
+    /// One of the workload's modules and the port byte FLXA carries for it
+    /// (an input's index; a control input's with `CTRL_PORT_BIT`).
+    Module(u8, u8),
+    /// The node's network.
+    Net,
+}
+
+/// The FLXA control-input bit on an edge's `to_port`
+/// (`kernel::exec::scheduler::live::CTRL_PORT_BIT`).
+const WORKLOAD_CTRL_PORT_BIT: u8 = 0x80;
+
+/// A workload's `wiring:` as the edges FLXA carries. Ends are written as a
+/// graph writes them — `module.port`, resolved against the module's
+/// manifest, or a bare `module` (its first output in `from:`, first input
+/// in `to:`). An end naming the node's network ([`WORKLOAD_NET_ENDS`]) is a
+/// lane: every module wired to it gets one of its own, keyed in the order
+/// the wiring first names the module, and is wired to it exactly once each
+/// way — `linux_net.net_out -> <module>.<port>` (the lane's events) and
+/// `<module>.<port> -> linux_net.net_in` (its commands).
+fn workload_edges(
+    pi: usize,
+    wiring: &[Value],
+    name_to_local: &HashMap<String, u8>,
+    local_names: &[String],
+    manifests: &HashMap<String, Manifest>,
+) -> Result<Vec<WorkloadEdge>> {
+    let mut lanes: Vec<u8> = Vec::new();
+    let mut edges = Vec::new();
+    for (ei, e) in wiring.iter().enumerate() {
+        let at = |why: String| Error::Config(format!("workload {pi} wiring {ei}: {why}"));
+        for key in ["from_port", "to_port"] {
+            if e.get(key).is_some() {
+                return Err(at(format!(
+                    "`{key}` is not a wiring key: name the port as a graph does \
+                     (`from: <module>.<port>`, `to: <module>.<port>`)"
+                )));
+            }
+        }
+        let end = |key: &str, is_from: bool| -> Result<WireEnd> {
+            let spec = e
+                .get(key)
+                .and_then(Value::as_str)
+                .ok_or_else(|| at(format!("`{key}` must be `<module>.<port>` or `<module>`")))?;
+            if spec.starts_with("net:") {
+                return Err(at(format!(
+                    "`{spec}`: the node's network is the platform's `linux_net` — wire \
+                     `linux_net.net_out` to the module's input and its output to \
+                     `linux_net.net_in`; each module wired so gets a lane of its own"
+                )));
+            }
+            let module = spec.split('.').next().unwrap_or(spec).trim();
+            if let Some(&local) = name_to_local.get(module) {
+                let (_, direction, index) =
+                    resolve_port_spec(spec, is_from, manifests, local_names)
+                        .map_err(|why| at(format!("{key} `{spec}`: {why}")))?;
+                if index >= WORKLOAD_CTRL_PORT_BIT {
+                    return Err(at(format!(
+                        "{key} `{spec}`: port index {index} is past what an edge carries"
+                    )));
+                }
+                let port = if !is_from && direction == 2 {
+                    index | WORKLOAD_CTRL_PORT_BIT
+                } else {
+                    index
+                };
+                return Ok(WireEnd::Module(local, port));
+            }
+            if WORKLOAD_NET_ENDS.contains(&module) {
+                let port = spec.split_once('.').map(|(_, p)| p.trim());
+                let lane_port = if is_from { "net_out" } else { "net_in" };
+                if port.is_some_and(|p| p != lane_port) {
+                    return Err(at(format!(
+                        "{key} `{spec}`: a workload reaches the node's network through its lane \
+                         alone — `{module}.net_out` in `from:`, `{module}.net_in` in `to:`"
+                    )));
+                }
+                return Ok(WireEnd::Net);
+            }
+            let hint = crate::target::closest_match(module, local_names, 3)
+                .map(|s| format!(" Did you mean '{s}'?"))
+                .unwrap_or_default();
+            Err(at(format!(
+                "{key} `{spec}`: unknown module `{module}`.{hint} A workload's wiring names \
+                 its own modules, and the node's network as `linux_net` (cross-workload \
+                 edges are not supported — workloads are self-contained)"
+            )))
+        };
+        let from = end("from", true)?;
+        let to = end("to", false)?;
+        let mut lane = |local: u8| -> Result<u8> {
+            let key = match lanes.iter().position(|&l| l == local) {
+                Some(k) => k,
+                None => {
+                    lanes.push(local);
+                    lanes.len() - 1
+                }
+            };
+            u8::try_from(key)
+                .map_err(|_| at("more than 256 modules are wired to the node's network".into()))
+        };
+        let (from, from_port, to, to_port) = match (from, to) {
+            (WireEnd::Module(f, fp), WireEnd::Module(t, tp)) => {
+                (WorkloadEnd::Local(f), fp, WorkloadEnd::Local(t), tp)
+            }
+            (WireEnd::Net, WireEnd::Module(t, tp)) => {
+                (WorkloadEnd::Net(lane(t)?), 0, WorkloadEnd::Local(t), tp)
+            }
+            (WireEnd::Module(f, fp), WireEnd::Net) => {
+                (WorkloadEnd::Local(f), fp, WorkloadEnd::Net(lane(f)?), 0)
+            }
+            (WireEnd::Net, WireEnd::Net) => {
+                return Err(at(
+                    "the node's network connects to a module of the workload, not to itself".into(),
+                ))
+            }
+        };
+        edges.push(WorkloadEdge {
+            from,
+            from_port,
+            to,
+            to_port,
+            buffer_bytes: e.get("buffer_bytes").and_then(Value::as_u64).unwrap_or(0) as u32,
+        });
+    }
+    // The kernel's lane rule, said of the module it binds: one edge each
+    // way between a module and the network.
+    for (key, &local) in lanes.iter().enumerate() {
+        let k = WorkloadEnd::Net(key as u8);
+        let into = edges.iter().filter(|x| x.to == k).count();
+        let out = edges.iter().filter(|x| x.from == k).count();
+        if into != 1 || out != 1 {
+            let m = &local_names[local as usize];
+            return Err(Error::Config(format!(
+                "workload {pi}: `{m}` is wired to the node's network {into} time(s) toward it and \
+                 {out} time(s) from it; a module's lane is exactly one of each \
+                 (`{m}.<port> -> linux_net.net_in`, `linux_net.net_out -> {m}.<port>`)"
+            )));
+        }
+    }
+    Ok(edges)
+}
 /// YAML keys a base-graph module turns into node tags (the params TLV's
 /// trust tier, protection level, device window, ISR budget, IRQ, quarantine
 /// partner and restart settings), or that would emit one (`voices:` packs

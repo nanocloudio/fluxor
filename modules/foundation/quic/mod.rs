@@ -98,6 +98,8 @@ include!("../tls/ed25519_job.rs");
 // Shared TLS / DTLS source — QUIC drives the same TLS 1.3 handshake
 // state machine via CRYPTO frames instead of records.
 include!("../tls/x509.rs");
+// `cert_file` / `key_file` / `trust` named by path and read at runtime.
+include!("../tls/cred_file.rs");
 include!("../tls/alert.rs");
 include!("../tls/record.rs");
 include!("../tls/key_schedule.rs");
@@ -197,6 +199,17 @@ const MAX_CERT_LEN: usize = 1024;
 /// them packs identically; quic signs in-module with P-256 only, and any
 /// other key fails its CertificateVerify.
 const MAX_KEY_LEN: usize = 2400;
+
+/// Where a rotation of credentials read from files decodes before it is
+/// installed (cred_file.rs): beside the live buffers on `CRED_ROTATE`
+/// targets, absent elsewhere, where the first read decodes in place.
+const CRED_STAGE_CERT: usize = if CRED_ROTATE { MAX_CERT_LEN } else { 0 };
+const CRED_STAGE_KEY: usize = if CRED_ROTATE { MAX_KEY_LEN } else { 0 };
+const CRED_STAGE_TRUST: usize = if CRED_ROTATE {
+    MAX_CERT_LEN * MAX_ANCHORS
+} else {
+    0
+};
 const NET_BUF_SIZE: usize = 1600;
 const MAX_TICKETS: usize = 4;
 
@@ -423,6 +436,17 @@ pub(crate) struct QuicState {
     /// A configured anchor was refused — it did not parse, was over-long,
     /// or was the ninth — and the instance declines to construct.
     anchor_refused: bool,
+    /// `cert_file`, `key_file` and `trust` named by path: read at runtime,
+    /// and until read the instance neither accepts nor dials (cred_file.rs).
+    creds: CredSet,
+    cred_stage_cert: [u8; CRED_STAGE_CERT],
+    cred_stage_key: [u8; CRED_STAGE_KEY],
+    cred_stage_trust: [u8; CRED_STAGE_TRUST],
+    /// Bumped each time anchors read from `trust` are replaced; a deferred
+    /// chain walk records it (`selected_anchor`).
+    trust_epoch: u32,
+    /// Initials dropped because the credential files were not read yet.
+    creds_early: u32,
     /// The override for the peer's expected name: when set it is the SNI
     /// the ClientHello carries and the dNSName the leaf must hold (with
     /// leftmost-wildcard support per RFC 6125 §6.4.3, or Subject CN as
@@ -456,6 +480,10 @@ pub(crate) struct QuicState {
     /// application; it never tests one for a particular value.
     alpn_cfg: [u8; MAX_ALPN_CFG],
     alpn_cfg_len: usize,
+    /// The `alpn` list is unusable (past `MAX_ALPN_CFG`, an empty name, a
+    /// name past `ALPN_NAME_MAX` or not printable ASCII): construction
+    /// refuses rather than offering a clipped list nobody configured.
+    alpn_refused: bool,
     /// P-256 scalar-multiplication chunking, in ladder bits per step.
     ///
     /// The handshake does two full 256-bit constant-time ladders — the
@@ -505,7 +533,7 @@ define_params! {
     6, enable_0rtt, u8, 0
         => |s, d, len| { s.enable_0rtt = p_u8(d, len, 0, 0); };
 
-    // Tags 3, 4, 7, 8, 10 and 13 are RETIRED and must not be reused: a graph still
+    // Tags 7, 8, 10 and 13 are RETIRED and must not be reused: a graph still
     // naming a retired param gets a clean "unknown param" from the composer,
     // where a reused tag would silently bind it to an unrelated value.
     9, verify_peer, u8, 0
@@ -529,19 +557,27 @@ define_params! {
     // Ladder bits per step for the two P-256 scalar multiplications in the
     // handshake. Clamped to [1, 256]: 0 would stall the ladder forever, and
     // above 256 is a whole ladder anyway.
-    //
-    // Tag 15 — 14 is the extended-TLV `alpn` key (see `parse_extended_params`).
     18, rsa_rows_per_step, u16, 16
         => |s, d, len| { s.rsa_rows_per_step = p_u16(d, len, 0, 16); };
 
-    // Trust anchors, as a `${file:<path>}` source spec naming one
-    // certificate or a bundle of up to MAX_ANCHORS (concatenated DER, or
-    // PEM). The build tool resolves the file and embeds its certificates
-    // as extended tag 12; the spec string itself never reaches the wire,
-    // so this arm reads nothing. Declared so the parameter is in the
-    // schema, where `[[requires_when]]` can bind to it.
+    // Trust anchors: an absolute path to one certificate or a bundle of up
+    // to MAX_ANCHORS (concatenated DER, or PEM) read at runtime through
+    // the `fs` contract (cred_file.rs), or the build-time `${file:<path>}`,
+    // which the builder embeds as extended tag 12 and never packs here.
+    // Declared in the schema, where `[[requires_when]]` can bind to it.
     19, trust, str, 0
-        => |_s, _d, _len| {};
+        => |s, d, len| { s.creds.files[CRED_TRUST].set_path(core::slice::from_raw_parts(d, len)); };
+
+    // The certificate chain this instance presents (leaf first, at most
+    // MAX_CERT_LEN bytes) and its P-256 / P-384 private key: absolute
+    // paths read at runtime, PEM or DER. Until both are read a server
+    // accepts no connection and a client does not dial. The build-time
+    // `${file:<path>}` is embedded as extended tags 10 / 11 instead.
+    3, cert_file, str, 0
+        => |s, d, len| { s.creds.files[CRED_CERT].set_path(core::slice::from_raw_parts(d, len)); };
+
+    4, key_file, str, 0
+        => |s, d, len| { s.creds.files[CRED_KEY].set_path(core::slice::from_raw_parts(d, len)); };
 
     15, ecdh_bits_per_step, u16, 256
         => |s, d, len| {
@@ -596,6 +632,49 @@ define_params! {
     // client with `redial_ms` dials a fresh one.
     25, idle_timeout_ms, u32, 30000
         => |s, d, len| { s.idle_timeout_ms = p_u32(d, len, 0, 30000); };
+
+    // The override for the peer's expected name: the SNI and the dNSName
+    // the leaf must hold, whatever the `authority`. Held whole or refused:
+    // a truncated name authenticates a different host. A schema string, so
+    // a workload binds it from its environment (`{env: NAME}`).
+    26, verify_hostname, str, 0
+        => |s, d, len| {
+            if len <= s.verify_hostname.len() {
+                core::ptr::copy_nonoverlapping(d, s.verify_hostname.as_mut_ptr(), len);
+                s.verify_hostname_len = len;
+            } else {
+                s.verify_hostname_refused = true;
+            }
+        };
+
+    // ALPN (RFC 7301): comma-separated tokens, e.g. `mqtt,h3`, in server
+    // preference order. Set, the framed mux surface; unset, the transparent
+    // byte stream. Kept whole or refused at construction.
+    27, alpn, str, 0
+        => |s, d, len| {
+            let list = core::slice::from_raw_parts(d, len);
+            if alpn_cfg_ok(list) {
+                core::ptr::copy_nonoverlapping(d, s.alpn_cfg.as_mut_ptr(), len);
+                s.alpn_cfg_len = len;
+            } else if len > 0 {
+                s.alpn_refused = true;
+            }
+        };
+}
+
+/// Longest protocol name one `alpn` entry may hold.
+const ALPN_NAME_MAX: usize = 24;
+
+/// Is `list` a usable `alpn` value: comma-separated names of 1..=
+/// `ALPN_NAME_MAX` printable ASCII bytes, `MAX_ALPN_CFG` bytes in all? The
+/// builder's rule, held here too for a value bound from the environment.
+fn alpn_cfg_ok(list: &[u8]) -> bool {
+    if list.is_empty() || list.len() > MAX_ALPN_CFG {
+        return false;
+    }
+    list.split(|&b| b == b',').all(|n| {
+        !n.is_empty() && n.len() <= ALPN_NAME_MAX && n.iter().all(|&c| (0x21..0x7F).contains(&c))
+    })
 }
 
 /// Exactly `out.len()` bytes of hex (a NUL ends the text).
@@ -778,6 +857,9 @@ pub unsafe extern "C" fn module_new(
     s.anchor_count = 0;
     s.anchor_operator = 0;
     s.anchor_refused = false;
+    CredSet::init(&mut s.creds);
+    s.trust_epoch = 0;
+    s.creds_early = 0;
     s.verify_hostname_len = 0;
     s.verify_hostname_refused = false;
     s.ticket_key = [-1, -1];
@@ -790,6 +872,7 @@ pub unsafe extern "C" fn module_new(
     s.replay_domain = [0u8; 16];
     s.pending_resumption_test = false;
     s.alpn_cfg_len = 0;
+    s.alpn_refused = false;
     let mut t = 0;
     while t < MAX_TICKETS {
         s.client_tickets[t] = ClientTicketEntry {
@@ -843,6 +926,10 @@ pub unsafe extern "C" fn module_new(
         }
     }
     parse_extended_params(s, params, params_len);
+    if let Some(msg) = quic_creds_admit(s) {
+        dev_log(sys, 1, msg.as_ptr(), msg.len());
+        return -1;
+    }
     // An anchor the module could not take refuses the instance: it was
     // given a trust set, and it either holds all of it or does not run.
     if s.anchor_refused {
@@ -852,6 +939,11 @@ pub unsafe extern "C" fn module_new(
     }
     if s.verify_hostname_refused {
         let msg = b"[quic] refusing to construct: `verify_hostname` exceeds 64 bytes; a truncated name authenticates a different host";
+        dev_log(sys, 1, msg.as_ptr(), msg.len());
+        return -1;
+    }
+    if s.alpn_refused {
+        let msg = b"[quic] refusing to construct: `alpn` must be comma-separated names of 1..=24 printable bytes, 64 bytes in all";
         dev_log(sys, 1, msg.as_ptr(), msg.len());
         return -1;
     }
@@ -1071,6 +1163,165 @@ fn push_anchor_bundle(s: &mut QuicState, bundle: &[u8], operator: bool) {
     }
 }
 
+// ── Credentials named by path (../tls/cred_file.rs) ──────────────────────
+
+/// Construction-time admission of credentials named by path. `None` when
+/// admitted: each credential has one source, a path read at runtime or a
+/// blob the builder embedded.
+fn quic_creds_admit(s: &QuicState) -> Option<&'static [u8]> {
+    if s.creds.bad_path() {
+        return Some(b"[quic] refusing to construct: cert_file / key_file / trust must be an absolute path of at most 255 bytes");
+    }
+    if s.creds.files[CRED_CERT].configured() && s.cert_len > 0 {
+        return Some(b"[quic] refusing to construct: cert_file names a file read at runtime and an embedded certificate");
+    }
+    if s.creds.files[CRED_KEY].configured() && s.key_len > 0 {
+        return Some(b"[quic] refusing to construct: key_file names a file read at runtime and an embedded key");
+    }
+    if s.creds.files[CRED_TRUST].configured() && s.anchor_count > s.anchor_operator {
+        return Some(b"[quic] refusing to construct: trust names a file read at runtime and embedded anchors");
+    }
+    None
+}
+
+/// Count, and say on the 1st, 2nd, 4th, 8th…, an Initial dropped because
+/// the credential files were not read yet.
+unsafe fn quic_creds_refuse_early(s: &mut QuicState) {
+    s.creds_early = s.creds_early.wrapping_add(1);
+    if s.creds_early & (s.creds_early - 1) == 0 {
+        let sys = &*s.syscalls;
+        let msg = b"[quic] credentials not yet read from their files: Initial dropped";
+        dev_log(sys, 2, msg.as_ptr(), msg.len());
+    }
+}
+
+/// Where each credential file decodes: staging on `CRED_ROTATE` targets,
+/// else the live buffers, read once before anything uses them.
+unsafe fn quic_creds_dests(s: &mut QuicState) -> [(*mut u8, usize); CRED_SLOTS] {
+    let op = s.anchor_operator as usize;
+    if CRED_ROTATE {
+        [
+            (s.cred_stage_cert.as_mut_ptr(), CRED_STAGE_CERT),
+            (s.cred_stage_key.as_mut_ptr(), CRED_STAGE_KEY),
+            (s.cred_stage_trust.as_mut_ptr(), CRED_STAGE_TRUST),
+        ]
+    } else {
+        [
+            (s.cert.as_mut_ptr(), MAX_CERT_LEN),
+            (s.key.as_mut_ptr(), MAX_KEY_LEN),
+            (
+                (s.anchors.as_mut_ptr() as *mut u8).add(op * MAX_CERT_LEN),
+                (MAX_ANCHORS - op.min(MAX_ANCHORS)) * MAX_CERT_LEN,
+            ),
+        ]
+    }
+}
+
+/// One step of the credential files.
+unsafe fn quic_creds_step(s: &mut QuicState) {
+    if !s.creds.configured() {
+        return;
+    }
+    let sys = &*s.syscalls;
+    let dest = quic_creds_dests(s);
+    if s.creds.step(sys, b"[quic]", &dest) != CS_CANDIDATE {
+        return;
+    }
+    let in_use = s.conns.iter().any(|c| c.phase == ConnPhase::Handshaking);
+    if s.creds.ready && in_use && !s.creds.deferred_long_enough(sys) {
+        return;
+    }
+    match quic_creds_install(s, &dest) {
+        Ok(()) => s.creds.adopt(sys, b"[quic]"),
+        Err((slot, why)) => s.creds.refuse(sys, b"[quic]", slot, why),
+    }
+}
+
+/// Validate the files just read and install all of them, or none while
+/// the credentials in use stay.
+unsafe fn quic_creds_install(
+    s: &mut QuicState,
+    dest: &[(*mut u8, usize); CRED_SLOTS],
+) -> Result<(), (usize, &'static [u8])> {
+    let cert_on = s.creds.files[CRED_CERT].configured();
+    let key_on = s.creds.files[CRED_KEY].configured();
+    let trust_on = s.creds.files[CRED_TRUST].configured();
+    let cert_len = s.creds.files[CRED_CERT].len;
+    let key_len = s.creds.files[CRED_KEY].len;
+    let trust_len = s.creds.files[CRED_TRUST].len;
+    let op = s.anchor_operator as usize;
+    if cert_on {
+        let chain = core::slice::from_raw_parts(dest[CRED_CERT].0, cert_len);
+        if cert_len > MAX_CERT_LEN || !chain_parses(chain) {
+            return Err((
+                CRED_CERT,
+                b"does not hold a certificate chain this module presents (leaf first, at most 1024 bytes)",
+            ));
+        }
+    }
+    if key_on {
+        let key = core::slice::from_raw_parts(dest[CRED_KEY].0, key_len);
+        let mut scalar = [0u8; 48];
+        let ec = if key_len == 0 || key_len > MAX_KEY_LEN {
+            0
+        } else {
+            identity_ec_scalar(key, &mut scalar)
+        };
+        zeroize(&mut scalar);
+        if ec != 32 && ec != 48 {
+            return Err((CRED_KEY, b"is not a P-256 or P-384 private key"));
+        }
+    }
+    let mut n_trust = 0;
+    if trust_on {
+        match count_certificates(
+            dest[CRED_TRUST].0,
+            trust_len,
+            MAX_CERT_LEN,
+            MAX_ANCHORS.saturating_sub(op),
+        ) {
+            Some(n) => n_trust = n,
+            None => {
+                return Err((
+                    CRED_TRUST,
+                    b"does not hold trust anchors this module takes (certificates of at most 1024 bytes, at most 8 with the operator's)",
+                ))
+            }
+        }
+    }
+    if cert_on {
+        core::ptr::copy(dest[CRED_CERT].0, s.cert.as_mut_ptr(), cert_len);
+        s.cert_len = cert_len;
+    }
+    if key_on {
+        core::ptr::copy(dest[CRED_KEY].0, s.key.as_mut_ptr(), key_len);
+        s.key_len = key_len;
+        if CRED_ROTATE {
+            core::ptr::write_bytes(dest[CRED_KEY].0, 0, key_len);
+        }
+    }
+    if trust_on {
+        let base = (s.anchors.as_mut_ptr() as *mut u8).add(op * MAX_CERT_LEN);
+        let mut written = [0u16; MAX_ANCHORS];
+        let _ = split_certificates(
+            dest[CRED_TRUST].0,
+            trust_len,
+            base,
+            MAX_CERT_LEN,
+            MAX_ANCHORS - op,
+            &mut written,
+        );
+        let mut k = 0;
+        while k < n_trust {
+            s.anchor_lens[op + k] = written[k];
+            k += 1;
+        }
+        s.anchor_count = (op + n_trust) as u8;
+        s.trust_epoch = s.trust_epoch.wrapping_add(1);
+    }
+    Ok(())
+}
+
 /// The configured anchors as the verifier's set, in configured order.
 fn anchor_set(s: &QuicState) -> AnchorSet<'_> {
     let mut set = AnchorSet::empty();
@@ -1084,10 +1335,11 @@ fn anchor_set(s: &QuicState) -> AnchorSet<'_> {
 
 /// The anchor a walked chain was accepted under, for the stepped links
 /// that read their issuer key from it. Empty for an index the table does
-/// not hold, which the step then refuses as a signature failure.
-fn selected_anchor(s: &QuicState, index: u8) -> &[u8] {
-    let i = index as usize;
-    if i < s.anchor_count as usize && i < MAX_ANCHORS {
+/// not hold, and for one replaced since the walk (a rotation of the anchors
+/// read from `trust`), which the step then refuses as a signature failure.
+fn selected_anchor<'a>(s: &'a QuicState, links: &DeferredLinks) -> &'a [u8] {
+    let i = links.anchor as usize;
+    if links.generation == s.trust_epoch && i < s.anchor_count as usize && i < MAX_ANCHORS {
         &s.anchors[i][..s.anchor_lens[i] as usize]
     } else {
         &[]
@@ -1119,7 +1371,7 @@ unsafe fn parse_extended_params(s: &mut QuicState, params: *const u8, params_len
     }
     while pos + 4 <= params_len {
         let tag = data[pos];
-        let ext = tag == 10 || tag == 11 || tag == 12 || tag == 13 || tag == 14 || tag == 16;
+        let ext = tag == 10 || tag == 11 || tag == 12 || tag == 16;
         if ext && pos + 4 <= params_len && data[pos + 1] == 0x00 {
             let len = ((data[pos + 2] as usize) << 8) | (data[pos + 3] as usize);
             let start = pos + 4;
@@ -1151,37 +1403,6 @@ unsafe fn parse_extended_params(s: &mut QuicState, params: *const u8, params_len
                     // table through the same walk.
                     let bundle = core::slice::from_raw_parts(data.as_ptr().add(start), len);
                     push_anchor_bundle(s, bundle, tag == 16);
-                }
-                13 => {
-                    // The expected-identity override. Truncating a name
-                    // would authenticate a different one, so an over-long
-                    // value is dropped and the instance refused.
-                    if len > 0 && len <= s.verify_hostname.len() {
-                        core::ptr::copy_nonoverlapping(
-                            data.as_ptr().add(start),
-                            s.verify_hostname.as_mut_ptr(),
-                            len,
-                        );
-                        s.verify_hostname_len = len;
-                    } else if len > 0 {
-                        s.verify_hostname_refused = true;
-                    }
-                }
-                14 => {
-                    // ALPN config list (RFC 7301): comma-separated raw
-                    // tokens, e.g. `mqtt,h3`. Stored verbatim; selection
-                    // splits on ',' at ClientHello time.
-                    let n = if len < MAX_ALPN_CFG {
-                        len
-                    } else {
-                        MAX_ALPN_CFG
-                    };
-                    core::ptr::copy_nonoverlapping(
-                        data.as_ptr().add(start),
-                        s.alpn_cfg.as_mut_ptr(),
-                        n,
-                    );
-                    s.alpn_cfg_len = n;
                 }
                 _ => {}
             }
@@ -1402,6 +1623,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
     // Module-scope metrics (~5s cadence): a bounded log beat always, plus the
     // telemetry-port counters when that port is wired.
     maybe_emit_telemetry(s);
+    quic_creds_step(s);
     ticket_rotate_if_due(s);
     // Drain any transport-continuity control commands (checkpoint / delta /
     // cut-over / reservation grants) on `cont_in`; no-op when unwired.
@@ -1440,7 +1662,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
     // Client mode: kick off the handshake by allocating a connection,
     // queueing a ClientHello in driver.out_buf, and emitting the
     // first Initial packet.
-    if s.mode == 0 && !s.client_started && s.endpoint.is_ready() {
+    if s.mode == 0 && !s.client_started && s.endpoint.is_ready() && s.creds.ready() {
         let ip = ip_mapped(s.peer_v4);
         if let Some(idx) = alloc_client_connection(s, &ip, s.peer_port) {
             // Drive far enough to get the ClientHello queued.
@@ -1581,7 +1803,13 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                             } else {
                                 -1
                             };
-                            if idx < 0 && s.mode == 1 {
+                            if idx < 0 && s.mode == 1 && !s.creds.ready() {
+                                // Credentials named by path and not read
+                                // yet: nothing to present. The Initial is
+                                // dropped unanswered and its retransmit
+                                // finds the instance ready.
+                                quic_creds_refuse_early(s);
+                            } else if idx < 0 && s.mode == 1 {
                                 // Only a server accepts an unmatched datagram as
                                 // a NEW connection. A client that can't match an
                                 // inbound packet to one of its own connections
@@ -3863,6 +4091,10 @@ pub mod test_helpers {
         } else {
             -1
         };
+        if idx < 0 && !s.creds.ready() {
+            super::quic_creds_refuse_early(s);
+            return -1;
+        }
         if idx < 0 {
             if let Some(new) = super::alloc_server_connection(s, &ip, port) {
                 idx = new as i32;
@@ -3876,6 +4108,23 @@ pub mod test_helpers {
             }
         }
         idx
+    }
+
+    /// Whether the credentials named by path are read and adopted (true
+    /// when none are), the presented chain's and key's lengths, and the
+    /// anchor count; and how many Initials were dropped waiting for them.
+    ///
+    /// # Safety
+    /// `state` must point to a fully-initialised `QuicState`.
+    pub unsafe fn credentials(state: *const u8) -> (bool, usize, usize, usize, u32) {
+        let s = &*(state as *const QuicState);
+        (
+            s.creds.ready(),
+            s.cert_len,
+            s.key_len,
+            s.anchor_count as usize,
+            s.creds_early,
+        )
     }
 
     /// Connections refused at the ceiling so far.

@@ -51,7 +51,7 @@ const PLACEHOLDER: &str = "${param:";
 ///
 /// A `file` is a path to a file the consumer supplies at run time — a CA
 /// bundle, a certificate, a key — that the graph names where a module takes
-/// a path (`cert_file: ${param:cert}`, `trust: "${file:${param:ca}}"`). Its
+/// a path (`cert_file: ${param:cert}`, `trust: ${param:ca}`). Its
 /// value renders as the file's absolute path, and a run is refused before
 /// anything is built when the file is not there. It has no default: the
 /// file is the consumer's, not the bundle's. Its example names a sample
@@ -702,11 +702,13 @@ static VALUES: std::sync::OnceLock<Values> = std::sync::OnceLock::new();
 
 /// Is this process checking graphs (`fluxor build --check`) rather than
 /// building or running them? A check validates a graph without the
-/// deployment's files: a certificate, key or trust bundle a module names
-/// by path (`cert_file`, `key_file`, `trust: "${file:…}"`) is decoded when
-/// it is there and stood in for at a nominal size when it is not, so an
-/// example does not depend on a file only its operator has. A build still
-/// reads every one of them and fails on a missing one.
+/// deployment's files: a certificate, key or trust bundle a module embeds
+/// at build (`cert_file`, `key_file`, `trust` written `${file:…}`, the form
+/// for targets with no file surface at runtime) is decoded when it is there
+/// and stood in for at a nominal size when it is not, so an example does
+/// not depend on a file only its operator has. A build still reads every
+/// one of them and fails on a missing one. A bare path is the module's to
+/// read at runtime, and neither a check nor a build reads it.
 pub fn checking() -> bool {
     matches!(VALUES.get(), Some(Values::Check))
 }

@@ -582,6 +582,7 @@ pub fn cmd_workload_image_publish(
             bytes,
         });
     }
+    let env = workload_image_env(&doc)?;
     let ref_name = tag
         .map(str::to_string)
         .unwrap_or_else(|| format!("{name}:latest"));
@@ -596,6 +597,7 @@ pub fn cmd_workload_image_publish(
             abi_surface_hex: &abi_surface,
             flxa: &flxa,
             modules: &modules,
+            env: &env,
             provenance: PROVENANCE_LOCAL,
             source_rev: source_rev.as_deref(),
             ref_name: &ref_name,
@@ -604,6 +606,48 @@ pub fn cmd_workload_image_publish(
     .map_err(|e| Error::Config(e.to_string()))?;
     println!("{ref_name} -> {}", desc.digest);
     Ok(())
+}
+
+/// `workload-image.json`'s `env`: every param the image binds to the
+/// workload's environment, each `name`, `module`, `param` and `required`.
+/// None listed is an image that binds none; an entry missing a field, or
+/// with an empty or malformed name, is refused, since the image's config
+/// would otherwise tell a puller less than its FLXA binds.
+fn workload_image_env(doc: &serde_json::Value) -> Result<Vec<oci_store::WorkloadEnvBinding>> {
+    let Some(listed) = doc.get("env") else {
+        return Ok(Vec::new());
+    };
+    let Some(listed) = listed.as_array() else {
+        return Err(Error::Config(
+            "workload-image.json: `env` is not a list".into(),
+        ));
+    };
+    let mut out = Vec::with_capacity(listed.len());
+    for b in listed {
+        let s = |k: &str| b.get(k).and_then(|v| v.as_str()).filter(|v| !v.is_empty());
+        let (Some(name), Some(module), Some(param), Some(required)) = (
+            s("name"),
+            s("module"),
+            s("param"),
+            b.get("required").and_then(|v| v.as_bool()),
+        ) else {
+            return Err(Error::Config(format!(
+                "workload-image.json: an env entry lacks name, module, param or required: {b}"
+            )));
+        };
+        if name.contains(['=', '\0']) {
+            return Err(Error::Config(format!(
+                "workload-image.json: env name {name:?} cannot be an environment name"
+            )));
+        }
+        out.push(oci_store::WorkloadEnvBinding {
+            name: name.into(),
+            module: module.into(),
+            param: param.into(),
+            required,
+        });
+    }
+    Ok(out)
 }
 
 // ── fluxor store ls|inspect|rm ────────────────────────────────────────
@@ -1100,6 +1144,34 @@ fn cmd_store_snapshot(name: &str, store_dir: Option<&Path>) -> Result<()> {
 mod tests {
     use super::*;
     use fluxor_tools::oci_store::{publish_module, ModulePublish, PROVENANCE_LOCAL};
+
+    /// `workload-image.json`'s `env` becomes the image config's bindings;
+    /// none listed is none bound; an entry that would tell a puller less
+    /// than the FLXA binds is refused.
+    #[test]
+    fn a_workload_image_env_list_is_read_whole_or_refused() {
+        let doc = serde_json::json!({"env": [
+            {"name": "TOKEN", "module": "probe", "param": "token", "required": true},
+            {"name": "PORT", "module": "probe", "param": "port", "required": false},
+        ]});
+        let env = workload_image_env(&doc).unwrap();
+        assert_eq!(env.len(), 2);
+        assert_eq!(
+            (env[0].name.as_str(), env[0].required, env[1].param.as_str()),
+            ("TOKEN", true, "port")
+        );
+        assert!(workload_image_env(&serde_json::json!({}))
+            .unwrap()
+            .is_empty());
+        for bad in [
+            serde_json::json!({"env": "TOKEN"}),
+            serde_json::json!({"env": [{"name": "TOKEN", "module": "probe", "param": "token"}]}),
+            serde_json::json!({"env": [{"name": "", "module": "m", "param": "p", "required": true}]}),
+            serde_json::json!({"env": [{"name": "A=B", "module": "m", "param": "p", "required": true}]}),
+        ] {
+            assert!(workload_image_env(&bad).is_err(), "{bad}");
+        }
+    }
 
     /// Keep every unit test in this binary out of the developer's real
     /// store.

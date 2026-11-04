@@ -152,13 +152,20 @@ reads that name off the connect record it forwards, so it is written
 once. `verify_hostname` is the override for a registry reached through
 a proxy or by a pinned address — set it only when the name to verify is
 not the one dialled.
-`trust` names its file as a source spec, `trust: "${file:pki/ca.der}"`,
-never as a bare path: the build reads the file and embeds its
-certificates, and a file that cannot be read or holds none fails the
-build naming the file and the instance. The file may be a bundle —
-concatenated DER, or PEM with several `CERTIFICATE` blocks — of up to
-eight anchors, which is how a CA rotation is expressed: the outgoing and
-incoming authorities side by side, and a chain signed by either verifies.
+`trust` names its file one of two ways, chosen by what the target can
+read at runtime. A bare absolute path, `trust: /etc/fluxor/ca.der`, is
+read by the instance where it runs, through the `fs` contract — the only
+form a Linux image takes, so the image carries no deployment's trust and
+a build reads nothing; until the file is read the client dials nothing
+(`EAGAIN`), and a rotated file is taken without a restart. On a target
+with no file surface at runtime the build embeds it instead:
+`trust: "${file:pki/ca.der}"` reads the file at build, and a file that
+cannot be read or holds none fails the build naming the file and the
+instance; a bare path there is refused unless the graph serves `fs`. The
+file may be a bundle — concatenated DER, or PEM with several
+`CERTIFICATE` blocks — of up to eight anchors, which is how a CA rotation
+is expressed: the outgoing and incoming authorities side by side, and a
+chain signed by either verifies.
 A device with no synchronised wall clock must also choose
 `clock_policy: unchecked`, which states that certificate lifetimes are
 not enforced on it.

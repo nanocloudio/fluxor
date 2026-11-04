@@ -43,13 +43,21 @@ use crate::kernel::module::loader::ModuleLoader;
 use crate::kernel::workload::owner::{OwnerHandle, OwnerState, OWNER_SYSTEM};
 
 /// Largest subgraph one `apply_add` admits. The working set is stack-only
-/// and bounded by these caps: decoding an encoded add holds every module and
-/// edge record at once (~7 KiB at 64 / 128), well inside the kernel stack of
-/// the targets that compile live mutation (bcm2712 and linux). A message
-/// broker with durable storage is ~14 modules and ~49 edges.
+/// and sized by these caps, not by the subgraph: decoding an encoded add
+/// holds every module and edge record at once, and staging holds the
+/// fan-expanded copy. A whole graph-backend `CREATE` at 64 / 192 reaches
+/// ~273 KiB deep optimised (~202 KiB at 64 / 128) and ~679 KiB unoptimised,
+/// inside the kernel stack of the targets that compile live mutation
+/// (bcm2712's 1 MiB core stacks, linux's 8 MiB main thread; RP compiles it
+/// out); the harness runs one on a 1 MiB stack and measures it
+/// (`workload_backend`). A message broker with durable storage is ~14
+/// modules and ~49 edges; a traffic-fabric integration image ~50 and ~182.
 pub const MAX_ADD_MODULES: usize = 64;
-/// Largest edge count one `apply_add` admits.
-pub const MAX_ADD_EDGES: usize = 128;
+/// Largest edge count one `apply_add` admits. 192 is the most the staged
+/// subgraph's byte-wide module index allows: every edge may need a fan
+/// module, and `MAX_ADD_MODULES + MAX_ADD_EDGES` staged modules must stay
+/// nameable by `Endpoint::New(u8)`.
+pub const MAX_ADD_EDGES: usize = 192;
 // The FLXA wire carries both counts in a byte.
 const _: () = assert!(MAX_ADD_MODULES <= u8::MAX as usize);
 const _: () = assert!(MAX_ADD_EDGES <= u8::MAX as usize);

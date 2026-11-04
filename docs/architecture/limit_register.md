@@ -256,6 +256,7 @@ CONT_OUT_NEED <= 64 * 1024 | modules/foundation/tls/continuity.rs
 | QUIC peer name | `MAX_PEER_NAME` | modules/foundation/quic/mod.rs | 64 | Policy: the longest DNS name a QUIC peer may be dialled by, and the SNI and `dNSName` the handshake checks. The datagram surface carries up to 253 bytes; the module sizes this for the state budget and refuses rather than truncates, because a clipped name verifies against the wrong certificate |
 | QUIC peer certificate | `MAX_CERT_LEN` | modules/foundation/quic/mod.rs | 1024 | Policy: the per-certificate ceiling for the configured leaf and each trust anchor. An anchor past it, or a ninth anchor, marks the table refused and the instance declines to construct |
 | QUIC configured ALPN list | `MAX_ALPN_CFG` | modules/foundation/quic/mod.rs | 64 | Policy: the comma-separated protocol tokens a graph configures (`mqtt,h3`); 64 bytes holds several names with their separators |
+| QUIC ALPN protocol name | `ALPN_NAME_MAX` | modules/foundation/quic/mod.rs | 24 | Policy: the longest single protocol token an `alpn` entry may hold; an env-bound list with a longer one is refused at construction rather than truncated |
 | QUIC resumption tickets | `MAX_TICKETS` | modules/foundation/quic/mod.rs | 4 | Policy: the client-side ticket cache. Each entry is bound to the authority that issued it, so the table holds a handful of recently dialled peers and the oldest is displaced rather than grown |
 | QUIC ticket replay claims | `TICKET_SEEN` | modules/foundation/quic/mod.rs | 64 | Policy: resumption tickets claimed against replay (RFC 8446 §8, RFC 9001 §9.2), each held for its ticket's whole lifetime (7200 s) and never reclaimed under pressure — that window is where a replay lands. Every resumption takes a claim, not only one carrying early data, since a ticket accepted twice also correlates two connections as one client. A full store refuses the resumption and the handshake completes in full — slower, never unprotected. It bounds resumptions per ticket lifetime: more of them means a shorter lifetime, not a wider replay window |
 | QUIC transparent stream read | `TRANSPARENT_READ_MAX` | modules/foundation/quic/mod.rs | 1200 | Policy: the most one read of the no-ALPN byte stream takes from `app_in`, one packet's worth. It is read only while the stream's send buffer has room for a whole read, so `app_in` backs up rather than losing bytes |
@@ -320,15 +321,17 @@ CONT_OUT_NEED <= 64 * 1024 | modules/foundation/tls/continuity.rs
 | Private regions per gated module | `MAX_PRIVATE` | src/kernel/module/gateway.rs | 3 | Sanity bound: state, heap and stack on an MMU target; one combined region on an MPU target. A pointer a gated module passes must lie in one of them |
 | Gateway argument copy | `WALK_MAX` | src/kernel/module/gateway.rs | 544 | Derived, not chosen: the largest walked request, an object `LIST` with a prefix and a cursor of `STORAGE_KEY_MAX` bytes each (`REQUEST_FIXED_LEN + 2 * STORAGE_KEY_MAX`, rounded up to 16). Stack-resident per gated call |
 | Gated provider handles | `SLOTS` | src/kernel/module/gateway.rs | 128 | Policy: provider handles minted to gated callers, one kernel-wide table across every gated module. A gated module may name only a handle the kernel returned to it, so a handle that cannot be minted is unusable: the open is answered `ENOSPC`, with a warning naming the module |
-| Remote channels per instance | `MAX_CHANNELS` | modules/foundation/remote_channel/wire.rs | 8 | Policy: each channel is a port pair, a reassembly region, a send state and on `quic` a stream; the manifest declares eight port pairs. A longer table is refused at construction |
+| Remote channels per instance | `PORT_CHANNELS` | modules/foundation/remote_channel/wire.rs | 8 | Policy: each `channels` entry is a port pair, a reassembly region, a send state and on `quic` a stream; the manifest declares eight port pairs. A longer table is refused at construction |
+| Remote-channel table | `MAX_CHANNELS` | modules/foundation/remote_channel/wire.rs | 10 | Derived, not chosen: every `channels` entry (`PORT_CHANNELS`) and the exchange endpoint's two after them, which have ports of their own and take no port pair |
 | Remote-channel content-type name | `CT_NAME_MAX` | modules/foundation/remote_channel/wire.rs | 32 | Sanity bound: longer than any name in the content-type registry; a longer name in `channels` is refused |
-| Remote-channel table frame | `HELLO_MAX` | modules/foundation/remote_channel/wire.rs | 399 | Derived, not chosen: the whole channel table at `MAX_CHANNELS` entries of `CT_NAME_MAX` names, the exchange endpoint's side byte, and the resume trailer (`RESUME_TRAILER_MAX`: a marker, two incarnations, a next record per channel) |
-| Remote-channel resume trailer | `RESUME_TRAILER_MAX` | modules/foundation/remote_channel/wire.rs | 97 | Derived, not chosen: the `HELLO`'s resume trailer — its marker, the sender's incarnation and the one it holds, and the next record expected on each of `MAX_CHANNELS` channels |
+| Remote-channel table frame | `HELLO_MAX` | modules/foundation/remote_channel/wire.rs | 489 | Derived, not chosen: the whole channel table at `MAX_CHANNELS` entries of `CT_NAME_MAX` names, the exchange endpoint's side byte, and the resume trailer (`RESUME_TRAILER_MAX`: a marker, two incarnations, a next record per channel) |
+| Remote-channel resume trailer | `RESUME_TRAILER_MAX` | modules/foundation/remote_channel/wire.rs | 113 | Derived, not chosen: the `HELLO`'s resume trailer — its marker, the sender's incarnation and the one it holds, and the next record expected on each of `MAX_CHANNELS` channels |
 | Remote-channel record | `MAX_RECORD` | modules/foundation/remote_channel/mod.rs | 262144 | Policy: the largest record any channel may declare — one record is reassembled whole before delivery, so this is the largest allocation a peer can make the module hold. Above a large body record with its frame (loam's 128 KiB frames). 128 KiB on wasm, 16 KiB on embedded. A larger declaration is refused at construction; a larger record is refused and counted |
 | Remote-channel reassembly | `REASSEMBLY_BYTES` | modules/foundation/remote_channel/mod.rs | 1048576 | Policy: every channel's reassembly ring (`max_record + 4`) per session, its retained window per session under `resume`, and its record stages (a `mailbox`'s two; one on every channel a listener with several sessions sends on) must fit; a table that does not is refused at construction rather than shrunk. 256 KiB on wasm, 32 KiB on embedded |
 | Remote-channel fragment (`net`) | `FRAGMENT_MAX` | modules/foundation/remote_channel/mod.rs | 4096 | Policy: record bytes in one frame on a shared stream — how long one channel holds the stream before the next channel's turn |
 | Remote-channel open exchanges | `OPEN_EXCHANGES_MAX` | modules/foundation/remote_channel/mod.rs | — | Policy, per target class (`abi::config::TARGET_CLASS`): 256 on host-class targets, 32 on MCUs. The exchanges a far endpoint has handed its provider without a terminal record yet — the ones it ABORTs when the session ends. A request HEAD past it is answered `503`, marked RAISED, and never reaches the provider |
 | Remote-channel sessions | `SESSIONS_MAX` | modules/foundation/remote_channel/mod.rs | — | Policy, per target class (`abi::config::TARGET_CLASS`): 8 on host-class targets, 4 on MCUs. The sessions one `net` listener serves at once (`sessions`), one per verified peer — each a send and receive state per channel and a reassembly ring per channel within `REASSEMBLY_BYTES`. A larger `sessions` is refused at construction; a peer arriving with every session in use is closed |
+| Remote-channel peer retention floor | `RETAIN_FLOOR_MS` | modules/foundation/remote_channel/mod.rs | 30000 | Policy: the least `retain_ms` derived when a graph names none (30 × the larger of `keepalive_ms` and `redial_ms`, at least this) — how long a listener serving several `resume` sessions keeps a peer with no session its slot and retained windows. Three setup timeouts, so a peer restarting or redialling finds its streams held; past it the slot is released (`peers_expired`) and the broadcast its full window held goes on. A graph may name any `retain_ms`, 0 for ever |
 | Remote-channel local header | `HDR_MAX` | modules/foundation/remote_channel/wire.rs | 64 | Policy: the longest local header a length framing (`len16@<off>+<add>`, `len32@<off>+<add>`) names — the length field's offset and width together. A framing past it is refused at construction |
 | Remote-channel fragment (`mux`) | `MUX_FRAGMENT_MAX` | modules/foundation/remote_channel/mod.rs | 1192 | Derived, not chosen: a whole frame fits one `CMD_MUX_STREAM_SEND` (`MUX_QUIC_STREAM_SEND_MAX` less the frame header and record length), held to that by a const assert |
 | Graph parameters | `MAX_PARAMS` | tools/src/params.rs | 64 | Policy: parameters one graph, stack or bundle may declare. A graph needing more is being configured through its internals rather than its run surface; the bound also bounds the checks every launch makes |
@@ -342,6 +345,8 @@ CONT_OUT_NEED <= 64 * 1024 | modules/foundation/tls/continuity.rs
 | Linux node store change history | `NODE_STORE_HISTORY` | src/platform/linux/store.rs | 65536 | Policy: revisions the node's control-plane store retains for `CHANGES`, one entry per revision. A reader further behind is answered LOST and relists rather than being handed a gap, so the figure is how long a watcher may sleep, not a ceiling on what the store holds |
 | Workload store change history | `OWNER_STORE_HISTORY` | src/platform/linux/owner_root.rs | 4096 | Policy: as the node store's, for one workload's own store — sized for one tenant's watchers rather than the node's |
 | Store subscriptions | `DEFAULT_RESERVES` | src/kernel/config.rs | — | Policy, sized at boot (the `store_subs` pool: what the graph's store consumers declare plus the reserve, by default 64): `SUBSCRIBE` watches the Linux node store holds at once. A full table is swept of subscriptions whose module is gone before it refuses; a watch past it is `ENOMEM`, counted and named |
+| Live-add subgraph modules | `MAX_ADD_MODULES` | src/kernel/exec/scheduler/live.rs | 64 | Policy: the modules one live add (a graph-backend workload `CREATE`, a resident workload at boot) brings, mirrored by the composer's `add_subgraph::MAX_ADD_MODULES` so `fluxor build` refuses a workload past it. The FLXA wire carries the count in a byte (const-asserted). Multi-tenant targets only: RP compiles live mutation out |
+| Live-add subgraph edges | `MAX_ADD_EDGES` | src/kernel/exec/scheduler/live.rs | 192 | Format-bound, not chosen: the most the staged subgraph's byte-wide module index (`Endpoint::New(u8)`) allows. A fanned port takes a tee or merge of its own and the edges bound the fans, so staging holds up to `MAX_ADD_MODULES + MAX_ADD_EDGES` = 256 modules (const-asserted) and twice the edges; 256 would need a wider index and the FLXA wire's edge count (a byte) widened. Sized past a traffic-fabric integration image (~50 modules, 182 edges). The working set lives on the kernel stack and is set by these caps, not by the subgraph: a whole graph-backend `CREATE` at 64 / 192 reaches 273 KiB deep optimised (202 KiB at 64 / 128) and 679 KiB unoptimised (503 KiB at 64 / 128), measured on aarch64 Linux by the harness (`workload_backend`, which runs one at the cap on a 1 MiB stack). Inside bcm2712's 1 MiB core stacks and Linux's 8 MiB main thread; RP has no live add. Mirrored by `add_subgraph::MAX_ADD_EDGES`; one edge past it is refused by `fluxor build` and by the kernel's decode (`EINVAL`) |
 
 ## Tables, arenas and budgets
 
@@ -615,6 +620,8 @@ MAX_PACKET_HOLD | modules/sdk/abi/config.rs | 4 | embedded
 LANE_CEILING | src/kernel/workload/net_attach.rs | 255 | *
 STATIC_LANES | src/kernel/workload/net_attach.rs | 16 | static-tables
 STATIC_LANES | src/kernel/workload/net_attach.rs | 0 | boot-sized
+MAX_ADD_MODULES | src/kernel/exec/scheduler/live.rs | 64 | *
+MAX_ADD_EDGES | src/kernel/exec/scheduler/live.rs | 192 | *
 MAX_CONTRACTS | src/kernel/module/provider.rs | 64 | *
 CONTRACT_ID_POSITIONS_ASSIGNED | tools/src/manifest.rs | 32 | *
 MAX_BUFFER_SLOTS | src/kernel/ipc/buffer_pool.rs | MAX_CHANNELS | *
@@ -744,6 +751,7 @@ MAX_AUTHORITY | modules/foundation/quic/mod.rs | MAX_PEER_NAME + 6 | *
 MAX_PEER_NAME | modules/foundation/quic/mod.rs | 64 | *
 MAX_CERT_LEN | modules/foundation/quic/mod.rs | 1024 | *
 MAX_ALPN_CFG | modules/foundation/quic/mod.rs | 64 | *
+ALPN_NAME_MAX | modules/foundation/quic/mod.rs | 24 | *
 MAX_TICKETS | modules/foundation/quic/mod.rs | 4 | *
 TICKET_SEEN | modules/foundation/quic/mod.rs | 64 | *
 TRANSPARENT_READ_MAX | modules/foundation/quic/mod.rs | 1200 | *
@@ -979,7 +987,8 @@ TOKEN_MAX | modules/sdk/contracts/storage/namespace.rs | 320 | *
 MAX_PRIVATE | src/kernel/module/gateway.rs | 3 | *
 WALK_MAX | src/kernel/module/gateway.rs | 544 | *
 SLOTS | src/kernel/module/gateway.rs | 128 | *
-MAX_CHANNELS | modules/foundation/remote_channel/wire.rs | 8 | *
+PORT_CHANNELS | modules/foundation/remote_channel/wire.rs | 8 | *
+MAX_CHANNELS | modules/foundation/remote_channel/wire.rs | PORT_CHANNELS + 2 | *
 CT_NAME_MAX | modules/foundation/remote_channel/wire.rs | 32 | *
 HELLO_MAX | modules/foundation/remote_channel/wire.rs | 4 + 1 + MAX_CHANNELS * HELLO_ENTRY_LEN + 1 + RESUME_TRAILER_MAX | *
 RESUME_TRAILER_MAX | modules/foundation/remote_channel/wire.rs | 1 + 2 * INCARNATION_LEN + 8 * MAX_CHANNELS | *
@@ -994,6 +1003,7 @@ MUX_FRAGMENT_MAX | modules/foundation/remote_channel/mod.rs | 1192 | *
 OPEN_EXCHANGES_MAX | modules/foundation/remote_channel/mod.rs | if abi::config::TARGET_CLASS == abi::config::target_class::HOST { 256 } else { 32 } | *
 SESSIONS_MAX | modules/foundation/remote_channel/mod.rs | if abi::config::TARGET_CLASS == abi::config::target_class::HOST { 8 } else { 4 } | *
 HDR_MAX | modules/foundation/remote_channel/wire.rs | 64 | *
+RETAIN_FLOOR_MS | modules/foundation/remote_channel/mod.rs | 3 * SETUP_TIMEOUT_MS | *
 MAX_PARAMS | tools/src/params.rs | 64 | *
 MAX_PARAM_STRING_BYTES | tools/src/params.rs | 4096 | *
 MAX_PARAM_NAME_BYTES | tools/src/params.rs | 64 | *
@@ -1038,6 +1048,9 @@ protocol constants, mirrors of a registered symbol — are excluded from
 the coverage report here, each with the reason it is not a row.
 
 ```limit-register-exempt
+MAX_FAN_MODULES | src/kernel/exec/scheduler/live.rs | derived: the tees and merges a live add can need, bounded by MAX_ADD_EDGES
+WORK_MODULES | src/kernel/exec/scheduler/live.rs | derived: a staged live add's modules, MAX_ADD_MODULES plus MAX_FAN_MODULES
+WORK_EDGES | src/kernel/exec/scheduler/live.rs | derived: a staged live add's edges, MAX_ADD_EDGES plus a joining edge per fan
 STATUS_NO_CAPACITY | modules/sdk/contracts/net/session_ctrl.rs | protocol: a continuity reply's status code, not a capacity
 SIG_MAX | modules/sdk/contracts/net/session_ctrl.rs | format: the longest custody-evidence signature (a P-256 DER signature) the evidence layout holds
 EVIDENCE_MAX | modules/sdk/contracts/net/session_ctrl.rs | derived: the custody evidence's fixed part and SIG_MAX

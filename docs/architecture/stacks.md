@@ -328,6 +328,50 @@ and it renders with its defaults and examples; the `examples` phase of
 `fluxor ci` checks an example stack that way. A stack's edges to
 the outside are checked by the graphs that include it.
 
+### In a workload
+
+A `workloads:` entry is a graph of its own: its module names are its own,
+and its wiring names its own modules and the node's network (`linux_net`,
+or `ip` on metal), never the base graph's. It takes an `include:` of its
+own, which expands into the workload's `modules:` and `wiring:` by the
+rules above, scoped to the workload:
+
+```yaml
+workloads:
+  - name: directory
+    include:
+      - stack: clustor-directory      # by name, or a file path
+        as: sd
+        params: { listen_port: 18790, wal_dir: /var/lib/app/wal, meta_dir: /var/lib/app/raft }
+    modules:
+      - name: app
+    wiring:
+      - from: linux_net.net_out       # the node's network: the stack's lane
+        to: sd.net_in
+      - from: sd.net_out
+        to: linux_net.net_in
+      - from: app.request_out
+        to: sd.requests
+      - from: sd.replies
+        to: app.reply_in
+```
+
+- The stack's modules become `<as>_<name>` among the workload's modules,
+  after the workload's own. A collision is with the workload's own modules
+  and its other includes only: the base graph and other workloads may use
+  the same names.
+- The workload's edges to `<as>.<export>` are rewritten onto the export's
+  internal ports, and the stack's internal edges follow the workload's own.
+  An end naming the node's network passes through for the workload's lane
+  rule (one lane per module, one edge each way).
+- An include in a workload takes no `node:` — a workload's modules run
+  together, where the workload runs — and its `as` is never `linux_net` or
+  `ip`, the network a workload's wiring names.
+- Errors name the workload (`workload 0: include 'sd' …`). An include by
+  name is a reference `fluxor update` pins ([References](#references)),
+  whether the graph or one of its workloads makes it, and a workload image
+  (`fluxor build --emit=workload`) or bundle carries the workload expanded.
+
 ## Placement
 
 `node: <name>` on an include places every module of the stack on that
@@ -416,7 +460,8 @@ their own right, already in the store.
 
 ## References
 
-A graph a project builds that includes a stack by name references it.
+A graph a project builds that includes a stack by name, in its own
+`include:` or in one of its workloads', references it.
 `fluxor update` pins every referenced stack from the dependency in
 `[dependencies]` that publishes it — read from its project index,
 `<dep>/meta:latest` — writing, in one locked lockfile update:
