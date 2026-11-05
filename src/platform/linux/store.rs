@@ -1290,7 +1290,11 @@ fn op_key(opcode: u32, a: &[u8]) -> Option<&[u8]> {
     match opcode {
         obj_op::GET => Some(a),
         obj_op::LIST => obj_op::list::parse_request(a).map(|r| r.prefix),
-        obj_op::PUT | obj_op::HEAD | obj_op::DELETE | obj_op::PUT_STREAMED_OPEN => {
+        obj_op::PUT
+        | obj_op::HEAD
+        | obj_op::DELETE
+        | obj_op::PUT_STREAMED_OPEN
+        | obj_op::RETAIN => {
             let n = u16::from_le_bytes([*a.first()?, *a.get(1)?]) as usize;
             a.get(2..2 + n)
         }
@@ -1687,6 +1691,7 @@ pub unsafe fn dispatch_object_on(
         obj_op::PUT => {
             // [key_len:u16][key][ct_len:u8][ct][body_ptr:u64][body_len:u64]
             // [precondition:u8][etag_len:u8][etag]
+            // [key_ref_len:u8][key_ref][retain_until_ms:u64][legal_hold:u8]
             // [fence_out_ptr:u64][fence_out_cap:u16]
             let Some((key, mut p)) = str_field(a) else {
                 return errno::EINVAL;
@@ -1710,9 +1715,15 @@ pub unsafe fn dispatch_object_on(
                 return errno::EINVAL;
             };
             let absent = precondition == Precondition::Absent;
+            let Some((kept, p)) = obj_op::Kept::parse(a, p) else {
+                return errno::EINVAL;
+            };
             let Some((fence_ptr, fence_cap)) = fence_out(a, p) else {
                 return errno::EINVAL;
             };
+            if !kept.is_none() {
+                return errno::ENOSYS;
+            }
 
             let body = if body_len == 0 {
                 Vec::new()
@@ -1772,6 +1783,7 @@ pub unsafe fn dispatch_object_on(
         obj_op::PUT_STREAMED_OPEN => {
             // [key_len:u16][key][ct_len:u8][ct][expected_size:u64]
             // [precondition:u8][etag_len:u8][etag]
+            // [key_ref_len:u8][key_ref][retain_until_ms:u64][legal_hold:u8]
             let Some((key, mut p)) = str_field(a) else {
                 return errno::EINVAL;
             };
@@ -1793,6 +1805,12 @@ pub unsafe fn dispatch_object_on(
             let Some(precondition) = read_precondition(a, &mut p) else {
                 return errno::EINVAL;
             };
+            let Some((kept, _)) = obj_op::Kept::parse(a, p) else {
+                return errno::EINVAL;
+            };
+            if !kept.is_none() {
+                return errno::ENOSYS;
+            }
             let Some(idx) = writes.iter().position(|w| !w.in_use) else {
                 return refuse_slot(pools[2], writes.len());
             };
@@ -1948,6 +1966,7 @@ pub unsafe fn dispatch_object_on(
                 return errno::ENXIO;
             };
             // HEAD record: [size:u64][mtime:u64][content_type_len:u8][ct][etag_len:u8][etag]
+            // [key_ref_len:u8][key_ref][retain_until_ms:u64][legal_hold:u8]
             let etag = etag_from_rev(rev);
             let mut rec = Vec::new();
             rec.extend_from_slice(&(val.len() as u64).to_le_bytes());
@@ -1955,6 +1974,8 @@ pub unsafe fn dispatch_object_on(
             rec.push(0); // content_type_len
             rec.push(32); // etag_len
             rec.extend_from_slice(&etag);
+            // This store keeps none of them: PUT refuses each with ENOSYS.
+            rec.extend_from_slice(&[0u8; obj_op::KEPT_FIXED_LEN]);
             // The count returned is the count written: a record that does not
             // fit is refused, not reported as delivered.
             if out_ptr == 0 {

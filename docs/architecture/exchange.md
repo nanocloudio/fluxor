@@ -165,14 +165,19 @@ leaves through one `ExchangeOutbox`.
 | `HEAD /<name>` | `200` with `content-length`, no body |
 | `PUT /<name>` | `200`: a single-shot put when the HEAD carries the whole body, a streamed one when it continues |
 | `DELETE /<name>` | `204` |
+| `PATCH /<name>` with `retain-until`, `legal-hold` or both | `200`: extends the object's retention, sets or clears its hold |
 | `GET /?list&prefix=…&after=…&max=…` | `200`, one page of names, one per line, with `next` when there is more |
 
 The name is the target after its `/`, verbatim. Every success carries the
 store's fence as `fence: <hex of Fence::encode>`, and the statuses map the
 store's refusals precisely: absent `404`, a condition that did not hold `412`,
-a body the store will not take `413`, a busy store `503`. A store's "not yet"
-(`EAGAIN` on a read, `EINPROGRESS` on a write) is asked again with the same
-request and is never an answer.
+a body the store will not take `413`, an object its retention or hold protects
+`423`, a store that cannot keep what was asked `501`, a busy store `503`. A
+store's "not yet" (`EAGAIN` on a read, `EINPROGRESS` on a write) is asked again
+with the same request and is never an answer. A header that would change what
+the request means and that the method does not honour — a conditional on a
+read, a vendor's object-lock or encryption header — is refused `400`, never
+dropped.
 
 Authority is a capability the graph gives the front (`scope`, `capability`):
 the front presents it to the store once and makes every call, for every

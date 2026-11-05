@@ -169,6 +169,9 @@ impl PlanLease {
 /// records exactly those decoded on a hosted kernel.
 pub struct DecodedPlan {
     pub generation: u64,
+    /// The sha256 over the plan's body that its trailer carries, verified at
+    /// decode.
+    pub digest: [u8; 32],
     count: usize,
     assignments: Records<PlanAssignment>,
     rev_count: usize,
@@ -396,8 +399,11 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedPlan, PlanError> {
             port: be_u16(&r[7..9]),
         };
     }
+    let mut digest = [0u8; 32];
+    digest.copy_from_slice(&bytes[PLAN_HEADER_LEN + body_len..]);
     Ok(DecodedPlan {
         generation,
+        digest,
         count,
         assignments,
         rev_count,
@@ -454,6 +460,9 @@ static mut STAGED_PLAN: Option<(*const u8, usize)> = None;
 /// this is rejected as a rollback. 0 = none applied yet.
 static mut LAST_APPLIED_GENERATION: u64 = 0;
 
+/// Digest of the last successfully-applied plan: all zero until one is.
+static mut LAST_APPLIED_DIGEST: [u8; 32] = [0; 32];
+
 /// The last successfully-applied plan, retained so a graph rebuild (which runs
 /// `prepare_graph`, resetting every module to the system owner) can RE-apply it
 /// without a fresh staged blob. `None` until the first plan is applied.
@@ -464,6 +473,15 @@ static mut RETAINED_PLAN: Option<DecodedPlan> = None;
 /// it reports came from.
 pub fn last_applied_generation() -> u64 {
     let p = &raw const LAST_APPLIED_GENERATION;
+    // SAFETY: scheduler-thread read (same access class as apply_staged).
+    unsafe { *p }
+}
+
+/// Digest of the last successfully-applied plan (all zero = none yet), the
+/// value its body hashed to when it was decoded. Lets the owner-status writer
+/// say exactly which plan the live state it reports came from.
+pub fn last_applied_digest() -> [u8; 32] {
+    let p = &raw const LAST_APPLIED_DIGEST;
     // SAFETY: scheduler-thread read (same access class as apply_staged).
     unsafe { *p }
 }
@@ -484,11 +502,13 @@ pub unsafe fn set_staged_plan(ptr: *const u8, len: usize) {
 pub fn reset_staged_plan_for_test() {
     let sp = &raw mut STAGED_PLAN;
     let lg = &raw mut LAST_APPLIED_GENERATION;
+    let ld = &raw mut LAST_APPLIED_DIGEST;
     let rp = &raw mut RETAINED_PLAN;
     // SAFETY: single-threaded test / scheduler-thread accessor.
     unsafe {
         *sp = None;
         *lg = 0;
+        *ld = [0; 32];
         *rp = None;
     }
 }
@@ -678,6 +698,7 @@ pub fn try_apply_drain_delta() -> Option<DrainDelta> {
     // Direct static assignment forms no reference.
     unsafe {
         LAST_APPLIED_GENERATION = generation;
+        LAST_APPLIED_DIGEST = plan.digest;
         RETAINED_PLAN = Some(plan);
     }
     log::info!(
@@ -796,11 +817,13 @@ pub fn apply_staged() -> Result<usize, PlanError> {
     let generation = plan.generation;
     let n = apply(&plan);
     let last_mut = &raw mut LAST_APPLIED_GENERATION;
+    let digest_mut = &raw mut LAST_APPLIED_DIGEST;
     let retained = &raw mut RETAINED_PLAN;
     // SAFETY: scheduler-thread single accessor. Retain the plan for rebuild
     // re-application.
     unsafe {
         *last_mut = generation;
+        *digest_mut = plan.digest;
         *retained = Some(plan);
     }
     log::info!("[owner] applied staged plan: {n} owners (gen {generation})");

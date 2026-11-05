@@ -26,7 +26,7 @@
 //   - Handle-bound ops (`RANGE_GET`, `CLOSE`) and open-returning
 //     ops (`GET`, `PUT_STREAMED_OPEN`) advertise the per-handle
 //     fence via `provider_query(handle, query_key::LAST_FENCE, …)`.
-//   - Handle=-1 one-shot ops (`PUT`, `HEAD`, `DELETE`, `LIST`) carry an
+//   - Handle=-1 one-shot ops (`PUT`, `HEAD`, `DELETE`, `LIST`, `RETAIN`) carry an
 //     explicit `[fence_out_ptr, fence_out_cap]` pair in their arg
 //     layout. The provider writes up to `fence::WIRE_MAX_LEN` bytes
 //     of `Fence::encode` output into `fence_out_ptr` atomically
@@ -47,6 +47,7 @@
 //     provider is in the path, `ContentHashed` for CAS.
 //   - `DELETE` → `LocalDurable` / `ReplicatedDurable` once the
 //     tombstone is committed.
+//   - `RETAIN` → the strongest fence the change achieved, as for `PUT`.
 //
 // ## Opcode class
 //
@@ -76,7 +77,7 @@
 //
 // ### Writes: `EINPROGRESS` means ask again with the same request
 //
-// `PUT`, `PUT_STREAMED_COMMIT` and `DELETE` MAY return `EINPROGRESS` when
+// `PUT`, `PUT_STREAMED_COMMIT`, `DELETE` and `RETAIN` MAY return `EINPROGRESS` when
 // the provider cannot decide the write inside the call. A replicated
 // provider is the case: a write and its precondition are decided where
 // the entry lands in the group's log, which is the linearization point
@@ -129,7 +130,7 @@
 
 /// What a storage write answered: decided, or not yet.
 ///
-/// Every write `provider_call` (`PUT`, `PUT_STREAMED_COMMIT`, `DELETE`, and
+/// Every write `provider_call` (`PUT`, `PUT_STREAMED_COMMIT`, `DELETE`, `RETAIN`, and
 /// `storage.namespace`'s `RENAME`, `DELETE`, `BIND`) hands its return code
 /// to [`write_answer`]; the hygiene scan holds every call site to that. A
 /// `match` on the answer then has to say what the caller does with
@@ -169,11 +170,16 @@ pub const fn write_answer(rc: i32) -> WriteAnswer {
 ///   [precondition: u8]                        — see `precondition` below
 ///   [etag_len: u8]                            — 0 unless precondition = ETAG
 ///   [etag: etag_len bytes]
+///   [key_ref_len: u8]                         — see [`Kept`]
+///   [key_ref: key_ref_len bytes]
+///   [retain_until_ms: u64 LE]                 — 0 = none
+///   [legal_hold: u8]                          — 0 or 1
 ///   [fence_out_ptr: u64 LE]                   — receives Fence::encode bytes
 ///   [fence_out_cap: u16 LE]                   — must be >= `fence::WIRE_MAX_LEN`
 /// ```
 ///
-/// Returns 0 or negative errno. On success the provider writes the
+/// Returns 0 or negative errno, `ERETAINED` over a retained or held object
+/// (see [`Kept`]). On success the provider writes the
 /// encoded fence (up to `fence::WIRE_MAX_LEN` bytes) into the
 /// buffer at `fence_out_ptr`. `body_len` must fit a single
 /// in-memory blob; large bodies use the `PUT_STREAMED_*` sequence
@@ -213,6 +219,11 @@ pub const PUT: u32 = 0x1420;
 /// A provider that cannot offer a condition MUST refuse it with
 /// `ENOSYS` rather than ignore it. Silently downgrading a conditional
 /// write to an unconditional one turns a refusal into a lost update.
+///
+/// The same rule holds for [`Kept`]: a provider that cannot keep a field MUST
+/// refuse a non-empty `key_ref`, a non-zero `retain_until_ms`, a `legal_hold`
+/// and [`RETAIN`] with `ENOSYS`. Ignoring one turns a write the caller asked
+/// to be immutable into a deletable one, and the caller is told it succeeded.
 pub mod precondition {
     /// Apply unconditionally.
     pub const ANY: u8 = 0;
@@ -221,6 +232,112 @@ pub mod precondition {
     /// Apply only if the key's current etag equals the supplied one.
     /// `EAGAIN` if it does not — re-read and retry.
     pub const ETAG: u8 = 2;
+}
+
+/// Longest `key_ref` a write may name, in bytes.
+pub const KEY_REF_MAX: usize = 64;
+
+/// [`Kept`]'s wire bytes besides its `key_ref`:
+/// `[key_ref_len: u8][retain_until_ms: u64][legal_hold: u8]`.
+pub const KEPT_FIXED_LEN: usize = 1 + 8 + 1;
+
+/// What the store keeps with an object besides its bytes: the block
+/// `[key_ref_len: u8][key_ref][retain_until_ms: u64 LE][legal_hold: u8]`,
+/// carried by [`PUT`], [`PUT_STREAMED_OPEN`] and the [`HEAD`] record.
+///
+/// `key_ref` is an opaque name of the key that sealed the object, at most
+/// [`KEY_REF_MAX`] bytes. The store keeps it and returns it and never
+/// interprets it; the object's bytes are sealed before they reach the store.
+///
+/// `retain_until_ms` is a time in milliseconds since the Unix epoch, 0 for
+/// none. Until it passes, by the store's own clock, the object is retained.
+/// `legal_hold` holds the object until the hold is cleared ([`RETAIN`]).
+///
+/// ## Retained and held objects
+///
+/// While an object is retained or held, a `DELETE` of it and a `PUT` or
+/// `PUT_STREAMED_COMMIT` over it are refused with `ERETAINED`. The decision
+/// is the store's, at the write's linearization point, in the same log order
+/// as every other write ([`precondition`]'s atomicity rule), so a write and a
+/// [`RETAIN`] are ordered one way for every observer. A streamed write states
+/// the block at `PUT_STREAMED_OPEN` and is judged at its commit. A
+/// precondition that does not hold answers its own code first.
+///
+/// A write that lands replaces all three: the new object has what its own
+/// write stated, and nothing of the object it replaced.
+///
+/// A provider that cannot keep these refuses them ([`precondition`]) and
+/// reports [`Kept::none`] in every `HEAD` record.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Kept<'a> {
+    pub key_ref: &'a [u8],
+    pub retain_until_ms: u64,
+    pub legal_hold: bool,
+}
+
+impl<'a> Kept<'a> {
+    /// Nothing kept.
+    pub const fn none() -> Self {
+        Kept {
+            key_ref: &[],
+            retain_until_ms: 0,
+            legal_hold: false,
+        }
+    }
+
+    /// Whether this asks the store to keep nothing.
+    pub const fn is_none(&self) -> bool {
+        self.key_ref.is_empty() && self.retain_until_ms == 0 && !self.legal_hold
+    }
+
+    /// Encoded size.
+    pub const fn wire_len(&self) -> usize {
+        KEPT_FIXED_LEN + self.key_ref.len()
+    }
+
+    /// Parse the block at `at` in `a`, with the offset just past it. `None`,
+    /// which a provider answers `EINVAL`, when it is cut short, its `key_ref`
+    /// is past [`KEY_REF_MAX`], or `legal_hold` is neither 0 nor 1.
+    pub fn parse(a: &'a [u8], at: usize) -> Option<(Self, usize)> {
+        let len = *a.get(at)? as usize;
+        if len > KEY_REF_MAX {
+            return None;
+        }
+        let key_ref = a.get(at + 1..at + 1 + len)?;
+        let p = at + 1 + len;
+        let until = a.get(p..p + 8)?;
+        let retain_until_ms = u64::from_le_bytes([
+            until[0], until[1], until[2], until[3], until[4], until[5], until[6], until[7],
+        ]);
+        let legal_hold = match *a.get(p + 8)? {
+            0 => false,
+            1 => true,
+            _ => return None,
+        };
+        Some((
+            Kept {
+                key_ref,
+                retain_until_ms,
+                legal_hold,
+            },
+            p + 9,
+        ))
+    }
+
+    /// Encode into `out`; the bytes written, or `None` when `out` is too small
+    /// or `key_ref` is past [`KEY_REF_MAX`].
+    pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+        let len = self.key_ref.len();
+        if len > KEY_REF_MAX {
+            return None;
+        }
+        let o = out.get_mut(..KEPT_FIXED_LEN + len)?;
+        o[0] = len as u8;
+        o[1..1 + len].copy_from_slice(self.key_ref);
+        o[1 + len..1 + len + 8].copy_from_slice(&self.retain_until_ms.to_le_bytes());
+        o[1 + len + 8] = self.legal_hold as u8;
+        Some(KEPT_FIXED_LEN + len)
+    }
 }
 
 /// Open a blob for streaming reads.
@@ -253,6 +370,10 @@ pub const GET: u32 = 0x1421;
 ///   [content_type: content_type_len bytes]
 ///   [etag_len: u8]
 ///   [etag: etag_len bytes]
+///   [key_ref_len: u8]                         — see [`Kept`]
+///   [key_ref: key_ref_len bytes]
+///   [retain_until_ms: u64 LE]                 — 0 = none
+///   [legal_hold: u8]                          — 0 or 1
 /// ```
 ///
 /// and writes the encoded fence into `fence_out_ptr`. Returns the
@@ -291,8 +412,9 @@ pub const RANGE_GET: u32 = 0x1423;
 ///   [fence_out_cap: u16 LE]                   — must be >= `fence::WIRE_MAX_LEN`
 /// ```
 ///
-/// Returns 0 or negative errno. The provider writes the encoded
-/// fence into `fence_out_ptr` atomically with returning success.
+/// Returns 0 or negative errno, `ERETAINED` for a retained or held object
+/// (see [`Kept`]). The provider writes the encoded fence into `fence_out_ptr`
+/// atomically with returning success.
 pub const DELETE: u32 = 0x1424;
 
 /// Close a GET or PUT_STREAMED_OPEN handle.
@@ -344,6 +466,10 @@ pub const IMG_CLOSE: u32 = 0x1432;
 ///   [precondition: u8]                        — see `precondition`
 ///   [etag_len: u8]                            — 0 unless precondition = ETAG
 ///   [etag: etag_len bytes]
+///   [key_ref_len: u8]                         — see [`Kept`]
+///   [key_ref: key_ref_len bytes]
+///   [retain_until_ms: u64 LE]                 — 0 = none
+///   [legal_hold: u8]                          — 0 or 1
 /// ```
 ///
 /// Returns a non-negative streaming-write handle or negative errno.
@@ -386,7 +512,8 @@ pub const PUT_STREAMED_WRITE: u32 = 0x1427;
 ///   [fence_out_cap: u16 LE]                   — must be >= `fence::WIRE_MAX_LEN`
 /// ```
 ///
-/// Returns 0 or negative errno. On success the staged event-log
+/// Returns 0 or negative errno, `ERETAINED` over a retained or held object
+/// (see [`Kept`]). On success the staged event-log
 /// stream is committed under the object key, the handle's
 /// per-handle fence is updated to the strongest fence the commit
 /// achieved, and the encoded fence is also written into
@@ -402,6 +529,119 @@ pub const PUT_STREAMED_COMMIT: u32 = 0x1428;
 /// not observe any appended chunks. After ABORT the handle is
 /// released — callers do not need to `CLOSE`.
 pub const PUT_STREAMED_ABORT: u32 = 0x1429;
+
+// ── Retention and legal hold ────────────────────────────────────────
+
+/// Change a live object's retention or legal hold.
+///
+/// `handle = -1`, or a grant; `arg` is:
+///
+/// ```text
+///   [key_len: u16 LE]
+///   [key: key_len bytes]
+///   [retain_until_ms: u64 LE]                 — 0 = leave unchanged
+///   [hold: u8]                                — see `hold`
+///   [fence_out_ptr: u64 LE]                   — receives Fence::encode bytes
+///   [fence_out_cap: u16 LE]                   — must be >= `fence::WIRE_MAX_LEN`
+/// ```
+///
+/// [`retain`] is the codec for both sides.
+///
+/// `retain_until_ms` only extends: a value earlier than the one held is
+/// refused `ERETAINED` and changes nothing, the hold included, and the value
+/// already held is a success that moves nothing. A hold can be set and cleared
+/// ([`hold`]), and clearing one leaves any retention standing. The object's
+/// bytes, etag, mtime and `key_ref` do not change.
+///
+/// The store decides at its linearization point, in the same log order as
+/// writes ([`Kept`]), so a `RETAIN` is a write: it MAY answer `EINPROGRESS`,
+/// and a caller passes its answer to [`write_answer`].
+///
+/// Returns 0 or negative errno: `ENXIO` for an absent key, `EINVAL` for a
+/// malformed request or one that changes neither field, `ENOSYS` from a
+/// provider that cannot keep these. On success the provider writes the encoded
+/// fence into `fence_out_ptr`. A grant authorizes it with the store's write
+/// permission ([`grant::access_of`]): it changes what later writes may do, as
+/// a write does, and a scope that may write its objects may protect them.
+pub const RETAIN: u32 = 0x142C;
+
+/// [`RETAIN`]'s `hold` byte.
+pub mod hold {
+    /// Leave the hold as it is.
+    pub const LEAVE: u8 = 0;
+    /// Set the hold.
+    pub const SET: u8 = 1;
+    /// Clear the hold.
+    pub const CLEAR: u8 = 2;
+}
+
+/// The [`RETAIN`] wire codec. No `std`, no allocation.
+pub mod retain {
+    use super::super::handle::STORAGE_KEY_MAX;
+
+    /// Request bytes besides the key: `key_len`, `retain_until_ms`, `hold`,
+    /// `fence_out_ptr` and `fence_out_cap`.
+    pub const REQUEST_FIXED_LEN: usize = 2 + 8 + 1 + 8 + 2;
+
+    /// A decoded [`super::RETAIN`] request.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct Request<'a> {
+        pub key: &'a [u8],
+        pub retain_until_ms: u64,
+        pub hold: u8,
+        pub fence_out_ptr: u64,
+        pub fence_out_cap: u16,
+    }
+
+    /// Parse and validate a request. `None`, which the provider answers
+    /// `EINVAL`, when the bytes are not exactly one request, the key is empty
+    /// or past `STORAGE_KEY_MAX`, `hold` is not one of [`super::hold`], the
+    /// request changes neither field, or the fence buffer is null or smaller
+    /// than `fence::WIRE_MAX_LEN`.
+    pub fn parse_request(arg: &[u8]) -> Option<Request<'_>> {
+        let key_len = u16::from_le_bytes([*arg.first()?, *arg.get(1)?]) as usize;
+        if key_len == 0 || key_len > STORAGE_KEY_MAX || arg.len() != REQUEST_FIXED_LEN + key_len {
+            return None;
+        }
+        let key = arg.get(2..2 + key_len)?;
+        let t = arg.get(2 + key_len..)?;
+        let req = Request {
+            key,
+            retain_until_ms: u64::from_le_bytes([t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7]]),
+            hold: t[8],
+            fence_out_ptr: u64::from_le_bytes([
+                t[9], t[10], t[11], t[12], t[13], t[14], t[15], t[16],
+            ]),
+            fence_out_cap: u16::from_le_bytes([t[17], t[18]]),
+        };
+        if req.hold > super::hold::CLEAR
+            || (req.retain_until_ms == 0 && req.hold == super::hold::LEAVE)
+            || req.fence_out_ptr == 0
+            || (req.fence_out_cap as usize) < super::super::super::super::fence::WIRE_MAX_LEN
+        {
+            return None;
+        }
+        Some(req)
+    }
+
+    /// Encode `req` into `out`; the bytes written, or `None` when `out` is too
+    /// small or the key is past `STORAGE_KEY_MAX`.
+    pub fn encode_request(out: &mut [u8], req: &Request<'_>) -> Option<usize> {
+        let n = req.key.len();
+        if n > STORAGE_KEY_MAX {
+            return None;
+        }
+        let o = out.get_mut(..REQUEST_FIXED_LEN + n)?;
+        o[0..2].copy_from_slice(&(n as u16).to_le_bytes());
+        o[2..2 + n].copy_from_slice(req.key);
+        let t = 2 + n;
+        o[t..t + 8].copy_from_slice(&req.retain_until_ms.to_le_bytes());
+        o[t + 8] = req.hold;
+        o[t + 9..t + 17].copy_from_slice(&req.fence_out_ptr.to_le_bytes());
+        o[t + 17..t + 19].copy_from_slice(&req.fence_out_cap.to_le_bytes());
+        Some(REQUEST_FIXED_LEN + n)
+    }
+}
 
 // ── Enumeration ─────────────────────────────────────────────────────
 
@@ -814,8 +1054,8 @@ pub mod list {
 // leaf names that scope's object ([`grant::scope_object`]); the provider
 // verifies the chain against its roots and its trusted clock and answers a
 // grant handle. Every later op passes the grant as its `handle` — `PUT`,
-// `GET`, `HEAD`, `DELETE`, `LIST` and `PUT_STREAMED_OPEN`, which otherwise
-// take `-1` — and is admitted only when:
+// `GET`, `HEAD`, `DELETE`, `LIST`, `RETAIN` and `PUT_STREAMED_OPEN`, which
+// otherwise take `-1` — and is admitted only when:
 //
 //   - the key (or, for `LIST`, the prefix) lies inside the scope;
 //   - the grant carries the permission the op's class needs
@@ -907,7 +1147,8 @@ pub mod grant {
             | super::PUT_STREAMED_OPEN
             | super::PUT_STREAMED_WRITE
             | super::PUT_STREAMED_COMMIT
-            | super::PUT_STREAMED_ABORT => Some(StorageAccess::Write),
+            | super::PUT_STREAMED_ABORT
+            | super::RETAIN => Some(StorageAccess::Write),
             _ => None,
         }
     }
@@ -1058,24 +1299,26 @@ pub mod range {
     }
 
     /// Minimum encoded size of a `HEAD` record: `size` + `mtime` + the
-    /// two length prefixes, with empty content-type and etag.
-    pub const HEAD_MIN_LEN: usize = 8 + 8 + 1 + 1;
+    /// two length prefixes + the `Kept` block, with empty content-type, etag
+    /// and `key_ref`.
+    pub const HEAD_MIN_LEN: usize = 8 + 8 + 1 + 1 + super::KEPT_FIXED_LEN;
 
     /// Encode a `HEAD` record into `out` per the `object::HEAD` layout
-    /// (`[size:u64][mtime:u64][ct_len:u8][ct][etag_len:u8][etag]`).
-    /// Returns the number of bytes written, or `None` if `out` is too
-    /// small or a field exceeds its `u8` length prefix.
+    /// (`[size:u64][mtime:u64][ct_len:u8][ct][etag_len:u8][etag]`, then the
+    /// `Kept` block). Returns the number of bytes written, or `None` if `out`
+    /// is too small or a field exceeds its length bound.
     pub fn encode_head(
         out: &mut [u8],
         size: u64,
         mtime: u64,
         content_type: &[u8],
         etag: &[u8],
+        kept: super::Kept<'_>,
     ) -> Option<usize> {
         if content_type.len() > u8::MAX as usize || etag.len() > u8::MAX as usize {
             return None;
         }
-        let total = HEAD_MIN_LEN + content_type.len() + etag.len();
+        let total = HEAD_MIN_LEN + content_type.len() + etag.len() + kept.key_ref.len();
         if out.len() < total {
             return None;
         }
@@ -1090,6 +1333,7 @@ pub mod range {
         p += 1;
         out[p..p + etag.len()].copy_from_slice(etag);
         p += etag.len();
+        p += kept.encode(out.get_mut(p..)?)?;
         Some(p)
     }
 
@@ -1101,8 +1345,9 @@ pub mod range {
     }
 
     /// Decode a `HEAD` record, returning its fixed fields plus borrowed
-    /// `content_type` and `etag` slices. Returns `None` on truncation.
-    pub fn decode_head(buf: &[u8]) -> Option<(Head, &[u8], &[u8])> {
+    /// `content_type` and `etag` slices and its `Kept` block. Returns `None`
+    /// on truncation or a malformed `Kept` block.
+    pub fn decode_head(buf: &[u8]) -> Option<(Head, &[u8], &[u8], super::Kept<'_>)> {
         if buf.len() < HEAD_MIN_LEN {
             return None;
         }
@@ -1124,6 +1369,7 @@ pub mod range {
             return None;
         }
         let etag = &buf[etag_start..etag_end];
+        let (kept, _) = super::Kept::parse(buf, etag_end)?;
         Some((
             Head {
                 size: u64::from_le_bytes(size),
@@ -1131,6 +1377,7 @@ pub mod range {
             },
             content_type,
             etag,
+            kept,
         ))
     }
 

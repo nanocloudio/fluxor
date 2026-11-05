@@ -51,7 +51,7 @@ request.
 - **Presenting.** Given `scope` and `capability`, the module presents them to
   the store once (`PRESENT`, `contracts/storage/object.rs`), and every call it
   makes for every request — `HEAD`, `GET`, `PUT`, `PUT_STREAMED_OPEN`,
-  `DELETE`, `LIST` — names the grant the store answered. The grant is held for
+  `DELETE`, `RETAIN`, `LIST` — names the grant the store answered. The grant is held for
   the module's life and dropped (`CLOSE`) when the module is destroyed.
 - **None given.** Every call names no grant (`-1`). A store with no mesh roots
   serves those calls; a store with roots refuses each `EACCES`, which arrives
@@ -112,9 +112,10 @@ starting with `?` (the listing's own target) are refused `400`.
 | `PUT /<name>`, body inline in the HEAD | `PUT` | `200`, no body |
 | `PUT /<name>`, body continuing (`MORE`) | `PUT_STREAMED_OPEN`, `_WRITE`, `_COMMIT` | `200`, no body |
 | `DELETE /<name>` | `DELETE` | `204` |
+| `PATCH /<name>` with `retain-until`, `legal-hold` or both, no body | `RETAIN` | `200`, no body |
 | `GET /?list…` | `LIST` | `200`, one page of names below the scope |
 
-Any other method — `POST`, `PATCH`, `OPTIONS`, `CONNECT`, `PUBLISH` — and a
+Any other method — `POST`, `OPTIONS`, `CONNECT`, `PUBLISH` — and a
 request flagged `WEBSOCKET`, `WEBTRANSPORT` or `BROADCAST` are refused `400`.
 
 ### Request headers
@@ -126,16 +127,52 @@ request flagged `WEBSOCKET`, `WEBTRANSPORT` or `BROADCAST` are refused `400`.
 | `content-length` | `PUT` | the streamed put's size hint; digits only |
 | `if-none-match: *` | `PUT` | create only: the store refuses an existing name |
 | `if-match: <hex etag>` | `PUT`, `DELETE` | only if the object's entity tag is this one; quoted or not |
+| `key-ref: <name>` | `PUT` | the name of the key that sealed the object: 1 to 64 bytes of visible ASCII, kept and returned, never interpreted |
+| `retain-until: <ms>` | `PUT`, `PATCH` | milliseconds since the Unix epoch, digits only, not zero: until then the object can be neither overwritten nor deleted. `PATCH` can only extend it |
+| `legal-hold: on` or `off` | `PUT`, `PATCH` | `on` holds the object until a `PATCH` says `off`; on a `PUT`, `off` is the default |
 
 `if-none-match` with any other value, both conditions at once, and an
 `if-match` that is not hex or names more than `ETAG_MAX` bytes are refused
 `400`. A condition is the store's to judge, at the write's own linearization
 point: the module never reads first to decide.
 
+A `key-ref` outside its bound, a `retain-until` that is not digits or is zero,
+a `legal-hold` that is neither `on` nor `off`, a `PATCH` with neither
+`retain-until` nor `legal-hold`, and a `PATCH` with a body or flagged `MORE`
+are refused `400`. Retention and the hold are the store's to judge, by its own
+clock and at the write's linearization point (`Kept`,
+`contracts/storage/object.rs`). A store that cannot keep one refuses it, which
+is answered `501`: a `200` always means the store kept what was asked.
+
 A `range` that is not one of the three forms, including a list of ranges, is
 refused `400`. A last-byte position past the end means the end. A range that
 starts at or past the end, a suffix of zero bytes, and any range of an empty
 object are answered `416` with `content-range: bytes */<size>`.
+
+### Headers refused
+
+A header this module does not act on must not change what the request means.
+Before a request is routed every header is checked, its name compared without
+regard to case, and any of these is refused `400`, `RAISED`, without a call to
+the store:
+
+- any `if-*` header other than `if-match` and `if-none-match`, on any method:
+  `if-range`, `if-modified-since`, `if-unmodified-since` and unknown ones;
+- `if-match` or `if-none-match` on any method but `PUT` and `DELETE`;
+- `content-range` on any method: a put replaces the whole object;
+- any header whose name contains `retain`, `retention`, `legal-hold`,
+  `object-lock`, `key-ref` (each of these also spelled with `_`), `immutab` or
+  `encryption`, other than the exact names on the
+  methods that honour them: `retain-until`, `legal-hold` and `key-ref` on
+  `PUT`; `retain-until` and `legal-hold` on `PATCH`. So a vendor's spelling
+  (`x-amz-object-lock-mode`, `x-amz-server-side-encryption`) is refused rather
+  than dropped;
+- `if-match`, `if-none-match`, `retain-until`, `legal-hold`, `key-ref` or
+  `range` given more than once.
+
+Every other header — `host`, `user-agent`, `accept`, `authorization`,
+`x-request-id` and so on — is ignored: HTTP fronts relay them, and they do not
+change what the request means.
 
 ### Response headers
 
@@ -145,12 +182,17 @@ object are answered `416` with `content-range: bytes */<size>`.
 | `content-range` | `206`, `416` | `bytes a-b/<size>`, or `bytes */<size>` |
 | `etag` | `GET`, `HEAD` | the object's entity tag, lowercase hex, when the store keeps one |
 | `fence` | every success | the lowercase hex of `Fence::encode` |
+| `retain-until` | `GET`, `HEAD` | the object's retention, in milliseconds since the Unix epoch, when it has one, passed or not |
+| `legal-hold` | `GET`, `HEAD` | `on`, when the object is held |
+| `key-ref` | `GET`, `HEAD` | the name the store keeps with the object, when it keeps one |
 | `next` | a listing page that is not the last | the cursor to resume after, below the scope, encoded as a listing line |
 
 The response's content type is the one the store keeps for the object; a store
 that keeps none answers an empty one. A read's fence is the one its read handle
 reports (`LAST_FENCE`), or the `HEAD` record's when the provider reports none;
-a write's is the one its commit reported.
+a write's is the one its commit reported. A store's `key_ref` that is not
+visible ASCII, which another writer could have stored, cannot be a header
+value: the read is refused `500`, `RAISED`.
 
 ## Listing
 
@@ -196,15 +238,16 @@ answer and is not.
 | `200` | answered; a write is durable at the fence named | no |
 | `204` | deleted | no |
 | `206` | a range | no |
-| `400` | a request this module cannot route or parse (see above) | yes |
+| `400` | a request this module cannot route or parse, or a header it refuses (see above) | yes |
 | `400` | the store refused the request as malformed (`EINVAL`) | no |
 | `403` | the store refused access (`EACCES`), or refused the module's capability | no |
 | `404` | the store has no such object (`ENXIO`, `ENOENT`) | no |
 | `412` | a condition did not hold (`EEXIST`; `EAGAIN` on a write) | no |
 | `413` | the store will not take the body (`ENOSPC`, `E2BIG`) | no |
 | `416` | an unsatisfiable range | no |
+| `423` | the object's retention or legal hold refuses the `PUT` or `DELETE`, or a `PATCH` would shorten its retention (`ERETAINED`) | no |
 | `500` | the store failed, or answered something the module cannot carry | yes when the module could not answer, no when the store failed |
-| `501` | the store does not offer the operation (`ENOSYS`) | no |
+| `501` | the store does not offer the operation, or cannot keep a `key-ref`, a retention or a hold (`ENOSYS`) | no |
 | `503` | every exchange slot is taken | yes |
 | `503` | the store is busy (`EBUSY`, `ENOMEM`), or had no room for the capability's grant | no |
 
@@ -275,6 +318,7 @@ Each refuses rather than clamps.
 | Listing `prefix` and `after`, the scope included | `STORAGE_KEY_MAX`, 255 bytes | `400` |
 | Stored content type | 255 bytes | `400` |
 | `if-match` entity tag (`ETAG_MAX`) | 32 bytes | `400` |
+| `key-ref` (`KEY_REF_MAX`) | 64 bytes of visible ASCII | `400` |
 | Listing page | `max` 1 to 1000 | `400` |
 | Request body past its credit | the window granted | ABORT `CREDIT_OVERRUN` |
 | Records read, and written, per step (`STEP_RECORD_BUDGET`) | 16 | the rest wait for the next step |
@@ -308,5 +352,5 @@ for want of a slot), `aborts` (exchanges the requester aborted).
 - **A public S3 surface.** Request signatures, S3's XML and multipart uploads
   belong to an S3 front, which can sit in front of this module as a
   requester.
-- **Multiple ranges, conditional reads** (`if-match` on `GET`), and server-side
-  copies.
+- **Multiple ranges, conditional reads** (`if-match` on `GET`, refused `400`),
+  and server-side copies.

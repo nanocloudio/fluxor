@@ -258,7 +258,8 @@ pub enum Arg {
 /// find each of them in it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Walker {
-    /// `storage.object` PUT: key, content type, body (in), etag, fence out.
+    /// `storage.object` PUT: key, content type, body (in), etag, key
+    /// reference, retention, hold, fence out.
     StoragePut,
     /// `storage.object` HEAD: key, record out, fence out.
     StorageHead,
@@ -268,6 +269,8 @@ pub enum Walker {
     StorageRangeGet,
     /// `storage.object` LIST: prefix, cursor, max keys, page out, fence out.
     StorageList,
+    /// `storage.object` RETAIN: key, retention, hold, fence out.
+    StorageRetain,
     /// `channel::IOCTL`: `[cmd: u32]` then the command's own argument. Only
     /// the kernel's built-in commands and the `storage.block` requests are
     /// admitted; a block request's buffer is the pointer walked.
@@ -392,20 +395,28 @@ pub static RULES: &[Rule] = &[
     walked(0x1423, HandleUse::Minted, WALK_MAX, Walker::StorageRangeGet),
     walked(0x1424, HandleUse::Scoped, WALK_MAX, Walker::StorageDelete),
     walked(0x142A, HandleUse::Scoped, WALK_MAX, Walker::StorageList),
+    walked(0x142C, HandleUse::Scoped, WALK_MAX, Walker::StorageRetain),
     // PRESENT: no pointers; the refusal is written into the request.
     rule(0x142B, HandleUse::Mints, Arg::InOut(ANY)),
     closing(0x1425), // CLOSE
 ];
 
 /// Longest argument struct the gateway copies to walk, sized to the largest
-/// request a gated caller makes: a `storage.object` `LIST` carrying a prefix
-/// and a cursor of `STORAGE_KEY_MAX` bytes each, rounded up to 16. A caller
-/// can therefore resume a listing at any key a provider holds.
-const WALK_MAX: usize = 544;
+/// request a gated caller makes: a `storage.object` `PUT` carrying a key and a
+/// content type of their longest, a 32-byte entity tag and a key reference of
+/// `KEY_REF_MAX`, rounded up to 16. A `LIST` with a prefix and a cursor of
+/// `STORAGE_KEY_MAX` bytes each fits too, so a caller can resume a listing at
+/// any key a provider holds.
+const WALK_MAX: usize = 656;
 const _: () = {
-    use crate::abi::contracts::storage::{handle::STORAGE_KEY_MAX, object::list};
-    let need = list::REQUEST_FIXED_LEN + 2 * STORAGE_KEY_MAX;
-    assert!(WALK_MAX >= need && WALK_MAX - 16 < need);
+    use crate::abi::contracts::storage::{
+        handle::STORAGE_KEY_MAX,
+        object::{list, KEPT_FIXED_LEN, KEY_REF_MAX},
+    };
+    let list_need = list::REQUEST_FIXED_LEN + 2 * STORAGE_KEY_MAX;
+    let put_need =
+        2 + STORAGE_KEY_MAX + 1 + 255 + 8 + 8 + 2 + 32 + KEPT_FIXED_LEN + KEY_REF_MAX + 10;
+    assert!(WALK_MAX >= list_need && WALK_MAX >= put_need && WALK_MAX - 16 < put_need);
 };
 
 /// A pointer an argument struct carries: where, how long, and whether the
@@ -467,6 +478,10 @@ pub fn walk(walker: Walker, arg: &[u8]) -> Option<([Embedded; 3], usize)> {
             r.u8()?; // precondition
             let e = r.u8()?;
             r.take(e)?;
+            let kr = r.u8()?;
+            r.take(kr)?;
+            r.u64()?; // retain_until_ms
+            r.u8()?; // legal_hold
             out[1] = Embedded {
                 ptr: r.u64()?,
                 len: r.u16()?,
@@ -495,6 +510,18 @@ pub fn walk(walker: Walker, arg: &[u8]) -> Option<([Embedded; 3], usize)> {
             r.u8()?; // precondition
             let e = r.u8()?;
             r.take(e)?;
+            out[0] = Embedded {
+                ptr: r.u64()?,
+                len: r.u16()?,
+                write: true,
+            };
+            1
+        }
+        Walker::StorageRetain => {
+            let k = r.u16()?;
+            r.take(k)?;
+            r.u64()?; // retain_until_ms
+            r.u8()?; // hold
             out[0] = Embedded {
                 ptr: r.u64()?,
                 len: r.u16()?,

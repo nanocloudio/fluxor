@@ -232,7 +232,8 @@ fn save_slot_gens<S: Storage>(store: &mut GenStore<S>, gens: &[u32]) -> Result<(
         .map_err(|_| StoreError::WriteFailed)
 }
 
-fn load_desired<S: Storage>(store: &GenStore<S>) -> Result<Vec<WorkloadDesired>, StoreError> {
+/// The node's persisted desired workload set.
+pub fn load_desired<S: Storage>(store: &GenStore<S>) -> Result<Vec<WorkloadDesired>, StoreError> {
     // Absent → first run (empty desired set). Present but undecodable → hard
     // error: silently treating corrupt state as an empty set would drop every
     // live workload on the next reconcile. An I/O fault is a hard error too — a
@@ -495,6 +496,10 @@ struct RuntimeStatusFile {
     /// to it: after a new commit/publish, live state from the previous
     /// generation must not be attached to the new durable workload records.
     plan_generation: u64,
+    /// Digest of the plan the writer applied: the sha256 over its body, verified
+    /// when the runtime decoded it. Absent from a writer that does not report it.
+    #[serde(default)]
+    plan_digest: Option<String>,
     workloads: Vec<RuntimeStatusWorkload>,
 }
 
@@ -564,6 +569,10 @@ pub struct NodeStatus {
     /// generation at boot.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub committed_abi_surface: Option<String>,
+    /// Digest (hex) of the plan a live runtime reports having applied, present
+    /// only when that runtime reports the committed generation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_plan_digest: Option<String>,
     pub workloads: Vec<WorkloadStatus>,
 }
 
@@ -648,6 +657,7 @@ pub fn node_status<S: Storage>(store: &GenStore<S>) -> Result<NodeStatus, StoreE
         generation,
         abi_surface: crate::hash::hex(&crate::hash::abi_surface_digest()),
         committed_abi_surface,
+        runtime_plan_digest: None,
         workloads,
     })
 }
@@ -669,6 +679,7 @@ pub fn node_status_with_runtime<S: Storage>(store: &GenStore<S>) -> Result<NodeS
         // hasn't rebuilt onto the new commit yet, or is behind a rollback)
         // must not be joined to the new durable records.
         if Some(file.plan_generation) == st.generation {
+            st.runtime_plan_digest.clone_from(&file.plan_digest);
             // Declared exports per workload, for the declared⇄bound endpoint join
             // (the agent owns this join; the runtime reported only the raw
             // binds it observed, with no notion of what was declared).
@@ -766,6 +777,95 @@ fn proc_start_ticks(pid: u32) -> Option<u64> {
     }
     // The field just consumed is field 3 (`state`); `starttime` is field 22.
     fields.nth(18)?.parse().ok()
+}
+
+/// What a bundle directory says of the workload once it has passed admission.
+#[derive(Clone, Debug)]
+pub struct ResolvedBundle {
+    pub name: String,
+    pub profile: crate::compose::ResourceProfile,
+    /// The workload digest: the sha256 of the bundle's `workload.json`, which
+    /// pins `resources.json` and `graph.yaml` by their own digests.
+    pub workload_digest: [u8; 32],
+    pub exports: Vec<crate::compose::ExportDecl>,
+}
+
+/// Verify an on-disk artifact's content hashes to the manifest's pinned digest.
+/// A bundle whose artifact bytes don't match the declared digest is rejected —
+/// modified artifacts must never be admitted.
+fn verify_artifact(bytes: &[u8], declared: &str, what: &str) -> Result<(), String> {
+    let actual = format!("sha256:{}", crate::hash::hex(&sha256(bytes)));
+    if actual != declared {
+        return Err(format!(
+            "bundle {what}: content digest mismatch (manifest pins {declared}, artifact is {actual})"
+        ));
+    }
+    Ok(())
+}
+
+/// Validate a bundle dir and extract the workload's resource profile + workload
+/// digest from it. Admission-gates the manifest: a bundle that fails
+/// validation, lacks a linux implementation, or whose artifacts don't match the
+/// manifest's pinned digests is rejected before anything is committed. The
+/// error is the diagnostic, verbatim.
+///
+/// This is the trust model of a manifest from a trusted source: the artifacts
+/// (`resources.json`, `graph.yaml`) are verified against the digests it pins, so
+/// a modified artifact fails. A signature over the manifest itself is not part
+/// of this format.
+pub fn resolve_bundle(dir: &std::path::Path) -> Result<ResolvedBundle, String> {
+    use crate::workload::{
+        parse_manifest, parse_resource_profile, select_implementation, validate,
+    };
+
+    let manifest_json = std::fs::read_to_string(dir.join("workload.json"))
+        .map_err(|e| format!("bundle {}: workload.json: {e}", dir.display()))?;
+    let manifest = parse_manifest(&manifest_json)?;
+    let report = validate(&manifest);
+    if !report.is_ok() {
+        return Err(format!(
+            "bundle '{}' failed validation: {}",
+            manifest.name,
+            report.errors.join("; ")
+        ));
+    }
+    let imp = select_implementation(&manifest, "linux", "aarch64", 1).ok_or_else(|| {
+        format!(
+            "bundle '{}' has no linux/aarch64/abi-1 implementation",
+            manifest.name
+        )
+    })?;
+
+    // Verify the bundle's artifacts against the digests the manifest pins.
+    let resources_json = std::fs::read(dir.join("resources.json"))
+        .map_err(|e| format!("bundle {}: resources.json: {e}", dir.display()))?;
+    verify_artifact(&resources_json, &imp.resources.digest, "resources.json")?;
+    let graph_yaml = std::fs::read(dir.join("graph.yaml"))
+        .map_err(|e| format!("bundle {}: graph.yaml: {e}", dir.display()))?;
+    verify_artifact(&graph_yaml, &imp.graph.digest, "graph.yaml")?;
+
+    let doc = parse_resource_profile(
+        &String::from_utf8(resources_json)
+            .map_err(|e| format!("bundle {}: resources.json: {e}", dir.display()))?,
+    )?;
+
+    // Declared exports travel with the desired workload so `agent status` can join
+    // them against the runtime's report of what actually bound.
+    let exports = manifest
+        .contract
+        .exports
+        .iter()
+        .map(|e| crate::compose::ExportDecl {
+            protocol: e.protocol.clone(),
+            port: e.port,
+        })
+        .collect();
+    Ok(ResolvedBundle {
+        name: manifest.name.clone(),
+        profile: doc.to_compose(),
+        workload_digest: sha256(manifest_json.as_bytes()),
+        exports,
+    })
 }
 
 /// Upsert `workload` into the node's persisted desired state and recompose ALL

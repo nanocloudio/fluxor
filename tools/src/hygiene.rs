@@ -13,7 +13,7 @@
 //!        staged, digest-verified `target/fluxor/**` tree, never a
 //!        raw `deps/<project>/modules/{sdk,common}/` checkout.
 //!      - Pending-write rule: in `modules/**`, a storage write's
-//!        return code (`storage.object` PUT/DELETE/PUT_STREAMED_COMMIT,
+//!        return code (`storage.object` PUT/DELETE/PUT_STREAMED_COMMIT/RETAIN,
 //!        `storage.namespace` RENAME/DELETE/BIND) must go straight
 //!        into `write_answer(...)`, because the write may answer
 //!        `EINPROGRESS`. There is no exemption row; classify the answer.
@@ -916,9 +916,9 @@ fn is_normative_surface(rel: &Path) -> bool {
 
 /// Storage write opcodes whose answer may be `EINPROGRESS`
 /// (`modules/sdk/contracts/storage/object.rs`, "Writes: `EINPROGRESS` means ask again
-/// with the same request"): `storage.object` PUT, DELETE and
-/// PUT_STREAMED_COMMIT, and `storage.namespace` RENAME, DELETE and BIND.
-const STORAGE_WRITE_OPS: [u64; 6] = [0x1420, 0x1424, 0x1428, 0x1303, 0x1304, 0x1308];
+/// with the same request"): `storage.object` PUT, DELETE, PUT_STREAMED_COMMIT
+/// and RETAIN, and `storage.namespace` RENAME, DELETE and BIND.
+const STORAGE_WRITE_OPS: [u64; 7] = [0x1420, 0x1424, 0x1428, 0x142C, 0x1303, 0x1304, 0x1308];
 
 /// pending-write: a storage write's return code must go straight into
 /// `write_answer(...)`, so the `WriteAnswer` it becomes makes every caller
@@ -1094,7 +1094,7 @@ fn is_write_op_path(e: &syn::Expr) -> bool {
     let owner = segs[segs.len() - 2].to_ascii_lowercase();
     let object = owner.contains("obj");
     let namespace = owner == "ns" || owner.contains("namespace");
-    (object && matches!(name, "PUT" | "DELETE" | "PUT_STREAMED_COMMIT"))
+    (object && matches!(name, "PUT" | "DELETE" | "PUT_STREAMED_COMMIT" | "RETAIN"))
         || (namespace && matches!(name, "RENAME" | "DELETE" | "BIND"))
 }
 
@@ -2867,6 +2867,10 @@ include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
     fn a_write_is_known_by_its_literal_or_a_constant() {
         let lit = "fn f() { provider_call(-1, 0x1424, p, n); }";
         assert_eq!(pending(lit), 1);
+        let retain = "fn f() { provider_call(-1, 0x142C, p, n); }";
+        assert_eq!(pending(retain), 1, "a RETAIN is a write");
+        let retain = "fn f() { provider_call(-1, obj::RETAIN, p, n); }";
+        assert_eq!(pending(retain), 1, "a RETAIN by name");
         let konst =
             "const OBJ_COMMIT: u32 = 0x1428; fn f() { provider_call(h, OBJ_COMMIT, p, 0); }";
         assert_eq!(pending(konst), 1);

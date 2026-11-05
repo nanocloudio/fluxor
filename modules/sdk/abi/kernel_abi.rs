@@ -362,6 +362,10 @@ pub mod errno {
     pub const ETIMEDOUT: i32 = -110;
     /// Connection refused.
     pub const ECONNREFUSED: i32 = -111;
+    /// A `storage.object` object's retention or legal hold refuses the
+    /// change. No host errno has this value, so a provider relaying a host
+    /// call's answer can never produce it by accident.
+    pub const ERETAINED: i32 = -200;
 }
 
 // ─────────────────────────────────────────────────────────────────────

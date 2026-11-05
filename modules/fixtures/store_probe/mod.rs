@@ -242,7 +242,8 @@ unsafe fn put(
     fence: &mut [u8; FENCE_CAP],
 ) -> WriteAnswer {
     // [key_len:u16][key][ct_len:u8][body_ptr:u64][body_len:u64]
-    // [precondition:u8][etag_len:u8][fence_ptr:u64][fence_cap:u16]
+    // [precondition:u8][etag_len:u8][key_ref_len:u8][retain_until_ms:u64]
+    // [legal_hold:u8][fence_ptr:u64][fence_cap:u16]
     let mut arg = [0u8; 320];
     let mut p = 0usize;
     arg[0..2].copy_from_slice(&(key.len() as u16).to_le_bytes());
@@ -258,6 +259,7 @@ unsafe fn put(
     arg[p] = 0; // precondition ANY
     arg[p + 1] = 0; // etag_len
     p += 2;
+    p += 10; // no key_ref, no retention, no hold: already zero
     arg[p..p + 8].copy_from_slice(&(fence.as_mut_ptr() as u64).to_le_bytes());
     p += 8;
     arg[p..p + 2].copy_from_slice(&(FENCE_CAP as u16).to_le_bytes());

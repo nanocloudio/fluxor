@@ -54,11 +54,12 @@ pub struct OwnerStatusWriter {
     /// This process's start time (clock ticks since boot), written into the
     /// file so the reader can tell this writer from a recycled PID.
     pid_start_ticks: u64,
-    /// Last emitted `(plan_generation, workloads payload)` — rewrite only on
-    /// change. The generation is part of the key: the reader scopes its join
-    /// to the committed generation, so a plan reload must rewrite the file
-    /// even when the derived workload states are byte-identical.
-    last_emit: Option<(u64, String)>,
+    /// Last emitted `(plan_generation, plan_digest, workloads payload)` —
+    /// rewrite only on change. The generation and digest are part of the key:
+    /// the reader scopes its join to the committed generation, so a plan reload
+    /// must rewrite the file even when the derived workload states are
+    /// byte-identical.
+    last_emit: Option<(u64, [u8; 32], String)>,
 }
 
 impl OwnerStatusWriter {
@@ -122,16 +123,21 @@ impl OwnerStatusWriter {
             workloads_json.push_str(&entry);
         }
         let plan_generation = crate::kernel::workload::owner_plan::last_applied_generation();
-        if self
-            .last_emit
-            .as_ref()
-            .is_some_and(|(g, p)| *g == plan_generation && *p == workloads_json)
-        {
+        let plan_digest = crate::kernel::workload::owner_plan::last_applied_digest();
+        if self.last_emit.as_ref().is_some_and(|(g, d, p)| {
+            *g == plan_generation && *d == plan_digest && *p == workloads_json
+        }) {
             return;
         }
+        let plan_digest_hex: String = plan_digest.iter().fold(String::new(), |mut s, b| {
+            use std::fmt::Write;
+            let _ = write!(s, "{b:02x}");
+            s
+        });
         let body = format!(
             "{{\n  \"version\": 1,\n  \"pid\": {},\n  \"pid_start_ticks\": {},\n  \
              \"plan_generation\": {plan_generation},\n  \
+             \"plan_digest\": \"{plan_digest_hex}\",\n  \
              \"written_at\": \"{}\",\n  \"workloads\": [{}\n  ]\n}}\n",
             std::process::id(),
             self.pid_start_ticks,
@@ -140,7 +146,7 @@ impl OwnerStatusWriter {
         );
         match write_atomic(&self.path, body.as_bytes()) {
             Ok(()) => {
-                self.last_emit = Some((plan_generation, workloads_json));
+                self.last_emit = Some((plan_generation, plan_digest, workloads_json));
             }
             Err(e) => {
                 // Non-fatal: the runtime must keep stepping even when the

@@ -52,6 +52,7 @@ How the system works. These are the authoritative references.
 - [architecture/security.md](architecture/security.md) — trust root, module signing, KEY_VAULT, network hardening
 - [architecture/pin_allocation.md](architecture/pin_allocation.md) — GPIO allocation, pin validation, peripheral assignments
 - [architecture/owner_status.md](architecture/owner_status.md) — per-owner live status and `owner_status.json`
+- [architecture/agent_protocol.md](architecture/agent_protocol.md) — one request and its answer between a controller and a target's node agent
 - [architecture/monitor-protocol.md](architecture/monitor-protocol.md) — the monitor record stream and its vocabularies
 - [architecture/rig-backend-protocol.md](architecture/rig-backend-protocol.md) — how a rig backend executable is invoked and what it reports
 

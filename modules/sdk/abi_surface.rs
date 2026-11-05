@@ -143,6 +143,7 @@ pub fn for_each_field(f: &mut impl FnMut(&str, i64)) {
     f("errno.ENOTCONN", ka::errno::ENOTCONN as i64);
     f("errno.ETIMEDOUT", ka::errno::ETIMEDOUT as i64);
     f("errno.ECONNREFUSED", ka::errno::ECONNREFUSED as i64);
+    f("errno.ERETAINED", ka::errno::ERETAINED as i64);
 
     // ── channel opcodes ──
     f("channel.OPEN", ka::channel::OPEN as i64);

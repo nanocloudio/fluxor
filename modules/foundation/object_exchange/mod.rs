@@ -34,6 +34,11 @@
 //! off. Names are opaque bytes, so the concatenation alone keeps every target
 //! inside the scope.
 //!
+//! A header this module does not act on must not change what the request
+//! means, so before anything is routed every header is checked against the
+//! method (`refused_header`): a conditional, retention or encryption header
+//! the method does not honour is refused, never dropped.
+//!
 //! The surface — targets, headers, statuses, limits — is in `README.md`.
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
@@ -100,10 +105,23 @@ const _: () = assert!(
     WINDOW >= obj::list::min_out_cap(NAME_MAX, u8::MAX as usize),
     "a LIST page in the window holds the longest entry"
 );
-/// A `PUT`, `PUT_STREAMED_OPEN` or `DELETE` request, or a `LIST` request,
-/// whichever is longer: kept whole while the provider may be asked again.
+/// A `PUT`, `PUT_STREAMED_OPEN`, `DELETE` or `RETAIN` request, or a `LIST`
+/// request, whichever is longer: kept whole while the provider may be asked
+/// again.
 const ARG_LEN: usize = {
-    let put = 2 + NAME_MAX + 1 + CT_MAX + 8 + 8 + 1 + 1 + ETAG_MAX + 8 + 2;
+    let put = 2
+        + NAME_MAX
+        + 1
+        + CT_MAX
+        + 8
+        + 8
+        + 1
+        + 1
+        + ETAG_MAX
+        + obj::KEPT_FIXED_LEN
+        + obj::KEY_REF_MAX
+        + 8
+        + 2;
     let list = obj::list::REQUEST_FIXED_LEN + 2 * NAME_MAX;
     if put > list {
         put
@@ -112,9 +130,24 @@ const ARG_LEN: usize = {
     }
 };
 /// A response's header block: `content-length`, a hex entity tag of the
-/// longest a `HEAD` record carries, a hex fence and a `content-range`, or a
-/// listing's encoded `next` cursor.
+/// longest a `HEAD` record carries, a hex fence, a `content-range`,
+/// `retain-until`, `legal-hold` and `key-ref`; or a listing's encoded `next`
+/// cursor and a hex fence.
 const HEADERS_LEN: usize = 1280;
+const _: () = {
+    let line = 2 + 2; // `: ` and the line's end.
+    let number = 20; // The longest `u64`.
+    let fence = 5 + line + 2 * WIRE_MAX_LEN;
+    let read = (14 + line + number)
+        + (4 + line + 2 * u8::MAX as usize)
+        + fence
+        + (13 + line + 8 + 3 * number)
+        + (12 + line + number)
+        + (10 + line + 2)
+        + (7 + line + obj::KEY_REF_MAX);
+    let listing = fence + 4 + line + 3 * NAME_MAX;
+    assert!(HEADERS_LEN >= read && HEADERS_LEN >= listing);
+};
 /// Steps between telemetry reports.
 const TLM_PERIOD: u32 = 4096;
 /// Longest `scope`: a key prefix, bounded as keys are.
@@ -150,6 +183,8 @@ enum Phase {
     PutCommit,
     /// A `DELETE` is being decided (asked again on `EINPROGRESS`).
     Delete,
+    /// A `RETAIN` is being decided (asked again on `EINPROGRESS`).
+    Retain,
     /// A `LIST` page is being read (asked again on `EAGAIN`).
     List,
     /// The listing goes out: the HEAD, then its lines as credit allows.
@@ -540,6 +575,97 @@ fn parse_range(v: &[u8]) -> Option<RangeSpec> {
     Some(RangeSpec::From(a, Some(b)))
 }
 
+/// Whether `hay` contains `needle`, ASCII case aside.
+fn contains_ignoring_case(hay: &[u8], needle: &[u8]) -> bool {
+    let mut at = 0usize;
+    while let Some(w) = hay.get(at..at + needle.len()) {
+        if w.eq_ignore_ascii_case(needle) {
+            return true;
+        }
+        at += 1;
+    }
+    false
+}
+
+/// Whether a header block says something `method` would otherwise drop, which
+/// would change what the request means. Refused: an `if-*` that is not
+/// `if-match` or `if-none-match`; those two on a method that does not honour
+/// them; a name that speaks of retention, a hold, an object lock, a key
+/// reference, immutability or encryption, in either `-` or `_` spelling, other
+/// than the names `method` honours; `content-range`, since a put replaces the
+/// whole object; and any of the six names `ex::header` would read only the
+/// first of, given twice. Every other header is the transport's, and changes
+/// nothing.
+fn refused_header(method: u8, headers: &[u8]) -> bool {
+    let put = method == ex::METHOD_PUT;
+    let patch = method == ex::METHOD_PATCH;
+    let conditional = put || method == ex::METHOD_DELETE;
+    // One bit each for the names that may not repeat.
+    let mut seen = 0u8;
+    for (name, _) in ex::header_lines(headers) {
+        let is = |exact: &[u8]| name.eq_ignore_ascii_case(exact);
+        let (bit, honoured) = if is(b"if-match") {
+            (1, conditional)
+        } else if is(b"if-none-match") {
+            (2, conditional)
+        } else if is(b"retain-until") {
+            (4, put || patch)
+        } else if is(b"legal-hold") {
+            (8, put || patch)
+        } else if is(b"key-ref") {
+            (16, put)
+        } else if is(b"range") {
+            (32, true)
+        } else {
+            let prefix = name
+                .get(..3)
+                .is_some_and(|p| p.eq_ignore_ascii_case(b"if-"));
+            if prefix
+                || contains_ignoring_case(name, b"retain")
+                || contains_ignoring_case(name, b"retention")
+                || contains_ignoring_case(name, b"legal-hold")
+                || contains_ignoring_case(name, b"legal_hold")
+                || contains_ignoring_case(name, b"object-lock")
+                || contains_ignoring_case(name, b"object_lock")
+                || contains_ignoring_case(name, b"key-ref")
+                || contains_ignoring_case(name, b"key_ref")
+                || contains_ignoring_case(name, b"immutab")
+                || contains_ignoring_case(name, b"encryption")
+                || is(b"content-range")
+            {
+                return true;
+            }
+            continue;
+        };
+        if !honoured || seen & bit != 0 {
+            return true;
+        }
+        seen |= bit;
+    }
+    false
+}
+
+/// A `retain-until` value: digits only, not zero. `None` for anything else.
+fn parse_retain_until(v: &[u8]) -> Option<u64> {
+    digits(v).filter(|&ms| ms != 0)
+}
+
+/// A `legal-hold` value: `on` is true, `off` is false. `None` for anything
+/// else.
+fn parse_legal_hold(v: &[u8]) -> Option<bool> {
+    match v {
+        b"on" => Some(true),
+        b"off" => Some(false),
+        _ => None,
+    }
+}
+
+/// Whether a `key-ref` can travel as a header value: visible ASCII only, so it
+/// cannot end the line or split the block it is written into.
+fn is_visible(v: &[u8]) -> bool {
+    v.iter().all(|c| c.is_ascii_graphic())
+}
+
 /// The status a provider's refusal answers. Each is the storage provider's
 /// own answer, so none is marked RAISED.
 fn status_of(rc: i32, write: bool) -> u16 {
@@ -549,6 +675,7 @@ fn status_of(rc: i32, write: bool) -> u16 {
         // On a write's decision, `EAGAIN` is a lost `ETAG` precondition.
         errno::EAGAIN if write => 412,
         errno::EACCES => 403,
+        errno::ERETAINED => 423,
         errno::EINVAL => ex::status::BAD_REQUEST,
         errno::E2BIG | errno::ENOSPC => ex::status::TOO_LARGE,
         errno::EBUSY | errno::ENOMEM | errno::EAGAIN => ex::status::BUSY,
@@ -717,6 +844,7 @@ fn awaits_store(phase: Phase) -> bool {
             | Phase::PutBody
             | Phase::PutCommit
             | Phase::Delete
+            | Phase::Retain
             | Phase::List
     )
 }
@@ -1040,12 +1168,13 @@ unsafe fn emit_stream(s: &mut State, i: usize) -> bool {
 }
 
 /// The response HEAD of a read: its status, the object's content type, and
-/// `content-length`, `etag`, `fence` and (for a range) `content-range`.
+/// `content-length`, `etag`, `fence`, (for a range) `content-range`, and what
+/// the store keeps with the object: `retain-until`, `legal-hold` and `key-ref`.
 unsafe fn emit_stream_head(s: &mut State, i: usize) -> bool {
     let head_len = usize::from(s.ex[i].head_len);
     // The record is in the exchange's own buffer, which nothing below writes.
     let record: &[u8] = core::slice::from_raw_parts(s.ex[i].buf.as_ptr(), head_len);
-    let Some((_, ct, etag)) = obj::range::decode_head(record) else {
+    let Some((_, ct, etag, kept)) = obj::range::decode_head(record) else {
         finish(s, i, ex::status::FAILED, true, 0);
         emit_reply(s, i);
         return true;
@@ -1069,6 +1198,19 @@ unsafe fn emit_stream_head(s: &mut State, i: usize) -> bool {
         w.dec(e.end.saturating_sub(1));
         w.byte(b'/');
         w.dec(e.size);
+        w.put(b"\r\n");
+    }
+    if kept.retain_until_ms != 0 {
+        w.put(b"retain-until: ");
+        w.dec(kept.retain_until_ms);
+        w.put(b"\r\n");
+    }
+    if kept.legal_hold {
+        w.put(b"legal-hold: on\r\n");
+    }
+    if !kept.key_ref.is_empty() {
+        w.put(b"key-ref: ");
+        w.put(kept.key_ref);
         w.put(b"\r\n");
     }
     let (hl, over) = (w.len, w.over);
@@ -1403,7 +1545,7 @@ unsafe fn begin(s: &mut State, i: usize, h: &ex::RequestHead<'_>) {
     e.resp_credit = h.resp_credit;
     let more = h.flags & ex::flag::MORE != 0;
     let refused_flags = ex::flag::WEBSOCKET | ex::flag::WEBTRANSPORT | ex::flag::BROADCAST;
-    if h.flags & refused_flags != 0 {
+    if h.flags & refused_flags != 0 || refused_header(h.method, h.headers) {
         return finish(s, i, ex::status::BAD_REQUEST, true, 0);
     }
     let sl = usize::from(s.scope_len);
@@ -1421,6 +1563,7 @@ unsafe fn begin(s: &mut State, i: usize, h: &ex::RequestHead<'_>) {
                 ex::METHOD_GET | ex::METHOD_HEAD => begin_read(s, i, h.headers),
                 ex::METHOD_PUT => begin_put(s, i, h.headers, h.body, more),
                 ex::METHOD_DELETE => begin_delete(s, i, h.headers),
+                ex::METHOD_PATCH => begin_retain(s, i, h.headers, h.body, more),
                 _ => Err(ex::status::BAD_REQUEST),
             }
         }
@@ -1498,8 +1641,9 @@ impl ArgW<'_> {
 
 /// A put: single-shot when the HEAD carries the whole body, streamed when
 /// the body continues (`more`). `content-type` is stored with the object,
-/// `content-length` is the streamed put's size hint, and `if-none-match: *`
-/// or `if-match` make the write conditional.
+/// `content-length` is the streamed put's size hint, `if-none-match: *` or
+/// `if-match` make the write conditional, and `key-ref`, `retain-until` and
+/// `legal-hold` are for the store to keep with the object.
 fn begin_put(
     s: &mut State,
     i: usize,
@@ -1517,6 +1661,24 @@ fn begin_put(
     let expected = match ex::header(headers, b"content-length") {
         Some(v) => digits(v).ok_or(bad)?,
         None => 0,
+    };
+    let key_ref = match ex::header(headers, b"key-ref") {
+        Some(v) if v.is_empty() || v.len() > obj::KEY_REF_MAX || !is_visible(v) => return Err(bad),
+        Some(v) => v,
+        None => b"",
+    };
+    let retain_until_ms = match ex::header(headers, b"retain-until") {
+        Some(v) => parse_retain_until(v).ok_or(bad)?,
+        None => 0,
+    };
+    let legal_hold = match ex::header(headers, b"legal-hold") {
+        Some(v) => parse_legal_hold(v).ok_or(bad)?,
+        None => false,
+    };
+    let kept = obj::Kept {
+        key_ref,
+        retain_until_ms,
+        legal_hold,
     };
     if inline.len() > WINDOW {
         return Err(ex::status::TOO_LARGE);
@@ -1546,6 +1708,10 @@ fn begin_put(
     }
     a.put(&[pre, etag_len as u8])?;
     a.put(etag.get(..etag_len).unwrap_or(&[]))?;
+    let n = kept
+        .encode(a.arg.get_mut(a.at..).unwrap_or(&mut []))
+        .ok_or(ex::status::FAILED)?;
+    a.at += n;
     if !more {
         a.put(&fence_ptr.to_le_bytes())?;
         a.put(&(WIRE_MAX_LEN as u16).to_le_bytes())?;
@@ -1579,6 +1745,45 @@ fn begin_delete(s: &mut State, i: usize, headers: &[u8]) -> Result<(), u16> {
     a.put(&(WIRE_MAX_LEN as u16).to_le_bytes())?;
     e.arg_len = a.at as u16;
     e.phase = Phase::Delete;
+    Ok(())
+}
+
+/// A change to an object's retention or hold: `retain-until` and `legal-hold`,
+/// at least one of them, and no body.
+fn begin_retain(
+    s: &mut State,
+    i: usize,
+    headers: &[u8],
+    inline: &[u8],
+    more: bool,
+) -> Result<(), u16> {
+    let bad = ex::status::BAD_REQUEST;
+    if more || !inline.is_empty() {
+        return Err(bad);
+    }
+    let retain_until_ms = match ex::header(headers, b"retain-until") {
+        Some(v) => parse_retain_until(v).ok_or(bad)?,
+        None => 0,
+    };
+    let hold = match ex::header(headers, b"legal-hold") {
+        Some(v) if parse_legal_hold(v).ok_or(bad)? => obj::hold::SET,
+        Some(_) => obj::hold::CLEAR,
+        None => obj::hold::LEAVE,
+    };
+    if retain_until_ms == 0 && hold == obj::hold::LEAVE {
+        return Err(bad);
+    }
+    let e = &mut s.ex[i];
+    let req = obj::retain::Request {
+        key: e.name.get(..usize::from(e.name_len)).unwrap_or(&[]),
+        retain_until_ms,
+        hold,
+        fence_out_ptr: e.fence.as_mut_ptr() as u64,
+        fence_out_cap: WIRE_MAX_LEN as u16,
+    };
+    let n = obj::retain::encode_request(&mut e.arg, &req).ok_or(ex::status::FAILED)?;
+    e.arg_len = n as u16;
+    e.phase = Phase::Retain;
     Ok(())
 }
 
@@ -1715,6 +1920,7 @@ unsafe fn drive(s: &mut State, i: usize) {
         Phase::PutBody => put_drain(s, i),
         Phase::PutCommit => put_commit(s, i),
         Phase::Delete => delete(s, i),
+        Phase::Retain => retain(s, i),
         Phase::List => list(s, i),
         _ => {}
     }
@@ -1740,8 +1946,11 @@ unsafe fn meta(s: &mut State, i: usize) {
     if rc < 0 {
         return finish(s, i, status_of(rc, false), false, 0);
     }
-    let size =
-        obj::range::decode_head(e.buf.get(..rc as usize).unwrap_or(&[])).map(|(h, _, _)| h.size);
+    // A key reference another writer stored that is not a header value is not
+    // one this front can answer.
+    let size = obj::range::decode_head(e.buf.get(..rc as usize).unwrap_or(&[]))
+        .filter(|(_, _, _, kept)| is_visible(kept.key_ref))
+        .map(|(h, _, _, _)| h.size);
     let Some(size) = size else {
         return finish(s, i, ex::status::FAILED, true, 0);
     };
@@ -1909,6 +2118,18 @@ unsafe fn delete(s: &mut State, i: usize) {
         obj::WriteAnswer::Pending => {}
         obj::WriteAnswer::Decided(0) => finish(s, i, 204, false, reply::FENCE),
         obj::WriteAnswer::Decided(rc) => finish(s, i, status_of(rc, true), false, 0),
+    }
+}
+
+/// A `RETAIN`, asked again with the same request until decided. It carries no
+/// etag, so `EAGAIN` from the store is a busy store, not a lost condition.
+unsafe fn retain(s: &mut State, i: usize) {
+    let e = &mut s.ex[i];
+    let (arg, len) = (e.arg.as_mut_ptr(), usize::from(e.arg_len));
+    match obj::write_answer(call(s.syscalls, s.grant, obj::RETAIN, arg, len)) {
+        obj::WriteAnswer::Pending => {}
+        obj::WriteAnswer::Decided(0) => finish(s, i, 200, false, reply::FENCE),
+        obj::WriteAnswer::Decided(rc) => finish(s, i, status_of(rc, false), false, 0),
     }
 }
 

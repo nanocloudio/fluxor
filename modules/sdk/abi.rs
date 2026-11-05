@@ -186,6 +186,12 @@ pub mod contracts {
     pub mod exchange {
         include!("contracts/exchange.rs");
     }
+    /// The records a controller and a target's node agent exchange: desired
+    /// bundle, descriptor revision, idempotency identity, observed activation
+    /// and fenced status.
+    pub mod agent {
+        include!("contracts/agent.rs");
+    }
     pub mod storage {
         pub mod graph_slot {
             include!("contracts/storage/graph_slot.rs");

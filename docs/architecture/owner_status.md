@@ -61,6 +61,7 @@ The file carries a small envelope plus one entry per resident workload:
   "pid": 4242,
   "pid_start_ticks": 12345678,
   "plan_generation": 7,
+  "plan_digest": "<hex>",
   "written_at": "<rfc3339>",
   "workloads": [
     {
@@ -85,6 +86,11 @@ The file carries a small envelope plus one entry per resident workload:
   ]
 }
 ```
+
+`plan_digest` is the sha256 over the body of the plan the runtime decoded and
+applied, all zero before the first. The
+[agent protocol](agent_protocol.md#what-the-activation-digest-proves) holds it to
+the committed plan's before it reports an activation.
 
 `terminated` is present only when `phase == "Terminated"`; `waiting_reason`
 only when `phase == "Activating"`; `started_at` only once the owner has

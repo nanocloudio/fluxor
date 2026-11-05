@@ -1,0 +1,115 @@
+# A controller's end of the agent protocol's remote transport: frames on the
+# runtime's stdin and stdout, mutual TLS on the network, one target dialled.
+# `fluxor agent call --runtime` runs it for a call; `agent_listen` is the target's
+# end (docs/architecture/agent_protocol.md).
+#
+#   stdin ─> cli_in ─> link.ch0 ═══ tls ═══ the other end ═══ link.ch0_rx ─> cli_out ─> stdout
+#
+# Every frame is `[peer:32][len:u32][record]`. The 32 bytes are the channel's
+# `peer_tag` prefix: inbound, the key fingerprint `tls` verified for the session
+# the record came from; outbound, the peer it goes to, all zero for every
+# session. `[len:u32][record]` is the channel's `len32` record, which is what
+# delimits it however stdin and stdout split it.
+#
+# Each record belongs to the session that carries it: no `resume`. A request or
+# an answer lost with its session is the controller's to send again under the
+# same idempotency identity, which the agent answers without a second commit.
+#
+# A graph includes it and names the target; the stack cannot name a target or a
+# scheduler. The graph needs `accept_cycles`, the network provider and `tls`
+# being a feedback pair:
+#
+#   target: linux
+#   tick_us: 1000
+#   scheduler: { accept_cycles: true }
+#   include:
+#     - stack: agent_dial
+#       as: agent
+#       params:
+#         authority: target-a.fabric:9310
+#         cert_file: /etc/fluxor/agent/controller.pem
+#         key_file: /etc/fluxor/agent/controller.key
+#         trust: /etc/fluxor/agent/targets-ca.pem
+#         peer_uri: spiffe://fabric/target/a
+stack: agent_dial
+version: 0.1.0
+description: A controller's agent-protocol frames on stdio, carried across mutual TLS by a remote channel.
+
+params:
+  authority:
+    type: string
+    required: true
+    example: target-a.fabric:9310
+    description: "The target's `host:port`."
+  cert_file:
+    type: string
+    required: true
+    example: /etc/fluxor/agent/controller.pem
+    description: "This end's certificate chain (PEM or DER): an absolute path `tls` reads where it runs, not at build."
+  key_file:
+    type: string
+    required: true
+    example: /etc/fluxor/agent/controller.key
+    description: "This end's private key (PEM or DER): an absolute path `tls` reads where it runs, not at build."
+  trust:
+    type: string
+    required: true
+    example: /etc/fluxor/agent/targets-ca.pem
+    description: "The authority the peer's certificate must chain to (PEM or DER): an absolute path `tls` reads where it runs, not at build."
+  peer_uri:
+    type: string
+    required: true
+    example: spiffe://fabric/target/a
+    description: "The URI SAN the target's certificate must carry."
+  clock_policy:
+    type: string
+    default: require
+    description: "`require`: a certificate's lifetime is checked against a clock the platform vouches for, and a host whose clock is not synchronised refuses every handshake. `unchecked`: lifetimes are not checked, and removing a controller from the agent's set is what ends its authority."
+
+modules:
+  - name: net
+    type: linux_net
+
+  - name: tls
+    type: tls
+    mode: 0
+    verify_peer: 1
+    peer_auth: ca_uri
+    verify_uri: ${param:peer_uri}
+    trust: ${param:trust}
+    cert_file: ${param:cert_file}
+    key_file: ${param:key_file}
+    clock_policy: ${param:clock_policy}
+    alpn: fluxor-agent
+
+  - name: link
+    type: remote_channel
+    transport: net
+    role: dial
+    authority: ${param:authority}
+    redial_ms: 200
+    channels: "OctetStream:len32:8196"
+    require_peer: 1
+    peer_tag: 1
+
+  - name: stdio_in
+    type: cli_in
+
+  - name: stdio_out
+    type: cli_out
+
+wiring:
+  - from: net.net_out
+    to: tls.cipher_in
+  - from: tls.cipher_out
+    to: net.net_in
+  - from: tls.clear_out
+    to: link.transport_in
+  - from: link.transport_out
+    to: tls.clear_in
+  - from: tls.peer_identity
+    to: link.peer_identity
+  - from: stdio_in.stdin_out
+    to: link.ch0
+  - from: link.ch0_rx
+    to: stdio_out.bytes_in

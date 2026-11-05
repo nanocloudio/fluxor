@@ -20,6 +20,7 @@
 pub mod abi_pin;
 pub mod add_subgraph;
 pub mod agent_logs;
+pub mod agent_protocol;
 pub mod asset_bank;
 pub mod ci;
 pub mod collect;

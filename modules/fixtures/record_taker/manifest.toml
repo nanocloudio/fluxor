@@ -1,0 +1,20 @@
+version = "1.0.0"
+hardware_targets = ["bcm2712", "linux"]
+
+# Takes one read per step from `in` and reports what that read held on
+# `out`: the first byte and the length, as a two-byte record.
+
+[[ports]]
+name = "records_in"
+direction = "input"
+content_type = "OctetStream"
+framed = true
+
+[[ports]]
+name = "records_out"
+direction = "output"
+content_type = "OctetStream"
+framed = true
+
+[observability]
+exempt = "channel framing fixture; a harness test reads its output off the channel"

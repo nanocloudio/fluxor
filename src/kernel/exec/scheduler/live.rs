@@ -606,7 +606,9 @@ pub fn begin_add(
     let mut edges = [AddEdge::UNUSED; WORK_EDGES];
     edges[..e].copy_from_slice(sub.edges);
     let mut mailbox = [false; WORK_EDGES];
+    let declared = n;
     let (n, e) = expand_fans(&mut mods, n, &mut edges, e, &mut mailbox);
+    mark_record_edges(&mods, declared, &edges[..e], &mut mailbox);
     begin_staged(
         sub.owner_uid,
         sub.state_cap,
@@ -660,8 +662,8 @@ impl StagedAdd {
 }
 
 /// Steps 1 to 5 of an add over the staged (fan-expanded) subgraph:
-/// `mailbox[i]` marks an edge around a record-carrying fan, which gets a
-/// channel of its own in mailbox mode.
+/// `mailbox[i]` marks an edge that carries records, around a record fan or
+/// point to point, which gets a channel of its own in mailbox mode.
 #[allow(
     clippy::too_many_arguments,
     clippy::large_types_passed_by_value,
@@ -1453,6 +1455,61 @@ fn expand_fans(
     (n2, e2)
 }
 
+/// Mark every point-to-point edge whose producer port or consumer port carries
+/// records, so it opens as a mailbox: only a mailbox delivers a record whole,
+/// and on a byte FIFO two records queued back to back read as one. Boot graphs
+/// get the same from the config tool (`group_framed_edges`).
+///
+/// An edge touching a fan module (a slot at or past `declared`) already has its
+/// fan's decision, and a byte fan must keep FIFOs. A tap's mirror only lands in
+/// a FIFO, a shared lane's channel is already open, and a net lane carries its
+/// own framing.
+fn mark_record_edges(
+    mods: &[AddModule; WORK_MODULES],
+    declared: usize,
+    edges: &[AddEdge],
+    mailbox: &mut [bool; WORK_EDGES],
+) {
+    // SAFETY: scheduler-thread graph-mutation context, as every add.
+    let node = unsafe { super::static_loader() };
+    let carries_record = |ep: Endpoint, dir: FanDirection, port: u8| {
+        let Endpoint::New(m) = ep else {
+            return false;
+        };
+        let hash = staged_hash(&mods[m as usize]);
+        let kind = super::declared_port_frame_kind(
+            resolving_loader(hash, node),
+            hash,
+            dir,
+            boot_port_key(port),
+        );
+        kind == Some(super::module_types::FRAME_KIND_RECORD)
+    };
+    let is_fan = |ep: Endpoint| matches!(ep, Endpoint::New(m) if m as usize >= declared);
+    let excluded = |ep: Endpoint| {
+        matches!(
+            ep,
+            Endpoint::Tap(_) | Endpoint::ExistingChannel(_) | Endpoint::Net(_)
+        )
+    };
+    for (i, ae) in edges.iter().enumerate() {
+        if mailbox[i] || is_fan(ae.from) || is_fan(ae.to) || excluded(ae.from) || excluded(ae.to) {
+            continue;
+        }
+        mailbox[i] = carries_record(ae.from, FanDirection::Out, ae.from_port_index)
+            || carries_record(ae.to, FanDirection::In, ae.to_port_index);
+    }
+}
+
+/// The boot pass's port key: a ctrl input is keyed with bit 0x10.
+fn boot_port_key(k: u8) -> u8 {
+    if k & CTRL_PORT_BIT != 0 {
+        0x10 | (k & 0x0F)
+    } else {
+        k
+    }
+}
+
 /// Whether `edge` leaves (`Out`) or enters (`In`) the staged module `l`.
 fn fan_touches(edge: &AddEdge, l: usize, dir: FanDirection) -> bool {
     let ep = match dir {
@@ -1546,16 +1603,8 @@ fn fan_frame_kind(
     dir: FanDirection,
     key: u8,
 ) -> u8 {
-    // The boot pass keys a ctrl input with bit 0x10.
-    let boot_key = |k: u8| {
-        if k & CTRL_PORT_BIT != 0 {
-            0x10 | (k & 0x0F)
-        } else {
-            k
-        }
-    };
     let kind_of = |hash: u32, d: FanDirection, k: u8| {
-        super::declared_port_frame_kind(resolving_loader(hash, node), hash, d, boot_key(k))
+        super::declared_port_frame_kind(resolving_loader(hash, node), hash, d, boot_port_key(k))
     };
     if let Some(kind) = kind_of(staged_hash(&mods[l]), dir, key) {
         if kind != super::module_types::FRAME_KIND_NONE {

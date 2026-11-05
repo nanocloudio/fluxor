@@ -320,6 +320,7 @@ unsafe fn alloc_slot(key: &[u8]) -> i32 {
 ///   [content_type_len:u8][content_type]
 ///   [body_ptr:u64 LE][body_len:u64 LE]
 ///   [precondition:u8][etag_len:u8][etag]
+///   [key_ref_len:u8][key_ref][retain_until_ms:u64 LE][legal_hold:u8]
 ///   [fence_out_ptr:u64 LE][fence_out_cap:u16 LE]
 /// ```
 ///
@@ -362,14 +363,24 @@ unsafe fn obj_put(arg: *mut u8, arg_len: usize) -> i32 {
     let precondition = *arg.add(p);
     let etag_len = *arg.add(p + 1) as usize;
     p += 2 + etag_len;
+    if arg_len < p {
+        return errno::EINVAL;
+    }
+    let Some((kept, after_kept)) =
+        dev_obj::Kept::parse(core::slice::from_raw_parts(arg, arg_len), p)
+    else {
+        return errno::EINVAL;
+    };
+    p = after_kept;
     if arg_len < p + 8 + 2 {
         return errno::EINVAL;
     }
-    // Anything but `ANY` asks for a guarantee this tier cannot make, so it
-    // is REFUSED rather than silently downgraded — the contract requires
-    // that, because downgrading a conditional write to an unconditional one
-    // turns a refusal into a lost update.
-    if precondition != obj_precondition::ANY {
+    // Anything but `ANY`, and any field for the store to keep, asks for a
+    // guarantee this tier cannot make, so it is REFUSED rather than silently
+    // downgraded — the contract requires that, because downgrading a
+    // conditional write to an unconditional one turns a refusal into a lost
+    // update, and a retained write to a deletable one.
+    if precondition != obj_precondition::ANY || !kept.is_none() {
         return errno::ENOSYS;
     }
     let fence_out_ptr = read_u64(arg, p) as usize as *mut u8;
@@ -540,10 +551,11 @@ unsafe fn obj_head(arg: *mut u8, arg_len: usize) -> i32 {
         return errno::EINVAL;
     }
     let out = core::slice::from_raw_parts_mut(out_ptr, out_cap);
-    let written = match dev_obj::range::encode_head(out, size, mtime, &[], &[]) {
-        Some(n) => n,
-        None => return errno::ENOMEM,
-    };
+    let written =
+        match dev_obj::range::encode_head(out, size, mtime, &[], &[], dev_obj::Kept::none()) {
+            Some(n) => n,
+            None => return errno::ENOMEM,
+        };
 
     write_fence_out(fence_out_ptr, fence_out_cap);
     written as i32

@@ -250,7 +250,7 @@ unsafe fn linux_obj_head(arg: *mut u8, arg_len: usize) -> i32 {
     };
     let out = core::slice::from_raw_parts_mut(out_ptr, out_cap);
     // mtime is 0: the HTTP-date `Last-Modified` header is not parsed.
-    let written = match obj_dev::range::encode_head(out, size, 0, &[], &[]) {
+    let written = match obj_dev::range::encode_head(out, size, 0, &[], &[], obj_dev::Kept::none()) {
         Some(n) => n,
         None => return obj_errno::ENOMEM,
     };

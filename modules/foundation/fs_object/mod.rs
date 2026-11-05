@@ -95,8 +95,9 @@
 //! ## What it does not do
 //!
 //! No grants (`PRESENT` answers `ENOSYS`: a store with no mesh roots), no
-//! streamed puts, no `ETAG` precondition (`ENOSYS`), no change subscription,
-//! and of the namespace surface only `LIST` and `CAPS`.
+//! streamed puts, no `ETAG` precondition (`ENOSYS`), no key reference,
+//! retention or legal hold (`ENOSYS`, and none in a `HEAD` record), no change
+//! subscription, and of the namespace surface only `LIST` and `CAPS`.
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
@@ -779,6 +780,9 @@ fn op_put(s: &mut State, a: &[u8]) -> i32 {
         return ERR_INVAL;
     };
     let at = at + 18 + el as usize;
+    let Some((kept, at)) = obj::Kept::parse(a, at) else {
+        return ERR_INVAL;
+    };
     let (Some(fence_ptr), Some(fence_cap)) = (u64_at(a, at), u16_at(a, at + 8)) else {
         return ERR_INVAL;
     };
@@ -788,7 +792,7 @@ fn op_put(s: &mut State, a: &[u8]) -> i32 {
     if (body_ptr == 0 && body_len != 0) || body_len > isize::MAX as u64 {
         return ERR_INVAL;
     }
-    if pre == obj::precondition::ETAG {
+    if pre == obj::precondition::ETAG || !kept.is_none() {
         return ERR_NOSYS;
     }
     if pre != obj::precondition::ANY && pre != obj::precondition::ABSENT {
@@ -1218,7 +1222,7 @@ fn op_head(s: &mut State, a: &[u8]) -> i32 {
         Ok(x) => x,
         Err(e) => return e,
     };
-    let need = 8 + 8 + 1 + h.ct_len + 1 + ETAG_LEN;
+    let need = 8 + 8 + 1 + h.ct_len + 1 + ETAG_LEN + obj::KEPT_FIXED_LEN;
     if (cap as usize) < need {
         return ERR_NOMEM;
     }
@@ -1231,6 +1235,10 @@ fn op_head(s: &mut State, a: &[u8]) -> i32 {
     let at = 17 + h.ct_len;
     o[at] = ETAG_LEN as u8;
     o[at + 1..at + 1 + ETAG_LEN].copy_from_slice(&s.hdr[h.etag_at..h.etag_at + ETAG_LEN]);
+    let at = at + 1 + ETAG_LEN;
+    if obj::Kept::none().encode(&mut o[at..]).is_none() {
+        return ERR_NOMEM;
+    }
     write_fence(Fence::Volatile, fp, fc);
     need as i32
 }

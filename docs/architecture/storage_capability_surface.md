@@ -526,7 +526,8 @@ PIC module providers handle `QUERY_OP` through their existing dispatch
 function; there is no separate query-callback ABI.
 
 **2. Handle=-1 one-shot ops** (e.g. `object::PUT`, `object::HEAD`,
-`object::DELETE`, `object::LIST`, `namespace::LIST`, `namespace::RENAME`,
+`object::DELETE`, `object::LIST`, `object::RETAIN`, `namespace::LIST`,
+`namespace::RENAME`,
 `namespace::DELETE`, `namespace::BIND`, `object::PUT_STREAMED_COMMIT`)
 carry a `[fence_out_ptr: u64 LE, fence_out_cap: u16 LE]` pair at the end
 of their arg layout. The provider writes the encoded fence (up to
@@ -716,7 +717,7 @@ Lifecycle rules:
   its own: the handle carries the grant's mesh permission bits, and each
   operation class needs one — `StorageAccess::Read` (`GET`, `HEAD`,
   `RANGE_GET`, `LIST`, `LOOKUP`, `STAT`) needs `ReadState`, `Write`
-  (`PUT`, the streamed put, `DELETE`, `RENAME`, `BIND`) needs
+  (`PUT`, the streamed put, `DELETE`, `RETAIN`, `RENAME`, `BIND`) needs
   `SendCommand`, `Subscribe` (`SUBSCRIBE`, `CHANGES`) needs `Subscribe`,
   and `Delegate` needs `Delegate`. `StorageHandle::allows` is the check.
 - `not_after` is an absolute monotonic timestamp (kernel `time_ns`). Such a
@@ -746,7 +747,8 @@ its own presentation op:
    `Refusal` written into the request's first byte. The request carries no
    pointer, so an isolated module can present the longest chain.
 3. Every later op passes the grant as its `handle`: `PUT`, `GET`, `HEAD`,
-   `DELETE`, `LIST` and `PUT_STREAMED_OPEN`, which otherwise take `-1`. The
+   `DELETE`, `LIST`, `RETAIN` and `PUT_STREAMED_OPEN`, which otherwise take
+   `-1`. The
    store admits an op only when all of these hold:
    - its key, or `LIST`'s prefix, lies inside the scope;
    - the grant carries the bit its `StorageAccess` class needs;
@@ -845,6 +847,30 @@ events; subsequent reads of `<key>` see no trace of the partial sequence.
 There is no separate "multipart" surface, and `object::PUT` is not
 stretched into a streaming op: `PUT` stays a small-blob single-shot, and
 large bodies compose through the four streaming opcodes above.
+
+### Key reference, retention and legal hold
+
+`object::PUT` and `object::PUT_STREAMED_OPEN` carry, and the `object::HEAD`
+record reports, one block (`object::Kept`):
+
+```
+[key_ref_len: u8][key_ref][retain_until_ms: u64 LE][legal_hold: u8]
+```
+
+`key_ref` names the key that sealed the object, at most `KEY_REF_MAX` (64)
+bytes; the store keeps and returns it and never interprets it.
+`retain_until_ms`, 0 for none, is judged on the store's clock. While an object
+is retained or held, a `DELETE` of it and a `PUT` or `PUT_STREAMED_COMMIT` over
+it are refused `ERETAINED`, decided at the write's linearization point.
+
+`object::RETAIN` (`0x142C`) changes a live object's retention and hold in the
+same log order as writes: retention only extends, and a hold can be set and
+cleared. A grant authorizes it with the write permission.
+
+A provider that cannot keep these refuses a non-empty `key_ref`, a non-zero
+`retain_until_ms`, a `legal_hold` and `RETAIN` with `ENOSYS`, never ignoring
+one, and reports none in `HEAD`. Every provider in this tree refuses them. A
+store that keeps them is one whose writes are durable and logged.
 
 ---
 

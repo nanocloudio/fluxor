@@ -728,7 +728,9 @@ pub unsafe fn dispatch_object(handle: i32, opcode: u32, arg: *mut u8, arg_len: u
     match opcode {
         obj_op::PUT => {
             // [key_len:u16][key][ct_len:u8][ct][body_ptr:u64][body_len:u64]
-            // [precondition:u8][etag_len:u8][etag][fence_out_ptr:u64][fence_out_cap:u16]
+            // [precondition:u8][etag_len:u8][etag]
+            // [key_ref_len:u8][key_ref][retain_until_ms:u64][legal_hold:u8]
+            // [fence_out_ptr:u64][fence_out_cap:u16]
             let Some(kl) = get_u16(a, 0).map(|v| v as usize) else {
                 return errno::EINVAL;
             };
@@ -753,11 +755,18 @@ pub unsafe fn dispatch_object(handle: i32, opcode: u32, arg: *mut u8, arg_len: u
             let Some(condition) = read_condition(a, &mut p) else {
                 return errno::EINVAL;
             };
+            let Some((kept, p)) = obj_op::Kept::parse(a, p) else {
+                return errno::EINVAL;
+            };
             let Some((fence_ptr, fence_cap)) = fence_out(a, p) else {
                 return errno::EINVAL;
             };
             if body_len > MAX_VALUE as u64 {
                 return errno::EINVAL;
+            }
+            // RAM: nothing here outlives a power cut, so it keeps none of them.
+            if !kept.is_none() {
+                return errno::ENOSYS;
             }
 
             let existing = store.get(key).map(|(_, r)| r);
@@ -859,7 +868,9 @@ pub unsafe fn dispatch_object(handle: i32, opcode: u32, arg: *mut u8, arg_len: u
             let out_ptr = get_u64(a, 2 + kl).unwrap_or(0);
             let out_cap = get_u32(a, 2 + kl + 8).unwrap_or(0) as usize;
             // [size:u64][mtime:u64][ct_len:u8][ct][etag_len:u8][etag]
-            let mut rec = [0u8; 8 + 8 + 1 + 1 + 32];
+            // [key_ref_len:u8][key_ref][retain_until_ms:u64][legal_hold:u8],
+            // the last three all zero: this store keeps none of them.
+            let mut rec = [0u8; 8 + 8 + 1 + 1 + 32 + obj_op::KEPT_FIXED_LEN];
             rec[0..8].copy_from_slice(&(vlen as u64).to_le_bytes());
             rec[17] = 32;
             rec[18..50].copy_from_slice(&etag_from_rev(rev));

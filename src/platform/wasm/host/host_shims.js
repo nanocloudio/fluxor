@@ -2395,6 +2395,13 @@ registerProcessor('pcm-ring', PcmRing);
                 },
                 // PUT_STREAMED_COMMIT: [fence]
                 0x1428: () => [[0, 8, 2, true]],
+                // RETAIN: [key_len u16][key][retain_until_ms u64][hold u8][fence]
+                0x142C: (dv) => {
+                  const kl = at16(dv, 0);
+                  if (kl < 0) return null;
+                  const o = 2 + kl + 9;
+                  return [[o, o + 8, 2, true]];
+                },
                 // object LIST: [prefix_len u16][prefix][cursor_len u16]
                 // [cursor][max_keys u16][out u64][out_cap u32][fence]
                 0x142A: (dv) => {
@@ -2450,16 +2457,18 @@ registerProcessor('pcm-ring', PcmRing);
               // Rather than stage it through kernel heap scratch, the PUT is
               // served here from child memory with the wasm provider's own
               // rules (`object.rs::obj_put`): a key of 1..=255 UTF-8 bytes,
-              // `ANY` as the only precondition (others are ENOSYS), a fence
+              // `ANY` as the only precondition (others are ENOSYS), no key
+              // reference, retention or legal hold (each ENOSYS), a fence
               // buffer of at least WIRE_MAX_LEN bytes, and a Volatile fence on
               // success.
               // Arg: [key_len:u16][key][ct_len:u8][ct][body_ptr:u64]
               //      [body_len:u64][precondition:u8][etag_len:u8][etag]
+              //      [key_ref_len:u8][key_ref][retain_until_ms:u64][legal_hold:u8]
               //      [fence_ptr:u64][fence_cap:u16]
               const OBJ_PUT_OP = 0x1420;
               if (op === OBJ_PUT_OP) {
                 const EINVAL = -22, ENOSYS = -38, ENODEV = -19;
-                const KEY_MAX = 255, FENCE_WIRE_MAX = 62, TAG_VOLATILE = 0;
+                const KEY_MAX = 255, KEY_REF_MAX = 64, FENCE_WIRE_MAX = 62, TAG_VOLATILE = 0;
                 try {
                   if (!p || l < 2) return EINVAL;
                   const cbuf = childMem();
@@ -2474,9 +2483,17 @@ registerProcessor('pcm-ring', PcmRing);
                   const bodyChild = Number(cdv.getBigUint64(bodyOff, true));
                   const bodyLen = Number(cdv.getBigUint64(bodyOff + 8, true));
                   const precondition = cdv.getUint8(bodyOff + 16);
-                  const fenceOff = bodyOff + 18 + cdv.getUint8(bodyOff + 17);
+                  const keptOff = bodyOff + 18 + cdv.getUint8(bodyOff + 17);
+                  if (keptOff + 10 > l) return EINVAL;
+                  const keyRefLen = cdv.getUint8(keptOff);
+                  if (keyRefLen > KEY_REF_MAX) return EINVAL;
+                  const untilOff = keptOff + 1 + keyRefLen;
+                  const fenceOff = untilOff + 9;
                   if (fenceOff + 10 > l) return EINVAL;
-                  if (precondition !== 0) return ENOSYS;
+                  const retainUntil = cdv.getBigUint64(untilOff, true);
+                  const legalHold = cdv.getUint8(untilOff + 8);
+                  if (legalHold > 1) return EINVAL;
+                  if (precondition !== 0 || keyRefLen !== 0 || retainUntil !== 0n || legalHold !== 0) return ENOSYS;
                   // The fence buffer must be able to receive the fence.
                   const fenceChild = Number(cdv.getBigUint64(fenceOff, true));
                   const fenceCap = cdv.getUint16(fenceOff + 8, true);

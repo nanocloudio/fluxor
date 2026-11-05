@@ -16,9 +16,9 @@ timer_class      = "agnostic"
 #
 # The request target names the object: `/<rest>` is `<scope><rest>`, the
 # scope (when given) as the front's root and the rest verbatim. `GET`, `HEAD`,
-# `PUT` and `DELETE` act on it; `GET /?list&prefix=…&after=…&max=…` lists one
-# page of names below the scope. Statuses are HTTP codes. See README.md for
-# the full surface and its limits.
+# `PUT`, `PATCH` and `DELETE` act on it; `GET /?list&prefix=…&after=…&max=…`
+# lists one page of names below the scope. Statuses are HTTP codes. See
+# README.md for the full surface and its limits.
 #
 # Params `scope` and `capability` (its `fxcap1.` text), given together, are
 # presented to the provider once (`PRESENT`), and every call for every request
