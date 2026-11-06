@@ -64,7 +64,10 @@
 //!    (`type:` if present, else the name) already exists is skipped too,
 //!    and every wire touching it is dropped with it. `require_distinct`
 //!    opts out of the type skip: a second instance of the same build is
-//!    injected, and only a variant mismatch is a hard error.
+//!    injected, and only a variant mismatch is a hard error. A member of an
+//!    included stack never counts: it is private to that stack, so the graph
+//!    could not reach it through the name it wires. Colliding with its name
+//!    is an error, since the stack module's wires would land on it.
 //! 8. **Placement.** Injected modules are prepended, giving them lower
 //!    ids and therefore earlier instantiation. Injected params are
 //!    coerced to integers/booleans where they parse as such.
@@ -355,7 +358,10 @@ pub fn expand_platform_stacks(
 
     let platform = match config.get("platform") {
         Some(p) => p.clone(),
-        None => return Ok(auto_added),
+        None => {
+            fluxor_tools::stack::strip_stack_member_marks(config);
+            return Ok(auto_added);
+        }
     };
     let platform_map = match platform.as_object() {
         Some(m) => m.clone(),
@@ -443,6 +449,8 @@ pub fn expand_platform_stacks(
             inject_wiring_and_services(config, overlay, &r.stack_file.stack, &globally_skipped)?;
         }
     }
+
+    fluxor_tools::stack::strip_stack_member_marks(config);
 
     // Remove platform: key so downstream code doesn't see it
     if let Some(obj) = config.as_object_mut() {
@@ -857,6 +865,8 @@ fn inject_modules(
     //     name is dropped in pass 2 via `globally_skipped`.
     let existing = collect_module_names(config);
     let existing_types = collect_existing_types(config);
+    let included = collect_included_members(config);
+    let reachable_types = collect_reachable_types(config);
 
     // Ensure arrays exist
     if config.get("modules").is_none() {
@@ -874,6 +884,13 @@ fn inject_modules(
     // edge whose endpoint references one of these names.
     let mut to_prepend = Vec::new();
     for sm in &variant.modules {
+        if included.contains(&sm.name) {
+            return Err(Error::Config(format!(
+                "platform stack '{}' adds a module named '{}', which an included stack's \
+                 member is already called — rename that `include:`'s `as:`",
+                stack_meta.name, sm.name,
+            )));
+        }
         if existing.contains(&sm.name) {
             // Name-based dedup. The user re-declared the stack's
             // module (same name) — their declaration wins; the stack
@@ -922,7 +939,7 @@ transport (e.g. `export_telemetry: udp` + fluxor-collect).",
                     )));
                 }
                 // fall through: inject a second instance of the same build.
-            } else {
+            } else if reachable_types.iter().any(|t| t == effective_type) {
                 // Type-based dedup. Some existing module already provides
                 // this implementation; injecting another would create two
                 // independent instances (e.g. parallel IP stacks) — almost
@@ -1130,6 +1147,28 @@ fn collect_existing_types(config: &Value) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// The effective types of the modules the graph itself declares, leaving out
+/// the private members of its includes.
+fn collect_reachable_types(config: &Value) -> Vec<String> {
+    let mut own = config.clone();
+    if let Some(arr) = own.get_mut("modules").and_then(Value::as_array_mut) {
+        arr.retain(|e| e.get(fluxor_tools::stack::STACK_MEMBER_KEY).is_none());
+    }
+    collect_existing_types(&own)
+}
+
+/// The names of the modules an `include:` brought in.
+fn collect_included_members(config: &Value) -> std::collections::HashSet<String> {
+    config
+        .get("modules")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|e| e.get(fluxor_tools::stack::STACK_MEMBER_KEY).is_some())
+        .filter_map(|e| e.get("name").and_then(Value::as_str).map(str::to_string))
+        .collect()
 }
 
 /// Extract the module name from a wiring endpoint string. `"foo.bar"`
@@ -1670,6 +1709,83 @@ mod tests {
         assert_eq!(endpoint_module("noport"), "noport");
         // Empty endpoint — split returns one empty piece; preserved.
         assert_eq!(endpoint_module(""), "");
+    }
+
+    #[test]
+    fn an_included_member_does_not_stand_in_for_a_platform_module() {
+        let mut config = json!({
+            "modules": [
+                { "name": "lane_net", "type": "linux_net", "_stack_member": true },
+                { "name": "front", "type": "http" },
+            ],
+            "wiring": [
+                { "from": "front.net_out", "to": "linux_net.net_in" },
+            ],
+        });
+        let mut skipped = std::collections::HashSet::new();
+        let added = inject_injection(
+            &mut config,
+            &make_injection(vec![make_module("linux_net", None)], vec![]),
+            &HashMap::new(),
+            &dummy_host(),
+            &empty_meta(),
+            &mut skipped,
+        )
+        .unwrap();
+        assert_eq!(added, vec!["linux_net".to_string()]);
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert!(
+            collect_module_names(&config)
+                .iter()
+                .any(|n| n == "linux_net"),
+            "the wire the graph wrote has its module"
+        );
+
+        fluxor_tools::stack::strip_stack_member_marks(&mut config);
+        assert!(config["modules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| m.get("_stack_member").is_none()));
+    }
+
+    #[test]
+    fn a_graph_declared_module_still_satisfies_a_platform_module_of_its_type() {
+        let mut config = json!({
+            "modules": [{ "name": "api_net", "type": "linux_net" }],
+            "wiring": [],
+        });
+        let mut skipped = std::collections::HashSet::new();
+        let added = inject_injection(
+            &mut config,
+            &make_injection(vec![make_module("linux_net", None)], vec![]),
+            &HashMap::new(),
+            &dummy_host(),
+            &empty_meta(),
+            &mut skipped,
+        )
+        .unwrap();
+        assert!(added.is_empty(), "{added:?}");
+        assert!(skipped.contains("linux_net"));
+    }
+
+    #[test]
+    fn a_platform_module_named_like_an_included_member_is_refused() {
+        let mut config = json!({
+            "modules": [{ "name": "linux_net", "type": "linux_net", "_stack_member": true }],
+            "wiring": [],
+        });
+        let e = inject_injection(
+            &mut config,
+            &make_injection(vec![make_module("linux_net", None)], vec![]),
+            &HashMap::new(),
+            &dummy_host(),
+            &empty_meta(),
+            &mut std::collections::HashSet::new(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("rename"), "{e}");
     }
 
     #[test]

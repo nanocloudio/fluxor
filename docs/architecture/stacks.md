@@ -194,6 +194,13 @@ from `src.out` to `inst.feed` becomes one edge to each endpoint, each
 carrying the edge's attributes. Each expanded edge is validated on its own,
 so a list mixes no directions.
 
+Privacy holds against platform stacks too. A member of an included stack
+never satisfies a platform stack's module of the same type, so a stack
+carrying its own `linux_net` leaves `platform: { net: {} }` adding the one
+the graph wires as `linux_net.*`. A module the graph declares itself does
+satisfy it, and the platform's is then skipped. A platform module whose name
+an included member already has is refused, which `as:` resolves.
+
 ### Modules and wiring
 
 Modules are the graph's module entries: a mapping with a `name`, an

@@ -1713,6 +1713,8 @@ const NON_PARAM_KEYS: &[&str] = &[
     // pinned module does not have.
     "_from_stack",
     "_stack_params",
+    // A member of an included stack (`fluxor_tools::stack::STACK_MEMBER_KEY`).
+    "_stack_member",
 ];
 
 /// Reject any YAML key on a module entry that the schema doesn't know

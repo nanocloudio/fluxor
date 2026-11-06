@@ -316,20 +316,6 @@ fn discover_all(project_root: &Path) -> Result<Vec<Candidate>> {
             let builtin = raw.builtin;
             let entry_rel = raw.entry.unwrap_or_else(|| "mod.rs".to_string());
             let entry = dir.join(&entry_rel);
-            // A `builtin = true` manifest is a declaration of a
-            // kernel-resident module: the implementation is compiled into
-            // the kernel and the directory carries no entry file. Its
-            // absence is correct, not the broken-module case below.
-            if !builtin && !entry.exists() {
-                // A manifest pointing at a missing entry is a broken
-                // module, not an absent one — diagnose the skip so the
-                // module doesn't silently vanish from the build set.
-                eprintln!(
-                    "warning: {}: entry `{entry_rel}` not found; module skipped",
-                    manifest.display()
-                );
-                continue;
-            }
             let type_id = resolve_type_id(&name, raw.type_str.as_deref());
             let edition = raw.edition.unwrap_or_else(|| "2021".to_string());
             if !SUPPORTED_EDITIONS.contains(&edition.as_str()) {
@@ -566,6 +552,43 @@ fn matches_abi(c: &Candidate, abi: &str) -> bool {
     crate::runtime_abi::module_on_abi(&c.hardware_targets, abi)
 }
 
+/// A `manifest.toml` under `modules/` declares a module, and one the tier walk
+/// cannot see would never be built: nothing would report it, and a build of
+/// the rest would read as a build of everything.
+fn refuse_manifests_outside_tiers(project_root: &Path) -> Result<()> {
+    let root = project_root.join("modules");
+    if !root.is_dir() {
+        return Ok(());
+    }
+    let seen: std::collections::BTreeSet<PathBuf> = discover_all(project_root)?
+        .into_iter()
+        .map(|c| c.manifest)
+        .collect();
+    let outside: Vec<String> = walkdir::WalkDir::new(&root)
+        .into_iter()
+        .filter_entry(|e| e.file_name() != "target")
+        .filter_map(std::result::Result::ok)
+        .filter(|e| e.file_name() == "manifest.toml" && !seen.contains(e.path()))
+        .map(|e| {
+            e.path()
+                .strip_prefix(project_root)
+                .unwrap_or(e.path())
+                .display()
+                .to_string()
+        })
+        .collect();
+    if outside.is_empty() {
+        return Ok(());
+    }
+    Err(Error::Module(format!(
+        "{} manifest(s) outside the module tiers, which nothing would build: {}. A module \
+         lives at `<tier>/<name>/` or `<tier>/<group>/<name>/`, a tier being one of {}",
+        outside.len(),
+        outside.join(", "),
+        crate::manifest::MODULE_TIERS.join(", "),
+    )))
+}
+
 /// Public entry point. Drives discovery, per-target compile, and pack.
 pub fn run(opts: &BuildOpts) -> Result<BuildReport> {
     // Staged consumption state (source trees under `target/fluxor/<name>/`,
@@ -574,16 +597,12 @@ pub fn run(opts: &BuildOpts) -> Result<BuildReport> {
     // building rather than demanding a manual re-sync.
     crate::store_sync::ensure_synced(&opts.project_root)
         .map_err(|e| crate::error::Error::Config(e.to_string()))?;
+    refuse_manifests_outside_tiers(&opts.project_root)?;
     // The target matrix only means something when there is something to
     // build, so discovery comes first. A portable-core-only repo has no
     // module tree and declares no `[ci].targets` — the `fluxor.toml` schema
     // gate refuses that key when nothing needs targeting — and an empty
     // build is the honest report for it.
-    //
-    // What keeps that from hiding a real fault is `ci`'s vacuity rule: a
-    // repo whose manifests exist but whose layout the tier walk cannot see
-    // reports zero here and fails there, because the count it is checked
-    // against is a separate walk of every `manifest.toml` under `modules/`.
     let candidates = discover(&opts.project_root)?;
     if candidates.is_empty() {
         return Ok(BuildReport::default());
@@ -926,6 +945,15 @@ fn build_one_target(
     let mut pending: Vec<(&Candidate, PathBuf)> = Vec::new();
     for cand in candidates {
         if !matches_abi(cand, &abi) {
+            continue;
+        }
+        // A manifest pointing at a missing entry is a broken module, not an
+        // absent one, and whatever artefact it last built is no answer.
+        if !cand.entry.exists() {
+            report.failed.push((
+                cand.name.clone(),
+                format!("entry `{}` not found", cand.entry.display()),
+            ));
             continue;
         }
         let out_path = out_dir.join(format!("{}.fmod", cand.name));
@@ -2621,6 +2649,87 @@ pub static TICKS_ATOMIC: AtomicU32 = AtomicU32::new(3);
             ] {
                 assert!(msg.contains(needle), "{target}: no `{needle}` in: {msg}");
             }
+        }
+    }
+
+    fn targeted_project(root: &Path) -> BuildOpts {
+        std::fs::write(
+            root.join("fluxor.toml"),
+            "[project]\nname = \"p\"\n[ci]\ntargets = [\"bcm2712\"]\n",
+        )
+        .unwrap();
+        BuildOpts {
+            project_root: root.to_path_buf(),
+            selector: TargetSelector::All,
+            out_root: root.join("target/fluxor"),
+            strict: false,
+            verbose: false,
+        }
+    }
+
+    fn manifest_at(root: &Path, dir: &str) {
+        let m = root.join(dir);
+        std::fs::create_dir_all(&m).unwrap();
+        std::fs::write(
+            m.join("manifest.toml"),
+            "version = \"1.0.0\"\nhardware_targets = [\"bcm2712\"]\n",
+        )
+        .unwrap();
+    }
+
+    /// A missing entry fails the module rather than dropping it from the
+    /// count, even with an artefact from an earlier build sitting on the shelf.
+    #[test]
+    fn a_module_whose_entry_is_missing_fails_the_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = targeted_project(dir.path());
+        manifest_at(dir.path(), "modules/app/gone");
+        let shelf = dir.path().join("target/fluxor/aarch64/modules");
+        std::fs::create_dir_all(&shelf).unwrap();
+        std::fs::write(shelf.join("gone.fmod"), b"stale").unwrap();
+
+        let report = run(&opts).unwrap();
+        assert!(!report.ok());
+        let failed = &report.per_target[0].failed;
+        assert_eq!(failed.len(), 1, "{failed:?}");
+        assert_eq!(failed[0].0, "gone");
+        assert!(failed[0].1.contains("not found"), "{}", failed[0].1);
+    }
+
+    /// A declared `builtin` carries no entry, and that is not a failure.
+    #[test]
+    fn a_builtin_needs_no_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = targeted_project(dir.path());
+        let m = dir.path().join("modules/platform/linux/kernel_side");
+        std::fs::create_dir_all(&m).unwrap();
+        std::fs::write(
+            m.join("manifest.toml"),
+            "version = \"1.0.0\"\nbuiltin = true\nhardware_targets = [\"linux\"]\n",
+        )
+        .unwrap();
+        let report = run(&opts).unwrap();
+        assert!(report.ok());
+    }
+
+    /// A manifest the tier walk cannot see is refused by name, whether it is
+    /// the only one in the project or sits beside modules that do build.
+    #[test]
+    fn a_manifest_outside_the_tiers_fails_the_build() {
+        for (flat, deep) in [(true, false), (false, true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let opts = targeted_project(dir.path());
+            let at = if flat {
+                "modules/flat_one"
+            } else {
+                "modules/app/a/b/too_deep"
+            };
+            manifest_at(dir.path(), at);
+            let err = run(&opts).expect_err(at).to_string();
+            assert!(
+                err.contains(&format!("{at}/manifest.toml")) && err.contains("outside"),
+                "flat={flat} deep={deep}: {err}"
+            );
         }
     }
 

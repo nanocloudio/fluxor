@@ -88,6 +88,10 @@ needs glibc 2.39 or newer.
   `[ci].targets` maps to. Publish requires exactly the same set, and
   retires any module tag outside it: after a publish, a project's tags
   are the shelves it declares and the modules built for them.
+- `fluxor modules build` exits non-zero on anything it cannot build: a
+  module that does not compile, a manifest whose entry file is missing, and
+  a `manifest.toml` under `modules/` outside the tiers, which no build would
+  ever reach.
 - A module naming no runtime is portable: it belongs on every shelf and
   runs under every runtime.
 - Placement is checked twice: `fluxor build` refuses a graph that places

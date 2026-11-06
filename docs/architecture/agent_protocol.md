@@ -7,8 +7,8 @@ under a fence.
 
 Source: `modules/sdk/contracts/agent.rs` (records), `tools/src/agent_protocol.rs`
 (semantics), `tools/src/agent_cli.rs` (`fluxor agent serve`, `fluxor agent call`),
-`packaging/stack/agent_listen.yaml`, `packaging/stack/agent_dial.yaml` (the remote
-transport).
+`packaging/stack/agent_listen.yaml`, `packaging/stack/agent_dial.yaml` and their
+`_lane` forms (the remote transport).
 
 The node agent's other verbs (`commit`, `remove`, `status`, `logs`, `policy`) are
 the local command surface of an orchestrator on the same host. They are not part
@@ -185,6 +185,13 @@ include:
       trust: /etc/fluxor/agent/controllers-ca.pem
       peer_uri: spiffe://fabric/controller/
 ```
+
+A controller or target that speaks the protocol from a module of its own, rather
+than through `fluxor agent`, includes `agent_dial_lane` or `agent_listen_lane`: the
+same stack, parameters included, with the channel exported as `frames_in` and
+`frames_out` in place of the two stdio modules. Each port carries the same
+`[peer:32][len:u32][record]` frame. A graph includes one per target, each under its
+own `as:`.
 
 The runtime carrying the transport is not the runtime carrying the workloads. A
 structural plan rebuilds a runtime's graph, sockets included, so a transport under

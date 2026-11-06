@@ -174,6 +174,11 @@ fn bundle_graph(
         return Ok((written, declared));
     }
     let mut doc = doc;
+    // Only a platform stack reads the mark, and a graph without one has
+    // nothing to carry it to.
+    if doc.get("platform").is_none() {
+        fluxor_tools::stack::strip_stack_member_marks(&mut doc);
+    }
     if let (Some(obj), false) = (doc.as_object_mut(), declared.is_empty()) {
         let schema = serde_json::to_value(&declared).map_err(|e| at(e.to_string()))?;
         obj.insert(params::PARAMS_KEY.to_string(), schema);

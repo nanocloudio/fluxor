@@ -2903,8 +2903,7 @@ fn run_modules_build_strict(project_root: &Path, verbose: bool) -> std::result::
         considered,
         module_manifest_count(project_root),
         "module manifest(s) exist under `modules/`",
-        "they are in a flat `modules/<name>/` layout the tiers do not cover, \
-         or `[ci] targets` names no target",
+        "`[ci] targets` names no target",
     )
 }
 

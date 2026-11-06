@@ -91,6 +91,23 @@ pub const TAG_PREFIX: &str = "stack/";
 /// The graph key that includes stacks.
 pub const INCLUDE_KEY: &str = "include";
 
+/// Set on a module a graph's own `include:` brought in. Such a member is
+/// private to its stack: only the stack's exports can be wired, so it cannot
+/// stand in for a module a platform stack would add. Never authored; an
+/// expanded bundle graph with a `platform:` carries it to the build that
+/// reads it, and platform stack expansion removes it there, so it never
+/// reaches a config.
+pub const STACK_MEMBER_KEY: &str = "_stack_member";
+
+/// Remove [`STACK_MEMBER_KEY`] from a graph's modules.
+pub fn strip_stack_member_marks(graph: &mut Value) {
+    if let Some(modules) = graph.get_mut("modules").and_then(Value::as_array_mut) {
+        for entry in modules.iter_mut().filter_map(Value::as_object_mut) {
+            entry.remove(STACK_MEMBER_KEY);
+        }
+    }
+}
+
 /// Every key a stack document may carry. A target, a platform, a
 /// scheduler, services, execution domains: each belongs to the graph that
 /// includes the stack, never to the stack.
@@ -980,6 +997,9 @@ fn expand_scope(
                 if let Some(r) = rename.get(p.as_str()) {
                     *p = r.clone();
                 }
+            }
+            if workload.is_none() {
+                entry.insert(STACK_MEMBER_KEY.into(), Value::Bool(true));
             }
             if let Some(n) = &node {
                 entry.retain(|k, _| PLACED_KEYS.contains(&k.as_str()));
