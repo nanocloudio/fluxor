@@ -1433,6 +1433,17 @@ pub fn select_cipher_suite(client_suites: &[u8]) -> Option<CipherSuite> {
     None
 }
 
+/// Whether a Certificate message body (after the handshake header) is the
+/// empty one a client without a certificate sends: a well-formed request
+/// context and a certificate list of length 0, and nothing after it.
+pub fn certificate_msg_is_empty(data: &[u8]) -> bool {
+    let Some(&ctx_len) = data.first() else {
+        return false;
+    };
+    let pos = 1 + ctx_len as usize;
+    pos + 3 == data.len() && get_u24(data, pos) == 0
+}
+
 /// Parse Certificate message body
 pub fn parse_certificate_msg(data: &[u8]) -> Option<&[u8]> {
     if data.len() < 4 {

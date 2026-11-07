@@ -967,7 +967,7 @@ unsafe fn check_contract_grant(contract: u16) -> Option<i32> {
 ///
 /// Bit layout is shared with `tools/src/manifest.rs` — keep in sync.
 pub mod permission {
-    // 16-bit bitmap, bits 9.. free. Bit layout is shared with
+    // 16-bit bitmap, bits 11.. free. Bit layout is shared with
     // `tools/src/manifest.rs` — keep the two in sync.
     pub const RECONFIGURE: u16 = 1 << 0;
     pub const FLASH_RAW: u16 = 1 << 1;
@@ -994,6 +994,10 @@ pub mod permission {
     /// former hands every such driver the whole address space. The same
     /// separation `pcie_device` already makes.
     pub const USB_HOST: u16 = 1 << 9;
+    /// Keep the key vault's durable image (`abi::internal::vault_store`):
+    /// the module holding it sees every persisted record, sealed or (under
+    /// seal mode `none`) not, and decides what reaches the medium.
+    pub const VAULT_STORE: u16 = 1 << 10;
 
     pub fn name(bit: u16) -> &'static str {
         match bit {
@@ -1007,6 +1011,7 @@ pub mod permission {
             DMA => "dma",
             OBSERVE => "observe",
             USB_HOST => "usb_host",
+            VAULT_STORE => "vault_store",
             _ => "<unknown>",
         }
     }
@@ -1030,6 +1035,10 @@ fn privileged_op_permission(op: u32) -> Option<u16> {
     // `pcie_device` already draws this line for the same reason.
     if (0x1500..=0x15FF).contains(&op) {
         return Some(USB_HOST);
+    }
+    // The key vault's durable store (0x1040..): only its keeper.
+    if crate::abi::internal::vault_store::is_store_op(op) {
+        return Some(VAULT_STORE);
     }
     // Isolated-workload surface (workload, 0x1Axx) — spawning owner-bound
     // isolated workloads is privileged; gated by the same
@@ -1382,10 +1391,13 @@ unsafe fn buffer_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
 }
 
 /// `TIMER::DISCIPLINE`: anchor the network-disciplined wall clock. Only a
-/// platform whose HAL reads `time_sync` (bcm2712, uefi) takes an anchor;
+/// platform whose HAL reads `time_sync` (bcm2712, uefi, rp2350) takes an anchor;
 /// anywhere else the call is `ENOSYS` rather than a second clock nobody reads.
 fn discipline_wall_clock(unix_us: u64, mono_us: u64, err_us: u64) -> i32 {
-    #[cfg(feature = "aarch64-metal")]
+    #[cfg(any(
+        feature = "aarch64-metal",
+        all(feature = "rp", not(feature = "chip-rp2040"))
+    ))]
     {
         // SAFETY: takes no pointers; the kernel timer is initialised before
         // any module runs.
@@ -1400,7 +1412,10 @@ fn discipline_wall_clock(unix_us: u64, mono_us: u64, err_us: u64) -> i32 {
         }
         rc
     }
-    #[cfg(not(feature = "aarch64-metal"))]
+    #[cfg(not(any(
+        feature = "aarch64-metal",
+        all(feature = "rp", not(feature = "chip-rp2040"))
+    )))]
     {
         let _ = (unix_us, mono_us, err_us);
         E_NOSYS

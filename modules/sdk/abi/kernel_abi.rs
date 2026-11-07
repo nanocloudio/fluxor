@@ -292,6 +292,8 @@ pub mod errno {
     pub const EFAULT: i32 = -14;
     /// No such device or address (e.g. I2C NACK).
     pub const ENXIO: i32 = -6;
+    /// I/O error: the medium refused or lost what it was given.
+    pub const EIO: i32 = -5;
     /// Resource temporarily unavailable — try again.
     pub const EAGAIN: i32 = -11;
     /// Cannot allocate memory / no free slots.

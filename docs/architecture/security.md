@@ -236,23 +236,37 @@ A labelled key asked to persist is sealed through the platform HAL.
   not be written durably refuses the key rather than reporting it persisted.
   Linux writes a temporary file, flushes it, renames it, and flushes the
   directory.
-- **Where records live.** On Linux, one file per label under
-  `FLUXOR_VAULT_DIR`, or `vault/` under `FLUXOR_STORE_DIR`. On a bare-metal
-  Pi 5 whose graph holds a backing provider (the `nvme` module), in the
-  NVMe's reserved backing pages: two 16 KiB slots, A/B. A write builds the
-  whole new image, writes it to the slot not in use, flushes, and only then
-  makes it live, so a power cut leaves the previous image whole; each image
-  carries a sequence number and a SHA-256 over itself, and a boot takes the
-  valid image with the higher sequence. Records there are sealed with
-  ChaCha20-Poly1305 under a key derived from the board's OTP device key. A
-  Pi 5 whose OTP holds no device key cannot seal: its vault keeps every key
-  in RAM, writes nothing to the store, and says so once in the boot log.
-- **A store not yet readable.** A durable store that exists but cannot be
-  read yet (the NVMe still coming up at boot) is not an empty one. Until it
-  reads, a labelled open of a key not already open, an import and a destroy
-  by label answer `EAGAIN`, and the caller asks again: answered as empty, an
-  open would generate a fresh key over the stored one, and a destroy would
-  leave the record to come back.
+- **Where records live.** In a graph that wires a `vault_store` module, on
+  whatever `storage.block` source it is wired to: one implementation for every
+  board (`modules/foundation/vault_store/README.md`, wire contract
+  `abi::internal::vault_store`). The records are one `FXVS` image in kernel
+  RAM; the module keeps it in two A/B slots, writing each new image to the
+  slot not holding the durable one and flushing before it reports it, so a
+  power cut leaves the previous image whole. Each image carries a sequence
+  number and a SHA-256 over itself, and a load takes the valid image with the
+  higher sequence. Without one: on Linux, one file per label under
+  `FLUXOR_VAULT_DIR`, or `vault/` under `FLUXOR_STORE_DIR`; on a bare-metal
+  board, nowhere — keys serve the boot that made them, and `DESCRIBE`
+  reports them unpersisted. On a Pi 5 the NVMe's External backing space
+  keeps its first 32 KiB out of every arena for this: `vault_store` over the
+  `nvme` module's `blocks` at `start_sector: 2097152`, `sector_count: 64`,
+  `image: 16384`.
+- **Waiting for the medium.** A key made with `PERSIST` through a
+  `vault_store` is in the image at once and on the medium only once the module
+  reports it. Until then the open that made it, and every open of it, answers
+  `EAGAIN`; asked again, the same key is answered. A destroy answers `EAGAIN`
+  until the medium no longer holds the record; asked again after that, the
+  label names nothing and the answer is `ENOENT`. A write the medium refuses
+  answers the waiting opens `ERROR`, and the module retries.
+- **Sealing.** `vault_store`'s `seal` names it. `hardware` (the default):
+  records are sealed through the platform HAL — ChaCha20-Poly1305 under a key
+  derived from the Pi 5's OTP device key, or the RP2350's OTP seal key once
+  provisioned — and a board with no such key persists nothing and says so
+  once. `none`: records are kept readable under `FXVC` (`FXVR` for a
+  workload's), whoever holds the medium holds the keys, and `DESCRIBE`
+  reports `persisted::CLEAR` with tier `SOFTWARE` (as does `TIER`), so a
+  consumer that needs a key protected at rest refuses it. A sealed store
+  never takes a readable record as a key: one found there is absent.
 - **Destroy.** Destroying a label removes its record, so the key does not
   come back.
 - **A workload's records.** Without a vault of its own a workload's record

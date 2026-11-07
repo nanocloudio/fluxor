@@ -91,6 +91,10 @@ unsafe fn backend_of(handle: i32) -> Result<Dispatch, i32> {
 /// `arg` valid for `arg_len` bytes, as each opcode's layout requires.
 pub unsafe fn dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
     match opcode {
+        // The store the software vault persists to, kept by `vault_store`.
+        op if crate::abi::internal::vault_store::is_store_op(op) => {
+            crate::kernel::security::vault_store::dispatch(op, arg, arg_len)
+        }
         kv::SHARE_REWRAP => share_rewrap(handle, arg, arg_len),
         kv::SHARE_COMBINE => share_combine(arg, arg_len),
         kv::ATTEST_KEY => attest_key(handle, arg, arg_len),

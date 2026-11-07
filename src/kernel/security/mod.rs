@@ -7,6 +7,7 @@ pub mod key_share;
 pub mod key_vault;
 pub mod key_vault_router;
 pub mod slot_signature;
+pub mod vault_store;
 
 /// A build-time key that is set but is not 64 hex digits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -301,7 +301,11 @@ pub const MAX_LABEL: usize = 64;
 /// - `-EBUSY`: another instance of the caller's module type holds the key
 ///   open;
 /// - `-ENOMEM`: no slot is free;
-/// - `-ERANGE`: the public-key buffer is short (nothing was opened or made).
+/// - `-ERANGE`: the public-key buffer is short (nothing was opened or made);
+/// - `-EAGAIN`: the vault's store cannot be read yet, or the key (`PERSIST`)
+///   is not on the store's medium yet; asked again, the same key is answered
+///   once it is;
+/// - `-1`: the store's medium refused the key's record.
 ///
 /// **This is the operation that makes an issuer key survive a restart**,
 /// and it is one operation rather than "does it exist?" then "create it"
@@ -334,8 +338,11 @@ pub const OPEN: u32 = 0x100A;
 /// Destroy the key named by `label`, wherever it is stored.
 ///
 /// handle=-1. arg layout: `[label_len:u8][label[label_len]]`.
-/// Returns 0, `-ENOENT` when no key has the label, or the generic error
-/// (`-1`) when the sealed record could not be removed (it would come back).
+/// Returns 0, `-ENOENT` when no key has the label, `-EAGAIN` while the
+/// vault's store cannot be read yet or its medium still holds the record
+/// (asked again once it does not, the label names nothing: `-ENOENT`), or
+/// the generic error (`-1`) when the sealed record could not be removed (it
+/// would come back).
 ///
 /// By label rather than by handle because the point is to remove the
 /// PERSISTED key: destroying a handle frees a slot and leaves the sealed
@@ -353,6 +360,18 @@ pub const DESTROY_BY_LABEL: u32 = 0x100B;
 /// deliberately separate from it: a caller that conflates the two is the
 /// failure mode this whole surface is shaped to prevent.
 pub const DESCRIBE: u32 = 0x100C;
+
+/// `persisted_out` values of [`DESCRIBE`].
+pub mod persisted {
+    /// Gone after a restart.
+    pub const NO: u8 = 0;
+    /// Kept sealed: the medium holds it opaque.
+    pub const SEALED: u8 = 1;
+    /// Kept READABLE (the vault's store is seal mode `none`): whoever holds
+    /// the medium holds the key. A consumer that needs a key protected at
+    /// rest refuses this, as it refuses a tier it did not ask for.
+    pub const CLEAR: u8 = 2;
+}
 
 /// Ask whether a backend can use `suite`, and what it costs.
 ///

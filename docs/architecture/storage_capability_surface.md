@@ -28,7 +28,7 @@ compose the family; every provider declares one or more.
 
 | Surface             | Domain                                                          | Providers / consumers                                        |
 |---------------------|-----------------------------------------------------------------|--------------------------------------------------------------|
-| `storage.block`     | Raw block I/O                                                   | nvme, sd (read-only), file_block, crypt_block provide; fat32, crypt_block and nbd_serve consume |
+| `storage.block`     | Raw block I/O                                                   | nvme, sd, flash_rp (data store), file_block, crypt_block provide; fat32, crypt_block, nbd_serve and vault_store consume |
 | `file.data`         | Byte-stream file access (open, read, seek, stat, write, fsync)  | fat32 and the mount router provide; player / viewer modules consume |
 | `storage.namespace` | Name-keyed directory surface (lookup, stat, list, rename, delete, bind, subscribe) | host platform providers and fs_object (§5); scanners and stores consume |
 | `storage.object`    | Whole-blob byte-addressed surface (put, get, head, range_get, delete, list) | host platform providers and fs_object (§5); object_bank consumes |
@@ -377,7 +377,8 @@ record:
 | Source | Serves |
 | --- | --- |
 | `nvme` | everything; 8 requests in flight on I/O queue 0 |
-| `sd` | read-only: `CAPS` and one-block `SUBMIT`/`REAP` reads (queue depth 1, `EXEC` answers `ENOSYS`), beside its sector stream |
+| `sd` | one-block `SUBMIT`/`REAP` reads and writes (queue depth 1, writes copied at submit and on the card when they complete, `EXEC` answers `ENOSYS`), beside its sector stream |
+| `flash_rp` (`store`) | the RP flash's 16 KiB data store in 4 KiB erase-sector blocks: reads, and writes that complete `LocalDurable` (queue depth 1, `EXEC` answers `ENOSYS`) |
 | `file_block` | everything over one file reached through `fs` |
 | `crypt_block` | everything, as authenticated encryption over the source wired to its `lower` input |
 

@@ -191,7 +191,7 @@ pub fn contract_id_from_name(s: &str) -> Result<u8> {
         // schema error — those go in `permissions = [...]`, not
         // `[[resources]]`.
         "internal" | "system" | "reconfigure" | "flash_raw" | "backing_provider"
-        | "platform_raw" | "monitor" | "bridge" => Err(Error::Module(format!(
+        | "platform_raw" | "monitor" | "bridge" | "vault_store" => Err(Error::Module(format!(
             "`{s}` is a permission, not a contract. Declare it in the \
                  top-level `permissions = [\"{s}\", ...]` list, not under \
                  `[[resources]]`. See docs/architecture/abi_layers.md."
@@ -1220,6 +1220,7 @@ pub mod permission {
     pub const DMA: u16 = 1 << 7; // DMA-arena buffer alloc + cache maintenance
     pub const OBSERVE: u16 = 1 << 8; // read-only telemetry-ring drain (TLM_SUBSCRIBE/DRAIN/STATS)
     pub const USB_HOST: u16 = 1 << 9; // kernel-mediated USB host controller bind + transfers
+    pub const VAULT_STORE: u16 = 1 << 10; // keep the key vault's durable image (vault_store)
 
     pub fn from_name(s: &str) -> Option<u16> {
         match s {
@@ -1233,6 +1234,7 @@ pub mod permission {
             "dma" => Some(DMA),
             "observe" => Some(OBSERVE),
             "usb_host" => Some(USB_HOST),
+            "vault_store" => Some(VAULT_STORE),
             _ => None,
         }
     }
@@ -1268,6 +1270,9 @@ pub mod permission {
         }
         if bits & USB_HOST != 0 {
             out.push("usb_host");
+        }
+        if bits & VAULT_STORE != 0 {
+            out.push("vault_store");
         }
         out
     }

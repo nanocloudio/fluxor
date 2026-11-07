@@ -165,6 +165,13 @@ chip-rp2040 = ["rp", "rp2040-boot2", "embedded-platform", "kernel-mpu"]
 # the flag is that the overclock is opt-in and visible in the build line.
 rp-overclock = []
 
+# RP2350: program a fresh seal key into a BLANK OTP page (`rp_otp_seal`) on
+# first use, then lock the page against the bootloader. Irreversible per
+# board, and unproven on hardware: never in a shipped image, and not to be
+# enabled before the page and lock encodings are confirmed on a sacrificial
+# board. Without it a board only reads a key that is already there.
+rp-otp-provision = []
+
 # Kernel hardware CAPABILITIES (what a platform can do, not which chip it is).
 # The kernel branches on these, never on chip identity; a chip or host feature
 # turns on whichever it provides.

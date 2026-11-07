@@ -289,6 +289,7 @@ pub const BEYOND_GATEWAY: &[(u16, &str)] = &[
     (crate::manifest::permission::PCIE_DEVICE, "pcie_device"),
     (crate::manifest::permission::DMA, "dma"),
     (crate::manifest::permission::USB_HOST, "usb_host"),
+    (crate::manifest::permission::VAULT_STORE, "vault_store"),
 ];
 
 /// Why a graph's gated modules cannot be admitted on a target with

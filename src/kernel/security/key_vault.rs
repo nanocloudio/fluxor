@@ -185,6 +185,11 @@ const FLAG_PERSISTED: u8 = 0x02;
 /// `SOFTWARE` whatever the platform's sealing key is worth, since whoever
 /// holds the volume and that key holds the key.
 const FLAG_OWNER_SEALED: u8 = 0x04;
+/// This slot's key is persisted READABLE: the vault's store keeps records
+/// unsealed (`vault_store` seal mode `none`). `DESCRIBE` reports it
+/// persisted in the clear, and its custody `SOFTWARE`: whoever holds the
+/// medium holds the key.
+const FLAG_CLEAR: u8 = 0x08;
 
 /// The realm of a key made by node code: every module the node runs itself.
 /// A workload's realm is its owner uid ([`Scope`]).
@@ -544,6 +549,12 @@ const MAX_SEALED: usize = MAX_KEY_BYTES + 12 + 16;
 /// its sealing key's, wherever the workload holding them runs.
 const RECORD_MAGIC: [u8; 4] = *b"FXVK";
 const REALM_RECORD_MAGIC: [u8; 4] = *b"FXVW";
+/// A record kept READABLE (`vault_store` seal mode `none`): `FXVC` for the
+/// node's, `FXVR` for a workload's, the key itself after the header. The
+/// magic is part of the header a sealed record authenticates, so neither
+/// kind reads as the other.
+const CLEAR_RECORD_MAGIC: [u8; 4] = *b"FXVC";
+const CLEAR_REALM_RECORD_MAGIC: [u8; 4] = *b"FXVR";
 const MAX_HEADER: usize = 4 + 4 + 2 + 4 + 1 + MAX_LABEL + 16;
 /// Longest durable name: `namespace:u32 (big-endian) ‖ [realm:16] ‖ label`.
 const MAX_BLOB_NAME: usize = 4 + 16 + MAX_LABEL;
@@ -561,6 +572,11 @@ struct Persisted {
     /// Who sealed `sealed`: an entry whose scope's keeper is another now
     /// (the workload that held the vault is gone) is not this key.
     kept: Keeper,
+    /// `sealed` holds the key itself: the store keeps records readable.
+    clear: bool,
+    /// The store's image sequence this record waits on to be durable; 0
+    /// once it is (`vault_store`).
+    pending: u64,
     sealed: [u8; MAX_SEALED],
     sealed_len: u8,
 }
@@ -576,6 +592,8 @@ impl Persisted {
             namespace: 0,
             realm: NODE_REALM,
             kept: Keeper::Platform,
+            clear: false,
+            pending: 0,
             sealed: [0; MAX_SEALED],
             sealed_len: 0,
         }
@@ -602,13 +620,15 @@ fn record_header(
     label: &[u8],
     suite: u16,
     usage: u32,
+    clear: bool,
     out: &mut [u8; MAX_HEADER],
 ) -> usize {
     let realm_bound = !scope.is_node() && kept == Keeper::Platform;
-    out[0..4].copy_from_slice(if realm_bound {
-        &REALM_RECORD_MAGIC
-    } else {
-        &RECORD_MAGIC
+    out[0..4].copy_from_slice(match (realm_bound, clear) {
+        (true, false) => &REALM_RECORD_MAGIC,
+        (false, false) => &RECORD_MAGIC,
+        (true, true) => &CLEAR_REALM_RECORD_MAGIC,
+        (false, true) => &CLEAR_RECORD_MAGIC,
     });
     out[4..8].copy_from_slice(&scope.namespace.to_le_bytes());
     out[8..10].copy_from_slice(&suite.to_le_bytes());
@@ -708,9 +728,45 @@ fn keeper_unseal(kept: Keeper, aad: &[u8], sealed: &[u8], out: &mut [u8]) -> Opt
     }
 }
 
+/// Whether the node's records go to a `vault_store` module's store rather
+/// than the platform's: the graph carries one.
+fn module_store() -> bool {
+    crate::kernel::security::vault_store::active()
+}
+
+/// Whether `kept` keeps records readable: the store's seal mode is `none`.
+fn keeps_clear(kept: Keeper) -> bool {
+    kept == Keeper::Platform && crate::kernel::security::vault_store::clear()
+}
+
+/// What storing (or removing) a record achieved.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Kept {
+    /// On the medium.
+    Durable,
+    /// In the store's image at this sequence, not on the medium yet.
+    Pending(u64),
+    /// The store refused it, or its medium did.
+    Failed,
+    /// There is no durable store at all.
+    NoStore,
+}
+
+impl From<crate::kernel::security::vault_store::Durability> for Kept {
+    fn from(d: crate::kernel::security::vault_store::Durability) -> Self {
+        use crate::kernel::security::vault_store::Durability as D;
+        match d {
+            D::Durable => Kept::Durable,
+            D::Pending(seq) => Kept::Pending(seq),
+            D::Failed => Kept::Failed,
+        }
+    }
+}
+
 /// Read the record `kept` holds under `name`.
 fn keeper_read(kept: Keeper, name: &[u8], out: &mut [u8]) -> Option<usize> {
     match kept {
+        Keeper::Platform if module_store() => crate::kernel::security::vault_store::read(name, out),
         Keeper::Platform => crate::kernel::sys::hal::seal_blob_read(name, out),
         #[cfg(feature = "host-linux")]
         // SAFETY: scheduler thread, as every vault call.
@@ -720,35 +776,82 @@ fn keeper_read(kept: Keeper, name: &[u8], out: &mut [u8]) -> Option<usize> {
     }
 }
 
-/// Store `blob` under `name` durably with `kept`.
-fn keeper_write(kept: Keeper, name: &[u8], blob: &[u8]) -> bool {
+/// Store `blob` under `name` with `kept`.
+fn keeper_write(kept: Keeper, name: &[u8], blob: &[u8]) -> Kept {
     match kept {
-        Keeper::Platform => crate::kernel::sys::hal::seal_blob_write(name, blob),
+        Keeper::Platform if module_store() => {
+            crate::kernel::security::vault_store::write(name, blob).into()
+        }
+        Keeper::Platform => {
+            if crate::kernel::sys::hal::seal_blob_write(name, blob) {
+                Kept::Durable
+            } else if crate::kernel::sys::hal::seal_blob_store() {
+                Kept::Failed
+            } else {
+                Kept::NoStore
+            }
+        }
         #[cfg(feature = "host-linux")]
-        // SAFETY: scheduler thread, as every vault call.
-        Keeper::Volume(h) => unsafe {
-            crate::platform::linux::owner_root::vault_write(h, name, blob)
-        },
+        Keeper::Volume(h) => {
+            // SAFETY: scheduler thread, as every vault call.
+            if unsafe { crate::platform::linux::owner_root::vault_write(h, name, blob) } {
+                Kept::Durable
+            } else {
+                Kept::Failed
+            }
+        }
     }
 }
 
-/// Remove the record `kept` holds under `name`; whether none remains.
-fn keeper_delete(kept: Keeper, name: &[u8]) -> bool {
+/// Remove the record `kept` holds under `name`. `Durable` when none remains.
+fn keeper_delete(kept: Keeper, name: &[u8]) -> Kept {
     match kept {
-        Keeper::Platform => crate::kernel::sys::hal::seal_blob_delete(name),
+        Keeper::Platform if module_store() => {
+            crate::kernel::security::vault_store::delete(name).into()
+        }
+        Keeper::Platform => {
+            if !crate::kernel::sys::hal::seal_blob_store() {
+                Kept::NoStore
+            } else if crate::kernel::sys::hal::seal_blob_delete(name) {
+                Kept::Durable
+            } else {
+                Kept::Failed
+            }
+        }
         #[cfg(feature = "host-linux")]
-        // SAFETY: scheduler thread, as every vault call.
-        Keeper::Volume(h) => unsafe { crate::platform::linux::owner_root::vault_delete(h, name) },
+        Keeper::Volume(h) => {
+            // SAFETY: scheduler thread, as every vault call.
+            if unsafe { crate::platform::linux::owner_root::vault_delete(h, name) } {
+                Kept::Durable
+            } else {
+                Kept::Failed
+            }
+        }
     }
 }
 
-/// Whether `kept` has a durable store: a workload's vault always does.
-fn keeper_stores(kept: Keeper) -> bool {
-    match kept {
-        Keeper::Platform => crate::kernel::sys::hal::seal_blob_store(),
-        #[cfg(feature = "host-linux")]
-        Keeper::Volume(_) => true,
+/// Whether a record waiting on the store's image at `seq` is durable yet:
+/// `Ok` when it is (or never waited), `EAGAIN` while the store writes it,
+/// `ERROR` when the store's medium refused the write.
+fn settled(pending: u64) -> Result<(), i32> {
+    if pending == 0 {
+        return Ok(());
     }
+    match crate::kernel::security::vault_store::durability(pending) {
+        crate::kernel::security::vault_store::Durability::Durable => Ok(()),
+        crate::kernel::security::vault_store::Durability::Pending(_) => Err(EAGAIN),
+        crate::kernel::security::vault_store::Durability::Failed => Err(ERROR),
+    }
+}
+
+/// [`settled`] for a `PERSISTED` entry, which forgets its wait once durable.
+///
+/// # Safety
+/// Kernel context, exclusive access to `PERSISTED`.
+unsafe fn settle(pi: usize) -> Result<(), i32> {
+    settled(PERSISTED[pi].pending)?;
+    PERSISTED[pi].pending = 0;
+    Ok(())
 }
 
 /// The platform has a durable store and it cannot be read yet (its medium
@@ -757,9 +860,13 @@ fn keeper_stores(kept: Keeper) -> bool {
 /// and a delete would leave the record to come back. Those paths answer
 /// `EAGAIN` until it reads.
 fn store_not_ready(scope: Scope) -> bool {
-    keeper_of(scope) == Keeper::Platform
-        && crate::kernel::sys::hal::seal_blob_store()
-        && !crate::kernel::sys::hal::seal_blob_ready()
+    if keeper_of(scope) != Keeper::Platform {
+        return false;
+    }
+    if module_store() {
+        return !crate::kernel::security::vault_store::ready();
+    }
+    crate::kernel::sys::hal::seal_blob_store() && !crate::kernel::sys::hal::seal_blob_ready()
 }
 
 /// Find a persisted entry by namespace and label: `Ok(None)` when no such
@@ -829,20 +936,34 @@ unsafe fn rehydrate_persisted(scope: Scope, label: &[u8]) -> Result<Option<usize
     }
     let suite = u16::from_le_bytes([blob[8], blob[9]]);
     let usage = u32::from_le_bytes([blob[10], blob[11], blob[12], blob[13]]);
+    // A readable record is the key itself, and only a store kept readable
+    // may hold one: in a sealed store it is a key planted on the medium.
+    let clear = blob[0..4] == CLEAR_RECORD_MAGIC || blob[0..4] == CLEAR_REALM_RECORD_MAGIC;
+    if clear && !keeps_clear(kept) {
+        zeroize(&mut blob);
+        return unreadable;
+    }
     let mut header = [0u8; MAX_HEADER];
-    let h = record_header(scope, kept, label, suite, usage, &mut header);
+    let h = record_header(scope, kept, label, suite, usage, clear, &mut header);
     if n <= h || blob[..h] != header[..h] || n - h > MAX_SEALED {
         zeroize(&mut blob);
         return unreadable;
     }
-    // Proven here, not at first use: a record that does not open under its
-    // own header is not this key.
-    let mut probe = [0u8; MAX_KEY_BYTES];
-    let opened = keeper_unseal(kept, &header[..h], &blob[h..n], &mut probe);
-    zeroize(&mut probe);
-    if opened.is_none() {
-        zeroize(&mut blob);
-        return unreadable;
+    if clear {
+        if n - h != suite_private_len(suite) {
+            zeroize(&mut blob);
+            return unreadable;
+        }
+    } else {
+        // Proven here, not at first use: a record that does not open under
+        // its own header is not this key.
+        let mut probe = [0u8; MAX_KEY_BYTES];
+        let opened = keeper_unseal(kept, &header[..h], &blob[h..n], &mut probe);
+        zeroize(&mut probe);
+        if opened.is_none() {
+            zeroize(&mut blob);
+            return unreadable;
+        }
     }
     let Some(idx) = free_persisted() else {
         return Err(ENOMEM);
@@ -858,6 +979,17 @@ unsafe fn rehydrate_persisted(scope: Scope, label: &[u8]) -> Result<Option<usize
     PERSISTED[idx].kept = kept;
     PERSISTED[idx].suite = suite;
     PERSISTED[idx].usage = usage;
+    PERSISTED[idx].clear = clear;
+    // Read from a store's image the medium may not hold yet: the record is
+    // only as durable as that image.
+    PERSISTED[idx].pending = if kept == Keeper::Platform && module_store() {
+        match crate::kernel::security::vault_store::image_durability() {
+            crate::kernel::security::vault_store::Durability::Durable => 0,
+            _ => crate::kernel::security::vault_store::live_seq(),
+        }
+    } else {
+        0
+    };
     PERSISTED[idx].sealed[..n - h].copy_from_slice(&blob[h..n]);
     #[expect(clippy::cast_possible_truncation, reason = "bounded by MAX_SEALED")]
     {
@@ -880,6 +1012,10 @@ enum Persist {
     /// The platform stores keys and this one could not be stored. The key
     /// must not be handed out as persistent.
     Failed,
+    /// In the store's image at this sequence, which the `vault_store`
+    /// module has not reported durable yet: the key is not handed out
+    /// until it is (the caller asks again, `EAGAIN`).
+    Pending(u64),
 }
 
 /// Seal `key` under `namespace`/`label` and store it durably.
@@ -891,27 +1027,45 @@ unsafe fn persist_key(scope: Scope, label: &[u8], suite: u16, usage: u32, key: &
         return Persist::Failed;
     }
     let kept = keeper_of(scope);
+    let clear = keeps_clear(kept);
     let mut header = [0u8; MAX_HEADER];
-    let h = record_header(scope, kept, label, suite, usage, &mut header);
+    let h = record_header(scope, kept, label, suite, usage, clear, &mut header);
     let mut sealed = [0u8; MAX_SEALED];
-    let Some(n) = keeper_seal(kept, &header[..h], key, &mut sealed) else {
-        // No sealing on this platform. The key still works for this boot;
-        // it simply will not come back, and `DESCRIBE` reports that
-        // truthfully rather than claiming a persistence that is not there.
-        return Persist::Unavailable;
+    let n = if clear {
+        if key.len() > MAX_SEALED {
+            return Persist::Failed;
+        }
+        sealed[..key.len()].copy_from_slice(key);
+        key.len()
+    } else {
+        match keeper_seal(kept, &header[..h], key, &mut sealed) {
+            Some(n) => n,
+            None => {
+                // No sealing on this platform. The key still works for this
+                // boot; it simply will not come back, and `DESCRIBE` reports
+                // that truthfully rather than claiming a persistence that is
+                // not there. A graph that asked for a sealed store on a board
+                // with no sealing key is told why, once.
+                if kept == Keeper::Platform && module_store() {
+                    warn_unsealable();
+                }
+                return Persist::Unavailable;
+            }
+        }
     };
     let mut record = [0u8; MAX_HEADER + MAX_SEALED];
     record[..h].copy_from_slice(&header[..h]);
     record[h..h + n].copy_from_slice(&sealed[..n]);
     let mut name = [0u8; MAX_BLOB_NAME];
     let name_len = blob_name(scope, kept, label, &mut name);
-    let outcome = if keeper_write(kept, &name[..name_len], &record[..h + n]) {
-        Persist::Durable
-    } else if keeper_stores(kept) {
-        log::warn!("[vault] persist failed: sealed record not durably stored (suite={suite})");
-        Persist::Failed
-    } else {
-        Persist::Unavailable
+    let outcome = match keeper_write(kept, &name[..name_len], &record[..h + n]) {
+        Kept::Durable => Persist::Durable,
+        Kept::Pending(seq) => Persist::Pending(seq),
+        Kept::Failed => {
+            log::warn!("[vault] persist failed: sealed record not durably stored (suite={suite})");
+            Persist::Failed
+        }
+        Kept::NoStore => Persist::Unavailable,
     };
     zeroize(&mut record);
     if outcome == Persist::Failed {
@@ -926,10 +1080,10 @@ unsafe fn persist_key(scope: Scope, label: &[u8], suite: u16, usage: u32, key: &
             Some(i) => i,
             None => {
                 zeroize(&mut sealed);
-                return if outcome == Persist::Durable {
-                    outcome
-                } else {
-                    Persist::Unavailable
+                return match outcome {
+                    // In the store: a later open finds it there.
+                    Persist::Durable | Persist::Pending(_) => outcome,
+                    _ => Persist::Unavailable,
                 };
             }
         },
@@ -942,6 +1096,11 @@ unsafe fn persist_key(scope: Scope, label: &[u8], suite: u16, usage: u32, key: &
     PERSISTED[idx].kept = kept;
     PERSISTED[idx].suite = suite;
     PERSISTED[idx].usage = usage;
+    PERSISTED[idx].clear = clear;
+    PERSISTED[idx].pending = match outcome {
+        Persist::Pending(seq) => seq,
+        _ => 0,
+    };
     PERSISTED[idx].sealed[..n].copy_from_slice(&sealed[..n]);
     PERSISTED[idx].sealed_len = n as u8;
     PERSISTED[idx].live = true;
@@ -963,16 +1122,27 @@ unsafe fn open_persisted(idx: usize) -> Result<usize, i32> {
         entry.label_bytes(),
         entry.suite,
         entry.usage,
+        entry.clear,
         &mut header,
     );
     let mut key = [0u8; MAX_KEY_BYTES];
-    let Some(n) = keeper_unseal(
-        entry.kept,
-        &header[..h],
-        &entry.sealed[..entry.sealed_len as usize],
-        &mut key,
-    ) else {
-        return Err(ERROR);
+    let n = if entry.clear {
+        let n = entry.sealed_len as usize;
+        if n > MAX_KEY_BYTES {
+            return Err(ERROR);
+        }
+        key[..n].copy_from_slice(&entry.sealed[..n]);
+        n
+    } else {
+        let Some(n) = keeper_unseal(
+            entry.kept,
+            &header[..h],
+            &entry.sealed[..entry.sealed_len as usize],
+            &mut key,
+        ) else {
+            return Err(ERROR);
+        };
+        n
     };
     if n == 0 || n > MAX_KEY_BYTES {
         zeroize(&mut key);
@@ -995,7 +1165,10 @@ unsafe fn open_persisted(idx: usize) -> Result<usize, i32> {
     }
     zeroize(&mut key);
     // In-use last, so a partial fill is never observable.
-    SLOTS[slot].flags = FLAG_IN_USE | FLAG_PERSISTED | owner_sealed_flag(entry.kept);
+    SLOTS[slot].flags = FLAG_IN_USE
+        | FLAG_PERSISTED
+        | owner_sealed_flag(entry.kept)
+        | if entry.clear { FLAG_CLEAR } else { 0 };
     Ok(slot)
 }
 
@@ -1033,12 +1206,14 @@ fn owner_sealed_flag(kept: Keeper) -> u8 {
 }
 
 /// Remove a persisted key: its RAM entry and its durable record. Returns
-/// whether there was one, and whether no durable record remains — false when
-/// the platform could not remove it, so it would come back.
+/// whether there was one, and where its removal stands: `Durable` (or
+/// `NoStore`) when no durable record remains, `Pending` while the store's
+/// medium still holds it, `Failed` when the store could not remove it, so it
+/// would come back.
 ///
 /// # Safety
 /// Kernel context, exclusive access to `PERSISTED`.
-unsafe fn forget_persisted(scope: Scope, label: &[u8]) -> (bool, bool) {
+unsafe fn forget_persisted(scope: Scope, label: &[u8]) -> (bool, Kept) {
     let mut found = false;
     let table = &raw mut PERSISTED;
     for e in (*table).iter_mut() {
@@ -1058,6 +1233,16 @@ unsafe fn forget_persisted(scope: Scope, label: &[u8]) -> (bool, bool) {
     zeroize(&mut blob);
     let removed = keeper_delete(kept, &name[..name_len]);
     (found, removed)
+}
+
+/// Warn, once, that a sealed store was asked for on a board that cannot seal.
+fn warn_unsealable() {
+    static WARNED: portable_atomic::AtomicBool = portable_atomic::AtomicBool::new(false);
+    if !WARNED.swap(true, portable_atomic::Ordering::Relaxed) {
+        log::warn!(
+            "[vault] store is seal: hardware and this board has no sealing key: keys are not persisted (seal: none keeps them readable)"
+        );
+    }
 }
 
 /// Provision `key` as a persisted key of module type `namespace` under
@@ -1081,11 +1266,20 @@ pub unsafe fn import_persisted(
     {
         return Err(EINVAL);
     }
-    if store_not_ready(Scope::node(namespace)) {
+    let scope = Scope::node(namespace);
+    if store_not_ready(scope) {
         return Err(EAGAIN);
     }
-    match persist_key(Scope::node(namespace), label, suite, usage, key) {
+    // An import already waiting on the store is answered by that wait, not
+    // made again: a fresh record would restart the write it waits on.
+    if let Ok(Some(pi)) = find_persisted(scope, label) {
+        if PERSISTED[pi].pending != 0 {
+            return settle(pi);
+        }
+    }
+    match persist_key(scope, label, suite, usage, key) {
         Persist::Durable => Ok(()),
+        Persist::Pending(_) => Err(EAGAIN),
         Persist::Unavailable => Err(ENOSYS),
         Persist::Failed => Err(ERROR),
     }
@@ -1116,6 +1310,7 @@ pub unsafe fn identity_public(namespace: u32, label: &[u8]) -> Result<[u8; 65], 
             if PERSISTED[pi].suite != suite::P256 || want & !PERSISTED[pi].usage != 0 {
                 return Err(EACCES);
             }
+            settle(pi)?;
             let slot = open_persisted(pi)?;
             key.copy_from_slice(&SLOTS[slot].data[..32]);
             zeroise_slot(slot);
@@ -1125,12 +1320,22 @@ pub unsafe fn identity_public(namespace: u32, label: &[u8]) -> Result<[u8; 65], 
                 zeroize(&mut key);
                 return Err(ERROR);
             }
-            if !matches!(
-                persist_key(scope, label, suite::P256, want, &key),
-                Persist::Durable
-            ) {
-                zeroize(&mut key);
-                return Err(ENOSYS);
+            match persist_key(scope, label, suite::P256, want, &key) {
+                Persist::Durable => {}
+                Persist::Pending(_) => {
+                    // Kept, not yet on the medium: asked again, the same
+                    // key is answered once it is.
+                    zeroize(&mut key);
+                    return Err(EAGAIN);
+                }
+                Persist::Unavailable => {
+                    zeroize(&mut key);
+                    return Err(ENOSYS);
+                }
+                Persist::Failed => {
+                    zeroize(&mut key);
+                    return Err(ERROR);
+                }
             }
         }
     }
@@ -1169,6 +1374,10 @@ pub(crate) fn zeroize(buf: &mut [u8]) {
 /// nothing bound to the device, and reporting `DEVICE_HW` there would pass
 /// every `tier >= DEVICE_HW` refusal on a claim nobody implemented.
 fn current_tier() -> u8 {
+    // A store kept readable holds the node's keys in the clear on its medium.
+    if crate::kernel::security::vault_store::clear() {
+        return dev_key_vault::tier::SOFTWARE;
+    }
     if crate::kernel::sys::hal::seal_provenance()
         != crate::kernel::sys::hal::SealProvenance::DeviceUnique
     {
@@ -2763,12 +2972,20 @@ pub unsafe fn provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             // A key a workload's own vault holds is sealed under a key its
             // owner supplied: isolated from nothing the platform's key
             // could add.
-            *arg.add(6) = if slot.flags & FLAG_OWNER_SEALED != 0 {
+            // A key kept readable on the medium is isolated from no one who
+            // holds the medium.
+            *arg.add(6) = if slot.flags & (FLAG_OWNER_SEALED | FLAG_CLEAR) != 0 {
                 dev_key_vault::tier::SOFTWARE
             } else {
                 current_tier()
             };
-            *arg.add(7) = u8::from((slot.flags & FLAG_PERSISTED) != 0);
+            *arg.add(7) = if slot.flags & FLAG_PERSISTED == 0 {
+                dev_key_vault::persisted::NO
+            } else if slot.flags & FLAG_CLEAR != 0 {
+                dev_key_vault::persisted::CLEAR
+            } else {
+                dev_key_vault::persisted::SEALED
+            };
             8
         }
         dev_key_vault::OPEN_OR_GENERATE | dev_key_vault::OPEN => {
@@ -2851,6 +3068,11 @@ pub unsafe fn provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
                         if PERSISTED[pi].suite != suite || usage & !PERSISTED[pi].usage != 0 {
                             return EACCES;
                         }
+                        // Made by an earlier call and still on its way to
+                        // the medium: not handed out until it is there.
+                        if let Err(e) = settle(pi) {
+                            return e;
+                        }
                         match open_persisted(pi) {
                             Ok(i) => i,
                             Err(e) => {
@@ -2902,9 +3124,22 @@ pub unsafe fn provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
                             zeroise_slot(i);
                             return ERROR;
                         }
+                        if matches!(persisted, Persist::Pending(_)) {
+                            // Kept in the store's image and not yet on its
+                            // medium. Its owner asks again; the same key is
+                            // answered once the medium holds it.
+                            zeroise_slot(i);
+                            return EAGAIN;
+                        }
                         SLOTS[i].flags = FLAG_IN_USE
                             | if persisted == Persist::Durable {
-                                FLAG_PERSISTED | owner_sealed_flag(keeper_of(scope))
+                                FLAG_PERSISTED
+                                    | owner_sealed_flag(keeper_of(scope))
+                                    | if keeps_clear(keeper_of(scope)) {
+                                        FLAG_CLEAR
+                                    } else {
+                                        0
+                                    }
                             } else {
                                 0
                             };
@@ -2971,9 +3206,16 @@ pub unsafe fn provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
                 found = true;
             }
             let (had, removed) = forget_persisted(scope, label);
-            if !removed {
-                log::warn!("[vault] destroy: sealed record could not be removed");
-                return ERROR;
+            match removed {
+                Kept::Durable | Kept::NoStore => {}
+                // Gone from the store's image, still on its medium: asked
+                // again, answered once the medium lacks it too (a retry finds
+                // nothing to remove and answers `ENOENT` then).
+                Kept::Pending(_) => return EAGAIN,
+                Kept::Failed => {
+                    log::warn!("[vault] destroy: sealed record could not be removed");
+                    return ERROR;
+                }
             }
             if found || had {
                 0

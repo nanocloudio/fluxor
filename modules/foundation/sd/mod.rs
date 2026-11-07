@@ -119,6 +119,7 @@ const CMD8: u8 = 8; // SEND_IF_COND
 const CMD9: u8 = 9; // SEND_CSD
 const CMD16: u8 = 16; // SET_BLOCKLEN
 const CMD17: u8 = 17; // READ_SINGLE_BLOCK
+const CMD24: u8 = 24; // WRITE_BLOCK
 const CMD55: u8 = 55; // APP_CMD prefix
 const ACMD41: u8 = 41; // SD_SEND_OP_COND (app command)
 const CMD58: u8 = 58; // READ_OCR
@@ -198,6 +199,31 @@ enum BlockReadState {
     WaitingR1 = 3,
     ReadingDataBlock = 4,
 }
+
+/// Block write state machine (write_block_poll): CMD24, the block, and the
+/// card's busy period, after which the block is on the card.
+///
+// Idle → Selecting → SendingCmd → WaitingR1 → SendingToken → SendingData →
+// SendingCrc → WaitingResponse → WaitingBusy → SendingDummy → Idle
+#[repr(u8)]
+#[derive(Clone, Copy, PartialEq)]
+enum BlockWriteState {
+    Idle = 0,
+    Selecting = 1,
+    SendingCmd = 2,
+    WaitingR1 = 3,
+    SendingToken = 4,
+    SendingData = 5,
+    SendingCrc = 6,
+    WaitingResponse = 7,
+    WaitingBusy = 8,
+    SendingDummy = 9,
+}
+
+/// The longest a card may hold the line busy after a block: the write
+/// timeout of the SD Physical Layer Simplified Specification (§4.6.2.2),
+/// whose largest value, any card's, is 500 ms.
+const WRITE_BUSY_MS: u64 = 500;
 
 /// The one `storage.block` request the source holds.
 ///
@@ -378,6 +404,15 @@ struct SdState {
     /// The caller's buffer, lent until the completion is reaped.
     req_buf: *mut u8,
 
+    // Block write state
+    wb_state: BlockWriteState,
+    _pad8: u8,
+    wb_attempts: u16,
+    /// What the write sends besides the block: the gap byte and start token,
+    /// then the (unchecked, SPI mode) CRC.
+    wb_token: [u8; 2],
+    wb_crc: [u8; 2],
+
     // Buffers (at end for alignment)
     block_buf: [u8; BLOCK_SIZE],
     csd_buf: [u8; BLOCK_SIZE],
@@ -423,6 +458,11 @@ impl SdState {
         self.req_tag_hi = 0;
         self.req_addr = 0;
         self.req_buf = ptr::null_mut();
+        self.wb_state = BlockWriteState::Idle;
+        self._pad8 = 0;
+        self.wb_attempts = 0;
+        self.wb_token = [0xFF, TOKEN_DATA];
+        self.wb_crc = [0xFF, 0xFF];
         self.init_state = SdInitPhase::Idle;
         self.init_retry = 0;
         self.init_preclk_count = 0;
@@ -1165,13 +1205,220 @@ unsafe fn read_block_poll(s: &mut SdState) -> i32 {
 }
 
 // ============================================================================
+// Block Write Layer (write_block)
+// ============================================================================
+
+/// Start a write of `req_data` to card address `addr`.
+unsafe fn write_addr_start(s: &mut SdState, addr: u32) {
+    s.cmd_buf = [
+        0x40 | CMD24,
+        (addr >> 24) as u8,
+        (addr >> 16) as u8,
+        (addr >> 8) as u8,
+        addr as u8,
+        0x01,
+    ];
+    let ms = millis(s);
+    store_ms(&mut s.cmd_start_ms_lo, &mut s.cmd_start_ms_hi, ms);
+    s.wb_attempts = 0;
+    s.wb_state = BlockWriteState::Selecting;
+}
+
+/// End a write that failed after the card was selected.
+unsafe fn write_abort(s: &mut SdState, rc: i32) -> i32 {
+    deselect(s);
+    release(s);
+    s.wb_state = BlockWriteState::Idle;
+    rc
+}
+
+/// Poll the block write.
+/// Returns: 0 = pending, 1 = on the card, negative = failed.
+unsafe fn write_block_poll(s: &mut SdState) -> i32 {
+    loop {
+        match s.wb_state {
+            BlockWriteState::Idle => return -1,
+
+            BlockWriteState::Selecting => {
+                let start_ms = load_ms(s.cmd_start_ms_lo, s.cmd_start_ms_hi);
+                let claim = claim_begin_select(s, start_ms);
+                if claim > 0 {
+                    let cmd = s.cmd_buf.as_ptr();
+                    if !spi_transfer_start(s, cmd, ptr::null_mut(), 6) {
+                        return write_abort(s, -2);
+                    }
+                    s.wb_state = BlockWriteState::SendingCmd;
+                    continue;
+                }
+                if claim < 0 {
+                    s.wb_state = BlockWriteState::Idle;
+                    return -3;
+                }
+                return 0;
+            }
+
+            BlockWriteState::SendingCmd => {
+                let res = spi_transfer_poll(s);
+                if res < 0 {
+                    return write_abort(s, -4);
+                }
+                if res > 0 {
+                    s.wb_attempts = 0;
+                    s.wb_state = BlockWriteState::WaitingR1;
+                    continue;
+                }
+                return 0;
+            }
+
+            BlockWriteState::WaitingR1 => {
+                let res = poll_or_start_byte(s);
+                if res < 0 {
+                    return write_abort(s, -5);
+                }
+                if res >= 0x100 {
+                    let r1 = (res & 0xFF) as u8;
+                    if r1 & 0x80 == 0 {
+                        if r1 != 0 {
+                            return write_abort(s, -6);
+                        }
+                        // One byte of gap, then the start token.
+                        let tok = s.wb_token.as_ptr();
+                        if !spi_transfer_start(s, tok, ptr::null_mut(), 2) {
+                            return write_abort(s, -4);
+                        }
+                        s.wb_state = BlockWriteState::SendingToken;
+                        return 0;
+                    }
+                    if s.wb_attempts >= CMD_TIMEOUT as u16 {
+                        return write_abort(s, -7);
+                    }
+                    s.wb_attempts += 1;
+                }
+                return 0;
+            }
+
+            BlockWriteState::SendingToken => {
+                let res = spi_transfer_poll(s);
+                if res < 0 {
+                    return write_abort(s, -4);
+                }
+                if res > 0 {
+                    let data = s.req_data.as_ptr();
+                    if !spi_transfer_start(s, data, ptr::null_mut(), BLOCK_SIZE) {
+                        return write_abort(s, -4);
+                    }
+                    s.wb_state = BlockWriteState::SendingData;
+                }
+                return 0;
+            }
+
+            BlockWriteState::SendingData => {
+                let res = spi_transfer_poll(s);
+                if res < 0 {
+                    return write_abort(s, -4);
+                }
+                if res > 0 {
+                    let crc = s.wb_crc.as_ptr();
+                    if !spi_transfer_start(s, crc, ptr::null_mut(), 2) {
+                        return write_abort(s, -4);
+                    }
+                    s.wb_state = BlockWriteState::SendingCrc;
+                }
+                return 0;
+            }
+
+            BlockWriteState::SendingCrc => {
+                let res = spi_transfer_poll(s);
+                if res < 0 {
+                    return write_abort(s, -4);
+                }
+                if res > 0 {
+                    s.wb_attempts = 0;
+                    s.wb_state = BlockWriteState::WaitingResponse;
+                    continue;
+                }
+                return 0;
+            }
+
+            BlockWriteState::WaitingResponse => {
+                let res = poll_or_start_byte(s);
+                if res < 0 {
+                    return write_abort(s, -5);
+                }
+                if res >= 0x100 {
+                    let b = (res & 0xFF) as u8;
+                    // A data response token is `xxx0sss1`; `010` accepted.
+                    if b & 0x11 == 0x01 {
+                        if b & 0x1F != 0x05 {
+                            return write_abort(s, -8);
+                        }
+                        let ms = millis(s);
+                        store_ms(&mut s.cmd_start_ms_lo, &mut s.cmd_start_ms_hi, ms);
+                        s.wb_state = BlockWriteState::WaitingBusy;
+                        continue;
+                    }
+                    if s.wb_attempts >= CMD_TIMEOUT as u16 {
+                        return write_abort(s, -7);
+                    }
+                    s.wb_attempts += 1;
+                }
+                return 0;
+            }
+
+            BlockWriteState::WaitingBusy => {
+                let res = poll_or_start_byte(s);
+                if res < 0 {
+                    return write_abort(s, -5);
+                }
+                if res >= 0x100 {
+                    if res & 0xFF != 0 {
+                        // The card let go of the line: the block is written.
+                        deselect(s);
+                        if !spi_transfer_start(s, ptr::null(), ptr::null_mut(), 1) {
+                            return write_abort(s, -4);
+                        }
+                        s.wb_state = BlockWriteState::SendingDummy;
+                        return 0;
+                    }
+                    let start_ms = load_ms(s.cmd_start_ms_lo, s.cmd_start_ms_hi);
+                    if millis(s).wrapping_sub(start_ms) >= WRITE_BUSY_MS {
+                        return write_abort(s, -9);
+                    }
+                }
+                return 0;
+            }
+
+            BlockWriteState::SendingDummy => {
+                let res = spi_transfer_poll(s);
+                if res < 0 {
+                    s.wb_state = BlockWriteState::Idle;
+                    return -4;
+                }
+                if res > 0 {
+                    release(s);
+                    s.wb_state = BlockWriteState::Idle;
+                    return 1;
+                }
+                return 0;
+            }
+
+            _ => return -1,
+        }
+    }
+}
+
+// ============================================================================
 // storage.block v1
 // ============================================================================
 //
-// A read-only source: `CAPS`, and one-block `READ` requests through
-// `SUBMIT` / `REAP` (queue depth 1), run on the same read machine the stream
-// uses, between the stream's own blocks. The stream on `blocks` itself is
-// unchanged.
+// A source of one-block requests: `CAPS`, and `READ` / `WRITE` through
+// `SUBMIT` / `REAP` (queue depth 1), run on the read machine the stream uses
+// or the write machine, between the stream's own blocks. A write is copied
+// at `SUBMIT` (`F_WRITE_COPIES`) and completes once the card has released
+// its busy line: in SPI mode the card keeps no write cache (its cache is off
+// unless enabled through CMD48/49, which this driver never does), so every
+// completed write is `LocalDurable` and `FLUSH` waits for nothing. The
+// stream on `blocks` itself is unchanged.
 //
 // There is no `EXEC`. It must finish inside the call, and a card transfer
 // takes as long as the card takes; a call that waits for it holds the whole
@@ -1237,7 +1484,10 @@ fn sd_caps(s: &SdState) -> Option<Caps> {
         max_blocks: 1,
         atomic_blocks: 1,
         queue_depth: 1,
-        flags: blk::caps::F_ASYNC,
+        flags: blk::caps::F_ASYNC
+            | blk::caps::F_WRITE
+            | blk::caps::F_FUA
+            | blk::caps::F_WRITE_COPIES,
         device_id: csd_device_id(&s.csd_buf),
     })
 }
@@ -1245,6 +1495,11 @@ fn sd_caps(s: &SdState) -> Option<Caps> {
 /// Finish the request that held the read machine: `res` is the machine's
 /// result, positive for a block read whole.
 unsafe fn request_finish(s: &mut SdState, res: i32) {
+    if s.req_op == blk::op::WRITE {
+        s.req_status = if res > 0 { 0 } else { E_IO };
+        s.req_state = ReqState::Done;
+        return;
+    }
     if res > 0 {
         let dst = s.req_buf;
         let mut i = 0usize;
@@ -1269,14 +1524,22 @@ unsafe fn request_step(s: &mut SdState) -> bool {
         if s.rb_state != BlockReadState::Idle {
             return false;
         }
-        let buf = s.req_data.as_mut_ptr();
-        read_addr_start(s, s.req_addr, buf);
+        if s.req_op == blk::op::WRITE {
+            write_addr_start(s, s.req_addr);
+        } else {
+            let buf = s.req_data.as_mut_ptr();
+            read_addr_start(s, s.req_addr, buf);
+        }
         s.req_state = ReqState::Running;
     }
     if s.req_state != ReqState::Running {
         return false;
     }
-    let res = read_block_poll(s);
+    let res = if s.req_op == blk::op::WRITE {
+        write_block_poll(s)
+    } else {
+        read_block_poll(s)
+    };
     if res != 0 {
         request_finish(s, res);
     }
@@ -1300,6 +1563,22 @@ unsafe fn request_submit(s: &mut SdState, arg: *mut u8) -> i32 {
     }
     let mut addr = 0u32;
     let mut buf = ptr::null_mut();
+    if r.op == blk::op::WRITE {
+        let Some(a) = card_address(r.lba, s.cdv) else {
+            return E_INVAL;
+        };
+        let Ok(p) = usize::try_from(r.buf_ptr) else {
+            return E_INVAL;
+        };
+        // Copied now: the caller's buffer is free when this returns.
+        let src = p as *const u8;
+        let mut i = 0usize;
+        while i < BLOCK_SIZE {
+            s.req_data[i] = *src.add(i);
+            i += 1;
+        }
+        addr = a;
+    }
     if r.op == blk::op::READ {
         // A block the card's command argument cannot name is out of range
         // however large the card claims to be.
@@ -1318,9 +1597,9 @@ unsafe fn request_submit(s: &mut SdState, arg: *mut u8) -> i32 {
     s.req_addr = addr;
     s.req_buf = buf;
     s.req_status = 0;
-    // Only a read touches the card. Nothing is ever written, so a flush has
-    // nothing to wait for.
-    s.req_state = if r.op == blk::op::READ {
+    // A read or a write touches the card. A write completes on the card,
+    // so a flush has nothing to wait for.
+    s.req_state = if r.op == blk::op::READ || r.op == blk::op::WRITE {
         ReqState::Queued
     } else {
         ReqState::Done
@@ -1336,7 +1615,8 @@ unsafe fn request_reap(s: &mut SdState, arg: *mut u8) -> i32 {
     }
     let tag = u64::from(s.req_tag_lo) | (u64::from(s.req_tag_hi) << 32);
     let mut cpl = Cpl::bare(tag, s.req_status);
-    if s.req_op != blk::op::READ {
+    // A failed write carries no fence: nothing it names is durable.
+    if s.req_op != blk::op::READ && s.req_status == 0 {
         if let Some(c) = sd_caps(s) {
             let f = Fence::LocalDurable {
                 device_id: c.device_id,

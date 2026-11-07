@@ -735,6 +735,7 @@ fn config_inspection_json(config_path: &Path, project_root: &Path) -> serde_json
                 "slot_b": g.slot_b,
                 "slot_size": g.slot_size,
                 "param_store": g.param_store,
+                "data_store": g.data_store,
             })),
         })),
         Err(_) => None,
@@ -1211,12 +1212,13 @@ fn inspect_config(config_path: &Path, project_root: &Path) -> Result<()> {
                 println!("  via board → silicon:  {}", desc.id);
                 if let Some(g) = desc.graph_flash() {
                     println!(
-                        "  flash:                {} KiB; firmware below {:#x}, slots A {:#x} and B {:#x} of {} KiB, parameter store {:#x}",
+                        "  flash:                {} KiB; firmware below {:#x}, slots A {:#x} and B {:#x} of {} KiB, data store {:#x}, parameter store {:#x}",
                         g.flash_size / 1024,
                         g.slot_a,
                         g.slot_a,
                         g.slot_b,
                         g.slot_size / 1024,
+                        g.data_store,
                         g.param_store
                     );
                 }

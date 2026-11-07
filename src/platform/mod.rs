@@ -128,6 +128,11 @@ pub mod rp_image_def;
 #[cfg(feature = "rp")]
 #[path = "rp/io.rs"]
 pub mod rp_io;
+/// RP2350 OTP seal key: the vault's sealing key, held in an OTP page the
+/// bootloader cannot read. Declared unconditionally so the key decision and
+/// the row layout are host-testable; the OTP access itself is `rp`-gated.
+#[path = "rp/otp_seal.rs"]
+pub mod rp_otp_seal;
 /// RP PIO registers. Declared unconditionally so the instance and state
 /// machine addressing is host-testable; the register access is `rp`-gated.
 #[path = "rp/pio_regs.rs"]

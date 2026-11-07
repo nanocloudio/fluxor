@@ -190,8 +190,22 @@ impl TargetFacts {
                 step_budget_us: STEP_BUDGET_DEFAULT_TICK_US,
                 nic_tx_drain: false,
             },
-            // No RTC, no room for the ML-DSA scratch, no sealing.
-            "rp2040" | "rp2350" => Self {
+            // No RTC, but the kernel vouches for wall time once `sntp`
+            // anchors it, as on bcm2712; no room for the ML-DSA scratch; an
+            // OTP seal key when provisioned (`rp_otp_seal`, unproven on
+            // hardware).
+            "rp2350" => Self {
+                time_wall_source: Some("network_sync"),
+                trust_system: false,
+                vault_suites: SUITES_BASE,
+                vault_tier_ceiling: vault_tier::DEVICE_HW,
+                net: NET_EMBEDDED,
+                step_budget_us: STEP_BUDGET_DEFAULT_TICK_US,
+                nic_tx_drain: false,
+            },
+            // No RTC and no `sntp` build, no room for the ML-DSA scratch, no
+            // OTP and so no sealing.
+            "rp2040" => Self {
                 time_wall_source: None,
                 trust_system: false,
                 vault_suites: SUITES_BASE,

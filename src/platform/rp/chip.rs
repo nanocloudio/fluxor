@@ -17,6 +17,20 @@ include!(concat!(env!("OUT_DIR"), "/chip_generated.rs"));
 pub const GRAPH_FLASH: crate::abi::platform::rp::flash_layout::GraphFlash =
     crate::abi::platform::rp::flash_layout::graph_flash(FLASH_SIZE, KERNEL_FLASH_RESERVE);
 
+// The partition is aligned to, and the data store serves blocks of,
+// `flash_layout::FLASH_SECTOR`: the flash part this board names must erase
+// in exactly that unit and program in pages that divide it. A part with a
+// larger erase unit is a partition with larger regions, which is a change to
+// `flash_layout` rather than a board fact to wave through.
+const _: () = assert!(
+    FLASH_ERASE_SIZE == crate::abi::platform::rp::flash_layout::FLASH_SECTOR,
+    "board flash erase unit differs from flash_layout::FLASH_SECTOR"
+);
+const _: () = assert!(
+    FLASH_PROGRAM_SIZE != 0 && FLASH_ERASE_SIZE.is_multiple_of(FLASH_PROGRAM_SIZE),
+    "board flash program page does not divide its erase unit"
+);
+
 /// Default step deadline: 2 ms.
 pub const DEFAULT_STEP_DEADLINE_US: u32 = 2000;
 

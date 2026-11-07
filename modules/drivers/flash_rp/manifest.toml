@@ -1,6 +1,8 @@
 version = "1.0.0"
 hardware_targets = ["rp2350", "rp2040"]
 permissions = ["flash_raw", "backing_provider"]
+# `store` (out[2]) is a `storage.block` source over the flash's data store.
+provides = ["storage.block"]
 
 # BOOTSEL button driver — reads the QSPI CS pin via the flash
 # sideband, debounces, and emits the canonical `input::button` raw
@@ -27,6 +29,15 @@ content_type = "OctetStream"
 buffer_size = 2048
 # BLOB_CHUNK_SIZE — blobs are emitted in 512-byte chunks.
 max_record = 512
+
+# The data store: `storage.block` over the 16 KiB directly below the
+# parameter store (`flash_layout::DATA_STORE_SIZE`), in erase-sector blocks.
+# A UF2 reflash never reaches it. `vault_store` keeps the key vault there.
+[[ports]]
+name = "store"
+index = 2
+direction = "output"
+content_type = "OctetStream"
 
 # Module-scope observability — exempt.
 [observability]

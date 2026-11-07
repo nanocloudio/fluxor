@@ -2466,6 +2466,36 @@ pub fn check_connector_addressing(config: &Value) -> Result<()> {
     Ok(())
 }
 
+/// One keeper of the key vault's durable image per graph: the kernel answers
+/// the first instance holding `vault_store` and refuses every other, so a
+/// second is a graph whose keys go where its author did not mean. Its block
+/// source is held to exactly one by the `blocks` port's
+/// `requires_capability = "storage.block"`.
+pub fn validate_vault_store(config: &Value, manifests: &HashMap<String, Manifest>) -> Result<()> {
+    let Some(mods) = config.get("modules").and_then(|m| m.as_array()) else {
+        return Ok(());
+    };
+    let keepers: Vec<&str> = mods
+        .iter()
+        .filter_map(|m| {
+            let name = m.get("name").and_then(|v| v.as_str())?;
+            // The manifest map is keyed by instance name.
+            manifests
+                .get(name)
+                .filter(|mf| mf.permissions.bits & manifest::permission::VAULT_STORE != 0)
+                .map(|_| name)
+        })
+        .collect();
+    if keepers.len() > 1 {
+        return Err(Error::Config(format!(
+            "{} keep the key vault's records (`vault_store`); a graph has one. \
+             The kernel answers the first and refuses the rest.",
+            keepers.join(", ")
+        )));
+    }
+    Ok(())
+}
+
 /// Coordinator exclusivity for the node's network identities.
 ///
 /// A graph is a *workload node* when it holds a workload creator — a module

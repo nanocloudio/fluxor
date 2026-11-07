@@ -186,6 +186,9 @@ pub fn setup(runner_config: &RunnerConfig) -> bool {
     true
 }
 
+/// `fnv1a32("vault_store")`: the module that keeps the vault's records.
+const VAULT_STORE_HASH: u32 = crate::abi::wire::fnv1a32(b"vault_store");
+
 /// Common graph preparation: validate config, wire edges, insert fan modules,
 /// open channels, and compute execution order.
 ///
@@ -223,6 +226,18 @@ pub fn prepare_graph() -> Result<(ModuleList, usize), i32> {
         log::error!("[graph] no usable modules");
         return Err(-1);
     }
+
+    // A graph that keeps the vault's records through a `vault_store` module
+    // says so before any module runs: until that store loads, the vault
+    // answers `EAGAIN` rather than read the platform's store, or none, as
+    // its own and mint a key over one already kept.
+    let mut carries_store = false;
+    for i in 0..module_count {
+        if let Some(e) = &module_list[i] {
+            carries_store |= e.name_hash == VAULT_STORE_HASH;
+        }
+    }
+    crate::kernel::security::vault_store::expect(carries_store);
 
     log::info!("[graph] modules={declared_modules} edges={edge_count}");
 

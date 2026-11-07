@@ -15,6 +15,17 @@
 //! 3. **Param store provider** — Registers via FLASH_STORE_ENABLE. Other
 //!    modules persist params via PARAM_STORE/DELETE/CLEAR_ALL syscalls.
 //!
+//! 4. **Data store** — a `storage.block` source on out[2] (`store`) over the
+//!    flash's data region (`flash_layout::DATA_STORE_SIZE` bytes directly below
+//!    the parameter store, where a UF2 reflash never reaches): blocks of one
+//!    erase sector (`flash_layout::FLASH_SECTOR`), one request at a time. A
+//!    read is an XIP copy, answered at `SUBMIT`. A write erases its sector in
+//!    one step and programs it a few pages per step after; it completes
+//!    `LocalDurable`, since the flash keeps no volatile cache, so `FUA` and
+//!    `FLUSH` cost nothing. Its buffer is lent until reaped. `EXEC` is not
+//!    served: an erase takes as long as the flash takes. Where `vault_store`
+//!    keeps the key vault's image slots.
+//!
 //! **Params (from config):**
 //! - `debounce_ms`: debounce window in ms (default 50)
 //! - `presets`: inline blob data (type=blob, up to 8 blobs, 4KB total)
@@ -23,6 +34,7 @@
 //!   - out[0]: `input::button` raw transitions (OctetStream, 1 byte
 //!     per debounced edge; 0x01=pressed, 0x00=released)
 //!   - out[1]: Blob stream (IOCTL_NOTIFY indexed, 512B chunks, IOCTL_EOF)
+//!   - out[2]: `storage.block` over the data store
 
 #![no_std]
 #![allow(
@@ -52,6 +64,9 @@ use abi::SyscallTable;
 
 include!("../../sdk/runtime.rs");
 include!("../../sdk/runtime/params.rs");
+
+use abi::contracts::storage::block::{self as blk, Caps, Cpl, Req};
+use abi::fence::Fence;
 
 // ============================================================================
 // Constants — BOOTSEL
@@ -173,7 +188,28 @@ struct FlashState {
     blob_offsets: [u16; MAX_BLOBS],
     blob_lengths: [u16; MAX_BLOBS],
     blob_storage: [u8; MAX_BLOB_STORAGE],
+    // --- Data store (out[2]) ---
+    store_chan: i32,
+    /// The data store's first byte (offset from XIP); 0 until known.
+    data_offset: u32,
+    /// A write is in progress.
+    store_busy: u8,
+    /// A completion waits for `REAP`.
+    store_done: u8,
+    /// Next page of the write to program; `ERASE_FIRST` while its sector is
+    /// still to be erased.
+    store_page: u8,
+    _store_pad: u8,
+    store_req: Req,
+    store_cpl: Cpl,
 }
+
+/// `store_page` before the sector is erased.
+const ERASE_FIRST: u8 = 0xFF;
+/// Pages a step programs.
+const PAGES_PER_STEP: u8 = 4;
+/// The device the data store's `LocalDurable` fences name ("flashdat").
+const DATA_STORE_ID: u64 = 0x6661_6c73_6864_6174;
 
 // ============================================================================
 // Parameter Definitions
@@ -326,6 +362,20 @@ pub unsafe extern "C" fn module_new(
 
         // Blob serving state
         s.stream_chan = dev_channel_port(&*(syscalls as *const SyscallTable), 1, 1); // out[1]
+
+        // Data store (out[2]): known once the layout is read on first step.
+        s.store_chan = dev_channel_port(&*(syscalls as *const SyscallTable), 1, 2);
+        s.data_offset = 0;
+        s.store_busy = 0;
+        s.store_done = 0;
+        if s.store_chan >= 0 {
+            dev_channel_register_ioctl(
+                &*(syscalls as *const SyscallTable),
+                s.store_chan,
+                state as *mut c_void,
+                Some(flash_store_ioctl),
+            );
+        }
         s.blob_count = 0;
         s.current_blob = 0;
         s.stream_phase = StreamPhase::Idle;
@@ -425,13 +475,17 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 layout.as_mut_ptr(),
                 layout.len(),
             );
-            s.store_offset = abi::platform::rp::flash_layout::GraphFlash::decode(&layout)
-                .filter(|_| rc >= 0)
-                .map_or(0, |g| g.param_store);
+            let g =
+                abi::platform::rp::flash_layout::GraphFlash::decode(&layout).filter(|_| rc >= 0);
+            s.store_offset = g.map_or(0, |g| g.param_store);
+            s.data_offset = g.map_or(0, |g| g.data_store);
             if s.store_offset != 0 {
                 init_free_offset(s);
             }
         }
+
+        // ---- Data store: the write in progress, a few pages a step ----
+        store_pump(s);
 
         // ---- Signal ready (once) — gates downstream modules ----
         if s.signaled_ready == 0 {
@@ -1100,6 +1154,137 @@ unsafe fn raw_flash_program(sys: &SyscallTable, offset: u32, page: *const u8) ->
         i += 1;
     }
     (sys.provider_call)(-1, FLASH_RAW_PROGRAM, bp, 260)
+}
+
+// ============================================================================
+// Data store — storage.block over the flash's data region (out[2])
+// ============================================================================
+
+fn store_caps() -> Caps {
+    let sector = abi::platform::rp::flash_layout::FLASH_SECTOR;
+    Caps {
+        logical_block_size: sector,
+        block_count: u64::from(abi::platform::rp::flash_layout::DATA_STORE_SIZE / sector),
+        max_blocks: 1,
+        atomic_blocks: 1,
+        queue_depth: 1,
+        flags: blk::caps::F_WRITE | blk::caps::F_FUA | blk::caps::F_ASYNC,
+        device_id: DATA_STORE_ID,
+    }
+}
+
+/// `r` decided with `status`. Every write that completes is on the flash.
+fn store_completion(r: &Req, status: i32) -> Cpl {
+    let mut c = Cpl::bare(r.tag, status);
+    if status == 0 && r.op != blk::op::READ {
+        let f = Fence::LocalDurable {
+            device_id: DATA_STORE_ID,
+        };
+        if let Some(n) = f.encode(&mut c.fence) {
+            c.fence_len = n as u16;
+        }
+    }
+    c
+}
+
+unsafe fn store_finish(s: &mut FlashState, status: i32) {
+    s.store_cpl = store_completion(&s.store_req, status);
+    s.store_busy = 0;
+    s.store_done = 1;
+}
+
+/// Advance the write in progress: the erase, then a few pages.
+unsafe fn store_pump(s: &mut FlashState) {
+    if s.store_busy == 0 {
+        return;
+    }
+    let sys = &*s.syscalls;
+    let sector = abi::platform::rp::flash_layout::FLASH_SECTOR;
+    let at = s.data_offset + (s.store_req.lba as u32) * sector;
+    if s.store_page == ERASE_FIRST {
+        let rc = raw_flash_erase(sys, at);
+        if rc < 0 {
+            store_finish(s, rc);
+            return;
+        }
+        s.store_page = 0;
+        return;
+    }
+    let pages = (sector as usize / PAGE_SIZE) as u8;
+    let src = s.store_req.buf_ptr as usize as *const u8;
+    let mut n = 0u8;
+    while n < PAGES_PER_STEP && s.store_page < pages {
+        let off = s.store_page as usize * PAGE_SIZE;
+        let rc = raw_flash_program(sys, at + off as u32, src.add(off));
+        if rc < 0 {
+            store_finish(s, rc);
+            return;
+        }
+        s.store_page += 1;
+        n += 1;
+    }
+    if s.store_page >= pages {
+        store_finish(s, 0);
+    }
+}
+
+unsafe extern "C" fn flash_store_ioctl(state: *mut c_void, cmd: u32, arg: *mut u8) -> i32 {
+    if state.is_null() || arg.is_null() {
+        return E_INVAL;
+    }
+    let s = &mut *(state as *mut FlashState);
+    if s.data_offset == 0 {
+        // The partition is read on the first step.
+        return E_AGAIN;
+    }
+    let caps = store_caps();
+    match cmd {
+        blk::ioctl::CAPS => {
+            caps.encode(core::slice::from_raw_parts_mut(arg, blk::caps::LEN));
+            blk::caps::LEN as i32
+        }
+        blk::ioctl::SUBMIT => {
+            let Some(r) = Req::decode(core::slice::from_raw_parts(arg, blk::req::LEN)) else {
+                return E_INVAL;
+            };
+            if !caps.admits(&r) || r.flags & !blk::F_ALL != 0 {
+                return E_INVAL;
+            }
+            if s.store_busy != 0 || s.store_done != 0 {
+                return E_AGAIN;
+            }
+            s.store_req = r;
+            match r.op {
+                blk::op::READ => {
+                    let from = (XIP_BASE + s.data_offset) as usize
+                        + r.lba as usize * caps.logical_block_size as usize;
+                    core::ptr::copy_nonoverlapping(
+                        from as *const u8,
+                        r.buf_ptr as usize as *mut u8,
+                        r.buf_len as usize,
+                    );
+                    store_finish(s, 0);
+                }
+                blk::op::WRITE => {
+                    s.store_busy = 1;
+                    s.store_page = ERASE_FIRST;
+                }
+                // Nothing is cached: a flush has nothing to wait for.
+                _ => store_finish(s, 0),
+            }
+            0
+        }
+        blk::ioctl::REAP => {
+            if s.store_done == 0 {
+                return 0;
+            }
+            s.store_done = 0;
+            s.store_cpl
+                .encode(core::slice::from_raw_parts_mut(arg, blk::cpl::LEN));
+            1
+        }
+        _ => E_NOSYS,
+    }
 }
 
 /// Initialize free_offset by scanning XIP sector.

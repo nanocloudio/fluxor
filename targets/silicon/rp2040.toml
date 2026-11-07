@@ -172,11 +172,19 @@ flash_base = "0x10000000"
 # The flash a board fits, by default: the die has none, and a board says
 # what it has in `[hardware.flash] size`. 2 MB is the Pico family's.
 flash_size = "0x200000"
+# The flash part's erase unit and program page (W25Q-class SPI NOR, as every
+# Pico board fits): the partition aligns to the first. A board with another
+# part says so in `[hardware.flash]` (`erase_size`, `program_size`).
+flash_erase_size = "0x1000"
+flash_program_size = "0x100"
 # Flash the kernel keeps at the bottom, which the graph-slot partition
 # (`flash_layout::graph_flash`) leaves it before it splits the rest three
 # ways: two slots and the firmware region's own graph. The gate holds every
 # board's kernel image under it; raising it costs each board that much slot.
-kernel_flash_reserve = "0x80000"
+# 528 KiB since the key vault's store (`vault_store`, kept by a module over a
+# block source) put the kernel ~11 KiB past 512: each slot gives up a third of
+# the 16 KiB.
+kernel_flash_reserve = "0x84000"
 ram_base = "0x20000000"
 # The striped 256 KiB the linker's RAM region covers, where the kernel's
 # statics and its stack live. SRAM4 and SRAM5 sit outside it.

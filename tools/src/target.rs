@@ -1122,10 +1122,10 @@ mod tests {
     fn rp_boards_partition_their_own_flash() {
         let root = repo_root();
         for (target, flash, slot_a, slot_size) in [
-            ("pico2w", 0x40_0000u32, 0x1C_1000u32, 0x11_F000u32),
-            ("rp2350", 0x40_0000, 0x1C_1000, 0x11_F000),
-            ("picow", 0x20_0000, 0x10_1000, 0x7_F000),
-            ("pico", 0x20_0000, 0x10_1000, 0x7_F000),
+            ("pico2w", 0x40_0000u32, 0x1B_F000u32, 0x11_E000u32),
+            ("rp2350", 0x40_0000, 0x1B_F000, 0x11_E000),
+            ("picow", 0x20_0000, 0x10_1000, 0x7_D000),
+            ("pico", 0x20_0000, 0x10_1000, 0x7_D000),
         ] {
             let g = super::load_target(target, &root)
                 .expect("target loads")
@@ -1135,6 +1135,12 @@ mod tests {
             assert_eq!(g.slot_a, slot_a, "`{target}` slot A");
             assert_eq!(g.slot_size, slot_size, "`{target}` slot size");
             assert_eq!(g.param_store + 4096, flash, "`{target}` parameter store");
+            assert_eq!(
+                g.data_store + 16 * 1024,
+                g.param_store,
+                "`{target}` data store"
+            );
+            assert_eq!(g.slot_b + g.slot_size, g.data_store, "`{target}` slot B");
         }
         for target in ["linux", "pi5", "wasm"] {
             let desc = super::load_target(target, &root).expect("target loads");

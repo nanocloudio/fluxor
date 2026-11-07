@@ -49,8 +49,6 @@ mod logger;
 mod rp1;
 #[path = "bcm2712/uart.rs"]
 mod uart;
-#[path = "bcm2712/vault_store.rs"]
-mod vault_store;
 
 // Bring the UART, GIC and exception names into the binary's namespace so
 // the callsites (`uart_puts(b"…")`, `irq_bind(…)`, `IRQ_BINDING_COUNT`,
@@ -3432,26 +3430,15 @@ fn bcm_unseal(aad: &[u8], input: &[u8], out: &mut [u8]) -> Option<usize> {
     }
 }
 
-/// `HalOps::seal_blob_store`: this node has a durable store for sealed blobs
-/// when its graph holds a backing provider (the `nvme` module). That is
-/// known from the graph before the medium is up, so a key is never
-/// generated over one the store already holds just because it was asked
-/// for early.
-fn bcm_seal_blob_store() -> bool {
-    fluxor::kernel::exec::scheduler::graph_holds_permission(
-        fluxor::kernel::module::syscalls::permission::BACKING_PROVIDER,
-    )
-}
-
 static BCM2712_HAL_OPS: HalOps = HalOps {
-    // The vault's durable store: the NVMe's reserved backing pages, A/B
-    // slots (`vault_store`). Readable once the backing provider is up; until
-    // then the vault answers a labelled open EAGAIN.
-    seal_blob_write: vault_store::write,
-    seal_blob_store: bcm_seal_blob_store,
-    seal_blob_delete: vault_store::delete,
-    seal_blob_read: vault_store::read,
-    seal_blob_ready: vault_store::ready,
+    // No store of its own: the vault's records live wherever the graph's
+    // `vault_store` module keeps them (`kernel::security::vault_store`), and
+    // a graph without one persists no key.
+    seal_blob_write: |_, _| false,
+    seal_blob_store: || false,
+    seal_blob_delete: |_| true,
+    seal_blob_read: |_, _| None,
+    seal_blob_ready: || true,
     disable_interrupts: bcm_disable_interrupts,
     restore_interrupts: bcm_restore_interrupts,
     wake_scheduler: bcm_wake_scheduler,

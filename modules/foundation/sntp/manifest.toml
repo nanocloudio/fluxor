@@ -1,5 +1,5 @@
 version = "0.1.0"
-hardware_targets = ["bcm2712", "uefi"]
+hardware_targets = ["bcm2712", "uefi", "rp2350"]
 permissions = ["platform_raw"]
 
 # SNTP client (RFC 4330) that anchors the platform's wall clock on a board

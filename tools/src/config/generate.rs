@@ -632,6 +632,8 @@ fn generate_config_impl(
     // One writer of the network stack's `addr_ctl` on a node that creates
     // workloads: the kernel.
     validate_net_identity_writers(config, &module_names, &manifests)?;
+    // One keeper of the key vault's durable image.
+    validate_vault_store(config, &manifests)?;
     // A module provider and the modules it serves share a domain (provider
     // code runs on the caller's core); one live-added workloads may reach
     // sits in the primary domain.

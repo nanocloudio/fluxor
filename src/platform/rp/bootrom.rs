@@ -57,6 +57,8 @@ pub mod code {
     pub const REBOOT: u32 = table_code(b'R', b'B');
     /// `get_sys_info` (RP2350): chip, boot and flash information.
     pub const GET_SYS_INFO: u32 = table_code(b'G', b'S');
+    /// `otp_access` (RP2350): read or program OTP rows.
+    pub const OTP_ACCESS: u32 = table_code(b'O', b'A');
 }
 
 /// Well-known addresses in the bootrom's header.
@@ -263,6 +265,18 @@ mod rp {
     pub fn program_fn() -> Option<ProgramFn> {
         // SAFETY: as `FlashRom::resolve`.
         unsafe { lookup(super::code::FLASH_RANGE_PROGRAM).map(|p| core::mem::transmute(p)) }
+    }
+
+    /// `otp_access(buf, buf_len, cmd)` (RP2350): `cmd` is the row in bits
+    /// 0..16, write in bit 16, ECC in bit 17. Returns 0 or a bootrom error.
+    #[cfg(not(feature = "chip-rp2040"))]
+    pub type OtpAccessFn = unsafe extern "C" fn(*mut u8, u32, u32) -> i32;
+
+    /// Resolve `otp_access`.
+    #[cfg(not(feature = "chip-rp2040"))]
+    pub fn otp_access_fn() -> Option<OtpAccessFn> {
+        // SAFETY: as `FlashRom::resolve`.
+        unsafe { lookup(super::code::OTP_ACCESS).map(|p| core::mem::transmute(p)) }
     }
 }
 

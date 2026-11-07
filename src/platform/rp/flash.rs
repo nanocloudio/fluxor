@@ -425,6 +425,12 @@ pub mod store {
             return true;
         }
 
+        // Data store — the sectors below it (`flash_rp`'s `store` output,
+        // where a `vault_store` keeps the key vault's image slots).
+        if offset >= LAYOUT.data_store && end <= LAYOUT.data_store + flash_layout::DATA_STORE_SIZE {
+            return true;
+        }
+
         // Graph slots A and B — OTA-writable bundles, as this board's flash
         // is partitioned. A board with no room for slots has none.
         if LAYOUT.slot_size == 0 {

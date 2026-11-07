@@ -57,6 +57,10 @@ struct MemoryToml {
     /// Flash the kernel keeps for itself at the bottom, which the graph-slot
     /// partition (`flash_layout::graph_flash`) leaves it.
     kernel_flash_reserve: Option<String>,
+    /// The flash's erase unit and program page: the partition aligns every
+    /// region to the first, and `flash_rp`'s data store serves blocks of it.
+    flash_erase_size: Option<String>,
+    flash_program_size: Option<String>,
 }
 
 // Board TOML — only the [platform.pcie] topology this script generates.
@@ -78,6 +82,9 @@ struct BoardHardware {
 #[derive(Deserialize)]
 struct BoardFlash {
     size: String,
+    /// The board's flash part, where it differs from the silicon's default.
+    erase_size: Option<String>,
+    program_size: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1492,6 +1499,21 @@ fn emit_rp(out: &Path, family: Rp) {
             if let Some(r) = &m.kernel_flash_reserve {
                 emit_hex_const(&mut generated, "KERNEL_FLASH_RESERVE", r);
             }
+            // The flash part's geometry: the board's when it names one, else
+            // the silicon's. Not guessed: the partition and the data store
+            // are cut to it.
+            let erase = board_flash
+                .as_ref()
+                .and_then(|f| f.erase_size.clone())
+                .or_else(|| m.flash_erase_size.clone())
+                .expect("[memory] flash_erase_size: the flash part's erase unit");
+            let program = board_flash
+                .as_ref()
+                .and_then(|f| f.program_size.clone())
+                .or_else(|| m.flash_program_size.clone())
+                .expect("[memory] flash_program_size: the flash part's program page");
+            emit_hex_const(&mut generated, "FLASH_ERASE_SIZE", &erase);
+            emit_hex_const(&mut generated, "FLASH_PROGRAM_SIZE", &program);
         }
     }
     File::create(out.join("chip_generated.rs"))

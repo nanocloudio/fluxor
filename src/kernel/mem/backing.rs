@@ -87,10 +87,11 @@ pub mod backing_store {
     /// abstract page index in its own addressing (LBA, sector, …).
     static mut EXTERNAL_ARENA_NEXT_PAGE: u32 = RESERVED_EXTERNAL_PAGES;
 
-    /// Pages at the start of the External space no arena is carved from:
-    /// the platform's sealed-blob store (the key vault's durable records)
-    /// lives there, at a place that does not move with the order arenas
-    /// register in on each boot. Two 16 KiB slots.
+    /// Pages at the start of the External space no arena is carved from: a
+    /// place that does not move with the order arenas register in on each
+    /// boot, which a graph's `vault_store` names to keep the key vault's two
+    /// 16 KiB image slots on the same device (on a Pi 5's NVMe, sectors
+    /// 2097152..2097216).
     pub const RESERVED_EXTERNAL_PAGES: u32 = 8;
 
     // ============================================================================

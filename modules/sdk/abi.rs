@@ -311,6 +311,9 @@ pub mod internal {
     pub mod flash {
         include!("internal/flash.rs");
     }
+    pub mod vault_store {
+        include!("internal/vault_store.rs");
+    }
 }
 
 pub mod platform {

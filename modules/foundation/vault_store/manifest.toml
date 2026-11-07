@@ -1,0 +1,21 @@
+version = "1.0.0"
+hardware_targets = ["rp2350", "rp2040", "bcm2712", "linux"]
+
+# The key vault's durable store: carries the vault's record image (kept in
+# kernel RAM) to and from two A/B slots on the block source wired to
+# `blocks`. One per graph (the composer refuses a second). See README.md and
+# abi::internal::vault_store.
+#
+# `vault_store`: the module holds every persisted record the vault makes,
+# sealed or (seal: none) not, and decides what reaches the medium.
+permissions = ["vault_store"]
+
+[[ports]]
+name = "blocks"
+direction = "input"
+content_type = "OctetStream"
+required = true
+requires_capability = "storage.block"
+
+[observability]
+exempt = "its '[vault_store]' load / write-failure lines and the kernel's '[vault] store' lines are the observable"

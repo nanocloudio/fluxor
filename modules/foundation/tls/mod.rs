@@ -308,6 +308,10 @@ const CLOCK_POLICY_REQUIRE: u8 = 0;
 
 /// `mode` values.
 const MODE_CLIENT: u8 = 0;
+
+/// `verify_peer` values (server mode): 0 requests no client certificate, 1
+/// requires one, 2 requests one and admits a client that presents none.
+const VERIFY_PEER_OPTIONAL: u8 = 2;
 /// The longest identity key file: a PKCS#1 RSAPrivateKey of 4096 bits with
 /// its CRT fields is about 2.4 KB; a PKCS#8 P-256 key is under 200 bytes.
 const MAX_KEY_LEN: usize = 2400;
@@ -721,6 +725,9 @@ struct TlsSession {
     /// verified + svid_len) + 32 B SVID = PEER_IDENTITY_MAX_TOTAL.
     pending_peer_identity: [u8; PEER_IDENTITY_MAX_TOTAL],
     pending_peer_identity_len: u8,
+    /// The client presented no certificate, which `verify_peer: 2` admits:
+    /// the session carries no peer identity and reports none.
+    anonymous_peer: bool,
 
     /// Observability: monotonic-micros start of this session's `tls.handshake`
     /// span, latched when the handshake begins and the telemetry port is wired
@@ -803,6 +810,7 @@ impl TlsSession {
             pending_ccs_client: false,
             pending_peer_identity: [0; PEER_IDENTITY_MAX_TOTAL],
             pending_peer_identity_len: 0,
+            anonymous_peer: false,
             span_start_us: 0,
             hs_idle_steps: 0,
             trace_ctx_trace: [0; 16],
@@ -853,6 +861,7 @@ impl TlsSession {
         self.pending_ccs = false;
         self.pending_ccs_client = false;
         self.pending_peer_identity_len = 0;
+        self.anonymous_peer = false;
         self.span_start_us = 0;
         self.trace_ctx_trace = [0; 16];
         self.trace_ctx_parent = [0; 8];
@@ -1515,6 +1524,15 @@ define_params! {
     1, mode, u8, 0
         => |s, d, len| { s.mode = p_u8(d, len, 0, 0); };
 
+    // Server mode: whether a client certificate is asked for. 0 asks for
+    // none; 1 sends CertificateRequest and refuses a client that presents no
+    // certificate, or one that does not verify; 2 sends CertificateRequest
+    // and admits a client that answers with an empty Certificate — no
+    // CertificateVerify is due then, and the session reports no peer
+    // identity, so bearer-token clients work beside certificate-holding
+    // ones. A certificate that IS presented is verified exactly as under 1.
+    // TLS over TCP only: the DTLS server asks no client for a certificate,
+    // so `2` there is refused at construction.
     2, verify_peer, u8, 1
         => |s, d, len| { s.verify_peer = p_u8(d, len, 0, 1); };
 
@@ -1940,6 +1958,13 @@ pub unsafe extern "C" fn module_new(
                 return -1;
             }
         }
+    }
+    if s.verify_peer > VERIFY_PEER_OPTIONAL
+        || (s.verify_peer == VERIFY_PEER_OPTIONAL && s.transport == TRANSPORT_UDP)
+    {
+        let msg = b"[tls] refusing to construct: verify_peer is 0, 1 or 2, and 2 (an optional client certificate) is TLS over TCP only: the DTLS server requests no client certificate";
+        dev_log(sys, 1, msg.as_ptr(), msg.len());
+        return -1;
     }
     if !peer_auth_admissible(s) {
         let msg = b"[tls] refusing to construct: no peer-authentication profile (set peer_auth + trust; verify_uri for ca_uri; a ca_dns client is named by each dial's authority, or by verify_hostname, which must be a name)";
@@ -5809,6 +5834,18 @@ unsafe fn pump_recv_client_cert(s: &mut TlsState, idx: usize) -> bool {
             if let Some(ref mut t) = s.sessions[idx].driver.transcript {
                 t.update(&data[..len]);
             }
+            // `verify_peer: 2`: a client with no certificate sends an empty
+            // Certificate (§4.4.2.4) and, having nothing to prove, no
+            // CertificateVerify; it goes straight to its Finished. The
+            // session is admitted with no peer identity, so a consumer
+            // authenticates it some other way (a bearer token) or not at
+            // all. Under `verify_peer: 1` the empty message is refused below
+            // as any certificate that does not verify.
+            if s.verify_peer == VERIFY_PEER_OPTIONAL && certificate_msg_is_empty(&data[4..len]) {
+                s.sessions[idx].anonymous_peer = true;
+                s.sessions[idx].driver.hs_state = HandshakeState::RecvClientFinished;
+                return true;
+            }
             if !session_verify_peer_cert(s, idx, &data[4..len]) {
                 s.sessions[idx].state = SessionState::Error;
                 s.last_err_site = 30;
@@ -5926,8 +5963,29 @@ unsafe fn pump_send_certificate(s: &mut TlsState, idx: usize) -> bool {
     } else {
         0
     };
+    // A client asked for a certificate it does not have answers with an
+    // empty Certificate and no CertificateVerify (RFC 8446 §4.4.2.4): the
+    // server decides whether that is enough (`verify_peer: 2`) or not.
+    if !s.sessions[idx].driver.is_server && s.cert_len == 0 && !s.label_id.configured() {
+        return pump_send_empty_certificate(&mut s.sessions[idx].driver);
+    }
     let cert = core::slice::from_raw_parts(s.cert.as_ptr(), cert_len);
     pump_send_certificate_core(&mut s.sessions[idx].driver, cert)
+}
+
+/// The client's empty Certificate: an empty request context (the handshake's
+/// CertificateRequest carries none) and an empty list; then the client's
+/// Finished.
+unsafe fn pump_send_empty_certificate(driver: &mut HandshakeDriver) -> bool {
+    let msg = [HT_CERTIFICATE, 0, 0, 4, 0, 0, 0, 0];
+    if let Some(ref mut t) = driver.transcript {
+        t.update(&msg);
+    }
+    if !driver.write_handshake_message(&msg) {
+        return false;
+    }
+    driver.hs_state = HandshakeState::SendClientFinished;
+    true
 }
 
 unsafe fn pump_send_certificate_verify(s: &mut TlsState, idx: usize) -> bool {
@@ -6838,7 +6896,7 @@ unsafe fn peer_id_facts(s: &TlsState, idx: usize) -> PeerIdFacts {
 /// at-least-once delivery: downstream consumers may safely receive
 /// the same envelope twice (idempotent identity binding).
 unsafe fn emit_peer_identity(s: &mut TlsState, idx: usize) {
-    if s.peer_identity < 0 {
+    if s.peer_identity < 0 || s.sessions[idx].anonymous_peer {
         return;
     }
     let f = peer_id_facts(s, idx);

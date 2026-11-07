@@ -2605,6 +2605,29 @@ mod continuity_tests {
     }
 
     #[test]
+    fn a_graph_keeps_the_vaults_records_through_one_vault_store() {
+        use crate::manifest::permission;
+        let keeper = Manifest {
+            permissions: crate::manifest::ManifestPermissions {
+                bits: permission::VAULT_STORE,
+            },
+            ..Manifest::default()
+        };
+        let mut m = HashMap::new();
+        m.insert("vault".to_string(), keeper.clone());
+        m.insert("sd".to_string(), Manifest::default());
+        let one = json!({"modules": [{"name": "vault", "type": "vault_store"}, {"name": "sd"}]});
+        validate_vault_store(&one, &m).expect("one keeper");
+        m.insert("vault2".to_string(), keeper);
+        let two = json!({"modules": [
+            {"name": "vault", "type": "vault_store"},
+            {"name": "vault2", "type": "vault_store"},
+        ]});
+        let e = validate_vault_store(&two, &m).unwrap_err();
+        assert!(e.to_string().contains("vault, vault2"), "{e}");
+    }
+
+    #[test]
     fn single_provider_allows_distinct_and_absent_providers() {
         // A graph with no `provides` anywhere is unaffected.
         let mut m = HashMap::new();

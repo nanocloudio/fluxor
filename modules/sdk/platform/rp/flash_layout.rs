@@ -88,6 +88,18 @@ pub const GRAPH_SLOT_SIGNATURE_LEN: usize = 72;
 // (boot scan + merge) and `modules/drivers/flash_rp/mod.rs` (writer).
 
 pub const PARAM_STORE_SIZE: usize = 4096;
+
+// ── Data store ───────────────────────────────────────────────────────
+//
+// The sectors directly below the parameter store, served by `flash_rp` as a
+// `storage.block` source of erase-sector blocks (its `store` output): where a
+// `vault_store` keeps the key vault's two image slots (8 KiB each on an RP2350,
+// 4 KiB on an RP2040). A UF2 writes only
+// the addresses it carries, and no image reaches past slot B, so reflashing
+// the firmware leaves this region and the parameter store as they are.
+
+/// Bytes of the data store: room for two 8 KiB vault image slots.
+pub const DATA_STORE_SIZE: u32 = 16 * 1024;
 pub const PARAM_STORE_MAGIC: u32 = 0x4650_5846; // "FXPS"
 pub const PARAM_STORE_VERSION: u8 = 1;
 
@@ -109,23 +121,29 @@ pub struct GraphFlash {
     /// no OTA.
     pub slot_size: u32,
     pub param_store: u32,
+    /// The data store's first byte; [`DATA_STORE_SIZE`] bytes, ending where
+    /// the parameter store starts.
+    pub data_store: u32,
 }
 
 /// Bytes [`GraphFlash::encode`] writes and `FLASH_LAYOUT` answers:
-/// `[flash_size][slot_a][slot_b][slot_size][param_store]`, each a u32 LE.
-pub const GRAPH_FLASH_LEN: usize = 20;
+/// `[flash_size][slot_a][slot_b][slot_size][param_store][data_store]`, each a
+/// u32 LE.
+pub const GRAPH_FLASH_LEN: usize = 24;
 
 /// The partition of a board with `flash_size` bytes of flash, of which the
 /// kernel reserves `kernel_reserve` at the bottom: the parameter store in the
-/// last sector, and two equal slots below it, each a third of what is left,
-/// sector-aligned. A flash too small for that gets slots of size 0.
+/// last sector, the data store below it, and two equal slots below that, each
+/// a third of what is left, sector-aligned. A flash too small for that gets
+/// slots of size 0.
 pub const fn graph_flash(flash_size: u32, kernel_reserve: u32) -> GraphFlash {
     let flash_size = flash_size - flash_size % FLASH_SECTOR;
     let param_store = flash_size.saturating_sub(FLASH_SECTOR);
-    let usable = param_store.saturating_sub(kernel_reserve);
+    let data_store = param_store.saturating_sub(DATA_STORE_SIZE);
+    let usable = data_store.saturating_sub(kernel_reserve);
     let third = usable / 3;
     let slot_size = third - third % FLASH_SECTOR;
-    let slot_b = param_store - slot_size;
+    let slot_b = data_store - slot_size;
     let slot_a = slot_b - slot_size;
     GraphFlash {
         flash_size,
@@ -133,6 +151,7 @@ pub const fn graph_flash(flash_size: u32, kernel_reserve: u32) -> GraphFlash {
         slot_b,
         slot_size,
         param_store,
+        data_store,
     }
 }
 
@@ -145,6 +164,7 @@ impl GraphFlash {
             self.slot_b,
             self.slot_size,
             self.param_store,
+            self.data_store,
         ];
         let mut out = [0u8; GRAPH_FLASH_LEN];
         let mut i = 0;
@@ -179,10 +199,12 @@ impl GraphFlash {
             slot_b: w(2),
             slot_size: w(3),
             param_store: w(4),
+            data_store: w(5),
         };
         let fits = (g.param_store as u64) + (PARAM_STORE_SIZE as u64) <= g.flash_size as u64
+            && (g.data_store as u64) + (DATA_STORE_SIZE as u64) <= g.param_store as u64
             && (g.slot_a as u64) + (g.slot_size as u64) <= g.slot_b as u64
-            && (g.slot_b as u64) + (g.slot_size as u64) <= g.param_store as u64;
+            && (g.slot_b as u64) + (g.slot_size as u64) <= g.data_store as u64;
         if fits {
             Some(g)
         } else {
