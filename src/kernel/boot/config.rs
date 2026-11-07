@@ -569,9 +569,10 @@ fn read_layout_from_trailer() -> Option<FlashLayout> {
 /// what lies between it and the next thing the platform owns.
 ///
 /// - A RAM-loaded aarch64 image (Pi 5, CM5, QEMU virt without side-loaded
-///   blobs) carries its payload between the end of its file-backed sections
-///   and `.bss`, which `_start` zeroes before `main`: the window ends at
-///   `__bss_start` (`linker/memory-bcm2712.x`, the payload window).
+///   blobs, a uefi image) carries its payload between the end of its
+///   file-backed sections and `.bss`, which `_start` zeroes before `main`: the
+///   window ends at `__bss_start` (`linker/memory-bcm2712.x`,
+///   `linker/memory-uefi.x`, the payload window).
 /// - An RP image executes in place from flash, and the config sits below the
 ///   graph slots (or, on a flash with no room for slots, below the parameter
 ///   store sector).
@@ -606,9 +607,9 @@ fn trailer_config_window(config_addr: u32) -> u32 {
 /// Maximum counts.
 ///
 /// `MAX_MODULES` is the kernel platform's module-index domain, stated in
-/// `kernel::config` (4096 on Linux, 1024 on bcm2712, 48 on wasm, 32 on RP);
-/// the per-module tables are sized from the boot plan within it. It is kernel
-/// capacity, not ABI: modules read the live slot count at runtime
+/// `kernel::config` (4096 on Linux, 1024 on bcm2712 and uefi, 48 on wasm, 32
+/// on RP); the per-module tables are sized from the boot plan within it. It
+/// is kernel capacity, not ABI: modules read the live slot count at runtime
 /// (`internal::reconfigure::SLOT_CAPACITY`). Every per-module set — the
 /// event-wake bitmap, owner and upstream masks — is a `ModuleMask` of
 /// `MODULE_MASK_WORDS` u64 words sized from it, so a profile value needs no
@@ -628,17 +629,18 @@ const _: () = assert!(
 
 /// Edge slots a graph section holds. On the static profiles it is the
 /// profile's compiled count (`kernel::config::GRAPH_EDGES`), the slot layout
-/// every blob for that profile is built with. On Linux and bcm2712 the section
-/// is laid out for the graph it carries — byte 3 states the slot count — and
-/// this is only the format's bound: a slot code is a byte of 128-edge units.
-#[cfg(any(feature = "host-linux", feature = "chip-bcm2712"))]
+/// every blob for that profile is built with. On Linux and aarch64 bare metal
+/// the section is laid out for the graph it carries — byte 3 states the slot
+/// count — and this is only the format's bound: a slot code is a byte of
+/// 128-edge units.
+#[cfg(any(feature = "host-linux", feature = "aarch64-metal"))]
 pub const MAX_GRAPH_EDGES: usize = 255 * 128;
-#[cfg(not(any(feature = "host-linux", feature = "chip-bcm2712")))]
+#[cfg(not(any(feature = "host-linux", feature = "aarch64-metal")))]
 pub const MAX_GRAPH_EDGES: usize = crate::kernel::config::GRAPH_EDGES;
 /// The edge slots of the small (static) profiles, named so the tools' capacity
 /// mirror can pin them against this source text.
 pub const SMALL_GRAPH_EDGES: usize = 128;
-#[cfg(not(any(feature = "host-linux", feature = "chip-bcm2712")))]
+#[cfg(not(any(feature = "host-linux", feature = "aarch64-metal")))]
 const _: () = assert!(
     MAX_GRAPH_EDGES == SMALL_GRAPH_EDGES,
     "a static profile lays its graph section out for the named slot count"
@@ -649,8 +651,8 @@ const _: () = assert!(
 /// blob laid out for another profile would put the domain metadata and
 /// hardware section at the wrong offsets; this byte is how the loader refuses
 /// it by name instead of by a CRC mismatch nobody can read. On Linux and
-/// bcm2712 the section is as large as the code says.
-#[cfg(not(any(feature = "host-linux", feature = "chip-bcm2712")))]
+/// aarch64 bare metal the section is as large as the code says.
+#[cfg(not(any(feature = "host-linux", feature = "aarch64-metal")))]
 pub const GRAPH_SLOTS_CODE: u8 = if MAX_GRAPH_EDGES == 128 {
     0
 } else {
@@ -933,8 +935,8 @@ pub type ModuleList = crate::kernel::mem::table::ParseTable<Option<ModuleEntry>,
 pub struct Config {
     pub header: ConfigHeader,
     /// Module entries by id: an array of the profile's module count on the
-    /// static profiles; on Linux and bcm2712 a list as long as the largest id
-    /// parsed.
+    /// static profiles; on Linux and aarch64 bare metal a list as long as the
+    /// largest id parsed.
     pub modules: ModuleList,
     /// Graph edges in blob order.
     pub graph_edges: crate::kernel::mem::table::ParseTable<Option<GraphEdge>, MAX_GRAPH_EDGES>,
@@ -980,6 +982,8 @@ pub struct Config {
     pub resident_workload_section: *const u8,
     /// Length in bytes of the resident-workload section (0 if absent).
     pub resident_workload_section_len: usize,
+    /// The graph's `boot:` map; all zero if it has none.
+    pub boot_params: [u8; BOOT_PARAMS_BYTES],
 }
 
 /// `graph_flags` bit 0: accept cycles in the dataflow graph. The
@@ -1015,6 +1019,7 @@ impl Config {
             graph_flags: 0,
             resident_workload_section: core::ptr::null(),
             resident_workload_section_len: 0,
+            boot_params: [0; BOOT_PARAMS_BYTES],
         }
     }
 }
@@ -1228,7 +1233,7 @@ pub fn read_config_from_slice(blob: &[u8], config: &mut Config) -> bool {
 
     // The graph section's slot code (its byte 3) fixes the section's size, so
     // it is read before any later offset is derived. A static profile holds
-    // exactly one layout and refuses another by name; Linux and bcm2712 take
+    // exactly one layout and refuses another by name; Linux and aarch64 take
     // the layout the blob states.
     let graph_off = HEADER_SIZE + 6 + section_size;
     if blob_len < graph_off + 4 {
@@ -1237,7 +1242,7 @@ pub fn read_config_from_slice(blob: &[u8], config: &mut Config) -> bool {
     }
     // SAFETY: `graph_off + 4 <= blob_len` checked above.
     let slots_code = unsafe { *flash_ptr.add(graph_off + 3) };
-    #[cfg(not(any(feature = "host-linux", feature = "chip-bcm2712")))]
+    #[cfg(not(any(feature = "host-linux", feature = "aarch64-metal")))]
     if slots_code != GRAPH_SLOTS_CODE {
         log::error!(
             "[config] graph section laid out for slot code {slots_code}, this kernel expects {GRAPH_SLOTS_CODE} (MAX_GRAPH_EDGES={MAX_GRAPH_EDGES}) — rebuild the config for this target"
@@ -1506,6 +1511,8 @@ pub fn read_config_from_slice(blob: &[u8], config: &mut Config) -> bool {
     //          for an arena below 2 GiB, KiB past it).
     //   FXDM — declared demand: the same entries, what the graph's modules
     //          declare they will ask of each pool, added to its derived size.
+    //   FXBO — boot parameters, the graph's `boot:` map: how a machine
+    //          behaves on a test rig, read by the platform.
     // Each is validated whole (bounds AND CRC) before use: workloads are
     // executable configuration and the envelope gates admission, so a corrupt
     // or truncated section must contribute NOTHING, never a garbled prefix.
@@ -1521,6 +1528,7 @@ pub fn read_config_from_slice(blob: &[u8], config: &mut Config) -> bool {
             ENVELOPE_SECTION_MAGIC | DEMAND_SECTION_MAGIC => {
                 crate::abi::contracts::resource::MAX_ENVELOPE_SECTION_BYTES
             }
+            BOOT_SECTION_MAGIC => 10 + BOOT_PARAMS_BYTES,
             _ => break,
         };
         // SAFETY: header fields within the 12 bytes checked above.
@@ -1555,6 +1563,11 @@ pub fn read_config_from_slice(blob: &[u8], config: &mut Config) -> bool {
             DEMAND_SECTION_MAGIC => {
                 parse_pool_entries(payload, crate::kernel::sys::resource_ledger::set_declared);
             }
+            BOOT_SECTION_MAGIC => {
+                if let Ok(params) = <[u8; BOOT_PARAMS_BYTES]>::try_from(payload) {
+                    config.boot_params = params;
+                }
+            }
             _ => unreachable!(),
         }
         section_off += section_len;
@@ -1562,6 +1575,14 @@ pub fn read_config_from_slice(blob: &[u8], config: &mut Config) -> bool {
 
     true
 }
+
+/// Boot-parameter section magic ("FXBO") — mirror of the tools'
+/// `capacity::BOOT_SECTION_MAGIC`.
+const BOOT_SECTION_MAGIC: u32 = 0x4658_424F;
+/// The boot section's payload, little-endian: `[reserved u8][fault_probe u8]
+/// [lockup_probe u8][reserved u8][summary_every_s u32][summary_for_s u32]
+/// [max_uptime_s u32]`. A payload of any other length is ignored.
+pub const BOOT_PARAMS_BYTES: usize = 16;
 
 /// Capacity-envelope section magic ("FXEV") — mirror of
 /// `abi::contracts::resource::ENVELOPE_SECTION_MAGIC`.

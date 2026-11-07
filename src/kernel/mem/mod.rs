@@ -1,7 +1,7 @@
 //! Memory domain — allocation and demand paging.
 
 pub mod backing;
-#[cfg(any(feature = "chip-bcm2712", feature = "rp"))]
+#[cfg(any(feature = "aarch64-metal", feature = "rp"))]
 pub mod carve;
 pub mod elastic;
 pub mod heap;

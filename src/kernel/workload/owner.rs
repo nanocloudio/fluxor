@@ -40,9 +40,9 @@ use crate::kernel::workload::storage::StorageGrant;
 /// at boot naming `owners`. Wire fields carrying a slot are `u16`.
 #[cfg(all(feature = "multitenant", feature = "host-linux"))]
 pub const MAX_OWNERS: usize = 4096;
-/// The owner-slot domain on bcm2712, including the system slot: the table is
-/// sized at boot from the plan (and carved), and a plan past this is refused
-/// naming `owners`.
+/// The owner-slot domain on aarch64 bare metal (bcm2712, uefi), including the
+/// system slot: the table is sized at boot from the plan (and carved), and a
+/// plan past this is refused naming `owners`.
 #[cfg(all(feature = "multitenant", not(feature = "host-linux")))]
 pub const MAX_OWNERS: usize = 64;
 /// Single-tenant: only the system owner exists.
@@ -181,10 +181,11 @@ impl OwnerEntry {
 
 /// Bounded table of owner slots. Slot 0 is permanently the system owner.
 ///
-/// On Linux and bcm2712 the table is sized at boot to the plan's `owners`
-/// ceiling — the system slot, the resident workloads and the owner reserve —
-/// within the owner-slot domain `MAX_OWNERS` (4096 on Linux, 64 on bcm2712);
-/// elsewhere it is the static array (1 single-tenant).
+/// On Linux, aarch64 bare metal and RP the table is sized at boot to the
+/// plan's `owners` ceiling — the system slot, the resident workloads and the
+/// owner reserve — within the owner-slot domain `MAX_OWNERS` (4096 on Linux,
+/// 64 on aarch64 bare metal, 1 on the single-tenant RP); on wasm it is the
+/// static array.
 pub struct OwnerTable {
     entries: crate::kernel::mem::table::Table<OwnerEntry, MAX_OWNERS>,
     /// The kernel's table ([`OwnerTable::kernel`]): its owners' log rings
@@ -195,7 +196,7 @@ pub struct OwnerTable {
 }
 
 /// Slot 0 is the system owner; every other slot starts free.
-#[cfg(any(feature = "host-linux", feature = "chip-bcm2712", feature = "rp"))]
+#[cfg(any(feature = "host-linux", feature = "aarch64-metal", feature = "rp"))]
 fn owner_init(slot: usize) -> OwnerEntry {
     if slot == 0 {
         OwnerEntry::SYSTEM
@@ -206,7 +207,7 @@ fn owner_init(slot: usize) -> OwnerEntry {
 
 /// The owners a table no plan has sized takes on first use: the plan's
 /// defaults, within the owner-slot domain.
-#[cfg(any(feature = "host-linux", feature = "chip-bcm2712", feature = "rp"))]
+#[cfg(any(feature = "host-linux", feature = "aarch64-metal", feature = "rp"))]
 fn owner_default() -> usize {
     (crate::kernel::sys::resource_ledger::ceiling(crate::abi::contracts::resource::POOL_OWNERS)
         as usize)
@@ -216,7 +217,7 @@ fn owner_default() -> usize {
 impl OwnerTable {
     /// A fresh table with only the system slot active.
     pub const fn new() -> Self {
-        #[cfg(any(feature = "host-linux", feature = "chip-bcm2712", feature = "rp"))]
+        #[cfg(any(feature = "host-linux", feature = "aarch64-metal", feature = "rp"))]
         {
             OwnerTable {
                 entries: crate::kernel::mem::table::Table::new_planned(owner_init, owner_default),
@@ -224,7 +225,7 @@ impl OwnerTable {
                 logs: false,
             }
         }
-        #[cfg(not(any(feature = "host-linux", feature = "chip-bcm2712", feature = "rp")))]
+        #[cfg(not(any(feature = "host-linux", feature = "aarch64-metal", feature = "rp")))]
         {
             let mut entries = [OwnerEntry::EMPTY; MAX_OWNERS];
             entries[0] = OwnerEntry::SYSTEM;

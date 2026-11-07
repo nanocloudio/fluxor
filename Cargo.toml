@@ -113,7 +113,8 @@ embedded-platform = []
 # When OFF, `MAX_OWNERS == 1`, the owner table collapses to a single system
 # slot, owner fields on graph objects compile out, and the authorization
 # helpers become no-ops — so single-tenant bare-metal targets (rp*) carry no
-# ownership cost. Enabled by the multi-owner targets (bcm2712, host-linux).
+# ownership cost. Enabled by the multi-owner targets (aarch64 bare metal,
+# host-linux).
 multitenant = ["fluxor-contracts/alloc"]
 
 # Test-only: bcm2712 fires a one-shot graph rebuild ~5 s after boot so the
@@ -165,13 +166,11 @@ chip-rp2040 = ["rp", "rp2040-boot2", "embedded-platform", "kernel-mpu"]
 rp-overclock = []
 
 # Kernel hardware CAPABILITIES (what a platform can do, not which chip it is).
-# The kernel branches on these, never on chip identity; a chip feature turns on
-# whichever it provides. Behaviour is unchanged — bcm2712 is today the only
-# bare-metal target that provides all three — but the boundary is expressed as
-# capability so a future MMU-but-single-core (or MPU-but-multi-core) target
-# would flip only the capabilities it actually has.
-#   kernel-vm: kernel-managed page-table virtual memory + EL0 module isolation
-#              (external-arena paging, isolated/page-aligned allocation).
+# The kernel branches on these, never on chip identity; a chip or host feature
+# turns on whichever it provides.
+#   kernel-vm: kernel-managed page-table virtual memory (external-arena paging,
+#              isolated/page-aligned allocation), on which a platform builds
+#              EL0 module isolation.
 #   kernel-mpu: MPU-based module isolation on a microcontroller: gated
 #              modules run unprivileged on their own process stack behind the
 #              gateway, inside regions from the shared planner.
@@ -200,12 +199,20 @@ rsa-vault = []
 # BCM2712 (Cortex-A76, aarch64). Requires target aarch64-unknown-none.
 # Bare-metal from scratch.
 chip-bcm2712 = [
+    "aarch64-metal",
+    "smp",
+    "dtb",
+]
+
+# What every aarch64 kernel without a host OS under it shares, whatever started
+# it (a device tree on bcm2712, UEFI and ACPI on uefi): page-table virtual
+# memory, tables carved at boot from the machine's memory, the multi-owner
+# kernel and the full key vault.
+aarch64-metal = [
     "portable-atomic",
     "embedded-platform",
     "multitenant",
     "kernel-vm",
-    "smp",
-    "dtb",
     "pq-vault",
     "rsa-vault",
 ]
@@ -214,6 +221,9 @@ chip-bcm2712 = [
 # board-pi5: Real Raspberry Pi 5 hardware (kernel loaded at 0x80000).
 # Without board-pi5: QEMU virt machine (kernel loaded at 0x40080000).
 board-pi5 = ["chip-bcm2712"]
+# board-qemu-uefi: the uefi runtime on QEMU, whose step deadline is scaled to an
+# emulated machine (`platform/uefi/chip.rs`).
+board-qemu-uefi = ["host-uefi"]
 
 # Rig-validation opt-in: enables the optional adaptive-tick mechanisms — the
 # SGI wake doorbell and the absolute `cntp_cval` re-arm — at boot on bcm2712.
@@ -245,7 +255,7 @@ trust-system = ["rustls", "rustls-pki-types", "rustls-pemfile"]
 host-wasm = ["portable-atomic", "pq-vault", "rsa-vault"]
 # UEFI-booted bare metal (aarch64): the kernel entry the UEFI loader jumps
 # to, with the machine as the loader read it from the firmware.
-host-uefi = ["embedded-platform"]
+host-uefi = ["aarch64-metal"]
 
 # Optional `linux_display` backend: open a real window via winit and
 # blit each RGB565 frame through softbuffer. Off by default; file +

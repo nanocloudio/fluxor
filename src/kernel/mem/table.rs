@@ -13,9 +13,10 @@
 //!   subgraph needs. A committed slot never moves, and indexing is one bounds
 //!   check and an offset. A table reaches past its ceiling by refusing, never
 //!   by reallocating under its readers.
-//! - **bcm2712** sizes its tables from the same plan, with no heap: the
-//!   table's block is a carve (`kernel::mem::carve`) off the top of the DRAM
-//!   zone the device tree describes, zeroed when it is carved. `reserve`
+//! - **aarch64 bare metal** (bcm2712, uefi) sizes its tables from the same
+//!   plan, with no heap: the table's block is a carve (`kernel::mem::carve`)
+//!   off the top of the DRAM zone the platform read from the machine at boot,
+//!   zeroed when it is carved. `reserve`
 //!   carves the ceiling and initialises every slot of it, so the table is
 //!   whole from then on and `grow` is a bounds check: an array whose size is
 //!   chosen at boot rather than at compile time.
@@ -26,7 +27,7 @@
 //!   arena (`kernel::mem::carve::begin_plan` / `place_arenas`). A rebuild
 //!   plans the pool afresh: it moves the carve's **sized tag**, every table
 //!   carved under an older tag reads as unsized, and the plan reserves it
-//!   again in the new split. Within a plan a table behaves as bcm2712's.
+//!   again in the new split. Within a plan a table behaves as aarch64's.
 //! - **wasm** keeps a static array of the profile's compiled size `N`: the
 //!   table is whole from the start, `reserve` admits any ceiling up to `N` and
 //!   refuses one above it, and `grow` is a bounds check.
@@ -44,7 +45,7 @@
 //! A reservation larger than the table's block moves the table to a new block.
 //! What becomes of the old one is the platform's:
 //!
-//! - **bcm2712** hands it back to the carve zone's free extents at once
+//! - **aarch64** hands it back to the carve zone's free extents at once
 //!   (`carve::retire`), and the next carve takes from them before it lowers
 //!   the floor, so a rebuild to a larger graph reuses what the previous
 //!   graph's tables held. That is sound because a reservation runs only
@@ -61,7 +62,7 @@
 //! [`ParseTable`] is the parse-side counterpart for the boot config's module
 //! and edge lists: it grows as the parser (or a test that builds a config by
 //! hand) writes entries, and reads past its end as the table's empty value.
-//! On bcm2712 its storage is a transient carve block, returned for reuse when
+//! On aarch64 its storage is a transient carve block, returned for reuse when
 //! the list is dropped, so a rebuild reuses the last parse's memory. RP keeps
 //! the format's array: the config blob's graph section is laid out for its
 //! compiled slot count there.
@@ -104,24 +105,24 @@ pub enum TableError {
 #[macro_export]
 macro_rules! boot_table {
     ($n:expr, $init:expr) => {{
-        #[cfg(any(feature = "host-linux", feature = "chip-bcm2712", feature = "rp"))]
+        #[cfg(any(feature = "host-linux", feature = "aarch64-metal", feature = "rp"))]
         {
             $crate::kernel::mem::table::Table::new(|_| $init)
         }
-        #[cfg(not(any(feature = "host-linux", feature = "chip-bcm2712", feature = "rp")))]
+        #[cfg(not(any(feature = "host-linux", feature = "aarch64-metal", feature = "rp")))]
         {
             $crate::kernel::mem::table::Table::from_array([const { $init }; $n])
         }
     }};
     ($n:expr, $init:expr, $pool:expr) => {{
-        #[cfg(any(feature = "host-linux", feature = "chip-bcm2712", feature = "rp"))]
+        #[cfg(any(feature = "host-linux", feature = "aarch64-metal", feature = "rp"))]
         {
             $crate::kernel::mem::table::Table::new_planned(
                 |_| $init,
                 || $crate::kernel::sys::resource_ledger::ceiling($pool) as usize,
             )
         }
-        #[cfg(not(any(feature = "host-linux", feature = "chip-bcm2712", feature = "rp")))]
+        #[cfg(not(any(feature = "host-linux", feature = "aarch64-metal", feature = "rp")))]
         {
             let _ = $pool;
             $crate::kernel::mem::table::Table::from_array([const { $init }; $n])
@@ -130,14 +131,14 @@ macro_rules! boot_table {
     // `$per` slots per slot of `$pool`: a table keyed by a pool's index and a
     // second, bounded one (an owner slot and an execution domain).
     ($n:expr, $init:expr, $pool:expr, $per:expr) => {{
-        #[cfg(any(feature = "host-linux", feature = "chip-bcm2712", feature = "rp"))]
+        #[cfg(any(feature = "host-linux", feature = "aarch64-metal", feature = "rp"))]
         {
             $crate::kernel::mem::table::Table::new_planned(
                 |_| $init,
                 || $crate::kernel::sys::resource_ledger::ceiling($pool) as usize * $per,
             )
         }
-        #[cfg(not(any(feature = "host-linux", feature = "chip-bcm2712", feature = "rp")))]
+        #[cfg(not(any(feature = "host-linux", feature = "aarch64-metal", feature = "rp")))]
         {
             let _ = ($pool, $per);
             $crate::kernel::mem::table::Table::from_array([const { $init }; $n])
@@ -145,7 +146,7 @@ macro_rules! boot_table {
     }};
 }
 
-// ── Linux, bcm2712 and RP: sized from the plan ────────────────────────────
+// ── Linux, aarch64 and RP: sized from the plan ────────────────────────────
 //
 // The bookkeeping is one non-generic core ([`Raw`]): only the slot writes
 // ([`fill_impl`]) and, on Linux, the drop are per element type. A kernel has
@@ -153,7 +154,7 @@ macro_rules! boot_table {
 // RP2040's flash cannot spare. A read is one comparison of the state word
 // against the current sized tag, then the slice.
 
-#[cfg(any(feature = "host-linux", feature = "chip-bcm2712", feature = "rp"))]
+#[cfg(any(feature = "host-linux", feature = "aarch64-metal", feature = "rp"))]
 mod imp {
     use super::{segments, TableError};
     use core::marker::PhantomData;
@@ -220,17 +221,17 @@ mod imp {
     }
 
     /// A block of `bytes` at `align`: a zeroed carve — from the DRAM zone on
-    /// bcm2712, from the static pool on RP.
-    #[cfg(any(feature = "chip-bcm2712", feature = "rp"))]
+    /// aarch64, from the static pool on RP.
+    #[cfg(any(feature = "aarch64-metal", feature = "rp"))]
     fn alloc_block(bytes: usize, align: usize) -> Result<*mut u8, TableError> {
         crate::kernel::mem::carve::carve(bytes, align).ok_or(TableError::NoMemory)
     }
 
-    /// Mask this core's interrupts for a table move (bcm2712); the state to
+    /// Mask this core's interrupts for a table move (aarch64); the state to
     /// restore. A compiler fence on each side keeps the move's accesses
     /// inside the masked window. `None` before the platform has installed
     /// its HAL, when no handler is bound yet.
-    #[cfg(feature = "chip-bcm2712")]
+    #[cfg(feature = "aarch64-metal")]
     fn mask_interrupts() -> Option<u32> {
         if !crate::kernel::sys::hal::is_initialised() {
             return None;
@@ -241,7 +242,7 @@ mod imp {
     }
 
     /// Restore what [`mask_interrupts`] saved.
-    #[cfg(feature = "chip-bcm2712")]
+    #[cfg(feature = "aarch64-metal")]
     fn restore_interrupts(state: u32) {
         core::sync::atomic::compiler_fence(Ordering::SeqCst);
         crate::kernel::sys::hal::restore_interrupts(state);
@@ -405,12 +406,12 @@ mod imp {
             } else if ceiling > reserved {
                 let bytes = ceiling.checked_mul(self.size).ok_or(TableError::NoMemory)?;
                 let fresh = alloc_block(bytes, self.align)?;
-                // bcm2712: the copy, the publish and the retire run with this
+                // aarch64: the copy, the publish and the retire run with this
                 // core's interrupts masked, so a handler on the core the move
                 // runs on (an event signal) can neither write a slot of the
                 // old block after it is copied, a write the move would lose,
                 // nor observe the old block once it is retired.
-                #[cfg(feature = "chip-bcm2712")]
+                #[cfg(feature = "aarch64-metal")]
                 let masked = if reserved > 0 {
                     mask_interrupts()
                 } else {
@@ -426,10 +427,10 @@ mod imp {
                 }
                 self.ptr.store(fresh, Ordering::Release);
                 self.reserved.store(ceiling, Ordering::Relaxed);
-                // The old block is freed: to the carve zone on bcm2712, to the
+                // The old block is freed: to the carve zone on aarch64, to the
                 // host's allocator on Linux. Its values moved to `fresh`
                 // bitwise and are not dropped there.
-                #[cfg(feature = "chip-bcm2712")]
+                #[cfg(feature = "aarch64-metal")]
                 if reserved > 0 {
                     // SAFETY: `old` is the block `alloc_block` carved for
                     // `reserved` slots, and `reserve`'s contract holds: no
@@ -440,7 +441,7 @@ mod imp {
                     // `Table::reserve`).
                     unsafe { crate::kernel::mem::carve::retire(old, reserved * self.size) };
                 }
-                #[cfg(feature = "chip-bcm2712")]
+                #[cfg(feature = "aarch64-metal")]
                 if let Some(state) = masked {
                     restore_interrupts(state);
                 }
@@ -454,9 +455,9 @@ mod imp {
                 }
             }
             self.ceiling.store(ceiling, Ordering::Relaxed);
-            // bcm2712 and RP: the whole ceiling is committed now, so `grow` is
+            // aarch64 and RP: the whole ceiling is committed now, so `grow` is
             // a bounds check and no slot is initialised on a live add.
-            #[cfg(any(feature = "chip-bcm2712", feature = "rp"))]
+            #[cfg(any(feature = "aarch64-metal", feature = "rp"))]
             self.grow(ceiling)?;
             Ok(())
         }
@@ -569,9 +570,12 @@ mod imp {
         /// callers reserve while a graph is prepared (or the platform boots),
         /// never while one runs.
         ///
-        /// On bcm2712 the old block is handed back to the carve zone at once,
+        /// On aarch64 the old block is handed back to the carve zone at once,
         /// so the contract is what keeps a reader off freed memory. Every
-        /// reservation there satisfies it:
+        /// reservation there satisfies it. On uefi the graph is prepared once,
+        /// at boot, on core 0, the one core that steps modules; the other
+        /// cores take only their timer tick, and core 0's handlers are masked
+        /// for the move as below. On bcm2712:
         ///
         /// - The kernel's tables are reserved on core 0 by
         ///   `size_kernel_tables` in `prepare_graph`, and the cross-domain
@@ -710,7 +714,7 @@ mod imp {
 
 // ── wasm: the profile's static array ──────────────────────────────────────
 
-#[cfg(not(any(feature = "host-linux", feature = "chip-bcm2712", feature = "rp")))]
+#[cfg(not(any(feature = "host-linux", feature = "aarch64-metal", feature = "rp")))]
 mod imp {
     use super::TableError;
 
@@ -907,11 +911,11 @@ impl<T: Copy, const N: usize> Clone for ParseTable<T, N> {
     }
 }
 
-// ── bcm2712: parse lists and scratch in transient carve blocks ────────────
+// ── aarch64: parse lists and scratch in transient carve blocks ────────────
 
 /// A transient block of `n` slots of `T` from the carve allocator, or a null
 /// block when `n` is 0 or the zone is exhausted.
-#[cfg(feature = "chip-bcm2712")]
+#[cfg(feature = "aarch64-metal")]
 fn take_slots<T>(n: usize) -> (*mut T, usize) {
     let size = core::mem::size_of::<T>();
     if n == 0 || size == 0 {
@@ -936,7 +940,7 @@ fn take_slots<T>(n: usize) -> (*mut T, usize) {
 ///
 /// # Safety
 /// `(ptr, cap)` is what `take_slots` returned and nothing references it.
-#[cfg(feature = "chip-bcm2712")]
+#[cfg(feature = "aarch64-metal")]
 unsafe fn give_slots<T>(ptr: *mut T, cap: usize) {
     let size = core::mem::size_of::<T>();
     if size == 0 || cap == 0 {
@@ -946,10 +950,10 @@ unsafe fn give_slots<T>(ptr: *mut T, cap: usize) {
     unsafe { crate::kernel::mem::carve::give(ptr as *mut u8, cap * size) };
 }
 
-/// The bcm2712 parse list: a growable list in a transient carve block,
+/// The aarch64 parse list: a growable list in a transient carve block,
 /// handed back for reuse when the list is dropped (the parser resets its
 /// config by assigning an empty one, which drops the old).
-#[cfg(feature = "chip-bcm2712")]
+#[cfg(feature = "aarch64-metal")]
 pub struct ParseTable<T: Copy, const N: usize> {
     ptr: *mut T,
     len: usize,
@@ -960,10 +964,10 @@ pub struct ParseTable<T: Copy, const N: usize> {
 }
 
 // SAFETY: the list owns its block exclusively; moving it moves that ownership.
-#[cfg(feature = "chip-bcm2712")]
+#[cfg(feature = "aarch64-metal")]
 unsafe impl<T: Copy + Send, const N: usize> Send for ParseTable<T, N> {}
 
-#[cfg(feature = "chip-bcm2712")]
+#[cfg(feature = "aarch64-metal")]
 impl<T: Copy, const N: usize> ParseTable<T, N> {
     /// An empty list whose unwritten slots read as `empty`.
     pub const fn new(empty: T) -> Self {
@@ -1020,7 +1024,7 @@ impl<T: Copy, const N: usize> ParseTable<T, N> {
     }
 }
 
-#[cfg(feature = "chip-bcm2712")]
+#[cfg(feature = "aarch64-metal")]
 impl<T: Copy, const N: usize> Drop for ParseTable<T, N> {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
@@ -1030,7 +1034,7 @@ impl<T: Copy, const N: usize> Drop for ParseTable<T, N> {
     }
 }
 
-#[cfg(feature = "chip-bcm2712")]
+#[cfg(feature = "aarch64-metal")]
 impl<T: Copy, const N: usize> Index<usize> for ParseTable<T, N> {
     type Output = T;
     #[inline]
@@ -1039,7 +1043,7 @@ impl<T: Copy, const N: usize> Index<usize> for ParseTable<T, N> {
     }
 }
 
-#[cfg(feature = "chip-bcm2712")]
+#[cfg(feature = "aarch64-metal")]
 impl<T: Copy, const N: usize> IndexMut<usize> for ParseTable<T, N> {
     fn index_mut(&mut self, i: usize) -> &mut T {
         if i >= N {
@@ -1065,7 +1069,7 @@ impl<T: Copy, const N: usize> IndexMut<usize> for ParseTable<T, N> {
     }
 }
 
-#[cfg(feature = "chip-bcm2712")]
+#[cfg(feature = "aarch64-metal")]
 macro_rules! parse_table_ranges_bcm {
     ($($r:ty),*) => {$(
         impl<T: Copy, const N: usize> Index<$r> for ParseTable<T, N> {
@@ -1083,7 +1087,7 @@ macro_rules! parse_table_ranges_bcm {
         }
     )*};
 }
-#[cfg(feature = "chip-bcm2712")]
+#[cfg(feature = "aarch64-metal")]
 parse_table_ranges_bcm!(
     core::ops::Range<usize>,
     core::ops::RangeTo<usize>,
@@ -1093,7 +1097,7 @@ parse_table_ranges_bcm!(
     core::ops::RangeToInclusive<usize>
 );
 
-#[cfg(feature = "chip-bcm2712")]
+#[cfg(feature = "aarch64-metal")]
 impl<T: Copy, const N: usize> Deref for ParseTable<T, N> {
     type Target = [T];
     #[inline]
@@ -1106,7 +1110,7 @@ impl<T: Copy, const N: usize> Deref for ParseTable<T, N> {
     }
 }
 
-#[cfg(feature = "chip-bcm2712")]
+#[cfg(feature = "aarch64-metal")]
 impl<T: Copy, const N: usize> DerefMut for ParseTable<T, N> {
     #[inline]
     fn deref_mut(&mut self) -> &mut [T] {
@@ -1118,7 +1122,7 @@ impl<T: Copy, const N: usize> DerefMut for ParseTable<T, N> {
     }
 }
 
-#[cfg(feature = "chip-bcm2712")]
+#[cfg(feature = "aarch64-metal")]
 impl<T: Copy, const N: usize> Clone for ParseTable<T, N> {
     fn clone(&self) -> Self {
         let mut out = Self::new(self.empty);
@@ -1132,16 +1136,16 @@ impl<T: Copy, const N: usize> Clone for ParseTable<T, N> {
     }
 }
 
-/// Build-time scratch on bcm2712 (see [`scratch!`]): `n` slots in a transient
+/// Build-time scratch on aarch64 (see [`scratch!`]): `n` slots in a transient
 /// carve block, handed back when it is dropped.
-#[cfg(feature = "chip-bcm2712")]
+#[cfg(feature = "aarch64-metal")]
 pub struct Scratch<T: Clone> {
     ptr: *mut T,
     len: usize,
     cap: usize,
 }
 
-#[cfg(feature = "chip-bcm2712")]
+#[cfg(feature = "aarch64-metal")]
 impl<T: Clone> Scratch<T> {
     /// `n` slots of `init`. Empty when the zone cannot hold it (logged).
     pub fn new(init: T, n: usize) -> Self {
@@ -1155,7 +1159,7 @@ impl<T: Clone> Scratch<T> {
     }
 }
 
-#[cfg(feature = "chip-bcm2712")]
+#[cfg(feature = "aarch64-metal")]
 impl<T: Clone> Drop for Scratch<T> {
     fn drop(&mut self) {
         // SAFETY: `[0, len)` is initialised and owned by the scratch.
@@ -1166,7 +1170,7 @@ impl<T: Clone> Drop for Scratch<T> {
     }
 }
 
-#[cfg(feature = "chip-bcm2712")]
+#[cfg(feature = "aarch64-metal")]
 impl<T: Clone> Deref for Scratch<T> {
     type Target = [T];
     #[inline]
@@ -1177,7 +1181,7 @@ impl<T: Clone> Deref for Scratch<T> {
     }
 }
 
-#[cfg(feature = "chip-bcm2712")]
+#[cfg(feature = "aarch64-metal")]
 impl<T: Clone> DerefMut for Scratch<T> {
     #[inline]
     fn deref_mut(&mut self) -> &mut [T] {
@@ -1187,13 +1191,13 @@ impl<T: Clone> DerefMut for Scratch<T> {
 }
 
 /// The static platforms' parse table: the array of `N`.
-#[cfg(not(any(feature = "host-linux", feature = "chip-bcm2712")))]
+#[cfg(not(any(feature = "host-linux", feature = "aarch64-metal")))]
 #[derive(Clone, Copy)]
 pub struct ParseTable<T: Copy, const N: usize> {
     items: [T; N],
 }
 
-#[cfg(not(any(feature = "host-linux", feature = "chip-bcm2712")))]
+#[cfg(not(any(feature = "host-linux", feature = "aarch64-metal")))]
 impl<T: Copy, const N: usize> ParseTable<T, N> {
     /// `N` slots of `empty`.
     pub const fn new(empty: T) -> Self {
@@ -1209,7 +1213,7 @@ impl<T: Copy, const N: usize> ParseTable<T, N> {
     }
 }
 
-#[cfg(not(any(feature = "host-linux", feature = "chip-bcm2712")))]
+#[cfg(not(any(feature = "host-linux", feature = "aarch64-metal")))]
 impl<T: Copy, const N: usize> Index<usize> for ParseTable<T, N> {
     type Output = T;
     #[inline]
@@ -1218,7 +1222,7 @@ impl<T: Copy, const N: usize> Index<usize> for ParseTable<T, N> {
     }
 }
 
-#[cfg(not(any(feature = "host-linux", feature = "chip-bcm2712")))]
+#[cfg(not(any(feature = "host-linux", feature = "aarch64-metal")))]
 impl<T: Copy, const N: usize> IndexMut<usize> for ParseTable<T, N> {
     #[inline]
     fn index_mut(&mut self, i: usize) -> &mut T {
@@ -1226,7 +1230,7 @@ impl<T: Copy, const N: usize> IndexMut<usize> for ParseTable<T, N> {
     }
 }
 
-#[cfg(not(any(feature = "host-linux", feature = "chip-bcm2712")))]
+#[cfg(not(any(feature = "host-linux", feature = "aarch64-metal")))]
 impl<T: Copy, const N: usize> Deref for ParseTable<T, N> {
     type Target = [T];
     #[inline]
@@ -1235,7 +1239,7 @@ impl<T: Copy, const N: usize> Deref for ParseTable<T, N> {
     }
 }
 
-#[cfg(not(any(feature = "host-linux", feature = "chip-bcm2712")))]
+#[cfg(not(any(feature = "host-linux", feature = "aarch64-metal")))]
 impl<T: Copy, const N: usize> DerefMut for ParseTable<T, N> {
     #[inline]
     fn deref_mut(&mut self) -> &mut [T] {
@@ -1246,7 +1250,7 @@ impl<T: Copy, const N: usize> DerefMut for ParseTable<T, N> {
 // ── Scratch ───────────────────────────────────────────────────────────────
 
 /// Build-time scratch of `n` slots of `$init`: a `Vec` on Linux (where `n` is
-/// the graph's live count), a transient carve block on bcm2712, the static
+/// the graph's live count), a transient carve block on aarch64, the static
 /// size `$cap` on the other platforms. Graph preparation and live adds use
 /// it; a step never does.
 #[macro_export]
@@ -1257,12 +1261,12 @@ macro_rules! scratch {
             let _ = $cap;
             ::std::vec![$init; $n]
         }
-        #[cfg(feature = "chip-bcm2712")]
+        #[cfg(feature = "aarch64-metal")]
         {
             let _ = $cap;
             $crate::kernel::mem::table::Scratch::new($init, $n)
         }
-        #[cfg(not(any(feature = "host-linux", feature = "chip-bcm2712")))]
+        #[cfg(not(any(feature = "host-linux", feature = "aarch64-metal")))]
         {
             let _ = $n;
             [$init; $cap]

@@ -5,7 +5,8 @@ pub mod gateway;
 pub mod loader;
 // OTA RAM staging surface (Pi 5 / hosted Linux). Not compiled on RP —
 // its OTA path is the flash graph-slot A/B pair, and the staging
-// buffers would dwarf SRAM.
+// buffers would dwarf SRAM — nor on uefi, whose run loop takes no graph
+// rebuild for a commit to land in.
 #[cfg(any(feature = "chip-bcm2712", feature = "host-linux"))]
 pub mod ota_stage;
 pub mod provider;

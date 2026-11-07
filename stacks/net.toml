@@ -18,6 +18,46 @@ wiring = [
 ]
 
 [[variant]]
+match = { board = "qemu-uefi-arm64", phy = "ethernet", nic = "virtio" }
+# A NIC and the IP stack exchange frames in both directions, which the
+# scheduler sees as a cycle. Without this the graph is rejected at
+# `prepare_graph` and the board boots with no network — silently, since
+# the netconsole that would have reported it is on that network.
+accept_cycles = true
+modules = [
+  { name = "virtio_net" },
+  { name = "conn_guard" },
+  { name = "ip", params = { use_dhcp = "user:use_dhcp|1", static_ip = "user:static_ip|0", static_netmask = "user:static_netmask|0", static_gateway = "user:static_gateway|0", trace_sample_permille = "user:trace_sample_permille|host:observability.sample_permille" } },
+]
+# RX path passes through conn_guard for SYN-flood admission control.
+# TX path goes direct from ip back to the NIC (no per-egress filtering).
+wiring = [
+  "virtio_net.frames_rx -> conn_guard.frames_rx",
+  "conn_guard.frames_tx -> ip.frames_rx",
+  "ip.frames_tx -> virtio_net.frames_tx",
+]
+
+[[variant]]
+match = { board = "ec2-arm64", phy = "ethernet", nic = "ena" }
+# A NIC and the IP stack exchange frames in both directions, which the
+# scheduler sees as a cycle. Without this the graph is rejected at
+# `prepare_graph` and the board boots with no network — silently, since
+# the netconsole that would have reported it is on that network.
+accept_cycles = true
+modules = [
+  { name = "ena" },
+  { name = "conn_guard" },
+  { name = "ip", params = { use_dhcp = "user:use_dhcp|1", static_ip = "user:static_ip|0", static_netmask = "user:static_netmask|0", static_gateway = "user:static_gateway|0", trace_sample_permille = "user:trace_sample_permille|host:observability.sample_permille" } },
+]
+# RX path passes through conn_guard for SYN-flood admission control.
+# TX path goes direct from ip back to the NIC (no per-egress filtering).
+wiring = [
+  "ena.frames_rx -> conn_guard.frames_rx",
+  "conn_guard.frames_tx -> ip.frames_rx",
+  "ip.frames_tx -> ena.frames_tx",
+]
+
+[[variant]]
 match = { board = "pico2w", phy = "wifi", nic = "cyw43" }
 # A NIC and the IP stack exchange frames in both directions, which the
 # scheduler sees as a cycle. Without this the graph is rejected at

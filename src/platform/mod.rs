@@ -78,6 +78,9 @@ pub mod chip;
 #[cfg(feature = "chip-bcm2712")]
 #[path = "bcm2712/chip.rs"]
 pub mod chip;
+#[cfg(feature = "host-uefi")]
+#[path = "uefi/chip.rs"]
+pub mod chip;
 #[cfg(feature = "host-linux")]
 #[path = "linux/chip.rs"]
 pub mod chip;

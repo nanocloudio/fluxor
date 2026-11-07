@@ -83,20 +83,20 @@ struct State {
 
 /// Regions a table no plan has sized takes on first use: one per owner the
 /// plan's defaults seat, and one being staged.
-#[cfg(any(feature = "host-linux", feature = "chip-bcm2712"))]
+#[cfg(any(feature = "host-linux", feature = "aarch64-metal"))]
 fn default_regions() -> usize {
     crate::kernel::sys::resource_ledger::ceiling(crate::abi::contracts::resource::POOL_OWNERS)
         as usize
         + 1
 }
 
-#[cfg(any(feature = "host-linux", feature = "chip-bcm2712"))]
+#[cfg(any(feature = "host-linux", feature = "aarch64-metal"))]
 static mut STATE: State = State {
     regions: Table::new_planned(|_| Region::EMPTY, default_regions),
     loaders: Table::new_planned(|_| ModuleLoader::new(), default_regions),
 };
 
-#[cfg(not(any(feature = "host-linux", feature = "chip-bcm2712")))]
+#[cfg(not(any(feature = "host-linux", feature = "aarch64-metal")))]
 static mut STATE: State = State {
     regions: Table::from_array([Region::EMPTY; REGIONS]),
     loaders: Table::from_array([const { ModuleLoader::new() }; REGIONS]),

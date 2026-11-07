@@ -19,10 +19,10 @@
 //! module source.
 //!
 //! One profile per kernel platform, selected by the platform feature:
-//! `host-linux`, `chip-bcm2712`, `host-wasm` and `rp`. Linux and bcm2712 are
-//! separate profiles even where their values agree, so a hosted Linux kernel
-//! is not bound to what a Pi 5's linker regions can hold, nor the board to
-//! what a Linux host can map.
+//! `host-linux`, `chip-bcm2712`, `host-uefi`, `host-wasm` and `rp`. Linux,
+//! bcm2712 and uefi are separate profiles even where their values agree, so a
+//! hosted Linux kernel is not bound to what a Pi 5's linker regions can hold,
+//! nor a board or a cloud instance to what a Linux host can map.
 //!
 //! The composer reads these profiles as data (`tools/src/capacity.rs` embeds
 //! this file) and runs the kernel's boot plan with them, so a value changed
@@ -34,6 +34,9 @@ pub use self::profile_linux::*;
 
 #[cfg(feature = "chip-bcm2712")]
 pub use self::profile_bcm2712::*;
+
+#[cfg(feature = "host-uefi")]
+pub use self::profile_uefi::*;
 
 #[cfg(feature = "host-wasm")]
 pub use self::profile_wasm::*;
@@ -216,6 +219,70 @@ mod profile_bcm2712 {
         (res::POOL_EVENTS, 32),
         (res::POOL_TIMERS, 16),
         (res::POOL_STORE_READS, 32),
+        (res::POOL_TRACKED_HANDLES, 128),
+        (res::POOL_NET_POLICY_TABLES, 8),
+        (res::POOL_NET_POLICY_TABLE_BYTES, 8192),
+        (res::POOL_NET_ROUTE_SEGMENTS, 16),
+        (res::POOL_NET_ROUTE_PEERS, 256),
+        (res::POOL_NET_ROUTE_HELD, 256),
+        (res::POOL_STATE_ARENA, STATE_ARENA_SIZE),
+        (res::POOL_BUFFER_ARENA, BUFFER_ARENA_SIZE),
+        (res::POOL_ELASTIC_REGION, ELASTIC_REGION_SIZE),
+    ];
+    /// No pool is a static table here.
+    pub const STATIC_POOLS: &[(u16, usize)] = &[];
+    use crate::abi::contracts::resource as res;
+}
+
+// ── UEFI-booted aarch64 (cloud instances, QEMU with UEFI firmware) ─────────
+//
+// No heap, as on bcm2712. The kernel's tables are sized at boot from the graph
+// and carved from the largest free stretch of the firmware's memory map
+// (`kernel::mem::carve`, `platform/uefi.rs`); the module state arena takes
+// what the carves leave of it. The image, its `.bss` (the fixed arenas) and
+// its boot stack lie in the span `targets/host/uefi.toml` reserves
+// (`[memory]`). The control-plane store is bcm2712's and Linux's, so its pools
+// have no row here.
+
+#[cfg(feature = "host-uefi")]
+mod profile_uefi {
+    /// Module state pool the graph builder plans against: what a 2 GiB cloud
+    /// instance can spare beside the firmware and the kernel. The arena is
+    /// placed at boot from the firmware's memory map, never at a fixed
+    /// address, and is never zeroed whole. `targets/host/uefi.toml` states the
+    /// same figure (`state_arena_kb`) for the graph builder.
+    pub const STATE_ARENA_SIZE: usize = 512 * 1024 * 1024;
+    /// Per-channel buffer pool (see the Linux profile).
+    pub const BUFFER_ARENA_SIZE: usize = 16 * 1024 * 1024;
+    /// The module-index DOMAIN (see the Linux profile), not a table size.
+    pub const MAX_MODULES: usize = 1024;
+    /// ISR-tier bridge slots (see the Linux profile).
+    pub const MAX_BRIDGES: usize = 16;
+    /// Loader sanity ceiling for a single module's code segment (see the
+    /// Linux profile).
+    pub const MAX_MODULE_CODE_SIZE: usize = 1024 * 1024;
+    /// Early-boot log ring (see the BCM2712 profile).
+    pub const LOG_RING_CAPACITY: usize = 65536;
+    /// Tier B elastic region (see the Linux profile).
+    pub const ELASTIC_REGION_SIZE: usize = 16 * 1024 * 1024;
+    /// Grant granularity: the 64 KiB platform quantum.
+    pub const ELASTIC_QUANTUM: usize = 64 * 1024;
+    /// Segments one module heap may carve (see the Linux profile).
+    pub const HEAP_SEGMENTS: usize = 8;
+    /// How far the state arena's zeroed frontier runs ahead (see the BCM2712
+    /// profile).
+    pub const ZERO_AHEAD_BYTES: usize = 64 * 1024 * 1024;
+    /// Bytes one slack claim zeroes (see the BCM2712 profile).
+    pub const ZERO_CHUNK_BYTES: usize = 64 * 1024;
+
+    /// Each kernel pool's default reserve (see the Linux profile).
+    pub const DEFAULT_RESERVES: &[(u16, usize)] = &[
+        (res::POOL_MODULE_SLOTS, 256),
+        (res::POOL_CHANNELS, 512),
+        (res::POOL_OWNERS, 63),
+        (res::POOL_STATE_FREE_LIST, 32),
+        (res::POOL_EVENTS, 32),
+        (res::POOL_TIMERS, 16),
         (res::POOL_TRACKED_HANDLES, 128),
         (res::POOL_NET_POLICY_TABLES, 8),
         (res::POOL_NET_POLICY_TABLE_BYTES, 8192),
@@ -454,7 +521,7 @@ pub const PROFILE: CapacityProfile = CapacityProfile {
 };
 
 /// The static size of `pool` on this profile, `None` where the profile sizes
-/// the pool at boot (every pool on Linux, bcm2712 and RP).
+/// the pool at boot (every pool on Linux, bcm2712, uefi and RP).
 pub const fn static_pool(pool: u16) -> Option<usize> {
     PROFILE.static_pool(pool)
 }

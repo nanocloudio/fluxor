@@ -1382,10 +1382,10 @@ unsafe fn buffer_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
 }
 
 /// `TIMER::DISCIPLINE`: anchor the network-disciplined wall clock. Only a
-/// platform whose HAL reads `time_sync` (bcm2712) takes an anchor; anywhere
-/// else the call is `ENOSYS` rather than a second clock nobody reads.
+/// platform whose HAL reads `time_sync` (bcm2712, uefi) takes an anchor;
+/// anywhere else the call is `ENOSYS` rather than a second clock nobody reads.
 fn discipline_wall_clock(unix_us: u64, mono_us: u64, err_us: u64) -> i32 {
-    #[cfg(feature = "chip-bcm2712")]
+    #[cfg(feature = "aarch64-metal")]
     {
         // SAFETY: takes no pointers; the kernel timer is initialised before
         // any module runs.
@@ -1400,7 +1400,7 @@ fn discipline_wall_clock(unix_us: u64, mono_us: u64, err_us: u64) -> i32 {
         }
         rc
     }
-    #[cfg(not(feature = "chip-bcm2712"))]
+    #[cfg(not(feature = "aarch64-metal"))]
     {
         let _ = (unix_us, mono_us, err_us);
         E_NOSYS

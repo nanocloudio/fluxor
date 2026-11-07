@@ -1,4 +1,5 @@
-//! NVMe block driver — Pi 5 PCIe1 external slot.
+//! NVMe block driver for a controller on PCIe: the Pi 5's PCIe1 external slot,
+//! or a cloud instance's volumes (`dma_window_gib: 0` there).
 //!
 //! See `README.md` for the state-machine contract, spec citations, and
 //! the bring-up checklist. See `nvme_trace/baseline/` for the
@@ -17,7 +18,7 @@
 //!
 //! Up to `MAX_IO_QUEUES` I/O queue pairs (`io_queue_count` parameter,
 //! default 1). With `irq_mode = 1` the driver programs MSI-X table
-//! entry 0 against the brcmstb MSI mux and asks CreateIoCQ for
+//! entry 0 with a vector the platform allocates and asks CreateIoCQ for
 //! interrupt delivery; otherwise the CQ is drained by polling in
 //! step_ready.
 //!
@@ -74,10 +75,11 @@ include!("../../sdk/runtime/params.rs");
 /// because the downstream card hasn't trained yet.
 const PCIE_RESCAN: u32 = 0x0CF5;
 
-/// PCI-bus address offset into BAR1's inbound window on BCM7712 PCIe1.
-/// BAR1 covers PCI bus 0x10_0000_0000..0x20_0000_0000 and is
-/// UBUS-REMAP'd to fabric 0x0 (ACCESS_EN, cpu_hi=0). Device TLPs must
-/// target `arm_arena_addr | PCI_DMA_OFFSET` to land in our arena.
+/// PCI-bus address offset into BAR1's inbound window on BCM7712 PCIe1, the
+/// `dma_window_gib` default (64 GiB). BAR1 covers PCI bus
+/// 0x10_0000_0000..0x20_0000_0000 and is UBUS-REMAP'd to fabric 0x0
+/// (ACCESS_EN, cpu_hi=0), so a device TLP to `arm_addr | PCI_DMA_OFFSET`
+/// lands at `arm_addr`.
 const PCI_DMA_OFFSET: u64 = 0x10_0000_0000;
 
 // NVMe register offsets
@@ -365,6 +367,8 @@ struct NvmeState {
     /// Selector string from the `bind:` param. Stored so `step_bind`
     /// can retry until the PCIe link trains.
     bind_str: [u8; 24],
+    /// ORed into every address the device is given (`dma_window_gib`).
+    dma_offset: u64,
     bind_len: u8,
 
     queue_depth: u16,
@@ -719,6 +723,14 @@ mod params_def {
                     else { v };
                 s.io_q_count = clamped;
             };
+
+        // 7: dma_window_gib. Where this machine's bus sees RAM: a device
+        //    address is the CPU address ORed with this many GiB. The default
+        //    is the Pi 5's PCIe1 inbound window (`PCI_DMA_OFFSET`); a machine
+        //    whose devices see RAM at its own address (a cloud instance,
+        //    QEMU) sets 0.
+        7, dma_window_gib, u32, 64
+            => |s, d, len| { s.dma_offset = (p_u32(d, len, 0, 64) as u64) << 30; };
     }
 }
 
@@ -805,7 +817,7 @@ unsafe fn write_sqe(sq_base: u64, slot: u32, cdw: [u32; 16]) {
 /// Build an admin-queue SQE for a PRP1-only command and ring the admin
 /// SQ tail doorbell. `cid` is the Command Identifier; the device echoes
 /// it in the CQE so callers can cross-reference. `prp1_pci` is the PCI
-/// bus address (i.e. `arm_addr | PCI_DMA_OFFSET`) of the buffer.
+/// bus address (i.e. `arm_addr | s.dma_offset`) of the buffer.
 #[allow(
     clippy::too_many_arguments,
     reason = "arguments mirror the NVMe admin SQE fields one-to-one; bundling them into a struct would rename the spec's own vocabulary"
@@ -1328,13 +1340,10 @@ unsafe fn step_config_queues(s: &mut NvmeState) -> i32 {
             // AQA: ASQS = ACQS = ADMIN_Q_ENTRIES-1, zero-based.
             let aqa = ((ADMIN_Q_ENTRIES - 1) << 16) | (ADMIN_Q_ENTRIES - 1);
             reg_w32(s, REG_AQA, aqa);
-            // ASQ/ACQ must be PCI bus addresses inside the BAR1
-            // inbound window. On BCM7712 PCIe1, BAR1 covers PCI
-            // 0x10_0000_0000..0x20_0000_0000 and is REMAP'd to fabric
-            // 0x0 (ACCESS_EN + cpu_hi=0), so PCI addr
-            // `arm_arena_addr | 0x10_0000_0000` lands at our arena.
-            reg_w64(s, REG_ASQ, s.admin_sq | PCI_DMA_OFFSET);
-            reg_w64(s, REG_ACQ, s.admin_cq | PCI_DMA_OFFSET);
+            // ASQ/ACQ are bus addresses: the CPU address ORed with the
+            // machine's DMA window (`dma_offset`, see `PCI_DMA_OFFSET`).
+            reg_w64(s, REG_ASQ, s.admin_sq | s.dma_offset);
+            reg_w64(s, REG_ACQ, s.admin_cq | s.dma_offset);
             s.state = S_ENABLE;
             s.substate = 0;
             0
@@ -1391,10 +1400,8 @@ unsafe fn step_identify_controller(s: &mut NvmeState) -> i32 {
             write_volatile(sqe.add(3), 0);
             write_volatile(sqe.add(4), 0); // MPTR lo
             write_volatile(sqe.add(5), 0); // MPTR hi
-                                           // PRP1 = PCI bus address inside BAR1's inbound window.
-                                           // See PCI_DMA_OFFSET — BAR1 maps PCI 0x10_0000_0000+X to
-                                           // fabric/ARM addr X for X in low 4 GB.
-            let prp1_pci = s.identify_buf | PCI_DMA_OFFSET;
+                                           // PRP1 = the buffer's bus address (`dma_offset`).
+            let prp1_pci = s.identify_buf | s.dma_offset;
             write_volatile(sqe.add(6), prp1_pci as u32);
             write_volatile(sqe.add(7), (prp1_pci >> 32) as u32);
             write_volatile(sqe.add(8), 0); // PRP2
@@ -1476,7 +1483,7 @@ unsafe fn step_identify_namespace(s: &mut NvmeState) -> i32 {
                 OPC_IDENTIFY,
                 CID_IDENTIFY_NS,
                 s.namespace,
-                s.identify_ns_buf | PCI_DMA_OFFSET,
+                s.identify_ns_buf | s.dma_offset,
                 0x00,
                 0,
                 0,
@@ -1516,8 +1523,8 @@ unsafe fn step_identify_namespace(s: &mut NvmeState) -> i32 {
 
 /// Create I/O Completion Queue (QIDs 1..=io_q_count). CDW11 always
 /// sets PC=1; if MSI-X bring-up succeeded it also sets IEN=1 IV=0
-/// so the controller posts an MSI to the brcmstb MSI mux on each
-/// completion. Otherwise the CQ is polled in step_ready.
+/// so the controller posts an MSI to the platform's MSI controller on
+/// each completion. Otherwise the CQ is polled in step_ready.
 ///
 /// The cursor `bringup_qidx` steps 0 → io_q_count-1, re-entering
 /// this state once per queue via the transition in step_create_io_sq.
@@ -1566,7 +1573,7 @@ unsafe fn step_create_io_cq(s: &mut NvmeState) -> i32 {
                 OPC_CREATE_CQ,
                 cid,
                 0,
-                cq_phys | PCI_DMA_OFFSET,
+                cq_phys | s.dma_offset,
                 cdw10,
                 cdw11,
                 0,
@@ -1621,7 +1628,7 @@ unsafe fn step_create_io_sq(s: &mut NvmeState) -> i32 {
                 OPC_CREATE_SQ,
                 cid,
                 0,
-                sq_phys | PCI_DMA_OFFSET,
+                sq_phys | s.dma_offset,
                 cdw10,
                 cdw11,
                 0,
@@ -1677,7 +1684,7 @@ unsafe fn submit_io_write(
     dma_buf: u64,
 ) {
     let nlb = clamp_nlb(nlb);
-    let prp1_pci = dma_buf | PCI_DMA_OFFSET;
+    let prp1_pci = dma_buf | s.dma_offset;
     let cdw = [
         ((cid as u32) << 16) | (OPC_WRITE as u32),
         nsid,
@@ -1861,6 +1868,9 @@ pub mod sim {
         s.needs_flush = needs_flush;
         s.inflight_cap = MAX_INFLIGHT as u8;
         s.msix_event = -1;
+        // The controller model decodes PRPs against the Pi 5's window, the
+        // parameter's default.
+        s.dma_offset = DMA_WINDOW;
     }
 
     /// # Safety
@@ -1978,7 +1988,7 @@ unsafe fn step_read_lba0(s: &mut NvmeState) -> i32 {
 unsafe fn submit_io_read(s: &mut NvmeState, lba: u64, nlb: u16, cid: u16) {
     let nlb = clamp_nlb(nlb);
     let q = s.read_q as usize;
-    let prp1_pci = s.read_buf | PCI_DMA_OFFSET;
+    let prp1_pci = s.read_buf | s.dma_offset;
     let cdw = [
         ((cid as u32) << 16) | (OPC_READ as u32),
         s.namespace,
@@ -2717,10 +2727,11 @@ unsafe fn walk_pcie_caps(s: &mut NvmeState) {
 ///
 /// Sequence:
 /// 1. Create an event fd.
-/// 2. Bring up the brcmstb MSI mux on the configured GIC SPI.
-/// 3. Allocate a vector, receiving `(vec, target_addr, data)`.
-/// 4. Write those into MSI-X table entry 0 with `ctrl=0` (unmasked).
-/// 5. Flip bit 15 (MSI-X Enable) in the cap's Message Control.
+/// 2. Allocate a vector through the PCIE_DEVICE contract, receiving
+///    `(vec, target_addr, data)`; the platform brings up its MSI
+///    controller on the first call.
+/// 3. Write those into MSI-X table entry 0 with `ctrl=0` (unmasked).
+/// 4. Flip bit 15 (MSI-X Enable) in the cap's Message Control.
 unsafe fn enable_msix(s: &mut NvmeState) -> bool {
     if s.msix_enabled != 0 {
         return true;
@@ -3580,7 +3591,7 @@ unsafe fn v1_issue(s: &mut NvmeState, idx: usize) {
         return;
     }
     let cid = CID_V1_BASE + idx as u16;
-    let prp = slot.dma | PCI_DMA_OFFSET;
+    let prp = slot.dma | s.dma_offset;
     let (opc, prp1, cdw10, cdw11, cdw12) = match slot.op {
         blk::op::READ => (
             OPC_READ,
@@ -4258,11 +4269,11 @@ unsafe fn submit_bulk_op(
     }
 
     let base = slot * (MAX_BULK_PAGES as usize);
-    let prp1_pci = s.pager_write_bufs[base] | PCI_DMA_OFFSET;
+    let prp1_pci = s.pager_write_bufs[base] | s.dma_offset;
     let (prp2_lo, prp2_hi): (u32, u32) = if count == 1 {
         (0, 0)
     } else if count == 2 {
-        let p2 = s.pager_write_bufs[base + 1] | PCI_DMA_OFFSET;
+        let p2 = s.pager_write_bufs[base + 1] | s.dma_offset;
         (p2 as u32, (p2 >> 32) as u32)
     } else {
         // Build PRP-list with pages 1..count-1 (count-1 entries).
@@ -4270,12 +4281,12 @@ unsafe fn submit_bulk_op(
         let mut i: u32 = 1;
         let mut idx: usize = 0;
         while i < count {
-            let entry = s.pager_write_bufs[base + i as usize] | PCI_DMA_OFFSET;
+            let entry = s.pager_write_bufs[base + i as usize] | s.dma_offset;
             write_volatile(list.add(idx), entry);
             idx += 1;
             i += 1;
         }
-        let plist = s.bulk_prp_list_bufs[slot] | PCI_DMA_OFFSET;
+        let plist = s.bulk_prp_list_bufs[slot] | s.dma_offset;
         (plist as u32, (plist >> 32) as u32)
     };
 
@@ -4882,7 +4893,7 @@ unsafe fn dispatch_body(state: *mut u8, opcode: u32, arg: *mut u8, arg_len: usiz
         return idle;
     }
     pager_claim(s, CID_PAGER_READ);
-    let prp1_pci = s.pager_buf | PCI_DMA_OFFSET;
+    let prp1_pci = s.pager_buf | s.dma_offset;
     let cdw = [
         ((CID_PAGER_READ as u32) << 16) | (OPC_READ as u32),
         s.namespace,
@@ -4931,6 +4942,8 @@ unsafe fn dispatch_body(state: *mut u8, opcode: u32, arg: *mut u8, arg_len: usiz
 pub extern "C" fn module_deferred_ready() -> u32 {
     1
 }
+
+declare_module_state_bytes!(NvmeState);
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_state_size"]

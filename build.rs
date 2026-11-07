@@ -1267,6 +1267,13 @@ fn emit_uefi(out: &Path) {
     );
     println!("cargo:rerun-if-changed=linker/memory-uefi.x");
     println!("cargo:rerun-if-changed={path}");
+
+    // `arch::aarch64::isolation` compiles against the blocks a device window
+    // may be granted in. This runtime isolates no module and ACPI names the
+    // machine only at boot, so the target declares none.
+    let mut generated = String::new();
+    emit_device_ranges(&mut generated, None);
+    fs::write(out.join("isolation_generated.rs"), generated).unwrap();
 }
 
 fn emit_bcm2712(out: &Path) {

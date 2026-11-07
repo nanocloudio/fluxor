@@ -1068,7 +1068,49 @@ fn generate_config_impl(
         .map_err(Error::Config)?;
     println!("{summary}");
 
+    // Boot parameters (FXBO), from the optional top-level `boot:` map.
+    if let Some(params) = boot_params(config)? {
+        result.extend_from_slice(&crate::capacity::encode_boot_section(&params));
+    }
+
     Ok(result)
+}
+
+/// The top-level `boot:` map: how a machine behaves on a test rig. `None`
+/// without one.
+pub(super) fn boot_params(config: &Value) -> Result<Option<crate::capacity::BootParams>> {
+    let Some(boot) = config.get("boot") else {
+        return Ok(None);
+    };
+    let obj = boot
+        .as_object()
+        .ok_or_else(|| Error::Config("boot: must be a map".into()))?;
+    let mut p = crate::capacity::BootParams::default();
+    for (key, value) in obj {
+        let seconds = || {
+            value
+                .as_u64()
+                .and_then(|n| u32::try_from(n).ok())
+                .ok_or_else(|| Error::Config(format!("boot.{key}: must be a number of seconds")))
+        };
+        match key.as_str() {
+            "fault_probe" => {
+                p.fault_probe = value
+                    .as_bool()
+                    .ok_or_else(|| Error::Config("boot.fault_probe: must be a bool".into()))?
+            }
+            "lockup_probe" => {
+                p.lockup_probe = value
+                    .as_bool()
+                    .ok_or_else(|| Error::Config("boot.lockup_probe: must be a bool".into()))?
+            }
+            "summary_every_s" => p.summary_every_s = seconds()?,
+            "summary_for_s" => p.summary_for_s = seconds()?,
+            "max_uptime_s" => p.max_uptime_s = seconds()?,
+            other => return Err(Error::Config(format!("boot: unknown key '{other}'"))),
+        }
+    }
+    Ok(Some(p))
 }
 
 /// Build the FXEV capacity-envelope section from the top-level `capacity:`

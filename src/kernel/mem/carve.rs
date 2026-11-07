@@ -6,9 +6,12 @@
 //! own static. The platform hands this module one zone, and the arithmetic of
 //! splitting it lives in `kernel::mem::pool_plan`:
 //!
-//! - **bcm2712**: the DRAM the device tree describes above the boot image
-//!   (`platform/bcm2712/memmap.rs`). Carves come off its top and the module
-//!   state arena (`kernel::module::loader`) owns the rest from the bottom up.
+//! - **aarch64 bare metal**: one stretch of DRAM the platform reads from the
+//!   machine at boot — on bcm2712 what the device tree describes above the
+//!   boot image (`platform/bcm2712/memmap.rs`), on uefi the largest free
+//!   stretch of the firmware's memory map (`platform/uefi.rs`). Carves come
+//!   off its top and the module state arena (`kernel::module::loader`) owns
+//!   the rest from the bottom up.
 //!   The boundary between them is the carve floor: a carve that would reach
 //!   memory the state arena has handed out is refused, and the arena's
 //!   capacity is whatever the carves have left it.
@@ -23,7 +26,7 @@
 //!   forgets every table carved for the previous graph (`Raw::revalidate` in
 //!   `kernel::mem::table`).
 //! - **Permanent carves** ([`carve`]) back the boot-sized tables, each one
-//!   zeroed as it is carved, never the zone wholesale. On bcm2712 a table
+//!   zeroed as it is carved, never the zone wholesale. On aarch64 a table
 //!   that moves to a larger block hands its old one back ([`retire`]) at the
 //!   point its reservation proves no core can still read it (see
 //!   `Table::reserve` in `kernel::mem::table`); the block joins the zone's
@@ -33,7 +36,7 @@
 //!   previous graph's tables held. On RP carves last until the next plan,
 //!   which frees the whole pool.
 //! - **Transient blocks** ([`take`] / [`give`]) back the graph builder's
-//!   scratch and the boot config's parse lists on bcm2712, which live while a
+//!   scratch and the boot config's parse lists on aarch64, which live while a
 //!   graph is prepared. A block given back is kept on a short recycle list
 //!   and handed out again to the next ask it fits, so a rebuild reuses the
 //!   last one's memory instead of carving more. A recycled block is not
@@ -50,7 +53,7 @@ use portable_atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 /// wiring scratches, the fan scan); a block given back when the list is full
 /// replaces the smallest, which is leaked and counted.
 pub const RECYCLE_SLOTS: usize = 16;
-/// Extents the bcm2712 zone's free list holds: the blocks tables moved out
+/// Extents the aarch64 zone's free list holds: the blocks tables moved out
 /// of, coalesced. One graph's tables are carved one below another, so the
 /// blocks a rebuild leaves behind merge into a few; a block handed back to a
 /// full list that joins none replaces the smallest extent when it is larger,
@@ -58,7 +61,7 @@ pub const RECYCLE_SLOTS: usize = 16;
 pub const FREE_EXTENTS: usize = 64;
 /// Granularity of a fresh transient block, so a list that grows by one slot
 /// at a time does not carve once per slot.
-#[cfg(feature = "chip-bcm2712")]
+#[cfg(feature = "aarch64-metal")]
 const TRANSIENT_GRAIN: usize = 4096;
 
 static LOCK: AtomicBool = AtomicBool::new(false);
@@ -91,12 +94,12 @@ struct Pool([u8; crate::kernel::config::KERNEL_POOL_SIZE]);
 static mut POOL: Pool = Pool([0; crate::kernel::config::KERNEL_POOL_SIZE]);
 
 /// The recycle list, touched only under `LOCK`.
-#[cfg(feature = "chip-bcm2712")]
+#[cfg(feature = "aarch64-metal")]
 struct Recycle {
     ptr: [usize; RECYCLE_SLOTS],
     size: [usize; RECYCLE_SLOTS],
 }
-#[cfg(feature = "chip-bcm2712")]
+#[cfg(feature = "aarch64-metal")]
 static mut RECYCLE: Recycle = Recycle {
     ptr: [0; RECYCLE_SLOTS],
     size: [0; RECYCLE_SLOTS],
@@ -104,7 +107,7 @@ static mut RECYCLE: Recycle = Recycle {
 
 /// The zone's free extents: blocks tables moved out of ([`retire`]), touched
 /// only under `LOCK`.
-#[cfg(feature = "chip-bcm2712")]
+#[cfg(feature = "aarch64-metal")]
 static mut FREE: super::pool_plan::FreeExtents<FREE_EXTENTS> = super::pool_plan::FreeExtents::new();
 
 struct Guard;
@@ -179,22 +182,22 @@ pub fn stats() -> (usize, usize, usize, usize) {
 }
 
 /// Bytes the zone's free extents hold for reuse: blocks tables moved out of
-/// that no carve has taken again. Always 0 off bcm2712.
+/// that no carve has taken again. Always 0 on RP.
 pub fn reusable() -> usize {
-    #[cfg(feature = "chip-bcm2712")]
+    #[cfg(feature = "aarch64-metal")]
     {
         let _g = Guard::acquire();
         // SAFETY: the free extents are touched only under the lock.
         unsafe { (*core::ptr::addr_of!(FREE)).bytes() }
     }
-    #[cfg(not(feature = "chip-bcm2712"))]
+    #[cfg(not(feature = "aarch64-metal"))]
     {
         0
     }
 }
 
 /// Take `bytes` at `align` from the zone's free extents, under the lock.
-#[cfg(feature = "chip-bcm2712")]
+#[cfg(feature = "aarch64-metal")]
 fn take_free(bytes: usize, align: usize) -> Option<usize> {
     // SAFETY: the free extents are touched only under the lock, which the
     // caller holds.
@@ -214,7 +217,7 @@ fn take_free(bytes: usize, align: usize) -> Option<usize> {
 /// that held it has published its new block, and every reader that could
 /// have loaded the old pointer has finished with it (`Table::reserve`'s
 /// contract, proven where it is called).
-#[cfg(feature = "chip-bcm2712")]
+#[cfg(feature = "aarch64-metal")]
 pub unsafe fn retire(ptr: *mut u8, bytes: usize) {
     if ptr.is_null() || bytes == 0 {
         return;
@@ -252,10 +255,10 @@ pub fn carve(bytes: usize, align: usize) -> Option<*mut u8> {
     }
     let at = {
         let _g = Guard::acquire();
-        // bcm2712: a block a table moved out of first, then the floor.
-        #[cfg(feature = "chip-bcm2712")]
+        // aarch64: a block a table moved out of first, then the floor.
+        #[cfg(feature = "aarch64-metal")]
         let reused = take_free(bytes, align);
-        #[cfg(not(feature = "chip-bcm2712"))]
+        #[cfg(not(feature = "aarch64-metal"))]
         let reused = None;
         match reused {
             Some(at) => at,
@@ -271,7 +274,7 @@ pub fn carve(bytes: usize, align: usize) -> Option<*mut u8> {
 
 /// A transient block of at least `bytes` at `align`: `(ptr, size)`. A recycled
 /// block is handed out as it was given back, unzeroed; a fresh one is zeroed.
-#[cfg(feature = "chip-bcm2712")]
+#[cfg(feature = "aarch64-metal")]
 pub fn take(bytes: usize, align: usize) -> Option<(*mut u8, usize)> {
     let align = align.max(16);
     {
@@ -311,7 +314,7 @@ pub fn take(bytes: usize, align: usize) -> Option<(*mut u8, usize)> {
 /// # Safety
 /// `(ptr, size)` is exactly what `take` returned, and nothing references it
 /// any more.
-#[cfg(feature = "chip-bcm2712")]
+#[cfg(feature = "aarch64-metal")]
 pub unsafe fn give(ptr: *mut u8, size: usize) {
     if ptr.is_null() || size == 0 {
         return;

@@ -16,7 +16,8 @@ pub static CORE_ID_SHIFT: AtomicU32 = AtomicU32::new(8);
 /// Which MPIDR affinity level holds the core number on this machine: the
 /// shift of that field (`8` for Aff1, as on the Pi 5; `0` for Aff0, as
 /// QEMU's `virt` machine numbers its cores). Set by the platform at boot,
-/// before the MMU is enabled.
+/// before any reader runs: bcm2712 before its MMU is on, uefi once ACPI has
+/// listed the cores and before its timer or a secondary starts.
 pub fn configure_core_id(mpidr_shift: u32) {
     CORE_ID_SHIFT.store(mpidr_shift, Ordering::Relaxed);
 }

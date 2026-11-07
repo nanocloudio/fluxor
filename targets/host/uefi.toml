@@ -27,6 +27,27 @@ module_target = "aarch64-unknown-none"
 loader_target = "aarch64-unknown-uefi"
 loader_path = "EFI/BOOT/BOOTAA64.EFI"
 
+[kernel]
+# The boot stack `linker/memory-uefi.x` links, above an unmapped guard page. A
+# module steps on it.
+kernel_stack_kb = 1024
+# The kernel's own frames beneath a module's: the scheduler's and whatever a
+# syscall from the module runs.
+kernel_stack_reserve_kb = 256
+# The pool every loaded module's state comes from: `STATE_ARENA_SIZE` in
+# `src/kernel/config.rs::profile_uefi`. The kernel's arena is what the firmware's
+# map leaves it, which on the smallest instance this targets is at least this.
+state_arena_kb = 524288
+
+[isolation]
+# The kernel runs under an MMU with a guard page below each core's stack. Every
+# module steps privileged under the step guard: this runtime compiles no
+# backend for `contained` or `isolated`, so a graph that asks for either is
+# refused at build.
+levels = []
+region_model = "pages"
+stack_bound = "guard-page"
+
 # No GPIO and no fixed peripherals: whatever the machine has, ACPI says.
 [gpio]
 max_pin = 0
@@ -42,13 +63,14 @@ pio_state_machines = 0
 dma_channels = 0
 
 # Where the kernel image runs: its link address and the RAM it uses from
-# there (the image, BSS on its 16 MiB boundary, the boot stack). The loader
-# reserves exactly this span from the firmware's map and refuses a busy page
-# in it, naming what holds it and the free spans that would do instead. On
+# there (the image, BSS on its 16 MiB boundary with the kernel's static tables
+# and buffer arena, the boot stack). The loader reserves exactly this span from
+# the firmware's map and refuses a busy page in it, naming what holds it and
+# the free spans that would do instead. On
 # QEMU `virt` with AAVMF the firmware's boot-services data sits at 1 GiB +
 # 64 MiB, so the span starts above it.
 [memory]
 ram_base = "0x48000000"
-ram_size = "0x02000000"
+ram_size = "0x08000000"
 flash_base = "0x00000000"
 flash_size = "0x00000000"

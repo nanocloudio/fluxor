@@ -1,5 +1,5 @@
 version = "1.0.0"
-hardware_targets = ["rp2350", "bcm2712", "linux"]
+hardware_targets = ["rp2350", "bcm2712", "linux", "uefi"]
 # Counts connections as they arrive; a half-closed connection's linger
 # (`linger_ms`) is measured on the wall clock.
 timer_class = "wall_clock"

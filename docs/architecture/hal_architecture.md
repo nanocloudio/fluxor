@@ -82,18 +82,18 @@ Each silicon target has its own HAL implementation under `src/platform/`:
 | RP2350 | `src/platform/rp.rs` | Cortex-M33; synchronous step loop |
 | BCM2712 | `src/platform/bcm2712.rs` | Synchronous polling (Cortex-A76, EL1) |
 | Pi 5 | `src/platform/bcm2712.rs` (board overlay) | Synchronous polling |
-| UEFI | `src/platform/uefi.rs` | Entered from the UEFI loader with `BootInfo`; aarch64, EL1 or EL2 |
+| UEFI | `src/platform/uefi.rs` | Entered from the UEFI loader with `BootInfo` at EL1 or EL2 (aarch64); one execution domain on the boot core, a pass per tick |
 
 The two RP families share `rp.rs` because both run on a Cortex-M core with
-the same peripheral families. The two bare-metal aarch64 boards share
-`bcm2712.rs`: the Pi 5 (`board-pi5`) is the BCM2712 itself, and the QEMU
-`virt` machine, the chip's default board, is a Cortex-A76 with a GICv2, a
-PL011 and virtio-mmio devices, whose differences are board constants.
+the same peripheral families. The two bcm2712 boards share `bcm2712.rs`:
+the Pi 5 (`board-pi5`) is the BCM2712 itself, and the QEMU `virt` machine,
+the chip's default board, is a Cortex-A76 with a GICv2, a PL011 and
+virtio-mmio devices, whose differences are board constants.
 
 What is the processor's rather than the chip's lives in `src/arch/`: on
-AArch64, the exception vectors and IRQ dispatch, the GICv2 driver, the
-generic timer, core numbering and the EL2 → EL1 drop, PSCI, the boot-time
-identity map and EL0 module isolation. None of it knows which machine it
+AArch64, the exception vectors and IRQ dispatch, the GICv2 and GICv3 driver,
+device register access, the generic timer, core numbering and the EL2 → EL1
+drop, PSCI, the boot-time identity map and EL0 module isolation. None of it knows which machine it
 runs on. The facts that differ between machines — where the interrupt
 controller is, which PPI the timer raises, physical or virtual counter,
 `smc` or `hvc` to the firmware, which MPIDR field numbers the cores, what
@@ -101,8 +101,13 @@ each gigabyte of the identity map holds, where a fault dump may be written,
 which gigabytes a module table must carry for the kernel — are values the
 platform hands over at boot through each module's `configure` and `set_*`
 functions, before the first interrupt; `bcm2712.rs` passes per-board
-constants for the Pi 5 and QEMU `virt`. The UEFI runtime (`uefi.rs`) uses
-none of this layer.
+constants for the Pi 5 and QEMU `virt`. The UEFI runtime (`uefi.rs`) uses the
+same layer and hands it what the machine's ACPI tables state: the GIC's
+version and addresses, the timer's interrupt, the PSCI conduit. Its own
+`uefi/` modules read those tables (`acpi.rs`), enumerate PCI through the
+ECAM window (`pci.rs`), route MSIs through a GICv3's ITS (`its.rs`) or a
+GICv2m frame, bring up the other cores (`smp.rs`) and serve driver modules
+device registers, DMA memory and MSI vectors (`devices.rs`).
 
 ### RP boot and runtime
 
@@ -464,11 +469,11 @@ with the union of every supported peripheral.
 | Loader | `src/kernel/module/loader.rs` |
 | Scheduler | `src/kernel/exec/scheduler/` |
 | HalOps table | `src/kernel/sys/hal.rs` |
-| Chip abstraction | `src/platform/{rp,bcm2712,linux,wasm}/chip.rs` (RP includes the generated `chip_generated.rs`) |
+| Chip abstraction | `src/platform/{rp,bcm2712,linux,wasm,uefi}/chip.rs` (RP includes the generated `chip_generated.rs`) |
 | RP HAL | `src/platform/rp.rs`, `src/platform/rp/` |
 | BCM2712 HAL | `src/platform/bcm2712.rs`, `src/platform/bcm2712/` |
-| UEFI kernel entry | `src/platform/uefi.rs`; the loader is `crates/fluxor-uefi-loader`, the handoff `contracts/src/boot.rs` |
-| AArch64 architecture | `src/arch/aarch64/` — exception vectors and IRQ dispatch, GICv2, generic timer, cores and the EL2 drop, PSCI, the boot identity map, EL0 isolation; each configured by the platform at boot |
+| UEFI HAL | `src/platform/uefi.rs`, `src/platform/uefi/`; the loader is `crates/fluxor-uefi-loader`, the handoff `contracts/src/boot.rs` |
+| AArch64 architecture | `src/arch/aarch64/` — exception vectors and IRQ dispatch, GICv2 and GICv3, generic timer, cores and the EL2 drop, PSCI, the boot identity map, EL0 isolation; each configured by the platform at boot |
 | Cortex-M architecture | `src/arch/` — vector table, NVIC, instruction primitives |
 | Silicon definitions | `targets/silicon/*.toml` |
 | Board definitions | `targets/boards/*.toml` |
@@ -500,14 +505,20 @@ else:
    go through `crate::kernel::config` — the ONLY kernel↔`platform::chip`
    reference — so this seam is a single audited surface.
 
-The kernel branches on capability, never chip identity. Chip-conditional
-behaviour is expressed as capability features that a chip feature turns on:
-`kernel-vm` (page-table VM + EL0 isolation), `kernel-mpu` (MPU isolation),
-`smp` (multi-core execution domains), `dtb` (device-tree boot).
-`chip-bcm2712` provides `kernel-vm`, `smp` and `dtb`, the only chip that
-does; the RP chips provide `kernel-mpu`. A chip with an MMU and one core
-(or an MPU and several) turns on only the capabilities it has, so no chip
-name appears in `src/kernel`.
+The kernel branches on capability, not chip identity. Platform-conditional
+behaviour is expressed as capability features that a chip or host feature
+turns on: `kernel-vm` (page-table VM, on which EL0 isolation is built),
+`kernel-mpu` (MPU isolation), `smp` (multi-core execution domains), `dtb`
+(device-tree boot), and `aarch64-metal`, what every aarch64 kernel with no
+host OS under it shares (`kernel-vm`, kernel tables carved from the
+machine's DRAM, the state arena's zeroed frontier, the multi-owner kernel).
+`chip-bcm2712` provides `aarch64-metal`, `smp` and `dtb`; `host-uefi`
+provides `aarch64-metal` alone, so a uefi kernel runs one execution domain;
+the RP chips provide `kernel-mpu`. A platform name appears in `src/kernel`
+only for what is that platform's own: its capacity profile
+(`kernel::config`), its runtime bit (`loader::OWN_RUNTIME_BIT`), the bcm2712
+control-plane store's tables and memory-map report, and OTA RAM staging,
+which bcm2712 and Linux implement.
 
 Anything a kernel file wants from a platform beyond these two seams is a
 boundary bug: add a `HalOps` op (behaviour), a `chip` constant (fact via

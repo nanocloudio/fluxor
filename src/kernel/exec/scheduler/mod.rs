@@ -79,8 +79,9 @@ pub(crate) const BUFFER_GROUPS: usize = rings::buffer_groups(MAX_GRAPH_EDGES);
 /// static profiles it is the compiled channel count.
 pub const MAX_CHANNELS: usize = MAX_GRAPH_EDGES;
 
-/// A scheduler table with one slot per module: boot-sized on Linux, bcm2712
-/// and RP, the profile's static array on wasm (`kernel::mem::table`).
+/// A scheduler table with one slot per module: boot-sized on Linux, aarch64
+/// bare metal and RP, the profile's static array on wasm
+/// (`kernel::mem::table`).
 pub type ModTable<T> = crate::kernel::mem::table::Table<T, MAX_MODULES>;
 /// A scheduler table with one slot per edge.
 pub type EdgeTable<T> = crate::kernel::mem::table::Table<T, MAX_CHANNELS>;
@@ -90,14 +91,14 @@ pub type EdgeTable<T> = crate::kernel::mem::table::Table<T, MAX_CHANNELS>;
 /// static profiles it is the compiled table size.
 #[inline]
 pub fn module_slots() -> usize {
-    #[cfg(any(feature = "host-linux", feature = "chip-bcm2712", feature = "rp"))]
+    #[cfg(any(feature = "host-linux", feature = "aarch64-metal", feature = "rp"))]
     {
         // SAFETY: a length read of the scheduler's module table; it changes
         // only while a graph is prepared or a subgraph is added, on the
         // scheduler thread.
         unsafe { (&*core::ptr::addr_of!(SCHED)).modules.len() }
     }
-    #[cfg(not(any(feature = "host-linux", feature = "chip-bcm2712", feature = "rp")))]
+    #[cfg(not(any(feature = "host-linux", feature = "aarch64-metal", feature = "rp")))]
     {
         MAX_MODULES
     }
@@ -106,12 +107,12 @@ pub fn module_slots() -> usize {
 /// Edge slots live now (see [`module_slots`]).
 #[inline]
 pub fn edge_slots() -> usize {
-    #[cfg(any(feature = "host-linux", feature = "chip-bcm2712", feature = "rp"))]
+    #[cfg(any(feature = "host-linux", feature = "aarch64-metal", feature = "rp"))]
     {
         // SAFETY: as `module_slots`.
         unsafe { (&*core::ptr::addr_of!(SCHED)).edges.len() }
     }
-    #[cfg(not(any(feature = "host-linux", feature = "chip-bcm2712", feature = "rp")))]
+    #[cfg(not(any(feature = "host-linux", feature = "aarch64-metal", feature = "rp")))]
     {
         MAX_CHANNELS
     }

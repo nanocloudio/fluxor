@@ -1,5 +1,5 @@
 version = "1.0.0"
-hardware_targets = ["bcm2712", "rp2350"]
+hardware_targets = ["bcm2712", "rp2350", "uefi"]
 # Cadence-independent SYN/connection filter pass-through; no tick-based timing.
 # Explicit attestation to run on a mechanism-(b) domain: an absent
 # declaration is treated as unattested and is blocked there.

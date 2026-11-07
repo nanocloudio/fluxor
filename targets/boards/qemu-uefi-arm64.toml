@@ -11,11 +11,20 @@ id = "qemu-uefi-arm64"
 host = "uefi"
 description = "QEMU aarch64 virt machine with UEFI firmware"
 
+# `board-qemu-uefi` scales the step deadline to an emulated machine; the image is
+# otherwise the one a cloud instance boots.
+[build]
+cargo_features = ["board-qemu-uefi"]
+
 [rig]
 artifact = "uefi_disk"
 deploy = ["deploy.qemu_disk"]
 console = ["console.qemu_serial"]
 telemetry = ["telemetry.qemu_virtio"]
-observe = ["observe.console_regex"]
+observe = ["observe.console_regex", "observe.tls_load", "observe.quic_mux"]
 power = ["power.cycle", "power.on", "power.off"]
 default_timeout_s = 60
+
+[platform.net]
+phy = "ethernet"
+nic = "virtio"

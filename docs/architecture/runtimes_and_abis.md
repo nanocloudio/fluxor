@@ -33,7 +33,7 @@ Source: `tools/src/runtime_abi.rs` (the table),
 | `macos` | `0x20` | `aarch64`, `x86_64` | name reserved |
 | `windows` | `0x40` | `aarch64`, `x86_64` | name reserved |
 | `esp32` | `0x80` | `xtensa-lx6` | target validation only |
-| `uefi` | `0x100` | `aarch64`, `x86_64` | kernel entry built on aarch64 |
+| `uefi` | `0x100` | `aarch64`, `x86_64` | built on aarch64 |
 
 `uefi` is bare metal on a machine its firmware describes — a cloud
 instance, or QEMU with UEFI firmware. The fluxor loader
@@ -44,10 +44,28 @@ address its header names and hands it a `BootInfo`
 firmware service and no knowledge of UEFI. As with `linux`, one host
 target (`targets/host/uefi.toml`, built for aarch64) stands for the
 runtime, and boards stand on it with `[board] host = "uefi"`
-(`qemu-uefi-arm64`). `fluxor build` for a `uefi` target writes, beside
-the packed image, the disk the machine boots: GPT with one FAT32 EFI
-system partition holding the loader at `EFI/BOOT/BOOTAA64.EFI` and the
+(`qemu-uefi-arm64`, `ec2-arm64`). `fluxor build` for a `uefi` target
+writes, beside the packed image, the disk the machine boots: GPT with one
+FAT32 EFI system partition holding the loader at `EFI/BOOT/BOOTAA64.EFI` and the
 image at `fluxor/fluxor.img` (`tools/src/uefi_disk.rs`).
+
+The kernel maps the machine from the firmware's memory map, reads its ACPI
+tables (`src/platform/uefi/acpi.rs`), starts its interrupt controller, timer
+and cores, enumerates PCI, and runs the graph on the boot core, one pass per
+tick. It reports each stage on the console UART as it reaches it —
+`[boot] stage=kernel_entry`, then `mmu`, `acpi`, `irq`, `timer`,
+`step_guard`, `smp`, `pcie` and `graph` — and repeats a `[boot] stages=`
+summary, because a cloud console can connect after the boot has finished.
+On this runtime a graph's optional `boot:` map sets how a machine behaves on
+a test rig:
+
+| Key | Meaning |
+|---|---|
+| `summary_every_s` | How often to repeat the summary, 10 by default. |
+| `summary_for_s` | For how long; 0, the default, is for as long as it runs. |
+| `max_uptime_s` | Power off after this long, by PSCI and the counter alone. |
+| `fault_probe` | Fault on purpose, to test the fault report. |
+| `lockup_probe` | Stop one secondary core taking interrupts, to test the lockup detector. |
 
 ## Module ABIs
 

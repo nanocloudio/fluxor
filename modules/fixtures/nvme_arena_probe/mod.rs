@@ -305,6 +305,8 @@ pub extern "C" fn module_deferred_ready() -> u32 {
     1
 }
 
+declare_module_state_bytes!(NapState);
+
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_state_size"]
 pub extern "C" fn module_state_size() -> usize {

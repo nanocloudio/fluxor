@@ -2960,6 +2960,34 @@ unsafe fn tcp_module_step(s: &mut TlsState) -> i32 {
                     s.sessions[si as usize].reset();
                     continue;
                 }
+                // An accepted connection whose handshake had not reached its
+                // consumer: the consumer never learned the id, so the close
+                // is not forwarded, and this module, the only one that knows
+                // the id, answers the transport itself (net_proto's release
+                // rule). Unanswered, the transport holds the id for the grace
+                // interval, and a peer that closes straight after its
+                // handshake would fill the transport's table.
+                if si >= 0
+                    && !own_close
+                    && s.sessions[si as usize].held_msg_type == NET_MSG_ACCEPTED
+                {
+                    s.free_peer_closed = s.free_peer_closed.wrapping_add(1);
+                    continuity_session_ending(
+                        s,
+                        si as usize,
+                        abi::contracts::net::session_ctrl::END_TRANSPORT,
+                    );
+                    s.sessions[si as usize].reset();
+                    let _ = tls_write_or_count(
+                        s,
+                        s.cipher_out,
+                        NET_CMD_CLOSE,
+                        conn_id,
+                        core::ptr::null(),
+                        0,
+                    );
+                    continue;
+                }
                 if si >= 0 {
                     s.free_peer_closed = s.free_peer_closed.wrapping_add(1);
                     continuity_session_ending(

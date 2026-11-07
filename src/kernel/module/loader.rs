@@ -80,11 +80,11 @@ pub const MAX_MODULES_BLOB_SIZE: usize = 8 * 1024 * 1024;
 /// list, else a bump. Reset wholesale at a rebuild.
 ///
 /// Channel buffers come from a separate arena (`buffer_pool.rs`), so this
-/// whole budget is module state and heaps. On bcm2712 the arena is sized at
-/// boot from the device tree instead, and on RP each graph's plan gives it
-/// what the static pool holds beside the graph's tables and buffer arena
-/// ([`arena_cap`]).
-#[cfg(not(any(feature = "chip-bcm2712", feature = "rp")))]
+/// whole budget is module state and heaps. On aarch64 bare metal the arena is
+/// sized at boot from the machine's DRAM instead, and on RP each graph's plan
+/// gives it what the static pool holds beside the graph's tables and buffer
+/// arena ([`arena_cap`]).
+#[cfg(not(any(feature = "aarch64-metal", feature = "rp")))]
 const STATE_ARENA_SIZE: usize = crate::kernel::config::STATE_ARENA_SIZE;
 // Module params are never copied into a loader buffer: a module, pending or
 // not, holds a pointer to its params in the resident config blob (or the
@@ -646,11 +646,11 @@ pub fn pic_irq_disabled_count() -> u32 {
 /// pointers (ARM requires aligned access for struct fields like pointers
 /// and u32).
 ///
-/// Zeroing is kept off the step path. On the bcm2712
-/// kernel the pool is no static at all: it is the DRAM zone the device tree
-/// describes above the boot image (`platform/bcm2712/memmap.rs`), less the
-/// kernel tables carved from its top (`kernel::mem::carve`), installed at boot
-/// by [`install_arena`]. That memory is dirty — nothing zeroes it at boot — so
+/// Zeroing is kept off the step path. On aarch64 bare metal the pool is no
+/// static at all: it is the DRAM zone the platform reads from the machine at
+/// boot (`platform/bcm2712/memmap.rs`, `platform/uefi.rs`), less the kernel
+/// tables carved from its top (`kernel::mem::carve`), installed at boot by
+/// [`install_arena`]. That memory is dirty — nothing zeroes it at boot — so
 /// the arena keeps a **zeroed frontier** ahead of the memory it has handed
 /// out, advanced in the execution domains' slack ([`zero_in_slack`]), and
 /// returns freed regions to zero there too before they are reused: an
@@ -661,51 +661,52 @@ pub fn pic_irq_disabled_count() -> u32 {
 /// kernel's static pool the graph's plan leaves it (`kernel::mem::carve::
 /// place_arenas`), zero-initialised `.bss` at power-on; what a previous plan
 /// gave the tables or the buffer arena is below [`CLEAN_MARK`] from then on
-/// ([`install_planned_arena`]). On Linux a freed region is returned to zero when it is freed
-/// (`rezero`: `madvise(MADV_DONTNEED)` on its whole pages, which refault as
-/// zero, and a memset of its partial edge pages), as is everything below the
-/// mark at a reset, so no allocation ever zeroes and no step pays for it.
+/// ([`install_planned_arena`]). On Linux a freed region is returned to zero
+/// when it is freed (`rezero`: `madvise(MADV_DONTNEED)` on its whole pages,
+/// which refault as zero, and a memset of its partial edge pages), as is
+/// everything below the mark at a reset, so no allocation ever zeroes and no
+/// step pays for it.
 /// Page-aligned on Linux, so `rezero` releases whole pages of the arena only.
 #[cfg(feature = "host-linux")]
 #[repr(C, align(4096))]
 struct AlignedArena([u8; STATE_ARENA_SIZE]);
-#[cfg(not(any(feature = "chip-bcm2712", feature = "host-linux", feature = "rp")))]
+#[cfg(not(any(feature = "aarch64-metal", feature = "host-linux", feature = "rp")))]
 #[repr(C, align(4))]
 struct AlignedArena([u8; STATE_ARENA_SIZE]);
-#[cfg(not(any(feature = "chip-bcm2712", feature = "rp")))]
+#[cfg(not(any(feature = "aarch64-metal", feature = "rp")))]
 static mut STATE_ARENA: AlignedArena = AlignedArena([0; STATE_ARENA_SIZE]);
-/// The bcm2712 and RP arena's base and capacity: the zone [`install_arena`]
+/// The aarch64 and RP arena's base and capacity: the zone [`install_arena`]
 /// (or the plan, [`install_planned_arena`]) gave it, shrunk from the top as
 /// tables are carved ([`cede_arena_above`]). Zero until installed, and an
 /// uninstalled arena refuses every allocation.
-#[cfg(any(feature = "chip-bcm2712", feature = "rp"))]
+#[cfg(any(feature = "aarch64-metal", feature = "rp"))]
 static ARENA_BASE: portable_atomic::AtomicUsize = portable_atomic::AtomicUsize::new(0);
-#[cfg(any(feature = "chip-bcm2712", feature = "rp"))]
+#[cfg(any(feature = "aarch64-metal", feature = "rp"))]
 static ARENA_CAP: portable_atomic::AtomicUsize = portable_atomic::AtomicUsize::new(0);
 
 /// The arena's first byte.
 #[inline]
 fn arena_ptr() -> *mut u8 {
-    #[cfg(any(feature = "chip-bcm2712", feature = "rp"))]
+    #[cfg(any(feature = "aarch64-metal", feature = "rp"))]
     {
         ARENA_BASE.load(portable_atomic::Ordering::Acquire) as *mut u8
     }
-    #[cfg(not(any(feature = "chip-bcm2712", feature = "rp")))]
+    #[cfg(not(any(feature = "aarch64-metal", feature = "rp")))]
     {
         core::ptr::addr_of_mut!(STATE_ARENA).cast::<u8>()
     }
 }
 
-/// The arena's capacity in bytes: the compiled size, on bcm2712 what the
-/// device tree's zone holds after the carves, on RP what the graph's plan
+/// The arena's capacity in bytes: the compiled size, on aarch64 what the
+/// machine's DRAM zone holds after the carves, on RP what the graph's plan
 /// left of the static pool.
 #[inline]
 pub fn arena_cap() -> usize {
-    #[cfg(any(feature = "chip-bcm2712", feature = "rp"))]
+    #[cfg(any(feature = "aarch64-metal", feature = "rp"))]
     {
         ARENA_CAP.load(portable_atomic::Ordering::Acquire)
     }
-    #[cfg(not(any(feature = "chip-bcm2712", feature = "rp")))]
+    #[cfg(not(any(feature = "aarch64-metal", feature = "rp")))]
     {
         STATE_ARENA_SIZE
     }
@@ -717,17 +718,17 @@ pub fn arena_cap() -> usize {
 static mut STATE_ARENA_OFFSET: usize = 0;
 /// The highest arena offset ever handed out. Monotone: unlike the bump
 /// offset it never retreats (on a top-region free) and survives
-/// `reset_state_arena`. On every profile but bcm2712 the arena above it has
+/// `reset_state_arena`. On every profile but aarch64's the arena above it has
 /// never been written, so it is zero. Touched under `STATE_LOCK`.
 static mut CLEAN_MARK: usize = 0;
 
 /// The arena's freed memory is returned to zero before it is reused (when it
-/// is freed on Linux, in a domain's slack on bcm2712), so nothing on the free
+/// is freed on Linux, in a domain's slack on aarch64), so nothing on the free
 /// list is dirty and no allocation from it zeroes.
-const ZERO_ON_FREE: bool = cfg!(any(feature = "host-linux", feature = "chip-bcm2712"));
+const ZERO_ON_FREE: bool = cfg!(any(feature = "host-linux", feature = "aarch64-metal"));
 /// The arena starts zeroed, so memory above `CLEAN_MARK` needs no zeroing
-/// (every arena but bcm2712's, which keeps a zeroed frontier instead).
-#[cfg(not(feature = "chip-bcm2712"))]
+/// (every arena but aarch64's, which keeps a zeroed frontier instead).
+#[cfg(not(feature = "aarch64-metal"))]
 const ZEROED_ARENA: bool = true;
 
 /// The host page size, read once.
@@ -787,15 +788,15 @@ unsafe fn rezero(ptr: *mut u8, len: usize) {
     }
 }
 /// Free-list entry describing a reusable hole: an offset from the arena's
-/// base and a length, both `usize` — the bcm2712 arena spans the device
-/// tree's whole zone, past 4 GiB on a large board.
+/// base and a length, both `usize` — the aarch64 arena spans the machine's
+/// whole DRAM zone, past 4 GiB on a large machine.
 #[derive(Copy, Clone)]
 struct FreeRegion {
     offset: usize,
     size: usize,
 }
 /// Bounded free list. Coalescing keeps fragmentation manageable in
-/// practice. Where the plan sizes it (Linux, bcm2712, RP) it holds the
+/// practice. Where the plan sizes it (Linux, aarch64, RP) it holds the
 /// plan's `state_free_list` ceiling: a hole for every allocation the module
 /// slots can hold, so a free never finds it full. A static profile's list is
 /// its fixed size, and when it is full a freed region is leaked until the next
@@ -808,20 +809,20 @@ static mut FREE_LIST: crate::kernel::mem::table::Table<FreeRegion, MAX_FREE_REGI
     crate::abi::contracts::resource::POOL_STATE_FREE_LIST
 );
 static mut FREE_COUNT: usize = 0;
-/// bcm2712: freed regions waiting to be returned to zero (the *in-zeroing*
+/// aarch64: freed regions waiting to be returned to zero (the *in-zeroing*
 /// state). A region here is on neither list: no allocation
 /// can take it until a domain with slack has zeroed it ([`zero_in_slack`]),
 /// when it joins the free list. Sized with the free list.
-#[cfg(feature = "chip-bcm2712")]
+#[cfg(feature = "aarch64-metal")]
 static mut ZEROING: crate::kernel::mem::table::Table<FreeRegion, MAX_FREE_REGIONS> = crate::boot_table!(
     MAX_FREE_REGIONS,
     FreeRegion { offset: 0, size: 0 },
     crate::abi::contracts::resource::POOL_STATE_FREE_LIST
 );
-#[cfg(feature = "chip-bcm2712")]
+#[cfg(feature = "aarch64-metal")]
 static mut ZEROING_COUNT: usize = 0;
 
-/// Size the free list (and, on bcm2712, the in-zeroing list beside it) to `n`
+/// Size the free list (and, on aarch64, the in-zeroing list beside it) to `n`
 /// entries, all live.
 ///
 /// # Safety
@@ -834,7 +835,7 @@ pub unsafe fn size_free_list(n: usize) -> Result<(), crate::kernel::mem::table::
     let list = &*core::ptr::addr_of!(FREE_LIST);
     list.reserve(n)?;
     list.grow(n)?;
-    #[cfg(feature = "chip-bcm2712")]
+    #[cfg(feature = "aarch64-metal")]
     {
         let z = &*core::ptr::addr_of!(ZEROING);
         z.reserve(n)?;
@@ -845,7 +846,7 @@ pub unsafe fn size_free_list(n: usize) -> Result<(), crate::kernel::mem::table::
 
 /// The in-zeroing list, sized from the plan's defaults when no plan has sized
 /// it. Called with `STATE_LOCK` held.
-#[cfg(feature = "chip-bcm2712")]
+#[cfg(feature = "aarch64-metal")]
 unsafe fn zeroing_list() -> *mut crate::kernel::mem::table::Table<FreeRegion, MAX_FREE_REGIONS> {
     let p = core::ptr::addr_of_mut!(ZEROING);
     (*p).size_unplanned(|| {
@@ -903,7 +904,7 @@ impl Drop for StateLock {
 
 impl StateLock {
     /// The lock if it is free now; `None` rather than waiting.
-    #[cfg(feature = "chip-bcm2712")]
+    #[cfg(feature = "aarch64-metal")]
     fn try_acquire() -> Option<Self> {
         STATE_LOCK
             .compare_exchange(
@@ -918,7 +919,7 @@ impl StateLock {
 }
 
 // ============================================================================
-// bcm2712: the arena's zone, its zeroed frontier and slack zeroing
+// aarch64: the arena's zone, its zeroed frontier and slack zeroing
 // ============================================================================
 //
 // Offsets below are from `ARENA_BASE`. Invariants:
@@ -943,33 +944,34 @@ impl StateLock {
 //   it is held — a table's first use).
 
 /// No claim, a frontier claim, an in-zeroing claim.
-#[cfg(feature = "chip-bcm2712")]
+#[cfg(feature = "aarch64-metal")]
 const CLAIM_NONE: u8 = 0;
-#[cfg(feature = "chip-bcm2712")]
+#[cfg(feature = "aarch64-metal")]
 const CLAIM_FRONTIER: u8 = 1;
-#[cfg(feature = "chip-bcm2712")]
+#[cfg(feature = "aarch64-metal")]
 const CLAIM_ZEROING: u8 = 2;
 
-#[cfg(feature = "chip-bcm2712")]
+#[cfg(feature = "aarch64-metal")]
 static FRONTIER: portable_atomic::AtomicUsize = portable_atomic::AtomicUsize::new(0);
-#[cfg(feature = "chip-bcm2712")]
+#[cfg(feature = "aarch64-metal")]
 static CLAIM: portable_atomic::AtomicU8 = portable_atomic::AtomicU8::new(CLAIM_NONE);
-#[cfg(any(feature = "chip-bcm2712", feature = "rp"))]
+#[cfg(any(feature = "aarch64-metal", feature = "rp"))]
 static ARENA_HIGH: portable_atomic::AtomicUsize = portable_atomic::AtomicUsize::new(0);
 /// Bytes the domains' slack has zeroed, and slack passes run.
-#[cfg(feature = "chip-bcm2712")]
+#[cfg(feature = "aarch64-metal")]
 static SLACK_ZEROED: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
-#[cfg(feature = "chip-bcm2712")]
+#[cfg(feature = "aarch64-metal")]
 static SLACK_PASSES: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
 /// Bytes zeroed synchronously because nothing zeroed fitted, anywhere (on a
 /// step or not): what slack did not keep up with.
-#[cfg(feature = "chip-bcm2712")]
+#[cfg(feature = "aarch64-metal")]
 static SYNC_ZEROED: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
 
-/// Install the arena over `[base, base + size)`: the device tree's zone above
-/// the boot image (`platform/bcm2712/memmap.rs`). Called once at boot before
-/// anything allocates. Nothing in it is zeroed here.
-#[cfg(feature = "chip-bcm2712")]
+/// Install the arena over `[base, base + size)`: the DRAM zone the platform
+/// read from the machine (`platform/bcm2712/memmap.rs`, `platform/uefi.rs`).
+/// Called once at boot before anything allocates. Nothing in it is zeroed
+/// here.
+#[cfg(feature = "aarch64-metal")]
 pub fn install_arena(base: usize, size: usize) {
     use portable_atomic::Ordering::SeqCst;
     ARENA_BASE.store(base, SeqCst);
@@ -1011,7 +1013,7 @@ pub fn uninstall_arena() {
 /// A carve asks for everything from `addr` up (`kernel::mem::carve`): shrink
 /// the arena to end there. `false` when the arena has handed out (or a domain
 /// is zeroing) memory at or above it, which the carve must not take.
-#[cfg(any(feature = "chip-bcm2712", feature = "rp"))]
+#[cfg(any(feature = "aarch64-metal", feature = "rp"))]
 pub fn cede_arena_above(addr: usize) -> bool {
     use portable_atomic::Ordering::SeqCst;
     let base = ARENA_BASE.load(SeqCst);
@@ -1035,7 +1037,7 @@ pub fn cede_arena_above(addr: usize) -> bool {
 
 /// Reserve `[.., end)` of the arena against carves: `false` (and nothing
 /// reserved) when a carve has taken it.
-#[cfg(any(feature = "chip-bcm2712", feature = "rp"))]
+#[cfg(any(feature = "aarch64-metal", feature = "rp"))]
 fn hold_arena_to(end: usize) -> bool {
     use portable_atomic::Ordering::SeqCst;
     if end > ARENA_CAP.load(SeqCst) {
@@ -1047,7 +1049,7 @@ fn hold_arena_to(end: usize) -> bool {
 
 /// Wait for a frontier claim to complete. Its completion takes no lock, so
 /// this may be called with `STATE_LOCK` held.
-#[cfg(feature = "chip-bcm2712")]
+#[cfg(feature = "aarch64-metal")]
 fn wait_frontier_claim() {
     while CLAIM.load(portable_atomic::Ordering::Acquire) == CLAIM_FRONTIER {
         core::hint::spin_loop();
@@ -1057,7 +1059,7 @@ fn wait_frontier_claim() {
 /// Wait for any claim to complete, then take `STATE_LOCK` with none in
 /// flight. An in-zeroing claim completes under the lock, so the wait is
 /// outside it.
-#[cfg(feature = "chip-bcm2712")]
+#[cfg(feature = "aarch64-metal")]
 fn lock_with_no_claim() -> StateLock {
     loop {
         while CLAIM.load(portable_atomic::Ordering::Acquire) != CLAIM_NONE {
@@ -1072,7 +1074,7 @@ fn lock_with_no_claim() -> StateLock {
 
 /// Smallest slack worth a pass: below it, checking the clock costs about
 /// what zeroing would save.
-#[cfg(feature = "chip-bcm2712")]
+#[cfg(feature = "aarch64-metal")]
 const MIN_SLACK_US: u64 = 20;
 
 /// Claim the next chunk to zero: an in-zeroing region's head first (it holds
@@ -1080,7 +1082,7 @@ const MIN_SLACK_US: u64 = 20;
 /// `ZERO_AHEAD_BYTES` ahead of the bump offset. `None` when there is nothing
 /// to do, another domain holds the claim or the lock is busy — a domain
 /// never waits to donate its slack.
-#[cfg(feature = "chip-bcm2712")]
+#[cfg(feature = "aarch64-metal")]
 fn claim_chunk() -> Option<(u8, usize, usize)> {
     use portable_atomic::Ordering::{AcqRel, Acquire, Release};
     let chunk = crate::kernel::config::ZERO_CHUNK_BYTES;
@@ -1130,11 +1132,11 @@ fn claim_chunk() -> Option<(u8, usize, usize)> {
 /// Zero the arena in this domain's slack: `slack_us` is what is left of its
 /// tick budget after its modules stepped. Bounded: at most half the slack,
 /// one `ZERO_CHUNK_BYTES` claim between clock reads. A domain with no budget
-/// (limit 0) passes 0 and donates nothing. A no-op off bcm2712, whose arenas
+/// (limit 0) passes 0 and donates nothing. A no-op off aarch64, whose arenas
 /// start zeroed and are returned to zero on free.
 #[inline]
 pub fn zero_in_slack(slack_us: u64) {
-    #[cfg(feature = "chip-bcm2712")]
+    #[cfg(feature = "aarch64-metal")]
     {
         if slack_us < MIN_SLACK_US || arena_cap() == 0 {
             return;
@@ -1177,10 +1179,11 @@ pub fn zero_in_slack(slack_us: u64) {
             );
             // The memory map beside it: a one-shot boot line can miss the
             // rig's capture.
+            #[cfg(feature = "chip-bcm2712")]
             crate::platform::memmap::report();
         }
     }
-    #[cfg(not(feature = "chip-bcm2712"))]
+    #[cfg(not(feature = "aarch64-metal"))]
     let _ = slack_us;
 }
 
@@ -1189,9 +1192,9 @@ pub fn zero_in_slack(slack_us: u64) {
 /// Called when a graph has been instantiated and before it first steps — not
 /// on a step, and bounded by `ZERO_AHEAD_BYTES` plus what was freed — so the
 /// first heap growth finds zeroed memory before any domain has had slack. A
-/// no-op off bcm2712.
+/// no-op off aarch64.
 pub fn prime_frontier() {
-    #[cfg(feature = "chip-bcm2712")]
+    #[cfg(feature = "aarch64-metal")]
     {
         let base = arena_ptr();
         while let Some((kind, off, len)) = claim_chunk() {
@@ -1210,11 +1213,11 @@ pub fn prime_frontier() {
 }
 
 /// `(frontier, bump offset, regions waiting to be zeroed)`; the frontier is
-/// the bump offset off bcm2712, where no frontier is kept.
+/// the bump offset off aarch64, where no frontier is kept.
 pub fn zero_state() -> (usize, usize, usize) {
     // SAFETY: word reads of the arena statics, for telemetry.
     unsafe {
-        #[cfg(feature = "chip-bcm2712")]
+        #[cfg(feature = "aarch64-metal")]
         {
             (
                 FRONTIER.load(portable_atomic::Ordering::Relaxed),
@@ -1222,7 +1225,7 @@ pub fn zero_state() -> (usize, usize, usize) {
                 ZEROING_COUNT,
             )
         }
-        #[cfg(not(feature = "chip-bcm2712"))]
+        #[cfg(not(feature = "aarch64-metal"))]
         {
             (STATE_ARENA_OFFSET, STATE_ARENA_OFFSET, 0)
         }
@@ -1230,16 +1233,16 @@ pub fn zero_state() -> (usize, usize, usize) {
 }
 
 /// `(slack_zeroed, sync_zeroed)` bytes since boot: what the domains' slack
-/// zeroed, and what allocations had to zero themselves. `(0, 0)` off bcm2712.
+/// zeroed, and what allocations had to zero themselves. `(0, 0)` off aarch64.
 pub fn zero_totals() -> (u64, u64) {
-    #[cfg(feature = "chip-bcm2712")]
+    #[cfg(feature = "aarch64-metal")]
     {
         (
             SLACK_ZEROED.load(portable_atomic::Ordering::Relaxed),
             SYNC_ZEROED.load(portable_atomic::Ordering::Relaxed),
         )
     }
-    #[cfg(not(feature = "chip-bcm2712"))]
+    #[cfg(not(feature = "aarch64-metal"))]
     {
         (0, 0)
     }
@@ -1349,7 +1352,7 @@ pub fn alloc_private(size: usize, align: usize) -> Result<*mut u8, LoaderError> 
             crate::kernel::sys::resource_ledger::deny(pool);
             return Err(LoaderError::StatePoolExhausted);
         }
-        #[cfg(any(feature = "chip-bcm2712", feature = "rp"))]
+        #[cfg(any(feature = "aarch64-metal", feature = "rp"))]
         if !hold_arena_to(used) {
             log::error!(
                 "[loader] STATE ARENA EXHAUSTED for a private region (taken by a kernel table \
@@ -1530,7 +1533,7 @@ pub fn alloc_state(size: usize) -> Result<*mut u8, LoaderError> {
     }
     if len > 0 {
         crate::kernel::mem::heap::note_zeroed(len);
-        #[cfg(feature = "chip-bcm2712")]
+        #[cfg(feature = "aarch64-metal")]
         SYNC_ZEROED.fetch_add(len as u64, portable_atomic::Ordering::Relaxed);
     }
     Ok(ptr)
@@ -1540,9 +1543,9 @@ pub fn alloc_state(size: usize) -> Result<*mut u8, LoaderError> {
 /// canary, from the free list or the bump mark, under `STATE_LOCK`. The
 /// bytes are not touched. Returns the region and the part of it, `(offset,
 /// len)` from its start, that may be dirty: none on Linux and from the free
-/// list on bcm2712 (both return freed memory to zero), the part below
+/// list on aarch64 (both return freed memory to zero), the part below
 /// `CLEAN_MARK` of a bump allocation on the other zero-initialised arenas,
-/// the part above the zeroed frontier of a bump allocation on bcm2712, and
+/// the part above the zeroed frontier of a bump allocation on aarch64, and
 /// all of a reused hole elsewhere.
 fn reserve_state(size: usize) -> Result<(*mut u8, (usize, usize)), LoaderError> {
     // SAFETY: the arena statics are touched only under `STATE_LOCK`.
@@ -1585,8 +1588,8 @@ fn reserve_state(size: usize) -> Result<(*mut u8, (usize, usize)), LoaderError> 
         // TWO ceilings guard this arena and they are reported apart, because
         // they are raised in different places by different people. The arena's
         // capacity is a platform fact: the compiled `STATE_ARENA_SIZE`
-        // (`kernel::config`, a kernel rebuild, no ABI epoch), or on bcm2712
-        // the DRAM the device tree gives the arena, less the kernel tables
+        // (`kernel::config`, a kernel rebuild, no ABI epoch), or on aarch64
+        // the DRAM the machine gives the arena, less the kernel tables
         // carved from its top. The envelope capacity is a PACKAGING fact,
         // computed by the composer from the graph that was packed and
         // installed from the boot config's FXEV section — and it is usually
@@ -1602,7 +1605,7 @@ fn reserve_state(size: usize) -> Result<(*mut u8, (usize, usize)), LoaderError> 
                 log::error!(
                     "[loader] STATE ARENA EXHAUSTED (platform capacity) — need={need} \
                      used={aligned} cap={cap} (the compiled STATE_ARENA_SIZE in kernel::config, \
-                     on bcm2712 the DRAM the device tree leaves above the boot image after \
+                     on aarch64 bare metal the machine's DRAM zone after \
                      the kernel's tables, on RP the static pool the graph's tables and buffer \
                      arena leave; reduce module arena demand or give the node more \
                      memory; modules without a heap arena will silently fail every heap_alloc \
@@ -1641,10 +1644,10 @@ fn reserve_state(size: usize) -> Result<(*mut u8, (usize, usize)), LoaderError> 
                 return Err(LoaderError::StatePoolExhausted);
             }
         };
-        // bcm2712 and RP: hold the memory against a carve racing for the
-        // arena's top; bcm2712 also waits out a frontier claim the
+        // aarch64 and RP: hold the memory against a carve racing for the
+        // arena's top; aarch64 also waits out a frontier claim the
         // allocation would reach into.
-        #[cfg(any(feature = "chip-bcm2712", feature = "rp"))]
+        #[cfg(any(feature = "aarch64-metal", feature = "rp"))]
         if !hold_arena_to(next) {
             log::error!(
                 "[loader] STATE ARENA EXHAUSTED (taken by a kernel table carve) — \
@@ -1653,13 +1656,13 @@ fn reserve_state(size: usize) -> Result<(*mut u8, (usize, usize)), LoaderError> 
             crate::kernel::sys::resource_ledger::deny(pool);
             return Err(LoaderError::StatePoolExhausted);
         }
-        #[cfg(feature = "chip-bcm2712")]
+        #[cfg(feature = "aarch64-metal")]
         if next > FRONTIER.load(portable_atomic::Ordering::Acquire) {
             wait_frontier_claim();
         }
         let ptr = arena_ptr().add(aligned);
         STATE_ARENA_OFFSET = next;
-        #[cfg(feature = "chip-bcm2712")]
+        #[cfg(feature = "aarch64-metal")]
         let dirty = {
             // `[aligned, FRONTIER)` is zero; what lies above it is not.
             let f = FRONTIER.load(portable_atomic::Ordering::Acquire);
@@ -1669,7 +1672,7 @@ fn reserve_state(size: usize) -> Result<(*mut u8, (usize, usize)), LoaderError> 
             let clean = f.saturating_sub(aligned).min(need);
             (clean, need - clean)
         };
-        #[cfg(not(feature = "chip-bcm2712"))]
+        #[cfg(not(feature = "aarch64-metal"))]
         let dirty = if ZERO_ON_FREE {
             (0, 0)
         } else if ZEROED_ARENA {
@@ -1760,9 +1763,9 @@ pub unsafe fn free_state_range(ptr: *mut u8, size: usize) {
     unsafe {
         rezero(ptr, need)
     };
-    // bcm2712: the region waits on the in-zeroing list for a domain with
+    // aarch64: the region waits on the in-zeroing list for a domain with
     // slack to zero it. Only when that list is full is it zeroed here.
-    #[cfg(feature = "chip-bcm2712")]
+    #[cfg(feature = "aarch64-metal")]
     {
         {
             let _lock = StateLock::acquire();
@@ -1782,7 +1785,7 @@ pub unsafe fn free_state_range(ptr: *mut u8, size: usize) {
         SYNC_ZEROED.fetch_add(need as u64, portable_atomic::Ordering::Relaxed);
     }
     let _lock = StateLock::acquire();
-    // SAFETY: under the lock; the region is zero (Linux, bcm2712) or its next
+    // SAFETY: under the lock; the region is zero (Linux, aarch64) or its next
     // allocation zeroes it.
     unsafe { insert_clean(offset, need) };
 }
@@ -1852,10 +1855,10 @@ pub fn reset_state_arena() {
     // SAFETY: at a rebuild no module is live; the lock orders this against
     // any allocation still finishing on another core.
     unsafe {
-        #[cfg(not(feature = "chip-bcm2712"))]
+        #[cfg(not(feature = "aarch64-metal"))]
         let _lock = StateLock::acquire();
-        // bcm2712: no domain may be zeroing a region the reset hands back.
-        #[cfg(feature = "chip-bcm2712")]
+        // aarch64: no domain may be zeroing a region the reset hands back.
+        #[cfg(feature = "aarch64-metal")]
         let _lock = lock_with_no_claim();
         // Everything below the mark is returned to zero at once (Linux), so
         // the next graph's allocations need none.
@@ -1863,9 +1866,9 @@ pub fn reset_state_arena() {
         rezero(arena_ptr(), CLEAN_MARK);
         STATE_ARENA_OFFSET = 0;
         FREE_COUNT = 0;
-        // bcm2712: everything the old graph held is dirty again; the frontier
+        // aarch64: everything the old graph held is dirty again; the frontier
         // restarts at the bottom and the in-zeroing list is moot.
-        #[cfg(feature = "chip-bcm2712")]
+        #[cfg(feature = "aarch64-metal")]
         {
             FRONTIER.store(0, portable_atomic::Ordering::Release);
             ZEROING_COUNT = 0;
@@ -2380,9 +2383,7 @@ impl LoadedModule {
 ///               + signature checks via `hal::verify_integrity` and the
 ///               `enforce_signatures` feature gate.
 /// `Embedded`  — built-in static blob (WASM `EMBEDDED_MODULES_BLOB`, Linux
-///               `mmap`'d `.fmod` file). The typed value lets a future
-///               policy treat host-development builds differently from
-///               network-staged images.
+///               `mmap`'d `.fmod` file).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoadSource {
     /// Module table sits in flash, mapped by the platform's flash layout.
@@ -2922,14 +2923,16 @@ pub enum Signing {
 }
 
 /// This kernel's runtime (`abi::wire::runtime_bit`). Module ABIs are shared
-/// between runtimes — hosted Linux on aarch64 loads the bytes bare-metal
-/// bcm2712 runs — so the ABI alone does not say a module may run here.
+/// between runtimes — hosted Linux on aarch64 loads the bytes bcm2712 and
+/// uefi run — so the ABI alone does not say a module may run here.
 #[cfg(feature = "host-linux")]
 pub const OWN_RUNTIME_BIT: u16 = crate::abi::wire::runtime_bit::LINUX;
 #[cfg(feature = "host-wasm")]
 pub const OWN_RUNTIME_BIT: u16 = crate::abi::wire::runtime_bit::WASM;
 #[cfg(feature = "chip-bcm2712")]
 pub const OWN_RUNTIME_BIT: u16 = crate::abi::wire::runtime_bit::BCM2712;
+#[cfg(feature = "host-uefi")]
+pub const OWN_RUNTIME_BIT: u16 = crate::abi::wire::runtime_bit::UEFI;
 #[cfg(feature = "chip-rp2350b")]
 pub const OWN_RUNTIME_BIT: u16 = crate::abi::wire::runtime_bit::RP2350;
 #[cfg(feature = "chip-rp2040")]
@@ -2939,6 +2942,7 @@ pub const OWN_RUNTIME_BIT: u16 = crate::abi::wire::runtime_bit::RP2040;
     feature = "host-linux",
     feature = "host-wasm",
     feature = "chip-bcm2712",
+    feature = "host-uefi",
     feature = "chip-rp2350b",
     feature = "chip-rp2040"
 )))]

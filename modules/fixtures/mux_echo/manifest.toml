@@ -1,7 +1,7 @@
 version = "1.0.0"
-# `linux` so the transport self-test runs as an ordinary host graph; the silicon
-# targets so the same fixture can prove a QUIC bring-up on a board.
-hardware_targets = ["rp2350", "bcm2712", "linux"]
+# `linux` so the transport self-test runs as an ordinary host graph; the
+# bare-metal targets so the same fixture can prove a QUIC bring-up on a machine.
+hardware_targets = ["rp2350", "bcm2712", "linux", "uefi"]
 
 # Tick-counted: this fixture holds no deadline of its own. It reacts to frames
 # and never samples a clock, so a variable scheduler cadence changes nothing

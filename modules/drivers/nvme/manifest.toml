@@ -1,5 +1,5 @@
 version = "0.2.0"
-hardware_targets = ["bcm2712"]
+hardware_targets = ["bcm2712", "uefi"]
 permissions = ["platform_raw", "backing_provider", "pcie_device", "dma"]
 # Controller/admin/I/O timeouts, link rescans, heartbeat, and telemetry cadence
 # all use dev_millis. The step counter is observational only.

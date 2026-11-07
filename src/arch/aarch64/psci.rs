@@ -3,8 +3,8 @@
 //!
 //! A secure monitor at EL3 (the Pi 5's Trusted Firmware) takes `smc`; a
 //! hypervisor (QEMU `virt`) takes `hvc`. The platform tells this module
-//! which ([`configure`]) before the first call; `bcm2712.rs` passes a
-//! per-board constant.
+//! which ([`configure`]) before the first call: `bcm2712.rs` from a
+//! per-board constant, `uefi.rs` from the FADT's `ARM_BOOT_ARCH` flags.
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -26,6 +26,8 @@ pub fn configure(conduit: Conduit) {
 
 /// PSCI `CPU_ON` (SMC64 function id).
 const CPU_ON: u64 = 0xC400_0003;
+/// PSCI `SYSTEM_OFF` (SMC32 function id).
+const SYSTEM_OFF: u64 = 0x8400_0008;
 
 /// A PSCI call: function id in x0, three arguments, the return value in x0.
 ///
@@ -76,4 +78,10 @@ unsafe fn call(fid: u64, a1: u64, a2: u64, a3: u64) -> u64 {
 /// must be at the point of coherency before this call.
 pub unsafe fn cpu_on(target_mpidr: u64, entry_point: u64, context_id: u64) -> i32 {
     call(CPU_ON, target_mpidr, entry_point, context_id) as i32
+}
+
+/// Power the machine off. Returns only if the firmware refuses.
+pub fn system_off() {
+    // SAFETY: the call ends the machine, or changes nothing if refused.
+    unsafe { call(SYSTEM_OFF, 0, 0, 0) };
 }

@@ -1,0 +1,29 @@
+# AWS EC2 arm64 instance running fluxor natively.
+#
+# The UEFI path on a cloud machine: the instance's firmware runs the fluxor
+# loader from the image's EFI system partition, and the kernel is the only
+# thing running. It stands on the `uefi` host target.
+#
+# Build: tools/firmware.sh ec2-arm64
+
+[board]
+id = "ec2-arm64"
+host = "uefi"
+description = "AWS EC2 arm64 instance, native uefi runtime"
+
+[rig]
+artifact = "uefi_disk"
+deploy = ["deploy.ec2_ami"]
+console = ["console.ec2_serial"]
+observe = ["observe.console_regex", "observe.tls_load", "observe.quic_mux"]
+power = ["power.cycle", "power.on", "power.off"]
+# After `running`: the firmware and the loader take seconds; the launch itself
+# is the power step's own time.
+default_timeout_s = 120
+# The disk is uploaded to a cloud account. No secret may be built into it, so
+# the profile may not carry one in [build_env].
+image_leaves_host = true
+
+[platform.net]
+phy = "ethernet"
+nic = "ena"

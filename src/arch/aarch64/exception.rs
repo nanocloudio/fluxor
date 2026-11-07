@@ -11,10 +11,11 @@
 //! slot index (`VBAR_EL1` offset / 0x80, 0–15) to [`exception_dump`] in
 //! w17, so the dump names the vector it came through.
 //!
-//! [`irq_handler`] reads `GICC_IAR`, EOIs, then either re-arms the timer
-//! tick (the platform's timer PPI) or walks `IRQ_BINDINGS` to fan out
-//! through the platform's IRQ multiplexer, enter a Tier-2 module's ISR, or
-//! signal a kernel event via `event_signal_from_isr`.
+//! [`irq_handler`] acknowledges the interrupt at the GIC's CPU interface,
+//! then either re-arms the timer tick (the platform's timer PPI) and ends it,
+//! or ends it and walks `IRQ_BINDINGS` to fan out through the platform's IRQ
+//! multiplexer, enter a Tier-2 module's ISR, or signal a kernel event via
+//! `event_signal_from_isr`.
 //!
 //! What the dump can safely write to is the platform's business: it prints
 //! through the sink the platform registered ([`set_dump_sink`]), which the
@@ -34,6 +35,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering
 
 use super::cpu::current_core_id;
 use super::gic::{self, EVENT_HANDLE_MUX, IRQ_BINDINGS, IRQ_BINDING_COUNT};
+use super::mmio;
 use super::timer;
 
 /// How many cores the per-core latches cover.
@@ -41,6 +43,12 @@ pub const MAX_CORES: usize = 4;
 
 static mut DUMP_SINK: Option<fn(&[u8])> = None;
 static FAULT_STASH: AtomicUsize = AtomicUsize::new(0);
+static STACK_LO: AtomicUsize = AtomicUsize::new(0);
+static STACK_HI: AtomicUsize = AtomicUsize::new(0);
+static TEXT_LO: AtomicUsize = AtomicUsize::new(0);
+static TEXT_HI: AtomicUsize = AtomicUsize::new(0);
+/// Frames the fault report prints at most.
+const MAX_FRAMES: u32 = 32;
 static mut STACK_GUARD_PROBE: Option<fn(u64) -> Option<usize>> = None;
 
 /// Where `exception_dump` writes its text: raw, synchronous, usable with
@@ -58,6 +66,16 @@ pub fn set_dump_sink(sink: fn(&[u8])) {
 /// happened before any console worked. `0` disables it.
 pub fn set_fault_stash(addr: usize) {
     FAULT_STASH.store(addr, Ordering::Relaxed);
+}
+
+/// What the fault report may scan for return addresses: the kernel's stack
+/// `[stack_lo, stack_hi)`, and the kernel's code `[text_lo, text_hi)` a word
+/// must point into to be reported. Unset (the default) means it does not scan.
+pub fn set_frame_bounds(stack_lo: usize, stack_hi: usize, text_lo: usize, text_hi: usize) {
+    STACK_LO.store(stack_lo, Ordering::Relaxed);
+    STACK_HI.store(stack_hi, Ordering::Relaxed);
+    TEXT_LO.store(text_lo, Ordering::Relaxed);
+    TEXT_HI.store(text_hi, Ordering::Relaxed);
 }
 
 /// How to tell whether a faulting address lies in a kernel stack's guard
@@ -185,6 +203,7 @@ global_asm!(
     "mrs x1, esr_el1",
     "mrs x2, far_el1",
     "mov w3, w17",
+    "mov x4, x15", // the stack at the exception, saved by `fluxor_el1_catch`
     "bl exception_dump",
     // No recovery: spin, keeping the core in a diagnosable state.
     "1: b 1b",
@@ -250,7 +269,7 @@ pub fn report_core_faults() {
 /// registers and the vector slot as arguments; writes the configured stash
 /// address.
 #[no_mangle]
-pub unsafe extern "C" fn exception_dump(elr: u64, esr: u64, far: u64, vector: u32) {
+pub unsafe extern "C" fn exception_dump(elr: u64, esr: u64, far: u64, vector: u32, sp: u64) {
     // Latch the fault per core BEFORE the recursion guard, so another core
     // can report it even when this core's console dump is invisible or the
     // core then hangs.
@@ -300,11 +319,30 @@ pub unsafe extern "C" fn exception_dump(elr: u64, esr: u64, far: u64, vector: u3
     dump(b"\r\n  vector slot ");
     exception_dump_u32(vector);
     dump(b"\r\n");
-    if let Some(core) = stack_guard_core(far) {
+    let guard_core = stack_guard_core(far);
+    if let Some(core) = guard_core {
         dump(b"  kernel stack overflow: guard page of core ");
         exception_dump_hex64(core as u64);
         dump(b"\r\n");
     }
+    dump(b"[fault] core=");
+    exception_dump_u32(c as u32);
+    dump(if guard_core.is_some() {
+        b" kind=kernel-stack-overflow vector="
+    } else {
+        b" kind=kernel vector="
+    });
+    exception_dump_u32(vector);
+    dump(b" far=0x");
+    exception_dump_hex64(far);
+    dump(b" esr=0x");
+    exception_dump_hex64(esr);
+    dump(b" elr=0x");
+    exception_dump_hex64(elr);
+    dump(b" spsr=0x");
+    exception_dump_hex64(spsr);
+    dump(b"\r\n");
+    dump_frames(elr, sp);
     // Recent log tail — helps correlate the fault with whatever the
     // system logged right before it. `read_tail` does not advance the
     // SPSC tail pointer, so a concurrent drain still sees the same bytes.
@@ -317,6 +355,43 @@ pub unsafe extern "C" fn exception_dump(elr: u64, esr: u64, far: u64, vector: u3
         dump(&buf[..n]);
         dump(b"\r\n--- end ---\r\n");
     }
+}
+
+/// The faulting address, then every word on the stack from the faulting `sp`
+/// up that points into the kernel's code: candidates for return addresses, not
+/// a proven chain, since nothing here assumes frame pointers. A fault on a
+/// stack other than the one [`set_frame_bounds`] named prints the address only.
+fn dump_frames(elr: u64, sp: u64) {
+    let (lo, hi) = (
+        STACK_LO.load(Ordering::Relaxed) as u64,
+        STACK_HI.load(Ordering::Relaxed) as u64,
+    );
+    let text = TEXT_LO.load(Ordering::Relaxed) as u64..TEXT_HI.load(Ordering::Relaxed) as u64;
+    if lo == hi {
+        return;
+    }
+    let frame = |n: u32, pc: u64| {
+        dump(b"[fault] frame ");
+        exception_dump_u32(n);
+        dump(b" pc=0x");
+        exception_dump_hex64(pc);
+        dump(b"\r\n");
+    };
+    frame(0, elr);
+    let mut n = 1;
+    let mut at = sp;
+    while at >= lo && at & 7 == 0 && at + 8 <= hi && n < MAX_FRAMES {
+        // SAFETY: inside the stack the platform named, aligned, so mapped.
+        let word = unsafe { core::ptr::read_volatile(at as *const u64) };
+        if text.contains(&word) {
+            frame(n, word);
+            n += 1;
+        }
+        at += 8;
+    }
+    dump(b"[fault] halt cpu=");
+    exception_dump_u32(current_core_id() as u32);
+    dump(b"\r\n");
 }
 
 /// Hex dump for the exception handler, through the raw sink — see
@@ -354,6 +429,9 @@ fn exception_dump_u32(mut n: u32) {
 /// next fire.
 pub static NEXT_DEADLINE_TICKS: [AtomicU32; MAX_CORES] = [const { AtomicU32::new(0) }; MAX_CORES];
 
+/// SGIs taken, by every core: a boot self-test reads it to know one arrived.
+pub static SGI_RECEIVED: AtomicU32 = AtomicU32::new(0);
+
 /// Per-core timer-IRQ counts.
 pub static CORE_TICKS: [AtomicU32; MAX_CORES] = [const { AtomicU32::new(0) }; MAX_CORES];
 
@@ -381,25 +459,35 @@ pub static ABSOLUTE_REARM: AtomicBool = AtomicBool::new(false);
 /// Unused (stays 0) while [`ABSOLUTE_REARM`] is off.
 pub static LAST_DEADLINE_CVAL: [AtomicU64; MAX_CORES] = [const { AtomicU64::new(0) }; MAX_CORES];
 
-/// The IRQ entry: acknowledge, EOI, then the timer tick or the bound
-/// event.
+/// The IRQ entry: acknowledge, then either the timer tick, ended once it is
+/// re-armed, or the end of the interrupt and the bound event.
 ///
 /// # Safety
 /// Called from the IRQ vector with the caller-saved registers preserved;
 /// touches the configured GIC and the binding table the boot thread built.
 #[no_mangle]
 pub unsafe extern "C" fn irq_handler() {
-    let iar = core::ptr::read_volatile(gic::gicc_iar());
-    let irq_id = iar & 0x3FF;
+    let iar = gic::acknowledge();
+    let irq_id = gic::intid(iar);
     // 1020-1023: nothing was pending by the time the CPU interface was
-    // read (1023, spurious). Not acknowledged, so no EOI.
-    if irq_id > gic::MAX_INTID {
+    // read (1023, spurious). Not acknowledged, so no EOI. Above them are a
+    // GICv3's LPIs, which are real interrupts.
+    if (gic::MAX_INTID + 1..=1023).contains(&irq_id) {
         return;
     }
-    // EOI with the whole IAR value: for an SGI it carries the source CPU.
-    core::ptr::write_volatile(gic::gicc_eoir(), iar);
+    // The timer's line is level-triggered and stays high until it is re-armed,
+    // so its EOI waits for the re-arm: ended earlier, a virtual GIC raises the
+    // same tick a second time. Everything else is ended here. EOI always takes
+    // the whole IAR value: for an SGI it carries the source CPU.
+    let timer_tick = irq_id == gic::timer_ppi();
+    if !timer_tick {
+        gic::end_of_interrupt(iar);
+    }
+    if irq_id < 16 {
+        SGI_RECEIVED.fetch_add(1, Ordering::Relaxed);
+    }
 
-    if irq_id == gic::timer_ppi() {
+    if timer_tick {
         // Timer tick: re-arm THIS core's timer from its own period slot,
         // then count. Wall-clock time never derives from this cadence (it
         // reads the counter), so the relative re-arm's drift is harmless at
@@ -424,6 +512,9 @@ pub unsafe extern "C" fn irq_handler() {
         } else {
             timer::timer_set(period);
         }
+        // The re-arm takes effect, lowering the line, before the EOI.
+        core::arch::asm!("isb", options(nostack, preserves_flags));
+        gic::end_of_interrupt(iar);
         CORE_TICKS[core_id].fetch_add(1, Ordering::Relaxed);
         // Latch the interrupted PC. If a core's scheduler loop has frozen
         // while CORE_TICKS keeps climbing, every timer IRQ interrupts the
@@ -438,6 +529,7 @@ pub unsafe extern "C" fn irq_handler() {
         while i < n {
             let binding = &IRQ_BINDINGS[i];
             if binding.irq == irq_id {
+                gic::BINDING_FIRES[i].fetch_add(1, Ordering::Relaxed);
                 if binding.event_handle == crate::kernel::exec::isr_tier::ISR_TIER2_EVENT {
                     // Tier 2 (IRQ-owned) dispatch: route this hardware IRQ
                     // straight into the module's `module_isr_entry` via the
@@ -453,12 +545,12 @@ pub unsafe extern "C" fn irq_handler() {
                     }
                 } else if binding.event_handle >= 0 {
                     // Acknowledge a virtio-mmio device: InterruptStatus
-                    // (0x60) written back to InterruptACK (0x64).
+                    // (0x60) written back to InterruptACK (0x64), registers a
+                    // hypervisor emulates.
                     if binding.mmio_base != 0 {
-                        let isr =
-                            core::ptr::read_volatile((binding.mmio_base + 0x60) as *const u32);
+                        let isr = mmio::read32(binding.mmio_base + 0x60);
                         if isr != 0 {
-                            core::ptr::write_volatile((binding.mmio_base + 0x64) as *mut u32, isr);
+                            mmio::write32(binding.mmio_base + 0x64, isr);
                         }
                     }
                     crate::kernel::ipc::event::event_signal_from_isr(binding.event_handle);

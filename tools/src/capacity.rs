@@ -29,12 +29,18 @@ fn is_bcm2712(target: &str) -> bool {
     matches!(target, "pi5" | "bcm2712" | "cm5" | "qemu-virt")
 }
 
+/// Targets whose kernel compiles `profile_uefi` (`src/kernel/config.rs`).
+fn is_uefi(target: &str) -> bool {
+    matches!(target, "uefi" | "qemu-uefi-arm64" | "ec2-arm64")
+}
+
 /// The kernel profile a target compiles. Unknown targets get the RP profile:
 /// a graph that fits the smallest profile fits everywhere.
 pub fn kernel_profile(target: &str) -> &'static str {
     match target {
         "linux" => "profile_linux",
         t if is_bcm2712(t) => "profile_bcm2712",
+        t if is_uefi(t) => "profile_uefi",
         "wasm" => "profile_wasm",
         _ => "profile_rp",
     }
@@ -114,7 +120,7 @@ fn profile_table(target: &str, table: &str) -> Vec<(String, Option<u64>)> {
 
 /// `target`'s static size for `pool`, from its profile's `STATIC_POOLS`, in
 /// the pool's own units (bytes for arenas, slots for tables). `None` where the
-/// profile sizes the pool at boot (every pool on Linux, bcm2712 and RP).
+/// profile sizes the pool at boot (every pool on Linux, bcm2712, uefi and RP).
 pub fn kernel_pool_static_size(target: &str, pool: &str) -> Option<u64> {
     profile_table(target, "STATIC_POOLS")
         .into_iter()
@@ -148,22 +154,25 @@ pub fn kernel_has_pool(target: &str, pool: &str) -> bool {
 }
 
 /// Whether `target`'s config blob lays its graph section out for the graph it
-/// carries (Linux, bcm2712) rather than for the profile's compiled slot count
+/// carries (Linux, bcm2712, uefi) rather than for the profile's compiled slot count
 /// (`GRAPH_EDGES`, RP and wasm), which is then also its channel-id domain.
 pub fn graph_section_per_graph(target: &str) -> bool {
-    matches!(kernel_profile(target), "profile_linux" | "profile_bcm2712")
+    matches!(
+        kernel_profile(target),
+        "profile_linux" | "profile_bcm2712" | "profile_uefi"
+    )
 }
 
 /// Kernel `MAX_MODULES` for the profile a target compiles: the module-index
-/// domain (config ids carry 12 bits), within which Linux, bcm2712 and RP size
-/// their module tables from the graph; wasm's static module table.
+/// domain (config ids carry 12 bits), within which Linux, bcm2712, uefi and RP
+/// size their module tables from the graph; wasm's static module table.
 pub fn kernel_max_modules(target: &str) -> usize {
     eval(profile_body(kernel_profile(target)), "MAX_MODULES").unwrap_or(32) as usize
 }
 
 /// Graph-edge slots a target's config blob may carry, and so its channel-id
 /// domain (`MAX_GRAPH_EDGES`, `MAX_CHANNELS`): the static profile's compiled
-/// `GRAPH_EDGES`, or on Linux and bcm2712, whose graph section is laid out
+/// `GRAPH_EDGES`, or on Linux, bcm2712 and uefi, whose graph section is laid out
 /// for the graph, the format's bound.
 pub fn kernel_max_edges(target: &str) -> usize {
     if graph_section_per_graph(target) {
@@ -178,7 +187,7 @@ pub fn kernel_max_edges(target: &str) -> usize {
 pub const GRAPH_EDGES_FORMAT_BOUND: usize = 255 * 128;
 
 /// Edge slots the graph section of a `target` blob carrying `edges` edges is
-/// laid out for: the static profile's count, or on Linux and bcm2712 the
+/// laid out for: the static profile's count, or on Linux, bcm2712 and uefi the
 /// graph's own edges rounded up to whole 128-edge units.
 pub fn graph_slots(target: &str, edges: usize) -> usize {
     if graph_section_per_graph(target) {
@@ -207,9 +216,9 @@ pub fn kernel_buffer_arena(runtime: &str) -> Option<u64> {
 /// Whether `runtime`'s kernel places its arenas per graph, at the sizes the
 /// plan gives them (RP, splitting its static pool), so an arena envelope
 /// entry is the arena's size, larger or smaller than the default. Elsewhere
-/// the arenas are fixed (a `.bss` array, or on bcm2712 the device tree's
-/// zone), and an entry only lowers the figure an allocation is admitted
-/// against.
+/// the arenas are fixed (a `.bss` array, or on bcm2712 and uefi the DRAM zone
+/// the machine describes), and an entry only lowers the figure an allocation
+/// is admitted against.
 pub fn kernel_places_arenas(runtime: &str) -> bool {
     kernel_profile(runtime) == "profile_rp"
 }
@@ -282,12 +291,14 @@ fn cfg_const(src: &str, cfg: Option<&str>, name: &str) -> Option<u64> {
 
 /// The owner-slot domain (`MAX_OWNERS`, `src/kernel/workload/owner.rs`) of
 /// the kernel `target` compiles, the system slot included: the hosted
-/// multitenant figure on Linux, the bare-metal multitenant one on bcm2712,
-/// and the system slot alone on the single-tenant profiles.
+/// multitenant figure on Linux, the bare-metal multitenant one on bcm2712 and
+/// uefi, and the system slot alone on the single-tenant profiles.
 pub fn kernel_max_owners(target: &str) -> u64 {
     let cfg = match kernel_profile(target) {
         "profile_linux" => r#"all(feature = "multitenant", feature = "host-linux")"#,
-        "profile_bcm2712" => r#"all(feature = "multitenant", not(feature = "host-linux"))"#,
+        "profile_bcm2712" | "profile_uefi" => {
+            r#"all(feature = "multitenant", not(feature = "host-linux"))"#
+        }
         _ => r#"not(feature = "multitenant")"#,
     };
     cfg_const(KERNEL_OWNER, Some(cfg), "MAX_OWNERS").unwrap_or(1)
@@ -698,6 +709,49 @@ pub const ENVELOPE_SECTION_MAGIC: u32 = 0x4658_4556;
 /// Declared-demand section magic "FXDM" — mirror of
 /// `resource::DEMAND_SECTION_MAGIC`.
 pub const DEMAND_SECTION_MAGIC: u32 = 0x4658_444D;
+
+/// Boot-parameter section magic "FXBO" — mirror of the kernel's
+/// `boot::config::BOOT_SECTION_MAGIC`.
+pub const BOOT_SECTION_MAGIC: u32 = 0x4658_424F;
+
+/// The graph's `boot:` map as the kernel's platform reads it: how a machine
+/// behaves on a test rig.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BootParams {
+    /// Fault on purpose once the kernel has vectors and a console.
+    pub fault_probe: bool,
+    /// Stop one secondary core's interrupts on purpose, to test the lockup
+    /// detector.
+    pub lockup_probe: bool,
+    /// Repeat the `[boot] stages=` line this often; 0 the platform's default.
+    pub summary_every_s: u32,
+    /// For this long; 0 the platform's default.
+    pub summary_for_s: u32,
+    /// Power off this long after entry; 0 never.
+    pub max_uptime_s: u32,
+}
+
+/// Encode the FXBO post-body section: `[magic][section_len u32][crc16]` then
+/// the 16-byte payload the kernel's `boot::config::BOOT_PARAMS_BYTES` names,
+/// `[0][fault_probe][lockup_probe][0][summary_every_s u32][summary_for_s u32]
+/// [max_uptime_s u32]`; crc over `section[10..]`.
+pub fn encode_boot_section(p: &BootParams) -> Vec<u8> {
+    let section_len = 10 + 16;
+    let mut s = Vec::with_capacity(section_len);
+    s.extend_from_slice(&BOOT_SECTION_MAGIC.to_le_bytes());
+    s.extend_from_slice(&(section_len as u32).to_le_bytes());
+    s.extend_from_slice(&[0, 0]); // crc placeholder
+    s.push(0);
+    s.push(u8::from(p.fault_probe));
+    s.push(u8::from(p.lockup_probe));
+    s.push(0);
+    s.extend_from_slice(&p.summary_every_s.to_le_bytes());
+    s.extend_from_slice(&p.summary_for_s.to_le_bytes());
+    s.extend_from_slice(&p.max_uptime_s.to_le_bytes());
+    let crc = crc16_ccitt(&s[10..]);
+    s[8..10].copy_from_slice(&crc.to_le_bytes());
+    s
+}
 
 /// Encode a pool section (`abi::contracts::resource`): `[magic][section_len
 /// u32][crc16][entry_count u16]` then `[pool u16][n u32]` entries; crc over

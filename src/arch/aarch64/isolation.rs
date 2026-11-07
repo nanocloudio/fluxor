@@ -2042,6 +2042,7 @@ pub mod el0 {
         "fluxor_el1_sync_vec:", // named entry for the EL1h synchronous slot
         "mov   w17, #4",
         "fluxor_el1_catch:",
+        "mov   x15, sp", // the faulting stack, for the report
         "adrp  x16, EL1_FAULT_STACKS",
         "add   x16, x16, :lo12:EL1_FAULT_STACKS",
         core_index!(),

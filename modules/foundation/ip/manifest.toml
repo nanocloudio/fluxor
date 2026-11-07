@@ -4,7 +4,7 @@ timer_class = "wall_clock"
 # `linux`: over the `linux_eth` built-in frame driver the module is the hosted runtime's
 # own TCP/IP stack (the transport-continuity surfaces need a stack that owns
 # its connections; `linux_net`'s host sockets cannot checkpoint one).
-hardware_targets = ["rp2040", "rp2350", "bcm2712", "linux"]
+hardware_targets = ["rp2040", "rp2350", "bcm2712", "linux", "uefi"]
 
 # The emission fence (`ADDR_FENCE` on `addr_ctl`): a provable cutoff for a
 # local address, reported as the frame counter at the ring hand-off.

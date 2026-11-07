@@ -193,6 +193,15 @@ unsafe fn avail_ring_set(avail_base: usize, slot: usize, val: u16) {
 }
 
 // Used (device) ring: [flags: u16, idx: u16, ring[N]: {id: u32, len: u32}]
+
+/// Whether the device asked not to be notified of new buffers
+/// (`VRING_USED_F_NO_NOTIFY`): it is polling the ring itself, and a doorbell is
+/// only an exit to its emulator. Read after [`kick_barrier`], so the flag seen
+/// is not older than the index just published.
+unsafe fn device_wants_notify(used_base: usize) -> bool {
+    read_volatile(used_base as *const u16) & 1 == 0
+}
+
 unsafe fn used_idx(used_base: usize) -> u16 {
     read_volatile((used_base + 2) as *const u16)
 }
@@ -203,6 +212,25 @@ unsafe fn used_ring_id(used_base: usize, slot: usize) -> u32 {
 
 unsafe fn used_ring_len(used_base: usize, slot: usize) -> u32 {
     read_volatile((used_base + 4 + slot * 8 + 4) as *const u32)
+}
+
+/// A full barrier between publishing `avail.idx` and what follows it: reading
+/// the device's `used.flags`, then the `QUEUE_NOTIFY` write. Without it the
+/// flag can be read before the publish is visible, and a notify can reach the
+/// device before the index it announces.
+///
+/// `dsb sy` on aarch64 covers the full system shareability domain, which the
+/// device sits outside of; a `dmb ish` orders only the inner-shareable one.
+/// Mirrors `kernel::sys::hal::dma_kick_barrier`.
+#[inline(always)]
+fn kick_barrier() {
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: a barrier; it touches no memory and no register.
+    unsafe {
+        core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
 }
 
 // ============================================================================
@@ -393,6 +421,7 @@ unsafe fn poll_rx(s: &mut VirtioNetState) {
     let sys = &*s.syscalls;
 
     let mut count = 0;
+    let mut refilled = false;
     while count < 4 {
         let ui = used_idx(s.rxq.used);
         let lu = s.rxq.last_used;
@@ -428,9 +457,15 @@ unsafe fn poll_rx(s: &mut VirtioNetState) {
         core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
         s.rxq.next_avail = ai.wrapping_add(1);
         avail_set_idx(s.rxq.avail, s.rxq.next_avail);
-        mmio_write(s.device_base, QUEUE_NOTIFY, 0);
+        refilled = true;
 
         count += 1;
+    }
+    if refilled {
+        kick_barrier();
+        if device_wants_notify(s.rxq.used) {
+            mmio_write(s.device_base, QUEUE_NOTIFY, 0);
+        }
     }
 }
 
@@ -502,27 +537,12 @@ unsafe fn poll_tx(s: &mut VirtioNetState) {
     avail_ring_set(s.txq.avail, (ai as usize) % QUEUE_SIZE, 0);
     s.txq.next_avail = ai.wrapping_add(1);
     avail_set_idx(s.txq.avail, s.txq.next_avail);
-    // Full DSB barrier immediately before the QUEUE_NOTIFY write —
-    // and AFTER `avail_set_idx`. `avail.idx` is the queue-visible
-    // publish store that has to be ordered before the notify;
-    // otherwise the device can pick up the notify and still observe
-    // the old `avail.idx`. Placing the barrier before
-    // `avail_set_idx` would order only the descriptor + ring writes,
-    // not the publish.
-    //
-    // `dsb sy` on aarch64 covers the full system shareability domain
-    // — PCIe-attached virtio MMIO sits OUTSIDE the inner-shareable
-    // domain that `dmb ish` orders. On other architectures
-    // `compiler_fence(SeqCst)` keeps the optimiser from reordering
-    // the kick before the publish. Mirrors
-    // `kernel::sys::hal::dma_kick_barrier`.
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+    // After `avail_set_idx`, not before: `avail.idx` is the publish the
+    // notify announces, so it is the store the barrier must order.
+    kick_barrier();
+    if device_wants_notify(s.txq.used) {
+        mmio_write(s.device_base, QUEUE_NOTIFY, 1);
     }
-    #[cfg(not(target_arch = "aarch64"))]
-    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
-    mmio_write(s.device_base, QUEUE_NOTIFY, 1);
 }
 
 // ============================================================================
@@ -534,6 +554,8 @@ unsafe fn poll_tx(s: &mut VirtioNetState) {
 pub extern "C" fn module_deferred_ready() -> u32 {
     1
 }
+
+declare_module_state_bytes!([u8; STATE_SIZE]);
 
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_state_size"]
@@ -636,16 +658,9 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     let s = &mut *(state as *mut VirtioNetState);
     s.step_count = s.step_count.wrapping_add(1);
 
-    // Acknowledge any pending interrupt status. With the interrupt bound
-    // (IRQ_BIND) the kernel's handler acknowledges it first and this reads
-    // zero; with the binding refused nothing else would, and the device
-    // would stop raising interrupts the used ring still needs.
-    if s.device_base != 0 {
-        let isr = mmio_read(s.device_base, INTERRUPT_STATUS);
-        if isr != 0 {
-            mmio_write(s.device_base, INTERRUPT_ACK, isr);
-        }
-    }
+    // No per-step read of the interrupt status: the rings are polled in memory,
+    // and the kernel acknowledges the interrupt it is bound to. Every register
+    // access is an exit to the device's emulator, which may be busy.
 
     // Send MAC announcement once after init; that step reports Ready.
     let mut ready = false;

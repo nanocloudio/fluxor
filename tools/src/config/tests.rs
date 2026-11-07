@@ -3103,18 +3103,36 @@ mod continuity_tests {
             })
         };
         let mods = names(&["http_chain", "router", "store"]);
-        validate_single_provider(&graph("store.commands"), &mods, &manifests(store(false), None), LINUX)
-            .expect("the store answers whatever its command input has carried");
-        let e = validate_single_provider(&graph("store.commands"), &mods, &manifests(store(true), None), LINUX)
-            .unwrap_err()
-            .to_string();
-        assert!(e.contains("which it feeds (`http_chain` → `router` → `store`)"), "{e}");
+        validate_single_provider(
+            &graph("store.commands"),
+            &mods,
+            &manifests(store(false), None),
+            LINUX,
+        )
+        .expect("the store answers whatever its command input has carried");
+        let e = validate_single_provider(
+            &graph("store.commands"),
+            &mods,
+            &manifests(store(true), None),
+            LINUX,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.contains("which it feeds (`http_chain` → `router` → `store`)"),
+            "{e}"
+        );
         // Defaults stay conservative: an undeclared port, or an endpoint
         // naming no port, gates.
         for into in ["store.snapshot_import", "store"] {
-            let e = validate_single_provider(&graph(into), &mods, &manifests(store(false), None), LINUX)
-                .unwrap_err()
-                .to_string();
+            let e = validate_single_provider(
+                &graph(into),
+                &mods,
+                &manifests(store(false), None),
+                LINUX,
+            )
+            .unwrap_err()
+            .to_string();
             assert!(e.contains("which it feeds"), "{into}: {e}");
         }
 
@@ -3126,18 +3144,37 @@ mod continuity_tests {
             named_port("out", 1, "OctetStream"),
         ];
         let mut through = graph("mid.in");
-        through["modules"].as_array_mut().unwrap().push(json!({"name": "mid", "type": "cache", "volume": "c"}));
-        through["wiring"].as_array_mut().unwrap().push(json!({"from": "mid.out", "to": "store.commands"}));
+        through["modules"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"name": "mid", "type": "cache", "volume": "c"}));
+        through["wiring"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"from": "mid.out", "to": "store.commands"}));
         let names3 = names(&["http_chain", "router", "mid", "store"]);
-        let e = validate_single_provider(&through, &names3, &manifests(store(false), Some(mid.clone())), LINUX)
-            .unwrap_err()
-            .to_string();
-        assert!(e.contains("which it feeds (`http_chain` → `router` → `mid` → `store`)"), "{e}");
+        let e = validate_single_provider(
+            &through,
+            &names3,
+            &manifests(store(false), Some(mid.clone())),
+            LINUX,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.contains("which it feeds (`http_chain` → `router` → `mid` → `store`)"),
+            "{e}"
+        );
         // The same intermediate entered through a port it does not wait on
         // is just another hop.
         mid.ports[0].gates_readiness = false;
-        validate_single_provider(&through, &names3, &manifests(store(false), Some(mid)), LINUX)
-            .expect("no provider on the path waits on what it hears");
+        validate_single_provider(
+            &through,
+            &names3,
+            &manifests(store(false), Some(mid)),
+            LINUX,
+        )
+        .expect("no provider on the path waits on what it hears");
     }
 
     /// A claim with `active_when_params` counts only for an instance that
@@ -3216,8 +3253,13 @@ mod continuity_tests {
             validate_provider_domains(c, &modules, &m, "linux")
         };
         check(&config(Value::Null)).expect("http never calls the store");
-        let e = check(&config(json!("/dataplane/edge/"))).unwrap_err().to_string();
-        assert!(e.contains("module 'http' (domain 'net') requires `storage.namespace`"), "{e}");
+        let e = check(&config(json!("/dataplane/edge/")))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("module 'http' (domain 'net') requires `storage.namespace`"),
+            "{e}"
+        );
     }
 
     /// A port of `module`'s manifest, by name and content type.
@@ -4087,6 +4129,31 @@ mod capacity_envelope_tests {
     use super::*;
     use serde_json::json;
 
+    /// `boot:` map → the FXBO section, its fields where the kernel reads them.
+    #[test]
+    fn boot_map_encodes_where_the_kernel_reads_it() {
+        let cfg = json!({"boot": {"fault_probe": true, "lockup_probe": true, "summary_every_s": 7, "summary_for_s": 8, "max_uptime_s": 9}});
+        let p = super::boot_params(&cfg).unwrap().unwrap();
+        let s = crate::capacity::encode_boot_section(&p);
+        assert_eq!(&s[0..4], &0x4658_424Fu32.to_le_bytes());
+        assert_eq!(s.len(), 26);
+        assert_eq!(u32::from_le_bytes(s[4..8].try_into().unwrap()), 26);
+        let payload = &s[10..];
+        assert_eq!(payload[0], 0);
+        assert_eq!(payload[1], 1);
+        assert_eq!(payload[2], 1);
+        assert_eq!(payload[3], 0);
+        assert_eq!(u32::from_le_bytes(payload[4..8].try_into().unwrap()), 7);
+        assert_eq!(u32::from_le_bytes(payload[8..12].try_into().unwrap()), 8);
+        assert_eq!(u32::from_le_bytes(payload[12..16].try_into().unwrap()), 9);
+        assert!(super::boot_params(&json!({"boot": {"bogus": 1}})).is_err());
+        assert!(super::boot_params(&json!({"boot": 1})).is_err());
+        assert!(super::boot_params(&json!({"boot": {"fault_probe": 1}})).is_err());
+        assert!(super::boot_params(&json!({"boot": {"max_uptime_s": -1}})).is_err());
+        assert!(super::boot_params(&json!({"boot": {"max_uptime_s": 1u64 << 32}})).is_err());
+        assert!(super::boot_params(&json!({})).unwrap().is_none());
+    }
+
     /// `capacity:` map → FXEV section appended; entries carry the contract
     /// pool ids and the asked n.
     #[test]
@@ -4310,6 +4377,21 @@ mod dynamic_capacity_tests {
         assert!(!kernel_has_pool("pi5", "store_writes"));
         assert!(kernel_has_pool("rp2350", "state_arena"));
         assert!(!kernel_has_pool("rp2350", "store_subs"));
+        // uefi: bare-metal aarch64 like bcm2712, without its control-plane store.
+        for t in ["uefi", "qemu-uefi-arm64", "ec2-arm64"] {
+            assert_eq!(crate::capacity::kernel_profile(t), "profile_uefi");
+            assert!(crate::capacity::graph_section_per_graph(t));
+            assert_eq!(kernel_max_modules(t), 1024);
+            assert_eq!(kernel_max_owners(t), 64);
+            assert_eq!(kernel_pool_default_reserve(t, "module_slots"), Some(256));
+            assert_eq!(
+                kernel_pool_default_reserve(t, "state_arena"),
+                Some(512 * 1024 * 1024)
+            );
+            assert!(kernel_has_pool(t, "net_route_peers"));
+            assert!(!kernel_has_pool(t, "store_subs"));
+            assert!(!kernel_has_pool(t, "store_reads"));
+        }
     }
 
     #[test]
@@ -6194,8 +6276,9 @@ mod check_mode_file_tests {
         let pack = |module: Value| {
             let m = normalize_peer_names("cli", "tls", module, all).unwrap();
             let mut entry = vec![0u8; 512];
-            let end = crate::schema::build_params_from_schema(&m, &schema, &mut entry, 0, None, "tls")
-                .unwrap();
+            let end =
+                crate::schema::build_params_from_schema(&m, &schema, &mut entry, 0, None, "tls")
+                    .unwrap();
             assert_eq!(entry[end - 2..end], [0xFF, 0], "no extended entries");
             packed_entries(&entry[..end])
         };
@@ -6244,12 +6327,18 @@ mod check_mode_file_tests {
 
         // A literal the module would refuse is refused here, with the reason.
         for (bad, says) in [
-            (json!({"verify_uri": "spiffe://"}), "must be scheme://authority/path"),
+            (
+                json!({"verify_uri": "spiffe://"}),
+                "must be scheme://authority/path",
+            ),
             (
                 json!({"verify_hostname": format!("{}.example", "a".repeat(60))}),
                 "over the 64-byte limit",
             ),
-            (json!({"verify_hostname": 7}), "a string or an `{env: NAME}` binding"),
+            (
+                json!({"verify_hostname": 7}),
+                "a string or an `{env: NAME}` binding",
+            ),
             (json!({"alpn": "h2,,x"}), "alpn name ''"),
         ] {
             let err = normalize_peer_names("cli", "tls", bad, all).unwrap_err();
@@ -6257,7 +6346,10 @@ mod check_mode_file_tests {
         }
         // A module whose schema declares none of them is left alone.
         let other = json!({"alpn": ["x"]});
-        assert_eq!(normalize_peer_names("m", "mqtt", other.clone(), |_| false).unwrap(), other);
+        assert_eq!(
+            normalize_peer_names("m", "mqtt", other.clone(), |_| false).unwrap(),
+            other
+        );
     }
 
     #[test]
@@ -6268,7 +6360,10 @@ mod check_mode_file_tests {
             s(json!(["h2", "http/1.1"])).unwrap().as_deref(),
             Some("h2,http/1.1")
         );
-        assert_eq!(s(json!("h2,http/1.1")).unwrap().as_deref(), Some("h2,http/1.1"));
+        assert_eq!(
+            s(json!("h2,http/1.1")).unwrap().as_deref(),
+            Some("h2,http/1.1")
+        );
         assert_eq!(alpn_param("m", "tls", None).unwrap(), None);
         // A name tls cannot record whole, an empty one, a space, a comma
         // inside a listed name, a non-string.
@@ -6280,6 +6375,9 @@ mod check_mode_file_tests {
         // quic keeps its 24-byte names.
         assert!(alpn_param("m", "quic", Some(&json!("a-protocol-name-17"))).is_ok());
         assert!(alpn_param("m", "quic", Some(&json!("x".repeat(25)))).is_err());
-        assert!(s(json!(vec!["abcdefgh"; 8])).is_err(), "over 64 bytes in all");
+        assert!(
+            s(json!(vec!["abcdefgh"; 8])).is_err(),
+            "over 64 bytes in all"
+        );
     }
 }

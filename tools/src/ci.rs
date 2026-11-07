@@ -1074,6 +1074,27 @@ fn clippy_matrix(project_root: &Path) -> std::result::Result<(), String> {
             feature_gate: Some("board-pi5"),
             package_gate: None,
         },
+        // The uefi runtime's QEMU board: its emulator-scaled deadline.
+        ClippyJob {
+            label: "kernel board-qemu-uefi",
+            cwd: "",
+            args: &[
+                "clippy",
+                "--release",
+                "--target",
+                "aarch64-unknown-none",
+                "--no-default-features",
+                "--features",
+                "board-qemu-uefi",
+                "--",
+                "-D",
+                "warnings",
+                "-C",
+                "target-feature=+aes,+sha2,+neon",
+            ],
+            feature_gate: Some("board-qemu-uefi"),
+            package_gate: None,
+        },
         // wasm.
         ClippyJob {
             label: "kernel wasm",

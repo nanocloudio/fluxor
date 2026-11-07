@@ -129,7 +129,7 @@ pub unsafe fn detach(owner: OwnerHandle) {
 // The capacity is the provider's to state (`wl::NET_PROVIDE [lanes:u8]`): a
 // lane id is a `u8`, so it is at most 255. The tables are boot tables
 // (`kernel::mem::table`) sized when the provider claims the role, which it
-// does while its graph is instantiated: carved on bcm2712, allocated on
+// does while its graph is instantiated: carved on aarch64, allocated on
 // Linux, the profile's static array elsewhere ([`STATIC_LANES`]). Across a
 // rebuild they keep `max(previous, stated)`.
 //
@@ -152,9 +152,9 @@ const _: () = assert!(LANE_CEILING == u8::MAX as usize);
 /// Lanes the static table holds where tables are not sized at boot (wasm,
 /// RP): the profile's compiled size, and the most a provider there may
 /// state.
-#[cfg(not(any(feature = "host-linux", feature = "chip-bcm2712")))]
+#[cfg(not(any(feature = "host-linux", feature = "aarch64-metal")))]
 pub const STATIC_LANES: usize = 16;
-#[cfg(any(feature = "host-linux", feature = "chip-bcm2712"))]
+#[cfg(any(feature = "host-linux", feature = "aarch64-metal"))]
 const STATIC_LANES: usize = 0;
 
 #[derive(Clone, Copy)]

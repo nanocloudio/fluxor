@@ -1106,6 +1106,7 @@ mod tests {
             ("esp32", "esp32", "xtensa-lx6"),
             ("uefi", "uefi", "aarch64"),
             ("qemu-uefi-arm64", "uefi", "aarch64"),
+            ("ec2-arm64", "uefi", "aarch64"),
         ] {
             let desc = super::load_target(target, &root).expect("target loads");
             assert_eq!(desc.runtime(), runtime, "target `{target}` runtime");

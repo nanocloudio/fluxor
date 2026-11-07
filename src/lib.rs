@@ -10,29 +10,30 @@
 
 #[cfg(any(
     feature = "rp",
-    feature = "chip-bcm2712",
+    feature = "aarch64-metal",
     feature = "host-linux",
     feature = "host-wasm"
 ))]
 #[path = "../modules/sdk/abi.rs"]
 pub mod abi;
 
-/// Architecture primitives (barriers, interrupt masks, NVIC). Cortex-M
-/// only today; see `arch/mod.rs` for why AArch64 has not moved yet.
+/// Architecture primitives: the Cortex-M ones (barriers, interrupt masks,
+/// NVIC) and, for the AArch64 bare-metal platforms, `arch::aarch64` (vectors,
+/// GIC, generic timer, PSCI, the boot identity map).
 ///
 /// Unconditional so that `arch::nvic`'s arithmetic is compiled — and its
 /// tests run — on host builds too. The asm-bearing half is ARM-gated inside.
 pub mod arch;
 #[cfg(any(
     feature = "rp",
-    feature = "chip-bcm2712",
+    feature = "aarch64-metal",
     feature = "host-linux",
     feature = "host-wasm"
 ))]
 pub mod kernel;
 #[cfg(any(
     feature = "rp",
-    feature = "chip-bcm2712",
+    feature = "aarch64-metal",
     feature = "host-linux",
     feature = "host-wasm"
 ))]
@@ -40,11 +41,15 @@ pub mod kernel;
 pub mod modules;
 #[cfg(any(
     feature = "rp",
-    feature = "chip-bcm2712",
+    feature = "aarch64-metal",
     feature = "host-linux",
     feature = "host-wasm"
 ))]
 pub mod platform;
+
+/// The loader's handoff, for the `uefi` platform.
+#[cfg(feature = "host-uefi")]
+pub use fluxor_contracts::boot;
 
 // WASM platform exports + host imports. Included as part of the
 // `cdylib` build under `host-wasm` so `kernel_init` / `kernel_step` /
@@ -57,7 +62,7 @@ pub mod wasm_entry;
 // FNV-1a hash as `crate::fnv1a32`. Implementation lives in `abi::wire`.
 #[cfg(any(
     feature = "rp",
-    feature = "chip-bcm2712",
+    feature = "aarch64-metal",
     feature = "host-linux",
     feature = "host-wasm"
 ))]

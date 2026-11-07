@@ -174,15 +174,15 @@ fn sample_cur(pool: u16) -> u64 {
 
 /// The pool's capacity where it is not a plan: the config blob's mapped
 /// length for the config arena, which is observed and never allocated from,
-/// and on bcm2712 the state arena the device tree's memory leaves.
+/// and on aarch64 bare metal and RP the state arena the platform placed.
 fn observed_cap(pool: u16) -> Option<u64> {
     match pool {
         res::POOL_CONFIG_ARENA => Some(crate::kernel::boot::config::config_params_usage().1 as u64),
-        // bcm2712's arena is what the device tree's zone holds after the
+        // aarch64's arena is what the machine's DRAM zone holds after the
         // kernel's tables are carved from it, RP's what the static pool holds
         // beside the graph's tables and buffer arena — not the planning
         // figure.
-        #[cfg(any(feature = "chip-bcm2712", feature = "rp"))]
+        #[cfg(any(feature = "aarch64-metal", feature = "rp"))]
         res::POOL_STATE_ARENA => Some(crate::kernel::module::loader::arena_cap() as u64),
         _ => None,
     }
@@ -565,7 +565,7 @@ fn resident_demand(config: &crate::kernel::boot::config::Config) -> (usize, usiz
 /// with a consumer-side channel of its own beside the producer's
 /// (`bridge_cross_domain_edges`). A tee or merge takes the domain of the
 /// module it fans on, so fanning adds no crossing.
-#[cfg(feature = "chip-bcm2712")]
+#[cfg(feature = "smp")]
 fn cross_domain_edges(config: &crate::kernel::boot::config::Config) -> usize {
     use crate::kernel::boot::config::EdgeClass;
     let domain = |id: crate::kernel::exec::scheduler::ModuleId| {
@@ -581,17 +581,18 @@ fn cross_domain_edges(config: &crate::kernel::boot::config::Config) -> usize {
 }
 
 /// Derive every pool's structural size from `config`. A fan doubles as a
-/// module and an edge; a resident workload's edges may each fan; on bcm2712 a
-/// cross-domain edge takes a second channel, its consumer side.
+/// module and an edge; a resident workload's edges may each fan; on a
+/// multi-domain (`smp`) kernel a cross-domain edge takes a second channel, its
+/// consumer side.
 pub fn plan(config: &crate::kernel::boot::config::Config) {
     let modules = config.modules.iter().flatten().count();
     let edges = config.edge_count as usize;
     let fans = fan_count(config);
     let (workloads, wl_modules, wl_edges) = resident_demand(config);
     let module_slots = modules + fans + wl_modules + wl_edges;
-    #[cfg(feature = "chip-bcm2712")]
+    #[cfg(feature = "smp")]
     let channels = edges + fans + 2 * wl_edges + cross_domain_edges(config);
-    #[cfg(not(feature = "chip-bcm2712"))]
+    #[cfg(not(feature = "smp"))]
     let channels = edges + fans + 2 * wl_edges;
     set_derived(res::POOL_MODULE_SLOTS, module_slots as u32);
     set_derived(res::POOL_CHANNELS, channels as u32);

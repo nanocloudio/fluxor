@@ -124,6 +124,10 @@ pub(crate) const EMBEDDED_BOARDS: &[(&str, &str)] = &[
         include_str!("../../../targets/boards/ec2-linux-arm64.toml"),
     ),
     (
+        "ec2-arm64",
+        include_str!("../../../targets/boards/ec2-arm64.toml"),
+    ),
+    (
         "qemu-uefi-arm64",
         include_str!("../../../targets/boards/qemu-uefi-arm64.toml"),
     ),

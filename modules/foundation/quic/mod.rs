@@ -806,6 +806,8 @@ fn authority_of(s: &QuicState) -> &[u8] {
     &s.authority[..s.authority_len as usize]
 }
 
+declare_module_state_bytes!(QuicState);
+
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 pub extern "C" fn module_state_size() -> u32 {
     core::mem::size_of::<QuicState>() as u32

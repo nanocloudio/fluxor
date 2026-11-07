@@ -5,7 +5,7 @@ timer_class = "wall_clock"
 # about what has been built and run, not about what the code can express.
 # `linux` is here because a Linux graph that terminates TLS is a first-class
 # deployment, and a consumer cannot wire a module its target list excludes.
-hardware_targets = ["rp2350", "bcm2712", "linux"]
+hardware_targets = ["rp2350", "bcm2712", "linux", "uefi"]
 
 # Ingress anchor role: tls terminates the client-visible secure stream in
 # front of the consumer it serves, so it owns the attachment a client sees

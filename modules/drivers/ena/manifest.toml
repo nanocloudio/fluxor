@@ -1,0 +1,28 @@
+version = "1.0.0"
+hardware_targets = ["uefi"]
+permissions = ["pcie_device", "dma"]
+
+# Amazon's Elastic Network Adapter: one queue pair in host memory, polled. Frames
+# reach `ip` and leave it exactly as with any other NIC here, and the MAC address
+# is announced on `frames_rx`.
+
+[[ports]]
+name = "frames_tx"
+direction = "input"
+content_type = "EthernetFrame"
+buffer_size = 16384
+
+[[ports]]
+name = "frames_rx"
+direction = "output"
+content_type = "EthernetFrame"
+required = true
+buffer_size = 16384
+max_record = 1514
+
+[[resources]]
+requires_contract = "pcie_device"
+access = "exclusive"
+
+[observability]
+exempt = "L2 frame DMA shim: wire-byte throughput is observed at the ip module above it; its '[ena]' lines report bring-up, link and faults"

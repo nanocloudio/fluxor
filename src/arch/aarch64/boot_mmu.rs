@@ -4,14 +4,17 @@
 //! Distinct from the per-module isolation tables (`isolation`), which
 //! the kernel programmes at runtime. This is the one map the kernel itself
 //! runs under: identity, 4 KB granule, EL1, 39-bit VA, 40-bit PA, 16-bit
-//! ASIDs, built from 1 GB blocks with the first gigabyte split into 2 MB
-//! blocks (and the blocks around kernel stack guard pages into 4 KB pages).
+//! ASIDs, built from 1 GB blocks with one gigabyte (the one the kernel lies
+//! in) split into 2 MB blocks (and the blocks around kernel stack guard
+//! pages into 4 KB pages).
 //!
 //! What goes where is the machine's: a Pi 5 has DRAM from address 0 and
 //! its peripherals in apertures from 64 GB up, QEMU's `virt` machine has
-//! RAM from 1 GB and devices below it. So the platform describes its map in [`Kind`]s, gigabyte by gigabyte
-//! ([`map_gb`]) and 2 MB block by block in the first gigabyte
-//! ([`map_2mb`]), then calls [`enable`].
+//! RAM from 1 GB and devices below it. So the platform describes its map in
+//! [`Kind`]s, gigabyte by gigabyte ([`map_gb`]) and 2 MB block by block in
+//! the split gigabyte ([`split_gb`], [`map_2mb`]), then calls [`enable`]. A
+//! device above the map's 512 GB reaches the kernel through a gigabyte the
+//! platform gives up to it ([`alias_gb`]).
 //!
 //! MAIR indices: 0 Normal Write-Back Write-Allocate, 1 Device-nGnRE,
 //! 2 Normal Non-cacheable (DMA arenas: hardware and CPU see the same
@@ -104,10 +107,14 @@ pub struct PageTable([u64; 512]);
 #[link_section = ".bss"]
 pub static mut L1_TABLE: PageTable = PageTable([0; 512]);
 
-/// L2 for the first gigabyte: 512 × 2 MB, so a DMA arena or a stack guard
-/// in the kernel's own BSS can differ from the DRAM around it.
+/// L2 for the gigabyte the kernel lies in: 512 × 2 MB, so a DMA arena or a
+/// stack guard in the kernel's own BSS can differ from the DRAM around it.
 #[link_section = ".bss"]
 static mut L2_TABLE_0: PageTable = PageTable([0; 512]);
+
+/// Which gigabyte `L2_TABLE_0` maps.
+#[link_section = ".bss"]
+static mut L2_GB: usize = 0;
 
 /// L3 tables for the 2 MB blocks that hold a kernel stack guard page — one
 /// per guard at most.
@@ -136,36 +143,67 @@ pub unsafe fn map_gb(index: usize, kind: Kind) {
     (*l1)[index] = block((index as u64) << 30, kind);
 }
 
+/// Point gigabyte `index` of the live map at physical gigabyte `phys_gb`: a
+/// device beyond the map's 512 GB reaches the kernel through an alias. Break
+/// before make, since the slot held a block already.
+///
+/// # Safety
+/// The boot core, MMU on, with no access to gigabyte `index` in flight or to come
+/// except through the new mapping.
+pub unsafe fn alias_gb(index: usize, phys_gb: u64, kind: Kind) {
+    let slot = (&raw mut L1_TABLE.0).cast::<u64>().add(index);
+    core::ptr::write_volatile(slot, 0);
+    core::arch::asm!(
+        "dsb ishst",
+        "tlbi vmalle1is",
+        "dsb ish",
+        "isb",
+        options(nostack)
+    );
+    core::ptr::write_volatile(slot, block(phys_gb << 30, kind));
+    core::arch::asm!("dsb ishst", "isb", options(nostack));
+}
+
 /// Split the first gigabyte into 2 MB blocks, all `kind`, so that
 /// [`map_2mb`] and [`unmap_stack_guards`] can refine it.
 ///
 /// # Safety
 /// As [`map_gb`].
 pub unsafe fn split_first_gb(kind: Kind) {
-    let l2 = &raw mut L2_TABLE_0.0;
-    for (i, e) in (*l2).iter_mut().enumerate() {
-        *e = block((i as u64) * 0x20_0000, kind);
-    }
-    let l1 = &raw mut L1_TABLE.0;
-    (*l1)[0] = table_desc(&raw const L2_TABLE_0 as u64);
+    split_gb(0, kind);
 }
 
-/// Map 2 MB block `index` of the first gigabyte (address `index << 21`)
-/// as `kind`. Needs [`split_first_gb`] first.
+/// Split gigabyte `gb` into 2 MB blocks, all `kind`, so that [`map_2mb`] and
+/// [`unmap_stack_guards`] can refine it. One gigabyte at most can be split.
+///
+/// # Safety
+/// As [`map_gb`].
+pub unsafe fn split_gb(gb: usize, kind: Kind) {
+    L2_GB = gb;
+    let l2 = &raw mut L2_TABLE_0.0;
+    for (i, e) in (*l2).iter_mut().enumerate() {
+        *e = block(((gb as u64) << 30) + (i as u64) * 0x20_0000, kind);
+    }
+    let l1 = &raw mut L1_TABLE.0;
+    (*l1)[gb] = table_desc(&raw const L2_TABLE_0 as u64);
+}
+
+/// Map 2 MB block `index` of the split gigabyte as `kind`. Needs
+/// [`split_gb`] first.
 ///
 /// # Safety
 /// As [`map_gb`].
 pub unsafe fn map_2mb(index: usize, kind: Kind) {
     let l2 = &raw mut L2_TABLE_0.0;
-    (*l2)[index] = block((index as u64) * 0x20_0000, kind);
+    (*l2)[index] = block(((L2_GB as u64) << 30) + (index as u64) * 0x20_0000, kind);
 }
 
-/// Leave each kernel stack's guard page (a 4 KB address in the first
+/// Leave each kernel stack's guard page (a 4 KB address in the split
 /// gigabyte) unmapped, so an overflow faults at an address instead of
 /// writing through the statics below the stack: the 2 MB block holding
 /// the guard is split into 4 KB pages carrying the block's attributes,
 /// with the guard page invalid. Two guards in one block share its table.
-/// Needs [`split_first_gb`] first.
+/// Needs [`split_gb`] first.
 ///
 /// # Safety
 /// As [`map_gb`].
@@ -176,7 +214,7 @@ pub unsafe fn unmap_stack_guards(guards: &[u64]) {
     let l2 = &mut *(&raw mut L2_TABLE_0).cast::<[u64; 512]>();
     let mut used = 0usize;
     for &guard in guards {
-        let l2i = (guard >> 21) as usize;
+        let l2i = ((guard >> 21) as usize).wrapping_sub(L2_GB << 9);
         if l2i >= 512 {
             continue;
         }
