@@ -235,6 +235,11 @@ async fn session(host: &str, port: u16, tls: Arc<ClientConfig>, echo: bool) -> R
         .await
         .map_err(|e| format!("tcp_connect: {e}"))?;
     stream.set_nodelay(true).ok();
+    // The client closes first, so each connection would leave this side's
+    // port in TIME_WAIT for a minute; above about 500 handshakes a second
+    // the ephemeral range runs out. A zero linger ends the connection with a
+    // RST once the TLS close is sent, keeping the port free.
+    stream.set_zero_linger().ok();
     let server_name: RustlsServerName<'static> =
         RustlsServerName::try_from(host.to_string()).map_err(|e| format!("server_name: {e}"))?;
     let mut tls = TlsConnector::from(tls)
@@ -591,7 +596,12 @@ fn process_cpu_s() -> f64 {
         return 0.0;
     };
     let fields: Vec<&str> = rest.split_whitespace().collect();
-    let ticks = |i: usize| fields.get(i).and_then(|f| f.parse::<u64>().ok()).unwrap_or(0);
+    let ticks = |i: usize| {
+        fields
+            .get(i)
+            .and_then(|f| f.parse::<u64>().ok())
+            .unwrap_or(0)
+    };
     // After the parenthesis, field 3 (state) is index 0, so utime (14) is 11.
     (ticks(11) + ticks(12)) as f64 / 100.0
 }

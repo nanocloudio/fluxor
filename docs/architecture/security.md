@@ -247,10 +247,11 @@ A labelled key asked to persist is sealed through the platform HAL.
   higher sequence. Without one: on Linux, one file per label under
   `FLUXOR_VAULT_DIR`, or `vault/` under `FLUXOR_STORE_DIR`; on a bare-metal
   board, nowhere — keys serve the boot that made them, and `DESCRIBE`
-  reports them unpersisted. On a Pi 5 the NVMe's External backing space
-  keeps its first 32 KiB out of every arena for this: `vault_store` over the
-  `nvme` module's `blocks` at `start_sector: 2097152`, `sector_count: 64`,
-  `image: 16384`.
+  reports them unpersisted. On a Pi 5 the store is a file on the board's
+  FAT32 (`file_block` under the `fat32` on `nvme.blocks`); a graph with
+  nothing else on `nvme.blocks` can use the first 32 KiB of the NVMe's
+  External backing space instead, which every arena leaves free:
+  `start_sector: 2097152`, `sector_count: 64`, `image: 16384`.
 - **Waiting for the medium.** A key made with `PERSIST` through a
   `vault_store` is in the image at once and on the medium only once the module
   reports it. Until then the open that made it, and every open of it, answers
@@ -442,6 +443,19 @@ than the instance holds is dropped whole. Until one is taken, a handshake that
 reaches its Certificate is refused rather than presenting nothing honest.
 A label identity is refused at construction alongside `cert_file` or
 `key_file`, without a vault, or with either port unwired.
+
+An issuer that takes proof of possession, such as a device signer redeeming
+a claim, needs more than the point. With `identity_request: csr` the request
+is a PKCS#10 instead (`[0x5D][len][DER]`): version 0, subject
+`CN=<identity_subject>` or empty, the key's SubjectPublicKeyInfo, no
+attributes, signed ecdsa-with-SHA256 in the vault. The TLS module builds the
+whole request from the key it holds and a name from its params, so the
+vault signs one shape for it and nothing a caller supplies: no other module
+reaches the key's signature, and the request asserts only what a certificate
+for the key would. The alternative, a vault lending a key's signature to a
+named module, would let that module sign anything under the key, which is
+wider than a request needs. The request is built once per key and resent as
+it is; it is public, and replaying it is useless without the key.
 
 With `trust_issuer`, the issuer of the chain the instance is certified
 with — its last certificate — is also a trust anchor, placed after the

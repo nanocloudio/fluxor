@@ -1101,7 +1101,7 @@ struct TlsState {
     eph_used: [bool; MAX_SESSIONS], // true if key has been consumed
     // Lifetime counters surfaced on the `[tls] hb` line. The pool
     // cliff signal is `ecdh_fallback_keygen > 0`: once seen, every
-    // new session pays the synchronous keygen cost.
+    // new P-256 session pays the synchronous keygen cost.
     ecdh_pool_hit: u32,
     ecdh_fallback_keygen: u32,
     /// `tls_write_frame` failures across cipher_out / clear_out;
@@ -1544,7 +1544,8 @@ define_params! {
 
     // How many ephemeral ECDH keys to mint before this module is ready.
     //
-    // The pool keeps a synchronous keygen off a SERVER's hot accept path.
+    // The pool keeps a synchronous keygen off the path of a SERVER handshake
+    // that selects P-256 (an X25519 handshake takes no pool key).
     // Minting all of it at `module_new` would charge every deployment a
     // busy server's warm-up, a full ladder per key before anything else
     // runs, and a client that opens one connection would discard all but
@@ -1553,7 +1554,7 @@ define_params! {
     // `ecdh_bits_per_step` a tick. A deployment that accepts many
     // simultaneous handshakes from cold sets this higher and pays for what
     // it asked for; one that does not is not charged for it. Beyond the
-    // warm count a handshake takes the `fallback_keygen` path, counted in
+    // warm count a P-256 handshake takes the `fallback_keygen` path, counted in
     // the heartbeat.
     18, ecdh_pool_warm, u16, 4
         => |s, d, len| {
@@ -1738,6 +1739,17 @@ define_params! {
                 s.alpn_cfg_bad = 1;
             }
         };
+
+    // With `identity_label`: what `identity_req` carries. `point`, the key's
+    // SEC1 point (0x5B); `csr`, a PKCS#10 for it signed in the vault (0x5D),
+    // for an issuer that takes proof of possession (identity.rs).
+    27, identity_request, u8, 0, enum { point=0, csr=1 }
+        => |s, d, len| { s.label_id.request_form = p_u8(d, len, 0, 255); };
+
+    // With `identity_request: csr`: the request's subject, `CN=<this>`; at
+    // most 64 printable ASCII bytes. Unset, the subject is empty.
+    28, identity_subject, str, 0
+        => |s, d, len| { s.label_id.set_subject(core::slice::from_raw_parts(d, len)); };
 }
 
 /// `TlsSession::peer_closed` bits.
@@ -5043,7 +5055,16 @@ unsafe fn zeroize_post_app_keys(driver: &mut HandshakeDriver) {
     }
 }
 
+/// A client offers its P-256 share in the ClientHello, so it takes its
+/// key here. A server takes one only when it selects P-256 from the
+/// ClientHello (`pump_recv_client_hello`): a session that agrees on
+/// X25519 never needs it.
 unsafe fn init_session_crypto(s: &mut TlsState, idx: usize) {
+    // Default suite (will be set during handshake)
+    s.sessions[idx].driver.suite = CipherSuite::ChaCha20Poly1305;
+    if s.sessions[idx].driver.is_server {
+        return;
+    }
     let sys = &*s.syscalls;
     let ok = assign_fresh_ecdh_key(
         sys,
@@ -5057,10 +5078,7 @@ unsafe fn init_session_crypto(s: &mut TlsState, idx: usize) {
     if !ok {
         s.sessions[idx].state = SessionState::Error;
         s.last_err_site = 6;
-        return;
     }
-    // Default suite (will be set during handshake)
-    s.sessions[idx].driver.suite = CipherSuite::ChaCha20Poly1305;
 }
 
 // ============================================================================
@@ -5738,6 +5756,19 @@ unsafe fn pump_recv_client_hello(s: &mut TlsState, idx: usize) -> bool {
             );
             sess.driver.peer_key_share_len = key_data.len() as u8;
             sess.driver.group = GROUP_SECP256R1;
+            if !assign_fresh_ecdh_key(
+                sys,
+                &mut sess.driver,
+                &mut s.eph_private,
+                &s.eph_public,
+                &mut s.eph_used,
+                &mut s.ecdh_pool_hit,
+                &mut s.ecdh_fallback_keygen,
+            ) {
+                sess.state = SessionState::Error;
+                s.last_err_site = 6;
+                return true;
+            }
         }
         _ => {
             if sess.driver.hrr_sent {

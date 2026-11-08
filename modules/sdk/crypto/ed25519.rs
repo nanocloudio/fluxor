@@ -139,15 +139,6 @@ fn ed_load_p() -> U256 {
     )
 }
 
-/// Load p - 2 = 2^255 - 21 as exponent limbs for Fermat inversion.
-#[inline(never)]
-fn ed_load_p_minus_2() -> U256 {
-    pic_u256(
-        0xFFFFFFEB, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
-        0x7FFFFFFF,
-    )
-}
-
 /// Load (p - 5) / 8 = 2^252 - 3 as exponent limbs for the decompression
 /// square-root candidate x = u·v³·(u·v⁷)^((p-5)/8).
 #[inline(never)]
@@ -232,13 +223,25 @@ fn fe_mul(a: &Fe, b: &Fe) -> Fe {
     let b2 = b[2] as u128;
     let b3 = b[3] as u128;
     let b4 = b[4] as u128;
+    // 19·b_j fits a u64 (b_j < 2^54), so each wrapped product is one
+    // 64×64 multiply rather than a product scaled in u128.
+    let b1_19 = (b[1] * 19) as u128;
+    let b2_19 = (b[2] * 19) as u128;
+    let b3_19 = (b[3] * 19) as u128;
+    let b4_19 = (b[4] * 19) as u128;
 
-    let t0 = a0 * b0 + 19 * (a1 * b4 + a2 * b3 + a3 * b2 + a4 * b1);
-    let mut t1 = a0 * b1 + a1 * b0 + 19 * (a2 * b4 + a3 * b3 + a4 * b2);
-    let mut t2 = a0 * b2 + a1 * b1 + a2 * b0 + 19 * (a3 * b4 + a4 * b3);
-    let mut t3 = a0 * b3 + a1 * b2 + a2 * b1 + a3 * b0 + 19 * (a4 * b4);
-    let mut t4 = a0 * b4 + a1 * b3 + a2 * b2 + a3 * b1 + a4 * b0;
+    let t0 = a0 * b0 + a1 * b4_19 + a2 * b3_19 + a3 * b2_19 + a4 * b1_19;
+    let t1 = a0 * b1 + a1 * b0 + a2 * b4_19 + a3 * b3_19 + a4 * b2_19;
+    let t2 = a0 * b2 + a1 * b1 + a2 * b0 + a3 * b4_19 + a4 * b3_19;
+    let t3 = a0 * b3 + a1 * b2 + a2 * b1 + a3 * b0 + a4 * b4_19;
+    let t4 = a0 * b4 + a1 * b3 + a2 * b2 + a3 * b1 + a4 * b0;
+    fe_carry_wide(t0, t1, t2, t3, t4)
+}
 
+/// Carry five u128 column sums (each < 2^116) down to radix-51 limbs:
+/// limbs 0 and 2-4 below 2^51, limb 1 below 2^51 + 2^13.
+#[inline(always)]
+fn fe_carry_wide(t0: u128, mut t1: u128, mut t2: u128, mut t3: u128, mut t4: u128) -> Fe {
     // Carry chain in u128, then fold the top carry back through ·19.
     t1 += t0 >> 51;
     let r0 = (t0 as u64) & MASK51;
@@ -257,8 +260,65 @@ fn fe_mul(a: &Fe, b: &Fe) -> Fe {
     r
 }
 
+/// `a²`: the symmetric products are formed once and doubled, 15
+/// multiplies against `fe_mul`'s 25.
 fn fe_sq(a: &Fe) -> Fe {
-    fe_mul(a, a)
+    let a0 = a[0] as u128;
+    let a1 = a[1] as u128;
+    let a2 = a[2] as u128;
+    let a3 = a[3] as u128;
+    let a4 = a[4] as u128;
+    let d0 = (a[0] * 2) as u128;
+    let d1 = (a[1] * 2) as u128;
+    let a3_19 = (a[3] * 19) as u128;
+    let a4_19 = (a[4] * 19) as u128;
+    let d3_19 = (a[3] * 38) as u128;
+
+    let t0 = a0 * a0 + d1 * a4_19 + (a[2] * 2) as u128 * a3_19;
+    let t1 = d0 * a1 + (a[2] * 2) as u128 * a4_19 + a3 * a3_19;
+    let t2 = d0 * a2 + a1 * a1 + d3_19 * a4;
+    let t3 = d0 * a3 + d1 * a2 + a4 * a4_19;
+    let t4 = d0 * a4 + d1 * a3 + a2 * a2;
+    fe_carry_wide(t0, t1, t2, t3, t4)
+}
+
+/// `a·c` for a small constant `c < 2^20`.
+fn fe_mul_small(a: &Fe, c: u64) -> Fe {
+    let c = c as u128;
+    fe_carry_wide(
+        a[0] as u128 * c,
+        a[1] as u128 * c,
+        a[2] as u128 * c,
+        a[3] as u128 * c,
+        a[4] as u128 * c,
+    )
+}
+
+/// `a + b` without a carry pass, for the ladder: its operands are
+/// `fe_mul`/`fe_sq` outputs (limbs < 2^52), so the sum stays below 2^53
+/// and feeds a multiply, which accepts limbs up to 2^54.
+#[inline(always)]
+fn fe_add_lazy(a: &Fe, b: &Fe) -> Fe {
+    [
+        a[0] + b[0],
+        a[1] + b[1],
+        a[2] + b[2],
+        a[3] + b[3],
+        a[4] + b[4],
+    ]
+}
+
+/// `a - b + 2p` without a carry pass, on the same terms as `fe_add_lazy`
+/// (b's limbs < 2^52 do not exceed 2p's, so nothing underflows).
+#[inline(always)]
+fn fe_sub_lazy(a: &Fe, b: &Fe) -> Fe {
+    [
+        a[0] + 0xFFFFFFFFFFFDA - b[0],
+        a[1] + 0xFFFFFFFFFFFFE - b[1],
+        a[2] + 0xFFFFFFFFFFFFE - b[2],
+        a[3] + 0xFFFFFFFFFFFFE - b[3],
+        a[4] + 0xFFFFFFFFFFFFE - b[4],
+    ]
 }
 
 /// a^e mod p for a PUBLIC exponent `e` (U256 limbs, little-endian).
@@ -284,8 +344,32 @@ fn fe_pow(a: &Fe, e: &U256) -> Fe {
 
 /// Modular inversion via Fermat: a^(p-2) mod p.
 fn fe_invert(a: &Fe) -> Fe {
-    let e = ed_load_p_minus_2();
-    fe_pow(a, &e)
+    // a^(2^255 - 21) by the standard chain: 254 squarings, 11 multiplies.
+    let z2 = fe_sq(a);
+    let z8 = fe_sq_n(&z2, 2);
+    let z9 = fe_mul(&z8, a);
+    let z11 = fe_mul(&z9, &z2);
+    let z22 = fe_sq(&z11);
+    let z_5_0 = fe_mul(&z22, &z9);
+    let z_10_0 = fe_mul(&fe_sq_n(&z_5_0, 5), &z_5_0);
+    let z_20_0 = fe_mul(&fe_sq_n(&z_10_0, 10), &z_10_0);
+    let z_40_0 = fe_mul(&fe_sq_n(&z_20_0, 20), &z_20_0);
+    let z_50_0 = fe_mul(&fe_sq_n(&z_40_0, 10), &z_10_0);
+    let z_100_0 = fe_mul(&fe_sq_n(&z_50_0, 50), &z_50_0);
+    let z_200_0 = fe_mul(&fe_sq_n(&z_100_0, 100), &z_100_0);
+    let z_250_0 = fe_mul(&fe_sq_n(&z_200_0, 50), &z_50_0);
+    fe_mul(&fe_sq_n(&z_250_0, 5), &z11)
+}
+
+/// `a^(2^n)`.
+fn fe_sq_n(a: &Fe, n: u32) -> Fe {
+    let mut r = *a;
+    let mut i = 0;
+    while i < n {
+        r = fe_sq(&r);
+        i += 1;
+    }
+    r
 }
 
 /// Canonical little-endian encoding (fully reduced below p, bit 255 clear).
@@ -918,6 +1002,330 @@ fn x25519_clamp(k: &mut [u8; 32]) {
 /// the same budget the P-256 ladder is driven at, so a key agreement
 /// fits a tick on any core rather than costing one call of whatever the
 /// core takes.
+/// The Ed25519 base point's four-tooth comb, for X25519 key generation:
+/// entry `idx` is the affine point `sum of 2^(64t)·B over the set bits t of
+/// idx`, as `(y+x, y-x, 2d·x·y)` radix-51 limbs. Entry 0 is the identity
+/// `(1, 1, 0)`, which the complete addition takes like any other.
+static X25519_COMB: [[u64; 15]; 16] = [
+    [
+        0x0000000000001,
+        0x0000000000000,
+        0x0000000000000,
+        0x0000000000000,
+        0x0000000000000,
+        0x0000000000001,
+        0x0000000000000,
+        0x0000000000000,
+        0x0000000000000,
+        0x0000000000000,
+        0x0000000000000,
+        0x0000000000000,
+        0x0000000000000,
+        0x0000000000000,
+        0x0000000000000,
+    ],
+    [
+        0x493c6f58c3b85,
+        0x0df7181c325f7,
+        0x0f50b0b3e4cb7,
+        0x5329385a44c32,
+        0x07cf9d3a33d4b,
+        0x03905d740913e,
+        0x0ba2817d673a2,
+        0x23e2827f4e67c,
+        0x133d2e0c21a34,
+        0x44fd2f9298f81,
+        0x11205877aaa68,
+        0x479955893d579,
+        0x50d66309b67a0,
+        0x2d42d0dbee5ee,
+        0x6f117b689f0c6,
+    ],
+    [
+        0x265e777d1f515,
+        0x0f1f54c1e39a5,
+        0x2f01b95522646,
+        0x4fdd8db9dde6d,
+        0x654878cba97cc,
+        0x38ec78df6b0fe,
+        0x13caebea36a22,
+        0x5ebc6e54e5f6a,
+        0x32804903d0eb8,
+        0x2102fdba2b20d,
+        0x6e405055ce6a1,
+        0x5024a35a532d3,
+        0x1f69054daf29d,
+        0x15d1d0d7a8bd5,
+        0x0ad725db29ecb,
+    ],
+    [
+        0x5c585601e59e8,
+        0x56cc901cc000a,
+        0x11791321e4cd0,
+        0x7959f0a55687f,
+        0x26ead8e64813c,
+        0x5b8b69c8462a4,
+        0x0acfa639af96e,
+        0x04d0bd8b761bf,
+        0x797e68cb97644,
+        0x0975b5970fc12,
+        0x72303da5ba743,
+        0x02a5e374dcc79,
+        0x1cd9f6812fe76,
+        0x2f5199bc86855,
+        0x534670479df6c,
+    ],
+    [
+        0x304bfacad8ea2,
+        0x502917d108b07,
+        0x043176ca6dd0f,
+        0x5d5158f2c1d84,
+        0x2b5449e58eb3b,
+        0x27562eb3dbe47,
+        0x291d7b4170be7,
+        0x5d1ca67dfa8e1,
+        0x2a88061f298a2,
+        0x1304e9e71627d,
+        0x014d26adc9cfe,
+        0x7f1691ba16f13,
+        0x5e71828f06eac,
+        0x349ed07f0fffc,
+        0x4468de2d7c2dd,
+    ],
+    [
+        0x0278de3bc6748,
+        0x41a1641dee423,
+        0x1eec6639c7ff5,
+        0x6a6faa8df28e3,
+        0x26a13664d0543,
+        0x22d3b13a339ee,
+        0x20d9b12a5252a,
+        0x3d3c3c6154895,
+        0x2176ff51d6a56,
+        0x49d76bba79427,
+        0x242338d56e61d,
+        0x0d86a2533429f,
+        0x6b6c6146474e5,
+        0x6e1123eabb6d3,
+        0x4e1fafe3a8fce,
+    ],
+    [
+        0x7053d236a044c,
+        0x62771b0fc62bc,
+        0x486a0a0f376f2,
+        0x5d228ccb06969,
+        0x4e559a0f0fc5b,
+        0x0e8769c12701c,
+        0x14073876bffc0,
+        0x00bac6e577370,
+        0x18660b4a2a586,
+        0x727021d35f875,
+        0x1040727df241e,
+        0x5565201a6d4ae,
+        0x29a6b7b7d17be,
+        0x00eff376dae30,
+        0x64fcb73007bbc,
+    ],
+    [
+        0x758cc6fd390ca,
+        0x6a2e3531f871d,
+        0x10b597fbde195,
+        0x377c4285bc7e2,
+        0x6f34c66d6fd08,
+        0x3cbb43898dc04,
+        0x64860f6e4f27e,
+        0x0d260741e47fe,
+        0x7b6ebdec04b67,
+        0x0b598b8e8b849,
+        0x7c18a0cc2f689,
+        0x0f6a539c54239,
+        0x02d6502044518,
+        0x364054de02360,
+        0x412128b0b1ac6,
+    ],
+    [
+        0x5cc9dc80c1ac0,
+        0x683671486d4cd,
+        0x76f5f1a5e8173,
+        0x6d5d3f5f9df4a,
+        0x7da0b8f68d7e7,
+        0x02014385675a6,
+        0x6155fb53d1def,
+        0x37ea32e89927c,
+        0x059a668f5a82e,
+        0x46115aba1d4dc,
+        0x71953c3b5da76,
+        0x6642233d37a81,
+        0x2c9658076b1bd,
+        0x5a581e63010ff,
+        0x5a5f887e83674,
+    ],
+    [
+        0x560180ca2c1f4,
+        0x3798d1be80151,
+        0x0bd3a66057ac3,
+        0x2e06bf33d23dc,
+        0x45a02890607f1,
+        0x366d1fd41f184,
+        0x22039fc23dfde,
+        0x5429d362da528,
+        0x0dd259cf0af00,
+        0x4013f03d6ad35,
+        0x282dc6ee065cc,
+        0x7a4495cc8d7a0,
+        0x2f3a1d0dae653,
+        0x727a9a74d6c7f,
+        0x482255c1d9f06,
+    ],
+    [
+        0x3eacf71cef800,
+        0x099515fd76780,
+        0x0a711de40d9d5,
+        0x2311c1ff51435,
+        0x4e8593b0bc655,
+        0x6114aa3e5638c,
+        0x525389e41a25b,
+        0x62c4e8ee8a92a,
+        0x4a22b58694ebd,
+        0x6bb91a497b9b7,
+        0x1e646c5e7d206,
+        0x1b24c7888a549,
+        0x6ad4a7ac4fbe7,
+        0x1cda855b67476,
+        0x20cf7d79b0ebe,
+    ],
+    [
+        0x28f4e8ae75c48,
+        0x22880016c197a,
+        0x2f085c0f3780a,
+        0x4431b9ddce44c,
+        0x7c1188539f570,
+        0x4939df0fe7dca,
+        0x1f9752a39cfb6,
+        0x5f87477d43ae4,
+        0x34e84c5f30e1a,
+        0x0235623788994,
+        0x6effae15a4c03,
+        0x2878ef1c0a41e,
+        0x267799cbd1c2a,
+        0x241bcfa8501fe,
+        0x38d20188d1061,
+    ],
+    [
+        0x011ad0e6315df,
+        0x0bc55d652047d,
+        0x57561b02d9434,
+        0x6f75bdd07acd3,
+        0x043eedd45e1f4,
+        0x147f2c7073217,
+        0x33e75fa419ed8,
+        0x107e00b1946e4,
+        0x39f12c7edfeb8,
+        0x173c4fa94f450,
+        0x1ea60928df9c4,
+        0x0c66e6ac5a7ae,
+        0x2554ac96df9e0,
+        0x2396cd828a651,
+        0x1e2a7024993cc,
+    ],
+    [
+        0x20fbcd45c811f,
+        0x7b25d81006c03,
+        0x74901fc92def1,
+        0x593506573158b,
+        0x5fcb43ee06225,
+        0x509b93509fba4,
+        0x6c0ac636ea620,
+        0x100721c3636cd,
+        0x3b9cbef665d29,
+        0x044649f411b2e,
+        0x524ad9598215f,
+        0x4d986cc518181,
+        0x05b73a86dfe40,
+        0x2c799c717aab8,
+        0x0c8a1bfa5cc0e,
+    ],
+    [
+        0x703b5681d104c,
+        0x3224c7968b1bc,
+        0x395b18cf4bde9,
+        0x3655738860b8e,
+        0x6b857c7efcc3e,
+        0x256b48b2801c0,
+        0x5878801f88f3a,
+        0x4cee905fa7efa,
+        0x56553a8d58ea3,
+        0x09de2bf5dd418,
+        0x10ff3eff0687f,
+        0x69e3c6f74477e,
+        0x5980d357aeba8,
+        0x165724f30930e,
+        0x5b466e2ac3b24,
+    ],
+    [
+        0x6eb6747fbb842,
+        0x6ac102351626f,
+        0x7e32269e77d71,
+        0x7e12d15d3b7b8,
+        0x09952a563bc8f,
+        0x0cb4bdc7ef83c,
+        0x74bf27844d455,
+        0x1938e965ad71b,
+        0x797ea75f58d83,
+        0x409b4adce5c6c,
+        0x53db9834350c4,
+        0x0b4bea0b6889a,
+        0x527fcbe24a64c,
+        0x6b27d917d512c,
+        0x69b968a704657,
+    ],
+];
+
+/// Column `i` of the comb: bits `i`, `64+i`, `128+i` and `192+i` of the
+/// little-endian scalar.
+#[inline(always)]
+fn x25519_comb_index(k: &[u8; 32], i: usize) -> u64 {
+    let bit = |b: usize| u64::from((k[b >> 3] >> (b & 7)) & 1);
+    bit(i) | (bit(64 + i) << 1) | (bit(128 + i) << 2) | (bit(192 + i) << 3)
+}
+
+/// `X25519_COMB[idx]` without branching on `idx` or using it as an
+/// address: every entry is read and the match selected under a mask.
+fn x25519_comb_lookup(idx: u64) -> (Fe, Fe, Fe) {
+    let mut ypx = FE_ZERO;
+    let mut ymx = FE_ZERO;
+    let mut xy2d = FE_ZERO;
+    let mut i = 0;
+    while i < 16 {
+        let mask = ct_eq_u64(i as u64, idx);
+        let e = &X25519_COMB[i];
+        ypx = fe_select(&ypx, &[e[0], e[1], e[2], e[3], e[4]], mask);
+        ymx = fe_select(&ymx, &[e[5], e[6], e[7], e[8], e[9]], mask);
+        xy2d = fe_select(&xy2d, &[e[10], e[11], e[12], e[13], e[14]], mask);
+        i += 1;
+    }
+    (ypx, ymx, xy2d)
+}
+
+/// `p + q` for an affine `q` given as `(y+x, y-x, 2d·x·y)`: `ge_add` with
+/// `q.z = 1`, complete like it.
+fn ge_madd(p: &GeP3, ypx: &Fe, ymx: &Fe, xy2d: &Fe) -> GeP3 {
+    let a = fe_mul(&fe_sub(&p.y, &p.x), ymx);
+    let b = fe_mul(&fe_add(&p.y, &p.x), ypx);
+    let c = fe_mul(&p.t, xy2d);
+    let d = fe_add(&p.z, &p.z);
+    let e = fe_sub(&b, &a);
+    let f = fe_sub(&d, &c);
+    let g = fe_add(&d, &c);
+    let h = fe_add(&b, &a);
+    GeP3 {
+        x: fe_mul(&e, &f),
+        y: fe_mul(&g, &h),
+        z: fe_mul(&f, &g),
+        t: fe_mul(&e, &h),
+    }
+}
+
 pub struct X25519State {
     k: [u8; 32],
     x1: Fe,
@@ -926,10 +1334,14 @@ pub struct X25519State {
     x3: Fe,
     z3: Fe,
     swap: u64,
-    /// Next ladder bit, 254 down to 0; -1 = done.
+    /// Next ladder bit, 254 down to 0, or comb column, 63 down to 0; -1 =
+    /// done.
     t: i16,
     bits_per_step: u8,
     initialised: u8,
+    /// 1 for `[scalar]·9` by the Edwards comb (`new_base`): `x2, z2, x3, z3`
+    /// hold the accumulator's `X, Y, Z, T` and `x1` is unused.
+    comb: u8,
 }
 
 impl X25519State {
@@ -945,6 +1357,7 @@ impl X25519State {
             t: -1,
             bits_per_step: 0,
             initialised: 0,
+            comb: 0,
         }
     }
 
@@ -965,14 +1378,32 @@ impl X25519State {
             t: 254,
             bits_per_step,
             initialised: 1,
+            comb: 0,
         }
     }
 
-    /// `[scalar]·9`: the public key of `scalar`.
+    /// `[scalar]·9`: the public key of `scalar`. The clamped scalar times the
+    /// Ed25519 base point by the comb (`X25519_COMB`), one doubling and one
+    /// mixed addition per column, 64 columns; `result` maps the Edwards
+    /// point to the Montgomery `u = (Z+Y)/(Z-Y)`. `bits_per_step` counts
+    /// columns.
     pub fn new_base(scalar: &[u8; 32], bits_per_step: u8) -> Self {
-        let mut base = [0u8; 32];
-        base[0] = 9;
-        Self::new(scalar, &base, bits_per_step)
+        let mut k = *scalar;
+        x25519_clamp(&mut k);
+        let id = GeP3::identity();
+        Self {
+            k,
+            x1: FE_ZERO,
+            x2: id.x,
+            z2: id.y,
+            x3: id.z,
+            z3: id.t,
+            swap: 0,
+            t: 63,
+            bits_per_step,
+            initialised: 1,
+            comb: 1,
+        }
     }
 
     pub fn is_initialised(&self) -> bool {
@@ -988,12 +1419,31 @@ impl X25519State {
         if self.initialised == 0 {
             return false;
         }
-        let a24: Fe = [121665, 0, 0, 0, 0];
         let mut remaining: i16 = if self.bits_per_step == 0 {
             i16::MAX
         } else {
             self.bits_per_step as i16
         };
+        if self.comb != 0 {
+            let mut acc = GeP3 {
+                x: self.x2,
+                y: self.z2,
+                z: self.x3,
+                t: self.z3,
+            };
+            while remaining > 0 && self.t >= 0 {
+                let (ypx, ymx, xy2d) =
+                    x25519_comb_lookup(x25519_comb_index(&self.k, self.t as usize));
+                acc = ge_madd(&ge_double(&acc), &ypx, &ymx, &xy2d);
+                self.t -= 1;
+                remaining -= 1;
+            }
+            self.x2 = acc.x;
+            self.z2 = acc.y;
+            self.x3 = acc.z;
+            self.z3 = acc.t;
+            return self.complete();
+        }
         while remaining > 0 && self.t >= 0 {
             let t = self.t as usize;
             let bit = ((self.k[t >> 3] >> (t & 7)) & 1) as u64;
@@ -1010,19 +1460,21 @@ impl X25519State {
             self.z3 = nz3;
             self.swap = bit;
 
-            let a = fe_add(&self.x2, &self.z2);
+            // Every lazy sum and difference below takes multiply outputs
+            // and feeds a multiply; see `fe_add_lazy`.
+            let a = fe_add_lazy(&self.x2, &self.z2);
             let aa = fe_sq(&a);
-            let b = fe_sub(&self.x2, &self.z2);
+            let b = fe_sub_lazy(&self.x2, &self.z2);
             let bb = fe_sq(&b);
-            let e = fe_sub(&aa, &bb);
-            let c = fe_add(&self.x3, &self.z3);
-            let d = fe_sub(&self.x3, &self.z3);
+            let e = fe_sub_lazy(&aa, &bb);
+            let c = fe_add_lazy(&self.x3, &self.z3);
+            let d = fe_sub_lazy(&self.x3, &self.z3);
             let da = fe_mul(&d, &a);
             let cb = fe_mul(&c, &b);
-            self.x3 = fe_sq(&fe_add(&da, &cb));
-            self.z3 = fe_mul(&self.x1, &fe_sq(&fe_sub(&da, &cb)));
+            self.x3 = fe_sq(&fe_add_lazy(&da, &cb));
+            self.z3 = fe_mul(&self.x1, &fe_sq(&fe_sub_lazy(&da, &cb)));
             self.x2 = fe_mul(&aa, &bb);
-            self.z2 = fe_mul(&e, &fe_add(&aa, &fe_mul(&a24, &e)));
+            self.z2 = fe_mul(&e, &fe_add_lazy(&aa, &fe_mul_small(&e, 121665)));
 
             self.t -= 1;
             remaining -= 1;
@@ -1032,6 +1484,12 @@ impl X25519State {
 
     /// The u-coordinate of the result, encoded. Meaningful once `complete()`.
     pub fn result(&self) -> [u8; 32] {
+        if self.comb != 0 {
+            // u = (1 + y) / (1 - y) = (Z + Y) / (Z - Y).
+            let num = fe_add(&self.x3, &self.z2);
+            let den = fe_sub(&self.x3, &self.z2);
+            return fe_tobytes(&fe_mul(&num, &fe_invert(&den)));
+        }
         let mask = self.swap.wrapping_neg();
         let fx2 = fe_select(&self.x2, &self.x3, mask);
         let fz2 = fe_select(&self.z2, &self.z3, mask);
@@ -1092,9 +1550,11 @@ pub fn x25519(scalar: &[u8; 32], u_in: &[u8; 32]) -> [u8; 32] {
 
 /// X25519 public key: `X25519(scalar, 9)`, RFC 7748 §6.1.
 pub fn x25519_public_key(scalar: &[u8; 32]) -> [u8; 32] {
-    let mut base = [0u8; 32];
-    base[0] = 9;
-    x25519(scalar, &base)
+    let mut st = X25519State::new_base(scalar, 0);
+    st.step();
+    let out = st.result();
+    st.zeroise();
+    out
 }
 
 /// X25519 shared secret with the RFC 7748 §6.1 check.

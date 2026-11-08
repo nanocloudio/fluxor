@@ -11,11 +11,13 @@
 //   1. Field and scalar arithmetic — constant-time. `fp_add`, `fp_sub`,
 //      `mod_n_reduce` and `fn_add` compute the correction
 //      unconditionally and select it with `ct_select_u256` on a
-//      carry/borrow mask. `fp_reduce` applies a fixed five masked
-//      additions then eight masked subtractions instead of correcting
-//      in value-dependent loops, and `fn_reduce_wide` folds a fixed
-//      sixteen passes. A field multiply therefore costs the same
-//      whatever it multiplies.
+//      carry/borrow mask. `fp_mul` is a Montgomery multiplication
+//      (`mont_mul`) with fixed trip counts and one masked final
+//      subtraction, and `fn_reduce_wide` folds a fixed sixteen passes.
+//      A field multiply therefore costs the same whatever it
+//      multiplies. Field elements in the point layer are held in the
+//      Montgomery domain; they enter it in `from_affine` and
+//      `is_on_curve` and leave it in `to_affine_with`.
 //   2. Point arithmetic — constant-time. `double` has no exceptional
 //      case to branch on, and `add_jacobian`/`add_affine` compute the
 //      generic add, the doubling and the identity outcomes and choose
@@ -23,23 +25,27 @@
 //      doubling per addition.
 //   3. Inversion — constant-time. `fp_inv` and `fn_inv` are
 //      square-and-multiply over the public exponents p-2 and n-2, so
-//      the schedule was never secret, and each of their ~512
-//      multiplies is fixed-cost per (1). `fn_inv` is applied to
+//      the schedule is public, and each multiply is fixed-cost per (1)
+//      (`fn_inv` multiplies in the Montgomery domain, `mont_mul`). `fn_inv` is applied to
 //      the ECDSA nonce `k`.
 //
-// Two scalar-multiplication paths, both constant-time in the scalar:
+// Three scalar-multiplication shapes, all constant-time in the scalar:
 //
-//   - `scalar_mul_ct` (one-shot, used by ECDH + ECDSA): fixed-window
+//   - `scalar_mul_ct` (one-shot `k·P`, used by ECDH): fixed-window
 //     w=4 with a branchless table lookup, four doublings and one
 //     addition per window regardless of the nibble. Same shape as
 //     BoringSSL / ring / OpenSSL.
+//   - `scalar_mul_base` (`k·G`, used by key generation and ECDSA): a
+//     four-tooth comb over the 16-entry `G_COMB` table, one doubling
+//     and one mixed addition per column, 64 columns, branchless lookup.
 //   - `ScalarMulState` (resumable, used when the kernel needs to yield
-//     mid-multiplication): per-bit Montgomery ladder, one add and one
-//     double per bit with a branchless swap. The `step()` API
-//     processes `bits_per_step` bits at a time so a concurrent
-//     handshake doesn't have to wait for the whole scalar
-//     multiplication to finish; how the work is divided across ticks
-//     is a scheduling choice and does not depend on the scalar.
+//     mid-multiplication): the comb columns for `k·G`, and for `k·P` a
+//     per-bit Montgomery ladder, one add and one double per bit with a
+//     branchless swap. The `step()` API processes `bits_per_step`
+//     columns or bits at a time so a concurrent handshake doesn't have
+//     to wait for the whole scalar multiplication to finish; how the
+//     work is divided across ticks is a scheduling choice and does not
+//     depend on the scalar.
 //
 // Named exceptions, none of them in the arithmetic stack:
 //
@@ -69,8 +75,11 @@
 // signatures to low-s form. Intermediate secrets are zeroised via
 // volatile writes before returning from each primitive.
 //
-// Curve constants are assembled on the stack from u32 immediates by
-// `pic_u256`, one `load_*` call per use.
+// The Montgomery-domain constants (`FP_*`) are plain `const`s and the
+// base-point comb `G_COMB` a scalar table, which position-independent
+// code reads relative to the PC; the other curve constants are assembled
+// on the stack from u32 immediates by `pic_u256`, one `load_*` call per
+// use.
 
 /// Load P-256 prime.
 #[inline(never)]
@@ -90,42 +99,12 @@ fn load_n() -> U256 {
     )
 }
 
-/// Load generator point Gx.
-#[inline(never)]
-fn load_gx() -> U256 {
-    pic_u256(
-        0xD898C296, 0xF4A13945, 0x2DEB33A0, 0x77037D81, 0x63A440F2, 0xF8BCE6E5, 0xE12C4247,
-        0x6B17D1F2,
-    )
-}
-
-/// Load generator point Gy.
-#[inline(never)]
-fn load_gy() -> U256 {
-    pic_u256(
-        0x37BF51F5, 0xCBB64068, 0x6B315ECE, 0x2BCE3357, 0x7C0F9E16, 0x8EE7EB4A, 0xFE1A7F9B,
-        0x4FE342E2,
-    )
-}
-
 /// Load N/2 for low-s normalisation.
 #[inline(never)]
 fn load_n_half() -> U256 {
     pic_u256(
         0x7E3192A8, 0x79DCE561, 0xD38BCF42, 0xDE737556, 0xFFFFFFFF, 0xFFFFFFFF, 0x80000000,
         0x7FFFFFFF,
-    )
-}
-
-/// Load curve constant b for the short-Weierstrass form
-/// y² ≡ x³ - 3x + b (mod p). Hex (MSB first):
-/// 0x5AC635D8 AA3A93E7 B3EBBD55 769886BC 651D06B0 CC53B0F6 3BCE3C3E 27D2604B
-/// `pic_u256` packs `(lo, hi)` per u64 limb, limb 0 being the LSBs.
-#[inline(never)]
-fn load_b() -> U256 {
-    pic_u256(
-        0x27D2604B, 0x3BCE3C3E, 0xCC53B0F6, 0x651D06B0, 0x769886BC, 0xB3EBBD55, 0xAA3A93E7,
-        0x5AC635D8,
     )
 }
 
@@ -137,6 +116,38 @@ type U256 = [u64; 4];
 
 const ZERO: U256 = [0, 0, 0, 0];
 const ONE: U256 = [1, 0, 0, 0];
+
+// The point layer holds field elements in the Montgomery domain, `x·R mod p`
+// with `R = 2^256` (`fp_mul`). These are the constants it needs there, and
+// the two that convert in and out of it.
+/// `R mod p`: one, in the Montgomery domain.
+const FP_ONE_MONT: U256 = [
+    0x0000000000000001,
+    0xffffffff00000000,
+    0xffffffffffffffff,
+    0x00000000fffffffe,
+];
+/// `R² mod p`: `fp_to_mont` multiplies by it.
+const FP_R2: U256 = [
+    0x0000000000000003,
+    0xfffffffbffffffff,
+    0xfffffffffffffffe,
+    0x00000004fffffffd,
+];
+/// The prime p.
+const FP_P: U256 = [
+    0xffffffffffffffff,
+    0x00000000ffffffff,
+    0x0000000000000000,
+    0xffffffff00000001,
+];
+/// The curve constant b, in the Montgomery domain.
+const FP_B_MONT: U256 = [
+    0xd89cdf6229c4bddf,
+    0xacf005cd78843090,
+    0xe5a220abf7212ed6,
+    0xdc30061d04874834,
+];
 
 /// Assemble a u64 from two u32 halves via volatile writes. Forces MOV/MOVK
 /// code generation instead of an ADRP-based literal pool load.
@@ -313,9 +324,9 @@ fn u256_inv_vartime(a: &U256, m: &U256) -> U256 {
 // Every routine in this section is constant-time in its operands.
 // `fp_add` and `fp_sub` compute both the corrected and the
 // uncorrected value and choose between them with `ct_select_u256` on a
-// mask built from the carry or borrow; `fp_reduce` performs a fixed
-// number of masked corrections rather than looping until the value is
-// in range. Trip counts and memory addresses here are independent of
+// mask built from the carry or borrow; `fp_mul` is a Montgomery
+// multiplication whose final reduction is one masked subtraction rather
+// than a loop until the value is in range. Trip counts and memory addresses here are independent of
 // the operands, which are secret on every ECDH agreement and ECDSA
 // signature.
 // ============================================================================
@@ -323,7 +334,7 @@ fn u256_inv_vartime(a: &U256, m: &U256) -> U256 {
 /// Modular addition: (a + b) mod p. The correction is always computed
 /// and selected under a mask.
 fn fp_add(a: &U256, b: &U256) -> U256 {
-    let p = load_p();
+    let p = FP_P;
     let (sum, carry) = u256_add(a, b);
     let (corrected, _) = u256_sub(&sum, &p);
     // Subtract p when the 256-bit sum overflowed or is already >= p.
@@ -335,7 +346,7 @@ fn fp_add(a: &U256, b: &U256) -> U256 {
 /// Modular subtraction: (a - b) mod p. The correction is always
 /// computed and selected under a mask.
 fn fp_sub(a: &U256, b: &U256) -> U256 {
-    let p = load_p();
+    let p = FP_P;
     let (diff, borrow) = u256_sub(a, b);
     let (corrected, _) = u256_add(&diff, &p);
     ct_select_u256(&diff, &corrected, borrow.wrapping_neg())
@@ -368,261 +379,38 @@ fn u256_mul_wide(a: &U256, b: &U256) -> [u64; 8] {
     out
 }
 
-/// Barrett-like reduction mod p for P-256. Uses the special form of
-/// the P-256 prime for fast reduction.
-///
-/// Variable-time. The final corrections are three loops — `while c <
-/// 0`, `while c > 0`, and the `u256_gte` subtraction loop — whose trip
-/// counts depend on the magnitude of `t`. Since `fp_mul` and `fp_sqr`
-/// both end here, the cost of a single field multiply on secret data
-/// varies with that data. Making this constant-time means a fixed
-/// number of masked corrections rather than loops.
-fn fp_reduce(t: &[u64; 8]) -> U256 {
-    // P-256 reduction using the NIST method (FIPS 186-4, D.2.3)
-    // p = 2^256 - 2^224 + 2^192 + 2^96 - 1
-    // Split 512-bit t into 32-bit words for NIST reduction
-    let mut s = [0u32; 16];
-    let mut i = 0;
-    while i < 8 {
-        s[i * 2] = t[i] as u32;
-        s[i * 2 + 1] = (t[i] >> 32) as u32;
-        i += 1;
-    }
-
-    // NIST reduction for P-256
-    // s1 = (s7, s6, s5, s4, s3, s2, s1, s0)
-    // s2 = (s15, s14, s13, s12, s11, 0, 0, 0)   * 2
-    // s3 = (0, s15, s14, s13, s12, 0, 0, 0)     * 2
-    // s4 = (s15, s14, 0, 0, 0, s10, s9, s8)
-    // s5 = (s8, s13, s15, s14, s13, s11, s10, s9)
-    // s6 = -(s10, s8, 0, 0, 0, s13, s12, s11)
-    // s7 = -(s11, s9, 0, 0, s15, s14, s13, s12)
-    // s8 = -(s12, 0, s10, s9, s8, s15, s14, s13)
-    // s9 = -(s13, 0, s11, s10, s9, 0, s15, s14)
-    // result = s1 + s2 + s3 + s4 + s5 - s6 - s7 - s8 - s9 mod p
-
-    // Accumulate into i64 to handle carries/borrows
-    let mut acc = [0i64; 8];
-
-    // s1
-    acc[0] += s[0] as i64;
-    acc[1] += s[1] as i64;
-    acc[2] += s[2] as i64;
-    acc[3] += s[3] as i64;
-    acc[4] += s[4] as i64;
-    acc[5] += s[5] as i64;
-    acc[6] += s[6] as i64;
-    acc[7] += s[7] as i64;
-
-    // s2 * 2: (s15, s14, s13, s12, s11, 0, 0, 0)
-    acc[3] += 2 * s[11] as i64;
-    acc[4] += 2 * s[12] as i64;
-    acc[5] += 2 * s[13] as i64;
-    acc[6] += 2 * s[14] as i64;
-    acc[7] += 2 * s[15] as i64;
-
-    // s3 * 2: (0, s15, s14, s13, s12, 0, 0, 0)
-    acc[3] += 2 * s[12] as i64;
-    acc[4] += 2 * s[13] as i64;
-    acc[5] += 2 * s[14] as i64;
-    acc[6] += 2 * s[15] as i64;
-
-    // s4: (s15, s14, 0, 0, 0, s10, s9, s8)
-    acc[0] += s[8] as i64;
-    acc[1] += s[9] as i64;
-    acc[2] += s[10] as i64;
-    acc[6] += s[14] as i64;
-    acc[7] += s[15] as i64;
-
-    // s5: (s8, s13, s15, s14, s13, s11, s10, s9)
-    acc[0] += s[9] as i64;
-    acc[1] += s[10] as i64;
-    acc[2] += s[11] as i64;
-    acc[3] += s[13] as i64;
-    acc[4] += s[14] as i64;
-    acc[5] += s[15] as i64;
-    acc[6] += s[13] as i64;
-    acc[7] += s[8] as i64;
-
-    // -s6: -(s10, s8, 0, 0, 0, s13, s12, s11)
-    acc[0] -= s[11] as i64;
-    acc[1] -= s[12] as i64;
-    acc[2] -= s[13] as i64;
-    acc[6] -= s[8] as i64;
-    acc[7] -= s[10] as i64;
-
-    // -s7: -(s11, s9, 0, 0, s15, s14, s13, s12)
-    acc[0] -= s[12] as i64;
-    acc[1] -= s[13] as i64;
-    acc[2] -= s[14] as i64;
-    acc[3] -= s[15] as i64;
-    acc[6] -= s[9] as i64;
-    acc[7] -= s[11] as i64;
-
-    // -s8: -(s12, 0, s10, s9, s8, s15, s14, s13)
-    acc[0] -= s[13] as i64;
-    acc[1] -= s[14] as i64;
-    acc[2] -= s[15] as i64;
-    acc[3] -= s[8] as i64;
-    acc[4] -= s[9] as i64;
-    acc[5] -= s[10] as i64;
-    acc[7] -= s[12] as i64;
-
-    // -s9: -(s13, 0, s11, s10, s9, 0, s15, s14)
-    acc[0] -= s[14] as i64;
-    acc[1] -= s[15] as i64;
-    acc[3] -= s[9] as i64;
-    acc[4] -= s[10] as i64;
-    acc[5] -= s[11] as i64;
-    acc[7] -= s[13] as i64;
-
-    // Propagate carries through the 32-bit limbs
-    let mut carry: i64 = 0;
-    i = 0;
-    while i < 8 {
-        acc[i] += carry;
-        carry = acc[i] >> 32;
-        acc[i] &= 0xFFFFFFFF;
-        i += 1;
-    }
-
-    // Reassemble into U256
-    let mut result: U256 = [
-        (acc[0] as u64) | ((acc[1] as u64) << 32),
-        (acc[2] as u64) | ((acc[3] as u64) << 32),
-        (acc[4] as u64) | ((acc[5] as u64) << 32),
-        (acc[6] as u64) | ((acc[7] as u64) << 32),
-    ];
-
-    // Fixed-trip-count correction. The value being reduced is
-    //   V = carry·2^256 + result
-    // with `carry` signed. The NIST sum above adds at most
-    // (1 + 2 + 2 + 1 + 1) = 7 and subtracts at most 4 full 256-bit
-    // terms, so V lies in (-4·2^256, 7·2^256).
-    //
-    // Both phases run a fixed number of iterations and apply their
-    // correction under a mask, so neither the trip count nor the
-    // branch pattern depends on V.
-    let p = load_p();
-
-    // Phase 1 — lift V to non-negative. Adding p when V < 0 preserves
-    // the invariant either way: if `result + p` overflows, the carry-out
-    // cancels one unit of 2^256, otherwise `carry` is unchanged and the
-    // whole value still rises by p. Since p > 0.99·2^256 and
-    // V > -4·2^256, five additions always suffice.
-    let mut i2 = 0;
-    while i2 < 5 {
-        // All-ones exactly when `carry` is negative.
-        let neg = (carry >> 63) as u64;
-        let (sum, carry_out) = u256_add(&result, &p);
-        result = ct_select_u256(&result, &sum, neg);
-        carry = carry.wrapping_add((carry_out & neg & 1) as i64);
-        i2 += 1;
-    }
-
-    // Phase 2 — bring V below p. V is now in [0, 7·2^256), i.e. under
-    // 7.01·p, so eight masked subtractions always suffice. The
-    // condition is "carry is non-zero" (then V >= 2^256 > p) "or the
-    // low 256 bits are already >= p".
-    let mut i3 = 0;
-    while i3 < 8 {
-        let c = carry as u64;
-        // All-ones when `carry != 0`.
-        let carry_nonzero = !ct_eq_u64(c, 0);
-        let need = carry_nonzero | u256_gte(&result, &p).wrapping_neg();
-        let (diff, borrow) = u256_sub(&result, &p);
-        result = ct_select_u256(&result, &diff, need);
-        carry = carry.wrapping_sub((borrow & need & 1) as i64);
-        i3 += 1;
-    }
-
-    result
-}
-
-/// Modular multiplication: (a * b) mod p
+/// Montgomery product mod p: `a·b·R⁻¹ mod p`. With both operands held as
+/// `x·R mod p` this is their product, in the same form. P-256's prime is
+/// `-1 mod 2^64`, so the reduction factor is 1. Constant-time per
+/// `mont_mul`.
+#[inline(always)]
 fn fp_mul(a: &U256, b: &U256) -> U256 {
-    let t = u256_mul_wide(a, b);
-    fp_reduce(&t)
+    mont_mul(a, b, &FP_P, 1)
 }
 
-/// Wide squaring: `a^2` → 512-bit result (8 × u64 limbs, little-endian).
-///
-/// Comba / column method exploiting symmetry: each output column `k` is the
-/// sum over `i + j == k` of `a[i]*a[j]`, with the off-diagonal (`i < j`) terms
-/// doubled and the diagonal (`i == j`) term added once — 10 single-limb
-/// multiplies instead of the 16 a general product needs. A 3-limb accumulator
-/// (`acc_lo: u128` + `acc_hi: u64`) absorbs each column's full sum (up to
-/// ~5·2^128) before the low 64 bits are emitted and the rest shifted down, so
-/// carries never truncate. Bit-identical to `u256_mul_wide(a, a)`; the prior
-/// version had a carry-truncation bug (gated out by the ECDSA/ECDH KATs).
-fn u256_sqr_wide(a: &U256) -> [u64; 8] {
-    let mut out = [0u64; 8];
-    // 3-limb little-endian accumulator: `acc_lo` holds bits 0..128, `acc_hi`
-    // holds bits 128..192. A single column sum stays well under 2^192.
-    let mut acc_lo: u128 = 0;
-    let mut acc_hi: u64 = 0;
-
-    let mut col = 0usize;
-    while col < 8 {
-        let mut i = 0usize;
-        while i < 4 {
-            // j such that i + j == col, with 0 <= j < 4.
-            if col >= i {
-                let j = col - i;
-                if j < 4 && i < j {
-                    // Off-diagonal: add the product twice (doubled).
-                    let p = (a[i] as u128) * (a[j] as u128);
-                    let (s1, c1) = acc_lo.overflowing_add(p);
-                    acc_lo = s1;
-                    if c1 {
-                        acc_hi += 1;
-                    }
-                    let (s2, c2) = acc_lo.overflowing_add(p);
-                    acc_lo = s2;
-                    if c2 {
-                        acc_hi += 1;
-                    }
-                } else if j == i {
-                    // Diagonal square term: add once.
-                    let p = (a[i] as u128) * (a[i] as u128);
-                    let (s, c) = acc_lo.overflowing_add(p);
-                    acc_lo = s;
-                    if c {
-                        acc_hi += 1;
-                    }
-                }
-            }
-            i += 1;
-        }
-        // Emit the low 64 bits of this column, shift the accumulator down 64.
-        out[col] = acc_lo as u64;
-        acc_lo = (acc_lo >> 64) | ((acc_hi as u128) << 64);
-        acc_hi = 0;
-        col += 1;
-    }
-    out
-}
-
-/// Modular squaring: a^2 mod p.
-///
-/// Uses the dedicated `u256_sqr_wide` (10 multiplies via cross-product
-/// symmetry) rather than the general `u256_mul_wide` (16 multiplies). Squaring
-/// dominates Jacobian point doubling, which dominates the scalar multiplication
-/// on every ECDH agreement and ECDSA sign — so this ~1.6× cheaper wide product
-/// speeds the whole handshake crypto. Bit-identical to `fp_mul(a, a)`.
+/// Montgomery square mod p.
+#[inline(always)]
 fn fp_sqr(a: &U256) -> U256 {
-    fp_reduce(&u256_sqr_wide(a))
+    mont_mul(a, a, &FP_P, 1)
 }
 
-/// Modular inversion using Fermat's little theorem: a^(p-2) mod p.
+/// Into the Montgomery domain: `a·R mod p`, for `a < p`.
+fn fp_to_mont(a: &U256) -> U256 {
+    fp_mul(a, &FP_R2)
+}
+
+/// Out of the Montgomery domain: `a·R⁻¹ mod p`.
+fn fp_from_mont(a: &U256) -> U256 {
+    fp_mul(a, &ONE)
+}
+
+/// Modular inversion using Fermat's little theorem: a^(p-2) mod p, in the
+/// Montgomery domain (the result is `a⁻¹·R` for an input `a·R`).
 ///
 /// The exponent is the public constant p-2, so the square-and-multiply
-/// schedule is fixed and reveals nothing. The individual `fp_mul` /
-/// `fp_sqr` calls it makes are still value-dependent per `fp_reduce`.
+/// schedule is fixed and reveals nothing, and each multiply is fixed-cost.
 fn fp_inv(a: &U256) -> U256 {
-    // p-2 = 2^256 - 2^224 + 2^192 + 2^96 - 3
-    // Use square-and-multiply with optimized addition chain
-    let mut result = ONE;
+    let mut result = FP_ONE_MONT;
     let mut base = *a;
 
     // Simple right-to-left binary method on p-2
@@ -646,9 +434,10 @@ fn fp_inv(a: &U256) -> U256 {
     result
 }
 
-/// `fp_inv` for a public coordinate; see `u256_inv_vartime`.
+/// `fp_inv` for a public coordinate; see `u256_inv_vartime`. Leaves and
+/// re-enters the Montgomery domain around the binary inverse.
 fn fp_inv_vartime(a: &U256) -> U256 {
-    u256_inv_vartime(a, &load_p())
+    fp_to_mont(&u256_inv_vartime(&fp_from_mont(a), &FP_P))
 }
 
 // ============================================================================
@@ -744,15 +533,66 @@ fn fn_reduce_wide(t: &[u64; 8]) -> U256 {
     mod_n_reduce(&[acc[0], acc[1], acc[2], acc[3]])
 }
 
-/// Modular inverse mod n using Fermat's little theorem.
+/// Montgomery product `a·b·2^-256 mod m` (CIOS), for an odd modulus
+/// `m`, `a, b < m`, and `m0inv = -m^-1 mod 2^64`.
 ///
-/// The exponent n-2 is public, so the schedule is fixed; the multiplies
-/// underneath it are variable-time per `fn_reduce_wide`.
-fn fn_inv(a: &U256) -> U256 {
-    let mut result = ONE;
-    let mut base = *a;
+/// Constant-time: fixed trip counts, and the final reduction from
+/// `[0, 2m)` is a masked subtraction. Inlined so that a constant modulus
+/// (`fp_mul`'s P-256 prime) folds into the reduction.
+#[inline(always)]
+fn mont_mul(a: &U256, b: &U256, m: &U256, m0inv: u64) -> U256 {
+    let mut t = [0u64; 6];
+    let mut i = 0;
+    while i < 4 {
+        // t += a[i]·b
+        let mut c = 0u64;
+        let mut j = 0;
+        while j < 4 {
+            let s = (t[j] as u128) + (a[i] as u128) * (b[j] as u128) + (c as u128);
+            t[j] = s as u64;
+            c = (s >> 64) as u64;
+            j += 1;
+        }
+        let s = (t[4] as u128) + (c as u128);
+        t[4] = s as u64;
+        t[5] = (s >> 64) as u64;
+        // t = (t + q·m) / 2^64, with q chosen so the low limb cancels.
+        let q = t[0].wrapping_mul(m0inv);
+        let s = (t[0] as u128) + (q as u128) * (m[0] as u128);
+        let mut c = (s >> 64) as u64;
+        let mut j = 1;
+        while j < 4 {
+            let s = (t[j] as u128) + (q as u128) * (m[j] as u128) + (c as u128);
+            t[j - 1] = s as u64;
+            c = (s >> 64) as u64;
+            j += 1;
+        }
+        let s = (t[4] as u128) + (c as u128);
+        t[3] = s as u64;
+        t[4] = t[5] + ((s >> 64) as u64);
+        i += 1;
+    }
+    let r: U256 = [t[0], t[1], t[2], t[3]];
+    let (d, borrow) = u256_sub(&r, m);
+    // r < m exactly when the subtraction borrowed and nothing sits above 2^256.
+    let keep = borrow & !((t[4] | t[4].wrapping_neg()) >> 63) & 1;
+    ct_select_u256(&d, &r, keep.wrapping_neg())
+}
 
+/// Modular inverse mod n using Fermat's little theorem, `a^(n-2)`.
+///
+/// The exponent n-2 is public, so the schedule is fixed, and each step
+/// is a fixed-cost Montgomery multiplication. The value enters the
+/// Montgomery domain through one `fn_reduce_wide` (`a·R mod n`) and
+/// leaves through a multiplication by one.
+fn fn_inv(a: &U256) -> U256 {
     let n = load_n();
+    let n0inv = pic_u64(0xEE00BC4F, 0xCCD1C8AA);
+    // R mod n = 2^256 - n, which is also 1 in the Montgomery domain.
+    let (r_mod_n, _) = u256_sub(&ZERO, &n);
+    let mut base = fn_reduce_wide(&u256_mul_wide(a, &r_mod_n));
+    let mut result = r_mod_n;
+
     let n_minus_2: U256 = [n[0] - 2, n[1], n[2], n[3]];
 
     let mut i = 0;
@@ -760,14 +600,15 @@ fn fn_inv(a: &U256) -> U256 {
         let mut j = 0;
         while j < 64 {
             if (n_minus_2[i] >> j) & 1 == 1 {
-                result = fn_mul(&result, &base);
+                result = mont_mul(&result, &base, &n, n0inv);
             }
-            base = fn_mul(&base, &base);
+            base = mont_mul(&base, &base, &n, n0inv);
             j += 1;
         }
         i += 1;
     }
-    result
+    zeroize_u256(&mut base);
+    mont_mul(&result, &ONE, &n, n0inv)
 }
 
 /// `fn_inv` for a signature's `s`; see `u256_inv_vartime`.
@@ -853,11 +694,18 @@ impl JacobianPoint {
         u256_is_zero(&self.z)
     }
 
+    /// The point `(x, y)` given in ordinary form (a decoded coordinate
+    /// pair), lifted into the Montgomery domain with `Z = 1`.
     fn from_affine(x: &U256, y: &U256) -> Self {
+        Self::from_affine_mont(&fp_to_mont(x), &fp_to_mont(y))
+    }
+
+    /// The point `(x, y)` given already in the Montgomery domain.
+    fn from_affine_mont(x: &U256, y: &U256) -> Self {
         Self {
             x: *x,
             y: *y,
-            z: ONE,
+            z: FP_ONE_MONT,
         }
     }
 
@@ -876,14 +724,15 @@ impl JacobianPoint {
         self.to_affine_with(&fp_inv_vartime(&self.z))
     }
 
-    /// Affine coordinates given `z^-1`, however it was computed.
+    /// Affine coordinates, in ordinary form, given `z^-1` in the
+    /// Montgomery domain, however it was computed.
     fn to_affine_with(&self, z_inv: &U256) -> (U256, U256) {
         let z_inv = *z_inv;
         let z_inv2 = fp_sqr(&z_inv);
         let z_inv3 = fp_mul(&z_inv2, &z_inv);
         let x = fp_mul(&self.x, &z_inv2);
         let y = fp_mul(&self.y, &z_inv3);
-        (x, y)
+        (fp_from_mont(&x), fp_from_mont(&y))
     }
 
     /// Point doubling in Jacobian coordinates.
@@ -928,7 +777,8 @@ impl JacobianPoint {
         }
     }
 
-    /// Point addition (mixed: Q is affine with Z=1).
+    /// Point addition (mixed: Q is affine with Z=1, in the Montgomery
+    /// domain).
     ///
     /// Exception-free by evaluation rather than by formula: the generic
     /// add and the doubling are both computed unconditionally, and the
@@ -972,7 +822,7 @@ impl JacobianPoint {
         // h == 0, r == 0 → P == Q → doubling.
         let out = ct_select_point(&out, &self.double(), h_zero & r_zero);
         // P is the identity → the result is Q, whatever the above said.
-        ct_select_point(&out, &JacobianPoint::from_affine(qx, qy), self_id)
+        ct_select_point(&out, &JacobianPoint::from_affine_mont(qx, qy), self_id)
     }
 
     /// Full Jacobian-Jacobian point addition (both points in Jacobian
@@ -1204,11 +1054,213 @@ fn scalar_mul_ct(k: &U256, px: &U256, py: &U256) -> JacobianPoint {
     acc
 }
 
-/// Scalar multiplication: k * G.
+/// The four-tooth comb for `k·G`: entry `idx` is the affine point
+/// `sum of 2^(64t)·G over the set bits t of idx`, as x limbs then y
+/// limbs, little-endian, in the Montgomery domain. Entry 0 would be the
+/// identity; the comb never adds it.
+static G_COMB: [[u64; 8]; 16] = [
+    [0, 0, 0, 0, 0, 0, 0, 0],
+    [
+        0x79e730d418a9143c,
+        0x75ba95fc5fedb601,
+        0x79fb732b77622510,
+        0x18905f76a53755c6,
+        0xddf25357ce95560a,
+        0x8b4ab8e4ba19e45c,
+        0xd2e88688dd21f325,
+        0x8571ff1825885d85,
+    ],
+    [
+        0x4f922fc516a0d2bb,
+        0x0d5cc16c1a623499,
+        0x9241cf3a57c62c8b,
+        0x2f5e6961fd1b667f,
+        0x5c15c70bf5a01797,
+        0x3d20b44d60956192,
+        0x04911b37071fdb52,
+        0xf648f9168d6f0f7b,
+    ],
+    [
+        0x9e566847e137bbbc,
+        0xe434469e8a6a0bec,
+        0xb1c4276179d73463,
+        0x5abe0285133d0015,
+        0x92aa837cc04c7dab,
+        0x573d9f4c43260c07,
+        0x0c93156278e6cc37,
+        0x94bb725b6b6f7383,
+    ],
+    [
+        0x62a8c244bfe20925,
+        0x91c19ac38fdce867,
+        0x5a96a5d5dd387063,
+        0x61d587d421d324f6,
+        0xe87673a2a37173ea,
+        0x2384800853778b65,
+        0x10f8441e05bab43e,
+        0xfa11fe124621efbe,
+    ],
+    [
+        0x1c891f2b2cb19ffd,
+        0x01ba8d5bb1923c23,
+        0xb6d03d678ac5ca8e,
+        0x586eb04c1f13bedc,
+        0x0c35c6e527e8ed09,
+        0x1e81a33c1819ede2,
+        0x278fd6c056c652fa,
+        0x19d5ac0870864f11,
+    ],
+    [
+        0x62577734d2b533d5,
+        0x673b8af6a1bdddc0,
+        0x577e7c9aa79ec293,
+        0xbb6de651c3b266b1,
+        0xe7e9303ab65259b3,
+        0xd6a0afd3d03a7480,
+        0xc5ac83d19b3cfc27,
+        0x60b4619a5d18b99b,
+    ],
+    [
+        0xbd6a38e11ae5aa1c,
+        0xb8b7652b49e73658,
+        0x0b130014ee5f87ed,
+        0x9d0f27b2aeebffcd,
+        0xca9246317a730a55,
+        0x9c955b2fddbbc83a,
+        0x07c1dfe0ac019a71,
+        0x244a566d356ec48d,
+    ],
+    [
+        0x56f8410ef4f8b16a,
+        0x97241afec47b266a,
+        0x0a406b8e6d9c87c1,
+        0x803f3e02cd42ab1b,
+        0x7f0309a804dbec69,
+        0xa83b85f73bbad05f,
+        0xc6097273ad8e197f,
+        0xc097440e5067adc1,
+    ],
+    [
+        0x846a56f2c379ab34,
+        0xa8ee068b841df8d1,
+        0x20314459176c68ef,
+        0xf1af32d5915f1f30,
+        0x99c375315d75bd50,
+        0x837cffbaf72f67bc,
+        0x0613a41848d7723f,
+        0x23d0f130e2d41c8b,
+    ],
+    [
+        0xed93e225d5be5a2b,
+        0x6fe799835934f3c6,
+        0x4314092622626ffc,
+        0x50bbb4d97990216a,
+        0x378191c6e57ec63e,
+        0x65422c40181dcdb2,
+        0x41a8099b0236e0f6,
+        0x2b10011801fe49c3,
+    ],
+    [
+        0xfc68b5c59b391593,
+        0xc385f5a2598270fc,
+        0x7144f3aad19adcbb,
+        0xdd55899983fbae0c,
+        0x93b88b8e74b82ff4,
+        0xd2e03c4071e734c9,
+        0x9a7a9eaf43c0322a,
+        0xe6e4c551149d6041,
+    ],
+    [
+        0x5fe14bfe80ec21fe,
+        0xf6ce116ac255be82,
+        0x98bc5a072f4a5d67,
+        0xfad27148db7e63af,
+        0x90c0b6ac29ab05b3,
+        0x37a9a83c4e251ae6,
+        0x0a7dc875c2aade7d,
+        0x77387de39f0e1a84,
+    ],
+    [
+        0x1e9ecc49a56c0dd7,
+        0xa5cffcd846086c74,
+        0x8f7a1408f505aece,
+        0xb37b85c0bef0c47e,
+        0x3596b6e4cc0e6a8f,
+        0xfd6d4bbf6b388f23,
+        0xaba453fac39cef4e,
+        0x9c135ac8f9f628d5,
+    ],
+    [
+        0x0a1c729495c8f8be,
+        0x2961c4803bf362bf,
+        0x9e418403df63d4ac,
+        0xc109f9cb91ece900,
+        0xc2d095d058945705,
+        0xb9083d96ddeb85c0,
+        0x84692b8d7a40449b,
+        0x9bc3344f2eee1ee1,
+    ],
+    [
+        0x0d5ae35642913074,
+        0x55491b2748a542b1,
+        0x469ca665b310732a,
+        0x29591d525f1a4cc1,
+        0xe76f5b6bb84f983f,
+        0xbe7eef419f5f84e1,
+        0x1200d49680baa189,
+        0x6376551f18ef332c,
+    ],
+];
+
+/// Column `i` of the comb: bits `i`, `64+i`, `128+i` and `192+i` of `k`.
+#[inline(always)]
+fn comb_index(k: &U256, i: u32) -> u64 {
+    ((k[0] >> i) & 1)
+        | (((k[1] >> i) & 1) << 1)
+        | (((k[2] >> i) & 1) << 2)
+        | (((k[3] >> i) & 1) << 3)
+}
+
+/// `G_COMB[idx]` without branching on `idx` or using it as an address:
+/// every entry is read and the match is selected under a mask.
+fn ct_lookup_comb(idx: u64) -> (U256, U256) {
+    let mut x = ZERO;
+    let mut y = ZERO;
+    let mut i = 0;
+    while i < 16 {
+        let mask = ct_eq_u64(i as u64, idx);
+        let e = &G_COMB[i];
+        x = ct_select_u256(&x, &[e[0], e[1], e[2], e[3]], mask);
+        y = ct_select_u256(&y, &[e[4], e[5], e[6], e[7]], mask);
+        i += 1;
+    }
+    (x, y)
+}
+
+/// One comb column: `2·acc + G_COMB[idx]`, with `idx` from column `i` of
+/// `k`. A zero column computes the addition anyway and keeps the
+/// doubling under a mask, so every column costs the same.
+fn comb_column(acc: &JacobianPoint, k: &U256, i: u32) -> JacobianPoint {
+    let d = acc.double();
+    let idx = comb_index(k, i);
+    let (qx, qy) = ct_lookup_comb(idx);
+    let sum = d.add_affine(&qx, &qy);
+    ct_select_point(&sum, &d, ct_eq_u64(idx, 0))
+}
+
+/// Scalar multiplication: k * G, by the fixed-base comb — 64 doublings
+/// and 64 mixed additions, against `scalar_mul_ct`'s 256 doublings and
+/// 64 full additions. Constant-time in `k` on the same terms as
+/// `scalar_mul_ct`: a fixed column schedule, a scanning lookup, and
+/// point arithmetic without exceptional-case branches.
 fn scalar_mul_base(k: &U256) -> JacobianPoint {
-    let gx = load_gx();
-    let gy = load_gy();
-    scalar_mul_ct(k, &gx, &gy)
+    let mut acc = JacobianPoint::identity();
+    let mut i: i32 = 63;
+    while i >= 0 {
+        acc = comb_column(&acc, k, i as u32);
+        i -= 1;
+    }
+    acc
 }
 
 /// Scalar multiplication: k * P (arbitrary point).
@@ -1262,6 +1314,9 @@ pub struct ScalarMulState {
     /// Next bit of `p - 2` to fold in; `INV_DONE` once all are.
     inv_bit: u16,
     want_affine: u8,
+    /// 1 for `k·G`: `bit_index` walks the 64 comb columns (see
+    /// `comb_column`) instead of the 256 ladder bits, and `r1` is unused.
+    comb: u8,
 }
 
 /// Fermat bits per ladder bit of a step: a ladder bit is an addition and
@@ -1292,6 +1347,7 @@ impl ScalarMulState {
             inv_base: ZERO,
             inv_bit: 0,
             want_affine: 0,
+            comb: 0,
         }
     }
 
@@ -1311,10 +1367,11 @@ impl ScalarMulState {
             bit_index: 255,
             bits_per_step,
             initialised: 1,
-            inv_result: ONE,
+            inv_result: FP_ONE_MONT,
             inv_base: ZERO,
             inv_bit: 0,
             want_affine: 1,
+            comb: 0,
         }
     }
 
@@ -1331,9 +1388,16 @@ impl ScalarMulState {
         reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
     )]
     pub fn new_base(k: &U256, bits_per_step: u8) -> Self {
-        let gx = load_gx();
-        let gy = load_gy();
-        Self::new(k, &gx, &gy, bits_per_step)
+        let mut s = Self::empty();
+        s.r0 = JacobianPoint::identity();
+        s.k = *k;
+        s.bit_index = 63;
+        s.bits_per_step = bits_per_step;
+        s.initialised = 1;
+        s.want_affine = 1;
+        s.inv_result = FP_ONE_MONT;
+        s.comb = 1;
+        s
     }
 
     pub fn complete(&self) -> bool {
@@ -1364,6 +1428,11 @@ impl ScalarMulState {
         } else {
             self.bits_per_step as i16
         };
+        while remaining > 0 && self.bit_index >= 0 && self.comb != 0 {
+            self.r0 = comb_column(&self.r0, &self.k, self.bit_index as u32);
+            self.bit_index -= 1;
+            remaining -= 1;
+        }
         while remaining > 0 && self.bit_index >= 0 {
             let bi = self.bit_index as u32;
             let word = self.k[(bi >> 6) as usize];
@@ -1381,7 +1450,7 @@ impl ScalarMulState {
             // both — except in run-to-completion mode, whose one call is
             // the whole computation.
             self.inv_base = self.r0.z;
-            self.inv_result = ONE;
+            self.inv_result = FP_ONE_MONT;
             self.inv_bit = 0;
             if self.bits_per_step == 0 {
                 self.step_inverse();
@@ -1739,6 +1808,9 @@ pub fn ecdh_keygen_finalise(state: &ScalarMulState) -> Option<[u8; 65]> {
 /// `key_vault`-signed identity key is reusable, and a follow-on
 /// CertificateVerify with a leaked component is catastrophic.
 pub fn is_on_curve(x: &U256, y: &U256) -> bool {
+    // Evaluated in the Montgomery domain, where `fp_mul` works.
+    let x = &fp_to_mont(x);
+    let y = &fp_to_mont(y);
     // y² mod p
     let y_sq = fp_sqr(y);
     // x³ mod p
@@ -1748,7 +1820,7 @@ pub fn is_on_curve(x: &U256, y: &U256) -> bool {
     let two_x = fp_add(x, x);
     let three_x = fp_add(&two_x, x);
     // x³ - 3x + b mod p
-    let rhs = fp_add(&fp_sub(&x_cubed, &three_x), &load_b());
+    let rhs = fp_add(&fp_sub(&x_cubed, &three_x), &FP_B_MONT);
     // Equality folded over all four limbs before the branch, so the
     // comparison itself reveals nothing about where the values differ.
     // The inputs here are a candidate public point — public — so this
@@ -2093,9 +2165,8 @@ pub fn ecdsa_verify(pub_key: &[u8], hash: &[u8], sig: &[u8]) -> bool {
     let p1 = scalar_mul_base(&u1);
     let p2 = scalar_mul(&u2, &qx, &qy);
 
-    // Add p1 + p2
-    let (p2x, p2y) = p2.to_affine_vartime();
-    let sum = p1.add_affine(&p2x, &p2y);
+    // Add p1 + p2, both Jacobian: no inversion before the final one.
+    let sum = p1.add_jacobian(&p2);
 
     if sum.is_identity() {
         return false;
@@ -2206,8 +2277,7 @@ pub fn ecdsa_verify_finalise(job: &EcdsaVerifyJob) -> bool {
     }
     let p1 = job.s1.result();
     let p2 = job.s2.result();
-    let (p2x, p2y) = p2.to_affine_vartime();
-    let sum = p1.add_affine(&p2x, &p2y);
+    let sum = p1.add_jacobian(&p2);
     if sum.is_identity() {
         return false;
     }

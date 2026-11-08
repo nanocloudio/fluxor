@@ -67,7 +67,6 @@ unsafe fn dtls_alloc_session(s: &mut TlsState, ip: &[u8; 4], port: u16) -> Optio
 }
 
 unsafe fn dtls_init_server_session(s: &mut TlsState, i: usize, ip: &[u8; 4], port: u16) -> usize {
-    let sys = &*s.syscalls;
     {
         let sess = &mut s.peer_sessions[i];
         sess.reset();
@@ -79,23 +78,8 @@ unsafe fn dtls_init_server_session(s: &mut TlsState, i: usize, ip: &[u8; 4], por
         sess.endpoint.driver.hs_state = HandshakeState::RecvClientHello;
         sess.endpoint.driver.suite = CipherSuite::ChaCha20Poly1305;
     }
-    // Fresh ECDH key per session (forward secrecy). Same helper
-    // and same CSPRNG-failure → pool-fallback policy as TCP-TLS
-    // (see `assign_fresh_ecdh_key`). On total failure, mark the
-    // slot Errored so the allocator's tombstone-reuse path picks
-    // it up rather than handing back a session with a zero key.
-    let ok = assign_fresh_ecdh_key(
-        sys,
-        &mut s.peer_sessions[i].endpoint.driver,
-        &mut s.eph_private,
-        &s.eph_public,
-        &mut s.eph_used,
-        &mut s.ecdh_pool_hit,
-        &mut s.ecdh_fallback_keygen,
-    );
-    if !ok {
-        s.peer_sessions[i].phase = DtlsPhase::Errored;
-    }
+    // The P-256 key is taken when the ClientHello selects P-256
+    // (`dtls_pump_recv_client_hello`); an X25519 session never needs it.
     i
 }
 
@@ -312,6 +296,20 @@ unsafe fn dtls_pump_recv_client_hello(s: &mut TlsState, idx: usize) -> bool {
             );
             driver.peer_key_share_len = key_data.len() as u8;
             driver.group = GROUP_SECP256R1;
+            // Fresh ECDH key per session (forward secrecy), from the pool
+            // or generated (see `assign_fresh_ecdh_key`).
+            if !assign_fresh_ecdh_key(
+                sys,
+                driver,
+                &mut s.eph_private,
+                &s.eph_public,
+                &mut s.eph_used,
+                &mut s.ecdh_pool_hit,
+                &mut s.ecdh_fallback_keygen,
+            ) {
+                driver.hs_state = HandshakeState::Error;
+                return true;
+            }
         }
         _ => {
             // RFC 8446 §4.1.4: client offered no usable share. Send HRR

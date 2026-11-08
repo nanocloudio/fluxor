@@ -15,6 +15,21 @@
 //   identity_cert in[3]   [0x5C][len:2 LE][leaf DER ‖ issuer DER ‖ …]
 //                         the chain presented to peers, leaf first
 //
+// With `identity_request: csr` the request is a PKCS#10 instead of the bare
+// point, so an issuer that takes proof of possession can have it:
+//
+//   identity_req  out[4]  [0x5D][len:2 LE][CertificationRequest DER]
+//                         version 0, subject `CN=<identity_subject>` (empty
+//                         when unset), the key's SubjectPublicKeyInfo, no
+//                         attributes, signed ecdsa-with-SHA256 in the vault
+//
+// The vault signs exactly one shape here, built by this module from the key
+// it holds and a subject from its params: the request asserts nothing but
+// "this key, under this name", which a certificate for the key asserts
+// anyway. No other module, and no caller-supplied bytes, reach the key's
+// signature. It is built once per key and sent again as it is; a request is
+// public, and replaying it gains nothing without the key.
+//
 // Both ports carry net_proto-framed messages. A chain is read off
 // `identity_cert` only once its whole frame is buffered, and a frame larger
 // than the inbox is dropped whole, so the port never holds part of one.
@@ -33,6 +48,15 @@
 
 const ID_MSG_REQ: u8 = 0x5B;
 const ID_MSG_CERT: u8 = 0x5C;
+const ID_MSG_CSR: u8 = 0x5D;
+/// `identity_request`: what `identity_req` carries.
+const ID_REQUEST_POINT: u8 = 0;
+const ID_REQUEST_CSR: u8 = 1;
+/// Longest `identity_subject` (a CN): a request stays one short-form name.
+pub const IDENTITY_SUBJECT_MAX: usize = 64;
+/// Largest request this module builds: a 64-byte CN, the key, a 72-byte
+/// signature and their DER, rounded up.
+const ID_CSR_MAX: usize = 288;
 /// Between certificate requests, and between vault retries after a refusal.
 const ID_REQ_PERIOD_MS: u64 = 1000;
 /// Between vault retries while the store is not yet readable.
@@ -76,6 +100,18 @@ struct LabelIdentity {
     /// so a link still stepping when a renewal writes over the slot fails
     /// cleanly instead of reading key bytes from a different anchor.
     adopted_generation: u32,
+    /// `identity_request` (ID_REQUEST_*); out of range refuses construction.
+    request_form: u8,
+    subject: [u8; IDENTITY_SUBJECT_MAX],
+    subject_len: u8,
+    /// `identity_subject` was longer than `IDENTITY_SUBJECT_MAX` or not
+    /// printable; construction refuses.
+    subject_bad: u8,
+    /// The signed request, once built (`csr_len` > 0); one per key.
+    csr: [u8; ID_CSR_MAX],
+    csr_len: u16,
+    /// The vault refused to sign the request; said once.
+    csr_refused: u8,
     /// One `identity_cert` frame: its net_proto header, then the chain.
     inbox: [u8; NET_FRAME_HDR + MAX_CERT_CHAIN_BYTES],
 }
@@ -93,6 +129,154 @@ impl LabelIdentity {
     fn configured(&self) -> bool {
         self.label_len > 0
     }
+    fn set_subject(&mut self, d: &[u8]) {
+        // A CN of printable ASCII: the request carries it as a UTF8String,
+        // and a name an issuer cannot read back as text is no name.
+        if d.len() > IDENTITY_SUBJECT_MAX || d.iter().any(|&c| !(0x20..0x7F).contains(&c)) {
+            self.subject_bad = 1;
+            return;
+        }
+        // SAFETY: d.len() <= IDENTITY_SUBJECT_MAX, checked above.
+        unsafe { core::ptr::copy_nonoverlapping(d.as_ptr(), self.subject.as_mut_ptr(), d.len()) };
+        self.subject_len = d.len() as u8;
+    }
+}
+
+// ── The PKCS#10 request (RFC 2986), in the one shape this module builds ──
+
+const DER_SPKI_P256_PREFIX: [u8; 26] = [
+    0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01, 0x06, 0x08, 0x2A,
+    0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00,
+];
+/// AlgorithmIdentifier ecdsa-with-SHA256, parameters absent (RFC 5758).
+const DER_ALG_ECDSA_SHA256: [u8; 12] = [
+    0x30, 0x0A, 0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02,
+];
+const DER_OID_CN: [u8; 5] = [0x06, 0x03, 0x55, 0x04, 0x03];
+
+/// A DER header (tag, minimal length) at `out[at..]`; where its value starts.
+/// `None` past `out` or past a two-byte length.
+fn der_head(out: &mut [u8], at: usize, tag: u8, len: usize) -> Option<usize> {
+    let mut h = [tag, 0, 0, 0];
+    let n = if len < 0x80 {
+        h[1] = len as u8;
+        2
+    } else if len < 0x100 {
+        h[1] = 0x81;
+        h[2] = len as u8;
+        3
+    } else if len < 0x10000 {
+        h[1] = 0x82;
+        h[2] = (len >> 8) as u8;
+        h[3] = len as u8;
+        4
+    } else {
+        return None;
+    };
+    out.get_mut(at..at + n)?.copy_from_slice(&h[..n]);
+    Some(at + n)
+}
+
+fn der_put(out: &mut [u8], at: usize, b: &[u8]) -> Option<usize> {
+    out.get_mut(at..at + b.len())?.copy_from_slice(b);
+    Some(at + b.len())
+}
+
+/// The CertificationRequestInfo for `point` under `CN=<subject>` (no RDN
+/// when `subject` is empty): its DER length in `out`.
+pub fn csr_info(point: &[u8; ID_POINT_LEN], subject: &[u8], out: &mut [u8]) -> Option<usize> {
+    let name_len = if subject.is_empty() {
+        0
+    } else {
+        // SEQUENCE { SET { SEQUENCE { OID cn, UTF8String } } }, all short.
+        2 + 2 + DER_OID_CN.len() + 2 + subject.len()
+    };
+    let body = 3 + 2 + name_len + DER_SPKI_P256_PREFIX.len() + ID_POINT_LEN + 2;
+    let mut at = der_head(out, 0, 0x30, body)?;
+    at = der_put(out, at, &[0x02, 0x01, 0x00])?;
+    at = der_head(out, at, 0x30, name_len)?;
+    if !subject.is_empty() {
+        at = der_head(out, at, 0x31, name_len - 2)?;
+        at = der_head(out, at, 0x30, name_len - 4)?;
+        at = der_put(out, at, &DER_OID_CN)?;
+        at = der_head(out, at, 0x0C, subject.len())?;
+        at = der_put(out, at, subject)?;
+    }
+    at = der_put(out, at, &DER_SPKI_P256_PREFIX)?;
+    at = der_put(out, at, point)?;
+    der_put(out, at, &[0xA0, 0x00])
+}
+
+/// One INTEGER of a signature: `v` (32 bytes, big-endian, unsigned) minimal.
+fn der_uint(out: &mut [u8], at: usize, v: &[u8; 32]) -> Option<usize> {
+    let mut z = 0;
+    while z < 31 && v[z] == 0 {
+        z += 1;
+    }
+    let pad = usize::from(v[z] & 0x80 != 0);
+    let mut at = der_head(out, at, 0x02, pad + 32 - z)?;
+    if pad == 1 {
+        at = der_put(out, at, &[0])?;
+    }
+    der_put(out, at, &v[z..])
+}
+
+/// The whole CertificationRequest: `info` and its signature `r ‖ s`.
+pub fn csr_finish(info: &[u8], sig: &[u8; 64], out: &mut [u8]) -> Option<usize> {
+    let mut r = [0u8; 32];
+    let mut s = [0u8; 32];
+    r.copy_from_slice(&sig[..32]);
+    s.copy_from_slice(&sig[32..]);
+    let mut ecdsa = [0u8; 72];
+    let mut n = der_uint(&mut ecdsa, 2, &r)?;
+    n = der_uint(&mut ecdsa, n, &s)?;
+    // Both INTEGERs fit 70 bytes, so the SEQUENCE header is two.
+    ecdsa[0] = 0x30;
+    ecdsa[1] = (n - 2) as u8;
+    let bits = 1 + n;
+    let body = info.len() + DER_ALG_ECDSA_SHA256.len() + 2 + bits;
+    let mut at = der_head(out, 0, 0x30, body)?;
+    at = der_put(out, at, info)?;
+    at = der_put(out, at, &DER_ALG_ECDSA_SHA256)?;
+    at = der_head(out, at, 0x03, bits)?;
+    at = der_put(out, at, &[0])?;
+    der_put(out, at, &ecdsa[..n])
+}
+
+/// Build and sign this key's request through the vault. `Some(true)` once
+/// held, `Some(false)` when the vault is busy (asked again next step),
+/// `None` when it refused.
+unsafe fn identity_build_csr(s: &mut TlsState) -> Option<bool> {
+    let sys = &*s.syscalls;
+    let mut info = [0u8; ID_CSR_MAX];
+    let n = (s.label_id.subject_len as usize).min(IDENTITY_SUBJECT_MAX);
+    let mut subject = [0u8; IDENTITY_SUBJECT_MAX];
+    subject[..n].copy_from_slice(&s.label_id.subject[..n]);
+    let point = s.label_id.point;
+    let info_len = csr_info(&point, &subject[..n], &mut info)?;
+    let digest = sha256(&info[..info_len]);
+    // SIGN: [mode:u8][_pad][input_len:u32][input][sig_ptr:u64][sig_cap:u16]
+    // [sig_len_out:u16]; DIGEST, because this IS the digest.
+    const SIGN_MODE_DIGEST: u8 = 1;
+    let mut sig = [0u8; 64];
+    let mut arg = [0u8; 6 + 32 + 12];
+    arg[0] = SIGN_MODE_DIGEST;
+    arg[2..6].copy_from_slice(&32u32.to_le_bytes());
+    arg[6..38].copy_from_slice(&digest);
+    arg[38..46].copy_from_slice(&(sig.as_mut_ptr() as u64).to_le_bytes());
+    arg[46..48].copy_from_slice(&64u16.to_le_bytes());
+    let rc = (sys.provider_call)(s.key_vault_handle, kv::SIGN, arg.as_mut_ptr(), arg.len());
+    if rc == abi::errno::EAGAIN || rc == abi::errno::EBUSY {
+        return Some(false);
+    }
+    if rc != 0 || u16::from_le_bytes([arg[48], arg[49]]) != 64 {
+        return None;
+    }
+    let mut csr = [0u8; ID_CSR_MAX];
+    let len = csr_finish(&info[..info_len], &sig, &mut csr)?;
+    s.label_id.csr[..len].copy_from_slice(&csr[..len]);
+    s.label_id.csr_len = len as u16;
+    Some(true)
 }
 
 /// May a handshake present this instance's certificate now? Always, for a
@@ -342,10 +526,35 @@ unsafe fn identity_request(s: &mut TlsState, now: u64) -> bool {
     if poll <= 0 || (poll as u32 & 0x02) == 0 {
         return false;
     }
-    let mut frame = [0u8; 3 + ID_POINT_LEN];
-    frame[0] = ID_MSG_REQ;
-    frame[1..3].copy_from_slice(&(ID_POINT_LEN as u16).to_le_bytes());
-    frame[3..].copy_from_slice(&s.label_id.point);
+    let mut frame = [0u8; 3 + ID_CSR_MAX];
+    let len = if s.label_id.request_form == ID_REQUEST_CSR {
+        if s.label_id.csr_len == 0 {
+            match identity_build_csr(s) {
+                Some(true) => {}
+                Some(false) => return false,
+                None => {
+                    if s.label_id.csr_refused == 0 {
+                        s.label_id.csr_refused = 1;
+                        let msg =
+                            b"[tls] identity: the vault refused to sign the certificate request";
+                        dev_log(sys, 1, msg.as_ptr(), msg.len());
+                    }
+                    s.label_id.next_at = now + ID_REQ_PERIOD_MS;
+                    return false;
+                }
+            }
+        }
+        let n = s.label_id.csr_len as usize;
+        frame[0] = ID_MSG_CSR;
+        frame[3..3 + n].copy_from_slice(&s.label_id.csr[..n]);
+        n
+    } else {
+        frame[0] = ID_MSG_REQ;
+        frame[3..3 + ID_POINT_LEN].copy_from_slice(&s.label_id.point);
+        ID_POINT_LEN
+    };
+    frame[1..3].copy_from_slice(&(len as u16).to_le_bytes());
+    let frame = &frame[..3 + len];
     if (sys.channel_write)(port, frame.as_ptr(), frame.len()) == frame.len() as i32 {
         s.label_id.next_at = now + ID_REQ_PERIOD_MS;
         return true;
@@ -392,7 +601,16 @@ unsafe fn identity_admit(s: &mut TlsState) -> Option<&'static [u8]> {
     if s.label_id.overflow != 0 {
         return Some(b"[tls] refusing to construct: identity_label exceeds 64 bytes");
     }
+    if s.label_id.subject_bad != 0 {
+        return Some(b"[tls] refusing to construct: identity_subject is longer than 64 bytes or not printable ASCII");
+    }
+    if s.label_id.request_form > ID_REQUEST_CSR {
+        return Some(b"[tls] refusing to construct: identity_request is point or csr");
+    }
     if !s.label_id.configured() {
+        if s.label_id.request_form != ID_REQUEST_POINT || s.label_id.subject_len != 0 {
+            return Some(b"[tls] refusing to construct: identity_request and identity_subject describe an identity_label's request, and there is none");
+        }
         if s.label_id.trust_issuer != 0 {
             return Some(b"[tls] refusing to construct: trust_issuer takes its authority from an identity_label chain, and there is none");
         }

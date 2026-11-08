@@ -97,6 +97,14 @@ decision seam):
 
 - `packet_decision` (`off` / `pre_transport`), `packet_hold_ms` (50) — the
   seam, and how long a packet waits for its disposition.
+- `packet_holds` (32 on aarch64, 8 on wasm, 4 on embedded) — packets the
+  seam holds at once, one whole frame each in this module's heap; at most
+  256 (the slots a `pkt_id` names), refused at construction past it. A
+  burst past them is refused and counted (`hold_refused`): declare what a
+  director's decision time times the offered rate needs. A packet the
+  holds have room for is never refused for the director's ring: held with
+  its record owed (`deferred`), described in arrival order as the ring
+  drains, and released silently at its deadline if it never could be.
 - `packet_mirror_budget` (0) — `MIRROR` and forward-and-copy (`COPY`)
   copies a second.
 - `seam_v6` (empty) — up to four IPv6 addresses, comma-separated, whose TCP

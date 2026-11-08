@@ -260,6 +260,16 @@ instantiation and refuses an entry past a table's count; nothing about a
 count is compiled in. A module that cannot take a table refuses to
 construct, saying which.
 
+**One block for several tables.** On the elastic profiles a heap commits
+segments as the module allocates and no allocation spans two of them, so
+tables taken one by one can strand the tail of a segment and miss a cap
+that holds their sum — at some counts and not others. A module with more
+than one table takes them as ONE allocation of their summed size and
+carves each from it (each carve rounded to the heap's 16-byte
+granularity, which `base` covers): a single allocation the cap holds is
+always served from one segment. A module with one table is that case
+already.
+
 `pack` holds the rule to the module: `base` to the declared arena, each
 `tag` to an integer param of the module's `define_params!` schema, and each
 `default` to that param's schema default. A type states at most one

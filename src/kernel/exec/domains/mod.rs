@@ -514,6 +514,27 @@ fn count_busy(domain_id: usize, since: u64) {
     );
 }
 
+/// This core's interrupt count, read before a pass so [`await_tick`] can tell
+/// whether an interrupt was taken during it.
+fn core_interrupts(core_id: usize) -> u32 {
+    exception::CORE_INTERRUPTS[core_id.min(exception::MAX_CORES - 1)].load(Ordering::Relaxed)
+}
+
+/// Sleep until the interrupt the next pass answers. An interrupt taken DURING
+/// a pass is already handled when the pass ends, so the WFI that follows
+/// would not return for it: a tick that fired mid-pass (a pass longer than
+/// the period) would lose its pass and idle the core for a whole period with
+/// work queued, and a device interrupt would leave the data it announced
+/// until the next tick. Either way the next pass runs at once instead. A
+/// pass therefore follows only an interrupt, so a loaded domain runs back to
+/// back and an idle one still sleeps.
+fn await_tick(core_id: usize, interrupts_before_pass: u32) {
+    if core_interrupts(core_id) == interrupts_before_pass {
+        // SAFETY: WFI halts the core until the next interrupt; hint-only.
+        unsafe { core::arch::asm!("wfi") };
+    }
+}
+
 /// The software-wake latency bound on an adaptive domain's relaxed deadline.
 ///
 /// The cooperative loop idles on WFI, broken only by an interrupt. A device
@@ -596,11 +617,12 @@ pub fn run(domain_id: usize, platform: &'static Platform) -> ! {
                 core_id,
                 scheduler::domain_tick_us(domain_id)
             );
+            let mut interrupts_before_pass = core_interrupts(core_id);
             loop {
-                // SAFETY: WFI halts the core until the next interrupt; hint-only.
-                unsafe { core::arch::asm!("wfi") };
+                await_tick(core_id, interrupts_before_pass);
                 park_if_requested(domain_id);
                 let woke = timer::read_timer_count_64();
+                interrupts_before_pass = core_interrupts(core_id);
                 let t0 = timer::read_timer_count();
                 domain_step_all(domain_id, platform);
                 cross::pump(domain_id);
@@ -720,32 +742,35 @@ pub fn run(domain_id: usize, platform: &'static Platform) -> ! {
                 }
             }
         }
-        Tier::Cooperative => loop {
-            // SAFETY: WFI halts the core until the next interrupt; hint-only.
-            unsafe { core::arch::asm!("wfi") };
-            park_if_requested(domain_id);
-            let woke = timer::read_timer_count_64();
-            let tick = exception::CORE_TICKS[core_id.min(exception::MAX_CORES - 1)]
-                .load(Ordering::Relaxed);
-            // Tier-2 silicon validation: from core 0, periodically send SGI 15
-            // to core 1, the interrupt its Tier-2 module owns. Build flag only.
-            #[cfg(feature = "test_tier2_sgi")]
-            if core_id == 0 && tick.is_multiple_of(2000) {
-                // SAFETY: a single write to the distributor mapped at boot.
-                unsafe { crate::arch::aarch64::gic::send_sgi(1, 15) };
+        Tier::Cooperative => {
+            let mut interrupts_before_pass = core_interrupts(core_id);
+            loop {
+                await_tick(core_id, interrupts_before_pass);
+                park_if_requested(domain_id);
+                let woke = timer::read_timer_count_64();
+                interrupts_before_pass = core_interrupts(core_id);
+                let tick = exception::CORE_TICKS[core_id.min(exception::MAX_CORES - 1)]
+                    .load(Ordering::Relaxed);
+                // Tier-2 silicon validation: from core 0, periodically send SGI 15
+                // to core 1, the interrupt its Tier-2 module owns. Build flag only.
+                #[cfg(feature = "test_tier2_sgi")]
+                if core_id == 0 && tick.is_multiple_of(2000) {
+                    // SAFETY: a single write to the distributor mapped at boot.
+                    unsafe { crate::arch::aarch64::gic::send_sgi(1, 15) };
+                }
+                domain_step_all(domain_id, platform);
+                cross::pump(domain_id);
+                // With no core of its own, a polled-timer ISR domain is fired from
+                // here.
+                crate::kernel::exec::isr_tier::poll_tier1b();
+                (platform.after_pass)(domain_id, core_id, tier);
+                count_pass(domain_id);
+                scheduler::maybe_emit_alive(u64::from(tick), Some(domain_id));
+                poll_rebuild(domain_id, platform);
+                arm_next_deadline(domain_id, core_id);
+                count_busy(domain_id, woke);
             }
-            domain_step_all(domain_id, platform);
-            cross::pump(domain_id);
-            // With no core of its own, a polled-timer ISR domain is fired from
-            // here.
-            crate::kernel::exec::isr_tier::poll_tier1b();
-            (platform.after_pass)(domain_id, core_id, tier);
-            count_pass(domain_id);
-            scheduler::maybe_emit_alive(u64::from(tick), Some(domain_id));
-            poll_rebuild(domain_id, platform);
-            arm_next_deadline(domain_id, core_id);
-            count_busy(domain_id, woke);
-        },
+        }
     }
 }
 

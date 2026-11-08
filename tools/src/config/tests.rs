@@ -5042,6 +5042,39 @@ mod port_capability_tests {
         assert!(msg.contains("exactly one source"), "got: {msg}");
     }
 
+    /// One block source wired to two consumers is a tee: the stream reaches
+    /// both, the requests only one, so the second waits for ever. A vault
+    /// beside a filesystem on one disk is the case that bit.
+    #[test]
+    fn a_block_source_feeding_two_consumers_is_refused() {
+        let mut m = HashMap::new();
+        m.insert("fat32".to_string(), consumer("blocks", "storage.block", 0));
+        m.insert("vault".to_string(), consumer("blocks", "storage.block", 0));
+        m.insert("nvme".to_string(), surface_provider(&["storage.block"]));
+        let g = block_graph(&[
+            ("nvme.blocks", "fat32.blocks"),
+            ("nvme.blocks", "vault.blocks"),
+        ]);
+        let msg = format!("{:?}", validate_port_capabilities(&g, &m).unwrap_err());
+        assert!(
+            msg.contains("`nvme.blocks` is a `storage.block` source")
+                && msg.contains("fat32.blocks")
+                && msg.contains("vault.blocks")
+                && msg.contains("tee"),
+            "got: {msg}"
+        );
+
+        // Also when the second edge goes to a port with no requirement: it
+        // is still a tee on the source's channel.
+        m.insert("tap".to_string(), Manifest::default());
+        let g = block_graph(&[
+            ("nvme.blocks", "fat32.blocks"),
+            ("nvme.blocks", "tap.in"),
+        ]);
+        let msg = format!("{:?}", validate_port_capabilities(&g, &m).unwrap_err());
+        assert!(msg.contains("tee"), "got: {msg}");
+    }
+
     /// Two block consumers, each on its own source, are two independent
     /// edges.
     #[test]

@@ -425,7 +425,14 @@ const DNS_PENDING_DEFAULT: u8 = 2;
 #[cfg(target_arch = "aarch64")]
 const HEAP_DEFAULT_BYTES: u32 = 16 * 1024 * 1024;
 #[cfg(not(target_arch = "aarch64"))]
-const HEAP_DEFAULT_BYTES: u32 = 5 * 1024;
+const HEAP_DEFAULT_BYTES: u32 = 5 * 1024
+    + (PACKET_HOLDS_DEFAULT as usize
+        * (core::mem::size_of::<HeldPacket>() + core::mem::size_of::<OwedRef>())) as u32;
+
+/// Decision-seam holds when the graph declares none: the profile's figure.
+const PACKET_HOLDS_DEFAULT: u16 = MAX_PACKET_HOLD as u16;
+/// The most holds a `pkt_id` can name.
+const PACKET_HOLDS_MAX: usize = 1 << abi::contracts::net::packet::PKT_SLOT_BITS;
 
 /// Workload network lanes this provider holds: a staged workload's own
 /// command/event channel pair, attached by the kernel. The provider states
@@ -778,6 +785,11 @@ const NOTIFY_RESET: u8 = 7;
 /// As `NOTIFY_RESET`, for a connection whose consumer is gone with its lane:
 /// nobody is told.
 const NOTIFY_RESET_QUIET: u8 = 8;
+/// A released slot whose consumer was told `CLOSED_GONE` before it sent
+/// `CMD_CLOSE`: held — `Closed`, unindexed, refused by the allocator — for
+/// that close or `CLOSE_WAIT_TICKS`, whichever comes first
+/// (`release_told_gone`). `9` is `continuity::NOTIFY_SHADOW_RESERVED`.
+const NOTIFY_ID_RESERVED: u8 = 10;
 /// TCP timer ticks per second (`step_tcp_timers` advances every 50 ms).
 const TCP_TIMER_HZ: u16 = 20;
 /// CloseWait bound: the peer has closed and the consumer has not answered
@@ -1042,6 +1054,32 @@ const fn tcp_slot_lo() -> usize {
     } else {
         0
     }
+}
+
+/// Release slot `idx` once its consumer has been told `CLOSED_GONE`.
+///
+/// net_proto's release rule reserves a closed connection's id for the
+/// consumer's `CMD_CLOSE`. A consumer that has already closed is done with
+/// the id and the slot frees now. One that has not — the peer reset the
+/// connection, or it timed out, under the consumer — will answer the notice
+/// with `CMD_CLOSE`, and were the slot handed to the next SYN that close
+/// would end the newcomer. So the slot is released (unindexed, its tuple
+/// reusable at once) but held from the allocator until the close arrives or
+/// `CLOSE_WAIT_TICKS` pass.
+unsafe fn release_told_gone(s: &mut IpState, idx: usize) {
+    let consumer_closed = (*s.tcp_conns.ptr(idx)).consumer_closed;
+    conn_reset(s, idx);
+    if !consumer_closed {
+        let c = &mut *s.tcp_conns.ptr_mut(idx);
+        c.pending_close_notify = NOTIFY_ID_RESERVED;
+        c.retransmit_timer = 0;
+    }
+}
+
+/// End an id reservation (`release_told_gone`): the slot frees.
+unsafe fn end_id_reservation(s: &mut IpState, idx: usize) {
+    (*s.tcp_conns.ptr_mut(idx)).pending_close_notify = NOTIFY_NONE;
+    free_push(s, idx);
 }
 
 /// Return a released TCP slot to the free stack.
@@ -1395,6 +1433,7 @@ impl IpDrops {
 /// header starts in it, which local-address slot it was demuxed to, and
 /// when it is released if no disposition comes.
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct HeldPacket {
     in_use: u8,
     /// Address family of the held packet: 0 or 4 IPv4, 6 IPv6.
@@ -1410,8 +1449,42 @@ pub struct HeldPacket {
     /// A TUNNEL/DSR disposition whose forward write did not fit yet:
     /// `[disposition][args:6]`, `disposition = 0xFF` when none pending.
     pending_fwd: [u8; 7],
-    _pad: u8,
+    /// Its decision record is owed: held while the director's ring had no
+    /// room, `desc[..desc_len]` sent (as `desc_msg`) once it has.
+    desc_owed: u8,
+    desc_msg: u8,
+    desc_len: u8,
+    desc: [u8; abi::contracts::net::packet::DECIDE6_LEN],
     frame: [u8; MAX_FRAME_SIZE],
+}
+
+/// A hold whose decision record is owed: its slot and the generation it
+/// was taken under (a slot freed and taken again is not the one owed).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct OwedRef {
+    slot: u16,
+    _pad: u16,
+    gen: u32,
+}
+
+impl HeldPacket {
+    /// A free slot: nothing held, no forward pending.
+    const EMPTY: Self = Self {
+        in_use: 0,
+        af: 0,
+        local_slot: 0,
+        gen: 0,
+        len: 0,
+        l3_off: 0,
+        deadline_ms: 0,
+        pending_fwd: [0xFF, 0, 0, 0, 0, 0, 0],
+        desc_owed: 0,
+        desc_msg: 0,
+        desc_len: 0,
+        desc: [0; abi::contracts::net::packet::DECIDE6_LEN],
+        frame: [0; MAX_FRAME_SIZE],
+    };
 }
 
 /// Decision-seam counters. Lifetime counters like `IpDrops`; a director
@@ -1455,6 +1528,12 @@ pub struct PktSeamStats {
     pub v6_nd_answered: u32,
     /// Forward-and-copy dispositions (`disposition::COPY`) taken.
     pub fwd_copy: u32,
+    /// Packets held while the director's ring was full, their decision
+    /// records sent once it drained.
+    pub desc_deferred: u32,
+    /// Of those, released at their deadline before the record could go:
+    /// the director never heard of them.
+    pub desc_expired: u32,
 }
 
 #[repr(C)]
@@ -1650,7 +1729,15 @@ struct IpState {
     ip6_param: [[u8; 16]; SEAM_V6_MAX],
     ip6_param_count: u8,
     pkt_stats: PktSeamStats,
-    pkt_hold: [HeldPacket; MAX_PACKET_HOLD],
+    /// The decision seam's held packets: `pkt_holds` slots from the heap
+    /// (`packet_holds`), each one whole frame.
+    pkt_hold: *mut HeldPacket,
+    pkt_holds: u16,
+    /// Holds whose record is owed, in arrival order: a ring of
+    /// `pkt_holds` `(slot, generation)` from the heap.
+    pkt_owed_q: *mut OwedRef,
+    pkt_owed_head: u16,
+    pkt_owed_len: u16,
 
     // Transport continuity (in[4] / out[6]); ports -1 when unwired.
     cont: continuity::Continuity,
@@ -2068,6 +2155,12 @@ mod params_def {
                 let v = p_u16(d, len, 0, 50);
                 s.pkt_hold_ms = if v == 0 { 1 } else { v };
             };
+        // Packets the decision seam holds at once (`packet_decision`), each
+        // a whole frame in this module's heap: a burst past them is refused
+        // (`hold_refused`) and its peers retransmit. At most the slots a
+        // `pkt_id` can name (`PKT_SLOT_BITS`).
+        32, packet_holds, u16, PACKET_HOLDS_DEFAULT
+            => |s, d, len| { s.pkt_holds = p_u16(d, len, 0, PACKET_HOLDS_DEFAULT); };
         // Declared capacities: each sizes a table in this module's heap at
         // construction. A graph that declares more than the defaults gives
         // the instance the heap for it (`heap.arena_bytes`).
@@ -2333,6 +2426,34 @@ unsafe fn refuse_capacity(s: &IpState, what: &[u8]) {
 /// Size the declared tables into the module heap. `false` (logged, naming
 /// the table) when a declaration is inconsistent or the heap cannot hold it.
 unsafe fn size_declared_tables(s: &mut IpState) -> bool {
+    // The decision seam's holds: a `pkt_id` names at most PACKET_HOLDS_MAX.
+    if usize::from(s.pkt_holds) > PACKET_HOLDS_MAX {
+        let msg =
+            b"[ip] refusing to construct: packet_holds exceeds the slots a pkt_id names (256)";
+        dev_log(&*s.syscalls, 1, msg.as_ptr(), msg.len());
+        return false;
+    }
+    if s.pkt_decision != PKT_DECISION_OFF && s.pkt_holds == 0 {
+        let msg = b"[ip] refusing to construct: packet_decision with packet_holds 0 would refuse every packet";
+        dev_log(&*s.syscalls, 1, msg.as_ptr(), msg.len());
+        return false;
+    }
+    if s.pkt_holds > 0 {
+        s.pkt_hold = heap_table(s, usize::from(s.pkt_holds), HeldPacket::EMPTY);
+        s.pkt_owed_q = heap_table(
+            s,
+            usize::from(s.pkt_holds),
+            OwedRef {
+                slot: 0,
+                _pad: 0,
+                gen: 0,
+            },
+        );
+        if s.pkt_hold.is_null() || s.pkt_owed_q.is_null() {
+            refuse_capacity(s, b"the decision seam's holds (packet_holds)");
+            return false;
+        }
+    }
     // The address table holds the primary, one address per lane, and the
     // held addresses: a declaration it cannot hold is refused here rather
     // than discovered when the next install is refused.
@@ -4709,13 +4830,8 @@ pub unsafe extern "C" fn module_new(
         s.v6t_stats = v6t::V6tStats::default();
         s.ip6_param = [[0; 16]; SEAM_V6_MAX];
         s.ip6_param_count = 0;
-        let mut hi = 0;
-        while hi < MAX_PACKET_HOLD {
-            let h = &mut *s.pkt_hold.as_mut_ptr().add(hi);
-            h.in_use = 0;
-            h.pending_fwd[0] = 0xFF;
-            hi += 1;
-        }
+        // The holds are sized (and emptied, `HeldPacket::EMPTY`) with the
+        // declared tables below.
 
         // Self-register as the node's net-identity provider (the kernel-side
         // workload backend resolves addr_ctl / ingress through this — no name
@@ -4758,6 +4874,7 @@ pub unsafe extern "C" fn module_new(
         s.dg_flow_idle_s = flows::IDLE_DEFAULT_S;
         s.max_segments = route::SEGMENTS_DEFAULT;
         s.policy_bytes = policy::BYTES_DEFAULT;
+        s.pkt_holds = PACKET_HOLDS_DEFAULT;
         if !params.is_null() && params_len > 0 {
             params_def::parse_tlv(s, params, params_len);
         }
@@ -4904,6 +5021,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     // 0c. Settle the director's dispositions before taking new frames, so
     // the slots they release are available to this step's intake; then
     // release anything held past its deadline.
+    flush_owed(s);
     service_packet_in(s);
 
     // 1. Receive and process incoming frames
@@ -5267,6 +5385,8 @@ unsafe fn emit_report_line(s: &mut IpState) {
                 pos += fmt_u32_dec(s.pkt_stats.decided, buf.add(pos));
                 emit(b" refused=", &mut pos);
                 pos += fmt_u32_dec(s.pkt_stats.hold_refused, buf.add(pos));
+                emit(b" deferred=", &mut pos);
+                pos += fmt_u32_dec(s.pkt_stats.desc_deferred, buf.add(pos));
                 emit(b" expired=", &mut pos);
                 pos += fmt_u32_dec(s.pkt_stats.hold_expired, buf.add(pos));
                 emit(b" stale=", &mut pos);
@@ -5746,7 +5866,7 @@ unsafe fn dispatch_l4(
 // packet is described to a director and held until the director settles it.
 // The buffer has one owner at a time — this module until the disposition,
 // then the transport (LOCAL), nobody (DROP/REJECT), or the forward port's
-// consumer (TUNNEL/DSR). A hold is bounded twice: `MAX_PACKET_HOLD` slots,
+// consumer (TUNNEL/DSR). A hold is bounded twice: `packet_holds` slots,
 // and `packet_hold_ms` per slot.
 
 /// Transport header verified? What the L4 parse says about a packet at
@@ -5830,8 +5950,8 @@ unsafe fn seam_l4_facts(
 /// A free hold slot, or `None` when every one is taken.
 unsafe fn hold_alloc(s: &mut IpState) -> Option<usize> {
     let mut i = 0;
-    while i < MAX_PACKET_HOLD {
-        if (*s.pkt_hold.as_ptr().add(i)).in_use == 0 {
+    while i < usize::from(s.pkt_holds) {
+        if (*s.pkt_hold.add(i)).in_use == 0 {
             return Some(i);
         }
         i += 1;
@@ -5841,17 +5961,111 @@ unsafe fn hold_alloc(s: &mut IpState) -> Option<usize> {
 
 /// Release a hold slot.
 unsafe fn hold_free(s: &mut IpState, slot: usize) {
-    let h = &mut *s.pkt_hold.as_mut_ptr().add(slot);
+    let h = &mut *s.pkt_hold.add(slot);
     if h.in_use != 0 {
         h.in_use = 0;
         h.pending_fwd[0] = 0xFF;
+        h.desc_owed = 0;
         s.pkt_held = s.pkt_held.saturating_sub(1);
     }
 }
 
-/// Every hold slot has to be nameable in the slot field the contract
-/// declares.
-const _: () = assert!(MAX_PACKET_HOLD <= (1usize << abi::contracts::net::packet::PKT_SLOT_BITS));
+/// Hold `slot` with its record owed: queued behind every record already
+/// owed, so the director hears of packets in the order they arrived.
+unsafe fn owe_description(s: &mut IpState, slot: usize, msg: u8, rec: &[u8]) {
+    let h = &mut *s.pkt_hold.add(slot);
+    h.desc_owed = 1;
+    h.desc_msg = msg;
+    h.desc_len = rec.len() as u8;
+    h.desc[..rec.len()].copy_from_slice(rec);
+    let n = usize::from(s.pkt_holds);
+    if usize::from(s.pkt_owed_len) == n {
+        // Full of entries, some for holds released since: keep the live
+        // ones, in order. Live owed holds are fewer than the holds (this
+        // one is not yet queued), so room is made.
+        let mut kept = 0usize;
+        for k in 0..n {
+            let e = *s.pkt_owed_q.add(
+                (usize::from(s.pkt_owed_head) + k)
+                    .checked_rem(n)
+                    .unwrap_or(0),
+            );
+            let o = &*s.pkt_hold.add(usize::from(e.slot));
+            if o.in_use != 0 && o.desc_owed != 0 && o.gen == e.gen && usize::from(e.slot) != slot {
+                *s.pkt_owed_q.add(kept) = e;
+                kept += 1;
+            }
+        }
+        s.pkt_owed_head = 0;
+        s.pkt_owed_len = kept as u16;
+    }
+    let at = (usize::from(s.pkt_owed_head) + usize::from(s.pkt_owed_len))
+        .checked_rem(n)
+        .unwrap_or(0);
+    *s.pkt_owed_q.add(at) = OwedRef {
+        slot: slot as u16,
+        _pad: 0,
+        gen: h.gen,
+    };
+    s.pkt_owed_len += 1;
+    s.pkt_stats.desc_deferred = s.pkt_stats.desc_deferred.wrapping_add(1);
+}
+
+/// Send owed records, oldest first, while the director's ring takes them.
+/// A queued hold released meanwhile (its deadline) is skipped.
+unsafe fn flush_owed(s: &mut IpState) {
+    let n = usize::from(s.pkt_holds);
+    let sys = &*s.syscalls;
+    while s.pkt_owed_len > 0 {
+        let r = *s.pkt_owed_q.add(usize::from(s.pkt_owed_head));
+        let h = &mut *s.pkt_hold.add(usize::from(r.slot));
+        if h.in_use != 0 && h.desc_owed != 0 && h.gen == r.gen {
+            let mut scratch = [0u8; NET_FRAME_HDR + abi::contracts::net::packet::DECIDE6_LEN];
+            if ip_net_write_frame(
+                sys,
+                s.pkt_out_chan,
+                h.desc_msg,
+                h.desc.as_ptr(),
+                usize::from(h.desc_len),
+                scratch.as_mut_ptr(),
+            ) != 0
+            {
+                return;
+            }
+            h.desc_owed = 0;
+        }
+        s.pkt_owed_head = (usize::from(s.pkt_owed_head) + 1)
+            .checked_rem(n)
+            .unwrap_or(0) as u16;
+        s.pkt_owed_len -= 1;
+    }
+}
+
+/// Describe a newly held packet: at once when nothing is owed and the
+/// director's ring has room, else owed behind the rest.
+unsafe fn describe_held(s: &mut IpState, slot: usize, msg: u8, rec: &[u8]) {
+    flush_owed(s);
+    if s.pkt_owed_len == 0 {
+        let sys = &*s.syscalls;
+        let mut scratch = [0u8; NET_FRAME_HDR + abi::contracts::net::packet::DECIDE6_LEN];
+        if ip_net_write_frame(
+            sys,
+            s.pkt_out_chan,
+            msg,
+            rec.as_ptr(),
+            rec.len(),
+            scratch.as_mut_ptr(),
+        ) == 0
+        {
+            return;
+        }
+    }
+    owe_description(s, slot, msg, rec);
+}
+
+/// The profile's default must be nameable in the slot field the contract
+/// declares; a declared `packet_holds` is held to it at construction.
+const _: () = assert!(PACKET_HOLDS_DEFAULT as usize <= PACKET_HOLDS_MAX);
 
 /// `pkt_id` for a slot under its current generation.
 fn hold_id(slot: usize, gen: u32) -> u32 {
@@ -5878,11 +6092,13 @@ fn hold_bump_gen(s: &mut IpState) {
 unsafe fn hold_lookup(s: &IpState, pkt_id: u32) -> Option<usize> {
     let slot = abi::contracts::net::packet::pkt_slot(pkt_id);
     let gen = abi::contracts::net::packet::pkt_generation(pkt_id);
-    if slot >= MAX_PACKET_HOLD {
+    if slot >= usize::from(s.pkt_holds) {
         return None;
     }
-    let h = &*s.pkt_hold.as_ptr().add(slot);
-    if h.in_use != 0 && h.gen == gen {
+    let h = &*s.pkt_hold.add(slot);
+    // A hold whose record is still owed is one the director has not heard
+    // of: an id naming it is not the director's to dispose.
+    if h.in_use != 0 && h.gen == gen && h.desc_owed == 0 {
         Some(slot)
     } else {
         None
@@ -5938,25 +6154,9 @@ unsafe fn seam_intake(
     rec[30..32].copy_from_slice(&(frame_len as u16).to_le_bytes());
     rec[32..34].copy_from_slice(&(l4_off as u16).to_le_bytes());
 
-    let mut scratch = [0u8; NET_FRAME_HDR + pkt::DECIDE_LEN];
-    if ip_net_write_frame(
-        sys,
-        s.pkt_out_chan,
-        pkt::MSG_PKT_DECIDE,
-        rec.as_ptr(),
-        rec.len(),
-        scratch.as_mut_ptr(),
-    ) != 0
-    {
-        // No room for the record: refuse the packet, as a full ring
-        // refuses anywhere else. The peer's retransmit covers it.
-        s.pkt_stats.hold_refused = s.pkt_stats.hold_refused.wrapping_add(1);
-        return;
-    }
-
     let now_ms = dev_millis(sys);
     let hold_ms = s.pkt_hold_ms;
-    let h = &mut *s.pkt_hold.as_mut_ptr().add(slot);
+    let h = &mut *s.pkt_hold.add(slot);
     h.in_use = 1;
     h.af = 4;
     h.local_slot = local_slot;
@@ -5965,10 +6165,14 @@ unsafe fn seam_intake(
     h.l3_off = l3_off as u16;
     h.deadline_ms = (now_ms as u32).wrapping_add(u32::from(hold_ms));
     h.pending_fwd[0] = 0xFF;
+    h.desc_owed = 0;
     core::ptr::copy_nonoverlapping(s.rx_frame.as_ptr(), h.frame.as_mut_ptr(), frame_len);
     hold_bump_gen(s);
     s.pkt_held += 1;
     s.pkt_stats.decided = s.pkt_stats.decided.wrapping_add(1);
+    // Held first, described after: a full ring defers the record, never
+    // refuses a packet the holds have room for.
+    describe_held(s, slot, pkt::MSG_PKT_DECIDE, &rec);
 }
 
 /// Deliver a held packet to its transport — the LOCAL disposition.
@@ -5978,14 +6182,14 @@ unsafe fn seam_intake(
 /// handed on are into `rx_frame` so nothing aliases the hold slot.
 unsafe fn deliver_held(s: &mut IpState, slot: usize) {
     let (len, l3_off, local_slot) = {
-        let h = &*s.pkt_hold.as_ptr().add(slot);
+        let h = &*s.pkt_hold.add(slot);
         core::ptr::copy_nonoverlapping(h.frame.as_ptr(), s.rx_frame.as_mut_ptr(), h.len as usize);
         (h.len as usize, h.l3_off as usize, h.local_slot)
     };
     s.rx_frame_len = len as u16;
     s.rx_l3_off = l3_off as u16;
     let l3 = s.rx_frame.as_mut_ptr().add(l3_off);
-    if (*s.pkt_hold.as_ptr().add(slot)).af == 6 {
+    if (*s.pkt_hold.add(slot)).af == 6 {
         // An IPv6 packet a director delivered: TCP to a local IPv6 address
         // goes to the TCP machine (`v6t.rs`); anything else has no local
         // transport over IPv6.
@@ -6015,7 +6219,7 @@ unsafe fn deliver_held(s: &mut IpState, slot: usize) {
 unsafe fn reject_held(s: &mut IpState, slot: usize, response: u8) {
     use abi::contracts::net::packet as pkt;
     let (len, l3_off) = {
-        let h = &*s.pkt_hold.as_ptr().add(slot);
+        let h = &*s.pkt_hold.add(slot);
         // Replies resolve the sender's MAC from the frame they answer.
         core::ptr::copy_nonoverlapping(h.frame.as_ptr(), s.rx_frame.as_mut_ptr(), h.len as usize);
         (h.len as usize, h.l3_off as usize)
@@ -6124,7 +6328,7 @@ unsafe fn send_icmp_unreachable(
 /// the slot is released; `false` leaves the slot held with the disposition
 /// pending for the next step.
 unsafe fn forward_held(s: &mut IpState, slot: usize) -> bool {
-    let rec = (*s.pkt_hold.as_ptr().add(slot)).pending_fwd;
+    let rec = (*s.pkt_hold.add(slot)).pending_fwd;
     forward_record(s, slot, &rec)
 }
 
@@ -6133,7 +6337,7 @@ unsafe fn forward_held(s: &mut IpState, slot: usize) -> bool {
 unsafe fn forward_record(s: &mut IpState, slot: usize, disp: &[u8; 7]) -> bool {
     use abi::contracts::net::packet as pkt;
     let sys = &*s.syscalls;
-    let h = &*s.pkt_hold.as_ptr().add(slot);
+    let h = &*s.pkt_hold.add(slot);
     let len = h.len as usize;
     let payload_len = 4 + 1 + pkt::DISP_ARGS_LEN + len;
     let total = NET_FRAME_HDR + payload_len;
@@ -6181,11 +6385,11 @@ unsafe fn dispose_held(
         return;
     };
     // A slot with a forward pending has been disposed already.
-    if (*s.pkt_hold.as_ptr().add(slot)).pending_fwd[0] != 0xFF {
+    if (*s.pkt_hold.add(slot)).pending_fwd[0] != 0xFF {
         s.pkt_stats.stale_disposition = s.pkt_stats.stale_disposition.wrapping_add(1);
         return;
     }
-    let v6 = (*s.pkt_hold.as_ptr().add(slot)).af == 6;
+    let v6 = (*s.pkt_hold.add(slot)).af == 6;
     if v6 && !v6t::V6T && matches!(disp, pkt::disposition::LOCAL | pkt::disposition::MIRROR) {
         // No IPv6 transport to deliver to on this build.
         s.pkt_stats.v6_no_local = s.pkt_stats.v6_no_local.wrapping_add(1);
@@ -6229,7 +6433,7 @@ unsafe fn dispose_held(
                 return;
             }
             {
-                let h = &mut *s.pkt_hold.as_mut_ptr().add(slot);
+                let h = &mut *s.pkt_hold.add(slot);
                 h.pending_fwd[0] = disp;
                 h.pending_fwd[1..7].copy_from_slice(args);
             }
@@ -6332,8 +6536,8 @@ unsafe fn clone_held(s: &mut IpState, pkt_id: u32) {
             }
             Some(dst) => {
                 let gen = s.pkt_gen;
-                let from = s.pkt_hold.as_ptr().add(src);
-                let to = s.pkt_hold.as_mut_ptr().add(dst);
+                let from = s.pkt_hold.add(src);
+                let to = s.pkt_hold.add(dst);
                 core::ptr::copy_nonoverlapping(from, to, 1);
                 (*to).gen = gen;
                 (*to).pending_fwd[0] = 0xFF;
@@ -6367,8 +6571,8 @@ unsafe fn service_packet_in(s: &mut IpState) {
     }
     if s.pkt_held > 0 && s.pkt_fwd_chan >= 0 {
         let mut i = 0;
-        while i < MAX_PACKET_HOLD {
-            let h = &*s.pkt_hold.as_ptr().add(i);
+        while i < usize::from(s.pkt_holds) {
+            let h = &*s.pkt_hold.add(i);
             if h.in_use != 0 && h.pending_fwd[0] != 0xFF && forward_held(s, i) {
                 hold_free(s, i);
             }
@@ -6376,7 +6580,7 @@ unsafe fn service_packet_in(s: &mut IpState) {
         }
     }
     let sys = &*s.syscalls;
-    let mut budget = MAX_PACKET_HOLD * 2;
+    let mut budget = usize::from(s.pkt_holds) * 2;
     while budget > 0 {
         budget -= 1;
         let poll = (sys.channel_poll)(s.pkt_in_chan, POLL_IN);
@@ -6426,14 +6630,18 @@ unsafe fn expire_held(s: &mut IpState) {
     let sys = &*s.syscalls;
     let now = dev_millis(sys) as u32;
     let mut i = 0;
-    while i < MAX_PACKET_HOLD {
+    while i < usize::from(s.pkt_holds) {
         let (live, gen, deadline) = {
-            let h = &*s.pkt_hold.as_ptr().add(i);
+            let h = &*s.pkt_hold.add(i);
             (h.in_use != 0, h.gen, h.deadline_ms)
         };
         // At or past the deadline, wrapping: the hold is milliseconds, the
         // counter is days.
-        if live && now.wrapping_sub(deadline) < 0x8000_0000 {
+        if live && now.wrapping_sub(deadline) < 0x8000_0000 && (*s.pkt_hold.add(i)).desc_owed != 0 {
+            // Never described: nothing to tell the director.
+            s.pkt_stats.desc_expired = s.pkt_stats.desc_expired.wrapping_add(1);
+            hold_free(s, i);
+        } else if live && now.wrapping_sub(deadline) < 0x8000_0000 {
             s.pkt_stats.hold_expired = s.pkt_stats.hold_expired.wrapping_add(1);
             let id = hold_id(i, gen).to_le_bytes();
             let mut scratch = [0u8; NET_FRAME_HDR + 4];
@@ -6865,23 +7073,9 @@ unsafe fn seam_intake6(s: &mut IpState, h: &ipv6::Ipv6Header, l4: *const u8, l4_
     rec[54..56].copy_from_slice(&(frame_len as u16).to_le_bytes());
     rec[56..58].copy_from_slice(&(l4_off as u16).to_le_bytes());
 
-    let mut scratch = [0u8; NET_FRAME_HDR + pkt::DECIDE6_LEN];
-    if ip_net_write_frame(
-        sys,
-        s.pkt_out_chan,
-        pkt::MSG_PKT_DECIDE6,
-        rec.as_ptr(),
-        rec.len(),
-        scratch.as_mut_ptr(),
-    ) != 0
-    {
-        s.pkt_stats.hold_refused = s.pkt_stats.hold_refused.wrapping_add(1);
-        return;
-    }
-
     let now_ms = dev_millis(sys);
     let hold_ms = s.pkt_hold_ms;
-    let hp = &mut *s.pkt_hold.as_mut_ptr().add(slot);
+    let hp = &mut *s.pkt_hold.add(slot);
     hp.in_use = 1;
     hp.af = 6;
     hp.local_slot = 0;
@@ -6890,11 +7084,13 @@ unsafe fn seam_intake6(s: &mut IpState, h: &ipv6::Ipv6Header, l4: *const u8, l4_
     hp.l3_off = l3_off as u16;
     hp.deadline_ms = (now_ms as u32).wrapping_add(u32::from(hold_ms));
     hp.pending_fwd[0] = 0xFF;
+    hp.desc_owed = 0;
     core::ptr::copy_nonoverlapping(s.rx_frame.as_ptr(), hp.frame.as_mut_ptr(), frame_len);
     hold_bump_gen(s);
     s.pkt_held += 1;
     s.pkt_stats.decided = s.pkt_stats.decided.wrapping_add(1);
     s.pkt_stats.v6_decided = s.pkt_stats.v6_decided.wrapping_add(1);
+    describe_held(s, slot, pkt::MSG_PKT_DECIDE6, &rec);
 }
 
 /// REJECT for a held IPv6 packet: a TCP RST (RFC 9293 §3.10.7.1, as for
@@ -6903,7 +7099,7 @@ unsafe fn seam_intake6(s: &mut IpState, h: &ipv6::Ipv6Header, l4: *const u8, l4_
 unsafe fn reject_held6(s: &mut IpState, slot: usize, response: u8) {
     use abi::contracts::net::packet as pkt;
     let (len, l3_off) = {
-        let hp = &*s.pkt_hold.as_ptr().add(slot);
+        let hp = &*s.pkt_hold.add(slot);
         core::ptr::copy_nonoverlapping(hp.frame.as_ptr(), s.rx_frame.as_mut_ptr(), hp.len as usize);
         (hp.len as usize, hp.l3_off as usize)
     };
@@ -7735,15 +7931,15 @@ unsafe fn process_tcp_segment(
             // can, the slot stays latched and the sweep asks again.
             let delivered = continuity::end_reported(s, conn_idx, ended)
                 && net_send_closed(s, conn_idx as u16, CLOSED_GONE);
-            let conn = &mut *s.tcp_conns.ptr_mut(conn_idx);
             if delivered {
                 if remote_ip != 0 {
                     arp::unpin(arp_tab(s), remote_ip);
                 }
-                conn_reset(s, conn_idx);
+                release_told_gone(s, conn_idx);
             } else {
                 // ARP unpin is deferred until the slot actually frees
                 // so a retry storm doesn't churn the table.
+                let conn = &mut *s.tcp_conns.ptr_mut(conn_idx);
                 conn.state = tcp::TcpState::Closed;
                 conn.pending_close_notify = NOTIFY_CLOSED;
             }
@@ -9765,6 +9961,15 @@ unsafe fn process_cmd_close(s: &mut IpState, conn_id: usize, abort: bool) -> boo
         close_loopback(s, conn_id);
         return true;
     }
+    {
+        let c = &mut *s.tcp_conns.ptr_mut(conn_id);
+        if c.state == tcp::TcpState::Closed && c.pending_close_notify == NOTIFY_ID_RESERVED {
+            // The close the reservation was holding the id for.
+            end_id_reservation(s, conn_id);
+            return true;
+        }
+        c.consumer_closed = true;
+    }
     let conn_state = (*s.tcp_conns.ptr(conn_id)).state;
     if abort
         && matches!(
@@ -10213,7 +10418,11 @@ unsafe fn close_released(s: &mut IpState, idx: usize, kind: u8) {
         if remote_ip != 0 && kind == NOTIFY_CLOSED {
             arp::unpin(arp_tab(s), remote_ip);
         }
-        conn_reset(s, idx);
+        if kind == NOTIFY_CLOSED {
+            release_told_gone(s, idx);
+        } else {
+            conn_reset(s, idx);
+        }
     } else {
         let c = &mut *s.tcp_conns.ptr_mut(idx);
         c.state = tcp::TcpState::Closed;
@@ -12121,6 +12330,16 @@ unsafe fn sweep_range(s: &mut IpState, start: usize, end: usize) {
                 i += 1;
                 continue;
             }
+            if kind == NOTIFY_ID_RESERVED {
+                // Held for the consumer's CMD_CLOSE (`release_told_gone`);
+                // after the grace interval the slot frees without it.
+                conn.retransmit_timer = conn.retransmit_timer.saturating_add(1);
+                if conn.retransmit_timer >= CLOSE_WAIT_TICKS {
+                    end_id_reservation(s, i);
+                }
+                i += 1;
+                continue;
+            }
             if kind != NOTIFY_NONE && kind != continuity::NOTIFY_SHADOW_RESERVED {
                 let delivered = match kind {
                     NOTIFY_CLOSED => {
@@ -12144,7 +12363,11 @@ unsafe fn sweep_range(s: &mut IpState, start: usize, end: usize) {
                         if remote_ip != 0 && kind == NOTIFY_CLOSED {
                             arp::unpin(arp_tab(s), remote_ip);
                         }
-                        conn_reset(s, i);
+                        if kind == NOTIFY_CLOSED {
+                            release_told_gone(s, i);
+                        } else {
+                            conn_reset(s, i);
+                        }
                     } else {
                         conn.pending_close_notify = NOTIFY_NONE;
                     }

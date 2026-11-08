@@ -435,6 +435,12 @@ pub static SGI_RECEIVED: AtomicU32 = AtomicU32::new(0);
 /// Per-core timer-IRQ counts.
 pub static CORE_TICKS: [AtomicU32; MAX_CORES] = [const { AtomicU32::new(0) }; MAX_CORES];
 
+/// Per-core count of every interrupt taken (timer, device, SGI). A loop that
+/// sleeps on WFI between passes compares it across a pass: an interrupt taken
+/// during the pass will not wake the WFI that follows, so the work it
+/// announced is picked up by running the next pass at once.
+pub static CORE_INTERRUPTS: [AtomicU32; MAX_CORES] = [const { AtomicU32::new(0) }; MAX_CORES];
+
 /// Per-core last interrupted PC (ELR_EL1), latched by the timer IRQ. When a
 /// core's scheduler loop hangs but timer IRQs still fire, this is the PC of
 /// the spinning code — map it with `rust-objdump -d` on the firmware ELF.
@@ -475,6 +481,8 @@ pub unsafe extern "C" fn irq_handler() {
     if (gic::MAX_INTID + 1..=1023).contains(&irq_id) {
         return;
     }
+    CORE_INTERRUPTS[(current_core_id() as usize).min(MAX_CORES - 1)]
+        .fetch_add(1, Ordering::Relaxed);
     // The timer's line is level-triggered and stays high until it is re-armed,
     // so its EOI waits for the re-arm: ended earlier, a virtual GIC raises the
     // same tick a second time. Everything else is ended here. EOI always takes

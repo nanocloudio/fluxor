@@ -26,8 +26,9 @@ one log line.
 - **Load.** Both slots are read and digested (`SCAN`), then the newer valid
   image is read again into the kernel (`FILL`): one image of RAM. Neither valid
   is an empty store. A slot that changes between the passes starts the load
-  over at once, a read the source fails a second later. Until the load finishes, every labelled vault open answers `EAGAIN`, in
-  this graph from before any module runs.
+  over at once; a read the source fails starts it over a second later. Until
+  the load finishes, every labelled vault open answers `EAGAIN`, from before
+  any module in the graph runs.
 - **Writes.** A key made with `PERSIST` changes the image. The module writes
   the new image to the slot not holding the durable one, a block at a time,
   then fences it (`FLUSH` on a source with a volatile cache); only then does it
@@ -87,8 +88,15 @@ wiring:
   - { from: file_block.blocks, to: vault_store.blocks }
 ```
 
-An SD card, raw: a window of the card no filesystem uses, e.g. sectors
-2048..2080:
+A block source answers the one consumer its channel reaches, so `vault_store`
+needs a source no other module reads: the composer refuses a second edge from
+the same output, since a tee carries the stream but not the requests and a
+vault behind one would never load. No module splits one source into windows,
+so on a device a filesystem already holds, the vault is a file on that
+filesystem.
+
+An SD card, raw: a window of the card, e.g. sectors 2048..2080, in a graph
+where nothing else reads `sd.blocks`:
 
 ```yaml
 - name: vault_store
@@ -97,9 +105,23 @@ wiring:
   - { from: sd.blocks, to: vault_store.blocks }
 ```
 
-Pi 5, NVMe: the first 32 KiB of the drive's External backing space, which no
-paging arena is carved from (LBA `0x200000` of a 512-byte namespace), as two
-16 KiB slots:
+Pi 5, recommended: a file on the board's FAT32, beside whatever else the
+volume holds (32 KiB, two 16 KiB slots):
+
+```yaml
+- name: fat32
+- name: file_block
+  params: { path: /vault.img, blocks: 64 }
+- name: vault_store
+  params: { image: 16384, seal: hardware }
+wiring:
+  - { from: nvme.blocks, to: fat32.blocks }
+  - { from: file_block.blocks, to: vault_store.blocks }
+```
+
+Pi 5, raw NVMe, in a graph where nothing else reads `nvme.blocks`: the first
+32 KiB of the drive's External backing space, which no paging arena is carved
+from (LBA `0x200000` of a 512-byte namespace), as two 16 KiB slots:
 
 ```yaml
 - name: vault_store

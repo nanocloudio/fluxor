@@ -1979,7 +1979,11 @@ pub fn validate_provider_domains(
 /// satisfied by a peer whose `provides` lists it. An input that requires a
 /// surface takes exactly one edge: a `storage.block` source is the channel
 /// wired to the consumer, answering on that channel alone, so a second
-/// producer into the same input could never be reached.
+/// producer into the same input could never be reached. The same holds the
+/// other way: the output feeding such an input feeds nothing else. A second
+/// edge from it builds as a tee, and a tee carries the stream but no
+/// requests, so the second consumer — a `vault_store` wired beside a `fat32`
+/// on one `nvme.blocks`, say — waits for ever on a source it never reaches.
 ///
 /// FAILS OPEN on a module whose manifest could not be resolved. A pinned
 /// store artifact may carry no `manifest.toml` layer at all, and refusing to
@@ -2012,6 +2016,9 @@ pub fn validate_port_capabilities(
     let is_surface =
         |wanted: &str| fluxor_contracts::vocabulary::PROVIDER_SURFACES.contains(&wanted);
     let mut surface_edges: HashMap<String, Vec<String>> = HashMap::new();
+    // Every edge out of each output, and the surface any of them requires.
+    let mut fan_out: HashMap<String, Vec<String>> = HashMap::new();
+    let mut surface_sources: HashMap<String, String> = HashMap::new();
 
     for entry in wiring {
         let Some(from) = entry.get("from").and_then(|v| v.as_str()) else {
@@ -2025,8 +2032,10 @@ pub fn validate_port_capabilities(
             continue;
         };
 
+        fan_out.entry(from.to_string()).or_default().push(to.to_string());
         if let Some(wanted) = port_of(&to_mod, &to_port).and_then(|p| p.requires_capability) {
             if is_surface(&wanted) {
+                surface_sources.insert(from.to_string(), wanted.clone());
                 let sources = surface_edges.entry(to.to_string()).or_default();
                 sources.push(from.to_string());
                 if sources.len() > 1 {
@@ -2112,6 +2121,23 @@ pub fn validate_port_capabilities(
                 }
             }
         }
+    }
+    let mut tees: Vec<_> = surface_sources
+        .iter()
+        .filter_map(|(from, wanted)| {
+            let to = fan_out.get(from)?;
+            (to.len() > 1).then(|| (from.clone(), wanted.clone(), to.clone()))
+        })
+        .collect();
+    tees.sort();
+    if let Some((from, wanted, to)) = tees.into_iter().next() {
+        return Err(Error::Config(format!(
+            "`{from}` is a `{wanted}` source wired to {}. A `{wanted}` source answers the one \
+             consumer its channel reaches; a second edge is a tee, which carries no requests, \
+             so the others never reach it. Give each consumer its own source (a file through \
+             `file_block`, a block window), or put one consumer in front of the rest.",
+            to.join(" and "),
+        )));
     }
     Ok(())
 }

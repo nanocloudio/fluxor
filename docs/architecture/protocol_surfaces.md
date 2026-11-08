@@ -206,9 +206,16 @@ release anything else, or everything on a build without it, counted
 `REJECT` answers with an IPv6 RST or ICMPv6 port unreachable quoting what
 fits the minimum MTU; the forwarding dispositions forward the frame whole.
 
-The hold is bounded twice. `abi::config::ip::MAX_PACKET_HOLD` slots
-(one frame each; 32 on the host profile) — a packet arriving with every
-slot taken is refused and counted, never displaces one. And
+The hold is bounded twice. `packet_holds` slots — a declared capacity of
+`ip`, one frame each in its heap, defaulting to the profile's
+`abi::config::ip::MAX_PACKET_HOLD` (32 on the host profile) and at most
+the 256 a `pkt_id` slot names — a packet arriving with every slot taken is
+refused and counted (`hold_refused`), never displaces one. The director's
+ring is not a third bound: a packet arriving while it is full is held with
+its record owed, and owed records go out in arrival order as it drains
+(`desc_deferred`); an owed hold is not the director's to dispose (an id
+naming it is stale), and one still owed at its deadline is released with
+no `MSG_PKT_EXPIRED` (`desc_expired`) — the director never heard of it. And
 `packet_hold_ms` per packet: a hold past its deadline is released and
 reported (`MSG_PKT_EXPIRED` 0x67). A forward that does not fit the
 forward ring stays held with its disposition pending and is retried each
@@ -216,7 +223,7 @@ step until it goes or expires.
 
 Those two bounds are what a director is sized against. The slots are the
 in-flight decision window, so a director answering in `t` sustains an
-offered rate of at most `MAX_PACKET_HOLD / t` decidable packets per
+offered rate of at most `packet_holds / t` decidable packets per
 second before arrivals start being refused; `packet_hold_ms` is the hard
 ceiling on any single decision, past which the packet is released whether
 the director has answered or not. Both are arithmetic over declared

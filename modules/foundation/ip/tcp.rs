@@ -147,6 +147,10 @@ pub struct TcpConn {
     /// Counted in the half-open gauge (`SynReceived`); cleared when it
     /// completes or is released, so the gauge never drifts.
     pub half_open_counted: bool,
+    /// The consumer has sent `CMD_CLOSE` for this connection. A connection
+    /// that ends without it keeps its id reserved for that close (the
+    /// net_proto release rule; `release_told_gone`).
+    pub consumer_closed: bool,
     /// Challenge-ACK refill epoch last applied to `chal_budget`.
     pub chal_epoch: u8,
     /// The workload network lane this endpoint was opened from (1-based;
@@ -283,6 +287,7 @@ impl TcpConn {
             owner_tag: 0,
             is_datagram: false,
             half_open_counted: false,
+            consumer_closed: false,
             chal_epoch: 0,
             lane: 0,
             svc_vip: 0,

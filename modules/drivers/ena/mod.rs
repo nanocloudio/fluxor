@@ -1,7 +1,9 @@
 //! Elastic Network Adapter: AWS's NIC on a Nitro instance.
 //!
 //! Exchanges Ethernet frames with the device over one TX and one RX queue pair
-//! held in host memory, by polling. `frames_tx` carries frames from `ip`,
+//! held in host memory. Every step polls both; between steps the RX queue's
+//! interrupt is armed, so a frame arriving while the core sleeps wakes it
+//! rather than waiting for the next tick. `frames_tx` carries frames from `ip`,
 //! `frames_rx` carries frames to it, and the MAC address is announced on
 //! `frames_rx` (ethertype 0x0000) before the module reports Ready.
 //!
@@ -97,6 +99,10 @@ const ADMIN_ENTRY: usize = 64;
 const IO_MSIX_VECTOR: u32 = 1;
 /// Vectors this driver programs: admin, then the one queue pair.
 const MSIX_VECTORS: usize = 2;
+/// A completion queue's interrupt unmask register value: unmask (bit 30),
+/// with no RX or TX moderation delay (bits 0-14 and 15-29 left zero). The
+/// device masks the vector again each time it fires.
+const INTR_UNMASK: u32 = 1 << 30;
 const DIRECTION_TX: u8 = 1;
 const DIRECTION_RX: u8 = 2;
 const PLACEMENT_HOST: u8 = 1;
@@ -148,6 +154,8 @@ struct Pair {
     cq: u64,
     sq_db: usize,
     cq_db: usize,
+    /// The queue's interrupt unmask register (absolute), 0 if none.
+    unmask: usize,
     cq_idx: u16,
     sq_tail: u16,
     cq_head: u16,
@@ -392,8 +400,8 @@ unsafe fn set_feature(s: &mut EnaState, feature: u8, at: usize, value: u32) {
 
 unsafe fn create_cq(s: &mut EnaState, ring: u64, entry_bytes: usize) {
     let entry = admin_entry(s, OP_CREATE_CQ);
-    // The device takes a CQ only with interrupt mode on. It raises none until a
-    // driver writes the queue's unmask register, which this polling one never does.
+    // Interrupt mode on: the device raises the queue's vector only after the
+    // driver writes the queue's unmask register (`arm_rx_interrupt`).
     put_u8(entry, 4, 1 << 5);
     put_u8(entry, 5, (entry_bytes / 4) as u8);
     put_u16(entry, 6, IO_DEPTH as u16);
@@ -452,8 +460,8 @@ unsafe fn allocate(s: &mut EnaState) -> bool {
 }
 
 /// Route vectors 0 and 1 to this module's event through the platform, program
-/// them into the device's MSI-X table and enable it. The driver polls; the
-/// vectors exist because the device requires them.
+/// them into the device's MSI-X table and enable it. The I/O vector wakes the
+/// core for RX (`arm_rx_interrupt`); the device requires both to exist.
 unsafe fn enable_msix(s: &mut EnaState) -> bool {
     const CAP_MSIX: u32 = 0x11;
     let sys_table = sys(s);
@@ -585,7 +593,8 @@ unsafe fn send_host_info(s: &mut EnaState) {
         put_u8(info, KERNEL_VER_STR + i, b);
     }
     // The field names operating systems and the device refuses a value outside
-    // them. DPDK's is the nearest truth: a driver that polls, with no interrupts.
+    // them. DPDK's is the nearest truth: a driver that polls, its interrupts only
+    // a wake for an idle core.
     put_u32(info, 0, OS_TYPE_DPDK);
     // Major in the low byte. The device creates no I/O queue for a driver
     // older than the 2.x line; this one is written to the 2.0 interface.
@@ -689,6 +698,16 @@ unsafe fn step_rx(s: &mut EnaState) {
         fence();
         reg_write(s, s.rx.sq_db - s.bar0, u32::from(s.rx.sq_tail));
         report_cq(s, true);
+    }
+}
+
+/// Ask the device for an interrupt on the next RX completion. Written after
+/// every poll: a frame that lands between this write and the next step
+/// raises the vector, whose event wakes this module's core.
+unsafe fn arm_rx_interrupt(s: &mut EnaState) {
+    if s.rx.unmask != 0 && s.msix_event >= 0 {
+        fence();
+        reg_write(s, s.rx.unmask - s.bar0, INTR_UNMASK);
     }
 }
 
@@ -895,6 +914,8 @@ unsafe fn step_setup(s: &mut EnaState) {
             s.rx.cq_idx = get_u16(reply, 8);
             let db = get_u32(reply, 16) as usize;
             s.rx.cq_db = if db != 0 { s.bar0 + db } else { 0 };
+            let unmask = get_u32(reply, 20) as usize;
+            s.rx.unmask = if unmask != 0 { s.bar0 + unmask } else { 0 };
             let (ring, cq) = (s.rx.sq, s.rx.cq_idx);
             create_sq(s, DIRECTION_RX, ring, cq);
             s.phase = Phase::RxSq;
@@ -990,6 +1011,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
             step_rx(s);
             step_tx_done(s);
             step_tx(s);
+            arm_rx_interrupt(s);
         }
         Phase::Failed => {}
         _ => step_setup(s),

@@ -218,6 +218,9 @@ buffer_size = { default = 65536, thumbv8m = 16384, aarch64 = 65536 }
 # certified — every second until a chain arrives, and again at two thirds of
 # its lifetime; `identity_cert` takes `[0x5C][len:2 LE][leaf DER ‖ issuer
 # DER ‖ …]`, which is presented only when its leaf certifies this key.
+# With `identity_request: csr` the request is `[0x5D][len:2 LE][PKCS#10 DER]`
+# instead, `CN=<identity_subject>`, signed by the key in the vault, for an
+# issuer that takes proof of possession.
 # Unwired, a label identity refuses to construct; with no label both ports
 # are inert.
 [[ports]]
