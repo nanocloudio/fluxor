@@ -452,9 +452,9 @@ Tier 1b admission and dispatch:
    `bcm_isr_tier_poll` (polled from the scheduler thread) fires
    `isr_tier1b_handler` whenever the elapsed counter passes the
    period.
-5. **Run loop.** The BCM2712 `run_domain_loop` Tier 1b arm
-   (`exec_mode == 2`) iterates core parking checks,
-   `isr_tier::poll_tier1b()`, `pump_cross_domain`, and WFE. The
+5. **Run loop.** The domain runtime's (`kernel::exec::domains::run`)
+   Tier 1b arm (`exec_mode == 2`) iterates core parking checks,
+   `isr_tier::poll_tier1b()`, the cross-domain pump, and WFE. The
    Tier 0 arm also calls `isr_tier::poll_tier1b()` on every loop
    iteration so configurations sharing a core between cooperative
    and Tier 1b work still fire the ISR handler.
@@ -478,7 +478,7 @@ Tier 2 (IRQ-owned) admission and dispatch:
   The hardware IRQ dispatches into `isr_tier2_trampoline`, which
   looks the module up by IRQ number and invokes `module_isr_entry`.
 - A Tier 2 domain that owns its own core runs the dedicated
-  `run_domain_loop` arm for `exec_mode == 4`: cross-domain pumping
+  `domains::run` arm for `exec_mode == 4`: cross-domain pumping
   plus WFI, with dispatch driven entirely by the hardware IRQ.
 - Tier 2 module state is built through the normal cooperative
   `module_new` at instantiation time (non-ISR context), the same

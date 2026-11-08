@@ -572,22 +572,20 @@ mod imp {
         ///
         /// On aarch64 the old block is handed back to the carve zone at once,
         /// so the contract is what keeps a reader off freed memory. Every
-        /// reservation there satisfies it. On uefi the graph is prepared once,
-        /// at boot, on core 0, the one core that steps modules; the other
-        /// cores take only their timer tick, and core 0's handlers are masked
-        /// for the move as below. On bcm2712:
+        /// reservation there satisfies it. On bcm2712 and uefi, where domains
+        /// run on cores of their own:
         ///
         /// - The kernel's tables are reserved on core 0 by
         ///   `size_kernel_tables` in `prepare_graph`, and the cross-domain
-        ///   bridge tables by `multicore::size_cross` after it. Core 0 enters
-        ///   `prepare_graph` from its pump loop between steps, holding no
-        ///   slice of any table: a slice lives only within the call that
+        ///   bridge tables by `domains::cross::size_cross` after it. Core 0
+        ///   enters `prepare_graph` from its pump loop between steps, holding
+        ///   no slice of any table: a slice lives only within the call that
         ///   reads it. At boot no other core has left its wait for
-        ///   `INIT_COMPLETE`. For a rebuild `poll_rebuild_bridge` quiesces
-        ///   the other domains first: each parks at its tick boundary,
-        ///   outside any step, and resumes only after the rebuild, when its
-        ///   next read loads the new block (its acquire load of the quiesce
-        ///   flag pairs with the release store that ends the quiesce).
+        ///   `domains::release`. For a rebuild `domains::poll_rebuild`
+        ///   quiesces the other domains first: each parks at its pass
+        ///   boundary, outside any step, and resumes only after the rebuild,
+        ///   when its next read loads the new block (its acquire load of the
+        ///   quiesce generation pairs with the store that ends the quiesce).
         /// - Core 0's own handlers are masked for the move, from the copy
         ///   to the retire. Those are the handlers that reach a table from
         ///   interrupt context: every event binding and the PCIe MSI

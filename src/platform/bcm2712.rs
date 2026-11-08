@@ -17,10 +17,10 @@
 
 use core::arch::global_asm;
 use core::panic::PanicInfo;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use fluxor::arch::aarch64::isolation;
-use fluxor::kernel::boot::config::EdgeClass;
+use fluxor::kernel::exec::domains::{self, cross};
 use fluxor::kernel::exec::scheduler;
 use fluxor::kernel::module::loader;
 use fluxor::platform::multicore;
@@ -355,15 +355,6 @@ mod eth {
 // `timer::{timer_freq, read_timer_count, timer_set}`.
 
 // ============================================================================
-// Multi-core init signaling
-// ============================================================================
-
-/// Set by core 0 once graph compilation and module instantiation have
-/// finished. Cores 1..3 spin on this in `secondary_core_main` before
-/// entering their domain pump.
-static INIT_COMPLETE: AtomicU32 = AtomicU32::new(0);
-
-// ============================================================================
 // Entry point with secondary core parking
 // ============================================================================
 //
@@ -481,425 +472,6 @@ global_asm!(
     "    b .Lpark_core",
     core_shift = const MPIDR_CORE_SHIFT,
 );
-
-// ============================================================================
-// Graph instantiation + activation
-// ============================================================================
-
-/// Instantiate every module in a compiled graph and activate per-domain
-/// scheduler state. Shared by first boot and live rebuild: both call
-/// `prepare_graph()` then this. Returns the count of modules loaded.
-///
-/// `module_list`/`module_count` come from `scheduler::prepare_graph()`. IRQs are
-/// masked for the duration via the kernel guard. Caller owns cross-domain edge
-/// bridging (boot does it inline before this; single-domain rebuild needs none).
-fn instantiate_and_activate(
-    module_list: &[Option<fluxor::kernel::boot::config::ModuleEntry>],
-    module_count: usize,
-) -> Result<usize, usize> {
-    // Mask IRQs during module instantiation
-    let _inst_guard = fluxor::kernel::sys::guard::KernelGuard::acquire();
-
-    // Ownership must be live before any provider handle is opened. See `kernel::exec::bare_metal` for why the
-    // ordering is load-bearing and why this fails closed.
-    if let Err(e) = fluxor::kernel::exec::bare_metal::apply_owner_plan() {
-        panic!("[owner] staged plan invalid ({e:?}); refusing to run the graph with ownership isolation disabled");
-    }
-
-    // SAFETY: boot-time read.
-    let loader_ref = unsafe { scheduler::static_loader() };
-    // SAFETY: scheduler-thread mutable access during graph instantiation.
-    let sched = unsafe { scheduler::sched_mut() };
-    let mut total_mods = 0usize;
-    let mut failed = 0usize;
-    for (module_idx, slot) in module_list.iter().enumerate().take(module_count) {
-        let entry = match slot {
-            Some(e) => e,
-            None => continue,
-        };
-        if entry.domain_id as usize >= multicore::MAX_DOMAINS {
-            uart_puts(b"[inst] invalid domain_id for module ");
-            uart_put_u32(module_idx as u32);
-            uart_puts(b"\r\n");
-            continue;
-        }
-        scheduler::set_current_module(module_idx);
-        let result = scheduler::instantiate_one_module(
-            loader_ref,
-            entry,
-            module_idx,
-            module_idx,
-            &mut sched.edges,
-            &mut sched.modules,
-            &mut sched.ports,
-        );
-        match result {
-            scheduler::InstantiateResult::Done => {
-                total_mods += 1;
-            }
-            scheduler::InstantiateResult::Pending(mut pending) => {
-                let mut loaded = false;
-                for _ in 0..100 {
-                    for _ in 0..10000 {
-                        // SAFETY: NOP is a hint; safe spin delay.
-                        unsafe { core::arch::asm!("nop") };
-                    }
-                    // SAFETY: `pending` was allocated by instantiate_one_module
-                    // and lives across these poll iterations.
-                    match unsafe { pending.try_complete() } {
-                        Ok(Some(dm)) => {
-                            scheduler::store_dynamic_module(module_idx, dm);
-                            total_mods += 1;
-                            loaded = true;
-                            break;
-                        }
-                        Ok(None) => {}
-                        Err(e) => {
-                            e.log("module");
-                            loaded = true;
-                            break;
-                        }
-                    }
-                }
-                if !loaded {
-                    uart_puts(b"[inst] module ");
-                    uart_put_u32(module_idx as u32);
-                    uart_puts(b" pending timeout\r\n");
-                    failed += 1;
-                }
-            }
-            scheduler::InstantiateResult::Error(e) => {
-                // Was an empty arm: a module could fail to load and leave no
-                // trace. See `bare_metal::instantiation_is_fail_closed`.
-                uart_puts(b"[inst] module ");
-                uart_put_u32(module_idx as u32);
-                uart_puts(b" failed rc=");
-                uart_put_u32(e as u32);
-                uart_puts(b"\r\n");
-                failed += 1;
-            }
-        }
-    }
-
-    // Activate the compiled graph and log per-domain composition.
-    // BCM doesn't populate `sched.edges`, so DMA-owned edges are
-    // logged by walking the config's edge slice directly via
-    // `log_dma_owned_edges_from_config`.
-    scheduler::set_active_module_count(module_count);
-    // SAFETY: scheduler-thread read of the installed static config.
-    let cfg = unsafe { scheduler::static_config() };
-    fluxor::kernel::exec::scheduler::log_dma_owned_edges_from_config(&cfg.graph_edges);
-
-    // Tier 1b admission: hand every module in a Tier 1b domain to
-    // the ISR-tier dispatcher. The helper picks the appropriate
-    // (step_fn, state_ptr) pair from each slot and arms the
-    // platform's polled-timer ISR (`bcm_isr_tier_poll`). Cooperative
-    // domains are untouched; the cooperative scheduler already
-    // skips ISR-tier modules via `step_one_module`.
-    let isr_registered = scheduler::register_isr_tier_modules_from_graph();
-    if isr_registered > 0 {
-        uart_puts(b"[isr] Tier 1b admitted ");
-        uart_put_u32(isr_registered as u32);
-        uart_puts(b" module(s)\r\n");
-    }
-
-    let mut d = 0usize;
-    while d < multicore::MAX_DOMAINS {
-        let mod_count = scheduler::domain_module_count(d);
-        if mod_count > 0 {
-            // SAFETY: per-domain state init; on boot the domain is not yet
-            // running, on rebuild its core is quiesced/parked.
-            unsafe {
-                let ds = multicore::domain_state(d);
-                ds.core_id = d as u8; // Domain N runs on core N
-                ds.module_count = mod_count as u16;
-                ds.active = true;
-            }
-            uart_puts(b"[domain] ");
-            uart_put_u32(d as u32);
-            uart_puts(b": ");
-            uart_put_u32(mod_count as u32);
-            uart_puts(b" modules (core ");
-            uart_put_u32(d as u32);
-            uart_puts(b") order: ");
-            let mut k = 0usize;
-            while k < mod_count {
-                if k > 0 {
-                    uart_puts(b"->");
-                }
-                if let Some(g) = scheduler::domain_exec_order_at(d, k) {
-                    uart_put_u32(g as u32);
-                }
-                k += 1;
-            }
-            uart_puts(b"\r\n");
-        }
-        d += 1;
-    }
-
-    drop(_inst_guard);
-    // Fail closed: a module that did not instantiate leaves its ports
-    // unwired, so the graph that would run is not the graph that was asked
-    // for. `Err` carries the failure count; the caller decides how loudly to
-    // refuse. See `bare_metal::instantiation_is_fail_closed`.
-    if failed > 0 && fluxor::kernel::exec::bare_metal::instantiation_is_fail_closed() {
-        return Err(failed);
-    }
-    // Before the graph's first step: clear the state arena's zeroed frontier
-    // its full distance ahead of what instantiation took, so the first heap
-    // growth on a step finds zeroed memory before any domain has had slack.
-    loader::prime_frontier();
-    Ok(total_mods)
-}
-
-/// Number of domains that have at least one module in the compiled graph.
-fn active_domain_count() -> usize {
-    (0..multicore::MAX_DOMAINS)
-        .filter(|&d| scheduler::domain_module_count(d) > 0)
-        .count()
-}
-
-/// Bridge every cross-domain edge of the freshly compiled graph: split each
-/// edge whose endpoints live in different domains into producer-side /
-/// consumer-side channels joined by a `multicore::CrossDomainChannel` SPSC
-/// pump. Shared by first boot and live rebuild — a rebuild first calls
-/// `multicore::reset_cross_state()` under quiesce so this re-registers from a
-/// clean table, exactly like boot.
-///
-/// The walk reads `sched.edges` (not `cfg.graph_edges`) so an edge that is
-/// part of both a fan group and a cross-domain hop is seen through its
-/// rewritten endpoints. For each cross edge: open a fresh consumer-side
-/// channel `W2`, register the SPSC bridge `edge.channel → W2`, and set
-/// `edge.consumer_channel = W2` (`collect_input_channels` honours it, so
-/// `populate_ports` lifts `W2` into the consumer's in_chans).
-///
-/// Returns the number of bridges established, or a diagnostic on reservation
-/// shortfall. On `Err` no partial rewiring is left visible to consumers: the
-/// failing edge's `consumer_channel` is untouched, and the caller decides the
-/// posture (boot halts; rebuild leaves the graph idle / fail-safe).
-fn bridge_cross_domain_edges() -> Result<usize, &'static str> {
-    use fluxor::kernel::ipc::channel;
-
-    // SAFETY: scheduler-thread access during graph prep (boot) or under
-    // full quiesce (rebuild) — sole mutator of scheduler state either way.
-    let sched = unsafe { scheduler::sched_mut() };
-    let n_compiled_edges = sched.edge_count;
-    // Size the ring and edge tables for this graph's cross-domain edges
-    // before any is registered.
-    let crossing = (0..n_compiled_edges)
-        .filter(|&e| {
-            let edge = sched.edges[e];
-            edge.channel >= 0
-                && (scheduler::module_domain_id(edge.from_module)
-                    != scheduler::module_domain_id(edge.to_module)
-                    || edge.edge_class == EdgeClass::CrossCore)
-        })
-        .count();
-    // SAFETY: graph prep (boot) or full quiesce (rebuild): no pump walks the
-    // tables.
-    if unsafe { multicore::size_cross(crossing) }.is_err() {
-        return Err("cross-domain ring tables could not be sized for this graph");
-    }
-    let mut bridged = 0usize;
-    let mut e = 0usize;
-    while e < n_compiled_edges {
-        let edge_snapshot = sched.edges[e];
-        if edge_snapshot.channel < 0 {
-            e += 1;
-            continue;
-        }
-
-        let from = edge_snapshot.from_module;
-        let to = edge_snapshot.to_module;
-        let from_domain = scheduler::module_domain_id(from);
-        let to_domain = scheduler::module_domain_id(to);
-        let is_cross = from_domain != to_domain || edge_snapshot.edge_class == EdgeClass::CrossCore;
-        if !is_cross {
-            e += 1;
-            continue;
-        }
-
-        // Reserve the SPSC ring, the consumer-side channel, and the
-        // edge-table slot before touching `consumer_channel`, so a failure
-        // never leaves a consumer rebound to a handle no pump fills.
-        let cross_ch_idx = match multicore::alloc_cross_channel() {
-            Some(i) => i,
-            None => return Err("cross-domain SPSC rings exhausted; cannot bridge edge"),
-        };
-
-        let in_ch = channel::channel_open(channel::CHANNEL_TYPE_PIPE, core::ptr::null(), 0);
-        if in_ch < 0 {
-            return Err("consumer-side channel alloc failed for cross-domain edge");
-        }
-
-        // Mirror the producer-side channel's mailbox flag onto the
-        // consumer-side bridge channel. Without this, typed-envelope
-        // edges (WsFrame, FmpMessage, etc.) shred their framing at
-        // this seam: the pump writes back-to-back atomic frames into
-        // a FIFO ring, the consumer's next `channel_read` returns
-        // multiple envelopes coalesced, and only the first parses
-        // cleanly. POLL_IN also stays latched on the leftover bytes,
-        // driving the consumer module to spin on phantom reads.
-        // `tests/ws.rs::cross_domain_pump_*` covers this seam on
-        // the host.
-        if channel::channel_is_mailbox(edge_snapshot.channel) {
-            channel::channel_set_mailbox(in_ch);
-        }
-
-        let to_port_marker: u8 = if edge_snapshot.is_ctrl() { 1 } else { 0 };
-        // SAFETY: cross-edge registration runs during graph prep (boot) or
-        // under full quiesce (rebuild); multicore module owns the registry.
-        let registered = unsafe {
-            multicore::register_cross_edge(multicore::CrossDomainEdge {
-                from_domain,
-                from_module: from as fluxor::kernel::exec::scheduler::ModuleId,
-                from_port: edge_snapshot.from_port_index,
-                to_domain,
-                to_module: to as fluxor::kernel::exec::scheduler::ModuleId,
-                to_port: to_port_marker,
-                channel_idx: cross_ch_idx as u8,
-                local_out_handle: edge_snapshot.channel,
-                local_in_handle: in_ch,
-                pending_aux: core::sync::atomic::AtomicU32::new(u32::MAX),
-            })
-        };
-        if registered.is_none() {
-            return Err("cross-domain edge table full; cannot bridge edge");
-        }
-
-        sched.edges[e].consumer_channel = in_ch;
-        // Delivery-side wake: for a `wake: true` cross-domain edge, bind
-        // the CONSUMER-local channel — the consumer-side pump delivers
-        // into it via `channel_write`, so the existing wake hook fires at
-        // the first moment the consumer could actually read the bytes.
-        // The producer-side channel is left unbound (a write-time wake is
-        // guaranteed-spurious: the consumer's domain steps before it
-        // pumps inbound). Wake service latency is bounded by the consumer
-        // domain's tick — cutting WFI mid-sleep needs the targeted SGI
-        // doorbell, gated on the WFI-wake mitigation.
-        if edge_snapshot.wake_on_write {
-            fluxor::kernel::ipc::channel::channel_set_wake_module(
-                in_ch,
-                edge_snapshot.to_module as i32,
-            );
-            log::info!(
-                "[wake] cross-domain edge {}→{} consumer chan={} delivery-wake bound",
-                edge_snapshot.from_module,
-                edge_snapshot.to_module,
-                in_ch
-            );
-        }
-        bridged += 1;
-        e += 1;
-    }
-    Ok(bridged)
-}
-
-/// Poll the live-rebuild bridge on the primary domain. Called from every
-/// per-domain pump loop (cooperative / Tier 1a / Tier 1b) so the rebuild runs
-/// regardless of the primary domain's tier. No-op off domain 0.
-///
-/// On a pending request: quiesce non-primary domains (race-free global mutation),
-/// reload STATIC_CONFIG, and rebuild the graph in place — mirroring the RP loop.
-/// `prepare_graph` does the destructive reset and is fail-safe on error.
-/// Single-domain only: multi-domain needs cross-domain SPSC bridges
-/// re-established (boot does that inline), so it is refused and left idle.
-/// Full rollback to the prior generation needs the previous config retained.
-fn poll_rebuild_bridge(domain_id: usize) {
-    if domain_id != 0 {
-        return;
-    }
-
-    // Test hook (feature `test-plan`): once, well after netconsole bring-up,
-    // report the owner-table occupancy. The boot `apply_staged()` installs the
-    // embedded plan's owner before the net is up (so its own log predates the
-    // netconsole); this late report makes that boot-applied ownership observable
-    // over the netconsole. Expect "active workloads = 1".
-    #[cfg(feature = "test-plan")]
-    {
-        use core::sync::atomic::{AtomicBool, Ordering as TestOrd};
-        static REPORTED: AtomicBool = AtomicBool::new(false);
-        let t = CORE_TICKS[0].load(TestOrd::Relaxed);
-        if t >= 180_000 && !REPORTED.swap(true, TestOrd::Relaxed) {
-            let n = scheduler::owners().active_workload_count();
-            log::info!("[test] owner table active workloads = {n}");
-        }
-    }
-
-    // Test hook (feature `test-rebuild`): one-shot rebuild after a fixed number
-    // of polls so the bridge can be observed on hardware. Absent from normal builds.
-    #[cfg(feature = "test-rebuild")]
-    {
-        use core::sync::atomic::{AtomicBool, Ordering as TestOrd};
-        static FIRED: AtomicBool = AtomicBool::new(false);
-        // Use the wall-clock-ish CORE_TICKS counter (advanced by the timer ISR,
-        // ~9.5k/s) rather than loop iterations — the cooperative pump `wfi`s, so
-        // iteration count accrues far slower than ticks. 450k ticks ≈ 47 s of
-        // scheduler time: long past DHCP/netconsole bring-up, so the rebuild is
-        // observable over the netconsole.
-        let t = CORE_TICKS[0].load(TestOrd::Relaxed);
-        if t >= 450_000 && !FIRED.swap(true, TestOrd::Relaxed) {
-            log::warn!("[test] one-shot rebuild trigger at tick {t}");
-            // SAFETY: null/0 = reload current STATIC_CONFIG sentinel.
-            unsafe { scheduler::request_rebuild(core::ptr::null(), 0) };
-        }
-    }
-
-    if scheduler::take_rebuild_request().is_none() {
-        return;
-    }
-    let expected = multicore::non_primary_active_count();
-    multicore::request_quiesce();
-    multicore::wait_parked(expected);
-    log::warn!("[reconfigure] quiesced {expected} domains; rebuilding");
-    // All non-primary domains are parked: safe to reset the cross-domain
-    // bridge state so `bridge_cross_domain_edges` re-registers from a clean
-    // table exactly like boot. (prepare_graph below also resets channel and
-    // buffer slots, so the consumer-side bridge channels are reopened fresh.)
-    // SAFETY: quiesce established above — parked pumps neither walk the edge
-    // table nor touch the SPSC rings.
-    unsafe { multicore::reset_cross_state() };
-    match scheduler::prepare_graph() {
-        Ok((module_list, module_count)) => {
-            // Re-establish cross-domain bridges for the new graph, then
-            // instantiate. Domain topology (exec modes / core assignment) must
-            // match the running generation: parked pumps resume inside their
-            // tier loop and re-read module tables per tick, but not their
-            // exec mode — changing tiers needs a reboot-class system update.
-            match bridge_cross_domain_edges() {
-                Ok(bridges) => {
-                    match instantiate_and_activate(&module_list, module_count) {
-                        Ok(n) => {
-                            // As at boot: owner accounting and the
-                            // contract-readiness gate over the new graph.
-                            fluxor::kernel::exec::scheduler::finalize_instantiation_accounting();
-                            let domains = active_domain_count();
-                            log::warn!(
-                                "[reconfigure] rebuilt graph: {n} modules, {domains} domain(s), \
-                                 {bridges} cross-domain bridge(s)"
-                            );
-                        }
-                        // A rebuild that cannot instantiate is refused, not
-                        // run partially. The node stays up with the graph it
-                        // has rather than silently becoming a different one.
-                        Err(failed) => log::error!(
-                            "[reconfigure] rebuild refused: {failed} module(s) failed to \
-                             instantiate; the graph would run with unwired ports"
-                        ),
-                    }
-                }
-                Err(msg) => {
-                    log::error!("[reconfigure] {msg}; graph left idle");
-                }
-            }
-        }
-        Err(_) => {
-            log::error!("[reconfigure] prepare_graph failed; graph left idle");
-        }
-    }
-    scheduler::set_reconfigure_phase(scheduler::ReconfigurePhase::Running);
-    multicore::release_quiesce();
-}
 
 // ============================================================================
 // Main entry point
@@ -1048,11 +620,9 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     //
     // `scheduler::prepare_graph` compiles the graph (edge decode, fan
     // module insertion, channel allocation, port-table population). This
-    // platform layers the multi-core concerns on top: cross-domain
-    // edges are bridged with `multicore::register_cross_edge`, and each
-    // core's run loop drives `scheduler::step_domain_modules` (or
-    // `step_domain_modules_poll` for Tier 3) through the shared
-    // `step_one_module` body.
+    // shared domain runtime (`kernel::exec::domains`) layers the multi-core
+    // concerns on top: cross-domain edges are bridged, and each core's run
+    // loop steps its domain through the shared `step_one_module` body.
     use fluxor::kernel::boot::config;
 
     // Parse config + loader into the kernel's static state. Pi 5 scans
@@ -1203,21 +773,9 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
         }
     };
 
-    // Cross-domain post-process: split every edge whose endpoints live
-    // in different domains into producer-side / consumer-side channels
-    // bridged by a `multicore::CrossDomainChannel` SPSC pump.
-    //
-    // The walk reads `sched.edges` (not `cfg.graph_edges`) so an edge
-    // that is part of both a fan group and a cross-domain hop is seen
-    // through its rewritten endpoints — the bridge lands on the actual
-    // producer/consumer hop, not the original config one.
-    //
-    // For each cross edge, open a fresh consumer-side channel `W2`,
-    // register the SPSC bridge `edge.channel → W2`, and set
-    // `edge.consumer_channel = W2`. `collect_input_channels` honours
-    // `consumer_channel`, so `populate_ports` lifts `W2` into the
-    // consumer's in_chans.
-    if let Err(msg) = bridge_cross_domain_edges() {
+    // Split every edge whose endpoints live in different domains into a
+    // producer-side and a consumer-side channel joined by an SPSC ring.
+    if let Err(msg) = cross::bridge_edges() {
         // Boot posture: a reservation shortfall halts — rebinding a consumer
         // to a handle no pump fills would strand every byte the producer
         // writes, and there is no earlier generation to fall back to.
@@ -1231,15 +789,26 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     }
 
     // Instantiate + activate the compiled graph (shared with live rebuild).
-    let total_mods = match instantiate_and_activate(&module_list, module_count) {
+    let total_mods = match domains::instantiate(&module_list, module_count) {
         Ok(n) => n,
-        Err(failed) => {
+        Err(why) => {
             // Fail closed at boot. Running a graph whose modules did not all
             // load converts a loud, local failure into a silent one that
-            // surfaces later as missing data, far from the cause.
-            uart_puts(b"[inst] REFUSING GRAPH: ");
-            uart_put_u32(failed as u32);
-            uart_puts(b" module(s) failed to instantiate\r\n");
+            // surfaces later as missing data, far from the cause; running it
+            // with an invalid owner plan runs it with isolation off.
+            for _ in 0..8 {
+                debug_drain_poll_core0();
+            }
+            match why {
+                domains::InstantiateError::Modules(failed) => {
+                    uart_puts(b"[inst] REFUSING GRAPH: ");
+                    uart_put_u32(failed as u32);
+                    uart_puts(b" module(s) failed to instantiate\r\n");
+                }
+                domains::InstantiateError::OwnerPlan(_) => {
+                    uart_puts(b"[owner] REFUSING GRAPH: staged plan invalid\r\n");
+                }
+            }
             boot_fail_stop();
         }
     };
@@ -1257,25 +826,25 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     // workloads with the base graph on the shared cooperative runner.
     fluxor::kernel::exec::scheduler::admit_resident_workloads_from_config();
 
-    // Signal init complete — secondary cores can start
-    INIT_COMPLETE.store(1, Ordering::Release);
-
-    // Log cross-domain channel status
     uart_puts(b"[cross] channels=");
-    uart_put_u32(multicore::cross_edge_count() as u32);
+    uart_put_u32(cross::cross_edge_count() as u32);
     uart_puts(b" dma_arena_used=");
     uart_put_u32(multicore::dma_arena_used() as u32);
     uart_puts(b"\r\n");
 
-    // Wake secondary cores that have non-empty domains assigned
+    // Wake a core for each domain with modules; each waits for the release.
+    // A domain whose core did not come up would hold its modules unstepped,
+    // so the graph is refused instead.
     wake_secondary_cores();
+    if let Some(d) = domains::coreless_domain(&PLATFORM) {
+        uart_puts(b"[wake] REFUSING GRAPH: no core came up for domain ");
+        uart_put_u32(d as u32);
+        uart_puts(b"\r\n");
+        boot_fail_stop();
+    }
 
-    // Every counted non-primary domain is now on its way into `run_domain_loop`
-    // (where it honours `park_if_requested`), so a runtime peer-core quiesce can
-    // make progress. This gates the live-splice's quiesce
-    // (`scheduler::live::apply_add`/`free_owner`): before this point the splice
-    // runs single-threaded (boot admission), after it under a real quiesce.
-    multicore::mark_smp_online();
+    // The secondaries may enter their loops.
+    domains::release();
 
     uart_puts(b"[sched] starting domain 0 on core 0\r\n");
 
@@ -1287,477 +856,44 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
         debug_drain_poll_core0();
     }
 
-    // Main loop — domain 0 on core 0
-    run_domain_loop(0)
+    domains::run(0, &PLATFORM)
 }
 
 // ============================================================================
-// Domain execution loop
+// The shared domain loop's platform part
 // ============================================================================
 
-/// Run the main loop for a domain. Steps all modules assigned to that domain.
-///
-/// This function never returns. On core 0 it is called directly from main().
-/// On secondary cores it is called from the secondary_core_main() entry point.
-/// Per-domain execution metrics.
-struct DomainMetrics {
-    /// Total ticks processed.
-    tick_count: u32,
-    /// Ticks where step work exceeded 50% of tick budget.
-    busy_ticks: u32,
-    /// Tier 3 only: total step calls.
-    poll_steps: u32,
-    /// Tier 3 only: steps where all modules returned Continue (idle).
-    poll_idle: u32,
-    /// Tier 3 only: WFE count.
-    wfe_count: u32,
-    /// Worst-case step duration in timer ticks (for deadline margin).
-    worst_step_ticks: u32,
+/// What this platform does around the shared domain loop.
+static PLATFORM: domains::Platform = domains::Platform {
+    has_core: bcm_has_core,
+    after_pass: bcm_after_pass,
+    after_step: bcm_after_step,
+};
+
+/// Domain `n` runs on core `n`, once that core has come up.
+fn bcm_has_core(domain_id: usize) -> bool {
+    u8::try_from(domain_id).is_ok_and(multicore::is_core_started)
 }
 
-impl DomainMetrics {
-    const fn new() -> Self {
-        Self {
-            tick_count: 0,
-            busy_ticks: 0,
-            poll_steps: 0,
-            poll_idle: 0,
-            wfe_count: 0,
-            worst_step_ticks: 0,
-        }
-    }
-}
-
-static mut DOMAIN_METRICS: [DomainMetrics; multicore::MAX_DOMAINS] =
-    [const { DomainMetrics::new() }; multicore::MAX_DOMAINS];
-
-/// Arm this core's next Tier-0 deadline from the pass just finished. The
-/// kernel pacer chooses the next-pass
-/// period (µs) from the domain's busy/idle + worst-step signals; we convert to
-/// generic-timer ticks and write this core's `NEXT_DEADLINE_TICKS` slot, which
-/// the `TIMER_PPI` handler reloads on the next fire. The IRQ-driven reload means
-/// the chosen period takes effect on the following timer period (a one-period
-/// propagation lag, acceptable for a cadence pacer).
-///
-/// A fixed domain (`adaptive_flags == 0`) gets the fixed `domain_tick_us` from
-/// the pacer, so the slot keeps its boot-seeded value and the cadence is a
-/// plain fixed tick. Variable cadence — idle widening toward `tick_max_us`
-/// and a per-pass period — is active only when a domain sets adaptive flags;
-/// on bcm2712 multicore it also relies on the SEV/WFI wake bound described
-/// below and the per-domain wake mask.
-///
-/// SEV-vs-WFI bound: the Tier-0 loop idles on `WFI`, broken only by an IRQ.
-/// IRQ-backed wakes (device interrupts) break it immediately, but a
-/// cross-domain / software wake only sets `EVENT_WAKE_PENDING` — it does NOT
-/// raise an IRQ, so it cannot cut short a widened idle `WFI`; that wake is
-/// serviced when the timer next fires. We therefore clamp the adaptive
-/// idle/relaxed deadline so the worst-case software-wake latency is bounded (no
-/// hot-path cost, no extra hardware; an SGI doorbell that interrupts `WFI`
-/// directly is the measured alternative). The clamp only bites when the pacer
-/// relaxes past it (an idle domain widening toward `tick_max_us`, or a
-/// per-pass period near it); busy passes return ≤ the nominal tick, far
-/// below it, so steady state and fixed-tick domains are untouched. Rig-tunable: it trades idle wakeups
-/// against worst-case software-wake latency.
-const BCM_IDLE_DEADLINE_CLAMP_US: u32 = 4_000;
-
-/// Most-relaxed deadline (µs) core 0's pacer chose since the last `[therm]`
-/// emit. The `[therm]` pass itself is busy (it drains the log ring → UDP), so a
-/// point-sampled `dl0_us` reads low even when the domain relaxes BETWEEN emits.
-/// This interval-max captures whether the pacer actually reached a relaxed
-/// cadence — a sampling-robust idle witness. Reset each emit.
-static DL0_MAX_US: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-
-/// Per-domain next-deadline (µs) produced by the most recent `domain_step_all`
-/// (the resident-graph runner / single-graph pacer). `arm_next_deadline` reads
-/// it instead of re-querying the pacer, so a multi-graph domain arms the
-/// merged deadline rather than the per-domain single-graph one. Always written
-/// by `domain_step_all` before `arm_next_deadline` runs in the same loop body.
-static DOMAIN_RUNNER_DEADLINE_US: [core::sync::atomic::AtomicU32; multicore::MAX_DOMAINS] =
-    [const { core::sync::atomic::AtomicU32::new(0) }; multicore::MAX_DOMAINS];
-
-#[inline]
-fn arm_next_deadline(domain_id: usize, core_id: usize) {
-    // The runner already chose this domain's next deadline during the preceding
-    // `domain_step_all` (the resident-graph merge, or the single-graph pacer).
-    let raw_us = if domain_id < multicore::MAX_DOMAINS {
-        DOMAIN_RUNNER_DEADLINE_US[domain_id].load(Ordering::Relaxed)
-    } else {
-        scheduler::pacer_next_deadline_us(domain_id)
-    };
-    // The software-wake latency clamp applies ONLY to an adaptive relaxed
-    // deadline. A fixed domain (adaptive_flags == 0) gets `domain_tick_us`
-    // verbatim from the pacer and must keep it — clamping a 10 ms fixed tick to
-    // 4 ms would silently re-pace it and break the fixed-cadence guarantee.
-    // Only an adaptive domain can relax past the clamp.
-    let next_us = if scheduler::domain_adaptive_flags(domain_id) != 0 {
-        // The clamp must NOT undercut the pacer's floor: the pacer never
-        // returns below `floor = max(tick_min_us, worst_step × MARGIN)`; arming
-        // below it (e.g. tick_min_us > 4 ms, or a live worst-step floor > 4 ms) would run
-        // the domain faster than its worst-step budget admits — a budget/floor
-        // contract break. Cap relaxation at `max(CLAMP, floor)`: the clamp still
-        // bounds software-wake latency when the floor is under it; a domain that
-        // genuinely needs a longer minimum period gets it (its own step cadence
-        // already bounds responsiveness, so no extra latency is added).
-        let floor = scheduler::pacer_domain_floor_us(domain_id);
-        raw_us.min(BCM_IDLE_DEADLINE_CLAMP_US.max(floor))
-    } else {
-        raw_us
-    };
+/// After each pass: core 0 drains the log to the UART; the cooperative and
+/// high-rate loops report the die temperature; a high-rate domain 0 reports
+/// the cross-domain bridges.
+fn bcm_after_pass(domain_id: usize, core_id: usize, tier: domains::Tier) {
     if core_id == 0 {
-        DL0_MAX_US.fetch_max(next_us, Ordering::Relaxed);
+        debug_drain_poll_core0();
     }
-    let freq = timer::timer_freq();
-    let ticks = if freq > 0 {
-        ((next_us as u64) * freq / 1_000_000) as u32
-    } else {
-        // freq read failed — same ~1 ms @ 62.5 MHz fallback the seed paths use.
-        62_500
-    };
-    let slot = core_id.min(NEXT_DEADLINE_TICKS.len() - 1);
-    NEXT_DEADLINE_TICKS[slot].store(ticks, Ordering::Relaxed);
-}
-
-fn run_domain_loop(domain_id: usize) -> ! {
-    let exec_mode = scheduler::domain_exec_mode(domain_id);
-    let core_id = current_core_id() as usize;
-
-    match exec_mode {
-        // ── Tier 1a: High-rate periodic (1-10 kHz) ──
-        // Same as Tier 0 but with per-domain timer tick rate.
-        // Timer IRQ fires at domain_tick_us; full module ABI retained.
-        1 => {
-            log::info!(
-                "[domain] {} core={} tier=1a tick_us={}",
-                domain_id,
-                core_id,
-                scheduler::domain_tick_us(domain_id)
-            );
-            loop {
-                // SAFETY: WFI halts the core until next interrupt; hint-only.
-                unsafe { core::arch::asm!("wfi") };
-                multicore::park_if_requested(domain_id);
-                let t0 = timer::read_timer_count();
-                domain_step_all(domain_id);
-                pump_cross_domain(domain_id);
-                if core_id == 0 {
-                    debug_drain_poll_core0();
-                }
-                let elapsed = timer::read_timer_count().wrapping_sub(t0);
-                // SAFETY: DOMAIN_METRICS[d] is exclusively touched by domain `d`'s
-                // pump thread; bounded by MAX_DOMAINS.
-                let metrics = unsafe { &mut DOMAIN_METRICS[domain_id] };
-                metrics.tick_count += 1;
-                scheduler::maybe_emit_alive(metrics.tick_count as u64, Some(domain_id));
-                maybe_emit_soc_temp(core_id);
-                // live-rebuild bridge (Tier 1a primary).
-                poll_rebuild_bridge(domain_id);
-                if elapsed > metrics.worst_step_ticks {
-                    metrics.worst_step_ticks = elapsed;
-                }
-                // Track busy ticks (step work exceeded 50% of tick budget)
-                let freq = timer::timer_freq() as u32;
-                let budget_ticks = if freq > 0 {
-                    (scheduler::domain_tick_us(domain_id) as u64 * freq as u64 / 1_000_000) as u32
-                } else {
-                    62500
-                };
-                if elapsed > budget_ticks / 2 {
-                    metrics.busy_ticks += 1;
-                }
-                // Report every ~10s (at domain tick rate)
-                let report_interval = 10_000_000 / scheduler::domain_tick_us(domain_id);
-                if metrics.tick_count % report_interval == 0 && metrics.tick_count > 0 {
-                    log::info!(
-                        "[tier1a] d={} ticks={} worst={}cyc",
-                        domain_id,
-                        metrics.tick_count,
-                        metrics.worst_step_ticks
-                    );
-                }
-                // Cross-domain bridge health — domain 0 only (core 0 owns the
-                // UDP debug drain), emitted frequently (~0.5 s at tick_us=100)
-                // so the multi-lane cross-domain wedge is visible over telemetry
-                // without UART. drops = SPSC ring rejected a frame; bp =
-                // backpressure (ring full / consumer not ready); depth[d] =
-                // pending frames queued toward domain d.
-                if domain_id == 0 && xdom_due() {
-                    let (drops, bp, _sb) = multicore::cross_domain_stats();
-                    let depth = multicore::cross_domain_queue_depths();
-                    // Per-domain liveness: tick_count (tier 0/1a) and poll_steps
-                    // (tier 3). A frozen count for a lane domain means that core
-                    // isn't stepping (timer/wake), distinct from a module that
-                    // isn't consuming its input. SAFETY: relaxed reads of other
-                    // domains' metrics for diagnostics only.
-                    let (d1t, d1p, d2t, d2p) = unsafe {
-                        (
-                            DOMAIN_METRICS[1].tick_count,
-                            DOMAIN_METRICS[1].poll_steps,
-                            DOMAIN_METRICS[2].tick_count,
-                            DOMAIN_METRICS[2].poll_steps,
-                        )
-                    };
-                    // Secondary-core fault latch — a frozen lane tick_count with
-                    // a nonzero fault count + ESR identifies a core that took an
-                    // exception (the UART dump being invisible on this bench).
-                    let f1 = exception::CORE_FAULT_COUNT[1].load(Ordering::Relaxed);
-                    let f2 = exception::CORE_FAULT_COUNT[2].load(Ordering::Relaxed);
-                    let e1 = exception::CORE_FAULT_ESR[1].load(Ordering::Relaxed);
-                    let e2 = exception::CORE_FAULT_ESR[2].load(Ordering::Relaxed);
-                    // Which module each lane core is currently stepping — if a
-                    // lane's tick is frozen, this names the module it hung in.
-                    let m1 = scheduler::module_index_on_core(1);
-                    // HW timer-IRQ count per core (climbs even while the loop is
-                    // stuck) + the last interrupted PC (the spin location).
-                    let ct1 = exception::CORE_TICKS[1].load(Ordering::Relaxed);
-                    // Programmed deadline for the lane core (freeze-detector
-                    // aid): under variable cadence an idle core's CORE_TICKS
-                    // climbs slowly *by design* — surfacing its deadline lets a
-                    // reader tell "idle (widened deadline, tick_count still
-                    // advancing)" from "wedged (tick_count frozen)". The frozen
-                    // tick_count remains the cadence-invariant freeze signal.
-                    let dl1 = exception::NEXT_DEADLINE_TICKS[1].load(Ordering::Relaxed);
-                    let elr1 = exception::CORE_LAST_ELR[1].load(Ordering::Relaxed);
-                    let far1 = exception::CORE_FAULT_FAR[1].load(Ordering::Relaxed);
-                    let sp1 = exception::CORE_FAULT_SPSR[1].load(Ordering::Relaxed);
-                    let fe1 = exception::CORE_FAULT_ELR[1].load(Ordering::Relaxed);
-                    // Cross-domain flow into/out of the consensus core (d2),
-                    // reported on the periodic [xdom] line. p = frames pushed
-                    // to the SPSC ring, c = frames delivered to the consumer
-                    // channel.
-                    let xp = |a: usize, b: usize| XPUMP_PROD[a * 4 + b].load(Ordering::Relaxed);
-                    let xc = |a: usize, b: usize| XPUMP_CONS[a * 4 + b].load(Ordering::Relaxed);
-                    log::info!(
-                        "[xdom] drops={} bp={} depth=[{},{},{},{}] d2t={} xf 1>2:{}/{} 3>2:{}/{} 2>1:{}/{} 2>3:{}/{} 2>0:{}/{}",
-                        drops, bp,
-                        depth[0], depth[1], depth[2], depth[3], d2t,
-                        xp(1,2), xc(1,2), xp(3,2), xc(3,2),
-                        xp(2,1), xc(2,1), xp(2,3), xc(2,3), xp(2,0), xc(2,0),
-                    );
-                    let _ = (
-                        d1p, d2p, f2, e2, d1t, ct1, dl1, m1, elr1, f1, e1, far1, sp1, fe1,
-                    );
-                    // If any core latched a panic, broadcast the site over UDP.
-                    let pc = PANIC_CORE.load(Ordering::Relaxed);
-                    if pc != 0xFFFF_FFFF {
-                        let line = PANIC_LINE.load(Ordering::Relaxed);
-                        let fptr = PANIC_FILE_PTR.load(Ordering::Relaxed);
-                        let flen = PANIC_FILE_LEN.load(Ordering::Relaxed) as usize;
-                        let file = if fptr != 0 && flen > 0 && flen < 256 {
-                            // SAFETY: file ptr/len come from a `&'static str` in
-                            // the shared address space; bounded length (<256),
-                            // read-only.
-                            let bytes =
-                                unsafe { core::slice::from_raw_parts(fptr as *const u8, flen) };
-                            core::str::from_utf8(bytes).unwrap_or("?")
-                        } else {
-                            "?"
-                        };
-                        log::info!("[PANIC] core={pc} at {file}:{line}");
-                    }
-                }
-                // Arm-after-step for Tier 1a too (the pacer governs Tier 0 AND
-                // Tier 1a). A Tier-1a domain with adaptive_flags advances its
-                // cadence here; byte-identical when adaptive_flags==0 (the
-                // pacer returns the fixed domain tick).
-                arm_next_deadline(domain_id, core_id);
-            }
-        }
-        // ── Tier 3: Poll-mode (continuous stepping) ──
-        // Continuous stepping through the shared scheduler body. The
-        // pass runs every module in the domain once via
-        // `step_domain_modules_poll`, which is identical to
-        // `step_domain_modules` except it also reports whether any
-        // module returned `StepOutcome::Burst` during the pass. When
-        // no module bursted (and there's no other pending work) the
-        // core WFEs.
-        3 => {
-            log::info!("[domain] {domain_id} core={core_id} tier=3 poll-mode");
-            loop {
-                multicore::park_if_requested(domain_id);
-                // SAFETY: scheduler-thread per-domain access; bounded.
-                let sched = unsafe { scheduler::sched_mut() };
-                let (_result, any_burst) =
-                    scheduler::step_domain_modules_poll(&mut sched.modules, domain_id);
-                pump_cross_domain(domain_id);
-                if core_id == 0 {
-                    debug_drain_poll_core0();
-                }
-
-                // SAFETY: DOMAIN_METRICS[d] is exclusively touched by domain `d`'s
-                // pump thread; bounded by MAX_DOMAINS.
-                let metrics = unsafe { &mut DOMAIN_METRICS[domain_id] };
-                metrics.poll_steps += 1;
-                scheduler::maybe_emit_alive(metrics.poll_steps as u64, Some(domain_id));
-                if !any_burst {
-                    metrics.poll_idle += 1;
-                    metrics.wfe_count += 1;
-                    // SAFETY: WFE halts the core until an event; hint-only.
-                    unsafe { core::arch::asm!("wfe") };
-                }
-                // Report every ~1M poll steps
-                if metrics.poll_steps & 0xFFFFF == 0 && metrics.poll_steps > 0 {
-                    let idle_pct = if metrics.poll_steps > 0 {
-                        metrics.poll_idle * 100 / metrics.poll_steps
-                    } else {
-                        0
-                    };
-                    log::info!(
-                        "[tier3] d={} polls={} idle={}% wfe={}",
-                        domain_id,
-                        metrics.poll_steps,
-                        idle_pct,
-                        metrics.wfe_count
-                    );
-                }
-            }
-        }
-        // ── Tier 1b: Polled-timer ISR ──
-        // Modules in this domain are *not* iterated via
-        // `domain_step_all` — they were handed to the ISR-tier
-        // dispatcher at graph setup. The pump just calls
-        // `isr_tier::poll_tier1b` each loop iteration; that helper
-        // fires `isr_tier1b_handler` when the configured period has
-        // elapsed (bcm_isr_tier_poll software-polls the architected
-        // counter on aarch64, since the cooperative scheduler shares
-        // the core). Cross-domain pumps still run so a Tier 0
-        // sibling can deliver work into the Tier 1b domain.
-        2 => {
-            log::info!(
-                "[domain] {} core={} tier=1b period_us={}",
-                domain_id,
-                core_id,
-                scheduler::domain_tick_us(domain_id)
-            );
-            loop {
-                multicore::park_if_requested(domain_id);
-                fluxor::kernel::exec::isr_tier::poll_tier1b();
-                pump_cross_domain(domain_id);
-                if core_id == 0 {
-                    debug_drain_poll_core0();
-                }
-                // SAFETY: WFE halts the core until an event arrives;
-                // the poll above is non-blocking, so spinning into WFE
-                // is the correct idle posture.
-                unsafe { core::arch::asm!("wfe") };
-                // SAFETY: DOMAIN_METRICS[d] is exclusively touched by
-                // domain `d`'s pump thread; bounded by MAX_DOMAINS.
-                let metrics = unsafe { &mut DOMAIN_METRICS[domain_id] };
-                metrics.tick_count += 1;
-                scheduler::maybe_emit_alive(metrics.tick_count as u64, Some(domain_id));
-                // live-rebuild bridge (Tier 1b primary).
-                poll_rebuild_bridge(domain_id);
-                if metrics.tick_count.is_multiple_of(1_000_000) {
-                    log::info!(
-                        "[tier1b] d={} polls={} ticks={}",
-                        domain_id,
-                        metrics.tick_count,
-                        fluxor::kernel::exec::isr_tier::tier1b_ticks(),
-                    );
-                }
-            }
-        }
-        // ── Tier 2: IRQ-owned, dedicated core ──
-        // Modules in this domain are NOT iterated cooperatively — each is
-        // bound to a hardware IRQ at graph setup (`register_tier2_module` +
-        // `hal::irq_bind` → `isr_tier2_trampoline`), and the GIC dispatches
-        // straight into `module_isr_entry` from interrupt context. This core's
-        // job is therefore to (a) stay parked in WFI so it is available to take
-        // its owned IRQ with minimal latency, and (b) still service the
-        // cooperative housekeeping that every domain core owes: cross-domain
-        // SPSC pumping (so a sibling can hand work toward a Tier-2 module's
-        // bridge), the live-rebuild bridge, and park-on-reconfigure. Without
-        // this arm an `exec_mode == 4` domain fell through to the Tier-0
-        // default and spun a cooperative pump that does no useful work for its
-        // (skipped) ISR-tier modules.
-        4 => {
-            log::info!("[domain] {domain_id} core={core_id} tier=2 irq-owned");
-            loop {
-                // SAFETY: WFI halts the core until its owned IRQ (or any other
-                // unmasked interrupt) fires; the trampoline runs in ISR context.
-                unsafe { core::arch::asm!("wfi") };
-                multicore::park_if_requested(domain_id);
-                pump_cross_domain(domain_id);
-                if core_id == 0 {
-                    debug_drain_poll_core0();
-                }
-                // SAFETY: DOMAIN_METRICS[d] is exclusively touched by domain
-                // `d`'s pump thread; bounded by MAX_DOMAINS.
-                let metrics = unsafe { &mut DOMAIN_METRICS[domain_id] };
-                metrics.tick_count += 1;
-                scheduler::maybe_emit_alive(metrics.tick_count as u64, Some(domain_id));
-                // live-rebuild bridge (so a Tier-2 domain can be reconfigured).
-                poll_rebuild_bridge(domain_id);
-                if metrics.tick_count.is_multiple_of(1_000_000) {
-                    log::info!(
-                        "[tier2] d={domain_id} wakes={} irqs={}",
-                        metrics.tick_count,
-                        fluxor::kernel::exec::isr_tier::tier2_dispatch_count(),
-                    );
-                }
-            }
-        }
-        // ── Tier 0: Cooperative (default, 1ms tick) ──
-        _ => {
-            loop {
-                // SAFETY: WFI halts the core until next interrupt; hint-only.
-                unsafe { core::arch::asm!("wfi") };
-                multicore::park_if_requested(domain_id);
-                let tick = CORE_TICKS[core_id].load(Ordering::Relaxed);
-                // Tier-2 silicon-validation trigger: from core 0, periodically
-                // send SGI 15 to core 1 (the Tier-2 dedicated core), which is
-                // the hardware IRQ its Tier-2 module owns. Drives
-                // `module_isr_entry` so the dispatch path is exercised on real
-                // silicon. Build-flag only; never in production.
-                #[cfg(feature = "test_tier2_sgi")]
-                if core_id == 0 && tick.is_multiple_of(2000) {
-                    // SAFETY: single MMIO write to the boot-mapped GIC distributor.
-                    unsafe { gic::send_sgi(1, 15) };
-                }
-                domain_step_all(domain_id);
-                pump_cross_domain(domain_id);
-                // Poll the Tier 1b timer here too — on configurations
-                // with no dedicated Tier 1b core, the cooperative pump
-                // is the only path to fire the ISR handler.
-                fluxor::kernel::exec::isr_tier::poll_tier1b();
-                if core_id == 0 {
-                    debug_drain_poll_core0();
-                }
-                // SAFETY: DOMAIN_METRICS[d] is exclusively touched by domain `d`'s
-                // pump thread; bounded by MAX_DOMAINS.
-                let metrics = unsafe { &mut DOMAIN_METRICS[domain_id] };
-                metrics.tick_count += 1;
-                scheduler::maybe_emit_alive(tick as u64, Some(domain_id));
-                maybe_emit_soc_temp(core_id);
-                // live-rebuild bridge (cooperative / Tier 0 primary).
-                poll_rebuild_bridge(domain_id);
-                // Arm-after-step: pick the next deadline from this pass and
-                // write the per-core slot before looping back to WFI.
-                // Byte-identical when adaptive_flags==0.
-                arm_next_deadline(domain_id, core_id);
-            }
-        }
+    if matches!(tier, domains::Tier::Cooperative | domains::Tier::HighRate) {
+        maybe_emit_soc_temp(core_id);
+    }
+    if tier == domains::Tier::HighRate && domain_id == 0 && xdom_due() {
+        report_cross_domain();
     }
 }
 
-/// Step every module in `domain_id` via the shared per-domain
-/// scheduler path. Routes through `scheduler::step_domain_modules`
-/// (same `step_one_module` body single-domain platforms use), so
-/// every BCM-domain step honours period gating, upstream-ready
-/// gating, `Done` finalisation, the fault state machine, and the
-/// `Burst` loop identically to RP/Linux/WASM.
-fn domain_step_all(domain_id: usize) {
-    // SAFETY: per-domain pump runs on the domain's owning core.
-    let sched = unsafe { scheduler::sched_mut() };
-    // Multi-graph runtime: with more than one resident graph in this domain,
-    // steps each owner independently, skips idle owners, and returns the
-    // merged deadline. Byte-identical to `step_domain_modules` +
-    // `pacer_next_deadline_us(domain)` with one resident graph. The deadline
-    // is stashed for the arm-after-step write below.
-    let (_result, deadline_us) =
-        scheduler::step_resident_graphs_domain(&mut sched.modules, domain_id);
-    // Owner roots' background jobs (making, charging, removing a workload's
-    // root) ride the domain that steps the node's own `fs` provider, so they
-    // never race its step.
+/// Owner roots' background jobs (making, charging, removing a workload's
+/// root) ride the domain that steps the node's own `fs` provider, so they
+/// never race its step.
+fn bcm_after_step(domain_id: usize) {
     let fs_domain = fluxor::kernel::module::provider::node_default_module(
         fluxor::kernel::module::provider::contract::FS as usize,
     )
@@ -1766,175 +902,40 @@ fn domain_step_all(domain_id: usize) {
         // SAFETY: on the domain that steps the node's `fs` provider.
         unsafe { fluxor::platform::owner_root::step() };
     }
-    if domain_id < multicore::MAX_DOMAINS {
-        DOMAIN_RUNNER_DEADLINE_US[domain_id].store(deadline_us, Ordering::Relaxed);
-    }
 }
 
-/// Move one slot per edge in each direction between local pipe channels
-/// and their cross-domain SPSC ring. Called from `run_domain_loop` on
-/// every tick; producer and consumer sides of each edge each fire on
-/// the tick of their owning domain.
-///
-/// On the consumer side, the local pipe FIFO is peeked via `POLL_OUT`
-/// before consuming from the SPSC ring — `channel_write` can return a
-/// short write when the FIFO is near-full, and SPSC slots are consumed
-/// in whole-message units, so pulling from the ring first and then
-/// writing to a full FIFO would silently drop the tail.
-///
-/// `IOCTL_NOTIFY` sideband (seek requests and the like) is bridged via
-/// `edge.pending_aux`: the consumer-side pump drains the consumer's
-/// local input aux and stores it there; the producer-side pump drains
-/// it and replays it onto the producer's local output aux.
-/// Max frames a single `pump_cross_domain` pass moves per edge per direction.
-/// Sized to a full SPSC ring so a producer can fill (or a consumer drain) the
-/// whole ring in one pass instead of one frame per domain tick — the latter
-/// throttled cross-domain TLS flights to 1 frame/tick and saturated the ring
-/// under load.
-const CROSS_PUMP_BURST: u32 = multicore::RING_SLOTS as u32;
-
-// Diagnostic per-domain-pair cross-domain flow matrix (from*4+to). PROD counts
-// frames the producer arm pushed into the SPSC ring; CONS counts frames the
-// consumer arm delivered into the local consumer channel. A pair where
-// PROD>0 but CONS≈0 localises where cross-core delivery stalls.
-static XPUMP_PROD: [core::sync::atomic::AtomicU32; 16] =
-    [const { core::sync::atomic::AtomicU32::new(0) }; 16];
-static XPUMP_CONS: [core::sync::atomic::AtomicU32; 16] =
-    [const { core::sync::atomic::AtomicU32::new(0) }; 16];
-
-fn pump_cross_domain(domain_id: usize) {
-    let n_cross = multicore::cross_edge_count();
-    let mut ei = 0;
-    while ei < n_cross {
-        let Some(edge) = multicore::get_cross_edge(ei) else {
-            ei += 1;
-            continue;
-        };
-        let Some(ch) = multicore::get_cross_channel(edge.channel_idx as usize) else {
-            ei += 1;
-            continue;
-        };
-
-        // Producer side. Check remote SPSC space first — `channel_read`
-        // commits the local mailbox frame, so consuming the producer's
-        // frame before knowing the SPSC ring has room would be a real
-        // drop. If the ring is full we leave the frame in the producer
-        // mailbox; the producer module sees back-pressure on its output
-        // and the pump retries next tick.
-        if edge.from_domain == domain_id as u8 && edge.local_out_handle >= 0 {
-            // Drain up to a full ring's worth of frames from the producer
-            // mailbox into the SPSC ring this pass. The original one-frame-
-            // per-pump shipped at most one frame per domain tick, so a TLS
-            // flight (many records) crawled across the seam and the ring
-            // saturated under load (observed: depth stuck at RING_SLOTS, the
-            // consumer's curl timing out). Stop when the ring is full
-            // (back-pressure) or the mailbox is drained.
-            let mut moved = 0u32;
-            while moved < CROSS_PUMP_BURST {
-                if ch.is_full() {
-                    multicore::CROSS_DOMAIN_BACKPRESSURE.fetch_add(1, Ordering::Relaxed);
-                    break;
-                }
-                let mut buf = [0u8; multicore::SLOT_DATA_SIZE];
-                // SAFETY: `buf` is `SLOT_DATA_SIZE` bytes on the stack;
-                // channel_read writes ≤ `buf.len()` bytes.
-                let n = unsafe {
-                    fluxor::kernel::ipc::channel::channel_read(
-                        edge.local_out_handle,
-                        buf.as_mut_ptr(),
-                        buf.len(),
-                    )
-                };
-                if n <= 0 {
-                    break; // producer mailbox empty
-                }
-                // The ring had space when we checked, but a parallel
-                // consumer-side close (or an oversized frame, which
-                // `ch.send` rejects) can still cause a refusal. Bump the
-                // cross-domain drop counter so operator-side telemetry sees it.
-                if !ch.send(&buf[..n as usize]) {
-                    multicore::CROSS_DOMAIN_DROPS.fetch_add(1, Ordering::Relaxed);
-                    break;
-                }
-                let mi = ((edge.from_domain as usize) * 4 + edge.to_domain as usize) & 15;
-                XPUMP_PROD[mi].fetch_add(1, Ordering::Relaxed);
-                moved += 1;
-            }
-            let aux = edge.pending_aux.swap(u32::MAX, Ordering::AcqRel);
-            if aux != u32::MAX {
-                let mut val = aux;
-                let _ = fluxor::kernel::ipc::channel::channel_ioctl(
-                    edge.local_out_handle,
-                    fluxor::kernel::ipc::channel::IOCTL_NOTIFY,
-                    &mut val as *mut u32 as *mut u8,
-                );
+/// The cross-domain bridges' health, on the ~0.5 s `[xdom]` cadence: drops
+/// (the ring refused a frame), backpressure (a pass that left frames queued),
+/// frames pending toward each domain, each domain's pass count, and, for each
+/// ordered pair of domains that has carried frames, those pushed into the ring
+/// and those delivered. A latched panic on any core is reported with it.
+fn report_cross_domain() {
+    let (drops, bp, _sb) = cross::cross_domain_stats();
+    let depth = cross::cross_domain_queue_depths();
+    let passes: [u32; scheduler::MAX_DOMAINS] = core::array::from_fn(domains::domain_ticks);
+    log::info!("[xdom] drops={drops} bp={bp} depth={depth:?} passes={passes:?}");
+    for from in 0..scheduler::MAX_DOMAINS {
+        for to in (0..scheduler::MAX_DOMAINS).filter(|&to| to != from) {
+            let (pushed, delivered) = cross::flow(from, to);
+            if pushed != 0 || delivered != 0 {
+                log::info!("[xdom] {from}>{to} pushed={pushed} delivered={delivered}");
             }
         }
-
-        // Consumer side.
-        if edge.to_domain == domain_id as u8 && edge.local_in_handle >= 0 {
-            // Drain up to a full ring's worth of frames from the SPSC ring
-            // into the local consumer channel this pass, re-checking POLL_OUT
-            // each iteration (the FIFO can fill mid-drain). Matches the
-            // multi-frame producer drain above so a burst clears in one pump.
-            let mut moved = 0u32;
-            while moved < CROSS_PUMP_BURST {
-                // Atomic-or-nothing delivery. The local consumer channel is a
-                // FIFO whose `channel_write` is partial-OK — writing a slot
-                // that doesn't fully fit truncates it, losing the tail and
-                // corrupting the consumer's framed byte stream (net_proto:
-                // a dropped tail desyncs the [type][len][payload] framing, so
-                // the consumer reads a bogus length and SPINS on phantom reads
-                // — exactly the lane-core hang). So peek the next slot's length
-                // and only consume+write it when the FIFO has room for ALL of
-                // it; otherwise leave it queued and back-pressure.
-                let Some(slot_len) = ch.try_peek_len() else {
-                    break; // ring empty
-                };
-                if fluxor::kernel::ipc::channel::channel_writable_bytes(edge.local_in_handle)
-                    < slot_len
-                {
-                    multicore::CROSS_DOMAIN_BACKPRESSURE.fetch_add(1, Ordering::Relaxed);
-                    break;
-                }
-                let mut buf = [0u8; multicore::SLOT_DATA_SIZE];
-                let Some(len) = ch.try_recv(&mut buf) else {
-                    break; // ring drained between peek and recv
-                };
-                // SAFETY: `len == slot_len <= SLOT_DATA_SIZE = buf.len()`, and
-                // the FIFO was just confirmed to have room for the whole slot,
-                // so this write is complete (no truncation).
-                unsafe {
-                    fluxor::kernel::ipc::channel::channel_write(
-                        edge.local_in_handle,
-                        buf.as_ptr(),
-                        len,
-                    );
-                }
-                let mi = ((edge.from_domain as usize) * 4 + edge.to_domain as usize) & 15;
-                XPUMP_CONS[mi].fetch_add(1, Ordering::Relaxed);
-                moved += 1;
-            }
-            let mut val: u32 = 0;
-            let rc = fluxor::kernel::ipc::channel::channel_ioctl(
-                edge.local_in_handle,
-                fluxor::kernel::ipc::channel::IOCTL_POLL_NOTIFY,
-                &mut val as *mut u32 as *mut u8,
-            );
-            if rc == fluxor::kernel::ipc::channel::CHAN_OK && val != u32::MAX {
-                // `pending_aux` is single-slot — a fresh notification
-                // overwrites any prior one that the producer pump
-                // hadn't yet drained. The single-slot design is
-                // intentionally coalescing (later writes win); the
-                // overwrite counter below makes the rate of coalesced
-                // events visible without changing the wire shape.
-                let prev = edge.pending_aux.swap(val, Ordering::AcqRel);
-                if prev != u32::MAX {
-                    multicore::SIDEBAND_AUX_OVERWRITES.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-        }
-        ei += 1;
+    }
+    let pc = PANIC_CORE.load(Ordering::Relaxed);
+    if pc != 0xFFFF_FFFF {
+        let line = PANIC_LINE.load(Ordering::Relaxed);
+        let fptr = PANIC_FILE_PTR.load(Ordering::Relaxed);
+        let flen = PANIC_FILE_LEN.load(Ordering::Relaxed) as usize;
+        let file = if fptr != 0 && flen > 0 && flen < 256 {
+            // SAFETY: file ptr/len come from a `&'static str` in the shared
+            // address space; bounded length (<256), read-only.
+            let bytes = unsafe { core::slice::from_raw_parts(fptr as *const u8, flen) };
+            core::str::from_utf8(bytes).unwrap_or("?")
+        } else {
+            "?"
+        };
+        log::info!("[PANIC] core={pc} at {file}:{line}");
     }
 }
 
@@ -1942,10 +943,10 @@ fn pump_cross_domain(domain_id: usize) {
 // Secondary core entry points
 // ============================================================================
 
-/// Entry point for secondary cores after wake.
-///
-/// Waits for init_complete, sets up its own timer and GIC, then runs its
-/// assigned domain loop. If no domain is assigned, parks in WFE.
+/// Entry point for secondary cores after wake: once the primary has
+/// released the graph, set up this core's GIC half and its tick at the
+/// domain's rate, then run the domain's loop. Only a domain with modules has
+/// its core woken.
 fn secondary_core_main_1() -> ! {
     secondary_core_main(1)
 }
@@ -1959,12 +960,9 @@ fn secondary_core_main_3() -> ! {
 }
 
 fn secondary_core_main(domain_id: usize) -> ! {
-    // Wait for init to complete on core 0
-    while INIT_COMPLETE.load(Ordering::Acquire) == 0 {
+    while !domains::released() {
         // SAFETY: WFE is a hint to wait until the next event.
-        unsafe {
-            core::arch::asm!("wfe");
-        }
+        unsafe { core::arch::asm!("wfe") };
     }
 
     let core_id = current_core_id();
@@ -1975,54 +973,23 @@ fn secondary_core_main(domain_id: usize) -> ! {
     uart_puts(b"\r\n");
     log::info!("[core{core_id}] started, domain={domain_id}");
 
-    // Set up GIC CPU interface + per-domain timer rate for this core. Tier 1a
-    // may run faster than the global tick; a Tier-0 lane domain may run
-    // slower. Storing the domain's tick into THIS core's deadline slot is
-    // what makes the rate stick: the TIMER_PPI handler reloads from the
-    // per-core slot, so the domain's rate survives the first IRQ rather than
-    // being taken from a shared global.
-    let domain_tick = scheduler::domain_tick_us(domain_id);
-    let freq = timer::timer_freq();
-    let ticks_for_domain = if freq > 0 {
-        ((domain_tick as u64) * freq / 1_000_000) as u32
-    } else {
-        // freq read failed — fall back to ~1 ms at the assumed 62.5 MHz timer
-        // (same constant the boot path uses for the freq==0 error case).
-        62_500
-    };
-    let slot = (core_id as usize).min(NEXT_DEADLINE_TICKS.len() - 1);
-    NEXT_DEADLINE_TICKS[slot].store(ticks_for_domain, Ordering::Relaxed);
-    // SAFETY: secondary-core init runs once before the domain pump starts;
-    // GIC + generic-timer registers are per-CPU.
+    let ticks = domains::seed_core_tick(domain_id);
+    // SAFETY: once, before the domain loop starts; the GIC CPU interface and
+    // the generic timer are this core's own.
     unsafe {
         gic::init_secondary();
-        timer::timer_set(ticks_for_domain);
-        // Enable IRQs (not needed for Tier 3 poll-mode, but harmless)
+        timer::timer_set(ticks);
         core::arch::asm!("msr daifclr, #2");
     }
-
-    // Check if this domain is active
-    let ds = multicore::domain_state_ref(domain_id);
-    if !ds.active || ds.module_count == 0 {
-        uart_puts(b"[core");
-        uart_put_u32(core_id as u32);
-        uart_puts(b"] no work, parking\r\n");
-        loop {
-            // SAFETY: WFE halts the core until an event; idle path.
-            unsafe {
-                core::arch::asm!("wfe");
-            }
-        }
-    }
-
-    // Run the domain loop
-    run_domain_loop(domain_id)
+    domains::run(domain_id, &PLATFORM)
 }
 
-/// Wake all secondary cores that have domains assigned.
-///
-/// Called after module instantiation on core 0. Each secondary core
-/// gets its own entry function that maps to its domain.
+/// How long a woken core has to report that it came up.
+const CORE_START_WAIT_US: u64 = 1_000_000;
+
+/// Wake the secondary cores whose domains have modules, after the primary has
+/// instantiated the graph, and wait for each to come up. Domain N runs on
+/// core N.
 pub fn wake_secondary_cores() {
     let entries: [fn() -> !; 3] = [
         secondary_core_main_1,
@@ -2032,21 +999,24 @@ pub fn wake_secondary_cores() {
 
     for core_id in 1u8..=3 {
         let domain_id = core_id as usize;
-        let ds = multicore::domain_state_ref(domain_id);
-        if ds.active && ds.module_count > 0 {
-            uart_puts(b"[wake] core ");
+        if !domains::is_active(domain_id) {
+            continue;
+        }
+        uart_puts(b"[wake] core ");
+        uart_put_u32(core_id as u32);
+        uart_puts(b" for domain ");
+        uart_put_u32(domain_id as u32);
+        uart_puts(b"\r\n");
+        if !multicore::wake_core(core_id, entries[(core_id - 1) as usize]) {
+            uart_puts(b"[wake] FAILED core ");
             uart_put_u32(core_id as u32);
-            uart_puts(b" for domain ");
-            uart_put_u32(domain_id as u32);
             uart_puts(b"\r\n");
-
-            let entry = entries[(core_id - 1) as usize];
-            let ok = multicore::wake_core(core_id, entry);
-            if !ok {
-                uart_puts(b"[wake] FAILED core ");
-                uart_put_u32(core_id as u32);
-                uart_puts(b"\r\n");
-            }
+            continue;
+        }
+        let until =
+            timer::read_timer_count_64() + CORE_START_WAIT_US * timer::timer_freq() / 1_000_000;
+        while !multicore::is_core_started(core_id) && timer::read_timer_count_64() < until {
+            core::hint::spin_loop();
         }
     }
 }
@@ -2250,7 +1220,7 @@ fn maybe_emit_soc_temp(core_id: usize) {
         }
     };
     let dl0_us = to_us(exception::NEXT_DEADLINE_TICKS[0].load(Ordering::Relaxed) as u64);
-    let dl0_max_us = DL0_MAX_US.swap(0, Ordering::Relaxed);
+    let dl0_max_us = domains::take_domain0_max_deadline_us();
     // worst_us = the pacer floor's input (decaying peak-hold step time); ovr =
     // per-domain budget overruns. Together they show whether the domain stays
     // inside budget and whether the floor rises on load and decays on cool-down.
@@ -2363,9 +1333,7 @@ fn bcm_pic_barrier() {
     unsafe { core::arch::asm!("dsb sy", "isb") };
 }
 
-// Step guard: software elapsed-time check
-static mut BCM_ARM_TIME: u64 = 0;
-static mut BCM_DEADLINE_TICKS: u64 = 0;
+// Step guard: a software elapsed-time check, each core against its own window.
 
 /// The generic-timer counter the board runs on (`TIMER_COUNTER`).
 #[inline(always)]
@@ -2385,12 +1353,7 @@ fn bcm_step_guard_arm(deadline_us: u32) {
     step_guard::set_armed(true);
     let freq = bcm_counter_freq();
     let ticks = (deadline_us as u64 * freq) / 1_000_000;
-    // SAFETY: per-core step-guard state; written by the same core that
-    // armed it. Read back in `bcm_step_guard_post_check` on the same core.
-    unsafe {
-        BCM_ARM_TIME = bcm_read_counter();
-        BCM_DEADLINE_TICKS = ticks;
-    }
+    step_guard::set_window(bcm_read_counter(), ticks);
 }
 
 fn bcm_step_guard_disarm() {
@@ -2402,11 +1365,8 @@ fn bcm_step_guard_post_check() {
     if !step_guard::is_armed() {
         return;
     }
-    let now = bcm_read_counter();
-    // SAFETY: per-core step-guard read paired with the arming write above.
-    let elapsed = now.wrapping_sub(unsafe { BCM_ARM_TIME });
-    // SAFETY: as above.
-    if elapsed >= unsafe { BCM_DEADLINE_TICKS } {
+    let (start, deadline) = step_guard::window();
+    if bcm_read_counter().wrapping_sub(start) >= deadline {
         step_guard::set_timed_out();
     }
     step_guard::set_armed(false);
@@ -3053,18 +2013,6 @@ fn bcm_protection_unmap_page(module_idx: usize, vaddr: usize) {
     isolation::unmap_4k_page(module_idx, vaddr as u64);
 }
 
-/// Park online secondaries for a structural mutation (HalOps seam): no-op
-/// before SMP is online; otherwise request + wait for every active peer.
-fn bcm_smp_quiesce_peers() -> bool {
-    if multicore::smp_online() {
-        let expected = multicore::non_primary_active_count();
-        multicore::request_quiesce();
-        multicore::wait_parked(expected);
-        return true;
-    }
-    false
-}
-
 // ── VideoCore property mailbox: the TRANSPORT half ──────────────────────
 //
 // The MESSAGE half — which tag, how the value region is sized, which
@@ -3486,9 +2434,9 @@ static BCM2712_HAL_OPS: HalOps = HalOps {
     core_id: || current_core_id() as usize,
     irq_bind,
     sleep_until: bcm_sleep_until,
-    smp_quiesce_peers: bcm_smp_quiesce_peers,
-    smp_release_peers: multicore::release_quiesce,
-    smp_max_domains: || multicore::MAX_DOMAINS,
+    smp_quiesce_peers: domains::quiesce_peers,
+    smp_release_peers: domains::release_quiesce,
+    smp_max_domains: || scheduler::MAX_DOMAINS,
     protection_set_enabled: bcm_protection_set_enabled,
     protection_reset: isolation::reset_isolation,
     protection_register_module: bcm_protection_register_module,

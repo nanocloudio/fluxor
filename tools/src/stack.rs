@@ -812,6 +812,15 @@ pub fn resolve_binding(name: &str, project_root: &Path) -> std::result::Result<S
         .ok_or_else(|| unbound(name, project_root))
 }
 
+/// The stack `project_root` binds `name` to, read as an include of
+/// `stack: "@<name>"` would read it: the project's own stack, else the
+/// one `fluxor.lock` pins. A caller that composes a graph around a bound
+/// stack reads its declared params and exports here first.
+pub fn load_bound(name: &str, ctx: &IncludeContext<'_>) -> std::result::Result<Stack, String> {
+    let stack = resolve_binding(name, ctx.project_root)?;
+    load(&stack, Some(name), ctx)
+}
+
 /// An unbound name's refusal: the line to add, and where.
 pub fn unbound(name: &str, project_root: &Path) -> String {
     format!(

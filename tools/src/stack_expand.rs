@@ -329,11 +329,20 @@ struct StackModule {
 /// its `params:` checked, its `include:` stacks expanded — a local stack
 /// path, and a `file` param value, relative to the graph's own directory, a
 /// stack name through `project_root` — and its placeholders rendered with
-/// the values this command was given. Runs before every other pass,
+/// the values this command was given, then its `${asset:<name>}`
+/// placeholders resolved for its target family. Runs before every other pass,
 /// platform stacks and placement included, so each sees an ordinary graph.
 pub fn load_graph(config_path: &std::path::Path, project_root: &std::path::Path) -> Result<Value> {
-    fluxor_tools::stack::load_graph(config_path, project_root)
-        .map_err(|e| Error::Config(format!("{}: {e}", config_path.display())))
+    let mut config = fluxor_tools::stack::load_graph(config_path, project_root)
+        .map_err(|e| Error::Config(format!("{}: {e}", config_path.display())))?;
+    // `${asset:<name>}` resolves by the graph's target family once its
+    // params are rendered (an asset's `path:` may name one). Resolving
+    // names the file a build step would write; it never runs one.
+    if crate::graph_assets::names_an_asset(&config) {
+        let family = crate::resolve_target(&config, None)?.family;
+        crate::graph_assets::resolve_placeholders(&mut config, config_path, &family, project_root)?;
+    }
+    Ok(config)
 }
 
 /// Expand all `platform:` stacks into concrete modules, wiring, and services.

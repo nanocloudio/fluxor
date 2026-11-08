@@ -82,7 +82,7 @@ Each silicon target has its own HAL implementation under `src/platform/`:
 | RP2350 | `src/platform/rp.rs` | Cortex-M33; synchronous step loop |
 | BCM2712 | `src/platform/bcm2712.rs` | Synchronous polling (Cortex-A76, EL1) |
 | Pi 5 | `src/platform/bcm2712.rs` (board overlay) | Synchronous polling |
-| UEFI | `src/platform/uefi.rs` | Entered from the UEFI loader with `BootInfo` at EL1 or EL2 (aarch64); one execution domain on the boot core, a pass per tick |
+| UEFI | `src/platform/uefi.rs` | Entered from the UEFI loader with `BootInfo` at EL1 or EL2 (aarch64); execution domain N on the Nth core it starts, a pass per tick |
 
 The two RP families share `rp.rs` because both run on a Cortex-M core with
 the same peripheral families. The two bcm2712 boards share `bcm2712.rs`:
@@ -513,8 +513,10 @@ turns on: `kernel-vm` (page-table VM, on which EL0 isolation is built),
 host OS under it shares (`kernel-vm`, kernel tables carved from the
 machine's DRAM, the state arena's zeroed frontier, the multi-owner kernel).
 `chip-bcm2712` provides `aarch64-metal`, `smp` and `dtb`; `host-uefi`
-provides `aarch64-metal` alone, so a uefi kernel runs one execution domain;
-the RP chips provide `kernel-mpu`. A platform name appears in `src/kernel`
+provides `aarch64-metal` and `smp`; the RP chips provide `kernel-mpu`. With
+`smp`, each execution domain runs on a core of its own through the shared
+domain runtime (`kernel::exec::domains`), and an edge between domains is
+bridged by a ring the two cores pump. A platform name appears in `src/kernel`
 only for what is that platform's own: its capacity profile
 (`kernel::config`), its runtime bit (`loader::OWN_RUNTIME_BIT`), the bcm2712
 control-plane store's tables and memory-map report, and OTA RAM staging,

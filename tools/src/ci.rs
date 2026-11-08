@@ -563,7 +563,20 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
         } else {
             run_step(unit_label, verbose, || {
                 let argv: Vec<&str> = args.clone();
-                cargo_test_phase(&dir, &argv)
+                // A tree whose inline tests are forbidden keeps every test
+                // under `tests/`; when the integration sweep runs that same
+                // tree, zero lib/bin tests here is the rule kept, not a gap.
+                let swept = cargo_integration_sites(project_root)
+                    .iter()
+                    .any(|(_, d, a)| d == &dir && a.contains(&"--tests"));
+                let forbidden = if swept {
+                    hygiene::Config::load(project_root)
+                        .map(|c| c.forbid_inline_tests)
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                cargo_test_phase(&dir, &argv, project_root, &forbidden)
             })
         });
     }
@@ -3046,14 +3059,39 @@ fn cargo_test_in(dir: &Path, args: &[&str]) -> std::result::Result<(), String> {
     ))
 }
 
-fn cargo_test_phase(dir: &Path, args: &[&str]) -> std::result::Result<(), String> {
+/// `forbidden` is the `[ci.hygiene] forbid_inline_tests` tiers (relative to
+/// `project_root`) when the integration sweep runs this same tree, else
+/// empty: a tree whose every lib and bin source lies under them can hold no
+/// lib/bin test, so zero executed is expected there.
+fn cargo_test_phase(
+    dir: &Path,
+    args: &[&str],
+    project_root: &Path,
+    forbidden: &[String],
+) -> std::result::Result<(), String> {
     cargo_test_in(dir, args)?;
     let executed = libtest_case_count(dir, args);
     if executed > 0 {
         return Ok(());
     }
-    let integration = integration_test_targets(dir);
+    let targets = cargo_targets(dir);
+    let integration: Vec<String> = targets
+        .iter()
+        .filter(|t| t.kinds.iter().any(|k| k == "test"))
+        .map(|t| t.name.clone())
+        .collect();
     if integration.is_empty() {
+        return Ok(());
+    }
+    let sources: Vec<&Path> = targets
+        .iter()
+        .filter(|t| t.is_lib_or_bin())
+        .map(|t| t.src_path.as_path())
+        .collect();
+    let root = project_root
+        .canonicalize()
+        .unwrap_or_else(|_| project_root.to_path_buf());
+    if inline_tests_forbidden_for(&root, &sources, forbidden) {
         return Ok(());
     }
     Err(format!(
@@ -3078,8 +3116,26 @@ fn libtest_case_count(dir: &Path, args: &[&str]) -> usize {
         .count()
 }
 
-/// Names of `tests/**` integration targets in this cargo tree.
-fn integration_test_targets(dir: &Path) -> Vec<String> {
+/// One target `cargo metadata` lists for this cargo tree.
+struct CargoTarget {
+    name: String,
+    kinds: Vec<String>,
+    src_path: PathBuf,
+}
+
+impl CargoTarget {
+    /// A target `--lib --bins` selects: none of the test, bench, example
+    /// or build-script kinds.
+    fn is_lib_or_bin(&self) -> bool {
+        !self
+            .kinds
+            .iter()
+            .any(|k| matches!(k.as_str(), "test" | "bench" | "example" | "custom-build"))
+    }
+}
+
+/// Every target of this cargo tree's own packages.
+fn cargo_targets(dir: &Path) -> Vec<CargoTarget> {
     let output = Command::new("cargo")
         .arg("metadata")
         .args(["--format-version", "1", "--no-deps"])
@@ -3091,7 +3147,7 @@ fn integration_test_targets(dir: &Path) -> Vec<String> {
     let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&out.stdout) else {
         return Vec::new();
     };
-    let mut names = Vec::new();
+    let mut targets = Vec::new();
     for pkg in parsed
         .get("packages")
         .and_then(|v| v.as_array())
@@ -3104,18 +3160,48 @@ fn integration_test_targets(dir: &Path) -> Vec<String> {
             .map(Vec::as_slice)
             .unwrap_or_default()
         {
-            let is_test = target
+            let (Some(name), Some(src)) = (
+                target.get("name").and_then(|v| v.as_str()),
+                target.get("src_path").and_then(|v| v.as_str()),
+            ) else {
+                continue;
+            };
+            let kinds = target
                 .get("kind")
                 .and_then(|v| v.as_array())
-                .is_some_and(|k| k.iter().any(|v| v.as_str() == Some("test")));
-            if is_test {
-                if let Some(n) = target.get("name").and_then(|v| v.as_str()) {
-                    names.push(n.to_string());
-                }
-            }
+                .map(|k| {
+                    k.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            targets.push(CargoTarget {
+                name: name.to_string(),
+                kinds,
+                src_path: PathBuf::from(src),
+            });
         }
     }
-    names
+    targets
+}
+
+/// Does every one of `sources` (lib and bin crate roots) lie under a tier
+/// whose inline tests `forbidden` forbids? Such a tree can hold no lib/bin
+/// test at all. No sources, or none forbidden, is `false`.
+fn inline_tests_forbidden_for(
+    project_root: &Path,
+    sources: &[&Path],
+    forbidden: &[String],
+) -> bool {
+    !sources.is_empty()
+        && !forbidden.is_empty()
+        && sources.iter().all(|src| {
+            src.strip_prefix(project_root).is_ok_and(|rel| {
+                forbidden
+                    .iter()
+                    .any(|tier| rel.starts_with(tier.trim_end_matches('/')))
+            })
+        })
 }
 
 /// Format the summary block printed at end-of-run.
@@ -3188,9 +3274,10 @@ fn preview(items: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_staleness, cli_dir_for, host_binary_build_args, live_staleness_scope,
-        load_setup_scripts, path_with_first, release_cli_dir, run, run_setup_scripts, shim_dir,
-        with_running_cli, PhaseStatus, RunningCli, SkipSet, HARNESS_TARGET,
+        classify_staleness, cli_dir_for, host_binary_build_args, inline_tests_forbidden_for,
+        live_staleness_scope, load_setup_scripts, path_with_first, release_cli_dir, run,
+        run_setup_scripts, shim_dir, with_running_cli, PhaseStatus, RunningCli, SkipSet,
+        HARNESS_TARGET,
     };
     use crate::store_sync::StalenessScope;
 
@@ -3607,5 +3694,51 @@ mod tests {
         assert!(args.contains(&"--release"));
         assert!(args.windows(2).any(|w| w == ["--target", HARNESS_TARGET]));
         assert!(args.windows(2).any(|w| w == ["--bin", "fluxor-linux"]));
+    }
+
+    /// A tree whose every lib and bin root lies under a tier that forbids
+    /// inline tests can have no lib/bin test, so the unit run's zero is
+    /// expected there; a root outside those tiers, or no forbidden tier,
+    /// keeps the zero a finding.
+    #[test]
+    fn zero_unit_tests_are_expected_only_where_inline_tests_are_forbidden() {
+        let root = std::path::Path::new("/w/p");
+        let lib = root.join("src/lib.rs");
+        let bin = root.join("src/bin/tool.rs");
+        let module = root.join("modules/app/m/mod.rs");
+        let forbid = |tiers: &[&str]| tiers.iter().map(|t| (*t).to_string()).collect::<Vec<_>>();
+        assert!(inline_tests_forbidden_for(
+            root,
+            &[&lib, &bin, &module],
+            &forbid(&["modules", "src"])
+        ));
+        assert!(inline_tests_forbidden_for(
+            root,
+            &[&lib],
+            &forbid(&["src/"])
+        ));
+        // `src` is not forbidden: its lib could hold tests and ran none.
+        assert!(!inline_tests_forbidden_for(
+            root,
+            &[&lib, &module],
+            &forbid(&["modules"])
+        ));
+        // Not swept (no tiers passed), or nothing to judge.
+        assert!(!inline_tests_forbidden_for(root, &[&lib], &[]));
+        assert!(!inline_tests_forbidden_for(root, &[], &forbid(&["src"])));
+        // A prefix is a path component, not a string prefix.
+        let srcx = root.join("srcx/lib.rs");
+        assert!(!inline_tests_forbidden_for(
+            root,
+            &[&srcx],
+            &forbid(&["src"])
+        ));
+        // A root outside the project is never covered.
+        let other = std::path::Path::new("/elsewhere/src/lib.rs");
+        assert!(!inline_tests_forbidden_for(
+            root,
+            &[other],
+            &forbid(&["src"])
+        ));
     }
 }

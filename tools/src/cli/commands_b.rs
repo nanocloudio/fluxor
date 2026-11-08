@@ -23,10 +23,11 @@ fn cmd_validate(
         );
         return Ok(());
     }
-    let config: serde_json::Value =
+    let mut config =
         stack_expand::load_graph(config_path, &crate::project::root_for_config(config_path))?;
-
-    let mut config = config;
+    // The `assets:` declarations are held to their rules here as at a build,
+    // without building any.
+    crate::graph_assets::parse(&config, config_path)?;
     let target_desc = resolve_target(&config, target_override)?;
     // Resolve from the CONFIG's location, not the cwd: the rig and
     // cross-repo builds invoke this from another project's root, and a
@@ -1447,16 +1448,16 @@ fn build_one_from(
     module_root: Option<&std::path::Path>,
     verbose: bool,
 ) -> Result<BuildResult> {
-    // Load and parse config
-    let config: serde_json::Value =
+    let mut config =
         stack_expand::load_graph(yaml_path, &crate::project::root_for_config(yaml_path))?;
-
-    let mut config = config;
     let target_desc = resolve_target(&config, None)?;
     // Anchor to the config file's own location so a build/run works from any
     // cwd (a subdirectory, or outside the tree with an absolute config path),
     // while still honoring FLUXOR_PROJECT_ROOT.
     let project_root = crate::project::root_for_config(yaml_path);
+    // Assets the graph builds through a bound stack are built first, for
+    // every target: a linux graph reads the file, a wasm bundle bakes it.
+    crate::graph_assets::build_all(&config, yaml_path, verbose)?;
     stack_expand::expand_platform_stacks(&mut config, &target_desc, &project_root)?;
     let family = target_desc.family.clone();
     // The target `fluxor modules build --target` takes to fill this shelf:
@@ -1698,9 +1699,10 @@ fn build_one_from(
 
             // Asset bank: bake graph-declared assets into the wasm via
             // a `fluxor.assets` custom section. Off when no `assets:`
-            // block is present. Resolves paths relative to the graph
-            // YAML's directory so demos can use `../../assets/foo.png`.
-            let assets = extract_asset_pairs(&config, yaml_path)?;
+            // block is present. Paths resolve relative to the graph
+            // YAML's directory so demos can use `../../assets/foo.png`;
+            // a built asset is the file its build step wrote above.
+            let assets = crate::graph_assets::files(&config, yaml_path, &project_root)?;
             let asset_count = assets.len();
             let entries = asset_bank::load_assets(&assets)?;
             let asset_bytes: usize = entries.iter().map(|e| e.bytes.len()).sum();
@@ -1731,76 +1733,6 @@ fn build_one_from(
         family,
         board_id,
     })
-}
-
-/// Pull `assets:` out of a graph YAML and return resolved `(name, path)`
-/// pairs the asset-bank builder can consume. Two shapes are accepted:
-///
-/// 1. Bare string — `assets: [examples/test_harness/assets/spiral.png, ...]`.
-///    The asset's logical name is the basename. Paths resolve
-///    relative to the graph YAML's directory.
-/// 2. Per-entry map — `assets: [{ path: ..., name: spiral.png }, ...]`.
-///    Explicit name override is useful when two folders ship files
-///    with the same basename.
-///
-/// Returns an empty vec when the YAML has no `assets:` field. Errors
-/// on schema mismatch or a relative-path traversal trying to escape
-/// the workspace via excessive `..` segments.
-fn extract_asset_pairs(
-    config: &serde_json::Value,
-    yaml_path: &std::path::Path,
-) -> Result<Vec<(String, PathBuf)>> {
-    let Some(arr) = config.get("assets").and_then(|v| v.as_array()) else {
-        return Ok(Vec::new());
-    };
-
-    let base_dir = yaml_path
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("."));
-
-    let mut out = Vec::with_capacity(arr.len());
-    for (i, entry) in arr.iter().enumerate() {
-        let (raw_path, override_name) = match entry {
-            serde_json::Value::String(s) => (s.clone(), None),
-            serde_json::Value::Object(m) => {
-                let p = m
-                    .get("path")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        Error::Config(format!(
-                            "graph `{}`: assets[{}] missing `path:` field",
-                            yaml_path.display(),
-                            i
-                        ))
-                    })?
-                    .to_string();
-                let n = m
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                (p, n)
-            }
-            _ => {
-                return Err(Error::Config(format!(
-                    "graph `{}`: assets[{}] must be a string or a map with `path:`",
-                    yaml_path.display(),
-                    i
-                )));
-            }
-        };
-
-        let resolved = base_dir.join(&raw_path);
-        let name = override_name.unwrap_or_else(|| {
-            std::path::Path::new(&raw_path)
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or(&raw_path)
-                .to_string()
-        });
-        out.push((name, resolved));
-    }
-    Ok(out)
 }
 
 // ── Polymorphic `fluxor inspect` ─────────────────────────────────────

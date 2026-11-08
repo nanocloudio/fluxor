@@ -120,7 +120,7 @@ mod plan {
         /// Every edge whose ends step in different domains, or whose class
         /// is `cross_core`, is split into a producer-side and a
         /// consumer-side channel joined by a pump, and the consumer side is
-        /// a default ring of its own (bcm2712's `bridge_cross_domain_edges`).
+        /// a default ring of its own (`kernel::exec::domains::cross::bridge_edges`).
         pub split_cross_domain: bool,
     }
 

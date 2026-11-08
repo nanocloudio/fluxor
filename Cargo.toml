@@ -262,7 +262,7 @@ trust-system = ["rustls", "rustls-pki-types", "rustls-pemfile"]
 host-wasm = ["portable-atomic", "pq-vault", "rsa-vault"]
 # UEFI-booted bare metal (aarch64): the kernel entry the UEFI loader jumps
 # to, with the machine as the loader read it from the firmware.
-host-uefi = ["aarch64-metal"]
+host-uefi = ["aarch64-metal", "smp"]
 
 # Optional `linux_display` backend: open a real window via winit and
 # blit each RGB565 frame through softbuffer. Off by default; file +

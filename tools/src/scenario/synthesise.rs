@@ -584,6 +584,11 @@ pub fn component_config(
         ))
     })?;
 
+    // The config is written into the scenario's work directory; its assets
+    // keep naming the files beside the graph it was read from.
+    if let Some(dir) = resolved_graph.parent() {
+        crate::graph_assets::anchor(&mut config, dir);
+    }
     if let Some(target) = &comp.runtime_override {
         config["target"] = serde_json::Value::String(target.clone());
         // The linux stack provides `linux_net` where a silicon graph wires

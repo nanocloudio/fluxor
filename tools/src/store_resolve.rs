@@ -557,6 +557,32 @@ pub fn references(project_root: &Path) -> Result<References> {
                 refs.stacks.insert(name.to_string());
             }
         }
+        // A build-time asset builds through a bound name, held to the same
+        // rule: the binding, pinned below with every other, must be there.
+        let assets = doc
+            .get("assets")
+            .and_then(serde_yaml::Value::as_sequence)
+            .map(|a| a.as_slice())
+            .unwrap_or_default();
+        for asset in assets {
+            let Some(build) = asset.get("build").and_then(serde_yaml::Value::as_str) else {
+                continue;
+            };
+            let name = asset
+                .get("name")
+                .and_then(serde_yaml::Value::as_str)
+                .unwrap_or("?");
+            let why = match crate::stack::bound_name(build) {
+                Some(bound) => crate::stack::resolve_binding(bound, project_root).err(),
+                None => Some("an asset builds through a bound name, `build: \"@<name>\"`".into()),
+            };
+            if let Some(why) = why {
+                return Err(Error::Config(format!(
+                    "{}: asset '{name}' (`build: {build}`): {why}",
+                    path.display()
+                )));
+            }
+        }
     }
     for (bound, stack) in bindings {
         if !crate::packaging::stack_path(project_root, &stack).is_file() {
@@ -1514,6 +1540,57 @@ mod tests {
         cmd_update(&root, None).unwrap();
         let lock = read_store_lock(&root).unwrap().unwrap();
         assert!(lock.artifacts.is_empty(), "{:?}", lock.artifacts);
+    }
+
+    /// A name used only by a build-time asset is held to the rule an
+    /// include's is: unbound, the update is refused naming the graph; bound,
+    /// it is pinned like any binding.
+    #[test]
+    fn a_name_only_an_asset_builds_through_is_bound_and_pinned() {
+        let _env = crate::oci_store::test_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let store_dir = dir.path().join("store");
+        let no_workspace = dir.path().join("no-workspace.toml");
+        let _scope = crate::oci_store::EnvScope::set(&[
+            ("FLUXOR_STORE", &store_dir),
+            ("FLUXOR_WORKSPACE", &no_workspace),
+        ]);
+        let store = OciStore::open(&store_dir).unwrap();
+        publish_stack(&store, "docs", "doc_pack");
+        let root = dir.path().join("consumer");
+        std::fs::create_dir_all(&root).unwrap();
+        consumer(&root, &[], None);
+        std::fs::write(
+            root.join("examples/g.yaml"),
+            "target: linux\nassets:\n  - { name: page.doc, build: \"@packer\", from: page.html }\n\
+             modules: []\n",
+        )
+        .unwrap();
+        git(&root, &["add", "-A"]);
+
+        let e = cmd_update(&root, None).unwrap_err().to_string();
+        assert!(
+            e.contains(
+                "examples/g.yaml: asset 'page.doc' (`build: @packer`): `packer` is not bound"
+            ),
+            "{e}"
+        );
+        assert!(read_store_lock(&root).unwrap().is_none(), "nothing written");
+
+        bind(&root, "\n[uses.stacks]\npacker = \"doc_pack\"\n");
+        assert_eq!(
+            references(&root).unwrap().bound,
+            [("packer".to_string(), "doc_pack".to_string())].into()
+        );
+        cmd_update(&root, None).unwrap();
+        let lock = read_store_lock(&root).unwrap().unwrap();
+        assert!(
+            lock.artifacts
+                .iter()
+                .any(|a| a.kind == "stack" && a.name == "doc_pack"),
+            "{:?}",
+            lock.artifacts
+        );
     }
 
     /// A binding naming a stack no index publishes, or more than one, is

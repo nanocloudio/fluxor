@@ -57,7 +57,7 @@ pub fn buffer_arena_bytes(target: &TargetDescriptor) -> Option<u64> {
 pub fn platform(target: &TargetDescriptor) -> RingPlatform {
     RingPlatform {
         buffer_groups: rings::buffer_groups(crate::capacity::kernel_max_edges(target.runtime())),
-        split_cross_domain: target.runtime() == "bcm2712",
+        split_cross_domain: crate::capacity::kernel_bridges_domains(target.runtime()),
     }
 }
 

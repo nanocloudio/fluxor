@@ -40,6 +40,7 @@ mod crypto;
 mod error;
 mod gpu_contract;
 mod gpu_pack;
+mod graph_assets;
 mod hash;
 mod hygiene;
 mod identity_key;

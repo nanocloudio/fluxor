@@ -1,5 +1,5 @@
 version = "1.0.0"
-hardware_targets = ["bcm2712"]
+hardware_targets = ["bcm2712", "uefi"]
 
 # Emits a 12-byte timestamped probe every `emit_every` (default 997) of
 # its own steps on `probe_out`. Paired with wake_snk to measure

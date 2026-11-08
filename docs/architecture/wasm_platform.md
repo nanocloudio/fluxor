@@ -143,7 +143,9 @@ It refuses to write a bundle that overflows a placeholder's capacity
 and reports the required size, so the kernel can be rebuilt with a
 larger placeholder. Graph-declared assets are appended as a
 `fluxor.assets` custom section and served by the host through the
-`asset://` scheme.
+`asset://` scheme; a module param names one as `${asset:<name>}`, which a
+wasm graph renders as `asset://<name>`. An asset may be built at build time
+by a bound stack ([stacks.md](stacks.md#build-time-assets)).
 
 At boot the kernel reads its own blob statics from linear memory
 (`used_len` via a volatile read, since the rewrite is invisible to the

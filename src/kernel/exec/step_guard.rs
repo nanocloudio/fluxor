@@ -25,7 +25,7 @@
 use crate::kernel::exec::scheduler::{ModuleId, NO_MODULE};
 use crate::kernel::sys::hal;
 use core::cell::UnsafeCell;
-use portable_atomic::{AtomicBool, AtomicI32, AtomicU16, Ordering};
+use portable_atomic::{AtomicBool, AtomicI32, AtomicU16, AtomicU64, Ordering};
 
 // ============================================================================
 // Fault state machine
@@ -407,6 +407,32 @@ pub fn set_armed(armed: bool) {
 /// Check if armed on the current core. Called by platform disarm/post-check.
 pub fn is_armed() -> bool {
     GUARD_ARMED[cur_core()].load(Ordering::Acquire)
+}
+
+/// Per-core step window for a platform that checks the deadline after the
+/// step against a free-running counter: where the counter stood when the step
+/// was armed, and the deadline in counter ticks. Per core, because each core
+/// arms and checks its own steps.
+static WINDOW_START: [AtomicU64; MAX_STEP_GUARD_CORES] =
+    [const { AtomicU64::new(0) }; MAX_STEP_GUARD_CORES];
+static WINDOW_TICKS: [AtomicU64; MAX_STEP_GUARD_CORES] =
+    [const { AtomicU64::new(0) }; MAX_STEP_GUARD_CORES];
+
+/// Record this core's step window. Called by platform arm.
+pub fn set_window(start: u64, deadline_ticks: u64) {
+    let c = cur_core();
+    WINDOW_START[c].store(start, Ordering::Relaxed);
+    WINDOW_TICKS[c].store(deadline_ticks, Ordering::Relaxed);
+}
+
+/// This core's step window, `(start, deadline_ticks)`. Called by platform
+/// post-check, on the core that armed it.
+pub fn window() -> (u64, u64) {
+    let c = cur_core();
+    (
+        WINDOW_START[c].load(Ordering::Relaxed),
+        WINDOW_TICKS[c].load(Ordering::Relaxed),
+    )
 }
 
 // ============================================================================

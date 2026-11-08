@@ -308,8 +308,98 @@ stack it resolved to. A bound name means "a stack whose params and exports
 fit this include": the composer holds the stack to the include as it holds
 any stack, so a provider may declare more params, each with a default, and
 more exports. Whoever writes the include documents the name; the CLI
-documents the one it uses, `@file_server`
-([wasm_browser_host.md](wasm_browser_host.md#serving)).
+documents the interfaces it composes against: `@file_server`
+([wasm_browser_host.md](wasm_browser_host.md#serving)) and the build step
+([Build-time assets](#build-time-assets)).
+
+### Build-time assets
+
+A graph declares the files it carries under `assets:`. An entry is a path,
+relative to the graph's directory, or a map:
+
+```yaml
+assets:
+  - art/logo.png                          # named by its basename
+  - { path: art/font.bin, name: font }    # named explicitly
+  - name: album_browser.doc               # built at build time
+    build: "@document_compiler"
+    from: ../documents/album_browser.html
+```
+
+A map takes `name` and either `path`, or `build` and `from`; any other key
+is refused, as is a name that is not one path segment or that two entries
+share. `build` is a bound name (`@<name>`, bound under `[uses.stacks]` like
+any include's), and `from` is a file or a directory, relative to the graph.
+`fluxor update` pins the binding as it pins every other, and refuses a
+tracked graph whose asset names an unbound name, naming the file.
+
+A module param names an asset with `${asset:<name>}`, as a whole value or
+inside text:
+
+```yaml
+modules:
+  - name: viewer
+    document: ${asset:album_browser.doc}
+```
+
+It resolves by the graph's target family, on the parsed graph, after
+`${param:}` placeholders are rendered:
+
+| Family | `${asset:<name>}` is |
+|---|---|
+| `wasm` | `asset://<name>`, served from the bundle's `fluxor.assets` section through the FS contract |
+| `linux` | the absolute path of the asset's file: a path entry's file, or a built asset's `target/assets/<name>` under the graph's project |
+| any other | refused: a bare-metal image carries no asset area a module could open an asset from by name |
+
+A name `assets:` does not declare is refused, naming the graph. Resolving a placeholder never builds anything, so a check
+(`fluxor build --check`, `fluxor ci`, `fluxor run --validate-only`) renders
+the path a build would write without running a build step.
+
+**Building.** `fluxor build`, and with it `fluxor run` and a scenario's
+component builds, builds every `build:` entry first, for any target. For
+each, it composes a Linux graph in the graph's own project, under
+`target/assets/.build/<name>/`:
+
+```yaml
+target: linux
+platform: { cli: {} }
+include:
+  - stack: "@document_compiler"
+    as: build
+    params: { input: /abs/path/of/from }
+wiring:
+  - { from: build.output, to: cli_out.bytes_in }
+  - { from: build.diagnostics, to: cli_out.err_in }   # if the stack exports it
+  - { from: build.exit, to: cli_out.exit_in }         # if the stack exports it
+```
+
+It builds that graph and runs it on the project's host runtime (the
+`fluxor-linux` `fluxor sync` installs under
+`target/<host triple>/release/`), keeping stdout as the asset's file,
+`target/assets/<name>`. From there a built asset is a file like any
+other: a wasm bundle bakes it, a Linux module reads it by path. The build
+fails, naming the graph, the asset, the bound name and the stack, when the
+runtime exits non-zero or writes nothing; it prints the step's diagnostics,
+its stderr without the runtime's own log records (`fluxor build -v` shows
+the whole of it), and removes any earlier output so a stale file cannot
+stand in. Every build runs every step again: there is no cache.
+
+**The build-step interface.** A stack fits a `build:` name when it meets
+this interface:
+
+| Item | Kind | Meaning |
+|---|---|---|
+| `input` | param, `string` | absolute path of the entry's `from`, a file or a directory |
+| `output` | export, `OctetStream`, required | the asset's bytes, to end of stream |
+| `diagnostics` | export, `OctetStream`, optional | the step's errors, one line each (`file:line:col: error: …` reads best) |
+| `exit` | export, `OctetStream`, optional | one `i32` little-endian exit code; non-zero fails the build |
+
+As for any bound name, a provider may declare more params, each with a
+default, and more exports. A provider is usually the project's own stack
+(`packaging/stack/<name>.yaml`, resolved unpinned), or one it pins from
+another project. Typical providers: a document compiler that turns an
+application's HTML and CSS into a document image, a package packer, a
+font-atlas generator.
 
 ## Expansion
 

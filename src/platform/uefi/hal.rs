@@ -53,18 +53,14 @@ fn now_millis() -> u64 {
     now_micros() / 1000
 }
 
-static mut STEP_ARMED_AT: u64 = 0;
-static mut STEP_DEADLINE_TICKS: u64 = 0;
-
 fn step_guard_arm(deadline_us: u32) {
     use fluxor::kernel::exec::step_guard;
     step_guard::clear_timed_out();
     step_guard::set_armed(true);
-    // SAFETY: this runtime steps on one core; read back on the same core.
-    unsafe {
-        STEP_DEADLINE_TICKS = u64::from(deadline_us) * timer::timer_freq() / 1_000_000;
-        STEP_ARMED_AT = timer::read_timer_count_64();
-    }
+    step_guard::set_window(
+        timer::read_timer_count_64(),
+        u64::from(deadline_us) * timer::timer_freq() / 1_000_000,
+    );
 }
 
 fn step_guard_post_check() {
@@ -72,8 +68,7 @@ fn step_guard_post_check() {
     if !step_guard::is_armed() {
         return;
     }
-    // SAFETY: as in `step_guard_arm`.
-    let (at, deadline) = unsafe { (STEP_ARMED_AT, STEP_DEADLINE_TICKS) };
+    let (at, deadline) = step_guard::window();
     let took = timer::read_timer_count_64().wrapping_sub(at);
     if took >= deadline {
         step_guard::set_timed_out();
@@ -276,9 +271,9 @@ pub static HAL_OPS: HalOps = HalOps {
     core_id: || current_core_id() as usize,
     irq_bind: gic::irq_bind,
     sleep_until,
-    smp_quiesce_peers: || true,
-    smp_release_peers: || {},
-    smp_max_domains: || 1,
+    smp_quiesce_peers: fluxor::kernel::exec::domains::quiesce_peers,
+    smp_release_peers: fluxor::kernel::exec::domains::release_quiesce,
+    smp_max_domains: || fluxor::kernel::exec::scheduler::MAX_DOMAINS,
     protection_set_enabled: |_| {},
     protection_reset: || {},
     protection_register_module: |_, _, _, _, _, _, _| false,

@@ -31,6 +31,7 @@ use fluxor::boot::{
     BootInfo, MemKind, MemRegion, BOOT_INFO_MAGIC, CONSOLE_16550, CONSOLE_16550_GAS, CONSOLE_PL011,
     CONSOLE_SBSA,
 };
+use fluxor::kernel::exec::domains;
 
 #[path = "uefi/acpi.rs"]
 mod acpi;
@@ -1023,7 +1024,7 @@ extern "C" fn uefi_main(info: *const BootInfo) -> ! {
     con.puts("\n");
     report_stages(&con, reached.as_str(), &clock);
 
-    run(&con, reached.as_str(), &params, &clock)
+    run(con, reached, params, clock)
 }
 
 /// The stages reached, for the summary line.
@@ -1085,52 +1086,23 @@ fn start_graph() -> Result<usize, &'static str> {
     unsafe { timer::timer_set(period) };
 
     let (list, count) = scheduler::prepare_graph().map_err(|_| "prepare_failed")?;
-    let guard = fluxor::kernel::sys::guard::KernelGuard::acquire();
-    if fluxor::kernel::exec::bare_metal::apply_owner_plan().is_err() {
-        return Err("owner_plan_invalid");
+    if let Err(why) = domains::cross::bridge_edges() {
+        log::error!("[graph] {why}");
+        return Err("bridge_failed");
     }
-    // SAFETY: the scheduler's thread, during instantiation.
-    let (loader_ref, sched) = unsafe { (scheduler::static_loader(), scheduler::sched_mut()) };
-    let mut loaded = 0usize;
-    for (index, slot) in list.iter().enumerate().take(count) {
-        let Some(entry) = slot else { continue };
-        scheduler::set_current_module(index);
-        match scheduler::instantiate_one_module(
-            loader_ref,
-            entry,
-            index,
-            index,
-            &mut sched.edges,
-            &mut sched.modules,
-            &mut sched.ports,
-        ) {
-            scheduler::InstantiateResult::Done => loaded += 1,
-            scheduler::InstantiateResult::Pending(mut pending) => loop {
-                // SAFETY: allocated by the call above; polled here until done.
-                match unsafe { pending.try_complete() } {
-                    Ok(Some(module)) => {
-                        scheduler::store_dynamic_module(index, module);
-                        loaded += 1;
-                        break;
-                    }
-                    Ok(None) => core::hint::spin_loop(),
-                    Err(e) => {
-                        e.log("module");
-                        return Err("module_failed");
-                    }
-                }
-            },
-            scheduler::InstantiateResult::Error(e) => {
-                log::error!("[inst] module {index} failed rc={e}");
-                return Err("module_failed");
-            }
-        }
-    }
-    scheduler::set_active_module_count(count);
-    drop(guard);
-    loader::prime_frontier();
+    let loaded = match domains::instantiate(&list, count) {
+        Ok(loaded) => loaded,
+        Err(domains::InstantiateError::OwnerPlan(_)) => return Err("owner_plan_invalid"),
+        Err(domains::InstantiateError::Modules(_)) => return Err("module_failed"),
+    };
     scheduler::finalize_instantiation_accounting();
     scheduler::admit_resident_workloads_from_config();
+    // Domain `n` runs on secondary `n`: a domain with modules and no core
+    // would hold its modules unstepped, so the graph is refused instead.
+    if let Some(d) = domains::coreless_domain(&PLATFORM) {
+        log::error!("[graph] domain {d} has modules but this machine started no core for it");
+        return Err("domain_without_core");
+    }
     Ok(loaded)
 }
 
@@ -1191,25 +1163,113 @@ impl Upkeep {
     }
 }
 
-/// The run loop: one domain on the boot core, a pass per tick. The summary keeps
-/// repeating, because a cloud console joins late.
-fn run(con: &Console, reached: &str, params: &BootParams, clock: &Clock) -> ! {
-    use fluxor::kernel::exec::scheduler;
-    let mut tick = 0u64;
-    let mut upkeep = Upkeep::new(params, clock);
-    loop {
-        // SAFETY: parks until the tick or a bound interrupt.
-        unsafe { core::arch::asm!("wfi") };
-        // SAFETY: the only core stepping the graph.
-        let sched = unsafe { scheduler::sched_mut() };
-        let _ = scheduler::step_resident_graphs_domain(&mut sched.modules, 0);
-        tick += 1;
-        scheduler::maybe_emit_alive(tick, Some(0));
-        if upkeep.poll(con, params, clock) {
-            log::info!("[boot] stages={reached} total_us={}", clock.elapsed_us());
-            report_interrupts();
+/// What the boot core's loop reports and watches between passes.
+struct Running {
+    con: Console,
+    params: BootParams,
+    clock: Clock,
+    reached: Reached,
+    upkeep: Upkeep,
+    cpu: CpuMeter,
+}
+
+/// How often the boot core reports each domain core's busy share.
+const CPU_EVERY_US: u64 = 5_000_000;
+
+/// Each active domain's busy share since the last report: the counter ticks
+/// its core spent in passes (`domains::busy_ticks`) over the ticks elapsed.
+/// What tells a saturated core from one waiting on its tick.
+struct CpuMeter {
+    at_us: u64,
+    at_ticks: u64,
+    busy: [u64; fluxor::kernel::exec::scheduler::MAX_DOMAINS],
+}
+
+impl CpuMeter {
+    fn new() -> Self {
+        CpuMeter {
+            at_us: 0,
+            at_ticks: timer::read_timer_count_64(),
+            busy: core::array::from_fn(domains::busy_ticks),
         }
     }
+
+    fn poll(&mut self, now_us: u64) {
+        if now_us < self.at_us + CPU_EVERY_US {
+            return;
+        }
+        let now = timer::read_timer_count_64();
+        let span = now.wrapping_sub(self.at_ticks).max(1);
+        let mut pct = [0u64; fluxor::kernel::exec::scheduler::MAX_DOMAINS];
+        for (d, last) in self.busy.iter_mut().enumerate() {
+            let busy = domains::busy_ticks(d);
+            pct[d] = busy.wrapping_sub(*last) * 100 / span;
+            *last = busy;
+        }
+        self.at_ticks = now;
+        self.at_us = now_us;
+        let shown = domains::domains_needed();
+        log::info!(
+            "[cpu] busy_pct={:?} span_ms={}",
+            &pct[..shown],
+            span * 1000 / timer::timer_freq().max(1)
+        );
+    }
+}
+
+static mut RUNNING: Option<Running> = None;
+
+/// What this platform does around the shared domain loop.
+static PLATFORM: domains::Platform = domains::Platform {
+    has_core: smp::online,
+    after_pass,
+    after_step,
+};
+
+/// After each pass of domain 0: the boot core's upkeep, and the summary when
+/// it is due.
+fn after_pass(domain_id: usize, _core_id: usize, _tier: domains::Tier) {
+    if domain_id != 0 {
+        return;
+    }
+    // SAFETY: set before the boot core entered domain 0's loop, which only
+    // the boot core runs.
+    let Some(running) = (unsafe { (*core::ptr::addr_of_mut!(RUNNING)).as_mut() }) else {
+        return;
+    };
+    running.cpu.poll(running.clock.elapsed_us());
+    if running
+        .upkeep
+        .poll(&running.con, &running.params, &running.clock)
+    {
+        log::info!(
+            "[boot] stages={} total_us={}",
+            running.reached.as_str(),
+            running.clock.elapsed_us()
+        );
+        report_interrupts();
+    }
+}
+
+fn after_step(_domain_id: usize) {}
+
+/// Release the graph to the other cores and run domain 0 on this one. The
+/// summary keeps repeating, because a cloud console joins late.
+fn run(con: Console, reached: Reached, params: BootParams, clock: Clock) -> ! {
+    let upkeep = Upkeep::new(&params, &clock);
+    // SAFETY: the boot core, once, before the loop that reads it.
+    unsafe {
+        RUNNING = Some(Running {
+            con,
+            params,
+            clock,
+            reached,
+            upkeep,
+            cpu: CpuMeter::new(),
+        });
+    }
+    domains::release();
+    domains::run(0, &PLATFORM)
 }
 
 /// Where the kernel stops when it has no graph to run, or a stage failed: what

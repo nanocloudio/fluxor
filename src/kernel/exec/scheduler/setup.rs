@@ -503,7 +503,7 @@ pub fn prepare_graph() -> Result<(ModuleList, usize), i32> {
     // aren't readable through the consumer's handle until the pump
     // moves them. The cross-domain binding happens where the knowledge
     // lives: the platform's cross-edge bridging binds the
-    // consumer-local channel (see bcm2712 `bridge_cross_domain_edges`),
+    // consumer-local channel (`domains::cross::bridge_edges`),
     // so the pump's delivery write into it triggers the same wake hook
     // at the first moment the consumer could actually read the bytes.
     for e in edges[..runtime_edge_count].iter() {

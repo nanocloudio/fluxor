@@ -167,8 +167,7 @@ fn collect_yaml_files(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
 /// that path before we reach here) or when `--print-features` exits
 /// non-zero (the binary is too old to expose its feature set).
 fn validate_linux_runtime_features(yaml_path: &std::path::Path) -> Result<()> {
-    let linux_bin = crate::project::root_for_config(yaml_path)
-        .join("target/aarch64-unknown-linux-gnu/release/fluxor-linux");
+    let linux_bin = crate::project::linux_runtime(&crate::project::root_for_config(yaml_path));
     if !linux_bin.exists() {
         return Ok(());
     }
@@ -543,8 +542,7 @@ fn spawn_scenario(
 
     // Anchor to the scenario's project root so `fluxor run <scenario>` finds the
     // runtime binary regardless of the caller's cwd.
-    let linux_bin = crate::project::root_for_config(scenario_path)
-        .join("target/aarch64-unknown-linux-gnu/release/fluxor-linux");
+    let linux_bin = crate::project::linux_runtime(&crate::project::root_for_config(scenario_path));
     if !linux_bin.exists() {
         return Err(Error::Config(format!(
             "fluxor-linux binary not found at {}. Run `make build` first.",
@@ -564,8 +562,7 @@ fn spawn_scenario(
                 .as_ref()
                 .ok_or_else(|| Error::Config(format!("component `{comp_name}` has no `graph:`")))?;
             let graph_abs = scenario_dir.join(graph_rel);
-            let bundle_target =
-                scenario::wasm_bundle_target_path(scenario_path, comp_name, comp)?;
+            let bundle_target = scenario::wasm_bundle_target_path(scenario_path, comp_name, comp)?;
             eprintln!(
                 "[scenario] {}: building component `{}` (wasm, {}) → {}",
                 scenario.name,
@@ -1183,8 +1180,8 @@ fn cmd_run(
             }
             // Anchor to the resolved project root so `fluxor run <config>` finds
             // the runtime binary regardless of the caller's cwd.
-            let linux_bin = crate::project::root_for_config(config_path)
-                .join("target/aarch64-unknown-linux-gnu/release/fluxor-linux");
+            let linux_bin =
+                crate::project::linux_runtime(&crate::project::root_for_config(config_path));
 
             if !linux_bin.exists() {
                 return Err(Error::Config(format!(

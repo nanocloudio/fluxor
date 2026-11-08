@@ -1,9 +1,8 @@
 version = "1.0.0"
-hardware_targets = ["bcm2712"]
+hardware_targets = ["bcm2712", "uefi"]
 
-# Period-gated consumer for the wake-on-write latency probe (RFC
-# idle_skip_wake): steps only every
-# 200 scheduler ticks (~800 ms at tick_us=4000) UNLESS event-woken. With
+# Period-gated consumer for the wake-on-write latency probe: steps only
+# every 200 scheduler ticks (~800 ms at tick_us=4000) UNLESS event-woken. With
 # `wake: true` on the inbound edge, a write latches its event-wake bit
 # and the runner steps it on the next pass (event_wake bypasses the
 # period gate) — delivery latency collapses from the period to the pass

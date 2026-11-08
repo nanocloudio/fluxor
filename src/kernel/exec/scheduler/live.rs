@@ -478,22 +478,22 @@ fn sched() -> &'static mut SchedulerState {
 //
 // ============================================================================
 //
-// bcm2712 cores step the PER-DOMAIN `domain_exec_order` (via
-// `step_domain_modules` / `..._poll`), which only the boot-only
-// `finalize_resident_graphs` populates — so a *runtime* `apply_add`/`free_owner`
-// that mutates only the flat `exec_order` stages a subgraph the domain runners
-// never step. The per-domain splice closes that: after the exec_order
-// mutation, on bcm2712, splice
-// the affected domains' `domain_exec_order` incrementally
-// (`scheduler::recompute_domain_orders`, byte-identical to a full recompute for
-// those domains) while every peer domain core is parked.
+// Domain cores (`kernel::exec::domains`, the `smp` feature) step the
+// PER-DOMAIN `domain_exec_order` (via `step_domain_modules` / `..._poll`), which
+// only the boot-only `finalize_resident_graphs` populates — so a *runtime*
+// `apply_add`/`free_owner` that mutates only the flat `exec_order` stages a
+// subgraph the domain runners never step. The per-domain splice closes that:
+// after the exec_order mutation, splice the affected domains'
+// `domain_exec_order` incrementally (`scheduler::recompute_domain_orders`,
+// byte-identical to a full recompute for those domains) while every peer domain
+// core is parked.
 //
-// Single-domain / non-bcm builds (host-linux, host-wasm, qemu-virt single-core)
-// step the flat `exec_order` directly and never read `domain_exec_order`, so the
-// splice is compiled out there and `apply_add`/`free_owner` stay byte-identical.
+// Builds without `smp` (host-linux, host-wasm, RP) step the flat `exec_order`
+// directly and never read `domain_exec_order`, so the splice is compiled out
+// there and `apply_add`/`free_owner` stay byte-identical.
 
 /// Bit `d` set ⇒ a module in the mutation touches domain `d`. Bounded by
-/// `multicore::MAX_DOMAINS` (≤ 32, so a `u32` mask is always sufficient).
+/// `scheduler::MAX_DOMAINS` (≤ 32, so a `u32` mask is always sufficient).
 #[cfg(feature = "smp")]
 #[inline]
 fn domain_bit(domain_id: u8) -> u32 {
@@ -502,8 +502,8 @@ fn domain_bit(domain_id: u8) -> u32 {
 
 /// Park every peer domain core for a live schedule mutation, returning `true`
 /// iff a quiesce was actually taken (so the caller must release it). At runtime
-/// on bcm2712 this is the `request_quiesce`/`wait_parked` park-all-secondaries
-/// pattern (`bcm2712/multicore.rs`); at boot (pre-SMP, `!smp_online`) and on
+/// on domain cores this is the `request_quiesce`/`wait_parked` park-all-secondaries
+/// pattern (`kernel::exec::domains`); before the domains are released and on
 /// single-domain hosts it is a no-op — the mutation runs single-threaded.
 ///
 /// **Invariant:** primary-core-only. `request_quiesce` is defined for domain 0;

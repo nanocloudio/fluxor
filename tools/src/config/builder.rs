@@ -131,8 +131,8 @@ fn parse_broker_addr(s: &str) -> (u32, u16) {
 const DEFAULT_STEP_DEADLINE_US: u32 = 2000;
 
 /// Maximum number of scheduling domains the kernel supports.
-/// Mirrors `src/platform/bcm2712/multicore.rs::MAX_DOMAINS = 4` and
-/// the scheduler's `MAX_DOMAINS` constant. The config writer
+/// Mirrors the scheduler's `MAX_DOMAINS` constant
+/// (`src/kernel/exec/scheduler/mod.rs`). The config writer
 /// serialises exactly 4 domain-metadata entries; the wire format
 /// has no slot for a 5th. Locked at the wire layer by
 /// `tests/harness/tests/abi_wire_surface.rs` (the kernel-side

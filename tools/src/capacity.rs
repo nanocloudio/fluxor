@@ -34,6 +34,14 @@ fn is_uefi(target: &str) -> bool {
     matches!(target, "uefi" | "qemu-uefi-arm64" | "ec2-arm64")
 }
 
+/// Targets whose kernel runs execution domains on cores of their own (its
+/// `smp` cargo feature): an edge between two domains is split into two
+/// channels joined by a ring, so it takes a second channel, its consumer side
+/// (`resource_ledger::cross_domain_edges`).
+pub fn kernel_bridges_domains(target: &str) -> bool {
+    is_bcm2712(target) || is_uefi(target)
+}
+
 /// The kernel profile a target compiles. Unknown targets get the RP profile:
 /// a graph that fits the smallest profile fits everywhere.
 pub fn kernel_profile(target: &str) -> &'static str {
@@ -370,11 +378,12 @@ pub struct GraphShape {
     /// Their edges, summed.
     pub workload_edges: u64,
     /// Base-graph edges that cross execution domains ([`crossing_count`]):
-    /// on bcm2712 each takes a second channel, its consumer side.
+    /// where the kernel bridges domains ([`kernel_bridges_domains`]) each
+    /// takes a second channel, its consumer side.
     pub crossings: u64,
 }
 
-/// Base-graph edges that cross execution domains, as the bcm2712 plan counts
+/// Base-graph edges that cross execution domains, as the kernel's plan counts
 /// them (`resource_ledger::cross_domain_edges`): an edge whose two modules sit
 /// in different domains, or whose edge class is cross-core. Each edge is
 /// `(from domain, to domain, cross_core)`; a tee or merge takes the domain of
@@ -464,13 +473,13 @@ fn figure(list: &PoolFigures, pool: &str) -> Option<u64> {
 /// `pool`'s boot plan on `target`, computed as `resource_ledger::plan`,
 /// `plan_parts_wide` and `size_kernel_tables` compute it: the structural part
 /// from `shape` (module slots, channels and owners from the graph and its
-/// resident workloads, and on bcm2712 a channel per cross-domain edge; on
-/// Linux the sandboxes from the owner table's workload slots; the state-arena
-/// free list from the module slots), plus `declared` (FXDM), plus the reserve
-/// — the envelope's entry in `entries`, never clamped (one past the pool's
-/// domain is refused), else what a static table leaves, else the profile's
-/// default clamped to what the pool's index domain leaves beside the derived
-/// part.
+/// resident workloads, and where the kernel bridges domains a channel per
+/// cross-domain edge; on Linux the sandboxes from the owner table's workload
+/// slots; the state-arena free list from the module slots), plus `declared`
+/// (FXDM), plus the reserve — the envelope's entry in `entries`, never
+/// clamped (one past the pool's domain is refused), else what a static table
+/// leaves, else the profile's default clamped to what the pool's index domain
+/// leaves beside the derived part.
 pub fn plan_pool(
     target: &str,
     pool: &str,
@@ -484,7 +493,7 @@ pub fn plan_pool(
         "module_slots" => {
             shape.modules + shape.fans + shape.workload_modules + shape.workload_edges
         }
-        "channels" if profile == "profile_bcm2712" => {
+        "channels" if kernel_bridges_domains(target) => {
             shape.edges + shape.fans + 2 * shape.workload_edges + shape.crossings
         }
         "channels" => shape.edges + shape.fans + 2 * shape.workload_edges,

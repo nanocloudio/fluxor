@@ -323,7 +323,7 @@ pub(crate) fn compute_domain_exec_orders_static(_module_count: usize) {
 /// `live_graph_mutation` harness (`domain_splice_matches_full_recompute`).
 ///
 /// Safe to call ONLY single-threaded (boot / host) or with every peer domain
-/// core parked (`multicore::request_quiesce` + `wait_parked`). Never on the hot
+/// core parked (`domains::request_quiesce` + `wait_parked`). Never on the hot
 /// path — a bounded scan invoked once per CREATE/DESTROY.
 #[cfg(feature = "multitenant")]
 pub fn recompute_domain_orders(affected_mask: u32) {

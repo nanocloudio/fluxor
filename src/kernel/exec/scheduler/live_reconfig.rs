@@ -25,6 +25,16 @@ pub fn prepare_in_progress() -> bool {
     unsafe { SCHED.prepare_in_progress }
 }
 
+/// Hold the graph idle after a rebuild that prepared it but could not finish
+/// (its bridges or its modules): every step path treats it as `Done`, as for a
+/// preparation that failed, until the next `prepare_graph` succeeds.
+pub fn hold_idle() {
+    // SAFETY: scheduler-thread mutation, with every other domain parked.
+    unsafe {
+        SCHED.prepare_in_progress = true;
+    }
+}
+
 /// Set the current reconfigure phase.
 ///
 /// Capturing the entry tick for `Draining` arms the kernel-side

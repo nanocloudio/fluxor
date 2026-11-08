@@ -561,9 +561,9 @@ fn resident_demand(config: &crate::kernel::boot::config::Config) -> (usize, usiz
 }
 
 /// Edges of the base graph that cross execution domains: their modules sit in
-/// different domains, or the edge is marked cross-core. bcm2712 bridges each
-/// with a consumer-side channel of its own beside the producer's
-/// (`bridge_cross_domain_edges`). A tee or merge takes the domain of the
+/// different domains, or the edge is marked cross-core. A kernel with domains
+/// on their own cores bridges each with a consumer-side channel of its own
+/// beside the producer's (`domains::cross::bridge_edges`). A tee or merge takes the domain of the
 /// module it fans on, so fanning adds no crossing.
 #[cfg(feature = "smp")]
 fn cross_domain_edges(config: &crate::kernel::boot::config::Config) -> usize {

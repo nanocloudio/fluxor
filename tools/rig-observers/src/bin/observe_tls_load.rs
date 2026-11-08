@@ -23,6 +23,16 @@
 //!                     `stability_s` seconds. ERR on any failure.
 //!   3 echo            one session, one line, and the line (or its
 //!                     uppercase) back.
+//!   4 throughput      `throughput_inflight` handshakes kept in flight, each
+//!                     worker opening the next as its last closes, for
+//!                     `throughput_s` seconds: the server's handshake
+//!                     capacity, where phase 0 measures one handshake's
+//!                     latency. Reports the rate, latency percentiles,
+//!                     failures and this process's own CPU use, so a run
+//!                     whose client was saturated is visible as one. Failures
+//!                     here are refusals under load, reported, not ERR; only
+//!                     a phase that completes nothing is. Skipped when
+//!                     `throughput_inflight` is 0.
 //!
 //! Binding fields (from `[observe.tls_load]` in the rig profile):
 //!
@@ -36,6 +46,8 @@
 //!   concurrent_handshakes (int)            Phase 1 sessions per client. Default 8.
 //!   stability_s           (int)            Phase 2 duration. Default 12.
 //!   stability_qps         (int)            Phase 2 sessions per second. Default 4.
+//!   throughput_inflight   (int)            Phase 4 handshakes in flight. Default 0 (skipped).
+//!   throughput_s          (int)            Phase 4 duration. Default 20.
 //!
 //! The certificate is accepted whatever it is — the identity under test
 //! is minted per run — and the scheme of its CertificateVerify is what is
@@ -71,6 +83,7 @@ const DEFAULT_CONCURRENT_N: u64 = 4;
 const DEFAULT_CONCURRENT_HANDSHAKES: u64 = 8;
 const DEFAULT_STABILITY_S: u64 = 12;
 const DEFAULT_STABILITY_QPS: u64 = 4;
+const DEFAULT_THROUGHPUT_S: u64 = 20;
 const PER_SESSION_TIMEOUT: Duration = Duration::from_secs(10);
 const BOOT_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -121,6 +134,8 @@ struct Config {
     concurrent_handshakes: u64,
     stability_s: u64,
     stability_qps: u64,
+    throughput_inflight: u64,
+    throughput_s: u64,
 }
 
 fn read_config(invocation: &Value) -> Result<Config, String> {
@@ -142,6 +157,8 @@ fn read_config(invocation: &Value) -> Result<Config, String> {
         concurrent_handshakes: int("concurrent_handshakes", DEFAULT_CONCURRENT_HANDSHAKES),
         stability_s: int("stability_s", DEFAULT_STABILITY_S),
         stability_qps: int("stability_qps", DEFAULT_STABILITY_QPS),
+        throughput_inflight: int("throughput_inflight", 0),
+        throughput_s: int("throughput_s", DEFAULT_THROUGHPUT_S),
     })
 }
 
@@ -479,6 +496,13 @@ async fn attach(invocation: &Value) -> Result<(), u8> {
         ));
     }
 
+    // ── Phase 4: throughput ──
+    if cfg.throughput_inflight > 0 {
+        let (line, ok) = throughput(&cfg, tls.clone()).await;
+        any_err |= !ok;
+        emit_line(&line);
+    }
+
     emit_line(&format!(
         "[tls_load] done any_err={any_err} hps={hps_measured:.1} scheme={}",
         scheme_name(*scheme.lock().unwrap())
@@ -488,6 +512,88 @@ async fn attach(invocation: &Value) -> Result<(), u8> {
     } else {
         Ok(())
     }
+}
+
+/// Phase 4: `throughput_inflight` workers, each running handshakes back to
+/// back until the deadline. Returns the summary line and whether it passed.
+async fn throughput(cfg: &Config, tls: Arc<ClientConfig>) -> (String, bool) {
+    let started = Instant::now();
+    let end = started + Duration::from_secs(cfg.throughput_s);
+    let cpu_before = process_cpu_s();
+    let mut tasks = FuturesUnordered::new();
+    for _ in 0..cfg.throughput_inflight {
+        let host = cfg.host.clone();
+        let port = cfg.port;
+        let tls = tls.clone();
+        tasks.push(tokio::spawn(async move {
+            let mut samples = Vec::new();
+            let mut errors = 0u64;
+            let mut last = String::new();
+            while Instant::now() < end {
+                match timed_session(&host, port, tls.clone(), false).await {
+                    Ok(us) => samples.push(us),
+                    Err(e) => {
+                        errors += 1;
+                        last = e;
+                    }
+                }
+            }
+            (samples, errors, last)
+        }));
+    }
+    let mut samples: Vec<u64> = Vec::new();
+    let mut errors = 0u64;
+    let mut last = String::new();
+    while let Some(r) = tasks.next().await {
+        match r {
+            Ok((s, e, l)) => {
+                samples.extend(s);
+                errors += e;
+                if !l.is_empty() {
+                    last = l;
+                }
+            }
+            Err(e) => {
+                errors += 1;
+                last = format!("join: {e}");
+            }
+        }
+    }
+    let secs = started.elapsed().as_secs_f64().max(0.001);
+    let cpu_pct = (process_cpu_s() - cpu_before) / secs * 100.0;
+    samples.sort_unstable();
+    let ok = !samples.is_empty();
+    let line = format!(
+        "[tls_load] phase=4 name=throughput inflight={} handshakes={} errors={} hps={:.1} p50_ms={:.1} p99_ms={:.1} client_cpu_pct={:.0} client_cpus={} last_err={} {}",
+        cfg.throughput_inflight,
+        samples.len(),
+        errors,
+        samples.len() as f64 / secs,
+        percentile(&samples, 0.5) as f64 / 1000.0,
+        percentile(&samples, 0.99) as f64 / 1000.0,
+        cpu_pct,
+        std::thread::available_parallelism().map_or(0, |n| n.get()),
+        if last.is_empty() { "-".to_string() } else { last.replace(' ', "_") },
+        if ok { "OK" } else { "ERR" }
+    );
+    (line, ok)
+}
+
+/// This process's user plus system CPU time, in seconds (`/proc/self/stat`
+/// fields 14 and 15, in clock ticks of 1/100 s); 0 where it cannot be read.
+fn process_cpu_s() -> f64 {
+    let Ok(stat) = std::fs::read_to_string("/proc/self/stat") else {
+        return 0.0;
+    };
+    // The command name (field 2) may hold spaces; the fields after it follow
+    // its closing parenthesis.
+    let Some(rest) = stat.rfind(')').map(|i| &stat[i + 1..]) else {
+        return 0.0;
+    };
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    let ticks = |i: usize| fields.get(i).and_then(|f| f.parse::<u64>().ok()).unwrap_or(0);
+    // After the parenthesis, field 3 (state) is index 0, so utime (14) is 11.
+    (ticks(11) + ticks(12)) as f64 / 100.0
 }
 
 fn emit_line(line: &str) {

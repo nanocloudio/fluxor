@@ -256,6 +256,15 @@ pub fn root() -> PathBuf {
     discover().path
 }
 
+/// The host runtime a project runs Linux graphs with: the `fluxor-linux`
+/// `make build` builds, and `fluxor sync` installs, for this host's triple.
+pub fn linux_runtime(project_root: &Path) -> PathBuf {
+    project_root.join(format!(
+        "target/{}-unknown-linux-gnu/release/fluxor-linux",
+        std::env::consts::ARCH
+    ))
+}
+
 /// Resolve the project root for a command driven by a config file at
 /// `config_path` (e.g. `fluxor run <config>`). Resolution order:
 ///

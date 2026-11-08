@@ -717,7 +717,7 @@ pub fn step_modules(modules: &mut [ModuleSlot], count: usize) -> StepResult {
 ///
 /// `domain_id` >= `MAX_DOMAINS` returns `StepResult::Done` immediately
 /// (no-op, no error). The caller should guarantee this never happens —
-/// `multicore::MAX_DOMAINS` already caps assignment.
+/// instantiation (`domains::instantiate`) already caps assignment.
 ///
 /// Set inside `step_one_module` whenever a module returns `Burst` from
 /// `m.step()`, and read by the Tier 3 poll-mode wrapper

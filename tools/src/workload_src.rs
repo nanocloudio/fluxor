@@ -766,11 +766,6 @@ fn write_identity_config(
     Ok(())
 }
 
-/// Where an applet's runtime binary lives relative to the project that
-/// built its bundle. Recorded in the catalogue at install time so `exec`
-/// runs the runtime the bundle was built against, wherever it is invoked.
-const RUNTIME_RELATIVE: &str = "target/aarch64-unknown-linux-gnu/release/fluxor-linux";
-
 /// A bundle's `workload.json`, parsed and held to the same validation the
 /// agent applies at commit.
 fn load_manifest(text: &str) -> Result<WorkloadManifest> {
@@ -1095,7 +1090,7 @@ fn launch_bundle(
                 r.display()
             )));
         }
-        None => project_root.join(RUNTIME_RELATIVE),
+        None => crate::project::linux_runtime(&project_root),
     };
     if !linux_bin.exists() {
         return Err(Error::Config(format!(
@@ -1301,7 +1296,7 @@ pub fn install_applet(
     if let Err(e) = crate::store_sync::ensure_synced(&project_root) {
         eprintln!("warning: could not sync the pinned artifacts before install: {e}");
     }
-    let runtime = project_root.join(RUNTIME_RELATIVE);
+    let runtime = crate::project::linux_runtime(&project_root);
     let runtime = runtime
         .exists()
         .then(|| runtime.canonicalize().unwrap_or(runtime));

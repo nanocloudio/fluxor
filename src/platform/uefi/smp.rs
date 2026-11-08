@@ -2,22 +2,25 @@
 // page, under the boot core's page tables, with its own half of the interrupt
 // controller and its own timer tick.
 //
-// They run no modules; what they prove is that they came up and keep taking
-// their tick. The boot core watches each one's tick count, and a core whose
-// count stops for two seconds is reported with the last PC its tick saw: a
-// lockup detector that needs nothing from the stalled core, which may have
-// stopped taking interrupts.
+// Secondary `n` runs execution domain `n`: once the boot core has instantiated
+// the graph and released it, a secondary whose domain has modules enters the
+// shared domain loop; the others keep taking their tick. The boot core watches
+// each one's tick count, and a core whose count stops for two seconds is
+// reported with the last PC its tick saw: a lockup detector that needs nothing
+// from the stalled core, which may have stopped taking interrupts.
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use fluxor::arch::aarch64::{cpu, exception, gic, psci, timer};
+use fluxor::kernel::exec::domains;
 
 use super::acpi;
 
 /// Cores beyond the boot core this kernel brings up.
 pub const MAX_SECONDARIES: usize = 3;
 const GUARD_BYTES: usize = 4096;
-const STACK_BYTES: usize = 64 * 1024;
+/// The boot stack's size (`[kernel] kernel_stack_kb`): modules step on these.
+const STACK_BYTES: usize = 1024 * 1024;
 const SLAB_BYTES: usize = GUARD_BYTES + STACK_BYTES;
 const START_WAIT_US: u64 = 1_000_000;
 /// The lockup probe masks the first secondary's interrupts this long after it
@@ -54,6 +57,11 @@ static mut PROBE: bool = false;
 static mut TICK_SLOT: [usize; MAX_SECONDARIES + 1] = [0; MAX_SECONDARIES + 1];
 static ONLINE: [AtomicU32; MAX_SECONDARIES + 1] =
     [const { AtomicU32::new(0) }; MAX_SECONDARIES + 1];
+
+/// Whether secondary `n` (1-based) came up.
+pub fn online(n: usize) -> bool {
+    n <= MAX_SECONDARIES && ONLINE[n].load(Ordering::Acquire) != 0
+}
 
 /// The guard page under each secondary's stack, for the boot page tables.
 pub fn guards() -> [u64; MAX_SECONDARIES] {
@@ -230,6 +238,13 @@ extern "C" fn secondary_main(number: u64) -> ! {
             loop {
                 core::hint::spin_loop();
             }
+        }
+        if domains::released() && domains::is_active(n) {
+            log::info!("[smp] core={n} running domain={n}");
+            let ticks = domains::seed_core_tick(n);
+            // SAFETY: this core's timer.
+            unsafe { timer::timer_set(ticks) };
+            domains::run(n, &super::PLATFORM)
         }
     }
 }

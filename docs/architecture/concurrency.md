@@ -21,10 +21,9 @@ classes; the safety story is different for each.
 ### Boot-only — written before the graph runs
 
 Everything from `kernel::boot()` through the final `instantiate_one_module`
-runs on core 0 only. Secondary cores spin in the trampoline waiting
-for `INIT_COMPLETE.store(1, Release)` (see
-`src/platform/bcm2712.rs`). Statics written exclusively in that window
-need no synchronisation:
+runs on core 0 only. Secondary cores wait for `domains::release()`
+(`src/kernel/exec/domains/mod.rs`) before entering their loops. Statics
+written exclusively in that window need no synchronisation:
 
 - `src/kernel/module/loader.rs`: `STATE_ARENA`, `STATE_ARENA_OFFSET`,
   `FREE_LIST`, `FREE_COUNT`, `PIC_IRQ_DISABLED_COUNT`
@@ -35,9 +34,10 @@ need no synchronisation:
   `SYSTEM_EXTENSION`, `DEV_QUERY_EXTENSION`
 - `src/kernel/sys/hal.rs`: `HAL_OPS`
 
-After init these are read-only. All four platforms publish
-`INIT_COMPLETE` (or its equivalent; for RP/Linux/WASM there is no
-secondary core to release) before any code reads them. Writes during
+After init these are read-only. The multi-core platforms (bcm2712, uefi)
+publish them to their secondaries with the release store `domains::release()`
+makes, which each secondary's acquire load pairs with before it reads them;
+RP, Linux and WASM have no secondary core to release. Writes during
 reconfigure happen on core 0 with all secondaries parked, restoring
 boot-only semantics for the duration of the rebuild. The parsed config's
 module entries borrow their params from the resident config blob in place
@@ -52,19 +52,19 @@ over the bounded bookkeeping and never while the carved bytes are zeroed.
 
 The boot-sized kernel tables (`src/kernel/mem/table.rs`) move to a larger
 block only while a graph is prepared, and the block a table moves out of is
-freed at once: on bcm2712 to the carve zone, for the next carve, and on Linux
-to the host's allocator. The move copies the table, publishes the new block
+freed at once: on bcm2712 and uefi to the carve zone, for the next carve,
+and on Linux to the host's allocator. The move copies the table, publishes the new block
 with a release store, and then frees the old one, so the argument that no
 reader can still hold the old block is made per platform.
 
-On bcm2712 every move runs on core 0, in `prepare_graph`, which core 0 enters
-from its pump loop between steps, holding no slice of any table (a slice
-lives only within the call that reads it). At boot no other core has left
-its wait for `INIT_COMPLETE`. For a rebuild the other domains are quiesced
-first: each parks at its tick boundary, outside any step, and resumes only
-after the rebuild, when its acquire load of the quiesce flag, paired with the
-release store that ends the quiesce, makes the new block visible to its next
-read. Interrupts are covered by three facts:
+On bcm2712 and uefi every move runs on core 0, in `prepare_graph`, which
+core 0 enters from its pump loop between steps, holding no slice of any table
+(a slice lives only within the call that reads it). At boot no other core has
+left its wait for `domains::release()`. For a rebuild the other domains are
+quiesced first: each parks at its pass boundary, outside any step, and resumes
+only after the rebuild, when its acquire load of the quiesce generation,
+paired with the store that ends the quiesce, makes the new block visible to
+its next read. Interrupts are covered by three facts:
 
 - Core 0 masks its own interrupts from the copy to the free. Every interrupt
   that reaches a table from handler context is delivered there: an event
